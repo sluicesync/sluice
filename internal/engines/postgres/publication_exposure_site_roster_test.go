@@ -171,3 +171,86 @@ func TestPublicationExposureSiteWordingIsSiteSpecific(t *testing.T) {
 		}
 	}
 }
+
+// TestPublicationExposureWarningIsWiredToTheSiteMethods closes the gap the
+// pre-tag value-fidelity review found in the two gates above: both grade the
+// site METHODS, and nothing asserted that the emitter actually calls them.
+//
+// That is CLAUDE.md's "the pin grades the function, not the wiring" verbatim,
+// and it is not hypothetical here — replacing `"why", site.why()` with the old
+// hardcoded backup literal would restore Bug 269 exactly and pass both gates,
+// because the roster only inspects the call's third argument and the wording
+// test never mentions warnPublicationExposure outside a comment.
+//
+// So: parse warnPublicationExposure's body and require the values paired with
+// the "why" and "remedy" keys to be calls on the site parameter. A literal, a
+// package-level string, or a different receiver fails.
+func TestPublicationExposureWarningIsWiredToTheSiteMethods(t *testing.T) {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "backup_snapshot.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse backup_snapshot.go: %v", err)
+	}
+
+	var body *ast.BlockStmt
+	ast.Inspect(f, func(n ast.Node) bool {
+		fn, ok := n.(*ast.FuncDecl)
+		if ok && fn.Name.Name == "warnPublicationExposure" {
+			body = fn.Body
+			return false
+		}
+		return true
+	})
+	if body == nil {
+		t.Fatal("warnPublicationExposure not found in backup_snapshot.go; this gate names a specific " +
+			"function and has rotted rather than passed")
+	}
+
+	// Collect the argument that FOLLOWS each of the keys we care about, in
+	// the slog key/value list.
+	want := map[string]string{"why": "why", "remedy": "remedy"}
+	found := map[string]bool{}
+	ast.Inspect(body, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		for i, a := range call.Args {
+			lit, isLit := a.(*ast.BasicLit)
+			if !isLit || lit.Kind != token.STRING || i+1 >= len(call.Args) {
+				continue
+			}
+			key := strings.Trim(lit.Value, `"`)
+			method, watched := want[key]
+			if !watched {
+				continue
+			}
+			// The value must be `site.<method>()`.
+			vc, isCall := call.Args[i+1].(*ast.CallExpr)
+			if !isCall {
+				t.Errorf("the %q value passed to the exposure warning is not a call — a hardcoded string "+
+					"here is Bug 269 restored, and both site gates would still pass", key)
+				continue
+			}
+			sel, isSel := vc.Fun.(*ast.SelectorExpr)
+			if !isSel || sel.Sel.Name != method {
+				t.Errorf("the %q value is not a call to .%s() on the site parameter", key, method)
+				continue
+			}
+			recv, isIdent := sel.X.(*ast.Ident)
+			if !isIdent || recv.Name != "site" {
+				t.Errorf("the %q value calls .%s() on something other than the `site` parameter", key, method)
+				continue
+			}
+			found[key] = true
+		}
+		return true
+	})
+
+	for key := range want {
+		if !found[key] {
+			t.Errorf("no `%q, site.%s()` pair found in warnPublicationExposure — the message is not wired "+
+				"to the per-door text, so the site parameter is decorative", key, want[key])
+		}
+	}
+}

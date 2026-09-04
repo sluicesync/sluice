@@ -141,16 +141,19 @@ func (s publicationExposureSite) why() string {
 func (s publicationExposureSite) remedy() string {
 	const give = "give each listed table a PRIMARY KEY or REPLICA IDENTITY FULL. "
 	if s == exposureSiteStreamOpen {
-		return give + "Do NOT drop the publication to restore those writes: whether that wedges the stream " +
-			"or silently widens it depends only on whether anything was written between the drop and the " +
-			"resume, and the quiet outcome is the worse one -- the stream comes back green with a " +
-			"database-wide publication. To retire this stream's slot and publication together, run " +
-			"'sluice sync decommission --stream-id <id> --yes'"
+		return give + "Do NOT drop the publication to restore those writes: depending on whether this " +
+			"stream has to decode anything written after the DROP, that either wedges it permanently or " +
+			"lets it resume having silently widened the publication back to FOR ALL TABLES -- and the " +
+			"quiet outcome is the worse one, because the stream comes back green. To retire a stream you " +
+			"are finished with, stop it and run 'sluice sync decommission --stream-id <id> --yes': that " +
+			"drops the SLOT, and the publication only if this stream had its own. The shared default " +
+			"'" + defaultPublication + "' is never dropped, because other streams may read through it -- " +
+			"drop that one by hand once nothing reads it"
 	}
 	return give + "The publication can be dropped once the whole chain is finished with it and NO stream " +
 		"is using it -- dropping one out from under a live stream either wedges it permanently (its slot's " +
 		"restart_lsn pins behind the DROP record) or silently widens it back to FOR ALL TABLES on the next " +
-		"open, depending only on whether anything was written in between"
+		"open, depending on whether that stream has to decode anything written after the DROP"
 }
 
 // backupSnapshotSlotPrefix is the prefix the backup-anchor temporary
