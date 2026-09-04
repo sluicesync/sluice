@@ -105,7 +105,7 @@ func TestDocsNameOnlyRealCommands(t *testing.T) {
 	// The bare-form check needs to know which words START a command, and it
 	// takes them from the same model rather than a list.
 	topLevel := map[string]bool{}
-	for _, c := range parser.Model.Node.Children {
+	for _, c := range parser.Model.Children {
 		if c.Name != "" {
 			topLevel[c.Name] = true
 		}
