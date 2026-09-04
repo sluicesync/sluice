@@ -482,6 +482,12 @@ AS $$
 DECLARE
     r RECORD;
 BEGIN
+    -- Amended 2026-09-03 (audit SLP-2, v0.140.0): the shipped body no longer
+    -- loops over EVERY command. An event trigger is database-wide and cannot be
+    -- scoped to a schema, so this sketch halted the stream on DDL in schemas
+    -- sluice never touches. The loop is now filtered to commands whose RELATION
+    -- carries this install’s row-capture trigger (classid-guarded; an index
+    -- resolves through pg_index.indrelid). See renderCaptureDDLFunction.
     FOR r IN SELECT * FROM pg_catalog.pg_event_trigger_ddl_commands() LOOP
         IF r.schema_name IS NULL OR r.object_identity IS NULL THEN
             CONTINUE;

@@ -306,8 +306,9 @@ invalid UTF-8, so the scrub is byte-level, e.g. matching on
 guard — catalog scalars, the snapshot phase — repairing the source value
 is sufficient as written. (Bug 245.)
 
-**The `d1-trigger` and `d1` lanes never halt on invalid UTF-8 — the
-value arrives pre-mangled.** Measured on real D1 (2026-08-13): the
+**The `d1-trigger` lane never halts on invalid UTF-8 — the value
+arrives pre-mangled. The bulk `d1` read DOES halt since v0.140.0, by a
+different route (see below).** Measured on real D1 (2026-08-13): the
 `/query` API replaces invalid bytes with U+FFFD *server-side*, for
 direct reads and change-log images alike, so the invalid-UTF-8 arm of
 this guard cannot fire on live-D1 sources — there is no halt to recover
@@ -345,6 +346,17 @@ For the subscriber shape there is a supported opt-in: re-run `sluice trigger set
 - **The enablement posture is recorded and verified.** Setup records the opt-in in `sluice_change_log_meta`, and every stream open checks the installed triggers — the per-table pair *and* both event triggers — against it: an opt-in install whose trigger was hand-flipped back to plain refuses (its replicated writes, or replica-role DDL, would be silently missed), and a default install whose trigger was hand-flipped to `ENABLE ALWAYS` refuses too (replica-role capture without the echo-loop vetting). Re-running `sluice trigger setup` with the matching flag repairs either — **name every captured table in `--tables`**, which is what the refusal message prints for you: the posture is recorded once for the whole install, so a re-run that names fewer tables cannot converge it.
 
 Separately, every `postgres-trigger` stream open now verifies the installed capture artifacts themselves (the same capture-shape door the `sqlite-trigger`/`d1-trigger` engines got in v0.131.2): a manually dropped or `DISABLE TRIGGER`-d capture trigger, a trigger set `ENABLE REPLICA`, a trigger rewired to a foreign function, or a dropped/disabled `sluice_capture_ddl_trg` / `sluice_capture_drop_trg` event trigger **refuses loudly at open** — re-running `sluice trigger setup` reinstalls everything and preserves the change-log and resume watermark. Without the door, a dropped trigger is invisible to both drift tiers (the DDL event triggers only watch table DDL and drops of captured tables; the `--allow-polled-fingerprint` tier watches nothing — its fingerprint loop is not yet implemented, and every stream open on that tier logs a `DDL-DETECTION-ABSENT` warning) and every subsequent change on that table would be silently uncaptured.
+
+### Which DDL halts the stream (scoped to captured tables since v0.140.0)
+
+A Postgres event trigger is DATABASE-wide — it cannot be attached to a schema — so through v0.139.0 the DDL tier recorded a marker for any `ALTER TABLE`, `CREATE TABLE` or `CREATE INDEX` anywhere in the database, and the stream halted on it. A colleague creating an unrelated table in a schema sluice never touches stopped your sync, with a restart-from-scratch remedy.
+
+Since v0.140.0 the tier records only commands whose RELATION carries this install’s capture trigger. In practice:
+
+- **Still halts** (these change a captured table’s shape): `ALTER TABLE` on a captured table, including `ADD COLUMN`, `ALTER COLUMN TYPE`, `DROP COLUMN`, `ADD CONSTRAINT` and `RENAME COLUMN`; and `CREATE INDEX` on one.
+- **No longer halts**: anything on a table this install does not capture — another schema entirely, an uncaptured neighbour in the same schema, or a brand-new table. A table with no capture trigger emits no change rows, so it cannot make the applier write a wrong one; `sluice sync add-table` is how it joins the stream.
+
+Upgrading changes the capture function bodies, so an install created by an earlier release warns `STALE-CAPTURE-FUNCTION` until `sluice trigger setup` is re-run once.
 
 ### Dropping a synced table (and the `DROP-CAPTURE-ABSENT` warning)
 

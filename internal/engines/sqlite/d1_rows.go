@@ -474,9 +474,24 @@ func findColumn(table *ir.Table, name string) *ir.Column {
 func textBytesExpr(table *ir.Table) string {
 	parts := make([]string, 0, len(table.Columns))
 	for _, c := range table.Columns {
+		// A GENERATED column is derived and never written — staging skips it
+		// on insert and a target recomputes it — so a mangle there cannot
+		// persist, and counting it on one side only is how this first
+		// diverged (a VIRTUAL column duplicating another text column made the
+		// server read double the client, caught by
+		// TestStageD1Table_RowidShadowMatrix). Excluded from BOTH sides.
+		if c.IsGenerated() {
+			continue
+		}
 		q := quoteIdent(c.Name)
+		// Measure the EXPRESSION THE PROJECTION DELIVERS, not the raw column.
+		// The two sides then align by construction rather than by coincidence:
+		// the client counts len() of the string CapturedValueExpr produced, so
+		// the server must weigh that same string. Measuring the bare column
+		// diverged the moment a projected value was not the column itself —
+		// caught by TestStageD1Table_RowidShadowMatrix on a generated column.
 		parts = append(parts,
-			"COALESCE(SUM(CASE WHEN typeof("+q+")='text' THEN length(CAST("+q+" AS BLOB)) ELSE 0 END),0)")
+			"COALESCE(SUM(CASE WHEN "+CapturedTypeofExpr(q)+"='text' THEN length(CAST("+CapturedValueExpr(q)+" AS BLOB)) ELSE 0 END),0)")
 	}
 	if len(parts) == 0 {
 		return "0"
@@ -719,7 +734,7 @@ func (r *D1RowReader) fetchPages(ctx context.Context, table *ir.Table, plan page
 		}
 	}
 
-	before, _, err := r.countRows(ctx, table)
+	before, beforeBytes, err := r.countRows(ctx, table)
 	if err != nil {
 		deliver(d1Page{err: fmt.Errorf("count rows before the read: %w", err), final: true})
 		return
@@ -777,7 +792,17 @@ func (r *D1RowReader) fetchPages(ctx context.Context, table *ir.Table, plan page
 				err = fmt.Errorf("count rows after the read: %w", err)
 			} else {
 				err = checkRowCount(ctx, table.Name, before, after, ordinal)
-				quiescent = before == after
+				// Quiescent means BOTH readings held still, not just the row
+				// count. A COUNT(*) is blind to an UPDATE, and an UPDATE that
+				// changes a text cell's length moves the byte sum on its own —
+				// so counting rows alone would have made the byte bracket
+				// refuse a healthy live database whenever a write landed in an
+				// already-delivered page. The count bracket 200 lines above
+				// deliberately WARNs rather than refuses for exactly that
+				// reason ("a live database would otherwise be unmigratable");
+				// this must abstain on the same evidence. A mangle moves only
+				// the DELIVERED side, so it still refuses.
+				quiescent = before == after && beforeBytes == afterBytes
 			}
 			deliver(d1Page{rows: rows, err: err, final: true, srcTextBytes: afterBytes, quiescent: quiescent})
 			return
@@ -821,7 +846,12 @@ func (r *D1RowReader) decodeRow(table *ir.Table, plan pagePlan, raw d1Row, enc d
 			return nil, nil, 0, fmt.Errorf("d1: table %q column %q row %d: %w",
 				table.Name, col.Name, ordinal, err)
 		}
-		if typeofText == "text" {
+		// Generated columns are excluded on BOTH sides (see textBytesExpr): a
+		// derived value is never written, so a mangle there cannot persist,
+		// and staging already skips them on insert. Counting them here but
+		// not there is what made the server read double the client on a
+		// VIRTUAL column duplicating another (TestStageD1Table_RowidShadowMatrix).
+		if typeofText == "text" && !col.IsGenerated() {
 			if str, isStr := storage.(string); isStr {
 				textBytes += int64(len(str))
 			}

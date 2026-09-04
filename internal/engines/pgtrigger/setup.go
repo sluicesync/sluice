@@ -490,7 +490,7 @@ func Setup(ctx context.Context, dsn string, opts SetupOptions) (*Plan, error) {
 	// --allow-polled-fingerprint re-run leaves an older body firing against
 	// the current suppression protocol and records sluice's own setup DDL.
 	// See [hasCaptureEventTriggers].
-	liveEventTriggers, err := hasCaptureEventTriggers(ctx, db)
+	liveEventTriggers, err := hasCaptureEventTriggers(ctx, db, opts.Schema)
 	if err != nil {
 		return nil, fmt.Errorf("pgtrigger: setup: %w", err)
 	}
@@ -1731,8 +1731,14 @@ func captureDDLSuppressionCheck(metaTableRef string) string {
 // The classid guard is why a non-relation command cannot be misread: an
 // OID is only meaningful against its own catalog, and `CREATE TRIGGER`
 // (measured: object_type "trigger", classid pg_trigger) would otherwise
-// have its trigger OID compared against pg_class. Today's WHEN TAG list
-// cannot deliver one; the guard keeps that true if the list ever grows.
+// have its trigger OID compared against pg_class.
+//
+// The guard is NOT inert today, and an earlier draft of this comment said it
+// was: measured on PG 16.15, `ALTER TABLE … RENAME CONSTRAINT` reports
+// object_type "table constraint" with classid pg_constraint and is filtered
+// out here. That is the behaviour we want — renaming a constraint cannot
+// change a row, the same reasoning that exempts DROP INDEX — but it is a
+// live shape the guard excludes, not a hypothetical one.
 //
 // Deliberate consequence: a `CREATE TABLE` in a SELECTED schema no longer
 // halts the stream either. An uncaptured table cannot make the applier
@@ -2313,11 +2319,21 @@ func quoteSQLString(s string) string {
 // already CREATE OR REPLACEs the ROW capture function, so any role that can
 // complete a re-run at all must already own the capture functions (measured
 // — a non-owner fails on `sluice_capture_change` before reaching these).
-func hasCaptureEventTriggers(ctx context.Context, db *sql.DB) (bool, error) {
+func hasCaptureEventTriggers(ctx context.Context, db *sql.DB, schema string) (bool, error) {
 	var n int
+	// Matched by the FUNCTION the trigger executes, not by its name alone
+	// (audit 2026-09-01 SLP-1 closed exactly that shape for the capture-shape
+	// door two releases ago, and the first cut of this probe reintroduced it).
+	// A two-schema install would otherwise see schema A's live trigger while
+	// setting up schema B, replace B's bodies, and report success while the
+	// body actually firing — A's — stayed stale.
 	err := db.QueryRowContext(ctx,
-		`SELECT pg_catalog.count(*) FROM pg_catalog.pg_event_trigger WHERE evtname IN ($1, $2)`,
-		CaptureTriggerDDL, CaptureTriggerDrop).Scan(&n)
+		`SELECT pg_catalog.count(*)
+		   FROM pg_catalog.pg_event_trigger et
+		   JOIN pg_catalog.pg_proc p ON p.oid = et.evtfoid
+		   JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+		  WHERE et.evtname IN ($1, $2) AND n.nspname = $3`,
+		CaptureTriggerDDL, CaptureTriggerDrop, schema).Scan(&n)
 	if err != nil {
 		return false, fmt.Errorf("probe existing capture event triggers: %w", err)
 	}

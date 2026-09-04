@@ -20,7 +20,7 @@ Drop-in from v0.139.0. No flag change, no format change. One new error code, `SL
 
 Two behaviour changes worth knowing. A Cloudflare D1 table holding invalid UTF-8 in a text column now refuses where it previously copied a rewritten value; the source is intact and readable as `hex(col)`, so the remedy is to repair or exclude those rows. And a `postgres-trigger` install created by an earlier release will warn `STALE-CAPTURE-FUNCTION` until `sluice trigger setup` is re-run once, which is the existing posture for any change to those bodies.
 
-Everything else in this release removes a refusal or a wasted copy rather than adding one.
+The D1 refusal is the one addition; everything else in this release removes a refusal or a wasted copy.
 
 ## Who needs this
 

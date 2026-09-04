@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // This file implements Strategy A: lossless local staging of a live Cloudflare
@@ -159,15 +160,28 @@ func stageD1Table(ctx context.Context, rr *D1RowReader, db *sql.DB, t *ir.Table,
 		ordinal  int64
 		total    int64
 		sawFinal bool
+		// LA-4, the staging half. fetchPages has TWO consumers and the byte
+		// bracket first reached only the reader's — while `--infer-types`
+		// against D1 engages staging AUTOMATICALLY and then swaps the source
+		// to the staged file, so a mangled cell would have been written here
+		// as valid UTF-8 with nothing downstream able to tell.
+		gotTextBytes int64
+		srcTextBytes int64
+		quiescent    bool
 	)
 	for page := range pages {
+		if page.final {
+			srcTextBytes, quiescent = page.srcTextBytes, page.quiescent
+		}
 		if page.err != nil {
 			return total, fmt.Errorf("d1 stage: table %q: %w", t.Name, page.err)
 		}
 		if len(page.rows) > 0 {
-			if err := stageInsertPage(ctx, db, t, plan, rr, insertSQL, stored, page.rows, &ordinal); err != nil {
+			pageBytes, err := stageInsertPage(ctx, db, t, plan, rr, insertSQL, stored, page.rows, &ordinal)
+			if err != nil {
 				return total, err
 			}
+			gotTextBytes += pageBytes
 			total += int64(len(page.rows))
 		}
 		sawFinal = page.final
@@ -182,6 +196,24 @@ func stageD1Table(ctx context.Context, rr *D1RowReader, db *sql.DB, t *ir.Table,
 		return total, fmt.Errorf("d1 stage: table %q: page fetch aborted before the final page", t.Name)
 	}
 
+	// LA-4: the same comparison the reader runs, on the same evidence. A
+	// staged file is the artifact the rest of the migrate reads, so a
+	// mangle that reaches it is undetectable from then on.
+	if quiescent && srcTextBytes >= 0 && gotTextBytes != srcTextBytes {
+		return total, sluicecode.Wrap(
+			sluicecode.CodeD1TextMangled,
+			"read the affected columns as hex(col) and repair the values at the source",
+			fmt.Errorf(
+				"d1 stage: table %q: the text this read received is %d bytes where the source stores %d, on a table "+
+					"whose row count and text size did not move -- D1 replaces every invalid UTF-8 byte with U+FFFD in "+
+					"its query response (three bytes for one), so at least one cell was silently rewritten in transit "+
+					"and staging it would bake the mangled value into the local file every later phase reads. The "+
+					"source is intact: hex(col) still returns the true bytes",
+				t.Name, gotTextBytes, srcTextBytes,
+			),
+		)
+	}
+
 	log.InfoContext(ctx, "d1 stage: table copied",
 		slog.String("table", t.Name), slog.Int64("rows", total))
 	return total, nil
@@ -191,10 +223,13 @@ func stageD1Table(ctx context.Context, rr *D1RowReader, db *sql.DB, t *ir.Table,
 // batches of [stageInsertBatch]. It binds each cell's exact storage-class value
 // (via [d1StorageValue]) and advances the 1-based ordinal exactly as the row
 // reader's stream loop does.
+// The int64 return is the delivered byte length of every text-storage cell
+// in the page (LA-4). typeof is already decoded per cell here, so this is
+// the same exact-and-free accounting the reader's decodeRow does.
 func stageInsertPage(
 	ctx context.Context, db *sql.DB, t *ir.Table, plan pagePlan, rr *D1RowReader,
 	insertSQL string, stored []int, rows []d1Row, ordinal *int64,
-) (retErr error) {
+) (textBytes int64, retErr error) {
 	// Normalise a cancellation-race error to carry context.Canceled.
 	// A cancel mid-page can land on ANY of this loop's DB operations —
 	// the ExecContext insert, a batch Commit, the BeginTx/Prepare that
@@ -218,7 +253,7 @@ func stageInsertPage(
 
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("d1 stage: begin tx for %q: %w", t.Name, err)
+		return 0, fmt.Errorf("d1 stage: begin tx for %q: %w", t.Name, err)
 	}
 	committed := false
 	defer func() {
@@ -228,7 +263,7 @@ func stageInsertPage(
 	}()
 	stmt, err := tx.PrepareContext(ctx, insertSQL)
 	if err != nil {
-		return fmt.Errorf("d1 stage: prepare insert for %q: %w", t.Name, err)
+		return 0, fmt.Errorf("d1 stage: prepare insert for %q: %w", t.Name, err)
 	}
 	defer func() { _ = stmt.Close() }()
 
@@ -240,21 +275,26 @@ func stageInsertPage(
 			col := t.Columns[i]
 			typeofText, ok, jerr := jsonString(raw[plan.typeofAliases[i]])
 			if jerr != nil {
-				return fmt.Errorf("d1 stage: table %q column %q row %d: decode typeof: %w",
+				return 0, fmt.Errorf("d1 stage: table %q column %q row %d: decode typeof: %w",
 					t.Name, col.Name, *ordinal, jerr)
 			}
 			if !ok {
 				typeofText = "null"
 			}
 			sv, serr := d1StorageValue(typeofText, raw[col.Name])
+			if typeofText == "text" {
+				if str, isStr := sv.(string); isStr {
+					textBytes += int64(len(str))
+				}
+			}
 			if serr != nil {
-				return fmt.Errorf("d1 stage: table %q column %q row %d: %w",
+				return 0, fmt.Errorf("d1 stage: table %q column %q row %d: %w",
 					t.Name, col.Name, *ordinal, serr)
 			}
 			vals = append(vals, sv)
 		}
 		if _, err := stmt.ExecContext(ctx, vals...); err != nil {
-			return fmt.Errorf("d1 stage: insert into %q row %d: %w", t.Name, *ordinal, err)
+			return 0, fmt.Errorf("d1 stage: insert into %q row %d: %w", t.Name, *ordinal, err)
 		}
 
 		// The fetcher derives the next page's bound itself; this per-row
@@ -262,32 +302,32 @@ func stageInsertPage(
 		// with full row context (the fetcher stops silently on that failure —
 		// see [fetchPages]), mirroring the reader's decodeRow.
 		if _, kerr := rr.extractKey(t, plan, raw, *ordinal); kerr != nil {
-			return kerr
+			return 0, kerr
 		}
 
 		sinceCommit++
 		if sinceCommit >= stageInsertBatch {
 			if err := tx.Commit(); err != nil {
-				return fmt.Errorf("d1 stage: commit %q: %w", t.Name, err)
+				return 0, fmt.Errorf("d1 stage: commit %q: %w", t.Name, err)
 			}
 			committed = true
 			// Start a fresh tx + stmt for the remainder of the page.
 			if tx, err = db.BeginTx(ctx, nil); err != nil {
-				return fmt.Errorf("d1 stage: begin tx for %q: %w", t.Name, err)
+				return 0, fmt.Errorf("d1 stage: begin tx for %q: %w", t.Name, err)
 			}
 			committed = false
 			if stmt, err = tx.PrepareContext(ctx, insertSQL); err != nil {
-				return fmt.Errorf("d1 stage: prepare insert for %q: %w", t.Name, err)
+				return 0, fmt.Errorf("d1 stage: prepare insert for %q: %w", t.Name, err)
 			}
 			sinceCommit = 0
 		}
 	}
 
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("d1 stage: commit %q: %w", t.Name, err)
+		return 0, fmt.Errorf("d1 stage: commit %q: %w", t.Name, err)
 	}
 	committed = true
-	return nil
+	return textBytes, nil
 }
 
 // buildStageInsert builds the parameterised INSERT for a staged table and the
