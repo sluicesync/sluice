@@ -4,6 +4,14 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.140.0] - 2026-09-03
+
+Five defects that only a real server could show, three of them in code v0.139.0 had just shipped. **If you use `postgres-trigger`, back up from a Postgres replica, or migrate Cloudflare D1 tables holding text that is not valid UTF-8, read the entry that names you.**
+
+### Compatibility
+
+Drop-in from v0.139.0. No flag change, no format change. One new error code: `SLUICE-E-D1-TEXT-MANGLED`. Two behaviour changes worth knowing: a D1 table holding invalid UTF-8 in a text column now REFUSES where it previously copied a rewritten value (the source is intact and readable as `hex(col)` — repair or exclude those rows), and a `postgres-trigger` install created by an earlier release WARNs `STALE-CAPTURE-FUNCTION` until `sluice trigger setup` is re-run once, the existing posture for any change to those bodies. Everything else here removes a refusal or a wasted copy rather than adding one.
+
 ### Fixed
 
 **A Cloudflare D1 read refuses when the API mangles invalid UTF-8, instead of copying the mangled value (audit LA-4).** D1 stores invalid-UTF-8 `TEXT` intact on disk but replaces every invalid byte with U+FFFD in its query response, three bytes for one, on the server. The cell therefore arrives as valid UTF-8, which is why sluice's own encoding guard could never fire for it and why that code said there was no independent expected value client-side. There is one on the server: the summed byte length of the table's text-storage cells, which the reader now reads in the SAME round trip as its closing row count and compares against the bytes it actually received. A quiescent table whose totals disagree refuses with the new `SLUICE-E-D1-TEXT-MANGLED`, naming both numbers and pointing at `hex(col)`, which still returns the true bytes. Measured on live D1: a three-byte cell arrives as seven. The alignment between the two sums is exact rather than approximate because a blob arrives as a JSON array and an integer as a number, so neither can drift into either total. No extra round trip, and a moving table is left to the row-count bracket that already speaks for it.
