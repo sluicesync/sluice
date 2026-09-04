@@ -43,7 +43,7 @@ func (e Engine) ensureChainSlotPublication(ctx context.Context, db *sql.DB, sche
 	// runs no replica-identity REFUSAL at all, so no table here is graded by
 	// anything else. Adding that refusal is a behaviour change on a shipped
 	// path and is deliberately not made here; warning is purely additive.
-	warnPublicationExposure(ctx, db, nil)
+	warnPublicationExposure(ctx, db, exposureSiteBackupChainSlot, nil)
 	if err := ensureAllTablesPublication(ctx, db, e.publicationName()); err != nil {
 		return classifyStandbyReadOnly(fmt.Errorf("postgres: backup snapshot: --chain-slot: ensure publication: %w", err))
 	}
@@ -64,7 +64,7 @@ func (e Engine) ensureChainSlotPublication(ctx context.Context, db *sql.DB, sche
 // Advisory by construction: every failure is swallowed to DEBUG. A catalog
 // read that cannot run must not fail a backup that would otherwise succeed,
 // which would turn an advisory into the refusal this deliberately is not.
-func warnPublicationExposure(ctx context.Context, db *sql.DB, covered func(namespace, table string) bool) {
+func warnPublicationExposure(ctx context.Context, db *sql.DB, site publicationExposureSite, covered func(namespace, table string) bool) {
 	query := func(ctx context.Context, q string, args ...any) (*catalogRows, error) {
 		return catalogQueryOn(ctx, db, q, args...)
 	}
@@ -81,15 +81,76 @@ func warnPublicationExposure(ctx context.Context, db *sql.DB, covered func(names
 		"UNSELECTED-NAMESPACE-EXPOSURE: this run's publication will stop UPDATE and DELETE on tables across this whole database",
 		"tables", exposed,
 		"count", len(exposed),
-		"why", "a chain slot needs a database-wide publication, so it is created FOR ALL TABLES and reaches every "+
-			"table in the database; Postgres refuses UPDATE and DELETE on a published table that has no replica "+
-			"identity, while INSERT keeps working -- so the failure surfaces inside whatever application owns them, "+
-			"and --chain-slot keeps the publication after the run",
-		"remedy", "give each listed table a PRIMARY KEY or REPLICA IDENTITY FULL. The publication can be dropped "+
-			"once the whole chain is finished with it and NO stream is using it -- dropping one out from under a "+
-			"live stream wedges that stream permanently, because its slot's restart_lsn pins behind the DROP "+
-			"record, and the next open recreates the publication FOR ALL TABLES regardless",
+		"why", site.why(),
+		"remedy", site.remedy(),
 	)
+}
+
+// publicationExposureSite names WHICH door is about to create a database-wide
+// publication. It exists because the message above has two callers and used to
+// have one vocabulary: the backup one. A plain `sync start` whose publication
+// had gone missing emitted it verbatim -- telling an operator who had run no
+// backup at all that "a chain slot needs a database-wide publication" and that
+// "--chain-slot keeps the publication after the run", and never naming the
+// remedy that actually retires a stream's publication (Bug 269).
+//
+// That is the shape CLAUDE.md calls a door that MOVED: the message was written
+// for one caller, a second caller was wired to it, and nothing made the second
+// caller declare what it was. The type does -- a new call site cannot compile
+// without saying which it is, and TestPublicationExposureSiteRoster holds every
+// call site to an explicit, classified value.
+type publicationExposureSite int
+
+const (
+	// exposureSiteBackupChainSlot is `backup full --chain-slot`, which
+	// deliberately PERSISTS the publication so the chain's incrementals can
+	// decode through it -- so the exposure outlives the run that caused it.
+	exposureSiteBackupChainSlot publicationExposureSite = iota
+	// exposureSiteStreamOpen is any StreamChanges whose publication is
+	// MISSING and which is therefore recreating it FOR ALL TABLES -- warm
+	// resume included. An operator reaching this has usually just dropped a
+	// scoped publication, and is one resume away from a database-wide one.
+	exposureSiteStreamOpen
+)
+
+// why returns the mechanism clause for this site. The first half is shared
+// because the Postgres behaviour is identical; only the reason the run needs a
+// database-wide publication, and what becomes of it afterwards, differ.
+func (s publicationExposureSite) why() string {
+	const mechanism = "Postgres refuses UPDATE and DELETE on a published table that has no replica " +
+		"identity, while INSERT keeps working -- so the failure surfaces inside whatever application owns them"
+	if s == exposureSiteStreamOpen {
+		return "this stream's publication does not exist, so it is being created FOR ALL TABLES and reaches " +
+			"every table in the database; " + mechanism + ". If you dropped a SCOPED publication and resumed, " +
+			"this is the moment it becomes database-wide"
+	}
+	return "a chain slot needs a database-wide publication, so it is created FOR ALL TABLES and reaches " +
+		"every table in the database; " + mechanism + ", and --chain-slot keeps the publication after the run"
+}
+
+// remedy returns the steer for this site. Both say DO NOT drop a publication a
+// live stream is using; they differ on what to do instead, and only the stream
+// site can honestly name `sluice sync decommission`.
+//
+// Both now describe the drop's outcome as a FORK rather than a certainty. The
+// v0.141.1 notes and this file's own comment said the post-drop resume always
+// fails; the v0.141.1 regression cycle isolated it on one variable and found
+// that with nothing written between the drop and the resume it SUCCEEDS, and
+// silently widens the publication (Bug 270). Stating only the loud outcome hid
+// the quiet one, which is the worse of the two.
+func (s publicationExposureSite) remedy() string {
+	const give = "give each listed table a PRIMARY KEY or REPLICA IDENTITY FULL. "
+	if s == exposureSiteStreamOpen {
+		return give + "Do NOT drop the publication to restore those writes: whether that wedges the stream " +
+			"or silently widens it depends only on whether anything was written between the drop and the " +
+			"resume, and the quiet outcome is the worse one -- the stream comes back green with a " +
+			"database-wide publication. To retire this stream's slot and publication together, run " +
+			"'sluice sync decommission --stream-id <id> --yes'"
+	}
+	return give + "The publication can be dropped once the whole chain is finished with it and NO stream " +
+		"is using it -- dropping one out from under a live stream either wedges it permanently (its slot's " +
+		"restart_lsn pins behind the DROP record) or silently widens it back to FOR ALL TABLES on the next " +
+		"open, depending only on whether anything was written in between"
 }
 
 // backupSnapshotSlotPrefix is the prefix the backup-anchor temporary

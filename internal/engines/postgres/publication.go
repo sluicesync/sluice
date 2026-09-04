@@ -150,16 +150,29 @@ func ensurePublication(ctx context.Context, db *sql.DB, name, schema string, tab
 			// database-wide one and breaking every keyless table in the
 			// database.
 			//
-			// This comment used to say "at exit 0". Measured otherwise by the
-			// v0.141.0 regression cycle (Bug 267): the widening itself is
-			// silent, but the stream does not survive to exploit it -- the
-			// slot's restart_lsn pins behind the DROP record and the resume
-			// fails NON-ZERO with `publication "sluice_pub" does not exist`,
-			// asserted while it demonstrably exists. Escaping that costs a slot
-			// drop and a full re-snapshot, and the publication the re-snapshot
-			// creates is FOR ALL TABLES again. So the loud failure and the
-			// silent widening are BOTH real, in that order.
-			warnPublicationExposure(ctx, db, nil)
+			// This comment has now been wrong TWICE, in opposite directions,
+			// and the second time is the instructive one.
+			//
+			// It first said "at exit 0". The v0.141.0 regression cycle
+			// measured otherwise (Bug 267): the slot's restart_lsn pins behind
+			// the DROP record and the resume fails NON-ZERO with `publication
+			// "sluice_pub" does not exist`, asserted while it demonstrably
+			// exists. Escaping that costs a slot drop and a full re-snapshot.
+			//
+			// So it was rewritten to say the stream never survives to exploit
+			// the widening -- and THAT is false too. The v0.141.1 cycle
+			// isolated it on one variable (Bug 270): whether anything was
+			// WRITTEN between the drop and the resume. With a row written, the
+			// resume dies as Bug 267 describes. With nothing written, it
+			// SUCCEEDS: the publication silently widens f -> t, the stream
+			// replicates the next change normally, and every keyless table in
+			// the database starts refusing UPDATE from that moment.
+			//
+			// It is a fork, not a sequence, and the QUIET branch is the
+			// dangerous one -- which is exactly why stating only the loud
+			// branch was worse than saying nothing. Each rewrite replaced one
+			// absolute with another absolute; the truth needed a condition.
+			warnPublicationExposure(ctx, db, exposureSiteStreamOpen, nil)
 			createQuery = fmt.Sprintf(`CREATE PUBLICATION %s FOR ALL TABLES`, quoteIdent(name))
 		} else {
 			createQuery = fmt.Sprintf(`CREATE PUBLICATION %s FOR TABLE %s`,
