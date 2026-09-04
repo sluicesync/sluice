@@ -491,6 +491,31 @@ that gap is now closed by `pipeline.SweepConsolidationLeases` in
   MySQL) carries the source-side CDC position the boundary was
   observed at. `FinalizeLeaseApply` writes it; legacy v0.75.0 rows
   (NULL anchor) are defensively retained by the sweeper.
+
+  **Correction (2026-09-04): that retention is PERMANENT, and this
+  bullet reads as though it is temporary.** The sweeper's own comment
+  used to say a later boundary on the table would rewrite the row with
+  an anchor via `FinalizeLeaseApply` and let a subsequent sweep act on
+  it. It cannot. The no-anchor arm is only reached when the row is
+  already APPLIED, and `tryAcquireShardLease` guards its conflict path
+  with `applied_at IS NULL` — so no stream can re-acquire the row, and
+  nothing can ever reach the finalize that would give it an anchor.
+
+  The operator-visible consequence is worse than a row that lingers:
+  **every later DDL boundary on that table refuses**, because the
+  acquire fails and the observer path then compares the new boundary's
+  checksum against the old applied one and reports a mismatch. On a
+  single-stream install the mismatch names the stream's own id as the
+  "peer holder", which reads as a bug in sluice rather than as stale
+  state. The only escape today is deleting the row by hand once every
+  stream is known to be past it; sluice does not do it automatically
+  because a legacy row carries no anchor, and the anchor is the
+  evidence the sweep needs to prove they are.
+
+  Filed as Bug 262b. Note that the same acquire guard makes a SECOND
+  DDL on any one table refuse until the GC sweep retires the first
+  row, so the legacy case is the permanent instance of a defect that
+  is otherwise timing-dependent.
 - Loud-failure tenet: GC errors are LOGGED at WARN but never
   propagated up. A failing sweep cannot crash an otherwise-healthy
   stream — retention is a maintenance operation, not a correctness

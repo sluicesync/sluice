@@ -52,7 +52,14 @@ func (e Engine) ensureChainSlotPublication(ctx context.Context, db *sql.DB, sche
 
 // warnPublicationExposure reports the tables a FOR ALL TABLES publication is
 // about to stop accepting UPDATE and DELETE on, and is engine-local because
-// this caller holds a *sql.DB rather than a Streamer.
+// its callers hold a *sql.DB rather than a Streamer.
+//
+// Both of them pass a nil predicate, so the reported set is EVERY at-risk
+// table in the database -- including tables the run itself reads. The message
+// says "across this whole database" for that reason. It used to say "tables
+// it does not read", which was a sentence about the SYNC path's set pasted
+// onto a path that has no refusal to take a complement of, and it was found
+// by a post-tag review rather than by anyone reading it.
 //
 // Advisory by construction: every failure is swallowed to DEBUG. A catalog
 // read that cannot run must not fail a backup that would otherwise succeed,
@@ -71,7 +78,7 @@ func warnPublicationExposure(ctx context.Context, db *sql.DB, covered func(names
 	}
 	slog.WarnContext(
 		ctx,
-		"UNSELECTED-NAMESPACE-EXPOSURE: this run's publication will stop UPDATE and DELETE on tables it does not read",
+		"UNSELECTED-NAMESPACE-EXPOSURE: this run's publication will stop UPDATE and DELETE on tables across this whole database",
 		"tables", exposed,
 		"count", len(exposed),
 		"why", "a chain slot needs a database-wide publication, so it is created FOR ALL TABLES and reaches every "+

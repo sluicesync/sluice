@@ -764,9 +764,16 @@ func (s *Streamer) warnPublicationExposure(ctx context.Context, graded map[strin
 	}
 	slog.WarnContext(
 		ctx,
-		"UNSELECTED-NAMESPACE-EXPOSURE: this sync's publication will stop UPDATE and DELETE on tables outside the schemas you selected",
+		"UNSELECTED-NAMESPACE-EXPOSURE: this sync's publication will stop UPDATE and DELETE on tables nothing else will refuse over",
 		"tables", exposed,
 		"count", len(exposed),
+		// "nothing else will refuse over", not "outside the schemas you
+		// selected". The set is the complement of what the replica-identity
+		// refusal GRADED, and the refusal applies the table filter first --
+		// so a table you excluded with --exclude-table INSIDE a selected
+		// schema is in here too. That case is the whole reason this set is
+		// a recorded list rather than a namespace test, and the old wording
+		// excluded it in prose while the code included it.
 		"why", "a multi-schema sync needs a database-wide logical slot, so its publication is FOR ALL TABLES and reaches every "+
 			"table in the database; Postgres refuses UPDATE and DELETE on a published table that has no replica identity, "+
 			"while INSERT keeps working -- so the failure surfaces inside whatever application owns these tables",

@@ -171,7 +171,10 @@ machinery MySQL already drives.
   supported PG versions; the slot is database-wide regardless, and the reader's
   `inScope` filter does the selection). PG15+ `FOR TABLES IN SCHEMA <list>` to
   trim WAL volume is a possible later optimisation, not the first cut — the
-  reader-side filter is the correctness boundary either way.
+  reader-side filter is the correctness boundary for SLUICE'S STREAM either
+  way. It is **not** the boundary for the source application's writes: see
+  "Publication write-breaking" under Consequences, which is the reason
+  `FOR TABLES IN SCHEMA` would be more than a WAL trim.
 - **Position state** stays a single `sluice_cdc_state` row per `--stream-id` (one
   database-wide LSN). No per-schema position bookkeeping.
 
@@ -261,7 +264,43 @@ against a real server, where removing it returned `public`'s row under
   drops a user schema — the inverse of the MySQL `_vt_*` lesson).
 - **Publication WAL volume.** `FOR ALL TABLES` decodes the whole database even
   when few schemas are selected; documented, with `FOR TABLES IN SCHEMA` (PG15+)
-  as the later trim. Correctness never depends on it (reader-side `inScope`).
+  as the later trim. sluice's OWN correctness never depends on it (reader-side
+  `inScope`) — but see the next consequence, which is the one this bullet was
+  read as covering and does not.
+- **Publication write-breaking (added 2026-09-04, v0.141.0).** WAL volume was
+  recorded here as the cost of `FOR ALL TABLES`. It is not the important one.
+  A `FOR ALL TABLES` publication makes PostgreSQL **refuse `UPDATE` and
+  `DELETE` on every permanent ordinary table in the database that has no
+  usable replica identity** — not only the schemas selected, and not only
+  tables sluice reads. `INSERT` keeps working, so the breakage is PARTIAL and
+  surfaces as an error inside whatever application owns those tables, with
+  nothing connecting it to the sync that started minutes earlier.
+
+  Measured identical on PostgreSQL 16.15, 17.11, 18.6 and 19beta1. The at-risk
+  set is exactly `relkind='r' AND relpersistence='p'`: unlogged tables,
+  partitioned parents, views and materialized views are outside a
+  `FOR ALL TABLES` publication; leaf partitions are inside. Both remedies
+  verified — dropping the publication restores the writes, and so does
+  `REPLICA IDENTITY FULL` with it in place.
+
+  The phrase "correctness never depends on it" above is true and was read as
+  broader than it is. It is a statement about sluice's stream, not about the
+  source database's ability to accept writes, and the second reading is what
+  left this consequence unrecorded for the life of the ADR.
+
+  **Decision (operator, 2026-09-04): WARN, do not refuse.** These tables are
+  outside the scope the operator declared, so refusing would block a sync over
+  a schema they deliberately excluded; they cannot discover the exposure any
+  other way, and a warning demands nothing of them. Emitted under the
+  grep-stable marker `UNSELECTED-NAMESPACE-EXPOSURE` before the publication is
+  created, on every path that creates one.
+
+  **A publication that is MISSING is recreated at every stream open**, warm
+  resume included, and with no table scope supplied it is recreated
+  `FOR ALL TABLES` — so dropping a scoped publication and resuming silently
+  widens a single-schema stream to the whole database. The
+  `SLUICE-E-CDC-PUBLICATION-SCOPE-CONFLICT` guard does not catch this: it
+  guards a rescope that REMOVES tables, not a create-from-absent.
 
 ## Alternatives considered
 
