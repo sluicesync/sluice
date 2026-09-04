@@ -580,6 +580,27 @@ func (r *CDCReader) poll(ctx context.Context, lastSeen int64) (events []ir.Chang
 	}
 	newLast = lastSeen
 	for _, rc := range raws {
+		// The watermark is the page's maximum id, so a page that is not
+		// strictly ascending advances it past rows this poll never returned
+		// — and a keyset resume then starts ABOVE them. They are captured,
+		// undelivered, and unreachable: silent CDC loss at exit 0.
+		//
+		// That is not hypothetical. Bug 266 was exactly this, from an SQL
+		// alias that made the poll sort lexicographically, and it survived
+		// because nothing between the query and the watermark ever asked
+		// whether the page was ordered. The SQL is fixed and pinned, but
+		// the pin grades the QUERY; this grades what the pump was handed,
+		// so a future transport, a re-broken alias or a server-side change
+		// in ordering becomes a loud refusal instead of missing rows.
+		if rc.id <= newLast && newLast != lastSeen {
+			return nil, lastSeen, fmt.Errorf(
+				"sqlite-trigger: poll: change-log page is not in ascending id order (saw %d after %d) — "+
+					"the resume watermark is this page's maximum id, so an out-of-order page would advance it "+
+					"past rows that were never delivered and they could never be read again. Refusing rather "+
+					"than advancing; this is a bug in the poll query or the transport, not in your data",
+				rc.id, newLast,
+			)
+		}
 		if rc.id > newLast {
 			newLast = rc.id
 		}

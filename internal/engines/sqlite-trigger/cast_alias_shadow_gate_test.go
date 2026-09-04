@@ -22,11 +22,15 @@ import (
 //
 // SQLite resolves an ORDER BY term against the output aliases BEFORE the
 // source columns. So `ORDER BY id` on that projection sorts the TEXT:
-// 1, 10, 11, 12, 2, 3, 9. The change-log poll did exactly this. It was inert
-// until v0.141.0 added an adaptive page, and then a truncated page skipped
-// every id below the page's numeric maximum that sorted later — captured,
-// never delivered, never read again, with the stream alive and reporting
-// nothing. Measured: 50 of 53 rows reached the target.
+// 1, 10, 11, 12, 2, 3, 9. The change-log poll did exactly this, and any page
+// that truncates then skips every id below its numeric maximum that sorted
+// later — captured, never delivered, never read again, with the stream alive
+// and reporting nothing. Measured: 50 of 53 rows reached the target.
+//
+// It was NOT inert before v0.141.0, which the first version of this comment
+// claimed. The poll has been clamped to 1000 rows a page since v0.99.175, so
+// any backlog above one page has always truncated; v0.141.0's adaptive page
+// lowered the threshold and is how it was found.
 //
 // WHAT THIS GRADES, and the distinction is the whole point: the shadowing
 // alias is NOT itself a defect. `readConsumersSQL` shadows `applied_id` and
@@ -55,23 +59,34 @@ func TestNoSortedCastAliasShadow(t *testing.T) {
 	// qualified — and the poll is the reason the gate exists.
 	shadow := regexp.MustCompile(`(?i)CAST\([^)]*?\b([A-Za-z_][A-Za-z0-9_]*)\s+AS\s+\w+\s*\)\s+AS\s+([A-Za-z_][A-Za-z0-9_]*)`)
 
-	entries, err := os.ReadDir(".")
-	if err != nil {
-		t.Fatalf("read package dir: %v", err)
+	// EVERY engine package, not just this one. The first cut walked
+	// os.ReadDir(".") — so the package that had already been fixed was the
+	// only one gated, while internal/engines/sqlite and
+	// internal/engines/mysql write the same CAST-alias idiom and learned this
+	// lesson EARLIER. A gate named for a class that reaches one directory is
+	// the coverage-narrower-than-its-name shape, and it is the shape that let
+	// Bug 266 survive in the first place.
+	var files []string
+	if werr := filepath.Walk("..", func(path string, info os.FileInfo, werr error) error {
+		if werr != nil || info.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return werr
+		}
+		files = append(files, path)
+		return nil
+	}); werr != nil {
+		t.Fatalf("walk engine packages: %v", werr)
 	}
 
 	shadows, sortedShadows := 0, 0
+	pkgs := map[string]bool{}
 	var problems []string
 
-	for _, e := range entries {
-		name := e.Name()
-		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
-			continue
-		}
+	for _, name := range files {
 		body, rerr := os.ReadFile(name)
 		if rerr != nil {
 			t.Fatalf("read %s: %v", name, rerr)
 		}
+		pkgs[filepath.Dir(name)] = true
 		// Comment lines are blanked, not dropped, so indices still line up.
 		// Without this the gate reads the prose ABOUT the defect as the
 		// defect: the fix's own comment quotes the bad `ORDER BY id` to
@@ -127,6 +142,14 @@ func TestNoSortedCastAliasShadow(t *testing.T) {
 	// mode that makes a gate worse than none.
 	if shadows < 2 {
 		t.Fatalf("found only %d shadowing CAST alias(es); the pattern stopped matching and this gate is vacuous", shadows)
+	}
+	// The walk must actually reach the sibling packages. Without this the
+	// root could silently collapse back to this directory and every
+	// assertion would still pass, which is the narrowing this widening
+	// exists to prevent.
+	if len(pkgs) < 4 {
+		t.Fatalf("scanned only %d engine package(s) %v; the walk root collapsed and the siblings that write "+
+			"this same idiom are ungated again", len(pkgs), pkgs)
 	}
 
 	if len(problems) > 0 {

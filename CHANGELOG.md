@@ -6,11 +6,11 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [0.141.1] - 2026-09-04
 
-A `d1-trigger` stream could silently skip changes, and v0.141.0 is what made it reachable. **Upgrade if you run one.** Everything else here corrects something v0.141.0 said, including a remedy it printed that would leave a stream unable to resume.
+A `d1-trigger` stream could silently skip changes, on every version since v0.99.175. **Upgrade if you run one.** Everything else here corrects something v0.141.0 said, including a remedy it printed that would leave a stream unable to resume.
 
 ### Fixed
 
-**The `d1-trigger` change-log poll sorted lexicographically and skipped changes across a page boundary (Bug 266, CRITICAL).** The poll selects the change id cast to text under the column own name, and SQLite resolves `ORDER BY` against the output aliases first — so it ordered 1, 10, 11, 12, 2, 3, 9 rather than numerically. Inert while a page holds the whole backlog; v0.141.0 added an adaptive page that halves an oversized batch, and a truncated page turns it into loss, because the stream advances its position to the highest id received and every lower id that sorted later is captured, never delivered, never read again. Stream alive, no error, restart does not recover. Measured on live D1: a backlog drained with 50 of 53 rows on the target. Cloudflare D1 only — a local SQLite file selects the id directly. Before v0.141.0 the same input stalled loudly instead.
+**The `d1-trigger` change-log poll sorted lexicographically and skipped changes across a page boundary (Bug 266, CRITICAL).** The poll selects the change id cast to text under the column own name, and SQLite resolves `ORDER BY` against the output aliases first — so it ordered 1, 10, 11, 12, 2, 3, 9 rather than numerically. Inert while a page holds the whole backlog; v0.141.0 added an adaptive page that halves an oversized batch, and a truncated page turns it into loss, because the stream advances its position to the highest id received and every lower id that sorted later is captured, never delivered, never read again. Stream alive, no error, restart does not recover. Measured on live D1: a backlog drained with 50 of 53 rows on the target. Cloudflare D1 only — a local SQLite file selects the id directly. **Older than v0.141.0:** the D1 poll has been clamped to 1,000 rows a page since v0.99.175, so any backlog above one page truncated the same way on the ordinary catch-up path. Simulated against the real pump loop, a 1,100-row backlog delivers 1,000 and loses 100. v0.141.0's adaptive page lowered the threshold and is how it was found; it did not create the exposure.
 
 **The publication-exposure warning printed a remedy that wedges the stream (Bug 267).** It suggested dropping the publication to restore the writes it had named as broken. On a running stream that pins the slot restart position behind the DROP record and the stream can never resume, failing with `publication "sluice_pub" does not exist` while it demonstrably exists; recovery costs a slot drop and a full re-copy, and the publication that recreates is database-wide again. Both warnings now say not to, and name `sluice sync decommission` instead.
 
@@ -20,7 +20,7 @@ A `d1-trigger` stream could silently skip changes, and v0.141.0 is what made it 
 
 Drop-in from v0.141.0. No flag change, no format change, no new error codes.
 
-If you run a `d1-trigger` stream whose change log has ever exceeded one page, changes may be missing on the target and sluice cannot tell you which — the position advanced past them, so they are indistinguishable from delivered ones. Re-snapshot the affected tables to be certain.
+If you have run a `d1-trigger` stream on any version from v0.99.175 onward whose change log has ever exceeded one page, changes may be missing on the target and sluice cannot tell you which — the position advanced past them, so they are indistinguishable from delivered ones. Re-snapshot the affected tables to be certain.
 
 ## [0.141.0] - 2026-09-04
 

@@ -1015,8 +1015,23 @@ func (e *d1Executor) pollChangeLogRows(ctx context.Context, sinceID int64, batch
 		// below that max which sorted later is captured, never delivered, and
 		// never looked at again. Bug 266, found on live D1 by the v0.141.0
 		// regression cycle -- 50 of 53 rows reached the target with the stream
-		// alive and no error. WHERE is unaffected: SQLite does not resolve
-		// output aliases there, so `id > ?` compares the real column.
+		// alive and no error.
+		//
+		// NOT inert before v0.141.0, which the first write-up of this claimed.
+		// maxPollBatch has clamped this poll to 1000 rows since v0.99.175, so
+		// any backlog above one page truncated the same way on the ordinary
+		// catch-up path. The adaptive page lowered the threshold and is how it
+		// was found; it did not create the exposure.
+		//
+		// WHERE is safe here, and NOT for the reason first written down. This
+		// comment used to say SQLite does not resolve output aliases in WHERE.
+		// It does -- that is a documented SQLite extension -- but only as a
+		// FALLBACK when no table column matched the name. `id > ?` binds the
+		// real column precisely BECAUSE the alias shadows one. The distinction
+		// is load-bearing for whoever edits this next: renaming the alias to
+		// something non-shadowing (`AS id_text`) and then using that name in
+		// WHERE would silently compare as TEXT, which is the same defect
+		// wearing different clothes. Measured on SQLite 3.53.3.
 		q := `SELECT CAST("` + ChangeLogTable + `".id AS TEXT) AS id, op, tbl, before, after, captured_at FROM "` +
 			ChangeLogTable + `" WHERE id > ? ORDER BY "` + ChangeLogTable + `".id ASC LIMIT ` + strconv.Itoa(batch)
 		rows, err := e.conn.Query(ctx, q, strconv.FormatInt(sinceID, 10))
