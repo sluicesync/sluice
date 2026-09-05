@@ -88,6 +88,20 @@ type notesAmendment struct {
 
 var declaredNotesAmendments = []notesAmendment{
 	{
+		amended:     semver{0, 141, 2},
+		fixedIn:     semver{0, 141, 3},
+		claimMarker: "the stream also has to be stopped first, which `sluice sync decommission` already enforces",
+		why: "it enforces that only when the control row records a slot name. A stream started without " +
+			"--slot-name records an EMPTY one, and that case was the FIRST arm of a switch sitting ahead " +
+			"of the active-stream refusal -- so on the default configuration the command deleted a " +
+			"RUNNING stream's control row, dropped neither slot nor publication, reported the fresh row " +
+			"as \"a legacy row from an older sluice\" and exited 0, orphaning a slot that blocks the next " +
+			"cold start (Bug 271). Older than v0.141.2 and not a regression; what that release changed " +
+			"is that it advertises the command at three warning doors together with a claim about what " +
+			"it enforces -- the third time in this arc a printed remedy was graded from the code path it " +
+			"was written from rather than by running it",
+	},
+	{
 		amended:     semver{0, 141, 1},
 		fixedIn:     semver{0, 141, 2},
 		claimMarker: "Both warnings now say not to, and point at `sluice sync decommission` instead",

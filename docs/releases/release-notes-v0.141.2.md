@@ -1,5 +1,14 @@
 # sluice v0.141.2
 
+> **Correction (2026-09-05).** One sentence below is wrong, and it is wrong about a safety property. Fixed in **v0.141.3**.
+>
+> **"the stream also has to be stopped first, which `sluice sync decommission` already enforces."** It enforces that only when the control row records a slot name. A stream started **without `--slot-name`** — the default — records an *empty* one, and the empty case was handled by the first arm of a switch that sat ahead of the active-stream refusal. So on the default configuration the command did not refuse a running stream: it deleted that stream's control row underneath it, dropped neither the slot nor the publication, reported the fresh row as "a legacy row from an older sluice", printed `stream "…" decommissioned` and exited 0. The orphaned slot then blocks the next cold start with `replication slot "sluice_slot" already exists`.
+>
+> This behaviour is **older than v0.141.2** — v0.141.1 is identical, and it is not a regression. What this release did was advertise the command at three warning doors alongside a statement of what it enforces, which is what turned a latent gap into printed advice. **If you ran `sluice sync decommission` without `--slot-name` and it reported no slot dropped, check `sluice slot list` for a leftover.**
+>
+> v0.141.3 recovers the slot name from the position the stream itself recorded, so the refusal and the drop both reach the default configuration. It does not adopt the engine default as a guess — that caution was correct and is kept for rows where no name can be recovered.
+
+
 **Two Postgres warnings were telling operators things that were not true — one of them in the direction that hides harm.** Both were found by v0.141.1's own regression cycle, and both were claims v0.141.1's release notes repeated. No code path that moves data changed; if you do not run Postgres CDC or `backup full --chain-slot`, there is nothing here for you.
 
 ## Fixed

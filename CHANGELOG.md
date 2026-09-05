@@ -4,7 +4,27 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.141.3] - 2026-09-05
+
+`sluice sync decommission` did nothing on the default configuration and reported success. If you run Postgres CDC and decommissioned a stream started without `--slot-name`, check `sluice slot list` for a leftover slot.
+
+### Fixed
+
+**A default-configuration stream was reported as "a legacy row from an older sluice" (Bug 271).** A stream started without `--slot-name` records an EMPTY `slot_name`: the convention is that empty means the engine default, and the fallback was left to each consumer. `add-table` implements it (`activeSlotName`, whose doc names both cases the empty value covers); `decommission` collapsed both into "legacy" — dropping no slot, dropping no publication, clearing the control row, printing `stream "…" decommissioned` and exiting 0. The orphaned slot then blocks the next cold start with `replication slot "sluice_slot" already exists`, the exact failure the command's own doc says it prevents.
+
+**The same gap skipped the active-stream refusal.** The empty-name arm sat FIRST in the switch, ahead of the `slot.Active` check, so on the default configuration `decommission` completed against a RUNNING stream and deleted its control row underneath it. Resolving the name before the switch is what makes one fix close both halves; a mutation run reverting it returns `ControlRowCleared: true` against an active slot.
+
+**The caution against guessing is kept.** "Dropping the engine DEFAULT slot on a hunch could take out a different stream" is sound for a genuinely legacy row, which cannot know whether its stream used a custom slot, and an empty value alone cannot distinguish the two. So sluice does not adopt the default: a new optional capability `ir.SlotNameResolver` recovers the name the stream RECORDED in its own position token (a Postgres position is `{"slot":…,"lsn":…}` and its encoder refuses an empty slot, so any decodable position names it authoritatively). Where nothing is recoverable the skip stands, with a message that no longer asserts the row is legacy. `DecommissionReport` now carries `SlotNameSource` so an operator can see whether the name was recorded or recovered.
+
+Pre-existing — v0.141.1 and earlier behave identically, so this is not a regression. Found by the v0.141.2 regression cycle.
+
+### Compatibility
+
+Drop-in from v0.141.2. No flag change, no format change, no new error codes. Streams started WITH `--slot-name` were never affected. v0.141.2's notes carry a correction banner: they claimed the command "already enforces" that a stream be stopped first, which held only when a slot name was recorded.
+
 ## [0.141.2] - 2026-09-04
+
+**Correction (2026-09-05):** one sentence in this entry is wrong about a safety property, fixed in **v0.141.3**. "that the stream must be stopped first" describes an enforcement that only holds when the control row records a slot name; a stream started without `--slot-name` records an EMPTY one, and that case was handled by a switch arm sitting AHEAD of the active-stream refusal. So on the default configuration `sluice sync decommission` did not refuse a running stream — it deleted its control row, dropped neither slot nor publication, called the fresh row "a legacy row from an older sluice" and exited 0, leaving an orphaned slot that blocks the next cold start (Bug 271). Older than v0.141.2 and not a regression; what this release changed is that it advertises the command at three doors alongside a claim about what it enforces.
 
 Two Postgres warnings were telling operators things that were not true, one of them in the direction that hides harm. Both were found by v0.141.1's own regression cycle, and both were claims v0.141.1's notes repeated. No data-moving code path changed.
 

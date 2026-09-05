@@ -243,6 +243,10 @@ List slots on the source:
 sluice slot list --source-driver postgres --source 'postgres://...'
 ```
 
+**Retiring a finished stream is usually not a slot drop.** `sluice sync decommission --stream-id <id> --yes` removes the stream's slot, its own publication and its control row together, refuses while the stream is still running, and works for a stream started without `--slot-name` (it recovers the slot name from the position the stream recorded). Dropping the slot by hand leaves the control row behind, so `sync status` keeps listing a stream that can no longer resume.
+
+Reach for `slot drop` when there is no stream to decommission: an abandoned slot from a run that never completed, a slot sluice did not create, or a control row whose position cannot be decoded — the case `decommission` deliberately refuses to guess at.
+
 Drop a slot (prompts for confirmation; pass `--yes` to skip):
 
 ```bash

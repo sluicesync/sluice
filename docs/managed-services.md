@@ -832,7 +832,7 @@ Untested. It is an authenticating TCP tunnel, not a transaction pooler, so CDC m
 
 ### Decommissioning
 
-A cleanly stopped sluice stream leaves its (resumable) replication slot in place; when done for good, `sluice slot drop --yes <slot>` — an abandoned slot retains WAL and will eventually fill the instance disk.
+A cleanly stopped sluice stream leaves its (resumable) replication slot in place; when done for good, `sluice sync decommission --stream-id <id> --yes` retires the slot, the stream OWN publication and the control row in one step (it recovers the slot name even for a stream started without `--slot-name`, and refuses while the stream is still running). `sluice slot drop --yes <slot>` remains the fallback for an abandoned or non-sluice slot, and leaves the control row behind — an abandoned slot retains WAL and will eventually fill the instance disk.
 
 ## Azure Database for MySQL (Flexible Server)
 
@@ -888,7 +888,7 @@ The built-in PgBouncer requires General Purpose or higher (port 6432 on the same
 
 ### Decommissioning
 
-A cleanly stopped sluice stream leaves its (resumable) replication slot in place; when done for good, `sluice slot drop --yes <slot>` — an abandoned slot retains WAL and will eventually fill the instance disk.
+A cleanly stopped sluice stream leaves its (resumable) replication slot in place; when done for good, `sluice sync decommission --stream-id <id> --yes` retires the slot, the stream OWN publication and the control row in one step (it recovers the slot name even for a stream started without `--slot-name`, and refuses while the stream is still running). `sluice slot drop --yes <slot>` remains the fallback for an abandoned or non-sluice slot, and leaves the control row behind — an abandoned slot retains WAL and will eventually fill the instance disk.
 
 ## Vultr Managed Databases for MySQL
 
@@ -930,7 +930,7 @@ Vultr's managed pgbouncer pools listen on the **primary hostname at port + 1** w
 
 ### Decommissioning
 
-A cleanly stopped sluice stream leaves its (resumable) replication slot in place; when done for good, `sluice slot drop --yes <slot>` — an abandoned slot retains WAL against the instance disk. (`pghoard_local` stays; see above.)
+A cleanly stopped sluice stream leaves its (resumable) replication slot in place; when done for good, `sluice sync decommission --stream-id <id> --yes` retires the slot, the stream OWN publication and the control row in one step (it recovers the slot name even for a stream started without `--slot-name`, and refuses while the stream is still running). `sluice slot drop --yes <slot>` remains the fallback for an abandoned or non-sluice slot, and leaves the control row behind — an abandoned slot retains WAL against the instance disk. (`pghoard_local` stays; see above.)
 
 ## Other managed services
 

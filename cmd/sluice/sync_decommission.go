@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/pipeline"
@@ -119,11 +120,26 @@ func renderDecommissionReport(w io.Writer, rep *pipeline.DecommissionReport) {
 		}
 		return past
 	}
+	// Provenance is rendered ONLY when the name was recovered rather than read
+	// off the control row. The recorded case is the unremarkable one and saying
+	// so on every run would be noise; the recovered case is the one an operator
+	// should be able to audit, because sluice picked the slot from the position
+	// token rather than from the column they can see in `sync status` (Bug 271).
+	//
+	// This exists because the field was added, its own doc said it was
+	// "surfaced so an operator can see WHICH slot this command decided to act
+	// on", the CHANGELOG repeated that -- and nothing rendered it. Caught by
+	// the pre-tag docs-drift pass as a checkable false claim, which is the
+	// same class as the three wrong sentences this release arc is about.
+	provenance := ""
+	if rep.SlotNameSource != "" && strings.Contains(rep.SlotNameSource, "recovered") {
+		provenance = " (name " + rep.SlotNameSource + ")"
+	}
 	switch {
 	case rep.SlotDropped:
-		fmt.Fprintf(w, "source: %s replication slot %q\n", did("drop", "dropped"), rep.SlotName)
+		fmt.Fprintf(w, "source: %s replication slot %q%s\n", did("drop", "dropped"), rep.SlotName, provenance)
 	case rep.SlotAlreadyAbsent:
-		fmt.Fprintf(w, "source: replication slot %q already absent\n", rep.SlotName)
+		fmt.Fprintf(w, "source: replication slot %q already absent%s\n", rep.SlotName, provenance)
 	default:
 		fmt.Fprintf(w, "source: no replication slot removed — %s\n", rep.SlotSkipped)
 	}

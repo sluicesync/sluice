@@ -171,3 +171,58 @@ func TestRenderDecommissionReport(t *testing.T) {
 		}
 	})
 }
+
+// TestRenderDecommissionReport_ShowsRecoveredSlotProvenance pins that a
+// recovered slot name says so in the output.
+//
+// WHY: SlotNameSource was added with Bug 271's fix, its own field comment said
+// it was "surfaced so an operator can see WHICH slot this command decided to
+// act on", and the CHANGELOG repeated that -- while renderDecommissionReport
+// never read it and the command has no --format json. Nothing an operator
+// could run exposed it. Caught by the pre-tag docs-drift pass as a checkable
+// false claim, which is the same class as the wrong sentences this release arc
+// is about: a statement graded from the code path it was written from rather
+// than by running it.
+//
+// The recorded case deliberately prints NO provenance -- it is the
+// unremarkable one, and annotating every run would be noise. Only the
+// recovered case is worth auditing, because there sluice chose the slot from
+// the position token rather than from the column an operator can see.
+func TestRenderDecommissionReport_ShowsRecoveredSlotProvenance(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		source     string
+		wantInLine bool
+	}{
+		{
+			name:       "a recovered name is annotated",
+			source:     "recovered from the position this stream recorded (the control row's slot_name is empty, which is what a stream started without --slot-name writes)",
+			wantInLine: true,
+		},
+		{
+			name:   "a recorded name is not",
+			source: "recorded on the control row",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			renderDecommissionReport(&buf, &pipeline.DecommissionReport{
+				StreamID:       "wave-a",
+				SlotName:       "sluice_slot",
+				SlotNameSource: tc.source,
+				SlotDropped:    true,
+			})
+			got := buf.String()
+			if !strings.Contains(got, `dropped replication slot "sluice_slot"`) {
+				t.Fatalf("slot line missing entirely:\n%s", got)
+			}
+			hasProvenance := strings.Contains(got, "recovered from the position")
+			if hasProvenance != tc.wantInLine {
+				t.Errorf("provenance rendered = %v, want %v.\n\nOutput:\n%s\n\n"+
+					"A recovered name must be auditable: sluice picked that slot from the position "+
+					"token, not from the slot_name column the operator can see in `sync status`.",
+					hasProvenance, tc.wantInLine, got)
+			}
+		})
+	}
+}
