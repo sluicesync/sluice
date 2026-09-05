@@ -76,7 +76,13 @@ import (
 //	100ms → 200ms → 400ms → 800ms → 1.6s → 3.2s → 6.4s → 12.8s →
 //	25.6s → 30s (cap) → 30s → 30s → ...
 //
-// 12 attempts × max(30s) ≈ up to ~4 min of failure tolerated before a LOUD
+// SUPERSEDED ARITHMETIC, kept visible because the paragraph below it already
+// carries the correction and the two disagreed for releases. The operational
+// bound is the ~30-MINUTE WALL CLOCK in the var block below, not an attempt
+// count; attempts became a runaway backstop (100000) in v0.99.103. And the
+// original figure was wrong on its own terms: 12 attempts is 11 sleeps summing
+// to ~1.85 min, not ~4 min -- the same multiply-the-cap-by-attempts slip
+// ADR-0038 carried until v0.141.4. What is tolerated before a LOUD
 // terminal error — long enough to ride a storage-grow / failover, short
 // enough that a genuinely-down source surfaces rather than hiding for
 // hours.

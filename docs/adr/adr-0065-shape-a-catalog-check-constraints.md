@@ -141,9 +141,14 @@ constraint.
 
 - **NOT VALID / not-yet-validated CHECKs (PG-only)**. PG supports
   `ALTER TABLE … ADD CONSTRAINT … CHECK (…) NOT VALID` for adding
-  constraints without scanning existing rows. The v1 IR carries no
-  `NotValid` field on `ir.CheckConstraint`; v1 always emits the
-  validating form. Operators who need NOT VALID for large-table
+  constraints without scanning existing rows. **Partly landed in
+  v0.141.4:** `ir.CheckConstraint` now HAS a `NotValid bool` and the
+  Postgres reader populates it from `pg_constraint.convalidated`, so
+  the state is no longer lost on read. The apply path still emits the
+  validating form, now with a loud WARN naming the constraint —
+  Postgres rejects `NOT VALID` inline in `CREATE TABLE`, and sluice
+  emits one statement per DDL, so carrying it needs a separate ALTER
+  pass (filed as UPR-1b). Operators who need NOT VALID for large-table
   rollouts use the drained model (or `--no-coordinate-live-ddl`) and
   apply the NOT VALID variant manually. A future iteration could
   extend `ir.CheckConstraint` with a `NotValid bool` and surface

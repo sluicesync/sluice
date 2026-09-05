@@ -87,13 +87,12 @@ package init, not config fields):
 
 | Bound | Value |
 |---|---|
-| attempts | 12 |
+| attempts | 100000 (runaway backstop since v0.99.103; NOT the operational bound) |
 | base backoff | 100ms |
 | per-attempt cap | 30s |
 
 Exponential doubling from base, capped: `100ms → 200ms → … → 25.6s → 30s
-→ 30s → …`. 12 × max(30s) ≈ up to ~4 min tolerated before a **LOUD
-terminal error** — long enough to ride a 30–60s (up to ~2–3 min)
+→ 30s → …`. **The operational bound is a ~30-MINUTE WALL CLOCK** (`coldCopyReparentMaxWallVar`, v0.99.103), not an attempt count -- see the amendment at the end of this ADR. The original figure here was also wrong on its own terms: 12 attempts is 11 sleeps summing to ~1.85 min, not ~4 min, the same multiply-cap-by-attempts slip ADR-0038 carried until v0.141.4. What is tolerated before a **LOUD terminal error** — long enough to ride a 30–60s (up to ~2–3 min)
 reparent / storage-grow, short enough that a genuinely-wedged target
 surfaces rather than hiding for hours. Stretched slightly past ADR-0038's
 8×30s because a storage-auto-grow reparent can run longer than a
@@ -252,8 +251,10 @@ siblings. The loud-on-genuine-error abort is unchanged.
 
 - A storage-auto-grow / planned-reparent during a large MySQL cold-copy
   is ridden out in-process instead of crash-looping the supervisor.
-- The recovery is bounded and observable (≤ ~4 min, WARN per retry, loud
-  terminal on exhaustion).
+- The recovery is bounded and observable (a ~30-minute wall clock since
+  v0.99.103 — NOT the "≤ ~4 min" this line claimed, which was both
+  superseded and wrong arithmetic; WARN per retry, loud terminal on
+  exhaustion).
 - The plain-path 1062 wart is the one subtlety. It is safe for a table
   that HAS a key (atomic single-statement batch + sole writer onto a
   fresh target) and scoped to retry-after-classified-transient only —

@@ -47,7 +47,9 @@ with these four pin-downs, owner-accepted:
    resolved first (contrast the ADR-0049→0050 hard-sequencing); the
    suspected gap is fenced in the non-retriable classification.
 3. **Defaults blessed as-written:** 8 attempts, 100ms base → 30s cap
-   (~4 min worst case). Accepted as the right default for the managed
+   (12.7s of deliberate backoff — the cap never binds at 8 attempts;
+   see the corrected arithmetic below). Accepted as the right default
+   for the managed
    Vitess / managed-PG envelope; operators override via
    `--apply-retry-attempts` (1–64) when a slow Patroni failover under
    throttler load needs a longer envelope. No change to the table.

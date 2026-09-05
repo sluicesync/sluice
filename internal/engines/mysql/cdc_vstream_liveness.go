@@ -578,7 +578,12 @@ func vstreamLivenessTimeoutError(window time.Duration, tabletType topodata.Table
 // genuinely idle-but-healthy source (no idle heartbeats over the public
 // vstream endpoint) processes zero events per reconnect, never advances the
 // position, and would otherwise be GUARANTEED to exhaust the budget in
-// ~ApplyRetryAttempts cycles (~6 min). The Phase-1 constructor
+// ~ApplyRetryAttempts cycles (~6 min: 8 cycles x the 45s
+// defaultVStreamProgressWindow = 6m, plus ADR-0038 backoff of 12.7s at
+// shipped defaults). The derivation is spelled out because a v0.141.4 docs
+// pass could not tell whether this figure had inherited ADR-0038 own wrong
+// four-minute envelope; it had not -- the dominant term is the liveness
+// window, not the backoff. The Phase-1 constructor
 // ([vstreamLivenessTimeoutError]) deliberately does NOT set this flag: a
 // stream that never established must still fail loudly after the budget.
 func vstreamProgressTimeoutError(window time.Duration, tabletType topodata.TabletType, keyspace string, shards []string) error {
