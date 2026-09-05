@@ -137,7 +137,19 @@ The `FOR ALL TABLES` requirement is a hard one: on stock PostgreSQL no grant sub
 
 Missing any of these surfaces as `SLUICE-E-CDC-PUBLICATION-PERMISSION`, which carries the server's own message saying which of the three bit. sluice reports what the server answered rather than predicting it from the catalog — a catalog-based prediction was measured live-wrong on RDS for a different check, so the failure is classified rather than forecast.
 
-**Managed providers: unverified.** Whether the admin role a given provider hands you (RDS `rds_superuser`, Cloud SQL `cloudsqlsuperuser`, Azure `azure_pg_admin`) satisfies the `FOR ALL TABLES` case has **not** been measured by this project, and those roles are deliberately not true superusers. Treat the table above as the stock-PostgreSQL contract and test the multi-schema path on your provider before relying on it.
+**Managed providers: measured, and the answer is yes.** AWS RDS and Azure Database for PostgreSQL Flexible Server both **patch** the superuser check — `CREATE PUBLICATION … FOR ALL TABLES` succeeds for their admin role even though `pg_roles.rolsuper` is `false`:
+
+| Provider | Admin role | `rolsuper` | Member of | `FOR ALL TABLES` |
+| --- | --- | --- | --- | --- |
+| AWS RDS (PG 18.3) | `sluiceadmin` | `f` | `rds_superuser` | **succeeds** |
+| Azure Flexible Server (PG 16.15) | `sluiceadmin` | `f` | `azure_pg_admin` | **succeeds** |
+| Stock PostgreSQL (18.6, control) | any non-superuser | `f` | — | refused, `42501` |
+
+Measured 2026-09-05 against live instances, each torn down afterwards. The stock control was run at PG **18.6** specifically to rule out the rule having been relaxed upstream — it has not — and Azure is the apples-to-apples case, succeeding on PG 16.15, the same major version where stock PostgreSQL refuses.
+
+So on RDS and Azure the multi-schema and `--chain-slot` paths work with the ordinary admin role. Google Cloud SQL was not measured; treat it as unknown until it is.
+
+The practical lesson is about *probing*, not privileges: `rolsuper` is `false` on both providers and the operation works anyway, so any check that predicted capability from that column would refuse a configuration that demonstrably works. sluice therefore does not predict — it attempts the statement and classifies the server's answer.
 
 ## Every in-scope table needs a usable replica identity
 
