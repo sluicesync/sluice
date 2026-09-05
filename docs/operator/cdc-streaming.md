@@ -77,14 +77,29 @@ batch:
   (default `100ms`), doubling each attempt, capped at
   `--apply-retry-backoff-cap` (default `30s`). With defaults the
   per-attempt sequence is `100ms → 200ms → 400ms → 800ms → 1.6s →
-  3.2s → 6.4s → 12.8s`.
+  3.2s → 6.4s` — seven sleeps, not eight: the final failure exhausts
+  the budget and returns without waiting, so the 12.8s term this list
+  used to end with was never reached.
 - **Bounded attempts.** After `--apply-retry-attempts` (default `8`)
   *consecutive* failures of the same un-progressed position, the
   stream exits with a terminal `apply retry budget exhausted` error
-  that preserves the most recent transient. Eight attempts with the
-  default schedule is roughly four minutes of total wait — long
-  enough to ride out a vtgate restart or a Patroni failover, short
-  enough that a genuinely stuck batch does not hide for hours.
+  that preserves the most recent transient. Eight attempts at the
+  default schedule is **12.7 seconds** of deliberate backoff
+  (100ms → 200ms → 400ms → 800ms → 1.6s → 3.2s → 6.4s; the eighth
+  failure exhausts the budget without sleeping). The observed wall
+  clock is longer and varies by failure shape — a half-open target
+  can burn up to `--apply-exec-timeout` (60s by default) per attempt
+  before the error even arrives — but the *deliberate* wait is those
+  12.7 seconds.
+
+  That is short. It absorbs a tx-killer or a momentary blip; it does
+  **not** ride out a Patroni failover or a vtgate restart, which take
+  longer than the whole budget. If you need that, widen it — see
+  `--apply-retry-attempts` below. Until v0.141.4 this paragraph, the
+  ADR and the CLI help all claimed "roughly four minutes", arrived at
+  by multiplying the 30s cap by the attempt count; the schedule
+  exponentiates from 100ms and never reaches that cap at eight
+  attempts.
 - **Counter resets on progress.** If the persisted CDC position
   advanced between attempts (a partial batch committed before the
   failure), the consecutive-failure counter resets to 1. A stream
@@ -138,8 +153,11 @@ from the docs is always the one the policy actually uses.
 Operators on bare-metal MySQL with an unbounded transaction lifetime,
 or anyone who wants the strict fail-fast behaviour, can opt out with
 `--apply-retry-attempts=1`. Operators expecting a slow Patroni
-failover under throttler load can widen the envelope, e.g.
-`--apply-retry-attempts=20`.
+failover under throttler load should widen the envelope — and at the
+default of 8 they need to, because 12.7 seconds does not cover a
+failover. `--apply-retry-attempts=20` gives 5m51s of deliberate backoff
+(measured, not derived), because attempts 10 onward do reach the 30s
+cap and each contributes a full 30 seconds.
 
 ## Tables the target lacks: skip-and-count, never halt
 

@@ -276,32 +276,76 @@ func TestComputeRetryBackoff(t *testing.T) {
 	}
 }
 
-// TestComputeRetryBackoff_AttemptsBudget walks the full
-// default-attempt schedule (8) and confirms the total wait the
-// operator is committing to with default flags. Useful as a regression
-// guard if the schedule's defaults are ever bumped — the
-// commit log + the docs both promise "~4 minutes worst case" and
-// this assertion pins that promise.
+// TestComputeRetryBackoff_AttemptsBudget pins the deliberate backoff an
+// operator commits to at the shipped defaults.
+//
+// THIS TEST USED TO BE THE DEFECT (upstream review UPR-3). It summed
+// `i := 1; i <= attempts` — eight terms — but only SEVEN sleeps occur: the
+// loop sleeps after each failure that is going to be retried, and the eighth
+// failure exhausts the budget and returns. So it measured a schedule the code
+// never runs, and asserted 25.5s where the truth is 12.7s.
+//
+// Worse, it then asserted `total > 4*time.Minute` and named that the
+// "ADR-0038 promise". 25.5s is two orders of magnitude under four minutes, so
+// that branch could never fire — the gate cited the promise it existed to
+// protect while being structurally incapable of grading it. CLAUDE.md calls
+// this "a gate can defend the defect", and the ADR it was guarding said
+// "Eight × max(30s) ≈ 4 minutes — enough to ride out vtgate restarts and
+// Patroni failovers" for four months. The backoff exponentiates from 100ms and
+// never reaches the 30s cap at eight attempts, so the cap never multiplies
+// anything.
+//
+// What this pins now is the SEQUENCE and its sum, both of which are what the
+// CLI help and the operator docs quote. An exact equality, so a defaults
+// change fails here and forces the four claim homes to be updated with it.
 func TestComputeRetryBackoff_AttemptsBudget(t *testing.T) {
 	const (
 		base       = 100 * time.Millisecond
 		maxBackoff = 30 * time.Second
 		attempts   = 8
 	)
+
+	// Sleeps happen for consecutive = 1 .. attempts-1. The attempts-th
+	// failure exhausts the budget and returns without sleeping.
 	var total time.Duration
-	for i := 1; i <= attempts; i++ {
-		total += computeRetryBackoff(i, base, maxBackoff, 0)
+	var seq []time.Duration
+	for i := 1; i < attempts; i++ {
+		d := computeRetryBackoff(i, base, maxBackoff, 0)
+		seq = append(seq, d)
+		total += d
 	}
-	// Schedule: 100ms + 200ms + 400ms + 800ms + 1.6s + 3.2s + 6.4s + 12.8s
-	want := 25500 * time.Millisecond
+
+	wantSeq := []time.Duration{
+		100 * time.Millisecond, 200 * time.Millisecond, 400 * time.Millisecond,
+		800 * time.Millisecond, 1600 * time.Millisecond, 3200 * time.Millisecond,
+		6400 * time.Millisecond,
+	}
+	if len(seq) != len(wantSeq) {
+		t.Fatalf("slept %d times at %d attempts; want %d — one sleep per retried failure, none after the last",
+			len(seq), attempts, len(wantSeq))
+	}
+	for i := range wantSeq {
+		if seq[i] != wantSeq[i] {
+			t.Errorf("sleep %d = %v; want %v.\n\nThe CLI help and docs/operator/cdc-streaming.md quote this "+
+				"sequence verbatim; changing it means changing them.", i+1, seq[i], wantSeq[i])
+		}
+	}
+
+	const want = 12700 * time.Millisecond
 	if total != want {
-		t.Errorf("8-attempt default budget = %v; want %v (ADR-0038 promise: < 4 min)", total, want)
+		t.Errorf("default deliberate backoff = %v; want %v.\n\nFour homes quote this number: "+
+			"adr-0038 (twice), docs/operator/cdc-streaming.md, and the --apply-retry-backoff-cap help. "+
+			"They were all wrong by a factor of ~19 until UPR-3; keep them and this equality together.",
+			total, want)
 	}
-	// Pin the "well under 4 minutes" property — the ADR's stated
-	// upper bound. If a future change makes the worst-case longer,
-	// the ADR needs updating too.
-	if total > 4*time.Minute {
-		t.Errorf("8-attempt budget exceeds 4-minute promise from ADR-0038: %v", total)
+
+	// The 30s cap does not bind at the default attempt count, and saying so
+	// is the point: the old ADR text multiplied the CAP by the attempts to
+	// reach "≈ 4 minutes", which is where the wrong number came from.
+	if capped := computeRetryBackoff(attempts-1, base, maxBackoff, 0); capped >= maxBackoff {
+		t.Errorf("the last slept backoff (%v) reached the %v cap; the documented arithmetic assumes it does "+
+			"NOT, so the cap-times-attempts reading would become right and the docs need revisiting",
+			capped, maxBackoff)
 	}
 }
 
