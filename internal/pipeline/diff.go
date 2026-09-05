@@ -871,8 +871,29 @@ func renderDiffText(w io.Writer, b diffBundle) error {
 				quote(td.Name), quote(name))
 		}
 		for _, ck := range td.ChecksMismatched {
+			// UPR-1c: a check can diverge on VALIDITY with an identical
+			// expression, in which case both Expr fields are empty. The
+			// generic line below would then print `target has ""; expected ""`
+			// and suggest `CHECK ()` as the remedy — worse than saying
+			// nothing — so the validity-only case is rendered on its own.
+			if ck.ValidityMismatched && ck.ExpectedExpr == "" && ck.ActualExpr == "" {
+				fmt.Fprintf(&sb, "--   CHECK %s validated: source %v   target %v\n",
+					quote(ck.Name), !ck.ExpectedNotValid, !ck.ActualNotValid)
+				if ck.ExpectedNotValid && !ck.ActualNotValid {
+					fmt.Fprintln(&sb, "--   ^ the source leaves this constraint UNVALIDATED and the "+
+						"target enforces it, so the target REJECTS ROWS THE SOURCE HOLDS TODAY")
+				} else {
+					fmt.Fprintln(&sb, "--   ^ the target carries this constraint as NOT VALID, so rows "+
+						"already on the target were NEVER CHECKED against it")
+				}
+				continue
+			}
 			fmt.Fprintf(&sb, "-- CHECK %s mismatched: target has %q; expected %q\n",
 				quote(ck.Name), ck.ActualExpr, ck.ExpectedExpr)
+			if ck.ValidityMismatched {
+				fmt.Fprintf(&sb, "--   and validated: source %v   target %v\n",
+					!ck.ExpectedNotValid, !ck.ActualNotValid)
+			}
 			fmt.Fprintf(&sb, "ALTER TABLE %s DROP CONSTRAINT %s;\n", quote(td.Name), quote(ck.Name))
 			fmt.Fprintf(&sb, "ALTER TABLE %s ADD CONSTRAINT %s CHECK (%s);\n",
 				quote(td.Name), quote(ck.Name), ck.ExpectedExpr)

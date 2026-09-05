@@ -34,9 +34,14 @@ package diff
 // entry attribute reaches the render, which is this gate's own defect
 // one more level down (the per-column prefix Length was the S8 class).
 // It does NOT walk [ir.CheckConstraint], [ir.ExcludeConstraint] or
-// [ir.View] (small structs whose compared fields are the name plus one
-// verbatim body; their uncompared fields are dialect/provenance tags of
-// the same kinds exempted below), and it does not walk the [ir.Type]
+// [ir.View]. That exemption used to say their uncompared fields are
+// dialect/provenance tags; UPR-1c made that FALSE for CheckConstraint,
+// which now carries NotValid -- a constraint-STRENGTH axis, not a
+// provenance tag. NotValid is compared (diffChecks) and rendered
+// (renderCheckSection) and pinned by the UPR-1c tests, so the surface is
+// covered; what is not covered is the roster WALKING the struct, so a
+// FUTURE field on it would slip. Named residual, not covered surface --
+// and the reason is now the honest one. It also does not walk the [ir.Type]
 // implementations (the type-family universe, which has its own
 // family-matrix pins). Those are named residuals, not covered surface.
 //

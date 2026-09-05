@@ -380,6 +380,21 @@ type CheckDiff struct {
 	Name         string `json:"name"`
 	ExpectedExpr string `json:"expected_expr,omitempty"`
 	ActualExpr   string `json:"actual_expr,omitempty"`
+
+	// ValidityMismatched flags a NOT VALID divergence, with the Expected /
+	// Actual pair naming which side is unvalidated. Same shape and same reason
+	// as [ForeignKeyDiff.ValidityMismatched]: both values are bools, so a
+	// populated-field test could not tell "false" from "not compared".
+	//
+	// UPR-1c. Without this the drift lane compared CHECK constraints on Name
+	// and Expr alone, so after a migrate that WARNED it was recreating a
+	// source NOT VALID constraint as validating, `sluice diff` reported the
+	// schemas as MATCHING. The warning is a one-shot log line; the diff is the
+	// independent evidence surface an operator uses to confirm it — and the
+	// two disagreed, which is the no-independent-expected-value shape.
+	ValidityMismatched bool `json:"validity_mismatched,omitempty"`
+	ExpectedNotValid   bool `json:"expected_not_valid,omitempty"`
+	ActualNotValid     bool `json:"actual_not_valid,omitempty"`
 }
 
 // IndexDiff captures one index's expected-vs-actual mismatch, for an index
@@ -796,7 +811,20 @@ func diffChecks(td *TableDiff, expected, actual *ir.Table, opts Options) {
 				expExpr = strings.TrimSpace(translated)
 			}
 		}
+		// UPR-1c: an identical expression can still be a DIFFERENT constraint.
+		// Validity is graded before the expression compare returns, so a pair
+		// that matches textually but differs in enforcement is still reported.
+		validity := exp.NotValid != act.NotValid
+		if expExpr == actExpr && !validity {
+			continue
+		}
 		if expExpr == actExpr {
+			td.ChecksMismatched = append(td.ChecksMismatched, CheckDiff{
+				Name:               name,
+				ValidityMismatched: true,
+				ExpectedNotValid:   exp.NotValid,
+				ActualNotValid:     act.NotValid,
+			})
 			continue
 		}
 		// Bug 241: a name-matched pair whose raw texts differ may still be
@@ -811,9 +839,12 @@ func diffChecks(td *TableDiff, expected, actual *ir.Table, opts Options) {
 			continue
 		}
 		td.ChecksMismatched = append(td.ChecksMismatched, CheckDiff{
-			Name:         name,
-			ExpectedExpr: expExpr,
-			ActualExpr:   actExpr,
+			Name:               name,
+			ExpectedExpr:       expExpr,
+			ActualExpr:         actExpr,
+			ValidityMismatched: validity,
+			ExpectedNotValid:   exp.NotValid,
+			ActualNotValid:     act.NotValid,
 		})
 	}
 }
