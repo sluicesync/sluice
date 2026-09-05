@@ -736,6 +736,46 @@ func isSchemaSnapshot(c ir.Change) bool {
 // point (no later change carries that same position). Recording happens
 // when the position CHANGES, so the highest seq of each position run is the
 // boundary — exactly the safe point.
+// TOKEN MONOTONICITY IS NOT CHECKED HERE, AND THAT IS A DECISION (2026-09-04).
+// [Orchestrator.writeCheckpoint]'s guard is `seq <= lastWrittenSeq` — monotone
+// in the orchestrator's own arrival counter, NOT in the position token. A
+// reader that delivers changes out of order therefore advances seq while the
+// TOKEN goes backwards, and the orchestrator persists the lower one. Bug 268
+// is exactly that: the d1-trigger poll sorted lexicographically, the last
+// change delivered carried `{"last_id":9}` after ids up to 42 had been
+// applied, and that 9 is what landed in the control row.
+//
+// Why there is no assertion here, having costed it:
+//
+//   - A generic non-decreasing-token check needs ordering semantics for an
+//     opaque string. The capability exists ([ir.PositionOrderer]) but the
+//     engines that REACH this function do not implement it: sqlite-trigger
+//     (and d1-trigger) and pgtrigger are marker-less and have no orderer,
+//     while postgres and binlog-MySQL have one and take the marker path,
+//     where noteBoundary is never called. Only VStream is both. A gate built
+//     on the orderer would therefore miss the two engines that produced the
+//     defect while reading as though it covered the marker-less path — the
+//     coverage-narrower-than-its-name shape.
+//   - The orderer is also SOURCE-side, and this orchestrator is constructed
+//     inside the TARGET engine's applier, which holds no source-engine
+//     handle. Plumbing one through is a cross-cutting change, not a guard.
+//   - The cheap version that needs no ordering — refuse a token already
+//     recorded — would NOT have caught Bug 268, whose 42 tokens were all
+//     distinct and each seen once. A gate that misses its own motivating
+//     defect is worse than none.
+//
+// So the check lives in the READER, which is the only component that knows
+// its token semantics: sqlite-trigger's `CHANGE-LOG-PAGE-UNORDERED` refuses a
+// non-ascending page before the pump can advance past it. Sibling checked at
+// the same time and clean: pgtrigger's poll selects `id` unaliased in both the
+// CTE and the outer query (`cdc_reader.go` pollQuery), so nothing shadows the
+// bigint, and its watermark is the end of the contiguous committed run rather
+// than the max id fetched — a strictly stronger contract than the one Bug 268
+// broke.
+//
+// What would change this: an engine that reaches noteBoundary AND implements
+// [ir.PositionOrderer] on the source side. Then the assertion is worth adding,
+// and it would have real coverage.
 func (o *Orchestrator) noteBoundary(seq uint64, pos ir.Position) {
 	if o.prevSeq != 0 && pos.Token != o.prevPos.Token && o.prevSeq > o.lastNotedSeq {
 		o.frontier.RecordTxBoundary(o.prevSeq, o.prevPos)
