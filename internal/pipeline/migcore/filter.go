@@ -41,6 +41,8 @@ import (
 	"fmt"
 	"log/slog"
 	"path"
+	"strconv"
+	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -102,6 +104,67 @@ func (f TableFilter) IsEmpty() bool {
 // treated as "no match" (a defensive choice — NewTableFilter rejects
 // invalid patterns up front, so this branch is only reachable if a
 // caller bypasses the constructor).
+// bareName returns the last dot-separated segment of a pattern -- the form a
+// table filter actually matches. Used only to render the remedy for an
+// unmatched schema-qualified pattern; it never changes what matches.
+func bareName(pattern string) string {
+	if i := strings.LastIndex(pattern, "."); i >= 0 && i+1 < len(pattern) {
+		return pattern[i+1:]
+	}
+	return pattern
+}
+
+// UnmatchedPatterns returns the operator-supplied patterns that matched NONE
+// of the given table names, in the order supplied.
+//
+// WHY (Bug 272). A filter pattern that matches nothing is silent, and for
+// --exclude-table it FAILS OPEN: the operator believes a table is excluded, it
+// is not, and its rows are copied at exit 0 with no warning. The regression
+// cycle found it with --exclude-table=public.pii, which copied the PII table
+// and every row.
+//
+// The dominant cause is schema qualification: these patterns match the BARE
+// table name, while sluice own diagnostics print names qualified
+// ("- public.nopk_t: no-primary-key"), so the qualified form is exactly what
+// an operator copies back into a flag. A typo or a dead glob produces the same
+// silence.
+//
+// Deliberately NOT fixed by accepting the qualified form. These patterns are
+// matched without schema context, so stripping a qualifier would make
+// "other_schema.pii" also match "public.pii" -- over-excluding on the exclude
+// path and, worse, over-INCLUDING on the include path. Reporting the mismatch
+// is strictly safe; changing what matches is not.
+//
+// Engine-supplied default exclusions are not the caller supplied patterns and
+// are never reported here -- see EffectiveTableFilter.
+func (f TableFilter) UnmatchedPatterns(tableNames []string) []string {
+	patterns := f.Include
+	if len(patterns) == 0 {
+		patterns = f.Exclude
+	}
+	var unmatched []string
+	for _, p := range patterns {
+		var hit bool
+		for _, n := range tableNames {
+			if ok, err := path.Match(p, n); err == nil && ok {
+				hit = true
+				break
+			}
+		}
+		if !hit {
+			unmatched = append(unmatched, p)
+		}
+	}
+	return unmatched
+}
+
+// LooksSchemaQualified reports whether a pattern carries a dot, which for an
+// unmatched pattern is very likely the reason. Split out so the caller can
+// give that case its own remedy instead of a generic one.
+func LooksSchemaQualified(pattern string) bool {
+	return strings.Contains(pattern, ".")
+}
+
 func (f TableFilter) Allows(tableName string) bool {
 	if len(f.Include) > 0 {
 		return matchesAny(f.Include, tableName)
@@ -183,6 +246,10 @@ func ApplyTableFilter(ctx context.Context, schema *ir.Schema, filter TableFilter
 		return nil
 	}
 	original := len(schema.Tables)
+	allNames := make([]string, 0, original)
+	for _, t := range schema.Tables {
+		allNames = append(allNames, t.Name)
+	}
 	kept := schema.Tables[:0]
 	for _, t := range schema.Tables {
 		if filter.Allows(t.Name) {
@@ -196,6 +263,39 @@ func ApplyTableFilter(ctx context.Context, schema *ir.Schema, filter TableFilter
 		slog.Int("matched", len(kept)),
 		slog.Int("excluded", original-len(kept)),
 	)
+	// Bug 272: a pattern that matched NOTHING is the silent half of this
+	// filter, and on the exclude path it fails OPEN -- the operator believes a
+	// table is excluded, it is not, and its rows are copied at exit 0. Found
+	// with --exclude-table=public.pii, which copied the PII table entirely.
+	//
+	// WARN rather than refuse, deliberately: a pattern naming a table absent
+	// from THIS source is legitimate (one config across environments), so
+	// refusing would break a working configuration. What was missing is that
+	// the operator was never told.
+	if unmatched := filter.UnmatchedPatterns(allNames); len(unmatched) > 0 {
+		mode := "--exclude-table"
+		effect := "those tables are NOT excluded and their rows WILL be copied"
+		if len(filter.Include) > 0 {
+			mode = "--include-table"
+			effect = "those patterns contribute nothing to the allow-list"
+		}
+		for _, pat := range unmatched {
+			remedy := "check the spelling against the source table list"
+			if LooksSchemaQualified(pat) {
+				remedy = "table patterns match the BARE table name, not a schema-qualified one — " +
+					"write " + strconv.Quote(bareName(pat)) + " instead of " + strconv.Quote(pat) +
+					" (sluice diagnostics print names schema-qualified, which is the usual reason " +
+					"this happens); use --include-schema / --exclude-schema to scope namespaces"
+			}
+			slog.WarnContext(
+				ctx, "table filter pattern matched NOTHING",
+				slog.String("flag", mode),
+				slog.String("pattern", pat),
+				slog.String("effect", effect),
+				slog.String("remedy", remedy),
+			)
+		}
+	}
 	if len(kept) == 0 {
 		return errors.New("pipeline: table filter excluded every source table; nothing to migrate (check --include-table / --exclude-table)")
 	}

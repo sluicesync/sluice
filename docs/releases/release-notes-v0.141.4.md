@@ -1,5 +1,11 @@
 # sluice v0.141.4
 
+> **Correction (2026-09-05).** One sentence below describes the failure mechanism imprecisely. **No upgrade is needed and nothing here changes what the release does** — the fix is real and the operator-visible outcome ("could not be migrated") was accurate. Prose-only, so it is corrected in place at v0.141.4 rather than pointing at a later version.
+>
+> **"the emitted DDL was a syntax error."** Postgres never saw it. sluice refuses to execute emitted DDL that is not a single well-formed statement (`SLUICE-E-DDL-EMIT-MULTI-STATEMENT`, an anti-tamper control on recorded schema content), and that guard rejected the malformed body first — `unbalanced ')' at byte 80`. So the run failed one layer earlier than described, on sluice's own check rather than the server's parser.
+>
+> Worth recording rather than quietly fixing: a control written to stop *tampered* schema content from executing is what caught an ordinary parse bug in sluice's own reader. Found by the v0.141.4 regression cycle, which measured the control binary instead of trusting the sentence.
+
 **If you run Postgres CDC, the retry budget is not what we told you it was.** sluice's docs have said the applier absorbs about four minutes of transient failure — "enough to ride out vtgate restarts and Patroni failovers." The real figure at shipped defaults is **12.7 seconds**, which does not cover a failover. Nothing changed in the code; the number was wrong from the day it was written, and it is corrected everywhere it appeared. If you sized your operations around it, see below.
 
 This release also fixes a Postgres source that could not be migrated at all, and gives the publication-permission failure a coded refusal with a remedy.

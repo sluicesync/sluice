@@ -6,6 +6,8 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [0.141.4] - 2026-09-05
 
+**Correction (2026-09-05):** one sentence in this entry describes a failure mechanism imprecisely, corrected in place at **v0.141.4** because it is prose-only — the shipped code is correct and unchanged. "the emitted DDL was a syntax error": Postgres never saw it. `assertSingleDDLStatement`, the anti-tamper control that refuses emitted DDL which is not one well-formed statement, rejected the malformed body first with `unbalanced ')' at byte 80`, so the run failed one layer earlier than described. The operator-visible outcome — the source could not be migrated — was accurate. Found by this release's own regression cycle, which measured the control binary rather than trusting the sentence.
+
 The applier retry budget is 12.7 seconds, not the four minutes the docs promised — corrected everywhere. Plus a Postgres source that could not be migrated at all, and a coded refusal for a publication the role may not create. Findings from a review of PlanetScale's pgcopydb fork PRs #34–#59.
 
 ### Fixed

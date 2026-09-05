@@ -88,6 +88,18 @@ type notesAmendment struct {
 
 var declaredNotesAmendments = []notesAmendment{
 	{
+		amended:     semver{0, 141, 4},
+		fixedIn:     semver{0, 141, 4},
+		claimMarker: "the emitted DDL was a syntax error",
+		why: "Postgres never saw it. assertSingleDDLStatement -- the anti-tamper control that refuses " +
+			"emitted DDL which is not one well-formed statement -- rejected the malformed body first " +
+			"with \"unbalanced ')' at byte 80\", so the run failed one layer earlier than the sentence " +
+			"describes. fixedIn is the amended version itself because this is PROSE-only: the shipped " +
+			"code is correct and unchanged, and the operator-visible outcome (the source could not be " +
+			"migrated) was accurate. Found by the v0.141.4 regression cycle, which measured the control " +
+			"binary rather than trusting the sentence",
+	},
+	{
 		amended:     semver{0, 141, 2},
 		fixedIn:     semver{0, 141, 3},
 		claimMarker: "the stream also has to be stopped first, which `sluice sync decommission` already enforces",
