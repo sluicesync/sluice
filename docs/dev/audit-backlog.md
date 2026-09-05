@@ -370,6 +370,21 @@ A gate built alongside these that was not on the G-list, recorded so it is finda
 
 *(Corrected 2026-09-01: (d) originally named a `sluice doctor` command. There is no such command; the operator-bundle command is `sluice diagnose`. Verified against `cmd/sluice/cli.go:183` — the project's own rule about not citing a flag or command without checking it still exists applies to a backlog entry proposing one.)*
 
+### TESTFRAGILE-1 — a wall-clock gate whose tolerance is funded from the value it measures (found 2026-09-04, during the v0.141.2 tag)
+
+`TestGrowGate_EvidenceAccumulatesPerEpisodeAndResetsWithTheLadder` (`internal/pipeline/migcore/grow_gate_evidence_test.go:234`) failed the **Windows** leg of `ci.yml` on the v0.141.2 tag with `escalated to 51.0227ms (cap 20ms)`. Not caused by that release — `migcore` is not in its delta — and not deterministic: 25/25 green locally on Windows under `GOMAXPROCS=1`, and the same job was green on the v0.141.1 tag. Unblocked by a rerun, diagnosed rather than waved through.
+
+**Mechanism.** `onWindowClosed` reports `now.Sub(g.windowStart)` (`grow_gate.go:827`) — **measured wall-clock**, including scheduler overhead. The reset assertion caps that measurement at `2*base` where `base = 20ms` is the same constant the hold is computed from, so the tolerance tracks the *computed* hold and not the *measured* overhead. Windows' default timer granularity is ~15.6ms, so one missed tick is ~78% of the entire budget. Worse, the two states the test distinguishes overlap once granularity is added: the capped ladder measures ~20ms+overhead and the sticky/unreset ladder is only asserted to exceed 40ms, so on a loaded runner both land in the same band.
+
+This is the "never fund a tolerance from the value it observes" shape recorded in [[a-flaky-gate-may-have-a-false-premise]], and it is **tag-only** — the Windows matrix joins on tag pushes, so it can only ever fire during a release, which is when there is least appetite to look at it.
+
+**Proposed fix, and why it is not a bigger tolerance.** Widening the cap keeps the two bands overlapping. Two shapes that do not:
+
+1. **Differential** — compare `deepestAfterReset` against the `deepest` measured in the stickiness phase and require a clear ratio. Both carry the same overhead, so granularity largely cancels; this is the "name the independent expected value" discipline applied to a timing test.
+2. **Scale the base up** so the signal dominates (e.g. `base = 200ms`), making ~16ms of granularity ~8% noise instead of ~78%.
+
+Either needs its own mutation run — delete the reset and confirm the new assertion still fails — which is exactly why it was NOT attempted between the release commit and the tag. A gate weakened under release pressure is the failure mode this repo already has a rule about.
+
 ### Invariant sweep — the enumerated queue
 
 55 claims: 33 verified, 17 unverified, 5 suspect-false. **The queue is CLOSED as of 2026-08-08.** All 5 suspect-false closed 2026-08-07 (table below); all 14 *nameable* unverified claims closed across four batches, with the remaining 3 unrecoverable (they existed only in the un-preserved per-worker sweep output — see the completeness caveat). **11 of the 14 verdicts differed from their filing**, which is the number that argues for re-running the sweep; the breakdown and the recommendation are below.
