@@ -162,6 +162,18 @@ func TestPublicationExposureSiteWordingIsSiteSpecific(t *testing.T) {
 				"(Bug 270). Saying only that the stream wedges states the loud outcome as the whole "+
 				"truth, and hides the branch where the resume comes back green and database-wide", label)
 		}
+		// "widen" alone is not enough, and this is measured rather than
+		// assumed: the pre-tag review mutated the BACKUP remedy to keep the
+		// word "widens" while deleting the condition that makes it a fork,
+		// and both this gate and the cross-package one stayed green. A fork
+		// needs the branch AND what selects it, so each message must carry a
+		// condition of its own.
+		if !strings.Contains(r, "depending on") {
+			t.Errorf("the %s remedy names the widening but states no CONDITION for it (Bug 270). "+
+				"Naming both outcomes without saying what selects them still reads as a certainty, "+
+				"and the per-message check exists because a file-level one cannot see which of the "+
+				"two messages in a single file lost its fork", label)
+		}
 	}
 
 	// Both doors must still refuse the same core advice.

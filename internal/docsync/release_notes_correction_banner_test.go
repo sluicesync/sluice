@@ -100,6 +100,19 @@ var declaredNotesAmendments = []notesAmendment{
 	{
 		amended:     semver{0, 141, 1},
 		fixedIn:     semver{0, 141, 2},
+		claimMarker: "which retires the slot and the publication together",
+		why: "`sluice sync decommission` drops the slot, and the publication ONLY when the stream had its " +
+			"own -- dropOwnPublicationIfPerStream returns early for the shared default sluice_pub, which " +
+			"is the dominant configuration at these doors because other streams may read through it. So " +
+			"the common outcome was exit 0 with the FOR ALL TABLES publication that was the whole subject " +
+			"of the warning still in place. The decommission REPORT was always honest about this; the " +
+			"warning that sent the operator there was not. Specific to v0.141.1 and to the multi-schema " +
+			"sync start warning -- v0.141.0's version of that remedy named no command at all -- and found " +
+			"by the pre-tag review of v0.141.2, which caught the claim being copied onto a second door",
+	},
+	{
+		amended:     semver{0, 141, 1},
+		fixedIn:     semver{0, 141, 2},
 		claimMarker: "pins the replication slot's restart position behind the drop, and the stream then fails to resume",
 		why: "that is the LOUD branch of a fork stated as the whole outcome. The v0.141.1 cycle isolated it " +
 			"on one variable -- whether anything was WRITTEN between the drop and the resume. With a row " +

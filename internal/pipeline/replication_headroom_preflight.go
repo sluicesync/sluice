@@ -148,8 +148,8 @@ func formatHeadroomRefusal(h ir.ReplicationHeadroom, slotsFull, sendersFull bool
 		}
 	}
 	b.WriteString(". Recovery: (a) retire a finished sluice stream's slot — `sluice slot list` to inspect, " +
-		"`sluice sync decommission --stream-id <id> --yes` to drop a finished stream's slot + publication + " +
-		"control row, or `sluice slot drop <name>` for an abandoned leftover (an INACTIVE sluice_* slot is " +
+		"`sluice sync decommission --stream-id <id> --yes` to drop a finished stream's slot + its OWN " +
+		"publication (the shared default is never dropped) + control row, or `sluice slot drop <name>` for an abandoned leftover (an INACTIVE sluice_* slot is " +
 		"usually a stream stopped mid-migration or never decommissioned — with per-stream publications, " +
 		"staged-wave migration runs one slot per stream, so leftovers from finished waves are the common cause); " +
 		"(b) raise max_replication_slots / max_wal_senders in postgresql.conf and restart (on managed Postgres, " +

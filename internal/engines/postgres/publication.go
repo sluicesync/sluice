@@ -168,6 +168,18 @@ func ensurePublication(ctx context.Context, db *sql.DB, name, schema string, tab
 			// replicates the next change normally, and every keyless table in
 			// the database starts refusing UPDATE from that moment.
 			//
+			// The MECHANISM behind that variable, which is what the emitted
+			// messages state: pgoutput resolves publication membership against
+			// the historical catalog snapshot at each change's LSN, so changes
+			// committed BEFORE the drop decode fine, and only a change committed
+			// in the window between the DROP and this resume's CREATE has no
+			// publication in its snapshot. "Anything was written" is the
+			// observable proxy the cycle varied; the window is the cause.
+			// UNVERIFIED PREMISE: the snapshot mechanism is derived from the
+			// error shape (a publication reported absent while it demonstrably
+			// exists) plus the PG 16.14 measurement, not from a test that pins
+			// pgoutput's catalog-snapshot behaviour directly.
+			//
 			// It is a fork, not a sequence, and the QUIET branch is the
 			// dangerous one -- which is exactly why stating only the loud
 			// branch was worse than saying nothing. Each rewrite replaced one

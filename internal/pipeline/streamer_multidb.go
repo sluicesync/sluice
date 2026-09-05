@@ -779,7 +779,8 @@ func (s *Streamer) warnPublicationExposure(ctx context.Context, graded map[strin
 			"while INSERT keeps working -- so the failure surfaces inside whatever application owns these tables",
 		"remedy", "give each listed table a PRIMARY KEY or REPLICA IDENTITY FULL before starting, or accept that writes to "+
 			"them will fail until you do. Do NOT drop this sync's publication as a shortcut: depending on "+
-			"whether the stream has to decode anything written after the DROP, that either wedges it "+
+			"whether the stream has to decode anything written after the DROP and before this resume "+
+			"recreates the publication, that either wedges it "+
 			"permanently (its slot's restart_lsn pins behind the DROP record) or lets it resume having "+
 			"silently recreated the publication FOR ALL TABLES -- and the quiet outcome is the worse one, "+
 			"because the stream comes back green. Retire a stream you are finished with by stopping it and "+

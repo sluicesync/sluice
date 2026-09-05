@@ -4,6 +4,9 @@
 package docsync
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +17,28 @@ import (
 // carries. It is the UNIVERSE this gate derives itself from — deliberately not
 // a hand-listed set of files, and deliberately not a helper's identifier.
 const exposureMarker = "UNSELECTED-NAMESPACE-EXPOSURE"
+
+// stringLiteralsOf returns every string-literal value in a Go file, joined.
+// Comments and identifiers are excluded on purpose: this gate asserts what a
+// message SAYS, and a claim that lives only in a comment is not something an
+// operator ever reads.
+func stringLiteralsOf(t *testing.T, path string) string {
+	t.Helper()
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, path, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", path, err)
+	}
+	var sb strings.Builder
+	ast.Inspect(f, func(n ast.Node) bool {
+		if lit, ok := n.(*ast.BasicLit); ok && lit.Kind == token.STRING {
+			sb.WriteString(lit.Value)
+			sb.WriteByte('\n')
+		}
+		return true
+	})
+	return sb.String()
+}
 
 // TestPublicationExposureWordingAcrossEveryEmitter holds every emitter of the
 // exposure warning to the same claim rules, wherever it lives.
@@ -34,11 +59,14 @@ const exposureMarker = "UNSELECTED-NAMESPACE-EXPOSURE"
 // thing they all carry (the marker) rather than on the helper one of them
 // happens to use.
 //
-// WHAT IT REACHES: the source text of every non-test file containing the
-// marker. It cannot tell which branch of a file emits what, so it asserts
-// file-level presence and absence of specific claim shapes. That is coarse,
-// and it is enough for the failure it exists to catch — a sibling emitter left
-// behind when a claim is corrected.
+// WHAT IT REACHES: the STRING LITERALS of every non-test file containing the
+// marker (comments excluded — see stringLiteralsOf). It cannot tell which
+// branch of a file emits what, so a file holding two messages is graded as
+// one: it catches a sibling FILE left behind when a claim is corrected, and
+// NOT a sibling message inside a file it already passes. That second gap is
+// real and is covered per-message by
+// TestPublicationExposureSiteWordingIsSiteSpecific in internal/engines/postgres,
+// which is where the two engine-local messages can be called individually.
 func TestPublicationExposureWordingAcrossEveryEmitter(t *testing.T) {
 	root := repoRootFromDocsync(t)
 
@@ -105,11 +133,14 @@ func TestPublicationExposureWordingAcrossEveryEmitter(t *testing.T) {
 	}
 
 	for _, f := range emitters {
-		b, err := os.ReadFile(f)
-		if err != nil {
-			t.Fatalf("read %s: %v", f, err)
-		}
-		body := string(b)
+		// Grade the STRING LITERALS only, never the whole file. Both emitting
+		// files carry doc comments that discuss these exact claims in nearly
+		// the same words, so a raw file grep can be satisfied by a comment
+		// while the emitted message quietly loses the claim — the gate would
+		// go green at the moment it stopped meaning anything. Flagged by the
+		// pre-tag review as latent (true today, one comment edit from false),
+		// which is the cheapest possible time to fix it.
+		body := stringLiteralsOf(t, f)
 		rel, _ := filepath.Rel(root, f)
 		for _, r := range required {
 			if !strings.Contains(body, r.substr) {
