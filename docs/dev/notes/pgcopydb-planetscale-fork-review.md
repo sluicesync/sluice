@@ -5,6 +5,8 @@ Sources:
 
 - Divergent commit list: `gh api repos/dimitri/pgcopydb/compare/main...planetscale:pgcopydb:main` (64 ahead, 14 behind, head `83568e89`).
 - PR #33 (the headliner): <https://github.com/planetscale/pgcopydb/pull/33>.
+
+> **REVIEW POSITION (updated 2026-09-05).** This note covers fork PRs **#1-#33**. A later pass covered **#34-#59** and its findings are recorded in the audit backlog, not here. Adoption status of this note-s three recommendations, re-verified against the CODE on 2026-09-05 rather than trusting the markers below: (a) json-equality cast under REPLICA IDENTITY FULL - SHIPPED (change_applier.go emits the ::text cast); (b) NOT VALID FK retry - SHIPPED (internal/ir/degraded_fk.go is a whole surface); (c) XID-wraparound preflight - SHIPPED (postgres, pgtrigger, and target_vacuum_health.go). The in-flight/queued markers in the text below were four months stale when checked, which is the doc-lag class - trust the code.
 - PRs sampled in detail: #2, #4, #5, #6, #7, #8, #9, #10, #11, #12, #17, #18, #19, #21, #22, #24, #25, #27, #28, #33. (Skimmed for shape, not read line-by-line. PRs #1, #14, #15, #16, #20, #32 were read by commit title only.)
 - AGENTS.md at fork root (rendered HTML returned a refusal; not load-bearing — the README/commit messages are enough).
 
