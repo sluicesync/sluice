@@ -229,6 +229,16 @@ type DomainCheck struct {
 	// with no surrounding `CHECK (...)` wrapper. E.g.
 	// `VALUE ~ '^[^@]+@[^@]+\\.[^@]+$'`.
 	Body string
+
+	// NotValid carries pg_constraint.convalidated INVERTED for a DOMAIN
+	// CHECK. Same contract as [ForeignKey.NotValid].
+	//
+	// Reading it is not optional here the way it might look. The reader takes
+	// pg_get_constraintdef, which renders a trailing " NOT VALID", so a reader
+	// that does not RECOGNISE the suffix does not merely lose the attribute --
+	// it leaves the text inside Body, unbalancing the parentheses, and the
+	// emitted DDL is a syntax error. Dropping this field reinstates that bug.
+	NotValid bool `json:",omitempty"`
 }
 
 func (Domain) isType()    {}

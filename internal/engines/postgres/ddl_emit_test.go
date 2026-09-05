@@ -1810,3 +1810,69 @@ func TestInlineSkipIndexNames(t *testing.T) {
 		t.Errorf("inlineSkipIndexNames on a PK table = %v; want empty", inlineSkipIndexNames(pkTbl))
 	}
 }
+
+// TestEmitAddForeignKey_CarriesNotValid pins the third constraint-strength
+// axis (upstream review UPR-1).
+//
+// A source NOT VALID foreign key states that the source holds rows the
+// predicate rejects. Recreating it as validating is not a stricter copy — PG
+// validates against the copied data and the constraint phase fails on a
+// source sluice was asked to reproduce faithfully.
+//
+// Written because a mutation run found the emit unpinned: replacing the
+// `if fk.NotValid` guard with `if false` left the whole postgres package
+// green. Match and Deferrable were pinned; this one arrived without a pin.
+//
+// Grammar order is load-bearing and measured on PG 16: NOT VALID comes AFTER
+// the DEFERRABLE clause, so the combined cell is not redundant with the plain
+// one — an emitter that appended it earlier would produce a syntax error that
+// a NotValid-only test would never see.
+func TestEmitAddForeignKey_CarriesNotValid(t *testing.T) {
+	base := func() *ir.ForeignKey {
+		return &ir.ForeignKey{
+			Name:              "fk_child_parent",
+			Columns:           []string{"parent_id"},
+			ReferencedSchema:  "public",
+			ReferencedTable:   "parent",
+			ReferencedColumns: []string{"id"},
+		}
+	}
+
+	t.Run("a validated FK is byte-identical to before", func(t *testing.T) {
+		got, err := emitAddForeignKey("public", "child", base())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(got, "NOT VALID") {
+			t.Errorf("emitted NOT VALID for a VALIDATED constraint — this would silently weaken every "+
+				"ordinary FK sluice lands:\n%s", got)
+		}
+	})
+
+	t.Run("a NOT VALID FK carries it", func(t *testing.T) {
+		fk := base()
+		fk.NotValid = true
+		got, err := emitAddForeignKey("public", "child", fk)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.HasSuffix(got, " NOT VALID;") {
+			t.Errorf("NOT VALID missing or misplaced; PG requires it last:\n%s", got)
+		}
+	})
+
+	t.Run("NOT VALID follows the DEFERRABLE clause", func(t *testing.T) {
+		fk := base()
+		fk.NotValid = true
+		fk.Deferrable = true
+		fk.InitiallyDeferred = true
+		got, err := emitAddForeignKey("public", "child", fk)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := " DEFERRABLE INITIALLY DEFERRED NOT VALID;"
+		if !strings.HasSuffix(got, want) {
+			t.Errorf("clause order wrong; PG's grammar puts NOT VALID after the timing clause.\n got: %s\nwant suffix: %s", got, want)
+		}
+	})
+}

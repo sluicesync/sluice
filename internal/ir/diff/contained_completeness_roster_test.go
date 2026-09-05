@@ -496,6 +496,25 @@ var foreignKeyFieldProbes = map[string]containedFieldProbe{
 			return nil
 		},
 	},
+	// UPR-1. NOT VALID is a strength axis exactly like Deferrable above: a
+	// target enforcing a constraint the source leaves unvalidated REJECTS
+	// writes the source accepts, so drift that stayed silent here would
+	// certify a target that behaves differently from the source it was just
+	// compared against.
+	"NotValid": {
+		mutate:        func(s *ir.Schema) { s.Tables[0].ForeignKeys[0].NotValid = true },
+		wantInSummary: "foreign-key mismatch",
+		wantInDiff: func(d SchemaDiff) error {
+			fd, err := oneForeignKeyDiff(d)
+			if err != nil {
+				return err
+			}
+			if !fd.ValidityMismatched || !fd.ActualNotValid {
+				return fmt.Errorf("ValidityMismatched/ActualNotValid not populated: %+v", fd)
+			}
+			return nil
+		},
+	},
 }
 
 func fkReferencePopulated(d SchemaDiff) error {

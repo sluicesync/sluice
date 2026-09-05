@@ -346,6 +346,19 @@ type CheckConstraint struct {
 	// compare-lane annotation is not part of what the target holds, so
 	// it has no business in a manifest.
 	SluiceEmitted bool `json:"-"`
+
+	// NotValid carries pg_constraint.convalidated INVERTED. Same contract as
+	// [ForeignKey.NotValid], and this is the sibling with NO escape hatch:
+	// `--allow-degraded-fks` covers foreign keys only, so a source CHECK read
+	// without its NOT VALID qualifier is recreated as validating and the
+	// migration aborts DURING bulk copy on 23514, against rows the source
+	// itself never claimed satisfied it.
+	//
+	// The reader must select convalidated explicitly. pg_get_expr(conbin, …)
+	// renders the EXPRESSION only and cannot carry the qualifier — measured
+	// on PG 16: `(q >= 0)` where pg_get_constraintdef gives
+	// `CHECK ((q >= 0)) NOT VALID`.
+	NotValid bool `json:",omitempty"`
 }
 
 // ExcludeConstraint represents a PostgreSQL EXCLUDE constraint
@@ -897,6 +910,22 @@ type ForeignKey struct {
 	// that worked before cutover.
 	Deferrable        bool
 	InitiallyDeferred bool
+
+	// NotValid carries pg_constraint.convalidated INVERTED: true means the
+	// source constraint was never validated against existing rows, and the
+	// target must recreate it that way.
+	//
+	// This is a constraint-STRENGTH attribute, exactly like Match and
+	// Deferrable above, and it is carried for the same reason: recreating a
+	// source-faithful NOT VALID constraint as VALIDATING is not a
+	// higher-fidelity copy, it is a different constraint. The source is
+	// telling you it has rows that do not satisfy this predicate; validating
+	// on the target either fails the migration or is a lie about the data.
+	//
+	// A source NOT VALID FK is therefore NOT a degraded FK: the degraded-FK
+	// report is for constraints sluice could not create faithfully, and this
+	// one is created faithfully.
+	NotValid bool `json:",omitempty"`
 }
 
 // FKMatch is a foreign key's composite-NULL matching rule.

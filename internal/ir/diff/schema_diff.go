@@ -1583,6 +1583,17 @@ func diffForeignKeys(td *TableDiff, expected, actual *ir.Table, opts Options) {
 			d.ExpectedInitiallyDeferred, d.ActualInitiallyDeferred = exp.InitiallyDeferred, act.InitiallyDeferred
 			mismatched = true
 		}
+		// NOT VALID is the third strength axis (UPR-1), and it belongs here
+		// for the same reason Deferrable does: it changes what the target
+		// ENFORCES. A validating constraint where the source has an
+		// unvalidated one rejects writes the source accepts, so a drift
+		// report that stayed silent about it would be describing a target
+		// that behaves differently from the one it just declared clean.
+		if exp.NotValid != act.NotValid {
+			d.ExpectedNotValid, d.ActualNotValid = exp.NotValid, act.NotValid
+			d.ValidityMismatched = true
+			mismatched = true
+		}
 
 		if mismatched {
 			td.ForeignKeysMismatched = append(td.ForeignKeysMismatched, d)
@@ -1619,9 +1630,17 @@ type ForeignKeyDiff struct {
 	// Deferrability is reported as a unit because the two flags are only
 	// meaningful together, and because false is both a real value and the
 	// zero value — a bare bool pair cannot say "this differs".
-	DeferrabilityMismatched   bool `json:"deferrability_mismatched,omitempty"`
-	ExpectedDeferrable        bool `json:"expected_deferrable,omitempty"`
-	ActualDeferrable          bool `json:"actual_deferrable,omitempty"`
+	DeferrabilityMismatched bool `json:"deferrability_mismatched,omitempty"`
+	ExpectedDeferrable      bool `json:"expected_deferrable,omitempty"`
+	ActualDeferrable        bool `json:"actual_deferrable,omitempty"`
+
+	// ValidityMismatched flags a NOT VALID divergence; the Expected/Actual
+	// pair carries which side was unvalidated. Separate flag for the same
+	// reason DeferrabilityMismatched is: both values are bools, so a
+	// populated-field test cannot distinguish "false" from "not compared".
+	ValidityMismatched        bool `json:"validity_mismatched,omitempty"`
+	ExpectedNotValid          bool `json:"expected_not_valid,omitempty"`
+	ActualNotValid            bool `json:"actual_not_valid,omitempty"`
 	ExpectedInitiallyDeferred bool `json:"expected_initially_deferred,omitempty"`
 	ActualInitiallyDeferred   bool `json:"actual_initially_deferred,omitempty"`
 }

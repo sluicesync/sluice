@@ -209,8 +209,9 @@ type schemaTypeEnvelope struct {
 // domainCheckOnDisk is the wire shape of one [DomainCheck] inside a
 // schema-type envelope. Append-only.
 type domainCheckOnDisk struct {
-	Name string `json:"name,omitempty"`
-	Body string `json:"body,omitempty"`
+	Name     string `json:"name,omitempty"`
+	Body     string `json:"body,omitempty"`
+	NotValid bool   `json:"not_valid,omitempty"`
 }
 
 // MarshalType renders an IR [Type] as a tagged-union JSON envelope.

@@ -2142,6 +2142,26 @@ func emitAddForeignKey(schema, childTable string, fk *ir.ForeignKey) (string, er
 			sb.WriteString(" INITIALLY DEFERRED")
 		}
 	}
+	// NOT VALID is the third strength axis (upstream review UPR-1), and it
+	// goes LAST because Postgres's grammar puts it after the timing clause.
+	//
+	// A source NOT VALID foreign key states that the source itself holds rows
+	// the predicate rejects. Recreating it as validating is not a stricter
+	// copy: PG then validates against the copied data and the constraint
+	// phase fails, on a source sluice was asked to reproduce faithfully. It
+	// is also NOT a degraded FK — the degraded-FK report exists for
+	// constraints sluice could not create as the source had them, and this
+	// one is created exactly as the source had it.
+	//
+	// This emitter can carry it because it is ALTER-based. The table-CHECK
+	// and domain-CHECK siblings cannot: PG rejects NOT VALID inline in both
+	// CREATE TABLE and CREATE DOMAIN (measured on PG 16), and sluice's
+	// emitters are held to one statement each by assertSingleDDLStatement,
+	// so those two need their own ALTER pass — filed as UPR-1b, and warned
+	// about loudly in the meantime rather than emitted wrongly.
+	if fk.NotValid {
+		sb.WriteString(" NOT VALID")
+	}
 	sb.WriteByte(';')
 	return sb.String(), nil
 }
@@ -2257,6 +2277,34 @@ func emitCheckConstraint(c *ir.CheckConstraint, tbl *ir.Table, opts emitOpts) (s
 	sb.WriteString("CHECK (")
 	sb.WriteString(exprText)
 	sb.WriteByte(')')
+	// UPR-1: the source had this CHECK as NOT VALID and this emitter cannot
+	// say so. PG rejects NOT VALID inside CREATE TABLE (measured on PG 16:
+	// `CREATE TABLE t2(q int CHECK (q>=0) NOT VALID)` is a syntax error), and
+	// sluice holds every emitter to one statement (assertSingleDDLStatement),
+	// so carrying it needs a separate ALTER pass — UPR-1b.
+	//
+	// WARN rather than refuse, deliberately. The constraint is created on an
+	// EMPTY table, so the failure lands later, during bulk copy, as 23514 —
+	// and only if the copied rows actually violate the predicate. A source
+	// whose data happens to satisfy an unvalidated CHECK migrates fine today,
+	// and refusing here would break that working configuration. What an
+	// operator needs is to know BEFORE the copy why a mid-copy 23514 is
+	// coming, since `--allow-degraded-fks` covers foreign keys only and has
+	// no effect on this.
+	if c.NotValid {
+		slog.Warn(
+			"source CHECK constraint is NOT VALID and is being recreated as VALIDATING — "+
+				"if the copied rows do not satisfy it, the bulk copy will fail with SQLSTATE 23514",
+			slog.String("table", tbl.Name),
+			slog.String("constraint", c.Name),
+			slog.String("why", "Postgres does not accept NOT VALID inside CREATE TABLE, and sluice emits "+
+				"one statement per DDL; carrying it needs a follow-up ALTER TABLE ... ADD CONSTRAINT "+
+				"... NOT VALID, which sluice does not yet emit"),
+			slog.String("remedy", "either validate the constraint on the SOURCE before migrating "+
+				"(ALTER TABLE ... VALIDATE CONSTRAINT), or recreate it on the target by hand as "+
+				"NOT VALID after the run; --allow-degraded-fks does NOT apply to CHECK constraints"),
+		)
+	}
 	return sb.String(), nil
 }
 

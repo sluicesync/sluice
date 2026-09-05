@@ -775,13 +775,26 @@ func (r *SchemaReader) readDomainChecks(ctx context.Context) (map[string][]ir.Do
 		// outer `CHECK (` and trailing `)` so the IR's
 		// DomainCheck.Body holds the bare expression. The writer
 		// re-wraps with `CHECK (...)` on emit.
+		//
+		// The NOT VALID suffix must come off FIRST, and getting that order
+		// wrong is not a lost attribute but a syntax error. Measured on PG
+		// 16, an unvalidated domain constraint renders as
+		// `CHECK ((VALUE > 0)) NOT VALID`: the TrimSuffix(")") below then
+		// matches nothing (the string ends in "D"), Body keeps an unbalanced
+		// paren, and the writer emits `CHECK ((VALUE > 0)) NOT VALID)` — a
+		// hard abort that reads like an internal sluice bug rather than a
+		// source sluice cannot carry (upstream review UPR-1).
 		body := condef
+		notValid := false
+		if trimmed, ok := strings.CutSuffix(body, " NOT VALID"); ok {
+			body, notValid = trimmed, true
+		}
 		const prefix = "CHECK ("
 		if strings.HasPrefix(body, prefix) {
 			body = strings.TrimPrefix(body, prefix)
 			body = strings.TrimSuffix(body, ")")
 		}
-		out[name] = append(out[name], ir.DomainCheck{Name: conname, Body: body})
+		out[name] = append(out[name], ir.DomainCheck{Name: conname, Body: body, NotValid: notValid})
 	}
 	return out, rows.Err()
 }
@@ -2068,6 +2081,7 @@ func (r *SchemaReader) populateForeignKeys(ctx context.Context, tables map[strin
 			con.confmatchtype,
 			con.condeferrable,
 			con.condeferred,
+			con.convalidated,
 			fk_col.attname,
 			ref_col.attname,
 			u.ord
@@ -2124,14 +2138,14 @@ func (r *SchemaReader) populateForeignKeys(ctx context.Context, tables map[strin
 		var (
 			name, tableName, refTable, refSchema string
 			updType, delType, matchType          string
-			deferrable, deferred                 bool
+			deferrable, deferred, validated      bool
 			fkCol, refCol                        sql.NullString
 			ord                                  int
 		)
 		if err := rows.Scan(
 			&name, &tableName, &refTable, &refSchema,
 			&updType, &delType, &matchType,
-			&deferrable, &deferred,
+			&deferrable, &deferred, &validated,
 			&fkCol, &refCol, &ord,
 		); err != nil {
 			return err
@@ -2173,6 +2187,12 @@ func (r *SchemaReader) populateForeignKeys(ctx context.Context, tables map[strin
 				Match:             fkMatchFromCode(matchType),
 				Deferrable:        deferrable,
 				InitiallyDeferred: deferred,
+				// convalidated INVERTED. A source NOT VALID FK recreated as
+				// validating is not a stricter copy, it is a different
+				// constraint: the source is stating it holds rows the
+				// predicate rejects, so validating on the target either fails
+				// the run or lies about the data (upstream review UPR-1).
+				NotValid: !validated,
 			}
 			collected[k] = fk
 		}
@@ -2217,7 +2237,8 @@ func (r *SchemaReader) populateCheckConstraints(ctx context.Context, tables map[
 		SELECT
 			cl.relname AS table_name,
 			con.conname,
-			pg_catalog.pg_get_expr(con.conbin, con.conrelid)
+			pg_catalog.pg_get_expr(con.conbin, con.conrelid),
+			con.convalidated
 		FROM   pg_constraint con
 		JOIN   pg_class      cl ON cl.oid = con.conrelid
 		JOIN   pg_namespace  n  ON n.oid  = cl.relnamespace
@@ -2233,7 +2254,8 @@ func (r *SchemaReader) populateCheckConstraints(ctx context.Context, tables map[
 
 	for rows.Next() {
 		var tableName, name, expr string
-		if err := rows.Scan(&tableName, &name, &expr); err != nil {
+		var validated bool
+		if err := rows.Scan(&tableName, &name, &expr, &validated); err != nil {
 			return err
 		}
 		t, ok := tables[tableName]
@@ -2244,6 +2266,14 @@ func (r *SchemaReader) populateCheckConstraints(ctx context.Context, tables map[
 			Name:        name,
 			Expr:        expr,
 			ExprDialect: dialectName,
+			// convalidated INVERTED. pg_get_expr above renders the
+			// EXPRESSION only and cannot carry this -- measured on PG 16, it
+			// returns "(q >= 0)" where pg_get_constraintdef returns
+			// "CHECK ((q >= 0)) NOT VALID". Without it a source NOT VALID
+			// CHECK is recreated as validating and the run aborts DURING
+			// bulk copy on 23514, with no --allow-degraded-fks equivalent to
+			// fall back on (upstream review UPR-1).
+			NotValid: !validated,
 		})
 	}
 	return rows.Err()

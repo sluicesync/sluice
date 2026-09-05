@@ -1949,6 +1949,32 @@ func emitAddForeignKey(childSchema, childTable string, fk *ir.ForeignKey) (strin
 		sb.WriteString(" ON UPDATE ")
 		sb.WriteString(fk.OnUpdate.String())
 	}
+	// SIBLING SWEEP for ir.ForeignKey.NotValid (upstream review UPR-1), which
+	// the Postgres emitter carries. MySQL is EXEMPT and this is the record of
+	// why rather than a silence: InnoDB has no NOT VALID -- a foreign key is
+	// either enforced or absent, and there is no "created but never checked"
+	// state to translate into. So a source NOT VALID FK lands here as an
+	// ORDINARY enforced constraint.
+	//
+	// That is a real fidelity difference and it fails LOUDLY rather than
+	// quietly: MySQL validates on ADD CONSTRAINT, so a source holding rows the
+	// predicate rejects surfaces as errno 1452 at the constraint phase, after
+	// the copy. WARN so the operator can see it coming, and name the
+	// asymmetry -- the same constraint migrates cleanly to a Postgres target.
+	if fk.NotValid {
+		slog.Warn(
+			"source FOREIGN KEY is NOT VALID and MySQL has no equivalent — it will be created as an "+
+				"ENFORCED constraint, and if the copied rows do not satisfy it the constraint phase "+
+				"fails with errno 1452",
+			slog.String("table", childTable),
+			slog.String("constraint", fk.Name),
+			slog.String("why", "InnoDB foreign keys are either enforced or absent; there is no "+
+				"created-but-unvalidated state for sluice to carry"),
+			slog.String("remedy", "validate the constraint on the SOURCE before migrating "+
+				"(ALTER TABLE ... VALIDATE CONSTRAINT), or migrate to a Postgres target, which "+
+				"carries NOT VALID faithfully"),
+		)
+	}
 	sb.WriteByte(';')
 	return sb.String(), nil
 }

@@ -255,6 +255,21 @@ var foreignKeyDiffFieldProbes = map[string]containedDiffProbe{
 		irdiff.ForeignKeyDiff{ExpectedMatch: "FULL", ActualMatch: "SIMPLE"},
 		"target SIMPLE",
 	),
+	// UPR-1. Each of the three gets its own probe for the same reason the
+	// deferrability trio does: all are bools, so one probe covering the flag
+	// would leave the two value fields indistinguishable from "not rendered".
+	"ValidityMismatched": fkProbe(
+		irdiff.ForeignKeyDiff{ValidityMismatched: true},
+		"validated:",
+	),
+	"ExpectedNotValid": fkProbe(
+		irdiff.ForeignKeyDiff{ValidityMismatched: true, ExpectedNotValid: true},
+		"source false", "REJECTS ROWS THE SOURCE HOLDS TODAY",
+	),
+	"ActualNotValid": fkProbe(
+		irdiff.ForeignKeyDiff{ValidityMismatched: true, ActualNotValid: true},
+		"target false", "NEVER CHECKED against it",
+	),
 	"DeferrabilityMismatched": fkProbe(
 		irdiff.ForeignKeyDiff{DeferrabilityMismatched: true},
 		"deferrable:",

@@ -96,6 +96,21 @@ func renderForeignKeyMismatch(sb *strings.Builder, table string, fd irdiff.Forei
 				"REJECTS A TRANSACTION ORDERING THE SOURCE ACCEPTS")
 		}
 	}
+	// UPR-1. Rendered for the same reason deferrability is: this is the third
+	// strength axis, and the asymmetry matters to whoever is reading. A target
+	// that VALIDATES where the source does not rejects writes the source
+	// accepts; the reverse is a target quietly holding rows nothing checked.
+	if fd.ValidityMismatched {
+		fmt.Fprintf(sb, "--   validated:    source %v   target %v\n", !fd.ExpectedNotValid, !fd.ActualNotValid)
+		if fd.ExpectedNotValid && !fd.ActualNotValid {
+			fmt.Fprintln(sb, "--   ^ the source leaves this constraint UNVALIDATED and the target enforces it, "+
+				"so the target REJECTS ROWS THE SOURCE HOLDS TODAY")
+		}
+		if !fd.ExpectedNotValid && fd.ActualNotValid {
+			fmt.Fprintln(sb, "--   ^ the target carries this constraint as NOT VALID, so rows already on the "+
+				"target were NEVER CHECKED against it")
+		}
+	}
 	fmt.Fprintf(sb, "-- review before acting; re-adding %s revalidates every existing row\n", quote(fd.Name))
 }
 
