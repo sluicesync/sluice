@@ -50,7 +50,8 @@ import (
 // state the source was left in.
 type DecommissionReport struct {
 	StreamID        string
-	SlotName        string // as recorded on the control row; "" = none recorded
+	SlotName        string // the slot acted on: recorded on the control row, or recovered from the position (Bug 271); "" = neither
+	SlotNameSource  string // how SlotName was obtained -- surfaced so an operator can see WHICH slot this command decided to act on
 	PublicationName string // as recorded on the control row; "" = none recorded
 	DryRun          bool   // when true, "Dropped/Cleared" mean "would drop/clear"
 
@@ -129,27 +130,57 @@ func DecommissionStream(ctx context.Context, applier ir.ChangeApplier, slots ir.
 		return nil, errors.New("pipeline: decommission: the target engine's change applier does not support clearing the cdc-state row; remove the stream's control row manually")
 	}
 
+	// Resolve the slot name BEFORE the switch below, so a recovered name
+	// flows through the SAME active-slot refusal and drop the recorded case
+	// takes. Bug 271: the empty-name arm sat first in that switch, so an empty
+	// `slot_name` skipped the `slot.Active` refusal along with the drop — and
+	// this command then completed against a RUNNING stream, deleting its
+	// control row underneath it. Resolving here is what makes one fix close
+	// both halves.
+	//
+	// A stream started without `--slot-name` records an EMPTY slot_name: the
+	// convention is "empty means the engine default", and the fallback was
+	// left to each consumer (`add-table` has activeSlotName; this command had
+	// nothing). The fix is NOT to adopt that default here — the original
+	// caution against guessing is right, because a genuinely legacy row cannot
+	// know whether its stream used a custom slot. It is to ask the engine to
+	// RECOVER the name the stream itself recorded in its position token
+	// ([ir.SlotNameResolver]), which is evidence rather than inference.
+	effectiveSlot, slotSource := st.SlotName, "recorded on the control row"
+	if effectiveSlot == "" && slots != nil {
+		if r, isResolver := slots.(ir.SlotNameResolver); isResolver {
+			if name, recovered := r.SlotNameFromPosition(st.Position); recovered {
+				effectiveSlot = name
+				slotSource = "recovered from the position this stream recorded (the control row's slot_name is empty, which is what a stream started without --slot-name writes)"
+			}
+		}
+	}
+
 	rep := &DecommissionReport{
 		StreamID:        streamID,
-		SlotName:        st.SlotName,
+		SlotName:        effectiveSlot,
 		PublicationName: st.PublicationName,
 		DryRun:          dryRun,
 	}
+	rep.SlotNameSource = slotSource
 
 	// ---- (b)+(c): the replication slot on the source ----
 	var firstErr error
 	switch {
 	case slots == nil:
 		rep.SlotSkipped = "the source engine has no replication slots (the binlog/change-log is the stream); nothing durable to remove on the source"
-	case st.SlotName == "":
+	case effectiveSlot == "":
 		// A legacy control row (pre-slot_name column) or a slotless
 		// source flavor recorded through a slot-capable engine name.
 		// Refuse to guess a name — dropping the engine DEFAULT slot on
 		// a hunch could take out a different stream. Same posture as
 		// the publication below.
-		rep.SlotSkipped = "the control row records no slot name (a legacy row from an older sluice); no slot was dropped — check `sluice slot list` and drop any leftover with `sluice slot drop`"
+		rep.SlotSkipped = "the control row records no slot name AND no slot name could be recovered from its recorded position " +
+			"(a genuinely legacy row, or a source flavor that records no slot) — no slot was dropped, and sluice will NOT guess the " +
+			"engine default here because a legacy row cannot say whether its stream used a custom one. Check `sluice slot list` and " +
+			"drop any leftover with `sluice slot drop`"
 	default:
-		slot, err := findSlot(ctx, slots, st.SlotName)
+		slot, err := findSlot(ctx, slots, effectiveSlot)
 		switch {
 		case err != nil:
 			firstErr = fmt.Errorf("pipeline: decommission: list source replication slots: %w", err)
@@ -159,24 +190,24 @@ func DecommissionStream(ctx context.Context, applier ir.ChangeApplier, slots ir.
 			// The stream is (or looks) live. Decommissioning a running
 			// stream is an operator error; refuse before touching
 			// anything.
-			return nil, decommissionActiveRefusal(streamID, st.SlotName)
+			return nil, decommissionActiveRefusal(streamID, effectiveSlot)
 		case dryRun:
 			rep.SlotDropped = true
 		default:
-			if err := dropSlotWithActiveRetry(ctx, slots, st.SlotName); err != nil {
+			if err := dropSlotWithActiveRetry(ctx, slots, effectiveSlot); err != nil {
 				switch {
 				case isSlotActiveShapeErr(err):
 					// Inactive at the pre-check, still held past the
 					// whole retry budget: a consumer re-attached under
 					// us. Same refusal as the pre-check, nothing else
 					// touched.
-					return nil, decommissionActiveRefusal(streamID, st.SlotName)
+					return nil, decommissionActiveRefusal(streamID, effectiveSlot)
 				case isSlotGoneShapeErr(err):
 					// Raced with a manual drop between List and Drop —
 					// the goal state either way.
 					rep.SlotAlreadyAbsent = true
 				default:
-					firstErr = fmt.Errorf("pipeline: decommission: drop replication slot %q: %w", st.SlotName, err)
+					firstErr = fmt.Errorf("pipeline: decommission: drop replication slot %q: %w", effectiveSlot, err)
 				}
 			} else {
 				rep.SlotDropped = true

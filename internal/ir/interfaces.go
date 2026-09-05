@@ -3351,6 +3351,45 @@ type SlotManagerOpener interface {
 	OpenSlotManager(ctx context.Context, dsn string) (SlotManager, error)
 }
 
+// SlotNameResolver is an optional [SlotManager] capability that recovers the
+// replication-slot name a stream was actually using from the position that
+// stream recorded.
+//
+// WHY IT EXISTS (Bug 271). A stream started WITHOUT `--slot-name` records an
+// EMPTY `slot_name` on its control row: the convention is "empty means the
+// engine default", and the fallback was left to each consumer. `add-table`
+// implements it ([activeSlotName], which names both cases the empty value
+// covers). `sync decommission` did not — it treated empty as "a legacy row
+// from an older sluice", skipped the slot drop, and, because that arm sits
+// FIRST in its switch, skipped the active-stream refusal with it. So the
+// default configuration got a command that dropped nothing, deleted the
+// control row of a possibly-RUNNING stream, printed success and exited 0,
+// leaving an orphaned slot that blocks the next cold start — the exact
+// failure decommission exists to prevent.
+//
+// The old behaviour had a REASON, and it is a good one: "refuse to guess a
+// name — dropping the engine DEFAULT slot on a hunch could take out a
+// different stream." That is sound for a genuinely legacy row, which cannot
+// know whether its stream used a custom slot. It is wrong for a default-named
+// stream, and an empty value alone cannot tell the two apart.
+//
+// This capability removes the guess rather than overriding the caution. A
+// Postgres position token is `{"slot":…,"lsn":…}` and its encoder REFUSES an
+// empty slot, so every control row carrying a position carries the
+// authoritative name — the stream's own record of what it opened, not an
+// inference. When no name can be recovered the caller must keep the
+// conservative skip.
+//
+// ok=false means "this position carries no recoverable slot name" (an empty
+// or unparseable token, or an engine whose positions do not name a slot) and
+// is NOT an error — it is the legacy case the caution was written for.
+type SlotNameResolver interface {
+	// SlotNameFromPosition returns the slot name recorded in p. It must not
+	// guess: an engine that cannot recover a name returns ok=false rather
+	// than a default.
+	SlotNameFromPosition(p Position) (name string, ok bool)
+}
+
 // PublicationDropOutcome reports what
 // [StreamPublicationDropper.DropStreamPublication] did (or, under
 // dryRun, would do) for a stream's recorded publication name. The

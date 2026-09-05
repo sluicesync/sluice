@@ -41,13 +41,21 @@ var (
 	_ ir.PositionOrderer                = Engine{}
 	_ ir.ServerCDCReaderOpener          = Engine{}
 	_ ir.SlotManagerOpener              = Engine{}
-	_ ir.SnapshotExporter               = Engine{}
-	_ ir.SnapshotImporterOpener         = Engine{}
-	_ ir.SnapshotStreamWithSlotOpener   = Engine{}
-	_ ir.SourceHostAdvisor              = Engine{}
-	_ ir.TargetConnectionBudgetProber   = Engine{}
-	_ ir.TargetStaleBackendReaper       = Engine{}
-	_ ir.UnloggedCapturePreflighter     = Engine{}
+	// Bug 271: recovers the slot name a stream recorded in its own position,
+	// so `sync decommission` stops treating the EMPTY slot_name a default-named
+	// stream writes as "a legacy row" -- which skipped the drop AND, because
+	// that arm sat first in the switch, the active-stream refusal with it.
+	// Dispatched by type assertion in internal/pipeline/decommission.go, so a
+	// receiver or signature drift would silently stop matching; this is the pin
+	// the optional-dispatch gate requires for exactly that reason.
+	_ ir.SlotNameResolver             = (*SlotManager)(nil)
+	_ ir.SnapshotExporter             = Engine{}
+	_ ir.SnapshotImporterOpener       = Engine{}
+	_ ir.SnapshotStreamWithSlotOpener = Engine{}
+	_ ir.SourceHostAdvisor            = Engine{}
+	_ ir.TargetConnectionBudgetProber = Engine{}
+	_ ir.TargetStaleBackendReaper     = Engine{}
+	_ ir.UnloggedCapturePreflighter   = Engine{}
 
 	// SchemaReader optional surfaces.
 	_ irbackup.PositionCapturer              = (*SchemaReader)(nil)

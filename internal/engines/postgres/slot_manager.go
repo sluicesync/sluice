@@ -193,3 +193,21 @@ func (m *SlotManager) DropStreamPublication(ctx context.Context, name string, dr
 	}
 	return ir.PublicationDropDropped, nil
 }
+
+// SlotNameFromPosition implements [ir.SlotNameResolver]: it recovers the
+// replication-slot name a stream recorded in its own position token.
+//
+// This is what lets `sync decommission` stop treating an empty `slot_name`
+// column as "a legacy row" (Bug 271). The pgPos encoder refuses an empty
+// slot, so any decodable Postgres position names the slot authoritatively —
+// the stream's own record of what it opened. A position that does not decode,
+// or an empty one, returns ok=false so the caller keeps the conservative skip
+// rather than guessing the engine default and possibly dropping a different
+// stream's slot.
+func (m *SlotManager) SlotNameFromPosition(p ir.Position) (string, bool) {
+	pos, ok, err := decodePGPos(p)
+	if err != nil || !ok || pos.Slot == "" {
+		return "", false
+	}
+	return pos.Slot, true
+}
