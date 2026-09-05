@@ -99,10 +99,3 @@ func TestPublicationPrivilegeRoster_EveryDDLSiteIsClassified(t *testing.T) {
 		t.Logf("%d of %d sites classified", classified, sites)
 	}
 }
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
