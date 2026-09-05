@@ -60,6 +60,7 @@ const (
 	CodeCDCGeneratedPrimaryKey   Code = "SLUICE-E-CDC-GENERATED-PRIMARY-KEY"
 	CodeCDCChangeLogIDReuse      Code = "SLUICE-E-CDC-CHANGELOG-ID-REUSE"
 	CodeCDCStandbySource         Code = "SLUICE-E-CDC-STANDBY-SOURCE"
+	CodeCDCPublicationPermission Code = "SLUICE-E-CDC-PUBLICATION-PERMISSION"
 	CodeCDCXAUnsupported         Code = "SLUICE-E-CDC-XA-UNSUPPORTED"
 	CodeConnectIPv6Only          Code = "SLUICE-E-CONNECT-IPV6-ONLY"
 
@@ -607,6 +608,7 @@ var registry = map[Code]Info{
 	CodeCDCReplicationPermission: {ClassRuntime, "connecting role lacks the REPLICATION attribute"},
 	CodeCDCPoolerEndpoint:        {ClassRuntime, "the source appears to be a connection pooler (Supavisor/pgbouncer) that stripped the replication startup parameter; CDC needs the direct endpoint"},
 	CodeCDCStandbySource:         {ClassRefusal, "the CDC source is a read-only standby / read replica (pg_is_in_recovery() = true); point --source at the primary endpoint — a replica remains fine for bulk migrate"},
+	CodeCDCPublicationPermission: {ClassRefusal, "the connecting role lacks the privilege to create the publication CDC needs (SQLSTATE 42501): CREATE on the database, ownership of every published table, and — for a database-wide FOR ALL TABLES publication — superuser"},
 	CodeCDCXAUnsupported:         {ClassRefusal, "a replicated table is written inside a MySQL XA (distributed) transaction, which sluice cannot faithfully replicate: the rows are invisible on the source until XA COMMIT, so a rollback would fabricate them on the target, and mid-body positions are not valid restart points"},
 	CodeConnectIPv6Only:          {ClassRuntime, "the DSN host resolves to an AAAA record only (IPv6-only) and this network appears IPv4-only"},
 	CodeDDLEmitMultiStatement:    {ClassRefusal, "an emitted DDL string is structurally more than one statement — sluice's emitters only ever produce one, so recorded schema content (a backup manifest's expression bodies) is corrupt or tampered, and executing it would run the extra SQL as the connected role; refused before the server saw it"},

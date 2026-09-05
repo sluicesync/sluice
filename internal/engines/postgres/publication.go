@@ -192,7 +192,7 @@ func ensurePublication(ctx context.Context, db *sql.DB, name, schema string, tab
 		}
 		if _, err := db.ExecContext(ctx, createQuery); err != nil {
 			if !isDuplicatePublication(err) {
-				return fmt.Errorf("postgres: create publication %q: %w", name, err)
+				return classifyPublicationPermission(ctx, db, name, fmt.Errorf("postgres: create publication %q: %w", name, err))
 			}
 			// Lost the create race against a concurrent ensurer. Several
 			// PG-source syncs sharing one source routinely ensure the same
@@ -275,12 +275,12 @@ func ensurePublication(ctx context.Context, db *sql.DB, name, schema string, tab
 		// directly.
 		dropQuery := fmt.Sprintf(`DROP PUBLICATION %s`, quoteIdent(name))
 		if _, err := db.ExecContext(ctx, dropQuery); err != nil {
-			return fmt.Errorf("postgres: drop FOR-ALL-TABLES publication %q for migration: %w", name, err)
+			return classifyPublicationPermission(ctx, db, name, fmt.Errorf("postgres: drop FOR-ALL-TABLES publication %q for migration: %w", name, err))
 		}
 		createQuery := fmt.Sprintf(`CREATE PUBLICATION %s FOR TABLE %s`,
 			quoteIdent(name), formatPublicationTableList(schema, tables, filters))
 		if _, err := db.ExecContext(ctx, createQuery); err != nil {
-			return fmt.Errorf("postgres: re-create publication %q with scoped tables: %w", name, err)
+			return classifyPublicationPermission(ctx, db, name, fmt.Errorf("postgres: re-create publication %q with scoped tables: %w", name, err))
 		}
 		return nil
 	}
@@ -306,7 +306,7 @@ func ensurePublication(ctx context.Context, db *sql.DB, name, schema string, tab
 		return rescopeRowFilteredPublication(ctx, db, name, alterQuery, version, excludeSlot)
 	}
 	if _, err := db.ExecContext(ctx, alterQuery); err != nil {
-		return fmt.Errorf("postgres: alter publication %q tables: %w", name, err)
+		return classifyPublicationPermission(ctx, db, name, fmt.Errorf("postgres: alter publication %q tables: %w", name, err))
 	}
 	return nil
 }
@@ -367,7 +367,7 @@ func rescopeRowFilteredPublication(ctx context.Context, db *sql.DB, name, alterQ
 		}
 	}()
 	if _, err := tx.ExecContext(ctx, alterQuery); err != nil {
-		return fmt.Errorf("postgres: alter publication %q tables: %w", name, err)
+		return classifyPublicationPermission(ctx, db, name, fmt.Errorf("postgres: alter publication %q tables: %w", name, err))
 	}
 	after, err := publicationMemberDefsAt(ctx, tx, name, version)
 	if err != nil {
@@ -874,10 +874,10 @@ func verifyPublicationUnchanged(ctx context.Context, db *sql.DB, name, schema st
 		// e.g. the publication was recreated FOR ALL TABLES (SET TABLE
 		// refuses there), or dropped outright — either way it no longer
 		// matches what this stream ensured moments ago. Loud.
-		return fmt.Errorf(
+		return classifyPublicationPermission(ctx, db, name, fmt.Errorf(
 			"postgres: post-slot publication re-verification: probe rescope of %q failed — the publication was redefined between this stream's ensure and its slot creation: %w",
 			name, err,
-		)
+		))
 	}
 	ensured, err := publicationMemberDefsAt(ctx, tx, name, version)
 	if err != nil {
@@ -976,7 +976,7 @@ func ensureAllTablesPublication(ctx context.Context, db *sql.DB, name string) er
 	if exists {
 		dropQuery := fmt.Sprintf(`DROP PUBLICATION %s`, quoteIdent(name))
 		if _, err := db.ExecContext(ctx, dropQuery); err != nil {
-			return fmt.Errorf("postgres: drop scoped publication %q for multi-schema FOR ALL TABLES: %w", name, err)
+			return classifyPublicationPermission(ctx, db, name, fmt.Errorf("postgres: drop scoped publication %q for multi-schema FOR ALL TABLES: %w", name, err))
 		}
 	}
 	createQuery := fmt.Sprintf(`CREATE PUBLICATION %s FOR ALL TABLES`, quoteIdent(name))
@@ -988,7 +988,7 @@ func ensureAllTablesPublication(ctx context.Context, db *sql.DB, name string) er
 		if isDuplicatePublication(err) {
 			return nil
 		}
-		return fmt.Errorf("postgres: create FOR ALL TABLES publication %q: %w", name, err)
+		return classifyPublicationPermission(ctx, db, name, fmt.Errorf("postgres: create FOR ALL TABLES publication %q: %w", name, err))
 	}
 	return nil
 }
@@ -1119,7 +1119,7 @@ func addTablesToPublication(ctx context.Context, db *sql.DB, name, schema string
 	alterQuery := fmt.Sprintf(`ALTER PUBLICATION %s ADD TABLE %s`,
 		quoteIdent(name), formatPublicationTableList(schema, toAdd, nil))
 	if _, err := db.ExecContext(ctx, alterQuery); err != nil {
-		return fmt.Errorf("postgres: alter publication %q add tables: %w", name, err)
+		return classifyPublicationPermission(ctx, db, name, fmt.Errorf("postgres: alter publication %q add tables: %w", name, err))
 	}
 	return nil
 }
@@ -1176,7 +1176,7 @@ func dropOwnPublicationIfPerStream(ctx context.Context, db *sql.DB, name string)
 		return nil
 	}
 	if _, err := db.ExecContext(ctx, "DROP PUBLICATION IF EXISTS "+quoteIdent(name)); err != nil {
-		return fmt.Errorf("postgres: drop per-stream publication %q: %w", name, err)
+		return classifyPublicationPermission(ctx, db, name, fmt.Errorf("postgres: drop per-stream publication %q: %w", name, err))
 	}
 	return nil
 }

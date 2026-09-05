@@ -118,6 +118,27 @@ ALTER ROLE sluice_user WITH REPLICATION;
 
 Without it, sluice fails on the first replication-protocol command rather than mid-stream.
 
+`REPLICATION` is necessary but not sufficient. sluice also creates the **publication** that CDC decodes through, and that DDL needs privileges the replication attribute does not confer:
+
+| What sluice does | What the role needs |
+| --- | --- |
+| `CREATE PUBLICATION … FOR TABLE …` (single-schema sync) | `CREATE` on the database, **and** ownership of every table in scope |
+| `CREATE PUBLICATION … FOR ALL TABLES` (multi-schema `sync start`, `backup full --chain-slot`) | **superuser** |
+
+```sql
+GRANT CREATE ON DATABASE appdb TO sluice_user;
+-- and, for each table in scope, either:
+ALTER TABLE public.orders OWNER TO sluice_user;
+-- or make sluice_user a member of the owning role:
+GRANT app_owner TO sluice_user;
+```
+
+The `FOR ALL TABLES` requirement is a hard one: on stock PostgreSQL no grant substitutes for superuser, because a database-wide publication reaches tables the role may not own. If superuser is not available to you, scope the run to a single schema and sluice creates a `FOR TABLE` publication instead.
+
+Missing any of these surfaces as `SLUICE-E-CDC-PUBLICATION-PERMISSION`, which carries the server's own message saying which of the three bit. sluice reports what the server answered rather than predicting it from the catalog — a catalog-based prediction was measured live-wrong on RDS for a different check, so the failure is classified rather than forecast.
+
+**Managed providers: unverified.** Whether the admin role a given provider hands you (RDS `rds_superuser`, Cloud SQL `cloudsqlsuperuser`, Azure `azure_pg_admin`) satisfies the `FOR ALL TABLES` case has **not** been measured by this project, and those roles are deliberately not true superusers. Treat the table above as the stock-PostgreSQL contract and test the multi-schema path on your provider before relying on it.
+
 ## Every in-scope table needs a usable replica identity
 
 sluice scopes its publication with `pubupdate`/`pubdelete`, and Postgres will not let *your own application* `UPDATE` or `DELETE` a published table that cannot identify its old row:
