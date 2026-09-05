@@ -4,6 +4,28 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.141.4] - 2026-09-05
+
+The applier retry budget is 12.7 seconds, not the four minutes the docs promised — corrected everywhere. Plus a Postgres source that could not be migrated at all, and a coded refusal for a publication the role may not create. Findings from a review of PlanetScale's pgcopydb fork PRs #34–#59.
+
+### Fixed
+
+**An unvalidated `CHECK` on a Postgres `DOMAIN` made the source un-migratable (UPR-1).** `readDomainChecks` strips `CHECK (` and trims the trailing `)`, but `pg_get_constraintdef` renders an unvalidated constraint as `CHECK ((VALUE > 0)) NOT VALID` — ending in `D`, so the trim matched nothing, the body kept an unbalanced paren and the emitted DDL was a syntax error. The suffix now comes off first. Measured on PG 16.
+
+**`NOT VALID` constraint state is carried instead of dropped (UPR-1).** `populateForeignKeys` never selected `convalidated`, and `populateCheckConstraints` reads `pg_get_expr(conbin, …)`, which renders the expression only — measured, `(q >= 0)` where `pg_get_constraintdef` gives `CHECK ((q >= 0)) NOT VALID`. Foreign keys now emit `NOT VALID` faithfully (after the `DEFERRABLE` clause, which PG's grammar requires) and it is compared and rendered as a third strength axis beside `Match` and `Deferrable`. Table and domain `CHECK` constraints WARN instead: PG rejects `NOT VALID` inline in `CREATE TABLE` and `CREATE DOMAIN`, and sluice emits one statement per DDL, so those need a separate `ALTER` pass (filed as UPR-1b). A warning rather than a refusal because the constraint is created on an empty table, so a source whose rows satisfy it migrates fine today. MySQL is exempt and says so at the emit site — InnoDB has no unvalidated state, so such an FK lands enforced and fails loudly at errno 1452.
+
+**A publication the role may not create is now `SLUICE-E-CDC-PUBLICATION-PERMISSION` (UPR-4).** Previously a raw uncoded `SQLSTATE 42501` at cold start, matched by no hint. Three grants produce it — `CREATE` on the database, table ownership, and superuser for `FOR ALL TABLES` — so the remedy names all three and the server's own message says which. `TestPublicationPrivilegeRoster_EveryDDLSiteIsClassified` derives the doors from the source: it found NINE where a hand count found eight, catching the mid-stream `schema add-table` add and the `sync decommission` drop.
+
+### Changed
+
+**The applier retry envelope is 12.7s, not ~4 minutes (UPR-3).** The schedule exponentiates from 100ms and never reaches the 30s cap at eight attempts: `100ms → 200ms → 400ms → 800ms → 1.6s → 3.2s → 6.4s`, seven sleeps, the eighth failure exhausting the budget without sleeping. The "four minutes" came from multiplying the cap by the attempt count. Corrected in five homes (the filing named four; the fifth was the per-attempt sequence in `cdc-streaming.md`, which listed an unreachable 12.8s term). **This does not cover a Patroni failover or vtgate restart** — `--apply-retry-attempts=20` gives 5m51s and does. `TestComputeRetryBackoff_AttemptsBudget` summed eight terms for seven sleeps and asserted a ceiling two orders of magnitude away, so it could not fail while naming the promise it guarded; it now pins the sequence and the total exactly.
+
+**`FOR ALL TABLES` works on RDS and Azure with the ordinary admin role.** Both patch PostgreSQL's superuser check — measured against live instances, `rolsuper` false on both and the statement succeeds — with a stock PG 18.6 control confirming the rule is not relaxed upstream. Cloud SQL unmeasured. The practical lesson is about instruments: a preflight predicting capability from `rolsuper` would refuse a configuration that demonstrably works, which is why sluice classifies the server's answer rather than forecasting it.
+
+### Compatibility
+
+Drop-in from v0.141.3. One new error code, no flag or format change. Carrying `NOT VALID` adds a schema field encoded so a schema without any unvalidated constraint hashes exactly as before — existing backup chains are unaffected; a source that has one will start a new chain segment, which is correct.
+
 ## [0.141.3] - 2026-09-05
 
 `sluice sync decommission` did nothing on the default configuration and reported success. If you run Postgres CDC and decommissioned a stream started without `--slot-name`, check `sluice slot list` for a leftover slot.
