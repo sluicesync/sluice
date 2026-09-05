@@ -1335,6 +1335,35 @@ func emitCreateDomainType(d ir.Domain, schema string, opts emitOpts) (string, er
 		} else {
 			out += fmt.Sprintf(" CHECK (%s)", c.Body)
 		}
+		// UPR-1, and this warn exists because its ABSENCE was the worst part
+		// of the fix that added it. Before v0.141.4 an unvalidated domain
+		// CHECK could not be migrated at all: the reader left a stray
+		// " NOT VALID" inside Body, and the emitted DDL was a syntax error.
+		// Fixing the parse made the DDL valid — and therefore made the run
+		// SUCCEED at exit 0, silently recreating the constraint as VALIDATING
+		// where the source had it unvalidated. That converted a loud failure
+		// into a quiet strength change, which is strictly worse, and the
+		// release notes claimed a warning here that did not exist. Caught by
+		// the pre-tag value-fidelity review.
+		//
+		// PG rejects NOT VALID inline in CREATE DOMAIN (measured on 16), and
+		// sluice emits one statement per DDL, so carrying it needs a separate
+		// ALTER DOMAIN pass — UPR-1b. Until then this is the notification.
+		if c.NotValid {
+			slog.Warn(
+				"source DOMAIN CHECK is NOT VALID and is being recreated as VALIDATING — the target will "+
+					"enforce a constraint the source does not",
+				slog.String("domain", d.Name),
+				slog.String("constraint", c.Name),
+				slog.String("why", "Postgres does not accept NOT VALID inside CREATE DOMAIN, and sluice "+
+					"emits one statement per DDL; carrying it needs a follow-up ALTER DOMAIN ... ADD "+
+					"CONSTRAINT ... NOT VALID, which sluice does not yet emit"),
+				slog.String("impact", "rows that violate this constraint will fail the copy with SQLSTATE "+
+					"23514 rather than landing wrong; --allow-degraded-fks does NOT apply to CHECK constraints"),
+				slog.String("remedy", "validate the constraint on the SOURCE before migrating "+
+					"(ALTER DOMAIN ... VALIDATE CONSTRAINT), or recreate it NOT VALID on the target by hand"),
+			)
+		}
 	}
 	return out + ";", nil
 }

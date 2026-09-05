@@ -778,10 +778,11 @@ func (r *SchemaReader) readDomainChecks(ctx context.Context) (map[string][]ir.Do
 		//
 		// The NOT VALID suffix must come off FIRST, and getting that order
 		// wrong is not a lost attribute but a syntax error. Measured on PG
-		// 16, an unvalidated domain constraint renders as
-		// `CHECK ((VALUE > 0)) NOT VALID`: the TrimSuffix(")") below then
+		// 16 -- and note this query passes pretty=true, so the render is
+		// `CHECK (VALUE > 0) NOT VALID` with SINGLE parens, not the
+		// double-paren non-pretty form. Either way the TrimSuffix(")") below then
 		// matches nothing (the string ends in "D"), Body keeps an unbalanced
-		// paren, and the writer emits `CHECK ((VALUE > 0)) NOT VALID)` — a
+		// paren, and the writer emits `CHECK (VALUE > 0) NOT VALID)` — a
 		// hard abort that reads like an internal sluice bug rather than a
 		// source sluice cannot carry (upstream review UPR-1).
 		body := condef

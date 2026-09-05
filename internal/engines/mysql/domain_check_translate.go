@@ -52,6 +52,7 @@ package mysql
 
 import (
 	"fmt"
+	"log/slog"
 	"regexp"
 	"strings"
 
@@ -117,6 +118,35 @@ func (m mysqlEmitter) translateDomainCheckToMySQL(col string, check ir.DomainChe
 	translated, ok := m.domainCheckBodyForMySQL(col, check)
 	if !ok {
 		return "", false
+	}
+	// UPR-1 sibling, and this one is a regression the SAME fix introduced —
+	// worth stating plainly because it is the shape where a fix removes a
+	// notification without anyone noticing.
+	//
+	// Before v0.141.4 the PG reader left a stray " NOT VALID" inside an
+	// unvalidated domain check's Body. That malformed body did not TRANSLATE,
+	// so this returned ok=false and maybeWarnDomainCheckDrop warned and
+	// dropped the constraint. Fixing the parse made the body clean, so the
+	// translation now SUCCEEDS — and MySQL silently gains an ENFORCED inline
+	// CHECK for a constraint the source declared unvalidated, with the old
+	// warning suppressed precisely because the translation stopped failing.
+	//
+	// MySQL has no NOT VALID: a CHECK is enforced or absent. So this lands
+	// strictly stronger than the source and fails LOUDLY at errno 3819 if the
+	// copied rows violate it — the same asymmetry the foreign-key path warns
+	// about, which is why it warns here too rather than relying on the
+	// drop-warn that no longer fires.
+	if check.NotValid {
+		slog.Warn(
+			"source DOMAIN CHECK is NOT VALID and MySQL has no equivalent — it becomes an ENFORCED "+
+				"column CHECK, so rows the source tolerates will fail the copy with errno 3819",
+			slog.String("column", col),
+			slog.String("constraint", check.Name),
+			slog.String("why", "MySQL CHECK constraints are enforced or absent; there is no "+
+				"created-but-unvalidated state to translate into"),
+			slog.String("remedy", "validate the constraint on the SOURCE before migrating, or drop it "+
+				"there if it no longer describes the data"),
+		)
 	}
 	return "CHECK (" + translated + ")", true
 }

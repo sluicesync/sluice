@@ -7,6 +7,7 @@ package postgres
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -150,4 +151,181 @@ func TestSchemaReader_DomainRoundTrip_NonDomainUserDefinedStillRoundTrips(t *tes
 	if _, isDomain := role.Type.(ir.Domain); isDomain {
 		t.Errorf("role column was wrongly wrapped as ir.Domain (typtype mismatch)")
 	}
+}
+
+// TestSchemaReader_NotValidConstraints_UPR1 pins the READER side of the
+// NOT VALID carry — the half that touches captured text and, until this test,
+// had no coverage at all.
+//
+// The emitter got a unit pin when the fix landed; the reader did not, and a
+// pre-tag review found that reverting the `CutSuffix` block left the entire
+// suite green. That is the shape of gap that lets a parse fix regress
+// silently, so it is pinned against a real catalog rather than a fixture.
+//
+// The domain cell is the headline: `pg_get_constraintdef(oid, true)` renders
+// an unvalidated constraint as `CHECK (VALUE > 0) NOT VALID`, and the reader
+// used to strip `CHECK (` then TrimSuffix(")") — which matched nothing,
+// because the string ends in "D". The captured Body kept an unbalanced paren
+// and the emitted DDL was a syntax error, so a legal source could not be
+// migrated at all.
+//
+// Cells 3 and 4 are the anti-vacuity half and they are not decoration: a cut
+// that over-matched (a regex on `NOT VALID` anywhere, say) would pass cells 1
+// and 2 and fail here, because the expression itself contains that text.
+func TestSchemaReader_NotValidConstraints_UPR1(t *testing.T) {
+	dsn, cleanup := startPostgres(t)
+	defer cleanup()
+
+	const ddl = `
+		DROP TABLE IF EXISTS nv_child CASCADE;
+		DROP TABLE IF EXISTS nv_parent CASCADE;
+		DROP DOMAIN IF EXISTS nv_pos;
+		DROP DOMAIN IF EXISTS nv_ok;
+		DROP DOMAIN IF EXISTS nv_literal;
+
+		CREATE DOMAIN nv_pos AS int;
+		ALTER DOMAIN nv_pos ADD CONSTRAINT nv_pos_chk CHECK (VALUE > 0) NOT VALID;
+
+		CREATE DOMAIN nv_ok AS int CHECK (VALUE > 0);
+
+		-- The expression itself ends in the literal text a naive cut would eat.
+		CREATE DOMAIN nv_literal AS text
+		  CHECK (VALUE <> 'x NOT VALID');
+
+		CREATE TABLE nv_parent (id int PRIMARY KEY);
+		CREATE TABLE nv_child (
+		  id  int PRIMARY KEY,
+		  qty int
+		);
+		ALTER TABLE nv_child ADD CONSTRAINT nv_fk
+		  FOREIGN KEY (id) REFERENCES nv_parent(id) NOT VALID;
+		ALTER TABLE nv_child ADD CONSTRAINT nv_chk CHECK (qty >= 0) NOT VALID;
+	`
+	applyDDL(t, dsn, ddl)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	r, err := Engine{}.OpenSchemaReader(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenSchemaReader: %v", err)
+	}
+	defer closeIf(r)
+
+	schema, err := r.ReadSchema(ctx)
+	if err != nil {
+		t.Fatalf("ReadSchema: %v", err)
+	}
+
+	domainCheck := func(domainName string) (ir.DomainCheck, bool) {
+		for _, tab := range schema.Tables {
+			for _, col := range tab.Columns {
+				d, ok := col.Type.(ir.Domain)
+				if !ok || d.Name != domainName {
+					continue
+				}
+				if len(d.Checks) > 0 {
+					return d.Checks[0], true
+				}
+			}
+		}
+		return ir.DomainCheck{}, false
+	}
+
+	t.Run("an unvalidated DOMAIN check keeps a balanced body and carries NotValid", func(t *testing.T) {
+		// Reached via a table column so the domain is in the read set.
+		applyDDL(t, dsn, `ALTER TABLE nv_child ADD COLUMN p nv_pos;`)
+		s2, err := r.ReadSchema(ctx)
+		if err != nil {
+			t.Fatalf("ReadSchema: %v", err)
+		}
+		schema = s2
+		c, ok := domainCheck("nv_pos")
+		if !ok {
+			t.Fatal("nv_pos domain not found in the read schema")
+		}
+		if !c.NotValid {
+			t.Error("NotValid=false for a constraint the source declared NOT VALID — the state was dropped")
+		}
+		if strings.Contains(c.Body, "NOT VALID") {
+			t.Errorf("Body still carries the qualifier: %q.\n\nThis is the exact pre-fix defect: the "+
+				"emitted DDL becomes a syntax error and the source cannot be migrated at all.", c.Body)
+		}
+		if strings.Count(c.Body, "(") != strings.Count(c.Body, ")") {
+			t.Errorf("Body has unbalanced parentheses: %q", c.Body)
+		}
+	})
+
+	t.Run("a VALIDATED domain check is unchanged", func(t *testing.T) {
+		applyDDL(t, dsn, `ALTER TABLE nv_child ADD COLUMN o nv_ok;`)
+		s2, err := r.ReadSchema(ctx)
+		if err != nil {
+			t.Fatalf("ReadSchema: %v", err)
+		}
+		schema = s2
+		c, ok := domainCheck("nv_ok")
+		if !ok {
+			t.Fatal("nv_ok domain not found")
+		}
+		if c.NotValid {
+			t.Error("NotValid=true for a VALIDATED constraint — inverted sign")
+		}
+		if strings.Contains(c.Body, "NOT VALID") {
+			t.Errorf("Body polluted: %q", c.Body)
+		}
+	})
+
+	t.Run("an expression ending in the literal 'NOT VALID' survives intact", func(t *testing.T) {
+		applyDDL(t, dsn, `ALTER TABLE nv_child ADD COLUMN l nv_literal;`)
+		s2, err := r.ReadSchema(ctx)
+		if err != nil {
+			t.Fatalf("ReadSchema: %v", err)
+		}
+		schema = s2
+		c, ok := domainCheck("nv_literal")
+		if !ok {
+			t.Fatal("nv_literal domain not found")
+		}
+		if c.NotValid {
+			t.Error("NotValid=true for a VALIDATED constraint whose EXPRESSION merely contains the text " +
+				"'NOT VALID' — the cut over-matched, which is the failure mode this cell exists for")
+		}
+		if !strings.Contains(c.Body, "NOT VALID") {
+			t.Errorf("the literal was eaten out of the expression body: %q — the constraint now means "+
+				"something different from what the source enforces", c.Body)
+		}
+	})
+
+	t.Run("table FK and CHECK carry NotValid", func(t *testing.T) {
+		tab := findTable(schema, "nv_child")
+		if tab == nil {
+			t.Fatalf("nv_child missing; have %v", tableNames(schema))
+		}
+		var sawFK bool
+		for _, fk := range tab.ForeignKeys {
+			if fk.Name == "nv_fk" {
+				sawFK = true
+				if !fk.NotValid {
+					t.Error("ForeignKey.NotValid=false for a NOT VALID source FK; convalidated was dropped " +
+						"or its sign inverted")
+				}
+			}
+		}
+		if !sawFK {
+			t.Error("nv_fk not read at all")
+		}
+		var sawChk bool
+		for _, c := range tab.CheckConstraints {
+			if c.Name == "nv_chk" {
+				sawChk = true
+				if !c.NotValid {
+					t.Error("CheckConstraint.NotValid=false for a NOT VALID source CHECK — pg_get_expr " +
+						"cannot carry the qualifier, so convalidated must be selected explicitly")
+				}
+			}
+		}
+		if !sawChk {
+			t.Error("nv_chk not read at all")
+		}
+	})
 }

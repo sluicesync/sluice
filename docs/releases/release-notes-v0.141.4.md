@@ -6,7 +6,7 @@ This release also fixes a Postgres source that could not be migrated at all, and
 
 ## Fixed
 
-**A Postgres source with an unvalidated `CHECK` on a `DOMAIN` could not be migrated.** The schema reader strips the `CHECK (` wrapper from `pg_get_constraintdef` and trims the closing paren — but an unvalidated constraint renders as `CHECK ((VALUE > 0)) NOT VALID`, which ends in `D`. The trim matched nothing, the captured body kept an unbalanced parenthesis, and the emitted DDL was a syntax error. A legal source failed in a way that read like an internal sluice bug rather than something about your schema. Measured on PostgreSQL 16.
+**A Postgres source with an unvalidated `CHECK` on a `DOMAIN` could not be migrated.** The schema reader strips the `CHECK (` wrapper from `pg_get_constraintdef` and trims the closing paren — but an unvalidated constraint renders as `CHECK (VALUE > 0) NOT VALID`, which ends in `D`. The trim matched nothing, the captured body kept an unbalanced parenthesis, and the emitted DDL was a syntax error. A legal source failed in a way that read like an internal sluice bug rather than something about your schema. Measured on PostgreSQL 16.
 
 **`NOT VALID` constraint state is now carried rather than silently dropped.** A source foreign key marked `NOT VALID` was recreated as validating. That is not a stricter copy: the source is telling you it holds rows the predicate rejects, so validating on the target either fails the run or misrepresents the data. Foreign keys now carry it faithfully, and it participates in schema-diff and drift reports as a third constraint-strength axis alongside `MATCH` and `DEFERRABLE`.
 
@@ -28,7 +28,7 @@ The test that was supposed to guard this number could not: `TestComputeRetryBack
 
 Drop-in from v0.141.3. One new error code (`SLUICE-E-CDC-PUBLICATION-PERMISSION`), no flag change, no format change.
 
-**Backup chains:** carrying `NOT VALID` adds a field to the recorded schema, encoded so that a schema *without* any unvalidated constraint hashes exactly as before — existing chains are unaffected. A source that genuinely has one will hash differently and its next backup will start a new chain segment, which is correct: what sluice records about that schema has changed.
+**Backup chains are unaffected, including for sources that do have unvalidated constraints.** Carrying `NOT VALID` adds a field to the recorded schema, encoded so a schema without one hashes exactly as before. And chain verification recomputes each link's hash from the schema that link itself carries, rather than comparing links to one another — so a chain written by an older release still self-verifies under this one. No repartition, no forced full backup.
 
 No re-run is needed for the retry correction; it is a documentation fix. Whether you want to *act* on it is the question — check whether your `--apply-retry-attempts` was chosen against the four-minute figure.
 

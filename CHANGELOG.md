@@ -10,7 +10,7 @@ The applier retry budget is 12.7 seconds, not the four minutes the docs promised
 
 ### Fixed
 
-**An unvalidated `CHECK` on a Postgres `DOMAIN` made the source un-migratable (UPR-1).** `readDomainChecks` strips `CHECK (` and trims the trailing `)`, but `pg_get_constraintdef` renders an unvalidated constraint as `CHECK ((VALUE > 0)) NOT VALID` — ending in `D`, so the trim matched nothing, the body kept an unbalanced paren and the emitted DDL was a syntax error. The suffix now comes off first. Measured on PG 16.
+**An unvalidated `CHECK` on a Postgres `DOMAIN` made the source un-migratable (UPR-1).** `readDomainChecks` strips `CHECK (` and trims the trailing `)`, but `pg_get_constraintdef` (which this reader calls with `pretty=true`) renders an unvalidated constraint as `CHECK (VALUE > 0) NOT VALID` — ending in `D`, so the trim matched nothing, the body kept an unbalanced paren and the emitted DDL was a syntax error. The suffix now comes off first. Measured on PG 16.
 
 **`NOT VALID` constraint state is carried instead of dropped (UPR-1).** `populateForeignKeys` never selected `convalidated`, and `populateCheckConstraints` reads `pg_get_expr(conbin, …)`, which renders the expression only — measured, `(q >= 0)` where `pg_get_constraintdef` gives `CHECK ((q >= 0)) NOT VALID`. Foreign keys now emit `NOT VALID` faithfully (after the `DEFERRABLE` clause, which PG's grammar requires) and it is compared and rendered as a third strength axis beside `Match` and `Deferrable`. Table and domain `CHECK` constraints WARN instead: PG rejects `NOT VALID` inline in `CREATE TABLE` and `CREATE DOMAIN`, and sluice emits one statement per DDL, so those need a separate `ALTER` pass (filed as UPR-1b). A warning rather than a refusal because the constraint is created on an empty table, so a source whose rows satisfy it migrates fine today. MySQL is exempt and says so at the emit site — InnoDB has no unvalidated state, so such an FK lands enforced and fails loudly at errno 1452.
 
@@ -24,7 +24,7 @@ The applier retry budget is 12.7 seconds, not the four minutes the docs promised
 
 ### Compatibility
 
-Drop-in from v0.141.3. One new error code, no flag or format change. Carrying `NOT VALID` adds a schema field encoded so a schema without any unvalidated constraint hashes exactly as before — existing backup chains are unaffected; a source that has one will start a new chain segment, which is correct.
+Drop-in from v0.141.3. One new error code, no flag or format change. Carrying `NOT VALID` adds a schema field encoded so a schema without any unvalidated constraint hashes exactly as before. Chains are unaffected even for sources that DO have one: verification recomputes each link's hash from the schema that link carries rather than comparing links, so a chain written by an older release still self-verifies. No repartition.
 
 ## [0.141.3] - 2026-09-05
 
