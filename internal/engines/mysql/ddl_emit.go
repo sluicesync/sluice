@@ -2014,6 +2014,22 @@ func emitCheckConstraint(c *ir.CheckConstraint, backslashEscapes bool) (string, 
 	sb.WriteString("CHECK (")
 	sb.WriteString(exprText)
 	sb.WriteByte(')')
+	// UPR-1c. MySQL CHECK constraints are enforced or absent -- there is no
+	// created-but-unvalidated state -- so a source NOT VALID CHECK lands
+	// STRICTLY STRONGER here than on the source. That fails loudly at errno
+	// 3819 if the copied rows violate it, which is the same asymmetry the
+	// foreign-key path warns about; it warned there and was silent here.
+	if c.NotValid {
+		slog.Warn(
+			"source CHECK constraint is NOT VALID and MySQL has no equivalent — it becomes an "+
+				"ENFORCED constraint, so rows the source tolerates will fail the copy with errno 3819",
+			slog.String("constraint", c.Name),
+			slog.String("why", "MySQL CHECK constraints are enforced or absent; there is no "+
+				"created-but-unvalidated state for sluice to carry"),
+			slog.String("remedy", "validate the constraint on the SOURCE before migrating, or drop it "+
+				"there if it no longer describes the data"),
+		)
+	}
 	return sb.String(), nil
 }
 

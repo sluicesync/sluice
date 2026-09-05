@@ -334,6 +334,24 @@ func emitForeignKey(fk *ir.ForeignKey) (string, error) {
 			fk.Name, len(fk.Columns), len(fk.ReferencedColumns))
 	}
 
+	// UPR-1c. SQLite has no unvalidated-constraint concept at all: a foreign
+	// key is enforced (when foreign_keys=ON) or it is not there. So a source
+	// NOT VALID FK cannot be carried, and lands stricter than the source did.
+	// Warned rather than dropped silently, matching the MySQL path -- the
+	// value of this line is that the operator learns it here rather than from
+	// a constraint failure later.
+	if fk.NotValid {
+		slog.Warn(
+			"source FOREIGN KEY is NOT VALID and SQLite has no equivalent — it is emitted as an "+
+				"ordinary enforced constraint",
+			slog.String("constraint", fk.Name),
+			slog.String("why", "SQLite foreign keys are enforced or absent; there is no "+
+				"created-but-unvalidated state for sluice to carry"),
+			slog.String("remedy", "validate the constraint on the SOURCE before migrating, or drop it "+
+				"there if it no longer describes the data"),
+		)
+	}
+
 	var sb strings.Builder
 	if fk.Name != "" {
 		sb.WriteString("CONSTRAINT ")
