@@ -48,7 +48,13 @@ var (
 	// Dispatched by type assertion in internal/pipeline/decommission.go, so a
 	// receiver or signature drift would silently stop matching; this is the pin
 	// the optional-dispatch gate requires for exactly that reason.
-	_ ir.SlotNameResolver             = (*SlotManager)(nil)
+	_ ir.SlotNameResolver = (*SlotManager)(nil)
+	// UPR-2: the pipeline wires this for EVERY reader it opens
+	// (streamer_filter_flip.go), so before the Postgres reader implemented it
+	// the type assertion silently matched nothing and the reader could not see
+	// the table filter at all — which is how a DDL on an --exclude-table'd
+	// table could still take a filtered stream down.
+	_ ir.CDCScopePredicateSetter      = (*CDCReader)(nil)
 	_ ir.SnapshotExporter             = Engine{}
 	_ ir.SnapshotImporterOpener       = Engine{}
 	_ ir.SnapshotStreamWithSlotOpener = Engine{}

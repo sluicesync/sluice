@@ -151,6 +151,25 @@ type CDCReader struct {
 	// CDCReader.cdcDBInScope (server-wide binlog → database-wide slot).
 	cdcSchemaInScope func(schema string) bool
 
+	// scopeAllowed is the pipeline-supplied TABLE-level scope predicate
+	// ([ir.CDCScopePredicateSetter]). cdcSchemaInScope above answers "is this
+	// namespace selected"; this answers "is this table selected", which is a
+	// strictly narrower question — `--exclude-table` removes a table from a
+	// schema that IS in scope.
+	//
+	// UPR-2: the reader consulted neither when handling a RelationMessage, so
+	// a DDL on a relation the reader had been told to ignore still ran the
+	// schema-race checks and could take the stream down with a refusal whose
+	// remedy names a table the operator deliberately excluded. The four
+	// dispatch sites always consulted schemaInScope; the relation path did
+	// not, which is the classic "the guard reached dispatchRow and not the
+	// other door" shape.
+	//
+	// nil means no table filter was supplied (the reader is unfiltered), and
+	// every table in an in-scope schema is allowed — so a nil predicate keeps
+	// the pre-UPR-2 behaviour byte-identical for unfiltered streams.
+	scopeAllowed func(schema, table string) bool
+
 	// dsn is the underlying connection string the schema-DB was
 	// opened with. Stashed so [StreamChanges] can re-open it in
 	// replication mode.
@@ -383,6 +402,68 @@ func (r *CDCReader) schemaInScope(schema string) bool {
 		return r.cdcSchemaInScope(schema)
 	}
 	return schema == r.schema
+}
+
+// gradeRelationSchemaRace runs the two stream-ending schema-race refusals for
+// one RelationMessage — but only for a relation this stream would actually
+// emit for.
+//
+// UPR-2. Before this existed the refusals ran for EVERY relation the
+// publication delivered, including a schema the operator did not select and a
+// table they excluded by name, so a DDL on an ignored relation could end a
+// filtered stream with a remedy naming a table they had deliberately removed
+// from scope. That is a refusal firing on a working configuration.
+//
+// It is a FUNCTION rather than a guard inlined in each arm because dispatchWAL
+// carries the V1 and V2 protocol arms as byte-for-byte duplicates, and that
+// duplication is what made the original miss possible: a fix applied to one
+// arm reads complete. One callee cannot be half-fixed.
+//
+// The caller still caches the entry afterwards. It is inert for an
+// out-of-scope relation (no DML is emitted for it), and keeping it means a
+// later live add-table that widens scope decodes against the current shape
+// rather than a stale one.
+func (r *CDCReader) gradeRelationSchemaRace(relations map[uint32]*relationCacheEntry, relationID uint32, entry *relationCacheEntry) error {
+	if !r.relationInScope(entry.Schema, entry.Name) {
+		return nil
+	}
+	// SLM-1c: the seeded prior stands in for the OID cache at this relation's
+	// first RelationMessage of the process — a stopped-stream zone swap is
+	// refused here or nowhere.
+	if err := r.checkSeededSchemaRace(relations, relationID, entry); err != nil {
+		return err
+	}
+	return checkSchemaRace(relations, relationID, entry, r.schemaForward)
+}
+
+// SetCDCScopePredicate implements [ir.CDCScopePredicateSetter]: the pipeline
+// hands the reader its effective TABLE scope. The pipeline already wires this
+// for every reader it opens (streamer_filter_flip.go); before UPR-2 the
+// Postgres reader simply did not implement the interface, so the assertion
+// silently found nothing and the reader could not see the table filter at all.
+//
+// Must be called before StreamChanges (the pipeline does); the predicate is
+// read from the pump goroutine and the pipeline closure reads an atomic
+// pointer, so it is safe there.
+func (r *CDCReader) SetCDCScopePredicate(allowed func(schema, table string) bool) {
+	r.scopeAllowed = allowed
+}
+
+// relationInScope reports whether this stream is configured to emit anything
+// for the relation. It is the single decision point the RelationMessage path
+// consults, mirroring what the four dispatch sites already do -- schema first
+// (the cheap, always-present check), then the table filter when one exists.
+//
+// A nil scopeAllowed means no table filter was supplied, so the schema answer
+// stands alone and an unfiltered stream behaves exactly as before UPR-2.
+func (r *CDCReader) relationInScope(schema, table string) bool {
+	if !r.schemaInScope(schema) {
+		return false
+	}
+	if r.scopeAllowed == nil {
+		return true
+	}
+	return r.scopeAllowed(schema, table)
 }
 
 // Close stops the pump goroutine, JOINS it, and only then releases the
@@ -1126,13 +1207,7 @@ func (r *CDCReader) dispatchWAL(
 		if err := r.resolveGeometryColumnSRIDs(ctx, entry); err != nil {
 			return fmt.Errorf("postgres: cdc: relation %s.%s: %w", m.Namespace, m.RelationName, err)
 		}
-		// SLM-1c: the seeded prior stands in for the OID cache at this
-		// relation's first RelationMessage of the process — a
-		// stopped-stream zone swap is refused here or nowhere.
-		if err := r.checkSeededSchemaRace(relations, m.RelationID, entry); err != nil {
-			return err
-		}
-		if err := checkSchemaRace(relations, m.RelationID, entry, r.schemaForward); err != nil {
+		if err := r.gradeRelationSchemaRace(relations, m.RelationID, entry); err != nil {
 			return err
 		}
 		// Replace the cache entry with the new shape so subsequent DML on
@@ -1169,13 +1244,7 @@ func (r *CDCReader) dispatchWAL(
 		if err := r.resolveGeometryColumnSRIDs(ctx, entry); err != nil {
 			return fmt.Errorf("postgres: cdc: relation %s.%s: %w", m.Namespace, m.RelationName, err)
 		}
-		// SLM-1c: the seeded prior stands in for the OID cache at this
-		// relation's first RelationMessage of the process — a
-		// stopped-stream zone swap is refused here or nowhere.
-		if err := r.checkSeededSchemaRace(relations, m.RelationID, entry); err != nil {
-			return err
-		}
-		if err := checkSchemaRace(relations, m.RelationID, entry, r.schemaForward); err != nil {
+		if err := r.gradeRelationSchemaRace(relations, m.RelationID, entry); err != nil {
 			return err
 		}
 		// Replace the cache entry with the new shape so subsequent DML on
