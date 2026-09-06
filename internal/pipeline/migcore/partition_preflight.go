@@ -1,7 +1,7 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-package pipeline
+package migcore
 
 import (
 	"context"
@@ -10,7 +10,6 @@ import (
 	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
-	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // Bug 100 (v0.92.0). PG native declarative partitioning
@@ -31,52 +30,52 @@ import (
 // operator-actionable recovery paths. Proper partition support is a
 // roadmap candidate, not a hotfix.
 
-// errPartitionedTableRefused is the sentinel for the Bug 100 loud
+// ErrPartitionedTableRefused is the sentinel for the Bug 100 loud
 // refusal. Wrapped with per-table detail.
-var errPartitionedTableRefused = errors.New("pipeline: source schema contains PG declaratively-partitioned table(s) — sluice does not yet support partition-aware migration")
+var ErrPartitionedTableRefused = errors.New("pipeline: source schema contains PG declaratively-partitioned table(s) — sluice does not yet support partition-aware migration")
 
-// partitionPreflightProber is the optional engine-side surface for
+// PartitionPreflightProber is the optional engine-side surface for
 // detecting declarative partitioning. PG implements
 // (`SchemaReader.PartitionedTables`); MySQL doesn't (its inheritance-
 // style partitioning is a different concept and out of scope here).
 //
 // Engines that don't implement the surface (MySQL, every non-CDC
 // path) are silently skipped — the opportunistic-skip posture matches
-// [preflightRLS] and [preflightSourceReplication].
-type partitionPreflightProber interface {
+// [PreflightRLS] and [preflightSourceReplication].
+type PartitionPreflightProber interface {
 	PartitionedTables(ctx context.Context) ([]string, error)
 }
 
-// preflightPartitionedTables runs the partitioning preflight against
+// PreflightPartitionedTables runs the partitioning preflight against
 // the source schema reader. Returns nil when:
 //
 //   - The source doesn't declare [ir.Capabilities.PostgresBackend]
 //     (PG declarative partitioning is a PG-server concept; MySQL
 //     silently skips, mirroring [preflightSourceReplication]'s
 //     capability gate).
-//   - The handle doesn't implement [partitionPreflightProber] (the
-//     opportunistic-skip posture matches [preflightRLS]).
+//   - The handle doesn't implement [PartitionPreflightProber] (the
+//     opportunistic-skip posture matches [PreflightRLS]).
 //   - No table in the active schema is partitioned.
 //   - Every partitioned parent is excluded via the operator's
-//     [migcore.TableFilter] (so a `--exclude-table=parent` operator-supplied
+//     [TableFilter] (so a `--exclude-table=parent` operator-supplied
 //     workaround actually works, instead of refusing on a table the
 //     operator already excluded).
 //
-// Returns a wrapped [errPartitionedTableRefused] when at least one
+// Returns a wrapped [ErrPartitionedTableRefused] when at least one
 // partitioned parent table is in-scope. The message names every
 // offending parent (sorted) and lists the three operator-actionable
 // recovery paths.
-func preflightPartitionedTables(ctx context.Context, handle any, sourceCaps ir.Capabilities, schema *ir.Schema) error {
+func PreflightPartitionedTables(ctx context.Context, handle any, sourceCaps ir.Capabilities, schema *ir.Schema) error {
 	if !sourceCaps.PostgresBackend {
 		return nil
 	}
-	prober, ok := handle.(partitionPreflightProber)
+	prober, ok := handle.(PartitionPreflightProber)
 	if !ok {
 		return nil
 	}
 	partitioned, err := prober.PartitionedTables(ctx)
 	if err != nil {
-		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf(
+		return WrapWithHint(PhaseConnect, fmt.Errorf(
 			"pipeline: partition preflight: probe source for partitioned tables: %w", err,
 		))
 	}
@@ -109,9 +108,9 @@ func preflightPartitionedTables(ctx context.Context, handle any, sourceCaps ir.C
 		return nil
 	}
 
-	return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf(
+	return WrapWithHint(PhaseConnect, fmt.Errorf(
 		"%w: %s",
-		errPartitionedTableRefused, formatPartitionedRefusal(inScope),
+		ErrPartitionedTableRefused, formatPartitionedRefusal(inScope),
 	))
 }
 

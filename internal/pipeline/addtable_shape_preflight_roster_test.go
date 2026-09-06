@@ -19,9 +19,9 @@ import (
 // table, and these three are the checks that decide whether those rows can be
 // read faithfully at all.
 var addTableShapePreflights = []string{
-	"preflightRLS",
-	"preflightPartitionedTables",
-	"preflightInheritanceTables",
+	"PreflightRLS",
+	"PreflightPartitionedTables",
+	"PreflightInheritanceTables",
 }
 
 // TestAddTableRosterReachesTheShapePreflights is the gate for audit
@@ -51,11 +51,14 @@ var addTableShapePreflights = []string{
 // or that the handle is still open when they do — those are pinned by the
 // behaviour of the preflights themselves.
 //
-// STILL OUTSIDE ANY ROSTER: `(*Backup).Run`, the third entry point the audit
-// named. It is not wired yet and is therefore not asserted here — a gate that
-// listed it with an exemption would be a standing excuse, and one that
-// demanded it would fail the build. Tracked in the audit backlog; when it is
-// wired it belongs in this test, not in a new one.
+// `(*Backup).Run` — the third entry point the audit named — IS now wired,
+// and is asserted by TestBackupRunReachesTheShapePreflights in the backup
+// package rather than here: this walker only scans internal/pipeline, and a
+// gate that cannot see the consumer it names is worse than no gate. It could not be before: pipeline imports pipeline/backup,
+// so backup can never import pipeline, and the three preflights lived in the
+// pipeline root. The audit's suggested "widen the consumer set" was therefore
+// a package move, not a wiring change; they now sit in migcore beside the
+// eight preflights that were already there, and both consumers reach them.
 func TestAddTableRosterReachesTheShapePreflights(t *testing.T) {
 	calls := discoverPreflightCallsByFunc(t)
 

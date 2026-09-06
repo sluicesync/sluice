@@ -167,7 +167,7 @@ func (m *Migrator) phaseReadSourceSchema(ctx context.Context, scope *multiDBScop
 	// table short-circuits the refusal (one of the documented
 	// recovery hints). No-op on non-PG sources (the interface
 	// type-assertion falls through silently).
-	if err := preflightRLS(ctx, schema, sr, rlsSideSource); err != nil {
+	if err := migcore.PreflightRLS(ctx, schema, sr, migcore.RLSSideSource); err != nil {
 		return sr, nil, err
 	}
 
@@ -187,7 +187,7 @@ func (m *Migrator) phaseReadSourceSchema(ctx context.Context, scope *multiDBScop
 	// re-copy the children as separate heaps. PG-only; the
 	// PostgresBackend capability gate inside the preflight excludes
 	// non-PG paths.
-	if err := preflightPartitionedTables(ctx, sr, m.Source.Capabilities(), schema); err != nil {
+	if err := migcore.PreflightPartitionedTables(ctx, sr, m.Source.Capabilities(), schema); err != nil {
 		return sr, nil, err
 	}
 
@@ -195,7 +195,7 @@ func (m *Migrator) phaseReadSourceSchema(ctx context.Context, scope *multiDBScop
 	// twin for old-style INHERITS hierarchies: children copy
 	// independently while the parent SELECT also returns their rows,
 	// so proceeding would silently duplicate the child data.
-	if err := preflightInheritanceTables(ctx, sr, m.Source.Capabilities(), schema); err != nil {
+	if err := migcore.PreflightInheritanceTables(ctx, sr, m.Source.Capabilities(), schema); err != nil {
 		return sr, nil, err
 	}
 
@@ -438,7 +438,7 @@ func (m *Migrator) phasePreflightTarget(ctx context.Context, rc resumeContext, s
 	// CHECK class. Runs against the target RowWriter (rw) regardless
 	// of resume / reset-target-data state: RLS is a role-permission
 	// gate, not a state gate. No-op on non-PG targets.
-	if err := preflightRLS(ctx, schema, rw, rlsSideTarget); err != nil {
+	if err := migcore.PreflightRLS(ctx, schema, rw, migcore.RLSSideTarget); err != nil {
 		return markFailed(ctx, rc, state, ir.MigrationPhasePending, err)
 	}
 

@@ -421,7 +421,7 @@ func (s *Streamer) coldStartReadSourceSchema(ctx context.Context, resumingCopy b
 	// AFTER the table filter so `--exclude-table` of an RLS table
 	// short-circuits the refusal (one of the recovery hints). No-op
 	// on non-PG sources.
-	if err := preflightRLS(ctx, schema, sr, rlsSideSource); err != nil {
+	if err := migcore.PreflightRLS(ctx, schema, sr, migcore.RLSSideSource); err != nil {
 		migcore.CloseIf(sr)
 		return nil, nil, err
 	}
@@ -471,14 +471,14 @@ func (s *Streamer) coldStartReadSourceSchema(ctx context.Context, resumingCopy b
 	// Partition preflight (Bug 100 / v0.92.0). Same shape as the
 	// migrate preflight — refuses upfront when the source schema
 	// contains declaratively-partitioned tables.
-	if err := preflightPartitionedTables(ctx, sr, s.Source.Capabilities(), schema); err != nil {
+	if err := migcore.PreflightPartitionedTables(ctx, sr, s.Source.Capabilities(), schema); err != nil {
 		migcore.CloseIf(sr)
 		return nil, nil, err
 	}
 	// Legacy-inheritance preflight (roadmap item 68b) — same shape as
 	// the migrate preflight: refuses upfront on old-style INHERITS
 	// parents, whose child rows would otherwise copy twice.
-	if err := preflightInheritanceTables(ctx, sr, s.Source.Capabilities(), schema); err != nil {
+	if err := migcore.PreflightInheritanceTables(ctx, sr, s.Source.Capabilities(), schema); err != nil {
 		migcore.CloseIf(sr)
 		return nil, nil, err
 	}
@@ -813,7 +813,7 @@ func (s *Streamer) coldStartOpenTargetWriters(ctx context.Context, schema *ir.Sc
 	// RLS gate is the operator's responsibility on that path. No-op on
 	// non-PG targets.
 	if !s.SchemaAlreadyApplied {
-		if err := preflightRLS(ctx, schema, rw, rlsSideTarget); err != nil {
+		if err := migcore.PreflightRLS(ctx, schema, rw, migcore.RLSSideTarget); err != nil {
 			migcore.CloseIf(rw)
 			migcore.CloseIf(sw)
 			_ = stream.Abandon()

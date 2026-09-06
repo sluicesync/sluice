@@ -5,7 +5,7 @@ package postgres
 
 // Postgres-side implementation of the orchestrator's RLS-preflight
 // prober surface (task #52 sub-deliverable 1; see
-// `internal/pipeline/rls_preflight.go` for the operator-facing
+// `internal/pipeline/migcore/rls_preflight.go` for the operator-facing
 // rationale).
 //
 // Two surfaces implement the probe:

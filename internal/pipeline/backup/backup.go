@@ -395,6 +395,17 @@ func (b *Backup) Run(ctx context.Context) error {
 	}
 	adopting := resumeAnchor.Engine != "" || resumeAnchor.Token != ""
 
+	// 0.5. A resume KEEPS the interrupted attempt's completed tables, so
+	// its redaction policy is not a per-run choice — it is a property of
+	// the manifest being continued. Refuse a resume that would mix two
+	// policies (or, the accident-shaped case, drop --redact on a shorter
+	// re-run) before anything is read. Runs on every resume shape, not
+	// just the anchor-adopting one: the non-snapshot fallback keeps prior
+	// tables too.
+	if err := refuseResumeUnderDifferentRedaction(prior, b.redactionMarker(), lineage.ManifestFileName); err != nil {
+		return err
+	}
+
 	// 1. Read source schema.
 	sr, err := b.Source.OpenSchemaReader(ctx, b.SourceDSN)
 	if err != nil {
@@ -431,6 +442,22 @@ func (b *Backup) Run(ctx context.Context) error {
 		return err
 	}
 
+	// 2.1. Source-shape preflights (audit 2026-09-06 W4 H3). backup full is a
+	// row-emitting entry point and ran none of these: an RLS-enabled table
+	// read by a role without BYPASSRLS yields only the rows the policy
+	// admits, so the ARCHIVE silently holds a partial table and every restore
+	// from it is short. Post-filter, so --exclude-table short-circuits the
+	// refusal exactly as it does on migrate.
+	//
+	// These live in migcore rather than the pipeline root BECAUSE of this
+	// call: pipeline imports this package, so backup can never import
+	// pipeline, and the audit's suggested fix ("widen the roster's consumer
+	// set to (*Backup).Run") was therefore not a wiring change but a package
+	// move. The three preflights moved to sit beside the eight that were
+	// already here.
+	if err := b.preflightSourceShape(ctx, sr, schema); err != nil {
+		return err
+	} // 2.1 source-shape preflights; see the helper
 	// 2.2. Redaction preflight (Bug 60 / Bug 99 / audit 2026-08-27 NEW-1).
 	// The chunk writer redacts through the same [migcore.RedactRow] the
 	// bulk-copy lanes use, keyed by the table's stamped namespace — but
@@ -812,6 +839,10 @@ func logBackupComplete(ctx context.Context, manifest *irbackup.Manifest, summary
 		slog.Int("tables", len(manifest.Tables)),
 		slog.Int64("rows", totalRows),
 		slog.Int("chunks", totalChunks),
+		// The recorded posture, not the flag: this is the value that
+		// decides whether an incremental may extend the chain, so an
+		// operator reading the log sees what the manifest will say.
+		slog.String("redaction", redactionSummaryForLog(manifest.Redaction)),
 	)
 }
 
@@ -851,7 +882,15 @@ func (b *Backup) buildInProgressManifest(schema *ir.Schema, prior *irbackup.Mani
 		Tables:        make([]*irbackup.TableManifest, 0, len(schema.Tables)),
 		PartialState:  irbackup.BackupStateInProgress,
 		Kind:          irbackup.BackupKindFull,
+		// Record the PII posture from the FIRST write, not at finalize:
+		// the marker is what makes `backup incremental` refuse, and an
+		// in-progress manifest is exactly what a resume reads back to
+		// decide whether its own policy matches. Stamped before the
+		// committer captures finalVersion so the version survives the
+		// sidecar layout's displace-and-restore.
+		Redaction: b.redactionMarker(),
 	}
+	irbackup.StampRedaction(manifest)
 	if prior != nil {
 		manifest.CreatedAt = prior.CreatedAt
 	}
@@ -2004,4 +2043,25 @@ func (b *Backup) resolveChunkCEK(chainCEK []byte) (cek, wrapped []byte, err erro
 		return nil, nil, fmt.Errorf("wrap chunk cek: %w", err)
 	}
 	return cek, wrapped, nil
+}
+
+// preflightSourceShape runs the three source-shape preflights backup full
+// owes as a row-emitting entry point.
+//
+// Extracted from Run only because Run outgrew the funlen limit — and that is
+// worth saying, because moving guarded calls OUT of the function a gate greps
+// is how this repo has lost coverage before. The add-table twin hit exactly
+// this an hour earlier. TestBackupRunReachesTheShapePreflights walks Run and
+// this helper together; a future extraction owes the same edit.
+func (b *Backup) preflightSourceShape(ctx context.Context, sr ir.SchemaReader, schema *ir.Schema) error {
+	if err := migcore.PreflightRLS(ctx, schema, sr, migcore.RLSSideSource); err != nil {
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("backup: %w", err))
+	}
+	if err := migcore.PreflightPartitionedTables(ctx, sr, b.Source.Capabilities(), schema); err != nil {
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("backup: %w", err))
+	}
+	if err := migcore.PreflightInheritanceTables(ctx, sr, b.Source.Capabilities(), schema); err != nil {
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("backup: %w", err))
+	}
+	return nil
 }

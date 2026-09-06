@@ -63,6 +63,16 @@ func VerifyBackupIDs(links []lineage.SegmentRecord) error {
 	return verifyBackupIDs(links)
 }
 
+// RefuseMixedRedactionChain is the exported form of
+// [refuseMixedRedactionChain]: it refuses a lineage whose links disagree
+// about redaction, so the broker's live apply does not land plaintext PII
+// out of a chain rooted in a `--redact`ed full. Exact sibling of
+// [CheckMixedModeChain] — same shape (a per-link property the chain must
+// agree on), same reason for existing as a wrapper.
+func RefuseMixedRedactionChain(chain []lineage.SegmentRecord) error {
+	return refuseMixedRedactionChain(chain)
+}
+
 // CheckMixedModeChain is the exported form of [checkMixedModeChain]: it
 // refuses a lineage where a segment full and one of its incrementals
 // disagree on encryption shape (an encrypted chain must not carry a

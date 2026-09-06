@@ -115,6 +115,14 @@ var canonExempt = map[string]string{
 		"restoreManifestIntegrityPreflights recomputes the id on BOTH chain shapes. Flipping the flag alone fails " +
 		"that recompute; flipping it AND re-stamping BackupID changes these canonical bytes and fails the MAC.",
 
+	"Manifest.Redaction": "bound transitively AND checkably, the same way Manifest.CDCPositionCommitsAfterRows is: " +
+		"ComputeBackupID folds RedactionInfo.Fingerprint at FormatVersion >= FormatVersionRedaction, Manifest.BackupID " +
+		"is itself folded here, and restoreManifestIntegrityPreflights recomputes the id on BOTH chain shapes. Deleting " +
+		"the marker (which is what an adversary would want — it is what makes `backup incremental` refuse) fails that " +
+		"recompute; deleting it AND re-stamping BackupID changes these canonical bytes and fails the MAC. It is folded " +
+		"here rather than added to the canon because canon v5 is an ON-DISK CONTRACT: a new token in it would " +
+		"invalidate every v5 signature already in the field, to bind a field whose transitive binding is already exact.",
+
 	"TableManifest.Partial": "read only by the backup RESUME classifier (tableManifestFullyComplete), which reads " +
 		"the prior IN-PROGRESS manifest — never signed. No restore/verify/export path consults it.",
 
@@ -231,6 +239,7 @@ func TestCanonicalManifestBytes_ExemptFieldsStayInvisible(t *testing.T) {
 		"Manifest.PartialState":                func(m *Manifest) { m.PartialState = BackupStateInProgress },
 		"Manifest.ProgressSidecar":             func(m *Manifest) { m.ProgressSidecar = &ProgressSidecarRef{File: "p.jsonl", AttemptID: "a"} },
 		"Manifest.CDCPositionCommitsAfterRows": func(m *Manifest) { m.CDCPositionCommitsAfterRows = true },
+		"Manifest.Redaction":                   func(m *Manifest) { m.Redaction = &RedactionInfo{RuleCount: 1, Fingerprint: "0123456789abcdef"} },
 		"TableManifest.Partial":                func(m *Manifest) { m.Tables[0].Partial = true },
 		"ChunkInfo.Encryption":                 func(m *Manifest) { m.Tables[0].Chunks[0].Encryption = &ChunkEncryption{Algorithm: "AES-256-GCM"} },
 	}

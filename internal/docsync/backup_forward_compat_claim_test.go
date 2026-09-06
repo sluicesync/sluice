@@ -185,6 +185,16 @@ var manifestPreflightForwardCompat = map[string]manifestPreflightForwardCompatEn
 			"treating an EMPTY PartialState as in-progress, which every pre-Phase-1 manifest carries — is carved out " +
 			"explicitly at refuseInterruptedManifest, and that carve-out is why it cannot start refusing old backups.",
 	},
+	"refuseMixedRedactionChain": {
+		why: "FORWARD-SAFE: it compares the RECORDED Manifest.Redaction markers of a chain's links to each other and " +
+			"recomputes nothing. No release before v0.144.0 wrote the field, so every link of a chain an older " +
+			"sluice produced decodes to nil, every link agrees with every other, and the check cannot fire on it — " +
+			"it needs a DISAGREEMENT, which requires at least one link a v0.144.0+ writer marked. The one shape it " +
+			"does refuse across versions is a chain whose redacted root an older binary extended with unredacted " +
+			"links, and refusing that IS the point: it restores plaintext PII out of a full taken to be PII-clean. " +
+			"(That shape is itself unreachable through an older binary, which refuses a FormatVersionRedaction " +
+			"manifest at the version preflight; it survives here for a hand-assembled lineage.)",
+	},
 	"verifySchemaHashes": {
 		caveat: "schema-fingerprint-epoch",
 		why: "PARTITIONS OLDER CHAINS. ComputeSchemaHash is a SHA-256 over the marshalled IR structs and takes only " +

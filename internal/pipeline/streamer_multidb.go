@@ -732,6 +732,14 @@ func (s *Streamer) coldStartReadOneDatabaseSchema(
 		return nil, fmt.Errorf("pipeline: filter tables for %q: %w", database, err)
 	}
 
+	// Doomed-read refusal, per namespace and post-filter, exactly as migrate
+	// and the single-schema cold start run it. Surfaced when the roster's
+	// matcher was widened to see EXPORTED preflight names: it had only ever
+	// matched the lowercase spelling, so an already-exported migcore
+	// preflight was invisible to it and this gap sat unreported.
+	if err := migcore.PreflightTableReads(sr, schema); err != nil {
+		return nil, fmt.Errorf("pipeline: preflight database %q: %w", database, err)
+	}
 	// RLS, and it belongs here beside its two siblings. The fan-out ran the
 	// partition and inheritance preflights and NOT this one — a gap the
 	// 2026-09-06 audit did not name (it enumerated add-table and backup full)
@@ -742,13 +750,13 @@ func (s *Streamer) coldStartReadOneDatabaseSchema(
 	// Per namespace rather than once, because the reader is bound to one
 	// namespace at a time on this leg and the refusal names the tables it
 	// actually saw.
-	if err := preflightRLS(ctx, schema, sr, rlsSideSource); err != nil {
+	if err := migcore.PreflightRLS(ctx, schema, sr, migcore.RLSSideSource); err != nil {
 		return nil, fmt.Errorf("pipeline: preflight database %q: %w", database, err)
 	}
-	if err := preflightPartitionedTables(ctx, sr, s.Source.Capabilities(), schema); err != nil {
+	if err := migcore.PreflightPartitionedTables(ctx, sr, s.Source.Capabilities(), schema); err != nil {
 		return nil, fmt.Errorf("pipeline: preflight database %q: %w", database, err)
 	}
-	if err := preflightInheritanceTables(ctx, sr, s.Source.Capabilities(), schema); err != nil {
+	if err := migcore.PreflightInheritanceTables(ctx, sr, s.Source.Capabilities(), schema); err != nil {
 		return nil, fmt.Errorf("pipeline: preflight database %q: %w", database, err)
 	}
 	return schema, nil

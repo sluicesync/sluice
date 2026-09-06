@@ -1048,6 +1048,14 @@ func (b *SyncFromBackup) verifyChainIntegrity(ctx context.Context, chain []linea
 	if err := backup.CheckMixedModeChain(chain); err != nil {
 		return fmt.Errorf("broker: %w", err)
 	}
+	// The redaction twin of the mixed-mode refusal above, and the reason
+	// it is here rather than only in restore's preflight list: the broker
+	// APPLIES a chain's incrementals to a live target, so a chain whose
+	// redacted root is followed by unredacted links lands the plaintext
+	// on that target exactly as a restore would.
+	if err := backup.RefuseMixedRedactionChain(chain); err != nil {
+		return fmt.Errorf("broker: %w", err)
+	}
 	if err := backup.VerifySchemaHashes(ctx, chain); err != nil {
 		return fmt.Errorf("broker: %w", err)
 	}

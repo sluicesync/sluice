@@ -63,7 +63,24 @@ work. Operators not using redaction pay nothing for the feature.
 | `sluice migrate` | ✅ | n/a | One-shot bulk copy |
 | `sluice sync start` | ✅ cold start | ✅ live CDC | Both phases honour `--redact` |
 | `sluice backup full` | ✅ | n/a | Backup chunks are PII-clean on disk; restore copies them through unchanged |
+| `sluice backup incremental` | n/a | ❌ | **No `--redact` flag and no redaction.** Change events are archived off the CDC pump verbatim |
+| `sluice backup stream run` | n/a | ❌ | Same as `backup incremental`; its rotation-born segment fulls are unredacted too |
 | `sluice schema preview` | n/a | n/a | Annotates `CREATE TABLE` with `-- REDACTED via <strategy>` comments; DDL itself unchanged |
+
+**A redacted backup chain is a series of FULLS.** Only `backup full`
+redacts, so extending a redacted full with `backup incremental` /
+`backup stream` would archive plaintext for every row touched after the
+snapshot and restore it — which is why, since v0.144.0, a redacted full
+records the fact in its manifest and both extenders REFUSE
+([`SLUICE-E-BACKUP-REDACTED-CHAIN`](operator/error-codes.md)), as does
+restore / `backup verify` / the from-backup broker over a chain whose
+links disagree. Take periodic redacted fulls, or accept plaintext in the
+change window by starting an unredacted chain deliberately.
+
+Chains taken **before** v0.144.0 carry no such marker, so nothing can
+detect the mix retroactively: a pre-v0.144.0 chain rooted in a redacted
+full still restores its incrementals' rows unredacted, silently. Re-take
+those chains.
 
 ---
 

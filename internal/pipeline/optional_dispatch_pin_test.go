@@ -52,6 +52,8 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines/mysql"
 	"sluicesync.dev/sluice/internal/engines/postgres"
+
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // ---- the pins ----
@@ -62,13 +64,13 @@ import (
 // type assertion that quietly returns false and a preflight that silently
 // stops running.
 var (
-	_ foreignTablePreflightProber = (*postgres.SchemaReader)(nil)
-	_ inheritancePreflightProber  = (*postgres.SchemaReader)(nil)
-	_ largeObjectPreflightProber  = (*postgres.SchemaReader)(nil)
-	_ partitionPreflightProber    = (*postgres.SchemaReader)(nil)
-	_ rlsPreflightProber          = (*postgres.SchemaReader)(nil)
-	_ xidWraparoundProber         = (*postgres.SchemaReader)(nil)
-	_ replicationCapabilityProber = (*postgres.SchemaReader)(nil)
+	_ foreignTablePreflightProber        = (*postgres.SchemaReader)(nil)
+	_ migcore.InheritancePreflightProber = (*postgres.SchemaReader)(nil)
+	_ largeObjectPreflightProber         = (*postgres.SchemaReader)(nil)
+	_ migcore.PartitionPreflightProber   = (*postgres.SchemaReader)(nil)
+	_ migcore.RLSPreflightProber         = (*postgres.SchemaReader)(nil)
+	_ xidWraparoundProber                = (*postgres.SchemaReader)(nil)
+	_ replicationCapabilityProber        = (*postgres.SchemaReader)(nil)
 
 	// The session-GUC cast refusal's arming surface (audit 2026-08-31
 	// SL-2). Pinned rather than frozen because it guards a REFUSAL, same as

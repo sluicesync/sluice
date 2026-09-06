@@ -228,7 +228,22 @@ import (
 // a v9 manifest loudly at the preflight rather than recomputing the old AAD
 // against chunks sealed under the new one (which would surface as a bare
 // auth-tag failure).
-const BackupFormatVersion = 9
+// v0.144.0+ introduces FormatVersion=10 for REDACTED manifests — a
+// `backup full --redact` run, whose chunks were written through the
+// operator's PII redaction policy ([Manifest.Redaction]). Same Bug-116
+// class as FormatVersion=2, and the one where the silently-dropped field
+// is a PRIVACY control rather than a correctness one: an older binary
+// reading the manifest ignores the unknown `redaction` member, so it
+// neither refuses `backup incremental` against the chain (the refusal
+// that keeps a chain PII-clean; incrementals carry no redaction) nor
+// refuses a chain whose links disagree about it. It would extend a
+// redacted chain with plaintext change events at exit 0 — the exact leak
+// the marker exists to stop. The bump makes it refuse loudly at the
+// manifest preflight instead. Proportional as always: a manifest with no
+// redaction is byte-identical to what this build wrote before the field
+// existed and keeps its feature-minimum version, so ordinary backups
+// still restore on older binaries.
+const BackupFormatVersion = 10
 
 // FormatVersionLegacy / FormatVersionSecurityMetadata name the
 // historically-recorded values so callers don't sprinkle bare ints
@@ -339,6 +354,23 @@ const (
 	// (the Bug-179 inherit-the-chain's-shape rule). A PLAINTEXT backup keeps
 	// its schema-derived version — a plaintext chunk has no ciphertext to bind.
 	FormatVersionInjectiveChunkAAD = 9
+
+	// FormatVersionRedaction is the version stamped on a manifest whose
+	// chunks were written through an operator redaction policy —
+	// [Manifest.Redaction] is non-nil. It is the read-side gate for the
+	// PII marker: a manifest at this version or above carries a
+	// `redaction` member, [ComputeBackupID] folds its fingerprint, and
+	// the readers that must not silently mix redacted and unredacted
+	// data (the `backup incremental` / `backup stream` chain-extension
+	// door, and restore/verify's mixed-chain refusal) can see it.
+	//
+	// Stamped ONLY when the field is actually present, via
+	// [StampRedaction] — an unredacted backup keeps its feature-minimum
+	// version and is byte-identical to a pre-field manifest, so it still
+	// restores on older binaries. Independent of the encryption/signing
+	// tiers: a redacted backup is stamped 10 whether plaintext,
+	// encrypted, or signed.
+	FormatVersionRedaction = 10
 )
 
 // StampCDCPositionBinding raises m.FormatVersion to
@@ -351,6 +383,21 @@ const (
 func StampCDCPositionBinding(m *Manifest) {
 	if m != nil && m.CDCPositionCommitsAfterRows {
 		m.FormatVersion = max(m.FormatVersion, FormatVersionCDCPositionBinding)
+	}
+}
+
+// StampRedaction raises m.FormatVersion to [FormatVersionRedaction] when
+// the manifest carries a [Manifest.Redaction] marker, so [ComputeBackupID]
+// folds its fingerprint into the identity and older binaries refuse the
+// manifest rather than silently ignore the marker. Idempotent, and a no-op
+// when the field is nil — an unredacted manifest keeps its feature-minimum
+// version and its legacy id.
+//
+// MUST be called before [ComputeBackupID] on any manifest that may carry
+// the marker, so the recorded id and the recorded version agree.
+func StampRedaction(m *Manifest) {
+	if m != nil && m.Redaction != nil {
+		m.FormatVersion = max(m.FormatVersion, FormatVersionRedaction)
 	}
 }
 
@@ -411,6 +458,7 @@ var minimumReaderVersion = map[int]string{
 	FormatVersionChunkTableBinding:     "v0.99.214",
 	FormatVersionCDCPositionBinding:    "v0.99.228",
 	FormatVersionInjectiveChunkAAD:     "v0.104.0",
+	FormatVersionRedaction:             "v0.144.0",
 }
 
 // MinimumReaderVersion names the earliest sluice release that can read a
@@ -519,6 +567,39 @@ type SchemaHistoryEntry struct {
 	// — byte-identical to what the engine stores in
 	// sluice_cdc_schema_history.ir_schema_json (locked decision #1).
 	TableJSON []byte `json:"table_json"`
+}
+
+// RedactionInfo identifies the PII redaction policy a backup's chunks
+// were written under. It is a FINGERPRINT, not a copy of the rules:
+// the rule set itself would enumerate exactly which of the operator's
+// columns hold PII, in an artifact whose whole point is to be shippable
+// off-site.
+//
+// A bare bool would have answered "was this redacted?" and nothing else.
+// The fingerprint additionally answers "redacted with the SAME rules?",
+// which is the question the resumed-full guard actually asks — an
+// interrupted `backup full --redact users.email=hash:sha256` resumed as
+// `--redact users.name=null` would otherwise write two policies' chunks
+// into one manifest, each table clean by its own rules and the archive
+// clean by neither.
+type RedactionInfo struct {
+	// RuleCount is the number of (schema, table, column) rules in the
+	// policy. Informational — an operator reading `manifest.json` sees
+	// at a glance that redaction was configured and how broadly, without
+	// needing the fingerprint to mean anything to them.
+	RuleCount int `json:"rule_count"`
+
+	// Fingerprint is [redact.Registry.Fingerprint] for the policy: a
+	// 16-hex-char SHA-256 over each rule's (schema, table, column,
+	// strategy-name). Equal fingerprints mean the same columns were
+	// redacted with the same strategies; it carries no key material and
+	// no column names (see that method's doc for why both matter).
+	//
+	// Compared for EQUALITY only. A manifest whose marker is present but
+	// whose fingerprint is empty is still redacted — the marker's
+	// presence is the load-bearing fact, and the guards that refuse on
+	// it must not degrade to "allow" on an unrecognised fingerprint.
+	Fingerprint string `json:"fingerprint,omitempty"`
 }
 
 // Store is the storage abstraction for logical backups. Phase 1
@@ -790,6 +871,45 @@ type Manifest struct {
 	// while this field's doc contradicted it). Held by
 	// TestSchemaHistoryAnchorHasNoRestoreSideConsumer in internal/pipeline.
 	CDCPositionCommitsAfterRows bool `json:"cdc_position_commits_after_rows,omitempty"`
+
+	// Redaction, when non-nil, records that the rows in this manifest's
+	// chunks were written through an operator-configured PII redaction
+	// policy (`backup full --redact`). Nil — the zero default — means
+	// the chunks carry source values verbatim, which is what every
+	// manifest written before v0.144.0 means too: the field is absent
+	// from those documents and decodes to nil.
+	//
+	// It records that a policy APPLIED and which one ([RedactionInfo]),
+	// never the policy itself. The consumers are the ones that must not
+	// silently mix redacted and unredacted data in one chain:
+	//
+	//   - `backup incremental` / `backup stream` refuse to extend a
+	//     chain whose parent carries this marker. Neither command
+	//     redacts — their change events come off the CDC pump verbatim
+	//     — so the incremental would restore plaintext for every row
+	//     touched after the full, which is precisely the leak
+	//     `--redact` was asked to prevent.
+	//   - A resumed `backup full` refuses when the resumed run's policy
+	//     differs from the interrupted attempt's, so one manifest never
+	//     lists chunks written under two policies.
+	//   - restore / `backup verify` / export refuse a chain whose links
+	//     disagree about it (refuseMixedRedactionChain), so a chain
+	//     assembled by an older binary — or by hand — cannot leak on
+	//     the way out.
+	//
+	// It is NOT tamper-proofing, and the distinction matters because the
+	// thing it gates is a refusal: an adversary who deletes the member
+	// deletes the refusal. What binds it is the same transitive path
+	// [CDCPositionCommitsAfterRows] uses — [ComputeBackupID] folds
+	// [RedactionInfo.Fingerprint] at FormatVersion >=
+	// [FormatVersionRedaction], the recorded BackupID is recomputed by
+	// restore and verify, and the BackupID is itself inside the
+	// manifest signature. Editing the marker alone fails the id
+	// recompute; editing it AND re-stamping the id fails the MAC on a
+	// signed chain. On an UNSIGNED chain an adversary can recompute
+	// both — the same acknowledged bound as every other unsigned
+	// manifest field (ADR-0152).
+	Redaction *RedactionInfo `json:"redaction,omitempty"`
 
 	// ChainEncryption, when non-nil, identifies this manifest's chain
 	// as encrypted under Phase 6 client-side envelope encryption. Empty

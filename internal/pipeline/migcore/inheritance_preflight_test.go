@@ -1,7 +1,7 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-package pipeline
+package migcore
 
 import (
 	"context"
@@ -28,7 +28,7 @@ func (s stubInheritanceProber) InheritanceParents(_ context.Context) ([]string, 
 func TestPreflightInheritanceTables_NonPGSourceSkips(t *testing.T) {
 	p := stubInheritanceProber{parents: []string{"measurements"}}
 	schema := &ir.Schema{Tables: []*ir.Table{{Name: "measurements"}}}
-	if err := preflightInheritanceTables(context.Background(), p, capsMySQL, schema); err != nil {
+	if err := PreflightInheritanceTables(context.Background(), p, capsMySQL, schema); err != nil {
 		t.Errorf("got %v; want nil (non-PG source short-circuits)", err)
 	}
 }
@@ -37,7 +37,7 @@ func TestPreflightInheritanceTables_NonPGSourceSkips(t *testing.T) {
 // opportunistic-skip posture (matches the partition preflight).
 func TestPreflightInheritanceTables_HandleWithoutProberSkips(t *testing.T) {
 	schema := &ir.Schema{Tables: []*ir.Table{{Name: "measurements"}}}
-	if err := preflightInheritanceTables(context.Background(), struct{}{}, capsSlotPG, schema); err != nil {
+	if err := PreflightInheritanceTables(context.Background(), struct{}{}, capsSlotPG, schema); err != nil {
 		t.Errorf("got %v; want nil (handle without prober skips silently)", err)
 	}
 }
@@ -46,7 +46,7 @@ func TestPreflightInheritanceTables_HandleWithoutProberSkips(t *testing.T) {
 func TestPreflightInheritanceTables_NoParents(t *testing.T) {
 	p := stubInheritanceProber{}
 	schema := &ir.Schema{Tables: []*ir.Table{{Name: "users"}}}
-	if err := preflightInheritanceTables(context.Background(), p, capsSlotPG, schema); err != nil {
+	if err := PreflightInheritanceTables(context.Background(), p, capsSlotPG, schema); err != nil {
 		t.Errorf("got %v; want nil (no inheritance parents)", err)
 	}
 }
@@ -61,12 +61,12 @@ func TestPreflightInheritanceTables_InScopeRefuses(t *testing.T) {
 	schema := &ir.Schema{Tables: []*ir.Table{
 		{Name: "measurements"}, {Name: "measurements_2025"}, {Name: "users"},
 	}}
-	err := preflightInheritanceTables(context.Background(), p, capsSlotPG, schema)
+	err := PreflightInheritanceTables(context.Background(), p, capsSlotPG, schema)
 	if err == nil {
 		t.Fatal("got nil; want loud refusal — old-style inheritance would silently duplicate the child rows")
 	}
-	if !errors.Is(err, errInheritanceTableRefused) {
-		t.Errorf("want errInheritanceTableRefused sentinel; got: %v", err)
+	if !errors.Is(err, ErrInheritanceTableRefused) {
+		t.Errorf("want ErrInheritanceTableRefused sentinel; got: %v", err)
 	}
 	msg := err.Error()
 	for _, want := range []string{
@@ -85,7 +85,7 @@ func TestPreflightInheritanceTables_InScopeRefuses(t *testing.T) {
 func TestPreflightInheritanceTables_ExcludedFromScopePasses(t *testing.T) {
 	p := stubInheritanceProber{parents: []string{"measurements"}}
 	schema := &ir.Schema{Tables: []*ir.Table{{Name: "measurements_2025"}, {Name: "users"}}}
-	if err := preflightInheritanceTables(context.Background(), p, capsSlotPG, schema); err != nil {
+	if err := PreflightInheritanceTables(context.Background(), p, capsSlotPG, schema); err != nil {
 		t.Errorf("got %v; want nil (`measurements` already excluded — operator took recovery path (a))", err)
 	}
 }
@@ -98,7 +98,7 @@ func TestPreflightInheritanceTables_MultipleParentsRefuses(t *testing.T) {
 	schema := &ir.Schema{Tables: []*ir.Table{
 		{Name: "cities"}, {Name: "logs"}, {Name: "measurements"}, {Name: "users"},
 	}}
-	err := preflightInheritanceTables(context.Background(), p, capsSlotPG, schema)
+	err := PreflightInheritanceTables(context.Background(), p, capsSlotPG, schema)
 	if err == nil {
 		t.Fatal("got nil; want loud refusal")
 	}
@@ -114,7 +114,7 @@ func TestPreflightInheritanceTables_MultipleParentsRefuses(t *testing.T) {
 // fail-loudly posture on a probe failure.
 func TestPreflightInheritanceTables_ProberErrorPropagates(t *testing.T) {
 	p := stubInheritanceProber{err: errors.New("source connection refused")}
-	err := preflightInheritanceTables(context.Background(), p, capsSlotPG, nil)
+	err := PreflightInheritanceTables(context.Background(), p, capsSlotPG, nil)
 	if err == nil {
 		t.Fatal("got nil; want prober error propagated")
 	}
@@ -129,11 +129,11 @@ func TestPreflightInheritanceTables_ProberErrorPropagates(t *testing.T) {
 func TestPreflightInheritanceTables_PostgresTriggerAlsoGated(t *testing.T) {
 	p := stubInheritanceProber{parents: []string{"measurements"}}
 	schema := &ir.Schema{Tables: []*ir.Table{{Name: "measurements"}}}
-	err := preflightInheritanceTables(context.Background(), p, capsTriggerPG, schema)
+	err := PreflightInheritanceTables(context.Background(), p, capsTriggerPG, schema)
 	if err == nil {
 		t.Fatal("got nil; want refusal — postgres-trigger also declares ir.Capabilities.PostgresBackend")
 	}
-	if !errors.Is(err, errInheritanceTableRefused) {
-		t.Errorf("want errInheritanceTableRefused sentinel; got: %v", err)
+	if !errors.Is(err, ErrInheritanceTableRefused) {
+		t.Errorf("want ErrInheritanceTableRefused sentinel; got: %v", err)
 	}
 }

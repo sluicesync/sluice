@@ -139,17 +139,16 @@ func TestChooseFormatVersion_Bug116(t *testing.T) {
 }
 
 // TestBackupFormatVersion_Bumped pins the version ladder: the build
-// ceiling is the ADR-0181 injective-chunk-AAD version, the
-// standalone-sequences version, the ADR-0086 in-progress sidecar
-// version and the Bug 116 security-metadata version keep their
-// historical slots, and the legacy value is frozen. If a future change
-// reorders these without updating the chooseFormatVersion / sidecar /
-// chunk-binding contracts, this test catches the regression at build
-// time.
+// ceiling is the redaction-marker version, the injective-chunk-AAD,
+// standalone-sequences, ADR-0086 in-progress sidecar and Bug 116
+// security-metadata versions keep their historical slots, and the
+// legacy value is frozen. If a future change reorders these without
+// updating the chooseFormatVersion / sidecar / chunk-binding contracts,
+// this test catches the regression at build time.
 func TestBackupFormatVersion_Bumped(t *testing.T) {
-	if BackupFormatVersion != FormatVersionInjectiveChunkAAD {
-		t.Errorf("BackupFormatVersion = %d; want FormatVersionInjectiveChunkAAD=%d (ADR-0181 ceiling)",
-			BackupFormatVersion, FormatVersionInjectiveChunkAAD)
+	if BackupFormatVersion != FormatVersionRedaction {
+		t.Errorf("BackupFormatVersion = %d; want FormatVersionRedaction=%d (current ceiling)",
+			BackupFormatVersion, FormatVersionRedaction)
 	}
 	// The ladder is strictly ascending — the AAD gates are `>=` comparisons,
 	// so a reordered constant would silently reroute a whole tier's chunks
@@ -157,6 +156,10 @@ func TestBackupFormatVersion_Bumped(t *testing.T) {
 	if FormatVersionInjectiveChunkAAD <= FormatVersionCDCPositionBinding {
 		t.Errorf("FormatVersionInjectiveChunkAAD (%d) must be strictly greater than FormatVersionCDCPositionBinding (%d)",
 			FormatVersionInjectiveChunkAAD, FormatVersionCDCPositionBinding)
+	}
+	if FormatVersionRedaction <= FormatVersionInjectiveChunkAAD {
+		t.Errorf("FormatVersionRedaction (%d) must be strictly greater than FormatVersionInjectiveChunkAAD (%d)",
+			FormatVersionRedaction, FormatVersionInjectiveChunkAAD)
 	}
 	if FormatVersionLegacy != 1 {
 		t.Errorf("FormatVersionLegacy = %d; must stay 1 (load-bearing for older-binary preflight semantics)", FormatVersionLegacy)

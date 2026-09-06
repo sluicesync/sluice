@@ -54,7 +54,7 @@ The same layer handles all four codepaths that emit row values:
 1. **Bulk-copy** (`Migrator` simple-mode, `pipeline.bulkCopyTable`): wraps the per-table row channel.
 2. **CDC apply** (per-change, `Apply`): wraps each `ir.Change`'s row before dispatch.
 3. **CDC apply** (batched, `ApplyBatch`): same wrap, just batched.
-4. **Backup-stream** (`backup full` + `backup stream run`): wraps rows on the write path so backups are PII-clean too.
+4. **Backup-stream** (`backup full` ONLY): wraps rows on the write path so a full backup's chunks are PII-clean too. **Corrected 2026-09-06 (audit W1-3): this said "`backup full` + `backup stream run`" and `backup stream run` has never had a `--redact` flag or a redactor — neither has `backup incremental`.** Both archive their change events off the CDC pump verbatim, which is why a redacted full can no longer be extended by either (`SLUICE-E-BACKUP-REDACTED-CHAIN`).
 
 The wrap point is conceptually `for each (column, value) in row { value = redactor.Redact(col, value) }`. When no redactions match the column, the redactor returns the value verbatim — zero-cost passthrough.
 
@@ -302,7 +302,9 @@ Per-row redaction events are NOT logged. (DEBUG-level audit hook is an opt-in ex
 
 ## Backup-chain integration
 
-Backups inherit the redactions when the same `--redact` rules are passed to `backup full` / `backup stream run`. The redaction layer sits at the same point in the backup path's IR flow (before chunk encoding), so backups stored on disk are PII-clean.
+A **full** backup inherits the redactions when the same `--redact` rules are passed to `backup full`. The redaction layer sits at the same point in the backup path's IR flow (before chunk encoding), so the full's chunks on disk are PII-clean.
+
+**Corrected 2026-09-06 (audit W1-3): this paragraph named `backup stream run` alongside `backup full`, and that command has no `--redact` flag — nor does `backup incremental`.** The chain-extending commands archive CDC events verbatim, so a redacted full followed by an incremental restored plaintext for every row touched after the snapshot, at exit 0. Since v0.144.0 a redacted full records a `redaction` marker in its manifest (format version 10) and both extenders refuse to build on it; restore, `backup verify`, `export-as-parquet` and the from-backup broker refuse a chain whose links disagree. A redacted chain is therefore a series of fulls until incremental-side redaction exists.
 
 Restore-from-backup: redactions ARE NOT re-applied — the backup already redacted the source rows; the restored data is whatever the backup contains. The operator's responsibility to ensure the original backup was created with the right redactions.
 

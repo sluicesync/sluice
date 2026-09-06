@@ -109,8 +109,8 @@ func TestStreamer_MultiSchema_HierarchyPreflightsRefuse(t *testing.T) {
 
 	t.Run("partitioned parent refuses and lands nothing", func(t *testing.T) {
 		err := runRefusing(t, newStreamer("multischema-part-refuse", "part"))
-		if !errors.Is(err, errPartitionedTableRefused) {
-			t.Fatalf("want errPartitionedTableRefused; got %v", err)
+		if !errors.Is(err, migcore.ErrPartitionedTableRefused) {
+			t.Fatalf("want migcore.ErrPartitionedTableRefused; got %v", err)
 		}
 		for _, want := range []string{`"ppart"`, `preflight database "part"`} {
 			if !strings.Contains(err.Error(), want) {
@@ -124,8 +124,8 @@ func TestStreamer_MultiSchema_HierarchyPreflightsRefuse(t *testing.T) {
 
 	t.Run("inheritance parent refuses and lands nothing", func(t *testing.T) {
 		err := runRefusing(t, newStreamer("multischema-inh-refuse", "inh"))
-		if !errors.Is(err, errInheritanceTableRefused) {
-			t.Fatalf("want errInheritanceTableRefused; got %v", err)
+		if !errors.Is(err, migcore.ErrInheritanceTableRefused) {
+			t.Fatalf("want migcore.ErrInheritanceTableRefused; got %v", err)
 		}
 		for _, want := range []string{`"ip"`, `preflight database "inh"`} {
 			if !strings.Contains(err.Error(), want) {

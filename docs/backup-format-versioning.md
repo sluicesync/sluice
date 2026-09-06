@@ -97,6 +97,24 @@ Every backup chain root manifest carries a `FormatVersion` field:
   floor to v9 — see [A chain's floor is its newest
   link](#a-chains-floor-is-its-newest-link) below, which is the part of this
   contract that is easiest to get wrong.
+- **`FormatVersion=10`** — a **redacted** manifest: a `backup full --redact`
+  run, whose chunks were written through the operator's PII redaction policy
+  (`v0.144.0+`). The manifest records a `redaction` member naming the policy's
+  rule count and a fingerprint of the rule set (the columns and their strategy
+  names, hashed — never the rules themselves, so a manifest shipped off-site
+  does not enumerate which columns hold PII), and `ComputeBackupID` folds that
+  fingerprint at v10+ on the manifest's own recorded version, exactly as v8
+  folds its flag. The bump is the Bug-116 class with a **privacy** control in
+  the dropped-field seat: only `backup full` redacts — `backup incremental` and
+  `backup stream` take their change events off the CDC pump verbatim — so an
+  older binary, which ignores the unknown member, would extend a redacted chain
+  with plaintext change events and restore them at exit 0. It refuses the
+  manifest loudly at preflight instead, and a current binary refuses the
+  extension itself (`SLUICE-E-BACKUP-REDACTED-CHAIN`) as well as any chain
+  whose links disagree about redaction. Proportional as always: a backup taken
+  **without** `--redact` records no member, keeps its schema-derived version,
+  and is byte-identical to what the same backup produced before the field
+  existed — so ordinary chains stay readable by older binaries.
 
 If your backups don't use RLS, EXCLUDE constraints, or standalone
 sequences, and you don't encrypt or sign, you'll never see a version

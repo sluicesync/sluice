@@ -330,6 +330,24 @@ const (
 	// and the post-sweep leg names a recovery.
 	CodeBackupChainUnreadable Code = "SLUICE-E-BACKUP-CHAIN-UNREADABLE"
 
+	// CodeBackupRedactedChain is the refusal that keeps a chain's PII
+	// posture from changing mid-chain. `backup full --redact` redacts at
+	// chunk-write time, so the full is PII-clean; `backup incremental`
+	// and `backup stream` have no redaction at all — their change events
+	// come off the CDC pump verbatim — so extending a redacted chain
+	// restored PLAINTEXT for every row touched after the full, at exit 0,
+	// with the `--redact` help text promising the opposite. Three doors
+	// raise it: the chain-extension door on `backup incremental` /
+	// `backup stream`, the resumed-`backup full` door when the resumed
+	// run's policy differs from the interrupted attempt's, and the
+	// read-side door (restore / `backup verify` / export) for a chain
+	// whose links disagree — the one that catches a mix an older binary
+	// or a hand edit produced. Refusal class: a re-run of the same
+	// command cannot help, and the remedies are real actions (a fresh
+	// redacted full, or an unredacted chain the operator chooses
+	// knowingly).
+	CodeBackupRedactedChain Code = "SLUICE-E-BACKUP-REDACTED-CHAIN"
+
 	// CodeBackupSchemaDeltaUnsupported is the chain-replay side's
 	// refusal for an `alter_table` schema delta carrying a structural
 	// change that has no faithful replay on the target: a dropped
@@ -669,6 +687,8 @@ var registry = map[Code]Info{
 	CodeSchemaKeyspaceMissing:          {ClassRefusal, "the multi-database fan-out probed the Vitess/PlanetScale target and the keyspace does not exist — vtgate has no CREATE DATABASE, so provision it on the platform and re-run (the existence probe then passes), or use per-database explicit targets; Bug 249"},
 	CodeBackupStoreNameCollision:       {ClassRefusal, "the destination store folds letter case (measured by a two-object probe) and case-colliding table names would write to one folded path, silently overwriting one table's data at exit 0 — refused before any write at backup full / export-as-parquet; back up to a case-sensitive store, exclude one colliding table, or rename one source table; Bug 248"},
 	CodeBackupChainUnreadable:          {ClassRefusal, "backup compact / backup prune re-read the chain the way a restore would and could not: the chain does not walk, a chunk file a surviving manifest references is missing from the store, or its identity/key material (the chain-root manifest.json a passphrase chain's Argon2id salt is recorded on) is missing or inconsistent — refused BEFORE the destructive sweep with nothing deleted, or reported AFTER it so the run never exits 0 over a chain it just made unreadable"},
+
+	CodeBackupRedactedChain: {ClassRefusal, "a backup operation would have mixed redacted and unredacted data in one chain: extending a `--redact`ed full with `backup incremental` / `backup stream` (neither redacts — the leak this closes), resuming an interrupted `backup full` under a different `--redact` policy, or reading a chain whose links disagree about redaction (restore / backup verify / export). Refused rather than silently restoring plaintext PII the operator asked to have removed"},
 
 	CodeBackupSchemaDeltaUnsupported: {ClassRefusal, "a chain restore / broker replay hit an alter_table schema delta whose shape has no faithful replay on the target (a dropped column, a changed primary key, a column that gained or lost GENERATED, or a malformed entry) — the appliable shapes (added column, column type, nullability, indexes) are emitted through the engine's delta surface; this is the loud half for the rest"},
 

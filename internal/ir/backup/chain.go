@@ -407,6 +407,26 @@ func ComputeBackupID(m *Manifest) string {
 		}
 		parts = append(parts, "cdc_position_commits_after_rows="+v)
 	}
+	// FormatVersion 10+ folds the redaction marker's fingerprint. Same
+	// shape and same rationale as the v8 fold above: the marker decides
+	// whether `backup incremental` may extend this chain and whether
+	// restore accepts it, so deleting or editing it must invalidate the
+	// recorded id exactly as an EndPosition edit does. APPENDED, never
+	// reordered, and gated on the manifest's OWN recorded version so
+	// every pre-10 manifest keeps its legacy id and still
+	// recompute-verifies clean in a mixed-version chain (see
+	// [StampRedaction]).
+	//
+	// Gated on the VERSION rather than on the field's presence, so a
+	// stripped marker on a v10 manifest folds "" and mismatches, instead
+	// of silently reproducing the pre-10 layout.
+	if m.FormatVersion >= FormatVersionRedaction {
+		fp := ""
+		if m.Redaction != nil {
+			fp = m.Redaction.Fingerprint
+		}
+		parts = append(parts, "redaction_fingerprint="+fp)
+	}
 	h := sha256.Sum256([]byte(strings.Join(parts, "\n")))
 	return hex.EncodeToString(h[:8])
 }

@@ -1423,11 +1423,11 @@ func (a *AddTable) preflightAddTableShape(ctx context.Context, sr ir.SchemaReade
 	// Scoped to the one table being added, not the whole schema: an unrelated
 	// partitioned or RLS-enabled table elsewhere in the source is not this
 	// command's business and refusing on it would be a false halt.
-	if err := preflightRLS(ctx, scoped, sr, rlsSideSource); err != nil {
+	if err := migcore.PreflightRLS(ctx, scoped, sr, migcore.RLSSideSource); err != nil {
 		return err
 	}
-	if err := preflightPartitionedTables(ctx, sr, a.Source.Capabilities(), scoped); err != nil {
+	if err := migcore.PreflightPartitionedTables(ctx, sr, a.Source.Capabilities(), scoped); err != nil {
 		return err
 	}
-	return preflightInheritanceTables(ctx, sr, a.Source.Capabilities(), scoped)
+	return migcore.PreflightInheritanceTables(ctx, sr, a.Source.Capabilities(), scoped)
 }

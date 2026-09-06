@@ -767,6 +767,17 @@ func (b *BackupStream) newRolloverLoop(ctx context.Context) (*rolloverInit, erro
 	if err != nil {
 		return nil, fmt.Errorf("stream: resolve parent: %w", err)
 	}
+	// Same door as `backup incremental`, at the one place a stream can
+	// still refuse cheaply. A rolling stream writes unredacted change
+	// chunks exactly as an incremental does, and its ROTATION takes a
+	// fresh `backup full` with no redactor at all — so a redacted chain
+	// would gain both an unredacted segment full and unredacted
+	// incrementals. Refusing at startup makes both unreachable rather
+	// than guarding them separately (see the guard's doc for the
+	// enumeration).
+	if err := backup.RefuseRedactedChainExtension(parent, parentPath, "backup stream"); err != nil {
+		return nil, err
+	}
 	startPos, err := resumeStartFromParent(ctx, b.Store, parent, parentPath)
 	if err != nil {
 		return nil, fmt.Errorf("stream: %w", err)

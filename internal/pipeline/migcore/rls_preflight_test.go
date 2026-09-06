@@ -1,7 +1,7 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-package pipeline
+package migcore
 
 import (
 	"context"
@@ -67,7 +67,7 @@ func TestPreflightRLS_NoRLSAndNoBypass(t *testing.T) {
 	schema := twoTableRLSSchema()
 	prober := newStubRLSProber("sluice_app", false)
 	// enabled map is empty → no table has RLS.
-	if err := preflightRLS(context.Background(), schema, prober, rlsSideTarget); err != nil {
+	if err := PreflightRLS(context.Background(), schema, prober, RLSSideTarget); err != nil {
 		t.Errorf("expected nil on RLS-off / role-without-bypass; got %v", err)
 	}
 	if prober.roleCallsCnt != 1 {
@@ -87,7 +87,7 @@ func TestPreflightRLS_RLSOnAndBypass(t *testing.T) {
 	prober.enabled["orders"] = true
 	prober.enabled["users"] = true
 	prober.forced["orders"] = true
-	if err := preflightRLS(context.Background(), schema, prober, rlsSideTarget); err != nil {
+	if err := PreflightRLS(context.Background(), schema, prober, RLSSideTarget); err != nil {
 		t.Errorf("expected nil when role has BYPASSRLS; got %v", err)
 	}
 	if len(prober.tableCalls) != 0 {
@@ -100,7 +100,7 @@ func TestPreflightRLS_RLSOnAndBypass(t *testing.T) {
 func TestPreflightRLS_NoRLSAndBypass(t *testing.T) {
 	schema := twoTableRLSSchema()
 	prober := newStubRLSProber("sluice_super", true)
-	if err := preflightRLS(context.Background(), schema, prober, rlsSideSource); err != nil {
+	if err := PreflightRLS(context.Background(), schema, prober, RLSSideSource); err != nil {
 		t.Errorf("expected nil; got %v", err)
 	}
 }
@@ -113,7 +113,7 @@ func TestPreflightRLS_RLSOnAndNoBypassRefuses(t *testing.T) {
 	schema := twoTableRLSSchema()
 	prober := newStubRLSProber("sluice_app", false)
 	prober.enabled["orders"] = true
-	err := preflightRLS(context.Background(), schema, prober, rlsSideTarget)
+	err := PreflightRLS(context.Background(), schema, prober, RLSSideTarget)
 	if err == nil {
 		t.Fatal("expected refusal; got nil")
 	}
@@ -151,7 +151,7 @@ func TestPreflightRLS_ForceRLSCallsItOut(t *testing.T) {
 	prober := newStubRLSProber("sluice_app", false)
 	prober.enabled["orders"] = true
 	prober.forced["orders"] = true
-	err := preflightRLS(context.Background(), schema, prober, rlsSideTarget)
+	err := PreflightRLS(context.Background(), schema, prober, RLSSideTarget)
 	if err == nil {
 		t.Fatal("expected refusal; got nil")
 	}
@@ -173,7 +173,7 @@ func TestPreflightRLS_SourceSideHintNamesSilentFiltering(t *testing.T) {
 	schema := twoTableRLSSchema()
 	prober := newStubRLSProber("sluice_app", false)
 	prober.enabled["orders"] = true
-	err := preflightRLS(context.Background(), schema, prober, rlsSideSource)
+	err := PreflightRLS(context.Background(), schema, prober, RLSSideSource)
 	if err == nil {
 		t.Fatal("expected refusal; got nil")
 	}
@@ -195,7 +195,7 @@ func TestPreflightRLS_TargetSideHintNamesWithCheck(t *testing.T) {
 	schema := twoTableRLSSchema()
 	prober := newStubRLSProber("sluice_app", false)
 	prober.enabled["orders"] = true
-	err := preflightRLS(context.Background(), schema, prober, rlsSideTarget)
+	err := PreflightRLS(context.Background(), schema, prober, RLSSideTarget)
 	if err == nil {
 		t.Fatal("expected refusal; got nil")
 	}
@@ -219,7 +219,7 @@ func TestPreflightRLS_NoProberSurfaceSkips(t *testing.T) {
 	schema := twoTableRLSSchema()
 	// stubWriterNoChecker (from preflight_test.go) doesn't implement
 	// rlsPreflightProber — engines without the surface must not error.
-	if err := preflightRLS(context.Background(), schema, stubWriterNoChecker{}, rlsSideTarget); err != nil {
+	if err := PreflightRLS(context.Background(), schema, stubWriterNoChecker{}, RLSSideTarget); err != nil {
 		t.Errorf("expected nil when handle lacks rlsPreflightProber; got %v", err)
 	}
 }
@@ -233,7 +233,7 @@ func TestPreflightRLS_RoleProbeErrorPropagates(t *testing.T) {
 	schema := twoTableRLSSchema()
 	prober := newStubRLSProber("sluice_app", false)
 	prober.roleErr = errors.New("permission denied on pg_roles")
-	err := preflightRLS(context.Background(), schema, prober, rlsSideTarget)
+	err := PreflightRLS(context.Background(), schema, prober, RLSSideTarget)
 	if err == nil {
 		t.Fatal("expected error; got nil")
 	}
@@ -248,7 +248,7 @@ func TestPreflightRLS_TableProbeErrorPropagates(t *testing.T) {
 	schema := twoTableRLSSchema()
 	prober := newStubRLSProber("sluice_app", false)
 	prober.tableErr = errors.New("connection reset probing pg_class")
-	err := preflightRLS(context.Background(), schema, prober, rlsSideSource)
+	err := PreflightRLS(context.Background(), schema, prober, RLSSideSource)
 	if err == nil {
 		t.Fatal("expected error; got nil")
 	}
@@ -268,7 +268,7 @@ func TestPreflightRLS_MultipleOffendersListedSorted(t *testing.T) {
 	prober.enabled["zeta"] = true
 	prober.enabled["alpha"] = true
 	prober.enabled["mu"] = true
-	err := preflightRLS(context.Background(), schema, prober, rlsSideTarget)
+	err := PreflightRLS(context.Background(), schema, prober, RLSSideTarget)
 	if err == nil {
 		t.Fatal("expected refusal; got nil")
 	}
@@ -294,7 +294,7 @@ func TestPreflightRLS_MultipleOffendersListedSorted(t *testing.T) {
 // short-circuit already covers this, but the preflight is defensive.
 func TestPreflightRLS_EmptySchemaIsNoOp(t *testing.T) {
 	prober := newStubRLSProber("anything", false)
-	if err := preflightRLS(context.Background(), &ir.Schema{}, prober, rlsSideTarget); err != nil {
+	if err := PreflightRLS(context.Background(), &ir.Schema{}, prober, RLSSideTarget); err != nil {
 		t.Errorf("expected nil on empty schema; got %v", err)
 	}
 	if prober.roleCallsCnt != 0 {

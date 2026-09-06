@@ -1,7 +1,7 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-package pipeline
+package migcore
 
 // Postgres Row-Level Security (RLS) preflight (task #52 sub-deliverable 1).
 //
@@ -56,7 +56,6 @@ import (
 	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
-	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // errRLSRefused is the sentinel cause for an RLS-preflight refusal.
@@ -65,24 +64,28 @@ import (
 // message text.
 var errRLSRefused = errors.New("pipeline: RLS preflight refused")
 
-// rlsSide identifies which side of the migration the preflight is
+// RLSSide identifies which side of the migration the preflight is
 // probing — its only purpose is to render an operator-facing
 // "source" / "target" label in the refusal message.
-type rlsSide int
+type RLSSide int
 
+// RLSSideSource and RLSSideTarget select which side of a run the RLS
+// preflight is probing. The source side is the silent one -- a policy-filtered
+// READ yields fewer rows with no error -- while the target side refuses a
+// write that RLS would reject.
 const (
-	rlsSideSource rlsSide = iota
-	rlsSideTarget
+	RLSSideSource RLSSide = iota
+	RLSSideTarget
 )
 
-func (s rlsSide) label() string {
-	if s == rlsSideSource {
+func (s RLSSide) label() string {
+	if s == RLSSideSource {
 		return "source"
 	}
 	return "target"
 }
 
-// rlsPreflightProber is the optional surface a PG engine handle (the
+// RLSPreflightProber is the optional surface a PG engine handle (the
 // [ir.SchemaReader] for the source-side probe, the [ir.RowWriter] for
 // the target-side probe) implements to drive the RLS preflight.
 //
@@ -105,7 +108,7 @@ func (s rlsSide) label() string {
 //
 // Defined in the pipeline package rather than `ir` because it is
 // orchestrator-private (matches the shape of [shardPreflightProber]).
-type rlsPreflightProber interface {
+type RLSPreflightProber interface {
 	TableRLSStatus(ctx context.Context, table *ir.Table) (enabled, forced bool, err error)
 	CurrentRoleBypassesRLS(ctx context.Context) (bypass bool, role string, err error)
 }
@@ -119,10 +122,10 @@ type rlsViolation struct {
 	Forced bool
 }
 
-// preflightRLS runs the RLS-preflight against one side (source or
+// PreflightRLS runs the RLS-preflight against one side (source or
 // target). Returns nil when:
 //
-//   - The handle doesn't implement [rlsPreflightProber] (non-PG engine,
+//   - The handle doesn't implement [RLSPreflightProber] (non-PG engine,
 //     or a PG engine surface that doesn't expose the probes — the
 //     opportunistic-skip posture matches [preflightColdStart]).
 //   - No table in the schema has RLS enabled.
@@ -138,11 +141,11 @@ type rlsViolation struct {
 //
 // `side` controls the operator-facing wording — "source" vs "target"
 // — and is used to disambiguate the two-sided refusal message.
-func preflightRLS(ctx context.Context, schema *ir.Schema, handle any, side rlsSide) error {
+func PreflightRLS(ctx context.Context, schema *ir.Schema, handle any, side RLSSide) error {
 	if schema == nil || len(schema.Tables) == 0 {
 		return nil
 	}
-	prober, ok := handle.(rlsPreflightProber)
+	prober, ok := handle.(RLSPreflightProber)
 	if !ok {
 		// Non-PG side or PG surface that doesn't expose the probes —
 		// silently skip. RLS is PG-only; the opportunistic-skip posture
@@ -155,7 +158,7 @@ func preflightRLS(ctx context.Context, schema *ir.Schema, handle any, side rlsSi
 	// every table in that case.
 	bypass, role, err := prober.CurrentRoleBypassesRLS(ctx)
 	if err != nil {
-		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf(
+		return WrapWithHint(PhaseConnect, fmt.Errorf(
 			"pipeline: RLS preflight: probe %s role BYPASSRLS: %w", side.label(), err,
 		))
 	}
@@ -172,7 +175,7 @@ func preflightRLS(ctx context.Context, schema *ir.Schema, handle any, side rlsSi
 		}
 		enabled, forced, err := prober.TableRLSStatus(ctx, table)
 		if err != nil {
-			return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf(
+			return WrapWithHint(PhaseConnect, fmt.Errorf(
 				"pipeline: RLS preflight: probe %s table %q RLS state: %w",
 				side.label(), table.Name, err,
 			))
@@ -187,7 +190,7 @@ func preflightRLS(ctx context.Context, schema *ir.Schema, handle any, side rlsSi
 	}
 
 	sort.Slice(violations, func(i, j int) bool { return violations[i].Table < violations[j].Table })
-	return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf(
+	return WrapWithHint(PhaseConnect, fmt.Errorf(
 		"%w: %s",
 		errRLSRefused, formatRLSRefusal(side, role, violations),
 	))
@@ -198,7 +201,7 @@ func preflightRLS(ctx context.Context, schema *ir.Schema, handle any, side rlsSi
 // concrete state (tables + role), explain the mechanism (BYPASSRLS),
 // and list every operator-actionable recovery path so the operator
 // can pick the one that fits their security posture.
-func formatRLSRefusal(side rlsSide, role string, violations []rlsViolation) string {
+func formatRLSRefusal(side RLSSide, role string, violations []rlsViolation) string {
 	tableList := make([]string, 0, len(violations))
 	hasForce := false
 	for _, v := range violations {
@@ -215,7 +218,7 @@ func formatRLSRefusal(side rlsSide, role string, violations []rlsViolation) stri
 		side.label(), role, strings.Join(tableList, ", "))
 
 	b.WriteString("Without BYPASSRLS the role is subject to every CREATE POLICY rule on these tables — ")
-	if side == rlsSideSource {
+	if side == RLSSideSource {
 		b.WriteString("rows that fail the USING expression are silently filtered out of the source snapshot " +
 			"(silent data loss; the migration would 'succeed' with fewer rows than the source). ")
 	} else {

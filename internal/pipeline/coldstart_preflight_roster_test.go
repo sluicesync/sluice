@@ -227,7 +227,14 @@ func discoverPreflightCallsByFunc(t *testing.T) map[string]map[string]struct{} {
 				default:
 					return true
 				}
-				if strings.HasPrefix(sym, "preflight") {
+				// Case-insensitive: three of these preflights moved into migcore
+				// and had to be EXPORTED to stay reachable (backup cannot import
+				// pipeline), so they are now PreflightRLS et al. A prefix check
+				// that only saw the lowercase spelling would have silently
+				// stopped collecting them — the roster would go green having
+				// lost three symbols, which is the failure this whole file
+				// exists to prevent.
+				if strings.HasPrefix(strings.ToLower(sym), "preflight") {
 					set[sym] = struct{}{}
 				}
 				return true

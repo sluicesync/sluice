@@ -891,6 +891,15 @@ func restoreManifestIntegrityPreflights(ctx context.Context, links []lineage.Seg
 	if err := refuseInterruptedManifests(links); err != nil {
 		return err
 	}
+	// Second, and for the same reason: a chain that mixes redacted and
+	// unredacted links is INTERNALLY CONSISTENT link by link — every
+	// hash, id and chunk checks out — and restoring it lands plaintext
+	// PII the operator asked to have removed. It runs on both shapes: a
+	// single manifest is one link and trivially agrees with itself, so
+	// the cost is a nil check on the non-chain path.
+	if err := refuseMixedRedactionChain(links); err != nil {
+		return err
+	}
 	if needsWalk {
 		if err := verifySchemaHashes(ctx, links); err != nil {
 			return err

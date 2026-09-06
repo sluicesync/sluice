@@ -50,6 +50,7 @@ package redact
 
 import (
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"slices"
@@ -201,6 +202,52 @@ func (r *Registry) Get(schema, table, column string) Strategy {
 // in PII-redaction mode).
 func (r *Registry) Empty() bool {
 	return r == nil || len(r.rules) == 0
+}
+
+// Fingerprint is a deterministic fingerprint of the Registry's RULE
+// SET — every (schema, table, column) triple paired with its
+// [Strategy.Name], hashed with SHA-256 and truncated to 16 hex chars.
+// Two registries fingerprint alike exactly when they redact the same
+// columns with the same strategy spellings; an empty (or nil)
+// Registry fingerprints to the empty string.
+//
+// It exists so an ARTIFACT can record WHICH redaction policy produced
+// it — the backup manifest's redaction marker — without recording the
+// policy itself. Two properties make it safe to persist:
+//
+//   - It carries no secret. [Strategy.Name] elides the static value
+//     ("static:<elided>") and names an HMAC / tokenize strategy
+//     without its key material, so this hash's INPUT is already the
+//     audit-log rendering operators see on stdout.
+//   - It is one-way over the column identities, so a manifest handed
+//     to a third party does not enumerate which columns hold PII.
+//
+// What it deliberately does NOT capture is key MATERIAL: two runs
+// using the same rules under different keyset keys fingerprint alike.
+// That is the right granularity for the consumer — the question a
+// backup chain asks is "were these rows written under the same
+// redaction policy", and a rotated HMAC key still redacts the same
+// columns with the same strategy.
+//
+// 64 bits is deliberate: the consumer is an equality check between
+// artifacts one operator produced, never an adversarial second-preimage
+// search (the manifest field it lands in is not tamper-proofing — see
+// that field's doc for what actually binds it).
+func (r *Registry) Fingerprint() string {
+	if r.Empty() {
+		return ""
+	}
+	h := sha256.New()
+	for _, rule := range r.Rules() {
+		// Length-prefixed tokens, injective by construction: a column
+		// name carrying the separator cannot forge a boundary between
+		// two different rule sets (the ADR-0181 lesson, at a much
+		// smaller scale).
+		for _, tok := range []string{rule.Schema, rule.Table, rule.Column, rule.Strategy.Name()} {
+			fmt.Fprintf(h, "%d:%s\n", len(tok), tok)
+		}
+	}
+	return hex.EncodeToString(h.Sum(nil))[:16]
 }
 
 // Rules returns the registered (schema, table, column, strategy)

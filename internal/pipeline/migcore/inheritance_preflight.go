@@ -1,7 +1,7 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-package pipeline
+package migcore
 
 import (
 	"context"
@@ -10,7 +10,6 @@ import (
 	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
-	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // Roadmap item 68b (ps-discovery comparison, 2026-07-15): old-style
@@ -30,38 +29,38 @@ import (
 // hierarchy loss — are data-shape corruption the operator would only
 // discover by counting rows.
 
-// errInheritanceTableRefused is the sentinel for the item-68b loud
+// ErrInheritanceTableRefused is the sentinel for the item-68b loud
 // refusal. Wrapped with per-table detail.
-var errInheritanceTableRefused = errors.New("pipeline: source schema contains old-style PG inheritance parent table(s) — sluice does not support inheritance-aware migration")
+var ErrInheritanceTableRefused = errors.New("pipeline: source schema contains old-style PG inheritance parent table(s) — sluice does not support inheritance-aware migration")
 
-// inheritancePreflightProber is the optional engine-side surface for
+// InheritancePreflightProber is the optional engine-side surface for
 // detecting old-style inheritance parents. PG implements it
 // ([postgres.SchemaReader.InheritanceParents]); the opportunistic-skip
-// posture matches [partitionPreflightProber].
-type inheritancePreflightProber interface {
+// posture matches [PartitionPreflightProber].
+type InheritancePreflightProber interface {
 	InheritanceParents(ctx context.Context) ([]string, error)
 }
 
-// preflightInheritanceTables runs the legacy-inheritance preflight
+// PreflightInheritanceTables runs the legacy-inheritance preflight
 // against the source schema reader. The gate/skip/in-scope shape
-// mirrors [preflightPartitionedTables] exactly: nil on a non-PG
+// mirrors [PreflightPartitionedTables] exactly: nil on a non-PG
 // source, a handle without the prober, a namespace with no
 // inheritance parents, or when every parent is excluded via the
 // operator's table filter (the schema arg reflects post-filter
-// state). Returns a wrapped [errInheritanceTableRefused] when at
+// state). Returns a wrapped [ErrInheritanceTableRefused] when at
 // least one inheritance parent is in scope, naming every offending
 // parent (sorted by the prober) and the recovery paths.
-func preflightInheritanceTables(ctx context.Context, handle any, sourceCaps ir.Capabilities, schema *ir.Schema) error {
+func PreflightInheritanceTables(ctx context.Context, handle any, sourceCaps ir.Capabilities, schema *ir.Schema) error {
 	if !sourceCaps.PostgresBackend {
 		return nil
 	}
-	prober, ok := handle.(inheritancePreflightProber)
+	prober, ok := handle.(InheritancePreflightProber)
 	if !ok {
 		return nil
 	}
 	parents, err := prober.InheritanceParents(ctx)
 	if err != nil {
-		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf(
+		return WrapWithHint(PhaseConnect, fmt.Errorf(
 			"pipeline: inheritance preflight: probe source for inheritance parents: %w", err,
 		))
 	}
@@ -93,9 +92,9 @@ func preflightInheritanceTables(ctx context.Context, handle any, sourceCaps ir.C
 		return nil
 	}
 
-	return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf(
+	return WrapWithHint(PhaseConnect, fmt.Errorf(
 		"%w: %s",
-		errInheritanceTableRefused, formatInheritanceRefusal(inScope),
+		ErrInheritanceTableRefused, formatInheritanceRefusal(inScope),
 	))
 }
 

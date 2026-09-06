@@ -237,7 +237,9 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 	// until a fresh `backup full` re-records it, and silently extending
 	// it is exactly how Bug 243 presented: incrementals kept succeeding
 	// on a chain whose restore was already broken.
-	warnIfParentChainUnrestorable(ctx, parent, parentPath)
+	if err := preflightParentChainPosture(ctx, parent, parentPath, "backup incremental"); err != nil {
+		return err
+	}
 
 	startPos, err := resumeStartFromParent(ctx, b.Store, parent, parentPath)
 	if err != nil {
@@ -1802,6 +1804,29 @@ func schemaWithRefreshedSequences(recorded, after *ir.Schema) *ir.Schema {
 // chain is exactly how Bug 243 presented: incrementals kept succeeding
 // on a chain whose restore was already broken, and nothing said so
 // until a restore was attempted.
+// preflightParentChainPosture is `backup incremental`'s parent-chain
+// door: both checks it owes its parent before opening a CDC window, in
+// the order their severities demand. op names the command for the
+// message.
+//
+// The order is not cosmetic. Bug 243's malformed-schema case is a WARN:
+// the incremental's own data is valid and an operator may still want it
+// captured, even though the chain will not restore until a fresh full
+// re-records the schema. The redaction case is a REFUSAL: that chain
+// restores perfectly well, and what it restores is the plaintext PII the
+// operator paid a `--redact` run to remove.
+//
+// `backup stream` calls [backup.RefuseRedactedChainExtension] directly
+// rather than this pair — deliberately, because it has never carried the
+// Bug 243 WARN and quietly gaining one through a shared helper is not a
+// change this door should make. (That asymmetry is a real gap in the
+// Bug-243 signal, not a decision; it is recorded here so the next reader
+// sees it rather than assuming the pairing is complete.)
+func preflightParentChainPosture(ctx context.Context, parent *irbackup.Manifest, parentPath, op string) error {
+	warnIfParentChainUnrestorable(ctx, parent, parentPath)
+	return backup.RefuseRedactedChainExtension(parent, parentPath, op)
+}
+
 func warnIfParentChainUnrestorable(ctx context.Context, parent *irbackup.Manifest, parentPath string) {
 	if parent == nil {
 		return
