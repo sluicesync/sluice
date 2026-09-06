@@ -4,6 +4,26 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.144.0] - 2026-09-06
+
+`backup full --redact` produced a PII-clean archive and every incremental taken on top of it restored plaintext. If you have ever run `backup full --redact` and extended that chain, treat the restored data as holding plaintext PII for every row the change window touched, and re-take the chain — pre-v0.144.0 chains carry no marker and the mix cannot be detected retroactively.
+
+### Fixed
+
+**A redacted backup chain can no longer be extended with plaintext.** Only `backup full` redacts; `backup incremental` and `backup stream run` have no `--redact` flag and take change events off the CDC pump verbatim, so a redacted full extended with incrementals restored unredacted PII for every row touched after the snapshot, at exit 0, while the `--redact` help promised the restored shape would match. The full's manifest now records a redaction marker — rule count plus a fingerprint of the policy, never the rules or column names — and both extenders refuse (`SLUICE-E-BACKUP-REDACTED-CHAIN`), as does a `backup full` resumed under different rules and the read side: restore, chain restore, `backup verify`, `export-as-parquet` and the from-backup broker refuse a chain whose links disagree. Reproduced old-binary-against-new on real Postgres.
+
+**`backup compact` could launder a mixed chain into one that passes the read door.** Compaction byte-copies the oldest segment's full manifest into the merged segment and folds later links' changes on top, re-attributing the manifest to data it did not cover — so compacting a chain an older binary had mixed produced a segment claiming to be redacted over plaintext chunks, which the read door then read as internally consistent and accepted. It now refuses any chain carrying the marker, which costs nothing because a redacted chain has no incrementals to collapse. `backup prune` is exempt with the reason recorded at the gate.
+
+**`sync start --position-from-manifest` resumed CDC off a redacted chain and wrote plaintext to a live target.** The documented workflow — restore from a chain, then resume CDC from its tail — landed hashed values correctly and then overwrote each one with plaintext as rows changed, on a live downstream database at exit 0. The loader built the whole lineage and held the marker while returning only the position; it now returns both, and a mismatch between the chain's policy and the sync's refuses before the stream opens, in both directions.
+
+**Every row-emitting entry point runs the source-shape preflights.** `PreflightRLS`, `PreflightPartitionedTables` and `PreflightInheritanceTables` ran only on `migrate` and single-stream `sync` cold start. An RLS-enabled table read by a role without `BYPASSRLS` returns only the rows the policy admits, so `backup full` wrote a silently short archive and every restore from it inherited the loss. They now also run on `backup full`, `schema add-table` and the multi-database fan-out. Widening the enforcing roster surfaced a fourth gap on its own: `PreflightTableReads`, already exported and never run by the fan-out.
+
+**The Cloudflare D1 change-log poll brackets captured images against what D1 stores.** D1 stores invalid UTF-8 verbatim but rewrites it to U+FFFD server-side in its HTTP response, so the existing guard structurally could not fire. The poll now compares both the stored byte length and the stored count of replacement characters — the second because a maximal invalid subpart of exactly three bytes (a severed four-byte emoji) rewrites to a three-byte replacement with the length unchanged. A value that legitimately contains U+FFFD still passes.
+
+### Compatibility
+
+Backup format version 9 → 10 for redacted manifests only, so a pre-v0.144.0 binary refuses one outright rather than extending it; an unredacted backup records no marker and stays byte-identical and readable by older binaries. New refusals can fire where nothing fired before: `backup full` on partitioned/`INHERITS`/RLS-restricted Postgres sources (`--exclude-table` is the route), `backup compact` on a redacted chain, and `sync start --position-from-manifest` on a policy mismatch. Chains taken before v0.144.0 carry no marker and cannot be checked retroactively — re-take them. New error code `SLUICE-E-BACKUP-REDACTED-CHAIN`; no flag added, renamed or removed.
+
 ## [0.143.0] - 2026-09-06
 
 Two silent-loss fixes, both found by a blind audit and both measured on real servers before and after. Take this one if you run multi-schema Postgres sync or parallel VStream copy.

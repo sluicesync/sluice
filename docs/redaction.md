@@ -73,9 +73,34 @@ redacts, so extending a redacted full with `backup incremental` /
 snapshot and restore it — which is why, since v0.144.0, a redacted full
 records the fact in its manifest and both extenders REFUSE
 ([`SLUICE-E-BACKUP-REDACTED-CHAIN`](operator/error-codes.md)), as does
-restore / `backup verify` / the from-backup broker over a chain whose
-links disagree. Take periodic redacted fulls, or accept plaintext in the
-change window by starting an unredacted chain deliberately.
+restore / chain restore / `backup verify` / `export-as-parquet` / the
+from-backup broker over a chain whose links disagree. Take periodic
+redacted fulls, or accept plaintext in the change window by starting an
+unredacted chain deliberately.
+
+Two more doors carry the same code, both closed in v0.144.0 after the
+first sweep enumerated the write and read doors and missed them:
+
+- **`backup compact` refuses a chain carrying the marker at all.**
+  Compaction merges a group of segments by byte-copying the *oldest*
+  segment's full manifest into the merged segment and folding every later
+  link's changes on top, so the manifest is re-attributed to data it did
+  not originally cover. A redacted base plus any unredacted link would
+  produce a segment claiming to be redacted over plaintext chunks — which
+  the read door above then sees as internally consistent and *passes*.
+  Refusing costs nothing, since a redacted chain has no incrementals to
+  collapse. `backup prune` is deliberately not a door: it deletes whole
+  segments and never re-attributes a manifest.
+- **`sync start --position-from-manifest` refuses unless the sync's own
+  redaction policy matches the chain's.** The documented workflow is
+  `restore --from=<chain>` to seed a target, then resume CDC from the
+  chain's tail without re-bulking. Off a redacted chain, a sync that is
+  not redacting overwrites each restored redacted value with the
+  plaintext one as rows change — on a live target, at exit 0. Pass the
+  same `--redact` rules to `sync start`, or seed from an unredacted chain.
+  The check is agreement in both directions: a *redacting* sync resumed
+  off an unredacted chain also refuses, because redacting only the tail
+  leaves a target holding plaintext for every untouched row.
 
 Chains taken **before** v0.144.0 carry no such marker, so nothing can
 detect the mix retroactively: a pre-v0.144.0 chain rooted in a redacted
