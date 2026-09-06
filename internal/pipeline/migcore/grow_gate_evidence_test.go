@@ -169,8 +169,22 @@ func TestGrowGate_EvidenceGovernsTheDeepEscalationAndNotTheEarlyHolds(t *testing
 func TestGrowGate_EvidenceAccumulatesPerEpisodeAndResetsWithTheLadder(t *testing.T) {
 	captureSlog(t)
 	const (
-		base = 20 * time.Millisecond
+		// TESTFRAGILE-1. base was 20ms, which is barely above Windows default
+		// timer granularity (~15.6ms) -- so a single missed tick was most of
+		// the budget, and the CAPPED and UNRESET bands overlapped on a loaded
+		// runner. This failed the Windows leg of a release tag, and the
+		// Windows matrix only runs on TAG pushes, so it could fire only during
+		// a release. 60ms puts the signal well clear of the noise; the phase
+		// still runs in well under a second.
+		base = 60 * time.Millisecond
 		idle = 250 * time.Millisecond
+		// schedulerSlack is the allowance for OS scheduling and timer
+		// granularity. It is NAMED and constant on purpose: the old ceiling
+		// was 2*base, i.e. a tolerance funded from the very value being
+		// measured, which tracked the COMPUTED hold and not the overhead the
+		// measurement actually carries. Sized for Windows (~15.6ms per missed
+		// tick) with room for several.
+		schedulerSlack = 150 * time.Millisecond
 	)
 	withScaledGrowGate(t, base, 1600*time.Millisecond, base, idle, time.Hour, 1.0)
 
@@ -230,12 +244,31 @@ func TestGrowGate_EvidenceAccumulatesPerEpisodeAndResetsWithTheLadder(t *testing
 			deepestAfterReset = d
 		}
 	}
-	if deepestAfterReset > 2*base {
+	// A DIFFERENTIAL against the sticky storm was tried here and REMOVED,
+	// because measuring it showed it can NEVER fire for this defect. The
+	// episode ladder resets on the idle stretch independently of the evidence
+	// flag, so the post-reset storm climbs from rung 1 either way: measured,
+	// sticky reaches 960ms while the post-reset storm is 60.7ms when correct
+	// and 480ms when the reset is deleted -- and 480 >= 960 is false. Keeping
+	// it would have been a second assertion that reads like a safety net and
+	// cannot catch the thing it names, which is the shape this very test was
+	// already guilty of once.
+	//
+	// So the absolute ceiling is the whole discriminator, and it is now sized
+	// to be one: 60.7ms correct against 480ms broken, bound at 270ms -- 4.4x
+	// clear of the true value, 1.8x under the defect. The old version failed
+	// on Windows because base was 20ms (barely above the ~15.6ms timer
+	// granularity) and the tolerance was 2*base, funded from the very quantity
+	// being measured rather than from the overhead it actually carries.
+	// Absolute sanity bound, kept as a second net but funded from the NAMED
+	// scheduler allowance rather than from base. An unreset ladder reaches
+	// roughly 8*base within these four windows, so this discriminates with
+	// wide margin while tolerating a badly-behaved scheduler.
+	if ceiling := 2*base + schedulerSlack; deepestAfterReset > ceiling {
 		t.Errorf(
-			"after a healthy stretch, an evidence-free storm escalated to %v (cap %v) — the evidence flag did "+
-				"not reset with the episode ladder, so one evidenced blip early in a run unlocks the deep ladder "+
-				"for every later evidence-free storm and the livelock returns",
-			deepestAfterReset, base,
+			"after a healthy stretch, an evidence-free storm escalated to %v, past the %v ceiling "+
+				"(2*base=%v plus a %v scheduler allowance) — the ladder is climbing where it should have reset",
+			deepestAfterReset, ceiling, 2*base, schedulerSlack,
 		)
 	}
 }

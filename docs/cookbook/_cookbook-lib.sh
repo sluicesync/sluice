@@ -112,10 +112,18 @@ sluice_detached(){ # logfile, args...
   # place, so a bash-side grep of the log never sees it). Convert for PS; the
   # converted Windows path resolves to the SAME physical file bash reads back.
   local wlog="$log"; command -v cygpath >/dev/null 2>&1 && wlog="$(cygpath -w "$log")"
+  # -FilePath needs the SAME conversion, and for the same reason. This was
+  # missed while the log path beside it was converted: an MSYS $SLUICE
+  # (/c/code/...) is not resolvable by a native-Windows process, so
+  # Start-Process fails and the recipe reports "could not launch sync start"
+  # — which reads as a product failure rather than a harness one. A v0.141.4
+  # regression cycle lost time to exactly that, twice, and only established it
+  # was not a regression by reproducing it on the control binary.
+  local wsluice="$SLUICE"; command -v cygpath >/dev/null 2>&1 && wsluice="$(cygpath -w "$SLUICE")"
   local ps_args=""
   for a in "$@"; do ps_args="$ps_args,'$a'"; done
   ps_args="${ps_args#,}"
-  powershell -NoProfile -Command "Start-Process -FilePath '$SLUICE' -ArgumentList $ps_args -RedirectStandardError '$wlog' -RedirectStandardOutput '$wlog.out' -PassThru | Select-Object -ExpandProperty Id" > "$pidfile" 2>/dev/null
+  powershell -NoProfile -Command "Start-Process -FilePath '$wsluice' -ArgumentList $ps_args -RedirectStandardError '$wlog' -RedirectStandardOutput '$wlog.out' -PassThru | Select-Object -ExpandProperty Id" > "$pidfile" 2>/dev/null
   tr -dc '0-9' < "$pidfile"
 }
 kill_pid(){ [ -n "${1:-}" ] && powershell -NoProfile -Command "Stop-Process -Id $1 -Force -ErrorAction SilentlyContinue" 2>/dev/null; return 0; }

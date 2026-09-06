@@ -390,7 +390,7 @@ Until then both paths WARN loudly at emit time naming the constraint, the mechan
 
 **Graded and closed:** #39 float8 precision (sluice binds parameters — no text-materialization stage exists; both text renderings on the PG CDC lane are shortest-round-trip, and the decode half is gated on a real server), #51 pipeline backlog (already double-bounded: 64 MiB ADR-0028 cap + 1000-row ceiling), #50, #44, #47 (no large-object path, and the absence is LOUD — a census WARNs and an `oid`/`lo` column refuses at schema read), #49, #34, #48, #40, #41, #36, #38, #42, #45, #46. One LOW optional: pin pgx's shortest-round-trip float rendering as a named premise on the `QueryExecModeExec` path.
 
-### TESTFRAGILE-1 — a wall-clock gate whose tolerance is funded from the value it measures (found 2026-09-04, during the v0.141.2 tag)
+### TESTFRAGILE-1 — FIXED. A wall-clock gate whose tolerance was funded from the value it measures (found 2026-09-04, fixed 2026-09-05)
 
 `TestGrowGate_EvidenceAccumulatesPerEpisodeAndResetsWithTheLadder` (`internal/pipeline/migcore/grow_gate_evidence_test.go:234`) failed the **Windows** leg of `ci.yml` on the v0.141.2 tag with `escalated to 51.0227ms (cap 20ms)`. Not caused by that release — `migcore` is not in its delta — and not deterministic: 25/25 green locally on Windows under `GOMAXPROCS=1`, and the same job was green on the v0.141.1 tag. Unblocked by a rerun, diagnosed rather than waved through.
 
@@ -403,7 +403,7 @@ This is the "never fund a tolerance from the value it observes" shape recorded i
 1. **Differential** — compare `deepestAfterReset` against the `deepest` measured in the stickiness phase and require a clear ratio. Both carry the same overhead, so granularity largely cancels; this is the "name the independent expected value" discipline applied to a timing test.
 2. **Scale the base up** so the signal dominates (e.g. `base = 200ms`), making ~16ms of granularity ~8% noise instead of ~78%.
 
-Either needs its own mutation run — delete the reset and confirm the new assertion still fails — which is exactly why it was NOT attempted between the release commit and the tag. A gate weakened under release pressure is the failure mode this repo already has a rule about.
+**Fixed, and the measurement changed the fix.** base raised 20ms -> 60ms so the signal clears the ~15.6ms Windows granularity, and the tolerance is now a NAMED 150ms scheduler allowance instead of 2*base. The differential was implemented first and then REMOVED: measuring it proved it can never fire for this defect, because the episode ladder resets on the idle stretch independently of the evidence flag, so the post-reset storm climbs from rung 1 either way (sticky 960ms, post-reset 60.7ms correct / 480ms broken -- and 480 >= 960 is false). Shipping it would have been a second assertion that reads like a safety net and cannot catch what it names, in the very test that was already guilty of that. Mutation-run: deleting the reset fails at 480ms against the 270ms bound; 20 consecutive runs green under GOMAXPROCS=1.
 
 ### Invariant sweep — the enumerated queue
 
