@@ -117,7 +117,22 @@ func ApplyTableScope(reader any, filter TableFilter) {
 		scoper.SetTableScope(nil)
 		return
 	}
-	scoper.SetTableScope(filter.Allows)
+	// The predicate RECORDS as well as decides (Bug 273). The engine asks
+	// this about every candidate table, so it is the only place the full
+	// source universe is visible to the pipeline once a push-down is in
+	// play — readTables drops a scoped-out table entirely, and the
+	// unmatched-pattern census downstream would otherwise conclude that a
+	// pattern which worked perfectly had matched nothing.
+	//
+	// Recording here rather than in Allows on purpose: Allows is called
+	// from the post-read prune too, and from the CDC dispatch path, where
+	// the input is already filtered — counting those would make the census
+	// describe something other than the source.
+	census := filter.census
+	scoper.SetTableScope(func(tableName string) bool {
+		census.record(tableName)
+		return filter.Allows(tableName)
+	})
 }
 
 // VerbatimBackupSourcePG reports whether a BACKUP run qualifies for

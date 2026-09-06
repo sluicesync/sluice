@@ -43,6 +43,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -66,6 +67,57 @@ type TableFilter struct {
 	// matches any pattern is dropped. Mutually exclusive with
 	// Include.
 	Exclude []string
+
+	// census, when non-nil, records every table name the ENGINE-SIDE
+	// scope push-down was asked about — the full source universe, before
+	// anything was hidden. [UnmatchedPatterns] needs that universe, and
+	// on Postgres it cannot get it from the post-read schema.
+	//
+	// WHY THIS EXISTS (Bug 273, a v0.142.0 regression). The Bug-76
+	// push-down hands the Postgres reader `filter.Allows` via
+	// [ApplyTableScope], and readTables SKIPS a scoped-out table
+	// entirely, so it never reaches [ApplyTableFilter]. That was
+	// harmless while the post-read prune was only PRUNING — the comment
+	// at the push-down still says "the post-read TableFilter remains the
+	// authoritative prune", and for pruning it is true. v0.142.0 made
+	// that same post-read view answer a different question ("did this
+	// pattern match anything?"), and for THAT question the view is
+	// missing exactly the rows the answer depends on: an
+	// `--exclude-table` pattern that worked perfectly looked unmatched,
+	// so the new warning fired on every correct exclusion on Postgres.
+	//
+	// A pointer so a copied TableFilter still writes to one census —
+	// this value is passed around by copy at a dozen call sites, and
+	// threading a census parameter through all of them would have been a
+	// larger, riskier change than the fix it carries.
+	census *scopeCensus
+}
+
+// scopeCensus records the table names the engine-side push-down was asked
+// about. Guarded because a reader is free to walk its catalog
+// concurrently; today's do not, and a census that silently raced would be
+// a poor thing to discover later.
+type scopeCensus struct {
+	mu    sync.Mutex
+	names []string
+}
+
+func (c *scopeCensus) record(name string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.names = append(c.names, name)
+	c.mu.Unlock()
+}
+
+func (c *scopeCensus) seen() []string {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.names...)
 }
 
 // NewTableFilter validates that Include and Exclude are not both
@@ -89,7 +141,7 @@ func NewTableFilter(include, exclude []string) (TableFilter, error) {
 			return TableFilter{}, fmt.Errorf("pipeline: invalid exclude pattern %q: %w", p, err)
 		}
 	}
-	return TableFilter{Include: include, Exclude: exclude}, nil
+	return TableFilter{Include: include, Exclude: exclude, census: &scopeCensus{}}, nil
 }
 
 // IsEmpty reports whether the filter has no rules — i.e. whether
@@ -228,7 +280,10 @@ func EffectiveTableFilter(filter TableFilter, source ir.Engine, sourceDSN string
 	if len(added) == 0 {
 		return filter, nil
 	}
-	return TableFilter{Include: nil, Exclude: merged}, added
+	// Carry the census: a merged filter is the SAME run, and dropping the
+	// pointer here would silently restore Bug 273 on any source that
+	// contributes engine-default exclusions (PlanetScale's `_vt_*`).
+	return TableFilter{Include: nil, Exclude: merged, census: filter.census}, added
 }
 
 // ApplyTableFilter mutates schema.Tables in place, retaining only
@@ -246,9 +301,29 @@ func ApplyTableFilter(ctx context.Context, schema *ir.Schema, filter TableFilter
 		return nil
 	}
 	original := len(schema.Tables)
+	// The universe for the unmatched-pattern census is the SOURCE's table
+	// set, which is not the same thing as the schema that arrives here.
+	// Where an engine implements the Bug-76 scope push-down (Postgres
+	// does; MySQL does not), a scoped-out table was already dropped by the
+	// reader and never appears below — so a census taken from
+	// schema.Tables alone reports every WORKING exclusion as unmatched.
+	// That was Bug 273. The push-down predicate records what it was asked
+	// about; union it in, and de-duplicate because a kept table appears in
+	// both.
+	seen := map[string]bool{}
 	allNames := make([]string, 0, original)
+	addName := func(n string) {
+		if seen[n] {
+			return
+		}
+		seen[n] = true
+		allNames = append(allNames, n)
+	}
 	for _, t := range schema.Tables {
-		allNames = append(allNames, t.Name)
+		addName(t.Name)
+	}
+	for _, n := range filter.census.seen() {
+		addName(n)
 	}
 	kept := schema.Tables[:0]
 	for _, t := range schema.Tables {

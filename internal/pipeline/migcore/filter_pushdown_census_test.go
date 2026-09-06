@@ -1,0 +1,170 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
+package migcore
+
+import (
+	"bytes"
+	"context"
+	"log/slog"
+	"strings"
+	"testing"
+
+	"sluicesync.dev/sluice/internal/ir"
+)
+
+// scopedReader is a minimal [ir.TableScoper] that behaves the way the real
+// Postgres reader does: it asks the scope predicate about EVERY candidate
+// table and then omits the ones it rejects from the schema it returns.
+//
+// That behaviour is the whole point of this file. The v0.142.0 pin for the
+// unmatched-pattern warning built its schema by hand, so the excluded table
+// was still present when ApplyTableFilter ran — a shape no Postgres run
+// ever produces. It passed, and the regression shipped.
+type scopedReader struct {
+	sourceTables []string
+	scope        func(string) bool
+}
+
+func (r *scopedReader) SetTableScope(allow func(tableName string) bool) { r.scope = allow }
+
+// readSchema mirrors postgres.readTables: consult the predicate per table,
+// drop what it rejects.
+func (r *scopedReader) readSchema() *ir.Schema {
+	s := &ir.Schema{}
+	for _, name := range r.sourceTables {
+		if r.scope != nil && !r.scope(name) {
+			continue
+		}
+		s.Tables = append(s.Tables, &ir.Table{Name: name})
+	}
+	return s
+}
+
+var _ ir.TableScoper = (*scopedReader)(nil)
+
+// TestUnmatchedCensus_SurvivesTheScopePushDown is the Bug 273 pin.
+//
+// Bug 273 was a v0.142.0 regression: on a Postgres source the new
+// TABLE-FILTER-PATTERN-UNMATCHED warning fired on EVERY `--exclude-table`
+// pattern, including ones that had correctly excluded their table. Under an
+// exclude filter no pattern can ever match a survivor, so it was
+// unconditional — the warning carried no information at all on the exact
+// flag and engine Bug 272 was filed on.
+//
+// Why it graded HIGH rather than cosmetic: the remedy branch keys on the
+// PATTERN'S SHAPE, not on what happened. An operator running a correct
+// `--exclude-table=pii` was told their PII table was being copied and handed
+// a remedy suggesting `public.pii` — which is precisely the input that
+// copies the PII for real. The warning pointed from a working configuration
+// at the broken one.
+//
+// The mechanism was an interaction, not a typo: the Bug-76 push-down
+// (`ApplyTableScope` → `postgres.readTables`) drops a scoped-out table
+// before the pipeline sees it. The comment at that push-down says "the
+// post-read TableFilter remains the authoritative prune", which is TRUE for
+// pruning and became insufficient the moment v0.142.0 asked that same
+// post-read view a different question. A written invariant that stays true
+// for its original purpose while a new caller quietly depends on more.
+func TestUnmatchedCensus_SurvivesTheScopePushDown(t *testing.T) {
+	run := func(t *testing.T, source []string, include, exclude []string, pushDown bool) (string, *ir.Schema) {
+		t.Helper()
+		f, err := NewTableFilter(include, exclude)
+		if err != nil {
+			t.Fatalf("NewTableFilter: %v", err)
+		}
+		r := &scopedReader{sourceTables: source}
+		if pushDown {
+			// The Postgres shape.
+			ApplyTableScope(r, f)
+		}
+		schema := r.readSchema()
+
+		var buf bytes.Buffer
+		prev := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		defer slog.SetDefault(prev)
+		if err := ApplyTableFilter(context.Background(), schema, f); err != nil {
+			// An "excluded every table" error is a legitimate outcome for
+			// some cells; the caller asserts on the log either way.
+			buf.WriteString("\nERR: " + err.Error())
+		}
+		return buf.String(), schema
+	}
+
+	source := []string{"users", "orders", "pii"}
+
+	t.Run("a WORKING exclusion does not warn, with the push-down active", func(t *testing.T) {
+		out, schema := run(t, source, nil, []string{"pii"}, true)
+		if strings.Contains(out, "TABLE-FILTER-PATTERN-UNMATCHED") {
+			t.Errorf("a correct --exclude-table=pii warned that it matched nothing (Bug 273).\n"+
+				"The push-down removed `pii` before ApplyTableFilter saw the schema, so the census "+
+				"concluded the pattern was dead. Worse than a false alarm: the remedy offered is "+
+				"`public.pii`, which is the input that actually copies the table.\ngot: %s", out)
+		}
+		if len(schema.Tables) != 2 {
+			t.Errorf("expected 2 surviving tables, got %d — the harness is not modelling the push-down", len(schema.Tables))
+		}
+	})
+
+	t.Run("a genuinely dead exclude pattern still warns, push-down active", func(t *testing.T) {
+		// The other direction, without which the fix could be "never warn".
+		out, _ := run(t, source, nil, []string{"public.pii"}, true)
+		if !strings.Contains(out, "TABLE-FILTER-PATTERN-UNMATCHED") {
+			t.Errorf("a schema-qualified exclude pattern matched nothing and did NOT warn — "+
+				"the Bug 273 fix has silenced Bug 272's whole point.\ngot: %s", out)
+		}
+		if !strings.Contains(out, `write \"pii\"`) {
+			t.Errorf("the bare-name remedy is missing from the surviving warn.\ngot: %s", out)
+		}
+	})
+
+	t.Run("MySQL shape is unchanged: no push-down, same two verdicts", func(t *testing.T) {
+		// The engine WITHOUT the push-down was correct throughout Bug 273
+		// and must stay correct — this is the sibling that proved the
+		// defect was an interaction rather than a logic error.
+		if out, _ := run(t, source, nil, []string{"pii"}, false); strings.Contains(out, "TABLE-FILTER-PATTERN-UNMATCHED") {
+			t.Errorf("no-push-down source warned on a working exclusion.\ngot: %s", out)
+		}
+		if out, _ := run(t, source, nil, []string{"public.pii"}, false); !strings.Contains(out, "TABLE-FILTER-PATTERN-UNMATCHED") {
+			t.Errorf("no-push-down source did not warn on a dead pattern.\ngot: %s", out)
+		}
+	})
+
+	t.Run("include mode, push-down active, both verdicts", func(t *testing.T) {
+		if out, _ := run(t, source, []string{"users"}, nil, true); strings.Contains(out, "TABLE-FILTER-PATTERN-UNMATCHED") {
+			t.Errorf("a working --include-table warned.\ngot: %s", out)
+		}
+		if out, _ := run(t, source, []string{"users", "public.orders"}, nil, true); !strings.Contains(out, "TABLE-FILTER-PATTERN-UNMATCHED") {
+			t.Errorf("a dead --include-table pattern did not warn.\ngot: %s", out)
+		}
+	})
+
+	t.Run("the census is per-run, not global", func(t *testing.T) {
+		// Two filters built separately must not share a census; a global
+		// would make a later run inherit an earlier run's table names and
+		// silently suppress real findings.
+		a, _ := NewTableFilter(nil, []string{"pii"})
+		b, _ := NewTableFilter(nil, []string{"pii"})
+		ra := &scopedReader{sourceTables: source}
+		ApplyTableScope(ra, a)
+		ra.readSchema()
+		if got := len(b.census.seen()); got != 0 {
+			t.Errorf("a second filter's census already holds %d name(s) — the census is shared across runs", got)
+		}
+	})
+
+	t.Run("a copied filter still writes to one census", func(t *testing.T) {
+		// The pointer field is load-bearing: TableFilter is passed by copy
+		// at a dozen call sites, and ApplyTableScope receives a copy.
+		f, _ := NewTableFilter(nil, []string{"pii"})
+		cp := f
+		r := &scopedReader{sourceTables: source}
+		ApplyTableScope(r, cp)
+		r.readSchema() // the predicate only records when the reader consults it
+		if got := len(f.census.seen()); got != len(source) {
+			t.Errorf("the original filter's census holds %d of %d names — a copy is writing to its own census, "+
+				"which is the shape that would reintroduce Bug 273 at any call site that copies", got, len(source))
+		}
+	})
+}
