@@ -306,6 +306,27 @@ func wrapSQLiteExpressionDefault(expr string) string {
 // predicate fails loudly on SQLite's parser at CREATE TABLE rather than
 // being silently dropped or mistranslated (ADR-0134 §3 / ADR-0133 §2).
 func emitCheckConstraint(c *ir.CheckConstraint) string {
+	// UPR-1c, the sibling the first cut of that change missed: SQLite has no
+	// unvalidated-constraint state for a CHECK any more than for a FOREIGN
+	// KEY, so a source NOT VALID CHECK lands ENFORCED and the copy of a row
+	// that violates it dies with "CHECK constraint failed" and no explanation
+	// of why the source tolerated it. Warned for the same reason the FK path
+	// below warns, and worth stating plainly why it was missed: the roster
+	// meant to enumerate every emitter listed seven, and this is the eighth —
+	// twelve lines above the one the same commit fixed.
+	if c.NotValid {
+		slog.Warn(
+			"source CHECK constraint is NOT VALID and SQLite has no equivalent — it is emitted as an "+
+				"ordinary enforced constraint",
+			slog.String("constraint", c.Name),
+			slog.String("why", "SQLite CHECK constraints are enforced or absent; there is no "+
+				"created-but-unvalidated state for sluice to carry, so pre-existing rows the source "+
+				"tolerated will fail the copy"),
+			slog.String("remedy", "validate the constraint on the SOURCE before migrating, or drop it "+
+				"there if it no longer describes the data"),
+		)
+	}
+
 	var sb strings.Builder
 	if c.Name != "" {
 		sb.WriteString("CONSTRAINT ")

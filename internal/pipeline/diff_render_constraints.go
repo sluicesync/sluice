@@ -159,6 +159,22 @@ func renderFKClause(fk *ir.ForeignKey, quote func(string) string) string {
 			sb.WriteString(" INITIALLY DEFERRED")
 		}
 	}
+	// NOT VALID goes LAST, after DEFERRABLE — the same ordering the Postgres
+	// emitter uses, because that is the only position PG's grammar accepts.
+	//
+	// UPR-1c made NotValid load-bearing in the comparison this suggestion
+	// remediates, and for a while this renderer did not carry it: the doc
+	// above promised "every attribute the comparison treats as load-bearing,
+	// so the suggestion reproduces the source's constraint rather than a
+	// weaker one", and it was quietly false in the STRICTER direction. An
+	// operator running the tool's own output against a target holding rows
+	// the source tolerates gets a mid-remediation constraint violation; if
+	// the target happens to comply, they get a constraint stricter than the
+	// source, which then kills the CDC apply on the first replicated row the
+	// source accepts.
+	if fk.NotValid {
+		sb.WriteString(" NOT VALID")
+	}
 	return sb.String()
 }
 

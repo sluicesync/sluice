@@ -91,11 +91,20 @@ func TestNotValidReachesEveryConstraintEmitter(t *testing.T) {
 			why: "SQLite foreign keys are enforced or absent, so the state cannot be carried and a " +
 				"warn is the honest outcome. Closed as part of UPR-1c",
 		},
+		{
+			file: "internal/engines/sqlite/ddl_emit.go", fn: "func emitCheckConstraint(",
+			verdict: "warns",
+			why: "SQLite CHECKs are enforced or absent, exactly like its FKs. THE EIGHTH ENTRY, and " +
+				"the reason this floor moved: the roster listed seven and this emitter sits twelve " +
+				"lines above the FK one the same commit fixed, so UPR-1c warned about a SQLite FK " +
+				"and stayed silent on a SQLite CHECK. A roster is only as wide as its list, which is " +
+				"the argument for deriving the list rather than typing it (filed, not done here)",
+		},
 	}
 
-	if len(roster) < 7 {
-		t.Fatalf("roster holds %d emitters; it held SEVEN when written — entries were removed rather "+
-			"than their emitters", len(roster))
+	if len(roster) < 8 {
+		t.Fatalf("roster holds %d emitters; it held EIGHT after the UPR-1c pre-tag review — entries "+
+			"were removed rather than their emitters", len(roster))
 	}
 
 	var carried, warned, exempt int

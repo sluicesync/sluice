@@ -895,8 +895,9 @@ func renderDiffText(w io.Writer, b diffBundle) error {
 					!ck.ExpectedNotValid, !ck.ActualNotValid)
 			}
 			fmt.Fprintf(&sb, "ALTER TABLE %s DROP CONSTRAINT %s;\n", quote(td.Name), quote(ck.Name))
-			fmt.Fprintf(&sb, "ALTER TABLE %s ADD CONSTRAINT %s CHECK (%s);\n",
-				quote(td.Name), quote(ck.Name), ck.ExpectedExpr)
+			fmt.Fprintf(&sb, "ALTER TABLE %s ADD CONSTRAINT %s CHECK (%s)%s;\n",
+				quote(td.Name), quote(ck.Name), ck.ExpectedExpr,
+				checkNotValidSuffix(ck.ExpectedNotValid))
 		}
 		renderForeignKeySection(&sb, td, quote, b.expected)
 		renderExcludeSection(&sb, td, quote, b.expected)
@@ -1016,14 +1017,14 @@ func renderPrimaryKeyColumns(pk *ir.Index, quote func(string) string) string {
 // expression text) — the operator can still see the name and chase
 // it down by hand.
 func renderMissingCheck(sb *strings.Builder, table, name string, quote func(string) string, expected *ir.Schema) {
-	expr := lookupCheckExpr(expected, table, name)
+	expr, notValid := lookupCheck(expected, table, name)
 	if expr == "" {
 		fmt.Fprintf(sb, "-- CHECK %s missing on target; expression unavailable for ADD CONSTRAINT suggestion\n",
 			quote(name))
 		return
 	}
-	fmt.Fprintf(sb, "ALTER TABLE %s ADD CONSTRAINT %s CHECK (%s); -- CHECK missing on target\n",
-		quote(table), quote(name), expr)
+	fmt.Fprintf(sb, "ALTER TABLE %s ADD CONSTRAINT %s CHECK (%s)%s; -- CHECK missing on target\n",
+		quote(table), quote(name), expr, checkNotValidSuffix(notValid))
 }
 
 // lookupCheckExpr returns the expression text for the named CHECK
@@ -1031,9 +1032,17 @@ func renderMissingCheck(sb *strings.Builder, table, name string, quote func(stri
 // nil / table absent / constraint absent. Used by the missing-CHECK
 // renderer; schemas should be populated with the constraint's text
 // from the source-side reader.
-func lookupCheckExpr(s *ir.Schema, tableName, checkName string) string {
+// lookupCheck returns the named CHECK constraint's expression text and its
+// NOT VALID state, or ("", false) when the schema is nil / table absent /
+// constraint absent.
+//
+// It replaced an expression-only lookupCheckExpr in UPR-1c's remediation fix:
+// the renderers need the validity state so an unvalidated source CHECK is not
+// suggested back as a validating one, and once every caller wanted both, the
+// text-only wrapper was dead code.
+func lookupCheck(s *ir.Schema, tableName, checkName string) (expr string, notValid bool) {
 	if s == nil {
-		return ""
+		return "", false
 	}
 	for _, t := range s.Tables {
 		if t.Name != tableName {
@@ -1041,9 +1050,25 @@ func lookupCheckExpr(s *ir.Schema, tableName, checkName string) string {
 		}
 		for _, c := range t.CheckConstraints {
 			if c != nil && c.Name == checkName {
-				return c.Expr
+				return c.Expr, c.NotValid
 			}
 		}
+	}
+	return "", false
+}
+
+// checkNotValidSuffix renders the trailing NOT VALID for an
+// `ADD CONSTRAINT … CHECK` suggestion.
+//
+// A source CHECK the source itself has not validated must not be suggested
+// back as a validating one. The operator runs the tool's own output against a
+// target holding the very rows the source tolerates and gets a constraint
+// violation mid-remediation — or, if the target happens to comply, a
+// constraint STRICTER than the source, which then fails the CDC apply on the
+// first replicated row the source accepts.
+func checkNotValidSuffix(notValid bool) string {
+	if notValid {
+		return " NOT VALID"
 	}
 	return ""
 }
