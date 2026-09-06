@@ -22,6 +22,26 @@ The predicate is **your own argv** — quoted operator SQL, the same trust model
 
 It is **native source SQL, evaluated on the source** — so it is intentionally source-dialect and **not cross-engine-portable**. A MySQL-source predicate uses MySQL syntax; a Postgres-source predicate uses Postgres syntax. You own its correctness, as you do with `backfill --where`.
 
+## How `--include-table` / `--exclude-table` patterns match
+
+`--where` filters rows; `--include-table` / `--exclude-table` filter *tables*, and their matching rule is worth stating explicitly because getting it wrong fails **open** — an `--exclude-table` that matches nothing copies the table it was meant to keep out, at exit 0.
+
+Patterns are stdlib [`path.Match`](https://pkg.go.dev/path#Match) globs — `*`, `?`, `[abc]`, `[a-z]` — matched against the **bare table name**, never the schema-qualified one:
+
+| Pattern | Matches |
+|---|---|
+| `audit_*` | `audit_log`, `audit_trail` — in **every** selected schema |
+| `sessions` | the table `sessions`, in every selected schema |
+| `public.pii` | **nothing** — a `.` is an ordinary character to `path.Match`, and the name it compares against has no schema in it |
+
+That last row is the trap, and it is the shape sluice's own diagnostics encourage: refusals, drift reports and log lines print tables as `public.orders`, so copying one of those strings into `--exclude-table` reads exactly right and silently excludes nothing.
+
+**Scope namespaces with the namespace flags**, which is what they are for: `--include-schema` / `--exclude-schema` on Postgres, `--include-database` / `--exclude-database` on MySQL. To exclude one table in one schema, exclude the bare name and scope the schema alongside it.
+
+**Since v0.142.0 an unmatched pattern is not silent.** A pattern that matches no table in the source emits a WARN naming the flag, the pattern, the effect (`nothing was excluded` / `nothing was included`) and the bare-name remedy. It is a warning rather than a refusal because a pattern that matches nothing in *this* source is legitimate — one config across several databases, or a table that has not been created yet.
+
+**Where the check runs:** the filter-apply door shared by `migrate` and `sync` cold start. `backup restore` and `cutover` evaluate the same patterns against their own table sets and do **not** report unmatched ones — so a typo'd pattern is still silent on those two paths.
+
 ## `migrate --where` — one-shot filtered copy
 
 For a one-shot migrate, the predicate is **pushed down into the source read**:
