@@ -616,9 +616,13 @@ intercept when Shape A is engaged, exactly as ADR-0058 did.
     stated: this is the PIPELINE door, reached when a boundary is
     FORWARDED — the mode that re-casts the target rows. The two
     reader-side first-boundary arms still carry only the sibling pair
-    (filed SLM-5c), and `ZoneSiblingSwap` still refuses `timetz` to
-    `time`, which measured NOT session-dependent (filed SLM-5b:
-    narrowing a shipped refusal is its own reviewed change).
+    (filed SLM-5c). `SessionDependentZoneSwap` used to refuse `timetz` to
+    `time` as well, which measured NOT session-dependent; SLM-5b narrowed
+    the time family to the ADD direction only (`time` to `timetz`), on
+    every arm that carried it — the IR predicate, the Postgres wire pair
+    list, and the seeded arm bound to it. The timestamp family keeps both
+    directions, because `timestamptz` is stored normalised to UTC and so
+    re-renders through the session zone whichever way the cast runs.
     The temporal-collapse members below
     are NOT in this class — their raw projection moves, so they emit a
     boundary and keep the normalizer posture described in the caveat.

@@ -67,6 +67,14 @@ func TestSessionZoneSiblingSwap_EveryFamilyAndShape(t *testing.T) {
 			sameDepth := strings.HasPrefix(a.name, "array:") == strings.HasPrefix(b.name, "array:")
 			// The sibling half (SL-2 / SLM-1): same family, zone differs.
 			sibling := a.ok && b.ok && a.family == b.family && a.zoned != b.zoned
+			// SLM-5b (measured 2026-09-05 on postgres:16): the time family
+			// is the ADD direction only. `timetz` carries its offset per
+			// value, so DROPPING it consults no session zone — refusing
+			// that was over-broad. The timestamp family stays symmetric
+			// because `timestamptz` is stored normalised to UTC.
+			if sibling && strings.HasSuffix(a.family, "time") {
+				sibling = !a.zoned && b.zoned
+			}
 			// The SLM-5 half, measured 2026-09-03 on mysql:8.0.46 and
 			// postgres:16: a cast is session-dependent when exactly one side
 			// is SESSION-NORMALISED (stored UTC, rendered through the session
@@ -86,10 +94,13 @@ func TestSessionZoneSiblingSwap_EveryFamilyAndShape(t *testing.T) {
 			}
 		}
 	}
-	// Anti-vacuity floor: timestamptz⇄{timestamp,datetime} and timetz⇄time,
-	// each direction, scalar and array = (2+2+1+1)×2 = 12 ordered pairs.
-	if wantSwaps != 12 {
-		t.Fatalf("derived %d ordered zone-sibling pairs; want 12", wantSwaps)
+	// Anti-vacuity floor: timestamptz⇄{timestamp,datetime} in BOTH
+	// directions plus time→timetz in ONE (SLM-5b), scalar and array
+	// = (2+2+1)×2 = 10 ordered pairs. It is exact rather than a floor so
+	// that either re-adding the drop direction or losing the add direction
+	// fails here rather than passing quietly.
+	if wantSwaps != 10 {
+		t.Fatalf("derived %d ordered zone-sibling pairs; want 10", wantSwaps)
 	}
 }
 

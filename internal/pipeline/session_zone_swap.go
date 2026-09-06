@@ -34,8 +34,8 @@ import (
 // sessionZoneSiblingSwap reports whether a column type change between
 // prev and cur moves a temporal column across its zone-sibling pair — a
 // zone-aware timestamp against a zone-naive one (MySQL `TIMESTAMP` ⇄
-// `DATETIME`, PG `timestamptz` ⇄ `timestamp`), or `timetz` ⇄ `time`, in
-// either direction, at any precision, scalar or array-of. Precision-only
+// `DATETIME`, PG `timestamptz` ⇄ `timestamp`), or `time` → `timetz`, at
+// any precision, scalar or array-of. Precision-only
 // changes and same-zone family changes are not swaps; a scalar ⇄ array
 // dimension change is not a swap either (PG needs an explicit USING to
 // express it, so a forwarded bare ALTER fails loudly rather than
@@ -47,9 +47,19 @@ import (
 // TIME / BIGINT and the reverse, `timestamptz` → text / date, and `time` →
 // `timetz`. Those were measured to shift by the ALTER session's offset on
 // mysql:8.0.46 and postgres:16 exactly as the sibling swap does, and they
-// forwarded unrefused. [ir.SessionZoneCast] contains [ir.ZoneSiblingSwap]
-// by construction (pinned by ir.TestSessionZoneCast_NeverNarrowsZoneSiblingSwap),
-// so nothing this door refused before is now allowed through.
+// forwarded unrefused. [ir.SessionZoneCast] contains
+// [ir.SessionDependentZoneSwap] by construction (pinned by
+// ir.TestSessionZoneCast_NeverNarrowsTheSiblingHalf), so the widening
+// dropped nothing this door refused before.
+//
+// NARROWED for audit SLM-5b (measured 2026-09-05), which is the one
+// direction this door refuses LESS than it used to: `timetz` → `time`
+// forwards now. Postgres stores the offset with each `timetz` value, so
+// dropping it consults no session zone and the cast was measured
+// byte-identical under `UTC` and `Asia/Tokyo` — the old refusal was
+// over-broad, and it fired on a boundary an operator could always have
+// forwarded safely. `time` → `timetz` still refuses: that direction has to
+// invent an offset and takes it from the executing session.
 //
 // SCOPE, stated so the name cannot be read wider than the truth: this is
 // the PIPELINE door, reached when a boundary is FORWARDED — which is the

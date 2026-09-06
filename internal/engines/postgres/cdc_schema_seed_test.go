@@ -204,9 +204,14 @@ func TestSeededSessionTZSwapPair_AgreesWithTheWireDeclaration(t *testing.T) {
 			}
 		}
 	}
-	// Anti-vacuity: four pairs × two directions, scalar and array.
-	if agreeingSwaps != 8 {
-		t.Fatalf("%d agreeing swap cells; want exactly 8 (time⇄timetz, timestamp⇄timestamptz, each scalar and array, both directions)", agreeingSwaps)
+	// Anti-vacuity, and it is exact rather than a floor so a one-armed
+	// change to either declaration fails here. Six after SLM-5b: the
+	// timestamp pair matches both directions scalar and array (4), the time
+	// pair matches the ADD direction only, scalar and array (2). The two
+	// `timetz → time` cells are the ones SLM-5b removed, and they must be
+	// absent from BOTH declarations or the loop above reports the drift.
+	if agreeingSwaps != 6 {
+		t.Fatalf("%d agreeing swap cells; want exactly 6 (timestamp⇄timestamptz both directions + time→timetz only, each scalar and array)", agreeingSwaps)
 	}
 }
 

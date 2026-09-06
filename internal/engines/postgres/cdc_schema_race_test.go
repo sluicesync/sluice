@@ -640,11 +640,29 @@ func TestCheckSchemaRace_UnforwardableTypmod(t *testing.T) {
 		}
 	})
 
-	t.Run("timetz→time OID swap refuses under forward (both directions)", func(t *testing.T) {
+	t.Run("timetz→time OID swap FORWARDS (SLM-5b: the drop direction is not session-dependent)", func(t *testing.T) {
+		// The one direction this gate deliberately refuses LESS than it
+		// used to. Postgres stores a `timetz` offset alongside each value,
+		// so dropping it renders identically whatever the session TimeZone
+		// is — measured byte-identical under `UTC` and `Asia/Tokyo` on
+		// postgres:16 (audit SLM-5b, 2026-09-05). The old refusal fired on
+		// a boundary an operator could always have forwarded safely.
+		//
+		// Its sibling above (`time→timetz`) still refuses, and the two
+		// subtests are kept adjacent on purpose: the asymmetry is the
+		// finding, so a future reader sees both halves at once rather than
+		// finding one and assuming the class.
 		prev := table(typedCol(t, "id", 23, -1), typedCol(t, "tm", 1266, 3))
 		curr := table(typedCol(t, "id", 23, -1), typedCol(t, "tm", 1083, 3))
 		relations := map[uint32]*relationCacheEntry{16400: prev}
-		requireSessionTZRefusal(t, checkSchemaRace(relations, 16400, curr, true), "tm", "time and timetz")
+		if err := checkSchemaRace(relations, 16400, curr, true); err != nil {
+			t.Errorf("timetz→time must forward under forward mode; got: %v", err)
+		}
+		// Refuse mode is unchanged: it refuses every schema change, and
+		// this narrowing must not have leaked into it.
+		if err := checkSchemaRace(relations, 16400, curr, false); err == nil {
+			t.Error("timetz→time must still refuse under refuse mode — that mode refuses every boundary, and SLM-5b narrowed only the forward-mode session-TZ door")
+		}
 	})
 
 	t.Run("timestamp→timestamptz OID swap refuses under forward (TIMESTAMPTZ-SWAP-FORWARD)", func(t *testing.T) {
@@ -685,21 +703,32 @@ func TestCheckSchemaRace_UnforwardableTypmod(t *testing.T) {
 		// the one-representative version of this test is exactly what
 		// missed the leak, since `timestamp[]` and `time[]` reached the
 		// gate by different routes (differing vs identical projections).
+		//
+		// `_timetz→_time` is the SLM-5b carve-out and is listed here with
+		// refuses=false rather than deleted: an absent row proves nothing,
+		// while a row asserting it FORWARDS fails if the refusal ever comes
+		// back, and keeps the array cell enumerating the whole pair set.
 		for _, tc := range []struct {
 			name     string
 			from, to uint32
 			pair     string
+			refuses  bool
 		}{
-			{"_time→_timetz", 1183, 1270, "time[] and timetz[]"},
-			{"_timetz→_time", 1270, 1183, "time[] and timetz[]"},
-			{"_timestamp→_timestamptz", 1115, 1185, "timestamp[] and timestamptz[]"},
-			{"_timestamptz→_timestamp", 1185, 1115, "timestamp[] and timestamptz[]"},
+			{"_time→_timetz", 1183, 1270, "time[] and timetz[]", true},
+			{"_timetz→_time", 1270, 1183, "time[] and timetz[]", false},
+			{"_timestamp→_timestamptz", 1115, 1185, "timestamp[] and timestamptz[]", true},
+			{"_timestamptz→_timestamp", 1185, 1115, "timestamp[] and timestamptz[]", true},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				prev := table(typedCol(t, "id", 23, -1), typedCol(t, "slots", tc.from, -1))
 				curr := table(typedCol(t, "id", 23, -1), typedCol(t, "slots", tc.to, -1))
 				relations := map[uint32]*relationCacheEntry{16400: prev}
-				requireSessionTZRefusal(t, checkSchemaRace(relations, 16400, curr, true), "slots", tc.pair)
+				forwardErr := checkSchemaRace(relations, 16400, curr, true)
+				if tc.refuses {
+					requireSessionTZRefusal(t, forwardErr, "slots", tc.pair)
+				} else if forwardErr != nil {
+					t.Errorf("%s must FORWARD under forward mode (SLM-5b: the array drop direction inherits the scalar carve-out through the element unwrap); got: %v", tc.name, forwardErr)
+				}
 				if err := checkSchemaRace(relations, 16400, curr, false); err == nil {
 					t.Errorf("%s must refuse under refuse mode too", tc.name)
 				}

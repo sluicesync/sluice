@@ -181,6 +181,14 @@ func priorShapeFromSeed(emitted map[string]ir.SchemaSignature, cacheKey string, 
 // projectVStreamFields → the same translateType. A future MySQL flavor
 // that resolves types by yet another route is covered the moment its
 // projection lands in the IR.
+//
+// The SLM-5b direction asymmetry does NOT reach this lane, and the reason
+// is structural rather than a judgement call: it applies to the "time"
+// family (PG `time` ⇄ `timetz`), and MySQL has no zone-carrying TIME type
+// at all. This lane's only zone-sibling pair is TIMESTAMP ⇄ DATETIME, and
+// TIMESTAMP is session-normalised in BOTH directions — stored as UTC, so
+// dropping the zone renders through the session and adding one interprets
+// through it — which is why this predicate is symmetric and stays so.
 func sessionTZSwapPair(prev, cur ir.Type) (string, bool) {
 	zoned := func(t ir.Type) (family string, withZone, ok bool) {
 		switch v := t.(type) {

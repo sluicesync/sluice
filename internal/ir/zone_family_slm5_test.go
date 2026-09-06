@@ -67,15 +67,15 @@ func TestSessionZoneCast_MeasuredFamilyMatrix(t *testing.T) {
 		{"DATE -> TIMESTAMP", date, tsz, true, "2026-06-14 15:00 vs 2026-06-15 00:00"},
 		{"BIGINT -> TIMESTAMP", bigint, tsz, true, "11:00 vs 20:00"},
 
-		// --- the sibling half ZoneSiblingSwap already covered; these must
-		// keep refusing, or SLM-1/SL-2 regress ---
+		// --- the sibling half SessionDependentZoneSwap already covered;
+		// these must keep refusing, or SLM-1/SL-2 regress ---
 		{"TIMESTAMP -> DATETIME", tsz, dt, true, "the SL-2 shape"},
 		{"DATETIME -> TIMESTAMP", dt, tsz, true, "the SL-2 shape, reversed"},
 		{"timestamptz -> timestamp(naive)", tsz, tsn, true, "the PG SL-2 shape"},
 
 		// --- the time family, where the measurement forced a distinction ---
 		{"time -> timetz", timen, timez, true, "20:00:00+09 vs +00 — an offset is invented"},
-		{"timetz -> time", timez, timen, true, "NOT session-dependent, but ZoneSiblingSwap still refuses it (SLM-5b)"},
+		{"timetz -> time", timez, timen, false, "the offset travels with the value: byte-identical under UTC and Asia/Tokyo, so nothing consults the session (SLM-5b closed this over-broad refusal)"},
 		{"timetz -> VARCHAR", timez, text, false, "20:00:00+00 under both zones"},
 		{"time -> VARCHAR", timen, text, false, "20:00:00 under both zones"},
 
@@ -112,13 +112,20 @@ func TestSessionZoneCast_MeasuredFamilyMatrix(t *testing.T) {
 	}
 }
 
-// TestSessionZoneCast_NeverNarrowsZoneSiblingSwap is the containment
+// TestSessionZoneCast_NeverNarrowsTheSiblingHalf is the containment
 // floor. SessionZoneCast is allowed to refuse strictly more than
-// ZoneSiblingSwap and never less: the sibling predicate is what the
-// shipped SL-2 / SLM-1 / SLM-1c refusals are built on, and a widening
+// [SessionDependentZoneSwap] and never less: the sibling predicate is what
+// the shipped SL-2 / SLM-1 / SLM-1c refusals are built on, and a widening
 // that quietly dropped one of them would reopen a silent-divergence class
 // while looking like an improvement.
-func TestSessionZoneCast_NeverNarrowsZoneSiblingSwap(t *testing.T) {
+//
+// It grades CONTAINMENT, not the sibling predicate's own extent, so it
+// stays honest across SLM-5b: the drop direction leaving the sibling half
+// takes it out of this loop rather than turning it into a failure here.
+// What pins the extent is TestSessionDependentZoneSwap_DirectionMatrix,
+// and the `timetz -> time` cell in the table above pins that the drop
+// direction is not re-refused by the wider half either.
+func TestSessionZoneCast_NeverNarrowsTheSiblingHalf(t *testing.T) {
 	types := []Type{
 		Timestamp{WithTimeZone: true},
 		Timestamp{WithTimeZone: false},
@@ -137,19 +144,21 @@ func TestSessionZoneCast_NeverNarrowsZoneSiblingSwap(t *testing.T) {
 	var siblings int
 	for _, prev := range types {
 		for _, cur := range types {
-			if !ZoneSiblingSwap(prev, cur) {
+			if !SessionDependentZoneSwap(prev, cur) {
 				continue
 			}
 			siblings++
 			if !SessionZoneCast(prev, cur) {
-				t.Errorf("ZoneSiblingSwap(%v, %v) refuses but SessionZoneCast does not — the widening dropped a shipped refusal", prev, cur)
+				t.Errorf("SessionDependentZoneSwap(%v, %v) refuses but SessionZoneCast does not — the widening dropped a shipped refusal", prev, cur)
 			}
 		}
 	}
 	// Anti-vacuity: if the sibling predicate stops matching anything, the
 	// containment claim above is empty and must fail rather than pass.
+	// Seven cells across this type list after SLM-5b (six in the timestamp
+	// family, one `time` -> `timetz`), so the floor still bites.
 	if siblings < 6 {
-		t.Fatalf("only %d sibling swaps found across %d types; the containment check is near-vacuous — ZoneSiblingSwap or the type list has changed",
+		t.Fatalf("only %d sibling swaps found across %d types; the containment check is near-vacuous — SessionDependentZoneSwap or the type list has changed",
 			siblings, len(types))
 	}
 }

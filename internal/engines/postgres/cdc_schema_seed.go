@@ -159,14 +159,17 @@ func unforwardableSeededSessionTZColumn(prior *ir.Table, current *relationCacheE
 }
 
 // seededSessionTZSwapPair is the IR-typed member of this lane's pair
-// declaration: [ir.ZoneSiblingSwap] over the seeded prior and the
-// projected wire type, naming the pair the way [sessionTZSwapPair] does
-// for the refusal text. Its universe is BOUND to the wire declaration's
-// by TestSeededSessionTZSwapPair_AgreesWithTheWireDeclaration — every
-// OID pair the wire predicate refuses, this refuses once projected, and
-// nothing else — so the two arms of one lane cannot drift apart.
+// declaration: [ir.SessionDependentZoneSwap] over the seeded prior and
+// the projected wire type, naming the pair the way [sessionTZSwapPair]
+// does for the refusal text. Its universe is BOUND to the wire
+// declaration's by TestSeededSessionTZSwapPair_AgreesWithTheWireDeclaration
+// — every OID pair the wire predicate refuses, this refuses once
+// projected, and nothing else — so the two arms of one lane cannot drift
+// apart. That binding is what carries the SLM-5b direction asymmetry
+// (timetz→time forwards, time→timetz refuses) into this arm without it
+// having to restate the rule.
 func seededSessionTZSwapPair(prev, cur ir.Type) (string, bool) {
-	if !ir.ZoneSiblingSwap(prev, cur) {
+	if !ir.SessionDependentZoneSwap(prev, cur) {
 		return "", false
 	}
 	family, _, _ := ir.ZoneFamily(cur)

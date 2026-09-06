@@ -562,12 +562,26 @@ func losslessNoRewriteDelta(pc, cc relationColumn) bool {
 }
 
 // sessionTZSwapPair reports an OID swap between a temporal type and its
-// with-time-zone sibling, in either direction — the
-// [unforwardableSessionTZCast] shape — naming the pair for the refusal
-// text. Each arm requires BOTH OIDs of a distinct pair, so a same-OID
-// typmod delta (timestamp(6)→timestamp(3)) can never match — the
-// precision-forward floor (TestTypmodProjectionGate_EveryTypmodFamily)
-// pins that.
+// with-time-zone sibling — the [unforwardableSessionTZCast] shape —
+// naming the pair for the refusal text. Each arm requires BOTH OIDs of a
+// distinct pair, so a same-OID typmod delta (timestamp(6)→timestamp(3))
+// can never match — the precision-forward floor
+// (TestTypmodProjectionGate_EveryTypmodFamily) pins that.
+//
+// DIRECTION is not symmetric across the two families, and this arm list
+// is the wire-OID half of the same rule [ir.SessionDependentZoneSwap]
+// states on IR types — the seeded arm is bound to this one by
+// TestSeededSessionTZSwapPair_AgreesWithTheWireDeclaration, so the two
+// cannot drift:
+//
+//   - timestamp⇄timestamptz matches BOTH ways. `timestamptz` is stored
+//     normalised to UTC, so dropping the zone renders it through the
+//     session and adding one interprets a naive value in the session.
+//   - time→timetz matches, timetz→time does NOT. `timetz` carries its
+//     offset with each value, so dropping the offset consults no session
+//     zone (measured byte-identical under UTC and Asia/Tokyo, audit
+//     SLM-5b); only the add direction invents an offset from the session.
+//     Refusing the drop direction was over-broad and stopped in SLM-5b.
 //
 // ARRAYS are matched by unwrapping BOTH sides through the production
 // [pgArrayElementOID] map and running the scalar arms on the element
@@ -595,9 +609,16 @@ func sessionTZSwapPair(pc, cc relationColumn) (string, bool) {
 		return "", false
 	}
 	switch {
-	case (prevOID == pgtype.TimeOID && currOID == pgtype.TimetzOID) ||
-		(prevOID == pgtype.TimetzOID && currOID == pgtype.TimeOID):
+	case prevOID == pgtype.TimeOID && currOID == pgtype.TimetzOID:
 		return "time" + suffix + " and timetz" + suffix, true
+	case prevOID == pgtype.TimetzOID && currOID == pgtype.TimeOID:
+		// The DROP direction, spelled out rather than left to fall through:
+		// it is measured NOT session-dependent (SLM-5b) and so forwards
+		// unrefused. Written as its own arm so the pair is still fully
+		// enumerated here — a reader (and the roster's symbol floor) sees
+		// both OIDs, and the asymmetry reads as deliberate rather than as
+		// an arm someone dropped.
+		return "", false
 	case (prevOID == pgtype.TimestampOID && currOID == pgtype.TimestamptzOID) ||
 		(prevOID == pgtype.TimestamptzOID && currOID == pgtype.TimestampOID):
 		return "timestamp" + suffix + " and timestamptz" + suffix, true

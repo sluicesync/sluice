@@ -246,15 +246,25 @@ func TestSessionTZSwapGate_EveryZoneSiblingPair(t *testing.T) {
 			if a == b {
 				continue
 			}
-			if classOf[a].family == classOf[b].family && classOf[a].zoned != classOf[b].zoned {
-				wantSwap[[2]uint32{a, b}] = true
+			if classOf[a].family != classOf[b].family || classOf[a].zoned == classOf[b].zoned {
+				continue
 			}
+			// SLM-5b: the time-of-day family is the ADD direction only.
+			// `timetz` stores its offset per value, so DROPPING the offset
+			// consults no session zone (measured byte-identical under UTC
+			// and Asia/Tokyo on postgres:16) and forwards unrefused. The
+			// timestamp family stays symmetric — `timestamptz` is stored
+			// normalised to UTC, so both directions go through the session.
+			if strings.HasPrefix(classOf[a].family, "time-of-day") && classOf[a].zoned {
+				continue
+			}
+			wantSwap[[2]uint32{a, b}] = true
 		}
 	}
-	// Anti-vacuity floor: four unordered pairs — time/timetz,
-	// timestamp/timestamptz, each scalar and array — so eight ordered.
-	if len(wantSwap) != 8 {
-		t.Fatalf("derived %d ordered zone-sibling pairs; want 8 (time⇄timetz, timestamp⇄timestamptz, each scalar and array)", len(wantSwap))
+	// Anti-vacuity floor, exact: timestamp⇄timestamptz both directions
+	// scalar and array (4) plus time→timetz scalar and array (2) = 6.
+	if len(wantSwap) != 6 {
+		t.Fatalf("derived %d ordered zone-sibling pairs; want 6 (timestamp⇄timestamptz both ways, time→timetz one way, each scalar and array)", len(wantSwap))
 	}
 
 	for _, a := range universe {

@@ -3,6 +3,8 @@
 
 package ir
 
+import "strings"
+
 // ZoneFamily classifies a type as (temporal family, carries-a-zone) for
 // the session-zone cast class: the ALTER COLUMN TYPE shapes an engine
 // resolves against the EXECUTING session's zone setting (PG `TimeZone`,
@@ -50,15 +52,57 @@ func ZoneFamily(t Type) (family string, zoned, ok bool) {
 	return "", false, false
 }
 
-// ZoneSiblingSwap reports whether a column type change between prev and
-// cur moves a temporal column across its zone-sibling pair, in either
-// direction, at any precision, scalar or array-of — the shape
-// [ZoneFamily] exists to name. Precision-only changes and same-zone
-// changes are not swaps.
-func ZoneSiblingSwap(prev, cur Type) bool {
+// baseFamily strips the "array:" dimension prefixes [ZoneFamily] adds,
+// leaving the scalar family name ("timestamp", "time", or "").
+func baseFamily(family string) string {
+	for {
+		rest, ok := strings.CutPrefix(family, "array:")
+		if !ok {
+			return family
+		}
+		family = rest
+	}
+}
+
+// SessionDependentZoneSwap reports whether a column type change between
+// prev and cur moves a temporal column across its zone-sibling pair — the
+// shape [ZoneFamily] exists to name — IN A DIRECTION WHOSE CAST RESOLVES
+// THROUGH THE EXECUTING SESSION'S ZONE. Precision-only changes and
+// same-zone changes are not swaps; a scalar⇄array dimension change is not
+// this class either (the family carries the array depth, so the two sides
+// cannot match).
+//
+// The direction qualifier is the whole point of the name, and it is
+// asymmetric BY FAMILY, measured on postgres:16 and mysql:8.0.46
+// (2026-09-03 for the drop direction, 2026-09-05 for the add direction;
+// audit SLM-5 and SLM-5b):
+//
+//   - The "timestamp" family is SYMMETRIC. `timestamptz` and MySQL
+//     `TIMESTAMP` are stored NORMALISED to UTC, so both directions consult
+//     the session: dropping the zone renders UTC through it, adding one
+//     interprets a naive wall-clock value in it. Both directions refuse.
+//   - The "time" family is NOT. `timetz` stores the offset alongside each
+//     value, so DROPPING it (`timetz` to `time`) needs no session zone at
+//     all and returned byte-identical values under `UTC` and `Asia/Tokyo`.
+//     Only the ADD direction (`time` to `timetz`) invents an offset, and
+//     Postgres takes it from the executing session. So only the add
+//     direction refuses.
+//
+// Refusing the `timetz` to `time` direction was over-broad — a loud
+// refusal on a boundary that could always have been forwarded safely — and
+// this predicate stops doing it. Every other cell of the matrix is
+// unchanged; see TestSessionDependentZoneSwap_DirectionMatrix, which pins
+// all four directions of both families, scalar and array.
+func SessionDependentZoneSwap(prev, cur Type) bool {
 	prevFamily, prevZoned, prevOK := ZoneFamily(prev)
 	curFamily, curZoned, curOK := ZoneFamily(cur)
-	return prevOK && curOK && prevFamily == curFamily && prevZoned != curZoned
+	if !prevOK || !curOK || prevFamily != curFamily || prevZoned == curZoned {
+		return false
+	}
+	if baseFamily(curFamily) == "time" {
+		return !prevZoned && curZoned
+	}
+	return true
 }
 
 // sessionNormalized reports whether a type is stored NORMALISED TO UTC, so
@@ -73,36 +117,22 @@ func ZoneSiblingSwap(prev, cur Type) bool {
 //
 // Measured on postgres:16 and mysql:8.0.46 (2026-09-03, audit SLM-5), which
 // is the only reason this distinction is drawn rather than assumed:
-// `timestamptz → text` rendered `2026-06-16 05:00:00+09` under Asia/Tokyo
-// against `2026-06-15 20:00:00+00` under UTC, while `timetz → text` and
-// `timetz → time` returned byte-identical values under both.
+// `timestamptz` to text rendered `2026-06-16 05:00:00+09` under Asia/Tokyo
+// against `2026-06-15 20:00:00+00` under UTC, while `timetz` to text and
+// `timetz` to `time` returned byte-identical values under both.
 //
-// NOTE, and it is the open half of this measurement (audit SLM-5b): the pair
-// is ASYMMETRIC, and only one direction was measured non-session-dependent.
-// Dropping an offset (`timetz → time`) needs no zone. ADDING one
-// (`time → timetz`) has to get the offset from somewhere, and Postgres takes
-// it from the executing session. [ZoneSiblingSwap] refuses BOTH directions,
-// so the refusal is correct for one and over-broad for the other. Narrowing
-// it is a behaviour change on shipped code and is deliberately NOT done here;
-// it owes a measurement of the add direction under two session zones first.
+// The asymmetry this note used to flag as open (audit SLM-5b) is now
+// resolved in [SessionDependentZoneSwap]: the add direction was measured
+// under two session zones, IS session-dependent, and still refuses, while
+// the drop direction no longer does.
 func sessionNormalized(t Type) bool {
 	family, zoned, ok := ZoneFamily(t)
 	if !ok || !zoned {
 		return false
 	}
-	// "timestamp" or "array:…:timestamp" — the time family's zoned member
-	// (timetz) is deliberately excluded, per the measurements above.
-	for len(family) > len("timestamp") {
-		i := 0
-		for i < len(family) && family[i] != ':' {
-			i++
-		}
-		if i == len(family) {
-			break
-		}
-		family = family[i+1:]
-	}
-	return family == "timestamp"
+	// The time family's zoned member (timetz) is deliberately excluded,
+	// per the measurements above.
+	return baseFamily(family) == "timestamp"
 }
 
 // arrayDepth counts the IR array dimensions wrapping t.
@@ -120,7 +150,7 @@ func arrayDepth(t Type) int {
 
 // SessionZoneCast reports whether an ALTER COLUMN TYPE from prev to cur
 // resolves through the EXECUTING session's zone setting — the full class,
-// of which [ZoneSiblingSwap] is the same-family half.
+// of which [SessionDependentZoneSwap] is the same-family half.
 //
 // A cast is session-dependent when either side of it has to invent or
 // interpret a zone:
@@ -132,32 +162,31 @@ func arrayDepth(t Type) int {
 //     one is invented, and it is the session's.
 //
 // Measured in both directions on real servers (audit 2026-09-01 SLM-5,
-// measured 2026-09-03). On MySQL 8.0.46, `TIMESTAMP` → VARCHAR / DATE /
+// measured 2026-09-03). On MySQL 8.0.46, `TIMESTAMP` to VARCHAR / DATE /
 // TIME / BIGINT / DATETIME each shifted by the ALTER session's offset
 // (a value stored at 20:00 UTC became 2026-06-16 05:00:00, 2026-06-16,
 // 05:00:00 and 20260616050000 respectively under `+09:00`), and the
 // reverse casts into `TIMESTAMP` shifted the stored instant by the same
-// nine hours. On postgres:16, `timestamptz` → text / varchar / date /
-// timestamp behaved identically, as did `time` → `timetz` (which stamps
+// nine hours. On postgres:16, `timestamptz` to text / varchar / date /
+// timestamp behaved identically, as did `time` to `timetz` (which stamps
 // the session's offset onto a naive value).
 //
-// The asymmetry in the time family is real and measured, not an oversight:
-// `time → timetz` IS session-dependent (an offset is invented) while
-// `timetz → time`, `timetz → text` and `timetz → varchar` are NOT (the
-// offset travels with the value). [ZoneSiblingSwap] still refuses the
-// `timetz → time` direction, so this function cannot be used to NARROW an
-// existing refusal — it only ever adds. Narrowing that direction is a
-// separate, deliberately-reviewed change (filed as SLM-5b).
+// The time family's asymmetry is real and measured, not an oversight:
+// `time` to `timetz` IS session-dependent (an offset is invented) while
+// `timetz` to `time`, `timetz` to text and `timetz` to varchar are NOT
+// (the offset travels with the value). Both halves of this function now
+// agree on that: the sibling half stopped refusing the drop direction in
+// SLM-5b, and the fall-through below never refused it.
 func SessionZoneCast(prev, cur Type) bool {
-	if ZoneSiblingSwap(prev, cur) {
+	if SessionDependentZoneSwap(prev, cur) {
 		return true
 	}
 	// A scalar ⇄ array dimension change is not this class, and the
-	// carve-out is inherited deliberately from [ZoneSiblingSwap]: Postgres
-	// needs an explicit USING to express one, so a forwarded bare ALTER
-	// fails LOUDLY on the target instead of diverging. Refusing it here
-	// would trade a loud target error for a sluice refusal on a shape that
-	// was never at risk of silent divergence.
+	// carve-out is inherited deliberately from [SessionDependentZoneSwap]:
+	// Postgres needs an explicit USING to express one, so a forwarded bare
+	// ALTER fails LOUDLY on the target instead of diverging. Refusing it
+	// here would trade a loud target error for a sluice refusal on a shape
+	// that was never at risk of silent divergence.
 	if arrayDepth(prev) != arrayDepth(cur) {
 		return false
 	}
