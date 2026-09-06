@@ -4,6 +4,24 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.143.0] - 2026-09-06
+
+Two silent-loss fixes, both found by a blind audit and both measured on real servers before and after. Take this one if you run multi-schema Postgres sync or parallel VStream copy.
+
+### Fixed
+
+**A multi-schema Postgres sync refuses a stopped-stream zone swap instead of priming (SLM-1d).** The first-boundary session-zone-cast refusal compares an incoming schema against a seed — the shape the stream last committed under. The two single-stream reader-open sites installed it; the two multi-database sites wired the scope predicate and nothing else, and the fan-out never set a seed loader at all, so calling the helper there would have been a no-op. Measured on postgres:16 before and after: stop the stream, `ALTER TABLE ... TYPE timestamp` under `Asia/Tokyo`, resume — the row lands, the target column is unchanged, and source and target disagree by the session offset at exit 0. The fan-out now builds a namespace-partitioned seed on both the cold-start and warm-resume legs. A MySQL multi-database stream still cannot fire this refusal at all (the seed is delivered and inert by construction); that residual is now stated in the runbook rather than omitted from it.
+
+**The concurrent VStream COPY pump refuses statement-format DML like its three siblings.** `dispatchCopyEvent` had no statement-DML arm and fell through to a silent `default`, so under `vstream_copy_table_parallelism >= 2` — the only condition where that pump runs — statement-logged writes were ignored rather than refused. Under `binlog_format=STATEMENT`/`MIXED` the server emits no row events at all, which is the loss the refusal exists to catch. The dispatcher universe is now derived from the source rather than hand-listed, and the premise the class rests on (the vendored vstreamer forwards these events rather than absorbing them) is pinned against the module's own source instead of a comment.
+
+**A table-filter pattern that matches nothing no longer cries wolf.** Three false-fire arms of `TABLE-FILTER-PATTERN-UNMATCHED` closed: the Postgres scope push-down (v0.142.1), engine-default `_vt_*` exclusions on PlanetScale, and multi-database runs — which called the filter door once per database, so a pattern naming a table in database B was reported dead while database A was copied. A fan-out is now quiet per pass and reports once, against the union of every selected database's tables. A warm resume never enumerates the source at all and so cannot answer the question; that is now recorded rather than left to be discovered.
+
+**Every remedy sluice prints can be pasted.** `sluice trigger setup` has two required flags, so "re-run `sluice trigger setup`" produced a second refusal — "--dsn is required" — mid-incident, on sluice's own advice. 51 messages across nine commands fixed, rendering your actual table list where it is known. A gate derives each command's required flags from the real CLI model so it cannot regress quietly. On the SQLite/D1 lane the remedies also name `--source-driver`: without it a paste ran the Postgres installer against a SQLite file.
+
+### Compatibility
+
+Drop-in from v0.142.1; no flag, format or schema change. Remedy TEXT changed in many messages — check anything keyed on exact wording; error codes and markers are unchanged. One new refusal can fire where nothing fired before: a multi-schema Postgres sync resuming across a stopped-stream `timestamptz`/`timestamp` swap now refuses rather than priming, which is the fix.
+
 ## [0.142.1] - 2026-09-06
 
 If you run `--exclude-table` against a Postgres source on v0.142.0, upgrade. The warning that release added fired on EVERY exclude pattern, including ones that worked, and the remedy it offered pointed at the input that actually breaks.
