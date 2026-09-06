@@ -4,6 +4,20 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.142.1] - 2026-09-06
+
+If you run `--exclude-table` against a Postgres source on v0.142.0, upgrade. The warning that release added fired on EVERY exclude pattern, including ones that worked, and the remedy it offered pointed at the input that actually breaks.
+
+### Fixed
+
+**The unmatched-pattern warning stops firing on working exclusions (Bug 273).** v0.142.0 added `TABLE-FILTER-PATTERN-UNMATCHED` so a dead `--exclude-table` pattern — which fails OPEN, copying the table you meant to keep out — would not be silent. On a Postgres source it fired on every exclude pattern instead. Under an exclude filter no pattern can ever match a survivor, so it was unconditional: on the exact flag and engine the original bug was filed against, the warning carried no information. Worse than the silence it replaced, because the remedy keys on the pattern SHAPE rather than on what happened — a correct `--exclude-table=pii` was told its PII table was being copied and handed `public.pii`, the input that copies it for real.
+
+An interaction, not a logic error: Postgres implements a scope push-down (catalog Bug 76) and skips excluded tables at read time, so they never reach the pipeline. The note at that push-down says the post-read filter "remains the authoritative prune" — true, for pruning. v0.142.0 asked that view a different question and it was missing exactly the rows the answer depends on. The push-down predicate now records what it was asked about, and the census consults the full source table set. MySQL never had the defect: no push-down. Pinned by `TestUnmatchedCensus_SurvivesTheScopePushDown`, which models the push-down rather than building the schema by hand — the v0.142.0 pin passed while shipping this precisely because it did the latter.
+
+### Compatibility
+
+Drop-in from v0.142.0; only that release was affected. A genuinely dead pattern still warns, with the same text and remedy.
+
 ## [0.142.0] - 2026-09-05
 
 **Correction (2026-09-06):** one sentence in this entry is wrong in two ways, corrected in place at v0.142.0 because it is prose-only — the shipped behaviour is BETTER than the sentence claims. "`backup restore` and `cutover` evaluate the same patterns and do not report unmatched ones": `backup restore` is not a command (`restore` is top-level), and `restore` **does** report unmatched patterns because it calls the same `ApplyTableFilter` door as `migrate`. Only `cutover` does not, pruning through its own `filterSchemaTables`. Found by the v0.142.0 regression cycle, which ran `restore` with a bad pattern instead of reading the code.
