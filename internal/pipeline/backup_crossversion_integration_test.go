@@ -384,6 +384,42 @@ func xvBackupFull(t *testing.T, bin, srcDSN, dir, slot string) {
 	xvMustExec(t, "backup full", bin, args...)
 }
 
+// xvTopFormatFlags returns the flags that make a `backup full` stamp the
+// CURRENT top format tier, whatever that tier happens to be about.
+//
+// WHY THIS IS NOT JUST xvEncryptFlags (2026-09-06). Versions 5, 7 and 9
+// were all ENCRYPTION tiers, so "encrypt and you get the newest version"
+// held for three bumps running and the harness came to rely on it in
+// cells 2 and 3 — with the reliance written down as an error message
+// ("An encrypted full must stamp the current tier; check that --encrypt
+// actually engaged") rather than as a check. Version 10 is a REDACTION
+// tier: an encrypted full stamps 9, and only `--redact` reaches 10. So
+// both cells went red, correctly, naming a cause that was not the cause.
+//
+// The lesson generalises past this bump: the stamped version is
+// PROPORTIONAL to a manifest's contents, so there is no reason the top
+// tier should stay reachable by any one flag. Whoever bumps the format
+// next owes this function an entry. Its own gate is the vacuity check
+// each cell already runs — if this stops reaching the top tier, cells 2
+// and 3 fail loudly instead of quietly grading an older tier.
+func xvTopFormatFlags() []string {
+	return append(xvEncryptFlags(), "--redact", "users.email=hash:sha256")
+}
+
+// xvBackupFullTopFormat writes a full stamped at the current top format
+// tier — the shape cells 2 and 3 need in order to assert anything about
+// an older binary's refusal.
+func xvBackupFullTopFormat(t *testing.T, bin, srcDSN, dir, slot string) {
+	t.Helper()
+	args := append([]string{
+		"backup", "full",
+		"--source-driver", "postgres", "--source", srcDSN,
+		"--output-dir", dir,
+		"--chain-slot", "--slot-name", slot,
+	}, xvTopFormatFlags()...)
+	xvMustExec(t, "backup full", bin, args...)
+}
+
 // xvBackupIncremental extends the chain in dir with one TIME-BOUND CDC
 // window.
 //
@@ -557,6 +593,24 @@ func xvChainVersions(t *testing.T, dir string) (root int, segments []int) {
 			"so it is not exercising the chain contract at all", dir)
 	}
 	return root, segments
+}
+
+// xvRootVersion returns ONLY the root full's format version, for the one
+// cell whose chain legitimately has no incremental segments.
+//
+// It exists because [xvChainVersions]'s "no incremental segments" Fatalf
+// is right for every other cell and wrong for cell 2 since v0.144.0: the
+// current top format tier is reached by `backup full --redact`, and a
+// redacted chain REFUSES incrementals by construction. So "a bare full"
+// is not a harness mistake there — it is the only shape the tier has.
+//
+// Kept as a separate function rather than a flag on xvChainVersions so
+// the guard stays loud everywhere else. A future cell that reaches for
+// this one owes the same justification: if the chain COULD have segments,
+// use xvChainVersions and let it fail.
+func xvRootVersion(t *testing.T, dir string) int {
+	t.Helper()
+	return xvManifestVersion(t, filepath.Join(dir, "manifest.json"))
 }
 
 // xvUser is one row of the shared chainSeedDDL `users` table.
@@ -817,17 +871,30 @@ func TestBackup_CrossVersionChainCompat(t *testing.T) {
 		tgt := xvCreateDB(t, adminDSN, "xv2_tgt")
 		dir := t.TempDir()
 
-		xvBackupFull(t, bins.newBin, src, dir, "xv_slot_2")
-		applyDDL(t, src, xvDelta1)
-		xvBackupIncremental(t, bins.newBin, src, dir, "xv_slot_2")
-
-		root, segs := xvChainVersions(t, dir)
+		// Top-format flags, not merely encrypted: since v0.144.0 the top
+		// tier is a REDACTION tier and an encrypted full stamps 9. See
+		// xvTopFormatFlags.
+		xvBackupFullTopFormat(t, bins.newBin, src, dir, "xv_slot_2")
+		// NO INCREMENTAL, and that is a property of the tier rather than a
+		// shortcut. The current top format is reached by `--redact`, and a
+		// redacted chain refuses extension by construction
+		// (SLUICE-E-BACKUP-REDACTED-CHAIN, v0.144.0) — so a bare full is the
+		// only shape this tier HAS. The multi-link walk that cell 2 used to
+		// exercise is still covered, by cells 3 and 4, which run chains of
+		// two segments each.
+		//
+		// If a future bump is once again reachable by an encrypted
+		// incremental, restore the incremental here and switch back to
+		// xvChainVersions — this cell is stronger with a chain, when the
+		// tier permits one.
+		root := xvRootVersion(t, dir)
 		if root <= bins.oldFormat {
 			t.Fatalf("NEW wrote a root manifest stamped %d, which OLD (%d) can read — this cell cannot "+
-				"assert a refusal it will never see. An encrypted full must stamp the current tier; "+
-				"check that --encrypt actually engaged.", root, bins.oldFormat)
+				"assert a refusal it will never see. xvTopFormatFlags is supposed to reach the CURRENT "+
+				"top tier (%d); if the format was bumped for a feature those flags do not trigger, add it "+
+				"there rather than lowering this check.", root, bins.oldFormat, bins.newFormat)
 		}
-		t.Logf("cell 2: NEW chain stamped root=%d segments=%v", root, segs)
+		t.Logf("cell 2: NEW wrote a redacted full stamped root=%d (OLD reads up to %d)", root, bins.oldFormat)
 
 		out, err := xvRestore(t, bins.oldBin, dir, tgt)
 		xvAssertVersionRefusal(t, "cell 2 (OLD restores NEW chain)", out, err, tgt)
@@ -873,17 +940,27 @@ func TestBackup_CrossVersionChainCompat(t *testing.T) {
 			t.Fatalf("cell 3: chain carries %d incremental segment(s), want 2 (OLD's, then NEW's extension)", len(segs))
 		}
 		ext := segs[len(segs)-1]
-		if ext <= root {
-			t.Fatalf("cell 3: the NEW binary's extension is stamped %d and the OLD root is stamped %d — "+
-				"the extension did not raise the chain's floor, so this cell is vacuous. Either the two "+
-				"binaries agree on the format version (check CROSSVER_OLD_TAG=%s) or --encrypt did not engage.",
-				ext, root, bins.oldTag)
-		}
-		if ext <= bins.oldFormat {
-			t.Fatalf("cell 3: the extension is stamped %d, which OLD (%d) can still read — cell 3b would "+
-				"assert a refusal that cannot happen", ext, bins.oldFormat)
-		}
-		t.Logf("cell 3: chain floor raised — root=%d segments=%v (OLD reads up to %d)", root, segs, bins.oldFormat)
+
+		// WHETHER THE FLOOR ROSE IS NOW A QUESTION, NOT AN ASSUMPTION
+		// (2026-09-06). This used to Fatalf when the extension did not
+		// out-rank the root, on the reasoning that the two binaries must
+		// then agree on the format and the cell is vacuous. That reasoning
+		// held while every bump was an ENCRYPTION tier, which an incremental
+		// inherits because its chunks are freshly sealed. Version 10 is a
+		// redaction tier: `backup full --redact` reaches it and an
+		// incremental never does — so a v0.144.0 binary extending a
+		// v0.143.0 chain writes a segment stamped 9, and OLD keeps reading
+		// the whole chain.
+		//
+		// That is the PROPORTIONAL rule working, not a defect, and it is
+		// worth an assertion of its own rather than a Fatalf: a
+		// feature-scoped bump must not retroactively lock an operator out of
+		// a chain they can otherwise read. So the cell now branches, and
+		// BOTH arms report — the Bug 212 coverage stays armed for the next
+		// bump an incremental does inherit.
+		floorRose := ext > root && ext > bins.oldFormat
+		t.Logf("cell 3: root=%d segments=%v ext=%d (OLD reads up to %d) — floor raised: %v",
+			root, segs, ext, bins.oldFormat, floorRose)
 
 		t.Run("a_NEW_restores_the_extended_chain", func(t *testing.T) {
 			out, err := xvRestore(t, bins.newBin, dir, tgtNew)
@@ -896,12 +973,29 @@ func TestBackup_CrossVersionChainCompat(t *testing.T) {
 
 		t.Run("b_OLD_loses_the_whole_chain", func(t *testing.T) {
 			out, err := xvRestore(t, bins.oldBin, dir, tgtOld)
-			// KNOWN + ACCEPTED (item 90 / Bug 212): OLD wrote the root and the
-			// first segment itself, understands both perfectly, and still
-			// restores NOTHING — because the walk refuses at the newer
-			// extension. Cell 4 is the control that proves the version raise,
-			// and not the harness, is what does this.
-			xvAssertVersionRefusal(t, "cell 3b (OLD restores the chain NEW extended)", out, err, tgtOld)
+			if floorRose {
+				// KNOWN + ACCEPTED (item 90 / Bug 212): OLD wrote the root and
+				// the first segment itself, understands both perfectly, and
+				// still restores NOTHING — because the walk refuses at the
+				// newer extension. Cell 4 is the control that proves the
+				// version raise, and not the harness, is what does this.
+				xvAssertVersionRefusal(t, "cell 3b (OLD restores the chain NEW extended)", out, err, tgtOld)
+				ledger.report(t, "3b-old-loses-extended")
+				return
+			}
+			// The complementary property, asserted rather than assumed: the
+			// current bump is not reachable by an incremental, so NEW's
+			// extension left every link at a version OLD understands and OLD
+			// must still restore the FULL contents — including the delta NEW
+			// wrote. A silent partial restore here would be the real harm,
+			// so this checks the rows, not just the exit status.
+			if err != nil {
+				t.Fatalf("cell 3b: NEW's extension is stamped %d and OLD reads up to %d, so OLD should "+
+					"still restore this chain — a feature-scoped format bump must not retroactively lock "+
+					"an operator out of a chain whose every link they can read. Restore failed: %v\n"+
+					"--- output ---\n%s", ext, bins.oldFormat, err, out)
+			}
+			xvAssertUsers(t, tgtOld, "cell 3b (OLD restores a chain NEW extended at an unraised floor)", xvAfterDelta2)
 			ledger.report(t, "3b-old-loses-extended")
 		})
 	})
