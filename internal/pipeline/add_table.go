@@ -323,12 +323,20 @@ func (a *AddTable) Run(ctx context.Context) error {
 		migcore.CloseIf(sr)
 		return err
 	}
-	migcore.CloseIf(sr)
-
+	// Isolate the table BEFORE closing the reader: the three source-side
+	// shape preflights below need both the scoped schema and the still-open
+	// handle, and the handle is what makes them able to ask the catalog.
 	scoped, err := isolateTable(fullSchema, a.TableName)
 	if err != nil {
+		migcore.CloseIf(sr)
 		return err
 	}
+
+	if err := a.preflightAddTableShape(ctx, sr, scoped); err != nil {
+		migcore.CloseIf(sr)
+		return err
+	}
+	migcore.CloseIf(sr)
 
 	// UNLOGGED-table registration door (audit 2026-08-27 A7; see
 	// preflightUnloggedAddTable). Must run before the dry-run report and
@@ -1390,4 +1398,36 @@ func (a *AddTable) logDryRun(ctx context.Context, scoped *ir.Schema, resolvedTar
 func isPublicationAdder(src ir.Engine) bool {
 	_, ok := src.(publicationAdder)
 	return ok
+}
+
+// preflightAddTableShape runs the three SOURCE-SHAPE preflights on the one
+// table being added, against the still-open reader.
+//
+// Extracted from Run only because Run outgrew the funlen limit. That is worth
+// a sentence, because moving a guarded call OUT of the function a roster
+// greps is exactly how this repo has lost coverage before -- the cold-start
+// roster carries the same warning about a fix that landed in a helper outside
+// its listed set and left the gate green while still exempt. So
+// TestAddTableRosterReachesTheShapePreflights lists BOTH (*AddTable).Run and
+// this helper as consumers; a future extraction owes the same edit.
+func (a *AddTable) preflightAddTableShape(ctx context.Context, sr ir.SchemaReader, scoped *ir.Schema) error {
+	// The three source-shape preflights every OTHER row-emitting entry point
+	// runs (audit 2026-09-06 W4 H3). add-table ran none of them, and the RLS
+	// one is the sharp end: preflightRLS's own documented remedy is to
+	// `--exclude-table` the offending table, and `schema add-table` is how an
+	// operator brings a table back afterwards. So the advice sluice gives on
+	// one door routed straight through the door with no check — an RLS-enabled
+	// table copied by a role without BYPASSRLS returns only the rows the
+	// policy admits, which is a silent PARTIAL copy at exit 0.
+	//
+	// Scoped to the one table being added, not the whole schema: an unrelated
+	// partitioned or RLS-enabled table elsewhere in the source is not this
+	// command's business and refusing on it would be a false halt.
+	if err := preflightRLS(ctx, scoped, sr, rlsSideSource); err != nil {
+		return err
+	}
+	if err := preflightPartitionedTables(ctx, sr, a.Source.Capabilities(), scoped); err != nil {
+		return err
+	}
+	return preflightInheritanceTables(ctx, sr, a.Source.Capabilities(), scoped)
 }

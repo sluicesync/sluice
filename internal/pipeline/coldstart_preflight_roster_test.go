@@ -92,8 +92,6 @@ var coldStartPreflightMultiDatabaseFuncs = []string{
 // here. Every entry today is a filed gap, not a design decision — the A2-2
 // roster sweep found them; each cites where it is tracked.
 var coldStartPreflightMultiDatabaseExempt = map[string]coldStartPreflightExemption{
-	"preflightRLS": {exemptFiledGap, "audit 2026-09-01 A2-2 roster sweep (source-side RLS): a BYPASSRLS-less role reads a " +
-		"silently-filtered snapshot; applies per namespace against the scoped reader, same shape as the partition preflight."},
 	"preflightSourceReplication": {exemptFiledGap, "audit 2026-09-01 A2-2 roster sweep: the ADR-0075 spanning snapshot creates a " +
 		"logical slot, so the REPLICATION-role refusal applies once per run, before the spanning open."},
 	"preflightReplicationHeadroom": {exemptFiledGap, "audit 2026-09-01 A2-2 roster sweep: applies once per run and must run BEFORE " +

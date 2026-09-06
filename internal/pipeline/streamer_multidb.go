@@ -732,6 +732,19 @@ func (s *Streamer) coldStartReadOneDatabaseSchema(
 		return nil, fmt.Errorf("pipeline: filter tables for %q: %w", database, err)
 	}
 
+	// RLS, and it belongs here beside its two siblings. The fan-out ran the
+	// partition and inheritance preflights and NOT this one — a gap the
+	// 2026-09-06 audit did not name (it enumerated add-table and backup full)
+	// and that the sweep for those two surfaced. A multi-schema sync over an
+	// RLS-enabled table, by a role without BYPASSRLS, copies only the rows the
+	// policy admits: a silent PARTIAL copy at exit 0, per namespace.
+	//
+	// Per namespace rather than once, because the reader is bound to one
+	// namespace at a time on this leg and the refusal names the tables it
+	// actually saw.
+	if err := preflightRLS(ctx, schema, sr, rlsSideSource); err != nil {
+		return nil, fmt.Errorf("pipeline: preflight database %q: %w", database, err)
+	}
 	if err := preflightPartitionedTables(ctx, sr, s.Source.Capabilities(), schema); err != nil {
 		return nil, fmt.Errorf("pipeline: preflight database %q: %w", database, err)
 	}
