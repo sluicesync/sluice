@@ -79,6 +79,18 @@ func TestVStreamStatementDML(t *testing.T) {
 			_, err := s.dispatchCopyEvent(ev)
 			return err
 		},
+		// The FOURTH dispatcher (audit 2026-09-06 H1): the ADR-0099
+		// concurrent cross-table COPY pump, engaged at
+		// vstream_copy_table_parallelism >= 2. It carries its OWN cursor
+		// (cs.cur) — the parent's currentVgtid is not maintained under
+		// K > 1 — so the coordinate cell below exercises the per-stream
+		// position, not the parent's.
+		"copyStream.dispatchCopyEvent": func(ev *binlogdata.VEvent) error {
+			parent := &vstreamSnapshotStream{keyspace: "main", fields: map[string][]*query.Field{}}
+			cs := &copyStream{parent: parent, idx: 0, tables: []string{"users"}, fields: fields, cur: vgtid}
+			_, err := cs.dispatchCopyEvent("users", ev)
+			return err
+		},
 	}
 	for dname, dispatch := range dispatchers {
 		for typ, dml := range cells {

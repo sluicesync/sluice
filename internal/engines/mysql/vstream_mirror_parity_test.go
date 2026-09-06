@@ -32,6 +32,19 @@ import (
 // name-based on purpose: it cannot verify the bodies agree, but it does catch
 // the shape the real defect took — one type gaining a helper the other never
 // got.
+//
+// REACH — stated because this gate's name reads broader than it is (audit
+// 2026-09-06 H1). Its universe is exactly TWO TYPES, vstreamCDCReader and
+// vstreamSnapshotStream, parsed from two files. It is blind to any OTHER type
+// that dispatches VEvents — which is how copyStream (the ADR-0099 concurrent
+// COPY pump, its own type in cdc_vstream_copy_concurrency_pump.go) went a
+// release without the statement-DML arm while `statementDMLRefusal` sat in
+// the required list below, satisfied by both tracked types. The
+// dispatcher-shaped universe lives in
+// TestVStreamStatementDMLRoster_EveryVEventDispatcher, which derives its
+// roster from the AST; this gate stays scoped to the hand-mirrored twin pair
+// deliberately, because helpers like invalidateFieldsForDDL are meaningful
+// only on a dispatcher with a DDL arm.
 func TestVStreamDispatchTwinsShareTheirRecoveryHelpers(t *testing.T) {
 	// Helpers that MUST exist on both dispatch types. Add to this list
 	// whenever a fix introduces a helper on one twin.

@@ -490,9 +490,54 @@ func (cs *copyStream) dispatchCopyEvent(table string, ev *binlogdata.VEvent) (bo
 		// stance as the sequential COPY's JOURNAL branch).
 		return false, journalToShardLayoutErr(ev.GetJournal())
 
+	case binlogdata.VEventType_INSERT,
+		binlogdata.VEventType_REPLACE,
+		binlogdata.VEventType_UPDATE,
+		binlogdata.VEventType_DELETE:
+		// Statement-format DML during COPY is a write the catch-up phase
+		// would otherwise lose exactly as the CDC tail would — the mirror
+		// of dispatchCopyEventLocked's arm (cdc_vstream_statement_dml.go).
+		//
+		// Audit 2026-09-06 H1: this dispatcher is the FOURTH one a
+		// statement-DML VEvent reaches (engaged whenever
+		// vstream_copy_table_parallelism >= 2), and the 2026-09-01 SLM-3
+		// sweep enumerated only three — so it kept the silent drop that
+		// sweep was written to close. The gate that now derives the
+		// dispatcher universe from the code instead of from a hand list is
+		// TestVStreamStatementDMLRoster_EveryVEventDispatcher.
+		return false, cs.statementDMLRefusal(ev)
+
 	default:
 		return false, nil
 	}
+}
+
+// statementDMLRefusal is the concurrent COPY pump's STATEMENT-DML arm
+// (audit 2026-09-01 SLM-3, reached 2026-09-06 H1;
+// cdc_vstream_statement_dml.go). The mirror of
+// [vstreamSnapshotStream.statementDMLRefusal], reading this stream's OWN
+// cursor: under K > 1 the parent's currentVgtid is never maintained (each
+// copyStream owns its cursor), so the parent's coordinate would be empty or
+// another stream's table.
+//
+// The error travels dispatchCopyEvent → pumpTable → run → failCopy, which
+// stores it as the snapshot's terminal error, flips copyComplete and
+// broadcasts — so a blocked ReadRows consumer surfaces it to the operator
+// rather than it dying inside the pump goroutine. It deliberately does NOT
+// pass through classifyReaderError: a statement-logged write is not
+// retriable, and the reconnect loop sits upstream of this return.
+func (cs *copyStream) statementDMLRefusal(ev *binlogdata.VEvent) error {
+	pos, _ := cs.positionFor() // a position that fails to encode still refuses; the coordinate is diagnostic only
+	return vstreamStatementDMLError(ev, pos)
+}
+
+// positionFor encodes this stream's current per-shard cursor as an
+// [ir.Position]. Per-stream, for the reason stated on statementDMLRefusal.
+func (cs *copyStream) positionFor() (ir.Position, error) {
+	if len(cs.cur) == 0 {
+		return ir.Position{}, nil
+	}
+	return encodeVStreamPos(cs.cur)
 }
 
 // bufferRow decodes a COPY-phase ROW for this stream's table and appends
