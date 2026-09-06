@@ -125,13 +125,25 @@ func TestNotValidReachesEveryConstraintEmitter(t *testing.T) {
 			continue
 		}
 		// Body of the function: from its declaration to the next top-level
-		// func. Coarse, and sufficient — a reference anywhere inside is what
-		// distinguishes "considered it" from "silently dropped it".
+		// func.
 		rest := body[i+len(e.fn):]
 		if j := strings.Index(rest, "\nfunc "); j >= 0 {
 			rest = rest[:j]
 		}
-		mentions := strings.Contains(rest, "NotValid")
+		// COMMENTS DO NOT COUNT. The first cut of this check was
+		// strings.Contains(rest, "NotValid") over the raw source, and the
+		// 2026-09-06 audit mutation-proved it: disabling the SQLite CHECK
+		// warn while leaving the word NotValid in the comment ABOVE it left
+		// the gate green, logging "7 warn". The comment explaining why the
+		// state cannot be carried is exactly the text that would survive
+		// someone deleting the code under it — so a gate reading comments
+		// certifies the defect it exists to catch, which is the shape this
+		// repo keeps paying for.
+		//
+		// A sibling gate in this same package was hardened against precisely
+		// this on the day it was written; this one was not, and nobody
+		// noticed because both were green.
+		mentions := strings.Contains(stripGoComments(rest), "NotValid")
 
 		switch e.verdict {
 		case "carries", "warns":
@@ -169,4 +181,66 @@ func TestNotValidReachesEveryConstraintEmitter(t *testing.T) {
 			"honour it are silent again")
 	}
 	t.Logf("NotValid emitters: %d carry, %d warn, %d exempt", carried, warned, exempt)
+}
+
+// stripGoComments removes // line comments and /* */ block comments from Go
+// source, leaving string literals intact.
+//
+// It exists because a roster that greps raw source for an identifier is
+// satisfied by the COMMENT that explains why the identifier is handled — and
+// the comment is precisely what survives when someone deletes the handling.
+// Deliberately simple: it is not a Go parser, and it does not need to be. A
+// false NEGATIVE here (a mention it fails to see) fails the gate loudly and
+// gets looked at; a false positive is what the audit caught, and stripping
+// comments removes that direction entirely.
+func stripGoComments(src string) string {
+	var out strings.Builder
+	inString, inRawString, inLine, inBlock := false, false, false, false
+	for i := 0; i < len(src); i++ {
+		c := src[i]
+		switch {
+		case inLine:
+			if c == '\n' {
+				inLine = false
+				out.WriteByte(c)
+			}
+		case inBlock:
+			if c == '*' && i+1 < len(src) && src[i+1] == '/' {
+				inBlock = false
+				i++
+			}
+		case inString:
+			out.WriteByte(c)
+			// 0x5c is the backslash. Written as a hex byte rather than a
+			// rune literal on purpose: this file has been mangled twice by
+			// shell here-docs eating the escape, and a constant that cannot
+			// be misquoted is cheaper than remembering not to.
+			if c == 0x5c && i+1 < len(src) {
+				i++
+				out.WriteByte(src[i])
+			} else if c == '"' {
+				inString = false
+			}
+		case inRawString:
+			out.WriteByte(c)
+			if c == '`' {
+				inRawString = false
+			}
+		case c == '"':
+			inString = true
+			out.WriteByte(c)
+		case c == '`':
+			inRawString = true
+			out.WriteByte(c)
+		case c == '/' && i+1 < len(src) && src[i+1] == '/':
+			inLine = true
+			i++
+		case c == '/' && i+1 < len(src) && src[i+1] == '*':
+			inBlock = true
+			i++
+		default:
+			out.WriteByte(c)
+		}
+	}
+	return out.String()
 }

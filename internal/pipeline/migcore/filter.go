@@ -91,6 +91,24 @@ type TableFilter struct {
 	// threading a census parameter through all of them would have been a
 	// larger, riskier change than the fix it carries.
 	census *scopeCensus
+
+	// engineDefaults are the patterns [EffectiveTableFilter] merged in on the
+	// ENGINE's behalf (PlanetScale's `_vt_*` shadow-table prefix today), not
+	// the operator's own.
+	//
+	// They are never reported as unmatched, and this field is what makes that
+	// true. [UnmatchedPatterns] used to carry a comment SAYING engine
+	// defaults "are never reported here -- see EffectiveTableFilter", and
+	// that comment was simply false: EffectiveTableFilter merges the defaults
+	// into Exclude, and the census reads Exclude. A PlanetScale database with
+	// no `_vt_*` shadow tables — the quiet, healthy case — therefore warned
+	// on every run that a pattern the operator never typed had matched
+	// nothing. Two independent audit workers found it on the same day.
+	//
+	// The invariant is now enforced rather than asserted, which is the whole
+	// difference: a comment claiming a property is a hypothesis until
+	// something fails when it stops holding.
+	engineDefaults map[string]bool
 }
 
 // scopeCensus records the table names the engine-side push-down was asked
@@ -188,7 +206,10 @@ func bareName(pattern string) string {
 // is strictly safe; changing what matches is not.
 //
 // Engine-supplied default exclusions are not the caller supplied patterns and
-// are never reported here -- see EffectiveTableFilter.
+// are never reported here -- enforced by the engineDefaults set, not merely
+// asserted. This comment previously claimed the property while nothing
+// implemented it, and PlanetScale runs with no _vt_* shadow tables warned on
+// every clean run as a result.
 func (f TableFilter) UnmatchedPatterns(tableNames []string) []string {
 	patterns := f.Include
 	if len(patterns) == 0 {
@@ -203,7 +224,7 @@ func (f TableFilter) UnmatchedPatterns(tableNames []string) []string {
 				break
 			}
 		}
-		if !hit {
+		if !hit && !f.engineDefaults[p] {
 			unmatched = append(unmatched, p)
 		}
 	}
@@ -283,7 +304,11 @@ func EffectiveTableFilter(filter TableFilter, source ir.Engine, sourceDSN string
 	// Carry the census: a merged filter is the SAME run, and dropping the
 	// pointer here would silently restore Bug 273 on any source that
 	// contributes engine-default exclusions (PlanetScale's `_vt_*`).
-	return TableFilter{Include: nil, Exclude: merged, census: filter.census}, added
+	addedSet := make(map[string]bool, len(added))
+	for _, p := range added {
+		addedSet[p] = true
+	}
+	return TableFilter{Include: nil, Exclude: merged, census: filter.census, engineDefaults: addedSet}, added
 }
 
 // ApplyTableFilter mutates schema.Tables in place, retaining only

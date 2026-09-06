@@ -168,3 +168,58 @@ func TestUnmatchedCensus_SurvivesTheScopePushDown(t *testing.T) {
 		}
 	})
 }
+
+// fakeDefaultExcluder is an engine that contributes a default exclusion, the
+// way PlanetScale contributes `_vt_*`.
+type fakeDefaultExcluder struct{ ir.Engine }
+
+func (fakeDefaultExcluder) DefaultExcludePatterns(string) []string { return []string{"_vt_*"} }
+
+// TestEngineDefaultExclusionsAreNeverReportedUnmatched pins the invariant
+// that UnmatchedPatterns' own doc comment used to merely ASSERT.
+//
+// EffectiveTableFilter merges an engine's default exclusions into Exclude,
+// and the unmatched census reads Exclude — so on a PlanetScale database with
+// no `_vt_*` shadow tables, which is the quiet healthy case, sluice warned on
+// every run that a pattern the operator never typed had matched nothing. The
+// comment said this could not happen. Nothing implemented that. Two audit
+// workers found it independently on the same day.
+func TestEngineDefaultExclusionsAreNeverReportedUnmatched(t *testing.T) {
+	base, err := NewTableFilter(nil, []string{"pii"})
+	if err != nil {
+		t.Fatalf("NewTableFilter: %v", err)
+	}
+	eff, added := EffectiveTableFilter(base, fakeDefaultExcluder{}, "dsn")
+	if len(added) != 1 || added[0] != "_vt_*" {
+		t.Fatalf("engine default not merged (added=%v) — this test would prove nothing", added)
+	}
+
+	// A source with no shadow tables AND a working operator exclusion.
+	names := []string{"users", "orders", "pii"}
+	got := eff.UnmatchedPatterns(names)
+	for _, p := range got {
+		if p == "_vt_*" {
+			t.Errorf("the engine's own default `_vt_*` was reported unmatched — an operator who never "+
+				"typed it is told their filter is broken, on every clean PlanetScale run. got=%v", got)
+		}
+	}
+
+	// Anti-vacuity in the other direction: an operator pattern that really
+	// does match nothing must still be reported through the merged filter,
+	// or this fix has silenced the feature on every PlanetScale source.
+	base2, _ := NewTableFilter(nil, []string{"public.pii"})
+	eff2, _ := EffectiveTableFilter(base2, fakeDefaultExcluder{}, "dsn")
+	var sawOperatorPattern bool
+	for _, p := range eff2.UnmatchedPatterns(names) {
+		if p == "public.pii" {
+			sawOperatorPattern = true
+		}
+		if p == "_vt_*" {
+			t.Errorf("engine default reported alongside the operator's: %v", eff2.UnmatchedPatterns(names))
+		}
+	}
+	if !sawOperatorPattern {
+		t.Error("a genuinely dead OPERATOR pattern went unreported through a merged filter — the " +
+			"engine-default carve-out has swallowed the real finding")
+	}
+}

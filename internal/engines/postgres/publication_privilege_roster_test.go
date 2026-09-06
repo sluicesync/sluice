@@ -61,7 +61,24 @@ func TestPublicationPrivilegeRoster_EveryDDLSiteIsClassified(t *testing.T) {
 		}
 		// Look ahead a short window for the exec of this query and the
 		// error branch it returns from.
-		window := lines[i:min(i+12, len(lines))]
+		//
+		// The window STOPS at the next DDL-query line, and that bound is the
+		// fix for a defect the 2026-09-06 audit mutation-proved: a flat
+		// 12-line lookahead can run past this site's error handling into the
+		// NEXT site's code, so an unclassified site was satisfied by its
+		// NEIGHBOUR's classifyPublicationPermission. Stripping the wrapper
+		// from the FOR-ALL-TABLES drop at publication.go:278 left this gate
+		// green — the uncoded SQLSTATE 42501 it exists to prevent would have
+		// shipped clean. A gate that reads a sibling's evidence is not
+		// grading the site it names.
+		end := min(i+12, len(lines))
+		for j := i + 1; j < end; j++ {
+			if !strings.HasPrefix(strings.TrimSpace(lines[j]), "//") && publicationDDLQuery.MatchString(lines[j]) {
+				end = j
+				break
+			}
+		}
+		window := lines[i:end]
 		joined := strings.Join(window, "\n")
 		if !strings.Contains(joined, "ExecContext(ctx,") {
 			continue // a query built here but executed elsewhere; not a site
