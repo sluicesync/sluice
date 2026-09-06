@@ -277,6 +277,10 @@ func (m *mockD1) pollResultsLocked(t *testing.T, since string) []map[string]any 
 			// directly in d1_mangle_bracket_test.go.
 			"before_bytes": storedBytesOrNull(t, r.before),
 			"after_bytes":  storedBytesOrNull(t, r.after),
+			// Same for the U+FFFD half: a non-rewriting server stores and
+			// delivers the same count, which for these fixtures is zero.
+			"before_fffd": storedFFFDOrNull(t, r.before),
+			"after_fffd":  storedFFFDOrNull(t, r.after),
 		})
 	}
 	return out
@@ -1184,4 +1188,21 @@ func storedBytesOrNull(t *testing.T, cells map[string]any) any {
 		t.Fatalf("mock captured image is %T, not a string", v)
 	}
 	return len(sv)
+}
+
+// storedFFFDOrNull is the U+FFFD-count half of storedBytesOrNull: it
+// reports how many replacement characters the STORED image holds, which
+// for a server that is not rewriting is the same count the delivered
+// image carries.
+func storedFFFDOrNull(t *testing.T, cells map[string]any) any {
+	t.Helper()
+	v := imageOrNull(t, cells)
+	if v == nil {
+		return nil
+	}
+	sv, ok := v.(string)
+	if !ok {
+		t.Fatalf("mock captured image is %T, not a string", v)
+	}
+	return strings.Count(sv, "�")
 }

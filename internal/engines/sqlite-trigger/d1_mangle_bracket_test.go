@@ -37,7 +37,7 @@ func TestD1CapturedImageBytes_BracketsTheServerSideRewrite(t *testing.T) {
 	}
 
 	t.Run("a rewritten cell is refused, naming both counts", func(t *testing.T) {
-		err := checkD1CapturedImageBytes(42, "after", sql.NullString{String: mangled, Valid: true}, json.RawMessage("3"))
+		err := checkD1CapturedImageBytes(42, "after", sql.NullString{String: mangled, Valid: true}, json.RawMessage("3"), json.RawMessage("0"))
 		if err == nil {
 			t.Fatal("a captured image delivered as 5 bytes where D1 stores 3 was accepted — this is the " +
 				"server-side U+FFFD rewrite, and applying it writes the rewritten text to the target while " +
@@ -67,19 +67,19 @@ func TestD1CapturedImageBytes_BracketsTheServerSideRewrite(t *testing.T) {
 		// The no-false-fire floor. Without it, "refuses the mangled case" is
 		// indistinguishable from "refuses everything", which would wedge
 		// every d1-trigger stream on its first change row.
-		if err := checkD1CapturedImageBytes(1, "before", sql.NullString{String: "AB", Valid: true}, json.RawMessage("2")); err != nil {
+		if err := checkD1CapturedImageBytes(1, "before", sql.NullString{String: "AB", Valid: true}, json.RawMessage("2"), json.RawMessage("0")); err != nil {
 			t.Errorf("an intact 2-byte cell was refused: %v", err)
 		}
 		// Multi-byte but VALID UTF-8 must also pass: the bracket compares
 		// bytes, and a 3-byte character is 3 stored bytes.
-		if err := checkD1CapturedImageBytes(2, "after", sql.NullString{String: "€", Valid: true}, json.RawMessage("3")); err != nil {
+		if err := checkD1CapturedImageBytes(2, "after", sql.NullString{String: "€", Valid: true}, json.RawMessage("3"), json.RawMessage("0")); err != nil {
 			t.Errorf("a valid multi-byte character was refused: %v", err)
 		}
 	})
 
 	t.Run("a NULL image is not compared", func(t *testing.T) {
 		// An INSERT has no before image. Comparing would refuse every insert.
-		if err := checkD1CapturedImageBytes(3, "before", sql.NullString{}, json.RawMessage("0")); err != nil {
+		if err := checkD1CapturedImageBytes(3, "before", sql.NullString{}, json.RawMessage("0"), json.RawMessage("0")); err != nil {
 			t.Errorf("a SQL NULL captured image was refused: %v", err)
 		}
 	})
@@ -88,7 +88,7 @@ func TestD1CapturedImageBytes_BracketsTheServerSideRewrite(t *testing.T) {
 		// The bracket's own liveness. If the query shape drifts and D1 stops
 		// returning the length column, silently skipping the check turns this
 		// gate into decoration — which is the failure mode it exists to stop.
-		err := checkD1CapturedImageBytes(4, "after", sql.NullString{String: mangled, Valid: true}, nil)
+		err := checkD1CapturedImageBytes(4, "after", sql.NullString{String: mangled, Valid: true}, nil, json.RawMessage("0"))
 		if err == nil {
 			t.Fatal("an absent stored-byte length was treated as clean — the bracket is then inoperative " +
 				"and nothing on this transport can see a server-side rewrite")
@@ -109,4 +109,87 @@ func TestD1CapturedImageBytes_BracketsTheServerSideRewrite(t *testing.T) {
 			t.Error("a non-numeric string decoded as a length; that would silence the bracket")
 		}
 	})
+}
+
+// TestD1CapturedImageBytes_CatchesTheLengthPreservingRewrite pins the
+// blind spot the pre-tag value-fidelity review found in the byte-length
+// bracket (audit 2026-09-06, MEDIUM).
+//
+// D1 substitutes one U+FFFD -- three bytes -- per MAXIMAL INVALID
+// SUBPART, and a subpart is one, two or three bytes. At exactly three
+// the substitution is byte-length PRESERVING and the length bracket sees
+// nothing. That shape is not exotic: a 4-byte UTF-8 sequence severed at
+// a byte boundary IS a 3-byte maximal subpart, and severing at a byte
+// boundary is what fixed-width truncation does to an emoji.
+//
+// So the fixture here is the realistic one: a cell holding 'A' followed
+// by the first three bytes of a 4-byte emoji. Stored: 4 bytes, zero
+// U+FFFD. Delivered: "A" + U+FFFD, also 4 bytes, one U+FFFD. The length
+// check passes by construction -- that is the point -- and the count
+// check is the only thing standing between this row and a silent
+// rewrite on the target.
+func TestD1CapturedImageBytes_CatchesTheLengthPreservingRewrite(t *testing.T) {
+	delivered := "A�"
+	if len(delivered) != 4 {
+		t.Fatalf("fixture is not length-preserving: delivered is %d bytes, want 4", len(delivered))
+	}
+
+	t.Run("equal byte counts do not make it clean", func(t *testing.T) {
+		// stored bytes = 4 (matches!), stored U+FFFD = 0 (does not).
+		err := checkD1CapturedImageBytes(7, "after",
+			sql.NullString{String: delivered, Valid: true},
+			json.RawMessage("4"), json.RawMessage("0"))
+		if err == nil {
+			t.Fatal("a length-preserving U+FFFD rewrite was accepted. A severed 4-byte sequence is three " +
+				"bytes -- exactly the width of the replacement it becomes -- so the byte-length bracket " +
+				"passes and only the replacement COUNT can see it. Without this check the captured row is " +
+				"applied with the source's bytes replaced, at exit 0.")
+		}
+		for _, want := range []string{"id=7", `"after"`, "1 U+FFFD", "stores 0"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("refusal missing %q; got: %v", want, err)
+			}
+		}
+	})
+
+	t.Run("a cell that legitimately holds U+FFFD passes", func(t *testing.T) {
+		// The control that keeps this from being a blanket ban on U+FFFD.
+		// A source may legitimately store the replacement character; it is
+		// counted on both sides and the counts agree.
+		if err := checkD1CapturedImageBytes(8, "before",
+			sql.NullString{String: delivered, Valid: true},
+			json.RawMessage("4"), json.RawMessage("1")); err != nil {
+			t.Fatalf("a value that genuinely stores U+FFFD must pass; got: %v", err)
+		}
+	})
+
+	t.Run("a missing count is refused, not skipped", func(t *testing.T) {
+		// Same rule as the byte half: an absent column means the query
+		// shape drifted, and skipping the check is how a bracket becomes
+		// decorative.
+		err := checkD1CapturedImageBytes(9, "after",
+			sql.NullString{String: delivered, Valid: true},
+			json.RawMessage("4"), nil)
+		if err == nil {
+			t.Fatal("a captured image with no stored U+FFFD count was accepted; the count half of the " +
+				"bracket must refuse rather than silently degrade to the length check it is there to cover")
+		}
+		if !strings.Contains(err.Error(), "no stored U+FFFD count") {
+			t.Errorf("refusal does not name the missing count: %v", err)
+		}
+	})
+}
+
+// TestD1ReplacementCountExpr_ShapeIsServerSide pins that the count is
+// computed on the STORED value, which is the property that makes it
+// independent evidence rather than this reader re-deriving its own
+// answer from the payload it is grading.
+func TestD1ReplacementCountExpr_ShapeIsServerSide(t *testing.T) {
+	got := d1ReplacementCountExpr("before")
+	for _, want := range []string{"length(CAST(before AS BLOB))", "replace(before, char(65533), '')", "/ 3"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("expression missing %q — it must measure the STORED value server-side, "+
+				"not the delivered text; got: %s", want, got)
+		}
+	}
 }

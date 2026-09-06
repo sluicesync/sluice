@@ -704,10 +704,10 @@ func (e *d1Executor) pollChangeLog(ctx context.Context, sinceID int64, batch int
 		// what this client decoded. They diverge exactly when D1's response
 		// rewrote invalid UTF-8 to U+FFFD, which the JSONStringValue guard
 		// structurally cannot see because what reaches it is valid UTF-8.
-		if err := checkD1CapturedImageBytes(id, "before", before, row["before_bytes"]); err != nil {
+		if err := checkD1CapturedImageBytes(id, "before", before, row["before_bytes"], row["before_fffd"]); err != nil {
 			return nil, err
 		}
-		if err := checkD1CapturedImageBytes(id, "after", after, row["after_bytes"]); err != nil {
+		if err := checkD1CapturedImageBytes(id, "after", after, row["after_bytes"], row["after_fffd"]); err != nil {
 			return nil, err
 		}
 		capturedAt, err := d1NullString(row["captured_at"])
@@ -1060,7 +1060,8 @@ func (e *d1Executor) pollChangeLogRows(ctx context.Context, sinceID int64, batch
 		// this poll copied mangled captured images at exit 0 while the bulk
 		// reader refused the identical row.
 		q := `SELECT CAST("` + ChangeLogTable + `".id AS TEXT) AS id, op, tbl, before, after, captured_at, ` +
-			`length(CAST(before AS BLOB)) AS before_bytes, length(CAST(after AS BLOB)) AS after_bytes FROM "` +
+			`length(CAST(before AS BLOB)) AS before_bytes, length(CAST(after AS BLOB)) AS after_bytes, ` +
+			d1ReplacementCountExpr("before") + ` AS before_fffd, ` + d1ReplacementCountExpr("after") + ` AS after_fffd FROM "` +
 			ChangeLogTable + `" WHERE id > ? ORDER BY "` + ChangeLogTable + `".id ASC LIMIT ` + strconv.Itoa(batch)
 		rows, err := e.conn.Query(ctx, q, strconv.FormatInt(sinceID, 10))
 		if err == nil {
@@ -1274,7 +1275,7 @@ func d1NullString(raw json.RawMessage) (sql.NullString, error) {
 // A cell D1 did not report a length for is NOT treated as clean: an absent
 // column means the query shape changed, and silently skipping the check is
 // how a bracket becomes decorative.
-func checkD1CapturedImageBytes(id int64, column string, got sql.NullString, rawLen json.RawMessage) error {
+func checkD1CapturedImageBytes(id int64, column string, got sql.NullString, rawLen, rawFFFD json.RawMessage) error {
 	if !got.Valid {
 		// SQL NULL: nothing was captured for this side of the change (an
 		// INSERT has no before image). Nothing to compare.
@@ -1303,6 +1304,41 @@ func checkD1CapturedImageBytes(id int64, column string, got sql.NullString, rawL
 					"so at least one cell of this captured row was silently rewritten in transit. Applying it would "+
 					"write the rewritten text to the target while the source still holds the original",
 				id, column, delivered, stored,
+			),
+		)
+	}
+
+	// The byte count agreeing is NOT proof the image is clean: a maximal
+	// invalid subpart of exactly three bytes -- a 4-byte sequence severed
+	// at a byte boundary, which is what truncating an emoji produces --
+	// rewrites to a 3-byte U+FFFD and preserves the length. Compare the
+	// replacement-character COUNT too; between them the two numbers admit
+	// no rewrite, because every rewrite either grows the byte count or
+	// introduces a U+FFFD that was not stored.
+	storedFFFD, ok := d1JSONInt64(rawFFFD)
+	if !ok {
+		return sluicecode.Wrap(
+			sluicecode.CodeD1TextMangled,
+			"re-run the read; if it persists, the change-log query shape has drifted and the mangle bracket is inoperative",
+			fmt.Errorf(
+				"d1-trigger: change-log id=%d: D1 returned no stored U+FFFD count for %q, so a length-preserving "+
+					"rewrite of this captured image cannot be detected -- the byte-length check alone is blind to a "+
+					"three-byte invalid subpart, and this half of the bracket is not optional",
+				id, column,
+			),
+		)
+	}
+	if deliveredFFFD := int64(strings.Count(got.String, "�")); deliveredFFFD != storedFFFD {
+		return sluicecode.Wrap(
+			sluicecode.CodeD1TextMangled,
+			"read the affected columns as hex(col) and repair the values at the source, then re-run",
+			fmt.Errorf(
+				"d1-trigger: change-log id=%d: the %q captured image arrived carrying %d U+FFFD where D1 stores %d -- "+
+					"D1 replaced an invalid UTF-8 subpart in its query response without changing the byte count "+
+					"(a severed 4-byte sequence is three bytes, exactly the width of the replacement it becomes), "+
+					"so this captured row was silently rewritten in transit. Applying it would write the rewritten "+
+					"text to the target while the source still holds the original",
+				id, column, deliveredFFFD, storedFFFD,
 			),
 		)
 	}
@@ -1335,4 +1371,32 @@ func d1JSONInt64(raw json.RawMessage) (int64, bool) {
 		return 0, false
 	}
 	return v, true
+}
+
+// d1ReplacementCountExpr renders a SQL expression counting how many
+// U+FFFD characters the STORED value of col already contains, evaluated
+// server-side like the byte-length bracket beside it.
+//
+// WHY A SECOND NUMBER IS NEEDED (audit 2026-09-06, pre-tag review). The
+// byte-length bracket alone is blind in one direction. D1 substitutes
+// one U+FFFD -- three bytes -- per MAXIMAL INVALID SUBPART, and a
+// subpart is one, two or three bytes long. When it is exactly THREE the
+// rewrite is byte-length PRESERVING and the bracket cannot see it. That
+// is not an exotic shape: a 4-byte UTF-8 sequence severed at a byte
+// boundary is precisely a 3-byte maximal subpart, and severing at a
+// byte boundary is what fixed-width truncation does to an emoji. A cell
+// holding 'A' || x'F09F98' stores 4 bytes and is delivered as "A" +
+// U+FFFD, also 4 bytes.
+//
+// Counting stored U+FFFD closes the class, because every rewrite either
+// grows the byte count OR introduces a replacement character that was
+// not stored -- there is no rewrite that does neither. A value that
+// legitimately CONTAINS U+FFFD is fine: it is counted on both sides and
+// the counts agree.
+//
+// The division by 3 is exact: U+FFFD is always three bytes in UTF-8, so
+// the byte delta between the value and the value with every U+FFFD
+// removed is always a multiple of 3.
+func d1ReplacementCountExpr(col string) string {
+	return `(length(CAST(` + col + ` AS BLOB)) - length(CAST(replace(` + col + `, char(65533), '') AS BLOB))) / 3`
 }

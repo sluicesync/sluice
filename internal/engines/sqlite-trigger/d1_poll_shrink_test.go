@@ -94,6 +94,11 @@ func startShrinkMock(t *testing.T, m *shrinkMock) *sqlite.D1Conn {
 			// nil length.
 			"before_bytes": nil,
 			"after_bytes":  len(`{"id":{"t":"integer","v":"1"}}`),
+			// The U+FFFD half of the same bracket: a healthy D1 rewrites
+			// nothing, so the stored count is zero and matches the
+			// delivered image. nil before image => nil count.
+			"before_fffd": nil,
+			"after_fffd":  0,
 		}}))
 	}))
 	t.Cleanup(srv.Close)

@@ -47,10 +47,15 @@ var manifestConsumerExempt = map[string]string{
 		"— so running the list here would make every crashed backup unresumable, the exact opposite of the intent.",
 
 	// --- chain maintenance (compact): metadata reads + verbatim byte moves ---
-	"CompactChain": "compact applies nothing to a target: it reads each link's manifest for positions/ids and MOVES " +
+	// Was keyed on "CompactChain" until the redaction door pushed that
+	// function over the cyclomatic ceiling and the manifest read moved into
+	// this helper. The gate caught the move — which is the whole reason it
+	// is keyed on the function that actually loads, not on the command.
+	"loadSegmentMetas": "compact applies nothing to a target: it reads each link's manifest for positions/ids and MOVES " +
 		"chunk bytes it never decodes. Its read-back gate (checkChainReadable, Bug 214) re-walks the result the " +
 		"way a restore would, before and after the destructive sweep, which is the check that matters for a " +
-		"command whose output is another chain rather than a database.",
+		"command whose output is another chain rather than a database. Note CompactChain does run one " +
+		"manifest-derived door of its own — refuseCompactRedactedChain, over the metas this helper returns.",
 	"executeMergeGroup": "compact's staging/merge core — manifest metadata + verbatim chunk moves, under CompactChain's exemption.",
 	"segmentByteTotal":  "compact size accounting: reads segment headers to total chunk bytes for the merge plan. Applies nothing, decodes nothing.",
 	"applySmartCompactionToStagedGroup": "ADR-0064 smart compaction decodes CHANGE chunks to collapse events, but reads the manifest only to " +

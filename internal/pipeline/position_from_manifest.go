@@ -42,26 +42,40 @@ import (
 //   - the chain's terminal manifest carries an empty EndPosition (a
 //     pre-Phase-3.3 v0.16.x or v0.17.0 full with no recorded position;
 //     the chain handoff path has nowhere to start)
-func LoadChainTerminalPosition(ctx context.Context, store irbackup.Store) (ir.Position, error) {
+//
+// It returns the terminal manifest's REDACTION MARKER alongside the
+// position, and that second return is not a convenience. This function
+// builds the whole lineage and reads the terminal manifest, so it has
+// always held the marker — and it returned only the position, which is
+// how `--position-from-manifest` became the one redaction-posture door
+// reaching no guard (audit 2026-09-06, found by the pre-tag review).
+// Resuming CDC off a redacted chain under a sync that is not redacting
+// overwrites the restore's redacted values with plaintext on a LIVE
+// target. Handing the marker back rather than exposing a separate
+// lookup is deliberate: the defect was not a missing check, it was a
+// function that held the evidence and dropped it, and a caller cannot
+// drop this one without an unused-variable or a visible `_`.
+// [backup.RefusePositionFromRedactedChain] is what grades it.
+func LoadChainTerminalPosition(ctx context.Context, store irbackup.Store) (ir.Position, *irbackup.RedactionInfo, error) {
 	// nil comparator: position-from-manifest only reads the terminal
 	// position; the structural + write-time guarantees suffice (no
 	// source engine instance available here without breaking the
 	// pipeline's no-engine-registry layering).
 	chain, err := lineage.BuildLineageChain(ctx, store, nil)
 	if err != nil {
-		return ir.Position{}, fmt.Errorf("position-from-manifest: build lineage: %w", err)
+		return ir.Position{}, nil, fmt.Errorf("position-from-manifest: build lineage: %w", err)
 	}
 	if len(chain) == 0 {
-		return ir.Position{}, errors.New("position-from-manifest: store contains no manifests")
+		return ir.Position{}, nil, errors.New("position-from-manifest: store contains no manifests")
 	}
 	terminal := chain[len(chain)-1].Manifest
 	if terminal.EndPosition.Engine == "" && terminal.EndPosition.Token == "" {
-		return ir.Position{}, fmt.Errorf(
+		return ir.Position{}, nil, fmt.Errorf(
 			"position-from-manifest: terminal manifest %q has no EndPosition recorded "+
 				"(pre-Phase-3.3 full backup or malformed chain). Take a fresh full backup "+
 				"with sluice v0.17.2+ to populate EndPosition automatically",
 			lineage.ManifestBackupID(terminal),
 		)
 	}
-	return terminal.EndPosition, nil
+	return terminal.EndPosition, terminal.Redaction, nil
 }

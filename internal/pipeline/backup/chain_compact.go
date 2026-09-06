@@ -432,25 +432,16 @@ func CompactChain(ctx context.Context, store irbackup.Store, opts CompactOpts) (
 	}
 
 	// Load per-segment metadata once.
-	metas := make([]segMeta, 0, len(eligible))
-	for i := range eligible {
-		seg := &eligible[i]
-		ss := seg.Store(store)
-		fm, err := lineage.ReadManifestAt(ctx, ss, seg.FullManifestPath)
-		if err != nil {
-			return nil, fmt.Errorf("backup compact: read segment %d full %q: %w", i, seg.FullManifestPath, err)
-		}
-		bt, err := segmentByteTotal(ctx, ss, seg, fm)
-		if err != nil {
-			return nil, fmt.Errorf("backup compact: sum segment %d bytes: %w", i, err)
-		}
-		metas = append(metas, segMeta{
-			idx:       i,
-			catIdx:    cat.RestorableFromSegment + i,
-			createdAt: fm.CreatedAt,
-			fullMani:  fm,
-			byteTotal: bt,
-		})
+	metas, err := loadSegmentMetas(ctx, store, cat, eligible)
+	if err != nil {
+		return nil, err
+	}
+
+	// Before any merge is planned: compaction re-attributes one segment's
+	// full manifest to the merged data of several, which would launder a
+	// redaction marker onto plaintext. See [refuseCompactRedactedChain].
+	if err := refuseCompactRedactedChain(metas); err != nil {
+		return nil, err
 	}
 
 	// Pairwise greedy grouping by CreatedAt distance. Cut a new group
@@ -1407,4 +1398,45 @@ func mergedSegmentFromGroup(cat *lineage.Catalog, pg *plannedGroup, now time.Tim
 		Codec:                    oldest.CodecOrDefault(),
 		VerbatimExtensionColumns: verbatim,
 	}
+}
+
+// loadSegmentMetas reads each eligible segment's full manifest once and
+// tallies its byte total, producing the [segMeta] slice every later pass
+// in CompactChain reads.
+//
+// Extracted from CompactChain to keep it under the cyclomatic ceiling
+// when the redaction door was added. The DOOR deliberately stayed in
+// CompactChain rather than moving in here with the loop: it is an
+// ordering constraint against the grouping pass, and
+// TestCompactChainReachesTheRedactionDoor grades that ordering by
+// position within CompactChain. Moving the call in here would put it
+// below the grouping call in file order and the gate would report a
+// correctly-placed door as misordered.
+func loadSegmentMetas(
+	ctx context.Context,
+	store irbackup.Store,
+	cat *lineage.Catalog,
+	eligible []lineage.Segment,
+) ([]segMeta, error) {
+	metas := make([]segMeta, 0, len(eligible))
+	for i := range eligible {
+		seg := &eligible[i]
+		ss := seg.Store(store)
+		fm, err := lineage.ReadManifestAt(ctx, ss, seg.FullManifestPath)
+		if err != nil {
+			return nil, fmt.Errorf("backup compact: read segment %d full %q: %w", i, seg.FullManifestPath, err)
+		}
+		bt, err := segmentByteTotal(ctx, ss, seg, fm)
+		if err != nil {
+			return nil, fmt.Errorf("backup compact: sum segment %d bytes: %w", i, err)
+		}
+		metas = append(metas, segMeta{
+			idx:       i,
+			catIdx:    cat.RestorableFromSegment + i,
+			createdAt: fm.CreatedAt,
+			fullMani:  fm,
+			byteTotal: bt,
+		})
+	}
+	return metas, nil
 }

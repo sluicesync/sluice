@@ -13,6 +13,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/appliercontrol"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
@@ -579,9 +580,15 @@ func (s *Streamer) phaseLookupPosition(ctx context.Context, applier ir.ChangeApp
 		found     bool
 	)
 	if s.PositionFromManifestStore != nil {
-		chainPos, err := LoadChainTerminalPosition(ctx, s.PositionFromManifestStore)
+		chainPos, chainRedaction, err := LoadChainTerminalPosition(ctx, s.PositionFromManifestStore)
 		if err != nil {
 			return ir.Position{}, false, migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("pipeline: %w", err))
+		}
+		// Before anything opens: a redacted chain resumed by a sync that
+		// is not redacting to the same policy overwrites the restore's
+		// redacted values with plaintext on a live target.
+		if err := backup.RefusePositionFromRedactedChain(chainRedaction, s.Redactor, "--position-from-manifest"); err != nil {
+			return ir.Position{}, false, migcore.WrapWithHint(migcore.PhaseCDC, err)
 		}
 		// Run Phase 3.3.C pre-flight checks before opening CDC. PG-only
 		// today; MySQL has no operator-attention surface here. Refuses

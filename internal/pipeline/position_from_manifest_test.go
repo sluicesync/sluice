@@ -40,7 +40,7 @@ func TestLoadChainTerminalPosition_FullOnly(t *testing.T) {
 		t.Fatalf("write parent: %v", err)
 	}
 
-	got, err := LoadChainTerminalPosition(context.Background(), store)
+	got, _, err := LoadChainTerminalPosition(context.Background(), store)
 	if err != nil {
 		t.Fatalf("LoadChainTerminalPosition: %v", err)
 	}
@@ -102,7 +102,7 @@ func TestLoadChainTerminalPosition_FullPlusIncrementals(t *testing.T) {
 		t.Fatalf("write incr2: %v", err)
 	}
 
-	got, err := LoadChainTerminalPosition(context.Background(), store)
+	got, _, err := LoadChainTerminalPosition(context.Background(), store)
 	if err != nil {
 		t.Fatalf("LoadChainTerminalPosition: %v", err)
 	}
@@ -133,7 +133,7 @@ func TestLoadChainTerminalPosition_EmptyEndPosition(t *testing.T) {
 		t.Fatalf("write full: %v", err)
 	}
 
-	_, err := LoadChainTerminalPosition(context.Background(), store)
+	_, _, err := LoadChainTerminalPosition(context.Background(), store)
 	if err == nil {
 		t.Fatal("LoadChainTerminalPosition: nil; want error on empty EndPosition")
 	}
@@ -151,7 +151,7 @@ func TestLoadChainTerminalPosition_EmptyEndPosition(t *testing.T) {
 func TestLoadChainTerminalPosition_EmptyStore(t *testing.T) {
 	dir := t.TempDir()
 	store, _ := blobcodec.NewLocalStore(dir)
-	_, err := LoadChainTerminalPosition(context.Background(), store)
+	_, _, err := LoadChainTerminalPosition(context.Background(), store)
 	if err == nil {
 		t.Fatal("LoadChainTerminalPosition: nil; want error")
 	}
