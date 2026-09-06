@@ -1,0 +1,31 @@
+# sluice v0.142.0
+
+**If you use `--exclude-table`, check your patterns.** A pattern that matches nothing was silent, and on the exclude path that fails **open**: the table you meant to keep out is copied, in full, at exit 0. The usual cause is close to a trap — patterns match the **bare** table name, while sluice's own diagnostics print tables as `public.orders`, so the string you copy out of sluice's output is exactly the string that matches nothing. It now warns, marked `TABLE-FILTER-PATTERN-UNMATCHED`.
+
+Two refusals that fired on working configurations are also gone: a Postgres DDL on a relation your stream was told to ignore no longer ends the stream, and a `timetz` → `time` column change no longer halts one.
+
+## Fixed
+
+**A table-filter pattern that matches nothing now warns (Bug 272).** Found by the v0.141.4 regression cycle with `--exclude-table=public.pii`, which copied the PII table and every row it held. The warning names the flag, the pattern, what it means (`those tables are NOT excluded and their rows WILL be copied`) and the remedy — and when the pattern looks schema-qualified it says so specifically, offering the bare name to use instead. It is a warning rather than a refusal on purpose: a pattern naming a table absent from *this* source is legitimate, so refusing would break a working configuration across environments. Scope worth knowing: the check runs at the filter-apply door shared by `migrate` and `sync` cold start. `backup restore` and `cutover` evaluate the same patterns and do **not** report unmatched ones, so a typo is still silent on those two paths. The matching rule itself was documented in neither repo and now has a home in the filtered-subset guide.
+
+**A Postgres DDL on a relation the stream was told to ignore no longer ends the stream (UPR-2).** The pgoutput reader's four DML dispatch sites had always consulted the stream's scope; the RelationMessage path consulted nothing. So a DDL in a schema outside `--include-schema`, or on an `--exclude-table`'d table, still ran the schema-race checks — and the refusal named a table the operator had deliberately excluded, with a remedy they could not run for it. `postgres.CDCReader` now implements `ir.CDCScopePredicateSetter`, which the pipeline already wired for every reader it opens. From a review of PlanetScale's pgcopydb fork PR #52, and proven by execution rather than by reading: hand-encoded pgoutput `R` payloads driven through `dispatchWAL` with a scope set.
+
+**`timetz` → `time` no longer halts a stream (SLM-5b).** The session-TimeZone refusal covered the `time`/`timetz` pair in both directions. Only one of them needs it. Postgres stores a `timetz` offset alongside each value, so dropping the offset consults no session zone at all — measured byte-identical under `UTC` and `Asia/Tokyo`, including negative and fractional offsets, 1-D arrays with NULL elements, and 2-D arrays compared with `array_dims`. Adding an offset (`time` → `timetz`) *does* invent one from the executing session, so that direction still refuses. The `timestamp` family is unchanged and still refuses both ways, because `timestamptz` is stored normalised to UTC and re-renders through the session zone whichever way the cast runs. The predicate is renamed `ir.SessionDependentZoneSwap` — the old name promised "in either direction", which stopped being true.
+
+**`NOT VALID` constraint state reaches the last emitter, and the remediation SQL stops re-validating (UPR-1c).** v0.141.4 began carrying this state; two gaps remained. `sqlite.emitCheckConstraint` dropped it silently, so a Postgres source with an unvalidated `CHECK` over a row that violates it migrated to SQLite/D1 as an *enforced* constraint, the copy died with `CHECK constraint failed`, and nothing said why the source had tolerated the row — while the identical MySQL case warned. Separately, `sluice diff` learned to *report* a validity divergence and kept emitting DDL that re-validates: run the tool's own output against a target holding rows the source tolerates and the `ADD CONSTRAINT` dies mid-remediation; against a compliant target it lands a constraint **stricter** than the source, which then fails the CDC apply on the first replicated row the source accepts. All three renderers now carry it, `renderFKClause` placing `NOT VALID` after `DEFERRABLE` where Postgres's grammar requires it.
+
+## Compatibility
+
+**One shipped refusal was narrowed, deliberately.** If a stream previously halted on a `timetz` → `time` (or `timetz[]` → `time[]`) column change, it will now forward that change instead. This is the intended effect and it is safe for the reason measured above; no other cell of the session-TimeZone class moved. `--schema-changes=refuse` is untouched — it refuses every boundary, as before.
+
+Nothing else changes behaviour. The new warning is additive, and the `NOT VALID` work only affects sources that carry unvalidated constraints.
+
+## Who needs this
+
+- **Anyone using `--include-table` / `--exclude-table`** — especially with schema-qualified patterns, which match nothing. This is the item with data-exposure consequences.
+- **Postgres CDC users running a filtered stream** — the out-of-scope-DDL halt is gone.
+- **Anyone migrating Postgres constraints**, particularly to SQLite/D1, or acting on `sluice diff` output for tables carrying `NOT VALID` constraints.
+
+## Development notes
+
+The pre-tag `value-fidelity-reviewer` pass found a HIGH in this release's own new code for the sixth consecutive release. UPR-2's first cut scope-gated **both** refusals in `gradeRelationSchemaRace`, including `checkSeededSchemaRace` — the one-shot door that refuses a stopped-stream zone swap at a relation's first message. Because the pipeline's scope predicate reads a live-added-table set that is nil until the apply sidecars start, and those start *after* the reader opens, a warm resume of a stream carrying a `schema add-table` table skipped that door once and disarmed it permanently. **No published version carried this**: the defect was introduced and fixed inside this release's own unreleased delta. It is recorded here because the item's own roster asserted that *every* schema-race site was gated, and so certified the defect it existed to prevent — the roster now declares a per-site posture instead of counting.

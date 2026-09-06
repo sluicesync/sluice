@@ -40,7 +40,7 @@ That last row is the trap, and it is the shape sluice's own diagnostics encourag
 
 **Since v0.142.0 an unmatched pattern is not silent.** A pattern that matches no table in the source emits a WARN marked `TABLE-FILTER-PATTERN-UNMATCHED` — grep your logs for that — naming the flag, the pattern, the effect (`nothing was excluded` / `nothing was included`) and the bare-name remedy. It is a warning rather than a refusal because a pattern that matches nothing in *this* source is legitimate — one config across several databases, or a table that has not been created yet.
 
-**Where the check runs:** the filter-apply door shared by `migrate` and `sync` cold start. `backup restore` and `cutover` evaluate the same patterns against their own table sets and do **not** report unmatched ones — so a typo'd pattern is still silent on those two paths.
+**Where the check runs:** the filter-apply door shared by `migrate` and `sync` cold start. `restore` and `cutover` evaluate the same patterns against their own table sets and do **not** report unmatched ones — so a typo'd pattern is still silent on those two paths.
 
 ## `migrate --where` — one-shot filtered copy
 

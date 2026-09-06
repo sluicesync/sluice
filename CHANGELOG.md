@@ -4,6 +4,24 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.142.0] - 2026-09-05
+
+If you use `--exclude-table`, check your patterns. One that matches nothing was silent, and on the exclude path that fails OPEN — the table you meant to keep out is copied in full, at exit 0. Two refusals that fired on working configurations are also gone.
+
+### Fixed
+
+**A table-filter pattern that matches nothing now warns (Bug 272).** Found by the v0.141.4 regression cycle with `--exclude-table=public.pii`, which copied the PII table and every row. The WARN is marked `TABLE-FILTER-PATTERN-UNMATCHED` and names the flag, the pattern, the effect and the remedy — and when the pattern looks schema-qualified it offers the bare name instead, which is the dominant cause: patterns match the BARE table name while sluice diagnostics print names qualified, so the string an operator copies out of sluice output is the one that matches nothing. A warning rather than a refusal because a pattern naming a table absent from THIS source is legitimate. Scope: the filter-apply door shared by `migrate` and `sync` cold start; `backup restore` and `cutover` evaluate the same patterns and do not report unmatched ones. The matching rule now has a documented home in the filtered-subset guide.
+
+**A Postgres DDL on a relation the stream was told to ignore no longer ends the stream (UPR-2).** The pgoutput reader dispatch sites consulted the stream scope; the RelationMessage path consulted nothing, so a DDL in an unselected schema or on an `--exclude-table`d table ran the schema-race checks and refused with a remedy naming a table the operator had deliberately excluded. `postgres.CDCReader` now implements `ir.CDCScopePredicateSetter`. From PlanetScale pgcopydb fork PR #52, proven by driving hand-encoded pgoutput `R` payloads through `dispatchWAL`.
+
+**`timetz` to `time` no longer halts a stream (SLM-5b).** The session-TimeZone refusal covered the time/timetz pair both ways and only one direction needs it: `timetz` stores its offset per value, so dropping it consults no session zone — measured byte-identical under `UTC` and `Asia/Tokyo` across negative and fractional offsets, 1-D arrays with NULL elements, and 2-D arrays checked with `array_dims`. The ADD direction still refuses (an offset is invented from the executing session), and the timestamp family is unchanged because `timestamptz` is stored normalised to UTC. The predicate is renamed `ir.SessionDependentZoneSwap`; the old name promised "in either direction" and that stopped being true.
+
+**`NOT VALID` reaches the last emitter and the remediation SQL stops re-validating (UPR-1c).** `sqlite.emitCheckConstraint` dropped the state silently, so an unvalidated source CHECK migrated to SQLite/D1 as enforced, the copy died with `CHECK constraint failed`, and nothing said why the source tolerated the row — while the identical MySQL case warned. And `sluice diff` reported a validity divergence while still emitting DDL that re-validates, which either dies mid-remediation against a target holding rows the source tolerates, or lands a constraint stricter than the source that then kills the CDC apply. All three renderers carry it now, with `NOT VALID` after `DEFERRABLE` as PG grammar requires.
+
+### Compatibility
+
+One shipped refusal was narrowed deliberately: a stream that previously halted on `timetz` to `time` (or the array form) now forwards that change. No other cell of the session-TimeZone class moved, and `--schema-changes=refuse` is untouched. Everything else is additive.
+
 ## [0.141.4] - 2026-09-05
 
 **Correction (2026-09-05):** one sentence in this entry describes a failure mechanism imprecisely, corrected in place at **v0.141.4** because it is prose-only — the shipped code is correct and unchanged. "the emitted DDL was a syntax error": Postgres never saw it. `assertSingleDDLStatement`, the anti-tamper control that refuses emitted DDL which is not one well-formed statement, rejected the malformed body first with `unbalanced ')' at byte 80`, so the run failed one layer earlier than described. The operator-visible outcome — the source could not be migrated — was accurate. Found by this release's own regression cycle, which measured the control binary rather than trusting the sentence.
