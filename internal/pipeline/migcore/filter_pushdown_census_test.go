@@ -223,3 +223,73 @@ func TestEngineDefaultExclusionsAreNeverReportedUnmatched(t *testing.T) {
 			"engine-default carve-out has swallowed the real finding")
 	}
 }
+
+// TestFanOutReportsOnceAgainstTheWholeUniverse pins the fourth false-fire arm
+// of Bug 273: a multi-database fan-out calls the filter door once per
+// database, over that database's tables only, so a pattern naming a table in
+// database A looked unmatched while database B was being processed — one
+// false warning per pass.
+//
+// Reporting per pass cannot be made correct, because no single pass has the
+// universe. So the fan-out form is quiet and the caller reports once. Both
+// halves are asserted here, because either alone is a defect: quiet-with-no
+// -final-report silently drops the Bug 272 protection for exactly the
+// multi-database operators who most need it.
+func TestFanOutReportsOnceAgainstTheWholeUniverse(t *testing.T) {
+	// Two databases; `orders` lives only in the second.
+	dbA := &ir.Schema{Tables: []*ir.Table{{Name: "users"}}}
+	// dbB carries a second table on purpose: excluding the ONLY table in a
+	// fan-out pass trips the door's "excluded every source table" refusal,
+	// which is itself wrong per-pass (other databases still have tables) and
+	// is filed separately. Keeping it out of this fixture isolates what this
+	// test grades.
+	dbB := &ir.Schema{Tables: []*ir.Table{{Name: "orders"}, {Name: "widgets"}}}
+
+	f, err := NewTableFilter(nil, []string{"orders"})
+	if err != nil {
+		t.Fatalf("NewTableFilter: %v", err)
+	}
+
+	capture := func(fn func()) string {
+		var buf bytes.Buffer
+		prev := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		defer slog.SetDefault(prev)
+		fn()
+		return buf.String()
+	}
+
+	perPass := capture(func() {
+		if err := ApplyTableFilterQuiet(context.Background(), dbA, f); err != nil {
+			t.Fatalf("pass A: %v", err)
+		}
+		if err := ApplyTableFilterQuiet(context.Background(), dbB, f); err != nil {
+			t.Fatalf("pass B: %v", err)
+		}
+	})
+	if strings.Contains(perPass, "TABLE-FILTER-PATTERN-UNMATCHED") {
+		t.Errorf("a fan-out pass warned. Database A does not contain `orders`, but database B does — "+
+			"no single pass has the universe, so a per-pass report is a false fire by construction.\ngot: %s", perPass)
+	}
+
+	final := capture(func() { ReportUnmatchedPatterns(context.Background(), f) })
+	if strings.Contains(final, "TABLE-FILTER-PATTERN-UNMATCHED") {
+		t.Errorf("the final report warned about `orders`, which database B DID contain — the accumulated "+
+			"census is not accumulating across passes.\ngot: %s", final)
+	}
+
+	// The other direction, without which "quiet" could just mean "broken":
+	// a pattern absent from EVERY database must still be reported once.
+	f2, _ := NewTableFilter(nil, []string{"nosuch"})
+	dbA2 := &ir.Schema{Tables: []*ir.Table{{Name: "users"}}}
+	dbB2 := &ir.Schema{Tables: []*ir.Table{{Name: "orders"}, {Name: "widgets"}}}
+	out := capture(func() {
+		_ = ApplyTableFilterQuiet(context.Background(), dbA2, f2)
+		_ = ApplyTableFilterQuiet(context.Background(), dbB2, f2)
+		ReportUnmatchedPatterns(context.Background(), f2)
+	})
+	if n := strings.Count(out, "TABLE-FILTER-PATTERN-UNMATCHED"); n != 1 {
+		t.Errorf("a genuinely dead pattern produced %d markers across a two-database fan-out; want exactly 1 "+
+			"(0 = the protection is gone for multi-db runs, 2 = the per-pass false fire is back).\ngot: %s", n, out)
+	}
+}

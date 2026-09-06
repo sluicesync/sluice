@@ -104,7 +104,7 @@ func TestWarmResumeSeed_PGSourceTargetMatrix(t *testing.T) {
 					if p.override {
 						mappings = []config.Mapping{{Table: "events", Column: "c", TargetType: "timestamptz"}}
 					}
-					seed, err := mergeWarmResumeSeed(ctx, "s", witness, history, mappings)
+					seed, err := mergeWarmResumeSeed(ctx, "s", "", witness, history, mappings)
 					if err != nil {
 						t.Fatal(err)
 					}

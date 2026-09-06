@@ -117,25 +117,38 @@ type TableFilter struct {
 // a poor thing to discover later.
 type scopeCensus struct {
 	mu    sync.Mutex
-	names []string
+	names map[string]bool
+	order []string
 }
 
+// record adds one name. A SET rather than a slice: the census is fed from two
+// sources (the engine push-down and each fan-out pass's own schema) which
+// overlap heavily, and a multi-database run would otherwise grow it once per
+// table per pass for no benefit.
 func (c *scopeCensus) record(name string) {
 	if c == nil {
 		return
 	}
 	c.mu.Lock()
-	c.names = append(c.names, name)
-	c.mu.Unlock()
+	defer c.mu.Unlock()
+	if c.names == nil {
+		c.names = map[string]bool{}
+	}
+	if !c.names[name] {
+		c.names[name] = true
+		c.order = append(c.order, name)
+	}
 }
 
+// seen returns the accumulated universe in first-seen order, so a report
+// derived from it is stable run to run.
 func (c *scopeCensus) seen() []string {
 	if c == nil {
 		return nil
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return append([]string(nil), c.names...)
+	return append([]string(nil), c.order...)
 }
 
 // NewTableFilter validates that Include and Exclude are not both
@@ -322,6 +335,43 @@ func EffectiveTableFilter(filter TableFilter, source ir.Engine, sourceDSN string
 // No-op when the filter is empty: avoids a noisy info line on every
 // migration where no filter is configured.
 func ApplyTableFilter(ctx context.Context, schema *ir.Schema, filter TableFilter) error {
+	return applyTableFilter(ctx, schema, filter, true)
+}
+
+// ApplyTableFilterQuiet is [ApplyTableFilter] for ONE PASS of a multi-database
+// fan-out: it prunes identically but does not report unmatched patterns.
+//
+// WHY IT EXISTS (Bug 273, fourth arm). The fan-out calls the filter door once
+// per database, over that database's tables only, so a pattern naming a table
+// in database A looks unmatched while database B is being processed — one
+// false warning per pass, on a warning whose entire value is that it is
+// trustworthy. Reporting per pass cannot be made correct: no single pass has
+// the universe.
+//
+// THE CALLER OWES A REPORT. Every fan-out that uses this MUST call
+// [ReportUnmatchedPatterns] once when it has finished every database, or the
+// Bug 272 protection is silently gone for multi-database runs — which would
+// be a worse outcome than the false fire it replaces.
+func ApplyTableFilterQuiet(ctx context.Context, schema *ir.Schema, filter TableFilter) error {
+	return applyTableFilter(ctx, schema, filter, false)
+}
+
+// ReportUnmatchedPatterns emits the unmatched-pattern warning from the
+// accumulated census, for callers that suppressed it per pass.
+//
+// The census is the union of every table name seen across the whole fan-out —
+// both the engine push-down (Postgres) and each pass's own schema (every
+// engine) — so this is the only place in a multi-database run where the
+// question "did this pattern match anything?" has a complete universe to be
+// answered against.
+func ReportUnmatchedPatterns(ctx context.Context, filter TableFilter) {
+	if filter.IsEmpty() {
+		return
+	}
+	reportUnmatched(ctx, filter, filter.census.seen())
+}
+
+func applyTableFilter(ctx context.Context, schema *ir.Schema, filter TableFilter, report bool) error {
 	if filter.IsEmpty() {
 		return nil
 	}
@@ -346,6 +396,10 @@ func ApplyTableFilter(ctx context.Context, schema *ir.Schema, filter TableFilter
 	}
 	for _, t := range schema.Tables {
 		addName(t.Name)
+		// Into the census as well as this pass's local list: a multi-database
+		// fan-out reports ONCE at the end, and on an engine with no push-down
+		// (MySQL) each pass's own schema is the only place those names appear.
+		filter.census.record(t.Name)
 	}
 	for _, n := range filter.census.seen() {
 		addName(n)
@@ -363,44 +417,12 @@ func ApplyTableFilter(ctx context.Context, schema *ir.Schema, filter TableFilter
 		slog.Int("matched", len(kept)),
 		slog.Int("excluded", original-len(kept)),
 	)
-	// Bug 272: a pattern that matched NOTHING is the silent half of this
-	// filter, and on the exclude path it fails OPEN -- the operator believes a
-	// table is excluded, it is not, and its rows are copied at exit 0. Found
-	// with --exclude-table=public.pii, which copied the PII table entirely.
-	//
-	// WARN rather than refuse, deliberately: a pattern naming a table absent
-	// from THIS source is legitimate (one config across environments), so
-	// refusing would break a working configuration. What was missing is that
-	// the operator was never told.
-	if unmatched := filter.UnmatchedPatterns(allNames); len(unmatched) > 0 {
-		mode := "--exclude-table"
-		effect := "those tables are NOT excluded and their rows WILL be copied"
-		if len(filter.Include) > 0 {
-			mode = "--include-table"
-			effect = "those patterns contribute nothing to the allow-list"
-		}
-		for _, pat := range unmatched {
-			remedy := "check the spelling against the source table list"
-			if LooksSchemaQualified(pat) {
-				remedy = "table patterns match the BARE table name, not a schema-qualified one — " +
-					"write " + strconv.Quote(bareName(pat)) + " instead of " + strconv.Quote(pat) +
-					" (sluice diagnostics print names schema-qualified, which is the usual reason " +
-					"this happens); use --include-schema / --exclude-schema to scope namespaces"
-			}
-			// TABLE-FILTER-PATTERN-UNMATCHED is the grep-stable handle, the
-			// same convention as POSITION-MODE / STALE-CAPTURE-FUNCTION /
-			// CHANGE-LOG-PAGE-UNORDERED. A warning an operator cannot search
-			// their logs for is a warning they find only by reading every
-			// line — and this one matters most in the case where they are not
-			// reading, because the run exits 0 either way.
-			slog.WarnContext(
-				ctx, "TABLE-FILTER-PATTERN-UNMATCHED: table filter pattern matched NOTHING",
-				slog.String("flag", mode),
-				slog.String("pattern", pat),
-				slog.String("effect", effect),
-				slog.String("remedy", remedy),
-			)
-		}
+	// Bug 272 report. Suppressed on a fan-out pass: no single pass has the
+	// universe, so reporting per pass produces one false warning per database
+	// (Bug 273, fourth arm). ApplyTableFilterQuiet callers owe a single
+	// ReportUnmatchedPatterns when the fan-out completes.
+	if report {
+		reportUnmatched(ctx, filter, allNames)
 	}
 	if len(kept) == 0 {
 		return errors.New("pipeline: table filter excluded every source table; nothing to migrate (check --include-table / --exclude-table)")
@@ -483,4 +505,53 @@ func PreflightTableReads(reader ir.SchemaReader, schema *ir.Schema) error {
 	}
 	return fmt.Errorf("pipeline: %d table(s) cannot be read from this source (--exclude-table routes around them): %w",
 		len(errs), errors.Join(errs...))
+}
+
+// reportUnmatched emits the operator warning for every supplied pattern that
+// matched none of allNames. Extracted from the filter door so a fan-out can
+// call it ONCE against the accumulated universe instead of once per pass.
+func reportUnmatched(ctx context.Context, filter TableFilter, allNames []string) {
+	// Bug 272: a pattern that matched NOTHING is the silent half of this
+	// filter, and on the exclude path it fails OPEN -- the operator believes a
+	// table is excluded, it is not, and its rows are copied at exit 0. Found
+	// with --exclude-table=public.pii, which copied the PII table entirely.
+	//
+	// WARN rather than refuse, deliberately: a pattern naming a table absent
+	// from THIS source is legitimate (one config across environments), so
+	// refusing would break a working configuration. What was missing is that
+	// the operator was never told.
+	unmatched := filter.UnmatchedPatterns(allNames)
+	if len(unmatched) == 0 {
+		return
+	}
+	{
+		mode := "--exclude-table"
+		effect := "those tables are NOT excluded and their rows WILL be copied"
+		if len(filter.Include) > 0 {
+			mode = "--include-table"
+			effect = "those patterns contribute nothing to the allow-list"
+		}
+		for _, pat := range unmatched {
+			remedy := "check the spelling against the source table list"
+			if LooksSchemaQualified(pat) {
+				remedy = "table patterns match the BARE table name, not a schema-qualified one — " +
+					"write " + strconv.Quote(bareName(pat)) + " instead of " + strconv.Quote(pat) +
+					" (sluice diagnostics print names schema-qualified, which is the usual reason " +
+					"this happens); use --include-schema / --exclude-schema to scope namespaces"
+			}
+			// TABLE-FILTER-PATTERN-UNMATCHED is the grep-stable handle, the
+			// same convention as POSITION-MODE / STALE-CAPTURE-FUNCTION /
+			// CHANGE-LOG-PAGE-UNORDERED. A warning an operator cannot search
+			// their logs for is a warning they find only by reading every
+			// line — and this one matters most in the case where they are not
+			// reading, because the run exits 0 either way.
+			slog.WarnContext(
+				ctx, "TABLE-FILTER-PATTERN-UNMATCHED: table filter pattern matched NOTHING",
+				slog.String("flag", mode),
+				slog.String("pattern", pat),
+				slog.String("effect", effect),
+				slog.String("remedy", remedy),
+			)
+		}
+	}
 }

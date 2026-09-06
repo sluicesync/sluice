@@ -11,9 +11,17 @@ package pipeline
 // their own boundary emitter wrote, which is empty at every table's first
 // boundary after a start — so the first DDL per table per process was
 // never checked, and Shape A forwards exactly that boundary. This file is
-// the streamer's half of the fix: it knows the prior on both paths and
+// the streamer's half of the fix: it knows the prior on each open path and
 // hands it to the reader through [schemaSeedSetter] before the stream
 // starts.
+//
+// There are FOUR open paths, not two — the single-stream cold start and
+// warm resume below, plus the multi-database / multi-schema fan-out's own
+// two, whose namespaced seeds live in schema_seed_multidb.go. The first
+// cut of this file said "both paths" and wired only the single-stream
+// pair; the fan-out ran unseeded until audit 2026-09-06 finding 1 measured
+// the harm on postgres:16. TestSchemaSeed_ReachesEveryReaderOpenSite is
+// the roster that now fails on a fifth.
 //
 //   - Cold start: the RAW source IR the SchemaReader produced, captured in
 //     [Streamer.coldStartPrepareSchema] before mappings and the Shape A
@@ -165,7 +173,7 @@ func (s *Streamer) loadWarmResumeSchemaSeed(ctx context.Context, applier ir.Chan
 	if err != nil {
 		return nil, err
 	}
-	return mergeWarmResumeSeed(ctx, streamID, witness, history, s.Mappings)
+	return mergeWarmResumeSeed(ctx, streamID, "", witness, history, s.Mappings)
 }
 
 // loadTargetZoneWitness reads the target's current schema through the
@@ -186,10 +194,19 @@ func (s *Streamer) loadWarmResumeSchemaSeed(ctx context.Context, applier ir.Chan
 // not turn a warm resume into a refusal, and a verbatim column is simply
 // not a zone-family member.
 func (s *Streamer) loadTargetZoneWitness(ctx context.Context) (map[string]*ir.Table, error) {
+	return s.loadTargetZoneWitnessFromDSN(ctx, s.TargetDSN)
+}
+
+// loadTargetZoneWitnessFromDSN is [Streamer.loadTargetZoneWitness] with the
+// target DSN supplied by the caller. The single-stream path passes
+// s.TargetDSN; the multi-database fan-out passes the per-namespace DSN it
+// derived ([Streamer.loadMultiDatabaseTargetZoneWitness]), because one read
+// of the bound namespace cannot witness N of them.
+func (s *Streamer) loadTargetZoneWitnessFromDSN(ctx context.Context, targetDSN string) (map[string]*ir.Table, error) {
 	if s.Target == nil {
 		return nil, errors.New("pipeline: load target zone witness: nil target engine")
 	}
-	tr, err := s.Target.OpenSchemaReader(ctx, s.TargetDSN)
+	tr, err := s.Target.OpenSchemaReader(ctx, targetDSN)
 	if err != nil {
 		return nil, fmt.Errorf("pipeline: load target zone witness: open target schema reader: %w", err)
 	}
@@ -234,7 +251,17 @@ func (s *Streamer) loadTargetZoneWitness(ctx context.Context) (map[string]*ir.Ta
 // The seed's contract is source-projection tables; the witness tables
 // carry the target's read-back of exactly the two IR types the source
 // reader's projection produces for the pair, and nothing else.
-func mergeWarmResumeSeed(ctx context.Context, streamID string, witness map[string]*ir.Table, history []*ir.Table, mappings []config.Mapping) ([]*ir.Table, error) {
+//
+// namespace is the SOURCE namespace this merge speaks for. It is "" on the
+// single-stream path — the reader binds its own database and a target
+// schema name in the key would be wrong there — and the source database /
+// schema on the multi-database fan-out, where the reader is server-wide and
+// keys every relation by (namespace, table): witness tables carry bare
+// names, so without the stamp two namespaces holding a same-named table
+// would collide on one key and one of them would resume on the other's
+// prior. It is also carried into the per-table log lines, which are
+// otherwise ambiguous across a fan-out.
+func mergeWarmResumeSeed(ctx context.Context, streamID, namespace string, witness map[string]*ir.Table, history []*ir.Table, mappings []config.Mapping) ([]*ir.Table, error) {
 	historyByName := make(map[string]*ir.Table, len(history))
 	for _, t := range history {
 		if t != nil {
@@ -262,6 +289,7 @@ func mergeWarmResumeSeed(ctx context.Context, streamID string, witness map[strin
 	fallback := func(name, reason string, hist *ir.Table) {
 		attrs := []any{
 			slog.String("stream_id", streamID),
+			slog.String("namespace", namespace),
 			slog.String("table", name),
 			slog.String("reason", reason),
 		}
@@ -287,7 +315,13 @@ func mergeWarmResumeSeed(ctx context.Context, streamID string, witness map[strin
 			fallback(name, fmt.Sprintf("the target reads column %q back as a type outside the zone-family pair", col), hist)
 			continue
 		}
-		out = append(out, zoneWitnessProjection(tgt))
+		proj := zoneWitnessProjection(tgt)
+		// The SOURCE namespace, never the target read-back's schema name:
+		// the reader resolves the seed under the relation's own namespace,
+		// and a --map-database run's target name is not that. "" on the
+		// single-stream path leaves the projection exactly as it was.
+		proj.Schema = namespace
+		out = append(out, proj)
 	}
 	return out, nil
 }
@@ -541,6 +575,20 @@ func resolveRetainedSeedTable(orderer ir.PositionOrderer, versions []ir.Retained
 // and silently keep their old behaviour. A loader error is the caller's
 // to surface: the reader is armed for a refusal whose prev the seed
 // supplies.
+// wireReaderSchemaSeedFrom installs load as the pending seed and hands it to
+// r in ONE step. It exists because the two-step form is a trap the fan-out
+// already fell into: [Streamer.readerSchemaSeed] is assigned on one path
+// (coldStartPrepareSchema, phaseOpenChangeStream) and consumed on another,
+// so a reader-open site that copied the consuming line without an assigning
+// one — or lost the assignment in a later edit — calls a helper that returns
+// nil, seeds nothing, and looks correct at the call site. Any open site that
+// owns its own loader uses this form; the two single-stream sites keep the
+// split because their loader is chosen by a phase that runs earlier.
+func (s *Streamer) wireReaderSchemaSeedFrom(ctx context.Context, r ir.CDCReader, load schemaSeedLoader) error {
+	s.readerSchemaSeed = load
+	return s.wireReaderSchemaSeed(ctx, r)
+}
+
 func (s *Streamer) wireReaderSchemaSeed(ctx context.Context, r ir.CDCReader) error {
 	load := s.readerSchemaSeed
 	s.readerSchemaSeed = nil

@@ -210,6 +210,7 @@ func runMultiDBGate(t *testing.T, s *Streamer, rows ir.RowReader, database strin
 		nil /*targetDeriver*/, false, /*targetCanDeriveDB → target-schema routing*/
 		restartReason(s.RestartFromScratch), /*these tests express intent via RestartFromScratch*/
 		0,                                   /*fanoutCeiling: none declared*/
+		&[]*ir.Table{},                      /*readerSeed: this test grades the reset, not the seed*/
 	)
 	if err != nil {
 		t.Fatalf("coldStartCopyOneDatabase(%q): %v", database, err)

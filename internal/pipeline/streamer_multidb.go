@@ -333,8 +333,12 @@ func (s *Streamer) coldStartMultiDatabase(
 	// database (stamped by MultiDatabaseScoper), and the spanning RowReader
 	// qualifies its SELECT by that schema, so the single pinned snapshot
 	// connection reads across every database at the one consistent view. ----
+	// SLM-1d: the fan-out cold start's reader seed, accumulated per
+	// namespace inside the copy loop (that is where each namespace's raw
+	// source IR is read) and handed to the reader at the CDC open below.
+	var readerSeed []*ir.Table
 	for _, database := range selected {
-		if err := s.coldStartCopyOneDatabase(ctx, stream, applier, streamID, database, inScope, targetDeriver, targetCanDeriveDB, fresh, budgetReport.CopyFanoutCeiling); err != nil {
+		if err := s.coldStartCopyOneDatabase(ctx, stream, applier, streamID, database, inScope, targetDeriver, targetCanDeriveDB, fresh, budgetReport.CopyFanoutCeiling, &readerSeed); err != nil {
 			abandonStream()
 			return nil, stop, err
 		}
@@ -428,6 +432,18 @@ func (s *Streamer) coldStartMultiDatabase(
 	}
 	// Bug 246: reader-side scope predicate, multidb cold-start mirror.
 	s.wireCDCScopePredicate(stream.Changes)
+	// SLM-1d: and the prior shape the session-zone door compares against at
+	// each table's FIRST boundary — the raw per-namespace source IR the copy
+	// loop above accumulated, keyed by (namespace, table) because this reader
+	// is server-wide. Without it this lane opened with no seed at all, and a
+	// swap performed while the stream was stopped primed silently (audit
+	// 2026-09-06 finding 1, OBSERVED on postgres:16). The cold-start loader
+	// is static and cannot fail; the error return is the warm-resume
+	// witness's.
+	if err := s.wireReaderSchemaSeedFrom(ctx, stream.Changes, staticSchemaSeed(readerSeed)); err != nil {
+		closeStream()
+		return nil, stop, migcore.WrapWithHint(migcore.PhaseCDC, err)
+	}
 
 	changes, err = stream.Changes.StreamChanges(ctx, stream.Position)
 	if err != nil {
@@ -518,6 +534,25 @@ func (s *Streamer) warmResumeMultiDatabase(
 		slog.String("position_token", persisted.Token),
 	)
 
+	// Flat-target refusal on the WARM-RESUME leg too (roadmap item 148 route
+	// 2). The cold start has run this since the item landed; this leg routes
+	// the same writes through the same SetMultiDatabaseRouting below and ran
+	// it never — the "which call PATHS reached the door" sibling shape. It
+	// cannot fire on a stream that cold-started successfully (the cold start
+	// refuses the identical shape), so it breaks no working configuration; it
+	// closes the path a chain-restored or hand-written position could take
+	// into a namespace-less target.
+	if err := migcore.ValidateMultiNamespaceTarget(s.Target, "multi-namespace sync warm resume", selected); err != nil {
+		return nil, stop, err
+	}
+	// The per-namespace target DSN deriver, resolved HERE — the one place on
+	// this leg that has already reached both the flat-target refusal above
+	// and the namespace-fold preflight (inside resolveStreamDatabases). The
+	// warm-resume zone-witness read below needs it to witness N namespaces
+	// (schema_seed_multidb.go); a nil deriver is the WARN-and-degrade arm
+	// there, not a silent one.
+	targetDeriver, _ := s.Target.(ir.DatabaseDSNDeriver)
+
 	// UNLOGGED-table census at the warm-resume open too (G2): `ALTER
 	// TABLE … SET UNLOGGED` succeeds mid-sync under the spanning FOR ALL
 	// TABLES publication and silently drops the table from it (observed
@@ -588,6 +623,18 @@ func (s *Streamer) warmResumeMultiDatabase(
 	}
 	// Bug 246: reader-side scope predicate, multidb warm-resume mirror.
 	s.wireCDCScopePredicate(cdc)
+	// SLM-1d: the fan-out warm-resume prior — the TARGET's zone witness read
+	// once per selected namespace, with the retained schema history as the
+	// per-table fallback, stamped with each table's SOURCE namespace. The
+	// loader is installed here rather than in phaseOpenChangeStream because
+	// the selected set is resolved from the live server above. Loud on a
+	// history-read error; a namespace whose target counterpart cannot be read
+	// degrades to history-only with a named WARN (schema_seed_multidb.go).
+	seed := s.multiDatabaseWarmResumeSchemaSeedLoader(applier, streamID, persisted, selected, targetDeriver)
+	if err := s.wireReaderSchemaSeedFrom(ctx, cdc, seed); err != nil {
+		closeReader()
+		return nil, stop, migcore.WrapWithHint(migcore.PhaseCDC, err)
+	}
 
 	changes, err = cdc.StreamChanges(ctx, persisted)
 	if err != nil {
@@ -923,6 +970,7 @@ func (s *Streamer) coldStartCopyOneDatabase(
 	targetCanDeriveDB bool,
 	fresh freshCopyReason,
 	fanoutCeiling int,
+	readerSeed *[]*ir.Table,
 ) error {
 	schema, err := s.coldStartReadOneDatabaseSchema(ctx, streamID, database, inScope)
 	if err != nil {
@@ -936,6 +984,14 @@ func (s *Streamer) coldStartCopyOneDatabase(
 	// ADR-0143: skip ORM/framework migration-bookkeeping tables in the
 	// per-database sync fan-out too. No-op unless SkipORMTables is set.
 	applyORMTableSkip(ctx, schema, s.SkipORMTables, s.Filter)
+
+	// SLM-1d: fold this namespace's RAW source IR into the fan-out's
+	// cold-start reader seed, captured HERE — after the filters, before the
+	// mapping passes below rewrite types FOR THE TARGET. Same capture point
+	// and same rationale as coldStartPrepareSchema's single-stream capture;
+	// the caller hands the accumulated seed to the reader before
+	// StreamChanges. See schema_seed_multidb.go.
+	*readerSeed = multiDatabaseColdStartSchemaSeed(*readerSeed, database, schema)
 
 	// Apply per-column type / expression overrides before schema-apply.
 	schema, err = translate.ApplyMappings(schema, s.Mappings)

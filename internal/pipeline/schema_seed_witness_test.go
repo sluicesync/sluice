@@ -110,7 +110,7 @@ func TestWarmResumeSeed_ZoneWitnessFamilyMatrix(t *testing.T) {
 					if override {
 						mappings = []config.Mapping{{Table: "events", Column: "c", TargetType: "timestamptz"}}
 					}
-					seed, err := mergeWarmResumeSeed(ctx, "s", map[string]*ir.Table{"events": target}, history, mappings)
+					seed, err := mergeWarmResumeSeed(ctx, "s", "", map[string]*ir.Table{"events": target}, history, mappings)
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -171,7 +171,7 @@ func TestWarmResumeSeed_TargetLacksTheTable(t *testing.T) {
 		"held": {Schema: "public", Name: "held", Columns: []*ir.Column{{Name: "c", Type: ir.DateTime{}}}},
 	}
 	gone := &ir.Table{Schema: "src", Name: "gone", Columns: []*ir.Column{{Name: "c", Type: ir.Timestamp{WithTimeZone: true}}}}
-	seed, err := mergeWarmResumeSeed(ctx, "s", witness, []*ir.Table{gone}, nil)
+	seed, err := mergeWarmResumeSeed(ctx, "s", "", witness, []*ir.Table{gone}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -242,7 +242,7 @@ func TestWarmResumeSeed_OverrideTouchesTemporal_ThreeArms(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			seed, err := mergeWarmResumeSeed(ctx, "s", map[string]*ir.Table{"events": tc.target}, []*ir.Table{hist}, []config.Mapping{tc.mapping})
+			seed, err := mergeWarmResumeSeed(ctx, "s", "", map[string]*ir.Table{"events": tc.target}, []*ir.Table{hist}, []config.Mapping{tc.mapping})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -259,7 +259,7 @@ func TestWarmResumeSeed_OverrideTouchesTemporal_ThreeArms(t *testing.T) {
 	}
 
 	t.Run("an unresolvable override is loud", func(t *testing.T) {
-		_, err := mergeWarmResumeSeed(ctx, "s", map[string]*ir.Table{}, nil, []config.Mapping{{Table: "events", Column: "c", TargetType: "no-such-type"}})
+		_, err := mergeWarmResumeSeed(ctx, "s", "", map[string]*ir.Table{}, nil, []config.Mapping{{Table: "events", Column: "c", TargetType: "no-such-type"}})
 		if err == nil {
 			t.Fatal("unknown override type degraded to a seed; the cold-start path refuses it")
 		}
