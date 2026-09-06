@@ -699,6 +699,17 @@ func (e *d1Executor) pollChangeLog(ctx context.Context, sinceID int64, batch int
 			return nil, fmt.Errorf("d1-trigger: change-log id=%d decode after: %w%s",
 				id, err, capturedImageRemedy(err, id))
 		}
+		// SQT-1 mangle bracket for the D1 transport (measured 2026-09-06).
+		// The stored byte length comes from the server; the delivered text is
+		// what this client decoded. They diverge exactly when D1's response
+		// rewrote invalid UTF-8 to U+FFFD, which the JSONStringValue guard
+		// structurally cannot see because what reaches it is valid UTF-8.
+		if err := checkD1CapturedImageBytes(id, "before", before, row["before_bytes"]); err != nil {
+			return nil, err
+		}
+		if err := checkD1CapturedImageBytes(id, "after", after, row["after_bytes"]); err != nil {
+			return nil, err
+		}
 		capturedAt, err := d1NullString(row["captured_at"])
 		if err != nil {
 			return nil, fmt.Errorf("d1-trigger: change-log id=%d decode captured_at: %w", id, err)
@@ -1032,7 +1043,24 @@ func (e *d1Executor) pollChangeLogRows(ctx context.Context, sinceID int64, batch
 		// something non-shadowing (`AS id_text`) and then using that name in
 		// WHERE would silently compare as TEXT, which is the same defect
 		// wearing different clothes. Measured on SQLite 3.53.3.
-		q := `SELECT CAST("` + ChangeLogTable + `".id AS TEXT) AS id, op, tbl, before, after, captured_at FROM "` +
+		// The two byte-length columns are the SQT-1 mangle bracket for this
+		// transport, and they are the whole reason this query is not just the
+		// local one. MEASURED on live D1 (2026-09-06): D1 STORES invalid UTF-8
+		// verbatim -- x`41ff42` reads back hex 41FF42 with
+		// length(CAST(c AS BLOB)) = 3 -- but its HTTP response REWRITES that
+		// byte to U+FFFD, so `SELECT c` delivers 41 EF BF BD 42, five bytes.
+		// The rewrite happens SERVER-SIDE, before any client decode, which is
+		// precisely why the JSONStringValue guard cannot see it: what reaches
+		// the decoder is valid UTF-8.
+		//
+		// length(CAST(... AS BLOB)) is evaluated server-side on the STORED
+		// value, so it is unaffected by the response rewrite and is a genuinely
+		// independent number -- the same shape as the bulk reader`s
+		// srcTextBytes/gotTextBytes bracket in sqlite/d1_rows.go. Without it
+		// this poll copied mangled captured images at exit 0 while the bulk
+		// reader refused the identical row.
+		q := `SELECT CAST("` + ChangeLogTable + `".id AS TEXT) AS id, op, tbl, before, after, captured_at, ` +
+			`length(CAST(before AS BLOB)) AS before_bytes, length(CAST(after AS BLOB)) AS after_bytes FROM "` +
 			ChangeLogTable + `" WHERE id > ? ORDER BY "` + ChangeLogTable + `".id ASC LIMIT ` + strconv.Itoa(batch)
 		rows, err := e.conn.Query(ctx, q, strconv.FormatInt(sinceID, 10))
 		if err == nil {
@@ -1219,4 +1247,92 @@ func d1NullString(raw json.RawMessage) (sql.NullString, error) {
 		return sql.NullString{}, err
 	}
 	return sql.NullString{String: s, Valid: ok}, nil
+}
+
+// checkD1CapturedImageBytes brackets one captured row image against the byte
+// length D1 reports for the STORED value.
+//
+// WHY THIS EXISTS, measured rather than reasoned (2026-09-06, live Cloudflare
+// D1). D1 stores invalid UTF-8 verbatim: a cell written as
+// CAST(x'41ff42' AS TEXT) reads back hex(c) = 41FF42 with
+// length(CAST(c AS BLOB)) = 3. But its HTTP query response REWRITES that byte
+// to U+FFFD, so SELECT c delivers 41 EF BF BD 42 -- five bytes for three.
+//
+// The rewrite is SERVER-SIDE, which is the whole point: by the time
+// sqlite.JSONStringValue (the SQT-1 guard this lane otherwise relies on) sees
+// the payload it is valid UTF-8, so that guard structurally cannot fire. The
+// code carried a comment saying exactly this and calling the behaviour an
+// unmeasured premise; the measurement settled it against us.
+//
+// length(CAST(... AS BLOB)) is evaluated on the stored value before the
+// response is built, so it survives the rewrite and is a genuinely
+// independent number -- not this reader re-deriving its own answer. That is
+// the same bracket the bulk d1 reader applies (sqlite/d1_rows.go), and this
+// poll was the third site where captured text crosses the D1 HTTP boundary
+// and the only one without it.
+//
+// A cell D1 did not report a length for is NOT treated as clean: an absent
+// column means the query shape changed, and silently skipping the check is
+// how a bracket becomes decorative.
+func checkD1CapturedImageBytes(id int64, column string, got sql.NullString, rawLen json.RawMessage) error {
+	if !got.Valid {
+		// SQL NULL: nothing was captured for this side of the change (an
+		// INSERT has no before image). Nothing to compare.
+		return nil
+	}
+	stored, ok := d1JSONInt64(rawLen)
+	if !ok {
+		return sluicecode.Wrap(
+			sluicecode.CodeD1TextMangled,
+			"re-run the read; if it persists, the change-log query shape has drifted and the mangle bracket is inoperative",
+			fmt.Errorf(
+				"d1-trigger: change-log id=%d: D1 returned no stored-byte length for %q, so the captured image "+
+					"cannot be checked against what D1 stores -- this bracket is the only thing on this transport "+
+					"that can see a server-side U+FFFD rewrite, and it is not optional",
+				id, column,
+			),
+		)
+	}
+	if delivered := int64(len(got.String)); delivered != stored {
+		return sluicecode.Wrap(
+			sluicecode.CodeD1TextMangled,
+			"read the affected columns as hex(col) and repair the values at the source, then re-run",
+			fmt.Errorf(
+				"d1-trigger: change-log id=%d: the %q captured image arrived as %d bytes where D1 stores %d -- "+
+					"D1 replaces every invalid UTF-8 byte with U+FFFD in its query response (three bytes for one), "+
+					"so at least one cell of this captured row was silently rewritten in transit. Applying it would "+
+					"write the rewritten text to the target while the source still holds the original",
+				id, column, delivered, stored,
+			),
+		)
+	}
+	return nil
+}
+
+// d1JSONInt64 reads a JSON number (or a numeric string -- D1 has returned both
+// shapes for integer columns) as an int64. Deliberately narrow: it is used
+// only for the mangle bracket byte lengths, which are small non-negative
+// counts, so it does not carry the big-integer precision handling the change
+// log id column needs.
+func d1JSONInt64(raw json.RawMessage) (int64, bool) {
+	if len(raw) == 0 {
+		return 0, false
+	}
+	var n json.Number
+	if err := json.Unmarshal(raw, &n); err == nil {
+		v, cerr := n.Int64()
+		if cerr != nil {
+			return 0, false
+		}
+		return v, true
+	}
+	var str string
+	if err := json.Unmarshal(raw, &str); err != nil {
+		return 0, false
+	}
+	v, err := strconv.ParseInt(str, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
 }

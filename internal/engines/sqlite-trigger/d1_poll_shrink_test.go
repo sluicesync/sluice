@@ -89,6 +89,11 @@ func startShrinkMock(t *testing.T, m *shrinkMock) *sqlite.D1Conn {
 			"before":      nil,
 			"after":       `{"id":{"t":"integer","v":"1"}}`,
 			"captured_at": "2026-09-03T00:00:00Z",
+			// SQT-1 mangle bracket: a healthy D1 delivers what it stores, so
+			// the stored length is the delivered length. nil before image =>
+			// nil length.
+			"before_bytes": nil,
+			"after_bytes":  len(`{"id":{"t":"integer","v":"1"}}`),
 		}}))
 	}))
 	t.Cleanup(srv.Close)

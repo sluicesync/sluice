@@ -270,6 +270,13 @@ func (m *mockD1) pollResultsLocked(t *testing.T, since string) []map[string]any 
 			"before":      imageOrNull(t, r.before),
 			"after":       imageOrNull(t, r.after),
 			"captured_at": r.capturedAt,
+			// The SQT-1 mangle bracket asks D1 for the STORED byte length of
+			// each captured image. A healthy D1 delivers exactly what it
+			// stores, so the mock reports the delivered length — modelling a
+			// server that is NOT rewriting. The rewrite case is pinned
+			// directly in d1_mangle_bracket_test.go.
+			"before_bytes": storedBytesOrNull(t, r.before),
+			"after_bytes":  storedBytesOrNull(t, r.after),
 		})
 	}
 	return out
@@ -1162,4 +1169,19 @@ func TestD1CDCReader_RefusesChangeLogThatCanReissueIDs(t *testing.T) {
 			t.Fatalf("a drained-but-healthy D1 change log was refused: %v", err)
 		}
 	})
+}
+
+// storedBytesOrNull mirrors D1 length(CAST(col AS BLOB)) for the mock: the
+// byte length of the image it is about to deliver, or nil for a SQL NULL.
+func storedBytesOrNull(t *testing.T, cells map[string]any) any {
+	t.Helper()
+	v := imageOrNull(t, cells)
+	if v == nil {
+		return nil
+	}
+	sv, ok := v.(string)
+	if !ok {
+		t.Fatalf("mock captured image is %T, not a string", v)
+	}
+	return len(sv)
 }
