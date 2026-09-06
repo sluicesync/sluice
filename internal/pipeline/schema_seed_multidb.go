@@ -213,6 +213,31 @@ func (s *Streamer) loadMultiDatabaseTargetZoneWitness(
 		)
 		return map[string]*ir.Table{}, nil
 	}
+	// An EMPTY witness is the same degrade and must say so, because on the
+	// engine this lane actually runs (Postgres) it is the ONLY shape the
+	// missing-namespace case produces. OpenSchemaReader parses, opens and
+	// pings without checking that the schema exists; every reader query is
+	// WHERE n.nspname = $1; ReadSchema returns an empty schema and a nil
+	// error when nothing matches. So the err != nil arm above cannot fire
+	// for a target namespace that was never cold-started -- that is the
+	// MySQL shape (WithDatabase changes dbname, so a missing database does
+	// error), and the MySQL fan-out seed is inert by construction.
+	//
+	// Without this arm the outcome is not merely un-warned, it is SILENT:
+	// the history fallback is empty for those namespaces too (the PG reader
+	// writes a schema-history row only when rel.Schema != its bound schema),
+	// so mergeWarmResumeSeed has no names either and its per-table
+	// "resumes WITHOUT a prior shape" warning does not fire. Zero log lines
+	// for a namespace whose every table resumes unchecked at its first
+	// boundary. Found by the v0.143.0 pre-tag value-fidelity review.
+	if len(witness) == 0 {
+		slog.WarnContext(
+			ctx, "multi-database warm resume: the target namespace read back EMPTY (it most likely does not exist yet — the selected set is re-resolved from the live source on every resume), so no target zone witness is available for it; its tables resume on the retained schema history alone, and a table with no history row resumes with NO prior shape — its FIRST schema boundary is not checked for a session-zone cast",
+			slog.String("stream_id", streamID),
+			slog.String("namespace", sourceNamespace),
+			slog.String("target_namespace", targetNamespace),
+		)
+	}
 	return witness, nil
 }
 

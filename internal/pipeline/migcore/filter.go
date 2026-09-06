@@ -364,6 +364,18 @@ func ApplyTableFilterQuiet(ctx context.Context, schema *ir.Schema, filter TableF
 // engine) — so this is the only place in a multi-database run where the
 // question "did this pattern match anything?" has a complete universe to be
 // answered against.
+// WHERE THIS CANNOT BE CALLED, and why that is a limit rather than a bug:
+// a WARM RESUME never reads the source table universe at all — it resumes
+// from a persisted position and opens a reader; no filter door runs on that
+// leg on any engine. The census is therefore EMPTY there, and calling this
+// would report every operator pattern as unmatched: a total false fire,
+// strictly worse than the silence. So the unmatched-pattern question is
+// answered on the paths that actually enumerate the source — migrate and
+// sync COLD START — and not on resume.
+//
+// Verified rather than assumed (v0.143.0 pre-tag review): warmResumeMultiDatabase
+// called no filter door at v0.142.1 either, so this is a standing property of
+// the resume path and not something the fan-out change took away.
 func ReportUnmatchedPatterns(ctx context.Context, filter TableFilter) {
 	if filter.IsEmpty() {
 		return

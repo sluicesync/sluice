@@ -543,10 +543,21 @@ func (s *Streamer) warmResumeMultiDatabase(
 	// 2). The cold start has run this since the item landed; this leg routes
 	// the same writes through the same SetMultiDatabaseRouting below and ran
 	// it never — the "which call PATHS reached the door" sibling shape. It
-	// cannot fire on a stream that cold-started successfully (the cold start
-	// refuses the identical shape), so it breaks no working configuration; it
-	// closes the path a chain-restored or hand-written position could take
-	// into a namespace-less target.
+	// cannot fire while the SELECTED SET IS UNCHANGED — the cold start
+	// refuses the identical shape — so it breaks no configuration that is
+	// still doing what it was started to do. The qualifier is not pedantry:
+	// `selected` is re-resolved from the LIVE source on every resume, so a
+	// stream that cold-started with one namespace against a flat target and
+	// now resolves two (a new source schema under --all-databases, or an
+	// --include-database entry created since) refuses here having run fine
+	// before. That refusal is right — a flat target cannot hold two
+	// namespaces — but "it cannot fire on a stream that cold-started
+	// successfully" was too strong, and a comment that says a thing cannot
+	// happen is what stops the next reader checking whether it did.
+	// Corrected by the v0.143.0 pre-tag review.
+	//
+	// It also closes the path a chain-restored or hand-written position could
+	// take into a namespace-less target.
 	if err := migcore.ValidateMultiNamespaceTarget(s.Target, "multi-namespace sync warm resume", selected); err != nil {
 		return nil, stop, err
 	}

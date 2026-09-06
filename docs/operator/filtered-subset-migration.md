@@ -38,9 +38,15 @@ That last row is the trap, and it is the shape sluice's own diagnostics encourag
 
 **Scope namespaces with the namespace flags**, which is what they are for: `--include-schema` / `--exclude-schema` on Postgres, `--include-database` / `--exclude-database` on MySQL. To exclude one table in one schema, exclude the bare name and scope the schema alongside it.
 
-**Since v0.142.0 an unmatched pattern is not silent.** A pattern that matches no table in the source emits a WARN marked `TABLE-FILTER-PATTERN-UNMATCHED` — grep your logs for that — naming the flag, the pattern, the effect (`nothing was excluded` / `nothing was included`) and the bare-name remedy. It is a warning rather than a refusal because a pattern that matches nothing in *this* source is legitimate — one config across several databases, or a table that has not been created yet.
+**Since v0.142.0 an unmatched pattern is not silent.** A pattern that matches no table in the source emits a WARN marked `TABLE-FILTER-PATTERN-UNMATCHED` — grep your logs for that — naming the flag, the pattern, the effect (`those tables are NOT excluded and their rows WILL be copied` / `those patterns contribute nothing to the allow-list`) and the bare-name remedy. It is a warning rather than a refusal because a pattern that matches nothing in *this* source is legitimate — one config across several databases, or a table that has not been created yet.
 
-**Where the check runs:** the `ApplyTableFilter` door, which `migrate`, `sync` cold start and `restore` all share — so all three report an unmatched pattern. `cutover` is the exception: it prunes through its own path and does **not** report, so a typo'd pattern is still silent there.
+**Engine-default exclusions are never reported.** PlanetScale sources carry a built-in `_vt_*` exclusion for Vitess shadow tables. That pattern is sluice's, not yours, so it is excluded from the check — a PlanetScale database with no shadow tables is the healthy case and does not warn. (Through v0.142.1 it did, on every clean run.)
+
+**On a multi-database or multi-schema run the check waits for the whole fan-out.** The filter is applied once per selected database, and no single pass can answer "did this pattern match anything?" — a pattern naming a table in database B would look dead while database A is being copied. So each pass is silent and the report is emitted **once, after every database has been read**, against the union of their tables. It fires on the dry-run and `--skip-foreign-keys` paths too.
+
+**It does not run on a warm resume.** A resume picks up from a persisted position and never enumerates the source tables, so there is no universe to answer the question against — on any engine, and this has always been so. Check your patterns on the run that copies, not on a restart.
+
+**Where the check runs:** the `ApplyTableFilter` door, shared by `migrate`, `sync` cold start, `sync --dry-run`, `restore`, `backup full`, `backup export-as-parquet`, `schema diff`, `schema preview` and `verify` — all of them report an unmatched pattern. Two kinds of caller deliberately do not: `cutover`, which prunes through its own path and never reports (so a typo'd pattern is still silent there); and the auxiliary re-reads inside a fan-out — the deferred cross-database constraint pass and the per-namespace replica-identity preflight — which stay quiet so they cannot double-report or repeat the per-pass mistake.
 
 ## `migrate --where` — one-shot filtered copy
 

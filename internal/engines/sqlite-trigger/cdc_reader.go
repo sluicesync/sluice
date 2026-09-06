@@ -271,7 +271,7 @@ func verifyNoSchemaDrift(ctx context.Context, exec executor, liveFingerprints ma
 		// here is an inconsistent half-install — refuse rather than skip the guard.
 		return nil, fmt.Errorf(
 			"sqlite-trigger: cannot read the captured-column fingerprint table %s (%w); "+
-				"the trigger install looks inconsistent — re-run `sluice trigger setup --dsn=... --tables=...`",
+				"the trigger install looks inconsistent — re-run `sluice trigger setup --dsn=... --tables=... --source-driver=<sqlite-trigger or d1-trigger>`",
 			ChangeLogColumnsTable, err,
 		)
 	}
@@ -280,14 +280,14 @@ func verifyNoSchemaDrift(ctx context.Context, exec executor, liveFingerprints ma
 		if !ok {
 			return nil, fmt.Errorf(
 				"sqlite-trigger: table %q has capture triggers installed but no longer exists in the source schema; "+
-					"re-run `sluice trigger setup --dsn=... --tables=...` after a schema change (Phase 1 does not forward DDL)", fp.tbl,
+					"re-run `sluice trigger setup --dsn=... --tables=... --source-driver=<sqlite-trigger or d1-trigger>` after a schema change (Phase 1 does not forward DDL)", fp.tbl,
 			)
 		}
 		if live != fp.columns {
 			return nil, fmt.Errorf(
 				"sqlite-trigger: table %q schema has drifted since `trigger setup` (captured columns %s, live columns %s); "+
 					"the stale triggers would mis-capture (an ADD COLUMN would be SILENTLY dropped) — "+
-					"re-run `sluice trigger setup --dsn=... --tables=...` (Phase 1 does not forward DDL)", fp.tbl, fp.columns, live,
+					"re-run `sluice trigger setup --dsn=... --tables=... --source-driver=<sqlite-trigger or d1-trigger>` (Phase 1 does not forward DDL)", fp.tbl, fp.columns, live,
 			)
 		}
 	}

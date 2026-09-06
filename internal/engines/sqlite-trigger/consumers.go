@@ -55,8 +55,8 @@ func (r *CDCReader) RegisterChangeLogConsumer(ctx context.Context, consumerID, d
 	if err := exec.upsertConsumer(ctx, consumerID, appliedLastID); err != nil {
 		return fmt.Errorf(
 			"%s: register change-log consumer %q: %w (if this source predates the consumer registry, "+
-				"re-run `sluice trigger setup --dsn=... --tables=...` to migrate its change log)",
-			r.b.driver, consumerID, err,
+				"re-run `sluice trigger setup --dsn=... --tables=... --source-driver=%s` to migrate its change log)",
+			r.b.driver, consumerID, err, r.b.driver,
 		)
 	}
 	return nil
@@ -126,20 +126,20 @@ func requireConsumerRegistry(ctx context.Context, driver string, exec executor) 
 	}
 	if !exists {
 		return fmt.Errorf(
-			"%s: auto-prune: %w — %q is absent from the source. Re-run `sluice trigger setup --dsn=... --tables=...` against this source "+
+			"%s: auto-prune: %w — %q is absent from the source. Re-run `sluice trigger setup --dsn=... --tables=... --source-driver=%s` against this source "+
 				"to migrate its change log, or drop --auto-prune-change-log: without the registry sluice cannot see "+
 				"whether another sync reads this change log, and pruning could delete its unread rows",
-			driver, triggercdc.ErrConsumerRegistryUnavailable, ChangeLogConsumersTable,
+			driver, triggercdc.ErrConsumerRegistryUnavailable, ChangeLogConsumersTable, driver,
 		)
 	}
 	if ver < triggercdc.ConsumerRegistrySchemaVer {
 		return fmt.Errorf(
 			"%s: auto-prune: %w — %s.schema_version is %d, below the registry floor %d. A sluice older than the "+
 				"consumer registry has run `trigger setup` against this source; such a binary streams WITHOUT "+
-				"registering, so its sync would be invisible to this prune. Re-run `sluice trigger setup --dsn=... --tables=...` with this "+
+				"registering, so its sync would be invisible to this prune. Re-run `sluice trigger setup --dsn=... --tables=... --source-driver=%s` with this "+
 				"version once every sync on this source is upgraded",
 			driver, triggercdc.ErrConsumerRegistryUnavailable, ChangeLogMetaTable, ver,
-			triggercdc.ConsumerRegistrySchemaVer,
+			triggercdc.ConsumerRegistrySchemaVer, driver,
 		)
 	}
 	return nil
