@@ -702,8 +702,9 @@ func (a *AddTable) logAddComplete(ctx context.Context) {
 		return
 	}
 	slog.InfoContext(
-		ctx, "add-table: complete; resume the stream by re-running `sluice sync start` with the same "+
-			"--stream-id (there is no resume flag) to pick up CDC for the new table",
+		ctx, "add-table: complete; resume the stream by re-running `sluice sync start --source-driver=... --source=... "+
+			"--target-driver=... --target=...` with the same --stream-id (there is no resume flag) "+
+			"to pick up CDC for the new table",
 		slog.String("table", a.TableName),
 		slog.String("stream_id", a.StreamID),
 	)
@@ -1377,7 +1378,7 @@ func (a *AddTable) logDryRun(ctx context.Context, scoped *ir.Schema, resolvedTar
 			slog.InfoContext(ctx, "dry run: add-table: live mode (--no-drain) binlog-source path (ADR-0034): would capture snapshot, bulk-copy rows, then record table on cdc-state.live_added_tables for the running streamer's poll to merge into the dispatch filter")
 		}
 	} else {
-		slog.InfoContext(ctx, "dry run: add-table: would capture snapshot, bulk-copy rows, drop temp slot, then nudge operator to re-run `sluice sync start` with the same --stream-id")
+		slog.InfoContext(ctx, "dry run: add-table: would capture snapshot, bulk-copy rows, drop temp slot, then nudge operator to re-run `sluice sync start --source-driver=... --source=... --target-driver=... --target=...` with the same --stream-id")
 	}
 	return nil
 }

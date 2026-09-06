@@ -78,7 +78,7 @@ func (e Engine) OpenSnapshotStream(ctx context.Context, dsn string) (*ir.Snapsho
 	} else if !exists {
 		_ = db.Close()
 		return nil, fmt.Errorf(
-			"pgtrigger: %s.%s does not exist on the source — run `sluice trigger setup --dsn=...` before starting the stream",
+			"pgtrigger: %s.%s does not exist on the source — run `sluice trigger setup --dsn=... --tables=...` before starting the stream",
 			cfg.schema, ChangeLogTable,
 		)
 	}

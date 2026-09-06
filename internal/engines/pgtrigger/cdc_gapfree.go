@@ -399,7 +399,7 @@ func verifyChangeLogSequence(ctx context.Context, db *sql.DB, schema string) err
 	}
 	if !seqName.Valid || !cache.Valid {
 		return fmt.Errorf(
-			"pgtrigger: %s.id is not backed by a sequence — sluice's gap-free CDC ordering requires the BIGSERIAL identity `sluice trigger setup` installs (ids allocated monotonically across sessions); drop the change-log table and re-run `sluice trigger setup --dsn=...`",
+			"pgtrigger: %s.id is not backed by a sequence — sluice's gap-free CDC ordering requires the BIGSERIAL identity `sluice trigger setup` installs (ids allocated monotonically across sessions); drop the change-log table and re-run `sluice trigger setup --dsn=... --tables=...`",
 			tableRef,
 		)
 	}

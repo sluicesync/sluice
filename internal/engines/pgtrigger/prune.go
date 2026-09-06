@@ -105,7 +105,7 @@ func Prune(ctx context.Context, dsn string, opts PruneOptions) (*PruneResult, er
 	}
 	if !exists {
 		return nil, fmt.Errorf(
-			"pgtrigger: prune: change-log table %q not found in schema %q — run `sluice trigger setup` first",
+			"pgtrigger: prune: change-log table %q not found in schema %q — run `sluice trigger setup --dsn=... --tables=...` first",
 			ChangeLogTable, schema,
 		)
 	}
@@ -221,7 +221,7 @@ func (r *CDCReader) prunePool(ctx context.Context) (*sql.DB, string, error) {
 	if !exists {
 		_ = db.Close()
 		return nil, "", fmt.Errorf(
-			"pgtrigger: prune: change-log table %q not found in schema %q — run `sluice trigger setup` first",
+			"pgtrigger: prune: change-log table %q not found in schema %q — run `sluice trigger setup --dsn=... --tables=...` first",
 			ChangeLogTable, r.schema,
 		)
 	}

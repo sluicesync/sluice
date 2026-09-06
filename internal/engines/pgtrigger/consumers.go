@@ -60,7 +60,7 @@ func (r *CDCReader) RegisterChangeLogConsumer(ctx context.Context, consumerID, d
 	if err != nil {
 		return fmt.Errorf(
 			"pgtrigger: register change-log consumer %q: %w (if this source predates the consumer registry, "+
-				"re-run `sluice trigger setup` to migrate its change log)",
+				"re-run `sluice trigger setup --dsn=... --tables=...` to migrate its change log)",
 			consumerID, err,
 		)
 	}
@@ -139,7 +139,7 @@ SELECT EXISTS (
 	}
 	if !exists {
 		return fmt.Errorf(
-			"pgtrigger: auto-prune: %w — %q is absent from schema %q. Re-run `sluice trigger setup` against this "+
+			"pgtrigger: auto-prune: %w — %q is absent from schema %q. Re-run `sluice trigger setup --dsn=... --tables=...` against this "+
 				"source to migrate its change log, or drop --auto-prune-change-log: without the registry sluice "+
 				"cannot see whether another sync reads this change log, and pruning could delete its unread rows",
 			triggercdc.ErrConsumerRegistryUnavailable, ChangeLogConsumersTable, r.schema,
@@ -157,7 +157,7 @@ SELECT EXISTS (
 		return fmt.Errorf(
 			"pgtrigger: auto-prune: %w — %s.schema_version is %d, below the registry floor %d. A sluice older than "+
 				"the consumer registry has run `trigger setup` against this source; such a binary streams WITHOUT "+
-				"registering, so its sync would be invisible to this prune. Re-run `sluice trigger setup` with this "+
+				"registering, so its sync would be invisible to this prune. Re-run `sluice trigger setup --dsn=... --tables=...` with this "+
 				"version once every sync on this source is upgraded",
 			triggercdc.ErrConsumerRegistryUnavailable, ChangeLogMetaTable, ver, triggercdc.ConsumerRegistrySchemaVer,
 		)

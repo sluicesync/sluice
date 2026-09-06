@@ -169,7 +169,7 @@ func prune(ctx context.Context, b backend, opts PruneOptions) (*PruneResult, err
 	}
 	if !exists {
 		return nil, fmt.Errorf(
-			"%s: prune: change-log table %q not found on the source — run `sluice trigger setup` first",
+			"%s: prune: change-log table %q not found on the source — run `sluice trigger setup --dsn=... --tables=...` first",
 			b.driver, ChangeLogTable,
 		)
 	}

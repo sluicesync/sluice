@@ -256,7 +256,7 @@ func (s *Streamer) startAutoPruneChangeLog(ctx context.Context, streamID string,
 			ctx, "auto-prune: REFUSING to prune — this source engine does not implement the change-log consumer "+
 				"registry, so sluice cannot tell whether another sync reads the same change log. Pruning without "+
 				"it could delete a peer sync's unread rows silently (roadmap item 115). The change log will keep "+
-				"growing; upgrade the engine, or run `sluice trigger prune` deliberately",
+				"growing; upgrade the engine, or run `sluice trigger prune --source=... --target-driver=... --target=... --stream-id=...` deliberately",
 			slog.String("stream_id", streamID),
 		)
 		return

@@ -137,5 +137,5 @@ func (m *Migrator) logPlan(ctx context.Context, plan *MigrationPlan) {
 			slog.String("phase", "analyze"),
 			slog.String("note", "--analyze-after: per-table target ANALYZE after constraints/views (advisory; failures WARN, never fail the run)"))
 	}
-	slog.InfoContext(ctx, "dry run: for full target DDL with translation notes and advisory hints, run `sluice schema preview` (ADR-0024)")
+	slog.InfoContext(ctx, "dry run: for full target DDL with translation notes and advisory hints, run `sluice schema preview --source-driver=... --source=... --target-driver=... --target=...` (ADR-0024)")
 }

@@ -225,7 +225,8 @@ func preflightBinaryTargetColumnsOnCDC(schema *ir.Schema, actual map[string]*ir.
 			"see the source type — stores the bytes verbatim. The same cell would disagree with itself "+
 			"with no error on either side. Remedies: alter the target column to the source column's own "+
 			"type (or drop it and let sluice create it), exclude the table with --exclude-table, or run "+
-			"`sluice migrate` instead, which has no CDC lane",
+			"`sluice migrate --source-driver=... --source=... --target-driver=... --target=...` instead, "+
+			"which has no CDC lane",
 		errBinaryTargetColumnOnCDC, mode, strings.Join(offenders, ", "),
 	)
 }

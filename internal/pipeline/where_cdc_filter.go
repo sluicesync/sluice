@@ -1003,7 +1003,7 @@ func (s *Streamer) preflightRowFilters(ctx context.Context) error {
 			t0 := tables[0]
 			return sluicecode.Wrap(
 				sluicecode.CodeWhereCDCUnsupportedPredicate,
-				"use a DOUBLE column, filter on a non-FLOAT column, or run `sluice migrate --where` for a one-shot source-evaluated copy",
+				"use a DOUBLE column, filter on a non-FLOAT column, or run `sluice migrate --source-driver=... --source=... --target-driver=... --target=... --where=...` for a one-shot source-evaluated copy",
 				fmt.Errorf(
 					"continuous filtered sync (--where on `sync`): table %q takes the client-side COPY fallback (it filters a "+
 						"PAD-SPACE-collation or engine-coerced temporal-literal column on a PlanetScale/Vitess source), and its "+

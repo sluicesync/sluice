@@ -271,7 +271,7 @@ func verifyNoSchemaDrift(ctx context.Context, exec executor, liveFingerprints ma
 		// here is an inconsistent half-install — refuse rather than skip the guard.
 		return nil, fmt.Errorf(
 			"sqlite-trigger: cannot read the captured-column fingerprint table %s (%w); "+
-				"the trigger install looks inconsistent — re-run `sluice trigger setup`",
+				"the trigger install looks inconsistent — re-run `sluice trigger setup --dsn=... --tables=...`",
 			ChangeLogColumnsTable, err,
 		)
 	}
@@ -280,14 +280,14 @@ func verifyNoSchemaDrift(ctx context.Context, exec executor, liveFingerprints ma
 		if !ok {
 			return nil, fmt.Errorf(
 				"sqlite-trigger: table %q has capture triggers installed but no longer exists in the source schema; "+
-					"re-run `sluice trigger setup` after a schema change (Phase 1 does not forward DDL)", fp.tbl,
+					"re-run `sluice trigger setup --dsn=... --tables=...` after a schema change (Phase 1 does not forward DDL)", fp.tbl,
 			)
 		}
 		if live != fp.columns {
 			return nil, fmt.Errorf(
 				"sqlite-trigger: table %q schema has drifted since `trigger setup` (captured columns %s, live columns %s); "+
 					"the stale triggers would mis-capture (an ADD COLUMN would be SILENTLY dropped) — "+
-					"re-run `sluice trigger setup` (Phase 1 does not forward DDL)", fp.tbl, fp.columns, live,
+					"re-run `sluice trigger setup --dsn=... --tables=...` (Phase 1 does not forward DDL)", fp.tbl, fp.columns, live,
 			)
 		}
 	}
@@ -320,7 +320,7 @@ func verifyCaptureTriggerShape(ctx context.Context, exec executor, driver string
 				return fmt.Errorf(
 					"sqlite-trigger: table %q capture trigger %q is MISSING from the source — its %s changes are not "+
 						"being captured at all (silently absent from the stream); re-run `sluice trigger setup "+
-						"--source-driver %s` to reinstall (the change-log and resume watermark are preserved)",
+						"--dsn=... --tables=... --source-driver %s` to reinstall (the change-log and resume watermark are preserved)",
 					fp.tbl, name, op.event, driver,
 				)
 			}
@@ -330,7 +330,7 @@ func verifyCaptureTriggerShape(ctx context.Context, exec executor, driver string
 						"installed by an older sluice or edited. Older installs capture REAL values through "+
 						"format('%%.17g'), which SQLite renders LOSSILY (its printf caps floats at 16 significant "+
 						"digits without the `!` flag — silently altered floats); re-run "+
-						"`sluice trigger setup --source-driver %s` to reinstall the triggers "+
+						"`sluice trigger setup --dsn=... --tables=... --source-driver %s` to reinstall the triggers "+
 						"(the change-log and resume watermark are preserved)",
 					fp.tbl, name, driver,
 				)

@@ -175,7 +175,7 @@ func waitForPreSnapshotTxnsToSettle(ctx context.Context, q settleQuerier, upperB
 		}
 		if time.Since(start) >= timeout {
 			return fmt.Errorf(
-				"cold-start CDC anchor: %d source transaction(s) still in flight after %s (txids: %v) — a transaction open since before the bulk-copy snapshot may hold an unsettled change-log id below the anchor, and proceeding could silently gap its changes; commit or roll back the stuck transaction(s) (find them: SELECT pid, state, xact_start, query FROM pg_stat_activity WHERE xact_start IS NOT NULL ORDER BY xact_start; last resort: SELECT pg_catalog.pg_terminate_backend(<pid>)), then re-run `sluice sync start`",
+				"cold-start CDC anchor: %d source transaction(s) still in flight after %s (txids: %v) — a transaction open since before the bulk-copy snapshot may hold an unsettled change-log id below the anchor, and proceeding could silently gap its changes; commit or roll back the stuck transaction(s) (find them: SELECT pid, state, xact_start, query FROM pg_stat_activity WHERE xact_start IS NOT NULL ORDER BY xact_start; last resort: SELECT pg_catalog.pg_terminate_backend(<pid>)), then re-run `sluice sync start --source-driver=... --source=... --target-driver=... --target=...`",
 				len(remaining), timeout, remaining,
 			)
 		}

@@ -78,8 +78,8 @@ func warnDDLDetectionAbsent(ctx context.Context, db *sql.DB, schema string) {
 			"the promised polled schema-fingerprint loop is not yet implemented, so ANY source DDL is invisible to capture: "+
 			"a table-rewriting ALTER (e.g. ALTER COLUMN ... TYPE ... USING) rewrites every stored row with NO change-log rows and NO refusal, "+
 			"and the sync keeps exiting 0 while pre-DDL rows diverge permanently. "+
-			"Apply source DDL with the drained model instead: `sluice sync stop --wait`, apply the DDL on source AND target, re-run `sluice trigger setup`, then `sluice sync start`. "+
-			"If your role can CREATE EVENT TRIGGER, re-run `sluice trigger setup` WITHOUT --allow-polled-fingerprint to install the event-trigger tier, which refuses loudly on observed DDL",
+			"Apply source DDL with the drained model instead: `sluice sync stop --wait`, apply the DDL on source AND target, re-run `sluice trigger setup --dsn=... --tables=...`, then `sluice sync start`. "+
+			"If your role can CREATE EVENT TRIGGER, re-run `sluice trigger setup --dsn=... --tables=...` WITHOUT --allow-polled-fingerprint to install the event-trigger tier, which refuses loudly on observed DDL",
 		slog.String("schema", schema))
 }
 

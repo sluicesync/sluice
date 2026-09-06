@@ -367,7 +367,7 @@ func gradeCaptureShape(schema string, installed []installedCaptureTrigger, ddl d
 			"pgtrigger: %s.%s exists but NO capture trigger is installed on any table in schema %q — "+
 				"nothing is being captured (every source change is silently absent from the stream); "+
 				"the triggers were dropped without `sluice trigger teardown`. Re-run `sluice trigger setup --dsn=... --tables=...` "+
-				"to reinstall (the change-log and resume watermark are preserved), or run `sluice trigger teardown` if the removal was intentional",
+				"to reinstall (the change-log and resume watermark are preserved), or run `sluice trigger teardown --dsn=...` if the removal was intentional",
 			schema, ChangeLogTable, schema,
 		)
 	}
@@ -385,7 +385,7 @@ func gradeCaptureShape(schema string, installed []installedCaptureTrigger, ddl d
 	// re-running their last command against a still-wedged stream. Setup
 	// now refuses to CREATE the divergence (refuseImplicitPostureNarrowing);
 	// this list is what repairs the installs that already have it.
-	allTables := "--tables=" + strings.Join(tables, ",")
+	allTables := strings.Join(tables, ",")
 
 	expected := []struct {
 		name   string
@@ -426,21 +426,21 @@ func gradeCaptureShape(schema string, installed []installedCaptureTrigger, ddl d
 			case "D":
 				return fmt.Errorf(
 					"pgtrigger: table %q capture trigger %q is DISABLED (ALTER TABLE ... DISABLE TRIGGER) — its %s changes are not being "+
-						"captured (silently absent from the stream); re-enable it (ALTER TABLE %q ENABLE TRIGGER %q) or re-run `sluice trigger setup` to reinstall",
-					tbl, want.name, want.events, tbl, want.name,
+						"captured (silently absent from the stream); re-enable it (ALTER TABLE %q ENABLE TRIGGER %q) or re-run `sluice trigger setup --dsn=... --tables=%s` to reinstall",
+					tbl, want.name, want.events, tbl, want.name, allTables,
 				)
 			case "R":
 				return fmt.Errorf(
 					"pgtrigger: table %q capture trigger %q is set ENABLE REPLICA — it fires ONLY under session_replication_role=replica, "+
-						"so none of this database's own %s changes are captured (silently absent from the stream); re-run `sluice trigger setup` to reinstall",
-					tbl, want.name, want.events,
+						"so none of this database's own %s changes are captured (silently absent from the stream); re-run `sluice trigger setup --dsn=... --tables=%s` to reinstall",
+					tbl, want.name, want.events, allTables,
 				)
 			case "A": // reachable only when the recorded posture is origin-only
 				return fmt.Errorf(
 					"pgtrigger: table %q capture trigger %q is set ENABLE ALWAYS but this install recorded ORIGIN-ONLY capture — the trigger's "+
 						"enablement was flipped by hand (or by a `trigger setup` run from before v0.137, which wrote the posture for the whole install "+
 						"but the trigger ALTERs only for the tables it named), so replica-role (replicated/applied) %s writes are being captured WITHOUT "+
-						"the echo-loop vetting the --capture-replicated-writes opt-in runs (ADR-0185); re-run `sluice trigger setup --dsn=... %s` — the "+
+						"the echo-loop vetting the --capture-replicated-writes opt-in runs (ADR-0185); re-run `sluice trigger setup --dsn=... --tables=%s` — the "+
 						"list is every table this install captures, and a re-run naming fewer cannot converge the posture — to restore origin-only capture, "+
 						"or add --capture-replicated-writes to make replicated-write capture the recorded, vetted intent",
 					tbl, want.name, want.events, allTables,
@@ -449,7 +449,7 @@ func gradeCaptureShape(schema string, installed []installedCaptureTrigger, ddl d
 				return fmt.Errorf(
 					"pgtrigger: table %q capture trigger %q is plain ENABLE (origin-only) but this install recorded --capture-replicated-writes — "+
 						"replica-role (replicated/applied) %s writes are NOT being captured (silently absent from the stream — the exact loss the opt-in "+
-						"exists to close; ADR-0185); re-run `sluice trigger setup --dsn=... %s --capture-replicated-writes` to restore the ENABLE ALWAYS "+
+						"exists to close; ADR-0185); re-run `sluice trigger setup --dsn=... --tables=%s --capture-replicated-writes` to restore the ENABLE ALWAYS "+
 						"triggers (the list is every table this install captures)",
 					tbl, want.name, want.events, allTables,
 				)
@@ -463,23 +463,23 @@ func gradeCaptureShape(schema string, installed []installedCaptureTrigger, ddl d
 				return fmt.Errorf(
 					"pgtrigger: table %q capture trigger %q is bound to function %q.%q — a function OUTSIDE the sluice schema %q, so it is "+
 						"not sluice's %q.%q whatever its name; its %s changes are captured by whatever that function does (a same-named "+
-						"decoy that records nothing makes them silently absent from the stream); re-run `sluice trigger setup` to rebind the "+
+						"decoy that records nothing makes them silently absent from the stream); re-run `sluice trigger setup --dsn=... --tables=%s` to rebind the "+
 						"trigger to the real function, and find out who rebound it",
-					tbl, want.name, got.fnSchema, got.fn, schema, schema, want.fn, want.events,
+					tbl, want.name, got.fnSchema, got.fn, schema, schema, want.fn, want.events, allTables,
 				)
 			}
 			if got.fn != want.fn {
 				return fmt.Errorf(
 					"pgtrigger: table %q capture trigger %q is bound to function %q, not sluice's %q — it is not what this sluice installs "+
-						"(edited, or installed by something else); its %s changes may be mis-captured; re-run `sluice trigger setup` to reinstall",
-					tbl, want.name, got.fn, want.fn, want.events,
+						"(edited, or installed by something else); its %s changes may be mis-captured; re-run `sluice trigger setup --dsn=... --tables=%s` to reinstall",
+					tbl, want.name, got.fn, want.fn, want.events, allTables,
 				)
 			}
 			if got.tgtype != want.tgtype {
 				return fmt.Errorf(
 					"pgtrigger: table %q capture trigger %q has shape tgtype=%d, want %d (AFTER %s, the shape setup installs) — "+
-						"it was edited or installed by something else and may mis-capture; re-run `sluice trigger setup` to reinstall",
-					tbl, want.name, got.tgtype, want.tgtype, want.events,
+						"it was edited or installed by something else and may mis-capture; re-run `sluice trigger setup --dsn=... --tables=%s` to reinstall",
+					tbl, want.name, got.tgtype, want.tgtype, want.events, allTables,
 				)
 			}
 		}
@@ -504,8 +504,8 @@ func gradeCaptureShape(schema string, installed []installedCaptureTrigger, ddl d
 		if !evt.present {
 			return fmt.Errorf(
 				"pgtrigger: the capture function %s.%s exists but event trigger %q is MISSING (DROP EVENT TRIGGER?) — %s "+
-					"would go undetected, so a post-DDL capture would silently mis-capture instead of refusing; re-run `sluice trigger setup` to reinstall it",
-				schema, tier.fn, tier.trigger, tier.watches,
+					"would go undetected, so a post-DDL capture would silently mis-capture instead of refusing; re-run `sluice trigger setup --dsn=... --tables=%s` to reinstall it",
+				schema, tier.fn, tier.trigger, tier.watches, allTables,
 			)
 		}
 		// The event triggers carry the SAME posture as the per-table pair
@@ -523,22 +523,22 @@ func gradeCaptureShape(schema string, installed []installedCaptureTrigger, ddl d
 		case "D", "R":
 			return fmt.Errorf(
 				"pgtrigger: event trigger %q is not enabled for origin sessions (evtenabled=%q) — %s would go undetected, "+
-					"so a post-DDL capture would silently mis-capture instead of refusing; ALTER EVENT TRIGGER %s ENABLE, or re-run `sluice trigger setup`",
-				tier.trigger, evt.enabled, tier.watches, tier.trigger,
+					"so a post-DDL capture would silently mis-capture instead of refusing; ALTER EVENT TRIGGER %s ENABLE, or re-run `sluice trigger setup --dsn=... --tables=%s`",
+				tier.trigger, evt.enabled, tier.watches, tier.trigger, allTables,
 			)
 		case "A": // reachable only when the recorded posture is origin-only
 			return fmt.Errorf(
 				"pgtrigger: event trigger %q is set ENABLE ALWAYS but this install recorded ORIGIN-ONLY capture — its enablement was flipped by hand, "+
 					"so %s is captured for replica-role sessions whose DML this install does NOT capture, and the two tiers disagree; "+
-					"re-run `sluice trigger setup` to restore origin-only capture, or re-run it with --capture-replicated-writes to make replicated capture the recorded, vetted intent",
-				tier.trigger, tier.watches,
+					"re-run `sluice trigger setup --dsn=... --tables=%s` to restore origin-only capture, or re-run it with --capture-replicated-writes to make replicated capture the recorded, vetted intent",
+				tier.trigger, tier.watches, allTables,
 			)
 		default: // evt.enabled == "O" while the recorded posture is ENABLE ALWAYS
 			return fmt.Errorf(
 				"pgtrigger: event trigger %q is plain ENABLE (origin-only) but this install recorded --capture-replicated-writes — %s is NOT detected for "+
 					"replica-role (replicated/applied) sessions while their DML IS captured, so the applier would write post-DDL-shaped rows with no refusal "+
-					"(ADR-0185, audit A-1); re-run `sluice trigger setup --capture-replicated-writes` to set it ENABLE ALWAYS",
-				tier.trigger, tier.watches,
+					"(ADR-0185, audit A-1); re-run `sluice trigger setup --dsn=... --tables=%s --capture-replicated-writes` to set it ENABLE ALWAYS",
+				tier.trigger, tier.watches, allTables,
 			)
 		}
 		// Namespace before name, for the same reason as the per-table arm
@@ -548,16 +548,16 @@ func gradeCaptureShape(schema string, installed []installedCaptureTrigger, ddl d
 			return fmt.Errorf(
 				"pgtrigger: event trigger %q is bound to function %q.%q — a function OUTSIDE the sluice schema %q, so it is not sluice's "+
 					"%q.%q whatever its name; %s is detected by whatever that function does (a same-named decoy that records nothing "+
-					"leaves a post-DDL capture silently mis-capturing instead of refusing); re-run `sluice trigger setup` to rebind it, "+
+					"leaves a post-DDL capture silently mis-capturing instead of refusing); re-run `sluice trigger setup --dsn=... --tables=%s` to rebind it, "+
 					"and find out who rebound it",
-				tier.trigger, evt.fnSchema, evt.fn, schema, schema, tier.fn, tier.watches,
+				tier.trigger, evt.fnSchema, evt.fn, schema, schema, tier.fn, tier.watches, allTables,
 			)
 		}
 		if evt.fn != tier.fn {
 			return fmt.Errorf(
 				"pgtrigger: event trigger %q is bound to function %q, not sluice's %q — it is not what this sluice installs; "+
-					"re-run `sluice trigger setup` to reinstall it",
-				tier.trigger, evt.fn, tier.fn,
+					"re-run `sluice trigger setup --dsn=... --tables=%s` to reinstall it",
+				tier.trigger, evt.fn, tier.fn, allTables,
 			)
 		}
 	}

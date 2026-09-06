@@ -110,7 +110,7 @@ func fkActionInvisible(rule string) bool {
 
 // fkReferentialActionRemedy is the shared remedy sentence both lanes'
 // WARNs carry.
-const fkReferentialActionRemedy = "run `sluice verify` after parent-key DELETEs/UPDATEs (it compares real rows, " +
+const fkReferentialActionRemedy = "run `sluice verify --source-driver=... --source=... --target-driver=... --target=...` after parent-key DELETEs/UPDATEs (it compares real rows, " +
 	"not binlog state), or drop the referential actions in favor of application-level deletes for the " +
 	"sync's duration"
 

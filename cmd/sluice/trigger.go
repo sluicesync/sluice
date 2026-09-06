@@ -57,7 +57,7 @@ var (
 // DDL-DETECTION-ABSENT warning on the polled tier.
 func pgtriggerSetupMode(plan *pgtrigger.Plan) string {
 	if !plan.EventTriggerSupported {
-		return "NONE (the polled-fingerprint loop is not yet implemented — source DDL is invisible to capture; re-run `sluice trigger setup` after any schema change)"
+		return "NONE (the polled-fingerprint loop is not yet implemented — source DDL is invisible to capture; re-run `sluice trigger setup --dsn=... --tables=...` after any schema change)"
 	}
 	return "event trigger (change-log polling carries the data; DDL arrives as a loud refusal)"
 }

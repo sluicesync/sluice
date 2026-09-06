@@ -157,7 +157,7 @@ func readInstallMeta(ctx context.Context, db *sql.DB, schema string) (installMet
 		return installMeta{}, fmt.Errorf(
 			"pgtrigger: cannot read the recorded capture posture from %s.%s (%w) — refusing to stream without knowing "+
 				"whether this install captures replicated writes (the posture selects the capture-shape door's expected "+
-				"trigger enablement and arms the echo-loop refusal); repair the meta table by re-running `sluice trigger setup`",
+				"trigger enablement and arms the echo-loop refusal); repair the meta table by re-running `sluice trigger setup --dsn=... --tables=...`",
 			schema, ChangeLogMetaTable, err,
 		)
 	}
@@ -361,7 +361,7 @@ SELECT s.subname, s.subenabled
 		"pgtrigger: "+captureGapRiskMarker+": this source database is a logical-replication SUBSCRIBER — rows its subscriptions apply run under "+
 			"session_replication_role=replica, and the capture triggers are plain CREATE TRIGGER (origin writes only), so every subscription-applied row is "+
 			"INVISIBLE to the change stream: the sync exits 0 with those rows silently missing from the target. Only rows written directly on this database are captured. "+
-			"Re-run `sluice trigger setup --capture-replicated-writes` to install ENABLE ALWAYS triggers that capture replicated writes (ADR-0185; refused if this "+
+			"Re-run `sluice trigger setup --dsn=... --tables=... --capture-replicated-writes` to install ENABLE ALWAYS triggers that capture replicated writes (ADR-0185; refused if this "+
 			"database is also the target of another sluice sync — the echo-loop shape), or sync from the publishing (origin) database instead, or keep subscribed "+
 			"tables out of the replication set",
 		slog.String("subscriptions", strings.Join(subs, ", ")))

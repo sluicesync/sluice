@@ -105,7 +105,7 @@ func warnInsecureCaptureFunctions(ctx context.Context, db *sql.DB, schema string
 		slog.WarnContext(ctx,
 			"pgtrigger: "+insecureDefinerMarker+": cannot read the capture functions' SECURITY DEFINER search_path settings from pg_proc; "+
 				"if this install predates the SEC-1 fix its superuser-owned DDL capture function can be hijacked by any user who can create a "+
-				"function on this database, and this open could not rule that out. Re-run `sluice trigger setup --dsn=...` to replace the "+
+				"function on this database, and this open could not rule that out. Re-run `sluice trigger setup --dsn=... --tables=...` to replace the "+
 				"capture functions with the fixed definitions",
 			slog.Any("err", err))
 		return

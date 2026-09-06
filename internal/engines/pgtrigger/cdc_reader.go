@@ -119,7 +119,7 @@ func openCDCReader(ctx context.Context, dsn, appID string) (ir.CDCReader, error)
 	} else if !exists {
 		_ = db.Close()
 		return nil, fmt.Errorf(
-			"pgtrigger: %s.%s does not exist on the source — run `sluice trigger setup --dsn=...` before starting the stream",
+			"pgtrigger: %s.%s does not exist on the source — run `sluice trigger setup --dsn=... --tables=...` before starting the stream",
 			cfg.schema, ChangeLogTable,
 		)
 	}
@@ -517,12 +517,12 @@ func refuseObservedDDL(m ddlMarker) error {
 			"pgtrigger: source table %s was DROPPED (%s) — the trigger engine refuses to forward DDL, and a drop is not something `sluice migrate` can land: "+
 				"the target still holds that table's last-synced rows and will keep them forever. Drain the stream (`sluice sync stop --wait`), decide the target's fate for that table "+
 				"(drop it on the target to match the source, or keep it as a deliberate archive), re-run `sluice trigger setup --dsn=<source-dsn> --tables=<the tables that still exist>` on the source, "+
-				"drop the table from the sync's --tables, then re-run `sluice sync start --restart-from-scratch` (there is no --reset-position flag; --restart-from-scratch is what discards the persisted position and re-copies from the beginning)",
+				"drop the table from the sync's --tables, then re-run `sluice sync start --source-driver=... --source=... --target-driver=... --target=... --restart-from-scratch` (there is no --reset-position flag; --restart-from-scratch is what discards the persisted position and re-copies from the beginning)",
 			m.droppedRelation, m.tag,
 		)
 	}
 	return fmt.Errorf(
-		"pgtrigger: observed source-side DDL (%s); the trigger engine refuses to forward DDL — drain the stream (`sluice sync stop --wait`), run `sluice migrate` on the target to land the schema change, then re-run `sluice sync start --restart-from-scratch` (there is no --reset-position flag; --restart-from-scratch is what discards the persisted position and re-copies from the beginning)",
+		"pgtrigger: observed source-side DDL (%s); the trigger engine refuses to forward DDL — drain the stream (`sluice sync stop --wait`), run `sluice migrate --source-driver=... --source=... --target-driver=... --target=...` on the target to land the schema change, then re-run `sluice sync start --source-driver=... --source=... --target-driver=... --target=... --restart-from-scratch` (there is no --reset-position flag; --restart-from-scratch is what discards the persisted position and re-copies from the beginning)",
 		m.tag,
 	)
 }

@@ -497,7 +497,7 @@ func (v *Verifier) renderText(r *VerifyResult) error {
 		for _, n := range r.ExtraOnTarget {
 			fmt.Fprintf(&sb, "   %s\n", n)
 		}
-		sb.WriteString("-- run `sluice schema diff` if you need to reconcile structural drift.\n")
+		sb.WriteString("-- run `sluice schema diff --source-driver=... --source=... --target-driver=... --target=...` if you need to reconcile structural drift.\n")
 	}
 	if r.Summary.TablesUnverified > 0 {
 		fmt.Fprintf(&sb, "\n-- %d table(s) could not be verified (SKIPPED above) — an unverified table is not a pass; non-zero exit code follows. Deliberately-unmigrated tables can be excluded with --exclude-table.\n",
