@@ -2019,6 +2019,26 @@ func emitCheckConstraint(c *ir.CheckConstraint, backslashEscapes bool) (string, 
 	// STRICTLY STRONGER here than on the source. That fails loudly at errno
 	// 3819 if the copied rows violate it, which is the same asymmetry the
 	// foreign-key path warns about; it warned there and was silent here.
+	//
+	// `NOT ENFORCED` IS NOT THE CARRY, and this is written down because it is
+	// the obvious next suggestion. MySQL 8 does have `CHECK ... NOT ENFORCED`,
+	// but it is a DIFFERENT state, not a spelling of NOT VALID. Measured on
+	// mysql:8.0.46 (2026-09-06), four cells:
+	//
+	//   - `ADD CONSTRAINT ... CHECK (q >= 0) NOT ENFORCED` over a stored
+	//     q = -1 is ACCEPTED, and a subsequently inserted q = -99 is ALSO
+	//     accepted (2 rows). So NOT ENFORCED checks NOTHING, ever.
+	//   - PG's NOT VALID means the opposite half: existing rows unchecked,
+	//     NEW rows enforced.
+	//   - The controls that make those two readings discriminating: an
+	//     ENFORCED check rejects a new violating row (3819), and cannot be
+	//     ADDED over a pre-existing violating row (3819).
+	//   - There is no promotion path either -- `ALTER TABLE ... ALTER CHECK
+	//     ... ENFORCED` validates the existing rows and fails 3819.
+	//
+	// So emitting NOT ENFORCED would swap "stricter than the source" for
+	// "weaker than the source", silently accepting writes the source rejects.
+	// Refusing to carry the state, loudly, is the honest option of the three.
 	if c.NotValid {
 		slog.Warn(
 			"source CHECK constraint is NOT VALID and MySQL has no equivalent — it becomes an "+
