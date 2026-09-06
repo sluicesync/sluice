@@ -50,12 +50,32 @@ If you want a "platform check" gate before merging a particular PR (e.g. a PR th
 - **Allow force pushes:** off — and unlike the linear-history rule, this one is **absolute**: a force-push to `main` is refused outright (`Cannot force-push to this branch … protected branch hook declined`), with no bypass. The consequence worth knowing before you need it: **a merge commit that lands on `main` cannot be rewritten away.** The rule that would have stopped it is soft; the rule that would let you undo it is hard. Accept it, or relax the protection in the UI deliberately — do not burn time on a repair the server will not accept.
 - **Allow deletions:** off
 
-## Recommended rules for tags
+## Tag protection — LIVE since 2026-09-06
 
-For release-tag protection (so an accidental tag delete doesn't drop a release):
+A repository ruleset named **"Protect release tags"** is active (id `22393777`). This is no longer a recommendation.
 
-- Tag rule pattern: `v*`
-- **Restrict who can create matching tags** — leave to maintainers or the workflows themselves.
+| | |
+|---|---|
+| Target | tags matching `refs/tags/v*` |
+| Rules | `creation`, `deletion`, `non_fast_forward` |
+| Bypass | `RepositoryRole` 5 (admin), mode `always` |
+| Enforcement | active |
+
+**Why the admin bypass is load-bearing rather than a weakening.** The release process legitimately force-moves a tag while its GitHub release is still a draft, and legitimately deletes a bad one. Blocking those outright would break the documented flow. The bypass keeps the maintainer path intact while closing the path this exists for: a leaked NON-admin credential (a fine-grained PAT with `contents:write`) can no longer create a `v*` tag — and creating one starts `release.yml`, which runs holding release-signing and tap-publishing credentials.
+
+**Verified in both directions before being pointed at `v*`**, on a throwaway `rulesetprobe-*` pattern so no probe could trigger a release build:
+
+- with the admin bypass in place, tag create and delete both SUCCEED;
+- with `bypass_actors` emptied, the same push is rejected: `[remote rejected] ... (push declined due to repository rule violations)`.
+
+The second half is the one that matters. A ruleset that only ever lets its author through proves nothing about whether the rule bites.
+
+**If a release tag push is ever rejected, check this first.** Deleting the ruleset restores the previous posture and is a one-line recovery.
+
+```
+gh api repos/sluicesync/sluice/rulesets --jq '.[] | [.id, .name, .enforcement] | @tsv'
+gh api repos/sluicesync/sluice/rulesets/22393777
+```
 
 ## Setting via the GitHub CLI
 

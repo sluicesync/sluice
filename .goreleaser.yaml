@@ -5,10 +5,30 @@ version: 2
 
 project_name: sluice
 
+# The release job runs with contents/packages/id-token/attestations WRITE and
+# TAP_GITHUB_TOKEN in its environment, so whatever runs here runs holding
+# release-signing and tap-publishing credentials.
+#
+# `go test ./...` USED TO RUN HERE and was removed (audit 2026-09-06, S-3).
+# It executes the entire test tree — arbitrary Go, plus any dependency's
+# init() linked into the test binaries — under that write scope, which turns a
+# supply-chain compromise from "a bad build" into "credential theft". It also
+# bought nothing: `ci.yml` runs the full suite WITH `-race` on the same tag,
+# and that run is publish gate 2, so no release reaches "Latest" without it.
+#
+# The cost of removing it, stated rather than implied: a draft release can now
+# be BUILT from a commit whose tests fail. It can never be PUBLISHED that way —
+# the six-check publish gate requires ci.yml green on the tag (or its
+# documented descendant-main fallback) before `--draft=false`. If that gate is
+# ever relaxed, this hook should come back.
+#
+# `go mod tidy` stays, but note it is the same class: it runs under the same
+# scope and can mutate go.mod/go.sum mid-build. It is a no-op in practice
+# because CI enforces `go mod tidy -diff` on every PR, which is the only
+# reason it is tolerable here.
 before:
   hooks:
     - go mod tidy
-    - go test ./...
 
 builds:
   - id: sluice
