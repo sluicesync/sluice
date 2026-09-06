@@ -424,14 +424,40 @@ func (r *CDCReader) schemaInScope(schema string) bool {
 // later live add-table that widens scope decodes against the current shape
 // rather than a stale one.
 func (r *CDCReader) gradeRelationSchemaRace(relations map[uint32]*relationCacheEntry, relationID uint32, entry *relationCacheEntry) error {
-	if !r.relationInScope(entry.Schema, entry.Name) {
-		return nil
-	}
 	// SLM-1c: the seeded prior stands in for the OID cache at this relation's
 	// first RelationMessage of the process — a stopped-stream zone swap is
 	// refused here or nowhere.
+	//
+	// DELIBERATELY NOT behind relationInScope, and this ordering is the fix
+	// for a HIGH the UPR-2 pre-tag review caught (2026-09-05). Two reasons,
+	// either of which is sufficient:
+	//
+	//  1. It does not need the gate. [CDCReader.checkSeededSchemaRace]
+	//     already returns nil for a relation the seed does not know, and the
+	//     seed IS the scope — on warm resume it is built from the target
+	//     witness (pipeline.loadWarmResumeSchemaSeed), so it holds exactly
+	//     the tables this stream maintains. Gating it again added no safety.
+	//  2. The gate was empty exactly when this door fires. The predicate the
+	//     pipeline supplies reads `s.liveFilterRef`, which is nil until
+	//     phaseStartApplySidecars — and that runs AFTER StreamChanges opens
+	//     the reader. So on a warm resume of a stream with a live-added
+	//     table (schema add-table), the first RelationMessage for that table
+	//     arrives while the predicate answers false for it. This door is
+	//     ONE-SHOT (it only fires while relations[relationID] is nil, and
+	//     the caller caches the entry immediately after), so skipping it
+	//     once disarmed it permanently for the process — a stopped-stream
+	//     timestamptz→timestamp swap on a live-added table would then have
+	//     been forwarded silently, at exit 0.
+	//
+	// Pinned by TestGradeRelationSchemaRace_SeededDoorIgnoresScopePredicate.
 	if err := r.checkSeededSchemaRace(relations, relationID, entry); err != nil {
 		return err
+	}
+	// The tier-2 loud refusal is what UPR-2 was actually about: a DDL on a
+	// relation this stream emits nothing for must not end the stream. That
+	// one is correctly scope-gated.
+	if !r.relationInScope(entry.Schema, entry.Name) {
+		return nil
 	}
 	return checkSchemaRace(relations, relationID, entry, r.schemaForward)
 }

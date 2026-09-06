@@ -154,7 +154,7 @@ The rule shipped in v0.94.1 is **proportional**: a manifest gets the
 *minimum* FormatVersion safe for its actual contents.
 
 ```
-ir.FormatVersionFor(schema) →
+backup.FormatVersionFor(schema) →
     Walk schema.Tables:
       If any RLSEnabled || RLSForced || len(Policies) > 0 || len(ExcludeConstraints) > 0 →
         return FormatVersionSecurityMetadata (= 2)
@@ -184,15 +184,15 @@ any DDL or data lands on the target:
 
 ```go
 // internal/pipeline/backup.go (paraphrased)
-if m.FormatVersion > ir.BackupFormatVersion {
+if m.FormatVersion > backup.BackupFormatVersion {
     return nil, fmt.Errorf(
         "backup: manifest format version %d is newer than this build supports (%d); upgrade sluice",
-        m.FormatVersion, ir.BackupFormatVersion,
+        m.FormatVersion, backup.BackupFormatVersion,
     )
 }
 ```
 
-`ir.BackupFormatVersion` is the build-time constant naming the
+`backup.BackupFormatVersion` is the build-time constant naming the
 highest FormatVersion this sluice binary knows about. v0.94.1+ has
 it at `2`; pre-v0.94.1 has it at `1`.
 
@@ -348,7 +348,7 @@ Otherwise let them ignore it.**
 Adding a new gated field means:
 
 1. Add the field to the IR (`internal/ir/...`).
-2. Add it to `ir.FormatVersionFor`'s detection logic.
+2. Add it to `backup.FormatVersionFor`'s detection logic.
 3. If a higher tier than v2 is needed, introduce
    `FormatVersionSecurityMetadataPlusFooBar = 3` and bump
    `BackupFormatVersion` to match.

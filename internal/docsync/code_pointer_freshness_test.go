@@ -307,60 +307,116 @@ func TestDocSymbolPointers_ResolveAgainstTheirPackage(t *testing.T) {
 		exemptInUse = map[string]bool{}
 	)
 
-	err = filepath.Walk(filepath.Join(repoRoot, "docs", "dev"), func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		if info.IsDir() {
-			if info.Name() == "design" || info.Name() == "notes" {
-				return filepath.SkipDir
+	// SCOPE, stated because it is narrower than the test's name and a gate
+	// that reads broader than its reach is worse than none. This grades the
+	// LIVING operator-facing docs — docs/dev/ (recursive, minus design and
+	// notes) plus the top-level docs/*.md runbooks and docs/operator/. It
+	// was docs/dev-only until 2026-09-05, when the SLM-5b rename was caught
+	// in docs/dev/audit-backlog.md and MISSED in docs/schema-change-runbook.md
+	// — the same citation syntax, one directory over.
+	//
+	// NOT graded, each for a reason rather than by omission:
+	//
+	//   - docs/releases/ and docs/adr/ are DATED RECORDS. A release note or
+	//     an accepted ADR states what was true when it was written; a later
+	//     rename must not make it fail, and rewriting it to satisfy a gate
+	//     would falsify the record. (Living prose inside an ADR — the parts
+	//     maintainers keep editing, like ADR-0091's forwarding matrix — is a
+	//     real gap this does not cover. Filed rather than implied.)
+	//   - Enabling docs/adr/ wholesale is NOT just an exemption list: the
+	//     `mysql.` qualifier there collides with MySQL's own system tables
+	//     (`mysql.user`) and with the EXTERNAL go-sql-driver package
+	//     (`mysql.ParseDSN`, `mysql.RegisterTLSConfig`), neither of which is
+	//     sluice's internal package. ~40 spans hit on a trial widening,
+	//     mostly those two false-positive classes. Closing it needs a
+	//     qualifier-disambiguation design, not a bigger denylist.
+	docWalkRoots := []string{
+		filepath.Join(repoRoot, "docs", "dev"),
+		filepath.Join(repoRoot, "docs", "operator"),
+		filepath.Join(repoRoot, "docs"), // top-level *.md only; subdirs skipped below
+	}
+	walkDocsFrom := func(root string) filepath.WalkFunc {
+		return func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if info.IsDir() {
+				// The walk root itself is never skipped; a SUBDIRECTORY of
+				// the top-level docs/ is, because it is either walked
+				// explicitly by another root above or deliberately out of
+				// scope per the note above. (Getting this wrong silently
+				// skipped docs/dev entirely — caught by the span floor,
+				// which is what a floor is for.)
+				if path != root && filepath.Dir(path) == filepath.Join(repoRoot, "docs") {
+					return filepath.SkipDir
+				}
+				if info.Name() == "design" || info.Name() == "notes" {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			base := filepath.Base(path)
+			if !strings.HasSuffix(base, ".md") || base == "roadmap.md" || base == "item49-phase3-prep.md" {
+				return nil
+			}
+			b, readErr := os.ReadFile(path)
+			if readErr != nil {
+				return readErr
+			}
+			rel, _ := filepath.Rel(repoRoot, path)
+			for _, m := range docSymbolRe.FindAllStringSubmatch(string(b), -1) {
+				pkg, sym := m[1], m[2]
+				if docSymbolFileExtTokens[sym] {
+					continue // a filename, not an identifier
+				}
+				if strings.Contains(sym, "_") && strings.ToLower(sym) == sym {
+					continue // a database object (mysql.general_log), not a Go symbol
+				}
+				set, known := decls[pkg]
+				if !known {
+					continue // qualifier is not an internal package dir — out of scope, see the doc comment
+				}
+				graded++
+				docs[path] = true
+				span := pkg + "." + sym
+				if set[sym] {
+					continue
+				}
+				if _, exempt := docSymbolExempt[span]; exempt {
+					exemptInUse[span] = true
+					continue
+				}
+				bad = append(bad, badRef{from: filepath.ToSlash(rel), span: span})
 			}
 			return nil
 		}
-		base := filepath.Base(path)
-		if !strings.HasSuffix(base, ".md") || base == "roadmap.md" || base == "item49-phase3-prep.md" {
-			return nil
+	}
+	for _, root := range docWalkRoots {
+		if err = filepath.Walk(root, walkDocsFrom(root)); err != nil {
+			t.Fatalf("walk %s: %v", root, err)
 		}
-		b, readErr := os.ReadFile(path)
-		if readErr != nil {
-			return readErr
-		}
-		rel, _ := filepath.Rel(repoRoot, path)
-		for _, m := range docSymbolRe.FindAllStringSubmatch(string(b), -1) {
-			pkg, sym := m[1], m[2]
-			if docSymbolFileExtTokens[sym] {
-				continue // a filename, not an identifier
-			}
-			if strings.Contains(sym, "_") && strings.ToLower(sym) == sym {
-				continue // a database object (mysql.general_log), not a Go symbol
-			}
-			set, known := decls[pkg]
-			if !known {
-				continue // qualifier is not an internal package dir — out of scope, see the doc comment
-			}
-			graded++
-			docs[path] = true
-			span := pkg + "." + sym
-			if set[sym] {
-				continue
-			}
-			if _, exempt := docSymbolExempt[span]; exempt {
-				exemptInUse[span] = true
-				continue
-			}
-			bad = append(bad, badRef{from: filepath.ToSlash(rel), span: span})
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("walk docs/dev: %v", err)
 	}
 
 	// Anti-vacuity: audit-backlog.md and perf-parity-matrix.md alone carry
 	// dozens of these today.
 	if graded < 40 || len(docs) < 2 {
 		t.Fatalf("graded only %d `pkg.Symbol` spans across %d docs (floor: >=40 spans, >=2 docs) — the matcher or the "+
-			"universe no longer reflects how docs/dev cite identifiers; fix the walker, not the floor", graded, len(docs))
+			"universe no longer reflects how docs/ cites identifiers; fix the walker, not the floor", graded, len(docs))
+	}
+	// A second floor, on REACH rather than volume: the docs/dev-only
+	// version of this walk passed its 40-span floor while covering one
+	// directory, which is exactly how a narrow gate reads as a broad one.
+	// At least one graded span must come from OUTSIDE docs/dev, or the
+	// widening has silently reverted.
+	outsideDev := 0
+	for d := range docs {
+		if !strings.HasPrefix(d, "docs/dev/") {
+			outsideDev++
+		}
+	}
+	if outsideDev == 0 {
+		t.Fatalf("every graded doc is under docs/dev/ — the walk no longer reaches the top-level runbooks or docs/operator/, "+
+			"which is the reach this gate was widened for (SLM-5b, 2026-09-05). Graded docs: %d", len(docs))
 	}
 
 	for _, b := range bad {

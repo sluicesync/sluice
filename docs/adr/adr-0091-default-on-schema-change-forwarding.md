@@ -506,9 +506,13 @@ intercept when Shape A is engaged, exactly as ADR-0058 did.
     every stored fractional second with zero decoded messages),
     **every ARRAY element typmod** (`numeric(10,4)[] → numeric(10,1)[]`
     rounds every element; the element resolves with typmod −1 by
-    design), and **the session-TZ cast swaps — `time ↔ timetz` and
-    `timestamp ↔ timestamptz`, either direction, scalar AND array**
-    (`unforwardableSessionTZCast`). Both swaps MOVE their projected
+    design), and **the session-TZ cast swaps — `time → timetz` and
+    `timestamp ↔ timestamptz`, scalar AND array**
+    (`unforwardableSessionTZCast`). The timestamp pair refuses in
+    EITHER direction; the time pair refuses only the ADD direction
+    since SLM-5b (v0.142.0), because `timetz` carries its offset per
+    value and dropping it consults no session zone — see the SLM-5b
+    note at the end of this item. Both swaps MOVE their projected
     signatures (`time ↔ timetz` since the TIMETZ-PROJECTION fix,
     2026-08-28, which caught it as projection-identical before that;
     the timestamp pair always has — `ir.DateTime` vs `ir.Timestamp`),
@@ -528,10 +532,13 @@ intercept when Shape A is engaged, exactly as ADR-0058 did.
     `SET TIME ZONE` anywhere in the engine) — a target-side pin would
     only narrow the hazard (making the target's cast deterministic),
     never close it, because the source setting stays unknowable.
-    *ARRAY variants — RESTORED, audit 2026-08-31 SL-3.* The 08-28
-    filing left `time[] ↔ timetz[]` and `timestamp[] ↔ timestamptz[]`
-    forwarding, and the first of those was a **regression opened
-    inside that same delta**: `time[] ↔ timetz[]` had refused since
+    *ARRAY variants — RESTORED, audit 2026-08-31 SL-3.* (Read the
+    `time[]` half of this paragraph as the ADD direction only, per
+    SLM-5b below; it was written while both directions refused.) The
+    08-28 filing left `time[] ↔ timetz[]` and `timestamp[] ↔
+    timestamptz[]` forwarding, and the first of those was a
+    **regression opened inside that same delta**: `time[] ↔
+    timetz[]` had refused since
     the A2 gate (v0.132.1) because both element types resolved at
     typmod −1 to a flag-less `ir.Time` and the pair was
     projection-IDENTICAL; the TIMETZ-PROJECTION fix made the two

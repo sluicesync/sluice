@@ -53,23 +53,47 @@ func TestCDCRelationScopeRoster_EverySchemaRaceIsScopeGated(t *testing.T) {
 	}
 	lines := strings.Split(string(b), "\n")
 
-	// The two refusals that can end the stream from the relation path. They
-	// now live in ONE callee (gradeRelationSchemaRace) rather than being
-	// duplicated into both protocol arms — so this roster grades two things:
-	// that the callee gates, and that BOTH arms still route through it.
-	guarded := []string{"checkSeededSchemaRace(relations", "checkSchemaRace(relations"}
-
-	var sites, gated int
-	var ungated []string
+	// The two refusals reachable from the relation path. They live in ONE
+	// callee (gradeRelationSchemaRace) rather than being duplicated into both
+	// protocol arms — so this roster grades two things: that the callee gates
+	// what MUST be gated, and that BOTH arms still route through it.
+	//
+	// Only ONE of the two is scope-gated, and the asymmetry is the finding
+	// this roster was corrected for (2026-09-05, the UPR-2 pre-tag review):
+	//
+	//   - checkSchemaRace is the TIER-2 loud refusal. Ungated it ends the
+	//     stream for a relation the reader was told to ignore, which is the
+	//     false-halt UPR-2 fixed. It MUST be gated.
+	//   - checkSeededSchemaRace is the SLM-1c one-shot correctness door. It
+	//     must NOT be gated: it self-guards on seed membership (the seed is
+	//     the scope), and the pipeline's predicate is empty at the moment it
+	//     fires, so gating it disarmed it permanently for a live-added table.
+	//
+	// The first cut of this roster asserted BOTH were gated, which is how it
+	// came to certify the defect it was written to prevent — a gate can
+	// defend a bug when its rule is "all sites look alike". Requiring each
+	// site to match its DECLARED posture is what stops that.
+	type racePosture struct {
+		call     string
+		mustGate bool
+		reason   string
+	}
+	postures := []racePosture{
+		{"checkSchemaRace(relations", true, "tier-2 loud refusal: ungated it ends the stream for an ignored relation (UPR-2)"},
+		{"checkSeededSchemaRace(relations", false, "SLM-1c one-shot door: self-guards on seed membership, and the pipeline predicate is nil when it fires"},
+	}
+	var sites, gated, ungatedOK int
+	var ungated, overGated []string
 	for i, ln := range lines {
 		trimmed := strings.TrimSpace(ln)
 		if strings.HasPrefix(trimmed, "//") {
 			continue
 		}
+		var posture racePosture
 		var isSite bool
-		for _, g := range guarded {
-			if strings.Contains(ln, g) {
-				isSite = true
+		for _, pst := range postures {
+			if strings.Contains(ln, pst.call) {
+				posture, isSite = pst, true
 				break
 			}
 		}
@@ -77,14 +101,24 @@ func TestCDCRelationScopeRoster_EverySchemaRaceIsScopeGated(t *testing.T) {
 			continue
 		}
 		sites++
-		// Walk back a short window for the enclosing scope guard. The guard
-		// wraps the pair, so it sits within a handful of lines above.
+		// Walk back a short window for an enclosing scope guard. A guard
+		// sits within a handful of lines above the call it protects.
 		start := max(0, i-14)
-		if strings.Contains(strings.Join(lines[start:i], "\n"), "relationInScope(") {
+		hasGuard := strings.Contains(strings.Join(lines[start:i], "\n"), "relationInScope(")
+		switch {
+		case posture.mustGate && hasGuard:
 			gated++
-			continue
+		case posture.mustGate && !hasGuard:
+			ungated = append(ungated, strings.TrimSpace(ln))
+		case !posture.mustGate && hasGuard:
+			// The regression direction for the one-shot door. Reported with
+			// its own message because "too much gating" is the defect here,
+			// and a roster that only ever complained about too little would
+			// have stayed green straight through it.
+			overGated = append(overGated, strings.TrimSpace(ln)+"  --  "+posture.reason)
+		default:
+			ungatedOK++
 		}
-		ungated = append(ungated, strings.TrimSpace(ln))
 	}
 
 	// Anti-vacuity. A rename, or a refactor moving the refusals out of this
@@ -105,6 +139,24 @@ func TestCDCRelationScopeRoster_EverySchemaRaceIsScopeGated(t *testing.T) {
 	if callers < 2 {
 		t.Errorf("only %d protocol arm(s) call gradeRelationSchemaRace; the V1 and V2 arms are the "+
 			"sibling pair UPR-2 was missed in, so both must route through it", callers)
+	}
+
+	// Each declared posture must be OBSERVED, or the roster is grading a
+	// site list that no longer matches the code: exactly one gated site and
+	// exactly one deliberately-ungated one.
+	if gated != 1 || ungatedOK != 1 {
+		t.Errorf("observed %d gated and %d deliberately-ungated schema-race site(s); want exactly 1 of each. "+
+			"The postures above name which door is which; a count that does not match them means a door was "+
+			"added, removed, or changed posture without updating this roster.", gated, ungatedOK)
+	}
+
+	for _, o := range overGated {
+		t.Errorf("a one-shot correctness door is scope-gated and must not be:\n    %s\n\n"+
+			"This door fires only at a relation's FIRST RelationMessage of the process, and the pipeline's "+
+			"scope predicate reads a live-added-table set that is nil until the apply sidecars start — which "+
+			"is AFTER the reader opens. Gating it means a warm resume skips it once for a live-added table "+
+			"and thereby disarms it permanently, forwarding a stopped-stream zone swap at exit 0. It needs no "+
+			"gate: it already returns nil for a relation the seed does not know, and the seed IS the scope.", o)
 	}
 
 	for _, u := range ungated {
