@@ -88,6 +88,20 @@ type notesAmendment struct {
 
 var declaredNotesAmendments = []notesAmendment{
 	{
+		amended:     semver{0, 142, 0},
+		fixedIn:     semver{0, 142, 0},
+		claimMarker: "`backup restore` and `cutover` evaluate the same patterns and do **not** report unmatched ones",
+		why: "wrong in two ways, and in the SAFE direction both times, which is why fixedIn is the " +
+			"amended version itself -- the shipped behaviour is wider than the sentence claims and no " +
+			"upgrade is needed. (1) `backup restore` is not a command; `restore` is top-level. (2) " +
+			"`restore` DOES report unmatched patterns, because it calls the same ApplyTableFilter door " +
+			"as migrate. Only `cutover` does not, pruning through its own filterSchemaTables. The " +
+			"method error is the part worth keeping: the claim was checked by grepping for direct " +
+			"UnmatchedPatterns call sites rather than asking which paths reach the DOOR that calls it " +
+			"-- a proxy for the question instead of the question. Found by the v0.142.0 regression " +
+			"cycle, which ran restore with a bad pattern instead of reading the code",
+	},
+	{
 		amended:     semver{0, 141, 4},
 		fixedIn:     semver{0, 141, 4},
 		claimMarker: "the emitted DDL was a syntax error",

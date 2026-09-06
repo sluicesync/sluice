@@ -6,6 +6,8 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [0.142.0] - 2026-09-05
 
+**Correction (2026-09-06):** one sentence in this entry is wrong in two ways, corrected in place at v0.142.0 because it is prose-only — the shipped behaviour is BETTER than the sentence claims. "`backup restore` and `cutover` evaluate the same patterns and do not report unmatched ones": `backup restore` is not a command (`restore` is top-level), and `restore` **does** report unmatched patterns because it calls the same `ApplyTableFilter` door as `migrate`. Only `cutover` does not, pruning through its own `filterSchemaTables`. Found by the v0.142.0 regression cycle, which ran `restore` with a bad pattern instead of reading the code.
+
 If you use `--exclude-table`, check your patterns. One that matches nothing was silent, and on the exclude path that fails OPEN — the table you meant to keep out is copied in full, at exit 0. Two refusals that fired on working configurations are also gone.
 
 ### Fixed

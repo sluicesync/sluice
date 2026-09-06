@@ -1,5 +1,11 @@
 # sluice v0.142.0
 
+> **Correction (2026-09-06).** One sentence below is wrong in two ways, and **no upgrade is needed for it** — the shipped behaviour is BETTER than the sentence claims, not worse. Prose-only, so it is corrected in place at v0.142.0 rather than pointing at a later version. The original sentence is left standing below; rewriting a published record silently is what this banner exists to avoid.
+>
+> **"`backup restore` and `cutover` evaluate the same patterns and do not report unmatched ones."** Two errors. (1) `backup restore` is not a command — `restore` is top-level. (2) `restore` **does** report unmatched patterns: it calls the same `ApplyTableFilter` door as `migrate`, so it carries the warning too. Only `cutover` does not, because it prunes through its own `filterSchemaTables` instead. So the coverage is wider than stated, and the one genuinely uncovered path is `cutover` alone.
+>
+> Worth recording rather than quietly fixing: I checked this by grepping for direct `UnmatchedPatterns` call sites instead of asking which paths reach the DOOR that calls it — a proxy for the question rather than the question. Found by the v0.142.0 regression cycle, which ran `restore` with a bad pattern instead of reading the code.
+
 **If you use `--exclude-table`, check your patterns.** A pattern that matches nothing was silent, and on the exclude path that fails **open**: the table you meant to keep out is copied, in full, at exit 0. The usual cause is close to a trap — patterns match the **bare** table name, while sluice's own diagnostics print tables as `public.orders`, so the string you copy out of sluice's output is exactly the string that matches nothing. It now warns, marked `TABLE-FILTER-PATTERN-UNMATCHED`.
 
 Two refusals that fired on working configurations are also gone: a Postgres DDL on a relation your stream was told to ignore no longer ends the stream, and a `timetz` → `time` column change no longer halts one.
