@@ -287,8 +287,14 @@ func ApplyTableFilter(ctx context.Context, schema *ir.Schema, filter TableFilter
 					" (sluice diagnostics print names schema-qualified, which is the usual reason " +
 					"this happens); use --include-schema / --exclude-schema to scope namespaces"
 			}
+			// TABLE-FILTER-PATTERN-UNMATCHED is the grep-stable handle, the
+			// same convention as POSITION-MODE / STALE-CAPTURE-FUNCTION /
+			// CHANGE-LOG-PAGE-UNORDERED. A warning an operator cannot search
+			// their logs for is a warning they find only by reading every
+			// line — and this one matters most in the case where they are not
+			// reading, because the run exits 0 either way.
 			slog.WarnContext(
-				ctx, "table filter pattern matched NOTHING",
+				ctx, "TABLE-FILTER-PATTERN-UNMATCHED: table filter pattern matched NOTHING",
 				slog.String("flag", mode),
 				slog.String("pattern", pat),
 				slog.String("effect", effect),
