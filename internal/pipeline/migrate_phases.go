@@ -105,7 +105,18 @@ func (m *Migrator) phaseReadSourceSchema(ctx context.Context, scope *multiDBScop
 	// Pruning here means every downstream phase (schema apply, bulk
 	// copy, indexes, constraints) operates on the filtered set
 	// implicitly — engines stay agnostic to the filter spec.
-	if err := migcore.ApplyTableFilter(ctx, schema, m.Filter); err != nil {
+	// Bug 273 arm 4: this phase serves BOTH modes. In a multi-database
+	// fan-out it runs once per database over that database's tables only,
+	// so an unmatched-pattern verdict taken here would be wrong by
+	// construction — a pattern naming a table in another selected database
+	// looks dead on every pass but its own. The fan-out driver
+	// (runMultiDatabase) reports ONCE against the accumulated census after
+	// the loop; single-database mode (scope == nil) still reports here.
+	applyFilter := migcore.ApplyTableFilter
+	if scope != nil {
+		applyFilter = migcore.ApplyTableFilterQuiet
+	}
+	if err := applyFilter(ctx, schema, m.Filter); err != nil {
 		return sr, nil, err
 	}
 	// Post-filter, pre-DDL: refuse loudly if any REMAINING table is

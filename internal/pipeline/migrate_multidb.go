@@ -272,6 +272,14 @@ func (m *Migrator) runMultiDatabase(ctx context.Context) error {
 		perRuns = append(perRuns, perDB)
 	}
 
+	// Bug 273 arm 4: the ONE place a multi-database migrate has the whole
+	// table universe. Each pass above ran quiet because no single pass can
+	// answer "did this pattern match anything?" — a pattern naming a table
+	// in database B looks dead while database A is being copied. The census
+	// accumulated across every pass, so this is the first and only point
+	// where the verdict is sound.
+	migcore.ReportUnmatchedPatterns(ctx, m.Filter)
+
 	// ---- Final cross-database pass: apply the deferred foreign keys now
 	// that every selected database's tables exist on the target. Skipped
 	// under --dry-run (CreateConstraints writes to the target; the dry run
@@ -400,7 +408,11 @@ func (m *Migrator) applyDeferredConstraints(ctx context.Context, scope *multiDBS
 	if err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: read source schema: %w", err))
 	}
-	if err := migcore.ApplyTableFilter(ctx, schema, m.Filter); err != nil {
+	// Quiet: this deferred cross-database pass re-reads one database's
+	// schema to rebuild the FK set. It is not the authoritative prune and
+	// reporting here would both double-report and repeat the per-pass
+	// mistake (Bug 273 arm 4).
+	if err := migcore.ApplyTableFilterQuiet(ctx, schema, m.Filter); err != nil {
 		return err
 	}
 	if err := migcore.PreflightTableReads(sr, schema); err != nil {

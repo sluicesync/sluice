@@ -344,6 +344,11 @@ func (s *Streamer) coldStartMultiDatabase(
 		}
 	}
 
+	// Bug 273 arm 4: the first point in a multi-database cold start where
+	// the whole table universe is known. Every pass above ran quiet because
+	// no single pass can answer "did this pattern match anything?".
+	migcore.ReportUnmatchedPatterns(ctx, s.Filter)
+
 	// Release the snapshot transaction + import-side connections now that
 	// every database is copied. CDC continues on its own connection.
 	if err := stream.ReleaseRows(); err != nil {
@@ -709,7 +714,10 @@ func (s *Streamer) coldStartReadOneDatabaseSchema(
 		return nil, nil
 	}
 
-	if err := migcore.ApplyTableFilter(ctx, schema, s.Filter); err != nil {
+	// Quiet: one pass of the fan-out. A pattern naming a table in another
+	// selected database looks dead here (Bug 273 arm 4); the driver reports
+	// once against the accumulated census after the copy loop.
+	if err := migcore.ApplyTableFilterQuiet(ctx, schema, s.Filter); err != nil {
 		return nil, fmt.Errorf("pipeline: filter tables for %q: %w", database, err)
 	}
 
@@ -913,7 +921,10 @@ func (s *Streamer) preflightOneNamespaceReplicaIdentity(ctx context.Context, src
 	if schema == nil || len(schema.Tables) == 0 {
 		return nil
 	}
-	if err := migcore.ApplyTableFilter(ctx, schema, s.Filter); err != nil {
+	// Quiet: an auxiliary per-namespace preflight, not the authoritative
+	// prune. Reporting here would both double-report and repeat the
+	// per-pass mistake.
+	if err := migcore.ApplyTableFilterQuiet(ctx, schema, s.Filter); err != nil {
 		return fmt.Errorf("pipeline: filter tables for %q: %w", database, err)
 	}
 	// The post-filter names, bare, which is the same list the copy loop
