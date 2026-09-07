@@ -6,6 +6,7 @@ package mysql
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log/slog"
 	"strings"
 	"testing"
@@ -13,32 +14,46 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 )
 
-// The identity-mismatch message must describe what sluice DOES.
+// A changed source identity REFUSES, and the refusal is terminal.
 //
-// # The defect this pins (audit SLM-6)
+// # What this pins, and why the wrapping assertion is the important one
 //
-// [verifySourceInstanceIdentity]'s firing arm used to log that sluice was
-// "refusing to resume to avoid a silent data gap". It does not refuse. It
-// returns an error wrapping [ir.ErrPositionInvalid] — deliberately, to route
-// the streamer's ADR-0022 fall-through — and on a binlog/GTID source that
-// fall-through AUTO-RE-SNAPSHOTS: it DROPS the target's tables and re-copies
-// them from whichever instance is now answering the DSN. The audit observed
-// `tables_dropped=2`.
+// [verifySourceInstanceIdentity]'s firing arm — the persisted position names
+// one instance, the DSN answers as another — must return an error that does
+// NOT wrap [ir.ErrPositionInvalid].
 //
-// So at the exact moment sluice was about to perform its most destructive
-// action, the only message the operator saw told them they were being
-// protected from it. That is worse than silence: an operator reading "refusing
-// to resume" has no reason to go and check which instance answered.
+// That is not a stylistic preference, it is the entire mechanism. Wrapping
+// ir.ErrPositionInvalid routes the streamer's ADR-0022 fall-through, and on a
+// binlog source that fall-through AUTO-RE-SNAPSHOTS: it DROPS the target's
+// tables and re-copies from whichever instance is now answering the DSN. So a
+// later, entirely well-meant `%w` here would silently convert this refusal
+// back into the most destructive action sluice can take, with no test failing
+// and no message changing. Nothing else in the codebase would notice.
 //
-// # What is NOT being changed, and why that is deliberate
+// # The history (audit SLM-6)
 //
-// The behaviour. For a genuinely replaced node the re-snapshot is the correct
-// recovery and matches the slot-purge posture. Whether an identity change
-// should instead refuse BY DEFAULT — it means a different SERVER, which sluice
-// cannot tell apart from a misconfigured DSN — is a live operator question,
-// and flipping it would turn a configuration that auto-recovers today into one
-// that halts. This test therefore grades the claim, not the posture.
-func TestInstanceIdentityMismatch_MessageDoesNotClaimARefusal(t *testing.T) {
+// This arm used to wrap ir.ErrPositionInvalid AND log that sluice was
+// "refusing to resume to avoid a silent data gap" — so the one message an
+// operator saw as the target was about to be dropped told them they were being
+// protected from it. The audit observed `tables_dropped=2`.
+//
+// The first fix corrected only the claim. The posture was then decided in the
+// same release, so no version ever shipped the interim "this is not a refusal"
+// wording.
+//
+// # Why refuse here but not for a purge
+//
+// A purge means the SAME server advanced past the position: re-copying from it
+// is right, and routine. An identity change means a DIFFERENT SERVER, which
+// sluice cannot distinguish from a stale connection string or a load-balanced
+// endpoint that landed elsewhere. The outcomes are asymmetric — refusing costs
+// one --restart-from-scratch on an event that already involved a human
+// rebuilding a server; not refusing destroys the target from the wrong source
+// at exit 0. And no unattended event reaches this arm: only NON-GTID MySQL
+// gets here (gtid_mode=ON takes the GTID arm, whose lineage check catches a
+// replaced instance by construction; Vitess/PlanetScale never reach this file;
+// MariaDB has its own lineage path).
+func TestInstanceIdentityMismatch_RefusesTerminally(t *testing.T) {
 	var buf bytes.Buffer
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
@@ -49,60 +64,66 @@ func TestInstanceIdentityMismatch_MessageDoesNotClaimARefusal(t *testing.T) {
 		t.Fatal("a genuine identity mismatch was accepted; the resume would start at a byte offset " +
 			"in an unrelated instance's binlog")
 	}
-	if !isPositionInvalid(err) {
-		t.Fatalf("the mismatch error no longer wraps ir.ErrPositionInvalid (%v).\n"+
-			"That wrapping is what routes the streamer's ADR-0022 fall-through. If you changed it to "+
-			"make this a hard refusal, that is the operator question in docs/dev/audit-backlog.md — "+
-			"update this test's doc rather than deleting the assertion.", err)
+
+	// THE load-bearing assertion. See the doc above: a `%w` added here turns
+	// the refusal back into an automatic drop-and-re-copy, silently.
+	if errors.Is(err, ir.ErrPositionInvalid) {
+		t.Fatalf("the identity-mismatch error wraps ir.ErrPositionInvalid again:\n  %v\n\n"+
+			"That wrapping routes the streamer's ADR-0022 fall-through, which on a binlog source "+
+			"AUTO-RE-SNAPSHOTS — it DROPS the target's tables and re-copies from whichever instance is "+
+			"now answering the DSN. This arm exists precisely because that instance is a DIFFERENT "+
+			"SERVER and may be a stale connection string rather than an intended replacement. If the "+
+			"posture is genuinely being reverted to auto-recovery, that is an operator decision: change "+
+			"this test's doc, not just the assertion.", err)
 	}
 
-	log := buf.String()
-
-	// The claim that was false, pinned as the CLAIM rather than as the
-	// word. A bare "refus" substring is the wrong assertion and was the
-	// first cut here: it fires on the message's own correct negation
-	// ("WHAT HAPPENS NEXT IS NOT A REFUSAL"), which is precisely the
-	// sentence that fixes the defect. Grade what is asserted, not what is
-	// mentioned.
-	for _, falseClaim := range []string{
-		"refusing to resume",
-		"refuses to resume",
-		"refusing to avoid",
-	} {
-		if strings.Contains(strings.ToLower(log), falseClaim) {
-			t.Errorf("the identity-mismatch WARN claims %q again:\n  %s\n"+
-				"sluice does not refuse here by default — it falls through to a cold start that DROPS "+
-				"the target's tables and re-copies from the instance now answering the DSN. If the "+
-				"posture genuinely changed to a refusal, the streamer fall-through has to change too, "+
-				"and this test's doc with it.", falseClaim, strings.TrimSpace(log))
+	// The operator has to be able to act on it: what happened, and the one
+	// command that makes the re-copy deliberate.
+	for _, want := range []string{"REFUSING", "--restart-from-scratch", "uuid-old", "uuid-new"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal no longer names %q:\n  %v", want, err)
 		}
 	}
-	// And the negation must actually be present, so the message cannot
-	// simply go quiet about which of the two it is.
-	if !strings.Contains(log, "NOT A REFUSAL") {
-		t.Errorf("the WARN no longer says plainly that this is not a refusal:\n  %s",
-			strings.TrimSpace(log))
-	}
 
-	// The facts an operator needs at that moment, each load-bearing:
-	// that a destructive re-copy is what happens, that its SOURCE is
-	// whatever now answers the DSN, and the flag that stops it.
-	for _, want := range []string{
-		instanceIdentityChangedMarker,
-		"DROPS",
-		"--no-auto-resnapshot",
-		"uuid-old",
-		"uuid-new",
-	} {
+	// And the WARN carries the grep-stable marker plus both identities, so an
+	// operator can find this in a log they are scrolling mid-incident.
+	log := buf.String()
+	for _, want := range []string{instanceIdentityChangedMarker, "uuid-old", "uuid-new"} {
 		if !strings.Contains(log, want) {
-			t.Errorf("the identity-mismatch WARN no longer names %q. An operator reading it has to be "+
-				"able to tell that a destructive re-copy is about to run, which instance it will read "+
-				"from, and how to stop it.\n  %s", want, strings.TrimSpace(log))
+			t.Errorf("the identity-mismatch WARN no longer names %q:\n  %s", want, strings.TrimSpace(log))
 		}
 	}
 }
 
-// isPositionInvalid keeps the wrapping assertion readable above.
-func isPositionInvalid(err error) bool {
-	return err != nil && strings.Contains(err.Error(), ir.ErrPositionInvalid.Error())
+// TestInstanceIdentityProbeFailure_StaysPermissive pins the SIBLING arm, and
+// the asymmetry with it, so neither gets "made consistent" by accident.
+//
+// `currentUUID == ""` means the probe could not run. That is a DIFFERENT
+// question from a known mismatch, and it stays permissive on purpose (audit
+// SLM-7): @@server_uuid is read ONCE at stream open, so an empty value is not
+// a mid-stream transient — it means the source will not tell sluice who it is,
+// whose realistic cause is a proxy or managed service that does not expose the
+// variable. Failing closed there would hard-block those deployments on the
+// file/pos path with no workaround, rather than catch a blip.
+//
+// It must stay LOUD, though: the whole residual is that an operator who cannot
+// be protected knows it.
+func TestInstanceIdentityProbeFailure_StaysPermissive(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	if err := verifySourceInstanceIdentity(context.Background(), "uuid-old", ""); err != nil {
+		t.Fatalf("a probe failure now refuses: %v\n"+
+			"That hard-blocks any source behind a proxy that does not expose @@server_uuid — the "+
+			"realistic cause, since the value is read once at stream open. If this is a deliberate "+
+			"tightening it needs an opt-out flag first; see the SLM-7 entry in "+
+			"docs/dev/audit-backlog.md.", err)
+	}
+	if !strings.Contains(buf.String(), unverifiedInstanceIdentityMarker) {
+		t.Errorf("the probe-failure arm went quiet. Permissive is only defensible while it is LOUD — "+
+			"the residual is an operator who cannot be protected and does not know:\n  %s",
+			strings.TrimSpace(buf.String()))
+	}
 }

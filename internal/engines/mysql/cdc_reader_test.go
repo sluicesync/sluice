@@ -157,36 +157,47 @@ func TestEncodeDecodeBinlogPosServerUUID(t *testing.T) {
 // **ADR-0049 DP-2 invariant (Chunk E regression-pin):** the
 // schema-history compaction floor must COMPOSE with, not bypass,
 // this pre-existing loud-refuse on identity-changed sources.
-// Resume from a position whose @@server_uuid differs from the
-// current source is ir.ErrPositionInvalid here BEFORE ADR-0049
-// resolveSchemaVersion is consulted — a new instance carries no
-// historical schema versions for our anchors, so the schema-history
-// floor would also refuse, but this floor's specificity ("instance
-// replaced, not just compacted past") gives the operator the
-// correct ADR-0022 cold-start signal.
+// A resume whose @@server_uuid differs from the current source is refused
+// here BEFORE ADR-0049 resolveSchemaVersion is consulted — a new instance
+// carries no historical schema versions for our anchors, so the
+// schema-history floor would also refuse, but this floor's specificity
+// ("instance replaced, not just compacted past") is what lets the operator
+// act on it.
+//
+// THE REFUSAL IS TERMINAL, AND THIS ASSERTION FLIPPED (audit SLM-6,
+// 2026-09-07). It used to require ir.ErrPositionInvalid, described here as
+// "the correct ADR-0022 cold-start signal". That routing is exactly the
+// problem: on a binlog source the ADR-0022 fall-through auto-re-snapshots —
+// it DROPS the target's tables and re-copies from whichever instance is now
+// answering the DSN. Correct for a routine PURGE (same server, retention
+// advanced); destructive here, where the source is a DIFFERENT SERVER that
+// sluice cannot tell apart from a stale connection string or a load-balanced
+// endpoint that landed elsewhere. See TestInstanceIdentityMismatch_
+// RefusesTerminally for the full argument and the operator-facing pins.
 func TestVerifySourceInstanceIdentity(t *testing.T) {
 	cases := []struct {
-		name             string
-		persisted, cur   string
-		wantPositionLoss bool
+		name           string
+		persisted, cur string
+		wantRefusal    bool
 	}{
 		{"same instance — resumable", "uuid-A", "uuid-A", false},
-		{"instance replaced — loud refuse", "uuid-A", "uuid-B", true},
+		{"instance replaced — terminal refusal", "uuid-A", "uuid-B", true},
 		{"persisted empty (pre-field / degraded) — skip check", "", "uuid-B", false},
 		{"current empty (lookup failed now) — degrade not refuse", "uuid-A", "", false},
 		{"both empty — skip check", "", "", false},
 	}
 	for _, c := range cases {
-		c := c
 		t.Run(c.name, func(t *testing.T) {
 			err := verifySourceInstanceIdentity(context.Background(), c.persisted, c.cur)
-			if c.wantPositionLoss {
+			if c.wantRefusal {
 				if err == nil {
-					t.Fatal("expected an error (loud refuse) on instance mismatch")
+					t.Fatal("expected a refusal on instance mismatch")
 				}
-				if !errors.Is(err, ir.ErrPositionInvalid) {
-					t.Errorf("error must wrap ir.ErrPositionInvalid (the streamer's "+
-						"ADR-0022 fall-through trigger); got %v", err)
+				if errors.Is(err, ir.ErrPositionInvalid) {
+					t.Errorf("the refusal must NOT wrap ir.ErrPositionInvalid: that routes the "+
+						"streamer's ADR-0022 fall-through, which drops the target's tables and "+
+						"re-copies from whatever now answers the DSN — the destructive outcome this "+
+						"arm exists to prevent; got %v", err)
 				}
 			} else if err != nil {
 				t.Errorf("expected nil (resumable / degraded-skip); got %v", err)
