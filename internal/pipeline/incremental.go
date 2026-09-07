@@ -426,6 +426,28 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 	sink.PhaseCompleted(incrPhaseStream)
 	sink.PhaseStarted(incrPhaseFinalize)
 	warnReplayOnlyWindow(ctx, manifest, advanced, startPos, endPos, totalChanges)
+	// EndPosition IS DELIBERATELY LEFT EMPTY when the chunk stream recorded
+	// nothing, and Bug 275's fix lives on the READ side rather than here.
+	//
+	// The first attempt stamped `endPos = startPos` at this line, on the
+	// reasoning that a window observing no position ends where it began.
+	// TestIncrementalWindow_SchemaSnapshotDoesNotMoveEndPosition refused it,
+	// correctly: there are THREE populations here, not two, and that edit
+	// collapsed the first two.
+	//
+	//	captured nothing at all      empty EndPosition — Bug 275's case
+	//	captured a DDL only          empty EndPosition — LOAD-BEARING; the
+	//	                             restore-side guards document a DDL-only
+	//	                             window as producing exactly this, and
+	//	                             use it to tell one apart from a data
+	//	                             window whose rows were emptied
+	//	captured rows                a real end position
+	//
+	// So an empty EndPosition here is not a defect to paper over — it is a
+	// signal the restore path reads. Bug 275 is that ONE consumer,
+	// `--position-from-manifest`, treated the signal as malformed instead of
+	// resolving it against the StartPosition sitting beside it. That is
+	// fixed where the misreading was, in [LoadChainTerminalPosition].
 	manifest.EndPosition = endPos
 	if err := assertDataWindowEndPositionInvariant(manifest); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseCDC, err)

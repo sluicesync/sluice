@@ -145,6 +145,72 @@ func TestLoadChainTerminalPosition_EmptyEndPosition(t *testing.T) {
 	}
 }
 
+// TestLoadChainTerminalPosition_QuietWindowResumesFromStart is Bug 275
+// (v0.146.0 regression cycle; the defect is pre-existing).
+//
+// A `backup incremental` whose window captured nothing used to write a
+// terminal manifest with an EMPTY EndPosition at exit 0, and this function
+// then refused the whole chain as a "pre-Phase-3.3 full backup or malformed
+// chain" — about a chain written seconds earlier by the same binary, whose
+// correct resume point was sitting in that same manifest's StartPosition.
+// The operator met that at the moment they were reaching for the no-re-bulk
+// handoff, which is precisely when they are trying to avoid a full re-copy.
+//
+// The two empty-EndPosition populations are distinguishable, and conflating
+// them is what made a fine chain look malformed:
+//
+//	FULL, pre-Phase-3.3     no EndPosition, no StartPosition  -> still refuses
+//	INCREMENTAL, quiet      no EndPosition, HAS StartPosition -> resumes there
+//
+// Writers at v0.146.0+ stamp EndPosition = StartPosition for a quiet window,
+// so this arm exists for chains ALREADY ON DISK — without it they stay
+// permanently unusable for the handoff.
+func TestLoadChainTerminalPosition_QuietWindowResumesFromStart(t *testing.T) {
+	dir := t.TempDir()
+	store, _ := blobcodec.NewLocalStore(dir)
+	ctx := context.Background()
+
+	fullEnd := ir.Position{Engine: "postgres", Token: `{"lsn":"0/1600000"}`}
+	full := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion,
+		CreatedAt:     time.Date(2026, 9, 7, 10, 0, 0, 0, time.UTC),
+		SourceEngine:  "postgres",
+		Schema:        &ir.Schema{},
+		Kind:          irbackup.BackupKindFull,
+		EndPosition:   fullEnd,
+		PartialState:  irbackup.BackupStateComplete,
+	}
+	if err := lineage.WriteManifestAt(ctx, store, lineage.ManifestFileName, full); err != nil {
+		t.Fatalf("write full: %v", err)
+	}
+
+	// The quiet incremental: StartPosition carried forward from the parent,
+	// EndPosition never stamped because no position-bearing event arrived.
+	incr := &irbackup.Manifest{
+		FormatVersion:  irbackup.BackupFormatVersion,
+		CreatedAt:      time.Date(2026, 9, 7, 10, 5, 0, 0, time.UTC),
+		SourceEngine:   "postgres",
+		Schema:         &ir.Schema{},
+		Kind:           irbackup.BackupKindIncremental,
+		ParentBackupID: lineage.ManifestBackupID(full),
+		StartPosition:  fullEnd,
+		PartialState:   irbackup.BackupStateComplete,
+	}
+	if err := lineage.WriteManifestAt(ctx, store, "manifest-incr-quiet.json", incr); err != nil {
+		t.Fatalf("write incremental: %v", err)
+	}
+
+	got, _, err := LoadChainTerminalPosition(ctx, store)
+	if err != nil {
+		t.Fatalf("a chain whose terminal incremental captured nothing was refused: %v\n"+
+			"Its StartPosition holds the resume point — the same value as the parent full's "+
+			"EndPosition — so the chain is usable and the operator was told it was malformed.", err)
+	}
+	if got != fullEnd {
+		t.Errorf("resume position = %+v; want the terminal's StartPosition %+v", got, fullEnd)
+	}
+}
+
 // TestLoadChainTerminalPosition_EmptyStore pins the loud-failure
 // shape on an empty store: clear "no manifests" message rather than
 // silent zero-position return.
