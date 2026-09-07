@@ -398,13 +398,35 @@ func (t Time) String() string {
 // `interval`, but MySQL has no equivalent — a MySQL `TIME` column is a
 // duration in the range -838:59:59…838:59:59, which exceeds PG `time`'s
 // 00:00–24:00 time-of-day range, so carrying such a column to PG needs
-// `interval`, not `time`. There is no default reader mapping to Interval
-// (MySQL `TIME` still reads as [Time] by default); it is reached only via
-// an explicit `--type-override col=interval`, for the MySQL `TIME`
-// duration → PG `interval` case. Values are carried as their textual
-// form (e.g. "838:59:59", "-12:00:00"), which PG's interval input
-// parser accepts. A MySQL/non-PG target has no native interval and is
-// refused loudly (emitColumnType / cross-engine supportability check).
+// `interval`, not `time`. Values are carried as their textual form
+// (e.g. "838:59:59", "-12:00:00"), which PG's interval input parser
+// accepts. A MySQL/non-PG target has no native interval and is refused
+// loudly (emitColumnType / cross-engine supportability check).
+//
+// TWO READER PATHS REACH IT, and this doc used to name only one. A MySQL
+// `TIME` reaches it via an explicit `--type-override col=interval` (MySQL
+// `TIME` still reads as [Time] by default). A POSTGRES source column
+// declared `interval` reaches it with no override at all — the PG reader
+// maps it unconditionally so PG→PG round-trips the type rather than
+// stopping the CDC applier's target-catalog read. The sentence that used to
+// stand here ("there is no default reader mapping to Interval") was true
+// when written and stopped being true when that first-class PG mapping
+// landed; it mattered, because it reads as "obscure override-only type" to
+// anyone deciding how carefully to treat this struct, and a plain PG→PG
+// migrate rides it.
+//
+// THE EMPTY STRUCT IS A KNOWN GAP, NOT AN OVERSIGHT (audit A2-6). PG's
+// `interval` takes a typmod — a field range (`DAY TO SECOND`,
+// `YEAR TO MONTH`) and a fractional-seconds precision — and none of it
+// survives here, so a PG→PG migrate lands every declaration as bare
+// `interval`. Measured on real PG 16: the VALUES are byte-identical (bare
+// `interval` is the widest interval type and PG rounds on store, so the
+// source had already rounded), and what is lost is the target's
+// CONSTRAINT, whose harm arrives at cutover. Carrying the typmod would move
+// [backup.ComputeSchemaHash] and repartition every existing chain with an
+// interval column, so it is a minor-version change with a chain-epoch
+// story. TestIntervalTypmodIsDroppedDeliberately holds the current
+// behaviour and carries the full argument.
 type Interval struct{}
 
 func (Interval) isType()    {}
