@@ -479,7 +479,7 @@ func TestGradeCaptureShape_GradesThePKArgumentValue(t *testing.T) {
 		//   SELECT encode(tgargs,'base64') -> WyJpZCJdAA==
 		//
 		// The second is a NON-ASCII column name, the family `escape` also
-		// mangled (it octal-escapes every byte >= 0x7F, so `café` came back
+		// mangled (it octal-escapes every byte >= 0x80, so `café` came back
 		// as ["caf\303\251"]\000 and failed the parse identically):
 		//
 		//   CREATE TRIGGER tru ... EXECUTE FUNCTION f('["café"]');

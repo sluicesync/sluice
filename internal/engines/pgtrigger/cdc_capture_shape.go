@@ -717,7 +717,7 @@ func gradeTriggerWiring(tbl, trigName string, got installedCaptureTrigger, allTa
 // removes nothing, json.Unmarshal fails on the trailing backslash, ok is
 // false, and the ENTIRE primary-key grading is skipped on every real
 // install, healthy or tampered. `escape` also octal-escapes any byte >=
-// 0x7F, so a column named `café` returns `["caf\303\251"]\000` and fails
+// 0x80, so a column named `café` returns `["caf\303\251"]\000` and fails
 // the same way even with the NUL handled.
 //
 // The unit fixture hid it by supplying "[\"id\"]\x00" — a real NUL byte,
@@ -728,8 +728,18 @@ func gradeTriggerWiring(tbl, trigName string, got installedCaptureTrigger, allTa
 // output, and there is an ok==true assertion on a real-shaped healthy
 // input so a regression to "skip everything" cannot pass silently.
 //
-// base64 is byte-faithful, so every column-name family survives it —
-// ASCII, UTF-8, and names carrying a quote or backslash alike.
+// AND `escape` IS NOT LOSSY, which is what makes it a trap rather than
+// merely a bad choice. Measured on PG 16:
+// `decode(encode(tgargs,'escape'),'escape') = tgargs` is TRUE — it is a
+// genuine reversible encoding whose TEXT is a lie. Feed its output back
+// through `decode` and you get your bytes; read it as text, as any JSON
+// parser must, and `\000` is four characters. So the defect was never
+// "information was lost"; it was "the text says something other than what
+// the bytes say", and every layer downstream believed the text.
+//
+// base64 is byte-faithful AND unambiguous as text, so every column-name
+// family survives it — ASCII, UTF-8, and names carrying a quote or
+// backslash alike.
 func parsePKColumnList(s string) (cols []string, ok bool) {
 	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(s))
 	if err != nil {

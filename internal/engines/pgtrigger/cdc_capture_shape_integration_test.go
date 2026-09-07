@@ -112,7 +112,7 @@ func TestCDCOpen_CaptureShapeDoor(t *testing.T) {
 	})
 
 	t.Run("a NON-ASCII key name still grades — the family escape mangled", func(t *testing.T) {
-		// `escape` octal-escapes every byte >= 0x7F, so a column named
+		// `escape` octal-escapes every byte >= 0x80, so a column named
 		// `café` came back as ["caf\303\251"]\000 and failed the parse
 		// identically to the NUL case — a second family, same silent
 		// skip. base64 is byte-faithful, and this proves it on the wire
