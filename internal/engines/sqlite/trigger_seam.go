@@ -11,6 +11,7 @@ import (
 	"strconv"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // This file is the minimal exported seam the sibling `sqlite-trigger` CDC engine
@@ -167,12 +168,26 @@ func RealRenderProbeSQL() string {
 func VerifyRealRenderProbe(rendered string) error {
 	parsed, err := strconv.ParseFloat(rendered, 64)
 	if err != nil || parsed != realRenderProbeValue {
-		return fmt.Errorf(
-			"sqlite: the connected SQLite renders REAL capture values LOSSILY: format('%%!.20g', %s) came back %q, "+
-				"which does not parse back to the same double — this engine ignores the `!` alternate-form-2 "+
-				"precision flag, so every captured REAL would be silently altered; use a SQLite build that honours "+
-				"it (every known release carrying the format()/printf() SQL function does)",
-			realRenderProbeLiteral, rendered,
+		// Coded at the SHARED verifier rather than at each caller, so every
+		// lane it guards raises the same code: sqlite-trigger capture,
+		// d1-trigger, the `--source-driver d1` bulk copy and
+		// `migrate --stage-local`. An operator meeting this on any of them is
+		// looking at the same fact about their engine, and `sluice diagnose`
+		// plus the error-triage workflow resolve entirely through
+		// `SLUICE-E-*` — before v0.147.0 this refusal had no code and no
+		// marker, so a terminal refusal on the plain `migrate` path was
+		// unroutable by either.
+		return sluicecode.Wrap(
+			sluicecode.CodeRealRenderLossy,
+			"use a SQLite build that honours the `!` alternate-form-2 precision flag; every known release "+
+				"carrying the format()/printf() SQL function does",
+			fmt.Errorf(
+				"sqlite: the connected SQLite renders REAL capture values LOSSILY: format('%%!.20g', %s) came back %q, "+
+					"which does not parse back to the same double — this engine ignores the `!` alternate-form-2 "+
+					"precision flag, so every captured REAL would be silently altered; use a SQLite build that honours "+
+					"it (every known release carrying the format()/printf() SQL function does)",
+				realRenderProbeLiteral, rendered,
+			),
 		)
 	}
 	return nil

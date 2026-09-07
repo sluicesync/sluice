@@ -94,6 +94,23 @@ const (
 	// rewritten in transit.
 	CodeD1TextMangled Code = "SLUICE-E-D1-TEXT-MANGLED"
 
+	// CodeRealRenderLossy is raised by the SQLite-family render-fidelity
+	// probe when the CONNECTED engine does not honour the `!`
+	// alternate-form-2 precision flag in `format('%!.20g', …)`.
+	//
+	// It is deliberately engine-shared rather than D1-specific: the same
+	// probe guards the sqlite-trigger capture lane, the d1-trigger lane, the
+	// `--source-driver d1` bulk copy and `migrate --stage-local`, and an
+	// operator meeting it on any of them is looking at the same fact about
+	// their engine.
+	//
+	// It got a code in v0.147.0 because the refusal reached the plain
+	// `migrate` path in v0.146.0 and had neither a code nor a marker, so
+	// `sluice diagnose` and the error-triage workflow — which resolve
+	// entirely through `SLUICE-E-*` against the error-code table — had
+	// nothing to route on for a terminal refusal on a mainstream path.
+	CodeRealRenderLossy Code = "SLUICE-E-REAL-RENDER-LOSSY"
+
 	// Audit 2026-08-11 C1-1: sluice's emitters only ever produce ONE SQL
 	// statement, and the restore path inlines RECORDED expression bodies
 	// from a backup manifest verbatim into that DDL before running it
@@ -620,6 +637,7 @@ var registry = map[Code]Info{
 	CodeBulkCopyRowCountMismatch: {ClassRefusal, "the d1 reader's server-side COUNT(*) before and after a table read agreed with each other but not with the rows pagination delivered — the reader lost or duplicated rows on a quiescent source"},
 	CodeBulkCopyRowTooLarge:      {ClassRefusal, "the d1 reader met a single row wider than its response cap even as a page of one — pages are sized in bytes and shrink to one row; the one row that still overflows is refused by key rather than decoded from a truncated body"},
 	CodeD1TextMangled:            {ClassRefusal, "D1 returned more text bytes than it stores for a quiescent table — invalid UTF-8 was replaced with U+FFFD in the response and copying it would persist the mangled value"},
+	CodeRealRenderLossy:          {ClassRefusal, "the connected SQLite-family engine renders REAL values lossily — it ignores the `!` alternate-form-2 precision flag and clamps to 16 significant digits, so every captured or copied REAL would be silently altered"},
 	CodeSchemaPermissionDenied:   {ClassRuntime, "target role lacks CREATE on the schema"},
 	CodeIndexStatementTimeLimit:  {ClassRuntime, "index build hit PlanetScale's statement-time limit (errno 3024)"},
 	CodeIndexDirectDDLDisabled:   {ClassRuntime, "PlanetScale safe-migrations blocks direct DDL (errno 1105)"},
