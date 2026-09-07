@@ -679,3 +679,72 @@ func TestStreamer_PGSource_OverrideFallsBackToHistory(t *testing.T) {
 		})
 	}
 }
+
+// streamerWithMode is [pgZoneSwapRig.streamer] with --schema-changes
+// set, for the audit 2026-09-06 H5 cell below.
+func (r *pgZoneSwapRig) streamerWithMode(streamID, mode string) *Streamer {
+	s := r.streamer(streamID)
+	s.SchemaChanges = mode
+	return s
+}
+
+// TestStreamer_PGSource_StoppedStreamZoneSwap_RefuseMode is the Postgres
+// half of audit 2026-09-06 H5.
+//
+// THE DEFECT WAS ONE LEVEL UP FROM THE READER. Postgres refuses a LIVE
+// ALTER COLUMN TYPE under --schema-changes=refuse at the reader
+// (cdc_relations.go, Bug 112/119/120), independent of any arming flag —
+// so the live half was never exposed. The STOPPED-STREAM half was, and
+// for a reason that had nothing to do with the PG reader: the warm-resume
+// schema SEED, which is the only prior a table can have across a stop, was
+// installed only `if s.schemaDeltaAppliesToTarget()`
+// (streamer_run_phases.go), with the stated rationale "only when a forward
+// path is live: the seed feeds a refusal that is otherwise unarmed, and
+// the reads are not free". Under refuse mode no seed loaded, so the seeded
+// first-boundary door had no prior to compare against and could not fire.
+//
+// Both engines therefore lost the same guarantee through different code,
+// which is why the fix is in the shared predicate rather than in either
+// reader.
+//
+// ONE DIRECTION AND ONE TARGET, deliberately: the full matrix is
+// [TestStreamer_PGSource_StoppedStreamZoneSwap]'s job and it exercises
+// every cell in forward mode. This cell exists to prove the MODE does not
+// change the answer, so re-running the whole matrix under it would buy
+// coverage of a variable this test is not about at ~4x the container time.
+func TestStreamer_PGSource_StoppedStreamZoneSwap_RefuseMode(t *testing.T) {
+	rig := newPGZoneSwapRig(t, pgZoneSwapTargets[0], pgZoneSwapDirections[0])
+	streamID := "h5-refuse-pg"
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	defer cancel1()
+	errc1 := rig.run(ctx1, rig.streamerWithMode(streamID, "refuse"))
+	if !rig.waitRowCount("events", 3, 90*time.Second) {
+		t.Fatal("bulk-copy never landed the seed rows")
+	}
+	anchor := rig.waitPersistedPosition(streamID)
+	applyDDL(t, rig.sourceDSN, "INSERT INTO events (id, c) VALUES (100, "+pgZoneSwapDirections[0].literalForSource()+");")
+	if !rig.waitRowID("events", 100, 90*time.Second) {
+		t.Fatal("the CDC row never landed")
+	}
+	rig.waitPersistedPositionPast(streamID, anchor)
+	rig.stop(cancel1, errc1)
+
+	// The source-only swap while the stream is stopped, plus the row that
+	// would land in the mismatched column.
+	rig.sourceSwapAtTokyo("events")
+
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	errc2 := rig.run(ctx2, rig.streamerWithMode(streamID, "refuse"))
+	rig.expectRefusal(errc2, "events", "warm resume after the swap under --schema-changes=refuse")
+
+	// The target is untouched. Without this the cell would pass on a
+	// refusal that fired after the damage.
+	if got := rig.targetColumnType("events"); got != rig.originalTargetType() {
+		t.Errorf("target events.c is %q after the refusal; want %q untouched", got, rig.originalTargetType())
+	}
+	if rig.targetRowExists("events", 4) {
+		t.Error("the post-swap row landed in the zone-mismatched column despite the refusal")
+	}
+}

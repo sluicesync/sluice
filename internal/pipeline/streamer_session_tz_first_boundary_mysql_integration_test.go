@@ -5,17 +5,24 @@
 
 // SLM-1 (audit 2026-09-01), end to end on a real MySQL source whose host
 // zone is not UTC: the zone-sibling swap as the FIRST DDL after a cold
-// start — no priming ADD COLUMN — must refuse loudly in BOTH modes that
-// re-apply schema deltas to the target, and leave the target's
-// pre-existing rows and column type untouched.
+// start -- no priming ADD COLUMN -- must refuse loudly in EVERY mode
+// that applies changes to a target, and leave the target's pre-existing
+// rows and column type untouched.
 //
-// The two observed shapes this pins (silent-loss-mysql.md §SLM-1):
+// The three shapes this pins -- two observed in silent-loss-mysql.md
+// §SLM-1, the third measured by audit 2026-09-06 H5:
 //
 //   - Shape A (--inject-shard-column): the first `MODIFY c TIMESTAMP` was
 //     FORWARDED through the boundary router and every pre-existing target
 //     row read 9 h off at exit 0.
 //   - default --schema-changes=forward: the same swap was seed-skipped at
 //     INFO and every later row landed in a zone-mismatched column.
+//   - --schema-changes=refuse: NO refusal at all, measured — the stream
+//     stayed alive for the full 90 s window and kept applying. The
+//     refusal was armed on "does a forward path exist", which is exactly
+//     what refuse mode turns off, so the most conservative mode was the
+//     least guarded one. See TestStreamer_SessionTZSwap_RefuseMode_MySQL
+//     for the dedicated cell and the target-divergence assertions.
 //
 // The container boots with --default-time-zone=+09:00 so the operator's
 // ALTER session inherits the non-UTC zone without any SET — the shipped
@@ -94,7 +101,7 @@ func startMySQLBinlogAtTokyo(t *testing.T) (sourceDSN, targetDSN string, cleanup
 	return srcConn, tgtConn, terminate
 }
 
-func TestStreamer_SessionTZSwapAtTheFirstBoundary_RefusesInBothModes(t *testing.T) {
+func TestStreamer_SessionTZSwapAtTheFirstBoundary_RefusesInEveryMode(t *testing.T) {
 	myEng, ok := engines.Get("mysql")
 	if !ok {
 		t.Fatal("mysql engine not registered")
@@ -122,6 +129,16 @@ func TestStreamer_SessionTZSwapAtTheFirstBoundary_RefusesInBothModes(t *testing.
 			// SchemaChanges is the shipping "forward" default).
 			name:      "default-forward",
 			configure: func(*Streamer) {},
+		},
+		{
+			// Scenario C: --schema-changes=refuse. Added by audit
+			// 2026-09-06 H5 — this arm did NOT exist while the test was
+			// named "RefusesInBothModes", and refuse mode was the one mode
+			// with no session-zone door at all. A gate whose name asserts
+			// completeness ("both modes") over a space it does not
+			// enumerate is how the gap survived; the space has three modes.
+			name:      "refuse",
+			configure: func(s *Streamer) { s.SchemaChanges = "refuse" },
 		},
 	}
 

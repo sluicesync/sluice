@@ -39,9 +39,15 @@ func TestSchemaDeltaAppliesToTarget_Matrix(t *testing.T) {
 			wantIntercept: true,
 		},
 		{
+			// WAS wantApplies:false, and that pin defended the defect
+			// (audit 2026-09-06 H5, measured). Refuse mode re-applies no
+			// DDL, but it applies every ROW to a target -- so a source zone
+			// swap leaves the target column in the old family while every
+			// post-boundary row arrives in the new one. Measured on MySQL 8
+			// at +09:00: no refusal in 90s, stream alive, still applying.
 			name:          "--schema-changes=refuse",
 			build:         func() *Streamer { return &Streamer{SchemaChanges: "refuse"} },
-			wantApplies:   false,
+			wantApplies:   true,
 			wantIntercept: false,
 		},
 		{
@@ -57,9 +63,12 @@ func TestSchemaDeltaAppliesToTarget_Matrix(t *testing.T) {
 			wantIntercept: false,
 		},
 		{
-			name:          "Shape A with --no-coordinate-live-ddl: no router, no intercept, nothing applies",
+			// Also WAS false, and the old cell name ("nothing applies") was
+			// the tell: no DDL applies, which is not the same as nothing.
+			// Rows still land on a target, so the swap still diverges them.
+			name:          "Shape A with --no-coordinate-live-ddl: no router and no intercept, but rows still apply",
 			build:         func() *Streamer { return &Streamer{InjectShardColumn: shardSpec(), NoCoordinateLiveDDL: true} },
-			wantApplies:   false,
+			wantApplies:   true,
 			wantIntercept: false,
 		},
 	} {

@@ -51,24 +51,41 @@ func (s *Streamer) singleStreamSchemaForwardActive() bool {
 		!s.multiDatabaseMode()
 }
 
-// schemaDeltaAppliesToTarget reports whether ANY path re-applies an
-// observed schema delta to the target — the UNION of the two, which is the
-// condition a reader-side value-semantics refusal must key on
-// ([schemaDeltaTargetApplySetter], SL-2):
+// schemaDeltaAppliesToTarget is the arming signal for the reader-side
+// session-GUC cast refusal ([schemaDeltaTargetApplySetter], SL-2).
 //
-//   - the ADR-0091 single-stream intercept ([singleStreamSchemaForwardActive]),
-//   - ADR-0054's Shape A boundary router, which routes every recognized
-//     shape (ALTER COLUMN TYPE included) through applyShapeDelta
-//     regardless of --schema-changes, and engages on
-//     --inject-shard-column unless --no-coordinate-live-ddl opts out.
+// WIDENED AGAIN (audit 2026-09-06 H5, measured on MySQL 8 at +09:00).
+// It used to be `singleStreamSchemaForwardActive() || shapeAActive` — the
+// union of the two paths that RE-APPLY a delta as DDL. That is the wrong
+// question, and answering it made `--schema-changes=refuse` the single
+// mode with no session-zone door: singleStreamSchemaForwardActive
+// requires forwardSchemaEnabled(), which refuse mode turns off, so the
+// most conservative setting was the least guarded one. Its own doc
+// promises the opposite ("any source DDL refuses loudly").
 //
-// Deliberately derived from CONFIG, not from `s.boundaryRouter != nil`:
-// the setter runs on the cold-start / warm-resume path and reading a field
-// another phase populates would make the arming order-dependent, which is
-// how a refusal quietly stops arming.
+// THE HARM SET OF A SOURCE ZONE SWAP HAS TWO MEMBERS and only one needs
+// a forward path:
+//
+//   - forwarded: the target's pre-existing rows are re-cast against the
+//     TARGET session's zone;
+//   - not forwarded: the target column keeps the OLD type while every
+//     post-boundary row arrives under the NEW one, so the target's own
+//     rows disagree with each other by the session offset.
+//
+// Measured before the fix: refuse mode surfaced no error in 90 s, stayed
+// alive and kept applying (TestStreamer_SessionTZSwap_RefuseMode_MySQL).
+//
+// So the question is now the one the consumers actually ask — does this
+// stream APPLY changes to a target — and for a Streamer the answer is
+// always yes. It is deliberately still a predicate rather than an inlined
+// `true`: the reader-side flag it feeds must stay FALSE for every
+// non-streamer construction (backup position capture, tooling, tests),
+// and that is achieved by those paths never calling the setter at all,
+// not by this returning false. Making it constant here keeps that
+// distinction where it belongs — at the setter's call sites, which are
+// exactly the streamer's cold start and warm resume.
 func (s *Streamer) schemaDeltaAppliesToTarget() bool {
-	shapeAActive := s.InjectShardColumn.Engaged() && !s.NoCoordinateLiveDDL
-	return s.singleStreamSchemaForwardActive() || shapeAActive
+	return true
 }
 
 // engageAddColumnForward opens the target SchemaWriter the ADR-0058
