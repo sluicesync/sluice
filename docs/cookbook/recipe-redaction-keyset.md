@@ -61,12 +61,25 @@ sluice migrate ... \
 
 ### Option B: env-backed
 
+The env var holds the **whole keyset YAML** — the same document as
+Option A's file, not one variable per key. This is the shape a secret
+manager or KMS sidecar writes into a container's environment
+(ADR-0041), so the keyset stays one object with one rotation story.
+
 ```sh
-export SLUICE_KEYSET_email_v1='base64-of-32-random-bytes-here...'
-export SLUICE_KEYSET_pan_v1='base64-of-32-random-bytes-here...'
+export SLUICE_KEYSET="$(cat <<'YAML'
+keyset:
+  keys:
+    - name: email_v1
+      active: 1
+      generations:
+        - generation: 1
+          bytes: "3q2+796tvu/erb7v3q2+796tvu/erb7v3q2+796tvu8="
+YAML
+)"
 
 sluice migrate ... \
-    --keyset-source 'env:SLUICE_KEYSET_' \
+    --keyset-source 'env:SLUICE_KEYSET' \
     --redact 'public.users.email=hash:hmac-sha256:email_v1'
 ```
 
