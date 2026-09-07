@@ -43,9 +43,21 @@
 //     restored from backup" mechanism — binlogs genuinely don't
 //     carry over).
 //
-// Oracle (loud-failure tenet floor): loud ir.ErrPositionInvalid
-// detection → ADR-0022 cold-start re-snapshot executes end-to-end →
-// data correct after (no gap, no dup, src == dst).
+// THE TWO CASES NO LONGER SHARE AN ORACLE (audit SLM-6, v0.146.0), and
+// the split is the point:
+//
+//   - PURGE: the same server advanced past the position. Loud
+//     ir.ErrPositionInvalid → ADR-0022 cold-start re-snapshot executes
+//     end-to-end → data correct after (no gap, no dup, src == dst).
+//     Unchanged.
+//   - NODE REPLACE: a DIFFERENT server is answering. This now refuses
+//     TERMINALLY and does NOT re-snapshot, because re-copying means
+//     dropping the target's tables and repopulating them from an
+//     instance that never produced the position — right for a purge,
+//     destructive when sluice cannot tell an intended replacement from
+//     a stale connection string. Its oracle is the refusal plus the
+//     target being UNTOUCHED; the row-count-equality oracle that used
+//     to apply here was asserting the destructive behaviour.
 //
 // Reuses startMySQLBinlog / applyDDLMySQL / waitForRowCountMySQL /
 // readPersistedPositionMySQL / pollRowCountMySQL /
@@ -58,7 +70,6 @@ package pipeline
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -289,7 +300,7 @@ func TestStreamer_MySQLGTIDMode_BinlogPurgedFallsThroughToColdStart(t *testing.T
 	}
 }
 
-// TestStreamer_MySQL_FreshInstanceNodeReplaceFallsThroughToColdStart
+// TestStreamer_MySQL_FreshInstanceNodeReplaceRefusesTerminally
 // reproduces the PlanetScale "node replaced / restored from backup"
 // mechanism. Binlogs are instance-local; when PS replaces the
 // underlying node the new instance carries the same logical data but
@@ -307,7 +318,7 @@ func TestStreamer_MySQLGTIDMode_BinlogPurgedFallsThroughToColdStart(t *testing.T
 // loud ir.ErrPositionInvalid → cold-start re-snapshots B IN FULL
 // (picking up B's extra row — proving the WHOLE table was
 // re-snapshotted, not a silent partial / delta-replay).
-func TestStreamer_MySQL_FreshInstanceNodeReplaceFallsThroughToColdStart(t *testing.T) {
+func TestStreamer_MySQL_FreshInstanceNodeReplaceRefusesTerminally(t *testing.T) {
 	setPollIntervalForTest(t, 200*time.Millisecond)
 
 	// Capture DEBUG slog so the resume-validation decision (node-
@@ -422,60 +433,100 @@ func TestStreamer_MySQL_FreshInstanceNodeReplaceFallsThroughToColdStart(t *testi
 	resumeErr := make(chan error, 1)
 	go func() { resumeErr <- resumeStreamer.Run(resumeCtx) }()
 
-	// All FIVE of B's rows must land — including b-only-row, which
-	// proves the whole table was re-snapshotted from B.
-	if !waitForRowCountMySQL(t, tgtB, "noderepl", 5, 60*time.Second) {
+	// ---- Phase 4: the resume must REFUSE, terminally, and must NOT
+	// have touched B's target. ----
+	//
+	// THIS ASSERTION IS INVERTED FROM WHAT IT WAS (audit SLM-6, v0.146.0),
+	// and the inversion is the point of the change. It used to require the
+	// full re-snapshot of B — all five rows including b-only-row — as proof
+	// that the ADR-0022 fall-through had run. That fall-through is exactly
+	// the destructive behaviour: it DROPS the target's tables and re-copies
+	// them from whichever instance is now answering the DSN. Right for a
+	// routine purge, where the same server has advanced past the position;
+	// wrong here, where B is a DIFFERENT SERVER that sluice cannot
+	// distinguish from a stale connection string or a load-balanced endpoint
+	// that landed elsewhere.
+	//
+	// The original concern this test was written for — silently skipping the
+	// delta — is still covered, and more conservatively: nothing is skipped
+	// because nothing proceeds.
+	var resumeFinalErr error
+	select {
+	case resumeFinalErr = <-resumeErr:
+	case <-time.After(90 * time.Second):
 		resumeCancel()
 		<-resumeErr
-		t.Fatalf("after node-replace fall-through, B's dst was not fully re-seeded (got %d rows; want 5)",
+		t.Fatal("PHASE-B (node-replace): the resume against a FRESH instance neither refused nor " +
+			"returned; it must not sit there having silently accepted a foreign lineage")
+	}
+	if resumeFinalErr == nil {
+		t.Fatalf("PHASE-B (node-replace): the resume against instance B SUCCEEDED. Either it streamed "+
+			"from a byte offset in an unrelated binlog lineage (silent-gap class), or it re-copied "+
+			"this target from a server that never produced its position. dst now holds %d rows.",
 			pollRowCountMySQL(tgtB, "noderepl"))
 	}
-
-	srcBPayloads := selectAllPayloadsMySQL(t, srcB, "noderepl")
-	dstBPayloads := selectAllPayloadsMySQL(t, tgtB, "noderepl")
-	if !equalStringSlicesMySQL(srcBPayloads, dstBPayloads) {
-		resumeCancel()
-		<-resumeErr
-		t.Fatalf("post-recovery src(B) != dst(B): src=%v dst=%v", srcBPayloads, dstBPayloads)
-	}
-	// Loud-failure oracle: the recovery must have gone through the
-	// ADR-0022 cold-start fall-through, which means the resume-
-	// validation step must have LOUDLY refused the unreachable
-	// position. The streamer logs this as the WARN "warm resume:
-	// persisted position is no longer valid; falling through to cold
-	// start". Asserting on it (not just the row count) is what
-	// distinguishes "loud detection → re-snapshot" from a lucky
-	// re-snapshot that happened for an unrelated reason. The full
-	// re-seed of b-only-row already proves data correctness; this
-	// proves the *mechanism* was the loud one.
-	logs := string(logBuf.Bytes())
-	if !strings.Contains(logs, "falling through to cold start") {
-		t.Fatalf("PHASE-B (node-replace): data ended correct BUT the loud fall-through WARN "+
-			"never fired — the persisted position was treated as resumable against a fresh "+
-			"instance with an unrelated binlog lineage (silent-gap class). This is the "+
-			"loud-failure-tenet violation the hardening must close. Captured logs:\n%s", logs)
-	}
-	t.Logf("PHASE-B (node-replace): recovery verified — loud fall-through fired AND fresh "+
-		"instance B fully re-snapshotted (src == dst, %d rows incl. b-only-row); no silent "+
-		"partial / delta-replay", len(srcBPayloads))
-
-	resumeCancel()
-	select {
-	case err := <-resumeErr:
-		// Tolerate context.Canceled: the streamer can be cancelled mid-
-		// startup (e.g., in `SHOW BINARY LOGS` while reaching steady-
-		// state CDC) and surface that as a wrapped context.Canceled
-		// rather than a clean nil. The assertion's intent is "exits
-		// cleanly on cancel"; both nil and context.Canceled satisfy it.
-		// Surfaced after CI 26135099781: the captureSlog race-fix
-		// removed a slowdown that was reliably putting the streamer
-		// past start-CDC by the time resumeCancel fired.
-		if err != nil && !errors.Is(err, context.Canceled) {
-			t.Errorf("resume Streamer.Run (B) returned err: %v", err)
+	for _, want := range []string{"server_uuid", "REFUSING", "--restart-from-scratch"} {
+		if !strings.Contains(resumeFinalErr.Error(), want) {
+			t.Errorf("PHASE-B: the refusal does not name %q — an operator mid-incident has to be able "+
+				"to tell which instance answered and what to do:\n%v", want, resumeFinalErr)
 		}
-	case <-time.After(15 * time.Second):
-		t.Errorf("resume Streamer.Run (B) did not return after ctx cancel")
 	}
+
+	// THE LOAD-BEARING HALF: B's target must be UNTOUCHED. This is what
+	// distinguishes the fix from the old behaviour, and no error-message
+	// assertion can stand in for it — the old path also logged loudly, then
+	// dropped the tables anyway.
+	//
+	// b-only-row is the witness: it exists ONLY on the instance sluice was
+	// never authorized to copy from. If the destructive fall-through had
+	// run, B's target would hold all five of B's rows including it.
+	//
+	// In this rig B's target starts EMPTY — only the sluice_cdc_state row
+	// was carried across to simulate the swap — so "untouched" shows up as
+	// the table not existing at all, which is the strongest form of the
+	// evidence and is exactly what the first run of this rewrite reported
+	// ("Table 'target_db.noderepl' doesn't exist"). Both shapes are accepted
+	// as proof; what is refused is the row being there.
+	if tableExistsMySQL(t, tgtB, "noderepl") {
+		dstBPayloads := selectAllPayloadsMySQL(t, tgtB, "noderepl")
+		for _, p := range dstBPayloads {
+			if p == "b-only-row" {
+				t.Fatalf("PHASE-B (node-replace): the target was RE-COPIED from instance B — b-only-row "+
+					"exists only there, and it is now in a target sluice refused to resume against. "+
+					"That is the destructive auto-resnapshot this refusal exists to prevent; on a "+
+					"misconfigured DSN it is an operator's target repopulated from the wrong "+
+					"database. dst=%v", dstBPayloads)
+			}
+		}
+		t.Logf("PHASE-B: target table present but carries no b-only-row (%d rows) — not re-copied",
+			len(dstBPayloads))
+	} else {
+		t.Log("PHASE-B: target table does not exist on B — the refusal fired before any table was " +
+			"created, so nothing was copied from an unverified instance")
+	}
+
+	logs := string(logBuf.Bytes())
+	if !strings.Contains(logs, "SOURCE-INSTANCE-IDENTITY-CHANGED") {
+		t.Errorf("PHASE-B (node-replace): the grep-stable marker never fired, so an operator scrolling "+
+			"their logs has nothing to search for. Captured logs:\n%s", logs)
+	}
+	if strings.Contains(logs, "falling through to cold start") {
+		t.Errorf("PHASE-B (node-replace): the ADR-0022 fall-through ran. The identity refusal must be " +
+			"terminal — routing it into the fall-through is what dropped the target and re-copied " +
+			"from an unverified instance.")
+	}
+	t.Log("PHASE-B (node-replace): verified — terminal refusal, target untouched, marker fired")
+
+	// The resume already returned its terminal error above — that is the
+	// whole point of the change, so there is nothing left to wait for.
+	// Cancelling is cleanup only; the channel is already drained.
+	//
+	// The block that used to stand here waited on resumeErr and tolerated
+	// context.Canceled, because under the old contract the streamer kept
+	// RUNNING after the fall-through re-snapshot and had to be cancelled
+	// out of steady-state CDC. A terminal refusal never reaches steady
+	// state.
+	resumeCancel()
 }
 
 // seedCDCStateMySQL writes a position token into the target's
@@ -526,6 +577,30 @@ func seedCDCStateMySQL(t *testing.T, dsn, streamID, token string) {
 // streamer_resume_mysql_integration_test.go reads `email`; these
 // chaos tables use `payload`). Returns the sorted payload list for
 // the src == dst exactly-once oracle.
+// tableExistsMySQL reports whether table exists in the DSN's database.
+//
+// It exists so the node-replace pin can tell "the target was never touched"
+// (the table was never created, because the refusal fired first) apart from
+// "the target was re-copied". Querying rows to prove absence fails with
+// "Table doesn't exist", which is the right ANSWER arriving as the wrong
+// SHAPE — the assertion has to be able to read it as evidence.
+func tableExistsMySQL(t *testing.T, dsn, table string) bool {
+	t.Helper()
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	var n int
+	if err := db.QueryRow(
+		"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?",
+		table,
+	).Scan(&n); err != nil {
+		t.Fatalf("table-exists probe: %v", err)
+	}
+	return n > 0
+}
+
 func selectAllPayloadsMySQL(t *testing.T, dsn, table string) []string {
 	t.Helper()
 	db, err := sql.Open("mysql", dsn)

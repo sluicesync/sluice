@@ -150,7 +150,7 @@ func TestEncodeDecodeBinlogPosServerUUID(t *testing.T) {
 
 // TestVerifySourceInstanceIdentity is the unit-level pin for the
 // Track-1c node-replace loud-failure floor. The integration test
-// (TestStreamer_MySQL_FreshInstanceNodeReplaceFallsThroughToColdStart)
+// (TestStreamer_MySQL_FreshInstanceNodeReplaceRefusesTerminally)
 // proves it end-to-end against two real instances; this pins the
 // decision table cheaply so a regression is caught without Docker.
 //

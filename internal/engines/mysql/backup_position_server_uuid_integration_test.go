@@ -43,6 +43,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -172,8 +173,18 @@ func TestBackupChainResumeRefusesAcrossInstances(t *testing.T) {
 	_ = snap.Close()
 	assertFilePosCarriesUUID(t, "OpenBackupSnapshot(A)", capturedOnA, uuidA)
 
-	// Direction 1 — the regression: resuming A's cursor on B must refuse
-	// with ir.ErrPositionInvalid.
+	// Direction 1 — the regression: resuming A's cursor on B must refuse,
+	// and the refusal must be TERMINAL.
+	//
+	// ASSERTION INVERTED v0.146.0 (audit SLM-6). It used to require
+	// ir.ErrPositionInvalid "so the streamer will route it to a cold-start
+	// re-snapshot". That routing was the defect: on a binlog source the
+	// ADR-0022 fall-through drops the target's tables and re-copies from
+	// whichever instance is now answering — correct for a purge (same server,
+	// retention advanced), destructive here, where B is a DIFFERENT SERVER
+	// that sluice cannot tell apart from a stale connection string. This test
+	// is the one place that proves the distinction on two real MySQL
+	// instances, so it now pins the absence of that wrapping.
 	readerB, err := e.OpenCDCReader(ctx, dsnB)
 	if err != nil {
 		t.Fatalf("OpenCDCReader(B): %v", err)
@@ -188,9 +199,19 @@ func TestBackupChainResumeRefusesAcrossInstances(t *testing.T) {
 		t.Fatal("resuming instance A's backup cursor against instance B was ACCEPTED; " +
 			"this is the silent-gap defect — the syncer streams from a byte offset in an unrelated binlog")
 	}
-	if !errors.Is(err, ir.ErrPositionInvalid) {
-		t.Fatalf("cross-instance resume failed, but not with ir.ErrPositionInvalid "+
-			"(so the streamer will not route it to a cold-start re-snapshot): %v", err)
+	if errors.Is(err, ir.ErrPositionInvalid) {
+		t.Fatalf("the cross-instance refusal wraps ir.ErrPositionInvalid, which routes the streamer's "+
+			"ADR-0022 fall-through — it would DROP this target's tables and re-copy them from "+
+			"instance B, a server that never produced this position: %v", err)
+	}
+	// It must still be recognisable and actionable: both identities named,
+	// the grep-stable marker, and a remedy. Checked on the real
+	// two-instance error rather than a constructed one.
+	for _, want := range []string{uuidA, uuidB, "REFUSING", "--restart-from-scratch", "backup full"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the cross-instance refusal does not name %q — an operator has to be able to tell "+
+				"WHICH instance answered and what to do about it:\n%v", want, err)
+		}
 	}
 
 	// Direction 2 — the control that stops direction 1 from passing for
