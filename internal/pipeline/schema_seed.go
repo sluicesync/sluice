@@ -76,11 +76,27 @@ package pipeline
 // every zoned time column as its naive sibling — a phantom swap at the
 // next boundary — so a stopped-stream `time`⇄`timetz` swap on a
 // Postgres source resumes with no prior for that column and is primed.
-// And the loader is installed only when a path re-applies deltas to the
-// target ([Streamer.schemaDeltaAppliesToTarget]); under
-// `--schema-changes=refuse` no lane is seeded, so a stopped-stream swap
-// in that mode primes on the Postgres lane too (the MySQL lanes' refusal
-// is unarmed there by the same choice).
+//
+// The `--schema-changes=refuse` residual that stood here is GONE (audit
+// 2026-09-06 H5). It read: "the loader is installed only when a path
+// re-applies deltas to the target; under `--schema-changes=refuse` no
+// lane is seeded, so a stopped-stream swap in that mode primes on the
+// Postgres lane too (the MySQL lanes' refusal is unarmed there by the
+// same choice)." Both halves were true and both were the defect rather
+// than a limitation — refuse mode was measured to surface no refusal at
+// all on a real MySQL source. [Streamer.schemaDeltaAppliesToTarget] now
+// answers "does this stream apply changes to a target", which is always
+// yes for a Streamer, so every lane is seeded in every mode.
+//
+// ARRAYS were never listed here and were nonetheless a residual until
+// 2026-09-06 (VF-ARRAY-WITNESS): [zoneFamilyMember] fell through to
+// false for `ir.Array`, so a `timestamptz[]` column was omitted from the
+// witness AND skipped by [witnessCoversHistory] — the witness was judged
+// covering and the history that carried the column was discarded,
+// leaving no prior at all. It now recurses. Worth recording that the
+// list above did not name it: an omission from an honest-residual list
+// reads as "checked and fine", which is the failure mode such a list
+// creates.
 //
 // # Why the witness is safe to hand the reader
 //
@@ -338,8 +354,33 @@ func mergeWarmResumeSeed(ctx context.Context, streamID, namespace string, witnes
 // TestSchemaDiffAfterMigrate_MySQLToPostgres_TypeFamilyMatrix (Postgres)
 // and is the identity on a MySQL-family target
 // (internal/engines/mysql.translateType).
+// ARRAYS RECURSE (audit 2026-09-06 VF-ARRAY-WITNESS, silent since
+// v0.138.0). `ir.Array` used to fall through to false, which was not a
+// decision anyone made — the honest-residual list above enumerates
+// `--type-override`, target-lacks-table, SQLite read-back and the
+// time/timetz pair, and says nothing about arrays. The asymmetry was
+// with the DOOR, which has supported them all along: [ir.ZoneFamily]
+// recurses through Array and seededSessionTZSwapPair renders
+// "timestamp[] and timestamptz[]".
+//
+// The consequence was not a missing witness column but a DISCARDED
+// history. Returning false here made [zoneWitnessProjection] omit a
+// `timestamptz[]` column AND made [witnessCoversHistory] skip it, so
+// the witness was judged covering and the retained history — which does
+// carry the array column — was replaced by a witness that does not. Net
+// effect: no prior at all for that column, so a stopped-stream
+// `ALTER ... TYPE timestamp[]` under a non-UTC session primes and
+// diverges per element at exit 0.
+//
+// Recursing preserves the discrimination the scalar arms make rather
+// than widening it: an array of the zone-naive `ir.Timestamp{}` shape is
+// still not a member, so the SQLite-read-back phantom-swap reasoning
+// above holds element-wise. Multi-dimensional arrays fall out of the
+// recursion.
 func zoneFamilyMember(t ir.Type) bool {
 	switch v := t.(type) {
+	case ir.Array:
+		return zoneFamilyMember(v.Element)
 	case ir.Timestamp:
 		return v.WithTimeZone
 	case ir.DateTime:

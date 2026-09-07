@@ -71,6 +71,16 @@ func TestWarmResumeSeed_ZoneWitnessFamilyMatrix(t *testing.T) {
 		{"mysql-datetime", ir.DateTime{}, true},
 		{"sqlite-datetime", ir.Timestamp{}, false},
 		{"overridden-text", ir.Text{}, false},
+		// ARRAY CELLS (audit 2026-09-06 VF-ARRAY-WITNESS). Before the fix
+		// zoneFamilyMember returned false for every ir.Array, so the
+		// witness omitted a timestamptz[] column AND witnessCoversHistory
+		// skipped it -- the witness was judged covering and the history
+		// that DID carry the column was discarded, leaving no prior at all.
+		{"pg-timestamptz-array", ir.Array{Element: ir.Timestamp{Precision: 6, WithTimeZone: true}}, true},
+		{"pg-timestamp-array", ir.Array{Element: ir.DateTime{Precision: 6}}, true},
+		// The non-member array keeps the fallback arm honest: an array of
+		// the zone-naive shape must still hand back the history.
+		{"sqlite-datetime-array", ir.Array{Element: ir.Timestamp{}}, false},
 	}
 	histories := []struct {
 		name string
@@ -78,6 +88,7 @@ func TestWarmResumeSeed_ZoneWitnessFamilyMatrix(t *testing.T) {
 	}{
 		{"history-timestamp", ir.Timestamp{WithTimeZone: true}},
 		{"history-datetime", ir.DateTime{}},
+		{"history-timestamptz-array", ir.Array{Element: ir.Timestamp{WithTimeZone: true}}},
 		{"no-history", nil},
 	}
 	members, nonMembers := 0, 0
@@ -330,7 +341,21 @@ func TestZoneFamilyMember_IsExactlyTheReaderProjection(t *testing.T) {
 		{ir.Time{WithTimeZone: true}, false},
 		{ir.Date{}, false},
 		{ir.Text{}, false},
-		{ir.Array{Element: ir.Timestamp{WithTimeZone: true}}, false},
+		// WAS false, and that cell pinned the defect as intent
+		// (audit 2026-09-06 VF-ARRAY-WITNESS). A timestamptz[] column
+		// is a zone-family member: ir.ZoneFamily has always recursed
+		// through Array, so the door could refuse a swap the witness
+		// builder had already thrown the prior away for.
+		{ir.Array{Element: ir.Timestamp{WithTimeZone: true}}, true},
+		{ir.Array{Element: ir.DateTime{}}, true},
+		// Multi-dimensional falls out of the recursion.
+		{ir.Array{Element: ir.Array{Element: ir.Timestamp{WithTimeZone: true}}}, true},
+		// The discrimination the scalar arms make is preserved
+		// element-wise, not widened: an array of the zone-naive shape
+		// is still not a member, so the SQLite-read-back phantom-swap
+		// reasoning holds per element.
+		{ir.Array{Element: ir.Timestamp{}}, false},
+		{ir.Array{Element: ir.Text{}}, false},
 	}
 	for _, tc := range cases {
 		if got := zoneFamilyMember(tc.typ); got != tc.want {
