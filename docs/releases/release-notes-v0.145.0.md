@@ -1,0 +1,47 @@
+# sluice v0.145.0
+
+**Two privilege/integrity findings and four silent-loss fixes, all from a blind audit of v0.144.0 and every one measured on a real server before it was fixed.** The sharpest, if you run trigger-CDC on Postgres: any source role that could create a table and a trigger could forge writes into your synced target tables. The other headline: `backup prune` and `backup compact` re-signed a signed chain without verifying it first, which is what laundering a tampered backup looks like.
+
+Take this one if you run **pgtrigger on a shared or multi-tenant Postgres**, if you run **scheduled `backup prune`/`compact` on a signed chain**, or if you use **`--schema-changes=refuse`**.
+
+## Fixed
+
+**pgtrigger: any source role that could create a table and a trigger could forge target writes.** The capture function is `SECURITY DEFINER`, lives in your data schema, and kept PostgreSQL's default `EXECUTE` grant to `PUBLIC` — while the reader routed change-log rows by table *name* with the schema discarded. So a low-privilege role could `CREATE TABLE mine.orders`, attach sluice's capture function to it, and have every row it wrote applied to the target's real `orders`. A cross-privilege write primitive sluice manufactured rather than inherited. Closed in three independent layers: the reader now drops any captured row whose schema is not this stream's (`rowInCaptureScope`, warning once per relation with a `CAPTURE-OUT-OF-SCOPE` marker), `trigger setup` takes the capture functions off `PUBLIC` and grants them back to itself, and the capture-shape door now grades the trigger's *wiring* — a `WHEN` clause or a missing primary-key argument used to pass every check. **An install created before this release keeps `PUBLIC`'s grant until `sluice trigger setup` re-runs**; the reader-side check covers that window.
+
+**`backup prune` and `backup compact` re-signed signed chains without verifying them.** ADR-0154 says a signature is "verified at restore/verify/prune/compact time"; the prune/compact half was never implemented. An attacker who can write your backup store edits a manifest — dropping a chunk from a table's list, weakening a `CHECK`, flipping RLS off — and that edit fails verification at restore. Then your scheduled maintenance runs with the chain's key material, as it must in order to re-sign, and mints fresh valid signatures over the attacker's content. Nothing downstream caught it: the schema-hash and backup-id checks recompute keyless hashes an adversary restates. Both commands now verify before restructuring (`verifyBeforeRestructure`), refusing rather than re-signing. A dry run still reports, and a chain whose signatures merely went *stale* after a crash still heals — the door sits below the no-op path deliberately, because that is the shape the crash-recovery heal exists to repair.
+
+**`sync from-backup --reset-target-data` destroyed the target and then refused.** The broker drops every table named in the cached manifest before calling the chain restore, which owns seven refusals its own comments describe as pre-target. An earlier fix hoisted exactly one of them above the drop; six stayed below, including all three integrity gates — the ones that fire when a chain is corrupt or tampered, which is precisely when you may have nothing else to restore from. Measured on three refusable chains, the drop ran first every time, turning "bad chain, target intact" into "bad chain, target gone". Both callers now run the same list, from one place, before anything is dropped.
+
+**`--schema-changes=refuse` was the only mode with no session-timezone door.** Its documented contract is that any source DDL refuses loudly. On a MySQL source that was false, and false in the direction that loses data: the refusal was armed on whether a *forward path* existed, which is exactly what refuse mode turns off — so the most conservative setting was the least guarded one. Measured on MySQL 8 at `+09:00`: a `DATETIME`→`TIMESTAMP` swap surfaced no refusal in 90 seconds, the stream stayed alive, and every row after the boundary landed in a target column of the other zone family. It now refuses in both engines and every mode, including the Postgres stopped-stream case, which lost the same guarantee through different code.
+
+**A `timestamptz[]` column could resume with no prior at all.** The warm-resume target witness classified only scalar timestamps as zone-family members, so an array column was omitted from the witness *and* skipped by the coverage check — which meant the witness was judged complete and the retained history that did carry the column was discarded. A clean stop, an `ALTER … TYPE timestamp[]` under a non-UTC session, and the resume primed instead of refusing. The refusal itself supported arrays the whole time; nothing could give it a prior.
+
+**Widening a Postgres publication is now guarded like narrowing it.** Promoting a scoped publication to `FOR ALL TABLES` requires a `DROP` and recreate, and that was unguarded on the reasoning that a publication is "metadata only". A concurrent stream reading through the same publication either wedges at its next resume or silently becomes database-wide — after which any table without a replica identity starts refusing `UPDATE`. Narrowing has consulted the other-slots probe since ADR-0175; widening now does too (`guardPublicationWidening`), because it is the `DROP` a peer experiences either way.
+
+**Redaction policies that differed only in a static value or an HMAC key fingerprinted identically.** The fingerprint hashed each rule's *elided* audit rendering, so `static:"A"` and `static:"B"` produced the same value, as did two different keys. Every door comparing it for equality silently accepted a mismatched policy: a resumed `backup full` under a rotated key left one archive whose tables were keyed differently, and no downstream join on the surrogate works. Strategies now contribute distinguishing material as a digest, so the manifest still carries no secret.
+
+## Compatibility
+
+**Fingerprints for `static:` and keyed-hash redaction policies have changed.** Recorded fingerprints are not recomputed, so every existing chain keeps its backup id and verifies unchanged. What moves is a *fresh* computation — so a resumed `backup full` or a `sync start --position-from-manifest` against a **v0.144.0-written** chain using one of those strategies will refuse even under identical rules. It is a loud refusal naming both postures, never a silent mismatch; re-take such a chain. Policies using `null`, `hash:sha256`, `truncate:`, `mask:*` or `randomize:*` are unaffected.
+
+**New refusals can fire on configurations that previously exited 0**, which is the point in each case: `--schema-changes=refuse` on a source zone swap, `backup prune`/`compact` on a signed chain whose signatures do not verify, `backup compact` on a chain carrying a redaction marker, a Postgres publication widening while another sluice slot exists, and a pgtrigger capture trigger carrying a hand-added `WHEN` clause.
+
+**`sluice trigger setup` now changes one thing about your database it did not before**: it revokes `EXECUTE` on sluice's four capture functions from `PUBLIC` and grants it back to the role running setup. It touches nothing else — no default privileges, no other object, no other role's access to anything. Existing capture triggers keep firing (PostgreSQL checks `EXECUTE` at `CREATE TRIGGER` time, not at fire time — measured on PG 16 over a real unprivileged connection).
+
+No flag was added, renamed or removed, and the backup format version is unchanged at 10.
+
+## Who needs this
+
+- **pgtrigger users on a shared, multi-tenant, or contractor-accessible Postgres source** — the privilege finding.
+- **Anyone running scheduled `backup prune` or `backup compact` against a signed chain.**
+- **Anyone using `sync from-backup --reset-target-data`.**
+- **Anyone running `--schema-changes=refuse`, on either engine.**
+- **Postgres sources with `timestamptz[]` columns under continuous sync.**
+
+## Development notes
+
+Two things about how this release was found are worth recording.
+
+**The cross-version compatibility gate had stopped reaching the newest format tier, and said so as an error message rather than a check.** Its cells forced a manifest to the top version with `--encrypt`, which worked because versions 5, 7 and 9 were all encryption tiers — three bumps in a row, long enough that the assumption stopped reading as an assumption and got written down as a *hint*: "check that `--encrypt` actually engaged". Version 10 is a redaction tier, so two cells failed naming a cause that was not the cause. The version is proportional to a manifest's contents; there was never a reason the top tier should stay reachable by one flag.
+
+**A gate that could not run is worse than no gate, and the audit's own proposal was one.** Four reconcilers asked for a test asserting every audit finding ID reaches the backlog, reading the reports under `workspace/`. That directory is gitignored — so in CI the test parses zero reports, extracts zero IDs, and passes, while looking identical to a working gate on the machine that ran the audit. The artifact moved instead: finding IDs are now committed, and the gate grades a tracked file against a tracked file. It caught two leaked findings from this very release on its first run.
