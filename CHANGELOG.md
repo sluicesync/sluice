@@ -4,6 +4,14 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Fixed
+
+**The redaction policy fingerprint no longer collides across `static:` values or HMAC keys.** It hashed each rule's elided *audit* rendering — `static:<elided>` whatever the value, `hash:hmac-sha256` whatever the key — so two genuinely different policies produced identical fingerprints and every door comparing them for equality silently accepted a mismatch. Measured: `static:"REDACTED-A"` and `static:"REDACTED-B"` both gave `7e09dd35fd72b1c4`. The consequence is not cosmetic: resuming an interrupted `backup full` under a rotated key left one manifest whose table A chunks were keyed differently from its table B chunks — each internally consistent, and no downstream join on the surrogate works — and `sync start --position-from-manifest` under a different key overwrote each restored surrogate with a different surrogate for the same source value. Strategies now contribute distinguishing material as a **digest**, so the manifest still carries no secret; the previous doc argued the coarse granularity was correct and has been corrected along with the code.
+
+### Compatibility
+
+**Fingerprints computed for `static:` and keyed-hash policies have changed.** Recorded fingerprints are not recomputed — `ComputeBackupID` folds the string the manifest already carries, so every existing chain keeps its backup id and verifies unchanged. What moves is a *fresh* computation, so a resumed `backup full` or a `sync start --position-from-manifest` against a **v0.144.0-written** chain using one of those strategies will refuse even under identical rules. It is a loud refusal naming both postures, never a silent mismatch; re-take such a chain. Chains using `null`, `hash:sha256`, `truncate:`, `mask:*` or `randomize:*` are unaffected.
+
 ## [0.144.0] - 2026-09-06
 
 **Correction (2026-09-06).** The `backup compact` paragraph below describes that door more widely than the code does, in two places, and both are left as published. "Compacting a chain an older binary had mixed" is **not reachable**: an older binary cannot write the redaction marker (the field postdates it) and cannot extend a redacted full either (format version 10 is above its ceiling), so such a chain carries no marker for either door to key on — the compaction door is defense-in-depth against a hand-assembled lineage, not that path. And the refusal runs *after* `CompactChain`'s "fewer than two eligible segments" early return, so it refuses compactions that would **merge** rather than the marker alone; that placement is correct, because the harm needs a merge and moving the door earlier would break the signature heal that same return performs. Nothing shipped is wrong and no upgrade is needed — only the justification was. Found by the v0.144.0 regression cycle.

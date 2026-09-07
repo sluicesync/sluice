@@ -316,3 +316,67 @@ func maskRune(char string) rune {
 	}
 	return 'X'
 }
+
+// FingerprintMaterial lets a strategy contribute DISTINGUISHING material
+// to [Registry.Fingerprint] beyond its [Strategy.Name].
+//
+// WHY IT EXISTS. Name is the elided AUDIT rendering — "static:<elided>",
+// "hash:hmac-sha256" — which is right for a log line and wrong as an
+// identity. Two policies differing only in a static value or an HMAC key
+// rendered identically, so the fingerprint collided and every consumer
+// comparing it for equality silently accepted a mismatched policy
+// (measured, v0.144.0 pre-tag review).
+//
+// THE CONTRACT, and both halves are load-bearing:
+//
+//   - The returned string must be DERIVED, never raw. A strategy hands
+//     over a digest of its material, because this value feeds a hash
+//     that lands in a manifest an operator may ship off-site. Eliding
+//     the secret from Name and then hashing the secret itself would
+//     move the leak rather than close it.
+//   - It must be STABLE across runs and processes. The consumers compare
+//     fingerprints for equality, so per-run variance turns every
+//     legitimate resume into a refusal — strictly worse than the
+//     collision it would be fixing.
+//
+// A strategy carrying no distinguishing material does not implement
+// this. The empty string is treated as "no material" so an unkeyed
+// variant of a keyed strategy stays byte-identical to what it hashed
+// before.
+type FingerprintMaterial interface {
+	FingerprintMaterial() string
+}
+
+// fingerprintDigest renders material as the stable, non-reversible token
+// the fingerprint input carries. Domain-separated by tag so two
+// strategies contributing the same bytes for different reasons cannot
+// alias.
+func fingerprintDigest(tag string, material []byte) string {
+	h := sha256.New()
+	fmt.Fprintf(h, "%d:%s\n", len(tag), tag)
+	h.Write(material)
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// FingerprintMaterial distinguishes two static replacement values.
+// The value is hashed here, so the constant never reaches the manifest
+// even though the fingerprint now depends on it.
+func (s Static) FingerprintMaterial() string {
+	return fingerprintDigest("static.value", []byte(s.Value))
+}
+
+// FingerprintMaterial distinguishes two HMAC keys, and is empty for the
+// keyless algorithms so their fingerprint is unchanged.
+//
+// The KEY is part of the policy's identity for the question the
+// consumers actually ask — not "are the same columns redacted the same
+// way" but "can these two artifacts be read together". Two halves of one
+// archive keyed differently are each internally consistent and cannot be
+// joined, which is precisely the silent divergence the marker exists to
+// refuse.
+func (h Hash) FingerprintMaterial() string {
+	if len(h.Key) == 0 {
+		return ""
+	}
+	return fingerprintDigest("hash.key", h.Key)
+}

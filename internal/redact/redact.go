@@ -217,17 +217,42 @@ func (r *Registry) Empty() bool {
 //
 //   - It carries no secret. [Strategy.Name] elides the static value
 //     ("static:<elided>") and names an HMAC / tokenize strategy
-//     without its key material, so this hash's INPUT is already the
-//     audit-log rendering operators see on stdout.
+//     without its key material, and where a strategy contributes
+//     DISTINGUISHING material via [FingerprintMaterial] it contributes
+//     a digest of that material rather than the material itself.
 //   - It is one-way over the column identities, so a manifest handed
 //     to a third party does not enumerate which columns hold PII.
 //
-// What it deliberately does NOT capture is key MATERIAL: two runs
-// using the same rules under different keyset keys fingerprint alike.
-// That is the right granularity for the consumer — the question a
-// backup chain asks is "were these rows written under the same
-// redaction policy", and a rotated HMAC key still redacts the same
-// columns with the same strategy.
+// IT DOES CAPTURE KEY MATERIAL, and this paragraph used to say the
+// opposite (corrected 2026-09-06, v0.144.0 pre-tag review). The old
+// text argued that two runs under different keyset keys SHOULD
+// fingerprint alike, on the grounds that "a rotated HMAC key still
+// redacts the same columns with the same strategy". That is true, and
+// it is not the question any consumer asks. They ask whether two
+// artifacts can be read TOGETHER:
+//
+//   - a resumed `backup full` under a rotated key leaves ONE manifest
+//     whose table A chunks are keyed differently from its table B
+//     chunks — each internally consistent, and no downstream join on
+//     the surrogate works;
+//   - a `sync start --position-from-manifest` under a different key
+//     overwrites each restored surrogate with a different surrogate
+//     for the same source value.
+//
+// Both were silently accepted while the fingerprint hashed only the
+// elided Name. Measured: static:"REDACTED-A" and static:"REDACTED-B"
+// produced the same 16 hex chars, as did two different HMAC keys.
+//
+// THE VALUE THEREFORE MOVED for `static:` and keyed-hash policies, and
+// the blast radius is worth stating exactly. Recorded fingerprints are
+// NOT recomputed: [irbackup.ComputeBackupID] folds the string the
+// manifest already carries, so every existing chain keeps its id and
+// verifies unchanged. What changes is a fresh computation, so the
+// EQUALITY doors (a resumed `backup full`, `sync start
+// --position-from-manifest`) will refuse a v0.144.0-written chain whose
+// policy used one of those strategies, even under identical rules.
+// That is a loud refusal naming both sides, never a silent mismatch,
+// and it is the safe direction; re-take such a chain.
 //
 // 64 bits is deliberate: the consumer is an equality check between
 // artifacts one operator produced, never an adversarial second-preimage
@@ -243,7 +268,15 @@ func (r *Registry) Fingerprint() string {
 		// name carrying the separator cannot forge a boundary between
 		// two different rule sets (the ADR-0181 lesson, at a much
 		// smaller scale).
-		for _, tok := range []string{rule.Schema, rule.Table, rule.Column, rule.Strategy.Name()} {
+		// The material token is ALWAYS emitted, empty or not: a strategy
+		// that grows material later must not collide with the same
+		// strategy before it had any, and a fixed token count keeps the
+		// length-prefixed encoding injective.
+		var material string
+		if fm, ok := rule.Strategy.(FingerprintMaterial); ok {
+			material = fm.FingerprintMaterial()
+		}
+		for _, tok := range []string{rule.Schema, rule.Table, rule.Column, rule.Strategy.Name(), material} {
 			fmt.Fprintf(h, "%d:%s\n", len(tok), tok)
 		}
 	}
