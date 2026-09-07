@@ -81,7 +81,7 @@ unredacted chain deliberately.
 Two more doors carry the same code, both closed in v0.144.0 after the
 first sweep enumerated the write and read doors and missed them:
 
-- **`backup compact` refuses a chain carrying the marker at all.**
+- **`backup compact` refuses a compaction that would MERGE segments of a chain carrying the marker.**
   Compaction merges a group of segments by byte-copying the *oldest*
   segment's full manifest into the merged segment and folding every later
   link's changes on top, so the manifest is re-attributed to data it did
@@ -90,7 +90,15 @@ first sweep enumerated the write and read doors and missed them:
   the read door above then sees as internally consistent and *passes*.
   Refusing costs nothing, since a redacted chain has no incrementals to
   collapse. `backup prune` is deliberately not a door: it deletes whole
-  segments and never re-attributes a manifest.
+  segments and never re-attributes a manifest. **This one is
+  defense-in-depth**, and worth saying plainly: no sluice binary can
+  currently produce a marker-carrying chain with more than one segment
+  (both extenders refuse, and an older binary can neither write the
+  marker nor read past the format-version stamp), so the input it
+  refuses is a hand-assembled lineage or whatever a future binary
+  produces if it learns to redact incrementals. It also runs *after*
+  compaction's "fewer than two eligible segments" check, so a chain with
+  nothing to merge exits 0 without it firing.
 - **`sync start --position-from-manifest` refuses unless the sync's own
   redaction policy matches the chain's.** The documented workflow is
   `restore --from=<chain>` to seed a target, then resume CDC from the

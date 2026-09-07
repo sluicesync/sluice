@@ -88,6 +88,39 @@ type notesAmendment struct {
 
 var declaredNotesAmendments = []notesAmendment{
 	{
+		amended:     semver{0, 144, 0},
+		fixedIn:     semver{0, 144, 0},
+		claimMarker: "Compact a chain an older binary had already mixed and the result is a segment claiming to be redacted over plaintext chunks",
+		why: "not reachable, and the reason is the release's own other half. An older binary cannot " +
+			"write the redaction marker (the field does not exist before v0.144.0) and cannot extend a " +
+			"redacted full either, because that manifest is stamped FormatVersion 10 and a v0.143.0 " +
+			"reader refuses anything above 9. So a chain an older binary mixed carries NO marker on any " +
+			"link, and neither the compaction door nor the mixed-chain read door keys on anything it " +
+			"has. The compact door is real and correct, but it is DEFENSE-IN-DEPTH against a " +
+			"hand-assembled lineage or a future binary that learns to redact incrementals -- not the " +
+			"older-binary path the sentence describes. fixedIn is the amended version itself because " +
+			"the shipped code is right and unchanged; only the justification was wrong. Two method " +
+			"errors worth keeping: the scenario was reasoned forward from the defect shape rather than " +
+			"checked against what a v0.143.0 binary can actually PRODUCE, and it was written in the same " +
+			"pass that added the format-version bump specifically to stop older binaries touching these " +
+			"manifests -- the two claims contradict each other and were authored minutes apart. Found " +
+			"by the v0.144.0 regression cycle, which could not construct a marker-carrying multi-segment " +
+			"chain with the shipped binary and had to splice one by hand to prove the door fires",
+	},
+	{
+		amended:     semver{0, 144, 0},
+		fixedIn:     semver{0, 144, 0},
+		claimMarker: "It now refuses a chain carrying the marker at all",
+		why: "wider than the code, in the safe direction. refuseCompactRedactedChain runs AFTER the " +
+			"`len(eligible) < 2` early return in CompactChain, so `backup compact` on a marker-carrying " +
+			"chain with nothing to merge returns 0 without the refusal firing. That placement is " +
+			"correct -- the laundering harm needs a MERGE to re-attribute a manifest, and moving the " +
+			"door earlier would break the signature verify-and-heal that same early return performs on " +
+			"a signed chain -- but 'at all' describes a door that refuses on the marker alone, and this " +
+			"one refuses compactions that would merge. Found by the v0.144.0 regression cycle, whose " +
+			"first pass read the rc=0 no-op as an open laundering path and nearly filed it",
+	},
+	{
 		amended:     semver{0, 142, 0},
 		fixedIn:     semver{0, 142, 0},
 		claimMarker: "`backup restore` and `cutover` evaluate the same patterns and do **not** report unmatched ones",

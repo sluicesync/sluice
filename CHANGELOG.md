@@ -6,6 +6,8 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [0.144.0] - 2026-09-06
 
+**Correction (2026-09-06).** The `backup compact` paragraph below describes that door more widely than the code does, in two places, and both are left as published. "Compacting a chain an older binary had mixed" is **not reachable**: an older binary cannot write the redaction marker (the field postdates it) and cannot extend a redacted full either (format version 10 is above its ceiling), so such a chain carries no marker for either door to key on — the compaction door is defense-in-depth against a hand-assembled lineage, not that path. And the refusal runs *after* `CompactChain`'s "fewer than two eligible segments" early return, so it refuses compactions that would **merge** rather than the marker alone; that placement is correct, because the harm needs a merge and moving the door earlier would break the signature heal that same return performs. Nothing shipped is wrong and no upgrade is needed — only the justification was. Found by the v0.144.0 regression cycle.
+
 `backup full --redact` produced a PII-clean archive and every incremental taken on top of it restored plaintext. If you have ever run `backup full --redact` and extended that chain, treat the restored data as holding plaintext PII for every row the change window touched, and re-take the chain — pre-v0.144.0 chains carry no marker and the mix cannot be detected retroactively.
 
 ### Fixed

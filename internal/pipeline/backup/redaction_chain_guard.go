@@ -131,14 +131,25 @@ func redactionMarkersAgree(a, b *irbackup.RedactionInfo) bool {
 // restore, chain restore, `backup verify` and `export-as-parquet`
 // alike.
 //
-// The write doors above make this shape unreachable for a chain a
-// current release produced. It is reachable for one an OLDER binary
-// extended — that binary ignores the unknown marker, which is exactly
-// why a redacted manifest is stamped [irbackup.FormatVersionRedaction]
-// so it refuses the manifest outright — and for a lineage assembled by
-// hand out of directories from two different backups. Neither is exotic
-// enough to leave to the writer's good behaviour when the failure mode
-// is plaintext PII landing on a restore target at exit 0.
+// WHAT CAN ACTUALLY REACH IT, stated precisely because the first cut of
+// this comment got it wrong in the release notes (corrected 2026-09-06).
+// The write doors make this shape unreachable for a chain a current
+// release produced. It is NOT reachable for one an older binary
+// extended either, and that is worth being explicit about because the
+// intuition points the other way: an older binary would indeed ignore a
+// member it does not know, but it never gets the chance, because a
+// redacted manifest is stamped [irbackup.FormatVersionRedaction] and a
+// pre-v0.144.0 reader refuses anything above its own ceiling. It also
+// cannot have WRITTEN a marker — the field postdates it — so a chain it
+// mixed carries no marker on any link and this predicate sees links
+// that agree.
+//
+// What remains is a lineage assembled BY HAND out of directories from
+// two different backups, and whatever a future binary produces if it
+// ever learns to redact incrementals. So this is defense-in-depth
+// rather than a door with live traffic. It stays because the failure
+// mode it covers is plaintext PII landing on a restore target at exit 0,
+// and because the cost is a nil check.
 //
 // The check is DISAGREEMENT, not "any link unredacted": a chain of
 // consistently-unredacted links is the ordinary case and must pass, and
@@ -210,12 +221,23 @@ func redactionSummaryForLog(r *irbackup.RedactionInfo) string {
 // WHY IT REFUSES THE WHOLE CLASS rather than just the mixed case. The
 // write doors make "redacted full + unredacted incremental" unreachable
 // for a chain a current release produced, so the mixed input arrives
-// only from an OLDER binary or a hand-assembled lineage — precisely the
-// inputs whose posture sluice cannot reconstruct. And the compactable
+// only from a hand-assembled lineage — an input whose posture sluice
+// cannot reconstruct. (Not from an older binary: see the reachability
+// paragraph on [refuseMixedRedactionChain]. The release notes claimed
+// otherwise and were corrected 2026-09-06.) And the compactable
 // remainder is empty anyway: a redacted chain a current release wrote
 // is a series of FULLS (incrementals are refused), and there are no
 // incrementals in it to collapse. So refusing costs nothing real and
 // removes the need to reason about which merge groups are safe.
+//
+// WHERE IT SITS, and why that is not "refuses the marker at all".
+// CompactChain calls this AFTER its fewer-than-two-eligible-segments
+// early return, so a marker-carrying chain with nothing to merge exits
+// 0 without reaching here. That is deliberate: the laundering harm
+// needs a MERGE to re-attribute a manifest, and that early return is
+// also where a signed chain gets its signatures verified-and-healed —
+// the most likely post-crash re-run shape — so refusing ahead of it
+// would break a documented recovery for no safety gain.
 //
 // SCOPE, stated where the gate is defined: this reaches `backup
 // compact` only. `backup prune` is exempt with a reason — it deletes
