@@ -1101,6 +1101,11 @@ func renderSetupDDL(schema string, tables []tableTriggerSpec, canEventTrigger, l
 		captureFns[CaptureFunctionTruncate],
 	)
 
+	// Audit 2026-09-06 S-2 layer 2: take the capture functions off
+	// PUBLIC. See [renderCaptureFunctionACL] for what this does and does
+	// not affect — both halves measured on PG 16 before it was written.
+	out = append(out, renderCaptureFunctionACL(schema, captureFns)...)
+
 	for _, t := range tables {
 		// Drop any pre-existing trigger with the canonical name so
 		// re-running Setup with a different PK list refreshes the
@@ -2338,4 +2343,78 @@ func hasCaptureEventTriggers(ctx context.Context, db *sql.DB, schema string) (bo
 		return false, fmt.Errorf("probe existing capture event triggers: %w", err)
 	}
 	return n > 0, nil
+}
+
+// renderCaptureFunctionACL takes sluice's capture functions off PUBLIC
+// and grants them back to the role running setup (audit 2026-09-06 S-2
+// layer 2).
+//
+// WHY. Every capture function is SECURITY DEFINER and PostgreSQL grants
+// EXECUTE on a new function to PUBLIC by default. A low-privilege source
+// role — an app service account, a tenant on a shared instance, a
+// contractor — could therefore CREATE TABLE mine.orders, attach sluice's
+// capture function to it, and have every row it wrote applied to the
+// TARGET's real orders table. That is a cross-privilege write primitive
+// sluice manufactures rather than inherits.
+//
+// The reader-side scope check ([CDCReader.rowInCaptureScope]) already
+// drops such rows, and this is the second, independent layer: it stops
+// them being WRITTEN. Defence in depth on purpose — the reader check
+// protects a stream that is running, this protects the change log
+// itself.
+//
+// WHAT IT AFFECTS, measured on PG 16 rather than reasoned:
+//
+//   - An EXISTING capture trigger keeps firing for a role with no
+//     EXECUTE. PostgreSQL checks EXECUTE at CREATE TRIGGER time, not at
+//     fire time — verified over a real unprivileged connection, which
+//     inserted successfully and produced a capture row
+//     (definer=owner, invoker=the unprivileged role). So this does not
+//     disturb capture on any table already set up.
+//   - That same role can no longer CREATE a trigger on the function:
+//     `ERROR: permission denied for function ...`. That is the attack.
+//
+// WHAT IT DOES NOT AFFECT: anything but these four functions. It changes
+// no default privileges, no other object, and no other role's access to
+// anything else. Nothing outside sluice has cause to call them.
+//
+// THE GRANT IS NOT OPTIONAL. Setup re-runs and `sluice schema add-table`
+// both CREATE triggers on these functions, and CREATE TRIGGER requires
+// EXECUTE — so revoking without granting back would make sluice unable
+// to extend its own install. current_user is the role that just created
+// the functions, and is therefore guaranteed to be able to grant on
+// them.
+//
+// Emitted inside setup's transaction with everything else, so a failure
+// rolls the whole install back rather than leaving the functions half
+// re-permissioned.
+func renderCaptureFunctionACL(schema string, captureFns map[string]string) []string {
+	// Derived from the captureFns map rather than a hand-listed set, so
+	// a future capture function is covered by construction: the
+	// polled-fingerprint plan renders two, the event-trigger plan four,
+	// and this follows whichever was rendered.
+	refs := map[string]string{
+		CaptureFunctionRow:      rowFunctionRef(schema),
+		CaptureFunctionTruncate: truncateFnRef(schema),
+		CaptureFunctionDDL:      ddlFnRef(schema),
+		CaptureFunctionDrop:     dropFnRef(schema),
+	}
+	names := make([]string, 0, len(captureFns))
+	for name := range captureFns {
+		names = append(names, name)
+	}
+	sort.Strings(names) // deterministic plan; the setup plan is compared byte-for-byte in tests
+	out := make([]string, 0, len(names)*2)
+	for _, name := range names {
+		ref, ok := refs[name]
+		if !ok {
+			continue
+		}
+		out = append(
+			out,
+			"REVOKE EXECUTE ON FUNCTION "+ref+"() FROM PUBLIC",
+			"GRANT EXECUTE ON FUNCTION "+ref+"() TO CURRENT_USER",
+		)
+	}
+	return out
 }
