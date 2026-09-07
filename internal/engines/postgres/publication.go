@@ -958,12 +958,36 @@ func publicationPostSlotConflictRefusal(name string, diff []string) error {
 //   - missing → CREATE PUBLICATION … FOR ALL TABLES.
 //   - exists and already FOR ALL TABLES → no-op (idempotent).
 //   - exists but SCOPED (a leftover FOR TABLE publication from a prior
-//     single-schema run) → DROP + recreate FOR ALL TABLES. ALTER cannot
-//     promote a FOR TABLE publication to FOR ALL TABLES, so a drop is
-//     required; it is safe because the publication is metadata only —
-//     slots reference WAL by LSN, not by a publication-name binding, and
-//     this opener creates a fresh slot in the same call.
-func ensureAllTablesPublication(ctx context.Context, db *sql.DB, name string) error {
+//     single-schema run) → DROP + recreate FOR ALL TABLES, GUARDED. ALTER
+//     cannot promote a FOR TABLE publication to FOR ALL TABLES, so a drop
+//     is required.
+//
+// THE DROP USED TO BE UNGUARDED, on a safety claim this same file
+// refutes (audit 2026-09-06 H2, fixed 2026-09-06). The claim was that
+// dropping is "safe because the publication is metadata only — slots
+// reference WAL by LSN, not by a publication-name binding, and this
+// opener creates a fresh slot in the same call". The first half is
+// wrong about a SIBLING stream's slot, and [ensurePublication]'s own
+// comment 800 lines up records both measured outcomes: with a write in
+// the drop→recreate window the sibling's resume dies NON-ZERO asserting
+// `publication "sluice_pub" does not exist` and costs a slot drop plus a
+// full re-snapshot (Bug 267); with no write it SUCCEEDS and silently
+// widens the sibling to FOR ALL TABLES, at which point every keyless
+// table in that database starts refusing UPDATE (Bug 270). The second
+// half is true and irrelevant: this opener's own fresh slot says nothing
+// about the peer's.
+//
+// THE DOOR FACED ONE WAY. Narrowing (FOR ALL TABLES → scoped) has run
+// [guardPublicationNarrowing] before its DROP since ADR-0175, because
+// removing tables from a peer's scope is silent loss. Widening was
+// treated as harmless because it only ADDS tables — which is true of the
+// member set and false of the operation, since the DROP is what the peer
+// experiences either way. Both directions now consult the same
+// [otherSluiceSlots] probe and raise the same coded refusal.
+//
+// excludeSlot is this caller's own slot, so a lone stream re-running its
+// own opener is never refused by itself.
+func ensureAllTablesPublication(ctx context.Context, db *sql.DB, name, excludeSlot string) error {
 	var exists, allTables bool
 	const checkQuery = "SELECT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = $1), " +
 		"COALESCE((SELECT puballtables FROM pg_publication WHERE pubname = $1), false)"
@@ -974,6 +998,12 @@ func ensureAllTablesPublication(ctx context.Context, db *sql.DB, name string) er
 		return nil
 	}
 	if exists {
+		// The widening half of the ADR-0175 guard. Only the DROP path
+		// needs it: a missing publication has no peer to disturb, and an
+		// already-FOR-ALL-TABLES one returned above without mutating.
+		if err := guardPublicationWidening(ctx, db, name, excludeSlot); err != nil {
+			return err
+		}
 		dropQuery := fmt.Sprintf(`DROP PUBLICATION %s`, quoteIdent(name))
 		if _, err := db.ExecContext(ctx, dropQuery); err != nil {
 			return classifyPublicationPermission(ctx, db, name, fmt.Errorf("postgres: drop scoped publication %q for multi-schema FOR ALL TABLES: %w", name, err))
@@ -1179,4 +1209,44 @@ func dropOwnPublicationIfPerStream(ctx context.Context, db *sql.DB, name string)
 		return classifyPublicationPermission(ctx, db, name, fmt.Errorf("postgres: drop per-stream publication %q: %w", name, err))
 	}
 	return nil
+}
+
+// guardPublicationWidening is [guardPublicationNarrowing]'s missing
+// twin: it refuses to DROP a scoped publication on the way to FOR ALL
+// TABLES while another sluice slot is reading through it.
+//
+// WHY WIDENING NEEDS A GUARD AT ALL, since it only adds tables. The harm
+// is not the resulting member set, it is the DROP, and the peer
+// experiences that identically in both directions. Measured, and
+// recorded at [ensurePublication]'s create arm rather than inferred:
+//
+//   - a write lands in the drop→recreate window: the peer's resume dies
+//     NON-ZERO with `publication ... does not exist` (Bug 267), costing
+//     a slot drop and a full re-snapshot;
+//   - no write lands: the peer resumes fine and is now silently
+//     database-wide, so every keyless table it can see begins refusing
+//     UPDATE/DELETE (Bug 270) — the quiet branch, and the dangerous one.
+//
+// It deliberately does NOT probe what the peer's scope was. Narrowing
+// has to, because which tables leave scope decides whether anything is
+// lost; here the answer is the same whatever the peer covered.
+//
+// The refusal is [publicationScopeConflictRefusal], shared verbatim with
+// narrowing so both directions speak with one voice and one code.
+func guardPublicationWidening(ctx context.Context, db *sql.DB, name, excludeSlot string) error {
+	slots, err := otherSluiceSlots(ctx, db, excludeSlot)
+	if err != nil {
+		return err
+	}
+	if len(slots) == 0 {
+		// The overwhelmingly common shape: one operator, one stream,
+		// re-running its own opener. No peer holds a claim.
+		return nil
+	}
+	return publicationScopeConflictRefusal(name, []string{
+		"DROP and recreate it FOR ALL TABLES, which either wedges those stream(s) at their next " +
+			"resume (`publication \"" + name + "\" does not exist`, recoverable only by dropping the " +
+			"slot and re-snapshotting) or silently WIDENS them to every table in the database — after " +
+			"which a table without a replica identity refuses UPDATE/DELETE",
+	}, slots)
 }

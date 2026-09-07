@@ -44,7 +44,7 @@ func (e Engine) ensureChainSlotPublication(ctx context.Context, db *sql.DB, sche
 	// anything else. Adding that refusal is a behaviour change on a shipped
 	// path and is deliberately not made here; warning is purely additive.
 	warnPublicationExposure(ctx, db, exposureSiteBackupChainSlot, nil)
-	if err := ensureAllTablesPublication(ctx, db, e.publicationName()); err != nil {
+	if err := ensureAllTablesPublication(ctx, db, e.publicationName(), e.ownSlot); err != nil {
 		return classifyStandbyReadOnly(fmt.Errorf("postgres: backup snapshot: --chain-slot: ensure publication: %w", err))
 	}
 	return nil
