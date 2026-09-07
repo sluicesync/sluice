@@ -310,7 +310,7 @@ func (b *Backup) stageBackupTables(
 	for _, table := range schema.Tables {
 		key := manifestTableKey(table.Schema, table.Name)
 		if existing, ok := priorTables[key]; ok {
-			full, err := tableManifestFullyComplete(ctx, b.Store, existing)
+			full, err := tableManifestFullyComplete(ctx, b.Store, existing, b.signingRequested())
 			if err != nil {
 				return nil, fmt.Errorf("backup: re-validate prior table %q: %w", table.Name, err)
 			}

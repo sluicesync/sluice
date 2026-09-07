@@ -385,3 +385,89 @@ func TestGradeCaptureShape_GradesTheTriggerWiring(t *testing.T) {
 		}
 	})
 }
+
+// TestGradeCaptureShape_GradesThePKArgumentValue closes the residual S-2
+// layer 3 left open: the door checked that the ROW trigger HAD an
+// argument and never what it said.
+//
+// WHY IT NEEDED NO SCHEMA BUMP. The layer-3 note said closing this
+// wanted a triggerdef digest stamped into the install meta at setup — a
+// version bump and a new column. It does not. The table's own PRIMARY
+// KEY is independent evidence of what that argument should say, sitting
+// in a catalog the door already reads, and it is strictly better than a
+// recorded expectation: it also catches the case where the PK CHANGED
+// after setup, which a recorded digest would have called healthy.
+//
+// The harm either way is that the capture function keys every
+// change-log row for the table from that argument, so the applier
+// matches the wrong target row.
+func TestGradeCaptureShape_GradesThePKArgumentValue(t *testing.T) {
+	withPK := func(args, livePK string) []installedCaptureTrigger {
+		trigs := healthyTriggers("t")
+		trigs[0].args = args
+		trigs[0].livePK = livePK
+		return trigs
+	}
+
+	t.Run("an argument naming the wrong column refuses", func(t *testing.T) {
+		err := gradeCaptureShape("public", withPK(`["tenant_id"]`, `["id"]`), healthyTiers(), false)
+		if err == nil {
+			t.Fatal("a capture trigger keyed on a column that is not the table's primary key was " +
+				"accepted; every captured change for that table carries the wrong key and the applier " +
+				"matches the wrong target row")
+		}
+		for _, want := range []string{"tenant_id", "id", "primary key"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("refusal missing %q; got: %v", want, err)
+			}
+		}
+	})
+
+	t.Run("a PK changed after setup refuses too", func(t *testing.T) {
+		// The shape a recorded digest could NOT have caught: the trigger
+		// is exactly as setup installed it, and the TABLE moved.
+		if err := gradeCaptureShape("public", withPK(`["id"]`, `["id","tenant_id"]`), healthyTiers(), false); err == nil {
+			t.Fatal("a table whose PRIMARY KEY gained a column since setup was accepted; the trigger " +
+				"still keys on the old list, so captured rows are keyed by a stale key")
+		}
+	})
+
+	t.Run("the matching case passes, including a trailing NUL", func(t *testing.T) {
+		// pg_trigger.tgargs is null-separated, so a single argument
+		// arrives with a trailing NUL. Without the trim this cell fails
+		// on every healthy install.
+		if err := gradeCaptureShape("public", withPK("[\"id\"]\x00", `["id"]`), healthyTiers(), false); err != nil {
+			t.Fatalf("a correctly-installed trigger was refused: %v", err)
+		}
+	})
+
+	t.Run("a composite key in a different ORDER passes", func(t *testing.T) {
+		// The floor that keeps this from refusing correct installs. The
+		// capture function builds pk_jsonb with jsonb_object_agg, which
+		// is order-independent, so column order carries no meaning — and
+		// json_agg over the index may well emit a different order than
+		// the Go slice setup marshalled.
+		if err := gradeCaptureShape("public", withPK(`["a","b"]`, `["b","a"]`), healthyTiers(), false); err != nil {
+			t.Fatalf("a composite key listed in a different order was refused, but the capture function "+
+				"aggregates by name and does not care about order: %v", err)
+		}
+	})
+
+	t.Run("an unparseable argument grades nothing", func(t *testing.T) {
+		// An argument this cannot read is a DIFFERENT finding from a
+		// wrong one; reporting it as "wrong columns" would be a
+		// confident error. The zero-arg case is caught by its own check.
+		if err := gradeCaptureShape("public", withPK("not-json", `["id"]`), healthyTiers(), false); err != nil {
+			t.Errorf("an unparseable argument was reported as a wrong key: %v", err)
+		}
+	})
+
+	t.Run("a keyless table grades nothing", func(t *testing.T) {
+		// live_pk is '[]' for a table with no primary key. Refusing here
+		// would break every keyless-table install, which pgtrigger
+		// supports.
+		if err := gradeCaptureShape("public", withPK(`[]`, `[]`), healthyTiers(), false); err != nil {
+			t.Errorf("a keyless table was refused: %v", err)
+		}
+	})
+}

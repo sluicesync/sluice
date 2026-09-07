@@ -6,6 +6,7 @@ package pgtrigger
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -139,8 +140,27 @@ type installedCaptureTrigger struct {
 	// reinstall by something that did not know that, and the captured PK
 	// would be wrong for every row.
 	//
-	// The VALUE is not graded here; see gradeCaptureShape's residual note.
+	// The VALUE is graded too, since 2026-09-07 — see [args] and [livePK].
 	nargs int16
+
+	// args is the ROW trigger's argument, decoded from pg_trigger.tgargs
+	// (null-separated, so a single argument arrives with a trailing NUL).
+	// Setup passes the table's primary-key column list as JSON.
+	args string
+
+	// livePK is the table's ACTUAL primary-key column list, read from
+	// pg_index in the same query, as a JSON array.
+	//
+	// This is what makes grading the argument's VALUE possible without a
+	// recorded expectation. The S-2 layer-3 note said closing this needed
+	// a triggerdef digest stamped into the install meta at setup — a
+	// schema-version bump and a new column. It does not: the table's own
+	// primary key is INDEPENDENT evidence of what the argument should
+	// say, available in the catalog the door already reads, and it is
+	// strictly better than a recorded expectation because it also catches
+	// the case where the PK CHANGED after setup (captured rows would then
+	// be keyed by a stale column list, silently).
+	livePK string
 }
 
 // eventTriggerState is the pg_event_trigger row for one capture event
@@ -246,7 +266,13 @@ func captureShapeProbeError(ctx, pctx context.Context, what string, err error) e
 func loadInstalledCaptureTriggers(ctx context.Context, db *sql.DB, schema string) ([]installedCaptureTrigger, error) {
 	const q = `
 SELECT c.relname, t.tgname, t.tgenabled::text, p.proname, pn.nspname, p.oid, t.tgtype,
-       pg_catalog.pg_get_expr(t.tgqual, t.tgrelid) AS when_clause, t.tgnargs
+       pg_catalog.pg_get_expr(t.tgqual, t.tgrelid) AS when_clause, t.tgnargs,
+       pg_catalog.encode(t.tgargs, 'escape') AS trig_args,
+       COALESCE((SELECT pg_catalog.json_agg(a.attname ORDER BY k.ord)::text
+                   FROM pg_index i
+                   JOIN pg_catalog.unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) ON TRUE
+                   JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+                  WHERE i.indrelid = t.tgrelid AND i.indisprimary), '[]') AS live_pk
   FROM pg_trigger   t
   JOIN pg_class     c  ON c.oid  = t.tgrelid
   JOIN pg_namespace n  ON n.oid  = c.relnamespace
@@ -264,7 +290,7 @@ SELECT c.relname, t.tgname, t.tgenabled::text, p.proname, pn.nspname, p.oid, t.t
 	var out []installedCaptureTrigger
 	for rows.Next() {
 		var it installedCaptureTrigger
-		if err := rows.Scan(&it.table, &it.name, &it.enabled, &it.fn, &it.fnSchema, &it.fnOID, &it.tgtype, &it.whenClause, &it.nargs); err != nil {
+		if err := rows.Scan(&it.table, &it.name, &it.enabled, &it.fn, &it.fnSchema, &it.fnOID, &it.tgtype, &it.whenClause, &it.nargs, &it.args, &it.livePK); err != nil {
 			return nil, err
 		}
 		out = append(out, it)
@@ -637,5 +663,71 @@ func gradeTriggerWiring(tbl, trigName string, got installedCaptureTrigger, allTa
 			tbl, trigName, allTables,
 		)
 	}
+	// The argument's VALUE, graded against the table's LIVE primary key
+	// (2026-09-07, closing the residual S-2 layer 3 left open). Two shapes
+	// reach here and both mis-key every captured row for the table:
+	// someone edited the argument, or the table's PK CHANGED after setup
+	// and the trigger still carries the old list.
+	//
+	// Compared as SETS, not as text: pkColsJSON marshals a Go slice while
+	// live_pk is json_agg over index order, so the two renderings differ
+	// in whitespace and can differ in column order for a composite key
+	// without either being wrong.
+	if trigName == CaptureTriggerRow && got.args != "" && got.livePK != "" {
+		gotCols, gotOK := parsePKColumnList(got.args)
+		wantCols, wantOK := parsePKColumnList(got.livePK)
+		if gotOK && wantOK && !samePKColumnSet(gotCols, wantCols) {
+			return fmt.Errorf(
+				"pgtrigger: table %q capture trigger %q carries primary-key columns %v, but the table's "+
+					"primary key is %v — the capture function keys every change-log row from that "+
+					"argument, so every captured change for this table is keyed by the wrong columns and "+
+					"the applier would match the wrong target row. Either the trigger argument was edited "+
+					"or the table's PRIMARY KEY changed after setup ran; re-run "+
+					"`sluice trigger setup --dsn=... --tables=%s` to reinstall",
+				tbl, trigName, gotCols, wantCols, allTables,
+			)
+		}
+	}
 	return nil
+}
+
+// parsePKColumnList decodes a JSON array of column names as setup renders
+// it into TG_ARGV[0], tolerating the trailing NUL that pg_trigger.tgargs
+// carries on a single argument. ok is false for anything it cannot read,
+// and the caller then grades nothing — an unparseable argument is a
+// DIFFERENT finding from a wrong one, and reporting it as "wrong columns"
+// would be a confident error.
+func parsePKColumnList(s string) (cols []string, ok bool) {
+	trimmed := strings.TrimRight(s, "\x00")
+	if trimmed == "" {
+		return nil, false
+	}
+	if err := json.Unmarshal([]byte(trimmed), &cols); err != nil {
+		return nil, false
+	}
+	return cols, true
+}
+
+// samePKColumnSet compares two primary-key column lists as sets.
+//
+// ORDER IS DELIBERATELY NOT GRADED. The capture function builds
+// pk_jsonb with jsonb_object_agg over TG_ARGV[0], which is
+// order-independent, so a composite key listed in a different order
+// produces the same captured image. Grading order would refuse a
+// correct install whose json_agg happened to walk the index differently.
+func samePKColumnSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	seen := make(map[string]int, len(a))
+	for _, c := range a {
+		seen[c]++
+	}
+	for _, c := range b {
+		seen[c]--
+		if seen[c] < 0 {
+			return false
+		}
+	}
+	return true
 }

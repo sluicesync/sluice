@@ -925,7 +925,7 @@ func (b *Backup) logResumePlan(ctx context.Context, schema *ir.Schema, prior *ir
 			toResume = append(toResume, table.Name)
 			continue
 		}
-		full, err := tableManifestFullyComplete(ctx, b.Store, existing)
+		full, err := tableManifestFullyComplete(ctx, b.Store, existing, b.signingRequested())
 		if err != nil {
 			return fmt.Errorf("backup: re-validate prior table %q: %w", table.Name, err)
 		}
@@ -1763,11 +1763,52 @@ func tableChunksAllPresent(ctx context.Context, store irbackup.Store, entry *irb
 // boundaries, so the default is correct); (2) every chunk listed is
 // still present on the store (an operator who manually deleted chunks
 // between runs forces a re-stream).
-func tableManifestFullyComplete(ctx context.Context, store irbackup.Store, entry *irbackup.TableManifest) (bool, error) {
+func tableManifestFullyComplete(ctx context.Context, store irbackup.Store, entry *irbackup.TableManifest, verifyHashes bool) (bool, error) {
 	if entry.Partial {
 		return false, nil
 	}
-	return tableChunksAllPresent(ctx, store, entry)
+	if !verifyHashes {
+		return tableChunksAllPresent(ctx, store, entry)
+	}
+	return tableChunksAllMatch(ctx, store, entry)
+}
+
+// tableChunksAllMatch is tableChunksAllPresent with the SHA actually
+// checked — the adoption-path half of the audit 2026-09-06 S-1 sibling.
+//
+// THE GAP IT CLOSES. A resumed backup full adopts a prior IN-PROGRESS
+// manifest`s completed tables verbatim, and an in-progress manifest is
+// UNSIGNED by construction (refuseSigningInProgressManifest). So a store
+// adversary who edits it during the interrupted window — drops a chunk
+// entry and its file, lowers a row count — had the edit adopted and then
+// SIGNED by the resuming run. Same class as the prune/compact laundering
+// door, narrower window: it needs an interrupted backup rather than a
+// scheduled job.
+//
+// Existence was never the right question. The write side has verified
+// the SHA since it existed (chunkAlreadyMatches, which overwrites a
+// mismatched partial upload); the adoption side asked only whether the
+// file was there, so a chunk whose BYTES had been replaced was adopted
+// as complete.
+//
+// ONLY WHEN THE RUN WILL SIGN, which is the whole cost argument. The
+// harm is "the edit is adopted AND signed", so an unsigned chain has no
+// signature to launder and pays nothing. A signing run re-hashes every
+// adopted chunk, which on a large interrupted backup is real I/O — and
+// it is the run whose operator has already asked for an integrity
+// guarantee. Stated here rather than hidden, because a future change
+// that makes signing the default inherits this cost.
+func tableChunksAllMatch(ctx context.Context, store irbackup.Store, entry *irbackup.TableManifest) (bool, error) {
+	for _, c := range entry.Chunks {
+		ok, err := chunkAlreadyMatches(ctx, store, c.File, c.SHA256)
+		if err != nil {
+			return false, fmt.Errorf("verify adopted chunk %q: %w", c.File, err)
+		}
+		if !ok {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // chunkAlreadyMatches reports whether key already exists in store and
