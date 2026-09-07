@@ -401,10 +401,7 @@ func PruneChain(ctx context.Context, store irbackup.Store, opts PruneOpts) (*Pru
 	}
 
 	if opts.DryRun {
-		// Enumerate (without deleting) what a real run would drop. Neither
-		// helper touches storage under DryRun, so neither can fail here.
-		_ = pruneWholeSegments(ctx, store, &origCat, floorSeg, true, res)
-		_ = pruneFloorLeadingIncrementals(ctx, floor, floorStore, keepFromInSeg, true, res)
+		enumerateDryRunPrune(ctx, store, &origCat, floorSeg, floor, floorStore, keepFromInSeg, res)
 		return res, nil
 	}
 	// The readability gate's FIRST leg (Bug 214 / item 95), against the
@@ -420,6 +417,12 @@ func PruneChain(ctx context.Context, store irbackup.Store, opts PruneOpts) (*Pru
 	// structural break the prune did not cause. Those keep the generic
 	// decoration, whose recovery is a `cp` of a surviving header rather
 	// than a retention change.
+	// S-1, below the no-op doors on purpose: a stale-signature chain is
+	// what the crash-recovery heal repairs, so refusing at the top of
+	// PruneChain would make that heal unreachable. [verifyBeforeRestructure]
+	if err := verifyBeforeRestructure(ctx, store, prunerOp, signed, opts.DryRun, verifyMaterial{env: opts.Envelope, verifyPub: opts.Signer.VerifyPublicKey()}); err != nil {
+		return nil, err
+	}
 	if err := verifyChainReadable(ctx, store, cat, opts.Envelope, prunerOp, "pre-commit"); err != nil {
 		return nil, errPreSweepReadability(prunerOp, err)
 	}
@@ -972,4 +975,28 @@ func oldestRetainedBackupResumePosition(ctx context.Context, store irbackup.Stor
 		return ir.Position{}, false, nil
 	}
 	return im.StartPosition, true, nil
+}
+
+// enumerateDryRunPrune fills res with what a real prune would drop,
+// without deleting anything. Neither helper touches storage under
+// DryRun, so neither can fail — which is why both errors are discarded
+// here and nowhere else.
+//
+// Extracted from PruneChain when the S-1 signature door pushed it over
+// the funlen ceiling. Deliberately THIS block: it is the one phase in
+// that function that reaches no door, so moving it cannot take a guard
+// out of the roster's sight (TestResignSitesVerifyFirst requires the
+// verify and the re-sign to share a body).
+func enumerateDryRunPrune(
+	ctx context.Context,
+	store irbackup.Store,
+	origCat *lineage.Catalog,
+	floorSeg int,
+	floor *lineage.Segment,
+	floorStore irbackup.Store,
+	keepFromInSeg int,
+	res *PruneResult,
+) {
+	_ = pruneWholeSegments(ctx, store, origCat, floorSeg, true, res)
+	_ = pruneFloorLeadingIncrementals(ctx, floor, floorStore, keepFromInSeg, true, res)
 }

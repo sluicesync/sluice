@@ -415,6 +415,101 @@ func refuseUnsignableMaintenance(op string, signed, dryRun bool, signer *lineage
 	return nil
 }
 
+// verifyBeforeRestructure refuses a signed chain whose EXISTING
+// signatures do not verify, before `backup prune` / `backup compact`
+// restructure it and re-sign the result.
+//
+// THE LAUNDERING DOOR (audit 2026-09-06 S-1). ADR-0154 signs manifests
+// and lineage.json so a store-level adversary cannot rewrite a chain,
+// and its line 47 says the signature is "verified at
+// restore/verify/prune/compact time". The prune/compact half was not
+// implemented: both ran [refuseUnsignableMaintenance] — refuse if
+// signed and no signer — and then [resignIfSigned] over whatever was on
+// the store, verifying nothing.
+//
+// So an attacker who can write the store (the exact adversary
+// ADR-0152/0154 name: bucket compromise, rogue storage admin, leaked
+// object-store credential) edits a surviving manifest — drops a chunk
+// from a table's list, flips RLS off, weakens a CHECK — and waits. Each
+// of those fails verification at restore. Then the operator's scheduled
+// prune runs WITH the chain's key material, as it must, and
+// ResignLineage mints fresh valid signatures over the attacker's
+// content. The next restore logs "all manifest + lineage signatures
+// verified".
+//
+// Nothing downstream catches it: verifySchemaHashes and verifyBackupIDs
+// recompute KEYLESS hashes an adversary restates, and a chunk's GCM AAD
+// binds it to manifest identity and its own path — not to the chunk
+// LIST or the schema.
+//
+// WHY IT SURVIVED. The 2026-08-26 SEC-1 / 2026-08-27 A3 work hardened
+// [healStaleLineageSignatures] with a recorded-KeyID wrong-key guard, a
+// preserved pre-heal `.sig` and a durable heal record, and its own doc
+// says "re-sign is also exactly what laundering a tampered catalog
+// looks like". That reasoning reached the crash-recovery NO-OP door and
+// not the restructure door every real prune/compact takes — the fast
+// path got the guard and its existence implied the slow one was covered.
+//
+// VERIFIED WITH THE SIGNER THAT WOULD RE-SIGN, which is the property
+// worth having: the signatures this run is about to replace must
+// currently verify under the very key it is about to sign with. A
+// wrong-key run therefore refuses here rather than silently re-keying
+// the chain.
+//
+// A MISSING signature is a refusal too, not just an invalid one — on a
+// signed chain that is the dropped-link shape, and re-signing it would
+// mint a valid signature over the survivor set.
+//
+// Callers place this AFTER their no-op and dry-run doors, deliberately:
+// a chain whose signatures are stale is exactly what the crash-recovery
+// heal repairs, and a strict verify at the top of either command would
+// make that heal unreachable.
+func verifyBeforeRestructure(
+	ctx context.Context,
+	store irbackup.Store,
+	op string,
+	signed, dryRun bool,
+	mat verifyMaterial,
+) error {
+	if !signed || dryRun {
+		return nil
+	}
+	links, err := lineage.BuildLineageChain(ctx, store, nil)
+	if err != nil {
+		return fmt.Errorf("%s: build lineage for signature verification: %w", op, err)
+	}
+	if len(links) == 0 {
+		return nil
+	}
+	// [verifyChainSignatures], not a hand-rolled loop over VerifyManifest.
+	// The first cut here did the latter and got the SEQUENCE semantics
+	// wrong: a signature records the link's position in the WALKED chain,
+	// and re-deriving that is exactly the detail a second implementation
+	// gets subtly different (it failed with "signed sequence 0 != expected
+	// chain position 3"). Sharing the verifier also means a future
+	// freshness anchor lands on this door for free.
+	//
+	// requireStrict is FALSE deliberately, and it is the one place this
+	// door is weaker than it could be: with no verification material it
+	// warns and proceeds, the same posture restore takes, so an operator
+	// without the chain's key can still run maintenance. That is
+	// acceptable because the attack this closes REQUIRES the operator to
+	// be running prune/compact with the chain's key material — that is
+	// what makes the re-sign possible at all — so the case that matters
+	// is exactly the case where material is present and verification
+	// really runs.
+	if verr := verifyChainSignatures(ctx, store, links, mat, false); verr != nil {
+		return lineage.SignatureInvalidError(fmt.Errorf(
+			"%s: refusing to restructure and re-sign a signed chain whose existing signatures do not "+
+				"verify — re-signing here would replace a failing signature with a valid one over the "+
+				"same content, which is indistinguishable from laundering a tampered chain. Verify the "+
+				"chain first (`sluice backup verify --require-signature`) and restore from a known-good "+
+				"copy if it does not pass: %w", op, verr,
+		))
+	}
+	return nil
+}
+
 // resignIfSigned re-signs the whole (already-restructured) lineage when
 // the chain is signed and a signer is available. A no-op otherwise.
 func resignIfSigned(ctx context.Context, store irbackup.Store, signed bool, signer *lineage.Signer) error {

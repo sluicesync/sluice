@@ -545,6 +545,21 @@ func CompactChain(ctx context.Context, store irbackup.Store, opts CompactOpts) (
 			"backup compact: no size-≥-2 merge groups found within --merge-window; nothing to do")
 	}
 
+	// S-1 (audit 2026-09-06): from HERE the run restructures the chain
+	// and re-signs the result, so the existing signatures must verify
+	// first — re-signing whatever is on the store is what laundering a
+	// tampered chain looks like. See [verifyBeforeRestructure].
+	//
+	// Placed after the no-op and dry-run doors above, not at the top of
+	// CompactChain, and that placement is load-bearing: a chain whose
+	// signatures are STALE is exactly what the crash-recovery heal
+	// ([healStaleLineageSignatures], reached through compactNoOpReturn)
+	// exists to repair. A strict verify at the top would make that heal
+	// unreachable — refusing the one shape it was written for.
+	if err := verifyBeforeRestructure(ctx, store, "backup compact", signed, opts.DryRun, verifyMaterial{env: opts.Envelope, verifyPub: opts.Signer.VerifyPublicKey()}); err != nil {
+		return nil, err
+	}
+
 	// First-pass cleanup: any leftover `.compact-staging-*` dirs from
 	// an earlier crashed run are unsalvageable; delete on resume so
 	// they don't pile up. Loud-but-non-fatal: a stale staging dir is

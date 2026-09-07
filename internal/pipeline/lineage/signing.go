@@ -795,3 +795,29 @@ func totalManifestCount(cat *Catalog) int {
 	}
 	return n
 }
+
+// VerifyPublicKey returns the PUBLIC half this signer verifies against,
+// or nil for a scheme with no asymmetric key (HMAC-off-KEK, whose verify
+// material is the envelope).
+//
+// Exported for the audit 2026-09-06 S-1 door: `backup prune` /
+// `backup compact` must verify a signed chain's EXISTING signatures
+// before restructuring and re-signing it, and the only key material
+// those commands are guaranteed to hold is the signer they are about to
+// sign with. For an Ed25519 or KMS chain that signer already carries the
+// public half ([NewEd25519Signer] derives it from the private key), so
+// handing it to the verifier makes the door effective on those schemes
+// instead of degrading to warn-and-proceed.
+//
+// It is deliberately the SIGNER's own public key and never one read from
+// a manifest — a rewritten KeyRef must not be able to redirect trust,
+// which is the same rule verifyMaterial's kms doc states.
+func (s *Signer) VerifyPublicKey() stdcrypto.PublicKey {
+	if s == nil {
+		return nil
+	}
+	if s.edPub != nil {
+		return s.edPub
+	}
+	return s.kmsPub
+}
