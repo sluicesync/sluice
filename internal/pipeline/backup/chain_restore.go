@@ -328,54 +328,11 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 		return migcore.WrapWithHint(migcore.PhaseConnect, err)
 	}
 
-	// 2. Cross-engine routing (Phase 5). Pre-flight the root full's
-	//    schema + every link's delta for unsupportable types.
-	crossEngine := root.Manifest.SourceEngine != r.Target.Name() && root.Manifest.SourceEngine != ""
-	if crossEngine {
-		if err := r.preflightCrossEngineSupportable(root, links); err != nil {
-			return err
-		}
-		slog.InfoContext(
-			ctx, "chain restore: cross-engine mode",
-			slog.String("source_engine", root.Manifest.SourceEngine),
-			slog.String("target_engine", r.Target.Name()),
-			slog.Int("incrementals", incrementalCount),
-		)
-	}
-
-	// 2.45. Object-emit pre-flight refusals, on the chain ROOT's schema.
-	if err := r.refuseUnrepresentableTargetShape(ctx, root.Manifest.Schema); err != nil {
+	// 2 through 2.8 — every refusal that must fire BEFORE anything lands
+	// on the target. Extracted so the BROKER can run the same list before
+	// its own destructive drop; see [ChainRestore.PreflightBeforeTarget].
+	if err := r.preflightBeforeTarget(ctx, root, links, incrementalCount); err != nil {
 		return err
-	}
-
-	// 2.5. Encryption pre-flight at the chain's IDENTITY (not merely at
-	//      the first restorable link — see [ChainRestore.chainIdentityManifest]).
-	if err := r.preflightEncryption(r.chainIdentityManifest(ctx, root.Manifest)); err != nil {
-		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("chain restore: %w", err))
-	}
-
-	// 2.6. Mixed-mode encryption refusal across the whole lineage.
-	if err := checkMixedModeChain(links); err != nil {
-		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("chain restore: %w", err))
-	}
-
-	// 2.7 + 2.7b. The manifest-integrity preflights, before anything lands
-	// on the target: the schema-fingerprint check across every link
-	// (ADR-0152 — what [irbackup.Manifest.SchemaHash] documents) and the
-	// BackupID recompute (audit item 57), in that order. Both live in
-	// [restoreManifestIntegrityPreflights] so `backup verify` runs the
-	// same LIST rather than a copy of it — see that function's comment for
-	// why the list, not just the checks, is the thing worth sharing.
-	if err := restoreManifestIntegrityPreflights(ctx, links, true); err != nil {
-		return migcore.WrapWithHint(migcore.PhaseConnect, err)
-	}
-
-	// 2.8. ADR-0154 whole-manifest signature + freshness verification.
-	// A signed (v6) chain refuses loudly on a missing/invalid/rolled-back
-	// signature, a truncated change-list, or a dropped-newest-link BEFORE
-	// anything lands on the target. Pre-v6 chains are a no-op.
-	if err := verifyChainSignatures(ctx, r.Store, links, verifyMaterial{env: r.Envelope, verifyPub: r.VerifyKey}, r.RequireSignature); err != nil {
-		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("chain restore: %w", err))
 	}
 
 	applier, err := r.Target.OpenChangeApplier(ctx, r.TargetDSN)
@@ -1745,4 +1702,131 @@ func (r *ChainRestore) changeChunkCEK(chunk *irbackup.ChunkInfo) ([]byte, error)
 		return nil, errors.New("encrypted change chunk encountered but chain CEK is unset")
 	}
 	return r.chainCEK, nil
+}
+
+// PreflightBeforeTarget runs every refusal a chain restore owes BEFORE
+// it touches the target, for a caller that is about to do something
+// destructive of its own.
+//
+// WHY IT IS EXPORTED (audit 2026-09-06 RCN-1). The broker's
+// `--reset-target-data` cold start DROPs every table named in the cached
+// tail manifest and only then calls [ChainRestore.Run]. Audit 2026-08-11
+// BRK-1 found that shape and hoisted ONE door — the Bug 243 malformed
+// recorded schema — above the drop. Six more stayed below it, including
+// all three integrity gates, and Run's own comment on the last of them
+// says it refuses "BEFORE anything lands on the target". That sentence
+// was false on this caller: measured on three refusable chains, the drop
+// ran first every time.
+//
+// The three unreached integrity gates are the ones that fire when a
+// chain is CORRUPT OR TAMPERED — precisely when the operator may have
+// nothing to restore from — so leaving them below the drop converted
+// "bad chain, target intact" into "bad chain, target gone", which is the
+// one case that cannot be walked back.
+//
+// A SHARED LIST RATHER THAN A SECOND COPY, for the reason
+// [restoreManifestIntegrityPreflights] already states about its own
+// contents: a caller holding its own subset of the doors IS the defect,
+// not the fix. Run calls this; the broker calls this; neither can drift.
+//
+// COST, stated because it is real: the broker runs the list twice (once
+// here before its drop, once inside Run). These are manifest reads,
+// schema-hash recomputes and signature verification — not free, and
+// cheap relative to a destroyed target. Deduplicating would mean
+// threading "already preflighted" state through Run, which is exactly
+// the kind of flag that goes stale and silently disarms a door.
+func (r *ChainRestore) PreflightBeforeTarget(ctx context.Context) error {
+	cmp := lineage.SameEngineComparator(ctx, r.Store, r.Target)
+	links, err := lineage.BuildLineageChain(ctx, r.Store, cmp)
+	if err != nil {
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("chain restore preflight: build lineage: %w", err))
+	}
+	if len(links) == 0 {
+		return errors.New("chain restore preflight: store contains no manifests")
+	}
+	for i := range links {
+		if verr := validateManifestStructure(links[i].Manifest); verr != nil {
+			return sluicecode.Wrap(sluicecode.CodeBackupSignatureInvalid,
+				"the backup manifest is structurally invalid (tampered or corrupt) — restore from a known-good chain",
+				fmt.Errorf("chain restore preflight: manifest %q: %w", links[i].Path, verr))
+		}
+	}
+	if cat, err := lineage.ResolveLineage(ctx, r.Store); err != nil {
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("chain restore preflight: %w", err))
+	} else if err := refuseVerbatimRestoreToNonPG(cat, r.Target); err != nil {
+		return migcore.WrapWithHint(migcore.PhaseConnect, err)
+	}
+	incrementalCount := 0
+	for _, l := range links {
+		if lineage.CanonicalKind(l.Manifest.Kind) == irbackup.BackupKindIncremental {
+			incrementalCount++
+		}
+	}
+	return r.preflightBeforeTarget(ctx, links[0], links, incrementalCount)
+}
+
+// preflightBeforeTarget is the door list itself, over a lineage the
+// caller has already built. [ChainRestore.Run] and
+// [ChainRestore.PreflightBeforeTarget] are its only callers, and
+// TestChainRestorePreTargetDoorRoster holds both to it.
+func (r *ChainRestore) preflightBeforeTarget(
+	ctx context.Context,
+	root lineage.SegmentRecord,
+	links []lineage.SegmentRecord,
+	incrementalCount int,
+) error {
+	// 2. Cross-engine routing (Phase 5). Pre-flight the root full's
+	//    schema + every link's delta for unsupportable types.
+	crossEngine := root.Manifest.SourceEngine != r.Target.Name() && root.Manifest.SourceEngine != ""
+	if crossEngine {
+		if err := r.preflightCrossEngineSupportable(root, links); err != nil {
+			return err
+		}
+		slog.InfoContext(
+			ctx, "chain restore: cross-engine mode",
+			slog.String("source_engine", root.Manifest.SourceEngine),
+			slog.String("target_engine", r.Target.Name()),
+			slog.Int("incrementals", incrementalCount),
+		)
+	}
+
+	// 2.45. Object-emit pre-flight refusals, on the chain ROOT's schema.
+	if err := r.refuseUnrepresentableTargetShape(ctx, root.Manifest.Schema); err != nil {
+		return err
+	}
+
+	// 2.5. Encryption pre-flight at the chain's IDENTITY (not merely at
+	//      the first restorable link — see [ChainRestore.chainIdentityManifest]).
+	if err := r.preflightEncryption(r.chainIdentityManifest(ctx, root.Manifest)); err != nil {
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("chain restore: %w", err))
+	}
+
+	// 2.6. Mixed-mode encryption refusal across the whole lineage.
+	if err := checkMixedModeChain(links); err != nil {
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("chain restore: %w", err))
+	}
+
+	// 2.7 + 2.7b. The manifest-integrity preflights, before anything lands
+	// on the target: the schema-fingerprint check across every link
+	// (ADR-0152 — what [irbackup.Manifest.SchemaHash] documents) and the
+	// BackupID recompute (audit item 57), in that order. Both live in
+	// [restoreManifestIntegrityPreflights] so `backup verify` runs the
+	// same LIST rather than a copy of it — see that function's comment for
+	// why the list, not just the checks, is the thing worth sharing.
+	if err := restoreManifestIntegrityPreflights(ctx, links, true); err != nil {
+		return migcore.WrapWithHint(migcore.PhaseConnect, err)
+	}
+
+	// 2.8. ADR-0154 whole-manifest signature + freshness verification.
+	// A signed (v6) chain refuses loudly on a missing/invalid/rolled-back
+	// signature, a truncated change-list, or a dropped-newest-link BEFORE
+	// anything lands on the target. Pre-v6 chains are a no-op.
+	//
+	// "BEFORE anything lands on the target" was FALSE on the broker's
+	// --reset-target-data caller until 2026-09-06; that is why this list
+	// is now reachable from outside Run.
+	if err := verifyChainSignatures(ctx, r.Store, links, verifyMaterial{env: r.Envelope, verifyPub: r.VerifyKey}, r.RequireSignature); err != nil {
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("chain restore: %w", err))
+	}
+	return nil
 }

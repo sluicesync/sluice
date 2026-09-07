@@ -773,6 +773,25 @@ func (b *SyncFromBackup) coldStartReset(ctx context.Context, applier ir.ChangeAp
 		return "", err
 	}
 
+	rest := b.newColdStartChainRestore()
+
+	// Audit 2026-09-06 RCN-1: BRK-1 hoisted ONE door above the drop and
+	// left six below it, including all three integrity gates — and
+	// ChainRestore.Run's own comment on the last of them claims it
+	// refuses "BEFORE anything lands on the target". Measured on three
+	// refusable chains (backup-id mismatch, schema-hash mismatch,
+	// require-signature over an unsigned chain): the drop ran first every
+	// time. The three unreached gates are the ones that fire when the
+	// chain is corrupt or tampered — exactly when the operator may have
+	// nothing else to restore from — so the old order turned "bad chain,
+	// target intact" into "bad chain, target gone".
+	//
+	// The whole list, from ChainRestore itself rather than a copy, so the
+	// two callers cannot drift.
+	if err := rest.PreflightBeforeTarget(ctx); err != nil {
+		return "", fmt.Errorf("broker: --reset-target-data: %w", err)
+	}
+
 	// Bug 40a fix: drop pre-existing target tables that match the
 	// chain's terminal schema. ChainRestore's CREATE TABLE IF NOT
 	// EXISTS would otherwise no-op against stale-schema tables and
@@ -783,7 +802,6 @@ func (b *SyncFromBackup) coldStartReset(ctx context.Context, applier ir.ChangeAp
 		}
 	}
 
-	rest := b.newColdStartChainRestore()
 	if err := rest.Run(ctx); err != nil {
 		return "", fmt.Errorf("broker: chain restore failed: %w", err)
 	}
