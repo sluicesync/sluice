@@ -35,6 +35,11 @@ var (
 	// method-set drift here silently stops pruning → the trigger change-log
 	// grows unbounded (a silent-loss-adjacent resource leak).
 	_ ir.ChangeLogPruner = (*CDCReader)(nil)
+
+	// Audit 2026-09-06 S-2: the pipeline has wired this at every
+	// reader-open site since Bug 246; pgtrigger never accepted it, so a
+	// change-log row naming a table outside the sync was applied.
+	_ ir.CDCScopePredicateSetter = (*CDCReader)(nil)
 	// Roadmap item 115: the consumer-registry COMPANION is what makes the
 	// auto-prune safe on a change log shared by several streams. The sidecar
 	// fails CLOSED without it — a method-set drift here does not silently

@@ -15,15 +15,21 @@
 package pgtrigger
 
 import (
+	"database/sql"
 	"strings"
 	"testing"
 )
 
 // healthyTriggers returns a correctly-installed plain-posture pair for
 // one table.
+//
+// nargs: 1 is not decoration — setup passes the PK column list as the ROW
+// trigger`s one argument, and the door refuses a zero-arg row trigger
+// (audit 2026-09-06 S-2 layer 3). A fixture that omits it is modelling a
+// trigger whose captured rows would carry the wrong key.
 func healthyTriggers(table string) []installedCaptureTrigger {
 	return []installedCaptureTrigger{
-		{table: table, name: CaptureTriggerRow, enabled: "O", fn: CaptureFunctionRow, fnSchema: "public", tgtype: expectedRowTgType},
+		{table: table, name: CaptureTriggerRow, enabled: "O", fn: CaptureFunctionRow, fnSchema: "public", tgtype: expectedRowTgType, nargs: 1},
 		{table: table, name: CaptureTriggerTruncate, enabled: "O", fn: CaptureFunctionTruncate, fnSchema: "public", tgtype: expectedTruncateTgType},
 	}
 }
@@ -32,7 +38,7 @@ func healthyTriggers(table string) []installedCaptureTrigger {
 // (ENABLE ALWAYS) pair for one table.
 func alwaysTriggers(table string) []installedCaptureTrigger {
 	return []installedCaptureTrigger{
-		{table: table, name: CaptureTriggerRow, enabled: "A", fn: CaptureFunctionRow, fnSchema: "public", tgtype: expectedRowTgType},
+		{table: table, name: CaptureTriggerRow, enabled: "A", fn: CaptureFunctionRow, fnSchema: "public", tgtype: expectedRowTgType, nargs: 1},
 		{table: table, name: CaptureTriggerTruncate, enabled: "A", fn: CaptureFunctionTruncate, fnSchema: "public", tgtype: expectedTruncateTgType},
 	}
 }
@@ -111,7 +117,7 @@ func TestGradeCaptureShape(t *testing.T) {
 		{
 			name: "plain row trigger under the opt-in posture refuses (replicated writes silently uncaptured)",
 			installed: []installedCaptureTrigger{
-				{table: "t", name: CaptureTriggerRow, enabled: "O", fn: CaptureFunctionRow, fnSchema: "public", tgtype: expectedRowTgType},
+				{table: "t", name: CaptureTriggerRow, enabled: "O", fn: CaptureFunctionRow, fnSchema: "public", tgtype: expectedRowTgType, nargs: 1},
 				{table: "t", name: CaptureTriggerTruncate, enabled: "A", fn: CaptureFunctionTruncate, fnSchema: "public", tgtype: expectedTruncateTgType},
 			},
 			ddl:               tiers(alwaysEvt, alwaysDropEvt),
@@ -121,7 +127,7 @@ func TestGradeCaptureShape(t *testing.T) {
 		{
 			name: "plain truncate trigger under the opt-in posture refuses too (both members graded)",
 			installed: []installedCaptureTrigger{
-				{table: "t", name: CaptureTriggerRow, enabled: "A", fn: CaptureFunctionRow, fnSchema: "public", tgtype: expectedRowTgType},
+				{table: "t", name: CaptureTriggerRow, enabled: "A", fn: CaptureFunctionRow, fnSchema: "public", tgtype: expectedRowTgType, nargs: 1},
 				{table: "t", name: CaptureTriggerTruncate, enabled: "O", fn: CaptureFunctionTruncate, fnSchema: "public", tgtype: expectedTruncateTgType},
 			},
 			ddl:               tiers(alwaysEvt, alwaysDropEvt),
@@ -131,7 +137,7 @@ func TestGradeCaptureShape(t *testing.T) {
 		{
 			name: "disabled trigger still refuses under the opt-in posture",
 			installed: []installedCaptureTrigger{
-				{table: "t", name: CaptureTriggerRow, enabled: "D", fn: CaptureFunctionRow, fnSchema: "public", tgtype: expectedRowTgType},
+				{table: "t", name: CaptureTriggerRow, enabled: "D", fn: CaptureFunctionRow, fnSchema: "public", tgtype: expectedRowTgType, nargs: 1},
 				{table: "t", name: CaptureTriggerTruncate, enabled: "A", fn: CaptureFunctionTruncate, fnSchema: "public", tgtype: expectedTruncateTgType},
 			},
 			ddl:               tiers(alwaysEvt, alwaysDropEvt),
@@ -210,14 +216,14 @@ func TestGradeCaptureShape(t *testing.T) {
 		{
 			name: "missing truncate trigger refuses naming it",
 			installed: []installedCaptureTrigger{
-				{table: "t", name: CaptureTriggerRow, enabled: "O", fn: CaptureFunctionRow, fnSchema: "public", tgtype: expectedRowTgType},
+				{table: "t", name: CaptureTriggerRow, enabled: "O", fn: CaptureFunctionRow, fnSchema: "public", tgtype: expectedRowTgType, nargs: 1},
 			},
 			wantErr: []string{CaptureTriggerTruncate, "MISSING", "TRUNCATE"},
 		},
 		{
 			name: "disabled trigger refuses",
 			installed: []installedCaptureTrigger{
-				{table: "t", name: CaptureTriggerRow, enabled: "D", fn: CaptureFunctionRow, fnSchema: "public", tgtype: expectedRowTgType},
+				{table: "t", name: CaptureTriggerRow, enabled: "D", fn: CaptureFunctionRow, fnSchema: "public", tgtype: expectedRowTgType, nargs: 1},
 				{table: "t", name: CaptureTriggerTruncate, enabled: "O", fn: CaptureFunctionTruncate, fnSchema: "public", tgtype: expectedTruncateTgType},
 			},
 			wantErr: []string{"DISABLED", "DISABLE TRIGGER"},
@@ -225,7 +231,7 @@ func TestGradeCaptureShape(t *testing.T) {
 		{
 			name: "ENABLE REPLICA trigger refuses (fires for no origin write)",
 			installed: []installedCaptureTrigger{
-				{table: "t", name: CaptureTriggerRow, enabled: "R", fn: CaptureFunctionRow, fnSchema: "public", tgtype: expectedRowTgType},
+				{table: "t", name: CaptureTriggerRow, enabled: "R", fn: CaptureFunctionRow, fnSchema: "public", tgtype: expectedRowTgType, nargs: 1},
 				{table: "t", name: CaptureTriggerTruncate, enabled: "O", fn: CaptureFunctionTruncate, fnSchema: "public", tgtype: expectedTruncateTgType},
 			},
 			wantErr: []string{"ENABLE REPLICA", "session_replication_role"},
@@ -233,7 +239,7 @@ func TestGradeCaptureShape(t *testing.T) {
 		{
 			name: "foreign bound function refuses",
 			installed: []installedCaptureTrigger{
-				{table: "t", name: CaptureTriggerRow, enabled: "O", fn: "audit_everything", fnSchema: "public", tgtype: expectedRowTgType},
+				{table: "t", name: CaptureTriggerRow, enabled: "O", fn: "audit_everything", fnSchema: "public", tgtype: expectedRowTgType, nargs: 1},
 				{table: "t", name: CaptureTriggerTruncate, enabled: "O", fn: CaptureFunctionTruncate, fnSchema: "public", tgtype: expectedTruncateTgType},
 			},
 			wantErr: []string{"audit_everything", CaptureFunctionRow, "not what this sluice installs"},
@@ -275,7 +281,7 @@ func TestGradeCaptureShape(t *testing.T) {
 		{
 			name: "row trigger bound to a same-named function in another schema refuses (SLP-1)",
 			installed: []installedCaptureTrigger{
-				{table: "t", name: CaptureTriggerRow, enabled: "O", fn: CaptureFunctionRow, fnSchema: "decoy", tgtype: expectedRowTgType},
+				{table: "t", name: CaptureTriggerRow, enabled: "O", fn: CaptureFunctionRow, fnSchema: "decoy", tgtype: expectedRowTgType, nargs: 1},
 				{table: "t", name: CaptureTriggerTruncate, enabled: "O", fn: CaptureFunctionTruncate, fnSchema: "public", tgtype: expectedTruncateTgType},
 			},
 			ddl:     healthyTiers(),
@@ -284,7 +290,7 @@ func TestGradeCaptureShape(t *testing.T) {
 		{
 			name: "truncate trigger bound to a same-named function in another schema refuses (SLP-1)",
 			installed: []installedCaptureTrigger{
-				{table: "t", name: CaptureTriggerRow, enabled: "O", fn: CaptureFunctionRow, fnSchema: "public", tgtype: expectedRowTgType},
+				{table: "t", name: CaptureTriggerRow, enabled: "O", fn: CaptureFunctionRow, fnSchema: "public", tgtype: expectedRowTgType, nargs: 1},
 				{table: "t", name: CaptureTriggerTruncate, enabled: "O", fn: CaptureFunctionTruncate, fnSchema: "decoy", tgtype: expectedTruncateTgType},
 			},
 			ddl:     healthyTiers(),
@@ -322,4 +328,60 @@ func TestGradeCaptureShape(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestGradeCaptureShape_GradesTheTriggerWiring covers audit 2026-09-06
+// S-2 layer 3: the door graded a trigger's IDENTITY (name, function,
+// namespace, OID) and its SHAPE (tgtype, tgenabled) and nothing about
+// its WIRING, so the two edits below passed every check.
+//
+// Both are quiet by construction. The trigger is present, enabled, bound
+// to the right function with the right tgtype; only what reaches the
+// function changes.
+func TestGradeCaptureShape_GradesTheTriggerWiring(t *testing.T) {
+	t.Run("a WHEN clause refuses", func(t *testing.T) {
+		// The quietest edit available: rows the predicate excludes are
+		// never captured, so they are simply missing from the target and
+		// nothing else reports it. Setup renders no WHEN clause, so any
+		// value here is an edit.
+		trigs := healthyTriggers("t")
+		trigs[0].whenClause = sql.NullString{String: "(new.tenant_id <> 42)", Valid: true}
+		err := gradeCaptureShape("public", trigs, healthyTiers(), false)
+		if err == nil {
+			t.Fatal("a capture trigger carrying a WHEN clause was accepted; rows the predicate excludes " +
+				"are silently never captured")
+		}
+		if !strings.Contains(err.Error(), "WHEN clause") || !strings.Contains(err.Error(), "tenant_id") {
+			t.Errorf("refusal does not name the clause it found: %v", err)
+		}
+	})
+
+	t.Run("a zero-arg row trigger refuses", func(t *testing.T) {
+		// Setup passes the PK column list as the ROW trigger's one
+		// argument and the capture function keys every change-log row
+		// from it, so a zero-arg reinstall mis-keys everything.
+		trigs := healthyTriggers("t")
+		trigs[0].nargs = 0
+		err := gradeCaptureShape("public", trigs, healthyTiers(), false)
+		if err == nil {
+			t.Fatal("a row capture trigger with no arguments was accepted; the capture function keys " +
+				"every change-log row from that argument")
+		}
+		if !strings.Contains(err.Error(), "NO arguments") {
+			t.Errorf("refusal does not name the missing argument: %v", err)
+		}
+	})
+
+	t.Run("the TRUNCATE trigger takes no arguments and must not be refused", func(t *testing.T) {
+		// The no-false-fire floor for the cell above: setup renders the
+		// truncate trigger with an empty arg list, so the nargs check is
+		// deliberately scoped to the ROW trigger. Without this, the fix
+		// would refuse every healthy install.
+		trigs := healthyTriggers("t")
+		trigs[1].nargs = 0
+		if err := gradeCaptureShape("public", trigs, healthyTiers(), false); err != nil {
+			t.Fatalf("a healthy install was refused because its TRUNCATE trigger takes no arguments, "+
+				"which is exactly how setup renders it: %v", err)
+		}
+	})
 }

@@ -120,6 +120,27 @@ type installedCaptureTrigger struct {
 	fnSchema string // bound function's namespace (pg_namespace.nspname via pronamespace)
 	fnOID    uint32 // bound function's pg_proc.oid — what the trigger EXECUTES
 	tgtype   int16
+
+	// whenClause is pg_get_expr(tgqual) — NULL for every trigger setup
+	// installs, because setup renders no WHEN clause. Any value here is
+	// therefore an edit, and a WHEN clause is the quietest possible one:
+	// the trigger is present, enabled, bound to the right function with
+	// the right tgtype, and simply does not fire for the rows the
+	// predicate excludes.
+	//
+	// Added by audit 2026-09-06 S-2 layer 3. Until then the door graded
+	// the trigger's identity and shape and nothing about its WIRING, so a
+	// rewritten WHEN clause passed every check.
+	whenClause sql.NullString
+
+	// nargs is pg_trigger.tgnargs. The ROW trigger carries exactly one
+	// argument — the PK column list as JSON, which the capture function
+	// uses to key every change-log row — so a zero-arg row trigger is a
+	// reinstall by something that did not know that, and the captured PK
+	// would be wrong for every row.
+	//
+	// The VALUE is not graded here; see gradeCaptureShape's residual note.
+	nargs int16
 }
 
 // eventTriggerState is the pg_event_trigger row for one capture event
@@ -218,7 +239,8 @@ func captureShapeProbeError(ctx, pctx context.Context, what string, err error) e
 // from the table's), and tgtype.
 func loadInstalledCaptureTriggers(ctx context.Context, db *sql.DB, schema string) ([]installedCaptureTrigger, error) {
 	const q = `
-SELECT c.relname, t.tgname, t.tgenabled::text, p.proname, pn.nspname, p.oid, t.tgtype
+SELECT c.relname, t.tgname, t.tgenabled::text, p.proname, pn.nspname, p.oid, t.tgtype,
+       pg_catalog.pg_get_expr(t.tgqual, t.tgrelid) AS when_clause, t.tgnargs
   FROM pg_trigger   t
   JOIN pg_class     c  ON c.oid  = t.tgrelid
   JOIN pg_namespace n  ON n.oid  = c.relnamespace
@@ -236,7 +258,7 @@ SELECT c.relname, t.tgname, t.tgenabled::text, p.proname, pn.nspname, p.oid, t.t
 	var out []installedCaptureTrigger
 	for rows.Next() {
 		var it installedCaptureTrigger
-		if err := rows.Scan(&it.table, &it.name, &it.enabled, &it.fn, &it.fnSchema, &it.fnOID, &it.tgtype); err != nil {
+		if err := rows.Scan(&it.table, &it.name, &it.enabled, &it.fn, &it.fnSchema, &it.fnOID, &it.tgtype, &it.whenClause, &it.nargs); err != nil {
 			return nil, err
 		}
 		out = append(out, it)
@@ -482,6 +504,9 @@ func gradeCaptureShape(schema string, installed []installedCaptureTrigger, ddl d
 					tbl, want.name, got.tgtype, want.tgtype, want.events, allTables,
 				)
 			}
+			if err := gradeTriggerWiring(tbl, want.name, got, allTables); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -560,6 +585,51 @@ func gradeCaptureShape(schema string, installed []installedCaptureTrigger, ddl d
 				tier.trigger, evt.fn, tier.fn, allTables,
 			)
 		}
+	}
+	return nil
+}
+
+// gradeTriggerWiring grades what REACHES a capture trigger's function,
+// as distinct from the trigger's identity and shape which
+// [gradeCaptureShape] grades above it (audit 2026-09-06 S-2 layer 3).
+//
+// Until this existed the door established that the right function was
+// bound, enabled, and correctly shaped — and nothing about the wiring in
+// between. Both edits below leave every one of those checks satisfied.
+//
+// Extracted rather than inlined because the two checks pushed
+// gradeCaptureShape over the funlen ceiling, which that ceiling's own
+// comment says to answer by carving a phase out. Checked first that no
+// roster greps gradeCaptureShape's body, so the extraction cannot take a
+// check out of a gate's sight — the trap this session has hit four times.
+func gradeTriggerWiring(tbl, trigName string, got installedCaptureTrigger, allTables string) error {
+	// A WHEN clause is the quietest available edit: the trigger is
+	// present and healthy by every other measure and simply does not fire
+	// for the rows the predicate excludes. Setup renders none, so any
+	// value is an edit.
+	if got.whenClause.Valid && got.whenClause.String != "" {
+		return fmt.Errorf(
+			"pgtrigger: table %q capture trigger %q carries a WHEN clause (%s) that `sluice trigger setup` "+
+				"never installs — rows the predicate excludes are silently NOT captured and will be missing "+
+				"from the target with nothing else reporting it; re-run "+
+				"`sluice trigger setup --dsn=... --tables=%s` to reinstall",
+			tbl, trigName, got.whenClause.String, allTables,
+		)
+	}
+	// The ROW trigger's PK-column argument. Setup always passes exactly
+	// one and the capture function keys every change-log row from it, so
+	// a zero-arg reinstall mis-keys everything. Scoped to the ROW trigger
+	// deliberately: setup renders the TRUNCATE trigger with an empty
+	// argument list, so grading nargs on it would refuse every healthy
+	// install (pinned as its own no-false-fire cell).
+	if trigName == CaptureTriggerRow && got.nargs == 0 {
+		return fmt.Errorf(
+			"pgtrigger: table %q capture trigger %q was installed with NO arguments, but setup passes the "+
+				"primary-key column list as its one argument — the capture function keys every change-log "+
+				"row from it, so captured changes would carry the wrong key; re-run "+
+				"`sluice trigger setup --dsn=... --tables=%s` to reinstall",
+			tbl, trigName, allTables,
+		)
 	}
 	return nil
 }

@@ -82,6 +82,21 @@ type CDCReader struct {
 	// the single auto-prune sidecar goroutine; no locking.
 	pruneBook triggercdc.Bookkeeper
 
+	// scopeAllowed is the pipeline-supplied effective table scope
+	// ([ir.CDCScopePredicateSetter], Bug 246). nil for every non-streamer
+	// construction, which is why [CDCReader.rowInCaptureScope] treats it
+	// as the SECONDARY half — the security-critical schema comparison it
+	// runs first needs no plumbing and cannot be absent.
+	//
+	// Set before StreamChanges, read from the pump goroutine; the
+	// pipeline's closure reads an atomic pointer, so that is safe.
+	scopeAllowed func(schema, table string) bool
+
+	// outOfScopeWarned dedupes the CAPTURE-OUT-OF-SCOPE WARN per
+	// (schema, table). Owned by the pump goroutine — the only writer and
+	// reader — so it needs no lock.
+	outOfScopeWarned map[string]bool
+
 	// mu guards err. The pump writes; the caller reads via Err.
 	mu  sync.Mutex
 	err error
@@ -621,6 +636,30 @@ func (r *CDCReader) poll(ctx context.Context, lastSeen int64) (pollBatch, error)
 		}
 		want = id + 1
 
+		// SECURITY SCOPE (audit 2026-09-06 S-2). The capture function is
+		// SECURITY DEFINER and, by default, EXECUTable by PUBLIC — so any
+		// source role that can create a table and a trigger can attach it
+		// to a table of its OWN, named after a synced table, and every row
+		// it writes becomes a change sluice applies to the real target
+		// table. The applier resolves the target schema from its own
+		// configuration and treats the change's schema as metadata, and
+		// the dispatch filter strips a `schema.` prefix before matching —
+		// so `evil.orders` reached `<target>.orders`.
+		//
+		// The check is HERE, after the watermark advances and outside the
+		// SQL, on purpose. Filtering in the poll query would punch holes in
+		// the id sequence the window's contiguity + settled-ceiling logic
+		// reads, and the hole guard would then wait on rows that are never
+		// coming. Dropping the event after `want` has advanced keeps the
+		// stream moving and simply never emits the forged row.
+		//
+		// A dropped row is WARNed once per (schema, table): it is either an
+		// attack or a misconfiguration, and both deserve to be visible.
+		if !r.rowInCaptureScope(schema, table) {
+			r.warnOutOfScopeCapture(ctx, schema, table, id)
+			continue
+		}
+
 		// §7 DDL marker handling — short-circuit the loop and
 		// surface the refusal to the pump.
 		// Source commit timestamp for the engine-neutral sync-lag metric
@@ -1001,3 +1040,75 @@ func readChangeLogAnchor(ctx context.Context, q anchorQuerier, schema string) (i
 // the addition of an Err method (the load-bearing loud-failure
 // surface for streaming readers — see [ir.RowReader] Err doc).
 var _ ir.CDCReader = (*CDCReader)(nil)
+
+// SetCDCScopePredicate implements [ir.CDCScopePredicateSetter]: the
+// pipeline hands this reader the sync's effective table scope so
+// [CDCReader.rowInCaptureScope] can drop a captured row for a table this
+// stream does not sync. Called before StreamChanges by the pipeline's
+// setter block; read from the pump goroutine, and the pipeline's closure
+// reads an atomic pointer, so it is safe there.
+//
+// This reader did not implement the surface at all until audit
+// 2026-09-06 S-2 — the pipeline has wired it at every reader-open site
+// since Bug 246, and pgtrigger simply never accepted it.
+func (r *CDCReader) SetCDCScopePredicate(allowed func(schema, table string) bool) {
+	r.scopeAllowed = allowed
+}
+
+// rowInCaptureScope reports whether a change-log row is one this stream
+// may act on (audit 2026-09-06 S-2).
+//
+// TWO INDEPENDENT HALVES, and the first is the security-critical one:
+//
+//  1. SCHEMA. The capture function is SECURITY DEFINER and EXECUTable by
+//     PUBLIC by default, so any source role that can create a table and a
+//     trigger can attach it to a table of its own — in a schema it
+//     controls — named after a synced table. The applier resolves the
+//     target schema from its OWN configuration and treats the change's
+//     schema as metadata, and the dispatch filter strips a `schema.`
+//     prefix before matching, so `evil.orders` reached `<target>.orders`
+//     as a write the attacking role could not have made on the source.
+//     A legitimate capture always carries this reader's own namespace
+//     (the DSN's `schema`, default `public`), so the comparison needs no
+//     plumbing and CANNOT fail open — r.schema is always set.
+//
+//  2. TABLE SCOPE, when the pipeline supplied a predicate. This is the
+//     ordinary Bug 246 filter and it is nil for non-streamer
+//     constructions, so it is applied only when present. It is NOT the
+//     security half: the pipeline's closure matches on table NAME alone,
+//     which is exactly why the schema check above cannot be folded into
+//     it.
+func (r *CDCReader) rowInCaptureScope(schema, table string) bool {
+	if schema != r.schema {
+		return false
+	}
+	if r.scopeAllowed != nil && !r.scopeAllowed(schema, table) {
+		return false
+	}
+	return true
+}
+
+// warnOutOfScopeCapture reports a dropped change-log row once per
+// (schema, table). Once, because a forged table can produce rows at the
+// attacker's rate and a per-row WARN would be its own denial of service;
+// at all, because a dropped row is either an attack or a
+// misconfiguration and both need to be visible.
+func (r *CDCReader) warnOutOfScopeCapture(ctx context.Context, schema, table string, id int64) {
+	key := schema + "." + table
+	if r.outOfScopeWarned == nil {
+		r.outOfScopeWarned = make(map[string]bool)
+	}
+	if r.outOfScopeWarned[key] {
+		return
+	}
+	r.outOfScopeWarned[key] = true
+	slog.WarnContext(
+		ctx, "pgtrigger: CAPTURE-OUT-OF-SCOPE: dropping a change-log row for a relation this stream does not sync; it will never be applied",
+		slog.String("row_schema", schema),
+		slog.String("row_table", table),
+		slog.String("stream_schema", r.schema),
+		slog.Int64("change_log_id", id),
+		slog.String("why", "the capture function is SECURITY DEFINER and executable by PUBLIC by default, so any source role that can create a table and a trigger can write rows into the change log naming a table it does not own"),
+		slog.String("action", "if you did not expect this, inspect the source for triggers calling sluice's capture function on tables outside the sync, and REVOKE EXECUTE ON FUNCTION <schema>.sluice_capture_change(text) FROM PUBLIC"),
+	)
+}
