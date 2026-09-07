@@ -15,6 +15,46 @@ Both are the doc-lags-code shape the working agreements name. A note *about* bac
 
 **Staleness caveat (2026-08-18 triage).** A ground-truth pass over the un-struck entries found the "open" section is itself doc-lags-code: EVERY high-value candidate filed before ~2026-08-13 that was checked had already been fixed in code and never struck here (B-2c, D-1/2/3, Bug 239, the Bug 244 restore sibling, C1-1's SQLite/D1 lane — all now struck above with their code proof). Reassuringly, that pass found **zero still-open silent-loss items**. But the lesson is the project's own rule turned on this file: **before executing any un-struck entry older than 2026-08-13, ground-truth it against the code — the backlog text is not reliable for pre-08-13 entries.** The genuinely-open work concentrates in the freshest (2026-08-17 Tier-3) section plus the design-gated / needs-infra items.
 
+## 2026-09-06 — post-v0.144.0 reconciler pass (findings and their disposition)
+
+Filed here as they were worked, because `TestAuditFindingsAreFiled` caught two of them (**RCN-1**, **S-3**) missing from this file on its very first run — the leak it exists to stop, happening while the gate that stops it was being written.
+
+- **RCN-1 (MEDIUM, F, observed) — FIXED (`f837cf25`).** BRK-1 hoisted ONE of `ChainRestore.Run`'s seven pre-target refusals above the broker's `--reset-target-data` drop; six stayed below it, including all three integrity gates. Measured on three refusable chains: the drop ran first every time, turning "bad chain, target intact" into "bad chain, target gone". Both callers now share one door list; `TestBrokerColdStartResetPreflightsBeforeTheDrop` pins the order and `TestChainRestorePreTargetDoorRoster` fails if `Run` inlines a door instead of delegating.
+- **S-1 (HIGH) — FIXED (`34268a7a`).** `backup prune` / `backup compact` re-signed a signed chain without verifying its existing signatures — a laundering door on the routine maintenance path. Now verified before restructure, with `TestResignSitesVerifyFirst` as the AST roster. The `backup full` resume sibling (adopting an in-progress manifest's chunk list on existence alone, then signing it) is **filed, not fixed**.
+- **S-2 (HIGH) — FIXED across three layers (`294e1428`, `41fdea86`).** The pgtrigger `SECURITY DEFINER` capture function was executable by PUBLIC and the reader routed rows by table name with the schema discarded. Layer 1: reader-side scope check (schema half needs no plumbing and cannot fail open). Layer 2: `REVOKE EXECUTE … FROM PUBLIC` + `GRANT … TO CURRENT_USER` at setup, both facts measured on PG 16 first. Layer 3: the shape door now grades `tgqual` and the row trigger's argument count. **Residual: the argument's VALUE is still ungraded** — that needs a triggerdef digest recorded at setup, the shape SL-5 provenance already uses.
+- **S-3 (MEDIUM) — FIXED.** The release workflow ran `go test ./...` with every publish token in scope, and no tag ruleset restricted who could start it. `go test` removed from the GoReleaser before-hooks in v0.143.0; the tag ruleset (id `22393777`) is documented in `docs/dev/branch-protection.md`.
+- **VF-ARRAY-WITNESS (MEDIUM, silent) — FIXED (`ea8533bc`).** See its own entry below.
+- **PERF-MATRIX-ARREARS (MEDIUM, doc-accuracy) — see its own entry below.**
+
+## 2026-09-06 — the 20 findings the 09-01 section claimed to file and did not
+
+The 09-01 section above opens *"This section files EVERY finding, including the ones inherited from prior passes that never reached this file."* Measured at HEAD by the 2026-09-06 reconciler, **20 of its own finding IDs returned zero hits in this file** — the fourth consecutive reconciler to report the filing step leaking, and the first to report it against a section whose stated purpose was to close it.
+
+They are filed here verbatim-enough to be actionable, and the durable half of the fix is `docs/dev/audit-findings-index.md` + `TestAuditFindingsAreFiled`, which now fails the build when a finding index lists an ID this file does not carry. See that gate's doc for why the previously-proposed version could not have worked.
+
+**Two of the 21 the reconciler counted (TCI-3, TCI-4) were filed in PROSE without their IDs** (`wholeRecordParsed` and `ScopesByArity` both appear in the 09-01 section). They are not re-filed; the gate demands the ID, which is the right call — a gate that accepted prose would be unwritable — so they are recorded here as ID-less and the index carries them as filed.
+
+- **SLM-6 (LOW, J):** the identity-mismatch fall-through auto-drops target tables and re-copies from whatever now answers the DSN.
+- **SLM-7 (LOW, J):** `verifySourceInstanceIdentity`'s probe-failure arm fails OPEN.
+- **SLP-3 (LOW, F; premise-naming):** `IntervalStyle` (and `lc_monetary`, derived) leak into the captured JSON — the GUC-pin family the pgtrigger body door enumerates. §5's disposition was an explicit NOT-fixing decision ("pin it if a non-PG consumer appears"); recorded here because a decision that lives only in a workspace report is one the next pass re-litigates from scratch.
+- **SLP-4 (LOW, F, observed at scaled constants):** the 1-hour evidence-freshness window turns a lock-stalled `--capture-replicated-writes` re-run into self-recording.
+- **SLP-5 (LOW, F):** `trigger setup` accepts a declaratively partitioned parent; the cloned triggers record DML under the PARTITION's name.
+- **A2-6 (LOW, F):** a forwarded ADD COLUMN drops the interval typmod on the target.
+- **A2-7 (LOW, F):** `--include-table tt` cold start fails on an out-of-scope matview dependency.
+- **LA-5 (LOW, J):** the D1 migrate/stage path does not run the `%!.20g` render probe the trigger lanes run.
+- **LA-7 (LOW, F):** cross-opening one directory as `file://` (fileblob) and as `--output-dir` (LocalStore) is not List-compatible — fileblob writes `.attrs` sidecars LocalStore then enumerates.
+- **TCI-5 (LOW, F):** the session-GUC roster's "honesty half" is FILE-scoped, so the PG lane's remedy marker is satisfied by a different refusal.
+- **TCI-7 (LOW, J):** the ServerUUID AST roster's floor sits deliberately below its universe, and Mode-by-variable constructions are outside it.
+- **AQP-1 (MEDIUM, F):** the pgtrigger open path re-reads the DDL-tier catalog state it already holds. **CLOSED BY DECISION** — the deliberate second read is now recorded at `pgtrigger/cdc_reader.go:174`; filed here because the decision lived only in code and the reconciler had to re-derive it.
+- **AQP-3 (LOW, F):** the heal-provenance report on the broker path uses the wrong verb and re-reads per tick.
+- **AQP-4 (LOW, F):** dangling doc-links to a renamed function.
+- **DDD-6 (LOW, F):** `UNVERIFIED-INSTANCE-IDENTITY`, `POSITION-MODE`, the v0.137.2 remedy and `--position-from-manifest` have no operator-doc home; WARN markers have no index.
+- **DDD-8 (LOW, F):** the local hooks gate untracked `workspace/` Go packages that CI never sees.
+- **DDD-9 (LOW, F):** dependency housekeeping — one module-level advisory, one version skew.
+- **SEC-LOW-1 (LOW, J):** the MySQL instance-identity guard is defeated by a cloned datadir that reuses `@@server_uuid`.
+- **NEW-2 (LOW, F):** the redact preflight compares table/column names case-EXACTLY while `redact.Registry` case-FOLDS them — an asymmetry the NEW-1 fix introduced (`migcore/redact_preflight.go` states "Table names stay an exact compare, as before"; `redact/redact.go` folds). Over-refusal direction, so loud rather than silent. **Now documented as deliberate**; filed so it is a decision rather than a rediscovery.
+- **C-5:** carried forward from 08-31 with zero backlog hits and **not re-derived** by the 09-06 pass. Its disposition is genuinely unknown at HEAD; the next audit should re-derive it before assuming either way.
+
 ## 2026-09-01 — post-v0.137.3 blind audit on Fable 5.1 (8 blind workers + reconciler + 3 specialists; report `workspace/repo-audit-2026-09-01.md`, worker reports `workspace/audit-2026-09-01/`)
 
 **Grade C+** (security C, silent-loss C+), down from B−. Delta v0.134.1→v0.137.3: 50 commits, +12.4k/−1k lines, three quarters in pgtrigger + mysql. Ran four releases after the last pass on delta size, not release count. Scorecard on 08-31: **21 FIXED / 3 PARTIAL / 12 OPEN / 0 REGRESSED.** Every HIGH/CRITICAL below was confirmed by the orchestrator independently of the worker that filed it. **This section files EVERY finding, including the ones inherited from prior passes that never reached this file** — the reconciler's own top finding was that 08-27 NEW-1 and 08-31 NEW-A/NEW-B/NEW-C/C-4 had zero backlog presence after two cycles.
