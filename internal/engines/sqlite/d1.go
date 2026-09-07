@@ -148,6 +148,15 @@ func (d d1Engine) OpenRowReader(ctx context.Context, dsn string) (ir.RowReader, 
 	if err := client.ping(ctx); err != nil {
 		return nil, err
 	}
+	// Render-fidelity door (audit LA-5). This reader projects REAL values
+	// through format('%!.20g', …); an engine ignoring the `!` flag clamps to
+	// 16 digits and silently alters every one of them. The trigger lanes have
+	// probed this since v0.131.2 — the bulk-copy lane, which renders the same
+	// expression against the same remote engine, did not. See
+	// [verifyD1RenderFidelity].
+	if err := verifyD1RenderFidelity(ctx, client); err != nil {
+		return nil, err
+	}
 	// The per-source DSN param wins; absent, the engine's --sqlite-date-encoding
 	// default applies (task 2.5). Both may be inherit → decode resolves to ISO.
 	return &D1RowReader{client: client, dateEnc: foldDateEncoding(client.dateEnc, d.dateEncoding)}, nil

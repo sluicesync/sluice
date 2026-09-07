@@ -71,6 +71,16 @@ func stageD1ClientToLocalFile(ctx context.Context, client *d1Client, destPath st
 	if log == nil {
 		log = slog.Default()
 	}
+	// Render-fidelity door (audit LA-5), at the staging core rather than at
+	// StageD1ToLocalFile so the injected-client test path is graded too. This
+	// path constructs its own D1RowReader and never passes through
+	// OpenRowReader, so it needed the door named separately -- the sibling the
+	// enumeration would have missed. A lossy render staged into the local file
+	// is worse than one read directly: every later phase reads the staged file
+	// and sees a value that looks native.
+	if err := verifyD1RenderFidelity(ctx, client); err != nil {
+		return err
+	}
 	sr := &D1SchemaReader{client: client}
 	schema, err := sr.ReadSchema(ctx)
 	if err != nil {

@@ -109,6 +109,16 @@ func CapturedTypeofExpr(colExpr string) string {
 // (modernc), and the one residual stays named: a THIRD-PARTY app library
 // firing a local capture trigger renders with ITS printf, which no probe from
 // this process can reach — bounded by the loud-failure shapes above.
+// THE READER LANE PROBES TOO, since audit LA-5 (2026-09-07). The paragraph
+// above used to end at the trigger readers, and that scope was the blind
+// spot: a `migrate` fires no triggers, so "the probed engine IS the engine
+// that fires the triggers" was true and said nothing about the
+// `--source-driver d1` bulk copy or `migrate --stage-local`, which project
+// this same expression against the same remote engine. Both now run the
+// probe at open ([verifyD1RenderFidelity]), and
+// TestD1RenderDoorRoster_EveryRowReaderConstructionClassified holds every
+// D1RowReader construction to being guarded or exempt-with-a-reason, so a
+// future lane cannot inherit the gap silently.
 // TestCapturedValueExpr_RealRenderRoundTripsExactly is the per-PR gate on the
 // bundled SQLite; the d1verify adversarial matrix is the live-D1 pin;
 // TestRealRenderProbe_GradesTheConnectedEngine pins the probe's both
