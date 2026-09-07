@@ -54,6 +54,16 @@ other eighteen.
 
 ---
 
+## 2026-09-07 — v0.145.0 pre-tag review
+
+- PRE-TAG-1 filed
+- PRE-TAG-2 filed
+- PRE-TAG-3 filed
+- PRE-TAG-4 filed
+- PRE-TAG-5 filed
+- H2 filed
+- H5 filed
+
 ## 2026-09-06 — reconciler pass (post-v0.144.0)
 
 - RCN-1 filed

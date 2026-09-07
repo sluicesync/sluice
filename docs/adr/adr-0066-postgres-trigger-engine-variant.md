@@ -749,6 +749,43 @@ Required source-side permissions:
 - `pg_create_event_trigger` role (PG 14+) OR superuser (PG ≤ 13) for
   the DDL-detection event trigger. On tiers that grant neither,
   fall through to polled-fingerprint mode (§7).
+- OWNERSHIP of the capture functions, in order to `REVOKE`/`GRANT` on
+  them (v0.145.0, audit 2026-09-06 S-2 layer 2 — see below). In practice
+  this adds nothing: the role that runs setup CREATEs the functions and
+  therefore owns them, and `CREATE OR REPLACE FUNCTION` already required
+  ownership on a re-run. It is listed because a cross-role setup — one
+  role's functions, another role's re-run — now fails at the REVOKE
+  rather than at the CREATE.
+
+**What setup changes about the database's PRIVILEGES (v0.145.0).** Setup
+emits `REVOKE EXECUTE ON FUNCTION <schema>.<capture fn>() FROM PUBLIC`
+followed by `GRANT EXECUTE ... TO CURRENT_USER`, for each capture
+function it renders — two on the polled-fingerprint tier, four on the
+event-trigger tier — inside its own transaction.
+
+Why: the capture functions are `SECURITY DEFINER`, and PostgreSQL grants
+EXECUTE on a new function to PUBLIC by default. Any source role that
+could create a table and a trigger could therefore attach sluice's
+capture function to a table of its own, named after a synced table, and
+have every row it wrote applied to the TARGET's real table — a
+cross-privilege write primitive sluice manufactured rather than
+inherited.
+
+What it does NOT touch: anything but those functions. No default
+privileges, no other object, no other role's access to anything else.
+
+What it does NOT break, measured on PG 16 over a real unprivileged
+connection: existing capture triggers keep firing for a role with no
+EXECUTE, because PostgreSQL checks EXECUTE at `CREATE TRIGGER` time and
+not at fire time.
+
+**Residual:** an install created before v0.145.0 keeps PUBLIC's grant
+until `sluice trigger setup` re-runs, and — unlike the four other
+re-run reasons — **nothing warns about it at CDC open**: the capture-body
+door grades `prosrc`/`proconfig`/`prosecdef` and never reads `proacl`.
+The reader-side scope check (`rowInCaptureScope`) covers the window by
+dropping any captured row outside the stream's schema. Adding a `proacl`
+arm to the open-time door is the follow-up.
 
 Notably **NOT required:**
 
