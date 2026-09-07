@@ -376,6 +376,17 @@ Since v0.140.0 the tier records only commands whose RELATION carries this instal
 
 Upgrading changes the capture function bodies, so an install created by an earlier release warns `STALE-CAPTURE-FUNCTION` until `sluice trigger setup` is re-run once.
 
+**One reason to re-run setup carries NO warning, and it is worth knowing about explicitly.** v0.145.0 takes sluice-created capture functions off PostgreSQL's default `PUBLIC` EXECUTE grant, because they are `SECURITY DEFINER`: without that revoke, any source role able to create a table and a trigger could attach the capture function to a table of its own, named after a synced table, and have every row it wrote applied to the target's real table. An install created BEFORE v0.145.0 keeps that grant until `sluice trigger setup` re-runs — and unlike the signalled reasons above, nothing reports it at stream open, because the capture-shape door grades the function's body, config and security flag and never reads its ACL. The reader-side scope check covers the window by dropping any captured row whose schema is not this stream's (a `CAPTURE-OUT-OF-SCOPE` warning, once per relation), so an unrevoked install is not exposed to the write primitive — but re-running setup is what actually closes it. Check with:
+
+```sql
+SELECT proname, proacl FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+ WHERE n.nspname = current_schema() AND proname LIKE sluice_capture%;
+```
+
+A `NULL` `proacl` is PostgreSQL's default, which means PUBLIC still holds EXECUTE.
+
+**`CAPTURE-OUT-OF-SCOPE`** is the warning that fires when a change-log row names a relation this stream does not sync. Two causes: a capture trigger left on a table outside the sync (a stale install, or the attack above), or a misconfiguration. The row is never applied and the stream continues; the log line carries the `REVOKE` remedy.
+
 ### Dropping a synced table (and the `DROP-CAPTURE-ABSENT` warning)
 
 Through v0.134.x, `DROP TABLE` on a synced source table was **invisible to capture**. The event trigger's tag list named `DROP TABLE`, but PostgreSQL reports dropped objects only through `pg_event_trigger_dropped_objects()` (a `sql_drop` event trigger) — never through the `pg_event_trigger_ddl_commands()` the DDL capture function reads — so the function found nothing to record. The stream kept running at exit 0 and the target kept the dropped table's last-synced rows forever.

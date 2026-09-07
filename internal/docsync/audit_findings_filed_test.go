@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -119,5 +121,136 @@ func TestAuditFindingsAreFiled(t *testing.T) {
 			"whose DECISION was recorded only in an untracked workspace file and gets re-litigated. "+
 			"File each under its ID, or mark it `prose <reason>` / `withdrawn <reason>` in the index.",
 			len(missing), strings.Join(missing, ", "))
+	}
+}
+
+// codeMarkerRE matches the `audit YYYY-MM-DD <ID>` markers the codebase
+// stamps beside a fix.
+var codeMarkerRE = regexp.MustCompile(`audit (20\d\d)-(\d\d)-\d\d ([A-Z][A-Za-z0-9-]*)`)
+
+// workerLabelRE matches a worker NUMBER ("W4" in "audit 2026-09-06 W4
+// H3"), which is not a finding id. Skipped rather than exempted: it is
+// not an unfiled finding, it is not a finding at all.
+var workerLabelRE = regexp.MustCompile(`^W\d+$`)
+
+// codeMarkerFloorYearMonth is the era this gate grades: markers dated on
+// or after it must be filed. Earlier ones predate the findings index and
+// are deliberately out of scope — see the doc below.
+const codeMarkerFloorYearMonth = 202609
+
+// codeMarkerExempt names an in-era marker that is deliberately unfiled,
+// with the reason. Fail-by-default.
+var codeMarkerExempt = map[string]string{}
+
+// TestAuditFindingsInCodeMarkersAreFiled closes audit 2026-09-06
+// PRE-TAG-5 — the gap in the gate above it.
+//
+// THE GAP. TestAuditFindingsAreFiled grades ids LISTED IN THE INDEX
+// against the backlog, so it cannot see a finding that never reached the
+// index at all. On the very release that shipped it, two ids the code's
+// own comments cite (H2, H5) were in neither file, and a third (H1) had
+// been fixed a release earlier and filed nowhere. A gate whose universe
+// is narrower than the thing it is named for.
+//
+// This one derives its universe from the CODE: every `audit YYYY-MM-DD
+// <ID>` marker a fix left behind. That is the independent evidence the
+// index cannot supply, because the index is written by the same pass
+// that would forget.
+//
+// WHY IT IS SCOPED TO AN ERA, stated plainly rather than left implied.
+// Across the whole tree 76 of 171 marker ids are absent from the
+// backlog — almost all of them historical (ARCH-*, D0-*, CRITICAL-*)
+// from audits that predate this file. Demanding 76 retroactive filings
+// would make the gate unlandable, and a gate nobody can land is a gate
+// nobody builds — which is exactly how PRE-TAG-5's ancestor went three
+// reconcilers without being written. So it grades the era in which the
+// discipline exists (2026-09 onward, where 26 of 27 were already filed
+// and the 27th is now), and says so here rather than pretending to
+// cover everything.
+//
+// Lowering the floor is the ratchet: each older era becomes gradeable as
+// its findings are filed.
+func TestAuditFindingsInCodeMarkersAreFiled(t *testing.T) {
+	root := repoRootFromDocsync(t)
+	backlogRaw, err := os.ReadFile(filepath.Join(root, "docs", "dev", "audit-backlog.md"))
+	if err != nil {
+		t.Fatalf("read backlog: %v", err)
+	}
+	backlog := string(backlogRaw)
+
+	ids := map[string]string{} // id -> first file it was seen in
+	scanned := 0
+	for _, dir := range []string{"internal", "cmd"} {
+		werr := filepath.Walk(filepath.Join(root, dir), func(p string, info os.FileInfo, err error) error {
+			if err != nil || info == nil || info.IsDir() || !strings.HasSuffix(p, ".go") {
+				return nil //nolint:nilerr // one unreadable subtree must not fail the whole walk
+			}
+			b, rerr := os.ReadFile(p)
+			if rerr != nil {
+				return nil //nolint:nilerr // same
+			}
+			scanned++
+			for _, m := range codeMarkerRE.FindAllStringSubmatch(string(b), -1) {
+				ym, cerr := strconv.Atoi(m[1] + m[2])
+				if cerr != nil || ym < codeMarkerFloorYearMonth {
+					continue
+				}
+				id := m[3]
+				if workerLabelRE.MatchString(id) {
+					continue
+				}
+				if _, seen := ids[id]; !seen {
+					ids[id] = strings.TrimPrefix(filepath.ToSlash(p), filepath.ToSlash(root)+"/")
+				}
+			}
+			return nil
+		})
+		if werr != nil {
+			t.Fatalf("walk %s: %v", dir, werr)
+		}
+	}
+
+	// Anti-vacuity, both halves: the walk must be reading real files, and
+	// the era must still contain markers. A regex that stops matching
+	// FAILS rather than passing over an empty set.
+	if scanned < 200 {
+		t.Fatalf("walked only %d .go files; the tree has far more, so this gate is grading almost nothing", scanned)
+	}
+	if len(ids) < 10 {
+		t.Fatalf("found only %d in-era audit markers %v; the 2026-09 era carries more, so the marker "+
+			"regex has drifted", len(ids), ids)
+	}
+
+	// WORD-BOUNDED, not a substring test. The first cut used
+	// strings.Contains and its own mutation run PASSED: renaming the
+	// backlog entry to "H1-MUTANT" still contains "H1". Short ids make
+	// that failure mode routine, and a gate that a rename satisfies is a
+	// gate that reports filed when the finding has been edited away.
+	filed := func(id string) bool {
+		re := regexp.MustCompile(`(^|[^A-Za-z0-9-])` + regexp.QuoteMeta(id) + `($|[^A-Za-z0-9-])`)
+		return re.MatchString(backlog)
+	}
+	var missing []string
+	for id, file := range ids {
+		if filed(id) {
+			continue
+		}
+		if why, ok := codeMarkerExempt[id]; ok {
+			if strings.TrimSpace(why) == "" {
+				t.Errorf("%s is exempt with an EMPTY reason", id)
+			}
+			continue
+		}
+		missing = append(missing, id+" ("+file+")")
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		t.Errorf("%d audit finding id(s) are cited by a code comment but appear nowhere in "+
+			"docs/dev/audit-backlog.md:\n  %s\n\n"+
+			"The code remembering a finding that the backlog does not is the leak four reconcilers "+
+			"reported, and the index-driven gate beside this one cannot see it — an id that never "+
+			"reached the index is invisible to a check that reads the index. File it, or add a "+
+			"codeMarkerExempt entry saying why it is not a backlog finding.",
+			len(missing), strings.Join(missing, "\n  "))
 	}
 }

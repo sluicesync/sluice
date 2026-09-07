@@ -159,3 +159,88 @@ func asRole(t *testing.T, dsn, user, pass string) string {
 	u.User = url.UserPassword(user, pass)
 	return u.String()
 }
+
+// TestCaptureFunctionACL_WarnsWhenPublicStillHoldsExecute pins audit
+// 2026-09-06 PRE-TAG-4: the advisory that tells an operator their
+// pre-v0.145.0 install still carries PUBLIC's EXECUTE grant.
+//
+// Before this arm existed there was no signal at all. The capture-shape
+// door grades the function's body, config and security flag and never
+// reads its ACL, so re-running `trigger setup` was a fifth reason with
+// no warning attached — while the operator docs enumerated four and
+// called the set closed.
+//
+// Both directions are graded because only one of them is the defect: a
+// probe that always warns would be noise on every current install, and a
+// probe that never warns is the gap itself.
+func TestCaptureFunctionACL_WarnsWhenPublicStillHoldsExecute(t *testing.T) {
+	dsn, cleanup := startPGForTrigger(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.ExecContext(ctx, `CREATE TABLE acl_warn_t (id int primary key, v text)`); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	if _, err := Setup(ctx, dsn, SetupOptions{Tables: []string{"acl_warn_t"}, Schema: "public"}); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	openFns := func(t *testing.T) []string {
+		t.Helper()
+		rows, qerr := db.QueryContext(ctx, `
+SELECT p.proname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+ WHERE n.nspname = 'public' AND p.proname LIKE 'sluice\_capture%'
+   AND (p.proacl IS NULL OR EXISTS (
+         SELECT 1 FROM pg_catalog.aclexplode(p.proacl) a
+          WHERE a.grantee = 0 AND a.privilege_type = 'EXECUTE'))`)
+		if qerr != nil {
+			t.Fatalf("query acls: %v", qerr)
+		}
+		defer func() { _ = rows.Close() }()
+		var out []string
+		for rows.Next() {
+			var n string
+			if serr := rows.Scan(&n); serr != nil {
+				t.Fatalf("scan: %v", serr)
+			}
+			out = append(out, n)
+		}
+		return out
+	}
+
+	// A CURRENT install: setup just revoked, so nothing should be open to
+	// PUBLIC. This is the no-false-fire direction, and it is the one that
+	// would make the advisory noise on every healthy stream.
+	if open := openFns(t); len(open) != 0 {
+		t.Fatalf("a freshly-set-up install still has %v EXECUTable by PUBLIC; the advisory would fire on "+
+			"every current install, which is noise rather than signal", open)
+	}
+
+	// Now recreate the pre-v0.145.0 posture by handing the grant back,
+	// and confirm the probe SEES it. Without this cell the check above
+	// would pass against a probe that can never detect anything.
+	if _, err := db.ExecContext(ctx,
+		`GRANT EXECUTE ON FUNCTION public.`+CaptureFunctionRow+`() TO PUBLIC`); err != nil {
+		t.Fatalf("re-grant to PUBLIC: %v", err)
+	}
+	open := openFns(t)
+	if len(open) == 0 {
+		t.Fatal("after handing EXECUTE back to PUBLIC the probe still reports nothing open — it cannot " +
+			"detect the very posture it exists to report, so the advisory is inert")
+	}
+	found := false
+	for _, n := range open {
+		if n == CaptureFunctionRow {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("the probe reports %v but not the row capture function, which is the one just re-granted", open)
+	}
+}

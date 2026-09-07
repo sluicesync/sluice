@@ -214,6 +214,12 @@ func verifyCaptureTriggerShape(ctx context.Context, db *sql.DB, schema string, m
 		return err
 	}
 	warnStaleCaptureFunctions(ctx, schema, drift)
+	// The ACL arm (audit 2026-09-06 PRE-TAG-4). WARN, never refuse — see
+	// [warnCaptureFunctionsExecutableByPublic] for why an advisory that
+	// failed closed would be the wrong trade. Deliberately last: it is
+	// the least urgent of the three signals and the only one that does
+	// not stop the stream.
+	warnCaptureFunctionsExecutableByPublic(ctx, pctx, db, schema)
 	return nil
 }
 
