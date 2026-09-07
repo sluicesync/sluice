@@ -380,3 +380,18 @@ func (h Hash) FingerprintMaterial() string {
 	}
 	return fingerprintDigest("hash.key", h.Key)
 }
+
+// FingerprintMaterial distinguishes two generic masks that differ only
+// in their mask CHARACTER. [Mask.Name] deliberately omits it as
+// uninteresting for an audit line — which is right for an audit line and
+// wrong for an identity, since `mask:inner:4,4,*` and `mask:inner:4,4,X`
+// emit different values for the same input.
+//
+// Returns "" for the fixed-format presets, whose Name already carries
+// everything that varies.
+func (m Mask) FingerprintMaterial() string {
+	if m.Char == "" {
+		return ""
+	}
+	return fingerprintDigest("mask.char", []byte(m.Char))
+}

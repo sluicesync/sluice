@@ -649,3 +649,30 @@ func (s *Streamer) wireReaderSchemaSeed(ctx context.Context, r ir.CDCReader) err
 	}
 	return nil
 }
+
+// wireSchemaDeltaArming arms a reader's session-GUC cast refusal
+// ([schemaDeltaTargetApplySetter]). Every site that opens a change
+// stream for a Streamer calls it; the roster is
+// TestSchemaDeltaArming_ReachesEveryReaderOpenSite.
+//
+// ONE HELPER RATHER THAN FOUR INLINE BLOCKS (audit 2026-09-06 H5's own
+// sibling miss, caught pre-tag by the v0.145.0 docs-drift pass). H5
+// widened [Streamer.schemaDeltaAppliesToTarget] so refuse mode arms like
+// every other mode — and the two MULTI-DATABASE reader-open sites called
+// the setter nowhere at all, so the MySQL fan-out stayed unarmed after
+// the fix that was supposed to cover every mode. The two single-stream
+// sites had the block inlined, which is how a third and fourth site came
+// to exist without one.
+//
+// The premise that hid it is written down next door: the seed roster's
+// doc says the fan-out "arms nothing, because
+// Streamer.schemaDeltaAppliesToTarget is false in multi-database mode by
+// construction". True when written, false the moment H5 landed — a
+// comment asserting an invariant, outliving the code it described.
+func (s *Streamer) wireSchemaDeltaArming(r ir.CDCReader) {
+	setter, ok := r.(schemaDeltaTargetApplySetter)
+	if !ok {
+		return
+	}
+	setter.SetSchemaDeltaAppliesToTarget(s.schemaDeltaAppliesToTarget())
+}

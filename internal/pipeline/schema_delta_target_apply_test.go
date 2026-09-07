@@ -104,44 +104,81 @@ func TestSchemaDeltaAppliesToTarget_Matrix(t *testing.T) {
 // SetSchemaDeltaAppliesToTarget(s.schemaDeltaAppliesToTarget()) must both
 // exist as CODE in each entry-point file.
 func TestSchemaDeltaTargetApplySetter_ArmedOnBothEntryPoints(t *testing.T) {
-	for _, file := range []string{"streamer_coldstart.go", "streamer_warm_resume.go"} {
+	// RETARGETED 2026-09-06: the four reader-open sites now arm through
+	// one helper, [Streamer.wireSchemaDeltaArming], instead of four
+	// inlined type-assert blocks. This gate used to require the assert to
+	// appear in each entry-point FILE, so the extraction turned it red on
+	// correct code — the extraction trap, and the fifth time this session.
+	//
+	// It now requires each entry point to REACH the helper, and grades the
+	// arming CONDITION at the helper itself. The wider question — does
+	// every site that opens a change stream arm at all, including the two
+	// multi-database sites this gate never covered — is
+	// TestSchemaDeltaArming_ReachesEveryReaderOpenSite.
+	for _, file := range []string{"streamer_coldstart.go", "streamer_warm_resume.go", "streamer_multidb.go"} {
 		fset := token.NewFileSet()
 		f, err := parser.ParseFile(fset, file, nil, 0)
 		if err != nil {
 			t.Fatalf("parse %s: %v", file, err)
 		}
-		asserted, armedWithUnion := false, false
+		reached := false
 		ast.Inspect(f, func(n ast.Node) bool {
-			switch v := n.(type) {
-			case *ast.TypeAssertExpr:
-				if id, ok := v.Type.(*ast.Ident); ok && id.Name == "schemaDeltaTargetApplySetter" {
-					asserted = true
-				}
-			case *ast.CallExpr:
-				sel, ok := v.Fun.(*ast.SelectorExpr)
-				if !ok || sel.Sel.Name != "SetSchemaDeltaAppliesToTarget" || len(v.Args) != 1 {
-					return true
-				}
-				arg, ok := v.Args[0].(*ast.CallExpr)
-				if !ok {
-					return true
-				}
-				argSel, ok := arg.Fun.(*ast.SelectorExpr)
-				if !ok || argSel.Sel.Name != "schemaDeltaAppliesToTarget" {
-					return true
-				}
-				if recv, ok := argSel.X.(*ast.Ident); ok && recv.Name == "s" {
-					armedWithUnion = true
-				}
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "wireSchemaDeltaArming" {
+				reached = true
 			}
 			return true
 		})
-		if !asserted {
-			t.Errorf("%s never type-asserts schemaDeltaTargetApplySetter — the session-GUC cast refusal is never armed on this entry point, so a MySQL TIMESTAMP⇄DATETIME MODIFY forwards silently for every stream that starts here", file)
-			continue
+		if !reached {
+			t.Errorf("%s never calls wireSchemaDeltaArming — the session-GUC cast refusal is never armed "+
+				"on this entry point, so a source TIMESTAMP/DATETIME swap goes unrefused for every stream "+
+				"that starts here", file)
 		}
-		if !armedWithUnion {
-			t.Errorf("%s arms the setter with something other than s.schemaDeltaAppliesToTarget() — the arming condition must be the UNION of the intercept and Shape A, not the intercept alone", file)
+	}
+
+	// The arming CONDITION, graded once at the helper: it must pass
+	// s.schemaDeltaAppliesToTarget() and not some narrower predicate.
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "schema_seed.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse schema_seed.go: %v", err)
+	}
+	asserted, armedWithUnion := false, false
+	ast.Inspect(f, func(n ast.Node) bool {
+		switch v := n.(type) {
+		case *ast.TypeAssertExpr:
+			if id, ok := v.Type.(*ast.Ident); ok && id.Name == "schemaDeltaTargetApplySetter" {
+				asserted = true
+			}
+		case *ast.CallExpr:
+			sel, ok := v.Fun.(*ast.SelectorExpr)
+			if !ok || sel.Sel.Name != "SetSchemaDeltaAppliesToTarget" || len(v.Args) != 1 {
+				return true
+			}
+			arg, ok := v.Args[0].(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			argSel, ok := arg.Fun.(*ast.SelectorExpr)
+			if !ok || argSel.Sel.Name != "schemaDeltaAppliesToTarget" {
+				return true
+			}
+			if recv, ok := argSel.X.(*ast.Ident); ok && recv.Name == "s" {
+				armedWithUnion = true
+			}
 		}
+		return true
+	})
+	if !asserted {
+		t.Fatal("schema_seed.go no longer type-asserts schemaDeltaTargetApplySetter; wireSchemaDeltaArming " +
+			"is where the arming lives, so this gate is now grading nothing")
+	}
+	if !armedWithUnion {
+		t.Error("wireSchemaDeltaArming arms the setter with something other than " +
+			"s.schemaDeltaAppliesToTarget() — the arming condition must be the widened predicate, not a " +
+			"narrower one")
 	}
 }

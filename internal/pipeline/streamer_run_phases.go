@@ -798,9 +798,13 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, lsnTrac
 		// at the persisted position as the fallback. The loader is
 		// installed here — the one place with the applier, the source and
 		// the position in hand — and run inside warmResume, only for a
-		// reader that accepts a seed. Only when a forward path is live: the
-		// seed feeds a refusal that is otherwise unarmed, and the reads are
-		// not free.
+		// reader that accepts a seed. The guard below used to read "only
+		// when a forward path is live: the seed feeds a refusal that is
+		// otherwise unarmed" — a cost argument that stopped being true
+		// when audit 2026-09-06 H5 widened the predicate, since the
+		// refusal is now armed in every mode. It is kept as a call rather
+		// than deleted so the predicate stays the single place that
+		// answers the question, but it no longer excludes anything.
 		if s.schemaDeltaAppliesToTarget() {
 			s.readerSchemaSeed = s.warmResumeSchemaSeedLoader(applier, streamID, persisted)
 		}

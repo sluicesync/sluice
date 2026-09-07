@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -248,3 +249,52 @@ var (
 	_ Strategy = RandomizeDict{}
 	_ Strategy = TokenizeDict{}
 )
+
+// FingerprintMaterial distinguishes two `randomize:dict` policies whose
+// dictionary NAME matches but whose CONTENTS differ.
+//
+// [Name] carries only DictName, so two runs pointing the same name at
+// different YAML produced identical fingerprints while emitting
+// different surrogates for the same input.
+func (r RandomizeDict) FingerprintMaterial() string {
+	return fingerprintDigest("randomize.dict", dictMaterial(r.DictName, r.Entries, "", nil))
+}
+
+// FingerprintMaterial distinguishes two `tokenize:dict` policies. This
+// is the widest of the fingerprint gaps the v0.145.0 pre-tag review
+// found, because THREE inputs decide the surrogate and [Name] carried
+// none of them: the dictionary contents, the keyset-resolved HMAC Key,
+// and the run's StreamID.
+//
+// THE STREAM-ID ARM NEEDS NO ROTATION AT ALL, which is what makes it
+// worse than a key mismatch. `backup full` constructs the strategy with
+// an empty StreamID and `sync start` with the operator's stream id, so
+// the workflow [RefusePositionFromRedactedChain]'s own remedy prescribes
+// — "pass the SAME --redact rules to sluice sync start" — produced two
+// different surrogates for one source value while the two markers
+// compared EQUAL and the door passed. Restored rows kept the backup's
+// token; every replicated update overwrote it with the sync's.
+//
+// Key and StreamID are hashed here, never carried, so the manifest still
+// records no secret.
+func (t TokenizeDict) FingerprintMaterial() string {
+	return fingerprintDigest("tokenize.dict", dictMaterial(t.DictName, t.Entries, t.StreamID, t.Key))
+}
+
+// dictMaterial renders a dictionary strategy's distinguishing inputs as
+// one length-prefixed byte string, injective over its parts so a name
+// containing the separator cannot forge a boundary (the same rule
+// [Registry.Fingerprint] applies to its own tokens).
+//
+// Entry ORDER is significant and deliberately so: both dictionary
+// strategies select by index, so a reordered dictionary emits different
+// surrogates for the same input and is a different policy.
+func dictMaterial(name string, entries []string, streamID string, key []byte) []byte {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%d:%s\n%d:%s\n%d:%s\n", len(name), name, len(streamID), streamID, len(key), key)
+	fmt.Fprintf(&b, "%d entries\n", len(entries))
+	for _, e := range entries {
+		fmt.Fprintf(&b, "%d:%s\n", len(e), e)
+	}
+	return []byte(b.String())
+}

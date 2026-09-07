@@ -80,9 +80,7 @@ func (s *Streamer) warmResume(ctx context.Context, persisted ir.Position, lsnTra
 	// SL-2 (audit 2026-08-31), warm-resume mirror: arm the reader's
 	// session-GUC cast refusal whenever ANY path re-applies an observed
 	// delta to the target (the intercept OR Shape A's boundary router).
-	if setter, ok := cdc.(schemaDeltaTargetApplySetter); ok {
-		setter.SetSchemaDeltaAppliesToTarget(s.schemaDeltaAppliesToTarget())
-	}
+	s.wireSchemaDeltaArming(cdc)
 	// SLM-1, warm-resume mirror: the prior shape per table is the target's
 	// zone witness with the retained schema-history version as fallback
 	// (SLM-1b), through the loader phaseOpenChangeStream installed before

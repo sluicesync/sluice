@@ -437,6 +437,10 @@ func (s *Streamer) coldStartMultiDatabase(
 	}
 	// Bug 246: reader-side scope predicate, multidb cold-start mirror.
 	s.wireCDCScopePredicate(stream.Changes)
+	// H5 sibling (2026-09-06): arm the session-zone refusal here too. This
+	// site called the setter nowhere until the v0.145.0 pre-tag pass asked
+	// whether the fan-out reached it.
+	s.wireSchemaDeltaArming(stream.Changes)
 	// SLM-1d: and the prior shape the session-zone door compares against at
 	// each table's FIRST boundary — the raw per-namespace source IR the copy
 	// loop above accumulated, keyed by (namespace, table) because this reader
@@ -639,6 +643,8 @@ func (s *Streamer) warmResumeMultiDatabase(
 	}
 	// Bug 246: reader-side scope predicate, multidb warm-resume mirror.
 	s.wireCDCScopePredicate(cdc)
+	// H5 sibling (2026-09-06), warm-resume mirror of the cold-start arming.
+	s.wireSchemaDeltaArming(cdc)
 	// SLM-1d: the fan-out warm-resume prior — the TARGET's zone witness read
 	// once per selected namespace, with the retained schema history as the
 	// per-table fallback, stamped with each table's SOURCE namespace. The

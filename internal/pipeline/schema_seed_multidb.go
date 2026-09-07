@@ -52,10 +52,16 @@ package pipeline
 //
 // The seed is consulted by the Postgres lane's seeded door
 // unconditionally, which is the lane the harm was measured on. The MySQL
-// lanes gate their refusal on schemaDeltaAppliesToTarget, which is false
-// in multi-database mode by construction ([singleStreamSchemaForwardActive]),
-// so on a MySQL fan-out the seed is delivered and INERT today: it arms
-// nothing, and it changes no behaviour. It is wired anyway rather than
+// lanes gate their refusal on schemaDeltaAppliesToTarget — and the
+// sentence that stood here, that the flag "is false in multi-database
+// mode by construction … so on a MySQL fan-out the seed is delivered and
+// INERT today", was TRUE when written and FALSE from the moment audit
+// 2026-09-06 H5 widened that predicate. It survived the fix by a day and
+// was caught by the v0.145.0 pre-tag pass; the fan-out now arms through
+// [Streamer.wireSchemaDeltaArming] like the two single-stream sites, so
+// the seed here is live rather than inert. Recorded rather than quietly
+// deleted, because "by construction" is the phrase this project has
+// learned to distrust. It is wired anyway rather than
 // engine-gated, because the alternative is a reader-open site that
 // deliberately does not seed — the exact state this whole surface exists
 // to make impossible, and the state the parity gate now fails on.

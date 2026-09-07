@@ -1361,9 +1361,7 @@ func (s *Streamer) coldStartBeginCDC(ctx context.Context, stream *ir.SnapshotStr
 	// whenever ANY path re-applies an observed delta to the target — the
 	// intercept above OR Shape A's boundary router. Wider than the setter
 	// above on purpose; see [schemaDeltaTargetApplySetter].
-	if setter, ok := stream.Changes.(schemaDeltaTargetApplySetter); ok {
-		setter.SetSchemaDeltaAppliesToTarget(s.schemaDeltaAppliesToTarget())
-	}
+	s.wireSchemaDeltaArming(stream.Changes)
 	// SLM-1: and the prior shape that refusal compares against at each
 	// table's FIRST boundary — the raw source IR coldStartPrepareSchema
 	// captured. Without it the arming above is inert until the reader has

@@ -655,7 +655,7 @@ func (r *CDCReader) poll(ctx context.Context, lastSeen int64) (pollBatch, error)
 		//
 		// A dropped row is WARNed once per (schema, table): it is either an
 		// attack or a misconfiguration, and both deserve to be visible.
-		if !r.rowInCaptureScope(schema, table) {
+		if !r.rowInCaptureScope(op, schema, table) {
 			r.warnOutOfScopeCapture(ctx, schema, table, id)
 			continue
 		}
@@ -1078,9 +1078,36 @@ func (r *CDCReader) SetCDCScopePredicate(allowed func(schema, table string) bool
 //     security half: the pipeline's closure matches on table NAME alone,
 //     which is exactly why the schema check above cannot be folded into
 //     it.
-func (r *CDCReader) rowInCaptureScope(schema, table string) bool {
+func (r *CDCReader) rowInCaptureScope(op, schema, table string) bool {
 	if schema != r.schema {
 		return false
+	}
+	// THE TABLE-SCOPE HALF IS NOT APPLIED TO DDL MARKERS, and this arm is
+	// the fix for a silent-loss regression the first cut of this check
+	// introduced (found by the v0.145.0 pre-tag value-fidelity review).
+	//
+	// The change log carries table_name in TWO shapes. The row and
+	// TRUNCATE arms write a BARE TG_TABLE_NAME; the ddl_command_end and
+	// sql_drop arms write COALESCE(r.object_identity, ...), which is
+	// SCHEMA-QUALIFIED ("public.orders"). The pipeline scope predicate
+	// matches bare names — path.Match("orders", "public.orders") is
+	// false — so grading an X row through it dropped every DDL marker for
+	// a CAPTURED table whenever --include-table was set.
+	//
+	// The harm was the D-1 class reopened silently: a DROP TABLE on a
+	// synced table writes an X row, the drop marker was discarded, the
+	// observed-DDL refusal never fired, and the stream ran on at exit 0
+	// with the target holding the dropped table rows forever — while the
+	// WARN claimed the relation was "not synced", which was false.
+	//
+	// X rows do not need the table half. They carry no row data, so they
+	// cannot forge a write; and they are already scoped at the SOURCE —
+	// the capture functions only record DDL on relations carrying this
+	// install`s capture trigger (SLP-2). The schema half above still
+	// applies, so a decoy relation in another schema cannot halt this
+	// stream.
+	if op == "X" {
+		return true
 	}
 	if r.scopeAllowed != nil && !r.scopeAllowed(schema, table) {
 		return false

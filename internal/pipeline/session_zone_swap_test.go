@@ -600,6 +600,8 @@ func TestSchemaSeed_WiredWhereverTheRefusalIsArmed(t *testing.T) {
 			ast.Inspect(fd.Body, func(n ast.Node) bool {
 				switch v := n.(type) {
 				case *ast.TypeAssertExpr:
+					// Retained so the walk still recognises an INLINED
+					// assert, should one come back.
 					if id, ok := v.Type.(*ast.Ident); ok && id.Name == "schemaDeltaTargetApplySetter" {
 						arms = true
 					}
@@ -607,7 +609,16 @@ func TestSchemaSeed_WiredWhereverTheRefusalIsArmed(t *testing.T) {
 					switch fun := v.Fun.(type) {
 					case *ast.SelectorExpr:
 						called[fun.Sel.Name] = true
-						if fun.Sel.Name == "wireReaderSchemaSeed" {
+						// RETARGETED 2026-09-06: arming moved into the shared
+						// wireSchemaDeltaArming helper, so a site now ARMS by
+						// calling it rather than by type-asserting inline. And
+						// the fan-out seeds through wireReaderSchemaSeedFrom,
+						// which this gate never named — it could not have seen
+						// the multi-database sites even if they had armed.
+						if fun.Sel.Name == "wireSchemaDeltaArming" {
+							arms = true
+						}
+						if fun.Sel.Name == "wireReaderSchemaSeed" || fun.Sel.Name == "wireReaderSchemaSeedFrom" {
 							seeds = true
 						}
 					case *ast.Ident:
@@ -617,6 +628,13 @@ func TestSchemaSeed_WiredWhereverTheRefusalIsArmed(t *testing.T) {
 				return true
 			})
 			fn := name + "::" + funcDeclName(fd)
+			// The arming HELPER itself is the primitive, not a call site: it
+			// arms by definition and seeds nothing by design (seeding is a
+			// separate wire* call at each of the four sites). Counting it
+			// would make this gate demand that the primitive do both.
+			if funcDeclName(fd) == "(*Streamer).wireSchemaDeltaArming" {
+				continue
+			}
 			if arms {
 				arming++
 				if !seeds {
@@ -627,8 +645,12 @@ func TestSchemaSeed_WiredWhereverTheRefusalIsArmed(t *testing.T) {
 		}
 	}
 	// Anti-vacuity: the cold-start and warm-resume open paths both arm.
-	if arming < 2 {
-		t.Fatalf("found %d arming sites; floor 2 (coldStartBeginCDC, warmResume) — the walk is vacuous", arming)
+	// Anti-vacuity, raised from 2 to 4 on 2026-09-06: the fan-out`s two
+	// reader-open sites now arm too, so a walk finding only the original
+	// single-stream pair has stopped seeing half the universe.
+	if arming < 4 {
+		t.Fatalf("found %d arming sites; floor 4 (coldStartBeginCDC, warmResume, and the two "+
+			"multi-database opens) — the walk is vacuous or the fan-out stopped arming", arming)
 	}
 	// The warm-resume dispatcher installs the loader, and the loader reads
 	// BOTH priors — the target witness and the history fallback (SLM-1b):

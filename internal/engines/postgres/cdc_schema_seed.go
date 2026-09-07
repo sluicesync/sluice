@@ -53,10 +53,18 @@ import (
 // resume-time classification — those keep priming exactly as before;
 // the warm-resume source↔target shape reconciliation is the A2-1
 // follow-up, not this. The seed is installed by the streamer only when a
-// path re-applies deltas to the target (pipeline.schemaDeltaAppliesToTarget:
-// `--schema-changes=forward`, the default, or Shape A); under
-// `--schema-changes=refuse` no lane seeds, so a stopped-stream swap in
-// that mode still primes here — stated, not hidden.
+// path re-applies deltas to the target (pipeline.schemaDeltaAppliesToTarget).
+//
+// The residual that stood here — "under `--schema-changes=refuse` no
+// lane seeds, so a stopped-stream swap in that mode still primes here —
+// stated, not hidden" — is GONE (audit 2026-09-06 H5). It was the
+// engine-side copy of the same sentence the pipeline carried, and it was
+// the defect rather than a limitation: refuse mode was measured to
+// surface no refusal at all. The predicate now answers "does this stream
+// apply changes to a target", which is always yes, so every lane seeds
+// in every mode. The copy outliving its original by one release is the
+// point worth keeping: a residual stated in two places gets fixed in
+// one.
 //
 // Precision never enters the predicate (a `timestamp(3)` seed against a
 // `timestamptz` wire type is a swap; `timestamp` against `timestamp(3)`
