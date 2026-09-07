@@ -20,27 +20,22 @@
 # named via the trailing `:<keyname>` segment and sourced with
 # `--keyset-source file:<path>`.
 #
-# ---- REAL DOC BUG this pin surfaces (flagged, NOT silently worked around) ----
-# recipe-redaction-keyset.md "Step 1 / Option A: file-backed" documents the
-# keyset YAML as:
-#       keys:
-#         email_v1: "base64-of-32-random-bytes-here..."
-# The released binary REJECTS that shape at preflight:
-#   "--keyset-source ...: redact: keyset has no keys (the 'keyset.keys' list is
-#    empty); declare at least one named key with a generation"
-# The shape the binary actually accepts is the nested one from the authoritative
-# docs/redaction.md "Keyset shape":
-#       keyset:
-#         default: <keyname>
-#         keys:
-#           - name: <keyname>
-#             active: 1
-#             generations:
-#               - generation: 1
-#                 bytes: "<base64 32-byte secret>"
-# This pin writes the REAL (accepted) shape so it stays green, and this header +
-# the runner report are the flag for a docs fix to recipe-redaction-keyset.md
-# Step 1 (align its Option A/B/C examples with docs/redaction.md's keyset shape).
+# ---- TWO DOC BUGS THIS PIN SURFACED, BOTH NOW FIXED IN THE PAGE -------------
+# Kept as history because each was found the same way and neither could have
+# been found by reading the page:
+#
+#   Option A wrote the keyset YAML flat (`keys:` / `email_v1: "..."`). The
+#   binary rejects that shape — "keyset has no keys (the 'keyset.keys' list is
+#   empty)" — and the accepted nested shape is the one in docs/redaction.md.
+#   This pin wrote the accepted shape and flagged the page; the page was fixed.
+#
+#   Option B documented a per-key variable plus a PREFIX
+#   (`--keyset-source 'env:SLUICE_KEYSET_'`), a scheme the loader has never
+#   had. That one this pin did NOT catch, because it had no env cell — the
+#   gap Bug 274 filed and the "Option B" cell below closes.
+#
+# The through-line worth keeping: this pin's coverage, not its result, is what
+# said anything about the page. It was green across both bugs.
 #
 # Local PG src -> PG dst; throwaway DBs (cookbook_red_src / cookbook_red_dst)
 # it creates + drops, plus a temp keyset file.
@@ -142,6 +137,35 @@ pg_dst_sql "$DSTDB" "DROP SCHEMA public CASCADE; CREATE SCHEMA public; GRANT ALL
 assert_rc0 "$?" "$STEP" "second migrate exits 0"
 DST_EMAIL1B=$(pg_dst_sql "$DSTDB" "SELECT email FROM users WHERE id=1")
 assert_eq "$DST_EMAIL1B" "$DST_EMAIL1" "$STEP" "same input -> same surrogate across runs"
+
+# ---- Option B: the ENV-backed keyset, graded against Option A's ground truth -
+# Bug 274. This cell exists because the recipe's three keyset options were
+# covered by one of them: the runner reported "PASS  PII redaction with keyset"
+# for a page whose Option B documented a scheme sluice has never implemented (a
+# per-key variable plus a PREFIX, as though the loader globbed the environment).
+# The page was wrong for as long as it liked, because nothing executed it.
+#
+# The assertion is deliberately NOT "env: exits 0". It is that env: produces the
+# SAME surrogate as the file-backed run and as the independently computed HMAC —
+# which is the recipe's actual claim, that the option you pick is a delivery
+# mechanism and not a change in behaviour. An env cell that only checked rc=0
+# would pass on a keyset that silently loaded some OTHER key.
+STEP="Option B: env-backed keyset"
+pg_dst_sql "$DSTDB" "DROP SCHEMA public CASCADE; CREATE SCHEMA public; GRANT ALL ON SCHEMA public TO $PG_USER;" >/dev/null
+# One variable holding the WHOLE keyset document — the documented form, and the
+# same bytes Option A wrote to disk.
+SLUICE_COOKBOOK_KEYSET="$(cat "$KSFILE")"
+export SLUICE_COOKBOOK_KEYSET
+"$SLUICE" migrate \
+  --source-driver postgres --source "$SRC_DSN" \
+  --target-driver postgres --target "$DST_DSN" \
+  --keyset-source "env:SLUICE_COOKBOOK_KEYSET" \
+  --redact "public.users.email=hash:hmac-sha256:$KEYNAME"
+assert_rc0 "$?" "$STEP" "migrate with an env-backed keyset exits 0"
+DST_EMAIL1C=$(pg_dst_sql "$DSTDB" "SELECT email FROM users WHERE id=1")
+assert_eq "$DST_EMAIL1C" "$GT_ALICE" "$STEP" "env-backed surrogate == independent HMAC-SHA256(key,email)"
+assert_eq "$DST_EMAIL1C" "$DST_EMAIL1" "$STEP" "env: and file: produce the SAME surrogate"
+unset SLUICE_COOKBOOK_KEYSET
 
 # ---- Common pitfalls: keyed strategy WITHOUT --keyset-source refuses loudly --
 STEP="Common pitfalls: no --keyset-source must refuse"
