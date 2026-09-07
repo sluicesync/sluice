@@ -2371,6 +2371,30 @@ func safePurgeHint(p binlogPos) string {
 // can key on it.
 const unverifiedInstanceIdentityMarker = "UNVERIFIED-INSTANCE-IDENTITY"
 
+// instanceIdentityChangedMarker is the grep-stable handle for the arm that
+// FIRES — the persisted position names one instance and the DSN answers as
+// another.
+//
+// It exists because the message that used to stand here said sluice was
+// "refusing to resume to avoid a silent data gap", and sluice does not refuse
+// (audit SLM-6). The error returned wraps [ir.ErrPositionInvalid], which is
+// deliberate — it routes the streamer's ADR-0022 fall-through — and on a
+// binlog/GTID source that fall-through AUTO-RE-SNAPSHOTS, dropping the
+// target's tables and re-copying from the instance now answering the DSN (the
+// audit observed `tables_dropped=2`). So the one message an operator sees at
+// the moment sluice is about to perform its most destructive action told them
+// they were being protected from it.
+//
+// The BEHAVIOUR is unchanged and deliberate: for a replaced node the
+// re-snapshot is the correct recovery, and it is the same posture the
+// slot-purge case takes. What was wrong was only the claim. Whether an
+// identity change — unlike a slot purge, it means a DIFFERENT SERVER, which
+// sluice cannot distinguish from a misconfigured DSN — should instead refuse
+// by default is a live operator question recorded in
+// docs/dev/audit-backlog.md, not something to flip silently: today it would
+// turn a configuration that auto-recovers into one that halts.
+const instanceIdentityChangedMarker = "SOURCE-INSTANCE-IDENTITY-CHANGED"
+
 // verifySourceInstanceIdentity refuses a file/pos resume whose
 // persisted @@server_uuid differs from the source instance the
 // resume is now connecting to. This is the loud-failure floor for
@@ -2442,9 +2466,17 @@ func verifySourceInstanceIdentity(ctx context.Context, persistedUUID, currentUUI
 		return nil
 	}
 	slog.WarnContext(
-		ctx, "mysql: cdc: source instance identity changed since the persisted "+
-			"position was captured (node replaced / restored from backup / failed over); the binlog "+
-			"lineage does not carry over — refusing to resume to avoid a silent data gap",
+		ctx, "mysql: cdc: "+instanceIdentityChangedMarker+": the source instance answering this DSN is "+
+			"NOT the one the persisted position was captured from (node replaced / restored from backup / "+
+			"failed over). The binlog lineage does not carry over, so this position cannot be resumed. "+
+			"WHAT HAPPENS NEXT IS NOT A REFUSAL by default: the stream falls through to a cold start, and "+
+			"on a binlog/GTID source that AUTO-RE-SNAPSHOTS — it DROPS the target's tables and re-copies "+
+			"them from whichever instance is now answering this DSN. That is the right recovery when the "+
+			"replacement is the one you intended, and it copies the WRONG DATABASE over your target when "+
+			"it is not (a stale connection string, a DNS failover into another cluster, a restored node "+
+			"pointed at the wrong backup). Verify the instance below is the one you meant BEFORE the copy "+
+			"finishes. To make this a terminal error instead of an automatic re-copy, run with "+
+			"--no-auto-resnapshot",
 		slog.String("persisted_server_uuid", persistedUUID),
 		slog.String("current_server_uuid", currentUUID),
 	)
