@@ -8,6 +8,8 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -77,11 +79,31 @@ func TestInstanceIdentityMismatch_RefusesTerminally(t *testing.T) {
 			"this test's doc, not just the assertion.", err)
 	}
 
-	// The operator has to be able to act on it: what happened, and the one
-	// command that makes the re-copy deliberate.
-	for _, want := range []string{"REFUSING", "--restart-from-scratch", "uuid-old", "uuid-new"} {
+	// The operator has to be able to act on it — and the remedy is
+	// PER-CALLER, which is the part that was wrong when this shipped.
+	//
+	// THREE callers reach this door, enumerated in backup_position.go's
+	// `backupPositionServerUUID` doc: a warm `sync start` resume,
+	// `sync start --position-from-manifest`, and `backup incremental`. The
+	// first cut of this refusal named only `--restart-from-scratch`. That is
+	// right for one of the three, absent from `backup` entirely, and on the
+	// manifest path it is REJECTED as mutually exclusive with
+	// --position-from-manifest — so an operator following the advice
+	// literally got a second refusal, mid-incident, from the message that was
+	// supposed to get them out. Found pre-tag by the docs-drift review; it is
+	// the "a recovery hint that cannot run" class, and the "a refusal that
+	// moved reaches one path and stops covering another" shape.
+	for _, want := range []string{
+		"REFUSING",
+		"--restart-from-scratch",   // the warm-resume path
+		"--position-from-manifest", // the manifest path, and why the flag above is not it
+		"backup full",              // the backup incremental path
+		"uuid-old", "uuid-new",
+	} {
 		if !strings.Contains(err.Error(), want) {
-			t.Errorf("the refusal no longer names %q:\n  %v", want, err)
+			t.Errorf("the refusal no longer names %q. Three callers reach this door and each needs a "+
+				"different remedy; a message naming only one sends the other two into a dead end:\n  %v",
+				want, err)
 		}
 	}
 
@@ -92,6 +114,35 @@ func TestInstanceIdentityMismatch_RefusesTerminally(t *testing.T) {
 		if !strings.Contains(log, want) {
 			t.Errorf("the identity-mismatch WARN no longer names %q:\n  %s", want, strings.TrimSpace(log))
 		}
+	}
+}
+
+// TestInstanceIdentityRemedy_MutualExclusionPremiseHolds binds the one claim
+// in the refusal that is a fact about OTHER code.
+//
+// The message tells an operator on the `--position-from-manifest` path that
+// `--restart-from-scratch` "is rejected alongside --position-from-manifest, so
+// it is not the answer there". That is true because of
+// `SyncStartCmd.validateFlagCombos` in cmd/sluice — a different package this
+// one cannot import. Per the project's premise-naming rule, a safety or
+// recovery argument that cites a fact about code elsewhere gets a check in the
+// same change or it is an unverified premise.
+//
+// If that exclusion is ever lifted, this test fails and the refusal's wording
+// can be SIMPLIFIED — which is the useful direction: the message is longer
+// than anyone wants precisely because the exclusion exists.
+func TestInstanceIdentityRemedy_MutualExclusionPremiseHolds(t *testing.T) {
+	src, err := os.ReadFile(filepath.Join("..", "..", "..", "cmd", "sluice", "cli.go"))
+	if err != nil {
+		t.Fatalf("read cmd/sluice/cli.go: %v", err)
+	}
+	if !strings.Contains(string(src), "RestartFromScratch && s.PositionFromManifest != \"\"") {
+		t.Error("the refusal at verifySourceInstanceIdentity tells operators that " +
+			"--restart-from-scratch is rejected alongside --position-from-manifest, but " +
+			"validateFlagCombos no longer enforces that.\n" +
+			"Either the premise moved (find its new home and re-point this check) or the exclusion " +
+			"was lifted — in which case --restart-from-scratch IS a valid remedy on the manifest " +
+			"path and the refusal's wording should be shortened accordingly.")
 	}
 }
 

@@ -2511,8 +2511,12 @@ func verifySourceInstanceIdentity(ctx context.Context, persistedUUID, currentUUI
 		"routine purge and destructive here, where the source is a different server. First confirm "+
 		"this instance is the one you meant — a stale connection string, a load-balanced or DNS-failover "+
 		"endpoint, or a node restored from the wrong backup all look identical to an intended "+
-		"replacement from here. If the replacement IS intended, re-run with --restart-from-scratch to "+
-		"re-copy from it deliberately",
+		"replacement from here. If the replacement IS intended, re-copy from it deliberately, and HOW "+
+		"depends on which command you ran: a warm `sync start` takes --restart-from-scratch; a "+
+		"`sync start --position-from-manifest` needs a manifest captured FROM this instance, or a fresh "+
+		"`backup full` to make one (--restart-from-scratch is rejected alongside --position-from-manifest, "+
+		"so it is not the answer there); `backup incremental` and `backup stream` need a fresh "+
+		"`backup full`, neither having a --restart-from-scratch flag at all",
 		currentUUID, persistedUUID)
 }
 

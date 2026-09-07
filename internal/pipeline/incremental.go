@@ -354,8 +354,17 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 		// source's WAL / binlog has been pruned past startPos. Surface
 		// that loudly with a clear "your --since parent is too old;
 		// take a fresh full" line.
+		//
+		// SCOPE NARROWED v0.146.0 (audit SLM-6): this branch used to say
+		// "or the source identity changed" and cover that case too. The
+		// MySQL file/pos @@server_uuid mismatch no longer wraps
+		// ir.ErrPositionInvalid — deliberately, so it cannot route the
+		// streamer's auto-resnapshot — so it does NOT arrive here. It
+		// surfaces as its own terminal error whose message already names
+		// the per-command remedy, including this one. A GTID lineage the
+		// source never executed still wraps and still lands here.
 		if errors.Is(err, ir.ErrPositionInvalid) {
-			return fmt.Errorf("incremental: source cannot serve the parent's terminal position (WAL/binlog pruned past it, or the source identity changed); take a fresh full backup — `backup full --chain-slot` provisions retention so this cannot recur — or shorten the chain interval. Underlying: %w", err)
+			return fmt.Errorf("incremental: source cannot serve the parent's terminal position (WAL/binlog pruned past it, or a GTID lineage the source never executed); take a fresh full backup — `backup full --chain-slot` provisions retention so this cannot recur — or shorten the chain interval. Underlying: %w", err)
 		}
 		return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("incremental: start cdc stream: %w", err))
 	}

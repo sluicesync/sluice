@@ -1798,7 +1798,28 @@ func tableManifestFullyComplete(ctx context.Context, store irbackup.Store, entry
 // it is the run whose operator has already asked for an integrity
 // guarantee. Stated here rather than hidden, because a future change
 // that makes signing the default inherits this cost.
+// THE INDEPENDENT NUMBER, added 2026-09-07 by this release's own pre-tag
+// value-fidelity review. The hash loop below re-hashes exactly the chunks the
+// manifest LISTS, so its "all clear" derives from the same artifact it is
+// checking: an adversary who removes a chunk's ENTRY as well as its file
+// leaves a manifest that is internally consistent, every listed chunk present
+// and matching, and the table is adopted as complete and then signed. The doc
+// above named that shape ("drops a chunk entry and its file") while the check
+// could not see it — the "verification with no independent expected value"
+// rule, in the code that rule was written for.
+//
+// [irbackup.TableManifest.RowCount] is that value, recorded by the WRITER at
+// table completion and independent of the chunk list, which is why restore
+// already compares against it. A dropped entry lowers the sum and no longer
+// reconciles.
+//
+// NOT closed, and named rather than implied: flipping `Partial: true → false`
+// on a mid-table checkpoint. Such an entry's RowCount is the sum of the chunks
+// it has, so the identity still holds and the check cannot distinguish it from
+// a completed table. Closing that needs a witness the writer stamps at
+// completion, which does not exist yet.
 func tableChunksAllMatch(ctx context.Context, store irbackup.Store, entry *irbackup.TableManifest) (bool, error) {
+	var sum int64
 	for _, c := range entry.Chunks {
 		ok, err := chunkAlreadyMatches(ctx, store, c.File, c.SHA256)
 		if err != nil {
@@ -1807,6 +1828,15 @@ func tableChunksAllMatch(ctx context.Context, store irbackup.Store, entry *irbac
 		if !ok {
 			return false, nil
 		}
+		sum += c.RowCount
+	}
+	// A zero recorded RowCount is not evidence of anything: manifests written
+	// before the writer stamped it carry zero for a perfectly good table, so
+	// demanding the identity there would refuse to adopt every older
+	// interrupted backup. Reconcile only when there is something to reconcile
+	// against.
+	if entry.RowCount > 0 && sum != entry.RowCount {
+		return false, nil
 	}
 	return true, nil
 }

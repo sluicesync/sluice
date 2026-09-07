@@ -16,6 +16,7 @@ package pgtrigger
 
 import (
 	"database/sql"
+	"encoding/base64"
 	"strings"
 	"testing"
 )
@@ -402,9 +403,37 @@ func TestGradeCaptureShape_GradesTheTriggerWiring(t *testing.T) {
 // change-log row for the table from that argument, so the applier
 // matches the wrong target row.
 func TestGradeCaptureShape_GradesThePKArgumentValue(t *testing.T) {
+	// withPK builds the fixture the way POSTGRESQL does, not the way the
+	// parser wishes it would.
+	//
+	// This helper is the fix for a HIGH that shipped inert (v0.146.0 pre-tag,
+	// found by the value-fidelity review). The door read
+	// `encode(tgargs,'escape')` and trimmed a Go NUL byte, and the fixture
+	// handed it a Go NUL byte — so the test proved the parser agreed with the
+	// test's own idea of the input, which was never in doubt. Measured on real
+	// PostgreSQL 16, `escape` renders the terminator as the four literal
+	// characters `\000` (a healthy `'["id"]'` comes back as `["id"]\000`, 10
+	// chars over 7 raw bytes), so the trim removed nothing, the JSON parse
+	// failed, and the ENTIRE primary-key grading was skipped on every real
+	// install. The query now uses base64, and this helper encodes exactly what
+	// the server returns: the argument bytes, NUL-terminated, base64'd.
+	//
+	// Every cell below therefore exercises a server-shaped value. Do not add a
+	// cell that hand-writes a base64 string unless it came off a server.
+	pgTgArgs := func(args string) string {
+		return base64.StdEncoding.EncodeToString(append([]byte(args), 0))
+	}
 	withPK := func(args, livePK string) []installedCaptureTrigger {
 		trigs := healthyTriggers("t")
-		trigs[0].args = args
+		trigs[0].args = pgTgArgs(args)
+		trigs[0].livePK = livePK
+		return trigs
+	}
+	// withRawPK bypasses the encoder for the cells that are ABOUT malformed
+	// server output rather than about a wrong key.
+	withRawPK := func(rawArgs, livePK string) []installedCaptureTrigger {
+		trigs := healthyTriggers("t")
+		trigs[0].args = rawArgs
 		trigs[0].livePK = livePK
 		return trigs
 	}
@@ -432,12 +461,60 @@ func TestGradeCaptureShape_GradesThePKArgumentValue(t *testing.T) {
 		}
 	})
 
-	t.Run("the matching case passes, including a trailing NUL", func(t *testing.T) {
-		// pg_trigger.tgargs is null-separated, so a single argument
-		// arrives with a trailing NUL. Without the trim this cell fails
-		// on every healthy install.
-		if err := gradeCaptureShape("public", withPK("[\"id\"]\x00", `["id"]`), healthyTiers(), false); err != nil {
+	t.Run("the matching case passes, on real server-shaped bytes", func(t *testing.T) {
+		if err := gradeCaptureShape("public", withPK(`["id"]`, `["id"]`), healthyTiers(), false); err != nil {
 			t.Fatalf("a correctly-installed trigger was refused: %v", err)
+		}
+	})
+
+	t.Run("VERBATIM server output parses — the anti-vacuity floor", func(t *testing.T) {
+		// The cell that would have caught the inert door, and the reason it
+		// hard-codes a literal: these two strings were COPIED OFF a real
+		// PostgreSQL 16, not constructed by the same helper the other cells
+		// use. If parsePKColumnList ever stops understanding what the server
+		// actually sends, every other cell here keeps passing (they agree
+		// with the encoder) and only this one fails.
+		//
+		//   CREATE TRIGGER tr ... EXECUTE FUNCTION f('["id"]');
+		//   SELECT encode(tgargs,'base64') -> WyJpZCJdAA==
+		//
+		// The second is a NON-ASCII column name, the family `escape` also
+		// mangled (it octal-escapes every byte >= 0x7F, so `café` came back
+		// as ["caf\303\251"]\000 and failed the parse identically):
+		//
+		//   CREATE TRIGGER tru ... EXECUTE FUNCTION f('["café"]');
+		//   SELECT encode(tgargs,'base64') -> WyJjYWbDqSJdAA==
+		for _, tc := range []struct{ name, b64, livePK string }{
+			{"ascii key", "WyJpZCJdAA==", `["id"]`},
+			{"non-ASCII key", "WyJjYWbDqSJdAA==", `["café"]`},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				// Assert the PARSE succeeded, not merely that grading passed
+				// — a parse failure also "passes" by grading nothing, which
+				// is exactly how the inert door looked green.
+				cols, ok := parsePKColumnList(tc.b64)
+				if !ok {
+					t.Fatalf("verbatim PostgreSQL output %q did not parse. The door grades NOTHING in "+
+						"this state, on every real install, healthy or tampered — which is how it "+
+						"shipped inert the first time.", tc.b64)
+				}
+				if len(cols) != 1 {
+					t.Fatalf("parsed %v, want one column", cols)
+				}
+				if err := gradeCaptureShape("public", withRawPK(tc.b64, tc.livePK), healthyTiers(), false); err != nil {
+					t.Fatalf("a correctly-installed trigger was refused: %v", err)
+				}
+			})
+		}
+	})
+
+	t.Run("server-shaped bytes still catch a WRONG key", func(t *testing.T) {
+		// The pair to the floor above: parsing correctly is only useful if
+		// the grade then fires. "WyJ0ZW5hbnRfaWQiXQA=" is '["tenant_id"]'
+		// NUL-terminated and base64'd, the same shape the server sends.
+		if err := gradeCaptureShape("public", withRawPK("WyJ0ZW5hbnRfaWQiXQA=", `["id"]`), healthyTiers(), false); err == nil {
+			t.Fatal("a trigger keyed on the wrong column passed when its argument arrived in the real " +
+				"server encoding — the parse works but the grade does not fire")
 		}
 	})
 
@@ -457,7 +534,7 @@ func TestGradeCaptureShape_GradesThePKArgumentValue(t *testing.T) {
 		// An argument this cannot read is a DIFFERENT finding from a
 		// wrong one; reporting it as "wrong columns" would be a
 		// confident error. The zero-arg case is caught by its own check.
-		if err := gradeCaptureShape("public", withPK("not-json", `["id"]`), healthyTiers(), false); err != nil {
+		if err := gradeCaptureShape("public", withRawPK("not-json", `["id"]`), healthyTiers(), false); err != nil {
 			t.Errorf("an unparseable argument was reported as a wrong key: %v", err)
 		}
 	})

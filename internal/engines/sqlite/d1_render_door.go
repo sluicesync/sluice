@@ -4,8 +4,10 @@
 package sqlite
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 )
 
@@ -62,9 +64,24 @@ func verifyD1RenderFidelity(ctx context.Context, c *d1Client) error {
 			"refusing to read without verifying the format('%%!.20g') render", "p")
 	}
 	// The render arrives as a JSON string (the CASE arm is format(), which
-	// yields TEXT). Anything else — a JSON number, null — means the arm under
-	// test did not run, so it is refused rather than coerced: a number would
-	// already have been through a double and could not evidence the render.
+	// yields TEXT). Anything else — a JSON number, a null — means the arm
+	// under test did not run, so it is refused rather than coerced: a number
+	// would already have been through a double and could not evidence the
+	// render.
+	//
+	// The null case needs its own arm and does not get one from Unmarshal:
+	// `json.Unmarshal([]byte("null"), &s)` returns a NIL ERROR and leaves the
+	// string untouched, so a null would fall through to VerifyRealRenderProbe
+	// and be refused there — correctly, but with the wrong diagnosis. The
+	// operator would be told this engine "renders REAL capture values
+	// LOSSILY" and "ignores the `!` flag", which is a specific and false
+	// claim about their database. Failing closed with the wrong reason is
+	// still a bug in the message.
+	if string(bytes.TrimSpace(raw)) == "null" {
+		return errors.New("d1: the REAL render-fidelity probe returned SQL NULL, so the format() arm " +
+			"did not run at all — this is not evidence about the engine's precision handling either " +
+			"way; refusing to read without verifying the format('%!.20g') render")
+	}
 	var rendered string
 	if err := json.Unmarshal(raw, &rendered); err != nil {
 		return fmt.Errorf("d1: the REAL render-fidelity probe returned %s, not the expected text render; "+

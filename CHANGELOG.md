@@ -4,6 +4,28 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.146.0] - 2026-09-07
+
+A guard that reached one lane of two, a refusal that promised protection while doing the opposite, and a documented recipe that could never have worked. Take this one if you migrate from Cloudflare D1, run continuous sync from a non-GTID MySQL source, or have followed the PII-redaction cookbook's env-backed keyset option.
+
+### Fixed
+
+**The Cloudflare D1 reader never checked that the source renders floating-point values losslessly.** sluice reads a D1 `REAL` through `format('%!.20g', …)`, where the `!` alternate-form-2 flag is load-bearing — an engine ignoring it clamps to 16 significant digits and silently alters every value (the v0.131.2 CRITICAL). That premise has been probed at runtime since, in the *trigger* readers only, because the door's rationale was written in terms of triggers: "on D1 the probed engine IS the engine that fires the triggers". A `migrate` fires none, opens no CDC stream, and so probed nothing while projecting the identical expression against an engine Cloudflare controls. The `--source-driver d1` bulk copy and `migrate --stage-local` now both probe at open (`verifyD1RenderFidelity`) and fail closed. Measured against live D1 with a discriminating control before the refusal shipped: the production expression renders `0.300000000000000044` and round-trips bit-exact, the same format without `!` renders `0.3`. `TestD1RenderDoorRoster_EveryRowReaderConstructionClassified` derives the site list from the AST so a future lane cannot inherit the gap.
+
+**A replaced MySQL source instance dropped the target's tables and re-copied from whatever answered the DSN.** A file/pos position whose `@@server_uuid` no longer matched returned an error wrapping the position-unusable sentinel, which routes the automatic recovery — correct for a routine purge (same server, retention advanced), wrong here, where the source is a **different server** that sluice cannot distinguish from a stale connection string or a load-balanced endpoint that landed elsewhere. It now refuses terminally, naming both identities and a grep-stable `SOURCE-INSTANCE-IDENTITY-CHANGED`. The asymmetry decided it: refusing costs one `--restart-from-scratch` on an event that already involved rebuilding a database server, while the old path destroyed the target from the wrong source at exit 0. The pin's load-bearing assertion is the *absence* of the sentinel wrapping — a later well-meant `%w` would silently restore the destructive path with no message changing.
+
+**The identity-mismatch warning claimed sluice was "refusing to resume to avoid a silent data gap"** while it was about to perform that same drop-and-re-copy. Claim and behaviour now agree.
+
+**The PII-redaction cookbook documented an env-backed keyset scheme sluice never had** — one variable per key plus a prefix, as though the loader globbed the environment. It reads one variable holding the whole keyset YAML, as ADR-0041 specifies and `docs/redaction.md` has always said, so the recipe produced `environment variable is empty or unset`. Loud, so nothing was at risk; it survived because the recipe's executable pin exercised the `file:` option and reported PASS for the whole page. The page is fixed, the pin gained the missing option (asserting `env:` and `file:` produce the same surrogate, not merely exit 0), and `TestDocumentedEnvKeysetExamplesLoad` runs every runnable `env:` example through the real loader.
+
+### Compatibility
+
+**One behaviour change, narrowly bounded.** A sync resuming a **non-GTID** MySQL file/pos position against an instance whose `@@server_uuid` changed now stops instead of re-copying; re-run with `--restart-from-scratch` if the replacement is intended. Nothing else reaches that arm: `gtid_mode=ON` MySQL takes the GTID path, where a replaced instance is caught by construction (a GTID is `<server_uuid>:<seq>`, so a fresh instance's executed set cannot contain the old UUID's transactions); Vitess and PlanetScale never reach this code at all (both use VStream, with its own per-shard lineage check); MariaDB has its own lineage path. The companion arm is deliberately unchanged — when the `@@server_uuid` probe cannot run, sluice still proceeds with a warning, because that value is read once at stream open and an empty result means a proxy that does not expose it, not a transient. The new D1 refusal fires only against a source that renders `REAL` lossily, which live D1 does not. No flag added, renamed or removed; backup format version unchanged at 10.
+
+### Also
+
+`ir.Interval` now records that PostgreSQL's interval typmod does not survive sluice's type model, so a PG→PG migrate lands every declaration as bare `interval`. Measured on real PG 16 the values are byte-identical — bare `interval` is the widest interval type and PG rounds on store — and what is lost is the target's constraint, whose harm arrives at cutover. Carrying it would move the backup schema fingerprint and repartition every chain containing an interval column, so it is a deliberate deferral with a tripwire test rather than an oversight.
+
 ## [0.145.0] - 2026-09-06
 
 Two privilege/integrity findings and four silent-loss fixes, all from a blind audit of v0.144.0 and every one measured on a real server before it was fixed. Take this one if you run trigger-CDC on a shared Postgres, run scheduled `backup prune`/`compact` on a signed chain, or use `--schema-changes=refuse`.

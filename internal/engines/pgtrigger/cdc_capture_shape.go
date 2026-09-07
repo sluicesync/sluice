@@ -4,8 +4,10 @@
 package pgtrigger
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -267,7 +269,7 @@ func loadInstalledCaptureTriggers(ctx context.Context, db *sql.DB, schema string
 	const q = `
 SELECT c.relname, t.tgname, t.tgenabled::text, p.proname, pn.nspname, p.oid, t.tgtype,
        pg_catalog.pg_get_expr(t.tgqual, t.tgrelid) AS when_clause, t.tgnargs,
-       pg_catalog.encode(t.tgargs, 'escape') AS trig_args,
+       pg_catalog.encode(t.tgargs, 'base64') AS trig_args,
        COALESCE((SELECT pg_catalog.json_agg(a.attname ORDER BY k.ord)::text
                    FROM pg_index i
                    JOIN pg_catalog.unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) ON TRUE
@@ -674,8 +676,15 @@ func gradeTriggerWiring(tbl, trigName string, got installedCaptureTrigger, allTa
 	// in whitespace and can differ in column order for a composite key
 	// without either being wrong.
 	if trigName == CaptureTriggerRow && got.args != "" && got.livePK != "" {
+		// TWO ENCODINGS, deliberately two parsers. `trig_args` is
+		// `encode(tgargs,'base64')` — raw bytes, because tgargs is bytea and
+		// every text rendering PostgreSQL offers mangles it (see
+		// [parsePKColumnList]). `live_pk` is `json_agg(...)::text`, which is
+		// already plain JSON. Running the base64 decoder over the latter
+		// fails, and failing here means grading NOTHING — the same silent
+		// skip this door shipped with once.
 		gotCols, gotOK := parsePKColumnList(got.args)
-		wantCols, wantOK := parsePKColumnList(got.livePK)
+		wantCols, wantOK := parseJSONColumnList(got.livePK)
 		if gotOK && wantOK && !samePKColumnSet(gotCols, wantCols) {
 			return fmt.Errorf(
 				"pgtrigger: table %q capture trigger %q carries primary-key columns %v, but the table's "+
@@ -692,17 +701,66 @@ func gradeTriggerWiring(tbl, trigName string, got installedCaptureTrigger, allTa
 }
 
 // parsePKColumnList decodes a JSON array of column names as setup renders
-// it into TG_ARGV[0], tolerating the trailing NUL that pg_trigger.tgargs
-// carries on a single argument. ok is false for anything it cannot read,
-// and the caller then grades nothing — an unparseable argument is a
-// DIFFERENT finding from a wrong one, and reporting it as "wrong columns"
-// would be a confident error.
+// it into TG_ARGV[0]. The input is `pg_catalog.encode(tgargs, 'base64')`;
+// `tgargs` is NUL-TERMINATED per argument, so the NUL is split off after
+// decoding. ok is false for anything it cannot read, and the caller then
+// grades nothing — an unparseable argument is a DIFFERENT finding from a
+// wrong one, and reporting it as "wrong columns" would be a confident error.
+//
+// # Why base64 and not 'escape' (this shipped INERT once)
+//
+// The first cut read `encode(tgargs, 'escape')` and trimmed a Go NUL byte
+// with strings.TrimRight(s, "\x00"). Measured on real PostgreSQL 16, that
+// combination can never work: `escape` renders the NUL terminator as the
+// FOUR LITERAL CHARACTERS `\`,`0`,`0`,`0`, so a healthy `'["id"]'` argument
+// comes back as `["id"]\000` — 10 characters over 7 raw bytes. TrimRight
+// removes nothing, json.Unmarshal fails on the trailing backslash, ok is
+// false, and the ENTIRE primary-key grading is skipped on every real
+// install, healthy or tampered. `escape` also octal-escapes any byte >=
+// 0x7F, so a column named `café` returns `["caf\303\251"]\000` and fails
+// the same way even with the NUL handled.
+//
+// The unit fixture hid it by supplying "[\"id\"]\x00" — a real NUL byte,
+// which is what the author assumed PostgreSQL produced and is a value that
+// expression never returns. That is the self-referential-fixture shape:
+// the gate proved the parser agrees with the test's idea of the input,
+// which was never in doubt. The fixture is now built from measured server
+// output, and there is an ok==true assertion on a real-shaped healthy
+// input so a regression to "skip everything" cannot pass silently.
+//
+// base64 is byte-faithful, so every column-name family survives it —
+// ASCII, UTF-8, and names carrying a quote or backslash alike.
 func parsePKColumnList(s string) (cols []string, ok bool) {
-	trimmed := strings.TrimRight(s, "\x00")
-	if trimmed == "" {
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(s))
+	if err != nil {
 		return nil, false
 	}
-	if err := json.Unmarshal([]byte(trimmed), &cols); err != nil {
+	// tgargs is a NUL-terminated sequence; TG_ARGV[0] is everything up to
+	// the first NUL. Splitting (rather than trimming) also keeps a
+	// multi-argument trigger from concatenating into one unparseable blob.
+	if i := bytes.IndexByte(raw, 0); i >= 0 {
+		raw = raw[:i]
+	}
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil, false
+	}
+	if err := json.Unmarshal(raw, &cols); err != nil {
+		return nil, false
+	}
+	return cols, true
+}
+
+// parseJSONColumnList decodes the live primary-key list, which arrives as
+// PLAIN JSON text from `json_agg(...)::text` — not base64, and not
+// NUL-terminated. It is a separate function from [parsePKColumnList] rather
+// than a shared one with a flag because the two columns genuinely carry
+// different encodings, and the first cut of this door lost a whole grading
+// arm by assuming an encoding it had not measured.
+func parseJSONColumnList(s string) (cols []string, ok bool) {
+	if strings.TrimSpace(s) == "" {
+		return nil, false
+	}
+	if err := json.Unmarshal([]byte(s), &cols); err != nil {
 		return nil, false
 	}
 	return cols, true

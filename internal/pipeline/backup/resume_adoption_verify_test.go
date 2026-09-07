@@ -114,6 +114,57 @@ func TestResumeAdoption_VerifiesChunkHashesWhenSigning(t *testing.T) {
 		}
 	})
 
+	t.Run("a dropped chunk ENTRY is caught by the row-count identity", func(t *testing.T) {
+		// The shape the hash loop cannot see, because removing the entry
+		// AND its file leaves a manifest that is internally consistent:
+		// every listed chunk is present and matches. This release's own
+		// pre-tag review found the doc naming this harm while the check
+		// could not reach it — a verification whose expected value came
+		// from the artifact under attack.
+		//
+		// TableManifest.RowCount is the independent number: the writer
+		// stamps it at table completion, restore already compares against
+		// it, and a dropped entry no longer reconciles.
+		store, entry := build(t)
+		entry.Chunks[0].RowCount = 10
+		entry.RowCount = 10
+		if full, err := tableManifestFullyComplete(ctx, store, entry, true); err != nil || !full {
+			t.Fatalf("the healthy baseline for this cell does not adopt (full=%v err=%v)", full, err)
+		}
+		// The adversary's edit: drop the entry and its file together.
+		if err := store.Delete(ctx, entry.Chunks[0].File); err != nil {
+			t.Fatalf("delete chunk: %v", err)
+		}
+		entry.Chunks = nil
+		full, err := tableManifestFullyComplete(ctx, store, entry, true)
+		if err != nil {
+			t.Fatalf("verify: %v", err)
+		}
+		if full {
+			t.Fatal("a table whose chunk ENTRY was removed along with its file was adopted as " +
+				"complete. Every listed chunk matched — because none were listed — so the hash loop " +
+				"alone reports all clear and the resuming run signs a table that is missing rows.")
+		}
+	})
+
+	t.Run("an older manifest with no recorded RowCount still adopts", func(t *testing.T) {
+		// The floor on the check above. Manifests written before the
+		// writer stamped RowCount carry zero for a perfectly good table;
+		// demanding the identity there would refuse to adopt every older
+		// interrupted backup and re-stream it.
+		store, entry := build(t)
+		entry.RowCount = 0
+		entry.Chunks[0].RowCount = 0
+		full, err := tableManifestFullyComplete(ctx, store, entry, true)
+		if err != nil {
+			t.Fatalf("verify: %v", err)
+		}
+		if !full {
+			t.Error("a healthy table from a manifest predating RowCount was refused adoption; every " +
+				"older interrupted backup would re-stream every completed table")
+		}
+	})
+
 	t.Run("a missing chunk is still caught under both postures", func(t *testing.T) {
 		// The pre-existing existence check must survive the change.
 		store, entry := build(t)

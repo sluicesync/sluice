@@ -46,8 +46,18 @@ func TestD1RenderDoorRoster_EveryRowReaderConstructionClassified(t *testing.T) {
 	// absent from this map must call verifyD1RenderFidelity in its own
 	// function or in the function that constructs its client.
 	exempt := map[string]string{
-		"verifier.go": "count-only: calls countRows, which renders no value, so no REAL passes " +
-			"through format('%!.20g') on this path",
+		// The reason is stated in terms of REACHABILITY, not "it renders
+		// nothing" — which was the first wording and was wrong. countRows
+		// DOES project CapturedValueExpr (d1_rows.go), so a reader checking
+		// the claim by grepping would find the expression right there and
+		// have to re-derive the argument. What actually makes it safe is that
+		// the projection sits inside a `CASE WHEN typeof(c)='text'` arm, so
+		// the format('%!.20g') branch — the REAL branch, the only one the `!`
+		// flag governs — is unreachable on this path. Restated so it survives
+		// someone reading textBytesExpr.
+		"verifier.go": "count-only: countRows projects CapturedValueExpr but only inside a " +
+			"CASE WHEN typeof(c)='text' arm, so the REAL branch that format('%!.20g') governs is " +
+			"unreachable here",
 	}
 	// Files whose construction is reached by a door. Named explicitly so a
 	// door that gets DELETED or moved shows up here as an unclassified site
@@ -178,6 +188,69 @@ func TestVerifyD1RenderFidelity_BothDirections(t *testing.T) {
 		if err := verifyD1RenderFidelity(ctx, c); err == nil {
 			t.Fatal("a JSON-number render was accepted; that value cannot evidence the text render")
 		}
+	})
+
+	// The four arms below all failed closed already; none was exercised, and
+	// one of them was giving the WRONG REASON. They are pinned together
+	// because "refuses" and "refuses for the right reason" are different
+	// properties, and only the second is useful to an operator mid-incident.
+	t.Run("SQL NULL is refused, and NOT as a precision failure", func(t *testing.T) {
+		// json.Unmarshal([]byte("null"), &s) returns a NIL error and leaves
+		// the string empty, so this used to fall through to
+		// VerifyRealRenderProbe and be refused as "this engine renders REAL
+		// capture values LOSSILY … ignores the `!` flag" — a specific, false
+		// claim about the operator's database.
+		c := stubRenderClient(t, `null`)
+		err := verifyD1RenderFidelity(ctx, c)
+		if err == nil {
+			t.Fatal("a SQL NULL probe result was accepted")
+		}
+		if strings.Contains(err.Error(), "LOSSILY") {
+			t.Errorf("a NULL probe result is diagnosed as a precision failure, which is a false "+
+				"statement about the engine — it says nothing either way: %v", err)
+		}
+		if !strings.Contains(err.Error(), "NULL") {
+			t.Errorf("the NULL refusal does not name what happened: %v", err)
+		}
+	})
+
+	t.Run("a missing p column is refused", func(t *testing.T) {
+		c := newRawStubD1(t, `{"success":true,"errors":[],"messages":[],"result":`+
+			`[{"success":true,"results":[{"other":"x"}],"meta":{}}]}`)
+		if err := verifyD1RenderFidelity(ctx, c); err == nil {
+			t.Fatal("a probe response with no p column was accepted")
+		}
+	})
+
+	t.Run("zero rows is refused", func(t *testing.T) {
+		c := newRawStubD1(t, `{"success":true,"errors":[],"messages":[],"result":`+
+			`[{"success":true,"results":[],"meta":{}}]}`)
+		if err := verifyD1RenderFidelity(ctx, c); err == nil {
+			t.Fatal("a probe that returned no rows was accepted; nothing was verified")
+		}
+	})
+
+	t.Run("more than one row is refused", func(t *testing.T) {
+		// A multi-row answer means this is not the one-row probe that was
+		// sent, so nothing about it evidences the render.
+		c := newRawStubD1(t, `{"success":true,"errors":[],"messages":[],"result":`+
+			`[{"success":true,"results":[{"p":"0.300000000000000044"},{"p":"0.3"}],"meta":{}}]}`)
+		if err := verifyD1RenderFidelity(ctx, c); err == nil {
+			t.Fatal("a multi-row probe response was accepted")
+		}
+	})
+}
+
+// newRawStubD1 answers every query with a caller-supplied envelope, for the
+// response shapes stubRenderClient's single-value form cannot express.
+func newRawStubD1(t *testing.T, body string) *d1Client {
+	t.Helper()
+	var probe any
+	if err := json.Unmarshal([]byte(body), &probe); err != nil {
+		t.Fatalf("stub envelope is not valid JSON: %v", err)
+	}
+	return startMockD1(t, func(string, []string) (int, []byte) {
+		return http.StatusOK, []byte(body)
 	})
 }
 
