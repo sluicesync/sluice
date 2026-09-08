@@ -88,12 +88,50 @@ func TestRenderSetupDDL_SelfDDLSuppression(t *testing.T) {
 			}
 			// Two arms: the early one covers a v4 install's meta ADD COLUMN
 			// no-ops (which DO fire ddl_command_end); the second, after the
-			// migration, is strict on every install vintage.
-			if len(armIdxs) != 2 {
-				t.Fatalf("render emits %d evidence ARM statement(s) %v, want 2 (early + post-migration)", len(armIdxs), armIdxs)
+			// migration, is strict on every install vintage. The opt-in
+			// posture adds a THIRD immediately before the ENABLE ALWAYS
+			// block (audit SLP-4) — the evidence's freshness window is a
+			// clock_timestamp() window, and clock_timestamp() advances
+			// inside a transaction, so a plan that stalls on the trigger
+			// DROP/CREATE locks would otherwise cross it and record its own
+			// ALTERs as source-side DDL.
+			wantArms := 2
+			if tc.captureRepl {
+				wantArms = 3
+			}
+			if len(armIdxs) != wantArms {
+				t.Fatalf("render emits %d evidence ARM statement(s) %v, want %d", len(armIdxs), armIdxs, wantArms)
 			}
 			if armIdxs[0] < markerIdx {
 				t.Errorf("the first ARM (%d) precedes the SET LOCAL marker (%d) — the arm adopts the nonce, so it must follow", armIdxs[0], markerIdx)
+			}
+
+			// The SLP-4 property, and it is ADJACENCY rather than presence:
+			// a re-arm that is merely somewhere earlier in the plan is what
+			// the two original arms already were. What bounds the exposure
+			// is that nothing lock-taking runs between the last arm and the
+			// first ENABLE ALWAYS.
+			firstEnable := -1
+			for i, s := range stmts {
+				if strings.Contains(s, "ENABLE ALWAYS TRIGGER") {
+					firstEnable = i
+					break
+				}
+			}
+			if tc.captureRepl {
+				if firstEnable < 0 {
+					t.Fatal("opt-in posture rendered no ENABLE ALWAYS statement")
+				}
+				if got := armIdxs[len(armIdxs)-1]; got != firstEnable-1 {
+					t.Errorf("the last evidence ARM is at %d and the first ENABLE ALWAYS at %d — they must be adjacent.\n"+
+						"  Anything between them runs inside the freshness window this arm exists to refresh, and the "+
+						"statements that stall are exactly the ones that would go there (DROP/CREATE TRIGGER take "+
+						"ACCESS EXCLUSIVE and queue behind any long transaction on a busy table).\n"+
+						"  Intervening statement: %q",
+						got, firstEnable, firstLine(stmts[got+1]))
+				}
+			} else if firstEnable >= 0 {
+				t.Errorf("statement %d is an ENABLE ALWAYS in a plan that did not opt in: %q", firstEnable, stmts[firstEnable])
 			}
 
 			if !tc.canEventTrigger {

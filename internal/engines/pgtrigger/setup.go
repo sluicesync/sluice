@@ -1112,6 +1112,11 @@ func renderSetupDDL(schema string, tables []tableTriggerSpec, canEventTrigger, l
 	// not affect — both halves measured on PG 16 before it was written.
 	out = append(out, renderCaptureFunctionACL(schema, captureFns)...)
 
+	// The ENABLE ALWAYS ALTERs, collected here and emitted together after
+	// a re-arm once every table's triggers exist (audit SLP-4; the reason
+	// is at the emit site below).
+	var enableAlways []string
+
 	for _, t := range tables {
 		// Drop any pre-existing trigger with the canonical name so
 		// re-running Setup with a different PK list refreshes the
@@ -1143,8 +1148,11 @@ func renderSetupDDL(schema string, tables []tableTriggerSpec, canEventTrigger, l
 			// (native subscription apply workers, privileged appliers).
 			// Both members of the pair, so replicated TRUNCATE is graded
 			// the same as replicated DML.
-			out = append(
-				out,
+			//
+			// DEFERRED rather than emitted here (audit SLP-4), see the
+			// re-arm below.
+			enableAlways = append(
+				enableAlways,
 				fmt.Sprintf("ALTER TABLE %s ENABLE ALWAYS TRIGGER %s", fqTable, quoteIdent(CaptureTriggerRow)),
 				fmt.Sprintf("ALTER TABLE %s ENABLE ALWAYS TRIGGER %s", fqTable, quoteIdent(CaptureTriggerTruncate)),
 			)
@@ -1166,11 +1174,42 @@ func renderSetupDDL(schema string, tables []tableTriggerSpec, canEventTrigger, l
 			if it.enabled != "O" {
 				continue
 			}
-			out = append(out, fmt.Sprintf(
+			enableAlways = append(enableAlways, fmt.Sprintf(
 				"ALTER TABLE %s.%s ENABLE ALWAYS TRIGGER %s",
 				quoteIdent(schema), quoteIdent(it.table), quoteIdent(it.name),
 			))
 		}
+	}
+
+	// Re-arm the DDL-suppression evidence immediately before the ENABLE
+	// ALWAYS ALTERs, and emit them all here rather than interleaved with
+	// each table's trigger work (audit SLP-4).
+	//
+	// ALTER TABLE is a WATCHED tag, so these statements are sluice's own
+	// DDL passing under sluice's own event trigger; the strict suppression
+	// arm recognises them only while the armed evidence is fresh
+	// (setup_at > clock_timestamp() - '1 hour'). The freshness clock is a
+	// real clock, not the transaction's: clock_timestamp() advances inside
+	// a transaction, so a plan that STALLS -- and the DROP TRIGGER /
+	// CREATE TRIGGER statements above take an ACCESS EXCLUSIVE lock and
+	// queue behind any long-running transaction on a busy table -- can
+	// cross the window mid-plan. Past it, sluice's own ALTERs are recorded
+	// as 'X' rows, and the NEXT open refuses with "observed source-side
+	// DDL (ALTER TABLE)" and a drain / --restart-from-scratch remedy,
+	// blaming the operator for DDL sluice wrote.
+	//
+	// Deferring them to one block after one re-arm bounds the exposure to
+	// the ALTERs' own duration rather than the whole plan's. It does NOT
+	// eliminate it -- a stall longer than the window inside this block
+	// still crosses it -- and that residual is deliberate: a lock_timeout
+	// in the plan would convert a slow-but-working setup on a busy table
+	// into a hard failure, which is a policy change and not this fix's to
+	// make. Ordering is unaffected: every table's triggers exist by the
+	// time the first ALTER runs, and the plan is applied as one
+	// transaction.
+	if len(enableAlways) > 0 {
+		out = append(out, renderArmSetupEvidence(metaRef))
+		out = append(out, enableAlways...)
 	}
 
 	if canEventTrigger {
