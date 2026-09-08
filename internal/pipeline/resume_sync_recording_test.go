@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"sluicesync.dev/sluice/internal/ir"
@@ -236,4 +237,87 @@ func TestMigrationIDWidthMatchesTheEngineDDL(t *testing.T) {
 		t.Errorf("the walk checked only %d migration_id column(s); expected 4 (header + progress, x2 engines). "+
 			"The regex or the DDL shape changed and this gate is now checking less than its name implies.", checked)
 	}
+}
+
+// The progress throttle, and specifically that it does NOT reach migrate.
+//
+// writeTableProgress is called per BATCH inside the copy loop. For a sync
+// cold start those rows are a status heartbeat, and paying a synchronous
+// control-table round trip per batch on a cross-region link is the exact
+// cost the operator who prompted this feature had just tuned away. For
+// `migrate` the same row is a RESUME cursor, and throttling it would widen
+// the replay window on every interrupted migration -- so the throttle is
+// nil there, and this pins that rather than trusting it.
+func TestProgressThrottle(t *testing.T) {
+	t.Parallel()
+
+	t.Run("migrate is untouched: every write goes through", func(t *testing.T) {
+		t.Parallel()
+		store := newFakeStateStore()
+		rc := resumeContext{store: store, migrationID: "m1", enabled: true} // no throttle
+		for i := 0; i < 5; i++ {
+			if err := writeTableProgress(context.Background(), rc, "orders", ir.TableProgress{
+				State: ir.TableProgressInProgress, RowsCopied: int64(i),
+			}); err != nil {
+				t.Fatalf("write %d: %v", i, err)
+			}
+		}
+		store.mu.Lock()
+		got := store.tableWrites
+		store.mu.Unlock()
+		if got != 5 {
+			t.Errorf("migrate wrote %d of 5 per-batch progress rows; anything less widens the --resume replay "+
+				"window, which is a correctness cost and not a perf saving", got)
+		}
+	})
+
+	t.Run("sync: the first write and terminal states always pass", func(t *testing.T) {
+		t.Parallel()
+		p := &progressThrottle{}
+		now := time.Now()
+		if !p.allow("orders", false, now) {
+			t.Error("the first write for a table was throttled; the table would not appear in `sync status` " +
+				"until an interval later")
+		}
+		if p.allow("orders", false, now.Add(10*time.Millisecond)) {
+			t.Error("an intermediate write 10ms later passed; the throttle is not throttling")
+		}
+		if !p.allow("orders", true, now.Add(10*time.Millisecond)) {
+			t.Error("a TERMINAL write was throttled — `sync status` would show the table stuck at its last " +
+				"intermediate value until some other table happened to flush")
+		}
+	})
+
+	t.Run("sync: an intermediate write passes once the interval elapses", func(t *testing.T) {
+		t.Parallel()
+		p := &progressThrottle{}
+		now := time.Now()
+		p.allow("orders", false, now)
+		if !p.allow("orders", false, now.Add(progressThrottleInterval)) {
+			t.Error("a write exactly at the interval was throttled; the heartbeat would drift slower than " +
+				"the documented freshness")
+		}
+	})
+
+	t.Run("sync: tables are throttled INDEPENDENTLY", func(t *testing.T) {
+		t.Parallel()
+		// The cross-table pool copies many tables concurrently. A single
+		// shared clock would let one busy table suppress every other
+		// table's first appearance in status.
+		p := &progressThrottle{}
+		now := time.Now()
+		p.allow("orders", false, now)
+		if !p.allow("line_items", false, now) {
+			t.Error("a second table's first write was throttled by the first table's; status would show " +
+				"tables appearing in lockstep rather than as they start")
+		}
+	})
+
+	t.Run("a nil throttle allows everything", func(t *testing.T) {
+		t.Parallel()
+		var p *progressThrottle
+		if !p.allow("orders", false, time.Now()) {
+			t.Error("the nil throttle blocked a write; migrate constructs its context without one")
+		}
+	})
 }

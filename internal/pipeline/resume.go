@@ -58,6 +58,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -112,6 +113,66 @@ type resumeContext struct {
 	// immediately: a field named for the on-behaviour silently inverts to
 	// off for every caller that does not know to set it.
 	noResume bool
+
+	// throttle rate-limits INTERMEDIATE per-table progress writes. nil
+	// (the zero value, so `migrate` is untouched) means every write goes
+	// through.
+	//
+	// The same write serves two purposes with very different granularity
+	// requirements, and that is the whole reason this exists:
+	//
+	//   - For `migrate`, a progress row is a RESUME cursor. It must be
+	//     fine-grained, because whatever it last recorded is what a
+	//     --resume re-copies from; throttling it would widen the replay
+	//     window on every interrupted migration.
+	//   - For a sync cold start, it is a STATUS heartbeat. Nobody resumes
+	//     from it (loadOrInitState refuses), and a human polling `sync
+	//     status` cannot perceive sub-second freshness.
+	//
+	// writeTableProgress is called PER BATCH inside the copy loop, so
+	// without this the sync cold start pays one synchronous control-table
+	// round trip per batch per table — on the cross-region, RTT-bound
+	// copy that motivated this whole feature, that is the exact cost the
+	// operator had just finished tuning away.
+	//
+	// Pointer so every copy of the context shares one throttle.
+	throttle *progressThrottle
+}
+
+// progressThrottleInterval is how stale a sync cold start's per-table
+// progress row may get. Two seconds is far finer than a human polling
+// `sync status` can perceive and bounds the write rate regardless of how
+// small the batches are.
+const progressThrottleInterval = 2 * time.Second
+
+// progressThrottle rate-limits intermediate progress writes per table.
+//
+// TERMINAL states are never throttled — a table that finished must say so
+// immediately, or `sync status` would show it stuck at its last
+// intermediate write until some later table happened to flush. The FIRST
+// write for a table is never throttled either, so a table appears in
+// status as soon as it starts rather than up to an interval later.
+type progressThrottle struct {
+	mu   sync.Mutex
+	last map[string]time.Time
+}
+
+// allow reports whether this table's write should go through now.
+func (p *progressThrottle) allow(tableName string, terminal bool, now time.Time) bool {
+	if p == nil {
+		return true
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.last == nil {
+		p.last = map[string]time.Time{}
+	}
+	prev, seen := p.last[tableName]
+	if terminal || !seen || now.Sub(prev) >= progressThrottleInterval {
+		p.last[tableName] = now
+		return true
+	}
+	return false
 }
 
 // newSyncRecordingContext builds the record-but-never-resume context the
@@ -190,6 +251,7 @@ func newSyncRecordingContext(ctx context.Context, store ir.MigrationStateStore, 
 		migrationID: syncMigrationID(streamID),
 		enabled:     true,
 		noResume:    true,
+		throttle:    &progressThrottle{},
 	}
 }
 
@@ -464,6 +526,13 @@ func writeState(ctx context.Context, rc resumeContext, state ir.MigrationState) 
 // store no-op contract as writeState.
 func writeTableProgress(ctx context.Context, rc resumeContext, tableName string, entry ir.TableProgress) error {
 	if !rc.enabled {
+		return nil
+	}
+	// Throttled only for a sync cold start, whose rows are a status
+	// heartbeat rather than a resume cursor; nil throttle on every
+	// `migrate` path, which needs the fine granularity. Terminal states
+	// always pass — see [progressThrottle].
+	if !rc.throttle.allow(tableName, entry.State != ir.TableProgressInProgress, time.Now()) {
 		return nil
 	}
 	if err := rc.store.WriteTableProgress(ctx, rc.migrationID, tableName, entry); err != nil {
