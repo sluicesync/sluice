@@ -305,8 +305,22 @@ func TestNoteTierCPUBoundTarget(t *testing.T) {
 		ps.noteTierCPUBoundTarget(ctx)
 		ps.noteTierCPUBoundTarget(ctx)
 	})
-	if n := strings.Count(out, "tier-CPU-bound"); n != 1 {
-		t.Errorf("PlanetScale-flavor writer emitted the tier hint %d times across 3 engagements; want exactly 1:\n%s", n, out)
+	if n := strings.Count(out, copyBottleneckMarker); n != 1 {
+		t.Errorf("PlanetScale-flavor writer emitted the copy-bottleneck hint %d times across 3 engagements; want exactly 1:\n%s", n, out)
+	}
+	// The hint must carry BOTH regimes and BOTH levers. That is the whole
+	// point of it after the 2026-09-08 user report: naming only the tier
+	// lever sent a cross-region operator to a 4x larger instance that did
+	// not help, while telling them not to raise the copy fan-out that did.
+	// A future trim back to a single lever IS the defect, so it fails here.
+	for _, want := range []string{
+		"read the TARGET's CPU", "HIGH target CPU", "LOW target CPU",
+		"larger tier or Metal", "--copy-fanout-degree", "CROSS-REGION",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the copy-bottleneck hint no longer names %q, so an operator cannot tell which of the two "+
+				"bounds they are on — and the two have opposite fixes:\n%s", want, out)
+		}
 	}
 
 	vanilla := &RowWriter{}

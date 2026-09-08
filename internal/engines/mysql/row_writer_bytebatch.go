@@ -147,24 +147,62 @@ func (b *insertBatcher) reset() {
 	b.bytes = 0
 }
 
+// copyBottleneckMarker is the grep-stable marker on the once-per-writer
+// bulk-load throughput hint. Operators reading this line are usually
+// mid-copy and asking "why is this slow"; the marker is what they search
+// their logs, and the docs, for.
+const copyBottleneckMarker = "COPY-BOTTLENECK"
+
 // noteTierCPUBoundTarget emits the once-per-writer ADR-0150 companion
 // hint when the bulk-write path engages against a hosted-PlanetScale
-// target: writes there are tier-CPU-bound, not connection-bound
-// (ADR-0116 ground truth: a PS-10 pins at 100% CPU under a 2-wide
-// copy), so operators should not crank copy parallelism expecting
-// linear scaling. Gated on the flavor at OpenRowWriter (self-hosted
-// vitess runs on the operator's own hardware and is deliberately
-// excluded); the sync.Once keeps it to one line per writer — one line
-// per run on the migrate path, which shares a single RowWriter.
+// target. Gated on the flavor at OpenRowWriter (self-hosted vitess runs
+// on the operator's own hardware and is deliberately excluded); the
+// sync.Once keeps it to one line per writer — one line per run on the
+// migrate path, which shares a single RowWriter.
+//
+// # Why this no longer names a lever (2026-09-08, from a user report)
+//
+// It used to say, flatly, that writes here are "tier-CPU-bound, not
+// connection-bound", that "copy parallelism beyond the auto budget will
+// not scale throughput linearly", and that "a larger tier (or Metal) is
+// the real lever". Its evidence is ADR-0116's ground truth: a **PS-10** —
+// the smallest tier — pins at 100% CPU under a 2-wide copy. That was
+// measured at one point and asserted across the whole range.
+//
+// A user migrating AWS to GCP us-east4 followed it: they scaled the
+// target from M-160 (2 vCPU) to M-640 (8 vCPU) and throughput moved
+// 14k to 16k rows/s while target CPU sat at **11%**. The real bound was
+// the single cross-region INSERT connection — a latency regime this hint
+// had no model for at all — and the fix was the very thing the hint told
+// them not to bother with: `--copy-fanout-degree 16
+// --vstream-copy-table-parallelism 4` took the copy from ~18-36h to ~4h.
+// So the hint cost a tier upgrade AND steered away from the 4.5-9x lever.
+//
+// The measured fact is kept and SCOPED to where it was measured. What is
+// removed is the generalisation to every tier and the single named lever.
+// In its place the line names the DISCRIMINATOR, because which regime you
+// are in is cheap to observe and not cheap to guess: if target CPU is
+// high you are tier-bound, and if it is low while throughput is flat you
+// are bound by round-trips in flight, which is what the fan-out flags
+// buy. sluice cannot decide this for the operator here — the hint fires
+// at the first flush, before any throughput exists to measure, and the
+// writer has no ir.TargetTelemetry handle — so it says how to tell
+// rather than asserting which.
 func (w *RowWriter) noteTierCPUBoundTarget(ctx context.Context) {
 	if !w.tierCPUBoundTarget {
 		return
 	}
 	w.tierHintOnce.Do(func() {
 		slog.InfoContext(
-			ctx, "mysql: bulk-loading a PlanetScale target: writes are tier-CPU-bound, not connection-bound "+
-				"(a PS-10 pins at 100% CPU under a 2-wide copy; ADR-0116), so copy parallelism beyond the auto "+
-				"budget will not scale throughput linearly — a larger tier (or Metal) is the real lever",
+			ctx, "mysql: cdc: "+copyBottleneckMarker+": bulk-loading a PlanetScale target. If the copy is "+
+				"slower than you expect, read the TARGET's CPU before changing anything — it tells you which "+
+				"of two bounds you are on, and they have opposite fixes. HIGH target CPU: the tier is the "+
+				"bound (a PS-10 pins at 100% under a 2-wide copy, ADR-0116) and more copy parallelism will "+
+				"not scale; a larger tier or Metal is the lever. LOW target CPU with flat throughput: the "+
+				"bound is round-trips in flight, not the server — usual on a CROSS-REGION copy, where one "+
+				"INSERT connection is latency-bound however large the tier — and the lever is "+
+				"--copy-fanout-degree with --vstream-copy-table-parallelism. --planetscale-metrics-db and "+
+				"--planetscale-metrics-branch surface the target CPU this decision needs",
 		)
 	})
 }
