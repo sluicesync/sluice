@@ -1,0 +1,53 @@
+# THIRD TABLET override (uid 102, a SECOND replica) for the errant-GTID
+# lineage experiments.
+#
+# The base compose has one primary + one replica, so the REPLICA pool is a
+# single tablet and a @replica probe can only ever land on the tablet that
+# produced an errant GTID. Adding a second replica makes the
+# sibling-replica landing -- the shape that actually happens on
+# PlanetScale -- reachable, and lets the errant-carrying tablet be DELETED
+# from the shard while a healthy replica remains.
+#
+# Layered as: docker compose -f docker-compose.yml -f docker-compose.errant3.yml
+services:
+  vttablet-replica2:
+    image: ${VITESS_LITE_IMAGE:-vitess/lite:v24.0.1}
+    hostname: vttablet-replica2
+    volumes:
+      - vttablet-replica2-data:/vt/vtdataroot
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -e
+        mkdir -p /vt/vtdataroot
+        mysqlctl --tablet-uid 102 --mysql-port 17000 init || mysqlctl --tablet-uid 102 --mysql-port 17000 start
+        exec vttablet \
+          --topo-implementation etcd2 --topo-global-server-address etcd:2379 --topo-global-root /vitess/global \
+          --tablet-path zone1-0000000102 \
+          --tablet-hostname vttablet-replica2 \
+          --init-keyspace test \
+          --init-shard 0 \
+          --init-tablet-type replica \
+          --mysql-server-version '8.0.40-Vitess' \
+          --health-check-interval 5s \
+          --port 15100 --grpc-port 16100 \
+          --service-map 'grpc-queryservice,grpc-tabletmanager,grpc-updatestream' \
+          --heartbeat-on-demand-duration=5s \
+          --config-file-not-found-handling=ignore
+    depends_on:
+      vtctld:
+        condition: service_healthy
+
+  init:
+    depends_on:
+      vttablet:
+        condition: service_started
+      vttablet-replica:
+        condition: service_started
+      vttablet-replica2:
+        condition: service_started
+      vtctld:
+        condition: service_healthy
+
+volumes:
+  vttablet-replica2-data:

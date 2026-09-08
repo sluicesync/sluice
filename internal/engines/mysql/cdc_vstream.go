@@ -1161,17 +1161,42 @@ func (r *vstreamCDCReader) verifyVStreamPositionReachable(ctx context.Context, d
 				// transaction was in a database outside the keyspace and the
 				// target had not diverged by one byte).
 				//
-				// IT STILL REFUSES, and that is deliberate rather than
-				// unfinished. Proceeding would hand vttablet a resume set that
-				// is not a subset of its gtid_executed; vttablet answers
-				// "GTIDSet Mismatch", and that refusal does NOT reliably reach
-				// sluice — vtgate marks the tablet ignorable and BLOCKS
-				// waiting for another. That is audit SLM-2's silent-loss path:
-				// a `backup incremental` window deadline expired into a clean
-				// close, wrote a link with an empty end_position, and the next
-				// link started from "current" on unrelated data at exit 0.
-				// This pre-flight is the defence against it, so loosening the
-				// ACTION here would trade a wasteful re-copy for silent loss.
+				// IT STILL REFUSES, and a 3-tablet cluster measurement
+				// (2026-09-08) settled that rather than leaving it inherited.
+				// Both halves were measured with the pre-flight bypassed:
+				//
+				//	TRANSIENT (the errant tablet still in the pool): vtgate
+				//	  routes the STREAM to the tablet that can serve it —
+				//	  "Picked REPLICA tablet zone1-0000000101" — and 41
+				//	  changes flowed with Err() nil. Proceeding would work
+				//	  here, so today's refusal is a FALSE refusal in this
+				//	  case, and that cost is known and accepted.
+				//
+				//	PERMANENT (the errant tablet replaced, which is routine
+				//	  on PlanetScale): every tablet answers "GTIDSet
+				//	  Mismatch", vtgate logs "No healthy serving tablet found
+				//	  ... sleeping for 30.000 seconds" at INFO and never
+				//	  propagates it, then gives up at ~90s with a gRPC
+				//	  Canceled. 18 messages arrived, all heartbeat-only, zero
+				//	  real events.
+				//
+				// The refusal is kept for the permanent half, which no
+				// routing can rescue: the position names a UUID that no
+				// longer exists anywhere in the shard, so no tablet can ever
+				// serve it and every future resume would spend ~90s
+				// discovering that. Refusing at the door costs one re-copy;
+				// proceeding costs an indefinite series of them.
+				//
+				// CORRECTED from the first version of this comment, which
+				// said vtgate "BLOCKS waiting for another" and cited SLM-2's
+				// silent-gap path. It does not block indefinitely — it gives
+				// up — and the silent path does not reach here: the give-up
+				// is classified, stored via setErr, and surfaced loudly by
+				// captureWindow, while cleanExitOnCallerCancel checks
+				// ctx.Err() first and so will not swallow a server-side
+				// cancel. Verified directly: a gRPC Canceled does NOT satisfy
+				// errors.Is(err, context.Canceled) before classification, so
+				// the pump's early return is not taken.
 				//
 				// What changes is the DIAGNOSIS and the remedy. Calling this a
 				// replaced keyspace sent an operator to re-create a database
