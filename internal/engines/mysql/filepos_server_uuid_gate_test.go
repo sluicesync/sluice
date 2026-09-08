@@ -133,10 +133,11 @@ func TestFilePosPositionsCarryServerUUID_ASTRoster(t *testing.T) {
 		line int
 	}
 	var (
-		checked []site
-		missing []site
-		exempt  []site
-		files   = map[string]bool{}
+		checked      []site
+		missing      []site
+		unresolvable []site
+		exempt       []site
+		files        = map[string]bool{}
 	)
 
 	// Raw source per file, so the exemption marker can be read off the
@@ -169,7 +170,7 @@ func TestFilePosPositionsCarryServerUUID_ASTRoster(t *testing.T) {
 				return true
 			}
 
-			var isFilePos, hasUUID bool
+			var isFilePos, hasUUID, modeUnresolvable bool
 			for _, el := range lit.Elts {
 				kv, ok := el.(*ast.KeyValueExpr)
 				if !ok {
@@ -181,14 +182,34 @@ func TestFilePosPositionsCarryServerUUID_ASTRoster(t *testing.T) {
 				}
 				switch key.Name {
 				case "Mode":
-					if v, ok := kv.Value.(*ast.Ident); ok && v.Name == "positionModeFilePos" {
+					// Only a bare identifier naming one of the two mode
+					// constants can be resolved statically. Anything else —
+					// a variable, a function call, a conditional — is a
+					// construction this walker CANNOT classify, and the old
+					// code treated exactly that as "not file/pos", which is
+					// fail-OPEN: `binlogPos{Mode: mode, File: f, Pos: p}`
+					// escaped the ServerUUID requirement silently while
+					// being, at runtime, precisely the construction the gate
+					// exists for (audit TCI-7). None exist today, so this arm
+					// is a ratchet rather than a fix; it is here so the first
+					// one is a build failure instead of a hole.
+					v, ok := kv.Value.(*ast.Ident)
+					switch {
+					case !ok:
+						modeUnresolvable = true
+					case v.Name == "positionModeFilePos":
 						isFilePos = true
+					case v.Name == "positionModeGTID":
+						// Statically a GTID position; ServerUUID is not this
+						// gate's business there.
+					default:
+						modeUnresolvable = true
 					}
 				case "ServerUUID":
 					hasUUID = true
 				}
 			}
-			if !isFilePos {
+			if !isFilePos && !modeUnresolvable {
 				return true
 			}
 
@@ -211,7 +232,11 @@ func TestFilePosPositionsCarryServerUUID_ASTRoster(t *testing.T) {
 			files[base] = true
 			checked = append(checked, s)
 			if !hasUUID {
-				missing = append(missing, s)
+				if modeUnresolvable {
+					unresolvable = append(unresolvable, s)
+				} else {
+					missing = append(missing, s)
+				}
 			}
 			return true
 		})
@@ -228,6 +253,21 @@ func TestFilePosPositionsCarryServerUUID_ASTRoster(t *testing.T) {
 				"reader), or, if this construction genuinely cannot carry one, put %q plus a reason on the "+
 				"line above.",
 			m.file, m.line, filePosUUIDExemptMarker,
+		)
+	}
+
+	for _, u := range unresolvable {
+		t.Errorf(
+			"%s:%d: binlogPos{Mode: <not a mode constant>, ...} does not set ServerUUID.\n"+
+				"  This walker can only classify a Mode written as `positionModeFilePos` or "+
+				"`positionModeGTID`. A variable, call or conditional is a construction it cannot read, "+
+				"and it is graded as file/pos rather than skipped, because the alternative is fail-OPEN: "+
+				"the previous version treated an unreadable Mode as \"not file/pos\" and let exactly this "+
+				"shape past while it was, at runtime, the construction the gate exists for.\n"+
+				"  Either write the Mode as a constant so this can be decided statically, or stamp "+
+				"ServerUUID unconditionally (it is ignored for a GTID position), or put %q plus a reason "+
+				"on the line above.",
+			u.file, u.line, filePosUUIDExemptMarker,
 		)
 	}
 
