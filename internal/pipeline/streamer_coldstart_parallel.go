@@ -353,7 +353,7 @@ func (s *Streamer) runColdStartParallel(
 			slog.String("error", storeErr.Error()))
 		progressStore = nil
 	}
-	rc := newSyncRecordingContext(progressStore, streamID)
+	rc := newSyncRecordingContext(ctx, progressStore, streamID)
 	if rc.writes() {
 		defer migcore.CloseIf(rc.store)
 	}

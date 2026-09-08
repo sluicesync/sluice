@@ -59,6 +59,7 @@ import (
 	"fmt"
 	"log/slog"
 	"time"
+	"unicode/utf8"
 
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/progress"
@@ -148,7 +149,33 @@ type resumeContext struct {
 // The returned context is deliberately NOT resumable: nothing calls
 // loadOrInitState with it, and if something ever does, `enabled` alone
 // no longer implies "you may resume from this".
-func newSyncRecordingContext(store ir.MigrationStateStore, streamID string) resumeContext {
+func newSyncRecordingContext(ctx context.Context, store ir.MigrationStateStore, streamID string) resumeContext {
+	// The id has to FIT, and a stream id that does not must cost the
+	// status surface rather than the migration.
+	//
+	// Both control tables declare migration_id VARCHAR(255) (characters,
+	// not bytes, on MySQL utf8mb4 and on PG). `--stream-id` has no length
+	// validation anywhere, and sluice_cdc_state.stream_id is also
+	// VARCHAR(255) — so a 251-to-255-character stream id is legal today
+	// and worked fine before this feature existed. Prefixing it pushes
+	// the migration id past the column: strict-mode MySQL (the default)
+	// refuses with Error 1406 and would have failed the whole cold start,
+	// and a non-strict server would truncate silently, which is worse —
+	// two long stream ids sharing a 250-character prefix would collapse
+	// onto one row and attribute one migration's progress to the other.
+	//
+	// Recording is OBSERVABILITY. Losing it is a degraded status surface;
+	// failing the copy for it would be a regression on a configuration
+	// that used to work. Same call as the unopenable-store path below.
+	if n := utf8.RuneCountInString(syncMigrationID(streamID)); n > migrationIDMaxRunes {
+		slog.WarnContext(ctx, "pipeline: cold-start progress recording is DISABLED for this stream: its id is "+
+			"too long for the progress table, so `sync status` will report the stream as absent until the copy "+
+			"finishes and the CDC anchor is written. The migration itself is unaffected",
+			slog.String("stream_id", streamID),
+			slog.Int("migration_id_runes", n),
+			slog.Int("limit", migrationIDMaxRunes))
+		return resumeContext{}
+	}
 	if store == nil || streamID == "" {
 		// A target whose engine implements no MigrationStateStore records
 		// nothing, and that is a real gap rather than a silent nicety:
@@ -171,6 +198,23 @@ func newSyncRecordingContext(store ir.MigrationStateStore, streamID string) resu
 // [newSyncRecordingContext] for why that separation is a safety property
 // and not just tidiness.
 func syncMigrationID(streamID string) string { return "sync-" + streamID }
+
+// migrationIDMaxRunes is the width both engines declare for
+// migration_id (VARCHAR(255) — characters, not bytes, on MySQL utf8mb4
+// and on PostgreSQL).
+//
+// Held here rather than derived from the DDL because the DDL lives
+// engine-side and this package must not import engines;
+// TestMigrationIDWidthMatchesTheEngineDDL greps both CREATE TABLE
+// statements so a widened column cannot leave this constant behind.
+//
+// Note the ASYMMETRY with `migrate`, which is NOT fixed here and does
+// not need to be: an over-long `--migration-id` fails migrate loudly,
+// and the error names a value the operator typed themselves. A sync
+// operator types a STREAM id and would get an error about a
+// migration_id column they have never heard of, for a table that exists
+// only to make status prettier — so this path degrades instead.
+const migrationIDMaxRunes = 255
 
 // writes reports whether this context should PERSIST progress. Every
 // state writer gates on it; the resume readers deliberately do not, so
