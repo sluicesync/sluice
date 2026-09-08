@@ -79,6 +79,8 @@ func newMigrationStateStore(db *sql.DB, upsert upsertSpelling) *MigrationStateSt
 					hdr + " WHERE migration_id = ?",
 				ReadProgressRows: "SELECT table_name, progress, updated_at FROM " +
 					prog + " WHERE migration_id = ?",
+				ListHeadersByPrefix: "SELECT migration_id, phase, started_at, updated_at, last_error FROM " +
+					hdr + " WHERE migration_id LIKE ? ESCAPE '\\' ORDER BY updated_at DESC",
 				// started_at is deliberately excluded from the SET list
 				// so its DEFAULT CURRENT_TIMESTAMP on the original
 				// INSERT survives subsequent upserts; updated_at
@@ -257,6 +259,14 @@ func (s *MigrationStateStore) ensureStateFormatColumn(ctx context.Context) error
 // internal/migratestate).
 func (s *MigrationStateStore) Read(ctx context.Context, migrationID string) (ir.MigrationState, bool, error) {
 	return s.shared.Read(ctx, migrationID)
+}
+
+// List implements [ir.MigrationStateLister]: every migration header
+// whose id starts with prefix, freshest first. `sync status` uses it to
+// see a cold start that is running but has not yet written its CDC
+// anchor.
+func (s *MigrationStateStore) List(ctx context.Context, prefix string) ([]ir.MigrationState, error) {
+	return s.shared.List(ctx, prefix)
 }
 
 // Write upserts the header row plus any per-table entries present in

@@ -210,9 +210,10 @@ var (
 
 	// Slot manager, snapshot importer, migration-state store — the
 	// concrete types behind the Engine-level openers above.
-	_ ir.SlotManager         = (*SlotManager)(nil)
-	_ ir.SnapshotImporter    = (*SnapshotImporter)(nil)
-	_ ir.MigrationStateStore = (*MigrationStateStore)(nil)
+	_ ir.SlotManager          = (*SlotManager)(nil)
+	_ ir.SnapshotImporter     = (*SnapshotImporter)(nil)
+	_ ir.MigrationStateStore  = (*MigrationStateStore)(nil)
+	_ ir.MigrationStateLister = (*MigrationStateStore)(nil)
 	// StreamPublicationDropper backs `sluice sync decommission`'s
 	// per-stream publication removal (audit 2026-07-23 DEVEX-3/Q3); a
 	// method-set drift would silently downgrade PG decommission to

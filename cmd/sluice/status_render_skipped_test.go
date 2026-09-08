@@ -39,7 +39,7 @@ func TestRenderStatusText_SkippedTablesBlock(t *testing.T) {
 	}}
 	var buf bytes.Buffer
 	now := time.Date(2026, 8, 12, 10, 0, 30, 0, time.UTC)
-	if err := renderStatus(&buf, streams, nil, statusSkips(), statusRenderOpts{Format: "text"}, now); err != nil {
+	if err := renderStatus(&buf, streams, nil, statusSkips(), nil, statusRenderOpts{Format: "text"}, now); err != nil {
 		t.Fatalf("renderStatus: %v", err)
 	}
 	out := buf.String()
@@ -61,7 +61,7 @@ func TestRenderStatusText_NoSkipsNoBlock(t *testing.T) {
 		UpdatedAt: time.Date(2026, 8, 12, 10, 0, 0, 0, time.UTC),
 	}}
 	var buf bytes.Buffer
-	if err := renderStatus(&buf, streams, nil, nil, statusRenderOpts{Format: "text"}, time.Now()); err != nil {
+	if err := renderStatus(&buf, streams, nil, nil, nil, statusRenderOpts{Format: "text"}, time.Now()); err != nil {
 		t.Fatalf("renderStatus: %v", err)
 	}
 	if strings.Contains(buf.String(), "SKIPPED TABLES") {
@@ -71,7 +71,7 @@ func TestRenderStatusText_NoSkipsNoBlock(t *testing.T) {
 
 func TestRenderStatusJSON_SkippedTables(t *testing.T) {
 	var buf bytes.Buffer
-	if err := renderStatus(&buf, nil, nil, statusSkips(), statusRenderOpts{Format: "json"}, time.Now()); err != nil {
+	if err := renderStatus(&buf, nil, nil, statusSkips(), nil, statusRenderOpts{Format: "json"}, time.Now()); err != nil {
 		t.Fatalf("renderStatus: %v", err)
 	}
 	var doc struct {

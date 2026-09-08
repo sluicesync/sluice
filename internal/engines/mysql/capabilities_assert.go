@@ -195,7 +195,8 @@ var (
 	_ ir.ClientCopyFilterSetter = (*vstreamSnapshotRows)(nil)
 
 	// Migration-state store.
-	_ ir.MigrationStateStore = (*MigrationStateStore)(nil)
+	_ ir.MigrationStateStore  = (*MigrationStateStore)(nil)
+	_ ir.MigrationStateLister = (*MigrationStateStore)(nil)
 
 	// audit-2026-07-11 M-3: finish the ARCH-F1 sweep — runtime-dispatched
 	// optional surfaces that were implemented but unpinned, so a method-set

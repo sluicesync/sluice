@@ -190,6 +190,27 @@ func (s *SyncHealthCmd) Run(_ *Globals) error {
 	}
 
 	if !result.Found {
+		// "Not found" is also what a healthy COLD START looks like: the
+		// stream's row is written only after the copy, the index build
+		// and the FLOAT exact re-read all finish. Before 2026-09-08 this
+		// error was the operator's whole picture during that window,
+		// which reads as a dead run and is why one reached for strace.
+		//
+		// The exit status is deliberately unchanged — a cold start is
+		// not a healthy STREAM, and a cron probe that started treating
+		// it as one would go quiet exactly when a genuinely stuck cold
+		// start needed attention. What changes is that the error says
+		// which of the two situations this is, and how to tell whether
+		// it is progressing.
+		if cs, ok := coldStartInFlight(ctx, target, s.Target, s.StreamID); ok {
+			return operationalError{err: fmt.Errorf(
+				"stream %q is COLD STARTING (phase %s, last progress write %s ago) and has not written its "+
+					"CDC anchor yet — expected during a cold start, not a stall. Its stream row appears only "+
+					"after the copy, the index build and the FLOAT exact re-read finish; `sluice sync status` "+
+					"shows the progress, and an age that keeps climbing across two calls means the run is gone",
+				s.StreamID, cs.phase, cs.age.Round(time.Second),
+			)}
+		}
 		return operationalError{err: fmt.Errorf("stream %q not found on target", s.StreamID)}
 	}
 	switch {
@@ -476,4 +497,52 @@ func (e staleStreamError) Error() string {
 	}
 	return fmt.Sprintf("stream %q stale: last apply %ds ago, threshold %ds",
 		e.streamID, e.secondsAgo, e.threshold)
+}
+
+// coldStartProgress is the little that `sync health` needs to tell a
+// cold start apart from a dead run: which phase, and how long since the
+// last progress write.
+type coldStartProgress struct {
+	phase ir.MigrationPhase
+	age   time.Duration
+}
+
+// coldStartInFlight reports whether streamID currently has a cold start
+// writing progress rows on the target.
+//
+// Best-effort and deliberately silent on failure: this runs on the
+// not-found path of a health probe, where the caller already has a
+// correct error to return. An engine with no [ir.MigrationStateLister],
+// an unopenable store, or a read error all mean "cannot tell" — and
+// "cannot tell" must degrade to the plain not-found message rather than
+// to a claim in either direction.
+func coldStartInFlight(ctx context.Context, target ir.Engine, dsn, streamID string) (coldStartProgress, bool) {
+	lister, err := openMigrationStateStoreForStatus(ctx, target, dsn)
+	if err != nil || lister == nil {
+		return coldStartProgress{}, false
+	}
+	if c, ok := lister.(io.Closer); ok {
+		defer func() { _ = c.Close() }()
+	}
+	states, err := lister.List(ctx, syncMigrationIDPrefix+streamID)
+	if err != nil || len(states) == 0 {
+		return coldStartProgress{}, false
+	}
+	// List matches by PREFIX, so ask for the exact id rather than
+	// trusting the first row: stream "prod" would otherwise be reported
+	// as cold-starting because stream "prod-2" is.
+	want := syncMigrationIDPrefix + streamID
+	for _, st := range states {
+		if st.MigrationID != want {
+			continue
+		}
+		if st.Phase == ir.MigrationPhaseComplete {
+			// The copy finished; whatever is happening now is the
+			// post-copy work, and the plain not-found message is the
+			// honest answer.
+			return coldStartProgress{}, false
+		}
+		return coldStartProgress{phase: st.Phase, age: time.Since(st.UpdatedAt)}, true
+	}
+	return coldStartProgress{}, false
 }

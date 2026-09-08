@@ -2586,13 +2586,34 @@ func (s *SyncStatusCmd) Run(g *Globals) error {
 		}
 	}()
 
+	// The cold-start progress reader (2026-09-08 user report). A cold
+	// start writes progress rows for hours before its sluice_cdc_state
+	// row exists, so without this `sync status` reports a live migration
+	// exactly as it reports a dead one.
+	//
+	// Best-effort in both directions: a target engine with no
+	// MigrationStateStore leaves the lister nil, and an open that fails
+	// is not worth failing the whole status command over — the streams
+	// half is still worth rendering. The renderer says when the
+	// cold-start half is unavailable rather than showing an empty
+	// section that reads as "nothing running".
+	var coldStartLister ir.MigrationStateLister
+	if store, serr := openMigrationStateStoreForStatus(ctx, target, s.Target); serr == nil && store != nil {
+		coldStartLister = store
+		defer func() {
+			if c, ok := store.(io.Closer); ok {
+				_ = c.Close()
+			}
+		}()
+	}
+
 	// One-shot path (default).
 	if s.Watch <= 0 {
-		return runStatusOnce(ctx, applier, os.Stdout, opts)
+		return runStatusOnce(ctx, applier, coldStartLister, os.Stdout, opts)
 	}
 
 	// Live-refresh path.
-	return runStatusWatch(ctx, applier, os.Stdout, opts, s.Watch)
+	return runStatusWatch(ctx, applier, coldStartLister, os.Stdout, opts, s.Watch)
 }
 
 // SyncStopCmd asks a running `sluice sync start` to drain in-flight

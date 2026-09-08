@@ -3722,6 +3722,33 @@ type MigrationState struct {
 	LastError     string
 }
 
+// MigrationStateLister is the OPTIONAL enumeration half of
+// [MigrationStateStore]: every migration header whose id starts with a
+// prefix, freshest first.
+//
+// It exists because a `sync` cold start is otherwise invisible. The
+// stream's row in sluice_cdc_state is written only at the very end, once
+// the copy, the index build and the FLOAT re-read have all finished — an
+// ordering that is load-bearing for crash safety — so for the whole of a
+// multi-hour cold start `sync status` had a stream id it could not look
+// up and nothing else. This lets it enumerate the progress rows the cold
+// start writes as it goes (see the pipeline's sync recording context)
+// and say "copying, 40 of 112 tables, last write 3s ago" instead of
+// "not found on target", which reads as a dead process.
+//
+// Optional by design, and the gap is real rather than cosmetic: a target
+// engine that does not implement it leaves `sync status` blind for the
+// same window, and callers must say so rather than rendering an empty
+// list as "nothing running".
+type MigrationStateLister interface {
+	// List returns the header of every migration whose MigrationID
+	// starts with prefix, ordered freshest-updated first. Headers only:
+	// TableProgress is not populated (use [MigrationStateStore.Read] for
+	// one known id). A missing control table is (nil, nil) — a target
+	// that has never migrated is the healthy shape, not a fault.
+	List(ctx context.Context, prefix string) ([]MigrationState, error)
+}
+
 // MigrationStateStore is the per-target persistence surface for
 // resumable simple-mode migrations. Mirrors [ChangeApplier]'s
 // EnsureControlTable / ReadPosition shape but with a different

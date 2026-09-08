@@ -67,6 +67,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -146,6 +147,24 @@ type SQL struct {
 	// (table_name, progress, updated_at) for every progress row of
 	// the migration.
 	ReadProgressRows string
+
+	// ListHeadersByPrefix: args (prefix pattern, already LIKE-escaped
+	// by this package with a trailing '%'). Must project exactly
+	// (migration_id, phase, started_at, updated_at, last_error) for
+	// every header row whose migration_id matches, ordered by
+	// updated_at DESC so the freshest run is first.
+	//
+	// HEADERS ONLY, deliberately. This exists so `sync status` can
+	// answer "is this cold start alive or dead", which needs a phase
+	// and a heartbeat and nothing else; joining every per-table
+	// progress row would turn a status command into a scan of the
+	// widest table in the control schema. Per-table detail is still
+	// available through Read for one known id.
+	//
+	// Optional: an engine that leaves this empty simply has no
+	// [ir.MigrationStateLister], and [Store.List] refuses rather than
+	// returning an empty list that would read as "no runs".
+	ListHeadersByPrefix string
 
 	// UpsertHeader: args (migrationID, phase, blobSentinel,
 	// stateFormat, lastError). Inserts or updates the header row,
@@ -267,6 +286,65 @@ func (s *Store) Read(ctx context.Context, migrationID string) (ir.MigrationState
 // notePendingUpgrade records that migrationID's header row was seen at
 // FormatLegacyBlob with the given decoded blob progress. The first
 // write path replays it into per-table rows via upgradeIfPending.
+// List returns the header of every migration whose id starts with
+// prefix, freshest first. It exists so `sync status` can see a cold
+// start that is running but has not yet written its CDC anchor — until
+// 2026-09-08 such a run was invisible to every status surface for its
+// entire duration, which is indistinguishable from a dead process.
+//
+// Headers only; see [SQL.ListHeadersByPrefix] for why.
+//
+// A missing control table is reported as NO RUNS rather than an error:
+// on a target that has never run a migration the table legitimately does
+// not exist, and that is the common healthy shape, not a fault. Any
+// other failure is returned — a status command that cannot read the
+// table must not render "no runs in progress", which is the answer an
+// operator would act on.
+func (s *Store) List(ctx context.Context, prefix string) ([]ir.MigrationState, error) {
+	if s.SQL.ListHeadersByPrefix == "" {
+		return nil, fmt.Errorf("%s: migrate-state store has no header-list statement", s.Config.EngineName)
+	}
+	rows, err := s.DB.QueryContext(ctx, s.SQL.ListHeadersByPrefix, likePrefix(prefix))
+	if err != nil {
+		if s.Config.IsMissingTable != nil && s.Config.IsMissingTable(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("%s: list migrate-state headers: %w", s.Config.EngineName, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []ir.MigrationState
+	for rows.Next() {
+		var (
+			st        ir.MigrationState
+			phase     string
+			lastError sql.NullString
+		)
+		if err := rows.Scan(&st.MigrationID, &phase, &st.StartedAt, &st.UpdatedAt, &lastError); err != nil {
+			return nil, fmt.Errorf("%s: scan migrate-state header: %w", s.Config.EngineName, err)
+		}
+		st.Phase = ir.MigrationPhase(phase)
+		st.LastError = lastError.String
+		out = append(out, st)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("%s: list migrate-state headers: %w", s.Config.EngineName, err)
+	}
+	return out, nil
+}
+
+// likePrefix turns a literal id prefix into a LIKE pattern, escaping the
+// wildcards so a prefix containing '%' or '_' matches literally.
+//
+// This is not hypothetical tidiness: stream ids are operator-chosen and
+// '_' is an ordinary character in one ("prod_cutover"), where an
+// unescaped pattern would silently also match "prodXcutover". A status
+// command that over-matches attributes one run's progress to another.
+func likePrefix(prefix string) string {
+	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	return r.Replace(prefix) + "%"
+}
+
 func (s *Store) notePendingUpgrade(migrationID string, progress map[string]ir.TableProgress) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

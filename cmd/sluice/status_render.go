@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strings"
 	"text/tabwriter"
 	"time"
 
@@ -40,7 +41,7 @@ type statusRenderOpts struct {
 // runStatusOnce is the one-shot path: query the target, render once,
 // return. The default --watch=0 path; also reused by --watch's tick
 // loop.
-func runStatusOnce(ctx context.Context, applier ir.ChangeApplier, out io.Writer, opts statusRenderOpts) error {
+func runStatusOnce(ctx context.Context, applier ir.ChangeApplier, lister ir.MigrationStateLister, out io.Writer, opts statusRenderOpts) error {
 	streams, err := applier.ListStreams(ctx)
 	if err != nil {
 		return fmt.Errorf("list streams: %w", err)
@@ -69,7 +70,90 @@ func runStatusOnce(ctx context.Context, applier ir.ChangeApplier, out io.Writer,
 		}
 		skips = filterSkippedTables(skips, opts.StreamID)
 	}
-	return renderStatus(out, streams, leases, skips, opts, time.Now())
+	// Cold starts in flight (2026-09-08 user report). A stream's row in
+	// sluice_cdc_state is written only at the very END of a cold start —
+	// after the copy, the index build and the FLOAT re-read — which is
+	// load-bearing for crash safety and is not going to change. So a
+	// running cold start appears in NEITHER `streams` above nor anywhere
+	// else, and for hours `sync status` reported exactly what it reports
+	// for a dead process. These are the progress rows the cold start
+	// writes as it goes.
+	//
+	// Best-effort: an engine with no [ir.MigrationStateLister] leaves
+	// this nil and the blackout persists for that target — the renderer
+	// says so rather than implying "nothing is running".
+	var coldStarts []ir.MigrationState
+	if lister != nil {
+		coldStarts, err = lister.List(ctx, syncMigrationIDPrefix)
+		if err != nil {
+			return fmt.Errorf("list cold starts in progress: %w", err)
+		}
+		coldStarts = filterColdStarts(coldStarts, opts.StreamID)
+	}
+	return renderStatus(out, streams, leases, skips, coldStarts, opts, time.Now())
+}
+
+// openMigrationStateStoreForStatus opens the target's migrate-state
+// store so `sync status` can enumerate cold starts in flight, or returns
+// (nil, nil) when the engine has no such store.
+//
+// No target-schema argument, deliberately: sluice's control tables
+// always live in the DSN's default schema (the pipeline's own opener
+// documents this and explicitly does not apply a target schema), so
+// there is no namespace for status to get wrong.
+//
+// The returned store is a LISTER only as far as this caller is
+// concerned — status never reads or writes migration state, it
+// enumerates headers.
+func openMigrationStateStoreForStatus(ctx context.Context, target ir.Engine, dsn string) (ir.MigrationStateLister, error) {
+	opener, ok := target.(ir.MigrationStateStoreOpener)
+	if !ok {
+		return nil, nil
+	}
+	store, err := opener.OpenMigrationStateStore(ctx, dsn)
+	if err != nil {
+		return nil, err
+	}
+	lister, ok := store.(ir.MigrationStateLister)
+	if !ok {
+		if c, isCloser := store.(io.Closer); isCloser {
+			_ = c.Close()
+		}
+		return nil, nil
+	}
+	return lister, nil
+}
+
+// syncMigrationIDPrefix is the namespace a sync cold start writes its
+// progress rows under. It mirrors the pipeline's syncMigrationID and is
+// duplicated rather than exported because the two packages agree on a
+// STORED string, not on a function: changing it on one side without the
+// other is a data-format change, and a shared helper would make that
+// look like a refactor. TestSyncMigrationIDPrefixMatchesThePipeline
+// holds them together.
+const syncMigrationIDPrefix = "sync-"
+
+// filterColdStarts narrows the cold-start list to one stream when
+// --stream-id is given, matching on the STREAM id rather than the
+// migration id the operator never sees.
+func filterColdStarts(states []ir.MigrationState, streamID string) []ir.MigrationState {
+	if streamID == "" {
+		return states
+	}
+	want := syncMigrationIDPrefix + streamID
+	out := states[:0]
+	for _, st := range states {
+		if st.MigrationID == want {
+			out = append(out, st)
+		}
+	}
+	return out
+}
+
+// coldStartStreamID recovers the operator-facing stream id from a
+// progress row's migration id.
+func coldStartStreamID(migrationID string) string {
+	return strings.TrimPrefix(migrationID, syncMigrationIDPrefix)
 }
 
 // filterSkippedTables mirrors filterStreams for the C-11 skip ledger.
@@ -101,11 +185,11 @@ func filterSkippedTables(records []ir.SkippedTableRecord, streamID string) []ir.
 // On ctx cancel the loop returns cleanly (no error); kong's signal
 // handling already maps Ctrl-C to ctx cancellation so the operator
 // sees the partial output and a clean exit.
-func runStatusWatch(ctx context.Context, applier ir.ChangeApplier, out io.Writer, opts statusRenderOpts, interval time.Duration) error {
+func runStatusWatch(ctx context.Context, applier ir.ChangeApplier, lister ir.MigrationStateLister, out io.Writer, opts statusRenderOpts, interval time.Duration) error {
 	// Initial render before sleeping. Operators expect immediate
 	// output on `sluice sync status --watch 2s`; making them wait
 	// the first interval would be confusing.
-	if err := clearAndRender(ctx, applier, out, opts); err != nil {
+	if err := clearAndRender(ctx, applier, lister, out, opts); err != nil {
 		// First-iteration errors are likely a misconfigured target;
 		// surface immediately rather than silently looping on the
 		// same failure. Subsequent-iteration errors (network blip
@@ -120,7 +204,7 @@ func runStatusWatch(ctx context.Context, applier ir.ChangeApplier, out io.Writer
 		case <-ctx.Done():
 			return nil
 		case <-t.C:
-			if err := clearAndRender(ctx, applier, out, opts); err != nil {
+			if err := clearAndRender(ctx, applier, lister, out, opts); err != nil {
 				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 					return nil
 				}
@@ -136,13 +220,13 @@ func runStatusWatch(ctx context.Context, applier ir.ChangeApplier, out io.Writer
 // clearAndRender clears the terminal and runs one render pass.
 // Factored so the initial render and each ticker iteration share
 // identical behaviour.
-func clearAndRender(ctx context.Context, applier ir.ChangeApplier, out io.Writer, opts statusRenderOpts) error {
+func clearAndRender(ctx context.Context, applier ir.ChangeApplier, lister ir.MigrationStateLister, out io.Writer, opts statusRenderOpts) error {
 	// ESC[2J = clear entire screen; ESC[H = move cursor to (1,1).
 	// Together they re-render the screen in place each tick.
 	if _, err := fmt.Fprint(out, "\x1b[2J\x1b[H"); err != nil {
 		return fmt.Errorf("write clear-screen: %w", err)
 	}
-	return runStatusOnce(ctx, applier, out, opts)
+	return runStatusOnce(ctx, applier, lister, out, opts)
 }
 
 // filterStreams returns either the input as-is (when streamID is
@@ -164,7 +248,7 @@ func filterStreams(streams []ir.StreamStatus, streamID string) []ir.StreamStatus
 // renderStatus dispatches by format. Single entry point so the watch
 // loop and the one-shot path share identical rendering logic; tests
 // drive it directly.
-func renderStatus(out io.Writer, streams []ir.StreamStatus, leases []ir.ShardConsolidationLeaseRow, skips []ir.SkippedTableRecord, opts statusRenderOpts, now time.Time) error {
+func renderStatus(out io.Writer, streams []ir.StreamStatus, leases []ir.ShardConsolidationLeaseRow, skips []ir.SkippedTableRecord, coldStarts []ir.MigrationState, opts statusRenderOpts, now time.Time) error {
 	// Sort for stable output across runs. Most-recently-updated first
 	// matches the operator's interest ("what's been moving?").
 	sort.Slice(streams, func(i, j int) bool {
@@ -173,9 +257,9 @@ func renderStatus(out io.Writer, streams []ir.StreamStatus, leases []ir.ShardCon
 
 	switch opts.Format {
 	case "", "text":
-		return renderStatusText(out, streams, leases, skips, opts, now)
+		return renderStatusText(out, streams, leases, skips, coldStarts, opts, now)
 	case "json":
-		return renderStatusJSON(out, streams, leases, skips, opts, now)
+		return renderStatusJSON(out, streams, leases, skips, coldStarts, opts, now)
 	default:
 		return fmt.Errorf("unknown --format %q (want text or json)", opts.Format)
 	}
@@ -184,14 +268,32 @@ func renderStatus(out io.Writer, streams []ir.StreamStatus, leases []ir.ShardCon
 // renderStatusText is the human-readable tabwriter path. Keeps the
 // pre-refactor output shape exactly when --summary is off, so
 // existing scripts that parsed the text output still work.
-func renderStatusText(out io.Writer, streams []ir.StreamStatus, leases []ir.ShardConsolidationLeaseRow, skips []ir.SkippedTableRecord, opts statusRenderOpts, now time.Time) error {
+func renderStatusText(out io.Writer, streams []ir.StreamStatus, leases []ir.ShardConsolidationLeaseRow, skips []ir.SkippedTableRecord, coldStarts []ir.MigrationState, opts statusRenderOpts, now time.Time) error {
 	if len(streams) == 0 {
+		// A cold start in flight is the common reason there is no stream
+		// row yet, and reporting only "no stream on target" here is what
+		// sent a real operator to strace to find out whether sluice was
+		// alive. Render it INSTEAD of the empty message, not after it:
+		// the two together would read as a contradiction.
+		if len(coldStarts) > 0 {
+			if err := writeColdStartsText(out, coldStarts, now); err != nil {
+				return err
+			}
+			return writeSkippedTablesText(out, skips)
+		}
 		if err := writeEmptyText(out, opts.StreamID); err != nil {
 			return err
 		}
 		// A cleared stream can leave its C-11 skip ledger behind; the
 		// ledger still renders so the drift stays visible.
 		return writeSkippedTablesText(out, skips)
+	}
+	// A cold start can also be running alongside established streams
+	// (a second stream against the same target), so it renders here too.
+	if len(coldStarts) > 0 {
+		if err := writeColdStartsText(out, coldStarts, now); err != nil {
+			return err
+		}
 	}
 
 	if opts.Summary {
@@ -302,6 +404,51 @@ func classifyLeasesForSummary(leases []ir.ShardConsolidationLeaseRow, now time.T
 
 // writeEmptyText handles the no-streams case for the text format.
 // Mirrors the pre-refactor messages exactly.
+// writeColdStartsText renders the cold starts that are running but have
+// not yet written a CDC anchor.
+//
+// The heartbeat age is the load-bearing column and the reason this is
+// not just a phase label: a phase alone is indistinguishable between a
+// run that is working and one that died mid-phase and left its last row
+// behind. An age that keeps climbing across two `sync status` calls is
+// how an operator tells those apart, so the age is stated as "last
+// progress write" rather than something vaguer.
+func writeColdStartsText(out io.Writer, coldStarts []ir.MigrationState, now time.Time) error {
+	if _, err := fmt.Fprintln(out, "cold start in progress (no CDC anchor yet — this is expected, not a stall):"); err != nil {
+		return err
+	}
+	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	if _, err := fmt.Fprintln(tw, "STREAM\tPHASE\tSTARTED\tLAST PROGRESS WRITE"); err != nil {
+		return err
+	}
+	for _, st := range coldStarts {
+		phase := string(st.Phase)
+		if phase == "" {
+			phase = "starting"
+		}
+		if _, err := fmt.Fprintf(
+			tw, "%s\t%s\t%s\t%s ago\n",
+			coldStartStreamID(st.MigrationID),
+			phase,
+			st.StartedAt.UTC().Format(time.RFC3339),
+			now.Sub(st.UpdatedAt).Round(time.Second),
+		); err != nil {
+			return err
+		}
+	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+	// The one thing an operator most needs to know here, because the
+	// natural reaction to a long quiet stretch is to kill the run.
+	_, err := fmt.Fprintln(out,
+		"  A cold start writes its stream row only after the copy, the index build and the FLOAT exact\n"+
+			"  re-read all finish, so `sync health` reports it as not-found until then. Re-run this command:\n"+
+			"  a LAST PROGRESS WRITE age that keeps climbing means the run is gone; one that resets means it\n"+
+			"  is working.")
+	return err
+}
+
 func writeEmptyText(out io.Writer, streamID string) error {
 	if streamID != "" {
 		_, err := fmt.Fprintf(out, "no stream %q on target\n", streamID)
@@ -371,7 +518,7 @@ func agesSpan(streams []ir.StreamStatus, now time.Time) (oldest, newest time.Dur
 // "scriptable output should always include aggregates" is the more
 // useful default). Field names match Go's json:"" tag conventions
 // (snake_case for JSON) so jq pipes are predictable.
-func renderStatusJSON(out io.Writer, streams []ir.StreamStatus, leases []ir.ShardConsolidationLeaseRow, skips []ir.SkippedTableRecord, _ statusRenderOpts, now time.Time) error {
+func renderStatusJSON(out io.Writer, streams []ir.StreamStatus, leases []ir.ShardConsolidationLeaseRow, skips []ir.SkippedTableRecord, coldStarts []ir.MigrationState, _ statusRenderOpts, now time.Time) error {
 	type jsonPosition struct {
 		Engine string `json:"engine"`
 		Token  string `json:"token"`
@@ -415,12 +562,25 @@ func renderStatusJSON(out io.Writer, streams []ir.StreamStatus, leases []ir.Shar
 		FirstSkippedAt string `json:"first_skipped_at"`
 		LastSkippedAt  string `json:"last_skipped_at"`
 	}
+	type jsonColdStart struct {
+		StreamID         string    `json:"stream_id"`
+		Phase            string    `json:"phase"`
+		StartedAt        time.Time `json:"started_at"`
+		UpdatedAt        time.Time `json:"updated_at"`
+		LastProgressAgeS int64     `json:"last_progress_age_seconds"`
+		LastError        string    `json:"last_error,omitempty"`
+	}
 	type jsonDoc struct {
-		GeneratedAt time.Time          `json:"generated_at"`
-		Summary     jsonSummary        `json:"summary"`
-		Streams     []jsonStream       `json:"streams"`
-		Leases      []jsonLease        `json:"consolidation_leases,omitempty"`
-		Skipped     []jsonSkippedTable `json:"skipped_tables,omitempty"`
+		GeneratedAt time.Time    `json:"generated_at"`
+		Summary     jsonSummary  `json:"summary"`
+		Streams     []jsonStream `json:"streams"`
+		Leases      []jsonLease  `json:"consolidation_leases,omitempty"`
+
+		Skipped []jsonSkippedTable `json:"skipped_tables,omitempty"`
+		// Cold starts that are running but have not yet written a CDC
+		// anchor. omitempty, so a target with none renders the pre-2026-09-08
+		// document byte-identically and no jq filter breaks.
+		ColdStarts []jsonColdStart `json:"cold_starts_in_progress,omitempty"`
 	}
 
 	out2 := make([]jsonStream, 0, len(streams))
@@ -469,6 +629,24 @@ func renderStatusJSON(out io.Writer, streams []ir.StreamStatus, leases []ir.Shar
 			LastSkippedAt:  rec.LastSkippedAt.UTC().Format(time.RFC3339),
 		})
 	}
+	coldStartsJSON := make([]jsonColdStart, 0, len(coldStarts))
+	for _, cs := range coldStarts {
+		phase := string(cs.Phase)
+		if phase == "" {
+			phase = "starting"
+		}
+		coldStartsJSON = append(coldStartsJSON, jsonColdStart{
+			StreamID:         coldStartStreamID(cs.MigrationID),
+			Phase:            phase,
+			StartedAt:        cs.StartedAt.UTC(),
+			UpdatedAt:        cs.UpdatedAt.UTC(),
+			LastProgressAgeS: int64(now.Sub(cs.UpdatedAt).Seconds()),
+			LastError:        cs.LastError,
+		})
+	}
+	if len(coldStartsJSON) == 0 {
+		coldStartsJSON = nil // omitempty: preserve the pre-2026-09-08 document exactly
+	}
 	doc := jsonDoc{
 		GeneratedAt: now.UTC(),
 		Summary: jsonSummary{
@@ -476,9 +654,10 @@ func renderStatusJSON(out io.Writer, streams []ir.StreamStatus, leases []ir.Shar
 			OldestSeconds: int64(oldest.Seconds()),
 			NewestSeconds: int64(newest.Seconds()),
 		},
-		Streams: out2,
-		Leases:  leasesJSON,
-		Skipped: skipsJSON,
+		Streams:    out2,
+		Leases:     leasesJSON,
+		ColdStarts: coldStartsJSON,
+		Skipped:    skipsJSON,
 	}
 
 	// Indent for human-skimmable scripted output. jq pipes don't care

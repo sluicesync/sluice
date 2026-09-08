@@ -28,7 +28,7 @@ func runStatusAllOnce(ctx context.Context, fleet *SyncFleetConfig, out io.Writer
 	// fleet roll-up: both are per-target surfaces, out of scope for the
 	// aggregate view (same scope rule; the single-target `sync status`,
 	// the stop summary, and `sync health` carry the skip records).
-	return renderStatus(out, streams, nil, nil, opts, time.Now())
+	return renderStatus(out, streams, nil, nil, nil, opts, time.Now())
 }
 
 // runStatusAllWatch is the live-refresh fleet view. Mirrors
