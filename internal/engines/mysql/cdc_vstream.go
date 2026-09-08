@@ -1129,10 +1129,22 @@ func (r *vstreamCDCReader) verifyVStreamPositionReachable(ctx context.Context, d
 		// subset of everything. vttablet's own uvstreamer refuses a resume
 		// set that is not ⊆ its gtid_executed ("GTIDSet Mismatch"), but that
 		// refusal does not reliably reach sluice: vtgate marks the refusing
-		// tablet ignorable and BLOCKS waiting for another, so a `backup
-		// incremental` window deadline expired into a clean close and a
-		// chain link with an empty end_position, and the next link started
-		// from "current" on the unrelated cluster — silent loss at exit 0.
+		// tablet ignorable and retries others without propagating anything,
+		// so a `backup incremental` window deadline expired into a clean
+		// close and a chain link with an empty end_position, and the next
+		// link started from "current" on the unrelated cluster — silent loss
+		// at exit 0.
+		//
+		// MEASURED SINCE, and this is the FOURTH place that wording lived
+		// (2026-09-08): vtgate does not block indefinitely, it gives up at
+		// ~90s with a gRPC Canceled, logging "No healthy serving tablet
+		// found … sleeping for 30.000 seconds" at INFO in between. The
+		// "blocks" phrasing was corrected in three homes one commit earlier —
+		// the errant arm's comment, its error string, and a test doc — and
+		// this copy was missed by that sweep, which is exactly the shape the
+		// correction itself was about. The SLM-2 conclusion is unchanged:
+		// asking the shard up front is still what makes the refusal reach
+		// sluice at all.
 		// Asking the shard the same question up front, the way the binlog
 		// arm does (verifyGTIDLineageContinuity), refuses at the door.
 		var contained int

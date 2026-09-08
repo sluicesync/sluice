@@ -432,6 +432,12 @@ func Setup(ctx context.Context, dsn string, opts SetupOptions) (*Plan, error) {
 		return nil, fmt.Errorf("pgtrigger: setup: preflight: %w", err)
 	}
 
+	// Advisory only, and it closes a door-on-one-path gap rather than a loss
+	// (audit SLP-5): the pipeline refuses a declaratively partitioned source
+	// table at preflight, so setup succeeding on one leaves the operator to
+	// discover that at `sync start` instead of here.
+	warnPartitionedParents(ctx, db, opts.Schema, opts.Tables)
+
 	// The engine's own tables are created with CREATE TABLE IF NOT EXISTS, so a
 	// pre-existing relation at one of those names would be ADOPTED rather than
 	// refused (item 149b). Graded before the event-trigger probe and before the
