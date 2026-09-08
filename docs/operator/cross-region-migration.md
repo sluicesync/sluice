@@ -51,12 +51,21 @@ This is a field-reported recipe, not yet a sluice-verified one. **The `--upfront
 
 ## The quiet window after the copy: finalization
 
-After the bulk copy finishes and every index deploy request completes, there is a **silent stretch** before CDC begins. During it:
+After the bulk copy finishes and every index deploy request completes, there is a stretch before CDC begins during which `sync status`, `sync health` and `verify` all report that the stream is **not found on target**. That is expected and does not mean the run has died.
 
-- `sync status`, `sync health` and `verify` report that the stream is **not found on target**.
-- sluice logs nothing at all until the phase completes.
+What is happening is the VStream FLOAT exact re-read, logged under `FLOAT-EXACT-REREAD`: vtgate's row streamer renders single-precision `FLOAT` through mysqld's float-to-text formatter, so a stored `8388608` arrives as `8388610` — a real float32-level loss — and sluice re-reads those columns exactly from the source and repairs them by primary key. Only after that does it persist the CDC anchor, which is what those three commands look for.
 
-Both are expected, and neither means the run has died. What is happening is the VStream FLOAT exact re-read: vtgate's row streamer renders single-precision `FLOAT` through mysqld's float-to-text formatter, so a stored `8388608` arrives as `8388610` — a real float32-level loss — and sluice re-reads those columns exactly from the source and repairs them by primary key. Only after that does it persist the CDC anchor.
+The phase announces itself, says how many tables it will touch, and logs each one as it completes:
+
+```
+pipeline: FLOAT-EXACT-REREAD: re-reading single-precision FLOAT columns exactly from the source
+  before CDC starts. The stream is NOT yet registered on the target, so `sync status` and
+  `sync health` will report it as not found until this finishes — that is expected, not a stall
+  tables=12
+pipeline: FLOAT-EXACT-REREAD: table repaired table=orders done=1 of=12
+```
+
+Before v0.148.0 it logged nothing at all until it finished, which is what prompted this section: silence plus a status surface reporting absence is indistinguishable from a dead process, and the operator who reported it reached for `strace` to find out. If you are on an older build, that is what the quiet is.
 
 The ordering is deliberate and load-bearing. CDC replays from the copy anchor, so anything that changed between the copy and the re-read is re-applied to its final value; and because the anchor is *not yet written*, a crash mid-repair re-cold-starts cleanly instead of warm-resuming onto a half-repaired target. Writing the anchor earlier to make the status surfaces happier would trade a cosmetic problem for a correctness one.
 

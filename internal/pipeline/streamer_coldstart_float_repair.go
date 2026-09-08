@@ -72,6 +72,13 @@ type floatRepairTable struct {
 // reaches the target, so even a FLOAT→DOUBLE `--type-override` still lands
 // rounded and still needs the exact re-read. A table with no single-
 // precision FLOAT column is omitted entirely.
+// floatRepairPhaseMarker is the grep-stable marker on the cold-start
+// FLOAT re-read phase. An operator watching a long finalization window —
+// during which every status surface reports the stream as absent, because
+// the CDC anchor is deliberately not written yet — needs one token to
+// search for in the log and in the docs.
+const floatRepairPhaseMarker = "FLOAT-EXACT-REREAD"
+
 func planFloatRepair(sourceSchema *ir.Schema) []floatRepairTable {
 	if sourceSchema == nil {
 		return nil
@@ -305,11 +312,35 @@ func (s *Streamer) repairColdStartFloats(ctx context.Context, plan []floatRepair
 		limit = migcore.DefaultBulkBatchSize
 	}
 
-	repaired := 0
+	// Announce the phase BEFORE doing any of it, and report each table as
+	// it completes (user report 2026-09-08).
+	//
+	// This phase used to log nothing at all until it finished. It runs
+	// after the copy and after every index build, it scales with the row
+	// count of the FLOAT-bearing tables, and the CDC anchor is deliberately
+	// not persisted until it returns — so for its whole duration `sync
+	// status` / `sync health` / `verify` also report the stream as NOT
+	// FOUND on target. Silence plus a status surface actively reporting
+	// absence is indistinguishable from a dead run, and the operator who
+	// reported this reasonably resorted to strace on the PID to find out
+	// whether sluice was still working. It was.
+	//
+	// The anchor ordering is not the thing to fix — it is load-bearing for
+	// crash safety (see the caller in streamer_coldstart.go). What was
+	// missing is any signal at all, which costs two log lines.
+	var repairable []floatRepairTable
 	for _, ft := range plan {
-		if !ft.repairable {
-			continue
+		if ft.repairable {
+			repairable = append(repairable, ft)
 		}
+	}
+	slog.InfoContext(ctx, "pipeline: "+floatRepairPhaseMarker+": re-reading single-precision FLOAT columns exactly "+
+		"from the source before CDC starts. The stream is NOT yet registered on the target, so `sync status` and "+
+		"`sync health` will report it as not found until this finishes — that is expected, not a stall",
+		slog.Int("tables", len(repairable)))
+
+	repaired := 0
+	for _, ft := range repairable {
 		tgt, ok := tgtByName[ft.name]
 		if !ok {
 			slog.WarnContext(ctx, "pipeline: float repair: target table not found; skipping",
@@ -321,6 +352,10 @@ func (s *Streamer) repairColdStartFloats(ctx context.Context, plan []floatRepair
 				fmt.Errorf("pipeline: float repair %q: %w", ft.name, err))
 		}
 		repaired++
+		slog.InfoContext(ctx, "pipeline: "+floatRepairPhaseMarker+": table repaired",
+			slog.String("table", ft.name),
+			slog.Int("done", repaired),
+			slog.Int("of", len(repairable)))
 	}
 	if repaired > 0 {
 		slog.InfoContext(ctx, "pipeline: float repair complete — single-precision FLOAT columns re-read exactly from source",
