@@ -310,17 +310,54 @@ func gradeSessionGUCCastRoster(
 					lane.id, filepath.ToSlash(site.file), site.callee)
 			}
 		}
-		for _, marker := range lane.messageMarkers {
-			found := false
+		// The markers must all appear in ONE literal, not merely somewhere
+		// among the literals of these files (audit TCI-5). Per-marker
+		// searching made the check FILE-scoped: PostgreSQL's projection-
+		// invisible refusal (cdc_relations.go:344) also carries "drained
+		// model", so the session-TZ-cast refusal beside it could lose its
+		// remedy and the gate stayed green — the marker was satisfied by a
+		// DIFFERENT refusal. A marker set split across two messages is not
+		// a refusal that names both; it is two refusals that each name one.
+		//
+		// Requiring co-occurrence is what makes "this literal IS the lane's
+		// refusal" checkable at all, and it holds today for every lane:
+		// cdc_relations.go:350 carries "TimeZone" and "drained model"
+		// together, cdc_session_tz_cast.go:271 carries "time_zone" and
+		// "drained model" together, and :344 carries only the remedy.
+		if len(lane.messageMarkers) > 0 {
+			bound := false
 			for _, msg := range f.messages {
-				if strings.Contains(msg, marker) {
-					found = true
+				all := true
+				for _, marker := range lane.messageMarkers {
+					if !strings.Contains(msg, marker) {
+						all = false
+						break
+					}
+				}
+				if all {
+					bound = true
 					break
 				}
 			}
-			if !found {
-				add("lane %q: no refusal message names %q. The refusal must name the MECHANISM (which session setting decides the cast) and the drained-model remedy, or the operator cannot tell whether they were exposed.",
-					lane.id, marker)
+			if !bound {
+				// Report which markers are present SOMEWHERE, because "split
+				// across two messages" and "one is simply gone" need
+				// different fixes and the failure should say which it is.
+				var elsewhere []string
+				for _, marker := range lane.messageMarkers {
+					for _, msg := range f.messages {
+						if strings.Contains(msg, marker) {
+							elsewhere = append(elsewhere, marker)
+							break
+						}
+					}
+				}
+				add("lane %q: no SINGLE refusal message names all of %v (found elsewhere in these files: %v). "+
+					"One refusal must name the MECHANISM (which session setting decides the cast) AND the "+
+					"drained-model remedy together, or the operator reading the message they actually got "+
+					"cannot tell whether they were exposed. Markers satisfied by separate literals mean a "+
+					"different refusal is holding this one's marker.",
+					lane.id, lane.messageMarkers, elsewhere)
 			}
 		}
 	}
@@ -447,7 +484,27 @@ func TestSessionGUCCastRoster_MetaFailsClosed(t *testing.T) {
 		f.messages = []string{"this ALTER cannot be forwarded; use the drained model"}
 		got := gradeSessionGUCCastRoster(names, []gucCastLane{goodLane},
 			map[string]string{}, map[string]gucCastLaneFacts{"fake-lane": f}, []string{"reader.go"})
-		requireProblemMentioning(t, got, `names "time_zone"`)
+		requireProblemMentioning(t, got, "no SINGLE refusal message names all of")
+	})
+
+	t.Run("(f) the markers are split across two refusals", func(t *testing.T) {
+		// The TCI-5 shape in miniature, and the cell the previous
+		// per-marker search PASSED: both markers are present among the
+		// file's literals, and no single refusal names both — so an
+		// operator who hits the first message is told the mechanism and
+		// given no remedy, while the gate reads as green because the
+		// remedy exists somewhere else in the file.
+		f := goodFacts
+		f.messages = []string{
+			"the source session's time_zone decided the cast",
+			"some unrelated refusal; use the drained model",
+		}
+		got := gradeSessionGUCCastRoster(names, []gucCastLane{goodLane},
+			map[string]string{}, map[string]gucCastLaneFacts{"fake-lane": f}, []string{"reader.go"})
+		requireProblemMentioning(t, got, "no SINGLE refusal message names all of")
+		// The failure must distinguish split-apart from simply-gone: both
+		// markers are present somewhere, and the message says so.
+		requireProblemMentioning(t, got, "found elsewhere in these files: [time_zone drained model]")
 	})
 }
 
