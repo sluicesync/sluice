@@ -1147,14 +1147,54 @@ func (r *vstreamCDCReader) verifyVStreamPositionReachable(ctx context.Context, d
 			// mismatching tablet and tries another. Only a UUID the shard
 			// has never executed is lineage evidence — refuse on that
 			// alone, and let the picker handle the rest.
-			if gtidSetUUIDsSubset(bare, executed) {
+			switch classifyLineage(bare, executed) {
+			case lineageReplicaLag:
 				slog.InfoContext(ctx, "mysql/vstream: lineage pre-flight: the probed tablet is BEHIND the resume position (every source UUID present, lower sequence numbers); treating as replica lag and leaving tablet selection to vtgate",
 					slog.String("target", c.DBName), slog.String("shard", sg.Shard))
-			} else {
+
+			case lineageErrantGTID:
+				// ERRANT GTID, not a replaced keyspace. The position shares
+				// source UUIDs with this shard AND names at least one the
+				// shard has never executed — the shape a transaction run
+				// directly on a replica makes (see [gtidSetUUIDsIntersect],
+				// measured on a real cluster 2026-09-08, where the errant
+				// transaction was in a database outside the keyspace and the
+				// target had not diverged by one byte).
+				//
+				// IT STILL REFUSES, and that is deliberate rather than
+				// unfinished. Proceeding would hand vttablet a resume set that
+				// is not a subset of its gtid_executed; vttablet answers
+				// "GTIDSet Mismatch", and that refusal does NOT reliably reach
+				// sluice — vtgate marks the tablet ignorable and BLOCKS
+				// waiting for another. That is audit SLM-2's silent-loss path:
+				// a `backup incremental` window deadline expired into a clean
+				// close, wrote a link with an empty end_position, and the next
+				// link started from "current" on unrelated data at exit 0.
+				// This pre-flight is the defence against it, so loosening the
+				// ACTION here would trade a wasteful re-copy for silent loss.
+				//
+				// What changes is the DIAGNOSIS and the remedy. Calling this a
+				// replaced keyspace sent an operator to re-create a database
+				// that is fine; the actual fix is to reconcile the errant GTID
+				// on the primary, after which this resume succeeds untouched.
+				_ = db.Close()
+				return fmt.Errorf("mysql/vstream: the resume position for shard %q names source UUID(s) this shard has "+
+					"never executed, but SHARES others with it (%s; resume %q, source executed %q) — that combination is "+
+					"an ERRANT GTID, not a replaced keyspace: a transaction was executed directly on a replica, so that "+
+					"tablet's gtid_executed carries a UUID the rest of the shard has no trace of, and sluice recorded it "+
+					"because the CDC tail streams from a replica. The database is fine and your target has probably not "+
+					"diverged (an errant transaction is often empty, administrative, or outside the synced keyspace "+
+					"entirely). RECONCILE THE ERRANT GTID on the primary — the usual fix is injecting an empty "+
+					"transaction with that GTID so the shard's lineage contains it — and this resume then succeeds with "+
+					"no re-copy. Resuming anyway is refused rather than attempted because vttablet would answer GTIDSet "+
+					"Mismatch and vtgate would block on it, which has previously turned into a silent gap: %w",
+					sg.Shard, c.DBName, abbreviateGTIDSet(bare), abbreviateGTIDSet(executed), ir.ErrPositionInvalid)
+
+			default:
 				_ = db.Close()
 				return fmt.Errorf("mysql/vstream: the resume position for shard %q names a source UUID the shard has never "+
-					"executed (%s; resume %q, source executed %q) — the source is a different lineage (a fresh, reset, "+
-					"rebuilt or replaced keyspace/shard); cannot resume: %w",
+					"executed, and shares NONE with it (%s; resume %q, source executed %q) — the source is a different "+
+					"lineage (a fresh, reset, rebuilt or replaced keyspace/shard); cannot resume: %w",
 					sg.Shard, c.DBName, abbreviateGTIDSet(bare), abbreviateGTIDSet(executed), ir.ErrPositionInvalid)
 			}
 		}

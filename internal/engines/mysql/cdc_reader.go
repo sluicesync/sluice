@@ -2692,6 +2692,88 @@ func verifyGTIDLineageContinuity(ctx context.Context, db *sql.DB, resumeSet stri
 
 // gtidSetUUIDsSubset reports whether every source UUID named in resume
 // also appears in executed (MySQL GTID sets: "uuid:intervals[,uuid:…]").
+// lineageVerdict is what a resume position's UUIDs say about the shard being
+// resumed against, once GTID_SUBSET(resume, executed) has already said "not
+// contained". The three outcomes have different diagnoses and different
+// operator remedies, and collapsing any two of them is how an errant GTID came
+// to be reported as a replaced keyspace.
+type lineageVerdict int
+
+const (
+	// lineageReplicaLag — every resume UUID is present, only sequence numbers
+	// are behind. The probe landed on a tablet behind the one streamed from;
+	// vtgate's picker handles it. Proceed.
+	lineageReplicaLag lineageVerdict = iota
+	// lineageErrantGTID — the position shares UUIDs with the shard AND names
+	// at least one it has never executed. A transaction run directly on a
+	// replica. The database is fine; the remedy is reconciling that GTID.
+	lineageErrantGTID
+	// lineageForeign — no shared UUIDs at all. A fresh, reset, rebuilt or
+	// replaced keyspace/shard.
+	lineageForeign
+)
+
+// classifyLineage is the DECISION, extracted from the pre-flight so it can be
+// graded without a cluster.
+//
+// It exists as its own function because pinning [gtidSetUUIDsSubset] and
+// [gtidSetUUIDsIntersect] individually does NOT pin the verdict: a mutation
+// that collapses the dispatch back to two outcomes leaves both helpers
+// correct, every helper cell green, and an errant GTID once again reported as
+// a replaced keyspace. Measured — that mutation passed until this function
+// existed. It is the same helper-versus-wiring seam that let the pgtrigger
+// capture-shape door ship inert, so the decision is a value here rather than a
+// shape spelled out at the call site.
+func classifyLineage(resume, executed string) lineageVerdict {
+	switch {
+	case gtidSetUUIDsSubset(resume, executed):
+		return lineageReplicaLag
+	case gtidSetUUIDsIntersect(resume, executed):
+		return lineageErrantGTID
+	default:
+		return lineageForeign
+	}
+}
+
+// gtidSetUUIDsIntersect reports whether resume and executed name at least one
+// source UUID in common, ignoring sequence ranges entirely.
+//
+// It is the ERRANT-GTID discriminator, and the distinction it draws was
+// measured on a real Vitess cluster (2026-09-08) rather than reasoned about:
+//
+//	resume {A,B} ∩ executed {B}    non-empty  — the shape an errant GTID makes
+//	resume {old} ∩ executed {new}  EMPTY      — a genuinely foreign lineage
+//
+// An errant GTID is a transaction executed DIRECTLY on a replica, so that
+// tablet's gtid_executed carries a UUID the primary never executed. sluice
+// records Vitess's VGTID verbatim, and the CDC tail streams from a REPLICA by
+// default on PlanetScale — so the errant UUID lands in the persisted resume
+// position. On the next resume the pre-flight probes through vtgate, which may
+// pick a DIFFERENT tablet that has no trace of that UUID, and the
+// every-UUID-must-be-present test then called it a replaced keyspace.
+//
+// Measured: an errant transaction in a database OUTSIDE the keyspace entirely
+// — touching nothing sluice syncs, with the target not diverging by one byte —
+// still poisoned the position, and the same position probed at the tablet
+// HOLDING the errant UUID resumed cleanly. Same database, same instant,
+// opposite verdict, decided by which tablet vtgate happened to pick.
+func gtidSetUUIDsIntersect(resume, executed string) bool {
+	have := map[string]bool{}
+	for _, part := range strings.Split(executed, ",") {
+		if i := strings.IndexByte(part, ':'); i > 0 {
+			have[strings.ToLower(strings.TrimSpace(part[:i]))] = true
+		}
+	}
+	for _, part := range strings.Split(resume, ",") {
+		if i := strings.IndexByte(part, ':'); i > 0 {
+			if have[strings.ToLower(strings.TrimSpace(part[:i]))] {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func gtidSetUUIDsSubset(resume, executed string) bool {
 	have := map[string]bool{}
 	for _, part := range strings.Split(executed, ",") {
