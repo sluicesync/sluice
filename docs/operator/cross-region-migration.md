@@ -51,7 +51,19 @@ This is a field-reported recipe, not yet a sluice-verified one. **The `--upfront
 
 ## The quiet window after the copy: finalization
 
-After the bulk copy finishes and every index deploy request completes, there is a stretch before CDC begins during which `sync status`, `sync health` and `verify` all report that the stream is **not found on target**. That is expected and does not mean the run has died.
+A `sync` cold start does not register its stream on the target until the very end — after the copy, the index build **and** the FLOAT exact re-read have all finished. The ordering is deliberate (see below), so for the whole of a multi-hour cold start there is no stream row to look up.
+
+From v0.148.0, `sync status` reports the cold start anyway, from the progress rows the copy writes as it goes:
+
+```
+cold start in progress (no CDC anchor yet — this is expected, not a stall):
+STREAM        PHASE      STARTED               LAST PROGRESS WRITE
+prod-cutover  bulk_copy  2026-09-08T10:31:02Z  4s ago
+```
+
+**`LAST PROGRESS WRITE` is the column that matters**, not the phase. A phase alone cannot tell a run that is working from one that died mid-phase and left its last row behind. Run the command twice: an age that keeps climbing means the run is gone; one that resets means it is working. `sync health` says the same thing in its error, and still exits non-zero — a cold start is not a healthy stream, and a cron probe that treated it as one would go quiet exactly when a stuck cold start needed attention.
+
+Before v0.148.0 all three commands reported only **not found on target**, with no way to tell that from a dead process. If you are on an older build, that is what the silence means.
 
 What is happening is the VStream FLOAT exact re-read, logged under `FLOAT-EXACT-REREAD`: vtgate's row streamer renders single-precision `FLOAT` through mysqld's float-to-text formatter, so a stored `8388608` arrives as `8388610` — a real float32-level loss — and sluice re-reads those columns exactly from the source and repairs them by primary key. Only after that does it persist the CDC anchor, which is what those three commands look for.
 
@@ -65,7 +77,7 @@ pipeline: FLOAT-EXACT-REREAD: re-reading single-precision FLOAT columns exactly 
 pipeline: FLOAT-EXACT-REREAD: table repaired table=orders done=1 of=12
 ```
 
-Before v0.148.0 it logged nothing at all until it finished, which is what prompted this section: silence plus a status surface reporting absence is indistinguishable from a dead process, and the operator who reported it reached for `strace` to find out. If you are on an older build, that is what the quiet is.
+Before v0.148.0 it logged nothing at all until it finished, which — together with the status surfaces reporting the stream as absent — is what sent the operator who reported this to `strace`.
 
 The ordering is deliberate and load-bearing. CDC replays from the copy anchor, so anything that changed between the copy and the re-read is re-applied to its final value; and because the anchor is *not yet written*, a crash mid-repair re-cold-starts cleanly instead of warm-resuming onto a half-repaired target. Writing the anchor earlier to make the status surfaces happier would trade a cosmetic problem for a correctness one.
 
