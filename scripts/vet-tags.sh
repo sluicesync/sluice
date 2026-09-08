@@ -84,10 +84,24 @@ combos=$(printf '%s\n' "$exprs" \
 	| sed -e 's|^//go:build ||' -e 's/ *&& */,/g' \
 	| sort -u)
 
+# `./...` is MODULE-scoped and reaches the gitignored scratch packages under
+# workspace/. In CI that is a no-op (a fresh checkout has no workspace/), but
+# this script also runs from both pre-commit hooks, where a throwaway Go main
+# that stopped compiling would fail the gate and nothing else — a local-only
+# block whose only escape is --no-verify (audit DDD-8). golangci-lint already
+# excludes workspace/ for the same reason.
+pkgs=$(go list ./... | grep -v '/workspace/' || true)
+pkg_count=$(printf '%s\n' "$pkgs" | grep -c . || true)
+if [ "${pkg_count:-0}" -lt 40 ]; then
+	echo "vet-tags: package list came back with only ${pkg_count:-0} entries; expected the whole module (~60)."
+	echo "  \`go list ./...\` likely failed — fix that rather than vetting a truncated universe."
+	exit 1
+fi
+
 status=0
 for tags in $combos; do
-	echo "vet-tags: go vet -tags=$tags ./..."
-	if ! go vet -tags="$tags" ./...; then
+	echo "vet-tags: go vet -tags=$tags <module, minus workspace/>"
+	if ! go vet -tags="$tags" $pkgs; then
 		status=1
 	fi
 done

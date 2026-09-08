@@ -84,8 +84,27 @@ if ($unformatted) {
     exit 1
 }
 
+# ---- the package universe these gates run over ----
+# `./...` is MODULE-scoped, so it reaches the gitignored scratch packages
+# under workspace/ (throwaway Go mains, agent residue). CI vets and tests a
+# fresh checkout where workspace/ does not exist, so a scratch program that
+# stopped compiling fails this hook and nothing else — a local-only block
+# whose only escape is --no-verify, which this project forbids. golangci-lint
+# already excludes workspace/ (.golangci.yml); vet and test are the siblings
+# that were missed (audit DDD-8). Nothing tracked can hide behind this
+# (`git ls-files workspace` is empty by .gitignore), and the floor refuses a
+# silently truncated list — an empty one would leave `go vet` with no
+# arguments, vetting the current directory and reporting success.
+$gatePkgs = @(& go list ./... | Where-Object { $_ -notmatch '/workspace/' })
+if ($gatePkgs.Count -lt 40) {
+    Red "the package list came back with only $($gatePkgs.Count) entries."
+    Write-Host "Expected the whole module (~60). 'go list ./...' likely failed; fix that rather than"
+    Write-Host "letting the gates run over a truncated universe."
+    exit 1
+}
+
 # ---- go vet ----
-& go vet ./...
+& go vet @gatePkgs
 if ($LASTEXITCODE -ne 0) {
     Red "go vet failed."
     exit 1
@@ -187,7 +206,7 @@ $cgoEnabled = (& go env CGO_ENABLED).Trim()
 if ($cgoEnabled -eq '1') {
     $testArgs += '-race'
 }
-$testArgs += './...'
+$testArgs += $gatePkgs
 & go test @testArgs | Out-Null
 if ($LASTEXITCODE -ne 0) {
     Red "tests failed."

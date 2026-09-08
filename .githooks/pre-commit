@@ -157,8 +157,29 @@ if [ -n "$unformatted" ]; then
 	exit 1
 fi
 
+# ---- the package universe these gates run over ----
+# `./...` is MODULE-scoped, so it reaches gitignored scratch under
+# workspace/ (throwaway Go mains, agent residue). CI vets and tests a
+# fresh checkout where workspace/ does not exist, so a scratch program
+# that stops compiling fails this hook and nothing else — a local-only
+# block whose only escape is --no-verify, which this project forbids.
+# golangci-lint already excludes workspace/ (.golangci.yml) for exactly
+# this reason; vet and test are the siblings that were missed (audit
+# DDD-8). Nothing tracked can hide behind this: `git ls-files workspace`
+# is empty by .gitignore, and the floor below refuses a silently empty
+# list (a `go list` failure would otherwise leave `go vet` with no
+# arguments, which vets the current directory and reports success).
+gate_pkgs=$(go list ./... | grep -v '/workspace/' || true)
+gate_pkg_count=$(printf '%s\n' "$gate_pkgs" | grep -c . || true)
+if [ "${gate_pkg_count:-0}" -lt 40 ]; then
+	red "pre-commit: the package list came back with only ${gate_pkg_count:-0} entries."
+	echo "Expected the whole module (~60). \`go list ./...\` likely failed; fix that rather than"
+	echo "letting the gates run over a truncated universe."
+	exit 1
+fi
+
 # ---- go vet ----
-if ! go vet ./...; then
+if ! go vet $gate_pkgs; then
 	red "pre-commit: go vet failed."
 	exit 1
 fi
@@ -185,7 +206,7 @@ test_args="-count=1"
 if [ "$(go env CGO_ENABLED 2>/dev/null)" = "1" ]; then
 	test_args="$test_args -race"
 fi
-if ! go test $test_args ./... >/dev/null; then
+if ! go test $test_args $gate_pkgs >/dev/null; then
 	red "pre-commit: tests failed."
 	echo "Run: go test ./...  (to see the failure)"
 	exit 1
