@@ -2749,6 +2749,19 @@ func classifyLineage(resume, executed string) lineageVerdict {
 // fall-through engages identically on either, and a refusal that stopped
 // wrapping it would silently change the failure mode from re-copy to hard
 // stop with nothing failing.
+// The two remedies the lineage refusal offers, kept as constants because they
+// are genuinely different advice sharing one code: an errant GTID is fixed on
+// the source and costs nothing, while a foreign lineage means the operator is
+// pointed at the wrong database or has decided to re-copy from a new one.
+const (
+	errantRemedy = "reconcile the errant GTID on the primary (usually by injecting an empty transaction " +
+		"carrying it) and this resume succeeds with no re-copy; check what that transaction touched first, " +
+		"because if it wrote to a table you sync the target may hold a row the source does not"
+	foreignRemedy = "confirm the DSN points at the database you think it does; if the source was genuinely " +
+		"replaced and you intend to re-copy from it, re-run with --restart-from-scratch (warm sync) or take " +
+		"a fresh `backup full` (chain)"
+)
+
 func lineageRefusal(v lineageVerdict, shard, target, resume, executed string) error {
 	switch v {
 	case lineageReplicaLag:
@@ -2804,27 +2817,29 @@ func lineageRefusal(v lineageVerdict, shard, target, resume, executed string) er
 		// replaced keyspace sent an operator to re-create a database
 		// that is fine; the actual fix is to reconcile the errant GTID
 		// on the primary, after which this resume succeeds untouched.
-		return fmt.Errorf("mysql/vstream: the resume position for shard %q names source UUID(s) this shard has "+
-			"never executed, but SHARES others with it (%s; resume %q, source executed %q) — that combination is "+
-			"an ERRANT GTID, not a replaced keyspace: a transaction was executed directly on a replica, so that "+
-			"tablet's gtid_executed carries a UUID the rest of the shard has no trace of, and sluice recorded it "+
-			"because the CDC tail streams from a replica. RECONCILE THE ERRANT GTID on the primary — the usual "+
-			"fix is injecting an empty transaction with that GTID so the shard's lineage contains it — and this "+
-			"resume then succeeds with no re-copy. CHECK WHAT THAT TRANSACTION TOUCHED FIRST: if it wrote to a "+
-			"table you sync, sluice read it from that replica and applied it, so your target may hold a row the "+
-			"source does not — and injecting an empty transaction makes the resume succeed without removing it. "+
-			"An errant transaction is often empty, administrative, or outside the synced keyspace entirely, in "+
-			"which case nothing diverged; sluice cannot tell which from here. Resuming anyway is refused rather "+
-			"than attempted because once the errant-carrying tablet is replaced no tablet can serve this "+
-			"position: every tablet answers GTIDSet Mismatch and vtgate spends ~90s cycling through them before "+
-			"giving up: %w",
-			shard, target, abbreviateGTIDSet(resume), abbreviateGTIDSet(executed), ir.ErrPositionInvalid)
+		return sluicecode.Wrap(sluicecode.CodeCDCLineageMismatch, errantRemedy,
+			fmt.Errorf("mysql/vstream: the resume position for shard %q names source UUID(s) this shard has "+
+				"never executed, but SHARES others with it (%s; resume %q, source executed %q) — that combination is "+
+				"an ERRANT GTID, not a replaced keyspace: a transaction was executed directly on a replica, so that "+
+				"tablet's gtid_executed carries a UUID the rest of the shard has no trace of, and sluice recorded it "+
+				"because the CDC tail streams from a replica. RECONCILE THE ERRANT GTID on the primary — the usual "+
+				"fix is injecting an empty transaction with that GTID so the shard's lineage contains it — and this "+
+				"resume then succeeds with no re-copy. CHECK WHAT THAT TRANSACTION TOUCHED FIRST: if it wrote to a "+
+				"table you sync, sluice read it from that replica and applied it, so your target may hold a row the "+
+				"source does not — and injecting an empty transaction makes the resume succeed without removing it. "+
+				"An errant transaction is often empty, administrative, or outside the synced keyspace entirely, in "+
+				"which case nothing diverged; sluice cannot tell which from here. Resuming anyway is refused rather "+
+				"than attempted because once the errant-carrying tablet is replaced no tablet can serve this "+
+				"position: every tablet answers GTIDSet Mismatch and vtgate spends ~90s cycling through them before "+
+				"giving up: %w",
+				shard, target, abbreviateGTIDSet(resume), abbreviateGTIDSet(executed), ir.ErrPositionInvalid))
 
 	default:
-		return fmt.Errorf("mysql/vstream: the resume position for shard %q names a source UUID the shard has never "+
-			"executed, and shares NONE with it (%s; resume %q, source executed %q) — the source is a different "+
-			"lineage (a fresh, reset, rebuilt or replaced keyspace/shard); cannot resume: %w",
-			shard, target, abbreviateGTIDSet(resume), abbreviateGTIDSet(executed), ir.ErrPositionInvalid)
+		return sluicecode.Wrap(sluicecode.CodeCDCLineageMismatch, foreignRemedy,
+			fmt.Errorf("mysql/vstream: the resume position for shard %q names a source UUID the shard has never "+
+				"executed, and shares NONE with it (%s; resume %q, source executed %q) — the source is a different "+
+				"lineage (a fresh, reset, rebuilt or replaced keyspace/shard); cannot resume: %w",
+				shard, target, abbreviateGTIDSet(resume), abbreviateGTIDSet(executed), ir.ErrPositionInvalid))
 	}
 }
 

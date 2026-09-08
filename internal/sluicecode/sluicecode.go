@@ -60,6 +60,21 @@ const (
 	CodeCDCGeneratedPrimaryKey   Code = "SLUICE-E-CDC-GENERATED-PRIMARY-KEY"
 	CodeCDCChangeLogIDReuse      Code = "SLUICE-E-CDC-CHANGELOG-ID-REUSE"
 	CodeCDCStandbySource         Code = "SLUICE-E-CDC-STANDBY-SOURCE"
+
+	// CodeCDCLineageMismatch is raised when a resume position's GTID lineage
+	// does not match the source being resumed against — either an errant
+	// GTID (the position shares UUIDs with the shard and names one it has
+	// never executed) or a genuinely foreign lineage (it shares none).
+	//
+	// One code, two diagnoses, because an operator meeting either is asking
+	// the same question — "why will this position not resume?" — and the
+	// remedies differ enough that the MESSAGE must distinguish them, not the
+	// code. It got a code in v0.147.1 because the errant arm is a refusal an
+	// operator hits on a healthy database, and it had neither a code nor a
+	// marker: nothing to look up, and nothing for `sluice diagnose` or the
+	// error-triage workflow — which resolve entirely through SLUICE-E-* — to
+	// route on.
+	CodeCDCLineageMismatch       Code = "SLUICE-E-CDC-LINEAGE-MISMATCH"
 	CodeCDCPublicationPermission Code = "SLUICE-E-CDC-PUBLICATION-PERMISSION"
 	CodeCDCXAUnsupported         Code = "SLUICE-E-CDC-XA-UNSUPPORTED"
 	CodeConnectIPv6Only          Code = "SLUICE-E-CONNECT-IPV6-ONLY"
@@ -644,6 +659,7 @@ var registry = map[Code]Info{
 	CodeCDCReplicationPermission: {ClassRuntime, "connecting role lacks the REPLICATION attribute"},
 	CodeCDCPoolerEndpoint:        {ClassRuntime, "the source appears to be a connection pooler (Supavisor/pgbouncer) that stripped the replication startup parameter; CDC needs the direct endpoint"},
 	CodeCDCStandbySource:         {ClassRefusal, "the CDC source is a read-only standby / read replica (pg_is_in_recovery() = true); point --source at the primary endpoint — a replica remains fine for bulk migrate"},
+	CodeCDCLineageMismatch:       {ClassRefusal, "the resume position's GTID lineage does not match the source: either an errant GTID (shares UUIDs with the shard and names one it never executed) or a genuinely different keyspace/instance (shares none) — the message says which"},
 	CodeCDCPublicationPermission: {ClassRefusal, "the connecting role lacks the privilege to create the publication CDC needs (SQLSTATE 42501): CREATE on the database, ownership of every published table, and — for a database-wide FOR ALL TABLES publication — superuser"},
 	CodeCDCXAUnsupported:         {ClassRefusal, "a replicated table is written inside a MySQL XA (distributed) transaction, which sluice cannot faithfully replicate: the rows are invisible on the source until XA COMMIT, so a rollback would fabricate them on the target, and mid-body positions are not valid restart points"},
 	CodeConnectIPv6Only:          {ClassRuntime, "the DSN host resolves to an AAAA record only (IPv6-only) and this network appears IPv4-only"},
