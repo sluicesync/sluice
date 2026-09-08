@@ -138,8 +138,14 @@ func TestStreamer_PositionFromManifest_EmptyEndPosition(t *testing.T) {
 	if err == nil {
 		t.Fatal("Run returned nil; want error on empty EndPosition")
 	}
-	if !strings.Contains(err.Error(), "no EndPosition") {
-		t.Errorf("err = %v; want 'no EndPosition' surface", err)
+	// The refusal's wording widened in v0.147.0 (it used to say "no
+	// EndPosition"): a MODERN full against a source whose reader cannot
+	// capture a backup position produces the identical shape, so blaming only
+	// "pre-Phase-3.3 v0.16.x" named the wrong cause for part of the
+	// population. What this test cares about is that the streamer surfaces
+	// the refusal at all rather than silently resuming from now.
+	if !strings.Contains(err.Error(), "EndPosition is empty") {
+		t.Errorf("err = %v; want the empty-EndPosition refusal to surface", err)
 	}
 }
 

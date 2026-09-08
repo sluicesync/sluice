@@ -64,9 +64,20 @@ not JSON number), REAL is `%.17g` round-trip-exact, BLOBs come back from hex. Th
 > passed only because π round-trips at ≤16 digits). The `!` flag lifts the cap so 17+
 > digits emit (measured: 0 misses over a 5k-double sweep on modernc 3.53.3 and on real
 > D1). `TestCapturedValueExpr_RealRenderRoundTripsExactly` is the per-PR gate; the CDC
-> reader's capture-shape door refuses installs still carrying the old body. **Open
-> premise:** on a third-party SQLite predating the `!` flag, `%!.20g` would also clamp
-> to 16 and the fix would be ineffective — unverified for pre-`!` app-library SQLite.
+> reader's capture-shape door refuses installs still carrying the old body. **Premise
+> CLOSED at runtime (v0.131.4, widened v0.146.0), residual narrowed:** the concern was
+> that on a SQLite ignoring the `!` flag, `%!.20g` would also clamp to 16 and the fix
+> would be ineffective rather than merely degraded. That is no longer unverified —
+> sluice PROBES the connected engine, running the production expression over a
+> 17-significant-digit double and refusing with `SLUICE-E-REAL-RENDER-LOSSY` (v0.147.0)
+> unless it round-trips bit-exact. The probe reached the two trigger-CDC lanes only
+> through v0.145.0; since v0.146.0 it also covers the `--source-driver d1` bulk copy and
+> `migrate --stage-local` (audit LA-5), and it fails closed — a probe that cannot run
+> refuses too. **The residual that remains** is narrower and is not reachable by any
+> probe from this process: a THIRD-PARTY application library firing a *local* capture
+> trigger renders with its own printf, which sluice never connects to. A local file
+> source's probe grades sluice's own poller connection; on D1 the probed engine is the
+> one that fires the triggers.
 
 ## Decision
 

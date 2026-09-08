@@ -9,6 +9,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // verifyD1RenderFidelity is the render-fidelity door for the D1 READER lane —
@@ -48,20 +50,35 @@ import (
 // It fails CLOSED, matching the trigger lane's door: a probe that cannot run
 // is not permission to read. Reading without the premise verified is the thing
 // this exists to prevent.
+
+// malformedProbeRemedy is the remedy for every arm where the probe RAN but
+// its answer cannot evidence the render — a wrong row count, a missing
+// column, a SQL NULL, a non-text value. These are distinct from the clamp
+// (the engine answered, lossily) and from a transport failure (it did not
+// answer at all), but they share a remedy and they share the door's refusal,
+// so they carry the same code. Coding only the clamp left the whole
+// fail-closed family at exit 1 and invisible to `sluice diagnose`, while the
+// code's own doc row already described this family in its remedy text.
+const malformedProbeRemedy = "the source answered the probe with something that cannot evidence a REAL " +
+	"render; check that it is a SQLite-family engine speaking the query API this reader expects"
+
 func verifyD1RenderFidelity(ctx context.Context, c *d1Client) error {
 	rows, err := c.queryRows(ctx, RealRenderProbeSQL())
 	if err != nil {
-		return fmt.Errorf("d1: cannot probe the source's REAL render fidelity (%w); "+
-			"refusing to read without verifying the format('%%!.20g') render", err)
+		return sluicecode.Wrap(sluicecode.CodeRealRenderLossy, "fix the source connection so the one-row probe query can run; it gates every later read",
+			fmt.Errorf("d1: cannot probe the source's REAL render fidelity (%w); "+
+				"refusing to read without verifying the format('%%!.20g') render", err))
 	}
 	if len(rows) != 1 {
-		return fmt.Errorf("d1: the REAL render-fidelity probe returned %d rows, want exactly 1; "+
-			"refusing to read without verifying the format('%%!.20g') render", len(rows))
+		return sluicecode.Wrap(sluicecode.CodeRealRenderLossy, malformedProbeRemedy,
+			fmt.Errorf("d1: the REAL render-fidelity probe returned %d rows, want exactly 1; "+
+				"refusing to read without verifying the format('%%!.20g') render", len(rows)))
 	}
 	raw, ok := rows[0]["p"]
 	if !ok || len(raw) == 0 {
-		return fmt.Errorf("d1: the REAL render-fidelity probe returned no %q column; "+
-			"refusing to read without verifying the format('%%!.20g') render", "p")
+		return sluicecode.Wrap(sluicecode.CodeRealRenderLossy, malformedProbeRemedy,
+			fmt.Errorf("d1: the REAL render-fidelity probe returned no %q column; "+
+				"refusing to read without verifying the format('%%!.20g') render", "p"))
 	}
 	// The render arrives as a JSON string (the CASE arm is format(), which
 	// yields TEXT). Anything else — a JSON number, a null — means the arm
@@ -78,14 +95,16 @@ func verifyD1RenderFidelity(ctx context.Context, c *d1Client) error {
 	// claim about their database. Failing closed with the wrong reason is
 	// still a bug in the message.
 	if string(bytes.TrimSpace(raw)) == "null" {
-		return errors.New("d1: the REAL render-fidelity probe returned SQL NULL, so the format() arm " +
-			"did not run at all — this is not evidence about the engine's precision handling either " +
-			"way; refusing to read without verifying the format('%!.20g') render")
+		return sluicecode.Wrap(sluicecode.CodeRealRenderLossy, malformedProbeRemedy,
+			errors.New("d1: the REAL render-fidelity probe returned SQL NULL, so the format() arm "+
+				"did not run at all — this is not evidence about the engine's precision handling either "+
+				"way; refusing to read without verifying the format('%!.20g') render"))
 	}
 	var rendered string
 	if err := json.Unmarshal(raw, &rendered); err != nil {
-		return fmt.Errorf("d1: the REAL render-fidelity probe returned %s, not the expected text render; "+
-			"refusing to read without verifying the format('%%!.20g') render", raw)
+		return sluicecode.Wrap(sluicecode.CodeRealRenderLossy, malformedProbeRemedy,
+			fmt.Errorf("d1: the REAL render-fidelity probe returned %s, not the expected text render; "+
+				"refusing to read without verifying the format('%%!.20g') render", raw))
 	}
 	return VerifyRealRenderProbe(rendered)
 }

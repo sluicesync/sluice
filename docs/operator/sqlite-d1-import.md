@@ -117,6 +117,18 @@ directly above). Unlike the export path, it reads each value via
 default-JSON paths round them, as the table above shows), distinguishes INTEGER from REAL,
 and decodes BLOBs from hex. Reads do not take D1 offline (only `export` does).
 
+**Losslessness for `REAL` is verified at open, not assumed (v0.146.0).** The reader encodes a
+`REAL` as `format('%!.20g', col)`, where the `!` alternate-form-2 flag is load-bearing: SQLite's
+`printf` caps `%g` at 16 significant digits, and 16 digits do not round-trip every IEEE-754
+binary-64 — so an engine that ignores the flag silently alters every REAL it hands over. Rather
+than assume no such engine exists, the reader probes the connected one at open and refuses with
+`SLUICE-E-REAL-RENDER-LOSSY` unless a 17-significant-digit double round-trips bit-exact. The probe
+fails **closed**: one that cannot run at all also refuses, because reading without the premise
+verified is what the door exists to prevent. It covers this lane and `migrate --stage-local`
+(which shares the paginator), alongside the two trigger-CDC lanes. Live D1 honours the flag —
+measured with a discriminating control, the production expression round-trips exactly while the
+same format without `!` returns the 16-digit clamp — so this does not fire on a working database.
+
 ```
 # the API token is read from the environment ONLY (never a flag, never logged)
 export CLOUDFLARE_API_TOKEN=...        # required

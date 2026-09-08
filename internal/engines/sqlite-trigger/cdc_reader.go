@@ -17,6 +17,7 @@ import (
 	"sluicesync.dev/sluice/internal/engines/internal/triggercdc"
 	"sluicesync.dev/sluice/internal/engines/sqlite"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // Defaults for the polling loop (ADR-0135 §3 — the pgtrigger defaults). Phase 1
@@ -358,8 +359,20 @@ type renderProber interface {
 func verifyRealRenderHonoured(ctx context.Context, p renderProber) error {
 	rendered, err := p.realRenderProbe(ctx)
 	if err != nil {
-		return fmt.Errorf("sqlite-trigger: cannot probe the source's REAL render fidelity (%w); "+
-			"refusing to stream without verifying the format('%%!.20g') capture render", err)
+		// CODED like the clamp arm it fails alongside. Both are the same
+		// refusal to an operator — this door would not let the stream start —
+		// and coding only the clamp left `sluice diagnose` and the
+		// error-triage workflow blind to the fail-closed half, at exit 1
+		// rather than 3. The v0.147.0 pre-tag review caught that the doc row
+		// for SLUICE-E-REAL-RENDER-LOSSY already described this family in its
+		// remedy, so the row promised coverage the code did not have: a gate
+		// narrower than its own documentation.
+		return sluicecode.Wrap(
+			sluicecode.CodeRealRenderLossy,
+			"fix the source connection so the one-row probe query can run; it gates every later read",
+			fmt.Errorf("sqlite-trigger: cannot probe the source's REAL render fidelity (%w); "+
+				"refusing to stream without verifying the format('%%!.20g') capture render", err),
+		)
 	}
 	return sqlite.VerifyRealRenderProbe(rendered)
 }

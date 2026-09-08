@@ -101,7 +101,15 @@ func LoadChainTerminalPosition(ctx context.Context, store irbackup.Store) (ir.Po
 		// resuming stream changes, so every restore-side guard still sees
 		// the same empty EndPosition it reads today. And re-reading is the
 		// safe direction — a resume that re-observes a span cannot skip one.
-		if terminal.StartPosition.Engine != "" || terminal.StartPosition.Token != "" {
+		// The Kind test makes the code ASSERT what the comment above claims.
+		// Without it this branched on emptiness alone while justifying itself
+		// entirely with "a full has no StartPosition either" — true of every
+		// constructor today, and an unchecked premise: a full carrying a
+		// start_position (hand-edited, foreign, or a future writer change)
+		// would have become a silently-accepted resume point instead of the
+		// refusal. Found by the v0.147.0 pre-tag review.
+		if terminal.Kind == irbackup.BackupKindIncremental &&
+			(terminal.StartPosition.Engine != "" || terminal.StartPosition.Token != "") {
 			slog.WarnContext(
 				ctx,
 				"position-from-manifest: the terminal manifest records no EndPosition, so its "+
@@ -115,9 +123,12 @@ func LoadChainTerminalPosition(ctx context.Context, store irbackup.Store) (ir.Po
 			return terminal.StartPosition, terminal.Redaction, nil
 		}
 		return ir.Position{}, nil, fmt.Errorf(
-			"position-from-manifest: terminal manifest %q has no EndPosition and no StartPosition "+
-				"recorded (pre-Phase-3.3 full backup or malformed chain). Take a fresh full backup "+
-				"with sluice v0.17.2+ to populate EndPosition automatically",
+			"position-from-manifest: terminal manifest %q records no position this stream can resume "+
+				"from — its EndPosition is empty, and it carries no usable StartPosition either. Causes: "+
+				"a pre-Phase-3.3 (v0.16.x / v0.17.0) full taken before EndPosition was recorded; a full "+
+				"taken against a source whose reader cannot capture a backup position at all; or a "+
+				"malformed chain. Take a fresh full backup against a source that supports position "+
+				"capture to populate EndPosition automatically",
 			lineage.ManifestBackupID(terminal),
 		)
 	}

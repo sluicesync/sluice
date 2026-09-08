@@ -436,18 +436,32 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 	// collapsed the first two.
 	//
 	//	captured nothing at all      empty EndPosition — Bug 275's case
-	//	captured a DDL only          empty EndPosition — LOAD-BEARING; the
-	//	                             restore-side guards document a DDL-only
-	//	                             window as producing exactly this, and
-	//	                             use it to tell one apart from a data
-	//	                             window whose rows were emptied
+	//	captured a DDL only          empty EndPosition — and the pin
+	//	                             TestIncrementalWindow_SchemaSnapshotDoesNotMoveEndPosition
+	//	                             holds it, which is what refused the
+	//	                             writer-side attempt
 	//	captured rows                a real end position
 	//
-	// So an empty EndPosition here is not a defect to paper over — it is a
-	// signal the restore path reads. Bug 275 is that ONE consumer,
-	// `--position-from-manifest`, treated the signal as malformed instead of
-	// resolving it against the StartPosition sitting beside it. That is
-	// fixed where the misreading was, in [LoadChainTerminalPosition].
+	// Bug 275 is that ONE consumer, `--position-from-manifest`, treated an
+	// empty EndPosition as malformed instead of resolving it against the
+	// StartPosition sitting beside it. That is fixed where the misreading
+	// was, in [LoadChainTerminalPosition], which also reaches every chain
+	// already on disk.
+	//
+	// THE FIRST FRAMING HERE OVERSTATED THE CASE and is corrected (found by
+	// the v0.147.0 pre-tag review). It said the DDL-only empty was
+	// "LOAD-BEARING" because restore uses it to tell a schema-only window
+	// from a data window whose rows were emptied. Restore's actual guard
+	// (chain_restore.go) exempts `end == StartPosition` explicitly, so it
+	// accepts BOTH spellings — and [BackupStream]'s rollover has been
+	// stamping `EndPosition = startPos` on an empty window all along, for
+	// exactly the reason the reverted attempt did. So the two backup lanes
+	// disagree on this today and nothing downstream minds.
+	//
+	// What actually blocks the writer change is narrower and honest: the
+	// DDL-only pin above encodes the empty spelling for THIS lane, and
+	// unifying the lanes means re-deciding what that pin protects. That is a
+	// design question, not a tag-time edit — filed, not settled here.
 	manifest.EndPosition = endPos
 	if err := assertDataWindowEndPositionInvariant(manifest); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseCDC, err)

@@ -4,6 +4,22 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.147.0] - 2026-09-07
+
+A small release with one thing in it that matters: a backup chain that a quiet hour made unusable is usable again. Take this one if you run scheduled `backup incremental` against a source that is sometimes idle.
+
+### Fixed
+
+**A `backup incremental` over a quiet window made its own chain unusable for the CDC handoff.** An incremental whose window captured nothing exits 0 and writes a terminal manifest with no `EndPosition`; `sync start --position-from-manifest` then refused that chain as a "pre-Phase-3.3 full backup or malformed chain" — about a chain written seconds earlier by the same binary, whose resume point was sitting in that manifest's `StartPosition`, byte-identical to the parent full's end. Restore worked throughout; what was lost was the no-re-bulk handoff, the path you reach for precisely when avoiding a full re-copy. The two cases were always distinguishable and the refusal conflated them: a pre-Phase-3.3 **full** has neither position and still refuses; an **incremental** has a `StartPosition` by construction, and the resume now uses it. Reaches chains **already on disk**, which a writer-only fix could not. Nothing rewrites a manifest — every restore-side guard reads what it read before, and only the position handed to the resuming stream changes. (Found by the v0.146.0 regression cycle; pre-existing, reproduces on v0.145.0.)
+
+**The REAL render-fidelity refusal has an error code: `SLUICE-E-REAL-RENDER-LOSSY`.** v0.146.0 put it on the plain `migrate` path with neither a code nor a marker, while `sluice diagnose` and the error-triage workflow resolve entirely through `SLUICE-E-*` — so a terminal refusal on a mainstream path was unroutable by both. Coded at the shared verifier so all four lanes that share the encoding raise the same one (`sqlite-trigger`, `d1-trigger`, the `--source-driver d1` bulk copy, `migrate --stage-local`), and named for the engine behaviour rather than for D1.
+
+**Two comments were wrong about `encode(bytea, 'escape')`.** They said it octal-escapes every byte `>= 0x7F`; measured on real PG 16, `0x7F` passes through raw and the threshold is `>= 0x80`. They also implied the encoding is lossy — it is not, `decode(encode(x,'escape'),'escape') = x` holds. What makes it a trap is that its *text* is a lie: `\000` is four characters to any JSON parser. The v0.146.0 defect was "the text says something other than what the bytes say", not information loss, and calling it lossy would send the next reader after the wrong bug.
+
+### Compatibility
+
+No behaviour change to anything that worked before: `--position-from-manifest` only accepts chains it previously refused, and a chain it accepted before resolves to the same position. The new error code is additive. No flag added, renamed or removed; backup format version unchanged at 10.
+
 ## [0.146.0] - 2026-09-07
 
 A guard that reached one lane of two, a refusal that promised protection while doing the opposite, and a documented recipe that could never have worked. Take this one if you migrate from Cloudflare D1, run continuous sync from a non-GTID MySQL source, or have followed the PII-redaction cookbook's env-backed keyset option.
