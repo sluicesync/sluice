@@ -328,13 +328,36 @@ func (s *Streamer) runColdStartParallel(
 		growGate:           gate,
 	}
 
-	// A disabled resume context: the fast path is fresh-cold-start-only
-	// (resume stays serial via the gate), so the migrate-state store is
-	// inert — markPhase / writeState / markComplete all no-op when
-	// rc.enabled is false. resuming=false drives the cold (non-upsert /
-	// raw) loader gates.
-	rc := resumeContext{}
-	state := ir.MigrationState{}
+	// A RECORD-but-never-RESUME context (2026-09-08). The fast path is
+	// still fresh-cold-start-only — resuming=false below drives the cold
+	// (non-upsert / raw) loader gates, and nothing here ever calls
+	// loadOrInitState — but it now WRITES its phase and per-table
+	// progress, which is what gives `sync status` something to report
+	// during a cold start.
+	//
+	// This used to be a zero-value resumeContext. The comment justifying
+	// that was about resume, correctly, and the same flag silently also
+	// turned off recording: for the whole cold start — schema, copy,
+	// index build, FLOAT re-read — nothing was persisted until
+	// WritePosition at the very end, so every status surface reported the
+	// stream as absent. See [newSyncRecordingContext].
+	// A store that cannot be opened degrades to silence with a WARN
+	// rather than failing the copy: this is observability, and refusing
+	// to migrate because the progress table is unavailable would be a
+	// worse trade than the blackout it replaces.
+	progressStore, storeErr := openMigrationStateStore(ctx, s.Target, s.TargetDSN, s.TargetSchema)
+	if storeErr != nil {
+		slog.WarnContext(ctx, "pipeline: cold start could not open the progress store; `sync status` will report "+
+			"this stream as absent until the copy finishes and the CDC anchor is written",
+			slog.String("stream_id", streamID),
+			slog.String("error", storeErr.Error()))
+		progressStore = nil
+	}
+	rc := newSyncRecordingContext(progressStore, streamID)
+	if rc.writes() {
+		defer migcore.CloseIf(rc.store)
+	}
+	state := ir.MigrationState{MigrationID: rc.migrationID}
 	return runBulkCopyPhases(
 		ctx, rc, &state, schema,
 		createSchema, // the ADR-0166 create subset from the sync cold-start's shape gate (roadmap item 25 residual); nil = create everything

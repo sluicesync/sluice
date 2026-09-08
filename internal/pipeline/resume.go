@@ -83,7 +83,102 @@ type resumeContext struct {
 	store       ir.MigrationStateStore
 	migrationID string
 	enabled     bool // store != nil (i.e. target engine supports MigrationStateStore)
+
+	// noResume refuses the READ half while leaving the WRITE half alone.
+	//
+	// `enabled` is store AVAILABILITY and nothing more — its own comment
+	// always said so. Two unrelated questions sat on top of it because
+	// they happen to share a table:
+	//
+	//   - RECORD: writeState / writeTableProgress / markFailed /
+	//     markComplete write where this run has got to. Pure
+	//     OBSERVABILITY, and safe on a run that can never resume.
+	//   - RESUME: loadOrInitState reads prior state to continue FROM it.
+	//     A correctness decision, and the one the sync cold start must
+	//     never take (its fast path is fresh-cold-start-only; resume
+	//     stays serial behind [coldStartFastEligible]).
+	//
+	// Collapsing them cost the sync cold start its entire progress
+	// surface, because giving it no store was the only way to say "do not
+	// resume" (see [newSyncRecordingContext]).
+	//
+	// The polarity is deliberate and is the v0.99.51 zero-value rule:
+	// this field is spelled as an OPT-OUT so its zero value is the
+	// existing behaviour. Every construction that predates it — `migrate`
+	// and every test — keeps recording AND resuming exactly as before,
+	// with no edit. The first cut of this change spelled it `recording`,
+	// defaulting off, and TestMarkFailedJoinsStateError caught it
+	// immediately: a field named for the on-behaviour silently inverts to
+	// off for every caller that does not know to set it.
+	noResume bool
 }
+
+// newSyncRecordingContext builds the record-but-never-resume context the
+// sync cold start uses, keyed on the STREAM ID.
+//
+// # Why this exists
+//
+// The sync cold start used to pass a zero-value resumeContext, so every
+// state write no-op'd. The stated reason was about RESUME — the fast path
+// is fresh-cold-start-only, so a resumable store is inert — and that
+// reasoning is correct as far as it goes. But one flag disabled two
+// unrelated things, and nobody decided the second: the cold start also
+// lost every progress row it would have written.
+//
+// The consequence was not subtle. `WritePosition` at the end of
+// coldStartBeginCDC is the ONLY row the cold-start path writes, so for
+// the whole of schema apply, bulk copy, index build and the FLOAT
+// re-read — hours on a real migration — `sync status`, `sync health` and
+// `verify` all reported the stream as absent, which is indistinguishable
+// from a dead process. The 2026-09-08 user report surfaced it at the
+// tail, where they expected to be done; the blackout covered everything
+// before that too.
+//
+// # Why the stream ID is load-bearing, and not just a collision fix
+//
+// Keying on the stream ID keeps two streams against one target apart,
+// which is the obvious reason. The important one is that it keeps sync's
+// rows out of the namespace `migrate --resume` derives.
+// [deriveMigrationID] hashes (source, target, targetSchema); if a sync
+// cold start wrote under that same id, a later `migrate --resume`
+// against the same pair would find state describing a copy IT did not
+// perform and resume from it. Sync rows live under a "sync-" prefix that
+// no migrate run can derive, so the two populations cannot alias.
+//
+// The returned context is deliberately NOT resumable: nothing calls
+// loadOrInitState with it, and if something ever does, `enabled` alone
+// no longer implies "you may resume from this".
+func newSyncRecordingContext(store ir.MigrationStateStore, streamID string) resumeContext {
+	if store == nil || streamID == "" {
+		// A target whose engine implements no MigrationStateStore records
+		// nothing, and that is a real gap rather than a silent nicety:
+		// `sync status` on such a target still reports the stream as
+		// absent during a cold start. Stated here rather than implied,
+		// because a reader who sees the recording context wired in could
+		// otherwise reasonably assume every target gets it.
+		return resumeContext{}
+	}
+	return resumeContext{
+		store:       store,
+		migrationID: syncMigrationID(streamID),
+		enabled:     true,
+		noResume:    true,
+	}
+}
+
+// syncMigrationID namespaces a sync cold start's progress rows so they
+// can never be mistaken for a resumable `migrate` state. See
+// [newSyncRecordingContext] for why that separation is a safety property
+// and not just tidiness.
+func syncMigrationID(streamID string) string { return "sync-" + streamID }
+
+// writes reports whether this context should PERSIST progress. Every
+// state writer gates on it; the resume readers deliberately do not, so
+// the two questions stay separable (see [resumeContext.recording]).
+//
+// `migrate` sets recording alongside enabled, so its behaviour is
+// byte-identical to before the split.
+func (rc resumeContext) writes() bool { return rc.enabled }
 
 // migrateRaiseRecorder resolves the ADR-0182 crash-safe recorder for the
 // query-timeout raise from the migrate resume context: the resumable
@@ -217,6 +312,22 @@ func truncateLastError(msg string) string {
 // work" — i.e., the already-complete-resume case. Callers branch on
 // that to short-circuit Migrator.Run.
 func loadOrInitState(ctx context.Context, rc resumeContext, resume, resetting bool) (ir.MigrationState, bool, error) {
+	// A record-only context must never be resumed from. Nothing calls
+	// this with one today — the sync cold start writes progress and never
+	// reads it back — so this is a door held shut ahead of the first
+	// caller rather than a live guard. It refuses LOUDLY rather than
+	// degrading to a fresh state, because a silent fresh-start here would
+	// look identical to a successful resume and re-copy the whole
+	// database (audit-style reasoning: the failure mode of the quiet
+	// branch is the expensive one).
+	if rc.noResume {
+		return ir.MigrationState{}, false, fmt.Errorf(
+			"pipeline: migration state %q is record-only and cannot be resumed from: it is written by a sync "+
+				"cold start purely so `sync status` has something to report, and the cold-start fast path is "+
+				"fresh-start-only by construction. Resuming an interrupted sync cold start is `sync start` "+
+				"again, which takes the serial resumable path", rc.migrationID,
+		)
+	}
 	if !rc.enabled {
 		// No store available — fall back to non-resumable behaviour.
 		// --resume requested without a store is a clear caller error
