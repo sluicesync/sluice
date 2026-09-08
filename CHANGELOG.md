@@ -4,6 +4,24 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.147.1] - 2026-09-08
+
+One fix, for PlanetScale and Vitess sources: an errant GTID is no longer reported as a replaced keyspace, and now names the remedy that avoids the full re-copy entirely. Nothing else is affected.
+
+### Fixed
+
+**An errant GTID made sluice call the keyspace "a different lineage" and re-copy the whole target.** An errant GTID — a transaction executed directly on a replica, so that tablet's `gtid_executed` carries a source UUID the primary never executed — lands in sluice's persisted resume position, because sluice records Vitess's VGTID verbatim and the CDC tail streams from a `REPLICA` by default on PlanetScale. The next resume probes through vtgate, which may pick a *different* tablet with no trace of that UUID, and the pre-flight's every-UUID-must-be-present test concluded the source had been replaced.
+
+Measured on a real 3-tablet Vitess cluster: the errant transaction was in a database **outside the synced keyspace entirely** — nothing sluice replicates was touched and the target had not diverged by one byte — and the position was still refused. The control settles it: the same position probed at the tablet holding the errant UUID resumed cleanly. Same database, same instant, opposite verdict, decided by which tablet vtgate picked. Left alone it becomes permanent, since once that replica is replaced no tablet holds the UUID.
+
+The verdict is now three-way (`classifyLineage`). Sharing UUIDs *and* naming an unknown one is an errant GTID, diagnosed as such with the remedy that costs nothing — reconcile the GTID on the primary and the resume succeeds with no re-copy. Sharing none is still a foreign lineage and still refuses. Replica lag is unchanged. SCOPE: this separates an errant GTID riding a UUID the shard has NEVER executed; one on a demoted primary rides an already-present UUID, is still classified as replica lag, and still proceeds — unchanged by this release and pinned as a known gap.
+
+**It still refuses on the errant shape rather than resuming through it, and that was measured.** With the pre-flight bypassed: while the errant-carrying tablet is in the pool vtgate routes the stream to it and resuming would work, so the refusal is knowingly conservative there; once that tablet is replaced every tablet answers `GTIDSet Mismatch` and vtgate spends ~90s cycling without surfacing anything before giving up. Refusing at the door costs one re-copy, resuming would cost that discovery on every future resume.
+
+### Compatibility
+
+No behaviour change for any source that was working — the only thing that changed is the diagnosis and message of a refusal that already fired. VStream lane only; vanilla MySQL, MariaDB, Postgres, SQLite and the trigger-CDC engines are untouched. No flag added, renamed or removed; backup format version unchanged at 10.
+
 ## [0.147.0] - 2026-09-07
 
 A small release with one thing in it that matters: a backup chain that a quiet hour made unusable is usable again. Take this one if you run scheduled `backup incremental` against a source that is sometimes idle.

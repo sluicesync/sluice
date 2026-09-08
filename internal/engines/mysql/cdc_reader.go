@@ -2690,8 +2690,6 @@ func verifyGTIDLineageContinuity(ctx context.Context, db *sql.DB, resumeSet stri
 		abbreviateGTIDSet(resumeSet), abbreviateGTIDSet(executed), ir.ErrPositionInvalid)
 }
 
-// gtidSetUUIDsSubset reports whether every source UUID named in resume
-// also appears in executed (MySQL GTID sets: "uuid:intervals[,uuid:…]").
 // lineageVerdict is what a resume position's UUIDs say about the shard being
 // resumed against, once GTID_SUBSET(resume, executed) has already said "not
 // contained". The three outcomes have different diagnoses and different
@@ -2735,6 +2733,101 @@ func classifyLineage(resume, executed string) lineageVerdict {
 	}
 }
 
+// lineageRefusal maps a [lineageVerdict] to the ACTION the pre-flight takes:
+// nil to proceed, a non-nil ir.ErrPositionInvalid-wrapped error to refuse.
+//
+// It is a separate function for the same reason [classifyLineage] is, one
+// level up — and the reason was measured, not assumed. Pinning the verdict
+// alone left the verdict-to-ACTION seam ungated: folding the errant arm into
+// the lag arm, so an errant GTID silently PROCEEDS instead of refusing,
+// passed the ENTIRE unit suite. That is the silent direction, and it is the
+// same helper-versus-wiring seam that let the pgtrigger capture-shape door
+// ship inert. Moving the decision up one level without gating the new seam
+// just relocates the hole, so the action is a value too.
+//
+// Both refusal arms wrap [ir.ErrPositionInvalid]: the streamer's ADR-0022
+// fall-through engages identically on either, and a refusal that stopped
+// wrapping it would silently change the failure mode from re-copy to hard
+// stop with nothing failing.
+func lineageRefusal(v lineageVerdict, shard, target, resume, executed string) error {
+	switch v {
+	case lineageReplicaLag:
+		return nil
+
+	case lineageErrantGTID:
+		// ERRANT GTID, not a replaced keyspace. The position shares
+		// source UUIDs with this shard AND names at least one the
+		// shard has never executed — the shape a transaction run
+		// directly on a replica makes (see [gtidSetUUIDsIntersect],
+		// measured on a real cluster 2026-09-08, where the errant
+		// transaction was in a database outside the keyspace and the
+		// target had not diverged by one byte).
+		//
+		// IT STILL REFUSES, and a 3-tablet cluster measurement
+		// (2026-09-08) settled that rather than leaving it inherited.
+		// Both halves were measured with the pre-flight bypassed:
+		//
+		//	TRANSIENT (the errant tablet still in the pool): vtgate
+		//	  routes the STREAM to the tablet that can serve it —
+		//	  "Picked REPLICA tablet zone1-0000000101" — and 41
+		//	  changes flowed with Err() nil. Proceeding would work
+		//	  here, so today's refusal is a FALSE refusal in this
+		//	  case, and that cost is known and accepted.
+		//
+		//	PERMANENT (the errant tablet replaced, which is routine
+		//	  on PlanetScale): every tablet answers "GTIDSet
+		//	  Mismatch", vtgate logs "No healthy serving tablet found
+		//	  ... sleeping for 30.000 seconds" at INFO and never
+		//	  propagates it, then gives up at ~90s with a gRPC
+		//	  Canceled. 18 messages arrived, all heartbeat-only, zero
+		//	  real events.
+		//
+		// The refusal is kept for the permanent half, which no
+		// routing can rescue: the position names a UUID that no
+		// longer exists anywhere in the shard, so no tablet can ever
+		// serve it and every future resume would spend ~90s
+		// discovering that. Refusing at the door costs one re-copy;
+		// proceeding costs an indefinite series of them.
+		//
+		// CORRECTED from the first version of this comment, which
+		// said vtgate "BLOCKS waiting for another" and cited SLM-2's
+		// silent-gap path. It does not block indefinitely — it gives
+		// up — and the silent path does not reach here: the give-up
+		// is classified, stored via setErr, and surfaced loudly by
+		// captureWindow, while cleanExitOnCallerCancel checks
+		// ctx.Err() first and so will not swallow a server-side
+		// cancel. Verified directly: a gRPC Canceled does NOT satisfy
+		// errors.Is(err, context.Canceled) before classification, so
+		// the pump's early return is not taken.
+		//
+		// What changes is the DIAGNOSIS and the remedy. Calling this a
+		// replaced keyspace sent an operator to re-create a database
+		// that is fine; the actual fix is to reconcile the errant GTID
+		// on the primary, after which this resume succeeds untouched.
+		return fmt.Errorf("mysql/vstream: the resume position for shard %q names source UUID(s) this shard has "+
+			"never executed, but SHARES others with it (%s; resume %q, source executed %q) — that combination is "+
+			"an ERRANT GTID, not a replaced keyspace: a transaction was executed directly on a replica, so that "+
+			"tablet's gtid_executed carries a UUID the rest of the shard has no trace of, and sluice recorded it "+
+			"because the CDC tail streams from a replica. RECONCILE THE ERRANT GTID on the primary — the usual "+
+			"fix is injecting an empty transaction with that GTID so the shard's lineage contains it — and this "+
+			"resume then succeeds with no re-copy. CHECK WHAT THAT TRANSACTION TOUCHED FIRST: if it wrote to a "+
+			"table you sync, sluice read it from that replica and applied it, so your target may hold a row the "+
+			"source does not — and injecting an empty transaction makes the resume succeed without removing it. "+
+			"An errant transaction is often empty, administrative, or outside the synced keyspace entirely, in "+
+			"which case nothing diverged; sluice cannot tell which from here. Resuming anyway is refused rather "+
+			"than attempted because once the errant-carrying tablet is replaced no tablet can serve this "+
+			"position: every tablet answers GTIDSet Mismatch and vtgate spends ~90s cycling through them before "+
+			"giving up: %w",
+			shard, target, abbreviateGTIDSet(resume), abbreviateGTIDSet(executed), ir.ErrPositionInvalid)
+
+	default:
+		return fmt.Errorf("mysql/vstream: the resume position for shard %q names a source UUID the shard has never "+
+			"executed, and shares NONE with it (%s; resume %q, source executed %q) — the source is a different "+
+			"lineage (a fresh, reset, rebuilt or replaced keyspace/shard); cannot resume: %w",
+			shard, target, abbreviateGTIDSet(resume), abbreviateGTIDSet(executed), ir.ErrPositionInvalid)
+	}
+}
+
 // gtidSetUUIDsIntersect reports whether resume and executed name at least one
 // source UUID in common, ignoring sequence ranges entirely.
 //
@@ -2774,6 +2867,14 @@ func gtidSetUUIDsIntersect(resume, executed string) bool {
 	return false
 }
 
+// gtidSetUUIDsSubset reports whether every source UUID named in resume
+// also appears in executed (MySQL GTID sets: "uuid:intervals[,uuid:…]").
+//
+// This is the REPLICA-LAG test: every UUID present with lower sequence
+// numbers means the probed tablet is behind the one streamed from, not a
+// different database. Its counterpart is [gtidSetUUIDsIntersect]; on any
+// non-empty resume, subset implies intersect, and [classifyLineage] depends
+// on that ordering.
 func gtidSetUUIDsSubset(resume, executed string) bool {
 	have := map[string]bool{}
 	for _, part := range strings.Split(executed, ",") {

@@ -135,13 +135,28 @@ jobs:
         env:
           VITESS_LITE_IMAGE: ghcr.io/sluicesync/sluice-vitess:v24.0.1
         run: |
-          # H-6 non-vacuity guard: 5 selected, 4 PASS — the 5th
+          # H-6 non-vacuity guard: 7 selected, 6 PASS — the 7th
           # (TestVitessChaos_RollingUpgrade_MidSync) is an unconditional
           # roadmap-tracked quarantine t.Skip. A cluster-boot infra skip on any
-          # of the other 4 (the failure mode this leg exists to catch) drops the
+          # of the other 6 (the failure mode this leg exists to catch) drops the
           # PASS count and fails loud instead of greening vacuously.
+          #
+          # Went 5→7 in v0.147.1 with two lineage tests that cover what this
+          # suite structurally could not: every pre-existing chaos test calls
+          # StreamChanges ONCE, before its fault, and Reopen does not re-run the
+          # resume pre-flight — so the suite could not exercise the pre-flight
+          # after a reparent at all, and its clean result on that question was
+          # nearly vacuous. TestVitessChaos_LineagePreflight_AcrossReparents and
+          # TestVitessChaos_ErrantGTID_PositionAndLineage ask it directly.
+          #
+          # A third probe from the same investigation is deliberately NOT here.
+          # It bypassed the production pre-flight to measure what resuming
+          # WOULD do, so it exercises a path production cannot reach — an
+          # experiment, not a gate. Hanging this leg's greenness on non-product
+          # code inverts what the leg is for; its evidence lives in
+          # docs/dev/audit-backlog.md and commit f4807c2d.
           bash scripts/check-leg-nonvacuity.sh \
-            'integration vitesscluster chaos' '^TestVitessChaos_' ./internal/engines/mysql/... 5 4 \
+            'integration vitesscluster chaos' '^TestVitessChaos_' ./internal/engines/mysql/... 7 6 \
             -race -timeout=120m
 
   # The reshard correctness test: proves the CDC reader follows a

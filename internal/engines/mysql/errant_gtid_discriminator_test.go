@@ -3,7 +3,13 @@
 
 package mysql
 
-import "testing"
+import (
+	"errors"
+	"strings"
+	"testing"
+
+	"sluicesync.dev/sluice/internal/ir"
+)
 
 // The three-way lineage verdict, and the case that used to be misdiagnosed.
 //
@@ -35,12 +41,31 @@ import "testing"
 // # What the fix does and deliberately does not do
 //
 // It corrects the DIAGNOSIS and the remedy. It does NOT proceed on the errant
-// shape, because handing vttablet a resume set that is not a subset of its
-// gtid_executed makes it answer "GTIDSet Mismatch" — a refusal that does not
-// reliably reach sluice, since vtgate marks the tablet ignorable and blocks.
-// That is audit SLM-2's silent-loss path. Trading a wasteful re-copy for a
-// silent gap would be the wrong direction, so the action is unchanged and only
-// the operator-facing story changes.
+// shape, and a 3-tablet cluster measurement settled why: once the
+// errant-carrying tablet is replaced — routine on PlanetScale — no tablet can
+// serve the position, every one answers "GTIDSet Mismatch", and vtgate spends
+// ~90s cycling through them before giving up. Refusing at the door costs one
+// re-copy; proceeding would cost that discovery on every future resume.
+//
+// While that tablet is still in the pool, vtgate DOES route the stream to it
+// and resuming works — so the refusal is knowingly conservative in that half,
+// and that cost is accepted rather than unexamined.
+//
+// (An earlier version of this comment said vtgate "marks the tablet ignorable
+// and blocks" and called it audit SLM-2's silent-loss path. It does not block
+// indefinitely, and the silent path does not reach here — the give-up is
+// classified, stored via setErr, and surfaced loudly, and
+// cleanExitOnCallerCancel checks ctx.Err() first. Corrected here after the
+// same claim was found uncorrected in three places, one commit apart.)
+//
+// # A LIMIT OF THE DISCRIMINATOR, stated so the next reader does not assume otherwise
+//
+// This separates an errant GTID riding a UUID the shard has NEVER executed.
+// An errant transaction on a DEMOTED PRIMARY rides a UUID already present in
+// every tablet's gtid_executed, so the UUID-set test sees every UUID present,
+// returns lineageReplicaLag, and PROCEEDS — landing on the same ~90s give-up.
+// That shape is pre-existing, unchanged by this fix, and is pinned below as a
+// known gap rather than left to be rediscovered.
 func TestGTIDLineageDiscriminator_SeparatesErrantFromForeign(t *testing.T) {
 	// The UUIDs the cluster probe actually produced, abbreviated. tablet101 is
 	// the replica that executed the errant transaction; shard is the lineage
@@ -103,6 +128,43 @@ func TestGTIDLineageDiscriminator_SeparatesErrantFromForeign(t *testing.T) {
 			wantVerdict: lineageForeign,
 			verdict:     "refuse as a replaced keyspace",
 		},
+		{
+			// THE REAL WIRE FORMAT. @@global.gtid_executed on a multi-UUID
+			// server comes back comma-AND-NEWLINE separated, which every
+			// cell above silently avoids by using single-UUID sets. If the
+			// splitting ever stopped tolerating the newline, the helpers
+			// would disagree with production on the ordinary shape.
+			name:       "multi-UUID executed set in MySQL's real ,\\n format",
+			resume:     shard + ":1-38",
+			executed:   shard + ":1-20,\n" + tablet101 + ":1-4",
+			wantSubset: true, wantIntersect: true,
+			wantVerdict: lineageReplicaLag,
+			verdict:     "INFO, proceed",
+		},
+		{
+			name:       "uppercase resume UUID — both helpers must fold case identically",
+			resume:     strings.ToUpper(shard) + ":1-38",
+			executed:   shard + ":1-20",
+			wantSubset: true, wantIntersect: true,
+			wantVerdict: lineageReplicaLag,
+			verdict:     "INFO, proceed",
+		},
+		{
+			// A KNOWN GAP, pinned as such rather than left to be
+			// rediscovered (v0.147.1 pre-tag review). An errant transaction
+			// on a DEMOTED PRIMARY rides a UUID already present in every
+			// tablet's gtid_executed, so the UUID-set test sees every UUID
+			// present and returns lag — which PROCEEDS, landing on the ~90s
+			// give-up. This discriminator separates the fresh-replica-UUID
+			// errant shape only. Closing it needs sequence-range reasoning,
+			// not UUID-set reasoning, and is not attempted here.
+			name:       "GAP: errant GTID on a demoted primary is classified as lag",
+			resume:     shard + ":1-38",
+			executed:   shard + ":1-20," + tablet101 + ":1-4",
+			wantSubset: true, wantIntersect: true,
+			wantVerdict: lineageReplicaLag,
+			verdict:     "proceeds — the known limit of a UUID-set discriminator",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := gtidSetUUIDsSubset(tc.resume, tc.executed); got != tc.wantSubset {
@@ -121,8 +183,52 @@ func TestGTIDLineageDiscriminator_SeparatesErrantFromForeign(t *testing.T) {
 			if got := classifyLineage(tc.resume, tc.executed); got != tc.wantVerdict {
 				t.Errorf("classifyLineage = %v, want %v (%s)", got, tc.wantVerdict, tc.verdict)
 			}
+			// Coherence: subset must IMPLY intersect. If they ever disagree
+			// that way, classifyLineage is incoherent — the lag arm would be
+			// reachable for a position sharing no UUIDs at all.
+			if tc.wantSubset && !tc.wantIntersect {
+				t.Fatal("subset without intersect: the two helpers disagree in the direction that makes the verdict incoherent")
+			}
 		})
 	}
+
+	// THE ACTION, not just the verdict. This is the seam the v0.147.1 pre-tag
+	// review found ungated: folding the errant arm into the lag arm — so an
+	// errant GTID silently PROCEEDS instead of refusing — passed the ENTIRE
+	// unit suite, because every test graded classifyLineage and nothing
+	// graded what the pre-flight DOES with it.
+	//
+	// The ir.ErrPositionInvalid assertion is load-bearing separately from the
+	// nil/non-nil one: the streamer's ADR-0022 fall-through keys on it, so a
+	// refusal that stopped wrapping it would silently change the failure mode
+	// from re-copy to hard stop with nothing failing.
+	t.Run("the verdict reaches the right ACTION", func(t *testing.T) {
+		const sh, tgt = "0", "test:0@replica"
+		if err := lineageRefusal(lineageReplicaLag, sh, tgt, "a:1-2", "a:1-1"); err != nil {
+			t.Errorf("replica lag must PROCEED (nil), got %v", err)
+		}
+		for _, tc := range []struct {
+			name    string
+			verdict lineageVerdict
+			wantIn  string
+		}{
+			{"errant refuses and says so", lineageErrantGTID, "ERRANT GTID"},
+			{"foreign refuses and says so", lineageForeign, "shares NONE"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				err := lineageRefusal(tc.verdict, sh, tgt, "a:1-2", "b:1-1")
+				if err == nil {
+					t.Fatalf("%v must REFUSE; a nil here resumes a position the shard cannot serve", tc.verdict)
+				}
+				if !errors.Is(err, ir.ErrPositionInvalid) {
+					t.Errorf("refusal must wrap ir.ErrPositionInvalid — the ADR-0022 fall-through keys on it: %v", err)
+				}
+				if !strings.Contains(err.Error(), tc.wantIn) {
+					t.Errorf("refusal does not name %q, so an operator cannot tell the two apart: %v", tc.wantIn, err)
+				}
+			})
+		}
+	})
 
 	// THE FLOOR. The errant case must be distinguishable from the foreign one
 	// — if the two helpers ever agree on it, the three-way verdict collapses
