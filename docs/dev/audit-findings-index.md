@@ -82,6 +82,13 @@ narrower than the pass.
 - A0909-MYSQL-HIGH-1-POLICY filed
 - A0909-MYSQL-MEDIUM-2 filed
 - A0909-PG-MEDIUM-1 filed
+- A0909-MYSQL-MEDIUM-2b filed
+- VF0909B-6 filed
+- VF0909B-5 filed
+- VF0909B-4 filed
+- VF0909B-3 filed
+- VF0909B-2 filed
+- VF0909B-1 filed
 
 ## 2026-09-07 — v0.145.0 pre-tag review
 

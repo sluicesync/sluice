@@ -1813,10 +1813,9 @@ DECLARE
     v_suppress BOOLEAN;
 BEGIN
 ` + captureDDLSuppressionCheck(metaTableRef) + `    FOR r IN
-        SELECT c.*
+        SELECT c.*, k.captured_relid
           FROM pg_catalog.pg_event_trigger_ddl_commands() c
-         WHERE c.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
-           AND EXISTS (
+          CROSS JOIN LATERAL (
                  -- The command's relation, OR ANY OF ITS DESCENDANTS, carries a
                  -- capture trigger (audit A0909-HIGH-1).
                  --
@@ -1855,11 +1854,37 @@ BEGIN
                        FROM pg_catalog.pg_inherits inh
                        JOIN captured_kin k ON inh.inhparent = k.relid
                  )
-                 SELECT 1
+                 -- The MATCHED captured relation, not the command's own
+                 -- object: recorded on the marker so the reader can tell a
+                 -- DDL that concerns a table it captures from one it does
+                 -- not, WITHOUT relying on the schema name (audit
+                 -- A0909-PG-MEDIUM-1 — ALTER TABLE … SET SCHEMA writes the
+                 -- marker under the DESTINATION schema).
+                 --
+                 -- It must be the matched relation and not c.objid. For
+                 -- object_type='index' the objid is the INDEX; for an ALTER
+                 -- on a partitioned parent it is the PARENT while the
+                 -- capture triggers sit on the partitions. The reader knows
+                 -- only the relations carrying THIS install's capture
+                 -- trigger, so recording anything else would never match and
+                 -- the marker would be discarded — the silent stall again,
+                 -- one shape over. The CTE above already resolves both
+                 -- cases; this reads the answer out of it instead of a
+                 -- second copy that could drift from it.
+                 --
+                 -- LATERAL rather than EXISTS because it yields the value
+                 -- AND the filter from one evaluation: an empty result
+                 -- eliminates the row exactly as EXISTS did. ORDER BY makes
+                 -- the choice deterministic when several kin are captured
+                 -- (any one answers the reader's question).
+                 SELECT tg.tgrelid AS captured_relid
                    FROM pg_catalog.pg_trigger tg
-                   JOIN captured_kin k ON k.relid = tg.tgrelid
+                   JOIN captured_kin ck ON ck.relid = tg.tgrelid
                   WHERE tg.tgname = ` + quoteSQLString(CaptureTriggerRow) + `
-                    AND NOT tg.tgisinternal)
+                    AND NOT tg.tgisinternal
+                  ORDER BY tg.tgrelid
+                  LIMIT 1) k
+         WHERE c.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
     LOOP
         IF r.object_identity IS NULL THEN
             CONTINUE;
@@ -1872,12 +1897,16 @@ BEGIN
                  COALESCE(r.schema_name, 'public'),
                  COALESCE(r.object_identity, 'unknown'),
                  'X',
-                 -- objid: the relation's OID, which survives a rename or a
-                 -- SET SCHEMA while schema_name/object_identity carry the NEW
-                 -- name. The reader grades a marker from a foreign schema by
-                 -- this identity (audit A0909-PG-MEDIUM-1). Text, so the
-                 -- reader's string-map decode keeps working on every field.
-                 pg_catalog.jsonb_build_object('command_tag', r.command_tag, 'object_type', r.object_type, 'objid', r.objid::text),
+                 -- captured_relid: the OID of the relation carrying this
+                 -- install's capture trigger that the command concerns (see
+                 -- the LATERAL above). An OID survives a rename or a SET
+                 -- SCHEMA while schema_name and object_identity carry the
+                 -- NEW name, so this is what lets the reader grade a marker
+                 -- that arrives under a foreign schema (A0909-PG-MEDIUM-1).
+                 -- TEXT, because the reader decodes this payload into a
+                 -- map[string]string and one numeric value would fail the
+                 -- whole decode, degrading EVERY marker to a bare "DDL" tag.
+                 pg_catalog.jsonb_build_object('command_tag', r.command_tag, 'object_type', r.object_type, 'captured_relid', r.captured_relid::text),
                  NULL,
                  NULL);
         EXCEPTION

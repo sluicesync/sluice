@@ -41,17 +41,18 @@ type CDCReader struct {
 	dsn    string
 
 	// capturedRelIDs is the set of relation OIDs carrying this install's
-	// capture trigger in `schema` at stream open. A DDL marker's relation
-	// identity outlives a rename or a `SET SCHEMA` — the OID does not
-	// change when the name does — so a marker whose schema_name is no
-	// longer this reader's schema is still in scope when its relation is
-	// one of these (audit 2026-09-09 A0909-PG-MEDIUM-1: `ALTER TABLE …
-	// SET SCHEMA` on a captured table wrote its marker under the NEW
-	// schema, the schema check dropped it, and the stream stalled
-	// silently at exit 0). A decoy relation in another schema was never
-	// captured here, so its OID is absent and the security half holds.
-	// nil when the load failed (a WARN says so); then only the schema
-	// check applies, which is the pre-fix behaviour.
+	// capture trigger at stream open, wherever those relations live (see
+	// [loadCapturedRelIDs]). A relation's OID outlives a rename or a `SET
+	// SCHEMA` — it does not change when the name does — so a marker whose
+	// schema_name is no longer this reader's schema is still in scope
+	// when its relation is one of these (audit 2026-09-09
+	// A0909-PG-MEDIUM-1: `ALTER TABLE … SET SCHEMA` on a captured table
+	// wrote its marker under the NEW schema, the schema check dropped it,
+	// and the stream stalled silently at exit 0). A decoy relation
+	// another role built was never captured here, so its OID is absent
+	// and the security half holds. nil when the load failed (a WARN says
+	// so); then only the schema check applies, which is the pre-fix
+	// behaviour.
 	capturedRelIDs map[uint32]bool
 
 	pollInterval time.Duration
@@ -902,16 +903,19 @@ const ddlMarkerDroppedRelationKey = "dropped_relation"
 type ddlMarker struct {
 	tag             string // command_tag, or "DDL" when unrecoverable
 	droppedRelation string // non-empty → a CAPTURED table was dropped
-	// relID is the relation's OID as the capture function recorded it
-	// ('objid', text), or 0 when absent — a marker written by a capture
-	// function older than this field, or a malformed payload. Zero never
-	// matches a captured relation, so an absent OID cannot widen scope.
+	// relID is the OID of the CAPTURED relation the command concerns, as
+	// the capture function recorded it ('captured_relid', text) — not the
+	// command's own object, which for an index is the index and for an
+	// ALTER on a partitioned parent is the parent. 0 when absent: a marker
+	// written by a capture function older than this field, or a malformed
+	// payload. Zero never matches a captured relation, so an absent value
+	// cannot widen scope.
 	relID uint32
 }
 
 // ddlMarkerRelIDKey is the pk_jsonb key the ddl_command_end capture
-// function writes the relation OID under.
-const ddlMarkerRelIDKey = "objid"
+// function writes the captured relation's OID under.
+const ddlMarkerRelIDKey = "captured_relid"
 
 // decodeDDLMarker pulls the §7 DDL-marker row's pk_jsonb payload apart.
 // A missing or malformed payload still yields a refusal (defensive — the
@@ -935,18 +939,28 @@ func decodeDDLMarker(s string) ddlMarker {
 	return out
 }
 
-// loadCapturedRelIDs reads the OIDs of the relations in schema that carry
-// this install's row capture trigger — the identity set a DDL marker from
-// a foreign schema is graded against (see CDCReader.capturedRelIDs).
+// loadCapturedRelIDs reads the OIDs of the relations carrying THIS
+// install's row capture trigger — the identity set a DDL marker arriving
+// under a foreign schema is graded against (see CDCReader.capturedRelIDs).
+//
+// The install is identified by the capture trigger's FUNCTION namespace,
+// not by the relation's: a table moved with `ALTER TABLE … SET SCHEMA`
+// takes its capture trigger with it, so scoping the query to the reader's
+// schema would lose exactly the relation the marker is about — a reader
+// opened AFTER the move would then discard the pending marker and the
+// halt would silently become a stall on resume, which is the defect one
+// step later. The function namespace still distinguishes two sluice
+// installs sharing one database (each has its own `<schema>.sluice_*`
+// functions), so a second install's tables cannot halt this stream.
 func loadCapturedRelIDs(ctx context.Context, db *sql.DB, schema string) (map[uint32]bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, openProbeTimeout)
 	defer cancel()
 	const q = `
 SELECT tg.tgrelid
   FROM pg_catalog.pg_trigger tg
-  JOIN pg_catalog.pg_class c ON c.oid = tg.tgrelid
-  JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
- WHERE n.nspname = $1
+  JOIN pg_catalog.pg_proc p ON p.oid = tg.tgfoid
+  JOIN pg_catalog.pg_namespace fn ON fn.oid = p.pronamespace
+ WHERE fn.nspname = $1
    AND tg.tgname = $2
    AND NOT tg.tgisinternal`
 	rows, err := db.QueryContext(ctx, q, schema, CaptureTriggerRow)

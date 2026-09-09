@@ -110,6 +110,12 @@ func classifyReaderError(err error) error {
 	// server (audit 2026-09-01 SLM-2's MariaDB arm, measured live). Same
 	// route: the position is not resumable here, so cold-start.
 	if isMariaDBForeignGTIDError(err) {
+		// lineage-exempt: this is MariaDB's own 1236 text, and it cannot
+		// separate a reset instance (where the automatic re-copy is right —
+		// there is no other lineage to copy FROM) from a replaced one. The
+		// discrimination happens where the server can be asked: the
+		// pipeline's reactive door calls [CDCReader.VerifyLineage], which
+		// runs the anchor and domain checks, before it drops anything.
 		return fmt.Errorf(
 			"source mariadb cannot resume: the persisted domain-GTID position was never executed on this source (a fresh, reset, or replaced instance, or a position from a different server); a fresh cold-start re-snapshot is required: %w (%w)", ir.ErrPositionInvalid, err,
 		)
@@ -209,6 +215,14 @@ func classifyReaderError(err error) error {
 	// pre-flight in verifyVStreamPositionReachable now refuses first; this is
 	// the reactive twin for the shapes that reach the stream.
 	if isVStreamGTIDSetMismatchError(err) {
+		// lineage-exempt: vtgate's message says "a different lineage" but this
+		// classification is reading an ERROR STRING, which cannot separate a
+		// reshard or a purge (where the automatic re-copy is the correct
+		// recovery, measured in f4807c2d) from a genuinely foreign keyspace.
+		// The discrimination happens where the shard can be asked: the
+		// pipeline's reactive door calls [vstreamCDCReader.VerifyLineage]
+		// before it drops anything, and the pre-flight refuses a foreign
+		// keyspace at the door with the sentinel.
 		return fmt.Errorf(
 			"source vstream refused the resume position: its GTID set is not contained in the shard's executed set (a fresh, reset, rebuilt or replaced keyspace/shard — a different lineage); a fresh cold-start re-snapshot is required: %w (%w)", ir.ErrPositionInvalid, err,
 		)

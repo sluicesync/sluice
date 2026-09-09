@@ -95,6 +95,67 @@ func TestRowWriter_LoadData_CheckViolationIsASkippedRowNotACoercion(t *testing.T
 	}
 }
 
+// TestMariaDB_LoadDataCheckViolationIsWarning4025 is the premise the
+// rowSkippingWarningCodes set rests on for the MariaDB half: the engines
+// do NOT share a code for a CHECK violation, and taking MySQL's 3819
+// alone left every MariaDB skip unclassified wherever the first-attempt
+// shortfall witness is unavailable. Measured here rather than asserted:
+// the refusal quotes the server's own warning, so the cell fails if
+// MariaDB ever renumbers it.
+func TestMariaDB_LoadDataCheckViolationIsWarning4025(t *testing.T) {
+	dsn, cleanup := newMariaDBDedicatedForCDC(t, mariadb114Image, "--local-infile=1")
+	defer cleanup()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	enableLocalInfile(t, dsn)
+
+	applyDDL(t, dsn, `CREATE TABLE ck_maria (id INT NOT NULL, q INT NULL, PRIMARY KEY (id),
+		CONSTRAINT ck_maria_nonneg CHECK (q >= 0)) ENGINE=InnoDB;`)
+	sr, err := Engine{Flavor: FlavorMariaDB}.OpenSchemaReader(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenSchemaReader: %v", err)
+	}
+	defer closeIf(sr)
+	schema, err := sr.ReadSchema(ctx)
+	if err != nil {
+		t.Fatalf("ReadSchema: %v", err)
+	}
+	table := findTable(schema, "ck_maria")
+	if table == nil {
+		t.Fatal("ck_maria not found")
+	}
+
+	relaxed := ""
+	db, err := openDB(ctx, mustParseDSN(t, dsn), &relaxed)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer db.Close()
+	w := &RowWriter{db: db, sqlMode: &relaxed, bulkLoad: ir.BulkLoadLoadDataInfile}
+	in := make(chan ir.Row, 3)
+	for _, r := range []ir.Row{{"id": int64(1), "q": int64(-5)}, {"id": int64(2), "q": int64(7)}, {"id": int64(3), "q": int64(-1)}} {
+		in <- r
+	}
+	close(in)
+	err = w.WriteRows(ctx, table, in)
+	if err == nil {
+		t.Fatalf("WriteRows on MariaDB returned nil with two CHECK-violating rows; target holds %d of 3",
+			countRowsIn(t, ctx, dsn, "ck_maria"))
+	}
+	if !strings.Contains(err.Error(), loadDataRowsSkippedMarker) {
+		t.Errorf("refusal does not carry %s: %v", loadDataRowsSkippedMarker, err)
+	}
+	// The premise: MariaDB's code for it, quoted from the server.
+	if !strings.Contains(err.Error(), "4025") {
+		t.Errorf("the refusal does not quote MariaDB's CHECK-violation warning code 4025, which is what "+
+			"rowSkippingWarningCodes claims this server emits — if MariaDB renumbered it, that set is now "+
+			"wrong for this engine: %v", err)
+	}
+	if n := countRowsIn(t, ctx, dsn, "ck_maria"); n >= 3 {
+		t.Errorf("target holds %d rows; the CHECK cannot have admitted the negative ones", n)
+	}
+}
+
 func countRowsIn(t *testing.T, ctx context.Context, dsn, table string) int {
 	t.Helper()
 	db, err := openDB(ctx, mustParseDSN(t, dsn), nil)

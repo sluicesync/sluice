@@ -357,14 +357,26 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 		//
 		// SCOPE NARROWED v0.146.0 (audit SLM-6): this branch used to say
 		// "or the source identity changed" and cover that case too. The
-		// MySQL file/pos @@server_uuid mismatch no longer wraps
-		// ir.ErrPositionInvalid — deliberately, so it cannot route the
-		// streamer's auto-resnapshot — so it does NOT arrive here. It
-		// surfaces as its own terminal error whose message already names
-		// the per-command remedy, including this one. A GTID lineage the
-		// source never executed still wraps and still lands here.
+		// NO foreign-lineage verdict arrives here any more (audit
+		// 2026-09-09 A0909-MYSQL-HIGH-1). Every "the source is a
+		// different lineage" refusal — the file/pos @@server_uuid
+		// mismatch since v0.146.0, and since this change the binlog-GTID,
+		// MariaDB anchor/domain and VStream arms too — carries
+		// ir.ErrPositionForeignLineage, which deliberately does NOT
+		// satisfy ErrPositionInvalid so it cannot route the streamer's
+		// destructive auto-resnapshot. Those surface as their own
+		// terminal error, whose message names the per-command remedy
+		// including this one. This arm now sees only genuine retention
+		// loss: the source pruned past the position.
+		//
+		// The sentence this replaces said a GTID lineage the source never
+		// executed "still wraps and still lands here", which was true
+		// when written and became false in the same commit that made the
+		// message below name it. Caught by the pre-tag value-fidelity
+		// review, which is the second time this file's comment has
+		// outlived the routing it describes.
 		if errors.Is(err, ir.ErrPositionInvalid) {
-			return fmt.Errorf("incremental: source cannot serve the parent's terminal position (WAL/binlog pruned past it, or a GTID lineage the source never executed); take a fresh full backup — `backup full --chain-slot` provisions retention so this cannot recur — or shorten the chain interval. Underlying: %w", err)
+			return fmt.Errorf("incremental: source cannot serve the parent's terminal position (WAL/binlog pruned past it); take a fresh full backup — `backup full --chain-slot` provisions retention so this cannot recur — or shorten the chain interval. If the source is a DIFFERENT database from the one the chain was captured on, that refuses separately and terminally, with its own remedy. Underlying: %w", err)
 		}
 		return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("incremental: start cdc stream: %w", err))
 	}

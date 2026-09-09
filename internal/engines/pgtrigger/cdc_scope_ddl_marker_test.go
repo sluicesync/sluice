@@ -120,11 +120,11 @@ func TestRowInCaptureScope_AMovedCapturedTableStaysInScopeByOID(t *testing.T) {
 }
 
 func TestDecodeDDLMarker_ReadsTheRelationOID(t *testing.T) {
-	m := decodeDDLMarker(`{"command_tag":"ALTER TABLE","object_type":"table","objid":"16385"}`)
+	m := decodeDDLMarker(`{"command_tag":"ALTER TABLE","object_type":"table","captured_relid":"16385"}`)
 	if m.relID != 16385 || m.tag != "ALTER TABLE" {
 		t.Fatalf("decoded %+v; want relID 16385 and the tag", m)
 	}
 	if old := decodeDDLMarker(`{"command_tag":"ALTER TABLE","object_type":"table"}`); old.relID != 0 || old.tag != "ALTER TABLE" {
-		t.Fatalf("a pre-OID marker decoded as %+v; want relID 0 with the tag intact", old)
+		t.Fatalf("a pre-captured_relid marker decoded as %+v; want relID 0 with the tag intact", old)
 	}
 }

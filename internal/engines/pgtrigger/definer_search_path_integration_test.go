@@ -11,7 +11,8 @@
 // definer resolves unqualified calls against the FIRING session's
 // search_path — the session of whoever ran the DDL. This file is the
 // load-bearing proof, not a shape assertion: it plants an attacker-typed
-// `jsonb_build_object(text,text,text,text)` overload as an UNPRIVILEGED
+// `jsonb_build_object` overload — typed to the arity of the call it must
+// shadow, derived rather than hardcoded — as an UNPRIVILEGED
 // role and fires one `CREATE TABLE`, asserting the shadow executes as the
 // superuser against the PRE-fix function and does NOT against the shipped
 // one.
@@ -55,6 +56,38 @@ func preFixCaptureDDLFunction(t *testing.T, schema, changeLogTableRef string) st
 		t.Fatalf("pre-fix fixture: no pg_catalog. qualifications were found to strip:\n%s", stripped)
 	}
 	return unqualified
+}
+
+// captureCallArity counts the arguments of the first `call` in body — the
+// number an overload must declare to shadow it, since PostgreSQL resolves
+// a function by (name, arity). Top-level commas only: nested calls and
+// single-quoted literals do not contribute.
+func captureCallArity(t *testing.T, body, call string) int {
+	t.Helper()
+	i := strings.Index(body, call)
+	if i < 0 {
+		t.Fatalf("the capture function no longer calls %s, so this fixture cannot shadow it:\n%s", call, body)
+	}
+	depth, args, inQuote := 1, 1, false
+	for _, r := range body[i+len(call):] {
+		switch {
+		case r == '\'':
+			inQuote = !inQuote
+		case inQuote:
+			// literal text
+		case r == '(':
+			depth++
+		case r == ')':
+			depth--
+			if depth == 0 {
+				return args
+			}
+		case r == ',' && depth == 1:
+			args++
+		}
+	}
+	t.Fatalf("unbalanced parentheses after %s in the rendered capture function", call)
+	return 0
 }
 
 // pinnedButUnqualifiedDDLFunction is the fixed function with ONLY the
@@ -157,7 +190,7 @@ CREATE TRIGGER sluice_capture AFTER INSERT ON lowpriv.temp_shadow_tbl FOR EACH R
 	// `lowpriv` cannot run itself). SECURITY INVOKER, so when the
 	// superuser-owned capture function calls it, it inherits that context.
 	const shadowBody = `
-CREATE FUNCTION %SCHEMA%.jsonb_build_object(text, text, text, text) RETURNS jsonb
+CREATE FUNCTION %SCHEMA%.jsonb_build_object(%ARGS%) RETURNS jsonb
 LANGUAGE plpgsql AS $shadow$
 DECLARE
     outcome TEXT;
@@ -174,8 +207,20 @@ BEGIN
 END
 $shadow$;`
 
-	if err := applyPGSQLAs(t, dsn, "lowpriv", "lowpriv",
-		strings.ReplaceAll(shadowBody, "%SCHEMA%", "lowpriv")); err != nil {
+	// The shadow's SIGNATURE is derived from the call it has to shadow,
+	// not written down. PostgreSQL identifies a function by (name, arity):
+	// this fixture hardcoded four text arguments, the capture function's
+	// jsonb_build_object call grew a fifth key-value pair, and the planted
+	// overload stopped matching — so the PRE-fix cell reported that the
+	// exploit no longer fires, which reads exactly like "the vulnerability
+	// is gone" and is really "the fixture stopped reproducing it". Caught
+	// by CI on 52756ce4. The same (name, arity) rule cost a HIGH once
+	// before, in the capture-body door.
+	args := captureCallArity(t, preFixCaptureDDLFunction(t, "public", `"public"."`+ChangeLogTable+`"`), "jsonb_build_object(")
+	shadow := strings.ReplaceAll(shadowBody, "%SCHEMA%", "lowpriv")
+	shadow = strings.ReplaceAll(shadow, "%ARGS%", strings.TrimSuffix(strings.Repeat("text, ", args), ", "))
+	t.Logf("planting a %d-argument jsonb_build_object shadow, derived from the capture function's own call", args)
+	if err := applyPGSQLAs(t, dsn, "lowpriv", "lowpriv", shadow); err != nil {
 		t.Fatalf("plant shadow overload as lowpriv: %v", err)
 	}
 
@@ -314,7 +359,14 @@ $shadow$;`
 
 		// Plant + fire in ONE session: a temp function lives only for the
 		// session that created it.
-		script := strings.ReplaceAll(shadowBody, "%SCHEMA%", "pg_temp") +
+		// Same derived arity as the lowpriv-schema plant above: a
+		// hardcoded signature here would silently stop shadowing the call
+		// and this cell would report the pin holding when nothing was
+		// tested.
+		script := strings.ReplaceAll(
+			strings.ReplaceAll(shadowBody, "%SCHEMA%", "pg_temp"),
+			"%ARGS%", strings.TrimSuffix(strings.Repeat("text, ", args), ", "),
+		) +
 			"\nALTER TABLE lowpriv.temp_shadow_tbl ADD COLUMN c1 int;"
 		if err := applyPGSQLAs(t, dsn, "lowpriv", "lowpriv", script); err != nil {
 			t.Fatalf("plant pg_temp overload + fire DDL as lowpriv: %v", err)

@@ -325,10 +325,22 @@ type showWarnings struct {
 	Skipped int
 }
 
-// mysqlCheckViolationWarningCode is the SHOW WARNINGS code for a CHECK
-// constraint violation (ER_CHECK_CONSTRAINT_VIOLATED); under LOAD DATA
-// LOCAL it is a warning and the row is skipped, not written.
-const mysqlCheckViolationWarningCode = "3819"
+// rowSkippingWarningCodes are the SHOW WARNINGS codes that mean the server
+// DROPPED the row rather than coercing a value in it. Under LOAD DATA
+// LOCAL (IGNORE semantics) a CHECK violation is a warning and the row is
+// skipped, not written.
+// The engines do NOT share a code for it, which is why this is a set and
+// not a constant: MySQL 8.0.46 reports `Warning 3819 Check constraint
+// 'ck_chk_1' is violated`, MariaDB 11.4.13 reports `Warning 4025
+// CONSTRAINT 'ck_nonneg' failed for 'db'.'ck'` — both measured
+// 2026-09-09, three rows in and one row landed on each. Taking the MySQL
+// code alone left the MariaDB skip visible to the shortfall witness on a
+// first attempt and invisible on a replay (pre-tag value-fidelity
+// review).
+var rowSkippingWarningCodes = map[string]bool{
+	"3819": true, // MySQL   ER_CHECK_CONSTRAINT_VIOLATED
+	"4025": true, // MariaDB ER_CONSTRAINT_FAILED
+}
 
 // loadDataRowsSkippedMarker is the grep-stable marker the rows-skipped
 // refusal carries.
@@ -357,7 +369,7 @@ func readShowWarnings(ctx context.Context, q diagnosticQuerier, table string) (s
 		if code != mysqlDupKeyWarningCode {
 			sw.NonDup++
 		}
-		if code == mysqlCheckViolationWarningCode {
+		if rowSkippingWarningCodes[code] {
 			sw.Skipped++
 		}
 		// Cap at a few warnings — gigantic loads can emit thousands and
@@ -433,14 +445,31 @@ func (w *RowWriter) decideBulkWriteWarnings(ctx context.Context, table string, s
 
 	if resolveSessionSQLMode(w.sqlMode) == "" {
 		// Relaxed: WARN once per table, don't refuse.
+		//
+		// The WARN must not claim more than the sample supports. The
+		// server caps SHOW WARNINGS at @@max_error_count, so `count`
+		// (@@warning_count, uncapped) can exceed what was READ — and the
+		// skip classification above only ever saw the read ones. Saying
+		// "N values were clamped" there would be asserting of N warnings
+		// what was checked of a few, and a row DROPPED beyond the cap
+		// would be reported as a coercion (pre-tag value-fidelity review,
+		// 2026-09-09; the residual is filed as A0909-MYSQL-MEDIUM-2b for
+		// the replay path, where the shortfall witness is unavailable).
+		unseen := ""
+		if sw.Visible < count {
+			unseen = fmt.Sprintf(" ONLY %d of the %d warnings could be read (the server caps SHOW WARNINGS at "+
+				"@@max_error_count): the rest were NOT classified, so if any of them dropped a row rather than "+
+				"coercing a value, that row is not on the target.", sw.Visible, count)
+		}
 		if _, seen := w.warnedClamp.LoadOrStore(table, struct{}{}); !seen {
 			slog.WarnContext(
 				ctx,
 				"mysql: target SILENTLY coerced value(s) under --mysql-sql-mode='' — out-of-range/over-long "+
 					"values were clamped or truncated on write, not refused (Vector B). The migration proceeds "+
-					"with the coerced values per your relaxed sql_mode opt-in.",
+					"with the coerced values per your relaxed sql_mode opt-in."+unseen,
 				slog.String("table", table),
 				slog.Int("warnings", count),
+				slog.Int("warnings_read", sw.Visible),
 				slog.String("examples", strings.Join(details, "; ")+more),
 				slog.String("hint", "to PRESERVE such values, map the column to a fitting type via "+
 					"--type-override (e.g. =decimal(P,S) for a numeric overflow, =text/=varchar for an over-long "+
@@ -554,20 +583,10 @@ func (w *RowWriter) reportLoadDataWarnings(ctx context.Context, conn *sql.Conn, 
 	return nil
 }
 
-// replayWarningsAreOnlyDuplicates reports whether every warning a replayed
-// segment produced is accounted for by a duplicate-key skip.
-//
-// Pure, so the decision matrix is unit-pinned without a server. The
-// conservative direction is always "no": an accounting that does not add up
-// (unknown affected-rows, more warnings than skipped rows, a visible warning
-// that is not 1062) refuses, because the cost of a false refusal is a
-// restart and the cost of a false tolerance is a silently coerced value.
-//
-// Note a row can be BOTH truncated and duplicate — two warnings, one skip —
-// which shows up here as total > skipped and refuses. That is intended.
 // rowsSkippedError is the refusal for rows the server DROPPED during a
 // bulk write — a CHECK constraint violation that LOAD DATA LOCAL (IGNORE
-// semantics) downgrades to warning 3819 and skips, or, on a first attempt,
+// semantics) downgrades to a warning and skips (3819 on MySQL, 4025 on
+// MariaDB — both measured), or, on a first attempt,
 // any shortfall between the rows sluice sent and the rows the server
 // reports inserted. Refused in EVERY sql_mode: --mysql-sql-mode=” opts
 // into coercion, and a skipped row is not a coerced one. Before audit
@@ -579,16 +598,29 @@ func rowsSkippedError(table string, skipped int64, details []string, more string
 	return fmt.Errorf("mysql: "+loadDataRowsSkippedMarker+": bulk write into %q SKIPPED %d row(s) — the target "+
 		"rejected them and LOAD DATA LOCAL reports a rejected row as a warning instead of an error, so the load "+
 		"continued without them. A skipped row is a lost row, not a coerced value, so this refuses under every "+
-		"sql_mode (--mysql-sql-mode='' does not opt into it). Warning 3819 names a CHECK constraint the row "+
+		"sql_mode (--mysql-sql-mode='' does not opt into it). A skip-class warning — 3819 on MySQL, 4025 on "+
+		"MariaDB — names a CHECK constraint the row "+
 		"violates: sluice translates a source CHECK — including a PostgreSQL NOT VALID one, which MySQL cannot "+
 		"leave unvalidated — into an ENFORCED target CHECK. Examples: [%s]%s. Recovery: fix or exclude the "+
 		"offending source rows, or relax the target CHECK (`ALTER TABLE … DROP CHECK <name>` on the target, "+
-		"then re-run), or route the copy through the batched-INSERT path by connecting to the target with "+
-		"local_infile=OFF (a DSN parameter, or the server setting), where the same violation fails the "+
-		"statement loudly at errno 3819 instead of being skipped",
+		"then re-run), or route the copy through the batched-INSERT path by setting local_infile=OFF on the "+
+		"TARGET server (it is a global variable, not a session or DSN one — sluice falls back to batched "+
+		"INSERTs when it reads @@local_infile as OFF), where the same violation fails the statement loudly "+
+		"instead of being skipped",
 		table, skipped, strings.Join(details, "; "), more)
 }
 
+// replayWarningsAreOnlyDuplicates reports whether every warning a replayed
+// segment produced is accounted for by a duplicate-key skip.
+//
+// Pure, so the decision matrix is unit-pinned without a server. The
+// conservative direction is always "no": an accounting that does not add up
+// (unknown affected-rows, more warnings than skipped rows, a visible warning
+// that is not 1062) refuses, because the cost of a false refusal is a
+// restart and the cost of a false tolerance is a silently coerced value.
+//
+// Note a row can be BOTH truncated and duplicate — two warnings, one skip —
+// which shows up here as total > skipped and refuses. That is intended.
 func replayWarningsAreOnlyDuplicates(segRows int, inserted, totalWarnings int64, visibleNonDup int) bool {
 	if inserted < 0 || visibleNonDup > 0 {
 		return false

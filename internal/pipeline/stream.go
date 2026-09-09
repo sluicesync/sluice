@@ -495,7 +495,7 @@ func (b *BackupStream) Run(ctx context.Context) (err error) {
 				changesCh, err = cdc.StreamChanges(ctx, resumeFrom)
 				if err != nil {
 					if errors.Is(err, ir.ErrPositionInvalid) {
-						return fmt.Errorf("stream: after transient retry, the source cannot serve the parent's terminal position (pruned past it, or a GTID lineage the source never executed — the underlying error says which; a MySQL file/pos server_uuid mismatch refuses separately and terminally, with its own per-command remedy); take a fresh full backup or shorten the chain interval. Underlying: %w", err)
+						return fmt.Errorf("stream: after transient retry, the source cannot serve the parent's terminal position: it has pruned past it. (A source that is a DIFFERENT lineage from the one this chain was captured on refuses separately and terminally, with its own remedy — since audit 2026-09-09 that covers every MySQL-family arm, not only the file/pos server_uuid check, so no lineage verdict reaches this message.) Take a fresh full backup or shorten the chain interval. Underlying: %w", err)
 					}
 					return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("stream: restart cdc stream after transient: %w", err))
 				}
@@ -863,7 +863,7 @@ func (b *BackupStream) newRolloverLoop(ctx context.Context) (*rolloverInit, erro
 	if err != nil {
 		migcore.CloseIf(cdc)
 		if errors.Is(err, ir.ErrPositionInvalid) {
-			return nil, fmt.Errorf("stream: the source cannot serve the parent's terminal position (pruned past it, or a GTID lineage the source never executed — the underlying error says which; a MySQL file/pos server_uuid mismatch refuses separately and terminally, with its own per-command remedy); take a fresh full backup or shorten the chain interval. Underlying: %w", err)
+			return nil, fmt.Errorf("stream: the source cannot serve the parent's terminal position: it has pruned past it. (A source that is a DIFFERENT lineage from the one this chain was captured on refuses separately and terminally, with its own remedy — since audit 2026-09-09 that covers every MySQL-family arm, not only the file/pos server_uuid check, so no lineage verdict reaches this message.) Take a fresh full backup or shorten the chain interval. Underlying: %w", err)
 		}
 		return nil, migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("stream: start cdc stream: %w", err))
 	}

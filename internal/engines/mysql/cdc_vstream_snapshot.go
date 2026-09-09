@@ -3397,6 +3397,12 @@ type vstreamSnapshotChanges struct {
 // the COPY pump has stopped writing currentVgtid, but reading it under
 // the same lock the pump used keeps the comparison race-clean by
 // construction rather than by sequencing assumption.
+// lineage-exempt: this reader is never returned by [Engine.OpenCDCReader]
+// — the pipeline receives it as the snapshot stream's Changes, and the
+// reactive re-snapshot door opens its OWN reader from the engine (which
+// is the vstreamCDCReader, and that one answers). It also streams from
+// the anchor of a snapshot it has just taken, so there is no persisted
+// position here that could belong to a different lineage.
 func (c *vstreamSnapshotChanges) StreamChanges(ctx context.Context, from ir.Position) (<-chan ir.Change, error) {
 	if from.Engine != "" || from.Token != "" {
 		shards, ok, err := decodeVStreamPos(from)
