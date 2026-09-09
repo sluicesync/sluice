@@ -20,6 +20,12 @@ prod-cutover  bulk_copy  2026-09-08T10:31:02Z  4s ago
 
 ## Fixed
 
+**Stopping a cold start after the copy no longer destroys the replication slot.** This is the most consequential fix in the release and it predates it by two months. The cold start abandoned its snapshot stream on *any* copy-phase error — including a plain `context.Canceled` — and abandoning drops the just-created replication slot. So Ctrl-C during a long index build dropped the slot for a bulk copy that had **already committed every row**: warm resume then has no position, cold start refuses the populated target, and the only escape was `--reset-target-data` and copying everything again.
+
+A stop and a failure arrive at that code as the same thing — a non-nil error — and they are not the same event. A stop now keeps the slot; a genuine failure still drops it, because there the slot is debris. This is the same call the v0.116-era anchor fix made one phase later, which put the CDC anchor write on an uncancellable context for exactly this reason and left the copy and index phases uncovered.
+
+**The kept slot pins WAL on the source, and sluice says so.** A slot preserved silently would trade a recoverable re-copy for a full disk on a busy source. `STOPPED-SLOT-KEPT` names the slot, states that it is retaining WAL, and gives both ways out — resume with the same `--stream-id`, or `pg_drop_replication_slot` if you are abandoning the migration. See [`cdc-streaming.md`](../operator/cdc-streaming.md).
+
 **The copy-throughput hint was wrong outside the smallest tiers, and it cost a real operator a tier upgrade.** sluice logged that writes to a PlanetScale target are "tier-CPU-bound, not connection-bound" and that "a larger tier (or Metal) is the real lever". That came from one measurement — a PS-10, the smallest tier, pinning at 100% CPU under a 2-wide copy — generalised to the whole range. Following it, the reporting operator scaled M-160 → M-640 (2 → 8 vCPU) and saw throughput move 14k → 16k rows/s with target CPU at **11%**. They were bound by the single cross-region INSERT connection, and the hint had explicitly steered them away from the fix: `--copy-fanout-degree 16 --vstream-copy-table-parallelism 4` took the copy from an estimated 18–36h to about 4h.
 
 The line now names the **discriminator** — read the target's CPU — and both regimes with their opposite fixes, instead of naming one lever. It carries the grep-stable marker `COPY-BOTTLENECK`. Worth knowing: `--vstream-copy-table-parallelism` defaults to **1, serial**, and `--copy-fanout-degree` to 4.

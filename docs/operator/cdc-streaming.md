@@ -417,6 +417,25 @@ The same re-run also repairs a second defect found in the same audit, and it is 
 
 **If you apply the `--dry-run` plan by hand, apply it whole, in one psql session.** It now begins with `BEGIN` and ends with `COMMIT`, and it uses `SET LOCAL`, so PostgreSQL reverts the suppression marker at both commit and rollback — which is the point: previously the marker was cleared by a `RESET` at the very end, and an operator whose paste stopped on an error (say, under `\set ON_ERROR_STOP on`) kept the suppression for the rest of that session, silently swallowing the `op='X'` marker for their own next `ALTER TABLE`. Stopping partway is now safe: roll back (or just disconnect) and the marker goes with it. Applying only part of the plan still leaves the engine partly installed, so re-run `sluice trigger setup` to converge either way.
 
+## Stopping a cold start after the copy keeps the slot (`STOPPED-SLOT-KEPT`)
+
+If you stop a `sync start` (Ctrl-C, SIGTERM) after the bulk copy has committed but before CDC begins — during the index build, say, which on a large table is where a stop most often lands — sluice **keeps** the source's replication slot instead of dropping it, and WARNs under `STOPPED-SLOT-KEPT`.
+
+That is deliberate. Without the slot the copy on the target is unresumable: warm resume has no position and a cold start refuses a populated target, so the only way forward would be `--reset-target-data` and copying everything again. Before v0.148.0 the slot was dropped in exactly this window, and a Ctrl-C during a long index build cost the whole copy.
+
+**The kept slot pins WAL on the source, and that is not free.** PostgreSQL retains WAL from the slot's position until the slot advances or goes away, so an unattended slot on a busy source can fill the disk. You have two ways out and should take one of them promptly:
+
+- **Resuming** — re-run `sluice sync start` with the same `--stream-id`. The stream picks up from the slot and releases the retained WAL as it catches up. This is the normal case.
+- **Abandoning** — if you are not going to resume this migration, drop the slot on the source so it stops retaining WAL:
+
+  ```sql
+  SELECT pg_drop_replication_slot('sluice_slot');   -- or your --slot-name
+  ```
+
+  Check what is outstanding with `SELECT slot_name, active, pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained FROM pg_replication_slots;`
+
+A cold start that fails for a real reason — a refused preflight, a foreign-key violation, an unreachable source — still drops its slot, because there the slot is debris rather than a resume point.
+
 ## PostgreSQL sources: slot creation can block on a prepared transaction (`PREPARED-XACT-BLOCKS-SLOT-CREATE`)
 
 `CREATE_REPLICATION_SLOT` builds a consistent point, and that builder waits for every prepared transaction (2PC) on the **cluster** — not just in your database — to be resolved. If one is orphaned because its coordinator died, the slot creation blocks indefinitely with no further output, which reads exactly like a hung connection.
