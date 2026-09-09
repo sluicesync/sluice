@@ -139,6 +139,22 @@ type CDCReader struct {
 	// `schema` is the whole set. Never consulted on the pump.
 	cdcDBList []string
 
+	// foldScopeNames is set at [StreamChanges] from the source's
+	// `lower_case_table_names`: when the server folds identifiers, the
+	// single-database scope compare folds too. The bound `schema` is the
+	// DSN's database AS THE OPERATOR TYPED IT, while every binlog event
+	// carries the database name AS STORED — and a folding server stores
+	// the lowercase form whatever was typed, resolving `SOURCE_DB` to
+	// `source_db` for every query so the copy phase never notices. A
+	// byte-exact compare then drops every event in scope: empty tail,
+	// green heartbeat (audit 2026-09-09 RC-1b, measured on a real
+	// lower_case_table_names=1 server). The multi-database predicate is
+	// deliberately NOT folded: its selected set is computed FROM the
+	// catalog listing (pipeline selectNamespaces filters the names the
+	// server returned), so it only ever holds stored spellings. Read on
+	// the pump goroutine; written before the pump starts.
+	foldScopeNames bool
+
 	// host and port are extracted from the DSN at construction time
 	// and used to configure the binlog syncer's connection. Stored
 	// separately because the syncer takes them as discrete fields
@@ -558,6 +574,11 @@ func (r *CDCReader) databaseInScope(database string) bool {
 	if r.cdcDBInScope != nil {
 		return r.cdcDBInScope(database)
 	}
+	if r.foldScopeNames {
+		// A folding server stores and logs the lowercase name whatever
+		// the DSN spelled (RC-1b); compare the way the server does.
+		return foldMySQLIdentifier(database) == foldMySQLIdentifier(r.schema)
+	}
 	return database == r.schema
 }
 
@@ -701,6 +722,16 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 	if err := preflightBinlogCDCOpen(ctx, r.db, r.binlogFilterScope(), r.flavor); err != nil {
 		return nil, err
 	}
+
+	// The scope compare follows the server's identifier fold (see
+	// foldScopeNames). One global read; loud on failure, the posture of
+	// the preflights above — any account that can open a stream can
+	// read it, so a failure is a broken connection, not evidence.
+	lct, err := readLowerCaseTableNames(ctx, r.db)
+	if err != nil {
+		return nil, fmt.Errorf("mysql: cdc: scope name rule: %w", err)
+	}
+	r.foldScopeNames = lct != 0
 
 	startPos, err := r.resolveStartPosition(ctx, from)
 	if err != nil {
