@@ -915,6 +915,29 @@ jobs:
           fi
           sh scripts/check-notes-claims.sh "$TAG" "docs/releases/release-notes-$TAG.md"
 
+      # The CHANGELOG at a release tag must carry that release's own heading
+      # (2026-09-09). v0.148.2 shipped with its three fixes still under
+      # `## [Unreleased]`: the release commit writes the entries there and is
+      # supposed to promote them, and nothing read that file at tag time —
+      # notes-claims grades the release-notes ARCHIVE, and every other publish
+      # check reads the notes or the assets. The published notes were correct,
+      # which is exactly why it went unnoticed: the only wrong artifact was the
+      # one no gate looked at. Also fails on entries LEFT under Unreleased,
+      # which would be work the release shipped without claiming.
+      - name: check the CHANGELOG carries this release's heading
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          case "$TAG" in
+            *-*) echo "::notice::changelog-heading: $TAG is a pre-release tag — skipping."; exit 0 ;;
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::notice::changelog-heading: $TAG is not a release tag — skipping."; exit 0 ;;
+          esac
+          if ! git rev-parse -q --verify "$TAG^{commit}" >/dev/null; then
+            git fetch --depth=1 --no-tags origin "refs/tags/$TAG:refs/tags/$TAG"
+          fi
+          sh scripts/check-changelog-heading.sh "$TAG"
+
   # ----- govulncheck -----
   # Reachability-based vulnerability scanning: unlike Dependabot alerts
   # / CodeQL (which flag vulnerable *versions*), govulncheck reports
