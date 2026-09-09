@@ -2016,9 +2016,13 @@ func emitCheckConstraint(c *ir.CheckConstraint, backslashEscapes bool) (string, 
 	sb.WriteByte(')')
 	// UPR-1c. MySQL CHECK constraints are enforced or absent -- there is no
 	// created-but-unvalidated state -- so a source NOT VALID CHECK lands
-	// STRICTLY STRONGER here than on the source. That fails loudly at errno
-	// 3819 if the copied rows violate it, which is the same asymmetry the
-	// foreign-key path warns about; it warned there and was silent here.
+	// STRICTLY STRONGER here than on the source. If the copied rows violate
+	// it, the batched-INSERT path fails loudly at errno 3819; the default
+	// LOAD DATA LOCAL path instead gets warning 3819 and the server SKIPS
+	// the row, which the writer's warning gate refuses as a lost row
+	// (LOAD-DATA-ROWS-SKIPPED, audit 2026-09-09 A0909-MYSQL-MEDIUM-2). Same
+	// asymmetry the foreign-key path warns about; it warned there and was
+	// silent here.
 	//
 	// `NOT ENFORCED` IS NOT THE CARRY, and this is written down because it is
 	// the obvious next suggestion. MySQL 8 does have `CHECK ... NOT ENFORCED`,

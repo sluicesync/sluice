@@ -132,10 +132,15 @@ func (m mysqlEmitter) translateDomainCheckToMySQL(col string, check ir.DomainChe
 	// warning suppressed precisely because the translation stopped failing.
 	//
 	// MySQL has no NOT VALID: a CHECK is enforced or absent. So this lands
-	// strictly stronger than the source and fails LOUDLY at errno 3819 if the
-	// copied rows violate it — the same asymmetry the foreign-key path warns
-	// about, which is why it warns here too rather than relying on the
-	// drop-warn that no longer fires.
+	// strictly stronger than the source. If the copied rows violate it, the
+	// batched-INSERT path fails loudly at errno 3819 — but the DEFAULT LOAD
+	// DATA LOCAL path does not: the server downgrades the violation to
+	// warning 3819 and SKIPS the row, in every sql_mode (measured
+	// mysql:8.0.46, audit 2026-09-09 A0909-MYSQL-MEDIUM-2). The writer's
+	// warning gate refuses that skip as a lost row (LOAD-DATA-ROWS-SKIPPED);
+	// the earlier version of this comment said "fails LOUDLY at errno 3819"
+	// unconditionally, which was true of one path of two. Same asymmetry the
+	// foreign-key path warns about, which is why it warns here too.
 	if check.NotValid {
 		slog.Warn(
 			"source DOMAIN CHECK is NOT VALID and MySQL has no equivalent — it becomes an ENFORCED "+

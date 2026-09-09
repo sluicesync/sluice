@@ -154,6 +154,12 @@ operator-friendly way to declare them all in one place.
 | `VARCHAR(0)` / `CHAR(0)` (MySQL → PG only) | Refuses at sluice schema-emit | `--type-override=COL=text` |
 | Division by zero in computed defaults | Raises error | `--mysql-sql-mode=''` (rare; usually you fix the default) |
 
+## A row the target dropped is never a coercion (`LOAD-DATA-ROWS-SKIPPED`)
+
+The bulk-copy path into MySQL uses `LOAD DATA LOCAL INFILE`, and `LOCAL` carries IGNORE semantics on the server: a row that violates a target CHECK constraint is reported as warning 3819 and **skipped**, not written — in strict and relaxed sql_mode alike. That is not a coerced value, it is a lost row, so sluice refuses it under every sql_mode, `--mysql-sql-mode=''` included; the refusal is marked `LOAD-DATA-ROWS-SKIPPED`, names the constraint, and states how many rows were skipped. A first-attempt shortfall between the rows sluice sent and the rows the server reports inserted is refused the same way, whatever the warning sample shows — that shortfall is the independent witness a capped or empty warning list cannot hide.
+
+This matters most for a PostgreSQL source with a `NOT VALID` CHECK: MySQL has no unvalidated state, so sluice creates the CHECK enforced, and rows the source never validated are exactly the ones that violate it. Through v0.148.1 the relaxed-mode gate WARNed that values had been "clamped or truncated" and the migration exited 0 short of rows (audit 2026-09-09, A0909-MYSQL-MEDIUM-2). Ways out: fix or exclude the offending source rows; drop or relax the target CHECK (`ALTER TABLE … DROP CHECK <name>`) and re-run; or connect to the target with `local_infile=OFF`, which routes the copy through batched INSERTs where the same violation fails the statement loudly at errno 3819.
+
 ## What `--mysql-sql-mode=''` does NOT change
 
 The MySQL driver-level overrides (UTF-8 charset, `time_zone='+00:00'`,
