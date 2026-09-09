@@ -1872,7 +1872,12 @@ BEGIN
                  COALESCE(r.schema_name, 'public'),
                  COALESCE(r.object_identity, 'unknown'),
                  'X',
-                 pg_catalog.jsonb_build_object('command_tag', r.command_tag, 'object_type', r.object_type),
+                 -- objid: the relation's OID, which survives a rename or a
+                 -- SET SCHEMA while schema_name/object_identity carry the NEW
+                 -- name. The reader grades a marker from a foreign schema by
+                 -- this identity (audit A0909-PG-MEDIUM-1). Text, so the
+                 -- reader's string-map decode keeps working on every field.
+                 pg_catalog.jsonb_build_object('command_tag', r.command_tag, 'object_type', r.object_type, 'objid', r.objid::text),
                  NULL,
                  NULL);
         EXCEPTION

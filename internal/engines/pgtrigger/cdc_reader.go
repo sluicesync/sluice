@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -38,6 +39,20 @@ type CDCReader struct {
 	db     *sql.DB
 	schema string
 	dsn    string
+
+	// capturedRelIDs is the set of relation OIDs carrying this install's
+	// capture trigger in `schema` at stream open. A DDL marker's relation
+	// identity outlives a rename or a `SET SCHEMA` — the OID does not
+	// change when the name does — so a marker whose schema_name is no
+	// longer this reader's schema is still in scope when its relation is
+	// one of these (audit 2026-09-09 A0909-PG-MEDIUM-1: `ALTER TABLE …
+	// SET SCHEMA` on a captured table wrote its marker under the NEW
+	// schema, the schema check dropped it, and the stream stalled
+	// silently at exit 0). A decoy relation in another schema was never
+	// captured here, so its OID is absent and the security half holds.
+	// nil when the load failed (a WARN says so); then only the schema
+	// check applies, which is the pre-fix behaviour.
+	capturedRelIDs map[uint32]bool
 
 	pollInterval time.Duration
 	batchSize    int
@@ -312,6 +327,16 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 		}
 	}
 
+	// The identity set a DDL marker from a foreign schema is graded
+	// against (A0909-PG-MEDIUM-1). A failed load WARNs and leaves the
+	// pre-fix behaviour: such a marker is discarded by the schema check.
+	if ids, lerr := loadCapturedRelIDs(ctx, r.db, r.schema); lerr != nil {
+		slog.WarnContext(ctx, "pgtrigger: stream: could not read the captured relations' OIDs; a DDL marker "+
+			"for a captured table moved to another schema (ALTER TABLE … SET SCHEMA) will be discarded "+
+			"instead of halting the stream", slog.String("schema", r.schema), slog.String("error", lerr.Error()))
+	} else {
+		r.capturedRelIDs = ids
+	}
 	out := make(chan ir.Change, cdcChannelBuffer)
 	pumpCtx, cancel := context.WithCancel(ctx)
 	r.pumpCancel = cancel
@@ -655,7 +680,13 @@ func (r *CDCReader) poll(ctx context.Context, lastSeen int64) (pollBatch, error)
 		//
 		// A dropped row is WARNed once per (schema, table): it is either an
 		// attack or a misconfiguration, and both deserve to be visible.
-		if !r.rowInCaptureScope(op, schema, table) {
+		// A DDL marker is decoded BEFORE the scope check: its relation OID
+		// is what keeps a moved captured table in scope (A0909-PG-MEDIUM-1).
+		var marker ddlMarker
+		if op == "X" {
+			marker = decodeDDLMarker(pkJSON.String)
+		}
+		if !r.rowInCaptureScope(op, schema, table, marker.relID) {
 			r.warnOutOfScopeCapture(ctx, schema, table, id)
 			continue
 		}
@@ -669,7 +700,7 @@ func (r *CDCReader) poll(ctx context.Context, lastSeen int64) (pollBatch, error)
 		commitTime := pgTriggerCommitTime(committed)
 
 		if op == "X" {
-			m := decodeDDLMarker(pkJSON.String)
+			m := marker
 			b.ddl = &m
 			return b, nil
 		}
@@ -871,7 +902,16 @@ const ddlMarkerDroppedRelationKey = "dropped_relation"
 type ddlMarker struct {
 	tag             string // command_tag, or "DDL" when unrecoverable
 	droppedRelation string // non-empty → a CAPTURED table was dropped
+	// relID is the relation's OID as the capture function recorded it
+	// ('objid', text), or 0 when absent — a marker written by a capture
+	// function older than this field, or a malformed payload. Zero never
+	// matches a captured relation, so an absent OID cannot widen scope.
+	relID uint32
 }
+
+// ddlMarkerRelIDKey is the pk_jsonb key the ddl_command_end capture
+// function writes the relation OID under.
+const ddlMarkerRelIDKey = "objid"
 
 // decodeDDLMarker pulls the §7 DDL-marker row's pk_jsonb payload apart.
 // A missing or malformed payload still yields a refusal (defensive — the
@@ -889,7 +929,40 @@ func decodeDDLMarker(s string) ddlMarker {
 	if out.tag == "" {
 		out.tag = "DDL"
 	}
+	if v, err := strconv.ParseUint(m[ddlMarkerRelIDKey], 10, 32); err == nil {
+		out.relID = uint32(v)
+	}
 	return out
+}
+
+// loadCapturedRelIDs reads the OIDs of the relations in schema that carry
+// this install's row capture trigger — the identity set a DDL marker from
+// a foreign schema is graded against (see CDCReader.capturedRelIDs).
+func loadCapturedRelIDs(ctx context.Context, db *sql.DB, schema string) (map[uint32]bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, openProbeTimeout)
+	defer cancel()
+	const q = `
+SELECT tg.tgrelid
+  FROM pg_catalog.pg_trigger tg
+  JOIN pg_catalog.pg_class c ON c.oid = tg.tgrelid
+  JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+ WHERE n.nspname = $1
+   AND tg.tgname = $2
+   AND NOT tg.tgisinternal`
+	rows, err := db.QueryContext(ctx, q, schema, CaptureTriggerRow)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	ids := map[uint32]bool{}
+	for rows.Next() {
+		var id uint32
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids[id] = true
+	}
+	return ids, rows.Err()
 }
 
 // changeLogTableExists probes for the §2 table on the source. A
@@ -1078,7 +1151,21 @@ func (r *CDCReader) SetCDCScopePredicate(allowed func(schema, table string) bool
 //     security half: the pipeline's closure matches on table NAME alone,
 //     which is exactly why the schema check above cannot be folded into
 //     it.
-func (r *CDCReader) rowInCaptureScope(op, schema, table string) bool {
+func (r *CDCReader) rowInCaptureScope(op, schema, table string, relID uint32) bool {
+	// A DDL marker from a FOREIGN schema is in scope when its relation is
+	// one this stream captured at open: `ALTER TABLE … SET SCHEMA` moves a
+	// captured table's name into another schema, its capture trigger
+	// moves with it, and the marker is written under the NEW schema —
+	// but the OID is the same. Graded before the schema check, so the
+	// marker reaches the observed-DDL refusal instead of being discarded,
+	// which turned a loud halt into a silent stall (audit 2026-09-09
+	// A0909-PG-MEDIUM-1). A decoy relation another role built in a schema
+	// it controls was never captured here, so its OID is absent and it
+	// still cannot halt this stream; an absent OID (older capture
+	// function) is 0 and matches nothing.
+	if op == "X" && schema != r.schema {
+		return relID != 0 && r.capturedRelIDs[relID]
+	}
 	if schema != r.schema {
 		return false
 	}
