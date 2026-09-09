@@ -79,7 +79,11 @@ func newMigrationStateStore(db *sql.DB, schema string) *MigrationStateStore {
 				ReadProgressRows: "SELECT table_name, progress, updated_at FROM " +
 					prog + " WHERE migration_id = $1",
 				ListHeadersByPrefix: "SELECT migration_id, phase, started_at, updated_at, last_error FROM " +
-					hdr + " WHERE migration_id LIKE $1 ESCAPE '\\' ORDER BY updated_at DESC",
+					// ESCAPE '#' — kept identical to the MySQL sibling on
+					// purpose. A backslash works here (standard_conforming_strings)
+					// and is a 1064 parse error there, and that divergence is
+					// what let the MySQL lister ship broken (audit A0909-H1-ESCAPE).
+					hdr + " WHERE migration_id LIKE $1 ESCAPE '#' ORDER BY updated_at DESC",
 				// started_at: set from the column default on first
 				// insert, preserved on conflict by simply not being in
 				// the SET list — the "set once" semantics resume runs

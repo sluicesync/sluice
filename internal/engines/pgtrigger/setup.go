@@ -1817,17 +1817,49 @@ BEGIN
           FROM pg_catalog.pg_event_trigger_ddl_commands() c
          WHERE c.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
            AND EXISTS (
+                 -- The command's relation, OR ANY OF ITS DESCENDANTS, carries a
+                 -- capture trigger (audit A0909-HIGH-1).
+                 --
+                 -- Matching only the named relation was silent loss. A
+                 -- partitioned parent's ALTER arrives as ONE
+                 -- pg_catalog.pg_event_trigger_ddl_commands() row whose objid is the
+                 -- PARENT (measured on PG 16), while the natural install puts
+                 -- capture triggers on the PARTITIONS -- sync start refuses a
+                 -- partitioned parent at preflight, so trigger setup --tables
+                 -- with the partition names is the route operators take. An
+                 -- ALTER TABLE parent ALTER COLUMN v TYPE int USING v*100
+                 -- then rewrote every captured partition, matched no trigger,
+                 -- recorded no 'X' row, and the stream ran on green while the
+                 -- target held the pre-ALTER values. Exit 0, no warning.
+                 --
+                 -- pg_inherits is walked recursively because it covers BOTH
+                 -- declarative partitioning and classic INHERITS with one
+                 -- mechanism, and because partition trees nest: a capture
+                 -- trigger on a sub-partition is as much a reason to record the
+                 -- root's ALTER as one on a direct child.
+                 --
+                 -- Direction matters and only DOWNWARD is needed. DDL naming a
+                 -- CHILD while only the parent is installed already matches
+                 -- directly, because PostgreSQL CLONES a parent's row trigger
+                 -- onto every partition.
+                 WITH RECURSIVE captured_kin(relid) AS (
+                     SELECT CASE
+                              WHEN c.object_type = 'index'
+                                THEN (SELECT i.indrelid
+                                        FROM pg_catalog.pg_index i
+                                       WHERE i.indexrelid = c.objid)
+                              ELSE c.objid
+                            END
+                   UNION ALL
+                     SELECT inh.inhrelid
+                       FROM pg_catalog.pg_inherits inh
+                       JOIN captured_kin k ON inh.inhparent = k.relid
+                 )
                  SELECT 1
                    FROM pg_catalog.pg_trigger tg
+                   JOIN captured_kin k ON k.relid = tg.tgrelid
                   WHERE tg.tgname = ` + quoteSQLString(CaptureTriggerRow) + `
-                    AND NOT tg.tgisinternal
-                    AND tg.tgrelid = CASE
-                          WHEN c.object_type = 'index'
-                            THEN (SELECT i.indrelid
-                                    FROM pg_catalog.pg_index i
-                                   WHERE i.indexrelid = c.objid)
-                          ELSE c.objid
-                        END)
+                    AND NOT tg.tgisinternal)
     LOOP
         IF r.object_identity IS NULL THEN
             CONTINUE;

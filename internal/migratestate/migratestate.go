@@ -340,8 +340,20 @@ func (s *Store) List(ctx context.Context, prefix string) ([]ir.MigrationState, e
 // '_' is an ordinary character in one ("prod_cutover"), where an
 // unescaped pattern would silently also match "prodXcutover". A status
 // command that over-matches attributes one run's progress to another.
+// The escape character is '#', matching the ESCAPE clause both engines
+// render. It is NOT a backslash: MySQL treats backslash as a string escape
+// by default, so `ESCAPE '\'` is an unterminated literal and a 1064 parse
+// error, while PostgreSQL's standard_conforming_strings makes the same text
+// valid. A character neither dialect treats specially keeps one escaper
+// correct for both (audit A0909-H1-ESCAPE).
+const likeEscapeChar = "#"
+
 func likePrefix(prefix string) string {
-	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	r := strings.NewReplacer(
+		likeEscapeChar, likeEscapeChar+likeEscapeChar,
+		`%`, likeEscapeChar+`%`,
+		`_`, likeEscapeChar+`_`,
+	)
 	return r.Replace(prefix) + "%"
 }
 

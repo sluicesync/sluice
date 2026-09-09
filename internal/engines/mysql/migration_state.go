@@ -80,7 +80,16 @@ func newMigrationStateStore(db *sql.DB, upsert upsertSpelling) *MigrationStateSt
 				ReadProgressRows: "SELECT table_name, progress, updated_at FROM " +
 					prog + " WHERE migration_id = ?",
 				ListHeadersByPrefix: "SELECT migration_id, phase, started_at, updated_at, last_error FROM " +
-					hdr + " WHERE migration_id LIKE ? ESCAPE '\\' ORDER BY updated_at DESC",
+					// ESCAPE '#', not a backslash. MySQL treats backslash as a
+					// STRING escape by default, so `ESCAPE '\'` is an
+					// unterminated literal and the whole statement is a 1064
+					// parse error — which fired on every `sync status` against a
+					// MySQL target, whether or not the control table existed.
+					// PostgreSQL's standard_conforming_strings made the
+					// byte-identical twin work, which is exactly why it shipped.
+					// A character neither dialect treats specially removes the
+					// divergence instead of quoting around it (audit A0909-H1-ESCAPE).
+					hdr + " WHERE migration_id LIKE ? ESCAPE '#' ORDER BY updated_at DESC",
 				// started_at is deliberately excluded from the SET list
 				// so its DEFAULT CURRENT_TIMESTAMP on the original
 				// INSERT survives subsequent upserts; updated_at
