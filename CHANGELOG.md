@@ -4,6 +4,38 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.148.0] - 2026-09-08
+
+sluice's first outside migration — an AWS → GCP `us-east4` move of a PlanetScale MySQL database — succeeded, and the operator sent back a candid field report. Most of this release is their findings, and the headline is that a running `sync` cold start was indistinguishable from a dead one for hours.
+
+### Added
+
+**`sync status` and `sync health` can see a cold start in flight.** A stream's row in `sluice_cdc_state` is written only at the very end of a cold start, after the copy, the index build and the FLOAT exact re-read — an ordering that is load-bearing for crash safety and has not changed. The cold start now records its phase and per-table progress as it goes, so status reports it rather than reporting nothing. `LAST PROGRESS WRITE` is the column that decides working-vs-dead; a phase alone cannot, because a run that died mid-phase leaves its last row behind. `sync health` still exits non-zero — a cold start is not a healthy stream, and a probe that treated it as one would go quiet exactly when a stuck cold start needed attention. MySQL and PostgreSQL targets; a target engine with no migration-state store still reports the stream absent, and the code says so.
+
+**The FLOAT exact re-read announces itself** (`FLOAT-EXACT-REREAD`), with a table count up front and a line per table as it completes. It previously logged nothing at all until it finished, which — combined with status reporting the stream as absent — sent the reporting operator to `strace`.
+
+**A new operator page, `docs/operator/cross-region-migration.md`:** where to run sluice, which throughput bound you are on, the safe-migrations index route, and what the quiet post-copy window is.
+
+### Fixed
+
+**The copy-throughput hint was wrong outside the smallest tiers, and cost a real operator a tier upgrade.** It asserted that writes to a PlanetScale target are "tier-CPU-bound, not connection-bound" and that "a larger tier (or Metal) is the real lever" — generalised from one PS-10 measurement to every tier. The reporting operator scaled M-160 → M-640 and saw throughput move 14k → 16k rows/s at 11% target CPU; they were bound by the single cross-region INSERT connection, and the hint had steered them away from the fix that gave them 4.5–9×. It now names the discriminator (read the target's CPU) and both regimes with their opposite fixes, under the marker `COPY-BOTTLENECK`.
+
+**A stalled `--capture-replicated-writes` setup no longer records its own DDL as source-side DDL** (`postgres-trigger`). The suppression evidence is fresh for an hour against `clock_timestamp()`, which advances inside a transaction, and the plan's trigger DDL queues behind any long transaction on a busy table. Past the window, sluice's own `ENABLE ALWAYS` ALTERs were recorded as source DDL and the next open refused with a rebuild remedy. The ALTERs now follow a single re-arm; the window is bounded rather than eliminated, and the code says so.
+
+**`trigger setup` warns about a declaratively partitioned parent** (`PARTITIONED-PARENT-CAPTURE`). Nothing was ever lost — `sync start` already refused such a table at preflight — but the operator learned at the wrong end.
+
+**An over-long `--stream-id` costs the status surface, never the migration.** Caught by the pre-release trigger in this release's own new code: a 251–255 character stream id would have overflowed the progress table's `VARCHAR(255)` (`Error 1406` on strict-mode MySQL, silent truncation elsewhere). Recording degrades with a WARN instead.
+
+**Cold-start progress writes are throttled** to one per table per 2s, with terminal states and first writes exempt. `writeTableProgress` sits inside the per-batch copy loop, so the new recording would otherwise have added a synchronous round trip per batch to exactly the RTT-bound copies this release exists to help. `migrate` is deliberately not throttled: there the same row is a `--resume` cursor.
+
+### Internal
+
+Six audit LOW-tail items closed, each with a gate: an AST-derived index requiring every operator log marker to have a doc home (it caught three within minutes, two of them in this release); the session-GUC roster binds markers to one refusal rather than to a file; the ServerUUID roster stops failing open on an unreadable `Mode`; the local pre-commit gate stops running over gitignored scratch CI never sees; two `x/crypto` advisories with available fixes cleared.
+
+### Compatibility
+
+No schema change, no new flags, no new error codes, no position or manifest format change. Cold-start progress rows reuse the existing migrate-state tables under a `sync-` prefixed id no `migrate` run can derive. `sync status --format json` gains `cold_starts_in_progress` under `omitempty`. `sync health` exit codes unchanged.
+
 ## [0.147.1] - 2026-09-08
 
 One fix, for PlanetScale and Vitess sources: an errant GTID is no longer reported as a replaced keyspace, and now names the remedy that avoids the full re-copy entirely. Nothing else is affected.
