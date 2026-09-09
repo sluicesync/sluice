@@ -321,3 +321,63 @@ func TestProgressThrottle(t *testing.T) {
 		}
 	})
 }
+
+// ensureTrackingStore records whether EnsureControlTable was called, and can
+// fail it, so the A0909-P2 fix is graded rather than assumed.
+type ensureTrackingStore struct {
+	*fakeStateStore
+	ensured   int
+	ensureErr error
+}
+
+func (e *ensureTrackingStore) EnsureControlTable(context.Context) error {
+	e.ensured++
+	return e.ensureErr
+}
+
+// The recording context must CREATE the control tables it writes to
+// (audit A0909-P2), and a failure to create them must cost only the status
+// surface.
+//
+// EnsureControlTable is called from exactly one place in the pipeline --
+// loadOrInitState, the resume read this context refuses by construction. So
+// splitting record-from-resume left table creation on the far side of the
+// door: on a target that had never run `migrate` (the ORDINARY `sync start`
+// target) every progress write failed with SQLSTATE 42P01 and `sync status`
+// showed nothing for the whole cold start. The feature was a no-op in exactly
+// its common case, which is the case it was built for.
+func TestSyncRecordingContextEnsuresItsTables(t *testing.T) {
+	t.Parallel()
+
+	t.Run("the tables are ensured before the context goes live", func(t *testing.T) {
+		t.Parallel()
+		store := &ensureTrackingStore{fakeStateStore: newFakeStateStore()}
+		rc := newSyncRecordingContext(context.Background(), store, "prod-cutover")
+		if !rc.writes() {
+			t.Fatal("the context is inert despite a healthy store")
+		}
+		if store.ensured != 1 {
+			t.Errorf("EnsureControlTable called %d time(s), want 1. Without it every progress write fails "+
+				"with an undefined-table error on any target that has never run `migrate`, and `sync status` "+
+				"reports the stream absent for the whole cold start.", store.ensured)
+		}
+	})
+
+	t.Run("a failure to create them costs the status surface, not the copy", func(t *testing.T) {
+		t.Parallel()
+		store := &ensureTrackingStore{
+			fakeStateStore: newFakeStateStore(),
+			ensureErr:      errors.New("permission denied for schema public"),
+		}
+		rc := newSyncRecordingContext(context.Background(), store, "prod-cutover")
+		if rc.writes() {
+			t.Error("the context went live after its tables could not be created; every subsequent write " +
+				"would fail and the copy would carry the errors")
+		}
+		// Inert, not panicking: the copy proceeds.
+		if err := writeTableProgress(context.Background(), rc, "orders", ir.TableProgress{}); err != nil {
+			t.Errorf("writeTableProgress on the degraded context returned %v; want a silent no-op so the "+
+				"migration is unaffected", err)
+		}
+	})
+}

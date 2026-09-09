@@ -246,6 +246,33 @@ func newSyncRecordingContext(ctx context.Context, store ir.MigrationStateStore, 
 		// otherwise reasonably assume every target gets it.
 		return resumeContext{}
 	}
+
+	// The control tables have to EXIST, and on this path nothing else
+	// creates them (audit A0909-P2).
+	//
+	// EnsureControlTable is called from exactly one place in the pipeline:
+	// loadOrInitState — which is the resume read this context refuses by
+	// construction. So splitting record-from-resume left the table
+	// creation on the far side of the door: on a target that had never run
+	// `migrate` (the ORDINARY `sync start` target) every progress write
+	// failed with SQLSTATE 42P01, and `sync status` showed nothing for the
+	// whole cold start. That is precisely the blackout the feature was
+	// built to end, so the feature was a no-op in its common case.
+	//
+	// A failure here degrades to inert rather than failing the copy, for
+	// the same reason the unopenable-store path does: this is
+	// observability, and refusing to migrate because a progress table
+	// could not be created would be the wrong trade in the wrong
+	// direction.
+	if err := store.EnsureControlTable(ctx); err != nil {
+		slog.WarnContext(ctx, "pipeline: cold-start progress recording is DISABLED for this stream: the "+
+			"progress tables could not be created, so `sync status` will report the stream as absent until "+
+			"the copy finishes and the CDC anchor is written. The migration itself is unaffected",
+			slog.String("stream_id", streamID),
+			slog.String("error", err.Error()))
+		return resumeContext{}
+	}
+
 	return resumeContext{
 		store:       store,
 		migrationID: syncMigrationID(streamID),

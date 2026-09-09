@@ -358,7 +358,7 @@ func (s *Streamer) runColdStartParallel(
 		defer migcore.CloseIf(rc.store)
 	}
 	state := ir.MigrationState{MigrationID: rc.migrationID}
-	return runBulkCopyPhases(
+	copyErr := runBulkCopyPhases(
 		ctx, rc, &state, schema,
 		createSchema, // the ADR-0166 create subset from the sync cold-start's shape gate (roadmap item 25 residual); nil = create everything
 		stream.Rows, sw, rw,
@@ -378,4 +378,18 @@ func (s *Streamer) runColdStartParallel(
 		s.UpfrontIndexes,
 		s.AnalyzeAfter,
 	)
+	if copyErr != nil {
+		return copyErr
+	}
+	// Mark the recorded cold start TERMINAL (audit A0909-P3).
+	//
+	// markComplete is called from migrate's runSingleDatabase, not from
+	// runBulkCopyPhases, so the sync path recorded a run that never
+	// finished: `sync status` kept printing "cold start in progress" above
+	// the live stream row forever. Worse than cosmetic -- the release's own
+	// operator rule is that a progress age which keeps climbing means the
+	// run is DEAD, so a permanent phantom row teaches operators to distrust
+	// the one signal the feature exists to provide.
+	markComplete(ctx, rc, state)
+	return nil
 }

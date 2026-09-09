@@ -53,7 +53,9 @@ This is a field-reported recipe, not yet a sluice-verified one. **The `--upfront
 
 A `sync` cold start does not register its stream on the target until the very end — after the copy, the index build **and** the FLOAT exact re-read have all finished. The ordering is deliberate (see below), so for the whole of a multi-hour cold start there is no stream row to look up.
 
-From v0.148.0, `sync status` reports the cold start anyway, from the progress rows the copy writes as it goes:
+> **Correction (v0.148.1).** v0.148.0 shipped this section claiming the cold-start block generally. It was not: on a target that had never run `migrate` the progress tables were never created, so the feature was a no-op in its most common case, and it reached only the PostgreSQL fast-path copy. v0.148.1 fixes the table creation and the phantom "in progress" row that outlived a finished copy. **The remaining limitation is real and not yet fixed: the block appears for PostgreSQL sources only.** A MySQL, MariaDB, PlanetScale or Vitess source takes the serial copy path, which still records nothing — so on those sources the blackout described above persists, and the log line below is your signal. That is tracked as audit A0909-P2b.
+
+For a **PostgreSQL source**, `sync status` reports the cold start from the progress rows the copy writes as it goes:
 
 ```
 cold start in progress (no CDC anchor yet — this is expected, not a stall):
