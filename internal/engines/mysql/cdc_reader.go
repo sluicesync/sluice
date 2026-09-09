@@ -1009,7 +1009,7 @@ func (r *CDCReader) startNoEventsWatchdog(ctx context.Context) {
 	case <-t.C:
 		slog.WarnContext(
 			ctx, "mysql: cdc: no binlog row events received during startup grace period",
-			slog.String("hint", "verify binary logging is enabled (log_bin=ON), the connecting role has REPLICATION SLAVE, and the source is producing changes; if running against a localhost docker container, see Bug 12 in the project changelog"),
+			slog.String("hint", "verify binary logging is enabled (log_bin=ON), the connecting role has REPLICATION SLAVE, the source is producing changes, and no server-side binlog filter (--binlog-do-db / --binlog-ignore-db, shown by SHOW MASTER STATUS) excludes the synced database under the server's own name comparison; if running against a localhost docker container, see Bug 12 in the project changelog"),
 		)
 	}
 }

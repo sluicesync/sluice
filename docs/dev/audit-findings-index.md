@@ -54,6 +54,24 @@ other eighteen.
 
 ---
 
+## 2026-09-09 — Tier-3 blind audit (post-v0.148.0; 6 blind workers + reconciler)
+
+The reconciler's and the fix-session's IDs. The five blind workers' own
+IDs (silent-loss-mysql, silent-loss-pg, arch-quality, testing-ci,
+perf-deps-devex-docs) are NOT yet entered — that consolidation is the
+open item the backlog section names, and until it lands this list is
+narrower than the pass.
+
+- A0909-HIGH-1 filed
+- A0909-H1-ESCAPE filed
+- A0909-P2 filed
+- A0909-P3 filed
+- A0909-P2b filed
+- RC-1 filed
+- RC-1b filed
+- RC-2 filed
+- RC-5 filed
+
 ## 2026-09-07 — v0.145.0 pre-tag review
 
 - PRE-TAG-1 filed

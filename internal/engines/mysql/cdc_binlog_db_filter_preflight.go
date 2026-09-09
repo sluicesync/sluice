@@ -52,12 +52,46 @@ import (
 // roster TestCDCOpenPreflightRoster_EveryChokepointRunsAllPreflights)
 // covers a filter ADDED across a mysqld restart mid-sync. The same
 // columns exist on SHOW BINARY LOG STATUS (8.4+) and on MariaDB, which
-// the masterStatusSpellings fallback already covers. Database-name
-// matching is case-insensitive: on lower_case_table_names!=0 servers
-// (the Windows/macOS defaults) a case-mismatched filter names the same
-// database, and on a case-sensitive server the mismatch is at minimum a
-// misconfiguration worth a loud stop — the over-refusal wart is
-// accepted in the silent-loss direction's favor.
+// the masterStatusSpellings fallback already covers.
+//
+// # Database-name equality is the SERVER's, not a fold of our choosing
+//
+// Audit 2026-09-09 RC-1 (HIGH, observed end-to-end on real mysql:8.0.46):
+// this door compared filter entries case-INSENSITIVELY on every server,
+// and the comment defending that choice argued the fold erred "in the
+// silent-loss direction's favor". It does — on the IGNORE arm only. On
+// the DO arm a fold errs the other way: `--binlog-do-db=T` with database
+// `t` on a case-sensitive server logs NOTHING for `t`, the fold said the
+// list covered it, and the sync ran green with an empty tail (source 4
+// rows, target 2, zero ERROR lines). The enumerate-the-harms miss, on
+// the door built for exactly this loss.
+//
+// So the equality is now the server's own, read at preflight time and
+// MEASURED per engine (2026-09-09, real containers, uppercase filter
+// entry `SOURCE_DB` against database `source_db`, both arms; the
+// integration pins in cdc_binlog_db_filter_case_integration_test.go
+// re-derive every cell from `SHOW BINLOG EVENTS` rather than from this
+// table, so a server that changes its rule fails the pin):
+//
+//	engine         lct   do-list logs source_db?   ignore-list skips it?   rule
+//	MySQL 8.0.46    0    no                        no                      byte-exact
+//	MySQL 8.0.46    1    yes                       yes                     case-fold
+//	MariaDB 11.4    0    no                        no                      byte-exact
+//	MariaDB 11.4    1    no (lowercase entry: yes) no                      byte-exact against the STORED name
+//
+// MySQL follows `lower_case_table_names` for its filter compare. MariaDB
+// does not: it compares the entry as typed against the name as stored,
+// and at lct=1 the stored name is the lowercase fold — so a mixed-case
+// MariaDB entry matches nothing, at any setting. The rule is one
+// function, [binlogFilterCaseRule.match], so both arms cannot disagree
+// about one server. UNVERIFIED PREMISE (named, not assumed away): at
+// lct=2 MariaDB stores the name as CREATEd rather than lowercased, so
+// "the stored name is the fold" can be false there; lct=2 is only
+// honoured on a case-insensitive filesystem (Windows/macOS), which is
+// not where a production MariaDB source runs, and no Linux container
+// can measure it. On that cell the do arm can over-refuse and the
+// ignore arm can under-refuse; the comment says so instead of the
+// code pretending otherwise.
 
 // binlogFilterScope names the databases a CDC start will read, for the
 // filter preflight's scope-limited refusal. databases is the concrete
@@ -81,15 +115,61 @@ type binlogFilterScope struct {
 	tableAllowed func(schema, table string) bool
 }
 
-// admits reports whether db is part of the sync's scope, by concrete
-// list or by predicate.
-func (s binlogFilterScope) admits(db string) bool {
+// admits reports whether the server's filter entry is part of the sync's
+// scope, by concrete list (under the server's own equality) or by
+// predicate, and names the synced database as SLUICE spells it — the
+// refusal must say "app" when the operator's scope is `app`, even when
+// the server's entry reads `APP`, or the two spellings side by side look
+// like a match the door is wrongly refusing.
+func (s binlogFilterScope) admits(rule binlogFilterCaseRule, entry string) (synced string, ok bool) {
 	for _, d := range s.databases {
-		if strings.EqualFold(d, db) {
-			return true
+		if rule.match(entry, d) {
+			return d, true
 		}
 	}
-	return s.inScope != nil && s.inScope(db)
+	if s.inScope != nil && s.inScope(entry) {
+		return entry, true
+	}
+	return "", false
+}
+
+// binlogFilterCaseRule is the equality a source server applies between a
+// binlog-filter entry and a database name. See the file comment's
+// measured table for where each arm of match comes from.
+type binlogFilterCaseRule struct {
+	lct     int
+	mariadb bool
+}
+
+// match reports whether the filter entry names database db under the
+// server's rule.
+func (r binlogFilterCaseRule) match(entry, db string) bool {
+	switch {
+	case r.lct == 0:
+		return entry == db
+	case r.mariadb:
+		return entry == foldMySQLIdentifier(db)
+	default:
+		return strings.EqualFold(entry, db)
+	}
+}
+
+// readBinlogFilterCaseRule reads the two server facts the equality
+// depends on. A failure is loud and uncoded, the posture of the status
+// read below: both are one-row reads any account that can open a CDC
+// stream can make, so a failure here is a broken connection rather
+// than evidence about the filters.
+func readBinlogFilterCaseRule(ctx context.Context, q dbQuerier) (binlogFilterCaseRule, error) {
+	lct, err := readLowerCaseTableNames(ctx, q)
+	if err != nil {
+		return binlogFilterCaseRule{}, fmt.Errorf("mysql: cdc: binlog filter case rule: %w", err)
+	}
+	var version string
+	if err := q.QueryRowContext(ctx, "SELECT VERSION()").Scan(&version); err != nil {
+		return binlogFilterCaseRule{}, fmt.Errorf("mysql: cdc: binlog filter case rule: read server version: %w", err)
+	}
+	_, _, mariadb := parseMariaDBVersion(version)
+	return binlogFilterCaseRule{lct: lct, mariadb: mariadb}, nil
 }
 
 // binlogDBFilterRemedyHint is the machine-readable remedy carried on
@@ -120,6 +200,16 @@ func preflightBinlogDBFilter(ctx context.Context, q dbQuerier, scope binlogFilte
 		// disabled?" error at anchor time.
 		return nil
 	}
+	if len(doList) == 0 && len(ignoreList) == 0 {
+		// No filters: nothing to compare, so the case rule is not read.
+		// (The common configuration pays for nothing here.)
+		return nil
+	}
+
+	rule, err := readBinlogFilterCaseRule(pctx, q)
+	if err != nil {
+		return err
+	}
 
 	if len(doList) > 0 {
 		if len(scope.databases) == 0 {
@@ -140,18 +230,19 @@ func preflightBinlogDBFilter(ctx context.Context, q dbQuerier, scope binlogFilte
 			)
 		}
 		for _, db := range scope.databases {
-			if !containsFold(doList, db) {
+			if !containsUnderRule(rule, doList, db) {
 				return sluicecode.Wrap(
 					sluicecode.CodeCDCBinlogDBFiltered,
 					binlogDBFilterRemedyHint,
 					fmt.Errorf(
-						"mysql: cdc: synced database %q is not in the source's --binlog-do-db list (%s): its "+
-							"writes are applied but never written to the binlog, so the cold copy would complete "+
-							"and the live CDC tail would be silently empty for it — the stream stays green while "+
-							"the target freezes at the snapshot (ground-truthed on real mysql:8.0, 2026-08-26). "+
-							"The filters are mysqld startup options: remove --binlog-do-db and restart the "+
-							"server, or take %q out of the sync's scope. Then re-run",
-						db, strings.Join(doList, ","), db,
+						"mysql: cdc: synced database %q is not in the source's --binlog-do-db list (%s) under the "+
+							"server's own name comparison (%s): its writes are applied but never written to the "+
+							"binlog, so the cold copy would complete and the live CDC tail would be silently empty "+
+							"for it — the stream stays green while the target freezes at the snapshot "+
+							"(ground-truthed on real mysql:8.0, 2026-08-26; the case rule on real MySQL and "+
+							"MariaDB, 2026-09-09). The filters are mysqld startup options: remove --binlog-do-db "+
+							"and restart the server, or take %q out of the sync's scope. Then re-run",
+						db, strings.Join(doList, ","), rule.describe(), db,
 					),
 				)
 			}
@@ -162,24 +253,51 @@ func preflightBinlogDBFilter(ctx context.Context, q dbQuerier, scope binlogFilte
 		return nil
 	}
 
-	for _, db := range ignoreList {
-		if scope.admits(db) {
+	for _, entry := range ignoreList {
+		if db, ok := scope.admits(rule, entry); ok {
 			return sluicecode.Wrap(
 				sluicecode.CodeCDCBinlogDBFiltered,
 				binlogDBFilterRemedyHint,
 				fmt.Errorf(
-					"mysql: cdc: synced database %q is in the source's --binlog-ignore-db list (%s): its writes "+
-						"are applied but never written to the binlog, so the cold copy would complete and the "+
-						"live CDC tail would be silently empty for it — the stream stays green while the target "+
-						"freezes at the snapshot (ground-truthed on real mysql:8.0, 2026-08-26). The filters are "+
-						"mysqld startup options: remove --binlog-ignore-db and restart the server, or take %q "+
-						"out of the sync's scope. Then re-run",
-					db, strings.Join(ignoreList, ","), db,
+					"mysql: cdc: synced database %q is in the source's --binlog-ignore-db list (%s) under the "+
+						"server's own name comparison (%s): its writes are applied but never written to the "+
+						"binlog, so the cold copy would complete and the live CDC tail would be silently empty "+
+						"for it — the stream stays green while the target freezes at the snapshot "+
+						"(ground-truthed on real mysql:8.0, 2026-08-26; the case rule on real MySQL and "+
+						"MariaDB, 2026-09-09). The filters are mysqld startup options: remove "+
+						"--binlog-ignore-db and restart the server, or take %q out of the sync's scope. "+
+						"Then re-run",
+					db, strings.Join(ignoreList, ","), rule.describe(), db,
 				),
 			)
 		}
 	}
 	return nil
+}
+
+// describe names the rule in the refusal so an operator reading
+// "`SOURCE_DB` is not in the list (SOURCE_DB)" can see WHY two spellings
+// that look alike did not match.
+func (r binlogFilterCaseRule) describe() string {
+	switch {
+	case r.lct == 0:
+		return fmt.Sprintf("byte-exact, lower_case_table_names=%d", r.lct)
+	case r.mariadb:
+		return fmt.Sprintf("MariaDB: entry as typed against the stored lowercase name, lower_case_table_names=%d", r.lct)
+	default:
+		return fmt.Sprintf("case-insensitive, lower_case_table_names=%d", r.lct)
+	}
+}
+
+// containsUnderRule reports whether list contains db under the server's
+// equality.
+func containsUnderRule(rule binlogFilterCaseRule, list []string, db string) bool {
+	for _, entry := range list {
+		if rule.match(entry, db) {
+			return true
+		}
+	}
+	return false
 }
 
 // readBinlogDBFilters scans the master-status row (whichever of the
@@ -273,14 +391,4 @@ func splitDBList(s string) []string {
 		}
 	}
 	return out
-}
-
-// containsFold reports whether list contains s case-insensitively.
-func containsFold(list []string, s string) bool {
-	for _, v := range list {
-		if strings.EqualFold(v, s) {
-			return true
-		}
-	}
-	return false
 }

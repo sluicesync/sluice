@@ -43,6 +43,16 @@ import (
 // can't host them. Boot retry schedule mirrors startMySQLRowImageForCDC.
 func startMySQLM2Preflight(t *testing.T, extraArgs ...string) (dsn string, cleanup func()) {
 	t.Helper()
+	return startMySQLM2PreflightImage(t, sharedMySQLImage, extraArgs...)
+}
+
+// startMySQLM2PreflightImage is startMySQLM2Preflight on a caller-chosen
+// image. The pre-baked image ships a data directory already initialised
+// at lower_case_table_names=0, and MySQL 8 refuses to boot it under any
+// other value (MY-011087) — so a cell that needs a FOLDING server must
+// pay the upstream image's cold init. Say which in the caller's name.
+func startMySQLM2PreflightImage(t *testing.T, image string, extraArgs ...string) (dsn string, cleanup func()) {
+	t.Helper()
 	testcontainers.SkipIfProviderIsNotHealthy(t)
 
 	cmd := append([]string{
@@ -61,7 +71,7 @@ func startMySQLM2Preflight(t *testing.T, extraArgs ...string) (dsn string, clean
 		ctx, cancel := context.WithTimeout(context.Background(), sharedMySQLBootTimeout)
 		c, err := mysqltc.Run(
 			ctx,
-			sharedMySQLImage,
+			image,
 			mysqltc.WithDatabase("source_db"),
 			mysqltc.WithUsername("root"),
 			mysqltc.WithPassword("rootpw"),

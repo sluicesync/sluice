@@ -4,6 +4,10 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Fixed
+
+**A case-mismatched `--binlog-do-db` no longer passes the binlog-filter door on a case-sensitive MySQL or MariaDB source** (`SLUICE-E-CDC-BINLOG-DB-FILTERED`, present since v0.132.0). The door compared filter entries to synced database names case-insensitively on every server. On the Linux default (`lower_case_table_names=0`) the server compares them byte-exactly, so `--binlog-do-db=T` with database `t` passed the door while the server logged nothing for `t`: the cold copy completed, the stream entered CDC and heartbeated green, and every later write stayed on the source at exit 0. The comparison is now the server's own rule, read at preflight and measured per engine on real servers: MySQL follows `lower_case_table_names`; MariaDB compares the entry as typed against the stored name at every setting, so a mixed-case MariaDB entry matches nothing. Both arms use one function, the refusal names the rule it compared under, and the same change stops the door over-refusing a case-mismatched `--binlog-ignore-db` that a case-sensitive server does not apply. The startup-grace WARN's hint now names binlog filters. Found by the 2026-09-09 blind audit (RC-1), fixed with real-server pins whose expected values come from `SHOW BINLOG EVENTS`, not from the rule table.
+
 ## [0.148.0] - 2026-09-08
 
 sluice's first outside migration — an AWS → GCP `us-east4` move of a PlanetScale MySQL database — succeeded, and the operator sent back a candid field report. Most of this release is their findings, and the headline is that a running `sync` cold start was indistinguishable from a dead one for hours.
