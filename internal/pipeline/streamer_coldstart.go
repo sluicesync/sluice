@@ -237,6 +237,7 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	// and Abandon would wrongly drop a slot carrying prior progress.
 	if pv, ok := s.Source.(publicationPostSlotVerifier); ok && !resumingCopy && len(publicationTables) > 0 {
 		if err := pv.VerifyPublicationScope(ctx, s.SourceDSN, publicationTables); err != nil {
+			//sluice:abandon-on-purpose PRE-COPY refusal — nothing is on the target yet, so the just-created slot is debris.
 			_ = stream.Abandon()
 			return nil, stop, fmt.Errorf("pipeline: post-slot publication re-verification: %w", err)
 		}
@@ -257,6 +258,7 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 		// exactly as the publication re-verification above does (Bug 177 —
 		// refuse before the anchor so the slot is dropped, not orphaned).
 		if err := s.strictFloatRefusal(floatPlan); err != nil {
+			//sluice:abandon-on-purpose PRE-COPY refusal — the reader is rejected before any row is copied.
 			_ = stream.Abandon()
 			return nil, stop, err
 		}
@@ -331,7 +333,8 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	// target column types the UPDATE binds against.
 	if floatCopyRounds && !s.NoFloatExactReread {
 		if err := s.repairColdStartFloats(ctx, floatPlan, schema); err != nil {
-			_ = stream.Abandon()
+			// Post-copy, so the same rule as the copy error above.
+			s.abandonUnlessStopped(ctx, stream, err)
 			return nil, stop, err
 		}
 	}
@@ -1161,7 +1164,10 @@ func (s *Streamer) coldStartRunCopy(ctx context.Context, schema, createSchema *i
 	if copyErr != nil {
 		migcore.CloseIf(rw)
 		migcore.CloseIf(sw)
-		_ = stream.Abandon()
+		// A STOP here is not a failure: the bulk copy may already have
+		// committed every row, and abandoning would drop the slot for a
+		// copy that succeeded (audit 2026-09-08).
+		s.abandonUnlessStopped(ctx, stream, copyErr)
 		return copyErr
 	}
 	// Item 112: prove any metadata-only-added FKs clean BEFORE closing sw and
@@ -1176,6 +1182,7 @@ func (s *Streamer) coldStartRunCopy(ctx context.Context, schema, createSchema *i
 	if fkErr := s.verifyUnvalidatedForeignKeys(ctx, sw, schema); fkErr != nil {
 		migcore.CloseIf(rw)
 		migcore.CloseIf(sw)
+		//sluice:abandon-on-purpose a PROVEN FK violation, not a stop — the target is wrong, so the slot IS debris.
 		_ = stream.Abandon()
 		return fkErr
 	}
