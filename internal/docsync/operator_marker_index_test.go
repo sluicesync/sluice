@@ -32,13 +32,42 @@ import (
 // argument for a gate rather than a resolution to remember. A convention
 // nothing checks decays at exactly the rate people are busy.
 //
-// # How the universe is derived
+// # How the universe is derived, and the half that was missing
 //
-// From the AST: every `const` whose NAME ends in `Marker` and whose VALUE is
-// an ALL-CAPS-HYPHENATED string literal. That is the codebase's own
-// convention, so the gate cannot drift out of step with a hand-kept list — a
-// new marker is in scope the moment it is declared, without anyone
-// remembering to register it.
+// From the AST, in two passes over every non-test file under `internal/`
+// and `cmd/`:
+//
+//  1. every `const` whose NAME ends in `Marker` and whose VALUE is an
+//     ALL-CAPS-HYPHENATED string literal; and
+//  2. every ALL-CAPS-HYPHENATED token IMMEDIATELY FOLLOWED BY A COLON
+//     inside any string literal — the codebase's `component: MARKER:
+//     message` log convention.
+//
+// Pass 2 is audit 2026-09-09 A0909-TCI-H-1, and the story is the one this file
+// already tells about itself. The gate shipped with pass 1 only and its
+// doc-comment said "a new marker is in scope the moment it is declared",
+// which is true and was not the property that mattered: a marker written
+// straight into the log call, never declared as a const, is in scope
+// never. Two were —`CHANGE-LOG-PAGE-UNORDERED` (sqlite-trigger's poll
+// refusal, itself the durable fix for a CRITICAL) and
+// `CAPTURE-FUNCTION-PUBLIC-EXECUTE` — and both had zero
+// `docs/operator/` hits while this test was green. Worse, the finding
+// that a gate existed was recorded in the audit backlog as evidence the
+// class was CLOSED. A gate whose universe is narrower than its name is
+// what stops the next person from looking.
+//
+// Two shapes are excluded from pass 2, both because they are not log
+// markers rather than because they are inconvenient:
+//
+//   - struct TAGS. A kong `help:"…"` is flag documentation, not a log
+//     line, and one of them contains the phrase "handled IN-LANE:".
+//   - `ADR-nnnn` references, which appear inside SQL comments embedded
+//     in query literals.
+//
+// It reaches only markers a Go string literal spells out verbatim. A
+// marker assembled at runtime from parts, or one that never precedes a
+// colon, is outside it — say so if you write one, rather than assuming
+// this catches everything.
 //
 // The check is presence in `docs/operator/`, deliberately not a specific file:
 // where a marker is explained is an editorial decision, and pinning it would
@@ -56,50 +85,91 @@ func TestOperatorMarkersHaveADocHome(t *testing.T) {
 	}
 
 	markerLiteral := regexp.MustCompile(`^[A-Z][A-Z0-9]*(-[A-Z0-9]+)+$`)
-	found := map[string]string{} // marker -> declaring file
+	// Pass 2's shape: an ALL-CAPS-HYPHENATED token followed by a colon, at
+	// a word boundary inside a message. ADR references match that shape and
+	// do occur in this exact position inside SQL comments embedded in query
+	// literals, so adrRef filters them explicitly.
+	inlineMarker := regexp.MustCompile(`(?:^|[ (\[])([A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+):(?: |$)`)
+	adrRef := regexp.MustCompile(`^ADR-\d+$`)
 
-	err := filepath.Walk(filepath.Join(root, "internal"), func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		if info.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
-			return nil
-		}
-		fset := token.NewFileSet()
-		f, perr := parser.ParseFile(fset, path, nil, 0)
-		if perr != nil {
-			// Deliberately NOT skipped. Build tags do not prevent parsing, so a
-			// parse error means genuinely malformed Go — and a marker declared
-			// inside a file this walk silently skipped would be invisible to the
-			// gate, which is the exact failure it exists to prevent.
-			return perr
-		}
-		rel, _ := filepath.Rel(root, path)
-		ast.Inspect(f, func(n ast.Node) bool {
-			vs, ok := n.(*ast.ValueSpec)
-			if !ok {
-				return true
+	found := map[string]string{}       // marker -> declaring file
+	inlineFound := map[string]string{} // marker -> emitting file (pass 2 only, for the floor)
+
+	walk := func(sub string) error {
+		return filepath.Walk(filepath.Join(root, sub), func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
 			}
-			for i, name := range vs.Names {
-				if !strings.HasSuffix(name.Name, "Marker") || i >= len(vs.Values) {
-					continue
+			if info.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+				return nil
+			}
+			fset := token.NewFileSet()
+			f, perr := parser.ParseFile(fset, path, nil, 0)
+			if perr != nil {
+				// Deliberately NOT skipped. Build tags do not prevent parsing, so a
+				// parse error means genuinely malformed Go — and a marker declared
+				// inside a file this walk silently skipped would be invisible to the
+				// gate, which is the exact failure it exists to prevent.
+				return perr
+			}
+			rel, _ := filepath.Rel(root, path)
+
+			// Struct tags are flag/serialization documentation, not log
+			// lines. Collected first so pass 2 can skip them by identity.
+			tags := map[*ast.BasicLit]bool{}
+			ast.Inspect(f, func(n ast.Node) bool {
+				if fld, ok := n.(*ast.Field); ok && fld.Tag != nil {
+					tags[fld.Tag] = true
 				}
-				lit, ok := vs.Values[i].(*ast.BasicLit)
-				if !ok || lit.Kind != token.STRING {
-					continue
+				return true
+			})
+
+			ast.Inspect(f, func(n ast.Node) bool {
+				// Pass 1: const …Marker = "ALL-CAPS-HYPHENATED".
+				if vs, ok := n.(*ast.ValueSpec); ok {
+					for i, name := range vs.Names {
+						if !strings.HasSuffix(name.Name, "Marker") || i >= len(vs.Values) {
+							continue
+						}
+						lit, ok := vs.Values[i].(*ast.BasicLit)
+						if !ok || lit.Kind != token.STRING {
+							continue
+						}
+						val, uerr := strconv.Unquote(lit.Value)
+						if uerr != nil || !markerLiteral.MatchString(val) {
+							continue
+						}
+						found[val] = rel
+					}
+					return true
+				}
+				// Pass 2: an inline `MARKER: ` inside any string literal.
+				lit, ok := n.(*ast.BasicLit)
+				if !ok || lit.Kind != token.STRING || tags[lit] {
+					return true
 				}
 				val, uerr := strconv.Unquote(lit.Value)
-				if uerr != nil || !markerLiteral.MatchString(val) {
-					continue
+				if uerr != nil {
+					return true
 				}
-				found[val] = rel
-			}
-			return true
+				for _, m := range inlineMarker.FindAllStringSubmatch(val, -1) {
+					if adrRef.MatchString(m[1]) {
+						continue
+					}
+					if _, already := found[m[1]]; !already {
+						found[m[1]] = rel
+					}
+					inlineFound[m[1]] = rel
+				}
+				return true
+			})
+			return nil
 		})
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("walk internal/: %v", err)
+	}
+	for _, sub := range []string{"internal", "cmd"} {
+		if err := walk(sub); err != nil {
+			t.Fatalf("walk %s/: %v", sub, err)
+		}
 	}
 
 	// Anti-vacuity floor. If the AST walk stops finding markers — a renamed
@@ -109,6 +179,20 @@ func TestOperatorMarkersHaveADocHome(t *testing.T) {
 		t.Fatalf("the walk found only %d marker constants (%v). The convention is a `const …Marker = "+
 			"\"ALL-CAPS-HYPHENATED\"`; if it changed, this gate is checking nothing and needs "+
 			"re-pointing rather than deleting.", len(found), found)
+	}
+	// Pass 2 needs its OWN floor. Without one, a change that broke only the
+	// inline scan would leave the combined count above 8 on the strength of
+	// pass 1's constants alone, and the gate would go back to exactly the
+	// blind spot A0909-TCI-H-1 found while still reporting green. Four inline
+	// markers exist today: CAPTURE-FUNCTION-PUBLIC-EXECUTE,
+	// CAPTURE-OUT-OF-SCOPE, CHANGE-LOG-PAGE-UNORDERED and
+	// TABLE-FILTER-PATTERN-UNMATCHED (UNSELECTED-NAMESPACE-EXPOSURE is
+	// spelled both ways and lands here too).
+	if len(inlineFound) < 4 {
+		t.Fatalf("the inline-literal pass found only %d marker(s) (%v); at least 4 are written straight "+
+			"into log calls today. That pass is what audit 2026-09-09 A0909-TCI-H-1 added — if it is finding "+
+			"nothing, re-point it rather than lowering this, because the const-only universe is the "+
+			"blind spot the finding was about.", len(inlineFound), inlineFound)
 	}
 
 	docs, derr := operatorDocCorpus(t, root)

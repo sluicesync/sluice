@@ -306,6 +306,21 @@ table with a non-PK UNIQUE constraint. Mitigate by running writers with
 prefer the latter. Details in
 [ADR-0135](../adr/adr-0135-sqlite-trigger-cdc.md).
 
+**`CHANGE-LOG-PAGE-UNORDERED` (refusal, at every poll).** The reader
+refuses a page of `sluice_change_log` whose rows do not arrive in
+strictly ascending `id` order, naming the two ids it saw out of
+sequence. This is a bug in the poll query or the transport, never in
+your data, and there is nothing to repair on your side — report it. The
+reason it refuses rather than carrying on is that the resume watermark
+is the page's MAXIMUM id: an out-of-order page advances that watermark
+past rows the poll never returned, and a keyset resume then starts above
+them, so those rows are captured, undelivered, and unreachable. That is
+not hypothetical. It is what Bug 266 was, on the `d1-trigger` lane,
+where an output alias made SQLite sort the page lexicographically; the
+query is fixed and pinned, but the pin grades the QUERY, while this
+check grades what the pump was actually handed. A future transport or a
+server-side ordering change becomes a loud stop instead of missing rows.
+
 **Recovering from an invalid-UTF-8 / lone-surrogate halt (the local
 `sqlite-trigger` lane).** The reader refuses loudly (batch withheld
 atomically, watermark unmoved — nothing is skipped or duplicated) when a
@@ -410,6 +425,23 @@ sluice trigger setup --dsn=<source-dsn> --tables=<same tables as before>
 Add `--capture-replicated-writes` if that is your recorded posture. The re-run preserves the change log, its resume watermark and the consumer registry, so a running sync resumes where it left off; do it at your next convenient window. Until then every `postgres-trigger` stream open logs an `INSECURE-CAPTURE-FUNCTION` warning naming the affected function and this remedy. It is a warning rather than a refusal deliberately: the same check runs on every warm resume, so refusing would turn a binary upgrade into an outage on every running sync. Sources on the `--allow-polled-fingerprint` tier never had the DDL capture function installed and are not affected.
 
 **`PARTITIONED-PARENT-CAPTURE` (warn, at `trigger setup`).** One of the tables you named is a declaratively **partitioned parent**. PostgreSQL clones the row trigger onto every partition, and a cloned trigger records the *partition's* name (`events_us`), not the parent's — because it fires on the partition and `TG_TABLE_NAME` is the relation it fired on. `sync start` and `migrate` refuse a partitioned source table at preflight, so this install is not usable for the parent as it stands, and that refusal names the recovery in full. The route that works is to exclude the parent (`--exclude-table`) and let the partitions copy as ordinary tables — and the clone names are exactly right for that, since the partitions are then what is in scope. Setup warns rather than refusing because preparing that route is legitimate; it is telling you at setup time what you would otherwise discover at `sync start`.
+
+**`CAPTURE-FUNCTION-PUBLIC-EXECUTE` (warn, at every stream open) is
+cleared by the same re-run.** It fires when the source's
+`sluice_capture*` functions are still EXECUTable by `PUBLIC`, and names
+which ones. Those functions are `SECURITY DEFINER`, so while PUBLIC can
+call them, any source role that can create a table and a trigger could
+attach one to a table of its own named after a synced table and have its
+rows applied to your target. Re-running `sluice trigger setup` revokes
+EXECUTE from PUBLIC and grants it back to the setup role. **A mitigation
+is already in place, which is why this is a warning and not a
+refusal:** the reader drops every captured row whose schema is not the
+one this stream is synchronising, logging `CAPTURE-OUT-OF-SCOPE`, so
+rows written that way are never applied. Treat the warning as
+defence-in-depth worth closing at your next window, not as an active
+breach. If the advisory's own catalog query fails, sluice logs at DEBUG
+and says nothing further, so absence of this warning is not by itself
+proof the grant was revoked; `\df+ sluice_capture*` in psql is.
 
 **The same re-run is also what clears a `STALE-CAPTURE-FUNCTION` warning.** From v0.137 every stream open compares the capture functions the source actually has — their body, their `SET` pins and their `SECURITY DEFINER` flag, read from `pg_proc` — against the definitions this binary renders. An install made by an older sluice keeps capturing through its OLD function body until setup re-runs, and that is not cosmetic: before the `bytea_output` pin every captured bytea is corrupted on the way to a MySQL or SQLite target, and before the `extra_float_digits` pin every captured float is silently rounded when the writing application's session setting is lower. The warning names the functions and this remedy; it is a warning, not a refusal, for the same reason as the one above. Two shapes DO refuse, because no sluice version could have produced them: a capture function whose body no longer writes into the change log at all (it would capture nothing while every trigger still looks correct), and — on installs created from v0.137 onward, which record what setup installed — a definition that was changed after setup installed it. If you edit a `--dry-run` plan's function bodies by hand, expect that second refusal; re-running setup restores the shipped definition.
 
