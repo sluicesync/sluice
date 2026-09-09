@@ -109,6 +109,20 @@ type parallelBulkCopyDeps struct {
 	// single-reader path regardless of parallelism.
 	minRows int64
 
+	// targetSchema is the operator's `--target-schema` namespace
+	// override (ADR-0031), threaded verbatim from [Migrator.TargetSchema]
+	// / [Streamer.TargetSchema] and applied to every chunk writer
+	// [openOneChunkConn] mints. Empty means "use the DSN's schema",
+	// which is the default and a no-op.
+	//
+	// It is a FIELD rather than something the opener reads off an
+	// orchestrator because this struct is the whole contract between the
+	// two callers and the shared chunk cores; anything the primary writer
+	// is configured with and this struct cannot carry is a setting the
+	// parallel lanes silently drop. That is exactly how audit
+	// 2026-09-09 P1 happened — see [openOneChunkConn].
+	targetSchema string
+
 	// maxBufferBytes is the per-chunk soft byte cap on writer batch
 	// accumulation (ADR-0028). Threaded through to each chunk's
 	// writer via [ir.MaxBufferBytesSetter] when the engine
@@ -811,6 +825,24 @@ func openOneChunkConn(ctx context.Context, deps *parallelBulkCopyDeps) (ir.RowRe
 		migcore.CloseIf(rdr)
 		return nil, nil, err
 	}
+	// ADR-0031: the operator's `--target-schema`. This must be the FIRST
+	// thing applied to a chunk writer, because it decides which relation
+	// every subsequent COPY/INSERT names — the PG writer qualifies every
+	// statement with its own schema field
+	// (buildRawCopyFromStmt / buildBatchInsert), so a writer that never
+	// heard the override addresses `public`.
+	//
+	// Audit 2026-09-09 P1: it was missing here while all seven other
+	// OpenRowWriter sites in this package applied it, so on a PG target
+	// every table above the parallel threshold (80,000/table-count, floor
+	// 10,000 — i.e. most real tables) had chunk 0 land in the named schema
+	// and every peer chunk address `public`. Loud when `public.<t>` is
+	// absent or its keys collide, and SILENT when it exists and accepts
+	// the rows: the named schema then holds one chunk, `public` holds the
+	// rest, exit 0, and CDC afterwards applies against the qualified
+	// table. TestOpenRowWriterSitesApplyTargetSchema is the roster that
+	// keeps the eighth site from going missing again.
+	migcore.ApplyTargetSchema(wr, deps.targetSchema)
 	migcore.ApplyMaxBufferBytes(wr, deps.maxBufferBytes)
 	// ADR-0110: share the run's coordinated grow-pause gate with this
 	// chunk/table writer so every cold-copy lane quiesces together for a

@@ -638,9 +638,13 @@ func (m *Migrator) phaseBuildCopyDeps(ctx context.Context, schema *ir.Schema, rr
 		targetDSN: m.TargetDSN,
 		// ADR-0173 Phase 1: every parallel chunk/table reader pushes the
 		// operator's --where predicates down (openChunkReader applies them).
-		rowFilters:     m.RowFilters,
-		parallelism:    withinParallelism,
-		minRows:        migcore.ResolveBulkParallelMinRows(m.BulkParallelMinRows, len(schema.Tables)),
+		rowFilters:  m.RowFilters,
+		parallelism: withinParallelism,
+		minRows:     migcore.ResolveBulkParallelMinRows(m.BulkParallelMinRows, len(schema.Tables)),
+		// ADR-0031: the same namespace override the PRIMARY writer got at
+		// migrate.go's OpenRowWriter. Every chunk writer must address the
+		// same relation the primary one does (audit 2026-09-09 P1).
+		targetSchema:   m.TargetSchema,
 		maxBufferBytes: m.MaxBufferBytes,
 		// ADR-0043 gate (3): --force-cold-start skipped the Bug 9
 		// preflight, so the target may hold rows; the fast non-upsert

@@ -37,6 +37,26 @@ import (
 // TestMigrate_PG_TargetSchema runs a PG → PG migration with
 // --target-schema=customer_svc and verifies the target tables land
 // in the named schema, public stays empty, and rows are present.
+//
+// # The chunked table is load-bearing, not filler (audit 2026-09-09 P1)
+//
+// This test's doc-comment promised "public stays empty" for years while
+// its fixture was two INSERT rows, which never crosses the within-table
+// parallel threshold — so the assertion only ever graded the PRIMARY
+// writer. [openOneChunkConn], the opener behind all three parallel chunk
+// cores, was not applying `--target-schema` at all, and no test could
+// see it: on a real schema the threshold is 80,000 divided by the table
+// count with a floor of 10,000, so most real tables took the unreached
+// path while every fixture here took the reached one. That is the
+// 2026-07-28 self-referential-fixture shape — a gate whose data cannot
+// reach the code it claims to cover.
+//
+// `orders` therefore exists to be chunked. `BulkParallelMinRows: 1000`
+// is honoured verbatim by [migcore.ResolveBulkParallelMinRows], and
+// 2,500 rows across a parallelism of 4 puts several peer chunks on the
+// wire. Do not shrink it below the threshold or raise the threshold
+// above it — the public-is-empty assertion silently stops covering the
+// chunk path if you do, which is precisely how P1 shipped.
 func TestMigrate_PG_TargetSchema(t *testing.T) {
 	sourceDSN, targetDSN, cleanup := startPostgres(t)
 	defer cleanup()
@@ -50,6 +70,13 @@ func TestMigrate_PG_TargetSchema(t *testing.T) {
 		INSERT INTO customers (email, plan) VALUES
 			('alice@example.com', 'pro'),
 			('bob@example.com',   'free');
+
+		CREATE TABLE orders (
+			id     BIGINT PRIMARY KEY,
+			note   TEXT NOT NULL
+		);
+		INSERT INTO orders (id, note)
+			SELECT g, 'order-' || g FROM generate_series(1, 2500) AS g;
 	`
 	applyPGDDL(t, sourceDSN, seedDDL)
 
@@ -64,6 +91,11 @@ func TestMigrate_PG_TargetSchema(t *testing.T) {
 		SourceDSN:    sourceDSN,
 		TargetDSN:    targetDSN,
 		TargetSchema: "customer_svc",
+		// Force `orders` onto the within-table parallel path so the
+		// public-is-empty assertion below grades the CHUNK writers and not
+		// only the primary one. See this test's doc-comment.
+		BulkParallelMinRows: 1000,
+		BulkParallelism:     4,
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -87,17 +119,36 @@ func TestMigrate_PG_TargetSchema(t *testing.T) {
 		t.Errorf("customer_svc.customers row count = %d; want 2", count)
 	}
 
-	// public.customers must NOT exist.
-	var publicExists bool
-	if err := db.QueryRowContext(ctx, `
-		SELECT EXISTS (
-			SELECT 1 FROM information_schema.tables
-			WHERE table_schema = 'public' AND table_name = 'customers'
-		)`).Scan(&publicExists); err != nil {
-		t.Fatalf("query public schema: %v", err)
+	// The CHUNKED table is the audit-2026-09-09-P1 assertion. Every row
+	// must be in the named schema: a chunk writer that never heard
+	// `--target-schema` addresses `public`, so under the defect this
+	// count came back at one chunk's worth (or the run died on a missing
+	// `public.orders`, which is the same defect wearing its loud face).
+	var orderCount int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM customer_svc.orders`).Scan(&orderCount); err != nil {
+		t.Fatalf("query customer_svc.orders: %v", err)
 	}
-	if publicExists {
-		t.Errorf("public.customers exists; want it to not exist (target-schema spillover)")
+	if orderCount != 2500 {
+		t.Errorf("customer_svc.orders row count = %d; want 2500. A shortfall here means the parallel "+
+			"chunk writers wrote somewhere else — audit 2026-09-09 P1, openOneChunkConn not applying "+
+			"--target-schema", orderCount)
+	}
+
+	// Neither table may exist in public. `customers` covers the primary
+	// writer; `orders` covers the chunk writers, and it is the one that
+	// was actually broken.
+	for _, table := range []string{"customers", "orders"} {
+		var publicExists bool
+		if err := db.QueryRowContext(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM information_schema.tables
+				WHERE table_schema = 'public' AND table_name = $1
+			)`, table).Scan(&publicExists); err != nil {
+			t.Fatalf("query public schema for %s: %v", table, err)
+		}
+		if publicExists {
+			t.Errorf("public.%s exists; want it to not exist (target-schema spillover)", table)
+		}
 	}
 
 	// Schema customer_svc must exist.

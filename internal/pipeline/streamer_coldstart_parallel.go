@@ -320,6 +320,7 @@ func (s *Streamer) runColdStartParallel(
 		targetDSN:          s.TargetDSN,
 		parallelism:        withinParallelism,
 		minRows:            migcore.ResolveBulkParallelMinRows(s.BulkParallelMinRows, len(schema.Tables)),
+		targetSchema:       s.TargetSchema, // ADR-0031, audit 2026-09-09 P1 — see openOneChunkConn
 		maxBufferBytes:     s.MaxBufferBytes,
 		forceColdStart:     false, // fresh cold-start: the fast non-upsert loader is safe (Bug 9 preflight ran)
 		rawCopyOK:          rawCopyOK,
