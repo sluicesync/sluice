@@ -21,6 +21,8 @@ import (
 	"strconv"
 	"strings"
 
+	mysql "github.com/go-sql-driver/mysql"
+
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
@@ -343,12 +345,36 @@ func parseMariaDBVersion(version string) (major, minor int, ok bool) {
 // path a probe failure is swallowed (a diagnostics aid must not add a
 // failure mode); on the mariadb path it propagates — if VERSION()
 // fails the connection is unusable anyway.
-func (e Engine) checkServerFlavor(ctx context.Context, db *sql.DB) error {
+// cfg identifies the SERVER for the per-(server, flavor) memo (see
+// flavor_memo.go): the probe runs at every connection-opening door, and
+// the row doors open per worker on the parallel copy path, so the answer
+// is reached once per server rather than once per pool.
+func (e Engine) checkServerFlavor(ctx context.Context, db *sql.DB, cfg *mysql.Config) error {
 	if e.Flavor.usesVStream() {
 		return nil
 	}
+	key := ""
+	if cfg != nil {
+		key = flavorMemoKey(cfg, e.Flavor)
+		if ok, verdict := lookupFlavorVerdict(key); ok {
+			return verdict
+		}
+	}
 	var version string
 	err := db.QueryRowContext(ctx, "SELECT VERSION()").Scan(&version)
+	reached, verdict := e.flavorVerdict(version, err)
+	if key != "" && reached {
+		rememberFlavorVerdict(key, verdict)
+	}
+	return verdict
+}
+
+// flavorVerdict is the decision itself, split out so the memo above
+// caches a verdict that was actually REACHED. reached=false means the
+// probe could not run (mariadb arm) — not an answer, and never cached,
+// so one transient read cannot make a wrong verdict sticky for the
+// life of the process.
+func (e Engine) flavorVerdict(version string, err error) (reached bool, verdict error) {
 	if e.Flavor != FlavorMariaDB {
 		if err == nil {
 			// Vitess/PlanetScale under a non-VStream flavor REFUSES
@@ -362,18 +388,18 @@ func (e Engine) checkServerFlavor(ctx context.Context, db *sql.DB) error {
 			// arm closes the self-hosted-Vitess sibling the
 			// 2026-08-14 ingestr-survey verification found unprobed.
 			if rerr := refuseVitessUnderNonVStreamFlavor(version); rerr != nil {
-				return rerr
+				return true, rerr
 			}
 			warnMariaDBUnderMySQLDriver(version)
 		}
-		return nil
+		return true, nil
 	}
 	if err != nil {
-		return fmt.Errorf("mariadb: probe server version: %w", err)
+		return false, fmt.Errorf("mariadb: probe server version: %w", err)
 	}
 	major, minor, isMariaDB := parseMariaDBVersion(version)
 	if !isMariaDB {
-		return sluicecode.Wrap(
+		return true, sluicecode.Wrap(
 			sluicecode.CodeDriverHostMismatch,
 			"use --source-driver/--target-driver mysql for a MySQL-family server",
 			fmt.Errorf(
@@ -394,7 +420,7 @@ func (e Engine) checkServerFlavor(ctx context.Context, db *sql.DB) error {
 			slog.String("server_version", version),
 		)
 	}
-	return nil
+	return true, nil
 }
 
 // isVitessServerVersion reports whether a VERSION() string fingerprints

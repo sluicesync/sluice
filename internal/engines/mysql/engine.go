@@ -96,7 +96,7 @@ func (e Engine) OpenSchemaReader(ctx context.Context, dsn string) (ir.SchemaRead
 	// REFUSES a non-MariaDB server (its defaults shim would mis-read
 	// MySQL conventions), the vanilla flavor WARNs when the server is
 	// MariaDB (steering to --source-driver/--target-driver mariadb).
-	if err := e.checkServerFlavor(ctx, db); err != nil {
+	if err := e.checkServerFlavor(ctx, db, cfg); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -120,7 +120,7 @@ func (e Engine) OpenSchemaWriter(ctx context.Context, dsn string) (ir.SchemaWrit
 	// guard as OpenSchemaReader — refuse a non-MariaDB server under the
 	// mariadb flavor, WARN toward the mariadb driver when a plain-mysql
 	// target fingerprints as MariaDB.
-	if err := e.checkServerFlavor(ctx, db); err != nil {
+	if err := e.checkServerFlavor(ctx, db, cfg); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -200,6 +200,15 @@ func (e Engine) OpenRowReader(ctx context.Context, dsn string) (ir.RowReader, er
 	if err != nil {
 		return nil, err
 	}
+	// Every connection-opening door runs the flavor probe (Bug 280); this
+	// one MOST of all, because the refusal it carries is about full scans
+	// silently truncating at Vitess's OLTP row cap — the harm happens
+	// HERE, at the reader that performs them. Memoised per (server,
+	// flavor): this door opens per worker on the parallel copy path.
+	if ferr := e.checkServerFlavor(ctx, db, cfg); ferr != nil {
+		_ = db.Close()
+		return nil, ferr
+	}
 	// Vitess/PlanetScale (CDCVStream flavors): a no-PK source table can't be
 	// PK-chunked, so it is read as ONE unbounded streaming SELECT
 	// ([RowReader.ReadRows]) — which vtgate's default OLTP workload silently
@@ -236,6 +245,16 @@ func (e Engine) OpenRowWriter(ctx context.Context, dsn string) (ir.RowWriter, er
 	}
 	db, err := openDB(ctx, cfg, e.opts.sqlMode)
 	if err != nil {
+		return nil, err
+	}
+	// The probe runs at EVERY connection-opening door (Bug 280): its two
+	// payloads are a driver steer and a silent-loss refusal, and leaving
+	// them at a subset made their coverage depend on which door a given
+	// path happened to open first — an assumption that was measured
+	// failing. Memoised per (server, flavor), so the doors that open per
+	// worker pay one probe per server rather than one per pool.
+	if err := e.checkServerFlavor(ctx, db, cfg); err != nil {
+		_ = db.Close()
 		return nil, err
 	}
 	return &RowWriter{
@@ -409,6 +428,28 @@ func (e Engine) OpenMigrationStateStore(ctx context.Context, dsn string) (ir.Mig
 	if err != nil {
 		return nil, err
 	}
+	// The flavor steer belongs HERE, not only at the schema doors (Bug
+	// 280, found by the v0.148.2 regression cycle). This store's SQL is
+	// flavor-specific — [Flavor.upsertSpelling] renders MySQL 8.0.20's
+	// row-alias `AS new ON DUPLICATE KEY UPDATE`, which MariaDB rejects
+	// — and the migrate pipeline opens this store at phase 1.75, BEFORE
+	// the schema reader and writer where checkServerFlavor used to run
+	// alone. So a MariaDB target addressed with `--target-driver mysql`
+	// died on `Error 1064 … near 'AS new …'`, sluice's own SQL, while
+	// the WARN that names the right driver never fired: the diagnosis
+	// was pre-empted by its own symptom. Running the probe at this door
+	// costs one SELECT VERSION() per run and puts the steer first.
+	//
+	// This arm also carries the Vitess-under-vanilla-flavor REFUSAL,
+	// which is a silent-loss guard (OLTP workload truncates full scans
+	// at the row cap), so the same ordering fix moves that door earlier
+	// too rather than leaving it to whichever door happened to open
+	// first. TestFlavorDoorRoster_EveryConnectionOpenerIsClassified
+	// grades the remaining openers.
+	if err := e.checkServerFlavor(ctx, db, cfg); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	// Sharded-target door, the state-store arm (Bug 250, found by the
 	// v0.126.0 regression cycle): the migrate pipeline opens THIS store
 	// (phase 1.75) BEFORE the schema writer, and loadOrInitState
@@ -466,6 +507,16 @@ func (e Engine) OpenChangeApplier(ctx context.Context, dsn string) (ir.ChangeApp
 	cfg.Params["foreign_key_checks"] = "0"
 	db, err := openDB(ctx, cfg, e.opts.sqlMode)
 	if err != nil {
+		return nil, err
+	}
+	// The sync twin of the state-store door above (Bug 280's sibling,
+	// enumerated rather than assumed): this applier renders EVERY upsert
+	// in the flavor's spelling — see `upsert` below — so a MariaDB target
+	// addressed as mysql fails on sluice's own `AS new ON DUPLICATE KEY
+	// UPDATE` here exactly as migrate did, and this is the sync path's
+	// first door. Same one-probe cost, once per run.
+	if err := e.checkServerFlavor(ctx, db, cfg); err != nil {
+		_ = db.Close()
 		return nil, err
 	}
 	return &ChangeApplier{

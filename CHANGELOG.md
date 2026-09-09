@@ -4,6 +4,10 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Fixed
+
+**A MariaDB server addressed with the plain `mysql` driver now meets the WARN naming the right driver before it meets sluice's own SQL failing** (Bug 280, filed by the v0.148.2 regression cycle; present since at least v0.131.0). The flavor probe carries two things — a steer toward `--source-driver`/`--target-driver mariadb`, and a refusal of Vitess under a non-VStream flavor, which is a silent-loss guard because the vanilla flavor's full scans run without `set workload=olap` and Vitess truncates them at its OLTP row cap. It ran at exactly two of the engine's eight doors, the schema reader and writer, and its coverage rested on an unwritten assumption: that every path reaching data opens one of those first. `migrate` does not. It opens the migration-state store at phase 1.75, and that store renders its upsert in the flavor's spelling — MySQL 8.0.20's row alias, which MariaDB rejects — so the run died on `Error 1064 … near 'AS new ON DUPLICATE KEY UPDATE'`, sluice's own statement, with the steer never reached. The diagnosis was pre-empted by its own symptom. The probe now runs at every connection-opening door, memoised per server and flavor so the doors that open per worker pay one probe per server rather than one per pool, and a roster derived from the code requires each door to run it or say at the site why not.
+
 ## [0.148.2] - 2026-09-09
 
 ### Fixed
