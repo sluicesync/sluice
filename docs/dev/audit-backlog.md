@@ -69,7 +69,92 @@ Delta `a4fa5a71`..`217024f2` — 157 commits, 16 releases (v0.139.0 → v0.148.0
 - ~~**Bug 280 (LOW, LOUD, zero data loss — filed by the v0.148.2 regression cycle, root-caused before the grade was trusted):** a MariaDB target addressed with `--target-driver mysql` dies on `Error 1064 … near 'AS new ON DUPLICATE KEY UPDATE'` — sluice's own migrate-state SQL — while `warnMariaDBUnderMySQLDriver`, which exists to name the right driver, never fires. The cycle bisected eleven staged binaries (identical back to v0.131.0, so not a regression) and located it exactly: `checkServerFlavor` ran only at `OpenSchemaReader` and `OpenSchemaWriter`, and migrate opens `OpenMigrationStateStore` at phase 1.75, ahead of both.~~ **FIXED 2026-09-09.** The interesting half is what the cycle left unmeasured and named honestly: the same probe carries `refuseVitessUnderNonVStreamFlavor`, a SILENT-LOSS guard (Vitess's OLTP workload truncates the vanilla flavor's full scans at its row cap), so the same ordering question applied to a silent class. Enumerated rather than assumed: the probe now runs at ALL SIX connection-opening doors, including `OpenRowReader` — where that truncation actually happens — with the verdict memoised per (server, flavor) so the doors that open per worker on the parallel copy path pay one `SELECT VERSION()` per server, not one per pool (mirrors `lctMemo`, including its network-identity key and its no-credentials rule; a probe that could not RUN is never cached, so one transient read cannot make a wrong verdict sticky). Gates: `TestFlavorDoorRoster_EveryConnectionOpenerIsClassified` derives its universe from the AST — every `Open*` that calls `openDB` must call the probe or carry `flavor-door-exempt: <reason>` at the site — with floors of six doors and four probing; and on a real mariadb:11.4, `TestMariaDBUnderMySQLDriver_SteerPrecedesItsOwnSymptom` drives the two doors the pipelines open FIRST and requires the steer plus a working control table (the pair that was impossible before), that the memo says it once across three opens, and that the CORRECT driver is not steered. Mutation-run: removing the state-store probe reds the pin from its own assertion. **Named residual:** the roster's universe is `engine.go`'s `Open*` methods; a future door that opens a pool elsewhere in the package is outside it.
 - ~~**A0909-MYSQL-HIGH-1-POLICY (design call, OPEN):** should the VStream ERRANT-GTID arm also be terminal?~~ **DECIDED 2026-09-09: NO — leave it routing into the automatic re-copy. This reverses my own earlier recommendation, and the reversal is the point of writing it down.** I had said "terminal for consistency" and the operator approved that; checking the merits before implementing showed consistency was the wrong axis. The two arms differ in what the automatic recovery DOES, not merely in how loud they are. On a foreign lineage the re-copy pulls from a DIFFERENT database, which is why it had to become terminal. On an errant GTID the re-copy pulls from the SAME keyspace — and on VStream/PlanetScale it is an idempotent UPSERT re-copy with **no target drop at all** (`streamer.go:1719-1724`). More than that, the errant case is precisely the one where sluice may have applied a transaction the shard never had, so the target can hold a row the source does not (the `errantRemedy` string says so itself): the automatic re-copy REPAIRS that divergence. Making it terminal would delete a safe, automatic repair and force manual intervention on the platform where the printed remedy — inject an empty transaction on the primary — is not executable by the customer, in exchange for nothing. Re-open only with a measured case where the errant re-copy is itself harmful.
 
-**Still open from this pass, pending consolidation into `audit-findings-index.md` by worker ID:** the stop-door/anchor multi-database lane gap (my own 2026-09-08 fix, sibling-missed), the D1 reader-lane mangle bracket, `ALTER TABLE … SET SCHEMA` slipping the DDL refusal, and 19 reconciler fix-quality flags (`workspace/audit-2026-09-09/reconciler.md` §2).
+### The five blind workers' own findings — consolidated 2026-09-09
+
+This subsection exists because the sentence that used to sit here was
+wrong twice over. It named three items as "still open pending
+consolidation", one of which (`ALTER TABLE … SET SCHEMA`) was struck
+through as FIXED twenty-six lines above it, and it pointed at "19
+reconciler fix-quality flags" by a path into `workspace/`, which is
+**gitignored** — a pointer to something the next pass cannot open. That
+is exactly the failure mode `docs/dev/audit-findings-index.md` was
+written to end, reproduced in the file the index grades.
+
+The consolidation measured the leak: **65 finding IDs across the five
+blind workers, 11 present in this file by ID, 6 in prose, and roughly 48
+absent.** Approximately 70%, the same order the 09-06 reconciler
+measured for the 09-01 pass and called larger than any prior. One of the
+absences was `A0909-PDD-P1`, a HIGH the perf worker had explicitly asked
+the reconciler to route to the silent-loss owners; it was routed
+nowhere, and it is filed and FIXED above.
+
+**Citing these findings needs a worker qualifier, because the workers'
+own schemes collide.** `silent-loss-mysql` and `silent-loss-pg` both
+number `HIGH-1`/`MEDIUM-1`/`MEDIUM-2`/`LOW-1`; `arch-quality` and
+`testing-ci` both use `H-1..H-3`/`M-n`/`L-n` for entirely different
+findings. The prefixes below extend the convention this file already
+half-used: `SLM` silent-loss-mysql, `SLP` silent-loss-pg, `AQ`
+arch-quality, `TCI` testing-ci, `PDD` perf-deps-devex-docs.
+
+**Everything below is AS FILED BY THE WORKER and NOT re-verified here.**
+A filing's grade and its blast radius are both hypotheses — `PDD-P1`'s
+reach was measurably wider than filed, and roughly a third of audit
+verdicts historically differ from the filing. Treat each as a lead with
+a stated severity, not a confirmed defect.
+
+**HIGH, unverified:**
+
+- **A0909-TCI-H-1** (= `A0909-PDD-DOC4`): `TestOperatorMarkersHaveADocHome` derives its universe from `const …Marker` declarations only, so a marker written as an inline literal is invisible to it. `CHANGE-LOG-PAGE-UNORDERED` and `CAPTURE-FUNCTION-PUBLIC-EXECUTE` are outside it and reportedly have no `docs/operator/` home today. Note the shape: this file's own `DDD-6` entry asserts the property the finding refutes, so the backlog currently records the gate as sound.
+- **A0909-TCI-H-2**: `scripts/check-shard-coverage.sh` discovers integration files by `^//go:build integration`, so a `linux && integration` constraint is invisible and its package runs in NO shard with both coverage guards green. Worker reports it mutation-proven.
+- **A0909-TCI-H-3**: `TestPublicationPrivilegeRoster_EveryDDLSiteIsClassified` grades 8 of 10 `ExecContext` sites; the two `ALTER PUBLICATION … SET TABLE` execs fall outside its window. Worker reports it mutation-proven.
+- **A0909-AQ-H-3**: the MULTI-DATABASE cold-start lane never got the two stop-door fixes — a stop after the copy still drops the Postgres slot via a bare `abandonStream()`, and the anchor's `WritePosition` runs on the CANCELLABLE context. Half of this is already noted inside `A0909-STOP-1` and by the reconciler's §2 flag 2; the anchor-on-a-cancellable-context half is recorded nowhere else, and it is the half that can lose the anchor on the very stop it is meant to survive.
+- **A0909-PDD-DOC3**: two copy-pasteable commands do not parse — `sluice verify --depth=full` in two cookbooks, and `sluice preview` in `AGENTS.md`, which the binary itself hands to an agent via `sluice agent-guide`.
+
+**MEDIUM, unverified:**
+
+- **A0909-SLM-MEDIUM-1**: the empty-`@@gtid_executed` fallback records a MariaDB file/pos position with no `server_uuid` and no `BINLOG_GTID_POS` anchor though the anchor was capturable — strictly weaker than what v0.138.0's cold start records. Distinct from Bug 261, which is the anchor-purged branch of a position that HAS one.
+- **A0909-SLP-MEDIUM-2**: the D1 READER lane still has the length-preserving U+FFFD blind spot the trigger lane closed (`d1_rows.go`, `stage_d1.go`). The reconciler measured the same thing as its §2 flag 6: the bracket reached 1 of 3 D1 text-crossing lanes.
+- **A0909-AQ-M-1**: `sync health --slot-name X` queries slot `X` while `sync start --slot-name X` created `sluice_X`; `effectiveSlotName` is the one non-resolving consumer of eight, plus a hard-coded `"sluice_slot"`.
+- **A0909-AQ-M-2**: MySQL's `sessionTZCastRefusal` is not table-scope-gated though its own comment cites the Postgres sibling that is, so an EXCLUDED table can halt the stream.
+- **A0909-AQ-M-3**: `sqlite-trigger` does not implement `ir.CDCScopePredicateSetter`, so its drift/shape doors grade the whole install; the written reason does not describe this engine.
+- **A0909-AQ-M-4**: the `UNSELECTED-NAMESPACE-EXPOSURE` WARN degrades to DEBUG when its own probe fails.
+- **A0909-TCI-M-1**: `scripts/vet-tags.sh` computes its package list with `go list ./...` WITHOUT tags, so an all-tagged package is never type-checked — the v0.58.1-retag class. Worker reports it mutation-proven in-tree.
+- **A0909-TCI-M-2**: both branch-protection-required filtered legs (PostGIS, vstream) use a `passed -lt 1` floor over universes of 25 and 40, with no fail-on-skip belt.
+- **A0909-TCI-M-3**: `TestChainRestorePreTargetDoorRoster` is satisfiable by a COMMENT and has no count floor; six doors sit under a comment saying seven.
+- **A0909-TCI-M-4**: `TestFanOutFilterCallersReportUnmatchedPatterns` pairs callers with reporters per FILE rather than per path.
+- **A0909-TCI-M-5**: `TestFingerprintCoversEveryStrategysState`'s floor of 20 sits four below the 24 real `Strategy` implementors.
+- **A0909-TCI-M-6**: `TestContainedIRCompletenessRosterEveryFieldComparedOrExempt`'s per-type floors are the probe maps' own lengths minus slack — a floor funded by the value it observes.
+- **A0909-TCI-M-7**: four integration tests added in this delta carry a vacuous-exit or self-referential shape.
+- **A0909-TCI-M-8**: two chaos-leg tests added in this delta assert nothing and now count toward that leg's non-vacuity budget.
+- **A0909-TCI-M-9** (J): `internal/docsync`'s gates never run on docs-only commits, because `ci.yml`'s `paths-ignore` skips `**.md` and `docs/**`.
+- **A0909-PDD-P4**: the text renderer hides a recorded failure — `markFailed` sets `LastError`, `writeColdStartsText` never prints it, and the row renders under the "this is expected, not a stall" line.
+- **A0909-PDD-P5**: the progress throttle bounds what it claims (largely a clean bill); two precisions unfiled — chunk-completion writes can be dropped, and `migrate`'s per-batch cursor write is a pre-existing per-batch RTT.
+- **A0909-PDD-P6**: four per-table/per-run entry costs landed unpriced (double `ReadSchema` per namespace, `PreflightRLS` per table, signature verify in prune/compact, the D1 render probe per reader open).
+
+**LOW and judgment calls, unverified:** `A0909-SLM-LOW-1` (`STOPPED-SLOT-KEPT` fires on MySQL-family sources with a Postgres remedy naming a slot that cannot exist), `A0909-SLM-LOW-2`/`A0909-AQ-L-4` (the `backup_position.go` half of the stale-invariant sweep, and a correction owed to `docs/releases/release-notes-v0.146.0.md:27` which carries no banner), `A0909-SLP-LOW-1` (UPR-2's tier-2 schema-race gate disarmed inside the pre-sidecar window), `A0909-AQ-L-1` (a manifest failing `ReadManifestAt` is skipped silently while `retireManifest` runs anyway — orphaned chunks at exit 0), `A0909-AQ-L-2`, `A0909-AQ-L-3` (dead exports), `A0909-AQ-L-5` (pgtrigger DDL-marker vs table-scope conflation, the residual `A0909-PG-MEDIUM-1`'s fix did not address), `A0909-AQ-L-6` (the MySQL schema reader carries no `CHECK … NOT ENFORCED` state, so a `NOT ENFORCED` check becomes enforced on every target), `A0909-AQ-L-7` (god files), `A0909-PDD-D2`, `A0909-PDD-D3`, `A0909-PDD-DOC2`, `A0909-PDD-DOC5`, and the perf worker's three unnumbered LOW bullets (progress rows never cleaned; `migrate --migration-id sync-<x>` not refused; perf-matrix rows 34–37 carry 7 cells against an 8-cell header).
+
+The testing-ci worker's fourteen LOW gate blind spots are enumerated
+rather than written as a range, because a range is not greppable and
+this file is graded by grep — the first cut of this section wrote
+"`A0909-TCI-L-1` … `A0909-TCI-L-14`" and `TestAuditFindingsAreFiled`
+correctly refused twelve of them as absent:
+
+- **A0909-TCI-L-1**: the all-tables-publication gate's universe.
+- **A0909-TCI-L-2**: the SECURITY DEFINER co-occurrence check.
+- **A0909-TCI-L-3**: the relation-scope posture roster.
+- **A0909-TCI-L-4**: reachability matched by suffix.
+- **A0909-TCI-L-5**: `coldstart_preflight_roster`'s floor of 1 over a universe of 7.
+- **A0909-TCI-L-6**: the probe-timeout roster grades one function.
+- **A0909-TCI-L-7**: the optional-dispatch gate's frozen debt list.
+- **A0909-TCI-L-8**: `migcore/caps_moved_test.go` contains no test.
+- **A0909-TCI-L-9**: the D1 render door is satisfiable by a comment.
+- **A0909-TCI-L-10**: doc-root walks that are not recursive.
+- **A0909-TCI-L-11**: `FuzzScanQuotedStringDelim` is never actually fuzzed.
+- **A0909-TCI-L-12**: premise gates that `t.Skip` rather than fail.
+- **A0909-TCI-L-13**: the `^TestMigrate_Corpus_` prefix allowlist of 23 tests.
+- **A0909-TCI-L-14**: `redaction_compact_gate_test.go` greps the whole file.
+
+**Two ID hygiene notes.** `A0909-HIGH-1` is the POSTGRES worker's parent-DDL finding while `A0909-MYSQL-HIGH-1` is the MySQL worker's lineage one — the bare ID reads as the general case and is not. It is left as spelled because it is already published in v0.148.1's notes; cite it as `A0909-HIGH-1 (PG)`. And `A0909-PDD-D1` collides visually with the D1/Cloudflare engine that appears throughout this repo; it is the fresh-target WARN-class finding, folded into `A0909-P2`.
 
 ## 2026-09-08 — the FIRST OUTSIDE USER REPORT (AWS → GCP `us-east4`, PlanetScale MySQL)
 
