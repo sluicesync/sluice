@@ -75,7 +75,7 @@ func TestMigrationStateStore_ListAgainstRealMySQL(t *testing.T) {
 	if err := store.EnsureControlTable(ctx); err != nil {
 		t.Fatalf("ensure control table: %v", err)
 	}
-	for _, id := range []string{"sync-prod", "sync-prod_x", "syncXprod", "auto-deadbeef"} {
+	for _, id := range []string{"sync-prod", "sync-prod_x", "syncXprod", "sync-a#b", "auto-deadbeef"} {
 		if err := store.Write(ctx, ir.MigrationState{MigrationID: id, Phase: ir.MigrationPhaseBulkCopy}); err != nil {
 			t.Fatalf("seed %q: %v", id, err)
 		}
@@ -102,6 +102,17 @@ func TestMigrationStateStore_ListAgainstRealMySQL(t *testing.T) {
 			if seen[notWant] {
 				t.Errorf("List(%q) returned %q — the prefix is over-matching", "sync-", notWant)
 			}
+		}
+	})
+
+	t.Run("the escape character itself is escaped", func(t *testing.T) {
+		rows, err := lister.List(ctx, "sync-a#")
+		if err != nil {
+			t.Fatalf("List: %v", err)
+		}
+		if len(rows) != 1 || rows[0].MigrationID != "sync-a#b" {
+			t.Errorf("List(%q) = %+v; want exactly sync-a#b — a bare '#' in the pattern would be an escape "+
+				"with nothing to escape, or would swallow the next character", "sync-a#", rows)
 		}
 	})
 

@@ -2598,7 +2598,16 @@ func (s *SyncStatusCmd) Run(g *Globals) error {
 	// cold-start half is unavailable rather than showing an empty
 	// section that reads as "nothing running".
 	var coldStartLister ir.MigrationStateLister
-	if store, serr := openMigrationStateStoreForStatus(ctx, target, s.Target); serr == nil && store != nil {
+	store, serr := openMigrationStateStoreForStatus(ctx, target, s.Target)
+	switch {
+	case serr != nil:
+		// Say so: a nil lister renders exactly like "no cold start in
+		// progress", and that is the reading this whole surface exists
+		// to prevent (pre-tag review of A0909-P2, 2026-09-09).
+		slog.WarnContext(ctx, "sync status: could not open the target's migration-state store, so a cold "+
+			"start in progress would NOT be shown below — treat an absent stream as unknown, not as idle",
+			slog.String("error", serr.Error()))
+	case store != nil:
 		coldStartLister = store
 		defer func() {
 			if c, ok := store.(io.Closer); ok {

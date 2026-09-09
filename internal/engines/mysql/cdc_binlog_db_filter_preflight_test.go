@@ -228,7 +228,7 @@ func TestPreflightBinlogDBFilter(t *testing.T) {
 			"do_lowercase_entry_on_folding_mariadb":       {"lct=1|mariadb=1|do=app|ignore=", listScope("App")}, // the stored name is the fold; the entry matches it
 		}
 		for name, tc := range pass {
-			if err := preflightBinlogDBFilter(ctx, newDBFilterDB(t, tc.spec), tc.scope); err != nil {
+			if err := preflightBinlogDBFilter(ctx, newDBFilterDB(t, tc.spec), tc.scope, FlavorVanilla); err != nil {
 				t.Errorf("%s (%q) = %v; want nil", name, tc.spec, err)
 			}
 		}
@@ -256,8 +256,30 @@ func TestPreflightBinlogDBFilter(t *testing.T) {
 			"ignore_case_mismatch_via_predicate":         {"do=|ignore=APP", predicateScope("APP"), []string{`"APP"`}},                                            // the predicate arm is the caller's own equality
 		}
 		for name, tc := range refuse {
-			err := preflightBinlogDBFilter(ctx, newDBFilterDB(t, tc.spec), tc.scope)
+			err := preflightBinlogDBFilter(ctx, newDBFilterDB(t, tc.spec), tc.scope, FlavorVanilla)
 			wantDBFilterRefusal(t, err, name+" ("+tc.spec+")", tc.phrases...)
+		}
+	})
+
+	t.Run("flavor_is_believed_over_a_version_string_without_the_word", func(t *testing.T) {
+		t.Parallel()
+		// A proxy's server_version can omit "MariaDB"; the reader's own
+		// flavor then decides, and the safe (byte-exact) branch wins.
+		err := preflightBinlogDBFilter(ctx, newDBFilterDB(t, "lct=1|do=APP|ignore="), listScope("app"), FlavorMariaDB)
+		wantDBFilterRefusal(t, err, "flavor_or_version", `"app"`, "MariaDB")
+	})
+
+	t.Run("predicate_scope_on_a_folding_server_is_offered_the_stored_spelling", func(t *testing.T) {
+		t.Parallel()
+		// A predicate-only scope (no concrete list) admits `app`; the
+		// server's entry is `APP` on a folding MySQL. Byte-exact alone
+		// would pass here while the server skips `app` — silent.
+		err := preflightBinlogDBFilter(ctx, newDBFilterDB(t, "lct=1|do=|ignore=APP"), predicateScope("app"), FlavorVanilla)
+		wantDBFilterRefusal(t, err, "predicate_folding", `"app"`, "--binlog-ignore-db")
+		// On an exact server the same shape must NOT refuse: `APP` and
+		// `app` are two databases and the server logs `app`.
+		if err := preflightBinlogDBFilter(ctx, newDBFilterDB(t, "lct=0|do=|ignore=APP"), predicateScope("app"), FlavorVanilla); err != nil {
+			t.Fatalf("predicate scope on an exact server refused a working configuration: %v", err)
 		}
 	})
 
@@ -267,7 +289,7 @@ func TestPreflightBinlogDBFilter(t *testing.T) {
 			"status_read":    "err=1",
 			"case_rule_read": "do=app|ignore=|lcterr=1",
 		} {
-			err := preflightBinlogDBFilter(ctx, newDBFilterDB(t, spec), listScope("app"))
+			err := preflightBinlogDBFilter(ctx, newDBFilterDB(t, spec), listScope("app"), FlavorVanilla)
 			if err == nil {
 				t.Fatalf("%s: preflight with a failing read = nil; want a loud error", name)
 			}

@@ -91,7 +91,15 @@ import (
 // not where a production MariaDB source runs, and no Linux container
 // can measure it. On that cell the do arm can over-refuse and the
 // ignore arm can under-refuse; the comment says so instead of the
-// code pretending otherwise.
+// code pretending otherwise. The same applies to MySQL at lct=2: the
+// unit matrix pins the fold there because every predicate in this
+// engine tests `!= 0` (see [Engine.lowerCaseTableNames]), not because
+// a server was measured. UNVERIFIED PREMISE, non-ASCII names: the fold
+// is [foldMySQLIdentifier], sluice's imitation of the server's, and
+// table_name_fold.go names the non-ASCII residual it carries; where Go
+// and the server disagree on a letter's case the do arm can pass while
+// the server logs nothing (silent) and the ignore arm can refuse a
+// working configuration — neither measured, both stated.
 
 // binlogFilterScope names the databases a CDC start will read, for the
 // filter preflight's scope-limited refusal. databases is the concrete
@@ -127,8 +135,18 @@ func (s binlogFilterScope) admits(rule binlogFilterCaseRule, entry string) (sync
 			return d, true
 		}
 	}
-	if s.inScope != nil && s.inScope(entry) {
-		return entry, true
+	if s.inScope != nil {
+		// The predicate compares under the CALLER's rule; on a folding
+		// server also offer it the stored spelling, so a predicate-only
+		// scope cannot under-refuse where the list would have refused
+		// (pre-tag review of RC-1, 2026-09-09 — no live caller reaches
+		// this today, both pipeline paths supply the list).
+		if s.inScope(entry) {
+			return entry, true
+		}
+		if rule.lct != 0 && s.inScope(foldMySQLIdentifier(entry)) {
+			return foldMySQLIdentifier(entry), true
+		}
 	}
 	return "", false
 }
@@ -150,7 +168,11 @@ func (r binlogFilterCaseRule) match(entry, db string) bool {
 	case r.mariadb:
 		return entry == foldMySQLIdentifier(db)
 	default:
-		return strings.EqualFold(entry, db)
+		// One fold for the whole engine (foldMySQLIdentifier), not a
+		// second Go imitation: EqualFold and ToLower disagree on some
+		// non-ASCII letters, and two rules in one file is how the two
+		// arms drift apart.
+		return foldMySQLIdentifier(entry) == foldMySQLIdentifier(db)
 	}
 }
 
@@ -158,8 +180,11 @@ func (r binlogFilterCaseRule) match(entry, db string) bool {
 // depends on. A failure is loud and uncoded, the posture of the status
 // read below: both are one-row reads any account that can open a CDC
 // stream can make, so a failure here is a broken connection rather
-// than evidence about the filters.
-func readBinlogFilterCaseRule(ctx context.Context, q dbQuerier) (binlogFilterCaseRule, error) {
+// than evidence about the filters. The reader's own flavor is OR'd in
+// with the version sniff: a MariaDB whose VERSION() string lacks the
+// word (a proxy's server_version) would otherwise take the MySQL fold
+// branch, which on a folding MariaDB is the silent direction.
+func readBinlogFilterCaseRule(ctx context.Context, q dbQuerier, flavor Flavor) (binlogFilterCaseRule, error) {
 	lct, err := readLowerCaseTableNames(ctx, q)
 	if err != nil {
 		return binlogFilterCaseRule{}, fmt.Errorf("mysql: cdc: binlog filter case rule: %w", err)
@@ -169,7 +194,7 @@ func readBinlogFilterCaseRule(ctx context.Context, q dbQuerier) (binlogFilterCas
 		return binlogFilterCaseRule{}, fmt.Errorf("mysql: cdc: binlog filter case rule: read server version: %w", err)
 	}
 	_, _, mariadb := parseMariaDBVersion(version)
-	return binlogFilterCaseRule{lct: lct, mariadb: mariadb}, nil
+	return binlogFilterCaseRule{lct: lct, mariadb: mariadb || flavor == FlavorMariaDB}, nil
 }
 
 // binlogDBFilterRemedyHint is the machine-readable remedy carried on
@@ -182,7 +207,7 @@ const binlogDBFilterRemedyHint = "remove --binlog-ignore-db / --binlog-do-db fro
 // columns of the master-status row and returns a coded refusal
 // ([sluicecode.CodeCDCBinlogDBFiltered]) when the server-side binlog
 // filters exclude a database in scope. See the file comment.
-func preflightBinlogDBFilter(ctx context.Context, q dbQuerier, scope binlogFilterScope) error {
+func preflightBinlogDBFilter(ctx context.Context, q dbQuerier, scope binlogFilterScope, flavor Flavor) error {
 	pctx, cancel := context.WithTimeout(ctx, rowImagePreflightTimeout)
 	defer cancel()
 
@@ -206,7 +231,7 @@ func preflightBinlogDBFilter(ctx context.Context, q dbQuerier, scope binlogFilte
 		return nil
 	}
 
-	rule, err := readBinlogFilterCaseRule(pctx, q)
+	rule, err := readBinlogFilterCaseRule(pctx, q, flavor)
 	if err != nil {
 		return err
 	}

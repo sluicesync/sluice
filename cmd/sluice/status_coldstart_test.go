@@ -116,6 +116,32 @@ func TestStatusRendersColdStartsInProgress(t *testing.T) {
 			t.Fatalf("filterColdStarts(\"prod\") = %+v; want exactly the sync-prod row", got)
 		}
 	})
+
+	t.Run("filter: a finished cold start is not in progress", func(t *testing.T) {
+		t.Parallel()
+		// The pipeline marks the row complete and leaves it; rendering it
+		// under the in-progress header with a climbing age teaches the
+		// operator to distrust the one signal the section provides
+		// (A0909-P3). Both the all-streams and the one-stream forms drop it.
+		states := []ir.MigrationState{
+			{MigrationID: "sync-done", Phase: ir.MigrationPhaseComplete, UpdatedAt: now.Add(-6 * time.Hour)},
+			{MigrationID: "sync-live", Phase: ir.MigrationPhaseIndexes, UpdatedAt: now.Add(-4 * time.Second)},
+		}
+		got := filterColdStarts(append([]ir.MigrationState(nil), states...), "")
+		if len(got) != 1 || got[0].MigrationID != "sync-live" {
+			t.Fatalf("filterColdStarts(\"\") = %+v; want only the live row", got)
+		}
+		if got := filterColdStarts(append([]ir.MigrationState(nil), states...), "done"); len(got) != 0 {
+			t.Fatalf("filterColdStarts(\"done\") = %+v; want nothing — the copy finished", got)
+		}
+		var buf bytes.Buffer
+		if err := renderStatus(&buf, nil, nil, nil, filterColdStarts(append([]ir.MigrationState(nil), states[:1]...), ""), statusRenderOpts{Format: "text"}, now); err != nil {
+			t.Fatalf("renderStatus: %v", err)
+		}
+		if strings.Contains(buf.String(), "cold start in progress") {
+			t.Fatalf("a completed cold start rendered under the in-progress header:\n%s", buf.String())
+		}
+	})
 }
 
 // The two packages agree on a STORED string, not on a shared symbol: the

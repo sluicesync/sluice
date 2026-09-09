@@ -354,8 +354,12 @@ func (s *Streamer) runColdStartParallel(
 		progressStore = nil
 	}
 	rc := newSyncRecordingContext(ctx, progressStore, streamID)
-	if rc.writes() {
-		defer migcore.CloseIf(rc.store)
+	if progressStore != nil {
+		// Close the store we opened whether or not the context ended up
+		// recording: the P2 degrade path (tables could not be ensured)
+		// leaves rc inert with the pool still open, one leak per cold
+		// start (pre-tag review, 2026-09-09).
+		defer migcore.CloseIf(progressStore)
 	}
 	state := ir.MigrationState{MigrationID: rc.migrationID}
 	copyErr := runBulkCopyPhases(

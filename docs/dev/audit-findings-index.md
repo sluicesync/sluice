@@ -71,6 +71,12 @@ narrower than the pass.
 - RC-1b filed
 - RC-2 filed
 - RC-5 filed
+- VF0909-1 filed
+- VF0909-2 filed
+- VF0909-3 filed
+- VF0909-4 filed
+- VF0909-5 filed
+- VF0909-6 filed
 
 ## 2026-09-07 — v0.145.0 pre-tag review
 

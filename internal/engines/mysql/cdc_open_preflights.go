@@ -53,7 +53,7 @@ func preflightBinlogCDCOpen(ctx context.Context, db dbQuerier, scope binlogFilte
 	if err := preflightReplicaSource(ctx, db); err != nil {
 		return err
 	}
-	if err := preflightBinlogDBFilter(ctx, db, scope); err != nil {
+	if err := preflightBinlogDBFilter(ctx, db, scope, flavor); err != nil {
 		return err
 	}
 	preflightFKReferentialActions(ctx, db, scope)

@@ -136,16 +136,29 @@ const syncMigrationIDPrefix = "sync-"
 // filterColdStarts narrows the cold-start list to one stream when
 // --stream-id is given, matching on the STREAM id rather than the
 // migration id the operator never sees.
+// filterColdStarts keeps the rows that are cold starts IN PROGRESS: the
+// requested stream (or every stream when streamID is empty), never a row
+// whose phase is complete. The pipeline marks the row complete when the
+// copy finishes and leaves it in place, so without this the section
+// would print a finished cold start under its "in progress" header
+// forever, with a LAST PROGRESS WRITE age that only climbs — the exact
+// signal the section tells operators means the run is dead (audit
+// 2026-09-09 A0909-P3, found half-landed by the pre-tag review; `sync
+// health` already filters the same way in coldStartFor).
 func filterColdStarts(states []ir.MigrationState, streamID string) []ir.MigrationState {
-	if streamID == "" {
-		return states
+	want := ""
+	if streamID != "" {
+		want = syncMigrationIDPrefix + streamID
 	}
-	want := syncMigrationIDPrefix + streamID
 	out := states[:0]
 	for _, st := range states {
-		if st.MigrationID == want {
-			out = append(out, st)
+		if st.Phase == ir.MigrationPhaseComplete {
+			continue
 		}
+		if want != "" && st.MigrationID != want {
+			continue
+		}
+		out = append(out, st)
 	}
 	return out
 }
