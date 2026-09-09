@@ -1,6 +1,6 @@
 module sluicesync.dev/sluice
 
-go 1.26.6
+go 1.26.7
 
 require (
 	cloud.google.com/go/kms v1.31.0
@@ -50,7 +50,7 @@ require (
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.58.0
 	pgregory.net/rapid v1.3.0
-	vitess.io/vitess v0.24.2
+	vitess.io/vitess v0.24.3
 )
 
 require (
