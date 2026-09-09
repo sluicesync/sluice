@@ -85,7 +85,7 @@ func TestAbandonUnlessStopped(t *testing.T) {
 		}
 	})
 
-	t.Run("the WARN names the slot and BOTH ways out", func(t *testing.T) {
+	t.Run("the WARN names the slot, says the state cannot be resumed, and gives the way out", func(t *testing.T) {
 		// No t.Parallel: this swaps the GLOBAL slog default to capture output,
 		// so parallel siblings would write into each other's buffers.
 		// Preserving silently would trade a recoverable re-copy for an
@@ -103,12 +103,14 @@ func TestAbandonUnlessStopped(t *testing.T) {
 		got := buf.String()
 		for _, want := range []string{
 			stoppedSlotKeptMarker,
-			"custom_slot",      // WHICH slot
-			"PINS",             // the cost
-			"sync start",       // way out 1: resume
-			"sluice slot drop", // way out 2: our OWN command, not raw SQL
-			"--yes",            // which drop refuses without
-			"fill the disk",    // why it matters on a busy source
+			"custom_slot",         // WHICH slot
+			"PINS",                // the cost
+			"CANNOT RESUME",       // the truth (A0909-STOP-1): no anchor exists yet, a re-run refuses
+			"sluice slot drop",    // the way out: our OWN command, not raw SQL
+			"--yes",               // which drop refuses without
+			"--reset-target-data", // and the re-copy that follows it
+			"A0909-STOP-1",        // where the resume that is missing is tracked
+			"fill the disk",       // why it matters on a busy source
 		} {
 			if !strings.Contains(got, want) {
 				t.Errorf("the stopped-slot WARN does not mention %q — an operator cannot act on it:\n%s", want, got)

@@ -1,5 +1,7 @@
 # sluice v0.148.0
 
+> **Correction (2026-09-09, v0.148.1):** the "Stopping a cold start after the copy no longer destroys the replication slot" item below says a stop that lands after the copy can be resumed by re-running with the same `--stream-id`. **That is false for the window it names.** The kept-slot door fires only before the CDC anchor is written (the copy and index phases), so no position is persisted; a re-run finds none, cold-starts, and refuses on the existing slot. Only a stop that lands during the anchor write itself resumes, and that window was already protected before this release. The slot IS kept and DOES pin WAL, as stated; what it buys today is nothing but the consistent point a future handoff resume will need. v0.148.1's `STOPPED-SLOT-KEPT` message says so and gives the real way out (`sluice slot drop … --yes`, then `sync start --reset-target-data`). Tracked as A0909-STOP-1.
+
 **A `sync` cold start is no longer invisible.** sluice's first outside migration — an AWS → GCP `us-east4` move of a PlanetScale MySQL database — succeeded, and the operator sent back a candid field report. Most of this release is their findings. The headline is that `sync status` could not tell a running cold start from a dead process, and said so for hours.
 
 ## Features

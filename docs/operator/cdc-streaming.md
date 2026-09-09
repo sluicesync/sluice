@@ -421,12 +421,12 @@ The same re-run also repairs a second defect found in the same audit, and it is 
 
 If you stop a `sync start` (Ctrl-C, SIGTERM) after the bulk copy has committed but before CDC begins — during the index build, say, which on a large table is where a stop most often lands — sluice **keeps** the source's replication slot instead of dropping it, and WARNs under `STOPPED-SLOT-KEPT`.
 
-That is deliberate. Without the slot the copy on the target is unresumable: warm resume has no position and a cold start refuses a populated target, so the only way forward would be `--reset-target-data` and copying everything again. Before v0.148.0 the slot was dropped in exactly this window, and a Ctrl-C during a long index build cost the whole copy.
+**Which window you stopped in decides what happens next, and v0.148.0's version of this page got that wrong (corrected in v0.148.1, audit A0909-STOP-1).** The cold start records its resume position — the CDC anchor — only at the very end of the handoff, after the index build, the constraints and the FLOAT re-read. A stop that lands *during the anchor write* still completes it (that write runs on an uncancellable context since v0.116), and a re-run with the same `--stream-id` warm-resumes from the kept slot. A stop that lands *before* it — the index build, which is where a stop on a large table most often lands — leaves the slot kept but **no recorded position**: a re-run finds none, cold-starts, and refuses on the existing slot. **This release cannot resume from that state.** The slot is kept anyway because its consistent point is exactly what a handoff resume will need; that resume is tracked as A0909-STOP-1 and, until it ships, the kept slot buys you nothing except retained WAL.
 
-**The kept slot pins WAL on the source, and that is not free.** PostgreSQL retains WAL from the slot's position until the slot advances or goes away, so an unattended slot on a busy source can fill the disk. You have two ways out and should take one of them promptly:
+**The kept slot pins WAL on the source, and that is not free.** PostgreSQL retains WAL from the slot's position until the slot advances or goes away, so an unattended slot on a busy source can fill the disk. Take one of these promptly:
 
-- **Resuming** — re-run `sluice sync start` with the same `--stream-id`. The stream picks up from the slot and releases the retained WAL as it catches up. This is the normal case.
-- **Abandoning** — if you are not going to resume this migration, drop the slot so it stops retaining WAL. sluice has first-class commands for this; you do not need psql:
+- **If the anchor was written** (`sync status` shows the stream, or your stop landed after the index build finished) — re-run `sluice sync start` with the same `--stream-id`. The stream picks up from the slot and releases the retained WAL as it catches up.
+- **If it was not** (the re-run refuses with `replication slot "…" already exists`, which is what a stop during the index build produces) — drop the slot, then re-run `sluice sync start` with `--reset-target-data` to copy again. sluice has first-class commands for the drop; you do not need psql:
 
   ```
   sluice slot list --source-driver postgres --source "$SLUICE_SOURCE"

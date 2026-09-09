@@ -77,6 +77,7 @@ narrower than the pass.
 - VF0909-4 filed
 - VF0909-5 filed
 - VF0909-6 filed
+- A0909-STOP-1 filed
 
 ## 2026-09-07 — v0.145.0 pre-tag review
 

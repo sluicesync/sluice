@@ -83,16 +83,26 @@ func (s *Streamer) abandonUnlessStopped(ctx context.Context, stream *ir.Snapshot
 	if slot == "" {
 		slot = defaultSlotNameForAdvice
 	}
+	// The truth about what the kept slot buys, stated in the message
+	// because v0.148.0's did not (audit 2026-09-09 A0909-STOP-1): this
+	// door only ever fires BEFORE coldStartBeginCDC's anchor write, so no
+	// persisted position exists yet. A re-run with the same --stream-id
+	// finds no position, cold-starts, and refuses on the existing slot —
+	// it does NOT resume. The slot is kept because its consistent point
+	// is the anchor a handoff-resume path will need; until that path
+	// ships, the only way forward is to drop it and re-copy, and an
+	// operator must not be told otherwise while WAL accumulates.
 	slog.WarnContext(ctx, "pipeline: "+stoppedSlotKeptMarker+": the cold start was STOPPED after rows had "+
-		"already been written, so the source's replication slot was KEPT rather than dropped — without it the "+
-		"copy on the target would be unresumable and would have to be redone from scratch. The slot now PINS "+
-		// remedy-partial: the resume is the operator's OWN original invocation, which sluice cannot render —
-		// the source and target flags are DSNs carrying credentials, and echoing them into a log line to
+		"already been written but BEFORE the CDC anchor was recorded, so the source's replication slot was KEPT "+
+		"rather than dropped. The slot now PINS WAL on the source and will keep doing so until you act. "+
+		// remedy-partial: both `sync start` mentions are the operator's OWN original invocation, which sluice cannot
+		// render — the source and target flags are DSNs carrying credentials, and echoing them into a log line to
 		// satisfy a paste-ability gate would leak them into every log sink the operator ships to.
-		"WAL on the source and will keep doing so until you act: re-run your `sluice sync start` command with the same "+
-		"--stream-id to resume and release it, or, if you are abandoning this migration, drop it with "+
-		"`sluice slot drop --source-driver postgres --source <DSN> "+slot+" --yes` (add --force only if a "+
-		"consumer is still attached). On a busy source an unattended slot can fill the disk",
+		"THIS RELEASE CANNOT RESUME FROM THIS STATE: re-running `sluice sync start` with the same --stream-id "+ // remedy-partial: the operator's own invocation
+		"finds no recorded position and refuses on the existing slot (handoff resume is tracked as A0909-STOP-1). "+
+		"To move on, drop the slot with `sluice slot drop --source-driver postgres --source <DSN> "+slot+" --yes` "+
+		"(add --force only if a consumer is still attached), then re-run `sluice sync start` with "+ // remedy-partial: the operator's own invocation
+		"--reset-target-data to copy again. On a busy source an unattended slot can fill the disk",
 		slog.String("slot", slot),
 		slog.String("cause", cause.Error()))
 }
