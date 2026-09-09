@@ -183,9 +183,38 @@ done
 # covered packages-wise here; whether their extra tag has a RUN entry
 # is scripts/check-run-filter-coverage.sh's concern).
 #
+# `integration` is matched as a TAG ANYWHERE IN THE EXPRESSION, not as a
+# prefix of the line (audit 2026-09-09 A0909-TCI-H-2). The old discovery
+# was `grep -l '^//go:build integration'`, which requires `integration`
+# to be the FIRST token: `//go:build integration && vstream` matched by
+# luck of ordering, while `//go:build linux && integration` — the same
+# package, the same tests, a perfectly ordinary constraint — matched
+# nothing. Such a package is then invisible to BOTH directions of this
+# guard, so it runs in NO shard and the guard that exists to prevent
+# exactly that reports green. No file in the tree has that shape today,
+# which is why this was latent rather than an active hole; the point of
+# fixing it is that the next person to write `linux && integration` gets
+# a CI failure instead of tests that silently never run.
+#
+# A leading `!` stays attached to its token by the normalisation below,
+# so `//go:build !integration` correctly does NOT match.
+#
 # `git ls-files | xargs grep` rather than `git grep`: see the MSYS
 # argument-mangling note in scripts/vet-tags.sh.
-dirs=$(git ls-files -- '*.go' | xargs grep -l '^//go:build integration' | xargs -n1 dirname | sort -u)
+dirs=$(
+	git ls-files -- '*.go' | xargs grep -l '^//go:build.*integration' | while IFS= read -r f; do
+		expr_line=$(sed -n 's|^//go:build ||p' "$f" | head -1)
+		[ -n "$expr_line" ] || continue
+		# Turn the boolean operators into whitespace so each build TAG
+		# becomes a shell word. `!` is deliberately left attached.
+		for tok in $(printf '%s' "$expr_line" | tr '(),&|' '     '); do
+			if [ "$tok" = "integration" ]; then
+				dirname "$f"
+				break
+			fi
+		done
+	done | sort -u
+)
 
 # Guard against vacuous success (empty discovery = broken discovery).
 if [ -z "$dirs" ]; then
