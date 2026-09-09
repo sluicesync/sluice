@@ -272,16 +272,33 @@ func TestSchemaDiff_BackslashWeakenedCheckIsReportedAsDrift(t *testing.T) {
 	}
 }
 
-// TestCanonicalCheckExpr_GroupingOnlyDifferencesAreTheOnlyCollision pins
-// the named wart both ways.
+// TestCanonicalCheckExpr_TheBooleanGroupingCollapseWindowIsAcceptedNotAbsent
+// pins the named wart both ways.
 //
 // The canonicalizer removes every paren, so two predicates differing
-// ONLY in grouping collide. That is stated at [canonicalCheckExpr] and
-// asserted here rather than left as a claim — and the second half is the
-// one that makes it safe: none of the shapes sluice EMITS has a
-// grouping-only variant with a different meaning, because three of them
-// are single operators and the fourth is a pure conjunction.
-func TestCanonicalCheckExpr_GroupingOnlyDifferencesAreTheOnlyCollision(t *testing.T) {
+// ONLY in BOOLEAN grouping collide. That is stated at
+// [canonicalCheckExpr] and asserted here rather than left as a claim —
+// and the second half is the one that makes it safe: none of the shapes
+// sluice EMITS has a grouping-only variant with a different meaning,
+// because three of them are single operators and the fourth is a pure
+// conjunction.
+//
+// # This test was renamed, and the old name is the lesson
+//
+// It was called `…_GroupingOnlyDifferencesAreTheOnlyCollision` until
+// audit 2026-09-09 RC-2 measured three collisions it does not cover:
+// ARITHMETIC regrouping, a cast around a column, and a PG case-folded
+// quoted identifier. Nothing in the file was wrong — the two assertions
+// below were true then and are true now — but the NAME asserted a
+// universal ("the only collision") that the body never tested, and a
+// reader looking for exactly this hazard would have read the name and
+// stopped. A gate whose name is broader than its body is worse than no
+// gate, because it is what stops the next person from checking. The two
+// closed collisions are pinned in
+// [TestSameCheckPredicate_TheMeasuredRC2CollisionsAreRefused]; the cast
+// one is pinned as still open in
+// [TestCheckExprComparable_TheCastCollisionIsStillOpen].
+func TestCanonicalCheckExpr_TheBooleanGroupingCollapseWindowIsAcceptedNotAbsent(t *testing.T) {
 	// The wart, demonstrated. If this ever stops colliding the
 	// canonicalizer has grown a parser and the doc must be rewritten.
 	if canonicalCheckExpr("a AND (b OR c)") != canonicalCheckExpr("(a AND b) OR c") {

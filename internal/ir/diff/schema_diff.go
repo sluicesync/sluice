@@ -835,7 +835,7 @@ func diffChecks(td *TableDiff, expected, actual *ir.Table, opts Options) {
 		// directions. Compare canonically before reporting; "" is
 		// un-matchable (an expression that folded to nothing tells us
 		// nothing), same rule as the emitted-match path.
-		if ce := canonicalCheckExpr(expExpr); ce != "" && ce == canonicalCheckExpr(actExpr) {
+		if sameCheckPredicate(expExpr, actExpr) {
 			continue
 		}
 		td.ChecksMismatched = append(td.ChecksMismatched, CheckDiff{
@@ -906,8 +906,8 @@ func matchEmittedChecks(expChecks, actChecks map[string]*ir.CheckConstraint) (ex
 	matchedExp := make(map[string]struct{}, len(emitted))
 	matchedAct := make(map[string]struct{}, len(emitted))
 	for _, expName := range emitted {
-		want := canonicalCheckExpr(expChecks[expName].Expr)
-		if want == "" {
+		want := expChecks[expName].Expr
+		if canonicalCheckExpr(want) == "" {
 			// A predictor that produced an empty predicate has told us
 			// nothing; leave the entry in the name-keyed pass rather than
 			// letting it match another empty one.
@@ -918,7 +918,7 @@ func matchEmittedChecks(expChecks, actChecks map[string]*ir.CheckConstraint) (ex
 				continue
 			}
 			a := actChecks[actName]
-			if a == nil || canonicalCheckExpr(a.Expr) != want {
+			if a == nil || !sameCheckPredicate(want, a.Expr) {
 				continue
 			}
 			matchedExp[expName] = struct{}{}

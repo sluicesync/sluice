@@ -55,13 +55,22 @@ package diff
 // edited to `(a AND b) OR c` — reports in sync, as does a cast added or
 // removed around a literal ([foldServerRenderings]'s own documented
 // window). Both windows are pinned as documentation
-// (TestCanonicalCheckExpr_GroupingOnlyDifferencesAreTheOnlyCollision's
+// (TestCanonicalCheckExpr_TheBooleanGroupingCollapseWindowIsAcceptedNotAbsent's
 // name-matched half, TestCanonicalCheckExpr_ServerRenderingFolds); the
 // alternative — a paren-preserving comparison for the name-matched path
 // — would re-open Bug 241 for any pair of renderings that differ in
-// parenthesization, which is the commoner case by far. A tamper that
-// changes an operator, a column, or a literal still changes the token
-// stream and is still reported.
+// parenthesization, which is the commoner case by far.
+//
+// This section used to end "a tamper that changes an operator, a column,
+// or a literal still changes the token stream and is still reported."
+// Audit 2026-09-09 RC-2 measured that as FALSE for a column: `"Amount"`
+// and `amount` are two columns on PostgreSQL and folded to one token, as
+// did `a-(b+c)` and `(a-b)+c`. Both are now refused — not by a change to
+// this fold, which must keep collapsing so Bug 241 stays fixed, but by
+// [checkExprComparable], which asks whether the two sides discarded the
+// SAME detail. **Every comparison of two CHECK expressions goes through
+// [sameCheckPredicate], never through this function directly**; calling
+// [canonicalCheckExpr] and comparing the results is precisely the bug.
 
 import (
 	"strings"
