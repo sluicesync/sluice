@@ -443,6 +443,10 @@ A cold start that fails for a real reason — a refused preflight, a foreign-key
 
 `CREATE_REPLICATION_SLOT` builds a consistent point, and that builder waits for every prepared transaction (2PC) on the **cluster** — not just in your database — to be resolved. If one is orphaned because its coordinator died, the slot creation blocks indefinitely with no further output, which reads exactly like a hung connection.
 
+The cross-database half is **measured, not inferred** (PostgreSQL 16, 2026-09-09): with a prepared transaction stranded in database `beta`, `CREATE_REPLICATION_SLOT` in database `alpha` blocked past a 40-second timeout; a `ROLLBACK PREPARED` on that transaction in `beta`, with nothing else changed, let the identical creation finish in **123 ms**. A prepared transaction you cannot see from your own database will stall your slot.
+
+One operational detail from the same measurement, because it surprises people: **an interrupted creation leaves the slot behind.** The slot is registered first and the consistent point is built second, so killing a blocked `CREATE_REPLICATION_SLOT` leaves an inactive slot that is already pinning WAL. Check with `sluice slot list` before retrying, and drop the leftover if you are not going to use it.
+
 Before creating the slot, sluice reads `pg_prepared_xacts` and warns under `PREPARED-XACT-BLOCKS-SLOT-CREATE` if anything is pending, listing each transaction's `gid`, database, owner and age. Resolve an orphan on the source with `COMMIT PREPARED '<gid>'` or `ROLLBACK PREPARED '<gid>'`; a transaction that belongs to a live coordinator will clear on its own and only needs waiting out.
 
 The same marker also carries the probe's own failure — if sluice could not read `pg_prepared_xacts` (permissions, a timeout), it says so rather than implying the cluster is clear. A warning that could not rule the condition out is not the same as one that ruled it in, and the message distinguishes them.
