@@ -281,6 +281,18 @@ func TestPreflightBinlogDBFilter(t *testing.T) {
 		if err := preflightBinlogDBFilter(ctx, newDBFilterDB(t, "lct=0|do=|ignore=APP"), predicateScope("app"), FlavorVanilla); err != nil {
 			t.Fatalf("predicate scope on an exact server refused a working configuration: %v", err)
 		}
+		// Nor on a folding MariaDB, which compares the entry as typed
+		// against the stored lowercase name: `APP` matches nothing and
+		// the server logs `app`. The reader's predicate folds (RC-1b), so
+		// handing it the raw entry would refuse here — the cell the
+		// real-server pin caught on the release commit.
+		foldingPredicate := binlogFilterScope{inScope: func(db string) bool { return foldMySQLIdentifier(db) == "app" }}
+		if err := preflightBinlogDBFilter(ctx, newDBFilterDB(t, "lct=1|mariadb=1|do=|ignore=APP"), foldingPredicate, FlavorMariaDB); err != nil {
+			t.Fatalf("predicate scope on a folding MariaDB refused a filter the server does not apply: %v", err)
+		}
+		// A lowercase MariaDB entry IS the stored name, and refuses.
+		err = preflightBinlogDBFilter(ctx, newDBFilterDB(t, "lct=1|mariadb=1|do=|ignore=app"), foldingPredicate, FlavorMariaDB)
+		wantDBFilterRefusal(t, err, "predicate_folding_mariadb_lowercase", `"app"`, "--binlog-ignore-db")
 	})
 
 	t.Run("read_failure_is_plain_error", func(t *testing.T) {

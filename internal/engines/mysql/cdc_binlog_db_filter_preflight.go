@@ -136,16 +136,16 @@ func (s binlogFilterScope) admits(rule binlogFilterCaseRule, entry string) (sync
 		}
 	}
 	if s.inScope != nil {
-		// The predicate compares under the CALLER's rule; on a folding
-		// server also offer it the stored spelling, so a predicate-only
-		// scope cannot under-refuse where the list would have refused
-		// (pre-tag review of RC-1, 2026-09-09 — no live caller reaches
-		// this today, both pipeline paths supply the list).
-		if s.inScope(entry) {
-			return entry, true
-		}
-		if rule.lct != 0 && s.inScope(foldMySQLIdentifier(entry)) {
-			return foldMySQLIdentifier(entry), true
+		// The predicate is the READER's scope: it answers for names as
+		// the server STORES them (on a folding server it folds, RC-1b).
+		// A filter entry is not a stored name, so first ask the server's
+		// rule which stored spelling — if any — the entry would match,
+		// and consult the predicate with that. Handing it the raw entry
+		// let a folding MariaDB refuse `--binlog-ignore-db=CDC_SRC` for
+		// scope `cdc_src`, which that server does not apply (caught by
+		// the real-server pin on the release commit, 2026-09-09).
+		if stored, ok := rule.storedSpelling(entry); ok && s.inScope(stored) {
+			return stored, true
 		}
 	}
 	return "", false
@@ -173,6 +173,26 @@ func (r binlogFilterCaseRule) match(entry, db string) bool {
 		// non-ASCII letters, and two rules in one file is how the two
 		// arms drift apart.
 		return foldMySQLIdentifier(entry) == foldMySQLIdentifier(db)
+	}
+}
+
+// storedSpelling reports the stored database name a filter entry would
+// match under the server's rule, or ok=false when it can match none:
+// byte-exact servers store what was typed; a folding MySQL matches the
+// entry to its lowercase form; a folding MariaDB compares the entry as
+// typed against the lowercase stored name, so only an already-lowercase
+// entry matches anything.
+func (r binlogFilterCaseRule) storedSpelling(entry string) (stored string, ok bool) {
+	switch {
+	case r.lct == 0:
+		return entry, true
+	case r.mariadb:
+		if entry != foldMySQLIdentifier(entry) {
+			return "", false
+		}
+		return entry, true
+	default:
+		return foldMySQLIdentifier(entry), true
 	}
 }
 
