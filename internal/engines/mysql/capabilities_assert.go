@@ -212,6 +212,13 @@ var (
 	// Migration-state store.
 	_ ir.MigrationStateStore  = (*MigrationStateStore)(nil)
 	_ ir.MigrationStateLister = (*MigrationStateStore)(nil)
+	// A0909-STOP-1, TARGET side: a MySQL target records a PG source's
+	// snapshot anchor exactly as a PG target does. The RESUME half is a
+	// SOURCE capability (ir.SnapshotAnchorVerifier) this engine does not
+	// implement — a MySQL source's cold start stays unresumable after a
+	// stop, which is today's behaviour and is stated in the pipeline's
+	// resume gate rather than implied here.
+	_ ir.SnapshotAnchorRecorder = (*MigrationStateStore)(nil)
 
 	// audit-2026-07-11 M-3: finish the ARCH-F1 sweep — runtime-dispatched
 	// optional surfaces that were implemented but unpinned, so a method-set

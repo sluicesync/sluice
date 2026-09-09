@@ -140,7 +140,13 @@ type Config struct {
 type SQL struct {
 	// ReadHeader: args (migrationID). Must project exactly
 	// (phase, table_progress, state_format, started_at, updated_at,
-	// last_error) for the header row.
+	// last_error, snapshot_anchor) for the header row.
+	//
+	// snapshot_anchor is the newest column and is NULL on every row a
+	// binary older than it wrote — which [Store.Read] surfaces as the
+	// empty string, the "no anchor recorded" value. Like state_format
+	// before it, the projection requires EnsureControlTable to have run
+	// on a legacy-shaped table (that is what adds the column).
 	ReadHeader string
 
 	// ReadProgressRows: args (migrationID). Must project exactly
@@ -171,6 +177,22 @@ type SQL struct {
 	// setting started_at only on first insert (the engine's upsert
 	// preserves it on conflict) and refreshing updated_at.
 	UpsertHeader string
+
+	// UpsertSnapshotAnchor: args (migrationID, phase, blobSentinel,
+	// stateFormat, anchor). Records the run's snapshot anchor
+	// ([ir.MigrationState.SnapshotAnchor]) and NOTHING else: it inserts
+	// the header row at the supplied phase when none exists, and on
+	// conflict updates ONLY snapshot_anchor — never phase, never
+	// last_error. That asymmetry is the point (see
+	// [ir.SnapshotAnchorRecorder]): the anchor writer must not clobber
+	// the phase ladder, and [SQL.UpsertHeader] — which every phase
+	// transition issues — must not clobber the anchor, so the two
+	// statements are disjoint in what they SET.
+	//
+	// Optional: an engine that leaves it empty has no
+	// [ir.SnapshotAnchorRecorder] and [Store.WriteSnapshotAnchor]
+	// refuses rather than silently recording nothing.
+	UpsertSnapshotAnchor string
 
 	// UpsertProgressRow: args (migrationID, tableName, progressJSON).
 	// Inserts or updates one progress row, refreshing its updated_at.
@@ -227,12 +249,12 @@ func (s *Store) Read(ctx context.Context, migrationID string) (ir.MigrationState
 	row := s.DB.QueryRowContext(ctx, s.SQL.ReadHeader, migrationID)
 
 	var (
-		phase                    string
-		tableProgress, lastError sql.NullString
-		format                   int
-		startedAt, updatedAt     time.Time
+		phase                                    string
+		tableProgress, lastError, snapshotAnchor sql.NullString
+		format                                   int
+		startedAt, updatedAt                     time.Time
 	)
-	switch err := row.Scan(&phase, &tableProgress, &format, &startedAt, &updatedAt, &lastError); {
+	switch err := row.Scan(&phase, &tableProgress, &format, &startedAt, &updatedAt, &lastError, &snapshotAnchor); {
 	case errors.Is(err, sql.ErrNoRows):
 		s.dropPendingUpgrade(migrationID)
 		return ir.MigrationState{}, false, nil
@@ -249,6 +271,11 @@ func (s *Store) Read(ctx context.Context, migrationID string) (ir.MigrationState
 		StartedAt:   startedAt,
 		UpdatedAt:   updatedAt,
 		LastError:   lastError.String,
+		// Verbatim: a position token is opaque and a resume is only as
+		// sound as this value being byte-exact what was written. SQL
+		// NULL (an older binary's row, or a run that recorded none)
+		// reads as "", which the contract defines as no evidence.
+		SnapshotAnchor: snapshotAnchor.String,
 	}
 
 	if format >= FormatPerTableRows {
@@ -583,6 +610,45 @@ func (s *Store) WriteTableProgress(ctx context.Context, migrationID, tableName s
 	}
 	if _, err := s.DB.ExecContext(ctx, s.SQL.UpsertProgressRow, migrationID, tableName, encoded); err != nil {
 		return fmt.Errorf("%s: write table progress %q: %w", s.Config.EngineName, tableName, err)
+	}
+	return nil
+}
+
+// WriteSnapshotAnchor records the run's snapshot anchor and nothing
+// else (see [SQL.UpsertSnapshotAnchor] for why it is its own
+// statement). The header row is created at [ir.MigrationPhasePending]
+// when it does not exist yet, so the anchor can be recorded before the
+// first phase mark.
+//
+// The token is written VERBATIM — no trimming, no normalisation. It is
+// the evidence a later resume compares against live source state, and
+// a value this store altered would compare unequal and cost a re-copy
+// at best, or match something it should not at worst.
+//
+// An empty anchor is refused rather than stored: "" is the column's
+// no-evidence value, so writing one would record the absence of an
+// anchor as if it were an anchor.
+func (s *Store) WriteSnapshotAnchor(ctx context.Context, migrationID, anchor string) error {
+	if migrationID == "" {
+		return fmt.Errorf("%s: migrate-state WriteSnapshotAnchor: migrationID is empty", s.Config.EngineName)
+	}
+	if anchor == "" {
+		return fmt.Errorf("%s: migrate-state WriteSnapshotAnchor: anchor is empty", s.Config.EngineName)
+	}
+	if s.SQL.UpsertSnapshotAnchor == "" {
+		return fmt.Errorf("%s: migrate-state store has no snapshot-anchor statement", s.Config.EngineName)
+	}
+	// Same ordering contract as Write: a legacy row Read flagged is
+	// exploded into per-table rows BEFORE this insert-or-update can
+	// flip its header to FormatPerTableRows and replace the blob.
+	if err := s.upgradeIfPending(ctx, migrationID); err != nil {
+		return err
+	}
+	if _, err := s.DB.ExecContext(
+		ctx, s.SQL.UpsertSnapshotAnchor,
+		migrationID, string(ir.MigrationPhasePending), UpgradedBlobSentinel, FormatPerTableRows, anchor,
+	); err != nil {
+		return fmt.Errorf("%s: write migrate-state snapshot anchor: %w", s.Config.EngineName, err)
 	}
 	return nil
 }

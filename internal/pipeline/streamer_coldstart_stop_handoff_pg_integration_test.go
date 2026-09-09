@@ -14,12 +14,12 @@
 //     lands here still writes the anchor; a re-run WARM-RESUMES from the
 //     kept slot and applies live changes.
 //   - The PRE-ANCHOR window (index build, constraints, FLOAT re-read): the
-//     v0.148.0 door abandonUnlessStopped keeps the slot, but no position has
-//     been written. A re-run finds no position, cold-starts, and REFUSES on
-//     the existing slot. The slot is kept for the handoff-resume path that
-//     does not exist yet (audit 2026-09-09 A0909-STOP-1); until it ships the
-//     way out is `slot drop` + `--reset-target-data`, and the STOPPED-SLOT-KEPT
-//     WARN says so.
+//     v0.148.0 door abandonUnlessStopped keeps the slot, but no CDC position
+//     has been written. Since A0909-STOP-1 shipped, a re-run here takes the
+//     HANDOFF RESUME when it can prove the copy finished and the slot has not
+//     moved (skip the copy, finish the phases, anchor from the slot's
+//     consistent point), and falls back to the old loud refusal naming the
+//     slot when it cannot.
 //
 // The first cut of this pin (v0.148.0) asserted "resumes" for BOTH windows
 // and passed only when its 1 ms poll happened to land the stop in the
@@ -78,6 +78,7 @@ func TestStreamer_ColdStartStopInHandoff_PG_KeepsSlotAndResumes(t *testing.T) {
 	interrupted := 0
 	anchoredResumeProven := false
 	preAnchorRefusalProven := false
+	preAnchorResumeProven := false
 	for attempt := 1; attempt <= coldStartStopAttempts; attempt++ {
 		func() {
 			src, tgt, cleanup := startPostgresLogical(t)
@@ -139,21 +140,48 @@ func TestStreamer_ColdStartStopInHandoff_PG_KeepsSlotAndResumes(t *testing.T) {
 			go func() { resumeErrCh <- newStream().Run(resumeCtx) }()
 
 			if !anchored {
-				// PRE-ANCHOR window: the honest behaviour today is a LOUD
-				// refusal naming the slot — not a resume, and not a silent
-				// re-copy over the populated target either.
+				// PRE-ANCHOR window. Since A0909-STOP-1 this has TWO honest
+				// outcomes, and which one applies depends on how much of the
+				// interrupted run had been recorded when the stop landed:
+				//
+				//   - the copy finished and the slot is untouched → the
+				//     re-run RESUMES (COLD-START-RESUMED) and applies a live
+				//     change;
+				//   - anything unproven → the old loud refusal naming the
+				//     slot.
+				//
+				// This pin does not predict which: its stop point is a 1 ms
+				// poll, so the recorded state varies per attempt, and a test
+				// that re-derived the gate's own predicate to choose an
+				// expectation would be grading the code against itself. It
+				// grades the outcome the run ANNOUNCED instead. The
+				// deterministic version — stop injected at the index build,
+				// resume required — is
+				// TestStreamer_ColdStartStoppedInIndexBuild_PG_ResumesWithoutRecopy.
+				applyDDL(t, src, `INSERT INTO handoff_t (id, v) VALUES (52, 52);`)
+				if waitForExactRowCount(tgt, "handoff_t", 51, 90*time.Second) {
+					t.Logf("attempt %d: pre-anchor re-run RESUMED and applied a live change", attempt)
+					preAnchorResumeProven = true
+					resumeCancel()
+					select {
+					case <-resumeErrCh:
+					case <-time.After(30 * time.Second):
+						t.Fatalf("attempt %d: resumed Run did not return after ctx cancel", attempt)
+					}
+					return
+				}
 				select {
 				case err := <-resumeErrCh:
 					if err == nil || !strings.Contains(err.Error(), "sluice_slot") {
-						t.Fatalf("attempt %d: re-run after a pre-anchor stop returned %v; want a loud refusal "+
-							"naming sluice_slot (this release cannot resume a copy stopped before the anchor — "+
-							"A0909-STOP-1)", attempt, err)
+						t.Fatalf("attempt %d: re-run after a pre-anchor stop returned %v; want either a resume "+
+							"that applies a live change or a loud refusal naming sluice_slot — never a silent "+
+							"exit (A0909-STOP-1)", attempt, err)
 					}
 					t.Logf("attempt %d: pre-anchor re-run refused as documented: %v", attempt, err)
 					preAnchorRefusalProven = true
-				case <-time.After(2 * time.Minute):
-					t.Fatalf("attempt %d: re-run after a pre-anchor stop neither refused nor returned in 2m "+
-						"(rows now %d); a copy without an anchor must not silently proceed", attempt, pollRowCount(tgt, "handoff_t"))
+				case <-time.After(60 * time.Second):
+					t.Fatalf("attempt %d: re-run after a pre-anchor stop neither resumed nor refused (rows now "+
+						"%d); a copy without an anchor must not silently proceed", attempt, pollRowCount(tgt, "handoff_t"))
 				}
 				return
 			}
@@ -187,8 +215,9 @@ func TestStreamer_ColdStartStopInHandoff_PG_KeepsSlotAndResumes(t *testing.T) {
 			"exercised what it exists to cover (widen the window or revisit the poll)",
 			coldStartStopAttempts)
 	}
-	if !anchoredResumeProven && !preAnchorRefusalProven {
-		t.Fatal("an interrupted handoff was observed but neither window's behaviour was graded")
+	if !anchoredResumeProven && !preAnchorRefusalProven && !preAnchorResumeProven {
+		t.Fatal("an interrupted handoff was observed but no window's behaviour was graded")
 	}
-	t.Logf("windows graded: anchored-resume=%v pre-anchor-refusal=%v", anchoredResumeProven, preAnchorRefusalProven)
+	t.Logf("windows graded: anchored-resume=%v pre-anchor-resume=%v pre-anchor-refusal=%v",
+		anchoredResumeProven, preAnchorResumeProven, preAnchorRefusalProven)
 }

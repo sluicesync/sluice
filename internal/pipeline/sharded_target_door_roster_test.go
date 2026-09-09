@@ -72,13 +72,25 @@ var shardedTargetDoorRoster = map[string]doorClass{
 
 	// --- OpenSchemaWriter, followed by table creation (guarded by the
 	//     CreateTablesWithoutConstraints door it leads to) ---
-	"add_table.go::(*AddTable).Run::OpenSchemaWriter":                                 classCreates, // add-table opens then calls CreateTablesWithoutConstraints.
-	"broker.go::(*SyncFromBackup).applySchemaDeltas::OpenSchemaWriter":                classCreates, // broker reset opens then CreateTablesWithoutConstraints.
-	"migrate.go::(*Migrator).runSingleDatabase::OpenSchemaWriter":                     classCreates, // migrate's single-database schema-apply reaches CreateTablesWithoutConstraints in runBulkCopy*.
-	"streamer_coldstart.go::(*Streamer).coldStartOpenTargetWriters::OpenSchemaWriter": classCreates, // sync cold-start creates tables.
-	"streamer_multidb.go::(*Streamer).coldStartCopyOneDatabase::OpenSchemaWriter":     classCreates, // multi-database sync cold-start creates tables.
-	"backup/restore.go::(*Restore).Run::OpenSchemaWriter":                             classCreates, // restore opens then CreateTablesWithoutConstraints.
-	"backup/chain_restore.go::(*ChainRestore).applySchemaDeltas::OpenSchemaWriter":    classCreates, // chain restore's schema-delta apply calls CreateTablesWithoutConstraints (for a table added mid-chain).
+	"add_table.go::(*AddTable).Run::OpenSchemaWriter":                  classCreates, // add-table opens then calls CreateTablesWithoutConstraints.
+	"broker.go::(*SyncFromBackup).applySchemaDeltas::OpenSchemaWriter": classCreates, // broker reset opens then CreateTablesWithoutConstraints.
+	"migrate.go::(*Migrator).runSingleDatabase::OpenSchemaWriter":      classCreates, // migrate's single-database schema-apply reaches CreateTablesWithoutConstraints in runBulkCopy*.
+	// A0909-STOP-1 moved this open out of coldStartOpenTargetWriters into a
+	// shared helper, so the site's key changed and both of its callers owe a
+	// verdict here (the "which call paths reached the old door" rule):
+	//   - coldStartOpenTargetWriters — CREATES (the sync cold-start's
+	//     schema-apply reaches CreateTablesWithoutConstraints), unchanged;
+	//   - resumeStoppedColdStart — creates NO tables (it finishes indexes /
+	//     constraints / views over a copy that already landed), so it would
+	//     class as open-only on its own.
+	// The site is therefore classified by its creating caller, which is the
+	// safe direction: classCreates asserts the door is reached INSIDE
+	// CreateTablesWithoutConstraints rather than at this open, and the
+	// non-creating caller is unaffected by a door it never reaches.
+	"streamer_coldstart.go::(*Streamer).openColdStartSchemaWriter::OpenSchemaWriter": classCreates, // sync cold-start creates tables; the resume caller creates none.
+	"streamer_multidb.go::(*Streamer).coldStartCopyOneDatabase::OpenSchemaWriter":    classCreates, // multi-database sync cold-start creates tables.
+	"backup/restore.go::(*Restore).Run::OpenSchemaWriter":                            classCreates, // restore opens then CreateTablesWithoutConstraints.
+	"backup/chain_restore.go::(*ChainRestore).applySchemaDeltas::OpenSchemaWriter":   classCreates, // chain restore's schema-delta apply calls CreateTablesWithoutConstraints (for a table added mid-chain).
 
 	// --- CreateTablesWithoutConstraints (every call is a create; the door
 	//     lives INSIDE this method, so all are covered uniformly) ---

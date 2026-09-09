@@ -75,8 +75,8 @@ func newMigrationStateStore(db *sql.DB, upsert upsertSpelling) *MigrationStateSt
 				IsMissingTable: isMySQLMissingTableErr,
 			},
 			SQL: migratestate.SQL{
-				ReadHeader: "SELECT phase, table_progress, state_format, started_at, updated_at, last_error FROM " +
-					hdr + " WHERE migration_id = ?",
+				ReadHeader: "SELECT phase, table_progress, state_format, started_at, updated_at, last_error, " +
+					"snapshot_anchor FROM " + hdr + " WHERE migration_id = ?",
 				ReadProgressRows: "SELECT table_name, progress, updated_at FROM " +
 					prog + " WHERE migration_id = ?",
 				ListHeadersByPrefix: "SELECT migration_id, phase, started_at, updated_at, last_error FROM " +
@@ -101,6 +101,14 @@ func newMigrationStateStore(db *sql.DB, upsert upsertSpelling) *MigrationStateSt
 					"table_progress = " + upsert.newRowRef("table_progress") + ", " +
 					"state_format = " + upsert.newRowRef("state_format") + ", " +
 					"last_error = " + upsert.newRowRef("last_error"),
+				// Anchor-only: on duplicate this sets snapshot_anchor and
+				// nothing else, so it can never move the phase a later phase
+				// mark owns (migratestate.SQL). started_at/updated_at are the
+				// column defaults on insert and the ON UPDATE clause after.
+				UpsertSnapshotAnchor: "INSERT INTO " + hdr + " " +
+					"(migration_id, phase, table_progress, state_format, snapshot_anchor) " +
+					"VALUES (?, ?, ?, ?, ?)" + upsert.clauseOpen() +
+					"snapshot_anchor = " + upsert.newRowRef("snapshot_anchor"),
 				UpsertProgressRow: "INSERT INTO " + prog + " " +
 					"(migration_id, table_name, progress) " +
 					"VALUES (?, ?, ?)" + upsert.clauseOpen() +
@@ -169,6 +177,9 @@ func (s *MigrationStateStore) EnsureControlTable(ctx context.Context) error {
 	if err := s.ensurePSQueryTimeoutRaiseColumn(ctx); err != nil {
 		return err
 	}
+	if err := s.ensureSnapshotAnchorColumn(ctx); err != nil {
+		return err
+	}
 	progExists, err := s.controlTableExists(ctx, migrateProgressTableName)
 	if err != nil {
 		return err
@@ -201,6 +212,7 @@ func migrateStateHeaderDDL() string {
 		ON UPDATE CURRENT_TIMESTAMP,
 	last_error      TEXT         NULL,
 	ps_query_timeout_raise TEXT  NULL,
+	snapshot_anchor TEXT         NULL,
 	PRIMARY KEY (migration_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
 }
@@ -234,27 +246,46 @@ func (s *MigrationStateStore) controlTableExists(ctx context.Context, table stri
 }
 
 // ensureStateFormatColumn adds the ADR-0082 state_format column to a
-// header table created by a ≤v0.99.x binary. Detect-then-ALTER keeps
-// the migration portable to MySQL 8.0.x versions older than 8.0.29
-// (no ADD COLUMN IF NOT EXISTS), mirroring control_table.go's column
-// migrations.
+// header table created by a ≤v0.99.x binary.
 func (s *MigrationStateStore) ensureStateFormatColumn(ctx context.Context) error {
+	return s.ensureHeaderColumn(ctx, "state_format", "INT NOT NULL DEFAULT 1")
+}
+
+// ensureSnapshotAnchorColumn adds the A0909-STOP-1 snapshot_anchor
+// column to a header table created by a binary that predates it.
+// NULLable and defaultless: an existing row keeps reading as "no
+// anchor recorded", which is exactly what it is.
+func (s *MigrationStateStore) ensureSnapshotAnchorColumn(ctx context.Context) error {
+	return s.ensureHeaderColumn(ctx, "snapshot_anchor", "TEXT NULL")
+}
+
+// ensureHeaderColumn is the migrate-state header's additive-column
+// migration: detect-then-ALTER, which keeps every such migration
+// portable to MySQL 8.0.x versions older than 8.0.29 (no ADD COLUMN IF
+// NOT EXISTS) and mirrors control_table.go's column migrations. The
+// Postgres sibling uses ADD COLUMN IF NOT EXISTS instead — that
+// per-engine divergence is the seam internal/migratestate documents as
+// staying engine-side.
+//
+// column is interpolated into SQL, so it must be a compile-time
+// constant from this file — never operator input.
+func (s *MigrationStateStore) ensureHeaderColumn(ctx context.Context, column, definition string) error {
 	const checkQ = `
 		SELECT COUNT(*)
 		FROM   information_schema.COLUMNS
 		WHERE  TABLE_SCHEMA = DATABASE()
 		  AND  TABLE_NAME   = ?
-		  AND  COLUMN_NAME  = 'state_format'`
+		  AND  COLUMN_NAME  = ?`
 	var n int
-	if err := s.db.QueryRowContext(ctx, checkQ, migrateStateTableName).Scan(&n); err != nil {
-		return fmt.Errorf("mysql: ensure migrate-state table: detect state_format: %w", err)
+	if err := s.db.QueryRowContext(ctx, checkQ, migrateStateTableName, column).Scan(&n); err != nil {
+		return fmt.Errorf("mysql: ensure migrate-state table: detect %s: %w", column, err)
 	}
 	if n > 0 {
 		return nil
 	}
-	const alter = "ALTER TABLE `" + migrateStateTableName + "` ADD COLUMN state_format INT NOT NULL DEFAULT 1"
+	alter := "ALTER TABLE `" + migrateStateTableName + "` ADD COLUMN " + column + " " + definition
 	if _, err := s.db.ExecContext(ctx, alter); err != nil {
-		return fmt.Errorf("mysql: ensure migrate-state table: add state_format: %w", wrapControlTableBootstrapError(err, alter))
+		return fmt.Errorf("mysql: ensure migrate-state table: add %s: %w", column, wrapControlTableBootstrapError(err, alter))
 	}
 	return nil
 }
@@ -289,6 +320,19 @@ func (s *MigrationStateStore) Write(ctx context.Context, state ir.MigrationState
 // per-checkpoint write (ADR-0082).
 func (s *MigrationStateStore) WriteTableProgress(ctx context.Context, migrationID, tableName string, progress ir.TableProgress) error {
 	return s.shared.WriteTableProgress(ctx, migrationID, tableName, progress)
+}
+
+// WriteSnapshotAnchor implements [ir.SnapshotAnchorRecorder]: it
+// records the run's snapshot anchor token on the header row and
+// touches no other column.
+//
+// A MySQL TARGET carries the column and this method for symmetry with
+// the Postgres store — the recording cold start writes wherever its
+// target is. Whether the anchor can then be RESUMED from is a property
+// of the SOURCE engine ([ir.SnapshotAnchorVerifier]), which MySQL does
+// not implement; see the pipeline's cold-start resume gate.
+func (s *MigrationStateStore) WriteSnapshotAnchor(ctx context.Context, migrationID, anchor string) error {
+	return s.shared.WriteSnapshotAnchor(ctx, migrationID, anchor)
 }
 
 // ClearMigration deletes the progress rows and header row for

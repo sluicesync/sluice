@@ -1610,6 +1610,92 @@ func runBulkCopyForAddTable(
 	return nil
 }
 
+// The recorded post-copy DDL phases, each in exactly one place.
+//
+// Every one of these is "mark the phase, run the DDL under the
+// reparent retry, wrap the failure with its migcore hint and record it,
+// tick the progress sink". They used to be written out inline at each
+// of their call sites — identity-sync three times, indexes twice —
+// which is fine until a second entry point needs the same ladder and
+// has to choose between calling them and copying them. The stopped-
+// cold-start resume ([Streamer.resumeStoppedColdStart]) is that second
+// entry point: it runs the tail of this ladder with no copy in front of
+// it, and it runs THESE functions rather than a second rendering of the
+// same phases, so a change to how a phase is marked, retried or
+// attributed reaches both paths.
+func runIdentitySyncPhase(ctx context.Context, rc resumeContext, state *ir.MigrationState, schema *ir.Schema, sw ir.SchemaWriter) error {
+	if err := markPhase(ctx, rc, state, ir.MigrationPhaseIdentitySync); err != nil {
+		// Phase mark is non-fatal; continue with the data work.
+		_ = err
+	}
+	if err := migcore.RunDDLPhaseWithReparentRetry(ctx, "identity-sequences", sw, func(ctx context.Context) error {
+		return sw.SyncIdentitySequences(ctx, schema)
+	}); err != nil {
+		err = fmt.Errorf("pipeline: sync identity sequences: %w", err)
+		return migcore.WrapWithHint(migcore.PhaseSchemaApply, markFailed(ctx, rc, *state, ir.MigrationPhaseIdentitySync, err))
+	}
+	progress.FromContext(ctx).PhaseCompleted(migPhase(ir.MigrationPhaseIdentitySync))
+	return nil
+}
+
+// runIndexesPhase builds the whole schema's secondary indexes.
+//
+// upfront selects the two things that differ when the phase is
+// relocated ahead of the copy by --upfront-indexes: the error's label
+// ("create indexes (upfront)") and the progress sink's early-completion
+// tick. Everything else — the mark, the retry, the hint, the failure
+// record — is identical, which is why they share a function.
+func runIndexesPhase(ctx context.Context, rc resumeContext, state *ir.MigrationState, schema *ir.Schema, sw ir.SchemaWriter, upfront bool) error {
+	if err := markPhase(ctx, rc, state, ir.MigrationPhaseIndexes); err != nil {
+		_ = err
+	}
+	if err := migcore.RunDDLPhaseWithReparentRetry(ctx, "indexes", sw, func(ctx context.Context) error {
+		return sw.CreateIndexes(ctx, schema)
+	}); err != nil {
+		label := "pipeline: create indexes: %w"
+		if upfront {
+			label = "pipeline: create indexes (upfront): %w"
+		}
+		err = fmt.Errorf(label, err)
+		return migcore.WrapWithHint(migcore.PhaseIndexes, markFailed(ctx, rc, *state, ir.MigrationPhaseIndexes, err))
+	}
+	if upfront {
+		progress.FromContext(ctx).PhaseCompletedEarly(migPhase(ir.MigrationPhaseIndexes))
+	} else {
+		progress.FromContext(ctx).PhaseCompleted(migPhase(ir.MigrationPhaseIndexes))
+	}
+	return nil
+}
+
+func runConstraintsPhase(ctx context.Context, rc resumeContext, state *ir.MigrationState, schema *ir.Schema, sw ir.SchemaWriter) error {
+	if err := markPhase(ctx, rc, state, ir.MigrationPhaseConstraints); err != nil {
+		_ = err
+	}
+	if err := migcore.RunDDLPhaseWithReparentRetry(ctx, "constraints", sw, func(ctx context.Context) error {
+		return sw.CreateConstraints(ctx, schema)
+	}); err != nil {
+		err = fmt.Errorf("pipeline: create constraints: %w", err)
+		return migcore.WrapWithHint(migcore.PhaseConstraints, markFailed(ctx, rc, *state, ir.MigrationPhaseConstraints, err))
+	}
+	reportDegradedFKs(ctx, sw)
+	progress.FromContext(ctx).PhaseCompleted(migPhase(ir.MigrationPhaseConstraints))
+	return nil
+}
+
+// runRecordedViewsPhase is the recorded wrapper around
+// [migcore.RunViewsPhase] — final phase, so every referenced base table
+// exists by the time a view is created.
+func runRecordedViewsPhase(ctx context.Context, rc resumeContext, state *ir.MigrationState, schema *ir.Schema, sw ir.SchemaWriter) error {
+	if err := markPhase(ctx, rc, state, ir.MigrationPhaseViews); err != nil {
+		_ = err
+	}
+	if err := migcore.RunViewsPhase(ctx, schema, sw); err != nil {
+		return migcore.WrapWithHint(migcore.PhaseViews, markFailed(ctx, rc, *state, ir.MigrationPhaseViews, err))
+	}
+	progress.FromContext(ctx).PhaseCompleted(migPhase(ir.MigrationPhaseViews))
+	return nil
+}
+
 // runBulkCopyPhases is the resume-aware variant of [runBulkCopy].
 // Each of the five phases is a state-update boundary: state.Phase
 // flips before the work runs, and on success the next iteration
@@ -1775,16 +1861,9 @@ func runBulkCopyPhases(
 	// without clashing on the already-built indexes. When false this block is
 	// skipped and the phase order is byte-identical to before.
 	if upfrontIndexes {
-		if err := markPhase(ctx, rc, state, ir.MigrationPhaseIndexes); err != nil {
-			_ = err
+		if err := runIndexesPhase(ctx, rc, state, schema, sw, true); err != nil {
+			return err
 		}
-		if err := migcore.RunDDLPhaseWithReparentRetry(ctx, "indexes", sw, func(ctx context.Context) error {
-			return sw.CreateIndexes(ctx, schema)
-		}); err != nil {
-			err = fmt.Errorf("pipeline: create indexes (upfront): %w", err)
-			return migcore.WrapWithHint(migcore.PhaseIndexes, markFailed(ctx, rc, *state, ir.MigrationPhaseIndexes, err))
-		}
-		progress.FromContext(ctx).PhaseCompletedEarly(migPhase(ir.MigrationPhaseIndexes))
 	}
 
 	// Phase 2: bulk-copy. Per-table state-row updates here so a mid-
@@ -1831,16 +1910,9 @@ func runBulkCopyPhases(
 		progress.FromContext(ctx).PhaseCompleted(migPhase(ir.MigrationPhaseBulkCopy))
 
 		// Phase 3.5: identity sync.
-		if err := markPhase(ctx, rc, state, ir.MigrationPhaseIdentitySync); err != nil {
-			_ = err
+		if err := runIdentitySyncPhase(ctx, rc, state, schema, sw); err != nil {
+			return err
 		}
-		if err := migcore.RunDDLPhaseWithReparentRetry(ctx, "identity-sequences", sw, func(ctx context.Context) error {
-			return sw.SyncIdentitySequences(ctx, schema)
-		}); err != nil {
-			err = fmt.Errorf("pipeline: sync identity sequences: %w", err)
-			return migcore.WrapWithHint(migcore.PhaseSchemaApply, markFailed(ctx, rc, *state, ir.MigrationPhaseIdentitySync, err))
-		}
-		progress.FromContext(ctx).PhaseCompleted(migPhase(ir.MigrationPhaseIdentitySync))
 	} else if ib, ok := sw.(ir.IncrementalIndexBuilder); ok {
 		if err := runOverlappedCopyAndIndexPhase(
 			ctx, rc, state, &stateMu, schema, rows, sw, rw, ib,
@@ -1855,16 +1927,9 @@ func runBulkCopyPhases(
 		// phase; it depends on the copied rows (sequence high-water mark),
 		// not on the indexes, so its position relative to index builds is
 		// immaterial.
-		if err := markPhase(ctx, rc, state, ir.MigrationPhaseIdentitySync); err != nil {
-			_ = err
+		if err := runIdentitySyncPhase(ctx, rc, state, schema, sw); err != nil {
+			return err
 		}
-		if err := migcore.RunDDLPhaseWithReparentRetry(ctx, "identity-sequences", sw, func(ctx context.Context) error {
-			return sw.SyncIdentitySequences(ctx, schema)
-		}); err != nil {
-			err = fmt.Errorf("pipeline: sync identity sequences: %w", err)
-			return migcore.WrapWithHint(migcore.PhaseSchemaApply, markFailed(ctx, rc, *state, ir.MigrationPhaseIdentitySync, err))
-		}
-		progress.FromContext(ctx).PhaseCompleted(migPhase(ir.MigrationPhaseIdentitySync))
 	} else {
 		// Fallback (MySQL): serial copy → identity-sync → whole-schema
 		// indexes, the pre-ADR-0077 ordering.
@@ -1877,28 +1942,14 @@ func runBulkCopyPhases(
 		progress.FromContext(ctx).PhaseCompleted(migPhase(ir.MigrationPhaseBulkCopy))
 
 		// Phase 3.5: identity sync.
-		if err := markPhase(ctx, rc, state, ir.MigrationPhaseIdentitySync); err != nil {
-			_ = err
+		if err := runIdentitySyncPhase(ctx, rc, state, schema, sw); err != nil {
+			return err
 		}
-		if err := migcore.RunDDLPhaseWithReparentRetry(ctx, "identity-sequences", sw, func(ctx context.Context) error {
-			return sw.SyncIdentitySequences(ctx, schema)
-		}); err != nil {
-			err = fmt.Errorf("pipeline: sync identity sequences: %w", err)
-			return migcore.WrapWithHint(migcore.PhaseSchemaApply, markFailed(ctx, rc, *state, ir.MigrationPhaseIdentitySync, err))
-		}
-		progress.FromContext(ctx).PhaseCompleted(migPhase(ir.MigrationPhaseIdentitySync))
 
 		// Phase 4: indexes.
-		if err := markPhase(ctx, rc, state, ir.MigrationPhaseIndexes); err != nil {
-			_ = err
+		if err := runIndexesPhase(ctx, rc, state, schema, sw, false); err != nil {
+			return err
 		}
-		if err := migcore.RunDDLPhaseWithReparentRetry(ctx, "indexes", sw, func(ctx context.Context) error {
-			return sw.CreateIndexes(ctx, schema)
-		}); err != nil {
-			err = fmt.Errorf("pipeline: create indexes: %w", err)
-			return migcore.WrapWithHint(migcore.PhaseIndexes, markFailed(ctx, rc, *state, ir.MigrationPhaseIndexes, err))
-		}
-		progress.FromContext(ctx).PhaseCompleted(migPhase(ir.MigrationPhaseIndexes))
 	}
 
 	// Loud-failure safety net (SLUICE-E-INDEX-MISSING): every branch above —
@@ -1935,29 +1986,17 @@ func runBulkCopyPhases(
 	}
 
 	// Phase 5: constraints.
-	if err := markPhase(ctx, rc, state, ir.MigrationPhaseConstraints); err != nil {
-		_ = err
+	if err := runConstraintsPhase(ctx, rc, state, schema, sw); err != nil {
+		return err
 	}
-	if err := migcore.RunDDLPhaseWithReparentRetry(ctx, "constraints", sw, func(ctx context.Context) error {
-		return sw.CreateConstraints(ctx, schema)
-	}); err != nil {
-		err = fmt.Errorf("pipeline: create constraints: %w", err)
-		return migcore.WrapWithHint(migcore.PhaseConstraints, markFailed(ctx, rc, *state, ir.MigrationPhaseConstraints, err))
-	}
-	reportDegradedFKs(ctx, sw)
-	progress.FromContext(ctx).PhaseCompleted(migPhase(ir.MigrationPhaseConstraints))
 
 	// Phase 6: views. Final phase so all referenced base tables
 	// exist by the time the view is created. View-to-view dependency
 	// ordering uses a single-pass-with-retries policy (see
 	// [migcore.RunViewsPhase]) — no SQL parser, no topological sort.
-	if err := markPhase(ctx, rc, state, ir.MigrationPhaseViews); err != nil {
-		_ = err
+	if err := runRecordedViewsPhase(ctx, rc, state, schema, sw); err != nil {
+		return err
 	}
-	if err := migcore.RunViewsPhase(ctx, schema, sw); err != nil {
-		return migcore.WrapWithHint(migcore.PhaseViews, markFailed(ctx, rc, *state, ir.MigrationPhaseViews, err))
-	}
-	progress.FromContext(ctx).PhaseCompleted(migPhase(ir.MigrationPhaseViews))
 
 	// Advisory post-success phase: `--analyze-after` (perf research delta
 	// 4). Runs LAST — after constraints and views — so the refreshed

@@ -3721,6 +3721,7 @@ type TableChunkProgress struct {
 //	started_at      TIMESTAMP NOT NULL
 //	updated_at      TIMESTAMP NOT NULL
 //	last_error      TEXT          -- truncated to 1KB on write
+//	snapshot_anchor TEXT          -- this run's snapshot anchor token, or NULL
 //
 //	-- sluice_migrate_table_progress (one row per table)
 //	migration_id    TEXT NOT NULL
@@ -3744,6 +3745,48 @@ type MigrationState struct {
 	StartedAt     time.Time
 	UpdatedAt     time.Time
 	LastError     string
+
+	// SnapshotAnchor is the [Position.Token] of the snapshot this run
+	// copied from — the source position at which its consistent view
+	// was captured — recorded when the run starts so a later process
+	// can ask whether the source still stands exactly there.
+	//
+	// Only a `sync` cold start records one (see the pipeline's sync
+	// recording context); `migrate` leaves it empty, and so does every
+	// header row written by a binary older than the column. EMPTY
+	// therefore means "this run recorded no anchor", never "the anchor
+	// was the empty position" — the two are indistinguishable in this
+	// column, so callers must read empty as NO EVIDENCE and refuse
+	// rather than assume.
+	//
+	// It is an opaque TOKEN, stored and read back verbatim: only the
+	// engine that wrote it can interpret it (see
+	// [SnapshotAnchorVerifier]), so this column must never normalise,
+	// re-encode or truncate it.
+	SnapshotAnchor string
+}
+
+// SnapshotAnchorRecorder is the OPTIONAL write half of
+// [MigrationStateStore] for [MigrationState.SnapshotAnchor].
+//
+// It is deliberately separate from Write. Write's header upsert is
+// issued at every phase transition, from whatever state value the
+// caller happens to hold — so carrying the anchor through it would
+// oblige every one of those call sites to keep re-supplying the token,
+// and a caller that simply did not know about it would erase the
+// resume evidence on its next phase mark. This method touches the
+// anchor column and nothing else; the phase writers touch every column
+// except it.
+//
+// A store that does not implement it records no anchor, and the
+// consequence is stated rather than implied: a cold start against such
+// a target cannot be resumed after a stop and gets the same refusal it
+// gets today.
+type SnapshotAnchorRecorder interface {
+	// WriteSnapshotAnchor records anchor as the snapshot anchor of
+	// migrationID, creating the header row (at [MigrationPhasePending])
+	// when none exists yet. The token is stored verbatim.
+	WriteSnapshotAnchor(ctx context.Context, migrationID, anchor string) error
 }
 
 // MigrationStateLister is the OPTIONAL enumeration half of
@@ -4260,6 +4303,62 @@ type CDCReaderWithSlotOpener interface {
 // — Postgres implements both.
 type SnapshotStreamWithSlotOpener interface {
 	OpenSnapshotStreamWithSlot(ctx context.Context, dsn, slotName string) (*SnapshotStream, error)
+}
+
+// ErrSnapshotAnchorAbsent is the verdict
+// [SnapshotAnchorVerifier.VerifySnapshotAnchor] wraps when the
+// server-side object the recorded anchor names is simply GONE (the
+// replication slot was dropped). It is a distinct answer from "the
+// anchor exists but has moved", because the two call for opposite
+// caller behaviour: an absent anchor means there is nothing to resume
+// from and the caller proceeds exactly as it would without this
+// surface, while a MOVED anchor means a resume would silently skip
+// changes and the caller must refuse.
+//
+// Callers classify with [errors.Is]; never by matching the message.
+var ErrSnapshotAnchorAbsent = errors.New("ir: the recorded snapshot anchor no longer exists on the source")
+
+// SnapshotAnchorVerifier is the OPTIONAL SOURCE-engine surface that
+// answers one question, and only for the engine that wrote the token:
+// does this source still stand EXACTLY at the anchor a previous run
+// recorded, with nothing consumed since?
+//
+// # Why the engine has to answer it
+//
+// The anchor is an opaque [Position] token
+// ([MigrationState.SnapshotAnchor]). Deciding whether the source has
+// moved past it means comparing that token against live server state
+// — on Postgres, the slot's confirmed_flush_lsn against the token's
+// LSN, in the server's own pg_lsn ordering. That is engine knowledge,
+// so the comparison lives engine-side and the orchestrator carries the
+// token without ever parsing it (IR-first).
+//
+// # What a nil error licenses
+//
+// Exactly one thing: the returned Position may be used as a CDC
+// resume anchor for work the source has NOT yet delivered. It is the
+// independent witness behind skipping a bulk copy, so an
+// implementation must prove the anchor unconsumed rather than assume
+// it — "the object exists" is not the question.
+//
+// Implementations MUST NOT create, drop, advance or consume anything.
+type SnapshotAnchorVerifier interface {
+	// VerifySnapshotAnchor returns the resumable Position for
+	// recordedAnchor when the source still stands exactly at it.
+	//
+	// slotName is the caller's resolved slot name (empty means "the
+	// engine default"); an engine with no slot concept ignores it.
+	//
+	// Errors:
+	//   - wrapping [ErrSnapshotAnchorAbsent]: the anchor's server-side
+	//     object is gone. The caller proceeds as it would without this
+	//     surface.
+	//   - any other error: the anchor could NOT be proven unconsumed —
+	//     it moved, something is attached to it, or the probe failed.
+	//     The message must name what was recorded and what was
+	//     observed, because the caller's only sound response is to
+	//     refuse and hand those two values to an operator.
+	VerifySnapshotAnchor(ctx context.Context, dsn, slotName, recordedAnchor string) (Position, error)
 }
 
 // SnapshotStreamResumer is the optional engine surface for resuming an

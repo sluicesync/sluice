@@ -866,6 +866,33 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, lsnTrac
 			warmResumed = false
 		}
 	default:
+		// A0909-STOP-1: before cold-starting, ask whether a PREVIOUS cold
+		// start for this stream already committed the whole copy and was
+		// STOPPED before its anchor was written. This is the only branch
+		// that asks, and deliberately: `found` is false here, which is
+		// the gate's "no cdc-state row" condition, and the branches above
+		// are the ones where the operator asked for something else
+		// (--reset-target-data, --restart-from-scratch, an interrupted-
+		// COPY cursor, a warm resume). handled=false means no such state
+		// exists and the cold start below runs exactly as before —
+		// including its refusals.
+		//
+		// warmResumed stays FALSE on the resumed path even though it ends
+		// in warmResume: the schema-history cache prime keys on "is this
+		// stream's applier resuming a stream it has applied before", and
+		// this one has applied nothing. Its copy is a cold start's, so it
+		// gets the brand-new-stream sentinel, exactly as coldStart does.
+		if resumedChanges, resumedStop, handled, resumeErr := s.resumeStoppedColdStart(
+			ctx, streamCtx, lsnTracker, applier, streamID,
+		); handled {
+			if resumeErr != nil {
+				if resumedStop != nil {
+					resumedStop()
+				}
+				return nil, func() {}, false, resumeErr
+			}
+			return resumedChanges, resumedStop, false, nil
+		}
 		changes, stop, err = s.coldStart(streamCtx, lsnTracker, applier, streamID, ir.Position{}, freshCopyNone)
 	}
 	return changes, stop, warmResumed, err

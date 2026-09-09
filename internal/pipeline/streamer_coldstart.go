@@ -729,11 +729,16 @@ func (s *Streamer) coldStartOpenSnapshot(ctx context.Context, applier ir.ChangeA
 // roadmap item 144); 0 means the target declared none. It is returned
 // rather than stashed on the Streamer so the value cannot be read by a
 // path that never ran this preflight.
-func (s *Streamer) coldStartOpenTargetWriters(ctx context.Context, schema *ir.Schema, stream *ir.SnapshotStream) (ir.SchemaWriter, ir.RowWriter, int, error) {
+// openColdStartSchemaWriter opens the target SchemaWriter and applies
+// every cold-start knob that shapes the DDL phases. Split out of
+// [Streamer.coldStartOpenTargetWriters] so the stopped-cold-start
+// resume — which finishes those same DDL phases with no copy and no
+// snapshot stream in front of it — opens an IDENTICALLY configured
+// writer rather than a similar one; a knob added here reaches both.
+func (s *Streamer) openColdStartSchemaWriter(ctx context.Context) (ir.SchemaWriter, error) {
 	sw, err := s.Target.OpenSchemaWriter(ctx, s.TargetDSN)
 	if err != nil {
-		_ = stream.Abandon()
-		return nil, nil, 0, connectHint(fmt.Errorf("pipeline: open target schema writer: %w", err))
+		return nil, connectHint(fmt.Errorf("pipeline: open target schema writer: %w", err))
 	}
 	migcore.ApplyTargetSchema(sw, s.TargetSchema)
 	applyIndexBuildMem(sw, s.IndexBuildMem)
@@ -751,8 +756,16 @@ func (s *Streamer) coldStartOpenTargetWriters(ctx context.Context, schema *ir.Sc
 	migcore.ArmForeignKeyConsistency(sw, len(s.RowFilters) == 0)
 	if err := applyEnabledPGExtensions(ctx, sw, s.EnabledPGExtensions); err != nil {
 		migcore.CloseIf(sw)
+		return nil, connectHint(fmt.Errorf("pipeline: enable PG extensions on target: %w", err))
+	}
+	return sw, nil
+}
+
+func (s *Streamer) coldStartOpenTargetWriters(ctx context.Context, schema *ir.Schema, stream *ir.SnapshotStream) (ir.SchemaWriter, ir.RowWriter, int, error) {
+	sw, err := s.openColdStartSchemaWriter(ctx)
+	if err != nil {
 		_ = stream.Abandon()
-		return nil, nil, 0, connectHint(fmt.Errorf("pipeline: enable PG extensions on target: %w", err))
+		return nil, nil, 0, err
 	}
 	rw, err := s.Target.OpenRowWriter(ctx, s.TargetDSN)
 	if err != nil {

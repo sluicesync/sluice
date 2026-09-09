@@ -51,28 +51,10 @@ type psQueryTimeoutRaiseRecord struct {
 }
 
 // ensurePSQueryTimeoutRaiseColumn adds the ps_query_timeout_raise column to a
-// header table created by a binary that predates ADR-0182. Detect-then-ALTER,
-// mirroring ensureStateFormatColumn (portable below MySQL 8.0.29, which lacks
-// ADD COLUMN IF NOT EXISTS).
+// header table created by a binary that predates ADR-0182. Detect-then-ALTER
+// via the shared [MigrationStateStore.ensureHeaderColumn].
 func (s *MigrationStateStore) ensurePSQueryTimeoutRaiseColumn(ctx context.Context) error {
-	const checkQ = `
-		SELECT COUNT(*)
-		FROM   information_schema.COLUMNS
-		WHERE  TABLE_SCHEMA = DATABASE()
-		  AND  TABLE_NAME   = ?
-		  AND  COLUMN_NAME  = 'ps_query_timeout_raise'`
-	var n int
-	if err := s.db.QueryRowContext(ctx, checkQ, migrateStateTableName).Scan(&n); err != nil {
-		return fmt.Errorf("mysql: ensure migrate-state table: detect ps_query_timeout_raise: %w", err)
-	}
-	if n > 0 {
-		return nil
-	}
-	const alter = "ALTER TABLE `" + migrateStateTableName + "` ADD COLUMN ps_query_timeout_raise TEXT NULL"
-	if _, err := s.db.ExecContext(ctx, alter); err != nil {
-		return fmt.Errorf("mysql: ensure migrate-state table: add ps_query_timeout_raise: %w", wrapControlTableBootstrapError(err, alter))
-	}
-	return nil
+	return s.ensureHeaderColumn(ctx, "ps_query_timeout_raise", "TEXT NULL")
 }
 
 // ReadQueryTimeoutRaise implements [ir.QueryTimeoutRaiseRecorder]. A missing

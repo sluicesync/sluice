@@ -83,25 +83,38 @@ func (s *Streamer) abandonUnlessStopped(ctx context.Context, stream *ir.Snapshot
 	if slot == "" {
 		slot = defaultSlotNameForAdvice
 	}
-	// The truth about what the kept slot buys, stated in the message
-	// because v0.148.0's did not (audit 2026-09-09 A0909-STOP-1): this
-	// door only ever fires BEFORE coldStartBeginCDC's anchor write, so no
-	// persisted position exists yet. A re-run with the same --stream-id
-	// finds no position, cold-starts, and refuses on the existing slot —
-	// it does NOT resume. The slot is kept because its consistent point
-	// is the anchor a handoff-resume path will need; until that path
-	// ships, the only way forward is to drop it and re-copy, and an
-	// operator must not be told otherwise while WAL accumulates.
+	// What the kept slot buys, stated in the message rather than assumed
+	// (audit 2026-09-09 A0909-STOP-1). This door fires BEFORE
+	// coldStartBeginCDC's anchor write, so no CDC position exists yet —
+	// and until A0909-STOP-1 shipped, that meant the kept slot bought
+	// nothing at all and the message had to say so.
+	//
+	// It now buys the handoff resume ([Streamer.resumeStoppedColdStart]):
+	// the slot's consistent point IS the anchor, and a re-run picks the
+	// copy up where it stopped. But only for the case that resume can
+	// PROVE — a PostgreSQL source, whose recording cold start finished
+	// copying every in-scope table — so this message must not promise it
+	// unconditionally. It names both outcomes and the one signal that
+	// separates them at re-run time (COLD-START-RESUMED in the log), and
+	// keeps the drop-and-re-copy exit for the cases that still need it.
+	//
+	// The WAL warning stays first either way: a slot kept for a resume
+	// the operator never runs pins WAL exactly as hard as one kept for
+	// nothing.
 	slog.WarnContext(ctx, "pipeline: "+stoppedSlotKeptMarker+": the cold start was STOPPED after rows had "+
 		"already been written but BEFORE the CDC anchor was recorded, so the source's replication slot was KEPT "+
-		"rather than dropped. The slot now PINS WAL on the source and will keep doing so until you act. "+
-		// remedy-partial: both `sync start` mentions are the operator's OWN original invocation, which sluice cannot
+		"rather than dropped. The slot now PINS WAL on the source and will keep doing so until you resume or "+
+		"drop it. "+
+		// remedy-partial: every `sync start` mention is the operator's OWN original invocation, which sluice cannot
 		// render — the source and target flags are DSNs carrying credentials, and echoing them into a log line to
 		// satisfy a paste-ability gate would leak them into every log sink the operator ships to.
-		"THIS RELEASE CANNOT RESUME FROM THIS STATE: re-running `sluice sync start` with the same --stream-id "+ // remedy-partial: the operator's own invocation
-		"finds no recorded position and refuses on the existing slot (handoff resume is tracked as A0909-STOP-1). "+
-		"To move on, drop the slot with `sluice slot drop --source-driver postgres --source <DSN> "+slot+" --yes` "+
-		"(add --force only if a consumer is still attached), then re-run `sluice sync start` with "+ // remedy-partial: the operator's own invocation
+		"TO RESUME: re-run `sluice sync start` with the same --stream-id. "+ // remedy-partial: the operator's own invocation
+		"If the copy had finished every in-scope table and this slot is still exactly where the snapshot was "+
+		"taken, the re-run SKIPS the copy, finishes the remaining phases and starts CDC from this slot — look "+
+		"for COLD-START-RESUMED in its output. That resume needs a PostgreSQL source; on any other source, and "+
+		"on a copy that had not finished, the re-run instead refuses on the existing slot. "+
+		"IF IT REFUSES: drop the slot with `sluice slot drop --source-driver postgres --source <DSN> "+slot+
+		" --yes` (add --force only if a consumer is still attached), then re-run `sluice sync start` with "+ // remedy-partial: the operator's own invocation
 		"--reset-target-data to copy again. On a busy source an unattended slot can fill the disk",
 		slog.String("slot", slot),
 		slog.String("cause", cause.Error()))

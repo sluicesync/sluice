@@ -164,24 +164,35 @@ func newScriptedStore(steps []msStep) (*Store, *[]msStep, *[]string) {
 			},
 		},
 		SQL: SQL{
-			ReadHeader:         "READ_HEADER",
-			ReadProgressRows:   "READ_PROGRESS",
-			UpsertHeader:       "UPSERT_HEADER",
-			UpsertProgressRow:  "UPSERT_PROGRESS",
-			MarkUpgraded:       "MARK_UPGRADED",
-			DeleteHeader:       "DELETE_HEADER",
-			DeleteProgressRows: "DELETE_PROGRESS",
+			ReadHeader:           "READ_HEADER",
+			ReadProgressRows:     "READ_PROGRESS",
+			UpsertHeader:         "UPSERT_HEADER",
+			UpsertProgressRow:    "UPSERT_PROGRESS",
+			UpsertSnapshotAnchor: "UPSERT_ANCHOR",
+			MarkUpgraded:         "MARK_UPGRADED",
+			DeleteHeader:         "DELETE_HEADER",
+			DeleteProgressRows:   "DELETE_PROGRESS",
 		},
 	}, stepsPtr, seen
 }
 
 // headerRow builds a scripted header-row result in the ReadHeader
 // projection order: (phase, table_progress, state_format, started_at,
-// updated_at, last_error).
+// updated_at, last_error, snapshot_anchor), with a NULL anchor.
+//
+// The NULL is the point, not a convenience: it is exactly what a binary
+// older than the snapshot_anchor column left behind (the column is
+// added NULLable and defaultless), so every test using this helper is
+// also reading a row that older sluice wrote. [headerRowWithAnchor]
+// covers the rows this binary writes.
 func headerRow(phase string, blob any, format int, started, updated time.Time, lastError any) *msRows {
+	return headerRowWithAnchor(phase, blob, format, started, updated, lastError, nil)
+}
+
+func headerRowWithAnchor(phase string, blob any, format int, started, updated time.Time, lastError, anchor any) *msRows {
 	return &msRows{
-		cols: []string{"phase", "table_progress", "state_format", "started_at", "updated_at", "last_error"},
-		vals: [][]driver.Value{{phase, blob, int64(format), started, updated, lastError}},
+		cols: []string{"phase", "table_progress", "state_format", "started_at", "updated_at", "last_error", "snapshot_anchor"},
+		vals: [][]driver.Value{{phase, blob, int64(format), started, updated, lastError, anchor}},
 	}
 }
 
@@ -575,6 +586,114 @@ func TestValidationErrors(t *testing.T) {
 	}
 	if err := store.ClearMigration(ctx, ""); err == nil || !strings.Contains(err.Error(), "migrationID is empty") {
 		t.Errorf("ClearMigration(\"\") err = %v", err)
+	}
+}
+
+// TestSnapshotAnchor_RoundTripsVerbatim is the persisted-state codec
+// pin for the A0909-STOP-1 anchor column.
+//
+// The anchor is an opaque position token that a later run compares
+// against live source state to decide whether it may SKIP a bulk copy.
+// A value this store trimmed, re-encoded or truncated would compare
+// unequal (a needless re-copy) or, worse, compare equal to something
+// it is not. So the pin is byte-exactness across the shapes a token
+// can carry — not one representative string.
+func TestSnapshotAnchor_RoundTripsVerbatim(t *testing.T) {
+	cases := []struct {
+		name   string
+		anchor string
+	}{
+		{"the real postgres shape", `{"slot":"sluice_slot","lsn":"0/1946620"}`},
+		{"with the identity pin populated", `{"slot":"sluice_slot","lsn":"1A/FFFFFFFF","systemid":"7412345678901234567","timeline":3}`},
+		// A token is JSON, so quotes, backslashes and braces are ordinary
+		// content; a store that re-encoded it would change them.
+		{"quotes and backslashes", `{"slot":"sluice_a\"b\\c","lsn":"0/1"}`},
+		// Multi-byte and non-ASCII: a slot name cannot carry these today,
+		// but the column's contract is "verbatim", and a column that only
+		// holds ASCII verbatim is a column with an unwritten limit.
+		{"multi-byte", `{"slot":"sluice_données_🚰","lsn":"0/2"}`},
+		// Leading/trailing whitespace is the shape a TRIM would eat.
+		{"surrounding whitespace", "  {\"slot\":\"sluice_slot\",\"lsn\":\"0/3\"}\t"},
+		{"a very long token", `{"slot":"sluice_` + strings.Repeat("s", 400) + `","lsn":"0/4"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Write: the anchor must reach the statement's args untouched.
+			store, _, seen := newScriptedStore([]msStep{{}})
+			if err := store.WriteSnapshotAnchor(context.Background(), "m1", tc.anchor); err != nil {
+				t.Fatalf("WriteSnapshotAnchor: %v", err)
+			}
+			wantStmt := "UPSERT_ANCHOR | m1,pending," + UpgradedBlobSentinel + ",2," + tc.anchor
+			assertSeen(t, *seen, []string{wantStmt})
+
+			// Read: and come back out of the column untouched.
+			store, _, _ = newScriptedStore([]msStep{
+				{rows: headerRowWithAnchor("indexes", UpgradedBlobSentinel, FormatPerTableRows, t1, t2, nil, tc.anchor)},
+				{rows: progressRows([]driver.Value{"users", `"complete"`, t1})},
+			})
+			got, ok, err := store.Read(context.Background(), "m1")
+			if err != nil || !ok {
+				t.Fatalf("Read = ok=%v err=%v", ok, err)
+			}
+			if got.SnapshotAnchor != tc.anchor {
+				t.Errorf("SnapshotAnchor round-tripped as %q; want %q byte-for-byte — this token is compared "+
+					"against the source's live position to authorise skipping a copy", got.SnapshotAnchor, tc.anchor)
+			}
+		})
+	}
+}
+
+// TestSnapshotAnchor_AbsentColumnReadsAsNoEvidence is the CROSS-VERSION
+// half: a header row written before the column existed carries SQL
+// NULL there (the column is added NULLable and defaultless), and must
+// read back as the empty string with every other field intact.
+//
+// The fixture is what the OLDER binary would have produced — a NULL —
+// rather than this binary's output, which is the distinction that made
+// item 104's frozen-golden gate self-referential.
+func TestSnapshotAnchor_AbsentColumnReadsAsNoEvidence(t *testing.T) {
+	store, _, _ := newScriptedStore([]msStep{
+		// headerRow's anchor is nil by construction: an older binary's row.
+		{rows: headerRow("bulk_copy", UpgradedBlobSentinel, FormatPerTableRows, t1, t2, "boom")},
+		{rows: progressRows([]driver.Value{"users", `"complete"`, t1})},
+	})
+	got, ok, err := store.Read(context.Background(), "m1")
+	if err != nil || !ok {
+		t.Fatalf("Read of a pre-anchor row = ok=%v err=%v; an older binary's row must still read cleanly", ok, err)
+	}
+	if got.SnapshotAnchor != "" {
+		t.Errorf("SnapshotAnchor = %q for a NULL column; want \"\" (no evidence)", got.SnapshotAnchor)
+	}
+	if got.Phase != ir.MigrationPhaseBulkCopy || got.LastError != "boom" ||
+		got.TableProgress["users"].State != ir.TableProgressComplete {
+		t.Errorf("the rest of the pre-anchor row did not survive the added column: %+v", got)
+	}
+}
+
+// TestWriteSnapshotAnchor_Refusals pins the two ways this write must
+// refuse rather than record something meaningless.
+func TestWriteSnapshotAnchor_Refusals(t *testing.T) {
+	ctx := context.Background()
+	store, _, seen := newScriptedStore(nil)
+	if err := store.WriteSnapshotAnchor(ctx, "m1", ""); err == nil || !strings.Contains(err.Error(), "anchor is empty") {
+		t.Errorf("WriteSnapshotAnchor with an empty anchor = %v; want a refusal — \"\" is the column's "+
+			"no-evidence value, so storing it would record an absence as if it were an anchor", err)
+	}
+	if err := store.WriteSnapshotAnchor(ctx, "", "tok"); err == nil || !strings.Contains(err.Error(), "migrationID is empty") {
+		t.Errorf("WriteSnapshotAnchor without an id = %v", err)
+	}
+	if len(*seen) != 0 {
+		t.Errorf("a refused anchor write still issued statements: %q", *seen)
+	}
+
+	// An engine that supplies no statement must refuse, not no-op: a
+	// silent no-op would leave the resume gate finding no anchor and
+	// nobody knowing why.
+	noStmt, _, _ := newScriptedStore(nil)
+	noStmt.SQL.UpsertSnapshotAnchor = ""
+	if err := noStmt.WriteSnapshotAnchor(ctx, "m1", "tok"); err == nil ||
+		!strings.Contains(err.Error(), "no snapshot-anchor statement") {
+		t.Errorf("WriteSnapshotAnchor on a store with no statement = %v; want a refusal", err)
 	}
 }
 

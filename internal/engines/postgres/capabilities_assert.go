@@ -55,6 +55,7 @@ var (
 	// the table filter at all — which is how a DDL on an --exclude-table'd
 	// table could still take a filtered stream down.
 	_ ir.CDCScopePredicateSetter      = (*CDCReader)(nil)
+	_ ir.SnapshotAnchorVerifier       = Engine{}
 	_ ir.SnapshotExporter             = Engine{}
 	_ ir.SnapshotImporterOpener       = Engine{}
 	_ ir.SnapshotStreamWithSlotOpener = Engine{}
@@ -214,6 +215,10 @@ var (
 	_ ir.SnapshotImporter     = (*SnapshotImporter)(nil)
 	_ ir.MigrationStateStore  = (*MigrationStateStore)(nil)
 	_ ir.MigrationStateLister = (*MigrationStateStore)(nil)
+	// A0909-STOP-1: without this the recording cold start records no
+	// snapshot anchor and a stop after the copy is unresumable again —
+	// silently, since the resume gate simply finds no evidence.
+	_ ir.SnapshotAnchorRecorder = (*MigrationStateStore)(nil)
 	// StreamPublicationDropper backs `sluice sync decommission`'s
 	// per-stream publication removal (audit 2026-07-23 DEVEX-3/Q3); a
 	// method-set drift would silently downgrade PG decommission to

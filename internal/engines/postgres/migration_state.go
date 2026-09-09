@@ -74,8 +74,8 @@ func newMigrationStateStore(db *sql.DB, schema string) *MigrationStateStore {
 				IsMissingTable: isUndefinedRelationErr,
 			},
 			SQL: migratestate.SQL{
-				ReadHeader: "SELECT phase, table_progress, state_format, started_at, updated_at, last_error FROM " +
-					hdr + " WHERE migration_id = $1",
+				ReadHeader: "SELECT phase, table_progress, state_format, started_at, updated_at, last_error, " +
+					"snapshot_anchor FROM " + hdr + " WHERE migration_id = $1",
 				ReadProgressRows: "SELECT table_name, progress, updated_at FROM " +
 					prog + " WHERE migration_id = $1",
 				ListHeadersByPrefix: "SELECT migration_id, phase, started_at, updated_at, last_error FROM " +
@@ -110,6 +110,15 @@ func newMigrationStateStore(db *sql.DB, schema string) *MigrationStateStore {
 					"state_format = EXCLUDED.state_format, " +
 					"updated_at = pg_catalog.timezone('utc', pg_catalog.now()), " +
 					"last_error = EXCLUDED.last_error",
+				// Anchor-only: on conflict this touches snapshot_anchor and
+				// nothing else, so it can never move the phase a concurrent
+				// or later phase mark owns (migratestate.SQL).
+				UpsertSnapshotAnchor: "INSERT INTO " + hdr + " " +
+					"(migration_id, phase, table_progress, state_format, started_at, updated_at, snapshot_anchor) " +
+					"VALUES ($1, $2, $3, $4, pg_catalog.timezone('utc', pg_catalog.now()), pg_catalog.timezone('utc', pg_catalog.now()), $5) " +
+					"ON CONFLICT (migration_id) DO UPDATE SET " +
+					"snapshot_anchor = EXCLUDED.snapshot_anchor, " +
+					"updated_at = pg_catalog.timezone('utc', pg_catalog.now())",
 				UpsertProgressRow: "INSERT INTO " + prog + " " +
 					"(migration_id, table_name, progress, updated_at) " +
 					"VALUES ($1, $2, $3, pg_catalog.timezone('utc', pg_catalog.now())) " +
@@ -159,6 +168,7 @@ func (s *MigrationStateStore) EnsureControlTable(ctx context.Context) error {
 			started_at      TIMESTAMP    NOT NULL DEFAULT (pg_catalog.timezone('utc', pg_catalog.now())),
 			updated_at      TIMESTAMP    NOT NULL DEFAULT (pg_catalog.timezone('utc', pg_catalog.now())),
 			last_error      TEXT         NULL,
+			snapshot_anchor TEXT         NULL,
 			PRIMARY KEY (migration_id)
 		)`
 	if _, err := s.db.ExecContext(ctx, hdrDDL); err != nil {
@@ -168,6 +178,14 @@ func (s *MigrationStateStore) EnsureControlTable(ctx context.Context) error {
 		" ADD COLUMN IF NOT EXISTS state_format INT NOT NULL DEFAULT 1"
 	if _, err := s.db.ExecContext(ctx, addFormat); err != nil {
 		return fmt.Errorf("postgres: ensure migrate-state table: add state_format: %w", err)
+	}
+	// snapshot_anchor (A0909-STOP-1): NULLable and defaultless, so an
+	// existing row keeps reading as "no anchor recorded" — which is what
+	// it is. Same additive shape as state_format above.
+	addAnchor := "ALTER TABLE " + hdr +
+		" ADD COLUMN IF NOT EXISTS snapshot_anchor TEXT NULL"
+	if _, err := s.db.ExecContext(ctx, addAnchor); err != nil {
+		return fmt.Errorf("postgres: ensure migrate-state table: add snapshot_anchor: %w", err)
 	}
 	progDDL := `
 		CREATE TABLE IF NOT EXISTS ` + prog + ` (
@@ -213,6 +231,13 @@ func (s *MigrationStateStore) Write(ctx context.Context, state ir.MigrationState
 // per-checkpoint write (ADR-0082).
 func (s *MigrationStateStore) WriteTableProgress(ctx context.Context, migrationID, tableName string, progress ir.TableProgress) error {
 	return s.shared.WriteTableProgress(ctx, migrationID, tableName, progress)
+}
+
+// WriteSnapshotAnchor implements [ir.SnapshotAnchorRecorder]: it
+// records the run's snapshot anchor token on the header row and
+// touches no other column.
+func (s *MigrationStateStore) WriteSnapshotAnchor(ctx context.Context, migrationID, anchor string) error {
+	return s.shared.WriteSnapshotAnchor(ctx, migrationID, anchor)
 }
 
 // ClearMigration deletes the progress rows and header row for

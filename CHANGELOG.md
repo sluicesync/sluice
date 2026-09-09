@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Added
+
+**A PostgreSQL cold start that was STOPPED after its bulk copy finished can be resumed by re-running it, instead of costing a full re-copy** (audit A0909-STOP-1). v0.148.0 made such a stop keep the source's replication slot rather than drop it, on the reasoning that the slot's consistent point is the anchor a resume would need; v0.148.2's notes had to admit the kept slot bought nothing, because the CDC anchor is written only at the very end of the handoff, so a stop before it left no position and the re-run refused on the existing slot. The v0.148.2 regression cycle re-copied 2.5M rows to get out of it. The cold start now records its snapshot anchor when it starts, in a new NULLable `snapshot_anchor` column on `sluice_migrate_state`, and a re-run with the same `--stream-id` skips the copy, finishes the remaining phases and starts CDC from that anchor, announcing it under `COLD-START-RESUMED`. Every source change committed during the stop is still on the slot and is delivered.
+
+The resume takes four separate proofs and refuses rather than guessing on any of them: the source must be PostgreSQL (the new `SnapshotAnchorVerifier` capability, which no other engine implements — every other source keeps today's refusal exactly); there must be no `sluice_cdc_state` row, so an ordinary warm resume is never touched; the recorded run must have finished copying **every in-scope table**, judged on the per-table progress rows rather than the phase, because on the PostgreSQL path the copy and index build run overlapped under one errgroup and a cancelled index build records phase `indexes` over a copy that may still have been mid-table; and the slot must still be inactive with its `confirmed_flush_lsn` exactly equal to the recorded anchor, compared by the server in `pg_lsn` ordering. A slot that moved means something consumed the changes in between, so that case refuses loudly under `COLD-START-ANCHOR-MOVED` naming both positions, rather than resuming past them. The premise the whole thing rests on — that an unconsumed slot's `confirmed_flush_lsn` is its snapshot's consistent point — is measured against a real server on every integration run rather than asserted in a comment.
+
 ## [0.148.3] - 2026-09-09
 
 ### Fixed

@@ -355,6 +355,11 @@ func (s *Streamer) runColdStartParallel(
 		progressStore = nil
 	}
 	rc := newSyncRecordingContext(ctx, progressStore, streamID)
+	// Make the recorded state describe THIS run, and record the anchor a
+	// stop after the copy can be resumed from (A0909-STOP-1). The anchor
+	// is the snapshot's own consistent point — the position CDC would
+	// have started from had this run reached the handoff.
+	beginRecordedColdStart(ctx, rc, stream.Position.Token)
 	if progressStore != nil {
 		// Close the store we opened whether or not the context ended up
 		// recording: the P2 degrade path (tables could not be ensured)
