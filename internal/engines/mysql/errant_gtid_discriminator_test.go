@@ -211,17 +211,29 @@ func TestGTIDLineageDiscriminator_SeparatesErrantFromForeign(t *testing.T) {
 			name    string
 			verdict lineageVerdict
 			wantIn  string
+			// autoRecopy says whether the refusal may route into the
+			// streamer's automatic cold-start re-snapshot. The errant arm
+			// keeps that route (its remedy is executable on the source; a
+			// terminal refusal there on PlanetScale is a filed policy
+			// call). The FOREIGN arm must NOT: the re-snapshot would drop
+			// the target and re-copy from a different keyspace (audit
+			// 2026-09-09 A0909-MYSQL-HIGH-1).
+			autoRecopy bool
 		}{
-			{"errant refuses and says so", lineageErrantGTID, "ERRANT GTID"},
-			{"foreign refuses and says so", lineageForeign, "shares NONE"},
+			{"errant refuses and says so", lineageErrantGTID, "ERRANT GTID", true},
+			{"foreign refuses and says so", lineageForeign, "shares NONE", false},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				err := lineageRefusal(tc.verdict, sh, tgt, "a:1-2", "b:1-1")
 				if err == nil {
 					t.Fatalf("%v must REFUSE; a nil here resumes a position the shard cannot serve", tc.verdict)
 				}
-				if !errors.Is(err, ir.ErrPositionInvalid) {
-					t.Errorf("refusal must wrap ir.ErrPositionInvalid — the ADR-0022 fall-through keys on it: %v", err)
+				if got := errors.Is(err, ir.ErrPositionInvalid); got != tc.autoRecopy {
+					t.Errorf("refusal wraps ir.ErrPositionInvalid = %v; want %v (that sentinel is what routes the "+
+						"destructive automatic re-copy): %v", got, tc.autoRecopy, err)
+				}
+				if got := errors.Is(err, ir.ErrPositionForeignLineage); got != !tc.autoRecopy {
+					t.Errorf("refusal wraps ir.ErrPositionForeignLineage = %v; want %v: %v", got, !tc.autoRecopy, err)
 				}
 				if !strings.Contains(err.Error(), tc.wantIn) {
 					t.Errorf("refusal does not name %q, so an operator cannot tell the two apart: %v", tc.wantIn, err)

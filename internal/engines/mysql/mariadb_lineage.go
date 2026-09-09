@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // MariaDB lineage binding for resume positions (v0.138.0, audit
@@ -188,15 +189,25 @@ func verifyMariaDBLineage(ctx context.Context, db *sql.DB, p binlogPos) error {
 				slog.String("anchor", fmt.Sprintf("%s:%d", p.LineageFile, p.LineagePos)), slog.String("evidence", why))
 			return nil
 		}
-		return fmt.Errorf("mariadb: the source has no binlog event at the position's lineage anchor (%s:%d) and %s — "+
-			"the source is a different lineage (a fresh, reset, rebuilt or replaced instance); cannot resume: %w",
-			p.LineageFile, p.LineagePos, why, ir.ErrPositionInvalid)
+		// Terminal, deliberately NOT ir.ErrPositionInvalid (audit
+		// 2026-09-09 A0909-MYSQL-HIGH-1): the automatic recovery would drop the
+		// target and re-copy from this other instance at exit 0.
+		return sluicecode.Wrap(sluicecode.CodeCDCLineageMismatch, foreignRemedy,
+			fmt.Errorf("mariadb: the source has no binlog event at the position's lineage anchor (%s:%d) and %s — "+
+				"the source is a different lineage (a fresh, reset, rebuilt or replaced instance). REFUSING rather "+
+				"than re-copying: the automatic recovery would drop the target's tables and re-copy from whatever "+
+				"now answers this DSN; if the replacement IS intended, re-copy deliberately with "+
+				"--restart-from-scratch: %w",
+				p.LineageFile, p.LineagePos, why, ir.ErrPositionForeignLineage))
 	}
 	if set != p.LineageSet {
-		return fmt.Errorf("mariadb: the source's binlog at the position's lineage anchor (%s:%d) reads GTID state %q, "+
-			"the position was captured at %q — the source is a different lineage (a rebuilt or replaced instance "+
-			"whose GTIDs happen to collide); cannot resume: %w",
-			p.LineageFile, p.LineagePos, set, p.LineageSet, ir.ErrPositionInvalid)
+		return sluicecode.Wrap(sluicecode.CodeCDCLineageMismatch, foreignRemedy,
+			fmt.Errorf("mariadb: the source's binlog at the position's lineage anchor (%s:%d) reads GTID state %q, "+
+				"the position was captured at %q — the source is a different lineage (a rebuilt or replaced instance "+
+				"whose GTIDs happen to collide). REFUSING rather than re-copying: the automatic recovery would drop "+
+				"the target's tables and re-copy from whatever now answers this DSN; if the replacement IS intended, "+
+				"re-copy deliberately with --restart-from-scratch: %w",
+				p.LineageFile, p.LineagePos, set, p.LineageSet, ir.ErrPositionForeignLineage))
 	}
 	return nil
 }
@@ -387,10 +398,24 @@ func verifyMariaDBDomainsPresent(ctx context.Context, db *sql.DB, resumeSet stri
 	if len(missing) == 0 {
 		return nil
 	}
-	return fmt.Errorf("mariadb: the resume GTID set names replication domain(s) %v the source has never written "+
-		"(source @@gtid_binlog_state %q, resume %q) — the source is a different lineage; MariaDB itself would "+
-		"accept this position and stream its entire history; cannot resume: %w",
-		missing, state, resumeSet, ir.ErrPositionInvalid)
+	if strings.TrimSpace(state) == "" {
+		// An EMPTY binlog state is a same-server RESET MASTER (or a fresh
+		// instance with no history): no other lineage to re-copy from, so
+		// the automatic re-snapshot stays the right recovery.
+		return fmt.Errorf("mariadb: the source's @@gtid_binlog_state is EMPTY, so the resume GTID set %q names "+
+			"domain(s) %v this source no longer records (RESET MASTER, or a fresh instance); cannot resume: %w",
+			resumeSet, missing, ir.ErrPositionInvalid)
+	}
+	// Terminal, deliberately NOT ir.ErrPositionInvalid (audit 2026-09-09
+	// HIGH-1): a non-empty state that has never seen the position's
+	// domain is a different lineage answering this DSN.
+	return sluicecode.Wrap(sluicecode.CodeCDCLineageMismatch, foreignRemedy,
+		fmt.Errorf("mariadb: the resume GTID set names replication domain(s) %v the source has never written "+
+			"(source @@gtid_binlog_state %q, resume %q) — the source is a different lineage; MariaDB itself would "+
+			"accept this position and stream its entire history. REFUSING rather than re-copying: the automatic "+
+			"recovery would drop the target's tables and re-copy from whatever now answers this DSN; if the "+
+			"replacement IS intended, re-copy deliberately with --restart-from-scratch: %w",
+			missing, state, resumeSet, ir.ErrPositionForeignLineage))
 }
 
 // mariadbGTIDDomains returns the set of domain ids named by a MariaDB

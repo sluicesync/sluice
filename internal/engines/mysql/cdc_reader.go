@@ -2534,7 +2534,10 @@ func verifySourceInstanceIdentity(ctx context.Context, persistedUUID, currentUUI
 	// GTID arm, whose lineage check catches a replaced instance by
 	// construction; Vitess/PlanetScale never reach this file; MariaDB has its
 	// own lineage path).
-	return fmt.Errorf("mysql: source server_uuid %q does not match the persisted position's "+
+	// Terminal AND carried as ir.ErrPositionForeignLineage (audit
+	// 2026-09-09 A0909-MYSQL-HIGH-1): one sentinel names the class across the four
+	// lanes, so the pipeline's reactive path can ask for it by name.
+	return sluicecode.Wrap(sluicecode.CodeCDCLineageMismatch, foreignRemedy, fmt.Errorf("mysql: source server_uuid %q does not match the persisted position's "+
 		"server_uuid %q — the instance answering this DSN is NOT the one this position was captured "+
 		"from (replaced / restored from backup / failed over), and binlog lineage does not carry over. "+
 		"REFUSING rather than re-copying: the automatic recovery for an unusable position drops the "+
@@ -2547,8 +2550,8 @@ func verifySourceInstanceIdentity(ctx context.Context, persistedUUID, currentUUI
 		"`sync start --position-from-manifest` needs a manifest captured FROM this instance, or a fresh "+
 		"`backup full` to make one (--restart-from-scratch is rejected alongside --position-from-manifest, "+
 		"so it is not the answer there); `backup incremental` and `backup stream` need a fresh "+
-		"`backup full`, neither having a --restart-from-scratch flag at all",
-		currentUUID, persistedUUID)
+		"`backup full`, neither having a --restart-from-scratch flag at all: %w",
+		currentUUID, persistedUUID, ir.ErrPositionForeignLineage))
 }
 
 // sourceServerUUID reads the source instance's @@server_uuid — a
@@ -2715,10 +2718,27 @@ func verifyGTIDLineageContinuity(ctx context.Context, db *sql.DB, resumeSet stri
 			"endpoint, a primary rolled back past the position, or a hole in the source's set; cannot resume here: %w",
 			abbreviateGTIDSet(resumeSet), abbreviateGTIDSet(executed), ir.ErrPositionInvalid)
 	}
-	return fmt.Errorf("mysql: the resume GTID set is not contained in the source's @@global.gtid_executed "+
-		"(resume %q; source executed %q) — the source is a different lineage (a fresh, reset, or rebuilt instance, "+
-		"or a replica promoted without transactions the old primary had); cannot resume: %w",
-		abbreviateGTIDSet(resumeSet), abbreviateGTIDSet(executed), ir.ErrPositionInvalid)
+	if strings.TrimSpace(executed) == "" {
+		// An EMPTY executed set is a same-server RESET MASTER (or an
+		// instance with no history at all): there is no other lineage
+		// here to re-copy from, so the automatic re-snapshot is the
+		// right recovery and this stays ir.ErrPositionInvalid.
+		return fmt.Errorf("mysql: the source's @@global.gtid_executed is EMPTY, so the resume GTID set %q "+
+			"names transactions this source no longer records (RESET MASTER, or a fresh instance); "+
+			"cannot resume: %w", abbreviateGTIDSet(resumeSet), ir.ErrPositionInvalid)
+	}
+	// Non-empty and sharing no UUID: a DIFFERENT lineage answering this
+	// DSN. Terminal, deliberately not ir.ErrPositionInvalid — the
+	// automatic recovery would drop the target and re-copy from this
+	// other database at exit 0 (audit 2026-09-09 A0909-MYSQL-HIGH-1, measured).
+	return sluicecode.Wrap(sluicecode.CodeCDCLineageMismatch, foreignRemedy,
+		fmt.Errorf("mysql: the resume GTID set is not contained in the source's @@global.gtid_executed "+
+			"(resume %q; source executed %q) — the source is a different lineage (a fresh, reset, or rebuilt "+
+			"instance, or a replica promoted without transactions the old primary had). REFUSING rather than "+
+			"re-copying: the automatic recovery for an unusable position drops the target's tables and re-copies "+
+			"from whatever now answers this DSN, which is correct for a routine purge and destructive here. If "+
+			"this replacement IS intended, re-copy deliberately with --restart-from-scratch: %w",
+			abbreviateGTIDSet(resumeSet), abbreviateGTIDSet(executed), ir.ErrPositionForeignLineage))
 }
 
 // lineageVerdict is what a resume position's UUIDs say about the shard being
@@ -2867,10 +2887,17 @@ func lineageRefusal(v lineageVerdict, shard, target, resume, executed string) er
 
 	default:
 		return sluicecode.Wrap(sluicecode.CodeCDCLineageMismatch, foreignRemedy,
+			// Terminal, deliberately NOT ir.ErrPositionInvalid (audit
+			// 2026-09-09 A0909-MYSQL-HIGH-1): a foreign keyspace at this DSN must not
+			// route into the automatic re-copy. The errant arm above keeps
+			// its route — its remedy is executable on the source, and
+			// turning it terminal on PlanetScale is a policy call, filed.
 			fmt.Errorf("mysql/vstream: the resume position for shard %q names a source UUID the shard has never "+
 				"executed, and shares NONE with it (%s; resume %q, source executed %q) — the source is a different "+
-				"lineage (a fresh, reset, rebuilt or replaced keyspace/shard); cannot resume: %w",
-				shard, target, abbreviateGTIDSet(resume), abbreviateGTIDSet(executed), ir.ErrPositionInvalid))
+				"lineage (a fresh, reset, rebuilt or replaced keyspace/shard). REFUSING rather than re-copying: the "+
+				"automatic recovery would drop the target's tables and re-copy from this other keyspace; if the "+
+				"replacement IS intended, re-copy deliberately with --restart-from-scratch: %w",
+				shard, target, abbreviateGTIDSet(resume), abbreviateGTIDSet(executed), ir.ErrPositionForeignLineage))
 	}
 }
 

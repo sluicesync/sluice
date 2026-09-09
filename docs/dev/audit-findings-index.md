@@ -78,6 +78,8 @@ narrower than the pass.
 - VF0909-5 filed
 - VF0909-6 filed
 - A0909-STOP-1 filed
+- A0909-MYSQL-HIGH-1 filed
+- A0909-MYSQL-HIGH-1-POLICY filed
 
 ## 2026-09-07 — v0.145.0 pre-tag review
 

@@ -810,6 +810,14 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, lsnTrac
 		}
 		changes, stop, err = s.warmResume(streamCtx, persisted, lsnTracker)
 		warmResumed = err == nil
+		// A foreign-lineage verdict never satisfies ErrPositionInvalid, so
+		// the fall-through below cannot engage on it; frame it as the
+		// pipeline's refusal so the operator reads what was NOT done and
+		// how to do it deliberately (audit 2026-09-09 A0909-MYSQL-HIGH-1).
+		if err != nil && errors.Is(err, ir.ErrPositionForeignLineage) {
+			stop()
+			return nil, func() {}, false, foreignLineageRefusalError(err)
+		}
 		// Slot-missing fall-through (ADR-0022) is suppressed when the
 		// position came from a manifest chain: the operator explicitly
 		// asked for "resume from this chain"; silently re-bulking would

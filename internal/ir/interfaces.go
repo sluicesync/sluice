@@ -2878,6 +2878,30 @@ type CDCDatabaseListSetter interface {
 	SetCDCDatabaseList(databases []string)
 }
 
+// LineageVerifier is the OPTIONAL capability a CDC reader implements so
+// the orchestrator can ask, BEFORE it destroys anything, whether the
+// source answering the DSN is the lineage a persisted position came from.
+//
+// The pre-flight warm-resume path gets this answer for free — the reader
+// refuses inside StreamChanges and the refusal carries
+// [ErrPositionForeignLineage]. The REACTIVE path does not: a
+// position-invalid error surfaced mid-stream sets the next attempt to
+// restart from scratch, which drops the target's in-scope tables and
+// re-copies from whatever now answers the DSN, with no pre-flight in
+// between. So before taking that route the orchestrator opens a reader,
+// hands it the persisted position, and refuses on a foreign verdict
+// (audit 2026-09-09 A0909-MYSQL-HIGH-1). Every other answer — same lineage, purged,
+// a probe that could not run — returns nil and the recovery proceeds;
+// this door only ever narrows what the automatic recovery may destroy.
+// Engines without the surface are simply not asked.
+type LineageVerifier interface {
+	// VerifyLineage returns an error satisfying
+	// errors.Is(err, ErrPositionForeignLineage) when the source is not
+	// the lineage from was captured from, and nil otherwise. It must not
+	// start a stream or mutate state.
+	VerifyLineage(ctx context.Context, from Position) error
+}
+
 // MultiDatabaseRouter is the OPTIONAL surface a [ChangeApplier]
 // implements to enable per-change target-namespace routing for a
 // multi-database fan-out CDC run (ADR-0074 Phase 1b). The applier stays

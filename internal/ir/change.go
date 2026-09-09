@@ -36,6 +36,28 @@ type Position struct {
 // it's merely degraded — `wal_status='lost'` stays strict).
 var ErrPositionInvalid = errors.New("ir: persisted position is no longer valid; cold-start is the only recovery path")
 
+// ErrPositionForeignLineage is the verdict that the source answering the
+// DSN is NOT the instance or lineage the persisted position was captured
+// from — a replaced, restored-from-the-wrong-backup, or DNS-failed-over
+// endpoint, or a keyspace that is simply a different database.
+//
+// It deliberately does NOT satisfy errors.Is(err, ErrPositionInvalid).
+// That sentinel routes the streamer's automatic recovery, which drops the
+// target's in-scope tables and re-copies from whatever now answers the
+// DSN; correct for a routine purge on the SAME source, destructive here.
+// Audit 2026-09-09 (A0909-MYSQL-HIGH-1) measured the GTID arm doing
+// exactly that: four correct target rows replaced by the wrong
+// database's one row, at exit 0. Engines wrap this via %w at every site
+// whose diagnosis is "different lineage / different instance"; a site
+// that cannot tell a reset from a replacement (an empty executed set is
+// a same-server RESET MASTER) keeps ErrPositionInvalid, and says so.
+//
+// The pipeline refuses on it — loudly, with the deliberate re-copy
+// flags named — on BOTH the pre-flight warm-resume path and the reactive
+// path, which asks the reader through [LineageVerifier] before it drops
+// anything.
+var ErrPositionForeignLineage = errors.New("ir: the source answering this DSN is not the lineage the persisted position was captured from; refusing the automatic re-copy")
+
 // PositionOrderer is an optional Engine capability the ADR-0049 CDC
 // schema-history store uses to resolve an event's position to the
 // schema version in effect at that position. Positions are

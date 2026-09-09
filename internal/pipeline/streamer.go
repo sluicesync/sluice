@@ -1722,6 +1722,15 @@ func (s *Streamer) reactiveResnapshotDecision(ctx context.Context, err error, al
 	// INSERT) drops + recreates the in-scope target tables first so the copy
 	// doesn't dup-key (Error 1062) on the prior copy's leftover rows. The
 	// cdc-state row is preserved either way.
+	//
+	// But not before asking the source whether it is still the lineage
+	// the position came from (audit 2026-09-09 A0909-MYSQL-HIGH-1): this path has no
+	// pre-flight of its own, and the drop below is the destructive half
+	// of the recovery. A foreign verdict is terminal; every other answer
+	// proceeds exactly as before.
+	if refusal := s.refuseIfForeignLineage(ctx); refusal != nil {
+		return false, refusal
+	}
 	s.RestartFromScratch = true
 	return true, nil
 }

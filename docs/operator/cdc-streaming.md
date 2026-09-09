@@ -439,6 +439,14 @@ If you stop a `sync start` (Ctrl-C, SIGTERM) after the bulk copy has committed b
 
 A cold start that fails for a real reason — a refused preflight, a foreign-key violation, an unreachable source — still drops its slot, because there the slot is debris rather than a resume point.
 
+## A source that is not the one your position came from is refused, never re-copied (`FOREIGN-LINEAGE-REFUSED`)
+
+A persisted position can stop being usable for two reasons that look the same from the outside. The **same** source may have moved past it — binlogs purged, `RESET MASTER`, a slot dropped — and there sluice's automatic recovery (ADR-0022/0093) is right: drop the in-scope target tables, re-copy, carry on. Or a **different** source may now be answering the DSN: an instance replaced or restored from the wrong backup, a load-balanced or DNS-failed-over endpoint, a keyspace that is simply another database. There the same recovery destroys a correct target and repopulates it from the wrong database, at exit 0, looking like success. The 2026-09-09 audit measured exactly that on the MySQL GTID path: four correct target rows replaced by the replacement instance's single row.
+
+Since v0.148.2 every MySQL-family lane — binlog GTID, binlog file/pos (`@@server_uuid`), MariaDB (lineage anchor and domain), and VStream (a foreign keyspace) — treats a **different lineage** as terminal. The refusal is `SLUICE-E-CDC-LINEAGE-MISMATCH` from the engine and, from the pipeline, a line marked `FOREIGN-LINEAGE-REFUSED` that says nothing on the target was touched. It fires on both paths: a warm resume refuses before streaming, and the reactive path — a position that went invalid mid-stream — asks the source the same question before it drops anything. What is *not* foreign, and still recovers automatically: an **empty** executed set on the source (`@@gtid_executed` / `@@gtid_binlog_state`), which is a same-server reset with no other lineage to re-copy from; a purged position; and a VStream errant GTID, whose remedy is on the source and which keeps its existing route.
+
+What to do when you see it: first confirm the DSN points at the database you mean — the three shapes above are indistinguishable from the position alone. If the replacement **is** intended, re-copy deliberately: `sluice sync start … --restart-from-scratch` (keeps the cdc-state row) or `--reset-target-data` (clears it too). Nothing happens until you say so.
+
 ## PostgreSQL sources: slot creation can block on a prepared transaction (`PREPARED-XACT-BLOCKS-SLOT-CREATE`)
 
 `CREATE_REPLICATION_SLOT` builds a consistent point, and that builder waits for every prepared transaction (2PC) on the **cluster** — not just in your database — to be resolved. If one is orphaned because its coordinator died, the slot creation blocks indefinitely with no further output, which reads exactly like a hung connection.

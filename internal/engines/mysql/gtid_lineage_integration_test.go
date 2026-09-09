@@ -119,12 +119,47 @@ func TestGTIDResumeBindsLineageAcrossInstances(t *testing.T) {
 		t.Fatal("resuming instance A's GTID position against fresh instance B was ACCEPTED; " +
 			"this is the SLM-2 defect — B streams its entire history as if it were A's delta")
 	}
-	if !errors.Is(err, ir.ErrPositionInvalid) {
-		t.Fatalf("cross-instance GTID resume failed, but not with ir.ErrPositionInvalid "+
-			"(so the streamer will not route it to a cold-start re-snapshot): %v", err)
+	// Audit 2026-09-09 A0909-MYSQL-HIGH-1 flipped this expectation. B has a
+	// NON-EMPTY gtid_executed sharing no UUID with A's position: a
+	// different lineage. Routing that into the cold-start re-snapshot is
+	// exactly the destructive path the worker measured (target dropped
+	// and refilled from B). It must be TERMINAL — the foreign sentinel,
+	// never the invalid-position one.
+	if !errors.Is(err, ir.ErrPositionForeignLineage) {
+		t.Fatalf("cross-instance GTID resume failed, but not with ir.ErrPositionForeignLineage: %v", err)
+	}
+	if errors.Is(err, ir.ErrPositionInvalid) {
+		t.Fatalf("cross-instance GTID resume wraps ir.ErrPositionInvalid — the streamer would drop the target and "+
+			"re-copy from the wrong database (A0909-MYSQL-HIGH-1): %v", err)
 	}
 	if !strings.Contains(err.Error(), "gtid_executed") {
 		t.Fatalf("the refusal must name the lineage check (gtid_executed), got: %v", err)
+	}
+
+	// Direction 1b — the discriminator: the SAME instance after RESET
+	// MASTER has an EMPTY gtid_executed. There is no other lineage to
+	// re-copy from, so this is the one "not contained" shape that keeps
+	// the automatic re-snapshot (ir.ErrPositionInvalid, and NOT foreign).
+	dsnD, cleanupD := startMySQLFamilyContainer(
+		t, ctx, "mysql:8.0", "lineage", mysqlFilePosEnvs("lineage"), mysqlGTIDBootCmd,
+	)
+	defer cleanupD()
+	execSQL(t, ctx, dsnD, "RESET MASTER")
+	if got := globalVar(t, ctx, dsnD, "gtid_executed"); strings.TrimSpace(got) != "" {
+		t.Fatalf("premise gone: RESET MASTER left gtid_executed %q; want empty", got)
+	}
+	readerD, err := e.OpenCDCReader(ctx, dsnD)
+	if err != nil {
+		t.Fatalf("OpenCDCReader(D): %v", err)
+	}
+	defer closeLineageReader(readerD)
+	_, err = readerD.StreamChanges(ctx, capturedOnA)
+	if err == nil {
+		t.Fatal("resuming A's position on a RESET instance was ACCEPTED")
+	}
+	if !errors.Is(err, ir.ErrPositionInvalid) || errors.Is(err, ir.ErrPositionForeignLineage) {
+		t.Fatalf("a RESET (empty gtid_executed) source must keep the automatic re-copy route: want "+
+			"ErrPositionInvalid and not ErrPositionForeignLineage, got: %v", err)
 	}
 
 	// Direction 2 — the control: the SAME position on the instance that
@@ -225,8 +260,17 @@ func TestGTIDResumeMariaDBBindsLineage(t *testing.T) {
 		t.Fatalf("encode legacy position: %v", err)
 	}
 
-	mustRefuse := func(t *testing.T, dsn, cell string, pos ir.Position) {
+	// want is the sentinel the refusal must carry — and the OTHER one it
+	// must not (audit 2026-09-09 A0909-MYSQL-HIGH-1): a foreign lineage is
+	// terminal (ir.ErrPositionForeignLineage), a server-side 1236 that the
+	// reactive classifier cannot tell from a reset keeps the automatic
+	// re-copy (ir.ErrPositionInvalid).
+	mustRefuse := func(t *testing.T, dsn, cell string, pos ir.Position, want error) {
 		t.Helper()
+		other := ir.ErrPositionInvalid
+		if errors.Is(want, ir.ErrPositionInvalid) {
+			other = ir.ErrPositionForeignLineage
+		}
 		reader, err := e.OpenCDCReader(ctx, dsn)
 		if err != nil {
 			t.Fatalf("%s: OpenCDCReader: %v", cell, err)
@@ -234,8 +278,8 @@ func TestGTIDResumeMariaDBBindsLineage(t *testing.T) {
 		defer closeLineageReader(reader)
 		ch, err := reader.StreamChanges(ctx, pos)
 		if err != nil {
-			if !errors.Is(err, ir.ErrPositionInvalid) {
-				t.Fatalf("%s: refused, but not with ir.ErrPositionInvalid (no cold-start route): %v", cell, err)
+			if !errors.Is(err, want) || errors.Is(err, other) {
+				t.Fatalf("%s: refused, but with the wrong routing (want %v, not %v): %v", cell, want, other, err)
 			}
 			t.Logf("%s: refused at open: %v", cell, err)
 			return
@@ -254,8 +298,8 @@ func TestGTIDResumeMariaDBBindsLineage(t *testing.T) {
 					if serr == nil {
 						t.Fatalf("%s: stream closed with NO error after accepting a foreign position — silent acceptance", cell)
 					}
-					if !errors.Is(serr, ir.ErrPositionInvalid) {
-						t.Fatalf("%s: stream refused, but not with ir.ErrPositionInvalid: %v", cell, serr)
+					if !errors.Is(serr, want) || errors.Is(serr, other) {
+						t.Fatalf("%s: stream refused, but with the wrong routing (want %v, not %v): %v", cell, want, other, serr)
 					}
 					t.Logf("%s: refused reactively on the stream: %v", cell, serr)
 					return
@@ -295,11 +339,17 @@ func TestGTIDResumeMariaDBBindsLineage(t *testing.T) {
 		}
 	}
 
-	t.Run("different server_id: server-refused, routed to cold-start", func(t *testing.T) {
+	t.Run("different server_id: sluice's anchor door refuses it at open as a foreign lineage", func(t *testing.T) {
+		// Before A0909-MYSQL-HIGH-1 this cell was named "server-refused,
+		// routed to cold-start": the server's 1236 arrived reactively and
+		// was classified ErrPositionInvalid. Measured on 2026-09-09, the
+		// anchor door catches it first (no binlog event at the anchor on a
+		// different instance), and a different instance IS a foreign
+		// lineage — terminal, never the automatic re-copy.
 		dsnB, cleanupB := newMariaDBDedicatedForCDC(t, "mariadb:11.4", "--server-id=2")
 		defer cleanupB()
 		execSQL(t, ctx, dsnB, `CREATE TABLE cdc_src.t (id INT PRIMARY KEY, v TEXT)`)
-		mustRefuse(t, dsnB, "different-server-id", capturedOnA)
+		mustRefuse(t, dsnB, "different-server-id", capturedOnA, ir.ErrPositionForeignLineage)
 	})
 
 	t.Run("different gtid_domain_id: server accepts, sluice refuses", func(t *testing.T) {
@@ -307,10 +357,10 @@ func TestGTIDResumeMariaDBBindsLineage(t *testing.T) {
 		defer cleanupB()
 		execSQL(t, ctx, dsnB, `CREATE TABLE cdc_src.t (id INT PRIMARY KEY, v TEXT)`)
 		execSQL(t, ctx, dsnB, `INSERT INTO cdc_src.t VALUES (10,'x'),(11,'y')`)
-		mustRefuse(t, dsnB, "different-domain", capturedOnA)
+		mustRefuse(t, dsnB, "different-domain", capturedOnA, ir.ErrPositionForeignLineage)
 		// The domain door alone must also catch the anchorless legacy
 		// shape here — the server would accept it.
-		mustRefuse(t, dsnB, "different-domain/legacy-position", legacyPos)
+		mustRefuse(t, dsnB, "different-domain/legacy-position", legacyPos, ir.ErrPositionForeignLineage)
 	})
 
 	t.Run("rebuilt: same server_id, colliding GTIDs — only the anchor can tell", func(t *testing.T) {
@@ -325,7 +375,7 @@ func TestGTIDResumeMariaDBBindsLineage(t *testing.T) {
 		if state != decoded.GTIDSet {
 			t.Fatalf("premise gone: the rebuilt instance's state is %q, A's position is %q — the collision this cell reproduces did not happen", state, decoded.GTIDSet)
 		}
-		mustRefuse(t, dsnB, "rebuilt-colliding", capturedOnA)
+		mustRefuse(t, dsnB, "rebuilt-colliding", capturedOnA, ir.ErrPositionForeignLineage)
 		// The anchorless legacy position on this instance is the documented
 		// degraded posture: accepted, with the WARN — refusing would force a
 		// full re-copy on every pre-v0.138.0 chain.
@@ -359,7 +409,7 @@ func TestGTIDResumeMariaDBBindsLineage(t *testing.T) {
 		if err != nil {
 			t.Fatalf("encode: %v", err)
 		}
-		mustRefuse(t, dsnB, "rebuilt-colliding/high-anchor", highPos)
+		mustRefuse(t, dsnB, "rebuilt-colliding/high-anchor", highPos, ir.ErrPositionForeignLineage)
 	})
 
 	t.Run("anchor purged by retention on the SAME lineage: accepted", func(t *testing.T) {
