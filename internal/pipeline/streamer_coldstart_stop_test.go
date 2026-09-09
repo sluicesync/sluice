@@ -86,7 +86,8 @@ func TestAbandonUnlessStopped(t *testing.T) {
 	})
 
 	t.Run("the WARN names the slot and BOTH ways out", func(t *testing.T) {
-		t.Parallel()
+		// No t.Parallel: this swaps the GLOBAL slog default to capture output,
+		// so parallel siblings would write into each other's buffers.
 		// Preserving silently would trade a recoverable re-copy for an
 		// unrecoverable outage: a kept slot pins WAL and can fill a busy
 		// source's disk. The warning is half the fix, so it is pinned.
@@ -102,11 +103,12 @@ func TestAbandonUnlessStopped(t *testing.T) {
 		got := buf.String()
 		for _, want := range []string{
 			stoppedSlotKeptMarker,
-			"custom_slot",              // WHICH slot
-			"PINS",                     // the cost
-			"sync start",               // way out 1: resume
-			"pg_drop_replication_slot", // way out 2: abandon deliberately
-			"fill the disk",            // why it matters on a busy source
+			"custom_slot",      // WHICH slot
+			"PINS",             // the cost
+			"sync start",       // way out 1: resume
+			"sluice slot drop", // way out 2: our OWN command, not raw SQL
+			"--yes",            // which drop refuses without
+			"fill the disk",    // why it matters on a busy source
 		} {
 			if !strings.Contains(got, want) {
 				t.Errorf("the stopped-slot WARN does not mention %q — an operator cannot act on it:\n%s", want, got)
@@ -115,7 +117,6 @@ func TestAbandonUnlessStopped(t *testing.T) {
 	})
 
 	t.Run("the WARN still names a slot when none was configured", func(t *testing.T) {
-		t.Parallel()
 		var buf bytes.Buffer
 		prev := slog.Default()
 		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
@@ -259,4 +260,64 @@ func readSourceLines(t *testing.T, path string) []string {
 		t.Fatalf("read %s: %v", path, err)
 	}
 	return strings.Split(string(b), "\n")
+}
+
+// The recovery advice must name the slot that actually EXISTS.
+//
+// `--slot-name` is a SUFFIX: sluice prepends "sluice_". An operator who
+// passed `--slot-name prod` has `sluice_prod` on the server, and a WARN
+// that told them to look for `prod` would send them hunting for an object
+// that does not exist -- in the one message whose entire job is telling
+// them what to act on. `sluice slot drop` takes the LITERAL name and does
+// no prefixing of its own, so the advice has to be pre-resolved.
+func TestStoppedSlotAdviceNamesTheRealSlot(t *testing.T) {
+	// Not parallel at any level: every cell swaps the global slog default.
+
+	capture := func(slotName string) string {
+		var buf bytes.Buffer
+		prev := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		defer slog.SetDefault(prev)
+		var a, c bool
+		s := &Streamer{SlotName: slotName}
+		s.abandonUnlessStopped(context.Background(), &ir.SnapshotStream{
+			AbandonFn: func() error { a = true; return nil },
+			CloseFn:   func() error { c = true; return nil },
+		}, context.Canceled)
+		_, _ = a, c
+		return buf.String()
+	}
+
+	t.Run("a bare suffix is resolved to the real slot", func(t *testing.T) {
+		got := capture("prod")
+		if !strings.Contains(got, "sluice_prod") {
+			t.Errorf("the advice does not name sluice_prod. --slot-name is a SUFFIX, so an operator told to "+
+				"look for %q would find nothing on the source:\n%s", "prod", got)
+		}
+	})
+
+	t.Run("an already-prefixed name is not double-prefixed", func(t *testing.T) {
+		got := capture("sluice_prod")
+		if strings.Contains(got, "sluice_sluice_prod") {
+			t.Errorf("the advice double-prefixed an already-qualified slot name:\n%s", got)
+		}
+	})
+
+	t.Run("the unset default matches what the PG engine actually creates", func(t *testing.T) {
+		// The constant is a copy of the engine's `defaultSlot`, because this
+		// package cannot import the engine. A divergence would leave the
+		// advice naming a slot nobody has.
+		src, err := os.ReadFile("../engines/postgres/cdc_reader.go")
+		if err != nil {
+			t.Fatalf("read the PG engine: %v", err)
+		}
+		if !bytes.Contains(src, []byte(`defaultSlot        = "`+defaultSlotNameForAdvice+`"`)) {
+			t.Errorf("the PG engine's defaultSlot is no longer %q, so the stopped-slot advice names a slot "+
+				"that does not exist. Re-point defaultSlotNameForAdvice rather than deleting this check.",
+				defaultSlotNameForAdvice)
+		}
+		if !strings.Contains(capture(""), defaultSlotNameForAdvice) {
+			t.Errorf("with no --slot-name the advice does not name %q", defaultSlotNameForAdvice)
+		}
+	})
 }

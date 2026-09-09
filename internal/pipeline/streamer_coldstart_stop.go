@@ -17,6 +17,13 @@ import (
 // search their logs for.
 const stoppedSlotKeptMarker = "STOPPED-SLOT-KEPT"
 
+// defaultSlotNameForAdvice is the slot the PG engine creates when no
+// --slot-name is given. Duplicated from the engine (this package must not
+// import it) and held to it by TestStoppedSlotAdviceNamesTheRealDefault,
+// because a recovery instruction that names a nonexistent slot is worse
+// than one that names none.
+const defaultSlotNameForAdvice = "sluice_slot"
+
 // abandonUnlessStopped is the single door every POST-COPY cold-start
 // error path goes through. It abandons a genuinely failed cold start —
 // dropping the just-created replication slot, per Bug 177, so a refused
@@ -64,17 +71,28 @@ func (s *Streamer) abandonUnlessStopped(ctx context.Context, stream *ir.Snapshot
 		return
 	}
 	_ = stream.Close()
-	slot := s.SlotName
+
+	// The RESOLVED name, not s.SlotName. `--slot-name` is a SUFFIX —
+	// sluice prepends "sluice_" ([ResolveSlotName]) — so an operator who
+	// passed `--slot-name prod` has a slot called `sluice_prod` on the
+	// server. Printing the raw field here would name an object that does
+	// not exist and send them looking for the wrong thing in
+	// pg_replication_slots, in a message whose entire job is telling them
+	// what to go and act on.
+	slot := ResolveSlotName(s.SlotName)
 	if slot == "" {
-		slot = "the stream's replication slot (default sluice_slot)"
+		slot = defaultSlotNameForAdvice
 	}
 	slog.WarnContext(ctx, "pipeline: "+stoppedSlotKeptMarker+": the cold start was STOPPED after rows had "+
 		"already been written, so the source's replication slot was KEPT rather than dropped — without it the "+
 		"copy on the target would be unresumable and would have to be redone from scratch. The slot now PINS "+
-		"WAL on the source and will keep doing so until you act: re-run `sluice sync start` with the same "+
-		"--stream-id to resume and release it, or, if you are abandoning this migration, drop the slot on the "+
-		"source (SELECT pg_drop_replication_slot(...)) so it stops retaining WAL. On a busy source an "+
-		"unattended slot can fill the disk",
+		// remedy-partial: the resume is the operator's OWN original invocation, which sluice cannot render —
+		// the source and target flags are DSNs carrying credentials, and echoing them into a log line to
+		// satisfy a paste-ability gate would leak them into every log sink the operator ships to.
+		"WAL on the source and will keep doing so until you act: re-run your `sluice sync start` command with the same "+
+		"--stream-id to resume and release it, or, if you are abandoning this migration, drop it with "+
+		"`sluice slot drop --source-driver postgres --source <DSN> "+slot+" --yes` (add --force only if a "+
+		"consumer is still attached). On a busy source an unattended slot can fill the disk",
 		slog.String("slot", slot),
 		slog.String("cause", cause.Error()))
 }

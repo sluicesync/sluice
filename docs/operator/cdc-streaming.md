@@ -426,13 +426,16 @@ That is deliberate. Without the slot the copy on the target is unresumable: warm
 **The kept slot pins WAL on the source, and that is not free.** PostgreSQL retains WAL from the slot's position until the slot advances or goes away, so an unattended slot on a busy source can fill the disk. You have two ways out and should take one of them promptly:
 
 - **Resuming** — re-run `sluice sync start` with the same `--stream-id`. The stream picks up from the slot and releases the retained WAL as it catches up. This is the normal case.
-- **Abandoning** — if you are not going to resume this migration, drop the slot on the source so it stops retaining WAL:
+- **Abandoning** — if you are not going to resume this migration, drop the slot so it stops retaining WAL. sluice has first-class commands for this; you do not need psql:
 
-  ```sql
-  SELECT pg_drop_replication_slot('sluice_slot');   -- or your --slot-name
+  ```
+  sluice slot list --source-driver postgres --source "$SLUICE_SOURCE"
+  sluice slot drop --source-driver postgres --source "$SLUICE_SOURCE" sluice_slot --yes
   ```
 
-  Check what is outstanding with `SELECT slot_name, active, pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained FROM pg_replication_slots;`
+  `slot list` shows each slot with what it is retaining, which is the number to watch on a busy source. `slot drop` requires `--yes` — it refuses loudly rather than prompting — and takes `--if-exists` if you are scripting it. Add `--force` only if a consumer is still attached.
+
+  **The name `slot drop` takes is the LITERAL slot, not the `--slot-name` you passed to `sync start`.** Those differ: `--slot-name` is a *suffix* and sluice prepends `sluice_`, so `--slot-name prod` creates `sluice_prod`. Use the name exactly as the `NAME` column of `slot list` prints it — which is also the name the `STOPPED-SLOT-KEPT` warning gives you, already resolved. (If you do name the suffix by mistake, `slot drop` tells you what you probably meant rather than dropping something else.)
 
 A cold start that fails for a real reason — a refused preflight, a foreign-key violation, an unreachable source — still drops its slot, because there the slot is debris rather than a resume point.
 
