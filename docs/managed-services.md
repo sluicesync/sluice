@@ -228,6 +228,10 @@ FROM __neki.list_metafuncs() ORDER BY group_name, name;
 
 That returns all 89 functions with their signatures and a one-line purpose, and it works on a sharded database (several ordinary catalog introspection queries do not).
 
+### Moving a PlanetScale Postgres database here
+
+There is a tested, step-by-step procedure — prerequisites, the one-shot and minimal-downtime paths, verification, and what changes if you later shard — in [`operator/planetscale-postgres-to-neki.md`](operator/planetscale-postgres-to-neki.md).
+
 ### Platform preview
 
 Neki is in platform preview and its surface moves. The behaviours above were measured on 2026-09-10; treat the refusals as current-as-of rather than permanent, and re-measure before relying on a limitation staying put.
