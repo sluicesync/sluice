@@ -208,7 +208,9 @@ func (s *SyncHealthCmd) Run(_ *Globals) error {
 				"stream %q is COLD STARTING (phase %s, last progress write %s ago) and has not written its "+
 					"CDC anchor yet — expected during a cold start, not a stall. Its stream row appears only "+
 					"after the copy, the index build and the FLOAT exact re-read finish; `sluice sync status` "+
-					"shows the progress, and an age that keeps climbing across two calls means the run is gone",
+					"shows the progress, and the PHASE advancing is what tells you it is working. That age "+
+					"moves when the phase does, so a long copy of one large table holds it still on a "+
+					"perfectly healthy run — it means the run is gone only if the phase has stopped too",
 				s.StreamID, cs.phase, cs.age.Round(time.Second),
 			)}
 		}

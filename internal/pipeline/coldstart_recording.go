@@ -186,6 +186,92 @@ type tableProgressRecorder struct {
 	// one invariant ("what this table's row says") rather than two that
 	// could disagree.
 	outstanding map[string]int
+
+	// issued is the per-table sequence number of the last snapshot taken
+	// under mu. Guarded by mu.
+	issued map[string]uint64
+
+	// persistMu guards persistLocks and persisted. persistLocks holds one
+	// mutex PER TABLE, which serializes that table's store writes; persisted
+	// records the sequence each table last landed, so a snapshot that lost
+	// the race is dropped rather than overwriting a newer one.
+	//
+	// # Why this exists
+	//
+	// The arithmetic above is atomic under mu, but the store write
+	// deliberately happens OUTSIDE it — a control-table round trip must not
+	// block a peer pipeline's chunk accounting. Two pipelines finishing
+	// chunks of the SAME table could therefore reach the store out of order:
+	// pipeline A snapshots {100 rows, in_progress}, pipeline B snapshots
+	// {200 rows, complete} and lands first, then A lands and overwrites the
+	// row back to {100, in_progress}. The in-memory truth stays right; the
+	// DURABLE row goes backwards.
+	//
+	// Today that is fail-safe for the stopped-cold-start resume (a row that
+	// under-reports makes it DECLINE, never proceed) and wrong for
+	// `sync status`, which would show a finished table as in_progress
+	// forever. It stops being merely cosmetic the moment the snapshot anchor
+	// widens to the work-stealing lanes, where the same stale row silently
+	// blocks a healthy resume. `-race` cannot see any of it: both in-memory
+	// accesses are correctly synchronized, and only the writes race (audit
+	// VF0910-F2).
+	//
+	// PER TABLE rather than one global lock, because the racing set is
+	// exactly the pipelines sharing a table: a write for `orders` has no
+	// reason to queue behind one for `users`.
+	persistMu    sync.Mutex
+	persistLocks map[string]*sync.Mutex
+	persisted    map[string]uint64
+}
+
+// persist writes one snapshot to the store under the table's own write lock,
+// dropping it if a NEWER snapshot of the same table has already landed. See
+// [tableProgressRecorder.persistMu].
+func (r *tableProgressRecorder) persist(ctx context.Context, key string, entry ir.TableProgress, seq uint64) {
+	lock := r.lockFor(key)
+	lock.Lock()
+	defer lock.Unlock()
+
+	r.persistMu.Lock()
+	stale := r.persisted[key] >= seq
+	r.persistMu.Unlock()
+	if stale {
+		return
+	}
+	if err := writeTableProgress(ctx, r.rc, key, entry); err != nil {
+		warnStateWriteFailed(ctx, key, err)
+		return
+	}
+	r.persistMu.Lock()
+	if r.persisted == nil {
+		r.persisted = map[string]uint64{}
+	}
+	r.persisted[key] = seq
+	r.persistMu.Unlock()
+}
+
+// lockFor returns the per-table store-write lock, creating it on first use.
+func (r *tableProgressRecorder) lockFor(key string) *sync.Mutex {
+	r.persistMu.Lock()
+	defer r.persistMu.Unlock()
+	if r.persistLocks == nil {
+		r.persistLocks = map[string]*sync.Mutex{}
+	}
+	if lock, ok := r.persistLocks[key]; ok {
+		return lock
+	}
+	lock := &sync.Mutex{}
+	r.persistLocks[key] = lock
+	return lock
+}
+
+// nextSeq stamps the next sequence number for a key. Caller holds mu.
+func (r *tableProgressRecorder) nextSeq(key string) uint64 {
+	if r.issued == nil {
+		r.issued = map[string]uint64{}
+	}
+	r.issued[key]++
+	return r.issued[key]
 }
 
 // newTableProgressRecorder returns the recorder for a run, or nil when
@@ -246,10 +332,9 @@ func (r *tableProgressRecorder) started(ctx context.Context, table *ir.Table) {
 	entry := ir.TableProgress{State: ir.TableProgressInProgress}
 	r.state.TableProgress[key] = entry
 	entryCopy := cloneTableProgressForWrite(entry)
+	seq := r.nextSeq(key)
 	r.mu.Unlock()
-	if err := writeTableProgress(ctx, r.rc, key, entryCopy); err != nil {
-		warnStateWriteFailed(ctx, key, err)
-	}
+	r.persist(ctx, key, entryCopy, seq)
 }
 
 // completed records rows against a table and marks it complete once
@@ -278,8 +363,7 @@ func (r *tableProgressRecorder) completed(ctx context.Context, table *ir.Table, 
 	}
 	r.state.TableProgress[key] = entry
 	entryCopy := cloneTableProgressForWrite(entry)
+	seq := r.nextSeq(key)
 	r.mu.Unlock()
-	if err := writeTableProgress(ctx, r.rc, key, entryCopy); err != nil {
-		warnStateWriteFailed(ctx, key, err)
-	}
+	r.persist(ctx, key, entryCopy, seq)
 }

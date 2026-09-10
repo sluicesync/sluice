@@ -95,7 +95,7 @@ Both counters are **cumulative since slot creation** — they accumulate over th
 
 - The slot name being probed does not exist on the source — most often because `--slot-name` was passed without its `sluice_` prefix. Fixed in v0.148.3: `sync health` and the `diagnose` bundle now resolve the flag exactly as `sync start` does, so they look up the slot your stream actually created.
 
-Sluice deliberately omits the fields rather than emitting `0` in these "no signal" cases, so a careless reader can't mistake "we can't tell" for "definitely no spill." **Since v0.148.3 it also says WHY**, which is the half that was missing: `sync health` sets `source_probe_reason` naming the slot it looked for, and the `diagnose` bundle records `spill_reason`. Before that the fields were simply absent, so a slot name that did not exist read exactly like a healthy slot that had not spilled.
+Sluice deliberately omits the fields rather than emitting `0` in these "no signal" cases, so a careless reader can't mistake "we can't tell" for "definitely no spill." **It also says WHY**, which is the half that was missing: `sync health` sets `source_probe_reason` naming the slot it looked for (v0.148.3), and the `diagnose` bundle records `spill_reason` alongside a `spill_slot_probed` field that is written on every outcome (v0.149.0 — v0.148.3 added the reason on a branch neither CLI path could reach, so a `diagnose` bundle from that release still shows nothing; that was Bug 281). Before those, the fields were simply absent, so a slot name that did not exist read exactly like a healthy slot that had not spilled.
 
 **Operator action when these grow:**
 
@@ -305,6 +305,8 @@ Auto-cleanup deliberately does not run when:
 
 - The slot already existed before the call. It might carry someone else's progress.
 - The pump goroutine fails *after* the channel is returned. At that point, changes may have been emitted whose positions reference the slot — that's user data, hands off.
+
+- **You stopped the cold start (Ctrl-C, SIGTERM) after the bulk copy began.** A stop and a failure reach that code as the same non-nil error, and they are not the same event: by then the copy may have committed every row, and dropping the slot would cost you the whole migration. sluice keeps the slot and WARNs under `STOPPED-SLOT-KEPT`, naming the resolved slot and both ways out. Since v0.149.0 a PostgreSQL cold start whose copy finished every in-scope table is genuinely resumable — re-run with the same `--stream-id` and it skips the copy, finishes the remaining phases, and anchors CDC at the slot's consistent point (`COLD-START-RESUMED`). On any other source, or if the slot has since moved, the way out is to drop the slot and re-run with `--reset-target-data`. **The kept slot pins WAL the whole time**, so decide promptly on a busy source. See [`cdc-streaming.md`](operator/cdc-streaming.md).
 
 For those cases, `sluice slot drop` is the explicit cleanup path.
 

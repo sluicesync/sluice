@@ -455,8 +455,10 @@ If you stop a `sync start` (Ctrl-C, SIGTERM) after the bulk copy has committed b
 
 **Re-run `sluice sync start` with the same `--stream-id`. That is the whole remedy on a PostgreSQL source whose copy had finished** — and it is worth saying plainly, because two earlier releases said something else. v0.148.0 told you to re-run and the re-run did not work; v0.148.1 corrected this page to say the state could not be resumed at all, which was true of that release. From v0.149.0 the resume exists, and the re-run picks the copy up: it **skips the bulk copy**, finishes the remaining phases (indexes, constraints, views), takes the CDC anchor from the slot's own consistent point, and starts streaming. Every source change committed while you were stopped is still on the slot, so nothing between the snapshot and now is lost. The run announces it under `COLD-START-RESUMED`, naming what it skipped and what it finished; that line is how you tell a resume from a fresh copy.
 
-**What the resume requires, in full, because it refuses rather than guessing.** Five things, and the re-run either proves all of them or does what it did before this release:
+**What the resume requires, in full, because it refuses rather than guessing.** The re-run either proves every one of these or does what it did before this release:
 
+- **No CDC anchor yet.** A stream that reached CDC has a `sluice_cdc_state` row and warm-resumes as it always has; this path is only ever the window before that row exists, so an ordinary resume is never touched by it. `--reset-target-data` and `--restart-from-scratch` are handled earlier still and never reach the gate: an operator who asked for a fresh copy gets one.
+- **A single namespace.** The proofs below are keyed by bare table name, so a schema spanning two namespaces — where `app.users` and `public.users` are different tables — stands the resume down rather than letting one inherit the other's evidence. A multi-schema sync takes a different lane, which records no anchor and never reaches here.
 - **A PostgreSQL source.** A replication slot is what makes the anchor provable; every other source has no equivalent and still refuses. The engines that can resume are exactly those below, derived from the code rather than maintained here by hand:
 
   <!-- coldstart-resume-engines: postgres -->

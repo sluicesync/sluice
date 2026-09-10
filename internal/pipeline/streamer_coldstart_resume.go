@@ -103,6 +103,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
@@ -229,6 +230,12 @@ func (s *Streamer) resumeStoppedColdStart(
 		logSkipForeignKeys(ctx, applySkipForeignKeys(schema))
 	}
 
+	// GATE — every proof below keys on the BARE table name, so the schema
+	// this resume grades must live in ONE namespace.
+	if spansNamespaces(ctx, schema, streamID) {
+		return nil, nil, false, nil
+	}
+
 	// GATE — the copy FINISHED, and this is the load-bearing evidence:
 	// every in-scope table recorded complete. See the file comment for
 	// why the phase alone cannot carry that proof.
@@ -262,8 +269,10 @@ func (s *Streamer) resumeStoppedColdStart(
 				"%s differ from the run that made it. Resuming would SKIP the copy and leave the target "+
 				"holding rows the current flags did not select or shape — silently, because CDC only carries "+
 				"changes from the snapshot onward and can never backfill them. sluice has changed NOTHING. "+
-				"Re-run with the flags the recorded copy used, or re-run `sluice sync start` with "+ // remedy-partial: the operator's own invocation carries their DSNs
-				"--reset-target-data to copy again under the new ones",
+				"If a FLAG changed, re-run with the ones the recorded copy used; the `tables` and `views` "+ // remedy-partial: the operator's own invocation carries their DSNs
+				"keys come from the SOURCE SCHEMA instead, so a table added or dropped on the source since "+
+				"the stop lands here too and no flag can restore it. Either way, `sluice sync start "+
+				"--reset-target-data` copies again under the current ones",
 			coldStartShapeChangedMarker, strings.Join(refusing, ", "), copyShapePlural(refusing),
 		)
 	}
@@ -343,6 +352,14 @@ func (s *Streamer) resumeStoppedColdStart(
 	}
 	defer migcore.CloseIf(sw)
 
+	revertQueryTimeout, err := s.raiseQueryTimeoutForResume(ctx, applier, streamID, schema, state)
+	if err != nil {
+		return nil, nil, true, err
+	}
+	if revertQueryTimeout != nil {
+		defer revertQueryTimeout()
+	}
+
 	// A recording context for the REMAINING phases, so a stop during
 	// them records where it got to and the next attempt resumes from
 	// there. Deliberately NOT beginRecordedColdStart: that clears the
@@ -351,6 +368,26 @@ func (s *Streamer) resumeStoppedColdStart(
 	rc := newSyncRecordingContext(ctx, store, streamID)
 	if err := runColdStartResumePhases(ctx, rc, &state, schema, sw); err != nil {
 		return nil, nil, true, err
+	}
+
+	// Item 112: prove any metadata-only-added FKs clean BEFORE the anchor
+	// write, exactly as the ordinary cold start does immediately after its
+	// copy (streamer_coldstart.go). [openColdStartSchemaWriter] — the helper
+	// this release split out so the resume gets an identically configured
+	// writer — ARMS the item-109 metadata-only FK path, and the constraints
+	// phase this resume just ran is where that path adds FKs without InnoDB's
+	// O(rows) validation. The bounded chunked orphan scan is the load-bearing
+	// net that recovers the loud signal; arming the fast add and never running
+	// the scan leaves an FK on the target whose data may violate it, at exit 0
+	// — a refusal the sibling path makes and this one silently did not (audit
+	// VF0910-F1, found by the pre-tag value-fidelity review of this release).
+	//
+	// Unlike the cold start's call, a violation here does NOT abandon the
+	// stream: the slot predates this run and holds the recorded anchor, so it
+	// is the operator's resume point, not debris. The scan has already dropped
+	// the offending FK; re-running after fixing the source data resumes again.
+	if fkErr := s.verifyUnvalidatedForeignKeys(ctx, sw, schema); fkErr != nil {
+		return nil, nil, true, fkErr
 	}
 
 	// The CDC anchor, on an UNCANCELLABLE ctx for exactly the reason
@@ -635,6 +672,92 @@ func runColdStartResumePhases(
 		}
 	}
 	return nil
+}
+
+// raiseQueryTimeoutForResume raises the PlanetScale keyspace query timeout for
+// the phases a resume still has to run, exactly as the ordinary cold start
+// does before its own copy + index/FK build ([Streamer.coldStart]). The caller
+// MUST defer the returned revert; nil means no raise happened.
+//
+// The resume runs the index build and the constraints phase and NOTHING ELSE,
+// which is precisely the work that blows the ~900s statement wall — and the
+// sympathetic case this whole feature exists for is a stop during a slow index
+// build, re-run. Skipping the raise here sends that re-run straight back into
+// the wall the flag was passed to avoid (audit VF0910-F3).
+//
+// The ADR-0182 size gate reads the RECORDED per-table row counts rather than a
+// source estimate: the copy already happened, so those are measured numbers,
+// and this path holds no snapshot reader to estimate from.
+func (s *Streamer) raiseQueryTimeoutForResume(
+	ctx context.Context,
+	applier ir.ChangeApplier,
+	streamID string,
+	schema *ir.Schema,
+	state ir.MigrationState,
+) (revert func(), err error) {
+	return maybeRaiseQueryTimeout(ctx, s.RaiseQueryTimeout, s.QueryTimeoutController,
+		queryTimeoutRaiseRecorder(applier), streamID, schema, recordedRowCounts(state))
+}
+
+// spansNamespaces reports whether a schema carries tables from more than one
+// namespace — in which case the resume must stand down, because every proof it
+// makes keys on the BARE table name.
+//
+// This is the premise the bare key rests on, made into a check rather than left
+// as a comment. It holds today by construction: the PostgreSQL SchemaReader is
+// bound to a single namespace, and `--schemas` / `--databases` route to
+// [Streamer.coldStartMultiDatabase], which records no anchor and so never
+// reaches here — which is exactly why the multi-database lane needed
+// ProgressNamespace and this one does not. But "holds by construction" is the
+// sentence this project has been burned by: if a spanning read ever reached
+// this path, `app.users` would inherit `public.users`'s recorded `complete`
+// and the resume would skip a copy that never happened, silently (audit
+// VF0910-G4).
+func spansNamespaces(ctx context.Context, schema *ir.Schema, streamID string) bool {
+	namespaces := distinctTableNamespaces(schema)
+	if len(namespaces) <= 1 {
+		return false
+	}
+	slog.WarnContext(ctx, "pipeline: this stream's source schema spans MORE THAN ONE namespace, and the "+
+		"stopped-cold-start resume proves its copy per BARE table name, which cannot tell two same-named "+
+		"tables in different namespaces apart; not resuming, so the run cold-starts as it would have before",
+		slog.String("stream_id", streamID),
+		slog.String("namespaces", strings.Join(namespaces, ", ")))
+	return true
+}
+
+// distinctTableNamespaces returns the sorted set of non-empty Table.Schema
+// values in a schema. One entry (or none, for an engine that does not qualify)
+// is what the bare-name progress key requires.
+func distinctTableNamespaces(schema *ir.Schema) []string {
+	seen := map[string]struct{}{}
+	for _, t := range schema.Tables {
+		if t.Schema != "" {
+			seen[t.Schema] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for ns := range seen {
+		out = append(out, ns)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// recordedRowCounts adapts the interrupted run's recorded per-table row
+// counts to the [ir.RowCountEstimator] surface the ADR-0182 size gate reads.
+//
+// The gate exists so a small copy does not pay two PlanetScale rolling
+// restarts for a wall it would never hit, and it normally asks the SOURCE
+// reader for an estimate. A resume holds no snapshot reader — and does not
+// need one: the copy already happened, so the recorded counts are measured
+// rather than estimated, which is strictly better evidence for the same
+// question. A table with no recorded count returns 0, which the gate reads as
+// "no estimate for this table" and skips.
+type recordedRowCounts ir.MigrationState
+
+func (r recordedRowCounts) EstimateRowCount(_ context.Context, table *ir.Table) (int64, error) {
+	return r.TableProgress[table.Name].RowsCopied, nil
 }
 
 // resolveSlotNameForDisplay renders the RESOLVED slot name for an

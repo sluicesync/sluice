@@ -253,6 +253,13 @@ the backlog under the 2026-09-06 section.
 - SEC-LOW-1 filed
 - NEW-2 filed
 - C-5 filed
+- VF0910-F1 filed
+- VF0910-F2 filed
+- VF0910-F3 filed
+- VF0910-F4 filed
+- VF0910-F5 filed
+- VF0910-F6 filed
+- VF0910-G4 filed
 
 Filed in prose without their IDs, and left that way:
 

@@ -102,7 +102,7 @@ func autoRevertDanglingQueryTimeoutRaise(ctx context.Context, controller ir.Quer
 // planetscale target / credentials; the recorder-absent branch covers a target
 // engine whose store can't record the raise, i.e. the crash-safety guarantee
 // cannot be honored.)
-func maybeRaiseQueryTimeout(ctx context.Context, armed bool, controller ir.QueryTimeoutController, recorder ir.QueryTimeoutRaiseRecorder, recordKey string, schema *ir.Schema, rr ir.RowReader) (revert func(), err error) {
+func maybeRaiseQueryTimeout(ctx context.Context, armed bool, controller ir.QueryTimeoutController, recorder ir.QueryTimeoutRaiseRecorder, recordKey string, schema *ir.Schema, sizeSource any) (revert func(), err error) {
 	if !armed {
 		return nil, nil
 	}
@@ -116,7 +116,7 @@ func maybeRaiseQueryTimeout(ctx context.Context, armed bool, controller ir.Query
 
 	// Size gate: two rolling restarts for a small copy are worse than the wall
 	// it would never hit.
-	largest, known := largestEstimatedRows(ctx, rr, schema)
+	largest, known := largestEstimatedRows(ctx, sizeSource, schema)
 	if known && largest < queryTimeoutRaiseMinRows {
 		slog.InfoContext(ctx,
 			"planetscale: skipping the query-timeout raise — the largest table is below the size floor, so the copy is unlikely to hit the statement-time wall (ADR-0182 size gate); two rolling restarts would cost more than they save",
@@ -187,12 +187,19 @@ func revertQueryTimeoutRaise(ctx context.Context, controller ir.QueryTimeoutCont
 }
 
 // largestEstimatedRows returns the largest per-table estimated row count over
-// the schema via the source reader's optional [ir.RowCountEstimator], and
-// whether any estimate was available. Estimate failures are non-fatal (the
-// size gate then errs toward raising rather than skipping). Mirrors the
-// pre-stream estimate the parallel-copy chunk decision already uses.
-func largestEstimatedRows(ctx context.Context, rr ir.RowReader, schema *ir.Schema) (int64, bool) {
-	estimator, ok := rr.(ir.RowCountEstimator)
+// the schema via sizeSource's optional [ir.RowCountEstimator], and whether any
+// estimate was available. Estimate failures are non-fatal (the size gate then
+// errs toward raising rather than skipping). Mirrors the pre-stream estimate
+// the parallel-copy chunk decision already uses.
+//
+// sizeSource is `any` rather than [ir.RowReader] because it has only ever been
+// used through that one optional assertion, and a caller with no reader can
+// carry the same evidence some other way: the stopped-cold-start resume passes
+// the interrupted run's RECORDED per-table counts, which are measured rather
+// than estimated. A source implementing neither is the pre-existing
+// "no estimate available" case, unchanged.
+func largestEstimatedRows(ctx context.Context, sizeSource any, schema *ir.Schema) (int64, bool) {
+	estimator, ok := sizeSource.(ir.RowCountEstimator)
 	if !ok {
 		return 0, false
 	}

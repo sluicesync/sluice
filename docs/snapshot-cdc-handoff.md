@@ -98,12 +98,29 @@ crash-and-restart resumes from the last successfully-applied
 position — no double-apply, no missed events.
 
 For the handoff specifically: between snapshot capture (phase 1)
-and CDC start (phase 5), the persisted position is the snapshot
-anchor. A crash anywhere in phases 2-4 restarts from the same
-anchor — the bulk-copy work is idempotent (replays from snapshot;
-target tables either get DROPPED + recreated under the
-`--reset-target-data` flag, or are detected as already-populated
-and the pre-flight refuses).
+and CDC start (phase 5), there is **no `sluice_cdc_state` row at
+all** — that row is written only when CDC starts, which is what
+made a stop in this window expensive, and an absent or NULL
+position here is the NORMAL state for the whole cold start rather
+than a sign that phase 1 failed.
+
+What the cold start does persist as it runs is progress, in
+`sluice_migrate_state`: a phase, per-table rows, and — on a
+PostgreSQL source since v0.149.0 — a `snapshot_anchor` recording
+where the exported snapshot stood.
+
+That anchor is what makes a stop in phases 2-4 recoverable rather
+than a full re-copy. Re-running with the same `--stream-id` on a
+PostgreSQL source resumes: the copy is skipped, the remaining
+phases finish, and CDC starts from the recorded anchor. It refuses
+rather than guessing if the recorded copy did not finish every
+in-scope table, if this run's copy-shaping flags differ from the
+recorded ones, if the target no longer holds the rows, or if the
+slot has moved. On every other source, and on a serial PostgreSQL
+copy, no anchor is recorded and the older dichotomy still
+describes it: target tables get DROPPED and recreated under
+`--reset-target-data`, or are detected as already-populated and
+the pre-flight refuses.
 
 ## Diagnosing a stuck handoff
 
@@ -129,13 +146,25 @@ mysql -e "SHOW BINARY LOGS"                    # MySQL
 
 Common findings:
 
-- **Position token NULL in sluice_cdc_state** → phase 1 didn't
-  complete. Re-run `sluice sync start --stream-id <id>` —
-  sluice will re-capture the anchor (or fail with the original
-  failure reason if it's persistent).
+- **No `sluice_cdc_state` row, or a NULL position token** → this
+  is *not* a diagnosis. The row is written when CDC starts, so
+  its absence is the expected state for the entire cold start.
+  Read `sluice sync status --stream-id <id>` instead: it reports
+  a cold start in flight with its PHASE. **The phase moving is
+  the liveness signal** — the reported age comes from a header
+  row that only moves when the phase does, so a long copy of one
+  large table holds it still while every table is streaming.
+  Before concluding the run is gone, compare the target's row
+  counts against the source.
 
 - **Slot/binlog absent** → see "edge case" above. Recovery via
   `--reset-target-data` or a fresh stream id.
+
+- **Re-running a stopped cold start refuses on the populated
+  target** → the resume applies to a PostgreSQL source with a
+  parallel copy that finished every in-scope table (v0.149.0+).
+  Outside that, drop the kept slot (`sluice slot drop <resolved
+  name> --yes`) and re-run with `--reset-target-data`.
 
 - **Apply lag growing not shrinking** → target write throughput
   is below the source's change rate. See

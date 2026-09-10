@@ -241,7 +241,7 @@ var docRows = map[Code]docRow{
 	},
 	"SLUICE-E-COLDSTART-TARGET-NOT-EMPTY": {
 		Meaning: "Cold-start refused: a target table already contains data (usually a previous run died mid-copy).",
-		Remedy:  "Sync: re-run with `--reset-target-data --yes`. Migrate: use `--resume`. Either mode: `--force-cold-start` to copy into the populated table anyway (collides on PRIMARY KEY in most cases).",
+		Remedy:  "Sync, when the previous run was a **stop** rather than a crash: re-run with the same `--stream-id` first. Since v0.149.0 a PostgreSQL cold start whose copy had finished every in-scope table resumes instead of refusing — it skips the copy, finishes the remaining phases and anchors CDC at the kept slot's consistent point (`COLD-START-RESUMED`); if it cannot prove that, it says which proof failed rather than re-copying. Otherwise, sync: re-run with `--reset-target-data --yes` (dropping the kept slot first if `STOPPED-SLOT-KEPT` named one). Migrate: use `--resume`. Either mode: `--force-cold-start` to copy into the populated table anyway (collides on PRIMARY KEY in most cases).",
 	},
 	"SLUICE-E-CONFIRMATION-REQUIRED": {
 		Meaning: "A destructive command was run without `--yes`. sluice is non-interactive and never prompts, so it refuses loudly instead of blocking on a prompt (`slot drop` and `sync decommission` are the current callers; `sync decommission --dry-run` is exempt — it touches nothing).",
