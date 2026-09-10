@@ -678,17 +678,17 @@ func probeAndWriteHealth(ctx context.Context, b *bundleWriter, name string, req 
 		// have made the original defect visible in the bundle.
 		slot := req.SlotName
 		if slot == "" {
+			// Defensive only, and worth labelling as such: both CLI builders
+			// resolve through pipeline.SlotNameForSource, which never returns
+			// empty for a postgres source, so this cannot fire from either
+			// of them. It exists for a Request assembled some other way —
+			// and it is NOT the case a wrong --slot-name lands on. That one
+			// is the statsOK=false branch below, which is where Bug 281 was.
 			out["spill_reason"] = "no replication-slot name was resolved for this source, so slot-spill " +
 				"counters were not probed"
 		}
 		if slot != "" {
-			stats, statsOK, sperr := spiller.SlotSpillStats(ctx, slot)
-			if sperr != nil {
-				out["spill_reason"] = sperr.Error()
-			} else if statsOK {
-				out["spill_txns"] = stats.SpillTxns
-				out["spill_bytes"] = stats.SpillBytes
-			}
+			collectSpillStats(ctx, out, spiller, slot)
 		}
 	}
 
@@ -861,5 +861,50 @@ func closeIfCloser(x any) {
 		if err := c.Close(); err != nil {
 			slog.Debug("diagnose: close failed", slog.String("err", err.Error()))
 		}
+	}
+}
+
+// collectSpillStats records the outcome of one slot-spill probe into the
+// health section, whatever that outcome is.
+//
+// # Every branch writes something, and that is the whole point
+//
+// Audit A0909-AQ-M-1 was that this probe looked up the raw `--slot-name`
+// rather than the resolved `sluice_`-prefixed one, found no such slot,
+// and wrote NOTHING — an absence indistinguishable from a healthy slot
+// that had not spilled. Bug 281, filed by the v0.148.3 regression cycle
+// against that very fix, was that the reason it added sat on the
+// "no slot name resolved" branch, which neither CLI path can reach
+// (pipeline.SlotNameForSource never returns empty for a postgres
+// source), while the branch a wrong or absent flag ACTUALLY lands on —
+// the probe succeeding and reporting no row — still wrote nothing.
+//
+// So the rule this function exists to hold: a probe that could not
+// answer says why. Split out of the bundle assembler so all three
+// outcomes are reachable from a test without standing up a server,
+// which is what let the silent branch survive its own fix.
+func collectSpillStats(ctx context.Context, out map[string]any, spiller ir.SlotSpillReporter, slot string) {
+	// The slot actually looked up, recorded on every outcome. The bundle
+	// already carries the stream's own slot in state/cdc_state.json, so
+	// this puts the INDEPENDENT expected value beside it and a reader
+	// sees at a glance that the two disagree — which no amount of prose
+	// about the `sluice_` prefix makes as obvious as two names side by
+	// side.
+	out["spill_slot_probed"] = slot
+
+	stats, statsOK, err := spiller.SlotSpillStats(ctx, slot)
+	switch {
+	case err != nil:
+		out["spill_reason"] = err.Error()
+	case statsOK:
+		out["spill_txns"] = stats.SpillTxns
+		out["spill_bytes"] = stats.SpillBytes
+	default:
+		out["spill_reason"] = fmt.Sprintf(
+			"no row for replication slot %q — the slot does not exist on this source, it has not decoded "+
+				"anything yet, or the server predates pg_stat_replication_slots (PG 14). Compare this name "+
+				"against slot_name in state/cdc_state.json: --slot-name is a SUFFIX, so `--slot-name "+
+				"shard_a` names the slot sluice_shard_a", slot,
+		)
 	}
 }
