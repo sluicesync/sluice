@@ -132,6 +132,18 @@ The applier can do what the upsert cannot, and the reason is worth keeping: **a 
 
 End to end on `neki-torture`, one stream: INSERT applied, UPDATE applied, DELETE applied (count 20), and a shard-key-changing UPDATE refused at exit 3 with the target row untouched. First CDC apply sluice has ever completed against a sharded Neki target.
 
+### `__neki.list_metafuncs()` documents the whole control plane, and `__neki.schema_snapshot()` reads a schema the catalog cannot
+
+Two capabilities found by re-listing the `__neki` schema, both worth knowing before designing any more of the Neki flavor.
+
+**`list_metafuncs()`** returns all **89** control-plane functions with argument list, return shape, required role and a one-sentence purpose — and it works on a sharded database, which the obvious alternative does not (`pg_get_function_arguments` is NK013 there; see the NEKI-008 footnote). It is the right way to enumerate the surface, and it retires the hand-maintained inventory in `neki-issues/README.md`. Groups: `sidecars` 16, `workflows` 16, `cutover` 12, `topology` 11, `control` 9, `verification` 7, `failover` 6, `schema` 5, `sessions` 4, `utilities` 3.
+
+**`schema_snapshot(in_databases text[])`** — *"Return a pg_dump-compatible schema dump, for the whole cluster or named databases"* — is the interesting one. Measured on the SHARDED cluster: 1,565 lines in a single `global_sql` text column, carrying `CREATE TABLE` for all 14 `public` tables plus the `__neki` internals, roles included (passwords redacted to `'********'`).
+
+That matters because it is a schema read that **works where ours does not**. NEKI-008 is a chain of catalog-query refusals on a sharded database; this function answers the same question in one call, server-side, with no subquery idioms to trip on.
+
+**It is not a drop-in replacement, and the reason is a tenet.** sluice is IR-first and explicitly forbids regex over DDL strings — a text dump would have to be parsed into the IR, which is a PostgreSQL DDL parser we do not have and should not grow casually. So the honest status is: a **fallback worth designing** if the sharded catalog reads prove unfixable, and an **independent oracle available today** for testing the catalog reader against (reader ≠ writer, for free). Recorded rather than acted on.
+
 ### D-1 RESHARD MID-STREAM — measured, and it PASSES
 
 The Tier-D row this has carried since the start, finally exercised. It could not be run before, because CDC into a sharded Neki target did not work at all.
