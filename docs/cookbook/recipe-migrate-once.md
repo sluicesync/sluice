@@ -92,9 +92,11 @@ missing permission, etc.) or skipping it with `--exclude-table=<name>`.
 - **Continuous sync.** Use `sluice sync start` for that — see
   [recipe-bidirectional-cutover.md](recipe-bidirectional-cutover.md).
 - **Verifying every row landed.** Use `sluice verify` after migrate
-  completes. The fastest variant is `--depth=count`; for stronger
-  guarantees use `--depth=sample` (row-hash on a random sample) or
-  `--depth=full`.
+  completes. The fastest variant is `--depth=count`; for a stronger
+  guarantee use `--depth=sample` (row-hash on a random sample). Those
+  two are the whole set: an every-row content hash is designed but not
+  built, and `--depth=full` is refused by the parser rather than
+  accepted.
 - **Type-override knobs.** If a specific column needs a target type
   sluice's translation policy didn't pick, use `--type-override
   TABLE.COL=<target_type>`. See [`docs/type-mapping.md`](../type-mapping.md).

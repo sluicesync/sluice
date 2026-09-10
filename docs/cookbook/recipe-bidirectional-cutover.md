@@ -162,8 +162,10 @@ sluice verify \
 ```
 
 Run after the CDC drain completes. `--depth=sample` is a good
-default; `--depth=count` is faster but only verifies row counts;
-`--depth=full` is the strongest guarantee and the slowest.
+default; `--depth=count` is faster but only verifies row counts.
+Those two are the whole set — a full every-row content hash is
+designed but not built, and `--depth=full` is refused by the parser
+rather than accepted, so nothing silently downgrades if you try it.
 
 ## Common pitfalls
 

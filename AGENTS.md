@@ -24,7 +24,7 @@ sluice is a single-binary CLI that migrates and continuously syncs databases (My
 
 ## The standard workflow
 
-1. **Preview first**: `sluice migrate --dry-run --format json ...` (or `sluice preview`) — emits the full plan as JSON. Show it to the human before proceeding.
+1. **Preview first**: `sluice migrate --dry-run --format json ...` — emits the full plan as JSON. Show it to the human before proceeding. To see the target DDL alone, `sluice schema preview` renders it with cross-engine translation notes.
 2. **Run**: `sluice migrate --format json ...` — one JSON result envelope on stdout (see below).
 3. **Verify**: `sluice verify --format json ...` — never report a migration done without it.
 4. For continuous sync: `sync start --dry-run` → `sync start` → poll `sync health --format json` (exits 1 on breached thresholds or on durably skipped tables — cron/agent-friendly).

@@ -91,7 +91,7 @@ var docExemptRe = regexp.MustCompile(`<!--\s*cli-command-exempt:\s*([a-z][a-z0-9
 // directory holding its own SKILL.md -- scanning skills/ non-recursively
 // found nothing at all, which is how the redaction skill kept the wrong
 // command name through the first cut of this gate.
-var docCommandRoots = []string{"docs", "docs/operator", "docs/cookbook", "skills/...", "README.md"}
+var docCommandRoots = []string{"docs", "docs/operator", "docs/cookbook", "skills/...", "README.md", "AGENTS.md"}
 
 func TestDocsNameOnlyRealCommands(t *testing.T) {
 	repo := repoRootForDocs(t)

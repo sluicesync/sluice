@@ -192,6 +192,7 @@ testing-ci, `PDD` perf-deps-devex-docs.
 - A0909-PDD-DOC1 prose the cross-region-migration.md home is filed under A0909-P2b; the other two claim homes are named in the consolidated list
 - A0909-PDD-DOC2 filed
 - A0909-PDD-DOC3 filed
+- A0909-DOCFLAG-1 filed
 - A0909-PDD-DOC4 filed
 - A0909-PDD-DOC5 filed
 
