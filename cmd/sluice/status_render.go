@@ -425,7 +425,8 @@ func classifyLeasesForSummary(leases []ir.ShardConsolidationLeaseRow, now time.T
 // run that is working and one that died mid-phase and left its last row
 // behind.
 //
-// CORRECTED 2026-09-10 (found by the A0909-P2b work): this comment used
+// CORRECTED 2026-09-10 (audit A0909-STATUS-1, found by the A0909-P2b
+// work, and published wrong in v0.148.0's notes): this comment used
 // to say a climbing age across two calls is how an operator tells those
 // apart. It is not, during the copy. The header row this renders moves
 // on markPhase / markComplete; per-table progress lands in a DIFFERENT
