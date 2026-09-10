@@ -296,9 +296,22 @@ func (a *ChangeApplier) dispatchPipelined(ctx context.Context, b *pgxBatchTx, st
 		if err != nil {
 			return false, fmt.Errorf("postgres: applier: column types for %s.%s: %w", schema, v.Table, err)
 		}
-		stmt, args, err := buildUpdateSQL(schema, v.Table, v.Before, v.After, colTypes)
+		// A sharded Neki target refuses an UPDATE that names its routing
+		// column, even assigned its own value; the shard keys let
+		// buildUpdateSQL drop an unchanged one and refuse a changed one.
+		// nil on every other target. See neki_update_shardkey.go.
+		shardKeys, err := a.shardKeyColumnsFor(ctx, schema, v.Table)
+		if err != nil {
+			return false, fmt.Errorf("postgres: applier: resolve shard key for %s.%s: %w", schema, v.Table, err)
+		}
+		stmt, args, err := buildUpdateSQL(schema, v.Table, v.Before, v.After, colTypes, shardKeys)
 		if err != nil {
 			return false, fmt.Errorf("postgres: applier: build update for %s.%s: %w", schema, v.Table, err)
+		}
+		if stmt == "" {
+			// Every column the update touched was an unchanged shard key:
+			// there is nothing to write, and the change is satisfied.
+			return false, nil
 		}
 		b.queue(stmt, args, queuedStmt{schema: schema, table: v.Table, kind: "update"})
 		return false, nil

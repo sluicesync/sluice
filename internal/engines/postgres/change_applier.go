@@ -98,6 +98,21 @@ import (
 type ChangeApplier struct {
 	db *sql.DB
 
+	// isNeki records that this applier's target is a PlanetScale Neki
+	// router, probed once per server at open (neki_probe.go). It gates the
+	// shard-key handling in the UPDATE path (neki_update_shardkey.go) and
+	// nothing else.
+	isNeki bool
+
+	// serverKey identifies this applier's endpoint for the per-server
+	// topology memo. Credential-free by construction — see
+	// [pgConfig.serverKey].
+	serverKey string
+
+	// shardKeys memoises per-table shard-key columns resolved from the Neki
+	// data topology, so a busy CDC stream does not re-walk it per change.
+	shardKeys nekiShardKeyCache
+
 	// pipelineDB is the dedicated ADR-0092 pipelined-apply pool: a lazy
 	// *sql.DB opened on first use ([pipelinePool]) from pipelineCfg with
 	// pgx's QueryExecModeDescribeExec default, so every distinct statement
@@ -1664,9 +1679,22 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		if err != nil {
 			return false, fmt.Errorf("postgres: applier: column types for %s.%s: %w", schema, v.Table, err)
 		}
-		stmt, args, err := buildUpdateSQL(schema, v.Table, v.Before, v.After, colTypes)
+		// A sharded Neki target refuses an UPDATE that names its routing
+		// column, even assigned its own value; the shard keys let
+		// buildUpdateSQL drop an unchanged one and refuse a changed one.
+		// nil on every other target. See neki_update_shardkey.go.
+		shardKeys, err := a.shardKeyColumnsFor(ctx, schema, v.Table)
+		if err != nil {
+			return false, fmt.Errorf("postgres: applier: resolve shard key for %s.%s: %w", schema, v.Table, err)
+		}
+		stmt, args, err := buildUpdateSQL(schema, v.Table, v.Before, v.After, colTypes, shardKeys)
 		if err != nil {
 			return false, fmt.Errorf("postgres: applier: build update for %s.%s: %w", schema, v.Table, err)
+		}
+		if stmt == "" {
+			// Every column the update touched was an unchanged shard key:
+			// there is nothing to write, and the change is satisfied.
+			return false, nil
 		}
 		// Update misses are tolerated (zero rows affected) for resume
 		// idempotency; the same caveat as MySQL applies — see the
@@ -2658,7 +2686,16 @@ func buildInsertSQL(schema, table string, row ir.Row, key []string, colTypes map
 // in After (unchanged-column detection is a v1.5 optimization).
 // WHERE uses every column in Before with NULL-aware predicate
 // building.
-func buildUpdateSQL(schema, table string, before, after ir.Row, colTypes map[string]*ir.Column) (sqlStmt string, args []any, err error) {
+// shardKeys, when non-empty, names the target's routing columns (a sharded
+// PlanetScale Neki target — nil everywhere else). Such a column may not appear
+// on the left of a SET at all, even assigned its own current value, so an
+// UNCHANGED one is dropped from the SET list and a CHANGED one is refused.
+// See neki_update_shardkey.go for why the before-image is what makes that
+// safe here and unsafe in the upsert path.
+//
+// An empty returned statement means "no work": every column the update
+// touched was an unchanged shard key, so there is nothing left to SET.
+func buildUpdateSQL(schema, table string, before, after ir.Row, colTypes map[string]*ir.Column, shardKeys []string) (sqlStmt string, args []any, err error) {
 	// Audit 2026-08-05 C-9: refuse a before-image with nothing usable as a
 	// predicate, in the same words the MySQL applier uses. Pre-fix this
 	// rendered `UPDATE t SET … WHERE ` and PG answered 42601 "syntax error
@@ -2667,11 +2704,21 @@ func buildUpdateSQL(schema, table string, before, after ir.Row, colTypes map[str
 	if len(appliershared.NonGeneratedRowKeys(before, colTypes)) == 0 {
 		return "", nil, appliershared.RefuseNoRowPredicate(engineNamePostgres, "update", schema, table, before)
 	}
-	tableRef := quoteIdent(schema) + "." + quoteIdent(table)
-	setSQL, setArgs, err := buildSetClause(after, 1, colTypes)
+	setRow, err := dropUnchangedShardKeys(schema, table, before, after, shardKeys)
 	if err != nil {
 		return "", nil, err
 	}
+	if len(setRow) == 0 {
+		return "", nil, nil
+	}
+	tableRef := quoteIdent(schema) + "." + quoteIdent(table)
+	setSQL, setArgs, err := buildSetClause(setRow, 1, colTypes)
+	if err != nil {
+		return "", nil, err
+	}
+	// The WHERE clause is built from the WHOLE before-image, shard key
+	// included, which is what makes dropping the column from SET safe: the
+	// statement still routes to the shard that holds the row.
 	whereSQL, whereArgs, err := buildWhereClause(before, len(setArgs)+1, colTypes)
 	if err != nil {
 		return "", nil, err

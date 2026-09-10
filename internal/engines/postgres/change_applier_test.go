@@ -233,7 +233,7 @@ func TestBuildSQL_VerbatimTypeCasts(t *testing.T) {
 	t.Run("UPDATE SET clause carries the cast", func(t *testing.T) {
 		before := ir.Row{"id": int64(1)}
 		after := ir.Row{"id": int64(1), "price": "$50.00", "lsn": "0/100"}
-		gotSQL, _, err := buildUpdateSQL("public", "t", before, after, colTypes)
+		gotSQL, _, err := buildUpdateSQL("public", "t", before, after, colTypes, nil)
 		if err != nil {
 			t.Fatalf("buildUpdateSQL: %v", err)
 		}
@@ -343,7 +343,7 @@ func TestBuildUpdateSQL(t *testing.T) {
 	before := ir.Row{"id": int64(7), "email": "old@example.com"}
 	after := ir.Row{"id": int64(7), "email": "new@example.com", "active": false}
 
-	gotSQL, gotArgs, err := buildUpdateSQL("public", "users", before, after, nil)
+	gotSQL, gotArgs, err := buildUpdateSQL("public", "users", before, after, nil, nil)
 	if err != nil {
 		t.Fatalf("buildUpdateSQL: %v", err)
 	}
@@ -643,7 +643,7 @@ func TestBuildSQL_FiltersGeneratedColumns(t *testing.T) {
 	t.Run("UPDATE SET and WHERE both exclude generated column", func(t *testing.T) {
 		before := ir.Row{"id": int64(1), "price": "9.99", "cost": "4.50", "margin": "5.49"}
 		after := ir.Row{"id": int64(1), "price": "12.99", "cost": "4.50", "margin": "8.49"}
-		gotSQL, _, err := buildUpdateSQL("public", "products", before, after, colTypes)
+		gotSQL, _, err := buildUpdateSQL("public", "products", before, after, colTypes, nil)
 		if err != nil {
 			t.Fatalf("buildUpdateSQL: %v", err)
 		}

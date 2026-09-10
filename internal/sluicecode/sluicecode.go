@@ -496,6 +496,53 @@ const (
 	// destroys data) — and nothing at this point can tell them apart.
 	CodeResumeFreshTableNotEmpty Code = "SLUICE-E-RESUME-FRESH-TABLE-NOT-EMPTY"
 
+	// CodeTargetShardKeyNotInUpsertKey fires when a SHARDED target's routing
+	// columns are not contained in the key sluice's idempotent write would
+	// conflict on. Refused before anything is written.
+	//
+	// The write is `INSERT … ON CONFLICT (k) DO UPDATE SET <every other
+	// column>` — the CDC applier and the bulk-copy resume path both use it —
+	// and on a sharded PlanetScale Neki table whose shard key is outside `k`
+	// both spellings fail, in opposite directions:
+	//
+	//   - naming the shard key in the SET list is refused outright (SQLSTATE
+	//     NK013), on the statement SHAPE, even when the value is unchanged;
+	//   - leaving it out silently INSERTS a duplicate of `k` whenever the
+	//     incoming row's shard key differs from the stored row's, because
+	//     `ON CONFLICT` evaluates its conflict only on the shard the incoming
+	//     row routes to. A PRIMARY KEY on a sharded table is enforced within
+	//     a shard, not across the database.
+	//
+	// Measured 2026-09-10 on a live 3-shard cluster: two rows carrying
+	// `id = 3001`, physically resident on different shards, at exit 0
+	// (neki-issues/NEKI-011). A CDC replay of an update that changed the
+	// shard key produces exactly that.
+	//
+	// There is no third spelling, so this is a refusal rather than a
+	// degradation. The safe condition is a property of the schema — every
+	// shard-key column contained in the conflict key — so it is knowable
+	// before any data moves and the operator can fix it.
+	CodeTargetShardKeyNotInUpsertKey Code = "SLUICE-E-TARGET-SHARD-KEY-NOT-IN-UPSERT-KEY"
+
+	// CodeTargetShardKeyUpdateUnsupported fires when a CDC change would alter
+	// a value in the target's SHARD-KEY column — the row would have to move
+	// to a different shard, which a sharded PlanetScale Neki target cannot
+	// express (`ERROR: not implemented: updating index column …`, NK013,
+	// refuses a plain `UPDATE … SET <shard key> = …` outright).
+	//
+	// Distinct from [CodeTargetShardKeyNotInUpsertKey], which is a schema
+	// refusal raised at preflight before anything moves. This one is a DATA
+	// refusal raised mid-stream, and it fires on a target that passed that
+	// preflight: an unchanged shard key is simply dropped from the UPDATE's
+	// SET list (the before-image proves it is a no-op, and the WHERE still
+	// routes), so only a genuine change reaches here.
+	//
+	// Refused rather than partially applied. Writing every other column and
+	// leaving the routing column behind would make the target's row disagree
+	// with the source's on the one value that decides where the row lives —
+	// silently, with the stream still reporting healthy.
+	CodeTargetShardKeyUpdateUnsupported Code = "SLUICE-E-TARGET-SHARD-KEY-UPDATE-UNSUPPORTED"
+
 	// CodeTargetDeferrableKey fires when a target table's only usable
 	// upsert key is a DEFERRABLE unique constraint. Postgres refuses a
 	// non-immediate index as an `ON CONFLICT` arbiter (SQLSTATE 55000),
@@ -811,10 +858,12 @@ var registry = map[Code]Info{
 
 	CodeTargetTableShapeMismatch: {ClassRefusal, "migrate refused before any data moved: a target table with the same name already exists but its column shape (names/types/nullability) differs from what the migration would create — proceeding would fail mid-copy or land rows in the wrong columns"},
 
-	CodeTargetPreexistingForeignKey:  {ClassRefusal, "migrate/sync cold-start refused before any data moved: the target already carries a foreign key on a table this run copies into, and that constraint's parent table is copied by the SAME run — the copy is not parent-first ordered, so a child row reaches the target before its parent and the constraint rejects it (MySQL Error 1452 / Postgres SQLSTATE 23503); sluice's deferred-constraint discipline only governs the constraints it creates itself"},
-	CodeTargetShardPlacementMismatch: {ClassRefusal, "refused before any data moved: a sharded target table's ROUTING and row PLACEMENT disagree, so its PRIMARY KEY is not globally enforced and sluice's idempotent upsert would insert duplicate rows instead of updating — the table was almost certainly assigned to a shard group without a reshard workflow to move its rows"},
-	CodeMigrateProgressUnrecordable:  {ClassRefusal, "refused before the table's first row moved: the migrate-state store could not record that this table is being copied, and a later --resume would read the missing progress row as \"never copied\" — appending a second copy of every row for a table with no primary key rather than resuming"},
-	CodeResumeFreshTableNotEmpty:     {ClassRefusal, "refused on --resume: a table with no persisted progress would be started from scratch WITHOUT truncating, but the target already holds rows — either an earlier attempt copied it and could not persist its progress row, or the target was already populated"},
+	CodeTargetPreexistingForeignKey:     {ClassRefusal, "migrate/sync cold-start refused before any data moved: the target already carries a foreign key on a table this run copies into, and that constraint's parent table is copied by the SAME run — the copy is not parent-first ordered, so a child row reaches the target before its parent and the constraint rejects it (MySQL Error 1452 / Postgres SQLSTATE 23503); sluice's deferred-constraint discipline only governs the constraints it creates itself"},
+	CodeTargetShardPlacementMismatch:    {ClassRefusal, "refused before any data moved: a sharded target table's ROUTING and row PLACEMENT disagree, so its PRIMARY KEY is not globally enforced and sluice's idempotent upsert would insert duplicate rows instead of updating — the table was almost certainly assigned to a shard group without a reshard workflow to move its rows"},
+	CodeMigrateProgressUnrecordable:     {ClassRefusal, "refused before the table's first row moved: the migrate-state store could not record that this table is being copied, and a later --resume would read the missing progress row as \"never copied\" — appending a second copy of every row for a table with no primary key rather than resuming"},
+	CodeTargetShardKeyUpdateUnsupported: {ClassRefusal, "refused mid-stream: a change would alter the target row’s SHARD-KEY value, moving it to a different shard, which a sharded target cannot express — applying the other columns and leaving the routing column behind would diverge silently"},
+	CodeTargetShardKeyNotInUpsertKey:    {ClassRefusal, "refused before anything was written: a sharded target table’s ROUTING columns are not contained in the key sluice’s idempotent write conflicts on, so a row whose shard key changed would be INSERTED alongside the original instead of updating it — two rows claiming one primary key, at exit 0, with no error at any point"},
+	CodeResumeFreshTableNotEmpty:        {ClassRefusal, "refused on --resume: a table with no persisted progress would be started from scratch WITHOUT truncating, but the target already holds rows — either an earlier attempt copied it and could not persist its progress row, or the target was already populated"},
 
 	CodePSForeignKeysNotEnabled: {ClassRefusal, "migrate/sync cold-start refused before the copy: the PlanetScale target has foreign-key support disabled (allow_foreign_key_constraints off, read back as foreign_keys_enabled=false) while the source schema declares foreign keys the run would add after the copy — the platform rejects ADD FOREIGN KEY outright, so the run would fail at the constraints phase after the whole copy and --resume re-hits it; enable foreign key support on the target database, or re-run with --skip-foreign-keys (each FK's referencing columns stay indexed, so the constraints can be added out-of-band)"},
 

@@ -290,6 +290,7 @@ func (e Engine) OpenRowWriter(ctx context.Context, dsn string) (ir.RowWriter, er
 		db:         db,
 		schema:     cfg.schema,
 		isNeki:     isNekiW,
+		serverKey:  cfg.serverKey(),
 		useCopy:    e.Capabilities().BulkLoad == ir.BulkLoadCopy,
 		hasPostGIS: hasGIS,
 	}, nil
@@ -639,8 +640,11 @@ func (e Engine) OpenChangeApplier(ctx context.Context, dsn string) (ir.ChangeApp
 	if err != nil {
 		return nil, err
 	}
+	isNekiA, _ := probeIsNeki(ctx, cfg.serverKey(), db)
 	return &ChangeApplier{
-		db: db,
+		db:        db,
+		isNeki:    isNekiA,
+		serverKey: cfg.serverKey(),
 		// pipelineCfg carries the parsed DSN so the ADR-0092 pipelined
 		// pool can be opened lazily on the first batch (Exec-mode default).
 		pipelineCfg:      cfg,

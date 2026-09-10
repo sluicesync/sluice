@@ -452,6 +452,19 @@ func (m *Migrator) phasePreflightTarget(ctx context.Context, rc resumeContext, s
 		return markFailed(ctx, rc, state, ir.MigrationPhasePending, err)
 	}
 
+	// Shard-key/upsert-key preflight — the SCHEMA sibling of the placement
+	// check above, and deliberately separate from it. That one asks whether a
+	// table's rows are where its routing says they are (a data question,
+	// probed behaviourally); this one asks whether the routing COLUMNS are
+	// contained in the key sluice's idempotent write conflicts on. When they
+	// are not, `ON CONFLICT` is evaluated only on the shard the incoming row
+	// routes to, so a row whose shard key changed is inserted alongside the
+	// original — two rows, one primary key, exit 0. A target can fail either
+	// check independently. See migcore.PreflightShardKeyUpsert.
+	if err := migcore.PreflightShardKeyUpsert(ctx, schema, rw); err != nil {
+		return markFailed(ctx, rc, state, ir.MigrationPhasePending, err)
+	}
+
 	// PlanetScale-Postgres ownership advisory (soak finding F10). Advisory-
 	// only (WARN, never a refusal): if the target connects as an ephemeral
 	// pscale_api_* role, every created table is owned by it — a recoverable

@@ -114,6 +114,24 @@ Two things generalise beyond Neki:
 - **A best-effort write becomes a correctness problem the moment something reads its ABSENCE as information.** The four breadcrumb sites now refuse; every later write for the same table stays best-effort deliberately, because losing one of those degrades to re-copying work the resume path already handles. The split is enforced by `TestProgressBreadcrumbsDoNotRideTheBestEffortHelper`, an AST walker that derives its own universe and requires every remaining best-effort call to carry a terminal entry.
 - **A store that fails SYSTEMATICALLY is a different hazard from one that fails transiently**, and sluice's tolerance was tuned for the transient kind. Neki is the first systematic one we have met; a revoked `GRANT` or a dropped control table is the same shape on any engine.
 
+### CDC into a SHARDED Neki target — now works end to end, and the first fix for it was wrong
+
+Recorded in full because the correction is the reusable part.
+
+`sync` into `neki-torture` died on the first change event: `applier: insert into public.cdc_resh: ERROR: not implemented: updating index column "tenant_id" is not supported (NK013)`. sluice's idempotent write is `INSERT … ON CONFLICT (k) DO UPDATE SET <every other column>`, and on a sharded table the shard key is one of those other columns. Neki refuses the statement on its **shape** — measured with the stored and incoming values both equal to 5.
+
+**The obvious fix is a silent-corruption bug.** Leaving the shard key out of the `SET` list makes the statement legal and makes the write wrong: `ON CONFLICT (k)` evaluates its conflict only on the shard the *incoming* row routes to, so a row whose shard key differs from the stored row's finds no conflict and INSERTS. Measured: `SELECT count(*) … WHERE id = 3001` returned **2**, the two rows physically on different shards, at exit 0. A guard predicate does not help — there is no conflict for it to skip. This is [NEKI-006](../../../neki-issues/NEKI-006-topology-without-reshard-silently-splits-a-table.md)'s harm reached with no topology mistake at all, so NEKI-006's diagnosis was narrower than the hazard.
+
+What shipped, in two parts, because the first part's premise failed under test:
+
+1. **`SLUICE-E-TARGET-SHARD-KEY-NOT-IN-UPSERT-KEY`** — a preflight refusal when a sharded target's routing columns are not contained in the upsert conflict key. When they are, the shard key cannot change for a given key, routing is stable, and it is already excluded from the `SET` list because key columns are. Verified live both ways: `(id)` keyed / `tenant_id` sharded is refused at exit 3; `(tenant_id, id)` keyed migrates 20/20.
+
+2. **The applier's UPDATE path**, which the preflight does **not** cover — and only a live run said so. A `sync` into the safely-keyed table copied, entered CDC, applied a DELETE, and died on the first UPDATE with the same NK013, because a plain `UPDATE`'s `SET` list is built from the **row**, not the key. Being in the primary key does not keep a column out of it.
+
+The applier can do what the upsert cannot, and the reason is worth keeping: **a CDC UPDATE carries a before-image.** So an unchanged shard key is dropped from the `SET` list (provably a no-op; the `WHERE` still carries the whole before-image so the statement routes), and a changed one is refused (`SLUICE-E-TARGET-SHARD-KEY-UPDATE-UNSUPPORTED`) rather than partially applied. **The same edit is correct in one place and silently corrupting in the other, and the before-image is the entire difference.**
+
+End to end on `neki-torture`, one stream: INSERT applied, UPDATE applied, DELETE applied (count 20), and a shard-key-changing UPDATE refused at exit 3 with the target row untouched. First CDC apply sluice has ever completed against a sharded Neki target.
+
 ### Tier C, second pass — the router's OTHER row path, and it is CLEAN
 
 The first Tier-C pass (below) went through `pg_dump | psql`, which is COPY text on a pass-through path. PlanetScale's ["lifecycle of a sharded Postgres query"](https://planetscale.com/blog/the-lifecycle-of-a-sharded-postgres-query) says the router is a real execution engine — hash joins, `AVG` rewritten to `SUM`/`COUNT`, spill-to-disk — and that copying encoded bytes straight through is an *optimisation*, i.e. one of two paths. Under this project's own family-dispatch rule that made the first pass a pinned representative standing in for an untested sibling: the Bug 74 shape exactly.

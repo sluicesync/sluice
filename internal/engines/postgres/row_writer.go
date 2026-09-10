@@ -88,6 +88,11 @@ type RowWriter struct {
 	// shard-placement preflight and nothing else.
 	isNeki bool
 
+	// serverKey identifies this writer's endpoint for the per-server memos
+	// (neki_probe.go, neki_topology.go). Credential-free by construction —
+	// see [pgConfig.serverKey].
+	serverKey string
+
 	// useCopy selects the bulk-load strategy. true → writeViaCopy;
 	// false → writeViaBatch (the original batched-insert path).
 	useCopy bool
