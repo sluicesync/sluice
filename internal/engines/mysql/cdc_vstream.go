@@ -251,6 +251,18 @@ type vstreamCDCReader struct {
 	// StreamChanges; read only on the pump goroutine.
 	schemaSeedSig map[string]ir.SchemaSignature
 
+	// scopeAllowed is the pipeline-supplied effective table scope, the
+	// same predicate the binlog reader carries (Bug 246). This lane needs
+	// it for the reason audit 2026-09-09 A0909-AQ-M-2 measured: the
+	// VStream tail request's rules end in `Match: "/.*/"`, so EVERY table
+	// in the keyspace arrives and the sync's table filter is applied one
+	// stage downstream — an excluded table therefore reaches the FIELD
+	// handler, lands in snapshotSig, and its next DDL would kill the
+	// stream through a refusal about a table this stream emits nothing
+	// for. nil when the pipeline wired none, which fires the refusal as
+	// before. Set before StreamChanges; read on the pump goroutine.
+	scopeAllowed func(schema, table string) bool
+
 	// currentVgtid is the latest position the reader has observed.
 	// VStream emits a VGTID after each transaction; we update this
 	// then promote it to the candidate position emitted alongside
@@ -1756,7 +1768,7 @@ func (r *vstreamCDCReader) maybeSnapshotSchema(ctx context.Context, fe *binlogda
 	// SLM-1: a table this reader has not yet snapshotted borrows its prev
 	// from the streamer's seed (priorShapeFromSeed), so a DDL that lands
 	// before the table's first FIELD of this process is checked too.
-	if r.schemaDeltaAppliesToTarget {
+	if r.schemaDeltaAppliesToTarget && sessionTZRefusalInScope(r.scopeAllowed, keyspace, table) {
 		if prior, hadPrior := priorShapeFromSeed(r.snapshotSig, cacheKey, r.schemaSeedSig, table); hadPrior {
 			if col, pair, found := unforwardableSessionTZColumn(prior, tbl); found {
 				return sessionTZCastRefusal(keyspace, table, col, pair)

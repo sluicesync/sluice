@@ -825,6 +825,11 @@ type vstreamSnapshotStream struct {
 	// read only on that pump goroutine.
 	schemaSeedSig map[string]ir.SchemaSignature
 
+	// scopeAllowed is the pipeline-supplied effective table scope; see the
+	// standalone reader's field of the same name for why this lane needs
+	// it (audit 2026-09-09 A0909-AQ-M-2). nil fires the refusal as before.
+	scopeAllowed func(schema, table string) bool
+
 	// currentVgtid is the latest VGTID observed on the stream. When the
 	// COPY pump reaches the global COPY_COMPLETED, this is the snapshot-
 	// consistent position; during the CDC phase it advances with each
@@ -2627,7 +2632,7 @@ func (s *vstreamSnapshotStream) maybeSnapshotSchemaCDC(ctx context.Context, fe *
 	// and last of this engine's SchemaSnapshot emitters. Same predicate and
 	// same position in the flow as the standalone reader's, including the
 	// SLM-1 seed fallback for a table not yet snapshotted on this phase.
-	if s.schemaDeltaAppliesToTarget {
+	if s.schemaDeltaAppliesToTarget && sessionTZRefusalInScope(s.scopeAllowed, keyspace, table) {
 		if prior, hadPrior := priorShapeFromSeed(s.snapshotSig, cacheKey, s.schemaSeedSig, table); hadPrior {
 			if col, pair, found := unforwardableSessionTZColumn(prior, tbl); found {
 				return sessionTZCastRefusal(keyspace, table, col, pair)

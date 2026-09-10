@@ -155,9 +155,17 @@ var (
 	// server-side — but pinned so the surface stays uniform across the flavor).
 	_ ir.FullBeforeImageSetter = (*CDCReader)(nil)
 	// Bug 246: the reader-side table-scope predicate the pipeline wires so
-	// the XA refusal honours the sync's --include/--exclude-table filter
-	// (the G9 FK-action census scopes by the same predicate, via
+	// a stream-killing refusal honours the sync's --include/--exclude-table
+	// filter (the G9 FK-action census scopes by the same predicate, via
 	// binlogFilterScope.tableAllowed).
+	//
+	// ALL THREE CDC lanes declare it as of audit 2026-09-09 A0909-AQ-M-2.
+	// Only the binlog reader did before, so the pipeline's type-assert
+	// silently found nothing on either VStream lane and the
+	// session-time_zone refusal there could kill a stream over an
+	// EXCLUDED table. The two VStream pins are below with their lanes;
+	// TestSessionTZRefusalSitesAreScopeGated is the roster that keeps a
+	// fourth refusal site from skipping the question.
 	_ ir.CDCScopePredicateSetter = (*CDCReader)(nil)
 
 	// VStream (PlanetScale / Vitess flavor) types. The snapshot-rows
@@ -171,12 +179,19 @@ var (
 	// down. A drift here silently reverts warm resume to the full-keyspace
 	// unfiltered stream (a perf regression) while go build stays green.
 	_ ir.ServerSideCDCFilterSetter = (*vstreamCDCReader)(nil)
-	_ ir.CDCReader                 = (*vstreamSnapshotChanges)(nil)
-	_ ir.ReshardReopener           = (*vstreamSnapshotChanges)(nil)
-	_ ir.FullBeforeImageSetter     = (*vstreamSnapshotChanges)(nil)
-	_ ir.CopyCheckpointer          = (*vstreamSnapshotRows)(nil)
-	_ ir.CopyDurableProgressSink   = (*vstreamSnapshotRows)(nil)
-	_ ir.IdempotentCopyReader      = (*vstreamSnapshotRows)(nil)
+	// A0909-AQ-M-2: the VStream tail request's rules end in
+	// `Match: "/.*/"`, so an excluded table still reaches these lanes and
+	// the sync's filter is applied downstream. Without the predicate a
+	// schema refusal here kills the stream over a table it emits nothing
+	// for.
+	_ ir.CDCScopePredicateSetter = (*vstreamCDCReader)(nil)
+	_ ir.CDCReader               = (*vstreamSnapshotChanges)(nil)
+	_ ir.ReshardReopener         = (*vstreamSnapshotChanges)(nil)
+	_ ir.FullBeforeImageSetter   = (*vstreamSnapshotChanges)(nil)
+	_ ir.CDCScopePredicateSetter = (*vstreamSnapshotChanges)(nil)
+	_ ir.CopyCheckpointer        = (*vstreamSnapshotRows)(nil)
+	_ ir.CopyDurableProgressSink = (*vstreamSnapshotRows)(nil)
+	_ ir.IdempotentCopyReader    = (*vstreamSnapshotRows)(nil)
 	// LossyFloatCopyReader signals the VStream COPY phase rounds FLOATs
 	// (the 17-year MySQL display-rounding bug), which TRIGGERS the
 	// cold-start FLOAT repair. Dispatched by runtime type-assertion at

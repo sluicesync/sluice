@@ -1498,7 +1498,7 @@ func (r *CDCReader) dispatchRows(
 	// changed nothing the reader could see). A predicate-exempted row still
 	// EMITS — the downstream filter drops it exactly as it drops every
 	// other excluded-table event.
-	if r.inXA && (r.scopeAllowed == nil || r.xaTableInScope(qn)) {
+	if r.inXA && (r.scopeAllowed == nil || r.tableInScope(qn)) {
 		return sluicecode.Wrap(
 			sluicecode.CodeCDCXAUnsupported,
 			"keep XA (distributed) transactions off the replicated tables, or exclude those tables from the "+
@@ -1847,7 +1847,28 @@ func (r *CDCReader) maybeSnapshotSchemaB1(ctx context.Context, qn string, tbl *t
 	// cache at every DDL, so the first boundary has a prev type too. A
 	// table with no prior at all (never seeded, never decoded) is the
 	// honest "no prior knowledge" residual; see [CDCReader.priorSig].
-	if prior, hadPrior := r.priorSig[qn]; r.schemaDeltaAppliesToTarget && hadPrior && !prior.Equal(sig) {
+	//
+	// SCOPE-GATED (audit 2026-09-09 A0909-AQ-M-2). This refusal kills the
+	// stream, and without the gate it killed it over a table the operator
+	// EXCLUDED. The reader decodes every table in the bound database —
+	// the sync's table filter lives one stage downstream, which is the
+	// same fact Bug 246 turned on for the XA refusal above — so
+	// r.schemaCache, and through retainPriorShapes therefore r.priorSig,
+	// hold excluded tables too. A TIMESTAMP⇄DATETIME MODIFY on one of
+	// them is not a divergence sluice can cause: nothing this stream
+	// emits for that table reaches the target.
+	//
+	// The comment below used to claim "the same posture as the PG
+	// reader's checkSchemaRace arm". That arm is scope-gated
+	// (`if !r.relationInScope(...) { return nil }`) and this one was not,
+	// so the sentence was true about the position in the flow and false
+	// about the posture. It is now true about both.
+	//
+	// A nil predicate means the pipeline never wired one, and then the
+	// refusal fires as before — the fail-loud direction, matching the XA
+	// site's convention.
+	inScope := r.scopeAllowed == nil || r.tableInScope(qn)
+	if prior, hadPrior := r.priorSig[qn]; inScope && r.schemaDeltaAppliesToTarget && hadPrior && !prior.Equal(sig) {
 		if col, pair, found := unforwardableSessionTZColumn(prior, irTbl); found {
 			return sessionTZCastRefusal(tbl.Schema, tbl.Name, col, pair)
 		}
@@ -2005,10 +2026,16 @@ func (r *CDCReader) SetCDCScopePredicate(allowed func(schema, table string) bool
 	r.scopeAllowed = allowed
 }
 
-// xaTableInScope splits the table-map's qualified "schema.table" name and
+// tableInScope splits the table-map's qualified "schema.table" name and
 // consults the pipeline-supplied scope predicate. Callers guard on
 // r.scopeAllowed != nil.
-func (r *CDCReader) xaTableInScope(qn string) bool {
+//
+// It was `xaTableInScope` until audit 2026-09-09 A0909-AQ-M-2 found a
+// SECOND refusal in this file that needed the same question asked. The
+// name is neutral now because the predicate is not about XA: it is
+// "does this stream emit anything for this table", and every refusal
+// that would kill the stream owes it.
+func (r *CDCReader) tableInScope(qn string) bool {
 	schema, table := qn, ""
 	if i := strings.IndexByte(qn, '.'); i >= 0 {
 		schema, table = qn[:i], qn[i+1:]

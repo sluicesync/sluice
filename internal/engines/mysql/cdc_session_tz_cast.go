@@ -138,6 +138,43 @@ func (c *vstreamSnapshotChanges) SetSchemaSeed(tables []*ir.Table) {
 	c.snap.schemaSeedSig = seedSignaturesByTable(tables)
 }
 
+// SetCDCScopePredicate implements [ir.CDCScopePredicateSetter] for the
+// VStream standalone lane (audit 2026-09-09 A0909-AQ-M-2). The pipeline
+// wires this at every reader-open site for any reader that implements it
+// ([Streamer.wireCDCScopePredicate]), so declaring it here is the whole
+// wiring — but until this pass neither VStream type declared it, and the
+// type-assert silently found nothing.
+//
+// Read on the pump goroutine; the pipeline's closure reads an atomic
+// pointer, so it is safe to call from there. Must be set before
+// StreamChanges, like every other reader-policy setter.
+func (r *vstreamCDCReader) SetCDCScopePredicate(allowed func(schema, table string) bool) {
+	r.scopeAllowed = allowed
+}
+
+// SetCDCScopePredicate implements [ir.CDCScopePredicateSetter] for the
+// cold-start snapshot lane's CDC half; see the standalone lane's method.
+func (c *vstreamSnapshotChanges) SetCDCScopePredicate(allowed func(schema, table string) bool) {
+	c.snap.scopeAllowed = allowed
+}
+
+// sessionTZRefusalInScope answers, for a VStream lane, whether a
+// stream-killing schema refusal about this table is the operator's
+// business at all: a table the sync's filter excludes emits nothing to
+// the target, so no DDL on it can diverge one.
+//
+// A nil predicate means the pipeline wired none, and the refusal fires
+// as it did before — the fail-loud direction, matching the binlog
+// reader's convention at its own two gated sites.
+//
+// The keyspace is passed as the schema half because that is what a
+// VStream FIELD event carries and what the refusal itself reports; the
+// pipeline's closure ignores the schema and matches on the table, so
+// the two lanes agree with the binlog lane's answer for the same table.
+func sessionTZRefusalInScope(allowed func(schema, table string) bool, keyspace, table string) bool {
+	return allowed == nil || allowed(keyspace, table)
+}
+
 // seedSignaturesByTable fingerprints a seed by bare table name — the key
 // both VStream lanes can resolve from a FIELD event, whose keyspace is the
 // DSN's and whose shard the seed does not know.
