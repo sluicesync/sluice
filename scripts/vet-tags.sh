@@ -90,17 +90,31 @@ combos=$(printf '%s\n' "$exprs" \
 # that stopped compiling would fail the gate and nothing else — a local-only
 # block whose only escape is --no-verify (audit DDD-8). golangci-lint already
 # excludes workspace/ for the same reason.
-pkgs=$(go list ./... | grep -v '/workspace/' || true)
-pkg_count=$(printf '%s\n' "$pkgs" | grep -c . || true)
-if [ "${pkg_count:-0}" -lt 40 ]; then
-	echo "vet-tags: package list came back with only ${pkg_count:-0} entries; expected the whole module (~60)."
-	echo "  \`go list ./...\` likely failed — fix that rather than vetting a truncated universe."
-	exit 1
-fi
-
 status=0
 for tags in $combos; do
-	echo "vet-tags: go vet -tags=$tags <module, minus workspace/>"
+	# The package list is computed PER COMBO, under that combo's tags
+	# (audit 2026-09-09 A0909-TCI-M-1). It used to be computed ONCE with
+	# no tags at all, and `go list ./...` does not report a package whose
+	# every Go file is excluded by build constraints — so a package that
+	# exists only under a tag was never in the list, and therefore never
+	# vetted under any combo, while this script printed a green line for
+	# each one.
+	#
+	# Measured rather than reasoned: a planted `internal/tagonlypkg`
+	# holding one `//go:build linux && integration` file with a genuine
+	# type error is absent from `GOOS=linux go list ./...` and present in
+	# `GOOS=linux go list -tags=integration ./...`, and `go vet` reports
+	# the error the moment the package is actually passed. That is the
+	# v0.58.1-retag class this script exists to prevent, inside the script
+	# itself.
+	pkgs=$(go list -tags="$tags" ./... | grep -v '/workspace/' || true)
+	pkg_count=$(printf '%s\n' "$pkgs" | grep -c . || true)
+	if [ "${pkg_count:-0}" -lt 40 ]; then
+		echo "vet-tags: package list for -tags=$tags came back with only ${pkg_count:-0} entries; expected the whole module (~60)."
+		echo "  \`go list -tags=$tags ./...\` likely failed — fix that rather than vetting a truncated universe."
+		exit 1
+	fi
+	echo "vet-tags: go vet -tags=$tags <module, minus workspace/, listed under those tags: $pkg_count pkgs>"
 	if ! go vet -tags="$tags" $pkgs; then
 		status=1
 	fi
