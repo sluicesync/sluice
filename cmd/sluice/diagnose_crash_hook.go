@@ -9,6 +9,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/diagnose"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline"
 )
 
 // CrashHookFlags is the embeddable flag group long-running
@@ -65,18 +66,33 @@ func installCrashHook(flags CrashHookFlags, req diagnose.Request) (func(error) e
 	}, nil
 }
 
+// sourceEngineName is the engine's registry name, or "" when no source
+// engine was configured. The crash hook is built from a sync-start
+// invocation that may have no source engine resolved yet, and a nil
+// interface here would panic on the Name() call rather than degrade to
+// "no slot to probe".
+func sourceEngineName(source ir.Engine) string {
+	if source == nil {
+		return ""
+	}
+	return source.Name()
+}
+
 // crashHookRequestForStreamer builds the [diagnose.Request] template
 // for the auto-on-crash hook from a sync-start invocation. The
 // PrivacyLevel + CrashContext fields are filled in at hook fire-time
 // by [diagnose.CrashHook.Wrap].
 func crashHookRequestForStreamer(streamID string, source, target ir.Engine, sourceDSN, targetDSN, slotName string) diagnose.Request {
 	return diagnose.Request{
-		StreamID:        streamID,
-		SourceEngine:    source,
-		SourceDSN:       sourceDSN,
-		TargetEngine:    target,
-		TargetDSN:       targetDSN,
-		SlotName:        slotName,
+		StreamID:     streamID,
+		SourceEngine: source,
+		SourceDSN:    sourceDSN,
+		TargetEngine: target,
+		TargetDSN:    targetDSN,
+		// Resolved, for the reason given at the other diagnose.Request
+		// builder: the bundle cannot resolve it itself, and a raw
+		// --slot-name names no slot that exists (A0909-AQ-M-1).
+		SlotName:        pipeline.SlotNameForSource(slotName, sourceEngineName(source)),
 		SluiceVersion:   version,
 		SluiceCommit:    commit,
 		SluiceBuildDate: date,

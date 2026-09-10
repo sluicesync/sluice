@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline"
 )
 
 // SyncHealthCmd implements `sluice sync health` (proto-ADR
@@ -355,21 +356,23 @@ func probeSource(ctx context.Context, result *HealthResult, cfg *SyncHealthCmd, 
 	result.SpillBytes = &bytes
 }
 
-// effectiveSlotName returns the operator-supplied --slot-name if non-
-// empty, or the engine's default ("sluice_slot" on PG, empty on MySQL —
-// MySQL has no slot concept, the call site's nil-check skips it). Kept
-// out of the engine package because the default-slot identifier is also
-// hard-coded in `internal/engines/postgres/cdc_reader.go`; the duplicate
-// constant here is small and the alternative (exporting `defaultSlot`
-// from the engine package) would couple cmd/ to the engine.
+// effectiveSlotName returns the slot this probe must look up: the
+// operator's --slot-name under the sluice-prefix convention, or the
+// engine's default when unset (empty on MySQL, which has no slot
+// concept — the call site's check skips it).
+//
+// It delegates rather than deciding. The previous version returned
+// s.SlotName VERBATIM, which is the audit 2026-09-09 A0909-AQ-M-1 bug:
+// `sync start --slot-name shard_a` creates `sluice_shard_a`, so
+// `sync health --slot-name shard_a` was querying a slot that does not
+// exist, and the miss is SILENT — SlotSpillStats returns ok=false and
+// the caller's "no signal" branch returns without a probe reason, so
+// the counters were absent in a way indistinguishable from a slot that
+// simply had not spilled. Its own doc-comment argued for duplicating
+// the default constant here, and that duplication is where the prefix
+// step went missing.
 func (s *SyncHealthCmd) effectiveSlotName(source ir.Engine) string {
-	if s.SlotName != "" {
-		return s.SlotName
-	}
-	if source.Name() == "postgres" {
-		return "sluice_slot"
-	}
-	return ""
+	return pipeline.SlotNameForSource(s.SlotName, source.Name())
 }
 
 // canComputeLagBytes reports whether the target engine ALSO supports

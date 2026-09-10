@@ -36,6 +36,44 @@ func ResolveSlotName(operatorSupplied string) string {
 	return resolveSlotName(operatorSupplied)
 }
 
+// SlotNameForSource answers the question a READ-ONLY PROBE has to ask:
+// given the operator's `--slot-name` and the source engine, which slot
+// name should I look up on the server?
+//
+// It is the two steps together — the sluice-prefix convention, then the
+// engine's default when nothing was supplied — because separating them
+// is what went wrong. Audit 2026-09-09 A0909-AQ-M-1: `sync health` and
+// the `diagnose` bundle each did the DEFAULT half and skipped the
+// PREFIX half, so `sync start --slot-name shard_a` created
+// `sluice_shard_a` while `sync health --slot-name shard_a` queried
+// `shard_a`. No such slot exists, `SlotSpillStats` returns ok=false,
+// and the "no signal" branch returns without setting a probe reason —
+// so the operator's spill counters were simply absent, indistinguishable
+// from a healthy slot that has not spilled.
+//
+// Empty means "this engine has no slot to probe" (MySQL and friends),
+// which is what both callers already branch on.
+//
+// The engine test is by NAME rather than by capability because the only
+// thing being decided here is which DEFAULT identifier to use, and that
+// default is a property of the postgres engine specifically. Callers
+// still type-assert the capability they need before probing.
+func SlotNameForSource(operatorSupplied, sourceEngineName string) string {
+	if resolved := resolveSlotName(operatorSupplied); resolved != "" {
+		return resolved
+	}
+	if sourceEngineName == enginePostgresName {
+		return defaultPGSlotName
+	}
+	return ""
+}
+
+// enginePostgresName is the registry name of the Postgres engine, as the
+// probe helpers above compare it. Kept beside them rather than imported
+// so `internal/pipeline` stays free of engine-package imports, which is
+// the same reason [defaultPGSlotName] is duplicated.
+const enginePostgresName = "postgres"
+
 // resolveSlotName applies the sluice-prefix convention to an
 // operator-supplied slot name. Empty input passes through unchanged
 // — the empty signal means "use the engine's default" (which is

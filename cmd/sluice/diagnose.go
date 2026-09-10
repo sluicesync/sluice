@@ -12,6 +12,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/diagnose"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline"
 )
 
 // telemetryWarmupTimeout bounds how long `sluice diagnose` waits for the
@@ -106,7 +107,6 @@ func (d *DiagnoseCmd) Run(_ *Globals) error {
 		SluiceBuildDate: date,
 		CLIArgs:         os.Args[1:],
 		LogFile:         d.LogFile,
-		SlotName:        d.SlotName,
 	}
 	if d.SourceDriver != "" {
 		source, err := resolveEngine(d.SourceDriver)
@@ -115,6 +115,14 @@ func (d *DiagnoseCmd) Run(_ *Globals) error {
 		}
 		req.SourceEngine = source
 		req.SourceDSN = d.Source
+		// RESOLVED here, not in the bundle: --slot-name is a suffix, so
+		// the slot to probe is `sluice_<name>`, and the resolution needs
+		// the source engine to know the default. internal/diagnose cannot
+		// call the resolver itself — internal/pipeline imports diagnose,
+		// so the reverse would be an import cycle — which is exactly how
+		// the bundle came to re-implement half of it and query a slot
+		// that does not exist (audit 2026-09-09 A0909-AQ-M-1).
+		req.SlotName = pipeline.SlotNameForSource(d.SlotName, source.Name())
 	} else if d.Source != "" {
 		return operationalError{err: errors.New("--source given without --source-driver")}
 	}

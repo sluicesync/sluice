@@ -661,9 +661,25 @@ func probeAndWriteHealth(ctx context.Context, b *bundleWriter, name string, req 
 		}
 	}
 	if spiller, ok := sr.(ir.SlotSpillReporter); ok {
+		// req.SlotName arrives ALREADY RESOLVED — sluice-prefix applied
+		// and the engine default filled in — because this package cannot
+		// resolve it: internal/pipeline imports internal/diagnose, so
+		// calling pipeline.SlotNameForSource from here is an import
+		// cycle. This block used to fill in the "sluice_slot" default
+		// itself and skip the PREFIX half, so an operator running with
+		// `--slot-name shard_a` had this probe query `shard_a` while
+		// their stream used `sluice_shard_a`; SlotSpillStats then
+		// returned ok=false and the bundle recorded nothing at all
+		// (audit 2026-09-09 A0909-AQ-M-1).
+		//
+		// An empty name is now RECORDED rather than silently skipped. On
+		// a source with no slot concept that is the honest answer, and on
+		// a Request built without resolution it is the signal that would
+		// have made the original defect visible in the bundle.
 		slot := req.SlotName
-		if slot == "" && req.SourceEngine.Name() == "postgres" {
-			slot = "sluice_slot"
+		if slot == "" {
+			out["spill_reason"] = "no replication-slot name was resolved for this source, so slot-spill " +
+				"counters were not probed"
 		}
 		if slot != "" {
 			stats, statsOK, sperr := spiller.SlotSpillStats(ctx, slot)
