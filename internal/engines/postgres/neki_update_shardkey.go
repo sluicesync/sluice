@@ -105,10 +105,14 @@ func (a *ChangeApplier) shardKeyColumnsFor(ctx context.Context, schema, table st
 	if err != nil {
 		return nil, err
 	}
-	cols, sharded := snap.topo.shardKeyFor(snap.database, schema, table)
-	if !sharded {
-		cols = nil
-	}
+	// Deliberately NOT gated on multiShard. The first cut was, and it was
+	// wrong: measured on the live cluster, a table in a group with a SINGLE
+	// key range still refuses `UPDATE … SET tenant_id = …` with NK013. The
+	// refusal keys on a shard index applying to the table, not on how many
+	// shards the group spans — so a single-shard group needs this handling
+	// exactly as much as a split one. The multiShard flag governs the
+	// DUPLICATION question instead, over in [RowWriter.ShardKeyUpsertMismatch].
+	cols, _ := snap.topo.shardKeyFor(snap.database, schema, table)
 
 	a.shardKeys.mu.Lock()
 	if a.shardKeys.cols == nil {

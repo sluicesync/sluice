@@ -127,13 +127,22 @@ func (w *RowWriter) writeViaBatchIdempotent(ctx context.Context, table *ir.Table
 		return errDeferrableUpsertKey(w.schema, table.Name, []string{blocked})
 	}
 
+	// How this target's shard key (if any) must shape the statement. Resolved
+	// ONCE per table rather than per batch: it reads the data topology, and
+	// the answer is a property of the schema. The zero plan on every non-Neki
+	// target renders byte-identical SQL to before.
+	shardPlan, err := w.upsertShardKeyPlanFor(ctx, table, keyCols)
+	if err != nil {
+		return err
+	}
+
 	batch := make([]ir.Row, 0, limit)
 	var batchBytes int64
 	flush := func() error {
 		if len(batch) == 0 {
 			return nil
 		}
-		query := buildBatchUpsert(w.schema, table, len(batch), keyCols)
+		query := buildBatchUpsert(w.schema, table, len(batch), keyCols, shardPlan)
 		args, err := flattenArgs(batch, table)
 		if err != nil {
 			return fmt.Errorf("postgres: prepare args for %q: %w", table.Name, err)
@@ -163,11 +172,32 @@ func (w *RowWriter) writeViaBatchIdempotent(ctx context.Context, table *ir.Table
 		// private effectiveUpsertKeyColumns.) Riding the same gate anyway is
 		// deliberate: one gate for every caller beats two that can drift apart.
 		batched := len(batch)
+		var affected int64
 		if err := w.copyChunkWithRetry(ctx, table, batched, func(attemptCtx context.Context) error {
-			_, execErr := w.db.ExecContext(attemptCtx, query, args...)
-			return execErr
+			res, execErr := w.db.ExecContext(attemptCtx, query, args...)
+			if execErr != nil {
+				return execErr
+			}
+			// Recorded per attempt so a replayed batch reports the count that
+			// actually landed, not the first attempt's.
+			if n, raErr := res.RowsAffected(); raErr == nil {
+				affected = n
+			} else {
+				// A driver that will not report the count cannot support the
+				// shortfall check; -1 makes that explicit downstream rather
+				// than looking like "every row applied".
+				affected = -1
+			}
+			return nil
 		}); err != nil {
 			return fmt.Errorf("postgres: idempotent insert into %q (%d rows): %w", table.Name, batched, err)
+		}
+		// The guard's other half. The predicate makes a shard-key-changing row
+		// a no-op instead of a partial update; this is how the run finds out
+		// it happened. The number is the SERVER's, not ours — the only
+		// evidence available that is independent of the rows we sent.
+		if err := refuseShardKeySkip(w.schema, table.Name, shardPlan, batched, affected); err != nil {
+			return err
 		}
 		// Report the durable-write delta (v0.99.9): this batch is now
 		// committed, so a resumable source reader's (VStream→PG) checkpoint
@@ -212,7 +242,13 @@ func (w *RowWriter) writeViaBatchIdempotent(ctx context.Context, table *ir.Table
 // the idempotent writer refuses keyless tables before reaching here
 // (errKeylessIdempotent), so this fallback is defensive for direct
 // callers and unit tests.
-func buildBatchUpsert(schema string, table *ir.Table, rowCount int, keyCols []string) string {
+// plan, when non-zero, shapes the statement for a PlanetScale Neki target: it
+// names shard-key columns that must be kept out of the DO UPDATE SET (the
+// target refuses the statement on shape alone, even assigning the column its
+// own value) and asks for the IS-NOT-DISTINCT-FROM guard that makes omitting
+// them safe. The zero plan renders byte-identical SQL to before, which is what
+// every non-Neki target gets. See neki_topology.go.
+func buildBatchUpsert(schema string, table *ir.Table, rowCount int, keyCols []string, plan upsertShardKeyPlan) string {
 	cols := nonGeneratedColumns(table.Columns)
 	colNames := make([]string, len(cols))
 	for i, c := range cols {
@@ -254,9 +290,21 @@ func buildBatchUpsert(schema string, table *ir.Table, rowCount int, keyCols []st
 		conflictTarget[i] = quoteIdent(c)
 	}
 
+	// Shard-key columns are excluded from the SET list alongside the key
+	// columns: a Neki target refuses `SET <shard key> = …` outright, even
+	// when the value is unchanged (SQLSTATE NK013). Empty on every other
+	// target, so this loop is a no-op there.
+	omit := make(map[string]struct{}, len(plan.omitFromSet))
+	for _, c := range plan.omitFromSet {
+		omit[c] = struct{}{}
+	}
+
 	nonKey := make([]string, 0, len(cols))
 	for _, c := range cols {
 		if _, isKey := keySet[c.Name]; isKey {
+			continue
+		}
+		if _, isShardKey := omit[c.Name]; isShardKey {
 			continue
 		}
 		// Generated columns are already excluded by nonGeneratedColumns
@@ -279,6 +327,25 @@ func buildBatchUpsert(schema string, table *ir.Table, rowCount int, keyCols []st
 		parts[i] = fmt.Sprintf("%s = EXCLUDED.%s", quoteIdent(c), quoteIdent(c))
 	}
 	sb.WriteString(strings.Join(parts, ", "))
+
+	// The guard that makes omitting the shard key from the SET list safe.
+	// Without it, an incoming row whose shard key differs from the stored
+	// row's would have every other column updated while the routing column
+	// silently kept its old value. With it, that row is SKIPPED — and the
+	// statement's own affected-row count falls short of the batch, which is
+	// how the caller learns it happened. See [upsertShardKeyPlan].
+	if plan.guard && len(plan.omitFromSet) > 0 {
+		ref := quoteIdent(table.Name)
+		if schema != "" {
+			ref = quoteIdent(schema) + "." + quoteIdent(table.Name)
+		}
+		preds := make([]string, len(plan.omitFromSet))
+		for i, c := range plan.omitFromSet {
+			preds[i] = fmt.Sprintf("%s.%s IS NOT DISTINCT FROM EXCLUDED.%s", ref, quoteIdent(c), quoteIdent(c))
+		}
+		sb.WriteString(" WHERE ")
+		sb.WriteString(strings.Join(preds, " AND "))
+	}
 	return sb.String()
 }
 

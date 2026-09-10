@@ -12,6 +12,7 @@ import (
 	"sync"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // Reading a PlanetScale Neki cluster's data topology, and the one refusal it
@@ -67,8 +68,14 @@ import (
 // # Scope, stated so the name cannot be read as broader than the truth
 //
 //   - NEKI ONLY. Every other PostgreSQL endpoint answers "" and pays nothing.
-//   - SHARDED SHARD GROUPS ONLY. A group with a single key range is one shard;
-//     its primary key is globally enforced and neither failure mode exists.
+//   - The PREFLIGHT REFUSAL covers MULTI-SHARD groups only. A group with a
+//     single key range enforces its primary key globally, so the duplication
+//     that refusal exists to prevent cannot happen there.
+//   - The SET-LIST HANDLING covers EVERY group a shard index routes,
+//     single-shard included. An earlier cut of this file gated both on one
+//     flag and said in this very list that a single-shard group had "neither
+//     failure mode" — that sentence was false and cost a mid-stream NK013.
+//     See [nekiTopology.shardKeyFor] for the two predicates.
 //   - Tables with a usable upsert key only. Without one the writer does not
 //     emit `ON CONFLICT` at all, so there is no conflict to mis-evaluate.
 //     (Such a table has its own, separate problem — a keyless copy is not
@@ -110,13 +117,34 @@ type nekiTopology struct {
 }
 
 // shardKeyFor returns the shard-key columns that route `table` in `schema` of
-// `database`, and whether that table's shard group is actually SHARDED (more
-// than one key range).
+// `database`, and whether that table's shard group currently spans MORE THAN
+// ONE shard.
+//
+// # Two questions, two answers, and conflating them was a real bug
+//
+// The first cut returned a single `sharded` flag and used it for both of the
+// questions this file answers. Measured on the live cluster, they have
+// different predicates:
+//
+//   - "may the shard key appear in a SET list?" — NO whenever a shard index
+//     applies to the table, however many shards the group spans. A table in a
+//     group with a SINGLE key range still fails `UPDATE … SET tenant_id = …`
+//     and still fails an `ON CONFLICT … DO UPDATE SET tenant_id = …` with
+//     NK013. So the COLUMNS must come back whenever an index resolves.
+//   - "can ON CONFLICT duplicate the conflict key?" — only when the group
+//     spans more than one shard, because that is what makes the conflict
+//     evaluable on a shard that does not hold the row. On one shard the
+//     conflict is always found and the primary key IS globally enforced.
+//
+// Collapsing them made the applier skip its shard-key handling for a
+// single-shard group and die on NK013 mid-stream, which is how this was
+// found. Callers take the columns for the first question and `multiShard`
+// for the second.
 //
 // The resolution chain is the one PlanetScale documents for undeclared
 // tables — table, then schema, then database — with the cluster default last.
 // A table that names its own shard index overrides the group's default.
-func (t *nekiTopology) shardKeyFor(database, schema, table string) (cols []string, sharded bool) {
+func (t *nekiTopology) shardKeyFor(database, schema, table string) (cols []string, multiShard bool) {
 	db, ok := t.Databases[database]
 	if !ok {
 		// A single-database cluster that does not name it by the value we
@@ -145,22 +173,24 @@ func (t *nekiTopology) shardKeyFor(database, schema, table string) (cols []strin
 
 // columnsForGroup resolves a shard group to its routing columns. indexOverride,
 // when non-empty, replaces the group's default shard index.
-func (t *nekiTopology) columnsForGroup(group, indexOverride string) (cols []string, sharded bool) {
+func (t *nekiTopology) columnsForGroup(group, indexOverride string) (cols []string, multiShard bool) {
 	for _, g := range t.ShardGroups {
 		if g.UID != group {
 			continue
 		}
-		// One key range is one shard: the primary key is globally enforced
-		// and neither failure mode in this file's header can occur.
-		sharded = len(g.KeyRanges) > 1
+		// One key range is one shard. That settles the DUPLICATION question
+		// only — the primary key is globally enforced there — and says
+		// nothing about whether the shard key may be named in a SET list,
+		// which it may not either way. See [nekiTopology.shardKeyFor].
+		multiShard = len(g.KeyRanges) > 1
 		idx := g.DefaultShardIndex
 		if indexOverride != "" {
 			idx = indexOverride
 		}
 		if si, ok := t.ShardIndexes[idx]; ok {
-			return si.Columns, sharded
+			return si.Columns, multiShard
 		}
-		return nil, sharded
+		return nil, multiShard
 	}
 	return nil, false
 }
@@ -259,8 +289,8 @@ func (w *RowWriter) ShardKeyUpsertMismatch(ctx context.Context, tables []*ir.Tab
 		if !ok || len(keyCols) == 0 {
 			continue
 		}
-		shardCols, sharded := snap.topo.shardKeyFor(snap.database, w.schemaOrPublic(), t.Name)
-		if !sharded || len(shardCols) == 0 {
+		shardCols, multiShard := snap.topo.shardKeyFor(snap.database, w.schemaOrPublic(), t.Name)
+		if !multiShard || len(shardCols) == 0 {
 			continue
 		}
 		inKey := make(map[string]struct{}, len(keyCols))
@@ -281,6 +311,103 @@ func (w *RowWriter) ShardKeyUpsertMismatch(ctx context.Context, tables []*ir.Tab
 		}
 	}
 	return "", nil
+}
+
+// upsertShardKeyPlan is how the idempotent batch writer must shape its
+// statement for one table on this target.
+type upsertShardKeyPlan struct {
+	// omitFromSet are the shard-key columns that must not appear on the left
+	// of the DO UPDATE SET, because the target refuses the statement on shape
+	// alone. Empty off Neki, and on any table no shard index routes.
+	omitFromSet []string
+
+	// guard asks for `WHERE <target>.<k> IS NOT DISTINCT FROM EXCLUDED.<k>`
+	// on the DO UPDATE, plus a rows-affected check by the caller.
+	//
+	// It is needed exactly when the shard key is NOT contained in the
+	// conflict key. Omitting a column from the SET list is only a no-op when
+	// its value cannot differ between the stored and incoming row, and the
+	// conflict key containing it is what guarantees that. Without it, an
+	// incoming row whose shard key differs would have every OTHER column
+	// updated while the routing column silently kept its old value — a
+	// partial update, which is the outcome this area exists to prevent.
+	//
+	// This combination is reachable only on a SINGLE-shard group: a
+	// multi-shard group whose conflict key lacks the shard key is refused at
+	// preflight ([RowWriter.ShardKeyUpsertMismatch]), because there the
+	// conflict is never even found and the guard would be inert. On one
+	// shard the conflict IS always found, so the predicate runs and a skipped
+	// row shows up as a shortfall in the statement's own affected-row count —
+	// which is the server's number, not ours.
+	guard bool
+}
+
+// upsertShardKeyPlanFor resolves how this writer must shape the idempotent
+// upsert for `table`, given the conflict key it has already chosen.
+//
+// Returns the zero plan (nothing to do) on every non-Neki target and on any
+// table that no shard index routes, so an ordinary PostgreSQL target renders
+// byte-identical SQL to before.
+func (w *RowWriter) upsertShardKeyPlanFor(ctx context.Context, table *ir.Table, keyCols []string) (upsertShardKeyPlan, error) {
+	if !w.isNeki || table == nil {
+		return upsertShardKeyPlan{}, nil
+	}
+	snap, err := loadNekiTopology(ctx, w.serverKey, w.db)
+	if err != nil {
+		return upsertShardKeyPlan{}, err
+	}
+	// Not gated on multiShard: a single-shard group refuses the shard key in
+	// a SET list exactly as a split one does. See [nekiTopology.shardKeyFor].
+	shardCols, _ := snap.topo.shardKeyFor(snap.database, w.schemaOrPublic(), table.Name)
+	if len(shardCols) == 0 {
+		return upsertShardKeyPlan{}, nil
+	}
+	inKey := make(map[string]struct{}, len(keyCols))
+	for _, c := range keyCols {
+		inKey[strings.ToLower(c)] = struct{}{}
+	}
+	plan := upsertShardKeyPlan{}
+	for _, sc := range shardCols {
+		if _, ok := inKey[strings.ToLower(sc)]; ok {
+			// Already excluded from the SET list because key columns are, and
+			// its value cannot differ for a given conflict key.
+			continue
+		}
+		plan.omitFromSet = append(plan.omitFromSet, sc)
+		plan.guard = true
+	}
+	return plan, nil
+}
+
+// refuseShardKeySkip converts a shortfall in the upsert's affected-row count
+// into a loud, coded refusal.
+//
+// Without the guard predicate, a batch row whose shard key differs from the
+// stored row's would have every OTHER column applied while the routing column
+// silently kept its old value. The guard turns that into a skip; this turns
+// the skip into an error, so the outcome is a stopped run rather than a target
+// that quietly disagrees with its source about where a row belongs.
+//
+// A negative `affected` means the driver would not report a count. That is not
+// a verdict either way, so it is passed rather than refused — the alternative
+// is failing every run against a driver that has nothing to do with this.
+func refuseShardKeySkip(schema, table string, plan upsertShardKeyPlan, batched int, affected int64) error {
+	if !plan.guard || affected < 0 || affected >= int64(batched) {
+		return nil
+	}
+	return &sluicecode.CodedError{
+		Code: sluicecode.CodeTargetShardKeyUpdateUnsupported,
+		Hint: "a row cannot move between shards on this target; stop routing on a column the source " +
+			"updates, or exclude the table with --exclude-table and reconcile it separately",
+		Err: fmt.Errorf(
+			"postgres: idempotent insert into %s.%s applied %d of %d rows: the skipped row(s) carry a "+
+				"different value in the target's shard-key column(s) (%s) than the row already stored under "+
+				"the same key, and a sharded target cannot move a row between shards"+
+				"\nsluice refuses rather than applying the other columns and leaving the routing column "+
+				"behind, which would diverge silently",
+			schema, table, affected, batched, strings.Join(plan.omitFromSet, ", "),
+		),
+	}
 }
 
 // schemaOrPublic is the schema this writer targets, defaulted the way

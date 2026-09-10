@@ -132,6 +132,48 @@ The applier can do what the upsert cannot, and the reason is worth keeping: **a 
 
 End to end on `neki-torture`, one stream: INSERT applied, UPDATE applied, DELETE applied (count 20), and a shard-key-changing UPDATE refused at exit 3 with the target row untouched. First CDC apply sluice has ever completed against a sharded Neki target.
 
+### D-1 RESHARD MID-STREAM — measured, and it PASSES
+
+The Tier-D row this has carried since the start, finally exercised. It could not be run before, because CDC into a sharded Neki target did not work at all.
+
+Setup: `rs_live` (900 rows, PK `(tenant_id, id)`) placed in `events_v3`, a shard group with a **single** key range; `sluice sync` running into it; a writer loop issuing an INSERT, an UPDATE and a DELETE per iteration against the source throughout. Then, with the stream live and the writer running:
+
+```sql
+SELECT __neki.reshard_create('rsw1','postgres','events_v3', <rs_v3 definition>, 'rs_v3', NULL);
+SELECT * FROM __neki.workflow_switch_traffic('rsw1', NULL);   -- reads AND writes
+```
+
+Result: **no loss, no duplication, no applier error, byte-identical.** After stopping the writer and letting the stream drain, the same ordered checksum on both sides:
+
+```
+source (PG 16.15)   271d7375ea3960ad9645e2dc673c68a6 | 900
+target (Neki)       271d7375ea3960ad9645e2dc673c68a6 | 900
+```
+
+Anti-vacuity — the reshard really happened, per shard-pinned counts afterwards: `shk3owth68zsjl` 423, `shoizkgheesrb2` 477, and the pre-reshard shard answers `ERROR: access to table "public.rs_live" is blocked (SQLSTATE NK213)`. `traffic_state = reads_and_writes_switched`. A transient target-ahead reading (903 vs 900) during the switch was DELETE lag and converged.
+
+**The test's first attempt failed, and that failure was the more valuable half** — see the next section.
+
+### The single-shard blind spot in the shard-key fix, found by trying to run D-1
+
+The reshard test could not even start: the stream died at once with the familiar `updating index column "tenant_id" is not supported (NK013)`, on a table in a shard group with **one** key range.
+
+The shard-key work had collapsed two questions into one `sharded` flag:
+
+| question | correct predicate |
+|---|---|
+| may the shard key be named in a `SET` list? | **an index routes the table** — regardless of shard count |
+| can `ON CONFLICT` duplicate the conflict key? | **the group spans more than one shard** |
+
+Measured on a one-key-range group: `UPDATE … SET tenant_id = 6` and `ON CONFLICT … DO UPDATE SET tenant_id = EXCLUDED.tenant_id` both fail NK013, while the same statement without the shard key in the `SET` list succeeds. So the first predicate does not depend on shard count at all — and the file's own scope comment had asserted that a single-shard group had "neither failure mode", which is exactly the written-invariant-nobody-checks shape.
+
+Split into `multiShard` plus the columns, and the bulk-copy idempotent upsert closed too — it is the third writer of this statement, alongside the applier's INSERT and UPDATE paths:
+
+- the shard key is omitted from its `SET` list (required);
+- when the conflict key does **not** contain the shard key, the statement carries `WHERE <target>.<k> IS NOT DISTINCT FROM EXCLUDED.<k>`, and a shortfall in the statement's own affected-row count is refused. Measured that this works on a single-shard group specifically: two rows offered, `INSERT 0 1`, the skipped row unchanged, no duplicate. It is inert on a multi-shard group — which is why that combination is refused at preflight instead.
+
+The affected-row count is the server's number, not one derived from the rows we sent — the independent-expected-value rule, satisfied by construction.
+
 ### Tier C, second pass — the router's OTHER row path, and it is CLEAN
 
 The first Tier-C pass (below) went through `pg_dump | psql`, which is COPY text on a pass-through path. PlanetScale's ["lifecycle of a sharded Postgres query"](https://planetscale.com/blog/the-lifecycle-of-a-sharded-postgres-query) says the router is a real execution engine — hash joins, `AVG` rewritten to `SUM`/`COUNT`, spill-to-disk — and that copying encoded bytes straight through is an *optimisation*, i.e. one of two paths. Under this project's own family-dispatch rule that made the first pass a pinned representative standing in for an untested sibling: the Bug 74 shape exactly.
