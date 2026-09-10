@@ -131,6 +131,11 @@ func bulkCopyOneTable(
 			slog.Int("chunks", len(entry.Chunks)))
 	case resumeActionFresh:
 		// Nothing to do up front; the per-batch path starts at PK > nil.
+		// But on a RESUME, "fresh" is a claim about the target, not just
+		// a gap in our bookkeeping — check it against the target itself.
+		if err := refuseResumedFreshTableThatHasRows(ctx, rw, table, resuming); err != nil {
+			return migcore.WrapWithHint(migcore.PhaseBulkCopy, markFailedLocked(ctx, rc, state, stateMu, ir.MigrationPhaseBulkCopy, err))
+		}
 	}
 
 	// ADR-0109: wrap the per-table data copy in the bounded source-read
@@ -278,7 +283,13 @@ func copyOneTableData(
 		if exp, imp, ok := asRawCopyEndpoints(rows, rw); ok {
 			// Breadcrumb so a mid-pipe crash leaves a clean truncate-and-redo
 			// entry for the next attempt (same disposition as copyTable's).
-			setTableProgressAndWrite(ctx, rc, state, stateMu, table.Name, ir.TableProgress{State: ir.TableProgressInProgress})
+			// Breadcrumb site 1 of 4 — see [persistTableBreadcrumb] for why
+			// this write, alone among the per-table writes, is not
+			// best-effort.
+			if err := persistTableBreadcrumb(ctx, rc, state, stateMu, table.Name,
+				ir.TableProgress{State: ir.TableProgressInProgress}); err != nil {
+				return migcore.WrapWithHint(migcore.PhaseBulkCopy, markFailedLocked(ctx, rc, state, stateMu, ir.MigrationPhaseBulkCopy, err))
+			}
 			rowsN, rawErr := runRawCopyChunk(ctx, exp, imp, table, nil, parallel.rawCopyFormat, -1)
 			if rawErr != nil {
 				wrapped := fmt.Errorf("pipeline: copy table %q (raw copy): %w", table.Name, rawErr)
@@ -315,7 +326,12 @@ func copyOneTableData(
 		// In-progress breadcrumb + terminal complete both go through the
 		// locked clone-and-write helper (ADR-0076): peer tables in the
 		// cross-table pool write distinct keys of this map concurrently.
-		setTableProgressAndWrite(ctx, rc, state, stateMu, table.Name, entry)
+		// Breadcrumb site 2 of 4, and the one the harm was measured on:
+		// this is the KEYLESS table's path, where a copy that runs twice
+		// appends rather than upserts (see [persistTableBreadcrumb]).
+		if err := persistTableBreadcrumb(ctx, rc, state, stateMu, table.Name, entry); err != nil {
+			return migcore.WrapWithHint(migcore.PhaseBulkCopy, markFailedLocked(ctx, rc, state, stateMu, ir.MigrationPhaseBulkCopy, err))
+		}
 		rowsCopied, err := copyTable(ctx, rows, rw, table, redactor, shard)
 		if err != nil {
 			wrapped := fmt.Errorf("pipeline: copy table %q: %w", table.Name, err)
@@ -456,8 +472,13 @@ func copyTableWithCursor(
 
 	// Persist the in-progress breadcrumb up front (mirrors the v0.3.0
 	// behaviour) so a crash before the first batch lands still leaves
-	// a meaningful state row for the next attempt.
-	setTableProgressAndWrite(ctx, rc, state, stateMu, table.Name, entry)
+	// a meaningful state row for the next attempt. Breadcrumb site 3 of
+	// 4; not best-effort ([persistTableBreadcrumb]). The caller wraps and
+	// marks the run failed, so the coded refusal reaches the exit
+	// boundary through the ordinary copy-table error path.
+	if err := persistTableBreadcrumb(ctx, rc, state, stateMu, table.Name, entry); err != nil {
+		return err
+	}
 
 	// Progress ticker for the long-running per-batch loop. The same
 	// shape as copyTable; one ticker per table.

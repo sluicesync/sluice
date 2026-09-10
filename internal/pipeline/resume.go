@@ -64,6 +64,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/progress"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // lastErrorMaxLen caps the size of the persisted last_error column.
@@ -868,6 +869,79 @@ func truncateForResume(ctx context.Context, rw ir.RowWriter, table *ir.Table) er
 		return fmt.Errorf("pipeline: resume: row writer for table %q does not support TRUNCATE; cannot resume in-progress table", table.Name)
 	}
 	return t.TruncateTable(ctx, table)
+}
+
+// refuseResumedFreshTableThatHasRows is the independent check on the
+// invariant the whole fresh-start disposition rests on: a table with NO
+// persisted progress row was never copied, so the resume can start it at
+// PK > nil WITHOUT truncating.
+//
+// [classifyTableForResume] cannot verify that; it only sees the absence
+// of a row, and an absence has two causes — never copied, or copied and
+// the row never landed. The target itself is the independent evidence,
+// and it is one bounded existence probe.
+//
+// When the invariant does hold (the ordinary case: the previous attempt
+// died before reaching this table) the target is empty and this costs a
+// probe that answers immediately. When it does not hold, the alternative
+// is a second copy of every row appended to the first, at whatever exit
+// code the original failure produced — measured 2026-09-10 on a sharded
+// PlanetScale Neki target whose control tables could not accept an
+// INSERT (neki-issues/NEKI-009): a 40-row keyless table came back from
+// the resume holding 80.
+//
+// # Why it refuses rather than truncating
+//
+// Truncating would be right for the case this exists to catch — those
+// rows are ours, from this migration. It would be catastrophic for the
+// other way a resumed fresh table can hold rows: an operator who passed
+// --force-cold-start over a deliberately pre-populated target. The
+// pipeline cannot tell those apart from here, and only one of the two
+// mistakes is recoverable, so it names both remedies and lets the
+// operator choose.
+//
+// # Why it is not narrowed to keyless tables
+//
+// The measured harm is keyless: with a primary key (or a usable non-null
+// UNIQUE index) the writer upserts and the second copy heals. That
+// healing is a property of the engine's upsert-key choice, which is not
+// visible from here — so a refusal scoped to it would be scoped by
+// something the pipeline cannot actually see, and would go quiet on
+// exactly the engines that stop resolving a key. The contradiction is
+// real for every table shape; a keyed table merely survives it. Saying
+// so is worth one refusal an operator clears with a flag.
+//
+// Engines that do not expose [ir.TableEmptyChecker] are skipped, as
+// everywhere else this surface is used — the check is opportunistic, and
+// the pre-existing behaviour is what they keep.
+func refuseResumedFreshTableThatHasRows(ctx context.Context, rw ir.RowWriter, table *ir.Table, resuming bool) error {
+	if !resuming {
+		return nil
+	}
+	checker, ok := rw.(ir.TableEmptyChecker)
+	if !ok {
+		return nil
+	}
+	empty, err := checker.IsTableEmpty(ctx, table)
+	if err != nil {
+		return fmt.Errorf("pipeline: resume: probe whether target table %q is empty: %w", table.Name, err)
+	}
+	if empty {
+		return nil
+	}
+	return &sluicecode.CodedError{
+		Code: sluicecode.CodeResumeFreshTableNotEmpty,
+		Hint: "re-run with --reset-target-data to clear the target's rows for this migration and re-copy, " +
+			"or --exclude-table=" + table.Name + " to leave the table alone",
+		Err: fmt.Errorf(
+			"pipeline: resume: target table %q holds rows but this migration recorded no progress for it"+
+				"\nresuming would start the table from scratch WITHOUT truncating, so a table with no primary "+
+				"key would end up holding every row twice"+
+				"\nthe usual cause is that an earlier attempt copied the table and could not persist its "+
+				"progress row (check that run's logs for state-write failures); the other is a target that "+
+				"was already populated when the migration started", table.Name,
+		),
+	}
 }
 
 // summariseTableProgress is a small helper for the resume-start log

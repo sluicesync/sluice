@@ -452,6 +452,50 @@ const (
 	// both use that statement, so every replayed change would add a row.
 	CodeTargetShardPlacementMismatch Code = "SLUICE-E-TARGET-SHARD-PLACEMENT-MISMATCH"
 
+	// CodeMigrateProgressUnrecordable fires when the migrate-state store
+	// cannot record the in-progress breadcrumb for a table that is about
+	// to be copied. It is a REFUSAL, raised before that table's first row
+	// moves.
+	//
+	// The breadcrumb is what makes a MISSING progress row mean "this table
+	// was never touched", which is the assumption the resume classifier
+	// acts on when it starts a table fresh WITHOUT truncating it. Swallow
+	// the write and the assumption inverts: a fully-copied table reads as
+	// untouched on the next --resume, and a table with no primary key —
+	// nothing for the upsert to conflict on — gets a second full copy of
+	// every row appended to the first.
+	//
+	// Measured 2026-09-10 against a sharded PlanetScale Neki target, where
+	// the default shard group covers `public` and so every INSERT into
+	// sluice's own control tables is refused for want of the shard key
+	// (SQLSTATE NK306, neki-issues/NEKI-009): a 40-row keyless table held
+	// 80 rows after the resume. The store failure is engine-neutral — a
+	// revoked GRANT or a dropped control table reaches the same state on
+	// any engine.
+	//
+	// Only the breadcrumb refuses. A lost cursor checkpoint or a lost
+	// terminal `complete` both degrade to re-copying work the resume path
+	// handles correctly, so those stay best-effort and a merely flaky
+	// store still finishes its migration.
+	CodeMigrateProgressUnrecordable Code = "SLUICE-E-MIGRATE-PROGRESS-UNRECORDABLE"
+
+	// CodeResumeFreshTableNotEmpty fires when a --resume run is about to
+	// start a table from scratch — no persisted progress row, so nothing
+	// to resume from — and the target table already holds rows.
+	//
+	// The fresh disposition does NOT truncate: it starts at PK > nil and
+	// relies on the writer's upsert to absorb any overlap. That is sound
+	// only while a missing progress row means the table was never copied.
+	// This is the check on that: the target is independent evidence, and
+	// it disagrees.
+	//
+	// Refused rather than truncated because the two ways to reach this
+	// state need opposite handling — an earlier attempt that copied the
+	// table and could not persist its row (truncate is right) versus a
+	// target deliberately pre-populated behind --force-cold-start (truncate
+	// destroys data) — and nothing at this point can tell them apart.
+	CodeResumeFreshTableNotEmpty Code = "SLUICE-E-RESUME-FRESH-TABLE-NOT-EMPTY"
+
 	// CodeTargetDeferrableKey fires when a target table's only usable
 	// upsert key is a DEFERRABLE unique constraint. Postgres refuses a
 	// non-immediate index as an `ON CONFLICT` arbiter (SQLSTATE 55000),
@@ -769,6 +813,8 @@ var registry = map[Code]Info{
 
 	CodeTargetPreexistingForeignKey:  {ClassRefusal, "migrate/sync cold-start refused before any data moved: the target already carries a foreign key on a table this run copies into, and that constraint's parent table is copied by the SAME run — the copy is not parent-first ordered, so a child row reaches the target before its parent and the constraint rejects it (MySQL Error 1452 / Postgres SQLSTATE 23503); sluice's deferred-constraint discipline only governs the constraints it creates itself"},
 	CodeTargetShardPlacementMismatch: {ClassRefusal, "refused before any data moved: a sharded target table's ROUTING and row PLACEMENT disagree, so its PRIMARY KEY is not globally enforced and sluice's idempotent upsert would insert duplicate rows instead of updating — the table was almost certainly assigned to a shard group without a reshard workflow to move its rows"},
+	CodeMigrateProgressUnrecordable:  {ClassRefusal, "refused before the table's first row moved: the migrate-state store could not record that this table is being copied, and a later --resume would read the missing progress row as \"never copied\" — appending a second copy of every row for a table with no primary key rather than resuming"},
+	CodeResumeFreshTableNotEmpty:     {ClassRefusal, "refused on --resume: a table with no persisted progress would be started from scratch WITHOUT truncating, but the target already holds rows — either an earlier attempt copied it and could not persist its progress row, or the target was already populated"},
 
 	CodePSForeignKeysNotEnabled: {ClassRefusal, "migrate/sync cold-start refused before the copy: the PlanetScale target has foreign-key support disabled (allow_foreign_key_constraints off, read back as foreign_keys_enabled=false) while the source schema declares foreign keys the run would add after the copy — the platform rejects ADD FOREIGN KEY outright, so the run would fail at the constraints phase after the whole copy and --resume re-hits it; enable foreign key support on the target database, or re-run with --skip-foreign-keys (each FK's referencing columns stay indexed, so the constraints can be added out-of-band)"},
 

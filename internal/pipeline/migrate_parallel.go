@@ -578,9 +578,16 @@ func resolveChunks(
 	entry.Chunks = chunks
 	// Set-under-lock persist (ADR-0076): peer tables mutate the shared
 	// TableProgress map concurrently, so the set + entry clone must
-	// happen under stateMu (setTableProgressAndWrite does exactly that,
+	// happen under stateMu (persistTableBreadcrumb does exactly that,
 	// then upserts this table's progress row — ADR-0082).
-	setTableProgressAndWrite(ctx, rc, state, stateMu, table.Name, entry)
+	//
+	// Breadcrumb site 4 of 4, and not best-effort — see
+	// [persistTableBreadcrumb]. This one carries more than the "being
+	// copied" fact: the chunk BOUNDARIES a resume re-derives its work
+	// from live in this row, so losing it loses the partition too.
+	if err := persistTableBreadcrumb(ctx, rc, state, stateMu, table.Name, entry); err != nil {
+		return nil, err
+	}
 	return chunks, nil
 }
 

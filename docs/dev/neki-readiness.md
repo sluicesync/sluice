@@ -95,6 +95,25 @@ A second Neki database was created (via the API — the CLI rejects `--engine ne
 
 **N-2 reproduced as a real failure, not just a NOTICE.** A `CREATE TABLE` acknowledged on one router, followed immediately by an `INSERT` on a new connection, failed with `relation "sharded_events" does not exist` from a *different* router cell — the exact create-then-write sequence sluice performs across a connection pool. `SELECT __neki.wait_for_ddl(<seq>, 0)` on a fresh connection fixes it, and after that the write succeeds. That confirms both the hazard and its remedy.
 
+### The sharded target found a silent data-duplication bug of OUR OWN — the most valuable thing this exercise has produced
+
+Recorded here, not only in `neki-issues/NEKI-009`, because the defect is **engine-neutral** and Neki was merely the first store that surfaced it.
+
+On a sharded Neki database the default shard group covers `public`, so every `INSERT` into sluice's own control tables is refused for want of the shard key (`SQLSTATE NK306`). `migrate` treats per-table progress writes as best-effort and warns past them, so a run completed at exit 0 with **zero** rows in `sluice_migrate_table_progress`.
+
+The consequence was mis-graded on first filing as "unresumable success". Measured, it is worse. `classifyTableForResume` reads a **missing** progress row as *never copied* and starts the table fresh **without truncating** — sound only while that reading is true, and it is exactly what the breadcrumb write exists to make true. With the write swallowed, a `--resume` re-copied a fully-copied table; for a table with no primary key there is nothing for the upsert to conflict on, so it **appended**:
+
+| binary | command | `t1_nopk` on the target |
+|---|---|---|
+| before the fix | `migrate` (dies on an unrelated table), then `--resume` | **80** rows — 40 source rows, twice, at an exit code from a different table |
+| after the fix | `migrate` | refuses at exit 3 before any row moves (`SLUICE-E-MIGRATE-PROGRESS-UNRECORDABLE`); **0** |
+| after the fix | `--resume` onto state the OLD binary left | refuses at exit 3 (`SLUICE-E-RESUME-FRESH-TABLE-NOT-EMPTY`); stays at **40** |
+
+Two things generalise beyond Neki:
+
+- **A best-effort write becomes a correctness problem the moment something reads its ABSENCE as information.** The four breadcrumb sites now refuse; every later write for the same table stays best-effort deliberately, because losing one of those degrades to re-copying work the resume path already handles. The split is enforced by `TestProgressBreadcrumbsDoNotRideTheBestEffortHelper`, an AST walker that derives its own universe and requires every remaining best-effort call to carry a terminal entry.
+- **A store that fails SYSTEMATICALLY is a different hazard from one that fails transiently**, and sluice's tolerance was tuned for the transient kind. Neki is the first systematic one we have met; a revoked `GRANT` or a dropped control table is the same shape on any engine.
+
 ### Neki as a SOURCE — works cross-engine, BLOCKED same-engine
 
 | direction | lane | result |

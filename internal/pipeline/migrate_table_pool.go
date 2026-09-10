@@ -46,6 +46,7 @@ package pipeline
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync"
 
@@ -54,6 +55,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/redact"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // warnStateWriteFailed logs the best-effort per-table state-write failure
@@ -242,8 +244,12 @@ func openTablePair(ctx context.Context, deps *parallelBulkCopyDeps) (ir.RowReade
 // the lock before the JSON encoding outside it (its Chunks slice can
 // share backing storage with chunk goroutines mutating their slots
 // under the same lock). A write error is logged at WARN and swallowed
-// — the data work is load-bearing, the breadcrumb is best-effort —
+// — the data work is load-bearing, a CHECKPOINT is best-effort —
 // mirroring the pre-pool per-table behaviour.
+//
+// Use [persistTableBreadcrumb] instead for the FIRST write of a table,
+// the one made before any of its rows move. That write is not
+// best-effort: see the reasoning there.
 func setTableProgressAndWrite(
 	ctx context.Context,
 	rc resumeContext,
@@ -261,6 +267,88 @@ func setTableProgressAndWrite(
 		// pre-ADR-0076 per-table state-write warnings operators grep for.
 		warnStateWriteFailed(ctx, tableName, err)
 	}
+}
+
+// persistTableBreadcrumb is [setTableProgressAndWrite] for the ONE write
+// per table that is not best-effort: the in-progress breadcrumb written
+// BEFORE any of that table's rows move. It returns the store error
+// instead of warning past it, and the caller aborts the run.
+//
+// # Why this one write is load-bearing
+//
+// [classifyTableForResume] reads a MISSING progress row as
+// resumeActionFresh, and fresh does not truncate — it starts the copy at
+// PK > nil and lets the per-batch upsert make a re-copy idempotent. That
+// is correct only because a missing row is supposed to mean the table was
+// never touched, and this breadcrumb is the only thing that makes it
+// mean that.
+//
+// When the breadcrumb write is swallowed, the invariant inverts silently:
+// the table copies, the run dies later for an unrelated reason, and the
+// next --resume classifies a fully-copied table as fresh. For a table
+// with a usable primary key the copy upserts and heals. For a KEYLESS
+// table there is nothing to conflict on, so the copy APPENDS a second
+// full set of rows — silent duplication at whatever exit code the
+// unrelated failure produced.
+//
+// Measured 2026-09-10 on a sharded PlanetScale Neki target, where every
+// control-table INSERT is refused for want of the database's shard key
+// (neki-issues/NEKI-009, SQLSTATE NK306): a 40-row keyless table came out
+// of the resume holding 80 rows. Neki is only how the store came to fail;
+// a revoked GRANT, a full disk or a dropped control table reach the same
+// place on any engine.
+//
+// # Why the LATER writes stay best-effort, deliberately
+//
+// Every subsequent write for the table degrades safely, which is what
+// makes it worth paying for this one and not the rest:
+//
+//   - a lost per-batch cursor checkpoint resumes from an older cursor and
+//     re-copies a range the upsert absorbs;
+//   - a lost terminal `complete` leaves the breadcrumb, and resume reads
+//     that as truncate-and-redo — slower, still correct.
+//
+// So the run survives a store that is merely flaky, and refuses one that
+// cannot record the fact that a table is being written. The refusal lands
+// before that table's first row moves, so --resume after fixing the store
+// picks up cleanly.
+//
+// # Scope
+//
+// A record-only context (the sync cold start, rc.noResume) is exempt: its
+// rows are a `sync status` heartbeat that [loadOrInitState] refuses to
+// resume from, so no correctness argument rests on them and killing a
+// cold start over one is pure loss. A context with no store at all is a
+// no-op, as everywhere else.
+func persistTableBreadcrumb(
+	ctx context.Context,
+	rc resumeContext,
+	state *ir.MigrationState,
+	stateMu *sync.Mutex,
+	tableName string,
+	entry ir.TableProgress,
+) error {
+	stateMu.Lock()
+	state.TableProgress[tableName] = entry
+	entryCopy := cloneTableProgressForWrite(entry)
+	stateMu.Unlock()
+	if !rc.enabled || rc.noResume {
+		return nil
+	}
+	if err := writeTableProgress(ctx, rc, tableName, entryCopy); err != nil {
+		return &sluicecode.CodedError{
+			Code: sluicecode.CodeMigrateProgressUnrecordable,
+			Hint: "the migrate-state store could not record that this table is being copied; fix the store " +
+				"(permissions, disk, or the control tables themselves) and re-run with --resume",
+			Err: fmt.Errorf(
+				"pipeline: record in-progress breadcrumb for table %q before copying it: %w"+
+					"\nsluice refuses to copy a table it cannot record: a later --resume would read the "+
+					"missing progress row as \"never copied\" and, for a table without a primary key, append "+
+					"a second copy of every row instead of resuming", tableName, err,
+			),
+		}
+	}
+	return nil
 }
 
 // markFailedLocked is the cross-table-safe wrapper around markFailed.
