@@ -124,15 +124,18 @@ Since that arc the surface has widened well beyond those four: encrypted logical
 
 ### Engines and directions
 
-| Source ↘ Target → | MySQL | MariaDB | PostgreSQL | PlanetScale MySQL | PlanetScale PG |
-|---|---|---|---|---|---|
-| **MySQL** | ✓ | ✓ | ✓ | ✓ | ✓ |
-| **MariaDB** | ✓ | ✓ | ✓ | ✓ | ✓ |
-| **PostgreSQL** | ✓ | ✓ | ✓ | ✓ | ✓ |
-| **PlanetScale MySQL** | ✓ (VStream CDC) | ✓ (VStream CDC) | ✓ (VStream CDC) | ✓ | ✓ |
-| **PlanetScale PG** | ✓ | ✓ | ✓ | ✓ | ✓ |
-| **CSV / TSV / NDJSON file** | ✓ (migrate) | ✓ (migrate) | ✓ (migrate) | ✓ (migrate) | ✓ (migrate) |
-| **mydumper / `pscale database dump` dir** | ✓ (migrate) | ✓ (migrate) | ✓ (migrate) | ✓ (migrate) | ✓ (migrate) |
+| Source ↘ Target → | MySQL | MariaDB | PostgreSQL | PlanetScale MySQL | PlanetScale PG | PlanetScale Neki |
+|---|---|---|---|---|---|---|
+| **MySQL** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| **MariaDB** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| **PostgreSQL** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| **PlanetScale MySQL** | ✓ (VStream CDC) | ✓ (VStream CDC) | ✓ (VStream CDC) | ✓ | ✓ | ✓ |
+| **PlanetScale PG** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| **CSV / TSV / NDJSON file** | ✓ (migrate) | ✓ (migrate) | ✓ (migrate) | ✓ (migrate) | ✓ (migrate) | ✓ (migrate) |
+| **mydumper / `pscale database dump` dir** | ✓ (migrate) | ✓ (migrate) | ✓ (migrate) | ✓ (migrate) | ✓ (migrate) | ✓ (migrate) |
+| **PlanetScale Neki** | ✓ (migrate) | ✓ (migrate) | ✓ (migrate) | ✓ (migrate) | ✓ (migrate) | ✓ (migrate) |
+
+**PlanetScale Neki** is reached with the ordinary `postgres` driver (no `--source-driver neki` — sluice detects it from the server version) and is a **migrate source only**: it can export a replication snapshot but nothing can import one, so there is no continuous `sync` OUT of it. As a TARGET it supports both, including into a sharded database and across a live reshard — see [`docs/operator/planetscale-postgres-to-neki.md`](docs/operator/planetscale-postgres-to-neki.md).
 
 The long-form version of this matrix — CDC modes and source requirements per engine, the known-limitations list, and a pre-production checklist — lives in [`docs/production-readiness.md`](docs/production-readiness.md).
 
@@ -142,7 +145,7 @@ Cross-engine type translation handles the common surfaces (PG `UUID` / `INET` / 
 
 ### Same-engine copies take a faster path
 
-Cross-engine work flows through sluice's typed IR, where type translation, redaction, and value-fidelity checks live — every value decoded and re-encoded. On a *same-engine, no-transform* Postgres→Postgres copy there's nothing to translate, so sluice skips the round trip entirely and byte-pipes the native `COPY` stream source-to-target (the pgcopydb tactic, composed with parallel chunking — [ADR-0078](docs/adr/adr-0078-pg-pg-identity-passthrough-raw-copy.md)); MySQL→MySQL stays on the IR but writes through the native `LOAD DATA` loader with no translation to perform. This is *the same fidelity, less work* — not a more-exact copy. The Postgres fast lane engages only when a single auditable gate proves there's no transform to skip: add `--redact` / `--type-override` / a shard column, or hit an OID-sensitive type, and it falls back to the IR path automatically, per table.
+Cross-engine work flows through sluice's typed IR, where type translation, redaction, and value-fidelity checks live — every value decoded and re-encoded. On a *same-engine, no-transform* Postgres→Postgres copy there's nothing to translate, so sluice skips the round trip entirely and byte-pipes the native `COPY` stream source-to-target (the pgcopydb tactic, composed with parallel chunking — [ADR-0078](docs/adr/adr-0078-pg-pg-identity-passthrough-raw-copy.md)); MySQL→MySQL stays on the IR but writes through the native `LOAD DATA` loader with no translation to perform. This is *the same fidelity, less work* — not a more-exact copy. The Postgres fast lane engages only when a single auditable gate proves there's no transform to skip: add `--redact` / `--type-override` / a shard column, hit an OID-sensitive type, or point it at an **endpoint that declines the lane**, and it falls back to the IR path automatically, per table. That last trigger is new in 2026-09 and is a runtime property of the server rather than a compile-time property of the types: a PlanetScale Neki source declines, because its router does not implement the `COPY (SELECT …) TO` form the exporter’s projection invariant requires. Detected from the server version, logged at INFO with the reason, no flag involved.
 
 ### SQLite & Cloudflare D1
 

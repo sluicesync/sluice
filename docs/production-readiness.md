@@ -10,15 +10,16 @@ Fourteen engines are registered (`sluice engines` lists them): `mysql`, `mariadb
 
 ### Live databases — migrate and continuous sync
 
-| Source ↘ Target → | MySQL | MariaDB | PostgreSQL | PlanetScale MySQL | PlanetScale PG |
-|---|---|---|---|---|---|
-| **MySQL** | ✓ | ✓ | ✓ | ✓ | ✓ |
-| **MariaDB** | ✓ | ✓ | ✓ | ✓ | ✓ |
-| **PostgreSQL** | ✓ | ✓ | ✓ | ✓ | ✓ |
-| **PlanetScale MySQL** | ✓ (VStream CDC) | ✓ (VStream CDC) | ✓ (VStream CDC) | ✓ | ✓ |
-| **PlanetScale PG** | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Source ↘ Target → | MySQL | MariaDB | PostgreSQL | PlanetScale MySQL | PlanetScale PG | PlanetScale Neki |
+|---|---|---|---|---|---|---|
+| **MySQL** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| **MariaDB** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| **PostgreSQL** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| **PlanetScale MySQL** | ✓ (VStream CDC) | ✓ (VStream CDC) | ✓ (VStream CDC) | ✓ | ✓ | ✓ |
+| **PlanetScale PG** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| **PlanetScale Neki** | ✓ (migrate) | ✓ (migrate) | ✓ (migrate) | ✓ (migrate) | ✓ (migrate) | ✓ (migrate) |
 
-Every cell supports one-shot `migrate`; every cell whose source has a CDC mode (next section) also supports continuous `sync`. MySQL flavors (vanilla, MariaDB, PlanetScale, Vitess) share one engine implementation with per-flavor `Capabilities` declarations; MariaDB is first-class since v0.99.268 (native `uuid`/`inet6`/`inet4` carry, domain-GTID CDC, JSON-via-`json_valid`).
+Every cell supports one-shot `migrate`; every cell whose source has a CDC mode (next section) also supports continuous `sync` — with ONE exception, stated here rather than left to be discovered: **PlanetScale Neki is a migrate source only.** A Neki replication connection can export a snapshot but nothing can import one (`pg_export_snapshot()` and `SET TRANSACTION SNAPSHOT` are unimplemented on the router), so there is no cold-start-to-CDC handoff out of it. Neki as a TARGET supports both, including into a sharded database and across a live reshard. Neki is reached with the ordinary `postgres` driver — there is no `--source-driver neki`; sluice detects it from the server version. See [`docs/managed-services.md`](managed-services.md#planetscale-neki-sharded-postgres) and [`docs/operator/planetscale-postgres-to-neki.md`](operator/planetscale-postgres-to-neki.md). MySQL flavors (vanilla, MariaDB, PlanetScale, Vitess) share one engine implementation with per-flavor `Capabilities` declarations; MariaDB is first-class since v0.99.268 (native `uuid`/`inet6`/`inet4` carry, domain-GTID CDC, JSON-via-`json_valid`).
 
 A PlanetScale MySQL host needs a VStream driver. `migrate` and `sync` **refuse** such a host under `--source-driver mysql` or `--source-driver mariadb` (and the `--target-driver` equivalents) with `SLUICE-E-DRIVER-HOST-MISMATCH`, from the DSN string alone and before any connection: those flavors drive binlog CDC and `LOAD DATA` cold-copy, both of which Vitess blocks, so the run would otherwise fail obscurely partway through. Use `--source-driver planetscale` — or `vitess` for a self-hosted Vitess — which gets VStream CDC with the Vitess `_vt_*` shadow tables auto-excluded. The DSN-based arm runs on `migrate` and `sync`; since v0.125.0 a connect-time VERSION() fingerprint backstops EVERY surface that opens a schema reader or writer — `schema diff`, `schema preview`, `backup`, `restore`, `verify` included — refusing a plain-`mysql` connection to any Vitess-reporting server rather than letting its full scans silently truncate under the OLTP workload.
 
