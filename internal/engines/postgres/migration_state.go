@@ -101,33 +101,58 @@ func newMigrationStateStore(db *sql.DB, schema string) *MigrationStateStore {
 				// and over-refused for hours on TZ-ahead ones. Writing
 				// timezone('utc', now()) — naive UTC digits — makes the
 				// stored value exactly what the read path assumes.
+				//
+				// The timestamps are supplied by the COLUMN DEFAULTS rather
+				// than written into the statement, which is what MySQL's
+				// sibling has always done (its DEFAULT + ON UPDATE
+				// CURRENT_TIMESTAMP). The UTC contract above is unchanged —
+				// the defaults are the same timezone('utc', now()) — and on
+				// conflict `EXCLUDED.updated_at` carries the row PROPOSED for
+				// insertion, defaults included, so the refresh is still a
+				// server-clock read.
+				//
+				// Why it is written this way rather than inline: a
+				// PlanetScale Neki router REFUSES a statement in which an
+				// expression wrapping now() precedes another now()-derived
+				// expression in the same VALUES list, with `ERROR: cannot add
+				// new column to INSERT RETURNING` — a message naming a
+				// RETURNING clause the statement does not have. It is
+				// order-dependent (the identical pair of expressions succeeds
+				// when swapped), so it is a router rewrite defect rather than
+				// a documented limitation; filed at C:\code\neki-issues as
+				// NEKI-001. These three statements each carried two such
+				// expressions, so `migrate` against a Neki target died on
+				// sluice's OWN control-table write at phase 1.75, before
+				// creating a table or copying a row. Leaning on the defaults
+				// removes every function call from the statement, which costs
+				// nothing on vanilla PostgreSQL and sidesteps the rewrite
+				// entirely.
 				UpsertHeader: "INSERT INTO " + hdr + " " +
-					"(migration_id, phase, table_progress, state_format, started_at, updated_at, last_error) " +
-					"VALUES ($1, $2, $3, $4, pg_catalog.timezone('utc', pg_catalog.now()), pg_catalog.timezone('utc', pg_catalog.now()), $5) " +
+					"(migration_id, phase, table_progress, state_format, last_error) " +
+					"VALUES ($1, $2, $3, $4, $5) " +
 					"ON CONFLICT (migration_id) DO UPDATE SET " +
 					"phase = EXCLUDED.phase, " +
 					"table_progress = EXCLUDED.table_progress, " +
 					"state_format = EXCLUDED.state_format, " +
-					"updated_at = pg_catalog.timezone('utc', pg_catalog.now()), " +
+					"updated_at = EXCLUDED.updated_at, " +
 					"last_error = EXCLUDED.last_error",
 				// Anchor-only: on conflict this touches snapshot_anchor and
 				// nothing else, so it can never move the phase a concurrent
 				// or later phase mark owns (migratestate.SQL).
 				UpsertSnapshotAnchor: "INSERT INTO " + hdr + " " +
-					"(migration_id, phase, table_progress, state_format, started_at, updated_at, " +
+					"(migration_id, phase, table_progress, state_format, " +
 					"snapshot_anchor, copy_shape) " +
-					"VALUES ($1, $2, $3, $4, pg_catalog.timezone('utc', pg_catalog.now()), " +
-					"pg_catalog.timezone('utc', pg_catalog.now()), $5, $6) " +
+					"VALUES ($1, $2, $3, $4, $5, $6) " +
 					"ON CONFLICT (migration_id) DO UPDATE SET " +
 					"snapshot_anchor = EXCLUDED.snapshot_anchor, " +
 					"copy_shape = EXCLUDED.copy_shape, " +
-					"updated_at = pg_catalog.timezone('utc', pg_catalog.now())",
+					"updated_at = EXCLUDED.updated_at",
 				UpsertProgressRow: "INSERT INTO " + prog + " " +
-					"(migration_id, table_name, progress, updated_at) " +
-					"VALUES ($1, $2, $3, pg_catalog.timezone('utc', pg_catalog.now())) " +
+					"(migration_id, table_name, progress) " +
+					"VALUES ($1, $2, $3) " +
 					"ON CONFLICT (migration_id, table_name) DO UPDATE SET " +
 					"progress = EXCLUDED.progress, " +
-					"updated_at = pg_catalog.timezone('utc', pg_catalog.now())",
+					"updated_at = EXCLUDED.updated_at",
 				MarkUpgraded: "UPDATE " + hdr +
 					" SET table_progress = $1, state_format = $2 WHERE migration_id = $3",
 				DeleteHeader:       "DELETE FROM " + hdr + " WHERE migration_id = $1",

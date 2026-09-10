@@ -266,8 +266,7 @@ func (w *SchemaWriter) CreateTablesWithoutConstraints(ctx context.Context, s *ir
 			// progress. PG has no `CREATE TYPE IF NOT EXISTS`; the
 			// DO-block guard (shared with the CDC forward path via
 			// guardedCreateEnumType) swallows duplicate_object.
-			stmt := guardedCreateEnumType(create)
-			if err := execEmittedDDL(ctx, w.db, stmt); err != nil {
+			if err := execCreateEnumTypeIdempotent(ctx, w.db, create); err != nil {
 				return fmt.Errorf("postgres: create enum type for %s.%s: %w", table.Name, col.Name, err)
 			}
 		}
@@ -312,7 +311,7 @@ func (w *SchemaWriter) CreateTablesWithoutConstraints(ctx context.Context, s *ir
 					if err != nil {
 						return fmt.Errorf("postgres: emit enum type for domain %s: %w", dom.Name, err)
 					}
-					if err := execEmittedDDL(ctx, w.db, guardedCreateEnumType(create)); err != nil {
+					if err := execCreateEnumTypeIdempotent(ctx, w.db, create); err != nil {
 						return fmt.Errorf("postgres: create enum type for domain %s: %w", dom.Name, err)
 					}
 				}
@@ -1789,8 +1788,7 @@ func (w *SchemaWriter) ensureEnumType(ctx context.Context, table *ir.Table, col 
 	if err != nil {
 		return err
 	}
-	stmt := guardedCreateEnumType(create)
-	if err := execEmittedDDL(ctx, w.db, stmt); err != nil {
+	if err := execCreateEnumTypeIdempotent(ctx, w.db, create); err != nil {
 		return fmt.Errorf("ensure enum type for %s.%s.%s: %w", w.schema, table.Name, col.Name, err)
 	}
 	return nil
@@ -1803,8 +1801,57 @@ func (w *SchemaWriter) ensureEnumType(ctx context.Context, table *ir.Table, col 
 // (ensureEnumType) so a re-run of either against a target where the
 // type already exists is a no-op instead of a hard failure (Bug 154,
 // Bug 145). The argument is the statement emitCreateEnumType produces.
+//
+// DEPRECATED for execution — kept because the emitted-DDL tests grade its
+// single-statement/quoting shape. Live creates go through
+// [execCreateEnumTypeIdempotent], which needs no plpgsql at all; see there
+// for why.
 func guardedCreateEnumType(create string) string {
 	return fmt.Sprintf("DO $$ BEGIN %s EXCEPTION WHEN duplicate_object THEN NULL; END $$;", create)
+}
+
+// isDuplicateObject reports whether err is SQLSTATE 42710, which PG returns
+// from `CREATE TYPE` when the type already exists.
+func isDuplicateObject(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "42710"
+}
+
+// execCreateEnumTypeIdempotent runs a bare `CREATE TYPE ... AS ENUM` and
+// treats "type already exists" as success, which is the same idempotency
+// [guardedCreateEnumType]'s DO block provided — moved out of SQL and into
+// Go.
+//
+// # Why it moved
+//
+// The DO-block form requires plpgsql EXCEPTION handlers, and a PlanetScale
+// Neki router refuses those outright:
+//
+//	ERROR: not implemented: plpgsql: BEGIN ... EXCEPTION handlers are not
+//	yet supported in execution (SQLSTATE NK013)
+//
+// which made any migration carrying a MySQL ENUM column fail at the
+// create-tables phase against a Neki target (filed at C:\code\neki-issues as
+// NEKI-005). Two alternatives were measured live on Neki: a plain
+// `CREATE TYPE` works, and a `DO` block using `IF NOT EXISTS (SELECT 1 FROM
+// pg_type …)` works and is idempotent. Neither was chosen, because doing the
+// tolerate in Go removes the plpgsql dependency ENTIRELY rather than trading
+// one dialect feature for another, and it is strictly more portable — every
+// engine returns a SQLSTATE.
+//
+// # The residual, stated rather than implied
+//
+// The DO-block form was atomic: the CREATE and the swallow happened in one
+// server round trip, so two concurrent creators could not both proceed. This
+// form has the same property for the same reason — the tolerate is on the
+// ERROR the server already returned, not on a prior existence CHECK, so
+// there is no TOCTOU window. A catalog-check guard would have introduced one,
+// which is the other reason it was not chosen.
+func execCreateEnumTypeIdempotent(ctx context.Context, db ddlExecer, create string) error {
+	if err := execEmittedDDL(ctx, db, create); err != nil && !isDuplicateObject(err) {
+		return err
+	}
+	return nil
 }
 
 // alterEnumAddValues forwards an enum value-add (Bug 145): ensure the enum

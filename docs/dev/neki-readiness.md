@@ -82,6 +82,57 @@ sluice's whole migrate shape is *create the tables, then copy into them*, across
 
 **N-5 (flavor detection): `version()` returns `PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2) (Neki)`.** A `(Neki)` suffix on the version string is a clean detection signal, exactly analogous to how the MySQL engine detects MariaDB.
 
+### SHARDED, measured — `neki-torture`, two shards, `xxhash(tenant_id)`
+
+A second Neki database was created (via the API — the CLI rejects `--engine neki`, NEKI-003), a second shard added (`POST …/branches/main/shards`), and a two-shard topology applied by `PUT`ting a data-topology JSON with an `xxhash` shard index on `tenant_id`. `EXPLAIN (NEKI_PLAN)` confirms real routing: `Route [EqualUnique]` on a shard-key predicate, `Aggregate [Ordered] → Collapse → Route [Scatter]` without one. 100 rows across 20 tenants.
+
+| # | Question | Measured |
+|---|---|---|
+| **A-5** | Does an unordered cross-shard read return PK order? | **No** — `SELECT … LIMIT 8` with no `ORDER BY` returned one row per tenant (`1.1 2.1 3.1 4.1 …`), not `1.1 1.2 1.3`. Exactly as the docs warn. |
+| **A-5** | Is an explicit `ORDER BY` honoured globally across shards? | **Yes** — correct global order. |
+| **A-5** | **Does keyset pagination work across shards?** | **Yes — 100 rows, 100 distinct.** Nothing skipped, nothing duplicated, over 10-row pages with `WHERE (tenant_id,id) > (…) ORDER BY tenant_id,id`. |
+| — | Is sluice safe here by construction? | **Yes**, and verified rather than assumed: the PG batched reader emits `ORDER BY pk1, pk2` (`row_reader_batch.go`), which is precisely the form measured correct above. |
+
+**N-2 reproduced as a real failure, not just a NOTICE.** A `CREATE TABLE` acknowledged on one router, followed immediately by an `INSERT` on a new connection, failed with `relation "sharded_events" does not exist` from a *different* router cell — the exact create-then-write sequence sluice performs across a connection pool. `SELECT __neki.wait_for_ddl(<seq>, 0)` on a fresh connection fixes it, and after that the write succeeds. That confirms both the hazard and its remedy.
+
+### Neki as a SOURCE — works cross-engine, BLOCKED same-engine
+
+| direction | lane | result |
+|---|---|---|
+| Neki → **MySQL** (cross-engine) | IR copy path | **100/100 rows, clean** |
+| Neki → **PostgreSQL** (same-engine) | ADR-0078 raw-copy passthrough | **FAILS loudly**: `ExportRawCopy: COPY TO STDOUT: ERROR: not implemented: COPY (SELECT …) TO is not supported` |
+
+**N-7 (sluice, design): the raw-copy passthrough lane is unconditional for PG→PG and has no off switch.** `--raw-copy-format` selects `text|binary` only; `ir.RawCopyFormat` has no disabled value. So a Neki source cannot be migrated to a PostgreSQL target at all today, while the same source to a MySQL target works — the fast lane is the only thing in the way. **This is the flavor's first concrete job**: gate `asRawCopyEndpoints` on a capability the Neki flavor declines, so the lane is skipped and the IR path (plain `SELECT`) is used, exactly as it already is cross-engine. An operator-facing `--raw-copy-format=off` would be a cruder second-best.
+
+**N-6: `pg_export_snapshot()` is not implemented** (`SQLSTATE NK013`), which is the cross-shard "no shared snapshot" fact (A-1) showing up at sluice's own door. **sluice handles it correctly** — it WARNs that the shared source snapshot is unavailable, that readers may observe different mid-copy states, and to quiesce the source or read a primary for a fully consistent copy, then falls back to independent per-connection readers. Loud, accurate, and with the right remedy; no change needed beyond the flavor recording it as expected rather than exceptional.
+
+### Cross-engine: PlanetScale MySQL → Neki, 12-table torture schema — MIGRATED CLEAN
+
+With N-1 and N-5 fixed locally, `sluice migrate` completed a full cross-engine migration: 12 tables, 45 rows, every phase (tables → bulk_copy → indexes → identity_sync → constraints → views). Source was a PlanetScale MySQL database seeded from `sluice_torture_mysql.sql` plus a boundary-value payload.
+
+**sluice's own refusals fired correctly on the way**, which is the torture schema doing its job rather than a defect:
+
+- `SLUICE-E-VALUE-TINYINT1-RANGE` on a `TINYINT(1)` holding `2` — carrying it as a boolean would have collapsed it to `true` and lost the integer. Refused before any row was written, naming the remedy.
+- WARNed that `bigint unsigned` maps to PG `bigint` and values above 2⁶³−1 are unrepresentable, naming `--type-override … = decimal(20,0)`. With the override, `18446744073709551615` landed exactly.
+- WARNed that MySQL `TIME` is a DURATION (−838:59:59..838:59:59) while PG `time` is a time-of-day, and that out-of-range values would refuse rather than clamp. `--type-override … = interval` carried them.
+
+**Value fidelity across the engine boundary, verified:** integer extremes exact at every width; `decimal(65,0)` and `decimal(65,30)` exact at full 65-digit precision; `octet_length` identical for every string including a 4-byte-emoji row (byte-identical hex) and the trailing-space PAD SPACE row; `float4`/`float8` exact.
+
+#### A retraction, kept because the mistake is the lesson
+
+Mid-run this file briefly recorded a **CRITICAL silent-loss finding**: that every single-precision FLOAT migrated MySQL→PostgreSQL was being rounded to 6 significant digits (`8388608` → `8388610`, float32 max → `3.40282e38`). It reproduced on vanilla MySQL 8.0 → vanilla PostgreSQL 16 with Neki nowhere in the picture, which made it look like a core-path defect in sluice's flagship direction.
+
+**It was not a defect. The measurement instrument was the lossy thing.** The oracle was `c_float::numeric(50,0)`, and PostgreSQL's `real → numeric` cast goes through a rounded text form. The control settles it — a `real` column holding the *correct* `8388608`:
+
+```
+SELECT v::numeric(50,0) FROM ctl;   -- 8388610      <-- the CAST rounds
+SELECT v::float8::text  FROM ctl;   -- 8388608      <-- the stored value is exact
+```
+
+Rendered through `::float8`, every migrated value matches its source exactly, on both the local PG target and Neki. Instrumenting the reader had already shown sluice reading `3.4028234663852886e+38` and `8388608` exactly, and the ADR-0153 `(col * 1E0)` projection in the emitted SQL — two pieces of evidence that contradicted the "finding" and should have stopped it sooner.
+
+This is the project's own rule turned on its author: **name the independent expected value, and check that your oracle is not the thing under test.** A verification whose "loss" derives from a lossy renderer is the same defect class as a verification whose "all clear" derives from the artifact it verifies. Worth noting too that the earlier `pg_dump | psql` Tier-C pass got the right answer precisely because it compared like with like.
+
 ### Tier C, first pass — value fidelity through the router: CLEAN
 
 A 26-column fixture covering every family the Bug 74 rule names — native (`integer`/`bigint`/`boolean`/`real`/`double precision`/`numeric(20,8)`), string-leaf (`text`/`varchar`/`uuid`/`inet`/`cidr`/`macaddr`), temporal (`date`/`time`/`timestamp`/`timestamptz`), `bytea`, `json`, `jsonb`, and arrays × {1-D, **2-D**, NULL-element} — seeded on a local `postgres:16`, loaded into Neki, and compared column-by-column as `::text` with `array_dims` ground-truthed on both sides.
