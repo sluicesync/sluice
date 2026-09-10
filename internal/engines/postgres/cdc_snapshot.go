@@ -231,10 +231,23 @@ func (e Engine) openSnapshotStreamShared(ctx context.Context, dsn, slotName stri
 	// slot, so asking first is equivalent — and it is the order the CDC
 	// reader already uses (IDENTIFY_SYSTEM, then START_REPLICATION).
 	//
-	// Best-effort: a probe that cannot run leaves the token exactly as
-	// it was before this change (no pin, installed lazily on the first
-	// stream), so a transient failure costs the extra check rather than
-	// the cold start.
+	// Best-effort, with a residual worth stating rather than implying.
+	// A probe that FAILS but leaves the connection usable costs only
+	// the pin: the token is exactly what it was before this change (no
+	// pin, installed lazily on the first stream) and the cold start
+	// proceeds. A probe that fails because the CONNECTION is gone is
+	// different — the create below then fails too, so this call can
+	// turn a cold start that would have succeeded into one that fails.
+	// It fails LOUDLY and at the create, never silently, and a
+	// connection too broken to answer IDENTIFY_SYSTEM would almost
+	// certainly not have survived CREATE_REPLICATION_SLOT either.
+	//
+	// That residual is accepted deliberately in preference to the
+	// alternative, which was a SECOND replication connection just for
+	// the probe: slots and wal_senders are the scarce resource on a
+	// source (sluice preflights the headroom for exactly that reason),
+	// so spending permanently from that budget to avoid a loud,
+	// near-impossible failure is the wrong side of the trade.
 	identity := identifySnapshotSource(ctx, replConn, slotName)
 
 	// EXPORT_SNAPSHOT is the default for non-temporary slots, but
