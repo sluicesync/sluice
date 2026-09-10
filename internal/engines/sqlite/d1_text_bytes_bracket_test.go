@@ -30,21 +30,31 @@ import (
 // page — a false refusal whose message accuses the operator's data of
 // corruption and tells them to exclude the table.
 
+// srcAnswer is one reading of the server-side bracket as the mock reports it:
+// the row count, the summed byte length of the text cells, and how many
+// U+FFFD those cells STORE (the second number, audit A0909-SLP-MEDIUM-2).
+type srcAnswer struct {
+	rows         int
+	textBytes    int64
+	replacements int64
+}
+
 // bracketMock serves one page of rows and answers the bracket with the
-// counts and byte sums it is told to, before and after.
-func bracketMock(t *testing.T, rows []map[string]any, beforeN, afterN int, beforeB, afterB int64) *D1RowReader {
+// numbers it is told to, before and after.
+func bracketMock(t *testing.T, rows []map[string]any, before, after srcAnswer) *D1RowReader {
 	t.Helper()
 	call := 0
 	h := func(sql string, _ []string) (int, []byte) {
 		if isD1CountQuery(sql) {
 			call++
-			n, b := beforeN, beforeB
+			a := before
 			if call > 1 {
-				n, b = afterN, afterB
+				a = after
 			}
 			return http.StatusOK, d1OK([]map[string]any{{
-				"n": strconv.Itoa(n),
-				"b": strconv.FormatInt(b, 10),
+				"n": strconv.Itoa(a.rows),
+				"b": strconv.FormatInt(a.textBytes, 10),
+				"f": strconv.FormatInt(a.replacements, 10),
 			}})
 		}
 		if isD1WidthProbe(sql) {
@@ -109,7 +119,9 @@ func TestD1RowReader_TextByteBracket(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			r := bracketMock(t, rows, tc.beforeN, tc.afterN, tc.beforeB, tc.afterB)
+			r := bracketMock(t, rows,
+				srcAnswer{rows: tc.beforeN, textBytes: tc.beforeB},
+				srcAnswer{rows: tc.afterN, textBytes: tc.afterB})
 			out, err := r.ReadRows(context.Background(), table)
 			if err != nil {
 				t.Fatalf("ReadRows: %v", err)
@@ -179,7 +191,8 @@ func TestStageD1Table_TextByteBracket(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			rr := bracketMock(t, rows, 1, 1, tc.srcBytes, tc.srcBytes)
+			src := srcAnswer{rows: 1, textBytes: tc.srcBytes}
+			rr := bracketMock(t, rows, src, src)
 			db := openStageDest(t, `CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)`)
 			_, err := stageD1Table(context.Background(), rr, db, table, tc.inScope, slog.Default())
 

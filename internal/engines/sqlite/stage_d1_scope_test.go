@@ -112,7 +112,7 @@ func underReportingBytesFor(db *sql.DB, table string) d1Handler {
 	honest := execD1Handler(db)
 	return func(sqlStr string, params []string) (int, []byte) {
 		if isD1CountQuery(sqlStr) && strings.Contains(sqlStr, `"`+table+`"`) {
-			return http.StatusOK, d1OK([]map[string]any{{"n": "1", "b": "1"}})
+			return http.StatusOK, d1OK([]map[string]any{{"n": "1", "b": "1", "f": "0"}})
 		}
 		return honest(sqlStr, params)
 	}

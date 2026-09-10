@@ -101,12 +101,15 @@ const (
 	CodeBulkCopyRowTooLarge Code = "SLUICE-E-BULKCOPY-ROW-TOO-LARGE"
 
 	// Audit 2026-09-01 LA-4: D1 stores invalid-UTF-8 TEXT intact but
-	// replaces every invalid byte with U+FFFD in its /query JSON response,
-	// server-side, so the mangled cell arrives as VALID UTF-8 and no
-	// client-side check can see it. The reader compares the server-summed
+	// replaces every maximal invalid subpart with U+FFFD in its /query JSON
+	// response, server-side, so the mangled cell arrives as VALID UTF-8 and
+	// no client-side check can see it. The reader compares the server-summed
 	// byte length of its text-storage cells against the bytes it received
-	// on a quiescent table; a disagreement means at least one cell was
-	// rewritten in transit.
+	// on a quiescent table — AND (audit A0909-SLP-MEDIUM-2) the server's
+	// count of the U+FFFD those cells already store against the ones it
+	// received, which is what sees a three-byte subpart, whose replacement
+	// is exactly as wide as what it replaced. Either disagreement means at
+	// least one cell was rewritten in transit.
 	CodeD1TextMangled Code = "SLUICE-E-D1-TEXT-MANGLED"
 
 	// CodeRealRenderLossy is raised by the SQLite-family render-fidelity
@@ -651,7 +654,7 @@ var registry = map[Code]Info{
 	CodeBulkCopyNoPaginationKey:  {ClassRefusal, "the d1 reader refused a table with no unique orderable key it can keyset-paginate on (every implicit-rowid name shadowed by a declared column, or a WITHOUT ROWID table keyed only by a BLOB column) — refused rather than paginated on a non-unique column or by LIMIT/OFFSET"},
 	CodeBulkCopyRowCountMismatch: {ClassRefusal, "the d1 reader's server-side COUNT(*) before and after a table read agreed with each other but not with the rows pagination delivered — the reader lost or duplicated rows on a quiescent source"},
 	CodeBulkCopyRowTooLarge:      {ClassRefusal, "the d1 reader met a single row wider than its response cap even as a page of one — pages are sized in bytes and shrink to one row; the one row that still overflows is refused by key rather than decoded from a truncated body"},
-	CodeD1TextMangled:            {ClassRefusal, "D1 returned more text bytes than it stores for a quiescent table — invalid UTF-8 was replaced with U+FFFD in the response and copying it would persist the mangled value"},
+	CodeD1TextMangled:            {ClassRefusal, "D1 returned text that does not match what it stores for a quiescent table — invalid UTF-8 was replaced with U+FFFD in the response (caught by the text-byte sum, or by the stored-U+FFFD count when the replacement is exactly as wide as what it replaced) and copying it would persist the mangled value"},
 	CodeRealRenderLossy:          {ClassRefusal, "the connected SQLite-family engine renders REAL values lossily — it ignores the `!` alternate-form-2 precision flag and clamps to 16 significant digits, so every captured or copied REAL would be silently altered"},
 	CodeSchemaPermissionDenied:   {ClassRuntime, "target role lacks CREATE on the schema"},
 	CodeIndexStatementTimeLimit:  {ClassRuntime, "index build hit PlanetScale's statement-time limit (errno 3024)"},

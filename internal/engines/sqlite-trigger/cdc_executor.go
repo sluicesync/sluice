@@ -1373,9 +1373,11 @@ func d1JSONInt64(raw json.RawMessage) (int64, bool) {
 	return v, true
 }
 
-// d1ReplacementCountExpr renders a SQL expression counting how many
-// U+FFFD characters the STORED value of col already contains, evaluated
-// server-side like the byte-length bracket beside it.
+// d1ReplacementCountExpr renders the server-side count of the U+FFFD
+// characters the STORED value of col already contains — the second number
+// of the mangle bracket, blind-spot-free where the byte length alone is
+// blind (a maximal invalid subpart of exactly three bytes rewrites to a
+// three-byte replacement and preserves the length).
 //
 // WHY A SECOND NUMBER IS NEEDED (audit 2026-09-06, pre-tag review). The
 // byte-length bracket alone is blind in one direction. D1 substitutes
@@ -1397,11 +1399,12 @@ func d1JSONInt64(raw json.RawMessage) (int64, bool) {
 // The division by 3 is exact: U+FFFD is always three bytes in UTF-8, so
 // the byte delta between the value and the value with every U+FFFD
 // removed is always a multiple of 3.
-// Delegates to [sqlite.D1ReplacementCountExpr] so both D1 text-crossing
-// lanes ask the server the SAME question. They were two copies of one
-// string until audit 2026-09-09 A0909-SLP-MEDIUM-2 found the reader lane
-// had never grown the second number at all — which is what a duplicated
-// expression invites, since each site reads correct on its own.
+// Delegates to [sqlite.D1ReplacementCountExpr], which carries this
+// rationale in full and is SHARED with the `d1` bulk reader's own
+// bracket (sqlite/d1_rows.go's replacementCountExpr). Both lanes cross
+// the same /query HTTP boundary and must not drift on the expression:
+// this one existed first and the reader lane inherited the gap until
+// audit A0909-SLP-MEDIUM-2, which is the sibling shape the hoist closes.
 func d1ReplacementCountExpr(col string) string {
 	return sqlite.D1ReplacementCountExpr(col)
 }

@@ -164,7 +164,7 @@ func withCount(n int, h d1Handler) d1Handler {
 			// count it serves and a byte sum of -1, the sentinel the reader
 			// treats as "this transport cannot weigh text" and skips the
 			// byte comparison for — see countRows.
-			return http.StatusOK, d1OK([]map[string]any{{"n": strconv.Itoa(n), "b": "-1"}})
+			return http.StatusOK, d1OK([]map[string]any{{"n": strconv.Itoa(n), "b": "-1", "f": "-1"}})
 		}
 		if isD1WidthProbe(sql) {
 			return http.StatusOK, d1WidthProbeAnswer(0)

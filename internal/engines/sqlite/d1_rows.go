@@ -454,10 +454,6 @@ func findColumn(table *ir.Table, name string) *ir.Column {
 	return nil
 }
 
-// countRows returns the server-side `COUNT(*)` of table — the independent
-// expected value the paginated read is checked against (audit LA-3). The count
-// is projected as TEXT and parsed exactly, the same discipline as every other
-// integer this transport reads (a JSON number would round past 2^53).
 // textBytesExpr builds the server-side companion to decodeRow's textBytes
 // (audit LA-4): the summed byte length of every cell whose storage class is
 // text, over the columns this read projects.
@@ -499,35 +495,134 @@ func textBytesExpr(table *ir.Table) string {
 	return strings.Join(parts, " + ")
 }
 
-func (r *D1RowReader) countRows(ctx context.Context, table *ir.Table) (count, textBytes int64, err error) {
+// replacementCountExpr builds the SECOND server-side number of the mangle
+// bracket (audit A0909-SLP-MEDIUM-2): how many U+FFFD characters the source
+// ALREADY STORES across exactly the cells [textBytesExpr] weighs.
+//
+// The byte sum alone is blind in one direction. D1 substitutes one U+FFFD —
+// three bytes — per MAXIMAL INVALID SUBPART, and when that subpart is exactly
+// three bytes the substitution PRESERVES the byte length and the sums agree
+// over a cell that was rewritten. A 4-byte UTF-8 sequence severed at a byte
+// boundary IS a three-byte maximal subpart, which is what fixed-width
+// truncation does to an emoji — so the blind case is the ordinary one, not an
+// exotic one. Counting stored replacements closes the class: every rewrite
+// either grows the byte count or introduces a U+FFFD that was not stored.
+//
+// It MUST count the same cells as [textBytesExpr] — same generated-column
+// exclusion, same `typeof()` guard, same projected expression rather than the
+// bare column — or the two sides stop describing the same set and one of them
+// becomes noise. That is why this mirrors that function line for line rather
+// than filtering its own way; the shared per-column expression is
+// [D1ReplacementCountExpr], which the d1-trigger change-log poll also uses.
+func replacementCountExpr(table *ir.Table) string {
+	parts := make([]string, 0, len(table.Columns))
+	for _, c := range table.Columns {
+		if c.IsGenerated() {
+			continue
+		}
+		q := quoteIdent(c.Name)
+		parts = append(parts,
+			"COALESCE(SUM(CASE WHEN "+CapturedTypeofExpr(q)+"='text' THEN "+
+				D1ReplacementCountExpr(CapturedValueExpr(q))+" ELSE 0 END),0)")
+	}
+	if len(parts) == 0 {
+		return "0"
+	}
+	return strings.Join(parts, " + ")
+}
+
+// d1SourceTotals is one reading of the server's OWN numbers for a table — the
+// independent expected values the paginated read is graded against, all three
+// taken in a single round trip so they describe the same instant:
+//
+//   - rows: the COUNT(*) the row bracket (audit LA-3) compares delivery to.
+//   - textBytes: the summed byte length of the text-storage cells this read
+//     projects ([textBytesExpr], audit LA-4). Negative is the "this transport
+//     cannot weigh its own text" sentinel — a canned test double, never a real
+//     D1 response — and disarms the mangle comparison rather than fabricating
+//     one.
+//   - replacements: how many U+FFFD those same cells already store
+//     ([replacementCountExpr], audit A0909-SLP-MEDIUM-2), which is what sees a
+//     length-preserving rewrite.
+//
+// A struct rather than a fourth return value because the three are one piece
+// of evidence and every caller wants them to travel together.
+type d1SourceTotals struct {
+	rows         int64
+	textBytes    int64
+	replacements int64
+}
+
+// d1DeliveredText is the CLIENT half of the mangle bracket for one row or one
+// read: the bytes and U+FFFD the decode loop actually received, over exactly
+// the cells [d1SourceTotals] weighs.
+type d1DeliveredText struct {
+	bytes        int64
+	replacements int64
+}
+
+// add accumulates one row's delivered text into a running total.
+func (d *d1DeliveredText) add(other d1DeliveredText) {
+	d.bytes += other.bytes
+	d.replacements += other.replacements
+}
+
+// replacementRune is U+FFFD, the character D1 substitutes for every maximal
+// invalid UTF-8 subpart in its /query JSON response. Counted on BOTH sides of
+// the bracket, so a value that legitimately stores it is not refused.
+const replacementRune = "�"
+
+// countRows returns the server's own numbers for table — the independent
+// expected values the paginated read is graded against (audit LA-3/LA-4).
+// Every one is projected as TEXT and parsed exactly, the same discipline as
+// every other integer this transport reads (a JSON number would round past
+// 2^53).
+//
+// It reads all three of [d1SourceTotals] in the SAME round trip. The
+// replacement count is NOT optional: an absent column means the query shape
+// drifted, and treating a missing server number as clean is how a bracket
+// becomes decoration (the d1-trigger lane's checkD1CapturedImageBytes refuses
+// on the same grounds). The "cannot weigh text" case is signalled by a
+// NEGATIVE textBytes, not by an omitted column.
+func (r *D1RowReader) countRows(ctx context.Context, table *ir.Table) (d1SourceTotals, error) {
 	rows, err := r.client.queryRows(ctx,
-		"SELECT CAST(COUNT(*) AS TEXT) AS n, CAST("+textBytesExpr(table)+" AS TEXT) AS b FROM "+quoteIdent(table.Name))
+		"SELECT CAST(COUNT(*) AS TEXT) AS n, CAST("+textBytesExpr(table)+" AS TEXT) AS b, CAST("+
+			replacementCountExpr(table)+" AS TEXT) AS f FROM "+quoteIdent(table.Name))
 	if err != nil {
-		return 0, 0, err
+		return d1SourceTotals{}, err
 	}
 	if len(rows) != 1 {
-		return 0, 0, fmt.Errorf("COUNT(*) returned %d rows; want 1", len(rows))
+		return d1SourceTotals{}, fmt.Errorf("COUNT(*) returned %d rows; want 1", len(rows))
 	}
+	var totals d1SourceTotals
 	bText, bOK, bErr := jsonString(rows[0]["b"])
 	if bErr != nil || !bOK {
-		return 0, 0, fmt.Errorf("text-byte sum is not a text scalar: %w", bErr)
+		return d1SourceTotals{}, fmt.Errorf("text-byte sum is not a text scalar: %w", bErr)
 	}
-	textBytes, bErr = strconv.ParseInt(bText, 10, 64)
+	totals.textBytes, bErr = strconv.ParseInt(bText, 10, 64)
 	if bErr != nil {
-		return 0, 0, fmt.Errorf("text-byte sum %q is not an integer: %w", bText, bErr)
+		return d1SourceTotals{}, fmt.Errorf("text-byte sum %q is not an integer: %w", bText, bErr)
+	}
+	fText, fOK, fErr := jsonString(rows[0]["f"])
+	if fErr != nil || !fOK {
+		return d1SourceTotals{}, fmt.Errorf("stored U+FFFD count is not a text scalar: %w", fErr)
+	}
+	totals.replacements, fErr = strconv.ParseInt(fText, 10, 64)
+	if fErr != nil {
+		return d1SourceTotals{}, fmt.Errorf("stored U+FFFD count %q is not an integer: %w", fText, fErr)
 	}
 	text, ok, err := jsonString(rows[0]["n"])
 	if err != nil {
-		return 0, 0, fmt.Errorf("COUNT(*) result is not a text scalar: %w", err)
+		return d1SourceTotals{}, fmt.Errorf("COUNT(*) result is not a text scalar: %w", err)
 	}
 	if !ok {
-		return 0, 0, errors.New("COUNT(*) result is NULL")
+		return d1SourceTotals{}, errors.New("COUNT(*) result is NULL")
 	}
-	count, err = strconv.ParseInt(text, 10, 64)
+	totals.rows, err = strconv.ParseInt(text, 10, 64)
 	if err != nil {
-		return 0, 0, fmt.Errorf("COUNT(*) result %q: %w", text, err)
+		return d1SourceTotals{}, fmt.Errorf("COUNT(*) result %q: %w", text, err)
 	}
-	return count, textBytes, nil
+	return totals, nil
 }
 
 // rowCountMismatchHint is the remedy carried by [sluicecode.CodeBulkCopyRowCountMismatch].
@@ -576,14 +671,66 @@ type d1Page struct {
 	err   error
 	final bool
 
-	// The LA-4 byte bracket, set on the final page only. srcTextBytes is
-	// the server's own SUM over every text-storage cell of the projected
-	// columns, read in the same round trip as the closing COUNT(*);
-	// quiescent says the two COUNT(*) readings agreed, which is what makes
-	// the byte comparison meaningful (a table being written under the read
-	// changes both numbers legitimately).
-	srcTextBytes int64
-	quiescent    bool
+	// The mangle bracket's SOURCE side, set on the final page only: the
+	// server's own text-byte sum and stored-U+FFFD count over the projected
+	// columns (audit LA-4 and A0909-SLP-MEDIUM-2), read in the same round
+	// trip as the closing COUNT(*). quiescent says the two readings agreed,
+	// which is what makes the comparison meaningful — a table being written
+	// under the read moves both numbers legitimately.
+	src       d1SourceTotals
+	quiescent bool
+}
+
+// mangleHint is the remedy carried by [sluicecode.CodeD1TextMangled] on the
+// reader and staging lanes.
+const mangleHint = "read the affected columns as hex(col) and repair the values at the source"
+
+// d1TextMangle compares what a table read DELIVERED against the server's own
+// numbers for the same cells, and returns the clause naming the divergence —
+// empty when they agree, which is the only clean answer.
+//
+// TWO numbers, because either one alone is blind. D1 stores invalid-UTF-8 TEXT
+// intact but replaces every maximal invalid subpart with U+FFFD in its /query
+// JSON — SERVER-SIDE, so the cell arrives as valid UTF-8 and no client-side
+// inspection can see it. The byte sum catches the common shape (three bytes
+// replace one or two, so delivery is longer than storage) and misses the
+// three-byte subpart, where the replacement is exactly as wide as what it
+// replaced; the stored-U+FFFD count catches that one. Between them they admit
+// no rewrite: every rewrite either grows the byte count or introduces a
+// replacement character that was not stored.
+//
+// Both halves are compared with `!=`, not `>`: a delivered total BELOW the
+// stored one is equally unexplained on a quiescent table, and the byte half
+// has always refused in both directions.
+//
+// Only when the table was quiescent — the row-count bracket has already spoken
+// for a table being written under the read, and a legitimate concurrent write
+// moves every one of these numbers. srcTextBytes < 0 is the "no byte evidence"
+// sentinel: a transport that cannot weigh its own text (the canned test
+// doubles) reports it, and BOTH comparisons are skipped rather than
+// fabricated. A real D1 response always carries the sums, so this cannot
+// silently disarm the check in production — countRows refuses a response that
+// omits either column outright.
+func d1TextMangle(got d1DeliveredText, src d1SourceTotals, quiescent bool) string {
+	if !quiescent || src.textBytes < 0 {
+		return ""
+	}
+	if got.bytes != src.textBytes {
+		return fmt.Sprintf("the text this read received is %d bytes where the source stores %d",
+			got.bytes, src.textBytes)
+	}
+	if got.replacements != src.replacements {
+		// Deliberately NOT worded as "extra replacements": the comparison is
+		// !=, so this fires in either direction, and a message that asserts
+		// the common one would misdescribe the other. What it explains is why
+		// the byte totals agreeing proves nothing here.
+		return fmt.Sprintf("the text this read received carries %d U+FFFD where the source stores %d, "+
+			"with the byte counts in agreement -- which settles nothing, because a maximal invalid "+
+			"subpart of exactly three bytes (a 4-byte sequence severed at a byte boundary, which is what "+
+			"truncating an emoji produces) is rewritten to a three-byte replacement and preserves the length",
+			got.replacements, src.replacements)
+	}
+	return ""
 }
 
 // stream decodes fetched pages and pushes IR Rows onto out, closing it when
@@ -612,15 +759,15 @@ func (r *D1RowReader) stream(ctx context.Context, table *ir.Table, plan pagePlan
 	go r.fetchPages(fetchCtx, table, plan, pages)
 
 	var (
-		ordinal      int64 // 1-based row counter, for error context
-		sawFinal     bool
-		gotTextBytes int64 // LA-4: delivered bytes of every text-storage cell
-		srcTextBytes int64 // the server's own sum, from the closing bracket
-		quiescent    bool
+		ordinal   int64 // 1-based row counter, for error context
+		sawFinal  bool
+		got       d1DeliveredText // the mangle bracket's delivered side
+		src       d1SourceTotals  // the server's own numbers, from the closing bracket
+		quiescent bool
 	)
 	for page := range pages {
 		if page.final {
-			srcTextBytes, quiescent = page.srcTextBytes, page.quiescent
+			src, quiescent = page.src, page.quiescent
 		}
 		if page.err != nil {
 			r.setErr(fmt.Errorf("d1: table %q: %w", table.Name, page.err))
@@ -628,8 +775,8 @@ func (r *D1RowReader) stream(ctx context.Context, table *ir.Table, plan pagePlan
 		}
 		for _, raw := range page.rows {
 			ordinal++
-			row, _, cellBytes, err := r.decodeRow(table, plan, raw, enc, ordinal)
-			gotTextBytes += cellBytes
+			row, _, cellText, err := r.decodeRow(table, plan, raw, enc, ordinal)
+			got.add(cellText)
 			if err != nil {
 				r.setErr(err)
 				return
@@ -654,34 +801,19 @@ func (r *D1RowReader) stream(ctx context.Context, table *ir.Table, plan pagePlan
 		r.setErr(fmt.Errorf("d1: table %q: page fetch aborted before the final page", table.Name))
 		return
 	}
-	// LA-4: the byte half of the bracket. D1 stores invalid-UTF-8 TEXT
-	// intact but replaces every invalid byte with U+FFFD in the /query JSON
-	// -- SERVER-SIDE, so the cell arrives as valid UTF-8 and no client-side
-	// check can see it. The server's own summed byte length of its
-	// text-storage cells is the independent expected value: a mangled cell
-	// is DELIVERED longer than it is STORED (three bytes for one), so the
-	// two sums disagree by exactly the inflation.
-	//
-	// Only when the table was quiescent: the row-count bracket has already
-	// spoken for a table being written under the read, and a legitimate
-	// concurrent write moves both numbers.
-	// srcTextBytes < 0 is the "no byte evidence" sentinel: a transport that
-	// cannot weigh its own text (the canned test doubles) reports it, and the
-	// comparison is skipped rather than fabricated. A real D1 response always
-	// carries the sum, so this cannot silently disarm the check in production
-	// — the count bracket would have refused a response missing columns.
-	if quiescent && srcTextBytes >= 0 && gotTextBytes != srcTextBytes {
+	// The mangle bracket's verdict (LA-4 + A0909-SLP-MEDIUM-2). See
+	// [d1TextMangle] for why it takes two numbers and when it abstains.
+	if detail := d1TextMangle(got, src, quiescent); detail != "" {
 		r.setErr(sluicecode.Wrap(
-			sluicecode.CodeD1TextMangled,
-			"read the affected columns as hex(col) and repair the values at the source",
+			sluicecode.CodeD1TextMangled, mangleHint,
 			fmt.Errorf(
-				"d1: table %q: the text this read received is %d bytes where the source stores %d, on a table whose "+
-					"row count did not move -- D1 replaces every invalid UTF-8 byte with U+FFFD in its query response "+
-					"(three bytes for one), so at least one cell was silently rewritten in transit and copying it would "+
-					"persist the mangled value. The source is intact: hex(col) still returns the true bytes. Find the "+
-					"affected rows by comparing length(CAST(col AS BLOB)) against length(col) per text column, repair "+
-					"them, or exclude the table",
-				table.Name, gotTextBytes, srcTextBytes,
+				"d1: table %q: %s, on a table whose row count and text size did not move -- D1 replaces every "+
+					"maximal invalid UTF-8 subpart with U+FFFD in its query response, so at least one cell was "+
+					"silently rewritten in transit and copying it would persist the mangled value. The source is "+
+					"intact: hex(col) still returns the true bytes. Find the affected rows by comparing "+
+					"length(CAST(col AS BLOB)) against length(col), and hex(col) against col, per text column; "+
+					"repair them, or exclude the table",
+				table.Name, detail,
 			),
 		))
 	}
@@ -734,7 +866,7 @@ func (r *D1RowReader) fetchPages(ctx context.Context, table *ir.Table, plan page
 		}
 	}
 
-	before, beforeBytes, err := r.countRows(ctx, table)
+	before, err := r.countRows(ctx, table)
 	if err != nil {
 		deliver(d1Page{err: fmt.Errorf("count rows before the read: %w", err), final: true})
 		return
@@ -786,13 +918,13 @@ func (r *D1RowReader) fetchPages(ctx context.Context, table *ir.Table, plan page
 		// A short (or empty) page is the last page: close the bracket and
 		// let its verdict ride the page.
 		if len(rows) < pageSize {
-			after, afterBytes, err := r.countRows(ctx, table)
+			after, err := r.countRows(ctx, table)
 			quiescent := false
 			if err != nil {
 				err = fmt.Errorf("count rows after the read: %w", err)
 			} else {
-				err = checkRowCount(ctx, table.Name, before, after, ordinal)
-				// Quiescent means BOTH readings held still, not just the row
+				err = checkRowCount(ctx, table.Name, before.rows, after.rows, ordinal)
+				// Quiescent means EVERY reading held still, not just the row
 				// count. A COUNT(*) is blind to an UPDATE, and an UPDATE that
 				// changes a text cell's length moves the byte sum on its own —
 				// so counting rows alone would have made the byte bracket
@@ -800,11 +932,13 @@ func (r *D1RowReader) fetchPages(ctx context.Context, table *ir.Table, plan page
 				// already-delivered page. The count bracket 200 lines above
 				// deliberately WARNs rather than refuses for exactly that
 				// reason ("a live database would otherwise be unmigratable");
-				// this must abstain on the same evidence. A mangle moves only
-				// the DELIVERED side, so it still refuses.
-				quiescent = before == after && beforeBytes == afterBytes
+				// this must abstain on the same evidence. The stored-U+FFFD
+				// count joins the test for the same reason: an UPDATE writing
+				// a legitimate U+FFFD moves it without any mangle. A mangle
+				// moves only the DELIVERED side, so it still refuses.
+				quiescent = before == after
 			}
-			deliver(d1Page{rows: rows, err: err, final: true, srcTextBytes: afterBytes, quiescent: quiescent})
+			deliver(d1Page{rows: rows, err: err, final: true, src: after, quiescent: quiescent})
 			return
 		}
 		if !deliver(d1Page{rows: rows}) {
@@ -824,18 +958,19 @@ func (r *D1RowReader) fetchPages(ctx context.Context, table *ir.Table, plan page
 // keyset bound for the next page. Every decode error is wrapped with
 // table/column/row so the operator can find the offending cell (the loud-failure
 // tenet).
-// textBytes (audit LA-4) is the DELIVERED byte length of every cell whose
-// SQLite storage class is text, summed across the row. The projection
-// already carries typeof() per column, so this is exact and free: it counts
-// precisely the cells the server-side sum counts, and nothing else. A blob
-// arrives as a JSON array and an integer as a number (measured on live D1),
-// so neither can drift into either total.
-func (r *D1RowReader) decodeRow(table *ir.Table, plan pagePlan, raw d1Row, enc dateEncoding, ordinal int64) (row ir.Row, key []string, textBytes int64, err error) {
+// text is the DELIVERED half of the mangle bracket for this row: the byte
+// length of every cell whose SQLite storage class is text, and the U+FFFD
+// those same cells carry, summed across the row (audit LA-4 and
+// A0909-SLP-MEDIUM-2). The projection already carries typeof() per column, so
+// this is exact and free: it counts precisely the cells the server-side sums
+// count, and nothing else. A blob arrives as a JSON array and an integer as a
+// number (measured on live D1), so neither can drift into either total.
+func (r *D1RowReader) decodeRow(table *ir.Table, plan pagePlan, raw d1Row, enc dateEncoding, ordinal int64) (row ir.Row, key []string, text d1DeliveredText, err error) {
 	row = make(ir.Row, len(table.Columns))
 	for i, col := range table.Columns {
 		typeofText, ok, err := jsonString(raw[plan.typeofAliases[i]])
 		if err != nil {
-			return nil, nil, 0, fmt.Errorf("d1: table %q column %q row %d: decode typeof: %w",
+			return nil, nil, d1DeliveredText{}, fmt.Errorf("d1: table %q column %q row %d: decode typeof: %w",
 				table.Name, col.Name, ordinal, err)
 		}
 		if !ok {
@@ -843,7 +978,7 @@ func (r *D1RowReader) decodeRow(table *ir.Table, plan pagePlan, raw d1Row, enc d
 		}
 		storage, err := d1StorageValue(typeofText, raw[col.Name])
 		if err != nil {
-			return nil, nil, 0, fmt.Errorf("d1: table %q column %q row %d: %w",
+			return nil, nil, d1DeliveredText{}, fmt.Errorf("d1: table %q column %q row %d: %w",
 				table.Name, col.Name, ordinal, err)
 		}
 		// Generated columns are excluded on BOTH sides (see textBytesExpr): a
@@ -853,12 +988,12 @@ func (r *D1RowReader) decodeRow(table *ir.Table, plan pagePlan, raw d1Row, enc d
 		// VIRTUAL column duplicating another (TestStageD1Table_RowidShadowMatrix).
 		if typeofText == "text" && !col.IsGenerated() {
 			if str, isStr := storage.(string); isStr {
-				textBytes += int64(len(str))
+				text.add(deliveredText(str))
 			}
 		}
 		v, err := decodeCell(storage, col.Type, enc)
 		if err != nil {
-			return nil, nil, 0, fmt.Errorf("d1: table %q column %q row %d: %w",
+			return nil, nil, d1DeliveredText{}, fmt.Errorf("d1: table %q column %q row %d: %w",
 				table.Name, col.Name, ordinal, err)
 		}
 		row[col.Name] = v
@@ -866,9 +1001,20 @@ func (r *D1RowReader) decodeRow(table *ir.Table, plan pagePlan, raw d1Row, enc d
 
 	key, err = r.extractKey(table, plan, raw, ordinal)
 	if err != nil {
-		return nil, nil, 0, err
+		return nil, nil, d1DeliveredText{}, err
 	}
-	return row, key, textBytes, nil
+	return row, key, text, nil
+}
+
+// deliveredText weighs one delivered text cell the way the server-side
+// bracket weighs the stored one: its byte length, and the U+FFFD it carries.
+// The single place the client half is measured, so the reader and the staging
+// materializer can never drift on what counts.
+func deliveredText(s string) d1DeliveredText {
+	return d1DeliveredText{
+		bytes:        int64(len(s)),
+		replacements: int64(strings.Count(s, replacementRune)),
+	}
 }
 
 // extractKey reads the exact-text values of the keyset columns from a result

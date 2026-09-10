@@ -139,6 +139,43 @@ func CapturedValueExpr(colExpr string) string {
 		") WHEN 'real' THEN format('%!.20g', " + colExpr + ") ELSE CAST(" + colExpr + " AS TEXT) END"
 }
 
+// D1ReplacementCountExpr renders a SQL expression counting how many U+FFFD
+// characters the STORED value of colExpr already contains, evaluated
+// SERVER-SIDE like the byte-length bracket beside it. colExpr is the
+// already-quoted reference (a change-log column name in the d1-trigger poll,
+// the projected `CapturedValueExpr` in the D1 reader's bracket).
+//
+// WHY A SECOND NUMBER IS NEEDED (audit 2026-09-06, pre-tag review). The
+// byte-length bracket alone is blind in one direction. D1 substitutes one
+// U+FFFD — three bytes — per MAXIMAL INVALID SUBPART, and a subpart is one,
+// two or three bytes long. When it is exactly THREE the rewrite is byte-length
+// PRESERVING and the bracket cannot see it. That is not an exotic shape: a
+// 4-byte UTF-8 sequence severed at a byte boundary is precisely a 3-byte
+// maximal subpart, and severing at a byte boundary is what fixed-width
+// truncation does to an emoji. A cell holding 'A' || x'F09F98' stores 4 bytes
+// and is delivered as "A" + U+FFFD, also 4 bytes.
+//
+// Counting stored U+FFFD closes the class, because every rewrite either grows
+// the byte count OR introduces a replacement character that was not stored —
+// there is no rewrite that does neither. A value that legitimately CONTAINS
+// U+FFFD is fine: it is counted on both sides and the counts agree.
+//
+// The division by 3 is exact: U+FFFD is always three bytes in UTF-8, so the
+// byte delta between the value and the value with every U+FFFD removed is
+// always a multiple of 3.
+//
+// It lives HERE, beside [CapturedValueExpr], because BOTH D1 lanes that cross
+// the /query HTTP boundary need it and they must not drift on the expression:
+// the `d1-trigger` change-log poll (sqlite-trigger's d1ReplacementCountExpr
+// delegates to this) and the `d1` bulk reader / `migrate --stage-local`
+// staging bracket (sqlite's replacementCountExpr sums it per projected text
+// column). Audit A0909-SLP-MEDIUM-2 is precisely the gap that existed while
+// only the first lane had it.
+func D1ReplacementCountExpr(colExpr string) string {
+	return "(length(CAST(" + colExpr + " AS BLOB)) - length(CAST(replace(" +
+		colExpr + ", char(65533), '') AS BLOB))) / 3"
+}
+
 // realRenderProbeValue is a double whose exact decimal round-trip needs 17
 // significant digits: SQLite's 16-digit printf cap renders it "0.3", which
 // parses to a DIFFERENT double, so a single render distinguishes a

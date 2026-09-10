@@ -233,11 +233,17 @@ so nothing is skipped; recovery per the Bug 245 runbook in
 On live D1 (`d1` / `d1-trigger`) THIS refusal cannot fire — the API mangles the value
 server-side, so it reaches sluice as valid UTF-8 and the encoding guard has nothing to
 catch. Since v0.140.0 the bulk `d1` read catches it a different way: the reader asks the
-source for the summed byte length of its own text-storage cells, in the same round trip as
-its closing `COUNT(*)`, and compares that against the bytes it received. A quiescent table
-whose totals disagree refuses with `SLUICE-E-D1-TEXT-MANGLED`, naming both numbers — a
-mangled cell is DELIVERED longer than it is STORED, three bytes for one. The
-`d1-trigger` change-log poll does not share that bracket and still cannot see the vector.
+source for two numbers about its own text-storage cells, in the same round trip as its
+closing `COUNT(*)`, and compares both against what it received. A quiescent table whose
+totals disagree refuses with `SLUICE-E-D1-TEXT-MANGLED`, naming both numbers.
+The first number is the summed BYTE LENGTH: a replacement character is three bytes, so an
+invalid subpart of one or two bytes arrives longer than it is stored. The second is how
+many U+FFFD the source ALREADY STORES, and it is the one that sees a rewrite the byte
+length cannot — a maximal invalid subpart of exactly three bytes (a 4-byte sequence severed
+at a byte boundary, which is what truncating an emoji produces) becomes a three-byte
+replacement and leaves the byte totals in agreement. Between them no rewrite passes, and a
+value that legitimately contains U+FFFD is counted on both sides and copies fine. The
+`d1-trigger` change-log poll brackets each captured row image the same way, on both numbers.
 See the invalid-UTF-8 caveat earlier in this page.
 The
 change-log, meta, and column-fingerprint tables are auto-skipped by the schema reader, so
