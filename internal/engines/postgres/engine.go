@@ -285,9 +285,11 @@ func (e Engine) OpenRowWriter(ctx context.Context, dsn string) (ir.RowWriter, er
 		_ = db.Close()
 		return nil, err
 	}
+	isNekiW, _ := probeIsNeki(ctx, cfg.serverKey(), db)
 	return &RowWriter{
 		db:         db,
 		schema:     cfg.schema,
+		isNeki:     isNekiW,
 		useCopy:    e.Capabilities().BulkLoad == ir.BulkLoadCopy,
 		hasPostGIS: hasGIS,
 	}, nil

@@ -83,6 +83,11 @@ type RowWriter struct {
 	db     *sql.DB
 	schema string
 
+	// isNeki records that this writer's endpoint is a PlanetScale Neki
+	// router, probed once per server at open (neki_probe.go). It gates the
+	// shard-placement preflight and nothing else.
+	isNeki bool
+
 	// useCopy selects the bulk-load strategy. true → writeViaCopy;
 	// false → writeViaBatch (the original batched-insert path).
 	useCopy bool

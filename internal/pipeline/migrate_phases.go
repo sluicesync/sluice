@@ -442,6 +442,16 @@ func (m *Migrator) phasePreflightTarget(ctx context.Context, rc resumeContext, s
 		return markFailed(ctx, rc, state, ir.MigrationPhasePending, err)
 	}
 
+	// Shard-placement preflight. Refuses a sharded target whose ROUTING and
+	// row PLACEMENT disagree — a state in which the target's PRIMARY KEY is
+	// not globally enforced, so every idempotent upsert sluice makes would
+	// INSERT a duplicate rather than update. Silent and cumulative, hence a
+	// refusal. No-op on any target that is not a sharded Neki, and on empty
+	// tables (which cannot be mis-placed). See migcore.PreflightShardPlacement.
+	if err := migcore.PreflightShardPlacement(ctx, schema, rw); err != nil {
+		return markFailed(ctx, rc, state, ir.MigrationPhasePending, err)
+	}
+
 	// PlanetScale-Postgres ownership advisory (soak finding F10). Advisory-
 	// only (WARN, never a refusal): if the target connects as an ephemeral
 	// pscale_api_* role, every created table is owned by it — a recoverable

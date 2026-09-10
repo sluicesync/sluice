@@ -433,6 +433,25 @@ const (
 	// leaves a pre-existing constraint enforcing.
 	CodeTargetPreexistingForeignKey Code = "SLUICE-E-TARGET-PREEXISTING-FOREIGN-KEY"
 
+	// CodeTargetShardPlacementMismatch fires when a sharded target's
+	// ROUTING and its row PLACEMENT disagree — a state in which the
+	// target's PRIMARY KEY is not globally enforced, so sluice's
+	// idempotent upsert would INSERT duplicates instead of updating.
+	//
+	// Measured on PlanetScale Neki 2026-09-10. Assigning an already-
+	// populated table to a different shard group changes which shard a
+	// keyed query routes to, but does NOT move the rows; the supported
+	// path (a reshard workflow) does both. In the split state a scattering
+	// read returns every row while an equality-routed read returns zero,
+	// and `INSERT … ON CONFLICT (pk) DO UPDATE` looks for its conflict on
+	// the routed shard, does not find the original, and inserts alongside
+	// it. Nothing errors at any point.
+	//
+	// Refused rather than warned because the harm is silent and
+	// cumulative: sluice's CDC applier and its idempotent bulk-copy writer
+	// both use that statement, so every replayed change would add a row.
+	CodeTargetShardPlacementMismatch Code = "SLUICE-E-TARGET-SHARD-PLACEMENT-MISMATCH"
+
 	// CodeTargetDeferrableKey fires when a target table's only usable
 	// upsert key is a DEFERRABLE unique constraint. Postgres refuses a
 	// non-immediate index as an `ON CONFLICT` arbiter (SQLSTATE 55000),
@@ -748,7 +767,8 @@ var registry = map[Code]Info{
 
 	CodeTargetTableShapeMismatch: {ClassRefusal, "migrate refused before any data moved: a target table with the same name already exists but its column shape (names/types/nullability) differs from what the migration would create — proceeding would fail mid-copy or land rows in the wrong columns"},
 
-	CodeTargetPreexistingForeignKey: {ClassRefusal, "migrate/sync cold-start refused before any data moved: the target already carries a foreign key on a table this run copies into, and that constraint's parent table is copied by the SAME run — the copy is not parent-first ordered, so a child row reaches the target before its parent and the constraint rejects it (MySQL Error 1452 / Postgres SQLSTATE 23503); sluice's deferred-constraint discipline only governs the constraints it creates itself"},
+	CodeTargetPreexistingForeignKey:  {ClassRefusal, "migrate/sync cold-start refused before any data moved: the target already carries a foreign key on a table this run copies into, and that constraint's parent table is copied by the SAME run — the copy is not parent-first ordered, so a child row reaches the target before its parent and the constraint rejects it (MySQL Error 1452 / Postgres SQLSTATE 23503); sluice's deferred-constraint discipline only governs the constraints it creates itself"},
+	CodeTargetShardPlacementMismatch: {ClassRefusal, "refused before any data moved: a sharded target table's ROUTING and row PLACEMENT disagree, so its PRIMARY KEY is not globally enforced and sluice's idempotent upsert would insert duplicate rows instead of updating — the table was almost certainly assigned to a shard group without a reshard workflow to move its rows"},
 
 	CodePSForeignKeysNotEnabled: {ClassRefusal, "migrate/sync cold-start refused before the copy: the PlanetScale target has foreign-key support disabled (allow_foreign_key_constraints off, read back as foreign_keys_enabled=false) while the source schema declares foreign keys the run would add after the copy — the platform rejects ADD FOREIGN KEY outright, so the run would fail at the constraints phase after the whole copy and --resume re-hits it; enable foreign key support on the target database, or re-run with --skip-foreign-keys (each FK's referencing columns stay indexed, so the constraints can be added out-of-band)"},
 
