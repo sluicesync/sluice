@@ -148,6 +148,54 @@ func TestSameCheckPredicate_OneServersOwnRenderingsStayComparable(t *testing.T) 
 			a:    "((pct >= 0) and (pct <= 100))",
 			b:    "pct >= 0 AND pct <= 100",
 		},
+
+		// THE SIX BELOW ARE VERBATIM FROM A RED CI RUN, and they are the
+		// reason isBinaryOperatorAt exists.
+		//
+		// The first cut of reassociatingGroups counted any group whose
+		// preceding byte was `-`, which catches `a-(b+c)` — the point —
+		// and ALSO catches a UNARY minus on a parenthesised literal,
+		// where the parentheses change nothing. MySQL renders a negative
+		// literal as `-(100000)` and PostgreSQL as `'-100000'::integer`,
+		// so the two sides counted differently and
+		// TestSchemaDiffAfterMigrate_MySQLToPostgres reported six CHECK
+		// mismatches against a target migrate had just created. That is
+		// Bug 241 — phantom drift on a clean target — reintroduced by the
+		// guard sitting on top of the fold that fixed it.
+		//
+		// Kept as real cross-engine renderings rather than reduced to a
+		// minimal `-(1)` pair, because the minimal pair is what I would
+		// have invented and these are what two servers actually emit.
+		{
+			name: "unary minus on a parenthesised literal, MySQL vs PG (ceiling)",
+			a:    "(ceiling(d) >= -(100000))",
+			b:    "(ceiling(d) >= ('-100000'::integer)::numeric)",
+		},
+		{
+			name: "unary minus on a parenthesised literal, MySQL vs PG (floor)",
+			a:    "(floor(d) >= -(100000))",
+			b:    "(floor(d) >= ('-100000'::integer)::numeric)",
+		},
+		{
+			name: "unary minus inside a multi-argument call",
+			a:    "(greatest(v,w) >= -(100000))",
+			b:    "(GREATEST(v, w) >= '-100000'::integer)",
+		},
+		{
+			name: "unary minus as a function argument",
+			a:    "(nullif(v,-(1)) is not null)",
+			b:    "(NULLIF(v, '-1'::integer) IS NOT NULL)",
+		},
+		{
+			name: "unary minus under a pg_catalog qualifier",
+			a:    "(pg_catalog.ROUND(d) >= -(100000))",
+			b:    "(round(d) >= ('-100000'::integer)::numeric)",
+		},
+		{
+			name: "unary minus with a double-precision cast",
+			a:    "(pg_catalog.ROUND(d2) >= -(100000))",
+			b:    "(round(d2) >= ('-100000'::integer)::double precision)",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if !sameCheckPredicate(tc.a, tc.b) {

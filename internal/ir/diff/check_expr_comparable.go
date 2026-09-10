@@ -184,11 +184,13 @@ func reassociatingGroups(expr string) string {
 			continue
 		}
 		if expr[i] == '(' {
-			switch prevNonSpaceByte(expr, i) {
-			case '-':
-				minus++
-			case '/':
-				div++
+			if op, at, ok := precedingOperator(expr, i); ok && isBinaryOperatorAt(expr, at) {
+				switch op {
+				case '-':
+					minus++
+				case '/':
+					div++
+				}
 			}
 		}
 		i++
@@ -196,15 +198,66 @@ func reassociatingGroups(expr string) string {
 	return strconv.Itoa(minus) + ":" + strconv.Itoa(div)
 }
 
-// prevNonSpaceByte returns the last non-whitespace byte before i, or 0
-// when i is at (or is preceded only by) the start of the expression.
-func prevNonSpaceByte(s string, i int) byte {
+// precedingOperator returns the last non-whitespace byte before i and its
+// index. ok is false when i is at, or preceded only by, the start of the
+// expression.
+func precedingOperator(s string, i int) (op byte, at int, ok bool) {
 	for j := i - 1; j >= 0; j-- {
 		switch s[j] {
 		case ' ', '\t', '\n', '\r':
 		default:
-			return s[j]
+			return s[j], j, true
 		}
 	}
-	return 0
+	return 0, 0, false
+}
+
+// isBinaryOperatorAt reports whether the operator at index at is BINARY
+// rather than unary, by asking whether anything that could end an operand
+// precedes it.
+//
+// # This is the fix for a real phantom-drift regression, so it is worth
+// # being precise about
+//
+// `reassociatingGroups` counts a group that re-associates its expression,
+// and the first cut keyed on "the byte before the `(` is a `-`". That
+// catches `a-(b+c)`, which is the point. It ALSO catches `-(100000)` —
+// and a unary minus applied to a parenthesised literal means exactly what
+// it means without the parentheses, so counting it is wrong.
+//
+// It was not hypothetical. `TestSchemaDiffAfterMigrate_MySQLToPostgres`
+// went red on CI with six CHECK mismatches against a target `migrate`
+// had just created, every one of the shape
+//
+//	expected  (ceiling(d) >= -(100000))
+//	actual    (ceiling(d) >= ('-100000'::integer)::numeric)
+//
+// where MySQL's rendering parenthesises the negative literal and
+// PostgreSQL's does not. One side counted a group, the other did not,
+// they disagreed, and the comparison reported drift on a clean target —
+// which is Bug 241, the exact defect the fold this guard sits on top of
+// was built to fix, reintroduced by the guard.
+//
+// So: an operator is binary only when something that can END an operand
+// sits before it — an identifier or number character, a closing
+// parenthesis or bracket, or a closing quote. After another operator, an
+// opening parenthesis, a comma, or the start of the expression, it is
+// unary and the group it precedes changes nothing.
+func isBinaryOperatorAt(s string, at int) bool {
+	prev, _, ok := precedingOperator(s, at)
+	if !ok {
+		return false // start of expression: unary
+	}
+	switch {
+	case prev >= 'a' && prev <= 'z', prev >= 'A' && prev <= 'Z', prev >= '0' && prev <= '9':
+		return true
+	case prev == '_' || prev == '$':
+		return true
+	case prev == ')' || prev == ']':
+		return true
+	case prev == '"' || prev == '`' || prev == '\'':
+		return true
+	default:
+		return false
+	}
 }
