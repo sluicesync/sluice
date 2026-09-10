@@ -371,9 +371,34 @@ func (e Engine) checkServerFlavor(ctx context.Context, db *sql.DB, cfg *mysql.Co
 
 // flavorVerdict is the decision itself, split out so the memo above
 // caches a verdict that was actually REACHED. reached=false means the
-// probe could not run (mariadb arm) — not an answer, and never cached,
-// so one transient read cannot make a wrong verdict sticky for the
+// probe could not run — not an answer, and never cached, so one
+// transient read cannot make a wrong verdict sticky for the life of the
+// process.
+//
+// # That property was true of ONE arm and claimed for both
+//
+// Caught by the pre-tag value-fidelity review, in this delta's own
+// Bug 280 change. The non-MariaDB arm used to end `return true, nil`
+// unconditionally, so a `SELECT VERSION()` that ERRORED reported a
+// reached verdict of nil and the memo cached it. Every later door then
+// short-circuited on that cache without probing, and
+// refuseVitessUnderNonVStreamFlavor — a SILENT-LOSS guard, because the
+// vanilla flavor's full scans run without `set workload=olap` and
+// Vitess truncates them at its OLTP row cap — never fired again for the
 // life of the process.
+//
+// It is a regression this delta introduced, not a pre-existing gap:
+// before the memo each door probed independently, so a transient at one
+// door was simply recovered by the next. Concretely, `migrate` against a
+// self-hosted vtgate whose `SELECT VERSION()` met a primary-routable
+// window at phase 1.75 would complete short, at exit 0, with the
+// refusal that exists for exactly that misconfiguration silently
+// disabled.
+//
+// `reached` is now `err == nil` on both arms, which is what
+// flavor_memo.go's "a probe that could not RUN is not a verdict and is
+// never cached" always claimed. Pinned by
+// TestFlavorVerdict_AFailedProbeIsNeverAVerdict.
 func (e Engine) flavorVerdict(version string, err error) (reached bool, verdict error) {
 	if e.Flavor != FlavorMariaDB {
 		if err == nil {
@@ -392,7 +417,11 @@ func (e Engine) flavorVerdict(version string, err error) (reached bool, verdict 
 			}
 			warnMariaDBUnderMySQLDriver(version)
 		}
-		return true, nil
+		// err != nil means the probe never produced a version, so there
+		// is no verdict to cache — see the header. The caller's posture
+		// for an unreachable probe is unchanged (it proceeds), but the
+		// NEXT door gets to ask again.
+		return err == nil, nil
 	}
 	if err != nil {
 		return false, fmt.Errorf("mariadb: probe server version: %w", err)

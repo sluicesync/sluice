@@ -20,7 +20,7 @@ Add a `sluice verify` command with three verification depths that an operator pi
 ```
 sluice verify --depth count      # fastest; just compare row counts per table
 sluice verify --depth sample     # default; compare row counts AND sampled-row content
-sluice verify --depth full       # slowest; compare every row's content hash
+sluice verify --depth full       # DESIGNED, NOT BUILT — the parser accepts only count,sample
 ```
 
 All three modes:
@@ -54,7 +54,7 @@ Cost: ~N rows per table × number-of-tables. For the default N=100 across 100 ta
 
 Tradeoff: sampling can miss a small number of bad rows. Coverage is statistical: with N=100 random samples per table, ~99% confidence of detecting a 5%+ corruption rate; ~50% confidence of detecting a single bad row in a million-row table. Operators wanting stronger guarantees use `--depth full`.
 
-### Mode 3: full content hash (`--depth full`)
+### Mode 3: full content hash (`--depth full`) — DESIGNED, NOT BUILT
 
 For each table:
 1. Run the count comparison (mode 1).
@@ -175,7 +175,7 @@ sample_rows=100  matched=98  mismatched=2  ✗
    pk=42 columns_differing=[updated_at]
    pk=187 columns_differing=[stock_count]
 
--- result: 1 table mismatched. Re-run with --depth=full for full-table verification.
+-- result: 1 table mismatched. (Illustrative: sluice emits no such hint, and --depth=full is refused by the parser.)
 ```
 
 JSON form preserves the same data with predictable field names; `VerifyResult` is the struct that drives both renderers.

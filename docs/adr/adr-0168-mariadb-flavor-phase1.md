@@ -28,7 +28,7 @@ Register `FlavorMariaDB` as engine name `mariadb` (supported floor: **MariaDB 10
 
 ### Guards
 
-- **Server-fingerprint guard** at `OpenSchemaReader`/`OpenSchemaWriter` (one `SELECT VERSION()`): the mariadb flavor **refuses** a non-MariaDB server (coded `SLUICE-E-DRIVER-HOST-MISMATCH` — the shim would actively mis-read MySQL conventions, e.g. a bare `abc` default classifies as an expression); the plain `mysql` flavor **WARNs** toward `--source-driver/--target-driver mariadb` when the server fingerprints as MariaDB (`-MariaDB` in VERSION()) — deliberately not a hard refusal; the loud `srs_id` wall still follows. Below the 10.11 floor: WARN, proceed.
+- **Server-fingerprint guard** at every connection-opening door — schema reader and writer, row reader and writer, migration-state store and change applier — memoised per (server, flavor) so it costs one `SELECT VERSION()` per server per run (widened from the two schema doors by Bug 280): the mariadb flavor **refuses** a non-MariaDB server (coded `SLUICE-E-DRIVER-HOST-MISMATCH` — the shim would actively mis-read MySQL conventions, e.g. a bare `abc` default classifies as an expression); the plain `mysql` flavor **WARNs** toward `--source-driver/--target-driver mariadb` when the server fingerprints as MariaDB (`-MariaDB` in VERSION()) — deliberately not a hard refusal; the loud `srs_id` wall still follows. Below the 10.11 floor: WARN, proceed.
 - **Invisible-object census**: MariaDB reports `SEQUENCE` and `SYSTEM VERSIONED` as distinct table_types the `BASE TABLE` filter silently misses (the Bug-100/INHERITS silent-loss class). The mariadb reader censuses both and refuses loudly naming every object; Phase 2 carries them.
 
 ## Alternatives considered

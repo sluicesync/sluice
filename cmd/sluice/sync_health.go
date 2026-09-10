@@ -348,6 +348,28 @@ func probeSource(ctx context.Context, result *HealthResult, cfg *SyncHealthCmd, 
 		return
 	}
 	if !statsOK {
+		// "No signal" is not "no spill", and until now the two were
+		// indistinguishable here: this branch returned leaving both
+		// pointers nil and no reason, which reads exactly like a healthy
+		// slot that has not spilled. The docs promise the fields are
+		// omitted "so a careless reader can't mistake 'we can't tell' for
+		// 'definitely no spill'" — omitting them is only half of keeping
+		// that promise, and the diagnose bundle got the other half in the
+		// same pass this branch did not (audit 2026-09-09 A0909-AQ-M-1's
+		// sibling, found by the pre-tag docs-drift sweep).
+		//
+		// The reason names the slot, because the likeliest cause of an
+		// absent row is a slot name that does not exist on this source —
+		// which is the very defect A0909-AQ-M-1 was, and which an
+		// operator can only diagnose if the name sluice looked for is
+		// printed. PG < 14 has no pg_stat_replication_slots at all, and a
+		// slot that exists but has never decoded also lands here, so the
+		// wording covers all three rather than asserting one.
+		result.SourceProbeReason = fmt.Sprintf(
+			"slot-spill-stats: no row for replication slot %q — the slot does not exist on this source, "+
+				"it has not decoded anything yet, or the server predates pg_stat_replication_slots (PG 14). "+
+				"Spill counters are omitted rather than reported as zero", slot,
+		)
 		return
 	}
 	txns := stats.SpillTxns

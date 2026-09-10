@@ -11,14 +11,14 @@ A 10-minute walkthrough that migrates a real ~30 MB dataset between MySQL and Po
 
 ## Prerequisites
 
-- **Go 1.25+** (for `go install`).
+- **Go 1.26.7+** (for `go install`) — the version in `go.mod`'s `go` directive.
 - **Docker** + **Docker Compose**.
 - About 5 minutes for the first-run sakila download.
 
 ## 1. Install sluice
 
 ```sh
-$ go install github.com/sluicesync/sluice/cmd/sluice@latest
+$ go install sluicesync.dev/sluice/cmd/sluice@latest
 
 $ sluice --version
 sluice version v0.x.x

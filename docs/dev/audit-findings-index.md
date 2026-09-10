@@ -114,6 +114,11 @@ testing-ci, `PDD` perf-deps-devex-docs.
 - VF0909B-3 filed
 - VF0909B-2 filed
 - VF0909B-1 filed
+- VF0909C-1 filed
+- VF0909C-2 filed
+- VF0909C-3 filed
+- VF0909C-4 filed
+- VF0909C-5 filed
 
 ### silent-loss-mysql
 

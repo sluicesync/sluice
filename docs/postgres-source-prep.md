@@ -93,7 +93,9 @@ Both counters are **cumulative since slot creation** — they accumulate over th
 - The slot has never been used for decoding yet (no row in the view).
 - The source engine isn't Postgres (MySQL has no analogue — binlog decoding doesn't spool the same way).
 
-Sluice deliberately omits the fields rather than emitting `0` in these "no signal" cases, so a careless reader can't mistake "we can't tell" for "definitely no spill."
+- The slot name being probed does not exist on the source — most often because `--slot-name` was passed without its `sluice_` prefix. Fixed in v0.148.3: `sync health` and the `diagnose` bundle now resolve the flag exactly as `sync start` does, so they look up the slot your stream actually created.
+
+Sluice deliberately omits the fields rather than emitting `0` in these "no signal" cases, so a careless reader can't mistake "we can't tell" for "definitely no spill." **Since v0.148.3 it also says WHY**, which is the half that was missing: `sync health` sets `source_probe_reason` naming the slot it looked for, and the `diagnose` bundle records `spill_reason`. Before that the fields were simply absent, so a slot name that did not exist read exactly like a healthy slot that had not spilled.
 
 **Operator action when these grow:**
 
