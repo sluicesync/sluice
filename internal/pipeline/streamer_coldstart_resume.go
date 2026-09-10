@@ -45,6 +45,18 @@
 //     earlier branches of the dispatch switch and never reach this
 //     gate: an operator who asked for a fresh copy gets one.
 //
+// # One phase the filing named that does not exist here
+//
+// A0909-STOP-1 lists the post-copy FLOAT exact re-read among the phases
+// a resume must finish, "because the copy path's floats are
+// display-rounded". On a PostgreSQL source that phase never runs at
+// all: [Streamer.repairColdStartFloats] is gated on the snapshot reader
+// implementing [ir.LossyFloatCopyReader], which only the VStream COPY
+// and mydumper readers do. So there is nothing for the ladder below to
+// finish, and this is a capability claim rather than an assumption —
+// postgres.TestPostgresSnapshotRowsDoNotDisplayRoundFloats fails if
+// that engine's reader ever starts rounding.
+//
 // # Why the phase cannot be the proof (a correction to the filing,
 // MEASURED)
 //
