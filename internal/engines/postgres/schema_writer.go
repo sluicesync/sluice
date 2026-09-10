@@ -341,7 +341,7 @@ func (w *SchemaWriter) CreateTablesWithoutConstraints(ctx context.Context, s *ir
 			return err
 		}
 		if err := execEmittedDDL(ctx, w.db, stmt); err != nil {
-			return fmt.Errorf("postgres: create table %q: %w", table.Name, err)
+			return annotateMissingOpclass(fmt.Errorf("postgres: create table %q: %w", table.Name, err), fmt.Sprintf("creating table %q", table.Name))
 		}
 	}
 
@@ -727,7 +727,7 @@ func (w *SchemaWriter) buildOneIndex(ctx context.Context, conn *sql.Conn, job in
 	// pool / overlap BuildTableIndexesFromChannel), so one wrap covers them all.
 	return retryOnCatalogRace(ctx, func() error {
 		if err := indexStmtExec(ctx, conn, stmt); err != nil {
-			return fmt.Errorf("postgres: create index %q on %q: %w", job.idx.Name, job.tableName, err)
+			return annotateMissingOpclass(fmt.Errorf("postgres: create index %q on %q: %w", job.idx.Name, job.tableName, err), fmt.Sprintf("creating index %q on %q", job.idx.Name, job.tableName))
 		}
 		return nil
 	})

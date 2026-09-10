@@ -183,6 +183,16 @@ Everything here is a **loud refusal with an error code**, chosen over degrading,
 
 - **`SLUICE-E-TARGET-SHARD-PLACEMENT-MISMATCH`** — a table whose routing and physical row placement disagree, which happens if the data topology was written directly for a table that already held rows instead of using a reshard workflow. The primary key is not globally enforced in that state.
 
+### Extensions, and a constraint guarantee that changes when you shard
+
+**Extensions work.** `btree_gist` (1.8), `btree_gin` (1.3), `pgcrypto` (1.4) and `postgis` (3.6.4) are all available, and `CREATE EXTENSION` succeeds on an unsharded and a sharded database alike. Measured with the shape `btree_gist` exists for: `EXCLUDE USING gist (room WITH =, during WITH &&)` plus a mixed `CREATE INDEX … USING gist (tenant_id, during)` — both create, and the exclusion constraint enforces. sluice carries all of it across (constraint, index, rows), and the constraint still enforces on the target afterwards.
+
+sluice does **not** install extensions — that is the contain-Postgres-complexity tenet. If the target lacks one an index or `EXCLUDE` constraint needs, it refuses with `SLUICE-E-SCHEMA-EXTENSION-NOT-ENABLED` and the exact command to run. Install the extensions your schema uses on the Neki target before migrating.
+
+**The part to plan around: on a sharded database, a `PRIMARY KEY`, `UNIQUE` or `EXCLUDE` constraint is enforced only WITHIN a shard unless its columns contain the shard key.** Measured on a 3-shard cluster: a table with `email text NOT NULL UNIQUE` accepted two rows with the same email, because they routed to different shards. The duplicate insert inside one shard was refused with `23505`; the one across shards was not, and nothing warned.
+
+This is inherent to distributed storage — Vitess and Citus behave the same way — but Neki accepts the constraint declaration silently, so a schema ported from PostgreSQL keeps every constraint on paper and loses the guarantee in fact. If your application relies on a `UNIQUE` or `EXCLUDE` that does not include the shard key, that reliance does not survive sharding. It is unaffected on an **unsharded** Neki database, which is where a migration lands by default. See `neki-issues/NEKI-012` for the measurements.
+
 A note that matters for anyone reading PlanetScale's docs: the shard-key restriction applies to a shard group with **one** shard exactly as it does to a split one. "Sharded" in the platform's phrasing does two jobs — a single-shard group is exempt from the *duplication* hazard above, but not from the restriction on naming the shard key in a `SET` list.
 
 ### Neki cannot be a continuous-sync source
