@@ -224,7 +224,8 @@ func (e Engine) OpenSchemaWriter(ctx context.Context, dsn string) (ir.SchemaWrit
 		_ = db.Close()
 		return nil, err
 	}
-	return &SchemaWriter{db: db, schema: cfg.schema, hasPostGIS: hasGIS}, nil
+	isNekiSW, _ := probeIsNeki(ctx, cfg.serverKey(), db)
+	return &SchemaWriter{db: db, schema: cfg.schema, hasPostGIS: hasGIS, isNeki: isNekiSW}, nil
 }
 
 // OpenRowReader returns a [RowReader] bound to the database identified

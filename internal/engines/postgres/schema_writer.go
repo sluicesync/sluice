@@ -36,6 +36,11 @@ import (
 type SchemaWriter struct {
 	db     *sql.DB
 	schema string
+	// isNeki records that this writer's target is a PlanetScale Neki router,
+	// probed once per server at open (neki_probe.go). It gates ONE thing:
+	// whether standalone-sequence creation may use a transaction. See
+	// [SchemaWriter.createAndPrimeSequence].
+	isNeki bool
 	// hasPostGIS is set at engine open time via detectPostGIS. When
 	// true, ir.Geometry columns emit as `geometry(<subtype>, <srid>)`;
 	// when false, they're rejected with a clear "install postgis"

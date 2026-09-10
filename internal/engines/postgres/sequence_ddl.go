@@ -90,16 +90,57 @@ func (w *SchemaWriter) ReprimeSequences(ctx context.Context, s *ir.Schema) error
 // (LastValueValid=false, the zero value) create unprimed and start
 // fresh at Start.
 func (w *SchemaWriter) createAndPrimeSequence(ctx context.Context, seq *ir.Sequence) error {
+	stmt, err := emitCreateSequence(w.schema, seq)
+	if err != nil {
+		return err
+	}
+
+	// A PlanetScale Neki target cannot run this pair in a transaction, and
+	// the failure is total rather than degraded.
+	//
+	// Measured 2026-09-10 on a live cluster: DDL issued inside an explicit
+	// transaction is NOT VISIBLE to later statements in that same
+	// transaction, and the DDL itself does not survive the commit.
+	//
+	//	BEGIN; CREATE SEQUENCE s …; SELECT setval('s', 7, true); COMMIT;
+	//	  -> ERROR: relation "s" does not exist (SQLSTATE 42P01)
+	//	  -> and afterwards, s does not exist
+	//
+	//	CREATE SEQUENCE s …;  SELECT setval('s', 7, true);   -- no BEGIN
+	//	  -> works
+	//
+	// It is not specific to sequences: `BEGIN; CREATE TABLE t …; INSERT
+	// INTO t …; COMMIT;` fails the same way, which is worth knowing because
+	// that is what every schema-migration framework emits. See
+	// neki-issues/NEKI-013.
+	//
+	// So on Neki the two statements run in autocommit. That gives up the
+	// atomicity this function was built for (delta review finding #1) —
+	// and the reason that is acceptable is written into createSequences
+	// already: the exists-path is a FORWARD-ONLY re-prime that explicitly
+	// heals "the crashed-before-prime window and the pre-created-unprimed
+	// shape". The transaction was belt-and-braces over a hazard that is
+	// separately covered, not the only thing standing between us and it.
+	// A crash between these two statements on Neki therefore costs a
+	// re-run, not a silently unprimed sequence.
+	if w.isNeki {
+		if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("postgres: create sequence %q: %w", seq.Name, err)
+		}
+		if seq.LastValueValid {
+			if err := w.setvalSequence(ctx, w.db, seq, seq.LastValue, seq.LastValueIsCalled); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
 	tx, err := w.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("postgres: begin create-sequence tx for %q: %w", seq.Name, err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	stmt, err := emitCreateSequence(w.schema, seq)
-	if err != nil {
-		return err
-	}
 	if _, err := tx.ExecContext(ctx, stmt); err != nil {
 		return fmt.Errorf("postgres: create sequence %q: %w", seq.Name, err)
 	}
