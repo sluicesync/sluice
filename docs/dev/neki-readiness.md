@@ -114,6 +114,26 @@ Two things generalise beyond Neki:
 - **A best-effort write becomes a correctness problem the moment something reads its ABSENCE as information.** The four breadcrumb sites now refuse; every later write for the same table stays best-effort deliberately, because losing one of those degrades to re-copying work the resume path already handles. The split is enforced by `TestProgressBreadcrumbsDoNotRideTheBestEffortHelper`, an AST walker that derives its own universe and requires every remaining best-effort call to carry a terminal entry.
 - **A store that fails SYSTEMATICALLY is a different hazard from one that fails transiently**, and sluice's tolerance was tuned for the transient kind. Neki is the first systematic one we have met; a revoked `GRANT` or a dropped control table is the same shape on any engine.
 
+### Tier C, second pass — the router's OTHER row path, and it is CLEAN
+
+The first Tier-C pass (below) went through `pg_dump | psql`, which is COPY text on a pass-through path. PlanetScale's ["lifecycle of a sharded Postgres query"](https://planetscale.com/blog/the-lifecycle-of-a-sharded-postgres-query) says the router is a real execution engine — hash joins, `AVG` rewritten to `SUM`/`COUNT`, spill-to-disk — and that copying encoded bytes straight through is an *optimisation*, i.e. one of two paths. Under this project's own family-dispatch rule that made the first pass a pinned representative standing in for an untested sibling: the Bug 74 shape exactly.
+
+Measured. A 28-column fixture (every value family × {scalar, 1-D, 2-D, NULL-element}, plus `-0`, `NaN`, `±Infinity`, float8 max and min-normal, `numeric NaN`, `int8` at both bounds, astral/combining/ZWJ/control-byte text, `4713 BC` and `294276 AD` timestamps) across 12 rows landing on **two different shards**, read nine ways and compared on **raw wire bytes plus per-field format code** against a shard-pinned read:
+
+| read shape | plan (`EXPLAIN (NEKI_PLAN)`) | verdict |
+|---|---|---|
+| scatter + `ORDER BY id` — **the shape sluice's batched reader emits** | `Sort [Merge]` over `Route [Scatter]` | byte-identical |
+| scatter + `ORDER BY c_text` | `Sort [Merge]` | byte-identical |
+| self-join on a non-shard-key column | `Join [Hash]`, `RemoteCalls: 4` | byte-identical |
+| `LEFT JOIN` on a text column | `Join [Hash]`, `JoinType: Left` | byte-identical |
+| `GROUP BY` every column / `DISTINCT` / `IN (subquery)` / `UNION ALL` / `OFFSET…LIMIT` | router-side | byte-identical |
+
+Anti-vacuity: the join plans confirm a real router-level hash join over scattered inputs, and the pushed-down probe query carries the wide value columns (`SELECT a.c_int8, a.c_float8, a.c_numeric, a.c_tstz, a.c_txt_arr2d, a.id`), so the values did pass through the router's row machinery. Row residency was confirmed by counting through each shard-pinned connection (0 / 5 / 7).
+
+**The sibling is closed: sluice's read path is byte-clean through the router's compute path, not just its pass-through path.**
+
+What the same probe DID find is `neki-issues/NEKI-010` — the router's own *arithmetic* diverges from PostgreSQL's. `avg(double precision)` returns a number where the shard's own PostgreSQL raises SQLSTATE 22003, and `sqrt`/`power` on `numeric` return a value PostgreSQL reports as **not equal** to its own (`power(2::numeric,0.5)` → `1.41421356237309504` at the router, `1.4142135623730950` on both stock PG 16.15 and the shard's PG 18.6). sluice's copy path never asks the router to do arithmetic, so this is not a sluice exposure — it is recorded because it is a measured counter-example to "SQL support behaves the way Postgres does", and because anything we ever add that pushes an expression down inherits it.
+
 ### Neki as a SOURCE — works cross-engine, BLOCKED same-engine
 
 | direction | lane | result |
