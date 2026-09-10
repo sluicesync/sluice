@@ -50,6 +50,27 @@ func anchorLSN(t *testing.T, pos ir.Position) string {
 	return decoded.LSN
 }
 
+// assertIdentityPinStamped requires a snapshot position token to carry
+// the source's system identifier and timeline, and requires them to be
+// the ones this server reports rather than merely present.
+func assertIdentityPinStamped(t *testing.T, token string) {
+	t.Helper()
+	var decoded struct {
+		SystemID string `json:"systemid"`
+		Timeline int32  `json:"timeline"`
+	}
+	if err := json.Unmarshal([]byte(token), &decoded); err != nil {
+		t.Fatalf("decode position token %q: %v", token, err)
+	}
+	if decoded.SystemID == "" {
+		t.Fatalf("the snapshot position carries NO systemid (%q), so a resume from it installs the identity "+
+			"pin from whatever answers the DSN and cannot refuse a replaced source", token)
+	}
+	if decoded.Timeline == 0 {
+		t.Errorf("the snapshot position carries timeline 0 (%q); a real IDENTIFY_SYSTEM reports 1 or more", token)
+	}
+}
+
 func slotLSNs(t *testing.T, dsn, slot string) (restart, confirmed string, active bool) {
 	t.Helper()
 	db, err := sql.Open("pgx", dsn)
@@ -108,6 +129,16 @@ func TestSnapshotAnchor_UnconsumedSlotHoldsTheConsistentPoint(t *testing.T) {
 		t.Fatalf("open snapshot stream: %v", err)
 	}
 	defer func() { _ = stream.Close() }()
+
+	// The ADR-0051 identity pin must be STAMPED at slot creation, not
+	// installed lazily on first stream (A0909-STOP-1 C-3). A resume is a
+	// first stream, so a token without the pin compares against nothing
+	// and accepts a clone, a restored backup or a promoted standby. The
+	// stamp is best-effort in production (a failed IDENTIFY_SYSTEM WARNs
+	// and carries on), which is exactly why it needs an assertion here:
+	// without one, a stamp that silently stopped working would leave
+	// every other test in this file green.
+	assertIdentityPinStamped(t, stream.Position.Token)
 
 	consistentPoint := anchorLSN(t, stream.Position)
 	restart, confirmed, active := slotLSNs(t, dsn, slot)
