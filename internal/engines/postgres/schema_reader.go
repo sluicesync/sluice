@@ -1605,26 +1605,23 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 			-- (pg_depend deptype 'e')? An extension-owned AM that is
 			-- NOT one of the ADR-0032 catalogued ones is carried
 			-- verbatim under the verbatim tier.
-			EXISTS (
-				SELECT 1 FROM pg_depend d
-				WHERE  d.classid = 'pg_am'::regclass
-				  AND  d.objid   = am.oid
-				  AND  d.deptype = 'e'
-			) AS am_ext_owned,
+			-- Both extension-ownership flags come from a LEFT JOIN against
+			-- a DISTINCT pg_depend derived table (below), not a correlated
+			-- EXISTS in this SELECT list: a sharded PlanetScale Neki router
+			-- does not implement that shape (measured 2026-09-10; the
+			-- boundary and the misleading error text are in
+			-- neki-issues/NEKI-008). The DISTINCT is load-bearing --
+			-- pg_depend can hold several rows per objid and a bare join
+			-- would multiply index-column rows. The flags stay boolean and
+			-- never NULL, as EXISTS did.
+			(amdep.objid IS NOT NULL) AS am_ext_owned,
 			-- ADR-0047 / Bug 47 invariant: an opclass is carried
 			-- verbatim ONLY when it is genuinely extension-owned
 			-- (pg_depend deptype 'e'). Core / default opclasses stay
 			-- unpopulated so a non-empty OperatorClass remains an
 			-- honest "extension-owned" marker the cross-engine refusal
 			-- keys on.
-			COALESCE((
-				SELECT EXISTS (
-					SELECT 1 FROM pg_depend d
-					WHERE  d.classid = 'pg_opclass'::regclass
-					  AND  d.objid   = opc.oid
-					  AND  d.deptype = 'e'
-				)
-			), false) AS opclass_ext_owned
+			(opcdep.objid IS NOT NULL) AS opclass_ext_owned
 		FROM   pg_index ix
 		JOIN   pg_class      cl ON cl.oid = ix.indrelid
 		JOIN   pg_class      i  ON i.oid  = ix.indexrelid
@@ -1635,6 +1632,12 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 		LEFT JOIN LATERAL pg_catalog.unnest(ix.indoption) WITH ORDINALITY AS uo(opt, ord) ON uo.ord = u.ord
 		LEFT JOIN pg_attribute a   ON a.attrelid = ix.indrelid AND a.attnum = u.attnum
 		LEFT JOIN pg_opclass   opc ON opc.oid    = uc.opcoid
+		LEFT JOIN (SELECT DISTINCT objid FROM pg_depend
+		           WHERE classid = 'pg_am'::regclass AND deptype = 'e') amdep
+		       ON amdep.objid = am.oid
+		LEFT JOIN (SELECT DISTINCT objid FROM pg_depend
+		           WHERE classid = 'pg_opclass'::regclass AND deptype = 'e') opcdep
+		       ON opcdep.objid = opc.oid
 		-- contype IN ('u','p'): the attribute columns below must see a PRIMARY
 		-- KEY as well as a UNIQUE constraint. Restricting the join to 'u' made
 		-- condeferrable unreadable for a PK, so a DEFERRABLE PRIMARY KEY was
@@ -2544,17 +2547,30 @@ func (r *SchemaReader) populateComments(ctx context.Context, tables map[string]*
 		return err
 	}
 
+	// pg_description is joined directly rather than going through
+	// pg_catalog.col_description(). The convenience function is exactly this
+	// lookup -- the comment on (objoid, objsubid) classed to pg_class -- so
+	// the two are equivalent, and the join form additionally drops the second
+	// evaluation the WHERE clause needed to filter NULLs.
+	//
+	// A PlanetScale Neki router does not implement col_description
+	// ("opcode not implemented: col_description_system_functions"), which
+	// made this one of two catalog reads that failed against a SHARDED Neki
+	// database (neki-issues/NEKI-008). Equivalence was verified rather than
+	// assumed: on real PostgreSQL with two column comments planted, the old
+	// and new forms return identical rows.
 	const colQ = `
-		SELECT cl.relname, a.attname,
-		       pg_catalog.col_description(cl.oid, a.attnum)
-		FROM   pg_class      cl
-		JOIN   pg_namespace  n ON n.oid = cl.relnamespace
-		JOIN   pg_attribute  a ON a.attrelid = cl.oid
+		SELECT cl.relname, a.attname, d.description
+		FROM   pg_class       cl
+		JOIN   pg_namespace   n ON n.oid = cl.relnamespace
+		JOIN   pg_attribute   a ON a.attrelid = cl.oid
+		JOIN   pg_description d ON d.objoid   = cl.oid
+		                       AND d.objsubid = a.attnum
+		                       AND d.classoid = 'pg_class'::regclass
 		WHERE  n.nspname  = $1
 		  AND  cl.relkind = 'r'
 		  AND  a.attnum   > 0
-		  AND  NOT a.attisdropped
-		  AND  pg_catalog.col_description(cl.oid, a.attnum) IS NOT NULL`
+		  AND  NOT a.attisdropped`
 
 	crows, err := r.catalogQuery(ctx, colQ, r.schema)
 	if err != nil {
