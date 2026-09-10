@@ -388,6 +388,60 @@ func TestStreamer_ColdStartResume_PG_RefusesWithoutProof(t *testing.T) {
 	})
 }
 
+// TestStreamer_ColdStartResume_PG_AdvisoryShapeChangeStillResumes is
+// the other half of the copy-shape policy: a difference that reaches
+// the target as DDL rather than as rows must WARN and carry on, not
+// refuse.
+//
+// Refusing here would be the wrong trade in a sympathetic case — an
+// operator who Ctrl-Cs a slow foreign-key validation and re-runs with
+// --skip-foreign-keys would be told to re-copy the whole database to
+// fix a constraint. The pin requires the resume to happen AND the
+// warning to name what stays.
+func TestStreamer_ColdStartResume_PG_AdvisoryShapeChangeStillResumes(t *testing.T) {
+	st := stopColdStartInIndexBuild(t, "coldstart-resume-advisory")
+	base := st.newRun
+	st.newRun = func() *Streamer {
+		s := base()
+		s.SkipForeignKeys = true
+		return s
+	}
+	applyDDL(t, st.src, `INSERT INTO resume_t (id, v) VALUES (3001, 3001);`)
+
+	logs := captureSlog(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() { errCh <- st.newRun().Run(ctx) }()
+
+	if !waitForExactRowCount(st.tgt, "resume_t", resumeFixtureRows+1, 3*time.Minute) {
+		select {
+		case err := <-errCh:
+			t.Fatalf("a --skip-foreign-keys difference REFUSED the resume (%v); it shapes the constraints "+
+				"phase the resume re-runs, not the rows, so it must warn and carry on\nlogs:\n%s",
+				err, logs.String())
+		default:
+			t.Fatalf("the resumed stream never caught up (target has %d)\nlogs:\n%s",
+				pollRowCount(st.tgt, "resume_t"), logs.String())
+		}
+	}
+	got := logs.String()
+	if !strings.Contains(got, coldStartResumedMarker) {
+		t.Errorf("the run did not announce %s:\n%s", coldStartResumedMarker, got)
+	}
+	if !strings.Contains(got, coldStartShapeChangedMarker) || !strings.Contains(got, "skip_fks") {
+		t.Errorf("the advisory difference was not reported (want %s naming skip_fks); an operator would have "+
+			"no way to learn that foreign keys the stopped run created are still there:\n%s",
+			coldStartShapeChangedMarker, got)
+	}
+	cancel()
+	select {
+	case <-errCh:
+	case <-time.After(60 * time.Second):
+		t.Error("the resumed Run did not return after ctx cancel")
+	}
+}
+
 // TestStreamer_ColdStartResume_PG_RefusesWhenTheSlotMoved is the
 // silent-loss negative and the one the gate exists for: something
 // consumed the slot between the stop and the re-run, so the changes

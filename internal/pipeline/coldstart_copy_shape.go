@@ -71,15 +71,43 @@ import (
 //	shard         — InjectShardColumn:     an extra column + its value
 //	target_schema — TargetSchema:          WHERE the rows were written
 //
-// DELIBERATELY NOT COVERED, each with its reason:
+// ADVISORY — recorded and compared, but a difference WARNS instead of
+// refusing (see [copyShapeAdvisory]):
 //
-//   - --skip-foreign-keys, ViewFilter/--skip-views: these shape the
-//     CONSTRAINTS and VIEWS phases, which the resume RE-RUNS with run
-//     2's settings. No copied row depends on them, and both phases run
-//     after the copy — so in the window this resume exists for they had
-//     not run at all. Residual, stated: a stop that landed in the VIEWS
-//     phase can leave behind a view run 2's narrower filter would not
-//     create; that is an extra view, not a missing or wrong row.
+//	skip_fks — --skip-foreign-keys
+//	views    — the effective view set (ViewFilter / --skip-views)
+//
+// The reason these are not refusals, and the precise limit of that
+// reason, which was worth tracing rather than asserting: both shape the
+// CONSTRAINTS and VIEWS phases, and the resume RE-RUNS those phases
+// under run 2's settings — so in the window this resume was built for
+// (a stop during the copy+index phase, which is where a stop actually
+// lands) run 2's intent is applied in full and nothing diverges. That
+// argument holds ONLY for that window. The phase gate also admits
+// `constraints`, `views` and `complete`, and there run 1's constraint
+// or view phase has already run in part or whole:
+//
+//   - run 1 without --skip-foreign-keys stopped at/after `constraints`
+//     has already CREATED some foreign keys. A run 2 that adds the flag
+//     creates no more — and cannot remove the ones already there. The
+//     operator asked for no FKs and the target holds some.
+//   - the mirror: run 1 WITH the flag synthesised backing indexes for
+//     the skipped FKs; a run 2 without it leaves those indexes in
+//     place, and creates the FKs on top.
+//   - a stop inside the VIEWS phase can leave a view run 2's narrower
+//     filter would not create.
+//
+// None of that is a lost or altered ROW — no copied row depends on
+// either flag — so refusing would cost a full re-copy to fix a
+// difference in DDL the operator can see and change with one
+// statement, and would do it in the sympathetic case where someone
+// Ctrl-Cs a slow FK validation and re-runs with --skip-foreign-keys.
+// So the resume proceeds and SAYS what the target now holds. That is a
+// deliberate trade, not an oversight, and it is why these keys are
+// recorded at all: an uncompared flag could not even be reported.
+//
+// NOT RECORDED, each with its reason:
+//
 //   - --upfront-indexes, --analyze-after, and every parallelism /
 //     buffer / fan-out knob: performance only. The resume builds the
 //     indexes itself, under run 2's settings.
@@ -92,7 +120,7 @@ import (
 //     whether the rows are there rather than trusting a fingerprint.
 //
 // TestColdStartCopyShape_EveryAspectDrifts holds that list to the code:
-// it changes each covered input and requires exactly its key to drift.
+// it changes each recorded input and requires exactly its key to drift.
 //
 // Every aspect emits a value even when the flag is unset, because
 // "unset" and "set" must hash differently in BOTH directions — the
@@ -112,6 +140,8 @@ func coldStartCopyShape(s *Streamer, schema *ir.Schema) string {
 		{"redact", copyShapeRedactHash(s)},
 		{"shard", copyShapeShardHash(s.InjectShardColumn)},
 		{"target_schema", copyShapeTokenHash(s.TargetSchema)},
+		{"skip_fks", copyShapeTokenHash(fmt.Sprint(s.SkipForeignKeys))},
+		{"views", copyShapeViewSetHash(schema)},
 	}
 	sort.Slice(pairs, func(i, j int) bool { return pairs[i][0] < pairs[j][0] })
 	parts := make([]string, 0, len(pairs))
@@ -151,6 +181,48 @@ func copyShapeDrift(recorded, current string) []string {
 		}
 	}
 	return drifted
+}
+
+// copyShapeAdvisory splits drifted keys into the ones that REFUSE the
+// resume and the ones that only WARN.
+//
+// The split is a policy, so it is a value rather than a condition
+// scattered through the caller: a key refuses when a difference means
+// the target holds ROWS the current flags do not describe, and warns
+// when it means the target holds DDL the current flags do not describe.
+// The second is visible, fixable with one statement, and cannot be
+// backfilled-or-not by CDC either way; refusing it would cost a full
+// re-copy to correct a constraint.
+//
+// A key that is neither — which today cannot happen, since the split
+// covers every key coldStartCopyShape emits — is treated as REFUSING.
+// That is the safe direction for a key someone adds without deciding.
+func copyShapeAdvisory(drifted []string) (refusing, advisory []string) {
+	for _, k := range drifted {
+		switch k {
+		case "skip_fks", "views":
+			advisory = append(advisory, k)
+		default:
+			refusing = append(refusing, k)
+		}
+	}
+	return refusing, advisory
+}
+
+// copyShapeViewSetHash hashes the effective view set, the same way the
+// table set is hashed: the schema's views are already filtered by the
+// time the fingerprint is taken, so this compares what would actually
+// be created rather than the filter's spelling.
+func copyShapeViewSetHash(schema *ir.Schema) string {
+	if schema == nil {
+		return copyShapeTokenHash("")
+	}
+	names := make([]string, 0, len(schema.Views))
+	for _, v := range schema.Views {
+		names = append(names, v.Schema+"."+v.Name)
+	}
+	sort.Strings(names)
+	return copyShapeTokenHash(names...)
 }
 
 // copyShapePlural renders "input" / "inputs" for the drift refusal, so

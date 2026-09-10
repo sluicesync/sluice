@@ -245,7 +245,8 @@ func (s *Streamer) resumeStoppedColdStart(
 			slog.String("stream_id", streamID))
 		return nil, nil, false, nil
 	}
-	if drifted := copyShapeDrift(state.CopyShape, current); len(drifted) > 0 {
+	refusing, advisory := copyShapeAdvisory(copyShapeDrift(state.CopyShape, current))
+	if len(refusing) > 0 {
 		return nil, nil, true, fmt.Errorf(
 			"pipeline: %s: this stream's recorded cold start finished its bulk copy, but this run's %s "+
 				"%s differ from the run that made it. Resuming would SKIP the copy and leave the target "+
@@ -253,8 +254,26 @@ func (s *Streamer) resumeStoppedColdStart(
 				"changes from the snapshot onward and can never backfill them. sluice has changed NOTHING. "+
 				"Re-run with the flags the recorded copy used, or re-run `sluice sync start` with "+ // remedy-partial: the operator's own invocation carries their DSNs
 				"--reset-target-data to copy again under the new ones",
-			coldStartShapeChangedMarker, strings.Join(drifted, ", "), copyShapePlural(drifted),
+			coldStartShapeChangedMarker, strings.Join(refusing, ", "), copyShapePlural(refusing),
 		)
+	}
+	if len(advisory) > 0 {
+		// Not a refusal: these shape the CONSTRAINTS and VIEWS phases,
+		// which the ladder below re-runs under THIS run's settings, so
+		// the difference reaches the target as DDL rather than as rows.
+		// It is still worth a line, because the re-run's settings are
+		// applied only to what those phases create NOW — anything run 1
+		// already created stays, and nothing else would tell the
+		// operator that. See [copyShapeAdvisory].
+		slog.WarnContext(ctx, "pipeline: "+coldStartShapeChangedMarker+": resuming a stopped cold start whose "+
+			"recorded run used DIFFERENT post-copy settings. The remaining phases run under THIS run's "+
+			"settings, but anything the stopped run had already created stays: foreign keys it added are not "+
+			"removed by adding --skip-foreign-keys now, and the backing indexes it synthesised for skipped "+
+			"foreign keys are not removed by dropping the flag. No copied row is affected. Check the target's "+
+			"constraints and views if either matters to you",
+			slog.String("stream_id", streamID),
+			slog.String("changed", strings.Join(advisory, ", ")),
+			slog.String("recorded_phase", string(state.Phase)))
 	}
 
 	// GATE — the TARGET's own account of what it holds (review C-2). Every

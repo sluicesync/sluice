@@ -104,6 +104,18 @@ func TestColdStartCopyShape_EveryAspectDrifts(t *testing.T) {
 			change: func(s *Streamer, _ *ir.Schema) { s.TargetSchema = "public" },
 			why:    "run 1's rows are in the other namespace",
 		},
+		{
+			key:    "skip_fks",
+			change: func(s *Streamer, _ *ir.Schema) { s.SkipForeignKeys = true },
+			why:    "advisory, but it must still be DETECTED to be reportable",
+		},
+		{
+			key: "views",
+			change: func(_ *Streamer, sc *ir.Schema) {
+				sc.Views = []*ir.View{{Schema: "public", Name: "extra", Definition: "SELECT 1"}}
+			},
+			why: "advisory, same reason",
+		},
 	}
 
 	for _, tc := range cases {
@@ -139,7 +151,6 @@ func TestColdStartCopyShape_StableAcrossIrrelevantChanges(t *testing.T) {
 	changed.BulkParallelism = 8
 	changed.TableParallelism = 4
 	changed.MaxBufferBytes = 1 << 20
-	changed.SkipForeignKeys = true
 	changed.SlotName = "other"
 	// And the table set in a different ORDER: the scope is a set, not a
 	// sequence, so a schema reader that returned it differently must not
@@ -151,6 +162,44 @@ func TestColdStartCopyShape_StableAcrossIrrelevantChanges(t *testing.T) {
 
 	if drifted := copyShapeDrift(recorded, coldStartCopyShape(changed, changedSchema)); len(drifted) != 0 {
 		t.Fatalf("irrelevant changes drifted %v; a false refusal here costs the operator a full re-copy", drifted)
+	}
+}
+
+// TestCopyShapeAdvisory_EveryKeyIsClassified is the policy pin: every
+// key the fingerprint can emit lands on one side of the
+// refuse-or-warn split, and the DEFAULT for an unrecognised key is to
+// refuse.
+//
+// The default matters more than the current membership. A key added
+// later without a decision must fail closed — the alternative is a new
+// shaping input that silently warns, which is the class this whole
+// gate exists to close.
+func TestColdStartCopyShape_EveryKeyIsClassified(t *testing.T) {
+	shape := coldStartCopyShape(&Streamer{}, &ir.Schema{Tables: []*ir.Table{{Name: "t"}}})
+	fields := strings.Split(shape, ";")
+	keys := make([]string, 0, len(fields))
+	for _, field := range fields {
+		k, _, _ := strings.Cut(field, "=")
+		keys = append(keys, k)
+	}
+	refusing, advisory := copyShapeAdvisory(keys)
+	if len(refusing)+len(advisory) != len(keys) {
+		t.Fatalf("the split dropped keys: %d in, %d refusing + %d advisory", len(keys), len(refusing), len(advisory))
+	}
+	if !reflect.DeepEqual(advisory, []string{"skip_fks", "views"}) {
+		t.Errorf("advisory keys = %v; want exactly [skip_fks views] — a key becomes advisory only with the "+
+			"argument in coldStartCopyShape's doc, which is that a difference reaches the target as DDL "+
+			"rather than as rows", advisory)
+	}
+	if len(refusing) < 6 {
+		t.Errorf("only %d refusing keys (%v); the row-shaping inputs must not drift into the advisory set",
+			len(refusing), refusing)
+	}
+	// An unrecognised key — the one a future change adds without
+	// deciding — must refuse.
+	r, a := copyShapeAdvisory([]string{"some_future_input"})
+	if len(a) != 0 || len(r) != 1 {
+		t.Errorf("an unclassified key split as refusing=%v advisory=%v; it must fail CLOSED", r, a)
 	}
 }
 
@@ -196,7 +245,7 @@ func TestCopyShapeDrift_UnknownAndMissingKeys(t *testing.T) {
 // drift as no change at all.
 func TestColdStartCopyShape_Rendering(t *testing.T) {
 	shape := coldStartCopyShape(&Streamer{}, &ir.Schema{Tables: []*ir.Table{{Name: "t"}}})
-	wantKeys := []string{"redact", "shard", "tables", "target_schema", "types", "where"}
+	wantKeys := []string{"redact", "shard", "skip_fks", "tables", "target_schema", "types", "views", "where"}
 	fields := strings.Split(shape, ";")
 	gotKeys := make([]string, 0, len(fields))
 	for _, field := range fields {
