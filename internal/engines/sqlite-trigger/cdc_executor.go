@@ -1397,6 +1397,11 @@ func d1JSONInt64(raw json.RawMessage) (int64, bool) {
 // The division by 3 is exact: U+FFFD is always three bytes in UTF-8, so
 // the byte delta between the value and the value with every U+FFFD
 // removed is always a multiple of 3.
+// Delegates to [sqlite.D1ReplacementCountExpr] so both D1 text-crossing
+// lanes ask the server the SAME question. They were two copies of one
+// string until audit 2026-09-09 A0909-SLP-MEDIUM-2 found the reader lane
+// had never grown the second number at all — which is what a duplicated
+// expression invites, since each site reads correct on its own.
 func d1ReplacementCountExpr(col string) string {
-	return `(length(CAST(` + col + ` AS BLOB)) - length(CAST(replace(` + col + `, char(65533), '') AS BLOB))) / 3`
+	return sqlite.D1ReplacementCountExpr(col)
 }
