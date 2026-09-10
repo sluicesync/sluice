@@ -142,12 +142,12 @@ func (s *Streamer) resumeStoppedColdStart(
 	applier ir.ChangeApplier,
 	streamID string,
 ) (changes <-chan ir.Change, stop func(), handled bool, err error) {
-	// Gate 1a: only a source that can PROVE where it stands.
+	// GATE — only a SOURCE that can prove where it stands.
 	verifier, ok := s.Source.(ir.SnapshotAnchorVerifier)
 	if !ok {
 		return nil, nil, false, nil
 	}
-	// Gate 1b: only a target that recorded something to stand on.
+	// GATE — only a TARGET that recorded something to stand on.
 	store, err := openMigrationStateStore(ctx, s.Target, s.TargetDSN, s.TargetSchema)
 	if err != nil {
 		slog.WarnContext(ctx, "pipeline: could not open the target's progress store to check whether this "+
@@ -170,8 +170,8 @@ func (s *Streamer) resumeStoppedColdStart(
 			slog.String("error", readErr.Error()))
 		return nil, nil, false, nil
 	}
-	// Gates 3a + 4: a header exists, its phase is past the copy, and it
-	// carries an anchor. A row written by a binary older than the anchor
+	// GATE — a header EXISTS, its phase is not from before the copy,
+	// and it carries an anchor. A row written by a binary older than the anchor
 	// column has none, and that is not evidence of anything.
 	if why := gradeRecordedColdStartHeader(state, found); why != "" {
 		slog.DebugContext(ctx, "pipeline: this stream has no resumable stopped cold start",
@@ -219,8 +219,9 @@ func (s *Streamer) resumeStoppedColdStart(
 		logSkipForeignKeys(ctx, applySkipForeignKeys(schema))
 	}
 
-	// Gate 3b, the load-bearing one: every in-scope table recorded
-	// complete. See the file comment for why the phase alone is not it.
+	// GATE — the copy FINISHED, and this is the load-bearing evidence:
+	// every in-scope table recorded complete. See the file comment for
+	// why the phase alone cannot carry that proof.
 	if missing, ok := everyTableCopied(schema, state); !ok {
 		slog.InfoContext(ctx, "pipeline: this stream's recorded cold start did NOT finish its bulk copy, so "+
 			"it cannot be resumed; the run proceeds exactly as it would have without a recorded copy",
@@ -230,8 +231,8 @@ func (s *Streamer) resumeStoppedColdStart(
 		return nil, nil, false, nil
 	}
 
-	// Gate 6 (C-1): the re-run's flags must describe the copy that is
-	// about to be inherited. Every identity-and-drift door in runOnce
+	// GATE — the re-run's FLAGS describe the copy about to be
+	// inherited (review C-1). Every identity-and-drift door in runOnce
 	// keys on the cdc-state row, which this path does not have — see
 	// coldstart_copy_shape.go for why that is structural and what each
 	// disagreement would cost. This is a REFUSAL rather than a
@@ -256,7 +257,7 @@ func (s *Streamer) resumeStoppedColdStart(
 		)
 	}
 
-	// Gate 7 (C-2): the TARGET's own account of what it holds. Every
+	// GATE — the TARGET's own account of what it holds (review C-2). Every
 	// gate above reads the target's BOOKKEEPING, which a TRUNCATE
 	// leaves perfectly intact — indexes and all, so even
 	// verifyBuiltIndexes would pass. The independent value is the rows:
@@ -266,10 +267,10 @@ func (s *Streamer) resumeStoppedColdStart(
 		return nil, nil, true, err
 	}
 
-	// Gate 5: the independent witness. Everything above is the target's
-	// account of what a previous process did; this is the SOURCE's
-	// account of where it stands now, and it is the only one that can
-	// tell "nothing has consumed the slot" from "something has".
+	// GATE — the SOURCE's account of where it stands now. Every gate
+	// above except the row floor reads what a previous sluice process
+	// wrote down; this one asks the server, and it is the only one that
+	// can tell "nothing has consumed this slot" from "something has".
 	anchor, err := verifier.VerifySnapshotAnchor(ctx, s.SourceDSN, s.SlotName, state.SnapshotAnchor)
 	switch {
 	case err == nil:
