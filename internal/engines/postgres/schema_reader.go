@@ -1130,9 +1130,25 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 			COALESCE(pt.typtype::text, '') AS column_type_kind,
 			COALESCE(pt.typname, '')       AS column_type_name
 		FROM   information_schema.columns c
+		-- The namespace is joined rather than looked up by a scalar
+		-- subquery in the ON clause. The subquery form was CORRELATED (on
+		-- c.table_schema), and a PlanetScale Neki router refuses that
+		-- outright -- "not implemented: correlated subquery in an OUTER
+		-- JOIN ON clause is not yet supported" -- which made this query,
+		-- and therefore every schema read, fail against a SHARDED Neki
+		-- database. Measured 2026-09-10: it succeeds on an unsharded Neki
+		-- and fails on a sharded one at the same version, so the
+		-- constraint arrives when a database is sharded rather than when
+		-- it is created (neki-issues/NEKI-008).
+		--
+		-- The rewrite is semantically identical and not a concession: the
+		-- correlation was incidental, since the WHERE below pins
+		-- c.table_schema to $1 for every row, and pg_namespace.nspname is
+		-- unique so the join matches at most one row exactly as the
+		-- scalar subquery did. It is also plainer SQL on every engine.
+		LEFT JOIN pg_namespace  ns   ON ns.nspname    = c.table_schema
 		LEFT JOIN pg_class      cl   ON cl.relname    = c.table_name
-		                            AND cl.relnamespace = (
-		                                  SELECT oid FROM pg_namespace WHERE nspname = c.table_schema)
+		                            AND cl.relnamespace = ns.oid
 		LEFT JOIN pg_attribute  a    ON a.attrelid    = cl.oid
 		                            AND a.attname     = c.column_name
 		                            AND a.attnum      > 0
