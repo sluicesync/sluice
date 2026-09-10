@@ -239,7 +239,13 @@ func (e Engine) OpenRowReader(ctx context.Context, dsn string) (ir.RowReader, er
 	if err != nil {
 		return nil, err
 	}
-	return &RowReader{q: db, schema: cfg.schema, closer: db}, nil
+	// A PlanetScale Neki router is postgres by wire protocol and engine but
+	// cannot serve the raw-copy passthrough lane (see neki_probe.go). A probe
+	// that could not RUN leaves this false, which is the pre-existing
+	// behaviour: the lane stays enabled and fails loudly at the COPY rather
+	// than being silently dropped for every ordinary PostgreSQL source.
+	isNeki, _ := probeIsNeki(ctx, cfg.serverKey(), db)
+	return &RowReader{q: db, schema: cfg.schema, closer: db, isNeki: isNeki}, nil
 }
 
 // OpenRowWriter returns a [RowWriter] bound to the database

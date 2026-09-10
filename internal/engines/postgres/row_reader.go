@@ -45,6 +45,11 @@ type RowReader struct {
 	// the only change is WHICH schema qualifies it.)
 	qualifyBySchema bool
 
+	// isNeki records that this reader's endpoint is a PlanetScale Neki
+	// router, probed once per server at open (neki_probe.go). It gates
+	// [RowReader.DeclinesRawCopy] and nothing else.
+	isNeki bool
+
 	// closer owns the underlying connection resources for this reader.
 	// In simple mode it's the *sql.DB; in snapshot mode it's nil and
 	// the SnapshotStream owns the lifecycle. Close is a no-op when nil.

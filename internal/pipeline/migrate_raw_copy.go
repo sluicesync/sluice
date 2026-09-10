@@ -369,7 +369,13 @@ func (c countingWriter) Write(p []byte) (int, error) {
 // asRawCopyEndpoints type-asserts a reader/writer pair to the raw-copy
 // surfaces. Returns (exporter, importer, true) only when BOTH sides
 // implement their respective surface — the orchestrator never byte-pipes
-// half a pair.
+// half a pair — and neither side DECLINES the lane at runtime.
+//
+// It is the single chokepoint for lane eligibility: all four call sites
+// (migrate's serial and parallel copies, the add-table copy, and the sync
+// cold start's parallel lane) go through here, so a decline reaches every
+// one of them. That is why the check lives here rather than at the call
+// sites.
 func asRawCopyEndpoints(rr ir.RowReader, rw ir.RowWriter) (ir.RawCopyExporter, ir.RawCopyImporter, bool) {
 	exp, eok := rr.(ir.RawCopyExporter)
 	if !eok {
@@ -379,5 +385,32 @@ func asRawCopyEndpoints(rr ir.RowReader, rw ir.RowWriter) (ir.RawCopyExporter, i
 	if !iok {
 		return nil, nil, false
 	}
+	// A server that cannot serve the lane, even though its Go type can.
+	// See [ir.RawCopyDecliner] — the case is a PlanetScale Neki endpoint,
+	// which is postgres by wire protocol and engine but whose router does
+	// not implement `COPY (SELECT …) TO`.
+	if why, declined := rawCopyDeclinedBy(rr, rw); declined {
+		slog.Info("raw-copy passthrough lane declined by an endpoint; using the IR copy path",
+			slog.String("reason", why))
+		return nil, nil, false
+	}
 	return exp, imp, true
+}
+
+// rawCopyDeclinedBy asks each endpoint whether it must be kept off the
+// raw-copy lane, returning the first reason given. Checked source-first
+// because that is the side the known case (Neki) sits on, and because a
+// source that cannot export makes the target's answer moot.
+func rawCopyDeclinedBy(rr ir.RowReader, rw ir.RowWriter) (string, bool) {
+	if d, ok := rr.(ir.RawCopyDecliner); ok {
+		if declined, why := d.DeclinesRawCopy(); declined {
+			return "source: " + why, true
+		}
+	}
+	if d, ok := rw.(ir.RawCopyDecliner); ok {
+		if declined, why := d.DeclinesRawCopy(); declined {
+			return "target: " + why, true
+		}
+	}
+	return "", false
 }

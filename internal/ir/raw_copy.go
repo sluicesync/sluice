@@ -115,6 +115,41 @@ type RawCopyExporter interface {
 	ExportRawCopy(ctx context.Context, table *Table, chunk *RawCopyChunk, format RawCopyFormat, w io.Writer) error
 }
 
+// RawCopyDecliner is the OPTIONAL surface an endpoint implements to say
+// that, although it satisfies [RawCopyExporter] / [RawCopyImporter], this
+// particular SERVER cannot actually serve the lane — so the orchestrator
+// must fall through to the ordinary IR copy path instead.
+//
+// # Why declining is a separate surface from not implementing the lane
+//
+// Raw-copy eligibility is otherwise a TYPE question: a postgres RowReader
+// is a RawCopyExporter, a mysql one is not, and that is decided at compile
+// time. This is a RUNTIME question about the server on the other end of a
+// DSN, and the same Go type answers it both ways. PlanetScale Neki is the
+// case that forced it: it speaks the PostgreSQL wire protocol and is served
+// by sluice's postgres engine, but its router does not implement
+// `COPY (SELECT …) TO`, which is the exporter's CRITICAL projection
+// invariant above and therefore not something the lane can work around.
+// Measured 2026-09-10: a Neki source to a PostgreSQL target failed with
+// `not implemented: COPY (SELECT …) TO is not supported`, while the SAME
+// source to a MySQL target succeeded, because cross-engine already takes
+// the IR path. The fast lane was the only thing in the way.
+//
+// # The default is ENABLED, and that is deliberate
+//
+// An endpoint that does not implement this surface, or returns false, keeps
+// the lane exactly as before — the zero value is the common, fast behaviour
+// (the v0.99.51 rule). Only an endpoint that KNOWS it cannot serve the lane
+// opts out, and it must say WHY: the reason is logged, so an operator who
+// notices the fast lane is not being used can see what decided that rather
+// than inferring it from a throughput change.
+type RawCopyDecliner interface {
+	// DeclinesRawCopy reports whether this endpoint must NOT be used for
+	// the raw-copy passthrough lane, and a short operator-facing reason.
+	// The reason is only read when the bool is true.
+	DeclinesRawCopy() (declined bool, reason string)
+}
+
 // RawCopyImporter is the OPTIONAL target-side surface for raw-copy
 // passthrough. ImportRawCopy consumes same-engine COPY wire bytes from
 // r (in the negotiated format) via COPY-FROM-STDIN and returns the
