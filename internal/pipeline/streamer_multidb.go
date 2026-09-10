@@ -837,9 +837,30 @@ func (s *Streamer) warnPublicationExposure(ctx context.Context, graded map[strin
 	if s.Source.Capabilities().CDC != ir.CDCLogicalReplication {
 		return
 	}
+	// A FAILED audit is reported at WARN, not DEBUG (audit 2026-09-09
+	// A0909-AQ-M-4). The audit itself is advisory by policy — it never
+	// refuses — but its silence is load-bearing: this WARN is the ONLY
+	// signal that a `FOR ALL TABLES` publication immediately breaks
+	// UPDATE and DELETE on every replica-identity-less table in the whole
+	// database, including schemas this sync did not select (A2-4b,
+	// measured on real PG 16). Both failure branches below used to
+	// DebugContext and return, so the operator most likely to hit them —
+	// a non-superuser who can run the sync but cannot read
+	// pg_publication_tables — got nothing at all at the default level,
+	// and an absent warning reads exactly like a clean audit.
+	//
+	// Same marker as the positive finding on purpose: an operator greps
+	// one token and lands on the same page, which explains the exposure
+	// either way. What changes is the verb — "will stop" versus "could
+	// not check".
 	sr, err := s.Source.OpenSchemaReader(ctx, s.SourceDSN)
 	if err != nil {
-		slog.DebugContext(ctx, "unselected-namespace exposure audit skipped (schema reader)", "error", err)
+		slog.WarnContext(ctx, "UNSELECTED-NAMESPACE-EXPOSURE: could not check whether this sync's "+
+			"publication exposes tables in schemas it did not select, because the source schema reader "+
+			"would not open. Treat the exposure as UNKNOWN rather than absent: on a FOR ALL TABLES "+
+			"publication, every replica-identity-less table in the database — including unselected "+
+			"schemas — stops accepting UPDATE and DELETE",
+			slog.String("error", err.Error()))
 		return
 	}
 	defer migcore.CloseIf(sr)
@@ -849,7 +870,12 @@ func (s *Streamer) warnPublicationExposure(ctx context.Context, graded map[strin
 	}
 	exposed, err := auditor.AuditPublicationExposure(ctx, covered)
 	if err != nil {
-		slog.DebugContext(ctx, "unselected-namespace exposure audit skipped", "error", err)
+		slog.WarnContext(ctx, "UNSELECTED-NAMESPACE-EXPOSURE: could not check whether this sync's "+
+			"publication exposes tables in schemas it did not select — the catalog query failed, commonly "+
+			"because the sync role cannot read pg_publication_tables. Treat the exposure as UNKNOWN rather "+
+			"than absent: on a FOR ALL TABLES publication, every replica-identity-less table in the "+
+			"database — including unselected schemas — stops accepting UPDATE and DELETE",
+			slog.String("error", err.Error()))
 		return
 	}
 	if len(exposed) == 0 {
