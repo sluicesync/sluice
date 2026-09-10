@@ -287,7 +287,8 @@ func copyOneTableData(
 			slog.InfoContext(ctx, "migration: table copied via raw-copy passthrough",
 				slog.String("table", table.Name),
 				slog.Int64("rows", rowsN))
-			setTableProgressAndWrite(ctx, rc, state, stateMu, table.Name, ir.TableProgress{State: ir.TableProgressComplete})
+			setTableProgressAndWrite(ctx, rc, state, stateMu, table.Name,
+				ir.TableProgress{State: ir.TableProgressComplete, RowsCopied: rowsN})
 			return nil
 		}
 	}
@@ -315,11 +316,13 @@ func copyOneTableData(
 		// locked clone-and-write helper (ADR-0076): peer tables in the
 		// cross-table pool write distinct keys of this map concurrently.
 		setTableProgressAndWrite(ctx, rc, state, stateMu, table.Name, entry)
-		if err := copyTable(ctx, rows, rw, table, redactor, shard); err != nil {
+		rowsCopied, err := copyTable(ctx, rows, rw, table, redactor, shard)
+		if err != nil {
 			wrapped := fmt.Errorf("pipeline: copy table %q: %w", table.Name, err)
 			return migcore.WrapWithHint(migcore.PhaseBulkCopy, markFailedLocked(ctx, rc, state, stateMu, ir.MigrationPhaseBulkCopy, wrapped))
 		}
-		setTableProgressAndWrite(ctx, rc, state, stateMu, table.Name, ir.TableProgress{State: ir.TableProgressComplete})
+		setTableProgressAndWrite(ctx, rc, state, stateMu, table.Name,
+			ir.TableProgress{State: ir.TableProgressComplete, RowsCopied: rowsCopied})
 		return nil
 	}
 
@@ -332,7 +335,16 @@ func copyOneTableData(
 		wrapped := fmt.Errorf("pipeline: copy table %q: %w", table.Name, err)
 		return migcore.WrapWithHint(migcore.PhaseBulkCopy, markFailedLocked(ctx, rc, state, stateMu, ir.MigrationPhaseBulkCopy, wrapped))
 	}
-	setTableProgressAndWrite(ctx, rc, state, stateMu, table.Name, ir.TableProgress{State: ir.TableProgressComplete})
+	// Carry the cursor path's accumulated count onto the terminal entry
+	// instead of overwriting it with a bare label: the per-batch writer
+	// has been counting all along, and the terminal write is the last
+	// chance to keep that number. Read under stateMu — peer tables in
+	// the cross-table pool mutate the shared map concurrently.
+	stateMu.Lock()
+	cursorRows := state.TableProgress[table.Name].RowsCopied
+	stateMu.Unlock()
+	setTableProgressAndWrite(ctx, rc, state, stateMu, table.Name,
+		ir.TableProgress{State: ir.TableProgressComplete, RowsCopied: cursorRows})
 	return nil
 }
 

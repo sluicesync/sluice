@@ -140,7 +140,7 @@ type Config struct {
 type SQL struct {
 	// ReadHeader: args (migrationID). Must project exactly
 	// (phase, table_progress, state_format, started_at, updated_at,
-	// last_error, snapshot_anchor) for the header row.
+	// last_error, snapshot_anchor, copy_shape) for the header row.
 	//
 	// snapshot_anchor is the newest column and is NULL on every row a
 	// binary older than it wrote — which [Store.Read] surfaces as the
@@ -179,10 +179,11 @@ type SQL struct {
 	UpsertHeader string
 
 	// UpsertSnapshotAnchor: args (migrationID, phase, blobSentinel,
-	// stateFormat, anchor). Records the run's snapshot anchor
-	// ([ir.MigrationState.SnapshotAnchor]) and NOTHING else: it inserts
-	// the header row at the supplied phase when none exists, and on
-	// conflict updates ONLY snapshot_anchor — never phase, never
+	// stateFormat, anchor, copyShape). Records the run's snapshot
+	// anchor and its copy-shape fingerprint
+	// ([ir.SnapshotAnchorRecord]) and NOTHING else: it inserts the
+	// header row at the supplied phase when none exists, and on
+	// conflict updates ONLY those two columns — never phase, never
 	// last_error. That asymmetry is the point (see
 	// [ir.SnapshotAnchorRecorder]): the anchor writer must not clobber
 	// the phase ladder, and [SQL.UpsertHeader] — which every phase
@@ -249,12 +250,13 @@ func (s *Store) Read(ctx context.Context, migrationID string) (ir.MigrationState
 	row := s.DB.QueryRowContext(ctx, s.SQL.ReadHeader, migrationID)
 
 	var (
-		phase                                    string
-		tableProgress, lastError, snapshotAnchor sql.NullString
-		format                                   int
-		startedAt, updatedAt                     time.Time
+		phase                                               string
+		tableProgress, lastError, snapshotAnchor, copyShape sql.NullString
+		format                                              int
+		startedAt, updatedAt                                time.Time
 	)
-	switch err := row.Scan(&phase, &tableProgress, &format, &startedAt, &updatedAt, &lastError, &snapshotAnchor); {
+	switch err := row.Scan(&phase, &tableProgress, &format, &startedAt, &updatedAt, &lastError,
+		&snapshotAnchor, &copyShape); {
 	case errors.Is(err, sql.ErrNoRows):
 		s.dropPendingUpgrade(migrationID)
 		return ir.MigrationState{}, false, nil
@@ -276,6 +278,7 @@ func (s *Store) Read(ctx context.Context, migrationID string) (ir.MigrationState
 		// NULL (an older binary's row, or a run that recorded none)
 		// reads as "", which the contract defines as no evidence.
 		SnapshotAnchor: snapshotAnchor.String,
+		CopyShape:      copyShape.String,
 	}
 
 	if format >= FormatPerTableRows {
@@ -614,26 +617,33 @@ func (s *Store) WriteTableProgress(ctx context.Context, migrationID, tableName s
 	return nil
 }
 
-// WriteSnapshotAnchor records the run's snapshot anchor and nothing
-// else (see [SQL.UpsertSnapshotAnchor] for why it is its own
-// statement). The header row is created at [ir.MigrationPhasePending]
-// when it does not exist yet, so the anchor can be recorded before the
-// first phase mark.
+// WriteSnapshotAnchor records the run's snapshot anchor and its
+// copy-shape fingerprint, and nothing else (see
+// [SQL.UpsertSnapshotAnchor] for why it is its own statement). The
+// header row is created at [ir.MigrationPhasePending] when it does not
+// exist yet, so the record can land before the first phase mark.
 //
-// The token is written VERBATIM — no trimming, no normalisation. It is
-// the evidence a later resume compares against live source state, and
-// a value this store altered would compare unequal and cost a re-copy
-// at best, or match something it should not at worst.
+// Both values are written VERBATIM — no trimming, no normalisation.
+// The anchor is evidence a later resume compares against live source
+// state, and the shape is evidence it compares against the re-run's
+// own flags; a value this store altered would compare unequal and cost
+// a re-copy at best, or match something it should not at worst.
 //
 // An empty anchor is refused rather than stored: "" is the column's
 // no-evidence value, so writing one would record the absence of an
-// anchor as if it were an anchor.
-func (s *Store) WriteSnapshotAnchor(ctx context.Context, migrationID, anchor string) error {
+// anchor as if it were an anchor. An empty CopyShape is refused for
+// the same reason and a sharper one — a resume that found an anchor
+// with no shape would have to choose between refusing (making the
+// write pointless) and skipping a copy whose flags it cannot check.
+func (s *Store) WriteSnapshotAnchor(ctx context.Context, migrationID string, rec ir.SnapshotAnchorRecord) error {
 	if migrationID == "" {
 		return fmt.Errorf("%s: migrate-state WriteSnapshotAnchor: migrationID is empty", s.Config.EngineName)
 	}
-	if anchor == "" {
+	if rec.Anchor == "" {
 		return fmt.Errorf("%s: migrate-state WriteSnapshotAnchor: anchor is empty", s.Config.EngineName)
+	}
+	if rec.CopyShape == "" {
+		return fmt.Errorf("%s: migrate-state WriteSnapshotAnchor: copy shape is empty", s.Config.EngineName)
 	}
 	if s.SQL.UpsertSnapshotAnchor == "" {
 		return fmt.Errorf("%s: migrate-state store has no snapshot-anchor statement", s.Config.EngineName)
@@ -646,7 +656,8 @@ func (s *Store) WriteSnapshotAnchor(ctx context.Context, migrationID, anchor str
 	}
 	if _, err := s.DB.ExecContext(
 		ctx, s.SQL.UpsertSnapshotAnchor,
-		migrationID, string(ir.MigrationPhasePending), UpgradedBlobSentinel, FormatPerTableRows, anchor,
+		migrationID, string(ir.MigrationPhasePending), UpgradedBlobSentinel, FormatPerTableRows,
+		rec.Anchor, rec.CopyShape,
 	); err != nil {
 		return fmt.Errorf("%s: write migrate-state snapshot anchor: %w", s.Config.EngineName, err)
 	}

@@ -2101,7 +2101,11 @@ func reapplyMigrateTableForReconcile(
 	if err := truncator.TruncateTable(ctx, table); err != nil {
 		return fmt.Errorf("truncate before redo: %w", err)
 	}
-	return copyTable(ctx, rows, rw, table, redactor, shard)
+	// The reparent reconcile re-derives one table from the source; the
+	// count is discarded because this path does not own the table's
+	// progress entry (the copy that recorded it already ran).
+	_, err := copyTable(ctx, rows, rw, table, redactor, shard)
+	return err
 }
 
 // validate checks that all required fields are populated. Errors here

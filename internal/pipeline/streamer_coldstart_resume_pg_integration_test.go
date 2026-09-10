@@ -38,6 +38,7 @@ import (
 	"testing"
 	"time"
 
+	"sluicesync.dev/sluice/internal/config"
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/engines/postgres"
 )
@@ -68,7 +69,15 @@ func stopColdStartInIndexBuild(t *testing.T, streamID string) stoppedColdStart {
 	src, tgt, cleanup := startPostgresLogical(t)
 	t.Cleanup(cleanup)
 
+	// REPLICA IDENTITY FULL because one case below re-runs WITH a
+	// `--where`, and the filtered-sync preflight refuses a predicate on
+	// a table without full before-images — it runs BEFORE the resume
+	// gate, so without this the copy-shape arm would never execute and
+	// the case would grade a different refusal. (The first cut did
+	// exactly that: it passed the run-refused check while asserting
+	// nothing about the gate it exists for.)
 	applyDDL(t, src, `CREATE TABLE resume_t (id BIGINT PRIMARY KEY, v INT NOT NULL);
+		ALTER TABLE resume_t REPLICA IDENTITY FULL;
 		CREATE INDEX resume_t_v_idx ON resume_t (v);
 		INSERT INTO resume_t (id, v) SELECT g, g FROM generate_series(1, 40) g;`)
 
@@ -280,6 +289,68 @@ func TestStreamer_ColdStartResume_PG_RefusesWithoutProof(t *testing.T) {
 		requireResumeRefused(t, st, "a row carrying no anchor")
 	})
 
+	t.Run("the re-run WIDENS --where", func(t *testing.T) {
+		// The C-1 silent-loss path: run 1 copied the rows its predicate
+		// selected; a re-run without the predicate would inherit them as
+		// if they were everything, and CDC can never backfill the rest.
+		// Refused rather than declined, so this asserts the marker too.
+		st := stopColdStartInIndexBuild(t, "coldstart-resume-widened")
+		widened := st.newRun
+		st.newRun = func() *Streamer {
+			s := widened()
+			s.RowFilters = map[string]string{"resume_t": "v > 0"}
+			return s
+		}
+		err := runResumeAndCaptureRefusal(t, st)
+		if !strings.Contains(err.Error(), coldStartShapeChangedMarker) {
+			t.Errorf("a changed --where did not refuse under %s: %v", coldStartShapeChangedMarker, err)
+		}
+		if !strings.Contains(err.Error(), "where") {
+			t.Errorf("the refusal does not name which input changed: %v", err)
+		}
+	})
+
+	t.Run("the re-run changes --type-override", func(t *testing.T) {
+		// A second aspect, chosen because NO preflight stands in front
+		// of it: if the `--where` case above ever starts being caught by
+		// something earlier again, this one still exercises the gate.
+		// Run 1 created the target column from the source type; a re-run
+		// declaring a different one describes a table it will not
+		// re-create.
+		st := stopColdStartInIndexBuild(t, "coldstart-resume-retyped")
+		base := st.newRun
+		st.newRun = func() *Streamer {
+			s := base()
+			s.Mappings = []config.Mapping{{Table: "resume_t", Column: "v", TargetType: "TEXT"}}
+			return s
+		}
+		err := runResumeAndCaptureRefusal(t, st)
+		if !strings.Contains(err.Error(), coldStartShapeChangedMarker) {
+			t.Errorf("a changed --type-override did not refuse under %s: %v", coldStartShapeChangedMarker, err)
+		}
+		if !strings.Contains(err.Error(), "types") {
+			t.Errorf("the refusal does not name which input changed: %v", err)
+		}
+	})
+
+	t.Run("the target was TRUNCATEd", func(t *testing.T) {
+		// The C-2 path, and the one every bookkeeping check passes: the
+		// control rows, the phase, the anchor and even the indexes all
+		// survive a TRUNCATE untouched.
+		st := stopColdStartInIndexBuild(t, "coldstart-resume-truncated")
+		execOnTarget(t, st.tgt, "TRUNCATE TABLE resume_t")
+		err := runResumeAndCaptureRefusal(t, st)
+		if !strings.Contains(err.Error(), coldStartTargetEmptiedMarker) {
+			t.Errorf("an emptied target did not refuse under %s: %v", coldStartTargetEmptiedMarker, err)
+		}
+		if !strings.Contains(err.Error(), "resume_t") {
+			t.Errorf("the refusal does not name the emptied table: %v", err)
+		}
+		if got := pollRowCount(st.tgt, "resume_t"); got != 0 {
+			t.Errorf("the refused run put %d rows back on the target; a refusal must change nothing", got)
+		}
+	})
+
 	t.Run("a phase from before the copy", func(t *testing.T) {
 		st := stopColdStartInIndexBuild(t, "coldstart-resume-earlyphase")
 		// NOT bulk_copy: that is what a real stop in the index window
@@ -364,6 +435,28 @@ func lsnFromToken(t *testing.T, token string) string {
 		t.Fatalf("position token %q has an unterminated lsn field", token)
 	}
 	return rest[:j]
+}
+
+// runResumeAndCaptureRefusal re-runs the stream and requires it to
+// FAIL, returning the error so the caller can grade its marker. Used
+// by the cases that are a deliberate refusal (a changed copy shape, an
+// emptied target) rather than a fall-through to the cold start.
+func runResumeAndCaptureRefusal(t *testing.T, st stoppedColdStart) error {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	logs := captureSlog(t)
+	err := st.newRun().Run(ctx)
+	if err == nil {
+		t.Fatalf("the re-run SUCCEEDED where it had to refuse\nlogs:\n%s", logs.String())
+	}
+	if strings.Contains(logs.String(), coldStartResumedMarker) {
+		t.Errorf("the run announced %s before refusing", coldStartResumedMarker)
+	}
+	if pgCDCStateRowExists(t, st.tgt, st.streamID) {
+		t.Error("the refused run wrote a CDC anchor row; a refusal must change nothing")
+	}
+	return err
 }
 
 // requireResumeRefused re-runs the stream and requires the pre-resume

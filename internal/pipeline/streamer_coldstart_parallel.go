@@ -355,11 +355,17 @@ func (s *Streamer) runColdStartParallel(
 		progressStore = nil
 	}
 	rc := newSyncRecordingContext(ctx, progressStore, streamID)
-	// Make the recorded state describe THIS run, and record the anchor a
-	// stop after the copy can be resumed from (A0909-STOP-1). The anchor
-	// is the snapshot's own consistent point — the position CDC would
-	// have started from had this run reached the handoff.
-	beginRecordedColdStart(ctx, rc, stream.Position.Token)
+	// Make the recorded state describe THIS run, and record what a stop
+	// after the copy can be resumed from (A0909-STOP-1): the snapshot's
+	// own consistent point — the position CDC would have started from
+	// had this run reached the handoff — plus the fingerprint of the
+	// flags that decide what this copy puts on the target, so a re-run
+	// under different flags is refused instead of inheriting rows its
+	// own predicate would not have selected.
+	beginRecordedColdStart(ctx, rc, ir.SnapshotAnchorRecord{
+		Anchor:    stream.Position.Token,
+		CopyShape: coldStartCopyShape(s, schema),
+	})
 	if progressStore != nil {
 		// Close the store we opened whether or not the context ended up
 		// recording: the P2 degrade path (tables could not be ensured)

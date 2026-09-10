@@ -66,7 +66,11 @@ func TestMigrationStateStore_SnapshotAnchorRoundTripsOnRealPostgres(t *testing.T
 	for i, tc := range anchorTokenMatrix {
 		t.Run(tc.name, func(t *testing.T) {
 			id := "sync-anchor-" + string(rune('a'+i))
-			if err := recorder.WriteSnapshotAnchor(ctx, id, tc.token); err != nil {
+			// The copy shape rides the same statement and the same
+			// verbatim contract; a distinct value per cell so a store
+			// that crossed the two columns shows up here.
+			rec := ir.SnapshotAnchorRecord{Anchor: tc.token, CopyShape: "where=00" + string(rune('a'+i)) + ";tables=zz"}
+			if err := recorder.WriteSnapshotAnchor(ctx, id, rec); err != nil {
 				t.Fatalf("WriteSnapshotAnchor: %v", err)
 			}
 			got, found, err := store.Read(ctx, id)
@@ -75,6 +79,9 @@ func TestMigrationStateStore_SnapshotAnchorRoundTripsOnRealPostgres(t *testing.T
 			}
 			if got.SnapshotAnchor != tc.token {
 				t.Fatalf("anchor round-tripped as %q; want %q byte-for-byte", got.SnapshotAnchor, tc.token)
+			}
+			if got.CopyShape != rec.CopyShape {
+				t.Fatalf("copy shape round-tripped as %q; want %q", got.CopyShape, rec.CopyShape)
 			}
 			// The anchor write creates the header at `pending` when there
 			// is none, so the row is readable before any phase mark.
@@ -110,7 +117,8 @@ func TestMigrationStateStore_AnchorAndPhaseWritersAreDisjoint(t *testing.T) {
 
 	const id = "sync-disjoint"
 	const anchor = `{"slot":"sluice_slot","lsn":"0/ABCDEF0"}`
-	if err := recorder.WriteSnapshotAnchor(ctx, id, anchor); err != nil {
+	const shape = "redact=1111111111111111;where=2222222222222222"
+	if err := recorder.WriteSnapshotAnchor(ctx, id, ir.SnapshotAnchorRecord{Anchor: anchor, CopyShape: shape}); err != nil {
 		t.Fatalf("WriteSnapshotAnchor: %v", err)
 	}
 	// Every phase a cold start walks, in order. The anchor must survive
@@ -132,6 +140,10 @@ func TestMigrationStateStore_AnchorAndPhaseWritersAreDisjoint(t *testing.T) {
 			t.Fatalf("the %s phase write ERASED the snapshot anchor (%q); the stopped run silently stops "+
 				"being resumable", phase, got.SnapshotAnchor)
 		}
+		if got.CopyShape != shape {
+			t.Fatalf("the %s phase write ERASED the copy shape (%q); the resume would then have an anchor "+
+				"it can prove and no way to check the re-run's flags against the copy", phase, got.CopyShape)
+		}
 		if got.Phase != phase {
 			t.Fatalf("phase = %q after writing %q", got.Phase, phase)
 		}
@@ -139,7 +151,7 @@ func TestMigrationStateStore_AnchorAndPhaseWritersAreDisjoint(t *testing.T) {
 
 	// And the reverse: re-recording an anchor must not move the phase.
 	const anchor2 = `{"slot":"sluice_slot","lsn":"0/BBBBBBB"}`
-	if err := recorder.WriteSnapshotAnchor(ctx, id, anchor2); err != nil {
+	if err := recorder.WriteSnapshotAnchor(ctx, id, ir.SnapshotAnchorRecord{Anchor: anchor2, CopyShape: shape}); err != nil {
 		t.Fatalf("WriteSnapshotAnchor (second): %v", err)
 	}
 	got, _, err := store.Read(ctx, id)
@@ -216,14 +228,16 @@ func TestMigrationStateStore_PreAnchorRowReadsCleanly(t *testing.T) {
 	if !found {
 		t.Fatal("Read found=false for a row written by an older binary")
 	}
-	if got.SnapshotAnchor != "" {
-		t.Errorf("SnapshotAnchor = %q; want empty (no evidence) for a row that predates the column", got.SnapshotAnchor)
+	if got.SnapshotAnchor != "" || got.CopyShape != "" {
+		t.Errorf("SnapshotAnchor = %q / CopyShape = %q; want both empty (no evidence) for a row that "+
+			"predates the columns", got.SnapshotAnchor, got.CopyShape)
 	}
 	if got.Phase != ir.MigrationPhaseIndexes || got.LastError != "boom" {
 		t.Errorf("the pre-anchor row's other fields did not survive: %+v", got)
 	}
-	// And the added column is writable straight away.
-	if err := store.(ir.SnapshotAnchorRecorder).WriteSnapshotAnchor(ctx, "sync-old", `{"slot":"s","lsn":"0/1"}`); err != nil {
+	// And the added columns are writable straight away.
+	if err := store.(ir.SnapshotAnchorRecorder).WriteSnapshotAnchor(ctx, "sync-old",
+		ir.SnapshotAnchorRecord{Anchor: `{"slot":"s","lsn":"0/1"}`, CopyShape: "where=abc"}); err != nil {
 		t.Fatalf("WriteSnapshotAnchor after the column migration: %v", err)
 	}
 }

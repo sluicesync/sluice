@@ -135,7 +135,11 @@ func copyTablePlainMaybeParallel(
 ) error {
 	par, ok := rw.(ir.ParallelCopyWriter)
 	if !ok || degree <= 1 || len(migcore.TablePKColumns(table)) == 0 {
-		return copyTable(ctx, rr, rw, table, redactor, shard)
+		// The row count is discarded here: this fan-out entry point is
+		// reached from the SERIAL cold-start / concurrent-group paths,
+		// which record no per-table progress at all.
+		_, err := copyTable(ctx, rr, rw, table, redactor, shard)
+		return err
 	}
 	return copyTablePlainParallel(ctx, rr, par, table, redactor, shard, degree)
 }

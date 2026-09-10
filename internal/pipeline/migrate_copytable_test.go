@@ -91,9 +91,17 @@ func TestCopyTable_CancelsReaderOnWriterError(t *testing.T) {
 	table := &ir.Table{Name: "comments", Columns: []*ir.Column{{Name: "id"}}}
 
 	ctx := context.Background()
-	err := copyTable(ctx, rr, rw, table, nil, ShardColumnSpec{})
+	rowsCopied, err := copyTable(ctx, rr, rw, table, nil, ShardColumnSpec{})
 	if err == nil {
 		t.Fatal("expected copyTable to surface the writer error; got nil")
+	}
+	// A FAILED copy reports zero rows, even though the writer consumed
+	// five before dying. The count is recorded on the table's terminal
+	// progress entry and read back as an expectation the target must
+	// meet (the stopped-cold-start resume's floor); a partial count from
+	// a failed copy would be an expectation nothing has to satisfy.
+	if rowsCopied != 0 {
+		t.Errorf("a failed copyTable reported %d rows copied; want 0", rowsCopied)
 	}
 	if !strings.Contains(err.Error(), "duplicate key") {
 		t.Errorf("expected wrapped writer error; got %v", err)
@@ -119,7 +127,7 @@ func TestCopyTable_LogsAbortedNotComplete(t *testing.T) {
 	rw := &erroringWriter{consume: 5, err: errors.New("collision")}
 	table := &ir.Table{Name: "comments", Columns: []*ir.Column{{Name: "id"}}}
 
-	if err := copyTable(context.Background(), rr, rw, table, nil, ShardColumnSpec{}); err == nil {
+	if _, err := copyTable(context.Background(), rr, rw, table, nil, ShardColumnSpec{}); err == nil {
 		t.Fatal("expected error; got nil")
 	}
 
@@ -142,8 +150,16 @@ func TestCopyTable_SuccessLogsComplete(t *testing.T) {
 	rw := &drainingWriter{}
 	table := &ir.Table{Name: "users", Columns: []*ir.Column{{Name: "id"}}}
 
-	if err := copyTable(context.Background(), rr, rw, table, nil, ShardColumnSpec{}); err != nil {
+	rowsCopied, err := copyTable(context.Background(), rr, rw, table, nil, ShardColumnSpec{})
+	if err != nil {
 		t.Fatalf("copyTable: %v", err)
+	}
+	// The returned count is what the terminal progress entry records,
+	// and the resume floor reads it back as "this table should hold
+	// rows". A copy that moved 3 rows and reported 0 would silently
+	// exempt the table from that floor.
+	if rowsCopied != 3 {
+		t.Errorf("copyTable reported %d rows; want 3", rowsCopied)
 	}
 
 	out := logs.String()
@@ -174,7 +190,7 @@ func TestCopyTable_SurfacesReaderStreamError(t *testing.T) {
 	rw := &drainingWriter{} // drains everything, returns nil — the dangerous case
 	table := &ir.Table{Name: "md", Columns: []*ir.Column{{Name: "id"}}}
 
-	err := copyTable(context.Background(), rr, rw, table, nil, ShardColumnSpec{})
+	_, err := copyTable(context.Background(), rr, rw, table, nil, ShardColumnSpec{})
 	if err == nil {
 		t.Fatal("Bug 68: copyTable returned nil despite a mid-stream reader error; this is the silent total-row-loss class")
 	}

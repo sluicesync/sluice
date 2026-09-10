@@ -26,6 +26,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pglogrepl"
+
 	"sluicesync.dev/sluice/internal/ir"
 )
 
@@ -205,23 +207,21 @@ func TestVerifySnapshotAnchor_Verdicts(t *testing.T) {
 		t.Fatalf("open snapshot stream: %v", err)
 	}
 	anchor := stream.Position.Token
-	// ACTIVE: the snapshot stream still holds its connections, so the
-	// slot may read active. Whichever way it reads, the verdict must not
-	// be "resumable while attached".
-	if _, _, active := slotLSNs(t, dsn, slot); active {
-		if _, err := eng.VerifySnapshotAnchor(ctx, dsn, slot, anchor); err == nil {
-			t.Error("verify returned OK for an ACTIVE slot; a consumer attached to it may be advancing it, so " +
-				"equality at this instant proves nothing")
-		} else if !strings.Contains(err.Error(), "ACTIVE") {
-			t.Errorf("the active-slot refusal does not say the slot is active: %v", err)
-		}
-	}
 	if err := stream.ReleaseRows(); err != nil {
 		t.Fatalf("release snapshot rows: %v", err)
 	}
 	if err := stream.Close(); err != nil {
 		t.Fatalf("close snapshot stream: %v", err)
 	}
+	waitForSlotInactive(t, dsn, slot, 30*time.Second)
+
+	// ACTIVE, attached deliberately rather than observed opportunistically.
+	// The first cut ran this arm only `if active` after the snapshot
+	// open, which is a race: on a run where the slot read inactive the
+	// arm silently did not execute and the test still passed. Here a
+	// walsender is attached on purpose, so the arm either runs or the
+	// attach fails loudly.
+	requireActiveSlotRefused(ctx, t, eng, dsn, slot, anchor)
 	waitForSlotInactive(t, dsn, slot, 30*time.Second)
 
 	// HAPPY: unconsumed and inactive.
@@ -252,15 +252,22 @@ func TestVerifySnapshotAnchor_Verdicts(t *testing.T) {
 		t.Error("verify accepted an EMPTY anchor; empty means no anchor was recorded, never 'the empty position'")
 	}
 
-	// MOVED: consume the slot (get, not peek — this advances it) and the
-	// same anchor must now be refused, naming both positions.
+	// MOVED: advance the slot and require the same anchor to be refused,
+	// naming both positions.
+	//
+	// pg_replication_slot_advance, not "consume and hope": the first cut
+	// of this pin consumed the slot and SKIPPED when
+	// confirmed_flush_lsn had not moved — and a skip is green, so the
+	// arm that grades the silent-loss case could quietly stop running.
+	// Advance names the target LSN, so either the slot moves or the
+	// call fails.
 	recordedLSN := anchorLSN(t, ir.Position{Engine: engineNamePostgres, Token: anchor})
 	applyDDL(t, dsn, `INSERT INTO anchor_verdicts (id, v) VALUES (2, 'b');`)
-	consumeSlot(t, dsn, slot, eng.publicationName())
+	advanceSlotToCurrentWAL(t, dsn, slot)
 	_, movedTo, _ := slotLSNs(t, dsn, slot)
 	if movedTo == recordedLSN {
-		t.Skipf("consuming the slot did not advance confirmed_flush_lsn (%s); the moved-anchor arm cannot be "+
-			"exercised on this server", movedTo)
+		t.Fatalf("pg_replication_slot_advance left confirmed_flush_lsn at the recorded anchor (%s), so the "+
+			"moved-anchor arm did not run; this pin must not pass without exercising it", movedTo)
 	}
 	_, err = eng.VerifySnapshotAnchor(ctx, dsn, slot, anchor)
 	if err == nil {
@@ -276,6 +283,68 @@ func TestVerifySnapshotAnchor_Verdicts(t *testing.T) {
 			t.Errorf("the moved-anchor refusal does not name %q — the operator needs both positions to know "+
 				"what consumed their slot:\n%v", want, err)
 		}
+	}
+}
+
+// requireActiveSlotRefused attaches a real walsender to the slot with
+// START_REPLICATION — the same command the CDC reader issues — and
+// requires VerifySnapshotAnchor to refuse while it is attached, even
+// though the slot's position is still exactly the recorded anchor.
+//
+// That is the point of the arm: "equal right now" proves nothing about
+// a slot something else is consuming, so equality alone must not be
+// enough to authorise skipping a copy.
+func requireActiveSlotRefused(ctx context.Context, t *testing.T, eng Engine, dsn, slot, anchor string) {
+	t.Helper()
+	cfg, err := eng.parseDSN(dsn)
+	if err != nil {
+		t.Fatalf("parseDSN: %v", err)
+	}
+	conn, err := openReplicationConn(ctx, cfg.dsn, cfg.appID)
+	if err != nil {
+		t.Fatalf("open replication conn: %v", err)
+	}
+	defer closeReplConnGraceful(conn)
+	if err := pglogrepl.StartReplication(ctx, conn, slot, 0, pglogrepl.StartReplicationOptions{
+		PluginArgs: []string{"proto_version '1'", "publication_names '" + eng.publicationName() + "'"},
+	}); err != nil {
+		t.Fatalf("attach a walsender to %q: %v", slot, err)
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if _, _, active := slotLSNs(t, dsn, slot); active {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("slot %q never read active after START_REPLICATION; the active arm cannot be graded", slot)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	_, err = eng.VerifySnapshotAnchor(ctx, dsn, slot, anchor)
+	if err == nil {
+		t.Fatal("verify returned OK for an ACTIVE slot; a consumer attached to it may be advancing it, so " +
+			"equality at this instant proves nothing")
+	}
+	if !strings.Contains(err.Error(), "ACTIVE") {
+		t.Errorf("the active-slot refusal does not say the slot is active: %v", err)
+	}
+}
+
+// advanceSlotToCurrentWAL moves the slot to the server's current WAL
+// insert position — deterministically, unlike draining changes, which
+// advances confirmed_flush_lsn only as far as the decoded stream
+// happens to reach.
+func advanceSlotToCurrentWAL(t *testing.T, dsn, slot string) {
+	t.Helper()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := db.Exec(
+		`SELECT pg_replication_slot_advance($1, pg_current_wal_insert_lsn())`, slot,
+	); err != nil {
+		t.Fatalf("advance slot %q: %v", slot, err)
 	}
 }
 

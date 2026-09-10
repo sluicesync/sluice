@@ -186,13 +186,16 @@ func newScriptedStore(steps []msStep) (*Store, *[]msStep, *[]string) {
 // also reading a row that older sluice wrote. [headerRowWithAnchor]
 // covers the rows this binary writes.
 func headerRow(phase string, blob any, format int, started, updated time.Time, lastError any) *msRows {
-	return headerRowWithAnchor(phase, blob, format, started, updated, lastError, nil)
+	return headerRowWithAnchor(phase, blob, format, started, updated, lastError, nil, nil)
 }
 
-func headerRowWithAnchor(phase string, blob any, format int, started, updated time.Time, lastError, anchor any) *msRows {
+func headerRowWithAnchor(phase string, blob any, format int, started, updated time.Time, lastError, anchor, copyShape any) *msRows {
 	return &msRows{
-		cols: []string{"phase", "table_progress", "state_format", "started_at", "updated_at", "last_error", "snapshot_anchor"},
-		vals: [][]driver.Value{{phase, blob, int64(format), started, updated, lastError, anchor}},
+		cols: []string{
+			"phase", "table_progress", "state_format", "started_at", "updated_at", "last_error",
+			"snapshot_anchor", "copy_shape",
+		},
+		vals: [][]driver.Value{{phase, blob, int64(format), started, updated, lastError, anchor, copyShape}},
 	}
 }
 
@@ -620,20 +623,25 @@ func TestSnapshotAnchor_RoundTripsVerbatim(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			// Write: the anchor must reach the statement's args untouched.
 			store, _, seen := newScriptedStore([]msStep{{}})
-			if err := store.WriteSnapshotAnchor(context.Background(), "m1", tc.anchor); err != nil {
+			rec := ir.SnapshotAnchorRecord{Anchor: tc.anchor, CopyShape: "where=deadbeefdeadbeef"}
+			if err := store.WriteSnapshotAnchor(context.Background(), "m1", rec); err != nil {
 				t.Fatalf("WriteSnapshotAnchor: %v", err)
 			}
-			wantStmt := "UPSERT_ANCHOR | m1,pending," + UpgradedBlobSentinel + ",2," + tc.anchor
+			wantStmt := "UPSERT_ANCHOR | m1,pending," + UpgradedBlobSentinel + ",2," + tc.anchor + "," + rec.CopyShape
 			assertSeen(t, *seen, []string{wantStmt})
 
 			// Read: and come back out of the column untouched.
 			store, _, _ = newScriptedStore([]msStep{
-				{rows: headerRowWithAnchor("indexes", UpgradedBlobSentinel, FormatPerTableRows, t1, t2, nil, tc.anchor)},
+				{rows: headerRowWithAnchor("indexes", UpgradedBlobSentinel, FormatPerTableRows, t1, t2, nil, tc.anchor, rec.CopyShape)},
 				{rows: progressRows([]driver.Value{"users", `"complete"`, t1})},
 			})
 			got, ok, err := store.Read(context.Background(), "m1")
 			if err != nil || !ok {
 				t.Fatalf("Read = ok=%v err=%v", ok, err)
+			}
+			if got.CopyShape != rec.CopyShape {
+				t.Errorf("CopyShape round-tripped as %q; want %q — the shape is compared against the "+
+					"re-run's own flags to authorise skipping a copy", got.CopyShape, rec.CopyShape)
 			}
 			if got.SnapshotAnchor != tc.anchor {
 				t.Errorf("SnapshotAnchor round-tripped as %q; want %q byte-for-byte — this token is compared "+
@@ -670,16 +678,27 @@ func TestSnapshotAnchor_AbsentColumnReadsAsNoEvidence(t *testing.T) {
 	}
 }
 
-// TestWriteSnapshotAnchor_Refusals pins the two ways this write must
+// TestWriteSnapshotAnchor_Refusals pins every way this write must
 // refuse rather than record something meaningless.
 func TestWriteSnapshotAnchor_Refusals(t *testing.T) {
 	ctx := context.Background()
+	const shape = "where=deadbeefdeadbeef"
 	store, _, seen := newScriptedStore(nil)
-	if err := store.WriteSnapshotAnchor(ctx, "m1", ""); err == nil || !strings.Contains(err.Error(), "anchor is empty") {
+	if err := store.WriteSnapshotAnchor(ctx, "m1", ir.SnapshotAnchorRecord{CopyShape: shape}); err == nil ||
+		!strings.Contains(err.Error(), "anchor is empty") {
 		t.Errorf("WriteSnapshotAnchor with an empty anchor = %v; want a refusal — \"\" is the column's "+
 			"no-evidence value, so storing it would record an absence as if it were an anchor", err)
 	}
-	if err := store.WriteSnapshotAnchor(ctx, "", "tok"); err == nil || !strings.Contains(err.Error(), "migrationID is empty") {
+	// The shape is refused for the same reason AND a sharper one: an
+	// anchor recorded without it would leave the resume able to prove
+	// where to restart while knowing nothing about whether the target's
+	// rows match the re-run's flags.
+	if err := store.WriteSnapshotAnchor(ctx, "m1", ir.SnapshotAnchorRecord{Anchor: "tok"}); err == nil ||
+		!strings.Contains(err.Error(), "copy shape is empty") {
+		t.Errorf("WriteSnapshotAnchor with no copy shape = %v; want a refusal", err)
+	}
+	if err := store.WriteSnapshotAnchor(ctx, "", ir.SnapshotAnchorRecord{Anchor: "tok", CopyShape: shape}); err == nil ||
+		!strings.Contains(err.Error(), "migrationID is empty") {
 		t.Errorf("WriteSnapshotAnchor without an id = %v", err)
 	}
 	if len(*seen) != 0 {
@@ -691,7 +710,7 @@ func TestWriteSnapshotAnchor_Refusals(t *testing.T) {
 	// nobody knowing why.
 	noStmt, _, _ := newScriptedStore(nil)
 	noStmt.SQL.UpsertSnapshotAnchor = ""
-	if err := noStmt.WriteSnapshotAnchor(ctx, "m1", "tok"); err == nil ||
+	if err := noStmt.WriteSnapshotAnchor(ctx, "m1", ir.SnapshotAnchorRecord{Anchor: "tok", CopyShape: shape}); err == nil ||
 		!strings.Contains(err.Error(), "no snapshot-anchor statement") {
 		t.Errorf("WriteSnapshotAnchor on a store with no statement = %v; want a refusal", err)
 	}

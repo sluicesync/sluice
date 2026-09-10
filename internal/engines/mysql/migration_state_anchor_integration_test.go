@@ -63,7 +63,11 @@ func TestMigrationStateStore_SnapshotAnchorRoundTripsOnRealMySQL(t *testing.T) {
 	for i, tc := range anchorTokenMatrix {
 		t.Run(tc.name, func(t *testing.T) {
 			id := "sync-anchor-" + string(rune('a'+i))
-			if err := recorder.WriteSnapshotAnchor(ctx, id, tc.token); err != nil {
+			// The copy shape rides the same statement and the same
+			// verbatim contract; a distinct value per cell so a store
+			// that crossed the two columns shows up here.
+			rec := ir.SnapshotAnchorRecord{Anchor: tc.token, CopyShape: "where=00" + string(rune('a'+i)) + ";tables=zz"}
+			if err := recorder.WriteSnapshotAnchor(ctx, id, rec); err != nil {
 				t.Fatalf("WriteSnapshotAnchor: %v", err)
 			}
 			got, found, err := store.Read(ctx, id)
@@ -72,6 +76,9 @@ func TestMigrationStateStore_SnapshotAnchorRoundTripsOnRealMySQL(t *testing.T) {
 			}
 			if got.SnapshotAnchor != tc.token {
 				t.Fatalf("anchor round-tripped as %q; want %q byte-for-byte", got.SnapshotAnchor, tc.token)
+			}
+			if got.CopyShape != rec.CopyShape {
+				t.Fatalf("copy shape round-tripped as %q; want %q", got.CopyShape, rec.CopyShape)
 			}
 			if got.Phase != ir.MigrationPhasePending {
 				t.Errorf("phase on an anchor-created header = %q; want pending", got.Phase)
@@ -98,7 +105,8 @@ func TestMigrationStateStore_AnchorAndPhaseWritersAreDisjointMySQL(t *testing.T)
 
 	const id = "sync-disjoint"
 	const anchor = `{"slot":"sluice_slot","lsn":"0/ABCDEF0"}`
-	if err := recorder.WriteSnapshotAnchor(ctx, id, anchor); err != nil {
+	const shape = "redact=1111111111111111;where=2222222222222222"
+	if err := recorder.WriteSnapshotAnchor(ctx, id, ir.SnapshotAnchorRecord{Anchor: anchor, CopyShape: shape}); err != nil {
 		t.Fatalf("WriteSnapshotAnchor: %v", err)
 	}
 	for _, phase := range []ir.MigrationPhase{
@@ -116,13 +124,16 @@ func TestMigrationStateStore_AnchorAndPhaseWritersAreDisjointMySQL(t *testing.T)
 		if got.SnapshotAnchor != anchor {
 			t.Fatalf("the %s phase write ERASED the snapshot anchor (%q)", phase, got.SnapshotAnchor)
 		}
+		if got.CopyShape != shape {
+			t.Fatalf("the %s phase write ERASED the copy shape (%q)", phase, got.CopyShape)
+		}
 		if got.Phase != phase {
 			t.Fatalf("phase = %q after writing %q", got.Phase, phase)
 		}
 	}
 
 	const anchor2 = `{"slot":"sluice_slot","lsn":"0/BBBBBBB"}`
-	if err := recorder.WriteSnapshotAnchor(ctx, id, anchor2); err != nil {
+	if err := recorder.WriteSnapshotAnchor(ctx, id, ir.SnapshotAnchorRecord{Anchor: anchor2, CopyShape: shape}); err != nil {
 		t.Fatalf("WriteSnapshotAnchor (second): %v", err)
 	}
 	got, _, err := store.Read(ctx, id)
@@ -192,13 +203,14 @@ func TestMigrationStateStore_PreAnchorRowReadsCleanlyMySQL(t *testing.T) {
 	if !found {
 		t.Fatal("Read found=false for a row written by an older binary")
 	}
-	if got.SnapshotAnchor != "" {
-		t.Errorf("SnapshotAnchor = %q; want empty (no evidence)", got.SnapshotAnchor)
+	if got.SnapshotAnchor != "" || got.CopyShape != "" {
+		t.Errorf("SnapshotAnchor = %q / CopyShape = %q; want both empty (no evidence)", got.SnapshotAnchor, got.CopyShape)
 	}
 	if got.Phase != ir.MigrationPhaseIndexes || got.LastError != "boom" {
 		t.Errorf("the pre-anchor row's other fields did not survive: %+v", got)
 	}
-	if err := store.(ir.SnapshotAnchorRecorder).WriteSnapshotAnchor(ctx, "sync-old", `{"slot":"s","lsn":"0/1"}`); err != nil {
+	if err := store.(ir.SnapshotAnchorRecorder).WriteSnapshotAnchor(ctx, "sync-old",
+		ir.SnapshotAnchorRecord{Anchor: `{"slot":"s","lsn":"0/1"}`, CopyShape: "where=abc"}); err != nil {
 		t.Fatalf("WriteSnapshotAnchor after the column migration: %v", err)
 	}
 }

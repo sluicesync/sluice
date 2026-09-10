@@ -88,13 +88,21 @@ func copyTableIdempotent(ctx context.Context, rr ir.RowReader, rw ir.RowWriter, 
 // untouched, so the orchestrator can decide what to do next.
 //
 
-func copyTable(ctx context.Context, rr ir.RowReader, rw ir.RowWriter, table *ir.Table, redactor *redact.Registry, shard ShardColumnSpec) (retErr error) {
+// The int64 return is the number of rows this copy MOVED, read off the
+// progress ticker that already counts them. It is recorded on the
+// table's terminal progress entry so the state row carries a per-table
+// expected value rather than only a label — which is what lets the
+// stopped-cold-start resume ask the TARGET whether the rows it is
+// about to skip re-copying are actually there
+// ([Streamer.resumeStoppedColdStart]). Callers that do not record it
+// discard it; it costs an atomic load.
+func copyTable(ctx context.Context, rr ir.RowReader, rw ir.RowWriter, table *ir.Table, redactor *redact.Registry, shard ShardColumnSpec) (rowsCopied int64, retErr error) {
 	copyCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	rows, err := rr.ReadRows(copyCtx, table)
 	if err != nil {
-		return fmt.Errorf("read rows: %w", err)
+		return 0, fmt.Errorf("read rows: %w", err)
 	}
 	pt := newProgressTicker(copyCtx, progressInterval, table.Name)
 	// Async row-count for ETA reporting. Best-effort: failures are
@@ -126,15 +134,20 @@ func copyTable(ctx context.Context, rr ir.RowReader, rw ir.RowWriter, table *ir.
 	// zero-cost passthrough when shard.Name is empty.
 	stamped, _ := shardStampRows(copyCtx, redacted, shard.Name, shard.Value)
 	if err := rw.WriteRows(copyCtx, table, stamped); err != nil {
-		return fmt.Errorf("write rows: %w", err)
+		return 0, fmt.Errorf("write rows: %w", err)
 	}
 	if err := redactErrFn(); err != nil {
-		return fmt.Errorf("redact rows: %w", err)
+		return 0, fmt.Errorf("redact rows: %w", err)
 	}
 	// The writer returned without error, but it may have observed a
 	// truncated stream because the reader aborted mid-table on a
 	// scan/decode failure. Surface that loudly (Bug 68).
-	return migcore.ReaderStreamErr(rr, table)
+	//
+	// The count is read AFTER the writer drained the stream, so it is
+	// the whole table's; on the error paths above it is deliberately 0
+	// rather than partial, because a partial count recorded against a
+	// failed copy would read as an expectation nothing has to meet.
+	return pt.rows.Load(), migcore.ReaderStreamErr(rr, table)
 }
 
 // copyTableColdStartIdempotent is the upsert-form of [copyTable] used

@@ -572,7 +572,7 @@ func runShardConsolidation(t *testing.T, p shardConsolidationParams) {
 
 	shard := ShardColumnSpec{Name: p.shardCol, Value: shardValue}
 	for _, tbl := range injected.Tables {
-		if err := copyTable(ctx, rr, rw, tbl, nil /*redactor*/, shard); err != nil {
+		if _, err := copyTable(ctx, rr, rw, tbl, nil /*redactor*/, shard); err != nil {
 			t.Fatalf("copy table %q (shard %d): %v", tbl.Name, p.shardVal, err)
 		}
 	}

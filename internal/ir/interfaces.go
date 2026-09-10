@@ -3764,6 +3764,37 @@ type MigrationState struct {
 	// [SnapshotAnchorVerifier]), so this column must never normalise,
 	// re-encode or truncate it.
 	SnapshotAnchor string
+
+	// CopyShape fingerprints the operator inputs that decided WHAT the
+	// run's copy put on the target — its row filters, its table scope,
+	// its type overrides, its redaction policy, its shard column, its
+	// target schema. Written with SnapshotAnchor by the same call, and
+	// meaningless without it.
+	//
+	// It exists because a resume that SKIPS the copy inherits run 1's
+	// rows under run 2's flags: a widened `--where`, a dropped
+	// `--redact`, a different `--target-schema` would each leave the
+	// target holding something the new flags do not describe, silently.
+	// The pipeline refuses on any difference. Opaque to this package —
+	// hashes only, never operator predicates, so a control row cannot
+	// leak what a `--where` selected.
+	CopyShape string
+}
+
+// SnapshotAnchorRecord is what a cold start records about the copy it
+// is ABOUT to make: where the source stood, and what shape the copy
+// will have.
+//
+// They are one value because they are only ever meaningful together —
+// an anchor without its shape would let a resume prove WHERE to
+// restart while knowing nothing about whether the rows already on the
+// target are the rows this run's flags describe.
+type SnapshotAnchorRecord struct {
+	// Anchor is the [Position.Token] the snapshot was taken at.
+	Anchor string
+
+	// CopyShape is the shaping fingerprint. Opaque to the store.
+	CopyShape string
 }
 
 // SnapshotAnchorRecorder is the OPTIONAL write half of
@@ -3783,10 +3814,12 @@ type MigrationState struct {
 // a target cannot be resumed after a stop and gets the same refusal it
 // gets today.
 type SnapshotAnchorRecorder interface {
-	// WriteSnapshotAnchor records anchor as the snapshot anchor of
-	// migrationID, creating the header row (at [MigrationPhasePending])
-	// when none exists yet. The token is stored verbatim.
-	WriteSnapshotAnchor(ctx context.Context, migrationID, anchor string) error
+	// WriteSnapshotAnchor records rec against migrationID, creating the
+	// header row (at [MigrationPhasePending]) when none exists yet.
+	// Both fields are stored verbatim and land in ONE statement: a
+	// resume that read an anchor without the matching shape would be
+	// proving half of what it needs.
+	WriteSnapshotAnchor(ctx context.Context, migrationID string, rec SnapshotAnchorRecord) error
 }
 
 // MigrationStateLister is the OPTIONAL enumeration half of

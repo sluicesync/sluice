@@ -93,6 +93,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
@@ -111,6 +112,18 @@ const coldStartResumedMarker = "COLD-START-RESUMED"
 // start because the two positions it names are the operator's evidence
 // that something else consumed their slot.
 const coldStartAnchorMovedMarker = "COLD-START-ANCHOR-MOVED"
+
+// coldStartShapeChangedMarker is the grep-stable marker on the refusal
+// that fires when the re-run's copy-shaping flags no longer describe
+// the copy already on the target (a widened `--where`, a dropped
+// `--redact`, a different `--target-schema`).
+const coldStartShapeChangedMarker = "COLD-START-SHAPE-CHANGED"
+
+// coldStartTargetEmptiedMarker is the grep-stable marker on the
+// refusal that fires when a table the recorded copy filled is empty on
+// the target now — the TRUNCATE case, which every bookkeeping-based
+// check passes.
+const coldStartTargetEmptiedMarker = "COLD-START-TARGET-EMPTIED"
 
 // resumeStoppedColdStart is the A0909-STOP-1 handoff resume.
 //
@@ -174,8 +187,17 @@ func (s *Streamer) resumeStoppedColdStart(
 	// slot already exists and no new one is consumed.
 	schema, _, err := s.coldStartReadSourceSchema(ctx, true)
 	if err != nil {
-		slog.WarnContext(ctx, "pipeline: could not read the source schema while checking for a resumable "+
-			"stopped cold start; continuing as if it cannot be resumed",
+		// Deliberately not "could not read the schema": this phase also
+		// runs every SOURCE-side preflight (RLS, replica identity, a
+		// partitioned table, XID wraparound), so the error here is as
+		// likely to be one of those refusals as a read failure — and
+		// mislabelling a refusal as a read failure sends the operator
+		// looking at connectivity. The cold start below runs the same
+		// phase and surfaces the same error properly; this line only
+		// explains why the resume stood down.
+		slog.WarnContext(ctx, "pipeline: the source-side read and preflight phase did not complete while "+
+			"checking for a resumable stopped cold start, so this run is not resumed; the cold start below "+
+			"runs the same phase and will report the reason in full",
 			slog.String("stream_id", streamID),
 			slog.String("error", err.Error()))
 		return nil, nil, false, nil
@@ -206,6 +228,42 @@ func (s *Streamer) resumeStoppedColdStart(
 			slog.String("phase", string(state.Phase)),
 			slog.String("first_unfinished_table", missing))
 		return nil, nil, false, nil
+	}
+
+	// Gate 6 (C-1): the re-run's flags must describe the copy that is
+	// about to be inherited. Every identity-and-drift door in runOnce
+	// keys on the cdc-state row, which this path does not have — see
+	// coldstart_copy_shape.go for why that is structural and what each
+	// disagreement would cost. This is a REFUSAL rather than a
+	// fall-through: an operator who changed `--where` between runs is
+	// not asking to silently keep the old predicate's rows.
+	current := coldStartCopyShape(s, schema)
+	if state.CopyShape == "" {
+		slog.InfoContext(ctx, "pipeline: this stream's recorded cold start carries no copy-shape fingerprint, "+
+			"so the re-run's flags cannot be checked against the copy already on the target; not resuming",
+			slog.String("stream_id", streamID))
+		return nil, nil, false, nil
+	}
+	if drifted := copyShapeDrift(state.CopyShape, current); len(drifted) > 0 {
+		return nil, nil, true, fmt.Errorf(
+			"pipeline: %s: this stream's recorded cold start finished its bulk copy, but this run's %s "+
+				"%s differ from the run that made it. Resuming would SKIP the copy and leave the target "+
+				"holding rows the current flags did not select or shape — silently, because CDC only carries "+
+				"changes from the snapshot onward and can never backfill them. sluice has changed NOTHING. "+
+				"Re-run with the flags the recorded copy used, or re-run `sluice sync start` with "+ // remedy-partial: the operator's own invocation carries their DSNs
+				"--reset-target-data to copy again under the new ones",
+			coldStartShapeChangedMarker, strings.Join(drifted, ", "), copyShapePlural(drifted),
+		)
+	}
+
+	// Gate 7 (C-2): the TARGET's own account of what it holds. Every
+	// gate above reads the target's BOOKKEEPING, which a TRUNCATE
+	// leaves perfectly intact — indexes and all, so even
+	// verifyBuiltIndexes would pass. The independent value is the rows:
+	// each table the copy recorded a non-zero count for must still hold
+	// something. See [everyCopiedTableStillHasRows].
+	if err := everyCopiedTableStillHasRows(ctx, s, schema, state); err != nil {
+		return nil, nil, true, err
 	}
 
 	// Gate 5: the independent witness. Everything above is the target's
@@ -383,6 +441,104 @@ func everyTableCopied(schema *ir.Schema, state ir.MigrationState) (firstMissing 
 		}
 	}
 	return "", true
+}
+
+// everyCopiedTableStillHasRows is the resume's only check that does
+// not read the target's bookkeeping: it asks the TARGET ITSELF whether
+// the rows the recorded copy put there are still present.
+//
+// # Why it exists (the 2026-08-01 rule, applied to this gate)
+//
+// Every other input to the skip decision — the phase, the per-table
+// `complete` labels, the anchor, the copy shape — is what a previous
+// sluice process wrote down. A TRUNCATE on the target contradicts all
+// of it and disturbs none of it: the control rows survive, the tables
+// survive, the INDEXES survive (so verifyBuiltIndexes passes too), and
+// the copy is skipped onto empty tables at exit 0. The more
+// destructive DROP fails loudly, which is the wrong way round.
+//
+// # The independent expected value, named
+//
+// [ir.TableProgress.RowsCopied], recorded per table by the copy that
+// wrote the rows. A table the copy recorded rows for must still hold
+// at least one; a table it recorded zero for is exempt, because there
+// is nothing to be missing. The probe is [ir.TableEmptyChecker] — the
+// same constant-cost `SELECT 1 … LIMIT 1` the Bug 9 populated-target
+// preflight uses, so this adds one cheap query per table and no new
+// engine surface.
+//
+// # What it does NOT catch, stated rather than implied
+//
+// A PARTIAL deletion. One surviving row satisfies the floor. Catching
+// that needs a full COUNT(*) per table compared against RowsCopied,
+// which is affordable on this path (it runs once, on a recovery) and
+// is the obvious upgrade if a partial-delete case ever shows up; it is
+// not done today because the floor covers the shapes that actually
+// occur (truncate, a wrong `--target` DSN, a dropped-and-recreated
+// table) and an exact comparison would refuse a healthy resume
+// whenever the recorded count and the target's disagree for any
+// reason.
+//
+// A target engine with no [ir.TableEmptyChecker] cannot be probed, and
+// that REFUSES rather than proceeding: the whole point is not to skip
+// a copy without evidence.
+func everyCopiedTableStillHasRows(ctx context.Context, s *Streamer, schema *ir.Schema, state ir.MigrationState) error {
+	expectRows := make([]*ir.Table, 0, len(schema.Tables))
+	for _, table := range schema.Tables {
+		if state.TableProgress[table.Name].RowsCopied > 0 {
+			expectRows = append(expectRows, table)
+		}
+	}
+	if len(expectRows) == 0 {
+		// Either the copy genuinely moved no rows (an empty source, or
+		// every table filtered to nothing), or it was recorded by a
+		// binary that predated the per-table counts. Both are "no
+		// expectation to check" — and both are cheap to re-copy, which
+		// is what the caller falls back to if some other gate refuses.
+		slog.InfoContext(ctx, "pipeline: the recorded cold start reports no rows copied for any in-scope "+
+			"table, so there is nothing to verify on the target before resuming",
+			slog.Int("tables", len(schema.Tables)))
+		return nil
+	}
+
+	rw, err := s.Target.OpenRowWriter(ctx, s.TargetDSN)
+	if err != nil {
+		return connectHint(fmt.Errorf("pipeline: open target row writer to verify the recorded copy: %w", err))
+	}
+	defer migcore.CloseIf(rw)
+	migcore.ApplyTargetSchema(rw, s.TargetSchema)
+	checker, ok := rw.(ir.TableEmptyChecker)
+	if !ok {
+		return fmt.Errorf(
+			"pipeline: %s: this stream's recorded cold start finished its bulk copy, but the target engine "+
+				"cannot be asked whether those rows are still there (no table-emptiness probe), so the copy "+
+				"cannot be skipped on the recorded state alone. Re-run `sluice sync start` with "+ // remedy-partial: the operator's own invocation carries their DSNs
+				"--reset-target-data to copy again",
+			coldStartTargetEmptiedMarker,
+		)
+	}
+
+	for _, table := range expectRows {
+		empty, err := checker.IsTableEmpty(ctx, table)
+		if err != nil {
+			return fmt.Errorf(
+				"pipeline: %s: could not verify that the recorded copy's rows are still on the target for "+
+					"table %q, so the copy cannot be skipped: %w",
+				coldStartTargetEmptiedMarker, table.Name, err,
+			)
+		}
+		if empty {
+			return fmt.Errorf(
+				"pipeline: %s: the recorded cold start copied %d rows into %q, but that table is EMPTY on the "+
+					"target now. Something removed them after the copy (a TRUNCATE leaves the control rows and "+
+					"the indexes intact, so nothing else notices). Resuming would skip the copy and start CDC "+
+					"over an empty table, which no later change can backfill. sluice has changed NOTHING; "+
+					"re-run `sluice sync start` with --reset-target-data to copy again", // remedy-partial: the operator's own invocation carries their DSNs
+				coldStartTargetEmptiedMarker, state.TableProgress[table.Name].RowsCopied, table.Name,
+			)
+		}
+	}
+	return nil
 }
 
 // runColdStartResumePhases finishes the post-copy ladder from the

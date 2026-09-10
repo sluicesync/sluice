@@ -471,7 +471,7 @@ func tryParallelCopyTable(
 	// (ADR-0076) — and only this table's progress row is upserted
 	// (ADR-0082).
 	setTableProgressAndWrite(ctx, rc, state, stateMu, table.Name,
-		ir.TableProgress{State: ir.TableProgressComplete})
+		ir.TableProgress{State: ir.TableProgressComplete, RowsCopied: tableRows})
 	return true, nil
 }
 

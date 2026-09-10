@@ -76,7 +76,7 @@ func newMigrationStateStore(db *sql.DB, upsert upsertSpelling) *MigrationStateSt
 			},
 			SQL: migratestate.SQL{
 				ReadHeader: "SELECT phase, table_progress, state_format, started_at, updated_at, last_error, " +
-					"snapshot_anchor FROM " + hdr + " WHERE migration_id = ?",
+					"snapshot_anchor, copy_shape FROM " + hdr + " WHERE migration_id = ?",
 				ReadProgressRows: "SELECT table_name, progress, updated_at FROM " +
 					prog + " WHERE migration_id = ?",
 				ListHeadersByPrefix: "SELECT migration_id, phase, started_at, updated_at, last_error FROM " +
@@ -106,9 +106,10 @@ func newMigrationStateStore(db *sql.DB, upsert upsertSpelling) *MigrationStateSt
 				// mark owns (migratestate.SQL). started_at/updated_at are the
 				// column defaults on insert and the ON UPDATE clause after.
 				UpsertSnapshotAnchor: "INSERT INTO " + hdr + " " +
-					"(migration_id, phase, table_progress, state_format, snapshot_anchor) " +
-					"VALUES (?, ?, ?, ?, ?)" + upsert.clauseOpen() +
-					"snapshot_anchor = " + upsert.newRowRef("snapshot_anchor"),
+					"(migration_id, phase, table_progress, state_format, snapshot_anchor, copy_shape) " +
+					"VALUES (?, ?, ?, ?, ?, ?)" + upsert.clauseOpen() +
+					"snapshot_anchor = " + upsert.newRowRef("snapshot_anchor") + ", " +
+					"copy_shape = " + upsert.newRowRef("copy_shape"),
 				UpsertProgressRow: "INSERT INTO " + prog + " " +
 					"(migration_id, table_name, progress) " +
 					"VALUES (?, ?, ?)" + upsert.clauseOpen() +
@@ -213,6 +214,7 @@ func migrateStateHeaderDDL() string {
 	last_error      TEXT         NULL,
 	ps_query_timeout_raise TEXT  NULL,
 	snapshot_anchor TEXT         NULL,
+	copy_shape      TEXT         NULL,
 	PRIMARY KEY (migration_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
 }
@@ -251,12 +253,15 @@ func (s *MigrationStateStore) ensureStateFormatColumn(ctx context.Context) error
 	return s.ensureHeaderColumn(ctx, "state_format", "INT NOT NULL DEFAULT 1")
 }
 
-// ensureSnapshotAnchorColumn adds the A0909-STOP-1 snapshot_anchor
-// column to a header table created by a binary that predates it.
-// NULLable and defaultless: an existing row keeps reading as "no
-// anchor recorded", which is exactly what it is.
+// ensureSnapshotAnchorColumn adds the two A0909-STOP-1 columns to a
+// header table created by a binary that predates them. NULLable and
+// defaultless: an existing row keeps reading as "nothing recorded",
+// which is exactly what it is.
 func (s *MigrationStateStore) ensureSnapshotAnchorColumn(ctx context.Context) error {
-	return s.ensureHeaderColumn(ctx, "snapshot_anchor", "TEXT NULL")
+	if err := s.ensureHeaderColumn(ctx, "snapshot_anchor", "TEXT NULL"); err != nil {
+		return err
+	}
+	return s.ensureHeaderColumn(ctx, "copy_shape", "TEXT NULL")
 }
 
 // ensureHeaderColumn is the migrate-state header's additive-column
@@ -331,8 +336,8 @@ func (s *MigrationStateStore) WriteTableProgress(ctx context.Context, migrationI
 // target is. Whether the anchor can then be RESUMED from is a property
 // of the SOURCE engine ([ir.SnapshotAnchorVerifier]), which MySQL does
 // not implement; see the pipeline's cold-start resume gate.
-func (s *MigrationStateStore) WriteSnapshotAnchor(ctx context.Context, migrationID, anchor string) error {
-	return s.shared.WriteSnapshotAnchor(ctx, migrationID, anchor)
+func (s *MigrationStateStore) WriteSnapshotAnchor(ctx context.Context, migrationID string, rec ir.SnapshotAnchorRecord) error {
+	return s.shared.WriteSnapshotAnchor(ctx, migrationID, rec)
 }
 
 // ClearMigration deletes the progress rows and header row for

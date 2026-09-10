@@ -75,7 +75,7 @@ func newMigrationStateStore(db *sql.DB, schema string) *MigrationStateStore {
 			},
 			SQL: migratestate.SQL{
 				ReadHeader: "SELECT phase, table_progress, state_format, started_at, updated_at, last_error, " +
-					"snapshot_anchor FROM " + hdr + " WHERE migration_id = $1",
+					"snapshot_anchor, copy_shape FROM " + hdr + " WHERE migration_id = $1",
 				ReadProgressRows: "SELECT table_name, progress, updated_at FROM " +
 					prog + " WHERE migration_id = $1",
 				ListHeadersByPrefix: "SELECT migration_id, phase, started_at, updated_at, last_error FROM " +
@@ -114,10 +114,13 @@ func newMigrationStateStore(db *sql.DB, schema string) *MigrationStateStore {
 				// nothing else, so it can never move the phase a concurrent
 				// or later phase mark owns (migratestate.SQL).
 				UpsertSnapshotAnchor: "INSERT INTO " + hdr + " " +
-					"(migration_id, phase, table_progress, state_format, started_at, updated_at, snapshot_anchor) " +
-					"VALUES ($1, $2, $3, $4, pg_catalog.timezone('utc', pg_catalog.now()), pg_catalog.timezone('utc', pg_catalog.now()), $5) " +
+					"(migration_id, phase, table_progress, state_format, started_at, updated_at, " +
+					"snapshot_anchor, copy_shape) " +
+					"VALUES ($1, $2, $3, $4, pg_catalog.timezone('utc', pg_catalog.now()), " +
+					"pg_catalog.timezone('utc', pg_catalog.now()), $5, $6) " +
 					"ON CONFLICT (migration_id) DO UPDATE SET " +
 					"snapshot_anchor = EXCLUDED.snapshot_anchor, " +
+					"copy_shape = EXCLUDED.copy_shape, " +
 					"updated_at = pg_catalog.timezone('utc', pg_catalog.now())",
 				UpsertProgressRow: "INSERT INTO " + prog + " " +
 					"(migration_id, table_name, progress, updated_at) " +
@@ -169,6 +172,7 @@ func (s *MigrationStateStore) EnsureControlTable(ctx context.Context) error {
 			updated_at      TIMESTAMP    NOT NULL DEFAULT (pg_catalog.timezone('utc', pg_catalog.now())),
 			last_error      TEXT         NULL,
 			snapshot_anchor TEXT         NULL,
+			copy_shape      TEXT         NULL,
 			PRIMARY KEY (migration_id)
 		)`
 	if _, err := s.db.ExecContext(ctx, hdrDDL); err != nil {
@@ -179,13 +183,20 @@ func (s *MigrationStateStore) EnsureControlTable(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, addFormat); err != nil {
 		return fmt.Errorf("postgres: ensure migrate-state table: add state_format: %w", err)
 	}
-	// snapshot_anchor (A0909-STOP-1): NULLable and defaultless, so an
-	// existing row keeps reading as "no anchor recorded" — which is what
-	// it is. Same additive shape as state_format above.
-	addAnchor := "ALTER TABLE " + hdr +
-		" ADD COLUMN IF NOT EXISTS snapshot_anchor TEXT NULL"
-	if _, err := s.db.ExecContext(ctx, addAnchor); err != nil {
-		return fmt.Errorf("postgres: ensure migrate-state table: add snapshot_anchor: %w", err)
+	// snapshot_anchor + copy_shape (A0909-STOP-1): NULLable and
+	// defaultless, so an existing row keeps reading as "nothing
+	// recorded" — which is what it is. Same additive shape as
+	// state_format above. The two are always written together; they are
+	// separate columns rather than one because an operator inspecting
+	// the row in psql should be able to read the position without
+	// parsing a fingerprint out of it.
+	for _, add := range []string{
+		"ALTER TABLE " + hdr + " ADD COLUMN IF NOT EXISTS snapshot_anchor TEXT NULL",
+		"ALTER TABLE " + hdr + " ADD COLUMN IF NOT EXISTS copy_shape TEXT NULL",
+	} {
+		if _, err := s.db.ExecContext(ctx, add); err != nil {
+			return fmt.Errorf("postgres: ensure migrate-state table: %s: %w", add, err)
+		}
 	}
 	progDDL := `
 		CREATE TABLE IF NOT EXISTS ` + prog + ` (
@@ -234,10 +245,10 @@ func (s *MigrationStateStore) WriteTableProgress(ctx context.Context, migrationI
 }
 
 // WriteSnapshotAnchor implements [ir.SnapshotAnchorRecorder]: it
-// records the run's snapshot anchor token on the header row and
-// touches no other column.
-func (s *MigrationStateStore) WriteSnapshotAnchor(ctx context.Context, migrationID, anchor string) error {
-	return s.shared.WriteSnapshotAnchor(ctx, migrationID, anchor)
+// records the run's snapshot anchor and copy-shape fingerprint on the
+// header row and touches no other column.
+func (s *MigrationStateStore) WriteSnapshotAnchor(ctx context.Context, migrationID string, rec ir.SnapshotAnchorRecord) error {
+	return s.shared.WriteSnapshotAnchor(ctx, migrationID, rec)
 }
 
 // ClearMigration deletes the progress rows and header row for

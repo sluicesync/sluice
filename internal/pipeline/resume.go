@@ -301,32 +301,43 @@ func newSyncRecordingContext(ctx context.Context, store ir.MigrationStateStore, 
 // 0. Clearing here makes that window carry no evidence at all, which is
 // the truth about it.
 //
-// # The anchor
+// # The record
 //
 // Recorded at the START of the copy rather than at its end because the
 // point is to survive an interrupt; a token written only on success
 // would be missing in exactly the case it exists for. Recording it
 // early is safe because the anchor alone licenses nothing — the gate
-// additionally requires the per-table evidence that the copy finished
-// AND the source's own confirmation that the slot still stands there.
+// additionally requires the per-table evidence that the copy finished,
+// the copy-shape fingerprint recorded beside it, the target's own
+// rows, AND the source's confirmation that the slot still stands
+// there.
 //
 // Both steps are best-effort with a WARN: this is the same trade the
 // rest of the recording context takes (see [newSyncRecordingContext]).
 // Failing them degrades a stopped run to today's re-copy; failing the
 // COPY over them would break a configuration that works.
-func beginRecordedColdStart(ctx context.Context, rc resumeContext, snapshotAnchor string) {
+func beginRecordedColdStart(ctx context.Context, rc resumeContext, rec ir.SnapshotAnchorRecord) {
 	if !rc.writes() {
 		return
 	}
 	if err := rc.store.ClearMigration(ctx, rc.migrationID); err != nil {
+		// What actually survives this branch: the PREVIOUS run's rows,
+		// anchor and shape, all of them stale. That is fail-safe rather
+		// than fail-open, and for a reason worth stating precisely — the
+		// stale anchor names the slot the previous run created, and this
+		// run creates a NEW slot at a new consistent point, so the
+		// source-side verification cannot match and the resume refuses.
+		// The honest cost is a stale `sync status` and a stopped run
+		// that will not resume.
 		slog.WarnContext(ctx, "pipeline: cold start could not clear the previous run's recorded progress; "+
-			"`sync status` may show stale per-table rows for this stream, and a stop before the CDC anchor "+
-			"will not be resumable",
+			"`sync status` may show stale per-table rows for this stream, and if this run is STOPPED before "+
+			"its CDC anchor is written the resume will refuse (the recorded anchor is the PREVIOUS run's and "+
+			"cannot match this run's replication slot), leaving drop-the-slot-and-re-copy as the way out",
 			slog.String("migration_id", rc.migrationID),
 			slog.String("error", err.Error()))
 		return
 	}
-	if snapshotAnchor == "" {
+	if rec.Anchor == "" {
 		// A source whose snapshot carries no position token records no
 		// anchor. Stated rather than silent: such a cold start is not
 		// resumable after a stop, and the gate will say so by finding
@@ -337,7 +348,7 @@ func beginRecordedColdStart(ctx context.Context, rc resumeContext, snapshotAncho
 	if !ok {
 		return
 	}
-	if err := recorder.WriteSnapshotAnchor(ctx, rc.migrationID, snapshotAnchor); err != nil {
+	if err := recorder.WriteSnapshotAnchor(ctx, rc.migrationID, rec); err != nil {
 		slog.WarnContext(ctx, "pipeline: cold start could not record its snapshot anchor; if this run is "+
 			"STOPPED after the copy but before the CDC anchor is written, it will not be resumable and the "+
 			"only way forward will be to drop the replication slot and copy again",

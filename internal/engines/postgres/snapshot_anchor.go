@@ -40,9 +40,43 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
+
+	"github.com/jackc/pglogrepl"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
+
+// snapshotSourceIdentity is the ADR-0051 (systemid, timeline) pin, or
+// the zero value when the probe could not run.
+type snapshotSourceIdentity struct {
+	SystemID string
+	Timeline int32
+}
+
+// identifySnapshotSource reads IDENTIFY_SYSTEM on the slot-creation
+// replication connection so the snapshot's position can carry the
+// source's identity from the moment it is taken.
+//
+// Best-effort with a WARN rather than an error: an unstamped position
+// behaves exactly as every pre-A0909-STOP-1 position did (the pin
+// installs lazily on first stream), so a failed probe must not fail a
+// cold start that is otherwise fine. The WARN says what the operator
+// loses, because "no identity pin" is the state in which a replaced
+// source is accepted silently.
+func identifySnapshotSource(ctx context.Context, replConn *pgconn.PgConn, slotName string) snapshotSourceIdentity {
+	sysident, err := pglogrepl.IdentifySystem(ctx, replConn)
+	if err != nil {
+		slog.WarnContext(ctx, "postgres: snapshot: could not read IDENTIFY_SYSTEM, so this snapshot's position "+
+			"carries no source-identity pin: a later resume from it cannot tell this instance from a clone, a "+
+			"restored backup or a promoted standby, and will install the pin from whatever answers the DSN then",
+			slog.String("slot", slotName),
+			slog.String("error", err.Error()))
+		return snapshotSourceIdentity{}
+	}
+	return snapshotSourceIdentity{SystemID: sysident.SystemID, Timeline: sysident.Timeline}
+}
 
 // VerifySnapshotAnchor implements [ir.SnapshotAnchorVerifier].
 //
@@ -52,7 +86,8 @@ import (
 //   - the anchor decodes as one of THIS engine's position tokens and
 //     names the slot the caller resolved (a token naming a different
 //     slot is not evidence about this one);
-//   - that slot still exists;
+//   - that slot still exists, and is bound to the database this run
+//     connects to;
 //   - nothing is attached to it (active = false) — an attached consumer
 //     may be advancing it as we look, so "equal right now" would prove
 //     nothing a moment later;
@@ -62,6 +97,26 @@ import (
 // Any other outcome is an error naming both the recorded and the
 // observed value, because the caller's only sound response is to refuse
 // and hand an operator those two numbers.
+//
+// # What it does NOT check here, and where that check lives
+//
+// The source's IDENTITY. A physical clone, a restored backup or a
+// promoted standby can carry a slot of the same name at the same LSN,
+// and none of the four conditions above can tell it apart. That
+// question is answered one step later and by the existing machinery:
+// the snapshot's position now carries the ADR-0051 (systemid,
+// timeline) pin from the moment the slot is created (see
+// [identifySnapshotSource]), so the resumed stream's own
+// StreamChanges runs [checkSourceIdentity] against the live
+// IDENTIFY_SYSTEM and refuses a divergence. Before that stamp the pin
+// installed LAZILY on first use, which for a first resume means it
+// compared against nothing.
+//
+// The residual, stated: a position recorded by a binary older than
+// that stamp carries no pin, so a resume from it still installs
+// lazily and cannot catch a replaced source. Such a position also
+// predates the copy-shape fingerprint, and the pipeline refuses a
+// resume without one — so the two gaps close together.
 func (e Engine) VerifySnapshotAnchor(ctx context.Context, dsn, slotName, recordedAnchor string) (ir.Position, error) {
 	if recordedAnchor == "" {
 		return ir.Position{}, errors.New("postgres: verify snapshot anchor: no anchor was recorded")
@@ -107,18 +162,29 @@ func (e Engine) VerifySnapshotAnchor(ctx context.Context, dsn, slotName, recorde
 	// of an optimisation. An unparseable recorded LSN errors here rather
 	// than silently comparing unequal — decodePGPos already rejected
 	// that shape, so this is the belt to its braces.
+	// `database` is projected and compared because slot NAMES are
+	// cluster-global while a logical slot is bound to ONE database: a
+	// slot of this name can exist, sit at exactly this LSN, and decode
+	// a different database entirely. Without the comparison this
+	// function would report "the anchor is intact" about a slot the
+	// stream cannot use, which asserts more than it proves.
 	const q = `
 		SELECT active,
 		       COALESCE(confirmed_flush_lsn::text, ''),
-		       confirmed_flush_lsn IS NOT DISTINCT FROM $2::pg_lsn
+		       confirmed_flush_lsn IS NOT DISTINCT FROM $2::pg_lsn,
+		       COALESCE(database, ''),
+		       pg_catalog.current_database()
 		FROM   pg_replication_slots
 		WHERE  slot_name = $1`
 	var (
-		active    bool
-		confirmed string
-		atAnchor  bool
+		active            bool
+		confirmed         string
+		atAnchor          bool
+		slotDB, currentDB string
 	)
-	switch err := db.QueryRowContext(ctx, q, want, decoded.LSN).Scan(&active, &confirmed, &atAnchor); {
+	switch err := db.QueryRowContext(ctx, q, want, decoded.LSN).Scan(
+		&active, &confirmed, &atAnchor, &slotDB, &currentDB,
+	); {
 	case errors.Is(err, sql.ErrNoRows):
 		return ir.Position{}, fmt.Errorf(
 			"postgres: verify snapshot anchor: replication slot %q does not exist on this source: %w",
@@ -126,6 +192,14 @@ func (e Engine) VerifySnapshotAnchor(ctx context.Context, dsn, slotName, recorde
 		)
 	case err != nil:
 		return ir.Position{}, fmt.Errorf("postgres: verify snapshot anchor: read slot %q: %w", want, err)
+	}
+	if slotDB != currentDB {
+		return ir.Position{}, fmt.Errorf(
+			"postgres: verify snapshot anchor: replication slot %q is bound to database %q but this run "+
+				"connects to %q; a logical slot decodes only the database it was created in, so this slot "+
+				"cannot carry this stream's changes whatever its position reads",
+			want, slotDB, currentDB,
+		)
 	}
 	if active {
 		return ir.Position{}, fmt.Errorf(
