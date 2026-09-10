@@ -6,8 +6,12 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
+
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/sqlident"
@@ -251,10 +255,69 @@ func (w *SchemaWriter) sequenceExists(ctx context.Context, name string) (bool, e
 func readSequencePositionOn(ctx context.Context, db *sql.DB, schema, name string) (lastValue int64, isCalled bool, err error) {
 	q := fmt.Sprintf(`SELECT last_value, is_called FROM %s.%s`,
 		quoteIdent(schema), quoteIdent(name))
-	if err := db.QueryRowContext(ctx, q).Scan(&lastValue, &isCalled); err != nil {
+	err = db.QueryRowContext(ctx, q).Scan(&lastValue, &isCalled)
+	if err == nil {
+		return lastValue, isCalled, nil
+	}
+	if !isNekiRelationReadRefusal(err) {
 		return 0, false, err
 	}
-	return lastValue, isCalled, nil
+	return readSequencePositionFromCatalog(ctx, db, schema, name)
+}
+
+// isNekiRelationReadRefusal reports whether err is a PlanetScale Neki router
+// refusing to read a sequence (or index) AS A RELATION.
+//
+// Measured 2026-09-10:
+//
+//	SELECT last_value, is_called FROM public.cf_demo_id_seq
+//	  ERROR: not implemented: reading relation "public.cf_demo_id_seq"
+//	         (a sequence or index) as a relation (SQLSTATE NK013)
+//
+// Deliberately narrow. It keys on Neki's own SQLSTATE plus the specific
+// message, so it cannot swallow a permission error, a missing sequence, or
+// anything else — those still surface unchanged. NK013 is Neki's
+// "recognised but not implemented on the router" code and no other engine
+// emits it.
+func isNekiRelationReadRefusal(err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "NK013" {
+		return false
+	}
+	return strings.Contains(pgErr.Message, "as a relation")
+}
+
+// readSequencePositionFromCatalog answers the same question through
+// `pg_sequences`, which a Neki router does serve.
+//
+// The view exposes `last_value` but not `is_called`, and PostgreSQL's own
+// definition is what makes that sufficient rather than a guess:
+// pg_sequences.last_value is "the last sequence value written to disk …
+// NULL if the sequence has not been read from yet". So a NULL is exactly the
+// not-yet-called state, in which the relation read would have reported
+// (start_value, is_called=false) — and start_value is in the same row.
+//
+// The mapping is therefore total and lossless for this function's purpose:
+//
+//	last_value NULL     -> (start_value, false)
+//	last_value non-NULL -> (last_value,  true)
+//
+// Used ONLY on the Neki fallback path, so vanilla PostgreSQL keeps reading
+// the relation exactly as before and none of the forward-only re-prime
+// comparisons change shape.
+func readSequencePositionFromCatalog(ctx context.Context, db *sql.DB, schema, name string) (lastValue int64, isCalled bool, err error) {
+	const q = `SELECT last_value, start_value FROM pg_catalog.pg_sequences
+	           WHERE schemaname = $1 AND sequencename = $2`
+	var last sql.NullInt64
+	var start int64
+	if err := db.QueryRowContext(ctx, q, schema, name).Scan(&last, &start); err != nil {
+		return 0, false, fmt.Errorf("postgres: read sequence position from pg_sequences for %q.%q: %w",
+			schema, name, err)
+	}
+	if !last.Valid {
+		return start, false, nil
+	}
+	return last.Int64, true, nil
 }
 
 // sequencePositionBehind reports whether position (aLV, aCalled) is

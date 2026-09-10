@@ -278,6 +278,12 @@ func (v *Verifier) Run(ctx context.Context) (*VerifyResult, error) {
 		return nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("verify: open target schema reader: %w", err))
 	}
 	defer migcore.CloseIf(tr)
+	// Same reasoning as the diff path: verify reads both schemas to compare
+	// what exists, translating nothing, so a verbatim-only type on either
+	// side must not fail the command. Source uses the computed same-engine
+	// predicate; target is same-engine by construction.
+	migcore.ApplyVerbatimExtensionPassthrough(sr, verbatimLiveSameEnginePG(v.Source, v.Target))
+	migcore.ApplyVerbatimExtensionPassthrough(tr, true)
 
 	srcVerifier, ok := sr.(ir.Verifier)
 	if !ok {

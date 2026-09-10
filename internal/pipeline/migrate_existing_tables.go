@@ -350,6 +350,28 @@ func (g *existingTablesGate) readTargetTablesUncached(ctx context.Context) (map[
 		warnFallback("enable PG extensions on target reader", err)
 		return nil, false
 	}
+	// Reading a PG target with the PG reader is same-engine BY DEFINITION —
+	// there is no cross-engine translation happening here, we are only
+	// learning the shape the target already has. Without this, a target
+	// holding any verbatim-only type (a range type, tsvector, tsquery, an
+	// uncatalogued user-defined type) fails the read with `unsupported
+	// data_type`, and BOTH checks below it — the pre-create shape compare
+	// and the pre-existing-foreign-key check — silently degrade to a WARN.
+	//
+	// That is a gate turning itself off on a whole class of target. The
+	// foreign-key half is the one that costs: SLUICE-E-TARGET-PREEXISTING-
+	// FOREIGN-KEY exists because a field report died ~20 seconds into a cold
+	// start on exactly the constraint it detects, and on a target with a
+	// range column the operator would have got that mid-copy 23503 instead
+	// of the refusal.
+	//
+	// Found while migrating a PlanetScale Postgres database (which carries
+	// int4range / tstzrange) into Neki, but it is not Neki-specific and not
+	// new: any PG -> PG run into a target holding one of these types loses
+	// both checks. [schema_seed.go]'s target-zone-witness read already
+	// passes true here for the same reason; this call site was the sibling
+	// that did not.
+	migcore.ApplyVerbatimExtensionPassthrough(tr, true)
 	actual, err := tr.ReadSchema(ctx)
 	if err != nil {
 		warnFallback("read target schema", err)

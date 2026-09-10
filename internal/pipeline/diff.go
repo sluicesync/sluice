@@ -209,6 +209,14 @@ func (d *Differ) Run(ctx context.Context) (*irdiff.SchemaDiff, error) {
 	if err := applyEnabledPGExtensions(ctx, sr, d.EnabledPGExtensions); err != nil {
 		return nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("diff: enable PG extensions on source: %w", err))
 	}
+	// A diff compares two schemas as they ARE; nothing is translated, so
+	// the cross-engine refusal for verbatim-only types protects nothing here
+	// and instead fails the whole command on any PG database holding a range
+	// type, tsvector, tsquery or an uncatalogued user-defined type. Measured:
+	// `schema diff` between two PostgreSQL databases died with
+	// `unsupported data_type "int4range"`. Same predicate as the migrate and
+	// cold-start source reads, so a genuinely cross-engine diff is unchanged.
+	migcore.ApplyVerbatimExtensionPassthrough(sr, verbatimLiveSameEnginePG(d.Source, d.Target))
 
 	// Engine-default exclusions (Bug 22): same shape as Migrator and
 	// Streamer — merge engine-supplied patterns (e.g. PlanetScale's
@@ -297,6 +305,10 @@ func (d *Differ) Run(ctx context.Context) (*irdiff.SchemaDiff, error) {
 	if err := applyEnabledPGExtensions(ctx, tr, d.EnabledPGExtensions); err != nil {
 		return nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("diff: enable PG extensions on target: %w", err))
 	}
+	// Unconditional, like schema_seed.go's target-zone-witness read:
+	// reading a PG target with the PG reader is same-engine by definition,
+	// and engines that do not implement the surface ignore it.
+	migcore.ApplyVerbatimExtensionPassthrough(tr, true)
 	defer migcore.CloseIf(tr)
 
 	actual, err := tr.ReadSchema(ctx)
