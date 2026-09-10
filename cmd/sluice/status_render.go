@@ -423,9 +423,19 @@ func classifyLeasesForSummary(leases []ir.ShardConsolidationLeaseRow, now time.T
 // The heartbeat age is the load-bearing column and the reason this is
 // not just a phase label: a phase alone is indistinguishable between a
 // run that is working and one that died mid-phase and left its last row
-// behind. An age that keeps climbing across two `sync status` calls is
-// how an operator tells those apart, so the age is stated as "last
-// progress write" rather than something vaguer.
+// behind.
+//
+// CORRECTED 2026-09-10 (found by the A0909-P2b work): this comment used
+// to say a climbing age across two calls is how an operator tells those
+// apart. It is not, during the copy. The header row this renders moves
+// on markPhase / markComplete; per-table progress lands in a DIFFERENT
+// table (UpsertProgressRow), and the lister reads only the header. So a
+// long copy of one large table holds this age still while the run is
+// perfectly healthy, and the advice told the operator to conclude the
+// opposite — the confidently-wrong-signal class the 2026-09-08 field
+// report made expensive. The rendered guidance now says the PHASE is
+// the liveness signal and a climbing age only means something once the
+// phase has also stopped.
 func writeColdStartsText(out io.Writer, coldStarts []ir.MigrationState, now time.Time) error {
 	if _, err := fmt.Fprintln(out, "cold start in progress (no CDC anchor yet — this is expected, not a stall):"); err != nil {
 		return err
@@ -457,8 +467,10 @@ func writeColdStartsText(out io.Writer, coldStarts []ir.MigrationState, now time
 	_, err := fmt.Fprintln(out,
 		"  A cold start writes its stream row only after the copy, the index build and the FLOAT exact\n"+
 			"  re-read all finish, so `sync health` reports it as not-found until then. Re-run this command:\n"+
-			"  a LAST PROGRESS WRITE age that keeps climbing means the run is gone; one that resets means it\n"+
-			"  is working.")
+			"  the PHASE advancing means it is working. LAST PROGRESS WRITE moves when the phase does, so a\n"+
+			"  long copy of a large table can hold it still for a while — a climbing age is only evidence\n"+
+			"  the run is gone if the PHASE has also stopped moving, and on a big table that can take a\n"+
+			"  long time. Check the target's row counts before killing a run on this signal alone.")
 	return err
 }
 

@@ -52,8 +52,20 @@ func TestStatusRendersColdStartsInProgress(t *testing.T) {
 		}
 		// The recovery instruction is the point of the block: without it
 		// the operator still cannot tell working from dead.
-		if !strings.Contains(got, "keeps climbing") {
-			t.Errorf("the block does not say how to tell a working cold start from a dead one:\n%s", got)
+		//
+		// It asserts the PHASE, not the age. This used to require the
+		// phrase "keeps climbing", from guidance that said a climbing
+		// LAST PROGRESS WRITE age alone meant the run was gone. That was
+		// wrong for the whole copy phase: the header row this renders
+		// moves on markPhase/markComplete, while per-table progress goes
+		// to a different table the lister does not read, so a long copy of
+		// one large table holds the age still on a perfectly healthy run
+		// (found by the A0909-P2b work). Pinning the old phrase would pin
+		// the old, wrong advice.
+		if !strings.Contains(got, "PHASE advancing means it is working") {
+			t.Errorf("the block does not name the PHASE as the liveness signal, so an operator still cannot "+
+				"tell a working cold start from a dead one — and the age alone cannot tell them, which is "+
+				"why this asserts the phase:\n%s", got)
 		}
 	})
 

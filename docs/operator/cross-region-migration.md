@@ -63,7 +63,7 @@ STREAM        PHASE      STARTED               LAST PROGRESS WRITE
 prod-cutover  bulk_copy  2026-09-08T10:31:02Z  4s ago
 ```
 
-**`LAST PROGRESS WRITE` is the column that matters**, not the phase. A phase alone cannot tell a run that is working from one that died mid-phase and left its last row behind. Run the command twice: an age that keeps climbing means the run is gone; one that resets means it is working. `sync health` says the same thing in its error, and still exits non-zero — a cold start is not a healthy stream, and a cron probe that treated it as one would go quiet exactly when a stuck cold start needed attention.
+**The PHASE advancing is the liveness signal.** `LAST PROGRESS WRITE` moves when the phase does — per-table progress is written to a separate table that `sync status` does not read — so a long copy of one large table can hold that age still for a long time while the run is perfectly healthy. **A climbing age is evidence the run is gone only once the PHASE has also stopped moving**, and on a big table that can take a while. Before killing a run on this signal, compare the target's row counts against the source. (Until v0.149.0 this section said a climbing age alone meant the run was gone; that was wrong for the whole copy phase.) `sync health` says the same thing in its error, and still exits non-zero — a cold start is not a healthy stream, and a cron probe that treated it as one would go quiet exactly when a stuck cold start needed attention.
 
 Before v0.148.0 all three commands reported only **not found on target**, with no way to tell that from a dead process. If you are on an older build, that is what the silence means.
 
