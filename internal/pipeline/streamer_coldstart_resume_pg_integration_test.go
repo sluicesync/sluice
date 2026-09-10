@@ -108,6 +108,14 @@ func stopColdStartInIndexBuild(t *testing.T, streamID string) stoppedColdStart {
 		cancel()
 	})
 
+	// POSITIVE CONTROL for the no-re-copy witness the headline pin
+	// uses. That witness asserts the copy seam fires ZERO times during
+	// a resume, which proves nothing unless the seam fires when a copy
+	// DOES run. Record run 1's copies here and require at least one.
+	var run1Copied []string
+	prevCopyObserver := onTableCopiedObserver
+	onTableCopiedObserver = func(table string) { run1Copied = append(run1Copied, table) }
+
 	errCh := make(chan error, 1)
 	go func() { errCh <- newRun().Run(ctx) }()
 
@@ -131,8 +139,13 @@ func stopColdStartInIndexBuild(t *testing.T, streamID string) stoppedColdStart {
 	// Restore BEFORE any resume: leaving the failpoint armed would cancel
 	// the resume's own index build too.
 	restore()
+	onTableCopiedObserver = prevCopyObserver
 	if runErr == nil {
 		t.Fatal("the cancelled cold start returned nil; the stop did not interrupt it")
+	}
+	if len(run1Copied) == 0 {
+		t.Fatal("the copy-completion seam did not fire during the INTERRUPTED cold start, so the headline " +
+			"pin's 'the copy did not run' witness would be satisfied by a dead seam rather than by a resume")
 	}
 
 	// The window this pin requires, asserted rather than assumed.
@@ -204,10 +217,20 @@ func TestStreamer_ColdStartStoppedInIndexBuild_PG_ResumesWithoutRecopy(t *testin
 		t.Logf("recorded phase after the interrupted index build: %q", phase)
 	}
 
-	// Witness 1 (no re-copy): remove a row from the TARGET that the
-	// source still has. A re-copy puts it back; CDC never will, because
-	// the row predates the snapshot.
-	execOnTarget(t, st.tgt, "DELETE FROM resume_t WHERE id = 7")
+	// Witness 1 (no re-copy): the copy pool's own per-table completion
+	// seam must not fire at all during the resumed run.
+	//
+	// The first cut of this witness DELETEd a row from the target and
+	// asserted it stayed deleted — which works only because the
+	// target-row floor is a non-empty check rather than an exact count,
+	// so the witness depended on a gate being loose, and would break the
+	// day that floor is tightened. Observing the copy directly says the
+	// same thing without tampering with the target.
+	var copied []string
+	prevObserver := onTableCopiedObserver
+	onTableCopiedObserver = func(table string) { copied = append(copied, table) }
+	t.Cleanup(func() { onTableCopiedObserver = prevObserver })
+
 	// Witness 2 (losslessness): a row committed on the SOURCE while
 	// sluice is stopped. It is after the snapshot's consistent point, so
 	// the resumed stream must deliver it.
@@ -219,15 +242,16 @@ func TestStreamer_ColdStartStoppedInIndexBuild_PG_ResumesWithoutRecopy(t *testin
 	resumeErr := make(chan error, 1)
 	go func() { resumeErr <- st.newRun().Run(resumeCtx) }()
 
-	// The live change proves CDC is running from the recorded anchor.
-	// resumeFixtureRows - 1 (the deleted witness) + 1 (the live insert).
-	if !waitForExactRowCount(st.tgt, "resume_t", resumeFixtureRows, 3*time.Minute) {
+	// The live change proves CDC is running from the recorded anchor:
+	// the copied rows plus the one committed during the stop.
+	const wantRows = resumeFixtureRows + 1
+	if !waitForExactRowCount(st.tgt, "resume_t", wantRows, 3*time.Minute) {
 		select {
 		case err := <-resumeErr:
 			t.Fatalf("the resumed run exited instead of streaming: %v\nlogs:\n%s", err, logs.String())
 		default:
 			t.Fatalf("the resumed stream never reached %d rows (target has %d)\nlogs:\n%s",
-				resumeFixtureRows, pollRowCount(st.tgt, "resume_t"), logs.String())
+				wantRows, pollRowCount(st.tgt, "resume_t"), logs.String())
 		}
 	}
 
@@ -235,9 +259,9 @@ func TestStreamer_ColdStartStoppedInIndexBuild_PG_ResumesWithoutRecopy(t *testin
 		t.Error("the row committed on the SOURCE during the stop never arrived; the resume is not lossless, " +
 			"which is the whole reason it may skip the copy")
 	}
-	if pgQueryOne[bool](t, st.tgt, "SELECT EXISTS (SELECT 1 FROM resume_t WHERE id = 7)") {
-		t.Error("the row deleted from the TARGET came back, so the bulk copy RE-RAN — the resume did not " +
-			"resume, it repeated the work it exists to skip")
+	if len(copied) != 0 {
+		t.Errorf("the resumed run COPIED %v; the copy pool must not run at all — the resume did not resume, "+
+			"it repeated the work it exists to skip", copied)
 	}
 	if !indexExists(t, st.tgt, "resume_t_v_idx") {
 		t.Error("the secondary index is still missing after the resume; the interrupted index build was " +
