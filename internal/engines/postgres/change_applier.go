@@ -1661,7 +1661,14 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		if err != nil {
 			return false, fmt.Errorf("postgres: applier: column types for %s.%s: %w", schema, v.Table, err)
 		}
-		stmt, args, err := buildInsertSQL(schema, v.Table, v.Row, key, colTypes)
+		// A sharded Neki target refuses an INSERT … ON CONFLICT DO UPDATE that
+		// names its routing column in the SET list, even assigned its own
+		// value. nil on every other target. See neki_update_shardkey.go.
+		insShardKeys, err := a.shardKeyColumnsFor(ctx, schema, v.Table)
+		if err != nil {
+			return false, fmt.Errorf("postgres: applier: resolve shard key for %s.%s: %w", schema, v.Table, err)
+		}
+		stmt, args, err := buildInsertSQL(schema, v.Table, v.Row, key, colTypes, insShardKeys)
 		if err != nil {
 			return false, fmt.Errorf("postgres: applier: build insert for %s.%s: %w", schema, v.Table, err)
 		}
@@ -2617,7 +2624,29 @@ func loadConflictKey(ctx context.Context, tx *sql.Tx, schema, table string) ([]s
 // entry (nil map, or column not present) is tolerated and the raw
 // value is bound — preserving the pre-Bug-6 shape so unit tests
 // without a populated cache still produce valid SQL.
-func buildInsertSQL(schema, table string, row ir.Row, key []string, colTypes map[string]*ir.Column) (sqlStmt string, args []any, err error) {
+// shardKeys, when non-empty, names the target's routing columns (a sharded
+// PlanetScale Neki target — nil everywhere else). A shard key OUTSIDE the
+// conflict key is REFUSED here; it is never dropped from the SET list.
+//
+// That asymmetry with [buildUpdateSQL], which does drop it, is the whole
+// point and it is not an oversight. A CDC UPDATE carries a before-image, so
+// it can PROVE the routing value is unchanged and omit a provable no-op. An
+// ON CONFLICT upsert carries no before-image and can prove nothing: dropping
+// the column there writes every other column while the routing column keeps
+// whatever the target already had (a silent partial update), or — on a
+// multi-shard group, where the conflict is evaluated only on the shard the
+// incoming row routes to — inserts a second row under the same key. Both are
+// the hazards this area exists to prevent; see neki_update_shardkey.go.
+//
+// [buildBatchUpsert] can drop it because it pays for a guard predicate plus a
+// server-side affected-row check. This lane cannot: the ADR-0092 pipelined
+// dispatch queues statements into a batch, so there is no per-statement count
+// to compare against.
+//
+// When the shard key IS in the conflict key nothing is refused and nothing is
+// dropped — it is already excluded from the SET list as a key column, and its
+// value cannot differ for a given conflict key.
+func buildInsertSQL(schema, table string, row ir.Row, key []string, colTypes map[string]*ir.Column, shardKeys []string) (sqlStmt string, args []any, err error) {
 	cols := appliershared.NonGeneratedRowKeys(row, colTypes)
 	args = make([]any, 0, len(cols))
 	colSQL := make([]string, len(cols))
@@ -2650,6 +2679,9 @@ func buildInsertSQL(schema, table string, row ir.Row, key []string, colTypes map
 		keySet := make(map[string]struct{}, len(key))
 		for _, p := range key {
 			keySet[p] = struct{}{}
+		}
+		if err := refuseShardKeyOutsideConflictKey(schema, table, key, shardKeys); err != nil {
+			return "", nil, err
 		}
 		nonKey := make([]string, 0, len(cols))
 		for _, c := range cols {

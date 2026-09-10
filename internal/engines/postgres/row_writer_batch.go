@@ -142,7 +142,7 @@ func (w *RowWriter) writeViaBatchIdempotent(ctx context.Context, table *ir.Table
 		if len(batch) == 0 {
 			return nil
 		}
-		query := buildBatchUpsert(w.schema, table, len(batch), keyCols, shardPlan)
+		query, guarded := buildBatchUpsert(w.schema, table, len(batch), keyCols, shardPlan)
 		args, err := flattenArgs(batch, table)
 		if err != nil {
 			return fmt.Errorf("postgres: prepare args for %q: %w", table.Name, err)
@@ -196,7 +196,7 @@ func (w *RowWriter) writeViaBatchIdempotent(ctx context.Context, table *ir.Table
 		// a no-op instead of a partial update; this is how the run finds out
 		// it happened. The number is the SERVER's, not ours — the only
 		// evidence available that is independent of the rows we sent.
-		if err := refuseShardKeySkip(w.schema, table.Name, shardPlan, batched, affected); err != nil {
+		if err := refuseShardKeySkip(w.schema, table.Name, shardPlan, guarded, batched, affected); err != nil {
 			return err
 		}
 		// Report the durable-write delta (v0.99.9): this batch is now
@@ -248,7 +248,14 @@ func (w *RowWriter) writeViaBatchIdempotent(ctx context.Context, table *ir.Table
 // own value) and asks for the IS-NOT-DISTINCT-FROM guard that makes omitting
 // them safe. The zero plan renders byte-identical SQL to before, which is what
 // every non-Neki target gets. See neki_topology.go.
-func buildBatchUpsert(schema string, table *ir.Table, rowCount int, keyCols []string, plan upsertShardKeyPlan) string {
+// Returns the statement and whether the shard-key GUARD predicate is actually
+// in it. The caller keys its affected-row check on that returned flag rather
+// than on the plan, because the two can legitimately disagree: a table whose
+// only non-key column IS the shard key renders DO NOTHING and never reaches
+// the guard, and a DO NOTHING statement under-counts by design. Reporting from
+// the builder means the check can never be armed for a statement that does not
+// carry the predicate it is checking.
+func buildBatchUpsert(schema string, table *ir.Table, rowCount int, keyCols []string, plan upsertShardKeyPlan) (stmt string, guarded bool) {
 	cols := nonGeneratedColumns(table.Columns)
 	colNames := make([]string, len(cols))
 	for i, c := range cols {
@@ -277,7 +284,7 @@ func buildBatchUpsert(schema string, table *ir.Table, rowCount int, keyCols []st
 	)
 
 	if len(keyCols) == 0 {
-		return sb.String()
+		return sb.String(), false
 	}
 
 	// ON CONFLICT (keyCols) DO UPDATE SET non-key = EXCLUDED.non-key
@@ -294,9 +301,14 @@ func buildBatchUpsert(schema string, table *ir.Table, rowCount int, keyCols []st
 	// columns: a Neki target refuses `SET <shard key> = …` outright, even
 	// when the value is unchanged (SQLSTATE NK013). Empty on every other
 	// target, so this loop is a no-op there.
+	// Lower-cased on both sides: the plan carries the TOPOLOGY spelling of the
+	// routing column and this loop reads the CATALOG spelling, and PostgreSQL
+	// folds unquoted identifiers. Matching exactly would leave the column in
+	// the SET list the plan believed it had removed — a loud NK013, but from a
+	// table the plan reported as handled.
 	omit := make(map[string]struct{}, len(plan.omitFromSet))
 	for _, c := range plan.omitFromSet {
-		omit[c] = struct{}{}
+		omit[strings.ToLower(c)] = struct{}{}
 	}
 
 	nonKey := make([]string, 0, len(cols))
@@ -304,7 +316,7 @@ func buildBatchUpsert(schema string, table *ir.Table, rowCount int, keyCols []st
 		if _, isKey := keySet[c.Name]; isKey {
 			continue
 		}
-		if _, isShardKey := omit[c.Name]; isShardKey {
+		if _, isShardKey := omit[strings.ToLower(c.Name)]; isShardKey {
 			continue
 		}
 		// Generated columns are already excluded by nonGeneratedColumns
@@ -319,7 +331,7 @@ func buildBatchUpsert(schema string, table *ir.Table, rowCount int, keyCols []st
 		// Every column is a conflict-key column — the conflicting row IS
 		// the row we wanted to write. DO NOTHING absorbs it silently.
 		sb.WriteString(" DO NOTHING")
-		return sb.String()
+		return sb.String(), false
 	}
 	sb.WriteString(" DO UPDATE SET ")
 	parts := make([]string, len(nonKey))
@@ -328,6 +340,20 @@ func buildBatchUpsert(schema string, table *ir.Table, rowCount int, keyCols []st
 	}
 	sb.WriteString(strings.Join(parts, ", "))
 
+	// UNVERIFIED PREMISE: this predicate's equality is the column's
+	// operator-class equality, while Neki routes on a hash of the value's
+	// BYTES. The two agree for every shard-key type we have measured, and
+	// they are not the same relation. A `citext` shard key, or `text` under a
+	// nondeterministic ICU collation, would report 'ACME' and 'acme' as not
+	// distinct while the router hashes them to different shards — the guard
+	// would pass and the routing column would silently keep its old value.
+	// `numeric` 1.0 versus 1.00 is the same shape. Nothing here checks the
+	// column's collation or type against that, and nothing binds the two
+	// facts, so the argument is stated rather than enforced. Named per the
+	// premise rule after the pre-tag value-fidelity pass raised it; closing it
+	// means restricting `plan.guard` to deterministic-collation, non-numeric
+	// shard keys and refusing the rest.
+	//
 	// The guard that makes omitting the shard key from the SET list safe.
 	// Without it, an incoming row whose shard key differs from the stored
 	// row's would have every other column updated while the routing column
@@ -346,7 +372,7 @@ func buildBatchUpsert(schema string, table *ir.Table, rowCount int, keyCols []st
 		sb.WriteString(" WHERE ")
 		sb.WriteString(strings.Join(preds, " AND "))
 	}
-	return sb.String()
+	return sb.String(), plan.guard && len(plan.omitFromSet) > 0
 }
 
 // primaryKeyColumns returns the PK column names in declaration order,

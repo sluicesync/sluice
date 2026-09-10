@@ -332,13 +332,14 @@ type upsertShardKeyPlan struct {
 	// updated while the routing column silently kept its old value — a
 	// partial update, which is the outcome this area exists to prevent.
 	//
-	// This combination is reachable only on a SINGLE-shard group: a
-	// multi-shard group whose conflict key lacks the shard key is refused at
-	// preflight ([RowWriter.ShardKeyUpsertMismatch]), because there the
-	// conflict is never even found and the guard would be inert. On one
-	// shard the conflict IS always found, so the predicate runs and a skipped
-	// row shows up as a shortfall in the statement's own affected-row count —
-	// which is the server's number, not ours.
+	// This is set only on a SINGLE-shard group, and that is enforced where
+	// the plan is built rather than assumed: a multi-shard group whose
+	// conflict key lacks the shard key is REFUSED by
+	// [RowWriter.upsertShardKeyPlanFor] itself, because there the conflict is
+	// never found and this predicate would be inert. On one shard the
+	// conflict IS always found, so the predicate runs and a skipped row shows
+	// up as a shortfall in the statement's own affected-row count — which is
+	// the server's number, not ours.
 	guard bool
 }
 
@@ -358,7 +359,14 @@ func (w *RowWriter) upsertShardKeyPlanFor(ctx context.Context, table *ir.Table, 
 	}
 	// Not gated on multiShard: a single-shard group refuses the shard key in
 	// a SET list exactly as a split one does. See [nekiTopology.shardKeyFor].
-	shardCols, _ := snap.topo.shardKeyFor(snap.database, w.schemaOrPublic(), table.Name)
+	shardCols, multiShard := snap.topo.shardKeyFor(snap.database, w.schemaOrPublic(), table.Name)
+	return planShardKeyUpsert(table.Name, shardCols, multiShard, keyCols)
+}
+
+// planShardKeyUpsert is the DECISION, split out from the topology read so it
+// can be graded exhaustively without a live cluster. Everything above it is
+// I/O; everything that matters for correctness is here.
+func planShardKeyUpsert(tableName string, shardCols []string, multiShard bool, keyCols []string) (upsertShardKeyPlan, error) {
 	if len(shardCols) == 0 {
 		return upsertShardKeyPlan{}, nil
 	}
@@ -367,14 +375,58 @@ func (w *RowWriter) upsertShardKeyPlanFor(ctx context.Context, table *ir.Table, 
 		inKey[strings.ToLower(c)] = struct{}{}
 	}
 	plan := upsertShardKeyPlan{}
+	var outside []string
 	for _, sc := range shardCols {
 		if _, ok := inKey[strings.ToLower(sc)]; ok {
 			// Already excluded from the SET list because key columns are, and
 			// its value cannot differ for a given conflict key.
 			continue
 		}
+		outside = append(outside, sc)
 		plan.omitFromSet = append(plan.omitFromSet, sc)
 		plan.guard = true
+	}
+
+	// The refusal, made HERE rather than trusted to a preflight.
+	//
+	// On a MULTI-shard group whose conflict key lacks the shard key, the
+	// guard is INERT: `ON CONFLICT` is evaluated only on the shard the
+	// incoming row routes to, so no conflict is found, the row INSERTs, the
+	// predicate never runs, and the affected-row count matches the batch.
+	// Nothing detects it and the target ends up holding two rows under one
+	// primary key (neki-issues/NEKI-011).
+	//
+	// An earlier cut of this file argued that combination was unreachable
+	// because [PreflightShardKeyUpsert] refuses it. That was true of
+	// `migrate` and false everywhere else — the preflight is wired into
+	// phasePreflightTarget alone, while this writer is also reached by the
+	// sync cold start (any source that forces idempotent writes), `schema
+	// add-table`, and restore. So the fix that made the statement LEGAL had
+	// quietly made a loud NK013 into silent duplication on those paths.
+	// Found by the pre-tag perf-parity pass.
+	//
+	// Refusing at the point of use makes the safety argument local: it
+	// cannot be defeated by a new entry point that forgets a preflight,
+	// which is this repo's most expensive recurring shape. The preflight
+	// stays, because refusing BEFORE the copy starts is a better operator
+	// experience than refusing at the first batch.
+	if plan.guard && multiShard {
+		return upsertShardKeyPlan{}, &sluicecode.CodedError{
+			Code: sluicecode.CodeTargetShardKeyNotInUpsertKey,
+			Hint: "add the shard-key column(s) to the table's PRIMARY KEY on the target (or to a NOT NULL " +
+				"UNIQUE index sluice can key on), then re-run; alternatively take the table out of scope " +
+				"with --exclude-table",
+			Err: fmt.Errorf(
+				"postgres: table %q is sharded across more than one shard on (%s) but sluice's idempotent "+
+					"write keys on (%s); %s is not in that key"+
+					"\nON CONFLICT is evaluated only on the shard the incoming row routes to, so a row whose "+
+					"shard key differs would be INSERTED alongside the original instead of updating it, "+
+					"leaving two rows with the same key and no error at any point"+
+					"\nrefused before writing",
+				tableName, strings.Join(shardCols, ", "), strings.Join(keyCols, ", "),
+				strings.Join(outside, ", "),
+			),
+		}
 	}
 	return plan, nil
 }
@@ -391,8 +443,8 @@ func (w *RowWriter) upsertShardKeyPlanFor(ctx context.Context, table *ir.Table, 
 // A negative `affected` means the driver would not report a count. That is not
 // a verdict either way, so it is passed rather than refused — the alternative
 // is failing every run against a driver that has nothing to do with this.
-func refuseShardKeySkip(schema, table string, plan upsertShardKeyPlan, batched int, affected int64) error {
-	if !plan.guard || affected < 0 || affected >= int64(batched) {
+func refuseShardKeySkip(schema, table string, plan upsertShardKeyPlan, guarded bool, batched int, affected int64) error {
+	if !guarded || affected < 0 || affected >= int64(batched) {
 		return nil
 	}
 	return &sluicecode.CodedError{

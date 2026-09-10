@@ -75,16 +75,36 @@ func TestDropUnchangedShardKeysRefusesARealChange(t *testing.T) {
 	}
 }
 
-// A missing before-value cannot establish that the column is unchanged, and
-// the loud side is the safe side.
-func TestDropUnchangedShardKeysRefusesWhenTheBeforeImageLacksTheColumn(t *testing.T) {
+// A missing before-value cannot establish that the column is unchanged, so
+// refusing is right — but it must be refused as the SCHEMA problem it is, not
+// as a row that changed its shard key.
+//
+// This is not hypothetical and it is the common case, which is what the
+// pre-tag value-fidelity pass caught: the PostgreSQL CDC reader narrows every
+// before-image to the relation's identity columns, so a routing column
+// outside the primary key / REPLICA IDENTITY is NEVER present. The first cut
+// reported "update … changes the target's shard-key column(s)" for an update
+// that changed nothing, with a hint the operator could not act on, on every
+// update to the table. The tell that it was a schema fact: the same table
+// behaves differently under `--where`, which emits a full before-image.
+func TestDropUnchangedShardKeysRefusesTheSCHEMAWhenTheBeforeImageLacksTheColumn(t *testing.T) {
 	t.Parallel()
-	before := ir.Row{"id": int64(7), "v": "old"} // no tenant_id
+	before := ir.Row{"id": int64(7), "v": "old"} // no tenant_id — PG identity narrowing
 	after := shardKeyRow(int64(3), "new")
 
-	if _, err := dropUnchangedShardKeys("public", "orders", before, after, []string{"tenant_id"}); err == nil {
+	_, err := dropUnchangedShardKeys("public", "orders", before, after, []string{"tenant_id"})
+	if err == nil {
 		t.Fatal("a shard key with no before-value was treated as unchanged; nothing established that, " +
 			"and guessing wrong drops a real routing change silently")
+	}
+	ce, ok := sluicecode.FromError(err)
+	if !ok || ce.Code != sluicecode.CodeTargetShardKeyNotInUpsertKey {
+		t.Errorf("refusal carried code %v (coded=%v), want the SCHEMA code %q — reporting this as a "+
+			"shard-key CHANGE accuses a row of something it did not do and sends the operator looking "+
+			"for data that does not exist", ce, ok, sluicecode.CodeTargetShardKeyNotInUpsertKey)
+	}
+	if !strings.Contains(err.Error(), "REPLICA IDENTITY") {
+		t.Errorf("the refusal does not name the actual cause, so it is unactionable: %v", err)
 	}
 }
 

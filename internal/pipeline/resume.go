@@ -931,8 +931,14 @@ func refuseResumedFreshTableThatHasRows(ctx context.Context, rw ir.RowWriter, ta
 	}
 	return &sluicecode.CodedError{
 		Code: sluicecode.CodeResumeFreshTableNotEmpty,
-		Hint: "re-run with --reset-target-data to clear the target's rows for this migration and re-copy, " +
-			"or --exclude-table=" + table.Name + " to leave the table alone",
+		// The remedy must be RUNNABLE. This refusal fires only on a --resume
+		// run, and --resume and --reset-target-data are mutually exclusive
+		// (cmd/sluice/cli.go), so telling the operator to add the latter
+		// without telling them to drop the former hands them a command the
+		// CLI rejects. Found by the pre-tag docs-drift pass.
+		Hint: "re-run WITHOUT --resume and WITH --reset-target-data (the two are mutually exclusive) to clear " +
+			"the in-scope target tables and re-copy, or keep --resume and add --exclude-table=" + table.Name +
+			" to leave this table alone",
 		Err: fmt.Errorf(
 			"pipeline: resume: target table %q holds rows but this migration recorded no progress for it"+
 				"\nresuming would start the table from scratch WITHOUT truncating, so a table with no primary "+

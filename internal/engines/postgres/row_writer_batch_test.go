@@ -25,7 +25,7 @@ func TestBuildBatchUpsert_SinglePK(t *testing.T) {
 		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}},
 	}
 	pk := primaryKeyColumns(table)
-	got := buildBatchUpsert("public", table, 2, pk, upsertShardKeyPlan{})
+	got, _ := buildBatchUpsert("public", table, 2, pk, upsertShardKeyPlan{})
 	want := `INSERT INTO "public"."users" ("id", "email", "name") VALUES ($1, $2, $3), ($4, $5, $6) ON CONFLICT ("id") DO UPDATE SET "email" = EXCLUDED."email", "name" = EXCLUDED."name"`
 	if got != want {
 		t.Errorf("\n got  %q\n want %q", got, want)
@@ -47,7 +47,7 @@ func TestBuildBatchUpsert_CompositePK(t *testing.T) {
 		}},
 	}
 	pk := primaryKeyColumns(table)
-	got := buildBatchUpsert("public", table, 1, pk, upsertShardKeyPlan{})
+	got, _ := buildBatchUpsert("public", table, 1, pk, upsertShardKeyPlan{})
 	want := `INSERT INTO "public"."products" ("tenant", "sku", "name") VALUES ($1, $2, $3) ON CONFLICT ("tenant", "sku") DO UPDATE SET "name" = EXCLUDED."name"`
 	if got != want {
 		t.Errorf("\n got  %q\n want %q", got, want)
@@ -68,7 +68,7 @@ func TestBuildBatchUpsert_AllPKColumns(t *testing.T) {
 		}},
 	}
 	pk := primaryKeyColumns(table)
-	got := buildBatchUpsert("public", table, 1, pk, upsertShardKeyPlan{})
+	got, _ := buildBatchUpsert("public", table, 1, pk, upsertShardKeyPlan{})
 	if !strings.Contains(got, "DO NOTHING") {
 		t.Errorf("got %q; want 'DO NOTHING' fallback", got)
 	}
@@ -86,7 +86,7 @@ func TestBuildBatchUpsert_NoKeyColsFallsBackToPlainInsert(t *testing.T) {
 			{Name: "data", Type: ir.Text{}},
 		},
 	}
-	got := buildBatchUpsert("public", table, 1, nil, upsertShardKeyPlan{})
+	got, _ := buildBatchUpsert("public", table, 1, nil, upsertShardKeyPlan{})
 	if strings.Contains(got, "ON CONFLICT") {
 		t.Errorf("expected plain INSERT for empty keyCols; got %q", got)
 	}
@@ -112,7 +112,7 @@ func TestBuildBatchUpsert_NonNullUniqueKey(t *testing.T) {
 	if !ok {
 		t.Fatal("effectiveUpsertKeyColumns: ok=false; want a non-null unique key")
 	}
-	got := buildBatchUpsert("public", table, 1, keyCols, upsertShardKeyPlan{})
+	got, _ := buildBatchUpsert("public", table, 1, keyCols, upsertShardKeyPlan{})
 	want := `INSERT INTO "public"."connections" ("id", "payload") VALUES ($1, $2) ON CONFLICT ("id") DO UPDATE SET "payload" = EXCLUDED."payload"`
 	if got != want {
 		t.Errorf("\n got  %q\n want %q", got, want)
@@ -137,7 +137,7 @@ func TestBuildBatchUpsert_NonNullUniqueAllKeyCols(t *testing.T) {
 	if !ok {
 		t.Fatal("effectiveUpsertKeyColumns: ok=false; want the composite non-null unique key")
 	}
-	got := buildBatchUpsert("public", table, 1, keyCols, upsertShardKeyPlan{})
+	got, _ := buildBatchUpsert("public", table, 1, keyCols, upsertShardKeyPlan{})
 	want := `INSERT INTO "public"."pairs" ("a", "b") VALUES ($1, $2) ON CONFLICT ("a", "b") DO NOTHING`
 	if got != want {
 		t.Errorf("\n got  %q\n want %q", got, want)

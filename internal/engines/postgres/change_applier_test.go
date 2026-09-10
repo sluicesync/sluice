@@ -174,7 +174,7 @@ func TestBuildInsertSQL(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			gotSQL, gotArgs, err := buildInsertSQL(c.schema, c.table, c.row, c.pk, nil)
+			gotSQL, gotArgs, err := buildInsertSQL(c.schema, c.table, c.row, c.pk, nil, nil)
 			if err != nil {
 				t.Fatalf("buildInsertSQL: %v", err)
 			}
@@ -211,7 +211,7 @@ func TestBuildSQL_VerbatimTypeCasts(t *testing.T) {
 
 	t.Run("INSERT VALUES placeholders carry the cast", func(t *testing.T) {
 		row := ir.Row{"id": int64(1), "price": "$99.99", "lsn": "0/16B3748", "doc": "<a/>", "r": "[1,10)", "v": "'foo':1"}
-		gotSQL, _, err := buildInsertSQL("public", "t", row, []string{"id"}, colTypes)
+		gotSQL, _, err := buildInsertSQL("public", "t", row, []string{"id"}, colTypes, nil)
 		if err != nil {
 			t.Fatalf("buildInsertSQL: %v", err)
 		}
@@ -262,7 +262,7 @@ func TestBuildSQL_VerbatimTypeCasts(t *testing.T) {
 	t.Run("non-verbatim columns keep bare $N", func(t *testing.T) {
 		row := ir.Row{"plain": "x"}
 		colTypesBare := map[string]*ir.Column{"plain": {Name: "plain", Type: ir.Text{Size: ir.TextLong}}}
-		gotSQL, _, err := buildInsertSQL("public", "t", row, nil, colTypesBare)
+		gotSQL, _, err := buildInsertSQL("public", "t", row, nil, colTypesBare, nil)
 		if err != nil {
 			t.Fatalf("buildInsertSQL: %v", err)
 		}
@@ -472,7 +472,7 @@ func TestBuildInsertSQL_RoutesThroughPrepareValue(t *testing.T) {
 		"tags": {Name: "tags", Type: ir.Array{Element: ir.Text{Size: ir.TextLong}}},
 	}
 
-	_, gotArgs, err := buildInsertSQL("public", "docs", row, []string{"id"}, colTypes)
+	_, gotArgs, err := buildInsertSQL("public", "docs", row, []string{"id"}, colTypes, nil)
 	if err != nil {
 		t.Fatalf("buildInsertSQL: %v", err)
 	}
@@ -629,7 +629,7 @@ func TestBuildSQL_FiltersGeneratedColumns(t *testing.T) {
 
 	t.Run("INSERT excludes generated column from column list and ON CONFLICT DO UPDATE SET", func(t *testing.T) {
 		row := ir.Row{"id": int64(1), "price": "9.99", "cost": "4.50", "margin": "5.49"}
-		gotSQL, _, err := buildInsertSQL("public", "products", row, []string{"id"}, colTypes)
+		gotSQL, _, err := buildInsertSQL("public", "products", row, []string{"id"}, colTypes, nil)
 		if err != nil {
 			t.Fatalf("buildInsertSQL: %v", err)
 		}
@@ -667,7 +667,7 @@ func TestBuildSQL_FiltersGeneratedColumns(t *testing.T) {
 
 	t.Run("nil colTypes: every column passes through (pre-fix shape)", func(t *testing.T) {
 		row := ir.Row{"id": int64(1), "margin": "5.49"}
-		gotSQL, _, err := buildInsertSQL("public", "products", row, []string{"id"}, nil)
+		gotSQL, _, err := buildInsertSQL("public", "products", row, []string{"id"}, nil, nil)
 		if err != nil {
 			t.Fatalf("buildInsertSQL: %v", err)
 		}

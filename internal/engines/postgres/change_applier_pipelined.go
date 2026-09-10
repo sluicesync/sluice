@@ -280,7 +280,14 @@ func (a *ChangeApplier) dispatchPipelined(ctx context.Context, b *pgxBatchTx, st
 		if err != nil {
 			return false, fmt.Errorf("postgres: applier: column types for %s.%s: %w", schema, v.Table, err)
 		}
-		stmt, args, err := buildInsertSQL(schema, v.Table, v.Row, key, colTypes)
+		// A sharded Neki target refuses an INSERT … ON CONFLICT DO UPDATE that
+		// names its routing column in the SET list, even assigned its own
+		// value. nil on every other target. See neki_update_shardkey.go.
+		insShardKeys, err := a.shardKeyColumnsFor(ctx, schema, v.Table)
+		if err != nil {
+			return false, fmt.Errorf("postgres: applier: resolve shard key for %s.%s: %w", schema, v.Table, err)
+		}
+		stmt, args, err := buildInsertSQL(schema, v.Table, v.Row, key, colTypes, insShardKeys)
 		if err != nil {
 			return false, fmt.Errorf("postgres: applier: build insert for %s.%s: %w", schema, v.Table, err)
 		}

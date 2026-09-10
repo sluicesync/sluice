@@ -70,6 +70,22 @@ import (
 // UNCHANGED verdict would drop a real shard-key change silently. reflect.
 // DeepEqual is used for exactly that bias — it is conservative, and every way
 // it is wrong lands on the loud side.
+//
+// Both images come off ONE decoder against the same relation column type, so
+// encoding drift between them is not a live risk on this lane; the surviving
+// asymmetries (`-0.0` versus `0.0`, a `time.Time` differing only by location,
+// whitespace in a json byte slice) all resolve to CHANGED, which refuses.
+//
+// # The load-bearing premise is the BEFORE-IMAGE, not the comparison
+//
+// The sentence above grades the comparison and is true. It was also, on its
+// own, a misleading safety argument: what actually decides correctness is
+// whether the routing column is IN the before-image at all. On a PostgreSQL
+// source it usually is not — the CDC reader narrows every before-image to the
+// relation's identity columns — so a routing column outside the primary key
+// never arrives and the "did it change?" question is unanswerable rather than
+// answered conservatively. That case is refused as a SCHEMA mismatch, with
+// its own code and its own message, in the `!inBefore` arm below.
 
 // nekiShardKeyCache memoises the per-table shard-key columns an applier
 // resolves, so a busy CDC stream does not re-walk the topology per change.
@@ -123,6 +139,58 @@ func (a *ChangeApplier) shardKeyColumnsFor(ctx context.Context, schema, table st
 	return cols, nil
 }
 
+// refuseShardKeyOutsideConflictKey refuses a CDC upsert whose conflict key
+// does not contain the target's routing columns.
+//
+// This is the applier's counterpart to [RowWriter.upsertShardKeyPlanFor]'s
+// refusal, and it is deliberately STRICTER: the writer permits the
+// single-shard case because it can arm a guard predicate and check the
+// server's affected-row count, while this lane's pipelined dispatch queues
+// statements into a batch and has no per-statement count to check. Rather
+// than emit a statement whose safety it cannot verify, it refuses the schema.
+//
+// The practical effect is one rule, easy to state and the same one the
+// preflight gives: on a sharded Neki target, put the shard key in the primary
+// key. Then nothing here fires, because a key column is already excluded from
+// every SET list this package builds.
+//
+// nil shardKeys (every non-Neki target, and any table no shard index routes)
+// returns nil immediately, so ordinary PostgreSQL pays nothing.
+func refuseShardKeyOutsideConflictKey(schema, table string, conflictKey, shardKeys []string) error {
+	if len(shardKeys) == 0 {
+		return nil
+	}
+	inKey := make(map[string]struct{}, len(conflictKey))
+	for _, c := range conflictKey {
+		inKey[strings.ToLower(c)] = struct{}{}
+	}
+	var outside []string
+	for _, sc := range shardKeys {
+		if _, ok := inKey[strings.ToLower(sc)]; !ok {
+			outside = append(outside, sc)
+		}
+	}
+	if len(outside) == 0 {
+		return nil
+	}
+	return &sluicecode.CodedError{
+		Code: sluicecode.CodeTargetShardKeyNotInUpsertKey,
+		Hint: "add the shard-key column(s) to the table's PRIMARY KEY on the target (or to a NOT NULL UNIQUE " +
+			"index sluice can key on), then restart the stream; alternatively take the table out of scope " +
+			"with --exclude-table",
+		Err: fmt.Errorf(
+			"postgres: applier: %s.%s is routed on (%s) but the change apply keys on (%s); %s is not in that key"+
+				"\nan ON CONFLICT upsert carries no before-image, so it cannot establish that the routing "+
+				"column is unchanged — writing it is refused by the target, and omitting it would either "+
+				"leave the target's routing column disagreeing with the source or, across shards, insert a "+
+				"second row under the same key"+
+				"\nrefused rather than applied",
+			schema, table, strings.Join(shardKeys, ", "), strings.Join(conflictKey, ", "),
+			strings.Join(outside, ", "),
+		),
+	}
+}
+
 // dropUnchangedShardKeys returns `after` with every shard-key column whose
 // value is unchanged removed, so the rendered SET list does not name it.
 //
@@ -142,10 +210,39 @@ func dropUnchangedShardKeys(schema, table string, before, after ir.Row, shardKey
 		}
 		bv, inBefore := before[k]
 		if !inBefore {
-			// No before-image for the routing column: we cannot establish
-			// that it is unchanged, and the loud side is the safe side.
-			changed = append(changed, k)
-			continue
+			// The routing column is not in the before-image, so nothing here
+			// can establish whether it changed. Refusing is right; blaming the
+			// ROW for it is not, and the first cut did.
+			//
+			// On a PostgreSQL source this is a SCHEMA fact, not a data one:
+			// the CDC reader narrows every before-image to the relation's
+			// identity key columns, so a shard key outside the primary key
+			// (or the REPLICA IDENTITY set) is never present — and then EVERY
+			// update to the table refuses, reporting a shard-key change that
+			// did not happen, with a hint the operator cannot act on. Caught
+			// by the pre-tag value-fidelity pass, which also spotted the tell:
+			// the same table works when --where-filtered, because that path
+			// emits a full before-image.
+			//
+			// So this arm reports the real, actionable problem — the target's
+			// routing column is not covered by the key the stream identifies
+			// rows with — and carries the schema code, not the data one.
+			return nil, &sluicecode.CodedError{
+				Code: sluicecode.CodeTargetShardKeyNotInUpsertKey,
+				Hint: "add the shard-key column(s) to the table's PRIMARY KEY (or, on a PostgreSQL source, " +
+					"to its REPLICA IDENTITY) so every change carries them, then restart the stream; " +
+					"alternatively take the table out of scope with --exclude-table",
+				Err: fmt.Errorf(
+					"postgres: applier: update %s.%s cannot be applied: the target routes on %q, and that "+
+						"column is absent from the change's before-image, so nothing establishes whether it "+
+						"changed"+
+						"\non a PostgreSQL source the before-image carries only the relation's identity "+
+						"columns, so a routing column outside the primary key / REPLICA IDENTITY is never "+
+						"present and every update to this table would refuse"+
+						"\nthis is a schema mismatch between source and target, not a property of this row",
+					schema, table, k,
+				),
+			}
 		}
 		if reflect.DeepEqual(bv, av) {
 			drop = append(drop, k)

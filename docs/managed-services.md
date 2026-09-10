@@ -138,6 +138,90 @@ end so re-runs are idempotent.
 
 PlanetScale's `ps-discovery` tool is a metadata census — it inventories what your source contains; sluice is the execution engine that enforces the hazards at run time. If ps-discovery flagged your schema, note what sluice checks automatically before any data moves: declaratively-partitioned tables (loud refusal), old-style `INHERITS` hierarchies (loud refusal — silent-duplication class), FDW foreign tables (loud WARN naming each skipped table and its server), RLS-filtered snapshots, XID-wraparound proximity, and replication-role/slot preconditions.
 
+## PlanetScale Neki (sharded Postgres)
+
+**Status**: Verified as a **target** — migrate, continuous sync, CDC apply, resume, and a live reshard underneath a running stream. Verified as a **migration source**, including from a sharded database. **Not usable as a continuous-sync source** — that is a platform limitation, explained below. Measured 2026-09-10 against live PS-10 clusters running `PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2) (Neki)`, one unsharded and one split across three shards.
+
+Neki is PlanetScale's sharded PostgreSQL: a router speaking the PostgreSQL wire protocol in front of real PostgreSQL clusters. It is the Postgres counterpart of what Vitess does for MySQL.
+
+### There is no `neki` engine or flag — and that is deliberate
+
+Point sluice at Neki with the ordinary PostgreSQL driver:
+
+```bash
+sluice migrate \
+  --source-driver postgres --source "postgres://…your-source…" \
+  --target-driver postgres --target "$NEKI_DSN"
+```
+
+`--target-driver neki` does not exist, and neither does `--engine neki`. sluice detects Neki at connect time from the server's own `version()` string and adapts the handful of behaviours that differ. See ADR-0186 for why it is a *flavor* rather than an engine.
+
+This is worth stating because PlanetScale's own CLI takes `pscale database create --engine neki`, so it is reasonable to go looking for the same word here. Nothing in sluice needs it.
+
+| Path | Verified |
+|------|----------|
+| Neki as **target** — simple-mode migration | ✅ |
+| Neki as **target** — sync cold start | ✅ |
+| Neki as **target** — CDC apply (insert / update / delete) | ✅ |
+| Neki as **target** — `migrate --resume` | ✅ |
+| Neki as **target** — value fidelity through the router | ✅ byte-identical, 28 column families |
+| Neki as **target** — reshard while a stream is running | ✅ no loss, no duplication |
+| Neki as **migration source** (including sharded) | ✅ byte-identical |
+| Neki as **continuous-sync source** (CDC out) | ❌ platform limitation — see below |
+
+### What is refused, and why
+
+Everything here is a **loud refusal with an error code**, chosen over degrading, because each one is a case where the alternative is silent divergence. Full detail per code in [`error-codes.md`](operator/error-codes.md).
+
+- **`SLUICE-E-TARGET-SHARD-KEY-NOT-IN-UPSERT-KEY`** — the one you are most likely to hit. On a sharded table whose **shard key is not part of the primary key**, sluice refuses before writing anything.
+
+  The reason is worth understanding rather than working around. sluice's idempotent write is `INSERT … ON CONFLICT (key) DO UPDATE`, and on a sharded database that statement is evaluated **only on the shard the incoming row routes to**. Routing is by shard key. So a row whose shard key differs from the stored row's finds no conflict there and is **inserted alongside it** — two rows with the same primary key, no error, and an equality-routed read shows only one of them. Measured on a live cluster.
+
+  **The fix is to make the shard key part of the primary key**, which is standard advice for a sharded schema anyway. Then the shard key cannot change for a given key, routing is stable, and the hazard disappears. There is deliberately no flag to proceed anyway.
+
+- **`SLUICE-E-TARGET-SHARD-KEY-UPDATE-UNSUPPORTED`** — a change that would move a row *between* shards. Neki cannot express that (`UPDATE … SET <shard key> = …` is refused by the platform), so sluice stops rather than applying every other column and leaving the routing column behind.
+
+- **`SLUICE-E-TARGET-SHARD-PLACEMENT-MISMATCH`** — a table whose routing and physical row placement disagree, which happens if the data topology was written directly for a table that already held rows instead of using a reshard workflow. The primary key is not globally enforced in that state.
+
+A note that matters for anyone reading PlanetScale's docs: the shard-key restriction applies to a shard group with **one** shard exactly as it does to a split one. "Sharded" in the platform's phrasing does two jobs — a single-shard group is exempt from the *duplication* hazard above, but not from the restriction on naming the shard key in a `SET` list.
+
+### Neki cannot be a continuous-sync source
+
+`sluice migrate` **out of** Neki works, including from a sharded database. `sluice sync` out of it does not, and this is a platform limitation rather than missing work on our side: a Neki replication connection can **export** a snapshot but there is no way to **import** one — both `pg_export_snapshot()` and `SET TRANSACTION SNAPSHOT` are unimplemented. Without an importable snapshot there is no consistent handoff from the bulk copy to the change stream, which is the mechanism every sluice sync depends on.
+
+Use `sluice migrate` for a one-shot move out, and plan a cutover window rather than a continuous tail.
+
+### Operator preconditions and operational notes
+
+- **A minted role's connection string uses `sslmode=verify-full`**, which fails for any client without the CA bundle — notably anything in a container (`root certificate file … does not exist`). `sslmode=require` connects. Adjust the DSN the CLI hands you, or supply the CA.
+
+- **sluice's control tables need a home on a sharded database.** Once a database is sharded, the default shard group covers `public`, so *every* table there inherits the shard-key requirement — including sluice's own bookkeeping tables, which have nothing to do with your sharding scheme. Their inserts are then refused with `shard-key column … required but missing from INSERT` (SQLSTATE `NK306`).
+
+  sluice does not paper over this: since the run cannot record what it is doing, it refuses (`SLUICE-E-MIGRATE-PROGRESS-UNRECORDABLE`) before the affected table's first row moves. Give the control tables a shard group that does not require the key, or add the shard-key column with a `DEFAULT` so the insert is accepted.
+
+- **DDL is eventually consistent across routers.** Every `CREATE TABLE` / `ALTER TABLE` returns a `NOTICE` saying other routers may not see it yet. Any client using a connection pool — which sluice does — can therefore create a table on one router and write to it on another. sluice's phases already tolerate this; if you are scripting around it, `SELECT __neki.wait_for_ddl(<schema_version>, 0)` on a fresh connection is the barrier.
+
+- **The fast raw-copy passthrough lane is declined for a Neki source**, automatically. The lane needs `COPY (SELECT …) TO`, which the router does not implement, so sluice logs `raw-copy passthrough lane declined by an endpoint; using the IR copy path` and copies through the ordinary path. Correctness is unaffected; a PG→Neki→PG copy is slower than PG→PG would be.
+
+- **Some index-build tuning degrades gracefully.** `pg_size_bytes()` is unimplemented on the router, so sluice's size-aware index-build tuning probe fails and it builds indexes serially with the provider's default `maintenance_work_mem`. This is a WARN, not an error.
+
+- **Resharding underneath a running sync is safe.** Measured: 900 rows in a single-shard group, a sync streaming into it, a writer issuing inserts, updates and deletes throughout, then `__neki.reshard_create` followed by `__neki.workflow_switch_traffic` switching reads *and* writes. Source and target checksums matched exactly afterwards, with the rows genuinely redistributed across two shards. No operator action is needed on the sluice side.
+
+### Administering Neki
+
+Neki's control plane is SQL, not REST or the CLI. Everything — topology, resharding, MoveTables, online DDL, row-comparison differs — lives as functions in the `__neki` schema, and the schema documents itself:
+
+```sql
+SELECT name, group_name, required_role, arguments, purpose
+FROM __neki.list_metafuncs() ORDER BY group_name, name;
+```
+
+That returns all 89 functions with their signatures and a one-line purpose, and it works on a sharded database (several ordinary catalog introspection queries do not).
+
+### Platform preview
+
+Neki is in platform preview and its surface moves. The behaviours above were measured on 2026-09-10; treat the refusals as current-as-of rather than permanent, and re-measure before relying on a limitation staying put.
+
 ## PlanetScale MySQL (and other Vitess deployments)
 
 **Status**: Supported via the `planetscale` engine (a flavor of the
