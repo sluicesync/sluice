@@ -2035,11 +2035,19 @@ func (r *CDCReader) SetCDCScopePredicate(allowed func(schema, table string) bool
 // name is neutral now because the predicate is not about XA: it is
 // "does this stream emit anything for this table", and every refusal
 // that would kill the stream owes it.
+// The table name comes from [ir.UnqualifiedTableName], which is the
+// convention the pipeline's dispatch filter uses, and the two must agree
+// (audit 2026-09-09 VF0909C-3). This used to split at the FIRST dot
+// while the dispatch scanned from the LAST, so for a table NAMED `a.b`
+// the reader asked about `a.b` and the dispatch about `b`. A refusal
+// this predicate waved through as out-of-scope could then have its
+// boundary forwarded by a dispatch that considered the table in scope.
+// The schema half keeps the leading segment; the pipeline's closure
+// ignores it and matches on the table, so only the table half decides.
 func (r *CDCReader) tableInScope(qn string) bool {
-	schema, table := qn, ""
-	if i := strings.IndexByte(qn, '.'); i >= 0 {
-		schema, table = qn[:i], qn[i+1:]
-	}
+	table := ir.UnqualifiedTableName(qn)
+	schema := strings.TrimSuffix(qn, table)
+	schema = strings.TrimSuffix(schema, ".")
 	return r.scopeAllowed(schema, table)
 }
 

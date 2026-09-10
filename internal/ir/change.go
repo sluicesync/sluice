@@ -116,6 +116,46 @@ func qualified(schema, table string) string {
 	return schema + "." + table
 }
 
+// UnqualifiedTableName strips a leading `schema.` from a qualified name,
+// scanning from the END.
+//
+// # Why this is a shared function and not two local loops
+//
+// [qualified] has no unambiguous inverse: it joins with a dot, and a
+// TABLE NAME may itself contain one, so `db.a.b` could be database `db`
+// with table `a.b` or schema `db.a` with table `b`. The string alone
+// cannot say. What matters is not which reading is philosophically right
+// but that every consumer picks the SAME one — because the places that
+// compare a name against the operator's `--include-table` /
+// `--exclude-table` filter must agree with the places that decide
+// whether a refusal applies.
+//
+// They did not. Audit 2026-09-09 VF0909C-3: the pipeline's dispatch
+// filter scanned from the end while the MySQL reader's scope predicate
+// split at the FIRST dot, so for a table named `a.b` the reader tested
+// `a.b` and the dispatch tested `b`. A stream-killing refusal the reader
+// skipped as out-of-scope could then have its boundary forwarded by a
+// dispatch that considered the table in scope — the reader declining to
+// refuse a re-cast that the target then received. Low likelihood, since
+// dotted table names are rare, and a genuine silent-divergence path.
+//
+// Scanning from the end is the dispatch filter's long-standing
+// behaviour, so it is the reading kept: matching the reader to the
+// dispatch changes no filter semantics for anyone, while matching the
+// dispatch to the reader would silently change which tables an existing
+// `--include-table` selects.
+//
+// A name with no dot is returned unchanged, which is the Schema-empty
+// case.
+func UnqualifiedTableName(qualifiedName string) string {
+	for i := len(qualifiedName) - 1; i >= 0; i-- {
+		if qualifiedName[i] == '.' {
+			return qualifiedName[i+1:]
+		}
+	}
+	return qualifiedName
+}
+
 // Insert is a row-insertion change event.
 type Insert struct {
 	Position Position

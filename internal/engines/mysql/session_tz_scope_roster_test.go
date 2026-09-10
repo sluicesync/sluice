@@ -192,3 +192,48 @@ func TestEveryMySQLCDCLaneTakesTheScopePredicate(t *testing.T) {
 		}
 	}
 }
+
+// TestTableInScopeUsesTheSharedQualifiedNameConvention is the engine-side
+// half of the pipeline's TestDispatchFilterUsesTheSharedConvention.
+//
+// The scope predicate this reader consults is the pipeline's, and it
+// matches on the UNQUALIFIED table name. So the name this reader derives
+// from a TABLE_MAP's "db.table" must be the one the pipeline's dispatch
+// filter derives from the emitted change's qualified name — otherwise a
+// refusal skipped here as out-of-scope has its boundary forwarded there.
+//
+// It split at the FIRST dot while the dispatch scanned from the LAST, so
+// for a table NAMED `a.b` this asked about `a.b` and the dispatch about
+// `b` (audit 2026-09-09 VF0909C-3). Both now route through
+// ir.UnqualifiedTableName. Go's import graph puts this package below
+// internal/pipeline, so the two halves cannot share one test; this is the
+// half that lives here.
+func TestTableInScopeUsesTheSharedQualifiedNameConvention(t *testing.T) {
+	for _, tc := range []struct{ qn, wantTable, wantSchema string }{
+		{"db.orders", "orders", "db"},
+		{"db.a.b", "b", "db.a"},
+		{"orders", "orders", ""},
+	} {
+		t.Run(tc.qn, func(t *testing.T) {
+			var gotSchema, gotTable string
+			r := &CDCReader{scopeAllowed: func(schema, table string) bool {
+				gotSchema, gotTable = schema, table
+				return true
+			}}
+			r.tableInScope(tc.qn)
+			if gotTable != tc.wantTable {
+				t.Errorf("tableInScope(%q) asked the filter about table %q; the pipeline's dispatch filter "+
+					"would ask about %q (ir.UnqualifiedTableName). They must agree, or a refusal skipped "+
+					"here is forwarded there — audit 2026-09-09 VF0909C-3",
+					tc.qn, gotTable, tc.wantTable)
+			}
+			if gotSchema != tc.wantSchema {
+				t.Errorf("tableInScope(%q) schema = %q; want %q", tc.qn, gotSchema, tc.wantSchema)
+			}
+			if want := ir.UnqualifiedTableName(tc.qn); gotTable != want {
+				t.Errorf("tableInScope(%q) table %q disagrees with ir.UnqualifiedTableName's %q",
+					tc.qn, gotTable, want)
+			}
+		})
+	}
+}

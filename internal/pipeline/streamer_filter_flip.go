@@ -200,16 +200,15 @@ func changeAllowedWithLiveAdd(c ir.Change, base migcore.TableFilter, live *liveA
 	case ir.TxBegin, ir.TxCommit:
 		return true
 	}
-	name := c.QualifiedName()
 	// Strip "schema." prefix if present — filter patterns target
-	// unqualified names, same convention as [changeAllowed].
-	for i := len(name) - 1; i >= 0; i-- {
-		if name[i] == '.' {
-			name = name[i+1:]
-			break
-		}
-	}
-	return tableAllowedWithLiveAdd(name, base, live)
+	// unqualified names, same convention as [changeAllowed]. The scan
+	// lives in [ir.UnqualifiedTableName] rather than inline here because
+	// the MySQL reader's scope predicate has to reach the SAME answer:
+	// it split at the first dot while this scanned from the last, so for
+	// a table named `a.b` the two disagreed and a refusal the reader
+	// skipped as out-of-scope had its boundary forwarded from here
+	// (audit 2026-09-09 VF0909C-3). Behaviour is unchanged on this side.
+	return tableAllowedWithLiveAdd(ir.UnqualifiedTableName(c.QualifiedName()), base, live)
 }
 
 // tableAllowedWithLiveAdd is the name-based core of the dispatch filter,
