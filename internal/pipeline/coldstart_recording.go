@@ -219,6 +219,15 @@ type tableProgressRecorder struct {
 	// PER TABLE rather than one global lock, because the racing set is
 	// exactly the pipelines sharing a table: a write for `orders` has no
 	// reason to queue behind one for `users`.
+	//
+	// The cost this accepts, stated rather than left for the next reader to
+	// discover: a pipeline can now BLOCK on a peer's control-table round
+	// trip, which it could not before. That is bounded by the throttle —
+	// intermediate writes are capped at one per table per
+	// [progressThrottleInterval], and terminal writes are one per table — so
+	// at most a couple of writes ever contend for one table's lock. A copy
+	// goroutine already paid for its own write synchronously; this only adds
+	// queueing behind a peer's.
 	persistMu    sync.Mutex
 	persistLocks map[string]*sync.Mutex
 	persisted    map[string]uint64
