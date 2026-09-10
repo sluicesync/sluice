@@ -211,6 +211,32 @@ func (e Engine) openSnapshotStreamShared(ctx context.Context, dsn, slotName stri
 		return nil, fmt.Errorf("postgres: snapshot: open replication conn: %w", err)
 	}
 
+	// Read the source's identity BEFORE creating the slot — and this
+	// ORDER is load-bearing rather than stylistic (A0909-STOP-1 C-3).
+	//
+	// CREATE_REPLICATION_SLOT … EXPORT_SNAPSHOT exports the snapshot
+	// from the transaction this connection is in, and the export lives
+	// only as long as that transaction. Any FURTHER command on this
+	// connection ends it — so an IDENTIFY_SYSTEM issued after the
+	// create invalidates the snapshot every other connection is about
+	// to import. Measured, because the first cut of this change did
+	// exactly that: it does not fail here, it fails later and
+	// elsewhere, as `ImportSnapshot SET 0: ERROR: invalid snapshot
+	// identifier` on the SECOND importer. The pinned reader imports
+	// before anything else runs and succeeds, so the serial path looks
+	// healthy while every parallel chunk reader dies — which is how it
+	// reached a full regression sweep rather than the first test.
+	//
+	// (systemid, timeline) is a property of the SERVER, not of the
+	// slot, so asking first is equivalent — and it is the order the CDC
+	// reader already uses (IDENTIFY_SYSTEM, then START_REPLICATION).
+	//
+	// Best-effort: a probe that cannot run leaves the token exactly as
+	// it was before this change (no pin, installed lazily on the first
+	// stream), so a transient failure costs the extra check rather than
+	// the cold start.
+	identity := identifySnapshotSource(ctx, replConn, slotName)
+
 	// EXPORT_SNAPSHOT is the default for non-temporary slots, but
 	// stating it explicitly documents intent. The helper layers
 	// FAILOVER true on PG 17+ (see slot_create.go) so the slot
@@ -266,23 +292,6 @@ func (e Engine) openSnapshotStreamShared(ctx context.Context, dsn, slotName stri
 		return nil, fmt.Errorf("postgres: snapshot: build cdc reader: %w", err)
 	}
 
-	// Stamp the ADR-0051 source identity onto the snapshot's position
-	// (A0909-STOP-1 C-3). The pin used to be installed LAZILY on the
-	// first StreamChanges, which means the first resume from this
-	// position compares against nothing and accepts whatever answers
-	// the DSN — and the stopped-cold-start resume is exactly a first
-	// resume: it takes the recorded anchor, writes it as the CDC
-	// anchor, and streams. A physical clone, a restored backup or a
-	// promoted standby carries the same slot name at the same LSN and
-	// would have verified clean.
-	//
-	// The replication connection that just created the slot is in hand,
-	// so this is one extra protocol round trip at slot creation.
-	// Best-effort by design: a probe that cannot run leaves the token
-	// exactly as it was before this change (empty pin, lazily installed
-	// later), so a transient failure costs the extra check rather than
-	// the cold start.
-	identity := identifySnapshotSource(ctx, replConn, slotName)
 	position, err := encodePGPos(pgPos{
 		Slot:     slotName,
 		LSN:      consistentPoint,

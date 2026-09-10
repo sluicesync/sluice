@@ -71,6 +71,41 @@ func assertIdentityPinStamped(t *testing.T, token string) {
 	}
 }
 
+// assertSnapshotStillImportable mints a reader through the engine's own
+// SnapshotImporter — the surface the ADR-0079 parallel cold start uses
+// for every chunk beyond the free pair — and requires the import to
+// succeed. An exported snapshot survives only as long as the
+// transaction that exported it, so this is the cheap, direct check that
+// nothing ran on the slot-creation connection after the create.
+func assertSnapshotStillImportable(ctx context.Context, t *testing.T, dsn, snapshotName string) {
+	t.Helper()
+	if snapshotName == "" {
+		t.Fatal("the snapshot stream surfaced no exported snapshot name; the parallel cold start would fall " +
+			"back to the serial path and this check would be vacuous")
+	}
+	importer, err := Engine{}.OpenSnapshotImporter(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open snapshot importer: %v", err)
+	}
+	defer func() {
+		if c, ok := importer.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+	readers, err := importer.ImportSnapshot(ctx, snapshotName, 1)
+	if err != nil {
+		t.Fatalf("a SECOND connection could not import the exported snapshot %q: %v\n\nThe snapshot is valid "+
+			"only while the transaction that exported it lives, so this means something ran on the "+
+			"slot-creation replication connection after CREATE_REPLICATION_SLOT. Every parallel chunk reader "+
+			"a cold start mints will fail the same way.", snapshotName, err)
+	}
+	for _, r := range readers {
+		if c, ok := r.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}
+}
+
 func slotLSNs(t *testing.T, dsn, slot string) (restart, confirmed string, active bool) {
 	t.Helper()
 	db, err := sql.Open("pgx", dsn)
@@ -139,6 +174,17 @@ func TestSnapshotAnchor_UnconsumedSlotHoldsTheConsistentPoint(t *testing.T) {
 	// without one, a stamp that silently stopped working would leave
 	// every other test in this file green.
 	assertIdentityPinStamped(t, stream.Position.Token)
+
+	// And the stamp must not have COST the exported snapshot. The first
+	// cut of the identity pin read IDENTIFY_SYSTEM on the
+	// slot-creation replication connection AFTER the create, which ends
+	// the transaction the snapshot was exported from — so every
+	// SUBSEQUENT importer got `invalid snapshot identifier` while the
+	// first one (the pinned reader, which imports before anything else
+	// runs) still worked. That asymmetry is why this needs its own
+	// assertion: the ordinary open looked completely healthy, and only
+	// the parallel cold start — which mints N more importers — broke.
+	assertSnapshotStillImportable(ctx, t, dsn, stream.SnapshotName)
 
 	consistentPoint := anchorLSN(t, stream.Position)
 	restart, confirmed, active := slotLSNs(t, dsn, slot)
