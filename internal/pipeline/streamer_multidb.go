@@ -337,12 +337,28 @@ func (s *Streamer) coldStartMultiDatabase(
 	// namespace inside the copy loop (that is where each namespace's raw
 	// source IR is read) and handed to the reader at the CDC open below.
 	var readerSeed []*ir.Table
+	// One recording context for the WHOLE fan-out, opened before the
+	// first database and reset once (audit A0909-P2b). Per-database would
+	// be wrong twice over: [beginRecordedColdStart] CLEARS the migration,
+	// so database N would erase databases 1..N-1's rows, and the whole
+	// fan-out is one stream with one id, so it is one recorded run.
+	//
+	// No snapshot anchor: [Streamer.resumeStoppedColdStart] is explicitly
+	// not reached from this entry point (its own file comment says so,
+	// and this path's stop still calls bare abandonStream), so recording
+	// one would offer evidence for a resume that cannot happen. Widening
+	// that door is a separate change.
+	multiRC, closeRecording := s.openColdStartRecording(ctx, streamID, ir.SnapshotAnchorRecord{})
+	defer closeRecording()
 	for _, database := range selected {
-		if err := s.coldStartCopyOneDatabase(ctx, stream, applier, streamID, database, inScope, targetDeriver, targetCanDeriveDB, fresh, budgetReport.CopyFanoutCeiling, &readerSeed); err != nil {
+		if err := s.coldStartCopyOneDatabase(ctx, multiRC, stream, applier, streamID, database, inScope, targetDeriver, targetCanDeriveDB, fresh, budgetReport.CopyFanoutCeiling, &readerSeed); err != nil {
 			abandonStream()
 			return nil, stop, err
 		}
 	}
+	// Every selected database is copied: the recorded run is terminal, so
+	// `sync status` stops listing it as a cold start in progress.
+	markRecordedColdStartComplete(ctx, multiRC)
 
 	// Bug 273 arm 4: the first point in a multi-database cold start where
 	// the whole table universe is known. Every pass above ran quiet because
@@ -1037,6 +1053,7 @@ func (s *Streamer) preflightOneNamespaceReplicaIdentity(ctx context.Context, src
 // here are bulk-copy-only and closed at the end of this call.
 func (s *Streamer) coldStartCopyOneDatabase(
 	ctx context.Context,
+	rc resumeContext,
 	stream *ir.SnapshotStream,
 	applier ir.ChangeApplier,
 	streamID, database string,
@@ -1293,6 +1310,14 @@ func (s *Streamer) coldStartCopyOneDatabase(
 		CopyFanoutCeiling:    fanoutCeiling,
 		NoIntraTableStealing: s.NoIntraTableStealing,
 		GrowGate:             gate,
+		Recording:            rc,
+		// The SOURCE database, so N namespaces copied under ONE stream id
+		// cannot upsert each other's progress rows: two databases holding
+		// a `users` table would otherwise share a key and the second
+		// would overwrite the first, silently. The source name (not the
+		// mapped target) because that is what the operator selected and
+		// what Table.Schema carries here.
+		ProgressNamespace: database,
 	}
 	if err := runBulkCopyWithOpts(ctx, schema, stream.Rows, sw, rw, bulkOpts); err != nil {
 		migcore.CloseIf(rw)

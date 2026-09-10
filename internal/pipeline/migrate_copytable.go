@@ -166,10 +166,10 @@ func copyTable(ctx context.Context, rr ir.RowReader, rw ir.RowWriter, table *ir.
 // INSERT would re-introduce the duplicate-key collision the dedup
 // removal was meant to fix. (Both shipping target engines implement
 // the surface; this guards a future engine that forgets it.)
-func copyTableColdStartIdempotent(ctx context.Context, rr ir.RowReader, rw ir.RowWriter, table *ir.Table, redactor *redact.Registry, shard ShardColumnSpec) (retErr error) {
+func copyTableColdStartIdempotent(ctx context.Context, rr ir.RowReader, rw ir.RowWriter, table *ir.Table, redactor *redact.Registry, shard ShardColumnSpec) (rowsCopied int64, retErr error) {
 	idem, ok := rw.(ir.IdempotentRowWriter)
 	if !ok {
-		return fmt.Errorf(
+		return 0, fmt.Errorf(
 			"pipeline: table %q: snapshot reader requires an idempotent bulk-copy writer "+
 				"(VStream COPY re-emits rows, Bug 125) but the target row writer does not "+
 				"implement IdempotentRowWriter",
@@ -188,7 +188,7 @@ func copyTableColdStartIdempotent(ctx context.Context, rr ir.RowReader, rw ir.Ro
 	if len(migcore.TablePKColumns(table)) == 0 {
 		icw, capable := idem.(ir.IdempotentCopyWriter)
 		if !capable || !icw.HandlesNoPKIdempotentCopy() {
-			return fmt.Errorf(
+			return 0, fmt.Errorf(
 				"pipeline: table %q has no PRIMARY KEY and the target's idempotent bulk-copy "+
 					"writer does not support no-PK upsert (VStream COPY re-emits rows out of order, "+
 					"Bug 125; a plain INSERT would duplicate them). Add a PRIMARY KEY to the source "+
@@ -203,7 +203,7 @@ func copyTableColdStartIdempotent(ctx context.Context, rr ir.RowReader, rw ir.Ro
 
 	rows, err := rr.ReadRows(copyCtx, table)
 	if err != nil {
-		return fmt.Errorf("read rows: %w", err)
+		return 0, fmt.Errorf("read rows: %w", err)
 	}
 	pt := newProgressTicker(copyCtx, progressInterval, table.Name)
 	kickOffRowCount(copyCtx, rr, table, pt)
@@ -213,10 +213,15 @@ func copyTableColdStartIdempotent(ctx context.Context, rr ir.RowReader, rw ir.Ro
 	redacted, redactErrFn := redactRows(copyCtx, teed, redactor, table.Schema, table.Name, table.Columns, migcore.TablePKColumns(table), "")
 	stamped, _ := shardStampRows(copyCtx, redacted, shard.Name, shard.Value)
 	if err := idem.WriteRowsIdempotent(copyCtx, table, stamped); err != nil {
-		return fmt.Errorf("write rows (idempotent): %w", err)
+		return 0, fmt.Errorf("write rows (idempotent): %w", err)
 	}
 	if err := redactErrFn(); err != nil {
-		return fmt.Errorf("redact rows: %w", err)
+		return 0, fmt.Errorf("redact rows: %w", err)
 	}
-	return migcore.ReaderStreamErr(rr, table)
+	// The count is the ROWS THE READER DELIVERED, which on this path can
+	// exceed what the target ends up holding: the VStream COPY re-emits
+	// (Bug 125) and the upsert absorbs the duplicates. Recorded as-is
+	// rather than "corrected" to a number nothing measured. 0 on every
+	// error path above, never partial (same discipline as [copyTable]).
+	return pt.rows.Load(), migcore.ReaderStreamErr(rr, table)
 }

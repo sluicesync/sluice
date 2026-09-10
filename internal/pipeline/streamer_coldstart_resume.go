@@ -33,12 +33,22 @@
 //     their cold start after a stop still refuses, because nothing can
 //     prove where their source stands.
 //   - The recorded anchor exists only if the cold start ran through the
-//     ADR-0079 fast parallel path, which is the only path that builds a
-//     recording context. A serial PG cold start (--schema-already-applied,
-//     an interrupted-COPY resume, the A0 client-copy fallback) records
-//     no anchor and is not resumable here.
+//     ADR-0079 fast parallel path. A serial PG cold start
+//     (--schema-already-applied, an interrupted-COPY resume, the A0
+//     client-copy fallback) records no anchor and is not resumable here.
+//
+//     CORRECTION (audit A0909-P2b): this used to read "…which is the
+//     only path that builds a recording context", and that half stopped
+//     being true when every serial lane started recording its phase and
+//     per-table progress. The scope above did NOT change, because the
+//     anchor is a separate decision from the recording: only
+//     [Streamer.coldStartRunCopy]'s fast branch passes a non-empty
+//     [ir.SnapshotAnchorRecord], and [gradeRecordedColdStartHeader]
+//     declines an anchorless header. Which is a sentence with no test
+//     behind it unless you can name one — it is
+//     TestSerialColdStartRecordsNoSnapshotAnchor.
 //   - The multi-namespace cold start ([Streamer.coldStartMultiDatabase])
-//     is deliberately NOT reached: it copies serially, records nothing,
+//     is deliberately NOT reached: it records progress but no anchor,
 //     and its stop path still calls bare abandonStream(). Widening that
 //     door is filed separately and must not be done from here.
 //   - --reset-target-data and --restart-from-scratch are handled by

@@ -1120,9 +1120,43 @@ func (s *Streamer) coldStartRunCopy(ctx context.Context, schema, createSchema *i
 	if coldStartDispatchObserver != nil {
 		coldStartDispatchObserver(fast)
 	}
+
+	// Open the run's progress recording ONCE, here, for BOTH lanes (audit
+	// A0909-P2b). It used to be built inside runColdStartParallel, which
+	// is why every serial cold start — MySQL, MariaDB, VStream, the
+	// trigger engines, --schema-already-applied, an ADR-0072 resumable
+	// copy, the A0 client-copy fallback — recorded nothing at all and
+	// `sync status` reported the stream as absent for the whole run.
+	//
+	// The SNAPSHOT ANCHOR is recorded on the fast lane ONLY, and that is
+	// a deliberate scope boundary rather than an omission: the anchor is
+	// what [Streamer.resumeStoppedColdStart] stands on to SKIP a copy,
+	// and that ladder re-runs the post-copy DDL phases (wrong under
+	// --schema-already-applied) and has never been exercised against a
+	// mid-COPY resume or the A0 fallback. An empty record writes no
+	// anchor, and [gradeRecordedColdStartHeader] declines an anchorless
+	// header, so the serial lanes keep today's stop behaviour exactly.
+	// See coldstart_recording.go, and
+	// TestSerialColdStartRecordsNoSnapshotAnchor.
+	var anchorRec ir.SnapshotAnchorRecord
+	if fast {
+		// The snapshot's own consistent point — the position CDC would
+		// have started from had this run reached the handoff — plus the
+		// fingerprint of the flags that decide what this copy puts on the
+		// target, so a re-run under different flags is refused instead of
+		// inheriting rows its own predicate would not have selected
+		// (A0909-STOP-1).
+		anchorRec = ir.SnapshotAnchorRecord{
+			Anchor:    stream.Position.Token,
+			CopyShape: coldStartCopyShape(s, schema),
+		}
+	}
+	rc, closeRecording := s.openColdStartRecording(ctx, streamID, anchorRec)
+	defer closeRecording()
+
 	var copyErr error
 	if fast {
-		copyErr = s.runColdStartParallel(ctx, stream, sw, rw, schema, createSchema, streamID)
+		copyErr = s.runColdStartParallel(ctx, rc, stream, sw, rw, schema, createSchema, streamID)
 	} else {
 		// The ADR-0079 fast shareable-snapshot path was not taken — but that
 		// does NOT mean the copy is serial. When the source surfaced a
@@ -1171,6 +1205,7 @@ func (s *Streamer) coldStartRunCopy(ctx context.Context, schema, createSchema *i
 			CopyFanoutCeiling:    fanoutCeiling,
 			NoIntraTableStealing: s.NoIntraTableStealing,
 			GrowGate:             gate,
+			Recording:            rc,
 		}
 		copyErr = runBulkCopyWithOpts(ctx, schema, stream.Rows, sw, rw, bulkOpts)
 	}
@@ -1183,6 +1218,12 @@ func (s *Streamer) coldStartRunCopy(ctx context.Context, schema, createSchema *i
 		s.abandonUnlessStopped(ctx, stream, copyErr)
 		return copyErr
 	}
+	// Mark the recorded cold start TERMINAL (audit A0909-P3), for BOTH
+	// lanes and at the same point the fast lane used to do it itself:
+	// immediately after the copy returns clean, before the FK verification
+	// and the CDC anchor. A run left non-terminal keeps printing
+	// "cold start in progress" above the live stream row forever.
+	markRecordedColdStartComplete(ctx, rc)
 	// Item 112: prove any metadata-only-added FKs clean BEFORE closing sw and
 	// BEFORE the CDC anchor. The unfiltered cold-start armed the item-109
 	// metadata-only FK path (coldStartOpenTargetWriters), which skips InnoDB's

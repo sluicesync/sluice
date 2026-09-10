@@ -104,7 +104,7 @@ func TestPlainMaybeParallel_FansOutWhenCapable(t *testing.T) {
 	rr := &fanoutFakeReader{rows: rows}
 	w := &plainParallelFakeWriter{failWorker: -1}
 
-	if err := copyTablePlainMaybeParallel(context.Background(), rr, w, table, nil, ShardColumnSpec{}, 4); err != nil {
+	if _, err := copyTablePlainMaybeParallel(context.Background(), rr, w, table, nil, ShardColumnSpec{}, 4); err != nil {
 		t.Fatalf("plain maybe-parallel (fan-out): %v", err)
 	}
 	if atomic.LoadInt32(&w.parallelHit) != 1 {
@@ -132,7 +132,7 @@ func TestPlainMaybeParallel_SerialWhenNotCapable(t *testing.T) {
 		{"id": int64(1), "v": "a"}, {"id": int64(2), "v": "b"}, {"id": int64(3), "v": "c"},
 	}}
 	w := &plainOnlyWriter{}
-	if err := copyTablePlainMaybeParallel(context.Background(), rr, w, table, nil, ShardColumnSpec{}, 4); err != nil {
+	if _, err := copyTablePlainMaybeParallel(context.Background(), rr, w, table, nil, ShardColumnSpec{}, 4); err != nil {
 		t.Fatalf("plain maybe-parallel (serial fallback): %v", err)
 	}
 	if atomic.LoadInt32(&w.serialHit) != 1 {
@@ -153,7 +153,7 @@ func TestPlainMaybeParallel_SerialForNoPKTable(t *testing.T) {
 	}
 	rr := &fanoutFakeReader{rows: []ir.Row{{"msg": "a"}, {"msg": "b"}}}
 	w := &plainParallelFakeWriter{failWorker: -1}
-	if err := copyTablePlainMaybeParallel(context.Background(), rr, w, table, nil, ShardColumnSpec{}, 4); err != nil {
+	if _, err := copyTablePlainMaybeParallel(context.Background(), rr, w, table, nil, ShardColumnSpec{}, 4); err != nil {
 		t.Fatalf("plain maybe-parallel (no-PK serial): %v", err)
 	}
 	if atomic.LoadInt32(&w.parallelHit) != 0 {
@@ -172,7 +172,7 @@ func TestPlainMaybeParallel_SerialWhenDegreeOne(t *testing.T) {
 	table := pkTable()
 	rr := &fanoutFakeReader{rows: []ir.Row{{"id": int64(1), "v": "a"}}}
 	w := &plainParallelFakeWriter{failWorker: -1}
-	if err := copyTablePlainMaybeParallel(context.Background(), rr, w, table, nil, ShardColumnSpec{}, 1); err != nil {
+	if _, err := copyTablePlainMaybeParallel(context.Background(), rr, w, table, nil, ShardColumnSpec{}, 1); err != nil {
 		t.Fatalf("plain maybe-parallel (degree 1): %v", err)
 	}
 	if atomic.LoadInt32(&w.parallelHit) != 0 {
@@ -194,7 +194,7 @@ func TestPlainParallelCopy_WorkerErrorFailsLoudly(t *testing.T) {
 	rr := &fanoutFakeReader{rows: rows}
 	w := &plainParallelFakeWriter{failWorker: 1} // worker 1 errors
 
-	err := copyTablePlainParallel(context.Background(), rr, w, table, nil, ShardColumnSpec{}, 4)
+	_, err := copyTablePlainParallel(context.Background(), rr, w, table, nil, ShardColumnSpec{}, 4)
 	if err == nil {
 		t.Fatal("expected a loud error when a plain worker fails; got nil")
 	}
@@ -212,7 +212,7 @@ func TestPlainParallelCopy_ReaderStreamErrSurfaces(t *testing.T) {
 		err:  errors.New("mysql: scan: boom"),
 	}
 	w := &plainParallelFakeWriter{failWorker: -1}
-	err := copyTablePlainParallel(context.Background(), rr, w, table, nil, ShardColumnSpec{}, 4)
+	_, err := copyTablePlainParallel(context.Background(), rr, w, table, nil, ShardColumnSpec{}, 4)
 	if err == nil {
 		t.Fatal("expected the Bug-68 loud-failure gate to surface the reader stream error")
 	}
@@ -300,7 +300,7 @@ func TestRunConcurrentTableCopy_NativeWxD(t *testing.T) {
 	writer := newWXDWriter()
 
 	// needsIdempotent=false → the plain path; degree=4 → per-table fan-out.
-	if err := runConcurrentTableCopy(context.Background(), groups, schema, reader, writer, nil, ShardColumnSpec{}, degree, false, false); err != nil {
+	if err := runConcurrentTableCopy(context.Background(), groups, schema, reader, writer, nil, ShardColumnSpec{}, degree, false, false, nil); err != nil {
 		t.Fatalf("runConcurrentTableCopy (native W×D): %v", err)
 	}
 	if atomic.LoadInt32(&writer.parallelHit) == 0 {
@@ -328,7 +328,7 @@ func TestRunConcurrentTableCopy_NativeDegreeOneByteIdentical(t *testing.T) {
 	reader := newNativeConcReader(groups, rowsPer)
 	writer := newWXDWriter()
 
-	if err := runConcurrentTableCopy(context.Background(), groups, schema, reader, writer, nil, ShardColumnSpec{}, 1, false, false); err != nil {
+	if err := runConcurrentTableCopy(context.Background(), groups, schema, reader, writer, nil, ShardColumnSpec{}, 1, false, false, nil); err != nil {
 		t.Fatalf("runConcurrentTableCopy (native D=1): %v", err)
 	}
 	if atomic.LoadInt32(&writer.parallelHit) != 0 {

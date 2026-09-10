@@ -427,7 +427,7 @@ func TestRunWorkStealingTableCopy_ChunkedExactlyOnce(t *testing.T) {
 	}
 	defer func() { intraTableChunkObserver = nil }()
 
-	if err := runConcurrentTableCopy(context.Background(), groups, schema, reader, writer, nil, ShardColumnSpec{}, 1, false, false); err != nil {
+	if err := runConcurrentTableCopy(context.Background(), groups, schema, reader, writer, nil, ShardColumnSpec{}, 1, false, false, nil); err != nil {
 		t.Fatalf("runConcurrentTableCopy (chunked): %v", err)
 	}
 

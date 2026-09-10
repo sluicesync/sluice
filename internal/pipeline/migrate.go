@@ -1294,11 +1294,72 @@ type bulkCopyOpts struct {
 	// runBulkCopyPhases. nil ⇒ the watchdog reads "never quiesced", which
 	// over-reports rather than under-reports.
 	GrowGate ir.GrowGate
+
+	// Recording is the sync cold start's record-but-never-resume context
+	// ([newSyncRecordingContext]), so the SERIAL cold start writes the same
+	// phase marks and per-table progress rows the ADR-0079 parallel lane
+	// writes (audit A0909-P2b).
+	//
+	// The zero value is INERT — every writer under it gates on
+	// [resumeContext.writes], which is false for a zero context — so
+	// `migrate` and every test that builds a bulkCopyOpts without this
+	// field behaves byte-identically to before it existed. That is the
+	// v0.99.51 zero-value rule applied to a struct rather than a bool: the
+	// absent value is the historical behaviour, never the new one.
+	//
+	// Why this had to be threaded at all: v0.148.0's cold-start visibility
+	// was built inside [Streamer.runColdStartParallel], whose gate
+	// ([coldStartFastEligible]) admits only a source that exports a
+	// SHAREABLE snapshot — Postgres. Every serial cold start (MySQL,
+	// MariaDB, VStream/PlanetScale/Vitess, pgtrigger, sqlite-trigger,
+	// d1-trigger, --schema-already-applied, an ADR-0072 resumable copy, the
+	// A0 client-copy fallback, and every --databases/--schemas fan-out)
+	// reached this function instead and recorded nothing at all, so the
+	// feature did not cover the PlanetScale-MySQL cross-region move that
+	// motivated it (docs/operator/cross-region-migration.md).
+	Recording resumeContext
+
+	// ProgressNamespace qualifies the key each per-table progress row is
+	// recorded under, as "<namespace>.<table>" ([qualifiedTableName]).
+	//
+	// The zero value ("") records the BARE table name, which is what the
+	// parallel lane and `migrate` both write — so a single-namespace copy
+	// keys its rows exactly the way its sibling does, and the two lanes
+	// stay comparable.
+	//
+	// The multi-database fan-out sets it, and must: it copies N databases
+	// under ONE stream id (one migration_id), and two of them holding a
+	// `users` table would otherwise upsert the same progress row, so the
+	// second database's copy would overwrite the first's and the recorded
+	// table count would be short by every collision. Nothing reads these
+	// rows back on that path today, which is exactly why the collision
+	// would have been invisible.
+	ProgressNamespace string
 }
 
 // runBulkCopyWithOpts is the configurable variant of [runBulkCopy].
 // Existing callers stay on the zero-options shortcut; new callers
 // use this to opt into [bulkCopyOpts.SkipSchemaApply] etc.
+//
+// # Recording (audit A0909-P2b)
+//
+// Every phase boundary below is marked through [markPhase] /
+// [markFailed] and every table through a [tableProgressRecorder] — the
+// SAME writers migrate's [runBulkCopyPhases] uses, so a change to how a
+// phase is marked or a progress row is persisted reaches both lanes.
+// The post-copy DDL ladder is not merely marked but DELEGATED to the
+// recorded phase helpers ([runIdentitySyncPhase], [runIndexesPhase],
+// [runConstraintsPhase], [runRecordedViewsPhase]) that
+// [Streamer.resumeStoppedColdStart] already shares with migrate — this
+// path used to carry its own rendering of the identical ladder.
+//
+// With a zero-value [bulkCopyOpts.Recording] every one of those writers
+// short-circuits on [resumeContext.writes] and the recorder is nil, so
+// the observable behaviour is what it was before recording existed. The
+// error text of every phase is byte-identical either way: the recorded
+// helpers wrap exactly the strings the inline ladder wrapped, and
+// [markFailed] returns its input error unchanged on a non-recording
+// context.
 func runBulkCopyWithOpts(
 	ctx context.Context,
 	schema *ir.Schema,
@@ -1310,6 +1371,12 @@ func runBulkCopyWithOpts(
 	// Item 146: bind the run's grow gate as the copy watchdog's quiesce
 	// source before any ticker is constructed downstream.
 	ctx = withCopyQuiesceSource(ctx, opts.GrowGate)
+	rc := opts.Recording
+	rec := newTableProgressRecorder(rc, opts.ProgressNamespace)
+	// The header this run's phase marks are written against. A
+	// non-recording context never writes it; a recording one keyed it to
+	// the stream id in [newSyncRecordingContext].
+	state := &ir.MigrationState{MigrationID: rc.migrationID}
 	// ADR-0184 (PlanetScale leg) sibling: the serial / multi-database sync
 	// cold-start builds its deferred indexes via the shared
 	// buildTableIndexes chokepoint too (CreateIndexes below), so thread the
@@ -1329,8 +1396,15 @@ func runBulkCopyWithOpts(
 		if opts.CreateSchema != nil {
 			createSchema = opts.CreateSchema
 		}
+		// Deliberately NOT marked under --schema-already-applied: there is
+		// no tables phase on that path, and recording one would tell an
+		// operator sluice was applying DDL it had promised not to.
+		if err := markPhase(ctx, rc, state, ir.MigrationPhaseTables); err != nil {
+			_ = err // best-effort; the data work is the load-bearing thing
+		}
 		if err := sw.CreateTablesWithoutConstraints(ctx, createSchema); err != nil {
-			return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf("pipeline: create tables: %w", err))
+			err = fmt.Errorf("pipeline: create tables: %w", err)
+			return migcore.WrapWithHint(migcore.PhaseSchemaApply, markFailed(ctx, rc, *state, ir.MigrationPhaseTables, err))
 		}
 	}
 	// --upfront-indexes (Streamer.UpfrontIndexes, item 111 phase 2): build the
@@ -1344,10 +1418,8 @@ func runBulkCopyWithOpts(
 	// is set (the operator owns the catalog). When false this block is skipped
 	// and the phase order is byte-identical to before.
 	if opts.UpfrontIndexes && !opts.SkipSchemaApply {
-		if err := migcore.RunDDLPhaseWithReparentRetry(ctx, "indexes", sw, func(ctx context.Context) error {
-			return sw.CreateIndexes(ctx, schema)
-		}); err != nil {
-			return migcore.WrapWithHint(migcore.PhaseIndexes, fmt.Errorf("pipeline: create indexes (upfront): %w", err))
+		if err := runIndexesPhase(ctx, rc, state, schema, sw, true); err != nil {
+			return err
 		}
 	}
 	// Bug 125: the MySQL VStream snapshot reader re-emits COPY-phase
@@ -1436,6 +1508,10 @@ func runBulkCopyWithOpts(
 			slog.Int("effective", fanoutDegree),
 			slog.Int("target_fanout_ceiling", opts.CopyFanoutCeiling))
 	}
+	// The copy phase starts here, whichever shape it takes below.
+	if err := markPhase(ctx, rc, state, ir.MigrationPhaseBulkCopy); err != nil {
+		_ = err // best-effort; the data work is the load-bearing thing
+	}
 	// ADR-0100 / ADR-0101: WRITE-side cross-table concurrency. When the
 	// snapshot reader surfaces a disjoint concurrent-copy partition (≥2
 	// groups), drive W consumer pipelines, one per group, each writing its
@@ -1463,18 +1539,26 @@ func runBulkCopyWithOpts(
 	// native MySQL / K = 1), concGroups is nil and the serial loop below runs
 	// BYTE-IDENTICALLY.
 	if concGroups != nil {
-		if err := runConcurrentTableCopy(ctx, concGroups, schema, rows, rw, opts.Redactor, opts.Shard, fanoutDegree, needsIdempotent, opts.NoIntraTableStealing); err != nil {
-			return err
+		if err := runConcurrentTableCopy(ctx, concGroups, schema, rows, rw, opts.Redactor, opts.Shard, fanoutDegree, needsIdempotent, opts.NoIntraTableStealing, rec); err != nil {
+			// NOT re-wrapped: runConcurrentTableCopy already attached the
+			// bulk-copy hint at the failing table, and markFailed returns
+			// its input unchanged on a non-recording context — so the error
+			// an operator sees is byte-identical to before this line existed.
+			return markFailed(ctx, rc, *state, ir.MigrationPhaseBulkCopy, err)
 		}
 	} else {
 		if concurrentCopyDispatchObserver != nil {
 			concurrentCopyDispatchObserver(0) // serial path taken
 		}
 		for _, table := range schema.Tables {
+			rec.started(ctx, table)
 			if needsIdempotent {
-				if err := copyTableColdStartIdempotentMaybeParallel(ctx, rows, rw, table, opts.Redactor, opts.Shard, fanoutDegree); err != nil {
-					return migcore.WrapWithHint(migcore.PhaseBulkCopy, fmt.Errorf("pipeline: copy table %q: %w", table.Name, err))
+				n, err := copyTableColdStartIdempotentMaybeParallel(ctx, rows, rw, table, opts.Redactor, opts.Shard, fanoutDegree)
+				if err != nil {
+					err = fmt.Errorf("pipeline: copy table %q: %w", table.Name, err)
+					return migcore.WrapWithHint(migcore.PhaseBulkCopy, markFailed(ctx, rc, *state, ir.MigrationPhaseBulkCopy, err))
 				}
+				rec.completed(ctx, table, n)
 				continue
 			}
 			// Plain (gap-free) path: compose the ADR-0097 D-way write fan-out
@@ -1484,28 +1568,33 @@ func runBulkCopyWithOpts(
 			// per-table fan-out; PG / VStream-single-stream targets that don't
 			// implement ir.ParallelCopyWriter fall through to copyTable
 			// byte-identically.
-			if err := copyTablePlainMaybeParallel(ctx, rows, rw, table, opts.Redactor, opts.Shard, fanoutDegree); err != nil {
-				return migcore.WrapWithHint(migcore.PhaseBulkCopy, fmt.Errorf("pipeline: copy table %q: %w", table.Name, err))
+			n, err := copyTablePlainMaybeParallel(ctx, rows, rw, table, opts.Redactor, opts.Shard, fanoutDegree)
+			if err != nil {
+				err = fmt.Errorf("pipeline: copy table %q: %w", table.Name, err)
+				return migcore.WrapWithHint(migcore.PhaseBulkCopy, markFailed(ctx, rc, *state, ir.MigrationPhaseBulkCopy, err))
 			}
+			rec.completed(ctx, table, n)
 		}
 	}
 	if !opts.SkipSchemaApply {
 		// ADR-0114: each post-copy DDL phase rides a storage-grow/reparent
 		// instead of aborting the whole migration after a correct data copy.
-		if err := migcore.RunDDLPhaseWithReparentRetry(ctx, "identity-sequences", sw, func(ctx context.Context) error {
-			return sw.SyncIdentitySequences(ctx, schema)
-		}); err != nil {
-			return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf("pipeline: sync identity sequences: %w", err))
+		//
+		// These four phases used to be written out inline here, a second
+		// rendering of the ladder migrate and the stopped-cold-start resume
+		// already share. They are the SAME functions now, so a change to
+		// how a phase is marked, retried or attributed reaches all three
+		// entry points instead of two (audit A0909-P2b).
+		if err := runIdentitySyncPhase(ctx, rc, state, schema, sw); err != nil {
+			return err
 		}
 		// Skip the post-copy index build when --upfront-indexes already built
 		// them before the copy (item 111 phase 2) — otherwise they build here,
 		// deferred, exactly as before. verifyBuiltIndexes below stays
 		// UNCONDITIONAL on every path.
 		if !opts.UpfrontIndexes {
-			if err := migcore.RunDDLPhaseWithReparentRetry(ctx, "indexes", sw, func(ctx context.Context) error {
-				return sw.CreateIndexes(ctx, schema)
-			}); err != nil {
-				return migcore.WrapWithHint(migcore.PhaseIndexes, fmt.Errorf("pipeline: create indexes: %w", err))
+			if err := runIndexesPhase(ctx, rc, state, schema, sw, false); err != nil {
+				return err
 			}
 		}
 		// Loud-failure safety net (SLUICE-E-INDEX-MISSING): the serial cold-start
@@ -1522,14 +1611,13 @@ func runBulkCopyWithOpts(
 		// by the loop below short-circuiting them in the same block.
 		return nil
 	}
-	if err := migcore.RunDDLPhaseWithReparentRetry(ctx, "constraints", sw, func(ctx context.Context) error {
-		return sw.CreateConstraints(ctx, schema)
-	}); err != nil {
-		return migcore.WrapWithHint(migcore.PhaseConstraints, fmt.Errorf("pipeline: create constraints: %w", err))
+	// reportDegradedFKs runs INSIDE runConstraintsPhase, in the same spot
+	// the inline block called it from.
+	if err := runConstraintsPhase(ctx, rc, state, schema, sw); err != nil {
+		return err
 	}
-	reportDegradedFKs(ctx, sw)
-	if err := migcore.RunViewsPhase(ctx, schema, sw); err != nil {
-		return migcore.WrapWithHint(migcore.PhaseViews, err)
+	if err := runRecordedViewsPhase(ctx, rc, state, schema, sw); err != nil {
+		return err
 	}
 	// Advisory post-success phase: --analyze-after (item 111 AnalyzeAfter
 	// parity). Runs LAST — after constraints and views — so the refreshed

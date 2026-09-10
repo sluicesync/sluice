@@ -66,6 +66,13 @@ var bulkCopyOptsKnobs = []string{
 	// noise, which gets suppressed, which is how a watchdog stops catching
 	// anything.
 	"GrowGate",
+	// Audit A0909-P2b: the cold start's progress recording. A site that
+	// omits it records nothing, and "records nothing" is exactly the
+	// defect this field exists to close — v0.148.0's visibility feature
+	// reached one lane of the seven and its absence on the other six was
+	// invisible for a release.
+	"Recording",
+	"ProgressNamespace",
 }
 
 // bulkCopyOptsProbeSourcedKnobs are [bulkCopyOpts] fields whose value must
@@ -86,6 +93,12 @@ var bulkCopyOptsOmissionReason = map[string]string{
 	"streamer_multidb.go:Shard":           "validateMultiDatabaseStream REFUSES --inject-shard-column in multi-database mode (ADR-0074), so ShardColumnSpec is provably un-engaged on this path",
 	"streamer_multidb.go:SkipSchemaApply": "validateMultiDatabaseStream REFUSES --schema-already-applied in multi-database mode (ADR-0074); the multi-database cold-start owns per-namespace creation",
 	"streamer_multidb.go:CreateSchema":    "the ADR-0166 pre-create shape gate that produces a create SUBSET runs on the single-database cold-start only (coldStartGatePreflight); multi-database creates every in-scope table, which nil already means",
+	// The single-database cold start copies exactly ONE namespace under
+	// its stream id, so a bare table name is already unique — and it MUST
+	// stay bare, because that is the key the ADR-0079 parallel lane and
+	// `migrate` write, and everyTableCopied reads. Only the N-namespace
+	// fan-out needs the qualifier.
+	"streamer_coldstart.go:ProgressNamespace": "the single-database cold start copies ONE namespace, so the bare table name is unique within its migration id — and must match the key the parallel lane writes, which everyTableCopied reads back",
 }
 
 // parsePipelineFiles parses every non-test .go file in the package.

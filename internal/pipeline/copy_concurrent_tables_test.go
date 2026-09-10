@@ -243,7 +243,7 @@ func TestRunConcurrentTableCopy_WindowsOverlap(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		// degree=1: isolate cross-TABLE concurrency from per-table fan-out.
-		done <- runConcurrentTableCopy(ctx, groups, schema, reader, writer, nil, ShardColumnSpec{}, 1, true, false)
+		done <- runConcurrentTableCopy(ctx, groups, schema, reader, writer, nil, ShardColumnSpec{}, 1, true, false, nil)
 	}()
 
 	// Wait until two windows are concurrently open (one per group).
@@ -273,7 +273,7 @@ func TestRunConcurrentTableCopy_ExactlyOnce(t *testing.T) {
 	reader := newConcPartReader(groups, rowsPer)
 	writer := newRecordingWriter()
 
-	if err := runConcurrentTableCopy(context.Background(), groups, schema, reader, writer, nil, ShardColumnSpec{}, 1, true, false); err != nil {
+	if err := runConcurrentTableCopy(context.Background(), groups, schema, reader, writer, nil, ShardColumnSpec{}, 1, true, false, nil); err != nil {
 		t.Fatalf("runConcurrentTableCopy: %v", err)
 	}
 
@@ -299,7 +299,7 @@ func TestRunConcurrentTableCopy_ErrorAbortsLoudly(t *testing.T) {
 	writer := newRecordingWriter()
 	writer.failOn = "b"
 
-	err := runConcurrentTableCopy(context.Background(), groups, schema, reader, writer, nil, ShardColumnSpec{}, 1, true, false)
+	err := runConcurrentTableCopy(context.Background(), groups, schema, reader, writer, nil, ShardColumnSpec{}, 1, true, false, nil)
 	if err == nil {
 		t.Fatal("expected error from failing consumer; got nil (silent partial success)")
 	}
@@ -314,7 +314,7 @@ func TestRunConcurrentTableCopy_MissingTableLoud(t *testing.T) {
 	reader := newConcPartReader(groups, map[string]int{"a": 1, "ghost": 1})
 	writer := newRecordingWriter()
 
-	err := runConcurrentTableCopy(context.Background(), groups, schema, reader, writer, nil, ShardColumnSpec{}, 1, true, false)
+	err := runConcurrentTableCopy(context.Background(), groups, schema, reader, writer, nil, ShardColumnSpec{}, 1, true, false, nil)
 	if err == nil {
 		t.Fatal("expected loud error for a group table missing from the schema; got nil")
 	}
@@ -335,7 +335,7 @@ func TestRunConcurrentTableCopy_CancelNoLeak(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- runConcurrentTableCopy(ctx, groups, schema, reader, writer, nil, ShardColumnSpec{}, 1, true, false)
+		done <- runConcurrentTableCopy(ctx, groups, schema, reader, writer, nil, ShardColumnSpec{}, 1, true, false, nil)
 	}()
 
 	time.Sleep(50 * time.Millisecond)
@@ -420,7 +420,7 @@ func TestRunConcurrentTableCopy_NativePlainInsert(t *testing.T) {
 	writer := newRecordingWriter()
 
 	// needsIdempotent=false → the plain copyTable path.
-	if err := runConcurrentTableCopy(context.Background(), groups, schema, reader, writer, nil, ShardColumnSpec{}, 1, false, false); err != nil {
+	if err := runConcurrentTableCopy(context.Background(), groups, schema, reader, writer, nil, ShardColumnSpec{}, 1, false, false, nil); err != nil {
 		t.Fatalf("runConcurrentTableCopy (native plain): %v", err)
 	}
 	writer.mu.Lock()
@@ -546,7 +546,7 @@ func TestRunConcurrentTableCopy_CoversAllGroupTables(t *testing.T) {
 	reader := newConcPartReader(groups, rowsPer)
 	writer := newRecordingWriter()
 
-	if err := runConcurrentTableCopy(context.Background(), groups, schema, reader, writer, nil, ShardColumnSpec{}, 1, true, false); err != nil {
+	if err := runConcurrentTableCopy(context.Background(), groups, schema, reader, writer, nil, ShardColumnSpec{}, 1, true, false, nil); err != nil {
 		t.Fatalf("runConcurrentTableCopy: %v", err)
 	}
 

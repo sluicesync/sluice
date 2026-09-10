@@ -140,6 +140,11 @@ func concurrentCopyGroups(rows ir.RowReader) [][]string {
 // connection; the mid-COPY durable watermark is never wired on this path
 // (the caller skips it) and the fan-out path passes reportDurable=false, so
 // no consumer touches the watermark concurrently.
+// rec is the sync cold start's per-table progress recorder (audit
+// A0909-P2b), or nil on every path that records nothing. It is written
+// from W concurrent pipelines (and, on the stealing lane, from pipelines
+// that share a table), which is why the recorder carries its own lock
+// rather than riding the copy's.
 func runConcurrentTableCopy(
 	ctx context.Context,
 	groups [][]string,
@@ -151,6 +156,7 @@ func runConcurrentTableCopy(
 	fanoutDegree int,
 	needsIdempotent bool,
 	noIntraTableStealing bool,
+	rec *tableProgressRecorder,
 ) error {
 	if concurrentCopyDispatchObserver != nil {
 		concurrentCopyDispatchObserver(len(groups))
@@ -179,7 +185,7 @@ func runConcurrentTableCopy(
 	// scoped to its group at the source, so a stealing consumer would have no
 	// rows for an out-of-group table — so it stays on the static partition below.
 	if ws, ok := rows.(ir.WorkStealingCopyReader); ok && ws.ConcurrentReaderCount() > 1 {
-		return runWorkStealingTableCopy(ctx, groups, byName, ws, rw, redactor, shard, fanoutDegree, needsIdempotent, noIntraTableStealing)
+		return runWorkStealingTableCopy(ctx, groups, byName, ws, rw, redactor, shard, fanoutDegree, needsIdempotent, noIntraTableStealing, rec)
 	}
 
 	tg, tctx := errgroup.WithContext(ctx)
@@ -201,9 +207,13 @@ func runConcurrentTableCopy(
 						name,
 					)
 				}
-				var cerr error
+				rec.started(tctx, table)
+				var (
+					cerr error
+					n    int64
+				)
 				if needsIdempotent {
-					cerr = copyTableColdStartIdempotentMaybeParallel(tctx, rows, rw, table, redactor, shard, fanoutDegree)
+					n, cerr = copyTableColdStartIdempotentMaybeParallel(tctx, rows, rw, table, redactor, shard, fanoutDegree)
 				} else {
 					// Native-MySQL gap-free snapshot (ADR-0101/0102): plain
 					// INSERT with the SAME ADR-0097 D-way write fan-out the
@@ -211,11 +221,12 @@ func runConcurrentTableCopy(
 					// fans its active table across D plain-INSERT workers →
 					// W × D. Reuses partitionRowsByPK verbatim; degree==1 or a
 					// no-PK table falls back to the single-writer copyTable.
-					cerr = copyTablePlainMaybeParallel(tctx, rows, rw, table, redactor, shard, fanoutDegree)
+					n, cerr = copyTablePlainMaybeParallel(tctx, rows, rw, table, redactor, shard, fanoutDegree)
 				}
 				if cerr != nil {
 					return migcore.WrapWithHint(migcore.PhaseBulkCopy, fmt.Errorf("pipeline: copy table %q: %w", name, cerr))
 				}
+				rec.completed(tctx, table, n)
 			}
 			return nil
 		})
@@ -287,6 +298,7 @@ func runWorkStealingTableCopy(
 	fanoutDegree int,
 	needsIdempotent bool,
 	noIntraTableStealing bool,
+	rec *tableProgressRecorder,
 ) error {
 	// Flatten the disjoint groups into one ordered table list. The partition is
 	// a pure function of the sorted table set, so this order is deterministic
@@ -304,6 +316,21 @@ func runWorkStealingTableCopy(
 	items, err := buildCopyWorkItems(ctx, allTables, byName, ws, noIntraTableStealing)
 	if err != nil {
 		return err
+	}
+
+	// Tell the recorder how many items each table is split into, BEFORE
+	// any pipeline spawns. A chunked table is copied by several pipelines
+	// and finishes when its LAST chunk lands; without this the first
+	// chunk to return would record the whole table complete — a finished
+	// copy written down for a table that is still being read.
+	if rec != nil {
+		perTable := map[string]int{}
+		for _, it := range items {
+			perTable[it.table.Name]++
+		}
+		for name, n := range perTable {
+			rec.expectItems(byName[name], n) // a no-op for a whole-table (n == 1) table
+		}
 	}
 
 	w := ws.ConcurrentReaderCount()
@@ -345,15 +372,22 @@ func runWorkStealingTableCopy(
 						upperPK:    item.upperPK,
 					}
 				}
-				var cerr error
+				rec.started(tctx, item.table)
+				var (
+					cerr error
+					n    int64
+				)
 				if needsIdempotent {
-					cerr = copyTableColdStartIdempotentMaybeParallel(tctx, src, rw, item.table, redactor, shard, fanoutDegree)
+					n, cerr = copyTableColdStartIdempotentMaybeParallel(tctx, src, rw, item.table, redactor, shard, fanoutDegree)
 				} else {
-					cerr = copyTablePlainMaybeParallel(tctx, src, rw, item.table, redactor, shard, fanoutDegree)
+					n, cerr = copyTablePlainMaybeParallel(tctx, src, rw, item.table, redactor, shard, fanoutDegree)
 				}
 				if cerr != nil {
 					return migcore.WrapWithHint(migcore.PhaseBulkCopy, fmt.Errorf("pipeline: copy table %q (chunk %d): %w", item.table.Name, item.chunkIndex, cerr))
 				}
+				// Sums this item's rows into the table's row and marks the
+				// table complete only once every one of its items has landed.
+				rec.completed(tctx, item.table, n)
 			}
 		})
 	}

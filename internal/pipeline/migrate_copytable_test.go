@@ -354,7 +354,7 @@ func TestCopyTableColdStartIdempotent_RoutesThroughUpsert(t *testing.T) {
 	rw := &idempotentCountingWriter{}
 	table := &ir.Table{Name: "connections", Columns: []*ir.Column{{Name: "id"}}}
 
-	if err := copyTableColdStartIdempotent(context.Background(), rr, rw, table, nil, ShardColumnSpec{}); err != nil {
+	if _, err := copyTableColdStartIdempotent(context.Background(), rr, rw, table, nil, ShardColumnSpec{}); err != nil {
 		t.Fatalf("copyTableColdStartIdempotent: %v", err)
 	}
 	if rw.idemCalls != 1 || rw.plainCalls != 0 {
@@ -372,7 +372,7 @@ func TestCopyTableColdStartIdempotent_RefusesNonIdempotentWriter(t *testing.T) {
 	rw := drainingWriter{} // implements only WriteRows
 	table := &ir.Table{Name: "connections", Columns: []*ir.Column{{Name: "id"}}}
 
-	err := copyTableColdStartIdempotent(context.Background(), rr, rw, table, nil, ShardColumnSpec{})
+	_, err := copyTableColdStartIdempotent(context.Background(), rr, rw, table, nil, ShardColumnSpec{})
 	if err == nil {
 		t.Fatal("expected refusal when target writer is not idempotent; got nil")
 	}
@@ -392,7 +392,7 @@ func TestCopyTableColdStartIdempotent_RefusesNoPKWithoutCopyCapability(t *testin
 	rw := &pkOnlyIdempotentWriter{}                                              // idempotent on PK, but no no-PK capability
 	table := &ir.Table{Name: "connections", Columns: []*ir.Column{{Name: "id"}}} // no PrimaryKey
 
-	err := copyTableColdStartIdempotent(context.Background(), rr, rw, table, nil, ShardColumnSpec{})
+	_, err := copyTableColdStartIdempotent(context.Background(), rr, rw, table, nil, ShardColumnSpec{})
 	if err == nil {
 		t.Fatal("expected refusal for a no-PK table on a writer without no-PK upsert capability; got nil")
 	}
@@ -417,7 +417,7 @@ func TestCopyTableColdStartIdempotent_AllowsPKWithPlainIdempotentWriter(t *testi
 		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}},
 	}
 
-	if err := copyTableColdStartIdempotent(context.Background(), rr, rw, table, nil, ShardColumnSpec{}); err != nil {
+	if _, err := copyTableColdStartIdempotent(context.Background(), rr, rw, table, nil, ShardColumnSpec{}); err != nil {
 		t.Fatalf("PK table must proceed on a plain idempotent writer; got %v", err)
 	}
 	if rw.idemCalls != 1 {

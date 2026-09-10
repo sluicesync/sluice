@@ -205,7 +205,7 @@ func runMultiDBGate(t *testing.T, s *Streamer, rows ir.RowReader, database strin
 
 	stream := &ir.SnapshotStream{Rows: rows, CloseFn: func() error { return nil }}
 	err := s.coldStartCopyOneDatabase(
-		context.Background(), stream, &stubChangeApplier{},
+		context.Background(), resumeContext{} /*recording: this test grades the reset, not the progress rows*/, stream, &stubChangeApplier{},
 		"stream-1", database, inScope,
 		nil /*targetDeriver*/, false, /*targetCanDeriveDB → target-schema routing*/
 		restartReason(s.RestartFromScratch), /*these tests express intent via RestartFromScratch*/

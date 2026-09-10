@@ -290,7 +290,7 @@ func TestMaybeParallel_FallsBackToSerialWhenNotCapable(t *testing.T) {
 		{"id": int64(1), "v": "a"}, {"id": int64(2), "v": "b"}, {"id": int64(3), "v": "c"},
 	}}
 	w := &serialOnlyWriter{}
-	if err := copyTableColdStartIdempotentMaybeParallel(context.Background(), rr, w, table, nil, ShardColumnSpec{}, 4); err != nil {
+	if _, err := copyTableColdStartIdempotentMaybeParallel(context.Background(), rr, w, table, nil, ShardColumnSpec{}, 4); err != nil {
 		t.Fatalf("maybe-parallel (serial fallback): %v", err)
 	}
 	if atomic.LoadInt32(&w.serialHit) != 1 {
@@ -362,7 +362,7 @@ func TestMaybeParallel_FansOutWhenCapable(t *testing.T) {
 	rr := &fanoutFakeReader{rows: rows}
 	w := &parallelFakeWriter{failWorker: -1}
 
-	if err := copyTableColdStartIdempotentMaybeParallel(context.Background(), rr, w, table, nil, ShardColumnSpec{}, 4); err != nil {
+	if _, err := copyTableColdStartIdempotentMaybeParallel(context.Background(), rr, w, table, nil, ShardColumnSpec{}, 4); err != nil {
 		t.Fatalf("maybe-parallel (fan-out): %v", err)
 	}
 	if atomic.LoadInt32(&w.parallelHit) != 1 {
@@ -391,7 +391,7 @@ func TestMaybeParallel_FallsBackToSerialForNoPKTable(t *testing.T) {
 	}
 	rr := &fanoutFakeReader{rows: []ir.Row{{"msg": "a"}, {"msg": "b"}}}
 	w := &parallelFakeWriter{failWorker: -1}
-	if err := copyTableColdStartIdempotentMaybeParallel(context.Background(), rr, w, table, nil, ShardColumnSpec{}, 4); err != nil {
+	if _, err := copyTableColdStartIdempotentMaybeParallel(context.Background(), rr, w, table, nil, ShardColumnSpec{}, 4); err != nil {
 		t.Fatalf("maybe-parallel (no-PK serial): %v", err)
 	}
 	if atomic.LoadInt32(&w.parallelHit) != 0 {
@@ -406,7 +406,7 @@ func TestMaybeParallel_SerialWhenDegreeOne(t *testing.T) {
 	table := pkTable()
 	rr := &fanoutFakeReader{rows: []ir.Row{{"id": int64(1), "v": "a"}}}
 	w := &parallelFakeWriter{failWorker: -1}
-	if err := copyTableColdStartIdempotentMaybeParallel(context.Background(), rr, w, table, nil, ShardColumnSpec{}, 1); err != nil {
+	if _, err := copyTableColdStartIdempotentMaybeParallel(context.Background(), rr, w, table, nil, ShardColumnSpec{}, 1); err != nil {
 		t.Fatalf("maybe-parallel (degree 1): %v", err)
 	}
 	if atomic.LoadInt32(&w.parallelHit) != 0 {
@@ -428,7 +428,7 @@ func TestParallelCopy_WorkerErrorFailsLoudly(t *testing.T) {
 	rr := &fanoutFakeReader{rows: rows}
 	w := &parallelFakeWriter{failWorker: 1} // worker 1 errors
 
-	err := copyTableColdStartIdempotentParallel(context.Background(), rr, w, table, nil, ShardColumnSpec{}, 4)
+	_, err := copyTableColdStartIdempotentParallel(context.Background(), rr, w, table, nil, ShardColumnSpec{}, 4)
 	if err == nil {
 		t.Fatal("expected a loud error when a worker fails; got nil")
 	}
@@ -446,7 +446,7 @@ func TestParallelCopy_ReaderStreamErrSurfaces(t *testing.T) {
 		err:  errors.New("mysql: scan: boom"),
 	}
 	w := &parallelFakeWriter{failWorker: -1}
-	err := copyTableColdStartIdempotentParallel(context.Background(), rr, w, table, nil, ShardColumnSpec{}, 4)
+	_, err := copyTableColdStartIdempotentParallel(context.Background(), rr, w, table, nil, ShardColumnSpec{}, 4)
 	if err == nil {
 		t.Fatal("expected the Bug-68 loud-failure gate to surface the reader stream error")
 	}

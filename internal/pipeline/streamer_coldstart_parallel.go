@@ -182,8 +182,12 @@ func resolveColdStartCopyBudget(
 //
 //   - chunkReaderFactory mints snapshot-pinned readers (not independent
 //     OpenRowReader connections); and
-//   - the resume state store is disabled (a zero-value resumeContext),
-//     because the fast path is fresh-cold-start-only (resume stays serial).
+//   - the state context RECORDS but never RESUMES (the caller's
+//     [newSyncRecordingContext]), because the fast path is
+//     fresh-cold-start-only. This line said "the resume state store is
+//     disabled (a zero-value resumeContext)" and stopped being true in
+//     v0.148.0, when recording was split from resuming — the store is
+//     very much live here now; it is [loadOrInitState] that refuses.
 //
 // Lifecycle: the snapshot-importer pool is closed when this returns. The
 // chunk/table readers it minted are closed by the pool's own release paths
@@ -193,6 +197,7 @@ func resolveColdStartCopyBudget(
 // `SET TRANSACTION SNAPSHOT` resolves against a still-live snapshot.
 func (s *Streamer) runColdStartParallel(
 	ctx context.Context,
+	rc resumeContext,
 	stream *ir.SnapshotStream,
 	sw ir.SchemaWriter,
 	rw ir.RowWriter,
@@ -329,50 +334,18 @@ func (s *Streamer) runColdStartParallel(
 		growGate:           gate,
 	}
 
-	// A RECORD-but-never-RESUME context (2026-09-08). The fast path is
-	// still fresh-cold-start-only — resuming=false below drives the cold
-	// (non-upsert / raw) loader gates, and nothing here ever calls
-	// loadOrInitState — but it now WRITES its phase and per-table
-	// progress, which is what gives `sync status` something to report
-	// during a cold start.
+	// rc is the run's RECORD-but-never-RESUME context (2026-09-08),
+	// opened by the caller ([Streamer.coldStartRunCopy]) so the SERIAL
+	// lane gets the same one — before audit A0909-P2b it was built here,
+	// which is precisely why nothing but this lane recorded anything.
+	// The fast path is still fresh-cold-start-only: resuming=false below
+	// drives the cold (non-upsert / raw) loader gates and nothing here
+	// ever calls loadOrInitState.
 	//
-	// This used to be a zero-value resumeContext. The comment justifying
-	// that was about resume, correctly, and the same flag silently also
-	// turned off recording: for the whole cold start — schema, copy,
-	// index build, FLOAT re-read — nothing was persisted until
-	// WritePosition at the very end, so every status surface reported the
-	// stream as absent. See [newSyncRecordingContext].
-	// A store that cannot be opened degrades to silence with a WARN
-	// rather than failing the copy: this is observability, and refusing
-	// to migrate because the progress table is unavailable would be a
-	// worse trade than the blackout it replaces.
-	progressStore, storeErr := openMigrationStateStore(ctx, s.Target, s.TargetDSN, s.TargetSchema)
-	if storeErr != nil {
-		slog.WarnContext(ctx, "pipeline: cold start could not open the progress store; `sync status` will report "+
-			"this stream as absent until the copy finishes and the CDC anchor is written",
-			slog.String("stream_id", streamID),
-			slog.String("error", storeErr.Error()))
-		progressStore = nil
-	}
-	rc := newSyncRecordingContext(ctx, progressStore, streamID)
-	// Make the recorded state describe THIS run, and record what a stop
-	// after the copy can be resumed from (A0909-STOP-1): the snapshot's
-	// own consistent point — the position CDC would have started from
-	// had this run reached the handoff — plus the fingerprint of the
-	// flags that decide what this copy puts on the target, so a re-run
-	// under different flags is refused instead of inheriting rows its
-	// own predicate would not have selected.
-	beginRecordedColdStart(ctx, rc, ir.SnapshotAnchorRecord{
-		Anchor:    stream.Position.Token,
-		CopyShape: coldStartCopyShape(s, schema),
-	})
-	if progressStore != nil {
-		// Close the store we opened whether or not the context ended up
-		// recording: the P2 degrade path (tables could not be ensured)
-		// leaves rc inert with the pool still open, one leak per cold
-		// start (pre-tag review, 2026-09-09).
-		defer migcore.CloseIf(progressStore)
-	}
+	// This lane's caller is also the one that records the SNAPSHOT ANCHOR
+	// (the fast lane is the only shape [Streamer.resumeStoppedColdStart]
+	// was designed and measured against), and the one that marks the run
+	// complete on the way out. See coldstart_recording.go.
 	state := ir.MigrationState{MigrationID: rc.migrationID}
 	copyErr := runBulkCopyPhases(
 		ctx, rc, &state, schema,
@@ -394,18 +367,8 @@ func (s *Streamer) runColdStartParallel(
 		s.UpfrontIndexes,
 		s.AnalyzeAfter,
 	)
-	if copyErr != nil {
-		return copyErr
-	}
-	// Mark the recorded cold start TERMINAL (audit A0909-P3).
-	//
-	// markComplete is called from migrate's runSingleDatabase, not from
-	// runBulkCopyPhases, so the sync path recorded a run that never
-	// finished: `sync status` kept printing "cold start in progress" above
-	// the live stream row forever. Worse than cosmetic -- the release's own
-	// operator rule is that a progress age which keeps climbing means the
-	// run is DEAD, so a permanent phantom row teaches operators to distrust
-	// the one signal the feature exists to provide.
-	markComplete(ctx, rc, state)
-	return nil
+	// The TERMINAL mark (audit A0909-P3) is the caller's, for both lanes —
+	// see [Streamer.coldStartRunCopy], which runs it at exactly this
+	// point in the sequence.
+	return copyErr
 }

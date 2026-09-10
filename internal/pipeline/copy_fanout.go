@@ -124,6 +124,12 @@ func applyCopyFanoutCeiling(degree, ceiling int) (effective int, capped bool) {
 // onto a FRESH target: each row is read exactly once, the disjoint partition
 // means each table is owned by one pipeline, and the PK-hash routing means
 // each row is written by exactly one worker — no overlap, nothing to absorb.
+// The returned row count is the whole table's on the serial and
+// whole-table fan-out paths, and this chunk's on a work-stealing chunk
+// item. It is 0 on every error path — deliberately, not partially:
+// a partial count recorded against a failed copy reads as an
+// expectation nothing has to meet. Callers that record per-table
+// progress (audit A0909-P2b) sum it; callers that do not, discard it.
 func copyTablePlainMaybeParallel(
 	ctx context.Context,
 	rr ir.RowReader,
@@ -132,14 +138,10 @@ func copyTablePlainMaybeParallel(
 	redactor *redact.Registry,
 	shard ShardColumnSpec,
 	degree int,
-) error {
+) (int64, error) {
 	par, ok := rw.(ir.ParallelCopyWriter)
 	if !ok || degree <= 1 || len(migcore.TablePKColumns(table)) == 0 {
-		// The row count is discarded here: this fan-out entry point is
-		// reached from the SERIAL cold-start / concurrent-group paths,
-		// which record no per-table progress at all.
-		_, err := copyTable(ctx, rr, rw, table, redactor, shard)
-		return err
+		return copyTable(ctx, rr, rw, table, redactor, shard)
 	}
 	return copyTablePlainParallel(ctx, rr, par, table, redactor, shard, degree)
 }
@@ -165,13 +167,13 @@ func copyTablePlainParallel(
 	redactor *redact.Registry,
 	shard ShardColumnSpec,
 	degree int,
-) (retErr error) {
+) (rowsCopied int64, retErr error) {
 	copyCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	rows, err := rr.ReadRows(copyCtx, table)
 	if err != nil {
-		return fmt.Errorf("read rows: %w", err)
+		return 0, fmt.Errorf("read rows: %w", err)
 	}
 	pt := newProgressTicker(copyCtx, progressInterval, table.Name)
 	kickOffRowCount(copyCtx, rr, table, pt)
@@ -189,15 +191,18 @@ func copyTablePlainParallel(
 	workers := partitionRowsByPK(copyCtx, stamped, table, degree)
 
 	if err := pw.WriteRowsParallel(copyCtx, table, workers); err != nil {
-		return fmt.Errorf("write rows (plain, fan-out): %w", err)
+		return 0, fmt.Errorf("write rows (plain, fan-out): %w", err)
 	}
 	if err := redactErrFn(); err != nil {
-		return fmt.Errorf("redact rows: %w", err)
+		return 0, fmt.Errorf("redact rows: %w", err)
 	}
 	// The writers returned without error, but the reader may have aborted
 	// mid-table on a scan/decode failure (Bug 68). Surface it loudly so a
 	// silently-truncated table never reports success.
-	return migcore.ReaderStreamErr(rr, table)
+	//
+	// The count is read after every worker joined inside WriteRowsParallel,
+	// so it is the whole item's — same discipline as [copyTable]'s.
+	return pt.rows.Load(), migcore.ReaderStreamErr(rr, table)
 }
 
 // copyTableColdStartIdempotentMaybeParallel routes a cold-start
@@ -214,6 +219,9 @@ func copyTablePlainParallel(
 //
 // Falling through to serial is always correct (same idempotent writer,
 // same loud-failure gate) — it just doesn't get the speedup.
+//
+// Returns the item's row count under the same contract as
+// [copyTablePlainMaybeParallel]: whole-table or per-chunk, 0 on error.
 func copyTableColdStartIdempotentMaybeParallel(
 	ctx context.Context,
 	rr ir.RowReader,
@@ -222,7 +230,7 @@ func copyTableColdStartIdempotentMaybeParallel(
 	redactor *redact.Registry,
 	shard ShardColumnSpec,
 	degree int,
-) error {
+) (int64, error) {
 	par, ok := rw.(ir.ParallelIdempotentCopyWriter)
 	if !ok || degree <= 1 || len(migcore.TablePKColumns(table)) == 0 {
 		return copyTableColdStartIdempotent(ctx, rr, rw, table, redactor, shard)
@@ -264,13 +272,13 @@ func copyTableColdStartIdempotentParallel(
 	redactor *redact.Registry,
 	shard ShardColumnSpec,
 	degree int,
-) (retErr error) {
+) (rowsCopied int64, retErr error) {
 	copyCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	rows, err := rr.ReadRows(copyCtx, table)
 	if err != nil {
-		return fmt.Errorf("read rows: %w", err)
+		return 0, fmt.Errorf("read rows: %w", err)
 	}
 	pt := newProgressTicker(copyCtx, progressInterval, table.Name)
 	kickOffRowCount(copyCtx, rr, table, pt)
@@ -288,15 +296,20 @@ func copyTableColdStartIdempotentParallel(
 	workers := partitionRowsByPK(copyCtx, stamped, table, degree)
 
 	if err := pw.WriteRowsIdempotentParallel(copyCtx, table, workers); err != nil {
-		return fmt.Errorf("write rows (idempotent, fan-out): %w", err)
+		return 0, fmt.Errorf("write rows (idempotent, fan-out): %w", err)
 	}
 	if err := redactErrFn(); err != nil {
-		return fmt.Errorf("redact rows: %w", err)
+		return 0, fmt.Errorf("redact rows: %w", err)
 	}
 	// The writers returned without error, but the reader may have
 	// aborted mid-table on a scan/decode failure (Bug 68). Surface it
 	// loudly so a silently-truncated table never reports success.
-	return migcore.ReaderStreamErr(rr, table)
+	//
+	// The count is the ROWS THE READER DELIVERED, which on this path can
+	// exceed the rows the target ends up holding: the VStream COPY
+	// re-emits (Bug 125) and the upsert absorbs the duplicates. Recorded
+	// as-is rather than "corrected" to a number nothing measured.
+	return pt.rows.Load(), migcore.ReaderStreamErr(rr, table)
 }
 
 // partitionRowsByPK launches one dispatcher goroutine that reads every
