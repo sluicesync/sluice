@@ -3310,6 +3310,45 @@ type ReplicationHeadroom struct {
 	Slots []SlotInfo
 }
 
+// SlotFailoverPosture reports whether the source cluster is configured to
+// carry a logical replication slot across a failover.
+//
+// sluice already does its half: since ADR-0012 it creates slots with
+// `FAILOVER true` on PG 17+. That flag is necessary and NOT sufficient —
+// it marks a slot as eligible for synchronization, and something still has
+// to do the synchronizing. On a PG 17+ cluster that is
+// `sync_replication_slots = on` (which additionally needs
+// `hot_standby_feedback = on` to keep the standby's copy usable).
+//
+// The gap this exists to surface: a slot flagged FAILOVER on a cluster
+// that never syncs it is silently primary-local, and the operator has
+// every reason to believe they are covered because sluice set the flag.
+//
+// NotObservable is the honest third state. Patroni permanent slots — the
+// "Logical slot name" field on PlanetScale Postgres — preserve slots
+// through a completely different mechanism that leaves no trace in
+// pg_settings, so a cluster reading `off` here may still be correctly
+// configured. Any warning built on this must say so rather than claim the
+// operator is broken.
+type SlotFailoverPosture struct {
+	// ServerVersionNum is PG_VERSION_NUM (e.g. 180006). Below 170000 the
+	// FAILOVER slot option does not exist and the native mechanism is
+	// unavailable regardless of the settings below.
+	ServerVersionNum int
+
+	// SyncReplicationSlots and HotStandbyFeedback are the two GUCs PG 17+
+	// native slot synchronization requires. Both must be on.
+	SyncReplicationSlots bool
+	HotStandbyFeedback   bool
+}
+
+// NativeSlotSyncAvailable reports whether the source's own settings would
+// carry a FAILOVER-flagged slot across a failover. False does NOT mean the
+// slot is unprotected — see the NotObservable note on [SlotFailoverPosture].
+func (p SlotFailoverPosture) NativeSlotSyncAvailable() bool {
+	return p.ServerVersionNum >= 170000 && p.SyncReplicationSlots && p.HotStandbyFeedback
+}
+
 // SlotManager is the engine-neutral surface for managing logical-
 // replication slots from the operator-facing CLI (`sluice slot list`,
 // `sluice slot drop`). Engines without a notion of replication slots

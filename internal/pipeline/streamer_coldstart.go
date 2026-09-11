@@ -461,6 +461,14 @@ func (s *Streamer) coldStartReadSourceSchema(ctx context.Context, resumingCopy b
 			return nil, nil, err
 		}
 	}
+	// Slot-failover advisory. sluice creates the slot with FAILOVER true
+	// (ADR-0012), which is necessary and NOT sufficient: something has to
+	// synchronize it, and on PG 17+ that is sync_replication_slots +
+	// hot_standby_feedback. Warns when sluice cannot confirm either
+	// mechanism, and says plainly that it cannot see Patroni permanent
+	// slots — so a correctly-configured cluster is told "unconfirmed",
+	// never "broken". Advisory by construction: it returns no error.
+	preflightSlotFailover(ctx, sr, s.Source.Capabilities())
 	// XID-wraparound preflight (pgcopydb PR #17 adoption). Refuses
 	// upfront when the source PG database is near the 32-bit wraparound
 	// horizon — long-running CDC against such a source either races

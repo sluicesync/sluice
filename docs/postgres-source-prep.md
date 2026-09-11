@@ -190,6 +190,10 @@ This is the part that bites people. **A logical replication slot is a primary-lo
 
 There are three orthogonal mechanisms that preserve slots across failover. You generally want *one* of them, and you need to confirm it's actually configured before betting your production CDC stream on it.
 
+**Since v0.151.0 sluice checks one of the three for you and says so.** At `sync` cold start against a PG 17+ source it reads `sync_replication_slots` and `hot_standby_feedback`, and if native slot sync is not fully enabled it emits a WARN naming both settings. This is **advisory and deliberately cannot refuse**: the other two mechanisms — Patroni permanent slots, and PlanetScale's "Logical slot name" field — leave no trace in `pg_settings`, so a correctly-configured cluster reads exactly like an unprotected one. The warning says "sluice cannot confirm you are protected", never "you are unprotected", and if you preserve slots by Patroni you can ignore it.
+
+It exists because the sentence above — *confirm it's actually configured* — was a written instruction with nothing checking it, and because the `FAILOVER true` flag sluice sets (below) is easy to mistake for sufficiency. It is not sufficient on its own; something has to do the synchronizing.
+
 ### On PlanetScale Postgres (Patroni-managed)
 
 PlanetScale uses [Patroni](https://patroni.readthedocs.io/) for HA. Patroni's `slots:` config defines "permanent replication slots" that are preserved across switchover and failover. The dashboard surfaces this as the **"Logical slot name"** field under *Cluster configuration > Parameters > Failover*. **Add the sluice slot name (default `sluice_slot`) there** — values are comma-delimited if you have more than one consumer.

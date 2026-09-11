@@ -71,6 +71,13 @@ var (
 	_ migcore.RLSPreflightProber         = (*postgres.SchemaReader)(nil)
 	_ xidWraparoundProber                = (*postgres.SchemaReader)(nil)
 	_ replicationCapabilityProber        = (*postgres.SchemaReader)(nil)
+	// The slot-failover advisory is pinned with the refusal probers even
+	// though it only WARNs. Its whole job is to be the one voice telling an
+	// operator that the FAILOVER flag sluice sets is not sufficient on its
+	// own; if this assertion silently stopped matching, the advisory would
+	// go quiet and the operator's conclusion would be that all is well —
+	// the same silence the refusal probers are pinned to prevent.
+	_ slotFailoverProber = (*postgres.SchemaReader)(nil)
 
 	// The session-GUC cast refusal's arming surface (audit 2026-08-31
 	// SL-2). Pinned rather than frozen because it guards a REFUSAL, same as

@@ -305,6 +305,19 @@ func (s *Streamer) coldStartMultiDatabase(
 	}
 	s.warnPublicationExposure(ctx, graded)
 
+	// Slot-failover advisory, ONCE for the run. The two GUCs it reads are
+	// cluster-wide, so any one database's connection answers for all of the
+	// selected namespaces — this is a property of the server, not of the
+	// schema, which is why it does not belong in the per-namespace loop.
+	// Advisory by construction (returns nothing), and a reader it cannot
+	// open is simply not probed: an advisory must never be a reason a run
+	// fails. The single-namespace cold start runs the same check against
+	// the reader it already holds.
+	if sr, srErr := s.Source.OpenSchemaReader(ctx, s.SourceDSN); srErr == nil {
+		preflightSlotFailover(ctx, sr, s.Source.Capabilities())
+		migcore.CloseIf(sr)
+	}
+
 	// ---- 3. Open the SINGLE spanning consistent snapshot. One tx, one
 	// binlog position spanning ALL selected databases. This is the crux:
 	// the position handed to CDC below is captured at one consistent cut. ----

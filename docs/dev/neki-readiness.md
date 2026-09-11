@@ -231,6 +231,39 @@ ERROR: access to table "public.mv_src" is blocked (SQLSTATE NK213)
 
 — a SQLSTATE nobody has memorised, with no mention of workflows, databases or cutovers. That is the same defect a MySQL-lane operator reported in different words ("the errors are pretty dense and hard to parse"). Closed by `SLUICE-E-TARGET-TABLE-BLOCKED-BY-WORKFLOW`, which names `__neki.list_blocked_tables()` and `move_tables_status()` and both end states; see `internal/engines/postgres/neki_blocked_table.go` for the sibling sweep, including the two paths it deliberately does **not** reach.
 
+### Can MoveTables import from an EXTERNAL Postgres? No — designed for, plumbed, not reachable (2026-09-10)
+
+Asked because if it can, it is a direct alternative to the PS-Postgres → Neki path we document, and because an outbound equivalent would close the "Neki cannot be a continuous-sync source" gap. Recorded in full because the answer is a *negative* result that took a while to establish and would be expensive to re-derive.
+
+**The hypothesis, and it was wrong.** `move_tables_create`'s options include `import_cluster_auth`, `skip_existing_roles`, `skip_grants`, `skip_source_extensions` and `read_from_standby`, which read unmistakably like connecting to an outside cluster. `import_cluster_auth` is **not** credentials — it is an enum:
+
+```
+IMPORT_CLUSTER_AUTH_OFF | IMPORT_CLUSTER_AUTH_FULL | IMPORT_CLUSTER_AUTH_WITHOUT_PASSWORDS
+```
+
+It governs whether the move carries the source's **roles and passwords** across. On a same-cluster move it is inert — `OFF` and `FULL` produce byte-identical dry-run findings.
+
+**But its existence is still evidence.** Roles, grants and extensions are *cluster-scoped* in Postgres; a move between two databases in one cluster would never need to import any of them. Those four options only mean anything cross-cluster. Four more things point the same way, and together they say "designed for, not yet exposed":
+
+| probe | result |
+| --- | --- |
+| `move_tables_create` with an unknown `source_db` | resolves against **registered shards** — `outbound connection to unknown shard … at 10.200.50.203:5432 … as neki_reader`. It only ever looks inward. |
+| `__neki.list_shards()` | carries an **`external boolean`** column. All three shards `false`. The column would be pointless if external shards were never intended. |
+| all 89 metafuncs | the only `*_create` functions are `move_tables_create`, `reshard_create`, `online_ddl_create`, `differ_create`. **Nothing registers or attaches an external shard or cluster.** |
+| PlanetScale API | `/databases/neki-torture/data-imports` → `not_found`. That endpoint is MySQL-only; a `kind: neki` database has no import surface. |
+
+So there is no way in from either the SQL admin surface or the API. **Re-check on a future build by looking at exactly two things**: whether any function appears that registers an external shard, and whether `list_shards().external` is ever `true`. Those are the tells.
+
+### There is NO outbound streaming primitive in Neki, and that is the whole of the sync-source answer
+
+Worth stating separately because it is the question operators coming from Vitess will ask.
+
+On Vitess, the thing sluice consumes as a sync source is **VStream** — an outbound change-stream API over gRPC. That is why PlanetScale MySQL works as a continuous-sync source. MoveTables is *not* the Neki VStream: it is the consumer side of an internal replication facility, pointed inward.
+
+The full `__neki` surface, all 89 functions, is **control plane** — topology 11, sidecars 16, workflows 16, cutover 12, control-plane 9, verification 7, failover 6, schema 5, sessions 4, utilities 3. **Not one of them emits data.** Combined with the router refusing a replication connection outright, the migrate-only verdict for Neki-as-source is not a gap in sluice and not a missing integration; there is nothing to integrate with.
+
+**The one avenue, unmeasurable from here.** The refusal wording is specific — `replication connections must target a specific shard` — which implies a replication connection to an *individual shard* is a real thing, and would make per-shard logical replication with an N-way fan-in conceivable. The blocker is reachability: `__neki.list_sidecars()` reports shard endpoints at `10.200.50.x:5432`, RFC1918 addresses inside PlanetScale's VPC with no customer-routable path. This only becomes testable if Neki gains private connectivity or a per-shard endpoint. Recorded as the thing to ask about rather than a design to start.
+
 ### Tier C, second pass — the router's OTHER row path, and it is CLEAN
 
 The first Tier-C pass (below) went through `pg_dump | psql`, which is COPY text on a pass-through path. PlanetScale's ["lifecycle of a sharded Postgres query"](https://planetscale.com/blog/the-lifecycle-of-a-sharded-postgres-query) says the router is a real execution engine — hash joins, `AVG` rewritten to `SUM`/`COUNT`, spill-to-disk — and that copying encoded bytes straight through is an *optimisation*, i.e. one of two paths. Under this project's own family-dispatch rule that made the first pass a pinned representative standing in for an untested sibling: the Bug 74 shape exactly.
