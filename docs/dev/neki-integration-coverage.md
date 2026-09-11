@@ -77,18 +77,28 @@ Superseding the earlier assumption that the suite reads two long-lived DSNs. **P
 
 | step | how | measured |
 | --- | --- | --- |
-| create database | `pscale database create --engine neki --region us-east --cluster-size PS-10-AWS-ARM-NEKI --replicas 0 --wait` | **418 s** to ready |
+| create database | `pscale database create --engine neki --region us-east --cluster-size PS-10-AWS-ARM-NEKI --replicas 2 --wait` | **418 s** to ready *at `--replicas 0`; the HA shape is untimed* |
 | add a shard | `POST /v1/organizations/{org}/databases/{db}/branches/{branch}/configuration-profiles/default/shards` → 201 | **31 s** to `ready:true` |
 | distribute data | `set_data_topology` → `reshard_create` → `workflow_switch_traffic` | minutes; not separately timed here |
 | delete database | `pscale database delete --force` | **1 s** to return |
 
 So setup is roughly **8–10 minutes** before the first assertion runs. Fine for a weekly job; far too slow for a per-PR one, which is another reason Tier 1 exists.
 
-**The shard-creation endpoint is not discoverable from either interface you would naturally reach for**, and this cost an hour to find. `pscale` has no shard subcommand at all. The `__neki` SQL surface has `delete_shard` and **no create** — and `validate_data_topology` refuses a group naming an absent shard with *"not a shard the cluster has created … create the shard first"*, which states the requirement without saying where to satisfy it. The REST path only surfaced because `POST …/branches/main/shards` answers **308** with a `location:` header pointing at the `configuration-profiles/default/` form. Follow the redirect and it works.
+**The shard-creation endpoint is not discoverable from either interface you would naturally reach for**, and it was re-derived here after being found and used earlier the same day -- the knowledge was lost to a context compaction, and re-finding it cost an hour. That is the argument for writing the path down rather than for treating it as a discovery. `pscale` has no shard subcommand at all. The `__neki` SQL surface has `delete_shard` and **no create** — and `validate_data_topology` refuses a group naming an absent shard with *"not a shard the cluster has created … create the shard first"*, which states the requirement without saying where to satisfy it. The REST path only surfaced because `POST …/branches/main/shards` answers **308** with a `location:` header pointing at the `configuration-profiles/default/` form. Follow the redirect and it works.
 
 Written down because the wrong conclusion was reachable and nearly reached: that a multi-shard Neki cannot be provisioned programmatically, and therefore that the sharded arm needs a standing database. It does not.
 
 **A fresh database has exactly one shard** (`sh1`, sole member of one shard group, `authoritative: true`). Every finding worth regression-testing — per-shard `UNIQUE`/`EXCLUDE`, the `ON CONFLICT` duplication gap, `NK013` on a shard-key `SET` — needs a MULTI-shard database, so adding a shard and resharding onto it is mandatory setup, not an optional extra. Treat the reshard as a setup step that can fail independently of any assertion, so a reshard failure is not reported as a product regression.
+
+### Provision `--replicas 2`, and test `--replicas 0` occasionally on purpose
+
+**Operator decision, 2026-09-11: the default is `--replicas 2`** — the high-availability shape, which is what the console offers and therefore what customers actually run. The fixture should match the thing being defended, not the cheapest thing that boots.
+
+That matters because the cheap shape is of contested legality. The console refuses single-node Neki; `pscale size cluster list --engine neki` advertises and prices it; `pscale database create --replicas 0` creates one that works (see `neki-issues/NEKI-015`). A shape that works today and may not be meant to exist is a bad thing to build a weekly regression suite on — if it were withdrawn, the suite would start failing for a reason that has nothing to do with sluice.
+
+**But keep exercising `--replicas 0` deliberately**, on the operator's read that it will likely become a supported option once PlanetScale settles the details. An occasional single-node run — dispatch-only, not on the weekly schedule — is how we find out early whether sluice cares about the difference. It should not: nothing in the Neki adaptations reads replica count. That is a claim worth testing rather than assuming, and it is cheap to test.
+
+Cost is not the deciding factor either way. PS-10 Neki is $30/month HA versus $10/month single-node, and prorated over a ~20-minute run both are rounding errors. **The 418 s create time was measured at `--replicas 0`; the HA shape is untimed and may be slower** — worth measuring before the job timeout is fixed.
 
 ### The orphan sweep is not optional
 
