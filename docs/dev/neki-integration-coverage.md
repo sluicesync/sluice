@@ -73,7 +73,22 @@ Superseding the earlier assumption that the suite reads two long-lived DSNs. **P
 
 `pscale database create --engine neki --region us-east --cluster-size PS-10-AWS-ARM-NEKI --replicas 0 --wait` creates one; deleting is a single call. A single-node PS-10 Neki is $10/month list, so a weekly ~20-minute run is a rounding error.
 
-**The sharded database is the expensive half, and it is also the important one.** A fresh Neki database comes up with ONE shard. Every finding worth regression-testing — per-shard `UNIQUE`/`EXCLUDE`, the `ON CONFLICT` duplication gap, `NK013` on a shard-key `SET` — needs a MULTI-shard database, which means `set_data_topology` → `reshard_create` → `workflow_switch_traffic` → wait, on top of provisioning. Budget for it in the job timeout and treat the reshard as a setup step that can fail independently of any assertion.
+### Measured end to end on a throwaway database, 2026-09-11
+
+| step | how | measured |
+| --- | --- | --- |
+| create database | `pscale database create --engine neki --region us-east --cluster-size PS-10-AWS-ARM-NEKI --replicas 0 --wait` | **418 s** to ready |
+| add a shard | `POST /v1/organizations/{org}/databases/{db}/branches/{branch}/configuration-profiles/default/shards` → 201 | **31 s** to `ready:true` |
+| distribute data | `set_data_topology` → `reshard_create` → `workflow_switch_traffic` | minutes; not separately timed here |
+| delete database | `pscale database delete --force` | **1 s** to return |
+
+So setup is roughly **8–10 minutes** before the first assertion runs. Fine for a weekly job; far too slow for a per-PR one, which is another reason Tier 1 exists.
+
+**The shard-creation endpoint is not discoverable from either interface you would naturally reach for**, and this cost an hour to find. `pscale` has no shard subcommand at all. The `__neki` SQL surface has `delete_shard` and **no create** — and `validate_data_topology` refuses a group naming an absent shard with *"not a shard the cluster has created … create the shard first"*, which states the requirement without saying where to satisfy it. The REST path only surfaced because `POST …/branches/main/shards` answers **308** with a `location:` header pointing at the `configuration-profiles/default/` form. Follow the redirect and it works.
+
+Written down because the wrong conclusion was reachable and nearly reached: that a multi-shard Neki cannot be provisioned programmatically, and therefore that the sharded arm needs a standing database. It does not.
+
+**A fresh database has exactly one shard** (`sh1`, sole member of one shard group, `authoritative: true`). Every finding worth regression-testing — per-shard `UNIQUE`/`EXCLUDE`, the `ON CONFLICT` duplication gap, `NK013` on a shard-key `SET` — needs a MULTI-shard database, so adding a shard and resharding onto it is mandatory setup, not an optional extra. Treat the reshard as a setup step that can fail independently of any assertion, so a reshard failure is not reported as a product regression.
 
 ### The orphan sweep is not optional
 
