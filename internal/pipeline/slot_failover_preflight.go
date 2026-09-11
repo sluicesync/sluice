@@ -45,7 +45,35 @@ import (
 // the judgement with the operator.
 //
 // A single-node cluster with no standby has nothing to fail over to and
-// needs none of this either. Same conclusion: advisory only.
+// needs none of this either — and that case is NOT detectable here.
+// `pg_stat_replication` shows non-privileged roles only their own rows, so
+// an empty result is equally consistent with "no standby" and "a standby
+// this role cannot see"; suppressing on it would silence the advisory on
+// exactly the HA clusters that need it. So single-node is named in the
+// message as a reason to dismiss it, rather than guessed at in code. Same
+// conclusion throughout: advisory only.
+//
+// # SCOPE: these are STANDBY-side settings, read here on the primary
+//
+// `sync_replication_slots` governs a physical standby synchronizing
+// failover slots FROM its primary, and `hot_standby_feedback` is likewise
+// applied on the standby. sluice reads them on the connection it already
+// has, which is the primary.
+//
+// On a managed platform that applies one cluster configuration to every
+// node — PlanetScale, and the alert that prompted this names "cluster
+// parameters ... in your cluster configuration" — the primary's value IS
+// the cluster's value, and the read is sound. On a hand-rolled
+// primary/standby pair whose configs are maintained separately it is a
+// proxy that can be wrong in BOTH directions: a primary reading `off` next
+// to a correctly-configured standby warns for nothing, and a primary
+// reading `on` next to a standby that is not can leave the advisory silent
+// when it should speak.
+//
+// That second direction is the one that matters, and it is the reason this
+// stays a WARN with no gate built on top of it. Reading the standby's own
+// settings would need a connection to the standby, which sluice does not
+// have and should not require.
 type slotFailoverProber interface {
 	SourceSlotFailoverPosture(ctx context.Context) (ir.SlotFailoverPosture, error)
 }
@@ -96,9 +124,11 @@ func preflightSlotFailover(ctx context.Context, handle any, sourceCaps ir.Capabi
 		slog.Bool("hot_standby_feedback", posture.HotStandbyFeedback),
 		slog.String("to_fix", "enable BOTH sync_replication_slots and hot_standby_feedback on the source cluster "+
 			"(on PlanetScale Postgres: Cluster configuration > Parameters)"),
-		slog.String("already_covered_if", "your cluster preserves slots by Patroni permanent slots instead — the "+
-			"\"Logical slot name\" field on PlanetScale Postgres. sluice cannot see that from SQL, so this warning "+
-			"does not mean you are unprotected; it means sluice cannot confirm that you are"),
+		slog.String("already_covered_if", "(a) this is a SINGLE-NODE instance with no standby — there is nothing to "+
+			"fail over to, and nothing to fix; or (b) your cluster preserves slots by Patroni permanent slots "+
+			"instead — the \"Logical slot name\" field on PlanetScale Postgres. sluice can see neither from SQL "+
+			"(pg_stat_replication hides other roles' rows, so an empty one does not prove there is no standby), so "+
+			"this warning does not mean you are unprotected; it means sluice cannot confirm that you are"),
 		slog.String("see", "docs/postgres-source-prep.md, \"Slot lifetime under failover\""),
 	)
 }

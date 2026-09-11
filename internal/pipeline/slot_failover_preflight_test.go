@@ -48,7 +48,13 @@ func TestPreflightSlotFailover(t *testing.T) {
 		// It must name what to change, and must NOT claim the operator is
 		// broken — Patroni permanent slots are invisible from SQL, so a
 		// correctly-configured cluster reads exactly like this one.
-		for _, want := range []string{"sync_replication_slots", "hot_standby_feedback", "Logical slot name"} {
+		// SINGLE-NODE is named because it is the most common reason the
+		// advisory does not apply and it is NOT detectable from SQL —
+		// pg_stat_replication hides other roles' rows, so an empty result
+		// cannot distinguish "no standby" from "a standby this role cannot
+		// see". An operator on a single-node instance has to be able to
+		// dismiss this in one read.
+		for _, want := range []string{"sync_replication_slots", "hot_standby_feedback", "Logical slot name", "SINGLE-NODE"} {
 			if !strings.Contains(out, want) {
 				t.Errorf("advisory does not mention %q: %q", want, out)
 			}

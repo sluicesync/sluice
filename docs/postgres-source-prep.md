@@ -190,7 +190,15 @@ This is the part that bites people. **A logical replication slot is a primary-lo
 
 There are three orthogonal mechanisms that preserve slots across failover. You generally want *one* of them, and you need to confirm it's actually configured before betting your production CDC stream on it.
 
-**Since v0.151.0 sluice checks one of the three for you and says so.** At `sync` cold start against a PG 17+ source it reads `sync_replication_slots` and `hot_standby_feedback`, and if native slot sync is not fully enabled it emits a WARN naming both settings. This is **advisory and deliberately cannot refuse**: the other two mechanisms — Patroni permanent slots, and PlanetScale's "Logical slot name" field — leave no trace in `pg_settings`, so a correctly-configured cluster reads exactly like an unprotected one. The warning says "sluice cannot confirm you are protected", never "you are unprotected", and if you preserve slots by Patroni you can ignore it.
+**Since v0.151.0 sluice checks one of the three for you and says so.** At `sync` cold start against a PG 17+ source it reads `sync_replication_slots` and `hot_standby_feedback`, and if native slot sync is not fully enabled it emits a WARN naming both settings.
+
+This is **advisory and deliberately cannot refuse**, for three reasons worth knowing before you act on it:
+
+- **A single-node instance with no standby has nothing to fail over to**, so none of this applies — and sluice cannot tell. `pg_stat_replication` shows a non-privileged role only its own rows, so an empty result is equally consistent with "no standby" and "a standby this role cannot see". Suppressing the warning on that would silence it on exactly the HA clusters that need it, so the warning names the single-node case instead of guessing.
+- **Patroni permanent slots and PlanetScale's "Logical slot name" field leave no trace in `pg_settings`**, so a correctly-configured cluster reads exactly like an unprotected one.
+- **Both GUCs are applied on the *standby*, and sluice reads them on the primary.** On a managed platform with one cluster-wide configuration (PlanetScale) the primary's value is the cluster's value and the read is sound. On a hand-rolled primary/standby pair with separately maintained configs it is a proxy that can be wrong in both directions — including staying quiet when it should speak.
+
+So the warning says "sluice cannot confirm you are protected", never "you are unprotected". If you are single-node, or you preserve slots by Patroni, ignore it.
 
 It exists because the sentence above — *confirm it's actually configured* — was a written instruction with nothing checking it, and because the `FAILOVER true` flag sluice sets (below) is easy to mistake for sufficiency. It is not sufficient on its own; something has to do the synchronizing.
 
