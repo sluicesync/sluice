@@ -54,6 +54,13 @@
 #                      off-pattern psverify test would compile under
 #                      the workflow's own vet, never be selected, emit
 #                      no `--- SKIP`, and green the fail-on-skip grep)
+#   - nekiverify     → nekiverify.yml (weekly Sunday + dispatch, real
+#                      PlanetScale Neki provisioned per run). Same class
+#                      as psverify and the same reason it needs guarding:
+#                      that workflow's honesty check is a fail-on-skip
+#                      grep, which an off-pattern test escapes silently —
+#                      it would never be SELECTED, so it emits no
+#                      `--- SKIP` for the grep to find
 #
 # The leg label's FIRST word must be the workflow filename: the
 # manifest-drift cross-check below greps that file for the regex.
@@ -69,6 +76,7 @@ kmsverify;^TestBackup_KMS;internal/pipeline;extended-suites.yml kmsverify
 crossversion;^TestBackup_CrossVersion;internal/pipeline;extended-suites.yml crossversion
 mariadbpreview;^TestMariaDB_Preview_;internal/engines/mysql/...;ci.yml integration-mariadb-preview
 psverify;^TestPS;internal/planetscale/... internal/engines/mysql internal/engines/postgres internal/pipeline;psverify.yml psverify
+nekiverify;^TestNekiverify;internal/engines/postgres;nekiverify.yml nekiverify
 '
 
 # Tags deliberately WITHOUT a manifest axis. Each entry needs a
