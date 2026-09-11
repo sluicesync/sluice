@@ -19,13 +19,19 @@ Both are the doc-lags-code shape the working agreements name. A note *about* bac
 
 **Not a defect; a coverage concentration worth knowing about, surfaced when it broke.** MinIO stopped publishing to Docker Hub and `internal/pipeline/blob_store_integration_test.go` went red at container start — four tests, no code change. Fixed by pinning `quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z` (verified both directions on a real daemon: docker.io denied, quay served).
 
-The part worth recording is what the outage exposed rather than the fix:
+**This entry's first cut was wrong in the usual direction and is corrected here** — it said one container was "the entire mechanical evidence" for the six providers `--backup-endpoint` names, which overstates the risk by ignoring the abstraction. sluice does not talk to providers directly: `internal/pipeline/blobcodec/blob_store.go` is built on `gocloud.dev/blob` with four drivers registered (`s3blob`, `gcsblob`, `azureblob`, `fileblob`), and every S3-compatible name rides the SAME `s3blob` driver. There is no per-provider code path to test, so the library genuinely removes that dimension.
 
-- `--backup-endpoint`'s help (`cmd/sluice/backup.go:747`) names **MinIO, Cloudflare R2, Backblaze B2, Wasabi, Tigris and Archil** as supported. sluice has no provider-specific code — the surface is generic S3 plus `--backup-path-style` — so those names are a claim about a CLASS.
-- **One container is the entire mechanical evidence for that class.** `startMinIO` is booted by exactly four tests in one file, and nothing else in CI exercises an S3-compatible server (localstack is in the tree for KMS only). Every other named provider is untested by construction.
-- So this image is a GATE, not a convenience, and it lived on a floating `:latest` from a registry outside our control. That combination is how an external company's packaging decision became an unexplained red on an unrelated push.
+**What it cannot remove is provider BEHAVIOUR, and that is where the real gap sits.** `PutIfAbsent` — the ADR-0160 chain concurrent-writer guard — maps gocloud's `IfNotExist` onto each backend's native precondition (S3 `If-None-Match: *`, GCS generation-0, Azure `If-None-Match: *`, fileblob `O_EXCL`), and its own comment states the premise:
 
-**Proposed, not built:** (a) mirror it to GHCR the way the postgres/mysql/mariadb stock images are — the existing `mirrors` engine derives from docker.io refs and this one is not on docker.io, so it needs a small generalisation to take an explicit source registry; (b) consider whether ONE S3 implementation is enough evidence for a six-provider claim, or whether the help text should say which one is actually exercised. (b) is the cheaper honesty fix and does not need infrastructure.
+> providers that predate conditional writes may **IGNORE** the `If-None-Match` header (silently behaving like Put) or reject it with a non-412 error. The chain guard treats a non-precondition failure as "capability absent at runtime" and degrades with a WARN.
+
+So there is a documented environmental premise about servers we never boot, with a SILENT-DEGRADE branch behind it. That is the premise-naming shape, and the residual is real:
+
+- **MinIO is the only server that premise is ever checked against.** `startMinIO` is booted by four tests in one file; nothing else in CI exercises an S3-compatible endpoint (localstack is in the tree for KMS only).
+- **GCS and Azure have their own drivers and ZERO tests** — no fake-gcs-server, no azurite anywhere in the tree. Their conditional-write mapping is asserted in a comment and exercised by nothing, which is a wider gap than the S3 one and was missed entirely by this entry's first cut.
+- The image is therefore a gate rather than a convenience, and it lived on a floating `:latest` from a registry outside our control — how an external packaging decision became an unexplained red on an unrelated push.
+
+**Proposed, not built, cheapest first:** (a) say in `--backup-endpoint`'s help which provider is actually exercised, so the six names read as "this class is supported" rather than "each of these is verified" — no infrastructure, and it is the honesty half; (b) boot a fake-gcs-server and an azurite container for the two untested drivers, since the conditional-write mapping is what the chain guard's correctness rests on; (c) mirror the MinIO image to GHCR the way the postgres/mysql/mariadb stock images are — the `mirrors` engine derives from docker.io refs and this one is not on docker.io, so it needs a small generalisation to take an explicit source registry.
 
 ## 2026-09-11 — the Neki sequence fallback's "total and lossless" claim is false (found while building its coverage)
 
