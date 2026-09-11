@@ -44,18 +44,27 @@ import (
 // states what sluice can see, names the mechanism it cannot, and leaves
 // the judgement with the operator.
 //
-// A single-node cluster with no standby has no standby to be promoted, so
-// the classic failover case cannot arise — but "single-node therefore
-// nothing to fix" is an UNVERIFIED PREMISE and is deliberately not claimed.
-// A cluster RESIZE plausibly replaces the node, which would have the same
-// effect on a primary-local slot as a failover, and that is untested: the
-// PlanetScale API refuses a Postgres branch resize outright (`Resize is not
-// supported`, confirmed slot-independent by a zero-slot control on
-// 2026-09-10), so it could not be measured from here. The message
-// therefore offers single-node as a reason the warning MAY not apply,
-// never as a guarantee.
+// SINGLE-NODE IS NOT AN EXEMPTION, and two earlier drafts of this file got
+// that wrong. "No standby, therefore nothing to fail over to, therefore
+// nothing to fix" is intuitive and false: the hazard is not only promotion
+// of a standby. PlanetScale's own UI, shown to an operator on a
+// single-node instance on 2026-09-10, states it directly —
 //
-// Either way the case is NOT detectable here.
+//	"Apply these changes to the main branch so its logical replication
+//	 slots survive failovers AND CLUSTER CHANGES."
+//	"Cluster changes and rollouts for this branch will be held until
+//	 2026-09-14."
+//
+// — and backs it by HOLDING cluster changes for the branch until the
+// settings are fixed. A resize or a maintenance rollout replaces the node,
+// which strands a primary-local slot exactly as a promotion would, and
+// replica count has nothing to do with it. So the advisory fires for
+// single-node instances on purpose, and the message no longer offers
+// single-node as a reason to dismiss it.
+//
+// Recorded because the wrong version shipped twice: first as a flat
+// "nothing to fix", then as a hedged "probably fine". Both were reasoning
+// from the word "failover" rather than from what the platform does.
 // `pg_stat_replication` shows non-privileged roles only their own rows, so
 // an empty result is equally consistent with "no standby" and "a standby
 // this role cannot see"; suppressing on it would silence the advisory on
@@ -127,20 +136,21 @@ func preflightSlotFailover(ctx context.Context, handle any, sourceCaps ir.Capabi
 
 	slog.WarnContext(
 		ctx,
-		"this stream's replication slot may not survive a failover: sluice created it with FAILOVER true, but the "+
-			"source's own settings will not synchronize it to a standby, so on a switchover or failover the slot "+
-			"can be left behind on the old primary and the stream would need a fresh slot and a re-copy",
+		"this stream's replication slot may not survive a failover OR A CLUSTER CHANGE: sluice created it with "+
+			"FAILOVER true, but the source's own settings will not synchronize it, so a switchover, a failover, or "+
+			"a cluster resize/maintenance rollout that replaces the node can leave the slot behind and the stream "+
+			"would need a fresh slot and a full re-copy. This applies to SINGLE-NODE instances too — replacing the "+
+			"one node is exactly the case",
 		slog.Bool("sync_replication_slots", posture.SyncReplicationSlots),
 		slog.Bool("hot_standby_feedback", posture.HotStandbyFeedback),
 		slog.String("to_fix", "enable BOTH sync_replication_slots and hot_standby_feedback on the source cluster "+
 			"(on PlanetScale Postgres: Cluster configuration > Parameters)"),
-		slog.String("already_covered_if", "(a) this is a SINGLE-NODE instance with no standby — no standby can be "+
-			"promoted, though note a cluster RESIZE may still replace the node, which would strand the slot the "+
-			"same way (untested, so treat single-node as probably-fine rather than certainly-fine); or "+
-			"(b) your cluster preserves slots by Patroni permanent slots "+
-			"instead — the \"Logical slot name\" field on PlanetScale Postgres. sluice can see neither from SQL "+
-			"(pg_stat_replication hides other roles' rows, so an empty one does not prove there is no standby), so "+
-			"this warning does not mean you are unprotected; it means sluice cannot confirm that you are"),
+		slog.String("not_an_exemption", "being SINGLE-NODE does not exempt you: PlanetScale's own console asks for "+
+			"these same two parameters so slots \"survive failovers and cluster changes\", and holds cluster "+
+			"changes for the branch until they are set. A resize replaces the node whether or not you have a replica"),
+		slog.String("already_covered_if", "your cluster preserves slots by Patroni permanent slots instead — the "+
+			"\"Logical slot name\" field on PlanetScale Postgres. sluice cannot see that from SQL, so this warning "+
+			"does not mean you are unprotected; it means sluice cannot confirm that you are"),
 		slog.String("see", "docs/postgres-source-prep.md, \"Slot lifetime under failover\""),
 	)
 }

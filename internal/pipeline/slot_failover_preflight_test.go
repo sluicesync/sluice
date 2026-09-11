@@ -48,13 +48,16 @@ func TestPreflightSlotFailover(t *testing.T) {
 		// It must name what to change, and must NOT claim the operator is
 		// broken — Patroni permanent slots are invisible from SQL, so a
 		// correctly-configured cluster reads exactly like this one.
-		// SINGLE-NODE is named because it is the most common reason the
-		// advisory does not apply and it is NOT detectable from SQL —
-		// pg_stat_replication hides other roles' rows, so an empty result
-		// cannot distinguish "no standby" from "a standby this role cannot
-		// see". An operator on a single-node instance has to be able to
-		// dismiss this in one read.
-		for _, want := range []string{"sync_replication_slots", "hot_standby_feedback", "Logical slot name", "SINGLE-NODE"} {
+		// SINGLE-NODE and "cluster change" are named because the intuitive
+		// reading — no standby, so nothing to fail over to, so nothing to
+		// fix — is FALSE, and two earlier drafts of this advisory shipped
+		// it. A resize or maintenance rollout replaces the node and strands
+		// the slot exactly as a promotion would. PlanetScale's own console
+		// asks for these two parameters so slots "survive failovers and
+		// cluster changes" and holds cluster changes until they are set.
+		// If either token stops appearing, the advisory has drifted back
+		// toward telling single-node operators they are safe.
+		for _, want := range []string{"sync_replication_slots", "hot_standby_feedback", "Logical slot name", "SINGLE-NODE", "cluster change"} {
 			if !strings.Contains(out, want) {
 				t.Errorf("advisory does not mention %q: %q", want, out)
 			}
