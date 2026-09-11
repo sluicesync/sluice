@@ -15,6 +15,27 @@ Both are the doc-lags-code shape the working agreements name. A note *about* bac
 
 **Staleness caveat (2026-08-18 triage).** A ground-truth pass over the un-struck entries found the "open" section is itself doc-lags-code: EVERY high-value candidate filed before ~2026-08-13 that was checked had already been fixed in code and never struck here (B-2c, D-1/2/3, Bug 239, the Bug 244 restore sibling, C1-1's SQLite/D1 lane — all now struck above with their code proof). Reassuringly, that pass found **zero still-open silent-loss items**. But the lesson is the project's own rule turned on this file: **before executing any un-struck entry older than 2026-08-13, ground-truth it against the code — the backlog text is not reliable for pre-08-13 entries.** The genuinely-open work concentrates in the freshest (2026-08-17 Tier-3) section plus the design-gated / needs-infra items.
 
+## 2026-09-11 — the Neki sequence fallback's "total and lossless" claim is false (found while building its coverage)
+
+**MEDIUM, narrow, silent in the worst arm.** `readSequencePositionFromCatalog` (`internal/engines/postgres/sequence_ddl.go`) is the Neki-only substitute for reading a sequence as a relation, which a Neki router refuses with NK013. Its doc asserted that `last_value NULL -> (start_value,false)` / `non-NULL -> (last_value,true)` is "total and lossless for this function's purpose". **Measured on real PostgreSQL 16 and 18.6, it is not:**
+
+```
+CREATE SEQUENCE s START 5;     relation (5,f)   pg_sequences NULL  -> (5,f)   agrees
+SELECT nextval('s');           relation (5,t)   pg_sequences 5     -> (5,t)   agrees
+SELECT setval('s', 9, true);   relation (9,t)   pg_sequences 9     -> (9,t)   agrees
+SELECT setval('s', 7, false);  relation (7,f)   pg_sequences NULL  -> (5,f)   LOSES 7
+```
+
+`pg_sequences.last_value` is NULL for **any** not-called sequence, not only a never-used one, so the view cannot tell "never used" from "positioned at 7, not yet issued". This is not a hypothetical state: `setvalSequence` writes `is_called=false` whenever the source sequence was in that state, so sluice creates it itself.
+
+**Why it is MEDIUM and not HIGH: the error only ever points BACKWARD.** The fallback can under-report a position, never over-report one. `reprimeExistingSequence` is forward-only against the captured source position, so an under-report makes it re-issue a `setval` it did not strictly need — idempotent — rather than skip one it did.
+
+**The residual, stated:** a target genuinely AHEAD of the source *in the not-called state* reads as behind, and the re-prime then rewinds it — after which the target re-issues values it has already handed out. That needs the target sequence to have moved independently of sluice (application writes on the target, or a re-run against an older captured position), on Neki, on a sequence in the `is_called=false` state. Narrow, but it is the silent arm.
+
+**Proposed fix, not built:** on a Neki target, never leave a sequence in the not-called state when an equivalent called state exists — `setval(s, n, false)` and `setval(s, n-increment, true)` issue the same next value, and the second is representable in `pg_sequences`. The transform is illegal when `n-increment` falls below `min_value` (a sequence sitting at its own start), and in that case the equivalent action is to leave the sequence unprimed, which is what a fresh target already does. That makes the fallback lossless for every sequence sluice itself primed; sequences primed by someone else stay ambiguous and that residual would need naming at the door.
+
+**Gate built instead of a promise:** `TestSequenceCatalogFallbackMatchesTheRelationRead` (`sequence_catalog_fallback_integration_test.go`, ordinary `integration` tag — the premise is PostgreSQL's, not Neki's, so it rides the per-PR postgres shard and the pg-version-matrix across every major we sweep). It grades all four states against the relation read as the independent expected value, pins WHICH state diverges, and asserts the divergence direction — an over-reporting regression fails loudly. It also fails if the hole ever CLOSES, naming this entry, so the doc cannot quietly outlive the measurement.
+
 ## 2026-09-11 — MySQL 8.4 is untested everywhere, and the code already carries premises measured on it (operator-raised)
 
 The operator asked whether the version matrices cover PG 18/19, MariaDB 12 and MySQL 8.4. Ground-truthed rather than recalled:

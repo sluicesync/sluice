@@ -290,17 +290,38 @@ func isNekiRelationReadRefusal(err error) bool {
 // readSequencePositionFromCatalog answers the same question through
 // `pg_sequences`, which a Neki router does serve.
 //
-// The view exposes `last_value` but not `is_called`, and PostgreSQL's own
-// definition is what makes that sufficient rather than a guess:
-// pg_sequences.last_value is "the last sequence value written to disk …
-// NULL if the sequence has not been read from yet". So a NULL is exactly the
-// not-yet-called state, in which the relation read would have reported
-// (start_value, is_called=false) — and start_value is in the same row.
-//
-// The mapping is therefore total and lossless for this function's purpose:
+// The view exposes `last_value` but not `is_called`:
 //
 //	last_value NULL     -> (start_value, false)
 //	last_value non-NULL -> (last_value,  true)
+//
+// THE MAPPING IS NOT LOSSLESS, and an earlier version of this comment said it
+// was — measured on real PostgreSQL 16 and 18.6 by
+// TestSequenceCatalogFallbackMatchesTheRelationRead, which grades all four
+// reachable states against the relation read:
+//
+//	CREATE SEQUENCE s START 5;            relation (5,f)   view NULL   -> (5,f)  agrees
+//	SELECT nextval('s');                  relation (5,t)   view 5      -> (5,t)  agrees
+//	SELECT setval('s', 9, true);          relation (9,t)   view 9      -> (9,t)  agrees
+//	SELECT setval('s', 7, false);         relation (7,f)   view NULL   -> (5,f)  LOSES 7
+//
+// pg_sequences.last_value is NULL for ANY not-called sequence, not only for a
+// never-used one, so the view cannot distinguish "never used" from
+// "positioned at 7 and not yet issued". sluice reaches the lossy state itself
+// — setvalSequence writes is_called=false whenever the source sequence was in
+// that state.
+//
+// The error is always BACKWARD: this function can under-report a position,
+// never over-report one. That direction is what keeps it usable. The
+// forward-only re-prime in [SchemaWriter.reprimeExistingSequence] compares
+// this reading against the captured source position, so an under-report makes
+// it re-issue a setval it did not strictly need (idempotent) rather than skip
+// one it did. The residual hazard — a target genuinely AHEAD of the source in
+// the not-called state reads as behind, and the re-prime rewinds it — needs
+// the target to have moved independently of sluice, and is filed with its
+// reachability analysis and proposed fix in docs/dev/audit-backlog.md
+// (2026-09-11). The test asserts the direction explicitly, so an
+// over-reporting regression fails rather than degrading quietly.
 //
 // Used ONLY on the Neki fallback path, so vanilla PostgreSQL keeps reading
 // the relation exactly as before and none of the forward-only re-prime
