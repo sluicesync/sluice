@@ -1,0 +1,163 @@
+# PlanetScale Neki verification workflow.
+#
+# Exercises sluice's Neki-specific behaviour against a REAL PlanetScale
+# Neki cluster that this workflow CREATES AND DESTROYS PER RUN. Gated
+# behind the `nekiverify` build tag, so the test files are excluded from
+# the default Test/Integration jobs and do nothing in a checkout without
+# credentials.
+#
+# # Why this exists at all
+#
+# Neki is not open source. There is no image to boot, so the testcontainers
+# pattern every other engine uses is unavailable — see
+# docs/dev/neki-integration-coverage.md for the two-tier split. Tier 1 (the
+# flavor-forced Postgres suite) runs on every PR for free; this is Tier 2,
+# the residue that genuinely needs a live router.
+#
+# What it verifies is unusual and worth being precise about: it checks the
+# PREMISES sluice's sharded-target refusals rest on, not sluice itself. A
+# unit test can only confirm we still believe what we already believed;
+# this asks a live platform-preview whether the beliefs are still true. The
+# dangerous direction is a loud refusal becoming SILENT ACCEPTANCE, which
+# would leave sluice's protection resting on a premise that no longer holds
+# with nothing in sluice to say so.
+#
+# # Cost
+#
+# PlanetScale prorates, so a database that lives ~15 minutes costs ~15
+# minutes of a PS-10 Neki ($30/month list at the HA shape this provisions).
+# Nothing is kept between runs. Measured provisioning: 109–789 s across
+# eight runs — it varies widely, which is why the timeout below is generous
+# rather than tuned to one observation.
+#
+# # Required repo secrets
+#
+#   PLANETSCALE_SERVICE_TOKEN_ID / PLANETSCALE_SERVICE_TOKEN
+#   PLANETSCALE_ORG
+#
+# The service token needs database create/delete plus branch and role
+# access in the org. The test's credential loader reads env vars only —
+# there is no .env fallback on this path.
+#
+# A missing secret does NOT green-skip. The fail-on-skip step below turns
+# any skipped nekiverify test into a job failure, for the reason the
+# psverify audit recorded (2026-07-15 MED-T1): that workflow sat at zero
+# recorded runs while its env block satisfied only 2 of 6 suites, so a
+# dispatch would have greened while silently skipping the rest. A live
+# suite that skips means "we did not look", which is the dishonest
+# outcome.
+
+name: Neki Verify
+
+on:
+  workflow_dispatch:
+  # Weekly, operator-decided 2026-09-11. Neki is a platform PREVIEW: the
+  # measurements these tests re-confirm are true on one build and will
+  # rot, and a suite nobody dispatches notices nothing. The cadence is a
+  # knob — drop to dispatch-only or lengthen the interval if the cost or
+  # the noise proves unwelcome.
+  schedule:
+    - cron: "0 7 * * 1"
+
+# Reads repo contents only; the secrets are scoped at the job's env block.
+permissions:
+  contents: read
+
+# Two parallel runs would both sweep and provision. The sweep deletes
+# `nekiverify-*` databases older than 3h so it cannot touch a concurrent
+# run's database, but serialising is cheaper than relying on that.
+concurrency:
+  group: nekiverify
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  nekiverify:
+    name: Neki verification (live cluster, provisioned per run)
+    runs-on: ubuntu-latest
+    # Generous on purpose. Provisioning alone ranged 109–789 s across eight
+    # measured runs, and each test function provisions its own database.
+    timeout-minutes: 60
+    steps:
+      # SHA-pinned rather than mutable tags: this workflow handles a
+      # PlanetScale service token with database CREATE/DELETE rights, so a
+      # re-pointed action tag would run arbitrary code holding a credential
+      # that can bill the account. Same rationale and same pins as
+      # release.yml and psverify.yml.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: "go.mod"
+      - run: go mod download
+
+      # Cheap pre-flight: prove the tagged files compile before spending
+      # minutes provisioning a cluster to discover a typo.
+      - run: go vet -tags=nekiverify ./internal/...
+
+      # The real run. Each test function provisions its own database and
+      # deletes it in t.Cleanup; the suite also sweeps `nekiverify-*`
+      # databases older than 3h BEFORE provisioning, so a run that died
+      # between create and delete is cleaned by the next one rather than
+      # leaking forever.
+      #
+      # -count=1 disables the test cache: a cached result would defeat the
+      # entire point of asking a live platform whether something is still
+      # true. No -race here, unlike psverify — these tests are API calls
+      # and SQL round-trips with no concurrency of their own, and -race
+      # would add build time for no coverage.
+      - name: Run Neki verification suite
+        env:
+          PLANETSCALE_SERVICE_TOKEN_ID: ${{ secrets.PLANETSCALE_SERVICE_TOKEN_ID }}
+          PLANETSCALE_SERVICE_TOKEN: ${{ secrets.PLANETSCALE_SERVICE_TOKEN }}
+          PLANETSCALE_ORG: ${{ secrets.PLANETSCALE_ORG }}
+        run: |
+          set -o pipefail
+          go test -tags=nekiverify -count=1 -timeout=50m -v \
+            -run '^TestNekiverify' ./internal/engines/postgres 2>&1 | tee nekiverify-output.txt
+
+      # Fail on skip. A nekiverify run that skipped anything did not verify
+      # what it claims to verify, and the skip reason names the missing
+      # env var, so the failure message is self-remediating.
+      - name: Fail if any nekiverify test was skipped
+        if: always()
+        run: |
+          if [ ! -s nekiverify-output.txt ]; then
+            echo "::error::nekiverify produced no output — the suite did not run at all."
+            exit 1
+          fi
+          if grep -E '^\s*--- SKIP' nekiverify-output.txt; then
+            echo "::error::nekiverify tests were SKIPPED (missing secrets above) — a green run must run everything. Wire the missing secrets and re-dispatch."
+            exit 1
+          fi
+          echo "fail-on-skip: no skipped tests."
+
+      # Leak check. The suite tears down its own databases, but a
+      # teardown that failed reports through t.Errorf and could in
+      # principle be missed; this is the independent confirmation, and it
+      # runs even when the tests failed.
+      #
+      # It does NOT delete anything — deleting here would hide exactly the
+      # recurring-teardown-failure signal worth seeing. The next run's
+      # sweep does the cleaning; this only reports.
+      - name: Report any leaked nekiverify databases
+        if: always()
+        env:
+          PLANETSCALE_SERVICE_TOKEN_ID: ${{ secrets.PLANETSCALE_SERVICE_TOKEN_ID }}
+          PLANETSCALE_SERVICE_TOKEN: ${{ secrets.PLANETSCALE_SERVICE_TOKEN }}
+          PLANETSCALE_ORG: ${{ secrets.PLANETSCALE_ORG }}
+        run: |
+          if [ -z "${PLANETSCALE_ORG:-}" ]; then
+            echo "leak check: no org configured; skipping."
+            exit 0
+          fi
+          leaked=$(curl -sS -H "Authorization: ${PLANETSCALE_SERVICE_TOKEN_ID}:${PLANETSCALE_SERVICE_TOKEN}" \
+            "https://api.planetscale.com/v1/organizations/${PLANETSCALE_ORG}/databases?per_page=100" \
+            | grep -o '"name":"nekiverify-[^"]*"' | wc -l)
+          if [ "$leaked" -gt 0 ]; then
+            echo "::warning::${leaked} nekiverify-* database(s) still exist. Each run's t.Cleanup should delete its own; the next run's sweep will remove any older than 3h. A RECURRING count here means teardown is failing and the sweep is carrying the whole burden."
+          else
+            echo "leak check: no nekiverify-* databases remain."
+          fi

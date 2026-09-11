@@ -29,6 +29,7 @@ on:
       - "Fuzz roundtrip"
       - "Postgres version matrix"
       - "Vitess version matrix"
+      - "Neki Verify"
     types: [completed]
 
 # Least privilege: this workflow only touches the issue tracker.
