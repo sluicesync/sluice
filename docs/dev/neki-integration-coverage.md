@@ -67,4 +67,23 @@ Reshard and MoveTables mid-stream stay **manual**. They need a writer, a workflo
 
 Note the interaction with the fail-on-skip belt, because together they are what makes the weekly run honest: the belt turns a missing-secret skip into a red, and the consumer turns that red into an issue. Without both, a weekly run that quietly stops exercising anything looks exactly like a weekly run that passes.
 
-**What to watch before deciding it is too costly.** The run is two short-lived connections against existing databases — it provisions nothing. The cost is therefore whatever the databases cost to keep alive, which is already an operator decision independent of this suite, plus negligible compute. If the databases are ever torn down, the belt turns the weekly run red on missing secrets rather than green-skipping, which is the correct signal and also the prompt to switch the schedule off.
+## Databases are PROVISIONED PER RUN, not kept standing
+
+Superseding the earlier assumption that the suite reads two long-lived DSNs. **PlanetScale prorates** (operator-confirmed, 2026-09-11), so a database that exists for twenty minutes costs twenty minutes — which makes on-demand strictly better than a standing pair: no idle spend, and no fixture quietly drifting between runs because somebody tested against it by hand.
+
+`pscale database create --engine neki --region us-east --cluster-size PS-10-AWS-ARM-NEKI --replicas 0 --wait` creates one; deleting is a single call. A single-node PS-10 Neki is $10/month list, so a weekly ~20-minute run is a rounding error.
+
+**The sharded database is the expensive half, and it is also the important one.** A fresh Neki database comes up with ONE shard. Every finding worth regression-testing — per-shard `UNIQUE`/`EXCLUDE`, the `ON CONFLICT` duplication gap, `NK013` on a shard-key `SET` — needs a MULTI-shard database, which means `set_data_topology` → `reshard_create` → `workflow_switch_traffic` → wait, on top of provisioning. Budget for it in the job timeout and treat the reshard as a setup step that can fail independently of any assertion.
+
+### The orphan sweep is not optional
+
+A workflow that creates and destroys billable infrastructure ~52 times a year **will** eventually die between the two — a cancelled run, a runner timeout, an assertion that panics before teardown. That is precisely the unattended-billable-infra failure this project's operating rules exist to prevent, and an `if: always()` teardown does not cover a runner that vanishes.
+
+So the job does two things, and the second is what actually saves you:
+
+1. **Teardown in `if: always()`**, deleting the databases this run created.
+2. **A sweep at the START of every run** that lists `nekiverify-*` databases and deletes any older than a couple of hours. The previous run's orphan is cleaned by the next run, so a single missed teardown costs hours of a $10/month database rather than accumulating forever.
+
+Name every provisioned database with the `nekiverify-` prefix and a run identifier so the sweep can recognise its own litter and never touch an operator's database.
+
+**And the sweep must be loud.** If it finds an orphan, that is evidence the previous run did not complete — worth a WARN in the log and worth noticing, not a silent cleanup that hides a recurring teardown failure.
