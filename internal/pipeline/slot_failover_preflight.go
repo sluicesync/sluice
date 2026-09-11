@@ -56,11 +56,25 @@ import (
 //	 2026-09-14."
 //
 // — and backs it by HOLDING cluster changes for the branch until the
-// settings are fixed. A resize or a maintenance rollout replaces the node,
-// which strands a primary-local slot exactly as a promotion would, and
-// replica count has nothing to do with it. So the advisory fires for
-// single-node instances on purpose, and the message no longer offers
-// single-node as a reason to dismiss it.
+// settings are fixed.
+//
+// MEASURED, not inferred (2026-09-10, PlanetScale Postgres 18.6,
+// single-node, zero replicas). A logical slot was created with
+// `failover => true`, read back as `failover=t, synced=f`, and a
+// PS-10 -> PS-20 resize was applied:
+//
+//	before resize   sluice_resize_probe | failover=true | synced=false
+//	                                    | wal_status=reserved
+//	                                    | restart_lsn=0/96001428
+//	after resize    (no rows) -- count(*) FROM pg_replication_slots = 0
+//
+// The slot was DESTROYED. A resize replaces the node, which strands a
+// primary-local slot exactly as a promotion would, and replica count has
+// nothing to do with it. For a sluice stream that means a lost position
+// and a full re-copy, from an operation an operator would reasonably
+// consider routine. So the advisory fires for single-node instances on
+// purpose, and the message no longer offers single-node as a reason to
+// dismiss it.
 //
 // Recorded because the wrong version shipped twice: first as a flat
 // "nothing to fix", then as a hedged "probably fine". Both were reasoning
