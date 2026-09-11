@@ -56,8 +56,19 @@ on:
   # rot, and a suite nobody dispatches notices nothing. The cadence is a
   # knob — drop to dispatch-only or lengthen the interval if the cost or
   # the noise proves unwelcome.
+  #
+  # 17:20 UTC Monday, chosen so the result lands in a Pacific workday
+  # MORNING — a red that nobody sees until Tuesday is most of a week of
+  # not knowing. Two notes on the exact time:
+  #
+  #   * GitHub cron is always UTC and does NOT follow daylight saving, so
+  #     this is ~10:20 Pacific in PDT and ~09:20 in PST. Both are working
+  #     hours; the hour of drift is deliberate rather than worth chasing.
+  #   * :20 rather than :00 because GitHub documents that scheduled runs
+  #     on the hour are the most contended and can be delayed — the top of
+  #     the hour is where everyone puts theirs.
   schedule:
-    - cron: "0 7 * * 1"
+    - cron: "20 17 * * 1"
 
 # Reads repo contents only; the secrets are scoped at the job's env block.
 permissions:
