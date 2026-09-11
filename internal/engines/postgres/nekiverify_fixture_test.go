@@ -75,7 +75,7 @@ func provisionShardedNeki(ctx context.Context, t *testing.T, c psCreds) *nekiFix
 	}
 
 	name := fmt.Sprintf("%s%d", nekiPrefix, time.Now().UnixNano())
-	t.Logf("nekiverify: creating %s (this takes several minutes)", name)
+	t.Logf("nekiverify: creating %s at %s UTC (this takes several minutes)", name, time.Now().UTC().Format(time.RFC3339))
 
 	if _, _, err := c.api(ctx, http.MethodPost, "/organizations/"+c.org+"/databases", map[string]any{
 		"name":         name,
@@ -119,7 +119,20 @@ func provisionShardedNeki(ctx context.Context, t *testing.T, c psCreds) *nekiFix
 	return fx
 }
 
-// waitBranchReady blocks until the branch reports ready.
+// waitBranchReady blocks until the branch reports ready, and logs the
+// BRANCH ID and a UTC timestamp when it does.
+//
+// Both are logged deliberately rather than incidentally. Anything surprising
+// this suite finds becomes a report shared with PlanetScale, and those are
+// the two fields that make one cross-referenceable against THEIR logs: the
+// branch id is the handle their systems index on (a database name is ours
+// and means little to them), and UTC timing is what lines up against a
+// server-side trace. Operator requirement, 2026-09-11 — see
+// neki-issues/README.md.
+//
+// Capturing it here rather than relying on whoever writes the report to
+// remember is the point: these databases are deleted at the end of every
+// run, so a branch id not captured while it existed cannot be recovered.
 func waitBranchReady(ctx context.Context, t *testing.T, c psCreds, db string) {
 	t.Helper()
 	deadline := time.Now().Add(20 * time.Minute)
@@ -127,6 +140,11 @@ func waitBranchReady(ctx context.Context, t *testing.T, c psCreds, db string) {
 		out, _, err := c.api(ctx, http.MethodGet, "/organizations/"+c.org+"/databases/"+db+"/branches/main", nil)
 		if err == nil {
 			if ready, _ := out["ready"].(bool); ready {
+				branchID, _ := out["id"].(string)
+				t.Logf("nekiverify: branch READY at %s — database=%q branch_id=%q (quote both in any Neki finding: "+
+					"the branch id is what PlanetScale can cross-reference, and this database is deleted at the "+
+					"end of the run)",
+					time.Now().UTC().Format(time.RFC3339), db, branchID)
 				return
 			}
 		}
@@ -351,7 +369,7 @@ func declareTopology(ctx context.Context, t *testing.T, fx *nekiFixture) {
 	if !ok {
 		t.Fatalf("nekiverify: set_data_topology reported success=false at revision %d", rev)
 	}
-	t.Logf("nekiverify: topology stored at revision %d", rev)
+	t.Logf("nekiverify: topology stored at revision %d, %s UTC", rev, time.Now().UTC().Format(time.RFC3339))
 
 	// Wait for every router, so a later CREATE TABLE cannot land on a
 	// router that has not seen the topology yet.
