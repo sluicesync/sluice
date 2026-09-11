@@ -24,10 +24,19 @@
 #
 # NAMING RULE (the single source of truth — build-prebaked-images.sh
 # reads it via `--print-ref` so publisher and consumers cannot drift):
-#   docker.io/<repo>:<tag>  ->  ${GHCR_NAMESPACE}/sluice-mirror-<basename(repo)>:<tag>
+#   <registry>/<repo>:<tag>  ->  ${GHCR_NAMESPACE}/sluice-mirror-<basename(repo)>:<tag>
 #   e.g. postgres:16                  -> ghcr.io/sluicesync/sluice-mirror-postgres:16
 #        mysql:8.0                    -> ghcr.io/sluicesync/sluice-mirror-mysql:8.0
 #        vitess/vttestserver:mysql80  -> ghcr.io/sluicesync/sluice-mirror-vttestserver:mysql80
+#
+# THE SOURCE REGISTRY IS NOT ALWAYS DOCKER.IO, and the rule already handles
+# that because it keys on the repo BASENAME: quay.io/minio/minio and
+# mcr.microsoft.com/azure-storage/azurite mirror to sluice-mirror-minio and
+# sluice-mirror-azurite. The fallback below pulls from whatever registry the
+# stock ref names, so "docker.io" in this file's prose means "the upstream
+# source", not literally Docker Hub. MinIO is the reason the distinction is
+# worth writing down: it left Docker Hub entirely on 2026-09-11, which is the
+# failure a vendor-controlled path can produce and a mirror cannot.
 # (The pre-existing vitess/lite mirror predates this scheme and lives at
 # ghcr.io/sluicesync/sluice-vitess:<tag>; use --mirror to consume it.)
 #

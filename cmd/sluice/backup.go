@@ -727,6 +727,11 @@ func (k *BackupKeygenCmd) resolvePaths() (priv, pub string, err error) {
 //   - --target=gs://bucket/prefix             → Google Cloud Storage
 //   - --target=azblob://container/prefix      → Azure Blob
 //
+// Which of those a real server has ever answered for is a separate
+// question from which are reachable, and the answer is derived rather
+// than remembered: docs/testing.md carries a `blob-backends-verified`
+// marker that a docsync gate builds from the integration tests.
+//
 // Phase-2 caveats:
 //
 //   - Full snapshot only. Incremental backups are Phase 3.
@@ -744,7 +749,14 @@ type BackupFullCmd struct {
 	OutputDir string `help:"Directory the backup is written to (local filesystem). Created if it doesn't exist. Manifest lives at <DIR>/manifest.json; chunks live under <DIR>/chunks/<table>/. Mutually exclusive with --target." placeholder:"DIR"`
 	Target    string `help:"Backup destination URL (s3://bucket/prefix, gs://bucket/prefix, azblob://container/prefix, file:///path). Mutually exclusive with --output-dir." placeholder:"URL"`
 
-	BackupEndpoint  string `help:"Override the S3 endpoint (e.g. http://minio.local:9000) for S3-compatible providers — MinIO, Cloudflare R2, Backblaze B2, Wasabi, Tigris, Archil's S3 read API. Only meaningful when --target is an s3:// URL." placeholder:"URL"`
+	// The provider list is a claim about a CLASS, not a per-provider
+	// verification, and says so — one generic S3 client serves all of them and
+	// CI boots exactly one S3 server (MinIO). Six names in a help string read
+	// as six things somebody tested; they are not, and an operator picking
+	// Wasabi on the strength of this line deserves to know that before they
+	// find out. See docs/testing.md's blob-backends-verified marker, which a
+	// docsync gate derives from the tests.
+	BackupEndpoint  string `help:"Override the S3 endpoint (e.g. http://minio.local:9000) for S3-compatible providers — MinIO, Cloudflare R2, Backblaze B2, Wasabi, Tigris, Archil's S3 read API. One generic S3 client serves all of them, so support is by class: CI verifies that client against MinIO, not each provider. Only meaningful when --target is an s3:// URL." placeholder:"URL"`
 	BackupRegion    string `help:"Override the S3 region. Required by some S3-compatible providers (Archil uses provider-specific codes like 'aws-us-east-1'). Only meaningful when --target is an s3:// URL." placeholder:"REGION"`
 	BackupPathStyle bool   `help:"Force path-style addressing (bucket-in-path rather than bucket-in-hostname). Required by Archil and many MinIO setups. Only meaningful when --target is an s3:// URL."`
 

@@ -46,6 +46,11 @@ Naming scheme (owned by `scripts/ci-mirror-pull.sh`, which the bake script queri
 | `postgres:16` (and each `scripts/pg-versions.txt` entry: 17, 18, latest) | `ghcr.io/sluicesync/sluice-mirror-postgres:<tag>` |
 | `mysql:8.0` (and each `scripts/mysql-versions.txt` entry: 8.4, latest) | `ghcr.io/sluicesync/sluice-mirror-mysql:<tag>` |
 | `vitess/vttestserver:mysql80` | `ghcr.io/sluicesync/sluice-mirror-vttestserver:mysql80` |
+| `quay.io/minio/minio:<release>` | `ghcr.io/sluicesync/sluice-mirror-minio:<release>` |
+| `fsouza/fake-gcs-server:<ver>` | `ghcr.io/sluicesync/sluice-mirror-fake-gcs-server:<ver>` |
+| `mcr.microsoft.com/azure-storage/azurite:<ver>` | `ghcr.io/sluicesync/sluice-mirror-azurite:<ver>` |
+
+**The last three are not on docker.io, and the naming rule handles them unchanged** because it keys on the repo basename. They are also the clearest case for mirroring being more than latency insurance: MinIO **removed** its Docker Hub repository on 2026-09-11 (`pull access denied … repository does not exist`), turning four blob-store tests red with nothing in this repo having changed. A vendor can retire a registry path; a retag under our own namespace is the difference between meeting that on our own schedule and meeting it mid-release.
 
 (`ghcr.io/sluicesync/sluice-vitess:<tag>` — the `vitess/lite` mirror — predates this scheme; consumers pass it explicitly via `ci-mirror-pull.sh --mirror`.)
 

@@ -418,6 +418,34 @@ jobs:
             mariadb:11.8 \
             mariadb:12.3
 
+      # The three cloud-blob emulators the backup suites boot. Scoped to
+      # pipeline-rest-other because that is where they land: the pipeline
+      # shards split by test NAME, and `TestBlobStore_*` matches neither
+      # `^TestMigrate_` nor `^TestStreamer_`, so it falls to the -skip shard.
+      #
+      # NOT ONLY A LATENCY MEASURE, unlike the database images. None of these
+      # three is on docker.io any more or ever was: MinIO REMOVED its Docker
+      # Hub repository (observed 2026-09-11 — four tests red at container
+      # start with nothing in this repo changed), Azurite ships on
+      # mcr.microsoft.com, and fake-gcs-server is a single-maintainer repo.
+      # A mirror under our own namespace is what makes the next such decision
+      # something we notice on our own schedule.
+      #
+      # The tags are duplicated from the Go constants (blob_store_integration_test.go
+      # and blob_store_gcs_azure_integration_test.go). Drift is non-fatal —
+      # ci-mirror-pull.sh ::warning-falls-back to the source registry — so this
+      # degrades to the pre-mirror behaviour rather than failing the shard.
+      - name: Pre-pull the blob-store emulators via their GHCR mirrors (source-registry fallback)
+        if: matrix.shard.name == 'pipeline-rest-other'
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          bash scripts/ci-mirror-pull.sh \
+            quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z \
+            fsouza/fake-gcs-server:1.56.1 \
+            mcr.microsoft.com/azure-storage/azurite:3.37.0
+
       # Run every package's integration tests. -count=1 disables the
       # test cache so we always exercise real containers (cached results
       # would defeat the point). -race catches data-race bugs in the

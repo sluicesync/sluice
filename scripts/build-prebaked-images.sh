@@ -547,6 +547,27 @@ mirror_stock_refs() {
     # non-required continue-on-error.)
     echo "mariadb:11.8"
     echo "mariadb:12.3"
+    # The cloud-blob emulators the backup suites boot (pipeline-rest-other
+    # shard). These are the FIRST mirrored refs that do not live on docker.io,
+    # and the naming rule handles them unchanged because it keys on the
+    # basename: quay.io/minio/minio -> sluice-mirror-minio,
+    # mcr.microsoft.com/azure-storage/azurite -> sluice-mirror-azurite.
+    #
+    # Mirroring these is not just latency insurance. MinIO REMOVED its Docker
+    # Hub repository (2026-09-11: `pull access denied … repository does not
+    # exist`), which turned four tests red with nothing in this repo having
+    # changed. A vendor can retire a registry path, and a mirror under our own
+    # namespace is the difference between noticing that on our schedule and
+    # discovering it mid-release.
+    #
+    # Keep the tags in step with the constants in
+    # internal/pipeline/blob_store_integration_test.go and
+    # blob_store_gcs_azure_integration_test.go. Drift is not fatal —
+    # ci-mirror-pull.sh falls back to the source registry with a ::warning —
+    # but it silently gives up the protection above.
+    echo "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z"
+    echo "fsouza/fake-gcs-server:1.56.1"
+    echo "mcr.microsoft.com/azure-storage/azurite:3.37.0"
 }
 
 # bake_mirrors MIRRORS each stock ref to GHCR. Pure retag, never a build —

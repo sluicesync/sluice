@@ -92,6 +92,25 @@ func TestMigrate_MySQL_to_Postgres_BasicTypes(t *testing.T) {
 
 **Speed budget:** the layer is allowed to take a few minutes locally and ten or fifteen minutes in CI. Container startup is the dominant cost, so containers are reused across tests in the same package via a shared setup.
 
+### Cloud blob backends — which are actually exercised
+
+`blobcodec.BlobStore` is built on `gocloud.dev/blob` with four drivers registered, so sluice's own code is provider-neutral: there is no "GCS path" through the orchestrator, only a different URL scheme. What the abstraction cannot cover is what each *backend* does, and one backend behaviour is load-bearing — `PutIfAbsent` (the ADR-0160 chain concurrent-writer guard) maps gocloud's `IfNotExist` onto each backend's native precondition, and a provider that ignores that precondition behaves like a plain `Put` while the guard degrades to a WARN.
+
+So the question worth answering precisely is which backends a real server has ever answered it for:
+
+<!-- blob-backends-verified: azblob, gs, s3 -->
+
+| scheme | exercised against | how |
+| --- | --- | --- |
+| `s3://` | MinIO (`quay.io/minio/minio`) | round-trip, conditional-put chain guard, cross-engine backup→restore, resumable backup |
+| `gs://` | fake-gcs-server | round-trip + prefix handling, conditional-put chain guard |
+| `azblob://` | Azurite | round-trip + prefix handling, conditional-put chain guard |
+| `file://` | — | **not exercised** through the blob path; the hardened `LocalStore` is the supported local backend and has its own coverage, and `fileblob` exists for URL-scheme parity |
+
+That marker is owned by `TestBlobBackendsVerifiedListMatchesTheTests` in `internal/docsync`, which derives the list from the integration tests themselves and fails when a driver gains or loses coverage. A `--backup-endpoint` that names six S3-compatible providers is a claim about a CLASS served by one generic S3 client; the class is verified against MinIO, and the other five are not separately booted.
+
+**What an emulator cannot prove:** credential resolution (ADC, managed identity, IAM), bucket policy, multi-region behaviour, and whether the real services agree with their emulators. That is an operator-run pass with real credentials, not CI.
+
 ## Layer 3: Semantic equivalence (sqllogictest)
 
 > **Status: not built (design target).** `test/sqllogic/` does not exist
