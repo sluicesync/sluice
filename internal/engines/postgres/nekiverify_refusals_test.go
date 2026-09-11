@@ -127,6 +127,11 @@ func TestNekiverify_ShardedRefusalPremises(t *testing.T) {
 
 	tenantA, tenantB := tenantsOnDistinctShards(ctx, t, db, fx.shards)
 
+	// Tier-2 coverage item #4 rides this fixture rather than provisioning a
+	// second database: none of its premises need sharding, and a database is
+	// minutes of wall clock and a real bill. See nekiverify_ddl_sequence_test.go.
+	nekiDDLAndSequencePremises(ctx, t, db)
+
 	t.Run("PREMISE: the shard key may not be named in an UPDATE SET list", func(t *testing.T) {
 		// sluice's SLUICE-E-TARGET-SHARD-KEY-UPDATE-UNSUPPORTED refusal, and
 		// the dropUnchangedShardKeys machinery that avoids tripping it,

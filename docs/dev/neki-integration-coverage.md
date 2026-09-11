@@ -55,6 +55,10 @@ Mirror `psverify` exactly; it is the same problem solved once already for live P
 3. `NK213` classification against a real MoveTables cutover.
 4. DDL-in-transaction and the sequence catalog fallback.
 
+**Status, 2026-09-11.** Item 1 is BUILT and has run green on a live cluster (`TestNekiverify_ShardedRefusalPremises`). Item 4 is BUILT but **has not yet run against a live cluster** — it is written, type-checked, and waiting on the first scheduled run; grade it on that run rather than assuming it passes. It rides item 1's fixture rather than provisioning its own database, because none of its premises need sharding and a database is minutes of wall clock plus a real bill. Items 2 and 3 are still open.
+
+Item 4 split in two along the line the table at the top of this file draws, which is worth recording as the pattern for the rest: the half that is really a claim about **PostgreSQL** (what `pg_sequences` reports for each sequence state, which `readSequencePositionFromCatalog` depends on) went to the ordinary integration shard, where it runs per-PR and sweeps every major in the version matrix for free — and immediately found that the mapping is **not** lossless, contrary to the comment asserting it was (see `docs/dev/audit-backlog.md`, 2026-09-11). Only the half that genuinely needs a **router** — DDL not surviving a transaction, and the NK013 relation-read refusal the fallback diverts on — costs a live cluster. Asking "which server is this premise about?" before writing the test moved most of item 4 out of the paid tier and made it stronger.
+
 Reshard and MoveTables mid-stream stay **manual**. They need a writer, a workflow and several minutes of wall clock; automating them would be the most expensive cell in the matrix and the one least likely to regress silently, since both fail loudly today.
 
 ## What this deliberately does not do
