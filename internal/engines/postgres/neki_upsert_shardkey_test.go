@@ -5,6 +5,7 @@ package postgres
 
 import (
 	"encoding/json"
+	"slices"
 	"strings"
 	"testing"
 
@@ -177,15 +178,30 @@ func TestBuildBatchUpsertDoesNotArmTheGuardForADoNothingStatement(t *testing.T) 
 func TestPlanShardKeyUpsert(t *testing.T) {
 	t.Parallel()
 
+	// The grid is (shard-key CONTAINMENT in the conflict key) × (one shard /
+	// many), which is the whole input space that changes the answer, plus the
+	// spelling and arity variations that have their own failure modes.
+	// Containment has three states and they are NOT two — "partly contained"
+	// is its own row, because a composite shard key whose first column is in
+	// the conflict key still routes on the second one, and an implementation
+	// that checked "any column present" rather than "every column present"
+	// would pass a two-state grid.
+	//
+	// wantOmitCols is asserted EXACTLY, not for non-emptiness. Omitting the
+	// wrong column is the failure this plan exists to prevent — the omitted
+	// column is the one left out of the SET list, so a plan that omits `id`
+	// instead of `tenant_id` would leave the routing column in the SET list
+	// (the NK013 refusal, loud) AND stop updating a real column (silent). A
+	// length check cannot tell those apart from the correct answer.
 	cases := []struct {
-		name       string
-		shardCols  []string
-		multiShard bool
-		keyCols    []string
-		wantErr    bool
-		wantOmit   bool
-		wantGuard  bool
-		why        string
+		name         string
+		shardCols    []string
+		multiShard   bool
+		keyCols      []string
+		wantErr      bool
+		wantOmitCols []string
+		wantGuard    bool
+		why          string
 	}{
 		{
 			name:      "multi-shard, shard key OUTSIDE the key: REFUSED",
@@ -197,7 +213,7 @@ func TestPlanShardKeyUpsert(t *testing.T) {
 		{
 			name:      "single-shard, shard key OUTSIDE the key: omit + guard",
 			shardCols: []string{"tenant_id"}, multiShard: false, keyCols: []string{"id"},
-			wantOmit: true, wantGuard: true,
+			wantOmitCols: []string{"tenant_id"}, wantGuard: true,
 			why: "the conflict IS found on one shard, so the predicate runs and a skip shows as a shortfall",
 		},
 		{
@@ -207,10 +223,36 @@ func TestPlanShardKeyUpsert(t *testing.T) {
 				"given conflict key",
 		},
 		{
+			name:      "shard key INSIDE the key, single shard: still nothing to do",
+			shardCols: []string{"tenant_id"}, multiShard: false, keyCols: []string{"tenant_id", "id"},
+			why: "the shard count is irrelevant once the conflict key fixes the routing column; arming a " +
+				"guard here would cost a predicate on every row of the common single-shard case for nothing",
+		},
+		{
 			name:      "composite shard key, one column outside: REFUSED on the multi-shard group",
 			shardCols: []string{"org_id", "region"}, multiShard: true, keyCols: []string{"org_id", "id"},
 			wantErr: true,
 			why:     "a partially-contained shard key routes on a value the conflict key does not fix",
+		},
+		{
+			name:      "composite shard key, one column outside, single shard: omit ONLY the uncontained one",
+			shardCols: []string{"org_id", "region"}, multiShard: false, keyCols: []string{"org_id", "id"},
+			wantOmitCols: []string{"region"}, wantGuard: true,
+			why: "org_id is already out of the SET list as a key column; omitting it again would be " +
+				"harmless, but omitting anything ELSE than region would stop updating a real column",
+		},
+		{
+			name:      "composite shard key, BOTH columns outside, single shard: omit both, in order",
+			shardCols: []string{"org_id", "region"}, multiShard: false, keyCols: []string{"id"},
+			wantOmitCols: []string{"org_id", "region"}, wantGuard: true,
+			why: "every routing column has to leave the SET list, or the statement carries the NK013 " +
+				"refusal for whichever one was left behind",
+		},
+		{
+			name:      "composite shard key, FULLY contained: nothing to do on either shard count",
+			shardCols: []string{"org_id", "region"}, multiShard: true,
+			keyCols: []string{"org_id", "region", "id"},
+			why:     "containment is per-column and all of them are present; there is nothing to omit",
 		},
 		{
 			name:      "no shard key at all: zero plan",
@@ -222,6 +264,32 @@ func TestPlanShardKeyUpsert(t *testing.T) {
 			shardCols: []string{"Tenant_ID"}, multiShard: true, keyCols: []string{"tenant_id", "id"},
 			why: "PostgreSQL folds unquoted identifiers; treating these as different columns would refuse a " +
 				"safe table, or worse leave the column in a SET list the plan believed it had removed",
+		},
+		{
+			name:      "case difference in the OTHER direction is not a miss either",
+			shardCols: []string{"tenant_id"}, multiShard: true, keyCols: []string{"TENANT_ID", "id"},
+			why: "the fold has to be applied to both sides; a one-sided ToLower passes the case above and " +
+				"refuses this one, which is the shape a single-direction fix leaves behind",
+		},
+		{
+			name:      "case difference on a column that is genuinely outside, single shard",
+			shardCols: []string{"Tenant_ID"}, multiShard: false, keyCols: []string{"id"},
+			wantOmitCols: []string{"Tenant_ID"}, wantGuard: true,
+			why: "the omitted name is echoed back AS THE TOPOLOGY SPELLED IT, not folded — the SET list and " +
+				"the guard predicate are rendered from this, and re-spelling a quoted identifier would " +
+				"address a different column",
+		},
+		{
+			// Not reachable through the writer today: its caller refuses a
+			// keyless table with errKeylessIdempotent before ever asking for a
+			// plan. Pinned anyway, and pinned in the FAIL-SAFE direction,
+			// because "a new entry point forgets the earlier refusal" is this
+			// repo's most expensive recurring shape and this function's own
+			// doc argues it must be safe on its own terms.
+			name:      "no conflict key at all, multi-shard: REFUSED (caller-unreachable, fail-safe)",
+			shardCols: []string{"tenant_id"}, multiShard: true, keyCols: nil,
+			wantErr: true,
+			why:     "an empty key contains nothing, so the routing column is outside it and the guard is inert",
 		},
 	}
 
@@ -242,8 +310,8 @@ func TestPlanShardKeyUpsert(t *testing.T) {
 			if err != nil {
 				t.Fatalf("refused a safe combination (%s): %v", tc.why, err)
 			}
-			if got := len(plan.omitFromSet) > 0; got != tc.wantOmit {
-				t.Errorf("omitFromSet=%v, want-non-empty=%v — %s", plan.omitFromSet, tc.wantOmit, tc.why)
+			if !slices.Equal(plan.omitFromSet, tc.wantOmitCols) {
+				t.Errorf("omitFromSet=%v, want %v — %s", plan.omitFromSet, tc.wantOmitCols, tc.why)
 			}
 			if plan.guard != tc.wantGuard {
 				t.Errorf("guard=%v, want %v — %s", plan.guard, tc.wantGuard, tc.why)
