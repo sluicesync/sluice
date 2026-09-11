@@ -4,6 +4,28 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.151.0] - 2026-09-11
+
+### Added
+
+**A coded refusal's remedy now reaches the terminal.** sluice had two hint mechanisms with opposite human visibility: `migcore.WrapWithHint` folds its hint into the error text, while a `sluicecode.CodedError`'s `Hint` reached only the structured slog record — so the last line of output, where anyone actually looks, carried the diagnosis and no fix. 242 of the tree's 243 coded construction sites carry a remedy, and for many it is the only statement of what to do. The exit boundary now appends it to the prose kong prints; an error already ending in its own hint block does not grow a second one, and exit codes are unchanged (the wrap keeps the `CodedError` reachable through `errors.As`).
+
+**`migrate` and `sync start` probe for direct-DDL acceptance before the schema phase.** On a PlanetScale branch with Safe Migrations enabled, sluice now refuses in ~200 ms with nothing created rather than discovering it partway through schema-apply and leaving a half-built target. The check is deliberately **behavioural** rather than reading PlanetScale's `safe_migrations` API flag: disabling propagates asynchronously to each gateway, so the flag reads "disabled" while the cluster still refuses — the window that costs an operator a wasted re-run. A refusal is conclusive; a pass is not, so a pass is silent and sluice never claims Safe Migrations is off. A probe that cannot run WARNs and continues. It does not probe when the run needs no DDL — the ADR-0166 pre-create bootstrap is unaffected, because the probe runs after the pre-create gate and only when something is left to create — and it is scoped to the Vitess-descended flavors, so vanilla MySQL and MariaDB targets issue nothing.
+
+**An advisory when a replication slot will not survive the cluster changing underneath it.** sluice has created slots with `FAILOVER true` on PG 17+ since ADR-0012; that flag is necessary and not sufficient, since something still has to synchronize the slot. `sync` cold start now reads `sync_replication_slots` and `hot_standby_feedback` and warns when it cannot confirm anything will. **Single-node instances are not exempt, measured:** on PlanetScale Postgres 18.6 with zero replicas, a slot carrying `failover=true` was destroyed by a routine PS-10 → PS-20 resize. It warns and cannot refuse — Patroni permanent slots preserve slots invisibly to `pg_settings`, so a correctly-configured cluster reads identically to an unprotected one.
+
+**`SLUICE-E-TARGET-TABLE-BLOCKED-BY-WORKFLOW`** — a PlanetScale Neki workflow (in practice a MoveTables write cutover) has blocked a table on the database sluice is connected to (SQLSTATE `NK213`). Terminal rather than retriable: the block carries a one-year expiry and the resolution changes which database the data lives in. Nothing is lost when it fires.
+
+**PlanetScale Neki MoveTables validated underneath a live stream** — byte-identical over 2,000 rows across `move_tables_create` → `switch_reads` → `switch_writes` → `reverse_traffic`. Create and the read switch are transparent; the write switch blocks the table on the source database and the stream halts, with the persisted position stopping before the block so a restart replays the gap to exact parity.
+
+### Fixed
+
+**Two sharded-target refusals reached `migrate` and not `sync start`.** `PreflightShardPlacement` and `PreflightShardKeyUpsert` shipped in v0.150.0 wired into migrate's target phase only; against the same Neki target, `migrate` refused at preflight while `sync start` copied all 60 rows, reached CDC, and died on the first change. Both now run at sync cold start before the snapshot opens, held there by a new AST-derived roster gate.
+
+**The safe-migrations message omitted the two facts that cost an operator a cycle each** — that disabling is not instantaneous, and that a re-run after a partial attempt is `--resume` rather than a fresh run. Both are now in the message, which is also line-broken rather than one run-on sentence.
+
+**Two published claims about Neki were measured false and corrected.** `postgis` is not creatable on Neki (`permission denied`, 42501) despite being listed in `pg_available_extensions`; the docs now carry the measured allowlist and note it is not PostgreSQL's `trusted` flag. And `sync` out of Neki fails on a refused replication connection, not the snapshot-import mechanism previously named.
+
 ## [0.150.0] - 2026-09-10
 
 ### Added

@@ -43,7 +43,7 @@ Any `sluice` invocation exited non-zero, printed a `SLUICE-E-*` code, or emitted
 - **Approval needed?** YES if the recovery uses a destructive flag (name it, and stop for human sign-off); NO for a safe re-run/config fix.
 - **If unclear:** the `sluice diagnose` line to produce a bundle for an issue.
 
-On exit 3 / `status:"refused"`: surface `error.hint` verbatim and wait — do not retry unchanged, and do not pre-authorize the destructive remedy.
+On exit 3 / `status:"refused"`: surface `error.hint` verbatim and wait — do not retry unchanged, and do not pre-authorize the destructive remedy. **Since v0.151.0 sluice already prints the hint** as a trailing `hint: <remedy>` line on stderr, so check before repeating it; the envelope `error.message` is unchanged (the append happens after the envelope is built), which is why the two can disagree.
 
 ## References (canonical — don't duplicate)
 `docs/operator/error-codes.md` (code | class | cause | remedy + the exit-code taxonomy) · `AGENTS.md` (envelope shape, taxonomy, destructive-flags list) · `skills/README.md` (safety model) · `sluice <command> --help`.
