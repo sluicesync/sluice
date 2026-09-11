@@ -162,6 +162,16 @@ func classifyApplierError(err error) error {
 			// Explicit non-retriable per ADR-0038 — reaches the
 			// terminal-code shield's bare return below. (Pre-shield this
 			// empty case fell THROUGH to the text legs — the D0-8 bug.)
+		case nekiBlockedTableCode:
+			// NK213 — a PlanetScale Neki workflow (in practice a
+			// MoveTables write cutover) has blocked this table on the
+			// database sluice is connected to. Already terminal via the
+			// shield below; this case adds the sentence an operator needs
+			// to get from a SQLSTATE nobody has memorised to "a workflow
+			// just took this table", and deliberately does NOT make it
+			// retriable. See neki_blocked_table.go for the measured
+			// cutover sequence and the sibling sweep.
+			return annotateNekiBlockedTable(err)
 		}
 		// PlanetScale Postgres serving-transition READ-ONLY window. During a
 		// non-Metal storage auto-grow the PG cluster is briefly promoted

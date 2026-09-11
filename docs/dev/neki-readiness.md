@@ -186,6 +186,51 @@ Split into `multiShard` plus the columns, and the bulk-copy idempotent upsert cl
 
 The affected-row count is the server's number, not one derived from the rows we sent — the independent-expected-value rule, satisfied by construction.
 
+### D-2 MOVETABLES MID-STREAM — measured, and it PASSES, but only because the cutover is LOUD
+
+The last open Tier-D row, and the one carrying the most prior weight: the Vitess filtered move-OUT class shipped a Critical and is why that lane has a tag-time cluster gate. This is its Neki analogue.
+
+**The first thing worth writing down is that MoveTables is not the thing the name suggests.** Neki's MoveTables moves tables from one **database** to another, not between shard groups — so exercising it needs a second database (`CREATE DATABASE mvtgt` works fine through the router). And the enrolment is stricter than it looks: `move_tables_create` refused `mv_src` with `NK604 … not found in the populated database topology` even though the table was fully routable and holding rows. **The data topology is an operator-DECLARED document, not a derived inventory** — `CREATE TABLE` through the router does not enrol a table in it. Six of the nineteen tables on the torture cluster were absent from `__neki.get_data_topology()` for exactly this reason, all of them working normally. The table has to be written into the topology with `set_data_topology` before a workflow can see it. Loud, so not dangerous; surprising enough to have cost a cycle here, and worth an issue.
+
+Setup: `mv_src` (PK `(tenant_id, id)`, shard key `tenant_id` inside the PK), a `sluice sync` stream applying into it, and a writer issuing an INSERT plus an UPDATE per tick against the source throughout. Then, underneath the live stream:
+
+```sql
+SELECT __neki.move_tables_create('mvw1','postgres',<src topo>,'mvtgt',<tgt topo>,
+                                 ARRAY['public.mv_src'],ARRAY['public.mv_src'],'{}');
+SELECT * FROM __neki.move_tables_switch_reads('mvw1');
+SELECT * FROM __neki.move_tables_switch_writes('mvw1','{"enable_reverse_replication":true}');
+SELECT * FROM __neki.move_tables_reverse_traffic('mvw1');
+```
+
+What the stream saw, step by step:
+
+| step | effect on a live sluice stream |
+| --- | --- |
+| `move_tables_create` | **transparent.** Both per-shard workflow streams ran `phase=streaming status=running` alongside sluice's; source and target stayed in lockstep throughout. |
+| `move_tables_switch_reads` | **transparent, and structurally so.** A Postgres client chooses its database at connect time, so a read switch cannot reach a connection that named the source database. sluice kept reading and writing the old copy. |
+| `move_tables_switch_writes` | **the stream HALTS.** The table is blocked on the source database on every shard primary; sluice died non-zero on the first statement. |
+| `move_tables_reverse_traffic` | the block moves to the other database, symmetrically, and a restarted stream replays the gap. |
+
+Final ground truth after reversing, restarting, and draining — the full ordered content, not a count:
+
+```
+source (PG 16.15)   c9d7b5d38355e7628638b580efcd123a | 2000
+target (Neki)       c9d7b5d38355e7628638b580efcd123a | 2000
+```
+
+**Anti-vacuity, because this is the row where a vacuous pass would be worst.** The workflow genuinely existed and ran (two streams, `traffic_state` walking `not_switched` → `reads_switched` → `reads_and_writes_switched`). The read switch was genuinely in effect: a sentinel row written **only** into `mvtgt` stayed invisible through the source connection, which is what proves the two databases are distinct read targets rather than one copy seen twice. The halt genuinely happened — `list_blocked_tables()` showed `action=reject scope=any` on both shard primaries — and the target froze at 1060 rows while the source climbed past 1139, so the stream really had stopped rather than quietly keeping up. And the checksum is over content, so a compensating pair of loss-plus-duplication could not produce it.
+
+**The pass is conditional on the failure being loud, and that is the finding.** Nothing here is safe because sluice is clever about MoveTables; it is safe because `NK213` is not in the retriable set, so the applier stopped and the persisted CDC position stopped with it — last advanced ~1 s **before** the block, not past the unapplied changes. That ordering is what makes the restart replay the gap instead of skipping it, and it was measured rather than reasoned.
+
+What was missing was the sentence an operator needs. The raw halt read
+
+```
+sluice: error: pipeline: apply changes: postgres: applier: update public.mv_src:
+ERROR: access to table "public.mv_src" is blocked (SQLSTATE NK213)
+```
+
+— a SQLSTATE nobody has memorised, with no mention of workflows, databases or cutovers. That is the same defect a MySQL-lane operator reported in different words ("the errors are pretty dense and hard to parse"). Closed by `SLUICE-E-TARGET-TABLE-BLOCKED-BY-WORKFLOW`, which names `__neki.list_blocked_tables()` and `move_tables_status()` and both end states; see `internal/engines/postgres/neki_blocked_table.go` for the sibling sweep, including the two paths it deliberately does **not** reach.
+
 ### Tier C, second pass — the router's OTHER row path, and it is CLEAN
 
 The first Tier-C pass (below) went through `pg_dump | psql`, which is COPY text on a pass-through path. PlanetScale's ["lifecycle of a sharded Postgres query"](https://planetscale.com/blog/the-lifecycle-of-a-sharded-postgres-query) says the router is a real execution engine — hash joins, `AVG` rewritten to `SUM`/`COUNT`, spill-to-disk — and that copying encoded bytes straight through is an *optimisation*, i.e. one of two paths. Under this project's own family-dispatch rule that made the first pass a pinned representative standing in for an untested sibling: the Bug 74 shape exactly.
@@ -375,7 +420,7 @@ sluice already paid for these in MySQL-land. They map almost one-for-one and eac
 | # | Hazard | Vitess precedent |
 |---|---|---|
 | D-1 | Reshard mid-stream | v0.131.4: sync had to survive the transient primary-routable window, and the reshard-follow reopen was REPLICA-defaulting — wrong across a reshard |
-| D-2 | MoveTables mid-stream | The filtered move-OUT gate exists because a filtered-sync Critical shipped. Neki's MoveTables is the analogue and needs the same end-to-end gate before anything ships |
+| D-2 | MoveTables mid-stream | **MEASURED, PASSES** (2026-09-10, byte-identical over 2,000 rows across create → switch-reads → switch-writes → reverse). Create and the read switch are transparent; the write switch blocks the table on the source database and the stream halts loudly with the position stopped before the block. Now coded as `SLUICE-E-TARGET-TABLE-BLOCKED-BY-WORKFLOW`. See the D-2 section above |
 | D-3 | Planned switchover / unplanned failover | The Admin service does both. What does an in-flight sluice copy or CDC stream see? |
 | D-4 | Online schema change (shadow table) | Does a shadow-table build appear to sluice's schema reader as a real table? A stray shadow copied to the target would be silent garbage |
 | D-5 | Router restart / topology change | "components pick up topology changes without restarting" — but what does an open connection see? |

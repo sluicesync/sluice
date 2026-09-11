@@ -543,6 +543,25 @@ const (
 	// silently, with the stream still reporting healthy.
 	CodeTargetShardKeyUpdateUnsupported Code = "SLUICE-E-TARGET-SHARD-KEY-UPDATE-UNSUPPORTED"
 
+	// CodeTargetTableBlockedByWorkflow fires when a PlanetScale Neki
+	// workflow holds a block on a table sluice is reading or writing
+	// (SQLSTATE NK213). A MoveTables write cutover does not redirect a
+	// connection that named the OLD database — Postgres clients choose
+	// their database at connect time — so it blocks the table there
+	// instead, on every shard primary, and every statement against it is
+	// refused until the move completes or is reversed.
+	//
+	// Terminal rather than retriable: the block carries a one-year expiry
+	// and clears only on an operator action, and the resolution (repoint
+	// the stream at the new database, or reverse the cutover) changes
+	// where the data lives, which is not sluice's decision to make.
+	//
+	// Nothing is lost when it fires. Measured on a live 3-shard cluster
+	// (2026-09-10): the persisted CDC position last advanced before the
+	// block, and reversing the workflow then restarting the stream
+	// replayed the gap to exact parity.
+	CodeTargetTableBlockedByWorkflow Code = "SLUICE-E-TARGET-TABLE-BLOCKED-BY-WORKFLOW"
+
 	// CodeTargetDeferrableKey fires when a target table's only usable
 	// upsert key is a DEFERRABLE unique constraint. Postgres refuses a
 	// non-immediate index as an `ON CONFLICT` arbiter (SQLSTATE 55000),
@@ -863,6 +882,7 @@ var registry = map[Code]Info{
 	CodeMigrateProgressUnrecordable:     {ClassRefusal, "refused before the table's first row moved: the migrate-state store could not record that this table is being copied, and a later --resume would read the missing progress row as \"never copied\" — appending a second copy of every row for a table with no primary key rather than resuming"},
 	CodeTargetShardKeyUpdateUnsupported: {ClassRefusal, "refused mid-stream: a change would alter the target row’s SHARD-KEY value, moving it to a different shard, which a sharded target cannot express — applying the other columns and leaving the routing column behind would diverge silently"},
 	CodeTargetShardKeyNotInUpsertKey:    {ClassRefusal, "refused before anything was written: a sharded target table’s ROUTING columns are not contained in the key sluice’s idempotent write conflicts on, so a row whose shard key changed would be INSERTED alongside the original instead of updating it — two rows claiming one primary key, at exit 0, with no error at any point"},
+	CodeTargetTableBlockedByWorkflow:    {ClassRefusal, "halted: a PlanetScale Neki workflow holds a block on this table in the database sluice is connected to (SQLSTATE NK213) — a MoveTables write cutover blocks the table on the OLD database rather than redirecting connections that named it, so every statement against it is refused until the move completes or is reversed; nothing is lost, the persisted position stops before the block"},
 	CodeResumeFreshTableNotEmpty:        {ClassRefusal, "refused on --resume: a table with no persisted progress would be started from scratch WITHOUT truncating, but the target already holds rows — either an earlier attempt copied it and could not persist its progress row, or the target was already populated"},
 
 	CodePSForeignKeysNotEnabled: {ClassRefusal, "migrate/sync cold-start refused before the copy: the PlanetScale target has foreign-key support disabled (allow_foreign_key_constraints off, read back as foreign_keys_enabled=false) while the source schema declares foreign keys the run would add after the copy — the platform rejects ADD FOREIGN KEY outright, so the run would fail at the constraints phase after the whole copy and --resume re-hits it; enable foreign key support on the target database, or re-run with --skip-foreign-keys (each FK's referencing columns stay indexed, so the constraints can be added out-of-band)"},
