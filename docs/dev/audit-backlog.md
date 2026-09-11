@@ -15,6 +15,28 @@ Both are the doc-lags-code shape the working agreements name. A note *about* bac
 
 **Staleness caveat (2026-08-18 triage).** A ground-truth pass over the un-struck entries found the "open" section is itself doc-lags-code: EVERY high-value candidate filed before ~2026-08-13 that was checked had already been fixed in code and never struck here (B-2c, D-1/2/3, Bug 239, the Bug 244 restore sibling, C1-1's SQLite/D1 lane — all now struck above with their code proof). Reassuringly, that pass found **zero still-open silent-loss items**. But the lesson is the project's own rule turned on this file: **before executing any un-struck entry older than 2026-08-13, ground-truth it against the code — the backlog text is not reliable for pre-08-13 entries.** The genuinely-open work concentrates in the freshest (2026-08-17 Tier-3) section plus the design-gated / needs-infra items.
 
+## 2026-09-11 — MySQL 8.4 is untested everywhere, and the code already carries premises measured on it (operator-raised)
+
+The operator asked whether the version matrices cover PG 18/19, MariaDB 12 and MySQL 8.4. Ground-truthed rather than recalled:
+
+| engine | covered | where |
+| --- | --- | --- |
+| PostgreSQL 17, 18, 19beta1, latest | ✅ | `scripts/pg-versions.txt` → `pg-version-matrix.yml` |
+| MariaDB 10.11, 11.4, 11.8, **12.3** | ✅ | `ci.yml:418-419` |
+| Vitess | ✅ | `scripts/vitess-versions.txt` → `vitess-version-matrix.yml` |
+| **MySQL** | ❌ **8.0 only** | pinned `mysql:8.0` in `ci.yml` / `build-prebaked-images.yml`; **no MySQL version matrix exists at all**, unlike PG and Vitess |
+
+**The sharp form of the gap is not "a version is missing".** It is that the tree already carries behavioural claims *measured on 8.4*, with nothing running against 8.4 to hold them:
+
+- `internal/engines/mysql/binary_default_recovery.go:57` — the two `SHOW CREATE TABLE` default-rendering forms are "empirically enumerated on MySQL 8.0.46 **and 8.4.10**". That enumeration is a premise for the binary-default recovery path; if 8.4 ever renders a third form, only an 8.4 run would notice.
+- `internal/engines/mysql/buffer_pool_tier_cap.go:131` — records real PlanetScale servers as **`8.4.6-Vitess`** and `8.4.9-Vitess`.
+
+That second one is the part that matters commercially: **PlanetScale MySQL is on the 8.4 line, and our matrix tops out at 8.0.** The engine we tell users to migrate onto is a major-version step away from the one CI exercises. MySQL 8.4 is also the current LTS, so this is where new deployments land.
+
+**Proposed:** a `scripts/mysql-versions.txt` + `mysql-version-matrix.yml` mirroring the PG pair exactly — same generator shape, same canary handling for pre-GA tags, same `report-red.yml` consumer. Start at `mysql:8.0` and `mysql:8.4`; the PG matrix's `latest` canary leg is the model for catching 9.x early. This is mechanical work with an existing template, not a design question.
+
+**Adjacent, smaller:** the per-release regression cycle's own containers lag CI. The v0.151.0 cycle used PG 16.15 / 17.11 and MySQL 8.0.43 — no PG 18 — while PlanetScale Postgres is 18.6. CI covers 18; the cycle does not, so a release's hands-on validation runs against older servers than the automated matrix. Worth aligning `sluice-testing`'s container pins to the CI matrix, or at least adding the version the managed platform actually runs.
+
 ## 2026-09-10 — pre-tag value-fidelity review of v0.149.0 (the Tier-2 trigger; ran BEFORE the tag this time)
 
 Six findings against the release's own new code — the resume, the serial recorder, the D1 second number. **The value paths themselves came back clean:** the reviewer re-derived the resume's gate order and tried to construct a copy-skip over an incomplete copy (cross-schema key collision, `--reset-target-data` killed mid-clear, a `complete` row with zero rows, a partially-deleted target, two concurrent runs, source DDL between stop and resume) and could not. What it found instead was a REFUSAL that the new path arms and never runs — the seventh consecutive release where this trigger has caught something before the tag.
