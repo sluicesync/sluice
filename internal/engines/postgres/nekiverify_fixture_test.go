@@ -46,6 +46,14 @@ import (
 // Two rows that route differently but collide on the constrained column are
 // the measurement; the constraint's existence is not.
 
+// Region and cluster size are named constants so the provisioning call and
+// the identity line logged for bug reports cannot drift apart -- a report
+// quoting the wrong tier is worse than one quoting none.
+const (
+	nekiRegion      = "us-east"
+	nekiClusterSize = "PS-10-AWS-ARM-NEKI"
+)
+
 // nekiFixture is a provisioned, sharded Neki database with its own teardown.
 type nekiFixture struct {
 	name   string
@@ -80,8 +88,8 @@ func provisionShardedNeki(ctx context.Context, t *testing.T, c psCreds) *nekiFix
 	if _, _, err := c.api(ctx, http.MethodPost, "/organizations/"+c.org+"/databases", map[string]any{
 		"name":         name,
 		"kind":         "neki",
-		"region":       "us-east",
-		"cluster_size": "PS-10-AWS-ARM-NEKI",
+		"region":       nekiRegion,
+		"cluster_size": nekiClusterSize,
 		// The HA shape, which is what the console offers and therefore what
 		// customers run. Single-node Neki is creatable through this API and
 		// refused by the console (neki-issues/NEKI-015) — a shape that works
@@ -119,20 +127,24 @@ func provisionShardedNeki(ctx context.Context, t *testing.T, c psCreds) *nekiFix
 	return fx
 }
 
-// waitBranchReady blocks until the branch reports ready, and logs the
-// BRANCH ID and a UTC timestamp when it does.
+// waitBranchReady blocks until the branch reports ready, and logs the FULL
+// IDENTITY of what the suite is talking to, stamped in UTC.
 //
-// Both are logged deliberately rather than incidentally. Anything surprising
-// this suite finds becomes a report shared with PlanetScale, and those are
-// the two fields that make one cross-referenceable against THEIR logs: the
-// branch id is the handle their systems index on (a database name is ours
-// and means little to them), and UTC timing is what lines up against a
-// server-side trace. Operator requirement, 2026-09-11 — see
-// neki-issues/README.md.
+// Anything surprising this suite finds becomes a report shared with
+// PlanetScale, and such a report has to be locatable in two different sets
+// of logs — theirs and ours. So all of it goes in, not one identifier
+// standing in for the rest: org, database name, branch name, branch ID,
+// cluster size, region, and (from the smoke test) the server version.
+//
+// The BRANCH ID is the one most easily forgotten and the one PlanetScale
+// most needs — their systems index on it, where a database name is ours and
+// means little to them. But it SUPPLEMENTS the names rather than replacing
+// them: a report carrying only the branch id is hard for us to place in our
+// own history. Operator requirement, 2026-09-11 — see neki-issues/README.md.
 //
 // Capturing it here rather than relying on whoever writes the report to
 // remember is the point: these databases are deleted at the end of every
-// run, so a branch id not captured while it existed cannot be recovered.
+// run, so anything not recorded while one existed cannot be recovered.
 func waitBranchReady(ctx context.Context, t *testing.T, c psCreds, db string) {
 	t.Helper()
 	deadline := time.Now().Add(20 * time.Minute)
@@ -140,11 +152,19 @@ func waitBranchReady(ctx context.Context, t *testing.T, c psCreds, db string) {
 		out, _, err := c.api(ctx, http.MethodGet, "/organizations/"+c.org+"/databases/"+db+"/branches/main", nil)
 		if err == nil {
 			if ready, _ := out["ready"].(bool); ready {
+				// The WHOLE identity tuple, not just the branch id. The id
+				// is what PlanetScale can cross-reference; the org, database
+				// and branch names are what WE can place in our own history;
+				// and cluster/region explain behaviour that differs by tier.
+				// A report carrying only one end matches only one set of
+				// logs.
 				branchID, _ := out["id"].(string)
-				t.Logf("nekiverify: branch READY at %s — database=%q branch_id=%q (quote both in any Neki finding: "+
-					"the branch id is what PlanetScale can cross-reference, and this database is deleted at the "+
-					"end of the run)",
-					time.Now().UTC().Format(time.RFC3339), db, branchID)
+				branchName, _ := out["name"].(string)
+				cluster, _ := out["cluster_name"].(string)
+				t.Logf("nekiverify: branch READY at %s UTC — org=%q database=%q branch=%q branch_id=%q cluster=%q "+
+					"region=%q. QUOTE ALL OF THESE in any Neki finding: this database is deleted when the run "+
+					"ends, so nothing here can be looked up afterward.",
+					time.Now().UTC().Format(time.RFC3339), c.org, db, branchName, branchID, cluster, nekiRegion)
 				return
 			}
 		}
