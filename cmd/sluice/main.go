@@ -102,7 +102,50 @@ func main() {
 	// CodedError exits 3, a ConfigError 2, everything else 1 (see
 	// docs/operator/error-codes.md for the taxonomy).
 	logCodedError(err)
-	ctx.FatalIfErrorf(err)
+	ctx.FatalIfErrorf(withHintForHumans(err))
+}
+
+// withHintForHumans appends a CodedError's remedy to the prose kong prints,
+// when the prose does not already carry it.
+//
+// # The defect this closes
+//
+// sluice had TWO hint mechanisms with OPPOSITE human visibility, and nothing
+// said so. [migcore.WrapWithHint] folds its hint into the error text, so it
+// reaches the operator's terminal. A [sluicecode.CodedError]'s Hint did not:
+// `CodedError.Error()` returns only the inner error, so the remedy appeared
+// ONLY in the structured slog record above — the dense machine-facing line.
+// An operator reading the last line of output, which is where anyone looks,
+// got the diagnosis with no fix.
+//
+// That is not theoretical: 15 of the 16 CodedError constructions in the tree
+// carry a Hint, and for several the Hint holds the ONLY statement of what to
+// do. Reported by an operator after a real migration — "the errors are pretty
+// dense and hard to parse" — which is what sent us looking.
+//
+// # Why here rather than in CodedError.Error()
+//
+// Putting it in Error() would push the hint into every wrap, every log line
+// and the structured record's own `err` attr, duplicating it wherever a coded
+// error is merely logged. The exit boundary is the one place the audience is
+// definitely a human at a terminal.
+//
+// The "already carries it" check keeps a WrapWithHint error — whose text ends
+// in its own `hint:` block — from growing a second one. An uncoded error is
+// returned untouched, so kong's behaviour is unchanged everywhere else.
+func withHintForHumans(err error) error {
+	if err == nil {
+		return nil
+	}
+	ce, ok := sluicecode.FromError(err)
+	if !ok || ce.Hint == "" {
+		return err
+	}
+	msg := err.Error()
+	if strings.Contains(msg, ce.Hint) {
+		return err
+	}
+	return fmt.Errorf("%w\nhint: %s", err, ce.Hint)
 }
 
 // recordRunningCommand records WHICH command the operator invoked, so a

@@ -66,15 +66,21 @@ func wrapDDLError(err error) error {
 	// "direct DDL is disabled" is the PlanetScale Safe Migrations
 	// refusal — the only 1105 shape this wrapper recognises today.
 	if mysqlErr.Number == 1105 && strings.Contains(mysqlErr.Message, "direct DDL is disabled") {
-		return fmt.Errorf("%w: %w | "+
-			"To bootstrap a sync stream against a Safe-Migrations-enabled target: "+
-			"(a) pre-create the source schema (and the `sluice_cdc_state` table) via a PlanetScale "+
-			"deploy request, then re-run with `--schema-already-applied` to skip sluice's "+
-			"schema-apply phase entirely; or "+
-			"(b) temporarily disable Safe Migrations on the target branch, run sluice to bootstrap "+
-			"the schema and the control table, then re-enable Safe Migrations once the stream "+
-			"is in CDC mode. "+
-			"See `sluice sync start --help` for `--schema-already-applied` details. GitHub issue #17",
+		return fmt.Errorf("%w: %w"+
+			"\nThe target branch has PlanetScale Safe Migrations enabled, which refuses direct DDL. "+
+			"Two ways forward:"+
+			"\n  (a) Pre-create the schema (and the `sluice_cdc_state` table) via a PlanetScale deploy "+
+			"request, then re-run with `--schema-already-applied` so sluice skips its schema-apply "+
+			"phase entirely. See `sluice sync start --help`."+
+			"\n  (b) Temporarily disable Safe Migrations on the target branch, run sluice to bootstrap "+
+			"the schema and the control table, then re-enable it once the stream is in CDC mode."+
+			"\nIf you take (b): DISABLING IS NOT INSTANT. The setting takes a short while to propagate, "+
+			"and a run started too soon hits this same refusal again from the in-between state. Wait "+
+			"until a direct DDL actually succeeds before re-running — an operator report describes "+
+			"losing a cycle to exactly this."+
+			"\nAnd if a previous attempt already created some of the schema, the next run is "+
+			"`--resume`, not a plain re-run: a plain re-run refuses on the objects that already "+
+			"exist. GitHub issue #17",
 			ErrSafeMigrationsBlocked, err)
 	}
 	return err
