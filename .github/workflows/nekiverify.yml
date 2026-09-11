@@ -57,18 +57,25 @@ on:
   # knob — drop to dispatch-only or lengthen the interval if the cost or
   # the noise proves unwelcome.
   #
-  # 17:20 UTC Monday, chosen so the result lands in a Pacific workday
-  # MORNING — a red that nobody sees until Tuesday is most of a week of
-  # not knowing. Two notes on the exact time:
+  # 17:20 UTC SUNDAY. Three constraints, in the order they mattered:
   #
+  #   * SUNDAY, not a weekday, because of the CHURN. Each test function
+  #     provisions and destroys its own Neki database, so a full run
+  #     creates and deletes several in quick succession. Doing that during
+  #     a working week muddies the org's database list exactly when
+  #     somebody may be reading it; Sunday is quiet (operator call,
+  #     2026-09-11).
+  #   * Still lands in a workday-adjacent window rather than overnight: a
+  #     red nobody sees for days is most of a week of not knowing, and
+  #     Sunday afternoon Pacific means Monday morning starts with the
+  #     answer already in hand.
   #   * GitHub cron is always UTC and does NOT follow daylight saving, so
-  #     this is ~10:20 Pacific in PDT and ~09:20 in PST. Both are working
-  #     hours; the hour of drift is deliberate rather than worth chasing.
-  #   * :20 rather than :00 because GitHub documents that scheduled runs
-  #     on the hour are the most contended and can be delayed — the top of
-  #     the hour is where everyone puts theirs.
+  #     this is ~10:20 Pacific in PDT and ~09:20 in PST. The hour of drift
+  #     is accepted rather than chased.
+  #   * :20 rather than :00 because GitHub documents that runs scheduled
+  #     on the hour are the most contended and can be delayed.
   schedule:
-    - cron: "20 17 * * 1"
+    - cron: "20 17 * * 0"
 
 # Reads repo contents only; the secrets are scoped at the job's env block.
 permissions:
