@@ -947,12 +947,31 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 	// value is intact: this is the same side of the copy, just after sluice
 	// knows whether it intends to emit DDL at all.
 	//
-	// On --resume the gate above does not run and createSchema is the full
-	// schema, so the probe runs — correct, because a resumed migrate's
-	// create phase is skipped on a different criterion (every in-scope table
-	// recorded complete) that is not yet known here, and a resumed run that
-	// DOES need DDL is exactly the case the operator report describes.
-	if len(createSchema.Tables) > 0 || len(createSchema.Views) > 0 {
+	// NOT ON --resume, and the reasoning above is what got this wrong the
+	// first time. An earlier version of this comment argued that probing on
+	// resume was "correct, because a resumed run that DOES need DDL is
+	// exactly the case the operator report describes". That is true of the
+	// intent and false of the mechanism: on resume the pre-create gate does
+	// not run, so createSchema is the WHOLE schema whatever the target
+	// already holds, and the probe fires unconditionally. A resumed migrate
+	// into a DDL-refusing target was therefore refused every single time,
+	// however completely the schema had been pre-created — and since the
+	// partial-migration refusal names `--resume` as the remedy, the operator
+	// was routed into a loop with no exit but deleting the state row or
+	// inventing a new --migration-id.
+	//
+	// Found by the v0.151.0 regression cycle (sluice-testing Bug 284) on a
+	// vttestserver booted with ENABLE_DIRECT_DDL=false. The feature exists to
+	// spare an operator exactly one wasted --resume cycle; it was creating a
+	// permanent one.
+	//
+	// A resumed run's DDL need is decided later and elsewhere, by
+	// [createTablesRedundantOnResume] reading recorded per-table progress —
+	// state this preflight cannot see from here. Rather than guess, it
+	// declines to answer: the create phase's own DDL still fails loudly a
+	// moment later if DDL really is needed, which is the pre-v0.151.0
+	// behaviour and no worse than it.
+	if !resuming && (len(createSchema.Tables) > 0 || len(createSchema.Views) > 0) {
 		if err := migcore.PreflightDirectDDL(ctx, rw, "migrate"); err != nil {
 			return markFailed(ctx, rc, state, ir.MigrationPhasePending, err)
 		}

@@ -135,13 +135,17 @@ func directDDLBlockedRefusal(err error) error {
 			"that disabling is NOT instant: the setting propagates asynchronously to the cluster, so the branch can "+
 			"read as disabled while DDL is still refused; re-run only once this preflight passes, which is what it "+
 			"is for; or (b) pre-create the schema via deploy requests (`sluice schema preview` prints the target "+
-			"DDL, `sluice deploy-ddl --ddl '<statement>'` ships each statement) and re-run. If an earlier attempt "+
-			"already created part of the schema, the next run is `--resume` (migrate) or a plain restart of the "+
-			"stream, NOT a fresh run — a fresh run refuses on the objects that already exist",
+			"DDL, `sluice deploy-ddl --ddl '<statement>'` ships each statement) and re-run. Because this refusal "+
+			"fires BEFORE the schema phase, no table of yours exists to resume onto — so re-run with a fresh "+
+			"`--migration-id` (or clear the recorded state) rather than with `--resume`. `--resume` is the right "+
+			"answer only when an earlier attempt got far enough to create part of the schema, which is a different "+
+			"refusal raised from the schema phase itself",
 		fmt.Errorf("%w: %w | "+
 			"refused BEFORE the schema phase: sluice probed the target with a throwaway CREATE TABLE and the "+
-			"branch refused it, so every DDL this run needs would be refused too. Caught here rather than partway "+
-			"through schema-apply, so nothing has been created and there is no half-built target to clean up",
+			"branch refused it, so every DDL this run needs would be refused too. No TABLE was created and no "+
+			"data moved — but this run did record its own migration-state row, so a plain re-run of the same "+
+			"--migration-id will be refused as a partial migration once the branch accepts DDL again. Re-run with "+
+			"a fresh --migration-id, or clear the recorded state, rather than reaching for --resume",
 			ErrSafeMigrationsBlocked, err),
 	)
 }
