@@ -44,8 +44,18 @@ import (
 // states what sluice can see, names the mechanism it cannot, and leaves
 // the judgement with the operator.
 //
-// A single-node cluster with no standby has nothing to fail over to and
-// needs none of this either — and that case is NOT detectable here.
+// A single-node cluster with no standby has no standby to be promoted, so
+// the classic failover case cannot arise — but "single-node therefore
+// nothing to fix" is an UNVERIFIED PREMISE and is deliberately not claimed.
+// A cluster RESIZE plausibly replaces the node, which would have the same
+// effect on a primary-local slot as a failover, and that is untested: the
+// PlanetScale API refuses a Postgres branch resize outright (`Resize is not
+// supported`, confirmed slot-independent by a zero-slot control on
+// 2026-09-10), so it could not be measured from here. The message
+// therefore offers single-node as a reason the warning MAY not apply,
+// never as a guarantee.
+//
+// Either way the case is NOT detectable here.
 // `pg_stat_replication` shows non-privileged roles only their own rows, so
 // an empty result is equally consistent with "no standby" and "a standby
 // this role cannot see"; suppressing on it would silence the advisory on
@@ -124,8 +134,10 @@ func preflightSlotFailover(ctx context.Context, handle any, sourceCaps ir.Capabi
 		slog.Bool("hot_standby_feedback", posture.HotStandbyFeedback),
 		slog.String("to_fix", "enable BOTH sync_replication_slots and hot_standby_feedback on the source cluster "+
 			"(on PlanetScale Postgres: Cluster configuration > Parameters)"),
-		slog.String("already_covered_if", "(a) this is a SINGLE-NODE instance with no standby — there is nothing to "+
-			"fail over to, and nothing to fix; or (b) your cluster preserves slots by Patroni permanent slots "+
+		slog.String("already_covered_if", "(a) this is a SINGLE-NODE instance with no standby — no standby can be "+
+			"promoted, though note a cluster RESIZE may still replace the node, which would strand the slot the "+
+			"same way (untested, so treat single-node as probably-fine rather than certainly-fine); or "+
+			"(b) your cluster preserves slots by Patroni permanent slots "+
 			"instead — the \"Logical slot name\" field on PlanetScale Postgres. sluice can see neither from SQL "+
 			"(pg_stat_replication hides other roles' rows, so an empty one does not prove there is no standby), so "+
 			"this warning does not mean you are unprotected; it means sluice cannot confirm that you are"),
