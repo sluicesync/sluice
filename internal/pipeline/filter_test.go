@@ -4,7 +4,6 @@
 package pipeline
 
 import (
-	"bytes"
 	"context"
 	"log/slog"
 	"strings"
@@ -247,7 +246,7 @@ func TestFilterChangesEmptyFilterPassthrough(t *testing.T) {
 func TestFilterChangesDebugLogOnly(t *testing.T) {
 	prev := slog.Default()
 	t.Cleanup(func() { slog.SetDefault(prev) })
-	var buf bytes.Buffer
+	var buf syncBuffer
 	// Set the handler to Info: a debug-level message should NOT
 	// appear in the buffer.
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))

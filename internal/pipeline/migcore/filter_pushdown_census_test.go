@@ -4,7 +4,6 @@
 package migcore
 
 import (
-	"bytes"
 	"context"
 	"log/slog"
 	"strings"
@@ -80,7 +79,7 @@ func TestUnmatchedCensus_SurvivesTheScopePushDown(t *testing.T) {
 		}
 		schema := r.readSchema()
 
-		var buf bytes.Buffer
+		var buf safeBuffer
 		prev := slog.Default()
 		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 		defer slog.SetDefault(prev)
@@ -251,7 +250,7 @@ func TestFanOutReportsOnceAgainstTheWholeUniverse(t *testing.T) {
 	}
 
 	capture := func(fn func()) string {
-		var buf bytes.Buffer
+		var buf safeBuffer
 		prev := slog.Default()
 		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 		defer slog.SetDefault(prev)

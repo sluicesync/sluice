@@ -43,6 +43,17 @@ func (s *safeBuffer) Len() int {
 	return s.buf.Len()
 }
 
+// WriteString exists because a test appends its own marker into the same
+// buffer the slog handler writes to. Going through the lock matters as much
+// here as on the handler's path: the point of this type is that there is ONE
+// serialized writer to the underlying buffer, and a test-side append that
+// bypassed the mutex would reintroduce exactly the race the type removes.
+func (s *safeBuffer) WriteString(str string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.WriteString(str)
+}
+
 // captureSlog redirects the default slog logger to a mutex-guarded buffer
 // for the duration of the test, restoring it on cleanup. Returns the
 // buffer so a test can assert on emitted log lines.

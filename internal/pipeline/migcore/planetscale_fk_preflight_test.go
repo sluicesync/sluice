@@ -4,7 +4,6 @@
 package migcore
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"log/slog"
@@ -34,7 +33,7 @@ func (f *fakeFKChecker) ForeignKeyStatus(context.Context) (ir.PlanetScaleForeign
 // process default), so the tests using it do not call t.Parallel.
 func captureLogs(t *testing.T, fn func()) string {
 	t.Helper()
-	var buf bytes.Buffer
+	var buf safeBuffer
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	defer slog.SetDefault(prev)

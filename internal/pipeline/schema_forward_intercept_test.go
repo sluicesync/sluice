@@ -4,7 +4,6 @@
 package pipeline
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"log/slog"
@@ -917,7 +916,7 @@ func TestRefuseComputedDefaults_WarnsWhenProjectionDroppedTheDefault(t *testing.
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			var buf bytes.Buffer
+			var buf syncBuffer
 			prev := slog.Default()
 			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 			defer slog.SetDefault(prev)

@@ -4,7 +4,6 @@
 package pipeline
 
 import (
-	"bytes"
 	"context"
 	"log/slog"
 	"strings"
@@ -76,7 +75,7 @@ func benignSchema() *ir.Schema {
 // captured buffer's current contents.
 func captureWarnLogs(t *testing.T) func() string {
 	t.Helper()
-	var buf bytes.Buffer
+	var buf syncBuffer
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 	t.Cleanup(func() { slog.SetDefault(prev) })

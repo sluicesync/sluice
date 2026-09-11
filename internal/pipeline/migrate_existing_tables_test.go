@@ -12,7 +12,6 @@
 package pipeline
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"log/slog"
@@ -25,9 +24,15 @@ import (
 
 // captureLogs routes slog.Default() into a buffer for the test's
 // duration — the package-documented pattern for asserting log output.
-func captureLogs(t *testing.T) *bytes.Buffer {
+//
+// The buffer is a syncBuffer, not a bare bytes.Buffer, and that is
+// load-bearing rather than defensive: slog.SetDefault is GLOBAL, so any
+// goroutine anywhere in this test binary — including one a parallel test
+// started and has not joined — writes through this handler while the calling
+// test reads it. See syncBuffer's own doc comment in heartbeat_test.go.
+func captureLogs(t *testing.T) *syncBuffer {
 	t.Helper()
-	buf := &bytes.Buffer{}
+	buf := &syncBuffer{}
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	t.Cleanup(func() { slog.SetDefault(prev) })

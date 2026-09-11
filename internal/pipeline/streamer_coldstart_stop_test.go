@@ -91,7 +91,7 @@ func TestAbandonUnlessStopped(t *testing.T) {
 		// Preserving silently would trade a recoverable re-copy for an
 		// unrecoverable outage: a kept slot pins WAL and can fill a busy
 		// source's disk. The warning is half the fix, so it is pinned.
-		var buf bytes.Buffer
+		var buf syncBuffer
 		prev := slog.Default()
 		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 		defer slog.SetDefault(prev)
@@ -128,7 +128,7 @@ func TestAbandonUnlessStopped(t *testing.T) {
 	})
 
 	t.Run("the WARN still names a slot when none was configured", func(t *testing.T) {
-		var buf bytes.Buffer
+		var buf syncBuffer
 		prev := slog.Default()
 		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 		defer slog.SetDefault(prev)
@@ -285,7 +285,7 @@ func TestStoppedSlotAdviceNamesTheRealSlot(t *testing.T) {
 	// Not parallel at any level: every cell swaps the global slog default.
 
 	capture := func(slotName string) string {
-		var buf bytes.Buffer
+		var buf syncBuffer
 		prev := slog.Default()
 		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 		defer slog.SetDefault(prev)

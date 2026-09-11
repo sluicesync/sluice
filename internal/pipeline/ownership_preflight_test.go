@@ -4,7 +4,6 @@
 package pipeline
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"log/slog"
@@ -45,7 +44,7 @@ func (f fakeRoleReporter) CurrentRole(_ context.Context) (string, error) {
 // and returns everything it logged.
 func captureWarn(t *testing.T, fn func()) string {
 	t.Helper()
-	var buf bytes.Buffer
+	var buf syncBuffer
 	old := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	defer slog.SetDefault(old)

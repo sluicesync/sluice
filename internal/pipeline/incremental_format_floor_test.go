@@ -4,7 +4,6 @@
 package pipeline
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"log/slog"
@@ -135,7 +134,7 @@ func runIncrementalCapturingWarnings(t *testing.T, parentVersion int, vstreamSha
 		clockNow:      func() time.Time { return now },
 	}
 
-	var buf bytes.Buffer
+	var buf syncBuffer
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 	runErr := b.Run(context.Background())

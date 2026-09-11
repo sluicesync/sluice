@@ -4,7 +4,6 @@
 package migcore
 
 import (
-	"bytes"
 	"context"
 	"log/slog"
 	"strings"
@@ -37,7 +36,7 @@ func TestApplyTableFilter_EmitsTheUnmatchedMarker(t *testing.T) {
 
 	capture := func(t *testing.T, patterns []string, include bool) string {
 		t.Helper()
-		var buf bytes.Buffer
+		var buf safeBuffer
 		prev := slog.Default()
 		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 		defer slog.SetDefault(prev)
