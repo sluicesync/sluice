@@ -918,6 +918,23 @@ func (s *Streamer) coldStartGatePreflight(ctx context.Context, schema *ir.Schema
 		return nil, err
 	}
 
+	// The direct-DDL probe, under the same parity agreement as the two
+	// above — and it matters more here than on migrate, because a cold
+	// start that walls on safe migrations has a replication slot open. The
+	// abandon below is what keeps the refusal clean.
+	//
+	// Skipped when the operator has promised the schema is already applied:
+	// that run performs no DDL of its own, so a branch refusing DDL is not
+	// an obstacle to it and refusing would break a working configuration.
+	if !s.SchemaAlreadyApplied {
+		if err := migcore.PreflightDirectDDL(ctx, rw, "sync cold-start"); err != nil {
+			migcore.CloseIf(rw)
+			migcore.CloseIf(sw)
+			_ = stream.Abandon()
+			return nil, err
+		}
+	}
+
 	var createSchema *ir.Schema
 
 	switch {
