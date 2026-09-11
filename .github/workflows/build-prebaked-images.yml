@@ -6,7 +6,8 @@
 # tags (scripts/vitess-versions.txt) to ghcr.io/sluicesync/sluice-vitess for
 # the gated multi-version cluster matrix (vitess-version-matrix.yml), plus
 # MIRROR the stock docker.io images CI pre-pulls (postgres:16 + the
-# scripts/pg-versions.txt majors, mysql:8.0, mariadb:{11.4,10.11}, vitess/vttestserver:mysql80)
+# scripts/pg-versions.txt majors, mysql:8.0 + the scripts/mysql-versions.txt
+# releases, mariadb:{11.4,10.11}, vitess/vttestserver:mysql80)
 # to ghcr.io/sluicesync/sluice-mirror-<name>:<tag> as pure retags (task
 # #36 — removes docker.io from CI's critical path; consumers pull via
 # scripts/ci-mirror-pull.sh with a docker.io fallback). The
@@ -52,11 +53,13 @@ on:
     paths:
       - "scripts/build-prebaked-images.sh"
       # ci-mirror-pull.sh owns the mirror naming rule the bake consumes
-      # via --print-ref; pg-versions.txt drives the postgres mirror list.
+      # via --print-ref; pg-versions.txt and mysql-versions.txt drive the
+      # postgres and mysql mirror lists.
       # A change to either must republish the mirrors promptly (e.g. a
       # new PG major) rather than waiting for the Sunday cron.
       - "scripts/ci-mirror-pull.sh"
       - "scripts/pg-versions.txt"
+      - "scripts/mysql-versions.txt"
       - ".github/workflows/build-prebaked-images.yml"
   # Also run on PRs that touch the bake script or this workflow so
   # the bake logic is exercised end-to-end before merge. Without this
@@ -75,6 +78,7 @@ on:
       - "scripts/build-prebaked-images.sh"
       - "scripts/ci-mirror-pull.sh"
       - "scripts/pg-versions.txt"
+      - "scripts/mysql-versions.txt"
       - ".github/workflows/build-prebaked-images.yml"
 
 # Default-deny at the workflow level; the GHCR write scope is granted

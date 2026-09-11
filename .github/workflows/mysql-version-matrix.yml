@@ -1,0 +1,203 @@
+# Multi-version MySQL engine matrix.
+#
+# Runs the full engines/mysql integration suite (with -race) against a
+# sweep of MySQL server versions by pointing the shared-container
+# harness's SLUICE_TEST_MYSQL_IMAGE override (see
+# internal/engines/mysql/shared_container_integration_test.go) at each
+# stock mysql image in turn. Binlog semantics, sql_mode defaults, the
+# information_schema column-default representation, and the error codes a
+# refusal keys on are exactly the surfaces that drift between MySQL
+# releases — this matrix catches that drift on a schedule instead of
+# letting a user find it.
+#
+# WHY IT EXISTS (audit-backlog 2026-09-11). Postgres has had a version
+# matrix since task #32 and MariaDB is swept in-band by the required
+# engines-mysql shard (10.11 / 11.4 / 11.8 / 12.3), but MySQL itself was
+# pinned at 8.0 with no sweep at all — while sluice's own code carries
+# claims measured on 8.4 servers (binary_default_recovery.go's default
+# enumeration names "MySQL 8.0.46 and 8.4.10"; buffer_pool_tier_cap.go
+# records 8.4.6-Vitess and 8.4.9-Vitess read off real PlanetScale
+# servers). MySQL 8.4 is the current LTS. A claim about a server version
+# that nothing boots is the unverified-premise shape this repo keeps
+# paying for.
+#
+# Why weekly, not per-PR: per-PR CI runs this suite on the pre-baked
+# MySQL 8.0 image (fast, cached, the supported-floor version) — adding
+# more full -race integration legs to every PR would multiply the
+# engines-mysql shard's CI cost for drift that moves on a release-cycle
+# timescale, not a per-commit one. This is NOT a required status check and
+# never blocks a merge.
+#
+# Versions come from scripts/mysql-versions.txt (the single source of
+# truth). These are STOCK images, not the pre-baked one — the sweep wants
+# upstream bytes, including each image's real first-boot initialise path
+# (the shared harness's retry + wait strategy handles both boot shapes;
+# see the bootSharedMySQLOnce comment). The pulls go through
+# scripts/ci-mirror-pull.sh, which fetches the byte-identical GHCR mirror
+# (ghcr.io/sluicesync/sluice-mirror-mysql:<tag> — a pure retag published
+# by build-prebaked-images.yml from the SAME mysql-versions.txt, so matrix
+# and mirrors cannot drift) and retags it locally back to the stock name;
+# docker.io stays as a ::warning fallback.
+#
+# WHAT THE OVERRIDE DOES NOT REACH, stated rather than implied: the boots
+# that pin an image on purpose. The lower_case_table_names folding pair
+# pins stock "mysql:8.0" (the pre-baked datadir is initialised at lct=0
+# and MySQL 8 refuses to boot it under 1), the backup-position helpers
+# name "mysql:8.0" to reach the file/pos cursor arm, and every mariadb:*
+# helper is a different flavor rather than a different version of this
+# one. Those legs therefore run at their pinned versions on EVERY matrix
+# leg — which is why this job pre-pulls them alongside the matrix image,
+# and why a green leg means "the non-pinned suite passes on this server",
+# not "every test in the package ran on this server".
+#
+# `mysql:latest` is the forward-compat CANARY (continue-on-error). On
+# MySQL that tag is the INNOVATION track: measured 2026-09-11 it resolves
+# to 26.7.0, years of server evolution ahead of the pinned lines, so it is
+# expected to break first and must not turn this non-required workflow
+# red. Pinned legs (8.4) failing ARE real regressions against a supported
+# release. Pre-release tags (beta / rc) are canaries for the same reason;
+# the rule in the setup step matches `latest`, `*beta*`, and `*rc*`.
+#
+# Operator decision point: when 8.4 has been green here for a while and
+# 8.0 ages out of support, bumping per-PR CI's default off 8.0 means
+# (1) bumping the base in
+# scripts/build-prebaked-images.sh / docs/dev/ci-images.md, (2) flipping
+# sharedMySQLDefaultImage in shared_container_integration_test.go, (3)
+# re-checking the two pinned-image call sites above, which name 8.0 for
+# reasons unrelated to it being the floor. This matrix's green history is
+# the evidence that makes that bump safe.
+#
+# Schedule: Saturday 11:00 UTC — after Saturday's 07:00 fuzz run and the
+# two 09:00 jobs (Postgres matrix, duckdb-verify), before Sunday's 06:00
+# prebake / 08:00 Vitess matrix / 10:00 extended suites / 17:20
+# nekiverify, so the weekend batch jobs stay serialized rather than
+# contending for runners.
+
+name: MySQL version matrix
+
+on:
+  schedule:
+    - cron: "0 11 * * 6"
+  workflow_dispatch:
+    inputs:
+      run:
+        description: "go test -run filter (default: the full engines/mysql suite)"
+        required: false
+        default: "."
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mysql-version-matrix-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # Build the job matrix from scripts/mysql-versions.txt so the version
+  # list lives in exactly one place. Emits [{version, image, canary}, ...]
+  # where image is the stock docker.io ref.
+  setup:
+    name: Resolve version matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: gen
+        run: |
+          entries=$(grep -vE '^[[:space:]]*#|^[[:space:]]*$' scripts/mysql-versions.txt | while read -r ref; do
+            tag="${ref##*:}"
+            # Canary (continue-on-error) legs: `latest` (the innovation
+            # track, currently 26.x) and any pre-release tag (betaN / rcN)
+            # — tracked here, but their own churn must not turn the
+            # non-required matrix red. Pinned releases (8.4) failing ARE
+            # real regressions. Keep this rule in sync with
+            # mysql-versions.txt's note.
+            canary=false
+            case "$tag" in
+              latest|*beta*|*rc*) canary=true ;;
+            esac
+            printf '{"version":"%s","image":"%s","canary":%s}\n' "$tag" "$ref" "$canary"
+          done | jq -s -c '.')
+          echo "resolved matrix: $entries"
+          echo "matrix=$entries" >> "$GITHUB_OUTPUT"
+
+  engine:
+    name: MySQL engine suite on mysql ${{ matrix.version }}
+    needs: setup
+    runs-on: ubuntu-latest
+    # packages: read lets the GITHUB_TOKEN pull the sluice-mirror-*
+    # images from GHCR. The workflow default is contents-only.
+    permissions:
+      contents: read
+      packages: read
+    # The canary legs are allowed to fail without failing the workflow.
+    # Pinned legs are fatal on failure.
+    continue-on-error: ${{ matrix.canary }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v6.5.0
+        with:
+          go-version-file: go.mod
+
+      # Pre-pull the matrix image plus every image this suite boots at a
+      # PINNED version regardless of the matrix leg — stock mysql:8.0 (the
+      # lct folding pair + the backup-position helpers) and the four
+      # MariaDB LTS lines the item-73 value-fidelity and CDC pins loop
+      # over. Same list the required engines-mysql shard pre-pulls in
+      # ci.yml, because under the override this job runs the same tests.
+      # GHCR_TOKEN authenticates the mirror pull (the job has
+      # packages: read); the docker.io fallback is anonymous.
+      - name: Pre-pull mysql/mariadb images via their GHCR mirrors (docker.io fallback)
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          bash scripts/ci-mirror-pull.sh "${{ matrix.image }}" \
+            mysql:8.0 \
+            mariadb:11.4 \
+            mariadb:10.11 \
+            mariadb:11.8 \
+            mariadb:12.3
+
+      # SLUICE_TEST_MYSQL_IMAGE routes the shared container + every
+      # non-version-pinned per-test boot in engines/mysql onto this leg's
+      # image. RYUK stays disabled (CI Option B): the ephemeral runner
+      # self-cleans and the reaper pull is its own flake source. The
+      # dispatch input reaches the script via env (shell-expanded), never
+      # interpolated into the `run:` text — the fuzz-roundtrip.yml
+      # env-indirection pattern.
+      - name: Run engines/mysql integration suite on ${{ matrix.image }}
+        env:
+          SLUICE_TEST_MYSQL_IMAGE: ${{ matrix.image }}
+          TESTCONTAINERS_RYUK_DISABLED: "true"
+          RUN_FILTER: ${{ github.event.inputs.run || '.' }}
+        run: |
+          set -o pipefail
+          go test -tags=integration -race -count=1 -timeout=35m \
+            -run "$RUN_FILTER" -v \
+            ./internal/engines/mysql/... 2>&1 | tee mysqlmatrix.out
+          # Non-vacuity guard for the dynamic-filter leg, same shape as
+          # pg-version-matrix.yml's. Exact counts are impossible
+          # (RUN_FILTER defaults to '.') and the suite has legitimate
+          # conditional skips, so a single `>= 1` PASS assert is the
+          # achievable guard: a zero-match filter or a total container-boot
+          # failure (every test skipped) yields zero PASS. A boot failure
+          # is the specific shape worth catching here — if the matrix image
+          # will not start under the harness's flag set, every test skips
+          # or fails fast and the leg must not read as green.
+          passed=$(grep -c '^--- PASS: Test' mysqlmatrix.out || true)
+          if [ "$passed" -lt 1 ]; then
+            echo "::error::mysql-matrix: -run '$RUN_FILTER' produced zero top-level PASS (no match, or every test skipped). See the run log."
+            exit 1
+          fi

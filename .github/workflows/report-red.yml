@@ -28,6 +28,7 @@ on:
       - "DuckDB parquet compat"
       - "Fuzz roundtrip"
       - "Postgres version matrix"
+      - "MySQL version matrix"
       - "Vitess version matrix"
       - "Neki Verify"
     types: [completed]

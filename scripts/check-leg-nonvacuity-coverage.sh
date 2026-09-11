@@ -26,10 +26,18 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# Scope, stated: the scheduled correctness workflows that run a
+# build-tagged `-run`-filtered integration leg, plus ci.yml. nekiverify.yml
+# is deliberately ABSENT — its leg is `-tags=nekiverify`, not `integration`,
+# so this detector would score it hasleg=0 and listing it would imply a
+# coverage it does not have; its vacuous-green guard is the fail-on-skip +
+# empty-output step in that workflow instead. duckdb-verify.yml runs no
+# filtered integration leg.
 FILES="
 .github/workflows/extended-suites.yml
 .github/workflows/vitess-version-matrix.yml
 .github/workflows/pg-version-matrix.yml
+.github/workflows/mysql-version-matrix.yml
 .github/workflows/fuzz-roundtrip.yml
 .github/workflows/ci.yml
 "

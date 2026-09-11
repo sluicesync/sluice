@@ -24,7 +24,7 @@ The operator asked whether the version matrices cover PG 18/19, MariaDB 12 and M
 | PostgreSQL 17, 18, 19beta1, latest | ✅ | `scripts/pg-versions.txt` → `pg-version-matrix.yml` |
 | MariaDB 10.11, 11.4, 11.8, **12.3** | ✅ | `ci.yml:418-419` |
 | Vitess | ✅ | `scripts/vitess-versions.txt` → `vitess-version-matrix.yml` |
-| **MySQL** | ❌ **8.0 only** | pinned `mysql:8.0` in `ci.yml` / `build-prebaked-images.yml`; **no MySQL version matrix exists at all**, unlike PG and Vitess |
+| **MySQL** | ❌ **8.0 only** *(as found — closed below the same day)* | was: pinned `mysql:8.0` in `ci.yml` / `build-prebaked-images.yml`, **no MySQL version matrix at all**, unlike PG and Vitess. Now `scripts/mysql-versions.txt` → `mysql-version-matrix.yml` (8.4 pinned, `latest` canary; 8.0 stays the per-PR floor) |
 
 **The sharp form of the gap is not "a version is missing".** It is that the tree already carries behavioural claims *measured on 8.4*, with nothing running against 8.4 to hold them:
 
@@ -33,7 +33,13 @@ The operator asked whether the version matrices cover PG 18/19, MariaDB 12 and M
 
 That second one is the part that matters commercially: **PlanetScale MySQL is on the 8.4 line, and our matrix tops out at 8.0.** The engine we tell users to migrate onto is a major-version step away from the one CI exercises. MySQL 8.4 is also the current LTS, so this is where new deployments land.
 
-**Proposed:** a `scripts/mysql-versions.txt` + `mysql-version-matrix.yml` mirroring the PG pair exactly — same generator shape, same canary handling for pre-GA tags, same `report-red.yml` consumer. Start at `mysql:8.0` and `mysql:8.4`; the PG matrix's `latest` canary leg is the model for catching 9.x early. This is mechanical work with an existing template, not a design question.
+~~**Proposed:** a `scripts/mysql-versions.txt` + `mysql-version-matrix.yml` mirroring the PG pair exactly.~~ **BUILT 2026-09-11.** `scripts/mysql-versions.txt` → `.github/workflows/mysql-version-matrix.yml` (Saturday 11:00 UTC), consumed by `report-red.yml`, mirrors published by the same `mirrors` engine that publishes the Postgres ones. Three things differ from the proposal as written, each deliberate:
+
+- **The engines/mysql harness had no image override to point.** Postgres has had `SLUICE_TEST_PG_IMAGE` since task #32; `sharedMySQLImage` was a `const`. The matrix is built on a new `SLUICE_TEST_MYSQL_IMAGE`, spelled to match. **Proven in both directions on this machine rather than assumed:** with the env set, `TestOpenDB_RefusesMultiStatementEvenWhenDSNAsksForIt` booted `mysql:8.4` and passed; with it unset, the same test booted `ghcr.io/sluicesync/sluice-mysql:8.0-prebaked`.
+- **`mysql:8.0` is NOT a matrix leg**, contrary to "start at 8.0 and 8.4" above. Per-PR CI already runs the whole suite on the prebaked 8.0 image, which the weekly prebake rebuilds from upstream `mysql:8.0` — so the floor is swept on every PR and a matrix leg would be redundant. Same reasoning that keeps `postgres:16` out of `pg-versions.txt`. The stock `mysql:8.0` ref stays mirrored, because two test families pin it on purpose.
+- **The `latest` canary is further out than PG's.** `mysql:latest` is the innovation track: measured 2026-09-11 it is **26.7.0** under the calendar scheme that succeeded 9.x, not a near-term LTS. Both it and `mysql:8.4` boot the shared harness's flag set today — verified on real containers; `binlog_format` warns as deprecated on both and is still honoured — so the canary starts from a working baseline and its first red will mean something.
+
+**What a green leg does and does not say, written into the workflow because the override's reach is narrower than its name:** the pinned-image boots do not follow it, by design. The `lower_case_table_names` folding pair keeps stock `mysql:8.0` (the prebaked datadir is initialised at lct=0 and MySQL 8 refuses to boot it under 1), the backup-position helpers keep `mysql:8.0` to reach the file/pos cursor arm, and the `mariadb:*` helpers are a different flavor. So a green 8.4 leg means "the non-pinned suite passes on 8.4", not "every test in the package ran on 8.4".
 
 **Adjacent, smaller:** the per-release regression cycle's own containers lag CI. The v0.151.0 cycle used PG 16.15 / 17.11 and MySQL 8.0.43 — no PG 18 — while PlanetScale Postgres is 18.6. CI covers 18; the cycle does not, so a release's hands-on validation runs against older servers than the automated matrix. Worth aligning `sluice-testing`'s container pins to the CI matrix, or at least adding the version the managed platform actually runs.
 

@@ -149,6 +149,7 @@ VITESS_TARGET_REPO="${GHCR_NAMESPACE}/sluice-vitess"
 # (a retag needs the bytes locally); `docker push` layer-dedups
 # unchanged tags so the weekly cron is cheap on uneventful weeks.
 PG_VERSIONS_FILE="${PG_VERSIONS_FILE:-$(dirname "$0")/pg-versions.txt}"
+MYSQL_VERSIONS_FILE="${MYSQL_VERSIONS_FILE:-$(dirname "$0")/mysql-versions.txt}"
 CI_MIRROR_PULL="$(dirname "$0")/ci-mirror-pull.sh"
 
 # --- Helpers ----------------------------------------------------------
@@ -520,10 +521,17 @@ bake_vitess() {
 # weekly PG version matrix and the mirror set cannot drift. That includes
 # the postgres:latest canary — a pure retag keeps upstream bytes, so the
 # canary still tests upstream, at most one prebake-cron behind the roll.
+#
+# The MySQL list is derived the same way for the same reason: 8.0 is the
+# per-PR floor (and the version two test families pin ON PURPOSE, so it is
+# mirrored regardless of what the matrix sweeps), and the rest come from
+# mysql-versions.txt so the weekly MySQL version matrix and the mirror set
+# cannot drift either.
 mirror_stock_refs() {
     echo "postgres:16"
     grep -vE '^[[:space:]]*#|^[[:space:]]*$' "$PG_VERSIONS_FILE"
     echo "mysql:8.0"
+    grep -vE '^[[:space:]]*#|^[[:space:]]*$' "$MYSQL_VERSIONS_FILE"
     # MariaDB LTS lines the item-73 flavor suites boot (engines-mysql +
     # pipeline-rest-streamer required shards); mirrored so a docker.io blip
     # cannot cold-pull-flake those shards (audit 2026-07-17 D1).

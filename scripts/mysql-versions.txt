@@ -1,0 +1,50 @@
+# Single source of truth for the MySQL SERVER versions the multi-version
+# matrix sweeps. One docker.io ref per line; blank lines and lines starting
+# with '#' are ignored.
+#
+# Consumers (keep them all reading THIS file — do not hardcode the list
+# elsewhere):
+#   - .github/workflows/mysql-version-matrix.yml builds its job matrix from
+#     this file (stock images, pulled via their GHCR mirrors with a
+#     docker.io fallback — scripts/ci-mirror-pull.sh).
+#   - scripts/build-prebaked-images.sh's `mirrors` engine derives the mysql
+#     mirror list from this file (plus the per-PR floor 8.0), so adding a
+#     line here both adds the matrix leg and publishes its
+#     ghcr.io/sluicesync/sluice-mirror-mysql:<tag> mirror on the next
+#     prebake run (the file is in build-prebaked-images.yml's trigger
+#     paths, so the mirror publishes on merge, not just on the cron).
+#
+# Policy: per-PR CI runs the engines/mysql suite on the pre-baked MySQL 8.0
+# image (ghcr.io/sluicesync/sluice-mysql:8.0-prebaked — see
+# sharedMySQLDefaultImage in shared_container_integration_test.go), which
+# build-prebaked-images.yml rebakes weekly from upstream mysql:8.0, so 8.0
+# is deliberately NOT listed here: the floor is already swept on every PR.
+# `mysql:8.0` IS still mirrored by the prebake (the folding-server and
+# backup-position tests boot the stock ref on purpose) — the mirror list is
+# this file plus that floor, exactly as the postgres side works.
+#
+# Why this file exists at all (audit-backlog 2026-09-11): sluice's MySQL
+# code carries claims measured on 8.4 servers — binary_default_recovery.go
+# enumerates defaults "on MySQL 8.0.46 and 8.4.10", and
+# buffer_pool_tier_cap.go records 8.4.6-Vitess / 8.4.9-Vitess from real
+# PlanetScale servers — while CI booted nothing but 8.0. Postgres and
+# MariaDB both had a version sweep; MySQL, the flavor with the most
+# operator-facing surface, did not.
+#
+# `:latest` is the forward-compat CANARY (allowed to fail in the matrix).
+# On MySQL that is the INNOVATION track, not the next LTS: measured
+# 2026-09-11, `mysql:latest` resolves to 26.7.0 under the calendar-based
+# scheme that succeeded 9.x, so this leg is several years of server
+# evolution ahead of the pinned lines and is expected to be the first to
+# break. It boots the shared harness's flag set today (--log-bin,
+# --binlog-format=ROW, --binlog-row-image=FULL — verified on a real
+# container; binlog_format warns as deprecated on both 8.4 and 26.7 and is
+# still honoured). The day a flag is REMOVED rather than deprecated, this
+# leg goes red first and that is the signal, not a build failure.
+#
+# beta / rc tags are ALSO canaries, same rule as the postgres matrix. See
+# the canary-detection rule in mysql-version-matrix.yml's setup step.
+# Promote a canary to a pinned line once it is a supported release and has
+# been green here.
+mysql:8.4
+mysql:latest

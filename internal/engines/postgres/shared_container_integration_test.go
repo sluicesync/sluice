@@ -193,7 +193,7 @@ const (
 	// override is set.
 	//
 	// Task #68: this is the pre-baked image
-	// (ghcr.io/sluicesync/sluice-postgres:16-prebaked) — built nightly from
+	// (ghcr.io/sluicesync/sluice-postgres:16-prebaked) — rebaked weekly from
 	// upstream postgres:16 by
 	// .github/workflows/build-prebaked-images.yml. The pre-baked image
 	// already has the heavy first-boot initdb step (~40MB written)

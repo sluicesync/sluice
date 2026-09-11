@@ -154,7 +154,7 @@ const sharedMySQLBootAttempts = 5
 // shared TestMain boot and by per-test boots in this package.
 //
 // Task #68: this is the pre-baked image
-// (ghcr.io/sluicesync/sluice-mysql:8.0-prebaked) — built nightly from
+// (ghcr.io/sluicesync/sluice-mysql:8.0-prebaked) — rebaked weekly from
 // upstream mysql:8.0 by .github/workflows/build-prebaked-images.yml.
 // The pre-baked image already has the heavy first-boot init step
 // (mysqld --initialize-insecure writes 50-100MB of system tables)
@@ -183,7 +183,45 @@ const sharedMySQLBootAttempts = 5
 //
 // See docs/dev/ci-images.md for how the pre-baked images are built and
 // when to bump the base version (e.g. MySQL 8.0 → 8.4).
-const sharedMySQLImage = "ghcr.io/sluicesync/sluice-mysql:8.0-prebaked"
+const sharedMySQLDefaultImage = "ghcr.io/sluicesync/sluice-mysql:8.0-prebaked"
+
+// sharedMySQLImageEnv overrides sharedMySQLDefaultImage with an arbitrary
+// MySQL-family image reference (e.g. "mysql:8.4"). Set by the weekly
+// .github/workflows/mysql-version-matrix.yml sweep — and usable locally
+// to point the whole engines/mysql suite at a different server version.
+// Mirrors SLUICE_TEST_PG_IMAGE in the postgres package
+// (sharedPGImageEnv), deliberately down to the spelling, so the two
+// matrices read the same way.
+//
+// Reach, stated rather than implied: this override is read by the shared
+// TestMain boot and by every per-test boot that spells
+// sharedMySQLImage. It does NOT reach the boots that pin a version ON
+// PURPOSE, and that is the intent — a version sweep must not silently
+// re-point a test whose premise is a specific server build. Those are:
+// the lower_case_table_names folding pair in
+// cdc_binlog_db_filter_case_integration_test.go (pins upstream
+// "mysql:8.0" because the pre-baked datadir is initialised at
+// lower_case_table_names=0 and MySQL 8 refuses to boot it under 1); the
+// backup-position helpers, which name "mysql:8.0" directly because they
+// boot deliberately unusual server configurations (binary logging off
+// with GTID on, to reach the file/pos cursor arm); and every mariadb:*
+// helper, which is a different flavor, not a different version of this
+// one.
+const sharedMySQLImageEnv = "SLUICE_TEST_MYSQL_IMAGE"
+
+// sharedMySQLImage is the image reference the shared TestMain boot AND
+// the non-version-pinned per-test boots actually use. Resolved once at
+// process init: SLUICE_TEST_MYSQL_IMAGE when set (the multi-version
+// matrix or a local override, typically a STOCK mysql image),
+// sharedMySQLDefaultImage (pre-baked MySQL 8.0) otherwise.
+var sharedMySQLImage = resolveSharedMySQLImage()
+
+func resolveSharedMySQLImage() string {
+	if img := os.Getenv(sharedMySQLImageEnv); img != "" {
+		return img
+	}
+	return sharedMySQLDefaultImage
+}
 
 // sharedMySQLBootBackoff returns the sleep duration to apply between
 // a failed boot attempt and the next one. attempt is 1-indexed and

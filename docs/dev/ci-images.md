@@ -44,7 +44,7 @@ Naming scheme (owned by `scripts/ci-mirror-pull.sh`, which the bake script queri
 | stock ref | mirror |
 | --- | --- |
 | `postgres:16` (and each `scripts/pg-versions.txt` entry: 17, 18, latest) | `ghcr.io/sluicesync/sluice-mirror-postgres:<tag>` |
-| `mysql:8.0` | `ghcr.io/sluicesync/sluice-mirror-mysql:8.0` |
+| `mysql:8.0` (and each `scripts/mysql-versions.txt` entry: 8.4, latest) | `ghcr.io/sluicesync/sluice-mirror-mysql:<tag>` |
 | `vitess/vttestserver:mysql80` | `ghcr.io/sluicesync/sluice-mirror-vttestserver:mysql80` |
 
 (`ghcr.io/sluicesync/sluice-vitess:<tag>` — the `vitess/lite` mirror — predates this scheme; consumers pass it explicitly via `ci-mirror-pull.sh --mirror`.)
