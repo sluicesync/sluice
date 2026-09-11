@@ -132,6 +132,12 @@ func TestNekiverify_ShardedRefusalPremises(t *testing.T) {
 	// minutes of wall clock and a real bill. See nekiverify_ddl_sequence_test.go.
 	nekiDDLAndSequencePremises(ctx, t, db)
 
+	// And the remedies sluice's Neki refusals tell operators to run must
+	// still exist on the router — a hint that cannot run is read mid-incident.
+	t.Run("PREMISE: every __neki function sluice's remedies name still exists", func(t *testing.T) {
+		nekiRemedyFunctionsExist(ctx, t, db)
+	})
+
 	t.Run("PREMISE: the shard key may not be named in an UPDATE SET list", func(t *testing.T) {
 		// sluice's SLUICE-E-TARGET-SHARD-KEY-UPDATE-UNSUPPORTED refusal, and
 		// the dropUnchangedShardKeys machinery that avoids tripping it,
