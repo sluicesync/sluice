@@ -1,6 +1,10 @@
 # Neki integration coverage — design
 
-**Status:** designed, not built. The fast-follow the operator chose alongside the MoveTables work when v0.150.0 shipped.
+**Status: BUILT AND RUNNING (2026-09-11).** Tier 1 is green per-PR. Tier 2's fixture harness provisions a sharded Neki cluster from nothing and the three refusal-premise checks pass against it; `nekiverify.yml` runs weekly with the fail-on-skip belt and a `report-red.yml` consumer.
+
+**The standing `neki-test` and `neki-torture` databases were deleted the same day**, which is what this design was for: their fixture — shard groups, key ranges, topology document — existed only as ad-hoc SQL in a session scratchpad, so they could not be torn down without losing the ability to reproduce them. `provisionShardedNeki` is now that recipe, executable and proven. The local credential files `NEKI_SLUICESYNC.env` and `NEKI_TORTURE.env` are correspondingly dead and were renamed `.DELETED-2026-09-11`.
+
+Still open: the CDC-into-a-sharded-target arm, the NK213/MoveTables arm (now cheap — a stuck one-year block on a per-run database costs nothing), and the DDL-in-transaction / sequence-catalog-fallback arm.
 
 **The constraint that shapes everything here:** Neki is not open source. There is no image to boot in CI, so the testcontainers pattern every other engine uses is unavailable — and the operator flagged the consequence explicitly: *"the integration coverage is likely only going to be possible by using actual PlanetScale Neki databases … so there would be potential long-term costs to consider."* A design that quietly makes a live cluster a prerequisite for every PR would impose a recurring bill for the life of the project.
 
