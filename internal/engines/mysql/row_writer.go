@@ -109,6 +109,13 @@ type RowWriter struct {
 	// local_infile=OFF or the table carries a geometry column.
 	upsert upsertSpelling
 
+	// safeMigrationsPossible marks a flavor whose server can refuse direct
+	// DDL outright (Vitess's "direct DDL is disabled", surfaced by
+	// PlanetScale as Safe Migrations). Vanilla MySQL and MariaDB have no
+	// such mode, so [RowWriter.ProbeDirectDDL] is a no-op there rather than
+	// issuing a pointless CREATE+DROP against every target on every run.
+	safeMigrationsPossible bool
+
 	// tierCPUBoundTarget marks a hosted-PlanetScale-flavor target;
 	// the first batched bulk flush per writer emits the ADR-0150
 	// tier-CPU-ceiling operator hint (see [noteTierCPUBoundTarget]).

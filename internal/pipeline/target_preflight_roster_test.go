@@ -48,8 +48,17 @@ import (
 
 // targetPreflightReferenceFuncs is migrate's target-side preflight phase —
 // the roster's universe.
+// runSingleDatabase is listed alongside the preflight phase because a
+// target-side preflight does not always live in phasePreflightTarget:
+// PreflightDirectDDL has to run AFTER the ADR-0166 pre-create gate (a run
+// that needs no DDL must not be refused for being unable to do DDL), and
+// that gate is in runSingleDatabase. Anchoring the roster on one function
+// made moving a call out of it silently shrink the universe — the gate went
+// green the moment PreflightDirectDDL left phasePreflightTarget, which is
+// the "gate narrower than its name" shape this file exists to avoid.
 var targetPreflightReferenceFuncs = []string{
 	"(*Migrator).phasePreflightTarget",
+	"(*Migrator).runSingleDatabase",
 }
 
 // targetPreflightColdStartFuncs are the sync cold-start functions that hold

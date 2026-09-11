@@ -78,7 +78,12 @@ import (
 // Residue: if the CREATE succeeds and the DROP fails, one empty table named
 // below is left behind. That is logged, not swallowed, and the name says
 // what it is.
-const directDDLProbeTable = "_sluice_direct_ddl_probe"
+// Named with the sluice_ prefix every other control object uses, and
+// registered on appliershared.ControlTableNames(), so a residue table is
+// classified as sluice bookkeeping rather than enumerated as USER data by
+// every schema reader -- which would show it as drift in schema diff /
+// verify and copy it onward from a promoted ex-target.
+const directDDLProbeTable = "sluice_direct_ddl_probe"
 
 // ProbeDirectDDL issues a real DDL against the target and reports whether
 // it was accepted. A nil return means "accepted on this connection, now" —
@@ -89,6 +94,14 @@ const directDDLProbeTable = "_sluice_direct_ddl_probe"
 // a probe error, never as a verdict: a preflight that cannot RUN must not
 // be reported as a preflight that FAILED.
 func (w *RowWriter) ProbeDirectDDL(ctx context.Context) error {
+	// Vanilla MySQL and MariaDB have no mode that refuses direct DDL, so
+	// there is nothing for the probe to discover and no reason to issue a
+	// CREATE+DROP against every such target on every run. Scoped at the
+	// flavor rather than at the call site so the pipeline stays
+	// engine-neutral (the preflight only knows it holds a prober).
+	if !w.safeMigrationsPossible {
+		return nil
+	}
 	create := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (id INT NOT NULL PRIMARY KEY)",
 		quoteIdent(directDDLProbeTable))
 	if _, err := w.db.ExecContext(ctx, create); err != nil {

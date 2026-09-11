@@ -275,6 +275,9 @@ func (e Engine) OpenRowWriter(ctx context.Context, dsn string) (ir.RowWriter, er
 		// is tier-CPU-bound (self-hosted vitess runs on the operator's
 		// own hardware, so the PS-tier ceiling doesn't apply).
 		tierCPUBoundTarget: e.Flavor == FlavorPlanetScale,
+		// Only the Vitess-descended flavors can refuse direct DDL; see
+		// RowWriter.safeMigrationsPossible.
+		safeMigrationsPossible: e.Flavor == FlavorPlanetScale || e.Flavor == FlavorVitess,
 	}, nil
 }
 

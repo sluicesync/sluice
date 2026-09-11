@@ -923,6 +923,41 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 		}
 	}
 
+	// Direct-DDL preflight, placed HERE and not in phasePreflightTarget, and
+	// the placement is the whole correctness of it.
+	//
+	// The probe asks whether the target accepts DDL by issuing one, so that a
+	// safe-migrations branch refuses in ~200ms with nothing created rather
+	// than partway through schema-apply. But a run that needs NO DDL must not
+	// be refused for being unable to do DDL — and that run is a documented,
+	// supported flow: ADR-0166's pre-create path, where the operator ships
+	// the whole schema through deploy requests and `migrate` then skips every
+	// pre-created table. phasePlanExistingTables above is what discovers
+	// that, so the probe has to run after it, not in the target-preflight
+	// phase that runs ~70 lines earlier.
+	//
+	// Wired first in phasePreflightTarget and caught by the pre-tag
+	// docs-drift pass before v0.151.0 shipped: four doc homes promise that
+	// exact bootstrap works with no flag at all, and an unconditional probe
+	// refused it. The sync lane had the sibling guard from the start
+	// (`if !s.SchemaAlreadyApplied`) — recognising the class on one side and
+	// missing it on the other is the repo's own door-move shape.
+	//
+	// Still before any row moves and before schema-apply, so the fail-fast
+	// value is intact: this is the same side of the copy, just after sluice
+	// knows whether it intends to emit DDL at all.
+	//
+	// On --resume the gate above does not run and createSchema is the full
+	// schema, so the probe runs — correct, because a resumed migrate's
+	// create phase is skipped on a different criterion (every in-scope table
+	// recorded complete) that is not yet known here, and a resumed run that
+	// DOES need DDL is exactly the case the operator report describes.
+	if len(createSchema.Tables) > 0 || len(createSchema.Views) > 0 {
+		if err := migcore.PreflightDirectDDL(ctx, rw, "migrate"); err != nil {
+			return markFailed(ctx, rc, state, ir.MigrationPhasePending, err)
+		}
+	}
+
 	// Resolve the copy parallelism from the target's measured
 	// connection budget at the single chokepoint: budget preflight
 	// (item 4) → ADR-0077 index-build reservation → ADR-0076 table ×

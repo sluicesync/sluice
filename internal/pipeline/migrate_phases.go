@@ -465,18 +465,6 @@ func (m *Migrator) phasePreflightTarget(ctx context.Context, rc resumeContext, s
 		return markFailed(ctx, rc, state, ir.MigrationPhasePending, err)
 	}
 
-	// Direct-DDL preflight. Asks the target, by issuing one, whether DDL is
-	// being accepted at all — so a PlanetScale branch with safe migrations
-	// enabled refuses HERE, in ~200ms with nothing created, instead of
-	// partway through schema-apply with a half-built target that the next
-	// run then has to --resume past. An operator report is the whole reason
-	// it exists; see migcore.PreflightDirectDDL for why the check has to be
-	// behavioural rather than reading the API's safe_migrations flag, and
-	// why a PASS is deliberately silent.
-	if err := migcore.PreflightDirectDDL(ctx, rw, "migrate"); err != nil {
-		return markFailed(ctx, rc, state, ir.MigrationPhasePending, err)
-	}
-
 	// PlanetScale-Postgres ownership advisory (soak finding F10). Advisory-
 	// only (WARN, never a refusal): if the target connects as an ephemeral
 	// pscale_api_* role, every created table is owned by it — a recoverable

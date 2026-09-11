@@ -118,7 +118,7 @@ func main() {
 // An operator reading the last line of output, which is where anyone looks,
 // got the diagnosis with no fix.
 //
-// That is not theoretical: 15 of the 16 CodedError constructions in the tree
+// That is not theoretical: 242 of the tree's 243 coded construction sites
 // carry a Hint, and for several the Hint holds the ONLY statement of what to
 // do. Reported by an operator after a real migration — "the errors are pretty
 // dense and hard to parse" — which is what sent us looking.

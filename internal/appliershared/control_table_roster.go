@@ -61,6 +61,15 @@ func ControlTableNames() []string {
 		// this package's dependency surface at ir only.
 		"sluice_cdc_query_timeout_raise",
 
+		// The MySQL direct-DDL preflight's throwaway probe table
+		// (mysql/direct_ddl_probe.go — directDDLProbeTable). Created and
+		// dropped within one preflight, so it is normally absent; listed
+		// because the probe explicitly leaves it behind when the DROP
+		// fails, and an unlisted residue table is enumerated as USER data
+		// by every schema reader — it would read as drift in `schema diff`
+		// / `verify` and be copied onward from a promoted ex-target.
+		"sluice_direct_ddl_probe",
+
 		// internal/pipeline's source-side heartbeat table
 		// (DefaultSourceHeartbeatTableName). The name is the DEFAULT —
 		// an operator-renamed table (--source-heartbeat-table-name) is

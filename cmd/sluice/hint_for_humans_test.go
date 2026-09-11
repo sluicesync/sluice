@@ -23,7 +23,9 @@ import (
 // last line of output, where anyone actually looks, carried the diagnosis and
 // no fix.
 //
-// 15 of the 16 CodedError constructions in the tree carry a Hint, and for
+// 242 of the tree's 243 coded construction sites carry a Hint — 18 of 19
+// &sluicecode.CodedError{…} literals plus all 224 sluicecode.Wrap(code,
+// hint, err) call sites, none of which pass an empty hint — and for
 // several it holds the ONLY statement of what to do.
 func TestWithHintForHumans(t *testing.T) {
 	t.Parallel()

@@ -78,6 +78,15 @@ var (
 	// go quiet and the operator's conclusion would be that all is well —
 	// the same silence the refusal probers are pinned to prevent.
 	_ slotFailoverProber = (*postgres.SchemaReader)(nil)
+	// migcore.DirectDDLProber is declared AND asserted entirely inside
+	// migcore, so this file's gate cannot see it: scanPipelineSurfaces
+	// walks os.ReadDir(".") — the pipeline directory only. It is pinned
+	// here by hand because the consequence of a silent miss is the same as
+	// for the refusal probers above: rename ProbeDirectDDL on the engine
+	// and the assertion returns false, the preflight becomes a no-op, and
+	// a safe-migrations target is discovered partway through schema-apply
+	// again with nothing to show that a check stopped running.
+	_ migcore.DirectDDLProber = (*mysql.RowWriter)(nil)
 
 	// The session-GUC cast refusal's arming surface (audit 2026-08-31
 	// SL-2). Pinned rather than frozen because it guards a REFUSAL, same as
