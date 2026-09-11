@@ -48,10 +48,17 @@ func (s *safeBuffer) Len() int {
 // here as on the handler's path: the point of this type is that there is ONE
 // serialized writer to the underlying buffer, and a test-side append that
 // bypassed the mutex would reintroduce exactly the race the type removes.
-func (s *safeBuffer) WriteString(str string) (int, error) {
+//
+// It returns nothing on purpose. bytes.Buffer's WriteString returns
+// `(int, error)` that is documented never to fail, and errcheck carries a
+// default exclusion for it BY TYPE — which a wrapper does not inherit, so the
+// (int, error) shape would make every call site write `_, _ =` for a value
+// that cannot be anything else. Dropping the returns says the same thing
+// without the noise.
+func (s *safeBuffer) WriteString(str string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.buf.WriteString(str)
+	s.buf.WriteString(str)
 }
 
 // captureSlog redirects the default slog logger to a mutex-guarded buffer

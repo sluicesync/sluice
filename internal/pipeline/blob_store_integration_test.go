@@ -53,7 +53,32 @@ const (
 	minioRegion    = "us-east-1"
 )
 
-// startMinIO boots a minio/minio container with default credentials,
+// minioImage is the MinIO server these tests boot.
+//
+// QUAY, NOT DOCKER HUB, and pinned rather than :latest. MinIO stopped
+// publishing to Docker Hub: as of 2026-09-11 a pull of `minio/minio:latest`
+// fails with
+//
+//	pull access denied for minio/minio, repository does not exist
+//	or may require 'docker login'
+//
+// which is what turned the pipeline-rest-other shard red on `main` — four
+// tests failing at container start, with nothing in this repo having changed.
+// Verified both ways on a real daemon that day: the Docker Hub pull is denied
+// and the quay.io pull succeeds.
+//
+// The tag is PINNED because the previous reference was `:latest`, and a
+// floating tag is how an external registry's roll becomes an unexplained CI
+// failure on an unrelated PR — exactly the shape this line just cost us.
+// `quay.io/minio/minio:latest` resolved to this release on 2026-09-11.
+//
+// Not GHCR-mirrored like the postgres/mysql/mariadb images: those mirrors are
+// published by build-prebaked-images.sh from docker.io refs and this one is
+// not on docker.io at all. If quay proves flaky in CI, mirroring it is the
+// next move rather than going back to a floating tag.
+const minioImage = "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z"
+
+// startMinIO boots a MinIO container with default credentials,
 // creates a single bucket the test can write into, and returns the
 // endpoint URL + bucket name + cleanup callback.
 func startMinIO(t *testing.T) (endpoint, bucket string, cleanup func()) {
@@ -64,7 +89,7 @@ func startMinIO(t *testing.T) (endpoint, bucket string, cleanup func()) {
 	defer cancel()
 
 	req := testcontainers.ContainerRequest{
-		Image:        "minio/minio:latest",
+		Image:        minioImage,
 		ExposedPorts: []string{"9000/tcp"},
 		Env: map[string]string{
 			"MINIO_ROOT_USER":     minioAccessKey,
