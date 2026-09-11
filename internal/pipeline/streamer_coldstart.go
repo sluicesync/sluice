@@ -883,6 +883,41 @@ func (s *Streamer) coldStartGatePreflight(ctx context.Context, schema *ir.Schema
 		EnabledPGExtensions: s.EnabledPGExtensions,
 		Mode:                "sync cold-start",
 	}
+
+	// The two SHARDED-TARGET refusals, under the copy-phase parity agreement
+	// (CLAUDE.md: a refusal touching a shared pipeline phase applies to both
+	// `migrate` and `sync` cold-start unless a written reason says otherwise).
+	// They shipped in v0.150.0 wired ONLY into migrate's pre-copy block, and
+	// the post-release regression cycle caught what that costs: `migrate`
+	// refused a shard-key/upsert-key mismatch with the table not created,
+	// while `sync start` against the SAME target copied all 60 rows, reached
+	// CDC, and died on the first change — an INSERT was enough, so no
+	// workload survived the shape. Same defect, same target, one command
+	// paying for it after the copy instead of before (Bug 283).
+	//
+	// This is the door-reach shape, not a missing check: the refusal existed
+	// and was correct; it simply had one caller. Both are hoisted to the top
+	// of this function, ahead of every branch below, because the question is
+	// a property of the target's topology and does not depend on which
+	// cold-start branch runs. Held to BOTH entry points by
+	// TestTargetShardPreflightParityMigrateAndColdStart.
+	//
+	// Neither can fire on a target that is not a sharded PlanetScale Neki —
+	// the probe interfaces are unimplemented elsewhere and the preflights
+	// return nil — so every other engine pays one type assertion.
+	if err := migcore.PreflightShardPlacement(ctx, schema, rw); err != nil {
+		migcore.CloseIf(rw)
+		migcore.CloseIf(sw)
+		_ = stream.Abandon()
+		return nil, err
+	}
+	if err := migcore.PreflightShardKeyUpsert(ctx, schema, rw); err != nil {
+		migcore.CloseIf(rw)
+		migcore.CloseIf(sw)
+		_ = stream.Abandon()
+		return nil, err
+	}
+
 	var createSchema *ir.Schema
 
 	switch {
