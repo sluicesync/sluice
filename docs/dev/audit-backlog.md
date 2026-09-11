@@ -15,6 +15,18 @@ Both are the doc-lags-code shape the working agreements name. A note *about* bac
 
 **Staleness caveat (2026-08-18 triage).** A ground-truth pass over the un-struck entries found the "open" section is itself doc-lags-code: EVERY high-value candidate filed before ~2026-08-13 that was checked had already been fixed in code and never struck here (B-2c, D-1/2/3, Bug 239, the Bug 244 restore sibling, C1-1's SQLite/D1 lane — all now struck above with their code proof). Reassuringly, that pass found **zero still-open silent-loss items**. But the lesson is the project's own rule turned on this file: **before executing any un-struck entry older than 2026-08-13, ground-truth it against the code — the backlog text is not reliable for pre-08-13 entries.** The genuinely-open work concentrates in the freshest (2026-08-17 Tier-3) section plus the design-gated / needs-infra items.
 
+## 2026-09-11 — the whole S3-compatible claim rests on one container from one external registry
+
+**Not a defect; a coverage concentration worth knowing about, surfaced when it broke.** MinIO stopped publishing to Docker Hub and `internal/pipeline/blob_store_integration_test.go` went red at container start — four tests, no code change. Fixed by pinning `quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z` (verified both directions on a real daemon: docker.io denied, quay served).
+
+The part worth recording is what the outage exposed rather than the fix:
+
+- `--backup-endpoint`'s help (`cmd/sluice/backup.go:747`) names **MinIO, Cloudflare R2, Backblaze B2, Wasabi, Tigris and Archil** as supported. sluice has no provider-specific code — the surface is generic S3 plus `--backup-path-style` — so those names are a claim about a CLASS.
+- **One container is the entire mechanical evidence for that class.** `startMinIO` is booted by exactly four tests in one file, and nothing else in CI exercises an S3-compatible server (localstack is in the tree for KMS only). Every other named provider is untested by construction.
+- So this image is a GATE, not a convenience, and it lived on a floating `:latest` from a registry outside our control. That combination is how an external company's packaging decision became an unexplained red on an unrelated push.
+
+**Proposed, not built:** (a) mirror it to GHCR the way the postgres/mysql/mariadb stock images are — the existing `mirrors` engine derives from docker.io refs and this one is not on docker.io, so it needs a small generalisation to take an explicit source registry; (b) consider whether ONE S3 implementation is enough evidence for a six-provider claim, or whether the help text should say which one is actually exercised. (b) is the cheaper honesty fix and does not need infrastructure.
+
 ## 2026-09-11 — the Neki sequence fallback's "total and lossless" claim is false (found while building its coverage)
 
 **MEDIUM, narrow, silent in the worst arm.** `readSequencePositionFromCatalog` (`internal/engines/postgres/sequence_ddl.go`) is the Neki-only substitute for reading a sequence as a relation, which a Neki router refuses with NK013. Its doc asserted that `last_value NULL -> (start_value,false)` / `non-NULL -> (last_value,true)` is "total and lossless for this function's purpose". **Measured on real PostgreSQL 16 and 18.6, it is not:**
