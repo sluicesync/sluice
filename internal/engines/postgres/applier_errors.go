@@ -111,9 +111,13 @@ func classifyApplierError(err error) error {
 	// classified retriable, and 23505 fell through the switch's empty case
 	// into the second text leg like MySQL's 1062 — retrying a
 	// deterministically-failing batch through the full ADR-0038 budget.
-	// The only message consultation allowed here is the XX000 read-only
-	// AND-gate (XX000 is a generic catch-all, so its semantics are
-	// message-dependent) — never a bare substring scan across all codes.
+	// The only message consultation allowed here is on XX000 — a generic
+	// catch-all whose semantics ARE message-dependent, so it is the one
+	// code where the wording carries the meaning. Two such AND-gates exist
+	// today (the read-only serving-transition window, and the sidecar
+	// connection-pool timeout), each matching its own named substring list.
+	// Never a bare substring scan across all codes, and never a second
+	// consultation on a code that already means something on its own.
 	// Pinned by [TestClassifyApplierError_TerminalCodeShield].
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
@@ -193,6 +197,37 @@ func classifyApplierError(err error) error {
 		if pgErr.Code == "XX000" && isPGReadOnlyClusterMessage(pgErr.Message) {
 			return &retriablePGError{err: err}
 		}
+		// SIDECAR CONNECTION-POOL EXHAUSTION. A PlanetScale Neki branch runs a
+		// sidecar POOL in front of each Postgres instance, with a bounded
+		// pool-capacity and a pool-max-wait-time (5s by default). A query that
+		// waits out that window is failed with `connection pool timed out`
+		// under SQLSTATE XX000 — the sidecar's own error, wearing Postgres's
+		// generic internal_error code.
+		//
+		// It is TRANSIENT by construction: it means "every pooled connection
+		// was busy for longer than the wait window", which clears as soon as
+		// any of them frees. Leaving it terminal means a momentary squeeze
+		// from ANY co-tenant permanently kills a running sync stream.
+		//
+		// That is not hypothetical — it is how this was found. On 2026-09-12 a
+		// concurrent cold copy on the same branch briefly asked for 16
+		// connections (the product-ceiling defect, fixed separately); the
+		// sidecar pool saturated, and a healthy long-running CDC stream into
+		// the same database died outright mid-apply, ~40 minutes before anyone
+		// noticed, with no recovery but a relaunch. The copy that caused it
+		// had already failed and gone away by then.
+		//
+		// Matched on the MESSAGE, not the bare code, for exactly the reason
+		// the read-only gate above is: XX000 is a catch-all, so a
+		// non-pool-timeout XX000 must stay terminal. The wording lives here
+		// rather than in grow_evidence.go's shared list because this has ONE
+		// consumer (retriability) — it is not grow evidence and must not be
+		// reported as such. The ADR-0038 budget is wall-clock bounded, so a
+		// pool that is genuinely and permanently exhausted still surfaces
+		// loudly instead of retrying forever.
+		if pgErr.Code == "XX000" && isPGConnectionPoolTimeoutMessage(pgErr.Message) {
+			return &retriablePGError{err: err}
+		}
 		// Connection-availability SQLSTATEs (57P0x admin shutdown/crash, plus
 		// class 08 connection_exception) delegate to the shared predicate,
 		// which declares itself the SINGLE HOME of that set (audit 2026-07-26
@@ -251,4 +286,29 @@ func classifyApplierError(err error) error {
 	}
 
 	return err
+}
+
+// pgConnectionPoolTimeoutSubstrings is the lower-cased wording that marks a
+// generic XX000 as a SIDECAR connection-pool timeout rather than an arbitrary
+// internal error. See the AND-gate in [classifyApplierError] for the
+// measurement and for why it is transient.
+//
+// Deliberately NOT co-located with pgReadOnlyClusterSubstrings: that list is
+// shared with growEvidenceOf because a read-only window IS grow evidence, and
+// a pool timeout is not. Keeping them apart is what stops a pool timeout from
+// being reported as a storage-grow claim.
+var pgConnectionPoolTimeoutSubstrings = []string{
+	"connection pool timed out",
+}
+
+// isPGConnectionPoolTimeoutMessage reports whether msg carries the sidecar
+// pool-timeout wording. Case-insensitive.
+func isPGConnectionPoolTimeoutMessage(msg string) bool {
+	lower := strings.ToLower(msg)
+	for _, sub := range pgConnectionPoolTimeoutSubstrings {
+		if strings.Contains(lower, sub) {
+			return true
+		}
+	}
+	return false
 }
