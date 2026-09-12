@@ -15,6 +15,28 @@ Both are the doc-lags-code shape the working agreements name. A note *about* bac
 
 **Staleness caveat (2026-08-18 triage).** A ground-truth pass over the un-struck entries found the "open" section is itself doc-lags-code: EVERY high-value candidate filed before ~2026-08-13 that was checked had already been fixed in code and never struck here (B-2c, D-1/2/3, Bug 239, the Bug 244 restore sibling, C1-1's SQLite/D1 lane — all now struck above with their code proof). Reassuringly, that pass found **zero still-open silent-loss items**. But the lesson is the project's own rule turned on this file: **before executing any un-struck entry older than 2026-08-13, ground-truth it against the code — the backlog text is not reliable for pre-08-13 entries.** The genuinely-open work concentrates in the freshest (2026-08-17 Tier-3) section plus the design-gated / needs-infra items.
 
+## 2026-09-12 — a server-side `statement_timeout` is a wall-clock cap on TABLE SIZE (found by the same soak; FIXED on the copy paths, one sibling left open)
+
+The soak's PG lane failed with `canceling statement due to statement timeout (SQLSTATE 57014)` inside `ImportRawCopy`. Root cause: **Neki ships `statement_timeout = 30s` by default** (operator-confirmed: it is an exposed Neki parameter, and PlanetScale Postgres does *not* set it — PG's own default is `0`). A bulk copy is ONE statement over a whole table, so a 30s wall means "no table that takes more than 30 seconds to copy can ever be migrated", and the re-run hits the same wall at the same place — the copy never converges.
+
+Measured on the live cluster: a plain 40-second statement was killed at exactly 30s; the identical statement under `SET LOCAL statement_timeout = 0` ran the full 40s and succeeded.
+
+**Fixed** by pinning `statement_timeout = 0` transaction-scoped in the shared `withCopySessionPins` helper and wiring the typed lane's `CopyFrom` through the same helper. Three surfaces covered, gated by `TestCopyLanesSurviveAServerStatementTimeout` (mutation-proven in four directions, including a mutation that disarms the rig to prove the cells cannot pass vacuously).
+
+**The sibling left OPEN, stated rather than implied:** `RowReader.ReadRows` — the typed lane's SOURCE read — is also a single long-running statement and is **not** pinned. A copy *out of* a server with a low `statement_timeout` still fails on the typed lane. It is not covered because the pin has to be transaction-scoped (a session `SET` leaks into the pool: pgx's `ResetSession` issues no `DISCARD ALL`, it only discards a conn left inside a transaction), and the reader hands its `*sql.Rows` to a streaming goroutine that outlives the function — so covering it is a change to the reader's lifetime model, not a line in a helper. Small/medium; worth doing before anyone migrates *from* Neki.
+
+**Deliberately exempt, with the argument** (so nobody "fixes" it later): index builds and constraint adds. pgx's default ctx handler cancels by breaking the socket rather than sending a `CancelRequest`. A backend streaming COPY is reading that socket continuously and notices at once; a backend inside `CREATE INDEX` is not, and would run the build to completion before noticing. For those phases the server's `statement_timeout` is the only bound there is, so the pin must not reach them — which is why it lives on the copy path and not in `afterConnectSessionPins`.
+
+## 2026-09-12 — Neki REJECTS the only `COPY TO` form sluice's raw lane emits (from PlanetScale's own docs; not yet hit, because Neki has only been a target)
+
+`platform-preview-limitations#copy-limits` states Neki rejects `COPY (SELECT …) TO`, and that `COPY TO` supports **unsharded tables only**. sluice's `ExportRawCopy` builds `COPY (SELECT <readable cols> FROM …) TO STDOUT` *always* — that is ADR-0078's CRUX invariant (a bare `COPY tbl TO STDOUT` would include generated columns and desync the importer's column list), so there is no fallback form to drop to.
+
+Consequence: **the raw-copy fast path cannot export from a Neki source at all.** Every soak so far has used Neki as the *target*, where only `COPY FROM STDIN` is exercised — which the same page explicitly supports for unsharded, sharded and reference tables — so this has never fired.
+
+Two things to do, neither yet built: (a) confirm the raw lane's Neki eligibility probe actually refuses the *export* direction rather than discovering it as a wire error, and (b) decide the fallback — the typed IR lane is the natural answer and needs no new code, it just needs the gate to route there.
+
+Also documented on that page and worth pinning as premises rather than assumptions: `COPY` must use the **simple query protocol** and must be the **only statement in the query**. sluice satisfies both today — `pgconn`'s `CopyFrom`/`CopyTo` use `SendQuery` (simple protocol), and the session pins are separate `Exec` round trips rather than a multi-statement string — but neither property is asserted anywhere, and both are the kind of thing a refactor silently breaks.
+
 ## 2026-09-12 — a PG→Neki cold start FAILS at default parallelism (found by the soak, in its first minute)
 
 **Loud, no data loss, and it is the first thing a user migrating PostgreSQL → Neki would hit.** The ADR-0079 fast parallel copy engaged with `within_table_parallelism=6`; the Neki router refuses more than **4 concurrent COPY operations** (`SQLSTATE 53300`, "too many concurrent COPY operations (limit: 4)"), so the copy died with `SLUICE-E-BULKCOPY-TABLE-FAILED` and the target was left holding 165,000 rows of a partial stream.

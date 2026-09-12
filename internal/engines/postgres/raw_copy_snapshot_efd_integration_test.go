@@ -7,7 +7,7 @@
 // (pipeline migrate_raw_copy_float_efd_pg_integration_test.go) drives the
 // raw text lane's *sql.DB branch, and the pgbouncer rig drives the
 // transaction-mode pooler — but nothing drove the SNAPSHOT-TRANSACTION
-// branch of rawCopyWithSessionPins: the sync cold-start reader is pinned
+// branch of withCopySessionPins: the sync cold-start reader is pinned
 // inside the exported-snapshot transaction (TxStatus != 'I'), so the pins
 // must JOIN the ambient transaction (SET LOCAL, no BEGIN — and above all
 // no COMMIT, which would DESTROY the snapshot) instead of owning one.
@@ -113,6 +113,6 @@ func TestSnapshotStream_RawCopyTextExport_FloatExactUnderEFD0Default(t *testing.
 	second := exportText("second")
 	assertExact("second", second)
 	if strings.Contains(second, "3.333333333333333") {
-		t.Error("post-snapshot row leaked into the second export — the pins ended the snapshot transaction (a BEGIN/COMMIT slipped into the ambient-join branch of rawCopyWithSessionPins)")
+		t.Error("post-snapshot row leaked into the second export — the pins ended the snapshot transaction (a BEGIN/COMMIT slipped into the ambient-join branch of withCopySessionPins)")
 	}
 }

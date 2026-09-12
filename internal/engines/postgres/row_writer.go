@@ -751,13 +751,30 @@ func (w *RowWriter) copyFromOnSQLConn(
 				return err
 			}
 		}
-		n, copyErr := conn.CopyFrom(
-			ctx,
-			pgx.Identifier{w.schema, table.Name},
-			columnNames,
-			source,
-		)
-		copied = n
+		// The typed lane's COPY is one statement over a whole table (or
+		// chunk), exactly like the raw lane's, so it hits a server-side
+		// statement_timeout in exactly the same place — and this lane is
+		// the one every CROSS-engine copy takes, so leaving it out would
+		// have fixed the PG→PG fast path and missed the common case.
+		// Sharing [withCopySessionPins] is what makes that structural
+		// rather than remembered; see its doc for why the pins have to be
+		// transaction-scoped SET LOCALs (a session SET would leak into the
+		// pool: pgx's ResetSession issues no DISCARD ALL, it only discards
+		// a conn left inside a transaction).
+		//
+		// pinFloats=false: extra_float_digits is OUTPUT-only and this is
+		// the import side; the typed lane's floats also ride pgx's binary
+		// codecs, which the GUC never touches.
+		copyErr := withCopySessionPins(ctx, conn.PgConn(), false, func() error {
+			n, cerr := conn.CopyFrom(
+				ctx,
+				pgx.Identifier{w.schema, table.Name},
+				columnNames,
+				source,
+			)
+			copied = n
+			return cerr
+		})
 		return copyErr
 	})
 	if rawErr != nil {

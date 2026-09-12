@@ -113,8 +113,8 @@ func (r *RowReader) ExportRawCopy(ctx context.Context, table *ir.Table, chunk *i
 		// Run the COPY under the session pins (client_encoding — and, on
 		// non-binary formats, extra_float_digits; binary COPY carries raw
 		// IEEE-754 send bytes, which the GUC never touches). See
-		// rawCopyWithSessionPins for why the pins are transaction-scoped.
-		err := rawCopyWithSessionPins(ctx, conn, format != ir.RawCopyBinary, func() error {
+		// withCopySessionPins for why the pins are transaction-scoped.
+		err := withCopySessionPins(ctx, conn, format != ir.RawCopyBinary, func() error {
 			if _, cerr := conn.CopyTo(ctx, w, sqlStmt); cerr != nil {
 				return fmt.Errorf("COPY TO STDOUT: %w", cerr)
 			}
@@ -208,7 +208,7 @@ func (w *RowWriter) ImportRawCopy(ctx context.Context, table *ir.Table, format i
 		// the importer receives is decoded under the same encoding it was
 		// emitted. No float pin here: extra_float_digits is OUTPUT-only,
 		// and float8in/float4in parse any digit count exactly.
-		err := rawCopyWithSessionPins(ctx, conn, false, func() error {
+		err := withCopySessionPins(ctx, conn, false, func() error {
 			tag, cerr := conn.CopyFrom(ctx, r, sqlStmt)
 			if cerr != nil {
 				return fmt.Errorf("COPY FROM STDIN: %w", cerr)
@@ -277,8 +277,44 @@ func (r *RowReader) rawConn(ctx context.Context, exec func(driverConn any) error
 	}
 }
 
-// rawCopyWithSessionPins runs fn (the COPY) with the raw lane's session
+// withCopySessionPins runs fn (the COPY) with the copy lanes' session
 // pins in effect, transaction-scoped:
+//
+//   - statement_timeout=0 (always). A bulk COPY is ONE statement over a
+//     whole table or chunk, so any server-side statement_timeout is a
+//     wall-clock cap on table size: cross it and the copy dies with
+//     57014 having written nothing, and re-running hits the same wall
+//     deterministically. PostgreSQL's own default is 0, which is why
+//     this went unnoticed for so long — but a managed platform may ship
+//     a non-zero default, and an operator may set one per-database or
+//     per-role for interactive workloads without meaning it to govern a
+//     migration. Measured on PlanetScale Neki 2026-09-12, which ships
+//     statement_timeout=30s by DEFAULT: a plain 40-second statement was
+//     killed at exactly 30s, and the identical statement under this pin
+//     ran to completion. The same 30s wall failed a real cold copy of a
+//     multi-GB table (see the accompanying test's header).
+//
+//     WHY ZERO RATHER THAN A LARGE FINITE VALUE: sluice cannot know how
+//     long a given table's copy should take — that is the operator's
+//     data, not ours — so any finite number we picked would be a new
+//     wall in the same place, just further out.
+//
+//     WHY THIS IS SAFE HERE AND IS DELIBERATELY *NOT* DONE GLOBALLY:
+//     removing the server's timeout is only sound where sluice's own
+//     cancellation can still stop the statement, and that holds for
+//     COPY specifically. pgx's default ctx handler is
+//     DeadlineContextWatcherHandler, which on cancellation sets an
+//     immediate deadline on the socket rather than sending a
+//     CancelRequest — so the backend learns the client is gone only
+//     when it next touches the socket. A backend streaming COPY is
+//     doing exactly that continuously, so Ctrl-C and ctx deadlines take
+//     effect at once. A backend inside CREATE INDEX or ALTER TABLE ADD
+//     CONSTRAINT is NOT reading the socket and would run the build to
+//     completion before noticing, so for those phases the server's
+//     statement_timeout is the only bound there is and this pin must
+//     not reach them. That is why it lives here, on the copy path, and
+//     not in [afterConnectSessionPins] where it would silently cover
+//     every statement sluice issues.
 //
 //   - client_encoding=UTF8 (always). The raw lane byte-pipes the
 //     source's COPY-TO-STDOUT stream straight into the target's
@@ -290,6 +326,7 @@ func (r *RowReader) rawConn(ctx context.Context, exec func(driverConn any) error
 //     (which would normalize this) never runs. Forcing both sessions to
 //     UTF8 makes the stream self-consistent by construction. (ADR-0078
 //     known-limitation note.)
+//
 //   - extra_float_digits=3 (pinFloats — the EXPORT side of non-binary
 //     formats; Bug 194, CRITICAL silent loss). PG ≥ 12 renders
 //     float4/float8 shortest-exact ONLY when the session's
@@ -325,12 +362,15 @@ func (r *RowReader) rawConn(ctx context.Context, exec func(driverConn any) error
 // transaction-mode pooler (the replication protocol requires a direct
 // connection), so the ambient transaction is always a real single
 // backend.
-func rawCopyWithSessionPins(ctx context.Context, conn *pgconn.PgConn, pinFloats bool, fn func() error) error {
+func withCopySessionPins(ctx context.Context, conn *pgconn.PgConn, pinFloats bool, fn func() error) error {
 	// 'I' = idle, outside any transaction (pgconn tracks the server's
 	// ReadyForQuery status byte). 'T'/'E' mean an ambient transaction
 	// owns the connection — join it rather than nesting.
 	ownTx := conn.TxStatus() == 'I'
-	pins := []string{"SET LOCAL client_encoding = 'UTF8'"}
+	pins := []string{
+		"SET LOCAL statement_timeout = 0",
+		"SET LOCAL client_encoding = 'UTF8'",
+	}
 	if pinFloats {
 		pins = append(pins, "SET LOCAL extra_float_digits = 3")
 	}
