@@ -52,13 +52,13 @@ func (e *retriableTestError) RetryHint() time.Duration { return 0 }
 func withFastRawCopyRetries(t *testing.T) {
 	t.Helper()
 	wall, attempts := rawCopyRetryMaxWall, rawCopyRetryAttempts
-	base, cap_ := chunkOpenRetryBackoffBase, chunkOpenRetryBackoffCap
+	baseBackoff, capBackoff := chunkOpenRetryBackoffBase, chunkOpenRetryBackoffCap
 	rawCopyRetryMaxWall = 5 * time.Second
 	chunkOpenRetryBackoffBase = time.Millisecond
 	chunkOpenRetryBackoffCap = 2 * time.Millisecond
 	t.Cleanup(func() {
 		rawCopyRetryMaxWall, rawCopyRetryAttempts = wall, attempts
-		chunkOpenRetryBackoffBase, chunkOpenRetryBackoffCap = base, cap_
+		chunkOpenRetryBackoffBase, chunkOpenRetryBackoffCap = baseBackoff, capBackoff
 	})
 }
 
