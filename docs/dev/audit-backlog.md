@@ -33,6 +33,35 @@ Measured on the live cluster: a plain 40-second statement was killed at exactly 
 
 **Deliberately exempt, with the argument** (so nobody "fixes" it later): index builds and constraint adds. pgx's default ctx handler cancels by breaking the socket rather than sending a `CancelRequest`. A backend streaming COPY is reading that socket continuously and notices at once; a backend inside `CREATE INDEX` is not, and would run the build to completion before noticing. For those phases the server's `statement_timeout` is the only bound there is, so the pin must not reach them — which is why it lives on the copy path and not in `afterConnectSessionPins`.
 
+## 2026-09-12 — the raw-copy chunk-progress write is a per-table serialization point that does not scale with within-table parallelism (found by raising parallelism 2 → 4 on a live target)
+
+**Measured differential on the same table, same binary, same target, same day:**
+
+| within-table parallelism | chunk-progress write failures |
+| --- | --- |
+| 2 | **0** |
+| 4 | **4+**, across two distinct causes |
+
+The failures are `SQLSTATE 55P03` (canceling statement due to lock timeout, against the target's `lock_timeout = 20s`) and `SQLSTATE 57014` (canceling statement due to user request). Every chunk worker writes its completion to the SAME `sluice_migrate_state` row for the table, so the writers serialize on one row lock; on a routed/high-latency target that is slow enough to exhaust a 20-second lock timeout.
+
+**Two harms, and the second is the one that is easy to miss** (the enumerate-the-harms rule):
+
+1. **Throughput — and the first reading of this was WRONG, which is worth recording.** Each blocked write waits up to the target's `lock_timeout` before giving up, and the 4-stream run decelerated from ~24,800 rows/s in its first minute to ~9,200 rows/s in the window containing the warnings. It was tempting to call the contention the cause. **The 2-stream run refutes it:** it decelerated by a comparable factor (19,400 rows/s early → 15,400 average, ×0.79) with **zero** progress-write failures, against the 4-stream run's 24,800 → 18,000 (×0.73). Both runs decay at nearly the same rate, so the decay is a property of the copy — PK index maintenance into a growing table is the obvious candidate — and not of the lock contention. The contention is real and worth removing, but its throughput cost is small and unmeasured, not the headline.
+2. **`--resume` gets quietly weaker exactly when parallelism is higher.** The write failure is a WARN and the copy continues, which is right — losing a progress row costs a redone chunk, not data. But it means the recorded resume state is LESS complete the more parallel the run, and the only signal is a warning line in a log nobody reads after a successful migration. An operator who resumes a 64-chunk copy will silently redo however many chunks lost their completion write.
+
+**Not yet fixed.** The obvious shapes, cheapest first: batch the completion writes (one row update per N chunks, or one at the end of each worker's run) rather than one per chunk; give each chunk its own row so there is nothing to contend on; or make the write a fire-and-forget with a bounded retry off the copy's critical path. The per-chunk-per-row option is the one that removes the contention rather than reducing it.
+
+Worth noting this was invisible until the connection budget allowed 4 streams — the same raise that exposed the product-ceiling defect. A parallelism ceiling that is never reached hides everything above it.
+
+**The measured return on all of it, since it bears on whether more parallelism is even worth pursuing.** Same table, same binary, same day, both verified lossless (ids contiguous, every key exactly once):
+
+| | streams | cluster / `max_connections` | rows | duration | rows/s | per stream |
+| --- | --- | --- | --- | --- | --- | --- |
+| run 1 | 2 | PS-10 / 30 | 22,330,001 | 24m09.7s | 15,403 | 7,702 |
+| run 3 | 4 | PS-40 / 64 | 23,798,001 | 21m58.7s | 18,047 | 4,512 |
+
+**+17% total for 2× the streams AND a 4× cluster bump**, with per-stream throughput down 41%. The streams contend rather than add, and the two variables were not separated (the resize and the `max_connections` raise landed together), so the parallelism component of that +17% is an upper bound — a same-hardware 2-stream control on PS-40 is the missing measurement. The honest conclusion today is that the target's COPY capacity is **not** the binding constraint on this workload, so raising the COPY ceiling further is unlikely to pay; the next thing to measure is the source read and the wire, not the target.
+
 ## 2026-09-12 — a Neki branch runs a SIDECAR pool in front of Postgres, and three of its defaults bear on the copy path
 
 Surfaced by the operator from the per-branch sidecar configuration ([`pscale branch` admin-and-sidecars](https://planetscale.com/docs/cli/branch#admin-and-sidecars)). Every Postgres instance runs one sidecar alongside it, and it is a **connection pool in front of the server** — so its limits are invisible to `pg_settings` and unreachable by `SET LOCAL`, while reporting themselves in PostgreSQL's own wording. Three defaults matter to us:
@@ -47,7 +76,9 @@ Surfaced by the operator from the per-branch sidecar configuration ([`pscale bra
 
 Consequence: **the raw-copy fast path cannot export from a Neki source at all.** Every soak so far has used Neki as the *target*, where only `COPY FROM STDIN` is exercised — which the same page explicitly supports for unsharded, sharded and reference tables — so this has never fired.
 
-Two things to do, neither yet built: (a) confirm the raw lane's Neki eligibility probe actually refuses the *export* direction rather than discovering it as a wire error, and (b) decide the fallback — the typed IR lane is the natural answer and needs no new code, it just needs the gate to route there.
+**(a) is now CONFIRMED by reading the gate, and the answer is the bad one.** `rawCopyGate` is purely the value-fidelity predicate (any transform present ⇒ fall back to the IR lane); it knows nothing about what the target platform accepts. The per-table dispatch re-check asserts the reader/writer *implement* the raw surface — and a Neki reader does implement `ir.RawCopyExporter`, because it is the ordinary Postgres reader. So nothing anywhere asks whether the statement will be accepted: a Neki source would issue `COPY (SELECT …) TO STDOUT`, the router would reject it, and that arrives as a hard copy failure rather than a graceful fall-back to the typed lane.
+
+**(b) the fallback is still the thing to build**, and it needs no new copy code — the typed IR lane already handles this correctly; the gate just has to route there. The cheapest correct shape is a source-side eligibility declaration (the reader knows it is Neki via the existing `probeIsNeki`) rather than catching the wire error, since a post-hoc catch would already have aborted the table.
 
 Also documented on that page and worth pinning as premises rather than assumptions: `COPY` must use the **simple query protocol** and must be the **only statement in the query**. sluice satisfies both today — `pgconn`'s `CopyFrom`/`CopyTo` use `SendQuery` (simple protocol), and the session pins are separate `Exec` round trips rather than a multi-statement string — but neither property is asserted anywhere, and both are the kind of thing a refactor silently breaks.
 
