@@ -15,6 +15,40 @@ Both are the doc-lags-code shape the working agreements name. A note *about* bac
 
 **Staleness caveat (2026-08-18 triage).** A ground-truth pass over the un-struck entries found the "open" section is itself doc-lags-code: EVERY high-value candidate filed before ~2026-08-13 that was checked had already been fixed in code and never struck here (B-2c, D-1/2/3, Bug 239, the Bug 244 restore sibling, C1-1's SQLite/D1 lane — all now struck above with their code proof). Reassuringly, that pass found **zero still-open silent-loss items**. But the lesson is the project's own rule turned on this file: **before executing any un-struck entry older than 2026-08-13, ground-truth it against the code — the backlog text is not reliable for pre-08-13 entries.** The genuinely-open work concentrates in the freshest (2026-08-17 Tier-3) section plus the design-gated / needs-infra items.
 
+## 2026-09-12 — THE RAW-COPY LANE CANNOT SURVIVE A STORAGE-GROW WINDOW, and ADR-0110's whole apparatus is inert on it (measured twice, on two tiers)
+
+**This outranks everything else on the register.** It fires on the most ordinary operation the product has — a first migration into a newly-created target — and the machinery built to prevent it is present, correct, and unable to help.
+
+**What was measured.** A 29 GB / 29 M-row table copied into a *freshly created* PlanetScale Neki database (10 GiB starting volume) from an in-region EC2 client, four streams, twice:
+
+| target | starting volume | outcome |
+| --- | --- | --- |
+| fresh `PS-160` / `NKR-5` | 10 GiB | **FAILED at 116s** — `53100 could not extend file … No space left on device` |
+| fresh `PS-10` / `NKR-1` | 10 GiB | **FAILED at 191s** — `08006 write: broken pipe`, primary CPU at 100% |
+| worn-in `PS-160` / `NKR-5` | **150 GiB, pre-grown** | **succeeded**, 29,869 rows/s, lossless |
+
+Only the target whose volume had already grown completed. The platform's autoscaling is reactive — the volume grew 10 → 39 GiB roughly **2m20s after** the client had already been refused (NEKI-021 has the sampled curve).
+
+**Why our own defences did not fire, which is the finding.** Everything worked as designed and none of it mattered:
+
+- `53100` (class 53, insufficient_resources) IS classified retriable — deliberately, for exactly this event, with the code comment citing the PlanetScale grow window.
+- `08006` IS classified retriable via the shared connection-availability predicate.
+- ADR-0110's grow-gate DID trip on both runs, logging `cold-copy grow-gate CLOSED — quiescing all cold-copy lanes so they back off together`.
+
+And the copy still died, because the raw lane's own error text says why: *"This is the raw-COPY fast path, which streams the source bytes straight into COPY FROM STDIN and therefore has NO resume point — the stream is consumed as it goes."* The retry classification decides *whether* to retry; the raw lane has nothing to retry **with**. `ImportRawCopy`'s reader is a one-shot pipe from the exporter, already partially drained.
+
+So the fastest lane is the one least able to survive the interruption most likely to hit it, and the gate that exists to ride out that interruption can only watch. This is the "a gate whose coverage is narrower than its name implies" shape at the level of a whole subsystem: ADR-0110 reads as protecting the cold copy, and it protects the *typed* cold copy.
+
+**What would actually close it, cheapest first:**
+
+1. **Make the raw lane replayable per chunk.** It already copies in 64 PK-bounded chunks; a chunk is re-derivable from its bounds, so a failed chunk could be re-exported from the source rather than replayed from a consumed pipe. This is the real fix and it reuses the chunking that exists.
+2. **Fall back to the typed IR lane on a grow-class refusal** rather than failing the table. Slower, but the typed lane CAN resume, and a slow copy that finishes beats a fast one that does not.
+3. **Preflight the target's free space against the source's size** and refuse *before* the copy with a sizing remedy, instead of discovering it 116 seconds in with a partially-populated target. Cheapest of the three and it converts a mid-copy failure into an actionable up-front one — but it only narrows the window, since a concurrent writer can still consume the headroom.
+
+(1) and (3) compose and are probably both worth having. Note that (3) needs the volume figures, which ARE readable — see the metrics-endpoint note in the register below; `planetscale_volume_capacity_bytes` / `_available_bytes` are exactly the inputs.
+
+**Not built.** Filed with its evidence rather than fixed today because it is a design change to the fast path, not a patch, and the session's remaining time is better spent recording it accurately than half-landing it.
+
 ## 2026-09-12 — NEKI ARC: consolidated follow-up register (the single list; individual entries below carry the detail)
 
 A day of live Neki work produced three shipped fixes and a tail of open items across three repos. This is the register so none of it is carried in conversation alone. **Shipped today:** `4c09c80e` (statement_timeout on the copy lanes), `771723ba` (COPY-concurrency product ceiling), `b570ecc6` (sidecar pool timeout no longer terminal).
@@ -23,6 +57,7 @@ A day of live Neki work produced three shipped fixes and a tail of open items ac
 
 | # | item | tier | state |
 | --- | --- | --- | --- |
+| 0 | **The raw-copy lane cannot survive a storage-grow window** — no resume point, so ADR-0110's grow-gate and the 53100/08006 retry classification are inert on it. Measured twice; a fresh Neki target fails a first migration at 116s / 191s while a pre-grown one succeeds. Full entry immediately above this register. | **loud failure on the most ordinary operation the product has** | **not built** |
 | 1 | **Deferred index builds fail at 30s on a Neki target.** `CREATE INDEX` on a 26.3M-row table died at **31s** (measured). The statement_timeout pin deliberately excludes index builds (pgx cannot cancel a backend that is not reading its socket), so on Neki the only bound is 30s. **Any secondary index on a large table blocks the migration.** Remedy proven to start: `__neki.online_ddl_create` accepted the same index in 2s and ran it asynchronously. | loud failure, blocks the product on Neki | **not built** |
 | 2 | Typed lane's SOURCE read (`ReadRows`) is unpinned for `statement_timeout` — copying OUT of a low-timeout server still fails. Needs a transaction held across the streaming goroutine's lifetime. | loud failure | filed |
 | 3 | Neki rejects `COPY (SELECT …) TO`, the only form `ExportRawCopy` emits, and there is **no graceful fallback** (confirmed by reading the gate). Needs a source-side eligibility declaration via `probeIsNeki` routing to the typed lane. | loud failure | filed |
