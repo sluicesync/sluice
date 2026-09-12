@@ -138,6 +138,18 @@ func TestNekiverify_ShardedRefusalPremises(t *testing.T) {
 		nekiRemedyFunctionsExist(ctx, t, db)
 	})
 
+	// Coverage item #2: CDC into this sharded target, graded on ordered
+	// CONTENT rather than a row count.
+	nekiCDCIntoShardedTarget(ctx, t, db, fx, tenantA, tenantB)
+
+	// Coverage item #3: the NK213 block from a real MoveTables cutover.
+	// LAST, deliberately — it creates a workflow that blocks a table and a
+	// second logical database, and although it reverses both, a failure
+	// part-way through leaves the cluster in a state no later subtest should
+	// have to reason about. Running it last means the only thing downstream of
+	// a bad outcome is teardown.
+	nekiMoveTablesBlocksWithNK213(ctx, t, db)
+
 	t.Run("PREMISE: the shard key may not be named in an UPDATE SET list", func(t *testing.T) {
 		// sluice's SLUICE-E-TARGET-SHARD-KEY-UPDATE-UNSUPPORTED refusal, and
 		// the dropUnchangedShardKeys machinery that avoids tripping it,
