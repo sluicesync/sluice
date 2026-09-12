@@ -60,7 +60,13 @@ Worth noting this was invisible until the connection budget allowed 4 streams �
 | run 1 | 2 | PS-10 / 30 | 22,330,001 | 24m09.7s | 15,403 | 7,702 |
 | run 3 | 4 | PS-40 / 64 | 23,798,001 | 21m58.7s | 18,047 | 4,512 |
 
-**+17% total for 2× the streams AND a 4× cluster bump**, with per-stream throughput down 41%. The streams contend rather than add, and the two variables were not separated (the resize and the `max_connections` raise landed together), so the parallelism component of that +17% is an upper bound — a same-hardware 2-stream control on PS-40 is the missing measurement. The honest conclusion today is that the target's COPY capacity is **not** the binding constraint on this workload, so raising the COPY ceiling further is unlikely to pay; the next thing to measure is the source read and the wire, not the target.
+**+17% total for 2× the streams AND a 4× cluster bump**, with per-stream throughput down 41%.
+
+**A THIRD variable was uncontrolled and I missed it on the first pass:** run 1 ran with the soak's CDC stream alive and competing; run 3 ran after that stream had died (17:33 UTC, ten minutes before run 3 started). So run 3 had *fewer* competitors as well as more streams and a bigger cluster — every variable moved in its favour — and it still returned only +17%. That makes the result more damning rather than less, and it makes the "parallelism share is an upper bound" caveat stronger than stated.
+
+**The likely explanation, operator-supplied and it fits everything:** the Neki ROUTER was observed pegged at **100% CPU** throughout. A saturated router is a serialization point in front of every stream, which is exactly the signature measured — total throughput barely moves while per-stream throughput collapses, because the streams are queueing for one exhausted resource rather than doing independent work. It also explains why the cluster resize (PS-40) bought so little: the resize grows the Postgres side, not the router in front of it.
+
+That reframes the tuning advice. The binding constraint on a Neki bulk import is not connection slots, not the COPY-concurrency limit, and not the Postgres cluster tier — it is the router. Router tier (`NKR-1` … `NKR-5`) is the knob, and it is the one the API and CLI do not expose (NEKI-017's closing note).
 
 ## 2026-09-12 — a Neki branch runs a SIDECAR pool in front of Postgres, and three of its defaults bear on the copy path
 
