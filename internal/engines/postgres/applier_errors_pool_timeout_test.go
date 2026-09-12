@@ -202,3 +202,65 @@ func TestClassifyApplierError_NekiQueryBufferTimeoutIsTransient(t *testing.T) {
 		})
 	}
 }
+
+// TestQuiesceAndReportTransient_ReturnsTheClassification pins the defect that
+// made a classified transient unreachable to every caller.
+//
+// quiesceAndReportTransient classifies its error to decide whether to trip the
+// grow gate, and until 2026-09-12 returned the RAW error afterwards. So the
+// gate learned the error was transient and backed the whole fleet off for it,
+// while the caller received a bare error with no ir.RetriableError in its
+// chain and could only treat it as terminal.
+//
+// The cost, measured: a 29 GB import into a fresh Neki branch died on NK205
+// from `acquire conn` — a code classified retriable — on a run whose logs show
+// the gate tripping four times. The retry could not see what the gate had
+// already concluded.
+//
+// The second cell is what stops a "just wrap everything" fix: a terminal error
+// must come back unchanged, because classifyApplierError's pass-through is the
+// only reason this is safe for unrecognised shapes.
+func TestQuiesceAndReportTransient_ReturnsTheClassification(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a transient comes back CLASSIFIED so a caller can retry it", func(t *testing.T) {
+		t.Parallel()
+		gate := &recordingGrowGate{}
+		w := &RowWriter{growGate: gate}
+
+		in := &pgconn.PgError{Code: "NK205", Message: "query buffer timeout: request exceeded max wait"}
+		out := w.quiesceAndReportTransient(in, "raw COPY import")
+
+		var re ir.RetriableError
+		if !errors.As(out, &re) || !re.Retriable() {
+			t.Fatalf("a transient came back UNCLASSIFIED — the gate tripped for it but the caller cannot "+
+				"see it is retriable, so it dies as terminal. got %#v", out)
+		}
+		// The chain must survive: callers match on the underlying PgError.
+		var pgErr *pgconn.PgError
+		if !errors.As(out, &pgErr) || pgErr.Code != "NK205" {
+			t.Errorf("the underlying *pgconn.PgError is no longer reachable through the wrapper")
+		}
+		if got := gate.trips.Load(); got != 1 {
+			t.Errorf("grow-gate trips = %d, want 1 — the fleet backoff must still fire", got)
+		}
+	})
+
+	t.Run("a TERMINAL error comes back unchanged and does not trip the gate", func(t *testing.T) {
+		t.Parallel()
+		gate := &recordingGrowGate{}
+		w := &RowWriter{growGate: gate}
+
+		in := &pgconn.PgError{Code: "23505", Message: "duplicate key value violates unique constraint"}
+		out := w.quiesceAndReportTransient(in, "raw COPY import")
+
+		var re ir.RetriableError
+		if errors.As(out, &re) && re.Retriable() {
+			t.Fatal("a terminal error was wrapped as retriable — a deterministic fault would now burn the " +
+				"whole retry budget instead of failing fast")
+		}
+		if got := gate.trips.Load(); got != 0 {
+			t.Errorf("grow-gate trips = %d, want 0 — a terminal fault must not back off the fleet", got)
+		}
+	})
+}

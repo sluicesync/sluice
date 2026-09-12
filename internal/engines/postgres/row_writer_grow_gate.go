@@ -174,11 +174,32 @@ func (w *RowWriter) quiesceAndReportTransient(err error, what string) error {
 	if err == nil {
 		return nil
 	}
+	// Classify ONCE and return what the classification produced. Returning the
+	// raw err here — which this did until 2026-09-12 — throws away the very
+	// verdict the line above just computed: the gate learns the error is
+	// transient and trips for it, and the CALLER receives a bare error with no
+	// [ir.RetriableError] in its chain and can only treat it as terminal.
+	//
+	// Measured cost. A 29 GB import into a fresh PlanetScale Neki branch died
+	// on `acquire conn: lookup spatial type OIDs: … query buffer timeout
+	// (SQLSTATE NK205)` — a code classified retriable, on a run whose logs show
+	// the grow gate tripping FOUR times. Three of those trips were COPY-side
+	// transients the raw-copy retry rode out; the fourth was this one, and the
+	// run died on it anyway because the retry could not see what the gate had
+	// already concluded.
+	//
+	// Safe for terminal errors by construction: classifyApplierError returns
+	// its argument unchanged for anything it does not recognise, so a
+	// non-transient error is returned exactly as before. For a transient the
+	// caller now gets the wrapper, whose Unwrap preserves the chain — every
+	// existing errors.Is/errors.As against the underlying *pgconn.PgError
+	// still matches.
+	classified := classifyApplierError(err)
 	var re ir.RetriableError
-	if errors.As(classifyApplierError(err), &re) && re.Retriable() {
+	if errors.As(classified, &re) && re.Retriable() {
 		w.tripGrowGate("postgres cold-copy "+what+" transient: "+err.Error(), err)
 	}
-	return err
+	return classified
 }
 
 // copyChunkWithRetry runs ONE buffered chunk's COPY with the bounded
