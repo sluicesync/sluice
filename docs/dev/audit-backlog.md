@@ -39,15 +39,25 @@ And the copy still died, because the raw lane's own error text says why: *"This 
 
 So the fastest lane is the one least able to survive the interruption most likely to hit it, and the gate that exists to ride out that interruption can only watch. This is the "a gate whose coverage is narrower than its name implies" shape at the level of a whole subsystem: ADR-0110 reads as protecting the cold copy, and it protects the *typed* cold copy.
 
-**What would actually close it, cheapest first:**
+**What would actually close it — and the scope is SMALLER than the first draft of this entry claimed.** The operator asked the right question ("check whether we already tried this"), and checking changed the answer:
 
-1. **Make the raw lane replayable per chunk.** It already copies in 64 PK-bounded chunks; a chunk is re-derivable from its bounds, so a failed chunk could be re-exported from the source rather than replayed from a consumed pipe. This is the real fix and it reuses the chunking that exists.
-2. **Fall back to the typed IR lane on a grow-class refusal** rather than failing the table. Slower, but the typed lane CAN resume, and a slow copy that finishes beats a fast one that does not.
-3. **Preflight the target's free space against the source's size** and refuse *before* the copy with a sizing remedy, instead of discovering it 116 seconds in with a partially-populated target. Cheapest of the three and it converts a mid-copy failure into an actionable up-front one — but it only narrows the window, since a concurrent writer can still consume the headroom.
+1. **Wire the raw chunk call to a bounded retry. This is the fix, and it is wiring rather than redesign.** Every precondition already holds:
+   - The raw lane is **already chunked** — `copyChunkRaw` builds an `ir.RawCopyChunk` with PK bounds and calls `runRawCopyChunk` with a chunk index (64 chunks on the measured table).
+   - `runRawCopyChunk` constructs a **fresh `io.Pipe` and re-invokes `ExportRawCopy` with those bounds on every call**, so the function is inherently re-runnable. The "no resume point" in its error text is about the importer's reader *within one attempt*, not about the chunk.
+   - A failed chunk **rolls back**: `ImportRawCopy` runs under `withCopySessionPins`, which wraps the COPY in `BEGIN`/`COMMIT` and rolls back on error, so a retry cannot duplicate rows.
+   - The typed lane's sibling `copyChunkFast` already does exactly this via `copyChunkWithRetry`. `copyChunkRaw` calls `runRawCopyChunk` **once** and returns on error.
 
-(1) and (3) compose and are probably both worth having. Note that (3) needs the volume figures, which ARE readable — see the metrics-endpoint note in the register below; `planetscale_volume_capacity_bytes` / `_available_bytes` are exactly the inputs.
+   **It was never tried and abandoned — it was never wired.** `git log -S runRawCopyChunk` shows only the original ADR-0078 implementation and the item-146 stall-watchdog work. The parity is simply missing: an ordinary sibling-miss, a retry added to one copy core and not the other.
 
-**Not built.** Filed with its evidence rather than fixed today because it is a design change to the fast path, not a patch, and the session's remaining time is better spent recording it accurately than half-landing it.
+   One genuine gap remains inside this: the **unchunked** whole-table path (`migrate_bulk.go` calls `runRawCopyChunk` with `chunk == nil`) has no bounds to re-derive from and needs restart-the-table semantics instead. Enumerate it rather than letting the fix look complete.
+
+   This single fix covers **both** measured failures — 53100 and 08006 — because both are already classified retriable and both were lost to the same missing wrapper.
+
+2. **Fall back to the typed IR lane on a grow-class refusal** rather than failing the table. Slower, but the typed lane CAN resume, and a slow copy that finishes beats a fast one that does not. Secondary to (1).
+
+3. ~~**Preflight the target's free space.**~~ **Demoted — it cannot be a default.** The operator's objection is correct: there is **no SQL route to volume capacity on Neki** (`pg_database_size`, `pg_total_relation_size` and `pg_size_bytes` are all `NK013`, and `__neki.list_metafuncs()` publishes nothing storage-related). The figures live only on the metrics endpoint, which needs a PlanetScale metrics service token sluice cannot assume is configured. Worth having as an **opt-in** — sluice already carries metrics-token plumbing for `metrics-watch` — but it must not be positioned as the fix.
+
+**Not built today.** (1) is now well-scoped work rather than the redesign the first draft assumed, and it is the next thing to build.
 
 ## 2026-09-12 — NEKI ARC: consolidated follow-up register (the single list; individual entries below carry the detail)
 
@@ -58,7 +68,7 @@ A day of live Neki work produced three shipped fixes and a tail of open items ac
 | # | item | tier | state |
 | --- | --- | --- | --- |
 | 0 | **The raw-copy lane cannot survive a storage-grow window** — no resume point, so ADR-0110's grow-gate and the 53100/08006 retry classification are inert on it. Measured twice; a fresh Neki target fails a first migration at 116s / 191s while a pre-grown one succeeds. Full entry immediately above this register. | **loud failure on the most ordinary operation the product has** | **not built** |
-| 1 | **Deferred index builds fail at 30s on a Neki target.** `CREATE INDEX` on a 26.3M-row table died at **31s** (measured). The statement_timeout pin deliberately excludes index builds (pgx cannot cancel a backend that is not reading its socket), so on Neki the only bound is 30s. **Any secondary index on a large table blocks the migration.** Remedy proven to start: `__neki.online_ddl_create` accepted the same index in 2s and ran it asynchronously. | loud failure, blocks the product on Neki | **not built** |
+| 1 | **Deferred index builds fail at 30s on a Neki target.** `CREATE INDEX` on a 26.3M-row table died at **31s** (measured). The statement_timeout pin deliberately excludes index builds (pgx cannot cancel a backend that is not reading its socket), so on Neki the only bound is 30s. **Any secondary index on a large table blocks the migration.** **Remedy now proven END TO END — the index LANDS** (recipe below). | loud failure, blocks the product on Neki | **not built** |
 | 2 | Typed lane's SOURCE read (`ReadRows`) is unpinned for `statement_timeout` — copying OUT of a low-timeout server still fails. Needs a transaction held across the streaming goroutine's lifetime. | loud failure | filed |
 | 3 | Neki rejects `COPY (SELECT …) TO`, the only form `ExportRawCopy` emits, and there is **no graceful fallback** (confirmed by reading the gate). Needs a source-side eligibility declaration via `probeIsNeki` routing to the typed lane. | loud failure | filed |
 | 4 | Sidecar `tx-idle-timeout` (30s) vs the raw byte-pipe: the target transaction is idle exactly as long as the source stalls, and the raw lane cannot retry (one-shot reader). Not yet reproduced against our own pipe — wants a throttled-source test. | loud failure | filed, unproven |
@@ -67,6 +77,38 @@ A day of live Neki work produced three shipped fixes and a tail of open items ac
 | 7 | Verify `metrics-watch` reports the **primary's** CPU rather than a pod average on a Neki branch. Tested only while idle, when every pod agrees. Under load the primary read 100% while a replica read 0.02%, so the distinction is load-bearing for any CPU alert. | correctness of an advisory | **unverified** |
 | 8 | `__neki.workflow_metrics` publishes live `rows_copied` / `bytes_copied` / stream phase per table in SQL. Candidate source for Neki-aware progress reporting — and the thing that would have prevented today's misreading of copy progress from target row counts. | observability | idea |
 | 9 | SQLite `DATETIME` → MySQL emitter fix (predates this arc; operator was open to it, deliberately kept out of v0.151.1). | correctness | not built |
+
+### The online-DDL recipe, measured end to end on a live cluster (2026-09-12) — this is what item 1 should build
+
+Proven on the worn-in branch against a 28.9M-row table, after the plain `CREATE INDEX` for the same index died at 31s:
+
+```sql
+-- 1. Submit. Returns (workflow, migration_id) in ~2 seconds.
+SELECT __neki.online_ddl_create(
+  'idx_land_wf', current_database(),
+  'CREATE INDEX idx_land_created ON public.soak_rows_pg (created_at)',
+  ''                                   -- empty migration_id ⇒ Neki generates one
+);
+
+-- 2. Poll. ~36 MINUTES for a single-column index on 28.9M rows.
+SELECT workflow, status, jsonb_pretty(status_by_shard)
+FROM __neki.online_ddl_status('idx_land_wf');
+
+-- 3. Cut over. The index is NOT visible until this runs.
+SELECT __neki.workflow_complete('idx_land_wf');
+```
+
+**THE GOTCHA, and it would hang a naive integration forever:** the top-level `status` stays `running` right up until `workflow_complete` is called — it does **not** transition to a terminal value when the build finishes. The signal that the build is done is per-shard, inside `status_by_shard`: **`current_readiness` flips `false` → `true`**. An integration that polls `status` waiting for it to stop saying `running` will wait indefinitely on a workflow that has been ready for half an hour. Poll `current_readiness` across every shard, then call `workflow_complete`.
+
+Other constraints, each learned by hitting it:
+
+- **Table names must be schema-qualified.** `soak_rows_pg` is refused with *"an unqualified name … is not allowed in a schema migration: schema-qualify every table name; a migration does not guess the search path"*. Use `public.soak_rows_pg`.
+- **No `CONCURRENTLY`** in an index built this way (per PlanetScale's docs).
+- One table and one execution category per workflow.
+- `online_ddl_create` takes a **fifth `options` argument** the docs page omits — `apply_direct`, `cutover_timeout`, `cutover_lag_threshold`, `differ`, `differ_timeout`, `batch_size` (from `__neki.list_metafuncs()`).
+- `__neki.workflow_cancel(workflow)` abandons a build cleanly; `__neki.online_ddl_cleanup(workflow)` drops a terminal workflow's artifacts so the name can be reused.
+
+The shape maps onto ADR-0148's deploy-request fallback for PlanetScale MySQL (`IndexBuildFallback`), so this is a second implementor of an existing pattern rather than a new subsystem.
 
 **OPEN — platform reports (`neki-issues`, private):** NEKI-017 (concurrent-COPY limit 4), NEKI-018 (30s `statement_timeout` + sidecar `tx-idle-timeout`), NEKI-019 (stale UI disk size). Two corrections already landed after first filing — see each file.
 
