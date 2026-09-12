@@ -111,13 +111,22 @@ func classifyApplierError(err error) error {
 	// classified retriable, and 23505 fell through the switch's empty case
 	// into the second text leg like MySQL's 1062 — retrying a
 	// deterministically-failing batch through the full ADR-0038 budget.
-	// The only message consultation allowed here is on XX000 — a generic
-	// catch-all whose semantics ARE message-dependent, so it is the one
-	// code where the wording carries the meaning. Two such AND-gates exist
-	// today (the read-only serving-transition window, and the sidecar
-	// connection-pool timeout), each matching its own named substring list.
-	// Never a bare substring scan across all codes, and never a second
-	// consultation on a code that already means something on its own.
+	// Message consultation is allowed ONLY where the code alone cannot
+	// decide, and each such site matches its own named substring list —
+	// never a bare substring scan across all codes. Three exist today:
+	//
+	//   - XX000 + read-only wording      — serving-transition window
+	//   - XX000 + pool-timeout wording   — sidecar pool saturated
+	//   - 25006 + low-disk wording       — Neki shard read-only, disk low
+	//
+	// The first two are XX000, a generic catch-all whose semantics ARE
+	// message-dependent. The third is the opposite case and the reason this
+	// paragraph is a rule rather than an XX000 exemption: 25006 means
+	// something definite on its own (read_only_sql_transaction — what a
+	// STANDBY returns, terminal, with its own preflight), so the wording is
+	// what CARVES OUT the one measured storage shape from an otherwise
+	// terminal code. Consulting a message to narrow a terminal code is safe;
+	// consulting one to broaden a transient code is not.
 	// Pinned by [TestClassifyApplierError_TerminalCodeShield].
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
@@ -253,6 +262,28 @@ func classifyApplierError(err error) error {
 		// pool that is genuinely and permanently exhausted still surfaces
 		// loudly instead of retrying forever.
 		if pgErr.Code == "XX000" && isPGConnectionPoolTimeoutMessage(pgErr.Message) {
+			return &retriablePGError{err: err}
+		}
+		// A Neki shard that has gone READ-ONLY because its disk is low. This
+		// is the PREVENTIVE twin of 53100: rather than letting a write hit
+		// `No space left on device`, the platform stops writes while the
+		// volume auto-grows. Measured 2026-09-12 on a fresh Neki branch:
+		//
+		//	cannot execute COPY: shard shnvbjnzljqjop is read-only
+		//	(disk space low)   (SQLSTATE 25006)
+		//
+		// It clears when the grow completes, so it belongs in the same
+		// bounded-retry class as 53100 and the XX000 read-only window.
+		//
+		// MATCHED ON THE MESSAGE, and here the AND-gate is not stylistic —
+		// it prevents a real regression. 25006 (read_only_sql_transaction)
+		// is legitimately TERMINAL in its ordinary meaning: it is what a
+		// STANDBY returns when asked to write, which is a misconfigured
+		// target that must fail loudly with its remedy rather than stall for
+		// the full retry budget (see standby_preflight.go, Bug 197). Only the
+		// measured low-disk wording is transient; every other 25006 keeps
+		// failing exactly as it did.
+		if pgErr.Code == "25006" && isPGLowDiskReadOnlyMessage(pgErr.Message) {
 			return &retriablePGError{err: err}
 		}
 		// Connection-availability SQLSTATEs (57P0x admin shutdown/crash, plus

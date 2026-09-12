@@ -264,3 +264,75 @@ func TestQuiesceAndReportTransient_ReturnsTheClassification(t *testing.T) {
 		}
 	})
 }
+
+// TestClassifyApplierError_LowDiskReadOnlyIsTransient pins the fifth distinct
+// transient PlanetScale Neki produced under bulk load, and pins the standby
+// regression that a careless version of this fix would cause.
+//
+// Neki protects a shard whose disk is running low by making it READ-ONLY
+// rather than letting a write hit ENOSPC:
+//
+//	cannot execute COPY: shard shnvbjnzljqjop is read-only (disk space low)
+//	(SQLSTATE 25006)
+//
+// That is the preventive twin of 53100 and clears when the volume finishes
+// growing, so it belongs in the same bounded-retry class.
+//
+// THE SECOND CELL IS THE POINT. 25006 (read_only_sql_transaction) is
+// legitimately terminal in its ordinary meaning — it is what a STANDBY returns
+// when asked to write. sluice has a whole preflight devoted to diagnosing that
+// (standby_preflight.go, Bug 197). A fix that made all of 25006 retriable
+// would turn "you pointed sluice at a replica" from a loud, actionable refusal
+// into a thirty-minute stall ending in a timeout.
+func TestClassifyApplierError_LowDiskReadOnlyIsTransient(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name          string
+		message       string
+		wantRetriable bool
+		wantEvidence  ir.GrowEvidence
+	}{
+		{
+			name:          "neki shard read-only because disk is low",
+			message:       "cannot execute COPY: shard shnvbjnzljqjop is read-only (disk space low)",
+			wantRetriable: true,
+			// A storage-driven read-only window IS a grow face — unlike the
+			// pool timeout, which is co-tenant contention.
+			wantEvidence: ir.GrowEvidenceTargetFace,
+		},
+		{
+			// THE STANDBY ARM. Must stay terminal and must NOT claim a grow.
+			name:          "an ordinary read-only transaction stays terminal",
+			message:       "cannot execute INSERT in a read-only transaction",
+			wantRetriable: false,
+			wantEvidence:  ir.GrowEvidenceNone,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			in := &pgconn.PgError{Code: "25006", Message: tc.message}
+
+			got := classifyApplierError(in)
+			var re ir.RetriableError
+			isRetriable := errors.As(got, &re) && re.Retriable()
+
+			switch {
+			case tc.wantRetriable && !isRetriable:
+				t.Fatalf("25006 %q classified TERMINAL, want retriable — a storage guard that lifts on "+
+					"its own will fail an import that could have finished", tc.message)
+			case !tc.wantRetriable && isRetriable:
+				t.Fatalf("25006 %q classified RETRIABLE, want terminal — pointing sluice at a STANDBY "+
+					"must stay a loud refusal with a remedy, not a 30-minute stall", tc.message)
+			}
+
+			if ev := growEvidenceOf(in); ev != tc.wantEvidence {
+				t.Errorf("grow evidence = %v, want %v — the ADR-0110 gate's structured log reports this "+
+					"verdict, so an over-claim here becomes a wrong storage-grow claim in the run log",
+					ev, tc.wantEvidence)
+			}
+		})
+	}
+}

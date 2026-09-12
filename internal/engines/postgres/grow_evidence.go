@@ -97,6 +97,11 @@ func growEvidenceOf(err error) ir.GrowEvidence {
 		if pgErr.Code == "XX000" && isPGReadOnlyClusterMessage(pgErr.Message) {
 			return ir.GrowEvidenceTargetFace
 		}
+		// A Neki shard that went read-only because its disk is low is a
+		// storage-grow face by definition — the PREVENTIVE form of 53100.
+		if pgErr.Code == "25006" && isPGLowDiskReadOnlyMessage(pgErr.Message) {
+			return ir.GrowEvidenceTargetFace
+		}
 		for _, code := range pgServingTransitionSQLStates {
 			if pgErr.Code == code {
 				return ir.GrowEvidenceTargetFace
@@ -117,4 +122,41 @@ func growEvidenceOf(err error) ir.GrowEvidence {
 		}
 	}
 	return ir.GrowEvidenceNone
+}
+
+// pgLowDiskReadOnlySubstrings is the lower-cased wording that marks a 25006
+// (read_only_sql_transaction) as a PlanetScale Neki shard that has gone
+// read-only BECAUSE ITS DISK IS LOW, rather than an ordinary read-only
+// transaction or a standby.
+//
+// Measured 2026-09-12 on a fresh Neki branch under a 29 GB import:
+//
+//	ERROR: cannot execute COPY: shard shnvbjnzljqjop is read-only
+//	       (disk space low)  (SQLSTATE 25006)
+//
+// This is a PROTECTIVE refusal — the platform stops writes before the volume
+// actually fills, where an earlier run on the same configuration was allowed
+// to hit 53100 `No space left on device` instead. Better platform behaviour,
+// and a storage-grow face just the same.
+//
+// Deliberately NOT merged into pgReadOnlyClusterSubstrings, even though both
+// describe a read-only target: that list is consulted ONLY under XX000, and
+// this wording arrives under 25006 — a code that is legitimately TERMINAL in
+// its ordinary meaning (a standby refusing writes; see standby_preflight.go).
+// Keeping the lists apart is what lets 25006 stay terminal everywhere except
+// this one measured, storage-driven shape.
+var pgLowDiskReadOnlySubstrings = []string{
+	"disk space low",
+}
+
+// isPGLowDiskReadOnlyMessage reports whether msg carries the Neki low-disk
+// read-only wording. Case-insensitive.
+func isPGLowDiskReadOnlyMessage(msg string) bool {
+	lower := strings.ToLower(msg)
+	for _, sub := range pgLowDiskReadOnlySubstrings {
+		if strings.Contains(lower, sub) {
+			return true
+		}
+	}
+	return false
 }
