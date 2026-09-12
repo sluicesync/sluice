@@ -294,7 +294,16 @@ func (e Engine) ProbeTargetConnectionBudget(ctx context.Context, dsn string, req
 	// operations, and connection slots are not the constraint — so the
 	// max_connections arithmetic above cannot see this and would hand back a
 	// budget the target refuses to honour.
+	copyConcurrencyCeiling := 0
 	if isNeki, _ := probeIsNeki(ctx, cfg.serverKey(), db); isNeki {
+		// Declared as a PRODUCT ceiling on the copy axes, NOT by shrinking
+		// effectiveBudget. Shrinking the budget would (a) constrain only
+		// the within-table axis, leaving the table axis free to multiply it
+		// back up — the defect this replaces — and (b) starve the
+		// overlapped index-build pool, which is funded out of the same
+		// CopyBudget even though an index build is not a COPY and the Neki
+		// limit does not apply to it.
+		copyConcurrencyCeiling = nekiConcurrentCopyLimit
 		if effectiveBudget > nekiConcurrentCopyLimit {
 			slog.InfoContext(ctx, "postgres: capping copy parallelism for a PlanetScale Neki target",
 				slog.Int("connection_budget", effectiveBudget),
@@ -314,6 +323,8 @@ func (e Engine) ProbeTargetConnectionBudget(ctx context.Context, dsn string, req
 		Available:        budget.Available,
 		CopyBudget:       budget.CopyBudget,
 		RequestedCeiling: ceiling,
+
+		CopyConcurrencyCeiling: copyConcurrencyCeiling,
 	}
 
 	if effectiveBudget < 1 {

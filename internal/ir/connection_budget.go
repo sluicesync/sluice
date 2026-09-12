@@ -69,6 +69,32 @@ type ConnectionBudget struct {
 	// mysql.copyFanoutCeiling for the derivation and the measurements.
 	CopyFanoutCeiling int
 
+	// CopyConcurrencyCeiling is the maximum number of COPY statements
+	// this target admits AT ONCE, across the whole run. Like
+	// CopyFanoutCeiling it is a SEPARATE axis from CopyBudget, and the
+	// distinction is the load-bearing part: CopyBudget counts free
+	// CONNECTION SLOTS, this counts concurrent COPIES. A target can have
+	// dozens of slots free and still refuse the fifth COPY.
+	//
+	// It therefore has to bound the PRODUCT of the copy axes
+	// (table_parallelism x within_table_parallelism), not just one of
+	// them — the bug this field exists to fix shipped as a cap on the
+	// within-table axis alone, which the table axis then multiplied back
+	// up. That was invisible while the connection budget was the tighter
+	// bound, and refused a live copy with SQLSTATE 53300 within forty
+	// seconds of the connection budget being raised.
+	//
+	// 0 is the sentinel "this engine declares no COPY-concurrency
+	// ceiling", and it is the zero-value-safe default (the v0.99.51
+	// trap): every engine that does not set it, and every zero-valued
+	// report built on a degraded probe, leaves the resolved axes
+	// untouched. A ceiling NEVER raises them.
+	//
+	// Set today only by the Postgres engine against a PlanetScale Neki
+	// target. See postgres.nekiConcurrentCopyLimit for the measurement
+	// and for why it is a constant rather than a probe.
+	CopyConcurrencyCeiling int
+
 	// EffectiveParallelism is the resolved bulk-copy parallelism after
 	// clamping the requested value to [1, min(CopyBudget, ceiling)].
 	// Meaningful only when Refuse is false.

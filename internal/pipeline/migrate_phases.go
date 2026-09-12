@@ -613,11 +613,17 @@ func (m *Migrator) phaseResolveCopyParallelism(ctx context.Context, rc resumeCon
 	//
 	// copyBudgetForAxes is the copy axes' slice after the ADR-0077 index
 	// reservation (== CopyBudget when overlap isn't engaged).
-	tableParallelism, withinParallelism = migcore.ResolveCopyParallelismBudget(
+	// Every PRODUCT ceiling folds together in migcore.ResolveCopyAxes —
+	// the operator's --max-target-connections (connection slots) and any
+	// COPY-concurrency ceiling the target declares (simultaneous COPY
+	// statements). See its doc for why the fold is a named function with
+	// its own test rather than three arguments inline here.
+	tableParallelism, withinParallelism = migcore.ResolveCopyAxes(
 		copyParallelism,
 		migcore.ResolveTableParallelism(m.TableParallelism),
 		copyBudgetForAxes,
 		m.MaxTargetConnections,
+		budgetReport,
 	)
 	slog.InfoContext(
 		ctx, "bulk-copy parallelism resolved",

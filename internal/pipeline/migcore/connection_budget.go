@@ -291,3 +291,39 @@ func minNonZeroBudget(a, b int) int {
 		return b
 	}
 }
+
+// ResolveCopyAxes resolves the two bulk-copy concurrency axes from the
+// budget report, folding in EVERY product ceiling the run is subject to.
+//
+// It exists as its own function because the fold is where a real defect
+// lived and could not be reached by a test. The Neki COPY-concurrency cap
+// originally shrank the WITHIN-table axis upstream and left the product
+// bound derived from the uncapped connection budget, so the table axis
+// multiplied it straight back up — 4 became 4x4. The unit test that
+// "covered" the cap tested the pigeonhole argument behind the constant and
+// explicitly disclaimed the wiring, so nothing failed; a live Neki router
+// refused the copy with SQLSTATE 53300 within forty seconds of the
+// connection budget being raised enough for the table axis to grow.
+//
+// The two ceilings count DIFFERENT things and both bound the product:
+//
+//   - maxTargetConnections (--max-target-connections) counts CONNECTION
+//     SLOTS the operator is willing to occupy.
+//   - report.CopyConcurrencyCeiling counts simultaneous COPY STATEMENTS the
+//     target admits. A target can have slots to spare and still refuse the
+//     next COPY.
+//
+// copyBudgetForAxes is the measured slot budget already reduced by the
+// ADR-0077 index reservation. 0 anywhere means "no limit from this source".
+func ResolveCopyAxes(
+	resolvedWithin, requestedTable, copyBudgetForAxes, maxTargetConnections int,
+	report ir.ConnectionBudget,
+) (tableP, withinP int) {
+	productCeiling := minNonZeroBudget(maxTargetConnections, report.CopyConcurrencyCeiling)
+	return ResolveCopyParallelismBudget(
+		resolvedWithin,
+		requestedTable,
+		copyBudgetForAxes,
+		productCeiling,
+	)
+}
