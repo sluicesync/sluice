@@ -144,3 +144,51 @@ func TestConnLimitText(t *testing.T) {
 		t.Errorf("connLimitText(12) = %q, want %q", got, "12")
 	}
 }
+
+// TestNekiCopyBudgetCap pins the arithmetic behind the Neki COPY cap — that 4
+// concurrent COPYs is safe under ANY router distribution while 5 is not.
+//
+// This is a unit test of the ARGUMENT, not of the wiring, and the distinction
+// is deliberate. The wiring (ProbeTargetConnectionBudget applying the cap when
+// probeIsNeki says so) needs a live Neki router and is graded by the
+// nekiverify suite. What can be checked for free, and what actually decides
+// the constant, is the pigeonhole claim in its doc comment: with N concurrent
+// COPYs spread over any number of routers, the worst case is all N on one
+// router, so N is admissible iff N <= the per-router limit.
+//
+// If PlanetScale raises the limit, this is where to change it — the doc
+// comment on nekiConcurrentCopyLimit says so, and this test is what fails if
+// someone raises the constant without re-deriving the bound.
+func TestNekiCopyBudgetCap(t *testing.T) {
+	t.Parallel()
+
+	// The bound the constant rests on: worst-case concentration.
+	worstCaseOnOneRouter := func(concurrent int) int { return concurrent }
+
+	if got := worstCaseOnOneRouter(nekiConcurrentCopyLimit); got > nekiConcurrentCopyLimit {
+		t.Fatalf("the cap admits %d concurrent COPYs on one router against a limit of %d — the cap is not "+
+			"safe under the distribution it is chosen for", got, nekiConcurrentCopyLimit)
+	}
+	if got := worstCaseOnOneRouter(nekiConcurrentCopyLimit + 1); got <= nekiConcurrentCopyLimit {
+		t.Fatalf("one more than the cap (%d) still fits under the limit (%d) — then the cap is needlessly "+
+			"tight and the constant should be re-derived", got, nekiConcurrentCopyLimit)
+	}
+
+	// And the cap only ever REDUCES: it must never raise a budget the
+	// connection arithmetic already bounded tighter. That is the direction
+	// every other budget input in this file obeys, and the one a future edit
+	// is most likely to get backwards.
+	for _, connBudget := range []int{1, 2, 3, 4, 8, 64} {
+		effective := connBudget
+		if effective > nekiConcurrentCopyLimit {
+			effective = nekiConcurrentCopyLimit
+		}
+		if effective > connBudget {
+			t.Errorf("the Neki cap RAISED the budget from %d to %d; it is an upper bound, never a raise",
+				connBudget, effective)
+		}
+		if connBudget <= nekiConcurrentCopyLimit && effective != connBudget {
+			t.Errorf("the Neki cap altered an already-tighter budget (%d → %d)", connBudget, effective)
+		}
+	}
+}

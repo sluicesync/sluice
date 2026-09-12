@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -73,6 +74,55 @@ type connectionBudget struct {
 // unlimited is the sentinel "no per-role / per-database limit" the
 // Postgres catalog encodes as a negative rolconnlimit / datconnlimit.
 const unlimited = -1
+
+// nekiConcurrentCopyLimit is the number of concurrent `COPY … FROM STDIN`
+// operations a PlanetScale Neki ROUTER admits. Exceeding it is refused:
+//
+//	ERROR: too many concurrent COPY operations (limit: 4)  (SQLSTATE 53300)
+//	CONTEXT: neki: router cell=aws_useast1b_6 uid=nkr-…
+//
+// # Why a constant and not a probe
+//
+// There is nothing to probe. The limit appears in no GUC (`pg_settings` has
+// no copy-related entry), no `__neki` metafunc publishes it, and it is
+// reported only when the offending COPY starts — by which point a parallel
+// copier already has several streams in flight. Measured 2026-09-12 on a live
+// PS-10-AWS-ARM-NEKI cluster by opening six concurrent COPYs; four succeeded
+// and two were refused. Filed upstream as neki-issues/NEKI-017, whose ask is
+// exactly that this become discoverable.
+//
+// # The scope of the limit: SHARED, not per-router
+//
+// The CONTEXT line names a router, and the first reading of this evidence
+// (mine, for about ten minutes) was that the limit is therefore per-router.
+// The run's own numbers rule that out. Six concurrent COPYs produced exactly
+// two refusals, and those two came from routers in DIFFERENT cells
+// (aws_useast1b_6 and aws_useast1c_6). For a per-router limit of 4 to refuse
+// once on each of two routers, each would have had to see five or more
+// attempts — at least ten connections. There were six.
+//
+// So the admission count is shared across the cluster (per database or per
+// cluster; this evidence cannot separate those), and the CONTEXT merely
+// identifies which router processed the request that lost. That is the
+// reading consistent with 4 admitted + 2 refused out of 6.
+//
+// The cap is the same number either way, which is why this correction changes
+// no code — but it changes what a client can conclude, so it is written down
+// rather than quietly fixed: under a SHARED limit, adding routers or resizing
+// them is not expected to raise the ceiling.
+//
+// # The premise this rests on, named
+//
+// 4 is safe only while sluice is the only thing holding COPYs on the cluster.
+// A second concurrent sluice run, or an operator's own `\copy`, consumes from
+// the same shared count — so the cap prevents sluice from exceeding the limit
+// BY ITSELF, and cannot prevent contention with someone else. That residual is
+// real and is the reason the 53300 path must stay a loud, actionable failure
+// rather than being treated as impossible.
+//
+// If PlanetScale raises the limit, this becomes conservative rather than
+// wrong, and TestNekiCopyBudgetCap is where to change it.
+const nekiConcurrentCopyLimit = 4
 
 // computeConnectionBudget turns a raw probe into the connection budget,
 // applying the formula from the connection-resilience note:
@@ -238,6 +288,21 @@ func (e Engine) ProbeTargetConnectionBudget(ctx context.Context, dsn string, req
 	effectiveBudget := budget.CopyBudget
 	if ceiling > 0 && ceiling < effectiveBudget {
 		effectiveBudget = ceiling
+	}
+
+	// A Neki router admits at most nekiConcurrentCopyLimit concurrent COPY
+	// operations, and connection slots are not the constraint — so the
+	// max_connections arithmetic above cannot see this and would hand back a
+	// budget the target refuses to honour.
+	if isNeki, _ := probeIsNeki(ctx, cfg.serverKey(), db); isNeki {
+		if effectiveBudget > nekiConcurrentCopyLimit {
+			slog.InfoContext(ctx, "postgres: capping copy parallelism for a PlanetScale Neki target",
+				slog.Int("connection_budget", effectiveBudget),
+				slog.Int("neki_concurrent_copy_limit", nekiConcurrentCopyLimit),
+				slog.String("why", "a Neki router refuses a COPY beyond its concurrent-COPY limit; the "+
+					"connection budget does not model that"))
+			effectiveBudget = nekiConcurrentCopyLimit
+		}
 	}
 
 	report := ir.ConnectionBudget{
