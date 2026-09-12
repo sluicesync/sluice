@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/sluicecode"
 	"sluicesync.dev/sluice/internal/sqlident"
 )
 
@@ -311,34 +312,108 @@ func isNekiRelationReadRefusal(err error) bool {
 // — setvalSequence writes is_called=false whenever the source sequence was in
 // that state.
 //
-// The error is always BACKWARD: this function can under-report a position,
-// never over-report one. That direction is what keeps it usable. The
-// forward-only re-prime in [SchemaWriter.reprimeExistingSequence] compares
-// this reading against the captured source position, so an under-report makes
-// it re-issue a setval it did not strictly need (idempotent) rather than skip
-// one it did. The residual hazard — a target genuinely AHEAD of the source in
-// the not-called state reads as behind, and the re-prime rewinds it — needs
-// the target to have moved independently of sluice, and is filed with its
-// reachability analysis and proposed fix in docs/dev/audit-backlog.md
-// (2026-09-11). The test asserts the direction explicitly, so an
-// over-reporting regression fails rather than degrading quietly.
+// In THAT state the error is BACKWARD: the function under-reports, and the
+// forward-only re-prime in [SchemaWriter.reprimeExistingSequence] therefore
+// re-issues a setval it did not strictly need rather than skipping one it did.
+//
+// THAT ARGUMENT GRADES ONE CONSUMER OF THREE, and the first version of this
+// comment stopped there — caught by the v0.151.1 pre-tag value-fidelity
+// review. [readSequencePositionOn]'s other two callers are SOURCE reads (the
+// schema reader's sequence capture and the cutover standalone prime), and on
+// the source an under-report is not a harmless extra setval: it lands a wrong
+// LastValue in the IR, the target is primed from it, and the first
+// post-cutover nextval re-issues values the copied rows already hold. Backward
+// is the SAFE direction for a target re-prime and the CORRUPTING one for a
+// source capture.
+//
+// Two further facts the same review established, both now pinned by
+// TestSequenceCatalogFallbackMatchesTheRelationRead:
+//
+//   - `ALTER SEQUENCE … RESTART WITH n` produces the identical not-called
+//     state, so the precondition is an ordinary DBA action rather than the
+//     exotic `setval(…, false)` the first write-up implied.
+//   - "Ahead" is INCREMENT-AWARE. On a descending sequence the fallback's
+//     start_value is numerically GREATER than the truth while being behind it
+//     in the sequence's direction, so the direction assertion goes through
+//     [sequencePositionBehind] rather than comparing int64s.
+//
+// The privilege arm above is closed by refusing. The not-called arm cannot be
+// resolved through this view at all, and the residual is filed with its
+// reachability analysis in docs/dev/audit-backlog.md (2026-09-11).
 //
 // Used ONLY on the Neki fallback path, so vanilla PostgreSQL keeps reading
 // the relation exactly as before and none of the forward-only re-prime
 // comparisons change shape.
 func readSequencePositionFromCatalog(ctx context.Context, db *sql.DB, schema, name string) (lastValue int64, isCalled bool, err error) {
-	const q = `SELECT last_value, start_value FROM pg_catalog.pg_sequences
+	// has_sequence_privilege is selected ALONGSIDE last_value because a NULL
+	// last_value has TWO causes and only one of them is a position.
+	//
+	// pg_sequences.last_value is defined as
+	//
+	//	CASE WHEN has_sequence_privilege(c.oid, 'SELECT,USAGE')
+	//	     THEN pg_sequence_last_value(c.oid::regclass) ELSE NULL END
+	//
+	// so a role without SELECT/USAGE reads NULL for a sequence that may be
+	// anywhere. Measured on real PostgreSQL 18.6: a sequence genuinely at
+	// (6, is_called=true) reads back through this view as
+	// (last_value NULL, start_value 5) for an unprivileged role. Mapping that
+	// to (start_value, false) — which this function did until 2026-09-11 —
+	// fabricates a position that is wrong by an unbounded amount AND flips
+	// is_called from true to false.
+	//
+	// On vanilla PostgreSQL the relation read in [readSequencePositionOn]
+	// fails first with "permission denied", which is not the Neki refusal, so
+	// it surfaces loudly and this function is never reached. On Neki the
+	// relation read ALWAYS fails NK013 regardless of privilege, so the
+	// classifier is not a door and this is the only place the ambiguity can
+	// be caught. Found by the v0.151.1 pre-tag value-fidelity review.
+	const q = `SELECT last_value, start_value,
+	                  pg_catalog.has_sequence_privilege(pg_catalog.format('%I.%I', schemaname, sequencename), 'SELECT,USAGE')
+	           FROM pg_catalog.pg_sequences
 	           WHERE schemaname = $1 AND sequencename = $2`
 	var last sql.NullInt64
 	var start int64
-	if err := db.QueryRowContext(ctx, q, schema, name).Scan(&last, &start); err != nil {
+	var readable bool
+	if err := db.QueryRowContext(ctx, q, schema, name).Scan(&last, &start, &readable); err != nil {
 		return 0, false, fmt.Errorf("postgres: read sequence position from pg_sequences for %q.%q: %w",
 			schema, name, err)
+	}
+	if !readable {
+		return 0, false, errSequencePositionUnreadable(schema, name)
 	}
 	if !last.Valid {
 		return start, false, nil
 	}
 	return last.Int64, true, nil
+}
+
+// errSequencePositionUnreadable is the refusal for the privilege ambiguity
+// above: the connected role cannot read the sequence, so every number this
+// function could return would be invented.
+//
+// Loud on purpose, and loud even though the caller could "carry on" with
+// start_value. Both consumers act on the number: the SOURCE capture writes it
+// into the IR and the target is primed from it, and the target re-prime
+// compares against it. An invented low position on the source means the
+// migrated target starts issuing values the copied rows already contain —
+// silent duplication at exit 0, on exactly the standalone sequences that
+// cannot be re-derived from MAX(column) the way a serial/identity sequence
+// can.
+func errSequencePositionUnreadable(schema, name string) error {
+	return sluicecode.Wrap(
+		sluicecode.CodeSequencePositionUnreadable,
+		"grant the connecting role read access to the sequence — `GRANT SELECT ON SEQUENCE "+
+			quoteIdent(schema)+"."+quoteIdent(name)+" TO <role>` (or USAGE) — and re-run. On PlanetScale "+
+			"Neki the default `postgres` role already has it; a custom role usually does not. If the "+
+			"sequence is genuinely out of scope, exclude its table with --exclude-table",
+		fmt.Errorf("postgres: cannot read the position of sequence %q.%q: the connected role lacks "+
+			"SELECT/USAGE on it, and on this target the only available reader is pg_catalog.pg_sequences, "+
+			"whose last_value is NULL for exactly that reason — indistinguishable from a sequence that has "+
+			"never been called. Refusing rather than reporting the sequence's start value as its position: "+
+			"that number would be wrong by however far the sequence has advanced, and a target primed from "+
+			"it would re-issue values the copied rows already hold",
+			schema, name),
+	)
 }
 
 // sequencePositionBehind reports whether position (aLV, aCalled) is

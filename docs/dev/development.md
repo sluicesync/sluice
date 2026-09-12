@@ -97,6 +97,15 @@ In CI, the MySQL and Postgres containers boot from pre-baked images on GHCR (`gh
 
 Local `make test-it` uses upstream images by default — the pre-baked optimization addresses concurrent-boot contention that doesn't typically happen on a developer's box.
 
+**Pointing a whole engine suite at a different server version.** Two env vars override the shared container's image, and they are the same mechanism the weekly version matrices use, so a local run reproduces a matrix leg exactly:
+
+```sh
+SLUICE_TEST_PG_IMAGE=postgres:18    go test -tags=integration ./internal/engines/postgres/...
+SLUICE_TEST_MYSQL_IMAGE=mysql:8.4   go test -tags=integration ./internal/engines/mysql/...
+```
+
+Unset, they resolve to the pre-baked floors (PG 16, MySQL 8.0). Set, they reach the shared boot and every per-test boot that does NOT pin a version on purpose — the `lower_case_table_names` folding pair, the file/pos backup-position helpers, the PG 17 FAILOVER tests and every `mariadb:*` helper keep their pinned images, because each of those tests exists to exercise a specific server build. That is why a green override run means "the non-pinned suite passes on this version", not "every test ran on it". The pinned sites are enumerated where each constant is defined.
+
 ### Build-tag layers and their image/time cost
 
 Integration tests are layered by build tag so the normal pass doesn't pull heavy images:

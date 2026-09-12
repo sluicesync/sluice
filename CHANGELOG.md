@@ -4,6 +4,29 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.151.1] - 2026-09-11
+
+### Fixed
+
+**The direct-DDL preflight v0.151.0 shipped was manufacturing the wasted cycle it was built to prevent.** The probe ran on `--resume` as well as on a fresh run, so an operator who hit the refusal, disabled Safe Migrations, and re-ran the way the message told them to hit the same refusal again — and the message said twice that nothing had been created, while the failed attempt had in fact recorded its own `sluice_migrate_state` row, which makes a plain re-run of the same `--migration-id` a refused partial migration. Both halves are fixed: `PreflightDirectDDL` no longer runs when `--resume` is set, and the refusal now says what actually recovers it — a fresh `--migration-id` (or clearing the recorded state), never `--resume`, because there is no partial schema to resume onto. Filed as Bug 284 by the v0.151.0 regression cycle. Pinned by `TestDirectDDLPreflightIsNotRunOnResume`.
+
+**`SLUICE-E-PS-DIRECT-DDL-BLOCKED` now documents its third arm, with the right remedy.** The error-code page and the `planetscale-migration` skill described only the control-table and schema-apply cases, both of which echo the exact statement the branch refused. The v0.151.0 preflight arm does not — it names a throwaway probe table — and its recovery is the opposite of what the page offered. No runtime change.
+
+### Changed
+
+**`--backup-endpoint`'s help no longer reads as a per-provider guarantee.** It names MinIO, Cloudflare R2, Backblaze B2, Wasabi, Tigris and Archil's S3 read API, and one generic S3 client serves all of them, so support is a claim about a class — CI boots exactly one S3 server. The help says so now. `docs/testing.md` carries the derived list of which storage backends a real server has actually answered for, held to the tests by `TestBlobBackendsVerifiedListMatchesTheTests`.
+
+**A PlanetScale Neki sequence's position could be INVENTED rather than read — new refusal `SLUICE-E-SEQUENCE-POSITION-UNREADABLE`.** On PlanetScale Neki the router refuses to read a sequence as a relation (`NK013`), leaving `pg_catalog.pg_sequences`, whose `last_value` is privilege-gated in the view's own definition: a role without `SELECT`/`USAGE` reads NULL for a sequence at any position, and sluice mapped that to the sequence's `start_value`. Measured on real PostgreSQL 18.6, a sequence at `(6, is_called=true)` came back as `(5, false)`. The source capture writes that number into the IR and the target is primed from it, so an invented low position makes the target re-issue values the copied rows already hold — on exactly the standalone sequences that cannot be re-derived from `MAX(column)`. Vanilla PostgreSQL was never affected (its relation read fails loudly with `permission denied` first). Found by the pre-tag value-fidelity review, which also regraded v0.151.0's "the error only points backward" comment: that argument covered one of the reader's three consumers, and the other two are source reads where backward is the corrupting direction. Pinned by `TestSequenceCatalogFallbackRefusesWhatItCannotRead` and an expanded `TestSequenceCatalogFallbackMatchesTheRelationRead` (ascending and descending, plus `ALTER SEQUENCE … RESTART WITH` as the ordinary route into the not-called state).
+
+### Testing
+
+No runtime change from anything in this section; it is recorded because it changes what a green CI run means.
+
+- **A MySQL server-version matrix**, `mysql-version-matrix.yml` from `scripts/mysql-versions.txt`, with a new `SLUICE_TEST_MYSQL_IMAGE` override mirroring the Postgres one. MySQL was the only engine family with no version sweep while the tree carried behaviour measured on 8.4 servers and PlanetScale MySQL runs the 8.4 line. Pinned leg 8.4; `latest` is a canary (measured 26.7.0 — the innovation track).
+- **GCS and Azure blob coverage** via fake-gcs-server and Azurite. Two of gocloud's four drivers had never been booted, including the create-only precondition the ADR-0160 chain concurrent-writer guard maps onto each backend. Both hold, with Azure answering 409 where S3 and GCS answer 412.
+- **MinIO moved off Docker Hub**, which turned four blob tests red with nothing in sluice having changed; the image is now the pinned `quay.io/minio/minio` release, and all three blob emulators are mirrored to GHCR.
+- A **data race** in the package's slog-capture tests, and the nekiverify build-tag axis registered in the run-filter manifest that had been failing Lint on `main`.
+
 ## [0.151.0] - 2026-09-11
 
 ### Added

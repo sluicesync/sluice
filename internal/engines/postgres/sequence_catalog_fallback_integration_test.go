@@ -36,8 +36,11 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"testing"
 	"time"
+
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // The three states a sequence can be in, and what each read reports.
@@ -62,7 +65,13 @@ func TestSequenceCatalogFallbackMatchesTheRelationRead(t *testing.T) {
 
 	cases := []struct {
 		name string
-		// setup runs after CREATE SEQUENCE … START 5.
+		// create overrides the default `CREATE SEQUENCE s_probe START 5`,
+		// which is what the descending cells need.
+		create string
+		// increment is the sequence's direction, fed to the
+		// increment-aware direction assertion below.
+		increment int64
+		// setup runs after the create.
 		setup string
 		// agrees is false for the ONE state where pg_sequences cannot
 		// represent the truth. Spelled per-case rather than derived, so a
@@ -72,31 +81,75 @@ func TestSequenceCatalogFallbackMatchesTheRelationRead(t *testing.T) {
 		why    string
 	}{
 		{
-			name:   "fresh, never called",
-			agrees: true,
+			name:      "fresh, never called",
+			increment: 1,
+			agrees:    true,
 			why: "pg_sequences.last_value is NULL and PostgreSQL's own definition of NULL here is " +
 				"'not read from yet', which is precisely (start_value, is_called=false)",
 		},
 		{
-			name:   "advanced by nextval",
-			setup:  `SELECT nextval('s_probe'), nextval('s_probe')`,
-			agrees: true,
-			why:    "a called sequence writes last_value to disk, so the view carries the real number",
+			name:      "advanced by nextval",
+			increment: 1,
+			setup:     `SELECT nextval('s_probe'), nextval('s_probe')`,
+			agrees:    true,
+			why:       "a called sequence writes last_value to disk, so the view carries the real number",
 		},
 		{
-			name:   "setval with is_called TRUE",
-			setup:  `SELECT setval('s_probe', 9, true)`,
-			agrees: true,
-			why:    "the common priming shape, and the one the fallback was built against",
+			name:      "setval with is_called TRUE",
+			increment: 1,
+			setup:     `SELECT setval('s_probe', 9, true)`,
+			agrees:    true,
+			why:       "the common priming shape, and the one the fallback was built against",
 		},
 		{
-			name:   "setval with is_called FALSE at a position above start",
-			setup:  `SELECT setval('s_probe', 7, false)`,
-			agrees: false,
+			name:      "setval with is_called FALSE at a position above start",
+			increment: 1,
+			setup:     `SELECT setval('s_probe', 7, false)`,
+			agrees:    false,
 			why: "THE HOLE. pg_sequences.last_value stays NULL for any not-called sequence regardless of " +
 				"where it was positioned, so the view cannot distinguish 'never used' from 'positioned at 7 " +
 				"and not yet issued'. sluice reaches this state itself: setvalSequence writes is_called=false " +
 				"whenever the source sequence was in that state",
+		},
+		{
+			// The same state by a FAR commoner route, and the reason the hole
+			// above is not exotic. The pre-tag review named it: an operator
+			// resetting a sequence types RESTART WITH, not setval(…, false).
+			name:      "ALTER SEQUENCE … RESTART WITH, the routine route into the same state",
+			increment: 1,
+			setup:     `ALTER SEQUENCE s_probe RESTART WITH 7`,
+			agrees:    false,
+			why: "RESTART WITH leaves (7, is_called=false) exactly as setval(7,false) does, so the view " +
+				"reports NULL and the fallback answers with start_value — this cell exists to document " +
+				"that the hole's precondition is an ordinary DBA action",
+		},
+		{
+			name:      "DESCENDING sequence, fresh",
+			create:    `CREATE SEQUENCE s_probe START -5 INCREMENT -1 MINVALUE -100 MAXVALUE -1`,
+			increment: -1,
+			agrees:    true,
+			why:       "direction does not change what the view reports for a never-called sequence",
+		},
+		{
+			name:      "DESCENDING sequence, advanced by nextval",
+			create:    `CREATE SEQUENCE s_probe START -5 INCREMENT -1 MINVALUE -100 MAXVALUE -1`,
+			increment: -1,
+			setup:     `SELECT nextval('s_probe'), nextval('s_probe')`,
+			agrees:    true,
+			why:       "a called descending sequence writes its real (negative) last_value to disk",
+		},
+		{
+			// The cell that makes the direction assertion above meaningful: a
+			// naive `gotLV > trueLV` check reads BACKWARD here, because the
+			// fallback's start_value (-5) is numerically GREATER than the
+			// truth (-7) while being behind it in the sequence's direction.
+			name:      "DESCENDING sequence, positioned not-called — the direction trap",
+			create:    `CREATE SEQUENCE s_probe START -5 INCREMENT -1 MINVALUE -100 MAXVALUE -1`,
+			increment: -1,
+			setup:     `SELECT setval('s_probe', -7, false)`,
+			agrees:    false,
+			why: "same hole, mirrored: the fallback answers (-5,false) for a sequence at (-7,false), which " +
+				"is an UNDER-report in the sequence's own direction even though -5 > -7 numerically",
 		},
 	}
 
@@ -105,7 +158,11 @@ func TestSequenceCatalogFallbackMatchesTheRelationRead(t *testing.T) {
 			if _, err := db.ExecContext(ctx, `DROP SEQUENCE IF EXISTS s_probe`); err != nil {
 				t.Fatalf("drop: %v", err)
 			}
-			if _, err := db.ExecContext(ctx, `CREATE SEQUENCE s_probe START 5`); err != nil {
+			create := tc.create
+			if create == "" {
+				create = `CREATE SEQUENCE s_probe START 5`
+			}
+			if _, err := db.ExecContext(ctx, create); err != nil {
 				t.Fatalf("create: %v", err)
 			}
 			if tc.setup != "" {
@@ -147,16 +204,131 @@ func TestSequenceCatalogFallbackMatchesTheRelationRead(t *testing.T) {
 			// when it did not need to (idempotent). One that OVER-reports
 			// would make it skip a prime that was needed, which is the silent
 			// outcome — so pin that it never happens.
-			if !agrees && gotLV > trueLV {
-				t.Errorf("the catalog fallback reported a position AHEAD of the truth (%d > %d); the "+
-					"forward-only re-prime would then believe the target is further along than it is and "+
-					"skip a prime the target needs", gotLV, trueLV)
+			//
+			// Asked through sequencePositionBehind rather than as `gotLV >
+			// trueLV`, because "ahead" is INCREMENT-AWARE: on a descending
+			// sequence the ahead position is the smaller number, and the
+			// naive comparison inverts. The pre-tag review caught that the
+			// first cut of this assertion was numerically wrong for the
+			// descending family — which the table below now covers.
+			if !agrees && !sequencePositionBehind(tc.increment, gotLV, gotCalled, trueLV, trueCalled) {
+				t.Errorf("the catalog fallback reported a position AT OR AHEAD of the truth "+
+					"(fallback %d/%v vs truth %d/%v, increment %d); the forward-only re-prime would then "+
+					"believe the target is further along than it is and skip a prime it needs",
+					gotLV, gotCalled, trueLV, trueCalled, tc.increment)
 			}
 			if !agrees && gotCalled && !trueCalled {
 				t.Errorf("the catalog fallback reported is_called=true for a not-called sequence; the next "+
 					"value the target issues is %d, and a caller told otherwise will place a row on it", trueLV)
 			}
 		})
+	}
+}
+
+// The privilege arm, which is the one that made this a HIGH rather than the
+// MEDIUM its first grading claimed.
+//
+// `pg_sequences.last_value` is privilege-gated in the view's own definition:
+//
+//	CASE WHEN has_sequence_privilege(c.oid, 'SELECT,USAGE')
+//	     THEN pg_sequence_last_value(c.oid::regclass) ELSE NULL END
+//
+// so a role without SELECT/USAGE reads NULL for a sequence at ANY position.
+// Before the fix, the fallback mapped that to `(start_value, false)` — wrong
+// by however far the sequence had advanced, and with is_called flipped from
+// true to FALSE, which is the opposite of the "only ever under-reports by a
+// bounded amount" story the first grading told.
+//
+// Why it matters more than the not-called hole: the magnitude is unbounded,
+// and one of this reader's consumers is the SOURCE capture, whose number is
+// written into the IR and primed onto the target. A source sequence at 10⁶
+// read as `(start, false)` produces a target that re-issues a million values
+// the copied rows already hold — at exit 0.
+//
+// On vanilla PostgreSQL the relation read fails first with "permission
+// denied", which is loud, so the ambiguity is unreachable there. This test
+// calls the fallback DIRECTLY for that reason: it is asserting what the
+// function does when it is the only reader, which on Neki it always is.
+func TestSequenceCatalogFallbackRefusesWhatItCannotRead(t *testing.T) {
+	dsn, cleanup := newSharedPGDB(t, "seq_catalog_fallback_priv")
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	for _, stmt := range []string{
+		`DROP SEQUENCE IF EXISTS s_priv`,
+		`CREATE SEQUENCE s_priv START 5`,
+		`SELECT nextval('s_priv')`,
+		`SELECT nextval('s_priv')`,
+		`DROP ROLE IF EXISTS sluice_seq_lowpriv`,
+		`CREATE ROLE sluice_seq_lowpriv`,
+		`GRANT USAGE ON SCHEMA public TO sluice_seq_lowpriv`,
+	} {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			t.Fatalf("setup %q: %v", stmt, err)
+		}
+	}
+	t.Cleanup(func() {
+		_, _ = db.ExecContext(context.Background(), `DROP ROLE IF EXISTS sluice_seq_lowpriv`)
+	})
+
+	// The truth, read as the owner: the sequence has been called twice.
+	var trueLV int64
+	var trueCalled bool
+	if err := db.QueryRowContext(ctx, `SELECT last_value, is_called FROM s_priv`).
+		Scan(&trueLV, &trueCalled); err != nil {
+		t.Fatalf("relation read as owner: %v", err)
+	}
+	if !trueCalled || trueLV <= 5 {
+		t.Fatalf("fixture did not advance the sequence: (%d,%v)", trueLV, trueCalled)
+	}
+
+	// A dedicated connection pinned to the unprivileged role. SET ROLE on the
+	// shared pool would leak into other tests.
+	lowDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open low-priv conn: %v", err)
+	}
+	defer lowDB.Close()
+	lowDB.SetMaxOpenConns(1)
+	if _, err := lowDB.ExecContext(ctx, `SET ROLE sluice_seq_lowpriv`); err != nil {
+		t.Fatalf("set role: %v", err)
+	}
+
+	// Anti-vacuity: the role must genuinely lack the privilege, or this test
+	// is checking the owner path under a different name.
+	var readable bool
+	if err := lowDB.QueryRowContext(ctx,
+		`SELECT has_sequence_privilege('public.s_priv', 'SELECT,USAGE')`).Scan(&readable); err != nil {
+		t.Fatalf("privilege probe: %v", err)
+	}
+	if readable {
+		t.Fatal("the low-privilege role CAN read the sequence, so this test proves nothing about the " +
+			"ambiguity it exists for")
+	}
+
+	gotLV, gotCalled, err := readSequencePositionFromCatalog(ctx, lowDB, "public", "s_priv")
+	if err == nil {
+		t.Fatalf("the fallback INVENTED a position (%d,%v) for a sequence it cannot read, whose true "+
+			"position is (%d,%v). Every consumer acts on that number — the source capture writes it into "+
+			"the IR and the target is primed from it — so this is silent duplication at exit 0",
+			gotLV, gotCalled, trueLV, trueCalled)
+	}
+	coded, ok := sluicecode.FromError(err)
+	if !ok || coded.Code != sluicecode.CodeSequencePositionUnreadable {
+		t.Fatalf("refused, but not with the coded refusal an operator can act on: %v", err)
+	}
+	for _, want := range []string{"s_priv", "SELECT"} {
+		if !strings.Contains(coded.Hint, want) && !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal names neither the sequence nor the grant: %v / hint %q", err, coded.Hint)
+		}
 	}
 }
 

@@ -589,6 +589,27 @@ const (
 	// NOTHING` fall out of the same catalog read.
 	CodeSourceReplicaIdentity Code = "SLUICE-E-SOURCE-REPLICA-IDENTITY"
 
+	// CodeSequencePositionUnreadable fires when sluice cannot read where a
+	// sequence actually is, and the only alternative would be to invent a
+	// number every consumer then acts on.
+	//
+	// It is reachable on a target (or source) whose router refuses to read a
+	// sequence AS A RELATION — PlanetScale Neki, SQLSTATE NK013 — leaving
+	// `pg_catalog.pg_sequences` as the only reader. That view's `last_value`
+	// is privilege-gated by its own definition (`has_sequence_privilege(…)
+	// … ELSE NULL`), so a role without SELECT/USAGE reads NULL for a
+	// sequence at any position — indistinguishable from one that has never
+	// been called. Mapping that NULL to `start_value` is what this code
+	// replaces: it is wrong by however far the sequence has advanced and it
+	// flips is_called, so a target primed from it re-issues values the copied
+	// rows already hold. Standalone sequences are the ones that carry this
+	// risk, precisely because they cannot be re-derived from MAX(column) the
+	// way a serial/identity sequence is.
+	//
+	// On vanilla PostgreSQL the relation read fails first with "permission
+	// denied", which is loud, so this code does not fire there.
+	CodeSequencePositionUnreadable Code = "SLUICE-E-SEQUENCE-POSITION-UNREADABLE"
+
 	CodePSSafeMigrationsDisabled Code = "SLUICE-E-PS-SAFE-MIGRATIONS-DISABLED"
 	CodePSDeployRequestFailed    Code = "SLUICE-E-PS-DEPLOY-REQUEST-FAILED"
 
@@ -870,6 +891,8 @@ var registry = map[Code]Info{
 	CodeSourceWrongDriver:   {ClassRefusal, "the --source is a recognisable format this source driver does not read (e.g. a mydumper directory handed to the csv driver) — the message names the right driver or preparation step"},
 	CodeCSVNullAmbiguous:    {ClassRefusal, "a csv/tsv source contains an unquoted empty field and no NULL representation was declared — RFC 4180 has no NULL, so sluice refuses to guess; declare the convention with --csv-null"},
 	CodeCSVHeaderUndeclared: {ClassRefusal, "a csv/tsv source was opened without declaring header presence — sluice never sniffs it; pass --csv-header or --csv-no-header"},
+
+	CodeSequencePositionUnreadable: {ClassRefusal, "sluice cannot read where a sequence actually is: the target's router refuses to read a sequence as a relation (PlanetScale Neki, NK013), leaving pg_catalog.pg_sequences as the only reader, and that view's last_value is privilege-gated — NULL for a role without SELECT/USAGE, which is indistinguishable from a sequence that has never been called. Refused rather than reporting the sequence's start value as its position: the source capture writes that number into the IR and the target is primed from it, so an invented low position makes the target re-issue values the copied rows already hold. Grant the role SELECT (or USAGE) on the sequence and re-run"},
 
 	CodeSourceReplicaIdentity: {ClassRefusal, "PG-source cold start refused before the publication was scoped: an in-scope source table has no usable replica identity (its only key is DEFERRABLE, it has no key at all, REPLICA IDENTITY is NOTHING, or the identity includes a STORED GENERATED column Postgres does not publish) — publishing its UPDATEs/DELETEs would make Postgres reject the SOURCE APPLICATION's own writes to it; make the key immediate, point REPLICA IDENTITY USING INDEX at an immediate NOT NULL UNIQUE index, or exclude the table — REPLICA IDENTITY FULL fixes the first three shapes but NOT the generated one"},
 
