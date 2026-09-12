@@ -138,3 +138,67 @@ func TestPoolTimeoutIsNotReportedAsGrowEvidence(t *testing.T) {
 			"contention, not a volume growing", ev, ir.GrowEvidenceNone)
 	}
 }
+
+// TestClassifyApplierError_NekiQueryBufferTimeoutIsTransient pins NK205, and
+// pins that its Neki siblings stay terminal.
+//
+// NK205 (`query buffer timeout: request exceeded max wait`) is a Neki router
+// telling a client its request queue was saturated. It killed a live 29 GB
+// import on 2026-09-12 that had otherwise recovered from every transient it
+// met — arriving from connection ACQUISITION rather than the COPY, while the
+// same run was already riding out 08006 broken pipes from a saturated primary.
+// Unknown SQLSTATEs are terminal by default, correctly, so it needed naming.
+//
+// The sibling cells are the half that keeps this honest: NK013 and NK213 are
+// deliberately terminal, and a fix that made "anything starting NK" retriable
+// would retry a missing feature and a workflow cutover forever.
+func TestClassifyApplierError_NekiQueryBufferTimeoutIsTransient(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name          string
+		code          string
+		message       string
+		wantRetriable bool
+	}{
+		{
+			name:          "NK205 query buffer timeout",
+			code:          "NK205",
+			message:       "query buffer timeout: request exceeded max wait",
+			wantRetriable: true,
+		},
+		{
+			// A missing feature never succeeds on retry.
+			name:          "NK013 opcode not implemented stays terminal",
+			code:          "NK013",
+			message:       "not implemented: opcode not implemented: pg_size_bytes",
+			wantRetriable: false,
+		},
+		{
+			// A deliberate workflow cutover, not an overload.
+			name:          "NK213 blocked table stays terminal",
+			code:          "NK213",
+			message:       "table is blocked by a workflow",
+			wantRetriable: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := classifyApplierError(&pgconn.PgError{Code: tc.code, Message: tc.message})
+			var retriable ir.RetriableError
+			isRetriable := errors.As(got, &retriable) && retriable.Retriable()
+
+			switch {
+			case tc.wantRetriable && !isRetriable:
+				t.Fatalf("SQLSTATE %s classified TERMINAL, want retriable — an overload signal that clears "+
+					"on its own will kill a run that could have finished", tc.code)
+			case !tc.wantRetriable && isRetriable:
+				t.Fatalf("SQLSTATE %s classified RETRIABLE, want terminal — this shape does not self-heal, "+
+					"so retrying burns the ADR-0038 budget on a deterministic failure", tc.code)
+			}
+		})
+	}
+}

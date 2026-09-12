@@ -166,6 +166,33 @@ func classifyApplierError(err error) error {
 			// Explicit non-retriable per ADR-0038 — reaches the
 			// terminal-code shield's bare return below. (Pre-shield this
 			// empty case fell THROUGH to the text legs — the D0-8 bug.)
+		case nekiQueryBufferTimeoutCode:
+			// NK205 — `query buffer timeout: request exceeded max wait`. A
+			// PlanetScale Neki router queues incoming requests; when the
+			// queue is saturated a request that waits past its limit is
+			// refused with this code. It is an OVERLOAD signal, not a fault:
+			// it says the cluster was too busy for this request right now,
+			// and it clears when the load does.
+			//
+			// Measured 2026-09-12 on a fresh PS-40 / NKR-1 branch under a
+			// 29 GB bulk import. It arrived from `acquire conn` — a setup
+			// query on connection acquisition, NOT the COPY itself — while
+			// the same run was already riding out 08006 broken pipes from a
+			// saturated primary. Unknown SQLSTATEs are terminal by default
+			// (correctly), so it killed a run that had otherwise recovered
+			// from every transient it met.
+			//
+			// Retriable rather than terminal, on the same argument as the
+			// class-53 and sidecar-pool-timeout carve-outs above: the
+			// ADR-0038 budget is wall-clock bounded, so a cluster that is
+			// genuinely and permanently saturated still surfaces loudly
+			// instead of retrying forever.
+			//
+			// NOT over-matched: its Neki siblings stay terminal on purpose.
+			// NK013 (`opcode not implemented`) is a missing feature and will
+			// never succeed on retry; NK213 (blocked table) is a deliberate
+			// workflow cutover, handled by the case below.
+			return &retriablePGError{err: err}
 		case nekiBlockedTableCode:
 			// NK213 — a PlanetScale Neki workflow (in practice a
 			// MoveTables write cutover) has blocked this table on the

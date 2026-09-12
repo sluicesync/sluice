@@ -120,3 +120,12 @@ func annotateNekiBlockedTable(err error) error {
 			"reversed: %w", err),
 	)
 }
+
+// nekiQueryBufferTimeoutCode is the SQLSTATE a PlanetScale Neki router returns
+// when its request queue is saturated and a request waits past its limit:
+//
+//	ERROR: query buffer timeout: request exceeded max wait  (SQLSTATE NK205)
+//
+// An overload signal rather than a fault — see the case in
+// [classifyApplierError] for why it is retriable while its NK siblings are not.
+const nekiQueryBufferTimeoutCode = "NK205"
