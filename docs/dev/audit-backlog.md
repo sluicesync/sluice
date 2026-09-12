@@ -15,6 +15,39 @@ Both are the doc-lags-code shape the working agreements name. A note *about* bac
 
 **Staleness caveat (2026-08-18 triage).** A ground-truth pass over the un-struck entries found the "open" section is itself doc-lags-code: EVERY high-value candidate filed before ~2026-08-13 that was checked had already been fixed in code and never struck here (B-2c, D-1/2/3, Bug 239, the Bug 244 restore sibling, C1-1's SQLite/D1 lane — all now struck above with their code proof). Reassuringly, that pass found **zero still-open silent-loss items**. But the lesson is the project's own rule turned on this file: **before executing any un-struck entry older than 2026-08-13, ground-truth it against the code — the backlog text is not reliable for pre-08-13 entries.** The genuinely-open work concentrates in the freshest (2026-08-17 Tier-3) section plus the design-gated / needs-infra items.
 
+## 2026-09-12 — NEKI ARC: consolidated follow-up register (the single list; individual entries below carry the detail)
+
+A day of live Neki work produced three shipped fixes and a tail of open items across three repos. This is the register so none of it is carried in conversation alone. **Shipped today:** `4c09c80e` (statement_timeout on the copy lanes), `771723ba` (COPY-concurrency product ceiling), `b570ecc6` (sidecar pool timeout no longer terminal).
+
+**OPEN — sluice code, ranked by the project's own priority order:**
+
+| # | item | tier | state |
+| --- | --- | --- | --- |
+| 1 | **Deferred index builds fail at 30s on a Neki target.** `CREATE INDEX` on a 26.3M-row table died at **31s** (measured). The statement_timeout pin deliberately excludes index builds (pgx cannot cancel a backend that is not reading its socket), so on Neki the only bound is 30s. **Any secondary index on a large table blocks the migration.** Remedy proven to start: `__neki.online_ddl_create` accepted the same index in 2s and ran it asynchronously. | loud failure, blocks the product on Neki | **not built** |
+| 2 | Typed lane's SOURCE read (`ReadRows`) is unpinned for `statement_timeout` — copying OUT of a low-timeout server still fails. Needs a transaction held across the streaming goroutine's lifetime. | loud failure | filed |
+| 3 | Neki rejects `COPY (SELECT …) TO`, the only form `ExportRawCopy` emits, and there is **no graceful fallback** (confirmed by reading the gate). Needs a source-side eligibility declaration via `probeIsNeki` routing to the typed lane. | loud failure | filed |
+| 4 | Sidecar `tx-idle-timeout` (30s) vs the raw byte-pipe: the target transaction is idle exactly as long as the source stalls, and the raw lane cannot retry (one-shot reader). Not yet reproduced against our own pipe — wants a throttled-source test. | loud failure | filed, unproven |
+| 5 | Chunk-progress writes contend on the shared `sluice_migrate_state` row. **Now diagnosed as LATENCY-driven, not capacity-driven**: 3–4 failures per run from a home link, **zero** from an in-region VM at the same parallelism. Still worth removing (give each chunk its own row) because it silently weakens `--resume`. | robustness | filed |
+| 6 | **Integrate the Neki-specific metrics.** `metrics-watch` already works against a Neki branch unchanged (verified live: storage/capacity/lag/conns all correct). What it does not consume is the Neki-only family: `planetscale_neki_router_queries_total`, `planetscale_neki_router_query_duration_seconds_*`, `planetscale_neki_router_query_errors_total`. | observability | **not built** |
+| 7 | Verify `metrics-watch` reports the **primary's** CPU rather than a pod average on a Neki branch. Tested only while idle, when every pod agrees. Under load the primary read 100% while a replica read 0.02%, so the distinction is load-bearing for any CPU alert. | correctness of an advisory | **unverified** |
+| 8 | `__neki.workflow_metrics` publishes live `rows_copied` / `bytes_copied` / stream phase per table in SQL. Candidate source for Neki-aware progress reporting — and the thing that would have prevented today's misreading of copy progress from target row counts. | observability | idea |
+| 9 | SQLite `DATETIME` → MySQL emitter fix (predates this arc; operator was open to it, deliberately kept out of v0.151.1). | correctness | not built |
+
+**OPEN — platform reports (`neki-issues`, private):** NEKI-017 (concurrent-COPY limit 4), NEKI-018 (30s `statement_timeout` + sidecar `tx-idle-timeout`), NEKI-019 (stale UI disk size). Two corrections already landed after first filing — see each file.
+
+**Live infrastructure, and it BILLS:** four PlanetScale databases (`soak-mysql-*`, `soak-pg-*`, `soak-neki-*`, plus `soak-neki2-*` created for the worn-in-vs-fresh comparison) and one AWS `c7i.2xlarge` in `us-east-1` (`sluice-neki-throughput-test`, plus its key pair and security group). The soak's own stream is DEAD (killed by the pool-timeout defect), so the three original databases are no longer producing data. Teardown is the operator's call; the AWS instance is mine to remove and must be, along with a zero-remaining check against the clean baseline verified before launch.
+
+**Measured throughput register** (same 29 GB table, same binary, verified lossless every time; rows/s from sluice's own `bulk copy complete`, which is the only lag-immune source):
+
+| run | client | cluster | router | streams | rows/s |
+| --- | --- | --- | --- | --- | --- |
+| 1 | laptop | PS-10 | NKR-1 | 2 | 15,403 |
+| 3 | laptop | PS-40 | NKR-1 | 4 | 18,047 |
+| 4 | laptop | PS-40 | NKR-5 | 4 | 19,794 |
+| 5 | us-east-1 VM | PS-40 | NKR-5 | 4 | 22,943 |
+
++49% across every lever, in three steps of ~10–17%. No single change dominated, and each of my successive single-cause explanations (parallelism, then the router, then the client link) was wrong in turn. The constraint moved each time it was relieved — at PS-40/NKR-5 the primary sits at 100% while the routers sit at 16–19%, which is why PS-160 is the next lever rather than a bigger router.
+
 ## 2026-09-12 — a server-side `statement_timeout` is a wall-clock cap on TABLE SIZE (found by the same soak; FIXED on the copy paths, one sibling left open)
 
 The soak's PG lane failed with `canceling statement due to statement timeout (SQLSTATE 57014)` inside `ImportRawCopy`. Root cause: **Neki ships `statement_timeout = 30s` by default** (operator-confirmed: it is an exposed Neki parameter, and PlanetScale Postgres does *not* set it — PG's own default is `0`). A bulk copy is ONE statement over a whole table, so a 30s wall means "no table that takes more than 30 seconds to copy can ever be migrated", and the re-run hits the same wall at the same place — the copy never converges.
@@ -46,7 +79,13 @@ The failures are `SQLSTATE 55P03` (canceling statement due to lock timeout, agai
 
 **Two harms, and the second is the one that is easy to miss** (the enumerate-the-harms rule):
 
-1. **Throughput — and the first reading of this was WRONG, which is worth recording.** Each blocked write waits up to the target's `lock_timeout` before giving up, and the 4-stream run decelerated from ~24,800 rows/s in its first minute to ~9,200 rows/s in the window containing the warnings. It was tempting to call the contention the cause. **The 2-stream run refutes it:** it decelerated by a comparable factor (19,400 rows/s early → 15,400 average, ×0.79) with **zero** progress-write failures, against the 4-stream run's 24,800 → 18,000 (×0.73). Both runs decay at nearly the same rate, so the decay is a property of the copy — PK index maintenance into a growing table is the obvious candidate — and not of the lock contention. The contention is real and worth removing, but its throughput cost is small and unmeasured, not the headline.
+1. **Throughput — UNMEASURED, and the two readings recorded here before it were both built on bad data.** Each blocked write waits up to the target's `lock_timeout` before giving up, so a throughput cost is plausible. Its size is not known.
+
+   The first reading blamed the contention for an apparent deceleration (~24,800 rows/s early → ~9,200 later). The second reading "refuted" that by pointing at the 2-stream run decaying by a comparable factor with zero contention, and concluded the decay belonged to the copy (PK index maintenance). **Both readings are withdrawn.** Every intermediate datapoint behind them came from polling `count(*)` / `n_live_tup` on the target — and the branch runs `--replicas 2` with **measured replication lag exceeding 120 seconds under load**. Reads were being served by a lagging replica, so the "deceleration" is at least partly the lag *growing* under load rather than the copy slowing, and a lag-confounded series cannot refute another lag-confounded series.
+
+   **What survives is only what sluice itself reported**: the `bulk copy complete` line's own row count and duration, which are client-side and lag-immune. Those give whole-run averages and nothing about the shape in between.
+
+   **The rule this cost:** on a target with replicas, a progress poll is a read of the replica, not of the copy. Measure progress from the writer's own accounting, never by counting rows at the target — and treat any mid-flight target count as an observation about replication, not about throughput.
 2. **`--resume` gets quietly weaker exactly when parallelism is higher.** The write failure is a WARN and the copy continues, which is right — losing a progress row costs a redone chunk, not data. But it means the recorded resume state is LESS complete the more parallel the run, and the only signal is a warning line in a log nobody reads after a successful migration. An operator who resumes a 64-chunk copy will silently redo however many chunks lost their completion write.
 
 **Not yet fixed.** The obvious shapes, cheapest first: batch the completion writes (one row update per N chunks, or one at the end of each worker's run) rather than one per chunk; give each chunk its own row so there is nothing to contend on; or make the write a fire-and-forget with a bounded retry off the copy's critical path. The per-chunk-per-row option is the one that removes the contention rather than reducing it.
@@ -64,7 +103,7 @@ Worth noting this was invisible until the connection budget allowed 4 streams �
 
 **A THIRD variable was uncontrolled and I missed it on the first pass:** run 1 ran with the soak's CDC stream alive and competing; run 3 ran after that stream had died (17:33 UTC, ten minutes before run 3 started). So run 3 had *fewer* competitors as well as more streams and a bigger cluster — every variable moved in its favour — and it still returned only +17%. That makes the result more damning rather than less, and it makes the "parallelism share is an upper bound" caveat stronger than stated.
 
-**The likely explanation, operator-supplied and it fits everything:** the Neki ROUTER was observed pegged at **100% CPU** throughout. A saturated router is a serialization point in front of every stream, which is exactly the signature measured — total throughput barely moves while per-stream throughput collapses, because the streams are queueing for one exhausted resource rather than doing independent work. It also explains why the cluster resize (PS-40) bought so little: the resize grows the Postgres side, not the router in front of it.
+**The likely explanation, operator-supplied:** the Neki ROUTER was observed pegged at **100% CPU** throughout. A saturated router is a serialization point in front of every stream, which fits the surviving whole-run numbers — total throughput barely moves while per-stream throughput collapses, because the streams queue for one exhausted resource rather than doing independent work. It also explains why the cluster resize (PS-40) bought so little: the resize grows the Postgres side, not the router in front of it. (This rests on the whole-run averages, which are sound; the per-window "signature" it was first argued from is not — see the replica-lag retraction above.)
 
 That reframes the tuning advice. The binding constraint on a Neki bulk import is not connection slots, not the COPY-concurrency limit, and not the Postgres cluster tier — it is the router. Router tier (`NKR-1` … `NKR-5`) is the knob, and it is the one the API and CLI do not expose (NEKI-017's closing note).
 
