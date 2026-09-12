@@ -15,6 +15,22 @@ Both are the doc-lags-code shape the working agreements name. A note *about* bac
 
 **Staleness caveat (2026-08-18 triage).** A ground-truth pass over the un-struck entries found the "open" section is itself doc-lags-code: EVERY high-value candidate filed before ~2026-08-13 that was checked had already been fixed in code and never struck here (B-2c, D-1/2/3, Bug 239, the Bug 244 restore sibling, C1-1's SQLite/D1 lane — all now struck above with their code proof). Reassuringly, that pass found **zero still-open silent-loss items**. But the lesson is the project's own rule turned on this file: **before executing any un-struck entry older than 2026-08-13, ground-truth it against the code — the backlog text is not reliable for pre-08-13 entries.** The genuinely-open work concentrates in the freshest (2026-08-17 Tier-3) section plus the design-gated / needs-infra items.
 
+## 2026-09-12 — a PG→Neki cold start FAILS at default parallelism (found by the soak, in its first minute)
+
+**Loud, no data loss, and it is the first thing a user migrating PostgreSQL → Neki would hit.** The ADR-0079 fast parallel copy engaged with `within_table_parallelism=6`; the Neki router refuses more than **4 concurrent COPY operations** (`SQLSTATE 53300`, "too many concurrent COPY operations (limit: 4)"), so the copy died with `SLUICE-E-BULKCOPY-TABLE-FAILED` and the target was left holding 165,000 rows of a partial stream.
+
+Filed upstream as `neki-issues/NEKI-017` with full identity and timing. The platform-side ask there is that the limit be discoverable — it is not in `pg_settings`, not in `list_metafuncs()`, and is reported only when the (N+1)th COPY starts.
+
+**The sluice-side question is separate and is the one for this file:** we pick a parallelism from the local CPU count and find out the target's cap by failing. Options, cheapest first:
+
+- **Classify 53300 on a Neki target and retry the table at a lower degree.** The error names the limit (`limit: 4`), so the retry does not have to guess. This is the smallest change and it turns a failed migration into a slower one.
+- **Probe once at cold start** — open N test COPYs, keep the highest that succeeds — which costs a round trip and gets the true cap rather than a parsed one.
+- **Cap the Neki lane at 4 by construction** and say so in the flag help. Simplest, and wrong the day the platform raises the limit.
+
+The first is what I would build: a retry keyed on a code the server already explains, rather than a number we hardcode. **Not built** — the soak is still running and the workaround (`--bulk-parallelism 3`) is in the soak's launcher with a comment saying it is a workaround, not a fix.
+
+**Second finding from the same minute, smaller:** `pg_size_bytes` is unimplemented on the router (`NK013`), hit by the index-build tuning probe. sluice degrades correctly — WARN, then serial index building with the provider default — so this is a note, not a defect. It is the third "standard PostgreSQL function absent, discoverable only by calling it" instance on Neki, after the sequence relation read and `set_data_topology`'s composite return.
+
 ## 2026-09-11 — the whole S3-compatible claim rests on one container from one external registry
 
 **Not a defect; a coverage concentration worth knowing about, surfaced when it broke.** MinIO stopped publishing to Docker Hub and `internal/pipeline/blob_store_integration_test.go` went red at container start — four tests, no code change. Fixed by pinning `quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z` (verified both directions on a real daemon: docker.io denied, quay served).
