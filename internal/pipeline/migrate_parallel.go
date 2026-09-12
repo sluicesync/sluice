@@ -1461,7 +1461,7 @@ func copyChunkRaw(
 		slog.String("format", format.String()),
 		slog.Time("t_start", chunkStart))
 
-	rows, err := runRawCopyChunk(ctx, exp, imp, table, rcChunk, format, chunkIndex)
+	rows, err := runRawCopyChunkWithRetry(ctx, exp, imp, table, rcChunk, format, chunkIndex)
 	if err != nil {
 		return err
 	}
