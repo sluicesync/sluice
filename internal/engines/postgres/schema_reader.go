@@ -1139,7 +1139,7 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 		-- database. Measured 2026-09-10: it succeeds on an unsharded Neki
 		-- and fails on a sharded one at the same version, so the
 		-- constraint arrives when a database is sharded rather than when
-		-- it is created (neki-issues/NEKI-008).
+		-- it is created (reported to PlanetScale).
 		--
 		-- The rewrite is semantically identical and not a concession: the
 		-- correlation was incidental, since the WHERE below pins
@@ -1610,7 +1610,7 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 			-- EXISTS in this SELECT list: a sharded PlanetScale Neki router
 			-- does not implement that shape (measured 2026-09-10; the
 			-- boundary and the misleading error text are in
-			-- neki-issues/NEKI-008). The DISTINCT is load-bearing --
+			-- reported to PlanetScale). The DISTINCT is load-bearing --
 			-- pg_depend can hold several rows per objid and a bare join
 			-- would multiply index-column rows. The flags stay boolean and
 			-- never NULL, as EXISTS did.
@@ -2556,7 +2556,7 @@ func (r *SchemaReader) populateComments(ctx context.Context, tables map[string]*
 	// A PlanetScale Neki router does not implement col_description
 	// ("opcode not implemented: col_description_system_functions"), which
 	// made this one of two catalog reads that failed against a SHARDED Neki
-	// database (neki-issues/NEKI-008). Equivalence was verified rather than
+	// database (reported to PlanetScale). Equivalence was verified rather than
 	// assumed: on real PostgreSQL with two column comments planted, the old
 	// and new forms return identical rows.
 	const colQ = `

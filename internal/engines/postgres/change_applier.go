@@ -2034,7 +2034,7 @@ func loadColumnTypes(ctx context.Context, db *sql.DB, schema, table string) (map
 		FROM   information_schema.columns c
 		-- Joined, not looked up by a correlated scalar subquery in the ON
 		-- clause: a SHARDED PlanetScale Neki router refuses that shape
-		-- outright (neki-issues/NEKI-008), and this query is the one that
+		-- outright (reported to PlanetScale), and this query is the one that
 		-- blocked CDC apply against Neki entirely. Semantically identical --
 		-- the WHERE pins c.table_schema for every row and nspname is unique --
 		-- and plainer SQL on every engine. Sibling of the same rewrite in

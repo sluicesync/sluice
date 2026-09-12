@@ -22,7 +22,7 @@ import (
 // nothing prevents, and which __neki.validate_data_topology reports as valid —
 // and the two disagree.
 //
-// Measured on a live cluster 2026-09-10 (neki-issues/NEKI-006). On a table in
+// Measured on a live cluster 2026-09-10 (reported to PlanetScale). On a table in
 // that state:
 //
 //   - a scattering read returns every row;

@@ -117,7 +117,7 @@ func (w *SchemaWriter) createAndPrimeSequence(ctx context.Context, seq *ir.Seque
 	// It is not specific to sequences: `BEGIN; CREATE TABLE t …; INSERT
 	// INTO t …; COMMIT;` fails the same way, which is worth knowing because
 	// that is what every schema-migration framework emits. See
-	// neki-issues/NEKI-013.
+	// Reported to PlanetScale.
 	//
 	// So on Neki the two statements run in autocommit. That gives up the
 	// atomicity this function was built for (delta review finding #1) —

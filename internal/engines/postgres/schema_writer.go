@@ -1836,8 +1836,8 @@ func isDuplicateObject(err error) bool {
 //	yet supported in execution (SQLSTATE NK013)
 //
 // which made any migration carrying a MySQL ENUM column fail at the
-// create-tables phase against a Neki target (filed at C:\code\neki-issues as
-// NEKI-005). Two alternatives were measured live on Neki: a plain
+// create-tables phase against a Neki target (reported to PlanetScale).
+// Two alternatives were measured live on Neki: a plain
 // `CREATE TYPE` works, and a `DO` block using `IF NOT EXISTS (SELECT 1 FROM
 // pg_type …)` works and is idempotent. Neither was chosen, because doing the
 // tolerate in Go removes the plpgsql dependency ENTIRELY rather than trading

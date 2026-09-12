@@ -84,7 +84,7 @@ sluice's whole migrate shape is *create the tables, then copy into them*, across
 
 ### SHARDED, measured — `neki-torture`, two shards, `xxhash(tenant_id)`
 
-A second Neki database was created (via the API — the CLI rejects `--engine neki`, NEKI-003), a second shard added (`POST …/branches/main/shards`), and a two-shard topology applied by `PUT`ting a data-topology JSON with an `xxhash` shard index on `tenant_id`. `EXPLAIN (NEKI_PLAN)` confirms real routing: `Route [EqualUnique]` on a shard-key predicate, `Aggregate [Ordered] → Collapse → Route [Scatter]` without one. 100 rows across 20 tenants.
+A second Neki database was created (via the API — the CLI rejects `--engine neki`, reported to PlanetScale), a second shard added (`POST …/branches/main/shards`), and a two-shard topology applied by `PUT`ting a data-topology JSON with an `xxhash` shard index on `tenant_id`. `EXPLAIN (NEKI_PLAN)` confirms real routing: `Route [EqualUnique]` on a shard-key predicate, `Aggregate [Ordered] → Collapse → Route [Scatter]` without one. 100 rows across 20 tenants.
 
 | # | Question | Measured |
 |---|---|---|
@@ -97,7 +97,7 @@ A second Neki database was created (via the API — the CLI rejects `--engine ne
 
 ### The sharded target found a silent data-duplication bug of OUR OWN — the most valuable thing this exercise has produced
 
-Recorded here, not only in `neki-issues/NEKI-009`, because the defect is **engine-neutral** and Neki was merely the first store that surfaced it.
+Recorded here, not only in a reported Neki platform finding, because the defect is **engine-neutral** and Neki was merely the first store that surfaced it.
 
 On a sharded Neki database the default shard group covers `public`, so every `INSERT` into sluice's own control tables is refused for want of the shard key (`SQLSTATE NK306`). `migrate` treats per-table progress writes as best-effort and warns past them, so a run completed at exit 0 with **zero** rows in `sluice_migrate_table_progress`.
 
@@ -120,7 +120,7 @@ Recorded in full because the correction is the reusable part.
 
 `sync` into `neki-torture` died on the first change event: `applier: insert into public.cdc_resh: ERROR: not implemented: updating index column "tenant_id" is not supported (NK013)`. sluice's idempotent write is `INSERT … ON CONFLICT (k) DO UPDATE SET <every other column>`, and on a sharded table the shard key is one of those other columns. Neki refuses the statement on its **shape** — measured with the stored and incoming values both equal to 5.
 
-**The obvious fix is a silent-corruption bug.** Leaving the shard key out of the `SET` list makes the statement legal and makes the write wrong: `ON CONFLICT (k)` evaluates its conflict only on the shard the *incoming* row routes to, so a row whose shard key differs from the stored row's finds no conflict and INSERTS. Measured: `SELECT count(*) … WHERE id = 3001` returned **2**, the two rows physically on different shards, at exit 0. A guard predicate does not help — there is no conflict for it to skip. This is [NEKI-006](../../../neki-issues/NEKI-006-topology-without-reshard-silently-splits-a-table.md)'s harm reached with no topology mistake at all, so NEKI-006's diagnosis was narrower than the hazard.
+**The obvious fix is a silent-corruption bug.** Leaving the shard key out of the `SET` list makes the statement legal and makes the write wrong: `ON CONFLICT (k)` evaluates its conflict only on the shard the *incoming* row routes to, so a row whose shard key differs from the stored row's finds no conflict and INSERTS. Measured: `SELECT count(*) … WHERE id = 3001` returned **2**, the two rows physically on different shards, at exit 0. A guard predicate does not help — there is no conflict for it to skip. This is [a reported Neki finding](../../../a reported Neki finding-topology-without-reshard-silently-splits-a-table.md)'s harm reached with no topology mistake at all, so a reported Neki finding's diagnosis was narrower than the hazard.
 
 What shipped, in two parts, because the first part's premise failed under test:
 
@@ -136,11 +136,11 @@ End to end on `neki-torture`, one stream: INSERT applied, UPDATE applied, DELETE
 
 Two capabilities found by re-listing the `__neki` schema, both worth knowing before designing any more of the Neki flavor.
 
-**`list_metafuncs()`** returns all **89** control-plane functions with argument list, return shape, required role and a one-sentence purpose — and it works on a sharded database, which the obvious alternative does not (`pg_get_function_arguments` is NK013 there; see the NEKI-008 footnote). It is the right way to enumerate the surface, and it retires the hand-maintained inventory in `neki-issues/README.md`. Groups: `sidecars` 16, `workflows` 16, `cutover` 12, `topology` 11, `control` 9, `verification` 7, `failover` 6, `schema` 5, `sessions` 4, `utilities` 3.
+**`list_metafuncs()`** returns all **89** control-plane functions with argument list, return shape, required role and a one-sentence purpose — and it works on a sharded database, which the obvious alternative does not (`pg_get_function_arguments` is NK013 there; see the a reported Neki finding footnote). It is the right way to enumerate the surface, and it retires the hand-maintained inventory in the finding-report requirements. Groups: `sidecars` 16, `workflows` 16, `cutover` 12, `topology` 11, `control` 9, `verification` 7, `failover` 6, `schema` 5, `sessions` 4, `utilities` 3.
 
 **`schema_snapshot(in_databases text[])`** — *"Return a pg_dump-compatible schema dump, for the whole cluster or named databases"* — is the interesting one. Measured on the SHARDED cluster: 1,565 lines in a single `global_sql` text column, carrying `CREATE TABLE` for all 14 `public` tables plus the `__neki` internals, roles included (passwords redacted to `'********'`).
 
-That matters because it is a schema read that **works where ours does not**. NEKI-008 is a chain of catalog-query refusals on a sharded database; this function answers the same question in one call, server-side, with no subquery idioms to trip on.
+That matters because it is a schema read that **works where ours does not**. That finding is a chain of catalog-query refusals on a sharded database; this function answers the same question in one call, server-side, with no subquery idioms to trip on.
 
 **It is not a drop-in replacement, and the reason is a tenet.** sluice is IR-first and explicitly forbids regex over DDL strings — a text dump would have to be parsed into the IR, which is a PostgreSQL DDL parser we do not have and should not grow casually. So the honest status is: a **fallback worth designing** if the sharded catalog reads prove unfixable, and an **independent oracle available today** for testing the catalog reader against (reader ≠ writer, for free). Recorded rather than acted on.
 
@@ -282,7 +282,7 @@ Anti-vacuity: the join plans confirm a real router-level hash join over scattere
 
 **The sibling is closed: sluice's read path is byte-clean through the router's compute path, not just its pass-through path.**
 
-What the same probe DID find is `neki-issues/NEKI-010` — the router's own *arithmetic* diverges from PostgreSQL's. `avg(double precision)` returns a number where the shard's own PostgreSQL raises SQLSTATE 22003, and `sqrt`/`power` on `numeric` return a value PostgreSQL reports as **not equal** to its own (`power(2::numeric,0.5)` → `1.41421356237309504` at the router, `1.4142135623730950` on both stock PG 16.15 and the shard's PG 18.6). sluice's copy path never asks the router to do arithmetic, so this is not a sluice exposure — it is recorded because it is a measured counter-example to "SQL support behaves the way Postgres does", and because anything we ever add that pushes an expression down inherits it.
+What the same probe DID find is a reported Neki platform finding — the router's own *arithmetic* diverges from PostgreSQL's. `avg(double precision)` returns a number where the shard's own PostgreSQL raises SQLSTATE 22003, and `sqrt`/`power` on `numeric` return a value PostgreSQL reports as **not equal** to its own (`power(2::numeric,0.5)` → `1.41421356237309504` at the router, `1.4142135623730950` on both stock PG 16.15 and the shard's PG 18.6). sluice's copy path never asks the router to do arithmetic, so this is not a sluice exposure — it is recorded because it is a measured counter-example to "SQL support behaves the way Postgres does", and because anything we ever add that pushes an expression down inherits it.
 
 ### Neki as a SOURCE — works cross-engine, BLOCKED same-engine
 
@@ -293,13 +293,13 @@ What the same probe DID find is `neki-issues/NEKI-010` — the router's own *ari
 
 **N-7 (sluice, design): the raw-copy passthrough lane is unconditional for PG→PG and has no off switch.** `--raw-copy-format` selects `text|binary` only; `ir.RawCopyFormat` has no disabled value. So a Neki source cannot be migrated to a PostgreSQL target at all today, while the same source to a MySQL target works — the fast lane is the only thing in the way. **This is the flavor's first concrete job**: gate `asRawCopyEndpoints` on a capability the Neki flavor declines, so the lane is skipped and the IR path (plain `SELECT`) is used, exactly as it already is cross-engine. An operator-facing `--raw-copy-format=off` would be a cruder second-best.
 
-**Neki as a CDC SOURCE: blocked, loudly, and the reason is precise.** The replication protocol itself is reachable per shard — `IDENTIFY_SYSTEM` and `CREATE_REPLICATION_SLOT … LOGICAL pgoutput EXPORT_SNAPSHOT` both succeed with `options=-c __neki.shard=<uid>`, returning a consistent point *and* a snapshot name. What cannot be done is USE that name: `SET TRANSACTION SNAPSHOT` is not implemented, and neither is `pg_export_snapshot()`. So the export half of the shared-snapshot mechanism works and the import half does not, which makes the exported name decorative (NEKI-007).
+**Neki as a CDC SOURCE: blocked, loudly, and the reason is precise.** The replication protocol itself is reachable per shard — `IDENTIFY_SYSTEM` and `CREATE_REPLICATION_SLOT … LOGICAL pgoutput EXPORT_SNAPSHOT` both succeed with `options=-c __neki.shard=<uid>`, returning a consistent point *and* a snapshot name. What cannot be done is USE that name: `SET TRANSACTION SNAPSHOT` is not implemented, and neither is `pg_export_snapshot()`. So the export half of the shared-snapshot mechanism works and the import half does not, which makes the exported name decorative (reported to PlanetScale).
 
 sluice's PG cold start opens a snapshot stream and has its readers `SET TRANSACTION SNAPSHOT` onto it, so this is a hard stop — and sluice reaches it correctly: two explicit WARNs (the replication-headroom census and the prepared-xact probe each degrade, naming what could not be checked) and then a loud refusal. Nothing silent.
 
 A second constraint found in the same run: a shard-pinned session cannot call router-managed functions (`current_setting`, `set_config`, `nextval`, SQLSTATE `0A000`). That is what made both preflights degrade, and it compounds — the shard-pinned connection is the only one that accepts replication and also the only one that cannot read a GUC.
 
-**Sharded WRITES: the hazard is real and it is sluice-shaped (NEKI-006).** Assigning an already-populated table to a shard group without running a data-movement workflow leaves routing and placement disagreeing, silently: scatter reads return all 100 rows while every equality-routed read returns **0**. Worse, `INSERT … ON CONFLICT (pk) DO UPDATE` — the exact statement sluice's CDC applier and idempotent bulk-copy writer use — **created a duplicate primary key**, because the conflict check runs on the routed shard, which does not hold the original row. Two rows now claim PK `(1,1)`.
+**Sharded WRITES: the hazard is real and it is sluice-shaped (reported to PlanetScale).** Assigning an already-populated table to a shard group without running a data-movement workflow leaves routing and placement disagreeing, silently: scatter reads return all 100 rows while every equality-routed read returns **0**. Worse, `INSERT … ON CONFLICT (pk) DO UPDATE` — the exact statement sluice's CDC applier and idempotent bulk-copy writer use — **created a duplicate primary key**, because the conflict check runs on the routed shard, which does not hold the original row. Two rows now claim PK `(1,1)`.
 
 We induced that state by writing the topology directly, which is **not** the supported path — and a first pass here wrongly concluded the supported one was unavailable, having probed only REST endpoints. **Neki's admin surface is SQL**: a `__neki` schema of functions covering topology (`set_data_topology`, `validate_data_topology`, `wait_for_data_topology`), workflows (`reshard_create`, the `move_tables_*` family, `online_ddl_*`, `list_workflows`), data comparison (`differ_*`), cluster ops, and a `neki_xxh3_64_*` hash function per type. `reshard_create` is the supported way to shard an existing table, and it politely refuses to target a shard group that already exists — the workflow expects to create its own.
 
@@ -309,7 +309,7 @@ What survives the correction is the actual finding: nothing stops the unsupporte
 
 The guard on sluice's side is worth building regardless. Note a design constraint found by testing: the `__neki.neki_xxh3_64_*` hash family is catalogued but **not callable** (`opcode not implemented: user-defined function neki_xxh3_64_int8`), so a preflight cannot compute the routing key itself — that idea was proposed here and is withdrawn. What works needs no hash function: **compare a keyed count against a scattering count for one sampled key**; they agree on a correctly-placed table and diverge to 0-vs-N on a mis-placed one. A target in that state should be refused before CDC apply rather than quietly accumulating duplicates. Filed as a gate proposal rather than built.
 
-**SHARDING NARROWS THE SUPPORTED SQL SURFACE, and this is the most consequential finding for us (NEKI-008).** Two databases, same org, same region, same Neki build `v0.0.0-20260910122429`, same PostgreSQL 18.6 — one unsharded, one sharded. A catalog query carrying a correlated scalar subquery in a `LEFT JOIN … ON` succeeds on the unsharded one and fails on the sharded one:
+**SHARDING NARROWS THE SUPPORTED SQL SURFACE, and this is the most consequential finding for us (reported to PlanetScale).** Two databases, same org, same region, same Neki build `v0.0.0-20260910122429`, same PostgreSQL 18.6 — one unsharded, one sharded. A catalog query carrying a correlated scalar subquery in a `LEFT JOIN … ON` succeeds on the unsharded one and fails on the sharded one:
 
 ```
 not implemented: correlated subquery in an OUTER JOIN ON clause is not yet supported (NK013)

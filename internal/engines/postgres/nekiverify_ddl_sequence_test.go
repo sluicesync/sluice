@@ -31,7 +31,7 @@ import (
 //
 //  1. DDL issued inside an explicit transaction is not visible to later
 //     statements in that transaction and does not survive the commit
-//     (neki-issues/NEKI-013). [SchemaWriter.createAndPrimeSequence] gives up
+//     (reported to PlanetScale). [SchemaWriter.createAndPrimeSequence] gives up
 //     its transaction on a Neki target BECAUSE of this. If the platform fixed
 //     it, the branch is merely unnecessary — safe, and worth knowing. If the
 //     AUTOCOMMIT form ever broke instead, sluice would stop being able to
@@ -93,7 +93,7 @@ func nekiDDLAndSequencePremises(ctx context.Context, t *testing.T, db *sql.DB) {
 		if exists {
 			t.Logf("PREMISE CHANGED (in the SAFE direction): a sequence created inside an explicit "+
 				"transaction SURVIVED the commit. createAndPrimeSequence's Neki branch gives up atomicity "+
-				"for a hazard that may no longer exist — re-derive it and NEKI-013 before relying on this. "+
+				"for a hazard that may no longer exist — re-derive it and the reported finding before relying on this. "+
 				"(create err: %v; setval err: %v; commit err: %v)", createErr, setvalErr, commitErr)
 			// Clean up so the autocommit arm below starts from nothing.
 			if _, err := db.ExecContext(ctx, `DROP SEQUENCE IF EXISTS nv_tx_seq`); err != nil {

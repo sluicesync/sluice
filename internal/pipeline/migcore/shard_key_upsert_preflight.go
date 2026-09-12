@@ -45,7 +45,7 @@ type ShardKeyUpsertProber interface {
 //     the shard the incoming row routes to.
 //
 // Measured on a live 3-shard cluster 2026-09-10: two rows with `id = 3001`,
-// physically resident on different shards, at exit 0 (neki-issues/NEKI-011).
+// physically resident on different shards, at exit 0 (reported to PlanetScale).
 // A CDC replay of an update that changed the shard key produces exactly that,
 // and an at-least-once pipeline will eventually emit one.
 //

@@ -66,7 +66,7 @@ func TestNekiverify_FixtureProvisions(t *testing.T) {
 	t.Run("the declared topology routes the fixture tables", func(t *testing.T) {
 		// The tables must be IN the declared topology, not merely present.
 		// A table created through the router is fully routable and still
-		// absent from the topology (neki-issues/NEKI-014), and a table
+		// absent from the topology (reported to PlanetScale), and a table
 		// outside it falls through to the default shard group rather than
 		// being routed by the shard key this suite relies on.
 		for _, tbl := range []string{"sk_good", "sk_bad", "uq_email"} {

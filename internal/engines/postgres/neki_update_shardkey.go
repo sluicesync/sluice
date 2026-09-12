@@ -33,7 +33,7 @@ import (
 //
 // [buildUpdateSQL] sets every column in the After image. The shard key is one
 // of them, so the statement names it, and Neki refuses on the SHAPE — measured
-// with the before and after values equal (neki-issues/NEKI-011). Being in the
+// with the before and after values equal (reported to PlanetScale). Being in the
 // primary key does not exempt a column from the SET list, because the SET list
 // is built from the row, not from the key.
 //

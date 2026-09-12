@@ -88,8 +88,8 @@ const unlimited = -1
 // reported only when the offending COPY starts — by which point a parallel
 // copier already has several streams in flight. Measured 2026-09-12 on a live
 // PS-10-AWS-ARM-NEKI cluster by opening six concurrent COPYs; four succeeded
-// and two were refused. Filed upstream as neki-issues/NEKI-017, whose ask is
-// exactly that this become discoverable.
+// and two were refused. Reported to PlanetScale, whose ask is exactly
+// that this become discoverable.
 //
 // # The scope of the limit: SHARED, not per-router
 //

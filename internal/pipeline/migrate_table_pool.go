@@ -293,7 +293,7 @@ func setTableProgressAndWrite(
 //
 // Measured 2026-09-10 on a sharded PlanetScale Neki target, where every
 // control-table INSERT is refused for want of the database's shard key
-// (neki-issues/NEKI-009, SQLSTATE NK306): a 40-row keyless table came out
+// (SQLSTATE NK306; reported to PlanetScale): a 40-row keyless table came out
 // of the resume holding 80 rows. Neki is only how the store came to fail;
 // a revoked GRANT, a full disk or a dropped control table reach the same
 // place on any engine.

@@ -119,8 +119,8 @@ func newMigrationStateStore(db *sql.DB, schema string) *MigrationStateStore {
 				// RETURNING clause the statement does not have. It is
 				// order-dependent (the identical pair of expressions succeeds
 				// when swapped), so it is a router rewrite defect rather than
-				// a documented limitation; filed at C:\code\neki-issues as
-				// NEKI-001. These three statements each carried two such
+				// a documented limitation, and is reported to PlanetScale.
+				// These three statements each carried two such
 				// expressions, so `migrate` against a Neki target died on
 				// sluice's OWN control-table write at phase 1.75, before
 				// creating a table or copying a row. Leaning on the defaults

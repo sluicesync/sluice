@@ -25,7 +25,7 @@ import (
 // [classifyTableForResume] acts on that when it returns resumeActionFresh,
 // and fresh does NOT truncate. Measured 2026-09-10 on a sharded PlanetScale
 // Neki target whose control tables refuse every INSERT for want of the
-// database's shard key (neki-issues/NEKI-009): a 40-row keyless table came
+// database's shard key (reported to PlanetScale): a 40-row keyless table came
 // out of a --resume holding 80 rows, because the breadcrumb write had been
 // swallowed as a WARN and the second copy had nothing to conflict on.
 //
@@ -320,7 +320,7 @@ func TestProgressBreadcrumbsDoNotRideTheBestEffortHelper(t *testing.T) {
 	for _, v := range violations {
 		t.Errorf("%s\n  a non-terminal progress entry must be written through %s, not %s: losing it makes a "+
 			"missing progress row mean \"never copied\" for a table that WAS copied, and a --resume then appends a "+
-			"second copy of every row of a keyless table (neki-issues/NEKI-009)", v, durable, bestEffort)
+			"second copy of every row of a keyless table (reported to PlanetScale)", v, durable, bestEffort)
 	}
 
 	// Anti-vacuity floor. A walker that found nothing passes for free, and

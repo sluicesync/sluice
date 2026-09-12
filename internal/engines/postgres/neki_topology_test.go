@@ -94,7 +94,7 @@ func TestNekiTopologyShardKeyResolution(t *testing.T) {
 			name: "UNDECLARED table inherits the database default", table: "not_in_the_topology",
 			wantCols: []string{"tenant_id"}, wantSharded: true,
 			why: "PlanetScale documents that an unlisted table inherits schema, then database, then cluster — " +
-				"which is exactly how sluice's own control tables ended up needing the shard key (NEKI-009). " +
+				"which is exactly how sluice's own control tables ended up needing the shard key (a reported Neki finding). " +
 				"Resolving an unlisted table to 'not sharded' would silently exempt the majority of tables",
 		},
 		{

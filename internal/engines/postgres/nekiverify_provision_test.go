@@ -55,7 +55,7 @@ import (
 // therefore what customers actually run) rather than the cheaper
 // single-node shape, whose availability is contested — the console refuses
 // it, `pscale size cluster list` sells it, and the API creates it
-// (neki-issues/NEKI-015). The HA create is UNTIMED and may be slower than
+// (reported to PlanetScale). The HA create is UNTIMED and may be slower than
 // 418 s; the timeouts below carry headroom for that.
 
 const (

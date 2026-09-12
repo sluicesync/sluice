@@ -111,7 +111,7 @@ Written down because the wrong conclusion was reachable and nearly reached: that
 
 **Operator decision, 2026-09-11: the default is `--replicas 2`** — the high-availability shape, which is what the console offers and therefore what customers actually run. The fixture should match the thing being defended, not the cheapest thing that boots.
 
-That matters because the cheap shape is of contested legality. The console refuses single-node Neki; `pscale size cluster list --engine neki` advertises and prices it; `pscale database create --replicas 0` creates one that works (see `neki-issues/NEKI-015`). A shape that works today and may not be meant to exist is a bad thing to build a weekly regression suite on — if it were withdrawn, the suite would start failing for a reason that has nothing to do with sluice.
+That matters because the cheap shape is of contested legality. The console refuses single-node Neki; `pscale size cluster list --engine neki` advertises and prices it; `pscale database create --replicas 0` creates one that works (see a reported Neki platform finding). A shape that works today and may not be meant to exist is a bad thing to build a weekly regression suite on — if it were withdrawn, the suite would start failing for a reason that has nothing to do with sluice.
 
 **But keep exercising `--replicas 0` deliberately**, on the operator's read that it will likely become a supported option once PlanetScale settles the details. An occasional single-node run — dispatch-only, not on the weekly schedule — is how we find out early whether sluice cares about the difference. It should not: nothing in the Neki adaptations reads replica count. That is a claim worth testing rather than assuming, and it is cheap to test.
 

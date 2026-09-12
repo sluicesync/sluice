@@ -468,7 +468,7 @@ const (
 	// Measured 2026-09-10 against a sharded PlanetScale Neki target, where
 	// the default shard group covers `public` and so every INSERT into
 	// sluice's own control tables is refused for want of the shard key
-	// (SQLSTATE NK306, neki-issues/NEKI-009): a 40-row keyless table held
+	// (SQLSTATE NK306; reported to PlanetScale): a 40-row keyless table held
 	// 80 rows after the resume. The store failure is engine-neutral — a
 	// revoked GRANT or a dropped control table reaches the same state on
 	// any engine.
@@ -515,7 +515,7 @@ const (
 	//
 	// Measured 2026-09-10 on a live 3-shard cluster: two rows carrying
 	// `id = 3001`, physically resident on different shards, at exit 0
-	// (neki-issues/NEKI-011). A CDC replay of an update that changed the
+	// (reported to PlanetScale). A CDC replay of an update that changed the
 	// shard key produces exactly that.
 	//
 	// There is no third spelling, so this is a refusal rather than a

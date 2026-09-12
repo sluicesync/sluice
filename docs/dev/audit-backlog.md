@@ -19,7 +19,7 @@ Both are the doc-lags-code shape the working agreements name. A note *about* bac
 
 **Loud, no data loss, and it is the first thing a user migrating PostgreSQL → Neki would hit.** The ADR-0079 fast parallel copy engaged with `within_table_parallelism=6`; the Neki router refuses more than **4 concurrent COPY operations** (`SQLSTATE 53300`, "too many concurrent COPY operations (limit: 4)"), so the copy died with `SLUICE-E-BULKCOPY-TABLE-FAILED` and the target was left holding 165,000 rows of a partial stream.
 
-Filed upstream as `neki-issues/NEKI-017` with full identity and timing. The platform-side ask there is that the limit be discoverable — it is not in `pg_settings`, not in `list_metafuncs()`, and is reported only when the (N+1)th COPY starts.
+Filed upstream as a reported Neki platform finding with full identity and timing. The platform-side ask there is that the limit be discoverable — it is not in `pg_settings`, not in `list_metafuncs()`, and is reported only when the (N+1)th COPY starts.
 
 **The sluice-side question is separate and is the one for this file:** we pick a parallelism from the local CPU count and find out the target's cap by failing. Options, cheapest first:
 

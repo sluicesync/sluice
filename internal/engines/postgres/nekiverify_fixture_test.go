@@ -92,7 +92,7 @@ func provisionShardedNeki(ctx context.Context, t *testing.T, c psCreds) *nekiFix
 		"cluster_size": nekiClusterSize,
 		// The HA shape, which is what the console offers and therefore what
 		// customers run. Single-node Neki is creatable through this API and
-		// refused by the console (neki-issues/NEKI-015) — a shape that works
+		// refused by the console (reported to PlanetScale) — a shape that works
 		// today and may not be meant to exist is a bad foundation for a
 		// weekly suite.
 		"replicas": 2,
@@ -140,7 +140,7 @@ func provisionShardedNeki(ctx context.Context, t *testing.T, c psCreds) *nekiFix
 // most needs — their systems index on it, where a database name is ours and
 // means little to them. But it SUPPLEMENTS the names rather than replacing
 // them: a report carrying only the branch id is hard for us to place in our
-// own history. Operator requirement, 2026-09-11 — see neki-issues/README.md.
+// own history. Operator requirement, 2026-09-11 — see the operator's finding-report requirements.
 //
 // Capturing it here rather than relying on whoever writes the report to
 // remember is the point: these databases are deleted at the end of every
@@ -407,7 +407,7 @@ func createFixtureTables(ctx context.Context, t *testing.T, fx *nekiFixture) {
 
 	// Each statement runs on its own — DDL inside an explicit transaction is
 	// invisible to that transaction on Neki and does not survive the commit
-	// (neki-issues/NEKI-013), so batching these would silently create
+	// (reported to PlanetScale), so batching these would silently create
 	// nothing.
 	stmts := []string{
 		// The supported shape: shard key inside the primary key. Anti-vacuity

@@ -41,7 +41,7 @@ type ShardPlacementProber interface {
 // else — so it stops the run rather than warning.
 //
 // Measured on a live PlanetScale Neki cluster on 2026-09-10 and written up at
-// C:\code\neki-issues as NEKI-006, including the side-by-side against a table
+// reported to PlanetScale, including the side-by-side against a table
 // sharded through the supported reshard workflow, which behaves correctly.
 //
 // # What it does NOT cover, stated rather than implied

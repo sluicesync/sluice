@@ -43,7 +43,7 @@ import (
 //
 // An equality-routed read hides the duplicate and a scattering read reveals
 // it, so the corruption is invisible to exactly the queries a sharded
-// application is written to use. See neki-issues/NEKI-011.
+// application is written to use. Reported to PlanetScale.
 //
 // The condition that makes the write safe is checkable before anything is
 // written, and it is simple:
@@ -394,7 +394,7 @@ func planShardKeyUpsert(tableName string, shardCols []string, multiShard bool, k
 	// incoming row routes to, so no conflict is found, the row INSERTs, the
 	// predicate never runs, and the affected-row count matches the batch.
 	// Nothing detects it and the target ends up holding two rows under one
-	// primary key (neki-issues/NEKI-011).
+	// primary key (reported to PlanetScale).
 	//
 	// An earlier cut of this file argued that combination was unreachable
 	// because [PreflightShardKeyUpsert] refuses it. That was true of

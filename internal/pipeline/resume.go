@@ -887,7 +887,7 @@ func truncateForResume(ctx context.Context, rw ir.RowWriter, table *ir.Table) er
 // is a second copy of every row appended to the first, at whatever exit
 // code the original failure produced — measured 2026-09-10 on a sharded
 // PlanetScale Neki target whose control tables could not accept an
-// INSERT (neki-issues/NEKI-009): a 40-row keyless table came back from
+// INSERT (reported to PlanetScale): a 40-row keyless table came back from
 // the resume holding 80.
 //
 // # Why it refuses rather than truncating
