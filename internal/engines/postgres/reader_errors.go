@@ -21,6 +21,28 @@ package postgres
 // [ir.RetriableError] when err matches one of the documented
 // transient shapes. Returns err unchanged otherwise. nil in → nil
 // out. Delegates to [classifyApplierError].
+//
+// # It delegates to the APPLIER classifier, not the copy one, deliberately
+//
+// Its five call sites are all in the CDC pump's walreceiver loop
+// ([cdc_reader.go]: standby status update, receive, server error, parse
+// xlogdata, and the decode path) — so this is a CDC classifier, and CDC keeps
+// the retriable verdict for schema drift.
+//
+// This line was briefly [classifyCopyError] during the Bug-285 fix, which made
+// schema drift terminal here as a side effect nobody chose: the commit that
+// did it is titled "schema drift is retriable for CDC and TERMINAL for a copy"
+// and this is CDC, so the change contradicted its own stated scope. Reverted
+// 2026-09-13 and pinned by TestCDCReaderKeepsTheRetriableSchemaDriftVerdict,
+// because the whole point of splitting the two classifiers was that the split
+// is a decision, and a decision that can be made by an unnoticed one-word edit
+// is not being made.
+//
+// Whether the CDC READER *should* eventually take the terminal verdict is a
+// real question — its errors arrive from the SOURCE, where "an operator is
+// about to create the missing relation" is a much weaker premise than it is on
+// the target — but that is a behaviour change owed a measurement and a
+// deliberate commit, not a patch-release side effect.
 func classifyReaderError(err error) error {
-	return classifyCopyError(err)
+	return classifyApplierError(err)
 }

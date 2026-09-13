@@ -411,6 +411,49 @@ func (e *terminalPGError) Error() string  { return e.err.Error() }
 func (e *terminalPGError) Unwrap() error  { return e.err }
 func (e *terminalPGError) Terminal() bool { return true }
 
+// Retriable and RetryHint are what make the terminal verdict STICK, and
+// without them this whole type was decorative at most of its consumers.
+//
+// The wrapped error is the already-classified one, which for every case this
+// type is used on is a *retriablePGError. `Unwrap` is preserved deliberately
+// (errors.Is/As against the underlying *pgconn.PgError must keep working), and
+// that is exactly what defeated the verdict: `errors.As(err, &someRetriable)`
+// does not stop at a type that fails to implement the interface — it unwraps
+// THROUGH it and matches the retriable error inside. So a consumer asking the
+// ordinary question got `true`.
+//
+// Measured 2026-09-13 on the real types: `ir.IsTerminal(err)` and
+// `re.Retriable()` both answered TRUE for the same 42P01. Only the consumers
+// that happen to test `ir.IsTerminal` FIRST — one of six — saw the verdict.
+// The other five are the typed COPY core and idempotent batch core (which rode
+// a missing relation to the ~30-minute reparent wall, and on a keyless table
+// reported it as an ambiguous-replay refusal), `quiesceAndReportTransient`
+// (which TRIPPED THE RUN-WIDE GROW GATE for a table that does not exist —
+// literally manufacturing the misleading storage-growth headline this
+// classifier was written to remove), and the index and constraint DDL phases.
+//
+// Implementing ir.RetriableError with a `false` answer short-circuits the
+// walk: errors.As now matches HERE and stops, so every consumer gets the
+// verdict regardless of which question it asks. This also repairs v0.152.0's
+// in-doubt-COMMIT refusal and the dead-pinned-connection refusal, which are
+// terminal producers that fed the same five predicates.
+//
+// The general rule, worth keeping: a wrapper that reverses a verdict must
+// implement the interface it is reversing. Implementing only the NEW verdict
+// leaves the OLD one reachable by unwrap, and the two then disagree.
+func (e *terminalPGError) Retriable() bool { return false }
+
+// RetryHint completes the ir.RetriableError contract; it is never consulted,
+// because Retriable answers false.
+func (e *terminalPGError) RetryHint() time.Duration { return 0 }
+
+// Compile-time proof that the reversal is visible to BOTH questions a consumer
+// can ask. Without the ir.RetriableError half this type answered only one.
+var (
+	_ ir.TerminalError  = (*terminalPGError)(nil)
+	_ ir.RetriableError = (*terminalPGError)(nil)
+)
+
 // classifyCopyError is [classifyApplierError] with ONE verdict reversed, for
 // the BULK-COPY and schema phases rather than the CDC applier.
 //
@@ -441,9 +484,29 @@ func (e *terminalPGError) Terminal() bool { return true }
 // Used by every COPY-path and schema-path classification: the raw lane's
 // export and import, the typed lane's write core (via
 // [quiesceAndReportTransient]), the source read, and the schema/index writers.
-// NOT used by anything under change_applier*.go — the CDC applier keeps the
-// retriable verdict, deliberately, and a change there would reintroduce the
-// crash-loop that verdict exists to prevent.
+//
+// The CDC applier keeps the retriable verdict, deliberately — a change there
+// would reintroduce the crash-loop that verdict exists to prevent. The CDC
+// READER keeps it too, via [classifyReaderError]; that one is worth naming
+// because it was silently switched to this classifier by the Bug-285 commit
+// and switched back, and it is now pinned.
+//
+// # One reach that is NOT obvious from the call graph, and was wrong here
+//
+// This comment used to say "NOT used by anything under change_applier*.go".
+// That was true by FILENAME and false by REACH: [afterConnectRegisterGeometry]
+// calls this function, and that hook is installed on the concurrent applier
+// pool, the pipelined applier pool and the CDC writer pool. So a 42703/42P01
+// raised while OPENING an applier connection is graded terminal.
+//
+// It is harmless — the hook's only query is a `pg_type` lookup, and a catalog
+// read cannot return undefined-table or undefined-column — but "harmless" is
+// not what the enumeration claimed, and an enumeration that exists to prevent
+// exactly this kind of leak has to be derived from reach rather than from
+// where the code happens to live. Found by the pre-tag value-fidelity review
+// of v0.152.1; recorded rather than quietly corrected, because the failure
+// mode (a file-scoped claim standing in for a call-graph claim) is the part
+// worth recognising next time.
 func classifyCopyError(err error) error {
 	classified := classifyApplierError(err)
 	if !isSchemaDriftPGError(err) {

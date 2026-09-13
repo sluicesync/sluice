@@ -178,9 +178,22 @@ func openPgxDBAs(dsn string, role connRole, appID string, opts ...stdlib.OptionO
 // pinStandardConformingStrings): a sub-1 extra_float_digits inside
 // sluice's OWN sessions can only reintroduce the Bug-194 silent-loss
 // class; there is no legitimate operator intent to honor.
+// Both failures are CLASSIFIED rather than returned bare, for the reason
+// [afterConnectRegisterGeometry] is: an AfterConnect hook runs on every
+// connection the engine opens, including every per-chunk writer connection,
+// so its error lands on the chunk-open path, whose retry reads the engine's
+// verdict and treats an unclassified error as fatal.
+//
+// This hook is the WIDER of the two and it runs FIRST. It is the default hook
+// on every pool (the geometry hook is on four), and [composeAfterConnect]
+// short-circuits left-to-right with this one ordered first everywhere — so
+// until this was classified, the v0.152.1 fix was only ever reachable on
+// connections where this hook had already succeeded. Found by the pre-tag
+// perf-parity review of that fix; whether the specific NK205 sidecar outage
+// also refuses a `SET` is unmeasured, and the shape does not depend on it.
 func afterConnectSessionPins(ctx context.Context, conn *pgx.Conn) error {
 	if _, err := conn.Exec(ctx, "SET extra_float_digits = 3"); err != nil {
-		return fmt.Errorf("postgres: pin extra_float_digits: %w", err)
+		return classifyCopyError(fmt.Errorf("postgres: pin extra_float_digits: %w", err))
 	}
 	// bytea_output, for the same reason and by the same argument — the
 	// SIBLING SWEEP of the walsender pin (audit 2026-08-05 B-1, whose first
@@ -198,7 +211,7 @@ func afterConnectSessionPins(ctx context.Context, conn *pgx.Conn) error {
 	// engines, so PG→MySQL gets a COUNT that a shrunk value does not change),
 	// which is why this is worth a pin rather than a note.
 	if _, err := conn.Exec(ctx, "SET bytea_output = hex"); err != nil {
-		return fmt.Errorf("postgres: pin bytea_output: %w", err)
+		return classifyCopyError(fmt.Errorf("postgres: pin bytea_output: %w", err))
 	}
 	return nil
 }

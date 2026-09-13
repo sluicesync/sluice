@@ -18,6 +18,22 @@ import (
 // query (the database isn't reachable, the role doesn't have
 // connect privileges) is propagated; "no row" is reported as
 // "not installed" without an error.
+//
+// # Why the failure is CLASSIFIED rather than returned bare
+//
+// This runs inside [Engine.OpenRowWriter] and [Engine.OpenSchemaWriter],
+// three lines after the pool is opened — so it is on the chunk-OPEN path,
+// whose retry decides by asking whether an error carries an engine verdict.
+// Returned bare, a transient platform fault here fails the whole table.
+//
+// It is the same-function SIBLING of the spatial-OID probe fixed in v0.152.1,
+// and it is a catalog query of exactly that probe's shape: on the measured
+// PS-10 Neki incident, where a full volume took the shard's sidecars
+// unhealthy, `NK205 no healthy sidecars available` arrives here just as
+// readily. Whichever of the two probes the sick shard happens to hit first
+// decided the run, so fixing one and not the other would have left the
+// outcome a coin flip. Found by the pre-tag perf-parity review of v0.152.1 —
+// the fix that prompted it had not enumerated its siblings.
 func detectPostGIS(ctx context.Context, db *sql.DB) (bool, error) {
 	var present bool
 	err := db.QueryRowContext(
@@ -25,7 +41,7 @@ func detectPostGIS(ctx context.Context, db *sql.DB) (bool, error) {
 		"SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'postgis')",
 	).Scan(&present)
 	if err != nil {
-		return false, fmt.Errorf("postgres: detect postgis: %w", err)
+		return false, classifyCopyError(fmt.Errorf("postgres: detect postgis: %w", err))
 	}
 	return present, nil
 }

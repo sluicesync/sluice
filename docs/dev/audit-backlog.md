@@ -27,7 +27,7 @@ Both are the doc-lags-code shape the working agreements name. A note *about* bac
 | fresh `PS-10` / `NKR-1` | 10 GiB | **FAILED at 191s** — `08006 write: broken pipe`, primary CPU at 100% |
 | worn-in `PS-160` / `NKR-5` | **150 GiB, pre-grown** | **succeeded**, 29,869 rows/s, lossless |
 
-Only the target whose volume had already grown completed. The platform's autoscaling is reactive — the volume grew 10 → 39 GiB roughly **2m20s after** the client had already been refused (NEKI-021 has the sampled curve).
+Only the target whose volume had already grown completed. The platform's autoscaling is reactive — the volume grew 10 → 39 GiB roughly **2m20s after** the client had already been refused; the sampled capacity curve behind that number is in the upstream report filed for it.
 
 **Why our own defences did not fire, which is the finding.** Everything worked as designed and none of it mattered:
 
@@ -161,7 +161,30 @@ That is legal and safe, and it is not obviously the best split. For six similar 
 **The honest caveat, which matters more than the result:** 200 MB against a 10 GiB volume means **no storage grow ever happened**. The earlier PS-10 failure was a *29 GB* copy into that same 10 GiB volume — a storage-grow failure, not a CPU or concurrency one. This run does not reproduce that condition and says nothing about it. So item 12 splits:
 
 - **Answered:** a PS-10 handles a modest multi-table migration at defaults, and nothing in sluice needs to pace itself to make that work.
-- **Still open:** whether a PS-10 survives a copy that outgrows its volume — which is the case that actually failed before, and the one the AIMD/grow-gate machinery exists for. That needs a dataset sized past 10 GiB on a small tier.
+- ~~**Still open:** whether a PS-10 survives a copy that outgrows its volume~~ — **ANSWERED 2026-09-13, and it found a real defect. See immediately below.**
+
+#### Item 12, second half — a PS-10 DOES survive outgrowing its volume, once the copy stops throwing away a verdict
+
+The dataset the first half asked for: 12,000,512 rows / ~13 GB of deliberately incompressible payload (md5 blobs, `STORAGE EXTERNAL` so nothing is compressed into invisibility) into a fresh PS-10 whose volume starts at 10 GiB. Two runs, same workload, same tier.
+
+**Run 1 died at 3m40s** — and the interesting part is that everything sluice is supposed to do had already worked. The grow gate closed and reopened, chunks retried, the shard reported itself read-only while the platform worked. Four chunk retries, worst chunk at attempt 2: nowhere near any budget. **The budget was never the limit.**
+
+Root cause, and it is not where two earlier hypotheses put it (the entry tier was never the problem, and neither was pacing): `afterConnectRegisterGeometry` is an **AfterConnect hook**, so it runs on *every* connection the engine opens, including every per-chunk writer connection a parallel copy mints. When the volume filled, the shard's sidecars went unhealthy and that hook's spatial-OID probe came back `NK205 no healthy sidecars available … SIDECAR_TYPE_PRIMARY`. `NK205` is classified transient *on purpose*, precisely so a copy can wait out this window — but the hook returned the error **bare**, and `isRetriableChunkOpenError` decides by asking whether an error carries an engine verdict. With nothing to read, a condition that clears the moment the platform finishes growing the volume failed the table.
+
+This is the Bug-207 class at a **`return` site** rather than a `setErr` one, which is why `internal/errclassgate` could not see it: that gate walks PARKED errors, and a hook that returns is invisible to it. Worth filing as a gate-scope gap in its own right.
+
+**Run 2, with the fix (`a66abb95`), completed.** Same tier, same data, no tuning:
+
+| | run 1 (bare error) | run 2 (classified) |
+|---|---|---|
+| outcome | died at 3m40s | **complete, 3 tables, 17m23s** |
+| `NK205`s | 1, fatal | **34, all ridden out** |
+| volume | filled, run dead | **10 GiB → 39 GiB mid-copy** (41,875,931,136 bytes capacity, from the platform's own metrics) |
+| verification | — | **counts exact; `blobs` md5-exact; `bulk`/`bulk2` order-independent hash exact vs source** |
+
+So the answer to the original question is **yes, a PS-10 survives outgrowing its volume** — but only because of this fix, and the first run is the honest evidence that the machinery built for this case was one unclassified `return err` away from being inert. Torn down: database deleted, org confirmed at zero, source container removed.
+
+**The gate half, which is the part worth keeping:** the pin is deliberately split across two packages. `postgres.TestSpatialOIDProbeErrorIsClassified` grades that the verdict is attached; `pipeline.TestChunkOpenRetryHonoursEngineVerdict` grades that the chunk-open retry reads it. Either passes while the other's side is broken — which is exactly how the live defect survived — so neither alone is evidence. The engine-side unit test was *also* self-referential in its first cut (it built the error itself, so reverting the hook to `return err` left it green); the binding gate is the integration test that takes the error **from the hook**, on a genuinely broken connection. That is the third self-referential gate caught in this arc.
 
 #### New finding — `--index-build-mem` tuning is INERT on Neki, and now measured rather than assumed
 
@@ -205,7 +228,7 @@ Other constraints, each learned by hitting it:
 
 The shape maps onto ADR-0148's deploy-request fallback for PlanetScale MySQL (`IndexBuildFallback`), so this is a second implementor of an existing pattern rather than a new subsystem.
 
-**OPEN — platform reports (`neki-issues`, private):** NEKI-017 (concurrent-COPY limit 4), NEKI-018 (30s `statement_timeout` + sidecar `tx-idle-timeout`), NEKI-019 (stale UI disk size). Two corrections already landed after first filing — see each file.
+**OPEN — reported upstream to the platform vendor:** the concurrent-COPY limit of 4; the 30s `statement_timeout` and the sidecar `tx-idle-timeout`; and a stale disk size in the UI. Two of those reports took a correction after first filing, so the measurements recorded here are the ones to trust over any earlier summary.
 
 **Live infrastructure, and it BILLS:** four PlanetScale databases (`soak-mysql-*`, `soak-pg-*`, `soak-neki-*`, plus `soak-neki2-*` created for the worn-in-vs-fresh comparison) and one AWS `c7i.2xlarge` in `us-east-1` (`sluice-neki-throughput-test`, plus its key pair and security group). The soak's own stream is DEAD (killed by the pool-timeout defect), so the three original databases are no longer producing data. Teardown is the operator's call; the AWS instance is mine to remove and must be, along with a zero-remaining check against the clean baseline verified before launch.
 
@@ -277,13 +300,13 @@ Worth noting this was invisible until the connection budget allowed 4 streams �
 
 **The likely explanation, operator-supplied:** the Neki ROUTER was observed pegged at **100% CPU** throughout. A saturated router is a serialization point in front of every stream, which fits the surviving whole-run numbers — total throughput barely moves while per-stream throughput collapses, because the streams queue for one exhausted resource rather than doing independent work. It also explains why the cluster resize (PS-40) bought so little: the resize grows the Postgres side, not the router in front of it. (This rests on the whole-run averages, which are sound; the per-window "signature" it was first argued from is not — see the replica-lag retraction above.)
 
-That reframes the tuning advice. The binding constraint on a Neki bulk import is not connection slots, not the COPY-concurrency limit, and not the Postgres cluster tier — it is the router. Router tier (`NKR-1` … `NKR-5`) is the knob, and it is the one the API and CLI do not expose (NEKI-017's closing note).
+That reframes the tuning advice. The binding constraint on a Neki bulk import is not connection slots, not the COPY-concurrency limit, and not the Postgres cluster tier — it is the router. Router tier (`NKR-1` … `NKR-5`) is the knob, and it is the one the API and CLI do not expose — confirmed in the closing note of the upstream concurrent-COPY report.
 
 ## 2026-09-12 — a Neki branch runs a SIDECAR pool in front of Postgres, and three of its defaults bear on the copy path
 
 Surfaced by the operator from the per-branch sidecar configuration ([`pscale branch` admin-and-sidecars](https://planetscale.com/docs/cli/branch#admin-and-sidecars)). Every Postgres instance runs one sidecar alongside it, and it is a **connection pool in front of the server** — so its limits are invisible to `pg_settings` and unreachable by `SET LOCAL`, while reporting themselves in PostgreSQL's own wording. Three defaults matter to us:
 
-- **`tx-idle-timeout` = 30s** — "maximum idle time before an open transaction is killed and its connection is recycled". This is the wall that killed a deliberately-slow `COPY` during the NEKI-018 probe while `pg_settings` reported `idle_in_transaction_session_timeout = 0`. **It is a live hazard for the raw byte-pipe lane specifically:** `ExportRawCopy` streams straight into `ImportRawCopy`, so the TARGET transaction sits idle for exactly as long as the SOURCE stalls. A 30-second source-side hiccup — a slow chunk query, a network stall, a source under load — costs the target connection mid-copy, and the raw lane cannot retry (`r` is a one-shot stream). Not yet reproduced against sluice's own pipe; worth a deliberate test with a throttled source before anyone migrates a large database over a slow link.
+- **`tx-idle-timeout` = 30s** — "maximum idle time before an open transaction is killed and its connection is recycled". This is the wall that killed a deliberately-slow `COPY` during the statement-timeout probe while `pg_settings` reported `idle_in_transaction_session_timeout = 0`. **It is a live hazard for the raw byte-pipe lane specifically:** `ExportRawCopy` streams straight into `ImportRawCopy`, so the TARGET transaction sits idle for exactly as long as the SOURCE stalls. A 30-second source-side hiccup — a slow chunk query, a network stall, a source under load — costs the target connection mid-copy, and the raw lane cannot retry (`r` is a one-shot stream). Not yet reproduced against sluice's own pipe; worth a deliberate test with a throttled source before anyone migrates a large database over a slow link.
 - **`external-conn-reservation` = 10** — connections set aside for the replicator, backups and metrics clients rather than the application. Our budget formula is `max_connections − superuser_reserved_connections − current_total`, which happens to account for these correctly *only because* it counts `current_total` from `pg_stat_activity` rather than trusting the headline number. Worth knowing that the headline `max_connections = 30` overstates what an application may have by roughly a third before anything else connects.
 - **`pool-capacity` = 16 per database pool** (the branch observed carried 16; the documented default is 44) and **`pool-max-wait-time` = 5s**. This is the likely mechanism behind the `write failed: … i/o timeout` errors that preceded the 53300 in the run that exposed the product-ceiling defect: that run resolved `max_concurrent_connections=16`, which with the sidecar's own pool sizing and a concurrent sync stream would exhaust the pool, and a query that waits 5s for a pooled connection and gives up looks exactly like a write timeout. Unproven, but it fits the evidence and it is cheap to check by re-running at 16 deliberately.
 
@@ -1681,3 +1704,43 @@ fixed before the tag; three residuals are recorded here rather than fixed.
   **FIXED in the advice, in all three homes** (the rendered block, the code comment beside it that asserted the same thing, and `docs/operator/cross-region-migration.md`): the PHASE is the liveness signal, a climbing age means something only once the phase has also stopped, and the operator is told to compare target row counts before killing a run on it. `TestStatusRendersColdStartsInProgress` now asserts the block names the PHASE rather than pinning the old phrase — pinning the phrase would have pinned the wrong advice.
   **OPEN, the display half:** the honest fix is for the cold-start rows to render the GREATER of the header's `updated_at` and the newest per-table progress row, so the number means what the guidance says. That needs a lister change in both engines' SQL and is not a 2am edit; filed rather than attempted. A0909-P2b now writes those per-table rows on every lane, so the data is there.
 - **A0909-STATUS-2 (LOW, F, same source, OPEN):** the per-table progress rows have no consumer outside `migrate --resume` and the anchor-gated resume ladder. `sync status` reads header rows only. The recording is ahead of its reader, which is the right order but worth knowing before someone concludes the rows are unused and prunes them.
+
+## 2026-09-13 — the private-reference guard was inert over the one file that accumulates the problem
+
+`scripts/check-no-private-refs.sh` was written days earlier, wired into CI's Lint job and both pre-commit hooks, and it ran green the whole time while **four private-tracker IDs sat in `docs/dev/audit-backlog.md`** — a file tracked in a public repository. Found by reading the guard's own exclusion list while about to add a fifth.
+
+The defect is the CLAUDE.md "a gate whose coverage is narrower than its name implies" shape, and the mechanism is worth naming because it is subtle: the script graded **two different classes with one scope**. The exemption it was reasoning about was the *local filesystem path* — engineering notes legitimately record where work happened, and a path there is provenance rather than a leak. That reasoning is sound. It then applied the same exemption to *private-tracker IDs*, where it is simply false: `docs/dev/` is exactly as public as `docs/adr/`, so the argument for scrubbing a ticket ID does not stop at a directory boundary. The script's own closing message went further and told the reader that `docs/dev/audit-backlog.md` was a **"legitimate home"** for such a reference — a gate actively instructing the next author to do the thing it exists to prevent.
+
+**Fixed** by splitting the two classes so each carries its own scope: the tracker pattern is graded over the whole tree with no directory exemption; the local-path pattern keeps the `docs/dev/` + `docs/research/` exemption it was always about. The four references were scrubbed to keep the finding and drop the ID (in every case the finding was the load-bearing half; the ticket number added nothing a reader of this repo could use).
+
+Mutation-run in all three directions, mutants grep-confirmed present and reverted by targeted edit rather than `git checkout`:
+
+- tracker ID appended to `docs/dev/audit-backlog.md` → **exit 1** (the direction that was previously inert)
+- local path appended to `docs/dev/audit-backlog.md` → **exit 0**, exempt as designed
+- the same local path appended to `docs/architecture.md` → **exit 1**
+
+**The generalizable bit:** when one gate grades two classes, check whether its exemptions belong to *both*. An exemption argued from class A and applied to class B is invisible in review, because the rationale reads as sound — it is sound, about the other thing. The tell here was a comment explaining the exemption in terms of only one of the two patterns in the regex right above it.
+
+## 2026-09-13 — a verdict-reversing wrapper must implement the verdict it reverses
+
+The single most useful finding of the v0.152.1 pre-tag reviews, and the one most likely to recur elsewhere in this codebase.
+
+`classifyCopyError` reverses one verdict by WRAPPING: `&terminalPGError{err: classified}`, where `classified` is the already-classified `*retriablePGError`. `Unwrap` is preserved on purpose, so `errors.Is`/`errors.As` against the underlying `*pgconn.PgError` keep working. That is the right instinct and it is what defeated the reversal: **`errors.As` does not stop at a type that fails to implement the interface it is looking for — it unwraps THROUGH it and matches what is inside.** `terminalPGError` implemented only `Terminal()`, so the retriable verdict underneath stayed reachable.
+
+Measured on the real types before the fix — both true, same error, same instant:
+
+```
+ir.IsTerminal(err)              -> true
+errors.As(err, &re) && re.Retriable() -> true
+```
+
+Consumers split by which question they happen to ask, and the split was 1–5 against the fix. `isRetriableChunkOpenError` tests `ir.IsTerminal` first and saw the verdict — which is exactly why Bug 285's reported symptom looked fixed. The five that use the ordinary `errors.As(...) && re.Retriable()` idiom did not: the typed COPY core and the idempotent batch core (a missing relation ridden to the ~30-minute reparent wall, and on a keyless table reported as `errKeylessAmbiguousReplay` — "a replay could double rows" — about a table that does not exist); `quiesceAndReportTransient`, which **tripped the run-wide grow gate** and parked every sibling cold-copy lane waiting out a storage grow that was not happening; and the index and constraint DDL phases.
+
+That grow-gate arm deserves its own sentence: Bug 285 was filed because a missing table produced *"a misleading headline about storage growth"*, and the fix for it left the code that manufactures precisely that headline untouched.
+
+**The rule:** a wrapper that reverses a verdict must implement the interface it is reversing, answering the new verdict. Implementing only the NEW interface leaves the OLD one reachable by unwrap, and the two then disagree — with the answer depending on which question each consumer happens to ask, which is not a property anyone designed.
+
+**Why the pins missed it, which is the familiar half.** `applier_errors_schema_drift_test.go` asserted `ir.IsTerminal(copyErr)` — the one question that already worked. Its sibling in the same file grades the other verdicts with the `errors.As && Retriable()` idiom and would have passed for 42P01 too. Both green, against code where the fix was inert at five of six consumers. This is the 2026-08-01 evidence-sharing rule again: the check and the thing checked derived their answer the same way, so there was no independent expected value. The replacement (`TestTerminalVerdictReachesBothConsumerQuestions`) asks BOTH questions of EVERY terminal producer and requires agreement; its roster is an AST walk with a floor, so a fourth producer cannot be added ungraded.
+
+**Worth checking elsewhere:** anywhere a verdict, capability, or policy is reversed by wrapping rather than by replacing. The pattern is cheap to grep for — a type implementing exactly one of a pair of opposed interfaces while wrapping a value that implements the other.
+
