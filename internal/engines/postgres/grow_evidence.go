@@ -160,3 +160,39 @@ func isPGLowDiskReadOnlyMessage(msg string) bool {
 	}
 	return false
 }
+
+// pgPlatformCancelSubstrings is the lower-cased wording that marks a 57014
+// (query_canceled) as the PLATFORM cancelling a statement, rather than sluice's
+// own refusal echoed back.
+//
+// Measured 2026-09-12 on a PlanetScale Neki branch under a 29 GB import:
+//
+//	ERROR: canceling statement due to user request  (SQLSTATE 57014)
+//
+// — the router abandoning a statement while the cluster is saturated. The
+// statement-timeout wording is the same class: a wall the platform imposes,
+// which clears when the load or the timeout does.
+//
+// The DISTINCTION this list exists to draw, and the reason 57014 cannot simply
+// be classified wholesale: when a copy SOURCE refuses a value (a NUL byte, a
+// ragged array), pgx aborts the COPY by sending the refusal text to the server,
+// and the server echoes it back as a *pgconn.PgError with SQLSTATE 57014
+// quoting our own message (see RowWriter.copyFromOnSQLConn). That is a
+// deterministic value fault — retrying it replays the same bad row through the
+// entire budget. Only the platform's own cancel wordings are transient.
+var pgPlatformCancelSubstrings = []string{
+	"canceling statement due to user request",
+	"canceling statement due to statement timeout",
+}
+
+// isPGPlatformCancelMessage reports whether msg carries a platform cancel
+// wording rather than an echoed sluice refusal. Case-insensitive.
+func isPGPlatformCancelMessage(msg string) bool {
+	lower := strings.ToLower(msg)
+	for _, sub := range pgPlatformCancelSubstrings {
+		if strings.Contains(lower, sub) {
+			return true
+		}
+	}
+	return false
+}

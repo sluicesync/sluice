@@ -336,3 +336,71 @@ func TestClassifyApplierError_LowDiskReadOnlyIsTransient(t *testing.T) {
 		})
 	}
 }
+
+// TestClassifyApplierError_PlatformCancelIsTransient pins the sixth Neki
+// transient, and the echoed-refusal arm that makes it safe.
+//
+// `canceling statement due to user request` (57014) is a Neki router
+// abandoning a statement while the cluster is saturated. Measured
+// 2026-09-12: it killed a 29 GB import whose raw lane had already ridden out
+// 08006 and 25006 and completed 49 of 64 chunks.
+//
+// THE ECHOED-REFUSAL ARM IS WHY THIS IS MESSAGE-GATED. 57014 is also how
+// sluice's OWN value refusals return: when a copy source rejects a value (a
+// NUL byte, a ragged array), pgx aborts the COPY by sending that refusal text
+// to the server, which echoes it back as a *pgconn.PgError with SQLSTATE
+// 57014 quoting us (RowWriter.copyFromOnSQLConn documents this). Those are
+// deterministic value faults. Classifying 57014 wholesale would replay the
+// same bad row through the entire retry budget and then fail anyway — turning
+// a precise, immediate value error into a thirty-minute mystery.
+func TestClassifyApplierError_PlatformCancelIsTransient(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name          string
+		message       string
+		wantRetriable bool
+	}{
+		{
+			// The shape that killed run J.
+			name:          "router cancel under load",
+			message:       "canceling statement due to user request",
+			wantRetriable: true,
+		},
+		{
+			name:          "statement timeout wall",
+			message:       "canceling statement due to statement timeout",
+			wantRetriable: true,
+		},
+		{
+			// THE ANTI-OVER-MATCH ARM: sluice's own refusal, echoed.
+			name:          "an echoed sluice value refusal stays terminal",
+			message:       `postgres: copy source: column "payload": value contains a NUL byte, which PostgreSQL text COPY cannot represent`,
+			wantRetriable: false,
+		},
+		{
+			name:          "an echoed ragged-array refusal stays terminal",
+			message:       `postgres: copy source: column "tags": ragged array: rows of differing length`,
+			wantRetriable: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := classifyApplierError(&pgconn.PgError{Code: "57014", Message: tc.message})
+			var re ir.RetriableError
+			isRetriable := errors.As(got, &re) && re.Retriable()
+
+			switch {
+			case tc.wantRetriable && !isRetriable:
+				t.Fatalf("57014 %q classified TERMINAL, want retriable — a platform cancel under load "+
+					"clears on its own and must not kill an import", tc.message)
+			case !tc.wantRetriable && isRetriable:
+				t.Fatalf("57014 %q classified RETRIABLE, want terminal — this is sluice's OWN value "+
+					"refusal echoed back; retrying replays the same bad row through the whole budget "+
+					"and turns a precise error into a thirty-minute mystery", tc.message)
+			}
+		})
+	}
+}

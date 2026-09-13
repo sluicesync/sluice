@@ -295,6 +295,18 @@ func classifyApplierError(err error) error {
 		if pgErr.Code == "25006" && isPGLowDiskReadOnlyMessage(pgErr.Message) {
 			return &retriablePGError{err: err}
 		}
+		// A 57014 the PLATFORM raised -- a router cancel under load, or a
+		// statement-timeout wall -- clears when the pressure does. Measured on
+		// Neki 2026-09-12: `canceling statement due to user request` killed an
+		// import whose raw lane had already recovered from every other class.
+		//
+		// MESSAGE-GATED because 57014 is ALSO how sluice own value refusals come
+		// back: pgx aborts a COPY by sending our refusal text to the server,
+		// which echoes it as a 57014 quoting us. Those are deterministic value
+		// faults and must stay terminal -- retrying replays the same bad row.
+		if pgErr.Code == "57014" && isPGPlatformCancelMessage(pgErr.Message) {
+			return &retriablePGError{err: err}
+		}
 		// Connection-availability SQLSTATEs (57P0x admin shutdown/crash, plus
 		// class 08 connection_exception) delegate to the shared predicate,
 		// which declares itself the SINGLE HOME of that set (audit 2026-07-26
