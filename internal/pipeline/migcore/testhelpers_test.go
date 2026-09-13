@@ -129,3 +129,18 @@ func (c *fakeGrowClock) After(d time.Duration) <-chan time.Time {
 	ch <- at
 	return ch
 }
+
+// Advance moves the clock forward WITHOUT the gate having asked to wait, which
+// is how a test simulates a healthy stretch — time passing while the gate is
+// open and idle.
+//
+// The real-time form of this is `time.Sleep(idle + slack)`, which costs the
+// wall-clock duration and then needs a scheduler allowance on top because the
+// sleep can overshoot. Advancing a fake clock costs nothing and overshoots by
+// nothing, so an episode-idle boundary can be crossed exactly rather than
+// approximately.
+func (c *fakeGrowClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(d)
+}

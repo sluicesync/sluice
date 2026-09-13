@@ -206,26 +206,31 @@ func TestGrowGate_EvidenceGovernsTheDeepEscalationAndNotTheEarlyHolds(t *testing
 func TestGrowGate_EvidenceAccumulatesPerEpisodeAndResetsWithTheLadder(t *testing.T) {
 	captureSlog(t)
 	const (
-		// TESTFRAGILE-1. base was 20ms, which is barely above Windows default
-		// timer granularity (~15.6ms) -- so a single missed tick was most of
-		// the budget, and the CAPPED and UNRESET bands overlapped on a loaded
-		// runner. This failed the Windows leg of a release tag, and the
-		// Windows matrix only runs on TAG pushes, so it could fire only during
-		// a release. 60ms puts the signal well clear of the noise; the phase
-		// still runs in well under a second.
+		// TESTFRAGILE-1, and then TESTFRAGILE-2. base was 20ms, barely above
+		// Windows default timer granularity (~15.6ms) -- so a single missed
+		// tick was most of the budget, and the CAPPED and UNRESET bands
+		// overlapped on a loaded runner. That failed the Windows leg of a
+		// release tag, and the Windows matrix only runs on TAG pushes, so it
+		// could fire only during a release. The first repair raised base to
+		// 60ms and funded the ceiling from a NAMED schedulerSlack rather than
+		// from the measured value -- both correct moves, and both still
+		// buying headroom against the OS rather than removing the dependency.
+		//
+		// The sibling above hit the same class again on the next release tag,
+		// which is what prompted finishing the job here. This test now runs on
+		// [fakeGrowClock], so the holds it observes are the durations the gate
+		// ASKED for, exactly. schedulerSlack is therefore gone -- there is no
+		// scheduler in the loop to allow for -- and the ceiling below is an
+		// exact bound rather than a tolerant one. base can stay at 60ms since
+		// it now costs nothing to hold.
 		base = 60 * time.Millisecond
 		idle = 250 * time.Millisecond
-		// schedulerSlack is the allowance for OS scheduling and timer
-		// granularity. It is NAMED and constant on purpose: the old ceiling
-		// was 2*base, i.e. a tolerance funded from the very value being
-		// measured, which tracked the COMPUTED hold and not the overhead the
-		// measurement actually carries. Sized for Windows (~15.6ms per missed
-		// tick) with room for several.
-		schedulerSlack = 150 * time.Millisecond
 	)
 	withScaledGrowGate(t, base, 1600*time.Millisecond, base, idle, time.Hour, 1.0)
 
 	g := NewGrowGate(context.Background(), nil)
+	clk := newFakeGrowClock()
+	g.nowFn, g.afterFn = clk.Now, clk.After
 	holds := make(chan time.Duration, 16)
 	g.onWindowClosed = func(d time.Duration) { holds <- d }
 	next := func() time.Duration {
@@ -274,7 +279,11 @@ func TestGrowGate_EvidenceAccumulatesPerEpisodeAndResetsWithTheLadder(t *testing
 	// there. A single-window version of this check passed the mutant that
 	// deleted the reset outright. The divergence only appears once the ladder
 	// has had room to climb.
-	time.Sleep(idle + 150*time.Millisecond)
+	// Crossing the episode-idle boundary on the fake clock: exact, instant,
+	// and with no overshoot to allow for. The real-time form was
+	// `time.Sleep(idle + 150ms)`, where the 150ms existed only because a real
+	// sleep can overshoot and the boundary had to be cleared for certain.
+	clk.Advance(idle + time.Millisecond)
 	var deepestAfterReset time.Duration
 	for range 4 {
 		if d := window(ir.GrowEvidenceNone); d > deepestAfterReset {
@@ -291,21 +300,23 @@ func TestGrowGate_EvidenceAccumulatesPerEpisodeAndResetsWithTheLadder(t *testing
 	// cannot catch the thing it names, which is the shape this very test was
 	// already guilty of once.
 	//
-	// So the absolute ceiling is the whole discriminator, and it is now sized
-	// to be one: 60.7ms correct against 480ms broken, bound at 270ms -- 4.4x
-	// clear of the true value, 1.8x under the defect. The old version failed
-	// on Windows because base was 20ms (barely above the ~15.6ms timer
-	// granularity) and the tolerance was 2*base, funded from the very quantity
-	// being measured rather than from the overhead it actually carries.
-	// Absolute sanity bound, kept as a second net but funded from the NAMED
-	// scheduler allowance rather than from base. An unreset ladder reaches
-	// roughly 8*base within these four windows, so this discriminates with
-	// wide margin while tolerating a badly-behaved scheduler.
-	if ceiling := 2*base + schedulerSlack; deepestAfterReset > ceiling {
+	// So the absolute ceiling is the whole discriminator. On the fake clock it
+	// is EXACT rather than tolerant: a correctly-reset episode is capped at
+	// `base` (GrowGateEvidenceFreeHoldCap is scaled to base by the harness
+	// above), while an unreset ladder keeps climbing and reaches roughly
+	// 8*base across these four windows. Measured on the real types: 60ms
+	// correct against 480ms broken.
+	//
+	// The previous version bounded this at `2*base + schedulerSlack` = 270ms,
+	// which was sound but only 1.8x under the defect, because most of the
+	// budget was paying for the OS rather than for signal. With the scheduler
+	// out of the loop the bound is `base` itself and the margin is 8x.
+	if deepestAfterReset > base {
 		t.Errorf(
-			"after a healthy stretch, an evidence-free storm escalated to %v, past the %v ceiling "+
-				"(2*base=%v plus a %v scheduler allowance) — the ladder is climbing where it should have reset",
-			deepestAfterReset, ceiling, 2*base, schedulerSlack,
+			"after a healthy stretch, an evidence-free storm escalated to %v, past its %v cap — the ladder "+
+				"is climbing where it should have reset. An unreset ladder reaches roughly %v across these "+
+				"four windows",
+			deepestAfterReset, base, 8*base,
 		)
 	}
 }
