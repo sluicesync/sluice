@@ -258,7 +258,25 @@ func afterConnectRegisterGeometry(ctx context.Context, conn *pgx.Conn) error {
 	}
 	oids, err := lookupSpatialOIDsConn(ctx, conn)
 	if err != nil {
-		return err
+		// CLASSIFY. This hook runs on EVERY connection the engine opens,
+		// including the per-chunk writer connections, so its error is on the
+		// chunk-OPEN path — and that path's retry
+		// ([isRetriableChunkOpenError]) decides by asking whether the error
+		// carries an engine verdict. Returned bare, a transient platform
+		// condition arrives with no verdict to read and is treated as fatal.
+		//
+		// MEASURED 2026-09-13 on a fresh PS-10 Neki whose 10 GiB volume filled
+		// mid-copy: the shard went read-only, its sidecars went unhealthy, and
+		// this probe's `pg_type` query returned `NK205 no healthy sidecars
+		// available`. NK205 IS classified transient — the whole point of that
+		// classification — but the verdict never reached the retry because it
+		// was discarded here, so chunk 6 failed the table and the migration
+		// died in 3m40s with four chunk retries and a max attempt of 2.
+		//
+		// This is the Bug-207 class at a RETURN site rather than a setErr one,
+		// which is why internal/errclassgate could not see it: that gate walks
+		// PARKED errors, and a hook that returns is invisible to it.
+		return classifyCopyError(err)
 	}
 	for _, name := range missing {
 		oid, found := oids[name]
