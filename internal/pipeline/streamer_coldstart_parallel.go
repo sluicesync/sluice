@@ -158,11 +158,19 @@ func resolveColdStartCopyBudget(
 		}
 	}
 
-	tableP, withinP = migcore.ResolveCopyParallelismBudget(
+	// ResolveCopyAxes, not ResolveCopyParallelismBudget: the cold start is
+	// subject to the same COPY-statement ceiling migrate is, and calling the
+	// lower-level resolver here silently dropped report.CopyConcurrencyCeiling
+	// on the floor. Against a PlanetScale Neki target that meant a `sync start`
+	// cold copy opened up to table x within COPYs against a router that admits
+	// four — the exact 4-became-4x4 defect ResolveCopyAxes was extracted to
+	// prevent, reaching migrate and not this path.
+	tableP, withinP = migcore.ResolveCopyAxes(
 		copyParallelism,
 		migcore.ResolveTableParallelism(s.TableParallelism),
 		copyBudgetForAxes,
 		s.MaxTargetConnections,
+		budgetReport,
 	)
 	return tableP, withinP, indexBudget, nil
 }

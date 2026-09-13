@@ -256,8 +256,14 @@ func (r *Restore) resolveRestoreParallelism(ctx context.Context, taskCount int) 
 	// its budget-capped value, the table factor gets whatever whole
 	// multiples of within fit the product budget (0 budget = MySQL /
 	// degraded probe = unclamped).
-	tableP, chunkP := migcore.ResolveCopyParallelismBudget(
-		resolvedChunk, requestedTable, budgetReport.CopyBudget, 0,
+	// ResolveCopyAxes rather than the lower-level resolver, so the target's
+	// COPY-statement ceiling reaches restore too. Passing a literal 0 here
+	// dropped report.CopyConcurrencyCeiling, which on a PlanetScale Neki target
+	// let a restore open table x chunk concurrent COPYs against a router that
+	// admits four. maxTargetConnections stays 0: restore has no
+	// --max-target-connections knob, and 0 means "no limit from this source".
+	tableP, chunkP := migcore.ResolveCopyAxes(
+		resolvedChunk, requestedTable, budgetReport.CopyBudget, 0, budgetReport,
 	)
 
 	tableParallelism = r.dispatchRestoreTableAxis(ctx, tableP, requestedTable, taskCount, budgetReport.CopyBudget)

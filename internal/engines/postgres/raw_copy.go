@@ -420,7 +420,36 @@ func withCopySessionPins(ctx context.Context, conn *pgconn.PgConn, pinFloats boo
 	}
 	if ownTx {
 		if _, err := conn.Exec(ctx, "COMMIT").ReadAll(); err != nil {
-			return fmt.Errorf("commit raw-copy transaction: %w", err)
+			// TERMINAL, and this is the one place in the copy path where
+			// "retriable" would be actively unsafe rather than merely
+			// wasteful.
+			//
+			// A COMMIT whose RESPONSE never arrives is IN DOUBT: the server
+			// may have durably committed and lost the reply. The failure that
+			// produces it is a dropped connection — 08006, which the transient
+			// classifier accepts, which is exactly right for a failure DURING
+			// the stream and exactly wrong for one at the commit boundary. The
+			// retry would re-export the same rows from scratch on top of rows
+			// that may already be there.
+			//
+			// On a chunked copy the duplicates would fail loudly later, when
+			// the primary key is added. On the WHOLE-TABLE raw lane they would
+			// not: that path is engaged for tables below the split threshold
+			// and needs no PK at all ("No PK needed — the whole-table export
+			// has no WHERE bound"), so a keyless table would end up holding 2N
+			// rows at exit 0. That is silent duplication, which outranks the
+			// throughput the retry buys.
+			//
+			// Refusing the retry costs a rare failed table and no correctness.
+			// The breadcrumb the caller already wrote records the
+			// truncate-and-redo disposition, so the re-run cleans up rather
+			// than appending. Found by the pre-tag value-fidelity review of
+			// the retry that introduced the window.
+			return &terminalPGError{err: fmt.Errorf(
+				"commit raw-copy transaction (IN DOUBT — the commit may have succeeded on the server; "+
+					"this table is not retried automatically because re-copying could duplicate rows "+
+					"on a table with no primary key to catch them): %w", err,
+			)}
 		}
 	}
 	return nil

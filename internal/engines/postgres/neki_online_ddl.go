@@ -3,8 +3,8 @@
 
 // # Index builds on a PlanetScale Neki target go through online DDL
 //
-// A Neki branch ships `statement_timeout = 30s` as a PLATFORM DEFAULT (see
-// NEKI-018), and a `CREATE INDEX` is one statement. Measured 2026-09-12 on a
+// A Neki branch ships `statement_timeout = 30s` as a PLATFORM DEFAULT, and a
+// `CREATE INDEX` is one statement. Measured 2026-09-12 on a
 // live branch: building a single-column index on a 26.3M-row table died at
 // **31 seconds** with `canceling statement due to user request`. So on Neki the
 // ordinary deferred index phase cannot build an index on any table large enough

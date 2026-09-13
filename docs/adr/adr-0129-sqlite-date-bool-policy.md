@@ -33,7 +33,7 @@ explicit, loud-on-mismatch policy.
 1. **Declared-type → IR temporal/bool, by default.** In the schema reader, a column
    whose declared type (case-insensitive, substring per SQLite's own matching) names a
    date/time/bool overrides the affinity-NUMERIC default:
-   - contains `DATETIME` or `TIMESTAMP` → `ir.Timestamp` (no tz; SQLite is tz-naive)
+   - contains `DATETIME` or `TIMESTAMP` → `ir.DateTime` (the tz-NAIVE family, which is what SQLite storage is). **Corrected 2026-09-13 (v0.152.0)**: this originally read `ir.Timestamp`, which the MySQL writer emits as `TIMESTAMP` — an instant type, zone-converted on store, capped at 2038 — so an ordinary pre-1970/post-2038 value refused at insert with a bare server 1292. Postgres targets are unaffected either way (both emit PG `TIMESTAMP`).
    - else contains `DATE` → `ir.Date`
    - else contains `TIME` → `ir.Time`
    - `BOOL` / `BOOLEAN` → `ir.Boolean`

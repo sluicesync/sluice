@@ -839,6 +839,16 @@ jobs:
       - name: check scheduled-red consumers
         run: bash scripts/check-schedule-consumers.sh
 
+      # Private-tracker / local-path leak guard. sluice is a public repository;
+      # a reference to a private issue tracker is unfollowable by every reader
+      # and advertises that repo's contents, and an absolute local path is
+      # meaningless to anyone but its author. A commit removed 26 such
+      # references by hand and a later commit the SAME DAY added one back,
+      # because nothing was watching — so now something is. The script states
+      # its own scope and its deliberate exclusions.
+      - name: check for private-tracker and local-path references
+        run: sh scripts/check-no-private-refs.sh
+
       # Vacuous-green leg coverage (audit H-6): every job in the scheduled
       # correctness workflows that runs a build-tagged, -run-filtered `go test`
       # must carry a non-vacuity signal (a check-leg-nonvacuity.sh call or a

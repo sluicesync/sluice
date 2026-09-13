@@ -296,13 +296,27 @@ func (e Engine) ProbeTargetConnectionBudget(ctx context.Context, dsn string, req
 	// budget the target refuses to honour.
 	copyConcurrencyCeiling := 0
 	if isNeki, _ := probeIsNeki(ctx, cfg.serverKey(), db); isNeki {
-		// Declared as a PRODUCT ceiling on the copy axes, NOT by shrinking
-		// effectiveBudget. Shrinking the budget would (a) constrain only
-		// the within-table axis, leaving the table axis free to multiply it
-		// back up — the defect this replaces — and (b) starve the
-		// overlapped index-build pool, which is funded out of the same
-		// CopyBudget even though an index build is not a COPY and the Neki
-		// limit does not apply to it.
+		// Declared as a PRODUCT ceiling on the copy axes — that is the part
+		// that actually binds, because shrinking the budget alone constrains
+		// only the within-table axis and leaves the table axis free to
+		// multiply it back up (4 became 4x4, the defect this replaces).
+		//
+		// effectiveBudget is ALSO shrunk, just below. An earlier version of
+		// this comment said "NOT by shrinking effectiveBudget" while the next
+		// eight lines did exactly that — a comment denying its own code, and
+		// the reason it is now written as "both, for different jobs":
+		//
+		//   - The product ceiling is what stops the axes multiplying past the
+		//     router's concurrent-COPY limit.
+		//   - The budget shrink keeps the single-axis path and any consumer
+		//     that reads CopyBudget without going through ResolveCopyAxes
+		//     from over-committing on its own.
+		//
+		// The cost of the shrink is real and accepted: the overlapped
+		// index-build pool is funded out of the same CopyBudget even though an
+		// index build is not a COPY and the Neki limit does not apply to it,
+		// so a Neki target funds fewer index workers than its connections
+		// would allow.
 		copyConcurrencyCeiling = nekiConcurrentCopyLimit
 		if effectiveBudget > nekiConcurrentCopyLimit {
 			slog.InfoContext(ctx, "postgres: capping copy parallelism for a PlanetScale Neki target",

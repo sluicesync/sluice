@@ -48,14 +48,25 @@
 //     chunk being unrepeatable.
 //  2. The import side is TRANSACTIONAL: ImportRawCopy runs its COPY inside
 //     postgres.withCopySessionPins, which wraps it in BEGIN/COMMIT and rolls
-//     back on failure. A failed attempt therefore leaves zero rows. That holds
-//     even when the connection dies mid-COPY (the 08006 case above) — the
-//     server aborts the transaction when the client goes away.
+//     back on failure. A failed attempt therefore leaves zero rows — with ONE
+//     exception, which is carved out rather than hand-waved. A failure DURING
+//     the stream (the 08006 case above) is safe: the server aborts the
+//     transaction when the client goes away. A failure on the COMMIT's
+//     RESPONSE is not, because it is IN DOUBT — the server may have committed
+//     and lost the reply, and re-exporting would stack a second copy on top.
+//     That case is marked TERMINAL at the commit itself
+//     (postgres.withCopySessionPins), so it never reaches this loop; the
+//     carve-out lives there, next to the COMMIT, rather than as a condition
+//     here that a reader of the commit would never see.
 //
-// The whole-table path (chunk == nil) is retried on the same argument: it too
-// re-exports from scratch and its import too is one transaction, so a retry
-// redoes more WORK but cannot produce different DATA. That is a deliberate
-// inclusion rather than an oversight — see the caller note in migrate_bulk.go.
+// The whole-table path (chunk == nil) is retried on the same argument, and it
+// is the reason the carve-out above is not merely tidy. It is engaged for
+// tables below the split threshold and needs NO PRIMARY KEY, so a duplicated
+// copy there has nothing to fail on later: it would be 2N rows at exit 0. On a
+// chunked table the same duplication would at least be loud, failing when the
+// primary key is added after the copy. Silent beats loud in the wrong
+// direction, so the in-doubt window is closed for both rather than reasoned
+// about per-arm.
 //
 // # The grow gate needs no plumbing here
 //
