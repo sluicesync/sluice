@@ -102,7 +102,7 @@ fi
 # Invoked via `bash`
 # (not `sh`): leg-nonvacuity-coverage uses bash-only here-strings, and `sh`
 # is dash on Linux/macOS. All are sub-second grep/git-ls/awk.
-for g in check-skills-flags check-schedule-consumers check-leg-nonvacuity-coverage check-dialect-translator-roster check-local-gate-parity check-notes-claims-selftest; do
+for g in check-skills-flags check-schedule-consumers check-leg-nonvacuity-coverage check-dialect-translator-roster check-local-gate-parity check-notes-claims-selftest check-no-private-refs; do
 	if ! bash "scripts/$g.sh"; then
 		red "pre-commit: $g failed (a CI Lint-job guard)."
 		exit 1
