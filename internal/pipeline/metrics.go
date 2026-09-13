@@ -593,17 +593,26 @@ func emitLaneAIMDMetrics(w io.Writer, snaps []appliercontrol.MetricsSnapshot) {
 //   - sluice_target_active_connections / sluice_target_max_connections —
 //     secondary signal.
 //
-// The front-door HELP strings, defined once because BOTH exporters must
+// The router and pooler HELP strings, defined once because BOTH exporters must
 // publish them identically — Prometheus allows one HELP per metric name, and a
 // dashboard written against the single-database exporter is meant to work
 // unchanged against the fleet one. Two copies of a sentence is two chances for
 // them to drift apart silently; [fleetGaugeFamilies] reads these same
 // constants.
+//
+// The two groups are named for what they ARE rather than merged under one
+// "front door" heading, because the distinction is operationally load-bearing:
+// a router terminates every connection sluice makes, and a pooler terminates
+// none of them.
 const (
-	helpFrontDoorCPU = "sluice_target_front_door_cpu_util CPU utilisation of the BUSIEST front-door instance as a fraction in [0,1] — the hop client connections land on before a database backend (PlanetScale Neki: a router pod; PlanetScale Postgres: the PgBouncer sidecar). Separate series from sluice_target_cpu_util (the database primary's), never a replacement for it."
-	helpFrontDoorMem = "sluice_target_front_door_mem_util Memory utilisation of the BUSIEST front-door instance as a fraction in [0,1]. Separate series from sluice_target_mem_util."
-	//nolint:lll // one Prometheus HELP line; wrapping it would change the exposition.
-	helpFrontDoorWait = "sluice_target_front_door_wait_seconds Seconds the LONGEST-WAITING client has been queued at the front door without yet being handed a backend connection. Non-zero means the front door is the bottleneck, whatever CPU says. Published where the platform exposes a queue wait (PlanetScale Postgres via PgBouncer); absent otherwise."
+	//nolint:lll // one Prometheus HELP line each; wrapping would change the exposition.
+	helpRouterCPU = "sluice_target_router_cpu_util CPU utilisation of the BUSIEST routing-layer pod as a fraction in [0,1] — the layer that terminates client connections and routes queries to shards (PlanetScale Neki's routers; the same role Vitess gives VTGate). It is in sluice's own connection path. Separate series from sluice_target_cpu_util (the database primary's), never a replacement for it."
+	helpRouterMem = "sluice_target_router_mem_util Memory utilisation of the BUSIEST routing-layer pod as a fraction in [0,1]. Separate series from sluice_target_mem_util."
+	//nolint:lll // as above.
+	helpPgBouncerCPU = "sluice_target_pgbouncer_cpu_util CPU utilisation of the BUSIEST PgBouncer connection pooler as a fraction in [0,1], from PgBouncer's own per-peer metric. NOT in sluice's path — sluice connects to PlanetScale Postgres directly, and logical replication cannot traverse a transaction pooler — so this describes the operator's application traffic to the same database, not sluice's."
+	helpPgBouncerMem = "sluice_target_pgbouncer_mem_util Memory utilisation of the BUSIEST PgBouncer connection pooler as a fraction in [0,1]."
+	//nolint:lll // as above.
+	helpPgBouncerWait = "sluice_target_pgbouncer_client_wait_seconds Seconds the LONGEST-WAITING client has been queued at the PgBouncer pooler without yet being handed a backend connection. Non-zero means clients are queueing there, whatever CPU says. A DIFFERENT ceiling from sluice_target_max_connections: measured on a real branch, PgBouncer admitted 400 clients in front of 25 Postgres backends."
 )
 
 func emitTargetTelemetryMetrics(w io.Writer, streamID string, snap ir.TargetHealthSnapshot) {
@@ -619,29 +628,43 @@ func emitTargetTelemetryMetrics(w io.Writer, streamID string, snap ir.TargetHeal
 		fmt.Fprintln(w, "# TYPE sluice_target_mem_util gauge")
 		fmt.Fprintf(w, `sluice_target_mem_util{stream_id=%q} %s`+"\n", streamID, formatPrometheusFraction(snap.MemUtil))
 	}
-	// The front door, as its own series rather than folded into the two
-	// above: the hop in front of the database can saturate while every
-	// database pod is comfortable, and a dashboard that cannot tell those
-	// apart sends the operator to the wrong machine. Absent entirely on a
-	// platform with no separate front door, which is how Prometheus says
-	// "not observed".
-	if snap.FrontDoorCPUKnown {
+	// The ROUTING LAYER, as its own series rather than folded into the two
+	// above: it can saturate while every database pod is comfortable, and a
+	// dashboard that cannot tell those apart sends the operator to the wrong
+	// machine. Absent entirely on an unsharded target, which is how
+	// Prometheus says "not observed".
+	if snap.RouterCPUKnown {
 		fmt.Fprintln(w)
-		fmt.Fprintln(w, "# HELP "+helpFrontDoorCPU)
-		fmt.Fprintln(w, "# TYPE sluice_target_front_door_cpu_util gauge")
-		fmt.Fprintf(w, `sluice_target_front_door_cpu_util{stream_id=%q} %s`+"\n", streamID, formatPrometheusFraction(snap.FrontDoorCPUUtil))
+		fmt.Fprintln(w, "# HELP "+helpRouterCPU)
+		fmt.Fprintln(w, "# TYPE sluice_target_router_cpu_util gauge")
+		fmt.Fprintf(w, `sluice_target_router_cpu_util{stream_id=%q} %s`+"\n", streamID, formatPrometheusFraction(snap.RouterCPUUtil))
 	}
-	if snap.FrontDoorMemKnown {
+	if snap.RouterMemKnown {
 		fmt.Fprintln(w)
-		fmt.Fprintln(w, "# HELP "+helpFrontDoorMem)
-		fmt.Fprintln(w, "# TYPE sluice_target_front_door_mem_util gauge")
-		fmt.Fprintf(w, `sluice_target_front_door_mem_util{stream_id=%q} %s`+"\n", streamID, formatPrometheusFraction(snap.FrontDoorMemUtil))
+		fmt.Fprintln(w, "# HELP "+helpRouterMem)
+		fmt.Fprintln(w, "# TYPE sluice_target_router_mem_util gauge")
+		fmt.Fprintf(w, `sluice_target_router_mem_util{stream_id=%q} %s`+"\n", streamID, formatPrometheusFraction(snap.RouterMemUtil))
 	}
-	if snap.FrontDoorWaitKnown {
+	// The CONNECTION POOLER, a separate family again. It is not in sluice's
+	// path (see the HELP text), so an operator must be able to read it
+	// without concluding anything about sluice's own throughput.
+	if snap.PgBouncerCPUKnown {
 		fmt.Fprintln(w)
-		fmt.Fprintln(w, "# HELP "+helpFrontDoorWait)
-		fmt.Fprintln(w, "# TYPE sluice_target_front_door_wait_seconds gauge")
-		fmt.Fprintf(w, `sluice_target_front_door_wait_seconds{stream_id=%q} %s`+"\n", streamID, formatPrometheusFraction(snap.FrontDoorWaitSeconds))
+		fmt.Fprintln(w, "# HELP "+helpPgBouncerCPU)
+		fmt.Fprintln(w, "# TYPE sluice_target_pgbouncer_cpu_util gauge")
+		fmt.Fprintf(w, `sluice_target_pgbouncer_cpu_util{stream_id=%q} %s`+"\n", streamID, formatPrometheusFraction(snap.PgBouncerCPUUtil))
+	}
+	if snap.PgBouncerMemKnown {
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "# HELP "+helpPgBouncerMem)
+		fmt.Fprintln(w, "# TYPE sluice_target_pgbouncer_mem_util gauge")
+		fmt.Fprintf(w, `sluice_target_pgbouncer_mem_util{stream_id=%q} %s`+"\n", streamID, formatPrometheusFraction(snap.PgBouncerMemUtil))
+	}
+	if snap.PgBouncerWaitKnown {
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "# HELP "+helpPgBouncerWait)
+		fmt.Fprintln(w, "# TYPE sluice_target_pgbouncer_client_wait_seconds gauge")
+		fmt.Fprintf(w, `sluice_target_pgbouncer_client_wait_seconds{stream_id=%q} %s`+"\n", streamID, formatPrometheusFraction(snap.PgBouncerClientWaitSeconds))
 	}
 	if snap.StorageKnown {
 		fmt.Fprintln(w)
@@ -782,29 +805,44 @@ func fleetGaugeFamilies() []fleetGaugeFamily {
 				return formatPrometheusFraction(s.MemUtil), s.MemKnown
 			},
 		},
-		// The FRONT DOOR. Enumerated here for the same reason the worst-pod
-		// family below was: a fleet exporter that silently lacks a signal its
-		// single-database sibling has is the exact miss this list's own
-		// comment records happening once already.
+		// The ROUTING LAYER and the CONNECTION POOLER — five families,
+		// enumerated here for the same reason the worst-pod family below was:
+		// a fleet exporter that silently lacks a signal its single-database
+		// sibling has is the exact miss this list's own comment records
+		// happening once already.
 		{
-			name: "sluice_target_front_door_cpu_util",
-			help: strings.TrimPrefix(helpFrontDoorCPU, "sluice_target_front_door_cpu_util "),
+			name: "sluice_target_router_cpu_util",
+			help: strings.TrimPrefix(helpRouterCPU, "sluice_target_router_cpu_util "),
 			read: func(s ir.TargetHealthSnapshot) (string, bool) {
-				return formatPrometheusFraction(s.FrontDoorCPUUtil), s.FrontDoorCPUKnown
+				return formatPrometheusFraction(s.RouterCPUUtil), s.RouterCPUKnown
 			},
 		},
 		{
-			name: "sluice_target_front_door_mem_util",
-			help: strings.TrimPrefix(helpFrontDoorMem, "sluice_target_front_door_mem_util "),
+			name: "sluice_target_router_mem_util",
+			help: strings.TrimPrefix(helpRouterMem, "sluice_target_router_mem_util "),
 			read: func(s ir.TargetHealthSnapshot) (string, bool) {
-				return formatPrometheusFraction(s.FrontDoorMemUtil), s.FrontDoorMemKnown
+				return formatPrometheusFraction(s.RouterMemUtil), s.RouterMemKnown
 			},
 		},
 		{
-			name: "sluice_target_front_door_wait_seconds",
-			help: strings.TrimPrefix(helpFrontDoorWait, "sluice_target_front_door_wait_seconds "),
+			name: "sluice_target_pgbouncer_cpu_util",
+			help: strings.TrimPrefix(helpPgBouncerCPU, "sluice_target_pgbouncer_cpu_util "),
 			read: func(s ir.TargetHealthSnapshot) (string, bool) {
-				return formatPrometheusFraction(s.FrontDoorWaitSeconds), s.FrontDoorWaitKnown
+				return formatPrometheusFraction(s.PgBouncerCPUUtil), s.PgBouncerCPUKnown
+			},
+		},
+		{
+			name: "sluice_target_pgbouncer_mem_util",
+			help: strings.TrimPrefix(helpPgBouncerMem, "sluice_target_pgbouncer_mem_util "),
+			read: func(s ir.TargetHealthSnapshot) (string, bool) {
+				return formatPrometheusFraction(s.PgBouncerMemUtil), s.PgBouncerMemKnown
+			},
+		},
+		{
+			name: "sluice_target_pgbouncer_client_wait_seconds",
+			help: strings.TrimPrefix(helpPgBouncerWait, "sluice_target_pgbouncer_client_wait_seconds "),
+			read: func(s ir.TargetHealthSnapshot) (string, bool) {
+				return formatPrometheusFraction(s.PgBouncerClientWaitSeconds), s.PgBouncerWaitKnown
 			},
 		},
 		{

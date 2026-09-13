@@ -76,25 +76,18 @@ type TargetHealthSnapshot struct {
 	MemUtil  float64
 	MemKnown bool
 
-	// The target's FRONT DOOR: the hop client connections land on before
-	// they reach a database backend. Every field here is the BUSIEST such
-	// instance, and each carries its own *Known flag — false on a platform
-	// with no separate front door, which is the ordinary "unobserved"
-	// degrade rather than a claim that the front door is idle.
+	// RouterCPUUtil / RouterMemUtil describe the ROUTING LAYER in front of a
+	// sharded target — the pods that terminate client connections and route
+	// each query to a shard — as the BUSIEST such pod, in [0, 1].
 	//
-	// "Front door" rather than a product's own word for it because two very
-	// different things fill the role and an operator needs the same question
-	// answered about both: on PlanetScale Neki it is a fleet of router pods
-	// sized by their own tier, and on PlanetScale Postgres it is a PgBouncer
-	// sidecar on each database pod. A dashboard that spelled these as two
-	// separate signals would leave half its panels empty on any given branch,
-	// and the question — "is the hop in front of my database the thing that
-	// is saturated?" — is identical either way. The REMEDIES differ (resize
-	// the router tier; resize the instance), which is a matter for the alert
-	// text, not for the shape of the reading.
+	// This is IN SLUICE'S OWN PATH. A PlanetScale Neki connection is an
+	// ordinary port-5432 Postgres connection that lands on a router first,
+	// the same shape as a Vitess cluster's VTGate layer; there is no way to
+	// reach a shard around it. So a saturated router is sluice's problem
+	// directly: every statement it issues queues behind one.
 	//
 	// SEPARATE from CPUUtil/MemUtil on purpose, by the same argument the
-	// storage pair above makes. The front door is not the database: it can
+	// storage pair below makes. The router is not the database: it can
 	// saturate while every database pod is comfortable, and when it does,
 	// throughput collapses for a reason nothing in the primary's numbers
 	// explains. That is not hypothetical — on a live Neki branch the routing
@@ -104,31 +97,53 @@ type TargetHealthSnapshot struct {
 	// across the two would answer "something is saturated" and never "which".
 	//
 	// BUSIEST rather than an average, for the reason the worst-volume pair
-	// gives: client connections are spread across front-door instances, so
-	// one pegged instance is a real stall for the share of traffic it serves,
-	// and an average over three dilutes a 100% reading to 33%.
-	FrontDoorCPUUtil  float64
-	FrontDoorCPUKnown bool
-	FrontDoorMemUtil  float64
-	FrontDoorMemKnown bool
+	// gives: connections are spread across router pods, so one pegged pod is
+	// a real stall for the share of traffic it serves, and an average over
+	// three dilutes a 100% reading to 33%.
+	//
+	// *Known is false on a target with no routing layer, which is the
+	// ordinary "unobserved" degrade rather than a claim that a router is
+	// idle. The remedy when it does saturate is a larger router tier, which
+	// is a separate control from the database's own size.
+	RouterCPUUtil  float64
+	RouterCPUKnown bool
+	RouterMemUtil  float64
+	RouterMemKnown bool
 
-	// FrontDoorWaitSeconds is how long the LONGEST-WAITING client has been
-	// queued at the front door without yet being handed a backend
-	// connection, across every front-door instance.
+	// The CONNECTION POOLER in front of an unsharded Postgres target
+	// (PlanetScale Postgres runs PgBouncer as a sidecar on each database
+	// pod), as the busiest such instance.
 	//
-	// It is the least ambiguous saturation signal of the three, and the only
-	// one that is not an inference. CPU at 90% might be fine; a client that
-	// has waited two seconds for a connection is being made to wait, full
-	// stop. It is also the signal most directly caused by sluice itself —
-	// a bulk copy opens many concurrent connections, and a pooled front door
-	// is exactly where that shows up first.
+	// KEPT DISTINCT FROM THE ROUTER FIELDS ABOVE, and the distinction is not
+	// cosmetic: a pooler is NOT in sluice's path. sluice connects directly to
+	// PlanetScale Postgres, and it must — logical replication cannot traverse
+	// a transaction pooler at all, so the CDC lane could not use one even if
+	// the copy lane did. A router terminates every connection sluice makes; a
+	// pooler terminates none of them.
 	//
-	// Known only where the platform publishes a queue wait. PlanetScale
-	// Postgres does (PgBouncer's per-pool maxwait); Neki does not, so a Neki
-	// branch reports CPU and memory here and leaves this unobserved rather
-	// than reporting a fabricated zero wait.
-	FrontDoorWaitSeconds float64
-	FrontDoorWaitKnown   bool
+	// That makes these fields a reading about the OPERATOR'S OWN application
+	// traffic rather than about sluice, which is exactly why they are worth
+	// having during a migration: the app and the migration are contending for
+	// one database, and a pooler that starts queueing app clients is the first
+	// visible sign that sluice's load is being felt on the other side of the
+	// same instance. Reading them as a sluice-path signal would be wrong in
+	// both directions — a quiet pooler says nothing about sluice's own
+	// throughput, and a saturated one is not sluice queueing.
+	//
+	// PgBouncerClientWaitSeconds is how long the LONGEST-WAITING client has
+	// been queued without yet being handed a backend connection. It is the
+	// least ambiguous of the three and the only one that is not an inference:
+	// CPU at 90% might be fine, but a client that has waited two seconds is
+	// being made to wait. Note it measures a DIFFERENT ceiling from
+	// MaxConnections below — measured on a real branch, PgBouncer admitted
+	// 400 clients in front of 25 Postgres backends — so clients can queue here
+	// long before the backend count looks stressed.
+	PgBouncerCPUUtil           float64
+	PgBouncerCPUKnown          bool
+	PgBouncerMemUtil           float64
+	PgBouncerMemKnown          bool
+	PgBouncerClientWaitSeconds float64
+	PgBouncerWaitKnown         bool
 
 	// StorageUtil is volume used / capacity in [0, 1]; StorageAvailableBytes
 	// / StorageCapacityBytes carry the raw figures for the storage-resize

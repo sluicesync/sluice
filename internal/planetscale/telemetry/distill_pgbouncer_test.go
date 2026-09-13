@@ -11,15 +11,18 @@ import (
 	"time"
 )
 
-// TestDistillPGExposition_ReadsThePgBouncerFrontDoor is the PlanetScale
-// Postgres half of the front-door signal.
+// TestDistillPGExposition_ReadsThePgBouncerPooler pins the connection-pooler
+// signal on PlanetScale Postgres.
 //
-// The two platforms fill the same role with very different machinery — Neki
-// with a fleet of router pods on their own tier, Postgres with a PgBouncer
-// sidecar riding on each database pod — and the operator's question is the same
-// for both: is the hop in front of my database the thing that is saturated?
-// So one pair of fields answers it, and this test is what keeps the Postgres
-// arm honest.
+// It is deliberately a SEPARATE signal from the routing layer the Neki test
+// covers, not a second instance of one "front door" reading, because the two
+// differ in the way that matters operationally: a Neki router terminates every
+// connection sluice makes, while a PgBouncer terminates none of them — sluice
+// connects to PlanetScale Postgres directly, and logical replication cannot
+// traverse a transaction pooler at all. So these numbers describe the
+// OPERATOR.S OWN application traffic against a database sluice is loading,
+// which is worth watching during a migration and worth never confusing with
+// sluice.s own throughput.
 //
 // Three ways to be wrong here, each of which produces a plausible number:
 //
@@ -29,7 +32,7 @@ import (
 //     pod-level slice understates exactly the condition worth alerting on.
 //     Measured on this fixture, which carries BOTH series for the same pods:
 //     swapping to the pod slice reports 0.0086 where the peer is at 0.725, an
-//     84x understatement that reads as a perfectly healthy front door.
+//     84x understatement that reads as a perfectly healthy pooler.
 //   - MEMORY read without the container filter, which picks up the database
 //     container sharing the pod — a much larger number about a different
 //     process.
@@ -41,7 +44,7 @@ import (
 // replicas stay near zero, so max ≠ mean), the postgres containers' memory to
 // 88% (so a missing container filter is visible against PgBouncer's ~38%), and
 // one pod's maxwait to 3.5s.
-func TestDistillPGExposition_ReadsThePgBouncerFrontDoor(t *testing.T) {
+func TestDistillPGExposition_ReadsThePgBouncerPooler(t *testing.T) {
 	t.Parallel()
 
 	raw, err := os.ReadFile("testdata/pg_pgbouncer_exposition.txt")
@@ -84,54 +87,68 @@ func TestDistillPGExposition_ReadsThePgBouncerFrontDoor(t *testing.T) {
 
 	snap := distill(samples, postgresMetricNames, time.Now())
 
-	if !snap.FrontDoorCPUKnown {
-		t.Fatal("FrontDoorCPUKnown is false on a PlanetScale Postgres exposition carrying three PgBouncer " +
-			"CPU series — the front door reads as unobserved and a saturated pooler stays invisible")
+	if !snap.PgBouncerCPUKnown {
+		t.Fatal("PgBouncerCPUKnown is false on a PlanetScale Postgres exposition carrying three PgBouncer " +
+			"CPU series — the pooler reads as unobserved and a saturated one stays invisible")
 	}
-	if got, want := snap.FrontDoorCPUUtil, 0.725; math.Abs(got-want) > 1e-9 {
-		t.Fatalf("FrontDoorCPUUtil = %v, want %v (the busiest PgBouncer peer). A mean over the three peers "+
+	if got, want := snap.PgBouncerCPUUtil, 0.725; math.Abs(got-want) > 1e-9 {
+		t.Fatalf("PgBouncerCPUUtil = %v, want %v (the busiest PgBouncer peer). A mean over the three peers "+
 			"would read ~0.242, and the pod metric's pgbouncer slice is a different measurement entirely", got, want)
 	}
 
-	if !snap.FrontDoorMemKnown {
-		t.Fatal("FrontDoorMemKnown is false although the fixture carries pgbouncer-container memory series")
+	if !snap.PgBouncerMemKnown {
+		t.Fatal("PgBouncerMemKnown is false although the fixture carries pgbouncer-container memory series")
 	}
-	if got := snap.FrontDoorMemUtil; math.Abs(got-0.384033203125) > 1e-9 {
+	if got := snap.PgBouncerMemUtil; math.Abs(got-0.384033203125) > 1e-9 {
 		if got > 0.8 {
-			t.Fatalf("FrontDoorMemUtil = %v — that is the DATABASE container's memory (0.88), not PgBouncer's "+
+			t.Fatalf("PgBouncerMemUtil = %v — that is the DATABASE container's memory (0.88), not PgBouncer's "+
 				"(~0.384). The memory selector is not filtering on planetscale_container", got)
 		}
-		t.Fatalf("FrontDoorMemUtil = %v, want ~0.384 (the busiest pgbouncer container)", got)
+		t.Fatalf("PgBouncerMemUtil = %v, want ~0.384 (the busiest pgbouncer container)", got)
 	}
 
-	if !snap.FrontDoorWaitKnown {
-		t.Fatal("FrontDoorWaitKnown is false although the fixture has a pod whose oldest client has waited " +
+	if !snap.PgBouncerWaitKnown {
+		t.Fatal("PgBouncerWaitKnown is false although the fixture has a pod whose oldest client has waited " +
 			"3.5s — this is the least ambiguous saturation signal the platform publishes and it must not be dropped")
 	}
-	if got := snap.FrontDoorWaitSeconds; math.Abs(got-3.5) > 1e-9 {
-		t.Fatalf("FrontDoorWaitSeconds = %v, want 3.5 (the longest-waiting client across pods)", got)
+	if got := snap.PgBouncerClientWaitSeconds; math.Abs(got-3.5) > 1e-9 {
+		t.Fatalf("PgBouncerClientWaitSeconds = %v, want 3.5 (the longest-waiting client across pods)", got)
 	}
 
 	// A duration, deliberately NOT run through clampFraction — a wait longer
 	// than one second is the entire point of the signal.
-	if snap.FrontDoorWaitSeconds <= 1 {
-		t.Fatalf("FrontDoorWaitSeconds = %v: a wait above 1 has been clamped as though it were a fraction, "+
-			"which would cap every real queue stall at one second", snap.FrontDoorWaitSeconds)
+	if snap.PgBouncerClientWaitSeconds <= 1 {
+		t.Fatalf("PgBouncerClientWaitSeconds = %v: a wait above 1 has been clamped as though it were a fraction, "+
+			"which would cap every real queue stall at one second", snap.PgBouncerClientWaitSeconds)
+	}
+
+	// And NOTHING may land in the router fields. An unsharded PlanetScale
+	// Postgres branch has no routing layer, and the two signals mean
+	// different things to an operator: a router is in sluice's connection
+	// path, a pooler is not. Publishing the pooler's number as a router
+	// reading would tell them to resize a component that does not exist and
+	// would imply sluice's own statements are queueing when they are not.
+	if snap.RouterCPUKnown || snap.RouterCPUUtil != 0 || snap.RouterMemKnown || snap.RouterMemUtil != 0 {
+		t.Errorf("router fields populated on a PlanetScale Postgres exposition: cpu=%v (known=%v) "+
+			"mem=%v (known=%v) — there is no routing layer here, and the pooler's reading must not be "+
+			"reported as one", snap.RouterCPUUtil, snap.RouterCPUKnown, snap.RouterMemUtil, snap.RouterMemKnown)
 	}
 }
 
-// TestFrontDoorSurfacesAreDisjoint is the premise check the metricNames doc
-// promises, and the reason one metric-name table can safely describe both
-// front-door shapes.
+// TestRouterAndPoolerSurfacesAreDisjoint records a platform fact the
+// metricNames doc cites: a branch has a routing layer or a connection pooler,
+// never both.
 //
 // Neki is Postgres by engine, so a Neki branch and a PlanetScale Postgres
-// branch both read [postgresMetricNames]. The cascade in [selectFrontDoorCPU]
-// tries the router-pod arm and then the pooler arm, which is only sound
-// because at most one can answer. That is a fact about two live expositions,
-// not about this code, so it is asserted rather than described: if PlanetScale
-// ever ships a branch carrying both, the cascade silently starts preferring
-// one and this fails first.
-func TestFrontDoorSurfacesAreDisjoint(t *testing.T) {
+// branch read the same [postgresMetricNames] table — which carries the names
+// for both shapes. Nothing DEPENDS on the disjointness any more (the two
+// signals select independently into separate snapshot fields, so a branch
+// running both would simply report both), and an earlier cut of this code that
+// cascaded between them did depend on it. The test stays because the fact is
+// what makes the two-signal split the right model at all: if PlanetScale ever
+// ships a branch with both, that is a design question worth being told about
+// rather than discovering in a dashboard.
+func TestRouterAndPoolerSurfacesAreDisjoint(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
@@ -183,9 +200,11 @@ func TestFrontDoorSurfacesAreDisjoint(t *testing.T) {
 					tc.file, haveRouter, tc.wantRouter, havePooler, tc.wantPooler, tc.description)
 			}
 			if haveRouter && havePooler {
-				t.Fatal("BOTH front-door shapes are present in one exposition. The cascade in " +
-					"selectFrontDoorCPU assumes at most one answers; with both it silently prefers the " +
-					"router arm and the pooler's reading is never published")
+				t.Fatal("a routing layer AND a connection pooler are both present in one exposition. " +
+					"Nothing breaks — the two signals select independently — but the model here assumes a " +
+					"branch has one or the other, and the operator guidance attached to each (resize the " +
+					"router tier; this is your application's traffic, not sluice's) was written on that " +
+					"assumption. Re-read both before trusting either")
 			}
 		})
 	}

@@ -57,7 +57,7 @@ func TestMetricsDocSync_RunningAsAService(t *testing.T) {
 	// the whole emit surface. Adding a metric to metrics.go moves this
 	// number — update it together with the doc table, which direction (1)
 	// below forces anyway.
-	const wantSeries = 33
+	const wantSeries = 35
 	if len(scraped) != wantSeries {
 		t.Fatalf("fully-attached scrape emitted %d distinct sluice_* series, want %d — if a metric was added/removed, update docs/operator/running-as-a-service.md's reference table and this count together. scraped: %v", len(scraped), wantSeries, sortedKeys(scraped))
 	}
@@ -119,20 +119,26 @@ func (docSyncTelemetry) Sample(context.Context) (ir.TargetHealthSnapshot, bool) 
 		CPUKnown:  true,
 		MemUtil:   0.5,
 		MemKnown:  true,
-		// The front door, enabled for the same reason the worst-pod family
-		// below is: the exporter gates each series on its own flag. Given a
-		// value UNLIKE the primary's 0.5 so a copy-paste that emitted the
-		// wrong field would be visible in a failure diff.
-		FrontDoorCPUUtil:      0.9,
-		FrontDoorCPUKnown:     true,
-		FrontDoorMemUtil:      0.3,
-		FrontDoorMemKnown:     true,
-		FrontDoorWaitSeconds:  1.25,
-		FrontDoorWaitKnown:    true,
-		StorageUtil:           0.5,
-		StorageAvailableBytes: 1 << 30,
-		StorageCapacityBytes:  1 << 31,
-		StorageKnown:          true,
+		// The routing layer and the connection pooler, enabled for the same
+		// reason the worst-pod family below is: the exporter gates each series
+		// on its own flag. Every value here is DISTINCT from every other so a
+		// copy-paste that emitted the wrong field is visible in a failure diff
+		// — which matters more since these five fields sit in two groups of
+		// near-identical shape.
+		RouterCPUUtil:              0.9,
+		RouterCPUKnown:             true,
+		RouterMemUtil:              0.3,
+		RouterMemKnown:             true,
+		PgBouncerCPUUtil:           0.55,
+		PgBouncerCPUKnown:          true,
+		PgBouncerMemUtil:           0.45,
+		PgBouncerMemKnown:          true,
+		PgBouncerClientWaitSeconds: 1.25,
+		PgBouncerWaitKnown:         true,
+		StorageUtil:                0.5,
+		StorageAvailableBytes:      1 << 30,
+		StorageCapacityBytes:       1 << 31,
+		StorageKnown:               true,
 		// The worst-pod family must be ENABLED here or the doc-sync gate
 		// cannot see it: the exporter emits it only under StorageWorstKnown,
 		// so a fixture that leaves the flag false lets a new metric ship both

@@ -312,7 +312,7 @@ func formatWatchLine(now time.Time, snap ir.TargetHealthSnapshot, ok bool) strin
 		stamp,
 		frac(snap.CPUKnown, snap.CPUUtil),
 		frac(snap.MemKnown, snap.MemUtil),
-		formatFrontDoorPair(snap),
+		formatRouterAndPoolerFields(snap),
 		frac(snap.StorageKnown, snap.StorageUtil), storageDetail,
 		lag, conns,
 		snap.SampledAt.UTC().Format(time.RFC3339),
@@ -355,20 +355,26 @@ func metricsWatchReadoutFields(now time.Time, snap ir.TargetHealthSnapshot, ok b
 		{Label: "cpu", Value: frac(snap.CPUKnown, snap.CPUUtil)},
 		{Label: "mem", Value: frac(snap.MemKnown, snap.MemUtil)},
 	}
-	// The front door gets rows only where there IS one. On a platform
-	// without a separate routing layer these would be two permanent "n/a"s,
-	// which is noise rather than honesty — the readout's own doc says it
-	// collapses rather than printing a wall of them.
-	if snap.FrontDoorCPUKnown {
-		fields = append(fields, progress.Field{Label: "front door cpu", Value: frac(true, snap.FrontDoorCPUUtil)})
+	// The router and the pooler get rows only where they EXIST. On a target
+	// with neither these would be permanent "n/a"s, which is noise rather
+	// than honesty — the readout.s own doc says it collapses rather than
+	// printing a wall of them.
+	if snap.RouterCPUKnown {
+		fields = append(fields, progress.Field{Label: "router cpu", Value: frac(true, snap.RouterCPUUtil)})
 	}
-	if snap.FrontDoorMemKnown {
-		fields = append(fields, progress.Field{Label: "front door mem", Value: frac(true, snap.FrontDoorMemUtil)})
+	if snap.RouterMemKnown {
+		fields = append(fields, progress.Field{Label: "router mem", Value: frac(true, snap.RouterMemUtil)})
 	}
-	if snap.FrontDoorWaitKnown {
+	if snap.PgBouncerCPUKnown {
+		fields = append(fields, progress.Field{Label: "pgbouncer cpu", Value: frac(true, snap.PgBouncerCPUUtil)})
+	}
+	if snap.PgBouncerMemKnown {
+		fields = append(fields, progress.Field{Label: "pgbouncer mem", Value: frac(true, snap.PgBouncerMemUtil)})
+	}
+	if snap.PgBouncerWaitKnown {
 		fields = append(fields, progress.Field{
-			Label: "front door wait",
-			Value: fmt.Sprintf("%.3fs", snap.FrontDoorWaitSeconds),
+			Label: "pgbouncer wait",
+			Value: fmt.Sprintf("%.3fs", snap.PgBouncerClientWaitSeconds),
 		})
 	}
 	return append(
@@ -380,35 +386,45 @@ func metricsWatchReadoutFields(now time.Time, snap ir.TargetHealthSnapshot, ok b
 	)
 }
 
-// formatFrontDoorPair renders the front door for the one-line watch output, or
-// the empty string when the platform exposes no front door at all — so a
-// Vitess/MySQL branch's line is BYTE-IDENTICAL to what it was before these
-// fields existed, and only a branch that actually has a front door grows a
-// field for it.
+// formatRouterAndPoolerFields renders the routing layer and the connection
+// pooler for the one-line watch output, or the empty string when the target has
+// neither — so a Vitess/MySQL branch's line is BYTE-IDENTICAL to what it was
+// before these fields existed, and only a target that actually has one of them
+// grows fields for it.
 //
-// Once a front door IS present, cpu and mem are rendered even if one of them
-// is unobserved, on the SL-6 rule: each half gates its own value, so a missing
-// one reads "n/a" rather than a fabricated 0.0 that would look like an idle
-// front door. The WAIT is different and is rendered only when known — it is
-// published by one platform and not the other (PgBouncer has a queue wait, a
-// Neki router does not), so a permanent "n/a" there would be a standing
-// question about a metric that is never coming, rather than a gap in a pair
-// the platform does publish.
-func formatFrontDoorPair(snap ir.TargetHealthSnapshot) string {
-	if !snap.FrontDoorCPUKnown && !snap.FrontDoorMemKnown && !snap.FrontDoorWaitKnown {
-		return ""
-	}
+// The two groups are rendered under their OWN names rather than a shared one.
+// They answer different questions: a router is in sluice's connection path and
+// a PgBouncer is not (sluice connects to PlanetScale Postgres directly), so an
+// operator reading `router_cpu=0.98` should reach for the router tier while
+// `pgbouncer_wait=2.5s` tells them their own application's clients are queueing
+// against a database sluice is loading. Collapsing them under one label would
+// invite exactly the wrong inference in both directions.
+//
+// Within a group, each half renders even when its sibling is unobserved, on the
+// SL-6 rule: a missing half reads "n/a" rather than a fabricated 0.0 that would
+// look like an idle machine. Between groups, a group absent entirely prints
+// nothing at all — a permanent "n/a" for a component the platform does not have
+// is a standing question about a metric that is never coming.
+func formatRouterAndPoolerFields(snap ir.TargetHealthSnapshot) string {
 	half := func(known bool, v float64) string {
 		if !known {
 			return "n/a"
 		}
 		return fmt.Sprintf("%.3f", v)
 	}
-	out := fmt.Sprintf(" front_door_cpu=%s front_door_mem=%s",
-		half(snap.FrontDoorCPUKnown, snap.FrontDoorCPUUtil),
-		half(snap.FrontDoorMemKnown, snap.FrontDoorMemUtil))
-	if snap.FrontDoorWaitKnown {
-		out += fmt.Sprintf(" front_door_wait=%.3fs", snap.FrontDoorWaitSeconds)
+	out := ""
+	if snap.RouterCPUKnown || snap.RouterMemKnown {
+		out += fmt.Sprintf(" router_cpu=%s router_mem=%s",
+			half(snap.RouterCPUKnown, snap.RouterCPUUtil),
+			half(snap.RouterMemKnown, snap.RouterMemUtil))
+	}
+	if snap.PgBouncerCPUKnown || snap.PgBouncerMemKnown || snap.PgBouncerWaitKnown {
+		out += fmt.Sprintf(" pgbouncer_cpu=%s pgbouncer_mem=%s",
+			half(snap.PgBouncerCPUKnown, snap.PgBouncerCPUUtil),
+			half(snap.PgBouncerMemKnown, snap.PgBouncerMemUtil))
+		if snap.PgBouncerWaitKnown {
+			out += fmt.Sprintf(" pgbouncer_wait=%.3fs", snap.PgBouncerClientWaitSeconds)
+		}
 	}
 	return out
 }
