@@ -264,7 +264,34 @@ func (r *RowReader) rawConn(ctx context.Context, exec func(driverConn any) error
 	case *sql.Conn:
 		// Snapshot-pinned conn: run the COPY on the pinned connection so
 		// it reads within the exported-snapshot transaction.
-		return q.Raw(exec)
+		err := q.Raw(exec)
+		if err == nil {
+			return nil
+		}
+		// A DEAD PINNED CONNECTION IS TERMINAL, and saying so is the whole
+		// point of this branch.
+		//
+		// The exported snapshot lives inside a transaction on THIS
+		// connection. When the connection dies the snapshot dies with it, so
+		// re-running the export can never succeed — every attempt re-enters
+		// the same corpse. That matters because the failure SHAPE is one the
+		// classifier otherwise reads as transient: pgconn.SafeToRetry is true
+		// for "conn closed", and on the *sql.DB branch below it genuinely is
+		// retriable, because that branch checks out a FRESH conn each call.
+		//
+		// Measured 2026-09-12: a cold copy whose pinned source conn dropped
+		// spent ~22 minutes replaying three chunks at a 30s backoff cap,
+		// ~135 attempts, none of which could ever have worked, while the
+		// storage condition that started it had already cleared. The run was
+		// killed rather than allowed to reach its budget.
+		//
+		// Refusing here converts that into an immediate, actionable failure.
+		// It is NOT wrapped as [ir.RetriableError], so every retry loop above
+		// stops on it. ADR-0109's reader-side retry is the one layer that CAN
+		// recover this class — it opens a brand-new reader rather than reusing
+		// the dead one — and it operates a level up, at table scope, where
+		// re-establishing a snapshot is meaningful.
+		return mapPinnedConnErr(err)
 	case *sql.DB:
 		conn, err := q.Conn(ctx)
 		if err != nil {
@@ -540,3 +567,70 @@ var (
 	_ ir.RawCopyExporter = (*RowReader)(nil)
 	_ ir.RawCopyImporter = (*RowWriter)(nil)
 )
+
+// isDeadPinnedConnErr reports whether err means the connection itself is gone,
+// as opposed to the server having refused something on a live connection.
+//
+// It is deliberately NARROW. The only shapes that qualify are the ones where a
+// replay on the SAME connection is provably futile: pgconn's own SafeToRetry
+// contract (its connLockError family, e.g. "conn closed"), the exported
+// ErrConnClosed sentinel, database/sql's ErrConnDone, and a bare EOF. A
+// server-side *pgconn.PgError never qualifies — the server RESPONDED, so the
+// connection was alive, and those shapes are classified by
+// [classifyApplierError] as usual.
+//
+// The asymmetry is the point: on a pooled (*sql.DB) source these same shapes
+// ARE retriable, because the next attempt draws a fresh connection. On a
+// snapshot-pinned (*sql.Conn) source they are terminal, because there is no
+// next connection to draw.
+func isDeadPinnedConnErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	// A server response means the conn was alive; classify it normally.
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return false
+	}
+	return pgconn.SafeToRetry(err) ||
+		errors.Is(err, pgconn.ErrConnClosed) ||
+		errors.Is(err, sql.ErrConnDone) ||
+		errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF)
+}
+
+// deadPinnedConnRefusal builds the terminal error the snapshot-pinned branch
+// returns when its connection is gone. Deliberately NOT wrapped as
+// [ir.RetriableError]: every retry loop above must stop on it, which is the
+// entire purpose — see the pinned branch in [RowReader.rawConn]. The cause is
+// wrapped so an operator can still see which connection error occurred.
+func deadPinnedConnRefusal(cause error) error {
+	return fmt.Errorf(
+		"postgres: ExportRawCopy: the exported snapshot's pinned connection is gone (%w). The snapshot "+
+			"lives in a transaction on that connection, so this table's copy cannot resume on it and "+
+			"retrying would replay the same dead connection. Re-run the copy; a fresh run takes a new "+
+			"snapshot",
+		cause,
+	)
+}
+
+// mapPinnedConnErr is the snapshot-pinned branch's error policy, extracted so
+// the WIRING is testable and not merely the two predicates it composes.
+//
+// That distinction is not pedantry: the first cut of this fix had tests for
+// [isDeadPinnedConnErr] and [deadPinnedConnRefusal] and none for the branch
+// joining them, so deleting the branch entirely broke no test. A gate that
+// covers a fix's parts but not its connection is the "narrower than its name"
+// shape this repo keeps paying for.
+//
+// nil in ⇒ nil out; a dead pinned connection ⇒ the terminal refusal; anything
+// else ⇒ unchanged, so server-side transients keep their classification.
+func mapPinnedConnErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	if isDeadPinnedConnErr(err) {
+		return deadPinnedConnRefusal(err)
+	}
+	return err
+}
