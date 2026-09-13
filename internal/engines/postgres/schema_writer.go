@@ -711,6 +711,20 @@ func (w *SchemaWriter) buildOneIndex(ctx context.Context, conn *sql.Conn, job in
 	// IF NOT EXISTS form (PG 9.5+), the same wrap CreateShapeIndex uses; the
 	// first " INDEX " token is the keyword to follow. sluice owns these
 	// tables, so a same-named index is the one it built.
+	// A PlanetScale Neki target cannot build an index this way at all: it
+	// ships statement_timeout=30s as a platform default and a CREATE INDEX is
+	// ONE statement, so any table large enough to matter dies at ~31s
+	// (measured). Route it through the router's asynchronous online-DDL
+	// workflow instead, where no single statement runs long. See
+	// neki_online_ddl.go for the lifecycle and its per-shard readiness trap.
+	//
+	// Placed BEFORE the IF NOT EXISTS rewrite because the online path does its
+	// own existence check — an online-DDL workflow that re-creates an existing
+	// index fails ~36 minutes after submission, so "check first" is both
+	// cheaper and the only way a resumed index phase becomes a no-op.
+	if w.isNeki {
+		return w.buildIndexViaNekiOnlineDDL(ctx, conn, job, stmt)
+	}
 	stmt = strings.Replace(stmt, "INDEX ", "INDEX IF NOT EXISTS ", 1)
 	// Bug #114 (found live by the v0.99.118 fresh-DB re-validation):
 	// `CREATE INDEX IF NOT EXISTS` is NOT atomic against an overlapping
