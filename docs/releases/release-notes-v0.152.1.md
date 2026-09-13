@@ -10,7 +10,7 @@ A fresh PlanetScale Neki branch starts with a 10 GiB volume that grows on demand
 
 The retry budget was never the limit. **One error arrived without a verdict attached.**
 
-`afterConnectRegisterGeometry` is an AfterConnect hook, so it runs on *every* connection the engine opens — including every per-chunk writer connection a parallel copy mints. When the volume filled, the shard's sidecars went unhealthy and that hook's PostGIS-OID probe came back `NK205 no healthy sidecars available`. NK205 is classified transient on purpose — exactly so a copy can wait out this window — but the hook returned the error **bare**. By the time it reached the chunk-open retry, which decides by asking whether an error carries an engine verdict, there was nothing to read. A condition that clears the moment the platform finishes growing the volume was treated as fatal.
+`afterConnectRegisterGeometry` is an AfterConnect hook, so it runs on *every* connection the engine opens — including every per-chunk writer connection a parallel copy mints. When the volume filled, the shard's sidecars went unhealthy and that hook's spatial-OID probe came back `NK205 no healthy sidecars available`. NK205 is classified transient on purpose — exactly so a copy can wait out this window — but the hook returned the error **bare**. By the time it reached the chunk-open retry, which decides by asking whether an error carries an engine verdict, there was nothing to read. A condition that clears the moment the platform finishes growing the volume was treated as fatal.
 
 It is classified now. Re-measured on a fresh PS-10 with the identical 13 GB workload:
 
