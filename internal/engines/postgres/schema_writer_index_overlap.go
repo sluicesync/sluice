@@ -286,7 +286,7 @@ func retryIndexBuildWithReparent(
 	deadline := time.Now().Add(pgCopyReparentMaxWallVar)
 	for try := 1; ; try++ {
 		var re ir.RetriableError
-		if !errors.As(classifyApplierError(err), &re) || !re.Retriable() {
+		if !errors.As(classifyCopyError(err), &re) || !re.Retriable() {
 			return err
 		}
 		if time.Now().After(deadline) || try >= pgCopyReparentRetryAttemptsVar {

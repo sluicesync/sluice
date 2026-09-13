@@ -30,6 +30,15 @@ func TestSetErrSitesClassify(t *testing.T) {
 		Classifiers: map[string]bool{
 			"classifyReaderError":  true,
 			"classifyApplierError": true,
+			// The COPY/schema-path classifier (Bug 285). It IS
+			// classifyApplierError with one verdict reversed — schema drift
+			// (42703/42P01) is terminal on a cold copy, because the relation
+			// being written into is one this run created and no operator is
+			// adding it mid-migrate — so it satisfies this gate for exactly
+			// the same reason its sibling does: the parked error carries a
+			// verdict the streamer can act on rather than an unclassified one
+			// it must treat as terminal.
+			"classifyCopyError": true,
 		},
 		// Deliberate exceptions, each judged individually rather than
 		// bulk-annotated. Keyed "file.go:argument-source".

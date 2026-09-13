@@ -134,7 +134,7 @@ func (r *RowReader) ExportRawCopy(ctx context.Context, table *ir.Table, chunk *i
 			// which is why internal/errclassgate could not see it: that gate
 			// walks parked errors, and most returned errors are legitimately
 			// unclassified.
-			return classifyApplierError(fmt.Errorf("postgres: ExportRawCopy %q: %w", table.Name, err))
+			return classifyCopyError(fmt.Errorf("postgres: ExportRawCopy %q: %w", table.Name, err))
 		}
 		return nil
 	}
@@ -239,7 +239,7 @@ func (w *RowWriter) ImportRawCopy(ctx context.Context, table *ir.Table, format i
 		// the re-priced gap 18 in docs/dev/perf-parity-matrix.md.
 		rawErr = w.quiesceAndReportTransient(rawErr, "raw COPY import")
 		var re ir.RetriableError
-		if errors.As(classifyApplierError(rawErr), &re) && re.Retriable() {
+		if errors.As(classifyCopyError(rawErr), &re) && re.Retriable() {
 			return 0, fmt.Errorf(
 				"%w. This is the raw-COPY fast path, which streams the source bytes straight into "+
 					"COPY FROM STDIN and therefore has NO resume point — the stream is consumed as it goes, "+

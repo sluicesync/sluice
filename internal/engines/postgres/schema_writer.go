@@ -437,7 +437,7 @@ type indexBuildJob struct {
 // and the phase fails loudly, exactly as before.
 func (w *SchemaWriter) IsTransientError(err error) bool {
 	var re ir.RetriableError
-	return errors.As(classifyApplierError(err), &re) && re.Retriable()
+	return errors.As(classifyCopyError(err), &re) && re.Retriable()
 }
 
 // Compile-time proof the SchemaWriter exposes the DDL-phase retry verdict

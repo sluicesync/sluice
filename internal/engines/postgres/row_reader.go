@@ -358,7 +358,7 @@ func (r *RowReader) stream(ctx context.Context, rows *sql.Rows, table *ir.Table,
 		// resuming. A retry technique that landed in one engine and silently
 		// missed its sibling (audit 2026-07-26; found by the shared setErr
 		// gate the moment it could see this package).
-		r.setErr(classifyApplierError(fmt.Errorf("postgres: rows iteration: %w", err)))
+		r.setErr(classifyCopyError(fmt.Errorf("postgres: rows iteration: %w", err)))
 	}
 }
 

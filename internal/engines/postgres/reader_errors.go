@@ -22,5 +22,5 @@ package postgres
 // transient shapes. Returns err unchanged otherwise. nil in → nil
 // out. Delegates to [classifyApplierError].
 func classifyReaderError(err error) error {
-	return classifyApplierError(err)
+	return classifyCopyError(err)
 }

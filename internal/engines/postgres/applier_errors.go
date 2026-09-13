@@ -410,3 +410,61 @@ type terminalPGError struct{ err error }
 func (e *terminalPGError) Error() string  { return e.err.Error() }
 func (e *terminalPGError) Unwrap() error  { return e.err }
 func (e *terminalPGError) Terminal() bool { return true }
+
+// classifyCopyError is [classifyApplierError] with ONE verdict reversed, for
+// the BULK-COPY and schema phases rather than the CDC applier.
+//
+// # The one difference, and why it is the whole point
+//
+// `42703 undefined_column` / `42P01 undefined_table` are classified RETRIABLE
+// for the CDC applier, and that is correct there: a long-running stream can
+// meet a table the target does not have yet, sluice does not auto-apply DDL,
+// and the condition genuinely self-heals the moment the operator creates it.
+// Riding it out beats a terminal exit into a supervisor restart loop.
+//
+// On a COLD COPY none of that holds. The relation being written into is one
+// THIS RUN created minutes earlier, in its own schema-apply phase. If it is
+// missing now, no operator is about to add it mid-migrate — the schema-apply
+// phase failed, or it applied to a different schema, which is precisely what
+// sluice's own `SLUICE-E-BULKCOPY-TARGET-TABLE-MISSING` refusal says and asks
+// about. The condition cannot clear, so retrying it converts a 67-millisecond
+// diagnosis into a half-hour of WARNs that end with the same verdict behind a
+// misleading headline about storage growth.
+//
+// That is Bug 285, filed by the v0.152.0 regression cycle. The raw-copy lane
+// REGRESSED into it when v0.152.0 gave that lane a retry at all; the typed IR
+// lane had the same stall before and after, which is why this fixes the CLASS
+// at the shared classifier rather than the one lane that changed.
+//
+// # Reach, enumerated rather than implied
+//
+// Used by every COPY-path and schema-path classification: the raw lane's
+// export and import, the typed lane's write core (via
+// [quiesceAndReportTransient]), the source read, and the schema/index writers.
+// NOT used by anything under change_applier*.go — the CDC applier keeps the
+// retriable verdict, deliberately, and a change there would reintroduce the
+// crash-loop that verdict exists to prevent.
+func classifyCopyError(err error) error {
+	classified := classifyApplierError(err)
+	if !isSchemaDriftPGError(err) {
+		return classified
+	}
+	// Preserve the classified error's message (it names the remedy and keeps
+	// the *pgconn.PgError reachable through errors.As) and flip only the
+	// verdict, so the operator-facing text does not change — the difference is
+	// that the copy stops asking.
+	return &terminalPGError{err: classified}
+}
+
+// isSchemaDriftPGError reports whether err carries the undefined-column /
+// undefined-table SQLSTATEs. Matched on the CODE via errors.As, never on
+// message text — the terminal-code shield's rule is that consulting a message
+// to narrow a terminal code is safe and consulting one to broaden a transient
+// code is not, and this broadens nothing.
+func isSchemaDriftPGError(err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	return pgErr.Code == "42703" || pgErr.Code == "42P01"
+}

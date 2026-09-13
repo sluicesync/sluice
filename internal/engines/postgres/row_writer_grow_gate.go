@@ -194,7 +194,7 @@ func (w *RowWriter) quiesceAndReportTransient(err error, what string) error {
 	// caller now gets the wrapper, whose Unwrap preserves the chain — every
 	// existing errors.Is/errors.As against the underlying *pgconn.PgError
 	// still matches.
-	classified := classifyApplierError(err)
+	classified := classifyCopyError(err)
 	var re ir.RetriableError
 	if errors.As(classified, &re) && re.Retriable() {
 		w.tripGrowGate("postgres cold-copy "+what+" transient: "+err.Error(), err)
@@ -255,7 +255,7 @@ func (w *RowWriter) copyChunkWithRetry(
 		// including a real terminal value-fidelity / constraint failure —
 		// returns unchanged.
 		var re ir.RetriableError
-		if !errors.As(classifyApplierError(err), &re) || !re.Retriable() {
+		if !errors.As(classifyCopyError(err), &re) || !re.Retriable() {
 			return err
 		}
 		// ADR-0110: this lane hit a classified grow-transient — TRIP the shared
