@@ -59,6 +59,30 @@ So the fastest lane is the one least able to survive the interruption most likel
 
 **Not built today.** (1) is now well-scoped work rather than the redesign the first draft assumed, and it is the next thing to build.
 
+## 2026-09-13 — `MaxChunksPerTable = 64` is reasoned as a PARALLELISM cap and silently sets three other things (operator-raised)
+
+Asked why a 44 GB table copies in 64 chunks. The arithmetic:
+
+```
+defaultBulkParallelMinRows = 80,000            rows/chunk the design wants
+table                      = 39,864,000 rows
+size wants  ceil(39.86M / 80k)  = 499 chunks
+cap         max(MaxChunksPerTable=64, copyBudget) = 64
+result                          = 64           ← capped, 7.8x over
+```
+
+So the chunker **wants 499 chunks and gets 64**, making each chunk ~623k rows / ~690 MB instead of the intended 80k / ~88 MB.
+
+**ADR-0119's rationale for the cap is explicitly about parallelism** — *"past a point extra chunks only add per-chunk overhead … without widening the copy beyond the N pinned readers"* — and that reasoning is correct for throughput. What it does not mention is that chunk SIZE also sets three unrelated properties:
+
+1. **Retry blast radius.** A failed chunk redoes ~690 MB rather than ~88 MB.
+2. **Statement-timeout exposure — the important one.** A chunk is ONE `COPY` statement. At 64 chunks and the measured 15.4k rows/s of run 1, each chunk ran **~45 seconds against Neki's 30s `statement_timeout`**. The cap is what put the copy over that wall; at 499 chunks each statement would have been ~6s and the timeout could never have fired. The cap and the platform's statement timeout are coupled, and nothing in the code says so.
+3. **Resume granularity.** Progress is written per chunk, so a crash or a fresh-reader restart loses up to one chunk's work.
+
+**The counterargument, and it sequences the work.** Raising the cap makes the chunk-progress contention (register item 5) strictly worse: every chunk completion writes the SAME `sluice_migrate_state` row, measured at 0 failures with 2 streams and 4+ with 4, blowing a 20s `lock_timeout`. 499 chunks is ~8x more writes to that one row.
+
+So: **fix the per-chunk progress row first, then raise `MaxChunksPerTable`.** In the other order this trades a storage problem for a lock problem. Neither half is built.
+
 ## 2026-09-12 — NEKI ARC: consolidated follow-up register (the single list; individual entries below carry the detail)
 
 A day of live Neki work produced three shipped fixes and a tail of open items across three repos. This is the register so none of it is carried in conversation alone. **Shipped today:** `4c09c80e` (statement_timeout on the copy lanes), `771723ba` (COPY-concurrency product ceiling), `b570ecc6` (sidecar pool timeout no longer terminal).
