@@ -320,6 +320,8 @@ Every series `/metrics` can emit, by family. Conditional families follow the hon
 |---|---|---|---|---|
 | `sluice_target_cpu_util` | gauge | `stream_id` | Target CPU utilisation, fraction in [0,1]. | > 0.9 sustained: the target is the bottleneck; expect AIMD damping. |
 | `sluice_target_mem_util` | gauge | `stream_id` | Target memory utilisation, fraction in [0,1]. | As above. |
+| `sluice_target_router_cpu_util` | gauge | `stream_id` | CPU utilisation of the **busiest front-door router pod**, fraction in [0,1]. Emitted only where the platform has a routing layer in front of the database (PlanetScale Neki); absent otherwise. | **Watch this alongside `sluice_target_cpu_util`, not instead of it.** The router can saturate while every database pod is comfortable, and when it does, throughput collapses for a reason nothing in the primary's numbers explains — measured on a live Neki branch with the routing layer pegged at 100%. Busiest rather than average: connections spread across router pods, so one pegged pod is a real stall for its share of traffic. The fix is a bigger router tier, not a bigger database. |
+| `sluice_target_router_mem_util` | gauge | `stream_id` | Memory utilisation of the busiest front-door router pod, fraction in [0,1]. | As above. |
 | `sluice_target_storage_util` | gauge | `stream_id` | Target storage volume utilisation, fraction in [0,1]. | Alert well before 1.0 — managed platforms resize with a serving pause. |
 | `sluice_target_storage_available_bytes` | gauge | `stream_id` | Storage bytes still available before a resize. | Pair with the util fraction for absolute headroom. |
 | `sluice_target_storage_capacity_bytes` | gauge | `stream_id` | Storage volume capacity in bytes. | Reference for the two above. |

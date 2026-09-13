@@ -604,6 +604,23 @@ func emitTargetTelemetryMetrics(w io.Writer, streamID string, snap ir.TargetHeal
 		fmt.Fprintln(w, "# TYPE sluice_target_mem_util gauge")
 		fmt.Fprintf(w, `sluice_target_mem_util{stream_id=%q} %s`+"\n", streamID, formatPrometheusFraction(snap.MemUtil))
 	}
+	// The front door, as its own series rather than folded into the two
+	// above: a routing layer can saturate while every database pod is
+	// comfortable, and a dashboard that cannot tell those apart sends the
+	// operator to the wrong machine. Absent entirely on a platform with no
+	// separate router, which is how Prometheus says "not observed".
+	if snap.RouterCPUKnown {
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "# HELP sluice_target_router_cpu_util CPU utilisation of the BUSIEST front-door router pod as a fraction in [0,1] — the routing layer client connections arrive on, where the platform has one (PlanetScale Neki). Separate series from sluice_target_cpu_util (the database primary's), never a replacement for it.")
+		fmt.Fprintln(w, "# TYPE sluice_target_router_cpu_util gauge")
+		fmt.Fprintf(w, `sluice_target_router_cpu_util{stream_id=%q} %s`+"\n", streamID, formatPrometheusFraction(snap.RouterCPUUtil))
+	}
+	if snap.RouterMemKnown {
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "# HELP sluice_target_router_mem_util Memory utilisation of the BUSIEST front-door router pod as a fraction in [0,1]. Separate series from sluice_target_mem_util.")
+		fmt.Fprintln(w, "# TYPE sluice_target_router_mem_util gauge")
+		fmt.Fprintf(w, `sluice_target_router_mem_util{stream_id=%q} %s`+"\n", streamID, formatPrometheusFraction(snap.RouterMemUtil))
+	}
 	if snap.StorageKnown {
 		fmt.Fprintln(w)
 		fmt.Fprintln(w, "# HELP sluice_target_storage_util Target storage volume utilisation as a fraction in [0,1] (ADR-0107).")
@@ -741,6 +758,24 @@ func fleetGaugeFamilies() []fleetGaugeFamily {
 			help: "Target memory utilisation as a fraction in [0,1] from the control-plane telemetry provider (ADR-0107).",
 			read: func(s ir.TargetHealthSnapshot) (string, bool) {
 				return formatPrometheusFraction(s.MemUtil), s.MemKnown
+			},
+		},
+		// The FRONT DOOR. Enumerated here for the same reason the worst-pod
+		// family below was: a fleet exporter that silently lacks a signal its
+		// single-database sibling has is the exact miss this list's own
+		// comment records happening once already.
+		{
+			name: "sluice_target_router_cpu_util",
+			help: "CPU utilisation of the BUSIEST front-door router pod as a fraction in [0,1] — the routing layer client connections arrive on, where the platform has one (PlanetScale Neki). Separate series from sluice_target_cpu_util (the database primary's), never a replacement for it.",
+			read: func(s ir.TargetHealthSnapshot) (string, bool) {
+				return formatPrometheusFraction(s.RouterCPUUtil), s.RouterCPUKnown
+			},
+		},
+		{
+			name: "sluice_target_router_mem_util",
+			help: "Memory utilisation of the BUSIEST front-door router pod as a fraction in [0,1]. Separate series from sluice_target_mem_util.",
+			read: func(s ir.TargetHealthSnapshot) (string, bool) {
+				return formatPrometheusFraction(s.RouterMemUtil), s.RouterMemKnown
 			},
 		},
 		{

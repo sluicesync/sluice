@@ -308,10 +308,11 @@ func formatWatchLine(now time.Time, snap ir.TargetHealthSnapshot, ok bool) strin
 	// (audit 2026-07-26 SL-6).
 	conns := formatConnPair(snap)
 	return fmt.Sprintf(
-		"%s  cpu=%s mem=%s storage=%s%s lag=%s conns=%s  sampled=%s fresh=%t",
+		"%s  cpu=%s mem=%s%s storage=%s%s lag=%s conns=%s  sampled=%s fresh=%t",
 		stamp,
 		frac(snap.CPUKnown, snap.CPUUtil),
 		frac(snap.MemKnown, snap.MemUtil),
+		formatRouterPair(snap),
 		frac(snap.StorageKnown, snap.StorageUtil), storageDetail,
 		lag, conns,
 		snap.SampledAt.UTC().Format(time.RFC3339),
@@ -350,14 +351,52 @@ func metricsWatchReadoutFields(now time.Time, snap ir.TargetHealthSnapshot, ok b
 	// fabricated "37/0", which reads as a target with no connection budget
 	// (audit 2026-07-26 SL-6).
 	conns := formatConnPair(snap)
-	return []progress.Field{
+	fields := []progress.Field{
 		{Label: "cpu", Value: frac(snap.CPUKnown, snap.CPUUtil)},
 		{Label: "mem", Value: frac(snap.MemKnown, snap.MemUtil)},
-		{Label: "storage", Value: storage},
-		{Label: "lag", Value: lag},
-		{Label: "connections", Value: conns},
-		{Label: "fresh", Value: fmt.Sprintf("%t", snap.Fresh(now, telemetryFreshnessWindow))},
 	}
+	// The front door gets rows only where there IS one. On a platform
+	// without a separate routing layer these would be two permanent "n/a"s,
+	// which is noise rather than honesty — the readout's own doc says it
+	// collapses rather than printing a wall of them.
+	if snap.RouterCPUKnown {
+		fields = append(fields, progress.Field{Label: "router cpu", Value: frac(true, snap.RouterCPUUtil)})
+	}
+	if snap.RouterMemKnown {
+		fields = append(fields, progress.Field{Label: "router mem", Value: frac(true, snap.RouterMemUtil)})
+	}
+	return append(
+		fields,
+		progress.Field{Label: "storage", Value: storage},
+		progress.Field{Label: "lag", Value: lag},
+		progress.Field{Label: "connections", Value: conns},
+		progress.Field{Label: "fresh", Value: fmt.Sprintf("%t", snap.Fresh(now, telemetryFreshnessWindow))},
+	)
+}
+
+// formatRouterPair renders the front door for the one-line watch output, or
+// the empty string when the platform exposes no router at all — so a
+// Vitess/MySQL branch's line is BYTE-IDENTICAL to what it was before the
+// router fields existed, and only a branch that actually has a front door
+// grows a field for it.
+//
+// When a router IS present, both halves are rendered even if one is
+// unobserved, on the SL-6 rule: each half gates its own value, so a missing
+// one reads "n/a" rather than a fabricated 0.0 that would look like an idle
+// router.
+func formatRouterPair(snap ir.TargetHealthSnapshot) string {
+	if !snap.RouterCPUKnown && !snap.RouterMemKnown {
+		return ""
+	}
+	half := func(known bool, v float64) string {
+		if !known {
+			return "n/a"
+		}
+		return fmt.Sprintf("%.3f", v)
+	}
+	return fmt.Sprintf(" router_cpu=%s router_mem=%s",
+		half(snap.RouterCPUKnown, snap.RouterCPUUtil),
+		half(snap.RouterMemKnown, snap.RouterMemUtil))
 }
 
 // panelEventNotifier is the ADR-0156 internal notify sink that forwards a

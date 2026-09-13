@@ -76,6 +76,33 @@ type TargetHealthSnapshot struct {
 	MemUtil  float64
 	MemKnown bool
 
+	// RouterCPUUtil / RouterMemUtil describe the target's FRONT DOOR — the
+	// routing layer client connections arrive on, where the platform has one
+	// and exposes it — as the BUSIEST such pod, in [0, 1]. *Known is false
+	// on a platform with no separate front door (a Vitess/MySQL branch
+	// exposes no router series at all), which is the ordinary "unobserved"
+	// degrade rather than a claim that the front door is idle.
+	//
+	// SEPARATE from CPUUtil/MemUtil on purpose, by the same argument the
+	// storage pair above makes. The router is not the database: it can
+	// saturate while every database pod is comfortable, and when it does,
+	// throughput collapses for a reason nothing in the primary's numbers
+	// explains. That is not hypothetical — on a live PlanetScale Neki branch
+	// the routing layer sat pegged at 100% while the operator watched it in
+	// the console and `metrics-watch` had no field to report it in. Folding
+	// it into CPUUtil would have hidden the primary's own reading behind it;
+	// a MAX across the two would answer "something is saturated" and never
+	// "which".
+	//
+	// BUSIEST rather than an average, for the reason the worst-volume pair
+	// gives: client connections are spread across router pods, so one pegged
+	// pod is a real stall for the share of traffic it serves, and an average
+	// over three pods dilutes a 100% reading to 33%.
+	RouterCPUUtil  float64
+	RouterCPUKnown bool
+	RouterMemUtil  float64
+	RouterMemKnown bool
+
 	// StorageUtil is volume used / capacity in [0, 1]; StorageAvailableBytes
 	// / StorageCapacityBytes carry the raw figures for the storage-resize
 	// anticipation path (use (b)) and operator observability (use (c)).

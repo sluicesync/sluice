@@ -174,6 +174,21 @@ const (
 	// (live-confirmed 2026-07-24 on two real PS-PG branches).
 	labelRole = "planetscale_role"
 
+	// labelRouter marks a FRONT-DOOR pod — the routing layer client
+	// connections arrive on. On a PlanetScale Neki branch it is carried by,
+	// and only by, `planetscale_component="nkrouter"` series (verified
+	// against a live branch 2026-09-13: every series carrying the label is
+	// an nkrouter one, and the database tablets carry none). Its PRESENCE is
+	// the test rather than its value, because the value is the operator's
+	// router name ("default" on a single-router branch) and a branch with
+	// several named routers must still be graded as one front door.
+	//
+	// The Vitess/MySQL surface emits no series carrying it, so the router
+	// fields simply stay unobserved there — no special-casing, and no risk
+	// of attributing a vttablet's number to a front door that does not
+	// exist.
+	labelRouter = "planetscale_router"
+
 	componentVTTablet = "vttablet"
 	tabletTypePrimary = "primary"
 	rolePrimary       = "primary"
@@ -207,6 +222,18 @@ func distill(samples []promSample, names metricNames, now time.Time) ir.TargetHe
 	if v, ok := selectPrimaryValue(samples, names.memUtilPct, names.primaryContainer); ok {
 		snap.MemUtil = clampFraction(v / 100.0)
 		snap.MemKnown = true
+	}
+
+	// The front door, as the BUSIEST router pod. See the snapshot fields'
+	// doc for why this is a separate signal from the primary's CPU/mem and
+	// not folded into it.
+	if v, ok := selectWorstRouterValue(samples, names.cpuUtilPct); ok {
+		snap.RouterCPUUtil = clampFraction(v / 100.0)
+		snap.RouterCPUKnown = true
+	}
+	if v, ok := selectWorstRouterValue(samples, names.memUtilPct); ok {
+		snap.RouterMemUtil = clampFraction(v / 100.0)
+		snap.RouterMemKnown = true
 	}
 
 	avail, availOK := selectPrimaryValue(samples, names.volAvailableByte, names.primaryContainer)
@@ -371,6 +398,36 @@ func selectWorstOf(samples []promSample, name string) (float64, bool) {
 	worst, found := 0.0, false
 	for _, s := range samples {
 		if s.name != name {
+			continue
+		}
+		if !found || s.value > worst {
+			worst, found = s.value, true
+		}
+	}
+	return worst, found
+}
+
+// selectWorstRouterValue returns the highest value of the named metric across
+// the branch's FRONT-DOOR pods — those carrying [labelRouter] — and ok=false
+// when the exposition has none, which is every non-Neki surface.
+//
+// It is deliberately NOT [selectWorstOf] with a filter argument bolted on:
+// that function's contract is "the worst across every series", and a router
+// series and a database-tablet series of `planetscale_pods_cpu_util_percentages`
+// are the same metric on different machines. Reducing them together answers
+// "is anything busy", which is the question nobody is asking — the whole point
+// of the router fields is to tell a saturated front door apart from a
+// saturated database.
+//
+// The filter is label PRESENCE, not a value match: a branch may run several
+// named routers and all of them are the front door (see [labelRouter]).
+func selectWorstRouterValue(samples []promSample, name string) (float64, bool) {
+	if name == "" {
+		return 0, false
+	}
+	worst, found := 0.0, false
+	for _, s := range samples {
+		if s.name != name || s.label(labelRouter) == "" {
 			continue
 		}
 		if !found || s.value > worst {
