@@ -76,32 +76,59 @@ type TargetHealthSnapshot struct {
 	MemUtil  float64
 	MemKnown bool
 
-	// RouterCPUUtil / RouterMemUtil describe the target's FRONT DOOR — the
-	// routing layer client connections arrive on, where the platform has one
-	// and exposes it — as the BUSIEST such pod, in [0, 1]. *Known is false
-	// on a platform with no separate front door (a Vitess/MySQL branch
-	// exposes no router series at all), which is the ordinary "unobserved"
+	// The target's FRONT DOOR: the hop client connections land on before
+	// they reach a database backend. Every field here is the BUSIEST such
+	// instance, and each carries its own *Known flag — false on a platform
+	// with no separate front door, which is the ordinary "unobserved"
 	// degrade rather than a claim that the front door is idle.
 	//
+	// "Front door" rather than a product's own word for it because two very
+	// different things fill the role and an operator needs the same question
+	// answered about both: on PlanetScale Neki it is a fleet of router pods
+	// sized by their own tier, and on PlanetScale Postgres it is a PgBouncer
+	// sidecar on each database pod. A dashboard that spelled these as two
+	// separate signals would leave half its panels empty on any given branch,
+	// and the question — "is the hop in front of my database the thing that
+	// is saturated?" — is identical either way. The REMEDIES differ (resize
+	// the router tier; resize the instance), which is a matter for the alert
+	// text, not for the shape of the reading.
+	//
 	// SEPARATE from CPUUtil/MemUtil on purpose, by the same argument the
-	// storage pair above makes. The router is not the database: it can
+	// storage pair above makes. The front door is not the database: it can
 	// saturate while every database pod is comfortable, and when it does,
 	// throughput collapses for a reason nothing in the primary's numbers
-	// explains. That is not hypothetical — on a live PlanetScale Neki branch
-	// the routing layer sat pegged at 100% while the operator watched it in
-	// the console and `metrics-watch` had no field to report it in. Folding
-	// it into CPUUtil would have hidden the primary's own reading behind it;
-	// a MAX across the two would answer "something is saturated" and never
-	// "which".
+	// explains. That is not hypothetical — on a live Neki branch the routing
+	// layer sat pegged at 100% while the operator watched it in the console
+	// and `metrics-watch` had no field to report it in. Folding it into
+	// CPUUtil would have hidden the primary's own reading behind it; a MAX
+	// across the two would answer "something is saturated" and never "which".
 	//
 	// BUSIEST rather than an average, for the reason the worst-volume pair
-	// gives: client connections are spread across router pods, so one pegged
-	// pod is a real stall for the share of traffic it serves, and an average
-	// over three pods dilutes a 100% reading to 33%.
-	RouterCPUUtil  float64
-	RouterCPUKnown bool
-	RouterMemUtil  float64
-	RouterMemKnown bool
+	// gives: client connections are spread across front-door instances, so
+	// one pegged instance is a real stall for the share of traffic it serves,
+	// and an average over three dilutes a 100% reading to 33%.
+	FrontDoorCPUUtil  float64
+	FrontDoorCPUKnown bool
+	FrontDoorMemUtil  float64
+	FrontDoorMemKnown bool
+
+	// FrontDoorWaitSeconds is how long the LONGEST-WAITING client has been
+	// queued at the front door without yet being handed a backend
+	// connection, across every front-door instance.
+	//
+	// It is the least ambiguous saturation signal of the three, and the only
+	// one that is not an inference. CPU at 90% might be fine; a client that
+	// has waited two seconds for a connection is being made to wait, full
+	// stop. It is also the signal most directly caused by sluice itself —
+	// a bulk copy opens many concurrent connections, and a pooled front door
+	// is exactly where that shows up first.
+	//
+	// Known only where the platform publishes a queue wait. PlanetScale
+	// Postgres does (PgBouncer's per-pool maxwait); Neki does not, so a Neki
+	// branch reports CPU and memory here and leaves this unobserved rather
+	// than reporting a fabricated zero wait.
+	FrontDoorWaitSeconds float64
+	FrontDoorWaitKnown   bool
 
 	// StorageUtil is volume used / capacity in [0, 1]; StorageAvailableBytes
 	// / StorageCapacityBytes carry the raw figures for the storage-resize

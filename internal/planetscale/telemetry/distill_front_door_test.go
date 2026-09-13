@@ -81,32 +81,42 @@ func TestDistillNekiExposition_ReportsTheFrontDoorSeparately(t *testing.T) {
 
 	snap := distill(samples, pgMetricNames(), time.Now())
 
-	if !snap.RouterCPUKnown {
-		t.Fatal("RouterCPUKnown is false on an exposition that carries three router CPU series — the front " +
+	if !snap.FrontDoorCPUKnown {
+		t.Fatal("FrontDoorCPUKnown is false on an exposition that carries three router CPU series — the front " +
 			"door reads as unobserved, and a saturated router stays invisible exactly as it was")
 	}
-	if got, want := snap.RouterCPUUtil, busiest/100.0; math.Abs(got-want) > 1e-9 {
+	if got, want := snap.FrontDoorCPUUtil, busiest/100.0; math.Abs(got-want) > 1e-9 {
 		switch {
 		case math.Abs(got-mean/100.0) < 1e-9:
-			t.Fatalf("RouterCPUUtil = %v, the MEAN of the router pods; want %v, the busiest. An average over "+
+			t.Fatalf("FrontDoorCPUUtil = %v, the MEAN of the router pods; want %v, the busiest. An average over "+
 				"three pods dilutes one pegged pod to a third of its real reading", got, want)
 		case got > 0.9:
-			t.Fatalf("RouterCPUUtil = %v — that is the database PRIMARY's reading, not a router's. The "+
+			t.Fatalf("FrontDoorCPUUtil = %v — that is the database PRIMARY's reading, not a router's. The "+
 				"selector is not filtering on %s, so the front-door series reports the wrong machine",
 				got, labelRouter)
 		default:
-			t.Fatalf("RouterCPUUtil = %v, want %v (the busiest router pod)", got, want)
+			t.Fatalf("FrontDoorCPUUtil = %v, want %v (the busiest router pod)", got, want)
 		}
 	}
 
-	if !snap.RouterMemKnown {
-		t.Fatal("RouterMemKnown is false although the fixture carries router memory series")
+	if !snap.FrontDoorMemKnown {
+		t.Fatal("FrontDoorMemKnown is false although the fixture carries router memory series")
 	}
 	// The fixture's only >50% memory series is a database pod's, so a missing
 	// filter shows up here as a high reading rather than a subtly wrong one.
-	if snap.RouterMemUtil > 0.5 {
-		t.Fatalf("RouterMemUtil = %v — the fixture's routers report ~0.26 and its database pod ~0.89, so a "+
-			"value this high means the memory selector took a database pod", snap.RouterMemUtil)
+	if snap.FrontDoorMemUtil > 0.5 {
+		t.Fatalf("FrontDoorMemUtil = %v — the fixture's routers report ~0.26 and its database pod ~0.89, so a "+
+			"value this high means the memory selector took a database pod", snap.FrontDoorMemUtil)
+	}
+
+	// Neki publishes no queue wait, so it must read as unobserved here rather
+	// than as a front door with a perfect zero-second wait. This is the
+	// asymmetry that makes the wait its own *Known flag instead of riding on
+	// the CPU one.
+	if snap.FrontDoorWaitKnown || snap.FrontDoorWaitSeconds != 0 {
+		t.Errorf("FrontDoorWaitSeconds = %v (known=%v) on a Neki exposition — Neki exposes no queue-wait "+
+			"metric, so claiming a zero wait would assert the front door is never queueing anyone",
+			snap.FrontDoorWaitSeconds, snap.FrontDoorWaitKnown)
 	}
 
 	// And the database's own signals are untouched by any of it.
@@ -136,14 +146,14 @@ planetscale_pods_mem_util_percentages{planetscale_component="vttablet",planetsca
 
 	snap := distill(samples, mysqlMetricNames, time.Now())
 
-	if snap.RouterCPUKnown || snap.RouterCPUUtil != 0 {
-		t.Errorf("RouterCPUUtil = %v (known=%v) on an exposition with no router series at all — a platform "+
+	if snap.FrontDoorCPUKnown || snap.FrontDoorCPUUtil != 0 {
+		t.Errorf("FrontDoorCPUUtil = %v (known=%v) on an exposition with no router series at all — a platform "+
 			"without a front door must read as unobserved, not as an idle one",
-			snap.RouterCPUUtil, snap.RouterCPUKnown)
+			snap.FrontDoorCPUUtil, snap.FrontDoorCPUKnown)
 	}
-	if snap.RouterMemKnown || snap.RouterMemUtil != 0 {
-		t.Errorf("RouterMemUtil = %v (known=%v) on an exposition with no router series at all",
-			snap.RouterMemUtil, snap.RouterMemKnown)
+	if snap.FrontDoorMemKnown || snap.FrontDoorMemUtil != 0 {
+		t.Errorf("FrontDoorMemUtil = %v (known=%v) on an exposition with no router series at all",
+			snap.FrontDoorMemUtil, snap.FrontDoorMemKnown)
 	}
 	// The tablet readings still resolve — the new selector must not have
 	// eaten the series it declines to claim.

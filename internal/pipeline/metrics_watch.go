@@ -312,7 +312,7 @@ func formatWatchLine(now time.Time, snap ir.TargetHealthSnapshot, ok bool) strin
 		stamp,
 		frac(snap.CPUKnown, snap.CPUUtil),
 		frac(snap.MemKnown, snap.MemUtil),
-		formatRouterPair(snap),
+		formatFrontDoorPair(snap),
 		frac(snap.StorageKnown, snap.StorageUtil), storageDetail,
 		lag, conns,
 		snap.SampledAt.UTC().Format(time.RFC3339),
@@ -359,11 +359,17 @@ func metricsWatchReadoutFields(now time.Time, snap ir.TargetHealthSnapshot, ok b
 	// without a separate routing layer these would be two permanent "n/a"s,
 	// which is noise rather than honesty — the readout's own doc says it
 	// collapses rather than printing a wall of them.
-	if snap.RouterCPUKnown {
-		fields = append(fields, progress.Field{Label: "router cpu", Value: frac(true, snap.RouterCPUUtil)})
+	if snap.FrontDoorCPUKnown {
+		fields = append(fields, progress.Field{Label: "front door cpu", Value: frac(true, snap.FrontDoorCPUUtil)})
 	}
-	if snap.RouterMemKnown {
-		fields = append(fields, progress.Field{Label: "router mem", Value: frac(true, snap.RouterMemUtil)})
+	if snap.FrontDoorMemKnown {
+		fields = append(fields, progress.Field{Label: "front door mem", Value: frac(true, snap.FrontDoorMemUtil)})
+	}
+	if snap.FrontDoorWaitKnown {
+		fields = append(fields, progress.Field{
+			Label: "front door wait",
+			Value: fmt.Sprintf("%.3fs", snap.FrontDoorWaitSeconds),
+		})
 	}
 	return append(
 		fields,
@@ -374,18 +380,22 @@ func metricsWatchReadoutFields(now time.Time, snap ir.TargetHealthSnapshot, ok b
 	)
 }
 
-// formatRouterPair renders the front door for the one-line watch output, or
-// the empty string when the platform exposes no router at all — so a
-// Vitess/MySQL branch's line is BYTE-IDENTICAL to what it was before the
-// router fields existed, and only a branch that actually has a front door
-// grows a field for it.
+// formatFrontDoorPair renders the front door for the one-line watch output, or
+// the empty string when the platform exposes no front door at all — so a
+// Vitess/MySQL branch's line is BYTE-IDENTICAL to what it was before these
+// fields existed, and only a branch that actually has a front door grows a
+// field for it.
 //
-// When a router IS present, both halves are rendered even if one is
-// unobserved, on the SL-6 rule: each half gates its own value, so a missing
+// Once a front door IS present, cpu and mem are rendered even if one of them
+// is unobserved, on the SL-6 rule: each half gates its own value, so a missing
 // one reads "n/a" rather than a fabricated 0.0 that would look like an idle
-// router.
-func formatRouterPair(snap ir.TargetHealthSnapshot) string {
-	if !snap.RouterCPUKnown && !snap.RouterMemKnown {
+// front door. The WAIT is different and is rendered only when known — it is
+// published by one platform and not the other (PgBouncer has a queue wait, a
+// Neki router does not), so a permanent "n/a" there would be a standing
+// question about a metric that is never coming, rather than a gap in a pair
+// the platform does publish.
+func formatFrontDoorPair(snap ir.TargetHealthSnapshot) string {
+	if !snap.FrontDoorCPUKnown && !snap.FrontDoorMemKnown && !snap.FrontDoorWaitKnown {
 		return ""
 	}
 	half := func(known bool, v float64) string {
@@ -394,9 +404,13 @@ func formatRouterPair(snap ir.TargetHealthSnapshot) string {
 		}
 		return fmt.Sprintf("%.3f", v)
 	}
-	return fmt.Sprintf(" router_cpu=%s router_mem=%s",
-		half(snap.RouterCPUKnown, snap.RouterCPUUtil),
-		half(snap.RouterMemKnown, snap.RouterMemUtil))
+	out := fmt.Sprintf(" front_door_cpu=%s front_door_mem=%s",
+		half(snap.FrontDoorCPUKnown, snap.FrontDoorCPUUtil),
+		half(snap.FrontDoorMemKnown, snap.FrontDoorMemUtil))
+	if snap.FrontDoorWaitKnown {
+		out += fmt.Sprintf(" front_door_wait=%.3fs", snap.FrontDoorWaitSeconds)
+	}
+	return out
 }
 
 // panelEventNotifier is the ADR-0156 internal notify sink that forwards a

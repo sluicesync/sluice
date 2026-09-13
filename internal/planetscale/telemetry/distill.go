@@ -37,6 +37,34 @@ type metricNames struct {
 	// (live-confirmed 2026-06-23). This selects the `postgres` container.
 	// Empty (MySQL/Vitess) ⇒ the vttablet/primary cascade as before.
 	primaryContainer string
+
+	// The FRONT-DOOR names, for a platform whose front door is a POOLER
+	// SIDECAR rather than a fleet of router pods. PlanetScale Postgres runs
+	// PgBouncer as a container on each database pod; PlanetScale Neki runs
+	// separate router pods identified by [labelRouter].
+	//
+	// Both shapes are described by ONE metricNames table, because Neki IS
+	// Postgres by engine and so reads [postgresMetricNames]. That is safe
+	// because the two surfaces are DISJOINT, verified live 2026-09-13 on two
+	// real branches of the same org: the Neki exposition contains the string
+	// "pgbouncer" zero times, and the PlanetScale Postgres exposition carries
+	// `planetscale_router` on zero series. So the selectors below can be
+	// tried in either order and at most one can answer. If that ever stops
+	// holding, [TestFrontDoorSurfacesAreDisjoint] fails.
+	//
+	//   - poolerCPUPct is the pooler's OWN cpu metric, not the per-container
+	//     slice of the pod metric. PgBouncer is single-threaded per peer
+	//     process, so "this peer is at 100%" is saturation even while the pod
+	//     it lives on is nearly idle; the pod-level container reading would
+	//     understate exactly the condition worth alerting on.
+	//   - poolerContainer picks the pooler's MEMORY out of the per-container
+	//     pods metric, because the platform publishes no pgbouncer-specific
+	//     memory series.
+	//   - frontDoorWaitSec is the queue wait — clients admitted but not yet
+	//     handed a backend connection.
+	poolerCPUPct     string
+	poolerContainer  string
+	frontDoorWaitSec string
 }
 
 // mysqlMetricNames is the MySQL/Vitess table, CONFIRMED against the live
@@ -85,6 +113,21 @@ var postgresMetricNames = metricNames{
 	activeConns:      "planetscale_edge_postgres_active_connections",
 	maxConns:         "planetscale_postgres_settings_max_connections",
 	primaryContainer: "postgres",
+	// The PgBouncer front door, CONFIRMED live 2026-09-13 against a real
+	// PlanetScale Postgres branch (all three present, one series per pod,
+	// tagged planetscale_container="pgbouncer" and planetscale_role).
+	//
+	// UNVERIFIED PREMISE, stated rather than assumed: the branch measured ran
+	// `planetscale_pgbouncer_total_peers = 1` on every pod, so whether
+	// `_per_peer_percentages` averages or maxes across MULTIPLE peers could
+	// not be determined from it. With one peer the two agree. If a branch
+	// ever runs several peers and the metric turns out to average, a single
+	// saturated peer would read low here — the reading would be conservative,
+	// never alarmist, which is why this is recorded as a caveat rather than
+	// treated as a blocker.
+	poolerCPUPct:     "planetscale_pgbouncer_cpu_util_per_peer_percentages",
+	poolerContainer:  "pgbouncer",
+	frontDoorWaitSec: "planetscale_pgbouncer_pools_client_maxwait_seconds",
 }
 
 // metricNamesFor selects the metric-name table for a target engine registry
@@ -224,16 +267,24 @@ func distill(samples []promSample, names metricNames, now time.Time) ir.TargetHe
 		snap.MemKnown = true
 	}
 
-	// The front door, as the BUSIEST router pod. See the snapshot fields'
-	// doc for why this is a separate signal from the primary's CPU/mem and
-	// not folded into it.
-	if v, ok := selectWorstRouterValue(samples, names.cpuUtilPct); ok {
-		snap.RouterCPUUtil = clampFraction(v / 100.0)
-		snap.RouterCPUKnown = true
+	// The front door, as the BUSIEST instance. See the snapshot fields' doc
+	// for why this is a separate signal from the primary's CPU/mem and not
+	// folded into it, and the metricNames doc for why one table can carry
+	// both the router-pod and pooler-sidecar shapes.
+	if v, ok := selectFrontDoorCPU(samples, names); ok {
+		snap.FrontDoorCPUUtil = clampFraction(v / 100.0)
+		snap.FrontDoorCPUKnown = true
 	}
-	if v, ok := selectWorstRouterValue(samples, names.memUtilPct); ok {
-		snap.RouterMemUtil = clampFraction(v / 100.0)
-		snap.RouterMemKnown = true
+	if v, ok := selectFrontDoorMem(samples, names); ok {
+		snap.FrontDoorMemUtil = clampFraction(v / 100.0)
+		snap.FrontDoorMemKnown = true
+	}
+	// Not clamped and not a fraction: this is a duration, and a long one is
+	// the point. The worst waiter across instances, for the same reason the
+	// utilisation figures take the busiest.
+	if v, ok := selectWorstOf(samples, names.frontDoorWaitSec); ok {
+		snap.FrontDoorWaitSeconds = v
+		snap.FrontDoorWaitKnown = true
 	}
 
 	avail, availOK := selectPrimaryValue(samples, names.volAvailableByte, names.primaryContainer)
@@ -428,6 +479,59 @@ func selectWorstRouterValue(samples []promSample, name string) (float64, bool) {
 	worst, found := 0.0, false
 	for _, s := range samples {
 		if s.name != name || s.label(labelRouter) == "" {
+			continue
+		}
+		if !found || s.value > worst {
+			worst, found = s.value, true
+		}
+	}
+	return worst, found
+}
+
+// selectFrontDoorCPU resolves the busiest front door's CPU across the two
+// shapes a PlanetScale branch can take, and reports ok=false when the branch
+// has neither.
+//
+// Router pods first, pooler sidecar second — an order that is presentational
+// rather than load-bearing, because the two surfaces are disjoint (see
+// [metricNames] and [TestFrontDoorSurfacesAreDisjoint]). Written as a cascade
+// rather than a single merged query so each arm keeps its own metric name: the
+// router arm reads the shared per-pod CPU metric filtered to router series,
+// while the pooler arm reads PgBouncer's own per-peer metric, which is a
+// DIFFERENT measurement and not interchangeable with the pod-level one.
+func selectFrontDoorCPU(samples []promSample, names metricNames) (float64, bool) {
+	if v, ok := selectWorstRouterValue(samples, names.cpuUtilPct); ok {
+		return v, true
+	}
+	return selectWorstOf(samples, names.poolerCPUPct)
+}
+
+// selectFrontDoorMem is the memory half of [selectFrontDoorCPU]. Both arms
+// read the same per-pod memory metric — there is no pgbouncer-specific memory
+// series — and differ only in which series they claim: router pods by their
+// [labelRouter], the pooler by its container label.
+func selectFrontDoorMem(samples []promSample, names metricNames) (float64, bool) {
+	if v, ok := selectWorstRouterValue(samples, names.memUtilPct); ok {
+		return v, true
+	}
+	return selectWorstContainerValue(samples, names.memUtilPct, names.poolerContainer)
+}
+
+// selectWorstContainerValue returns the highest value of the named metric
+// across series whose `planetscale_container` matches container, and false
+// when container is empty or no series carries it.
+//
+// Distinct from [selectPrimaryValue]'s container tier, which picks the ONE
+// primary series and is about identifying the write target. This reduces
+// across every pod running that container, which is what "the busiest front
+// door" means when the front door is a sidecar riding on all of them.
+func selectWorstContainerValue(samples []promSample, name, container string) (float64, bool) {
+	if name == "" || container == "" {
+		return 0, false
+	}
+	worst, found := 0.0, false
+	for _, s := range samples {
+		if s.name != name || s.label(labelContainer) != container {
 			continue
 		}
 		if !found || s.value > worst {

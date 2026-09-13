@@ -57,7 +57,7 @@ func TestMetricsDocSync_RunningAsAService(t *testing.T) {
 	// the whole emit surface. Adding a metric to metrics.go moves this
 	// number — update it together with the doc table, which direction (1)
 	// below forces anyway.
-	const wantSeries = 32
+	const wantSeries = 33
 	if len(scraped) != wantSeries {
 		t.Fatalf("fully-attached scrape emitted %d distinct sluice_* series, want %d — if a metric was added/removed, update docs/operator/running-as-a-service.md's reference table and this count together. scraped: %v", len(scraped), wantSeries, sortedKeys(scraped))
 	}
@@ -123,10 +123,12 @@ func (docSyncTelemetry) Sample(context.Context) (ir.TargetHealthSnapshot, bool) 
 		// below is: the exporter gates each series on its own flag. Given a
 		// value UNLIKE the primary's 0.5 so a copy-paste that emitted the
 		// wrong field would be visible in a failure diff.
-		RouterCPUUtil:         0.9,
-		RouterCPUKnown:        true,
-		RouterMemUtil:         0.3,
-		RouterMemKnown:        true,
+		FrontDoorCPUUtil:      0.9,
+		FrontDoorCPUKnown:     true,
+		FrontDoorMemUtil:      0.3,
+		FrontDoorMemKnown:     true,
+		FrontDoorWaitSeconds:  1.25,
+		FrontDoorWaitKnown:    true,
 		StorageUtil:           0.5,
 		StorageAvailableBytes: 1 << 30,
 		StorageCapacityBytes:  1 << 31,
