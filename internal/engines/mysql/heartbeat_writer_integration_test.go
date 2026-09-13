@@ -239,9 +239,9 @@ func TestHeartbeat_AdvancesBinlogPosition(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 
-	// MySQL 8.0+ uses SHOW MASTER STATUS (returns File, Position, ...).
-	// We only need (File, Position) pair to confirm the position
-	// advanced.
+	// The binlog tip, read through the production version cascade — see
+	// readMasterPos. We only need the (File, Position) pair to confirm the
+	// position advanced.
 	beforeFile, beforePos, err := readMasterPos(ctx, db)
 	if err != nil {
 		t.Fatalf("read master pos before: %v", err)
@@ -277,15 +277,32 @@ func TestHeartbeat_AdvancesBinlogPosition(t *testing.T) {
 // readMasterPos returns the master's current binlog (File, Position).
 // MySQL 8.0+ supports SHOW BINARY LOG STATUS (8.4+) as an alias; we use
 // SHOW MASTER STATUS for 8.0 compatibility.
+// readMasterPos returns the source's current binlog (file, position) by
+// delegating to the production [masterStatus] helper.
+//
+// It used to issue `SHOW MASTER STATUS` itself, with a comment asserting
+// "MySQL 8.0+ uses SHOW MASTER STATUS". That statement was DEPRECATED in
+// 8.0.22 and REMOVED in 8.4, so on 8.4 this failed with error 1064 and took
+// the whole MySQL engine suite red on both legs of the version matrix — while
+// the code under test was fine, because [masterStatusSpellings] already walks
+// `SHOW BINARY LOG STATUS` / `SHOW MASTER STATUS` / `SHOW BINLOG STATUS` and
+// picks whichever the server accepts.
+//
+// So this is the shape a version matrix exists to catch and the reason it is
+// worth running: a TEST pinned to one server version while the production path
+// it exercises was already version-aware. Delegating rather than re-spelling
+// the cascade here means the test cannot drift from the code again — if a
+// future server renames the statement once more, both move together.
+//
+// (The scan shape moved too: the old code scanned exactly five columns, which
+// is 8.0's. `masterStatus` discards anything past the first two, so a server
+// that returns a different column count no longer breaks the read either.)
 func readMasterPos(ctx context.Context, db *sql.DB) (file string, pos uint64, err error) {
-	row := db.QueryRowContext(ctx, `SHOW MASTER STATUS`)
-	// SHOW MASTER STATUS in MySQL 8.0 returns: File, Position,
-	// Binlog_Do_DB, Binlog_Ignore_DB, Executed_Gtid_Set
-	var binlogDoDB, binlogIgnoreDB, executedGtidSet sql.NullString
-	if err := row.Scan(&file, &pos, &binlogDoDB, &binlogIgnoreDB, &executedGtidSet); err != nil {
+	f, p, err := masterStatus(ctx, db)
+	if err != nil {
 		return "", 0, err
 	}
-	return file, pos, nil
+	return f, uint64(p), nil
 }
 
 // TestEnsureHeartbeatTable_PermissionDenied pins the loud-failure path:
