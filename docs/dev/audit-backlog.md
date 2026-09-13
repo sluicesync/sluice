@@ -1744,3 +1744,43 @@ That grow-gate arm deserves its own sentence: Bug 285 was filed because a missin
 
 **Worth checking elsewhere:** anywhere a verdict, capability, or policy is reversed by wrapping rather than by replacing. The pattern is cheap to grep for — a type implementing exactly one of a pair of opposed interfaces while wrapping a value that implements the other.
 
+## 2026-09-13 — nekiverify's first successful live run, and the two things it found immediately
+
+The weekly suite had never actually executed. Its first scheduled run failed at provisioning on stale CI credentials (see below); once those were replaced it provisioned a real 2-shard PS-10 Neki cluster, ran, and tore itself down cleanly — org independently confirmed back to zero. Most premises held. Two did not, and they are different kinds of finding.
+
+### NEKI-NK306 (OPEN, needs investigation before it is graded) — the batched CDC applier's INSERT omits the shard key
+
+```
+ApplyBatch into the sharded target: postgres: applier: commit: postgres: applier:
+insert into public.cdc_content: error preprocessing batch (prepare):
+ERROR: shard-key column "tenant_id" of primary index 0 ("xxhash_tenant_id")
+is required but missing from INSERT (SQLSTATE NK306)
+```
+
+**What is established:** the change events carry the shard key. `insertRow` builds `ir.Row{"tenant_id": …, "id": …, "payload": …}`, so this is not a fixture omitting a column. `EnsureControlTable` succeeded first, so it is not the known control-table case either — the error names the DATA table. The applier under test is `ir.BatchedChangeApplier`, which the test selects deliberately because it is what a continuous sync uses; the test refuses to fall back to the serial path rather than silently degrading.
+
+**What is NOT established, and must not be written down as if it were:** whether the applier drops the column while building its statement, or whether Neki's prepare step cannot derive the shard key from the statement SHAPE the batch path emits (parameterised multi-row / `UNNEST`-style). Those have different fixes and only one of them is sluice's defect. The serial path is untested here, so "CDC into a sharded Neki target does not work" is NOT a supported claim — what is supported is "the batched applier's INSERT is refused for want of the shard key on a sharded target".
+
+**A second, independent gap the same failure exposes:** `NK306` is **not in the classifier**. The engine grades `NK013`, `NK205` and `NK213` and nothing else in the NK3xx range. NK306 appears in this repo only as prose — `sluicecode/docrows.go`, `sluicecode.go`, and a comment at `migrate_table_pool.go:296` — plus a hand-built string in `breadcrumb_durability_test.go`. So the shape is already known to be real (it was measured 2026-09-10 against a sharded target, where the default shard group covers `public` and every INSERT into sluice's own control tables was refused for want of the shard key, and a 40-row keyless table held 80 rows after a resume) and it still carries no verdict. Whatever the applier question turns out to be, an unclassified NK306 is the v0.152.1 class at a code we already document.
+
+### Fixed in the same pass — the MoveTables arm called a function that does not exist, for the reason that is always the reason
+
+```
+preparing the move source: enrol "mv_src" in the data topology:
+ERROR: function set_data_topology(text) does not exist (SQLSTATE 42883)
+```
+
+Reads like the platform removed it. It did not: the fixture in the same package calls `__neki.set_data_topology` successfully on every run. The MoveTables arm passed **one** argument; the function takes **three**. A PostgreSQL function's identity is (name, **arity**), so a one-argument call resolves to nothing at all whatever the three-argument function is doing.
+
+This is the third appearance of that class here — the pgtrigger capture-body door auditing by `proname` and admitting a same-named overload, and the security fixture that silently stopped exploiting when the call gained an argument. **A function reference that carries the name and not the signature is not a reference to a function.** Fixed by matching the fixture's call exactly, including selecting `success`/`revision` as separate fields rather than scanning the composite (the fixture already records why: a bare scan yields the literal `(t,35150)`, which the wait function rejects as invalid bigint syntax, reporting a confusing error for a write that had already succeeded).
+
+Because the arm failed at setup, the MoveTables/NK213 premise is **unverified rather than refuted** — nothing is known about whether a write switch blocks the table, only that the test could not get far enough to ask.
+
+### Why it had never run: the secrets predated the workflow by two months
+
+`PLANETSCALE_ORG` and `PLANETSCALE_SERVICE_TOKEN*` were last set 2026-07-16; `nekiverify.yml` landed 2026-09-11 and was wired to reuse them. Nobody re-verified them against the operation the new workflow needs, and the first scheduled run was the first time anything asked.
+
+The failure mode is worth keeping because it is a platform behaviour, measured live: **PlanetScale's org-scoped API answers 404 for a bad TOKEN as well as for a bad ORG** — auth failures are folded into not-found so that a 401 cannot be used to prove an org exists. One status code covers wrong-org, invalid-token and token-scoped-elsewhere. The suite now preflights with a read-only list and names all three causes, and fails BEFORE the first billable `create` rather than reporting the same misconfiguration once per test attached to a different provisioning attempt.
+
+**The generalizable bit:** a workflow that reuses existing secrets inherits the assumption that they are still valid for a scope nobody checked. A credentialed job whose first real execution is a scheduled run months after it merged has never been tested; the gap between "the workflow is correct" and "the workflow works here" is exactly the secrets, and nothing in CI grades them.
+

@@ -255,15 +255,46 @@ func enrolTableInTopology(ctx context.Context, db *sql.DB, table string) error {
 	// The topology's tables live under databases.<db>.schemas.public.tables.
 	// jsonb_set through the router keeps the document's own shape rather than
 	// this test inventing one.
-	_, err = db.ExecContext(ctx, `
-		SELECT __neki.set_data_topology(
+	// THREE arguments, and the arity is the whole point of this comment.
+	//
+	// This called `set_data_topology(<one text arg>)` until 2026-09-13 and
+	// failed on the suite's first successful live run with
+	// `function set_data_topology(text) does not exist (SQLSTATE 42883)` —
+	// which reads like "the platform removed it" and is not that at all. The
+	// function exists and the fixture in this very package calls it fine; a
+	// PostgreSQL function's identity is (name, ARITY), so a one-argument call
+	// resolves to nothing whatever the three-argument function is doing.
+	//
+	// It is the same class as the pgtrigger capture-body door that audited by
+	// `proname` and let a same-named overload through: a function reference
+	// that carries the name and not the signature is not a reference to a
+	// function. Matched to the fixture's call deliberately, so the two agree
+	// by construction rather than by coincidence.
+	//
+	// The second argument is the fixture's `true`, and the third its comment
+	// document. `success`/`revision` are SELECTed as separate fields rather
+	// than scanned as one composite — the fixture learned that the hard way
+	// (a bare scan yields the literal "(t,35150)", which the wait function
+	// then rejects as invalid bigint syntax, reporting a confusing error for
+	// a write that had already succeeded).
+	var (
+		ok  bool
+		rev int64
+	)
+	err = db.QueryRowContext(ctx, `
+		SELECT success, revision FROM __neki.set_data_topology(
 			jsonb_set(
 				$1::jsonb,
 				ARRAY['databases','postgres','schemas','public','tables','`+table+`'],
 				'{}'::jsonb,
 				true
-			)::text
-		)`, doc)
+			)::text,
+			true,
+			'{"comment":"nekiverify movetables"}'
+		)`, doc).Scan(&ok, &rev)
+	if err == nil && !ok {
+		err = fmt.Errorf("set_data_topology reported success=false at revision %d", rev)
+	}
 	if err != nil {
 		return fmt.Errorf("enrol %q in the data topology (CREATE TABLE does not do this — the topology is "+
 			"declared, not derived; an unenrolled table is refused by move_tables_create with NK604): %w",
