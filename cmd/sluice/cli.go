@@ -1414,6 +1414,7 @@ type SyncStartCmd struct {
 	NotifyStorageUtil         float64       `help:"Alert when the target's storage utilisation (used/capacity, 0-1) is at or above this fraction (ADR-0107 item 36). 0 (default) disables the rule. Edge-triggered + cooldown'd. Requires --planetscale-org telemetry + a --notify-webhook/--notify-slack sink." placeholder:"FRAC"`
 	NotifyCPUUtil             float64       `help:"Alert when the target's CPU utilisation (0-1) is at or above this fraction (ADR-0107 item 36). 0 disables. Same gating as --notify-storage-util." placeholder:"FRAC"`
 	NotifyMemUtil             float64       `help:"Alert when the target's memory utilisation (0-1) is at or above this fraction (ADR-0107 item 36). 0 disables. Same gating as --notify-storage-util." placeholder:"FRAC"`
+	NotifyRouterCPUUtil       float64       `help:"Alert when the target's ROUTING LAYER CPU (0-1) is at or above this fraction — PlanetScale Neki's routers, the hop connections land on before a shard. Separate from --notify-cpu-util (the database's own CPU): the two saturate independently and are resized by different controls. 0 disables. Inert on a target with no routing layer." placeholder:"FRAC"`
 	NotifyLagSeconds          float64       `help:"Alert when the target's replica lag (seconds) is at or above this value (ADR-0107 item 36). 0 disables. Same gating as --notify-storage-util." placeholder:"SECONDS"`
 	NotifyStorageGrowthPerMin float64       `help:"Alert when the target's storage utilisation is CLIMBING at or above this fraction-of-capacity per minute (ADR-0107 item 36) — a pre-grow early warning. e.g. 0.02 = +2%/min. 0 disables. Same gating as --notify-storage-util." placeholder:"FRAC_PER_MIN"`
 	NotifyCooldown            time.Duration `help:"Minimum interval between re-fires of a STILL-breached target-metrics alert (ADR-0107 item 36). A sustained breach reminds at most once per this interval rather than every poll. Default 15m." default:"15m" placeholder:"DUR"`
@@ -2266,6 +2267,7 @@ func (s *SyncStartCmd) run(g *Globals, env *envelopeRun) error {
 		NotifyStorageUtil:         s.NotifyStorageUtil,
 		NotifyCPUUtil:             s.NotifyCPUUtil,
 		NotifyMemUtil:             s.NotifyMemUtil,
+		NotifyRouterCPUUtil:       s.NotifyRouterCPUUtil,
 		NotifyLagSeconds:          s.NotifyLagSeconds,
 		NotifyStorageGrowthPerMin: s.NotifyStorageGrowthPerMin,
 		NotifyCooldown:            s.NotifyCooldown,

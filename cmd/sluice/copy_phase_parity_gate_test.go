@@ -164,6 +164,7 @@ var migrateSyncDivergenceReason = map[string]string{
 	"notify-dead-tuple-ratio":         reasonLongRunningProcess,
 	"notify-lag-seconds":              reasonLongRunningProcess,
 	"notify-mem-util":                 reasonLongRunningProcess,
+	"notify-router-cpu-util":          reasonLongRunningProcess,
 	"notify-schema-drift":             reasonLongRunningProcess,
 	"notify-slack":                    reasonLongRunningProcess,
 	"notify-slot-health":              reasonLongRunningProcess,

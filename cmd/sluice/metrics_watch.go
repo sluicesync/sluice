@@ -99,6 +99,7 @@ type MetricsWatchCmd struct {
 	NotifyStorageUtil         float64 `help:"Alert when storage utilisation (used/capacity, 0-1) is at or above this fraction. 0 (default) disables. Edge-triggered + cooldown'd. Requires a --notify-webhook/--notify-slack sink to deliver." placeholder:"FRAC"`
 	NotifyCPUUtil             float64 `help:"Alert when CPU utilisation (0-1) is at or above this fraction. 0 disables." placeholder:"FRAC"`
 	NotifyMemUtil             float64 `help:"Alert when memory utilisation (0-1) is at or above this fraction. 0 disables." placeholder:"FRAC"`
+	NotifyRouterCPUUtil       float64 `help:"Alert when the ROUTING LAYER's CPU (0-1) is at or above this fraction — PlanetScale Neki's routers. Separate from --notify-cpu-util (the database's own). 0 disables." placeholder:"FRAC"`
 	NotifyLagSeconds          float64 `help:"Alert when replica lag (seconds) is at or above this value. 0 disables." placeholder:"SECONDS"`
 	NotifyStorageGrowthPerMin float64 `help:"Alert when storage utilisation is CLIMBING at or above this fraction-of-capacity per minute (a pre-grow early warning). e.g. 0.02 = +2%/min. 0 disables." placeholder:"FRAC_PER_MIN"`
 
@@ -253,6 +254,7 @@ func (m *MetricsWatchCmd) Run(g *Globals) error {
 		StorageUtil:         m.NotifyStorageUtil,
 		CPUUtil:             m.NotifyCPUUtil,
 		MemUtil:             m.NotifyMemUtil,
+		RouterCPUUtil:       m.NotifyRouterCPUUtil,
 		LagSeconds:          m.NotifyLagSeconds,
 		StorageGrowthPerMin: m.NotifyStorageGrowthPerMin,
 		Cooldown:            m.NotifyCooldown,

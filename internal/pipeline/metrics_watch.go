@@ -55,6 +55,11 @@ type MetricsWatchConfig struct {
 	MemUtil             float64
 	LagSeconds          float64
 	StorageGrowthPerMin float64
+	// RouterCPUUtil arms the routing-layer alert (PlanetScale Neki routers,
+	// the VTGate-shaped hop sluice connections land on first). Inert on a
+	// target with no routing layer: the reading is unobserved there, and an
+	// unobserved metric never fires.
+	RouterCPUUtil float64
 
 	// Cooldown is the minimum interval between re-fires of a still-breached
 	// rule. 0 ⇒ defaultNotifyCooldown (15m).
@@ -150,9 +155,7 @@ func RunMetricsWatch(ctx context.Context, provider ir.TargetTelemetry, cfg Metri
 	// starts — validated HERE so both the single-database loop and the
 	// fleet dispatch below (which reuses the same cfg thresholds) are
 	// covered by one door.
-	if err := validateMetricsNotifyThresholds(
-		cfg.StorageUtil, cfg.CPUUtil, cfg.MemUtil, cfg.LagSeconds, cfg.StorageGrowthPerMin,
-	); err != nil {
+	if err := validateMetricsNotifyThresholds(cfg.notifyThresholds()); err != nil {
 		return err
 	}
 	if cfg.Fleet != nil {
@@ -181,7 +184,7 @@ func RunMetricsWatch(ctx context.Context, provider ir.TargetTelemetry, cfg Metri
 		out = io.Discard
 	}
 
-	rules := buildMetricsNotifyRulesFrom(cfg.StorageUtil, cfg.CPUUtil, cfg.MemUtil, cfg.LagSeconds, cfg.StorageGrowthPerMin)
+	rules := buildMetricsNotifyRulesFrom(cfg.notifyThresholds())
 	notifier := buildMetricsNotifierFrom(cfg.WebhookURL, cfg.SlackWebhookURL, cfg.SMTP)
 	// ADR-0156: on the pretty path, add an internal sink that forwards fired
 	// breaches into the live panel's events ring, so the panel is a delivery
@@ -532,4 +535,19 @@ func formatConnPair(snap ir.TargetHealthSnapshot) string {
 		return strconv.Itoa(v)
 	}
 	return half(snap.ActiveConnections, snap.ActiveConnKnown) + "/" + half(snap.MaxConnections, snap.MaxConnKnown)
+}
+
+// notifyThresholds gathers the watch's configured thresholds into the shared
+// struct. It exists so the single-database watch, the fleet watch and the
+// sync-scoped alerter all arm from ONE definition — the same reason
+// [buildMetricsNotifyRulesFrom] is a free function.
+func (c MetricsWatchConfig) notifyThresholds() metricsNotifyThresholds {
+	return metricsNotifyThresholds{
+		StorageUtil:         c.StorageUtil,
+		CPUUtil:             c.CPUUtil,
+		MemUtil:             c.MemUtil,
+		LagSeconds:          c.LagSeconds,
+		StorageGrowthPerMin: c.StorageGrowthPerMin,
+		RouterCPUUtil:       c.RouterCPUUtil,
+	}
 }

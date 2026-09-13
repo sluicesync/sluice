@@ -55,7 +55,7 @@ func runFleetMetricsWatch(ctx context.Context, fleet ir.FleetTelemetry, cfg Metr
 		out = io.Discard
 	}
 
-	rules := buildMetricsNotifyRulesFrom(cfg.StorageUtil, cfg.CPUUtil, cfg.MemUtil, cfg.LagSeconds, cfg.StorageGrowthPerMin)
+	rules := buildMetricsNotifyRulesFrom(cfg.notifyThresholds())
 	notifier := buildMetricsNotifierFrom(cfg.WebhookURL, cfg.SlackWebhookURL, cfg.SMTP)
 	if cfg.Event != nil {
 		notifier = notify.NewMultiNotifier(notifier, panelEventNotifier{emit: cfg.Event})

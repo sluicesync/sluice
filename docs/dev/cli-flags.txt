@@ -302,6 +302,7 @@ metrics-watch --notify-cooldown
 metrics-watch --notify-cpu-util
 metrics-watch --notify-lag-seconds
 metrics-watch --notify-mem-util
+metrics-watch --notify-router-cpu-util
 metrics-watch --notify-slack
 metrics-watch --notify-smtp-auth
 metrics-watch --notify-smtp-from
@@ -610,6 +611,7 @@ sync start --notify-cpu-util
 sync start --notify-dead-tuple-ratio
 sync start --notify-lag-seconds
 sync start --notify-mem-util
+sync start --notify-router-cpu-util
 sync start --notify-schema-drift
 sync start --notify-slack
 sync start --notify-slot-health

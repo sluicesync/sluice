@@ -57,7 +57,33 @@ const (
 	notifyMemUtil       notifyMetric = "mem_util"
 	notifyLagSeconds    notifyMetric = "replica_lag_seconds"
 	notifyStorageGrowth notifyMetric = "storage_growth_per_min"
+	notifyRouterCPUUtil notifyMetric = "router_cpu_util"
 )
+
+// metricsNotifyThresholds carries the configured --notify-* thresholds for one
+// watch or stream. A zero field leaves that rule INERT, so every metric is
+// opted into individually.
+//
+// A STRUCT rather than the positional parameter list this used to be. Six
+// same-typed floats in a row is a transposition waiting to happen, and the
+// failure mode is silent: swap two and the build is clean, the tests that
+// exercise one threshold at a time still pass, and an operator gets an alert
+// armed on the wrong metric. Named fields make the call sites read as
+// assignments, which is also what lets a new threshold be added without
+// touching every caller's argument order.
+type metricsNotifyThresholds struct {
+	StorageUtil         float64
+	CPUUtil             float64
+	MemUtil             float64
+	LagSeconds          float64
+	StorageGrowthPerMin float64
+	// RouterCPUUtil arms an alert on the ROUTING LAYER's CPU — the pods that
+	// terminate client connections and route to shards — which is a separate
+	// machine from the database CPUUtil above and has its own remedy (a
+	// larger router tier). Inert on a target without a routing layer, since
+	// the reading is then unobserved and an unobserved metric never fires.
+	RouterCPUUtil float64
+}
 
 // metricsNotifyRule is one configured threshold. read extracts the metric's
 // current value from a snapshot and whether the provider observed it
@@ -107,10 +133,7 @@ func newMetricsNotifyState() *metricsNotifyState {
 // operator opts each metric in individually. Returns nil when no rule is
 // active (the alerter then no-ops).
 func (s *Streamer) buildMetricsNotifyRules() []metricsNotifyRule {
-	return buildMetricsNotifyRulesFrom(
-		s.NotifyStorageUtil, s.NotifyCPUUtil, s.NotifyMemUtil,
-		s.NotifyLagSeconds, s.NotifyStorageGrowthPerMin,
-	)
+	return buildMetricsNotifyRulesFrom(s.metricsNotifyThresholds())
 }
 
 // validateMetricsNotifyThresholds refuses out-of-range --notify-*
@@ -124,15 +147,16 @@ func (s *Streamer) buildMetricsNotifyRules() []metricsNotifyRule {
 // documented "disabled"). Called from every entry that arms the rules:
 // [Streamer.validate], [RunMetricsWatch], and the fleet watcher — one
 // validator, three doors.
-func validateMetricsNotifyThresholds(storageUtil, cpuUtil, memUtil, lagSeconds, storageGrowthPerMin float64) error {
+func validateMetricsNotifyThresholds(t metricsNotifyThresholds) error {
 	fractions := []struct {
 		flag string
 		v    float64
 	}{
-		{"--notify-storage-util", storageUtil},
-		{"--notify-cpu-util", cpuUtil},
-		{"--notify-mem-util", memUtil},
-		{"--notify-storage-growth-per-min", storageGrowthPerMin},
+		{"--notify-storage-util", t.StorageUtil},
+		{"--notify-cpu-util", t.CPUUtil},
+		{"--notify-mem-util", t.MemUtil},
+		{"--notify-storage-growth-per-min", t.StorageGrowthPerMin},
+		{"--notify-router-cpu-util", t.RouterCPUUtil},
 	}
 	for _, f := range fractions {
 		if math.IsNaN(f.v) || f.v < 0 {
@@ -144,8 +168,8 @@ func validateMetricsNotifyThresholds(storageUtil, cpuUtil, memUtil, lagSeconds, 
 				f.flag, f.v, f.v, f.v, f.v/100)
 		}
 	}
-	if math.IsNaN(lagSeconds) || lagSeconds < 0 {
-		return fmt.Errorf("--notify-lag-seconds: %v is not a valid threshold (seconds; 0 disables)", lagSeconds)
+	if math.IsNaN(t.LagSeconds) || t.LagSeconds < 0 {
+		return fmt.Errorf("--notify-lag-seconds: %v is not a valid threshold (seconds; 0 disables)", t.LagSeconds)
 	}
 	return nil
 }
@@ -159,7 +183,7 @@ func validateMetricsNotifyThresholds(storageUtil, cpuUtil, memUtil, lagSeconds, 
 // thresholds, levels, and titles — the daemon can never drift from the sync.
 // Range validation lives in [validateMetricsNotifyThresholds], run by every
 // entry BEFORE anything starts.
-func buildMetricsNotifyRulesFrom(storageUtil, cpuUtil, memUtil, lagSeconds, storageGrowthPerMin float64) []metricsNotifyRule {
+func buildMetricsNotifyRulesFrom(t metricsNotifyThresholds) []metricsNotifyRule {
 	var rules []metricsNotifyRule
 	add := func(metric notifyMetric, threshold float64, level notify.Level, title string, read func(ir.TargetHealthSnapshot) (float64, bool)) {
 		if threshold <= 0 {
@@ -181,24 +205,35 @@ func buildMetricsNotifyRulesFrom(storageUtil, cpuUtil, memUtil, lagSeconds, stor
 	// is unavailable — an engine/exposition that yields only the primary
 	// series still alerts exactly as it did before, never goes silent.
 	// (Adaptivity stays on the primary; see ir.TargetHealthSnapshot.)
-	add(notifyStorageUtil, storageUtil, notify.LevelCritical, "target storage approaching capacity", func(snap ir.TargetHealthSnapshot) (float64, bool) {
+	add(notifyStorageUtil, t.StorageUtil, notify.LevelCritical, "target storage approaching capacity", func(snap ir.TargetHealthSnapshot) (float64, bool) {
 		if snap.StorageWorstKnown {
 			return snap.StorageUtilWorst, true
 		}
 		return snap.StorageUtil, snap.StorageKnown
 	})
-	add(notifyCPUUtil, cpuUtil, notify.LevelWarning, "target CPU saturating", func(snap ir.TargetHealthSnapshot) (float64, bool) {
+	add(notifyCPUUtil, t.CPUUtil, notify.LevelWarning, "target CPU saturating", func(snap ir.TargetHealthSnapshot) (float64, bool) {
 		return snap.CPUUtil, snap.CPUKnown
 	})
-	add(notifyMemUtil, memUtil, notify.LevelWarning, "target memory saturating", func(snap ir.TargetHealthSnapshot) (float64, bool) {
+	add(notifyMemUtil, t.MemUtil, notify.LevelWarning, "target memory saturating", func(snap ir.TargetHealthSnapshot) (float64, bool) {
 		return snap.MemUtil, snap.MemKnown
 	})
-	add(notifyLagSeconds, lagSeconds, notify.LevelCritical, "target replica lag high", func(snap ir.TargetHealthSnapshot) (float64, bool) {
+	// The ROUTING LAYER, deliberately its own rule rather than folded into the
+	// CPU rule above. The two saturate independently and have different
+	// remedies — a larger router tier versus a larger database — so an
+	// operator who armed one has not armed the other, and a single alert that
+	// fired for either would not say which machine to resize. It reads the
+	// router fields, which are unobserved on a target with no routing layer;
+	// an unobserved metric neither fires nor re-arms, so arming this against a
+	// plain Postgres target is inert rather than wrong.
+	add(notifyRouterCPUUtil, t.RouterCPUUtil, notify.LevelWarning, "target routing layer saturating", func(snap ir.TargetHealthSnapshot) (float64, bool) {
+		return snap.RouterCPUUtil, snap.RouterCPUKnown
+	})
+	add(notifyLagSeconds, t.LagSeconds, notify.LevelCritical, "target replica lag high", func(snap ir.TargetHealthSnapshot) (float64, bool) {
 		return snap.ReplicaLagSeconds, snap.LagKnown
 	})
 	// The storage rate-of-change rule has a nil reader; its value is derived
 	// in evalMetricsNotifyTick from the storage delta between ticks.
-	add(notifyStorageGrowth, storageGrowthPerMin, notify.LevelCritical, "target storage climbing fast (auto-grow may be imminent)", nil)
+	add(notifyStorageGrowth, t.StorageGrowthPerMin, notify.LevelCritical, "target storage climbing fast (auto-grow may be imminent)", nil)
 	return rules
 }
 
@@ -460,4 +495,18 @@ func makeNotification(rule metricsNotifyRule, value float64, at time.Time) notif
 // the target-metrics and sync-lag notifications read identically.
 func formatThresholdBody(metric notifyMetric, value, threshold float64, title string) string {
 	return fmt.Sprintf("%s %.4g ≥ %.4g (%s)", metric, value, threshold, title)
+}
+
+// metricsNotifyThresholds gathers the streamer's configured thresholds into
+// the shared struct, so the streamer and the standalone watch arm their rules
+// from one definition and cannot drift apart field by field.
+func (s *Streamer) metricsNotifyThresholds() metricsNotifyThresholds {
+	return metricsNotifyThresholds{
+		StorageUtil:         s.NotifyStorageUtil,
+		CPUUtil:             s.NotifyCPUUtil,
+		MemUtil:             s.NotifyMemUtil,
+		LagSeconds:          s.NotifyLagSeconds,
+		StorageGrowthPerMin: s.NotifyStorageGrowthPerMin,
+		RouterCPUUtil:       s.NotifyRouterCPUUtil,
+	}
 }

@@ -267,6 +267,7 @@ type SyncSpec struct {
 	NotifyStorageUtil         float64 `koanf:"notify-storage-util"`
 	NotifyCPUUtil             float64 `koanf:"notify-cpu-util"`
 	NotifyMemUtil             float64 `koanf:"notify-mem-util"`
+	NotifyRouterCPUUtil       float64 `koanf:"notify-router-cpu-util"`
 	NotifyLagSeconds          float64 `koanf:"notify-lag-seconds"`
 	NotifyStorageGrowthPerMin float64 `koanf:"notify-storage-growth-per-min"`
 }
@@ -1060,6 +1061,7 @@ func buildStreamerFromSpec(ctx context.Context, spec *SyncSpec, g *Globals) (*pi
 		NotifyStorageUtil:            spec.NotifyStorageUtil,
 		NotifyCPUUtil:                spec.NotifyCPUUtil,
 		NotifyMemUtil:                spec.NotifyMemUtil,
+		NotifyRouterCPUUtil:          spec.NotifyRouterCPUUtil,
 		NotifyLagSeconds:             spec.NotifyLagSeconds,
 		NotifyStorageGrowthPerMin:    spec.NotifyStorageGrowthPerMin,
 

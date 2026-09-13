@@ -580,7 +580,12 @@ type Streamer struct {
 	NotifyMemUtil             float64
 	NotifyLagSeconds          float64
 	NotifyStorageGrowthPerMin float64
-	NotifyCooldown            time.Duration
+	// NotifyRouterCPUUtil arms the ROUTING-LAYER alert, separately from
+	// NotifyCPUUtil above: a Neki router and the database behind it saturate
+	// independently and are resized by different controls, so arming one is
+	// not arming the other. Inert on a target with no routing layer.
+	NotifyRouterCPUUtil float64
+	NotifyCooldown      time.Duration
 
 	// NotifySyncLagSeconds is the threshold (in seconds) for the
 	// engine-neutral SYNC-LAG alert (roadmap item 45): fire when sluice's
@@ -2284,10 +2289,7 @@ func (s *Streamer) validate() error {
 	// PROG-NOTIFY-1: an out-of-range --notify-* fraction armed a rule
 	// that could never fire — refuse at sync start, not silently at
 	// every tick.
-	if err := validateMetricsNotifyThresholds(
-		s.NotifyStorageUtil, s.NotifyCPUUtil, s.NotifyMemUtil,
-		s.NotifyLagSeconds, s.NotifyStorageGrowthPerMin,
-	); err != nil {
+	if err := validateMetricsNotifyThresholds(s.metricsNotifyThresholds()); err != nil {
 		return err
 	}
 	return validateEnabledPGExtensions(s.Source, s.Target, s.EnabledPGExtensions)
