@@ -138,7 +138,14 @@ func runSQLiteTargetRoundTrip(t *testing.T, midName string, start func(*testing.
 	// below via asNum), the type label degrades like JSON/UUID→TEXT.
 	assertSQLiteColType(t, widgets, "price", func(x ir.Type) bool { _, ok := x.(ir.Text); return ok })
 	assertSQLiteColType(t, widgets, "made_on", func(x ir.Type) bool { _, ok := x.(ir.Date); return ok })
-	assertSQLiteColType(t, widgets, "made_at", func(x ir.Type) bool { _, ok := x.(ir.Timestamp); return ok })
+	// ir.DateTime, not ir.Timestamp, since v0.152.0: a SQLite DATETIME is
+	// tz-NAIVE — the storage carries no zone and the platform has no zone type
+	// — and ir.DateTime is the IR's name for that. The round trip therefore
+	// lands the naive family, which is the FAMILY this assertion is about; the
+	// value fidelity is asserted separately below. Going out through a
+	// zone-carrying source and back would narrow here too, and deliberately:
+	// a zone SQLite never stored cannot be recovered from what it did store.
+	assertSQLiteColType(t, widgets, "made_at", func(x ir.Type) bool { _, ok := x.(ir.DateTime); return ok })
 	assertSQLiteColType(t, widgets, "made_time", func(x ir.Type) bool { _, ok := x.(ir.Time); return ok })
 
 	rr, err := sqliteEng.OpenRowReader(ctx, dst)
