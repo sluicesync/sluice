@@ -114,6 +114,65 @@ A day of live Neki work produced three shipped fixes and a tail of open items ac
 | 11 | **Every Neki measurement was SINGLE-TABLE, so the COPY-concurrency PRODUCT ceiling has never been exercised against a real router.** Operator-raised 2026-09-13, and the evidence is specific: the live `53300 too many concurrent COPY operations (limit: 4)` that motivated the whole ceiling came from `within_table_parallelism=6` on ONE table — the TABLE axis was 1 the entire arc. So the defect the ceiling exists to prevent (`4` becoming `4×4` because capping one axis lets the other multiply it back) was **reasoned and unit-tested, never produced against the thing that refuses it**. The sibling miss found at the v0.152.0 tag — the ceiling reaching `migrate` and not the cold start or restore — was likewise caught by a reviewer reading call sites, not by a run. Cross-table parallelism is also the axis that decides how a Neki target behaves at the ADR-0076 defaults (`--table-parallelism` 0→4), which is what an ordinary multi-table migration uses. **Needs: a multi-table PG→Neki copy at default parallelism, on a fresh branch, watching for 53300 and for the axes the run actually resolves.** | correctness of a shipped fix, unexercised | **filed 2026-09-13** |
 | 12 | **Whether a SMALL Neki tier can complete a migration at all is unknown — every success was on an upsized cluster.** Operator-raised 2026-09-13. The two PS-10 data points both predate this release's fixes and both are failures: a fresh `PS-10`/`NKR-1` died at 191s (`08006`, primary CPU pinned at 100%), and the only succeeding run in that table was a worn-in `PS-160`/`NKR-5` with a pre-grown 150 GiB volume. Every later measurement — the retry proof, the statement_timeout proof, run K's clean 39.9M-row copy — was taken on `PS-160`/`NKR-5`. So the product's own evidence that Neki works is evidence that it works on a large cluster, while **a first-time user is most likely on a small one**. The open question is not only "does it finish" but "can sluice PACE itself to make it finish": the AIMD copy gate, the grow gate and the connection budget all exist to back off under exactly this pressure, and none of them has been observed doing so on a tier small enough to need it. A failure here is a tuning finding; a SUCCESS is the more valuable result, because it would mean the adaptive machinery works unaided. **Needs: a fresh PS-10 / NKR-1, multi-table, at defaults, with the AIMD and grow-gate behaviour observed rather than assumed.** | product viability at the entry tier, unmeasured | **filed 2026-09-13** |
 
+### 2026-09-13 — the PS-10 multi-table CDC run: items 10, 11 and 12 in one measurement
+
+Fresh `nekitest-ps10-202609131648`, **PS_10 / 2 replicas, NO pre-sizing, no tuning of any kind** — the branch was created and used as it came. Source: a local `postgres:16` with `wal_level=logical`, **six tables / 1,000,065 rows / 200 MB** (four tables at 250k rows so they chunk, two tiny ones so the run has a mixed shape). Binary: `main` at the Bug 285 fix. Everything below is from one continuous `sync start`, torn down afterwards with the org confirmed empty.
+
+**The branch's own defaults, measured on a FRESH PS-10:** `statement_timeout = 30s`, `max_connections = 30`. So the 30s wall is not an artefact of the worn-in soak branch; it is what a new database gives you.
+
+#### Item 10 — the PG→Neki CDC handoff WORKS, verified on content
+
+The lane that never reached the handoff all through the 09-12 arc reached it in **~70 seconds** and stayed up.
+
+| phase | result |
+| --- | --- |
+| cold start | all six tables, 1,000,065 rows, **zero retries, zero refusals, zero grow-gate trips** |
+| per-table copy | customers 11.6s / events 11.4s / ledger 13.0s / orders 11.5s, 19 chunks each; the two small tables took the raw passthrough |
+| handoff | `forward-add-column intercept: seeded from cold-start handoff` on all six, then `laneapply: concurrent key-hash CDC apply engaged` |
+| CDC content | INSERT, UPDATE and DELETE driven across **four** tables and verified **on the target's rows**, not on liveness — the UPDATE landed as the POST-image, the DELETEs are gone, the cross-table insert/update/delete all correct |
+| full compare | row counts identical on all six tables; **ordered-content md5 identical** on `orders` and `ledger` |
+| warm resume | stopped the stream, made an insert + update + delete while it was DOWN, restarted with the same `--stream-id`: **zero cold-start mentions**, `warm resume from persisted position`, and all three changes caught up. Post-resume checksum matches again. |
+
+So position persistence against a sharded target works, and the handoff works. What this does NOT cover is the reader's reconnect/resume against a router mid-stream (nothing was killed underneath it), so item 10's reader half stays open.
+
+#### Item 11 — the product ceiling is real, and it binds by COLLAPSING THE TABLE AXIS
+
+This is the answer, and it is more interesting than "it works".
+
+```
+postgres: capping copy parallelism for a PlanetScale Neki target
+    connection_budget=9  neki_concurrent_copy_limit=4
+capping bulk parallelism: target connection budget
+    requested=8 effective=4 max_connections=30 reserved=3 in_use=14 available=13 copy_budget=9
+sync cold-start: fast parallel copy engaged (ADR-0079)
+    table_parallelism=1  within_table_parallelism=4  index_build_budget=2
+```
+
+The ceiling is applied and the product is **1 × 4 = 4**, exactly the router's limit. So the fix works against a real router with a genuinely multi-table workload — which is what item 11 asked for.
+
+But note what it did to get there: **`table_parallelism = 1`.** The within-table axis is pinned at its budget-capped 4 and the table factor then gets "whatever whole multiples of within fit the product budget", which is 1. **Cross-table parallelism is therefore effectively disabled on a Neki target**, at any table count, for as long as the within-table axis alone consumes the whole limit of 4. Six tables copied one after another.
+
+That is legal and safe, and it is not obviously the best split. For six similar tables, `4 × 1` (four tables at once, one chunk each) is the same product and a different shape. Nothing has measured which is faster on a router, and the current allocation is an artefact of the resolver pinning `within` first rather than a decision anyone made for Neki. **Filed as the open half of item 11** — the ceiling's correctness is now measured; its allocation policy is not.
+
+#### Item 12 — a PS-10 completed cleanly, but the result is NARROWER than it looks
+
+1M rows across six tables on the smallest tier: clean, fast, no back-pressure, no AIMD damping needed, no grow-gate activity. On this workload the entry tier is entirely adequate and the adaptive machinery never had to do anything.
+
+**The honest caveat, which matters more than the result:** 200 MB against a 10 GiB volume means **no storage grow ever happened**. The earlier PS-10 failure was a *29 GB* copy into that same 10 GiB volume — a storage-grow failure, not a CPU or concurrency one. This run does not reproduce that condition and says nothing about it. So item 12 splits:
+
+- **Answered:** a PS-10 handles a modest multi-table migration at defaults, and nothing in sluice needs to pace itself to make that work.
+- **Still open:** whether a PS-10 survives a copy that outgrows its volume — which is the case that actually failed before, and the one the AIMD/grow-gate machinery exists for. That needs a dataset sized past 10 GiB on a small tier.
+
+#### New finding — `--index-build-mem` tuning is INERT on Neki, and now measured rather than assumed
+
+```
+WARN postgres: index-build tuning probe failed; building indexes serially with
+     provider-default maintenance_work_mem
+     error="probe shared_buffers: ERROR: not implemented: opcode not implemented: pg_size_bytes (NK013)"
+```
+
+The probe reads `pg_size_bytes`, which a Neki router does not implement. It degrades correctly — loud WARN, serial builds, provider defaults — so this is not a defect. But it **confirms the UNVERIFIED PREMISE recorded at perf-parity-matrix row 34**, which guessed that `--index-build-mem` would be inert on Neki because the build runs asynchronously inside the router's workflow. The real reason is simpler and upstream of that: the probe that sizes the knob cannot run at all. Row 34's premise should be updated from "likely inert, not measured" to "measured inert, for this reason".
+
 ### The online-DDL recipe, measured end to end on a live cluster (2026-09-12) — this is what item 1 should build
 
 Proven on the worn-in branch against a 28.9M-row table, after the plain `CREATE INDEX` for the same index died at 31s:
