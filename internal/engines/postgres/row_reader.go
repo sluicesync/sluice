@@ -268,16 +268,23 @@ func (r *RowReader) ReadRows(ctx context.Context, table *ir.Table) (<-chan ir.Ro
 	}
 
 	query := buildSelect(schema, table, r.rowFilters[table.Name])
+	// This is the one unbounded read on the typed lane, so it runs with
+	// statement_timeout pinned to 0 — see row_reader_timeout.go for which
+	// reads are pinned and why. q is NOT always r.q: on a pool the pin
+	// needs a transaction on one checked-out connection, and release gives
+	// that connection back once the stream has drained.
+	q, release := pinReadSession(ctx, r.q, "ReadRows")
 	// rowserrcheck and sqlclosecheck can't follow rows into the
 	// goroutine; both rows.Err() and rows.Close() are handled inside
 	// stream() (Close via defer, Err checked once iteration ends).
-	rows, err := r.q.QueryContext(ctx, query) //nolint:rowserrcheck,sqlclosecheck
+	rows, err := q.QueryContext(ctx, query) //nolint:rowserrcheck,sqlclosecheck
 	if err != nil {
+		release()
 		return nil, fmt.Errorf("postgres: ReadRows: query failed: %w", err)
 	}
 
 	out := make(chan ir.Row, rowChanBuffer)
-	go r.stream(ctx, rows, table, out)
+	go r.stream(ctx, rows, table, out, release)
 	return out, nil
 }
 
@@ -297,8 +304,12 @@ const rowChanBuffer = 64
 // and therefore out of the iterated columns here too — the database
 // recomputes them on the target's INSERT, so the source value is
 // never carried.
-func (r *RowReader) stream(ctx context.Context, rows *sql.Rows, table *ir.Table, out chan<- ir.Row) {
+// release gives back whatever the read session checked out (see
+// [pinReadSession]); it runs AFTER rows.Close, because the transaction it
+// rolls back is the one those rows are being read inside.
+func (r *RowReader) stream(ctx context.Context, rows *sql.Rows, table *ir.Table, out chan<- ir.Row, release func()) {
 	defer close(out)
+	defer release()
 	defer func() { _ = rows.Close() }()
 
 	cols := sourceReadableColumns(table.Columns)

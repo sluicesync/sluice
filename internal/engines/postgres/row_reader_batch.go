@@ -106,7 +106,10 @@ func (r *RowReader) readRowsBatch(ctx context.Context, table *ir.Table, after, u
 	}
 
 	out := make(chan ir.Row, rowChanBuffer)
-	go r.stream(ctx, rows, table, out)
+	// Deliberately unpinned for statement_timeout — a LIMIT-bounded keyset
+	// page is the one read class the pin skips, with the reasoning in
+	// row_reader_timeout.go. noopRelease keeps the stream signature shared.
+	go r.stream(ctx, rows, table, out, noopRelease)
 	return out, nil
 }
 

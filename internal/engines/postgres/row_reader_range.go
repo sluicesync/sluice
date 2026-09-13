@@ -452,6 +452,11 @@ func (r *RowReader) sampleKeysetOn(ctx context.Context, q querier, table *ir.Tab
 		ORDER BY rn`,
 		pkList, pkList, pkList, tableRef, strings.Join(rankExpr, ", "))
 
+	// A full scan plus a sort over the whole table, once, before any row
+	// has been copied — so it gets the statement_timeout pin
+	// (row_reader_timeout.go).
+	q, release := pinReadSession(ctx, q, "SampleKeysetBoundaries")
+	defer release()
 	rows, err := q.QueryContext(ctx, stmt) //nolint:rowserrcheck,sqlclosecheck // handled below
 	if err != nil {
 		return nil, fmt.Errorf("postgres: SampleKeysetBoundaries query: %w", err)
@@ -505,6 +510,11 @@ func (r *RowReader) exactCountOn(ctx context.Context, q querier, table *ir.Table
 		return 0, err
 	}
 	stmt := `SELECT pg_catalog.COUNT(*) FROM ` + quoteIdent(schema) + `.` + quoteIdent(table.Name)
+	// A full seq scan, once per table, on exactly the never-ANALYZEd
+	// tables a freshly loaded migrate source is made of — so it gets the
+	// statement_timeout pin (row_reader_timeout.go).
+	q, release := pinReadSession(ctx, q, "CountRows exact")
+	defer release()
 	rows, err := q.QueryContext(ctx, stmt) //nolint:rowserrcheck,sqlclosecheck // handled below
 	if err != nil {
 		return 0, fmt.Errorf("postgres: CountRows exact pg_catalog.COUNT(*): %w", err)
