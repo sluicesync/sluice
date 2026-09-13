@@ -75,6 +75,40 @@ import (
 // The INDEPENDENT expected value for both halves is the OTHER gate's observed
 // holds, measured in this run — not a constant written down here and not
 // anything a gate reports about its own intent.
+//
+// # TESTFRAGILE-2: this ran on the WALL CLOCK and failed a release tag's
+// Windows leg, for the same reason as its sibling and with a worse tolerance
+//
+// The original compared two measured durations with a tolerance funded FROM
+// one of them (`lo, hi := free[i]/2, free[i]*2`). At `base = 20ms` — barely
+// above Windows's ~15.6ms default timer granularity — window 1 measured
+// 47.3ms against a 20.2ms reference and failed, because a single missed tick
+// on a loaded runner is more than the entire budget. Nothing was wrong with
+// the gate.
+//
+// Two rules from CLAUDE.md were both broken here, and they compound: never
+// fund a tolerance from the value it observes, and a sleep-timing assertion
+// cannot distinguish "the gate chose a different rung" from "the OS was busy"
+// when the rungs are 20ms apart and the scheduler quantum is 15.6ms.
+//
+// Its sibling [TestGrowGate_EvidenceAccumulatesPerEpisodeAndResetsWithTheLadder]
+// hit the identical failure on an earlier tag and was fixed by raising `base`
+// — and the fix was never swept to this test, which is why the same Windows
+// leg failed again. Raising the base only buys headroom, though; it does not
+// remove the dependency on the OS scheduler.
+//
+// So this one is driven by a FAKE CLOCK instead. [GrowGate] already has both
+// seams it needs (`nowFn` and `afterFn`), and its hold loop is written
+// entirely in terms of them, so advancing the clock by exactly the duration
+// the gate asked to wait makes the reported hold EXACT. The assertions below
+// are therefore equalities rather than bands: strictly stronger than the old
+// tolerance, immune to scheduler noise, and the test runs in microseconds
+// rather than three seconds.
+//
+// The independence property in the doc above is preserved — the expected
+// value is still the OTHER gate's observed ladder, measured in this run. What
+// changed is only that "observed" now means "what the gate actually asked to
+// wait" rather than "how long this runner happened to take".
 func TestGrowGate_EvidenceGovernsTheDeepEscalationAndNotTheEarlyHolds(t *testing.T) {
 	captureSlog(t)
 	const (
@@ -91,6 +125,8 @@ func TestGrowGate_EvidenceGovernsTheDeepEscalationAndNotTheEarlyHolds(t *testing
 	holds := map[ir.GrowEvidence][]time.Duration{}
 	for _, ev := range []ir.GrowEvidence{ir.GrowEvidenceNone, ir.GrowEvidenceTargetFace, ir.GrowEvidenceTelemetry} {
 		g := NewGrowGate(context.Background(), nil)
+		clk := newFakeGrowClock()
+		g.nowFn, g.afterFn = clk.Now, clk.After
 		done := make(chan time.Duration, windows+2)
 		g.onWindowClosed = func(d time.Duration) {
 			select {
@@ -120,10 +156,11 @@ func TestGrowGate_EvidenceGovernsTheDeepEscalationAndNotTheEarlyHolds(t *testing
 	for _, ev := range []ir.GrowEvidence{ir.GrowEvidenceTargetFace, ir.GrowEvidenceTelemetry} {
 		got := holds[ev]
 
-		// HALF ONE: the early rungs are evidence-independent.
+		// HALF ONE: the early rungs are evidence-independent. On the fake
+		// clock this is an EQUALITY — the gate either asked for the same hold
+		// or it did not, and there is no runner noise to hide a difference in.
 		for i := range sharedRungs {
-			lo, hi := free[i]/2, free[i]*2
-			if got[i] < lo || got[i] > hi {
+			if got[i] != free[i] {
 				t.Errorf(
 					"window %d: evidence=%s held %v but evidence=%s held %v — the EARLY rungs must not depend on "+
 						"the evidence. Item 154 caps only the deep escalation precisely so that a real grow which "+
