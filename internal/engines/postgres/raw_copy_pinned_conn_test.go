@@ -202,3 +202,42 @@ func TestIsDeadPinnedConnErr_ServerResponseWinsInAJoinedChain(t *testing.T) {
 			"storage transient into a permanent failure on the snapshot-pinned path")
 	}
 }
+
+// TestDeadPinnedConnRefusalSurvivesEveryClassifier is the cell whose absence
+// let a terminal refusal be replayed 26 times in production.
+//
+// The refusal already carried no ir.RetriableError, which the earlier cells
+// checked — and that was NOT ENOUGH, because the retry classifiers are
+// heuristic and layered. They fall back to stdlib sentinels and driver text
+// shapes, and a refusal that wraps its cause with %w carries that cause's
+// io.EOF and its "conn closed" text into every one of those heuristics. The
+// engine knew recovery was impossible and had no way to be heard.
+//
+// So this asserts the property that actually matters: the refusal must read as
+// TERMINAL through the engine's own classifier, which is the layer that was
+// re-wrapping it. ir.TerminalError is the primitive that makes that possible.
+func TestDeadPinnedConnRefusalSurvivesEveryClassifier(t *testing.T) {
+	t.Parallel()
+
+	// The realistic shape: the cause is exactly what the heuristics look for.
+	for _, cause := range []error{pgconn.ErrConnClosed, io.EOF, sql.ErrConnDone} {
+		refusal := deadPinnedConnRefusal(cause)
+
+		if !ir.IsTerminal(refusal) {
+			t.Fatalf("refusal wrapping %v does not assert ir.TerminalError — every downstream "+
+				"heuristic is free to read its wrapped cause as transient", cause)
+		}
+
+		// The engine classifier must not re-wrap it as retriable.
+		var re ir.RetriableError
+		if errors.As(classifyApplierError(refusal), &re) && re.Retriable() {
+			t.Fatalf("classifyApplierError turned the terminal refusal (cause %v) back into a "+
+				"RETRIABLE error — this is precisely the 26-replay incident", cause)
+		}
+
+		// And the cause must remain reachable for diagnosis.
+		if !errors.Is(refusal, cause) {
+			t.Errorf("refusal dropped its cause %v", cause)
+		}
+	}
+}

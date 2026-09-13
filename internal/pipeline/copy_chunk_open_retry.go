@@ -112,6 +112,13 @@ func isRetriableChunkOpenError(err error) bool {
 	}
 	msg := strings.ToLower(err.Error())
 
+	// An engine that KNOWS recovery is impossible overrides every heuristic
+	// below, including the wrapped-cause sentinels and text shapes those
+	// heuristics match on. See [ir.TerminalError] for the measured reason.
+	if ir.IsTerminal(err) {
+		return false
+	}
+
 	// Permanent faults: fail fast + loud. Checked before any transient test.
 	for _, p := range []string{
 		"access denied",

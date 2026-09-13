@@ -3,7 +3,10 @@
 
 package ir
 
-import "time"
+import (
+	"errors"
+	"time"
+)
 
 // RetriableError is the optional surface an applier error can
 // implement to signal that the pipeline's retry policy (ADR-0038)
@@ -119,4 +122,51 @@ type LivenessProgressTimeoutError interface {
 	// return the per-error verdict; the bare presence of the method is
 	// not itself the signal.
 	IsIdleProgressTimeout() bool
+}
+
+// TerminalError is the INVERSE of [RetriableError]: an error whose producer
+// knows recovery is impossible, asserted strongly enough to override every
+// heuristic a classifier would otherwise apply.
+//
+// # Why this exists, and why RetriableError alone was not enough
+//
+// The retry classifiers are layered and heuristic by design. They honour an
+// engine's RetriableError verdict, then fall back to stdlib surfaces
+// (driver.ErrBadConn, io.EOF, net.Error timeouts) and finally to a text
+// allow-list of driver/OS connection-drop shapes. That layering is what lets a
+// new transport failure be ridden out without teaching every engine about it.
+//
+// It also means an engine CANNOT reliably say "no". A terminal error that
+// merely lacks a RetriableError wrapper is still judged by the heuristics —
+// and if it WRAPS its cause (which good errors do), the cause's text and
+// sentinels are still in the chain and can make the whole thing read as
+// transient.
+//
+// Measured 2026-09-12: the Postgres engine refuses a copy whose exported
+// SNAPSHOT-PINNED connection has died, because the snapshot lives in a
+// transaction on that connection and no replay can ever succeed. The refusal
+// deliberately carried no RetriableError. The chunk retry replayed it 26 times
+// anyway, because the refusal wrapped its cause with %w and the cause was an
+// EOF — so errors.Is(err, io.EOF) was true and the heuristic said "transient".
+// The engine knew; it had no way to be heard.
+//
+// Consumers MUST check this BEFORE any transient test, including before
+// honouring RetriableError, so that an error which somehow satisfies both is
+// treated as terminal. Refusing to retry is the safe direction: the cost of a
+// wrong terminal verdict is one loud failure, and the cost of a wrong
+// retriable verdict is a run that spins until its budget expires and fails
+// anyway — with the operator having waited for it.
+type TerminalError interface {
+	error
+
+	// Terminal reports that retrying cannot succeed. Implementations
+	// return true unconditionally; the producer already decided.
+	Terminal() bool
+}
+
+// IsTerminal reports whether err, or anything it wraps, asserts itself as
+// [TerminalError]. The single predicate every classifier should consult first.
+func IsTerminal(err error) bool {
+	var te TerminalError
+	return errors.As(err, &te) && te.Terminal()
 }

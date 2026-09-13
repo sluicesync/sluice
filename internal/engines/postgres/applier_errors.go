@@ -14,6 +14,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/nettransient"
 )
 
@@ -69,6 +70,14 @@ func (e *retriablePGError) RetryHint() time.Duration { return e.hint }
 func classifyApplierError(err error) error {
 	if err == nil {
 		return nil
+	}
+
+	// A producer that asserts recovery is impossible wins over every test
+	// below, including the stdlib-sentinel checks — which would otherwise
+	// re-wrap a terminal refusal as retriable via its WRAPPED CAUSE. See
+	// [ir.TerminalError] for the measured incident.
+	if ir.IsTerminal(err) {
+		return err
 	}
 
 	// Driver-level "bad connection" / EOF — auto-reconnect on retry.
@@ -370,3 +379,22 @@ func isPGConnectionPoolTimeoutMessage(msg string) bool {
 	}
 	return false
 }
+
+// terminalPGError satisfies [ir.TerminalError]: an error whose producer knows
+// no retry can succeed, asserted strongly enough to override the pipeline's
+// transient heuristics.
+//
+// It exists because NOT wrapping an error as [ir.RetriableError] is too weak a
+// way to say "no". The chunk-open/raw-copy classifiers fall back to stdlib
+// sentinels and driver text shapes, so a refusal that WRAPS its cause with %w
+// — which a good error does — still carries that cause's io.EOF and its
+// "conn closed" text into every heuristic downstream. Measured 2026-09-12: a
+// dead-snapshot refusal was replayed 26 times for exactly that reason.
+//
+// Unwrap is preserved so errors.Is/As against the cause keep working; only the
+// retry verdict changes.
+type terminalPGError struct{ err error }
+
+func (e *terminalPGError) Error() string  { return e.err.Error() }
+func (e *terminalPGError) Unwrap() error  { return e.err }
+func (e *terminalPGError) Terminal() bool { return true }

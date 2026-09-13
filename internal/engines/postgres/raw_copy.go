@@ -605,13 +605,13 @@ func isDeadPinnedConnErr(err error) bool {
 // entire purpose — see the pinned branch in [RowReader.rawConn]. The cause is
 // wrapped so an operator can still see which connection error occurred.
 func deadPinnedConnRefusal(cause error) error {
-	return fmt.Errorf(
+	return &terminalPGError{err: fmt.Errorf(
 		"postgres: ExportRawCopy: the exported snapshot's pinned connection is gone (%w). The snapshot "+
 			"lives in a transaction on that connection, so this table's copy cannot resume on it and "+
 			"retrying would replay the same dead connection. Re-run the copy; a fresh run takes a new "+
 			"snapshot",
 		cause,
-	)
+	)}
 }
 
 // mapPinnedConnErr is the snapshot-pinned branch's error policy, extracted so
