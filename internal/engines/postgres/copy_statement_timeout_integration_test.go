@@ -34,15 +34,26 @@
 //     is the lane EVERY cross-engine copy takes, so it is the common
 //     case rather than the fast path.
 //
-// AND THE ONE IT DOES NOT REACH, which is a real gap and not a
-// rounding error: RowReader.ReadRows — the typed lane's SOURCE read —
-// is also a single long-running statement and is NOT pinned. Covering
-// it means holding a transaction open across the streaming goroutine's
-// lifetime, which is a change to the reader's lifetime model rather
-// than a line in a helper. So a copy OUT OF a server with a low
-// statement_timeout still fails on the typed lane. That is not the
-// shape the Neki finding has (there the timeout is on the TARGET), but
-// it is the sibling, and it is filed rather than left implied.
+// THE SIBLING THIS FILE ONCE FILED AS A GAP IS NOW CLOSED, and the
+// correction is left visible rather than deleted because the gap is why
+// the pin exists at all. This header used to say RowReader.ReadRows —
+// the typed lane's SOURCE read — "is NOT pinned", so "a copy OUT OF a
+// server with a low statement_timeout still fails on the typed lane".
+// That was true when it was written and stopped being true the same day:
+// `195f9d13` pinned the source side in [pinReadSession], covering
+// ReadRows, the keyset-boundary sample and the exact COUNT(*) preflight
+// — every read whose cost scales with the table. Its own gates live in
+// row_reader_timeout_integration_test.go.
+//
+// The LIMIT-bounded keyset page is still deliberately unpinned, with the
+// reasoning recorded where that decision lives. So the honest statement
+// today is "the source side is pinned except on the chunked path", not
+// "the source side is unpinned".
+//
+// Worth noting how this was caught: not by a gate, and not by re-reading
+// the diff — by a sweep that read the header against the code months
+// later. A comment that was accurate when written is exactly the kind
+// that stops the next reader from checking.
 //
 // Index builds and constraint adds are DELIBERATELY exempt — see
 // [withCopySessionPins]'s doc for the argument: pgx cancels a statement
