@@ -301,9 +301,27 @@ func selectPrimaryValue(samples []promSample, name, primaryContainer string) (fl
 		}
 		matches = append(matches, s)
 		// (0) Postgres container match — the write-target DB container among a
-		// multi-container fan. Take it immediately.
+		// multi-container fan (the pod also runs walg-daemon and friends).
+		//
+		// THE ROLE CHECK IS NOT OPTIONAL, and its absence was a live defect.
+		// On a single-writer Postgres the container label alone identifies the
+		// write target, which is why this started as a container-only match.
+		// On a PlanetScale NEKI branch it does not: the primary AND every
+		// replica run `planetscale_container="postgres"`, so a container-only
+		// match returns whichever pod the exposition happens to list first.
+		// Measured 2026-09-13 on a real Neki exposition — the first
+		// postgres-container CPU series was a REPLICA, and `metrics-watch`
+		// reported the replica's utilisation as the target's. It went
+		// unnoticed because that branch was thrashing and every pod sat near
+		// 100%, so the wrong answer equalled the right one.
+		//
+		// A series that carries no role label keeps the old behaviour (a
+		// single-writer PG exposition tags no roles), so this narrows the
+		// match only where a role is actually declared.
 		if primaryContainer != "" && s.label(labelContainer) == primaryContainer {
-			return s.value, true
+			if role := s.label(labelRole); role == "" || role == rolePrimary {
+				return s.value, true
+			}
 		}
 		isPrimary := s.label(labelTabletType) == tabletTypePrimary
 		if isPrimary && s.label(labelComponent) == componentVTTablet {
