@@ -139,7 +139,7 @@ func TestD1InferTypes_Code7500_StageLocalAvoids(t *testing.T) {
 		target       ir.Type
 		wantResolved ir.Type
 	}{
-		{"created_at", ir.Timestamp{}, ir.Timestamp{Precision: 6, WithTimeZone: false}},
+		{"created_at", ir.Timestamp{}, ir.DateTime{Precision: 6}}, // naive values → the tz-naive IR family
 		{"ref_uuid", ir.UUID{}, ir.UUID{}},
 	} {
 		t.Run(tc.col, func(t *testing.T) {

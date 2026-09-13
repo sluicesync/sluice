@@ -308,21 +308,41 @@ func advCorpusSQLiteCells() []advSQLiteCell {
 			pgProbe: "to_char(%s,'YYYY-MM-DD HH24:MI:SS.US')", pgWant: "2026-03-08 02:30:00.123456",
 			myProbe: "CAST(%s AS CHAR)", myWant: "2026-03-08 02:30:00.123456",
 		},
-		// FINDING (2026-08-22, pinned rather than papered over): a SQLite
-		// declared DATETIME resolves to ir.Timestamp (ADR-0129), which the
-		// MySQL writer emits as MySQL TIMESTAMP — an INSTANT type whose
+		// FINDING (2026-08-22) and its RESOLUTION (2026-09-13). A SQLite
+		// declared DATETIME used to resolve to ir.Timestamp (ADR-0129), which
+		// the MySQL writer emits as MySQL TIMESTAMP — an INSTANT type whose
 		// range is 1970-01-01 00:00:01 .. 2038-01-19. So a tz-naive SQLite
-		// datetime outside that window (this cell; any pre-1970 value)
-		// REFUSES loudly at insert on a MySQL target (Error 1292) even
-		// though the value is an ordinary in-range DATETIME there. The
-		// refusal is pinned in the MySQL refusal matrix; whether the
-		// resolver should produce ir.DateTime (→ MySQL DATETIME, range
-		// 1000..9999) instead is a type-mapping design call for the
-		// operator, filed in the corpus report.
+		// datetime outside that window REFUSED loudly at insert on a MySQL
+		// target (Error 1292) even though the value is an ordinary in-range
+		// DATETIME there. The corpus pinned that refusal rather than papering
+		// over it, and flagged the mapping as a design call for the operator.
+		//
+		// The operator took it: the resolver now produces ir.DateTime, the
+		// IR's tz-naive family, which MySQL emits as DATETIME (1000..9999).
+		// The two cells below assert the value now lands on BOTH targets, at
+		// each end of the window the old mapping cut off. Postgres was never
+		// affected — both IR families emit PG TIMESTAMP — which is why its
+		// side of these cells is unchanged.
 		{
+			// The cell that motivated the ir.DateTime correction, now
+			// asserting the fixed behaviour on BOTH targets. It used to carry
+			// a mySkip: SQLite DATETIME resolved to ir.Timestamp, which the
+			// MySQL writer emits as TIMESTAMP, whose range stops at
+			// 2038-01-19 — so this perfectly ordinary far-future value
+			// refused at insert with a bare server 1292. It now resolves to
+			// ir.DateTime → MySQL DATETIME (1000..9999) and lands intact.
 			family: "temporal", col: "dt_max", ddl: "DATETIME NOT NULL", lit: "'9999-12-31 23:59:59.999999'",
 			pgProbe: "to_char(%s,'YYYY-MM-DD HH24:MI:SS.US')", pgWant: "9999-12-31 23:59:59.999999",
-			mySkip: "SQLite DATETIME → ir.Timestamp → MySQL TIMESTAMP caps at 2038; the out-of-range refusal is pinned in the MySQL refusal matrix",
+			myProbe: "CAST(%s AS CHAR)", myWant: "9999-12-31 23:59:59.999999",
+		},
+		{
+			// The other end of the window the old mapping cut off, and the
+			// more likely one in real data: a pre-1970 date. Under
+			// ir.Timestamp → MySQL TIMESTAMP this refused exactly as the
+			// far-future value did.
+			family: "temporal", col: "dt_pre1970", ddl: "DATETIME NOT NULL", lit: "'1900-01-01 00:00:00'",
+			pgProbe: "to_char(%s,'YYYY-MM-DD HH24:MI:SS')", pgWant: "1900-01-01 00:00:00",
+			myProbe: "CAST(%s AS CHAR)", myWant: "1900-01-01 00:00:00.000000", // DATETIME(6) renders the fraction
 		},
 		{
 			family: "temporal", col: "tm_frac", ddl: "TIME NOT NULL", lit: "'23:59:59.999999'",
@@ -595,21 +615,35 @@ func TestMigrate_AdversarialCorpusRefusals_SQLite(t *testing.T) {
 			target: "mysql",
 			alt:    []string{"inf", "illegal", "out of range", "nan"},
 		},
-		// SQLite DATETIME → ir.Timestamp → MySQL TIMESTAMP: the 2038 range
-		// cap makes an ordinary far-future (or pre-1970) datetime refuse at
-		// insert (see the dt_max corpus cell's finding note). Pinned loud so
-		// a future mapping change (ir.DateTime → MySQL DATETIME) flips this
-		// cell deliberately, not silently.
-		{
-			name:   "datetime_beyond_mysql_timestamp_range",
-			create: `CREATE TABLE r_cell (id INTEGER PRIMARY KEY, v DATETIME NOT NULL)`,
-			insert: `INSERT INTO r_cell VALUES (1, '9999-12-31 23:59:59.999999')`,
-			target: "mysql",
-			alt:    []string{"incorrect datetime", "1292", "out of range"},
-		},
+		// REMOVED: `datetime_beyond_mysql_timestamp_range`. Its removal is the
+		// point, and the floor below moved with it rather than being padded.
+		//
+		// SQLite DATETIME resolved to ir.Timestamp → MySQL TIMESTAMP, whose
+		// 1970..2038 range refused an ordinary far-future or pre-1970
+		// datetime. The cell was pinned loud precisely so a mapping change
+		// would flip it deliberately; the mapping is now ir.DateTime → MySQL
+		// DATETIME and the value is carried (the dt_max and dt_pre1970 corpus
+		// cells above assert it on both targets), so there is no refusal left
+		// to pin.
+		//
+		// A replacement cell at the "new boundary" was written and then
+		// DELETED, because the boundary it assumed does not exist. MEASURED
+		// on real MySQL 8.4 under the default strict sql_mode
+		// (STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE): a DATETIME(6)
+		// column ACCEPTED '0500-01-01', '0001-01-01' AND '0000-01-01'. The
+		// widely-quoted "DATETIME supports 1000-01-01 .. 9999-12-31" is the
+		// documented range, not an enforced floor — so there is no ordinary
+		// SQLite datetime that MySQL DATETIME rejects on range, and inventing
+		// a cell to keep the count up would have pinned a refusal that does
+		// not happen. The same probe confirmed the defect this fix removes:
+		// the identical value in a TIMESTAMP(6) column fails with
+		// `ERROR 1292 (22007) Incorrect datetime value: '1900-01-01 00:00:00'`.
 	}
-	if len(refusals) < 6 {
-		t.Fatalf("anti-vacuity floor: refusal matrix has %d cells; floor is 6", len(refusals))
+	// Floor lowered 6 → 5 when the datetime cell was removed. It tracks the
+	// cells that legitimately remain; padding it back to 6 with an invented
+	// refusal would defeat the purpose of having a floor at all.
+	if len(refusals) < 5 {
+		t.Fatalf("anti-vacuity floor: refusal matrix has %d cells; floor is 5", len(refusals))
 	}
 
 	for _, rc := range refusals {

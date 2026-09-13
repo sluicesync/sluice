@@ -81,9 +81,14 @@ func emitColumnType(t ir.Type) (string, error) {
 		// ir.Time.
 		return "TIME", nil
 	case ir.DateTime, ir.Timestamp:
-		// DATETIME reads back as ir.Timestamp (no tz). A tz-aware source
-		// timestamp is stored as its UTC ISO instant (instant-faithful;
-		// the display zone is dropped — SQLite has no tz type, ADR-0134).
+		// DATETIME reads back as ir.DateTime, the IR's tz-NAIVE family,
+		// which is what SQLite storage is. A tz-aware source timestamp is
+		// stored as its UTC ISO instant (instant-faithful; the display zone
+		// is dropped — SQLite has no tz type, ADR-0134), so the zone cannot
+		// be recovered on read-back and the naive family is the honest
+		// answer. Round-tripping PG timestamptz -> SQLite -> PG therefore
+		// lands in timestamp, not timestamptz; that asymmetry is ADR-0134's
+		// and predates the ir.DateTime correction.
 		return "DATETIME", nil
 	case ir.JSON:
 		// SQLite has no native JSON type (JSONSupport=None). Emitting a

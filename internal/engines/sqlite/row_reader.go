@@ -282,7 +282,7 @@ func buildSelect(cols []*ir.Column, tableName string, hasRowid bool) string {
 // TestRealDriver_TemporalEncodings.
 func selectColumnExpr(c *ir.Column) string {
 	switch c.Type.(type) {
-	case ir.Date, ir.Timestamp, ir.Time:
+	case ir.Date, ir.DateTime, ir.Timestamp, ir.Time:
 		q := quoteIdent(c.Name)
 		return "coalesce(" + q + ", " + q + ") AS " + q
 	default:

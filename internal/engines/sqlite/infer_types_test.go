@@ -85,7 +85,11 @@ func TestValidateInferredType_PerFamily(t *testing.T) {
 	)
 
 	tsTZ := ir.Timestamp{Precision: 6, WithTimeZone: true}
-	tsNaive := ir.Timestamp{Precision: 6, WithTimeZone: false}
+	// A value set that is tz-NAIVE resolves to ir.DateTime, not to an
+	// ir.Timestamp with the zone flag off. The two emit the same PG type but
+	// different MySQL ones (DATETIME 1000..9999 vs TIMESTAMP 1970..2038), and
+	// naive is what SQLite storage actually is.
+	tsNaive := ir.Type(ir.DateTime{Precision: 6})
 
 	cases := []struct {
 		col          string
@@ -221,7 +225,11 @@ func TestValidateInferredType_ZoneSpellingMatrix(t *testing.T) {
 	)
 
 	tsTZ := ir.Timestamp{Precision: 6, WithTimeZone: true}
-	tsNaive := ir.Timestamp{Precision: 6, WithTimeZone: false}
+	// A value set that is tz-NAIVE resolves to ir.DateTime, not to an
+	// ir.Timestamp with the zone flag off. The two emit the same PG type but
+	// different MySQL ones (DATETIME 1000..9999 vs TIMESTAMP 1970..2038), and
+	// naive is what SQLite storage actually is.
+	tsNaive := ir.Type(ir.DateTime{Precision: 6})
 	cases := []struct {
 		col          string
 		wantConforms bool
@@ -273,12 +281,16 @@ func TestValidateInferredType_ZoneSpellingMatrix(t *testing.T) {
 // PADDED text through the REAL decoder (decodeCell, iso encoding) under the
 // exact type the validator resolved.
 func TestValidateInferredType_PaddedValidatorDecoderParity(t *testing.T) {
-	tsTZ := ir.Timestamp{Precision: 6, WithTimeZone: true}
-	tsNaive := ir.Timestamp{Precision: 6, WithTimeZone: false}
+	tsTZ := ir.Type(ir.Timestamp{Precision: 6, WithTimeZone: true})
+	// A value set that is tz-NAIVE resolves to ir.DateTime, not to an
+	// ir.Timestamp with the zone flag off. The two emit the same PG type but
+	// different MySQL ones (DATETIME 1000..9999 vs TIMESTAMP 1970..2038), and
+	// naive is what SQLite storage actually is.
+	tsNaive := ir.Type(ir.DateTime{Precision: 6})
 	rows := []struct {
 		col          string
 		raw          string
-		wantResolved ir.Timestamp
+		wantResolved ir.Type
 		wantInstant  time.Time
 	}{
 		// +05:30 with a trailing space: the instant is the wall clock MINUS

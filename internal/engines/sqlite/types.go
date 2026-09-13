@@ -89,9 +89,9 @@ func resolveColumnType(declaredType string) ir.Type {
 // of the declared type (the same matching philosophy as SQLite's own
 // affinity rules), in a load-bearing PRECEDENCE order:
 //
-//  1. contains "DATETIME" or "TIMESTAMP" → ir.Timestamp (no tz; SQLite is
-//     tz-naive). Checked first because "DATETIME" also contains "DATE" and
-//     "TIME"; without this precedence a DATETIME column would mis-map to Date.
+//  1. contains "DATETIME" or "TIMESTAMP" → ir.DateTime (SQLite is tz-naive).
+//     Checked first because "DATETIME" also contains "DATE" and "TIME";
+//     without this precedence a DATETIME column would mis-map to Date.
 //  2. else contains "DATE" → ir.Date
 //  3. else contains "TIME" → ir.Time (no tz)
 //  4. else contains "BOOL" → ir.Boolean (covers BOOL and BOOLEAN)
@@ -111,14 +111,29 @@ func declaredTemporalBoolType(declaredType string) (ir.Type, bool) {
 	t := strings.ToUpper(strings.TrimSpace(declaredType))
 	switch {
 	case strings.Contains(t, "DATETIME"), strings.Contains(t, "TIMESTAMP"):
-		// PrecisionUnspecified: SQLite temporals are TEXT storage with
-		// no declared fractional-second precision — values may carry
-		// any sub-second detail. Carrying an explicit 0 here (the
-		// pre-TRIAGE-#3 zero value) would truncate fractional seconds
-		// on engines that honor a declared 0 (MySQL DATETIME(0), PG
-		// timestamp(0)); unspecified lets each writer pick its
-		// max-fidelity form (PG bare, MySQL (6)).
-		return ir.Timestamp{PrecisionUnspecified: true}, true
+		// ir.DateTime, NOT ir.Timestamp, and the difference is only visible
+		// on a MySQL target. A SQLite datetime is tz-naive — the storage has
+		// no zone and the platform has no zone type — and ir.DateTime is the
+		// IR's name for exactly that. MySQL's own emitter already says so
+		// ("DateTime-without-zone IR values would map to DATETIME, not
+		// TIMESTAMP"); this reader was handing it the wrong IR type for a
+		// naive value.
+		//
+		// The cost of the old mapping was a LOUD failure on ordinary data:
+		// MySQL TIMESTAMP spans 1970-01-01..2038-01-19, so any pre-1970 or
+		// post-2038 datetime refused at insert with a bare server 1292 —
+		// while MySQL DATETIME holds 1000..9999 and would have taken it. It
+		// also silently applied a zone CONVERSION on store and retrieval to a
+		// value that never had a zone. Postgres targets were never affected
+		// and are unchanged here: both IR types emit PG TIMESTAMP.
+		//
+		// PrecisionUnspecified: SQLite temporals are TEXT storage with no
+		// declared fractional-second precision — values may carry any
+		// sub-second detail. Carrying an explicit 0 here (the pre-TRIAGE-#3
+		// zero value) would truncate fractional seconds on engines that honor
+		// a declared 0 (MySQL DATETIME(0), PG timestamp(0)); unspecified lets
+		// each writer pick its max-fidelity form (PG bare, MySQL (6)).
+		return ir.DateTime{PrecisionUnspecified: true}, true
 	case strings.Contains(t, "DATE"):
 		return ir.Date{}, true
 	case strings.Contains(t, "TIME"):

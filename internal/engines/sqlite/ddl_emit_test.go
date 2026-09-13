@@ -39,9 +39,18 @@ func TestEmitColumnType(t *testing.T) {
 		{"blob", ir.Blob{Size: ir.BlobLong}, "BLOB", isType[ir.Blob]},
 		{"date", ir.Date{}, "DATE", isType[ir.Date]},
 		{"time", ir.Time{}, "TIME", isType[ir.Time]},
-		{"datetime", ir.DateTime{}, "DATETIME", isType[ir.Timestamp]},
-		{"timestamp", ir.Timestamp{}, "DATETIME", isType[ir.Timestamp]},
-		{"timestamptz", ir.Timestamp{WithTimeZone: true}, "DATETIME", isType[ir.Timestamp]},
+		// All three IR families emit SQLite DATETIME — SQLite has one
+		// tz-naive datetime spelling and no zone type — and all three now
+		// read BACK as ir.DateTime, because tz-naive is what SQLite storage
+		// actually is. That is exact for the first case and a deliberate,
+		// documented narrowing for the other two: a zone that SQLite never
+		// stored cannot be recovered from what it did store, so claiming
+		// ir.Timestamp on the way back would assert a zone from nothing.
+		// (What this loses is only visible migrating INTO SQLite and out
+		// again; the ddl_emit header carries the same note.)
+		{"datetime", ir.DateTime{}, "DATETIME", isType[ir.DateTime]},
+		{"timestamp", ir.Timestamp{}, "DATETIME", isType[ir.DateTime]},
+		{"timestamptz", ir.Timestamp{WithTimeZone: true}, "DATETIME", isType[ir.DateTime]},
 		{"json", ir.JSON{Binary: true}, "TEXT", isType[ir.Text]},
 		{"uuid", ir.UUID{}, "TEXT", isType[ir.Text]},
 		{"enum", ir.Enum{Values: []string{"a"}}, "TEXT", isType[ir.Text]},

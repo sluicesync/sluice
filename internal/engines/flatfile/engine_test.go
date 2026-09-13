@@ -228,8 +228,15 @@ func TestInferTypeValidatorSurface(t *testing.T) {
 	if !conforms || n != 2 {
 		t.Errorf("created_at: conforms=%v n=%d; want true/2", conforms, n)
 	}
-	if ts, ok := resolved.(ir.Timestamp); !ok || ts.WithTimeZone {
-		t.Errorf("created_at resolved = %#v; want naive ir.Timestamp", resolved)
+	// ir.DateTime is the IR's tz-NAIVE datetime family, and these values carry
+	// no offset. A flat file has no zone of its own — only its values can — so
+	// naive is the honest resolution, and the distinction is load-bearing on a
+	// MySQL target (DATETIME holds 1000..9999; TIMESTAMP is zone-converted and
+	// capped at 2038). A column whose values DO all carry offsets still
+	// resolves to ir.Timestamp{WithTimeZone: true}; this engine stages through
+	// the SQLite reader, so it inherits that split rather than defining one.
+	if _, ok := resolved.(ir.DateTime); !ok {
+		t.Errorf("created_at resolved = %#v; want ir.DateTime (the tz-naive family)", resolved)
 	}
 	conforms, _, _, err = val.ValidateInferredType(ctx, "infer", "customer_id", ir.UUID{})
 	if err != nil {

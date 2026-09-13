@@ -596,7 +596,7 @@ func TestD1SchemaReader_ReadSchema(t *testing.T) {
 	}
 	// Column types resolved through the shared resolveColumnType.
 	wantTypes := map[string]string{
-		"id": "Integer", "name": "Text", "created_at": "Timestamp", "active": "Boolean",
+		"id": "Integer", "name": "Text", "created_at": "DateTime", "active": "Boolean",
 	}
 	for _, c := range users.Columns {
 		if got := typeKind(c.Type); got != wantTypes[c.Name] {
@@ -760,6 +760,8 @@ func typeKind(t ir.Type) string {
 		return "Integer"
 	case ir.Text:
 		return "Text"
+	case ir.DateTime:
+		return "DateTime"
 	case ir.Timestamp:
 		return "Timestamp"
 	case ir.Boolean:

@@ -61,7 +61,7 @@
 // as TEXT/INTEGER/REAL by application convention and booleans as 0/1
 // INTEGERs. The affinity mapping above is overridden for columns whose
 // DECLARED type names a temporal/boolean shape (ADR-0129): a column
-// declared DATETIME/TIMESTAMP → ir.Timestamp, DATE → ir.Date, TIME →
+// declared DATETIME/TIMESTAMP → ir.DateTime (tz-naive), DATE → ir.Date, TIME →
 // ir.Time, BOOL/BOOLEAN → ir.Boolean (case-insensitive substring, in that
 // precedence). An INTEGER-declared 0/1 column is NOT guessed as bool; only
 // the explicit BOOL/BOOLEAN spelling triggers it.

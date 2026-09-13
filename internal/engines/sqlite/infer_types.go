@@ -268,7 +268,7 @@ func validateInferredType(
 		}
 		return bad == 0, ir.UUID{}, total, nil
 
-	case ir.Timestamp:
+	case ir.DateTime, ir.Timestamp:
 		return validateInferredTimestamp(ctx, count, qt, qc, total)
 
 	default:
@@ -347,7 +347,19 @@ func validateInferredTimestamp(
 
 	// Precision 6 mirrors the `timestamptz` --type-override alias (mappings.go);
 	// PG renders timestamp(6)/timestamptz(6), the SQLite/ISO common case.
-	return true, ir.Timestamp{Precision: 6, WithTimeZone: noOffset == 0}, total, nil
+	//
+	// A value set where EVERY value carried a UTC offset is genuinely zoned,
+	// so it stays ir.Timestamp{WithTimeZone: true}. One where any value did
+	// not is tz-NAIVE, and naive belongs in ir.DateTime — the same correction
+	// the declared-type resolver got (see [declaredTemporalBoolType]). The
+	// distinction is invisible on a Postgres target (both emit TIMESTAMP) and
+	// load-bearing on a MySQL one: naive-as-ir.Timestamp emits MySQL
+	// TIMESTAMP, which is zone-converted on store and capped at 2038, where
+	// DATETIME is naive and holds 1000..9999.
+	if noOffset == 0 {
+		return true, ir.Timestamp{Precision: 6, WithTimeZone: true}, total, nil
+	}
+	return true, ir.DateTime{Precision: 6}, total, nil
 }
 
 // quoteSQLiteIdent renders a table/column name as a double-quoted SQL

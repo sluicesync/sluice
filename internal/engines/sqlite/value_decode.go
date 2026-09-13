@@ -87,7 +87,7 @@ func decodeCell(raw any, t ir.Type, enc dateEncoding) (any, error) {
 	}
 
 	switch t.(type) {
-	case ir.Date, ir.Timestamp, ir.Time:
+	case ir.Date, ir.DateTime, ir.Timestamp, ir.Time:
 		return decodeTemporal(raw, t, enc)
 
 	case ir.Boolean:
@@ -298,7 +298,7 @@ func decodeTemporal(raw any, t ir.Type, enc dateEncoding) (any, error) {
 	case ir.Time:
 		// The IR Time value is a textual time-of-day (value-types.md).
 		return formatTimeOfDay(raw, tm, enc), nil
-	default: // ir.Timestamp
+	default: // ir.DateTime / ir.Timestamp — a full instant
 		return tm.UTC(), nil
 	}
 }
