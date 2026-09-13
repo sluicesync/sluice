@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -97,7 +98,105 @@ func nekiverifyCreds(t *testing.T) psCreds {
 	if c.tokenID == "" || c.token == "" || c.org == "" {
 		t.Skip("nekiverify: PLANETSCALE_SERVICE_TOKEN_ID / PLANETSCALE_SERVICE_TOKEN / PLANETSCALE_ORG not set")
 	}
+	c.preflight(t)
 	return c
+}
+
+// credsPreflight memoises the one-time reachability check below, so a suite
+// of N tests pays for it once and reports it identically in each.
+var credsPreflight struct {
+	once sync.Once
+	err  error
+}
+
+// preflight proves the credentials can actually reach the org BEFORE any test
+// tries to create a database, and turns the platform's deliberately
+// uninformative answer into a diagnosis.
+//
+// # Why this exists
+//
+// The first scheduled run of this suite (2026-09-13 17:20 UTC, delayed to
+// 19:30 by GitHub's scheduler) failed every test with:
+//
+//	create database: POST /organizations/***/databases: HTTP 404: Not Found
+//
+// A 404 on an org-scoped PlanetScale endpoint does NOT mean "the endpoint is
+// wrong". MEASURED against the live API 2026-09-13, all three of these answer
+// an identical HTTP 404:
+//
+//	real org    + valid token   -> 200
+//	BOGUS org   + valid token   -> 404
+//	real org    + BOGUS token   -> 404   <- note this one
+//
+// That last row is the trap, and it is why the first cut of this comment was
+// wrong: a rejected credential does not come back 401 or 403 here, it comes
+// back 404, because distinguishing "this org does not exist" from "it exists
+// and you may not see it" would leak the org's existence. Authentication and
+// authorization failures are folded into the same answer.
+//
+// So a 404 is genuinely ambiguous across three causes, and the raw error
+// points at none of them.
+//
+// Worse, it arrived once per test, attached to whatever operation happened to
+// run first, so the same configuration problem read as five unrelated
+// failures. Every one of them was a `create`, which is also the billable call:
+// failing here instead means the suite never attempts to provision against an
+// org it cannot address.
+//
+// The check is a read-only list, which needs the same org access every
+// operation in this suite needs and creates nothing.
+func (c psCreds) preflight(t *testing.T) {
+	t.Helper()
+
+	credsPreflight.once.Do(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		_, status, err := c.api(ctx, http.MethodGet, "/organizations/"+c.org+"/databases", nil)
+		if err == nil {
+			return
+		}
+		switch status {
+		case http.StatusNotFound:
+			credsPreflight.err = fmt.Errorf(
+				"nekiverify: the PlanetScale credentials cannot reach organization %q (HTTP 404).\n\n"+
+					"A 404 here is AMBIGUOUS BY DESIGN and does NOT mean the endpoint is wrong. Measured "+
+					"against the live API: a bogus ORG returns 404, and a bogus TOKEN against a real org "+
+					"ALSO returns 404 rather than 401 — auth failures are folded into the same answer so "+
+					"that a 401 cannot be used to prove an org exists. Three causes to check, in order:\n"+
+					"  1. PLANETSCALE_ORG names the wrong organization — it is the slug in the PlanetScale "+
+					"URL, not the display name\n"+
+					"  2. the service token is invalid, revoked, or expired (this is the arm that looks "+
+					"like a missing org and is the easiest to overlook)\n"+
+					"  3. the token was minted in, or is scoped to, a DIFFERENT org than PLANETSCALE_ORG "+
+					"names — a token cannot be moved between orgs, it has to be re-minted\n\n"+
+					"All three are configuration, not a sluice defect: nothing in the suite ran. Verified "+
+					"by a read-only list, so no database was created and nothing is billing", c.org,
+			)
+		case http.StatusUnauthorized, http.StatusForbidden:
+			// Defensive rather than expected: measured 2026-09-13, this API
+			// folds a rejected token into the 404 above. Kept so that a
+			// platform change toward the conventional codes reports clearly
+			// instead of falling into the generic arm.
+			credsPreflight.err = fmt.Errorf(
+				"nekiverify: the PlanetScale service token was REJECTED for organization %q (HTTP %d). "+
+					"Re-mint it and update the PLANETSCALE_SERVICE_TOKEN_ID / PLANETSCALE_SERVICE_TOKEN "+
+					"secrets.\n\nWorth noting: this API historically answered 404 for a bad token rather "+
+					"than %d, so seeing this code means the platform's behaviour has changed and the 404 "+
+					"guidance above may now be over-broad", c.org, status, status,
+			)
+		default:
+			credsPreflight.err = fmt.Errorf(
+				"nekiverify: could not reach organization %q to verify credentials: %w\n\n"+
+					"This is the preflight, so no database was created. If the platform is simply down, "+
+					"the suite is expected to fail — it tests against a live cluster by design", c.org, err,
+			)
+		}
+	})
+
+	if credsPreflight.err != nil {
+		t.Fatal(credsPreflight.err)
+	}
 }
 
 // api performs one PlanetScale API call. Returns the decoded body.
