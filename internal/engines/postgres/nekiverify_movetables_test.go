@@ -218,16 +218,31 @@ func nekiMoveTablesBlocksWithNK213(ctx context.Context, t *testing.T, db *sql.DB
 		// real signal is per-shard and has to be polled. A sequence written
 		// from the happy-path call order alone will always fail here.
 		if err := phase("await_streaming", func() error {
+			// The whole row as JSON, not a named column.
+			//
+			// The first cut selected `status` and was refused with
+			// `column "status" does not exist` (42703) — I guessed the output
+			// shape of a function whose signature I had not read, which is the
+			// same mistake as the ::jsonb topology argument two runs earlier.
+			// row_to_json needs no such guess: it works whatever the columns
+			// are called, and searching the rendered row for "streaming" is
+			// robust to the field being renamed or nested.
+			//
+			// If even this fails, the message prints the function's REGISTERED
+			// signature (OUT parameters included — that is how
+			// move_tables_create's shape was recovered), so the next run
+			// answers rather than guesses.
 			deadline := time.Now().Add(5 * time.Minute)
 			var last string
 			for time.Now().Before(deadline) {
-				var status string
+				var row string
 				if err := db.QueryRowContext(ctx,
-					`SELECT status FROM __neki.move_tables_status($1)`, workflow).Scan(&status); err != nil {
-					return fmt.Errorf("poll move_tables_status: %w", err)
+					`SELECT row_to_json(t)::text FROM __neki.move_tables_status($1) t`, workflow).Scan(&row); err != nil {
+					return fmt.Errorf("poll move_tables_status: %w\n\n%s", err,
+						nekiFunctionSignature(ctx, db, "move_tables_status"))
 				}
-				last = status
-				if strings.Contains(status, "streaming") {
+				last = row
+				if strings.Contains(row, "streaming") {
 					return nil
 				}
 				select {

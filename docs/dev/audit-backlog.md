@@ -1753,6 +1753,34 @@ And `CREATE TABLE` does **not** enrol a table into it — proven by the MoveTabl
 
 **Do not start with code.** The cheapest decisive experiment is a topology probe, and it is one nekiverify arm.
 
+### ANSWERED 2026-09-14 by two live probes — and the recommendation changed twice
+
+**Unknown 2 — separate schema: NO.** The control held first (a shard-key-less table in `public` refused with `NK306`), and the same table in its own schema was refused **identically**. The default shard group reaches unlisted schemas too, so sluice cannot escape it by putting its control tables somewhere else. *That was my preferred option going in; the probe is the only reason it was not designed on.*
+
+**Unknown 1 — a CONSTANT shard key: YES, the full lifecycle works.** Probed as the lifecycle rather than an INSERT, because each step fails differently and the INSERT is the least interesting:
+
+| step | result |
+|---|---|
+| INSERT, three rows, constant key `0` | accepted |
+| UPDATE `source_position` without naming the routing column | accepted, `RowsAffected == 1` |
+| SELECT unpinned | correct value back, all 3 rows visible |
+
+The UPDATE is the one that mattered: it runs on every committed CDC batch, this suite separately proves a sharded Neki refuses an UPDATE that *names* the shard key even assigned its own value, and an update matching nothing would be the silent half — sluice believing it had checkpointed while the stored position never moved.
+
+**So NK306's control-table half has a confirmed viable fix.** Its known cost: control-table DDL becomes **target-dependent** for the first time on any engine (the column's name and type come from the database), plus the state-format change that older binaries must still be able to read.
+
+### …but there is a BETTER candidate, from the vendor's own guidance (operator-supplied)
+
+PlanetScale's Neki best-practices page says the **authoritative shard group "holds unsharded data"** and should be "sized for **metadata, catalog work, and sequences**". sluice's control tables are exactly that — a CDC position and a migrate breadcrumb are metadata about the migration, with nothing per-tenant in them to route on.
+
+**The schema probe did not already answer this**, and the distinction is easy to miss: that probe used an *unlisted* schema, while the topology names a `shard_group` **per table** and `enrolTableInTopology` enrols with an **empty** object — no group named — which is precisely why anything it touches lands in the sharded default. "Unlisted" and "assigned to the authoritative group" are different questions.
+
+A YES there would beat the constant-shard-key fix outright: no DDL shape change, no target-dependent column, and the tables land where the platform's own guidance says metadata belongs. **The catch that survives a YES** is enrolment, not routing: `CREATE TABLE` does not enrol, so sluice would have to call `set_data_topology` itself — writing a **cluster-wide topology revision** as a side effect of creating a control table. That is far heavier than creating a table and deserves its own decision rather than arriving bundled with the fix. The probe reports the permission answer in the same call, since it is as decisive as the routing.
+
+**Not yet run** — added after the dispatch that answered the other two.
+
+**Reference tables and GSIs**, also named on that page, are NOT candidates on current evidence: the page documents neither's mechanics, GSIs map a lookup key to an owner row's shard key (control tables have no owner row), and "duplicate across shards" has different semantics for a *written* checkpoint than for a read-mostly lookup. Worth revisiting only if the mechanics get documented.
+
 ## 2026-09-14 — FILED, blocked on the above: backup/restore has never been run against Neki
 
 No nekiverify arm touches backup, and the backup package's **only** Neki reference is a comment in `restore_table_pool.go` recording a bug that code review caught rather than a run: passing a literal `0` to the axis resolver dropped `CopyConcurrencyCeiling`, which *"on a PlanetScale Neki target let a restore open table × chunk concurrent COPYs against a router that admits four."*
