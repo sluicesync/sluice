@@ -148,6 +148,7 @@ func TestNekiverify_ShardedRefusalPremises(t *testing.T) {
 	// test can only ever prove sluice agrees with itself about them.
 	nekiConcurrentCopyLimitHoldsOnTheCluster(ctx, t, fx, []int{tenantA, tenantB})
 	nekiShardKeyRequiredOnInsert(ctx, t, db, tenantA)
+	nekiShardKeyRoutingCorpus(ctx, t, db, fx.shards)
 
 	// Bisecting the open NK306 finding. These two run BEFORE the CDC arm on
 	// purpose: they answer "whose fault is it" independently of whether that
