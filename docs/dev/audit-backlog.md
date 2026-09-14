@@ -1721,6 +1721,31 @@ Mutation-run in all three directions, mutants grep-confirmed present and reverte
 
 **The generalizable bit:** when one gate grades two classes, check whether its exemptions belong to *both*. An exemption argued from class A and applied to class B is invisible in review, because the rationale reads as sound — it is sound, about the other thing. The tell here was a comment explaining the exemption in terms of only one of the two patterns in the regex right above it.
 
+## 2026-09-14 — NK306 control-table fix: the implementation plan, derived from the code
+
+The design is settled (authoritative shard group; sluice's role can enrol). This is what building it actually touches, scoped against the tree rather than estimated.
+
+**Surface: 62 non-test files** reference `sluice_cdc_state` / `sluice_migrate_state` / `sluice_cdc_skipped_tables`. That is not a Neki-local edit.
+
+**The chokepoints, and there are two per engine — this is the sibling sweep:**
+
+- `postgres/change_applier.go:968` — `ChangeApplier.EnsureControlTable` (CDC position + skipped-table ledger)
+- `postgres/migration_state.go:182` — `MigrationStateStore.EnsureControlTable` (migrate breadcrumbs, and **restore's** state)
+
+A fix that reaches only the applier leaves `migrate` and `restore` broken on a sharded Neki, which is exactly the recurring shape this file catalogues. Both are Postgres-side; MySQL has its own pair and is unaffected by NK306 but shares the roster.
+
+**`internal/appliershared/control_table_roster.go` already single-sources the names** (roadmap item 65b) with a both-directions source-scan gate. Any new placement must go through it, or the roster and the reality diverge silently — and the roster is what the schema readers use to EXCLUDE control tables from user-table enumeration, so a control table that moves without the roster knowing becomes a table sluice tries to migrate.
+
+**Implementation order:**
+
+1. **A Neki-only enrolment step** at both `EnsureControlTable` chokepoints: after `CREATE TABLE`, call `__neki.set_data_topology` to place the table in the authoritative shard group. Gate it on `isNeki` — every other target must be byte-identical to today.
+2. **Idempotency.** `EnsureControlTable` runs on every start. The enrolment must be a no-op when the table is already placed, not a fresh topology revision each time. Unanswered: does `set_data_topology` with an unchanged document still bump the revision? Cheap nekiverify arm.
+3. **Concurrency.** Two sluice processes starting against one cluster will both enrol. Read-modify-write on a shared document is a lost-update hazard; the function returns a `revision`, so check whether it takes an expected-revision argument before assuming it is safe.
+4. **Resume compatibility — the part that reaches every engine.** A binary that wrote control tables to the old placement must still FIND them. Since the table NAME and schema do not change (only its topology group), this is likely a no-op — but "likely" is not the standard for state, and a pre-fix binary's tables on a post-fix cluster is a two-version test, not a unit test.
+5. **Then unblock**: the CDC sharded arm, the BISECT arm, and the filed backup/restore-into-Neki arm all gate on this.
+
+**Deliberately NOT started in the session that scoped it.** Sixty-two files and a state-format change want a context that can hold the whole design at once; this session was at 81% with autocompact pending, and the failure mode of starting anyway is precisely the sibling-miss this backlog is full of. The plan is the deliverable; the code is the next session's first task.
+
 ## 2026-09-14 — nekiverify closing state: 24 arms pass, and every remaining failure is diagnosed
 
 The suite went from **never having executed** to 24 passing arms against a real 2-shard PS-10, in one day. What matters more than the count: **there are no unexplained failures left.** All three reds are known, filed, and have named next actions.
