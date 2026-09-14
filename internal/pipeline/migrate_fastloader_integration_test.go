@@ -435,8 +435,32 @@ func TestMigrate_FastLoader_CrashMidFastChunk_ResumeIsIdempotent(t *testing.T) {
 				MigrationID:         "fl-crash-" + kind.name(),
 				Resume:              true,
 			}
-			if err := mig2.Run(ctx); err != nil {
-				t.Fatalf("resume Run: %v", err)
+
+			// TESTFRAGILE-3: bound the RESUME by idle time, not wall clock.
+			//
+			// This leg blew a fixed 3-minute budget on two consecutive release
+			// tags — v0.152.1 and v0.152.2, ~181s each, passing on rerun both
+			// times — always as `create indexes: context deadline exceeded`,
+			// and never as a regression (the two tags carried unrelated
+			// runtime deltas). The Windows matrix and full job set join only
+			// on TAG pushes, so a tag CI is the most contended run the project
+			// does and a constant budget is likeliest to blow exactly when it
+			// is most expensive: on the check that gates publish.
+			//
+			// Raising the constant would trade a flake for a weaker test. A
+			// fixed deadline cannot tell "wedged" from "slow because forty
+			// other jobs are running" — which is the distinction this test
+			// exists to make. The watchdog can: a contended run still emits
+			// phase and table events, a wedged one emits nothing.
+			//
+			// The hard bound is a backstop against a run that reports progress
+			// forever, and should never be the thing that fires.
+			resumeCtx, watchdog, stopWatchdog := newProgressWatchdog(context.Background(), 90*time.Second, 15*time.Minute)
+			defer stopWatchdog()
+			mig2.Progress = watchdog
+
+			if err := mig2.Run(resumeCtx); err != nil {
+				t.Fatalf("resume Run: %v\n\ncause: %v", err, context.Cause(resumeCtx))
 			}
 
 			f2, i2 := tr2.counts("events")
