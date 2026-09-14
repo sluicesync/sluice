@@ -159,6 +159,7 @@ func TestNekiverify_ShardedRefusalPremises(t *testing.T) {
 	nekiControlTableSchemaProbe(ctx, t, db)
 	nekiControlTableShardKeyProbe(ctx, t, db, "tenant_id")
 	nekiControlTableAuthoritativeGroupProbe(ctx, t, db, readAuthoritativeShardGroup(ctx, t, fx))
+	nekiTopologyWriteSemanticsProbe(ctx, t, db)
 	nekiCDCSerialVsBatchedIntoSharded(ctx, t, db, fx, tenantA, tenantB)
 
 	// Coverage item #2: CDC into this sharded target, graded on ordered
