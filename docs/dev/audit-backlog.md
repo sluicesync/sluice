@@ -1784,3 +1784,31 @@ The failure mode is worth keeping because it is a platform behaviour, measured l
 
 **The generalizable bit:** a workflow that reuses existing secrets inherits the assumption that they are still valid for a scope nobody checked. A credentialed job whose first real execution is a scheduled run months after it merged has never been tested; the gap between "the workflow is correct" and "the workflow works here" is exactly the secrets, and nothing in CI grades them.
 
+### Third run (2026-09-14) — the diagnostic paid for itself, and two new findings
+
+**`move_tables_create` — SOLVED by the diagnostic, in one run.** The signature probe printed what the router actually registers:
+
+```
+move_tables_create(INOUT workflow text, source_db text, source_database_topology text,
+                   target_db text, target_database_topology text,
+                   source_tables text[], target_tables text[],
+                   options text DEFAULT NULL::text, OUT report text)
+```
+
+The topology parameters are **`text`**; the call passed them as `::jsonb`. A jsonb value is a perfectly good value and not a text one, so overload resolution found nothing and PostgreSQL reported it as *"function … does not exist"* — which reads like removal. Every remaining literal was untyped, which is why the error rendered them `unknown`. Now cast explicitly on all eight arguments, so a future signature change fails **as** a signature change. This is the whole argument for the diagnostic: the previous two runs each burned a provisioned cluster to learn one thing, and this one learned the answer outright.
+
+**NEKI-COPYLIMIT (OPEN) — the platform admits AT LEAST 6 concurrent COPYs where sluice paces itself to 4.** The new premise arm's first live measurement: every one of its six sessions was accepted, none refused. `nekiConcurrentCopyLimit = 4` folds into `CopyConcurrencyCeiling` and collapses the copy's table × chunk fan-out, so if the real limit is higher, every Neki migrate is slower than it needs to be.
+
+**Not yet actionable, and the reason matters more than the number.** Six is where the probe *stopped asking*, not a measured limit — the first cut of the failure message said "measured 6" and advised raising the constant "to the measured value", which would have swapped one unverified number for another that merely looked freshly confirmed. **The leading hypothesis is that the limit is per-SHARD:** this fixture has two shards, so a per-shard limit of 4 presents as 8, and `nekiConcurrentCopyLimit` would be correct as written with only the arm's comparison wrong. The probe's ceiling is now 12 — sized against `max_connections = 30` minus the sidecar's 10-connection reservation — which can tell 8 from a genuinely raised cluster-wide limit. Six could not.
+
+**Two defects in the new probe, both found by running it rather than by reading it.** Worth recording because both had the same shape — a measurement that could not distinguish its subject from its apparatus:
+
+- A **zero-row COPY may never engage a shard.** The first cut sent no bytes, so it may have been counting open COPY commands rather than concurrent copies into the cluster, and comparing that to a constant about the latter. Each session now sends one real row, routed across both shards, before it parks.
+- **Release hung on two of six sessions** (30s each, serially — most of the arm's 87s). Now released concurrently with the per-session error reported, rather than a bare "did not finish" that leaves the reason on the platform.
+
+A third was caught before it ever ran, during a local mechanism check against `postgres:18`: with a wrong password every session returned early exactly as a refusal does, and the loop read it as "the platform admits 0 concurrent COPYs". A transient connect failure at session 3 would have been reported as a measured limit of 2. The probe now connects as its own step, and an early return that is not a `53300` is refused as inconclusive.
+
+**NK306 premise — PASSES.** A shard-key-less INSERT is refused with `NK306` and the message still names the shard key. The platform half of the CDC investigation is now pinned weekly, so that arm's failure can no longer be attributed to the platform changing its mind.
+
+**The MoveTables arm costs 17 minutes of setup.** `create_and_enrol_table` took **1007.1s** on the run where enrolment first succeeded — topology propagation across every router, not a hang. The arm's own timing log exists to decide "weekly schedule or dispatch input", and this is the number it was waiting for: it roughly doubles the suite's wall clock. Worth deciding deliberately rather than absorbing.
+

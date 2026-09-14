@@ -60,14 +60,28 @@ import (
 // BLOCKS, and the session stays open until this test releases it. An accepted
 // COPY is therefore one whose CopyFrom has not returned; a refused one returns
 // `53300` promptly. That distinction is the whole measurement.
-func nekiConcurrentCopyLimitHoldsOnTheCluster(ctx context.Context, t *testing.T, fx *nekiFixture) {
+func nekiConcurrentCopyLimitHoldsOnTheCluster(ctx context.Context, t *testing.T, fx *nekiFixture, probeTenants []int) {
 	t.Helper()
 
 	t.Run("PREMISE: the concurrent-COPY limit sluice paces itself to is still the platform's", func(t *testing.T) {
-		// Probe one above the constant so the ABOVE direction is observable at
-		// all. A probe that stopped at the constant could only ever report
-		// "at least 4" and would be blind to a platform that raised it.
-		maxProbe := nekiConcurrentCopyLimit + 2
+		// The ceiling is 12, raised from nekiConcurrentCopyLimit+2 after the
+		// first live run accepted every one of its six sessions and could only
+		// report a floor.
+		//
+		// 12 is chosen against the cluster rather than picked: a fresh PS-10
+		// reports max_connections = 30, of which the sidecar reserves 10 for
+		// the replicator, backups and metrics, so ~20 are available to an
+		// application. Twelve concurrent holders leaves real headroom for the
+		// fixture's own connection and anything the router keeps for itself,
+		// while sitting comfortably above both the constant and the floor the
+		// first run established.
+		//
+		// THE HYPOTHESIS IT IS SIZED TO TEST: this fixture has two shards, so
+		// a limit enforced PER SHARD at 4 would present as 8 here — and
+		// nekiConcurrentCopyLimit would then be right as written, with only
+		// this arm's comparison being wrong. Twelve can distinguish that from
+		// a genuinely raised cluster-wide limit; six could not.
+		maxProbe := 12
 
 		type session struct {
 			conn    *sql.DB
@@ -76,19 +90,63 @@ func nekiConcurrentCopyLimitHoldsOnTheCluster(ctx context.Context, t *testing.T,
 		}
 		var held []*session
 
+		// A connection of the arm's own, for cleaning the probe's rows up. The
+		// per-session ones are each pinned to a held COPY and cannot run a
+		// DELETE while they are holding one.
+		probeDB, err := sql.Open("pgx", fx.dsn)
+		if err != nil {
+			t.Fatalf("open the probe's cleanup connection: %v", err)
+		}
+		defer func() { _ = probeDB.Close() }()
+
 		// Release every held COPY before leaving, whatever happens. A COPY
 		// left open would occupy a slot for the rest of the suite and make
 		// every later subtest's failure someone else's mystery.
+		//
+		// Released CONCURRENTLY, and that is a fix rather than a flourish. The
+		// first live run released them one at a time with a 30s budget each,
+		// two sessions did not come back, and the arm spent 87s — most of it
+		// waiting serially on timeouts that a parallel release overlaps into
+		// one. It also reports the ERROR from a session that fails to finish,
+		// where the first cut only said "did not finish" and left the reason
+		// in the platform rather than in the log.
 		defer func() {
-			for _, s := range held {
+			type outcome struct {
+				i   int
+				err error
+				ok  bool
+			}
+			results := make(chan outcome, len(held))
+			for i, s := range held {
 				close(s.release)
-				select {
-				case <-s.done:
-				case <-time.After(30 * time.Second):
-					t.Errorf("a held COPY did not finish after release — the fixture may still be " +
-						"occupying a copy slot for whatever runs next")
+				go func() {
+					select {
+					case err := <-s.done:
+						results <- outcome{i: i, err: err, ok: true}
+					case <-time.After(45 * time.Second):
+						results <- outcome{i: i, ok: false}
+					}
+				}()
+			}
+			for range held {
+				r := <-results
+				switch {
+				case !r.ok:
+					t.Errorf("held COPY %d did not finish within 45s of release — the fixture may still "+
+						"be occupying a copy slot for whatever runs next", r.i+1)
+				case r.err != nil:
+					t.Errorf("held COPY %d failed on release: %v", r.i+1, r.err)
 				}
+			}
+			for _, s := range held {
 				_ = s.conn.Close()
+			}
+			// The probe's own rows, removed so the fixture is as it was found.
+			cctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+			if _, err := probeDB.ExecContext(cctx,
+				fmt.Sprintf("DELETE FROM %s WHERE v = 'copy-limit-probe'", copyProbeTable)); err != nil {
+				t.Errorf("could not remove the probe's rows from %s: %v", copyProbeTable, err)
 			}
 		}()
 
@@ -123,7 +181,11 @@ func nekiConcurrentCopyLimitHoldsOnTheCluster(ctx context.Context, t *testing.T,
 			s := &session{conn: db, release: make(chan struct{}), done: make(chan error, 1)}
 
 			go func() {
-				s.done <- holdOneCopy(ctx, db, s.release)
+				// A distinct id per session, and a tenant that alternates, so
+				// the sessions do not all route to the same shard — a limit
+				// enforced per shard would otherwise be invisible to a probe
+				// whose rows all land in one place.
+				s.done <- holdOneCopy(ctx, db, s.release, probeTenants[i%len(probeTenants)], 91000+i)
 			}()
 
 			// Give the COPY long enough to be accepted or refused. A refusal
@@ -154,7 +216,18 @@ func nekiConcurrentCopyLimitHoldsOnTheCluster(ctx context.Context, t *testing.T,
 			break
 		}
 
-		if observed == 0 && refusal == nil {
+		// Nothing was refused within the probe's own ceiling. That is a FLOOR,
+		// not a measurement, and the distinction is load-bearing.
+		//
+		// The first live run hit exactly this and reported "measured 6" —
+		// then told the reader to raise nekiConcurrentCopyLimit "to the
+		// measured value". Six was never measured; six is where the probe
+		// stopped asking, and the true limit could be 8, 40, or absent. Acting
+		// on that advice would have replaced one unverified constant with
+		// another, which is worse than the original because it would look
+		// freshly confirmed.
+		unbounded := observed == 0 && refusal == nil
+		if unbounded {
 			observed = maxProbe
 		}
 
@@ -188,16 +261,36 @@ func nekiConcurrentCopyLimitHoldsOnTheCluster(ctx context.Context, t *testing.T,
 				"Lower nekiConcurrentCopyLimit (internal/engines/postgres/connection_budget.go) to the "+
 				"measured value.", observed, nekiConcurrentCopyLimit, refusal)
 
+		case unbounded:
+			t.Fatalf("the platform admits AT LEAST %d concurrent COPYs — every session this probe "+
+				"opened was accepted — while nekiConcurrentCopyLimit is %d.\n\n"+
+				"AT LEAST, not exactly: %d is where this probe stopped asking, so the real limit may be "+
+				"higher or may not exist. Do NOT raise the constant to %d on the strength of this "+
+				"message; that would swap one unverified number for another that merely looks freshly "+
+				"confirmed.\n\n"+
+				"This is the benign direction for correctness — sluice is conservative, not wrong, and "+
+				"no migration breaks. It fails anyway, deliberately: a weekly premise check that "+
+				"tolerated drift would stop being evidence, and the cost is throughput left on the "+
+				"table for as long as nobody looks.\n\n"+
+				"To act on it: raise maxProbe here until a 53300 actually appears, confirm the number "+
+				"is stable across runs and shard counts, and only then change "+
+				"nekiConcurrentCopyLimit (internal/engines/postgres/connection_budget.go). Worth ruling "+
+				"out first that the limit is per-SHARD rather than per-cluster — this fixture has two "+
+				"shards, so a per-shard limit of 4 would present as 8 here and the constant would be "+
+				"right as written.",
+				observed, nekiConcurrentCopyLimit, observed, observed)
+
 		default:
-			t.Fatalf("the platform now admits MORE concurrent COPYs than sluice uses: measured %d, "+
-				"nekiConcurrentCopyLimit is %d.\n\n"+
-				"This is the benign direction — sluice is conservative, not wrong, and no migration "+
-				"breaks. It fails anyway, deliberately: a weekly premise check that tolerated drift "+
-				"would stop being evidence, and the cost of the drift is throughput left on the table "+
-				"for as long as nobody looks.\n\n"+
-				"Raise nekiConcurrentCopyLimit (internal/engines/postgres/connection_budget.go) to the "+
-				"measured value — its own comment nominates that as the place — and re-run.",
-				observed, nekiConcurrentCopyLimit)
+			t.Fatalf("the platform refused the %dth concurrent COPY, so it admits %d — more than the %d "+
+				"sluice paces itself to.\n\n"+
+				"This is the benign direction for correctness — sluice is conservative, not wrong. It "+
+				"fails anyway, deliberately: a weekly that tolerated drift would stop being evidence, "+
+				"and the fix is a one-line constant change its own comment nominates a home for.\n\n"+
+				"Refusal: %v\n\n"+
+				"Before raising nekiConcurrentCopyLimit "+
+				"(internal/engines/postgres/connection_budget.go), rule out that the limit is per-SHARD "+
+				"rather than per-cluster — this fixture has two shards.",
+				observed+1, observed, nekiConcurrentCopyLimit, refusal)
 		}
 
 		// The SQLSTATE is already guaranteed to be 53300 — the loop refuses to
@@ -237,12 +330,14 @@ const copyProbeTable = "sk_good"
 // exactly as long as this test wants it. Returning io.EOF with no bytes ends
 // the COPY cleanly and inserts nothing, so the probe leaves the fixture's data
 // exactly as it found it.
-func holdOneCopy(ctx context.Context, db *sql.DB, release <-chan struct{}) error {
+func holdOneCopy(ctx context.Context, db *sql.DB, release <-chan struct{}, tenant, id int) error {
 	conn, err := db.Conn(ctx)
 	if err != nil {
 		return fmt.Errorf("acquire connection: %w", err)
 	}
 	defer func() { _ = conn.Close() }()
+
+	row := []byte(fmt.Sprintf("%d\t%d\tcopy-limit-probe\n", tenant, id))
 
 	return conn.Raw(func(driverConn any) error {
 		pgConn, perr := pgConnFromDriver(driverConn)
@@ -251,7 +346,7 @@ func holdOneCopy(ctx context.Context, db *sql.DB, release <-chan struct{}) error
 		}
 		_, cerr := pgConn.CopyFrom(
 			ctx,
-			&blockingReader{release: release},
+			&blockingReader{release: release, row: row},
 			fmt.Sprintf("COPY %s (tenant_id, id, v) FROM STDIN", copyProbeTable),
 		)
 		if cerr != nil {
@@ -261,15 +356,45 @@ func holdOneCopy(ctx context.Context, db *sql.DB, release <-chan struct{}) error
 	})
 }
 
-// blockingReader returns no bytes until release is closed, then reports EOF.
+// blockingReader emits ONE row, then blocks until release is closed, then
+// reports EOF.
+//
+// # Why it emits a row rather than nothing
+//
+// The first cut sent no bytes at all, which held the COPY open and measured
+// six acceptances where sluice assumes four. That number was not trustworthy,
+// and the reason is the shard key.
+//
+// `sk_good` is sharded on `tenant_id`. A COPY that never sends a row never
+// routes anything, so it may occupy a protocol slot on the router while never
+// engaging the per-shard machinery the limit is actually about — in which case
+// the probe was counting open COPY commands rather than concurrent copies into
+// the cluster, and comparing that to a constant about the latter.
+//
+// Sending one real row first makes each session a copy that has demonstrably
+// reached a shard before it parks. The row is deleted by the caller's cleanup.
 type blockingReader struct {
 	release <-chan struct{}
+	row     []byte
+	sent    bool
 	done    bool
 }
 
 func (r *blockingReader) Read(p []byte) (int, error) {
 	if r.done {
 		return 0, io.EOF
+	}
+	if !r.sent {
+		r.sent = true
+		n := copy(p, r.row)
+		if n < len(r.row) {
+			// The caller's buffer is smaller than one row. Not expected for a
+			// ~40-byte row, and silently truncating would corrupt the COPY
+			// stream into a confusing parse error attributed to the platform.
+			return 0, fmt.Errorf("probe row (%d bytes) does not fit the COPY buffer (%d bytes)",
+				len(r.row), len(p))
+		}
+		return n, nil
 	}
 	<-r.release
 	r.done = true

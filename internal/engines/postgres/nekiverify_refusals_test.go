@@ -146,7 +146,7 @@ func TestNekiverify_ShardedRefusalPremises(t *testing.T) {
 	// applied: nekiConcurrentCopyLimit and the mandatory shard key are claims
 	// about somebody else's platform baked into shipped behaviour, and a unit
 	// test can only ever prove sluice agrees with itself about them.
-	nekiConcurrentCopyLimitHoldsOnTheCluster(ctx, t, fx)
+	nekiConcurrentCopyLimitHoldsOnTheCluster(ctx, t, fx, []int{tenantA, tenantB})
 	nekiShardKeyRequiredOnInsert(ctx, t, db, tenantA)
 
 	// Coverage item #2: CDC into this sharded target, graded on ordered

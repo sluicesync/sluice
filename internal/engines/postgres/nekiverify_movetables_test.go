@@ -134,9 +134,31 @@ func nekiMoveTablesBlocksWithNK213(ctx context.Context, t *testing.T, db *sql.DB
 		// Phase 1 — create. Measured transparent: the per-shard copy+stream
 		// runs alongside anything else reading the table.
 		if err := phase("move_tables_create", func() error {
+			// EVERY argument explicitly ::text, and the topology ones are text
+			// rather than jsonb. Both halves were wrong and the run told us so.
+			//
+			// The registered signature, read off pg_proc by the diagnostic in
+			// the failure message below on 2026-09-14:
+			//
+			//	move_tables_create(INOUT workflow text, source_db text,
+			//	                   source_database_topology text, target_db text,
+			//	                   target_database_topology text,
+			//	                   source_tables text[], target_tables text[],
+			//	                   options text DEFAULT NULL::text, OUT report text)
+			//
+			// The topology parameters are TEXT. This call passed them as
+			// ::jsonb, which is a perfectly good jsonb value and not a text
+			// one, so overload resolution found nothing — and PostgreSQL
+			// reported that as "function … does not exist", which reads like
+			// the platform removed it. The remaining literals were untyped and
+			// resolved to `unknown`, which is why the error rendered them that
+			// way. Casting every argument means a future signature change
+			// fails as a signature change rather than as a resolution puzzle.
 			_, err := db.ExecContext(ctx,
-				`SELECT __neki.move_tables_create($1,'postgres',$2::jsonb,$3,$2::jsonb,
-				                                  ARRAY['public.`+table+`'],ARRAY['public.`+table+`'],'{}')`,
+				`SELECT __neki.move_tables_create(
+				     $1::text, 'postgres'::text, $2::text, $3::text, $2::text,
+				     ARRAY['public.`+table+`']::text[], ARRAY['public.`+table+`']::text[],
+				     '{}'::text)`,
 				workflow, srcTopo, moveTgt)
 			return err
 		}); err != nil {
