@@ -156,6 +156,7 @@ func TestNekiverify_ShardedRefusalPremises(t *testing.T) {
 	// than only the symptom. sk_good is the fixture's own sharded table, so
 	// neither depends on the CDC arm having created anything.
 	nekiShardKeyIsNotReportedGenerated(ctx, t, db, "sk_good", "tenant_id")
+	nekiControlTableSchemaProbe(ctx, t, db)
 	nekiCDCSerialVsBatchedIntoSharded(ctx, t, db, fx, tenantA, tenantB)
 
 	// Coverage item #2: CDC into this sharded target, graded on ordered
