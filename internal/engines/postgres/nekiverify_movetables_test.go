@@ -140,11 +140,16 @@ func nekiMoveTablesBlocksWithNK213(ctx context.Context, t *testing.T, db *sql.DB
 				workflow, srcTopo, moveTgt)
 			return err
 		}); err != nil {
-			t.Fatalf("move_tables_create: %v\n"+
+			t.Fatalf("move_tables_create: %v\n\n"+
 				"If this is an NK604 'not found in the populated database topology', the enrolment step "+
-				"above no longer does what it did on 2026-09-10. If it is a signature error, the metafunc "+
-				"has changed — run `SELECT * FROM __neki.list_metafuncs()` and update this call; do NOT "+
-				"relax the test, because the arm it guards is a terminal refusal", err)
+				"above no longer does what it did on 2026-09-10.\n\n"+
+				"If it is a 42883 signature error, note that the suite's own premise check proves this "+
+				"function EXISTS by name — so this is overload resolution failing, not a missing "+
+				"function. A PostgreSQL function's identity is (name, argument TYPES), and an untyped "+
+				"literal resolves to `unknown` rather than to anything, so the fix is usually an explicit "+
+				"cast on each literal rather than a different argument count. %s\n\n"+
+				"Do NOT relax the test — the arm it guards is a terminal refusal.",
+				err, nekiFunctionSignature(ctx, db, "move_tables_create"))
 		}
 		t.Cleanup(func() {
 			cctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)

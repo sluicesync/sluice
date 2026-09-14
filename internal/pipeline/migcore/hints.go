@@ -274,6 +274,72 @@ var hintRegistry = []errorHint{
 	// cold-starts, `schema add-table` AND `restore`, so only `migrate` may
 	// be told about --resume and only migrate/sync-start about
 	// --upfront-indexes / --planetscale-org.
+	// Index / constraint phase: the relation or column the DDL names is gone.
+	//
+	// The COPY phase has carried a code and a hint for this condition since
+	// forever; these two phases carried NEITHER, so the identical condition
+	// produced a bare `pipeline: create indexes: … (SQLSTATE 42P01)` one phase
+	// later. Found by the v0.152.1 regression cycle, which graded it before
+	// filing and correctly declined to file it — it is loud, immediate and
+	// names the SQLSTATE, so it is a quality gap rather than a defect.
+	//
+	// THE DIAGNOSIS IS NOT THE COPY LANE'S, which is why these do not simply
+	// reuse [sluicecode.CodeBulkCopyTargetMissing] and its wording. At copy
+	// time a missing relation means schema-apply failed or wrote somewhere
+	// else — the copy is the first thing to touch the table after creation.
+	// By the index phase the table demonstrably existed and took rows, so the
+	// same SQLSTATE means something different and rarer: it was dropped, or
+	// altered out from under the run, BETWEEN the copy and the DDL. Pointing
+	// that operator at their schema-apply output would send them to look at a
+	// phase that provably worked.
+	//
+	// A missing COLUMN (42703 / 1054) lands here too and has a second cause
+	// worth naming: the index or constraint references a column the
+	// schema-apply phase never created, which is what a partially-applied or
+	// hand-edited target schema looks like at this phase.
+	{
+		phase:    PhaseIndexes,
+		contains: "does not exist",
+		hint: "the relation or column this index names is not on the target — but the table existed " +
+			"and took rows during the copy, so this is not a schema-apply failure. Something dropped or " +
+			"altered it between the copy and the index build (concurrent DDL against the target, or the " +
+			"target reset underneath the run), or the index references a column the schema-apply phase " +
+			"never created. The copied rows are intact; re-run the index phase once the target schema is " +
+			"settled.",
+		code: sluicecode.CodeIndexTargetMissing,
+	},
+	{
+		phase:    PhaseIndexes,
+		contains: "doesn't exist",
+		hint: "the relation or column this index names is not on the target — but the table existed " +
+			"and took rows during the copy, so this is not a schema-apply failure. Something dropped or " +
+			"altered it between the copy and the index build (concurrent DDL against the target, or the " +
+			"target reset underneath the run), or the index references a column the schema-apply phase " +
+			"never created. The copied rows are intact; re-run the index phase once the target schema is " +
+			"settled.",
+		code: sluicecode.CodeIndexTargetMissing,
+	},
+	{
+		phase:    PhaseConstraints,
+		contains: "does not exist",
+		hint: "the relation or column this constraint names is not on the target — but the table existed " +
+			"and took rows during the copy, so this is not a schema-apply failure. For a FOREIGN KEY the " +
+			"missing side is often the PARENT table, which a table-filtered run may never have been asked " +
+			"to create. Otherwise something dropped or altered it between the copy and the constraint " +
+			"phase. The copied rows are intact.",
+		code: sluicecode.CodeConstraintTargetMissing,
+	},
+	{
+		phase:    PhaseConstraints,
+		contains: "doesn't exist",
+		hint: "the relation or column this constraint names is not on the target — but the table existed " +
+			"and took rows during the copy, so this is not a schema-apply failure. For a FOREIGN KEY the " +
+			"missing side is often the PARENT table, which a table-filtered run may never have been asked " +
+			"to create. Otherwise something dropped or altered it between the copy and the constraint " +
+			"phase. The copied rows are intact.",
+		code: sluicecode.CodeConstraintTargetMissing,
+	},
+
 	{
 		phase:    PhaseIndexes,
 		contains: "maximum statement execution time",

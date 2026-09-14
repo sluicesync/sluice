@@ -8,6 +8,7 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -161,4 +162,61 @@ func nekiFunctionsNamedInSluice(t *testing.T) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// nekiFunctionSignature renders the signature(s) the router actually registers
+// for `__neki.<name>`, for splicing into a 42883 failure message.
+//
+// # Why this exists
+//
+// A `function f(unknown, unknown, jsonb, …) does not exist` from PostgreSQL is
+// almost never "the function is gone" — it is overload resolution failing,
+// because a PostgreSQL function's identity is (name, argument TYPES), and an
+// untyped literal resolves to `unknown` rather than to anything. The suite's
+// own premise check proves these functions exist by name, so a 42883 here is
+// always a signature question.
+//
+// The MoveTables arm used to answer that question with an instruction: "run
+// `SELECT * FROM __neki.list_metafuncs()` and update this call". Good advice
+// and unrunnable in practice — this suite destroys its database at the end of
+// every run, so by the time anyone reads the failure there is nothing left to
+// query. Each guess then costs a full dispatch: a provisioned cluster, several
+// minutes, and a real bill.
+//
+// So the run answers it itself, at the moment it still can. pg_proc is served
+// by the router (the existence probe above already depends on that), and
+// `pg_get_function_arguments` renders the exact argument list to write.
+//
+// Best-effort by construction: this decorates a failure that has already
+// happened, so it must never panic, never fail the test itself, and never turn
+// a clear error into a confusing one. Every problem it meets becomes a note in
+// the string.
+func nekiFunctionSignature(ctx context.Context, db *sql.DB, name string) string {
+	rows, err := db.QueryContext(ctx, `
+		SELECT pg_catalog.pg_get_function_arguments(p.oid)
+		  FROM pg_catalog.pg_proc p
+		  JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+		 WHERE n.nspname = '__neki' AND p.proname = $1
+		 ORDER BY 1`, name)
+	if err != nil {
+		return fmt.Sprintf("(could not read __neki.%s's signature from pg_proc: %v)", name, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var sigs []string
+	for rows.Next() {
+		var args string
+		if err := rows.Scan(&args); err != nil {
+			return fmt.Sprintf("(could not scan __neki.%s's signature: %v)", name, err)
+		}
+		sigs = append(sigs, fmt.Sprintf("__neki.%s(%s)", name, args))
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Sprintf("(reading __neki.%s's signature failed part-way: %v)", name, err)
+	}
+	if len(sigs) == 0 {
+		return fmt.Sprintf("(pg_proc registers NO function named __neki.%s at all — this one really is "+
+			"missing, rather than being an overload-resolution failure)", name)
+	}
+	return "the router registers:\n      " + strings.Join(sigs, "\n      ")
 }

@@ -54,6 +54,8 @@ const (
 	CodeIndexStatementTimeLimit  Code = "SLUICE-E-INDEX-STATEMENT-TIME-LIMIT"
 	CodeIndexDirectDDLDisabled   Code = "SLUICE-E-INDEX-DIRECT-DDL-DISABLED"
 	CodeIndexMissing             Code = "SLUICE-E-INDEX-MISSING"
+	CodeIndexTargetMissing       Code = "SLUICE-E-INDEX-TARGET-MISSING"
+	CodeConstraintTargetMissing  Code = "SLUICE-E-CONSTRAINT-TARGET-MISSING"
 	CodeCDCReplicationPermission Code = "SLUICE-E-CDC-REPLICATION-PERMISSION"
 	CodeCDCPoolerEndpoint        Code = "SLUICE-E-CDC-POOLER-ENDPOINT"
 	CodeCDCRowImagePartial       Code = "SLUICE-E-CDC-ROW-IMAGE-PARTIAL"
@@ -800,6 +802,8 @@ var registry = map[Code]Info{
 	CodeConnectAuthFailed:        {ClassRuntime, "database rejected the DSN credentials"},
 	CodeConnectDatabaseMissing:   {ClassRuntime, "the DSN names a database that does not exist"},
 	CodeBulkCopyTargetMissing:    {ClassRuntime, "bulk-copy target table not found on the target"},
+	CodeIndexTargetMissing:       {ClassRuntime, "the index phase met a missing relation or column — the target schema changed after the copy"},
+	CodeConstraintTargetMissing:  {ClassRuntime, "the constraint phase met a missing relation or column — the target schema changed after the copy"},
 	CodeBulkCopyTableFailed:      {ClassRuntime, "a table failed mid-bulk-copy; earlier tables lack secondary indexes"},
 	CodeBulkCopyNoPaginationKey:  {ClassRefusal, "the d1 reader refused a table with no unique orderable key it can keyset-paginate on (every implicit-rowid name shadowed by a declared column, or a WITHOUT ROWID table keyed only by a BLOB column) — refused rather than paginated on a non-unique column or by LIMIT/OFFSET"},
 	CodeBulkCopyRowCountMismatch: {ClassRefusal, "the d1 reader's server-side COUNT(*) before and after a table read agreed with each other but not with the rows pagination delivered — the reader lost or duplicated rows on a quiescent source"},
