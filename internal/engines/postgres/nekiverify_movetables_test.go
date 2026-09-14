@@ -235,9 +235,19 @@ func nekiMoveTablesBlocksWithNK213(ctx context.Context, t *testing.T, db *sql.DB
 			deadline := time.Now().Add(5 * time.Minute)
 			var last string
 			for time.Now().Before(deadline) {
+				// Called as a SCALAR expression, not a FROM-clause row source.
+				//
+				// `SELECT row_to_json(t)::text FROM …($1) t` was refused with
+				// `projection column … resolved to no input column` (XX000):
+				// the router does not build a row source out of this function
+				// the way stock PostgreSQL would. Its registered signature —
+				// recovered by the diagnostic below on 2026-09-14 —
+				// is `move_tables_status(in_workflow text DEFAULT NULL::text)`,
+				// so calling it and casting the result is the form that needs
+				// no assumption about shape at all.
 				var row string
 				if err := db.QueryRowContext(ctx,
-					`SELECT row_to_json(t)::text FROM __neki.move_tables_status($1) t`, workflow).Scan(&row); err != nil {
+					`SELECT __neki.move_tables_status($1)::text`, workflow).Scan(&row); err != nil {
 					return fmt.Errorf("poll move_tables_status: %w\n\n%s", err,
 						nekiFunctionSignature(ctx, db, "move_tables_status"))
 				}

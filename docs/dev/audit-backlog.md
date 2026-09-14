@@ -1777,7 +1777,26 @@ PlanetScale's Neki best-practices page says the **authoritative shard group "hol
 
 A YES there would beat the constant-shard-key fix outright: no DDL shape change, no target-dependent column, and the tables land where the platform's own guidance says metadata belongs. **The catch that survives a YES** is enrolment, not routing: `CREATE TABLE` does not enrol, so sluice would have to call `set_data_topology` itself — writing a **cluster-wide topology revision** as a side effect of creating a control table. That is far heavier than creating a table and deserves its own decision rather than arriving bundled with the fix. The probe reports the permission answer in the same call, since it is as decisive as the routing.
 
-**Not yet run** — added after the dispatch that answered the other two.
+**ANSWERED 2026-09-14, and it is a YES on BOTH halves — this is the fix.**
+
+```
+ANSWER: YES — a control table assigned to the AUTHORITATIVE shard group
+  "sh7xeak9f22vu6" accepts a shard-key-less INSERT and reads back unpinned.
+
+topology accepted the placement at revision 36020;
+  sluice's own role COULD write it
+```
+
+So the design is settled, and it is the best of the four candidates:
+
+- **No DDL shape change.** The control tables keep the definition they have on every other engine.
+- **No target-dependent column.** The constant-shard-key fix would have made control-table DDL depend on the target database's routing column — a first for any engine — and it is no longer needed.
+- **No operator prerequisite.** sluice's own role can write the topology, so enrolment happens at control-table creation and the operator never sees it.
+- **It is where the platform says this data belongs** — PlanetScale's own guidance puts metadata, catalog work and sequences in the authoritative group.
+
+**The one decision this does NOT settle, and it should not be smuggled in with the fix.** Enrolment means sluice issuing a **cluster-wide topology revision** as a side effect of creating a control table. That is a much heavier action than `CREATE TABLE` — it bumps a revision every router must converge on — and it wants its own answer to: is it idempotent on re-run; what happens when two sluice processes create control tables concurrently; and does it need an operator opt-out for a cluster where topology writes are governed. None of those is answered by this probe, and all are cheaper to answer before the fix than after.
+
+**The constant-shard-key result stays on file** as the fallback if the topology write turns out to be unacceptable for governance reasons rather than technical ones.
 
 **Reference tables and GSIs**, also named on that page, are NOT candidates on current evidence: the page documents neither's mechanics, GSIs map a lookup key to an owner row's shard key (control tables have no owner row), and "duplicate across shards" has different semantics for a *written* checkpoint than for a read-mostly lookup. Worth revisiting only if the mechanics get documented.
 

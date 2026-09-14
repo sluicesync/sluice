@@ -192,8 +192,14 @@ func nekiFunctionsNamedInSluice(t *testing.T) []string {
 // a clear error into a confusing one. Every problem it meets becomes a note in
 // the string.
 func nekiFunctionSignature(ctx context.Context, db *sql.DB, name string) string {
+	// Arguments AND the RETURN type. The first cut printed arguments only, and
+	// on 2026-09-14 that was the half that did not help: a poll of
+	// move_tables_status failed on its OUTPUT shape and the diagnostic dutifully
+	// reported `(in_workflow text DEFAULT NULL::text)` — correct, and silent
+	// about the only thing being asked. A signature is both halves.
 	rows, err := db.QueryContext(ctx, `
 		SELECT pg_catalog.pg_get_function_arguments(p.oid)
+		       || ') RETURNS ' || pg_catalog.pg_get_function_result(p.oid)
 		  FROM pg_catalog.pg_proc p
 		  JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
 		 WHERE n.nspname = '__neki' AND p.proname = $1
@@ -209,7 +215,7 @@ func nekiFunctionSignature(ctx context.Context, db *sql.DB, name string) string 
 		if err := rows.Scan(&args); err != nil {
 			return fmt.Sprintf("(could not scan __neki.%s's signature: %v)", name, err)
 		}
-		sigs = append(sigs, fmt.Sprintf("__neki.%s(%s)", name, args))
+		sigs = append(sigs, fmt.Sprintf("__neki.%s(%s", name, args))
 	}
 	if err := rows.Err(); err != nil {
 		return fmt.Sprintf("(reading __neki.%s's signature failed part-way: %v)", name, err)
