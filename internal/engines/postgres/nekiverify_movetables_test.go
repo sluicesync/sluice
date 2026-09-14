@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // Tier-2 coverage item #3: NK213 against a REAL MoveTables cutover.
@@ -318,10 +320,33 @@ func nekiMoveTablesBlocksWithNK213(ctx context.Context, t *testing.T, db *sql.DB
 		if annotated == nil {
 			t.Fatal("annotateNekiBlockedTable returned nil for a genuine NK213")
 		}
+		// Read the HINT, not Error().
+		//
+		// The first live run to reach this point (2026-09-14) reported all
+		// three names missing and looked like a product defect — an NK213
+		// refusal that diagnoses without remediating. It is not.
+		// annotateNekiBlockedTable puts the remedy in sluicecode.Wrap's HINT,
+		// and `CodedError.Error()` is `e.Err.Error()` — the wrapped error
+		// alone, by design. The hint reaches operators as a `hint` slog
+		// attribute via sluicecode.Attrs, not by being concatenated into the
+		// message.
+		//
+		// So the original assertion was reading a surface the remedy was never
+		// on, and would have failed forever while the product was correct.
+		// Third time this suite has asserted against the wrong ATTRIBUTE
+		// rather than the wrong value — the bisect arm compared SQLSTATE where
+		// the site was what differed, and the copy-limit probe counted open
+		// COPY commands where concurrent copies were the subject.
+		ce, ok := sluicecode.FromError(annotated)
+		if !ok {
+			t.Fatalf("the annotated refusal carries no sluicecode.CodedError, so it has no hint field at "+
+				"all and the remedy cannot reach an operator: %v", annotated)
+		}
+		remedy := ce.Hint
 		for _, want := range []string{"list_blocked_tables", "move_tables_status", "move_tables_reverse_traffic"} {
-			if !strings.Contains(annotated.Error(), want) && !strings.Contains(fmt.Sprint(annotated), want) {
-				t.Errorf("the annotated refusal does not name %q — the remedy an operator reads mid-incident "+
-					"is incomplete: %v", want, annotated)
+			if !strings.Contains(remedy, want) {
+				t.Errorf("the refusal's HINT does not name %q — the remedy an operator reads mid-incident "+
+					"is incomplete.\n\nhint: %s\n\nerror: %v", want, remedy, annotated)
 			}
 		}
 		t.Logf("premise holds: the write switch blocked the table and sluice classified it — %v", blockErr)
