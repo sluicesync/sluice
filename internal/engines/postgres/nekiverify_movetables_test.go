@@ -130,7 +130,7 @@ func nekiMoveTablesBlocksWithNK213(ctx context.Context, t *testing.T, db *sql.DB
 		// see oneDatabaseTopologyDoc for why. `postgres` is the source database
 		// named in the call below, and is the same one enrolTableInTopology
 		// writes the table into.
-		srcTopo, err := oneDatabaseTopologyDoc(ctx, db, "postgres")
+		srcTopo, err := oneDatabaseTopologyDoc(ctx, db, "postgres", table)
 		if err != nil {
 			t.Fatalf("read the source topology to pass to move_tables_create: %v", err)
 		}
@@ -375,18 +375,52 @@ func currentTopologyDoc(ctx context.Context, db *sql.DB) (string, error) {
 //
 // If this is still wrong, the failure prints the document's real key structure
 // (see topologyDocShape) and the next reader compares rather than guesses.
-func oneDatabaseTopologyDoc(ctx context.Context, db *sql.DB, database string) (string, error) {
+func oneDatabaseTopologyDoc(ctx context.Context, db *sql.DB, database, onlyTable string) (string, error) {
+	// Reduced to the ONE table being moved, which the 2026-09-14 run showed is
+	// required rather than merely tidy:
+	//
+	//	NK604: table public.sk_bad is in the populated database topology
+	//	       but not in source_tables
+	//
+	// `move_tables_create` cross-checks the topology it is handed against the
+	// `source_tables` array and refuses any table present in one and absent
+	// from the other. Both directions have to agree.
+	//
+	// The alternative — listing every enrolled table in source_tables — is the
+	// one the error literally suggests, and it is WRONG here: the fixture also
+	// enrols sk_good, sk_bad and uq_email, and the premise arms that run AFTER
+	// this one assert on those very tables. Moving them to another database
+	// mid-suite would break later arms in a way that looks like a platform
+	// change rather than like this arm's doing. Narrowing the document keeps
+	// the blast radius to mv_src.
 	var doc string
-	err := db.QueryRowContext(ctx,
-		`SELECT (__neki.get_data_topology()::jsonb -> 'databases' -> $1)::text`, database).Scan(&doc)
+	err := db.QueryRowContext(ctx, `
+		SELECT jsonb_set(
+		         d,
+		         ARRAY['schemas','public','tables'],
+		         jsonb_build_object($2::text, d -> 'schemas' -> 'public' -> 'tables' -> $2::text)
+		       )::text
+		  FROM (SELECT __neki.get_data_topology()::jsonb -> 'databases' -> $1::text AS d) t`,
+		database, onlyTable).Scan(&doc)
 	if err != nil {
-		return "", fmt.Errorf("get_data_topology for database %q: %w", database, err)
+		return "", fmt.Errorf("get_data_topology for database %q table %q: %w", database, onlyTable, err)
 	}
 	if strings.TrimSpace(doc) == "" || doc == "null" {
 		return "", fmt.Errorf(
 			"the topology document has no entry at databases.%s (got %q) — either the database is not "+
 				"enrolled, or the document's shape is not the one enrolTableInTopology writes to",
 			database, doc,
+		)
+	}
+	// Anti-vacuity on the reduction itself: dropping the one table it was
+	// meant to keep would produce a document move_tables_create refuses as
+	// "not in the populated database topology" — the opposite NK604 arm, and
+	// a confusing place to land from a helper that thinks it succeeded.
+	if !strings.Contains(doc, onlyTable) {
+		return "", fmt.Errorf(
+			"the reduced topology document does not mention %q (%s) — the reduction dropped the very "+
+				"table it was supposed to keep",
+			onlyTable, doc,
 		)
 	}
 	return doc, nil
