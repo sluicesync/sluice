@@ -4,6 +4,16 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.152.2] - 2026-09-14
+
+### Fixed
+
+**A missing relation during the index or constraint phase now carries a code and a hint, as the copy phase always has.** Point a copy at a target whose table is absent and the copy phase answers in milliseconds with `SLUICE-E-BULKCOPY-TARGET-TABLE-MISSING` and the question worth asking; hit the identical condition one phase later and it answered with a bare `pipeline: create indexes: … (SQLSTATE 42P01)` — no code to search for, no hint, nothing to act on. Two new codes, `SLUICE-E-INDEX-TARGET-MISSING` and `SLUICE-E-CONSTRAINT-TARGET-MISSING`, following the existing per-phase convention. **The hint is deliberately not the copy phase's, and that is the substance of the change:** at copy time a missing relation indicts schema-apply, but by the index phase the table demonstrably existed and took rows, so the same SQLSTATE means something later and rarer — dropped or altered between the copy and the DDL, or an index naming a column schema-apply never created. Sending that operator to audit schema-apply would point them at a phase that provably worked. The constraint arm names the likeliest real cause: a `FOREIGN KEY` whose PARENT sits outside a `--tables` selection. Found by the v0.152.1 regression cycle, which graded it and correctly declined to file it as a defect — the refusal was already loud and named the SQLSTATE, relation and phase.
+
+### Changed
+
+**The weekly live-Neki suite runs, and is earning its keep.** Not shipped behaviour, recorded because the findings bear on it: its first successful runs measured that the platform admits **at least 12** concurrent `COPY`s where sluice paces itself to 4 (filed as perf-parity gap 33 — a floor rather than a measurement, so the constant is unchanged), bisected the open `NK306` finding into **two** distinct problems sharing one SQLSTATE (sluice's control tables under the default shard group, which blocks both apply lanes, and the pipelined lane's data-table INSERT), and confirmed the shard key is not being dropped by sluice's column list. Two probes the suite added were themselves defective in ways only a live run exposed, which is the argument for the suite.
+
 ## [0.152.1] - 2026-09-13
 
 ### Fixed
