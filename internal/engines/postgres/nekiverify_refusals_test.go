@@ -149,6 +149,14 @@ func TestNekiverify_ShardedRefusalPremises(t *testing.T) {
 	nekiConcurrentCopyLimitHoldsOnTheCluster(ctx, t, fx, []int{tenantA, tenantB})
 	nekiShardKeyRequiredOnInsert(ctx, t, db, tenantA)
 
+	// Bisecting the open NK306 finding. These two run BEFORE the CDC arm on
+	// purpose: they answer "whose fault is it" independently of whether that
+	// arm passes, so a week where CDC fails still yields the diagnosis rather
+	// than only the symptom. sk_good is the fixture's own sharded table, so
+	// neither depends on the CDC arm having created anything.
+	nekiShardKeyIsNotReportedGenerated(ctx, t, db, "sk_good", "tenant_id")
+	nekiCDCSerialVsBatchedIntoSharded(ctx, t, db, fx, tenantA, tenantB)
+
 	// Coverage item #2: CDC into this sharded target, graded on ordered
 	// CONTENT rather than a row count.
 	nekiCDCIntoShardedTarget(ctx, t, db, fx, tenantA, tenantB)
