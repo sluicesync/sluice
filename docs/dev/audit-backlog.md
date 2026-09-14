@@ -1721,6 +1721,30 @@ Mutation-run in all three directions, mutants grep-confirmed present and reverte
 
 **The generalizable bit:** when one gate grades two classes, check whether its exemptions belong to *both*. An exemption argued from class A and applied to class B is invisible in review, because the rationale reads as sound — it is sound, about the other thing. The tell here was a comment explaining the exemption in terms of only one of the two patterns in the regex right above it.
 
+## 2026-09-14 — TESTFRAGILE-3: a fixed wall-clock budget on a test that only runs under the heaviest concurrency
+
+`TestMigrate_FastLoader_CrashMidFastChunk_ResumeIsIdempotent/postgres` has now failed on **two consecutive release tags** — v0.152.1 and v0.152.2 — with the identical shape:
+
+```
+resume Run: pipeline: create indexes: context deadline exceeded
+pipeline: state-write on failure: postgres: write migrate-state: context deadline exceeded
+```
+
+Both times at ~181s against the test's own `3*time.Minute` budget, i.e. it consumed the whole allowance rather than failing an assertion. Both times a rerun passed. The MySQL leg of the same test finishes in about 6 seconds.
+
+**It is not a regression, and the control says so rather than the reruns.** On the v0.152.2 tag the runtime delta was three files — `hints.go`, `sluicecode.go`, `docrows.go` — and the new hint-registry entries key on `does not exist` / `doesn't exist`, which a `context deadline exceeded` error matches under no reading. On the v0.152.1 tag the delta was entirely different and the failure identical. Same symptom, two unrelated deltas, is the signature of the environment rather than the code.
+
+**Why it fires on TAGS specifically, which is the part worth keeping.** Routine PR and branch pushes are Linux-only; the Windows matrix and the full job set join on **tag pushes**. So a tag-push CI runs materially more jobs concurrently than any run that came before it, and this test's budget is fixed. It is therefore most likely to blow at exactly the moment it is most expensive — during a release, on the check that gates publish.
+
+**Same class as TESTFRAGILE-1 and -2** (the grow-gate pins, both fixed on 2026-09-13 by moving them off the wall clock), with one difference that rules out the same remedy: those were unit tests with an injectable clock, and this one drives real containers through a real crash-and-resume. There is no fake clock to reach for.
+
+**Not fixed here, deliberately** — changing a budget mid-release is how a flake becomes a masked regression. The shape of a fix, for whoever takes it:
+
+- raise the budget for the Postgres leg specifically (it is ~30× the MySQL leg's runtime, so a single shared constant is already the wrong instrument), or
+- make the budget a function of observed progress rather than of wall clock — the test knows how many rows committed, so a deadline that resets on progress distinguishes "stalled" from "slow", which is the distinction the current budget cannot make.
+
+The second is the honest one: a fixed deadline on a loaded runner cannot tell a hung resume from a contended one, and that is precisely the ambiguity that made both tag failures cost a rerun and a diagnosis.
+
 ## 2026-09-13 — a verdict-reversing wrapper must implement the verdict it reverses
 
 The single most useful finding of the v0.152.1 pre-tag reviews, and the one most likely to recur elsewhere in this codebase.
