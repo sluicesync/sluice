@@ -163,6 +163,12 @@ func nekiMoveTablesBlocksWithNK213(ctx context.Context, t *testing.T, db *sql.DB
 			return err
 		}); err != nil {
 			t.Fatalf("move_tables_create: %v\n\n"+
+				"If this is a 22023 'invalid source topology JSON', the ARGUMENT SHAPE is wrong rather "+
+				"than the signature — the call now resolves (the ::text casts fixed that on 2026-09-14) "+
+				"and the function is rejecting the document's CONTENT. What is being passed is the FULL "+
+				"cluster document from __neki.get_data_topology(); the parameter is named "+
+				"`source_database_topology`, singular, so the likely shape is one DATABASE's sub-document "+
+				"rather than the whole thing. The structure actually returned, to compare against: %s\n\n"+
 				"If this is an NK604 'not found in the populated database topology', the enrolment step "+
 				"above no longer does what it did on 2026-09-10.\n\n"+
 				"If it is a 42883 signature error, note that the suite's own premise check proves this "+
@@ -171,7 +177,7 @@ func nekiMoveTablesBlocksWithNK213(ctx context.Context, t *testing.T, db *sql.DB
 				"literal resolves to `unknown` rather than to anything, so the fix is usually an explicit "+
 				"cast on each literal rather than a different argument count. %s\n\n"+
 				"Do NOT relax the test — the arm it guards is a terminal refusal.",
-				err, nekiFunctionSignature(ctx, db, "move_tables_create"))
+				err, topologyDocShape(ctx, db), nekiFunctionSignature(ctx, db, "move_tables_create"))
 		}
 		t.Cleanup(func() {
 			cctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
@@ -340,4 +346,31 @@ func currentTopologyDoc(ctx context.Context, db *sql.DB) (string, error) {
 		return "", fmt.Errorf("get_data_topology returned an empty document")
 	}
 	return doc, nil
+}
+
+// topologyDocShape renders the top-level keys of the cluster topology document
+// and, if present, the keys one level inside `databases`, for splicing into a
+// failure message.
+//
+// It exists for the same reason nekiFunctionSignature does: the suite destroys
+// its database at the end of every run, so "go and look at the document" is an
+// instruction nobody can follow by the time they read the failure, and every
+// guess costs a provisioned cluster. Printing the shape at the moment it is
+// still readable turns the next fix into a comparison rather than a guess.
+//
+// Best-effort: this decorates a failure that has already happened, so every
+// problem it meets becomes a note in the string.
+func topologyDocShape(ctx context.Context, db *sql.DB) string {
+	var top, inner string
+	err := db.QueryRowContext(ctx, `
+		SELECT
+		  coalesce((SELECT string_agg(k, ', ' ORDER BY k)
+		              FROM jsonb_object_keys(__neki.get_data_topology()::jsonb) k), '(none)'),
+		  coalesce((SELECT string_agg(k, ', ' ORDER BY k)
+		              FROM jsonb_object_keys(__neki.get_data_topology()::jsonb -> 'databases') k), '(no databases key)')
+	`).Scan(&top, &inner)
+	if err != nil {
+		return fmt.Sprintf("(could not read the topology document's shape: %v)", err)
+	}
+	return fmt.Sprintf("top-level keys = [%s]; databases.* = [%s]", top, inner)
 }

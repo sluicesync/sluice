@@ -10,6 +10,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -41,12 +42,31 @@ import (
 // rather than fixed. These two arms decide it, and they decide it every week
 // rather than once.
 //
-// Between them the answer is mechanical:
+// Between them the answer is mechanical — and the verdicts turn on WHERE each
+// lane failed, not merely on the SQLSTATE, which is the same in every NK306:
 //
-//	generated-flag arm FAILS          -> (a). sluice's bug, in NonGeneratedRowKeys.
-//	serial PASSES, batch FAILS        -> (b). The pipelined lane is the differentiator.
-//	both apply paths FAIL             -> neither; the problem is upstream of both
-//	                                     and the CDC arm's framing needs revisiting.
+//	generated-flag arm FAILS              -> (a). sluice's bug, in NonGeneratedRowKeys.
+//	serial fails at its POSITION WRITE,
+//	  batch fails on the DATA TABLE       -> (b), plus a SECOND finding. See below.
+//	both fail on their DATA TABLE         -> the lane is not the variable.
+//	both succeed                          -> neither explains the CDC arm; the
+//	                                         variable is in that arm's own shape.
+//
+// # Measured 2026-09-14, and it is the second row
+//
+//	SERIAL : postgres: write position: … NK306        <- sluice's CONTROL table
+//	BATCHED: insert into public.nk306_batch: … NK306  <- the DATA table
+//
+// Two findings sharing one code. `Apply` writes the position LAST and inside
+// the same transaction as the data, so a serial lane that reached its position
+// write executed its data statements without error — meaning the serial DATA
+// insert is fine, and what failed is sluice's own control table under the
+// default shard group.
+//
+// The first cut of this arm compared SQLSTATEs alone, concluded "both NK306,
+// so the lane is not the variable", and was confidently wrong. Two
+// observations agreed on the one attribute it compared and differed on the one
+// that mattered.
 
 // nekiShardKeyIsNotReportedGenerated tests candidate (a) at its mechanism.
 //
@@ -202,10 +222,56 @@ func nekiCDCSerialVsBatchedIntoSharded(ctx context.Context, t *testing.T, db *sq
 		t.Logf("SERIAL  : err=%v rows=%d", serialErr, serialRows)
 		t.Logf("BATCHED : err=%v rows=%d", batchErr, batchRows)
 
+		// WHERE a lane failed, not just WITH WHAT. The first cut of this arm
+		// compared SQLSTATEs alone and reported "both NK306, so the lane is
+		// not the variable" — which was wrong, and wrong in the confident
+		// direction. The live run showed the two lanes failing in different
+		// PLACES:
+		//
+		//	SERIAL : postgres: write position: … NK306        <- sluice's CONTROL table
+		//	BATCHED: insert into public.nk306_batch: … NK306  <- the DATA table
+		//
+		// Those are two different findings that happen to share a code. The
+		// serial lane reaching its position write means its data statements
+		// executed without error — the position write is the last thing Apply
+		// does inside the same transaction — so the serial DATA insert was
+		// fine and it died on sluice's own control table, which is the
+		// already-documented "the default shard group covers public, so every
+		// INSERT into sluice's control tables needs a shard key it has not
+		// got" problem.
+		//
+		// Matching on the code alone erased exactly the distinction this arm
+		// exists to draw. It is the evidence-sharing failure in miniature: two
+		// observations agreed on the one attribute being compared and differed
+		// on the one that mattered.
+		failedAtPosition := func(err error) bool {
+			return err != nil && strings.Contains(err.Error(), "write position")
+		}
+		failedAtDataTable := func(err error, tbl string) bool {
+			return err != nil && strings.Contains(err.Error(), tbl)
+		}
+
 		serialNK306 := isPGCode(serialErr, "NK306")
 		batchNK306 := isPGCode(batchErr, "NK306")
 
 		switch {
+		case serialNK306 && failedAtPosition(serialErr) && batchNK306 && failedAtDataTable(batchErr, batchTable):
+			t.Fatalf("BISECTED, and the two lanes failed in DIFFERENT PLACES.\n\n"+
+				"serial: %v\nbatch:  %v\n\n"+
+				"The SERIAL lane reached its POSITION WRITE, which Apply does last and inside the same "+
+				"transaction as the data — so its data INSERT executed fine and it was refused on "+
+				"sluice's own CONTROL TABLE. That is the separate, already-documented problem: the "+
+				"default shard group covers `public`, so every INSERT into sluice's control tables needs "+
+				"a shard key they do not carry.\n\n"+
+				"The BATCHED lane was refused on the DATA table itself. So for the DATA insert the LANE "+
+				"IS the variable, and the pipelined path is what cannot present the shard key in a form "+
+				"the router routes on.\n\n"+
+				"TWO fixes, not one:\n"+
+				"  (1) the control tables need a shard key, or need to live outside the shard group — "+
+				"this blocks BOTH lanes and is the wider problem\n"+
+				"  (2) the pipelined lane's INSERT shape needs to carry the shard key routably, or a "+
+				"sharded Neki target must not select that lane", serialErr, batchErr)
+
 		case serialErr == nil && batchNK306:
 			// THE ANSWER, if this is what comes back.
 			t.Fatalf("BISECTED: the SERIAL lane applied all %d rows and the BATCHED lane was refused "+
@@ -215,12 +281,21 @@ func nekiCDCSerialVsBatchedIntoSharded(ctx context.Context, t *testing.T, db *sq
 				"shard key in a form the router cannot route on at prepare time. The fix belongs in "+
 				"lane selection for a sharded Neki target, NOT in buildInsertSQL.", serialRows, batchErr)
 
-		case serialNK306 && batchNK306:
-			t.Fatalf("BOTH lanes were refused with NK306, so the lane is NOT the variable.\n\n"+
-				"serial: %v\nbatch:  %v\n\n"+
+		case serialNK306 && batchNK306 &&
+			failedAtDataTable(serialErr, serialTable) && failedAtDataTable(batchErr, batchTable):
+			t.Fatalf("BOTH lanes were refused ON THEIR DATA TABLE with NK306, so the lane is NOT the "+
+				"variable.\n\nserial: %v\nbatch:  %v\n\n"+
 				"That rules out the pipelined-path hypothesis and points back at what both lanes share "+
 				"— the statement builder or the column list. Check the generated-flag arm's verdict "+
 				"alongside this one.", serialErr, batchErr)
+
+		case serialNK306 && batchNK306:
+			t.Fatalf("both lanes hit NK306 but NOT in a pattern this arm has a reading for — check the "+
+				"SITES before concluding anything.\n\nserial: %v\nbatch:  %v\n\n"+
+				"The code is the same in every NK306 failure and says nothing about which statement was "+
+				"refused. What distinguishes the findings is WHERE: sluice's control table (a position "+
+				"write) is the documented shard-group problem; the data table is the CDC arm's. Do not "+
+				"collapse them.", serialErr, batchErr)
 
 		case serialErr == nil && batchErr == nil:
 			// Both lanes work. Informative and worth saying loudly: it means

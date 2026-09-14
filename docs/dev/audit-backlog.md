@@ -1812,3 +1812,29 @@ A third was caught before it ever ran, during a local mechanism check against `p
 
 **The MoveTables arm costs 17 minutes of setup.** `create_and_enrol_table` took **1007.1s** on the run where enrolment first succeeded — topology propagation across every router, not a hang. The arm's own timing log exists to decide "weekly schedule or dispatch input", and this is the number it was waiting for: it roughly doubles the suite's wall clock. Worth deciding deliberately rather than absorbing.
 
+> **CORRECTED 2026-09-14 by the next run: 1007s was an OUTLIER, not a standing cost.** The identical step took **0.2s** on the following run — same code, same fresh cluster, same call. So enrolment cost is *highly variable* (0.2s to 1007s observed across two runs), and the paragraph above generalised from a single sample. The honest statement is that topology propagation can occasionally take seventeen minutes, which is a reason for the arm's timeout to be generous, not a reason to move it off the weekly. The original wording is left standing rather than edited because the mistake — one measurement read as a cost — is the part worth not repeating.
+
+### Fourth run (2026-09-14) — the bisect answered, and caught my own gate comparing the wrong thing
+
+**NK306 BISECTED, and it is TWO findings sharing one SQLSTATE.** The measured pair:
+
+```
+SERIAL : postgres: write position: … NK306                  <- sluice's CONTROL table
+BATCHED: insert into public.nk306_batch: … NK306            <- the DATA table
+```
+
+`Apply` writes the position **last**, inside the same transaction as the data — so a serial lane that reached its position write had already executed its data statements without error. **The serial DATA insert is fine.** What failed there is sluice's own control table, which is the separately-documented problem: the default shard group covers `public`, so every INSERT into `sluice_cdc_state` and friends needs a shard key those tables do not carry. The batched lane, by contrast, was refused on the data table itself.
+
+So there are two distinct fixes, and the control-table one is the wider of them because it blocks **both** lanes:
+
+1. **The control tables need a shard key, or need to live outside the shard group.** Already visible in prose since 2026-09-10 (the 40-row keyless table that held 80 rows after a resume); now confirmed to block CDC *apply*, not just migrate breadcrumbs.
+2. **The pipelined lane cannot present the shard key routably** on a data-table INSERT, where the serial lane can.
+
+**Candidate (a) is RULED OUT.** The new catalog arm passed: `public.sk_good.tenant_id` reports `attgenerated=''`, an ordinary column, so `NonGeneratedRowKeys` is not dropping it.
+
+**And the bisect arm's own verdict was WRONG on this data.** It compared SQLSTATEs alone, saw NK306 on both sides, and reported *"both lanes were refused, so the lane is NOT the variable"* — the opposite of what the evidence says. Two observations agreed on the one attribute it compared and differed on the one that mattered. Fixed to discriminate on the failure **site**, with a named verdict for the different-sites case. This is the evidence-sharing rule at gate level: a check that compares the wrong attribute is not a weaker check, it is a confidently wrong one.
+
+**NEKI-COPYLIMIT: at least 12, and the per-shard hypothesis is REFUTED.** The probe now sends a real row per session and alternates tenants across both shards; all twelve were accepted, none refused. A per-shard limit of 4 on a two-shard fixture would have presented as 8, so that explanation is dead. Either the platform's limit was raised well beyond 4, or it does not apply to this shape at all. `nekiConcurrentCopyLimit = 4` remains unchanged — the arm still reports a floor rather than a measurement, and raising a shipped constant on "at least 12" would repeat the mistake the arm's own message warns about.
+
+**`move_tables_create` now RESOLVES.** The `::text` casts fixed the signature (no more 42883); it fails on content — `invalid source topology JSON (SQLSTATE 22023)`. The call passes the whole cluster document from `get_data_topology()`, while the parameter is `source_database_topology`, singular, so the likely shape is one database's sub-document. The arm now prints the document's actual key structure on failure, so the next run answers it rather than costing another guess.
+
