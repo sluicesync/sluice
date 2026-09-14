@@ -126,7 +126,11 @@ func nekiMoveTablesBlocksWithNK213(ctx context.Context, t *testing.T, db *sql.DB
 			_, _ = db.ExecContext(cctx, `DROP DATABASE IF EXISTS `+moveTgt)
 		})
 
-		srcTopo, err := currentTopologyDoc(ctx, db)
+		// The SOURCE database's own sub-document, not the whole cluster one —
+		// see oneDatabaseTopologyDoc for why. `postgres` is the source database
+		// named in the call below, and is the same one enrolTableInTopology
+		// writes the table into.
+		srcTopo, err := oneDatabaseTopologyDoc(ctx, db, "postgres")
 		if err != nil {
 			t.Fatalf("read the source topology to pass to move_tables_create: %v", err)
 		}
@@ -164,11 +168,15 @@ func nekiMoveTablesBlocksWithNK213(ctx context.Context, t *testing.T, db *sql.DB
 		}); err != nil {
 			t.Fatalf("move_tables_create: %v\n\n"+
 				"If this is a 22023 'invalid source topology JSON', the ARGUMENT SHAPE is wrong rather "+
-				"than the signature — the call now resolves (the ::text casts fixed that on 2026-09-14) "+
-				"and the function is rejecting the document's CONTENT. What is being passed is the FULL "+
-				"cluster document from __neki.get_data_topology(); the parameter is named "+
-				"`source_database_topology`, singular, so the likely shape is one DATABASE's sub-document "+
-				"rather than the whole thing. The structure actually returned, to compare against: %s\n\n"+
+				"than the signature — the call resolves (the ::text casts fixed that on 2026-09-14) and "+
+				"the function is rejecting the document's CONTENT.\n\n"+
+				"TWO shapes have now been tried and this message must say which one you are looking at. "+
+				"The 2026-09-14 run passed the FULL cluster document and was refused; this call passes "+
+				"one DATABASE's sub-document (`databases.postgres`), inferred from the parameter's "+
+				"singular name and from the path enrolTableInTopology writes to. If BOTH are refused, "+
+				"stop inferring from names — the document below is the ground truth to read, and "+
+				"__neki.list_metafuncs() may publish the expected shape.\n\n"+
+				"The document's actual structure: %s\n\n"+
 				"If this is an NK604 'not found in the populated database topology', the enrolment step "+
 				"above no longer does what it did on 2026-09-10.\n\n"+
 				"If it is a 42883 signature error, note that the suite's own premise check proves this "+
@@ -344,6 +352,42 @@ func currentTopologyDoc(ctx context.Context, db *sql.DB) (string, error) {
 	}
 	if strings.TrimSpace(doc) == "" {
 		return "", fmt.Errorf("get_data_topology returned an empty document")
+	}
+	return doc, nil
+}
+
+// oneDatabaseTopologyDoc returns the sub-document for a SINGLE database, which
+// is what `move_tables_create`'s topology parameters appear to want.
+//
+// # Why this is an inference and not a guess
+//
+// The 2026-09-14 run got past signature resolution and was refused with
+// `invalid source topology JSON (SQLSTATE 22023)` — so the function accepted
+// the call and rejected the CONTENT. What it was handed is the whole cluster
+// document from [currentTopologyDoc].
+//
+// Two things point at the sub-document. The parameter is named
+// `source_database_topology` — DATABASE, singular, alongside a separate
+// `source_db` naming which one. And [enrolTableInTopology], in this same file,
+// already tells us the document's shape: it writes to the path
+// `databases → <db> → schemas → public → tables → <table>`, so
+// `databases.<db>` is exactly "one database's topology" as a standalone value.
+//
+// If this is still wrong, the failure prints the document's real key structure
+// (see topologyDocShape) and the next reader compares rather than guesses.
+func oneDatabaseTopologyDoc(ctx context.Context, db *sql.DB, database string) (string, error) {
+	var doc string
+	err := db.QueryRowContext(ctx,
+		`SELECT (__neki.get_data_topology()::jsonb -> 'databases' -> $1)::text`, database).Scan(&doc)
+	if err != nil {
+		return "", fmt.Errorf("get_data_topology for database %q: %w", database, err)
+	}
+	if strings.TrimSpace(doc) == "" || doc == "null" {
+		return "", fmt.Errorf(
+			"the topology document has no entry at databases.%s (got %q) — either the database is not "+
+				"enrolled, or the document's shape is not the one enrolTableInTopology writes to",
+			database, doc,
+		)
 	}
 	return doc, nil
 }
