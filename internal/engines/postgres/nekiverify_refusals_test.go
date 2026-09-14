@@ -138,6 +138,17 @@ func TestNekiverify_ShardedRefusalPremises(t *testing.T) {
 		nekiRemedyFunctionsExist(ctx, t, db)
 	})
 
+	// The platform facts sluice COMPILES IN, measured rather than trusted.
+	// Both ride this fixture — neither needs a second database, and a database
+	// is minutes of wall clock and a real bill.
+	//
+	// These are the premise-naming rule applied where it can actually be
+	// applied: nekiConcurrentCopyLimit and the mandatory shard key are claims
+	// about somebody else's platform baked into shipped behaviour, and a unit
+	// test can only ever prove sluice agrees with itself about them.
+	nekiConcurrentCopyLimitHoldsOnTheCluster(ctx, t, fx)
+	nekiShardKeyRequiredOnInsert(ctx, t, db, tenantA)
+
 	// Coverage item #2: CDC into this sharded target, graded on ordered
 	// CONTENT rather than a row count.
 	nekiCDCIntoShardedTarget(ctx, t, db, fx, tenantA, tenantB)
