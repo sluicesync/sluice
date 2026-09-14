@@ -71,7 +71,7 @@ func nekiMoveTablesBlocksWithNK213(ctx context.Context, t *testing.T, db *sql.DB
 			total := time.Duration(0)
 			for _, k := range []string{
 				"create_target_database", "create_and_enrol_table",
-				"move_tables_create", "switch_reads", "switch_writes",
+				"move_tables_create", "await_streaming", "switch_reads", "switch_writes",
 				"observe_block", "reverse_traffic", "cleanup",
 			} {
 				if d, ok := timings[k]; ok {
@@ -201,6 +201,46 @@ func nekiMoveTablesBlocksWithNK213(ctx context.Context, t *testing.T, db *sql.DB
 			`INSERT INTO `+table+` (tenant_id, id, payload) VALUES (1,2,'during-create')`); err != nil {
 			t.Fatalf("the table stopped accepting writes at move_tables_create, which the 2026-09-10 "+
 				"measurement recorded as TRANSPARENT — the premise moved: %v", err)
+		}
+
+		// WAIT FOR THE WORKFLOW TO REACH running/streaming BEFORE SWITCHING.
+		//
+		// Measured 2026-09-14: `move_tables_create` now succeeds (the narrowed
+		// topology fixed NK604), and the very next call was refused —
+		//
+		//	workflow … stream … on shard … is running/initializing,
+		//	not running/streaming; start the workflow and let it [catch up]
+		//
+		// — because create RETURNS as soon as the workflow is accepted, not
+		// when its per-shard streams are caught up. This is the same shape as
+		// the online-DDL trap already recorded for the index path: the
+		// top-level call tells you nothing useful about readiness, and the
+		// real signal is per-shard and has to be polled. A sequence written
+		// from the happy-path call order alone will always fail here.
+		if err := phase("await_streaming", func() error {
+			deadline := time.Now().Add(5 * time.Minute)
+			var last string
+			for time.Now().Before(deadline) {
+				var status string
+				if err := db.QueryRowContext(ctx,
+					`SELECT status FROM __neki.move_tables_status($1)`, workflow).Scan(&status); err != nil {
+					return fmt.Errorf("poll move_tables_status: %w", err)
+				}
+				last = status
+				if strings.Contains(status, "streaming") {
+					return nil
+				}
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(2 * time.Second):
+				}
+			}
+			return fmt.Errorf("the workflow never reached running/streaming within 5m (last status %q) — "+
+				"it is not a hang in sluice, it is the per-shard copy still catching up; raise the wait "+
+				"if a larger fixture is ever used here", last)
+		}); err != nil {
+			t.Fatalf("waiting for the MoveTables workflow to start streaming: %v", err)
 		}
 
 		// Phase 2 — switch reads. Measured transparent for a Postgres client.

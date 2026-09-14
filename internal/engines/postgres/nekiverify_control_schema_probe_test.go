@@ -172,3 +172,124 @@ func nekiControlTableSchemaProbe(ctx context.Context, t *testing.T, db *sql.DB) 
 		}
 	})
 }
+
+// nekiControlTableShardKeyProbe is the follow-on, and since 2026-09-14 it is
+// the DECIDING question for NK306's control-table half.
+//
+// The schema probe above answered NO: a shard-key-less control table in its own
+// schema is refused with NK306 exactly as one in `public` is, so the default
+// shard group reaches unlisted schemas too. That kills the clean fix and leaves
+// one candidate — give the control tables a shard-key column — whose viability
+// turns on questions nobody has asked a live router.
+//
+// It probes the FULL control-table lifecycle rather than an INSERT, because
+// that is what sluice actually does with these tables and each step can fail
+// differently:
+//
+//	INSERT  — the position row is created once per stream
+//	UPDATE  — every committed batch rewrites source_position. This is the one
+//	          most likely to break: the suite separately proves a sharded Neki
+//	          refuses an UPDATE that NAMES the shard key in its SET list, even
+//	          assigned its own value, so a control-table update must be written
+//	          to leave the routing column alone.
+//	SELECT  — resume reads it back, unpinned. A row that landed somewhere an
+//	          ordinary read cannot see is indistinguishable from a lost one.
+//
+// A CONSTANT shard-key value is used deliberately. sluice has no per-tenant
+// meaning to put in a CDC position row, so whatever it writes there is
+// arbitrary — which means every control row routes to ONE shard. Whether the
+// router accepts that, and whether the rows stay readable, is precisely what
+// has to be known before the fix is designed rather than after.
+func nekiControlTableShardKeyProbe(ctx context.Context, t *testing.T, db *sql.DB, shardKey string) {
+	t.Helper()
+
+	t.Run("PROBE: does a control table with a CONSTANT shard key survive its lifecycle?", func(t *testing.T) {
+		const tbl = "probe_ctl_shardkey"
+
+		t.Cleanup(func() {
+			cctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+			_, _ = db.ExecContext(cctx, `DROP TABLE IF EXISTS public.`+tbl)
+		})
+
+		// sluice_cdc_state's real shape plus the routing column. The shard key
+		// is NOT in the primary key: stream_id is what identifies a row, and
+		// making the routing column part of the identity would change what the
+		// table MEANS on every engine, not just this one.
+		if _, err := db.ExecContext(ctx, `CREATE TABLE public.`+tbl+` (
+			`+shardKey+`      int          NOT NULL,
+			stream_id       VARCHAR(255) NOT NULL,
+			source_position TEXT         NOT NULL,
+			updated_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY (stream_id)
+		)`); err != nil {
+			t.Fatalf("ANSWER: the control table cannot even be CREATED with the shard key outside its "+
+				"primary key: %v\n\nThat constrains the fix hard — the routing column would have to join "+
+				"the PRIMARY KEY, which changes what the table identifies on every engine and not just "+
+				"this one.", err)
+		}
+
+		// INSERT — several rows, all on the same constant key, as sluice would.
+		for i, stream := range []string{"stream-a", "stream-b", "stream-c"} {
+			if _, err := db.ExecContext(ctx,
+				`INSERT INTO public.`+tbl+` (`+shardKey+`, stream_id, source_position) VALUES (0, $1, $2)`,
+				stream, "tok-"+stream); err != nil {
+				t.Fatalf("ANSWER: INSERT %d with a CONSTANT shard key of 0 was refused: %v\n\n"+
+					"The remaining NK306 candidate depends on this working. If a constant is refused, "+
+					"sluice would have to invent a meaningful per-row routing value for bookkeeping that "+
+					"has no per-tenant meaning — and there is no honest one to invent.", i, err)
+			}
+		}
+
+		// UPDATE — the position write, the step most likely to break. The SET
+		// list deliberately does NOT name the shard key.
+		res, err := db.ExecContext(ctx,
+			`UPDATE public.`+tbl+` SET source_position = $1, updated_at = CURRENT_TIMESTAMP
+			 WHERE stream_id = $2`, "tok-advanced", "stream-b")
+		if err != nil {
+			t.Fatalf("ANSWER: the POSITION WRITE was refused: %v\n\n"+
+				"This is the step every committed CDC batch performs, so a refusal here kills the "+
+				"candidate outright even though the INSERT worked. Note the SET list does not name the "+
+				"shard key — the suite separately proves naming it is refused — so this is the "+
+				"best-case form of the statement.", err)
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			t.Fatalf("ANSWER: the position write reported %d rows affected, not 1.\n\n"+
+				"A control-table UPDATE that matches nothing is the silent half of this problem: sluice "+
+				"would believe it had checkpointed while the stored position never moved, and a resume "+
+				"would replay from an older token.", n)
+		}
+
+		// SELECT — unpinned, the way resume reads it.
+		var got string
+		if err := db.QueryRowContext(ctx,
+			`SELECT source_position FROM public.`+tbl+` WHERE stream_id = $1`, "stream-b").Scan(&got); err != nil {
+			t.Fatalf("ANSWER: the row could not be read back unpinned: %v\n\n"+
+				"Resume reads these tables without a shard pin. A row that is written and not readable "+
+				"is worse than a refusal.", err)
+		}
+		if got != "tok-advanced" {
+			t.Fatalf("ANSWER: the position read back as %q, not the value just written.\n\n"+
+				"The update landed somewhere the read does not see — which for a checkpoint is silent "+
+				"divergence rather than a loud failure.", got)
+		}
+
+		var n int
+		if err := db.QueryRowContext(ctx, `SELECT count(*) FROM public.`+tbl).Scan(&n); err != nil {
+			t.Fatalf("count: %v", err)
+		}
+		if n != 3 {
+			t.Fatalf("ANSWER: an unpinned count returned %d of 3 control rows — some are not visible "+
+				"without a shard pin, and resume does not pin", n)
+		}
+
+		t.Logf("ANSWER: YES — a control table carrying a CONSTANT shard key (outside its primary key) "+
+			"takes INSERTs, accepts the position UPDATE without naming the routing column, and reads "+
+			"back unpinned with all %d rows visible.\n\n"+
+			"So the remaining NK306 candidate is viable: add the routing column, discovered from the "+
+			"topology, with an arbitrary constant. The cost is that control-table DDL becomes "+
+			"TARGET-DEPENDENT — the column's name and type come from the database — which it has never "+
+			"been on any engine, and it remains a STATE-FORMAT change that a binary written against the "+
+			"old shape must still be able to read.", n)
+	})
+}
