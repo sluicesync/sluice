@@ -1721,6 +1721,48 @@ Mutation-run in all three directions, mutants grep-confirmed present and reverte
 
 **The generalizable bit:** when one gate grades two classes, check whether its exemptions belong to *both*. An exemption argued from class A and applied to class B is invisible in review, because the rationale reads as sound — it is sound, about the other thing. The tell here was a comment explaining the exemption in terms of only one of the two patterns in the regex right above it.
 
+## 2026-09-14 — NK306's control-table half: what the fix needs before it can be designed
+
+The bisect established the defect: **sluice's own control tables cannot be written on a sharded Neki.** The default shard group covers `public`, so every INSERT into `sluice_cdc_state`, `sluice_migrate_state` and `sluice_cdc_skipped_tables` is refused for want of a shard key those tables do not carry. It blocks **both** apply lanes and is the wider of the two NK306 findings.
+
+**The structural fact that shapes every option.** Neki's topology declares `shard_group` **per table**, in an operator-declared document:
+
+```json
+"schemas": {"public": {"tables": {
+    "sk_good":  {"shard_group": "nv_group"},
+    "sk_bad":   {"shard_group": "nv_group"}
+}}}
+```
+
+And `CREATE TABLE` does **not** enrol a table into it — proven by the MoveTables arm, which was refused with `NK604` for a table that plainly existed and held rows. So a control table sluice creates is, by construction, absent from the document and falls to the default sharded group. **sluice cannot fix this by creating the table differently.** That is the constraint that rules out the obvious approach.
+
+### The three candidate designs, and what is unknown about each
+
+1. **Give the control tables a shard-key column.** sluice can read `__neki.get_data_topology()` and the refusal names the column outright (`shard-key column "tenant_id" of primary index 0`), so discovering it is tractable. **Unknown:** whether a *constant* value is acceptable — a single-valued shard key routes every control row to one shard, which may be fine or may be refused. Also unknown: the column's TYPE varies per database, so the control-table DDL becomes target-dependent, which it has never been on any engine.
+
+2. **Put the control tables in a schema outside the shard group.** The topology path is `databases.<db>.schemas.<schema>.tables.<t>`, so schemas are addressable and a non-`public` schema might be unsharded. **Unknown, and it is the cheapest to answer:** does an unlisted schema fall outside the shard group, or into the default? If outside, this is much the cleanest fix — no DDL shape change, no target-dependent columns.
+
+3. **Require the operator to enrol sluice's control tables.** Rejected on its face unless 1 and 2 both fail: it makes a migration tool's own bookkeeping a manual prerequisite, and the `NK604` refusal an operator would hit gives no hint that sluice is what needs enrolling.
+
+### What is needed before any of this is designed
+
+- **Answer unknown 2 first** — one topology write and one INSERT against the live fixture decides whether option 2 works, and it is by far the best outcome. A nekiverify arm can answer it, and should, before anyone writes code.
+- **Then unknown 1's constant-value question**, only if 2 fails.
+- **Treat it as a STATE-FORMAT change.** These tables are what `--resume` and every warm CDC start read. Moving them or changing their shape has resume-compatibility consequences on every engine, not just Neki, and falls squarely under CLAUDE.md's new-surface checklist: anything that round-trips through a store is a codec. A control table that moves schema must still be FOUND by a binary that wrote it to the old location, or the run reads "never copied" for a table that was — which is the `SLUICE-E-MIGRATE-STATE-WRITE` silent-duplication shape the code already documents.
+- **Sibling sweep, stated up front:** there are three control tables and at least four writers (migrate breadcrumbs, CDC position, the skipped-table ledger, and restore's migrate-state). A fix that reaches one is the recurring failure this file is full of.
+
+**Do not start with code.** The cheapest decisive experiment is a topology probe, and it is one nekiverify arm.
+
+## 2026-09-14 — FILED, blocked on the above: backup/restore has never been run against Neki
+
+No nekiverify arm touches backup, and the backup package's **only** Neki reference is a comment in `restore_table_pool.go` recording a bug that code review caught rather than a run: passing a literal `0` to the axis resolver dropped `CopyConcurrencyCeiling`, which *"on a PlanetScale Neki target let a restore open table × chunk concurrent COPYs against a router that admits four."*
+
+That comment is the argument for the arm. **Restore runs the same phases as migrate** — schema-apply, bulk copy, indexes, constraints — so it meets every Neki hazard catalogued this week: the COPY ceiling, the 30s statement timeout on index builds, the online-DDL routing, and the control-table shard-key problem. Migrate's versions of those are now measured; restore's are assumed.
+
+**Scope when it is built:** restore INTO a sharded Neki, riding the existing fixture (no second database). Backup FROM a Neki source is the lower-priority direction — reads are better covered by the copy-path work already done.
+
+**Blocked on the NK306 control-table fix, deliberately.** Restore writes `sluice_migrate_state`, so the arm would fail today on a wall we have already diagnosed — costing a provisioned cluster to re-learn something known, and producing a red weekly that says nothing new. Build it after, when a failure would be information.
+
 ## 2026-09-14 — TESTFRAGILE-3: a fixed wall-clock budget on a test that only runs under the heaviest concurrency
 
 `TestMigrate_FastLoader_CrashMidFastChunk_ResumeIsIdempotent/postgres` has now failed on **two consecutive release tags** — v0.152.1 and v0.152.2 — with the identical shape:
