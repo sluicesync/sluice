@@ -1721,6 +1721,28 @@ Mutation-run in all three directions, mutants grep-confirmed present and reverte
 
 **The generalizable bit:** when one gate grades two classes, check whether its exemptions belong to *both*. An exemption argued from class A and applied to class B is invisible in review, because the rationale reads as sound — it is sound, about the other thing. The tell here was a comment explaining the exemption in terms of only one of the two patterns in the regex right above it.
 
+## 2026-09-14 — nekiverify closing state: 24 arms pass, and every remaining failure is diagnosed
+
+The suite went from **never having executed** to 24 passing arms against a real 2-shard PS-10, in one day. What matters more than the count: **there are no unexplained failures left.** All three reds are known, filed, and have named next actions.
+
+| still failing | status |
+|---|---|
+| concurrent-COPY limit | platform admits ≥12 where sluice paces to 4 — a FLOOR, perf-matrix gap 33. Do not raise the constant on it |
+| NK306 bisect | diagnosed into two findings; the control-table half now has a settled fix |
+| CDC into a sharded target | same root cause; gated on that fix |
+
+**Tier-2 coverage item #3 is CLOSED.** The MoveTables arm reached and verified its premise for the first time: the write switch blocked the table, the refusal arrived as `NK213`, sluice classified it, and the remedy hint names all three `__neki` functions. Full sequence in ~13–29s, so the arm is **cheap** and belongs on the weekly — the 1007s enrolment is now confirmed an outlier across three further samples.
+
+**It took six runs, each failing at a different point**, which is worth recording as a shape rather than as a tally: signature arity → argument type (`::jsonb` vs `::text`) → topology scope (whole cluster vs one database) → table-set cross-check (`NK604`) → a missing readiness wait → the poll's call form → and finally an assertion reading the wrong surface. Every one was invisible on inspection and obvious on execution, and each fix was mechanical once the run said what it wanted. The diagnostics are what made that true: by the end, a failure printed the function's registered signature *and* return type rather than leaving the next attempt to guess.
+
+**Three of this week's defects were the same shape, and it is the one to watch for.** A check that RAN, produced a confident verdict, and was measuring something ADJACENT to its question:
+
+- the NK306 bisect compared **SQLSTATE** where the failure **site** was what differed — and reported "the lane is not the variable", the opposite of the truth
+- the copy-limit probe counted **open COPY commands** where **concurrent copies into the cluster** were the subject — a zero-row COPY may never engage a shard
+- the MoveTables arm read **`Error()`** where the remedy lives in **`Hint`** — and would have failed forever against correct product code, one step from being filed as a Tier-2 defect
+
+None is a test that simply failed; each was a wrong answer delivered confidently. The common tell is a gate whose assertion names a *proxy* for its question rather than the question. Worth asking of any new gate: is the attribute I am comparing the one that distinguishes the outcomes I care about?
+
 ## 2026-09-14 — NK306's control-table half: what the fix needs before it can be designed
 
 The bisect established the defect: **sluice's own control tables cannot be written on a sharded Neki.** The default shard group covers `public`, so every INSERT into `sluice_cdc_state`, `sluice_migrate_state` and `sluice_cdc_skipped_tables` is refused for want of a shard key those tables do not carry. It blocks **both** apply lanes and is the wider of the two NK306 findings.
