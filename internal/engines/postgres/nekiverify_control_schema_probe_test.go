@@ -293,3 +293,139 @@ func nekiControlTableShardKeyProbe(ctx context.Context, t *testing.T, db *sql.DB
 			"old shape must still be able to read.", n)
 	})
 }
+
+// nekiControlTableAuthoritativeGroupProbe tests the candidate PlanetScale's own
+// best-practices page points at, and which the first two probes missed.
+//
+// That page says the authoritative shard group "holds unsharded data" and
+// should be "sized for metadata, catalog work, and sequences". sluice's control
+// tables are exactly that: a CDC position and a migrate breadcrumb are metadata
+// about the migration, not tenant data, and they have no honest shard key
+// because there is nothing per-tenant in them to route on.
+//
+// # Why the earlier schema probe did not already answer this
+//
+// That probe created a table in an UNLISTED schema and found it refused with
+// NK306 — the default shard group reaches unlisted schemas. But "unlisted"
+// is not the same as "assigned to the authoritative group". The topology names
+// a `shard_group` PER TABLE, and [enrolTableInTopology] enrols with an EMPTY
+// object — no group named — which is precisely why anything it touches lands
+// in the sharded default. Naming the authoritative group instead is a
+// different question, and it is the one the vendor documentation suggests has
+// a different answer.
+//
+// # What a YES would mean, and the catch that survives it
+//
+// A yes makes this the cleanest of the three candidates by some distance: no
+// DDL shape change, no target-dependent column, and the tables end up where the
+// platform's own guidance says metadata belongs.
+//
+// The catch is unchanged and is the thing to measure next: `CREATE TABLE` does
+// not enrol, so SOMETHING has to write the topology. If sluice's own role may
+// call `__neki.set_data_topology`, sluice can self-enrol its control tables at
+// creation and the operator never sees it. If it may not, this becomes a
+// documented prerequisite — better than a target-dependent DDL, but no longer
+// invisible. The probe reports which, because the permission is as decisive as
+// the routing.
+func nekiControlTableAuthoritativeGroupProbe(ctx context.Context, t *testing.T, db *sql.DB, authGroup string) {
+	t.Helper()
+
+	t.Run("PROBE: can a control table live in the AUTHORITATIVE (unsharded) shard group?", func(t *testing.T) {
+		const tbl = "probe_ctl_auth"
+
+		t.Cleanup(func() {
+			cctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+			_, _ = db.ExecContext(cctx, `DROP TABLE IF EXISTS public.`+tbl)
+		})
+
+		if authGroup == "" {
+			t.Fatal("INCONCLUSIVE: the fixture reported no authoritative_shard_group, so there is no " +
+				"unsharded group to place a table in and this probe has nothing to ask")
+		}
+
+		if _, err := db.ExecContext(ctx, `CREATE TABLE public.`+tbl+` (
+			stream_id       VARCHAR(255) NOT NULL,
+			source_position TEXT         NOT NULL,
+			updated_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY (stream_id)
+		)`); err != nil {
+			t.Fatalf("create the probe control table: %v", err)
+		}
+
+		// Enrol it naming the AUTHORITATIVE group — the difference from
+		// enrolTableInTopology, which writes an empty entry and so lands in the
+		// sharded default.
+		//
+		// This call is ALSO the permission answer: if sluice's role cannot
+		// write the topology, the failure here says so, and that changes the
+		// candidate from invisible-to-the-operator into a documented
+		// prerequisite.
+		var ok bool
+		var rev int64
+		err := db.QueryRowContext(ctx, `
+			SELECT success, revision FROM __neki.set_data_topology(
+			  jsonb_set(
+			    __neki.get_data_topology()::jsonb,
+			    ARRAY['databases','postgres','schemas','public','tables','`+tbl+`'],
+			    jsonb_build_object('shard_group', $1::text),
+			    true
+			  )::text,
+			  true,
+			  '{"comment":"nekiverify control-table authoritative-group probe"}'
+			)`, authGroup).Scan(&ok, &rev)
+		if err != nil {
+			t.Fatalf("ANSWER (permission half): sluice's role could not WRITE the topology to enrol its "+
+				"own control table: %v\n\n"+
+				"That does not kill the authoritative-group candidate, but it decides its shape: the "+
+				"enrolment becomes an operator prerequisite rather than something sluice does at "+
+				"control-table creation. Record which role is required — the fixture's own notes say "+
+				"set_data_topology needs `neki_operator`.", err)
+		}
+		if !ok {
+			t.Fatalf("ANSWER: set_data_topology reported success=false at revision %d — the topology "+
+				"refused the placement itself, which is a different answer from a permission refusal "+
+				"and should be recorded as such", rev)
+		}
+		t.Logf("topology accepted the placement at revision %d; sluice's own role COULD write it", rev)
+
+		if _, err := db.ExecContext(ctx,
+			`SELECT __neki.wait_for_data_topology($1)`, rev); err != nil {
+			t.Logf("wait_for_data_topology(%d): %v (continuing; the insert below is the real test)", rev, err)
+		}
+
+		// THE QUESTION: does a shard-key-less INSERT now work?
+		_, insErr := db.ExecContext(ctx,
+			`INSERT INTO public.`+tbl+` (stream_id, source_position) VALUES ('probe','tok')`)
+
+		switch {
+		case insErr == nil:
+			var got string
+			if err := db.QueryRowContext(ctx,
+				`SELECT source_position FROM public.`+tbl+` WHERE stream_id = 'probe'`).Scan(&got); err != nil {
+				t.Fatalf("ANSWER (partial): the INSERT succeeded but the unpinned read back failed: %v\n\n"+
+					"Resume reads control tables without a shard pin, so this is not the clean outcome "+
+					"it first appears to be.", err)
+			}
+			t.Logf("ANSWER: YES — a control table assigned to the AUTHORITATIVE shard group %q accepts a "+
+				"shard-key-less INSERT and reads back unpinned.\n\n"+
+				"This is the best of the three candidates and matches PlanetScale's own guidance that "+
+				"the authoritative group holds unsharded data — metadata, catalog work, sequences. No "+
+				"DDL shape change and no target-dependent column, unlike the constant-shard-key "+
+				"candidate.\n\n"+
+				"The remaining design question is ENROLMENT, not routing: CREATE TABLE does not enrol, "+
+				"so sluice must call set_data_topology itself at control-table creation (this run shows "+
+				"its role could) — and that write is a cluster-wide topology revision, which is a much "+
+				"heavier side effect than creating a table and deserves its own decision.", authGroup)
+
+		case isPGCode(insErr, "NK306"):
+			t.Logf("ANSWER: NO — even assigned to the authoritative group %q the INSERT is refused with "+
+				"NK306: %v\n\nThat leaves the constant-shard-key candidate as the only one standing.",
+				authGroup, insErr)
+
+		default:
+			t.Fatalf("INCONCLUSIVE: the INSERT failed with neither success nor NK306: %v\n\n"+
+				"Record verbatim rather than forcing it into a reading.", insErr)
+		}
+	})
+}
