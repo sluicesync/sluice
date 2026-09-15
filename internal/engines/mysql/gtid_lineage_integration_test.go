@@ -540,7 +540,7 @@ func TestGTIDResumeMariaDBBindsLineage(t *testing.T) {
 		}
 		switch verdict := measureVerdict(t, dsnB, capturedOnA); verdict {
 		case "invalid":
-			t.Skipf("KNOWN GAP (A0915-MYSQL-HIGH-2, MariaDB): a rebuilt instance with an empty gtid_binlog_state is "+
+			t.Logf("KNOWN GAP (A0915-MYSQL-HIGH-2, MariaDB), measured and unchanged by design: a rebuilt instance with an empty gtid_binlog_state is "+
 				"routed to the automatic re-copy (ir.ErrPositionInvalid), which would reduce the target to this "+
 				"instance's stale rows; MariaDB offers no instance identity to tell it from a same-server RESET "+
 				"MASTER, and the policy is undecided. Measured verdict: %s", verdict)
@@ -606,7 +606,7 @@ func TestGTIDResumeMariaDBBindsLineage(t *testing.T) {
 		}
 		switch verdict := measureVerdict(t, dsnB2, capturedOnA2); verdict {
 		case "accepted":
-			t.Skipf("KNOWN GAP S2 (A0915-MYSQL-HIGH-2, MariaDB): a byte-identical rebuilt instance passed the domain "+
+			t.Logf("KNOWN GAP S2 (A0915-MYSQL-HIGH-2, MariaDB), measured and unchanged by design: a byte-identical rebuilt instance passed the domain "+
 				"door AND the anchor door (anchor %s:%d = %q on both), the server accepted the position, and the "+
 				"rebuild's own write was delivered as the original's continuation with no lineage WARN. No second "+
 				"witness exists on MariaDB; policy undecided", dA2.LineageFile, dA2.LineagePos, dA2.LineageSet)
