@@ -147,11 +147,18 @@ func TestXA_TerminalVerbsFoldOwnGroupAndReleaseTheWindow(t *testing.T) {
 // worked before the refusal existed — because the table filter lives one
 // stage downstream of the reader; and a tripped stream re-refused forever,
 // since excluding the table changed nothing the reader could see. With the
-// pipeline-supplied predicate excluding the table, the row must NOT refuse
-// and must EMIT (the downstream filter drops it like any other
-// excluded-table event); with the predicate including it, the refusal is
-// unchanged. The nil-predicate default (refuse everything in-schema) is
-// pinned by TestXA_InScopeRowRefusesLoudly above.
+// pipeline-supplied predicate excluding the table, the row must NOT refuse;
+// with the predicate including it, the refusal is unchanged. The
+// nil-predicate default (refuse everything in-schema) is pinned by
+// TestXA_InScopeRowRefusesLoudly above.
+//
+// Bug 246's cut let the exempted row EMIT and relied on the downstream
+// filter to drop it. Since audit 2026-09-15 A0915-ARCH-MEDIUM-3 the reader drops an
+// out-of-scope rows event WHOLE at the scope gate — ahead of every
+// per-row refusal, not just this one — so the excluded row emits nothing,
+// which is exactly what the downstream filter would have made of it. The
+// dispatch-level pin for the wider class is
+// TestDispatchRows_OutOfScopeTableNeverKillsTheStream.
 func TestXA_ScopePredicateExemptsFilteredTables(t *testing.T) {
 	t.Run("excluded table streams past the refusal", func(t *testing.T) {
 		r := newStagingReader(t, FlavorVanilla, stagingUUID+":1-5")
@@ -171,9 +178,9 @@ func TestXA_ScopePredicateExemptsFilteredTables(t *testing.T) {
 		for range out {
 			n++
 		}
-		if n != 1 {
-			t.Fatalf("excluded-table XA row emitted %d changes; want 1 — the reader emits and the DOWNSTREAM "+
-				"filter drops, exactly like every other excluded-table event", n)
+		if n != 0 {
+			t.Fatalf("excluded-table XA row emitted %d changes; want 0 — the scope gate drops an out-of-scope "+
+				"rows event whole, which is what the downstream filter would have done with each of its rows", n)
 		}
 	})
 	t.Run("included table still refuses", func(t *testing.T) {

@@ -176,6 +176,14 @@ type CDCReader struct {
 	host string
 	port uint16
 
+	// flavorMemoServer is the source's [flavorMemoServerKey], kept so the
+	// lineage verdict — the one place this engine has positive evidence
+	// that the server behind the address has been replaced — can forget
+	// the flavor memo's verdicts for it (audit 2026-09-15 A0915-MYSQL-MEDIUM-2). Empty on a
+	// reader built without a DSN (tests), which forgetFlavorVerdicts
+	// treats as a no-op.
+	flavorMemoServer string
+
 	// user and password are likewise extracted from the DSN. The
 	// account needs REPLICATION SLAVE (and REPLICATION CLIENT, for
 	// the SHOW MASTER STATUS / @@gtid_executed queries) at minimum.
@@ -1511,10 +1519,42 @@ func (r *CDCReader) dispatchRows(
 	if !ok {
 		// Row event arrived before its TableMapEvent — should not
 		// happen in a well-formed binlog, but bail out clearly if so.
+		// scope-exempt: the table's identity is unknown here, so the scope
+		// question cannot be asked; a rows event with no TABLE_MAP is a
+		// malformed stream, not an excluded table.
 		return fmt.Errorf("mysql: cdc: rows event for unknown table_id %d (no preceding TABLE_MAP_EVENT)", ev.TableID)
 	}
 	if qn == "" {
 		// Out-of-scope schema; silently drop.
+		return nil
+	}
+	// THE SCOPE GATE. The sync's --include/--exclude-table filter lives one
+	// stage DOWNSTREAM, in the pipeline's dispatch goroutine, so this reader
+	// decodes every table in the scoped databases (Bug 246). Every refusal
+	// below — the XA window, the TABLE_MAP shape guard, the partial-image
+	// and generated-PK belts, and each per-value decode refusal (TINYINT(1)
+	// range, zero-date, arity, MariaDB native decode) — KILLS THE STREAM,
+	// and killing it over a table whose every row the pipeline would drop
+	// refuses a working configuration that excluding the table cannot
+	// repair: the reader sees the same event on every resume. Bug 246 gated
+	// the XA refusal alone; audit 2026-09-09 A0909-AQ-M-2 found the
+	// session-time_zone refusal ungated; audit 2026-09-15 A0915-ARCH-MEDIUM-3 found three
+	// more, with the sharpest asymmetry on TINYINT(1): its PREFLIGHT is
+	// in-scope-only, so an excluded legacy column holding 2..127 passed
+	// preflight clean and halted CDC at its first row, under a remedy that
+	// could not mention --exclude-table because the flag would not have
+	// worked.
+	//
+	// So the question is asked ONCE, here, ahead of every per-row question:
+	// an out-of-scope table's rows event is dropped whole, exactly as the
+	// downstream filter would have dropped each of its rows (the filter
+	// advances no position on a dropped change either, so nothing
+	// observable moves). A nil predicate — no pipeline wiring, direct API
+	// use — keeps every in-schema table in scope, the fail-loud direction.
+	// TestStreamKillingRefusalsInDispatchAreScopeGated holds every non-nil
+	// return of this function behind this statement.
+	if r.scopeAllowed != nil && !r.tableInScope(qn) {
+		slog.DebugContext(ctx, "cdc rows event dropped by table scope", slog.String("table", qn))
 		return nil
 	}
 	// CDCPOS-1 (audit 2026-08-11): an IN-SCOPE row inside an XA transaction
@@ -1524,15 +1564,12 @@ func (r *CDCReader) dispatchRows(
 	// forever, and a crash mid-body could skip its tail; neither can be
 	// closed without buffering prepared transactions like a real replica
 	// (demand-gated). Out-of-scope traffic never trips it: a foreign SCHEMA
-	// is dropped above, and a TABLE the sync's filter excludes is exempted
-	// by the pipeline-supplied scope predicate (Bug 246 — the table filter
-	// lives one stage downstream, so without the predicate this refused
-	// filtered-out tables, a working configuration, and the tripped stream
-	// re-refused forever on the historical body because excluding the table
-	// changed nothing the reader could see). A predicate-exempted row still
-	// EMITS — the downstream filter drops it exactly as it drops every
-	// other excluded-table event.
-	if r.inXA && (r.scopeAllowed == nil || r.tableInScope(qn)) {
+	// and a filter-excluded TABLE are both dropped above (Bug 246 — before
+	// the scope predicate existed this refused filtered-out tables, a
+	// working configuration, and the tripped stream re-refused forever on
+	// the historical body because excluding the table changed nothing the
+	// reader could see).
+	if r.inXA {
 		return sluicecode.Wrap(
 			sluicecode.CodeCDCXAUnsupported,
 			"keep XA (distributed) transactions off the replicated tables, or exclude those tables from the "+
@@ -2290,6 +2327,15 @@ func (r *CDCReader) verifyPositionResumable(ctx context.Context, p binlogPos) er
 			"mysql: resume-position verify exceeded %s (%s); reconnecting: %w",
 			timeout, diag, err,
 		))
+	}
+	// A foreign-lineage verdict is positive evidence that the server behind
+	// this address is not the one the flavor memo probed (audit 2026-09-15
+	// A0915-MYSQL-MEDIUM-2): forget its verdicts so the re-copy the pipeline runs next
+	// re-probes at its first door instead of trusting a stale nil for up to
+	// flavorMemoTTL. Both callers — the warm-resume open and the reactive
+	// door's VerifyLineage — reach this wrapper, so the hook lives here.
+	if errors.Is(err, ir.ErrPositionForeignLineage) {
+		forgetFlavorVerdicts(r.flavorMemoServer)
 	}
 	return err
 }

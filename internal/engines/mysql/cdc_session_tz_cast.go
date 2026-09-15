@@ -158,20 +158,23 @@ func (c *vstreamSnapshotChanges) SetCDCScopePredicate(allowed func(schema, table
 	c.snap.scopeAllowed = allowed
 }
 
-// sessionTZRefusalInScope answers, for a VStream lane, whether a
-// stream-killing schema refusal about this table is the operator's
-// business at all: a table the sync's filter excludes emits nothing to
-// the target, so no DDL on it can diverge one.
+// vstreamTableInScope answers, for a VStream lane, whether a
+// stream-killing refusal about this table is the operator's business at
+// all: a table the sync's filter excludes emits nothing to the target, so
+// no DDL on it can diverge one and no row of it can be mis-decoded into
+// one. It is the VStream twin of the binlog reader's tableInScope — the
+// two schema-refusal sites consult it, and since audit 2026-09-15 A0915-ARCH-MEDIUM-3 so
+// does each lane's row dispatcher, ahead of every per-row refusal.
 //
 // A nil predicate means the pipeline wired none, and the refusal fires
 // as it did before — the fail-loud direction, matching the binlog
-// reader's convention at its own two gated sites.
+// reader's convention at its own gated sites.
 //
 // The keyspace is passed as the schema half because that is what a
 // VStream FIELD event carries and what the refusal itself reports; the
 // pipeline's closure ignores the schema and matches on the table, so
 // the two lanes agree with the binlog lane's answer for the same table.
-func sessionTZRefusalInScope(allowed func(schema, table string) bool, keyspace, table string) bool {
+func vstreamTableInScope(allowed func(schema, table string) bool, keyspace, table string) bool {
 	return allowed == nil || allowed(keyspace, table)
 }
 

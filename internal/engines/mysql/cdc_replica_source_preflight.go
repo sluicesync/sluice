@@ -76,8 +76,23 @@ import (
 
 // replicaSourceRemedyHint is the machine-readable remedy carried on the
 // coded refusal, mirroring the prose in the error message.
-const replicaSourceRemedyHint = "point the sync at the primary, or restart mysqld with " +
-	"log_replica_updates=ON (the variable is read-only at runtime), then re-run"
+//
+// It names three remedies because the door keys on a channel RECORD, not
+// on running threads (see sourceIsConfiguredReplica), and the record
+// outlives a failover: a promoted primary that ran `STOP REPLICA` but not
+// `RESET REPLICA ALL` still carries the row, is now taking direct writes
+// — all of them binlogged — and is refused here. For that server "point
+// at the primary" (it IS the primary) and "restart mysqld" (a production
+// primary, to clear bookkeeping) cannot be run; `RESET REPLICA ALL` is
+// the one that can, and through v0.153.2 it appeared only in the door's
+// own integration test (audit 2026-09-15 A0915-CLI-MEDIUM-1). Whether that server
+// should be ACCEPTED rather than told the remedy is a separate, pending
+// decision; the refusal stands and the cell that measures it is
+// TestCDCReader_ReplicaSourcePreflight/stopped_channel_still_refuses.
+const replicaSourceRemedyHint = "point the sync at the primary; if THIS server is the primary (promoted after a " +
+	"failover, replication stopped but its channel never cleared), clear the stale channel with RESET REPLICA ALL " +
+	"(MariaDB: RESET REPLICA 'connection_name' ALL) — its direct writes are binlogged; or restart mysqld with " +
+	"log_replica_updates=ON (the variable is read-only at runtime); then re-run"
 
 // dbQuerier is the query surface the M2 preflights need — both the
 // single-row form ([rowQuerier]) and the multi-row/any-column form —
@@ -141,9 +156,13 @@ func preflightReplicaSource(ctx context.Context, q dbQuerier) error {
 				"would stream only local writes — the replicated traffic is silently absent while the stream "+
 				"stays green (and on GTID resume the advanced gtid_purged forces a perpetual resnapshot loop "+
 				"misdiagnosed as retention loss; ground-truthed on a real linked mysql:8.0 pair, 2026-08-26). "+
-				"Point the sync at the primary instead, or restart mysqld with log_replica_updates=ON — the "+
-				"variable is read-only at runtime, so SET GLOBAL cannot fix it. A replica WITH "+
-				"log_replica_updates=ON is a legitimate chained source and passes this check. Then re-run",
+				"Point the sync at the primary instead. If THIS server IS the primary — promoted after a "+
+				"failover, with replication stopped but its channel never cleared — the channel record is what "+
+				"this check sees: clear it with RESET REPLICA ALL (MariaDB: RESET REPLICA 'connection_name' "+
+				"ALL); the direct writes it takes now are binlogged. Otherwise restart mysqld with "+
+				"log_replica_updates=ON — the variable is read-only at runtime, so SET GLOBAL cannot fix it. A "+
+				"replica WITH log_replica_updates=ON is a legitimate chained source and passes this check. "+
+				"Then re-run",
 			spelling,
 		),
 	)

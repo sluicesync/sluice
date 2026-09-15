@@ -2632,7 +2632,7 @@ func (s *vstreamSnapshotStream) maybeSnapshotSchemaCDC(ctx context.Context, fe *
 	// and last of this engine's SchemaSnapshot emitters. Same predicate and
 	// same position in the flow as the standalone reader's, including the
 	// SLM-1 seed fallback for a table not yet snapshotted on this phase.
-	if s.schemaDeltaAppliesToTarget && sessionTZRefusalInScope(s.scopeAllowed, keyspace, table) {
+	if s.schemaDeltaAppliesToTarget && vstreamTableInScope(s.scopeAllowed, keyspace, table) {
 		if prior, hadPrior := priorShapeFromSeed(s.snapshotSig, cacheKey, s.schemaSeedSig, table); hadPrior {
 			if col, pair, found := unforwardableSessionTZColumn(prior, tbl); found {
 				return sessionTZCastRefusal(keyspace, table, col, pair)
@@ -2669,7 +2669,15 @@ func (s *vstreamSnapshotStream) dispatchCDCRow(ctx context.Context, ev *binlogda
 	// ADR-0073 (c): drop ROW events for Vitess-internal tables before the
 	// FIELD lookup (their FIELD was already dropped above, so this also
 	// keeps the missing-FIELD floor reserved for logical-table bugs).
-	if isVitessInternalTable(stripKeyspaceFromTable(rev.GetTableName(), rev.GetKeyspace())) {
+	tableName := stripKeyspaceFromTable(rev.GetTableName(), rev.GetKeyspace())
+	if isVitessInternalTable(tableName) {
+		return nil
+	}
+	// THE SCOPE GATE — mirrored from dispatchRow (cdc_vstream.go), which
+	// carries the argument; a hand-mirrored dispatcher mirrors the
+	// obligation (audit 2026-09-15 A0915-ARCH-MEDIUM-3). Every non-nil return below is held
+	// behind it by TestStreamKillingRefusalsInDispatchAreScopeGated.
+	if !vstreamTableInScope(s.scopeAllowed, rev.GetKeyspace(), tableName) {
 		return nil
 	}
 	key := fieldCacheKey(rev.GetShard(), rev.GetTableName())
@@ -2681,7 +2689,6 @@ func (s *vstreamSnapshotStream) dispatchCDCRow(ctx context.Context, ev *binlogda
 	if err != nil {
 		return err
 	}
-	tableName := stripKeyspaceFromTable(rev.GetTableName(), rev.GetKeyspace())
 
 	for _, rc := range rev.GetRowChanges() {
 		// Item 74 belt (mirror of dispatchRow): refuse a partial after image

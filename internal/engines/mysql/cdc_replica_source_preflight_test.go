@@ -203,16 +203,34 @@ func TestPreflightReplicaSource(t *testing.T) {
 			t.Errorf("%s: want %s; got %T: %v", name, sluicecode.CodeCDCReplicaNoLogUpdates, err, err)
 			continue
 		}
+		// The diagnosis lives in the message.
 		for _, phrase := range []string{
 			"@@GLOBAL." + tc.spelling + "=0", // names the evidence
 			"silently absent",                // names the consequence
-			"log_replica_updates=ON",         // the remedy
-			"read-only at runtime",           // why SET GLOBAL is not the remedy
 			"legitimate chained source",      // the passing sibling, so the operator doesn't over-correct
-			"point the sync at the primary,", // hint mirror check below
 		} {
-			if !strings.Contains(err.Error(), phrase) && !strings.Contains(ce.Hint, phrase) {
-				t.Errorf("%s: message+hint missing %q; got: %v (hint %q)", name, phrase, err, ce.Hint)
+			if !strings.Contains(err.Error(), phrase) {
+				t.Errorf("%s: message missing %q; got: %v", name, phrase, err)
+			}
+		}
+		// The remedies live in BOTH homes — message and hint — or an
+		// operator who reads only the hint line misses one the message
+		// carries. Audit 2026-09-15 A0915-CLI-MEDIUM-1 was a remedy that lived in
+		// neither: RESET REPLICA ALL, the only one that runs on a promoted
+		// primary whose channel is merely stopped. Both spellings, because
+		// MariaDB's takes the connection name. Case-insensitive, because
+		// the message opens a sentence with the re-point remedy.
+		for _, phrase := range []string{
+			"point the sync at the primary",
+			"RESET REPLICA ALL",
+			"RESET REPLICA 'connection_name' ALL",
+			"log_replica_updates=ON",
+			"read-only at runtime", // why SET GLOBAL is not the remedy
+		} {
+			for _, home := range []struct{ name, text string }{{"message", err.Error()}, {"hint", ce.Hint}} {
+				if !strings.Contains(strings.ToLower(home.text), strings.ToLower(phrase)) {
+					t.Errorf("%s: %s missing remedy %q; got: %q", name, home.name, phrase, home.text)
+				}
 			}
 		}
 	}

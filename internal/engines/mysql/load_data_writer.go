@@ -316,10 +316,11 @@ type showWarnings struct {
 	// accounting — see [replayWarningsAreOnlyDuplicates].
 	NonDup int
 	// Skipped counts the VISIBLE rows whose code says the server DROPPED
-	// the row rather than coercing a value in it: 3819, a CHECK constraint
-	// violation, which LOAD DATA LOCAL (IGNORE semantics) downgrades to a
-	// warning and skips. A skip is a lost row in EVERY sql_mode, so it is
-	// refused before the relaxed-mode policy is consulted (audit
+	// the row rather than coercing a value in it — a constraint the row
+	// violates (CHECK, FOREIGN KEY, no admitting PARTITION), which LOAD
+	// DATA LOCAL (IGNORE semantics) downgrades to a warning and skips; see
+	// [rowSkippingWarningCodes]. A skip is a lost row in EVERY sql_mode, so
+	// it is refused before the relaxed-mode policy is consulted (audit
 	// 2026-09-09 A0909-MYSQL-MEDIUM-2: under --mysql-sql-mode='' the WARN
 	// called it a clamp and the migration exited 0 short of rows).
 	Skipped int
@@ -327,19 +328,36 @@ type showWarnings struct {
 
 // rowSkippingWarningCodes are the SHOW WARNINGS codes that mean the server
 // DROPPED the row rather than coercing a value in it. Under LOAD DATA
-// LOCAL (IGNORE semantics) a CHECK violation is a warning and the row is
-// skipped, not written.
-// The engines do NOT share a code for it, which is why this is a set and
-// not a constant: MySQL 8.0.46 reports `Warning 3819 Check constraint
-// 'ck_chk_1' is violated`, MariaDB 11.4.13 reports `Warning 4025
-// CONSTRAINT 'ck_nonneg' failed for 'db'.'ck'` — both measured
-// 2026-09-09, three rows in and one row landed on each. Taking the MySQL
-// code alone left the MariaDB skip visible to the shortfall witness on a
-// first attempt and invisible on a replay (pre-tag value-fidelity
-// review).
+// LOCAL (IGNORE semantics) a constraint violation is a warning and the row
+// is skipped, not written.
+//
+// The set is DERIVED, not listed: TestLoadDataLocal_RejectionFamilyCodesAreClassified
+// loads a violating row through LOAD DATA LOCAL for every rejection family
+// {CHECK, FOREIGN KEY, PARTITION range, UNIQUE} on mysql:8.0, mysql:8.4 and
+// mariadb:11 and fails the build if the server lands fewer rows than it
+// was sent under a code this set (or the duplicate-key code the replay
+// accounting owns) does not hold. A code a future server adds is
+// therefore a red test, not a row silently reclassified as a coercion.
+//
+// The engines do NOT share a code for CHECK, which is why this is a set
+// and not a constant: MySQL reports `Warning 3819 Check constraint
+// 'ck_chk_1' is violated`, MariaDB `Warning 4025 CONSTRAINT 'ck_nonneg'
+// failed for 'db'.'ck'` (both measured 2026-09-09). FOREIGN KEY and
+// PARTITION share their codes across the engines (measured 2026-09-15,
+// audit A0915-MYSQL-MEDIUM-1: before this, 1452 and 1526 skips were
+// classified as coercions — refused with a --type-override remedy under
+// strict mode, WARNed past at exit 0 under --mysql-sql-mode=”).
+//
+// The one drop code deliberately NOT here is 1062 (duplicate key): it is
+// the code a replayed segment legitimately produces once per already-
+// landed row, and [reportLoadDataWarnings] accounts for it against the
+// driver's rows-inserted rather than refusing on sight. On a first attempt
+// a 1062 skip is still caught — by the shortfall witness, not by this set.
 var rowSkippingWarningCodes = map[string]bool{
 	"3819": true, // MySQL   ER_CHECK_CONSTRAINT_VIOLATED
-	"4025": true, // MariaDB ER_CONSTRAINT_FAILED
+	"4025": true, // MariaDB ER_CONSTRAINT_FAILED (CHECK)
+	"1452": true, // ER_NO_REFERENCED_ROW_2 — FOREIGN KEY, MySQL and MariaDB alike
+	"1526": true, // ER_NO_PARTITION_FOR_GIVEN_VALUE — no partition admits the row, both engines
 }
 
 // loadDataRowsSkippedMarker is the grep-stable marker the rows-skipped
@@ -523,20 +541,6 @@ func (w *RowWriter) reportLoadDataWarnings(ctx context.Context, conn *sql.Conn, 
 	if err != nil {
 		return err
 	}
-	// The independent witness for a first attempt (the 2026-08-01 rule:
-	// name the number the check does not derive from the artifact it
-	// grades): the driver's rows-inserted against the rows sluice sent.
-	// A shortfall is a dropped row whatever the warning SAMPLE says —
-	// including a sample the server capped at max_error_count=0 — and it
-	// is refused before any policy that could call it a coercion. It is
-	// consulted only when the server warned at all (every IGNORE-skipped
-	// row carries a warning; a driver that reports no rows and no warnings
-	// is a test fake, not a loss). Replays are exempt because their
-	// shortfall is the duplicates the accounting below explains, or refuses.
-	var dropped int64
-	if !replay && inserted >= 0 && int64(segRows) > inserted {
-		dropped = int64(segRows) - inserted
-	}
 	// The SHOW WARNINGS row count cannot answer "were there any warnings?": the
 	// server truncates the list at @@max_error_count, and a server tuned to 0
 	// returns an empty list while @@warning_count stays accurate (COLD-1). Read
@@ -545,6 +549,27 @@ func (w *RowWriter) reportLoadDataWarnings(ctx context.Context, conn *sql.Conn, 
 	// than failing a clean write.
 	total, terr := readTrueWarningCount(ctx, conn)
 	warned := (terr == nil && total > 0) || (terr != nil && sw.Visible > 0)
+	// The independent witness (the 2026-08-01 rule: name the number the
+	// check does not derive from the artifact it grades): the driver's
+	// rows-inserted against the rows sluice sent. A shortfall is a dropped
+	// row whatever the warning SAMPLE says — including a sample the server
+	// capped at max_error_count=0 — and it is refused before any policy
+	// that could call it a coercion. It is consulted only when the server
+	// warned at all (every IGNORE-skipped row carries a warning; a driver
+	// that reports no rows and no warnings is a test fake, not a loss).
+	//
+	// On a REPLAY part of the shortfall is legitimate — every row the prior
+	// attempt landed is re-sent and skipped as a duplicate — so the witness
+	// subtracts the duplicates the warning list ACCOUNTS for and refuses on
+	// what remains; see [unexplainedShortfall] for why that subtraction is
+	// only sound over a complete list. Until audit 2026-09-15 A0915-MYSQL-MEDIUM-1 the replay
+	// was exempt from the witness wholesale, so a FOREIGN KEY (1452) or
+	// PARTITION (1526) skip on a replayed segment — codes the skip set did
+	// not hold — reached the coercion policy: refused with a --type-override
+	// remedy under strict mode, WARNed past as "clamped values" at exit 0
+	// under --mysql-sql-mode=''.
+	listComplete := terr == nil && int64(sw.Visible) >= total
+	dropped := unexplainedShortfall(segRows, inserted, replay, listComplete, sw.Visible-sw.NonDup)
 	if dropped > 0 && warned {
 		return rowsSkippedError(table, dropped, sw.Details, "")
 	}
@@ -583,30 +608,72 @@ func (w *RowWriter) reportLoadDataWarnings(ctx context.Context, conn *sql.Conn, 
 	return nil
 }
 
+// unexplainedShortfall is the dropped-row count the shortfall witness
+// refuses on: the rows sluice sent minus the rows the server reports
+// inserted, less — on a replay — the rows the warning list accounts for
+// as duplicate-key skips (its visible 1062 rows, `visibleDups`).
+//
+// Pure, so the decision is unit-pinned without a server
+// (TestUnexplainedShortfall). Three shapes, stated:
+//
+//   - First attempt: every missing row is a drop. Nothing to subtract.
+//   - Replay over a COMPLETE warning list (every warning was read, so
+//     every 1062 was counted): the shortfall beyond the duplicates is a
+//     row some OTHER warning skipped — an FK, a partition, a CHECK, or a
+//     code this build does not know — and it is refused as such. A row
+//     can carry two warnings (a truncation and a 1062) and still be one
+//     duplicate, which is why the subtraction counts 1062 ROWS, not
+//     warnings.
+//   - Replay over a CAPPED list (@@max_error_count truncated it): the
+//     duplicates beyond the cap were never counted, so subtracting only
+//     the visible ones would overstate the drop and refuse a legitimate
+//     large replay as lost rows. The witness abstains (0) and the caller's
+//     capped-list arm decides — loud under strict mode, and under
+//     --mysql-sql-mode=” a WARN that says what it could not classify.
+//     That residual is A0909-MYSQL-MEDIUM-2b, unchanged here.
+//
+// An unknown rows-inserted (-1) is not evidence either way: 0.
+func unexplainedShortfall(segRows int, inserted int64, replay, listComplete bool, visibleDups int) int64 {
+	if inserted < 0 || int64(segRows) <= inserted {
+		return 0
+	}
+	shortfall := int64(segRows) - inserted
+	switch {
+	case !replay:
+		return shortfall
+	case listComplete:
+		return max(shortfall-int64(visibleDups), 0)
+	default:
+		return 0
+	}
+}
+
 // rowsSkippedError is the refusal for rows the server DROPPED during a
-// bulk write — a CHECK constraint violation that LOAD DATA LOCAL (IGNORE
-// semantics) downgrades to a warning and skips (3819 on MySQL, 4025 on
-// MariaDB — both measured), or, on a first attempt,
-// any shortfall between the rows sluice sent and the rows the server
-// reports inserted. Refused in EVERY sql_mode: --mysql-sql-mode=” opts
-// into coercion, and a skipped row is not a coerced one. Before audit
-// 2026-09-09 A0909-MYSQL-MEDIUM-2 the relaxed path WARNed that values had
-// been "clamped or truncated" and exited 0 short of rows, and the strict
-// path refused with a type-conversion diagnosis and a --type-override
-// remedy that cannot address a CHECK.
+// bulk write — a constraint violation that LOAD DATA LOCAL (IGNORE
+// semantics) downgrades to a warning and skips (the codes in
+// [rowSkippingWarningCodes], each measured on real servers), or any
+// shortfall between the rows sluice sent and the rows the server reports
+// inserted that the replay's duplicate-key accounting cannot explain.
+// Refused in EVERY sql_mode: --mysql-sql-mode=” opts into coercion, and a
+// skipped row is not a coerced one. Before audit 2026-09-09
+// A0909-MYSQL-MEDIUM-2 the relaxed path WARNed that values had been
+// "clamped or truncated" and exited 0 short of rows, and the strict path
+// refused with a type-conversion diagnosis and a --type-override remedy
+// that cannot address a constraint.
 func rowsSkippedError(table string, skipped int64, details []string, more string) error {
 	return fmt.Errorf("mysql: "+loadDataRowsSkippedMarker+": bulk write into %q SKIPPED %d row(s) — the target "+
 		"rejected them and LOAD DATA LOCAL reports a rejected row as a warning instead of an error, so the load "+
 		"continued without them. A skipped row is a lost row, not a coerced value, so this refuses under every "+
-		"sql_mode (--mysql-sql-mode='' does not opt into it). A skip-class warning — 3819 on MySQL, 4025 on "+
-		"MariaDB — names a CHECK constraint the row "+
-		"violates: sluice translates a source CHECK — including a PostgreSQL NOT VALID one, which MySQL cannot "+
-		"leave unvalidated — into an ENFORCED target CHECK. Examples: [%s]%s. Recovery: fix or exclude the "+
-		"offending source rows, or relax the target CHECK (`ALTER TABLE … DROP CHECK <name>` on the target, "+
-		"then re-run), or route the copy through the batched-INSERT path by setting local_infile=OFF on the "+
-		"TARGET server (it is a global variable, not a session or DSN one — sluice falls back to batched "+
-		"INSERTs when it reads @@local_infile as OFF), where the same violation fails the statement loudly "+
-		"instead of being skipped",
+		"sql_mode (--mysql-sql-mode='' does not opt into it). A skip-class warning names the constraint the row "+
+		"violates: a CHECK (3819 on MySQL, 4025 on MariaDB — sluice translates a source CHECK, including a "+
+		"PostgreSQL NOT VALID one, which MySQL cannot leave unvalidated, into an ENFORCED target CHECK), a "+
+		"FOREIGN KEY whose parent row is absent (1452 — the parent table copied later, or filtered out), or a "+
+		"partitioned target with no partition for the value (1526). Examples: [%s]%s. Recovery: fix or exclude "+
+		"the offending source rows; or relax the target constraint (`ALTER TABLE … DROP CHECK <name>` / "+
+		"`DROP FOREIGN KEY <name>` on the target, or add the missing partition, then re-run); or route the copy "+
+		"through the batched-INSERT path by setting local_infile=OFF on the TARGET server (it is a global "+
+		"variable, not a session or DSN one — sluice falls back to batched INSERTs when it reads @@local_infile "+
+		"as OFF), where the same violation fails the statement loudly instead of being skipped",
 		table, skipped, strings.Join(details, "; "), more)
 }
 

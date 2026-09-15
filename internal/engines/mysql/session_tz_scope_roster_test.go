@@ -48,7 +48,7 @@ import (
 // Every call to sessionTZCastRefusal in this package's non-test files,
 // and it requires the enclosing function to consult a scope predicate —
 // either `scopeAllowed` directly, the binlog reader's tableInScope, or
-// the shared sessionTZRefusalInScope helper. It is deliberately keyed on
+// the shared vstreamTableInScope helper. It is deliberately keyed on
 // the REFUSAL rather than on a list of lanes: a fourth lane, or a fourth
 // call in an existing one, joins the roster by existing.
 //
@@ -67,10 +67,10 @@ func TestSessionTZRefusalSitesAreScopeGated(t *testing.T) {
 	// asking the question. Named rather than pattern-matched so adding a
 	// fourth spelling is a deliberate edit to this list.
 	askers := map[string]bool{
-		"scopeAllowed":            true,
-		"tableInScope":            true,
-		"sessionTZRefusalInScope": true,
-		"relationInScope":         true,
+		"scopeAllowed":        true,
+		"tableInScope":        true,
+		"vstreamTableInScope": true,
+		"relationInScope":     true,
 	}
 
 	type site struct{ fn, file string }
@@ -158,7 +158,7 @@ func TestSessionTZRefusalSitesAreScopeGated(t *testing.T) {
 			"the CDC readers, so an EXCLUDED table still reaches this code — and a TIMESTAMP/DATETIME "+
 			"MODIFY on a table this stream emits nothing for cannot diverge the target, so refusing over "+
 			"it refuses a working configuration (Bug 246's shape, re-found as audit 2026-09-09 "+
-			"A0909-AQ-M-2). Gate it on scopeAllowed / sessionTZRefusalInScope, treating a nil predicate "+
+			"A0909-AQ-M-2). Gate it on scopeAllowed / vstreamTableInScope, treating a nil predicate "+
 			"as in-scope so an unwired pipeline still fails loud.", s.fn, s.file)
 	}
 	if len(gated) < 3 {

@@ -1768,7 +1768,7 @@ func (r *vstreamCDCReader) maybeSnapshotSchema(ctx context.Context, fe *binlogda
 	// SLM-1: a table this reader has not yet snapshotted borrows its prev
 	// from the streamer's seed (priorShapeFromSeed), so a DDL that lands
 	// before the table's first FIELD of this process is checked too.
-	if r.schemaDeltaAppliesToTarget && sessionTZRefusalInScope(r.scopeAllowed, keyspace, table) {
+	if r.schemaDeltaAppliesToTarget && vstreamTableInScope(r.scopeAllowed, keyspace, table) {
 		if prior, hadPrior := priorShapeFromSeed(r.snapshotSig, cacheKey, r.schemaSeedSig, table); hadPrior {
 			if col, pair, found := unforwardableSessionTZColumn(prior, tbl); found {
 				return sessionTZCastRefusal(keyspace, table, col, pair)
@@ -1809,7 +1809,22 @@ func (r *vstreamCDCReader) dispatchRow(ctx context.Context, ev *binlogdata.VEven
 	// and even with a FIELD it must never be applied to the target. Must
 	// precede the field lookup so the floor is reserved for genuine
 	// missing-FIELD bugs on logical tables.
-	if isVitessInternalTable(stripKeyspaceFromTable(rev.GetTableName(), rev.GetKeyspace())) {
+	tableName := stripKeyspaceFromTable(rev.GetTableName(), rev.GetKeyspace())
+	if isVitessInternalTable(tableName) {
+		return nil
+	}
+	// THE SCOPE GATE — the VStream twin of the binlog reader's (see
+	// dispatchRows in cdc_reader.go for the full argument). The tail
+	// request's rules end in `Match: "/.*/"`, so every table in the
+	// keyspace arrives here, and every non-nil return below — the missing-
+	// FIELD floor, the partial-image belt, each decode refusal (malformed
+	// event, zero-date, SRID, framing, TINYINT(1) range) — kills the stream
+	// over a table the sync's filter would drop anyway (audit 2026-09-15
+	// A0915-ARCH-MEDIUM-3). Asked once, ahead of every per-row question; a nil predicate
+	// keeps every table in scope.
+	// TestStreamKillingRefusalsInDispatchAreScopeGated holds every non-nil
+	// return of this function behind this statement.
+	if !vstreamTableInScope(r.scopeAllowed, rev.GetKeyspace(), tableName) {
 		return nil
 	}
 	key := fieldCacheKey(rev.GetShard(), rev.GetTableName())
@@ -1822,8 +1837,6 @@ func (r *vstreamCDCReader) dispatchRow(ctx context.Context, ev *binlogdata.VEven
 	if err != nil {
 		return err
 	}
-
-	tableName := stripKeyspaceFromTable(rev.GetTableName(), rev.GetKeyspace())
 
 	// Source commit timestamp for the sync-lag metric (roadmap item 45).
 	// A VStream VEvent's Timestamp is the originating transaction's commit
