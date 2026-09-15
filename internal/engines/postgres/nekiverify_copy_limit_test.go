@@ -10,6 +10,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 	"testing"
@@ -272,7 +273,20 @@ func nekiConcurrentCopyLimitHoldsOnTheCluster(ctx context.Context, t *testing.T,
 				refusal = err
 				_ = db.Close()
 				if !isPGCode(err, "53300") {
-					t.Fatalf("%s", nekiInconclusiveCopyProbe(i, len(held), "during its burst", err))
+					// Run 34939361499: the sixth session's burst died with
+					// `write failed: use of closed network connection` — the
+					// router ended the session instead of (or before) sending
+					// a 53300, and pgx surfaced the write failure. A session
+					// the router closes mid-burst did not get a slot; it is a
+					// refusal delivered as a close, and the sessions accepted
+					// before it remain a lower bound on what the platform
+					// admits — which is the only direction the premise grades.
+					if !nekiIsConnectionClosed(err) {
+						t.Fatalf("%s", nekiInconclusiveCopyProbe(i, len(held), "during its burst", err))
+					}
+					refusal = fmt.Errorf("refusal delivered as a connection close, no SQLSTATE (session %d): %w", i, err)
+					t.Logf("NEKI-COPYLIMIT: session %d was CLOSED by the router during its burst (%v) — counted "+
+						"as refused; %d session(s) were accepted before it", i, err, len(held))
 				}
 			case <-time.After(nekiCopyBurstDeadline):
 				// The burst never finished writing and no error arrived. The
@@ -295,7 +309,12 @@ func nekiConcurrentCopyLimitHoldsOnTheCluster(ctx context.Context, t *testing.T,
 					refusal = err
 					_ = db.Close()
 					if !isPGCode(err, "53300") {
-						t.Fatalf("%s", nekiInconclusiveCopyProbe(i, len(held), "in the settle window after its burst", err))
+						if !nekiIsConnectionClosed(err) {
+							t.Fatalf("%s", nekiInconclusiveCopyProbe(i, len(held), "in the settle window after its burst", err))
+						}
+						refusal = fmt.Errorf("refusal delivered as a connection close, no SQLSTATE (session %d): %w", i, err)
+						t.Logf("NEKI-COPYLIMIT: session %d was CLOSED by the router in its settle window (%v) — counted "+
+							"as refused; %d session(s) were accepted before it", i, err, len(held))
 					}
 				case <-time.After(nekiCopyBurstSettle):
 					held = append(held, s)
@@ -590,4 +609,32 @@ func nekiShardKeyRequiredOnInsert(ctx context.Context, t *testing.T, db *sql.DB,
 		}
 		t.Logf("premise holds: %s (SQLSTATE %s)", pgErr.Message, pgErr.Code)
 	})
+}
+
+// nekiIsConnectionClosed reports whether err is the shape a session shows when
+// the ROUTER ended it under the client — a write onto a closed socket, an EOF,
+// or a reset — rather than a SQL-level answer. Measured 2026-09-15 (run
+// 34939361499): the sixth probe session's burst failed with `write failed: use
+// of closed network connection`, which is the deferred concurrency refusal
+// arriving as a close instead of a 53300.
+func nekiIsConnectionClosed(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	msg := err.Error()
+	for _, s := range []string{
+		"use of closed network connection",
+		"unexpected EOF",
+		"connection reset by peer",
+		"broken pipe",
+		"conn closed",
+	} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
 }

@@ -1721,6 +1721,24 @@ Mutation-run in all three directions, mutants grep-confirmed present and reverte
 
 **The generalizable bit:** when one gate grades two classes, check whether its exemptions belong to *both*. An exemption argued from class A and applied to class B is invisible in review, because the rationale reads as sound — it is sound, about the other thing. The tell here was a comment explaining the exemption in terms of only one of the two patterns in the regex right above it.
 
+## 2026-09-15 — MEASURED: shard-targeted sessions answer YES on every premise, and the write hazard is the silent shape (run 34939361499)
+
+The probe arm below ran on a 2-shard PS-10 (fixture `nekiverify-…`, sluice `3ea6de8c`), 4.9 s for all seven measurements:
+
+| measurement | answer |
+|---|---|
+| (a) `pg_current_wal_lsn()` under `SET __neki.shard` | **YES**, per shard, and the positions DIFFER (`0/570B190` vs `0/46C3518`) |
+| (b) `pg_export_snapshot()` under targeting | **YES** — a targeted REPEATABLE READ exported `00000008-00000040-1` |
+| (c) REPEATABLE READ on a targeted session | **YES** — a real per-shard snapshot: the count held at 15 across a concurrent router INSERT that demonstrably landed on that shard |
+| (d) per-shard union of a SHARDED table | **YES** — per-shard sum equals the router's unpinned count (40); each row visible on exactly one shard, so a shard-by-shard read is complete and non-duplicating. The unsharded-table half was INCONCLUSIVE only because the arm now runs BEFORE the CDC arm that creates `sluice_cdc_state` — the probe should place its own table next time |
+| (e) `COPY FROM STDIN` under targeting | **REFUSED** — `COPY is not supported when __neki.shard is set` (0A000), as the vendor page says |
+| (f) an INSERT under targeting of a row whose key routes ELSEWHERE | **THE HAZARD IS REAL AND SILENT**: the row landed on the targeted shard; the router's equality-routed read returned 0, the scattering read returned 1, targeted reads `{target:1, home:0}`. sluice must never write under targeting |
+| (g) a replication connection targeted at one shard | **ACCEPTED**, both as `options=-c __neki.shard=<uid>` and as a bare startup parameter — `IDENTIFY_SYSTEM` answered (systemid, timeline 1, xlogpos) |
+
+**What this decides.** (a)+(g) together mean a Neki CAN be a per-shard CDC source: N shard-targeted replication connections, N positions, the composite-position (VGTID-like) token sluice already has for Vitess. (b)+(c)+(d) mean `migrate` and `backup` FROM a sharded Neki can read shard-by-shard, N-way parallel, each slice internally consistent — strictly better than today's router scatter-gather, which is consistent nowhere. Not measured yet, and the next arm: whether an exported snapshot can be IMPORTED by a second targeted session (parallel consistent reads within one shard), and whether a logical slot on a targeted replication connection decodes only that shard's WAL. (e)+(f) close the restore direction: no per-shard parallel restore, ever, through this door. All of this is a design chunk (the pipeline's single-position model, ADR-0186's named design work); it is now demand-gated on evidence rather than on a mechanism.
+
+**Also in that run:** `backup full` FROM the sharded fixture GREEN end to end (the product fix + the chunk-file read-back); restore GREEN again (43.9 s); the whole function 300 s under per-arm budgets. The copy-limit arm was INCONCLUSIVE for a new, honest reason: probe session 6's burst ended with `use of closed network connection` — the deferred refusal arriving as a connection CLOSE rather than a 53300 — with five sessions accepted before it; the arm now counts a router-closed session as refused (the accepted set is a lower bound, which is the premise's only graded direction) and reports the number.
+
 ## 2026-09-15 — FILED: shard-targeted sessions on Neki (`SET __neki.shard`) — the probe arm that decides per-shard reads and composite-position incrementals
 
 The operator pointed at PlanetScale's query-planning page (2026-09-15): `SET __neki.shard = '<uid>'` makes a session forward its DML (`SELECT`/`INSERT`/`UPDATE`/`DELETE`/`MERGE`) to ONE shard, bypassing shard-key routing; `COPY`, `DO` and schema DDL are **rejected** under it; router-managed functions (`current_setting`, `set_config`, `nextval`) are unavailable; it cannot change mid-transaction; `RESET __neki.shard` clears it. The same page states the fact the whole Neki arc rests on: "an ordinary multi-shard read does not establish one shared Postgres snapshot across its destinations", and Neki "commits each shard separately … does not use two-phase commit". PlanetScale's own backups (the massively-parallel-backups post) are physical, per shard, on throwaway nodes with direct shard access, and their cross-shard cut is a wall-clock timestamp T — no cross-shard snapshot exists at any layer.
