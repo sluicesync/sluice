@@ -370,21 +370,32 @@ func nekiConcurrentCopyLimitHoldsOnTheCluster(ctx context.Context, t *testing.T,
 			"router census: %s; refusals deferred past the burst: %d",
 			measured, maxProbe, nekiConcurrentCopyLimit, censusNote, deferred)
 
-		// THE ARTIFACT CHECK, and it is the first thing to read on the next
-		// live run. A session counted as accepted that comes back 53300 means
-		// the refusal outran the burst too.
+		// THE ARTIFACT CHECK, turned into the measurement. A session counted
+		// as accepted that comes back 53300 on release was refused all along —
+		// the burst did not outrun the deferral for it. But every session ends
+		// in exactly one of three ways: a 53300 on release (refused, late), a
+		// close mid-burst (refused, as a close), or a clean end / 25P03 (it
+		// held a slot until released or reaped). The RELEASE OUTCOME is
+		// therefore per-session evidence that does not share the burst's
+		// defect, and the admitted count is the sessions that never met a
+		// refusal in any form. Measured 2026-09-15 (run 34940466964): 5
+		// passed the burst, the router census counted 5 (all with sidecar
+		// detail — so sidecar detail is not a slot proof either), and 1 came
+		// back 53300 on release: 4 admitted, exactly the platform's own
+		// `limit: 4`. Runs 34926553073 / 34928571469 / 34932058458 had
+		// reported "12" by inferring acceptance from four seconds of silence.
 		if deferred > 0 {
-			t.Fatalf("NEKI-COPYLIMIT INCONCLUSIVE: %d of the %d session(s) this probe counted as ACCEPTED came "+
-				"back 53300 on release.%s\n\n"+
-				"The platform refused them and delivered the refusal only after they stopped sending — so "+
-				"'the burst was flushed and nothing came back' is NOT sufficient evidence of acceptance "+
-				"either, and %d is not a measured limit. This is the same artifact that made runs "+
-				"34926553073 / 34928571469 / 34932058458 report a floor of 12 while the platform's own "+
-				"message in those logs said `limit: 4`; the burst was supposed to outrun it and did not.\n\n"+
-				"The router census taken while the sessions were held is the evidence that does not share "+
-				"this defect: %s\n\n%s",
-				deferred, measured, deferredDetail.String(), measured, censusNote,
+			t.Logf("NEKI-COPYLIMIT: %d of the %d session(s) that passed the burst came back 53300 on release — "+
+				"refused late, not admitted.%s\n  The burst is NOT a sufficient acceptance criterion on its own; "+
+				"the release outcome is. Router census while held: %s\n  %s",
+				deferred, measured, deferredDetail.String(), censusNote,
 				nekiCensusReading(running, withSidecars, measured))
+			measured -= deferred
+			if refusal == nil {
+				refusal = fmt.Errorf("%d session(s) refused with 53300 on release (deferred past the burst)", deferred)
+			}
+			t.Logf("NEKI-COPYLIMIT: admitted=%d after subtracting the late refusals (nekiConcurrentCopyLimit=%d)",
+				measured, nekiConcurrentCopyLimit)
 		}
 
 		// The graded question, and only it.
