@@ -262,16 +262,18 @@ func xvLoadBinaries(t *testing.T) xvBinaries {
 			"before reaching the fingerprint check, so cell 5 would assert the wrong refusal. Pick an older epoch tag "+
 			"in scripts/crossversion-build.sh.", b.epochTag, b.epochFormat, b.newFormat)
 	}
-	// Cell 6's precondition, and the reason the peer is derived on EQUALITY.
-	// A peer at a lower format refuses a NEW-written chain on the version
-	// gate, which cell 2 already covers — cell 6 would then report green
-	// about a refusal instead of red about a fingerprint it cannot
-	// reproduce, which is the exact failure mode the whole file is built to
-	// avoid.
-	if b.peerFormat != b.newFormat {
-		t.Fatalf("PEER %s stamps BackupFormatVersion=%d and NEW stamps %d — cell 6 needs them EQUAL so the only thing "+
-			"that can refuse the restore is the schema fingerprint. Re-run scripts/crossversion-build.sh, or repoint "+
-			"CROSSVER_PEER_TAG at a same-format release.", b.peerTag, b.peerFormat, b.newFormat)
+	// Cell 6's harness precondition. The peer is derived on EQUALITY when a
+	// same-format release exists, and falls back to the newest release
+	// BELOW NEW's format on a fresh proportional bump (the FormatVersion-11
+	// case — see scripts/crossversion-build.sh). What cell 6 actually needs
+	// is narrower than equality and is checked where the evidence is: every
+	// manifest the cell's chain STAMPS must sit at or below the peer's
+	// ceiling, or the version gate refuses first and the cell would report
+	// about a refusal instead of a fingerprint. A peer ABOVE NEW is never a
+	// previous release, so that stays a harness error here.
+	if b.peerFormat > b.newFormat {
+		t.Fatalf("PEER %s stamps BackupFormatVersion=%d, above NEW's %d — it is not a previous release of this format. "+
+			"Re-run scripts/crossversion-build.sh, or repoint CROSSVER_PEER_TAG.", b.peerTag, b.peerFormat, b.newFormat)
 	}
 	for _, p := range []string{b.oldBin, b.newBin, b.epochBin, b.peerBin} {
 		if _, err := os.Stat(p); err != nil {
@@ -404,6 +406,20 @@ func xvBackupFull(t *testing.T, bin, srcDSN, dir, slot string) {
 // and 3 fail loudly instead of quietly grading an older tier.
 func xvTopFormatFlags() []string {
 	return append(xvEncryptFlags(), "--redact", "users.email=hash:sha256")
+}
+
+// xvShapeStampedTiers names the format tiers NO `backup full` flag can
+// reach on a Postgres primary, each with the suite that carries its
+// backward-refusal evidence instead. Cell 2 accepts a NEW-written top
+// flag-reachable full that OLD can still read ONLY when every tier above
+// OLD's ceiling is listed here — so a flag-reachable bump still fails
+// cell 2 until xvTopFormatFlags learns it, exactly as before.
+//
+// Version 11 is the first such tier: it is stamped by the SHAPE of the
+// source (a full that finalizes without a CDC position on a source whose
+// reader resumes from one), and a Postgres primary always records an LSN.
+var xvShapeStampedTiers = map[int]string{
+	irbackup.FormatVersionPositionlessFull: "TestBackup_CrossVersionPositionlessFull (internal/pipeline/backup)",
 }
 
 // xvBackupFullTopFormat writes a full stamped at the current top format
@@ -889,10 +905,47 @@ func TestBackup_CrossVersionChainCompat(t *testing.T) {
 		// tier permits one.
 		root := xvRootVersion(t, dir)
 		if root <= bins.oldFormat {
-			t.Fatalf("NEW wrote a root manifest stamped %d, which OLD (%d) can read — this cell cannot "+
-				"assert a refusal it will never see. xvTopFormatFlags is supposed to reach the CURRENT "+
-				"top tier (%d); if the format was bumped for a feature those flags do not trigger, add it "+
-				"there rather than lowering this check.", root, bins.oldFormat, bins.newFormat)
+			// No flag reached a tier OLD cannot read. That is legitimate only
+			// when EVERY tier above OLD's ceiling is one no `backup full` flag
+			// can reach on a Postgres primary — each named, with the suite
+			// that carries its backward refusal, in xvShapeStampedTiers.
+			// Anything else is the old mistake: a flag-reachable bump nobody
+			// added to xvTopFormatFlags.
+			for v := bins.oldFormat + 1; v <= bins.newFormat; v++ {
+				if _, shaped := xvShapeStampedTiers[v]; !shaped {
+					t.Fatalf("NEW wrote a root manifest stamped %d, which OLD (%d) can read, and tier %d is not in "+
+						"xvShapeStampedTiers — this cell cannot assert a refusal it will never see. xvTopFormatFlags "+
+						"is supposed to reach every flag-reachable tier up to NEW's (%d); if the format was bumped for "+
+						"a feature those flags do not trigger, add it there, or — if no flag on a Postgres primary can "+
+						"reach it — name it in xvShapeStampedTiers with the suite that pins its refusal. Never lower "+
+						"this check.", root, bins.oldFormat, v, bins.newFormat)
+				}
+			}
+			// The complementary property, asserted rather than assumed: the
+			// newest flag-reachable full stays readable by OLD, or the
+			// shape-scoped bump locked OLD out of a backup it can read. Rows
+			// are graded against the SOURCE, and the redacted column must
+			// still be redacted after OLD's restore.
+			t.Logf("cell 2: tiers %d..%d are shape-stamped (%v); NEW's top flag-reachable full is stamped %d, so OLD must RESTORE it",
+				bins.oldFormat+1, bins.newFormat, xvShapeStampedTiers, root)
+			out, err := xvRestore(t, bins.oldBin, dir, tgt)
+			if err != nil {
+				t.Fatalf("cell 2: OLD %s could not restore a full NEW stamped %d, within OLD's ceiling %d — a "+
+					"shape-scoped bump must not lock OLD out of the fulls no flag stamps above it: %v\n--- output ---\n%s",
+					bins.oldTag, root, bins.oldFormat, err, out)
+			}
+			srcUsers, tgtUsers := xvUsers(t, src), xvUsers(t, tgt)
+			if len(tgtUsers) != len(srcUsers) || len(srcUsers) == 0 {
+				t.Fatalf("cell 2: OLD restored %d users; the source holds %d", len(tgtUsers), len(srcUsers))
+			}
+			for i := range srcUsers {
+				if tgtUsers[i].ID != srcUsers[i].ID || tgtUsers[i].Email == srcUsers[i].Email {
+					t.Fatalf("cell 2: restored user %+v against source %+v — want the same id with the email redacted",
+						tgtUsers[i], srcUsers[i])
+				}
+			}
+			ledger.report(t, "2-backward-refusal")
+			return
 		}
 		t.Logf("cell 2: NEW wrote a redacted full stamped root=%d (OLD reads up to %d)", root, bins.oldFormat)
 
@@ -1163,8 +1216,10 @@ func TestBackup_CrossVersionChainCompat(t *testing.T) {
 		for _, v := range append([]int{root}, segs...) {
 			if v > bins.peerFormat {
 				t.Fatalf("cell 6: NEW stamped a manifest at %d, above PEER %s's BackupFormatVersion %d — PEER would "+
-					"refuse on the VERSION gate and this cell would be measuring cell 2. The peer derivation is "+
-					"supposed to make that impossible; see scripts/crossversion-build.sh.", v, bins.peerTag, bins.peerFormat)
+					"refuse on the VERSION gate and this cell would be measuring cell 2. On a fresh format bump the "+
+					"peer is the newest release BELOW NEW's format (scripts/crossversion-build.sh), so this fires when "+
+					"the bump reaches the ordinary chain this cell writes; once a release ships at NEW's format the "+
+					"peer re-arms to it.", v, bins.peerTag, bins.peerFormat)
 			}
 		}
 		t.Logf("cell 6: NEW chain stamped root=%d segments=%v (PEER %s reads up to %d)", root, segs, bins.peerTag, bins.peerFormat)
