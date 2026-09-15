@@ -50,9 +50,17 @@ type CDCReader struct {
 	// wrote its marker under the NEW schema, the schema check dropped it,
 	// and the stream stalled silently at exit 0). A decoy relation
 	// another role built was never captured here, so its OID is absent
-	// and the security half holds. nil when the load failed (a WARN says
-	// so); then only the schema check applies, which is the pre-fix
-	// behaviour.
+	// and the security half holds.
+	//
+	// Never nil after a successful StreamChanges: a failed load REFUSES
+	// the open (audit 2026-09-15 A0915-PG-MEDIUM-1 / -2). It used to WARN and
+	// leave the field nil, which the earlier comment here described as
+	// "the pre-fix behaviour" — that is, the silent stall the fix exists
+	// to close, re-entered on a catalog blip with a WARN as the only
+	// trace. The DDL halt is the ONLY thing standing between a moved
+	// captured table and permanent unnoticed divergence (its rows arrive
+	// under the new schema and are dropped), so the set the halt depends
+	// on is load-bearing, not an optimisation.
 	capturedRelIDs map[uint32]bool
 
 	pollInterval time.Duration
@@ -329,15 +337,24 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 	}
 
 	// The identity set a DDL marker from a foreign schema is graded
-	// against (A0909-PG-MEDIUM-1). A failed load WARNs and leaves the
-	// pre-fix behaviour: such a marker is discarded by the schema check.
-	if ids, lerr := loadCapturedRelIDs(ctx, r.db, r.schema); lerr != nil {
-		slog.WarnContext(ctx, "pgtrigger: stream: could not read the captured relations' OIDs; a DDL marker "+
-			"for a captured table moved to another schema (ALTER TABLE … SET SCHEMA) will be discarded "+
-			"instead of halting the stream", slog.String("schema", r.schema), slog.String("error", lerr.Error()))
-	} else {
-		r.capturedRelIDs = ids
+	// against (A0909-PG-MEDIUM-1). A failed load REFUSES the open
+	// (A0915-PG-MEDIUM-2): without the set, the marker for a captured
+	// table moved with `ALTER TABLE … SET SCHEMA` is discarded, nothing
+	// halts, and every later row of that table is dropped behind one WARN
+	// — the silent stall, re-entered on a catalog read that failed. The
+	// trade-off is stated: a transient failure of this one catalog read
+	// at open now fails `sync start` (a loud, re-runnable refusal) where
+	// it used to degrade the scope check silently for the stream's whole
+	// life. The read has [openProbeTimeout] and touches only pg_trigger /
+	// pg_proc / pg_namespace, which every role can read, so a failure
+	// here is a real connectivity or catalog fault, not a privilege gap.
+	ids, err := loadCapturedRelIDs(ctx, r.db, r.schema)
+	if err != nil {
+		return nil, fmt.Errorf("pgtrigger: stream: read the captured relations' OIDs (schema %q): %w — refusing to open: without this set a "+
+			"DDL marker for a captured table moved to another schema (ALTER TABLE … SET SCHEMA) would be discarded and the table's later "+
+			"changes dropped instead of halting the stream; re-run `sluice sync start --source-driver=... --source=... --target-driver=... --target=...` once the source catalog is readable", r.schema, err)
 	}
+	r.capturedRelIDs = ids
 	out := make(chan ir.Change, cdcChannelBuffer)
 	pumpCtx, cancel := context.WithCancel(ctx)
 	r.pumpCancel = cancel
@@ -688,7 +705,7 @@ func (r *CDCReader) poll(ctx context.Context, lastSeen int64) (pollBatch, error)
 			marker = decodeDDLMarker(pkJSON.String)
 		}
 		if !r.rowInCaptureScope(op, schema, table, marker.relID) {
-			r.warnOutOfScopeCapture(ctx, schema, table, id)
+			r.warnOutOfScopeCapture(ctx, op, schema, table, id)
 			continue
 		}
 
@@ -1221,7 +1238,30 @@ func (r *CDCReader) rowInCaptureScope(op, schema, table string, relID uint32) bo
 // attacker's rate and a per-row WARN would be its own denial of service;
 // at all, because a dropped row is either an attack or a
 // misconfiguration and both need to be visible.
-func (r *CDCReader) warnOutOfScopeCapture(ctx context.Context, schema, table string, id int64) {
+//
+// TWO CAUSES, TWO MARKERS (audit 2026-09-15 A0915-PG-MEDIUM-1 / -2). A row
+// from a foreign schema is either a decoy (the S-2 attack, or a stale
+// install) or a CAPTURED table that was moved there with `ALTER TABLE …
+// SET SCHEMA`: the row trigger writes TG_TABLE_SCHEMA, which after the
+// move is the new schema, and the row arms carry no OID. The WARN used
+// to blame the attacker in both cases and never mentioned the move, so
+// an operator whose table had moved was sent hunting for a trigger that
+// does not exist while the table's every change was being dropped. The
+// two are told apart by ONE catalog read per relation (the dedupe makes
+// it once): the row's relation resolved to its OID, which is in this
+// stream's captured set exactly when the relation is one it captured at
+// open. A decoy's OID never is. A failed probe falls back to the generic
+// marker with both causes listed — it must not go quiet.
+//
+// Why the moved table's rows are DROPPED rather than applied: the halt is
+// the design. `SET SCHEMA` writes a DDL marker that stops the stream
+// stickily before any post-move row is consumed, so this WARN fires for a
+// moved table only when that halt did not — an install whose capture
+// function predates `captured_relid` (STALE-CAPTURE-FUNCTION says so at
+// every open), or a halt an operator cleared without re-running setup.
+// Applying the rows would forward writes into a target table the sync's
+// configuration no longer describes.
+func (r *CDCReader) warnOutOfScopeCapture(ctx context.Context, op, schema, table string, id int64) {
 	key := schema + "." + table
 	if r.outOfScopeWarned == nil {
 		r.outOfScopeWarned = make(map[string]bool)
@@ -1230,13 +1270,67 @@ func (r *CDCReader) warnOutOfScopeCapture(ctx context.Context, schema, table str
 		return
 	}
 	r.outOfScopeWarned[key] = true
+
+	moved, probeErr := r.rowNamesAMovedCapturedRelation(ctx, op, schema, table)
+	if moved {
+		slog.WarnContext(
+			ctx, "pgtrigger: "+capturedRelationMovedMarker+": dropping a change-log row for a CAPTURED table that was moved to another schema (ALTER TABLE … SET SCHEMA); every change to it is being dropped and will never be applied",
+			slog.String("row_schema", schema),
+			slog.String("row_table", table),
+			slog.String("stream_schema", r.schema),
+			slog.Int64("change_log_id", id),
+			slog.String("why", "the relation carries this install's capture trigger but its rows now arrive under a schema this stream does not read; the move's DDL marker should have halted the stream and did not (a capture function older than captured_relid, or a cleared halt)"),
+			slog.String("action", "drain the stream (`sluice sync stop --wait`), decide whether the table belongs in the sync under its new schema, re-run `sluice trigger setup --dsn=<source-dsn> --tables=<...>` so the capture functions carry captured_relid, then `sluice sync start --source-driver=... --source=... --target-driver=... --target=... --restart-from-scratch`; the target has been frozen for this table since the move"),
+		)
+		return
+	}
+	why := "the capture function is SECURITY DEFINER and executable by PUBLIC by default, so any source role that can create a table and a trigger can write rows into the change log naming a table it does not own"
+	if probeErr != nil {
+		why += "; OR a captured table was moved with ALTER TABLE … SET SCHEMA and its move-halt did not fire — the catalog probe that tells the two apart failed: " + probeErr.Error()
+	}
 	slog.WarnContext(
 		ctx, "pgtrigger: CAPTURE-OUT-OF-SCOPE: dropping a change-log row for a relation this stream does not sync; it will never be applied",
 		slog.String("row_schema", schema),
 		slog.String("row_table", table),
 		slog.String("stream_schema", r.schema),
 		slog.Int64("change_log_id", id),
-		slog.String("why", "the capture function is SECURITY DEFINER and executable by PUBLIC by default, so any source role that can create a table and a trigger can write rows into the change log naming a table it does not own"),
-		slog.String("action", "if you did not expect this, inspect the source for triggers calling sluice's capture function on tables outside the sync, and REVOKE EXECUTE ON FUNCTION <schema>.sluice_capture_change(text) FROM PUBLIC"),
+		slog.String("why", why),
+		slog.String("action", "if you did not expect this, inspect the source for triggers calling sluice's capture function on tables outside the sync, and REVOKE EXECUTE ON FUNCTION <schema>.sluice_capture_change(text) FROM PUBLIC; if the relation is a synced table you moved between schemas, drain the stream, re-run `sluice trigger setup --dsn=<source-dsn> --tables=<...>`, and `sluice sync start --source-driver=... --source=... --target-driver=... --target=... --restart-from-scratch`"),
 	)
+}
+
+// capturedRelationMovedMarker is the grep-stable marker for a change-log
+// row dropped because its CAPTURED relation now lives in a schema this
+// stream does not read (see [CDCReader.warnOutOfScopeCapture]).
+const capturedRelationMovedMarker = "CAPTURE-RELATION-MOVED"
+
+// rowNamesAMovedCapturedRelation resolves an out-of-scope row's relation
+// to its OID and reports whether that OID is one this stream captured at
+// open — i.e. the relation is a captured table that was moved, not a
+// decoy. The row arms write a bare TG_TABLE_NAME under TG_TABLE_SCHEMA;
+// the DDL arms write object_identity, which is already a regclass
+// spelling. to_regclass returns NULL for a relation that does not exist
+// (a dropped decoy), which reads as "not moved".
+func (r *CDCReader) rowNamesAMovedCapturedRelation(ctx context.Context, op, schema, table string) (bool, error) {
+	if len(r.capturedRelIDs) == 0 || r.db == nil {
+		return false, nil
+	}
+	ident := table
+	if op != "X" {
+		ident = quoteIdent(schema) + "." + quoteIdent(table)
+	}
+	ctx, cancel := context.WithTimeout(ctx, openProbeTimeout)
+	defer cancel()
+	var oid sql.NullString
+	if err := r.db.QueryRowContext(ctx, `SELECT pg_catalog.to_regclass($1)::oid::text`, ident).Scan(&oid); err != nil {
+		return false, err
+	}
+	if !oid.Valid {
+		return false, nil
+	}
+	v, err := strconv.ParseUint(oid.String, 10, 32)
+	if err != nil {
+		return false, err
+	}
+	return r.capturedRelIDs[uint32(v)], nil
 }

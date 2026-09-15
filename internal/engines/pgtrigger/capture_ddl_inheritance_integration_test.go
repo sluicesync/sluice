@@ -8,6 +8,7 @@ package pgtrigger
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"testing"
 	"time"
 )
@@ -149,5 +150,118 @@ func TestCaptureDDL_ThroughParentWithTriggersOnChildren(t *testing.T) {
 					tc.ddl, got, tc.table, tc.want)
 			}
 		})
+	}
+
+	// # Relation-ADDING shapes (the 2026-09-15 PG audit's F4)
+	//
+	// Every statement that adds an UNCAPTURED relation to a tree one of
+	// whose members is captured. Rows routed into the new member are rows
+	// the captured logical table used to receive and now silently does
+	// not, so each must record a marker — or be named in the exemption map
+	// with a reason. Before the fix, `ATTACH PARTITION` (objid = the
+	// parent, walked downward) recorded one and `CREATE TABLE … PARTITION
+	// OF` (objid = the NEW partition, descendant set empty) recorded
+	// nothing, on PG 16.15 and 18.6 alike: the fix's own class, half
+	// closed. The negative controls are the same shapes against a tree
+	// nobody captures, so the fix cannot "pass" by recording every CREATE.
+	//
+	// table is the marker's table_name — object_identity of the command's
+	// OWN object, which for a CREATE is the NEW relation and for an ATTACH
+	// is the parent.
+	relationAddingExempt := map[string]string{}
+	applyPGSQL(t, dsn, `
+		-- val is BIGINT: the ALTER cells above already widened the parents, and ATTACH requires the same type.
+		CREATE TABLE ev_ap (id bigint, region text, val bigint, PRIMARY KEY (id, region));
+		CREATE TABLE deep_eu_fr_ap (id bigint, region text, val bigint, PRIMARY KEY (id, region));
+		CREATE TABLE unwatched_p (id bigint, region text, val int, PRIMARY KEY (id, region)) PARTITION BY LIST (region);
+		CREATE TABLE unwatched_p_us PARTITION OF unwatched_p FOR VALUES IN ('us');
+		CREATE TABLE unwatched_base (id bigint PRIMARY KEY, val int);
+		CREATE TABLE unwatched_leaf (PRIMARY KEY (id)) INHERITS (unwatched_base);
+		CREATE TABLE unwatched_ap (id bigint, region text, val int, PRIMARY KEY (id, region));`)
+	for _, tc := range []struct {
+		name  string
+		ddl   string
+		table string
+		want  int
+	}{
+		{
+			name:  "ALTER … ATTACH PARTITION adds a partition to a captured tree",
+			ddl:   `ALTER TABLE ev ATTACH PARTITION ev_ap FOR VALUES IN ('ap')`,
+			table: "public.ev",
+			want:  1,
+		},
+		{
+			name:  "CREATE TABLE … PARTITION OF adds a partition to a captured tree",
+			ddl:   `CREATE TABLE ev_uk PARTITION OF ev FOR VALUES IN ('uk')`,
+			table: "public.ev_uk",
+			want:  1,
+		},
+		{
+			name:  "CREATE TABLE … INHERITS adds a child to a captured tree",
+			ddl:   `CREATE TABLE leaf2 (PRIMARY KEY (id)) INHERITS (base)`,
+			table: "public.leaf2",
+			want:  1,
+		},
+		{
+			name:  "nesting: CREATE TABLE … PARTITION OF a SUB-partition whose sibling is captured",
+			ddl:   `CREATE TABLE deep_eu_fr PARTITION OF deep_eu FOR VALUES IN ('fr')`,
+			table: "public.deep_eu_fr",
+			want:  1,
+		},
+		{
+			name:  "nesting: ATTACH PARTITION to a SUB-partition whose child is captured",
+			ddl:   `ALTER TABLE deep_eu ATTACH PARTITION deep_eu_fr_ap FOR VALUES IN ('fr-ap')`,
+			table: "public.deep_eu",
+			want:  1,
+		},
+		{
+			name:  "NEGATIVE control: CREATE TABLE … PARTITION OF an uncaptured tree",
+			ddl:   `CREATE TABLE unwatched_p_eu PARTITION OF unwatched_p FOR VALUES IN ('eu')`,
+			table: "public.unwatched_p_eu",
+			want:  0,
+		},
+		{
+			name:  "NEGATIVE control: ATTACH PARTITION to an uncaptured tree",
+			ddl:   `ALTER TABLE unwatched_p ATTACH PARTITION unwatched_ap FOR VALUES IN ('ap')`,
+			table: "public.unwatched_p",
+			want:  0,
+		},
+		{
+			name:  "NEGATIVE control: CREATE TABLE … INHERITS an uncaptured parent",
+			ddl:   `CREATE TABLE unwatched_leaf2 (PRIMARY KEY (id)) INHERITS (unwatched_base)`,
+			table: "public.unwatched_leaf2",
+			want:  0,
+		},
+		{
+			name:  "NEGATIVE control: a plain CREATE TABLE joins no tree",
+			ddl:   `CREATE TABLE loner (id bigint PRIMARY KEY, val int)`,
+			table: "public.loner",
+			want:  0,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if reason, ok := relationAddingExempt[tc.name]; ok {
+				t.Logf("exempt: %s", reason)
+				return
+			}
+			before := countX(t, tc.table)
+			applyPGSQL(t, dsn, tc.ddl)
+			got := countX(t, tc.table) - before
+			if got != tc.want {
+				t.Errorf("%q recorded %d 'X' marker(s) for %q, want %d.\n"+
+					"  A missing marker here is SILENT: the new relation carries no capture trigger, so every "+
+					"row routed into it is never captured and never reaches the target, at exit 0 (F4).\n"+
+					"  A SPURIOUS marker is its own failure -- it halts a stream over a tree nobody captures.",
+					tc.ddl, got, tc.table, tc.want)
+			}
+		})
+	}
+	if len(relationAddingExempt) > 0 {
+		t.Logf("relation-adding shapes exempt from the marker requirement: %v", relationAddingExempt)
+	}
+	for name := range relationAddingExempt {
+		if strings.TrimSpace(relationAddingExempt[name]) == "" {
+			t.Errorf("relation-adding exemption %q has no reason", name)
+		}
 	}
 }

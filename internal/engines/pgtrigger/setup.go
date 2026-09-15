@@ -1772,11 +1772,15 @@ func captureDDLSuppressionCheck(metaTableRef string) string {
 //	ALTER TABLE … RENAME COLUMN                                  object_type "table column", objid = the table
 //	ALTER TABLE … ATTACH PARTITION                               object_type "table",        objid = the PARENT
 //	CREATE INDEX, CREATE INDEX CONCURRENTLY                      object_type "index",        objid = the index
+//	CREATE TABLE … PARTITION OF / … INHERITS (…)  (PG 16 + 18)   object_type "table",        objid = the NEW relation
 //
 // So every shape but an index resolves through objid directly, and an
 // index resolves through pg_index.indrelid. ADD CONSTRAINT was the one
 // worth measuring — a constraint OID there would have been silently
-// skipped — and it reports the table.
+// skipped — and it reports the table. The relation-ADDING CREATEs are the
+// shape where objid is the wrong end of the tree, which is why the CTE
+// seeds their parents (2026-09-15 F4 below; pinned by the relation-adding
+// cells of TestCaptureDDL_ThroughParentWithTriggersOnChildren).
 //
 // The classid guard is why a non-relation command cannot be misread: an
 // OID is only meaningful against its own catalog, and `CREATE TRIGGER`
@@ -1795,6 +1799,12 @@ func captureDDLSuppressionCheck(metaTableRef string) string {
 // write a wrong row — no capture trigger, no change rows — and
 // `sluice sync add-table` is how it joins the stream. Halting for it
 // forced a restart-from-scratch over a table the stream was not carrying.
+// The exception is a `CREATE TABLE` that ADDS a relation to a tree one
+// of whose members is captured (`PARTITION OF` / `INHERITS`, audit
+// 2026-09-15 F4): rows routed into the new partition are rows the
+// captured logical table used to receive and now silently does not, so
+// that shape records a marker exactly as `ATTACH PARTITION` does — the
+// `captured_kin` CTE below seeds the new relation's parents for it.
 //
 // Changing this body changes the capture-shape door's digest, so an
 // install created by an earlier sluice WARNs [staleCaptureFunctionMarker]
@@ -1837,10 +1847,28 @@ BEGIN
                  -- trigger on a sub-partition is as much a reason to record the
                  -- root's ALTER as one on a direct child.
                  --
-                 -- Direction matters and only DOWNWARD is needed. DDL naming a
-                 -- CHILD while only the parent is installed already matches
-                 -- directly, because PostgreSQL CLONES a parent's row trigger
-                 -- onto every partition.
+                 -- Direction matters and DOWNWARD is enough for every shape
+                 -- but one. DDL naming a CHILD while only the parent is
+                 -- installed already matches directly, because PostgreSQL
+                 -- CLONES a parent's row trigger onto every partition.
+                 --
+                 -- The one exception is a relation-ADDING command (audit
+                 -- 2026-09-15 F4): CREATE TABLE p3 PARTITION OF p and
+                 -- CREATE TABLE leaf2 (...) INHERITS (base) arrive with the
+                 -- NEW relation as objid, whose descendant set is empty, so
+                 -- the walk found nothing while its sibling ALTER TABLE p
+                 -- ATTACH PARTITION p4 (objid = the parent) recorded a
+                 -- marker. Both add an uncaptured relation to a captured
+                 -- tree; rows routed into the new partition are never
+                 -- captured and never reach the target, at exit 0. For
+                 -- those two tags the new relation's PARENTS seed the walk
+                 -- too, so the captured siblings are found. Only those
+                 -- tags: seeding parents for every command would halt the
+                 -- stream on an ALTER of an UNCAPTURED sibling partition,
+                 -- which concerns no captured row. CREATE FOREIGN TABLE
+                 -- is included because a foreign table can be a partition
+                 -- and is added the same way (not measured on a real
+                 -- server; the CREATE TABLE cells are).
                  WITH RECURSIVE captured_kin(relid) AS (
                      SELECT CASE
                               WHEN c.object_type = 'index'
@@ -1849,6 +1877,12 @@ BEGIN
                                        WHERE i.indexrelid = c.objid)
                               ELSE c.objid
                             END
+                   UNION ALL
+                     SELECT inh.inhparent
+                       FROM pg_catalog.pg_inherits inh
+                      WHERE inh.inhrelid = c.objid
+                        AND c.object_type = 'table'
+                        AND c.command_tag IN ('CREATE TABLE', 'CREATE FOREIGN TABLE')
                    UNION ALL
                      SELECT inh.inhrelid
                        FROM pg_catalog.pg_inherits inh
@@ -1985,6 +2019,40 @@ $sluice$;`
 // the sibling's, for the same reasons ([captureDDLSuppressionCheck],
 // SEC-1). Teardown drops the event triggers before its own DROP TABLEs,
 // so removing the engine never records its own drops.
+//
+// # captured_relid on THIS arm too (audit 2026-09-15 A0915-PG-MEDIUM-1)
+//
+// The foreign-schema escape (A0909-PG-MEDIUM-1) grades an 'X' marker
+// that arrives under a schema other than the reader's by the OID of the
+// captured relation it names, and it landed on the ddl_command_end arm
+// only. This arm wrote no OID, so `DROP TABLE other.t` on a captured
+// table that had been moved with `ALTER TABLE … SET SCHEMA` (and whose
+// move-halt the operator had cleared) recorded a marker the reader
+// decoded to relID 0 and discarded — the D-1 silent-DROP class reopened,
+// one schema over, on both PG 16 and PG 18. The dropped table's OID is
+// `objid` in pg_event_trigger_dropped_objects() (classid pg_class for an
+// object_type of 'table'), and it is the relation that carried the
+// capture trigger, so it is exactly what the reader's captured-OID set
+// holds for a table that was captured at stream open.
+//
+// The residual this does NOT close, named so nobody reads the fix as
+// wider than it is: a reader opened AFTER the drop cannot grade the
+// marker, because the relation — and the trigger the captured-OID set is
+// derived from — is gone from the catalog, and post-drop a decoy's marker
+// and a captured table's are indistinguishable. A live stream halts (the
+// pin is the "moved-then-dropped" cell of
+// TestCDCReader_DDLRefusal_ForeignSchemaMarkers); a plain `sync start`
+// resume over the pending foreign-schema DROP marker re-discards it.
+// The drop remedy is `--restart-from-scratch`, which never re-reads the
+// marker, so the residual is confined to a resume the remedy does not
+// prescribe. Closing it needs setup to RECORD the captured OIDs (the meta
+// table carries no table list today) and is deferred with that reason.
+//
+// Changing this body changes the capture-shape door's digest, exactly
+// as it did for the sibling in v0.148.2: an existing install WARNs
+// [staleCaptureFunctionMarker] at every CDC open until `trigger setup`
+// is re-run, and until then its DROP markers carry no OID and decode as
+// the vintage shape (relID 0 — never in scope from a foreign schema).
 func renderCaptureDropFunction(schema, changeLogTableRef, metaTableRef string) string {
 	return `CREATE OR REPLACE FUNCTION ` + dropFnRef(schema) + `()
 RETURNS event_trigger
@@ -1998,7 +2066,7 @@ DECLARE
     v_suppress BOOLEAN;
 BEGIN
 ` + captureDDLSuppressionCheck(metaTableRef) + `    FOR r IN
-        SELECT d.schema_name AS schema_name, d.object_identity AS object_identity
+        SELECT d.schema_name AS schema_name, d.object_identity AS object_identity, d.objid AS captured_relid
           FROM pg_catalog.pg_event_trigger_dropped_objects() d
          WHERE d.object_type = 'table'
            AND NOT d.is_temporary
@@ -2018,10 +2086,16 @@ BEGIN
                  COALESCE(r.schema_name, 'public'),
                  COALESCE(r.object_identity, 'unknown'),
                  'X',
+                 -- captured_relid: the dropped relation's own OID — it is
+                 -- the relation that carried the capture trigger, so it
+                 -- is what the reader's captured-OID set holds. TEXT for
+                 -- the same reason as the sibling arm (a string-map
+                 -- decode). See the function doc (A0915-PG-MEDIUM-1).
                  pg_catalog.jsonb_build_object(
                      'command_tag', TG_TAG,
                      'object_type', 'table',
-                     '` + ddlMarkerDroppedRelationKey + `', COALESCE(r.object_identity, 'unknown')),
+                     '` + ddlMarkerDroppedRelationKey + `', COALESCE(r.object_identity, 'unknown'),
+                     '` + ddlMarkerRelIDKey + `', r.captured_relid::text),
                  NULL,
                  NULL);
         EXCEPTION

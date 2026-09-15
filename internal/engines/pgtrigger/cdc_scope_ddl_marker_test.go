@@ -3,7 +3,12 @@
 
 package pgtrigger
 
-import "testing"
+import (
+	"context"
+	"database/sql"
+	"strings"
+	"testing"
+)
 
 // TestRowInCaptureScope_DDLMarkersAreNotTableScoped pins the fix for the
 // silent-loss regression the v0.145.0 pre-tag value-fidelity review found
@@ -107,8 +112,15 @@ func TestRowInCaptureScope_AMovedCapturedTableStaysInScopeByOID(t *testing.T) {
 		t.Fatal("a DDL marker for a relation this stream never captured was accepted from a foreign schema; " +
 			"a decoy could halt the stream")
 	}
+	// A marker with no OID is the VINTAGE shape only — an install whose
+	// capture functions predate captured_relid. It is not what any CURRENT
+	// producer writes: TestDDLMarkerProducerRoster_EveryProducerRecordsCapturedRelID
+	// derives every op='X' producer from setup.go and requires the key of
+	// each. This cell used to be read as also covering the sql_drop arm,
+	// which then wrote no OID and so had its foreign-schema DROP markers
+	// discarded as if they were vintage (A0915-PG-MEDIUM-1).
 	if r.rowInCaptureScope("X", "other", "other.orders", 0) {
-		t.Fatal("a foreign-schema marker with NO recorded OID was accepted; an older capture function must not widen scope")
+		t.Fatal("a foreign-schema marker with NO recorded OID was accepted; a vintage capture function must not widen scope")
 	}
 	if r.rowInCaptureScope("I", "other", "orders", 16385) {
 		t.Fatal("a ROW event from a foreign schema was accepted because its relation is captured; the OID rule is for DDL markers only (the S-2 security half stays)")
@@ -126,5 +138,49 @@ func TestDecodeDDLMarker_ReadsTheRelationOID(t *testing.T) {
 	}
 	if old := decodeDDLMarker(`{"command_tag":"ALTER TABLE","object_type":"table"}`); old.relID != 0 || old.tag != "ALTER TABLE" {
 		t.Fatalf("a pre-captured_relid marker decoded as %+v; want relID 0 with the tag intact", old)
+	}
+	// The sql_drop arm's payload, as it is written from v0.153.x: the OID
+	// rides alongside dropped_relation, and BOTH must survive the decode —
+	// the OID is what keeps a moved table's DROP in scope, the relation
+	// name is what selects the drop remedy (A0915-PG-MEDIUM-1).
+	drop := decodeDDLMarker(`{"command_tag":"DROP TABLE","object_type":"table","dropped_relation":"other.orders","captured_relid":"16385"}`)
+	if drop.relID != 16385 || drop.droppedRelation != "other.orders" || drop.tag != "DROP TABLE" {
+		t.Fatalf("a sql_drop marker decoded as %+v; want relID 16385, dropped_relation other.orders and the tag", drop)
+	}
+	r := &CDCReader{schema: "public", capturedRelIDs: map[uint32]bool{16385: true}}
+	if !r.rowInCaptureScope("X", "other", "other.orders", drop.relID) {
+		t.Fatal("the DROP marker for a captured table that had been moved to another schema was discarded; " +
+			"the D-1 silent-DROP class, one schema over")
+	}
+}
+
+// TestStreamChanges_RefusesWhenTheCapturedOIDSetCannotBeLoaded pins
+// A0915-PG-MEDIUM-2's loud half: a failed [loadCapturedRelIDs] refuses the
+// open instead of WARNing and leaving the set nil, because a nil set is
+// the silent stall the set exists to prevent (a moved captured table's
+// marker discarded, its rows dropped behind one WARN).
+//
+// The stub connector never connects, so the first catalog read fails. A
+// resume position is used so that read IS the OID load: the zero
+// position would fail one query earlier, at the MAX(id) anchor, and the
+// cell would grade the wrong refusal.
+func TestStreamChanges_RefusesWhenTheCapturedOIDSetCannotBeLoaded(t *testing.T) {
+	r := &CDCReader{db: sql.OpenDB(stubConnector{}), schema: "public"}
+	pos, err := encodePos(pgTriggerPos{LastID: 7})
+	if err != nil {
+		t.Fatalf("encodePos: %v", err)
+	}
+	out, err := r.StreamChanges(context.Background(), pos)
+	if err == nil {
+		_ = r.Close()
+		t.Fatal("StreamChanges opened with the captured-OID set unloaded; a SET SCHEMA marker would now be discarded and the moved table's changes dropped silently")
+	}
+	if out != nil {
+		t.Errorf("StreamChanges returned a channel alongside the refusal")
+	}
+	for _, want := range []string{"captured relations' OIDs", "SET SCHEMA", "refusing to open"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal %q does not name %q", err, want)
+		}
 	}
 }

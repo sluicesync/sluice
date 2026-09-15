@@ -32,6 +32,8 @@ package pgtrigger
 import (
 	"context"
 	"database/sql"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -41,8 +43,9 @@ import (
 // expectDDLHalt opens a reader at resumeFrom, runs apply, and requires the
 // stream to close with the observed-DDL refusal. A stream that keeps
 // running is the defect: the marker was discarded and the halt became a
-// silent stall.
-func expectDDLHalt(t *testing.T, ctx context.Context, dsn string, resumeFrom ir.Position, cell string, apply func()) {
+// silent stall. wantInErr names substrings the refusal must carry beyond
+// the generic "DDL" — the drop remedy's relation name, for one.
+func expectDDLHalt(t *testing.T, ctx context.Context, dsn string, resumeFrom ir.Position, cell string, apply func(), wantInErr ...string) {
 	t.Helper()
 	reader, err := (Engine{}).OpenCDCReader(ctx, dsn)
 	if err != nil {
@@ -76,6 +79,11 @@ func expectDDLHalt(t *testing.T, ctx context.Context, dsn string, resumeFrom ir.
 				}
 				if !contains(err.Error(), "DDL") {
 					t.Errorf("%s: Err = %v; want the observed-DDL refusal", cell, err)
+				}
+				for _, want := range wantInErr {
+					if !contains(err.Error(), want) {
+						t.Errorf("%s: Err = %v; want it to name %q", cell, err, want)
+					}
 				}
 				t.Logf("%s: halted as documented: %v", cell, err)
 				return
@@ -123,14 +131,114 @@ func TestCDCReader_DDLRefusal_ForeignSchemaMarkers(t *testing.T) {
 	mustExec(`CREATE TABLE public.mv (id int PRIMARY KEY, v int)`)
 	mustExec(`CREATE TABLE public.mr (id int PRIMARY KEY, v int)`)
 	mustExec(`CREATE TABLE public.mi (id int PRIMARY KEY, v int)`)
+	mustExec(`CREATE TABLE public.md (id int PRIMARY KEY, v int)`)
+	mustExec(`CREATE TABLE public.mrow (id int PRIMARY KEY, v int)`)
 	mustExec(`CREATE TABLE public.pp (id int, v int, PRIMARY KEY (id)) PARTITION BY RANGE (id)`)
 	mustExec(`CREATE TABLE public.pp_p1 PARTITION OF public.pp FOR VALUES FROM (1) TO (100)`)
 	// The supported route for a partitioned source: sync start and migrate
 	// refuse a declaratively partitioned parent at preflight, so the
 	// operator installs on the PARTITIONS.
-	if _, err := Setup(ctx, dsn, SetupOptions{Tables: []string{"mv", "mr", "mi", "pp_p1"}, Schema: "public"}); err != nil {
+	if _, err := Setup(ctx, dsn, SetupOptions{Tables: []string{"mv", "mr", "mi", "md", "mrow", "pp_p1"}, Schema: "public"}); err != nil {
 		t.Fatalf("Setup: %v", err)
 	}
+
+	t.Run("moved, halt cleared, then DROPPED: the sql_drop marker is graded by OID too", func(t *testing.T) {
+		// Audit 2026-09-15 A0915-PG-MEDIUM-1. The OID escape landed on the
+		// ddl_command_end arm only; the sql_drop arm wrote no
+		// captured_relid, so the DROP of a moved captured table arrived
+		// under the foreign schema with relID 0, was discarded as if
+		// vintage, and the stream ran on at exit 0 — the D-1 class, one
+		// schema over. "Halt cleared" is modelled by opening the reader
+		// PAST the move's marker, which is the state an operator is in
+		// after clearing the SET SCHEMA halt without re-running setup.
+		mustExec(`ALTER TABLE public.md SET SCHEMA other`)
+		from := tipPos()
+		expectDDLHalt(t, ctx, dsn, from, "moved-then-dropped", func() {
+			mustExec(`DROP TABLE other.md`)
+		}, "DROPPED", "other.md")
+	})
+
+	t.Run("moved, halt cleared: its rows are dropped under CAPTURE-RELATION-MOVED, a decoy's under CAPTURE-OUT-OF-SCOPE", func(t *testing.T) {
+		// Audit 2026-09-15 A0915-PG-MEDIUM-2. The escape is DDL-only — the
+		// row arms carry no OID — so a moved captured table's every ROW
+		// and TRUNCATE is dropped, and the one WARN that said so blamed an
+		// attacking role and never mentioned SET SCHEMA. The reader now
+		// tells the two apart with one catalog read per relation. This
+		// cell is the only pin on that WARN's shape: a decoy built AFTER
+		// the stream opened is absent from the captured set and must keep
+		// the generic marker, or the fix would just relabel every attack
+		// as a move.
+		mustExec(`ALTER TABLE public.mrow SET SCHEMA other`)
+		from := tipPos()
+
+		logs := &syncLogBuffer{}
+		prev := slog.Default()
+		slog.SetDefault(slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		t.Cleanup(func() { slog.SetDefault(prev) })
+
+		reader, err := (Engine{}).OpenCDCReader(ctx, dsn)
+		if err != nil {
+			t.Fatalf("OpenCDCReader: %v", err)
+		}
+		cdc := reader.(*CDCReader)
+		defer func() { _ = cdc.Close() }()
+		streamCtx, streamCancel := context.WithTimeout(ctx, 30*time.Second)
+		defer streamCancel()
+		out, err := cdc.StreamChanges(streamCtx, from)
+		if err != nil {
+			t.Fatalf("StreamChanges: %v", err)
+		}
+
+		mustExec(`INSERT INTO other.mrow (id, v) VALUES (1, 1)`)
+		mustExec(`TRUNCATE other.mrow`)
+		// The decoy: the S-2 shape, built after open so its OID is not in
+		// the captured set. A superuser builds it here; on a real install
+		// setup's REVOKE is what stops an unprivileged role doing the same.
+		mustExec(`CREATE SCHEMA evil`)
+		mustExec(`CREATE TABLE evil.mrow (id int PRIMARY KEY, v int)`)
+		mustExec(`CREATE TRIGGER ` + CaptureTriggerRow + ` AFTER INSERT OR UPDATE OR DELETE ON evil.mrow FOR EACH ROW EXECUTE FUNCTION ` + rowFunctionRef("public") + `('["id"]')`)
+		mustExec(`INSERT INTO evil.mrow (id, v) VALUES (1, 1)`)
+
+		deadline := time.Now().Add(15 * time.Second)
+		for time.Now().Before(deadline) {
+			s := logs.String()
+			if contains(s, capturedRelationMovedMarker) && contains(s, "CAPTURE-OUT-OF-SCOPE") {
+				break
+			}
+			select {
+			case ev, open := <-out:
+				if !open {
+					t.Fatalf("the stream closed (Err = %v); want it to keep running, dropping the moved table's rows with a WARN", cdc.Err())
+				}
+				t.Fatalf("the stream emitted %+v; a moved table's rows must be dropped, not applied under the sync's old schema", ev)
+			case <-time.After(250 * time.Millisecond):
+			}
+		}
+		s := logs.String()
+		for _, line := range strings.Split(strings.TrimSpace(s), "\n") {
+			switch {
+			case contains(line, capturedRelationMovedMarker):
+				if !contains(line, `"row_schema":"other"`) || !contains(line, `"row_table":"mrow"`) {
+					t.Errorf("CAPTURE-RELATION-MOVED did not name the moved relation other.mrow: %s", line)
+				}
+				for _, want := range []string{"SET SCHEMA", "sluice trigger setup", "--restart-from-scratch"} {
+					if !contains(line, want) {
+						t.Errorf("CAPTURE-RELATION-MOVED does not carry %q: %s", want, line)
+					}
+				}
+			case contains(line, "CAPTURE-OUT-OF-SCOPE"):
+				if !contains(line, `"row_schema":"evil"`) {
+					t.Errorf("CAPTURE-OUT-OF-SCOPE fired for something other than the decoy: %s", line)
+				}
+			}
+		}
+		if !contains(s, capturedRelationMovedMarker) {
+			t.Errorf("no CAPTURE-RELATION-MOVED WARN within 15s for the moved captured table's rows; the operator is still being sent to look for an attacker. Logs:\n%s", s)
+		}
+		if !contains(s, "CAPTURE-OUT-OF-SCOPE") {
+			t.Errorf("no CAPTURE-OUT-OF-SCOPE WARN within 15s for the decoy; the generic marker must survive. Logs:\n%s", s)
+		}
+	})
 
 	t.Run("live stream: SET SCHEMA on a captured table", func(t *testing.T) {
 		expectDDLHalt(t, ctx, dsn, tipPos(), "live/set-schema", func() {

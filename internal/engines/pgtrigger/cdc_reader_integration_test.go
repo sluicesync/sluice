@@ -16,6 +16,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"os"
 	"testing"
 	"time"
 
@@ -37,6 +38,12 @@ import (
 // Basic would see — those tiers don't run a pre-baked image either.
 // The per-test boot cost is acceptable for Phase 1; Phase 2 can
 // optimise via a shared container if the integration suite grows.
+//
+// SLUICE_TEST_PG_IMAGE overrides the image, mirroring the postgres
+// package's shared-container override, so this suite can be swept
+// across server versions (the audit 2026-09-15 pgtrigger findings were
+// measured on 16.15 AND 18.6, and the event-trigger catalog shapes the
+// DDL tier reads are exactly what a major version can change).
 func startPGForTrigger(t *testing.T) (dsn string, cleanup func()) {
 	t.Helper()
 	testcontainers.SkipIfProviderIsNotHealthy(t)
@@ -46,7 +53,7 @@ func startPGForTrigger(t *testing.T) (dsn string, cleanup func()) {
 
 	container, err := pgtc.Run(
 		ctx,
-		"postgres:16",
+		triggerPGImage(),
 		pgtc.WithDatabase("source_db"),
 		pgtc.WithUsername("test"),
 		pgtc.WithPassword("test"),
@@ -68,6 +75,15 @@ func startPGForTrigger(t *testing.T) (dsn string, cleanup func()) {
 		t.Fatalf("connection string: %v", err)
 	}
 	return conn, terminate
+}
+
+// triggerPGImage is the image [startPGForTrigger] boots: the
+// SLUICE_TEST_PG_IMAGE override when set, stock postgres:16 otherwise.
+func triggerPGImage() string {
+	if img := os.Getenv("SLUICE_TEST_PG_IMAGE"); img != "" {
+		return img
+	}
+	return "postgres:16"
 }
 
 // applyPGSQL runs a possibly-multi-statement script against dsn.

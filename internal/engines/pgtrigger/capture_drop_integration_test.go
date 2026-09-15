@@ -229,8 +229,24 @@ func TestCaptureDropTier_DroppedCapturedTableRefusesAtResume(t *testing.T) {
 		t.Fatalf("stream consumed %d event(s) after the no-false-fire shapes, want the INSERT; reader.Err() = %v", len(got), reader.Err())
 	}
 
-	// The consequence.
+	// The consequence. The relation's OID is read BEFORE the drop: it is
+	// the independent expected value the marker's captured_relid is graded
+	// against below (A0915-PG-MEDIUM-1 — the sql_drop arm must record the
+	// OID the reader's captured set holds, not merely "an OID").
+	var goneOID string
+	if err := db.QueryRowContext(ctx, `SELECT 'public.drop_gone'::regclass::oid::text`).Scan(&goneOID); err != nil {
+		t.Fatalf("read drop_gone's OID: %v", err)
+	}
 	applyPGSQL(t, dsn, `DROP TABLE public.drop_gone`)
+	var markerOID sql.NullString
+	if err := db.QueryRowContext(ctx, `SELECT pk_jsonb->>'`+ddlMarkerRelIDKey+`' FROM public.sluice_change_log WHERE op = 'X' ORDER BY id DESC LIMIT 1`).Scan(&markerOID); err != nil {
+		t.Fatalf("read the drop marker's %s: %v", ddlMarkerRelIDKey, err)
+	}
+	if !markerOID.Valid || markerOID.String != goneOID {
+		t.Errorf("the sql_drop marker recorded %s=%q, want the dropped table's own OID %q: a marker without the "+
+			"captured relation's OID is discarded whenever it arrives under a foreign schema (a moved table), "+
+			"which silently reopens the D-1 class one schema over", ddlMarkerRelIDKey, markerOID.String, goneOID)
+	}
 	if got := drainEvents(t, out, 1, 20*time.Second); len(got) != 0 {
 		t.Fatalf("stream emitted %d event(s) after a captured table was dropped, want the refusal: %+v", len(got), got)
 	}
