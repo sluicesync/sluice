@@ -97,7 +97,7 @@ jobs:
     timeout-minutes: 135
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v6.5.0
+      - uses: actions/setup-go@v7.0.0
         with:
           go-version-file: go.mod
 
@@ -173,7 +173,7 @@ jobs:
     timeout-minutes: 110
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v6.5.0
+      - uses: actions/setup-go@v7.0.0
         with:
           go-version-file: go.mod
 
@@ -253,7 +253,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v6.5.0
+      - uses: actions/setup-go@v7.0.0
         with:
           go-version-file: go.mod
 
@@ -318,7 +318,7 @@ jobs:
       VSTREAM_PIPELINE_EXPECTED_TESTS: "15"
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v6.5.0
+      - uses: actions/setup-go@v7.0.0
         with:
           go-version-file: go.mod
 
@@ -405,7 +405,7 @@ jobs:
       TESTCONTAINERS_RYUK_DISABLED: "true"
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v6.5.0
+      - uses: actions/setup-go@v7.0.0
         with:
           go-version-file: go.mod
 
@@ -462,7 +462,7 @@ jobs:
       TESTCONTAINERS_RYUK_DISABLED: "true"
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v6.5.0
+      - uses: actions/setup-go@v7.0.0
         with:
           go-version-file: go.mod
 
@@ -539,7 +539,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: actions/setup-go@v6.5.0
+      - uses: actions/setup-go@v7.0.0
         with:
           go-version-file: go.mod
 
@@ -609,7 +609,7 @@ jobs:
     timeout-minutes: 50
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v6.5.0
+      - uses: actions/setup-go@v7.0.0
         with:
           go-version-file: go.mod
 
