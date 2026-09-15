@@ -169,6 +169,11 @@ var errBinaryTargetColumnOnCDC = errors.New(
 //     finds nothing and the check is a no-op — and if a future branch
 //     only truncates, the columns survive and it fires, which is also
 //     right.
+//   - The stopped-cold-start resume (resumeTargetPreflight): it re-reads
+//     the source schema and the target catalog before entering CDC, so a
+//     target column made binary while the cold start was stopped is
+//     refused there (audit 2026-09-15 A0915-ARCH-MEDIUM-2's roster against
+//     the single-database cold start).
 //   - `schema add-table`, against the target the live stream applies to.
 //   - NOT the multi-database cold-start fan-out
 //     (coldStartCopyOneDatabase): it reads no target catalog of its own

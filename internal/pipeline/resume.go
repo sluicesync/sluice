@@ -58,6 +58,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -126,9 +127,14 @@ type resumeContext struct {
 	//     fine-grained, because whatever it last recorded is what a
 	//     --resume re-copies from; throttling it would widen the replay
 	//     window on every interrupted migration.
-	//   - For a sync cold start, it is a STATUS heartbeat. Nobody resumes
-	//     from it (loadOrInitState refuses), and a human polling `sync
-	//     status` cannot perceive sub-second freshness.
+	//   - For a sync cold start, it is a STATUS heartbeat while the copy
+	//     runs, and a human polling `sync status` cannot perceive
+	//     sub-second freshness. The stopped-cold-start resume DOES read
+	//     these rows back afterwards (an earlier version of this line said
+	//     nobody did) — but it keys on the TERMINAL `complete` row, which
+	//     is never throttled (see [progressThrottle]), so throttling the
+	//     intermediate writes cannot make it skip a copy. Pinned by
+	//     TestProgressThrottle ("terminal states always pass").
 	//
 	// writeTableProgress is called PER BATCH inside the copy loop, so
 	// without this the sync cold start pays one synchronous control-table
@@ -205,12 +211,20 @@ func (p *progressThrottle) allow(tableName string, terminal bool, now time.Time)
 // [deriveMigrationID] hashes (source, target, targetSchema); if a sync
 // cold start wrote under that same id, a later `migrate --resume`
 // against the same pair would find state describing a copy IT did not
-// perform and resume from it. Sync rows live under a "sync-" prefix that
-// no migrate run can derive, so the two populations cannot alias.
+// perform and resume from it. Sync rows live under [SyncMigrationIDPrefix],
+// which the DERIVED id cannot carry (it is always "auto-…") and which an
+// OPERATOR-SUPPLIED --migration-id is refused for at
+// [Migrator.resolveMigrationID]. An earlier version of this comment said
+// the two populations "cannot alias" on the strength of the derived id
+// alone; `migrate --migration-id sync-x --resume` against a target a
+// sync had cold-started was measured exiting 0 having copied nothing
+// (audit 2026-09-15 A0915-STATE-MEDIUM-1 (refuter 3)), which is why the refusal exists.
 //
-// The returned context is deliberately NOT resumable: nothing calls
-// loadOrInitState with it, and if something ever does, `enabled` alone
-// no longer implies "you may resume from this".
+// The returned context is deliberately NOT resumable through
+// loadOrInitState (it refuses a noResume context). The stopped-cold-start
+// resume ([Streamer.resumeStoppedColdStart]) DOES read these rows back,
+// through [readRecordedColdStart] and its own gates — see that file for
+// what it proves before trusting them.
 func newSyncRecordingContext(ctx context.Context, store ir.MigrationStateStore, streamID string) resumeContext {
 	// The id has to FIT, and a stream id that does not must cost the
 	// status surface rather than the migration.
@@ -358,11 +372,19 @@ func beginRecordedColdStart(ctx context.Context, rc resumeContext, rec ir.Snapsh
 	}
 }
 
+// SyncMigrationIDPrefix is the namespace a sync cold start's progress rows
+// live under in sluice_migrate_state: the STORED prefix, exported so the
+// CLI's status/health readers and the migrate-side refusal use the one
+// value the writer uses rather than a mirror of it. Changing it is a
+// data-format change (rows written under the old prefix stop being found).
+const SyncMigrationIDPrefix = "sync-"
+
 // syncMigrationID namespaces a sync cold start's progress rows so they
 // can never be mistaken for a resumable `migrate` state. See
 // [newSyncRecordingContext] for why that separation is a safety property
-// and not just tidiness.
-func syncMigrationID(streamID string) string { return "sync-" + streamID }
+// and not just tidiness, and [Migrator.resolveMigrationID] for the door
+// that keeps an operator-typed id out of this namespace.
+func syncMigrationID(streamID string) string { return SyncMigrationIDPrefix + streamID }
 
 // migrationIDMaxRunes is the width both engines declare for
 // migration_id (VARCHAR(255) — characters, not bytes, on MySQL utf8mb4
@@ -490,14 +512,60 @@ func deriveMigrationID(sourceEngine, sourceDSN, targetEngine, targetDSN, targetS
 // hoc-inspect-friendly without dropping the head of the message
 // (which carries the phase prefix).
 //
-// The ellipsis ("…") is three bytes in UTF-8, so the head slice
-// reserves three bytes to keep the total under the byte budget.
+// The budget is BYTES (the column's own unit is characters, so bytes are
+// the conservative side), but the cut lands on a RUNE boundary: a cut
+// inside a multi-byte sequence produced invalid UTF-8, which PostgreSQL
+// refuses with SQLSTATE 22021 and MySQL in strict mode with Error 1366 —
+// so the failure mark never landed, the header kept the PREVIOUS phase,
+// and the operator saw an encoding error stapled to their real failure
+// (audit 2026-09-15 A0915-STATE-MEDIUM-3; non-ASCII error text over 1 KiB
+// is routine once a verbose PG context quotes a row value). The ellipsis
+// ("…") is three bytes in UTF-8, so the head reserves three bytes for it.
+//
+// The cut is only one way a message becomes unstorable, so the message is
+// made storable FIRST — see [storableDiagnostic]. Held by
+// TestTruncateLastError's family matrix and, through the real stores, by
+// TestTruncateLastError_LandsOnBothEngines.
 func truncateLastError(msg string) string {
+	msg = storableDiagnostic(msg)
 	if len(msg) <= lastErrorMaxLen {
 		return msg
 	}
 	const ellipsis = "…"
-	return msg[:lastErrorMaxLen-len(ellipsis)] + ellipsis
+	return cutAtRuneBoundary(msg, lastErrorMaxLen-len(ellipsis)) + ellipsis
+}
+
+// storableDiagnostic makes an error message storable in a text column on
+// every migration-state store, by replacing each invalid UTF-8 sequence
+// with U+FFFD and escaping each NUL byte as the four characters `\x00`.
+//
+// A named wart, and deliberately confined to DIAGNOSTIC text: it rewrites
+// bytes, which sluice never does to a row value. It exists because the
+// message is not always sluice's own prose — several refusals echo a
+// byte-truncated value snippet (a bytea or BLOB rendered as a string and
+// cut at a fixed byte count), and a driver error can quote a row value
+// verbatim. Either can carry an invalid sequence or a NUL mid-message,
+// which no rune-boundary cut repairs, and PostgreSQL refuses both in a
+// TEXT column (SQLSTATE 22021) — losing the failure record exactly as the
+// bad cut did. A failure record with one replaced byte beats no record.
+func storableDiagnostic(msg string) string {
+	msg = strings.ToValidUTF8(msg, "�")
+	return strings.ReplaceAll(msg, "\x00", `\x00`)
+}
+
+// cutAtRuneBoundary returns the longest prefix of s that is at most
+// maxBytes long and does not end inside a multi-byte rune. For valid
+// UTF-8 the result is valid UTF-8; it gives up at most three bytes of
+// budget (the width of the widest rune, less one).
+func cutAtRuneBoundary(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
 }
 
 // loadOrInitState resolves the pre-run state. Branches:

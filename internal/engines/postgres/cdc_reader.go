@@ -846,10 +846,10 @@ func (r *CDCReader) resolveStartPosition(
 		// instance, and any LSN comparison across the boundary is
 		// silently meaningless (different timelines have independent
 		// LSN reference frames). Refuse loudly, wrapping
-		// ErrPositionInvalid so the pipeline orchestrator can route
-		// the error through the ADR-0022 cold-start fall-through path
-		// (the only recovery for a position that no longer points at
-		// the same database).
+		// ErrPositionForeignLineage so the pipeline REFUSES rather than
+		// routing the divergence into the ADR-0022 automatic re-copy —
+		// see checkSourceIdentity for why the automatic recovery is the
+		// wrong one for a source that is no longer the same database.
 		//
 		// Positions persisted by pre-ADR-0051 sluice have empty
 		// SystemID/Timeline and are accepted unchanged: a one-time INFO
@@ -960,13 +960,30 @@ func checkSlotUsable(info *slotState) error {
 //     position is from pre-ADR-0051 sluice (empty SystemID, zero
 //     Timeline). The lazy-install case emits a one-time INFO log so
 //     operators can see the pin going in.
-//   - an error wrapping [ir.ErrPositionInvalid] when the pin diverges
-//     from live. Wrapping the sentinel routes the error through the
-//     ADR-0022 cold-start fall-through (the only recovery for a
-//     position that no longer points at the same database — different
-//     timelines have independent LSN reference frames, so cross-
-//     timeline LSN comparisons are silently meaningless and the
-//     persisted LSN cannot be resumed).
+//   - an error wrapping [ir.ErrPositionForeignLineage] when the pin
+//     diverges from live. A different system identifier is a different
+//     instance; a different timeline is a different history of the same
+//     one (a PITR or a promotion forked it). Either way the persisted
+//     LSN belongs to a reference frame the live source does not share:
+//     cross-timeline LSN comparisons are silently meaningless, so the
+//     position cannot be resumed.
+//
+// # Why the FOREIGN sentinel, not ErrPositionInvalid (audit 2026-09-15 A0915-ARCH-MEDIUM-1)
+//
+// This used to wrap [ir.ErrPositionInvalid], reasoning that a fresh cold
+// start is "the only recovery". It is — but that sentinel routes the
+// pipeline's AUTOMATIC recovery, which re-copies from whatever now
+// answers the DSN at exit 0, and a (systemid, timeline) divergence is
+// the strongest evidence any engine has that what answers the DSN is
+// not the database the position came from. A populated target was
+// already saved by the populated-target gate (forceFresh=false for a
+// logical-slot source); an EMPTY target re-pointed at a PITR'd
+// instance cold-started from it silently, with every change on the
+// abandoned timeline absent forever. The foreign sentinel deliberately
+// does not satisfy ErrPositionInvalid, so the pipeline REFUSES
+// (FOREIGN-LINEAGE-REFUSED) and names the deliberate re-copy flags
+// instead. Held by TestCheckSourceIdentity and, tree-wide, by
+// engines.TestForeignLineageVerdictsCarryTheSentinelInEveryEngine.
 //
 // The error message names both the OLD and NEW (systemid, timeline)
 // pairs so operators have enough information to confirm whether the
@@ -992,7 +1009,7 @@ func checkSourceIdentity(ctx context.Context, slotName, persistedSysID string, p
 			"To recover: confirm the change matches your intended PITR/promotion event, then drop the slot and persisted position so a fresh cold-start runs against the new source — "+
 			"`sluice slot drop %s --source-driver=postgres --source ...` then restart with empty position (forces a fresh snapshot): %w",
 		persistedSysID, persistedTimeline, liveSysID, liveTimeline,
-		slotName, ir.ErrPositionInvalid,
+		slotName, ir.ErrPositionForeignLineage,
 	)
 }
 

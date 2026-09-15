@@ -102,6 +102,8 @@ func (s *Streamer) attachSlotHealthProbe(ctx context.Context, streamID string) *
 // defaultPGSlotName mirrors the default slot identifier hard-coded in
 // `internal/engines/postgres/cdc_reader.go` (`defaultSlot = "sluice_slot"`).
 // Duplicated here to avoid coupling `internal/pipeline` to the postgres
-// engine package; the constant has been stable across releases and is
-// surfaced as a CLI default in `--slot-name` help text.
+// engine package, and BOUND to the engine's value by
+// TestStoppedSlotAdviceNamesTheRealDefault: this is the name
+// [SlotNameForSource] hands every read-only probe, and a probe of a slot
+// nothing created returns no rows, which reads as healthy (A0909-AQ-M-1).
 const defaultPGSlotName = "sluice_slot"

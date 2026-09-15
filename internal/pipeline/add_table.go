@@ -1086,7 +1086,8 @@ func slotNameSource(status ir.StreamStatus) string {
 // defaultActiveSlotName mirrors the engine-side default in
 // internal/engines/postgres/cdc_reader.go's defaultSlot constant.
 // Held in the pipeline package because the orchestrator stays
-// engine-neutral; the constant is small enough to keep in sync by
+// engine-neutral; bound to the engine's value by
+// TestStoppedSlotAdviceNamesTheRealDefault rather than kept in sync by
 // hand.
 const defaultActiveSlotName = "sluice_slot"
 

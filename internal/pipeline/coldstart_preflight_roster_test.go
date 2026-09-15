@@ -236,12 +236,87 @@ func discoverPreflightCallsByFunc(t *testing.T) map[string]map[string]struct{} {
 				// exists to prevent.
 				if strings.HasPrefix(strings.ToLower(sym), "preflight") {
 					set[sym] = struct{}{}
+					// A preflight that takes an explicit side (PreflightRLS)
+					// is ALSO recorded under a side-qualified key, e.g.
+					// "PreflightRLS(RLSSideTarget)". The plain key stays, so
+					// every roster that names the bare symbol reads as before;
+					// the qualified key is what lets a roster tell a target
+					// call from a source call, which the bare symbol cannot —
+					// the multi-namespace fan-out reaches a SOURCE PreflightRLS
+					// too, so deleting its target call left the bare key
+					// reached and the target roster green.
+					if side := preflightSideArg(call); side != "" {
+						set[sym+"("+side+")"] = struct{}{}
+					}
 				}
 				return true
 			})
 		}
 	}
 	return out
+}
+
+// discoverCalledNamesByFunc maps each non-test declaration in this package
+// to the bare names of everything it calls (`s.coldStartGatePreflight(…)`
+// → "coldStartGatePreflight"), closures included. Coarse by design: it is
+// used only to ask whether a function listed in a roster is called from
+// another listed function at all.
+func discoverCalledNamesByFunc(t *testing.T) map[string]map[string]struct{} {
+	t.Helper()
+	out := make(map[string]map[string]struct{})
+	fset := token.NewFileSet()
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read pipeline dir: %v", err)
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, name, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %q: %v", name, err)
+		}
+		for _, decl := range f.Decls {
+			fd, ok := decl.(*ast.FuncDecl)
+			if !ok || fd.Body == nil {
+				continue
+			}
+			set := make(map[string]struct{})
+			out[funcDeclName(fd)] = set
+			ast.Inspect(fd.Body, func(n ast.Node) bool {
+				if call, ok := n.(*ast.CallExpr); ok {
+					switch fn := call.Fun.(type) {
+					case *ast.Ident:
+						set[fn.Name] = struct{}{}
+					case *ast.SelectorExpr:
+						set[fn.Sel.Name] = struct{}{}
+					}
+				}
+				return true
+			})
+		}
+	}
+	return out
+}
+
+// preflightSideArg returns the name of the first RLSSide* argument of call
+// (`migcore.RLSSideTarget` → "RLSSideTarget"), or "" when it has none.
+func preflightSideArg(call *ast.CallExpr) string {
+	for _, arg := range call.Args {
+		var name string
+		switch a := arg.(type) {
+		case *ast.Ident:
+			name = a.Name
+		case *ast.SelectorExpr:
+			name = a.Sel.Name
+		}
+		if strings.HasPrefix(name, "RLSSide") {
+			return name
+		}
+	}
+	return ""
 }
 
 // unionPreflightCalls returns the union of the preflight call sets of the

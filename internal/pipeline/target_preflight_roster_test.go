@@ -26,25 +26,44 @@ import (
 // indistinguishable from one that holds, and this one was written inside a
 // gate, which is the shape that stops anyone from looking.
 //
-// SCOPE, stated so the name cannot be read wider than the truth:
+// THREE cold-start-class entry points are graded, each by its own test, and
+// the tests are named for the entry point they reach so none can be read as
+// "the cold start" when it means one of them. The first cut of this file
+// had one test named for the cold start that graded the single-database
+// path only; audit 2026-09-15 A0915-ARCH-MEDIUM-2 found the other two
+// reaching NONE of migrate's target-side preflights — the stopped-cold-start
+// resume, and the multi-namespace fan-out, measured on plain PG dying
+// mid-copy on a raw 0A000 where its siblings refused up front. The gate's
+// own narrowness was the finding.
 //
-//   - The roster is migrate's target-preflight phase. Target-side checks
-//     that live somewhere else in migrate are outside it.
+// The resume lane is graded against TWO references, because migrate is the
+// wrong yardstick for it on its own: the resume continues a single-database
+// cold start, and that entry point runs emit-side refusals (index, view,
+// table-name fold) outside migrate's target phase, which a migrate-only
+// roster could never ask about.
+//
+// SCOPE, stated so the names cannot be read wider than the truth:
+//
+//   - The references are migrate's target-preflight phase and, for the
+//     resume lane only, the single-database cold start's own preflight
+//     functions. Checks that live somewhere else in either are outside them.
 //   - It matches by SYMBOL, so it cannot tell one call of a preflight from
-//     another with different arguments. PreflightRLS takes an explicit side
-//     and the cold start calls it on BOTH (source at
-//     coldStartReadSourceSchema, target at coldStartOpenTargetWriters), so
-//     the roster is right about it today — but it would stay green if the
-//     target call were changed to the source side. A side-sensitive check is
-//     a separate gate; this one is about call reach.
+//     another with different arguments — with one exception. A preflight
+//     that takes an explicit RLSSide* argument (PreflightRLS) is also keyed
+//     by that side (see discoverPreflightCallsByFunc), because every entry
+//     point graded here calls it on BOTH sides and the bare symbol would
+//     stay reached if the TARGET call were deleted or flipped to the source
+//     side. That was not hypothetical: the multi-namespace fan-out reaches
+//     a source PreflightRLS in coldStartReadOneDatabaseSchema, and before
+//     the side key existed, deleting its target call left this gate green.
 //   - It proves the call exists, not that it runs on every branch of the
 //     function it lives in.
 //
-// Writing it also corrected three guesses made while writing it: the cold
-// start was assumed not to run the stale-backend clear, the target-side RLS
-// preflight, or the ownership advisory. It runs all three. The only genuine
-// gaps were the two shard refusals — which is the argument for deriving a
-// roster from the AST instead of reasoning about one.
+// Writing the first cut also corrected three guesses made while writing it:
+// the cold start was assumed not to run the stale-backend clear, the
+// target-side RLS preflight, or the ownership advisory. It runs all three.
+// The only genuine gaps were the two shard refusals — which is the argument
+// for deriving a roster from the AST instead of reasoning about one.
 
 // targetPreflightReferenceFuncs is migrate's target-side preflight phase —
 // the roster's universe.
@@ -61,30 +80,126 @@ var targetPreflightReferenceFuncs = []string{
 	"(*Migrator).runSingleDatabase",
 }
 
-// targetPreflightColdStartFuncs are the sync cold-start functions that hold
-// target-side preflights: the entry point and the gate cluster that has the
-// RowWriter open.
-var targetPreflightColdStartFuncs = []string{
+// targetPreflightSingleDatabaseColdStartFuncs are the SINGLE-DATABASE sync
+// cold-start functions that hold target-side preflights: the entry point
+// and the gate cluster that has the RowWriter open. It is also the second
+// reference the stopped-cold-start resume is graded against.
+var targetPreflightSingleDatabaseColdStartFuncs = []string{
 	"(*Streamer).coldStart",
 	"(*Streamer).coldStartGatePreflight",
 	"(*Streamer).coldStartOpenTargetWriters",
 }
 
-// targetPreflightColdStartExempt is fail-by-default: a migrate target-side
-// preflight absent from the cold start passes ONLY with an entry here,
-// reusing the classes the cold-start roster defines.
-// It is EMPTY, and that is the finding rather than an oversight: once the
-// two shard refusals were wired, every preflight migrate runs against the
-// target is also run by the sync cold-start. The map stays so the next
-// divergence has to be written down with a class and a tracker rather than
-// appearing as a passing build.
-var targetPreflightColdStartExempt = map[string]coldStartPreflightExemption{}
+// targetPreflightSingleDatabaseColdStartExempt is fail-by-default: a migrate
+// target-side preflight absent from the single-database cold start passes
+// ONLY with an entry here, reusing the classes the cold-start roster
+// defines. It is EMPTY, and that is the finding rather than an oversight:
+// once the two shard refusals were wired, every preflight migrate runs
+// against the target is also run by this entry point. The map stays so the
+// next divergence has to be written down with a class and a tracker rather
+// than appearing as a passing build.
+var targetPreflightSingleDatabaseColdStartExempt = map[string]coldStartPreflightExemption{}
 
-func TestTargetPreflightRoster_ColdStartReachesMigrateSiblings(t *testing.T) {
+// targetPreflightMultiNamespaceFanOutFuncs are the multi-namespace fan-out's
+// functions that hold its writers and readers. Only coldStartCopyOneDatabase
+// opens a RowWriter (per database), so that is where every target-side
+// preflight lives; coldStartReadOneDatabaseSchema holds the per-database
+// source DSN, which the one SOURCE-side probe in migrate's pre-copy block
+// (PreflightSourceBoolRanges) needs; coldStartMultiDatabase is listed for
+// the once-per-run checks (the connection budget) so a preflight hoisted
+// there stays in reach.
+var targetPreflightMultiNamespaceFanOutFuncs = []string{
+	"(*Streamer).coldStartMultiDatabase",
+	"(*Streamer).coldStartReadOneDatabaseSchema",
+	"(*Streamer).coldStartCopyOneDatabase",
+}
+
+// targetPreflightMultiNamespaceFanOutExempt is fail-by-default. Since
+// A0915-ARCH-MEDIUM-2 the fan-out runs every migrate target-side preflight
+// per database (its --schema-already-applied conditions are absent because
+// the mode refuses that flag in validateMultiDatabaseStream); the one entry
+// is ARCHITECTURAL.
+var targetPreflightMultiNamespaceFanOutExempt = map[string]coldStartPreflightExemption{
+	"PreflightPlanetScaleForeignKeys": {exemptArchitectural, "the fan-out STRIPS every foreign key before its " +
+		"CreateConstraints phase (cross-database FK deferral, see coldStartCopyOneDatabase), so there is no FK add " +
+		"for the control-plane FK-support check to guard; the preflight would only ever return its no-FKs INFO."},
+}
+
+// targetPreflightStoppedColdStartResumeFuncs are the stopped-cold-start
+// resume's functions: the entry point and the helper that opens a RowWriter
+// for the target-side checks.
+var targetPreflightStoppedColdStartResumeFuncs = []string{
+	"(*Streamer).resumeStoppedColdStart",
+	"(*Streamer).resumeTargetPreflight",
+}
+
+// targetPreflightStoppedColdStartResumeExempt is fail-by-default against
+// migrate's reference. The one entry is ARCHITECTURAL; every other migrate
+// target-side preflight is run by resumeTargetPreflight (with the
+// enumeration at its definition).
+var targetPreflightStoppedColdStartResumeExempt = map[string]coldStartPreflightExemption{
+	"PreflightSourceBoolRanges": {exemptArchitectural, resumeRunsNoCopySourceBoolRanges},
+}
+
+// targetPreflightStoppedColdStartResumeVsColdStartExempt is fail-by-default
+// against the single-database cold start's own preflights — the entry point
+// this lane continues. Every entry is ARCHITECTURAL and each names the
+// mechanism that makes the preflight inapplicable to a run that copies
+// nothing and creates no tables.
+var targetPreflightStoppedColdStartResumeVsColdStartExempt = map[string]coldStartPreflightExemption{
+	"PreflightSourceBoolRanges": {exemptArchitectural, resumeRunsNoCopySourceBoolRanges},
+	"preflightCrossShardCollision": {exemptArchitectural, "refuses a multi-shard source merging into one target; " +
+		"the lane admits only a source implementing ir.SnapshotAnchorVerifier (Postgres), which implements no " +
+		"ir.ShardDiscoverer, so the preflight's own no-shards branch would return nil."},
+	"preflightShardConsolidation": {exemptArchitectural, "judges whether a populated target may receive a COPY " +
+		"from another shard; the resume copies nothing, and whether the rows on the target are the recorded copy's " +
+		"is decided by the copy-shape gate (its `shard` aspect included) and the row floor."},
+	"preflightColdStart": {exemptArchitectural, "refuses a COPY into a populated target; the resume REQUIRES a " +
+		"populated target (the row floor refuses an emptied one) and copies nothing into it."},
+}
+
+// resumeRunsNoCopySourceBoolRanges is the one exemption both resume rosters
+// share, spelled once so the two cannot drift.
+const resumeRunsNoCopySourceBoolRanges = "a MySQL TINYINT(1) fail-fast for the COPY; this lane is " +
+	"PostgreSQL-source-only (the ir.SnapshotAnchorVerifier gate at the top of resumeStoppedColdStart) and skips " +
+	"the copy, so the probe would be a no-op on both counts."
+
+// targetPreflightReference names one yardstick an entry point is graded
+// against.
+type targetPreflightReference struct {
+	label string
+	funcs []string
+}
+
+var (
+	migrateTargetPreflightReference = targetPreflightReference{
+		label: "migrate's target preflight phase",
+		funcs: targetPreflightReferenceFuncs,
+	}
+	singleDatabaseColdStartPreflightReference = targetPreflightReference{
+		label: "the single-database sync cold start",
+		funcs: targetPreflightSingleDatabaseColdStartFuncs,
+	}
+)
+
+// assertTargetPreflightRoster grades one cold-start-class entry point
+// against a reference: every reference preflight is reached from
+// reachedFuncs or carries an exemption with a class and a reason, the two
+// sharded-target refusals are named explicitly, and every exemption names a
+// live, unreached reference preflight.
+func assertTargetPreflightRoster(
+	t *testing.T,
+	ref targetPreflightReference,
+	entryPoint string,
+	reachedFuncs []string,
+	exempt map[string]coldStartPreflightExemption,
+) {
+	t.Helper()
+	assertReachedFuncsAreConnected(t, entryPoint, reachedFuncs)
 	calls := discoverPreflightCallsByFunc(t)
 
-	reference := unionPreflightCalls(t, calls, targetPreflightReferenceFuncs)
-	reached := unionPreflightCalls(t, calls, targetPreflightColdStartFuncs)
+	reference := unionPreflightCalls(t, calls, ref.funcs)
+	reached := unionPreflightCalls(t, calls, reachedFuncs)
 
 	// Anti-vacuity floors, set where a single deletion reaches the check
 	// being graded rather than tripping the floor first — the step-5 trap
@@ -97,7 +212,7 @@ func TestTargetPreflightRoster_ColdStartReachesMigrateSiblings(t *testing.T) {
 	// check while still catching a matcher that has stopped finding things.
 	if len(reference) < 3 {
 		t.Fatalf("anti-vacuity: expected >=3 preflight* symbols in %v, found %d: %v — the AST matcher is likely broken",
-			targetPreflightReferenceFuncs, len(reference), sortedPreflightKeys(reference))
+			ref.funcs, len(reference), sortedPreflightKeys(reference))
 	}
 	var reachedReference int
 	for sym := range reference {
@@ -106,8 +221,8 @@ func TestTargetPreflightRoster_ColdStartReachesMigrateSiblings(t *testing.T) {
 		}
 	}
 	if reachedReference < 1 {
-		t.Fatalf("anti-vacuity: expected >=1 migrate target preflight reached from %v, found none (reached=%v) — "+
-			"the AST matcher is likely broken", targetPreflightColdStartFuncs, sortedPreflightKeys(reached))
+		t.Fatalf("anti-vacuity: expected >=1 preflight of %s reached from %v, found none (reached=%v) — "+
+			"the AST matcher is likely broken", ref.label, reachedFuncs, sortedPreflightKeys(reached))
 	}
 
 	// The two sharded-target refusals are named explicitly, ABOVE the
@@ -116,25 +231,42 @@ func TestTargetPreflightRoster_ColdStartReachesMigrateSiblings(t *testing.T) {
 	// failure that says so by name rather than disappearing into a list.
 	for _, sym := range []string{"PreflightShardPlacement", "PreflightShardKeyUpsert"} {
 		if _, ok := reference[sym]; !ok {
-			t.Errorf("%s is no longer called from migrate's target preflight phase — if it moved, move this roster's "+
-				"anchor with it; if it was deleted, delete this check", sym)
+			t.Errorf("%s is no longer called from %s %v — if it moved, move this roster's anchor with it; if it "+
+				"was deleted, delete this check", sym, ref.label, ref.funcs)
 			continue
 		}
 		if _, ok := reached[sym]; !ok {
-			t.Errorf("%s refuses a sharded target on `migrate` but is NOT called from the sync cold-start %v. That is "+
+			t.Errorf("%s refuses a sharded target in %s but is NOT called from the %s %v. That is "+
 				"Bug 283 exactly: the same target, the same defect, and `sync start` pays for it after copying every "+
-				"row instead of before the first one. Wire it into coldStartGatePreflight.", sym, targetPreflightColdStartFuncs)
+				"row instead of before the first one.", sym, ref.label, entryPoint, reachedFuncs)
 		}
 	}
 
-	// Forward: every migrate target-side preflight is reached by the cold
-	// start or carries an exemption with a stated reason.
+	// The TARGET-side RLS refusal is named by its side-qualified key, for the
+	// reason in the scope note: the bare symbol is also reached through the
+	// source-side call. Asserting the key is in the reference is the
+	// anti-vacuity half — if the side extraction ever stopped producing it,
+	// the forward check below would pass on the bare symbol alone.
+	const targetRLS = "PreflightRLS(RLSSideTarget)"
+	if _, ok := reference[targetRLS]; !ok {
+		t.Errorf("%s is not in %s %v — either the target-side RLS call moved (move this anchor) or the side-keyed "+
+			"discovery broke, in which case this roster can no longer tell a target RLS call from a source one",
+			targetRLS, ref.label, ref.funcs)
+	} else if _, ok := reached[targetRLS]; !ok {
+		t.Errorf("%s refuses a target whose tables force row-level security against a NOBYPASSRLS role in %s, but "+
+			"the %s %v does not call it. Without it the copy dies mid-table on SQLSTATE 0A000 behind an "+
+			"--exclude-table hint that fixes nothing (audit 2026-09-15 A0915-ARCH-MEDIUM-2).",
+			targetRLS, ref.label, entryPoint, reachedFuncs)
+	}
+
+	// Forward: every reference preflight is reached by the entry point or
+	// carries an exemption with a stated reason.
 	var missing []string
 	for _, sym := range sortedPreflightKeys(reference) {
 		if _, ok := reached[sym]; ok {
 			continue
 		}
-		ex, ok := targetPreflightColdStartExempt[sym]
+		ex, ok := exempt[sym]
 		if !ok {
 			missing = append(missing, sym)
 			continue
@@ -153,24 +285,88 @@ func TestTargetPreflightRoster_ColdStartReachesMigrateSiblings(t *testing.T) {
 		}
 	}
 	if len(missing) > 0 {
-		t.Fatalf("migrate target-side preflight(s) NOT reached by the sync cold-start %v and not exempted:\n  %s\n\n"+
+		t.Fatalf("preflight(s) of %s NOT reached by the %s %v and not exempted:\n  %s\n\n"+
 			"The copy-phase parity agreement (CLAUDE.md) says a refusal touching a shared pipeline phase applies to "+
-			"BOTH entry points unless a written reason says otherwise. Either call it from coldStartGatePreflight, or "+
-			"add a targetPreflightColdStartExempt entry with a class and a reason.",
-			targetPreflightColdStartFuncs, strings.Join(missing, "\n  "))
+			"BOTH entry points unless a written reason says otherwise. Either call it from one of the listed "+
+			"functions, or add an exemption entry with a class and a reason.",
+			ref.label, entryPoint, reachedFuncs, strings.Join(missing, "\n  "))
 	}
 
-	// Reverse: an exemption must name a live reference preflight the cold
-	// start does NOT reach. A phantom is a typo or a deleted preflight; a
+	// Reverse: an exemption must name a live reference preflight the entry
+	// point does NOT reach. A phantom is a typo or a deleted preflight; a
 	// stale one would silently re-cover the next regression.
-	for _, sym := range sortedPreflightKeys(targetPreflightColdStartExempt) {
+	for _, sym := range sortedPreflightKeys(exempt) {
 		if _, ok := reference[sym]; !ok {
 			t.Errorf("phantom exemption %q: no such preflight is called from %v — remove it or fix the name",
-				sym, targetPreflightReferenceFuncs)
+				sym, ref.funcs)
 			continue
 		}
 		if _, ok := reached[sym]; ok {
-			t.Errorf("stale exemption %q: the cold start now calls it — remove the exemption so the gate holds the call", sym)
+			t.Errorf("stale exemption %q: the %s now calls it — remove the exemption so the gate holds the call", sym, entryPoint)
+		}
+	}
+}
+
+// TestTargetPreflightRoster_SingleDatabaseColdStartReachesMigrateSiblings
+// grades the single-database `sync start` cold start — and only that one.
+func TestTargetPreflightRoster_SingleDatabaseColdStartReachesMigrateSiblings(t *testing.T) {
+	assertTargetPreflightRoster(t, migrateTargetPreflightReference, "single-database sync cold-start",
+		targetPreflightSingleDatabaseColdStartFuncs, targetPreflightSingleDatabaseColdStartExempt)
+}
+
+// TestTargetPreflightRoster_MultiNamespaceFanOutReachesMigrateSiblings grades
+// the `sync start --include-schema` / `--databases` fan-out, which opens its
+// own writers per namespace and reached none of these until
+// A0915-ARCH-MEDIUM-2. Its end-to-end pin on a real server is
+// TestStreamer_MultiSchema_PG_TargetRLSRefusedBeforeTheCopy. Mutation-run
+// (2026-09-15): deleting the fan-out's target-side PreflightRLS call fails
+// here on the side-keyed check, and fails that integration pin too.
+func TestTargetPreflightRoster_MultiNamespaceFanOutReachesMigrateSiblings(t *testing.T) {
+	assertTargetPreflightRoster(t, migrateTargetPreflightReference, "multi-namespace sync cold-start fan-out",
+		targetPreflightMultiNamespaceFanOutFuncs, targetPreflightMultiNamespaceFanOutExempt)
+}
+
+// TestTargetPreflightRoster_StoppedColdStartResumeReachesMigrateSiblings
+// grades the A0909-STOP-1 resume lane against migrate, which skips the copy
+// but still issues DDL and enters CDC — and ran zero target-side preflights
+// until A0915-ARCH-MEDIUM-2.
+func TestTargetPreflightRoster_StoppedColdStartResumeReachesMigrateSiblings(t *testing.T) {
+	assertTargetPreflightRoster(t, migrateTargetPreflightReference, "stopped-cold-start resume",
+		targetPreflightStoppedColdStartResumeFuncs, targetPreflightStoppedColdStartResumeExempt)
+}
+
+// TestTargetPreflightRoster_StoppedColdStartResumeReachesSingleDatabaseColdStartSiblings
+// grades the same lane against the entry point it continues: every
+// preflight the single-database cold start runs is either run again by the
+// resume or written down as inapplicable to a run that copies nothing.
+func TestTargetPreflightRoster_StoppedColdStartResumeReachesSingleDatabaseColdStartSiblings(t *testing.T) {
+	assertTargetPreflightRoster(t, singleDatabaseColdStartPreflightReference, "stopped-cold-start resume",
+		targetPreflightStoppedColdStartResumeFuncs, targetPreflightStoppedColdStartResumeVsColdStartExempt)
+}
+
+// assertReachedFuncsAreConnected closes the hole a helper-based reached set
+// opens. The rosters prove a preflight is CALLED from one of the listed
+// functions; listing a helper (resumeTargetPreflight, coldStartGatePreflight)
+// makes every preflight inside it count as reached — including after the one
+// call that runs the helper is deleted. So every listed function after the
+// first (the entry point) must itself be called from another listed
+// function. This still proves reach by the call graph, not by every branch.
+func assertReachedFuncsAreConnected(t *testing.T, entryPoint string, reachedFuncs []string) {
+	t.Helper()
+	called := discoverCalledNamesByFunc(t)
+	for _, helper := range reachedFuncs[1:] {
+		bare := helper[strings.LastIndex(helper, ".")+1:]
+		connected := false
+		for _, caller := range reachedFuncs {
+			if _, ok := called[caller][bare]; ok && caller != helper {
+				connected = true
+				break
+			}
+		}
+		if !connected {
+			t.Errorf("%s is listed as part of the %s, but no other listed function %v calls it — every preflight "+
+				"inside it is counted as reached while nothing on this entry point runs it. Restore the call, or "+
+				"list the function that makes it.", helper, entryPoint, reachedFuncs)
 		}
 	}
 }

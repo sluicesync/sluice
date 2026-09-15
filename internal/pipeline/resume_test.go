@@ -6,9 +6,11 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
+	"unicode/utf8"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -569,18 +571,96 @@ func TestDeriveMigrationID(t *testing.T) {
 	}
 }
 
-// TestTruncateLastError clamps overlong messages to the 1KB limit.
+// TestTruncateLastError clamps overlong messages to the 1KB limit and
+// never cuts inside a rune (audit 2026-09-15 A0915-STATE-MEDIUM-3).
+//
+// The function dispatches on the byte width of whatever rune straddles
+// the cut, so the pin is the family matrix — ASCII, 2-byte, 3-byte and
+// 4-byte runes — × every byte offset the cut can land at inside that
+// rune, arranged by shifting an ASCII prefix so the boundary walks
+// through the rune one byte at a time. The earlier version of this test
+// used one ASCII representative, which is the Bug 74 shape at a
+// persistence boundary: it could not fail for the input that broke.
 func TestTruncateLastError(t *testing.T) {
+	t.Parallel()
 	short := "short error"
 	if got := truncateLastError(short); got != short {
 		t.Errorf("short input mutated: %q -> %q", short, got)
 	}
-	long := strings.Repeat("x", lastErrorMaxLen+200)
-	got := truncateLastError(long)
-	if len(got) > lastErrorMaxLen {
-		t.Errorf("truncated len = %d; want <= %d", len(got), lastErrorMaxLen)
+
+	families := []struct {
+		name string
+		r    string
+	}{
+		{"ascii-1B", "x"},
+		{"latin-2B", "é"},
+		{"cjk-3B", "名"},
+		{"emoji-4B", "🌊"},
 	}
-	if !strings.HasSuffix(got, "…") {
-		t.Errorf("truncated value missing ellipsis: tail=%q", got[len(got)-3:])
+	// The nominal cut: the budget less the ellipsis's own three bytes.
+	nominalCut := lastErrorMaxLen - len("…")
+	cells := 0
+	for _, fam := range families {
+		width := len(fam.r)
+		// offset is how many bytes of the straddling rune fall BEFORE the
+		// nominal cut; 0 means the cut lands exactly on the rune's start.
+		for offset := 0; offset < width; offset++ {
+			cells++
+			t.Run(fmt.Sprintf("%s/cut-offset-%d", fam.name, offset), func(t *testing.T) {
+				// An ASCII prefix of length p puts the nominal cut
+				// (nominalCut-p) mod width bytes into the rune run, so
+				// p = (nominalCut-offset) mod width lands it `offset` in.
+				prefixLen := (nominalCut - offset) % width
+				msg := strings.Repeat("a", prefixLen) + strings.Repeat(fam.r, lastErrorMaxLen/width+2)
+				if !utf8.RuneStart(msg[nominalCut-offset]) || (offset > 0 && utf8.RuneStart(msg[nominalCut])) {
+					t.Fatalf("fixture does not put the nominal cut %d byte(s) into a %d-byte rune", offset, width)
+				}
+				got := truncateLastError(msg)
+				if len(got) > lastErrorMaxLen {
+					t.Fatalf("truncated len = %d; want <= %d", len(got), lastErrorMaxLen)
+				}
+				if !utf8.ValidString(got) {
+					t.Fatalf("truncated value is not valid UTF-8 — the target refuses it (PG 22021 / MySQL 1366) "+
+						"and the failure record is lost: tail=%q", got[len(got)-8:])
+				}
+				if !strings.HasSuffix(got, "…") {
+					t.Fatalf("truncated value missing ellipsis: tail=%q", got[len(got)-3:])
+				}
+				// The head is a prefix of the input (nothing reordered or
+				// substituted, only cut).
+				if !strings.HasPrefix(msg, strings.TrimSuffix(got, "…")) {
+					t.Fatalf("truncated head is not a prefix of the input")
+				}
+				// And the cut gives up exactly the straddling rune's leading
+				// bytes: walking back further would drop text it had room
+				// for, and not walking back at all is the defect.
+				if want := lastErrorMaxLen - offset; len(got) != want {
+					t.Fatalf("truncated to %d bytes; with the cut %d byte(s) into a %d-byte rune it must be exactly %d",
+						len(got), offset, width, want)
+				}
+			})
+		}
+	}
+	// Anti-vacuity: 1+2+3+4 offsets across the four families.
+	if cells != 10 {
+		t.Fatalf("the matrix ran %d cells; want 10", cells)
+	}
+
+	// Bytes the cut cannot repair: an invalid sequence or a NUL already
+	// INSIDE the message (a refusal that echoes a byte-truncated bytea /
+	// BLOB snippet), short and long. Both must come out storable, with
+	// every other byte left alone.
+	for _, tc := range []struct{ name, msg, want string }{
+		{"invalid sequence, short", "bad value \xe5\x90 here", "bad value � here"},
+		{"NUL, short", "bad value a\x00b here", `bad value a\x00b here`},
+	} {
+		if got := truncateLastError(tc.msg); got != tc.want {
+			t.Errorf("%s: truncateLastError(%q) = %q; want %q", tc.name, tc.msg, got, tc.want)
+		}
+	}
+	long := "snippet \xff\x00 " + strings.Repeat("名", lastErrorMaxLen)
+	if got := truncateLastError(long); !utf8.ValidString(got) || strings.ContainsRune(got, 0) || len(got) > lastErrorMaxLen {
+		t.Errorf("long message with an invalid byte and a NUL: valid=%v nul=%v len=%d; want valid UTF-8, no NUL, <= %d bytes",
+			utf8.ValidString(got), strings.ContainsRune(got, 0), len(got), lastErrorMaxLen)
 	}
 }

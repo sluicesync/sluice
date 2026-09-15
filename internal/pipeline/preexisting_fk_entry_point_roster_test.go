@@ -99,6 +99,12 @@ var preExistingFKEntryPointPosture = map[string]map[string]fkEntryPointPosture{
 				"misses and the verdict is a no-op by construction — while the read it needs is not free. A " +
 				"check that can only be vacuous or wrong is worth naming, not wiring",
 		},
+		"(*Streamer).resumeTargetPreflight": {
+			why: "EXEMPT: the stopped-cold-start resume copies nothing — it continues a cold start that already " +
+				"copied every table, and whose constraints phase may already have added foreign keys with every " +
+				"parent in scope — so the check would refuse it for having worked. The same argument as the " +
+				"--resume exclusion (audit 2026-09-15 A0915-ARCH-MEDIUM-2 rostered this lane)",
+		},
 	},
 	"backup": {
 		"(*Restore).refuseUnrepresentableTargetShape": {

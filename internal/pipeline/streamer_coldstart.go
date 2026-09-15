@@ -907,8 +907,12 @@ func (s *Streamer) coldStartGatePreflight(ctx context.Context, schema *ir.Schema
 	// and was correct; it simply had one caller. Both are hoisted to the top
 	// of this function, ahead of every branch below, because the question is
 	// a property of the target's topology and does not depend on which
-	// cold-start branch runs. Held to BOTH entry points by
-	// TestTargetShardPreflightParityMigrateAndColdStart.
+	// cold-start branch runs. Held to migrate's phase by
+	// TestTargetPreflightRoster_SingleDatabaseColdStartReachesMigrateSiblings
+	// (this entry point), with sibling rosters for the multi-namespace
+	// fan-out and the stopped-cold-start resume in the same file — an
+	// earlier version of this comment cited a test that did not exist
+	// (2026-09-15 audit, LOW: a comment naming a test that does not exist).
 	//
 	// Neither can fire on a target that is not a sharded PlanetScale Neki —
 	// the probe interfaces are unimplemented elsewhere and the preflights

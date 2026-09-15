@@ -81,6 +81,10 @@ var indexPreflightEntryPoints = map[string]map[string]string{
 			"an unrepresentable index in database N is found after N-1 databases are copied",
 		"(*AddTable).Run": "`add-table`: copies the new table, then emits its indexes — mid-sync, with " +
 			"the publication already extended",
+		"(*Streamer).resumeTargetPreflight": "`sync` stopped-cold-start resume: skips the copy the recorded run " +
+			"already made, but still emits that run's remaining indexes and views from a source schema re-read " +
+			"after the stop — so a refusal must land before that DDL, not at it (audit 2026-09-15 " +
+			"A0915-ARCH-MEDIUM-2)",
 	},
 	"backup": {
 		"(*Restore).refuseUnrepresentableTargetShape": "`restore`: writes the whole archive to the " +

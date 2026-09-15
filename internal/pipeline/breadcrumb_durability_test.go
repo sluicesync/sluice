@@ -76,9 +76,11 @@ func TestPersistTableBreadcrumbRefusesWhenTheStoreCannotRecordIt(t *testing.T) {
 	}
 }
 
-// A sync cold start's progress rows are a `sync status` heartbeat that
-// loadOrInitState refuses to resume from, so no correctness argument rests
-// on them. Killing a cold start over one would be pure loss.
+// A sync cold start's progress rows are read back by the stopped-cold-start
+// resume, but only a terminal `complete` row can authorise skipping a copy,
+// and a swallowed breadcrumb can only remove that evidence (see
+// persistTableBreadcrumb's scope note). Killing a cold start over one would
+// be pure loss.
 func TestPersistTableBreadcrumbIsExemptForARecordOnlyContext(t *testing.T) {
 	t.Parallel()
 	store := newFakeStateStore()

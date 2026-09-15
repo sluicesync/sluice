@@ -19,9 +19,10 @@ const stoppedSlotKeptMarker = "STOPPED-SLOT-KEPT"
 
 // defaultSlotNameForAdvice is the slot the PG engine creates when no
 // --slot-name is given. Duplicated from the engine (this package must not
-// import it) and held to it by TestStoppedSlotAdviceNamesTheRealDefault,
-// because a recovery instruction that names a nonexistent slot is worse
-// than one that names none.
+// import it) and held to it — with its two package siblings and the
+// CLI's copy — by TestStoppedSlotAdviceNamesTheRealDefault, because a
+// recovery instruction that names a nonexistent slot is worse than one
+// that names none.
 const defaultSlotNameForAdvice = "sluice_slot"
 
 // abandonUnlessStopped is the single door every POST-COPY cold-start

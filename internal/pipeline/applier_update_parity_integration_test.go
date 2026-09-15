@@ -57,6 +57,9 @@ type applierVerdict struct {
 	// [appliershared.ErrNoRowPredicate] — the named refusal, as opposed to
 	// any other error (a driver syntax error, say), which lands in errText.
 	refused bool
+	// refusedEmptySet is the after-image sibling: an error wrapping
+	// [appliershared.ErrEmptySetClause] (audit 2026-09-15 A0915-PG-MEDIUM-3).
+	refusedEmptySet bool
 	// errText is "" on success; otherwise the error, so a divergence report
 	// shows WHICH loud failure each engine produced.
 	errText string
@@ -72,6 +75,8 @@ func (v applierVerdict) String() string {
 	switch {
 	case v.refused:
 		return "REFUSED(no-row-predicate)"
+	case v.refusedEmptySet:
+		return "REFUSED(empty-set-clause)"
 	case v.errText != "":
 		return "ERROR(" + v.errText + ")"
 	case !v.rowPresent:
@@ -243,6 +248,70 @@ func TestApplierUpdateImageParity(t *testing.T) {
 	}
 }
 
+// TestApplierEmptyAfterImageIsLoudOnBothEngines is the after-image row of
+// the divergence map (audit 2026-09-15 A0915-PG-MEDIUM-3). An ir.Update whose
+// After carries nothing settable renders `UPDATE t SET  WHERE …`; both
+// servers used to reject that as a syntax error, and then the Postgres
+// applier's sharded-target trim turned it into a silent no-op at exit 0
+// on EVERY Postgres target. The verdict both engines must share is LOUD
+// with the target row untouched:
+//
+//   - Postgres: sluice's own named refusal, appliershared.ErrEmptySetClause,
+//     before any SQL is rendered.
+//   - MySQL: still the SERVER's syntax error (Error 1064) — loud, but
+//     unattributed. The MySQL applier is deliberately not changed by the
+//     PG-MEDIUM-3 fix; giving it the named refusal is its own follow-up,
+//     and this test pins what it does today so that follow-up is a
+//     visible change rather than a silent one.
+//
+// Both batch shapes, both engines, exactly as TestApplierUpdateImageParity.
+func TestApplierEmptyAfterImageIsLoudOnBothEngines(t *testing.T) {
+	mysqlDSN, mysqlCleanup := parityMySQLTarget(t)
+	defer mysqlCleanup()
+	pgDSN, pgCleanup := parityPostgresTarget(t)
+	defer pgCleanup()
+
+	tc := parityCase{
+		name: "empty-After/row-present",
+		seed: "INSERT INTO parity (id, tag, body) VALUES (1, 'orig', 'big-body')",
+		change: func(e string) ir.Change {
+			return ir.Update{
+				Position: ir.Position{Engine: e, Token: "par-empty-after"}, Table: "parity",
+				Before: ir.Row{"id": int64(1)},
+				After:  ir.Row{},
+			}
+		},
+	}
+	targets := []struct{ engine, dsn, schema, want string }{
+		{"postgres", pgDSN, "public", "REFUSED(empty-set-clause)"},
+		{"mysql", mysqlDSN, "target_db", "1064"},
+	}
+	for _, bs := range []struct {
+		name      string
+		batchSize int
+	}{
+		{"serial", 1},
+		{"batched", 64},
+	} {
+		for _, tgt := range targets {
+			t.Run(bs.name+"/"+tgt.engine, func(t *testing.T) {
+				got := runParityCase(t, tgt.engine, tgt.dsn, tgt.schema, tc, bs.batchSize)
+				// LOUD: never an applied verdict of any shape.
+				if !strings.HasPrefix(got.String(), "REFUSED(") && !strings.HasPrefix(got.String(), "ERROR(") {
+					t.Fatalf("%s applier (%s) absorbed an empty after-image silently: %s", tgt.engine, bs.name, got)
+				}
+				if !strings.Contains(got.String(), tgt.want) {
+					t.Errorf("%s applier (%s):\n  got  %s\n  want a verdict containing %q", tgt.engine, bs.name, got, tgt.want)
+				}
+				// And the target's own row is what the seed left.
+				if !got.rowPresent || got.tag != "orig" || got.body != "big-body" {
+					t.Errorf("%s applier (%s) disturbed the seeded row: %s", tgt.engine, bs.name, got)
+				}
+			})
+		}
+	}
+}
+
 // runParityCase resets the target table, seeds it, applies the one change
 // through the engine's real applier, and reads the row back.
 func runParityCase(t *testing.T, engine, dsn, schema string, tc parityCase, batchSize int) applierVerdict {
@@ -288,7 +357,8 @@ func runParityCase(t *testing.T, engine, dsn, schema string, tc parityCase, batc
 	}
 	if err := batched.ApplyBatch(ctx, "parity-stream", ch, batchSize); err != nil {
 		v.refused = errors.Is(err, appliershared.ErrNoRowPredicate)
-		if !v.refused {
+		v.refusedEmptySet = errors.Is(err, appliershared.ErrEmptySetClause)
+		if !v.refused && !v.refusedEmptySet {
 			v.errText = compactErr(err)
 		}
 		// A refusal aborts the batch, so the target is whatever the seed

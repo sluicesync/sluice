@@ -6,6 +6,7 @@ package postgres
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log/slog"
 	"reflect"
 	"strings"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"sluicesync.dev/sluice/internal/appliershared"
 	"sluicesync.dev/sluice/internal/ir"
 )
 
@@ -355,6 +357,46 @@ func TestBuildUpdateSQL(t *testing.T) {
 	wantArgs := []any{false, "new@example.com", int64(7), "old@example.com", int64(7)}
 	if !reflect.DeepEqual(gotArgs, wantArgs) {
 		t.Errorf("\n got args: %#v\nwant args: %#v", gotArgs, wantArgs)
+	}
+}
+
+// TestBuildUpdateSQL_EmptyAfterImageIsRefused pins audit 2026-09-15
+// A0915-PG-MEDIUM-3: an after-image with nothing settable is REFUSED with the
+// named sentinel, never returned as the empty "no work" statement that
+// the sharded-target trim legitimately produces. All three empty shapes
+// — nil, empty, generated-only — and both target kinds (shardKeys nil
+// and set), because the silent branch was reachable on every target.
+func TestBuildUpdateSQL_EmptyAfterImageIsRefused(t *testing.T) {
+	t.Parallel()
+	before := ir.Row{"id": int64(7)}
+	colTypes := map[string]*ir.Column{
+		"id":  {Name: "id"},
+		"gen": {Name: "gen", GeneratedExpr: "id * 2"},
+	}
+	afters := map[string]ir.Row{
+		"nil":            nil,
+		"empty":          {},
+		"generated-only": {"gen": int64(14)},
+	}
+	for _, shardKeys := range [][]string{nil, {"id"}} {
+		for name, after := range afters {
+			t.Run(name+"/shardKeys="+strings.Join(shardKeys, ","), func(t *testing.T) {
+				t.Parallel()
+				stmt, _, err := buildUpdateSQL("public", "t", before, after, colTypes, shardKeys)
+				if !errors.Is(err, appliershared.ErrEmptySetClause) {
+					t.Fatalf("stmt=%q err=%v; want a refusal wrapping appliershared.ErrEmptySetClause — pre-fix this "+
+						"was a silent no-op on every non-sharded target", stmt, err)
+				}
+			})
+		}
+	}
+	// The legitimate empty statement is untouched: an after-image whose
+	// only column is an UNCHANGED shard key trims to nothing and returns
+	// ("", nil) with no error.
+	stmt, _, err := buildUpdateSQL("public", "t", ir.Row{"id": int64(7), "v": "x"}, ir.Row{"id": int64(7)},
+		map[string]*ir.Column{"id": {Name: "id"}, "v": {Name: "v"}}, []string{"id"})
+	if err != nil || stmt != "" {
+		t.Fatalf("unchanged-shard-key-only update: stmt=%q err=%v; want the empty no-work statement and no error", stmt, err)
 	}
 }
 

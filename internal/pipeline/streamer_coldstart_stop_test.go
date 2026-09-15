@@ -4,7 +4,6 @@
 package pipeline
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -13,6 +12,7 @@ import (
 	"go/token"
 	"log/slog"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -314,21 +314,61 @@ func TestStoppedSlotAdviceNamesTheRealSlot(t *testing.T) {
 		}
 	})
 
-	t.Run("the unset default matches what the PG engine actually creates", func(t *testing.T) {
-		// The constant is a copy of the engine's `defaultSlot`, because this
-		// package cannot import the engine. A divergence would leave the
-		// advice naming a slot nobody has.
-		src, err := os.ReadFile("../engines/postgres/cdc_reader.go")
-		if err != nil {
-			t.Fatalf("read the PG engine: %v", err)
-		}
-		if !bytes.Contains(src, []byte(`defaultSlot        = "`+defaultSlotNameForAdvice+`"`)) {
-			t.Errorf("the PG engine's defaultSlot is no longer %q, so the stopped-slot advice names a slot "+
-				"that does not exist. Re-point defaultSlotNameForAdvice rather than deleting this check.",
-				defaultSlotNameForAdvice)
-		}
+	t.Run("the unset default is the advice's constant", func(t *testing.T) {
+		// That the constant equals the engine's `defaultSlot` is
+		// TestStoppedSlotAdviceNamesTheRealDefault's job, below; this half
+		// only checks the advice renders it.
 		if !strings.Contains(capture(""), defaultSlotNameForAdvice) {
 			t.Errorf("with no --slot-name the advice does not name %q", defaultSlotNameForAdvice)
 		}
 	})
+}
+
+// TestStoppedSlotAdviceNamesTheRealDefault binds every VALUE-bearing copy
+// of the default slot name to the engine's own `defaultSlot` — the one
+// the Postgres reader actually creates.
+//
+// This package cannot import the engine, so it carries three copies
+// (defaultSlotNameForAdvice, defaultPGSlotName, defaultActiveSlotName)
+// and the CLI carries a fourth. TestDefaultSlotLiteralHasNoNewHome stops
+// a sixth home appearing but binds none of the five to each other; two
+// comments cited THIS test as the binding and it did not exist under
+// this name — the check lived as an unnamed subtest binding one copy
+// (2026-09-15 audit, LOW: sluice_slot has four value copies and both comments cite a test that did not exist). A divergence in defaultPGSlotName is the
+// A0909-AQ-M-1 shape exactly: a slot lookup against a name nothing
+// created returns no rows, which the caller cannot tell from a healthy
+// slot with nothing to report.
+func TestStoppedSlotAdviceNamesTheRealDefault(t *testing.T) {
+	t.Parallel()
+	engine := literalAssignedTo(t, "../engines/postgres/cdc_reader.go", `defaultSlot\s*=\s*"([^"]+)"`)
+	cli := literalAssignedTo(t, "../../cmd/sluice/sync_run.go", `return "([^"]+)"\s*\n\s*}\s*\n\s*return pipeline\.ResolveSlotName`)
+
+	copies := map[string]string{
+		"defaultSlotNameForAdvice (streamer_coldstart_stop.go)": defaultSlotNameForAdvice,
+		"defaultPGSlotName (streamer_slot_health.go)":           defaultPGSlotName,
+		"defaultActiveSlotName (add_table.go)":                  defaultActiveSlotName,
+		"cmd/sluice resolvedSlotName literal (sync_run.go)":     cli,
+	}
+	for name, got := range copies {
+		if got != engine {
+			t.Errorf("%s = %q, but the PG engine creates %q. Re-point the copy rather than deleting this "+
+				"check: advice or a probe naming a slot that does not exist is worse than none.", name, got, engine)
+		}
+	}
+}
+
+// literalAssignedTo reads a Go source file and returns the first capture
+// of re, failing if the pattern no longer matches — a renamed anchor must
+// fail here rather than silently bind to nothing.
+func literalAssignedTo(t *testing.T, path, re string) string {
+	t.Helper()
+	src, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	m := regexp.MustCompile(re).FindSubmatch(src)
+	if m == nil {
+		t.Fatalf("%s no longer matches %q — re-anchor this binding rather than deleting it", path, re)
+	}
+	return string(m[1])
 }

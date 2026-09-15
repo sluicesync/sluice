@@ -249,22 +249,51 @@ func (s *Streamer) resumeStoppedColdStart(
 	}
 
 	// GATE — the re-run's FLAGS describe the copy about to be
-	// inherited (review C-1). Every identity-and-drift door in runOnce
-	// keys on the cdc-state row, which this path does not have — see
-	// coldstart_copy_shape.go for why that is structural and what each
-	// disagreement would cost. This is a REFUSAL rather than a
-	// fall-through: an operator who changed `--where` between runs is
-	// not asking to silently keep the old predicate's rows.
+	// inherited (review C-1). See [Streamer.resumeCopyShapeGate].
+	if ok, refusal := s.resumeCopyShapeGate(ctx, streamID, state, schema); !ok {
+		return nil, nil, refusal != nil, refusal
+	}
+
+	// GATE — the TARGET-side preflights the cold start ran before its
+	// copy, re-run against the target as it is NOW (see
+	// [Streamer.resumeTargetPreflight] for the enumeration and why a
+	// refusal here is handled=true). Before the row floor: Bug 123 ordering.
+	if err := s.resumeTargetPreflight(ctx, schema, state.Phase); err != nil {
+		return nil, nil, true, err
+	}
+
+	// GATE — the TARGET's own account of what it holds (review C-2). Every
+	// gate above reads the target's BOOKKEEPING, which a TRUNCATE
+	// leaves perfectly intact — indexes and all, so even
+	// verifyBuiltIndexes would pass. The independent value is the rows:
+	// each table the copy recorded a non-zero count for must still hold
+	// something. See [everyCopiedTableStillHasRows].
+	if err := everyCopiedTableStillHasRows(ctx, s, schema, state); err != nil {
+		return nil, nil, true, err
+	}
+
+	return s.resumeStoppedColdStartFromVerifiedState(ctx, streamCtx, lsnTracker, applier, streamID, store, verifier, state, schema)
+}
+
+// resumeCopyShapeGate is the copy-shape gate of [Streamer.resumeStoppedColdStart]:
+// every identity-and-drift door in runOnce keys on the cdc-state row,
+// which the resume path does not have — see coldstart_copy_shape.go for
+// why that is structural and what each disagreement would cost. (false,
+// nil) means "not resumable, proceed as today"; (false, refusal) is the
+// deliberate COLD-START-SHAPE-CHANGED refusal — an operator who changed
+// `--where` between runs is not asking to silently keep the old
+// predicate's rows.
+func (s *Streamer) resumeCopyShapeGate(ctx context.Context, streamID string, state ir.MigrationState, schema *ir.Schema) (ok bool, refusal error) {
 	current := coldStartCopyShape(s, schema)
 	if state.CopyShape == "" {
 		slog.InfoContext(ctx, "pipeline: this stream's recorded cold start carries no copy-shape fingerprint, "+
 			"so the re-run's flags cannot be checked against the copy already on the target; not resuming",
 			slog.String("stream_id", streamID))
-		return nil, nil, false, nil
+		return false, nil
 	}
 	refusing, advisory := copyShapeAdvisory(copyShapeDrift(state.CopyShape, current))
 	if len(refusing) > 0 {
-		return nil, nil, true, fmt.Errorf(
+		return false, fmt.Errorf(
 			"pipeline: %s: this stream's recorded cold start finished its bulk copy, but this run's %s "+
 				"%s differ from the run that made it. Resuming would SKIP the copy and leave the target "+
 				"holding rows the current flags did not select or shape — silently, because CDC only carries "+
@@ -294,17 +323,26 @@ func (s *Streamer) resumeStoppedColdStart(
 			slog.String("changed", strings.Join(advisory, ", ")),
 			slog.String("recorded_phase", string(state.Phase)))
 	}
+	return true, nil
+}
 
-	// GATE — the TARGET's own account of what it holds (review C-2). Every
-	// gate above reads the target's BOOKKEEPING, which a TRUNCATE
-	// leaves perfectly intact — indexes and all, so even
-	// verifyBuiltIndexes would pass. The independent value is the rows:
-	// each table the copy recorded a non-zero count for must still hold
-	// something. See [everyCopiedTableStillHasRows].
-	if err := everyCopiedTableStillHasRows(ctx, s, schema, state); err != nil {
-		return nil, nil, true, err
-	}
-
+// resumeStoppedColdStartFromVerifiedState is the second half of
+// [Streamer.resumeStoppedColdStart]: every bookkeeping and target-side
+// gate has passed, and what remains is the SOURCE's own account of the
+// anchor, then the committed resume (the remaining DDL phases, the
+// anchor write, and the warm-resume handoff into CDC). Split at the
+// point where the decision stops being "is this resumable" and becomes
+// "resume it", so each half reads on one screen.
+func (s *Streamer) resumeStoppedColdStartFromVerifiedState(
+	ctx, streamCtx context.Context,
+	lsnTracker any,
+	applier ir.ChangeApplier,
+	streamID string,
+	store ir.MigrationStateStore,
+	verifier ir.SnapshotAnchorVerifier,
+	state ir.MigrationState,
+	schema *ir.Schema,
+) (changes <-chan ir.Change, stop func(), handled bool, err error) {
 	// GATE — the SOURCE's account of where it stands now. Every gate
 	// above except the row floor reads what a previous sluice process
 	// wrote down; this one asks the server, and it is the only one that
@@ -416,6 +454,145 @@ func (s *Streamer) resumeStoppedColdStart(
 	// that ran to completion leaves behind.
 	changes, stop, err = s.warmResume(streamCtx, anchor, lsnTracker)
 	return changes, stop, true, err
+}
+
+// resumeTargetPreflight runs, against a RowWriter opened for the purpose,
+// every TARGET-side preflight the single-database cold start runs in
+// [Streamer.coldStartOpenTargetWriters] and [Streamer.coldStartGatePreflight]
+// that still applies to a run which skips the copy. Enumerated, with the
+// verdict for each, so the omissions are decisions rather than gaps
+// (this lane ran ZERO of them before audit 2026-09-15 A0915-ARCH-MEDIUM-2):
+//
+//   - preflightStaleBackends — WIRED. The index/constraint/view phases
+//     take the same locks the copy would; an orphan of the stopped run
+//     holding one would wedge them.
+//   - PreflightShardPlacement / PreflightShardKeyUpsert — WIRED. The
+//     resume enters CDC, whose applier upserts; both refusals guard
+//     exactly that (Bug 283's silent PK-duplication class).
+//   - PreflightDirectDDL — WIRED, under the same --schema-already-applied
+//     condition as its siblings for parity, although that flag cannot
+//     reach this lane (its cold start records no anchor).
+//   - PreflightRLS (target) — WIRED. CDC applies rows through this role.
+//   - preflightTargetOwnershipAdvisory — WIRED; advisory and free.
+//   - PreflightPlanetScaleForeignKeys — WIRED, gated on the recorded
+//     phase the way runColdStartResumePhases gates the constraints phase:
+//     that phase is what adds the FKs, and a confirmable
+//     FK-support-disabled target would wall there after the index build;
+//     but a run recorded at `views` or `complete` already added its FKs
+//     under the setting live then and adds none now, so refusing it on a
+//     since-toggled flag would be a false refusal. The returned status is
+//     dropped: there is no plan report on a resume.
+//   - the five emit dispatchers (PreflightTableEmit, PreflightTableNameFold,
+//     PreflightIndexEmit, PreflightViewEmit, PreflightColumnTypeEmit) —
+//     WIRED. The remaining phases create this schema's indexes and views
+//     on the target and CDC addresses its tables and columns by name, so a
+//     verdict the target would now return is one this run acts on. All
+//     five are functions of (target, schema) and passed run 1 for the same
+//     pair, so they refuse only when the source schema or the target
+//     changed during the stop — which is the window this lane exists for.
+//     The table and column-type members are wired although the lane
+//     creates no tables, because TestIndexEmitPreflightReachesEveryCopyEntryPoint
+//     holds every rostered entry point to all five, and a no-op on an
+//     unchanged schema is cheaper than a carve-out in that gate.
+//   - preflightBinaryTargetColumnsOnCDC / preflightArrayBytesLeafOnCDC —
+//     WIRED, last, as the single-database cold start orders them. Both
+//     refuse a source/target column pair CDC's applier cannot carry
+//     faithfully, and this lane enters CDC; the binary one reads the
+//     target catalog, which a stop can change.
+//   - PreflightTableEmit / PreflightColumnTypeEmit — NOT run: both guard
+//     CREATE TABLE, and this lane creates no tables.
+//   - PreflightSourceBoolRanges — NOT run: it is a MySQL TINYINT(1)
+//     fail-fast for the COPY, and this lane is PostgreSQL-source-only
+//     (its SnapshotAnchorVerifier gate) and runs no copy, so it would be
+//     a no-op twice over.
+//   - preflightCrossShardCollision — NOT run: it refuses a multi-shard
+//     source merging into one target, and the only source this lane
+//     admits (Postgres) reports no shards.
+//   - preflightShardConsolidation / preflightColdStart — NOT run: both
+//     judge whether a populated target may receive a COPY, and this lane
+//     requires a populated target and copies nothing into it. Whether the
+//     rows there are the recorded copy's is what the copy-shape gate (its
+//     `shard` aspect included) and the row floor decide.
+//   - the connection-budget probe (ResolveTargetCopyParallelism) — NOT
+//     run: it sizes the copy fan-out, and this lane runs no copy.
+//
+// A source column added during the stop is a residual none of these
+// reaches: it leaves the target column absent with no copy to trip over
+// (named in the audit report behind A0915-ARCH-MEDIUM-2), and the honest
+// answer is a schema compare, not a preflight — not closed here.
+//
+// Held, against both of the lane's references, by
+// TestTargetPreflightRoster_StoppedColdStartResumeReachesMigrateSiblings
+// and TestTargetPreflightRoster_StoppedColdStartResumeReachesSingleDatabaseColdStartSiblings.
+func (s *Streamer) resumeTargetPreflight(ctx context.Context, schema *ir.Schema, recordedPhase ir.MigrationPhase) error {
+	if err := migcore.PreflightTableEmit(ctx, s.Target, schema, "sync cold-start resume"); err != nil {
+		return err
+	}
+	if err := migcore.PreflightTableNameFold(ctx, s.Target, s.TargetDSN, schema, "sync cold-start resume"); err != nil {
+		return err
+	}
+	if err := migcore.PreflightIndexEmit(ctx, s.Target, schema, "sync cold-start resume"); err != nil {
+		return err
+	}
+	if err := migcore.PreflightViewEmit(ctx, s.Target, schema, "sync cold-start resume"); err != nil {
+		return err
+	}
+	if err := migcore.PreflightColumnTypeEmit(ctx, s.Target, schema, "sync cold-start resume"); err != nil {
+		return err
+	}
+	if recordedPhase != ir.MigrationPhaseViews && recordedPhase != ir.MigrationPhaseComplete {
+		if _, err := migcore.PreflightPlanetScaleForeignKeys(ctx, migcore.PlanetScaleFKPreflightInput{
+			TargetIsPlanetScale: s.Target.Name() == enginePlanetScale,
+			SkipForeignKeys:     s.SkipForeignKeys,
+			ForeignKeyCount:     migcore.CountForeignKeys(schema),
+			Checker:             s.FKEnablementChecker,
+		}); err != nil {
+			return err
+		}
+	}
+	rw, err := s.Target.OpenRowWriter(ctx, s.TargetDSN)
+	if err != nil {
+		return connectHint(fmt.Errorf("pipeline: open target row writer for the resume's target preflights: %w", err))
+	}
+	defer migcore.CloseIf(rw)
+	migcore.ApplyTargetSchema(rw, s.TargetSchema)
+
+	if err := preflightStaleBackends(ctx, s.Target, s.TargetDSN, targetWriteSchemas(schema, s.TargetSchema), s.ReapStaleBackends); err != nil {
+		return err
+	}
+	if err := migcore.PreflightShardPlacement(ctx, schema, rw); err != nil {
+		return err
+	}
+	if err := migcore.PreflightShardKeyUpsert(ctx, schema, rw); err != nil {
+		return err
+	}
+	if !s.SchemaAlreadyApplied {
+		if err := migcore.PreflightDirectDDL(ctx, rw, "sync cold-start resume"); err != nil {
+			return err
+		}
+		if err := migcore.PreflightRLS(ctx, schema, rw, migcore.RLSSideTarget); err != nil {
+			return err
+		}
+	}
+	preflightTargetOwnershipAdvisory(ctx, rw)
+
+	// The two CDC-lane value refusals, last, in the single-database cold
+	// start's order. The binary-column one reads the target's catalog, which
+	// is exactly what a stop can change underneath a stream.
+	gate := &existingTablesGate{
+		Source:              s.Source,
+		Target:              s.Target,
+		TargetDSN:           s.TargetDSN,
+		TargetSchema:        s.TargetSchema,
+		EnabledPGExtensions: s.EnabledPGExtensions,
+		Mode:                "sync cold-start resume",
+	}
+	if actual, ok := gate.readTargetTablesForShapeGate(ctx); ok {
+		if err := preflightBinaryTargetColumnsOnCDC(schema, actual, "sync cold-start resume"); err != nil {
+			return err
+		}
+	}
+	return preflightArrayBytesLeafOnCDC(schema, engineNameOrEmpty(s.Target), "sync cold-start resume")
 }
 
 // readRecordedColdStart reads the recorded header, healing the one

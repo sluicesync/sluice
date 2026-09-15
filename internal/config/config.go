@@ -366,7 +366,7 @@ func Load(path string) (*Config, error) {
 	envProvider := env.Provider("SLUICE_", ".", func(s string) string {
 		key, ok := idx.resolve(s)
 		if !ok {
-			if !isProcessLevelEnvVar(s) {
+			if !IsProcessLevelEnvVar(s) {
 				unknown = append(unknown, s)
 			}
 			return "" // koanf skips empty keys — the var is not a config key
@@ -523,17 +523,26 @@ func (idx *envKeyIndex) validKeys() []string {
 	return keys
 }
 
-// isProcessLevelEnvVar reports whether name is a SLUICE_-prefixed
+// IsProcessLevelEnvVar reports whether name is a SLUICE_-prefixed
 // variable that belongs to the CLI / hook surface rather than the
 // config file — those are consumed elsewhere (kong `env:` tags,
 // os.Getenv) and must neither overlay the config nor trip the
 // unknown-variable WARN. The set mirrors the kong bindings in
 // cmd/sluice; SLUICE_ROLLOVER_* is the env sluice itself exports to
 // backup rollover hooks.
-func isProcessLevelEnvVar(name string) bool {
+//
+// "Mirrors" is held mechanically, not by hand: cmd/sluice's
+// TestEveryKongEnvBindingIsProcessLevel walks kong's own model and fails
+// for any SLUICE_* `env:` binding this set does not name. It exists
+// because the hand-kept list drifted — SLUICE_STAGE_DIR and
+// SLUICE_METRICS_SINK_HTTP were both real bindings that this function
+// reported to the operator as typos being "ignored", while kong was
+// consuming them (2026-09-15 audit, LOW: SLUICE_STAGE_DIR and SLUICE_METRICS_SINK_HTTP WARNed as typos).
+func IsProcessLevelEnvVar(name string) bool {
 	switch name {
 	case "SLUICE_SOURCE", "SLUICE_TARGET",
-		"SLUICE_NOTIFY_WEBHOOK", "SLUICE_NOTIFY_SLACK", "SLUICE_NOTIFY_SMTP_PASSWORD":
+		"SLUICE_NOTIFY_WEBHOOK", "SLUICE_NOTIFY_SLACK", "SLUICE_NOTIFY_SMTP_PASSWORD",
+		"SLUICE_STAGE_DIR", "SLUICE_METRICS_SINK_HTTP":
 		return true
 	}
 	return strings.HasPrefix(name, "SLUICE_ROLLOVER_")

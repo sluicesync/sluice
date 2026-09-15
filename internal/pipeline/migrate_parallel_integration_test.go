@@ -147,6 +147,31 @@ func TestMigrate_PG_ParallelCopy_LargeTable(t *testing.T) {
 	if phase != string(ir.MigrationPhaseComplete) {
 		t.Errorf("phase = %q; want complete", phase)
 	}
+
+	// The completed table's RowsCopied is the SUM of its chunk counts, not
+	// zero (2026-09-15 audit, LOW: RowsCopied doc false at completion). ir.TableProgress.RowsCopied's doc used
+	// to say the field is zero on the parallel path without the
+	// completion half, which made the one silent-loss gate that reads it
+	// at completion — the stopped-cold-start resume's target row floor,
+	// everyCopiedTableStillHasRows — look vacuous. Read back through the
+	// engine's own store so the assertion is about the persisted row.
+	opener, ok := pgEng.(ir.MigrationStateStoreOpener)
+	if !ok {
+		t.Fatal("postgres engine no longer opens a migration state store")
+	}
+	store, err := opener.OpenMigrationStateStore(ctx, targetDSN)
+	if err != nil {
+		t.Fatalf("OpenMigrationStateStore: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+	state, found, err := store.Read(ctx, "test-parallel-copy")
+	if err != nil || !found {
+		t.Fatalf("read recorded state: found=%v err=%v", found, err)
+	}
+	if got := state.TableProgress["events"].RowsCopied; got != rowCount {
+		t.Errorf("recorded TableProgress[events].RowsCopied = %d at completion; want the chunk sum %d — the "+
+			"stopped-cold-start resume's target row floor keys on this value", got, rowCount)
+	}
 }
 
 // TestMigrate_PG_ParallelCopy_V04BackwardCompat seeds a v0.4.0-shape

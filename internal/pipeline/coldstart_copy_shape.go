@@ -51,6 +51,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
@@ -278,13 +279,36 @@ func copyShapeTableSetHash(schema *ir.Schema) string {
 // overrides. Both lists shape the TARGET columns the copy wrote into,
 // and the resume does not re-create tables, so a change means run 2's
 // declared types describe a table run 1 built differently.
+//
+// Each group's overrides are SORTED (by table, then column, then the
+// rest) before hashing, so the aspect is a set like its siblings
+// ([copyShapeTableSetHash], [copyShapeViewSetHash]): the same
+// `--type-override` flags typed in a different order must agree, or the
+// resume refuses with a remedy ("re-run with the ones the recorded copy
+// used") the operator cannot act on, because nothing records the order
+// (2026-09-15 audit, LOW: copyShapeTypesHash unsorted).
+//
+// The token stream is otherwise the one the unsorted version hashed —
+// type overrides first, then expression overrides, each override's
+// tokens in the same order — so a cold start recorded by an older binary
+// whose overrides were already in sorted order (every single-override
+// run among them) still matches after an upgrade. Only a recorded run
+// with several overrides typed out of order refuses once, loudly, as a
+// changed shape. Pinned by TestColdStartCopyShape_TypesIsASetNotASequence.
 func copyShapeTypesHash(s *Streamer) string {
-	tokens := make([]string, 0, len(s.Mappings)*4+len(s.ExpressionMappings)*3)
+	mappings := make([][]string, 0, len(s.Mappings))
 	for _, m := range s.Mappings {
-		tokens = append(tokens, "m", m.Table, m.Column, m.TargetType, fmt.Sprint(m.TargetTypeOptions))
+		mappings = append(mappings, []string{"m", m.Table, m.Column, m.TargetType, fmt.Sprint(m.TargetTypeOptions)})
 	}
+	expressions := make([][]string, 0, len(s.ExpressionMappings))
 	for _, m := range s.ExpressionMappings {
-		tokens = append(tokens, "e", m.Table, m.Column, m.Expression)
+		expressions = append(expressions, []string{"e", m.Table, m.Column, m.Expression})
+	}
+	slices.SortFunc(mappings, slices.Compare)
+	slices.SortFunc(expressions, slices.Compare)
+	tokens := make([]string, 0, len(mappings)*5+len(expressions)*4)
+	for _, override := range slices.Concat(mappings, expressions) {
+		tokens = append(tokens, override...)
 	}
 	return copyShapeTokenHash(tokens...)
 }

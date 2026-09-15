@@ -551,14 +551,14 @@ func coldStartInFlight(ctx context.Context, target ir.Engine, dsn, streamID stri
 	if c, ok := lister.(io.Closer); ok {
 		defer func() { _ = c.Close() }()
 	}
-	states, err := lister.List(ctx, syncMigrationIDPrefix+streamID)
+	states, err := lister.List(ctx, pipeline.SyncMigrationIDPrefix+streamID)
 	if err != nil || len(states) == 0 {
 		return coldStartProgress{}, false
 	}
 	// List matches by PREFIX, so ask for the exact id rather than
 	// trusting the first row: stream "prod" would otherwise be reported
 	// as cold-starting because stream "prod-2" is.
-	want := syncMigrationIDPrefix + streamID
+	want := pipeline.SyncMigrationIDPrefix + streamID
 	for _, st := range states {
 		if st.MigrationID != want {
 			continue

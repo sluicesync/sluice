@@ -10,6 +10,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -436,6 +437,31 @@ func TestChangeLogConsumerID_IsUniquePerTargetAndCredentialFree(t *testing.T) {
 	again := ChangeLogConsumerID("sync", "postgres", "postgres://u:secret@db.host:5432/alpha?sslmode=require")
 	if again != a {
 		t.Errorf("consumer id is not stable across restarts: %q vs %q", again, a)
+	}
+}
+
+// TestChangeLogConsumerID_CutsOnARuneBoundary pins the length clamp's
+// sibling of audit 2026-09-15 A0915-STATE-MEDIUM-3: the id is the TEXT
+// primary key of the source's consumer registry, and a byte cut through a
+// non-ASCII stream id is invalid UTF-8 that Postgres refuses. Every rune
+// width, at every offset the 512-byte clamp can land inside it.
+func TestChangeLogConsumerID_CutsOnARuneBoundary(t *testing.T) {
+	for _, r := range []string{"é", "名", "🌊"} {
+		for offset := 0; offset < len(r); offset++ {
+			// A head of h ASCII bytes puts the clamp (max-h) mod width
+			// bytes into the rune run, so h = (max-offset) mod width
+			// lands it `offset` bytes in.
+			head := strings.Repeat("x", (maxChangeLogConsumerID-offset)%len(r))
+			id := ChangeLogConsumerID(head+strings.Repeat(r, maxChangeLogConsumerID), "postgres", "postgres://h/db")
+			if len(id) > maxChangeLogConsumerID || !utf8.ValidString(id) {
+				t.Errorf("rune %q offset %d: consumer id len=%d valid=%v; want <= %d bytes of valid UTF-8",
+					r, offset, len(id), utf8.ValidString(id), maxChangeLogConsumerID)
+			}
+			if maxChangeLogConsumerID-len(id) >= len(r) {
+				t.Errorf("rune %q offset %d: clamp gave up %d bytes; a boundary cut gives up fewer than one rune",
+					r, offset, maxChangeLogConsumerID-len(id))
+			}
+		}
 	}
 }
 

@@ -4,6 +4,7 @@
 package pipeline
 
 import (
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -162,6 +163,68 @@ func TestColdStartCopyShape_StableAcrossIrrelevantChanges(t *testing.T) {
 
 	if drifted := copyShapeDrift(recorded, coldStartCopyShape(changed, changedSchema)); len(drifted) != 0 {
 		t.Fatalf("irrelevant changes drifted %v; a false refusal here costs the operator a full re-copy", drifted)
+	}
+}
+
+// TestColdStartCopyShape_TypesIsASetNotASequence is the two-direction
+// pin for the `types` aspect (2026-09-15 audit, LOW: copyShapeTypesHash unsorted): REORDERING the
+// same overrides must not drift, while CHANGING one still must. The
+// aspect's siblings (`tables`, `views`) sort their inputs; this one did
+// not, so the same flags typed in a different order refused a healthy
+// resume with a remedy nothing could satisfy.
+func TestColdStartCopyShape_TypesIsASetNotASequence(t *testing.T) {
+	two := func() (*Streamer, *ir.Schema) {
+		s, schema := copyShapeBaseline()
+		s.Mappings = []config.Mapping{
+			{Table: "users", Column: "id", TargetType: "BIGINT"},
+			{Table: "orders", Column: "total", TargetType: "NUMERIC", TargetTypeOptions: map[string]any{"precision": 12, "scale": 2}},
+		}
+		s.ExpressionMappings = []config.ExpressionMapping{
+			{Table: "users", Column: "full", Expression: "a || b"},
+			{Table: "orders", Column: "note", Expression: "upper(n)"},
+		}
+		return s, schema
+	}
+	base, schema := two()
+	recorded := coldStartCopyShape(base, schema)
+
+	reordered, _ := two()
+	reordered.Mappings[0], reordered.Mappings[1] = reordered.Mappings[1], reordered.Mappings[0]
+	reordered.ExpressionMappings[0], reordered.ExpressionMappings[1] = reordered.ExpressionMappings[1], reordered.ExpressionMappings[0]
+	if drifted := copyShapeDrift(recorded, coldStartCopyShape(reordered, schema)); len(drifted) != 0 {
+		t.Fatalf("reordering the same overrides drifted %v; the types aspect must be a set", drifted)
+	}
+
+	changed, _ := two()
+	changed.Mappings[1].TargetTypeOptions = map[string]any{"precision": 14, "scale": 2}
+	if drifted := copyShapeDrift(recorded, coldStartCopyShape(changed, schema)); !reflect.DeepEqual(drifted, []string{"types"}) {
+		t.Fatalf("changing an override's options drifted %v; want exactly [types]", drifted)
+	}
+
+	// Upgrade compatibility: a cold start recorded by the binary that
+	// hashed in slice order must still match when its overrides were
+	// already in sorted order. The expected value is the OLD formula,
+	// written out here rather than derived from the new function.
+	legacy := func(s *Streamer) string {
+		tokens := make([]string, 0, 5*len(s.Mappings)+4*len(s.ExpressionMappings))
+		for _, m := range s.Mappings {
+			tokens = append(tokens, "m", m.Table, m.Column, m.TargetType, fmt.Sprint(m.TargetTypeOptions))
+		}
+		for _, m := range s.ExpressionMappings {
+			tokens = append(tokens, "e", m.Table, m.Column, m.Expression)
+		}
+		return copyShapeTokenHash(tokens...)
+	}
+	single, _ := two()
+	single.Mappings, single.ExpressionMappings = single.Mappings[:1], single.ExpressionMappings[:1]
+	sorted, _ := two()
+	sorted.Mappings[0], sorted.Mappings[1] = sorted.Mappings[1], sorted.Mappings[0] // orders < users
+	sorted.ExpressionMappings[0], sorted.ExpressionMappings[1] = sorted.ExpressionMappings[1], sorted.ExpressionMappings[0]
+	for name, s := range map[string]*Streamer{"single override per group": single, "overrides already sorted": sorted} {
+		if got, want := copyShapeTypesHash(s), legacy(s); got != want {
+			t.Errorf("%s: types hash %s differs from the pre-sort formula's %s — a cold start stopped under the "+
+				"older binary would refuse as a changed shape after an upgrade", name, got, want)
+		}
 	}
 }
 

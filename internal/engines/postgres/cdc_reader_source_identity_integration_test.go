@@ -8,7 +8,7 @@
 // to capture a position whose token now carries (systemid, timeline),
 // then exercises both the happy-path (resume against the same source
 // passes) and the divergence path (resume with a tampered systemid /
-// timeline refuses loudly with an ir.ErrPositionInvalid-wrapped
+// timeline refuses loudly with an ir.ErrPositionForeignLineage-wrapped
 // error). A live PITR or standby promotion can't be cleanly wired up
 // in testcontainers, but a tampered persisted-position token
 // exercises the same divergence-detection code path: the comparison
@@ -141,9 +141,10 @@ func TestCDCReader_SourceIdentityPin_HappyPathResume(t *testing.T) {
 // TestCDCReader_SourceIdentityPin_DivergenceRefusesLoud is the
 // silent-loss closure: a persisted position whose (systemid,
 // timeline) disagrees with what IDENTIFY_SYSTEM now reports MUST be
-// refused, and the refusal MUST wrap ir.ErrPositionInvalid so the
-// pipeline streamer's ADR-0022 fall-through routes to cold-start
-// rather than silently advancing the slot against the wrong
+// refused, and the refusal MUST wrap ir.ErrPositionForeignLineage —
+// not ir.ErrPositionInvalid, whose ADR-0022 fall-through would
+// cold-start from the diverged instance at exit 0 (audit 2026-09-15
+// A0915-ARCH-MEDIUM-1) — rather than silently advancing the slot against the wrong
 // timeline.
 //
 // The divergence is simulated by tampering with a real captured
@@ -228,8 +229,11 @@ func TestCDCReader_SourceIdentityPin_DivergenceRefusesLoud(t *testing.T) {
 	if err == nil {
 		t.Fatal("StreamChanges with diverged sysid must refuse; got nil error")
 	}
-	if !errors.Is(err, ir.ErrPositionInvalid) {
-		t.Errorf("error must wrap ir.ErrPositionInvalid so the streamer ADR-0022 fall-through engages; got: %v", err)
+	if !errors.Is(err, ir.ErrPositionForeignLineage) {
+		t.Errorf("error must wrap ir.ErrPositionForeignLineage so the streamer refuses the automatic re-copy; got: %v", err)
+	}
+	if errors.Is(err, ir.ErrPositionInvalid) {
+		t.Errorf("error must NOT satisfy ir.ErrPositionInvalid (the automatic re-copy sentinel); got: %v", err)
 	}
 	if !strings.Contains(err.Error(), "source identity has changed") {
 		t.Errorf("error must say 'source identity has changed'; got: %v", err)

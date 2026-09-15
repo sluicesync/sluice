@@ -127,10 +127,12 @@ func TestEncodePGPosOmitsZeroIdentityFields(t *testing.T) {
 // TestCheckSourceIdentity exercises the ADR-0051 divergence detector:
 // match (silent), pre-ADR-0051 sentinel (lazy install — silent),
 // timeline mismatch (refuse), sysid mismatch (refuse). The refusal
-// MUST wrap ir.ErrPositionInvalid so the streamer's existing
-// ADR-0022 fall-through path can re-route to cold-start, and MUST
-// name both old and new (sysid, timeline) so operators can confirm
-// the divergence matches their intended PITR/promotion event.
+// MUST wrap ir.ErrPositionForeignLineage — and must NOT satisfy
+// ir.ErrPositionInvalid, the sentinel that routes the streamer's
+// automatic re-copy from whatever now answers the DSN (audit
+// 2026-09-15 A0915-ARCH-MEDIUM-1) — and MUST name both old and new (sysid, timeline) so
+// operators can confirm the divergence matches their intended
+// PITR/promotion event.
 func TestCheckSourceIdentity(t *testing.T) {
 	cases := []struct {
 		name           string
@@ -193,8 +195,12 @@ func TestCheckSourceIdentity(t *testing.T) {
 				if err == nil {
 					t.Fatal("expected error; got nil")
 				}
-				if !errors.Is(err, ir.ErrPositionInvalid) {
-					t.Errorf("error must wrap ir.ErrPositionInvalid so the streamer's ADR-0022 fall-through engages; got: %v", err)
+				if !errors.Is(err, ir.ErrPositionForeignLineage) {
+					t.Errorf("error must wrap ir.ErrPositionForeignLineage so the streamer REFUSES the automatic re-copy; got: %v", err)
+				}
+				if errors.Is(err, ir.ErrPositionInvalid) {
+					t.Errorf("error must NOT satisfy ir.ErrPositionInvalid — that sentinel routes the ADR-0022 automatic "+
+						"re-copy from whatever now answers the DSN, which is the wrong recovery for a different lineage; got: %v", err)
 				}
 				for _, sub := range c.wantContains {
 					if !strings.Contains(err.Error(), sub) {

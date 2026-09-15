@@ -95,6 +95,41 @@ func RefuseNoRowPredicate(engine, op, schema, table string, before ir.Row) error
 	)
 }
 
+// ErrEmptySetClause is the sentinel for an [ir.Update] whose after-image
+// carries nothing an UPDATE could SET — nil, empty, or only generated
+// columns. Errors wrapping it are matchable with [errors.Is].
+var ErrEmptySetClause = errors.New("change carries no after-image column to SET")
+
+// RefuseEmptySetClause is [RefuseNoRowPredicate]'s sibling for the OTHER
+// half of an UPDATE: an after-image that renders to an empty SET list.
+//
+// Rendered, such a change is `UPDATE t SET  WHERE …`, which both servers
+// reject as a syntax error (PG 42601, MySQL 1064) — loud, unattributed,
+// and until audit 2026-09-15 A0915-PG-MEDIUM-3 the same answer on both
+// engines. The Postgres applier then gained a sharded-target rule that
+// drops an UNCHANGED shard key from the SET list and treats an empty
+// result as "nothing left to write"; on every non-sharded target that
+// rule is the identity, so its empty-result branch reduced to
+// `len(after) == 0` and turned the loud 42601 into a silent no-op at
+// exit 0, on every Postgres target, while MySQL still failed loudly.
+//
+// No reader in the tree produces an empty after-image today (every CDC
+// reader emits at least one after column; the backfill synthesiser is
+// fed a non-empty added-column set), so this is a corruption / decoder
+// guard rather than a routine path — which is exactly the shape the
+// new-surface checklist says must refuse rather than skip: a decoder
+// that silently yields an empty payload must not be absorbed by an
+// applier that silently accepts one. Refusing names the row, which
+// the server's syntax error never did.
+func RefuseEmptySetClause(engine, schema, table string, after ir.Row) error {
+	return fmt.Errorf(
+		"%s: applier: update on %s: %w (after-image carries %v, none of it settable) "+
+			"— the change describes no new value for any column, so applying it is either a no-op the "+
+			"source never intended or a decoded row that lost its payload; refusing rather than guessing",
+		engine, qualified(schema, table), ErrEmptySetClause, rowColumnNames(after),
+	)
+}
+
 // qualified renders "schema.table", or just "table" when schema is empty —
 // the same spelling [ir.Change.QualifiedName] produces, so a refusal names
 // the row the way every other applier message does.

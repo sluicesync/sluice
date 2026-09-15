@@ -104,6 +104,9 @@ var errArrayBytesLeafOnCDC = errors.New(
 //
 //   - `sync` single-database cold start, on every branch of
 //     coldStartGatePreflight.
+//   - The stopped-cold-start resume (resumeTargetPreflight), which re-reads
+//     the source schema before entering CDC — added by audit 2026-09-15
+//     A0915-ARCH-MEDIUM-2's roster against the single-database cold start.
 //   - `schema add-table`, against the target the live stream applies to.
 //   - A column declared as a DOMAIN over such an array
 //     (`CREATE DOMAIN d AS json[]`) — see [unwrapDomainToArray]. The

@@ -288,7 +288,16 @@ func TestEnvVars_PrecedenceOverYAML(t *testing.T) {
 func TestEnvVars_UnknownVarWarnsLoudly(t *testing.T) {
 	t.Setenv("SLUICE_TYPO_KEY", "1")
 	// A kong-bound process var must NOT warn (it is consumed by the CLI).
+	// Three of them, deliberately: SLUICE_SOURCE was always in the exempt
+	// set; SLUICE_STAGE_DIR and SLUICE_METRICS_SINK_HTTP are the two real
+	// kong bindings the hand-kept set had drifted from, so an operator who
+	// set either was told sluice was "ignoring" a variable kong was in fact
+	// consuming (2026-09-15 audit, LOW: SLUICE_STAGE_DIR and SLUICE_METRICS_SINK_HTTP WARNed as typos). cmd/sluice's
+	// TestEveryKongEnvBindingIsProcessLevel derives the full set from the
+	// kong model; this pins the operator-visible symptom.
 	t.Setenv("SLUICE_SOURCE", "postgres://u:p@h/db")
+	t.Setenv("SLUICE_STAGE_DIR", t.TempDir())
+	t.Setenv("SLUICE_METRICS_SINK_HTTP", "http://127.0.0.1:1/metrics")
 
 	var logBuf bytes.Buffer
 	prev := slog.Default()
@@ -309,8 +318,11 @@ func TestEnvVars_UnknownVarWarnsLoudly(t *testing.T) {
 	if !strings.Contains(logs, "keyset_source") {
 		t.Errorf("WARN log %q should list the valid keys", logs)
 	}
-	if strings.Contains(logs, "SLUICE_SOURCE") {
-		t.Errorf("WARN log %q flagged the kong-bound SLUICE_SOURCE — process-level vars are exempt", logs)
+	for _, bound := range []string{"SLUICE_SOURCE", "SLUICE_STAGE_DIR", "SLUICE_METRICS_SINK_HTTP"} {
+		if strings.Contains(logs, bound) {
+			t.Errorf("WARN log %q flagged the kong-bound %s as a typo being ignored — process-level vars are exempt, "+
+				"and this one is consumed by the CLI", logs, bound)
+		}
 	}
 }
 

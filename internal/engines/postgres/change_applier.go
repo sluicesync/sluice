@@ -1715,7 +1715,11 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		}
 		if stmt == "" {
 			// Every column the update touched was an unchanged shard key:
-			// there is nothing to write, and the change is satisfied.
+			// there is nothing to write, and the change is satisfied. This
+			// is the only shape that arrives here empty — an after-image
+			// with nothing settable is refused inside buildUpdateSQL
+			// (appliershared.ErrEmptySetClause), so a decoder that lost a
+			// row's payload cannot be absorbed as "satisfied".
 			return false, nil
 		}
 		// Update misses are tolerated (zero rows affected) for resume
@@ -2742,6 +2746,9 @@ func buildInsertSQL(schema, table string, row ir.Row, key []string, colTypes map
 //
 // An empty returned statement means "no work": every column the update
 // touched was an unchanged shard key, so there is nothing left to SET.
+// That is the ONLY way an empty statement comes back — an after-image
+// that had nothing settable to begin with is refused, below, before the
+// shard-key trim runs.
 func buildUpdateSQL(schema, table string, before, after ir.Row, colTypes map[string]*ir.Column, shardKeys []string) (sqlStmt string, args []any, err error) {
 	// Audit 2026-08-05 C-9: refuse a before-image with nothing usable as a
 	// predicate, in the same words the MySQL applier uses. Pre-fix this
@@ -2750,6 +2757,17 @@ func buildUpdateSQL(schema, table string, before, after ir.Row, colTypes map[str
 	// and NOT the same answer MySQL's coalescing path gave (it upserted).
 	if len(appliershared.NonGeneratedRowKeys(before, colTypes)) == 0 {
 		return "", nil, appliershared.RefuseNoRowPredicate(engineNamePostgres, "update", schema, table, before)
+	}
+	// Audit 2026-09-15 A0915-PG-MEDIUM-3: the after-image half of the same
+	// question, and it must be asked BEFORE the shard-key trim. On a
+	// non-sharded target shardKeys is nil and dropUnchangedShardKeys is
+	// the identity, so the `len(setRow) == 0` no-op below reduced to
+	// `len(after) == 0` — converting the loud 42601 an empty after-image
+	// used to draw into a silent success on every Postgres target, while
+	// MySQL's sibling still fails loudly at the server. Refuse here so
+	// the empty-statement branch keeps its one honest meaning.
+	if len(appliershared.NonGeneratedRowKeys(after, colTypes)) == 0 {
+		return "", nil, appliershared.RefuseEmptySetClause(engineNamePostgres, schema, table, after)
 	}
 	setRow, err := dropUnchangedShardKeys(schema, table, before, after, shardKeys)
 	if err != nil {

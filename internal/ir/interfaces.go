@@ -3647,9 +3647,18 @@ type TableProgress struct {
 	LastPK []any
 
 	// RowsCopied is the count of rows committed so far on the single-
-	// chunk path. The parallel-copy path reports its total via the sum
-	// of [TableChunkProgress.RowsCopied] across [Chunks]; this field is
-	// zero in that case.
+	// chunk path. On the parallel-copy path it is ZERO WHILE CHUNKS ARE
+	// IN FLIGHT — each chunk carries its own count in [Chunks] — and the
+	// SUM of those chunk counts AT COMPLETION, when the orchestrator
+	// replaces the chunked entry with a bare `complete` row carrying
+	// the total (migrate_parallel.go; the sync cold start's fast lane
+	// accumulates into the same field). An earlier version of this
+	// comment said "zero in that case" without the completion half,
+	// which made the one gate that reads this field at completion —
+	// the stopped-cold-start resume's target row floor,
+	// everyCopiedTableStillHasRows — look vacuous on the parallel path
+	// (2026-09-15 audit, LOW: RowsCopied doc false at completion). It is not: pinned by
+	// TestMigrate_PG_ParallelCopy_LargeTable's RowsCopied assertion.
 	RowsCopied int64
 
 	// Chunks holds the per-chunk progress entries when the table is

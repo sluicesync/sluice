@@ -113,3 +113,21 @@ func TestRefuseNoRowPredicate(t *testing.T) {
 		t.Errorf("empty schema should not render a leading dot: %v", err)
 	}
 }
+
+func TestRefuseEmptySetClause(t *testing.T) {
+	err := RefuseEmptySetClause("postgres", "shop", "orders", ir.Row{"gen": "x"})
+	if !errors.Is(err, ErrEmptySetClause) {
+		t.Fatalf("error %v does not wrap ErrEmptySetClause", err)
+	}
+	if errors.Is(err, ErrNoRowPredicate) {
+		t.Fatalf("the two refusals must stay distinguishable; %v also satisfies ErrNoRowPredicate", err)
+	}
+	for _, want := range []string{"postgres", "update", "shop.orders", "gen"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal does not name %q: %v", want, err)
+		}
+	}
+	if err := RefuseEmptySetClause("mysql", "", "orders", nil); strings.Contains(err.Error(), ".orders") {
+		t.Errorf("empty schema should not render a leading dot: %v", err)
+	}
+}

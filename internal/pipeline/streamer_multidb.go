@@ -794,6 +794,16 @@ func (s *Streamer) coldStartReadOneDatabaseSchema(
 	if err := migcore.PreflightInheritanceTables(ctx, sr, s.Source.Capabilities(), schema); err != nil {
 		return nil, fmt.Errorf("pipeline: preflight database %q: %w", database, err)
 	}
+	// Pre-copy TINYINT(1)-range fail-fast, per database — the fan-out half
+	// of the migrate / single-database parity (audit 2026-09-15 roster
+	// sweep; it surfaced as the one SOURCE-side probe in migrate's pre-copy
+	// block the fan-out did not run). Against the per-database DSN, because
+	// the probe's reader is bound to one database and names tables bare.
+	// The per-row decode guard remains the correctness floor; a probe that
+	// cannot complete WARNs and proceeds.
+	if err := migcore.PreflightSourceBoolRanges(ctx, s.Source, srcDSN, schema, s.RowFilters); err != nil {
+		return nil, fmt.Errorf("pipeline: preflight database %q: %w", database, err)
+	}
 	return schema, nil
 }
 
@@ -1233,6 +1243,54 @@ func (s *Streamer) coldStartCopyOneDatabase(
 	}
 	migcore.ApplyTargetSchema(rw, targetSchema)
 	migcore.ApplyMaxBufferBytes(rw, s.MaxBufferBytes)
+
+	// ---- The TARGET-side preflights migrate and the single-database cold
+	// start run against their freshly opened writers (audit 2026-09-15
+	// A0915-ARCH-MEDIUM-2, its multi-namespace half). This fan-out opens its own writers rather than going
+	// through coldStartOpenTargetWriters / coldStartGatePreflight, so it
+	// reached NONE of them: measured on plain postgres:16, `sync start
+	// --all-schemas` into an RLS-enabled target with a NOBYPASSRLS role
+	// created both schemas, opened the slot and died mid-copy on a raw
+	// 0A000 with an `--exclude-table` hint, where `migrate` and the
+	// single-schema `sync start` both refused up front naming `ALTER ROLE
+	// … BYPASSRLS`. Bug 283's exact shape one entry point further out.
+	//
+	// Per database, because a catalog is per database and the writer is
+	// bound to THIS namespace's DSN/schema. Ordered as migrate orders them:
+	// stale backends BEFORE the populated-target preflight below (Bug 123
+	// — an orphan's AccessExclusive lock blocks the table reads that
+	// preflight makes), the two sharded-target refusals (topology, branch-
+	// independent), direct DDL (this pass creates tables, indexes and
+	// views), RLS on the target side, then the ownership advisory. RLS and
+	// direct-DDL are unconditional here where their siblings key on
+	// --schema-already-applied, because validateMultiDatabaseStream refuses
+	// that flag in this mode. Held by
+	// TestTargetPreflightRoster_MultiNamespaceFanOutReachesMigrateSiblings.
+	closeWriters := func() {
+		migcore.CloseIf(rw)
+		migcore.CloseIf(sw)
+	}
+	if err := preflightStaleBackends(ctx, s.Target, targetDSN, targetWriteSchemas(schema, targetSchema), s.ReapStaleBackends); err != nil {
+		closeWriters()
+		return fmt.Errorf("pipeline: stale-backend preflight for %q: %w", database, err)
+	}
+	if err := migcore.PreflightShardPlacement(ctx, schema, rw); err != nil {
+		closeWriters()
+		return err
+	}
+	if err := migcore.PreflightShardKeyUpsert(ctx, schema, rw); err != nil {
+		closeWriters()
+		return err
+	}
+	if err := migcore.PreflightDirectDDL(ctx, rw, "sync cold-start"); err != nil {
+		closeWriters()
+		return err
+	}
+	if err := migcore.PreflightRLS(ctx, schema, rw, migcore.RLSSideTarget); err != nil {
+		closeWriters()
+		return fmt.Errorf("pipeline: target RLS preflight for %q: %w", database, err)
+	}
+	preflightTargetOwnershipAdvisory(ctx, rw)
 
 	// Cold-start preflight: refuse if any target table already holds data
 	// (Bug 9). --force-cold-start / --restart-from-scratch / --reset-target-

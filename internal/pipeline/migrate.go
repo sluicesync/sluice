@@ -1071,9 +1071,14 @@ func (m *Migrator) openResumeContext(ctx context.Context, resetting bool) (resum
 	if err != nil {
 		return resumeContext{}, ir.MigrationState{}, false, migcore.WrapWithHint(migcore.PhaseConnect, err)
 	}
+	migrationID, err := m.resolveMigrationID()
+	if err != nil {
+		migcore.CloseIf(store)
+		return resumeContext{}, ir.MigrationState{}, false, err
+	}
 	rc := resumeContext{
 		store:       store,
-		migrationID: m.resolveMigrationID(),
+		migrationID: migrationID,
 		enabled:     store != nil,
 	}
 	state, exitClean, err := loadOrInitState(ctx, rc, m.Resume, resetting)
@@ -1090,11 +1095,35 @@ func (m *Migrator) openResumeContext(ctx context.Context, resetting bool) (resum
 // non-empty, else an auto-derived value. Mirrors
 // Streamer.resolveStreamID's contract; see [deriveMigrationID] for
 // the hashing rationale.
-func (m *Migrator) resolveMigrationID() string {
-	if m.MigrationID != "" {
-		return m.MigrationID
+//
+// An operator-supplied id under [SyncMigrationIDPrefix] is REFUSED. That
+// namespace holds the progress rows a `sync start` cold start records
+// under its stream id; a `migrate --resume` given one of those ids reads
+// a copy it did not perform as its own and exits 0 having copied nothing
+// — measured, from a different source engine, in audit 2026-09-15 A0915-STATE-MEDIUM-1.
+// The door is here, at the pipeline chokepoint, rather than on the kong
+// flag, so a config-file or programmatic caller meets it too. Held by
+// TestResolveMigrationID_RefusesTheSyncNamespace.
+//
+// This closes the aliasing half only. The wider class — `migrate
+// --resume` binding an id to no source identity at all, so an auto-derived
+// id from a different database on the same host resumes the same way — is
+// a pending policy decision (refute-3, fix shape 2) and is deliberately
+// NOT taken here.
+func (m *Migrator) resolveMigrationID() (string, error) {
+	if m.MigrationID == "" {
+		return deriveMigrationID(m.Source.Name(), m.SourceDSN, m.Target.Name(), m.TargetDSN, m.TargetSchema), nil
 	}
-	return deriveMigrationID(m.Source.Name(), m.SourceDSN, m.Target.Name(), m.TargetDSN, m.TargetSchema)
+	if strings.HasPrefix(m.MigrationID, SyncMigrationIDPrefix) {
+		return "", fmt.Errorf(
+			"pipeline: --migration-id %q is refused: the %q prefix is reserved for the progress rows a "+
+				"`sync start` cold start records under its stream id, and a `migrate --resume` under such an id "+
+				"would read that sync's finished copy as its own and exit 0 having copied nothing. Choose an id "+
+				"without the prefix, or omit --migration-id to derive one from the source/target pair",
+			m.MigrationID, SyncMigrationIDPrefix,
+		)
+	}
+	return m.MigrationID, nil
 }
 
 // runBulkCopy applies the shared phases that follow target-writer

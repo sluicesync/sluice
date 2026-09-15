@@ -6,8 +6,6 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"os"
-	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -154,34 +152,4 @@ func TestStatusRendersColdStartsInProgress(t *testing.T) {
 			t.Fatalf("a completed cold start rendered under the in-progress header:\n%s", buf.String())
 		}
 	})
-}
-
-// The two packages agree on a STORED string, not on a shared symbol: the
-// pipeline writes migration ids under this prefix and the CLI reads them
-// back. A change on one side alone is a data-format break that would show
-// up as "no cold starts ever appear", which is silent and looks exactly
-// like the bug this feature fixed.
-//
-// The gate reads the pipeline's source rather than importing it, because
-// syncMigrationID is unexported and the coupling being checked is the
-// literal, not the function.
-func TestSyncMigrationIDPrefixMatchesThePipeline(t *testing.T) {
-	t.Parallel()
-
-	src, err := os.ReadFile("../../internal/pipeline/resume.go")
-	if err != nil {
-		t.Fatalf("read the pipeline's resume.go: %v", err)
-	}
-	re := regexp.MustCompile(`func syncMigrationID\(streamID string\) string \{ return "([^"]+)" \+ streamID \}`)
-	m := re.FindSubmatch(src)
-	if m == nil {
-		t.Fatalf("could not find syncMigrationID's literal in the pipeline. If it was reshaped, re-point this "+
-			"gate rather than deleting it: the CLI's %q is only correct because it matches that function.",
-			syncMigrationIDPrefix)
-	}
-	if got := string(m[1]); got != syncMigrationIDPrefix {
-		t.Errorf("the pipeline writes migration ids under %q but the CLI looks for %q.\n"+
-			"  Nothing fails loudly when these diverge — `sync status` simply never shows a cold start again, "+
-			"which is indistinguishable from the blackout this feature exists to fix.", got, syncMigrationIDPrefix)
-	}
 }

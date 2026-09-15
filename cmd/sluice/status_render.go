@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline"
 )
 
 // statusRenderOpts is the rendering knobs SyncStatusCmd surfaces.
@@ -84,7 +85,7 @@ func runStatusOnce(ctx context.Context, applier ir.ChangeApplier, lister ir.Migr
 	// says so rather than implying "nothing is running".
 	var coldStarts []ir.MigrationState
 	if lister != nil {
-		coldStarts, err = lister.List(ctx, syncMigrationIDPrefix)
+		coldStarts, err = lister.List(ctx, pipeline.SyncMigrationIDPrefix)
 		if err != nil {
 			return fmt.Errorf("list cold starts in progress: %w", err)
 		}
@@ -124,15 +125,6 @@ func openMigrationStateStoreForStatus(ctx context.Context, target ir.Engine, dsn
 	return lister, nil
 }
 
-// syncMigrationIDPrefix is the namespace a sync cold start writes its
-// progress rows under. It mirrors the pipeline's syncMigrationID and is
-// duplicated rather than exported because the two packages agree on a
-// STORED string, not on a function: changing it on one side without the
-// other is a data-format change, and a shared helper would make that
-// look like a refactor. TestSyncMigrationIDPrefixMatchesThePipeline
-// holds them together.
-const syncMigrationIDPrefix = "sync-"
-
 // filterColdStarts narrows the cold-start list to one stream when
 // --stream-id is given, matching on the STREAM id rather than the
 // migration id the operator never sees.
@@ -148,7 +140,7 @@ const syncMigrationIDPrefix = "sync-"
 func filterColdStarts(states []ir.MigrationState, streamID string) []ir.MigrationState {
 	want := ""
 	if streamID != "" {
-		want = syncMigrationIDPrefix + streamID
+		want = pipeline.SyncMigrationIDPrefix + streamID
 	}
 	out := states[:0]
 	for _, st := range states {
@@ -164,9 +156,13 @@ func filterColdStarts(states []ir.MigrationState, streamID string) []ir.Migratio
 }
 
 // coldStartStreamID recovers the operator-facing stream id from a
-// progress row's migration id.
+// progress row's migration id. The prefix is the pipeline's own
+// constant — the writer's — so the reader cannot drift from it (the
+// CLI used to carry a mirror held by a regex over the pipeline source;
+// the constant was exported instead when the same prefix gained a
+// refusal on `migrate --migration-id`, audit 2026-09-15 A0915-STATE-MEDIUM-1).
 func coldStartStreamID(migrationID string) string {
-	return strings.TrimPrefix(migrationID, syncMigrationIDPrefix)
+	return strings.TrimPrefix(migrationID, pipeline.SyncMigrationIDPrefix)
 }
 
 // filterSkippedTables mirrors filterStreams for the C-11 skip ledger.

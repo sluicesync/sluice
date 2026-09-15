@@ -315,11 +315,17 @@ func setTableProgressAndWrite(
 //
 // # Scope
 //
-// A record-only context (the sync cold start, rc.noResume) is exempt: its
-// rows are a `sync status` heartbeat that [loadOrInitState] refuses to
-// resume from, so no correctness argument rests on them and killing a
-// cold start over one is pure loss. A context with no store at all is a
-// no-op, as everywhere else.
+// A record-only context (the sync cold start, rc.noResume) is exempt, and
+// the reason is NARROWER than "nothing reads these rows" — that used to be
+// the sentence here, and it stopped being true when the stopped-cold-start
+// resume ([Streamer.resumeStoppedColdStart]) started reading them back
+// through [readRecordedColdStart]. What still holds: that resume skips a
+// copy only on a TERMINAL `complete` row per table, and a swallowed
+// breadcrumb can only REMOVE evidence (no `complete`, or an understated
+// RowsCopied), which makes [everyTableCopied] decline and fall back to the
+// loud populated-target refusal. There is no path from a swallowed write
+// to a wrongly-skipped copy, so killing a cold start over one is still
+// pure loss. A context with no store at all is a no-op, as everywhere else.
 func persistTableBreadcrumb(
 	ctx context.Context,
 	rc resumeContext,

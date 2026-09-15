@@ -61,7 +61,7 @@ package pipeline
 // callers, so the four sibling COPY ENTRY POINTS went unmentioned — the
 // sibling-sweep shape CLAUDE.md exists to stop, in the half that keeps
 // getting missed. The entry-point set is
-// [indexPreflightEntryPoints] — the same six declarations items 147/148/
+// [indexPreflightEntryPoints] — the same declarations items 147/148/
 // 149 each reached for one line — and every one of them is now covered
 // or exempt WITH A REASON, held to that roster by
 // TestPreExistingFKCheckNamesEveryCopyEntryPoint:
@@ -70,6 +70,8 @@ package pipeline
 //	sync cold-start, single DB  COVERED via existingTablesGate.plan
 //	sync cold-start, multi DB   COVERED via readAndCheckPreExistingForeignKeys
 //	add-table                   EXEMPT — see below
+//	stopped cold-start resume   EXEMPT — see below (rostered by audit
+//	                            2026-09-15 A0915-ARCH-MEDIUM-2)
 //	restore                     EXEMPT — see below
 //	chain restore               EXEMPT — see below (and with it
 //	                            `sync from-backup`, whose cold-start
@@ -84,15 +86,20 @@ package pipeline
 // constraints sluice would CREATE, never one the target already has,
 // which is the same reason --skip-foreign-keys is not an exemption.
 //
-// # The three exemptions, and the single property they share
+// # The four exemptions, and the single property they share
 //
 // This check cannot tell a foreign key the target was BRANCHED with from
 // one an earlier sluice run CREATED. Both read back from the catalog
 // identically. On an entry point whose contract is "run me again and I
 // converge", that ambiguity turns the refusal into a refusal for having
 // worked — which is exactly why --resume is excluded above, and it is
-// the same argument for all three:
+// the same argument for all four:
 //
+//   - stopped cold-start resume: it continues a cold start that already
+//     copied every table and may already have run its constraints phase,
+//     so the foreign keys it would read back are that run's own, every
+//     parent in scope. It copies nothing, so there is no copy for a
+//     branched target's keys to fail.
 //   - restore: idempotent by contract (CREATE TABLE IF NOT EXISTS +
 //     upsert). The re-run of a completed restore reads back the foreign
 //     keys its own constraints phase created, every parent in scope.
@@ -106,7 +113,7 @@ package pipeline
 //     check that can only be vacuous or wrong is worth naming, not
 //     wiring.
 //
-// None of the three is exempt for being cheap or unimportant: a restore
+// None of the four is exempt for being cheap or unimportant: a restore
 // onto a branched target hits Error 1452 exactly as a cold copy does.
 // The residual is REAL and it is filed, not implied — see the roadmap
 // entry for item 140 and gap 20 in docs/dev/perf-parity-matrix.md. What

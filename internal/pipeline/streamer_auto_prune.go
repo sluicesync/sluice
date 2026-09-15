@@ -111,10 +111,12 @@ func (g *autoPruneGate) due(now time.Time) bool {
 // and is named in the staleness WARN, instead of silently unblocking it.
 func ChangeLogConsumerID(streamID, targetEngine, targetDSN string) string {
 	id := streamID + " -> " + targetEngine + "://" + diagnose.RedactDSN(targetDSN)
-	if len(id) > maxChangeLogConsumerID {
-		id = id[:maxChangeLogConsumerID]
-	}
-	return id
+	// On a rune boundary: the id is the PRIMARY KEY of a TEXT column on
+	// the source, and a byte cut through a non-ASCII stream id or DSN is
+	// invalid UTF-8 that Postgres refuses (22021) — the same defect as
+	// truncateLastError's (audit 2026-09-15 A0915-STATE-MEDIUM-3 sibling
+	// sweep). Pinned by TestChangeLogConsumerID_CutsOnARuneBoundary.
+	return cutAtRuneBoundary(id, maxChangeLogConsumerID)
 }
 
 // captureChangeLogConsumerRegistry records the source reader's item-115

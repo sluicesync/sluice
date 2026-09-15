@@ -56,9 +56,9 @@ var defaultSlotLiteralRoots = []string{
 var defaultSlotLiteralAllowed = map[string]string{
 	"../engines/postgres/cdc_reader.go":  "the ORIGIN: the engine that actually creates the slot (`defaultSlot`). Everything else is a copy of this.",
 	"../engines/postgres/slot_create.go": "prose only — two comments about quoting, explaining why the default name needs none.",
-	"add_table.go":                       "`defaultActiveSlotName` — pipeline must not import an engine package.",
-	"streamer_coldstart_stop.go":         "`defaultSlotNameForAdvice` — the STOPPED-SLOT-KEPT remedy must name a slot that exists; held to the engine by TestStoppedSlotAdviceNamesTheRealDefault.",
-	"streamer_slot_health.go":            "`defaultPGSlotName` — the health probe's resolver; its comment already points at the engine's copy.",
+	"add_table.go":                       "`defaultActiveSlotName` — pipeline must not import an engine package; bound to the engine's value by TestStoppedSlotAdviceNamesTheRealDefault.",
+	"streamer_coldstart_stop.go":         "`defaultSlotNameForAdvice` — the STOPPED-SLOT-KEPT remedy must name a slot that exists; bound to the engine's value by TestStoppedSlotAdviceNamesTheRealDefault.",
+	"streamer_slot_health.go":            "`defaultPGSlotName` — the health probe's resolver (SlotNameForSource); bound to the engine's value by TestStoppedSlotAdviceNamesTheRealDefault, because a divergence here reproduces A0909-AQ-M-1 (a probe of a slot nothing created reads as healthy).",
 	"streamer_slot_policy.go":            "prose only — a worked example of the suffix→resolved mapping.",
 	"replication_preflight.go":           "prose only — a quoted PostgreSQL error message.",
 	"../../cmd/sluice/sync_run.go":       "the CLI's operator-facing default, rendered into help and advice.",
