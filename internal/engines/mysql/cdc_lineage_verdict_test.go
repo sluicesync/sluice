@@ -131,13 +131,17 @@ func wantVerdict(t *testing.T, name string, err error, foreign bool) {
 
 // TestLineageVerdicts_ForeignIsTerminalResetIsNot pins the discrimination
 // audit 2026-09-09 A0909-MYSQL-HIGH-1 asked for, per lane, as refined by
-// audit 2026-09-15 A0915-MYSQL-HIGH-2 on the MySQL arm: a source whose
+// audit 2026-09-15 A0915-MYSQL-HIGH-2 and the operator decisions of
+// 2026-09-15 that closed its two open policy questions: a source whose
 // executed set is NON-EMPTY and shares no UUID with the position is a
-// different lineage (terminal); an EMPTY executed set, and a set that is
-// merely BEHIND (shares UUIDs, lacks transactions), keep the automatic
-// re-copy ONLY on an instance whose @@server_uuid the position names —
-// on any other instance they are the rebuilt/restored-node shape and are
-// terminal too. The MySQL cells are the full {empty, behind} × {uuid
+// different lineage (terminal); an EMPTY executed set keeps the automatic
+// re-copy ONLY on an instance whose @@server_uuid the position names; a
+// set merely BEHIND the position (shares UUIDs, lacks transactions) is
+// terminal under EITHER uuid — under a foreign one it is the rebuilt-node
+// shape, under the server's own it is a rollback or in-place restore
+// with the target AHEAD, and the two diagnoses differ. On MariaDB an
+// EMPTY binlog state is terminal: no instance identity can tell a reset
+// from a rebuild. The MySQL cells are the full {empty, behind} × {uuid
 // named, uuid foreign} matrix, because a green on one cell of a
 // family-dispatched verdict says nothing about the others.
 func TestLineageVerdicts_ForeignIsTerminalResetIsNot(t *testing.T) {
@@ -166,10 +170,25 @@ func TestLineageVerdicts_ForeignIsTerminalResetIsNot(t *testing.T) {
 			newLineageFakeDB(t, "contained=0|executed=|uuid="+uuidA), resume), false)
 		wantVerdict(t, "reset on a REBUILT instance (empty executed, uuid the position never saw)", verifyGTIDLineageContinuity(ctx,
 			newLineageFakeDB(t, "contained=0|executed=|uuid="+uuidB), resume), true)
-		wantVerdict(t, "behind on the SAME instance (shares the UUID, lacks transactions)", verifyGTIDLineageContinuity(ctx,
-			newLineageFakeDB(t, "contained=0|executed="+uuidA+":1-9|uuid="+uuidA), resume), false)
-		wantVerdict(t, "behind on a REBUILT instance (seeded through gtid_purged under the old uuid)", verifyGTIDLineageContinuity(ctx,
-			newLineageFakeDB(t, "contained=0|executed="+uuidA+":1-9|uuid="+uuidB), resume), true)
+		behindOwn := verifyGTIDLineageContinuity(ctx, newLineageFakeDB(t, "contained=0|executed="+uuidA+":1-9|uuid="+uuidA), resume)
+		wantVerdict(t, "behind on the SAME instance (shares the UUID, lacks transactions)", behindOwn, true)
+		// Its own diagnosis, not the rebuilt-node one: the instance is the
+		// right one and holds LESS than the target.
+		for _, phrase := range []string{"under this server's own @@server_uuid " + uuidA, "rolled back", "AHEAD", "nothing on the target was touched"} {
+			if behindOwn != nil && !strings.Contains(behindOwn.Error(), phrase) {
+				t.Errorf("behind-own-uuid refusal missing %q: %v", phrase, behindOwn)
+			}
+		}
+		if ce, ok := sluicecode.FromError(behindOwn); !ok || ce.Hint != rolledBackRemedy {
+			t.Errorf("behind-own-uuid refusal must carry the rolled-back remedy, got %+v", ce)
+		}
+		behindForeign := verifyGTIDLineageContinuity(ctx, newLineageFakeDB(t, "contained=0|executed="+uuidA+":1-9|uuid="+uuidB), resume)
+		wantVerdict(t, "behind on a REBUILT instance (seeded through gtid_purged under the old uuid)", behindForeign, true)
+		if behindForeign != nil && strings.Contains(behindForeign.Error(), "AHEAD") {
+			t.Errorf("the rebuilt-node BEHIND refusal carries the same-instance rollback diagnosis: %v", behindForeign)
+		}
+		wantVerdict(t, "behind on a promoted replica whose own uuid the multi-source position names", verifyGTIDLineageContinuity(ctx,
+			newLineageFakeDB(t, "contained=0|executed="+uuidA+":1-9,"+uuidB+":1-3|uuid="+uuidB), resume+","+uuidB+":1-3"), true)
 		// The uuid compare is case-insensitive like the set compare, and a
 		// promoted replica's position names its old primary too.
 		wantVerdict(t, "reset on the same instance, uuid spelled upper-case by the server", verifyGTIDLineageContinuity(ctx,
@@ -196,8 +215,23 @@ func TestLineageVerdicts_ForeignIsTerminalResetIsNot(t *testing.T) {
 		}
 		wantVerdict(t, "foreign (state non-empty, domain absent)",
 			verifyMariaDBDomainsPresent(ctx, newLineageFakeDB(t, "state=7-4-100"), "0-1-12"), true)
-		wantVerdict(t, "reset (state empty)",
-			verifyMariaDBDomainsPresent(ctx, newLineageFakeDB(t, "state="), "0-1-12"), false)
+		empty := verifyMariaDBDomainsPresent(ctx, newLineageFakeDB(t, "state="), "0-1-12")
+		wantVerdict(t, "state empty (a same-server reset or a rebuilt node; MariaDB cannot say which)", empty, true)
+		// Both possibilities named, because sluice cannot tell the operator
+		// which one it is looking at.
+		for _, phrase := range []string{"RESET MASTER on this same server", "REBUILT", "point the sync at the instance that holds the position"} {
+			if empty != nil && !strings.Contains(empty.Error(), phrase) {
+				t.Errorf("empty-state refusal missing %q: %v", phrase, empty)
+			}
+		}
+		if ce, ok := sluicecode.FromError(empty); !ok || ce.Hint != mariadbEmptyStateRemedy {
+			t.Errorf("empty-state refusal must carry the two-possibility remedy, got %+v", ce)
+		}
+		// The brand-new-source position (an empty resume set) still binds
+		// nothing, even on an empty state.
+		if err := verifyMariaDBDomainsPresent(ctx, newLineageFakeDB(t, "state="), ""); err != nil {
+			t.Fatalf("empty resume set on an empty state: %v; want nil", err)
+		}
 	})
 
 	t.Run("file/pos instance identity", func(t *testing.T) {
@@ -259,6 +293,13 @@ func TestVerifyLineage_AnswersOnlyTheForeignQuestion(t *testing.T) {
 	rebuilt := &CDCReader{db: newLineageFakeDB(t, "contained=0|executed=|uuid=bbbbbbbb-0000-0000-0000-000000000002"), flavor: FlavorVanilla}
 	if err := rebuilt.VerifyLineage(ctx, gtidPos(resume)); !errors.Is(err, ir.ErrPositionForeignLineage) {
 		t.Fatalf("rebuilt source (empty set, foreign uuid): VerifyLineage = %v; want ErrPositionForeignLineage", err)
+	}
+	// And the BEHIND-own-uuid arm: the reactive door must refuse it too, or
+	// a position that goes invalid mid-stream on a rolled-back source would
+	// still drop the target it is behind (operator decision 2026-09-15).
+	rolledBack := &CDCReader{db: newLineageFakeDB(t, "contained=0|executed=aaaaaaaa-0000-0000-0000-000000000001:1-9|uuid=aaaaaaaa-0000-0000-0000-000000000001"), flavor: FlavorVanilla}
+	if err := rolledBack.VerifyLineage(ctx, gtidPos(resume)); !errors.Is(err, ir.ErrPositionForeignLineage) {
+		t.Fatalf("rolled-back source (behind, own uuid): VerifyLineage = %v; want ErrPositionForeignLineage", err)
 	}
 	if err := foreign.VerifyLineage(ctx, ir.Position{}); err != nil {
 		t.Fatalf("undecodable position: VerifyLineage = %v; want nil", err)

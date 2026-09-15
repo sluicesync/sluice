@@ -5,7 +5,9 @@
 
 // Audit 2026-09-09 A0909-MYSQL-HIGH-1, end to end on one real MySQL: a
 // sync whose source becomes a DIFFERENT lineage at the same DSN must
-// REFUSE, and the target must keep every row it had — while the same
+// REFUSE, and the target must keep every row it had — so must the same
+// source rolled back BEHIND a position it issued itself (operator
+// decision 2026-09-15: the target is ahead of it) — while the same
 // source after a plain RESET MASTER (empty executed set) must still take
 // the automatic re-snapshot, because there the re-copy is the right
 // recovery.
@@ -25,7 +27,9 @@ package pipeline
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -198,6 +202,61 @@ func TestStreamer_MySQLForeignLineage_RefusesTheAutomaticRecopy(t *testing.T) {
 		}
 	})
 
+	t.Run("same server rolled back BEHIND its own position: refuses, target untouched", func(t *testing.T) {
+		// Operator decision 2026-09-15, closing the policy question audit
+		// 2026-09-15 A0915-MYSQL-HIGH-2 left open. The server keeps its uuid
+		// and presents an executed set BEHIND the persisted position under
+		// that uuid — what a primary rolled back past the position, or an
+		// in-place restore that seeds gtid_purged from an older backup,
+		// looks like. The target is AHEAD of such a source; until the
+		// decision the automatic re-copy ran and reduced it to the source's
+		// one row. Produced here exactly that way: RESET MASTER, then
+		// gtid_purged seeded one transaction short of the persisted set.
+		applier, err := mysqlEng.OpenChangeApplier(context.Background(), tgtDSN)
+		if err != nil {
+			t.Fatalf("OpenChangeApplier: %v", err)
+		}
+		defer migcore.CloseIf(applier)
+		persisted, found, err := applier.ReadPosition(context.Background(), "test-foreign-lineage")
+		if err != nil || !found {
+			t.Fatalf("ReadPosition: found=%v err=%v", found, err)
+		}
+		var tok struct {
+			Mode    string `json:"mode"`
+			GTIDSet string `json:"gtid_set"`
+		}
+		if err := json.Unmarshal([]byte(persisted.Token), &tok); err != nil || tok.Mode != "gtid" {
+			t.Fatalf("premise gone: the persisted position is not a GTID position (token %q, err %v)", persisted.Token, err)
+		}
+		behind := behindOwnGTIDSet(t, tok.GTIDSet, mysqlGlobal(t, srcDSN, "server_uuid"))
+		applyDDLMySQL(t, srcDSN, "RESET MASTER; SET GLOBAL gtid_purged = '"+behind+"';")
+		if got := strings.TrimSpace(mysqlGlobal(t, srcDSN, "gtid_executed")); !strings.EqualFold(got, behind) {
+			t.Fatalf("premise gone: gtid_executed = %q; want exactly the behind set %q", got, behind)
+		}
+
+		rctx, rcancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer rcancel()
+		err = newStream().Run(rctx)
+		if err == nil {
+			t.Fatal("sync start against a source rolled back behind its own position returned nil")
+		}
+		if !errors.Is(err, ir.ErrPositionForeignLineage) || !strings.Contains(err.Error(), foreignLineageMarker) {
+			t.Fatalf("want the %s refusal carrying ir.ErrPositionForeignLineage, got: %v", foreignLineageMarker, err)
+		}
+		if errors.Is(err, ir.ErrPositionInvalid) {
+			t.Fatalf("the refusal also reads as an invalid position, which is the auto-recopy route: %v", err)
+		}
+		if !strings.Contains(err.Error(), "AHEAD") {
+			t.Fatalf("the refusal does not carry the rolled-back diagnosis (target AHEAD of the source): %v", err)
+		}
+		// The independent expected value: the target still holds the four
+		// rows; the re-copy would have left the source's single row.
+		if got := pollRowCountMySQL(tgtDSN, "users"); got != 4 {
+			t.Fatalf("target holds %d rows after the refusal; want the original 4 — the automatic re-copy would "+
+				"reduce a target AHEAD of its rolled-back source to the source's single row", got)
+		}
+	})
+
 	t.Run("same server after RESET MASTER: the automatic re-snapshot still runs", func(t *testing.T) {
 		// Empty executed set: no other lineage here, the re-copy is right.
 		applyDDLMySQL(t, srcDSN, "RESET MASTER;")
@@ -226,6 +285,23 @@ func TestStreamer_MySQLForeignLineage_RefusesTheAutomaticRecopy(t *testing.T) {
 			t.Fatal("streamer did not stop after cancel")
 		}
 	})
+}
+
+// behindOwnGTIDSet returns set one transaction short — the set this
+// server held one transaction earlier. The premise, asserted rather than
+// guessed at: a single-interval set under exactly this server's uuid.
+func behindOwnGTIDSet(t *testing.T, set, serverUUID string) string {
+	t.Helper()
+	uuid, interval, ok := strings.Cut(strings.TrimSpace(set), ":")
+	if !ok || !strings.EqualFold(uuid, serverUUID) || strings.ContainsAny(interval, ",:") {
+		t.Fatalf("premise gone: persisted GTID set %q is not a single interval under this server's uuid %s", set, serverUUID)
+	}
+	lo, hi, ok := strings.Cut(interval, "-")
+	n, err := strconv.Atoi(hi)
+	if !ok || err != nil || n < 2 {
+		t.Fatalf("premise gone: persisted GTID set %q has no interval a transaction can be taken off", set)
+	}
+	return uuid + ":" + lo + "-" + strconv.Itoa(n-1)
 }
 
 func mysqlGlobal(t *testing.T, dsn, name string) string {

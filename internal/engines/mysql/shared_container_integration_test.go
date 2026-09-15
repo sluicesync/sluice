@@ -206,7 +206,10 @@ const sharedMySQLDefaultImage = "ghcr.io/sluicesync/sluice-mysql:8.0-prebaked"
 // boot deliberately unusual server configurations (binary logging off
 // with GTID on, to reach the file/pos cursor arm); and every mariadb:*
 // helper, which is a different flavor, not a different version of this
-// one.
+// one. The GTID lineage cells (gtid_lineage_integration_test.go) DO read
+// the variable, with stock "mysql:8.0" as their default in place of the
+// pre-baked one, because they boot their own gtid_mode=ON command line
+// and their verdicts are exactly what a version sweep should re-measure.
 const sharedMySQLImageEnv = "SLUICE_TEST_MYSQL_IMAGE"
 
 // sharedMySQLImage is the image reference the shared TestMain boot AND

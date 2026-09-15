@@ -48,9 +48,13 @@ var ErrPositionInvalid = errors.New("ir: persisted position is no longer valid; 
 // Audit 2026-09-09 (A0909-MYSQL-HIGH-1) measured the GTID arm doing
 // exactly that: four correct target rows replaced by the wrong
 // database's one row, at exit 0. Engines wrap this via %w at every site
-// whose diagnosis is "different lineage / different instance"; a site
-// that cannot tell a reset from a replacement (an empty executed set is
-// a same-server RESET MASTER) keeps ErrPositionInvalid, and says so.
+// whose diagnosis is "different lineage / different instance", and at
+// the sites whose automatic re-copy would reduce a target that is AHEAD
+// of its source (MySQL: an executed set BEHIND the position under the
+// server's own uuid; MariaDB: an empty binlog state, which cannot be
+// told from a rebuilt node). A site whose shape is a same-server reset
+// (MySQL: an empty executed set under the server's own uuid) keeps
+// ErrPositionInvalid, and says so.
 //
 // The pipeline refuses on it — loudly, with the deliberate re-copy
 // flags named — on BOTH the pre-flight warm-resume path and the reactive

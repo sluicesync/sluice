@@ -38,8 +38,9 @@ import (
 // offset) — the GTID state at that byte of THIS server's binlog. On
 // resume the source is asked the same question: the same lineage answers
 // the same set; a rebuilt or foreign instance answers NULL (no such file
-// or offset) or a different set, and the resume refuses with
-// ir.ErrPositionInvalid. Measured: on the capturing instance
+// or offset) or a different set, and the resume refuses as a different
+// lineage (ir.ErrPositionForeignLineage since v0.148.2; this sentence
+// said ir.ErrPositionInvalid until 2026-09-15). Measured: on the capturing instance
 // BINLOG_GTID_POS('mysqld-bin.000002', 821) returned exactly "0-1-3"; on a
 // rebuilt instance with the same server_id and the same "0-1-3" state it
 // returned NULL; on a nonexistent file it returned NULL.
@@ -371,12 +372,30 @@ func (r *CDCReader) reanchorMariaDBLineage(ctx context.Context, newFile string) 
 	r.lineageFile, r.lineagePos, r.lineageSet = newFile, 4, set
 }
 
+// mariadbEmptyStateRemedy is the remedy for the empty-state refusal in
+// [verifyMariaDBDomainsPresent]: two remedies, because the refusal
+// cannot tell the operator which of the two situations it is looking at.
+const mariadbEmptyStateRemedy = "if this server ran RESET MASTER with its data intact, re-copy from it deliberately " +
+	"with --restart-from-scratch (warm sync) or a fresh `backup full` (chain); if it was rebuilt, restored or " +
+	"replaced, point the sync at the instance that still holds the position — nothing on the target was touched"
+
 // verifyMariaDBDomainsPresent refuses a GTID-mode resume whose set names
 // a replication domain the source has never written to. MariaDB's own
 // replication ACCEPTS such a position (a replica at "5-1-1" against a
 // master that has never seen domain 5 starts with Slave_IO_Running: Yes,
 // even under gtid_strict_mode) and then streams the master's whole
 // history — measured on 11.4 — so the server cannot be relied on here.
+// Both refusals are terminal (ir.ErrPositionForeignLineage): a non-empty
+// state missing the domain is a different lineage; an EMPTY state is a
+// same-server reset or a rebuilt node, which MariaDB cannot tell apart.
+//
+// Reach of the empty-state refusal, stated: GTID-mode positions only —
+// every MariaDB capture door since v0.139.0. A file/pos MariaDB position
+// (persisted by a v0.138.0-or-earlier sync cold start) never reaches
+// this function; with an anchor, a reset server fails the anchor door
+// instead (its file is gone or re-created, and no retained file above
+// it can prove a purge), and an anchorless one resumes under the
+// UNVERIFIED-INSTANCE-IDENTITY WARN — a population that cannot grow.
 func verifyMariaDBDomainsPresent(ctx context.Context, db *sql.DB, resumeSet string) error {
 	if strings.TrimSpace(resumeSet) == "" {
 		// The empty set is the legitimate "from the beginning of history"
@@ -399,21 +418,27 @@ func verifyMariaDBDomainsPresent(ctx context.Context, db *sql.DB, resumeSet stri
 		return nil
 	}
 	if strings.TrimSpace(state) == "" {
-		// An EMPTY binlog state is a same-server RESET MASTER, a fresh
-		// instance with no history — or a REBUILT instance at the same
-		// address (a restore, then RESET MASTER) with its stale rows
-		// intact, and the automatic re-snapshot then reduces the target
-		// to those rows (audit 2026-09-15 A0915-MYSQL-HIGH-2, measured on
-		// mariadb:11.4). MySQL closes that shape with @@server_uuid;
-		// MariaDB has no instance identity, so the shapes are
-		// indistinguishable from the server's answers and refusing every
-		// empty state would also refuse every legitimate reset. KNOWN
-		// GAP, deliberately unchanged: the "KNOWN GAP" cells of
-		// TestGTIDResumeMariaDBBindsLineage measure it every run, and
-		// the policy call is filed in the audit backlog.
-		return fmt.Errorf("mariadb: the source's @@gtid_binlog_state is EMPTY, so the resume GTID set %q names "+
-			"domain(s) %v this source no longer records (RESET MASTER, or a fresh instance); cannot resume: %w",
-			resumeSet, missing, ir.ErrPositionInvalid)
+		// An EMPTY binlog state is a same-server RESET MASTER with its
+		// data intact — or a REBUILT instance at the same address (a
+		// restore, then RESET MASTER) holding stale rows, where the
+		// automatic re-snapshot reduces the target to those rows (audit
+		// 2026-09-15 A0915-MYSQL-HIGH-2, measured on mariadb:11.4). MySQL
+		// tells the two apart with @@server_uuid; MariaDB has no instance
+		// identity, so from the server's answers they are the same shape.
+		// TERMINAL by operator decision (2026-09-15): the reset costs one
+		// --restart-from-scratch, the rebuild would have cost the target.
+		// The message names both, because sluice cannot say which.
+		return sluicecode.Wrap(sluicecode.CodeCDCLineageMismatch, mariadbEmptyStateRemedy,
+			fmt.Errorf("mariadb: the source's @@gtid_binlog_state is EMPTY, so it records none of the replication "+
+				"domain(s) %v the resume GTID set %q names, and MariaDB carries no instance identity to say which of "+
+				"two things happened: a RESET MASTER on this same server with its data intact, or a REBUILT or "+
+				"restored node at this address (a restore followed by RESET MASTER) holding stale rows. REFUSING "+
+				"rather than re-copying: nothing on the target was touched, and the automatic recovery would drop "+
+				"the target's tables and re-copy from this source — right after a same-server reset, and on a "+
+				"rebuilt node it reduces the target to the rebuild's stale rows. If this server was reset in place "+
+				"with its data intact, re-run with --restart-from-scratch; if it was rebuilt or replaced, point the "+
+				"sync at the instance that holds the position: %w",
+				missing, resumeSet, ir.ErrPositionForeignLineage))
 	}
 	// Terminal, deliberately NOT ir.ErrPositionInvalid (audit 2026-09-09
 	// HIGH-1): a non-empty state that has never seen the position's

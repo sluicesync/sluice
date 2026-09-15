@@ -14,20 +14,21 @@
 // passing the preflight.
 //
 // Two dedicated containers (log_slave_updates is read-only at
-// runtime): the default-OFF one walks no-connection → named-connection
-// (refuse) → reset (release); the --log-slave-updates=ON one proves a
-// named connection with log updates ON stays a legitimate chained
-// source. Like TestCDCReader_ReplicaSourcePreflight, this pin holds
-// the DOOR on a configured connection (threads never started — a
-// channel's presence is the operator's stated intent); the blind-
-// replica server mechanism itself is the capture-completeness matrix's
-// recorded ground truth.
+// runtime): the default-OFF one walks no-connection → named connection
+// RUNNING (refuse) → named connection STOPPED (accept, with the INFO;
+// operator decision 2026-09-15, audit 2026-09-15 A0915-CLI-MEDIUM-1) →
+// reset (release); the --log-slave-updates=ON one proves a named
+// connection with log updates ON stays a legitimate chained source. The
+// thread state each cell claims is read back from SHOW ALL REPLICAS
+// STATUS before the door is graded. The blind-replica server mechanism
+// itself is the capture-completeness matrix's recorded ground truth.
 
 package mysql
 
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"testing"
 	"time"
 
@@ -61,8 +62,8 @@ func countStatusRows(t *testing.T, dsn, stmt string) int {
 }
 
 // TestMariaDB_CDCReader_ReplicaSourcePreflight_NamedConnection is the
-// A1 refusal pin on a real mariadb:11.4 with the default
-// log_slave_updates=0.
+// A1 pin on a real MariaDB with the default log_slave_updates=0, both
+// thread-state arms of the stopped-channel acceptance.
 func TestMariaDB_CDCReader_ReplicaSourcePreflight_NamedConnection(t *testing.T) {
 	dsn, cleanup := newMariaDBDedicatedForCDC(t, mariadb114Image)
 	defer cleanup()
@@ -84,18 +85,10 @@ func TestMariaDB_CDCReader_ReplicaSourcePreflight_NamedConnection(t *testing.T) 
 		_, err = rdr.(*CDCReader).StreamChanges(ctx, ir.Position{})
 		return err
 	}
-
-	t.Run("no_connection_passes", func(t *testing.T) {
-		if err := openStream(t); err != nil {
-			t.Fatalf("StreamChanges on a non-replica MariaDB = %v; want nil", err)
-		}
-	})
-
-	t.Run("named_connection_refuses", func(t *testing.T) {
+	configure := func(t *testing.T) {
+		t.Helper()
 		applyMySQL(t, dsn, `CHANGE MASTER 'conn1' TO MASTER_HOST='192.0.2.10', MASTER_PORT=3306,
 			MASTER_USER='repl', MASTER_PASSWORD='replpw'`)
-		defer applyMySQL(t, dsn, "RESET REPLICA 'conn1' ALL")
-
 		// Anti-vacuity floor: this scenario must BE the bare-blind shape —
 		// the bare spelling empty, the ALL spelling listing the named
 		// connection. If MariaDB ever starts listing named connections in
@@ -106,8 +99,29 @@ func TestMariaDB_CDCReader_ReplicaSourcePreflight_NamedConnection(t *testing.T) 
 		if n := countStatusRows(t, dsn, "SHOW ALL REPLICAS STATUS"); n != 1 {
 			t.Fatalf("SHOW ALL REPLICAS STATUS = %d rows; want 1 (the named connection)", n)
 		}
+	}
 
-		wantCodedRefusal(t, openStream(t), sluicecode.CodeCDCReplicaNoLogUpdates, "StreamChanges")
+	t.Run("no_connection_passes", func(t *testing.T) {
+		if err := openStream(t); err != nil {
+			t.Fatalf("StreamChanges on a non-replica MariaDB = %v; want nil", err)
+		}
+	})
+
+	t.Run("named_connection_running_refuses", func(t *testing.T) {
+		configure(t)
+		applyMySQL(t, dsn, "START REPLICA 'conn1'")
+		defer applyMySQL(t, dsn, "RESET REPLICA 'conn1' ALL")
+		defer applyMySQL(t, dsn, "STOP REPLICA 'conn1'")
+		if io, sqlThread := replicaThreadState(t, dsn, "SHOW ALL REPLICAS STATUS", "conn1"); sqlThread != "Yes" || io == "No" {
+			t.Fatalf("Slave_IO_Running=%q Slave_SQL_Running=%q after START REPLICA 'conn1'; want a running SQL "+
+				"thread and a not-stopped IO thread", io, sqlThread)
+		}
+
+		err := openStream(t)
+		wantCodedRefusal(t, err, sluicecode.CodeCDCReplicaNoLogUpdates, "StreamChanges")
+		if !strings.Contains(err.Error(), "conn1 [") {
+			t.Errorf("the refusal does not name the running named connection: %v", err)
+		}
 
 		if snap, err := eng.OpenSnapshotStream(ctx, dsn); err == nil {
 			_ = snap.Close()
@@ -115,6 +129,32 @@ func TestMariaDB_CDCReader_ReplicaSourcePreflight_NamedConnection(t *testing.T) 
 		} else {
 			wantCodedRefusal(t, err, sluicecode.CodeCDCReplicaNoLogUpdates, "OpenSnapshotStream")
 		}
+	})
+
+	t.Run("named_connection_stopped_is_accepted", func(t *testing.T) {
+		configure(t)
+		applyMySQL(t, dsn, "START REPLICA 'conn1'")
+		applyMySQL(t, dsn, "STOP REPLICA 'conn1'")
+		defer applyMySQL(t, dsn, "RESET REPLICA 'conn1' ALL")
+		if io, sqlThread := replicaThreadState(t, dsn, "SHOW ALL REPLICAS STATUS", "conn1"); io != "No" || sqlThread != "No" {
+			t.Fatalf("Slave_IO_Running=%q Slave_SQL_Running=%q after STOP REPLICA 'conn1'; want No/No", io, sqlThread)
+		}
+
+		var err error
+		logged := captureInfoLog(func() { err = openStream(t) })
+		if err != nil {
+			t.Fatalf("StreamChanges with a stopped named connection = %v; want the reader to open", err)
+		}
+		for _, want := range []string{replicaChannelsStoppedMarker, "conn1 [IO=No SQL=No]", "RESET REPLICA 'connection_name' ALL"} {
+			if !strings.Contains(logged, want) {
+				t.Errorf("the acceptance INFO is missing %q:\n%s", want, logged)
+			}
+		}
+		snap, err := eng.OpenSnapshotStream(ctx, dsn)
+		if err != nil {
+			t.Fatalf("OpenSnapshotStream with a stopped named connection = %v; want it to open", err)
+		}
+		_ = snap.Close()
 	})
 
 	t.Run("after_reset_passes", func(t *testing.T) {

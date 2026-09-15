@@ -2806,16 +2806,21 @@ func verifyGTIDSetReachable(ctx context.Context, db *sql.DB, resumeSet string) e
 // re-snapshot — drop the target's in-scope tables, re-copy from whatever
 // answers the DSN — may run:
 //
+//   - the executed set is EMPTY (a RESET MASTER) on a server whose own
+//     @@server_uuid the position names: ir.ErrPositionInvalid → the
+//     ADR-0022/ADR-0093 cold-start fall-through. The uuid is the witness
+//     that the instance answering the DSN is the one (or one of the
+//     ones) the position was captured from, so the re-copy reads the
+//     same lineage.
 //   - the source is BEHIND the position (every resume UUID present,
-//     sequence numbers short), or its executed set is EMPTY (a RESET
-//     MASTER): ir.ErrPositionInvalid → the ADR-0022/ADR-0093 cold-start
-//     fall-through — but ONLY when the server's own @@server_uuid is
-//     one the position names. That is the witness that the instance
-//     answering the DSN is the one (or one of the ones) the position was
-//     captured from, so the re-copy reads the same lineage.
-//   - the same two shapes on a server whose @@server_uuid the position
-//     has never seen, and a non-empty executed set sharing no UUID at
-//     all: ir.ErrPositionForeignLineage, terminal.
+//     sequence numbers short) on a server whose own @@server_uuid the
+//     position names: ir.ErrPositionForeignLineage, terminal, with its
+//     own diagnosis ([gtidLineageBehindItsOwnPosition]) — this instance
+//     has not executed transactions it issued, so it was rolled back or
+//     restored in place and the target is AHEAD of it.
+//   - the EMPTY and BEHIND shapes on a server whose @@server_uuid the
+//     position has never seen, and a non-empty executed set sharing no
+//     UUID at all: ir.ErrPositionForeignLineage, terminal.
 //
 // The empty and BEHIND arms used to say "an EMPTY executed set is a
 // same-server RESET MASTER ... there is no other lineage here to re-copy
@@ -2832,32 +2837,44 @@ func verifyGTIDSetReachable(ctx context.Context, db *sql.DB, resumeSet string) e
 // @@server_uuid into the position it wrote after destroying the target.
 //
 // What the uuid witness cannot tell apart, stated: a physical restore
-// that carries auto.cnf (same uuid) onto another host reads as a
-// same-server reset and still takes the re-copy; a replica promoted and
-// then RESET (its own uuid, never in the position) is refused and costs
-// one --restart-from-scratch — the safe direction. A genuinely lagging
-// replica behind a failover endpoint is refused on the BEHIND arm rather
-// than re-copied from; the refusal says to wait for it to catch up,
-// after which the position is contained and the resume proceeds with
-// the target intact — strictly better than the re-copy it replaces.
+// that carries auto.cnf (same uuid) onto another host reads as the same
+// server; a replica promoted and then RESET (its own uuid, never in the
+// position) is refused and costs one --restart-from-scratch — the safe
+// direction. A genuinely lagging replica behind a failover endpoint is
+// refused on the BEHIND arm rather than re-copied from; the refusal
+// says to wait for it to catch up, after which the position is
+// contained and the resume proceeds with the target intact — strictly
+// better than the re-copy it replaces.
 //
-// The IN-PLACE restore is the residual the witness cannot see, and it
-// is the common restore shape: `RESET MASTER` then `mysql < dump.sql`
-// on the SAME box, auto.cnf untouched. The instance keeps its uuid, so
-// the position names it; the executed set is EMPTY (a plain load) or
-// BEHIND under that same uuid (`--set-gtid-purged=ON` seeding the
-// pre-backup range) — both are the witness-passes shape, and the
-// automatic re-copy still runs, reducing the target to the restored
-// rows and losing every row CDC had written since the backup, at exit
-// 0. (A load that ran MORE transactions than the position names is
-// worse still: the set is CONTAINED, nothing here fires, and the
-// resume streams the load's own transactions as if they were new
-// writes.) That is a stated residual, not a closed case, and the open policy
-// question is whether BEHIND-with-own-uuid should be terminal too: it
-// would close this shape at the cost of refusing the primary-rolled-
-// back and hole-in-the-set diagnoses that the BEHIND arm exists to
-// name, and of turning a routine same-server RESET MASTER into a
-// --restart-from-scratch. Not decided here.
+// BEHIND under the server's OWN uuid is terminal by operator decision
+// (2026-09-15, closing the policy question audit 2026-09-15
+// A0915-MYSQL-HIGH-2 left open). That shape arises only when this
+// instance no longer holds transactions it issued: a primary rolled
+// back past the position, a hole in its set, a replica promoted without
+// the old primary's last transactions, or the common IN-PLACE restore —
+// `RESET MASTER`, then a dump loaded on the SAME box with
+// `--set-gtid-purged=ON` seeding the pre-backup range, auto.cnf
+// untouched. In every one of those the TARGET is ahead of the source,
+// and the automatic re-copy would reduce the only copy still holding
+// those rows to the source's, at exit 0. Measured before the decision
+// (real mysql:8.0, TestGTIDResumeBindsLineageAcrossInstances' same-
+// instance BEHIND cell): it routed to the re-copy. The cost, accepted: a
+// same-instance rollback the operator WANTS to re-copy from now takes
+// one --restart-from-scratch.
+//
+// The EMPTY-with-own-uuid arm keeps the automatic re-copy, and the
+// residual that leaves is stated rather than closed: a plain `RESET
+// MASTER` on a server whose data is intact is indistinguishable, from
+// the server's answers, from an in-place restore that loaded a dump
+// WITHOUT seeding gtid_purged (`mysql < dump.sql` after `RESET MASTER`,
+// auto.cnf untouched). The first is the routine reset the v0.148.2
+// decision made automatic; the second reduces an ahead target to the
+// dump's rows at exit 0. Refusing both would turn every same-server
+// RESET MASTER into a --restart-from-scratch, and the operator decision
+// was not to. (A load that ran MORE transactions than the position
+// names is worse still: the set is CONTAINED, nothing here fires, and
+// the resume streams the load's own transactions as if they were new
+// writes.)
 //
 // The executed-set probe and the @@server_uuid witness are ONE
 // statement, deliberately: on *sql.DB two QueryRowContext calls can
@@ -2875,8 +2892,10 @@ func verifyGTIDSetReachable(ctx context.Context, db *sql.DB, resumeSet string) e
 // and it fails loudly rather than silently.
 //
 // Pinned per cell by TestLineageVerdicts_ForeignIsTerminalResetIsNot
-// (fake server) and TestGTIDResumeBindsLineageAcrossInstances (real
-// servers, both uuid regimes on both arms).
+// (fake server), TestGTIDResumeBindsLineageAcrossInstances (real
+// servers, both uuid regimes on both arms) and, for the BEHIND-own-uuid
+// arm end to end, TestStreamer_MySQLForeignLineage_RefusesTheAutomaticRecopy
+// (the target keeps its rows).
 func verifyGTIDLineageContinuity(ctx context.Context, db *sql.DB, resumeSet string) error {
 	var contained int
 	var executed, serverUUID string
@@ -2896,30 +2915,25 @@ func verifyGTIDLineageContinuity(ctx context.Context, db *sql.DB, resumeSet stri
 	behind := gtidSetUUIDsSubset(resumeSet, executed)
 	empty := strings.TrimSpace(executed) == ""
 	if behind || empty {
-		// The witness, consulted only on the two arms whose verdict
-		// turns on it.
+		// The witness, consulted only on the two arms that need it: it
+		// decides the ROUTE on the empty arm and the DIAGNOSIS on the
+		// behind arm (terminal under either uuid).
 		if !gtidSetNamesUUID(resumeSet, serverUUID) {
 			return gtidLineageForeignByIdentity(resumeSet, executed, serverUUID, behind)
 		}
 	}
-	// Lag and lineage are different diagnoses with the same (safe)
-	// route. If every source UUID the position names is present in the
-	// source's executed set and only sequence numbers are ahead, the
-	// source is BEHIND the position — the instance itself (its uuid is
-	// in the set) rolled back past the position, or has a hole in its
-	// set — and the operator should hear that.
+	// BEHIND on the instance whose uuid the position names: terminal,
+	// with its own diagnosis (see the doc comment for the decision).
 	if behind {
-		return fmt.Errorf("mysql: the source is BEHIND the resume position: every source UUID in the resume set is "+
-			"present in the source's @@global.gtid_executed, but the resume set names transactions the source has "+
-			"not executed (resume %q; source executed %q) — a primary rolled back past the position, or a hole in "+
-			"the source's set; cannot resume here: %w",
-			abbreviateGTIDSet(resumeSet), abbreviateGTIDSet(executed), ir.ErrPositionInvalid)
+		return gtidLineageBehindItsOwnPosition(resumeSet, executed, serverUUID)
 	}
 	if empty {
 		// An EMPTY executed set on the instance whose uuid the position
-		// names is a same-server RESET MASTER: the lineage is this
-		// server's own, so the automatic re-snapshot is the right
-		// recovery and this stays ir.ErrPositionInvalid.
+		// names reads as a same-server RESET MASTER: the lineage is this
+		// server's own, so the automatic re-snapshot stays, and this stays
+		// ir.ErrPositionInvalid. It is also what an in-place restore that
+		// seeded no gtid_purged looks like — the residual the doc comment
+		// states.
 		return fmt.Errorf("mysql: the source's @@global.gtid_executed is EMPTY, so the resume GTID set %q "+
 			"names transactions this source no longer records (RESET MASTER on this same instance); "+
 			"cannot resume: %w", abbreviateGTIDSet(resumeSet), ir.ErrPositionInvalid)
@@ -3166,7 +3180,8 @@ func gtidSetUUIDsSubset(resume, executed string) bool {
 
 // gtidSetNamesUUID reports whether the GTID set names uuid as one of its
 // sources — the witness [verifyGTIDLineageContinuity] uses on its BEHIND
-// and EMPTY arms: a position captured on this instance carries its
+// and EMPTY arms (the route on EMPTY, the diagnosis on BEHIND): a
+// position captured on this instance carries its
 // @@server_uuid (or, after a promotion, the uuid of a primary it
 // replicated from), and a position that has never seen the uuid was
 // captured on a different lineage. Compared case-insensitively the way
@@ -3202,6 +3217,40 @@ func gtidLineageForeignByIdentity(resumeSet, executed, serverUUID string, behind
 			"behind a failover endpoint, wait for it to catch up and retry (the resume proceeds once the position is "+
 			"contained). If the replacement IS intended, re-copy deliberately with --restart-from-scratch: %w",
 			shape, serverUUID, abbreviateGTIDSet(resumeSet), abbreviateGTIDSet(executed), ir.ErrPositionForeignLineage))
+}
+
+// rolledBackRemedy is the remedy for [gtidLineageBehindItsOwnPosition]:
+// the source is not a stranger, it is the right instance holding LESS
+// than the target, so "confirm the DSN" is the wrong first question and
+// the choice to make is which side is the truth.
+const rolledBackRemedy = "nothing on the target was touched, and the target is AHEAD of this source: point the sync " +
+	"at the instance that still holds the position, or — if this rolled-back source is now the truth — re-copy " +
+	"from it deliberately with --restart-from-scratch (warm sync) or a fresh `backup full` (chain)"
+
+// gtidLineageBehindItsOwnPosition is the terminal verdict for the BEHIND
+// arm of [verifyGTIDLineageContinuity] on the instance whose own
+// @@server_uuid the resume position names. The position was issued by
+// this lineage and the server no longer holds all of it, so it was
+// rolled back or restored in place and the target is AHEAD of it — the
+// automatic re-copy would reduce the only copy still holding those
+// rows. Deliberately ir.ErrPositionForeignLineage, never
+// ir.ErrPositionInvalid: the pipeline refuses on that sentinel on both
+// the warm-resume and the reactive path, which is the property this arm
+// needs, even though the instance is not a stranger (operator decision
+// 2026-09-15; see the caller's doc comment).
+func gtidLineageBehindItsOwnPosition(resumeSet, executed, serverUUID string) error {
+	return sluicecode.Wrap(sluicecode.CodeCDCLineageMismatch, rolledBackRemedy,
+		fmt.Errorf("mysql: the source's @@global.gtid_executed is BEHIND the resume position under this server's "+
+			"own @@server_uuid %s (resume %q; source executed %q): every source uuid the position names is present, "+
+			"and this same instance no longer holds transactions the position consumed — it was rolled back or "+
+			"restored in place (a primary rolled back past the position, a snapshot or backup restore on this box, "+
+			"`RESET MASTER` then a reload with --set-gtid-purged=ON, a replica promoted without the old primary's last "+
+			"transactions, or a hole in its set), so the target is AHEAD of it. REFUSING rather than re-copying: "+
+			"nothing on the target was touched, and the automatic recovery for an unusable position drops the "+
+			"target's tables and re-copies from this source, reducing the only copy that still holds those rows. "+
+			"Decide which side is the truth: point the sync at the instance that holds the position, or re-copy "+
+			"from this one deliberately with --restart-from-scratch: %w",
+			serverUUID, abbreviateGTIDSet(resumeSet), abbreviateGTIDSet(executed), ir.ErrPositionForeignLineage))
 }
 
 // abbreviateGTIDSet keeps an error message readable when a gtid_executed

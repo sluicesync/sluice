@@ -58,6 +58,10 @@ import (
 //     so the re-copy the pipeline runs next re-probes at its first door
 //     rather than waiting out the TTL
 //     (TestVerifyPositionResumable_ForeignVerdictForgetsTheFlavorMemo).
+//     The sentinel is also carried by two verdicts that are not a
+//     substitution (operator decisions 2026-09-15): MySQL BEHIND under
+//     the server's own uuid, and MariaDB's empty binlog state. There
+//     the forget costs one re-probe and nothing else.
 //     The VStream flavors skip the probe entirely and memoise nothing,
 //     so their lineage verdict has nothing to forget.
 //

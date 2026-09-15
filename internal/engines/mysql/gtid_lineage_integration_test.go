@@ -49,6 +49,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -71,11 +72,11 @@ func TestGTIDResumeBindsLineageAcrossInstances(t *testing.T) {
 	defer cancel()
 
 	dsnA, cleanupA := startMySQLFamilyContainer(
-		t, ctx, "mysql:8.0", "lineage", mysqlFilePosEnvs("lineage"), mysqlGTIDBootCmd,
+		t, ctx, lineageMySQLImage(), "lineage", mysqlFilePosEnvs("lineage"), mysqlGTIDBootCmd,
 	)
 	defer cleanupA()
 	dsnB, cleanupB := startMySQLFamilyContainer(
-		t, ctx, "mysql:8.0", "lineage", mysqlFilePosEnvs("lineage"), mysqlGTIDBootCmd,
+		t, ctx, lineageMySQLImage(), "lineage", mysqlFilePosEnvs("lineage"), mysqlGTIDBootCmd,
 	)
 	defer cleanupB()
 
@@ -147,14 +148,14 @@ func TestGTIDResumeBindsLineageAcrossInstances(t *testing.T) {
 	// target to the rebuild's stale rows at exit 0. The real same-server
 	// cells are at the end of this test, on A itself.
 	dsnD, cleanupD := startMySQLFamilyContainer(
-		t, ctx, "mysql:8.0", "lineage", mysqlFilePosEnvs("lineage"), mysqlGTIDBootCmd,
+		t, ctx, lineageMySQLImage(), "lineage", mysqlFilePosEnvs("lineage"), mysqlGTIDBootCmd,
 	)
 	defer cleanupD()
 	uuidD := serverUUIDOf(t, ctx, dsnD)
 	if uuidD == uuidA || strings.Contains(setA, uuidD) {
 		t.Fatalf("premise gone: the rebuilt instance's uuid %q is named by A's position %q", uuidD, setA)
 	}
-	execSQL(t, ctx, dsnD, "RESET MASTER")
+	resetBinaryLogs(t, ctx, dsnD)
 	if got := globalVar(t, ctx, dsnD, "gtid_executed"); strings.TrimSpace(got) != "" {
 		t.Fatalf("premise gone: RESET MASTER left gtid_executed %q; want empty", got)
 	}
@@ -197,6 +198,31 @@ func TestGTIDResumeBindsLineageAcrossInstances(t *testing.T) {
 		}
 		t.Logf("%s: refused, re-copy route kept: %v", cell, err)
 	}
+	// mustBeRolledBack grades the BEHIND-under-its-own-uuid arm: terminal
+	// like a foreign lineage, with the rolled-back diagnosis naming the
+	// server's own uuid and the target being AHEAD.
+	mustBeRolledBack := func(t *testing.T, cell, dsn, ownUUID string) {
+		t.Helper()
+		reader, err := e.OpenCDCReader(ctx, dsn)
+		if err != nil {
+			t.Fatalf("%s: OpenCDCReader: %v", cell, err)
+		}
+		defer closeLineageReader(reader)
+		_, err = reader.StreamChanges(ctx, capturedOnA)
+		if err == nil {
+			t.Fatalf("%s: resuming A's position was ACCEPTED", cell)
+		}
+		if !errors.Is(err, ir.ErrPositionForeignLineage) || errors.Is(err, ir.ErrPositionInvalid) {
+			t.Fatalf("%s: must be terminal (ErrPositionForeignLineage, not the ErrPositionInvalid re-copy route — "+
+				"the target is AHEAD of a rolled-back source): %v", cell, err)
+		}
+		for _, phrase := range []string{"under this server's own @@server_uuid " + ownUUID, "AHEAD", "--restart-from-scratch"} {
+			if !strings.Contains(err.Error(), phrase) {
+				t.Fatalf("%s: the refusal is missing %q: %v", cell, phrase, err)
+			}
+		}
+		t.Logf("%s: refused terminally: %v", cell, err)
+	}
 	mustBeForeign(t, "rebuilt instance, EMPTY executed set", dsnD)
 
 	// Direction 1c — the sibling the refuter measured (S1): the same
@@ -204,7 +230,7 @@ func TestGTIDResumeBindsLineageAcrossInstances(t *testing.T) {
 	// `mysqldump --set-gtid-purged=ON` / the xtrabackup restore step
 	// produce: gtid_purged seeded under A's uuid, short of the position.
 	// The BEHIND arm; the uuid witness must make it terminal too.
-	execSQL(t, ctx, dsnD, "RESET MASTER")
+	resetBinaryLogs(t, ctx, dsnD)
 	execSQL(t, ctx, dsnD, "SET @@GLOBAL.gtid_purged = '"+behindGTIDSet(t, setA)+"'")
 	if got := globalVar(t, ctx, dsnD, "gtid_executed"); !strings.Contains(got, uuidA) {
 		t.Fatalf("premise gone: seeding D behind A's position failed: gtid_executed %q", got)
@@ -230,10 +256,10 @@ func TestGTIDResumeBindsLineageAcrossInstances(t *testing.T) {
 	// promoted replica's executed set looks like — must ACCEPT, even though
 	// its @@server_uuid differs from A's.
 	dsnC, cleanupC := startMySQLFamilyContainer(
-		t, ctx, "mysql:8.0", "lineage", mysqlFilePosEnvs("lineage"), mysqlGTIDBootCmd,
+		t, ctx, lineageMySQLImage(), "lineage", mysqlFilePosEnvs("lineage"), mysqlGTIDBootCmd,
 	)
 	defer cleanupC()
-	execSQL(t, ctx, dsnC, "RESET MASTER")
+	resetBinaryLogs(t, ctx, dsnC)
 	execSQL(t, ctx, dsnC, "SET @@GLOBAL.gtid_purged = '"+setA+"'")
 	if got := globalVar(t, ctx, dsnC, "gtid_executed"); !strings.Contains(got, uuidA) {
 		t.Fatalf("seeding C's lineage failed: gtid_executed %q does not carry A's uuid %q", got, uuidA)
@@ -250,19 +276,54 @@ func TestGTIDResumeBindsLineageAcrossInstances(t *testing.T) {
 	}
 
 	// Direction 4 — the SAME instance, for real this time (A, whose uuid
-	// the position names), on both arms: after RESET MASTER (empty), and
-	// restored behind its own position (gtid_purged under its own uuid).
-	// Both keep the automatic re-copy — the lineage is this server's own,
-	// so re-copying from it is the right recovery (the v0.148.2 decision,
-	// now scoped to the instance it was made for). Last, because RESET
-	// MASTER on A ends its usefulness for the accept cells above.
-	execSQL(t, ctx, dsnA, "RESET MASTER")
+	// the position names), on both arms, and they now route differently.
+	// After RESET MASTER (empty) the automatic re-copy stays — the lineage
+	// is this server's own (the v0.148.2 decision, scoped to the instance
+	// it was made for). Restored BEHIND its own position (gtid_purged under
+	// its own uuid, the in-place restore / rollback shape) is TERMINAL by
+	// operator decision 2026-09-15: the target is ahead of such a source,
+	// and until the decision this cell pinned the re-copy that reduced it.
+	// Last, because RESET MASTER on A ends its usefulness for the accept
+	// cells above.
+	resetBinaryLogs(t, ctx, dsnA)
 	if got := globalVar(t, ctx, dsnA, "gtid_executed"); strings.TrimSpace(got) != "" {
 		t.Fatalf("premise gone: RESET MASTER left A's gtid_executed %q; want empty", got)
 	}
 	mustBeInvalid(t, "same instance, EMPTY executed set (RESET MASTER)", dsnA)
 	execSQL(t, ctx, dsnA, "SET @@GLOBAL.gtid_purged = '"+behindGTIDSet(t, setA)+"'")
-	mustBeInvalid(t, "same instance, BEHIND its own position", dsnA)
+	if got := globalVar(t, ctx, dsnA, "gtid_executed"); !strings.Contains(strings.ToLower(got), strings.ToLower(uuidA)) {
+		t.Fatalf("premise gone: seeding A behind its own position failed: gtid_executed %q", got)
+	}
+	mustBeRolledBack(t, "same instance, BEHIND its own position", dsnA, uuidA)
+}
+
+// lineageMySQLImage is the stock image the MySQL lineage cells boot:
+// SLUICE_TEST_MYSQL_IMAGE when set (the version matrix, or a local
+// mysql:8.4 run), mysql:8.0 otherwise. Never the pre-baked default of
+// that variable: every cell here boots its own gtid_mode=ON command line.
+func lineageMySQLImage() string {
+	if img := os.Getenv(sharedMySQLImageEnv); img != "" {
+		return img
+	}
+	return "mysql:8.0"
+}
+
+// resetBinaryLogs empties a MySQL server's binary logs and GTID state.
+// MySQL 8.4 removed RESET MASTER in favour of RESET BINARY LOGS AND GTIDS
+// (8.2+); older servers know only the first spelling.
+func resetBinaryLogs(t *testing.T, ctx context.Context, dsn string) {
+	t.Helper()
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := db.ExecContext(ctx, "RESET BINARY LOGS AND GTIDS"); err == nil {
+		return
+	}
+	if _, err := db.ExecContext(ctx, "RESET MASTER"); err != nil {
+		t.Fatalf("neither RESET BINARY LOGS AND GTIDS nor RESET MASTER ran: %v", err)
+	}
 }
 
 // behindGTIDSet returns set with its last interval's upper bound reduced
@@ -293,8 +354,9 @@ func behindGTIDSet(t *testing.T, set string) string {
 // MariaDB safe; the pre-tag review then measured the two cells the
 // server does NOT refuse. The matrix:
 //
-//   - different server_id, same domain — the server refuses (1236 "not
-//     in the master's binlog"); sluice must route it to cold-start.
+//   - different server_id, same domain — the server would refuse (1236
+//     "not in the master's binlog"); sluice's anchor door refuses it
+//     first, as a foreign lineage.
 //   - different gtid_domain_id — the server ACCEPTS and streams its whole
 //     history; sluice's domain door and anchor must refuse.
 //   - rebuilt: same server_id, same domain, a history that reads the SAME
@@ -305,10 +367,16 @@ func behindGTIDSet(t *testing.T, set string) string {
 //   - an anchorless legacy position on a rebuilt instance — must ACCEPT
 //     with the UNVERIFIED-INSTANCE-IDENTITY warning (the documented
 //     degraded posture), never refuse.
+//   - an EMPTY gtid_binlog_state, on a rebuilt instance AND on the same
+//     instance after RESET MASTER — both must refuse terminally (operator
+//     decision 2026-09-15: MariaDB cannot tell them apart), with a message
+//     naming both possibilities.
 //
-// Every cell asserts an independent expected value: the refusal wraps
-// ir.ErrPositionInvalid (so the streamer cold-starts), and an accepted
-// stream must deliver a write made on the resumed instance.
+// Every cell asserts an independent expected value: the refusal carries
+// the sentinel its routing requires (ir.ErrPositionForeignLineage for a
+// terminal verdict, and never the ir.ErrPositionInvalid re-copy route
+// alongside it), and an accepted stream must deliver a write made on the
+// resumed instance.
 func TestGTIDResumeMariaDBBindsLineage(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
@@ -351,7 +419,9 @@ func TestGTIDResumeMariaDBBindsLineage(t *testing.T) {
 	// terminal (ir.ErrPositionForeignLineage), a server-side 1236 that the
 	// reactive classifier cannot tell from a reset keeps the automatic
 	// re-copy (ir.ErrPositionInvalid).
-	mustRefuse := func(t *testing.T, dsn, cell string, pos ir.Position, want error) {
+	// It returns the refusal's text, for the cells that also grade the
+	// diagnosis.
+	mustRefuse := func(t *testing.T, dsn, cell string, pos ir.Position, want error) string {
 		t.Helper()
 		other := ir.ErrPositionInvalid
 		if errors.Is(want, ir.ErrPositionInvalid) {
@@ -368,7 +438,7 @@ func TestGTIDResumeMariaDBBindsLineage(t *testing.T) {
 				t.Fatalf("%s: refused, but with the wrong routing (want %v, not %v): %v", cell, want, other, err)
 			}
 			t.Logf("%s: refused at open: %v", cell, err)
-			return
+			return err.Error()
 		}
 		// Accepted at open: only a reactive server refusal may follow.
 		// Write on the resumed instance so silent acceptance has
@@ -388,7 +458,7 @@ func TestGTIDResumeMariaDBBindsLineage(t *testing.T) {
 						t.Fatalf("%s: stream refused, but with the wrong routing (want %v, not %v): %v", cell, want, other, serr)
 					}
 					t.Logf("%s: refused reactively on the stream: %v", cell, serr)
-					return
+					return serr.Error()
 				}
 				t.Fatalf("%s: a foreign position was ACCEPTED and the resumed instance's write was DELIVERED as the position's continuation (%+v) — the SLM-2 shape", cell, ev)
 			case <-deadline:
@@ -475,9 +545,9 @@ func TestGTIDResumeMariaDBBindsLineage(t *testing.T) {
 	// measureVerdict drives a resume and reports what happened without
 	// grading it: "invalid", "foreign", "accepted" (the resumed instance's
 	// own write was delivered as the position's continuation), or the
-	// error text for anything else. The two KNOWN-GAP cells below use it
-	// so the gap is measured on a real server on every run and stated as
-	// a skip, rather than asserted away or left as a permanent red.
+	// error text for anything else. The KNOWN-GAP cell below uses it so the
+	// gap is measured on a real server on every run and stated, rather
+	// than asserted away or left as a permanent red.
 	measureVerdict := func(t *testing.T, dsn string, pos ir.Position) string {
 		t.Helper()
 		reader, err := e.OpenCDCReader(ctx, dsn)
@@ -516,20 +586,34 @@ func TestGTIDResumeMariaDBBindsLineage(t *testing.T) {
 		}
 	}
 
-	t.Run("KNOWN GAP: rebuilt instance with an EMPTY gtid_binlog_state (a restore, then RESET MASTER)", func(t *testing.T) {
+	// wantEmptyStateDiagnosis grades the empty-state refusal's text: it must
+	// name BOTH possibilities, because sluice cannot say which it is, and
+	// the remedy for each.
+	wantEmptyStateDiagnosis := func(t *testing.T, cell, refusal string) {
+		t.Helper()
+		for _, phrase := range []string{
+			"@@gtid_binlog_state is EMPTY",
+			"RESET MASTER on this same server with its data intact",
+			"REBUILT",
+			"--restart-from-scratch",
+			"point the sync at the instance that holds the position",
+		} {
+			if !strings.Contains(refusal, phrase) {
+				t.Fatalf("%s: the empty-state refusal is missing %q: %s", cell, phrase, refusal)
+			}
+		}
+	}
+
+	t.Run("rebuilt instance with an EMPTY gtid_binlog_state (a restore, then RESET MASTER): refused terminally", func(t *testing.T) {
 		// Audit 2026-09-15 A0915-MYSQL-HIGH-2, MariaDB arm — measured end to
-		// end: a rebuilt mariadb:11.4 at the same address with stale rows
-		// and an empty state took the automatic re-copy and the target was
-		// reduced to the stale rows at exit 0, exactly as on MySQL. On
-		// MySQL the @@server_uuid witness now makes this terminal. MariaDB
-		// has no instance identity (no @@server_uuid; GTIDs carry
-		// domain-server-seq only), so "same server after RESET MASTER" and
-		// "rebuilt instance after RESET MASTER" are indistinguishable from
-		// the server's answers, and the choice — refuse every empty state
-		// (a same-server reset then costs --restart-from-scratch) or keep
-		// the re-copy (a rebuilt node destroys the target) — is an operator
-		// policy call filed in the audit backlog. Behaviour is deliberately
-		// UNCHANGED here; this cell measures it and states the gap.
+		// end before the decision: a rebuilt mariadb:11.4 at the same address
+		// with stale rows and an empty state took the automatic re-copy and
+		// the target was reduced to the stale rows at exit 0. MariaDB has no
+		// instance identity (no @@server_uuid; GTIDs carry domain-server-seq
+		// only), so this shape and a same-server RESET MASTER (the next cell)
+		// are indistinguishable from the server's answers; the operator
+		// decision (2026-09-15) is that both refuse. Until the decision this
+		// cell was a measured KNOWN GAP asserting the 'invalid' verdict.
 		dsnB, cleanupB := newMariaDBDedicatedForCDC(t, "mariadb:11.4")
 		defer cleanupB()
 		execSQL(t, ctx, dsnB, `CREATE TABLE cdc_src.t (id INT PRIMARY KEY, v TEXT)`)
@@ -538,19 +622,47 @@ func TestGTIDResumeMariaDBBindsLineage(t *testing.T) {
 		if got := globalVar(t, ctx, dsnB, "gtid_binlog_state"); strings.TrimSpace(got) != "" {
 			t.Fatalf("premise gone: RESET MASTER left gtid_binlog_state %q; want empty", got)
 		}
-		switch verdict := measureVerdict(t, dsnB, capturedOnA); verdict {
-		case "invalid":
-			t.Logf("KNOWN GAP (A0915-MYSQL-HIGH-2, MariaDB), measured and unchanged by design: a rebuilt instance with an empty gtid_binlog_state is "+
-				"routed to the automatic re-copy (ir.ErrPositionInvalid), which would reduce the target to this "+
-				"instance's stale rows; MariaDB offers no instance identity to tell it from a same-server RESET "+
-				"MASTER, and the policy is undecided. Measured verdict: %s", verdict)
-		case "foreign":
-			t.Fatalf("the MariaDB empty-state gap has been CLOSED (verdict foreign): promote this cell to " +
-				"mustRefuse(..., ir.ErrPositionForeignLineage) and add the same-server RESET MASTER cell it now needs")
-		default:
-			t.Fatalf("rebuilt MariaDB with an empty state: unexpected verdict %q (want the known-gap 'invalid', "+
-				"or 'foreign' once the gap is closed)", verdict)
+		wantEmptyStateDiagnosis(t, "rebuilt-empty-state",
+			mustRefuse(t, dsnB, "rebuilt-empty-state", capturedOnA, ir.ErrPositionForeignLineage))
+	})
+
+	t.Run("same server after RESET MASTER, data intact: refused terminally too", func(t *testing.T) {
+		// The cost side of the decision, measured rather than assumed: the
+		// SAME instance that issued the position, reset with every row still
+		// in place, refuses the same way — MariaDB cannot tell it from the
+		// rebuilt node above, so this reset now takes one deliberate
+		// --restart-from-scratch. A dedicated instance, because RESET MASTER
+		// on A would end its usefulness for the cells below.
+		dsnS, cleanupS := newMariaDBDedicatedForCDC(t, "mariadb:11.4")
+		defer cleanupS()
+		execSQL(t, ctx, dsnS, `CREATE TABLE cdc_src.t (id INT PRIMARY KEY, v TEXT)`)
+		execSQL(t, ctx, dsnS, `INSERT INTO cdc_src.t VALUES (1,'a'),(2,'b'),(3,'c')`)
+		snapS, err := e.OpenBackupSnapshot(ctx, dsnS, irbackup.SnapshotOptions{})
+		if err != nil {
+			t.Fatalf("OpenBackupSnapshot(S): %v", err)
 		}
+		capturedOnS := snapS.Position
+		_ = snapS.Close()
+		var dS binlogPos
+		if err := json.Unmarshal([]byte(capturedOnS.Token), &dS); err != nil || dS.Mode != positionModeGTID || dS.GTIDSet == "" {
+			t.Fatalf("premise gone: S's position is not a non-empty GTID position: %q %v", capturedOnS.Token, err)
+		}
+		execSQL(t, ctx, dsnS, `RESET MASTER`)
+		if got := globalVar(t, ctx, dsnS, "gtid_binlog_state"); strings.TrimSpace(got) != "" {
+			t.Fatalf("premise gone: RESET MASTER left gtid_binlog_state %q; want empty", got)
+		}
+		dbS, err := sql.Open("mysql", dsnS)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		var rows int
+		err = dbS.QueryRowContext(ctx, `SELECT COUNT(*) FROM cdc_src.t`).Scan(&rows)
+		_ = dbS.Close()
+		if err != nil || rows != 3 {
+			t.Fatalf("premise gone: the reset server must still hold its 3 rows (got %d, %v)", rows, err)
+		}
+		wantEmptyStateDiagnosis(t, "same-server-reset",
+			mustRefuse(t, dsnS, "same-server-reset", capturedOnS, ir.ErrPositionForeignLineage))
 	})
 
 	t.Run("KNOWN GAP S2: a byte-identical rebuild collides with the lineage anchor and passes both doors", func(t *testing.T) {
@@ -570,6 +682,13 @@ func TestGTIDResumeMariaDBBindsLineage(t *testing.T) {
 		// is systematic. No second witness exists today (candidate: the
 		// anchor file's Format_description timestamp); behaviour is
 		// deliberately UNCHANGED, the cell measures and states the gap.
+		//
+		// NOT reached by the 2026-09-15 empty-state refusal, and that is
+		// why this is the one MariaDB known-gap cell left: the rebuild's
+		// @@gtid_binlog_state is NOT empty — it carries domain 0 at the
+		// colliding sequence — so the domain door passes on presence before
+		// the empty-state branch is ever consulted, and the anchor door
+		// passes on the collision.
 		dsnA2, cleanupA2 := newMariaDBDedicatedForCDC(t, "mariadb:11.4")
 		defer cleanupA2()
 		dsnB2, cleanupB2 := newMariaDBDedicatedForCDC(t, "mariadb:11.4")
