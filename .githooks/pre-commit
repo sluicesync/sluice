@@ -102,12 +102,25 @@ fi
 # Invoked via `bash`
 # (not `sh`): leg-nonvacuity-coverage uses bash-only here-strings, and `sh`
 # is dash on Linux/macOS. All are sub-second grep/git-ls/awk.
-for g in check-skills-flags check-schedule-consumers check-leg-nonvacuity-coverage check-dialect-translator-roster check-local-gate-parity check-notes-claims-selftest check-no-private-refs; do
+for g in check-skills-flags check-schedule-consumers check-leg-nonvacuity-coverage check-dialect-translator-roster check-local-gate-parity check-notes-claims-selftest check-changelog-heading-selftest check-prerelease-triggers-selftest check-no-private-refs; do
 	if ! bash "scripts/$g.sh"; then
 		red "pre-commit: $g failed (a CI Lint-job guard)."
 		exit 1
 	fi
 done
+
+# ---- CHANGELOG heading, pre-tag (audit 2026-09-15 T-3) ----
+# CI's tag-triggered step can only fire after the tag is pushed, when the
+# remedy is a force-move — and in the known case where ci.yml does not
+# trigger on the tag push it never fires at all. The --working-tree form
+# needs no tag: it grades the INDEX, so the release commit that archives
+# docs/releases/release-notes-vX.Y.Z.md without promoting `## [X.Y.Z]`
+# (v0.148.2's shape) is refused HERE, before it exists. Above the Go-staged
+# early return because a release commit can stage no Go at all.
+if ! sh scripts/check-changelog-heading.sh --working-tree; then
+	red "pre-commit: check-changelog-heading failed (the CHANGELOG does not carry the newest archived release's heading)."
+	exit 1
+fi
 
 # ---- CI coverage guards ----
 # These two run in CI's Lint job; without them here, adding

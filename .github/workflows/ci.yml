@@ -888,6 +888,21 @@ jobs:
       - name: check notes-claims gate self-test
         run: bash scripts/check-notes-claims-selftest.sh
 
+      # The changelog-heading gate's own gate (audit 2026-09-15 T-3). The
+      # gate itself runs on tags only (below) and in the pre-commit hooks'
+      # --working-tree form; this proves both forms on a hermetic replica of
+      # v0.148.2's shape on every PR, so a regression in the script cannot
+      # wait for the next tag to be found.
+      - name: check changelog-heading gate self-test
+        run: bash scripts/check-changelog-heading-selftest.sh
+
+      # The prerelease-triggers unscheduled-pin category's own gate (audit
+      # 2026-09-15 T-1): its universe is DERIVED from check-run-filter-
+      # coverage.sh and the workflows, and a derivation that silently comes
+      # back empty looks exactly like "nothing to advise".
+      - name: check prerelease-triggers self-test
+        run: bash scripts/check-prerelease-triggers-selftest.sh
+
       - uses: golangci/golangci-lint-action@v9.3.0
         with:
           # @v8+ of the action natively requires golangci-lint v2 (the
