@@ -89,6 +89,7 @@ package pgtrigger
 
 import (
 	"context"
+	"fmt"
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/engines/postgres"
@@ -152,10 +153,34 @@ func (e Engine) WithConnectionLabel(id string) ir.Engine {
 	return e
 }
 
-// OpenSchemaReader delegates to the composed [postgres.Engine] — the
-// trigger engine's schema surface is byte-equivalent to vanilla PG.
+// OpenSchemaReader opens the composed [postgres.Engine]'s reader — the
+// trigger engine's schema surface is byte-equivalent to vanilla PG — and
+// wraps it in this engine's [SchemaReader], which re-points the two
+// CDC-position surfaces (the backup-position capturer and the
+// position-from-manifest preflight) at the change log. Everything else
+// the composed reader answers is promoted through the embedding
+// unchanged.
 func (e Engine) OpenSchemaReader(ctx context.Context, dsn string) (ir.SchemaReader, error) {
-	return e.pg.OpenSchemaReader(ctx, dsn)
+	cfg, err := parseDSNCompat(dsn)
+	if err != nil {
+		return nil, err
+	}
+	sr, err := e.pg.OpenSchemaReader(ctx, dsn)
+	if err != nil {
+		return nil, err
+	}
+	pgsr, ok := sr.(*postgres.SchemaReader)
+	if !ok {
+		// Cannot happen today — postgres.Engine.OpenSchemaReader returns its
+		// own concrete type — and if it ever changes, refusing here is the
+		// loud failure we want: silently returning the un-wrapped reader
+		// would hand a trigger full a pgoutput position again.
+		if c, isCloser := sr.(interface{ Close() error }); isCloser {
+			_ = c.Close()
+		}
+		return nil, fmt.Errorf("pgtrigger: OpenSchemaReader: the composed postgres engine returned a %T, not a *postgres.SchemaReader; the trigger engine cannot re-point its position surfaces", sr)
+	}
+	return &SchemaReader{SchemaReader: pgsr, dsn: cfg.dsn, schema: cfg.schema, appID: e.appID}, nil
 }
 
 // OpenSchemaWriter delegates to the composed [postgres.Engine].

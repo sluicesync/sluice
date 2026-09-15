@@ -3,7 +3,10 @@
 
 package sqlitetrigger
 
-import "sluicesync.dev/sluice/internal/ir"
+import (
+	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+)
 
 // Compile-time declarations of the ir interfaces this engine's concrete types
 // intentionally implement.
@@ -36,4 +39,16 @@ var (
 	// reader IS this type) from registering, making its stream invisible to a
 	// peer's pruner. Pin it.
 	_ ir.ChangeLogConsumerRegistry = (*CDCReader)(nil)
+
+	// Roadmap item 163: the two halves of "a trigger full can root a chain".
+	// The snapshot opener is the gap-free primary path (MAX(id) read BEFORE
+	// the sweep's reader opens); losing it silently drops the orchestrator
+	// to the v0.17.x post-sweep fallback, where the capturers below record
+	// nothing on purpose and the chain refuses. Both reader wrappers are
+	// pinned — the D1 one is the type the d1-trigger engine hands back — and
+	// graded across the registry by docsync's
+	// TestEveryCDCEngineRecordsABackupPosition.
+	_ irbackup.SnapshotOpener   = Engine{}
+	_ irbackup.PositionCapturer = (*SchemaReader)(nil)
+	_ irbackup.PositionCapturer = (*D1SchemaReader)(nil)
 )

@@ -53,6 +53,7 @@ import (
 	"sluicesync.dev/sluice/internal/engines/sqlite"
 	sqlitetrigger "sluicesync.dev/sluice/internal/engines/sqlite-trigger"
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // ErrNotImplemented is returned by the write / target / change-apply Open*
@@ -84,11 +85,13 @@ func (Engine) Name() string { return EngineName }
 // engine on the shared type/feature surface.
 func (Engine) Capabilities() ir.Capabilities { return capabilities }
 
-// OpenSchemaReader delegates to the composed `d1` engine — the cold-start schema
-// reader, which already skips the engine's own change-log/meta/fingerprint
-// tables and D1's internal `_cf_*` tables (ADR-0130/0135).
+// OpenSchemaReader opens the composed `d1` engine's cold-start schema reader —
+// which already skips the engine's own change-log/meta/fingerprint tables and
+// D1's internal `_cf_*` tables (ADR-0130/0135) — wrapped by the shared trigger
+// logic in [sqlitetrigger.D1SchemaReader], which adds the full-backup position
+// surface a trigger-CDC source owes (roadmap item 163).
 func (Engine) OpenSchemaReader(ctx context.Context, dsn string) (ir.SchemaReader, error) {
-	return sqlite.NewD1Engine().OpenSchemaReader(ctx, dsn)
+	return sqlitetrigger.OpenD1SchemaReader(ctx, dsn)
 }
 
 // OpenRowReader delegates to the composed `d1` engine — the lossless cold-start
@@ -125,6 +128,19 @@ func (Engine) OpenCDCReader(ctx context.Context, dsn string) (ir.CDCReader, erro
 // reader, CDC tail over the same HTTP transport).
 func (Engine) OpenSnapshotStream(ctx context.Context, dsn string) (*ir.SnapshotStream, error) {
 	return sqlitetrigger.OpenD1SnapshotStream(ctx, dsn)
+}
+
+// OpenBackupSnapshot implements [irbackup.SnapshotOpener] (roadmap item 163):
+// a full backup's EndPosition is the change log's MAX(id) read BEFORE the row
+// sweep, over the same HTTP transport, so a `backup incremental` chained off
+// the full resumes the poller there instead of "from now". It is the SAME
+// function the local sqlite-trigger engine runs
+// ([sqlitetrigger.OpenD1BackupSnapshot] → the shared backend seam); the
+// gap-freedom argument is derived from the local single-writer proof and
+// pinned against the local executor and the D1 mock, not measured on a live
+// D1 in this release.
+func (Engine) OpenBackupSnapshot(ctx context.Context, dsn string, opts irbackup.SnapshotOptions) (*irbackup.Snapshot, error) {
+	return sqlitetrigger.OpenD1BackupSnapshot(ctx, dsn, opts)
 }
 
 // init registers the engine with the engines registry. The blank import in

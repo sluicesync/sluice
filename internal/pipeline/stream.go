@@ -778,17 +778,14 @@ func (b *BackupStream) newRolloverLoop(ctx context.Context) (*rolloverInit, erro
 	if err := backup.RefuseRedactedChainExtension(parent, parentPath, "backup stream"); err != nil {
 		return nil, err
 	}
-	startPos, err := resumeStartFromParent(ctx, b.Store, b.Source, parent, parentPath)
+	// Never empty past this point: a positionless FULL is refused inside
+	// (POSITIONLESS-FULL-ROOT, on every source since v0.153.3 — the
+	// trigger-CDC engines record an anchor now, roadmap item 163) and a
+	// positionless INCREMENTAL resolves to its nearest positioned ancestor
+	// or refuses.
+	startPos, err := resumeStartFromParent(ctx, b.Store, parent, parentPath)
 	if err != nil {
 		return nil, fmt.Errorf("stream: %w", err)
-	}
-	if startPos.Engine == "" && startPos.Token == "" {
-		// Trigger-CDC sources only (see resumeStartFromParent's exemption);
-		// every other positionless full was refused above.
-		slog.WarnContext(
-			ctx, "stream: parent full has no EndPosition (a trigger-CDC source records none); chain will start from the change log's current position, so changes between the full's read and now are not in this chain",
-			slog.String("parent_path", parentPath),
-		)
 	}
 
 	// 2.1. ADR-0087 rotation-boundary resume heal (Bug 139). When this
@@ -860,6 +857,13 @@ func (b *BackupStream) newRolloverLoop(ctx context.Context) (*rolloverInit, erro
 	// below releases its window via releaseChainAckTo, bounding source
 	// WAL retention to ~one rollover window.
 	holdChainAck(cdc)
+
+	// Trigger-CDC sources: seat the chain in the change log's consumer
+	// registry at its resume position BEFORE reading, so a peer sync's
+	// prune cannot reap the window the first rollover is about to capture;
+	// refreshed to each committed rollover's EndPosition in commitRollover
+	// (see chainConsumerID for the stated residual). A no-op elsewhere.
+	registerChainConsumer(ctx, cdc, b.Store, startPos, "stream")
 
 	changesCh, err := cdc.StreamChanges(ctx, startPos)
 	if err != nil {
@@ -1088,8 +1092,12 @@ func (b *BackupStream) commitRollover(ctx context.Context, roll rolloverOutcome,
 		return rolloverCommit{}, fmt.Errorf("stream: lineage catalog: %w", err)
 	}
 	// The rollover is durable — let the slot release its window's WAL (this
-	// is what bounds source WAL retention to ~one rollover window).
+	// is what bounds source WAL retention to ~one rollover window), and, on
+	// a trigger-CDC source, move the chain's registry seat up to the
+	// window's end so rows at or below it may be pruned on the chain's
+	// account (a no-op elsewhere; an empty EndPosition keeps the seat).
 	releaseChainAckTo(ctx, cdc, roll.Manifest.EndPosition)
+	registerChainConsumer(ctx, cdc, b.Store, roll.Manifest.EndPosition, "stream")
 
 	if roll.StopRequested {
 		slog.InfoContext(

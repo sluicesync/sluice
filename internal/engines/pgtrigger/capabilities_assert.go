@@ -6,6 +6,7 @@ package pgtrigger
 import (
 	"sluicesync.dev/sluice/internal/engines/postgres"
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // Compile-time declarations of the ir interfaces this engine's
@@ -57,4 +58,17 @@ var (
 	// This is a delegated-reader fact, not a widening of this engine's own
 	// surface; the narrowness note above is about the slot openers.
 	_ ir.RowFilterSetter = (*postgres.RowReader)(nil)
+
+	// Roadmap item 163: the two halves of "a trigger full can root a chain".
+	// The snapshot opener is the gap-free primary path (the anchor is taken
+	// INSIDE the backup's REPEATABLE READ view); losing it silently drops
+	// the orchestrator to the v0.17.x post-sweep fallback, where the
+	// capturer below records nothing on purpose and the chain refuses. The
+	// capturer + manifest preflight live on this engine's OWN reader type
+	// so the composed postgres reader's WAL-LSN answers can never leak into
+	// a trigger chain again. Both are graded across the registry by
+	// docsync's TestEveryCDCEngineRecordsABackupPosition.
+	_ irbackup.SnapshotOpener                = Engine{}
+	_ irbackup.PositionCapturer              = (*SchemaReader)(nil)
+	_ irbackup.PositionFromManifestPreflight = (*SchemaReader)(nil)
 )

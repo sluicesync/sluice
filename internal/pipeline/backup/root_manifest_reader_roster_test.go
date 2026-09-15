@@ -114,6 +114,11 @@ var rootManifestReaderRoster = map[string]string{
 		"whole reason the file is kept when its segment is retired.",
 	"pipe/broker.go:SyncFromBackup.preflightChainEncryption": "IDENTITY. The broker's chain-root " +
 		"encryption preflight; its data replay walks the catalog through BuildBrokerChain.",
+	"pipe/resume_start.go:chainConsumerID": "IDENTITY. Reads only the root's BackupID, as the chain's " +
+		"name in a trigger-CDC source's change-log consumer registry (roadmap item 163). The name must " +
+		"stay stable across `backup prune`/`backup compact` retiring segment 0 — which is exactly why the " +
+		"kept root file is the right one to read (retireManifest keeps its body) and a catalog-floor full " +
+		"would be wrong (a new floor would re-key the registry row). Never reads tables or chunks.",
 	"cmd/backup.go:EncryptionFlags.buildMaintenanceSigner": "IDENTITY. Feeds buildReadEnvelope so an " +
 		"HMAC-off-KEK maintenance signer derives the chain's KEK; key material only.",
 	"cmd/backup.go:BackupVerifyCmd.Run": "IDENTITY (both sites). --rebuild-catalog and the verify " +

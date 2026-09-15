@@ -241,22 +241,14 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 		return err
 	}
 
-	startPos, err := resumeStartFromParent(ctx, b.Store, b.Source, parent, parentPath)
+	// Never empty past this point: a positionless FULL is refused inside
+	// (POSITIONLESS-FULL-ROOT, on every source since v0.153.3 — the
+	// trigger-CDC engines record an anchor now, roadmap item 163) and a
+	// positionless INCREMENTAL resolves to its nearest positioned ancestor
+	// or refuses.
+	startPos, err := resumeStartFromParent(ctx, b.Store, parent, parentPath)
 	if err != nil {
 		return fmt.Errorf("incremental: %w", err)
-	}
-	if startPos.Engine == "" && startPos.Token == "" {
-		// Reached only for a trigger-CDC source (the one exemption in
-		// resumeStartFromParent; every other positionless full is refused
-		// there). Its reader anchors "from now" — changes after the
-		// incremental opens — so the chain is approximate: anything
-		// between the full's read and this anchor is missed. Said at WARN
-		// so the gap is visible; closing it is the trigger engines'
-		// position-capture item.
-		slog.WarnContext(
-			ctx, "incremental: parent full has no EndPosition (a trigger-CDC source records none); chain will start from the change log's current position, so changes between the full's read and now are not in this chain",
-			slog.String("parent_path", parentPath),
-		)
 	}
 
 	// 1.1. ADR-0087 rotation-boundary resume heal (Bug 139) — symmetric
@@ -346,6 +338,13 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 	// the ack at the stream's start; the committed end is released
 	// after the manifest write below.
 	holdChainAck(cdc)
+
+	// Trigger-CDC sources: seat the chain in the change log's consumer
+	// registry at its resume position BEFORE reading, so a peer sync's
+	// prune cannot reap the window this link is about to capture; refreshed
+	// to the committed EndPosition in commitWindow (see chainConsumerID for
+	// the stated residual). A no-op on every other source.
+	registerChainConsumer(ctx, cdc, b.Store, startPos, "incremental")
 
 	changesCh, err := cdc.StreamChanges(ctx, startPos)
 	if err != nil {
@@ -639,6 +638,11 @@ func (b *IncrementalBackup) commitWindow(ctx context.Context, cdc ir.CDCReader, 
 	if err := lineage.UpdateLineageForManifestBestEffort(ctx, b.Store, manifest, manifestPath, b.segCodec); err != nil {
 		return fmt.Errorf("incremental: lineage catalog: %w", err)
 	}
+	// The window is durable, so the chain's registry seat moves up to its
+	// end: rows at or below it may now be pruned on the chain's account
+	// (trigger-CDC sources only; a no-op elsewhere). An empty EndPosition
+	// keeps the seat where the window started.
+	registerChainConsumer(ctx, cdc, b.Store, manifest.EndPosition, "incremental")
 	return nil
 }
 

@@ -58,44 +58,14 @@ func (e Engine) OpenSnapshotStream(ctx context.Context, dsn string) (*ir.Snapsho
 // openSnapshotStream is the transport-neutral snapshot→CDC handoff used by both
 // the local file engine and the D1 engine (ADR-0136). The backend supplies the
 // cold-start row reader, the executor (for the anchor read + the change-log
-// preflight), and the CDC reader.
+// preflight), and the CDC reader. The anchor half is [anchorChangeLog], shared
+// with the full-backup snapshot ([openBackupSnapshot], roadmap item 163) so
+// the gap-freedom argument above has one implementation; the anchor is read
+// BEFORE the Rows reader opens — the happens-before edge that argument needs.
 func openSnapshotStream(ctx context.Context, b backend) (*ir.SnapshotStream, error) {
-	// Refuse loudly when the change-log is absent — the operator forgot
-	// `sluice trigger setup`. Fire it here so cold-start aborts before any data
-	// moves rather than mid-stream. Use a short-lived executor for the preflight
-	// + anchor read (captured BEFORE the Rows reader — the happens-before edge the
-	// gap-freedom argument needs).
-	anchorExec, err := b.openExec(ctx, true)
+	position, err := anchorChangeLog(ctx, b)
 	if err != nil {
-		return nil, fmt.Errorf("sqlite-trigger: snapshot: open: %w", err)
-	}
-	if exists, err := anchorExec.changeLogExists(ctx); err != nil {
-		_ = anchorExec.close()
-		return nil, fmt.Errorf("sqlite-trigger: snapshot: preflight: %w", err)
-	} else if !exists {
-		_ = anchorExec.close()
-		return nil, changeLogAbsentErr(b.driver)
-	}
-
-	anchor, err := anchorExec.maxChangeLogID(ctx)
-	if err != nil {
-		_ = anchorExec.close()
-		return nil, fmt.Errorf("sqlite-trigger: snapshot: read CDC anchor: %w", err)
-	}
-	// CDC door 2 of 2 (the other is CDCReader.StreamChanges): the gap-freedom
-	// argument in this file's doc comment rests on the change-log id being
-	// monotonic and never reused, which is a property of the table's DDL and
-	// of sqlite_sequence rather than of SQLite's locking. Graded here, before
-	// any data moves — a cold start that hands back an anchor the log can dip
-	// below has already lost the changes captured while it dipped.
-	wmErr := verifyChangeLogWatermark(ctx, anchorExec, b.driver, anchor)
-	_ = anchorExec.close()
-	if wmErr != nil {
-		return nil, wmErr
-	}
-	position, err := encodePos(sqliteTriggerPos{LastID: anchor})
-	if err != nil {
-		return nil, fmt.Errorf("sqlite-trigger: snapshot: encode position: %w", err)
+		return nil, err
 	}
 
 	// Perf-parity gap 3: the trigger-CDC cold-start copies tables SERIALLY on

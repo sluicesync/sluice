@@ -53,6 +53,7 @@ package sqlitetrigger
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/engines/sqlite"
@@ -95,11 +96,27 @@ func (Engine) Name() string { return EngineName }
 // the cold-start engine on the type/feature surface they share.
 func (Engine) Capabilities() ir.Capabilities { return capabilities }
 
-// OpenSchemaReader delegates to the composed [sqlite.Engine]. The reader skips
-// the trigger engine's own change-log/meta tables (the sqlite reader's exact-name
-// skip set, ADR-0135) so a cold-start never copies them.
+// OpenSchemaReader opens the composed [sqlite.Engine]'s reader — it skips the
+// trigger engine's own change-log/meta tables (the sqlite reader's exact-name
+// skip set, ADR-0135) so a cold-start never copies them — and wraps it in this
+// engine's [SchemaReader], which adds the full-backup position surface a
+// trigger-CDC source owes (roadmap item 163). Everything else the composed
+// reader answers is promoted through the embedding unchanged.
 func (e Engine) OpenSchemaReader(ctx context.Context, dsn string) (ir.SchemaReader, error) {
-	return e.sq.OpenSchemaReader(ctx, dsn)
+	sr, err := e.sq.OpenSchemaReader(ctx, dsn)
+	if err != nil {
+		return nil, err
+	}
+	sqsr, ok := sr.(*sqlite.SchemaReader)
+	if !ok {
+		// Cannot happen today — sqlite.Engine.OpenSchemaReader returns its own
+		// concrete type — and if it ever changes, refusing here is the loud
+		// failure we want rather than silently handing back a reader without
+		// the capturer.
+		_ = closeReader(sr)
+		return nil, fmt.Errorf("%s: OpenSchemaReader: the composed sqlite engine returned a %T, not a *sqlite.SchemaReader; the trigger engine cannot attach its position surface", EngineName, sr)
+	}
+	return &SchemaReader{SchemaReader: sqsr, b: localBackend(dsn)}, nil
 }
 
 // OpenRowReader delegates to the composed [sqlite.Engine] — the cold-start
