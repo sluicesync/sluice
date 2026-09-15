@@ -43,6 +43,26 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 fail=0
 
+# Run every case as if the checkout had NO TAGS, which is what CI's Lint job
+# sees (shallow, tagless). A PATH shim fails `git describe` only and forwards
+# every other git call to the real binary — the script's derivation still
+# needs `git ls-files`, `git blame` and `git tag --contains`. Without this the
+# self-test passed wherever tags exist and first failed on main's CI, where the
+# script resolved its base tag before reading the synthetic delta (v0.153.3).
+real_git=$(command -v git)
+mkdir -p "$work/bin"
+cat >"$work/bin/git" <<SHIM
+#!/bin/sh
+if [ "\$1" = "describe" ]; then
+	echo "fatal: No names found, cannot describe anything. (self-test tagless shim)" >&2
+	exit 128
+fi
+exec "$real_git" "\$@"
+SHIM
+chmod +x "$work/bin/git"
+PATH="$work/bin:$PATH"
+export PATH
+
 # run_case <name> <delta-lines...>: writes the delta, runs the script, leaves
 # the combined output in $out.
 out=""

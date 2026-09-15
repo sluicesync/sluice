@@ -20,20 +20,28 @@
 # apply regardless.
 set -euo pipefail
 
-base="${1:-$(git describe --tags --abbrev=0 2>/dev/null || true)}"
-if [ -z "$base" ]; then
-  echo "prerelease-triggers: no BASE_REF given and no tag found; pass a base ref explicitly." >&2
-  exit 2
-fi
-
-files="$(git diff --name-only "$base"..HEAD 2>/dev/null || true)"
 # PRERELEASE_TRIGGERS_DELTA_FILE names a file holding one repo-relative path
 # per line to grade INSTEAD of the git delta. It exists for
 # scripts/check-prerelease-triggers-selftest.sh, which feeds synthetic deltas
 # through the real category logic; nothing else should set it.
+#
+# It is checked BEFORE the base ref is resolved, and that order is
+# load-bearing: CI's Lint job checks out shallow and tagless, so
+# `git describe --tags` finds nothing there, and resolving the base first
+# made every synthetic case exit 2 on the missing tag. The self-test passed
+# on a developer machine (tags present) and failed on main's CI — the first
+# run after the category landed (v0.153.3). The self-test now shims
+# `git describe` to fail so a local run reproduces the tagless checkout.
 if [ -n "${PRERELEASE_TRIGGERS_DELTA_FILE:-}" ]; then
   files="$(cat "$PRERELEASE_TRIGGERS_DELTA_FILE")"
   base="synthetic:$PRERELEASE_TRIGGERS_DELTA_FILE"
+else
+  base="${1:-$(git describe --tags --abbrev=0 2>/dev/null || true)}"
+  if [ -z "$base" ]; then
+    echo "prerelease-triggers: no BASE_REF given and no tag found; pass a base ref explicitly." >&2
+    exit 2
+  fi
+  files="$(git diff --name-only "$base"..HEAD 2>/dev/null || true)"
 fi
 if [ -z "$files" ]; then
   echo "prerelease-triggers: no changed files in $base..HEAD -- nothing to advise."
