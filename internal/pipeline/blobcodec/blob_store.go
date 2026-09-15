@@ -45,6 +45,7 @@ import (
 	_ "gocloud.dev/blob/s3blob"
 
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/safeerr"
 )
 
 // BlobStore is the cloud-backend implementation of [irbackup.Store].
@@ -136,7 +137,12 @@ func OpenBlobStore(ctx context.Context, urlStr string, opts BlobStoreOptions) (*
 func extractBlobPrefix(urlStr string) (string, error) {
 	u, err := url.Parse(urlStr)
 	if err != nil {
-		return "", fmt.Errorf("blob store: parse URL %q for prefix: %w", redactBlobURL(urlStr), err)
+		// SafeParseError, not the raw *url.Error: url.Error embeds the
+		// verbatim input, credentials included, so wrapping it would
+		// undo the redactBlobURL one argument earlier (audit 2026-09-15
+		// A0915-SEC-MEDIUM-1). Gated repo-wide by
+		// TestEveryURLParseErrorIsWrappedThroughSafeParseError.
+		return "", fmt.Errorf("blob store: parse URL %q for prefix: %w", redactBlobURL(urlStr), safeerr.SafeParseError(err))
 	}
 	// fileblob is the lone exception: the URL's path *is* the bucket
 	// (a local directory). gocloud treats the whole thing as the
@@ -477,10 +483,15 @@ func sanitiseBlobKey(path string) (string, error) {
 func annotateBlobURL(urlStr string, opts BlobStoreOptions) (string, error) {
 	u, err := url.Parse(urlStr)
 	if err != nil {
-		return "", fmt.Errorf("blob store: parse URL %q: %w", redactBlobURL(urlStr), err)
+		// See extractBlobPrefix: the raw *url.Error carries the input
+		// verbatim; SafeParseError keeps only the reason.
+		return "", fmt.Errorf("blob store: parse URL %q: %w", redactBlobURL(urlStr), safeerr.SafeParseError(err))
 	}
 	if u.Scheme == "" {
-		return "", fmt.Errorf("blob store: URL %q has no scheme (expected s3://, gs://, azblob://, or file://)", urlStr)
+		// `//KEY:SECRET@bucket/p` (a dropped `s3:`) parses cleanly with
+		// userinfo set and lands here — the echo must be the redacted
+		// form, exactly like the parse-failure branch above.
+		return "", fmt.Errorf("blob store: URL %q has no scheme (expected s3://, gs://, azblob://, or file://)", redactBlobURL(urlStr))
 	}
 	hasS3Opts := opts.Endpoint != "" || opts.Region != "" || opts.PathStyle
 	if hasS3Opts && u.Scheme != "s3" {

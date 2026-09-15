@@ -206,30 +206,45 @@ type Redaction struct {
 	// Length is the rune-count when Strategy == "truncate". Required
 	// for truncate (must be non-negative); ignored for other
 	// strategies.
-	Length int `koanf:"length"`
+	//
+	// A POINTER, like every other required numeric option below
+	// (M1, M2, Min, Max), so that "the operator omitted the key" is
+	// representable and distinct from "the operator wrote 0". Audit
+	// 2026-09-15 A0915-CFG-HIGH-1: as a flat int, an omitted
+	// `length:` decoded to 0 and `strategy: truncate` alone emptied
+	// every row at exit 0 — while the identical `--redact` spec was
+	// refused. The CLI layer (cmd/sluice/redact_flag.go) refuses nil
+	// with the SAME error value the CLI parser uses; the gate is
+	// TestRedactCLIAndYAMLAgreeOnRequiredOptions (cmd/sluice). This is
+	// CLAUDE.md's zero-value-safe-defaults rule applied to config.
+	Length *int `koanf:"length"`
 
 	// Form is the mask form when Strategy == "mask". Valid values:
 	// "inner" / "outer". Required for mask; ignored otherwise.
 	// PII Phase 2.a (v0.56.0+).
 	Form string `koanf:"form"`
 
-	// M1 is the "first N chars" margin when Strategy == "mask".
-	// Required for mask; non-negative.
-	M1 int `koanf:"m1"`
+	// M1 is the "first N chars" margin when Strategy == "mask" and
+	// Form is a generic form ("inner" / "outer"). Required there
+	// (nil is refused — see Length); non-negative. Presets take no
+	// margins and refuse them when present.
+	M1 *int `koanf:"m1"`
 
-	// M2 is the "last N chars" margin when Strategy == "mask".
-	// Required for mask; non-negative.
-	M2 int `koanf:"m2"`
+	// M2 is the "last N chars" margin when Strategy == "mask" and
+	// Form is a generic form. Required there (nil is refused — see
+	// Length); non-negative.
+	M2 *int `koanf:"m2"`
 
 	// Char is the mask character when Strategy == "mask". Defaults
 	// to "X" when empty. Single rune only.
 	Char string `koanf:"char"`
 
 	// Min / Max are the integer bounds when Strategy == "randomize"
-	// and Form == "int". PII Phase 2.c (v0.59.0). Inclusive; Min
-	// must not exceed Max. Ignored for other forms / strategies.
-	Min int64 `koanf:"min"`
-	Max int64 `koanf:"max"`
+	// and Form == "int". PII Phase 2.c (v0.59.0). Both required there
+	// (nil is refused — see Length); inclusive; Min must not exceed
+	// Max. Other forms / strategies refuse them when present.
+	Min *int64 `koanf:"min"`
+	Max *int64 `koanf:"max"`
 
 	// Brand selects the issuer prefix when Strategy == "randomize"
 	// and Form == "pan". PII Phase 2.c second wave (v0.60.0).

@@ -15,6 +15,33 @@ import (
 	"sluicesync.dev/sluice/internal/redact"
 )
 
+// The required-option refusals shared by BOTH parse surfaces.
+//
+// A strategy whose required option is missing must be refused with the
+// same error value whether the rule arrived as `--redact` or as a YAML
+// `redactions:` entry, so the two messages cannot drift and an operator
+// gets one instruction naming both spellings. Audit 2026-09-15
+// A0915-CFG-HIGH-1: the CLI refused `randomize:int` / `truncate` /
+// `mask:inner` / `mask:outer` without options while the YAML sibling
+// decoded the omitted key to the Go zero value and ran — every row 0,
+// every row empty, everything masked, and for `mask/outer` the source
+// value UNCHANGED under a rule that declared it masked. The gate that
+// holds the two surfaces to the same verdict is
+// TestRedactCLIAndYAMLAgreeOnRequiredOptions; it derives its case list
+// from strategyFromSpec's own refusals, not from a hand list.
+var (
+	errTruncateRequiresLength     = errors.New("strategy 'truncate' requires a length (CLI: 'truncate:N'; YAML: 'length: N')")
+	errRandomizeIntRequiresBounds = errors.New("strategy 'randomize:int' requires bounds (CLI: 'randomize:int:<min>,<max>'; YAML: 'min:' and 'max:')")
+	errMaskGenericFormNoMargins   = errors.New("generic form requiring margins")
+)
+
+// errMaskFormRequiresMargins is the per-form rendering of
+// errMaskGenericFormNoMargins (`inner` / `outer` without m1,m2), wrapped
+// so errors.Is matches on either surface.
+func errMaskFormRequiresMargins(form string) error {
+	return fmt.Errorf("strategy 'mask:%s': '%s' is a %w (CLI: 'mask:%s:<m1>,<m2>[,<char>]'; YAML: 'm1:' and 'm2:')", form, form, errMaskGenericFormNoMargins, form)
+}
+
 // parseRedactFlags converts the operator's `--redact TABLE.COLUMN=STRATEGY[:options]`
 // repeatable values into a [redact.Registry]. Returns (nil, nil) when
 // the slice is empty (no redactions configured).
@@ -172,10 +199,15 @@ func yamlStrategyToSluice(entry config.Redaction, keyset *redact.Keyset, streamI
 			return nil, fmt.Errorf("strategy 'hash:%s' is not supported (use 'sha256' or 'hmac-sha256')", entry.Algo)
 		}
 	case "truncate":
-		if entry.Length < 0 {
-			return nil, fmt.Errorf("strategy 'truncate' requires non-negative 'length'; got %d", entry.Length)
+		// nil is "the operator omitted `length:`" — refused with the
+		// CLI's error value, never decoded to 0 (A0915-CFG-HIGH-1).
+		if entry.Length == nil {
+			return nil, errTruncateRequiresLength
 		}
-		return redact.Truncate{N: entry.Length}, nil
+		if *entry.Length < 0 {
+			return nil, fmt.Errorf("strategy 'truncate' requires non-negative 'length'; got %d", *entry.Length)
+		}
+		return redact.Truncate{N: *entry.Length}, nil
 	case "mask":
 		return yamlMaskToSluice(entry)
 	case "randomize":
@@ -204,7 +236,7 @@ func yamlStrategyToSluice(entry config.Redaction, keyset *redact.Keyset, streamI
 // randomize, not tokenize), missing `dict:` field, or a `dict:`
 // referencing a name not declared under top-level `dictionaries:`.
 func yamlTokenizeToSluice(entry config.Redaction, keyset *redact.Keyset, streamID string, dictionaries map[string][]string) (redact.Strategy, error) {
-	if entry.Min != 0 || entry.Max != 0 {
+	if entry.Min != nil || entry.Max != nil {
 		return nil, errors.New("strategy 'tokenize' takes no min/max; remove the fields")
 	}
 	if entry.Brand != "" {
@@ -250,14 +282,22 @@ func yamlTokenizeToSluice(entry config.Redaction, keyset *redact.Keyset, streamI
 //   - form: uk-nin    — no other fields
 //   - form: iban      — optional `country_code:` (DE, GB, FR)
 //
-// Validation refuses missing form, unknown form, missing/invalid
-// min/max on int form, spurious min/max/brand/country_code on
-// forms that don't take them, and unsupported brand / country_code
-// values (so operator misconfiguration is loud, not silent).
+// Validation refuses missing form, unknown form, spurious
+// min/max/brand/country_code/dict on forms that don't take them, and
+// unsupported brand / country_code values (so operator
+// misconfiguration is loud, not silent). On the int form a missing
+// `min:` or `max:` is refused with errRandomizeIntRequiresBounds —
+// the same value the CLI returns for `randomize:int` — and min > max
+// is refused; the test that fails if the YAML side stops refusing an
+// omitted bound is TestRedactCLIAndYAMLAgreeOnRequiredOptions. (An
+// earlier version of this comment asserted the missing-bounds refusal
+// while no code performed it; audit 2026-09-15 A0915-CFG-HIGH-1.)
 func yamlRandomizeToSluice(entry config.Redaction, _ string, dictionaries map[string][]string) (redact.Strategy, error) {
-	// Guard helpers: each form rejects fields it doesn't use.
+	// Guard helpers: each form rejects fields it doesn't use. Presence
+	// is the test (`!= nil`), not the value: `min: 0` on `form: email`
+	// is as spurious as `min: 5`.
 	noBounds := func(form string) error {
-		if entry.Min != 0 || entry.Max != 0 {
+		if entry.Min != nil || entry.Max != nil {
 			return fmt.Errorf("strategy 'randomize' form %q takes no min/max; remove the fields", form)
 		}
 		return nil
@@ -363,10 +403,16 @@ func yamlRandomizeToSluice(entry config.Redaction, _ string, dictionaries map[st
 		if err := noDict("int"); err != nil {
 			return nil, err
 		}
-		if entry.Min > entry.Max {
-			return nil, fmt.Errorf("strategy 'randomize' form 'int' requires min <= max; got min=%d, max=%d", entry.Min, entry.Max)
+		// Both bounds are required; an omitted one is nil, never 0
+		// (A0915-CFG-HIGH-1: `0,0` is a constant generator, and the
+		// operator did not ask for one).
+		if entry.Min == nil || entry.Max == nil {
+			return nil, errRandomizeIntRequiresBounds
 		}
-		return redact.RandomizeInt{Min: entry.Min, Max: entry.Max}, nil
+		if *entry.Min > *entry.Max {
+			return nil, fmt.Errorf("strategy 'randomize' form 'int' requires min <= max; got min=%d, max=%d", *entry.Min, *entry.Max)
+		}
+		return redact.RandomizeInt{Min: *entry.Min, Max: *entry.Max}, nil
 	case "dict":
 		if err := noBounds("dict"); err != nil {
 			return nil, err
@@ -409,15 +455,18 @@ func yamlRandomizeToSluice(entry config.Redaction, _ string, dictionaries map[st
 //     strategy: mask
 //     form: ssn        # ssn | pan | pan-relaxed | email — no other fields needed
 //
-// Validation refuses negative margins, missing form, non-single-
-// rune char, and spurious M1/M2/Char fields on presets (so
-// operator misconfiguration is loud, not silent).
+// Validation refuses missing form, MISSING margins on inner/outer
+// (with errMaskFormRequiresMargins, the CLI's own value — an omitted
+// `m1:`/`m2:` is nil, never 0; at 0,0 `outer` masks NOTHING and ships
+// the PII the rule was written to remove, A0915-CFG-HIGH-1), negative
+// margins, non-single-rune char, and spurious m1/m2/char fields on
+// presets (so operator misconfiguration is loud, not silent).
 func yamlMaskToSluice(entry config.Redaction) (redact.Strategy, error) {
 	switch entry.Form {
 	case "":
 		return nil, errors.New("strategy 'mask' requires 'form' field: 'inner', 'outer', or a preset (ssn, pan, pan-relaxed, email, ca-sin, uk-nin, iban, uuid)")
 	case "ssn", "pan", "pan-relaxed", "email", "ca-sin", "uk-nin", "iban", "uuid":
-		if entry.M1 != 0 || entry.M2 != 0 || entry.Char != "" {
+		if entry.M1 != nil || entry.M2 != nil || entry.Char != "" {
 			return nil, fmt.Errorf("strategy 'mask' preset 'form: %s' takes no other fields; remove m1/m2/char", entry.Form)
 		}
 		return parseMaskPreset(entry.Form)
@@ -431,18 +480,21 @@ func yamlMaskToSluice(entry config.Redaction) (redact.Strategy, error) {
 	default:
 		return nil, fmt.Errorf("strategy 'mask' has unknown form %q (supported: inner, outer, ssn, pan, pan-relaxed, email, ca-sin, uk-nin, iban, uuid)", entry.Form)
 	}
-	if entry.M1 < 0 {
-		return nil, fmt.Errorf("strategy 'mask' requires non-negative 'm1'; got %d", entry.M1)
+	if entry.M1 == nil || entry.M2 == nil {
+		return nil, errMaskFormRequiresMargins(entry.Form)
 	}
-	if entry.M2 < 0 {
-		return nil, fmt.Errorf("strategy 'mask' requires non-negative 'm2'; got %d", entry.M2)
+	if *entry.M1 < 0 {
+		return nil, fmt.Errorf("strategy 'mask' requires non-negative 'm1'; got %d", *entry.M1)
+	}
+	if *entry.M2 < 0 {
+		return nil, fmt.Errorf("strategy 'mask' requires non-negative 'm2'; got %d", *entry.M2)
 	}
 	if entry.Char != "" {
 		if n := utf8.RuneCountInString(entry.Char); n != 1 {
 			return nil, fmt.Errorf("strategy 'mask' 'char' must be a single rune; got %d runes in %q", n, entry.Char)
 		}
 	}
-	return redact.Mask{Form: form, M1: entry.M1, M2: entry.M2, Char: entry.Char}, nil
+	return redact.Mask{Form: form, M1: *entry.M1, M2: *entry.M2, Char: entry.Char}, nil
 }
 
 // splitTriple is YAML's variant of splitRedactValue's left half:
@@ -539,7 +591,7 @@ func strategyFromSpec(spec string, keyset *redact.Keyset, streamID string, dicti
 		}
 	case "truncate":
 		if opts == "" {
-			return nil, errors.New("strategy 'truncate' requires a length: 'truncate:N'")
+			return nil, errTruncateRequiresLength
 		}
 		n, err := strconv.Atoi(opts)
 		if err != nil {
@@ -664,7 +716,7 @@ func parseRandomizeStrategy(opts string, dictionaries map[string][]string) (reda
 		case "iban":
 			return redact.RandomizeIBAN{}, nil
 		case "int":
-			return nil, errors.New("strategy 'randomize:int' requires bounds: 'randomize:int:<min>,<max>'")
+			return nil, errRandomizeIntRequiresBounds
 		case "dict":
 			return nil, errors.New("strategy 'randomize:dict' requires a dictionary name: 'randomize:dict:<name>' (the dictionary must be declared in YAML under 'dictionaries:')")
 		default:
@@ -827,8 +879,9 @@ func parseMaskPreset(name string) (redact.Strategy, error) {
 	case "uuid":
 		return redact.MaskUUID{}, nil
 	case "inner", "outer":
-		// Common mistake: dropped the colon + margins.
-		return nil, fmt.Errorf("strategy 'mask:%s': '%s' is a generic form requiring margins (use 'mask:%s:<m1>,<m2>[,<char>]')", name, name, name)
+		// Common mistake: dropped the colon + margins. Same value the
+		// YAML arm returns for an omitted m1/m2.
+		return nil, errMaskFormRequiresMargins(name)
 	default:
 		return nil, fmt.Errorf("strategy 'mask:%s': unknown form/preset (supported: inner:<m1>,<m2>[,<char>], outer:<m1>,<m2>[,<char>], ssn, pan, pan-relaxed, email, ca-sin, uk-nin, iban, uuid)", name)
 	}

@@ -270,6 +270,40 @@ keyset_source: file:/etc/sluice/keyset.yaml
 Useful for: production deployments (version-controllable,
 reviewable, audit-friendly).
 
+### YAML field reference
+
+Every CLI spec has a YAML spelling. The strategy name goes in
+`strategy:`; the colon-separated options become sibling keys:
+
+| CLI spec | YAML keys | Required keys |
+|---|---|---|
+| `null` | `strategy: "null"` (MUST be quoted — bare `null` is YAML's null literal) | — |
+| `static:<value>` | `strategy: static`, `value: <value>` | — (`value` may be omitted or empty for an explicit empty-out) |
+| `hash:sha256` / `hash:hmac-sha256[:<key>]` | `strategy: hash`, `algo: sha256 \| hmac-sha256`, `key: <keyset key>` | `algo` |
+| `truncate:<n>` | `strategy: truncate`, `length: <n>` | `length` |
+| `mask:inner:<m1>,<m2>[,<char>]` / `mask:outer:…` | `strategy: mask`, `form: inner \| outer`, `m1: <n>`, `m2: <n>`, `char: <one rune>` | `m1`, `m2` |
+| `mask:<preset>` | `strategy: mask`, `form: ssn \| pan \| pan-relaxed \| email \| ca-sin \| uk-nin \| iban \| uuid` | `form` (no `m1`/`m2`/`char`) |
+| `randomize:int:<min>,<max>` | `strategy: randomize`, `form: int`, `min: <n>`, `max: <n>` | `min`, `max` |
+| `randomize:pan[:<brand>]` | `strategy: randomize`, `form: pan`, `brand: visa \| mastercard \| amex` | `form` |
+| `randomize:iban[:<country-code>]` | `strategy: randomize`, `form: iban`, `country_code: DE \| GB \| FR` | `form` |
+| `randomize:email` / `us-phone` / `uuid` / `ssn` / `ca-sin` / `uk-nin` | `strategy: randomize`, `form: <name>` | `form` |
+| `randomize:dict:<name>` | `strategy: randomize`, `form: dict`, `dict: <name>` | `dict` |
+| `tokenize:dict:<name>[:<key>]` | `strategy: tokenize`, `dict: <name>`, `key: <keyset key>` | `dict` |
+
+A required key that is **omitted is refused at load time with the
+same error the CLI gives for the option-less spec** — `strategy:
+truncate` without `length:` fails exactly like `--redact
+users.email=truncate`. Releases before the 2026-09-15 audit fix
+(A0915-CFG-HIGH-1) decoded an omitted numeric key to `0` and ran:
+`randomize`/`int` wrote `0` to
+every row, `truncate` emptied every row, `mask`/`inner` masked the
+whole value, and `mask`/`outer` left the source value **unchanged**
+under a rule that declared it masked. A key that is *present* with
+the value `0` is still honoured (`length: 0`, `m1: 0`, `min: 0`),
+exactly as `truncate:0` / `mask:inner:0,4` / `randomize:int:0,9` are
+on the CLI. Keys a strategy or form does not take are refused when
+present (an unknown key name is refused by the loader itself).
+
 ### Hybrid
 
 CLI flags override / extend the YAML. Recommended pattern: keep

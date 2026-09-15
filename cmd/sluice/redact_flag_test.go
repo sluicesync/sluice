@@ -338,7 +338,7 @@ func TestLogRedactionConfig(_ *testing.T) {
 func TestMergeYAMLRedactions_AllStrategies(t *testing.T) {
 	entries := []config.Redaction{
 		{Table: "public.users.email", Strategy: "hash", Algo: "sha256"},
-		{Table: "users.phone", Strategy: "truncate", Length: 4},
+		{Table: "users.phone", Strategy: "truncate", Length: ip(4)},
 		{Table: "public.users.ssn", Strategy: "static", Value: "REDACTED"},
 		{Table: "users.middle_name", Strategy: "null"},
 	}
@@ -373,7 +373,7 @@ func TestMergeYAMLRedactions_AppendsToCLIRegistry(t *testing.T) {
 		t.Fatalf("CLI parse failed: %v", err)
 	}
 	yaml := []config.Redaction{
-		{Table: "users.phone", Strategy: "truncate", Length: 4},
+		{Table: "users.phone", Strategy: "truncate", Length: ip(4)},
 	}
 	reg, err := mergeYAMLRedactions(cli, yaml, nil, "", nil)
 	if err != nil {
@@ -462,7 +462,7 @@ func TestMergeYAMLRedactions_RefusalPaths(t *testing.T) {
 		{"empty strategy", config.Redaction{Table: "users.email"}, "'strategy' field is required"},
 		{"hash no algo", config.Redaction{Table: "users.email", Strategy: "hash"}, "requires 'algo' field"},
 		{"hash unknown algo", config.Redaction{Table: "users.email", Strategy: "hash", Algo: "md5"}, "not supported"},
-		{"truncate negative", config.Redaction{Table: "users.email", Strategy: "truncate", Length: -1}, "non-negative"},
+		{"truncate negative", config.Redaction{Table: "users.email", Strategy: "truncate", Length: ip(-1)}, "non-negative"},
 		{"empty table", config.Redaction{Strategy: "null"}, "'table' field is empty"},
 		{"single-segment table", config.Redaction{Table: "users", Strategy: "null"}, "must be"},
 		{"too many segments", config.Redaction{Table: "a.b.c.d", Strategy: "null"}, "must be"},
@@ -567,9 +567,9 @@ func TestParseRedactFlags_MaskRefusalPaths(t *testing.T) {
 // TestMergeYAMLRedactions_Mask covers the YAML form of mask.
 func TestMergeYAMLRedactions_Mask(t *testing.T) {
 	entries := []config.Redaction{
-		{Table: "users.pan", Strategy: "mask", Form: "inner", M1: 4, M2: 4},
-		{Table: "users.ssn", Strategy: "mask", Form: "inner", M1: 0, M2: 4, Char: "*"},
-		{Table: "users.token", Strategy: "mask", Form: "outer", M1: 2, M2: 2},
+		{Table: "users.pan", Strategy: "mask", Form: "inner", M1: ip(4), M2: ip(4)},
+		{Table: "users.ssn", Strategy: "mask", Form: "inner", M1: ip(0), M2: ip(4), Char: "*"},
+		{Table: "users.token", Strategy: "mask", Form: "outer", M1: ip(2), M2: ip(2)},
 	}
 	reg, err := mergeYAMLRedactions(nil, entries, nil, "", nil)
 	if err != nil {
@@ -604,11 +604,11 @@ func TestMergeYAMLRedactions_MaskRefusalPaths(t *testing.T) {
 		entry         config.Redaction
 		wantSubstring string
 	}{
-		{"missing form", config.Redaction{Table: "users.pan", Strategy: "mask", M1: 4, M2: 4}, "requires 'form' field"},
-		{"unknown form", config.Redaction{Table: "users.pan", Strategy: "mask", Form: "middle", M1: 4, M2: 4}, "unknown form"},
-		{"negative m1", config.Redaction{Table: "users.pan", Strategy: "mask", Form: "inner", M1: -1, M2: 4}, "non-negative 'm1'"},
-		{"negative m2", config.Redaction{Table: "users.pan", Strategy: "mask", Form: "inner", M1: 4, M2: -1}, "non-negative 'm2'"},
-		{"multi-rune char", config.Redaction{Table: "users.pan", Strategy: "mask", Form: "inner", M1: 4, M2: 4, Char: "XY"}, "single rune"},
+		{"missing form", config.Redaction{Table: "users.pan", Strategy: "mask", M1: ip(4), M2: ip(4)}, "requires 'form' field"},
+		{"unknown form", config.Redaction{Table: "users.pan", Strategy: "mask", Form: "middle", M1: ip(4), M2: ip(4)}, "unknown form"},
+		{"negative m1", config.Redaction{Table: "users.pan", Strategy: "mask", Form: "inner", M1: ip(-1), M2: ip(4)}, "non-negative 'm1'"},
+		{"negative m2", config.Redaction{Table: "users.pan", Strategy: "mask", Form: "inner", M1: ip(4), M2: ip(-1)}, "non-negative 'm2'"},
+		{"multi-rune char", config.Redaction{Table: "users.pan", Strategy: "mask", Form: "inner", M1: ip(4), M2: ip(4), Char: "XY"}, "single rune"},
 	}
 	for _, c := range cases {
 		c := c
@@ -810,7 +810,7 @@ func TestMergeYAMLRedactions_MaskPresetRefusalPaths(t *testing.T) {
 		entry         config.Redaction
 		wantSubstring string
 	}{
-		{"spurious m1 on preset", config.Redaction{Table: "users.ssn", Strategy: "mask", Form: "ssn", M1: 4}, "takes no other fields"},
+		{"spurious m1 on preset", config.Redaction{Table: "users.ssn", Strategy: "mask", Form: "ssn", M1: ip(4)}, "takes no other fields"},
 		{"spurious char on preset", config.Redaction{Table: "users.pan", Strategy: "mask", Form: "pan", Char: "*"}, "takes no other fields"},
 		{"unknown preset/form", config.Redaction{Table: "users.x", Strategy: "mask", Form: "zip"}, "unknown form"},
 	}
@@ -927,7 +927,7 @@ func TestMergeYAMLRedactions_Randomize(t *testing.T) {
 	}{
 		{
 			name:     "int",
-			entry:    config.Redaction{Table: "users.age", Strategy: "randomize", Form: "int", Min: 18, Max: 90},
+			entry:    config.Redaction{Table: "users.age", Strategy: "randomize", Form: "int", Min: i64p(18), Max: i64p(90)},
 			wantName: "randomize:int:18,90",
 		},
 		{
@@ -1124,7 +1124,7 @@ func TestMergeYAMLRedactions_RandomizeSecondWaveRefusals(t *testing.T) {
 		},
 		{
 			name:          "ssn with spurious min",
-			entry:         config.Redaction{Table: "u.x", Strategy: "randomize", Form: "ssn", Min: 5},
+			entry:         config.Redaction{Table: "u.x", Strategy: "randomize", Form: "ssn", Min: i64p(5)},
 			wantSubstring: "takes no min/max",
 		},
 		{
@@ -1134,7 +1134,7 @@ func TestMergeYAMLRedactions_RandomizeSecondWaveRefusals(t *testing.T) {
 		},
 		{
 			name:          "pan with spurious min",
-			entry:         config.Redaction{Table: "u.x", Strategy: "randomize", Form: "pan", Min: 5},
+			entry:         config.Redaction{Table: "u.x", Strategy: "randomize", Form: "pan", Min: i64p(5)},
 			wantSubstring: "takes no min/max",
 		},
 		{
@@ -1144,7 +1144,7 @@ func TestMergeYAMLRedactions_RandomizeSecondWaveRefusals(t *testing.T) {
 		},
 		{
 			name:          "iban with spurious max",
-			entry:         config.Redaction{Table: "u.x", Strategy: "randomize", Form: "iban", Max: 5},
+			entry:         config.Redaction{Table: "u.x", Strategy: "randomize", Form: "iban", Max: i64p(5)},
 			wantSubstring: "takes no min/max",
 		},
 		{
@@ -1159,7 +1159,7 @@ func TestMergeYAMLRedactions_RandomizeSecondWaveRefusals(t *testing.T) {
 		},
 		{
 			name:          "int with spurious brand",
-			entry:         config.Redaction{Table: "u.x", Strategy: "randomize", Form: "int", Brand: "visa", Min: 1, Max: 10},
+			entry:         config.Redaction{Table: "u.x", Strategy: "randomize", Form: "int", Brand: "visa", Min: i64p(1), Max: i64p(10)},
 			wantSubstring: "takes no brand",
 		},
 	}
@@ -1198,17 +1198,17 @@ func TestMergeYAMLRedactions_RandomizeRefusalPaths(t *testing.T) {
 		},
 		{
 			name:          "int with min > max",
-			entry:         config.Redaction{Table: "users.x", Strategy: "randomize", Form: "int", Min: 100, Max: 5},
+			entry:         config.Redaction{Table: "users.x", Strategy: "randomize", Form: "int", Min: i64p(100), Max: i64p(5)},
 			wantSubstring: "min <= max",
 		},
 		{
 			name:          "email with spurious min",
-			entry:         config.Redaction{Table: "users.x", Strategy: "randomize", Form: "email", Min: 5},
+			entry:         config.Redaction{Table: "users.x", Strategy: "randomize", Form: "email", Min: i64p(5)},
 			wantSubstring: "takes no min/max",
 		},
 		{
 			name:          "uuid with spurious max",
-			entry:         config.Redaction{Table: "users.x", Strategy: "randomize", Form: "uuid", Max: 5},
+			entry:         config.Redaction{Table: "users.x", Strategy: "randomize", Form: "uuid", Max: i64p(5)},
 			wantSubstring: "takes no min/max",
 		},
 	}
@@ -1395,7 +1395,7 @@ func TestMergeYAMLRedactions_TokenizeDictRefusals(t *testing.T) {
 		},
 		{
 			name:          "tokenize with spurious min",
-			entry:         config.Redaction{Table: "u.n", Strategy: "tokenize", Dict: "first_names", Min: 5},
+			entry:         config.Redaction{Table: "u.n", Strategy: "tokenize", Dict: "first_names", Min: i64p(5)},
 			wantSubstring: "takes no min/max",
 		},
 		{
@@ -1425,7 +1425,7 @@ func TestMergeYAMLRedactions_TokenizeDictRefusals(t *testing.T) {
 		},
 		{
 			name:          "randomize:int with spurious dict",
-			entry:         config.Redaction{Table: "u.n", Strategy: "randomize", Form: "int", Min: 1, Max: 10, Dict: "first_names"},
+			entry:         config.Redaction{Table: "u.n", Strategy: "randomize", Form: "int", Min: i64p(1), Max: i64p(10), Dict: "first_names"},
 			wantSubstring: "takes no dict",
 		},
 		{
@@ -1488,3 +1488,11 @@ func TestLoadDictionariesAndParse_EndToEnd(t *testing.T) {
 		t.Errorf("output %q not in dict; mapping broken", out)
 	}
 }
+
+// ip / i64p build the pointer-typed required options of a
+// config.Redaction literal (Length, M1, M2 are *int; Min, Max are
+// *int64). The pointer is the fix for A0915-CFG-HIGH-1: nil means "the
+// operator omitted the key", which the flat int could not say.
+func ip(n int) *int { return &n }
+
+func i64p(n int64) *int64 { return &n }

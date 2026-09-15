@@ -149,8 +149,13 @@ keyset_source: file:/etc/sluice/keyset.yaml
 		if r.Value != c2.value {
 			t.Errorf("Redactions[%d].Value = %q; want %q", c2.idx, r.Value, c2.value)
 		}
-		if r.Length != c2.length {
-			t.Errorf("Redactions[%d].Length = %d; want %d", c2.idx, r.Length, c2.length)
+		// Length is a pointer (A0915-CFG-HIGH-1): absent → nil,
+		// present → the decoded value. Only the truncate entry sets it.
+		switch {
+		case c2.strategy == "truncate" && (r.Length == nil || *r.Length != c2.length):
+			t.Errorf("Redactions[%d].Length = %v; want %d", c2.idx, r.Length, c2.length)
+		case c2.strategy != "truncate" && r.Length != nil:
+			t.Errorf("Redactions[%d].Length = %d; want nil (key absent)", c2.idx, *r.Length)
 		}
 	}
 }
