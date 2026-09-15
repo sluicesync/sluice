@@ -241,21 +241,20 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 		return err
 	}
 
-	startPos, err := resumeStartFromParent(ctx, b.Store, parent, parentPath)
+	startPos, err := resumeStartFromParent(ctx, b.Store, b.Source, parent, parentPath)
 	if err != nil {
 		return fmt.Errorf("incremental: %w", err)
 	}
 	if startPos.Engine == "" && startPos.Token == "" {
-		// v0.16.x fulls didn't record an EndPosition. Phase 3.1 still
-		// supports them by streaming "from now" — ie capturing
-		// changes after the incremental opens the slot, on the
-		// understanding that the resulting chain is approximate (any
-		// changes between the full's snapshot point and now would be
-		// missed). Operators get a clear log line so the gap is
-		// visible. Future Phase 3.3 work to backfill EndPosition into
-		// fulls will close this gap.
+		// Reached only for a trigger-CDC source (the one exemption in
+		// resumeStartFromParent; every other positionless full is refused
+		// there). Its reader anchors "from now" — changes after the
+		// incremental opens — so the chain is approximate: anything
+		// between the full's read and this anchor is missed. Said at WARN
+		// so the gap is visible; closing it is the trigger engines'
+		// position-capture item.
 		slog.WarnContext(
-			ctx, "incremental: parent manifest has no EndPosition; chain will start from CDC's current position (parent is a v0.16.x full or pre-Phase-3 manifest)",
+			ctx, "incremental: parent full has no EndPosition (a trigger-CDC source records none); chain will start from the change log's current position, so changes between the full's read and now are not in this chain",
 			slog.String("parent_path", parentPath),
 		)
 	}

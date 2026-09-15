@@ -504,6 +504,16 @@ Since v0.148.2 every MySQL-family lane — binlog GTID, binlog file/pos (`@@serv
 
 What to do when you see it: first confirm the DSN points at the database you mean — the three shapes above are indistinguishable from the position alone. If the replacement **is** intended, re-copy deliberately: `sluice sync start … --restart-from-scratch` (keeps the cdc-state row) or `--reset-target-data` (clears it too). Nothing happens until you say so.
 
+## A full backup that recorded no end position cannot root a chain (`POSITIONLESS-FULL-ROOT`)
+
+Every `backup incremental` and `backup stream` resumes the source's change stream from the position its parent recorded. A full backup normally records one at the end of its row sweep — a Postgres LSN, a MySQL GTID set or file/position, a VStream vgtid — and that position is the only thing that makes the chain contiguous: the incremental covers everything from *there* forward, and the full covered everything up to it.
+
+Three kinds of full carry **no** position: one taken FROM a PlanetScale Neki router (a Neki has no cluster-wide WAL position to give — the backup succeeds since v0.153.1 and says so at WARN), one taken from a MySQL server whose binary log was off, and one older than v0.17.2. Before v0.153.1 sluice extended such a full anyway, after a WARN, by starting the chain from the source's **current** position — which silently left out every change between the full's read and the moment the incremental opened. Since v0.153.1 the extension refuses instead, with a line marked `POSITIONLESS-FULL-ROOT` that names the parent and the remedy, before any replication connection is opened and before anything is written to the store.
+
+What to do when you see it: take a fresh `backup full` on a source that records a position and start a new chain from it. A Neki full is a complete, restorable backup on its own; it just cannot be the root of an incremental chain. If the source is MySQL, confirm `log_bin` is ON before the full — a full taken with it off has nothing for the next link to resume from.
+
+One exemption, stated: trigger-CDC sources (`postgres-trigger`, `sqlite-trigger`, `d1-trigger`) record no position on a full by construction, and their chains still start from the change log's current id with the same WARN as before. That window is uncovered on those engines today (roadmap item 163); until it closes, take the first incremental immediately after the full.
+
 ## PostgreSQL sources: slot creation can block on a prepared transaction (`PREPARED-XACT-BLOCKS-SLOT-CREATE`)
 
 `CREATE_REPLICATION_SLOT` builds a consistent point, and that builder waits for every prepared transaction (2PC) on the **cluster** — not just in your database — to be resolved. If one is orphaned because its coordinator died, the slot creation blocks indefinitely with no further output, which reads exactly like a hung connection.

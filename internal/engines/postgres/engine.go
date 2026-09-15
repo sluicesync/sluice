@@ -201,6 +201,10 @@ func (e Engine) OpenSchemaReader(ctx context.Context, dsn string) (ir.SchemaRead
 	if err != nil {
 		return nil, err
 	}
+	// `reached` is deliberately dropped: a probe that could not answer
+	// leaves isNeki=false, and every consumer of the reader's flag then
+	// takes the vanilla path, which on a real Neki fails LOUDLY (NK013 at
+	// CaptureBackupPosition) — the pre-v0.153.1 shape, never a silent one.
 	isNekiR, _ := probeIsNeki(ctx, cfg.serverKey(), db)
 	return &SchemaReader{db: db, schema: cfg.schema, isNeki: isNekiR}, nil
 }

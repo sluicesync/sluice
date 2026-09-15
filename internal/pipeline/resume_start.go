@@ -35,12 +35,47 @@ import (
 // nearest ANCESTOR that recorded one — the position the empty link itself
 // started from, since a link that recorded nothing ended where it began.
 // Re-streaming the empty link's window re-delivers at most its schema
-// snapshot, which the schema history absorbs. Only a FULL with no
-// EndPosition (the genuine v0.16.x shape) still reaches the legacy branch,
-// and only when no ancestor exists to walk to.
-func resumeStartFromParent(ctx context.Context, store irbackup.Store, parent *irbackup.Manifest, parentPath string) (ir.Position, error) {
-	if !positionEmpty(parent.EndPosition) || parent.Kind != irbackup.BackupKindIncremental {
+// snapshot, which the schema history absorbs.
+//
+// A FULL with no EndPosition is REFUSED (v0.153.1, POSITIONLESS-FULL-ROOT)
+// on every source whose CDC reader resumes from a recorded position. The
+// legacy "start from the source's current position" branch it used to
+// take was written for v0.16.x fulls, which nothing has produced since
+// v0.17.2 — but the population it admits kept growing: a full FROM a
+// PlanetScale Neki (no WAL position to record, v0.153.1), a MySQL full
+// taken with the binlog off, and the unrecognised shapes to come. Every
+// one of them extended "from now" at exit 0 after a WARN, which is the
+// silent chain gap the Bug 260 door in backup.go refused to trade a loud
+// failure for. The safety argument that no incremental could reach this
+// branch off a Neki full rested on the router refusing replication
+// connections — and the same release measured that a SHARD-TARGETED
+// replication connection is accepted, so the branch was one DSN option
+// away from starting a chain on one shard's changes only. A written
+// invariant nobody checks is indistinguishable from one that holds; this
+// is the check.
+//
+// The one exemption, stated: a trigger-CDC source ([ir.CDCTriggers]).
+// Its fulls carry no position BY CONSTRUCTION — no trigger engine
+// implements [irbackup.PositionCapturer], its reader anchors at the
+// change log's current MAX(id) when handed an empty position — so the
+// from-now branch is the only chain shape those engines have today.
+// That is the same gap class (the window between the full's read and the
+// incremental's anchor is uncovered), pre-existing, and filed as its own
+// item rather than closed here by refusing every trigger-engine chain.
+func resumeStartFromParent(ctx context.Context, store irbackup.Store, src ir.Engine, parent *irbackup.Manifest, parentPath string) (ir.Position, error) {
+	if !positionEmpty(parent.EndPosition) {
 		return parent.EndPosition, nil
+	}
+	if parent.Kind != irbackup.BackupKindIncremental {
+		if src.Capabilities().CDC == ir.CDCTriggers {
+			return ir.Position{}, nil
+		}
+		return ir.Position{}, fmt.Errorf("%s: parent full %s (%s) records no EndPosition, so there is no position for this "+
+			"chain to resume from; extending it would start the chain from the source's CURRENT position and silently "+
+			"skip every change between the full's read and now. A full recorded without a position cannot root a "+
+			"chain on this source (a PlanetScale Neki router, a MySQL server whose binlog was off, or a pre-v0.17.2 "+
+			"full): take a fresh `backup full` on a source that records one and start a new chain: %w",
+			positionlessFullRootMarker, lineage.ManifestBackupID(parent), parentPath, ir.ErrPositionInvalid)
 	}
 	chain, err := lineage.BuildLineageChain(ctx, store, nil)
 	if err != nil {
@@ -89,6 +124,10 @@ func nearestAncestorPosition(chain []lineage.SegmentRecord, parentID string) (po
 	}
 	return ir.Position{}, "", false
 }
+
+// positionlessFullRootMarker is the grep-stable handle on the refusal above
+// (same convention as POSITION-MODE / FOREIGN-LINEAGE-REFUSED).
+const positionlessFullRootMarker = "POSITIONLESS-FULL-ROOT"
 
 func positionEmpty(p ir.Position) bool {
 	return p.Engine == "" && p.Token == ""

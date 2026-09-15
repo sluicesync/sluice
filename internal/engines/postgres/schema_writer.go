@@ -37,9 +37,15 @@ type SchemaWriter struct {
 	db     *sql.DB
 	schema string
 	// isNeki records that this writer's target is a PlanetScale Neki router,
-	// probed once per server at open (neki_probe.go). It gates ONE thing:
-	// whether standalone-sequence creation may use a transaction. See
-	// [SchemaWriter.createAndPrimeSequence].
+	// probed once per server at open (neki_probe.go). It gates: whether
+	// standalone-sequence creation may use a transaction
+	// ([SchemaWriter.createAndPrimeSequence]); the online-DDL index route
+	// ([SchemaWriter.buildOneIndex], ADR-0184); skipping the index-build
+	// tuning probe ([SchemaWriter.resolveIndexBuildConcurrency]); and the
+	// control-table / topology placement doors (neki_placement.go,
+	// neki_topology.go). `TestEveryNekiFlagIsWiredAtConstruction` holds the
+	// construction sites; this list is maintained by hand and has been
+	// wrong before (it said "ONE thing" through four additions).
 	isNeki bool
 	// hasPostGIS is set at engine open time via detectPostGIS. When
 	// true, ir.Geometry columns emit as `geometry(<subtype>, <srid>)`;

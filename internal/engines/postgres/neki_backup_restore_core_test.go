@@ -424,9 +424,10 @@ var nekiCataloguedHazards = map[string]string{
 		"this out at provisioning time (readShardUIDs/has_writable_primary); seeing it mid-run means a shard lost " +
 		"its primary DURING the arm.",
 	"53300": "too many connections. This is the concurrent-COPY ceiling: sluice paces a Neki target to " +
-		"nekiConcurrentCopyLimit concurrent COPYs and the platform admits more than that (a floor of 12 was " +
-		"measured, never a refusal) — so a 53300 HERE means either the pacing did not reach this door or the " +
-		"platform's admission dropped.",
+		"nekiConcurrentCopyLimit concurrent COPYs, which is EXACTLY the platform's admitted limit (`limit: 4`, " +
+		"measured 2026-09-15 by the copy-limit arm; the earlier 'floor of 12' was an artifact of deferred " +
+		"refusal) — so a 53300 HERE means the pacing did not reach this door (a lane resolving its axes " +
+		"without the product ceiling) or the platform's admission dropped below 4.",
 	"57014": "statement timeout. Neki caps DDL at 30 s, which is why ADR-0184 splits an index build into one ALTER " +
 		"per index; a 57014 in the INDEX phase is that wall being met by an unsplit build.",
 	"42501": "insufficient privilege — the role this run minted lacks something. See mintDSN: the fixture's role " +

@@ -778,13 +778,15 @@ func (b *BackupStream) newRolloverLoop(ctx context.Context) (*rolloverInit, erro
 	if err := backup.RefuseRedactedChainExtension(parent, parentPath, "backup stream"); err != nil {
 		return nil, err
 	}
-	startPos, err := resumeStartFromParent(ctx, b.Store, parent, parentPath)
+	startPos, err := resumeStartFromParent(ctx, b.Store, b.Source, parent, parentPath)
 	if err != nil {
 		return nil, fmt.Errorf("stream: %w", err)
 	}
 	if startPos.Engine == "" && startPos.Token == "" {
+		// Trigger-CDC sources only (see resumeStartFromParent's exemption);
+		// every other positionless full was refused above.
 		slog.WarnContext(
-			ctx, "stream: parent manifest has no EndPosition; chain will start from CDC's current position",
+			ctx, "stream: parent full has no EndPosition (a trigger-CDC source records none); chain will start from the change log's current position, so changes between the full's read and now are not in this chain",
 			slog.String("parent_path", parentPath),
 		)
 	}

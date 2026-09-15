@@ -17,6 +17,9 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
+
+	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // Tier-2 coverage: `sluice restore` INTO a sharded Neki, and `sluice backup
@@ -192,6 +195,20 @@ func nekiBackupFromShardedSource(ctx context.Context, t *testing.T, db *sql.DB, 
 			nekiChunkCount(res.manifest), res.manifest.EndPosition.Engine, res.manifest.EndPosition.Token,
 			res.manifest.PartialState, res.rawCopyNote)
 
+		// The v0.153.1 fix's contract on the real router, asserted rather
+		// than logged: the manifest finalized (complete, not partial) and
+		// its EndPosition is EMPTY — not zero-valued, not a per-shard
+		// position leaked through a targeted session. A non-empty value
+		// here would be a position the chain extenders would trust.
+		if res.manifest.PartialState != irbackup.BackupStateComplete {
+			t.Errorf("manifest partial_state = %q; want %q (the backup did not finalize)",
+				res.manifest.PartialState, irbackup.BackupStateComplete)
+		}
+		if res.manifest.EndPosition != (ir.Position{}) {
+			t.Errorf("manifest EndPosition = %+v; want EMPTY on a Neki source — a recorded position here is one "+
+				"`backup incremental` would resume from, and the router has no cluster-wide position to give",
+				res.manifest.EndPosition)
+		}
 		if !strings.Contains(res.rawCopyNote, "declined=true") {
 			t.Errorf("the Postgres row reader did NOT decline the raw-copy lane against this Neki source (%s). "+
 				"The router refuses `COPY (SELECT …) TO` with NK013, so a backup taking that lane would die "+

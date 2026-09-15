@@ -1353,12 +1353,15 @@ func (b *Backup) openSnapshotOrFallback(ctx context.Context, schema *ir.Schema, 
 		//
 		// The alternative — copy the rows and deliberately record NO
 		// EndPosition, the shape an engine without a PositionCapturer
-		// already produces — was rejected: a positionless FULL root is
-		// extended "from now" with a WARN (see the v0.16.x
-		// compatibility branch in incremental.go), so it would trade
+		// already produces — was rejected: a positionless FULL root
+		// was extended "from now" with a WARN, so it would have traded
 		// this loud failure for a silent chain gap, which the tenets
-		// rank strictly worse. Offering it needs an explicit opt-in AND
-		// a refusal on extending a positionless root; filed, not built.
+		// rank strictly worse. Since v0.153.1 the refusal half exists:
+		// resumeStartFromParent (pipeline/resume_start.go) refuses to
+		// extend a positionless full on any non-trigger source
+		// (POSITIONLESS-FULL-ROOT), so the Neki path below records an
+		// empty position safely. The opt-in half (a standby full that
+		// KNOWS it cannot chain) is still not built; this door stays.
 		//
 		// Keyed on the shared error CODE, not an engine type: any engine
 		// that codes a standby refusal gets this door, and the pipeline
@@ -1471,11 +1474,14 @@ func (b *Backup) captureEndPosition(ctx context.Context, manifest *irbackup.Mani
 		// because an operator who expects to chain incrementals off this
 		// full needs to learn here, not at the first `backup incremental`.
 		// Every OTHER capture failure stays a refusal: a lost position on a
-		// source that has one is the silent half.
+		// source that has one is the silent half. The WARN's promise is
+		// enforced, not assumed: `backup incremental` / `backup stream`
+		// refuse a positionless full root (resumeStartFromParent,
+		// POSITIONLESS-FULL-ROOT) rather than starting "from now".
 		if errors.Is(err, irbackup.ErrPositionUnavailable) {
 			slog.WarnContext(
 				ctx, "backup: this source cannot provide a CDC position, so the manifest's EndPosition is empty; "+
-					"no `backup incremental` can chain off this full on this source",
+					"`backup incremental` and `backup stream` refuse to chain off this full (POSITIONLESS-FULL-ROOT)",
 				slog.String("engine", b.Source.Name()),
 				slog.String("reason", err.Error()),
 			)
