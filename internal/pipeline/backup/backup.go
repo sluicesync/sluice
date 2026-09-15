@@ -674,8 +674,11 @@ func (b *Backup) Run(ctx context.Context) error {
 	sink.PhaseStarted(backupPhaseFinalize)
 
 	// 4.5. Record EndPosition — anchored-resume adoption / snapshot-
-	// anchored / v0.17.x post-sweep fallback (see recordEndPosition).
-	if err := b.recordEndPosition(ctx, manifest, adopting, resumeAnchor, snapshotPos, snap); err != nil {
+	// anchored / v0.17.x post-sweep fallback (see recordEndPosition) —
+	// then stamp a full that finalized WITHOUT one FormatVersion 11 so
+	// older readers refuse to chain off it (stampPositionlessFull). Both
+	// before ComputeBackupID, which folds on the recorded version.
+	if err := b.finalizeEndPosition(ctx, manifest, committer, adopting, resumeAnchor, snapshotPos, snap); err != nil {
 		return err
 	}
 
@@ -940,6 +943,62 @@ func (b *Backup) logResumePlan(ctx context.Context, schema *ir.Schema, prior *ir
 		slog.Int("tables_already_complete", len(alreadyComplete)),
 		slog.Any("tables_to_resume", toResume),
 	)
+	return nil
+}
+
+// finalizeEndPosition is step 4.5 of [Backup.Run]: record the end
+// position, then stamp the manifest if that position came back empty.
+// One call so the two can never be reordered — the stamp keys on the
+// FINAL EndPosition, whichever recordEndPosition path produced it.
+func (b *Backup) finalizeEndPosition(ctx context.Context, manifest *irbackup.Manifest, committer *manifestCommitter, adopting bool, resumeAnchor ir.Position, snapshotPos *ir.Position, snap *irbackup.Snapshot) error {
+	if err := b.recordEndPosition(ctx, manifest, adopting, resumeAnchor, snapshotPos, snap); err != nil {
+		return err
+	}
+	return b.stampPositionlessFull(manifest, committer)
+}
+
+// stampPositionlessFull applies [irbackup.StampPositionlessFull] at the
+// one point a full's final EndPosition is known, and carries the raised
+// version through the committer.
+//
+// The committer is told because finalize restores the version it captured
+// before the sweep (raiseFinalVersion's doc has the why) — told the TIER,
+// not the manifest's current value: in sidecar mode that value is the
+// in-progress stamp, and lifting the final version to it would finalize
+// every unstamped full at the sidecar tier.
+//
+// This is the ONLY format stamp applied after chunks are sealed, and that
+// is what the refusal below is about. Every other tier is decided before
+// the sweep, so the version a chunk's GCM AAD and the chain-CEK wrap were
+// derived from is the version the finalized manifest records. Raising the
+// version afterwards is safe only when it crosses no AAD encoding gate:
+// from [irbackup.FormatVersionInjectiveChunkAAD] up, ChunkAAD and
+// CEKBinding render identically at every version, so a fresh encrypted
+// run (stamped 9 by setupChainEncryption) raises cleanly. Below it — an
+// encrypted run RESUMED from a pre-v0.104.0 attempt, which keeps that
+// attempt's tier so its kept chunks still open — the raise would switch
+// the reader onto an encoding those chunks were never sealed under, and
+// the full would fail authenticated decryption on every restore. Leaving
+// it unstamped instead would hand older binaries the "extend from now"
+// hazard the stamp exists to close. Neither is acceptable, so the run
+// refuses, naming the remedy. The boundary is not a constant restated
+// here: TestBackup_PositionlessFullRefusalBoundaryIsTheAADEncodingBoundary
+// derives it from the AAD renderers themselves.
+func (b *Backup) stampPositionlessFull(manifest *irbackup.Manifest, committer *manifestCommitter) error {
+	cdc := b.Source.Capabilities().CDC
+	if !irbackup.IsPositionlessFull(manifest, cdc) {
+		return nil
+	}
+	if manifest.ChainEncryption != nil && manifest.FormatVersion < irbackup.FormatVersionInjectiveChunkAAD {
+		return fmt.Errorf("backup: this full finished without a CDC end position on a source whose incrementals resume "+
+			"from one, so it must be written at manifest format version %d (POSITIONLESS-FULL-ROOT) for older sluice "+
+			"binaries to refuse chaining off it — but it resumed an encrypted run written at format version %d, whose "+
+			"chunks are sealed under an AAD encoding format version %d does not open. Refusing rather than writing a "+
+			"full that is either unrestorable or silently extendable from now; start a fresh full with --force-overwrite",
+			irbackup.FormatVersionPositionlessFull, manifest.FormatVersion, irbackup.FormatVersionPositionlessFull)
+	}
+	irbackup.StampPositionlessFull(manifest, cdc)
+	committer.raiseFinalVersion(irbackup.FormatVersionPositionlessFull)
 	return nil
 }
 

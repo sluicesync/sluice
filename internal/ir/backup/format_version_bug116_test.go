@@ -139,16 +139,17 @@ func TestChooseFormatVersion_Bug116(t *testing.T) {
 }
 
 // TestBackupFormatVersion_Bumped pins the version ladder: the build
-// ceiling is the redaction-marker version, the injective-chunk-AAD,
-// standalone-sequences, ADR-0086 in-progress sidecar and Bug 116
-// security-metadata versions keep their historical slots, and the
-// legacy value is frozen. If a future change reorders these without
-// updating the chooseFormatVersion / sidecar / chunk-binding contracts,
-// this test catches the regression at build time.
+// ceiling is the positionless-full version, the redaction-marker,
+// injective-chunk-AAD, standalone-sequences, ADR-0086 in-progress
+// sidecar and Bug 116 security-metadata versions keep their historical
+// slots, and the legacy value is frozen. If a future change reorders
+// these without updating the chooseFormatVersion / sidecar /
+// chunk-binding contracts, this test catches the regression at build
+// time.
 func TestBackupFormatVersion_Bumped(t *testing.T) {
-	if BackupFormatVersion != FormatVersionRedaction {
-		t.Errorf("BackupFormatVersion = %d; want FormatVersionRedaction=%d (current ceiling)",
-			BackupFormatVersion, FormatVersionRedaction)
+	if BackupFormatVersion != FormatVersionPositionlessFull {
+		t.Errorf("BackupFormatVersion = %d; want FormatVersionPositionlessFull=%d (current ceiling)",
+			BackupFormatVersion, FormatVersionPositionlessFull)
 	}
 	// The ladder is strictly ascending — the AAD gates are `>=` comparisons,
 	// so a reordered constant would silently reroute a whole tier's chunks
@@ -160,6 +161,14 @@ func TestBackupFormatVersion_Bumped(t *testing.T) {
 	if FormatVersionRedaction <= FormatVersionInjectiveChunkAAD {
 		t.Errorf("FormatVersionRedaction (%d) must be strictly greater than FormatVersionInjectiveChunkAAD (%d)",
 			FormatVersionRedaction, FormatVersionInjectiveChunkAAD)
+	}
+	// Above the redaction tier, not beside it: an 11-stamped manifest must
+	// still take the redaction fold in ComputeBackupID (a redacted
+	// positionless full carries both), which the `>=` gate only gives it
+	// from above.
+	if FormatVersionPositionlessFull <= FormatVersionRedaction {
+		t.Errorf("FormatVersionPositionlessFull (%d) must be strictly greater than FormatVersionRedaction (%d)",
+			FormatVersionPositionlessFull, FormatVersionRedaction)
 	}
 	if FormatVersionLegacy != 1 {
 		t.Errorf("FormatVersionLegacy = %d; must stay 1 (load-bearing for older-binary preflight semantics)", FormatVersionLegacy)

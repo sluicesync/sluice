@@ -521,13 +521,22 @@ jobs:
   # prefix or the -run filter below silently skips it (enforced by
   # scripts/check-run-filter-coverage.sh in ci.yml's Lint job; keep that
   # script's manifest in sync with this filter).
+  #
+  # TWO suites share the leg since the FormatVersion-11 bump (audit
+  # 2026-09-15 F-2): internal/pipeline's chain-compat suite and
+  # internal/pipeline/backup's TestBackup_CrossVersionPositionlessFull,
+  # which pins the one tier no `backup full` flag can reach — it is stamped
+  # by the SHAPE of the source (a MySQL server with its binary log off), so
+  # it boots its own mysql:8.0 containers rather than the PG image below.
+  # Both guards count 2 accordingly; a third suite bumps them again.
   crossversion:
     name: Cross-version backup compat
     if: ${{ github.event_name == 'schedule' || github.event.inputs.suite == 'all' || github.event.inputs.suite == 'crossversion' }}
     runs-on: ubuntu-latest
-    # 40, not 30: the peer axis (cell 6) added a fourth tag build and a
-    # sixth cell, each with its own full + incremental + restore.
-    timeout-minutes: 40
+    # 45, not 40: the positionless-full suite adds two MySQL boots and one
+    # incremental window on top of the peer axis (cell 6), which itself
+    # added a fourth tag build and a sixth cell.
+    timeout-minutes: 45
     env:
       TESTCONTAINERS_RYUK_DISABLED: "true"
     steps:
@@ -549,9 +558,9 @@ jobs:
       # contract is read inside the test body, not at list time).
       - name: Assert the -run filter matches the suite (vacuous-green guard)
         run: |
-          matched=$(go test -tags='integration crossversion' -list '^TestBackup_CrossVersion' ./internal/pipeline/ | grep -c '^Test' || true)
-          if [ "$matched" -ne 1 ]; then
-            echo "::error::crossversion: -run filter matches ${matched} top-level tests, expected 1. A rename emptied the filter (0) or a new cross-version test joined the leg (>1) — update the filter, this guard, and scripts/check-run-filter-coverage.sh together."
+          matched=$(go test -tags='integration crossversion' -list '^TestBackup_CrossVersion' ./internal/pipeline/ ./internal/pipeline/backup/ | grep -c '^Test' || true)
+          if [ "$matched" -ne 2 ]; then
+            echo "::error::crossversion: -run filter matches ${matched} top-level tests, expected 2 (chain-compat + positionless-full). A rename emptied the filter or a cross-version test joined/left the leg — update the filter, this guard, and scripts/check-run-filter-coverage.sh together."
             exit 1
           fi
 
@@ -568,16 +577,16 @@ jobs:
       - name: Run the cross-version backup-compatibility gate
         run: |
           set -o pipefail
-          go test -tags='integration crossversion' -count=1 -timeout=25m \
-            -run '^TestBackup_CrossVersion' -v ./internal/pipeline/ 2>&1 | tee crossversion.out
+          go test -tags='integration crossversion' -count=1 -timeout=30m \
+            -run '^TestBackup_CrossVersion' -v ./internal/pipeline/ ./internal/pipeline/backup/ 2>&1 | tee crossversion.out
           # Second half of the guard, mirroring the vstream-pipeline leg: a
-          # t.Skip greens `go test` while executing nothing. (The four cells
-          # have their OWN ledger inside the test — a cell that never runs
-          # fails the parent by name — so this outer check is specifically
-          # for the case where the whole suite silently didn't.)
+          # t.Skip greens `go test` while executing nothing. (Each suite's
+          # cells have their OWN ledger inside the test — a cell that never
+          # runs fails the parent by name — so this outer check is
+          # specifically for the case where a whole suite silently didn't.)
           passed=$(grep -c '^--- PASS: TestBackup_CrossVersion' crossversion.out || true)
-          if [ "$passed" -ne 1 ]; then
-            echo "::error::crossversion: ${passed} top-level tests PASSed, expected 1 — the suite was skipped or didn't run (vacuous green). See the run log."
+          if [ "$passed" -ne 2 ]; then
+            echo "::error::crossversion: ${passed} top-level tests PASSed, expected 2 — a suite was skipped or didn't run (vacuous green). See the run log."
             exit 1
           fi
 

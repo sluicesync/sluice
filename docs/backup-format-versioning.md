@@ -115,9 +115,39 @@ Every backup chain root manifest carries a `FormatVersion` field:
   **without** `--redact` records no member, keeps its schema-derived version,
   and is byte-identical to what the same backup produced before the field
   existed — so ordinary chains stay readable by older binaries.
+- **`FormatVersion=11`** — a **positionless full**: a `backup full` that
+  finalized with an **empty `EndPosition`** on a source whose CDC reader
+  resumes from a recorded position — a PlanetScale Neki router (no
+  cluster-wide WAL position to give) or a MySQL server whose binary log was
+  off (`v0.154.0+`, audit 2026-09-15 F-2). Since v0.153.1 `backup incremental`
+  and `backup stream` refuse to chain off such a full (`POSITIONLESS-FULL-ROOT`,
+  see [cdc-streaming.md](operator/cdc-streaming.md)) — but that refusal lives
+  in the *reading* binary, and the artifact recorded nothing an older reader
+  would trip over: a pre-v0.153.1 binary reads the empty position as a
+  v0.16.x legacy full and extends the chain from the source's *current*
+  position after a WARN, silently skipping every change between the full's
+  read and the incremental's open. It is the Bug-116 class with the dropped
+  field being the *absence* of one. The bump makes every pre-v0.154.0 reader
+  refuse the manifest loudly at its own ceiling instead. Proportional as
+  always, and this tier is the narrowest yet: a full that records a position
+  (every Postgres primary, every MySQL server with `log_bin` on), every
+  incremental, every trigger-CDC full (`postgres-trigger`, `sqlite-trigger`,
+  `d1-trigger` record no position *by construction* and their chains anchor at
+  the change log on every binary — stamping them would lock older readers out
+  for no protection), and every full from a CDC-less source (nothing could
+  extend it) keep their feature-minimum version. A Neki or binlog-off full is
+  a complete, restorable backup on its own — it just needs a v0.154.0+ binary
+  to restore it, and can root a chain on none. One refusal comes with it: the
+  stamp is the only version raise applied *after* a full's chunks are sealed,
+  so an encrypted `backup full` that **resumes an attempt written before
+  v0.104.0** (whose kept chunks are sealed under an older AAD encoding that
+  version 11 does not open) and then finishes without a position refuses at
+  finalize instead of writing a full that is either unrestorable or silently
+  extendable. Start a fresh full with `--force-overwrite`.
 
 If your backups don't use RLS, EXCLUDE constraints, or standalone
-sequences, and you don't encrypt or sign, you'll never see a version
+sequences, you don't encrypt, sign or redact, and your source records a
+CDC position (or has no CDC at all), you'll never see a version
 above 1 on a finalized manifest and cross-version restore behaves
 exactly as it did pre-v0.94.1. If your backups *do* use any of them,
 you get the guarantee that older sluice can't silently land a restored

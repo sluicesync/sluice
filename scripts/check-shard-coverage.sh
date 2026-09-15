@@ -57,15 +57,16 @@ internal/notify/...
 
 # Entries that mirror ci.yml shard entries carrying NO integration-
 # tagged tests today: the engines-postgres-and-rest shard deliberately
-# bundles the small packages, and the pipeline shard lists
-# internal/pipeline/backup explicitly, so future integration tests
-# there run without a ci.yml edit. Declared BY NAME (spelled exactly as
-# in COVERED_PACKAGES) so the reverse check stays strict for everything
-# else — and self-tidying: an entry here that GAINS integration tests
-# fails below until it is promoted out, and an entry whose directory
-# disappears fails the tracked-Go-files check like any other entry.
+# bundles the small packages so future integration tests there run
+# without a ci.yml edit. (internal/pipeline/backup was listed here
+# until the FormatVersion-11 cross-version suite gave it its first
+# integration-tagged file, 2026-09-15; the strict reverse check covers
+# it now.) Declared BY NAME (spelled exactly as in COVERED_PACKAGES) so
+# the reverse check stays strict for everything else — and
+# self-tidying: an entry here that GAINS integration tests fails below
+# until it is promoted out, and an entry whose directory disappears
+# fails the tracked-Go-files check like any other entry.
 DEFENSIVE_PACKAGES="
-internal/pipeline/backup
 internal/ir/...
 internal/redact/...
 internal/crypto/...

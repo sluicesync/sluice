@@ -63,7 +63,9 @@
 # a v0.104.3 operator hit, and it needs a binary that shares this build's
 # BackupFormatVersion — otherwise the version gate refuses first and the
 # fingerprint is never reached. Hence a FOURTH binary, derived as the
-# newest tag at the same format version, minus the known orphan epochs.
+# newest tag at the same format version, minus the known orphan epochs —
+# or, on a fresh proportional bump no release carries yet, the newest
+# release below it (see the peer block for why that stays loud).
 #
 # Environment overrides (all default OUTSIDE the repo, so nothing here
 # needs a .gitignore entry and no sweep over the working tree ever walks a
@@ -177,11 +179,13 @@ git worktree add --detach "$epoch_worktree" "$epoch_tag" >/dev/null
 # The SAME-FORMAT PEER tag (roadmap item 104 / Bug 216).
 #
 # Derived, like OLD: the newest tag whose BackupFormatVersion EQUALS the
-# working tree's. Equality is the point — the peer cell asserts that a
-# chain THIS build writes still restores on the previous release, and a
-# peer at a lower format would refuse on the version gate before the
-# schema fingerprint is ever recomputed, turning the cell into a
-# restatement of cell 2.
+# working tree's. Equality is the preference — the peer cell asserts that
+# a chain THIS build writes still restores on the previous release, and a
+# peer below a version that chain actually stamps would refuse on the
+# version gate before the schema fingerprint is ever recomputed, turning
+# the cell into a restatement of cell 2. That condition is checked per
+# manifest inside cell 6, not assumed from the tag, so the fresh-bump
+# fallback below cannot make the cell vacuous.
 #
 # THE EXCLUSION LIST IS THE ORPHAN EPOCHS. A release whose fingerprint
 # nobody else reproduces cannot serve as the peer: it would fail the cell
@@ -210,14 +214,44 @@ if [ -z "$peer_tag" ]; then
 	done
 fi
 
+# A FRESH, PROPORTIONAL FORMAT BUMP (the FormatVersion-11 case, audit
+# 2026-09-15 F-2). Until a release ships at the working tree's format, no
+# tag equals it. That used to be a refusal here — which also stopped OLD
+# and NEW from being built, so NO cross-version cell could run in exactly
+# the window before the bump's own tag, when the gate matters most. Since
+# every bump from 10 up is proportional (only the manifests that carry
+# the feature are stamped), the chain cell 6 writes is usually still at
+# a version the newest release reads. So the peer falls back to the
+# newest non-orphan release BELOW the working tree's format, and the
+# question "can this peer reach the fingerprint check at all?" moves to
+# where the evidence is: cell 6 reads every manifest its chain actually
+# stamped and fails by name if one sits above the peer's ceiling. Loud,
+# never vacuous, and it re-arms to a same-format peer the moment one ships.
 if [ -z "$peer_tag" ]; then
-	echo "::error::crossversion-build: no released tag stamps BackupFormatVersion=$new_version (excluding the orphan epochs: $peer_exclude), so the same-format peer cell has nothing to run against. This is what a FRESH FORMAT BUMP looks like: until a release ships at this format, no older binary can read this build's chains at all and the fingerprint direction is untestable from outside. Ship the bump, then this derivation re-arms itself on the next run. To run the suite deliberately without the peer cell in the meantime, set CROSSVER_PEER_TAG to a same-format tag by hand — there is no skip flag, on purpose."
+	for t in $(git tag --list 'v*' --sort=-v:refname); do
+		skip=
+		for x in $peer_exclude; do
+			[ "$t" = "$x" ] && skip=1 && break
+		done
+		[ -n "$skip" ] && continue
+		v=$(git show "$t:$manifest_file" 2>/dev/null | read_format_version || true)
+		[ -n "$v" ] || continue
+		if [ "$v" -lt "$new_version" ]; then
+			peer_tag=$t
+			echo "crossversion-build: no released tag stamps BackupFormatVersion=$new_version yet (a fresh bump); the same-format peer falls back to $t (BackupFormatVersion=$v) and cell 6 checks every manifest it writes against that ceiling" >&2
+			break
+		fi
+	done
+fi
+
+if [ -z "$peer_tag" ]; then
+	echo "::error::crossversion-build: no released tag at or below BackupFormatVersion=$new_version (excluding the orphan epochs: $peer_exclude) — the peer cell has nothing to run against. The tags are probably missing from this checkout (the workflow needs fetch-depth: 0). There is no skip flag, on purpose."
 	exit 1
 fi
 
 peer_version=$(git show "$peer_tag:$manifest_file" | read_format_version)
-if [ "$peer_version" != "$new_version" ]; then
-	echo "::error::crossversion-build: peer tag $peer_tag stamps BackupFormatVersion=$peer_version, not the working tree's $new_version — the peer cell would assert a version refusal instead of the fingerprint compatibility it exists for."
+if [ -z "$peer_version" ] || [ "$peer_version" -gt "$new_version" ]; then
+	echo "::error::crossversion-build: peer tag $peer_tag stamps BackupFormatVersion=${peer_version:-?}, above the working tree's $new_version — it is not a previous release of this format."
 	exit 1
 fi
 

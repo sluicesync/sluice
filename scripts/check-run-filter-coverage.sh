@@ -40,7 +40,10 @@
 #   - crossversion   → extended-suites.yml `crossversion` (roadmap item 90 /
 #                      Bug 212: the previous RELEASE's binary and the working
 #                      tree's, run against ONE backup chain. The only suite
-#                      here that is not one binary reading its own output)
+#                      here that is not one binary reading its own output.
+#                      Two packages since the FormatVersion-11 bump: the
+#                      pipeline chain-compat suite and the backup package's
+#                      positionless-full suite, one leg, one -run filter)
 #   - mariadbpreview → ci.yml `integration-mariadb-preview` (INFORMATIONAL,
 #                      continue-on-error; the MariaDB 13.1 preview-line
 #                      native-uuid/inet canary — roadmap item 73 matrix
@@ -73,7 +76,7 @@ vitessreshard;^TestVitessReshard_;internal/engines/mysql/...;extended-suites.yml
 vitesscluster!chaos;TestVitessCluster;internal/engines/mysql/...;vitess-version-matrix.yml cluster (weekly default)
 ddlfixture;^TestDDLFixture;internal/translate/...;extended-suites.yml ddlfixture
 kmsverify;^TestBackup_KMS;internal/pipeline;extended-suites.yml kmsverify
-crossversion;^TestBackup_CrossVersion;internal/pipeline;extended-suites.yml crossversion
+crossversion;^TestBackup_CrossVersion;internal/pipeline internal/pipeline/backup;extended-suites.yml crossversion
 mariadbpreview;^TestMariaDB_Preview_;internal/engines/mysql/...;ci.yml integration-mariadb-preview
 psverify;^TestPS;internal/planetscale/... internal/engines/mysql internal/engines/postgres internal/pipeline;psverify.yml psverify
 nekiverify;^TestNekiverify;internal/engines/postgres;nekiverify.yml nekiverify

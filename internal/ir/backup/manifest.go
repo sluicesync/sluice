@@ -243,7 +243,24 @@ import (
 // redaction is byte-identical to what this build wrote before the field
 // existed and keeps its feature-minimum version, so ordinary backups
 // still restore on older binaries.
-const BackupFormatVersion = 10
+// v0.154.0+ introduces FormatVersion=11 for a POSITIONLESS FULL — a full
+// backup that finalized with an empty EndPosition on a source whose CDC
+// reader resumes from a recorded position (audit 2026-09-15 F-2). The
+// refusal that keeps such a full from rooting a chain
+// (POSITIONLESS-FULL-ROOT, v0.153.1) lives in the READING binary, and
+// the artifact carried nothing an older reader would trip over: a
+// v0.148.0 build handed a v0.153.1-written positionless full WARNed and
+// extended the chain "from now", silently skipping every change between
+// the full's read and the incremental's open — the exact gap the
+// refusal exists to stop. The Bug-116 class again, with the dropped
+// "field" being the ABSENCE of one: an older binary reads the empty
+// position as a v0.16.x legacy full and takes the legacy branch. The
+// bump makes every pre-v0.154.0 reader refuse the manifest at its own
+// ceiling instead. Proportional as always: a full that records a
+// position, every incremental, and every trigger-CDC or CDC-less full
+// (positionless BY CONSTRUCTION, and never extended from a recorded
+// position by any binary) keep their feature-minimum version.
+const BackupFormatVersion = 11
 
 // FormatVersionLegacy / FormatVersionSecurityMetadata name the
 // historically-recorded values so callers don't sprinkle bare ints
@@ -371,6 +388,35 @@ const (
 	// tiers: a redacted backup is stamped 10 whether plaintext,
 	// encrypted, or signed.
 	FormatVersionRedaction = 10
+
+	// FormatVersionPositionlessFull is the version stamped on a FULL
+	// manifest that finalized with an EMPTY [Manifest.EndPosition] on a
+	// source whose CDC reader resumes from a recorded position — a
+	// PlanetScale Neki router (no cluster-wide WAL position to give), a
+	// MySQL server whose binary log was off, and the shapes to come. It
+	// is the artifact-side half of POSITIONLESS-FULL-ROOT: the reader
+	// refusal (pipeline/resume_start.go, v0.153.1) protects only readers
+	// that carry it, and every older binary reads an empty position as a
+	// v0.16.x legacy full and extends the chain "from now" after a WARN,
+	// silently skipping the changes in between. Stamped above every
+	// older ceiling, the manifest is refused at [lineage.ReadManifest]'s
+	// version check by any pre-v0.154.0 reader — `backup incremental`,
+	// `backup stream`, restore and verify alike — rather than chained.
+	//
+	// Stamped ONLY when the hazard is present, via
+	// [StampPositionlessFull]. Two exemptions, stated: a trigger-CDC
+	// source ([ir.CDCTriggers]) records no position on a full BY
+	// CONSTRUCTION and its chains anchor at the change log's current id
+	// on every binary, so stamping would lock older readers out of every
+	// trigger-engine backup for no protection; and a CDC-less source
+	// ([ir.CDCNone]) has no change stream any binary could extend the
+	// full with, so there is no chain gap to prevent — only restore
+	// compatibility to lose. Both keep their feature-minimum version.
+	// Independent of the encryption/signing/redaction tiers: a
+	// positionless full is stamped 11 whatever else it carries. And a
+	// positionless full at an OLDER recorded version is one a pre-bump
+	// binary wrote — exactly what the reader refusal still exists for.
+	FormatVersionPositionlessFull = 11
 )
 
 // StampCDCPositionBinding raises m.FormatVersion to
@@ -399,6 +445,51 @@ func StampRedaction(m *Manifest) {
 	if m != nil && m.Redaction != nil {
 		m.FormatVersion = max(m.FormatVersion, FormatVersionRedaction)
 	}
+}
+
+// StampPositionlessFull raises m.FormatVersion to
+// [FormatVersionPositionlessFull] when m is a FULL manifest whose
+// EndPosition is empty and the source's CDC method is one whose reader
+// resumes from a recorded position, so older binaries refuse the
+// manifest at their version ceiling rather than extend the chain "from
+// now". cdc is the SOURCE engine's [ir.Capabilities.CDC] — the writer
+// has the engine in hand; the manifest records only its name.
+//
+// Idempotent, and a no-op for every shape that is not the hazard: a
+// full that records a position, an incremental (an empty EndPosition
+// there is a quiet or DDL-only window, resolved by walking to the
+// nearest positioned ancestor), a trigger-CDC full (positionless by
+// construction on every binary), and a CDC-less full (no change stream
+// to extend it with). Each keeps its feature-minimum version.
+//
+// MUST be called after EndPosition is final and before [ComputeBackupID]
+// — the id folds on the recorded version (the redaction fold at 10+
+// applies to an 11-stamped manifest), so stamping after the id is
+// computed would leave the two disagreeing.
+func StampPositionlessFull(m *Manifest, cdc ir.CDCMethod) {
+	if IsPositionlessFull(m, cdc) {
+		m.FormatVersion = max(m.FormatVersion, FormatVersionPositionlessFull)
+	}
+}
+
+// IsPositionlessFull reports whether m is the shape
+// [StampPositionlessFull] stamps: a FULL manifest with an empty
+// EndPosition from a source whose CDC reader resumes from a recorded
+// position. Exported so a writer can decide BEFORE raising the version
+// whether the raise is safe for what it already sealed (see
+// Backup.stampPositionlessFull in pipeline/backup).
+func IsPositionlessFull(m *Manifest, cdc ir.CDCMethod) bool {
+	if m == nil || canonicalKind(m.Kind) != BackupKindFull {
+		return false
+	}
+	if m.EndPosition.Engine != "" || m.EndPosition.Token != "" {
+		return false
+	}
+	switch cdc {
+	case ir.CDCTriggers, ir.CDCNone:
+		return false
+	}
+	return true
 }
 
 // chooseFormatVersion returns the smallest manifest format version
@@ -459,6 +550,7 @@ var minimumReaderVersion = map[int]string{
 	FormatVersionCDCPositionBinding:    "v0.99.228",
 	FormatVersionInjectiveChunkAAD:     "v0.104.0",
 	FormatVersionRedaction:             "v0.144.0",
+	FormatVersionPositionlessFull:      "v0.154.0",
 }
 
 // MinimumReaderVersion names the earliest sluice release that can read a

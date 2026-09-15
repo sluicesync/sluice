@@ -595,8 +595,28 @@ type manifestCommitter struct {
 
 	// finalVersion is the manifest's schema-appropriate format version
 	// ([irbackup.FormatVersionFor]), displaced while in progress by the
-	// sidecar-layout stamp and restored by [finalize].
+	// sidecar-layout stamp and restored by [finalize]. Raised post-sweep
+	// by [raiseFinalVersion] for a stamp that is only decidable once the
+	// end position is known.
 	finalVersion int
+}
+
+// raiseFinalVersion lifts the version [finalize] restores to at least v.
+//
+// Every other tier is stamped on the manifest BEFORE the committer is
+// built and captured into finalVersion there. A stamp that depends on the
+// END POSITION — [irbackup.StampPositionlessFull] — cannot be: on the
+// fallback path the position is captured after the row sweep, by which
+// time finalize would restore the captured value over the stamp and the
+// finalized manifest would silently carry the feature-minimum version.
+// (Pinned by TestBackup_PositionlessFullStampSurvivesFinalize on both
+// committer modes; a memStore run — no Appender — restores nothing, so
+// only the sidecar mode was ever at risk, and it is the mode LocalStore
+// takes on every `backup full --output-dir`.) Idempotent; never lowers.
+func (c *manifestCommitter) raiseFinalVersion(v int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.finalVersion = max(c.finalVersion, v)
 }
 
 // newManifestCommitter builds the committer for one backup run. When
