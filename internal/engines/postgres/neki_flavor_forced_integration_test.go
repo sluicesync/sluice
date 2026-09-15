@@ -229,4 +229,64 @@ func TestPostgresSuite_NekiFlavorForced(t *testing.T) {
 				"a working migration", detail)
 		}
 	})
+
+	t.Run("control-table placement warns and continues when the topology cannot be read", func(t *testing.T) {
+		// On a Neki whose topology sluice cannot read — and on this vanilla
+		// server, which has no __neki schema at all — EnsureControlTable
+		// must still succeed. Refusing would take down an unsharded cluster
+		// whose role merely lacks SELECT on the topology; the consequence
+		// of skipping is a LOUD NK306 on a sharded one, never silent loss.
+		// This pins the WARN-not-refuse decision at every placement door:
+		// the applier bundle, the target-metrics door, the migrate-state
+		// store and the keyset store.
+		applier, err := eng.OpenChangeApplier(ctx, dsn)
+		if err != nil {
+			t.Fatalf("open applier: %v", err)
+		}
+		defer func() { _ = applier.(interface{ Close() error }).Close() }()
+		if err := applier.EnsureControlTable(ctx); err != nil {
+			t.Fatalf("EnsureControlTable with the Neki flavor forced on a server without __neki: %v", err)
+		}
+		if mh, ok := applier.(interface{ EnsureTargetMetricsHistory(context.Context) error }); ok {
+			if err := mh.EnsureTargetMetricsHistory(ctx); err != nil {
+				t.Fatalf("EnsureTargetMetricsHistory: %v", err)
+			}
+		} else {
+			t.Fatal("the applier no longer exposes EnsureTargetMetricsHistory")
+		}
+
+		store, err := eng.OpenMigrationStateStore(ctx, dsn)
+		if err != nil {
+			t.Fatalf("open migrate-state store: %v", err)
+		}
+		defer func() { _ = store.(interface{ Close() error }).Close() }()
+		if err := store.EnsureControlTable(ctx); err != nil {
+			t.Fatalf("migrate-state EnsureControlTable with the Neki flavor forced: %v", err)
+		}
+
+		ks, err := openKeysetStore(ctx, dsn)
+		if err != nil {
+			t.Fatalf("open keyset store: %v", err)
+		}
+		defer func() { _ = ks.Close() }()
+		if err := ks.EnsureKeysetTable(ctx); err != nil {
+			t.Fatalf("EnsureKeysetTable with the Neki flavor forced: %v", err)
+		}
+
+		// Anti-vacuity: the placement was actually reached. The applier
+		// believes it is Neki (asserted above), so the helper ran and took
+		// the read-failure branch; prove the tables exist, i.e. the create
+		// half completed and the placement half did not undo it.
+		db, err := sql.Open("pgx", dsn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = db.Close() }()
+		for _, tbl := range []string{"sluice_cdc_state", "sluice_cdc_skipped_tables", "sluice_migrate_state", "sluice_keysets", "sluice_target_metrics_history"} {
+			var n int
+			if err := db.QueryRowContext(ctx, `SELECT count(*) FROM pg_catalog.pg_tables WHERE tablename = $1`, tbl).Scan(&n); err != nil || n != 1 {
+				t.Errorf("control table %s: present=%d err=%v", tbl, n, err)
+			}
+		}
+	})
 }

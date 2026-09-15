@@ -617,7 +617,8 @@ func (e Engine) OpenMigrationStateStore(ctx context.Context, dsn string) (ir.Mig
 	if err != nil {
 		return nil, err
 	}
-	return newMigrationStateStore(db, cfg.schema), nil
+	isNekiM, _ := probeIsNeki(ctx, cfg.serverKey(), db)
+	return newMigrationStateStore(db, cfg.schema, isNekiM, cfg.serverKey()), nil
 }
 
 // OpenChangeApplier returns a [ChangeApplier] bound to the database

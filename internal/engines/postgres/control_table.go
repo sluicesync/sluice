@@ -644,7 +644,11 @@ func isUndefinedColumnErr(err error) bool {
 func writePositionTx(ctx context.Context, tx *sql.Tx, schema, streamID, token, slotName, publicationName, rowFilterHash, sourceFingerprint, targetSchema string, rowsApplied int64) error {
 	q, args := buildWritePositionSQL(schema, streamID, token, slotName, publicationName, rowFilterHash, sourceFingerprint, targetSchema, rowsApplied)
 	if _, err := tx.ExecContext(ctx, q, args...); err != nil {
-		return fmt.Errorf("postgres: write position: %w", err)
+		// NK306 on the position write is the measured shape of the
+		// control-table half of NEKI-NK306 (the serial lane's data INSERT
+		// succeeded; only sluice's own bookkeeping was refused). Annotated
+		// here because this write does not route through the classifier.
+		return annotateNekiShardKeyMissing(fmt.Errorf("postgres: write position: %w", err))
 	}
 	return nil
 }

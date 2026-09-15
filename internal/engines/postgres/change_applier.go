@@ -966,7 +966,7 @@ func (a *ChangeApplier) Close() error {
 // CREATE TABLE IF NOT EXISTS, so retrying the whole bundle is safe
 // even if an earlier inner call already succeeded.
 func (a *ChangeApplier) EnsureControlTable(ctx context.Context) error {
-	return retryOnCatalogRace(ctx, func() error {
+	err := retryOnCatalogRace(ctx, func() error {
 		if err := ensureControlTable(ctx, a.db, a.controlSchema); err != nil {
 			return err
 		}
@@ -980,6 +980,21 @@ func (a *ChangeApplier) EnsureControlTable(ctx context.Context) error {
 		// empty and written only when a stream carries changes for a table
 		// the target lacks.
 		return ensureSkippedTablesTable(ctx, a.db, a.controlSchema)
+	})
+	if err != nil {
+		return err
+	}
+	// On a sharded PlanetScale Neki the tables just created would be routed
+	// by the database's default shard group and every write to them refused
+	// (NK306); place them in the authoritative group. A no-op everywhere
+	// else, and on a Neki that does not route them. The list is every table
+	// the bundle above creates — TestEveryPostgresControlTableIsPlacedOnNeki
+	// holds it to the package's table-name constants.
+	return ensureNekiControlTablePlacement(ctx, a.db, a.isNeki, a.serverKey, a.controlSchema, []string{
+		controlTableName,
+		schemaHistoryTableName,
+		shardConsolidationLeaseTableName,
+		skippedTablesTableName,
 	})
 }
 

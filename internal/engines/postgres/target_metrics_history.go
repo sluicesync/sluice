@@ -74,7 +74,13 @@ func ensureTargetMetricsHistoryTable(ctx context.Context, db *sql.DB, schema str
 
 // EnsureTargetMetricsHistory implements [ir.TargetMetricsHistoryStore].
 func (a *ChangeApplier) EnsureTargetMetricsHistory(ctx context.Context) error {
-	return ensureTargetMetricsHistoryTable(ctx, a.db, a.controlSchema)
+	if err := ensureTargetMetricsHistoryTable(ctx, a.db, a.controlSchema); err != nil {
+		return err
+	}
+	// Same placement as EnsureControlTable's bundle: this table is created
+	// on its own door, so it enrols on its own door.
+	return ensureNekiControlTablePlacement(ctx, a.db, a.isNeki, a.serverKey, a.controlSchema,
+		[]string{targetMetricsHistoryTableName})
 }
 
 // RecordTargetMetricsSample implements [ir.TargetMetricsHistoryStore]. It

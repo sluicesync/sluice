@@ -114,6 +114,12 @@ type nekiTopology struct {
 	} `json:"databases"`
 
 	DefaultShardGroup string `json:"default_shard_group"`
+
+	// AuthoritativeShardGroup is the single-shard group that owns
+	// sequences and schema publishing and, per PlanetScale's guidance,
+	// holds unsharded metadata. It is where sluice places its own control
+	// tables on a sharded database (neki_control_placement.go).
+	AuthoritativeShardGroup string `json:"authoritative_shard_group"`
 }
 
 // shardKeyFor returns the shard-key columns that route `table` in `schema` of
@@ -261,6 +267,16 @@ func loadNekiTopology(ctx context.Context, serverKey string, q querier) (*nekiTo
 	nekiTopoMemo.byServer[serverKey] = snap
 	nekiTopoMemo.mu.Unlock()
 	return snap, nil
+}
+
+// invalidateNekiTopologyMemo drops the memoised topology for one server.
+// Called after sluice itself writes the topology (control-table placement),
+// so a preflight in the same process reads the document sluice just stored
+// rather than the one it read before.
+func invalidateNekiTopologyMemo(serverKey string) {
+	nekiTopoMemo.mu.Lock()
+	delete(nekiTopoMemo.byServer, serverKey)
+	nekiTopoMemo.mu.Unlock()
 }
 
 // ShardKeyUpsertMismatch implements the target-side probe the pipeline's

@@ -211,6 +211,11 @@ func classifyApplierError(err error) error {
 			// never succeed on retry; NK213 (blocked table) is a deliberate
 			// workflow cutover, handled by the case below.
 			return &retriablePGError{err: err}
+		case nekiShardKeyMissingCode:
+			// NK306 — an INSERT without the table's shard-key column.
+			// Terminal on the statement's shape; see
+			// neki_shard_key_missing.go for the sibling sweep.
+			return annotateNekiShardKeyMissing(err)
 		case nekiBlockedTableCode:
 			// NK213 — a PlanetScale Neki workflow (in practice a
 			// MoveTables write cutover) has blocked this table on the

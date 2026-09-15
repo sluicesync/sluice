@@ -500,7 +500,10 @@ func (a *ChangeApplier) attributeQueuedError(s queuedStmt, err error) error {
 	case "truncate":
 		return fmt.Errorf("postgres: applier: truncate %s.%s: %w", s.schema, s.table, err)
 	case "position":
-		return fmt.Errorf("postgres: write position: %w", err)
+		// Same annotation as the serial lane's WritePosition: NK306 here is
+		// the control-table half of NEKI-NK306, and this write does not
+		// route through the classifier.
+		return annotateNekiShardKeyMissing(fmt.Errorf("postgres: write position: %w", err))
 	default:
 		return fmt.Errorf("postgres: applier: pipelined %s %s.%s: %w", s.kind, s.schema, s.table, err)
 	}

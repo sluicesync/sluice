@@ -1721,6 +1721,52 @@ Mutation-run in all three directions, mutants grep-confirmed present and reverte
 
 **The generalizable bit:** when one gate grades two classes, check whether its exemptions belong to *both*. An exemption argued from class A and applied to class B is invisible in review, because the rationale reads as sound — it is sound, about the other thing. The tell here was a comment explaining the exemption in terms of only one of the two patterns in the regex right above it.
 
+## 2026-09-14 — NK306 control-table half: SHIPPED — placement in the authoritative shard group
+
+The plan below was the next session's first task and it is now done. Decision and alternatives: [ADR-0187](../adr/adr-0187-neki-control-table-placement.md). Operator-facing recipe: `docs/operator/planetscale-postgres-to-neki.md` § "Sharded targets and sluice's control tables". Measured history, marked superseded in place: `docs/dev/neki-readiness.md`.
+
+**What landed.** `internal/engines/postgres/neki_control_placement.go`: `ensureNekiControlTablePlacement` (the I/O) and `planNekiControlPlacement` (the decision, pure, gradeable against measured documents without a cluster). On a Neki target, after the control tables are created, sluice asks whether a shard index currently routes each one — the exact condition under which the router demands a shard key — and if so assigns those tables to the topology's `authoritative_shard_group`, writes the document back with `__neki.set_data_topology`, and waits on `__neki.wait_for_data_topology` so the next write cannot land on an unconverged router. The document is edited as generic JSON with `UseNumber()`, so a preview-era field sluice has never heard of survives a sluice write. Off Neki, and on a Neki that routes none of the tables, it is a no-op and no revision is minted.
+
+**The probe answers that decided it** (live 2-shard PS-10, nekiverify run `34910229846`, 2026-09-14):
+
+| question | answer |
+| --- | --- |
+| does a shard-key-less control table in its OWN SCHEMA escape the default group? | **NO** — refused with `NK306` identically to one in `public`, with the `public` control arm holding first. The default group reaches unlisted schemas |
+| does a CONSTANT shard-key column work? | **YES** through `INSERT`/`UPDATE`/unpinned-`SELECT` — and rejected: control-table DDL would become target-dependent for the first time on any engine. On file as the fallback if topology writes are ever unacceptable for governance reasons |
+| does assignment to the AUTHORITATIVE group work, and can sluice's role write it? | **YES on both** — shard-key-less `INSERT` accepted, reads back unpinned, topology accepted the placement at revision 36020 under sluice's own role |
+| is `set_data_topology` idempotent on an unchanged document? | **NO** — an identical document still mints a revision (36469 then 36472). Compare-before-write is load-bearing, not an optimisation: `EnsureControlTable` runs on every start |
+| how is the current revision READ over SQL? | `__neki.get_data_topology_revision()` → `bigint`. **Not on the vendor's data-topology page**, which documents the `expected_revision` option and not how to read the revision; found by enumerating `pg_proc`. A router without it answers `42883`, and the write then goes last-writer-wins |
+| what does a stale `expected_revision` look like? | `success=false, revision=0` — **data, not an error**. The current revision is accepted |
+| does the convergence wait exist? | `__neki.wait_for_data_topology(revision bigint, timeout interval DEFAULT NULL)`; the one-arg form works |
+
+**Sibling sweep — 8 control tables, 4 doors, each stated fixed or exempt-with-a-reason:**
+
+| table | door | disposition |
+| --- | --- | --- |
+| `sluice_cdc_state` | `ChangeApplier.EnsureControlTable` | FIXED — placed |
+| `sluice_cdc_schema_history` | same | FIXED — placed |
+| `sluice_shard_consolidation_lease` | same | FIXED — placed |
+| `sluice_cdc_skipped_tables` | same | FIXED — placed |
+| `sluice_target_metrics_history` | `ChangeApplier.EnsureTargetMetricsHistory` | FIXED — created on its own door, so it enrols on its own door |
+| `sluice_migrate_state` | `MigrationStateStore.EnsureControlTable` | FIXED — placed. This door is **migrate's AND restore's** |
+| `sluice_migrate_table_progress` | same | FIXED — placed |
+| `sluice_keysets` | `pgKeysetStore.EnsureKeysetTable` | FIXED — placed |
+| `sluice_heartbeat` | pipeline, name passed as a parameter | **EXEMPT** — written on the SOURCE, and a Neki cannot be a continuous-sync source (ADR-0186 probe R-1), so it is never a sharded Neki table sluice writes |
+| the migrate breadcrumb's own `NK306` | `migration_state.go` | **EXEMPT from the new code** — it already surfaces as `SLUICE-E-MIGRATE-PROGRESS-UNRECORDABLE`, whose doc row names `NK306` and the placement remedy; a second code on the same failure would compete with a more specific one |
+| the bulk-copy `COPY` writer | `postgres` row writer | **EXEMPT, FILED** — it does not route through the applier's classifier (the same exemption `neki_blocked_table.go` records for `NK213`), and a `COPY` without the shard key is a schema-level mismatch whose home is the preflight's topology check |
+| pgtrigger capture tables on a Neki SOURCE | `internal/engines/pgtrigger` | **OUT OF SCOPE, FILED** — trigger-CDC on a sharded Neki source has never been run; nothing here reaches it and nothing here claims to |
+
+The enumeration is a gate rather than a list in a commit message: `TestEveryPostgresControlTableIsPlacedOnNeki` derives its universe from the package's own `*TableName` constants off the AST, grades both directions (every constant placed or exempt-with-a-reason; nothing placed that is not such a constant; nothing both), cross-checks each placed name against `appliershared.IsControlTable` so placement and the schema readers' exclusion roster cannot diverge, and carries an anti-vacuity floor of 8 constants / 4 call sites.
+
+**The WARN-vs-refuse split, stated because it is a decision and not an oversight.** A topology READ failure is a `WARN`: skipping placement fails loudly later (`NK306`), never silently, and refusing would take down an *unsharded* cluster whose role merely lacks `SELECT` on the topology. A topology WRITE failure is the coded refusal `SLUICE-E-TARGET-CONTROL-TABLE-PLACEMENT` — the governance door — raised before any data moves and naming the exact placement to make by hand. No opt-out flag, deliberately: the next control-table write would be refused anyway, so the flag would buy a later, less informative failure. `NK306` itself is now classified (`SLUICE-E-TARGET-SHARD-KEY-MISSING`, terminal), closing the "measured twice, still no verdict" gap the bisect filed.
+
+**Resume compatibility.** The table NAME, schema and column shape are unchanged — only the topology group. A pre-fix binary's control tables are found unchanged by a post-fix one, and a pre-fix cluster's tables are placed on the first post-fix start: one revision, once.
+
+**Two follow-ups now unblocked:**
+
+1. **The CDC-into-a-sharded-target arm and the NK306 BISECT arm** both gated on this root cause and should go green on the next nekiverify run. If either stays red, that is new information rather than the known wall.
+2. **The backup/restore-into-Neki arm** (filed 2026-09-14, deliberately blocked on this) can now be built. Restore writes `sluice_migrate_state` through the very door this fixes, so a failure there would finally be information rather than a re-learning of something diagnosed.
+
 ## 2026-09-14 — NK306 control-table fix: the implementation plan, derived from the code
 
 The design is settled (authoritative shard group; sluice's role can enrol). This is what building it actually touches, scoped against the tree rather than estimated.

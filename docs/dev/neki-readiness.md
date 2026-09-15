@@ -1,6 +1,6 @@
 # Neki (sharded PlanetScale Postgres) — readiness matrix
 
-**Status:** investigation, 2026-09-10. Nothing here is implemented. The Tier-B probes have now been **measured against a live cluster** — see "First probe run" below; the rest are still hypotheses, and the whole point of this file is to keep the two apart.
+**Status:** investigation, 2026-09-10; **parts of it have since shipped** — the flavor itself (ADR-0186, v0.150.0), the MoveTables cutover refusal (v0.151.0), and the control-table placement that closes NK306's control-table half (ADR-0187, 2026-09-14). The Tier-B probes have been **measured against a live cluster** — see "First probe run" below; the rest are still hypotheses, and the whole point of this file is to keep the two apart. Where a measurement has been superseded by a fix, it is marked in place rather than deleted.
 
 ## First probe run — 2026-09-10, live `neki-test` (PS-10, AWS us-east-1, 2 replicas)
 
@@ -101,6 +101,8 @@ Recorded here, not only in a reported Neki platform finding, because the defect 
 
 On a sharded Neki database the default shard group covers `public`, so every `INSERT` into sluice's own control tables is refused for want of the shard key (`SQLSTATE NK306`). `migrate` treats per-table progress writes as best-effort and warns past them, so a run completed at exit 0 with **zero** rows in `sluice_migrate_table_progress`.
 
+> **The refusal itself is fixed as of 2026-09-14 — see "NK306's control-table half is CLOSED" below.** sluice now places its own control tables in the authoritative shard group, so the writes described here succeed on a sharded target. The generalisable half of this finding stands unchanged and is the reason the section stays: a best-effort write whose ABSENCE something reads as information is a correctness problem, and the breadcrumb refusals that came out of it apply to every engine.
+
 The consequence was mis-graded on first filing as "unresumable success". Measured, it is worse. `classifyTableForResume` reads a **missing** progress row as *never copied* and starts the table fresh **without truncating** — sound only while that reading is true, and it is exactly what the breadcrumb write exists to make true. With the write swallowed, a `--resume` re-copied a fully-copied table; for a table with no primary key there is nothing for the upsert to conflict on, so it **appended**:
 
 | binary | command | `t1_nopk` on the target |
@@ -113,6 +115,30 @@ Two things generalise beyond Neki:
 
 - **A best-effort write becomes a correctness problem the moment something reads its ABSENCE as information.** The four breadcrumb sites now refuse; every later write for the same table stays best-effort deliberately, because losing one of those degrades to re-copying work the resume path already handles. The split is enforced by `TestProgressBreadcrumbsDoNotRideTheBestEffortHelper`, an AST walker that derives its own universe and requires every remaining best-effort call to carry a terminal entry.
 - **A store that fails SYSTEMATICALLY is a different hazard from one that fails transiently**, and sluice's tolerance was tuned for the transient kind. Neki is the first systematic one we have met; a revoked `GRANT` or a dropped control table is the same shape on any engine.
+
+### NK306's control-table half is CLOSED — sluice places its own tables in the authoritative shard group (2026-09-14)
+
+Recorded here because this file is where the defect's measured history lives; the decision and its alternatives are [ADR-0187](../adr/adr-0187-neki-control-table-placement.md).
+
+**What sluice does now.** On a Neki target, after creating its control tables, sluice reads `__neki.get_data_topology()` and asks a narrow question of each table: does a shard index currently route it? If none does — which is the whole of the unsharded case — nothing happens and no topology revision is minted. If one does, sluice assigns that table to the topology's `authoritative_shard_group` and writes the document back with `__neki.set_data_topology`, then waits on `__neki.wait_for_data_topology` so the write that follows cannot land on a router still routing by shard key. The comparison before the write is load-bearing rather than tidy: **re-writing an unchanged document still mints a new revision** (measured 36469 then 36472 on the 2-shard PS-10, nekiverify run `34910229846`), and `EnsureControlTable` runs on every start.
+
+**Why the authoritative group and not the other two candidates**, both probed live the same day:
+
+| candidate | answer |
+| --- | --- |
+| a separate SCHEMA for the control tables | **NO** — a shard-key-less table in its own schema is refused with `NK306` *identically* to one in `public`; the default group reaches unlisted schemas. The control arm (same table, `public`) held first, so this is the schema's answer, not the fixture's |
+| a CONSTANT shard-key column | **YES**, through the full `INSERT`/`UPDATE`/unpinned-`SELECT` lifecycle — and rejected: it makes control-table DDL depend on the target's routing column, a first for any engine. **Stays on file as the fallback** if topology writes ever prove unacceptable for governance reasons |
+| assignment to the AUTHORITATIVE shard group | **YES on both halves** — the table accepts a shard-key-less `INSERT` and reads back unpinned, and sluice's own role could write the topology (revision 36020 in that probe). PlanetScale's guidance puts "metadata, catalog work, and sequences" in this group, which is what a CDC position and a migrate breadcrumb are |
+
+**Two codes, and the split between them is deliberate.** A topology **read** failure is a `WARN`, not a refusal: skipping the placement fails loudly later (`NK306`) rather than silently, while refusing would take down an *unsharded* cluster whose role merely lacks `SELECT` on the topology — a configuration that works today. A topology **write** failure is the coded refusal `SLUICE-E-TARGET-CONTROL-TABLE-PLACEMENT`, raised at control-table creation before any data moves, naming the database, schema, tables and group so the placement can be made by hand; it also covers a topology with no `authoritative_shard_group`, an authoritative group that itself declares a `default_shard_index` (a table placed there would still be routed), and a control table an operator has pinned to a shard index, which sluice will not overwrite. There is no opt-out flag: the next control-table write would be refused anyway, and the refusal carries the manual recipe.
+
+`NK306` itself is now classified as `SLUICE-E-TARGET-SHARD-KEY-MISSING`, terminal — the statement's *shape* is what the router refuses, so a retry is refused identically. Before this it appeared in the repository only as prose: the engine graded `NK013`, `NK205` and `NK213` and nothing else in the NK3xx range, so a refusal this suite had measured twice carried no verdict at all.
+
+**The manual placement, for the refusal's sake**, is in `docs/operator/planetscale-postgres-to-neki.md` under "Sharded targets and sluice's control tables", along with what the topology change log shows and the role requirement.
+
+**What this unblocks.** The CDC-into-a-sharded-target arm and the NK306 bisect arm both gate on this and should go green on the next nekiverify run. The filed **backup/restore-into-Neki** arm was deliberately blocked on it — restore writes `sluice_migrate_state` through the same door as migrate — and can now be built.
+
+**Still not reached:** a Neki **source** running the pgtrigger engine. Trigger-CDC's capture tables live on the source, nothing here touches them, and trigger-CDC on a sharded Neki source has never been run. Filed as a follow-up rather than claimed.
 
 ### CDC into a SHARDED Neki target — now works end to end, and the first fix for it was wrong
 

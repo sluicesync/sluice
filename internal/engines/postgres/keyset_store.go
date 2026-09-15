@@ -31,6 +31,12 @@ func init() {
 type pgKeysetStore struct {
 	db     *sql.DB
 	schema string
+
+	// isNeki / serverKey: the keyset DSN can name a PlanetScale Neki, and
+	// sluice_keysets is a control table like any other — probed at open,
+	// consumed by the placement in EnsureKeysetTable and nothing else.
+	isNeki    bool
+	serverKey string
 }
 
 // openKeysetStore opens a *sql.DB against the keyset DSN and pings
@@ -52,7 +58,8 @@ func openKeysetStore(ctx context.Context, dsn string) (redact.KeysetStore, error
 	if err != nil {
 		return nil, err
 	}
-	return &pgKeysetStore{db: db, schema: cfg.schema}, nil
+	isNekiK, _ := probeIsNeki(ctx, cfg.serverKey(), db)
+	return &pgKeysetStore{db: db, schema: cfg.schema, isNeki: isNekiK, serverKey: cfg.serverKey()}, nil
 }
 
 // EnsureKeysetTable creates sluice_keysets if absent. Schema per
@@ -74,7 +81,7 @@ func (s *pgKeysetStore) EnsureKeysetTable(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, ddl); err != nil {
 		return fmt.Errorf("postgres: ensure keyset table: %w", err)
 	}
-	return nil
+	return ensureNekiControlTablePlacement(ctx, s.db, s.isNeki, s.serverKey, s.schema, []string{keysetTableName})
 }
 
 // LoadKeyset reads every row and resolves it via the shared

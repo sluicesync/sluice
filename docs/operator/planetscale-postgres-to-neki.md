@@ -109,6 +109,61 @@ A migration lands on an **unsharded** Neki database, where everything above hold
 
 Both point the same way: **if you intend to shard, get the shard key into the primary key of the tables that will be sharded, ideally before the migration.**
 
+## Sharded targets and sluice's control tables
+
+sluice keeps a small set of bookkeeping tables on the target — the CDC position (`sluice_cdc_state`), the migrate breadcrumbs (`sluice_migrate_state`, `sluice_migrate_table_progress`), the schema-history and skipped-table ledgers, the shard-consolidation lease, the target-metrics history and the keyset store. None of them carries a shard key, because on every other database in the world there is no reason for one. On a **sharded** Neki that is a problem: the database's default shard group covers `public`, so the router refuses every write to them with `NK306` (`shard-key column "…" of primary index 0 is required but missing from INSERT`). Left alone it stops a stream at its position write and makes a `--resume` re-copy a table it had already finished.
+
+**You do not have to do anything about this.** When the target is a Neki, sluice checks its own control tables against the data topology after creating them, and if a shard index would route any of them it assigns those tables to the topology's **authoritative shard group** — the unsharded group PlanetScale's own guidance describes as holding metadata, catalog work and sequences — and waits for every router to pick the change up. Points worth knowing:
+
+- **Nothing happens on an unsharded database.** The placement is made only when a shard index actually routes the table, so an unsharded Neki never sees a topology revision from sluice.
+- **It happens at most once.** sluice compares before it writes, so a start that finds the placement already in place writes nothing. (This matters: re-writing an identical topology document still mints a new revision.)
+- **It is attributable.** The write carries the comment `sluice: place control tables in the authoritative shard group`, so it shows up in the topology's own audit log:
+
+  ```sql
+  SELECT * FROM __neki.list_data_topology_changes();
+  ```
+
+  An entry with that comment, naming only the `sluice_*` tables, is this and nothing else. `SELECT __neki.get_data_topology()` shows the result: each control table listed under `databases.<db>.schemas.<schema>.tables` with a `shard_group` naming the authoritative group.
+
+**The role requirement.** sluice's role needs `SELECT` on `__neki.get_data_topology()` to plan the placement and the right to call `__neki.set_data_topology` to make it. The default role a Neki database hands you could do both when this was measured. If the read is not permitted, sluice logs a warning and carries on — which is safe on an unsharded database and will fail loudly on a sharded one rather than losing anything.
+
+### When `SLUICE-E-TARGET-CONTROL-TABLE-PLACEMENT` fires
+
+This refusal arrives at control-table creation, **before any data moves**, and means sluice could not make the placement itself. The usual cause is that its role may not write the topology (`permission denied`, SQLSTATE `42501`); the others are a topology with no `authoritative_shard_group`, an authoritative group that itself declares a `default_shard_index` (a table placed there would still be routed, so remove the index — that group is meant to hold unsharded data), or a control table an operator has pinned to a shard index, which sluice will not overwrite.
+
+Either grant sluice's role the right to call `set_data_topology` and re-run — it will make the placement on the next start — or make it by hand with a role that may, using the table names the error lists:
+
+```sql
+-- 1. read the current document
+SELECT __neki.get_data_topology();
+```
+
+Add an entry per table under `databases.<your-db>.schemas.<your-schema>.tables`, naming the authoritative group the error reports:
+
+```jsonc
+"tables": {
+  "sluice_cdc_state":      { "shard_group": "<authoritative group>" },
+  "sluice_migrate_state":  { "shard_group": "<authoritative group>" },
+  // … one per table the refusal names
+}
+```
+
+Then write it back and re-run sluice:
+
+```sql
+SELECT * FROM __neki.set_data_topology(
+  '<the edited document>',
+  true,
+  '{"comment":"sluice control tables"}'
+);
+```
+
+A `success` of `false` means the document was refused; `SELECT * FROM __neki.validate_data_topology('<document>')` explains why.
+
+There is deliberately **no flag to proceed without the placement**. The next write to a control table would be refused anyway, and a breadcrumb sluice cannot write is exactly what makes a fully-copied table read as never copied on `--resume`.
+
+If you see `SLUICE-E-TARGET-SHARD-KEY-MISSING` instead, that is `NK306` itself reaching sluice at run time. For one of sluice's own tables it means the placement was never made — most often because the topology could not be read, which is a warning rather than a refusal so that unsharded databases keep working — and the recipe above is the fix. For one of *your* tables it means the `INSERT` sluice emitted carries no column by the target's shard-key name: give the target a routing column the source rows actually have, or take the table out of scope with `--exclude-table`.
+
 ## Not supported: Neki as a continuous-sync source
 
 `migrate` **out of** Neki works, including from a sharded database. `sync` out of it does not, and the reason is earlier and more absolute than this page previously said: **the router does not accept a replication connection at all.**

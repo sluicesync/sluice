@@ -564,6 +564,33 @@ const (
 	// replayed the gap to exact parity.
 	CodeTargetTableBlockedByWorkflow Code = "SLUICE-E-TARGET-TABLE-BLOCKED-BY-WORKFLOW"
 
+	// CodeTargetControlTablePlacement fires when sluice's own control
+	// tables (CDC position, migrate breadcrumbs, skipped-table ledger and
+	// their siblings) must be placed in an unsharded shard group on a
+	// PlanetScale Neki target and sluice could not make the placement.
+	//
+	// On a sharded Neki the database's default shard group covers `public`,
+	// and a table `CREATE TABLE` creates is absent from the operator-declared
+	// topology by construction — so every write to a control table, which
+	// carries no shard key on any engine, is refused with SQLSTATE NK306.
+	// sluice places them in the AUTHORITATIVE shard group (the platform's
+	// own guidance is that it holds unsharded metadata) by writing the
+	// topology at control-table creation. This refusal is the door for a
+	// cluster where that write is denied to sluice's role, has no
+	// authoritative group, or whose authoritative group itself declares a
+	// shard index. It names the exact placement to make by hand.
+	CodeTargetControlTablePlacement Code = "SLUICE-E-TARGET-CONTROL-TABLE-PLACEMENT"
+
+	// CodeTargetShardKeyMissing classifies PlanetScale Neki's SQLSTATE
+	// NK306 — an INSERT into a sharded table that does not carry the
+	// table's shard-key column. Terminal: the statement's SHAPE is what is
+	// refused, and the same shape is refused on retry. Two things reach it:
+	// a control table that was not placed in an unsharded group (see
+	// CodeTargetControlTablePlacement, which fires first when sluice can
+	// tell), and a user table whose target shard key the source row does
+	// not carry under that name.
+	CodeTargetShardKeyMissing Code = "SLUICE-E-TARGET-SHARD-KEY-MISSING"
+
 	// CodeTargetDeferrableKey fires when a target table's only usable
 	// upsert key is a DEFERRABLE unique constraint. Postgres refuses a
 	// non-immediate index as an `ON CONFLICT` arbiter (SQLSTATE 55000),
@@ -910,6 +937,8 @@ var registry = map[Code]Info{
 	CodeTargetShardKeyUpdateUnsupported: {ClassRefusal, "refused mid-stream: a change would alter the target row’s SHARD-KEY value, moving it to a different shard, which a sharded target cannot express — applying the other columns and leaving the routing column behind would diverge silently"},
 	CodeTargetShardKeyNotInUpsertKey:    {ClassRefusal, "refused before anything was written: a sharded target table’s ROUTING columns are not contained in the key sluice’s idempotent write conflicts on, so a row whose shard key changed would be INSERTED alongside the original instead of updating it — two rows claiming one primary key, at exit 0, with no error at any point"},
 	CodeTargetTableBlockedByWorkflow:    {ClassRefusal, "halted: a PlanetScale Neki workflow holds a block on this table in the database sluice is connected to (SQLSTATE NK213) — a MoveTables write cutover blocks the table on the OLD database rather than redirecting connections that named it, so every statement against it is refused until the move completes or is reversed; nothing is lost, the persisted position stops before the block"},
+	CodeTargetControlTablePlacement:     {ClassRefusal, "sluice's own control tables must be placed in an unsharded shard group on this PlanetScale Neki target (they carry no shard key, and the database's default shard group would refuse every write to them with SQLSTATE NK306) and sluice could not make the placement — its role may not write the topology, the topology names no authoritative shard group, or that group itself declares a shard index. Refused at control-table creation, before any data moves, with the exact topology entry to add by hand"},
+	CodeTargetShardKeyMissing:           {ClassRefusal, "a PlanetScale Neki target refused an INSERT that does not carry the table's shard-key column (SQLSTATE NK306). Terminal — the statement's shape is what is refused. For one of sluice's own control tables it means the table was not placed in an unsharded group (see SLUICE-E-TARGET-CONTROL-TABLE-PLACEMENT); for a user table it means the source row carries no column by the target's shard-key name"},
 	CodeResumeFreshTableNotEmpty:        {ClassRefusal, "refused on --resume: a table with no persisted progress would be started from scratch WITHOUT truncating, but the target already holds rows — either an earlier attempt copied it and could not persist its progress row, or the target was already populated"},
 
 	CodePSForeignKeysNotEnabled: {ClassRefusal, "migrate/sync cold-start refused before the copy: the PlanetScale target has foreign-key support disabled (allow_foreign_key_constraints off, read back as foreign_keys_enabled=false) while the source schema declares foreign keys the run would add after the copy — the platform rejects ADD FOREIGN KEY outright, so the run would fail at the constraints phase after the whole copy and --resume re-hits it; enable foreign key support on the target database, or re-run with --skip-foreign-keys (each FK's referencing columns stay indexed, so the constraints can be added out-of-band)"},

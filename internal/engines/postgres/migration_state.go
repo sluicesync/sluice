@@ -56,17 +56,29 @@ type MigrationStateStore struct {
 	db     *sql.DB
 	schema string
 	shared *migratestate.Store
+
+	// isNeki records that this store's target is a PlanetScale Neki
+	// router, probed once per server at open (neki_probe.go). It gates
+	// the control-table placement in EnsureControlTable and nothing else.
+	isNeki bool
+
+	// serverKey identifies the endpoint for the per-server topology memo,
+	// which the placement invalidates after writing. Credential-free by
+	// construction — see [pgConfig.serverKey].
+	serverKey string
 }
 
 // newMigrationStateStore builds the store plus its dialect SQL. The
 // statement set and the argument-order contract per statement are
 // documented on [migratestate.SQL].
-func newMigrationStateStore(db *sql.DB, schema string) *MigrationStateStore {
+func newMigrationStateStore(db *sql.DB, schema string, isNeki bool, serverKey string) *MigrationStateStore {
 	hdr := quoteIdent(schema) + "." + quoteIdent(migrateStateTableName)
 	prog := quoteIdent(schema) + "." + quoteIdent(migrateProgressTableName)
 	return &MigrationStateStore{
-		db:     db,
-		schema: schema,
+		db:        db,
+		schema:    schema,
+		isNeki:    isNeki,
+		serverKey: serverKey,
 		shared: &migratestate.Store{
 			DB: db,
 			Config: migratestate.Config{
@@ -234,7 +246,15 @@ func (s *MigrationStateStore) EnsureControlTable(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, progDDL); err != nil {
 		return fmt.Errorf("postgres: ensure migrate-state progress table: %w", err)
 	}
-	return nil
+	// Sharded PlanetScale Neki: both tables would be routed by the default
+	// shard group and every breadcrumb write refused (NK306) — which is the
+	// measured 40-rows-became-80 resume. Place them in the authoritative
+	// group; a no-op everywhere else. This is migrate's AND restore's door,
+	// the sibling of ChangeApplier.EnsureControlTable.
+	return ensureNekiControlTablePlacement(ctx, s.db, s.isNeki, s.serverKey, s.schema, []string{
+		migrateStateTableName,
+		migrateProgressTableName,
+	})
 }
 
 // Read returns the merged header + per-table state for migrationID,

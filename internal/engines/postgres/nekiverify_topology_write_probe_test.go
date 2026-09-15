@@ -143,8 +143,11 @@ func nekiTopologyWriteSemanticsProbe(ctx context.Context, t *testing.T, db *sql.
 	})
 }
 
-// nekiFunctionInventory lists every function in the __neki namespace as
-// `__neki.name(args) RETURNS result`.
+// nekiFunctionInventory lists every function in the __neki namespace with
+// its argument list and return type, one string per registered signature.
+// (Spelled out rather than shown as a pattern: the remedy premise check
+// scans this package for `__neki.<fn>(` references and grades each against
+// the live router, and an illustrative name in a comment was graded too.)
 func nekiFunctionInventory(ctx context.Context, db *sql.DB) ([]string, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT p.proname,
