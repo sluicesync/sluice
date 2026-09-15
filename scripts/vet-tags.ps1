@@ -50,11 +50,23 @@ if (-not $lines) {
     exit 1
 }
 
-# Only simple conjunctions (`a && b`) are supported -- refuse loudly on
-# negation/disjunction/grouping rather than silently skipping.
+# Expand top-level disjunction: `a || b` is satisfied by the tag set {a} OR
+# by {b}, so each disjunct is vetted as its own combination. Mirror of
+# vet-tags.sh; see that file for why (the shared Neki backup/restore core is
+# `integration || nekiverify`). Only TOP-LEVEL disjunction is handled, which
+# is why the grouping guard below stays.
+$lines = $lines | ForEach-Object {
+    ($_ -replace '^//go:build ', '') -split '\s*\|\|\s*' |
+        Where-Object { $_ } |
+        ForEach-Object { "//go:build $_" }
+} | Sort-Object -Unique
+
+# What remains must be simple conjunctions (`a && b`) -- refuse loudly on
+# negation/grouping, or on a stray `|` the expansion above could not have
+# produced, rather than silently skipping.
 $bad = $lines | Where-Object { $_ -match '[!|()]' }
 if ($bad) {
-    Write-Host 'vet-tags: unsupported //go:build expression (negation/disjunction/grouping):' -ForegroundColor Red
+    Write-Host 'vet-tags: unsupported //go:build expression (negation/grouping):' -ForegroundColor Red
     $bad | ForEach-Object { Write-Host "  $_" }
     Write-Host 'vet-tags: extend scripts/vet-tags.ps1 (and vet-tags.sh) to cover it.'
     Pop-Location

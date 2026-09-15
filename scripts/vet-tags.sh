@@ -69,10 +69,29 @@ if [ -z "$exprs" ]; then
 	exit 1
 fi
 
-# All expressions in this repo are simple conjunctions (`a && b`). The
-# comma-join below is only valid for conjunctions, so refuse loudly if
-# someone introduces negation/disjunction/grouping — extend this script
-# (compute the satisfying tag sets) rather than silently skipping.
+# Expand top-level DISJUNCTION. `//go:build a || b` is satisfied by the tag
+# set {a} OR by {b}, so vetting under each disjunct separately covers the
+# file — and both sets already exist as combinations in their own right, so
+# this normally adds no passes at all. (The shared Neki backup/restore core
+# is `integration || nekiverify`: its two consumers are an integration test
+# and a nekiverify arm, and duplicating ~500 lines to keep the constraint a
+# conjunction would be the worse trade.)
+#
+# Only TOP-LEVEL disjunction is handled, which is why the grouping guard
+# below is kept: `a && (b || c)` would survive this split malformed, and is
+# refused rather than mis-expanded.
+exprs=$(printf '%s\n' "$exprs" | awk '
+	{
+		sub(/^\/\/go:build /, "")
+		n = split($0, d, /[[:space:]]*\|\|[[:space:]]*/)
+		for (i = 1; i <= n; i++) if (d[i] != "") print "//go:build " d[i]
+	}' | sort -u)
+
+# What remains must be simple conjunctions (`a && b`). The comma-join below
+# is only valid for those, so refuse loudly on negation/grouping — or on a
+# stray `|` the expansion above could not have produced — rather than
+# silently skipping. Extend this script (compute the satisfying tag sets)
+# instead of widening the guard.
 if printf '%s\n' "$exprs" | grep -q '[!|()]'; then
 	echo "vet-tags: unsupported //go:build expression (negation/disjunction/grouping):" >&2
 	printf '%s\n' "$exprs" | grep '[!|()]' >&2

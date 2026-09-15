@@ -138,6 +138,8 @@ Recorded here because this file is where the defect's measured history lives; th
 
 **What this unblocks.** The CDC-into-a-sharded-target arm and the NK306 bisect arm both gate on this and should go green on the next nekiverify run. The filed **backup/restore-into-Neki** arm was deliberately blocked on it — restore writes `sluice_migrate_state` through the same door as migrate — and can now be built.
 
+**Built the same day, not yet run live:** the backup/restore arms — `nekiRestoreIntoShardedTarget` and `nekiBackupFromShardedSource` in `internal/engines/postgres/nekiverify_backup_restore_test.go`, with their non-router half running per-PR as `TestPostgresSuite_NekiBackupRestorePlumbing`. They also correct the sentence above: a **single-full** restore opens no change applier at all, so it writes neither `sluice_migrate_state` nor the CDC control tables — only `ChainRestore.Run` reaches that door, and a multi-segment chain restore is not what the arm takes. Grade the arms on their first live run; nothing here claims a measured result.
+
 **Still not reached:** a Neki **source** running the pgtrigger engine. Trigger-CDC's capture tables live on the source, nothing here touches them, and trigger-CDC on a sharded Neki source has never been run. Filed as a follow-up rather than claimed.
 
 ### CDC into a SHARDED Neki target — now works end to end, and the first fix for it was wrong

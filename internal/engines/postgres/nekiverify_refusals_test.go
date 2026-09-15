@@ -166,6 +166,19 @@ func TestNekiverify_ShardedRefusalPremises(t *testing.T) {
 	// CONTENT rather than a row count.
 	nekiCDCIntoShardedTarget(ctx, t, db, fx, tenantA, tenantB)
 
+	// backup/restore against a sharded Neki — filed 2026-09-14, blocked on
+	// the NK306 control-table fix and unblocked by ADR-0187.
+	//
+	// RESTORE FIRST, then BACKUP, so the backup arm can include the tables the
+	// restore created: two more sharded tables to scatter-read across, at no
+	// extra cost. Both run AFTER the CDC arm, which is what has already
+	// created and placed the applier's control tables — the restore arm's
+	// placement check is worded as a statement about the target's STATE for
+	// exactly that reason, and measures separately which control tables the
+	// restore itself created. See nekiverify_backup_restore_test.go.
+	nekiRestoreIntoShardedTarget(ctx, t, db, fx, tenantA, tenantB)
+	nekiBackupFromShardedSource(ctx, t, db, fx, tenantA, tenantB)
+
 	// Coverage item #3: the NK213 block from a real MoveTables cutover.
 	// LAST, deliberately — it creates a workflow that blocks a table and a
 	// second logical database, and although it reverses both, a failure

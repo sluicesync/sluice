@@ -1909,7 +1909,21 @@ So the design is settled, and it is the best of the four candidates:
 
 **Reference tables and GSIs**, also named on that page, are NOT candidates on current evidence: the page documents neither's mechanics, GSIs map a lookup key to an owner row's shard key (control tables have no owner row), and "duplicate across shards" has different semantics for a *written* checkpoint than for a read-mostly lookup. Worth revisiting only if the mechanics get documented.
 
-## 2026-09-14 — FILED, blocked on the above: backup/restore has never been run against Neki
+## 2026-09-14 — BUILT (pending its first live run): backup/restore against Neki
+
+**Status update, same day.** The two arms below are written and wired into `TestNekiverify_ShardedRefusalPremises` — `nekiRestoreIntoShardedTarget` then `nekiBackupFromShardedSource`, both after the CDC arm and before the MoveTables arm (`internal/engines/postgres/nekiverify_backup_restore_test.go`). **They have not run against a live cluster. Grade them on that run; nothing below claims a measured result.**
+
+Everything that is not about the router lives in `internal/engines/postgres/neki_backup_restore_core_test.go` under `//go:build integration || nekiverify`, and `TestPostgresSuite_NekiBackupRestorePlumbing` drives it on every PR against an ordinary PostgreSQL container with `forceNekiFlavor` on. That split is deliberate: this suite's history is six MoveTables dispatches that each failed on a harness question, at the cost of a provisioned cluster apiece. A paid run should be spent on questions only a router can answer, and when the live arm fails, "the same path worked against vanilla PostgreSQL an hour ago" is what makes the failure attributable.
+
+The restore arm's backup SOURCE is a SQLite file the test builds through the IR — never the Neki fixture itself, which would make the backup side Neki too and leave a failure with two candidate causes. The independent expected value is the row set the test generated, digested in Go before anything is written; the backup arm's is an ordered `SELECT` of the source, digested in Go and compared against the artifact read back by restoring it into a LOCAL SQLite target. `backup verify --depth read` is run too and is reported rather than relied on for content — it streams each chunk through the same reader restore uses, so it is internally consistent with the artifact by construction.
+
+**One correction the arm carries, and it was already half-made here.** The entry below and `docs/dev/neki-readiness.md` both say restore writes `sluice_migrate_state`; the ADR-0187 sibling sweep corrects that in place (*"a chain restore never opens this store, it reaches the applier door"*). Reading `internal/pipeline/backup/restore.go` says something narrower still: only `ChainRestore.Run` opens a change applier and calls `EnsureControlTable` (chain_restore.go step 2.9), and a **single-full** restore — which is what the arm takes — goes down `Restore.Run`'s single-manifest path and opens no applier at all. So the arm measures which control tables the restore itself created and prints the answer, and asserts placement as a statement about the target's STATE. **A multi-segment chain restore, the shape that would actually reach the applier door, is NOT COVERED** — filed here rather than implied.
+
+**Also touched:** `scripts/vet-tags.sh` and `scripts/vet-tags.ps1` now expand top-level disjunction in a `//go:build` expression into one combination per disjunct, which is what the shared core's `integration || nekiverify` constraint needs. The scripts' own comments invited exactly this ("extend this script … rather than silently skipping"); the grouping and negation guards are unchanged.
+
+### The original filing, kept
+
+
 
 No nekiverify arm touches backup, and the backup package's **only** Neki reference is a comment in `restore_table_pool.go` recording a bug that code review caught rather than a run: passing a literal `0` to the axis resolver dropped `CopyConcurrencyCeiling`, which *"on a PlanetScale Neki target let a restore open table × chunk concurrent COPYs against a router that admits four."*
 
