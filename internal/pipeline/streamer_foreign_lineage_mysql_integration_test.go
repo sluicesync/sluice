@@ -128,6 +128,76 @@ func TestStreamer_MySQLForeignLineage_RefusesTheAutomaticRecopy(t *testing.T) {
 		}
 	})
 
+	t.Run("rebuilt instance with an EMPTY executed set: refuses, target untouched", func(t *testing.T) {
+		// Audit 2026-09-15 A0915-MYSQL-HIGH-2. The worker measured this
+		// shape by replacing the container behind one host:port with a
+		// rebuild that had run RESET MASTER: an EMPTY @@gtid_executed on a
+		// server whose @@server_uuid the persisted position never named.
+		// The empty arm routed it to the automatic re-copy and the target
+		// was reduced to the rebuild's stale rows at exit 0. testcontainers
+		// cannot re-bind the port, and a server keeps its uuid across
+		// RESET MASTER, so the shape is produced from the other side: the
+		// PERSISTED position is re-stamped under a uuid this server never
+		// had (byte for byte what a position captured on the replaced
+		// instance looks like from here), and the server is RESET. From
+		// sluice's evidence — the position and the server's answers — that
+		// is a rebuilt node.
+		applier, err := mysqlEng.OpenChangeApplier(context.Background(), tgtDSN)
+		if err != nil {
+			t.Fatalf("OpenChangeApplier: %v", err)
+		}
+		defer migcore.CloseIf(applier)
+		persisted, found, err := applier.ReadPosition(context.Background(), "test-foreign-lineage")
+		if err != nil || !found {
+			t.Fatalf("ReadPosition: found=%v err=%v", found, err)
+		}
+		thisUUID := mysqlGlobal(t, srcDSN, "server_uuid")
+		if !strings.Contains(persisted.Token, thisUUID) {
+			t.Fatalf("premise gone: the persisted position %q does not carry this server's uuid %s", persisted.Token, thisUUID)
+		}
+		const replacedUUID = "eeeeeeee-5555-6666-7777-888888888888"
+		foreignPos := persisted
+		foreignPos.Token = strings.ReplaceAll(persisted.Token, thisUUID, replacedUUID)
+		writer, ok := applier.(ir.PositionWriter)
+		if !ok {
+			t.Fatal("the mysql applier no longer implements ir.PositionWriter")
+		}
+		if err := writer.WritePosition(context.Background(), "test-foreign-lineage", foreignPos); err != nil {
+			t.Fatalf("WritePosition: %v", err)
+		}
+		// Put the original position back for the RESET MASTER cell below,
+		// whichever way this cell ends.
+		defer func() {
+			if err := writer.WritePosition(context.Background(), "test-foreign-lineage", persisted); err != nil {
+				t.Errorf("restore the persisted position: %v", err)
+			}
+		}()
+		applyDDLMySQL(t, srcDSN, "RESET MASTER;")
+		if got := mysqlGlobal(t, srcDSN, "gtid_executed"); strings.TrimSpace(got) != "" {
+			t.Fatalf("premise gone: gtid_executed = %q after RESET MASTER; want empty", got)
+		}
+
+		rctx, rcancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer rcancel()
+		err = newStream().Run(rctx)
+		if err == nil {
+			t.Fatal("sync start against a rebuilt instance (empty executed set, foreign uuid) returned nil")
+		}
+		if !errors.Is(err, ir.ErrPositionForeignLineage) || !strings.Contains(err.Error(), foreignLineageMarker) {
+			t.Fatalf("want the %s refusal carrying ir.ErrPositionForeignLineage, got: %v", foreignLineageMarker, err)
+		}
+		if errors.Is(err, ir.ErrPositionInvalid) {
+			t.Fatalf("the refusal also reads as an invalid position, which is the auto-recopy route: %v", err)
+		}
+		// The independent expected value: the target still holds the
+		// four rows; the re-copy would have left it with the one row the
+		// source holds now.
+		if got := pollRowCountMySQL(tgtDSN, "users"); got != 4 {
+			t.Fatalf("target holds %d rows after the refusal; want the original 4 — the automatic re-copy this "+
+				"door exists to stop would leave the replacement's single row (A0915-MYSQL-HIGH-2)", got)
+		}
+	})
+
 	t.Run("same server after RESET MASTER: the automatic re-snapshot still runs", func(t *testing.T) {
 		// Empty executed set: no other lineage here, the re-copy is right.
 		applyDDLMySQL(t, srcDSN, "RESET MASTER;")

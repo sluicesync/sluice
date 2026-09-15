@@ -49,6 +49,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -136,31 +137,79 @@ func TestGTIDResumeBindsLineageAcrossInstances(t *testing.T) {
 		t.Fatalf("the refusal must name the lineage check (gtid_executed), got: %v", err)
 	}
 
-	// Direction 1b — the discriminator: the SAME instance after RESET
-	// MASTER has an EMPTY gtid_executed. There is no other lineage to
-	// re-copy from, so this is the one "not contained" shape that keeps
-	// the automatic re-snapshot (ir.ErrPositionInvalid, and NOT foreign).
+	// Direction 1b — a REBUILT instance after RESET MASTER: an EMPTY
+	// gtid_executed on a server whose @@server_uuid A's position has
+	// never seen. Until audit 2026-09-15 A0915-MYSQL-HIGH-2 this cell was
+	// titled "the SAME instance after RESET MASTER" and expected
+	// ir.ErrPositionInvalid — while booting a DIFFERENT container. It was
+	// measuring the rebuilt-node shape and pinning the destructive route
+	// for it: measured end to end, the automatic re-copy reduced the
+	// target to the rebuild's stale rows at exit 0. The real same-server
+	// cells are at the end of this test, on A itself.
 	dsnD, cleanupD := startMySQLFamilyContainer(
 		t, ctx, "mysql:8.0", "lineage", mysqlFilePosEnvs("lineage"), mysqlGTIDBootCmd,
 	)
 	defer cleanupD()
+	uuidD := serverUUIDOf(t, ctx, dsnD)
+	if uuidD == uuidA || strings.Contains(setA, uuidD) {
+		t.Fatalf("premise gone: the rebuilt instance's uuid %q is named by A's position %q", uuidD, setA)
+	}
 	execSQL(t, ctx, dsnD, "RESET MASTER")
 	if got := globalVar(t, ctx, dsnD, "gtid_executed"); strings.TrimSpace(got) != "" {
 		t.Fatalf("premise gone: RESET MASTER left gtid_executed %q; want empty", got)
 	}
-	readerD, err := e.OpenCDCReader(ctx, dsnD)
-	if err != nil {
-		t.Fatalf("OpenCDCReader(D): %v", err)
+	mustBeForeign := func(t *testing.T, cell, dsn string) {
+		t.Helper()
+		reader, err := e.OpenCDCReader(ctx, dsn)
+		if err != nil {
+			t.Fatalf("%s: OpenCDCReader: %v", cell, err)
+		}
+		defer closeLineageReader(reader)
+		_, err = reader.StreamChanges(ctx, capturedOnA)
+		if err == nil {
+			t.Fatalf("%s: resuming A's position was ACCEPTED", cell)
+		}
+		if !errors.Is(err, ir.ErrPositionForeignLineage) {
+			t.Fatalf("%s: refused, but not as a foreign lineage: %v", cell, err)
+		}
+		if errors.Is(err, ir.ErrPositionInvalid) {
+			t.Fatalf("%s: the refusal also reads as an invalid position — the streamer would drop the target and "+
+				"re-copy from the rebuilt instance's stale rows (A0915-MYSQL-HIGH-2): %v", cell, err)
+		}
+		if !strings.Contains(err.Error(), uuidD) {
+			t.Fatalf("%s: the refusal must name the witness (@@server_uuid %s): %v", cell, uuidD, err)
+		}
+		t.Logf("%s: refused: %v", cell, err)
 	}
-	defer closeLineageReader(readerD)
-	_, err = readerD.StreamChanges(ctx, capturedOnA)
-	if err == nil {
-		t.Fatal("resuming A's position on a RESET instance was ACCEPTED")
+	mustBeInvalid := func(t *testing.T, cell, dsn string) {
+		t.Helper()
+		reader, err := e.OpenCDCReader(ctx, dsn)
+		if err != nil {
+			t.Fatalf("%s: OpenCDCReader: %v", cell, err)
+		}
+		defer closeLineageReader(reader)
+		_, err = reader.StreamChanges(ctx, capturedOnA)
+		if err == nil {
+			t.Fatalf("%s: resuming A's position was ACCEPTED", cell)
+		}
+		if !errors.Is(err, ir.ErrPositionInvalid) || errors.Is(err, ir.ErrPositionForeignLineage) {
+			t.Fatalf("%s: must keep the automatic re-copy route (ErrPositionInvalid, not foreign): %v", cell, err)
+		}
+		t.Logf("%s: refused, re-copy route kept: %v", cell, err)
 	}
-	if !errors.Is(err, ir.ErrPositionInvalid) || errors.Is(err, ir.ErrPositionForeignLineage) {
-		t.Fatalf("a RESET (empty gtid_executed) source must keep the automatic re-copy route: want "+
-			"ErrPositionInvalid and not ErrPositionForeignLineage, got: %v", err)
+	mustBeForeign(t, "rebuilt instance, EMPTY executed set", dsnD)
+
+	// Direction 1c — the sibling the refuter measured (S1): the same
+	// rebuilt instance restored from an OLDER backup of A, which is what
+	// `mysqldump --set-gtid-purged=ON` / the xtrabackup restore step
+	// produce: gtid_purged seeded under A's uuid, short of the position.
+	// The BEHIND arm; the uuid witness must make it terminal too.
+	execSQL(t, ctx, dsnD, "RESET MASTER")
+	execSQL(t, ctx, dsnD, "SET @@GLOBAL.gtid_purged = '"+behindGTIDSet(t, setA)+"'")
+	if got := globalVar(t, ctx, dsnD, "gtid_executed"); !strings.Contains(got, uuidA) {
+		t.Fatalf("premise gone: seeding D behind A's position failed: gtid_executed %q", got)
 	}
+	mustBeForeign(t, "rebuilt instance, BEHIND under the old uuid", dsnD)
 
 	// Direction 2 — the control: the SAME position on the instance that
 	// produced it must be accepted.
@@ -199,6 +248,43 @@ func TestGTIDResumeBindsLineageAcrossInstances(t *testing.T) {
 			"(a promoted replica or a --set-gtid-purged=ON restore must resume; the check binds lineage, "+
 			"not @@server_uuid)", err)
 	}
+
+	// Direction 4 — the SAME instance, for real this time (A, whose uuid
+	// the position names), on both arms: after RESET MASTER (empty), and
+	// restored behind its own position (gtid_purged under its own uuid).
+	// Both keep the automatic re-copy — the lineage is this server's own,
+	// so re-copying from it is the right recovery (the v0.148.2 decision,
+	// now scoped to the instance it was made for). Last, because RESET
+	// MASTER on A ends its usefulness for the accept cells above.
+	execSQL(t, ctx, dsnA, "RESET MASTER")
+	if got := globalVar(t, ctx, dsnA, "gtid_executed"); strings.TrimSpace(got) != "" {
+		t.Fatalf("premise gone: RESET MASTER left A's gtid_executed %q; want empty", got)
+	}
+	mustBeInvalid(t, "same instance, EMPTY executed set (RESET MASTER)", dsnA)
+	execSQL(t, ctx, dsnA, "SET @@GLOBAL.gtid_purged = '"+behindGTIDSet(t, setA)+"'")
+	mustBeInvalid(t, "same instance, BEHIND its own position", dsnA)
+}
+
+// behindGTIDSet returns set with its last interval's upper bound reduced
+// by one — a set the same lineage would have had one transaction earlier,
+// the shape of a restore from an older backup. A single-uuid, single-
+// interval set is what instance A's short history produces; anything
+// else fails the premise rather than being guessed at.
+func behindGTIDSet(t *testing.T, set string) string {
+	t.Helper()
+	uuid, interval, ok := strings.Cut(set, ":")
+	if !ok || strings.Contains(interval, ",") || strings.Contains(interval, ":") {
+		t.Fatalf("premise gone: GTID set %q is not a single uuid:lo-hi interval", set)
+	}
+	lo, hi, ok := strings.Cut(interval, "-")
+	if !ok {
+		t.Fatalf("premise gone: GTID set %q has a single-transaction interval; a BEHIND set needs at least two", set)
+	}
+	n, err := strconv.Atoi(hi)
+	if err != nil || n < 2 {
+		t.Fatalf("premise gone: GTID set %q upper bound %q", set, hi)
+	}
+	return uuid + ":" + lo + "-" + strconv.Itoa(n-1)
 }
 
 // TestGTIDResumeMariaDBBindsLineage is the MariaDB family, every cell on
@@ -384,6 +470,153 @@ func TestGTIDResumeMariaDBBindsLineage(t *testing.T) {
 
 	t.Run("same instance: accepted", func(t *testing.T) {
 		mustAccept(t, dsnA, "same-instance", capturedOnA)
+	})
+
+	// measureVerdict drives a resume and reports what happened without
+	// grading it: "invalid", "foreign", "accepted" (the resumed instance's
+	// own write was delivered as the position's continuation), or the
+	// error text for anything else. The two KNOWN-GAP cells below use it
+	// so the gap is measured on a real server on every run and stated as
+	// a skip, rather than asserted away or left as a permanent red.
+	measureVerdict := func(t *testing.T, dsn string, pos ir.Position) string {
+		t.Helper()
+		reader, err := e.OpenCDCReader(ctx, dsn)
+		if err != nil {
+			t.Fatalf("OpenCDCReader: %v", err)
+		}
+		defer closeLineageReader(reader)
+		classify := func(err error) string {
+			switch {
+			case errors.Is(err, ir.ErrPositionForeignLineage):
+				return "foreign"
+			case errors.Is(err, ir.ErrPositionInvalid):
+				return "invalid"
+			}
+			return "other: " + err.Error()
+		}
+		ch, err := reader.StreamChanges(ctx, pos)
+		if err != nil {
+			return classify(err)
+		}
+		execSQL(t, ctx, dsn, `INSERT INTO cdc_src.t VALUES (950,'rebuilt-instance-write')`)
+		deadline := time.After(45 * time.Second)
+		for {
+			select {
+			case _, ok := <-ch:
+				if !ok {
+					if serr := reader.(*CDCReader).Err(); serr != nil {
+						return classify(serr)
+					}
+					return "other: stream closed with no error"
+				}
+				return "accepted"
+			case <-deadline:
+				return "other: neither a refusal nor a change within 45s"
+			}
+		}
+	}
+
+	t.Run("KNOWN GAP: rebuilt instance with an EMPTY gtid_binlog_state (a restore, then RESET MASTER)", func(t *testing.T) {
+		// Audit 2026-09-15 A0915-MYSQL-HIGH-2, MariaDB arm — measured end to
+		// end: a rebuilt mariadb:11.4 at the same address with stale rows
+		// and an empty state took the automatic re-copy and the target was
+		// reduced to the stale rows at exit 0, exactly as on MySQL. On
+		// MySQL the @@server_uuid witness now makes this terminal. MariaDB
+		// has no instance identity (no @@server_uuid; GTIDs carry
+		// domain-server-seq only), so "same server after RESET MASTER" and
+		// "rebuilt instance after RESET MASTER" are indistinguishable from
+		// the server's answers, and the choice — refuse every empty state
+		// (a same-server reset then costs --restart-from-scratch) or keep
+		// the re-copy (a rebuilt node destroys the target) — is an operator
+		// policy call filed in the audit backlog. Behaviour is deliberately
+		// UNCHANGED here; this cell measures it and states the gap.
+		dsnB, cleanupB := newMariaDBDedicatedForCDC(t, "mariadb:11.4")
+		defer cleanupB()
+		execSQL(t, ctx, dsnB, `CREATE TABLE cdc_src.t (id INT PRIMARY KEY, v TEXT)`)
+		execSQL(t, ctx, dsnB, `INSERT INTO cdc_src.t VALUES (10,'stale'),(11,'stale')`)
+		execSQL(t, ctx, dsnB, `RESET MASTER`)
+		if got := globalVar(t, ctx, dsnB, "gtid_binlog_state"); strings.TrimSpace(got) != "" {
+			t.Fatalf("premise gone: RESET MASTER left gtid_binlog_state %q; want empty", got)
+		}
+		switch verdict := measureVerdict(t, dsnB, capturedOnA); verdict {
+		case "invalid":
+			t.Skipf("KNOWN GAP (A0915-MYSQL-HIGH-2, MariaDB): a rebuilt instance with an empty gtid_binlog_state is "+
+				"routed to the automatic re-copy (ir.ErrPositionInvalid), which would reduce the target to this "+
+				"instance's stale rows; MariaDB offers no instance identity to tell it from a same-server RESET "+
+				"MASTER, and the policy is undecided. Measured verdict: %s", verdict)
+		case "foreign":
+			t.Fatalf("the MariaDB empty-state gap has been CLOSED (verdict foreign): promote this cell to " +
+				"mustRefuse(..., ir.ErrPositionForeignLineage) and add the same-server RESET MASTER cell it now needs")
+		default:
+			t.Fatalf("rebuilt MariaDB with an empty state: unexpected verdict %q (want the known-gap 'invalid', "+
+				"or 'foreign' once the gap is closed)", verdict)
+		}
+	})
+
+	t.Run("KNOWN GAP S2: a byte-identical rebuild collides with the lineage anchor and passes both doors", func(t *testing.T) {
+		// The refuter's S2 (audit 2026-09-15): a stock rebuilt container
+		// reproduces the ORIGINAL's GTID state at the same binlog byte,
+		// because the same image, --server-id and statements produce the
+		// same events at the same offsets. Then the domain door passes
+		// (domain 0 present), the anchor door passes (BINLOG_GTID_POS at
+		// the anchor reads exactly the recorded set), the server accepts
+		// the position, and the rebuilt instance's history streams as the
+		// original's continuation with NO lineage WARN. The existing
+		// "rebuilt: same server_id, colliding GTIDs" cell above catches its
+		// rebuild only because its data differ in LENGTH from A's, so the
+		// anchor offset is not an event boundary there — orchestrated
+		// rebuilds are byte-identical. mariadb_lineage.go names this
+		// residual as an accidental collision; on containerised MariaDB it
+		// is systematic. No second witness exists today (candidate: the
+		// anchor file's Format_description timestamp); behaviour is
+		// deliberately UNCHANGED, the cell measures and states the gap.
+		dsnA2, cleanupA2 := newMariaDBDedicatedForCDC(t, "mariadb:11.4")
+		defer cleanupA2()
+		dsnB2, cleanupB2 := newMariaDBDedicatedForCDC(t, "mariadb:11.4")
+		defer cleanupB2()
+		for _, dsn := range []string{dsnA2, dsnB2} {
+			execSQL(t, ctx, dsn, `CREATE TABLE cdc_src.t (id INT PRIMARY KEY, v TEXT)`)
+			execSQL(t, ctx, dsn, `INSERT INTO cdc_src.t VALUES (1,'a'),(2,'b'),(3,'c')`)
+			execSQL(t, ctx, dsn, `FLUSH LOGS`)
+		}
+		snapA2, err := e.OpenBackupSnapshot(ctx, dsnA2, irbackup.SnapshotOptions{})
+		if err != nil {
+			t.Fatalf("OpenBackupSnapshot(A2): %v", err)
+		}
+		capturedOnA2 := snapA2.Position
+		_ = snapA2.Close()
+		var dA2 binlogPos
+		if err := json.Unmarshal([]byte(capturedOnA2.Token), &dA2); err != nil || dA2.LineageFile == "" {
+			t.Fatalf("A2's position has no anchor: %q %v", capturedOnA2.Token, err)
+		}
+		// The premise, asserted on B2: the same file, offset and state as
+		// A2's anchor — i.e. both doors are inert by construction.
+		dbB2, err := sql.Open("mysql", dsnB2)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		setAtAnchor, ok, err := mariadbLineageSetAt(ctx, dbB2, dA2.LineageFile, dA2.LineagePos)
+		_ = dbB2.Close()
+		if err != nil {
+			t.Fatalf("BINLOG_GTID_POS on B2: %v", err)
+		}
+		if !ok || setAtAnchor != dA2.LineageSet {
+			t.Fatalf("premise gone: B2 reads %q (ok=%v) at A2's anchor %s:%d, A2 recorded %q — the byte-identical "+
+				"collision this cell measures did not happen", setAtAnchor, ok, dA2.LineageFile, dA2.LineagePos, dA2.LineageSet)
+		}
+		switch verdict := measureVerdict(t, dsnB2, capturedOnA2); verdict {
+		case "accepted":
+			t.Skipf("KNOWN GAP S2 (A0915-MYSQL-HIGH-2, MariaDB): a byte-identical rebuilt instance passed the domain "+
+				"door AND the anchor door (anchor %s:%d = %q on both), the server accepted the position, and the "+
+				"rebuild's own write was delivered as the original's continuation with no lineage WARN. No second "+
+				"witness exists on MariaDB; policy undecided", dA2.LineageFile, dA2.LineagePos, dA2.LineageSet)
+		case "foreign":
+			t.Fatalf("the MariaDB S2 gap has been CLOSED (verdict foreign): promote this cell to " +
+				"mustRefuse(..., ir.ErrPositionForeignLineage)")
+		default:
+			t.Fatalf("byte-identical rebuilt MariaDB: unexpected verdict %q (want the known-gap 'accepted', or "+
+				"'foreign' once the gap is closed)", verdict)
+		}
 	})
 
 	t.Run("rebuilt colliding instance whose numbering never reached the anchor's file: refused", func(t *testing.T) {

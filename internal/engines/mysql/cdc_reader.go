@@ -1262,13 +1262,17 @@ func (r *CDCReader) dispatch(ctx context.Context, ev *replication.BinlogEvent, o
 		// parser is narrow (TRUNCATE [TABLE] [<schema>.]<table>);
 		// out-of-shape forms (multi-table truncate, etc.) fall
 		// through to generic DDL handling.
-		if truncSchema, truncTable, ok := parseTruncateTable(q); ok {
-			// The parsed schema is empty when the source DDL didn't
-			// qualify it; default to the QueryEvent's schema (the
-			// session's USE-context).
-			if truncSchema == "" {
-				truncSchema = string(e.Schema)
-			}
+		//
+		// The names are the ONE thing this lane emits that does not
+		// come from a Table_map event, so truncateEmitNames folds them
+		// to the server's stored spelling before the scope compare and
+		// the emit — every row event for the same table carries the
+		// stored name, and the pipeline's dispatch filter matches
+		// byte-exactly (audit 2026-09-15 A0915-MYSQL-HIGH-1). The scope
+		// predicate is not consulted for admission, exactly as on the
+		// row path: the reader emits, the dispatch filter drops, and
+		// what the filter must see is the spelling it sees on the rows.
+		if truncSchema, truncTable, ok := r.truncateEmitNames(q, string(e.Schema)); ok {
 			if r.databaseInScope(truncSchema) {
 				pos, err := r.positionFor(ev.Header)
 				if err != nil {
@@ -2721,11 +2725,49 @@ func verifyGTIDSetReachable(ctx context.Context, db *sql.DB, resumeSet string) e
 //
 // A promoted replica passes (its executed set is a superset of what it
 // replicated); a restore with `--set-gtid-purged=ON` passes (gtid_purged
-// seeds gtid_executed); a fresh instance, a RESET MASTER, and a replica
-// promoted WITHOUT some transactions the old primary had — which sluice
-// already applied to the target — all refuse with ir.ErrPositionInvalid
-// and route to the ADR-0022/ADR-0093 cold-start fall-through, exactly as
-// the file/pos arm's identity mismatch does.
+// seeds gtid_executed). Every "not contained" outcome is a refusal, and
+// which sentinel it carries decides whether the streamer's automatic
+// re-snapshot — drop the target's in-scope tables, re-copy from whatever
+// answers the DSN — may run:
+//
+//   - the source is BEHIND the position (every resume UUID present,
+//     sequence numbers short), or its executed set is EMPTY (a RESET
+//     MASTER): ir.ErrPositionInvalid → the ADR-0022/ADR-0093 cold-start
+//     fall-through — but ONLY when the server's own @@server_uuid is
+//     one the position names. That is the witness that the instance
+//     answering the DSN is the one (or one of the ones) the position was
+//     captured from, so the re-copy reads the same lineage.
+//   - the same two shapes on a server whose @@server_uuid the position
+//     has never seen, and a non-empty executed set sharing no UUID at
+//     all: ir.ErrPositionForeignLineage, terminal.
+//
+// The empty and BEHIND arms used to say "an EMPTY executed set is a
+// same-server RESET MASTER ... there is no other lineage here to re-copy
+// from" and route unconditionally to the re-copy. Measured false (audit
+// 2026-09-15 A0915-MYSQL-HIGH-2, real `sync start` on mysql:8.0): a
+// REBUILT instance at the same address — a restore followed by the
+// documented `RESET MASTER`, or a logical load under sql_log_bin=0 —
+// presents an empty set with its stale rows intact, and the automatic
+// re-copy reduced the target to those stale rows, losing every row CDC
+// had written since the backup, at exit 0. The BEHIND arm has the same
+// harm from a restore that seeds gtid_purged under the OLD uuid
+// (`mysqldump --set-gtid-purged=ON`, the xtrabackup restore step). In
+// both, sluice had the witness in hand — it stamped the replacement's
+// @@server_uuid into the position it wrote after destroying the target.
+//
+// What the uuid witness cannot tell apart, stated: a physical restore
+// that carries auto.cnf (same uuid) onto another host reads as a
+// same-server reset and still takes the re-copy; a replica promoted and
+// then RESET (its own uuid, never in the position) is refused and costs
+// one --restart-from-scratch — the safe direction. A genuinely lagging
+// replica behind a failover endpoint is refused on the BEHIND arm rather
+// than re-copied from; the refusal says to wait for it to catch up,
+// after which the position is contained and the resume proceeds with
+// the target intact — strictly better than the re-copy it replaces.
+//
+// Pinned per cell by TestLineageVerdicts_ForeignIsTerminalResetIsNot
+// (fake server) and TestGTIDResumeBindsLineageAcrossInstances (real
+// servers, both uuid regimes on both arms).
 func verifyGTIDLineageContinuity(ctx context.Context, db *sql.DB, resumeSet string) error {
 	var contained int
 	var executed string
@@ -2740,26 +2782,41 @@ func verifyGTIDLineageContinuity(ctx context.Context, db *sql.DB, resumeSet stri
 	if contained == 1 {
 		return nil
 	}
+	behind := gtidSetUUIDsSubset(resumeSet, executed)
+	empty := strings.TrimSpace(executed) == ""
+	if behind || empty {
+		// The witness, read only on the two arms whose verdict turns on
+		// it so the contained path stays a single round trip. A probe
+		// failure is neither verdict: the open fails loudly on it, and
+		// the reactive door treats it as "could not judge".
+		serverUUID, err := sourceServerUUID(ctx, db)
+		if err != nil {
+			return fmt.Errorf("mysql: resume lineage check needs the source's identity: %w", err)
+		}
+		if !gtidSetNamesUUID(resumeSet, serverUUID) {
+			return gtidLineageForeignByIdentity(resumeSet, executed, serverUUID, behind)
+		}
+	}
 	// Lag and lineage are different diagnoses with the same (safe)
 	// route. If every source UUID the position names is present in the
 	// source's executed set and only sequence numbers are ahead, the
-	// source is BEHIND the position — a lagging replica behind a
-	// load-balanced or DNS-failover endpoint, or a rolled-back primary —
-	// not a different lineage, and the operator should hear that.
-	if gtidSetUUIDsSubset(resumeSet, executed) {
+	// source is BEHIND the position — the instance itself (its uuid is
+	// in the set) rolled back past the position, or has a hole in its
+	// set — and the operator should hear that.
+	if behind {
 		return fmt.Errorf("mysql: the source is BEHIND the resume position: every source UUID in the resume set is "+
 			"present in the source's @@global.gtid_executed, but the resume set names transactions the source has "+
-			"not executed (resume %q; source executed %q) — a lagging replica behind a load-balanced or failover "+
-			"endpoint, a primary rolled back past the position, or a hole in the source's set; cannot resume here: %w",
+			"not executed (resume %q; source executed %q) — a primary rolled back past the position, or a hole in "+
+			"the source's set; cannot resume here: %w",
 			abbreviateGTIDSet(resumeSet), abbreviateGTIDSet(executed), ir.ErrPositionInvalid)
 	}
-	if strings.TrimSpace(executed) == "" {
-		// An EMPTY executed set is a same-server RESET MASTER (or an
-		// instance with no history at all): there is no other lineage
-		// here to re-copy from, so the automatic re-snapshot is the
-		// right recovery and this stays ir.ErrPositionInvalid.
+	if empty {
+		// An EMPTY executed set on the instance whose uuid the position
+		// names is a same-server RESET MASTER: the lineage is this
+		// server's own, so the automatic re-snapshot is the right
+		// recovery and this stays ir.ErrPositionInvalid.
 		return fmt.Errorf("mysql: the source's @@global.gtid_executed is EMPTY, so the resume GTID set %q "+
-			"names transactions this source no longer records (RESET MASTER, or a fresh instance); "+
+			"names transactions this source no longer records (RESET MASTER on this same instance); "+
 			"cannot resume: %w", abbreviateGTIDSet(resumeSet), ir.ErrPositionInvalid)
 	}
 	// Non-empty and sharing no UUID: a DIFFERENT lineage answering this
@@ -3000,6 +3057,46 @@ func gtidSetUUIDsSubset(resume, executed string) bool {
 		}
 	}
 	return true
+}
+
+// gtidSetNamesUUID reports whether the GTID set names uuid as one of its
+// sources — the witness [verifyGTIDLineageContinuity] uses on its BEHIND
+// and EMPTY arms: a position captured on this instance carries its
+// @@server_uuid (or, after a promotion, the uuid of a primary it
+// replicated from), and a position that has never seen the uuid was
+// captured on a different lineage. Compared case-insensitively the way
+// [gtidSetUUIDsSubset] does; an empty uuid names nothing.
+func gtidSetNamesUUID(set, uuid string) bool {
+	if uuid == "" {
+		return false
+	}
+	return gtidSetUUIDsSubset(uuid+":1", set)
+}
+
+// gtidLineageForeignByIdentity is the terminal verdict for the BEHIND and
+// EMPTY arms of [verifyGTIDLineageContinuity] on a server whose
+// @@server_uuid the resume position has never seen: a rebuilt or
+// restored instance, or a replica promoted from elsewhere. Deliberately
+// ir.ErrPositionForeignLineage, never ir.ErrPositionInvalid — the
+// automatic recovery would drop the target and re-copy from this other
+// instance at exit 0 (audit 2026-09-15 A0915-MYSQL-HIGH-2, measured on
+// both arms).
+func gtidLineageForeignByIdentity(resumeSet, executed, serverUUID string, behind bool) error {
+	shape := "the source's @@global.gtid_executed is EMPTY"
+	if behind {
+		shape = "the source's @@global.gtid_executed is BEHIND the resume position (it names every uuid the " +
+			"position names, short some transactions)"
+	}
+	return sluicecode.Wrap(sluicecode.CodeCDCLineageMismatch, foreignRemedy,
+		fmt.Errorf("mysql: %s, and the instance answering this DSN (@@server_uuid %s) is one the resume position has "+
+			"never seen (resume %q; source executed %q) — the source is a different lineage: a rebuilt or restored "+
+			"instance (a restore followed by RESET MASTER, or one seeded through gtid_purged from an older backup), "+
+			"or a replica promoted from elsewhere. REFUSING rather than re-copying: the automatic recovery for an "+
+			"unusable position drops the target's tables and re-copies from whatever now answers this DSN, which is "+
+			"correct for a routine purge on the same instance and destructive here. If this is a lagging replica "+
+			"behind a failover endpoint, wait for it to catch up and retry (the resume proceeds once the position is "+
+			"contained). If the replacement IS intended, re-copy deliberately with --restart-from-scratch: %w",
+			shape, serverUUID, abbreviateGTIDSet(resumeSet), abbreviateGTIDSet(executed), ir.ErrPositionForeignLineage))
 }
 
 // abbreviateGTIDSet keeps an error message readable when a gtid_executed
@@ -3268,6 +3365,49 @@ func splitQualified(qn string) (schema, table string) {
 	return "", qn
 }
 
+// truncateEmitNames is the emit-site half of the TRUNCATE arm: the
+// parser's raw spelling, defaulted to the QueryEvent's schema (the
+// session's USE-context) when the statement did not qualify it, then
+// folded the way the server stores it when the server folds
+// (foldScopeNames, read once per stream open from
+// lower_case_table_names). The fold lives HERE and not in the parser
+// because the parser's contract is the statement's spelling — its
+// tests pin raw output — and because the fold is a property of the
+// server, not of the text. It is the same fold databaseInScope applies
+// to the admission compare, so the two cannot disagree about one
+// server setting.
+//
+// Why it exists (audit 2026-09-15 A0915-MYSQL-HIGH-1, measured on
+// mysql:8.0 at lower_case_table_names=1 through a real `sync start`):
+// `TRUNCATE TABLE T1` against a stored `t1` was emitted as `T1` while
+// every row event for the same table carried `t1` from the Table_map.
+// Against a case-sensitive target the TRUNCATE was skipped as "target
+// lacks this table" and the target kept every row the source dropped;
+// against a folding MySQL target with `--exclude-table=t1` the
+// EXCLUDED table was truncated, with no WARN, because the pipeline's
+// byte-exact filter did not match `T1`. The RC-1b fold had reached the
+// admission and not the payload.
+//
+// On a case-sensitive server (lct=0) the names are emitted byte-exact:
+// there `t1` and `T1` really are two tables, and folding would be its
+// own bug. Pinned by TestTruncateEmitNames_FollowsTheServersFold (both
+// regimes) and, on a real folding server, by
+// TestCDCReader_EmittedTruncateNameFollowsTheServersFold.
+func (r *CDCReader) truncateEmitNames(query, eventSchema string) (schema, table string, ok bool) {
+	schema, table, ok = parseTruncateTable(query)
+	if !ok {
+		return "", "", false
+	}
+	if schema == "" {
+		schema = eventSchema
+	}
+	if r.foldScopeNames {
+		schema = foldMySQLIdentifier(schema)
+		table = foldMySQLIdentifier(table)
+	}
+	return schema, table, true
+}
+
 // parseTruncateTable detects whether a binlog QUERY_EVENT body is a
 // TRUNCATE statement and, if so, returns the schema-qualified table
 // reference. Returns ok=false for any non-TRUNCATE input — the
@@ -3288,6 +3428,9 @@ func splitQualified(qn string) (schema, table string) {
 // generic DDL handling, which still invalidates the schema cache —
 // the only thing the operator loses is a typed ir.Truncate event,
 // not correctness.
+//
+// The parser returns the statement's OWN spelling; the server's fold is
+// applied by [CDCReader.truncateEmitNames], the only caller that emits.
 func parseTruncateTable(query string) (schema, table string, ok bool) {
 	q := strings.TrimSpace(stripLeadingSQLComments(query))
 	upper := strings.ToUpper(q)

@@ -13,7 +13,37 @@ import (
 // stop summary) names, spelled once so the wording cannot drift: the
 // skipped rows are still on the source, and the operator either
 // re-attaches the table or makes the exclusion explicit.
-const SkippedTableRemedy = "re-attach it with `sluice schema add-table` (fresh table snapshot — the source still holds every skipped row), or make the exclusion explicit with a table filter"
+//
+// The parenthetical is scoped to ROW changes on purpose. It used to say
+// "the source still holds every skipped row", which is false for the
+// one op that removes rows: a skipped TRUNCATE means the source has
+// already dropped them (audit 2026-09-15 A0915-MYSQL-HIGH-1 measured
+// the WARN steering an operator away from the fix). The ledger and the
+// CLI surfaces that read from it do not know the op, so this shared
+// text stays true for every op; the applier's WARN, which does know
+// the op, names the TRUNCATE-specific remedy through
+// [SkippedTableRemedyFor].
+const SkippedTableRemedy = "re-attach it with `sluice schema add-table` (fresh table snapshot — for skipped INSERT/UPDATE/DELETE events the source still holds every row; a skipped TRUNCATE is the one event for which it does not), or make the exclusion explicit with a table filter"
+
+// SkippedTableTruncateRemedy is the remedy the applier's WARN names when
+// the first skipped event for a table is a TRUNCATE: the sentence that
+// holds for row changes ("the source still holds every skipped row") is
+// exactly wrong here, and the likeliest reason a TRUNCATE alone misses
+// its target table — the target holds it under another spelling — is
+// the case where the target is now AHEAD of the source and needs the
+// truncate applied by hand before anything is re-attached.
+const SkippedTableTruncateRemedy = "the skipped event is a TRUNCATE, so the source does NOT still hold the rows it dropped; if the target holds this table under another spelling it is now AHEAD of the source — truncate it deliberately, or re-attach it with `sluice schema add-table` (fresh table snapshot), or make the exclusion explicit with a table filter"
+
+// SkippedTableRemedyFor picks the remedy for the first skipped op on a
+// table: [SkippedTableTruncateRemedy] for "truncate", [SkippedTableRemedy]
+// for every row change. The op strings are the applier's own
+// ("insert"/"update"/"delete"/"truncate").
+func SkippedTableRemedyFor(op string) string {
+	if op == "truncate" {
+		return SkippedTableTruncateRemedy
+	}
+	return SkippedTableRemedy
+}
 
 // SkippedTableRecord is one row of the durable unknown-target-table
 // skip ledger (`sluice_cdc_skipped_tables`, audit C-11): when a CDC

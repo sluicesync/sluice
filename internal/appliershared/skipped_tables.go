@@ -76,13 +76,16 @@ func (t *SkipWarnTracker) FirstSighting(qualifiedTable string) bool {
 // it on [SkipWarnTracker.FirstSighting]). op names the first skipped
 // operation ("insert"/"update"/"delete"/"truncate") for diagnosis; the
 // hint names the remedy and the durable ledger so the WARN is a
-// pointer, not the record.
+// pointer, not the record. The hint is op-aware ([ir.SkippedTableRemedyFor]):
+// a skipped TRUNCATE is the one op for which "the source still holds
+// every skipped row" is false, and this WARN is the only skip surface
+// that knows the op (audit 2026-09-15 A0915-MYSQL-HIGH-1).
 func WarnSkippedTable(ctx context.Context, engineName, op, qualifiedTable string) {
 	slog.WarnContext(
 		ctx, engineName+": applier: target lacks this table — skipping its CDC events (counted durably in "+SkippedTablesTableName+"; `sluice sync health` trips while the count is nonzero)",
 		slog.String("op", op),
 		slog.String("table", qualifiedTable),
-		slog.String("hint", SkippedTableRemedy),
+		slog.String("hint", ir.SkippedTableRemedyFor(op)),
 	)
 }
 
