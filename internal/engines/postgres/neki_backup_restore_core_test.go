@@ -13,6 +13,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"path/filepath"
 	"slices"
@@ -71,13 +72,13 @@ import (
 // in Go and digested before anything is written anywhere. It is not a count
 // the target reports about itself, and not a re-read of the manifest. The
 // backup core's expected value is an ordered SELECT of the SOURCE, digested in
-// Go, compared against rows read out of the backup by restoring it into a
-// LOCAL SQLite file — a target that shares no code with the Neki read path
-// under test.
+// Go, compared against the rows read back out of the ARTIFACT'S OWN CHUNK
+// FILES — a path that touches the Neki source not at all.
 //
 // `backup verify --depth read` is run too, and is deliberately NOT the content
-// evidence: it streams each chunk through the same chunk reader restore uses,
-// so it is internally consistent with the artifact by construction. It answers
+// evidence: it streams each chunk through the same chunk reader and DISCARDS
+// the rows, so it is internally consistent with the artifact by construction
+// and says nothing about what the values are. It answers
 // a different and narrower question — "is every chunk byte-intact and
 // decodable, and does its decoded row count match what the manifest recorded"
 // — and is reported as such.
@@ -737,13 +738,17 @@ type nekiBackupCoreResult struct {
 // again, grading the artifact's content against an ordered SELECT of the
 // source digested in Go.
 //
-// The read-back target is a local SQLite file. That is deliberate and it is
-// the whole independence argument: restoring into the source would compare the
-// backup against the thing it was taken from through the same engine, and
-// `backup verify` — which is also run, below — streams each chunk through the
-// same reader restore uses and so is internally consistent with the artifact
-// by construction. Neither alone is evidence about content. The Go-side digest
-// of the source is.
+// The read-back streams the artifact's own chunk files and rebuilds the rows
+// in Go; it never touches the source again. That is deliberate and it is the
+// whole independence argument: re-reading the source would compare the backup
+// against the thing it was taken from through the same engine, and `backup
+// verify` — which is also run, below — streams each chunk and DISCARDS the
+// rows, so it is internally consistent with the artifact by construction.
+// Neither alone is evidence about content. The Go-side digest of the source,
+// taken before anything was written, is.
+//
+// See the read-back block below for why this is no longer a restore into a
+// local SQLite file, and for the one property that change gives up.
 func nekiBackupCoreFromPG(
 	ctx context.Context,
 	t *testing.T,
@@ -847,26 +852,53 @@ func nekiBackupCoreFromPG(
 		t.Errorf("neki backup core: backup verify reported %d failed chunk(s) of %d", report.Failed, report.Chunks)
 	}
 
-	// The read-back: restore into a LOCAL SQLite file, never back into the
-	// source.
-	dstDSN := filepath.Join(t.TempDir(), "neki-backup-readback.db")
-	readRec := newNekiPhaseRecorder()
-	if err := (&backup.Restore{
-		Target:    sqlite.Engine{},
-		TargetDSN: dstDSN,
-		Store:     store,
-		Progress:  readRec,
-	}).Run(ctx); err != nil {
-		t.Fatalf("%s\n\nThis is the read-back into a LOCAL SQLite file, so a failure here is about the ARTIFACT "+
-			"(or the cross-engine retarget), not about the source.",
-			nekiExplainFailure("neki backup core: read the backup back into local SQLite", readRec, err))
-	}
-
-	dst, err := sql.Open("sqlite", dstDSN)
-	if err != nil {
-		t.Fatalf("neki backup core: open the SQLite read-back target: %v", err)
-	}
-	defer func() { _ = dst.Close() }()
+	// The read-back: stream every chunk the backup wrote through the real
+	// chunk reader and rebuild the row set in Go. Never back into the source.
+	//
+	// # Why this is no longer a restore into a local SQLite file
+	//
+	// It was, until run 34928571469 (2026-09-15) failed here on a live cluster
+	// with the artifact perfectly healthy:
+	//
+	//	restore: create tables: sqlite: schema carries standalone sequence
+	//	"nv_tx_seq" (1 total); SQLite has no sequence objects and cannot
+	//	preserve its options or nextval() topology — refusing rather than
+	//	silently dropping it
+	//
+	// That refusal is CORRECT product behaviour, and the sequence was residue:
+	// the DDL/sequence premise arm creates `nv_tx_seq` on the SAME shared
+	// fixture, earlier in the run. The residue is fixed separately — but the
+	// coupling is the real defect here, because a standalone sequence rides a
+	// backup no matter which TABLES the filter names (migcore's
+	// `dropSequencesOwnedByFilteredTables` prunes only sequences whose OWNER
+	// was filtered out, and an unowned one always passes through). So this
+	// arm's content check was hostage to what every OTHER arm happened to
+	// leave in the schema, and a check that can be broken by an object it
+	// never reads is a check nobody can interpret.
+	//
+	// # What this trades away, named rather than implied
+	//
+	// The SQLite leg proved one extra thing: that the artifact RESTORES,
+	// cross-engine, into a target that shares no code with the Neki read path.
+	// Reading the chunks does NOT prove that, and this arm no longer claims
+	// it. That property is proved on every PR by [nekiRestoreCoreIntoTarget]
+	// (a full backup restored end to end into a real target), and the
+	// decodability of THIS artifact by the `--depth read` verify above.
+	//
+	// # What it does NOT trade away — the independent expected value
+	//
+	// Unchanged: an ordered SELECT of the SOURCE, folded in Go before anything
+	// was written anywhere. The comparison is still source-versus-artifact.
+	// What moved is only which of sluice's own readers renders the artifact
+	// side, and the previous one (restore) was no more independent of the
+	// writer than this one is.
+	//
+	// ORDERING. The SQLite leg re-sorted on the way out with `ORDER BY
+	// tenant_id, id`. Chunks carry rows in the order the scatter-gather read
+	// produced them, which across shards is not the source's order and is not
+	// required to be, so the sort happens here instead — explicitly, on the
+	// same key, and nothing else about a row is repaired.
+	codec := nekiRootSegmentCodec(ctx, t, store)
 
 	res := &nekiBackupCoreResult{
 		manifest:     manifest,
@@ -878,13 +910,20 @@ func nekiBackupCoreFromPG(
 		rawCopyNote:  rawCopyNote,
 		report:       report,
 	}
+	byName := map[string]*irbackup.TableManifest{}
+	for _, entry := range manifest.Tables {
+		byName[entry.Name] = entry
+	}
 	for _, tbl := range tables {
 		want := perTableWant[tbl]
-		got, err := nekiReadTriples(ctx, dst, nekiOrderedProjection(tbl))
-		if err != nil {
-			t.Errorf("neki backup core: read %s back out of the restored artifact: %v", tbl, err)
+		entry, ok := byName[tbl]
+		if !ok {
+			// Already reported above as a missing manifest entry; nothing to
+			// read back, and a silent `continue` would leave the digest maps
+			// short without saying why.
 			continue
 		}
+		got := nekiTriplesFromChunks(ctx, t, store, manifest, codec, entry)
 		wantDigest, gotDigest := nekiDigestTriples(want), nekiDigestTriples(got)
 		res.sourceDigest[tbl], res.readbackHash[tbl] = wantDigest, gotDigest
 		res.sourceRows[tbl], res.readbackRows[tbl] = len(want), len(got)
@@ -914,9 +953,165 @@ func nekiBackupCoreFromPG(
 // tables name it `payload`; aliasing here keeps ONE scan shape, so the digest
 // function cannot be fed a differently-ordered column list by accident.
 func nekiOrderedProjection(table string) string {
-	payload := "payload"
+	return fmt.Sprintf(`SELECT tenant_id, id, %s FROM %s ORDER BY tenant_id, id`,
+		nekiPayloadColumn(table), table)
+}
+
+// nekiPayloadColumn names a table's payload column — the ONE place the
+// fixture's `sk_good.v` and the restored tables' `payload` are reconciled, so
+// the SQL projection and the chunk read cannot drift apart about which column
+// carries the value.
+func nekiPayloadColumn(table string) string {
 	if table == "sk_good" {
-		payload = "v"
+		return "v"
 	}
-	return fmt.Sprintf(`SELECT tenant_id, id, %s FROM %s ORDER BY tenant_id, id`, payload, table)
+	return "payload"
+}
+
+// nekiRootSegmentCodec resolves the codec every chunk in this store was
+// written with, the same way restore does: from what the lineage RECORDS,
+// never sniffed from chunk bytes.
+func nekiRootSegmentCodec(ctx context.Context, t *testing.T, store irbackup.Store) blobcodec.Codec {
+	t.Helper()
+	cat, err := lineage.ResolveLineage(ctx, store)
+	if err != nil {
+		t.Fatalf("neki backup core: resolve the lineage to learn the chunks' recorded codec: %v", err)
+	}
+	if len(cat.Segments) == 0 {
+		t.Fatal("neki backup core: the resolved lineage has no segments, so no codec is recorded for the " +
+			"chunks this backup just wrote")
+	}
+	return cat.Segments[0].CodecOrDefault()
+}
+
+// nekiTriplesFromChunks reads every row one table's chunk files carry, through
+// the real [blobcodec.ChunkReader], and returns them sorted on (tenant, id).
+//
+// The sort is explicit because chunks hold rows in the order the source's
+// scatter-gather read produced them — across shards that is not the source's
+// `ORDER BY tenant_id, id` order and is not required to be. Nothing else about
+// a row is normalised: a value whose Go type is not one this projection can
+// hold is a hard stop naming the row, not a coercion.
+func nekiTriplesFromChunks(
+	ctx context.Context,
+	t *testing.T,
+	store irbackup.Store,
+	manifest *irbackup.Manifest,
+	codec blobcodec.Codec,
+	entry *irbackup.TableManifest,
+) []nekiTriple {
+	t.Helper()
+
+	payload := nekiPayloadColumn(entry.Name)
+	out := make([]nekiTriple, 0, entry.RowCount)
+	for _, chunk := range entry.Chunks {
+		// This core never passes key material, so an ENCRYPTED chunk cannot
+		// be opened here. Refuse by name rather than handing ciphertext to
+		// the codec reader and reporting the artifact unreadable — the
+		// diagnosis would be badly wrong (see chunkReadTarget.requireKey,
+		// which exists for the same reason on the verify path).
+		if chunk.Encryption != nil {
+			t.Fatalf("neki backup core: chunk %q of %s is ENCRYPTED and this read-back holds no key material. "+
+				"The core takes an unencrypted backup, so either the backup grew an --encrypt path or the "+
+				"manifest is not the one this run wrote.", chunk.File, entry.Name)
+		}
+		src, err := blobcodec.FetchChunkVerified(ctx, store, chunk.File, chunk.SHA256)
+		if err != nil {
+			t.Fatalf("neki backup core: fetch chunk %q of %s: %v", chunk.File, entry.Name, err)
+		}
+		// NewChunkReader owns src's Close on every path, success or failure.
+		cr, err := blobcodec.NewChunkReader(src, chunk.SHA256, nil, codec,
+			irbackup.ChunkAADFor(manifest, chunk, entry.Schema, entry.Name))
+		if err != nil {
+			t.Fatalf("neki backup core: open chunk %q of %s: %v", chunk.File, entry.Name, err)
+		}
+		for {
+			row, rerr := cr.ReadRow()
+			if errors.Is(rerr, io.EOF) {
+				break
+			}
+			if rerr != nil {
+				_ = cr.Close()
+				t.Fatalf("neki backup core: read a row out of chunk %q of %s: %v", chunk.File, entry.Name, rerr)
+			}
+			out = append(out, nekiTripleFromRow(t, entry.Name, payload, row))
+		}
+		// Close finalises the SHA-256 check over the bytes actually consumed.
+		if err := cr.Close(); err != nil {
+			t.Fatalf("neki backup core: close chunk %q of %s (this is where the chunk's SHA-256 is "+
+				"finalised): %v", chunk.File, entry.Name, err)
+		}
+	}
+	slices.SortFunc(out, func(a, b nekiTriple) int {
+		if c := cmp.Compare(a.tenant, b.tenant); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.id, b.id)
+	})
+	return out
+}
+
+// nekiTripleFromRow projects one decoded chunk row onto the (tenant, id,
+// payload) shape the digest folds.
+func nekiTripleFromRow(t *testing.T, table, payloadCol string, row ir.Row) nekiTriple {
+	t.Helper()
+	out := nekiTriple{
+		tenant: nekiRowInt64(t, table, row, "tenant_id"),
+		id:     nekiRowInt64(t, table, row, "id"),
+	}
+	raw, ok := row[payloadCol]
+	if !ok {
+		t.Fatalf("neki backup core: a chunk row of %s carries no %q column (columns present: %v) — the "+
+			"backup captured a different shape than the source projection reads", table, payloadCol, nekiRowKeys(row))
+	}
+	switch v := raw.(type) {
+	case nil:
+		// A genuine NULL. nekiDigestTriples renders it distinctly from the
+		// literal string "NULL", which is the whole reason the payload is a
+		// sql.NullString rather than a string.
+		out.payload = sql.NullString{}
+	case string:
+		out.payload = sql.NullString{String: v, Valid: true}
+	case []byte:
+		out.payload = sql.NullString{String: string(v), Valid: true}
+	default:
+		t.Fatalf("neki backup core: the %q value of %s row (%d,%d) decoded as %T, which this projection "+
+			"cannot hold — refusing rather than rendering it with %%v and comparing a coerced string",
+			payloadCol, table, out.tenant, out.id, raw)
+	}
+	return out
+}
+
+// nekiRowInt64 reads one integer key column out of a decoded chunk row,
+// refusing loudly on anything the projection cannot hold.
+func nekiRowInt64(t *testing.T, table string, row ir.Row, col string) int64 {
+	t.Helper()
+	raw, ok := row[col]
+	if !ok {
+		t.Fatalf("neki backup core: a chunk row of %s carries no %q column (columns present: %v)",
+			table, col, nekiRowKeys(row))
+	}
+	switch v := raw.(type) {
+	case int64:
+		return v
+	case int32:
+		return int64(v)
+	case int:
+		return int64(v)
+	}
+	t.Fatalf("neki backup core: the %q value of a %s chunk row decoded as %T (%v), not an integer — a BIGINT "+
+		"key column arriving as something else is a value-fidelity finding, not something to coerce",
+		col, table, raw, raw)
+	return 0
+}
+
+// nekiRowKeys renders a decoded row's column names deterministically for a
+// failure message.
+func nekiRowKeys(row ir.Row) []string {
+	keys := make([]string, 0, len(row))
+	for k := range row {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	return keys
 }

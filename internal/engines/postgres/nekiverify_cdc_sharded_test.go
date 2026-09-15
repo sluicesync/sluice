@@ -78,6 +78,11 @@ func nekiCDCIntoShardedTarget(ctx context.Context, t *testing.T, db *sql.DB, fx 
 			)`); err != nil {
 			t.Fatalf("create cdc_content: %v", err)
 		}
+		// RESIDUE: this table lives on the SHARED fixture and the backup arm,
+		// which runs later in the same test function, reads the whole schema.
+		// A subtest-scoped t.Cleanup is correct here (unlike the DDL arm's
+		// sequence, nothing after this subtest needs cdc_content).
+		t.Cleanup(func() { nekiDropResidue(t, db, `DROP TABLE IF EXISTS cdc_content`) })
 		// The shard key is INSIDE the primary key — the supported shape. The
 		// unsupported one is what TestNekiverify_ShardedRefusalPremises
 		// grades; this test is about content on a table that is allowed to

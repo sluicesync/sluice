@@ -127,6 +127,16 @@ func nekiMoveTablesBlocksWithNK213(ctx context.Context, t *testing.T, db *sql.DB
 			defer cancel()
 			_, _ = db.ExecContext(cctx, `DROP DATABASE IF EXISTS `+moveTgt)
 		})
+		// RESIDUE ROSTER, this arm's entry: the move-target database is
+		// dropped above and the workflow's traffic is reversed below. `mv_src`
+		// itself is deliberately LEFT — it is ENROLLED in the operator-declared
+		// data topology, and dropping the relation without de-enrolling it
+		// would leave the topology naming a table that does not exist, which is
+		// a worse state than the table. De-enrolling is a router WRITE, and a
+		// teardown is the wrong place for one. This arm runs LAST by design
+		// (see the ordering comment in nekiverify_refusals_test.go), so nothing
+		// downstream reads the schema; if an arm is ever added after it, this
+		// exemption is the thing to revisit first.
 
 		// The SOURCE database's own sub-document, not the whole cluster one —
 		// see oneDatabaseTopologyDoc for why. `postgres` is the source database

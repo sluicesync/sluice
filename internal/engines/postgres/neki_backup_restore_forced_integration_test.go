@@ -32,7 +32,9 @@ import (
 // index through the Neki-adapted engine code, the content digests line up, the
 // backup-from-Postgres direction writes a manifest whose recorded row count
 // matches an independent count, `backup verify --depth read` passes on the
-// artifact, and the artifact reads back into a local SQLite target byte-exact.
+// artifact, and the artifact's own chunk files read back byte-exact — with a
+// standalone sequence deliberately standing on the source, which is the exact
+// shape that made the live arm's read-back refuse on 2026-09-15.
 // When the live arm then fails, the diff between "it worked here an hour ago"
 // and "it failed there" is a platform finding rather than a coin flip.
 //
@@ -118,10 +120,57 @@ func TestPostgresSuite_NekiBackupRestorePlumbing(t *testing.T) {
 		}
 	})
 
-	t.Run("backup core: a backup of those tables reads back byte-exact into local SQLite", func(t *testing.T) {
+	t.Run("backup core: a backup of those tables reads back byte-exact", func(t *testing.T) {
 		// Runs second, on the tables the restore above created, mirroring
 		// the live arms' ordering exactly.
+
+		// A STANDALONE SEQUENCE on the source, and it is the point of this
+		// leg rather than scenery.
+		//
+		// The live backup arm failed on run 34928571469 (2026-09-15) not on
+		// the router but on its read-back, because an earlier arm had left
+		// `nv_tx_seq` on the shared fixture: a standalone sequence rides a
+		// backup no matter which TABLES the filter names, and the read-back
+		// target refused it. That was a HARNESS question answered at the cost
+		// of a provisioned cluster, which is exactly what this file exists to
+		// prevent. So the per-PR run now reproduces the shape for free —
+		// unowned (no OWNED BY), so migcore's owned-sequence pruning cannot
+		// filter it out, and primed, so the manifest carries real options.
+		const residueSeq = "nk_plumbing_standalone_seq"
+		func() {
+			db, err := sql.Open("pgx", dsn)
+			if err != nil {
+				t.Fatalf("open to create the standalone sequence: %v", err)
+			}
+			defer func() { _ = db.Close() }()
+			if _, err := db.ExecContext(ctx, `CREATE SEQUENCE IF NOT EXISTS `+residueSeq+` START 5`); err != nil {
+				t.Fatalf("create the standalone sequence this leg reproduces the live failure with: %v", err)
+			}
+			if _, err := db.ExecContext(ctx, `SELECT setval('`+residueSeq+`', 7, true)`); err != nil {
+				t.Fatalf("prime the standalone sequence: %v", err)
+			}
+		}()
+
 		res := nekiBackupCoreFromPG(ctx, t, dsn, []string{spec.table, spec.tableSmall}, 4_000)
+
+		// ANTI-VACUITY for the paragraph above. If the backup stopped
+		// capturing standalone sequences — a filter change, a reader change —
+		// this leg would go on passing while no longer reproducing anything,
+		// and the next live run would pay for the discovery again.
+		carried := false
+		for _, seq := range res.manifest.Schema.Sequences {
+			if seq != nil && seq.Name == residueSeq {
+				carried = true
+				break
+			}
+		}
+		if !carried {
+			t.Errorf("the backup did NOT capture the standalone sequence %q (manifest carries %d sequence(s)), "+
+				"so this leg no longer reproduces the shape that failed live on 2026-09-15 and the read-back "+
+				"below proves nothing about it. Either the schema reader stopped reporting standalone "+
+				"sequences or the table filter started pruning unowned ones — both are worth knowing.",
+				residueSeq, len(res.manifest.Schema.Sequences))
+		}
 
 		// The raw-copy decline is what makes a Neki backup take the IR copy
 		// path rather than `COPY (SELECT …) TO`, which the router refuses

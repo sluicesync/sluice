@@ -556,3 +556,35 @@ func readAuthoritativeShardGroup(ctx context.Context, t *testing.T, fx *nekiFixt
 	t.Logf("nekiverify: existing authoritative shard group is %q — preserving it", group)
 	return group
 }
+
+// nekiDropResidue drops objects an arm created on the SHARED fixture, on a
+// context of its own so it still runs when the arm's has been spent.
+//
+// # Why this is a named helper rather than an inline DROP
+//
+// Every arm in this suite runs as a subtest of one parent test function
+// against ONE database, so anything an arm leaves behind is visible to every
+// arm after it — including the backup arm, which reads the WHOLE schema.
+// Run 34928571469 (2026-09-15) is what that costs: the DDL/sequence arm's
+// `nv_tx_seq` was still standing when the backup arm ran, the backup captured
+// it (a standalone sequence rides a backup regardless of which tables the
+// filter names), and the read-back refused it — correctly, and on a question
+// the paid run should never have been spent asking.
+//
+// Failures are LOGGED, never fatal: a teardown that fails is worth seeing and
+// is not itself a finding about the platform, and a t.Fatalf here would turn
+// residue into a red arm.
+func nekiDropResidue(t *testing.T, db *sql.DB, stmts ...string) {
+	t.Helper()
+	// A context of its own, deliberately: the arm's may already be cancelled
+	// by the time a teardown runs, and a teardown that silently no-ops is the
+	// exact shape this helper exists to remove.
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	for _, stmt := range stmts {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			t.Logf("nekiverify teardown: %q failed, so this object is now residue a LATER arm's schema read "+
+				"will see: %v", stmt, err)
+		}
+	}
+}

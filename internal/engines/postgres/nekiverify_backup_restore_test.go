@@ -62,10 +62,20 @@ import (
 func nekiRestoreIntoShardedTarget(ctx context.Context, t *testing.T, db *sql.DB, fx *nekiFixture, tenantA, tenantB int) {
 	t.Helper()
 
+	// RESIDUE, and the one place a PARENT-scoped cleanup is the right scope:
+	// the backup arm runs after this one and deliberately backs these tables
+	// up when they exist, so a subtest-scoped teardown would take them away
+	// before the arm that wants them. Registering on the parent drops them at
+	// the end of the test function — after every arm, before teardown.
+	spec := defaultNekiBackupRestoreSpec(int64(tenantA), int64(tenantB))
+	t.Cleanup(func() {
+		nekiDropResidue(t, db,
+			`DROP TABLE IF EXISTS `+spec.table,
+			`DROP TABLE IF EXISTS `+spec.tableSmall)
+	})
+
 	t.Run("restore INTO a sharded Neki target lands byte-exact content across both shards", func(t *testing.T) {
 		nekiArmIdentity(t, "restore-into-sharded-neki", fx.name)
-
-		spec := defaultNekiBackupRestoreSpec(int64(tenantA), int64(tenantB))
 
 		// A clean slate for this arm's own tables. `DROP TABLE IF EXISTS`
 		// rather than a filter, because a leftover from a previous failed

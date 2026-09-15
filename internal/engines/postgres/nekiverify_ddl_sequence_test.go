@@ -58,6 +58,20 @@ import (
 func nekiDDLAndSequencePremises(ctx context.Context, t *testing.T, db *sql.DB) {
 	t.Helper()
 
+	// RESIDUE. `nv_tx_seq` outlives the subtests below — they create it,
+	// re-read it, and classify the refusal on it — so its teardown belongs to
+	// the ARM, not to any one subtest.
+	//
+	// `defer` rather than `t.Cleanup`, and the difference is the whole bug:
+	// every arm in this suite is a subtest of ONE parent test function, so a
+	// cleanup registered on that parent runs after EVERY LATER ARM. That is
+	// exactly the ordering that left a standalone sequence standing on the
+	// shared fixture for the backup arm's schema read (run 34928571469,
+	// 2026-09-15), where it was captured into the backup and made the
+	// read-back refuse. A defer fires when this arm returns, including on a
+	// t.Fatalf inside it.
+	defer nekiDropResidue(t, db, `DROP SEQUENCE IF EXISTS nv_tx_seq`)
+
 	t.Run("PREMISE: DDL inside an explicit transaction does not survive", func(t *testing.T) {
 		// Drop first so a re-run against a fixture that somehow kept state
 		// cannot pass by finding yesterday's sequence.
