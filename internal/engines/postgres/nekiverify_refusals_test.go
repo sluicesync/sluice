@@ -179,6 +179,17 @@ func TestNekiverify_ShardedRefusalPremises(t *testing.T) {
 	nekiRestoreIntoShardedTarget(ctx, t, db, fx, tenantA, tenantB)
 	nekiBackupFromShardedSource(ctx, t, db, fx, tenantA, tenantB)
 
+	// What a SHARD-TARGETED session can do — the probe that decides whether
+	// per-shard consistent reads and composite-position incrementals are
+	// mechanisms sluice could have, or neither.
+	//
+	// AFTER the backup arm deliberately: it opens sessions of its own and
+	// writes (then removes) probe rows in sk_good to measure the misrouting
+	// hazard, and the backup arm reads the WHOLE schema. Running it earlier
+	// would make its transient rows somebody else's read.
+	// See nekiverify_shard_targeting_probe_test.go.
+	nekiShardTargetedSessionProbe(ctx, t, db, fx, tenantA, tenantB, readAuthoritativeShardGroup(ctx, t, fx))
+
 	// Coverage item #3: the NK213 block from a real MoveTables cutover.
 	// LAST, deliberately — it creates a workflow that blocks a table and a
 	// second logical database, and although it reverses both, a failure
