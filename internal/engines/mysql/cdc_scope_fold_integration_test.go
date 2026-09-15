@@ -25,6 +25,7 @@ import (
 	"context"
 	"database/sql"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -55,8 +56,8 @@ func TestCDCReader_ScopeFollowsTheServersFold(t *testing.T) {
 			if err != nil {
 				t.Fatalf("StreamChanges: %v", err)
 			}
-			if !rdr.(*CDCReader).foldScopeNames {
-				t.Fatal("reader did not learn the server folds (lower_case_table_names=1) — the cell below would measure the wrong regime")
+			if rdr.(*CDCReader).lowerCaseTableNames != 1 {
+				t.Fatalf("reader learned lower_case_table_names=%d; want 1 — the cell below would measure the wrong regime", rdr.(*CDCReader).lowerCaseTableNames)
 			}
 
 			// Give the pump its startup window, then write through THIS
@@ -113,30 +114,52 @@ func TestCDCReader_ScopeFollowsTheServersFold(t *testing.T) {
 // driven, because each alone can pass for the wrong reason — a
 // fold-always mutant greens the lct=1 cell and reds the lct=0 one, where
 // the mixed-case stored name must come back byte-exact.
+//
+// Two resolution sources are driven on the real server (the unit test
+// grades the third, the lct=2 regime, which no Linux container can run):
+// a table whose rows the reader has already MAPPED (each TRUNCATE is
+// preceded by an INSERT, so the stored spelling comes off the Table_map
+// record) and a table the reader has never seen a row for (the catalog
+// lookup — the information_schema query is what this cell proves valid
+// on a real 8.0; its answer is checked against the CREATE spelling). The
+// lookup is counted through the reader's seam, set before the pump
+// starts: on lct=1 it must be asked exactly once (the unmapped table,
+// never the mapped ones), on lct=0 never — a resolution that consulted
+// the catalog on a case-sensitive server, or ahead of the reader's own
+// record, shows here.
 func TestCDCReader_EmittedTruncateNameFollowsTheServersFold(t *testing.T) {
 	cells := []struct {
-		name      string
-		args      []string
-		wantFold  bool
-		table     string   // the CREATE TABLE spelling (= the stored name on both regimes)
-		truncates []string // the TRUNCATE statements, in the operator's spelling
+		name            string
+		args            []string
+		wantLCT         int
+		table           string   // the CREATE TABLE spelling (= the stored name on both regimes)
+		truncates       []string // the TRUNCATE statements, in the operator's spelling
+		unmappedTable   string   // a second table the reader never sees a row event for
+		unmappedTrunc   string   // its TRUNCATE, in the operator's spelling
+		wantLookupCalls int64
 	}{
 		{
-			name:     "lct1_folding_server",
-			args:     []string{"--lower-case-table-names=1"},
-			wantFold: true,
-			table:    "t",
+			name:    "lct1_folding_server",
+			args:    []string{"--lower-case-table-names=1"},
+			wantLCT: 1,
+			table:   "t",
 			// Unqualified with the table upper-cased, then qualified with
 			// BOTH halves upper-cased: the schema fold and the table fold
 			// are each exercised against the real server.
-			truncates: []string{"TRUNCATE TABLE T", "TRUNCATE TABLE SOURCE_DB.T"},
+			truncates:       []string{"TRUNCATE TABLE T", "TRUNCATE TABLE SOURCE_DB.T"},
+			unmappedTable:   "u",
+			unmappedTrunc:   "TRUNCATE TABLE SOURCE_DB.U",
+			wantLookupCalls: 1,
 		},
 		{
-			name:      "lct0_case_sensitive_server_stays_byte_exact",
-			args:      nil, // the upstream image's Linux default, lct=0
-			wantFold:  false,
-			table:     "Tt",
-			truncates: []string{"TRUNCATE TABLE Tt", "TRUNCATE TABLE source_db.Tt"},
+			name:            "lct0_case_sensitive_server_stays_byte_exact",
+			args:            nil, // the upstream image's Linux default, lct=0
+			wantLCT:         0,
+			table:           "Tt",
+			truncates:       []string{"TRUNCATE TABLE Tt", "TRUNCATE TABLE source_db.Tt"},
+			unmappedTable:   "Uu",
+			unmappedTrunc:   "TRUNCATE TABLE source_db.Uu",
+			wantLookupCalls: 0,
 		},
 	}
 	for _, cell := range cells {
@@ -144,6 +167,7 @@ func TestCDCReader_EmittedTruncateNameFollowsTheServersFold(t *testing.T) {
 			dsn, cleanup := startMySQLM2PreflightImage(t, "mysql:8.0", cell.args...)
 			defer cleanup()
 			applyMySQL(t, dsn, "CREATE TABLE "+cell.table+" (id BIGINT NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB;")
+			applyMySQL(t, dsn, "CREATE TABLE "+cell.unmappedTable+" (id BIGINT NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB;")
 
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 			defer cancel()
@@ -152,12 +176,20 @@ func TestCDCReader_EmittedTruncateNameFollowsTheServersFold(t *testing.T) {
 				t.Fatalf("OpenCDCReader: %v", err)
 			}
 			defer func() { _ = rdr.(*CDCReader).Close() }()
+			// Count the catalog lookups through the seam, delegating to
+			// the REAL query so the server still answers it. Written
+			// before the pump starts, read after the stream is drained.
+			var lookupCalls atomic.Int64
+			rdr.(*CDCReader).storedTableNameLookup = func(ctx context.Context, q rowQuerier, schema, table string) (string, string, bool, error) {
+				lookupCalls.Add(1)
+				return lookupStoredTableName(ctx, q, schema, table)
+			}
 			ch, err := rdr.(*CDCReader).StreamChanges(ctx, ir.Position{})
 			if err != nil {
 				t.Fatalf("StreamChanges: %v", err)
 			}
-			if got := rdr.(*CDCReader).foldScopeNames; got != cell.wantFold {
-				t.Fatalf("reader learned foldScopeNames=%v; want %v — the cell would measure the wrong regime", got, cell.wantFold)
+			if got := rdr.(*CDCReader).lowerCaseTableNames; got != cell.wantLCT {
+				t.Fatalf("reader learned lower_case_table_names=%d; want %d — the cell would measure the wrong regime", got, cell.wantLCT)
 			}
 
 			time.Sleep(3 * time.Second)
@@ -180,11 +212,17 @@ func TestCDCReader_EmittedTruncateNameFollowsTheServersFold(t *testing.T) {
 					t.Fatalf("%s: %v", stmt, err)
 				}
 			}
+			// The unmapped table: a TRUNCATE with no row event before it,
+			// so the reader holds no Table_map record to resolve from.
+			if _, err := db.ExecContext(ctx, cell.unmappedTrunc); err != nil {
+				t.Fatalf("%s: %v", cell.unmappedTrunc, err)
+			}
 
 			var inserts []ir.Insert
 			var truncates []ir.Truncate
+			wantTruncates := len(cell.truncates) + 1
 			deadline := time.After(45 * time.Second)
-			for len(truncates) < len(cell.truncates) {
+			for len(truncates) < wantTruncates {
 				select {
 				case c, ok := <-ch:
 					if !ok {
@@ -197,11 +235,11 @@ func TestCDCReader_EmittedTruncateNameFollowsTheServersFold(t *testing.T) {
 						truncates = append(truncates, e)
 					}
 				case <-deadline:
-					t.Fatalf("saw %d insert(s) and %d truncate(s) within 45s; want %d truncates", len(inserts), len(truncates), len(cell.truncates))
+					t.Fatalf("saw %d insert(s) and %d truncate(s) within 45s; want %d truncates", len(inserts), len(truncates), wantTruncates)
 				}
 			}
 			if len(inserts) != len(cell.truncates) {
-				t.Fatalf("saw %d inserts; want %d (one per TRUNCATE) — the harness is not measuring what it claims", len(inserts), len(cell.truncates))
+				t.Fatalf("saw %d inserts; want %d (one per mapped TRUNCATE) — the harness is not measuring what it claims", len(inserts), len(cell.truncates))
 			}
 			// The Table_map's spelling is the stored name: the premise
 			// that makes the insert an INDEPENDENT expected value.
@@ -210,13 +248,24 @@ func TestCDCReader_EmittedTruncateNameFollowsTheServersFold(t *testing.T) {
 					t.Fatalf("Table_map-sourced insert carries %q.%q; want source_db.%s (the stored spelling)", ins.Schema, ins.Table, cell.table)
 				}
 			}
-			for i, tr := range truncates {
+			for i, tr := range truncates[:len(cell.truncates)] {
 				ins := inserts[i]
 				if tr.Schema != ins.Schema || tr.Table != ins.Table {
 					t.Fatalf("%s: emitted ir.Truncate names %q.%q but the Table_map-sourced ir.Insert for the same table names "+
 						"%q.%q — the pipeline's byte-exact filter and a case-sensitive target see two tables (A0915-MYSQL-HIGH-1)",
 						cell.truncates[i], tr.Schema, tr.Table, ins.Schema, ins.Table)
 				}
+			}
+			// The unmapped table's expected value is its CREATE spelling
+			// (the stored name on both regimes: lowercase on lct=1 where
+			// it was created lowercase, byte-exact on lct=0).
+			if last := truncates[len(cell.truncates)]; last.Schema != "source_db" || last.Table != cell.unmappedTable {
+				t.Fatalf("%s: emitted ir.Truncate names %q.%q; want source_db.%s (the stored spelling of a table the reader never mapped)",
+					cell.unmappedTrunc, last.Schema, last.Table, cell.unmappedTable)
+			}
+			if got := lookupCalls.Load(); got != cell.wantLookupCalls {
+				t.Fatalf("the catalog lookup ran %d time(s); want %d — lct=%d resolves the mapped tables from the reader's own "+
+					"Table_map record and only the unmapped one from information_schema, and lct=0 resolves nothing", got, cell.wantLookupCalls, cell.wantLCT)
 			}
 		})
 	}

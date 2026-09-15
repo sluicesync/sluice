@@ -89,4 +89,50 @@ func TestBlobStore_ParseFailureErrorsDoNotLeakCredentials(t *testing.T) {
 			})
 		}
 	}
+
+	// The THIRD leak shape, reachable only through the public entry point:
+	// a URL that parses cleanly and is refused by the gocloud DRIVER,
+	// whose error text is `%v` of the *url.URL — userinfo included. Two
+	// refusal families, each driver's own param validation (`?bogus=1`,
+	// answered before any credential or network is touched) and the mux's
+	// unregistered-scheme refusal (`s4://`), so a scrub that reached one
+	// wrapper and not the other would show here. Every registered scheme
+	// that accepts a userinfo-bearing URL is driven (azblob is not: its
+	// opener needs an account before it validates params).
+	t.Run("driver refusal echoes the URL", func(t *testing.T) {
+		fileRoot := strings.ReplaceAll(t.TempDir(), "\\", "/")
+		if !strings.HasPrefix(fileRoot, "/") {
+			fileRoot = "/" + fileRoot // a Windows drive path needs the leading slash to form a three-slash file URL
+		}
+		driverInputs := []struct {
+			name, in, reason string
+		}{
+			{"s3 unknown query parameter", "s3://" + accessKey + ":" + secret + "@mybucket/prefix?bogus=1", "bogus"},
+			{"gs unknown query parameter", "gs://" + accessKey + ":" + secret + "@mybucket/prefix?bogus=1", "bogus"},
+			{"file unknown query parameter", "file://" + accessKey + ":" + secret + "@" + fileRoot + "?bogus=1", "bogus"},
+			{"unregistered scheme", "s4://" + accessKey + ":" + secret + "@mybucket/prefix", "s4"},
+		}
+		for _, in := range driverInputs {
+			t.Run(in.name, func(t *testing.T) {
+				_, err := OpenBlobStore(context.Background(), in.in, BlobStoreOptions{})
+				if err == nil {
+					t.Fatalf("OpenBlobStore accepted %q; expected the driver to refuse it", redactBlobURL(in.in))
+				}
+				msg := err.Error()
+				for _, s := range []string{secret, accessKey} {
+					if strings.Contains(msg, s) {
+						t.Errorf("OpenBlobStore leaked %q through the DRIVER's error text:\n  %s\n\n"+
+							"gocloud builds its refusal with %%v of the *url.URL, which prints userinfo; "+
+							"the wrapped driver error must go through scrubBlobDriverErr.", s, msg)
+					}
+				}
+				if !strings.Contains(msg, "bucket") {
+					t.Errorf("the scrub dropped the locator with the credential: %s", msg)
+				}
+				if !strings.Contains(msg, in.reason) {
+					t.Errorf("the scrub dropped the driver's reason (%q) with the credential: %s", in.reason, msg)
+				}
+			})
+		}
+	})
 }

@@ -18,12 +18,16 @@ import (
 )
 
 // lineageFakeDriver answers the lineage probes from its DSN:
-// "executed=<set>|contained=<0|1>" for the MySQL GTID_SUBSET probe,
-// "uuid=<server_uuid>" for the @@server_uuid witness the BEHIND and EMPTY
-// arms read (a DSN that omits it makes that read FAIL, so a cell that
-// reaches the witness without stating it errors rather than silently
-// measuring the empty-uuid case), and "state=<set>" for MariaDB's
-// @@gtid_binlog_state.
+// "executed=<set>|contained=<0|1>|uuid=<server_uuid>" for the MySQL
+// probe — ONE statement carrying the GTID_SUBSET verdict, the executed
+// set and the @@server_uuid witness, matched on its exact text so a
+// change that split the witness back onto a second round trip (two pool
+// connections; two backends behind a load balancer) is red here — and
+// "state=<set>" for MariaDB's @@gtid_binlog_state. A DSN that omits
+// uuid= makes the WHOLE MySQL statement fail, which is what a source
+// that refuses @@global.server_uuid does to the folded probe: a cell
+// that wants a verdict must state its uuid, and the one cell that wants
+// the unreadable-witness shape omits it on purpose.
 type lineageFakeDriver struct{}
 
 type lineageFakeConn struct {
@@ -58,15 +62,13 @@ func (c *lineageFakeConn) Begin() (driver.Tx, error) { return nil, errors.New("u
 
 func (c *lineageFakeConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
 	switch query {
-	case "SELECT GTID_SUBSET(?, @@global.gtid_executed), @@global.gtid_executed":
-		return &lineageFakeRows{cols: []string{"contained", "executed"}, vals: []driver.Value{c.contained, c.executed}}, nil
+	case "SELECT GTID_SUBSET(?, @@global.gtid_executed), @@global.gtid_executed, @@global.server_uuid":
+		if !c.hasUUID {
+			return nil, errors.New("lineage fake: @@global.server_uuid is not readable on this source (no uuid= in the cell's DSN)")
+		}
+		return &lineageFakeRows{cols: []string{"contained", "executed", "server_uuid"}, vals: []driver.Value{c.contained, c.executed, c.uuid}}, nil
 	case "SELECT @@gtid_binlog_state":
 		return &lineageFakeRows{cols: []string{"@@gtid_binlog_state"}, vals: []driver.Value{c.state}}, nil
-	case "SELECT @@global.server_uuid":
-		if !c.hasUUID {
-			return nil, errors.New("lineage fake: the cell reached the @@server_uuid witness without a uuid= in its DSN")
-		}
-		return &lineageFakeRows{cols: []string{"@@global.server_uuid"}, vals: []driver.Value{c.uuid}}, nil
 	}
 	return nil, errors.New("unexpected query: " + query)
 }
@@ -149,11 +151,16 @@ func TestLineageVerdicts_ForeignIsTerminalResetIsNot(t *testing.T) {
 
 	t.Run("mysql GTID continuity", func(t *testing.T) {
 		t.Parallel()
-		if err := verifyGTIDLineageContinuity(ctx, newLineageFakeDB(t, "contained=1|executed="+resume), resume); err != nil {
+		if err := verifyGTIDLineageContinuity(ctx, newLineageFakeDB(t, "contained=1|executed="+resume+"|uuid="+uuidA), resume); err != nil {
 			t.Fatalf("contained: %v; want nil", err)
 		}
+		// The disjoint arm never consults the witness: the source's own
+		// uuid being named is irrelevant once the executed set shares
+		// nothing with the position.
 		wantVerdict(t, "foreign (non-empty, disjoint)", verifyGTIDLineageContinuity(ctx,
-			newLineageFakeDB(t, "contained=0|executed="+uuidB+":1-8"), resume), true)
+			newLineageFakeDB(t, "contained=0|executed="+uuidB+":1-8|uuid="+uuidB), resume), true)
+		wantVerdict(t, "foreign (non-empty, disjoint) even when the witness names the position's uuid", verifyGTIDLineageContinuity(ctx,
+			newLineageFakeDB(t, "contained=0|executed="+uuidB+":1-8|uuid="+uuidA), resume), true)
 		// The four-cell witness matrix.
 		wantVerdict(t, "reset on the SAME instance (empty executed, uuid named by the position)", verifyGTIDLineageContinuity(ctx,
 			newLineageFakeDB(t, "contained=0|executed=|uuid="+uuidA), resume), false)
@@ -170,10 +177,15 @@ func TestLineageVerdicts_ForeignIsTerminalResetIsNot(t *testing.T) {
 		wantVerdict(t, "reset on a promoted replica whose uuid the multi-source position names", verifyGTIDLineageContinuity(ctx,
 			newLineageFakeDB(t, "contained=0|executed=|uuid="+uuidB), resume+","+uuidB+":1-3"), false)
 		// A witness that cannot be read is neither verdict: loud, and
-		// routing nothing.
-		if err := verifyGTIDLineageContinuity(ctx, newLineageFakeDB(t, "contained=0|executed="), resume); err == nil ||
-			errors.Is(err, ir.ErrPositionInvalid) || errors.Is(err, ir.ErrPositionForeignLineage) {
-			t.Fatalf("unreadable @@server_uuid on the empty arm: %v; want a plain error carrying neither sentinel", err)
+		// routing nothing. Under the folded statement the unreadable
+		// witness takes the whole probe with it, on every arm — the
+		// contained cell here would have passed on the split read and
+		// is now loud too (documented at verifyGTIDLineageContinuity).
+		for _, cell := range []string{"contained=0|executed=", "contained=1|executed=" + resume} {
+			if err := verifyGTIDLineageContinuity(ctx, newLineageFakeDB(t, cell), resume); err == nil ||
+				errors.Is(err, ir.ErrPositionInvalid) || errors.Is(err, ir.ErrPositionForeignLineage) {
+				t.Fatalf("unreadable @@server_uuid (%s): %v; want a plain error carrying neither sentinel", cell, err)
+			}
 		}
 	})
 
@@ -220,9 +232,21 @@ func TestVerifyLineage_AnswersOnlyTheForeignQuestion(t *testing.T) {
 	}
 	const resume = "aaaaaaaa-0000-0000-0000-000000000001:1-15"
 
-	foreign := &CDCReader{db: newLineageFakeDB(t, "contained=0|executed=bbbbbbbb-0000-0000-0000-000000000002:1-8"), flavor: FlavorVanilla}
+	foreign := &CDCReader{db: newLineageFakeDB(t, "contained=0|executed=bbbbbbbb-0000-0000-0000-000000000002:1-8|uuid=bbbbbbbb-0000-0000-0000-000000000002"), flavor: FlavorVanilla}
 	if err := foreign.VerifyLineage(ctx, gtidPos(resume)); !errors.Is(err, ir.ErrPositionForeignLineage) {
 		t.Fatalf("foreign source: VerifyLineage = %v; want ErrPositionForeignLineage", err)
+	}
+	// An UNREADABLE witness is "could not judge", and the door's
+	// documented answer to that is nil — fail-OPEN: the reactive recovery
+	// proceeds exactly as it would on a source this door cannot see. That
+	// is a deliberate posture (the door may only narrow what the recovery
+	// destroys, never widen what it refuses), and this pin exists so a
+	// change to it is a decision rather than a drift. Under the folded
+	// probe an unreadable @@server_uuid fails the whole statement, so the
+	// shape is one source that answers nothing.
+	unreadable := &CDCReader{db: newLineageFakeDB(t, "contained=0|executed="), flavor: FlavorVanilla}
+	if err := unreadable.VerifyLineage(ctx, gtidPos(resume)); err != nil {
+		t.Fatalf("unreadable witness: VerifyLineage = %v; want nil (documented fail-open — the door answers only the foreign question)", err)
 	}
 	reset := &CDCReader{db: newLineageFakeDB(t, "contained=0|executed=|uuid=aaaaaaaa-0000-0000-0000-000000000001"), flavor: FlavorVanilla}
 	if err := reset.VerifyLineage(ctx, gtidPos(resume)); err != nil {

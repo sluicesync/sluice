@@ -139,21 +139,35 @@ type CDCReader struct {
 	// `schema` is the whole set. Never consulted on the pump.
 	cdcDBList []string
 
-	// foldScopeNames is set at [StreamChanges] from the source's
-	// `lower_case_table_names`: when the server folds identifiers, the
-	// single-database scope compare folds too. The bound `schema` is the
-	// DSN's database AS THE OPERATOR TYPED IT, while every binlog event
-	// carries the database name AS STORED — and a folding server stores
-	// the lowercase form whatever was typed, resolving `SOURCE_DB` to
-	// `source_db` for every query so the copy phase never notices. A
-	// byte-exact compare then drops every event in scope: empty tail,
-	// green heartbeat (audit 2026-09-09 RC-1b, measured on a real
-	// lower_case_table_names=1 server). The multi-database predicate is
-	// deliberately NOT folded: its selected set is computed FROM the
-	// catalog listing (pipeline selectNamespaces filters the names the
-	// server returned), so it only ever holds stored spellings. Read on
-	// the pump goroutine; written before the pump starts.
-	foldScopeNames bool
+	// lowerCaseTableNames is the source's EFFECTIVE
+	// `lower_case_table_names`, read once at [StreamChanges]. It decides
+	// two things on the pump. (1) Whether the single-database scope
+	// compare folds (`!= 0`): the bound `schema` is the DSN's database AS
+	// THE OPERATOR TYPED IT, while every binlog event carries the
+	// database name AS STORED — and a folding server stores the lowercase
+	// form whatever was typed, resolving `SOURCE_DB` to `source_db` for
+	// every query so the copy phase never notices. A byte-exact compare
+	// then drops every event in scope: empty tail, green heartbeat (audit
+	// 2026-09-09 RC-1b, measured on a real lower_case_table_names=1
+	// server). The multi-database predicate is deliberately NOT folded:
+	// its selected set is computed FROM the catalog listing (pipeline
+	// selectNamespaces filters the names the server returned), so it
+	// only ever holds stored spellings. (2) How [truncateEmitNames]
+	// resolves a TRUNCATE's stored spelling when the server compares
+	// case-insensitively — the VALUE matters there, not just the
+	// predicate, because lct=1 stores lowercase and lct=2 stores the
+	// as-created case. Read on the pump goroutine; written before the
+	// pump starts.
+	lowerCaseTableNames int
+
+	// storedTableNameLookup is the seam [truncateEmitNames] resolves a
+	// TRUNCATE's stored spelling through when the reader's own cache has
+	// not seen the table. nil — the value every production construction
+	// gets — means the real information_schema lookup on r.db; unit
+	// tests inject a fake so the lct=2 regime, which no Linux container
+	// can run (see truncateEmitNames), is graded at all. Zero-value-safe
+	// the way schemaLoader is.
+	storedTableNameLookup func(ctx context.Context, q rowQuerier, schema, table string) (storedSchema, storedTable string, found bool, err error)
 
 	// host and port are extracted from the DSN at construction time
 	// and used to configure the binlog syncer's connection. Stored
@@ -574,13 +588,21 @@ func (r *CDCReader) databaseInScope(database string) bool {
 	if r.cdcDBInScope != nil {
 		return r.cdcDBInScope(database)
 	}
-	if r.foldScopeNames {
+	if r.foldsScopeNames() {
 		// A folding server stores and logs the lowercase name whatever
 		// the DSN spelled (RC-1b); compare the way the server does.
 		return foldMySQLIdentifier(database) == foldMySQLIdentifier(r.schema)
 	}
 	return database == r.schema
 }
+
+// foldsScopeNames reports whether the source compares identifiers
+// case-insensitively (lower_case_table_names 1 or 2) — the ONE predicate
+// the scope compare and the TRUNCATE emit both key on, so they cannot
+// disagree about one server setting. Both non-zero settings compare
+// case-insensitively; they differ only in what they STORE, which is
+// [truncateEmitNames]'s concern.
+func (r *CDCReader) foldsScopeNames() bool { return r.lowerCaseTableNames != 0 }
 
 // binlogFilterScope names this stream's synced databases for the G6
 // binlog-filter preflight: the bound schema in single-database mode,
@@ -723,15 +745,16 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 		return nil, err
 	}
 
-	// The scope compare follows the server's identifier fold (see
-	// foldScopeNames). One global read; loud on failure, the posture of
-	// the preflights above — any account that can open a stream can
-	// read it, so a failure is a broken connection, not evidence.
+	// The scope compare and the TRUNCATE emit follow the server's
+	// identifier rule (see lowerCaseTableNames). One global read; loud on
+	// failure, the posture of the preflights above — any account that
+	// can open a stream can read it, so a failure is a broken connection,
+	// not evidence.
 	lct, err := readLowerCaseTableNames(ctx, r.db)
 	if err != nil {
 		return nil, fmt.Errorf("mysql: cdc: scope name rule: %w", err)
 	}
-	r.foldScopeNames = lct != 0
+	r.lowerCaseTableNames = lct
 
 	startPos, err := r.resolveStartPosition(ctx, from)
 	if err != nil {
@@ -1264,15 +1287,22 @@ func (r *CDCReader) dispatch(ctx context.Context, ev *replication.BinlogEvent, o
 		// through to generic DDL handling.
 		//
 		// The names are the ONE thing this lane emits that does not
-		// come from a Table_map event, so truncateEmitNames folds them
-		// to the server's stored spelling before the scope compare and
-		// the emit — every row event for the same table carries the
+		// come from a Table_map event, so truncateEmitNames resolves
+		// them to the server's stored spelling before the scope compare
+		// and the emit — every row event for the same table carries the
 		// stored name, and the pipeline's dispatch filter matches
 		// byte-exactly (audit 2026-09-15 A0915-MYSQL-HIGH-1). The scope
 		// predicate is not consulted for admission, exactly as on the
 		// row path: the reader emits, the dispatch filter drops, and
 		// what the filter must see is the spelling it sees on the rows.
-		if truncSchema, truncTable, ok := r.truncateEmitNames(q, string(e.Schema)); ok {
+		// A resolution error fails the stream the way a schema-load
+		// error on the row path does: the alternative is an emitted
+		// name nothing downstream can trust.
+		truncSchema, truncTable, ok, err := r.truncateEmitNames(ctx, q, string(e.Schema))
+		if err != nil {
+			return err
+		}
+		if ok {
 			if r.databaseInScope(truncSchema) {
 				pos, err := r.positionFor(ev.Header)
 				if err != nil {
@@ -2765,19 +2795,54 @@ func verifyGTIDSetReachable(ctx context.Context, db *sql.DB, resumeSet string) e
 // after which the position is contained and the resume proceeds with
 // the target intact — strictly better than the re-copy it replaces.
 //
+// The IN-PLACE restore is the residual the witness cannot see, and it
+// is the common restore shape: `RESET MASTER` then `mysql < dump.sql`
+// on the SAME box, auto.cnf untouched. The instance keeps its uuid, so
+// the position names it; the executed set is EMPTY (a plain load) or
+// BEHIND under that same uuid (`--set-gtid-purged=ON` seeding the
+// pre-backup range) — both are the witness-passes shape, and the
+// automatic re-copy still runs, reducing the target to the restored
+// rows and losing every row CDC had written since the backup, at exit
+// 0. (A load that ran MORE transactions than the position names is
+// worse still: the set is CONTAINED, nothing here fires, and the
+// resume streams the load's own transactions as if they were new
+// writes.) That is a stated residual, not a closed case, and the open policy
+// question is whether BEHIND-with-own-uuid should be terminal too: it
+// would close this shape at the cost of refusing the primary-rolled-
+// back and hole-in-the-set diagnoses that the BEHIND arm exists to
+// name, and of turning a routine same-server RESET MASTER into a
+// --restart-from-scratch. Not decided here.
+//
+// The executed-set probe and the @@server_uuid witness are ONE
+// statement, deliberately: on *sql.DB two QueryRowContext calls can
+// take two pool connections, and behind a load-balancing proxy two
+// connections can land on two backends — a witness read from a
+// different instance than the set it is judging is no witness. MariaDB
+// never reaches this function (it has neither GTID_SUBSET nor
+// @@server_uuid; its domain door is verifyMariaDBDomainsPresent), so
+// the folded statement costs nothing it did not already require. The
+// one behaviour it changes: a source that answers GTID_SUBSET but
+// refuses @@global.server_uuid now fails this check on EVERY arm,
+// where the split read only reached the witness on the BEHIND/EMPTY
+// arms — stock MySQL 5.6+ (the only population with gtid_mode) always
+// has the variable, so that is a proxy that filters system variables,
+// and it fails loudly rather than silently.
+//
 // Pinned per cell by TestLineageVerdicts_ForeignIsTerminalResetIsNot
 // (fake server) and TestGTIDResumeBindsLineageAcrossInstances (real
 // servers, both uuid regimes on both arms).
 func verifyGTIDLineageContinuity(ctx context.Context, db *sql.DB, resumeSet string) error {
 	var contained int
-	var executed string
+	var executed, serverUUID string
 	err := db.QueryRowContext(
 		ctx,
-		"SELECT GTID_SUBSET(?, @@global.gtid_executed), @@global.gtid_executed",
+		"SELECT GTID_SUBSET(?, @@global.gtid_executed), @@global.gtid_executed, @@global.server_uuid",
 		resumeSet,
-	).Scan(&contained, &executed)
+	).Scan(&contained, &executed, &serverUUID)
 	if err != nil {
-		return fmt.Errorf("mysql: GTID_SUBSET(resume, @@gtid_executed): %w", err)
+		// A probe failure is neither verdict: the open fails loudly on
+		// it, and the reactive door treats it as "could not judge".
+		return fmt.Errorf("mysql: GTID_SUBSET(resume, @@gtid_executed) with the @@server_uuid witness: %w", err)
 	}
 	if contained == 1 {
 		return nil
@@ -2785,14 +2850,8 @@ func verifyGTIDLineageContinuity(ctx context.Context, db *sql.DB, resumeSet stri
 	behind := gtidSetUUIDsSubset(resumeSet, executed)
 	empty := strings.TrimSpace(executed) == ""
 	if behind || empty {
-		// The witness, read only on the two arms whose verdict turns on
-		// it so the contained path stays a single round trip. A probe
-		// failure is neither verdict: the open fails loudly on it, and
-		// the reactive door treats it as "could not judge".
-		serverUUID, err := sourceServerUUID(ctx, db)
-		if err != nil {
-			return fmt.Errorf("mysql: resume lineage check needs the source's identity: %w", err)
-		}
+		// The witness, consulted only on the two arms whose verdict
+		// turns on it.
 		if !gtidSetNamesUUID(resumeSet, serverUUID) {
 			return gtidLineageForeignByIdentity(resumeSet, executed, serverUUID, behind)
 		}
@@ -3368,13 +3427,14 @@ func splitQualified(qn string) (schema, table string) {
 // truncateEmitNames is the emit-site half of the TRUNCATE arm: the
 // parser's raw spelling, defaulted to the QueryEvent's schema (the
 // session's USE-context) when the statement did not qualify it, then
-// folded the way the server stores it when the server folds
-// (foldScopeNames, read once per stream open from
-// lower_case_table_names). The fold lives HERE and not in the parser
+// resolved to the spelling the server STORES when the server compares
+// identifiers case-insensitively (lowerCaseTableNames != 0, read once
+// per stream open). The resolution lives HERE and not in the parser
 // because the parser's contract is the statement's spelling — its
-// tests pin raw output — and because the fold is a property of the
-// server, not of the text. It is the same fold databaseInScope applies
-// to the admission compare, so the two cannot disagree about one
+// tests pin raw output — and because the rule is a property of the
+// server, not of the text. It keys on the same predicate
+// databaseInScope applies to the admission compare
+// ([CDCReader.foldsScopeNames]), so the two cannot disagree about one
 // server setting.
 //
 // Why it exists (audit 2026-09-15 A0915-MYSQL-HIGH-1, measured on
@@ -3388,24 +3448,118 @@ func splitQualified(qn string) (schema, table string) {
 // byte-exact filter did not match `T1`. The RC-1b fold had reached the
 // admission and not the payload.
 //
+// # Why the stored spelling is RESOLVED, not computed
+//
+// The first cut lowercased the name whenever the server compares
+// case-insensitively. That is exact on lct=1, where the server STORES
+// lowercase, and wrong on lct=2 (the Windows / macOS default: stored
+// as created, compared case-insensitively), where a stored `Users`
+// reaches every row event as `Users` from the Table_map while the
+// lowercased TRUNCATE would say `users` — the HIGH-1 harm in the other
+// regime (pre-tag value-fidelity review of v0.153.2). So the name is
+// looked up rather than derived, from two sources that are both
+// independent of the statement text and both carry the stored
+// spelling: the reader's own Table_map record and schema cache (what
+// the row events for this table already said), then a case-insensitive
+// information_schema lookup on the source. Only when neither knows the
+// table — an excluded table whose rows this reader never mapped, on a
+// server whose catalog has already lost it — does the rule fall back:
+// the lowercase fold on lct=1, where it is exact by the server's own
+// storage rule, and the statement's spelling on lct=2.
+//
+// UNVERIFIED PREMISE: the lct=2 regime cannot be measured here. MySQL
+// honours 2 only on a case-insensitive filesystem; asked for it in a
+// Linux container it logs MY-010160 and runs at 0 (see
+// table_name_fold.go), so no CI container can hold a stored `Users`
+// under a case-insensitive compare. The cache and catalog resolutions
+// are graded on lct=1 by the real-server pin, and on the lct=2 shape
+// only by the unit test's fake lookup; that the Table_map and
+// information_schema carry the as-created case on a real lct=2 server
+// is the documented behaviour and is not pinned by anything here.
+//
 // On a case-sensitive server (lct=0) the names are emitted byte-exact:
-// there `t1` and `T1` really are two tables, and folding would be its
-// own bug. Pinned by TestTruncateEmitNames_FollowsTheServersFold (both
-// regimes) and, on a real folding server, by
-// TestCDCReader_EmittedTruncateNameFollowsTheServersFold.
-func (r *CDCReader) truncateEmitNames(query, eventSchema string) (schema, table string, ok bool) {
+// there `t1` and `T1` really are two tables, and any resolution would
+// be its own bug. Pinned by TestTruncateEmitNames_FollowsTheServersFold
+// (all three regimes × every resolution source) and, on a real folding
+// server, by TestCDCReader_EmittedTruncateNameFollowsTheServersFold.
+func (r *CDCReader) truncateEmitNames(ctx context.Context, query, eventSchema string) (schema, table string, ok bool, err error) {
 	schema, table, ok = parseTruncateTable(query)
 	if !ok {
-		return "", "", false
+		return "", "", false, nil
 	}
 	if schema == "" {
 		schema = eventSchema
 	}
-	if r.foldScopeNames {
-		schema = foldMySQLIdentifier(schema)
-		table = foldMySQLIdentifier(table)
+	if !r.foldsScopeNames() {
+		return schema, table, true, nil
 	}
-	return schema, table, true
+	if s, t, found := r.mappedStoredTableName(schema, table); found {
+		return s, t, true, nil
+	}
+	lookup := r.storedTableNameLookup
+	if lookup == nil {
+		lookup = lookupStoredTableName
+	}
+	s, t, found, err := lookup(ctx, r.db, schema, table)
+	if err != nil {
+		return "", "", false, fmt.Errorf("mysql: cdc: resolve the stored spelling of the TRUNCATE target %s.%s: %w", schema, table, err)
+	}
+	if found {
+		return s, t, true, nil
+	}
+	if r.lowerCaseTableNames == 1 {
+		return foldMySQLIdentifier(schema), foldMySQLIdentifier(table), true, nil
+	}
+	return schema, table, true, nil
+}
+
+// mappedStoredTableName resolves a TRUNCATE target's stored spelling
+// from what this reader has already seen the SERVER say about the
+// table: the qualified names recorded off Table_map events (tableMap;
+// out-of-scope tables are the "" sentinel and never match) and the
+// schema cache keyed by them. Both carry the stored spelling, and both
+// are consulted on the pump goroutine that writes them. The match is
+// the server's own case-insensitive rule imitated by
+// [foldMySQLIdentifier] on both halves.
+func (r *CDCReader) mappedStoredTableName(schema, table string) (storedSchema, storedTable string, found bool) {
+	want := qualifiedName(foldMySQLIdentifier(schema), foldMySQLIdentifier(table))
+	match := func(qn string) bool {
+		s, t := splitQualified(qn)
+		return qn != "" && qualifiedName(foldMySQLIdentifier(s), foldMySQLIdentifier(t)) == want
+	}
+	for _, qn := range r.tableMap {
+		if match(qn) {
+			s, t := splitQualified(qn)
+			return s, t, true
+		}
+	}
+	for qn := range r.schemaCache {
+		if match(qn) {
+			s, t := splitQualified(qn)
+			return s, t, true
+		}
+	}
+	return "", "", false
+}
+
+// lookupStoredTableName is the catalog half of the resolution: the
+// stored spelling of a table the source knows under a case-insensitive
+// compare. The fold is the SERVER's LOWER(), not Go's, so a non-ASCII
+// name is matched by the rule the server itself stores under. Not
+// found is a verdict, not an error — the caller decides the fallback.
+func lookupStoredTableName(ctx context.Context, q rowQuerier, schema, table string) (storedSchema, storedTable string, found bool, err error) {
+	err = q.QueryRowContext(
+		ctx,
+		"SELECT TABLE_SCHEMA, TABLE_NAME FROM information_schema.TABLES WHERE LOWER(TABLE_SCHEMA) = LOWER(?) AND LOWER(TABLE_NAME) = LOWER(?) LIMIT 1",
+		schema, table,
+	).Scan(&storedSchema, &storedTable)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", false, nil
+	}
+	if err != nil {
+		return "", "", false, err
+	}
+	return storedSchema, storedTable, true, nil
 }
 
 // parseTruncateTable detects whether a binlog QUERY_EVENT body is a

@@ -80,7 +80,7 @@ var emittedChangeNameRoster = map[string]emittedNameEntry{
 	// VStream lane (two hand-mirrored readers): rows and boundaries from
 	// FIELD/ROW events; the TRUNCATE arms parse DDL text and are emitted
 	// UNFOLDED. Stated, not implied: this lane never reads
-	// lower_case_table_names (no foldScopeNames on either reader) and its
+	// lower_case_table_names (no lowerCaseTableNames on either reader) and its
 	// keyspace-bound scope compare is byte-exact too, so a fold here would
 	// be a rule the lane has no evidence for. The names it emits for a
 	// TRUNCATE follow whatever case the operator spelled — the same

@@ -397,12 +397,21 @@ func Load(path string) (*Config, error) {
 	// The explicit StringToSliceHookFunc makes a comma-separated env
 	// value land as a []string ("citext,pg_trgm" → [citext pg_trgm]) —
 	// koanf's default unmarshal leaves it a one-element slice. Mirrors
-	// the fleet loader's decoder config (cmd/sluice/sync_run.go).
+	// the fleet loader's decoder config (cmd/sluice/sync_run.go), which
+	// has no optional-integer fields and no WeaklyTypedInput, so the
+	// integer hook below is this loader's alone.
 	var c Config
 	if err := k.UnmarshalWithConf("", &c, koanf.UnmarshalConf{
 		Tag: "koanf",
 		DecoderConfig: &mapstructure.DecoderConfig{
-			DecodeHook:       mapstructure.StringToSliceHookFunc(","),
+			// optionalIntegerHook runs FIRST: WeaklyTypedInput (needed for
+			// the env-var overlay, where every value is a string) would
+			// otherwise coerce `""`, `5.7`, `true` and 2^63 into a present
+			// integer for the pointer-typed redaction options.
+			DecodeHook: mapstructure.ComposeDecodeHookFunc(
+				optionalIntegerHook(),
+				mapstructure.StringToSliceHookFunc(","),
+			),
 			Result:           &c,
 			WeaklyTypedInput: true,
 			TagName:          "koanf",

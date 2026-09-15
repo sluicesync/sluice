@@ -118,6 +118,53 @@ func TestRedactCLIAndYAMLAgreeOnRequiredOptions(t *testing.T) {
 	if sharedValue < 4 {
 		t.Fatalf("only %d refusal pair(s) matched a shared error value; floor 4 (truncate, randomize:int, mask:inner, mask:outer) — a surface stopped returning the shared value", sharedValue)
 	}
+
+	// The PRESENT-BUT-NOT-AN-INTEGER half of the same agreement (pre-tag
+	// value-fidelity review of v0.153.2): every spelling the CLI's strconv
+	// refuses for these options must be refused by the YAML surface too —
+	// at config.Load, before any rule is built — where WeaklyTypedInput
+	// used to coerce it into a present integer (`""` → 0, 5.7 → 5, true →
+	// 1, 2^63 → -2^63). Each YAML value is written the way the option
+	// would appear in the file; the CLI spelling is the same text inside
+	// the spec. The 2^63 cell is representable on both; the boolean and
+	// the empty string are text on the CLI (where `truncate:` is the
+	// option-less shape, refused as missing) and a YAML scalar in the
+	// file.
+	t.Run("present but not an integer is refused on both surfaces", func(t *testing.T) {
+		cells := []struct {
+			name, cliSpec, yamlEntry string
+		}{
+			{"truncate length empty", "truncate:", "strategy: truncate\n    length: \"\""},
+			{"truncate length 5.7", "truncate:5.7", "strategy: truncate\n    length: 5.7"},
+			{"truncate length true", "truncate:true", "strategy: truncate\n    length: true"},
+			{"truncate length 2^63", "truncate:9223372036854775808", "strategy: truncate\n    length: 9223372036854775808"},
+			{"mask inner m1 empty", "mask:inner:,4", "strategy: mask\n    form: inner\n    m1: \"\"\n    m2: 4"},
+			{"mask outer m2 5.7", "mask:outer:4,5.7", "strategy: mask\n    form: outer\n    m1: 4\n    m2: 5.7"},
+			{"mask outer m1 true", "mask:outer:true,4", "strategy: mask\n    form: outer\n    m1: true\n    m2: 4"},
+			{"randomize int min 2^63", "randomize:int:9223372036854775808,1", "strategy: randomize\n    form: int\n    min: 9223372036854775808\n    max: 1"},
+			{"randomize int max 5.7", "randomize:int:1,5.7", "strategy: randomize\n    form: int\n    min: 1\n    max: 5.7"},
+			{"randomize int min empty", "randomize:int:,9", "strategy: randomize\n    form: int\n    min: \"\"\n    max: 9"},
+			{"randomize int max true", "randomize:int:1,true", "strategy: randomize\n    form: int\n    min: 1\n    max: true"},
+		}
+		for _, c := range cells {
+			t.Run(c.name, func(t *testing.T) {
+				if _, err := strategyFromSpec(c.cliSpec, nil, "", nil); err == nil {
+					t.Fatalf("the CLI accepted %q; this cell's premise is that it refuses", c.cliSpec)
+				}
+				path := filepath.Join(t.TempDir(), "sluice.yaml")
+				yaml := "redactions:\n  - table: users.col\n    " + c.yamlEntry + "\n"
+				if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				cfg, err := config.Load(path)
+				if err == nil {
+					t.Fatalf("the CLI refuses %q but the YAML sibling LOADED as %+v — a non-integer spelling decoded to a present "+
+						"integer, so a rule the CLI would not run is about to run at exit 0 (the WeaklyTypedInput coercion)",
+						c.cliSpec, cfg.Redactions[0])
+				}
+			})
+		}
+	})
 }
 
 // cliSupportedSpecShapes reads the CLI parser's own supported-spec list

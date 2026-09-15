@@ -115,7 +115,7 @@ func OpenBlobStore(ctx context.Context, urlStr string, opts BlobStoreOptions) (*
 	}
 	bucket, err := blob.OpenBucket(ctx, full)
 	if err != nil {
-		return nil, fmt.Errorf("blob store: open bucket %q: %w", redactBlobURL(full), err)
+		return nil, fmt.Errorf("blob store: open bucket %q: %w", redactBlobURL(full), scrubBlobDriverErr(full, err))
 	}
 	prefix, err := extractBlobPrefix(full)
 	if err != nil {
@@ -589,6 +589,67 @@ func redactBlobURL(s string) string {
 		return scheme + "[redacted]@" + s[at+1:]
 	}
 	return s
+}
+
+// scrubBlobDriverErr removes the URL's userinfo from a gocloud driver
+// error before it is wrapped beside the redacted URL.
+//
+// The redactBlobURL one argument earlier is not enough on its own, and
+// this is the second time the same shape has slipped past it (the first
+// was the raw *url.Error, A0915-SEC-MEDIUM-1): gocloud's drivers build
+// their refusals with `%v` of the *url.URL they were handed, and
+// url.URL.String() prints userinfo, password included. So
+// `s3://KEY:SECRET@bucket/p?bogus=1` came back as
+// `open bucket "s3://bucket/p": ... unknown query parameter "bogus"` with
+// the FULL URL inside the wrapped text, and an unregistered scheme
+// (`s4://KEY:SECRET@…`) echoed the whole URL from blob.DefaultURLMux's
+// "no driver registered" refusal. Reproduced through OpenBlobStore with
+// no network (pre-tag value-fidelity review of v0.153.2).
+//
+// The URL parsed cleanly to get here (annotateBlobURL parsed it), so
+// the userinfo is KNOWN rather than guessed: every spelling the driver
+// could have echoed — the raw string, url.URL's re-encoded rendering,
+// the userinfo segment of each, and the bare password in either
+// encoding — is replaced by its redacted form. The bare username is not
+// scrubbed on its own: it reaches driver text only inside the userinfo
+// (which is), and a username can coincide with a bucket or path word
+// the operator needs to read.
+//
+// The result is a NEW error and the driver's chain is deliberately
+// dropped: keeping an Unwrap would hand the raw text straight back to
+// any `%v` of the cause, and nothing matches on this error — the one
+// caller (cmd/sluice/backup.go openBackupStore) wraps it and returns;
+// the gcerrors.Code / smithy matches in this file are all on per-object
+// operations, never on the open. Pinned by
+// TestBlobStore_ParseFailureErrorsDoNotLeakCredentials's OpenBlobStore
+// site (`?bogus=1` on s3 / gs / file, and an unknown scheme).
+func scrubBlobDriverErr(full string, err error) error {
+	u, perr := url.Parse(full)
+	if perr != nil || u.User == nil {
+		// No userinfo to scrub: the query string is not a credential
+		// carrier for any registered driver (see redactBlobURL), and
+		// the wrapped text is the driver's own.
+		return err
+	}
+	redacted := redactBlobURL(full)
+	pairs := []string{full, redacted, u.String(), redacted}
+	// The userinfo segment as the operator typed it (between the scheme
+	// separator and the LAST '@' of the authority), and as url.URL
+	// re-encodes it.
+	if sep := strings.Index(full, "://"); sep >= 0 {
+		authority := full[sep+3:]
+		if end := strings.IndexAny(authority, "/?#"); end >= 0 {
+			authority = authority[:end]
+		}
+		if at := strings.LastIndexByte(authority, '@'); at >= 0 {
+			pairs = append(pairs, authority[:at+1], "")
+		}
+	}
+	pairs = append(pairs, u.User.String()+"@", "")
+	if pw, ok := u.User.Password(); ok && pw != "" {
+		pairs = append(pairs, pw, "[redacted]", url.QueryEscape(pw), "[redacted]", url.PathEscape(pw), "[redacted]")
+	}
+	return errors.New(strings.NewReplacer(pairs...).Replace(err.Error()))
 }
 
 // wrapBlobErr maps a gocloud error to an operator-actionable wrapped
