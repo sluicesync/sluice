@@ -77,12 +77,16 @@ func TestAuditFindingsAreFiled(t *testing.T) {
 
 	// ANTI-VACUITY, and it is the specific lesson of
 	// TestManifestCommitter_SidecarCheckpointCost: an index this parser
-	// cannot read must FAIL, never pass with zero rows. The floor is well
-	// under the current count so ordinary additions do not trip it, and
-	// well above zero so a broken parser cannot hide.
-	if len(entries) < 20 {
-		t.Fatalf("parsed only %d finding entries from %s; the index carries far more, so the line "+
-			"regex has drifted and this gate would pass on nothing. Fix the parser, not the floor.",
+	// cannot read must FAIL, never pass with zero rows. The floors sit
+	// within ~20% of the measured truth (169 entries / 149 filed on
+	// 2026-09-15), not at the 20/15 the first cut chose: at 20/15 a parser
+	// drift dropping 85% of the index still passed (audit 2026-09-15,
+	// reconciler §2 item 7 — the same slack A0909-TCI-H-3 corrected in the
+	// publication roster). Ordinary additions only raise the counts; a
+	// deliberate index prune lowers the floor in the same commit.
+	if len(entries) < 135 {
+		t.Fatalf("parsed only %d finding entries from %s; the index carries ~169, so the line "+
+			"regex has drifted and this gate would pass on a fraction. Fix the parser, not the floor.",
 			len(entries), indexPath)
 	}
 
@@ -107,9 +111,10 @@ func TestAuditFindingsAreFiled(t *testing.T) {
 	}
 
 	// The second half of the floor: if every entry were `prose` or
-	// `withdrawn`, the loop above would assert nothing at all.
-	if filedCount < 15 {
-		t.Fatalf("only %d of %d entries are marked `filed`; this gate enforces nothing on the rest, so "+
+	// `withdrawn`, the loop above would assert nothing at all. ~149 are
+	// `filed` today; the floor is within ~20% of that.
+	if filedCount < 120 {
+		t.Fatalf("only %d of %d entries are marked `filed` (~149 are); this gate enforces nothing on the rest, so "+
 			"a wholesale re-labelling would silence it", filedCount, len(entries))
 	}
 
@@ -252,5 +257,109 @@ func TestAuditFindingsInCodeMarkersAreFiled(t *testing.T) {
 			"reached the index is invisible to a check that reads the index. File it, or add a "+
 			"codeMarkerExempt entry saying why it is not a backlog finding.",
 			len(missing), strings.Join(missing, "\n  "))
+	}
+}
+
+// datedSectionRE matches a level-2 dated section heading in either file:
+// "## 2026-09-15 — …".
+var datedSectionRE = regexp.MustCompile(`^## (20\d\d-\d\d-\d\d)\b`)
+
+// TestAuditFindingsIndexCoversTheNewestBacklogSection closes the one
+// direction the two gates above cannot see (audit 2026-09-15, reconciler
+// §5). TestAuditFindingsAreFiled grades index → backlog, so an ID never
+// ENTERED in the index is invisible to it by construction — its own doc
+// says so. TestAuditFindingsInCodeMarkersAreFiled derives its universe from
+// in-code markers, and a pass whose fixes carry no marker leaves that
+// universe empty for the era. Both floors were kept high by older eras
+// while 0 of the 2026-09-15 pass's IDs (VF0915-F1..F3, PP0915, A0915-*)
+// were indexed.
+//
+// THE RULE: the newest dated section in docs/dev/audit-backlog.md must
+// have a section of the same date in docs/dev/audit-findings-index.md,
+// and that index section must carry at least one parseable entry. A
+// backlog section the index does not know about therefore FAILS instead
+// of passing.
+//
+// WHAT IT REACHES, stated so it cannot be read as broader: the NEWEST
+// backlog date only. Older unindexed sections are not graded — the
+// ratchet is that each new pass has to index itself before the next one
+// lands. A dated backlog section that genuinely carries no finding IDs
+// (a measurement register) still owes the index a section, with a single
+// `- <label> prose <reason>` line saying so; that is one line, and it is
+// the acknowledgement that turns "nobody indexed it" into "there was
+// nothing to index".
+//
+// Mutation-run both ways: delete the newest index section → red; delete
+// the newest backlog section (so the newest becomes a date the index has
+// no section for) → red.
+func TestAuditFindingsIndexCoversTheNewestBacklogSection(t *testing.T) {
+	root := repoRootFromDocsync(t)
+	indexRaw, err := os.ReadFile(filepath.Join(root, "docs", "dev", "audit-findings-index.md"))
+	if err != nil {
+		t.Fatalf("read index: %v", err)
+	}
+	backlogRaw, err := os.ReadFile(filepath.Join(root, "docs", "dev", "audit-backlog.md"))
+	if err != nil {
+		t.Fatalf("read backlog: %v", err)
+	}
+
+	// Newest backlog date, by VALUE — the file is not strictly ordered
+	// (a 2026-09-12 register sits below a 2026-09-13 entry today).
+	newest := ""
+	backlogDated := 0
+	for _, line := range strings.Split(string(backlogRaw), "\n") {
+		m := datedSectionRE.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		backlogDated++
+		if m[1] > newest {
+			newest = m[1]
+		}
+	}
+
+	// Index sections, with the count of parseable entries under each.
+	indexEntries := map[string]int{}
+	current := ""
+	indexDated := 0
+	for _, line := range strings.Split(string(indexRaw), "\n") {
+		if m := datedSectionRE.FindStringSubmatch(line); m != nil {
+			current = m[1]
+			indexDated++
+			if _, seen := indexEntries[current]; !seen {
+				indexEntries[current] = 0
+			}
+			continue
+		}
+		if current != "" && findingLineRE.MatchString(strings.TrimSpace(line)) {
+			indexEntries[current]++
+		}
+	}
+
+	// Anti-vacuity on both parses: the backlog carries dozens of dated
+	// sections and the index several; a regex that stops matching fails
+	// here rather than passing on an empty comparison.
+	if backlogDated < 20 {
+		t.Fatalf("parsed only %d dated sections from the backlog; it carries dozens, so datedSectionRE drifted", backlogDated)
+	}
+	if indexDated < 3 {
+		t.Fatalf("parsed only %d dated sections from the index; it carries several, so datedSectionRE drifted", indexDated)
+	}
+	if newest == "" {
+		t.Fatal("no dated backlog section found")
+	}
+
+	n, ok := indexEntries[newest]
+	switch {
+	case !ok:
+		t.Errorf("the newest dated section in docs/dev/audit-backlog.md is %s, and docs/dev/audit-findings-index.md "+
+			"has no '## %s' section. Every pass indexes itself: add the section listing each finding ID as "+
+			"`filed` / `prose <reason>` / `withdrawn <reason>` — the index-driven gate cannot see an ID that "+
+			"never reached the index, which is exactly how 0 of the 2026-09-15 pass's IDs were indexed.",
+			newest, newest)
+	case n == 0:
+		t.Errorf("docs/dev/audit-findings-index.md has a '## %s' section for the newest backlog date but it carries "+
+			"no parseable entry ('- <ID> filed|prose|withdrawn'); an empty section is the same leak with a heading on it",
+			newest)
 	}
 }

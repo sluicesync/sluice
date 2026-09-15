@@ -54,6 +54,49 @@ other eighteen.
 
 ---
 
+## 2026-09-15 — Tier-3 blind audit at the v0.153.1 release commit, plus the pre-tag VF/PP reviews
+
+Indexed 2026-09-15 by the CI/gate remediation pass, which also added
+`TestAuditFindingsIndexCoversTheNewestBacklogSection` — the gate that
+fails when the newest dated backlog section has no section here. The IDs
+below are the backlog's own spellings. Where the backlog files a range on
+one line (`A0915-PG-MEDIUM-1 / -2`, `A0915-TCI-MEDIUM-1..4`) the members
+after the first are `prose`: present by content on the sibling's line,
+not by their own ID.
+
+### Reconciler-graded HIGHs and MEDIUMs
+
+- A0915-CFG-HIGH-1 filed
+- A0915-MYSQL-HIGH-1 filed
+- A0915-MYSQL-HIGH-2 filed
+- A0915-SEC-MEDIUM-1 filed
+- A0915-STATE-MEDIUM-1 filed
+- A0915-STATE-MEDIUM-2 filed
+- A0915-STATE-MEDIUM-3 filed
+- A0915-PG-MEDIUM-1 filed
+- A0915-PG-MEDIUM-2 prose filed as "/ -2" on the A0915-PG-MEDIUM-1 line (the two producers of one defect)
+- A0915-PG-MEDIUM-3 filed
+- A0915-MYSQL-MEDIUM-1 filed
+- A0915-MYSQL-MEDIUM-2 filed
+- A0915-ARCH-MEDIUM-1 filed
+- A0915-ARCH-MEDIUM-2 filed
+- A0915-ARCH-MEDIUM-3 filed
+- A0915-ARCH-MEDIUM-4 filed
+- A0915-CLI-MEDIUM-1 filed
+- A0915-TCI-MEDIUM-1 filed
+- A0915-TCI-MEDIUM-2 prose filed as the "1..4" range on the A0915-TCI-MEDIUM-1 line (check-no-private-refs.sh scope; FIXED by the 2026-09-15 CI/gate pass)
+- A0915-TCI-MEDIUM-3 prose filed as the "1..4" range on the A0915-TCI-MEDIUM-1 line (check-changelog-heading.sh placement; FIXED by the 2026-09-15 CI/gate pass)
+- A0915-TCI-MEDIUM-4 prose filed as the "1..4" range on the A0915-TCI-MEDIUM-1 line (nekiverify.yml -race; FIXED by the 2026-09-15 CI/gate pass)
+- A0915-DEVEX-MEDIUM-1 filed
+- A0915-PERF-MEDIUM-1 filed
+
+### Pre-tag value-fidelity and perf-parity reviews of v0.153.1
+
+- VF0915-F1 filed
+- VF0915-F2 filed
+- VF0915-F3 filed
+- PP0915 filed
+
 ## 2026-09-09 — Tier-3 blind audit (post-v0.148.0; 6 blind workers + reconciler)
 
 **Consolidated 2026-09-09.** The five blind workers' IDs are now entered
