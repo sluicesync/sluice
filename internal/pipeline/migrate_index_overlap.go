@@ -35,6 +35,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 
 	"golang.org/x/sync/errgroup"
 
@@ -68,6 +69,13 @@ import (
 // failure that merely CANCELS the index axis therefore still reports as
 // bulk-copy (the index axis's ctx.Err() arrives second and loses), which is
 // the correct attribution.
+//
+// That last sentence was true only for a failure ORIGINATING in one of the
+// two axes, and it is the whole reason
+// [attributeOverlappedFailure] exists — read it before trusting the
+// first-to-return ordering. When the cancellation arrives from outside the
+// group both axes see it at once, the index axis returns first, and the tag
+// then names the wrong phase.
 type indexAxisError struct{ err error }
 
 func (e indexAxisError) Error() string { return e.err.Error() }
@@ -145,6 +153,17 @@ func runOverlappedCopyAndIndexPhase(
 
 	g, gctx := errgroup.WithContext(ctx)
 
+	// copyErr and indexJobsQueued are the two inputs
+	// [attributeOverlappedFailure] needs that errgroup cannot give it:
+	// which error the COPY axis produced (Wait returns only the first
+	// error any axis produced), and how many tables the index axis was
+	// ever handed. Both are written inside the group and read after
+	// Wait, which establishes the happens-before.
+	var (
+		copyErr         error
+		indexJobsQueued atomic.Int64
+	)
+
 	// Producer: the cross-table copy pool. Its onTableCopied fires for
 	// every table whose copy returned nil — which on resume INCLUDES the
 	// resumeActionSkip path (a completed table returns nil without
@@ -156,7 +175,7 @@ func runOverlappedCopyAndIndexPhase(
 	// The channel is closed once the pool finishes so the builder drains.
 	g.Go(func() error {
 		defer close(completedTables)
-		return runBulkCopyTablePool(
+		copyErr = runBulkCopyTablePool(
 			gctx, rc, state, stateMu, schema, rows, rw,
 			resuming, bulkBatchSize, parallel, tableParallelism, redactor, shard,
 			func(table *ir.Table) {
@@ -168,10 +187,12 @@ func runOverlappedCopyAndIndexPhase(
 				}
 				select {
 				case completedTables <- table:
+					indexJobsQueued.Add(1)
 				case <-gctx.Done():
 				}
 			},
 		)
+		return copyErr
 	})
 
 	// Consumer: the engine's per-table index builder. Returns nil once
@@ -186,26 +207,117 @@ func runOverlappedCopyAndIndexPhase(
 
 	if err := g.Wait(); err != nil {
 		// Attribute the failure to the axis that produced it, not to
-		// whichever phase mark happens to be in flight. See indexAxisError
-		// for what the old "bulk-copy, conservatively" guess cost.
-		var axis indexAxisError
-		if errors.As(err, &axis) {
-			// Same prefix the sequential index phase uses, so the registry's
-			// PhaseIndexes entries and the operator's grep both see the shape
-			// they see on every other index-phase path.
-			//
-			// The persisted phase moves to indexes with it. Resume is
-			// unaffected: every resume decision reads per-table
-			// state.TableProgress, and state.Phase is only ever compared
-			// against MigrationPhaseComplete (see loadOrInitState) — so this
-			// names what failed without changing what a --resume re-copies.
-			wrapped := fmt.Errorf("pipeline: create indexes: %w", axis.err)
-			return migcore.WrapWithHint(migcore.PhaseIndexes,
-				markFailedLocked(ctx, rc, state, stateMu, ir.MigrationPhaseIndexes, wrapped))
-		}
-		return migcore.WrapWithHint(migcore.PhaseBulkCopy, markFailedLocked(ctx, rc, state, stateMu, ir.MigrationPhaseBulkCopy, err))
+		// whichever phase mark happens to be in flight, and not to
+		// whichever axis merely returned FIRST. See indexAxisError for what
+		// the old "bulk-copy, conservatively" guess cost, and
+		// attributeOverlappedFailure for what "first to return" costs.
+		attr := attributeOverlappedFailure(err, copyErr, indexJobsQueued.Load())
+		return migcore.WrapWithHint(attr.hint,
+			markFailedLocked(ctx, rc, state, stateMu, attr.phase, attr.err))
 	}
 	return nil
+}
+
+// overlapFailureAttribution names the axis a failed overlapped phase is
+// reported against: the hint registry's phase, the phase persisted into the
+// migration-state row, and the error the operator sees.
+type overlapFailureAttribution struct {
+	hint  string
+	phase ir.MigrationPhase
+	err   error
+}
+
+// attributeOverlappedFailure decides which axis names the failure, given
+// the error [errgroup.Group.Wait] returned, the error the copy axis itself
+// produced, and how many tables the index axis was ever handed.
+//
+// It exists because Wait returns whichever goroutine returned an error
+// FIRST, which is an attribution only when one axis is the thing that
+// failed. [indexAxisError]'s doc argues exactly that: a copy failure that
+// merely CANCELS the index axis still reports as bulk-copy because "the
+// index axis's ctx.Err() arrives second and loses". That holds for a copy
+// failure. It does not hold when the cancellation comes from OUTSIDE the
+// group — a deadline, a Ctrl-C, a test's stall watchdog — because then both
+// axes observe the cancellation at the same instant and the index axis is
+// enormously quicker to return. With zero index jobs in the schema (a
+// single-integer-PK fixture has none: the PK is constraint-backed and
+// skipped), the PG builder's drain loop returns a bare ctx.Err() on its
+// very next select — see the totalJobs == 0 branch of
+// internal/engines/postgres/schema_writer_index_overlap.go — while the copy
+// axis is still unwinding real database calls. The index axis wins errOnce
+// essentially every time, so EVERY externally cancelled overlapped migrate
+// was labelled `create indexes` regardless of where it was blocked.
+// TESTFRAGILE-3's wedged CI run was reported that way, and the label sent
+// the investigation at an index phase that had nothing queued.
+//
+// So an index axis that was handed nothing and returned nothing but the
+// shared cancellation does not get to name the failure. Scope, stated
+// plainly rather than implied: the only case this reclassifies is
+// `indexJobsQueued == 0` AND the index error is context.Canceled /
+// DeadlineExceeded. An index axis that was handed work and then hit the
+// cancellation still names the failure — it may well have been mid-build —
+// and every non-context index error is untouched, so the errno-3024 hint
+// path this attribution was built for is unaffected.
+//
+// indexJobsQueued counts what the pipeline HANDED the index axis, not what
+// the engine built: the pipeline cannot see inside a builder. Zero is
+// therefore proof the axis had nothing to do; non-zero is not proof it did
+// any of it.
+func attributeOverlappedFailure(groupErr, copyErr error, indexJobsQueued int64) overlapFailureAttribution {
+	var axis indexAxisError
+	if !errors.As(groupErr, &axis) {
+		return overlapFailureAttribution{
+			hint:  migcore.PhaseBulkCopy,
+			phase: ir.MigrationPhaseBulkCopy,
+			err:   groupErr,
+		}
+	}
+
+	if !idleIndexAxisCancellation(axis.err, indexJobsQueued) {
+		// Same prefix the sequential index phase uses, so the registry's
+		// PhaseIndexes entries and the operator's grep both see the shape
+		// they see on every other index-phase path.
+		//
+		// The persisted phase moves to indexes with it. Resume is
+		// unaffected: every resume decision reads per-table
+		// state.TableProgress, and state.Phase is only ever compared
+		// against MigrationPhaseComplete (see loadOrInitState) — so this
+		// names what failed without changing what a --resume re-copies.
+		return overlapFailureAttribution{
+			hint:  migcore.PhaseIndexes,
+			phase: ir.MigrationPhaseIndexes,
+			err:   fmt.Errorf("pipeline: create indexes: %w", axis.err),
+		}
+	}
+
+	// The index axis reported nothing but the shared cancellation, with
+	// nothing ever queued to it. Prefer the copy axis's own error; when the
+	// copy axis has none, keep the cancellation but say plainly that the
+	// index axis was idle, so the sentence cannot be read as "the index
+	// build hung".
+	if copyErr != nil {
+		return overlapFailureAttribution{
+			hint:  migcore.PhaseBulkCopy,
+			phase: ir.MigrationPhaseBulkCopy,
+			err:   copyErr,
+		}
+	}
+	return overlapFailureAttribution{
+		hint:  migcore.PhaseBulkCopy,
+		phase: ir.MigrationPhaseBulkCopy,
+		err: fmt.Errorf("pipeline: copy phase cancelled with the index axis idle "+
+			"(no index jobs were ever queued): %w", axis.err),
+	}
+}
+
+// idleIndexAxisCancellation reports whether an index-axis error is nothing
+// but the cancellation the copy axis also saw, on an axis that was never
+// handed a table.
+func idleIndexAxisCancellation(err error, indexJobsQueued int64) bool {
+	if indexJobsQueued > 0 {
+		return false
+	}
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // markTableIndexesBuilt flips one table's IndexesBuilt flag to true and

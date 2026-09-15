@@ -98,6 +98,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"log/slog"
 	"sort"
 	"strings"
@@ -129,12 +130,24 @@ func TestStreamer_AddTable_LiveMode_PG_DiagnoseLossSurface(t *testing.T) {
 	// integration tests use for log scraping. Slog's JSONHandler keeps
 	// the parser deterministic across runs so verdict-rendering can
 	// rely on field shapes.
+	//
+	// The std log package's writer and flags are restored alongside the
+	// slog default for the reason captureSlog documents: slog.SetDefault
+	// repoints log at the new handler but does NOT repoint it back when the
+	// restored logger's handler is slog's internal defaultHandler, so
+	// without this every later log line in the package's test binary lands
+	// in this finished test's buffer.
 	logBuf := &lockedBuffer{}
 	prevDefault := slog.Default()
+	prevWriter, prevFlags := log.Writer(), log.Flags()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(logBuf, &slog.HandlerOptions{
 		Level: slog.LevelDebug,
 	})))
-	defer slog.SetDefault(prevDefault)
+	defer func() {
+		slog.SetDefault(prevDefault)
+		log.SetOutput(prevWriter)
+		log.SetFlags(prevFlags)
+	}()
 
 	const seedDDL = `
 		CREATE TABLE customers (

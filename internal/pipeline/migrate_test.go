@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"log"
 	"log/slog"
 	"strings"
 	"sync"
@@ -69,13 +70,92 @@ func (s *safeBuffer) Len() int {
 // thread-safe buffer for the duration of the test, restoring the
 // previous default on cleanup. Use it when an assertion needs to look
 // at logged output.
+//
+// # Restoring slog's default is NOT enough (TESTFRAGILE-3)
+//
+// [slog.SetDefault] does two things: it stores the logger AND, unless the
+// logger's handler is slog's internal defaultHandler, repoints the std
+// [log] package at it via log.SetOutput + log.SetFlags(0). The asymmetry is
+// the trap: restoring `prev` — whose handler IS the defaultHandler at
+// process start — takes the skip branch, so log.SetOutput is never called
+// back and the std log package stays pointed at THIS test's buffer for the
+// rest of the process. slog's own defaultHandler then writes through that
+// dead buffer, and every subsequent sluice log line in the binary
+// disappears. A tag CI job showed the last sluice log line at 00:36:17
+// followed by ~17 minutes of silence across ~700 tests — which is why the
+// run that wedged had no logs to read.
+//
+// So capture and restore the std log package's writer and flags by hand.
+// [TestCaptureSlogRestoresTheStdLogSink] is the pin.
 func captureSlog(t *testing.T) *safeBuffer {
 	t.Helper()
 	prev := slog.Default()
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	prevWriter, prevFlags := log.Writer(), log.Flags()
+	t.Cleanup(func() {
+		slog.SetDefault(prev)
+		log.SetOutput(prevWriter)
+		log.SetFlags(prevFlags)
+	})
 	buf := &safeBuffer{}
 	slog.SetDefault(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	return buf
+}
+
+// TestCaptureSlogRestoresTheStdLogSink grades the restore above, in the one
+// direction that matters: after a captureSlog user has cleaned up, a log
+// line emitted through the DEFAULT logger must reach the sink that was
+// installed before the test ran — not the dead buffer.
+//
+// It is deliberately NOT parallel. It mutates process-global logging state,
+// and Go runs a package's sequential tests to completion before resuming
+// any parallel ones, so not calling t.Parallel is what makes the global
+// swap exclusive.
+//
+// Mutation run 2026-09-14: dropping the log.SetOutput restore from
+// captureSlog's cleanup fails this test with "the std log sink was NOT
+// restored" — the assertion written here, not another guard.
+func TestCaptureSlogRestoresTheStdLogSink(t *testing.T) {
+	// Stand in for the process's real log sink, and put everything back
+	// afterwards so this test cannot do to the suite what it is grading.
+	outerWriter, outerFlags := log.Writer(), log.Flags()
+	outerLogger := slog.Default()
+	defer func() {
+		slog.SetDefault(outerLogger)
+		log.SetOutput(outerWriter)
+		log.SetFlags(outerFlags)
+	}()
+
+	original := &safeBuffer{}
+	log.SetOutput(original)
+
+	// Premise check, named rather than assumed: this test can only observe
+	// the sink it grades if the DEFAULT slog logger routes through the std
+	// log package — which it does exactly while its handler is slog's
+	// internal defaultHandler, the process-start state. That type is
+	// unexported, so probe for the behaviour instead of asserting the type.
+	// A failure here means an earlier test left a custom default installed,
+	// which is the very leak this file is about.
+	slog.Info("std log routing probe")
+	if !strings.Contains(original.String(), "std log routing probe") {
+		t.Fatalf("the default slog logger does not route through the std log package in this "+
+			"process state, so this test cannot observe the sink it grades — an earlier test left a "+
+			"custom slog default installed. original sink held: %q", original.String())
+	}
+
+	t.Run("a captureSlog user", func(t *testing.T) {
+		captured := captureSlog(t)
+		slog.Info("inside the capture")
+		if !strings.Contains(captured.String(), "inside the capture") {
+			t.Fatalf("captureSlog did not capture its own subtest's logs: %q", captured.String())
+		}
+	})
+
+	slog.Info("after the capture cleaned up")
+	if !strings.Contains(original.String(), "after the capture cleaned up") {
+		t.Errorf("the std log sink was NOT restored: a line logged after captureSlog's cleanup "+
+			"never reached the original sink. Every later log line in the process is going into "+
+			"the finished test's buffer instead. original sink held: %q", original.String())
+	}
 }
 
 func TestRunValidates(t *testing.T) {

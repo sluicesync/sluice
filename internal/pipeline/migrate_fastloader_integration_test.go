@@ -48,6 +48,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
@@ -305,6 +306,24 @@ func (w *trackingWriter) TruncateTable(ctx context.Context, table *ir.Table) err
 	return tr.TruncateTable(ctx, table)
 }
 
+// Close forwards to the inner writer, and it is LOAD-BEARING rather than
+// tidy (TESTFRAGILE-3).
+//
+// The pipeline releases every writer it opens through [migcore.CloseIf],
+// which is an [io.Closer] type assertion. A wrapper that does not implement
+// Close is not a Closer, so every CloseIf against it is a silent no-op and
+// the real engine writer's connection pool is never released — measured at
+// 1-8 leaked backends per run of this file. Nine iterations against one
+// container reach `FATAL: sorry, too many clients already`, which surfaces
+// as an unrelated-looking mid-copy failure rather than as a leak.
+//
+// [TestRowWriterTestWrapperRoster_EveryWrapperClosesItsInner] is the gate
+// that keeps the next wrapper from re-opening the hole.
+func (w *trackingWriter) Close() error {
+	migcore.CloseIf(w.inner)
+	return nil
+}
+
 // ---- 1. fresh parallel cold-start uses the fast loader --------------
 
 func TestMigrate_FastLoader_FreshColdStart_UsesFastLoader(t *testing.T) {
@@ -455,9 +474,17 @@ func TestMigrate_FastLoader_CrashMidFastChunk_ResumeIsIdempotent(t *testing.T) {
 			//
 			// The hard bound is a backstop against a run that reports progress
 			// forever, and should never be the thing that fires.
+			//
+			// The watchdog is armed with the target so that if it ever DOES
+			// fire, the run leaves behind every goroutine's stack plus the
+			// target's pg_stat_activity and ungranted pg_locks — taken
+			// before the cancel, while the stall is still the state being
+			// described. Without that, the only artifact a wedged run
+			// produced was the phase label, and the phase label was wrong
+			// (see attributeOverlappedFailure).
 			resumeCtx, watchdog, stopWatchdog := newProgressWatchdog(context.Background(), 90*time.Second, 15*time.Minute)
 			defer stopWatchdog()
-			mig2.Progress = watchdog
+			mig2.Progress = watchdog.diagnose(env.driver, env.targetDSN)
 
 			if err := mig2.Run(resumeCtx); err != nil {
 				t.Fatalf("resume Run: %v\n\ncause: %v", err, context.Cause(resumeCtx))
@@ -488,6 +515,36 @@ func TestMigrate_FastLoader_CrashMidFastChunk_ResumeIsIdempotent(t *testing.T) {
 			}
 			if distinct != rowCount {
 				t.Errorf("COUNT(DISTINCT id) = %d; want %d (idempotent absorb failed)", distinct, rowCount)
+			}
+
+			// TESTFRAGILE-3: the runtime half of the connection-leak fix.
+			//
+			// [TestRowWriterTestWrapperRoster_EveryWrapperClosesItsInner] can
+			// only prove trackingWriter IS an io.Closer; it cannot prove the
+			// Close forwards. This asks the server, which is the independent
+			// evidence: after both migrations have returned, the only backend
+			// on the target should be this test's own verification handle.
+			//
+			// Measured 2026-09-14 in both directions, 3 runs each: with
+			// trackingWriter.Close present, 0 other backends every run; with
+			// it renamed away (so migcore.CloseIf's io.Closer assertion
+			// misses), 9 every run. The bound below is 2 rather than 0 to
+			// leave room for a backend the server has not reaped yet — it is
+			// nowhere near the 9 the defect produces, and it is not derived
+			// from the number being measured.
+			if env.driver == "pgx" {
+				var backends int
+				if err := db.QueryRowContext(ctx,
+					"SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "+
+						"AND pid <> pg_backend_pid()").Scan(&backends); err != nil {
+					t.Logf("could not count target backends: %v", err)
+				} else if backends > 2 {
+					t.Errorf("%d backends are still connected to the target after both migrations "+
+						"returned; the pipeline's migcore.CloseIf could not reach a writer's Close, so "+
+						"the engine pool leaked. Nine iterations of this shape against one container "+
+						"reach `FATAL: sorry, too many clients already`, which then fails whatever "+
+						"test is running at the time", backends)
+				}
 			}
 		})
 	}

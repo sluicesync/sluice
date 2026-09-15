@@ -22,6 +22,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 
 	// Register the postgres engine so engines.Get("postgres") works.
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
@@ -113,6 +114,17 @@ func (f *failingRowWriter) TruncateTable(ctx context.Context, table *ir.Table) e
 		return errors.New("inner writer does not implement TableTruncator")
 	}
 	return t.TruncateTable(ctx, table)
+}
+
+// Close forwards to the inner writer so the pipeline's [migcore.CloseIf]
+// actually releases the engine writer's pool; without it the assertion is a
+// silent no-op and the backends leak for the life of the test binary. See
+// trackingWriter.Close in migrate_fastloader_integration_test.go for the
+// measurement, and
+// [TestRowWriterTestWrapperRoster_EveryWrapperClosesItsInner] for the gate.
+func (f *failingRowWriter) Close() error {
+	migcore.CloseIf(f.inner)
+	return nil
 }
 
 // TestMigrate_ResumeFromBulkCopyFailure: run a migration that fails

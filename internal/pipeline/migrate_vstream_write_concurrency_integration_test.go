@@ -102,6 +102,17 @@ func (p *writeConcurrencyProbe) SetMaxBufferBytes(bytes int64) {
 	}
 }
 
+// Close forwards to the inner writer so the pipeline's [migcore.CloseIf]
+// actually releases the engine writer's pool; without it the assertion is a
+// silent no-op and the backends leak for the life of the test binary. See
+// trackingWriter.Close in migrate_fastloader_integration_test.go for the
+// measurement, and
+// [TestRowWriterTestWrapperRoster_EveryWrapperClosesItsInner] for the gate.
+func (p *writeConcurrencyProbe) Close() error {
+	migcore.CloseIf(p.inner)
+	return nil
+}
+
 func (p *writeConcurrencyProbe) peakConcurrent() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
