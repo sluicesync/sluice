@@ -298,16 +298,24 @@ func nekiCDCSerialVsBatchedIntoSharded(ctx context.Context, t *testing.T, db *sq
 				"collapse them.", serialErr, batchErr)
 
 		case serialErr == nil && batchErr == nil:
-			// Both lanes work. Informative and worth saying loudly: it means
-			// the CDC arm's failure is about something its own fixture does
-			// that this one does not (ON CONFLICT, an UPDATE, a DELETE), not
-			// about plain inserts on a sharded table at all.
-			t.Fatalf("BOTH lanes applied cleanly (serial %d rows, batch %d rows), so neither the lane "+
-				"nor the column list explains the CDC arm's NK306.\n\n"+
-				"This arm sends plain INSERTs; the CDC arm sends INSERT + UPDATE + DELETE and its "+
-				"inserts go through ON CONFLICT. The variable is therefore something in THAT shape — "+
-				"most likely the ON CONFLICT DO UPDATE form, which is the one statement whose shard-key "+
-				"handling sluice deliberately special-cases. Narrow the CDC arm before filing further.",
+			// Both lanes work. Since 2026-09-14 this is the EXPECTED outcome
+			// and the arm's success state: with sluice's control tables placed
+			// in the authoritative shard group (ADR-0187), the serial lane's
+			// position write and the batched lane's data INSERT both land.
+			// The first cut of this arm treated both-clean as "inconclusive"
+			// and failed — written when the CDC arm was red and this arm's
+			// job was to bisect it. The measured pair before the fix was
+			// serial-dies-at-position-write / batched-dies-at-data-table,
+			// and the placement fixed BOTH, so the "pipelined lane cannot
+			// present the shard key" reading was the same defect seen from
+			// the other lane. Anti-vacuity: the rows must actually be there.
+			if serialRows != 3 || batchRows != 3 {
+				t.Fatalf("both lanes reported no error but the tables hold %d and %d rows, not 3 and 3 — "+
+					"a clean return over missing rows is the silent shape, not the fixed one", serialRows, batchRows)
+			}
+			t.Logf("PREMISE holds: BOTH lanes applied cleanly into the sharded target (serial %d rows, batch %d "+
+				"rows) with sluice's control tables placed in the authoritative shard group. Any NK306 here "+
+				"is a regression of ADR-0187's placement, and the cases above say which lane and which site.",
 				serialRows, batchRows)
 
 		default:

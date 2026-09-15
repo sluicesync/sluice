@@ -43,7 +43,8 @@ const shardedFixtureTopology = `{
     "sk_bad": {"shard_group": "nv_group"},
     "uq_email": {"shard_group": "nv_group"}
   }}}}},
-  "future_field": {"n": 12345678901234567890, "f": 1.50}
+  "future_field": {"n": 12345678901234567890, "f": 1.50, "e": 1e5, "z": -0.0,
+                   "s": "<a>&b c", "nested": [{"a": [null, {}, [], true]}]}
 }`
 
 func decodeTopologyDoc(t *testing.T, raw []byte) map[string]any {
@@ -86,8 +87,13 @@ func TestPlanNekiControlPlacement_PlacesRoutedTablesInTheAuthoritativeGroup(t *t
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("written document differs from the input plus the two placements:\n got: %s\nwant: %v", plan.doc, want)
 	}
-	if !strings.Contains(string(plan.doc), "12345678901234567890") {
-		t.Fatalf("a large integer in an unknown field did not survive the round trip: %s", plan.doc)
+	for _, want := range []string{"12345678901234567890", "1.50", "1e5", "-0.0", `"<a>&b\u2028c"`} {
+		if !strings.Contains(string(plan.doc), want) {
+			t.Fatalf("value %s in an unknown field did not survive the round trip verbatim: %s", want, plan.doc)
+		}
+	}
+	if strings.Contains(string(plan.doc), `\u003c`) || strings.Contains(string(plan.doc), `\u0026`) {
+		t.Fatalf("HTML escaping rewrote the operator's strings (a needless diff in the topology change log): %s", plan.doc)
 	}
 
 	// And the placement is effective by sluice's own predicate: after the
@@ -304,12 +310,42 @@ func TestClassifyApplierError_NK306IsCodedAndTerminal(t *testing.T) {
 	}
 }
 
+// Every step of the placement path can hold something that is not an object
+// — null, a string, an array — and each must be refused rather than
+// overwritten, because the alternative is sluice silently replacing part of
+// the operator's routing document.
 func TestAssignTablesToShardGroup_RefusesToOverwriteANonObject(t *testing.T) {
 	t.Parallel()
-	_, err := assignTablesToShardGroup([]byte(`{"databases": {"postgres": {"schemas": "oops"}}}`),
-		"postgres", "public", []string{"t"}, "auth")
-	if err == nil || !strings.Contains(err.Error(), "databases.postgres.schemas is not an object") {
-		t.Fatalf("a document whose path is not an object must be refused, not overwritten: %v", err)
+	cases := []struct{ name, doc, want string }{
+		{"string at schemas", `{"databases": {"postgres": {"schemas": "oops"}}}`, "databases.postgres.schemas is not an object"},
+		{"null at databases", `{"databases": null}`, "databases is not an object"},
+		{"array at tables", `{"databases": {"postgres": {"schemas": {"public": {"tables": []}}}}}`, "databases.postgres.schemas.public.tables is not an object"},
+		{"null at the table entry", `{"databases": {"postgres": {"schemas": {"public": {"tables": {"t": null}}}}}}`, "tables.t is not an object"},
+		{"string at the table entry", `{"databases": {"postgres": {"schemas": {"public": {"tables": {"t": "x"}}}}}}`, "tables.t is not an object"},
+		{"array at the table entry", `{"databases": {"postgres": {"schemas": {"public": {"tables": {"t": [1]}}}}}}`, "tables.t is not an object"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := assignTablesToShardGroup([]byte(tc.doc), "postgres", "public", []string{"t"}, "auth")
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("must be refused with %q, not overwritten: %v", tc.want, err)
+			}
+		})
+	}
+
+	// And the one shape that IS allowed to be absent: a missing step is
+	// created, an existing entry keeps its other fields.
+	doc, err := assignTablesToShardGroup([]byte(`{"databases": {"postgres": {"schemas": {"public": {"tables": {"t": {"extra": 1}}}}}}}`),
+		"postgres", "public", []string{"t", "u"}, "auth")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := decodeTopologyDoc(t, doc)
+	tables := got["databases"].(map[string]any)["postgres"].(map[string]any)["schemas"].(map[string]any)["public"].(map[string]any)["tables"].(map[string]any)
+	if !reflect.DeepEqual(tables["t"], map[string]any{"extra": json.Number("1"), "shard_group": "auth"}) ||
+		!reflect.DeepEqual(tables["u"], map[string]any{"shard_group": "auth"}) {
+		t.Fatalf("tables = %v", tables)
 	}
 }
 

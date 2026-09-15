@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5/pgconn"
 
@@ -109,9 +110,23 @@ func ensureNekiControlTablePlacement(ctx context.Context, db *sql.DB, isNeki boo
 		schema = "public"
 	}
 
-	var lastConflict error
+	var (
+		lastConflict error
+		lastSnap     *nekiTopologyForWrite
+		lastPlan     nekiControlPlacementPlan
+	)
 	for attempt := 1; attempt <= nekiTopologyWriteAttempts; attempt++ {
 		snap, err := readNekiTopologyForWrite(ctx, db)
+		if err == nil {
+			// A document Go cannot parse is a READ failure in every sense
+			// that matters, and gets the read-failure policy below rather
+			// than a refusal — see finding 4 of the pre-tag review.
+			if !utf8.Valid(snap.raw) {
+				err = errors.New("postgres: Neki data topology is not valid UTF-8")
+			} else if !json.Valid(snap.raw) {
+				err = errors.New("postgres: Neki data topology is not valid JSON")
+			}
+		}
 		if err != nil {
 			// Not a verdict. See the file comment: the consequence of
 			// skipping is loud, and refusing would break clusters that do
@@ -126,6 +141,7 @@ func ensureNekiControlTablePlacement(ctx context.Context, db *sql.DB, isNeki boo
 		if err != nil {
 			return err
 		}
+		lastSnap, lastPlan = snap, plan
 		if !plan.changed {
 			if attempt > 1 {
 				slog.InfoContext(ctx, "sluice's control tables were placed in the authoritative shard group by a "+
@@ -152,8 +168,12 @@ func ensureNekiControlTablePlacement(ctx context.Context, db *sql.DB, isNeki boo
 			slog.Any("tables", plan.placed), slog.Int64("topology_revision", rev))
 		return nil
 	}
-	return refuseNekiControlPlacement("", schema, nekiControlPlacementPlan{},
-		fmt.Errorf("gave up after %d attempts: %w", nekiTopologyWriteAttempts, lastConflict))
+	// Exhausted. The refusal must still name the tables, database and group
+	// the operator has to place, so it is built from the last plan rather
+	// than from nothing.
+	return refuseNekiControlPlacement(lastSnap.database, schema, lastPlan,
+		fmt.Errorf("gave up after %d attempts, each finding the topology revision superseded by another "+
+			"writer before sluice's placement landed: %w", nekiTopologyWriteAttempts, lastConflict))
 }
 
 // nekiTopologyForWrite is one fresh read of the topology, un-memoised: a
@@ -165,9 +185,13 @@ type nekiTopologyForWrite struct {
 	// revision is the stored document's revision when the router exposes
 	// it, and hasRevision says whether it does. The write passes it as
 	// `expected_revision` so a concurrent editor's change is refused rather
-	// than silently overwritten; without it the write is last-writer-wins,
-	// which is still correct for two sluice processes (both compute the
-	// same placement) and unsafe only against a concurrent OPERATOR edit.
+	// than silently overwritten. Without it the write is last-writer-wins,
+	// which loses the loser's placement whenever two writers place
+	// DIFFERENT table sets — a `migrate` and a `sync` starting together
+	// go through different doors — or an operator edits concurrently. The
+	// loss is loud (the next write to the unplaced table is NK306) and
+	// heals on restart; it is not silent. Every measured router exposes
+	// the revision, so this is the fallback, not the path.
 	revision    int64
 	hasRevision bool
 }
@@ -211,10 +235,17 @@ type nekiControlPlacementPlan struct {
 // INSERT. A table nothing routes is left where it is, so an unsharded
 // database never has its topology touched.
 //
-// The document is edited as generic JSON with numbers preserved, so every
-// field this code does not understand round-trips byte-for-byte in value; the
-// platform is in preview and a field sluice has never heard of must survive a
-// sluice write.
+// The document is edited as generic JSON with numbers preserved
+// (`UseNumber`, so an int64 beyond 2^53 and a float's spelling survive) and
+// with HTML escaping off, so a field this code does not understand keeps its
+// VALUE across the round trip; the platform is in preview and a field sluice
+// has never heard of must survive a sluice write. Key order and string escape
+// spellings are not preserved — those are not values. Two shapes ARE lossy
+// and are stated rather than hidden: invalid UTF-8 (refused before the edit,
+// by the caller's validity check) and duplicate keys within one object
+// (undetectable after decode; the last one wins). UNVERIFIED PREMISE: the
+// router emits neither — every live read so far has cast the document to
+// jsonb successfully, which forbids both.
 func planNekiControlPlacement(raw []byte, database, schema string, tables []string) (nekiControlPlacementPlan, error) {
 	var topo nekiTopology
 	if err := json.Unmarshal(raw, &topo); err != nil {
@@ -263,8 +294,8 @@ func planNekiControlPlacement(raw []byte, database, schema string, tables []stri
 					return nekiControlPlacementPlan{}, refuseNekiControlPlacement(database, schema,
 						nekiControlPlacementPlan{placed: need, group: auth},
 						fmt.Errorf("the topology pins sluice's control table %q to shard index %q; sluice will not "+
-							"overwrite an explicit placement, and a routed control table cannot take sluice's "+
-							"shard-key-less writes", t, tb.ShardIndex))
+							"remove an explicit shard_index (it does re-point a shard_group), and a routed control "+
+							"table cannot take sluice's shard-key-less writes", t, tb.ShardIndex))
 				}
 			}
 		}
@@ -306,7 +337,16 @@ func assignTablesToShardGroup(raw []byte, database, schema string, tables []stri
 		entry["shard_group"] = group
 		tablesObj[t] = entry
 	}
-	return json.Marshal(root)
+	// An encoder rather than json.Marshal so `<`, `>` and `&` in the
+	// operator's strings are not rewritten as <-style escapes: equal
+	// JSON, but a needless diff in the topology's own change log.
+	var out bytes.Buffer
+	enc := json.NewEncoder(&out)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(root); err != nil {
+		return nil, fmt.Errorf("postgres: encode Neki data topology for placement: %w", err)
+	}
+	return bytes.TrimRight(out.Bytes(), "\n"), nil
 }
 
 // descendObject walks `root` along `path`, creating a missing object at each
@@ -424,9 +464,10 @@ func refuseNekiControlPlacement(database, schema string, plan nekiControlPlaceme
 // revision is read; it was found by enumerating pg_proc on a live router
 // (nekiverify_topology_write_probe_test.go, 2026-09-14). A router without it
 // answers ok=false rather than an error, and the write then goes without an
-// expected revision — last-writer-wins, which is still correct for concurrent
-// sluice processes (they compute the same placement) and unsafe only against
-// a concurrent OPERATOR edit of the same document.
+// expected revision — last-writer-wins, whose failure mode is a LOST placement
+// when two writers place different table sets or an operator edits
+// concurrently; loud (NK306 on the next write) and healed by a restart, never
+// silent. See [nekiTopologyForWrite].
 func readNekiTopologyRevision(ctx context.Context, db *sql.DB) (rev int64, ok bool, err error) {
 	err = db.QueryRowContext(ctx, "SELECT __neki.get_data_topology_revision()").Scan(&rev)
 	if err != nil {

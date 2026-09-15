@@ -1748,7 +1748,7 @@ The plan below was the next session's first task and it is now done. Decision an
 | `sluice_shard_consolidation_lease` | same | FIXED — placed |
 | `sluice_cdc_skipped_tables` | same | FIXED — placed |
 | `sluice_target_metrics_history` | `ChangeApplier.EnsureTargetMetricsHistory` | FIXED — created on its own door, so it enrols on its own door |
-| `sluice_migrate_state` | `MigrationStateStore.EnsureControlTable` | FIXED — placed. This door is **migrate's AND restore's** |
+| `sluice_migrate_state` | `MigrationStateStore.EnsureControlTable` | FIXED — placed. This door is migrate's (also sync cold-start recording, backfill, expand/contract). **Not restore's** — the commit message and the plan entry below said it was, and that was wrong: a chain restore never opens this store, it reaches the applier door above, which is placed too |
 | `sluice_migrate_table_progress` | same | FIXED — placed |
 | `sluice_keysets` | `pgKeysetStore.EnsureKeysetTable` | FIXED — placed |
 | `sluice_heartbeat` | pipeline, name passed as a parameter | **EXEMPT** — written on the SOURCE, and a Neki cannot be a continuous-sync source (ADR-0186 probe R-1), so it is never a sharded Neki table sluice writes |
@@ -1765,7 +1765,7 @@ The enumeration is a gate rather than a list in a commit message: `TestEveryPost
 **Two follow-ups now unblocked:**
 
 1. **The CDC-into-a-sharded-target arm and the NK306 BISECT arm** both gated on this root cause and should go green on the next nekiverify run. If either stays red, that is new information rather than the known wall.
-2. **The backup/restore-into-Neki arm** (filed 2026-09-14, deliberately blocked on this) can now be built. Restore writes `sluice_migrate_state` through the very door this fixes, so a failure there would finally be information rather than a re-learning of something diagnosed.
+2. **The backup/restore-into-Neki arm** (filed 2026-09-14, deliberately blocked on this) can now be built. A chain restore creates the CDC control tables through the applier door this fixes (it never opens the migrate-state store), so a failure there would finally be information rather than a re-learning of something diagnosed.
 
 ## 2026-09-14 — NK306 control-table fix: the implementation plan, derived from the code
 

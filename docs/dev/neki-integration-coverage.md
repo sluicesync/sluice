@@ -19,7 +19,9 @@ The Neki-specific surface is already mostly pure. Taking it honestly, function b
 | `isNekiVersion`, `probeIsNeki` | **no** | a string predicate over `version()`; the wire behaviour is the `SELECT`, which plain PG shares |
 | `shardKeyFor`, `columnsForGroup`, `planShardKeyUpsert` | **no** | pure functions over a parsed topology document |
 | `buildBatchUpsert` | **no** | renders SQL text; pinned on the string |
-| `isNekiTableBlocked`, `annotateNekiBlockedTable` | **no** | classifies a `*pgconn.PgError` by SQLSTATE |
+| `isNekiTableBlocked`, `annotateNekiBlockedTable`, `isNekiShardKeyMissing`, `annotateNekiShardKeyMissing` | **no** | classifies a `*pgconn.PgError` by SQLSTATE |
+| `planNekiControlPlacement`, `assignTablesToShardGroup` | **no** | pure functions over the topology document; the placement decision and the JSON round-trip are pinned against a measured document |
+| `ensureNekiControlTablePlacement` (the `set_data_topology` write, `expected_revision`, `wait_for_data_topology`) | **yes** | the write semantics are the router's — an unchanged write minting a revision, the mismatch shape — measured by `nekiverify_topology_write_probe_test.go`; the tier-1 forced-flavor suite pins only the WARN-and-continue branch a server without `__neki` takes |
 | `opclassExtensionFor`, `annotateMissingOpclass` | **no** | regex + mapping over an error message |
 | `dropUnchangedShardKeys`, `refuseShardKeyOutsideConflictKey` | **no** | operates on before/after images already in memory |
 | `createAndPrimeSequence` taking the no-transaction branch | **partly** | the *branch choice* is unit-testable; that Neki rejects DDL in a transaction is not |

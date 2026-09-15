@@ -249,8 +249,10 @@ func (s *MigrationStateStore) EnsureControlTable(ctx context.Context) error {
 	// Sharded PlanetScale Neki: both tables would be routed by the default
 	// shard group and every breadcrumb write refused (NK306) — which is the
 	// measured 40-rows-became-80 resume. Place them in the authoritative
-	// group; a no-op everywhere else. This is migrate's AND restore's door,
-	// the sibling of ChangeApplier.EnsureControlTable.
+	// group; a no-op everywhere else. This door serves migrate, the sync
+	// cold-start progress recording, backfill and the expand/contract DDL
+	// executor — the sibling of ChangeApplier.EnsureControlTable, which is
+	// the door a chain restore reaches (restore never opens this store).
 	return ensureNekiControlTablePlacement(ctx, s.db, s.isNeki, s.serverKey, s.schema, []string{
 		migrateStateTableName,
 		migrateProgressTableName,
