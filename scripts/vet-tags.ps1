@@ -77,10 +77,31 @@ $combos = $lines |
     ForEach-Object { ($_ -replace '^//go:build ', '') -replace ' *&& *', ',' } |
     Sort-Object -Unique
 
+# `./...` is MODULE-scoped and reaches the gitignored scratch packages under
+# workspace/. CI runs the .sh on a fresh checkout with no workspace/, but this
+# script is what scripts/pre-commit.ps1 runs on the primary development
+# machine, where a throwaway Go main that stopped compiling would fail the
+# gate and nothing else — a local-only block whose only escape is --no-verify
+# (audit DDD-8; the .sh got this exclusion and this mirror did not, audit
+# 2026-09-15 X1). golangci-lint excludes workspace/ for the same reason.
+#
+# The package list is computed PER COMBO, under that combo's tags, for the
+# reason vet-tags.sh records (A0909-TCI-M-1): a package that exists only
+# under a tag is absent from an untagged `go list`. And it carries the same
+# anti-vacuity floor — a `go list` that silently matched almost nothing would
+# otherwise leave `go vet` a truncated universe and print a green line.
+# scripts/check-local-gate-parity.sh holds this file to both properties.
 $failed = $false
 foreach ($tags in $combos) {
-    Write-Host "vet-tags: go vet -tags=$tags ./..."
-    & go vet "-tags=$tags" ./...
+    $pkgs = @(& go list "-tags=$tags" ./... | Where-Object { $_ -notmatch '/workspace/' })
+    if ($pkgs.Count -lt 40) {
+        Write-Host "vet-tags: package list for -tags=$tags came back with only $($pkgs.Count) entries; expected the whole module (~60)." -ForegroundColor Red
+        Write-Host "  'go list -tags=$tags ./...' likely failed -- fix that rather than vetting a truncated universe."
+        Pop-Location
+        exit 1
+    }
+    Write-Host "vet-tags: go vet -tags=$tags <module, minus workspace/, listed under those tags: $($pkgs.Count) pkgs>"
+    & go vet "-tags=$tags" @pkgs
     if ($LASTEXITCODE -ne 0) { $failed = $true }
 }
 

@@ -70,6 +70,40 @@ for g in $ci_guards; do
 	fi
 done
 
+# ---- vet-tags.sh <-> vet-tags.ps1 property parity (audit 2026-09-15 X1) ----
+# The guard loop above catches a guard MISSING from a hook. It cannot see a
+# guard that exists in both entry points with different PROPERTIES — which is
+# how vet-tags.sh gained a workspace/ exclusion (DDD-8) and a per-combo
+# package-count floor (A0909-TCI-M-1) while vet-tags.ps1, the mirror
+# scripts/pre-commit.ps1 actually runs on the primary development machine,
+# got neither. Each property is asserted in BOTH files, with the .sh as the
+# reference: the .sh losing one is a regression of the reference, not a
+# licence for the mirror to drop it — so the check is red in both
+# directions, not vacuous when the reference changes.
+VET_SH=scripts/vet-tags.sh
+VET_PS1=scripts/vet-tags.ps1
+for f in "$VET_SH" "$VET_PS1"; do
+	[ -f "$f" ] || { echo "check-local-gate-parity: $f missing"; exit 1; }
+done
+# name | regex that must match a NON-comment line of the .sh | same for the .ps1
+vet_props='
+workspace-exclusion|grep -v .\/workspace\/.|-notmatch .\/workspace\/.
+package-count-floor|pkg_count.* -lt [0-9]+|\.Count -lt [0-9]+
+'
+printf '%s\n' "$vet_props" | sed '/^$/d' | while IFS='|' read -r pname sh_re ps1_re; do
+	[ -n "$pname" ] || continue
+	if ! grep -vE '^[[:space:]]*#' "$VET_SH" | grep -qE -- "$sh_re"; then
+		echo "check-local-gate-parity: $VET_SH lost its '$pname' (no non-comment line matches /$sh_re/). That property is the reference the .ps1 mirror is held to; restore it."
+		exit 1
+	fi
+	if ! grep -vE '^[[:space:]]*#' "$VET_PS1" | grep -qE -- "$ps1_re"; then
+		echo "check-local-gate-parity: $VET_PS1 lacks the '$pname' that $VET_SH carries (no non-comment line matches /$ps1_re/)."
+		echo "  The .ps1 is what scripts/pre-commit.ps1 runs; a property the .sh has and the .ps1 lacks is a gate that differs by machine."
+		exit 1
+	fi
+	echo "check-local-gate-parity: vet-tags $pname — present in both $VET_SH and $VET_PS1. OK."
+done || exit 1
+
 if [ "$fail" -ne 0 ]; then
 	echo "check-local-gate-parity: FAILED — a CI Lint guard is not enforced locally."
 	exit 1
