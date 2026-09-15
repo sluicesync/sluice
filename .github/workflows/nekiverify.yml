@@ -123,17 +123,29 @@ jobs:
       #
       # -count=1 disables the test cache: a cached result would defeat the
       # entire point of asking a live platform whether something is still
-      # true. No -race here, unlike psverify — these tests are API calls
-      # and SQL round-trips with no concurrency of their own, and -race
-      # would add build time for no coverage.
+      # true.
+      #
+      # -race, as psverify runs. The first cut of this workflow omitted it
+      # on the stated premise that "these tests are API calls and SQL
+      # round-trips with no concurrency of their own" — and the same window
+      # that wrote that sentence added nekiverify_copy_limit_test.go, whose
+      # NEKI-COPYLIMIT arm launches goroutines at two sites over state guarded
+      # by a sync.Once, and which runs under -race nowhere else (its shared
+      # core is `integration || nekiverify`, but the concurrent arm lives in
+      # the nekiverify-only file). Audit 2026-09-15 T-4: a cost argument
+      # citing a fact about the suite that stopped being true, with nothing
+      # checking it. CGO is stated explicitly because -race needs it; the
+      # ubuntu runner has gcc and defaults CGO on, so this is a declaration,
+      # not a change.
       - name: Run Neki verification suite
         env:
+          CGO_ENABLED: "1"
           PLANETSCALE_SERVICE_TOKEN_ID: ${{ secrets.PLANETSCALE_SERVICE_TOKEN_ID }}
           PLANETSCALE_SERVICE_TOKEN: ${{ secrets.PLANETSCALE_SERVICE_TOKEN }}
           PLANETSCALE_ORG: ${{ secrets.PLANETSCALE_ORG }}
         run: |
           set -o pipefail
-          go test -tags=nekiverify -count=1 -timeout=50m -v \
+          go test -tags=nekiverify -race -count=1 -timeout=50m -v \
             -run '^TestNekiverify' ./internal/engines/postgres 2>&1 | tee nekiverify-output.txt
 
       # Fail on skip. A nekiverify run that skipped anything did not verify
