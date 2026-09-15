@@ -30,7 +30,7 @@ set -euo pipefail
 # `git describe --tags` finds nothing there, and resolving the base first
 # made every synthetic case exit 2 on the missing tag. The self-test passed
 # on a developer machine (tags present) and failed on main's CI — the first
-# run after the category landed (v0.153.3). The self-test now shims
+# run after the category landed (v0.154.0). The self-test now shims
 # `git describe` to fail so a local run reproduces the tagless checkout.
 if [ -n "${PRERELEASE_TRIGGERS_DELTA_FILE:-}" ]; then
   files="$(cat "$PRERELEASE_TRIGGERS_DELTA_FILE")"

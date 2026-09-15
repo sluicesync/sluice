@@ -17,7 +17,7 @@ import (
 )
 
 // triggerCDCFake is a fakeCDCEngine that declares trigger CDC — until
-// v0.153.3 the one source class whose positionless fulls were allowed to
+// v0.154.0 the one source class whose positionless fulls were allowed to
 // anchor "from now"; since roadmap item 163 every trigger engine records
 // the change log's anchor on a full, and the exemption is gone.
 type triggerCDCFake struct{ *fakeCDCEngine }
@@ -48,9 +48,9 @@ func positionlessFullParent(t *testing.T, store *blobcodec.LocalStore) *irbackup
 // the chokepoint both chain extenders share: a FULL parent with no
 // EndPosition is refused (ErrPositionInvalid, under the
 // POSITIONLESS-FULL-ROOT marker) on EVERY source — the trigger-CDC
-// exemption v0.153.1 stated is gone since roadmap item 163 (v0.153.3),
+// exemption v0.153.1 stated is gone since roadmap item 163 (v0.154.0),
 // because those engines record an anchor on a full now, so a
-// positionless trigger full is a pre-v0.153.3 one or one whose
+// positionless trigger full is a pre-v0.154.0 one or one whose
 // snapshot-anchored open refused. With the exemption gone the chokepoint
 // no longer consults the source at all; the per-source-class pins are the
 // extender twins below, which drive a trigger-CDC source through the real

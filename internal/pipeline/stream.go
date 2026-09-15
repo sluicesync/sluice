@@ -779,7 +779,7 @@ func (b *BackupStream) newRolloverLoop(ctx context.Context) (*rolloverInit, erro
 		return nil, err
 	}
 	// Never empty past this point: a positionless FULL is refused inside
-	// (POSITIONLESS-FULL-ROOT, on every source since v0.153.3 — the
+	// (POSITIONLESS-FULL-ROOT, on every source since v0.154.0 — the
 	// trigger-CDC engines record an anchor now, roadmap item 163) and a
 	// positionless INCREMENTAL resolves to its nearest positioned ancestor
 	// or refuses.

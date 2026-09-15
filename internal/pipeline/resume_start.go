@@ -53,7 +53,7 @@ import (
 // written invariant nobody checks is indistinguishable from one that
 // holds; this is the check.
 //
-// Until v0.153.3 a trigger-CDC source ([ir.CDCTriggers]) was the ONE
+// Until v0.154.0 a trigger-CDC source ([ir.CDCTriggers]) was the ONE
 // exemption: no trigger engine recorded a position on a full, and their
 // readers anchored at the change log's current MAX(id) when handed an
 // empty one — so the from-now branch was the only chain shape those
@@ -62,7 +62,7 @@ import (
 // by the v0.153.1 regression cycle). Every trigger engine now records the
 // change log's anchor inside the full's own read (their
 // [irbackup.SnapshotOpener] implementations), so the exemption is gone:
-// a trigger full with no EndPosition is a pre-v0.153.3 full, or one whose
+// a trigger full with no EndPosition is a pre-v0.154.0 full, or one whose
 // snapshot-anchored open refused (its capturer then records nothing on
 // purpose), and it is refused here like every other positionless root.
 func resumeStartFromParent(ctx context.Context, store irbackup.Store, parent *irbackup.Manifest, parentPath string) (ir.Position, error) {
@@ -74,7 +74,7 @@ func resumeStartFromParent(ctx context.Context, store irbackup.Store, parent *ir
 			"chain to resume from; extending it would start the chain from the source's CURRENT position and silently "+
 			"skip every change between the full's read and now. A full recorded without a position cannot root a "+
 			"chain on this source (a PlanetScale Neki router, a MySQL server whose binlog was off, a trigger-CDC "+
-			"full taken before v0.153.3 or whose snapshot-anchored open refused, or a pre-v0.17.2 full): take a fresh "+
+			"full taken before v0.154.0 or whose snapshot-anchored open refused, or a pre-v0.17.2 full): take a fresh "+
 			"`backup full` on a source that records one and start a new chain: %w",
 			positionlessFullRootMarker, lineage.ManifestBackupID(parent), parentPath, ir.ErrPositionInvalid)
 	}

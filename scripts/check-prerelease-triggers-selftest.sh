@@ -48,7 +48,7 @@ fail=0
 # every other git call to the real binary — the script's derivation still
 # needs `git ls-files`, `git blame` and `git tag --contains`. Without this the
 # self-test passed wherever tags exist and first failed on main's CI, where the
-# script resolved its base tag before reading the synthetic delta (v0.153.3).
+# script resolved its base tag before reading the synthetic delta (v0.154.0).
 real_git=$(command -v git)
 mkdir -p "$work/bin"
 cat >"$work/bin/git" <<SHIM
