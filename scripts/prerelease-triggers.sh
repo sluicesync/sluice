@@ -27,6 +27,14 @@ if [ -z "$base" ]; then
 fi
 
 files="$(git diff --name-only "$base"..HEAD 2>/dev/null || true)"
+# PRERELEASE_TRIGGERS_DELTA_FILE names a file holding one repo-relative path
+# per line to grade INSTEAD of the git delta. It exists for
+# scripts/check-prerelease-triggers-selftest.sh, which feeds synthetic deltas
+# through the real category logic; nothing else should set it.
+if [ -n "${PRERELEASE_TRIGGERS_DELTA_FILE:-}" ]; then
+  files="$(cat "$PRERELEASE_TRIGGERS_DELTA_FILE")"
+  base="synthetic:$PRERELEASE_TRIGGERS_DELTA_FILE"
+fi
 if [ -z "$files" ]; then
   echo "prerelease-triggers: no changed files in $base..HEAD -- nothing to advise."
   exit 0
@@ -120,6 +128,113 @@ done <<EOF
 $(grep -nEi "$expiry_pattern" docs/dev/roadmap.md docs/adr/*.md 2>/dev/null || true)
 EOF
 if [ "$expiry_hits" -gt 0 ]; then
+  hit=1
+  echo
+fi
+
+# ---- Unscheduled-pin gate (audit 2026-09-15 T-1 / T-11) --------------------
+# Some surfaces have exactly one end-to-end pin, and that pin runs in NO
+# scheduled workflow: the d1verify suite (live Cloudflare credentials are
+# machine-local, so it has no workflow at all), psverify (dispatch-only), the
+# ddlfixture leg (dispatch-only by its job's `if:`). Four D1 commits shipped in
+# one window with the premise they rest on asserted only by a d1verify test
+# nobody was asked to run -- the five categories above key on file NAMES and
+# none of them names a suite.
+#
+# DERIVED, NOT LISTED. scripts/check-run-filter-coverage.sh already maps every
+# tagged test axis to its workflow leg (MANIFEST) or to "no workflow at all"
+# (EXEMPT_TAGS), and keeps both honest with its own symmetric staleness
+# checks. This block reads those two tables, decides per tag whether ANY leg
+# runs on a schedule (an active `schedule:` trigger in the workflow AND a job
+# `if:` that does not demand workflow_dispatch), and for every tag with no
+# scheduled leg maps the tag to the packages its tagged test files live in.
+# A delta touching such a package fires: "run it, or record why not". A
+# package under internal/pipeline is touched by most releases, so this will
+# fire often for psverify -- that is the advisory posture of this script
+# (favor a suggestion over a miss), and the hit lists the exact pins so the
+# decision is one glance.
+coverage_script="scripts/check-run-filter-coverage.sh"
+if [ ! -f "$coverage_script" ]; then
+  echo "prerelease-triggers: $coverage_script is missing -- the unscheduled-pin derivation has no source. Refusing to advise on a broken derivation." >&2
+  exit 2
+fi
+exempt_tags="$(sed -n "s/^EXEMPT_TAGS='\(.*\)'$/\1/p" "$coverage_script")"
+manifest_lines="$(awk -v q="'" '/^MANIFEST=/{on=1; next} on && $0 == q {exit} on' "$coverage_script" | sed '/^$/d')"
+manifest_count="$(printf '%s\n' "$manifest_lines" | grep -c . || true)"
+if [ -z "$exempt_tags" ] || [ "${manifest_count:-0}" -lt 5 ]; then
+  echo "prerelease-triggers: could not read EXEMPT_TAGS / MANIFEST from $coverage_script (got exempt='$exempt_tags', $manifest_count manifest lines) -- the parse drifted; fix it rather than advising over an empty universe." >&2
+  exit 2
+fi
+
+# leg_is_scheduled WORKFLOW JOB -> 0 when that leg runs WITHOUT being asked:
+# the workflow fires on a schedule, on push, or on pull_request (ci.yml's
+# postgis/vstream/mariadb legs run on every PR and are not dispatch-only),
+# and the job's own `if:` does not confine it to workflow_dispatch.
+leg_is_scheduled() {
+  _wf=".github/workflows/$1"
+  _job="$2"
+  [ -f "$_wf" ] || return 1
+  grep -qE '^[[:space:]]+(schedule|push|pull_request):' "$_wf" || return 1
+  # The job's own `if:` can still confine it to dispatch (extended-suites'
+  # ddlfixture). Read the job block and look for that condition.
+  _jobif="$(awk -v job="  $_job:" 'index($0, job) == 1 {injob=1; next} injob && /^  [A-Za-z0-9_-]+:/ {injob=0} injob && /^    if:/' "$_wf")"
+  case "$_jobif" in
+  *"event_name == 'workflow_dispatch'"*) return 1 ;;
+  esac
+  return 0
+}
+
+unscheduled=""   # "tag|reason" per line
+for t in $exempt_tags; do
+  unscheduled="$unscheduled
+$t|no workflow at all (EXEMPT_TAGS in $coverage_script)"
+done
+for t in $(printf '%s\n' "$manifest_lines" | cut -d';' -f1 | sed 's/!.*//' | sort -u); do
+  scheduled=0
+  legs=""
+  while IFS=';' read -r mtag _ _ mlabel; do
+    [ "${mtag%%!*}" = "$t" ] || continue
+    wf="${mlabel%% *}"
+    job="$(printf '%s' "$mlabel" | awk '{print $2}')"
+    legs="$legs $wf/$job"
+    if leg_is_scheduled "$wf" "$job"; then scheduled=1; fi
+  done <<EOF
+$manifest_lines
+EOF
+  if [ "$scheduled" -eq 0 ]; then
+    unscheduled="$unscheduled
+$t|dispatch-only (${legs# } has no scheduled trigger)"
+  fi
+done
+unscheduled="$(printf '%s\n' "$unscheduled" | sed '/^$/d')"
+if [ -z "$unscheduled" ]; then
+  echo "prerelease-triggers: derived ZERO unscheduled tags, but d1verify is exempt by design -- the derivation broke. Refusing to advise over it." >&2
+  exit 2
+fi
+
+unsched_hits=0
+test_files="$(git ls-files -- '*_test.go')"
+while IFS='|' read -r tag reason; do
+  [ -n "$tag" ] || continue
+  pins="$(printf '%s\n' "$test_files" | xargs grep -lE "^//go:build.*\b$tag\b" 2>/dev/null || true)"
+  [ -n "$pins" ] || continue
+  for d in $(printf '%s\n' "$pins" | xargs -n1 dirname | sort -u); do
+    touched="$(printf '%s\n' "$files" | grep -E "^$d/[^/]+$" || true)"
+    [ -n "$touched" ] || continue
+    if [ "$unsched_hits" -eq 0 ]; then
+      echo "> [unscheduled-pin] -> run the named suite by hand, or record in the release notes / backlog why not"
+      echo "  why: this delta touches a surface whose only end-to-end pin runs in NO scheduled workflow -- a premise nobody is asked to re-measure rots silently (audit 2026-09-15 T-1)"
+    fi
+    unsched_hits=$((unsched_hits + 1))
+    echo "  - tag '$tag' ($reason) covers $d/, touched by:"
+    printf '%s\n' "$touched" | sed 's/^/      - /'
+    echo "    pins that run nowhere on a schedule:"
+    printf '%s\n' "$pins" | grep -E "^$d/[^/]+$" | sed 's/^/      - /'
+  done
+done <<EOF
+$unscheduled
+EOF
+if [ "$unsched_hits" -gt 0 ]; then
   hit=1
   echo
 fi
