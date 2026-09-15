@@ -130,6 +130,13 @@ func (e Engine) openBackupSnapshotSerial(ctx context.Context, cfg *gomysql.Confi
 	if err != nil {
 		return nil, err
 	}
+	// Flavor probe (Bug 280 roster, audit 2026-09-15): `backup full` opens
+	// the schema reader first today, but the door probes for itself rather
+	// than inheriting from call order. Memoised per (server, flavor).
+	if err := e.checkServerFlavor(ctx, db, cfg); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 
 	conn, err := db.Conn(ctx)
 	if err != nil {
@@ -293,6 +300,14 @@ func (e Engine) openBackupSnapshotCoordinated(ctx context.Context, cfg *gomysql.
 			ctx, "mysql: backup snapshot: coordinated parallel open could not connect; falling back to serial reader",
 			slog.String("err", err.Error()),
 		)
+		return nil
+	}
+	// Flavor probe (Bug 280 roster, audit 2026-09-15). A refusal here is
+	// not swallowed by the serial fallback: the verdict is memoised per
+	// (server, flavor), so the serial opener's own probe returns the same
+	// refusal loudly on the next line of the caller.
+	if err := e.checkServerFlavor(ctx, db, cfg); err != nil {
+		_ = db.Close()
 		return nil
 	}
 

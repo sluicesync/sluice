@@ -176,6 +176,13 @@ func (e Engine) openBinlogSnapshotStreamConcurrent(ctx context.Context, dsn stri
 	if err != nil {
 		return nil, err
 	}
+	// Flavor probe at the concurrent snapshot door too (Bug 280 roster,
+	// audit 2026-09-15); same reasoning as the serial opener in
+	// cdc_snapshot.go. Memoised per (server, flavor).
+	if err := e.checkServerFlavor(ctx, db, cfg); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 
 	// The binlog CDC-open preflight set (row image / format / replica
 	// source / db filters), before the FTWRL window and the bulk copy

@@ -138,6 +138,11 @@ func (e Engine) OpenSnapshotStreamFromPosition(ctx context.Context, dsn string, 
 	if e.Capabilities().CDC == ir.CDCNone {
 		return nil, fmt.Errorf("%s: snapshot+CDC not supported by this flavor: %w", e.Name(), ErrNotImplemented)
 	}
+	// flavor-door-exempt: VStream-only door — every non-VStream flavor is
+	// refused on the next line, and checkServerFlavor returns nil for every
+	// VStream flavor before touching the connection (pinned by
+	// TestCheckServerFlavor_IsANoOpForVStreamFlavors), so there is no probe
+	// to run here.
 	if !e.Flavor.usesVStream() {
 		return nil, fmt.Errorf(
 			"%s: resumable cold-start COPY is only implemented for the VStream flavors (planetscale / vitess): %w",
@@ -224,6 +229,11 @@ func (e Engine) OpenSnapshotStreamFromPositionFiltered(ctx context.Context, dsn 
 	if e.Capabilities().CDC == ir.CDCNone {
 		return nil, fmt.Errorf("%s: snapshot+CDC not supported by this flavor: %w", e.Name(), ErrNotImplemented)
 	}
+	// flavor-door-exempt: VStream-only door — every non-VStream flavor is
+	// refused on the next line, and checkServerFlavor returns nil for every
+	// VStream flavor before touching the connection (pinned by
+	// TestCheckServerFlavor_IsANoOpForVStreamFlavors), so there is no probe
+	// to run here.
 	if !e.Flavor.usesVStream() {
 		return nil, fmt.Errorf(
 			"%s: resumable cold-start COPY is only implemented for the VStream flavors (planetscale / vitess): %w",
@@ -389,6 +399,14 @@ func (e Engine) openBinlogSnapshotStreamShared(ctx context.Context, dsn string, 
 	applySourceReadSessionTimeouts(cfg)
 	db, err := openDB(ctx, cfg, e.opts.sqlMode)
 	if err != nil {
+		return nil, err
+	}
+	// Flavor probe at the snapshot door (Bug 280 roster, audit 2026-09-15):
+	// the sync cold start opens the schema reader first today, but that is
+	// the unwritten call-order assumption Bug 280 measured failing, so the
+	// door probes for itself. Memoised per (server, flavor).
+	if err := e.checkServerFlavor(ctx, db, cfg); err != nil {
+		_ = db.Close()
 		return nil, err
 	}
 
@@ -687,7 +705,7 @@ func (e Engine) openBinlogSnapshotStreamShared(ctx context.Context, dsn string, 
 // SetCDCDatabaseScope predicate is the sole event-scope authority.
 func (e Engine) openCDCReaderForSnapshot(ctx context.Context, dsn string, multiDatabase bool) (ir.CDCReader, error) {
 	if multiDatabase {
-		return openBinlogServerCDCReader(ctx, dsn, e.Flavor, e.opts)
+		return openBinlogServerCDCReader(ctx, dsn, e)
 	}
 	return e.OpenCDCReader(ctx, dsn)
 }

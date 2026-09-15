@@ -313,14 +313,15 @@ func (e Engine) OpenCDCReader(ctx context.Context, dsn string) (ir.CDCReader, er
 	// land here; the reader flavor-branches its MariaDB-specific SQL
 	// (domain GTIDs, gtid_binlog_pos, SHOW BINLOG STATUS) off e.Flavor
 	// (ADR-0170).
-	return openBinlogCDCReader(ctx, dsn, e.Flavor, e.opts)
+	return openBinlogCDCReader(ctx, dsn, e)
 }
 
 // openBinlogCDCReader is the binlog (FlavorVanilla / FlavorMariaDB) path
 // of OpenCDCReader. Lifted out of OpenCDCReader so the flavor dispatch
-// above stays readable.
-func openBinlogCDCReader(ctx context.Context, dsn string, flavor Flavor, opts engineOptions) (ir.CDCReader, error) {
-	return openBinlogCDCReaderShared(ctx, dsn, flavor, false, opts)
+// above stays readable. It takes the Engine rather than its fields so the
+// shared opener can run the engine's own flavor probe (Bug 280 roster).
+func openBinlogCDCReader(ctx context.Context, dsn string, e Engine) (ir.CDCReader, error) {
+	return openBinlogCDCReaderShared(ctx, dsn, e, false)
 }
 
 // openBinlogServerCDCReader opens a binlog CDC reader against a *server*
@@ -330,8 +331,8 @@ func openBinlogCDCReader(ctx context.Context, dsn string, flavor Flavor, opts en
 // separately via [CDCReader.SetCDCDatabaseScope]. The single-database
 // path keeps the strict [parseDSN] (database required); this sibling
 // relaxes only that precondition.
-func openBinlogServerCDCReader(ctx context.Context, dsn string, flavor Flavor, opts engineOptions) (ir.CDCReader, error) {
-	return openBinlogCDCReaderShared(ctx, dsn, flavor, true, opts)
+func openBinlogServerCDCReader(ctx context.Context, dsn string, e Engine) (ir.CDCReader, error) {
+	return openBinlogCDCReaderShared(ctx, dsn, e, true)
 }
 
 // OpenServerCDCReader opens a server-wide binlog CDC reader against a
@@ -358,10 +359,11 @@ func (e Engine) OpenServerCDCReader(ctx context.Context, dsn string) (ir.CDCRead
 			e.Name(), ErrNotImplemented,
 		)
 	}
-	return openBinlogServerCDCReader(ctx, dsn, e.Flavor, e.opts)
+	return openBinlogServerCDCReader(ctx, dsn, e)
 }
 
-func openBinlogCDCReaderShared(ctx context.Context, dsn string, flavor Flavor, serverScope bool, opts engineOptions) (ir.CDCReader, error) {
+func openBinlogCDCReaderShared(ctx context.Context, dsn string, e Engine, serverScope bool) (ir.CDCReader, error) {
+	flavor, opts := e.Flavor, e.opts
 	// Package-level parse (not parseDSNForFlavor): the binlog path is
 	// reachable from FlavorVanilla and FlavorMariaDB (the VStream flavors
 	// branch to openVStreamReader before this). Both keep the binary-
@@ -384,6 +386,18 @@ func openBinlogCDCReaderShared(ctx context.Context, dsn string, flavor Flavor, s
 	zeroDate = foldZeroDate(zeroDate, opts.zeroDate)
 	db, err := openDB(ctx, cfg, opts.sqlMode)
 	if err != nil {
+		return nil, err
+	}
+	// The flavor probe, at the CDC door too (Bug 280 roster, audit
+	// 2026-09-15). The reader flavor-branches its binlog SQL off e.Flavor,
+	// so a MariaDB source addressed with `--source-driver mysql` on a warm
+	// resume — where this is the FIRST door the sync opens on the source —
+	// would die on sluice's own MySQL-spelled statement with the steer that
+	// names the right driver never having run: Bug 280's shape, one door
+	// over. Memoised per (server, flavor), so the schema reader's earlier
+	// probe on a cold start makes this a map lookup.
+	if err := e.checkServerFlavor(ctx, db, cfg); err != nil {
+		_ = db.Close()
 		return nil, err
 	}
 	host, port, err := hostPortFromAddr(cfg.Addr)

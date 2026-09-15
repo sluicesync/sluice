@@ -66,6 +66,13 @@ func (e Engine) OpenBackfillExecutor(ctx context.Context, dsn string) (ir.Backfi
 	if err != nil {
 		return nil, err
 	}
+	// Flavor probe (Bug 280 roster, audit 2026-09-15): `backfill` opens
+	// this door FIRST, ahead of any schema door, so it cannot inherit the
+	// probe from call order. Memoised per (server, flavor).
+	if err := e.checkServerFlavor(ctx, db, cfg); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	return &BackfillExecutor{db: db}, nil
 }
 
