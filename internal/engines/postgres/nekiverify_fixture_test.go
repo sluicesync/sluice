@@ -588,3 +588,146 @@ func nekiDropResidue(t *testing.T, db *sql.DB, stmts ...string) {
 		}
 	}
 }
+
+// nekiReapProbeCopySessions proves the copy-limit probe's sessions are gone
+// from the ROUTER, and kills the ones that are not.
+//
+// # Why a client-side close is not evidence
+//
+// `sql.DB.Close` closes the pool's FREE connections and marks it closed; a
+// connection still checked out closes when it is returned. It waits for
+// nothing on the server. So after the probe releases twelve held COPYs and
+// closes twelve pools, the only thing established is that this process has
+// stopped holding sockets — which says nothing about whether the router still
+// has backends for them, and a leftover COPY occupies one of the four slots
+// [nekiConcurrentCopyLimit] names for whatever arm runs next.
+//
+// The census is the same one the stall diagnostic uses; the kill is
+// `__neki.terminate_backend(router_cell, router_uid, pid)`, which needs the
+// router coordinates the census returns — which is why the census must be
+// read structurally rather than rendered.
+//
+// SCOPE, stated because a reaper that guesses wide is worse than none: only
+// backends whose query names `COPY <table>` for THIS probe's table are
+// candidates. Nothing else is touched, and a candidate is given a grace
+// period first — the server reaps these on its own (the 25P03s in the log are
+// exactly that), and killing a session that was about to exit would make the
+// count meaningless.
+//
+// Failures are LOGGED, never fatal. A teardown that can fail an arm converts
+// a platform observation into a red test about the harness.
+func nekiReapProbeCopySessions(t *testing.T, db *sql.DB, table string) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	marker := "COPY " + table
+	survivors := func() ([]nekiBackend, string) {
+		backends, source, err := nekiReadBackends(ctx, db)
+		if err != nil {
+			t.Logf("copy-probe reap: the backend census could not be taken, so whether the probe's COPY "+
+				"sessions survived is UNKNOWN for this run: %v", err)
+			return nil, ""
+		}
+		var hits []nekiBackend
+		for _, b := range backends {
+			if strings.Contains(b.query, marker) {
+				hits = append(hits, b)
+			}
+		}
+		return hits, source
+	}
+
+	// Grace: the platform reaps these itself, and a run where it already has
+	// is the expected outcome rather than a special case.
+	var hits []nekiBackend
+	var source string
+	for attempt := 1; attempt <= 6; attempt++ {
+		hits, source = survivors()
+		if len(hits) == 0 {
+			t.Logf("copy-probe reap: no backend is running %q — the probe's COPY sessions are gone from the "+
+				"router (census: %s)", marker, source)
+			return
+		}
+		if attempt < 6 {
+			select {
+			case <-ctx.Done():
+				break
+			case <-time.After(5 * time.Second):
+				continue
+			}
+		}
+		break
+	}
+
+	t.Logf("copy-probe reap: %d backend(s) still running %q after the grace period — terminating them so the "+
+		"next arm does not inherit an occupied copy slot.\n%s",
+		len(hits), marker, nekiRenderBackends(hits, source))
+
+	killed := 0
+	for _, b := range hits {
+		var ok bool
+		if err := db.QueryRowContext(ctx,
+			`SELECT __neki.terminate_backend($1, $2, $3)`, b.routerCell, b.routerUID, b.pid).Scan(&ok); err != nil {
+			t.Logf("copy-probe reap: terminate_backend(%q, %q, %d) failed: %v", b.routerCell, b.routerUID, b.pid, err)
+			continue
+		}
+		if !ok {
+			t.Logf("copy-probe reap: terminate_backend(%q, %q, %d) reported success=false", b.routerCell, b.routerUID, b.pid)
+			continue
+		}
+		killed++
+	}
+
+	residue, _ := survivors()
+	t.Logf("copy-probe reap: terminated %d of %d leftover COPY backend(s); %d still present afterwards",
+		killed, len(hits), len(residue))
+}
+
+// nekiArm runs ONE arm of the sharded-premise suite under a budget of its own.
+//
+// # Why a per-arm budget replaced the single shared one
+//
+// The suite ran every arm on one 30-minute context. Run 34932058458
+// (2026-09-15) is what that costs: the NK306 arm — two single-row INSERTs,
+// 0.33 s and 0.36 s in the two runs either side of it — took 1008.76 s, and
+// the backup arm then died mid-read on the shared deadline at exactly
+// 1800.81 s. Everything after it never ran, including the shard-targeting
+// probe the dispatch had been paid for. One arm's stall consumed the whole
+// run's budget, and the failure it produced pointed at the arm that was
+// UNLUCKY enough to be holding the context when it expired rather than the
+// one that spent it.
+//
+// A budget per arm makes both halves right: a stall is attributed to the arm
+// that stalls, and it costs that arm's budget instead of the suite's.
+//
+// The elapsed time is logged on EVERY arm, not only slow ones. Sizing these
+// budgets took a diff of three run logs precisely because the suite never
+// recorded its own per-arm cost; one t.Logf per arm means the next revision is
+// read off a single run.
+func nekiArm(parent context.Context, t *testing.T, name string, budget time.Duration, run func(context.Context)) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(parent, budget)
+	defer cancel()
+
+	start := time.Now()
+	run(ctx)
+	elapsed := time.Since(start)
+
+	switch {
+	case parent.Err() != nil:
+		t.Errorf("ARM %q ended after %s because the SUITE's budget was exhausted, not its own (%s). Every arm "+
+			"after this one is starved too — read the per-arm timings above for which arm spent it",
+			name, elapsed.Round(time.Second), budget)
+	case ctx.Err() != nil:
+		t.Errorf("ARM %q spent its ENTIRE %s budget and was cut off (%s elapsed). The suite continues — that "+
+			"is what the per-arm budget is for — but this arm's result is 'it stalled', not 'it failed'. If "+
+			"the arm is legitimately slower than its budget, raise it where it is wired; if it is not, the "+
+			"backend census is the next evidence to add here",
+			name, budget, elapsed.Round(time.Second))
+	default:
+		t.Logf("arm %q: %s of a %s budget", name, elapsed.Round(time.Millisecond), budget)
+	}
+}

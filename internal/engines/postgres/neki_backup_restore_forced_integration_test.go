@@ -8,6 +8,11 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -200,5 +205,120 @@ func TestPostgresSuite_NekiBackupRestorePlumbing(t *testing.T) {
 			t.Logf("backup core: %s — source %d rows digested %s, read back %d rows digested %s",
 				tbl, res.sourceRows[tbl], res.sourceDigest[tbl], res.readbackRows[tbl], res.readbackHash[tbl])
 		}
+	})
+
+	// The stall diagnostic, exercised rather than merely compiled.
+	//
+	// WHAT THIS LEG REACHES, stated because the name could be read as broader:
+	// the `pg_catalog.pg_stat_activity` FALLBACK only. A vanilla server has no
+	// `__neki` schema, so the router query fails and the fallback answers —
+	// which is precisely the half a live run never exercises. The router half
+	// is reached only by a provisioned cluster, and is ungated here.
+	//
+	// It exists because the diagnostic it guards is only ever read during a
+	// stall on a cluster that is deleted minutes later. A census helper with a
+	// typo in its projection would be discovered exactly once, at the worst
+	// possible time, and would then have to be fixed and re-dispatched.
+	t.Run("the stall census reads back on a server with no __neki schema", func(t *testing.T) {
+		db, err := sql.Open("pgx", dsn)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		defer func() { _ = db.Close() }()
+
+		backends, source, err := nekiReadBackends(ctx, db)
+		if err != nil {
+			t.Fatalf("the backend census could not be taken at all: %v", err)
+		}
+		if !strings.Contains(source, "pg_stat_activity") {
+			t.Errorf("the census answered from %q — on a server with no __neki schema the fallback is the only "+
+				"view that can answer, so this leg is no longer exercising it", source)
+		}
+		// Anti-vacuity: this connection is itself a backend, and the query
+		// excludes only the CURRENT pid. An empty census means the projection
+		// ran and returned nothing, which would make a stall snapshot a blank
+		// line at the moment it matters most.
+		if len(backends) == 0 {
+			t.Error("the census returned ZERO backends on a live server this test is connected to. The " +
+				"projection runs and says nothing, so a stall snapshot would print an empty table")
+		}
+		t.Logf("%s", nekiRenderBackends(backends, source))
+	})
+
+	// The stall WATCHDOG, mutation-proved in both directions.
+	//
+	// The live arm's threshold is 60 s and the stall it exists for was seven
+	// minutes, so the branch that fires can never be reached by a healthy run
+	// — which means without this leg the only evidence that it fires at all
+	// would be the next stalled dispatch, and a diagnostic that turns out not
+	// to work is discovered exactly when it is needed. Both directions are
+	// asserted because a watchdog that always fires is as useless as one that
+	// never does.
+	//
+	// It is also the regression gate for a defect this very watch shipped in
+	// its first cut: it observed the backup by tee-ing `slog`'s default
+	// handler, which deadlocks the process (see
+	// [nekiStoreProgressWatch]'s doc). These legs run the watch for real; a
+	// return to a seam that hangs fails here in under two seconds rather than
+	// consuming a live cluster's entire budget.
+	t.Run("the stall watchdog fires on quiet and stays quiet while the store grows", func(t *testing.T) {
+		db, err := sql.Open("pgx", dsn)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		defer func() { _ = db.Close() }()
+
+		t.Run("it FIRES, and takes a real census, when the store stops growing", func(t *testing.T) {
+			root := t.TempDir()
+			var mu sync.Mutex
+			var reasons []string
+			w := nekiWatchStoreProgress(t, root, 200*time.Millisecond, func(why string) {
+				mu.Lock()
+				reasons = append(reasons, why)
+				mu.Unlock()
+				nekiLogBackendCensus(t, db, why)
+			})
+			time.Sleep(900 * time.Millisecond)
+			fired := w.snapshotTaken()
+			w.stop()
+
+			if !fired {
+				t.Error("the watchdog did NOT fire after 900ms of a store that never grew, against a 200ms " +
+					"threshold. The live arm's 60s branch is therefore unproven, and the next stalled " +
+					"dispatch would produce the same evidence-free log the diagnostic was added to prevent")
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			// ONCE, not once per tick: a stalled router sampled every interval
+			// for seven minutes buries the evidence under copies of itself.
+			if len(reasons) != 1 {
+				t.Errorf("the stall sample fired %d time(s) (%v), want exactly 1", len(reasons), reasons)
+			}
+		})
+
+		t.Run("it does NOT fire while the store keeps growing", func(t *testing.T) {
+			root := t.TempDir()
+			fired := false
+			w := nekiWatchStoreProgress(t, root, 200*time.Millisecond, func(string) { fired = true })
+			// Write for longer than the threshold. A watch that fired here
+			// would be reporting a stall on a run that is plainly working.
+			for i := range 9 {
+				if err := os.WriteFile(filepath.Join(root, fmt.Sprintf("chunk-%d", i)),
+					make([]byte, 128*(i+1)), 0o600); err != nil {
+					t.Fatalf("write a growing chunk: %v", err)
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+			w.stop()
+
+			if fired {
+				t.Error("the watchdog reported a stall while the store was growing on every poll, so its " +
+					"firing says nothing about whether anything actually stopped")
+			}
+			if trace := w.progressTrace(); len(trace) < 2 {
+				t.Errorf("the progress trace recorded %d sample(s) (%v) across nine writes — it is not "+
+					"observing the store at all, which would make the non-firing above vacuous", len(trace), trace)
+			}
+		})
 	})
 }

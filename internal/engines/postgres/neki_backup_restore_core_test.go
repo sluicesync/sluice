@@ -20,6 +20,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 
@@ -765,11 +766,23 @@ func nekiBackupCoreFromPG(
 	defer func() { _ = db.Close() }()
 
 	// The INDEPENDENT expected value, taken BEFORE the backup runs.
+	//
+	// TIMED, and reported even on the happy path. Run 34932058458's backup arm
+	// stalled for 465 s on a read that had taken 2.0 s in the run before it,
+	// and the whole evidence the log carried was "context deadline exceeded" —
+	// no per-read duration to say whether the SOURCE or the backup was slow.
+	// These reads and the backup's own (see [nekiWatchTableReads] below) are
+	// the two halves of that answer, so both now leave a number behind.
 	perTableWant := map[string][]nekiTriple{}
+	readLedger := make([]string, 0, len(tables))
 	for _, tbl := range tables {
+		readStart := time.Now()
 		rows, err := nekiReadTriples(ctx, db, nekiOrderedProjection(tbl))
+		readLedger = append(readLedger, fmt.Sprintf("%s=%s", tbl, time.Since(readStart).Round(time.Millisecond)))
 		if err != nil {
-			t.Fatalf("neki backup core: read %s from the source for the independent expected value: %v", tbl, err)
+			nekiLogBackendCensus(t, db, fmt.Sprintf("the independent expected-value read of %s failed", tbl))
+			t.Fatalf("neki backup core: read %s from the source for the independent expected value: %v\n"+
+				"  reads so far: %s", tbl, err, strings.Join(readLedger, ", "))
 		}
 		if len(rows) == 0 {
 			t.Fatalf("neki backup core: %s is EMPTY on the source, so backing it up and reading it back would "+
@@ -777,6 +790,7 @@ func nekiBackupCoreFromPG(
 		}
 		perTableWant[tbl] = rows
 	}
+	t.Logf("neki backup core: independent expected-value reads: %s", strings.Join(readLedger, ", "))
 
 	// The raw-copy lane's disposition, recorded rather than assumed: on Neki
 	// the reader declines it (the router refuses `COPY (SELECT …) TO` with
@@ -799,16 +813,50 @@ func nekiBackupCoreFromPG(
 		t.Fatalf("neki backup core: NewLocalStore: %v", err)
 	}
 
+	// The stall watch. 60 s is the threshold the observed stall argues for:
+	// every table this arm has ever read completed in single-digit seconds,
+	// and the stall that cost run 34932058458 its remaining arms was seven
+	// minutes — so a minute with nothing written is unambiguous.
+	//
+	// It watches the STORE rather than the run, so it detects a stall inside a
+	// table as well as between tables. That matters here specifically: the
+	// observed stall never finished its first table.
+	watch := nekiWatchStoreProgress(t, storeRoot, 60*time.Second, func(why string) {
+		nekiLogBackendCensus(t, db, why)
+	})
+
 	rec := newNekiPhaseRecorder()
-	if err := (&backup.Backup{
+	backupErr := (&backup.Backup{
 		Source:    Engine{},
 		SourceDSN: sourceDSN,
 		Store:     store,
 		Filter:    migcore.TableFilter{Include: tables},
 		ChunkRows: chunkRows,
 		Progress:  rec,
-	}).Run(ctx); err != nil {
-		t.Fatalf("%s", nekiExplainFailure("neki backup core: backup FROM the source", rec, err))
+	}).Run(ctx)
+	// The ledger is written BEFORE the failure is reported, on both paths:
+	// "which table was it on, and for how long" is the first question a red
+	// weekly arm raises, and a t.Fatalf would leave the stop deferred to the
+	// end of the test where its output lands after the failure it explains.
+	trace, sampled := watch.progressTrace(), watch.snapshotTaken()
+	watch.stop()
+	if backupErr != nil {
+		// The two facts that decide, on sight, whether this failure is a
+		// STALL or something else. Run 34932058458's version of this message
+		// carried neither, and "context deadline exceeded" alone is
+		// compatible with a slow read, an interrupted one, and a healthy one
+		// that simply started too late.
+		census := "no — the store kept growing right up to the failure, so this is NOT a run that stopped " +
+			"making progress; it ran out of time rather than stalling"
+		if sampled {
+			census = "yes — a backend census was logged above, taken at the moment the store went quiet"
+		}
+		written := "NOTHING was ever written"
+		if len(trace) > 0 {
+			written = strings.Join(trace, ", ")
+		}
+		t.Fatalf("%s  backup store growth: %s\n  stall census taken: %s",
+			nekiExplainFailure("neki backup core: backup FROM the source", rec, backupErr), written, census)
 	}
 
 	manifest, err := lineage.ReadManifest(ctx, store)

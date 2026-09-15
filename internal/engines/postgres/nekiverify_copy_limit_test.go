@@ -141,6 +141,28 @@ func nekiConcurrentCopyLimitHoldsOnTheCluster(ctx context.Context, t *testing.T,
 			for _, s := range held {
 				_ = s.conn.Close()
 			}
+
+			// PROVE the sessions are gone rather than asserting it in a
+			// comment.
+			//
+			// The Errorf above says "the fixture MAY still be occupying a copy
+			// slot for whatever runs next", and that sentence was the entire
+			// state of knowledge: a client-side `sql.DB.Close` returns without
+			// waiting for anything the SERVER is still doing (it closes free
+			// connections and marks the pool closed; in-use ones close on
+			// return), so nothing here had ever established that the probe's
+			// twelve COPY sessions were actually gone. A written invariant
+			// nobody checks is indistinguishable from one that holds, and this
+			// one gates every arm that follows — run 34932058458 spent 1008 s
+			// inside the NEXT arm's first single-row INSERT.
+			//
+			// That stall is NOT attributed to these sessions (the same release
+			// outcomes appear in two runs that had no stall, and this teardown
+			// measured 0.55 s in the stalled run itself). It is the reason the
+			// question must stop being unanswerable: the next occurrence now
+			// has a census either way.
+			nekiReapProbeCopySessions(t, probeDB, copyProbeTable)
+
 			// The probe's own rows, removed so the fixture is as it was found.
 			cctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 			defer cancel()

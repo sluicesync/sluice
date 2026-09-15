@@ -113,29 +113,97 @@ func isPGCode(err error, code string) bool {
 	return errors.As(err, &pgErr) && pgErr.Code == code
 }
 
+// # BUDGETS AND ORDER — where the suite's wall clock is spent, and why
+//
+// ## Every arm gets a budget of its own
+//
+// Until run 34932058458 (2026-09-15) this function ran every arm on ONE
+// 30-minute context. That run is what the shared budget costs: the NK306 arm
+// — two single-row INSERTs, 0.33 s and 0.36 s in the runs either side of it —
+// took 1008.76 s, and the backup arm then died mid-read when the shared
+// context expired at 1800.81 s. Eight arms never ran, including the
+// shard-targeting probe the dispatch had been paid for, and the run's only red
+// pointed at the arm that happened to be holding the context when it expired
+// rather than the one that spent it.
+//
+// So each arm now runs under [nekiArm] with a ceiling of its own. The
+// ceilings are sized from the MEASURED cost in run 34928571469 (the healthy
+// run of the same code), rounded up hard — roughly 4× measured with a 90 s
+// floor — because the purpose is to bound a stall, not to police a slow-ish
+// arm into a flake. They are deliberately NOT additive: the suite ceiling
+// below is the wall, and the per-arm ceilings exist so that no single arm can
+// reach it. Normal total work is ~5.5 minutes, so several arms can burn their
+// whole budget and the rest of the suite still runs.
+//
+// The suite ceiling is 42 minutes against the workflow's `-timeout=50m`,
+// leaving room for [TestNekiverify_FixtureProvisions] (measured 204 s) and for
+// the fixture teardown that deletes the database. Provisioning takes a budget
+// of its own — measured 109–789 s across eight runs — so a slow control plane
+// cannot present as every arm being starved.
+//
+// ## Order
+//
+// Cheap and decisive first, expensive and destructive last. Two orderings are
+// load-bearing rather than aesthetic:
+//
+//   - The SHARD-TARGETING probe now runs BEFORE restore/backup. It was last
+//     but one, on the argument that it writes transient rows into sk_good and
+//     the backup arm reads the whole schema. That argument is satisfied by
+//     the probe cleaning up WITHIN its own arm — every row it inserts is
+//     removed in a `t.Cleanup` on its own subtest, so the rows are gone before
+//     this function calls the next arm, and the backup arm takes its
+//     independent expected value afterwards. What the old order did NOT
+//     survive is a stall upstream of it: it is the cheapest, most decisive arm
+//     in the suite and the one this dispatch existed to run, and in run
+//     34932058458 it never executed. A per-arm budget alone would have saved
+//     it; ordering it ahead of the two multi-minute arms is the belt to that
+//     braces.
+//   - MoveTables stays LAST. It creates a workflow that blocks a table and a
+//     second logical database, and although it reverses both, a failure
+//     part-way through leaves the cluster in a state no later arm should have
+//     to reason about. Running it last means the only thing downstream of a
+//     bad outcome is teardown.
+
 // TestNekiverify_ShardedRefusalPremises checks the three platform
 // behaviours sluice's sharded-target refusals are built on.
 func TestNekiverify_ShardedRefusalPremises(t *testing.T) {
 	c := nekiverifyCreds(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 42*time.Minute)
 	defer cancel()
 
-	fx := provisionShardedNeki(ctx, t, c)
+	var fx *nekiFixture
+	nekiArm(ctx, t, "provision the sharded fixture", 20*time.Minute, func(ctx context.Context) {
+		fx = provisionShardedNeki(ctx, t, c)
+	})
+	if fx == nil {
+		// Reachable only if provisioning returns without having called
+		// t.Fatalf — which today it cannot, but a nil dereference two lines
+		// down would report a panic where the truth is "the fixture was never
+		// provisioned", and that is a bad first line for a weekly's log.
+		t.Fatal("nekiverify: the fixture was never provisioned, so no arm below has anything to run against")
+	}
 	db := openFixtureDB(t, fx)
 	defer func() { _ = db.Close() }()
 
-	tenantA, tenantB := tenantsOnDistinctShards(ctx, t, db, fx.shards)
+	var tenantA, tenantB int
+	nekiArm(ctx, t, "discover two tenants on distinct shards", 3*time.Minute, func(ctx context.Context) {
+		tenantA, tenantB = tenantsOnDistinctShards(ctx, t, db, fx.shards)
+	})
 
 	// Tier-2 coverage item #4 rides this fixture rather than provisioning a
 	// second database: none of its premises need sharding, and a database is
 	// minutes of wall clock and a real bill. See nekiverify_ddl_sequence_test.go.
-	nekiDDLAndSequencePremises(ctx, t, db)
+	nekiArm(ctx, t, "DDL and sequence premises", 3*time.Minute, func(ctx context.Context) {
+		nekiDDLAndSequencePremises(ctx, t, db)
+	})
 
 	// And the remedies sluice's Neki refusals tell operators to run must
 	// still exist on the router — a hint that cannot run is read mid-incident.
-	t.Run("PREMISE: every __neki function sluice's remedies name still exists", func(t *testing.T) {
-		nekiRemedyFunctionsExist(ctx, t, db)
+	nekiArm(ctx, t, "remedy functions exist", 2*time.Minute, func(ctx context.Context) {
+		t.Run("PREMISE: every __neki function sluice's remedies name still exists", func(t *testing.T) {
+			nekiRemedyFunctionsExist(ctx, t, db)
+		})
 	})
 
 	// The platform facts sluice COMPILES IN, measured rather than trusted.
@@ -146,25 +214,55 @@ func TestNekiverify_ShardedRefusalPremises(t *testing.T) {
 	// applied: nekiConcurrentCopyLimit and the mandatory shard key are claims
 	// about somebody else's platform baked into shipped behaviour, and a unit
 	// test can only ever prove sluice agrees with itself about them.
-	nekiConcurrentCopyLimitHoldsOnTheCluster(ctx, t, fx, []int{tenantA, tenantB})
-	nekiShardKeyRequiredOnInsert(ctx, t, db, tenantA)
-	nekiShardKeyRoutingCorpus(ctx, t, db, fx.shards)
+	nekiArm(ctx, t, "concurrent-COPY limit", 4*time.Minute, func(ctx context.Context) {
+		nekiConcurrentCopyLimitHoldsOnTheCluster(ctx, t, fx, []int{tenantA, tenantB})
+	})
+	nekiArm(ctx, t, "shard key required on INSERT (NK306)", 90*time.Second, func(ctx context.Context) {
+		nekiShardKeyRequiredOnInsert(ctx, t, db, tenantA)
+	})
+	nekiArm(ctx, t, "hostile shard-key routing corpus", 2*time.Minute, func(ctx context.Context) {
+		nekiShardKeyRoutingCorpus(ctx, t, db, fx.shards)
+	})
 
-	// Bisecting the open NK306 finding. These two run BEFORE the CDC arm on
+	// Bisecting the open NK306 finding. These run BEFORE the CDC arm on
 	// purpose: they answer "whose fault is it" independently of whether that
 	// arm passes, so a week where CDC fails still yields the diagnosis rather
 	// than only the symptom. sk_good is the fixture's own sharded table, so
-	// neither depends on the CDC arm having created anything.
-	nekiShardKeyIsNotReportedGenerated(ctx, t, db, "sk_good", "tenant_id")
-	nekiControlTableSchemaProbe(ctx, t, db)
-	nekiControlTableShardKeyProbe(ctx, t, db, "tenant_id")
-	nekiControlTableAuthoritativeGroupProbe(ctx, t, db, readAuthoritativeShardGroup(ctx, t, fx))
-	nekiTopologyWriteSemanticsProbe(ctx, t, db)
-	nekiCDCSerialVsBatchedIntoSharded(ctx, t, db, fx, tenantA, tenantB)
+	// none depends on the CDC arm having created anything.
+	nekiArm(ctx, t, "shard key is not reported GENERATED", 90*time.Second, func(ctx context.Context) {
+		nekiShardKeyIsNotReportedGenerated(ctx, t, db, "sk_good", "tenant_id")
+	})
+	nekiArm(ctx, t, "control tables in a separate schema", 2*time.Minute, func(ctx context.Context) {
+		nekiControlTableSchemaProbe(ctx, t, db)
+	})
+	nekiArm(ctx, t, "control table with a constant shard key", 2*time.Minute, func(ctx context.Context) {
+		nekiControlTableShardKeyProbe(ctx, t, db, "tenant_id")
+	})
+	nekiArm(ctx, t, "control table in the authoritative shard group", 2*time.Minute, func(ctx context.Context) {
+		nekiControlTableAuthoritativeGroupProbe(ctx, t, db, readAuthoritativeShardGroup(ctx, t, fx))
+	})
+	nekiArm(ctx, t, "set_data_topology write semantics", 2*time.Minute, func(ctx context.Context) {
+		nekiTopologyWriteSemanticsProbe(ctx, t, db)
+	})
+
+	// What a SHARD-TARGETED session can do — the probe that decides whether
+	// per-shard consistent reads and composite-position incrementals are
+	// mechanisms sluice could have, or neither. Cheap and decisive, so it runs
+	// ahead of the multi-minute arms; see this function's ordering note.
+	// See nekiverify_shard_targeting_probe_test.go.
+	nekiArm(ctx, t, "shard-targeted session probe", 4*time.Minute, func(ctx context.Context) {
+		nekiShardTargetedSessionProbe(ctx, t, db, fx, tenantA, tenantB, readAuthoritativeShardGroup(ctx, t, fx))
+	})
+
+	nekiArm(ctx, t, "CDC serial vs batched applier bisect", 4*time.Minute, func(ctx context.Context) {
+		nekiCDCSerialVsBatchedIntoSharded(ctx, t, db, fx, tenantA, tenantB)
+	})
 
 	// Coverage item #2: CDC into this sharded target, graded on ordered
 	// CONTENT rather than a row count.
-	nekiCDCIntoShardedTarget(ctx, t, db, fx, tenantA, tenantB)
+	nekiArm(ctx, t, "CDC into a sharded target", 4*time.Minute, func(ctx context.Context) {
+		nekiCDCIntoShardedTarget(ctx, t, db, fx, tenantA, tenantB)
+	})
 
 	// backup/restore against a sharded Neki — filed 2026-09-14, blocked on
 	// the NK306 control-table fix and unblocked by ADR-0187.
@@ -176,27 +274,33 @@ func TestNekiverify_ShardedRefusalPremises(t *testing.T) {
 	// placement check is worded as a statement about the target's STATE for
 	// exactly that reason, and measures separately which control tables the
 	// restore itself created. See nekiverify_backup_restore_test.go.
-	nekiRestoreIntoShardedTarget(ctx, t, db, fx, tenantA, tenantB)
-	nekiBackupFromShardedSource(ctx, t, db, fx, tenantA, tenantB)
+	nekiArm(ctx, t, "restore INTO a sharded Neki", 5*time.Minute, func(ctx context.Context) {
+		nekiRestoreIntoShardedTarget(ctx, t, db, fx, tenantA, tenantB)
+	})
+	nekiArm(ctx, t, "backup FROM a sharded Neki", 5*time.Minute, func(ctx context.Context) {
+		nekiBackupFromShardedSource(ctx, t, db, fx, tenantA, tenantB)
+	})
 
-	// What a SHARD-TARGETED session can do — the probe that decides whether
-	// per-shard consistent reads and composite-position incrementals are
-	// mechanisms sluice could have, or neither.
-	//
-	// AFTER the backup arm deliberately: it opens sessions of its own and
-	// writes (then removes) probe rows in sk_good to measure the misrouting
-	// hazard, and the backup arm reads the WHOLE schema. Running it earlier
-	// would make its transient rows somebody else's read.
-	// See nekiverify_shard_targeting_probe_test.go.
-	nekiShardTargetedSessionProbe(ctx, t, db, fx, tenantA, tenantB, readAuthoritativeShardGroup(ctx, t, fx))
+	nekiArm(ctx, t, "statement-shape premises", 3*time.Minute, func(ctx context.Context) {
+		nekiStatementShapePremises(ctx, t, db, tenantA, tenantB)
+	})
 
-	// Coverage item #3: the NK213 block from a real MoveTables cutover.
-	// LAST, deliberately — it creates a workflow that blocks a table and a
-	// second logical database, and although it reverses both, a failure
-	// part-way through leaves the cluster in a state no later subtest should
-	// have to reason about. Running it last means the only thing downstream of
-	// a bad outcome is teardown.
-	nekiMoveTablesBlocksWithNK213(ctx, t, db)
+	// Coverage item #3: the NK213 block from a real MoveTables cutover. LAST,
+	// deliberately — see this function's ordering note.
+	nekiArm(ctx, t, "MoveTables blocks with NK213", 5*time.Minute, func(ctx context.Context) {
+		nekiMoveTablesBlocksWithNK213(ctx, t, db)
+	})
+}
+
+// nekiStatementShapePremises checks the refusals sluice's sharded-target
+// preflights are built on: the shard key in an UPDATE SET list, ON CONFLICT
+// across shards, and UNIQUE's scope.
+//
+// Extracted from the test function so it can take a budget of its own like
+// every other arm — see the budget note on
+// [TestNekiverify_ShardedRefusalPremises].
+func nekiStatementShapePremises(ctx context.Context, t *testing.T, db *sql.DB, tenantA, tenantB int) {
+	t.Helper()
 
 	t.Run("PREMISE: the shard key may not be named in an UPDATE SET list", func(t *testing.T) {
 		// sluice's SLUICE-E-TARGET-SHARD-KEY-UPDATE-UNSUPPORTED refusal, and
