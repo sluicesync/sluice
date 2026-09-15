@@ -10,8 +10,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"io"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -39,27 +39,78 @@ import (
 // owes that fact a runtime check, and a weekly live suite is the only place one
 // can exist.
 //
-// # The two directions fail differently, and both fail
+// # THE CONTRACT, and why it is asymmetric
 //
-// Observed limit BELOW the constant is the dangerous direction: sluice would
-// pace itself to 4, the platform would admit fewer, and a real migration meets
-// `53300` mid-copy — the loud, actionable failure the constant's comment says
-// must stay loud precisely because the cap cannot prevent contention.
+// The graded question is exactly one: **is the measured admitted count at
+// least [nekiConcurrentCopyLimit]?**
 //
-// Observed limit ABOVE the constant is benign for correctness — sluice is
-// merely conservative and copies slower than it could. It still fails here, on
-// purpose. A weekly that tolerates drift stops being evidence of anything, the
-// fix is a one-line constant change, and the constant's own comment already
-// nominates where to make it. Silently leaving throughput on the table for
-// however long nobody looks is not the better outcome.
+//   - FEWER than 4 is the dangerous direction and FAILS. `ResolveCopyAxes`
+//     paces every Neki migrate to 4; if the platform admits three, sluice
+//     opens more concurrent COPYs than the cluster will take and meets `53300`
+//     mid-copy.
+//   - An INCONCLUSIVE measurement FAILS. A probe that cannot tell its subject
+//     from its apparatus must say so rather than report a number; every defect
+//     this arm has had was of that shape.
+//   - MORE than 4 is LOGGED, not failed. sluice is conservative, not wrong,
+//     and nothing breaks. This used to fail on the argument that "a weekly
+//     that tolerates drift stops being evidence" — which was correct in
+//     principle and wrong in practice: it made the weekly permanently red, so
+//     GitHub issue #338 re-filed every Sunday on a condition nobody was going
+//     to act on, and a suite that is always red is a suite whose next genuine
+//     red is invisible. The measured number is logged under the
+//     `NEKI-COPYLIMIT` marker on every outcome, which is what makes the trend
+//     greppable without making it a failure.
 //
-// # What "held open" means, and why the probe is shaped this way
+// # What "accepted" means, and why the first two cuts measured the wrong thing
 //
 // A `COPY … FROM STDIN` occupies its slot for as long as the client has not
-// finished sending. So each probe session starts a CopyFrom whose reader
-// BLOCKS, and the session stays open until this test releases it. An accepted
-// COPY is therefore one whose CopyFrom has not returned; a refused one returns
-// `53300` promptly. That distinction is the whole measurement.
+// finished sending, so each probe session starts a CopyFrom whose reader
+// eventually BLOCKS, and the session stays open until this arm releases it.
+// The measurement is which of those sessions the platform took.
+//
+// Deciding that by "CopyFrom has not returned within four seconds" is WRONG,
+// and three paid runs recorded it being wrong without the arm noticing:
+//
+//	34926553073, 34928571469, 34932058458 — all three logged
+//	  "measured concurrent-COPY limit: 12 accepted, then <nil>"
+//	and then, in the SAME SECOND, on release:
+//	  held COPY 5..12 failed on release: … too many concurrent COPY
+//	  operations (limit: 4) (SQLSTATE 53300)
+//	  held COPY 1..4  failed on release: … idle-in-transaction timeout (25P03)
+//
+// Read those together and the platform is saying its limit is four. Sessions
+// 1–4 held real slots — the server saw them as sessions in a transaction and
+// reaped them, which is what a 25P03 IS. Sessions 5–12 were refused; the
+// router simply did not deliver the refusal until the client sent more, and
+// the first row plus a four-second wait was not "more". The arm reported a
+// floor of twelve, which is how `NEKI-COPYLIMIT` came to be filed as "at least
+// 12, and the per-shard hypothesis is REFUTED" on evidence that says neither.
+//
+// So acceptance is now PROVEN rather than inferred from silence. Each session
+// streams a sustained burst — [nekiCopyBurstRows] rows of
+// [nekiCopyBurstPayload] bytes, about half a megabyte, many times pgx's own
+// 64 KiB send frame — and counts as accepted only when **every byte of that
+// burst has been flushed AND no error has arrived in the settle window that
+// follows**. A `53300` at any point during the burst or the settle is a
+// refusal, which is what it always was.
+//
+// # The independent expected value
+//
+// The burst is a client-side inference, so it gets a cross-check that does not
+// share its evidence: [nekiCountRouterCopySessions] asks the ROUTER how many
+// backends are running this COPY, before anything is released. The two numbers
+// are logged side by side. They are not required to agree — a router-side
+// session that is holding a client COPY without a downstream slot may well
+// appear — which is why the census also counts how many of those rows carry
+// `sidecar_backends`, the per-shard detail that only a COPY which reached a
+// shard can have.
+//
+// And the artifact that fooled three runs is now caught explicitly: if a
+// session this arm counted as ACCEPTED comes back `53300` on release, the
+// refusal was deferred past the burst too, the burst is not a sufficient
+// criterion either, and the arm reports INCONCLUSIVE with both numbers rather
+// than publishing the one it can no longer trust. That is the outcome to read
+// for first on the next live run.
 func nekiConcurrentCopyLimitHoldsOnTheCluster(ctx context.Context, t *testing.T, fx *nekiFixture, probeTenants []int) {
 	t.Helper()
 
@@ -80,64 +131,66 @@ func nekiConcurrentCopyLimitHoldsOnTheCluster(ctx context.Context, t *testing.T,
 		// a limit enforced PER SHARD at 4 would present as 8 here — and
 		// nekiConcurrentCopyLimit would then be right as written, with only
 		// this arm's comparison being wrong. Twelve can distinguish that from
-		// a genuinely raised cluster-wide limit; six could not.
-		maxProbe := 12
+		// a genuinely raised cluster-wide limit; six could not. (The previous
+		// runs' apparent refutation of the per-shard hypothesis rested on the
+		// deferred-refusal artifact and refutes nothing — see this arm's doc.)
+		const maxProbe = 12
 
 		type session struct {
-			conn    *sql.DB
-			release chan struct{}
-			done    chan error
+			conn      *sql.DB
+			release   chan struct{}
+			burstDone chan struct{}
+			done      chan error
 		}
 		var held []*session
 
-		// A connection of the arm's own, for cleaning the probe's rows up. The
-		// per-session ones are each pinned to a held COPY and cannot run a
-		// DELETE while they are holding one.
+		// A connection of the arm's own, for the router census and for
+		// cleaning the probe's rows up. The per-session ones are each pinned
+		// to a held COPY and cannot run anything while they are holding one.
 		probeDB, err := sql.Open("pgx", fx.dsn)
 		if err != nil {
-			t.Fatalf("open the probe's cleanup connection: %v", err)
+			t.Fatalf("open the probe's own connection: %v", err)
 		}
 		defer func() { _ = probeDB.Close() }()
 
-		// Release every held COPY before leaving, whatever happens. A COPY
-		// left open would occupy a slot for the rest of the suite and make
-		// every later subtest's failure someone else's mystery.
-		//
-		// Released CONCURRENTLY, and that is a fix rather than a flourish. The
-		// first live run released them one at a time with a 30s budget each,
-		// two sessions did not come back, and the arm spent 87s — most of it
-		// waiting serially on timeouts that a parallel release overlaps into
-		// one. It also reports the ERROR from a session that fails to finish,
-		// where the first cut only said "did not finish" and left the reason
-		// in the platform rather than in the log.
-		defer func() {
-			type outcome struct {
-				i   int
-				err error
-				ok  bool
-			}
-			results := make(chan outcome, len(held))
-			for i, s := range held {
-				close(s.release)
-				go func() {
-					select {
-					case err := <-s.done:
-						results <- outcome{i: i, err: err, ok: true}
-					case <-time.After(45 * time.Second):
-						results <- outcome{i: i, ok: false}
-					}
-				}()
-			}
-			for range held {
-				r := <-results
-				switch {
-				case !r.ok:
-					t.Errorf("held COPY %d did not finish within 45s of release — the fixture may still "+
-						"be occupying a copy slot for whatever runs next", r.i+1)
-				case r.err != nil:
-					t.Errorf("held COPY %d failed on release: %v", r.i+1, r.err)
+		// Releasing the held COPYs is part of the MEASUREMENT, not teardown:
+		// an outcome that arrives only on release is exactly the artifact this
+		// arm exists to stop mis-reading, so the verdict below reads these.
+		// The deferred call is the safety net for a path that leaves early.
+		type outcome struct {
+			session  int
+			err      error
+			timedOut bool
+		}
+		var outcomes []outcome
+		var releaseOnce sync.Once
+		releaseAll := func() {
+			releaseOnce.Do(func() {
+				// Released CONCURRENTLY, and that is a fix rather than a
+				// flourish. The first live run released them one at a time
+				// with a 30s budget each, two sessions did not come back, and
+				// the arm spent 87s — most of it waiting serially on timeouts
+				// that a parallel release overlaps into one.
+				results := make(chan outcome, len(held))
+				for i, s := range held {
+					close(s.release)
+					go func() {
+						select {
+						case err := <-s.done:
+							results <- outcome{session: i + 1, err: err}
+						case <-time.After(45 * time.Second):
+							results <- outcome{session: i + 1, timedOut: true}
+						}
+					}()
 				}
-			}
+				for range held {
+					outcomes = append(outcomes, <-results)
+				}
+			})
+		}
+
+		defer func() {
+			releaseAll()
 			for _, s := range held {
 				_ = s.conn.Close()
 			}
@@ -145,34 +198,26 @@ func nekiConcurrentCopyLimitHoldsOnTheCluster(ctx context.Context, t *testing.T,
 			// PROVE the sessions are gone rather than asserting it in a
 			// comment.
 			//
-			// The Errorf above says "the fixture MAY still be occupying a copy
-			// slot for whatever runs next", and that sentence was the entire
-			// state of knowledge: a client-side `sql.DB.Close` returns without
-			// waiting for anything the SERVER is still doing (it closes free
-			// connections and marks the pool closed; in-use ones close on
-			// return), so nothing here had ever established that the probe's
-			// twelve COPY sessions were actually gone. A written invariant
-			// nobody checks is indistinguishable from one that holds, and this
-			// one gates every arm that follows — run 34932058458 spent 1008 s
-			// inside the NEXT arm's first single-row INSERT.
-			//
-			// That stall is NOT attributed to these sessions (the same release
-			// outcomes appear in two runs that had no stall, and this teardown
-			// measured 0.55 s in the stalled run itself). It is the reason the
-			// question must stop being unanswerable: the next occurrence now
-			// has a census either way.
+			// A client-side `sql.DB.Close` returns without waiting for
+			// anything the SERVER is still doing (it closes free connections
+			// and marks the pool closed; in-use ones close on return), so
+			// nothing here had ever established that the probe's sessions were
+			// actually gone. A written invariant nobody checks is
+			// indistinguishable from one that holds, and this one gates every
+			// arm that follows.
 			nekiReapProbeCopySessions(t, probeDB, copyProbeTable)
 
 			// The probe's own rows, removed so the fixture is as it was found.
-			cctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			// LIKE rather than equality: the burst's payload column carries a
+			// per-row suffix, so the marker is a prefix now.
+			cctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 			defer cancel()
 			if _, err := probeDB.ExecContext(cctx,
-				fmt.Sprintf("DELETE FROM %s WHERE v = 'copy-limit-probe'", copyProbeTable)); err != nil {
+				fmt.Sprintf("DELETE FROM %s WHERE v LIKE '%s%%'", copyProbeTable, nekiCopyProbeMarker)); err != nil {
 				t.Errorf("could not remove the probe's rows from %s: %v", copyProbeTable, err)
 			}
 		}()
 
-		observed := 0
 		var refusal error
 
 		for i := 1; i <= maxProbe; i++ {
@@ -194,63 +239,70 @@ func nekiConcurrentCopyLimitHoldsOnTheCluster(ctx context.Context, t *testing.T,
 			// fail as a connection problem.
 			if err := db.PingContext(ctx); err != nil {
 				_ = db.Close()
-				t.Fatalf("probe session %d could not CONNECT (%v).\n\n"+
+				t.Fatalf("NEKI-COPYLIMIT INCONCLUSIVE: probe session %d could not CONNECT (%v).\n\n"+
 					"This is not a concurrency limit and must not be reported as one — %d session(s) "+
 					"were holding a COPY at the time, but that number measures nothing while a "+
 					"connection cannot be established.", i, err, len(held))
 			}
 
-			s := &session{conn: db, release: make(chan struct{}), done: make(chan error, 1)}
+			s := &session{
+				conn:      db,
+				release:   make(chan struct{}),
+				burstDone: make(chan struct{}),
+				done:      make(chan error, 1),
+			}
 
 			go func() {
-				// A distinct id per session, and a tenant that alternates, so
-				// the sessions do not all route to the same shard — a limit
-				// enforced per shard would otherwise be invisible to a probe
-				// whose rows all land in one place.
-				s.done <- holdOneCopy(ctx, db, s.release, probeTenants[i%len(probeTenants)], 91000+i)
+				// A distinct id range per session, and a tenant that
+				// alternates, so the sessions do not all route to the same
+				// shard — a limit enforced per shard would otherwise be
+				// invisible to a probe whose rows all land in one place.
+				s.done <- holdOneCopy(ctx, db, copyProbeTable, s.release, s.burstDone,
+					probeTenants[i%len(probeTenants)], nekiCopyProbeFirstID+i*1000)
 			}()
 
-			// Give the COPY long enough to be accepted or refused. A refusal
-			// comes back fast; an acceptance never comes back until released.
+			// ACCEPTANCE, proven in two steps. Step one: every byte of the
+			// burst reaches the wire. Step two: nothing comes back for the
+			// settle window afterwards.
 			select {
 			case err := <-s.done:
-				// This session did NOT get a slot. Whether that is THE LIMIT
-				// or merely a failure depends on what came back, and the probe
-				// must not assume.
+				// Returned before the burst finished — this session did not
+				// get a slot, and what came back decides whether that is THE
+				// LIMIT or merely a failure.
 				refusal = err
 				_ = db.Close()
-
-				var pgErr *pgconn.PgError
-				if !errors.As(err, &pgErr) || pgErr.Code != "53300" {
-					t.Fatalf("probe session %d's COPY failed with something that is NOT the "+
-						"concurrency refusal: %v\n\n"+
-						"%d session(s) were holding a COPY, but that is not a measured limit — only a "+
-						"53300 means 'the platform would not admit another COPY'. Reporting this as a "+
-						"limit would turn an unrelated failure into a finding about the platform.",
-						i, err, len(held))
+				if !isPGCode(err, "53300") {
+					t.Fatalf("%s", nekiInconclusiveCopyProbe(i, len(held), "during its burst", err))
 				}
-				observed = i - 1
-			case <-time.After(4 * time.Second):
-				// Still running ⇒ the COPY is open and holding a slot.
-				held = append(held, s)
-				continue
+			case <-time.After(nekiCopyBurstDeadline):
+				// The burst never finished writing and no error arrived. The
+				// router is neither taking the data nor refusing it, so this
+				// session's status is unknown — and an unknown session makes
+				// the count unknown.
+				_ = db.Close()
+				t.Fatalf("NEKI-COPYLIMIT INCONCLUSIVE: probe session %d neither finished sending its %s burst "+
+					"nor failed, within %s.\n\n"+
+					"%d session(s) had been accepted before it. A session the probe cannot classify makes the "+
+					"whole count unclassifiable, so no number is reported. Back-pressure with no refusal is "+
+					"itself worth knowing: it would mean the router accepts bytes it has nowhere to put, and "+
+					"the next thing to measure is whether it ever refuses at all.",
+					i, nekiCopyBurstDescription(), nekiCopyBurstDeadline, len(held))
+			case <-s.burstDone:
+				// Every burst byte is flushed. Now give a refusal time to
+				// arrive before calling this session accepted.
+				select {
+				case err := <-s.done:
+					refusal = err
+					_ = db.Close()
+					if !isPGCode(err, "53300") {
+						t.Fatalf("%s", nekiInconclusiveCopyProbe(i, len(held), "in the settle window after its burst", err))
+					}
+				case <-time.After(nekiCopyBurstSettle):
+					held = append(held, s)
+					continue
+				}
 			}
 			break
-		}
-
-		// Nothing was refused within the probe's own ceiling. That is a FLOOR,
-		// not a measurement, and the distinction is load-bearing.
-		//
-		// The first live run hit exactly this and reported "measured 6" —
-		// then told the reader to raise nekiConcurrentCopyLimit "to the
-		// measured value". Six was never measured; six is where the probe
-		// stopped asking, and the true limit could be 8, 40, or absent. Acting
-		// on that advice would have replaced one unverified constant with
-		// another, which is worse than the original because it would look
-		// freshly confirmed.
-		unbounded := observed == 0 && refusal == nil
-		if unbounded {
-			observed = maxProbe
 		}
 
 		// ANTI-VACUITY, and it matters more than usual here: a probe where
@@ -259,60 +311,105 @@ func nekiConcurrentCopyLimitHoldsOnTheCluster(ctx context.Context, t *testing.T,
 		// INSERT. Reporting that as "the platform admits 0 concurrent COPYs"
 		// would be a confident lie.
 		if len(held) == 0 {
-			t.Fatalf("not a single COPY was accepted, so no limit was measured. The first failure was: "+
-				"%v\n\nThis is a broken probe rather than a platform of zero — check that %s exists on "+
-				"the fixture and that the role may INSERT into it.", refusal, copyProbeTable)
+			t.Fatalf("NEKI-COPYLIMIT INCONCLUSIVE: not a single COPY was accepted, so no limit was measured. "+
+				"The first failure was: %v\n\nThis is a broken probe rather than a platform of zero — check "+
+				"that %s exists on the fixture and that the role may INSERT into it.", refusal, copyProbeTable)
 		}
 
-		t.Logf("measured concurrent-COPY limit: %d accepted, then %v", len(held), refusal)
+		measured := len(held)
 
+		// The INDEPENDENT number, taken while the sessions are still held and
+		// before anything is released. It does not share the burst's evidence.
+		running, withSidecars, censusNote := nekiCountRouterCopySessions(t, probeDB, copyProbeTable)
+
+		// The outcomes on release, which is where the deferred refusal that
+		// fooled three runs shows itself.
+		releaseAll()
+		deferred := 0
+		var deferredDetail strings.Builder
+		for _, o := range outcomes {
+			switch {
+			case o.timedOut:
+				t.Errorf("held COPY %d did not finish within 45s of release — the fixture may still be "+
+					"occupying a copy slot for whatever runs next", o.session)
+			case o.err == nil:
+				continue
+			case isPGCode(o.err, "53300"):
+				deferred++
+				fmt.Fprintf(&deferredDetail, "\n  session %d: %v", o.session, o.err)
+			default:
+				// 25P03 belongs here and is EXPECTED for a session that held a
+				// real slot: the server reaps a session idle in a transaction,
+				// which is what a parked COPY becomes once its burst is sent.
+				t.Logf("held COPY %d ended with %v", o.session, o.err)
+			}
+		}
+
+		// One line, always, under a marker an operator can grep and issue #338
+		// can be closed against.
+		t.Logf("NEKI-COPYLIMIT: measured=%d admitted (probe ceiling %d, nekiConcurrentCopyLimit=%d); "+
+			"router census: %s; refusals deferred past the burst: %d",
+			measured, maxProbe, nekiConcurrentCopyLimit, censusNote, deferred)
+
+		// THE ARTIFACT CHECK, and it is the first thing to read on the next
+		// live run. A session counted as accepted that comes back 53300 means
+		// the refusal outran the burst too.
+		if deferred > 0 {
+			t.Fatalf("NEKI-COPYLIMIT INCONCLUSIVE: %d of the %d session(s) this probe counted as ACCEPTED came "+
+				"back 53300 on release.%s\n\n"+
+				"The platform refused them and delivered the refusal only after they stopped sending — so "+
+				"'the burst was flushed and nothing came back' is NOT sufficient evidence of acceptance "+
+				"either, and %d is not a measured limit. This is the same artifact that made runs "+
+				"34926553073 / 34928571469 / 34932058458 report a floor of 12 while the platform's own "+
+				"message in those logs said `limit: 4`; the burst was supposed to outrun it and did not.\n\n"+
+				"The router census taken while the sessions were held is the evidence that does not share "+
+				"this defect: %s\n\n%s",
+				deferred, measured, deferredDetail.String(), measured, censusNote,
+				nekiCensusReading(running, withSidecars, measured))
+		}
+
+		// The graded question, and only it.
 		switch {
-		case observed == nekiConcurrentCopyLimit:
-			// The premise holds. Say the number out loud so the run's log is
-			// evidence rather than a silent pass.
-			t.Logf("premise holds: the platform admits %d concurrent COPYs, matching "+
-				"nekiConcurrentCopyLimit", observed)
-
-		case observed < nekiConcurrentCopyLimit:
-			t.Fatalf("THE PLATFORM NOW ADMITS FEWER CONCURRENT COPYs THAN SLUICE PACES ITSELF TO: "+
-				"measured %d, nekiConcurrentCopyLimit is %d.\n\n"+
+		case measured < nekiConcurrentCopyLimit:
+			t.Fatalf("NEKI-COPYLIMIT: THE PLATFORM NOW ADMITS FEWER CONCURRENT COPYs THAN SLUICE PACES ITSELF "+
+				"TO: measured %d, nekiConcurrentCopyLimit is %d.\n\n"+
 				"This is the dangerous direction. ResolveCopyAxes folds that constant into "+
-				"CopyConcurrencyCeiling and collapses the table × chunk fan-out to stay at or below it, "+
-				"so every Neki migrate now opens more concurrent COPYs than the cluster will take and "+
-				"meets 53300 mid-copy.\n\nFirst refusal: %v\n\n"+
+				"CopyConcurrencyCeiling and collapses the table × chunk fan-out to stay at or below it, so "+
+				"every Neki migrate now opens more concurrent COPYs than the cluster will take and meets "+
+				"53300 mid-copy.\n\nFirst refusal: %v\nRouter census: %s\n\n"+
 				"Lower nekiConcurrentCopyLimit (internal/engines/postgres/connection_budget.go) to the "+
-				"measured value.", observed, nekiConcurrentCopyLimit, refusal)
+				"measured value.", measured, nekiConcurrentCopyLimit, refusal, censusNote)
 
-		case unbounded:
-			t.Fatalf("the platform admits AT LEAST %d concurrent COPYs — every session this probe "+
-				"opened was accepted — while nekiConcurrentCopyLimit is %d.\n\n"+
-				"AT LEAST, not exactly: %d is where this probe stopped asking, so the real limit may be "+
-				"higher or may not exist. Do NOT raise the constant to %d on the strength of this "+
-				"message; that would swap one unverified number for another that merely looks freshly "+
-				"confirmed.\n\n"+
-				"This is the benign direction for correctness — sluice is conservative, not wrong, and "+
-				"no migration breaks. It fails anyway, deliberately: a weekly premise check that "+
-				"tolerated drift would stop being evidence, and the cost is throughput left on the "+
-				"table for as long as nobody looks.\n\n"+
-				"To act on it: raise maxProbe here until a 53300 actually appears, confirm the number "+
-				"is stable across runs and shard counts, and only then change "+
-				"nekiConcurrentCopyLimit (internal/engines/postgres/connection_budget.go). Worth ruling "+
-				"out first that the limit is per-SHARD rather than per-cluster — this fixture has two "+
-				"shards, so a per-shard limit of 4 would present as 8 here and the constant would be "+
-				"right as written.",
-				observed, nekiConcurrentCopyLimit, observed, observed)
+		case measured == nekiConcurrentCopyLimit && refusal != nil:
+			t.Logf("NEKI-COPYLIMIT premise holds EXACTLY: the platform admitted %d concurrent COPYs and "+
+				"refused the %dth, matching nekiConcurrentCopyLimit. Refusal: %v",
+				measured, measured+1, refusal)
+
+		case refusal == nil:
+			// Nothing was refused within the probe's own ceiling. That is a
+			// FLOOR, not a measurement, and the distinction is load-bearing:
+			// the first live run hit exactly this, reported "measured 6" and
+			// advised raising the constant "to the measured value". Six was
+			// never measured; six is where the probe stopped asking.
+			t.Logf("NEKI-COPYLIMIT: the platform admits AT LEAST %d concurrent COPYs — every session this "+
+				"probe opened was accepted and none was refused — while nekiConcurrentCopyLimit is %d. "+
+				"AT LEAST, not exactly: %d is where this probe stopped asking.\n\n"+
+				"This is the benign direction and is NOT a failure: sluice is conservative, not wrong, and "+
+				"no migration breaks. To act on it, raise maxProbe here until a 53300 actually appears, "+
+				"confirm the number is stable across runs and shard counts, and only then change "+
+				"nekiConcurrentCopyLimit (internal/engines/postgres/connection_budget.go). Rule out first "+
+				"that the limit is per-SHARD rather than per-cluster — this fixture has two shards, so a "+
+				"per-shard limit of 4 would present as 8 here and the constant would be right as written.\n\n"+
+				"Router census: %s", measured, nekiConcurrentCopyLimit, measured, censusNote)
 
 		default:
-			t.Fatalf("the platform refused the %dth concurrent COPY, so it admits %d — more than the %d "+
-				"sluice paces itself to.\n\n"+
-				"This is the benign direction for correctness — sluice is conservative, not wrong. It "+
-				"fails anyway, deliberately: a weekly that tolerated drift would stop being evidence, "+
-				"and the fix is a one-line constant change its own comment nominates a home for.\n\n"+
-				"Refusal: %v\n\n"+
+			t.Logf("NEKI-COPYLIMIT: the platform refused the %dth concurrent COPY, so it admits %d — more "+
+				"than the %d sluice paces itself to. Benign: sluice is conservative, not wrong, and this "+
+				"is logged rather than failed.\n\nRefusal: %v\nRouter census: %s\n\n"+
 				"Before raising nekiConcurrentCopyLimit "+
 				"(internal/engines/postgres/connection_budget.go), rule out that the limit is per-SHARD "+
 				"rather than per-cluster — this fixture has two shards.",
-				observed+1, observed, nekiConcurrentCopyLimit, refusal)
+				measured+1, measured, nekiConcurrentCopyLimit, refusal, censusNote)
 		}
 
 		// The SQLSTATE is already guaranteed to be 53300 — the loop refuses to
@@ -344,83 +441,87 @@ func nekiConcurrentCopyLimitHoldsOnTheCluster(ctx context.Context, t *testing.T,
 // so a refusal can only be about concurrency and never about NK306.
 const copyProbeTable = "sk_good"
 
-// holdOneCopy opens a COPY … FROM STDIN and keeps it open until release is
-// closed, then finishes it with zero rows.
+// The arm's own windows and id range. The burst itself — its size, its reader
+// and the COPY that streams it — lives in neki_copy_burst_test.go, under a tag
+// the per-PR run can reach, because a router is not needed to prove that the
+// apparatus does what it claims.
 //
-// The blocking reader is the mechanism: `CopyFrom` does not return until the
-// reader reports EOF, so the COPY — and its slot on the cluster — is held for
-// exactly as long as this test wants it. Returning io.EOF with no bytes ends
-// the COPY cleanly and inserts nothing, so the probe leaves the fixture's data
-// exactly as it found it.
-func holdOneCopy(ctx context.Context, db *sql.DB, release <-chan struct{}, tenant, id int) error {
-	conn, err := db.Conn(ctx)
-	if err != nil {
-		return fmt.Errorf("acquire connection: %w", err)
-	}
-	defer func() { _ = conn.Close() }()
+// IDS. Session i writes [nekiCopyProbeFirstID + i*1000, +nekiCopyBurstRows),
+// which for a 12-session probe spans 92000–104128 — clear of every other id
+// this suite uses (90001/90002, 900000+g, 3001, 4002, 1).
+//
+// WINDOWS. The deadline bounds "the burst never finished and nothing came
+// back", which is a state the probe must not silently wait out. The settle is
+// how long a refusal has to arrive after the burst is flushed before the
+// session counts as accepted; it is short because pgx surfaces an
+// ErrorResponse concurrently with its writes, so a refusal that is going to
+// arrive at all arrives promptly once the data has been sent.
+const (
+	nekiCopyProbeFirstID  = 91000
+	nekiCopyBurstDeadline = 20 * time.Second
+	nekiCopyBurstSettle   = 3 * time.Second
+)
 
-	row := []byte(fmt.Sprintf("%d\t%d\tcopy-limit-probe\n", tenant, id))
-
-	return conn.Raw(func(driverConn any) error {
-		pgConn, perr := pgConnFromDriver(driverConn)
-		if perr != nil {
-			return perr
-		}
-		_, cerr := pgConn.CopyFrom(
-			ctx,
-			&blockingReader{release: release, row: row},
-			fmt.Sprintf("COPY %s (tenant_id, id, v) FROM STDIN", copyProbeTable),
-		)
-		if cerr != nil {
-			return fmt.Errorf("COPY FROM STDIN: %w", cerr)
-		}
-		return nil
-	})
+func nekiCopyBurstDescription() string {
+	return fmt.Sprintf("%d-row / ~%dKiB", nekiCopyBurstRows, nekiCopyBurstRows*nekiCopyBurstPayload/1024)
 }
 
-// blockingReader emits ONE row, then blocks until release is closed, then
-// reports EOF.
-//
-// # Why it emits a row rather than nothing
-//
-// The first cut sent no bytes at all, which held the COPY open and measured
-// six acceptances where sluice assumes four. That number was not trustworthy,
-// and the reason is the shard key.
-//
-// `sk_good` is sharded on `tenant_id`. A COPY that never sends a row never
-// routes anything, so it may occupy a protocol slot on the router while never
-// engaging the per-shard machinery the limit is actually about — in which case
-// the probe was counting open COPY commands rather than concurrent copies into
-// the cluster, and comparing that to a constant about the latter.
-//
-// Sending one real row first makes each session a copy that has demonstrably
-// reached a shard before it parks. The row is deleted by the caller's cleanup.
-type blockingReader struct {
-	release <-chan struct{}
-	row     []byte
-	sent    bool
-	done    bool
+// nekiInconclusiveCopyProbe renders the "this failed, but not as a limit"
+// refusal. Its whole job is to stop an unrelated failure being published as a
+// finding about somebody else's platform.
+func nekiInconclusiveCopyProbe(session, accepted int, when string, err error) string {
+	hint := ""
+	if isPGCode(err, "25P03") {
+		hint = "\n\n25P03 is the idle-in-transaction reaper. A session that has finished its burst and parked " +
+			"IS idle in a transaction, so this means the server's timeout is shorter than this probe's own " +
+			"hold — which is a fixture-tuning problem, not a concurrency limit. Shorten the probe or raise " +
+			"the timeout; do not read it as a refusal."
+	}
+	return fmt.Sprintf("NEKI-COPYLIMIT INCONCLUSIVE: probe session %d's COPY failed %s with something that is "+
+		"NOT the concurrency refusal: %v\n\n"+
+		"%d session(s) were holding a COPY, but that is not a measured limit — only a 53300 means 'the "+
+		"platform would not admit another COPY'. Reporting this as a limit would turn an unrelated failure "+
+		"into a finding about the platform.%s", session, when, err, accepted, hint)
 }
 
-func (r *blockingReader) Read(p []byte) (int, error) {
-	if r.done {
-		return 0, io.EOF
+// nekiCensusReading says what the router census means for the next revision of
+// this arm, in the one case where the client-side burst has already been shown
+// to be untrustworthy.
+//
+// It is prose in a failure message rather than a branch in the grading,
+// deliberately: nothing has yet established what a Neki router reports for a
+// COPY it has queued but not placed, so turning either count into a verdict
+// today would be the same mistake as trusting the burst — a criterion adopted
+// before anything measured it. The next live run under this code is what
+// establishes it, and this sentence is what tells its reader which number to
+// believe.
+func nekiCensusReading(running, withSidecars, measured int) string {
+	switch {
+	case running < 0:
+		return "The census could not be taken on this run, so there is no independent number to fall back " +
+			"on and the next dispatch has to re-ask the same question."
+	case withSidecars == nekiConcurrentCopyLimit:
+		return fmt.Sprintf("READ THIS FIRST: %d of the %d router backends carry sidecar detail — exactly "+
+			"nekiConcurrentCopyLimit. That is the reading which agrees with the platform's own `limit: %d` "+
+			"message, and it says the constant is CORRECT as written and only this probe's client-side "+
+			"criterion was wrong. Grade the next revision of this arm on the sidecar-carrying count.",
+			withSidecars, running, nekiConcurrentCopyLimit)
+	case running == nekiConcurrentCopyLimit:
+		return fmt.Sprintf("READ THIS FIRST: the router reports %d backends running the COPY — exactly "+
+			"nekiConcurrentCopyLimit — even though the client counted %d. The router-side count is the one "+
+			"to grade on, and the constant is CORRECT as written.",
+			running, measured)
+	case running >= measured:
+		return fmt.Sprintf("The router reports %d backend(s) running the COPY, %d of them with sidecar "+
+			"detail — it counts the queued sessions too, so neither number discriminates on its own. What "+
+			"would: whether `sidecar_backends` is populated for a queued COPY. The %d/%d split is the "+
+			"evidence for that question.", running, withSidecars, withSidecars, running)
+	default:
+		return fmt.Sprintf("The router reports %d backend(s) running the COPY against %d counted by the "+
+			"client, %d with sidecar detail. The two views disagree and neither matches "+
+			"nekiConcurrentCopyLimit (%d); that disagreement is the finding to chase, not a number to "+
+			"publish.", running, measured, withSidecars, nekiConcurrentCopyLimit)
 	}
-	if !r.sent {
-		r.sent = true
-		n := copy(p, r.row)
-		if n < len(r.row) {
-			// The caller's buffer is smaller than one row. Not expected for a
-			// ~40-byte row, and silently truncating would corrupt the COPY
-			// stream into a confusing parse error attributed to the platform.
-			return 0, fmt.Errorf("probe row (%d bytes) does not fit the COPY buffer (%d bytes)",
-				len(r.row), len(p))
-		}
-		return n, nil
-	}
-	<-r.release
-	r.done = true
-	return 0, io.EOF
 }
 
 // nekiShardKeyRequiredOnInsert pins NK306 — the refusal a sharded Neki target

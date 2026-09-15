@@ -191,3 +191,68 @@ func nekiLogBackendCensus(t *testing.T, db *sql.DB, why string) {
 	}
 	t.Logf("BACKEND CENSUS (%s): %s", why, nekiRenderBackends(backends, source))
 }
+
+// nekiCountRouterCopySessions asks the ROUTER how many backends are running a
+// COPY into table, and how many of those carry per-shard detail.
+//
+// This is the independent expected value for the burst's client-side
+// inference: it is read from the platform's own activity view rather than
+// deduced from what the client did not receive. The two numbers are logged
+// side by side and neither is derived from the other.
+//
+// WHAT THE SECOND NUMBER IS FOR. A router-side session may be holding a client
+// COPY it has not placed on any shard — that is precisely the state sessions
+// 5–12 were in across three runs. `sidecar_backends` is the per-shard detail,
+// and only a COPY that reached a shard can have it, so the split between the
+// two counts is the discriminator. It is reported rather than graded, because
+// nothing has yet established what the router puts in that column for a
+// queued COPY; the first live run under this code is what establishes it.
+//
+// Failure to take the census is reported as such and never fails the arm — a
+// cross-check that can fail a run is one somebody removes.
+func nekiCountRouterCopySessions(t *testing.T, db *sql.DB, table string) (running, withSidecars int, note string) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	backends, source, err := nekiReadBackends(ctx, db)
+	if err != nil {
+		return -1, -1, fmt.Sprintf("UNAVAILABLE (%v) — the burst count below has no independent cross-check "+
+			"on this run", err)
+	}
+
+	// The sidecar count is meaningful ONLY on the router view. On the vanilla
+	// fallback `extra` carries `wait_event_type/wait_event`, which is
+	// populated for essentially every backend — counting it would report
+	// "every COPY reached a shard" on a server that has no shards. Caught by
+	// [TestPostgresSuite_NekiCopyBurstApparatus] reporting 1-of-1 against a
+	// single-node PostgreSQL; -1 means "not applicable here", never zero,
+	// because zero is a claim.
+	routerView := strings.HasPrefix(source, "__neki.")
+	withSidecars = -1
+	if routerView {
+		withSidecars = 0
+	}
+
+	marker := "COPY " + table
+	for _, b := range backends {
+		if !strings.Contains(b.query, marker) {
+			continue
+		}
+		running++
+		if !routerView {
+			continue
+		}
+		if e := strings.TrimSpace(b.extra); e != "" && e != "null" && e != "[]" && e != "{}" {
+			withSidecars++
+		}
+	}
+
+	sidecarNote := fmt.Sprintf("%d of them carrying sidecar detail", withSidecars)
+	if !routerView {
+		sidecarNote = "sidecar detail NOT APPLICABLE on this view"
+	}
+	return running, withSidecars, fmt.Sprintf("%d backend(s) running %q, %s (from %s)",
+		running, marker, sidecarNote, source)
+}
