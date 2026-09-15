@@ -230,9 +230,13 @@ identity. Heap tables and tables without PKs both work.
 
 ## CLI vs YAML
 
-CLI flags and YAML config can be mixed. CLI rules are processed
-first; YAML rules append. Duplicates on the same column
-(`schema.table.column`) last-write-wins with a WARN.
+CLI flags and YAML config can be mixed. CLI rules are parsed
+first; YAML rules are merged in afterwards. When both declare a
+rule for the same column (`[schema.]table.column`), **the CLI rule
+wins**: the YAML entry is skipped, with a loud WARN naming the
+column and the YAML strategy that was not applied (Bug 108,
+v0.96.0 — before that fix the YAML rule silently overwrote the CLI
+one).
 
 ### CLI-only form
 
@@ -301,14 +305,25 @@ whole value, and `mask`/`outer` left the source value **unchanged**
 under a rule that declared it masked. A key that is *present* with
 the value `0` is still honoured (`length: 0`, `m1: 0`, `min: 0`),
 exactly as `truncate:0` / `mask:inner:0,4` / `randomize:int:0,9` are
-on the CLI. Keys a strategy or form does not take are refused when
-present (an unknown key name is refused by the loader itself).
+on the CLI. Of the keys a strategy or form does not take, these are
+checked and refused when present: `dict` on any strategy other than
+`tokenize` or `randomize` + `form: dict`; `m1`, `m2` and `char` on a
+`mask` preset form; and `min`, `max`, `brand` and `country_code` on
+a `randomize` form that does not take them, or on `tokenize`. Every
+other misplaced key — `length` outside `truncate`, `algo` outside
+`hash`, `value` outside `static`, `key` outside `hash`/`hmac-sha256`
+and `tokenize`, `form` or the mask margins on a strategy that has no
+forms — is **silently ignored**, so check the row above for the keys
+your strategy actually reads. An unknown key *name* is refused by the
+loader itself.
 
 ### Hybrid
 
-CLI flags override / extend the YAML. Recommended pattern: keep
-the bulk in YAML; use CLI for per-environment overrides
-(`--redact=users.email=null` in staging).
+CLI flags override / extend the YAML: a column declared on both
+surfaces takes the CLI rule, and the YAML entry is skipped with a
+WARN naming the column (see "CLI vs YAML" above). Recommended
+pattern: keep the bulk in YAML; use CLI for per-environment
+overrides (`--redact=users.email=null` in staging).
 
 ---
 

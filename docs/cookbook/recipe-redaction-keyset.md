@@ -119,22 +119,26 @@ Or via YAML:
 # sluice.yaml
 keyset_source: file:/etc/sluice/keyset.yaml
 redactions:
-  - column: public.users.email
-    strategy: hash:hmac-sha256
+  - table: public.users.email
+    strategy: hash
+    algo: hmac-sha256
     key: email_v1
-  - column: public.users.ssn
-    strategy: mask:ssn
-  - column: public.payments.pan
-    strategy: mask:pan
-  - column: public.users.name
-    strategy: randomize:dict
+  - table: public.users.ssn
+    strategy: mask
+    form: ssn
+  - table: public.payments.pan
+    strategy: mask
+    form: pan
+  - table: public.users.name
+    strategy: randomize
+    form: dict
     dict: fake_names
 dictionaries:
   fake_names:
-    - "Alice"
-    - "Bob"
-    - "Carol"
+    entries: ["Alice", "Bob", "Carol"]
 ```
+
+Each rule names its column under `table:` as the same `[schema.]table.column` triple the CLI takes, and a CLI spec's colon-separated options become sibling keys — `hash:hmac-sha256:email_v1` is `strategy: hash` + `algo:` + `key:`, `mask:ssn` is `strategy: mask` + `form: ssn`, `randomize:dict:fake_names` is `strategy: randomize` + `form: dict` + `dict:`. A dictionary is declared with `entries:` (inline) or `file:` (one entry per line). The loader refuses any key it does not know, so the full CLI-to-YAML key table in [`docs/redaction.md`](../redaction.md#yaml-field-reference) is the reference.
 
 If both YAML and CLI declare a rule for the same column, **CLI wins**
 — with a loud `slog.WARN` line naming the column and the YAML strategy

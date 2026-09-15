@@ -399,9 +399,18 @@ func verifyMariaDBDomainsPresent(ctx context.Context, db *sql.DB, resumeSet stri
 		return nil
 	}
 	if strings.TrimSpace(state) == "" {
-		// An EMPTY binlog state is a same-server RESET MASTER (or a fresh
-		// instance with no history): no other lineage to re-copy from, so
-		// the automatic re-snapshot stays the right recovery.
+		// An EMPTY binlog state is a same-server RESET MASTER, a fresh
+		// instance with no history — or a REBUILT instance at the same
+		// address (a restore, then RESET MASTER) with its stale rows
+		// intact, and the automatic re-snapshot then reduces the target
+		// to those rows (audit 2026-09-15 A0915-MYSQL-HIGH-2, measured on
+		// mariadb:11.4). MySQL closes that shape with @@server_uuid;
+		// MariaDB has no instance identity, so the shapes are
+		// indistinguishable from the server's answers and refusing every
+		// empty state would also refuse every legitimate reset. KNOWN
+		// GAP, deliberately unchanged: the "KNOWN GAP" cells of
+		// TestGTIDResumeMariaDBBindsLineage measure it every run, and
+		// the policy call is filed in the audit backlog.
 		return fmt.Errorf("mariadb: the source's @@gtid_binlog_state is EMPTY, so the resume GTID set %q names "+
 			"domain(s) %v this source no longer records (RESET MASTER, or a fresh instance); cannot resume: %w",
 			resumeSet, missing, ir.ErrPositionInvalid)
