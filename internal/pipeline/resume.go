@@ -144,6 +144,19 @@ type resumeContext struct {
 	//
 	// Pointer so every copy of the context shares one throttle.
 	throttle *progressThrottle
+
+	// sourceIdentity names the LIVE source this run reads from, in the
+	// form [renderSourceIdentity] stores. It is recorded on the header
+	// row a fresh run INSERTs, and compared against the recorded value
+	// before a --resume adopts prior state.
+	//
+	// The zero value "" means "this caller supplies no identity", and the
+	// door treats it as "do not compare" — the v0.99.51 opt-in polarity,
+	// so every construction that predates this field (the sync recording
+	// context, every test) behaves exactly as before with no edit.
+	// `migrate` always sets it, and it is never empty there because an
+	// engine's registered name never is.
+	sourceIdentity string
 }
 
 // progressThrottleInterval is how stale a sync cold start's per-table
@@ -629,11 +642,31 @@ func loadOrInitState(ctx context.Context, rc resumeContext, resume, resetting bo
 		// reset path will DELETE it shortly. Return a pending state
 		// so the rest of Run treats this as a fresh migration.
 		fresh := ir.MigrationState{
-			MigrationID:   rc.migrationID,
-			Phase:         ir.MigrationPhasePending,
-			TableProgress: nil,
+			MigrationID:    rc.migrationID,
+			Phase:          ir.MigrationPhasePending,
+			TableProgress:  nil,
+			SourceIdentity: rc.sourceIdentity,
 		}
 		return fresh, false, nil
+	}
+
+	// The foreign-source door (audit 2026-09-15 A0915-STATE-MEDIUM-1).
+	//
+	// It sits above the switch rather than inside a branch because BOTH
+	// --resume arms below adopt recorded state and both are ways to exit
+	// 0 having copied nothing: `complete` returns ok=true and Run
+	// short-circuits, and the partial arm hands the state to the
+	// bulk-copy phase, which skips every table recorded complete. One
+	// check covers the two; duplicating it into each is how one of them
+	// later stops being covered.
+	//
+	// It sits BELOW the `resetting` return by construction, and that is
+	// correct rather than a gap: --reset-target-data deletes the row and
+	// re-copies in full, so there is no adopted work to mis-attribute.
+	if found && resume {
+		if err := refuseForeignSourceOnResume(ctx, rc.migrationID, state.SourceIdentity, rc.sourceIdentity); err != nil {
+			return ir.MigrationState{}, false, err
+		}
 	}
 
 	switch {
@@ -643,10 +676,15 @@ func loadOrInitState(ctx context.Context, rc resumeContext, resume, resetting bo
 	case !found && !resume:
 		// Fresh migration: write the initial pending row. Subsequent
 		// phase boundaries flip the phase forward.
+		//
+		// This INSERT is where the source identity is recorded, and the
+		// only place it can be: the column is set-once, so every later
+		// phase mark preserves whatever this row captured.
 		fresh := ir.MigrationState{
-			MigrationID:   rc.migrationID,
-			Phase:         ir.MigrationPhasePending,
-			TableProgress: nil,
+			MigrationID:    rc.migrationID,
+			Phase:          ir.MigrationPhasePending,
+			TableProgress:  nil,
+			SourceIdentity: rc.sourceIdentity,
 		}
 		if err := rc.store.Write(ctx, fresh); err != nil {
 			return ir.MigrationState{}, false, fmt.Errorf("pipeline: write initial migrate-state: %w", err)

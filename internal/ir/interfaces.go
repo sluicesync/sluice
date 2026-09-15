@@ -3827,6 +3827,33 @@ type MigrationState struct {
 	// hashes only, never operator predicates, so a control row cannot
 	// leak what a `--where` selected.
 	CopyShape string
+
+	// SourceIdentity names the SOURCE this migration's state describes —
+	// its engine, its database, and its schema where the engine scopes by
+	// one. Recorded when the header row is first INSERTed and never
+	// updated afterwards, so it always names the source the recorded work
+	// was actually copied FROM.
+	//
+	// It exists because a migration id is not an identity. `migrate
+	// --resume` adopts recorded state by id alone, so a resume pointed at
+	// a DIFFERENT source that shares the id reads someone else's finished
+	// copy as its own and exits 0 having copied nothing — measured both
+	// with an operator-supplied id and, with no typed id at all, from two
+	// databases on one host colliding on the auto-derived id, which
+	// hashes source/target HOSTS and not the database (audit 2026-09-15
+	// A0915-STATE-MEDIUM-1).
+	//
+	// EMPTY means NO EVIDENCE, never "the source had no identity": every
+	// header row written by a binary older than this column reads back
+	// empty. The pipeline WARNs and proceeds on empty rather than
+	// refusing — see the resume door — because refusing would strand
+	// every migration already in flight at upgrade time.
+	//
+	// Opaque to this package: rendered and compared by the pipeline as
+	// one string, never parsed back into fields. It carries no host and
+	// no credentials by construction, so a control row cannot leak where
+	// the source lives.
+	SourceIdentity string
 }
 
 // SnapshotAnchorRecord is what a cold start records about the copy it

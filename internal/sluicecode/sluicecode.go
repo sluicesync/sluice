@@ -498,6 +498,25 @@ const (
 	// destroys data) — and nothing at this point can tell them apart.
 	CodeResumeFreshTableNotEmpty Code = "SLUICE-E-RESUME-FRESH-TABLE-NOT-EMPTY"
 
+	// CodeResumeSourceMismatch fires when `migrate --resume` finds
+	// recorded state whose SOURCE is not the source this run reads from.
+	//
+	// A migration id is a name, not an identity, and before this door a
+	// resume adopted state by id alone: a run pointed at a different
+	// source exited 0 having copied nothing, because the recorded phase
+	// was `complete` (short-circuit) or its per-table rows were all
+	// `complete` (every table skipped). Reachable two ways — an
+	// operator-supplied --migration-id reused across sources, and the
+	// auto-derived id, which hashes the source/target HOSTS and not the
+	// database, so two databases on one host collide with no typed id at
+	// all (audit 2026-09-15 A0915-STATE-MEDIUM-1).
+	//
+	// Identity is the source engine, database and schema, and NOT the
+	// host: ADR-0015 makes --migration-id the operator's assertion of a
+	// stable identity across DNS shifts and host renames, so a failover
+	// or a replica of the same database must keep resuming.
+	CodeResumeSourceMismatch Code = "SLUICE-E-RESUME-SOURCE-MISMATCH"
+
 	// CodeTargetShardKeyNotInUpsertKey fires when a SHARDED target's routing
 	// columns are not contained in the key sluice's idempotent write would
 	// conflict on. Refused before anything is written.
@@ -940,6 +959,7 @@ var registry = map[Code]Info{
 	CodeTargetControlTablePlacement:     {ClassRefusal, "sluice's own control tables must be placed in an unsharded shard group on this PlanetScale Neki target (they carry no shard key, and the database's default shard group would refuse every write to them with SQLSTATE NK306) and sluice could not make the placement — its role may not write the topology, the topology names no authoritative shard group, or that group itself declares a shard index. Refused at control-table creation, before any data moves, with the exact topology entry to add by hand"},
 	CodeTargetShardKeyMissing:           {ClassRefusal, "a PlanetScale Neki target refused an INSERT that does not carry the table's shard-key column (SQLSTATE NK306). Terminal — the statement's shape is what is refused. For one of sluice's own control tables it means the table was not placed in an unsharded group (see SLUICE-E-TARGET-CONTROL-TABLE-PLACEMENT); for a user table it means the source row carries no column by the target's shard-key name"},
 	CodeResumeFreshTableNotEmpty:        {ClassRefusal, "refused on --resume: a table with no persisted progress would be started from scratch WITHOUT truncating, but the target already holds rows — either an earlier attempt copied it and could not persist its progress row, or the target was already populated"},
+	CodeResumeSourceMismatch:            {ClassRefusal, "refused before any copy on --resume: the recorded migration state was written by a run against a DIFFERENT source (engine/database/schema), so resuming would adopt that copy as this run's own and skip every table it recorded complete — exiting 0 having copied nothing; use the id the source belongs to, or drop --resume and pass a fresh --migration-id"},
 
 	CodePSForeignKeysNotEnabled: {ClassRefusal, "migrate/sync cold-start refused before the copy: the PlanetScale target has foreign-key support disabled (allow_foreign_key_constraints off, read back as foreign_keys_enabled=false) while the source schema declares foreign keys the run would add after the copy — the platform rejects ADD FOREIGN KEY outright, so the run would fail at the constraints phase after the whole copy and --resume re-hits it; enable foreign key support on the target database, or re-run with --skip-foreign-keys (each FK's referencing columns stay indexed, so the constraints can be added out-of-band)"},
 

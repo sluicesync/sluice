@@ -87,7 +87,7 @@ func newMigrationStateStore(db *sql.DB, schema string, isNeki bool, serverKey st
 			},
 			SQL: migratestate.SQL{
 				ReadHeader: "SELECT phase, table_progress, state_format, started_at, updated_at, last_error, " +
-					"snapshot_anchor, copy_shape FROM " + hdr + " WHERE migration_id = $1",
+					"snapshot_anchor, copy_shape, source_identity FROM " + hdr + " WHERE migration_id = $1",
 				ReadProgressRows: "SELECT table_name, progress, updated_at FROM " +
 					prog + " WHERE migration_id = $1",
 				ListHeadersByPrefix: "SELECT migration_id, phase, started_at, updated_at, last_error FROM " +
@@ -139,9 +139,14 @@ func newMigrationStateStore(db *sql.DB, schema string, isNeki bool, serverKey st
 				// removes every function call from the statement, which costs
 				// nothing on vanilla PostgreSQL and sidesteps the rewrite
 				// entirely.
+				// source_identity is in the INSERT list and deliberately NOT
+				// in the SET list — the set-once contract on
+				// [migratestate.SQL.UpsertHeader]. Adding it to the SET list
+				// would let a resume against a FOREIGN source overwrite the
+				// very evidence that refuses it.
 				UpsertHeader: "INSERT INTO " + hdr + " " +
-					"(migration_id, phase, table_progress, state_format, last_error) " +
-					"VALUES ($1, $2, $3, $4, $5) " +
+					"(migration_id, phase, table_progress, state_format, last_error, source_identity) " +
+					"VALUES ($1, $2, $3, $4, $5, $6) " +
 					"ON CONFLICT (migration_id) DO UPDATE SET " +
 					"phase = EXCLUDED.phase, " +
 					"table_progress = EXCLUDED.table_progress, " +
@@ -210,6 +215,7 @@ func (s *MigrationStateStore) EnsureControlTable(ctx context.Context) error {
 			last_error      TEXT         NULL,
 			snapshot_anchor TEXT         NULL,
 			copy_shape      TEXT         NULL,
+			source_identity TEXT         NULL,
 			PRIMARY KEY (migration_id)
 		)`
 	if _, err := s.db.ExecContext(ctx, hdrDDL); err != nil {
@@ -227,9 +233,14 @@ func (s *MigrationStateStore) EnsureControlTable(ctx context.Context) error {
 	// separate columns rather than one because an operator inspecting
 	// the row in psql should be able to read the position without
 	// parsing a fingerprint out of it.
+	// source_identity (A0915-STATE-MEDIUM-1) joins them on the same
+	// additive terms: NULLable and defaultless, so a row an older binary
+	// wrote keeps reading as "no identity recorded" — which is the truth
+	// about it, and what the resume door WARNs on rather than refusing.
 	for _, add := range []string{
 		"ALTER TABLE " + hdr + " ADD COLUMN IF NOT EXISTS snapshot_anchor TEXT NULL",
 		"ALTER TABLE " + hdr + " ADD COLUMN IF NOT EXISTS copy_shape TEXT NULL",
+		"ALTER TABLE " + hdr + " ADD COLUMN IF NOT EXISTS source_identity TEXT NULL",
 	} {
 		if _, err := s.db.ExecContext(ctx, add); err != nil {
 			return fmt.Errorf("postgres: ensure migrate-state table: %s: %w", add, err)

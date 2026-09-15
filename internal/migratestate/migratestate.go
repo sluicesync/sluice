@@ -140,7 +140,8 @@ type Config struct {
 type SQL struct {
 	// ReadHeader: args (migrationID). Must project exactly
 	// (phase, table_progress, state_format, started_at, updated_at,
-	// last_error, snapshot_anchor, copy_shape) for the header row.
+	// last_error, snapshot_anchor, copy_shape, source_identity) for the
+	// header row.
 	//
 	// snapshot_anchor is the newest column and is NULL on every row a
 	// binary older than it wrote — which [Store.Read] surfaces as the
@@ -173,9 +174,21 @@ type SQL struct {
 	ListHeadersByPrefix string
 
 	// UpsertHeader: args (migrationID, phase, blobSentinel,
-	// stateFormat, lastError). Inserts or updates the header row,
-	// setting started_at only on first insert (the engine's upsert
-	// preserves it on conflict) and refreshing updated_at.
+	// stateFormat, lastError, sourceIdentity). Inserts or updates the
+	// header row, setting started_at only on first insert (the engine's
+	// upsert preserves it on conflict) and refreshing updated_at.
+	//
+	// source_identity is SET-ONCE, exactly like started_at and by the
+	// same mechanism: the engine supplies it in the INSERT column list
+	// and leaves it OUT of the on-conflict SET list. That is what makes
+	// [ir.MigrationState.SourceIdentity] mean "the source the recorded
+	// work was copied from" rather than "the source of the last run that
+	// touched this row" — a resume against a foreign source must not be
+	// able to overwrite the evidence that would refuse it. It also keeps
+	// a legacy row (NULL here) legacy: every phase mark this binary
+	// writes takes the conflict path, so the column stays NULL and the
+	// resume keeps WARNing instead of silently adopting an identity
+	// nobody recorded.
 	UpsertHeader string
 
 	// UpsertSnapshotAnchor: args (migrationID, phase, blobSentinel,
@@ -250,13 +263,14 @@ func (s *Store) Read(ctx context.Context, migrationID string) (ir.MigrationState
 	row := s.DB.QueryRowContext(ctx, s.SQL.ReadHeader, migrationID)
 
 	var (
-		phase                                               string
-		tableProgress, lastError, snapshotAnchor, copyShape sql.NullString
-		format                                              int
-		startedAt, updatedAt                                time.Time
+		phase                string
+		format               int
+		startedAt, updatedAt time.Time
+
+		tableProgress, lastError, snapshotAnchor, copyShape, sourceIdentity sql.NullString
 	)
 	switch err := row.Scan(&phase, &tableProgress, &format, &startedAt, &updatedAt, &lastError,
-		&snapshotAnchor, &copyShape); {
+		&snapshotAnchor, &copyShape, &sourceIdentity); {
 	case errors.Is(err, sql.ErrNoRows):
 		s.dropPendingUpgrade(migrationID)
 		return ir.MigrationState{}, false, nil
@@ -279,6 +293,10 @@ func (s *Store) Read(ctx context.Context, migrationID string) (ir.MigrationState
 		// reads as "", which the contract defines as no evidence.
 		SnapshotAnchor: snapshotAnchor.String,
 		CopyShape:      copyShape.String,
+		// SQL NULL — an older binary's row, or a writer that recorded
+		// none — reads as "", which the contract defines as NO EVIDENCE
+		// rather than "the source had no identity".
+		SourceIdentity: sourceIdentity.String,
 	}
 
 	if format >= FormatPerTableRows {
@@ -547,6 +565,10 @@ func (s *Store) Write(ctx context.Context, state ir.MigrationState) error {
 		UpgradedBlobSentinel,
 		FormatPerTableRows,
 		nullableString(state.LastError),
+		// Set-once: consumed by the INSERT column list and absent from
+		// every engine's on-conflict SET list (see [SQL.UpsertHeader]),
+		// so a later phase mark cannot move it.
+		nullableString(state.SourceIdentity),
 	}
 
 	if len(state.TableProgress) == 0 {

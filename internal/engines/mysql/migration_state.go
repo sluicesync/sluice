@@ -76,7 +76,7 @@ func newMigrationStateStore(db *sql.DB, upsert upsertSpelling) *MigrationStateSt
 			},
 			SQL: migratestate.SQL{
 				ReadHeader: "SELECT phase, table_progress, state_format, started_at, updated_at, last_error, " +
-					"snapshot_anchor, copy_shape FROM " + hdr + " WHERE migration_id = ?",
+					"snapshot_anchor, copy_shape, source_identity FROM " + hdr + " WHERE migration_id = ?",
 				ReadProgressRows: "SELECT table_name, progress, updated_at FROM " +
 					prog + " WHERE migration_id = ?",
 				ListHeadersByPrefix: "SELECT migration_id, phase, started_at, updated_at, last_error FROM " +
@@ -94,9 +94,14 @@ func newMigrationStateStore(db *sql.DB, upsert upsertSpelling) *MigrationStateSt
 				// so its DEFAULT CURRENT_TIMESTAMP on the original
 				// INSERT survives subsequent upserts; updated_at
 				// refreshes via the column's ON UPDATE clause.
+				// source_identity is in the INSERT list and deliberately NOT
+				// in the ON DUPLICATE KEY UPDATE list — the set-once
+				// contract on [migratestate.SQL.UpsertHeader]. Adding it
+				// there would let a resume against a FOREIGN source
+				// overwrite the very evidence that refuses it.
 				UpsertHeader: "INSERT INTO " + hdr + " " +
-					"(migration_id, phase, table_progress, state_format, last_error) " +
-					"VALUES (?, ?, ?, ?, ?)" + upsert.clauseOpen() +
+					"(migration_id, phase, table_progress, state_format, last_error, source_identity) " +
+					"VALUES (?, ?, ?, ?, ?, ?)" + upsert.clauseOpen() +
 					"phase = " + upsert.newRowRef("phase") + ", " +
 					"table_progress = " + upsert.newRowRef("table_progress") + ", " +
 					"state_format = " + upsert.newRowRef("state_format") + ", " +
@@ -181,6 +186,9 @@ func (s *MigrationStateStore) EnsureControlTable(ctx context.Context) error {
 	if err := s.ensureSnapshotAnchorColumn(ctx); err != nil {
 		return err
 	}
+	if err := s.ensureSourceIdentityColumn(ctx); err != nil {
+		return err
+	}
 	progExists, err := s.controlTableExists(ctx, migrateProgressTableName)
 	if err != nil {
 		return err
@@ -215,6 +223,7 @@ func migrateStateHeaderDDL() string {
 	ps_query_timeout_raise TEXT  NULL,
 	snapshot_anchor TEXT         NULL,
 	copy_shape      TEXT         NULL,
+	source_identity TEXT         NULL,
 	PRIMARY KEY (migration_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
 }
@@ -262,6 +271,15 @@ func (s *MigrationStateStore) ensureSnapshotAnchorColumn(ctx context.Context) er
 		return err
 	}
 	return s.ensureHeaderColumn(ctx, "copy_shape", "TEXT NULL")
+}
+
+// ensureSourceIdentityColumn adds the A0915-STATE-MEDIUM-1 column to a
+// header table created by a binary that predates it. Same additive terms
+// as the two above: NULLable and defaultless, so a row an older binary
+// wrote keeps reading as "no identity recorded" — the truth about it,
+// and what the resume door WARNs on rather than refusing.
+func (s *MigrationStateStore) ensureSourceIdentityColumn(ctx context.Context) error {
+	return s.ensureHeaderColumn(ctx, "source_identity", "TEXT NULL")
 }
 
 // ensureHeaderColumn is the migrate-state header's additive-column

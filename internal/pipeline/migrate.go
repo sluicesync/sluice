@@ -1080,6 +1080,13 @@ func (m *Migrator) openResumeContext(ctx context.Context, resetting bool) (resum
 		store:       store,
 		migrationID: migrationID,
 		enabled:     store != nil,
+		// Recorded on the fresh run's header row and compared before a
+		// --resume adopts prior state, so an id alone can no longer make
+		// this run inherit a copy made from a different source
+		// (A0915-STATE-MEDIUM-1). Per-database in the multi-database
+		// fan-out, which clones this Migrator with a per-database
+		// SourceDSN.
+		sourceIdentity: renderSourceIdentity(m.Source.Name(), m.SourceDSN),
 	}
 	state, exitClean, err := loadOrInitState(ctx, rc, m.Resume, resetting)
 	if err != nil {
@@ -1108,8 +1115,13 @@ func (m *Migrator) openResumeContext(ctx context.Context, resetting bool) (resum
 // This closes the aliasing half only. The wider class — `migrate
 // --resume` binding an id to no source identity at all, so an auto-derived
 // id from a different database on the same host resumes the same way — is
-// a pending policy decision (refute-3, fix shape 2) and is deliberately
-// NOT taken here.
+// closed at the resume door instead, by recording the source's identity on
+// the header row and refusing a mismatch: see [refuseForeignSourceOnResume].
+// The two are complementary rather than redundant. This refusal fires at
+// id RESOLUTION and needs no recorded state, so it still catches a typed
+// `sync-` id whose target holds a sync's rows; the identity door fires at
+// state ADOPTION and catches every other foreign source, including the
+// auto-derived collision that carries no typed id at all.
 func (m *Migrator) resolveMigrationID() (string, error) {
 	if m.MigrationID == "" {
 		return deriveMigrationID(m.Source.Name(), m.SourceDSN, m.Target.Name(), m.TargetDSN, m.TargetSchema), nil

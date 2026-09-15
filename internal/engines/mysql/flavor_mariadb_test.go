@@ -604,9 +604,15 @@ func TestMariaDBUpsertBuilders_BothSpellings(t *testing.T) {
 
 	t.Run("migration_state SQL", func(t *testing.T) {
 		s := newMigrationStateStore(nil, upsertValuesFunc)
+		// source_identity sits in the INSERT list and deliberately NOT in
+		// the UPDATE list — the set-once contract (audit 2026-09-15
+		// A0915-STATE-MEDIUM-1). This is the MariaDB-flavor witness for it:
+		// the legacy VALUES() spelling must not update it either, or a
+		// resume from a foreign source would overwrite the recorded
+		// identity that refuses it.
 		wantHdr := "INSERT INTO `sluice_migrate_state` " +
-			"(migration_id, phase, table_progress, state_format, last_error) " +
-			"VALUES (?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE " +
+			"(migration_id, phase, table_progress, state_format, last_error, source_identity) " +
+			"VALUES (?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE " +
 			"phase = VALUES(phase), " +
 			"table_progress = VALUES(table_progress), " +
 			"state_format = VALUES(state_format), " +
@@ -623,8 +629,8 @@ func TestMariaDBUpsertBuilders_BothSpellings(t *testing.T) {
 		// Row-alias shapes stay byte-identical to the pre-item-73 statements.
 		a := newMigrationStateStore(nil, upsertRowAlias)
 		wantAliasHdr := "INSERT INTO `sluice_migrate_state` " +
-			"(migration_id, phase, table_progress, state_format, last_error) " +
-			"VALUES (?, ?, ?, ?, ?) AS new ON DUPLICATE KEY UPDATE " +
+			"(migration_id, phase, table_progress, state_format, last_error, source_identity) " +
+			"VALUES (?, ?, ?, ?, ?, ?) AS new ON DUPLICATE KEY UPDATE " +
 			"phase = new.phase, " +
 			"table_progress = new.table_progress, " +
 			"state_format = new.state_format, " +

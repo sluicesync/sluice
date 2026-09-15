@@ -178,24 +178,35 @@ func newScriptedStore(steps []msStep) (*Store, *[]msStep, *[]string) {
 
 // headerRow builds a scripted header-row result in the ReadHeader
 // projection order: (phase, table_progress, state_format, started_at,
-// updated_at, last_error, snapshot_anchor), with a NULL anchor.
+// updated_at, last_error, snapshot_anchor, copy_shape, source_identity),
+// with the last three NULL.
 //
-// The NULL is the point, not a convenience: it is exactly what a binary
-// older than the snapshot_anchor column left behind (the column is
+// The NULLs are the point, not a convenience: they are exactly what a
+// binary older than each of those columns left behind (every one is
 // added NULLable and defaultless), so every test using this helper is
-// also reading a row that older sluice wrote. [headerRowWithAnchor]
-// covers the rows this binary writes.
+// also reading a row that older sluice wrote. [headerRowWithAnchor] and
+// [headerRowWithSourceIdentity] cover the rows this binary writes.
 func headerRow(phase string, blob any, format int, started, updated time.Time, lastError any) *msRows {
 	return headerRowWithAnchor(phase, blob, format, started, updated, lastError, nil, nil)
 }
 
+// source_identity is NULL here for the same reason the anchor is: it is
+// the newest header column, so a row that predates it is exactly what an
+// older binary left behind. [headerRowWithSourceIdentity] covers the
+// rows this binary writes.
 func headerRowWithAnchor(phase string, blob any, format int, started, updated time.Time, lastError, anchor, copyShape any) *msRows {
+	return headerRowWithSourceIdentity(phase, blob, format, started, updated, lastError, anchor, copyShape, nil)
+}
+
+func headerRowWithSourceIdentity(phase string, blob any, format int, started, updated time.Time, lastError, anchor, copyShape, sourceIdentity any) *msRows {
 	return &msRows{
 		cols: []string{
 			"phase", "table_progress", "state_format", "started_at", "updated_at", "last_error",
-			"snapshot_anchor", "copy_shape",
+			"snapshot_anchor", "copy_shape", "source_identity",
 		},
-		vals: [][]driver.Value{{phase, blob, int64(format), started, updated, lastError, anchor, copyShape}},
+		vals: [][]driver.Value{{
+			phase, blob, int64(format), started, updated, lastError, anchor, copyShape, sourceIdentity,
+		}},
 	}
 }
 
@@ -366,7 +377,7 @@ func TestWrite_HeaderOnlyOnLegacyRowUpgradesFirst(t *testing.T) {
 		`UPSERT_PROGRESS | m1,users,"complete"`,
 		"MARK_UPGRADED | " + UpgradedBlobSentinel + ",2,m1",
 		"COMMIT",
-		"UPSERT_HEADER | m1,tables," + UpgradedBlobSentinel + ",2,<nil>",
+		"UPSERT_HEADER | m1,tables," + UpgradedBlobSentinel + ",2,<nil>,<nil>",
 	}
 	assertSeen(t, *seen, want)
 }
@@ -447,7 +458,7 @@ func TestRead_LegacyEmptyBlobStillUpgradesOnWrite(t *testing.T) {
 		"DELETE_PROGRESS | m1",
 		"MARK_UPGRADED | " + UpgradedBlobSentinel + ",2,m1",
 		"COMMIT",
-		"UPSERT_HEADER | m1,bulk_copy," + UpgradedBlobSentinel + ",2,<nil>",
+		"UPSERT_HEADER | m1,bulk_copy," + UpgradedBlobSentinel + ",2,<nil>,<nil>",
 	}
 	assertSeen(t, *seen, want)
 }
@@ -478,7 +489,7 @@ func TestClearMigration_DropsPendingUpgradeNote(t *testing.T) {
 		"READ_HEADER | m1",
 		"DELETE_PROGRESS | m1",
 		"DELETE_HEADER | m1",
-		"UPSERT_HEADER | m1,pending," + UpgradedBlobSentinel + ",2,<nil>",
+		"UPSERT_HEADER | m1,pending," + UpgradedBlobSentinel + ",2,<nil>,<nil>",
 	}
 	assertSeen(t, *seen, want)
 }
@@ -497,7 +508,7 @@ func TestWrite_HeaderOnlyIsSingleStatement(t *testing.T) {
 		t.Fatalf("Write: %v", err)
 	}
 	want := []string{
-		"UPSERT_HEADER | m1,tables," + UpgradedBlobSentinel + ",2,<nil>",
+		"UPSERT_HEADER | m1,tables," + UpgradedBlobSentinel + ",2,<nil>,<nil>",
 	}
 	assertSeen(t, *seen, want)
 }
@@ -524,7 +535,7 @@ func TestWrite_FullSnapshotIsSortedTx(t *testing.T) {
 	}
 	want := []string{
 		"BEGIN",
-		"UPSERT_HEADER | m1,bulk_copy," + UpgradedBlobSentinel + ",2,<nil>",
+		"UPSERT_HEADER | m1,bulk_copy," + UpgradedBlobSentinel + ",2,<nil>,<nil>",
 		`UPSERT_PROGRESS | m1,a_users,"complete"`,
 		`UPSERT_PROGRESS | m1,b_orders,{"state":"in_progress","last_pk":[{"_t":"i64","v":9}],"rows_copied":9}`,
 		"COMMIT",
