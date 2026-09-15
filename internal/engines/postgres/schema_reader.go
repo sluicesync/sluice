@@ -38,6 +38,12 @@ type SchemaReader struct {
 	db     *sql.DB
 	schema string
 
+	// isNeki records that this reader's endpoint is a PlanetScale Neki
+	// router, probed once per server at open (neki_probe.go). It gates
+	// CaptureBackupPosition — a router has no WAL position to record —
+	// and nothing else.
+	isNeki bool
+
 	// enabledExtensions is the set of extension names the operator
 	// opted into via `--enable-pg-extension` (ADR-0032). Populated by
 	// [EnableExtensions]; nil / empty means "no extension passthrough,

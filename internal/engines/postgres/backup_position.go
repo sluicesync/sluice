@@ -9,6 +9,7 @@ import (
 	"fmt"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // CaptureBackupPosition implements [irbackup.PositionCapturer]. Returns
@@ -34,6 +35,27 @@ import (
 func (r *SchemaReader) CaptureBackupPosition(ctx context.Context, slotName string) (ir.Position, error) {
 	if r.db == nil {
 		return ir.Position{}, errors.New("postgres: CaptureBackupPosition: reader not opened")
+	}
+	// A PlanetScale Neki router has no WAL position to record: it does not
+	// implement pg_current_wal_lsn() (NK013 — measured 2026-09-15, where a
+	// `backup full` FROM a sharded Neki finished its copy and died here), and
+	// nothing could consume one anyway — a router-level replication
+	// connection is refused ("must target a specific shard", 0A000), which is
+	// why a Neki cannot be a continuous-sync source (ADR-0186 probe R-1).
+	// Decided from the flavor probe rather than by catching NK013, so the
+	// answer does not depend on the router's error text; the orchestrator
+	// records no EndPosition and says so.
+	//
+	// SIBLING SWEEP — other pg_current_wal_lsn() readers on this engine:
+	//   - diagnose.go: guarded `if err == nil`, degrades in place — EXEMPT
+	//   - engine.go ReadCurrentWALPosition (schema add-table), health_reporter.go,
+	//     slot_health_reporter.go: reached only by a `sync` whose SOURCE is a
+	//     Neki, which fails at the replication connect (0A000) either way —
+	//     loud on both roads, NOT annotated here; filed
+	if r.isNeki {
+		return ir.Position{}, fmt.Errorf("postgres: CaptureBackupPosition: a PlanetScale Neki router implements "+
+			"neither the current-WAL-LSN function nor a router-level replication connection, so there is no CDC "+
+			"position to anchor an incremental on: %w", irbackup.ErrPositionUnavailable)
 	}
 	if slotName == "" {
 		slotName = defaultSlot

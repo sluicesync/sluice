@@ -201,7 +201,8 @@ func (e Engine) OpenSchemaReader(ctx context.Context, dsn string) (ir.SchemaRead
 	if err != nil {
 		return nil, err
 	}
-	return &SchemaReader{db: db, schema: cfg.schema}, nil
+	isNekiR, _ := probeIsNeki(ctx, cfg.serverKey(), db)
+	return &SchemaReader{db: db, schema: cfg.schema, isNeki: isNekiR}, nil
 }
 
 // OpenSchemaWriter returns a [SchemaWriter] bound to the database

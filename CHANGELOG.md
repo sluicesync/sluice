@@ -4,6 +4,14 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Fixed
+
+**`backup full` FROM a PlanetScale Neki no longer dies at the finalize phase.** Measured 2026-09-15 on a sharded 2-shard cluster by the new live backup arm: the copy completed across both shards, then the end-position capture called `pg_current_wal_lsn()`, which the router does not implement (`SQLSTATE NK013`), and the backup exited non-zero with a complete store on disk — every release from v0.150.0 through v0.153.0. A Neki has no WAL position to record and nothing that could consume one (a router-level replication connection is refused, ADR-0186 probe R-1), so the postgres capturer now answers `irbackup.ErrPositionUnavailable` when its flavor probe says Neki — decided from the probe, not by catching the router's error text — and the orchestrator records an empty `EndPosition` with a WARN naming the consequence: no `backup incremental` can chain off that full on this source. Every other capture failure still refuses, because a lost position on a source that has one is the silent half; pinned in both directions. Sibling sweep of the engine's other `pg_current_wal_lsn()` readers: `diagnose` already degrades in place; the `sync`-side readers are reached only from a Neki source, which fails at the replication connect on the same road. Also on a Neki: the index-build tuning probe no longer WARNs `pg_size_bytes … NK013` on every restore or migrate — every Neki index build goes through the online-DDL workflow, so the serial plan it fell back to is now taken directly.
+
+### Changed
+
+**The weekly live-Neki suite gained `restore` INTO and `backup full` FROM a sharded cluster**, with the router-free half proven per-PR against vanilla PostgreSQL under the forced flavor (`TestPostgresSuite_NekiBackupRestorePlumbing`). First live run: restore works end to end (six-chunk copy, online-DDL index builds, 20,500 rows scattered evenly, byte-exact content); the NK306 bisect arm's both-lanes-clean outcome is its success state. A single-full restore creates no control tables (only a chain restore reaches the applier door), stated as not covered rather than implied; restore's single cross-table writer on a Neki is filed as a perf item. `scripts/vet-tags.{sh,ps1}` accept an `a || b` build constraint.
+
 ## [0.153.0] - 2026-09-14
 
 ### Added

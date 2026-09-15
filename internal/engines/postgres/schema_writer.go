@@ -585,6 +585,15 @@ type indexBuildPlan struct {
 // probe degrades to serial (N=1) but keeps whatever mem tuning succeeded.
 // numJobs is the index count (an upper bound on useful workers).
 func (w *SchemaWriter) resolveIndexBuildConcurrency(ctx context.Context, numJobs int) indexBuildPlan {
+	// A PlanetScale Neki router builds every index through its online-DDL
+	// workflow (ADR-0184), not in a session sluice tunes — and it does not
+	// implement pg_size_bytes(), so the probe below fails with NK013 and
+	// WARNs on every restore/migrate into a Neki (measured 2026-09-15). The
+	// serial, untuned plan is the right answer there; take it without the
+	// probe and without the noise.
+	if w.isNeki {
+		return indexBuildPlan{workers: 1, perBuildMemBytes: 0, parallelMaintenanceWorkers: 0}
+	}
 	// Probe the tuning GUCs on a throwaway pooled query. The per-worker
 	// sessions re-derive their own SET values from this same plan; the
 	// probe here only needs the numbers, not a dedicated session.

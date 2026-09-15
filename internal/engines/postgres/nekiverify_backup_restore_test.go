@@ -8,12 +8,15 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"runtime/debug"
 	"sort"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // Tier-2 coverage: `sluice restore` INTO a sharded Neki, and `sluice backup
@@ -238,11 +241,30 @@ func nekiTableShardGroup(ctx context.Context, t *testing.T, db *sql.DB, table st
 	var group sql.NullString
 	const q = `SELECT ((__neki.get_data_topology())::jsonb)
 	             #>> ARRAY['databases', current_database(), 'schemas', 'public', 'tables', $1, 'shard_group']`
-	if err := db.QueryRowContext(ctx, q, table).Scan(&group); err != nil {
-		t.Fatalf("read the topology's shard_group for %q: %v\n%s", table, err,
-			nekiFunctionSignature(ctx, db, "get_data_topology"))
+	// Retried on a transport-level failure only. The first live run
+	// (2026-09-15, run 34926553073) reached this read straight after a
+	// 20k-row restore and got `read: connection reset by peer` on the
+	// suite's long-lived pool — a dropped idle connection, not a topology
+	// answer — and the arm reported it as a placement failure. A SQL error
+	// (a 42883 signature change, a 42703) is a real answer and is not
+	// retried.
+	var err error
+	for attempt := 1; attempt <= 3; attempt++ {
+		err = db.QueryRowContext(ctx, q, table).Scan(&group)
+		if err == nil {
+			return group.String
+		}
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) {
+			break
+		}
+		t.Logf("topology read for %q failed at the transport (attempt %d/3): %v — retrying on a fresh connection",
+			table, attempt, err)
+		time.Sleep(3 * time.Second)
 	}
-	return group.String
+	t.Fatalf("read the topology's shard_group for %q: %v\n%s", table, err,
+		nekiFunctionSignature(ctx, db, "get_data_topology"))
+	return ""
 }
 
 // nekiControlTablePlacementHolds grades ADR-0187's premise on the target the

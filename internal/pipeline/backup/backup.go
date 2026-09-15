@@ -1464,6 +1464,23 @@ func (b *Backup) captureEndPosition(ctx context.Context, manifest *irbackup.Mani
 	}
 	pos, err := capturer.CaptureBackupPosition(ctx, b.SlotName)
 	if err != nil {
+		// The capturer exists but THIS server has no position to give
+		// (a PlanetScale Neki router: no pg_current_wal_lsn, no router-level
+		// replication — see irbackup.ErrPositionUnavailable). Same outcome
+		// as an engine without a capturer, said at WARN rather than DEBUG
+		// because an operator who expects to chain incrementals off this
+		// full needs to learn here, not at the first `backup incremental`.
+		// Every OTHER capture failure stays a refusal: a lost position on a
+		// source that has one is the silent half.
+		if errors.Is(err, irbackup.ErrPositionUnavailable) {
+			slog.WarnContext(
+				ctx, "backup: this source cannot provide a CDC position, so the manifest's EndPosition is empty; "+
+					"no `backup incremental` can chain off this full on this source",
+				slog.String("engine", b.Source.Name()),
+				slog.String("reason", err.Error()),
+			)
+			return nil
+		}
 		return fmt.Errorf("capture position: %w", err)
 	}
 	manifest.EndPosition = pos

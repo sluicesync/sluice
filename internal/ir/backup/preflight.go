@@ -5,6 +5,7 @@ package backup
 
 import (
 	"context"
+	"errors"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -107,3 +108,24 @@ type PositionCapturer interface {
 	// engine's CDC reader.
 	CaptureBackupPosition(ctx context.Context, slotName string) (ir.Position, error)
 }
+
+// ErrPositionUnavailable is returned (wrapped, with the reason) by a
+// [PositionCapturer] whose engine is talking to a source that HAS a CDC
+// capability on paper but cannot produce a position on this particular
+// server. The orchestrator treats it exactly as "does not implement
+// PositionCapturer": the manifest's EndPosition stays empty and a WARN names
+// the consequence (no incremental can chain off this full on this source).
+//
+// The case it exists for: a PlanetScale Neki router is driven by the
+// postgres engine (ADR-0186), whose Capabilities declare CDC, but the router
+// implements neither `pg_current_wal_lsn()` (NK013) nor a router-level
+// replication connection ("replication connections must target a specific
+// shard", 0A000) — so there is no WAL position to record and, per ADR-0186
+// probe R-1, nothing that could consume one. Measured 2026-09-15 by the
+// nekiverify backup arm, where `backup full` FROM a sharded Neki completed
+// its copy and then died at the finalize phase on the LSN read.
+//
+// A capturer that hits an UNEXPECTED failure must NOT return this; a lost
+// position on a source that does have one is the silent half, and the
+// orchestrator keeps refusing loudly for every other error.
+var ErrPositionUnavailable = errors.New("backup position unavailable on this source")
