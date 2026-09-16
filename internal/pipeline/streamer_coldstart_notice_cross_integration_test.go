@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/logcapture"
 
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
@@ -61,9 +62,9 @@ func TestStreamer_ColdStart_UnsignedBigintNotice_Cross_MySQLToPG(t *testing.T) {
 	}
 
 	// Capture WARN-level slog from the live cold-start path. The
-	// goroutine-safe lockedBuffer is required because the streamer runs in
-	// its own goroutine alongside the test goroutine.
-	logBuf := &lockedBuffer{}
+	// goroutine-safe logcapture.Buffer is required because the streamer
+	// runs in its own goroutine alongside the test goroutine.
+	logBuf := &logcapture.Buffer{}
 	prevDefault := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(logBuf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 	defer slog.SetDefault(prevDefault)

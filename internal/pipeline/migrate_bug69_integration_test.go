@@ -36,6 +36,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/logcapture"
 
 	// Both engines must be registered for engines.Get to find them.
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
@@ -185,9 +186,9 @@ func TestMigrate_PostgresToMySQL_Bug69UnconstrainedNumeric(t *testing.T) {
 
 	// Capture the slog stream so the loud advisory can be asserted —
 	// the Bug 69 silent-loss class is closed only if the operator is
-	// loudly told. Same lockedBuffer + JSONHandler pattern the diagnose
-	// and broker integration tests use.
-	logBuf := &lockedBuffer{}
+	// loudly told. Same logcapture.Buffer + JSONHandler pattern the
+	// diagnose and broker integration tests use.
+	logBuf := &logcapture.Buffer{}
 	prevDefault := slog.Default()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(logBuf, &slog.HandlerOptions{
 		Level: slog.LevelDebug,

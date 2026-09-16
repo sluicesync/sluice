@@ -45,6 +45,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/logcapture"
 
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 )
@@ -166,7 +167,7 @@ var slm4PipelineOpeners = []slm4PipelineOpener{
 // test's own writes use the plain DSN.
 func runColdStartAndReadAnchor(t *testing.T, mysqlEng ir.Engine, sourceDSN, dsnSuffix, targetDSN, streamID string) (token string, logs string) {
 	t.Helper()
-	logBuf := &lockedBuffer{}
+	logBuf := &logcapture.Buffer{}
 	prevDefault := slog.Default()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(logBuf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	defer slog.SetDefault(prevDefault)
@@ -328,7 +329,7 @@ func TestStreamer_MySQLGTIDMode_FailoverToPromotedReplicaResumes(t *testing.T) {
 	applyDDLMySQL(t, tgtC, "INSERT INTO gh_a (id, payload) VALUES (9000, 'target-only-witness')")
 	seedCDCStateMySQL(t, tgtC, streamID, anchorFromA)
 
-	logBuf := &lockedBuffer{}
+	logBuf := &logcapture.Buffer{}
 	prevDefault := slog.Default()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(logBuf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	defer slog.SetDefault(prevDefault)

@@ -30,13 +30,11 @@
 package mysql
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"log"
 	"log/slog"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -45,6 +43,7 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/logcapture"
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
@@ -168,31 +167,12 @@ func wantCodedRefusal(t *testing.T, err error, code sluicecode.Code, site string
 // A0915-LOGCAPTURE-1; it is NOT swept repo-wide here, because ~90 test
 // files share the shape and most are never at risk.
 func captureInfoLog(fn func()) string {
-	buf := &lockedBuffer{}
+	buf := &logcapture.Buffer{}
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
 	defer slog.SetDefault(prev)
 	fn()
 	return buf.String()
-}
-
-// lockedBuffer serialises writes against reads so a logger still running
-// in another goroutine cannot race the reader. See captureInfoLog.
-type lockedBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
-}
-
-func (b *lockedBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.Write(p)
-}
-
-func (b *lockedBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.String()
 }
 
 // TestCDCReader_ReplicaSourcePreflight is the G5 door pin on a real

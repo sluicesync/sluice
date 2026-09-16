@@ -31,6 +31,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/logcapture"
 
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
@@ -63,7 +64,7 @@ func TestMigrate_PostgresToMySQL_Bug72WideVarcharDownmap(t *testing.T) {
 	applyPGDDL(t, pgSource, bug72SeedDDL)
 
 	// Capture the slog stream so the loud advisory can be asserted.
-	logBuf := &lockedBuffer{}
+	logBuf := &logcapture.Buffer{}
 	prevDefault := slog.Default()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(logBuf, &slog.HandlerOptions{
 		Level: slog.LevelDebug,

@@ -77,6 +77,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/logcapture"
 
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 
@@ -323,9 +324,9 @@ func TestStreamer_MySQL_FreshInstanceNodeReplaceRefusesTerminally(t *testing.T) 
 
 	// Capture DEBUG slog so the resume-validation decision (node-
 	// replace identity check) is observable as ground truth, not
-	// inferred from row counts alone. Same lockedBuffer + JSON-handler
+	// inferred from row counts alone. Same logcapture.Buffer + JSON-handler
 	// pattern the ADR-0036 diagnose test uses.
-	logBuf := &lockedBuffer{}
+	logBuf := &logcapture.Buffer{}
 	prevDefault := slog.Default()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(logBuf, &slog.HandlerOptions{
 		Level: slog.LevelDebug,

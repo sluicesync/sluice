@@ -23,7 +23,7 @@
 //   - The `col::text` canonical-read oracle (NULL-element + array
 //     dimensionality observable in one compare) — generalised from
 //     migrate_bug7374_integration_test.go's readAll.
-//   - lockedBuffer + slog JSON capture pattern — available for advisory
+//   - logcapture.Buffer + slog JSON capture pattern — available for advisory
 //     assertions (migrate_bug69/72 use it); the harness classifies on
 //     migrate exit status + canonical diff, so it does not need it, but
 //     the pattern was studied.

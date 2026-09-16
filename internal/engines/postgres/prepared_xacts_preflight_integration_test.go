@@ -15,12 +15,10 @@
 package postgres
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"log/slog"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -28,6 +26,7 @@ import (
 	pgtc "github.com/testcontainers/testcontainers-go/modules/postgres"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 // startPostgresForPreparedXacts boots a dedicated PG container with
@@ -72,26 +71,6 @@ func startPostgresForPreparedXacts(t *testing.T) (dsn string, cleanup func()) {
 	return srcConn, terminate
 }
 
-// lockedBuffer is a mutex-guarded log sink: the CDC open runs on its
-// own goroutine in the pending direction (it blocks at slot creation
-// by design), so the WARN write and the test's poll race without it.
-type lockedBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
-}
-
-func (b *lockedBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.Write(p)
-}
-
-func (b *lockedBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.String()
-}
-
 func TestCDCReader_PreparedXactWarnBeforeSlotCreate(t *testing.T) {
 	dsn, cleanup := startPostgresForPreparedXacts(t)
 	defer cleanup()
@@ -99,7 +78,7 @@ func TestCDCReader_PreparedXactWarnBeforeSlotCreate(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	logs := &lockedBuffer{}
+	logs := &logcapture.Buffer{}
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
 	t.Cleanup(func() { slog.SetDefault(prev) })

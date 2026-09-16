@@ -110,6 +110,7 @@ import (
 	"github.com/jackc/pglogrepl"
 
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/logcapture"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
@@ -137,7 +138,7 @@ func TestStreamer_AddTable_LiveMode_PG_DiagnoseLossSurface(t *testing.T) {
 	// restored logger's handler is slog's internal defaultHandler, so
 	// without this every later log line in the package's test binary lands
 	// in this finished test's buffer.
-	logBuf := &lockedBuffer{}
+	logBuf := &logcapture.Buffer{}
 	prevDefault := slog.Default()
 	prevWriter, prevFlags := log.Writer(), log.Flags()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(logBuf, &slog.HandlerOptions{
@@ -361,28 +362,6 @@ func TestStreamer_AddTable_LiveMode_PG_DiagnoseLossSurface(t *testing.T) {
 	case <-time.After(20 * time.Second):
 		t.Fatal("Streamer.Run did not return after ctx cancel")
 	}
-}
-
-// lockedBuffer is a goroutine-safe wrapper around bytes.Buffer.
-// slog.JSONHandler writes from arbitrary goroutines (the streamer's
-// pump, the orchestrator's main goroutine, the test goroutine).
-type lockedBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
-}
-
-func (b *lockedBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.Write(p)
-}
-
-func (b *lockedBuffer) Bytes() []byte {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	out := make([]byte, b.buf.Len())
-	copy(out, b.buf.Bytes())
-	return out
 }
 
 // diagRecord is the parsed shape of one slog JSON line we care about
