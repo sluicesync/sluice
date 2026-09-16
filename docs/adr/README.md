@@ -89,7 +89,7 @@ ADRs are numbered in the order they were proposed. A few notable conventions:
 | ADR | Decision |
 |---|---|
 | [0051a](adr-0051-core-pg-type-verbatim-carry.md) | Core-PG-type verbatim carry beyond tsvector/tsquery (range/multirange/Stage 2 family) |
-| [0051b](adr-0051-pg-cdc-source-identity-pinning.md) | PG CDC source-identity pinning (refuse to resume against a different source after failover) |
+| [0051b](adr-0051-pg-cdc-source-identity-pinning.md) | PG CDC source-identity pinning (a different source after a PITR/promotion/failover is refused TERMINALLY — never auto-re-copied; amended 2026-09-15) |
 | [0052](adr-0052-aimd-apply-batch-size-controller.md) | AIMD apply-batch-size controller for batched CDC |
 | [0053](adr-0053-exclude-constraint-verbatim-carry.md) | EXCLUDE constraint verbatim carry (same-engine PG → PG) |
 | [0054](adr-0054-shape-a-phase-2-live-cross-shard-ddl-coordination.md) | Shape A Phase 2 live cross-shard DDL coordination |

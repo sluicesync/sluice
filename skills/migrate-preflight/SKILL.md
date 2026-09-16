@@ -38,6 +38,8 @@ The user wants to migrate or continuously-sync a database and you are about to r
 
 4. **Check the target's starting state.** A non-empty target table is `SLUICE-E-COLDSTART-TARGET-NOT-EMPTY` at run time. Note whether recovery would need a **destructive** flag (`--reset-target-data --yes` for sync, `--resume` for migrate, `--force-cold-start` to override) — those require explicit human approval (see `AGENTS.md` destructive-flags list); never pre-authorize them.
 
+   **⚠ `--resume` is no longer an unconditional recovery: since v0.154.0 it can REFUSE.** The recorded state now carries the identity of the source that wrote it — engine + database + schema, deliberately **not** the host — and a resume whose live source disagrees is refused with `SLUICE-E-RESUME-SOURCE-MISMATCH` (exit 3) before any copy. So prescribing `--resume` for a non-empty target is only right when this run reads the **same** source the recorded copy did. Two shapes hit it and neither looks wrong from the command line: a `--migration-id` reused across two sources, and — with no `--migration-id` at all — two databases on **one host**, because the derived id hashes the hosts and not the database. A re-pointed DSN that is genuinely the same database (a DNS move, a failover, a replica) still resumes, by design. If the source really is different, the answer is a **new** migration: drop `--resume` and pass a fresh `--migration-id`.
+
 ## What you return — the go/no-go
 A short report:
 - **Verdict:** GO / GO-WITH-RISKS / NO-GO.

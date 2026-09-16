@@ -129,20 +129,21 @@ Every backup chain root manifest carries a `FormatVersion` field:
   read and the incremental's open. It is the Bug-116 class with the dropped
   field being the *absence* of one. The bump makes every pre-v0.154.0 reader
   refuse the manifest loudly at its own ceiling instead. Proportional as
-  always, and this tier is the narrowest yet: a full that records a position
+  always, and this tier is narrow: a full that records a position
   (every Postgres primary, every MySQL server with `log_bin` on, and — since
-  roadmap item 163 — every trigger-CDC full whose snapshot-anchored open
-  succeeded, which records the change log's anchor), every incremental, and
-  every full from a CDC-less source (nothing could extend it) keep their
-  feature-minimum version. A trigger-CDC source was exempt in the first cut of
-  this tier, on the premise that such a full records no position *by
-  construction*; roadmap item 163 falsified that in the same release, and the
-  fulls the exemption actually covered were the fault-path ones — a trigger
-  `backup full` whose snapshot open refused falls back to the non-snapshot
-  sweep and finalizes positionless, which is the same hazard on the same
-  artifact class. Those are stamped (audit 2026-09-15 F-2). A Neki or binlog-off full is
-  a complete, restorable backup on its own — it just needs a v0.154.0+ binary
-  to restore it, and can root a chain on none. One refusal comes with it: the
+  v0.154.0, roadmap item 163 — every trigger-CDC full, which now records the
+  change log's own anchor: on `postgres-trigger` the settled anchor read inside
+  the backup's `REPEATABLE READ` view, on `sqlite-trigger` and `d1-trigger` the
+  log's `MAX(id)` read before the sweep), every incremental, and every full from
+  a CDC-less source (nothing could extend it) keep their feature-minimum
+  version. A trigger-CDC full is **no longer exempt on the grounds that it
+  records no position**: that was true by construction through v0.153.2 and is
+  not true of a full written by v0.154.0 or later. A trigger full that still
+  finalizes with an empty position is the fault path — a snapshot-anchored open
+  that refused and fell back, which the backup names at WARN — and it carries
+  exactly the hazard this tier exists for, so it is stamped like any other.
+  A Neki or binlog-off full is a complete, restorable backup on its own — it
+  just needs a v0.154.0+ binary to restore it, and can root a chain on none. One refusal comes with it: the
   stamp is the only version raise applied *after* a full's chunks are sealed,
   so an encrypted `backup full` that **resumes an attempt written before
   v0.104.0** (whose kept chunks are sealed under an older AAD encoding that

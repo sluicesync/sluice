@@ -244,6 +244,38 @@ automatic path it deliberately does **not** refuse when there is no
 registry to consult: that path has been safe for a single stream since it
 shipped, and refusing would break it.
 
+## A backup chain reads the same change log, and now registers as a consumer
+
+A `backup incremental` (or `backup stream`) off a trigger-CDC source resumes
+the change log from the position its parent link recorded — so a chain is a
+reader of the same log every sync reads, and until v0.154.0 it registered
+nothing. A peer sync's auto-prune, or an operator `sluice trigger prune`,
+could reap the rows between the chain's resume point and the peer's frontier,
+and the next link would open above a hole it could not see.
+
+Both chain extenders now publish into `sluice_change_log_consumers` like any
+other reader. The chain's consumer id is **`backup-chain:<root BackupID>`** —
+derived from the lineage root's full, so it is stable across incrementals and
+rotations and unique per chain, which keeps two chains on one source off each
+other's row. The chain registers at the position it **resumes from**, before it
+reads anything, and moves the seat to each committed link's `EndPosition`. Both
+pruners already cut at the MIN across every registered consumer, so they now
+include chains without any change to how you run them. A registry write that
+fails WARNs and never fails the backup — but take that WARN seriously: a chain
+that could not register is invisible to the pruner, which is the whole hazard.
+
+**The residual, stated plainly: the window between a full and its FIRST
+incremental is not covered** (roadmap item 164, in `docs/dev/roadmap.md`).
+Registration needs the chain's identity, and that identity is the root full's
+BackupID — computed *after* the full's snapshot open, so nothing can register
+at anchor time. If a peer sync applies past the full's anchor and a prune cuts
+above it before the first incremental runs, the rows in between are in no link
+of the chain, at exit 0. The signal differs by engine and nowhere is it loud:
+`postgres-trigger` proves the pruned range permanently absent and skips it with
+an INFO line; `sqlite-trigger` and `d1-trigger` scan `id > last_id` and simply
+never see the deleted ids, with no signal at all. Until the item lands, **take
+the first incremental promptly after the full** on any source with peer syncs.
+
 ## See also
 
 - `docs/adr/adr-0137-trigger-changelog-retention.md` — the design and

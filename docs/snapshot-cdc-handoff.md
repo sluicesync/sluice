@@ -109,6 +109,20 @@ What the cold start does persist as it runs is progress, in
 PostgreSQL source since v0.149.0 — a `snapshot_anchor` recording
 where the exported snapshot stood.
 
+Since v0.154.0 the header row also records a `source_identity`:
+the source's engine, database and schema (where the engine scopes
+by one), each rendered with Go's `strconv.Quote` so a name that is
+not valid UTF-8 round-trips instead of being refused by the column.
+It carries **no host and no credentials**, so the control row cannot
+say where the source lives or how to reach it. It is **set once**, on
+the header INSERT, and absent from every upsert's SET list — because
+the value is what a `migrate --resume` checks the live source
+against, and a row that updated itself would overwrite the very
+evidence that refuses a foreign source. An empty value means "written
+by a binary older than the column", not "no identity": such a resume
+proceeds under a `RESUME-SOURCE-UNRECORDED` warning rather than being
+refused, so upgrading never strands a migration already in flight.
+
 That anchor is what makes a stop in phases 2-4 recoverable rather
 than a full re-copy. Re-running with the same `--stream-id` on a
 PostgreSQL source resumes: the copy is skipped, the remaining

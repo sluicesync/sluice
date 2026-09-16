@@ -6,10 +6,45 @@ Accepted. Implemented in:
 
 - `internal/engines/postgres/cdc_position.go` — `pgPos` extended with optional `SystemID` (string) and `Timeline` (int32) JSON fields; older tokens without them decode cleanly.
 - `internal/engines/postgres/cdc_reader.go::resolveStartPosition` — issues `IDENTIFY_SYSTEM` on every `StreamChanges` call (both cold-start and resume paths); captures `SystemID` / `Timeline` onto the reader and compares against the persisted pin on resume via `checkSourceIdentity`.
-- `internal/engines/postgres/cdc_reader.go::checkSourceIdentity` — pure comparator; returns nil on match or pre-ADR-0051 sentinel (lazy install + INFO log); returns `fmt.Errorf("...: %w", ir.ErrPositionInvalid)` on divergence.
+- `internal/engines/postgres/cdc_reader.go::checkSourceIdentity` — pure comparator; returns nil on match or pre-ADR-0051 sentinel (lazy install + INFO log); returns `fmt.Errorf("...: %w", ir.ErrPositionForeignLineage)` on divergence (see the 2026-09-15 amendment below — this wrapped `ir.ErrPositionInvalid` through v0.153.2).
 - `internal/engines/postgres/cdc_reader.go::positionAt` — every emitted change's `ir.Position` now carries the reader's pinned `(SystemID, Timeline)` so subsequent reconnects have the pin to compare against.
 
 Closes severity-A finding F5 from `2026-05-22 PG-internals research chapters 9–10–11` (durable findings doc).
+
+### Amendment — 2026-09-15 (v0.154.0): the divergence is TERMINAL, not a route into cold start
+
+Audit 2026-09-15 A0915-ARCH-MEDIUM-1. As first shipped, this ADR routed a
+diverged source through `ir.ErrPositionInvalid` — the sentinel that drives the
+pipeline's **automatic** ADR-0022/ADR-0093 recovery. That recovery drops the
+target's in-scope tables and re-copies from whatever now answers the DSN, which
+is right for a source that has merely moved past its position and wrong here: a
+`(systemid, timeline)` divergence is the strongest evidence any engine has that
+what answers the DSN is **not** the database the position came from.
+
+A populated target was saved by the populated-target gate (a logical-slot source
+takes `forceFresh=false`), but an **empty** one — a freshly prepared target an
+operator pointed a resuming sync at — cold-started from the diverged instance at
+exit 0 and streamed the wrong lineage, with every change on the abandoned
+timeline absent forever.
+
+`checkSourceIdentity` now wraps **`ir.ErrPositionForeignLineage`**, which
+deliberately does *not* satisfy `ir.ErrPositionInvalid`, so the ADR-0022
+fall-through cannot engage. The pipeline refuses instead, under the
+`FOREIGN-LINEAGE-REFUSED` marker, states that nothing on the target was touched,
+and names the deliberate re-copy flags (`--restart-from-scratch`, which keeps the
+cdc-state row, or `--reset-target-data`, which clears it too). Postgres thereby
+joins the MySQL-family lanes in the same terminal class rather than sitting
+outside it; the tree-wide holder is
+`engines.TestForeignLineageVerdictsCarryTheSentinelInEveryEngine`.
+
+Scope, stated so it cannot be read wider than the truth: on Postgres the door is
+the **resume open** — `checkSourceIdentity` runs inside `resolveStartPosition` on
+every `StreamChanges`, and the refusal surfaces through the streamer's
+warm-resume arm. The Postgres CDC reader does **not** implement
+`ir.LineageVerifier`, so the pipeline's *reactive* door
+(`Streamer.refuseIfForeignLineage`, for a position that goes invalid mid-stream)
+has no Postgres verifier to ask and returns without a verdict. That door is a
+MySQL-family surface today.
 
 ## Context
 
@@ -33,17 +68,17 @@ Pin the source's identity. Three layered design choices:
 
 2. **Persist the pin on the position token, additively.** `pgPos` gains `SystemID` and `Timeline` as JSON fields with `omitempty`. Positions persisted by pre-ADR-0051 sluice decode cleanly with both fields zero-valued. On the first reconnect with a legacy token, `checkSourceIdentity` engages **lazy install**: emit a one-time INFO log noting the pin is being installed, accept the legacy position, and let subsequent reconnects engage the strict comparison (the next emitted change carries the now-installed pin). This preserves drop-in upgrade from prior versions.
 
-3. **Refuse loudly on divergence, wrap `ir.ErrPositionInvalid`.** When persisted `(SystemID, Timeline)` disagree with the live IDENTIFY_SYSTEM reply, return an error that:
+3. **Refuse loudly on divergence, wrap `ir.ErrPositionForeignLineage`** (amended 2026-09-15; this said `ir.ErrPositionInvalid` through v0.153.2). When persisted `(SystemID, Timeline)` disagree with the live IDENTIFY_SYSTEM reply, return an error that:
    - Names both the OLD `(systemid, timeline)` (from the persisted token) and the NEW `(systemid, timeline)` (from the live reply), so the operator can confirm whether the divergence matches their intended PITR / promotion event.
    - Spells out the three plausible operator-side causes: source-side PITR, standby promotion, or pointing sluice at the wrong instance.
-   - Mirrors ADR-0022's slot-missing recovery-hint shape — name the slot, point at `sluice slot drop`, point at the cold-start fall-through ("restart with empty position (forces a fresh snapshot)").
-   - **Wraps `ir.ErrPositionInvalid`** via `%w`. This routes the divergence through the existing ADR-0022 streamer fall-through — the same code path that handles slot-missing on the warm-resume side. The operator-experience semantics are identical: "the persisted position is no longer valid; cold-start is the only recovery path."
+   - Mirrors ADR-0022's slot-missing recovery-hint shape as far as the diagnosis goes — name the slot, point at `sluice slot drop` — but does **not** point at an automatic cold-start fall-through, because there is none on this verdict. The operator re-copies deliberately or not at all.
+   - **Wraps `ir.ErrPositionForeignLineage`** via `%w`. That sentinel deliberately does not satisfy `ir.ErrPositionInvalid`, so the ADR-0022 streamer fall-through never engages and the run is refused under `FOREIGN-LINEAGE-REFUSED` with nothing on the target touched. The operator-experience semantics are *not* the slot-missing ones: "the source answering this DSN is not the one this position came from — decide, then re-copy deliberately with `--restart-from-scratch` or `--reset-target-data`."
 
-There is no `--ignore-source-identity-change` flag. The persisted LSN is *by definition* meaningless against a source whose identity has changed; "stay strict" is the only semantic — a flag would only let the operator opt into the silent-loss class the ADR closes. The ADR-0022 logic ("loud WARN + cold-start fall-through" — non-destructive on its own, ADR-0009's `--reset-target-data` still gates destructive dest-data operations) is the right shape for this class too.
+There is no `--ignore-source-identity-change` flag. The persisted LSN is *by definition* meaningless against a source whose identity has changed; "stay strict" is the only semantic — a flag would only let the operator opt into the silent-loss class the ADR closes. ADR-0022's shape ("loud WARN + cold-start fall-through") was adopted here originally and is **no longer** the shape for this class: a slot that went missing on the same source and an instance that is a different source only look alike from the error's side, and the 2026-09-15 amendment above separates them.
 
 ## Consequences
 
-- **Closes a silent-loss class.** A post-PITR / post-promotion reconnect now refuses loudly with operator-actionable diagnostics, instead of silently streaming WAL from a different timeline's LSN reference frame. The refusal is the same shape as ADR-0022's slot-missing one; operators familiar with the slot-drop recovery flow see the same recovery shape here.
+- **Closes a silent-loss class.** A post-PITR / post-promotion reconnect now refuses loudly with operator-actionable diagnostics, instead of silently streaming WAL from a different timeline's LSN reference frame. Since the 2026-09-15 amendment the refusal is **terminal** and is deliberately *not* ADR-0022's slot-missing shape: it touches nothing, and re-copying is the operator's explicit `--restart-from-scratch` / `--reset-target-data` decision rather than something sluice does on their behalf.
 
 - **Position token grows by ~30 bytes on average.** A typical IDENTIFY_SYSTEM reply has a 19-digit `SystemID` (uint64 as decimal) and a small `Timeline` (single or double digits). The `omitempty` tags mean the wire size grows only for positions emitted post-ADR-0051; pre-existing persisted positions stay byte-identical.
 
@@ -51,9 +86,9 @@ There is no `--ignore-source-identity-change` flag. The persisted LSN is *by def
 
 - **`IDENTIFY_SYSTEM` now runs on every StreamChanges call.** It already ran on cold-start; the change is that it also runs on warm-resume. The command is a single round-trip and is cheap relative to slot-state validation (`slotInfo` queries `pg_replication_slots` via the *sql.DB pool, which is also a round-trip). No measurable cost.
 
-- **Other engines: out of scope.** This is a PG-specific finding (logical replication's protocol command is what gives sluice the identity tuple). ~~MySQL's `verifyPositionResumable` already covers the equivalent class via `GTID_SUBSET` (a GTID set from a different server-uuid would simply not be a subset of the new source's executed GTIDs).~~ **Corrected 2026-09-02 (audit 2026-09-01, SLM-2 + docs-drift P1): that sentence was false in both arms.** In file/pos mode (MySQL 8's default) nothing in `GTID_SUBSET` runs at all; the class is caught only by the explicit `@@server_uuid` stamp on the position, which the two backup capturers did not write until v0.137.2. In GTID mode the check is `GTID_SUBSET(@@global.gtid_purged, resumeSet)` — "nothing the position needs has been purged" — and a fresh or reset instance has an empty `gtid_purged`, which is a subset of anything, so a position from an unrelated instance is ACCEPTED and the new instance streams its entire history (observed: `backup incremental` recorded the wrong instance's changes as the chain delta at exit 0). The lineage-continuity check that would close it, `GTID_SUBSET(resumeSet, @@global.gtid_executed) = 1`, is filed as OPEN in `docs/dev/audit-backlog.md` §2026-09-01; until it lands, MySQL GTID mode does NOT self-identify. VStream / future engines should be evaluated when their CDC readers land — the engine-neutral sentinel (`ir.ErrPositionInvalid`) already exists; each engine's reader is responsible for surfacing the engine-specific divergence shape.
+- **Other engines: out of scope.** This is a PG-specific finding (logical replication's protocol command is what gives sluice the identity tuple). ~~MySQL's `verifyPositionResumable` already covers the equivalent class via `GTID_SUBSET` (a GTID set from a different server-uuid would simply not be a subset of the new source's executed GTIDs).~~ **Corrected 2026-09-02 (audit 2026-09-01, SLM-2 + docs-drift P1): that sentence was false in both arms.** In file/pos mode (MySQL 8's default) nothing in `GTID_SUBSET` runs at all; the class is caught only by the explicit `@@server_uuid` stamp on the position, which the two backup capturers did not write until v0.137.2. In GTID mode the check is `GTID_SUBSET(@@global.gtid_purged, resumeSet)` — "nothing the position needs has been purged" — and a fresh or reset instance has an empty `gtid_purged`, which is a subset of anything, so a position from an unrelated instance is ACCEPTED and the new instance streams its entire history (observed: `backup incremental` recorded the wrong instance's changes as the chain delta at exit 0). The lineage-continuity check that would close it, `GTID_SUBSET(resumeSet, @@global.gtid_executed) = 1`, is filed as OPEN in `docs/dev/audit-backlog.md` §2026-09-01; until it lands, MySQL GTID mode does NOT self-identify. VStream / future engines should be evaluated when their CDC readers land — the engine-neutral sentinel exists (as of 2026-09-15 it is `ir.ErrPositionForeignLineage` for "a different source", with `ir.ErrPositionInvalid` reserved for "the same source moved past the position"); each engine's reader is responsible for surfacing the engine-specific divergence shape, and for choosing between the two sentinels, which `engines.TestForeignLineageVerdictsCarryTheSentinelInEveryEngine` grades tree-wide.
 
-- **Reviewer corollary (CLAUDE.md "pin the class, not the representative").** The test matrix exercises all three branches of `checkSourceIdentity`: exact-match (silent pass), lazy-install sentinel (silent pass + INFO log), and divergence (refuse + ErrPositionInvalid wrap). The integration test exercises the end-to-end shape against a real PG container via a tampered persisted token — a stand-in for a real PITR / promotion event, since wiring `pg_promote` into testcontainers is heavier without exercising additional surface (the comparator is the load-bearing logic).
+- **Reviewer corollary (CLAUDE.md "pin the class, not the representative").** The test matrix exercises all three branches of `checkSourceIdentity`: exact-match (silent pass), lazy-install sentinel (silent pass + INFO log), and divergence (refuse + `ErrPositionForeignLineage` wrap, asserted together with the negative that it must NOT satisfy `ErrPositionInvalid`). The integration test exercises the end-to-end shape against a real PG container via a tampered persisted token — a stand-in for a real PITR / promotion event, since wiring `pg_promote` into testcontainers is heavier without exercising additional surface (the comparator is the load-bearing logic).
 
 ## Why a tampered-token integration test rather than a real `pg_basebackup` + promote
 
@@ -72,10 +107,17 @@ Unit tests in `internal/engines/postgres/cdc_reader_test.go`:
 - `TestEncodeDecodePGPos` extended with two cases pinning the `SystemID` / `Timeline` round-trip.
 - `TestDecodePGPosPreADR0051CompatibleToken` — pre-ADR-0051 JSON shape (no systemid / timeline keys) decodes cleanly with zero-value pin fields.
 - `TestEncodePGPosOmitsZeroIdentityFields` — wire-format invariant: zero-value pin fields are NOT emitted to JSON (omitempty).
-- `TestCheckSourceIdentity` — every branch of the comparator: exact match (silent pass), pre-ADR-0051 sentinel (lazy install — silent pass), timeline diverges (refuse), sysid diverges (refuse), both diverge (refuse). Each refusal case asserts `errors.Is(err, ir.ErrPositionInvalid)` so the ADR-0022 fall-through engages, AND asserts both old and new (sysid, timeline) pairs appear in the message AND asserts the recovery hint names the slot and `sluice slot drop`.
+- `TestCheckSourceIdentity` — every branch of the comparator: exact match (silent pass), pre-ADR-0051 sentinel (lazy install — silent pass), timeline diverges (refuse), sysid diverges (refuse), both diverge (refuse). Each refusal case asserts `errors.Is(err, ir.ErrPositionForeignLineage)` so the streamer REFUSES, **and the negative** — that the error must NOT satisfy `ir.ErrPositionInvalid`, because that sentinel is what would route the automatic re-copy this verdict exists to prevent — AND asserts both old and new (sysid, timeline) pairs appear in the message AND asserts the recovery hint names the slot and `sluice slot drop`. The negative assertion is the load-bearing half: the original wrap satisfied it, so without it the 2026-09-15 amendment could silently regress.
 
 Integration tests in `internal/engines/postgres/cdc_reader_source_identity_integration_test.go` (build tag `integration`):
 
 - `TestCDCReader_SourceIdentityPin_HappyPathResume` — positive control. Cold-start captures a position with the live pin; resume with the SAME position succeeds and the next emitted position still carries the pin.
-- `TestCDCReader_SourceIdentityPin_DivergenceRefusesLoud` — tamper the captured position's `SystemID`; resume must fail with `ir.ErrPositionInvalid`-wrapped error naming both old and new sysids; the un-tampered position must still succeed (regression guard against over-strict refusal).
+- `TestCDCReader_SourceIdentityPin_DivergenceRefusesLoud` — tamper the captured position's `SystemID`; resume must fail with an `ir.ErrPositionForeignLineage`-wrapped error (and, asserted separately, one that does NOT satisfy `ir.ErrPositionInvalid`) naming both old and new sysids; the un-tampered position must still succeed (regression guard against over-strict refusal).
 - `TestCDCReader_SourceIdentityPin_LegacyPositionLazyInstalls` — re-serialize a captured position WITHOUT the pin fields (mimicking pre-ADR-0051 persisted state); resume must succeed; the next emitted position must carry the now-installed pin so future reconnects engage divergence detection.
+
+Added with the 2026-09-15 amendment, because the comparator's verdict and what
+the *pipeline* does with it are two facts that can each be pinned while nothing
+binds them:
+
+- `internal/pipeline/streamer_pg_foreign_lineage_integration_test.go::TestStreamer_PG_ForeignLineageRefusedOnWarmResume_EmptyTarget` — the end-to-end pin on the arm the audit found open: an EMPTY target, a tampered systemid, a dropped slot. Before the amendment the run cold-started from the diverged instance and never returned; it must now refuse naming `FOREIGN-LINEAGE-REFUSED`, with the target still empty.
+- `internal/engines/foreign_lineage_roster_test.go::TestForeignLineageVerdictsCarryTheSentinelInEveryEngine` — the tree-wide roster: any engine package whose return site words a verdict as "a different lineage" must carry `ir.ErrPositionForeignLineage` or be exempted with a reason. Postgres sat outside the MySQL-only roster that preceded it, which is how this arm stayed open; mutation-proven in both directions (stripping the sentinel from `checkSourceIdentity` fails on the postgres line).

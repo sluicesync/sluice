@@ -11,6 +11,53 @@ JSON blob became a header row + one `sluice_migrate_table_progress`
 row per table (O(1) checkpoint writes; legacy rows upgrade on first
 Read). The resume semantics this ADR defines are unchanged.
 
+### Amendment — 2026-09-15 (v0.154.0): resume binds the SOURCE, not just the id
+
+Audit 2026-09-15 A0915-STATE-MEDIUM-1. As specified below, resume is
+**adoption by id**: `loadOrInitState` reads the recorded row whose
+`migration_id` matches and continues it. A migration id is a *name*, not an
+identity, so a `--resume` pointed at a **different source** that shares the id
+read a copy it never performed as its own — and exited **0 having copied
+nothing**. At phase `complete` it logged "already complete; nothing to do" and
+stopped; mid-phase it skipped every table the other run had recorded complete.
+Both arms were measured on real servers.
+
+Two doors close it, and they are complementary rather than redundant:
+
+- **The header row now records the source's identity, and a `--resume` refuses
+  a live source that disagrees** — `SLUICE-E-RESUME-SOURCE-MISMATCH`, before
+  any copy, printing the recorded and the live identity side by side. Identity
+  is the source **engine + database + schema** (where the engine scopes by
+  one). A new `source_identity` column carries it on both engines, added
+  idempotently to control tables an older binary created. It is **set once**,
+  at the header INSERT, and deliberately absent from every upsert's SET list:
+  were it updated, a resume from a foreign source would overwrite the very
+  evidence that refuses it, so the door would hold on the first re-run and open
+  silently on the second. This is the door that catches the **no-flag** case
+  this ADR documents as a known limitation — two databases on one host
+  colliding on the auto-derived id, which hashes the *hosts* and deliberately
+  not the database.
+- **An operator-typed `--migration-id sync-<x>` is refused outright**, at id
+  resolution in `resolveMigrationID` rather than on the kong flag, so a config
+  file or a programmatic caller meets it too. That namespace holds the progress
+  rows a `sync start` cold start records under its stream id; a `migrate
+  --resume` given one reads that sync's finished copy as its own. This arm
+  needs no recorded state, which is why it is separate from the identity door.
+
+**The host is deliberately excluded**, and that exclusion is load-bearing
+rather than an omission: this ADR frames `--migration-id` as the operator's
+assertion of a stable identity across DSN changes, so a DNS move, a failover,
+or a resume pointed at a replica of the same database must still resume.
+Keying on the host would refuse precisely the case the flag exists to serve.
+Neither host nor credentials ever enter the stored value.
+
+State written by a sluice older than the column carries no identity. Such a
+resume **proceeds** with a `RESUME-SOURCE-UNRECORDED` warning rather than being
+refused — refusing would strand every migration in flight at the moment an
+operator upgrades, which is the one thing `--resume` exists to prevent — and
+that population can only shrink, since every header row this binary writes
+records an identity and a row is never back-filled on resume.
+
 ## Context
 
 Before this work, a `sluice migrate` run that failed partway through —
