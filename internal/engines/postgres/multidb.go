@@ -146,17 +146,19 @@ func withSchemaURI(dsn, schema string) (string, error) {
 	return u.String(), nil
 }
 
+// withSchemaKV replaces the `schema` setting of a libpq key/value DSN,
+// leaving every other byte exactly as the operator wrote it.
+//
+// It used to split on whitespace and re-join the survivors, which
+// silently deleted any token that happened to live inside a quoted value
+// (audit A0915-VF2-PGDSN-1 — see conninfo.go). The strip now goes through
+// the one conninfo grammar; only the appended setting is rendered by us.
 func withSchemaKV(dsn, schema string) string {
-	keepers := make([]string, 0, len(strings.Fields(dsn))+1)
-	for _, tok := range strings.Fields(dsn) {
-		k, _, ok := strings.Cut(tok, "=")
-		if ok && strings.EqualFold(k, "schema") {
-			continue // drop the existing schema= token; we re-append below
-		}
-		keepers = append(keepers, tok)
+	rest := stripSettings(dsn, "schema")
+	if rest == "" {
+		return "schema=" + schema
 	}
-	keepers = append(keepers, "schema="+schema)
-	return strings.Join(keepers, " ")
+	return rest + " schema=" + schema
 }
 
 // EnsureDatabase implements [ir.DatabaseDSNDeriver]: it issues

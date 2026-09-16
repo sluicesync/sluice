@@ -86,21 +86,16 @@ func (c *pgConfig) serverKey() string {
 	if u, err := url.Parse(c.dsn); err == nil && u.Host != "" {
 		return "uri|" + u.Host + "|" + strings.TrimPrefix(u.Path, "/")
 	}
-	var host, port, dbname string
-	for _, f := range strings.Fields(c.dsn) {
-		k, v, ok := strings.Cut(f, "=")
-		if !ok {
-			continue
-		}
-		switch k {
-		case "host":
-			host = v
-		case "port":
-			port = v
-		case "dbname":
-			dbname = v
-		}
-	}
+	// Read through the one conninfo grammar (conninfo.go). This walk used
+	// to be `strings.Fields` + `strings.Cut` — the READING arm of audit
+	// A0915-VF2-PGDSN-1 — and it carried a second defect of its own: the
+	// keyword was compared WITHOUT lowercasing, so a DSN spelling it
+	// `HOST=h` found no host, fell through to the "unparsed" constant, and
+	// silently shared one memo entry with every other unreadable DSN.
+	// parseKVFields lowercases keywords the way libpq compares them, so
+	// both are fixed by the same delegation.
+	kv := parseKVFields(c.dsn)
+	host, port, dbname := kv["host"], kv["port"], kv["dbname"]
 	if host == "" {
 		return "unparsed"
 	}

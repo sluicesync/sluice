@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"sluicesync.dev/sluice/internal/diagnose"
+	"sluicesync.dev/sluice/internal/engines/postgres"
 )
 
 // pgConfig is the engine-local mirror of the vanilla postgres
@@ -53,23 +54,25 @@ func parseURIDSN(dsn string) (*pgConfig, error) {
 	return &pgConfig{dsn: u.String(), schema: schema}, nil
 }
 
+// parseKVDSN reads sluice's `schema` setting out of a libpq key/value
+// connection string and hands the driver the rest of it VERBATIM.
+//
+// This was its own whitespace-splitting copy of the postgres engine's
+// parser, and it carried that parser's defect with it (audit
+// A0915-VF2-PGDSN-1): a token living INSIDE a quoted value was
+// recognised as a `schema=` setting and deleted from the string handed
+// to pgx, so `password='s schema=x' dbname=real` reached the driver as
+// `password='s dbname=real` — a truncated credential. Seven call sites
+// in this package reach it through [parseDSNCompat].
+//
+// It now delegates, for the reason [Engine.SourceIdentity] already
+// delegates: two copies that disagree about a schema make a
+// `migrate --resume` across the two drivers against ONE database refuse,
+// and no test exercising either engine alone would notice.
 func parseKVDSN(dsn string) (*pgConfig, error) {
-	schema := ""
-	keepers := []string{}
-	for _, tok := range strings.Fields(dsn) {
-		k, v, ok := strings.Cut(tok, "=")
-		if !ok {
-			keepers = append(keepers, tok)
-			continue
-		}
-		if strings.EqualFold(k, "schema") {
-			schema = v
-			continue
-		}
-		keepers = append(keepers, tok)
-	}
+	schema, rest := postgres.SplitSchemaFromKVDSN(dsn)
 	if schema == "" {
 		schema = "public"
 	}
-	return &pgConfig{dsn: strings.Join(keepers, " "), schema: schema}, nil
+	return &pgConfig{dsn: rest, schema: schema}, nil
 }

@@ -110,12 +110,18 @@ func withApplicationName(dsn string, role connRole, id string) string {
 		return u.String()
 	}
 
-	// libpq KV form. Scan for an existing application_name token; leave
-	// it untouched if present.
-	for _, tok := range strings.Fields(dsn) {
-		if k, _, ok := strings.Cut(tok, "="); ok && strings.EqualFold(k, "application_name") {
-			return dsn // operator-supplied; don't clobber
-		}
+	// libpq KV form. Read an existing application_name through the one
+	// conninfo grammar (conninfo.go); leave the DSN untouched if present.
+	//
+	// This scan used to be `strings.Fields` + `strings.Cut`, which is the
+	// READING arm of audit A0915-VF2-PGDSN-1: a quoted value that happens
+	// to contain ` application_name=` — a password, say — yields a token
+	// that looks like the setting, so sluice concluded the operator had
+	// supplied one and declined to stamp its own. Wrong in the harmless
+	// direction (a missing label on a connection, not a broken one), but
+	// wrong for exactly the reason the rewriters were.
+	if parseKVFields(dsn)["application_name"] != "" {
+		return dsn // operator-supplied; don't clobber
 	}
 	// pgx/libpq KV values with embedded `/` don't need quoting, so the
 	// bare append is safe for our slash-separated value.

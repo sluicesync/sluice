@@ -86,29 +86,26 @@ func parseURIDSN(dsn string) (*pgConfig, error) {
 	return &pgConfig{dsn: u.String(), schema: schema}, nil
 }
 
+// parseKVDSN reads sluice's `schema` setting out of a libpq key/value
+// connection string and hands the driver the rest of it VERBATIM.
+//
+// The old comment here said quoted values "are not supported in this
+// first cut (pgx does support them, so connections still work)". The
+// second half was false, and that is audit A0915-VF2-PGDSN-1: the split
+// was `strings.Fields` and the result was re-joined, so a token living
+// INSIDE a quoted value was recognised as a `schema=` setting and
+// DELETED from the string handed to pgx. `password='s schema=x'
+// dbname=real` reached the driver as `password='s dbname=real` — a
+// truncated credential, not a working connection. Both halves now go
+// through the one conninfo grammar (conninfo.go); nothing is re-rendered,
+// so every byte the operator wrote that is not the `schema` setting
+// arrives unchanged.
 func parseKVDSN(dsn string) (*pgConfig, error) {
-	// libpq-style KV pairs separated by whitespace. We do a simple
-	// tokenize; quoted values with embedded spaces are not supported in
-	// this first cut (pgx does support them, so connections still work
-	// — we just don't pull `schema` out of quoted values).
-	schema := ""
-	keepers := []string{}
-	for _, tok := range strings.Fields(dsn) {
-		k, v, ok := strings.Cut(tok, "=")
-		if !ok {
-			keepers = append(keepers, tok)
-			continue
-		}
-		if strings.EqualFold(k, "schema") {
-			schema = v
-			continue // strip
-		}
-		keepers = append(keepers, tok)
-	}
+	schema := parseKVFields(dsn)["schema"]
 	if schema == "" {
 		schema = defaultSchema
 	}
-	return &pgConfig{dsn: strings.Join(keepers, " "), schema: schema}, nil
+	return &pgConfig{dsn: stripSettings(dsn, "schema"), schema: schema}, nil
 }
 
 // OpenPgxDB opens a lazy *sql.DB against the Postgres server named by

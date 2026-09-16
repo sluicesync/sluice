@@ -86,60 +86,16 @@ func (Engine) SourceIdentity(dsn string) ir.SourceIdentity {
 // with no `=`) stops the walk and keeps what was parsed: this is an
 // identity extractor, not a validator — the connection path refuses a
 // DSN the driver cannot read, with the driver's message.
+// The walk itself lives in conninfo.go, because the REWRITERS need the
+// same grammar and a second copy of it is how A0915-VF2-PGDSN-1 happened:
+// this reader was fixed for the identity depth (A0915-VF2-F3) while every
+// rewriter kept splitting on whitespace. Last occurrence wins, which the
+// map assignment gives for free since parseConnInfo returns settings in
+// source order.
 func parseKVFields(dsn string) map[string]string {
 	out := map[string]string{}
-	i, n := 0, len(dsn)
-	skipSpace := func() {
-		for i < n && isConnInfoSpace(dsn[i]) {
-			i++
-		}
-	}
-	for i < n {
-		skipSpace()
-		if i >= n {
-			break
-		}
-		start := i
-		for i < n && !isConnInfoSpace(dsn[i]) && dsn[i] != '=' {
-			i++
-		}
-		key := dsn[start:i]
-		skipSpace()
-		if i >= n || dsn[i] != '=' {
-			break
-		}
-		i++
-		skipSpace()
-		var val strings.Builder
-		if i < n && dsn[i] == '\'' {
-			i++
-			for i < n {
-				if dsn[i] == '\\' && i+1 < n {
-					val.WriteByte(dsn[i+1])
-					i += 2
-					continue
-				}
-				if dsn[i] == '\'' {
-					i++
-					break
-				}
-				val.WriteByte(dsn[i])
-				i++
-			}
-		} else {
-			for i < n && !isConnInfoSpace(dsn[i]) {
-				if dsn[i] == '\\' && i+1 < n {
-					val.WriteByte(dsn[i+1])
-					i += 2
-					continue
-				}
-				val.WriteByte(dsn[i])
-				i++
-			}
-		}
-		if key != "" {
-			out[strings.ToLower(key)] = val.String()
-		}
+	for _, s := range parseConnInfo(dsn) {
+		out[s.Key] = s.Value
 	}
 	return out
 }

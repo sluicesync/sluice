@@ -2758,16 +2758,17 @@ func withReplicationParam(dsn string) (string, error) {
 		return u.String(), nil
 	}
 	// libpq KV form: same strip-schema dance, then append replication.
-	out := []string{}
-	for _, tok := range strings.Fields(dsn) {
-		if strings.HasPrefix(strings.ToLower(tok), "schema=") {
-			continue
-		}
-		if strings.HasPrefix(strings.ToLower(tok), "replication=") {
-			continue
-		}
-		out = append(out, tok)
+	//
+	// This used to match by PREFIX on a whitespace-split token, which is
+	// audit A0915-VF2-PGDSN-1 in a second idiom: `password='s schema=x'`
+	// is ONE password setting, and the prefix test recognised its inner
+	// run as a `schema=` token and dropped it from the string handed to
+	// the driver. On this path that is a corrupted credential on the
+	// REPLICATION connection. The strip now goes through the one conninfo
+	// grammar (conninfo.go) and re-renders nothing.
+	rest := stripSettings(dsn, "schema", "replication")
+	if rest == "" {
+		return "replication=database", nil
 	}
-	out = append(out, "replication=database")
-	return strings.Join(out, " "), nil
+	return rest + " replication=database", nil
 }
