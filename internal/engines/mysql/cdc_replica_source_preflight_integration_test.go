@@ -36,6 +36,7 @@ import (
 	"log"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -149,14 +150,49 @@ func wantCodedRefusal(t *testing.T, err error, code sluicecode.Code, site string
 }
 
 // captureInfoLog routes the default slog handler into a buffer at INFO
-// for the duration of fn. The callers are not parallel.
+// for the duration of fn and returns what was written.
+//
+// The writer is mutex-guarded, and that is load-bearing rather than
+// defensive tidiness. This comment used to say "the callers are not
+// parallel" — true, and irrelevant: `slog.SetDefault` installs a
+// PROCESS-WIDE logger, so every live goroutine writes through it, not
+// just the caller. CI's `-race` shard caught the consequence on run
+// 35043003665: a go-mysql `BinlogSyncer` started by an EARLIER subtest
+// was still emitting INFO from `handleEventAndACK` while this helper
+// read `buf.String()` for a later one. A syncer keeps logging after
+// `Close()` returns, and a test cannot join a goroutine it does not
+// own — so guarding the buffer is the only fix available here, and it
+// holds for any stray logger rather than for the one we happened to
+// find. The class (a capture-the-default-logger helper over an
+// unguarded buffer, in a package that starts goroutines) is filed as
+// A0915-LOGCAPTURE-1; it is NOT swept repo-wide here, because ~90 test
+// files share the shape and most are never at risk.
 func captureInfoLog(fn func()) string {
-	var buf bytes.Buffer
+	buf := &lockedBuffer{}
 	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	slog.SetDefault(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
 	defer slog.SetDefault(prev)
 	fn()
 	return buf.String()
+}
+
+// lockedBuffer serialises writes against reads so a logger still running
+// in another goroutine cannot race the reader. See captureInfoLog.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 // TestCDCReader_ReplicaSourcePreflight is the G5 door pin on a real
