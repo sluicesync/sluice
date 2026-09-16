@@ -14,9 +14,19 @@
 // "from now" and the restore was short by every post-full row — 100 of 100
 // in the v0.153.1 regression cycle, the exact shape asserted here.
 //
-// D1 has no live access in this release: the d1-trigger engine runs the
-// SAME openBackupSnapshot through the backend seam, pinned against the D1
-// mock in internal/engines/sqlite-trigger/backup_snapshot_test.go.
+// The d1-trigger engine runs the SAME openBackupSnapshot through the backend
+// seam. It was pinned only against the D1 mock when this file was written
+// ("derived-not-verified", audit A0915-D1VERIFY-DEFERRED); it is now ALSO
+// pinned on LIVE Cloudflare D1 by the twin in
+// backup_trigger_chain_d1_verify_test.go (tags: d1verify && integration),
+// measured 2026-09-16.
+//
+// One difference that twin documents and this file cannot show: `d1-trigger`
+// registers under its own name but shares the trigger-CDC family codec, whose
+// WriteEngine is `sqlite-trigger` and whose Accept list covers both. So a D1
+// full records a `sqlite-trigger`-tagged anchor and that is correct, not
+// foreign — unlike the pgtrigger case below, where a genuinely foreign
+// pgoutput position was what the poller refused.
 
 package pipeline
 
