@@ -4,11 +4,11 @@
 package pipeline
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"os"
-	"regexp"
-	"strconv"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -17,163 +17,192 @@ import (
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
-// The DSN forms the identity is derived from. One cell per form
-// [redactedHost] accepts, because a form this extractor does not read
-// renders every such source as the same identity — which is the silent
-// direction.
-func TestRenderSourceIdentity_DSNForms(t *testing.T) {
+// identityEngine is a stubEngine that DOES describe its identity — the
+// shape every registered engine has since audit 2026-09-15 F-1. The
+// bare stubEngine, which does not, is the other half of the dispatch and
+// is exercised beside it.
+type identityEngine struct {
+	stubEngine
+
+	name string
+	id   ir.SourceIdentity
+}
+
+func (e identityEngine) Name() string { return e.name }
+
+func (e identityEngine) SourceIdentity(string) ir.SourceIdentity { return e.id }
+
+// identityOf is the test's shorthand for an identity string built the
+// way the production renderer builds one. It calls the REAL framing
+// function, so there is no test-local duplicate to drift (the previous
+// spelling of this file carried one, because the renderer took a DSN and
+// a hostile name could not be fed through a URL parser intact).
+func identityOf(engine, database, schema string) string {
+	return renderSourceIdentityFields(engine, ir.SourceIdentity{Database: database, Schema: schema})
+}
+
+// The DISPATCH: the orchestrator asks the ENGINE, and reports honestly
+// when the engine's answer carries no discriminator.
+//
+// This replaces a matrix over DSN shapes the pipeline used to parse
+// itself. That matrix could only ever grade the shapes someone had
+// remembered to add — and the finding was precisely the shapes nobody
+// had (SQLite files, D1 databases, flat files, mydumper dumps, and the
+// `user:pw@/db` MySQL spelling all rendered ONE identity). The per-DSN
+// grading now lives against REAL engines, in
+// docsync.TestSourceIdentityIsInjectiveThroughRealDSNs.
+func TestRenderSourceIdentity_AsksTheEngine(t *testing.T) {
 	t.Parallel()
 
-	cases := []struct {
-		name         string
-		engine, dsn  string
-		wantDatabase string
-		wantSchema   string
-	}{
-		{
-			name: "postgres URI", engine: "postgres",
-			dsn:          "postgres://u:p@host:5432/src_db?sslmode=disable",
-			wantDatabase: "src_db", wantSchema: "public",
-		},
-		{
-			name: "postgres URI with explicit schema", engine: "postgres",
-			dsn:          "postgres://u:p@host:5432/src_db?schema=tenant_a&sslmode=disable",
-			wantDatabase: "src_db", wantSchema: "tenant_a",
-		},
-		{
-			name: "postgresql:// alias", engine: "postgres",
-			dsn:          "postgresql://u:p@host/src_db",
-			wantDatabase: "src_db", wantSchema: "public",
-		},
-		{
-			name: "libpq KV", engine: "postgres",
-			dsn:          "host=localhost port=5432 user=u password=p dbname=src_db",
-			wantDatabase: "src_db", wantSchema: "public",
-		},
-		{
-			name: "libpq KV with schema", engine: "postgres",
-			dsn:          "host=localhost dbname=src_db schema=tenant_b",
-			wantDatabase: "src_db", wantSchema: "tenant_b",
-		},
-		{
-			// A password containing '@' must not make this look like a
-			// MySQL DSN — the protocol section is the tell, not the '@'.
-			name: "libpq KV whose password contains an at-sign", engine: "postgres",
-			dsn:          "host=localhost password=a@b dbname=src_db",
-			wantDatabase: "src_db", wantSchema: "public",
-		},
-		{
-			name: "mysql tcp", engine: "mysql",
-			dsn:          "root:pw@tcp(localhost:3306)/src_db?parseTime=true",
-			wantDatabase: "src_db", wantSchema: "",
-		},
-		{
-			name: "mysql unix socket", engine: "mysql",
-			dsn:          "root:pw@unix(/var/run/mysqld/mysqld.sock)/src_db",
-			wantDatabase: "src_db", wantSchema: "",
-		},
-		{
-			// Underivable is a legitimate value, not a failure: it must
-			// render and compare like any other.
-			name: "postgres URI naming no database", engine: "postgres",
-			dsn:          "postgres://u:p@host:5432/",
-			wantDatabase: "", wantSchema: "public",
-		},
-	}
+	t.Run("an engine that describes its identity", func(t *testing.T) {
+		t.Parallel()
+		e := identityEngine{name: "postgres", id: ir.SourceIdentity{Database: "src_db", Schema: "tenant_a"}}
+		got, discriminating := renderSourceIdentity(e, "postgres://u:p@host/src_db?schema=tenant_a")
+		if want := identityOf("postgres", "src_db", "tenant_a"); got != want {
+			t.Errorf("identity = %q; want %q", got, want)
+		}
+		if !discriminating {
+			t.Error("an identity naming a database reported as UNDISCRIMINATED; the door would warn on every run")
+		}
+	})
 
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			t.Parallel()
-			if got := sourceDSNDatabase(c.dsn); got != c.wantDatabase {
-				t.Errorf("sourceDSNDatabase(%q) = %q; want %q", c.dsn, got, c.wantDatabase)
-			}
-			if got := sourceDSNSchema(c.dsn); got != c.wantSchema {
-				t.Errorf("sourceDSNSchema(%q) = %q; want %q", c.dsn, got, c.wantSchema)
-			}
-			want := `engine="` + c.engine + `";database="` + c.wantDatabase + `";schema="` + c.wantSchema + `"`
-			if got := renderSourceIdentity(c.engine, c.dsn); got != want {
-				t.Errorf("renderSourceIdentity = %q; want %q", got, want)
-			}
-		})
-	}
+	t.Run("an engine that describes a dataset but no namespace", func(t *testing.T) {
+		t.Parallel()
+		e := identityEngine{name: "sqlite", id: ir.SourceIdentity{Database: "app.db"}}
+		got, discriminating := renderSourceIdentity(e, "./app.db")
+		if want := identityOf("sqlite", "app.db", ""); got != want {
+			t.Errorf("identity = %q; want %q", got, want)
+		}
+		if !discriminating {
+			t.Error("a flat-namespace engine naming a file reported as UNDISCRIMINATED")
+		}
+	})
+
+	t.Run("an engine that implements nothing", func(t *testing.T) {
+		t.Parallel()
+		// The fallback is deliberately NOT a DSN guess: the identity
+		// carries the engine name and says so.
+		got, discriminating := renderSourceIdentity(stubEngine{}, "postgres://u:p@host/src_db")
+		if want := identityOf("stub", "", ""); got != want {
+			t.Errorf("identity = %q; want %q — the pipeline must not parse a DSN it was never taught", got, want)
+		}
+		if discriminating {
+			t.Error(
+				"an engine-name-only identity reported as discriminating; the door would then read the " +
+					"absence of a refusal as proof that the source matched", //nolint:gocritic // one message, one line
+			)
+		}
+	})
+
+	t.Run("a describer that cannot parse this DSN", func(t *testing.T) {
+		t.Parallel()
+		e := identityEngine{name: "sqlite", id: ir.SourceIdentity{}}
+		got, discriminating := renderSourceIdentity(e, "")
+		if want := identityOf("sqlite", "", ""); got != want {
+			t.Errorf("identity = %q; want %q", got, want)
+		}
+		if discriminating {
+			t.Error("a zero-value engine answer reported as discriminating")
+		}
+	})
 }
 
 // The comparison matrix. Each axis of the identity must discriminate on
 // its own, and the HOST must not discriminate at all — that last cell is
-// the one the mutation run breaks in the second direction.
+// the one the mutation run breaks in the second direction. The cells are
+// built from identity FIELDS now, because the DSN→fields half belongs to
+// the engines and is graded there.
 func TestRefuseForeignSourceOnResume_Matrix(t *testing.T) {
 	t.Parallel()
-
-	const pgSrc = "postgres://u:p@host-a:5432/src_db"
 
 	cases := []struct {
 		name           string
 		recorded, live string
+		discriminating bool
 		wantRefusal    bool
 		wantInMessage  []string
 	}{
 		{
-			name:     "identical source resumes",
-			recorded: renderSourceIdentity("postgres", pgSrc),
-			live:     renderSourceIdentity("postgres", pgSrc),
+			name:           "identical source resumes",
+			recorded:       identityOf("postgres", "src_db", "public"),
+			live:           identityOf("postgres", "src_db", "public"),
+			discriminating: true,
 		},
 		{
-			name:        "engine matches, DATABASE differs",
-			recorded:    renderSourceIdentity("postgres", "postgres://u:p@host-a:5432/db_one"),
-			live:        renderSourceIdentity("postgres", "postgres://u:p@host-a:5432/db_two"),
-			wantRefusal: true,
+			name:           "engine matches, DATABASE differs",
+			recorded:       identityOf("postgres", "db_one", "public"),
+			live:           identityOf("postgres", "db_two", "public"),
+			discriminating: true,
+			wantRefusal:    true,
 			// This is the auto-derived-id collision (Scenario D): one host,
 			// two databases, no typed --migration-id anywhere.
 			wantInMessage: []string{"db_one", "db_two", "DIFFERENT source"},
 		},
 		{
-			name:          "database matches, ENGINE differs",
-			recorded:      renderSourceIdentity("postgres", "postgres://u:p@host-a:5432/src_db"),
-			live:          renderSourceIdentity("mysql", "root:pw@tcp(host-a:3306)/src_db"),
+			name:           "database matches, ENGINE differs",
+			recorded:       identityOf("postgres", "src_db", "public"),
+			live:           identityOf("mysql", "src_db", ""),
+			discriminating: true,
+			wantRefusal:    true,
+			wantInMessage:  []string{"postgres", "mysql"},
+		},
+		{
+			name:           "engine and database match, SCHEMA differs",
+			recorded:       identityOf("postgres", "src_db", "tenant_a"),
+			live:           identityOf("postgres", "src_db", "tenant_b"),
+			discriminating: true,
+			wantRefusal:    true,
+			wantInMessage:  []string{"tenant_a", "tenant_b"},
+		},
+		{
+			// A SQLite source: two files, no host anywhere. Before F-1 the
+			// orchestrator rendered ONE identity for every SQLite source and
+			// this resume was silently admitted.
+			name:           "two SQLite FILES are two sources",
+			recorded:       identityOf("sqlite", "one.db", ""),
+			live:           identityOf("sqlite", "two.db", ""),
+			discriminating: true,
+			wantRefusal:    true,
+			wantInMessage:  []string{"one.db", "two.db"},
+		},
+		{
+			// THE DNS-MOVE CELL, at the level the door now sees it: the
+			// host never enters the identity, so a run against a renamed
+			// host, a failover, or a replica renders the SAME string.
+			// ADR-0015 requires that resume to proceed.
+			name:           "the host is absent from the identity, so a DNS move still resumes",
+			recorded:       identityOf("postgres", "src_db", "public"),
+			live:           identityOf("postgres", "src_db", "public"),
+			discriminating: true,
+		},
+		{
+			// An engine whose DSN names no dataset. It still compares (the
+			// engine half is real evidence) but it warns first — pinned by
+			// TestRefuseForeignSourceOnResume_WarnsWhenUndiscriminated.
+			name:     "undiscriminated identity that MATCHES proceeds",
+			recorded: identityOf("stub", "", ""),
+			live:     identityOf("stub", "", ""),
+		},
+		{
+			name:          "undiscriminated identity still refuses a different ENGINE",
+			recorded:      identityOf("postgres", "", ""),
+			live:          identityOf("mysql", "", ""),
 			wantRefusal:   true,
 			wantInMessage: []string{"postgres", "mysql"},
-		},
-		{
-			name:          "engine and database match, SCHEMA differs",
-			recorded:      renderSourceIdentity("postgres", "postgres://u:p@host-a:5432/src_db?schema=tenant_a"),
-			live:          renderSourceIdentity("postgres", "postgres://u:p@host-a:5432/src_db?schema=tenant_b"),
-			wantRefusal:   true,
-			wantInMessage: []string{"tenant_a", "tenant_b"},
-		},
-		{
-			// Two spellings of ONE source. Refusing here would be a false
-			// refusal on a legitimate resume, which is why the extractor
-			// mirrors the engine's own "public" default.
-			name:     "explicit schema=public equals an absent schema parameter",
-			recorded: renderSourceIdentity("postgres", "postgres://u:p@host-a:5432/src_db?schema=public"),
-			live:     renderSourceIdentity("postgres", "postgres://u:p@host-a:5432/src_db"),
-		},
-		{
-			// THE DNS-MOVE CELL. ADR-0015 makes --migration-id the
-			// operator's assertion of a stable identity across DNS shifts
-			// and host renames, so this must resume. A comparison that
-			// included the host would refuse it.
-			name:     "same engine and database under a different host alias",
-			recorded: renderSourceIdentity("postgres", "postgres://u:p@localhost:5432/src_db"),
-			live:     renderSourceIdentity("postgres", "postgres://u:p@127.0.0.1:5432/src_db"),
-		},
-		{
-			name:     "same database reached on a different PORT (failover)",
-			recorded: renderSourceIdentity("postgres", "postgres://u:p@host-a:5432/src_db"),
-			live:     renderSourceIdentity("postgres", "postgres://u:p@host-a:6432/src_db"),
 		},
 		{
 			// A state row written before the column existed. WARNs and
 			// proceeds; refusing would strand every in-flight migration on
 			// upgrade.
-			name:     "legacy state carries no recorded identity",
-			recorded: "",
-			live:     renderSourceIdentity("postgres", pgSrc),
+			name:           "legacy state carries no recorded identity",
+			recorded:       "",
+			live:           identityOf("postgres", "src_db", "public"),
+			discriminating: true,
 		},
 		{
 			// The zero-value caller (sync recording context, tests).
 			name:     "caller supplies no live identity",
-			recorded: renderSourceIdentity("postgres", pgSrc),
+			recorded: identityOf("postgres", "src_db", "public"),
 			live:     "",
 		},
 	}
@@ -181,7 +210,7 @@ func TestRefuseForeignSourceOnResume_Matrix(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
-			err := refuseForeignSourceOnResume(context.Background(), "mig-1", c.recorded, c.live)
+			err := refuseForeignSourceOnResume(context.Background(), "mig-1", c.recorded, c.live, c.discriminating)
 			if !c.wantRefusal {
 				if err != nil {
 					t.Fatalf("refused a resume that must proceed: %v", err)
@@ -212,39 +241,88 @@ func TestRefuseForeignSourceOnResume_Matrix(t *testing.T) {
 	}
 }
 
+// The absence of a refusal must never be readable as proof. When the
+// live identity carries no dataset, the door says so with a grep-stable
+// marker — otherwise an operator sees a clean resume and concludes the
+// source was checked, when all that was checked is the engine name.
+//
+// Not parallel: it installs a default slog handler.
+func TestRefuseForeignSourceOnResume_WarnsWhenUndiscriminated(t *testing.T) {
+	capture := func(t *testing.T, recorded, live string, discriminating bool) string {
+		t.Helper()
+		var buf bytes.Buffer
+		prev := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		t.Cleanup(func() { slog.SetDefault(prev) })
+		_ = refuseForeignSourceOnResume(context.Background(), "mig-1", recorded, live, discriminating)
+		return buf.String()
+	}
+
+	undiscriminated := identityOf("stub", "", "")
+	if got := capture(t, undiscriminated, undiscriminated, false); !strings.Contains(got, sourceIdentityUndiscriminatedMarker) {
+		t.Errorf("a matching but UNDISCRIMINATED resume logged no %s warning, so an operator reads the clean "+
+			"run as proof the source matched. Got:\n%s", sourceIdentityUndiscriminatedMarker, got)
+	}
+
+	// A real discriminator must NOT drag the warning along, or the marker
+	// stops meaning anything and operators learn to ignore it.
+	full := identityOf("postgres", "src_db", "public")
+	if got := capture(t, full, full, true); strings.Contains(got, sourceIdentityUndiscriminatedMarker) {
+		t.Errorf("an identity naming a database warned %s anyway:\n%s", sourceIdentityUndiscriminatedMarker, got)
+	}
+
+	// And the legacy-state marker still fires on its own axis.
+	if got := capture(t, "", full, true); !strings.Contains(got, sourceIdentityUnrecordedMarker) {
+		t.Errorf("legacy state logged no %s warning:\n%s", sourceIdentityUnrecordedMarker, got)
+	}
+}
+
 // The encoding is a codec: it is persisted and read back, so it owes the
 // codec treatment. Two properties, both adversarial.
 //
-//   - INJECTIVE: a database name carrying the separator or the key
-//     syntax must not alias a different triple. A naive
+//   - INJECTIVE: a database or schema name carrying the separator or the
+//     key syntax must not alias a different triple. A naive
 //     `engine=x;database=y` concatenation fails exactly here.
 //   - STORABLE: the rendered value must be valid, NUL-free UTF-8 on
 //     every input, because PostgreSQL refuses an invalid byte sequence
 //     in a TEXT column (SQLSTATE 22021) and MySQL in strict mode refuses
 //     it with Error 1366 — which is how the neighbouring last_error
 //     column silently lost its writes.
+//
+// SCOPE, stated so the name is not read as broader than the truth: this
+// grades the FRAMING — fields in, string out. That two different DSNs
+// produce two different FIELDS is the engines' half, and it is graded
+// against real engines by docsync.TestSourceIdentityIsInjectiveThroughRealDSNs.
+// Both halves are needed: an injective framing over a colliding
+// extractor is exactly the vacuous door audit 2026-09-15 F-1 found.
 func TestRenderSourceIdentity_InjectiveAndStorable(t *testing.T) {
 	t.Parallel()
 
 	hostile := []struct {
-		name             string
-		engine, database string
+		name                     string
+		engine, database, schema string
 	}{
-		{"plain", "postgres", "src_db"},
-		{"database containing the field separator", "postgres", `a;database=b`},
-		{"database containing an equals sign", "postgres", "a=b"},
-		{"database containing a double quote", "postgres", `a"b`},
-		{"database containing a backslash", "postgres", `a\b`},
-		{"database containing a newline", "postgres", "a\nb"},
-		{"database containing a NUL", "postgres", "a\x00b"},
-		{"database that is invalid UTF-8", "postgres", "a\xffb"},
-		{"database with multi-byte runes", "postgres", "数据库"},
-		{"engine containing the separator", `a;database=b`, "src_db"},
+		{"plain", "postgres", "src_db", "public"},
+		{"database containing the field separator", "postgres", `a;database=b`, "public"},
+		{"database containing an equals sign", "postgres", "a=b", "public"},
+		{"database containing a double quote", "postgres", `a"b`, "public"},
+		{"database containing a backslash", "postgres", `a\b`, "public"},
+		{"database containing a newline", "postgres", "a\nb", "public"},
+		{"database containing a NUL", "postgres", "a\x00b", "public"},
+		{"database that is invalid UTF-8", "postgres", "a\xffb", "public"},
+		{"database with multi-byte runes", "postgres", "数据库", "public"},
+		{"engine containing the separator", `a;database=b`, "src_db", "public"},
+		{"schema containing the separator", "postgres", "src_db", `a;schema=b`},
+		{"schema that is invalid UTF-8", "postgres", "src_db", "s\xffb"},
+		{"the field-shifting pair", "postgres", `a";schema="b`, "public"},
+		// A file path is a legitimate database value for the file engines,
+		// and a Windows one carries backslashes.
+		{"a Windows file path", "sqlite", `C:\data\app.db`, ""},
 	}
 
 	seen := map[string]string{}
 	for _, h := range hostile {
-		got := renderSourceIdentity(h.engine, "postgres://u@host/"+h.database)
+		got := renderSourceIdentityFields(h.engine, ir.SourceIdentity{Database: h.database, Schema: h.schema})
 		// Storable on both engines.
 		if !utf8.ValidString(got) {
 			t.Errorf("%s: rendered identity is not valid UTF-8: %q", h.name, got)
@@ -252,77 +330,18 @@ func TestRenderSourceIdentity_InjectiveAndStorable(t *testing.T) {
 		if strings.ContainsRune(got, 0) {
 			t.Errorf("%s: rendered identity carries a NUL byte: %q", h.name, got)
 		}
-		// Injective: render the triple DIRECTLY (not via a DSN, so the
-		// URL parser cannot normalise the hostile bytes away) and require
-		// distinct triples to produce distinct strings.
-		direct := renderSourceIdentityFields(h.engine, h.database, "public")
-		if prev, dup := seen[direct]; dup {
+		// Injective: distinct triples must produce distinct strings.
+		if prev, dup := seen[got]; dup {
 			t.Errorf("%s: renders identically to %s — the encoding is NOT injective, so two different "+
-				"sources compare equal and a foreign resume is admitted: %q", h.name, prev, direct)
+				"sources compare equal and a foreign resume is admitted: %q", h.name, prev, got)
 		}
-		seen[direct] = h.name
-		if !utf8.ValidString(direct) || strings.ContainsRune(direct, 0) {
-			t.Errorf("%s: direct render is unstorable: %q", h.name, direct)
-		}
+		seen[got] = h.name
 	}
 
 	// Anti-vacuity: the hostile set must actually have exercised the
 	// aliasing shape, not just a list of tame names.
 	if len(seen) != len(hostile) {
 		t.Fatalf("collapsed %d hostile names into %d renderings", len(hostile), len(seen))
-	}
-}
-
-// renderSourceIdentityFields is the test's own spelling of the field
-// rendering, used to feed bytes a DSN parser would otherwise normalise.
-// It must stay byte-identical to [renderSourceIdentity]'s framing; the
-// cell below pins that against drift.
-func renderSourceIdentityFields(engine, database, schema string) string {
-	return "engine=" + strconv.Quote(engine) +
-		";database=" + strconv.Quote(database) +
-		";schema=" + strconv.Quote(schema)
-}
-
-func TestRenderSourceIdentityFieldsMatchesTheRealRenderer(t *testing.T) {
-	t.Parallel()
-	const dsn = "postgres://u:p@host:5432/src_db?schema=tenant_a"
-	want := renderSourceIdentity("postgres", dsn)
-	got := renderSourceIdentityFields("postgres", "src_db", "tenant_a")
-	if got != want {
-		t.Fatalf("the test helper has drifted from the renderer:\n  helper:   %s\n  renderer: %s", got, want)
-	}
-}
-
-// The `schema` default is a MIRROR of the Postgres engine's own DSN
-// parser, and the pipeline cannot import an engine to check it
-// (internal/archgate). Drift would make `?schema=public` and an absent
-// parameter render different identities and refuse a legitimate resume,
-// silently and only for Postgres sources — so the premise gets a gate
-// rather than a comment (the premise-naming rule).
-func TestSourceIdentitySchemaDefaultMatchesTheEngine(t *testing.T) {
-	t.Parallel()
-
-	const path = "../engines/postgres/connect.go"
-	src, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read %s: %v", path, err)
-	}
-	re := regexp.MustCompile(`schema\s*=\s*"([a-z_]+)"`)
-	matches := re.FindAllSubmatch(src, -1)
-	// Anti-vacuity: BOTH DSN forms apply the default (parseURIDSN and
-	// parseKVDSN). Fewer means the regex or the parser shape changed and
-	// this gate has stopped looking at something.
-	if len(matches) < 2 {
-		t.Fatalf("%s: found %d schema defaults, expected at least 2 (parseURIDSN + parseKVDSN). "+
-			"Re-point this gate rather than deleting it: pgDefaultSchema is only correct because it "+
-			"matches the engine's own default.", path, len(matches))
-	}
-	for _, m := range matches {
-		if got := string(m[1]); got != pgDefaultSchema {
-			t.Errorf("%s defaults the source schema to %q but pgDefaultSchema is %q — two spellings of one "+
-				"source would render different identities and a legitimate --resume would be refused",
-				path, got, pgDefaultSchema)
-		}
 	}
 }
 
@@ -411,8 +430,8 @@ func TestSourceIdentityColumnDeclaredOnBothEngines(t *testing.T) {
 func TestLoadOrInitState_RefusesForeignSource(t *testing.T) {
 	t.Parallel()
 
-	recorded := renderSourceIdentity("postgres", "postgres://u@host/db_one")
-	live := renderSourceIdentity("postgres", "postgres://u@host/db_two")
+	recorded := identityOf("postgres", "db_one", "public")
+	live := identityOf("postgres", "db_two", "public")
 
 	for _, phase := range []ir.MigrationPhase{ir.MigrationPhaseComplete, ir.MigrationPhaseBulkCopy} {
 		t.Run(string(phase), func(t *testing.T) {
@@ -421,7 +440,10 @@ func TestLoadOrInitState_RefusesForeignSource(t *testing.T) {
 			store.rows["m1"] = ir.MigrationState{
 				MigrationID: "m1", Phase: phase, SourceIdentity: recorded,
 			}
-			rc := resumeContext{store: store, migrationID: "m1", enabled: true, sourceIdentity: live}
+			rc := resumeContext{
+				store: store, migrationID: "m1", enabled: true,
+				sourceIdentity: live, sourceIdentityDiscriminating: true,
+			}
 
 			_, exitClean, err := loadOrInitState(context.Background(), rc, true /*resume*/, false)
 			if err == nil {
@@ -441,7 +463,10 @@ func TestLoadOrInitState_RefusesForeignSource(t *testing.T) {
 		store.rows["m1"] = ir.MigrationState{
 			MigrationID: "m1", Phase: ir.MigrationPhaseBulkCopy, SourceIdentity: recorded,
 		}
-		rc := resumeContext{store: store, migrationID: "m1", enabled: true, sourceIdentity: recorded}
+		rc := resumeContext{
+			store: store, migrationID: "m1", enabled: true,
+			sourceIdentity: recorded, sourceIdentityDiscriminating: true,
+		}
 		if _, _, err := loadOrInitState(context.Background(), rc, true, false); err != nil {
 			t.Fatalf("refused a resume against the SAME source: %v", err)
 		}
@@ -451,7 +476,10 @@ func TestLoadOrInitState_RefusesForeignSource(t *testing.T) {
 		t.Parallel()
 		store := newFakeStateStore()
 		store.rows["m1"] = ir.MigrationState{MigrationID: "m1", Phase: ir.MigrationPhaseBulkCopy}
-		rc := resumeContext{store: store, migrationID: "m1", enabled: true, sourceIdentity: live}
+		rc := resumeContext{
+			store: store, migrationID: "m1", enabled: true,
+			sourceIdentity: live, sourceIdentityDiscriminating: true,
+		}
 		if _, _, err := loadOrInitState(context.Background(), rc, true, false); err != nil {
 			t.Fatalf("refused a resume of state written before the column existed: %v", err)
 		}
@@ -463,7 +491,10 @@ func TestLoadOrInitState_RefusesForeignSource(t *testing.T) {
 		store.rows["m1"] = ir.MigrationState{
 			MigrationID: "m1", Phase: ir.MigrationPhaseComplete, SourceIdentity: recorded,
 		}
-		rc := resumeContext{store: store, migrationID: "m1", enabled: true, sourceIdentity: live}
+		rc := resumeContext{
+			store: store, migrationID: "m1", enabled: true,
+			sourceIdentity: live, sourceIdentityDiscriminating: true,
+		}
 		// Nothing is adopted: the row is deleted and the copy re-runs in
 		// full, so a differing source is not a mis-attribution.
 		if _, _, err := loadOrInitState(context.Background(), rc, false, true /*resetting*/); err != nil {
@@ -478,9 +509,12 @@ func TestLoadOrInitState_RefusesForeignSource(t *testing.T) {
 func TestLoadOrInitState_FreshRunRecordsSourceIdentity(t *testing.T) {
 	t.Parallel()
 
-	live := renderSourceIdentity("postgres", "postgres://u@host/src_db")
+	live := identityOf("postgres", "src_db", "public")
 	store := newFakeStateStore()
-	rc := resumeContext{store: store, migrationID: "fresh", enabled: true, sourceIdentity: live}
+	rc := resumeContext{
+		store: store, migrationID: "fresh", enabled: true,
+		sourceIdentity: live, sourceIdentityDiscriminating: true,
+	}
 
 	if _, _, err := loadOrInitState(context.Background(), rc, false, false); err != nil {
 		t.Fatalf("loadOrInitState: %v", err)

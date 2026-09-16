@@ -24,9 +24,35 @@
 // The `sync-` aliasing arm of the same class is refused separately, at
 // [Migrator.resolveMigrationID]. This is the general door.
 //
+// # Where the DSN grammar lives, and why it is not here
+//
+// It lives in the ENGINE ([ir.SourceIdentityDescriber]). The first cut
+// of this file parsed DSNs in the orchestrator and knew three shapes —
+// Postgres URI, libpq key/value, and the go-sql-driver `@tcp(`/`@unix(`
+// forms — returning "" for everything else. The damage was not a missing
+// feature but a VACUOUS door, and it was wide (audit 2026-09-15 F-1,
+// measured by the reviewer against byte-identical copies of the shipped
+// functions): two different SQLite files, two different D1 databases,
+// two mydumper dumps, two flat files, and two MySQL DSNs spelled
+// `root:pw@/db` all rendered ONE identity — and the auto-derived id
+// collapsed with them, since [deriveMigrationID] hashes [redactedHost],
+// which is equally "" for those shapes. Both discriminators failed
+// together, so the run adopted the other source's completed copy and
+// exited 0.
+//
+// The migrate-state store lives on the TARGET, so every one of those is
+// a supported resumable configuration: a SQLite, D1, flat-file or
+// mydumper source into a Postgres or MySQL target.
+//
+// Asking the engine is what makes that class closed rather than patched:
+// an engine cannot forget to teach the orchestrator a grammar the
+// orchestrator never learns. The registry-derived roster
+// docsync.TestEverySourceEngineDescribesItsIdentity is the gate, with an
+// EMPTY exemption map.
+//
 // # What identity is, and what it deliberately is NOT
 //
-// Source ENGINE + source DATABASE + source SCHEMA where the engine
+// Source ENGINE + the engine's own dataset + its namespace where it
 // scopes by one. NOT the host, and that exclusion is the load-bearing
 // half rather than an omission: ADR-0015 frames --migration-id as an
 // operator-asserted stable identity across DNS shifts and host renames
@@ -46,10 +72,9 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"net/url"
 	"strconv"
-	"strings"
 
+	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
@@ -59,21 +84,38 @@ import (
 // without identity evidence.
 const sourceIdentityUnrecordedMarker = "RESUME-SOURCE-UNRECORDED"
 
-// pgDefaultSchema mirrors the default the Postgres engine's own DSN
-// parser applies when a DSN carries no `schema` parameter
-// (internal/engines/postgres/connect.go — parseURIDSN and parseKVDSN
-// both fall back to "public").
+// sourceIdentityUndiscriminatedMarker is the grep-stable token for the
+// other way this door can be quiet: the LIVE identity carries no dataset
+// at all, so it discriminates only by engine name and two different
+// sources under that engine compare equal.
 //
-// The pipeline must not import an engine (internal/archgate forbids it),
-// so this is a MIRROR, and a mirror that silently drifts would make two
-// spellings of one source — `?schema=public` and no parameter at all —
-// render different identities and refuse a legitimate resume.
-// TestSourceIdentitySchemaDefaultMatchesTheEngine reads the engine's
-// source file and holds the two together.
-const pgDefaultSchema = "public"
+// It exists so the absence of a refusal is never read as proof. Every
+// registered engine describes its identity (the roster gate holds that),
+// and every engine that does still answers "" for a DSN it cannot parse
+// or one that genuinely names no dataset — so this is reachable, rare,
+// and exactly the state an operator must not mistake for a check that
+// passed.
+const sourceIdentityUndiscriminatedMarker = "RESUME-SOURCE-UNDISCRIMINATED"
 
 // renderSourceIdentity renders the identity of the source a migration
 // reads from, as the value stored in sluice_migrate_state.source_identity.
+//
+// It ASKS THE ENGINE ([ir.SourceIdentityDescriber]) — see the file
+// header for why the grammar is not here. The second return reports
+// whether the answer carries a discriminator beyond the engine name;
+// false means a comparison against it can only distinguish engines, and
+// the door says so out loud.
+func renderSourceIdentity(e ir.Engine, dsn string) (identity string, discriminating bool) {
+	var id ir.SourceIdentity
+	if d, ok := e.(ir.SourceIdentityDescriber); ok {
+		id = d.SourceIdentity(dsn)
+	}
+	return renderSourceIdentityFields(e.Name(), id), id != (ir.SourceIdentity{})
+}
+
+// renderSourceIdentityFields is the FRAMING: it turns an engine name and
+// the engine's own identity fields into the one string that is stored
+// and compared.
 //
 // # The encoding, and why it round-trips
 //
@@ -96,109 +138,26 @@ const pgDefaultSchema = "public"
 // aliases the moment a database is named `a;database=b`; this is the
 // same length-prefix-everything lesson [copyShapeTokenHash] learned.
 //
+// Injectivity of the FRAMING is only half of what the door needs, and
+// the half that was never in doubt: the other half is that two different
+// DSNs produce two different triples, which is the engine's job and is
+// graded against real engines by
+// docsync.TestSourceIdentityIsInjectiveThroughRealDSNs.
+//
 // The value is compared as ONE STRING and never parsed back into
 // fields, so the decode half cannot be got wrong: there is no decoder.
 // The refusal prints the recorded value verbatim, which is what makes
 // that affordable.
-func renderSourceIdentity(engineName, dsn string) string {
+func renderSourceIdentityFields(engineName string, id ir.SourceIdentity) string {
 	return "engine=" + strconv.Quote(engineName) +
-		";database=" + strconv.Quote(sourceDSNDatabase(dsn)) +
-		";schema=" + strconv.Quote(sourceDSNSchema(dsn))
-}
-
-// isPGURIDSN reports whether dsn is the Postgres URI form. Same test
-// [redactedHost] makes, kept identical on purpose: the two functions
-// dispatch over the same DSN forms and a divergence would mean one of
-// them is reading a shape the other does not.
-func isPGURIDSN(dsn string) bool {
-	return strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://")
-}
-
-// isMySQLDSN reports whether dsn is the go-sql-driver MySQL form. The
-// protocol section is the tell, exactly as in [redactedHost]: a bare "@"
-// would misclassify a libpq KV DSN whose PASSWORD contains one.
-func isMySQLDSN(dsn string) bool {
-	return strings.Contains(dsn, "@tcp(") || strings.Contains(dsn, "@unix(")
-}
-
-// sourceDSNDatabase extracts the database name from a DSN, or "" when
-// it cannot be derived. Accepts the same three forms [redactedHost]
-// does — Postgres URI, go-sql-driver MySQL, libpq KV — and is
-// deliberately structured to mirror it, because a form that function
-// reads and this one does not would silently render every such source
-// as the same identity.
-//
-// "" is a legitimate value, not a failure: it means "this DSN does not
-// name a database". It is rendered and compared like any other, so two
-// runs whose database is equally underivable still agree — the check
-// never becomes silently vacuous, it just carries less evidence, and
-// the ENGINE half of the identity still discriminates.
-func sourceDSNDatabase(dsn string) string {
-	if isPGURIDSN(dsn) {
-		u, err := url.Parse(dsn)
-		if err != nil {
-			return ""
-		}
-		return strings.TrimPrefix(u.Path, "/")
-	}
-	if isMySQLDSN(dsn) {
-		// `user:pass@tcp(host:port)/dbname?params` — strip the params,
-		// then take everything after the LAST slash, which is correct for
-		// the unix-socket form too (`@unix(/var/run/mysqld.sock)/dbname`).
-		body := dsn
-		if q := strings.IndexByte(body, '?'); q >= 0 {
-			body = body[:q]
-		}
-		if slash := strings.LastIndexByte(body, '/'); slash >= 0 {
-			return body[slash+1:]
-		}
-		return ""
-	}
-	for _, tok := range strings.Fields(dsn) {
-		if k, v, ok := strings.Cut(tok, "="); ok && strings.EqualFold(k, "dbname") {
-			return v
-		}
-	}
-	return ""
-}
-
-// sourceDSNSchema extracts the source NAMESPACE a schema-scoping engine
-// reads, or "" for an engine with a flat namespace.
-//
-// MySQL is flat — its database IS its namespace, already carried by
-// [sourceDSNDatabase] — so a MySQL DSN contributes "" here rather than
-// duplicating the database into a second field.
-//
-// Postgres scopes by schema and takes it from the DSN's `schema`
-// parameter, defaulting to [pgDefaultSchema]; this mirrors that rule in
-// both DSN forms so `?schema=public` and an absent parameter render the
-// same identity and a resume across the two spellings is not refused.
-func sourceDSNSchema(dsn string) string {
-	if isPGURIDSN(dsn) {
-		u, err := url.Parse(dsn)
-		if err != nil {
-			return pgDefaultSchema
-		}
-		if s := u.Query().Get("schema"); s != "" {
-			return s
-		}
-		return pgDefaultSchema
-	}
-	if isMySQLDSN(dsn) {
-		return ""
-	}
-	for _, tok := range strings.Fields(dsn) {
-		if k, v, ok := strings.Cut(tok, "="); ok && strings.EqualFold(k, "schema") && v != "" {
-			return v
-		}
-	}
-	return pgDefaultSchema
+		";database=" + strconv.Quote(id.Database) +
+		";schema=" + strconv.Quote(id.Schema)
 }
 
 // refuseForeignSourceOnResume is the door: recorded migration state may
 // only be adopted by a run reading from the source that recorded it.
 //
-// Three outcomes, and the two that are not the refusal are the ones
+// Four outcomes, and the three that are not the refusal are the ones
 // worth stating:
 //
 //   - live == "": the CONSTRUCTING caller supplies no identity. Not
@@ -210,6 +169,15 @@ func sourceDSNSchema(dsn string) string {
 //     the unit tests. Spelled as an opt-IN rather than defaulting to
 //     refuse so the zero value is the pre-existing behaviour, per the
 //     v0.99.51 rule.
+//
+//   - discriminating == false: the live identity names no dataset, so it
+//     can only tell engines apart. WARNs and CONTINUES to the comparison
+//     — the engine half is still real evidence, and a mismatch there is
+//     still a refusal worth making. The point of the WARN is that the
+//     absence of a refusal must not be read as proof. Zero-value-safe
+//     per v0.99.51: false is the noisy answer, so a future caller that
+//     sets an identity and forgets this flag gets the warning rather
+//     than silence.
 //
 //   - recorded == "": the state was written by a binary older than the
 //     source_identity column, which the store surfaces as "" (NO
@@ -223,9 +191,21 @@ func sourceDSNSchema(dsn string) string {
 //     resuming run's identity would be recording a guess as evidence and
 //     would silently arm the refusal against whichever source happened
 //     to run second.
-func refuseForeignSourceOnResume(ctx context.Context, migrationID, recorded, live string) error {
+func refuseForeignSourceOnResume(ctx context.Context, migrationID, recorded, live string, discriminating bool) error {
 	if live == "" {
 		return nil
+	}
+	if !discriminating {
+		slog.WarnContext(
+			ctx,
+			"migration: "+sourceIdentityUndiscriminatedMarker+": this source's DSN names no database, file or "+
+				"dataset this engine can report, so the resume's source check can only tell one ENGINE from "+
+				"another — two different sources under this engine would compare equal and this resume would "+
+				"adopt the other one's copy. It is not a refusal because the engine half still holds; confirm "+
+				"the source is the one the recorded copy came from",
+			slog.String("migration_id", migrationID),
+			slog.String("live_source", live),
+		)
 	}
 	if recorded == "" {
 		slog.WarnContext(
@@ -257,8 +237,9 @@ func refuseForeignSourceOnResume(ctx context.Context, migrationID, recorded, liv
 				"\n  live:     %s"+
 				"\nresuming would adopt that copy as this run's own — every table it recorded complete is "+
 				"SKIPPED, so the run would exit 0 having copied nothing from this source"+
-				"\nidentity is the source engine, database and schema and deliberately NOT the host, so a DNS "+
-				"change, a failover, or a replica of the same database still resumes",
+				"\nidentity is the source engine, its database or file, and its schema where the engine has "+
+				"one, and deliberately NOT the host, so a DNS change, a failover, or a replica of the same "+
+				"database still resumes",
 			migrationID, recorded, live,
 		),
 	}

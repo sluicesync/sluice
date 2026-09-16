@@ -257,9 +257,9 @@ import (
 // position as a v0.16.x legacy full and takes the legacy branch. The
 // bump makes every pre-v0.154.0 reader refuse the manifest at its own
 // ceiling instead. Proportional as always: a full that records a
-// position, every incremental, and every trigger-CDC or CDC-less full
-// (positionless BY CONSTRUCTION, and never extended from a recorded
-// position by any binary) keep their feature-minimum version.
+// position, every incremental, and every CDC-less full (no change
+// stream exists that any binary could extend it with) keep their
+// feature-minimum version.
 const BackupFormatVersion = 11
 
 // FormatVersionLegacy / FormatVersionSecurityMetadata name the
@@ -404,14 +404,31 @@ const (
 	// `backup stream`, restore and verify alike — rather than chained.
 	//
 	// Stamped ONLY when the hazard is present, via
-	// [StampPositionlessFull]. Two exemptions, stated: a trigger-CDC
-	// source ([ir.CDCTriggers]) records no position on a full BY
-	// CONSTRUCTION and its chains anchor at the change log's current id
-	// on every binary, so stamping would lock older readers out of every
-	// trigger-engine backup for no protection; and a CDC-less source
-	// ([ir.CDCNone]) has no change stream any binary could extend the
-	// full with, so there is no chain gap to prevent — only restore
-	// compatibility to lose. Both keep their feature-minimum version.
+	// [StampPositionlessFull]. ONE exemption, and it is the only one that
+	// survives its own premise: a CDC-less source ([ir.CDCNone]) has no
+	// change stream any binary could extend the full with, so there is no
+	// chain gap to prevent — only restore compatibility to lose. It keeps
+	// its feature-minimum version.
+	//
+	// A trigger-CDC source ([ir.CDCTriggers]) was exempt in the first cut
+	// of this constant, on the premise that such a full records no
+	// position BY CONSTRUCTION and therefore that stamping would lock
+	// older readers out for no protection. Roadmap item 163 falsified
+	// both halves inside the same release: every trigger engine now takes
+	// its anchor at snapshot start, so a trigger full DOES record a
+	// position (and is not this shape at all), and [resumeStartFromParent]
+	// no longer exempts trigger sources — v0.154.0's own reader refuses a
+	// positionless trigger full. What the exemption then covered was
+	// exactly the FAULT path that still produces one: a trigger
+	// `OpenBackupSnapshot` refusal (missing change log, tampered id
+	// sequence, wedged pre-snapshot transaction) is not fatal, so the run
+	// falls back to the non-snapshot sweep, the trigger capturer answers
+	// [ErrPositionUnavailable] by design, and the full finalizes
+	// positionless — where a pre-v0.154.0 binary would take ITS trigger
+	// exemption and anchor the chain "from now". That is the same silent
+	// gap on the same artifact class, so the exemption is gone (audit
+	// 2026-09-15 F-2, pre-tag value-fidelity review).
+	//
 	// Independent of the encryption/signing/redaction tiers: a
 	// positionless full is stamped 11 whatever else it carries. And a
 	// positionless full at an OLDER recorded version is one a pre-bump
@@ -456,11 +473,12 @@ func StampRedaction(m *Manifest) {
 // has the engine in hand; the manifest records only its name.
 //
 // Idempotent, and a no-op for every shape that is not the hazard: a
-// full that records a position, an incremental (an empty EndPosition
-// there is a quiet or DDL-only window, resolved by walking to the
-// nearest positioned ancestor), a trigger-CDC full (positionless by
-// construction on every binary), and a CDC-less full (no change stream
-// to extend it with). Each keeps its feature-minimum version.
+// full that records a position (which, since roadmap item 163, includes
+// every trigger-CDC full whose snapshot-anchored open succeeded), an
+// incremental (an empty EndPosition there is a quiet or DDL-only window,
+// resolved by walking to the nearest positioned ancestor), and a
+// CDC-less full (no change stream to extend it with). Each keeps its
+// feature-minimum version.
 //
 // MUST be called after EndPosition is final and before [ComputeBackupID]
 // — the id folds on the recorded version (the redaction fold at 10+
@@ -478,6 +496,12 @@ func StampPositionlessFull(m *Manifest, cdc ir.CDCMethod) {
 // position. Exported so a writer can decide BEFORE raising the version
 // whether the raise is safe for what it already sealed (see
 // Backup.stampPositionlessFull in pipeline/backup).
+//
+// [ir.CDCTriggers] is NOT exempt — see the exemption note on
+// [FormatVersionPositionlessFull] for why it stopped being one. A
+// trigger full that recorded its change-log anchor is not this shape and
+// is unaffected; the only trigger fulls this reaches are the fault-path
+// ones the snapshot open refused.
 func IsPositionlessFull(m *Manifest, cdc ir.CDCMethod) bool {
 	if m == nil || canonicalKind(m.Kind) != BackupKindFull {
 		return false
@@ -485,11 +509,9 @@ func IsPositionlessFull(m *Manifest, cdc ir.CDCMethod) bool {
 	if m.EndPosition.Engine != "" || m.EndPosition.Token != "" {
 		return false
 	}
-	switch cdc {
-	case ir.CDCTriggers, ir.CDCNone:
-		return false
-	}
-	return true
+	// The one exemption: no change stream exists to extend this full
+	// with, so there is no chain gap an older reader could open.
+	return cdc != ir.CDCNone
 }
 
 // chooseFormatVersion returns the smallest manifest format version

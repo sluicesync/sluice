@@ -463,6 +463,54 @@ func TestChangeLogConsumerID_CutsOnARuneBoundary(t *testing.T) {
 			}
 		}
 	}
+
+	// The audit 2026-09-15 F-4 cells: a byte that was ALREADY invalid.
+	// The rune-boundary cut alone could never repair one — utf8.RuneStart
+	// is TRUE for 0xFF, so the cut steps straight over it — and an id
+	// under the clamp is not cut at all, so the length loop above could
+	// not see this class. PostgreSQL refuses the registry write with
+	// 22021 either way: `sync` then fails closed on its prune, and the
+	// v0.154.0 backup-chain seat only WARNs and carries on, leaving the
+	// chain invisible to a peer's pruner.
+	t.Run("invalid UTF-8 in the stream id or DSN", func(t *testing.T) {
+		short := ChangeLogConsumerID("stream\xffone", "postgres", "postgres://h/db")
+		if !utf8.ValidString(short) {
+			t.Errorf("a SHORT id carrying an invalid byte came back invalid: %q — Postgres refuses it with 22021 "+
+				"and the registry row is never written", short)
+		}
+		if strings.ContainsRune(short, 0) {
+			t.Errorf("id carries a NUL: %q", short)
+		}
+		// And it must not COLLAPSE two streams onto one registry row:
+		// the later writer would overwrite the earlier's frontier and a
+		// prune would cut above the slower one, which is the collision
+		// ChangeLogConsumerID's own doc says the target locator exists to
+		// prevent. storableDiagnostic's U+FFFD would fail exactly here.
+		other := ChangeLogConsumerID("stream\xfeone", "postgres", "postgres://h/db")
+		if short == other {
+			t.Errorf("two DIFFERENT stream ids render the same consumer id %q; they would share one registry row "+
+				"and the prune would cut above the slower consumer", short)
+		}
+		if !utf8.ValidString(other) {
+			t.Errorf("id came back invalid: %q", other)
+		}
+		// A NUL in the DSN is the same class on the same column.
+		withNUL := ChangeLogConsumerID("s", "postgres", "postgres://h/db\x00x")
+		if !utf8.ValidString(withNUL) || strings.ContainsRune(withNUL, 0) {
+			t.Errorf("id carrying a NUL is unstorable: %q", withNUL)
+		}
+		// An ALREADY-storable id is returned verbatim, which is what keeps
+		// the registry row an older binary wrote addressable after upgrade:
+		// no escaping, and byte-identical across calls.
+		const plain = "sync-1"
+		storable := ChangeLogConsumerID(plain, "postgres", "postgres://h/db")
+		if !strings.HasPrefix(storable, plain+" -> postgres://") || strings.Contains(storable, `\x`) {
+			t.Errorf("a storable id was rewritten: %q", storable)
+		}
+		if again := ChangeLogConsumerID(plain, "postgres", "postgres://h/db"); again != storable {
+			t.Errorf("consumer id is not stable across calls: %q vs %q", again, storable)
+		}
+	})
 }
 
 // TestStartChangeLogConsumerRegistration_RunsWithoutTheAutoPruneFlag is the

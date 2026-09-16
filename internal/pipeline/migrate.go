@@ -1076,17 +1076,23 @@ func (m *Migrator) openResumeContext(ctx context.Context, resetting bool) (resum
 		migcore.CloseIf(store)
 		return resumeContext{}, ir.MigrationState{}, false, err
 	}
+	// Recorded on the fresh run's header row and compared before a
+	// --resume adopts prior state, so an id alone can no longer make this
+	// run inherit a copy made from a different source
+	// (A0915-STATE-MEDIUM-1). The ENGINE answers for its own DSN grammar
+	// (ir.SourceIdentityDescriber, audit 2026-09-15 F-1); `discriminating`
+	// is false when that answer names no dataset, which the door WARNs
+	// about rather than reading as proof. Per-database in the
+	// multi-database fan-out, which clones this Migrator with a
+	// per-database SourceDSN.
+	sourceIdentity, discriminating := renderSourceIdentity(m.Source, m.SourceDSN)
 	rc := resumeContext{
 		store:       store,
 		migrationID: migrationID,
 		enabled:     store != nil,
-		// Recorded on the fresh run's header row and compared before a
-		// --resume adopts prior state, so an id alone can no longer make
-		// this run inherit a copy made from a different source
-		// (A0915-STATE-MEDIUM-1). Per-database in the multi-database
-		// fan-out, which clones this Migrator with a per-database
-		// SourceDSN.
-		sourceIdentity: renderSourceIdentity(m.Source.Name(), m.SourceDSN),
+
+		sourceIdentity:               sourceIdentity,
+		sourceIdentityDiscriminating: discriminating,
 	}
 	state, exitClean, err := loadOrInitState(ctx, rc, m.Resume, resetting)
 	if err != nil {

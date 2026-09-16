@@ -145,7 +145,29 @@ const codeMarkerFloorYearMonth = 202609
 
 // codeMarkerExempt names an in-era marker that is deliberately unfiled,
 // with the reason. Fail-by-default.
-var codeMarkerExempt = map[string]string{}
+//
+// THE THREE ENTRIES BELOW ARE TEMPORARY AND THE REASON SAYS SO. They are
+// not "not backlog findings" — they are backlog findings whose entries
+// are landing in this same release from the session that owns
+// docs/dev/audit-backlog.md, which this change was explicitly scoped out
+// of editing (a concurrent-edit conflict, not a judgement that they are
+// unfileable). F-2, from the same review, is already in the backlog,
+// which is what a filed one looks like. DELETE these three the moment
+// the entries land; an exemption that outlives its reason is the rot
+// this map exists to make visible.
+var codeMarkerExempt = map[string]string{
+	"F-1": "v0.154.0 pre-tag value-fidelity review, HIGH: the migrate --resume source_identity door was vacuous " +
+		"for every engine whose DSN shape the orchestrator did not parse. FIXED in this commit " +
+		"(ir.SourceIdentityDescriber). Backlog entry pending from the audit-backlog-owning session — remove this " +
+		"exemption when it lands.",
+	"F-3": "v0.154.0 pre-tag value-fidelity review, MEDIUM: libpq key/value extraction was not injective " +
+		"(quoted values, first-wins). FIXED in this commit (postgres.parseKVFields). Backlog entry pending from " +
+		"the audit-backlog-owning session — remove this exemption when it lands.",
+	"F-4": "v0.154.0 pre-tag value-fidelity review, MEDIUM: ChangeLogConsumerID was rune-cut but not made " +
+		"storable, so a pre-existing invalid byte still drew PostgreSQL 22021. FIXED in this commit " +
+		"(storableIdentity). Backlog entry pending from the audit-backlog-owning session — remove this " +
+		"exemption when it lands.",
+}
 
 // TestAuditFindingsInCodeMarkersAreFiled closes audit 2026-09-06
 // PRE-TAG-5 — the gap in the gate above it.

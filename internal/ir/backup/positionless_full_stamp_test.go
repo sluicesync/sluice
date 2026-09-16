@@ -13,9 +13,10 @@ import (
 // cdcMethodRoster derives every recognised [ir.CDCMethod] from the type's
 // own String() — the walk stops at the first value the type does not
 // name — so a method added to the IR joins this matrix without anyone
-// editing a list here. Anti-vacuity: the walk must find the two the stamp
-// exempts by name and at least one it does not, or the matrix below is
-// grading nothing.
+// editing a list here. Anti-vacuity: the walk must find the ONE method
+// the stamp exempts ([ir.CDCNone]), the one whose exemption this release
+// removed ([ir.CDCTriggers]), and at least two more, or the matrix below
+// is grading nothing.
 func cdcMethodRoster(t *testing.T) []ir.CDCMethod {
 	t.Helper()
 	var roster []ir.CDCMethod
@@ -27,8 +28,9 @@ func cdcMethodRoster(t *testing.T) []ir.CDCMethod {
 		seen[m] = true
 	}
 	if !seen[ir.CDCTriggers] || !seen[ir.CDCNone] || len(roster) < 4 {
-		t.Fatalf("CDCMethod roster derived from String() is %v — it must include CDCTriggers and CDCNone (the two "+
-			"exemptions) and at least two resuming methods, otherwise the stamp matrix is vacuous", roster)
+		t.Fatalf("CDCMethod roster derived from String() is %v — it must include CDCNone (the one exemption) and "+
+			"CDCTriggers (the ex-exemption, audit 2026-09-15 F-2) by name, plus at least two more methods, "+
+			"otherwise the stamp matrix is vacuous", roster)
 	}
 	return roster
 }
@@ -38,7 +40,7 @@ func cdcMethodRoster(t *testing.T) []ir.CDCMethod {
 // EMPTY position, on a source whose reader resumes from a recorded
 // position, is raised to FormatVersionPositionlessFull.
 func positionlessStampExpected(kind string, pos ir.Position, cdc ir.CDCMethod, before int) int {
-	if canonicalKind(kind) != BackupKindFull || pos != (ir.Position{}) || cdc == ir.CDCTriggers || cdc == ir.CDCNone {
+	if canonicalKind(kind) != BackupKindFull || pos != (ir.Position{}) || cdc == ir.CDCNone {
 		return before
 	}
 	return max(before, FormatVersionPositionlessFull)
@@ -105,12 +107,23 @@ func TestStampPositionlessFull_FamilyMatrix(t *testing.T) {
 	StampPositionlessFull(nil, ir.CDCBinlog) // must not panic
 }
 
-// TestStampPositionlessFull_ExemptionsAreExactlyTriggersAndNone pins the
-// exemption set by NAME against the derived roster, so a new CDC method
-// is stamped by default (the safe direction: a full it cannot chain from
-// is refused by older readers) and only a deliberate edit here exempts it.
-func TestStampPositionlessFull_ExemptionsAreExactlyTriggersAndNone(t *testing.T) {
-	exempt := map[ir.CDCMethod]bool{ir.CDCTriggers: true, ir.CDCNone: true}
+// TestStampPositionlessFull_TheOnlyExemptionIsCDCNone pins the exemption
+// set by NAME against the derived roster, so a new CDC method is stamped
+// by default (the safe direction: a full it cannot chain from is refused
+// by older readers) and only a deliberate edit here exempts it.
+//
+// [ir.CDCTriggers] was the second exemption until audit 2026-09-15 F-2.
+// Its premise — "a trigger full records no position by construction, so
+// stamping locks older readers out for no protection" — was falsified by
+// roadmap item 163 in the SAME release: the trigger engines record an
+// anchor now, and resumeStartFromParent stopped exempting them, so
+// v0.154.0's own reader refuses a positionless trigger full while
+// v0.154.0 could still PRODUCE one on the snapshot-open fault path and
+// hand an older binary a chain to anchor "from now". The trigger cell
+// below is what fails if the exemption comes back.
+func TestStampPositionlessFull_TheOnlyExemptionIsCDCNone(t *testing.T) {
+	exempt := map[ir.CDCMethod]bool{ir.CDCNone: true}
+	graded := 0
 	for _, cdc := range cdcMethodRoster(t) {
 		m := fixedSignedManifest()
 		m.Kind = BackupKindFull
@@ -118,8 +131,50 @@ func TestStampPositionlessFull_ExemptionsAreExactlyTriggersAndNone(t *testing.T)
 		m.FormatVersion = FormatVersionLegacy
 		StampPositionlessFull(m, cdc)
 		if got, want := m.FormatVersion == FormatVersionPositionlessFull, !exempt[cdc]; got != want {
-			t.Errorf("cdc=%s: stamped=%v, want %v — the exemption set is {triggers, none} and nothing else", cdc, got, want)
+			t.Errorf("cdc=%s: stamped=%v, want %v — the exemption set is {none} and nothing else", cdc, got, want)
 		}
+		graded++
+	}
+	if graded < 4 {
+		t.Fatalf("graded %d CDC methods; the roster has collapsed", graded)
+	}
+}
+
+// TestStampPositionlessFull_TriggerFullOnTheFaultPathIsStamped is the
+// F-2 cell stated in the artifact's own terms rather than by enum name:
+// the manifest a trigger-CDC `backup full` finalizes when its
+// snapshot-anchored open refused and the post-sweep capturer answered
+// ErrPositionUnavailable (which both trigger capturers always do on that
+// door). That artifact is indistinguishable, to a pre-v0.154.0 reader,
+// from the v0.16.x legacy full it would extend "from now" — so it must
+// carry the stamp. The companion cell is the trigger full that DID
+// anchor: not this shape, and untouched.
+func TestStampPositionlessFull_TriggerFullOnTheFaultPathIsStamped(t *testing.T) {
+	faulted := fixedSignedManifest()
+	faulted.Kind = BackupKindFull
+	faulted.EndPosition = ir.Position{}
+	faulted.FormatVersion = FormatVersionLegacy
+	if !IsPositionlessFull(faulted, ir.CDCTriggers) {
+		t.Fatal("a trigger-CDC full that finalized with an empty EndPosition is not recognised as positionless; a " +
+			"pre-v0.154.0 binary would take its own trigger exemption and anchor the chain from now")
+	}
+	StampPositionlessFull(faulted, ir.CDCTriggers)
+	if faulted.FormatVersion != FormatVersionPositionlessFull {
+		t.Errorf("fault-path trigger full stamped %d; want %d so older readers refuse it at their ceiling",
+			faulted.FormatVersion, FormatVersionPositionlessFull)
+	}
+
+	anchored := fixedSignedManifest()
+	anchored.Kind = BackupKindFull
+	anchored.EndPosition = ir.Position{Engine: "postgres-trigger", Token: `{"last_id":42}`}
+	anchored.FormatVersion = FormatVersionLegacy
+	if IsPositionlessFull(anchored, ir.CDCTriggers) {
+		t.Fatal("a trigger full that recorded its change-log anchor was treated as positionless")
+	}
+	StampPositionlessFull(anchored, ir.CDCTriggers)
+	if anchored.FormatVersion != FormatVersionLegacy {
+		t.Errorf("an anchored trigger full was stamped to %d; the happy path must keep its feature-minimum version "+
+			"so ordinary trigger backups still restore on older binaries", anchored.FormatVersion)
 	}
 }
 

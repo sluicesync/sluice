@@ -78,7 +78,7 @@ func parseURIDSN(dsn string) (*pgConfig, error) {
 	q := u.Query()
 	schema := q.Get("schema")
 	if schema == "" {
-		schema = "public"
+		schema = defaultSchema
 	}
 	q.Del("schema")
 	u.RawQuery = q.Encode()
@@ -106,7 +106,7 @@ func parseKVDSN(dsn string) (*pgConfig, error) {
 		keepers = append(keepers, tok)
 	}
 	if schema == "" {
-		schema = "public"
+		schema = defaultSchema
 	}
 	return &pgConfig{dsn: strings.Join(keepers, " "), schema: schema}, nil
 }

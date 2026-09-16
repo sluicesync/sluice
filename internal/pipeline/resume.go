@@ -157,6 +157,19 @@ type resumeContext struct {
 	// `migrate` always sets it, and it is never empty there because an
 	// engine's registered name never is.
 	sourceIdentity string
+
+	// sourceIdentityDiscriminating reports whether sourceIdentity carries
+	// anything beyond the ENGINE NAME — a database, a file, a dataset id.
+	// When it is false the door still compares, but it WARNs first
+	// (RESUME-SOURCE-UNDISCRIMINATED), so the absence of a refusal is
+	// never read as proof that the source matched.
+	//
+	// Zero-value-safe per the v0.99.51 rule, and the polarity is the
+	// whole reason it is spelled this way round: false is the NOISY
+	// answer, so every construction that predates the field — and any
+	// future caller that sets an identity and does not know about this —
+	// gets the warning rather than silence.
+	sourceIdentityDiscriminating bool
 }
 
 // progressThrottleInterval is how stale a sync cold start's per-table
@@ -566,6 +579,61 @@ func storableDiagnostic(msg string) string {
 	return strings.ReplaceAll(msg, "\x00", `\x00`)
 }
 
+// storableIdentity makes s storable as the TEXT PRIMARY KEY of a control
+// table, WITHOUT collapsing two different inputs onto one value.
+//
+// The sibling of [storableDiagnostic] and deliberately not the same
+// function. Both exist for the same refusal — PostgreSQL rejects an
+// invalid byte sequence in a TEXT column with SQLSTATE 22021, MySQL in
+// strict mode with Error 1366 — but storableDiagnostic replaces every
+// invalid sequence with ONE replacement rune. That is right for prose (a
+// failure record with a replaced byte beats no record) and wrong for an
+// IDENTITY: two ids differing only in invalid bytes would land on ONE
+// registry row, the later writer would overwrite the earlier's frontier,
+// and a prune would cut above the slower consumer — precisely the
+// collision [ChangeLogConsumerID]'s own doc says appending the target
+// locator exists to prevent. Reusing the diagnostic helper there would
+// have contradicted that function's safety argument.
+//
+// So: an already-storable s is returned VERBATIM, which is what keeps
+// every registry row an older binary wrote addressable after an upgrade;
+// an unstorable one is escaped injectively — `\xNN` per invalid byte and
+// per NUL, `\\` per backslash.
+//
+// THE NAMED WART: the two branches are not injective ACROSS each other.
+// A storable id that literally spells some unstorable id's escaped form
+// aliases it. Closing that would mean escaping backslashes on the
+// storable branch too, which re-keys every existing registry row
+// containing one — and a stale registry row holds a peer's prune back
+// forever, so the cure is worse than a collision an operator would have
+// to construct deliberately. Pinned by
+// TestChangeLogConsumerID_CutsOnARuneBoundary's invalid-UTF-8 cells.
+func storableIdentity(s string) string {
+	if utf8.ValidString(s) && !strings.ContainsRune(s, 0) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s) + 8)
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		switch {
+		case r == utf8.RuneError && size == 1:
+			// DecodeRuneInString reports (RuneError, 1) only for a byte
+			// that starts no valid sequence; a real U+FFFD decodes at
+			// size 3 and passes through untouched.
+			fmt.Fprintf(&b, `\x%02x`, s[i])
+		case r == 0:
+			b.WriteString(`\x00`)
+		case r == '\\':
+			b.WriteString(`\\`)
+		default:
+			b.WriteString(s[i : i+size])
+		}
+		i += size
+	}
+	return b.String()
+}
+
 // cutAtRuneBoundary returns the longest prefix of s that is at most
 // maxBytes long and does not end inside a multi-byte rune. For valid
 // UTF-8 the result is valid UTF-8; it gives up at most three bytes of
@@ -664,7 +732,9 @@ func loadOrInitState(ctx context.Context, rc resumeContext, resume, resetting bo
 	// correct rather than a gap: --reset-target-data deletes the row and
 	// re-copies in full, so there is no adopted work to mis-attribute.
 	if found && resume {
-		if err := refuseForeignSourceOnResume(ctx, rc.migrationID, state.SourceIdentity, rc.sourceIdentity); err != nil {
+		if err := refuseForeignSourceOnResume(
+			ctx, rc.migrationID, state.SourceIdentity, rc.sourceIdentity, rc.sourceIdentityDiscriminating,
+		); err != nil {
 			return ir.MigrationState{}, false, err
 		}
 	}

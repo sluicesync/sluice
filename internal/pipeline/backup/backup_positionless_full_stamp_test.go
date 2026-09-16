@@ -112,11 +112,20 @@ func TestBackup_PositionlessFullStampSurvivesFinalize(t *testing.T) {
 
 					// The stamp rule, restated from the store's point of view: a
 					// CDC-less source never captures, so its position is empty
-					// and it is exempt; a trigger source is exempt; every other
-					// empty position is the hazard.
+					// and it is the ONE exemption — nothing could extend it.
+					// Every other empty position is the hazard, INCLUDING a
+					// trigger-CDC source: since roadmap item 163 a trigger full
+					// records the change log's anchor, so an empty position
+					// there means the snapshot open refused and the run fell
+					// back — exactly the artifact a pre-v0.154.0 binary would
+					// take its own trigger exemption on and anchor "from now"
+					// (audit 2026-09-15 F-2). The `unavailable (Neki router)`
+					// capture below IS that fault path for a trigger source:
+					// both trigger capturers answer ErrPositionUnavailable on
+					// the post-sweep door by design.
 					want := irbackup.FormatVersionFor(schema)
 					positionless := c.empty || cdc == ir.CDCNone
-					if positionless && cdc != ir.CDCTriggers && cdc != ir.CDCNone {
+					if positionless && cdc != ir.CDCNone {
 						want = irbackup.FormatVersionPositionlessFull
 						stamped++
 					}
@@ -148,8 +157,10 @@ func TestBackup_PositionlessFullStampSurvivesFinalize(t *testing.T) {
 			}
 		}
 	}
-	// Two committer modes × three resuming methods × two empty shapes.
-	if want := 2 * 3 * 2; stamped != want {
+	// Two committer modes × FOUR resuming methods (binlog, logical
+	// replication, vstream and — since audit 2026-09-15 F-2 — triggers)
+	// × two empty shapes.
+	if want := 2 * 4 * 2; stamped != want {
 		t.Fatalf("%d cells expected the stamp, want %d — the matrix is not exercising the hazard arm", stamped, want)
 	}
 }

@@ -130,12 +130,17 @@ Every backup chain root manifest carries a `FormatVersion` field:
   field being the *absence* of one. The bump makes every pre-v0.154.0 reader
   refuse the manifest loudly at its own ceiling instead. Proportional as
   always, and this tier is the narrowest yet: a full that records a position
-  (every Postgres primary, every MySQL server with `log_bin` on), every
-  incremental, every trigger-CDC full (`postgres-trigger`, `sqlite-trigger`,
-  `d1-trigger` record no position *by construction* and their chains anchor at
-  the change log on every binary — stamping them would lock older readers out
-  for no protection), and every full from a CDC-less source (nothing could
-  extend it) keep their feature-minimum version. A Neki or binlog-off full is
+  (every Postgres primary, every MySQL server with `log_bin` on, and — since
+  roadmap item 163 — every trigger-CDC full whose snapshot-anchored open
+  succeeded, which records the change log's anchor), every incremental, and
+  every full from a CDC-less source (nothing could extend it) keep their
+  feature-minimum version. A trigger-CDC source was exempt in the first cut of
+  this tier, on the premise that such a full records no position *by
+  construction*; roadmap item 163 falsified that in the same release, and the
+  fulls the exemption actually covered were the fault-path ones — a trigger
+  `backup full` whose snapshot open refused falls back to the non-snapshot
+  sweep and finalizes positionless, which is the same hazard on the same
+  artifact class. Those are stamped (audit 2026-09-15 F-2). A Neki or binlog-off full is
   a complete, restorable backup on its own — it just needs a v0.154.0+ binary
   to restore it, and can root a chain on none. One refusal comes with it: the
   stamp is the only version raise applied *after* a full's chunks are sealed,

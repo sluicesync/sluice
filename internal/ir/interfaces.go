@@ -1442,6 +1442,74 @@ type DSNValidator interface {
 	ValidateDSN(dsn string) error
 }
 
+// SourceIdentity names WHICH source a DSN points at, in the engine's own
+// units, with everything that is merely how-to-reach-it left out.
+//
+// It is the value a resumable run compares before it adopts recorded
+// state as its own. Both fields are free-form engine values: the
+// orchestrator renders and compares them, never parses them.
+type SourceIdentity struct {
+	// Database is the DATASET the DSN names, in whatever unit the engine
+	// has one: a database name for an engine with databases (Postgres,
+	// MySQL), a D1 database id, a SQLite file path, a mydumper dump
+	// directory, a flat file's path.
+	//
+	// "" means "this DSN names no dataset" — a legitimate answer (a
+	// Postgres URI with an empty path), not an error. It is rendered and
+	// compared like any other value; it just carries no discriminator,
+	// which the orchestrator says out loud rather than reading as proof.
+	Database string
+
+	// Schema is the namespace WITHIN Database for an engine that scopes
+	// by one (Postgres: the `schema` DSN parameter, defaulting to the
+	// engine's own default). "" for an engine with a flat namespace —
+	// MySQL's database IS its namespace and is already carried by
+	// Database, so duplicating it here would add no discrimination.
+	Schema string
+}
+
+// SourceIdentityDescriber is the optional surface an [Engine] implements
+// to answer "which source does this DSN name?" — the IR-first half of
+// `migrate --resume`'s foreign-source door (ADR-0015; audit 2026-09-15
+// F-1).
+//
+// It exists because DSN grammar is SOURCE knowledge and belongs in the
+// reader, not in the orchestrator. The first cut of the door parsed DSNs
+// in the pipeline and recognised three shapes — Postgres URI, libpq
+// key/value, and the go-sql-driver `@tcp(`/`@unix(` forms — returning ""
+// for everything else. Every SQLite file, every D1 database, every
+// flat file and every mydumper directory therefore rendered the SAME
+// identity, as did a MySQL DSN spelled `user:pw@/db`, and the door
+// silently admitted a foreign resume for all of them. An engine cannot
+// forget to teach the orchestrator its own DSN grammar if the
+// orchestrator never learns one.
+//
+// CONTRACT, and the narrowness is the point:
+//
+//   - No context, no connection, NO I/O — the same posture as
+//     [DSNValidator]. It is called before anything is opened, on a run
+//     that may be about to refuse.
+//   - It returns the ZERO VALUE for a DSN it cannot parse. A malformed
+//     DSN is refused loudly at open, by the engine, with the engine's
+//     own message; duplicating that refusal here would move a
+//     connection diagnosis into a resume door.
+//   - It MUST NOT include the host, the port, or any credential.
+//     ADR-0015 makes --migration-id the operator's assertion of a stable
+//     identity across DNS shifts and host renames, so a DNS move, a
+//     failover, or a replica of the same database must still resume; and
+//     a control row must never record where the source lives. A file
+//     path or a D1 database id is a dataset, not a host.
+//
+// An engine that does not implement it contributes only its NAME to the
+// identity, and the orchestrator warns (RESUME-SOURCE-UNDISCRIMINATED)
+// rather than treating the absence of a refusal as proof. Every
+// registered engine implements it — held by docsync's
+// TestEverySourceEngineDescribesItsIdentity, whose exemption map is
+// empty.
+type SourceIdentityDescriber interface {
+	SourceIdentity(dsn string) SourceIdentity
+}
+
 // CDCUnsupportedExplainer is the optional surface an [Engine] whose
 // [Capabilities.CDC] is [CDCNone] implements to supply the operator-
 // facing refusal for CDC-requiring modes (sync start, backup

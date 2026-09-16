@@ -34,6 +34,74 @@ func openTriggerReader(t *testing.T, ctx context.Context, dsn string) *CDCReader
 	return cr
 }
 
+// TestChangeLogConsumerID_RawInvalidByteIsRefusedAndTheEscapedFormInserts is
+// the real-server half of audit 2026-09-15 F-4.
+//
+// The registry's consumer_id is a TEXT PRIMARY KEY on the SOURCE, and PostgreSQL
+// refuses an invalid byte sequence in a TEXT column with SQLSTATE 22021. The
+// orchestrator composes that id from an operator-supplied stream id and a
+// redacted DSN, and clamped it on a rune boundary — which cannot repair a byte
+// that was ALREADY invalid (utf8.RuneStart is true for 0xFF) and does not run at
+// all on an id under the clamp. The registration was therefore refused: for
+// `sync` that fails closed on the prune, and for the v0.154.0 backup-chain seat
+// registerChainConsumer only WARNs, leaving the chain invisible to a peer's
+// pruner.
+//
+// SCOPE, so this is not read as broader than it is. This grades the SERVER's
+// half — that the raw form is genuinely refused and the escaped form is a usable
+// primary key — against a real postgres:16. That the orchestrator PRODUCES the
+// escaped form is the other half, pinned without a server by
+// pipeline.TestChangeLogConsumerID_CutsOnARuneBoundary; the two are deliberately
+// split because this package must not import the pipeline, and the escaped
+// spelling below is duplicated here on purpose so a drift in either fails one of
+// them.
+func TestChangeLogConsumerID_RawInvalidByteIsRefusedAndTheEscapedFormInserts(t *testing.T) {
+	dsn, cleanup := setupTriggerSource(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	cr := openTriggerReader(t, ctx, dsn)
+
+	// The id as it arrives before [pipeline.storableIdentity]: a stream id
+	// carrying a raw 0xFF, which no rune-boundary cut repairs.
+	raw := "sync\xff-1 -> postgres://h/db"
+	if err := cr.RegisterChangeLogConsumer(ctx, raw, `{"last_id":5}`); err == nil {
+		t.Fatalf("PostgreSQL ACCEPTED a consumer id carrying a raw invalid byte (%q). This test's premise is "+
+			"that it refuses with 22021 — if the server stopped refusing, the F-4 fix is no longer load-bearing "+
+			"and this gate is measuring nothing; re-derive it rather than deleting it.", raw)
+	}
+
+	// The same id after escaping: valid UTF-8, injective (0xFF and 0xFE do not
+	// collapse onto one row), and usable as the TEXT primary key.
+	escaped := `sync\xff-1 -> postgres://h/db`
+	if err := cr.RegisterChangeLogConsumer(ctx, escaped, `{"last_id":5}`); err != nil {
+		t.Fatalf("the escaped consumer id was refused too (%q): %v — the chain seat would still be invisible "+
+			"to a peer's pruner", escaped, err)
+	}
+	// Re-registering must UPDATE that row rather than fail, which is what makes
+	// the escaped id a working primary key and not merely an insertable string.
+	if err := cr.RegisterChangeLogConsumer(ctx, escaped, `{"last_id":9}`); err != nil {
+		t.Fatalf("the escaped consumer id does not upsert: %v", err)
+	}
+	// And the sibling byte gets its OWN row: collapsing the two (what a
+	// U+FFFD replacement would do) would let the later writer overwrite the
+	// earlier's frontier and a prune cut above the slower consumer.
+	sibling := `sync\xfe-1 -> postgres://h/db`
+	if err := cr.RegisterChangeLogConsumer(ctx, sibling, `{"last_id":3}`); err != nil {
+		t.Fatalf("the sibling escaped id was refused: %v", err)
+	}
+	deleted, err := cr.PruneConsumedChangeLogToRegisteredMin(ctx, escaped, `{"last_id":9}`, 0)
+	if err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	// Nothing to delete (the log is empty), but the prune must have SEEN both
+	// rows: a cut computed from a single collapsed row is the harm.
+	if deleted != 0 {
+		t.Errorf("deleted = %d; want 0 on an empty change log", deleted)
+	}
+}
+
 // TestItem115_SlowPeersUnreadRowsSurviveAFastPeersPrune_PG is the pgtrigger half
 // of the item-115 gate, and the test that fails at HEAD.
 //

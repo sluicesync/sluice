@@ -111,12 +111,21 @@ func (g *autoPruneGate) due(now time.Time) bool {
 // and is named in the staleness WARN, instead of silently unblocking it.
 func ChangeLogConsumerID(streamID, targetEngine, targetDSN string) string {
 	id := streamID + " -> " + targetEngine + "://" + diagnose.RedactDSN(targetDSN)
-	// On a rune boundary: the id is the PRIMARY KEY of a TEXT column on
-	// the source, and a byte cut through a non-ASCII stream id or DSN is
-	// invalid UTF-8 that Postgres refuses (22021) — the same defect as
-	// truncateLastError's (audit 2026-09-15 A0915-STATE-MEDIUM-3 sibling
-	// sweep). Pinned by TestChangeLogConsumerID_CutsOnARuneBoundary.
-	return cutAtRuneBoundary(id, maxChangeLogConsumerID)
+	// STORABLE first, then cut on a rune boundary — the same order, and
+	// for the same reason, as [truncateLastError]'s.
+	//
+	// The id is the PRIMARY KEY of a TEXT column on the SOURCE, so a byte
+	// cut through a non-ASCII stream id or DSN is invalid UTF-8 that
+	// Postgres refuses with 22021 (audit 2026-09-15 A0915-STATE-MEDIUM-3
+	// sibling sweep). The cut alone was not enough: `utf8.RuneStart` is
+	// true for 0xFF, so a byte that was ALREADY invalid — an operator's
+	// --stream-id carrying raw bytes, a DSN that does — survived the cut
+	// untouched and the registry write was still refused; and an id under
+	// the 512-byte clamp was never cut at all (audit 2026-09-15 F-4).
+	// [storableIdentity], not storableDiagnostic: this is an identity, and
+	// it must not collapse two streams onto one row. Pinned by
+	// TestChangeLogConsumerID_CutsOnARuneBoundary.
+	return cutAtRuneBoundary(storableIdentity(id), maxChangeLogConsumerID)
 }
 
 // captureChangeLogConsumerRegistry records the source reader's item-115
