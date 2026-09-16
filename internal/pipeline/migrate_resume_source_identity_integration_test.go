@@ -21,7 +21,6 @@
 package pipeline
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -31,6 +30,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/logcapture"
 	"sluicesync.dev/sluice/internal/sluicecode"
 
 	// Register both engines so engines.Get works and the pgx / mysql
@@ -286,9 +286,9 @@ func identityPGText(t *testing.T, dsn, query string) string {
 // captureDefaultLogger redirects slog's default logger into a buffer for
 // the duration of one test and restores it afterwards. The subtest using
 // it is deliberately NOT parallel — the default logger is global.
-func captureDefaultLogger(t *testing.T) *bytes.Buffer {
+func captureDefaultLogger(t *testing.T) *logcapture.Buffer {
 	t.Helper()
-	buf := &bytes.Buffer{}
+	buf := &logcapture.Buffer{}
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	t.Cleanup(func() { slog.SetDefault(prev) })

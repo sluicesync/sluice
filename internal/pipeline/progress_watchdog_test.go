@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"sluicesync.dev/sluice/internal/logcapture"
 	"sluicesync.dev/sluice/internal/progress"
 )
 
@@ -402,7 +403,7 @@ func TestProgressWatchdog_FiresOnlyOnSilence(t *testing.T) {
 		// than calling dumpStall directly, so the wiring is graded too: a
 		// dump that is never invoked leaves exactly the evidence the last
 		// wedged run left, which was none.
-		var dump safeBuffer
+		var dump logcapture.Buffer
 		ctx, w, stop := newProgressWatchdog(context.Background(), 100*time.Millisecond, time.Minute)
 		defer stop()
 		// An unroutable DSN on purpose: it proves the server-side half fails

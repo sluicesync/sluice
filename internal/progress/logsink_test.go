@@ -4,18 +4,19 @@
 package progress
 
 import (
-	"bytes"
 	"log/slog"
 	"testing"
+
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 // captureLog swaps slog.Default with a text handler that drops the volatile
 // `time` attr, so the emitted line is deterministic and can be pinned
 // byte-for-byte. It returns the buffer and a restore func.
-func captureLog(t *testing.T) (buf *bytes.Buffer, restore func()) {
+func captureLog(t *testing.T) (buf *logcapture.Buffer, restore func()) {
 	t.Helper()
 	prev := slog.Default()
-	buf = &bytes.Buffer{}
+	buf = &logcapture.Buffer{}
 	h := slog.NewTextHandler(buf, &slog.HandlerOptions{
 		Level: slog.LevelDebug,
 		ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {

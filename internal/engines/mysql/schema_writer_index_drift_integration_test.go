@@ -18,7 +18,6 @@
 package mysql
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"log/slog"
@@ -27,6 +26,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 func TestIndexDrift_RealCatalog(t *testing.T) {
@@ -81,7 +81,7 @@ func TestIndexDrift_RealCatalog(t *testing.T) {
 		},
 	}}}
 
-	buf := &bytes.Buffer{}
+	buf := &logcapture.Buffer{}
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 	t.Cleanup(func() { slog.SetDefault(prev) })

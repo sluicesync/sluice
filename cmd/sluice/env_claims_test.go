@@ -4,7 +4,6 @@
 package main
 
 import (
-	"bytes"
 	"log/slog"
 	"reflect"
 	"strings"
@@ -13,6 +12,7 @@ import (
 	"github.com/alecthomas/kong"
 
 	"sluicesync.dev/sluice/internal/config"
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 // TestClaimedEnvVarNames_ParsedCLI pins the claim collection through the
@@ -126,7 +126,7 @@ func TestRegisterClaimedEnvVars_SilencesTheUnknownKeyWarning(t *testing.T) {
 	}
 	registerClaimedEnvVars(cli)
 
-	var logBuf bytes.Buffer
+	var logBuf logcapture.Buffer
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, nil)))
 	t.Cleanup(func() { slog.SetDefault(prev) })

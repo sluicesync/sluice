@@ -4,7 +4,6 @@
 package mysql
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"log/slog"
@@ -14,6 +13,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 // A changed source identity REFUSES, and the refusal is terminal.
@@ -56,7 +56,7 @@ import (
 // replaced instance by construction; Vitess/PlanetScale never reach this file;
 // MariaDB has its own lineage path).
 func TestInstanceIdentityMismatch_RefusesTerminally(t *testing.T) {
-	var buf bytes.Buffer
+	var buf logcapture.Buffer
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 	t.Cleanup(func() { slog.SetDefault(prev) })
@@ -160,7 +160,7 @@ func TestInstanceIdentityRemedy_MutualExclusionPremiseHolds(t *testing.T) {
 // It must stay LOUD, though: the whole residual is that an operator who cannot
 // be protected knows it.
 func TestInstanceIdentityProbeFailure_StaysPermissive(t *testing.T) {
-	var buf bytes.Buffer
+	var buf logcapture.Buffer
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 	t.Cleanup(func() { slog.SetDefault(prev) })

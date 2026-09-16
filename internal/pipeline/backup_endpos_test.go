@@ -4,7 +4,6 @@
 package pipeline
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"log/slog"
@@ -14,6 +13,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/logcapture"
 	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
@@ -492,7 +492,7 @@ func TestBackup_RecordsSnapshotAnchoredEndPosition(t *testing.T) {
 func TestBackup_SnapshotOpenerErrorFallsBackToCapturer(t *testing.T) {
 	prev := slog.Default()
 	t.Cleanup(func() { slog.SetDefault(prev) })
-	var logBuf bytes.Buffer
+	var logBuf logcapture.Buffer
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 
 	dir := t.TempDir()

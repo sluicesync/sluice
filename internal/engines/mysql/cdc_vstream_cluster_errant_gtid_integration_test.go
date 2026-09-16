@@ -43,7 +43,6 @@
 package mysql
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -54,6 +53,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 // errantVStreamDSN is chaosVStreamDSN with an explicit tablet type, so the
@@ -150,7 +150,7 @@ func probeAt(t *testing.T, cc *chaosCluster, pos ir.Position, tabletType, label 
 // slog captured at DEBUG. Returns the StreamChanges error and the logs.
 func resumeAt(t *testing.T, cc *chaosCluster, pos ir.Position, tabletType string) (error, string) {
 	t.Helper()
-	var buf bytes.Buffer
+	var buf logcapture.Buffer
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	defer slog.SetDefault(prev)

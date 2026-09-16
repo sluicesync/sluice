@@ -4,13 +4,13 @@
 package migcore
 
 import (
-	"bytes"
 	"context"
 	"log/slog"
 	"strings"
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 // TestApplyTableFilter_DropsSequencesOwnedByFilteredTables pins the
@@ -54,7 +54,7 @@ func TestApplyTableFilter_DropsSequencesOwnedByFilteredTables(t *testing.T) {
 		t.Run(dir.name, func(t *testing.T) {
 			// Capture the WARN: the drop must be loud and name the
 			// sequence + its excluded owner.
-			var logBuf bytes.Buffer
+			var logBuf logcapture.Buffer
 			prev := slog.Default()
 			slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, nil)))
 			t.Cleanup(func() { slog.SetDefault(prev) })

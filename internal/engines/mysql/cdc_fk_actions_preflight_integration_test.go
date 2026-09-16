@@ -15,7 +15,6 @@
 package mysql
 
 import (
-	"bytes"
 	"context"
 	"log/slog"
 	"strings"
@@ -23,6 +22,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 func TestCDCReader_FKReferentialActionWarn(t *testing.T) {
@@ -37,7 +37,7 @@ func TestCDCReader_FKReferentialActionWarn(t *testing.T) {
 	// capture installed, returning what the open logged.
 	openStream := func(t *testing.T) string {
 		t.Helper()
-		var buf bytes.Buffer
+		var buf logcapture.Buffer
 		prev := slog.Default()
 		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 		defer slog.SetDefault(prev)

@@ -4,13 +4,14 @@
 package mysql
 
 import (
-	"bytes"
 	"log/slog"
 	"net/url"
 	"strings"
 	"testing"
 
 	mysqldriver "github.com/go-sql-driver/mysql"
+
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 // TestParseDSN_NoDoubleInvalidPrefix is the GitHub #17 papercut
@@ -190,7 +191,7 @@ func TestInjectSessionSQLMode_WarnsOnNBEDisagreement(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parseDSN(%q): %v", dsnMode, err)
 		}
-		var buf bytes.Buffer
+		var buf logcapture.Buffer
 		prev := slog.Default()
 		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 		defer slog.SetDefault(prev)
@@ -221,7 +222,7 @@ func TestInjectSessionSQLMode_WarnsOnNBEDisagreement(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parseDSN (no DSN sql_mode): %v", err)
 		}
-		var buf bytes.Buffer
+		var buf logcapture.Buffer
 		prev := slog.Default()
 		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 		defer slog.SetDefault(prev)

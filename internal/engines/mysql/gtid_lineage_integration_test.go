@@ -42,7 +42,6 @@
 package mysql
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -57,6 +56,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 // mysqlGTIDBootCmd boots a vanilla MySQL with binary logging and GTID mode
@@ -843,7 +843,7 @@ func TestGTIDResumeMariaDBBindsLineage(t *testing.T) {
 		// foreign instance's rows as a chain delta at exit 0 under it.
 		// Capturing WARN+ and requiring the marker is the pin: a revert
 		// to the INFO wording, or to a silent accept, fails this cell.
-		var warnLog bytes.Buffer
+		var warnLog logcapture.Buffer
 		prevLogger := slog.Default()
 		slog.SetDefault(slog.New(slog.NewTextHandler(&warnLog, &slog.HandlerOptions{Level: slog.LevelWarn})))
 		mustAccept(t, dsnP, "same-lineage/anchor-purged", capturedOnP)

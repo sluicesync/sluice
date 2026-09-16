@@ -12,12 +12,12 @@
 package expandcontract
 
 import (
-	"bytes"
 	"context"
 	"log/slog"
 	"strings"
 	"testing"
 
+	"sluicesync.dev/sluice/internal/logcapture"
 	"sluicesync.dev/sluice/internal/planetscale/api"
 )
 
@@ -26,7 +26,7 @@ import (
 // pattern).
 func captureLog(t *testing.T, fn func()) string {
 	t.Helper()
-	var buf bytes.Buffer
+	var buf logcapture.Buffer
 	old := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	defer slog.SetDefault(old)
@@ -36,13 +36,13 @@ func captureLog(t *testing.T, fn func()) string {
 
 // newCleanupHarness serves a fakePS holding one leftover dev branch
 // and returns it with a branchCleanup already tracking that branch.
-func newCleanupHarness(t *testing.T, branch string, deleteScript []int) (*fakePS, *branchCleanup, *bytes.Buffer) {
+func newCleanupHarness(t *testing.T, branch string, deleteScript []int) (*fakePS, *branchCleanup, *logcapture.Buffer) {
 	t.Helper()
 	ps := newFakePS(t)
 	ps.branches[branch] = &api.Branch{Name: branch, Ready: true}
 	ps.deleteScript = deleteScript
 	_, client := ps.serve()
-	var out bytes.Buffer
+	var out logcapture.Buffer
 	cleanup := &branchCleanup{
 		api:      client,
 		org:      "o",

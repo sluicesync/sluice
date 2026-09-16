@@ -16,20 +16,20 @@
 package mysql
 
 import (
-	"bytes"
 	"context"
 	"log/slog"
 	"strings"
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 // captureWarnLog swaps the default slog handler for a buffer at WARN
 // level for the duration of fn.
 func captureWarnLog(t *testing.T, fn func()) string {
 	t.Helper()
-	var buf bytes.Buffer
+	var buf logcapture.Buffer
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 	defer slog.SetDefault(prev)

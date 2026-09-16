@@ -23,12 +23,13 @@
 package mysql
 
 import (
-	"bytes"
 	"context"
 	"log/slog"
 	"strings"
 	"testing"
 	"time"
+
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 func TestMariaDBUnderMySQLDriver_SteerPrecedesItsOwnSymptom(t *testing.T) {
@@ -73,7 +74,7 @@ func TestMariaDBUnderMySQLDriver_SteerPrecedesItsOwnSymptom(t *testing.T) {
 			flavorMemo.byServer = nil
 			flavorMemo.mu.Unlock()
 
-			var buf bytes.Buffer
+			var buf logcapture.Buffer
 			prev := slog.Default()
 			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 			defer slog.SetDefault(prev)
@@ -98,7 +99,7 @@ func TestMariaDBUnderMySQLDriver_SteerPrecedesItsOwnSymptom(t *testing.T) {
 		flavorMemo.byServer = nil
 		flavorMemo.mu.Unlock()
 
-		var buf bytes.Buffer
+		var buf logcapture.Buffer
 		prev := slog.Default()
 		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 		defer slog.SetDefault(prev)
@@ -123,7 +124,7 @@ func TestMariaDBUnderMySQLDriver_SteerPrecedesItsOwnSymptom(t *testing.T) {
 		flavorMemo.byServer = nil
 		flavorMemo.mu.Unlock()
 
-		var buf bytes.Buffer
+		var buf logcapture.Buffer
 		prev := slog.Default()
 		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 		defer slog.SetDefault(prev)

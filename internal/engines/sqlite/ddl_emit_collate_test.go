@@ -10,16 +10,16 @@ package sqlite
 // per table (docs/type-mapping.md "Charsets and collations").
 
 import (
-	"bytes"
 	"log/slog"
 	"strings"
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 func TestEmitTableDef_CrossEngineCollationWarn_SQLite(t *testing.T) {
-	buf := &bytes.Buffer{}
+	buf := &logcapture.Buffer{}
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 	t.Cleanup(func() { slog.SetDefault(prev) })

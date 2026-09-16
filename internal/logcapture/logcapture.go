@@ -22,17 +22,38 @@
 // The helper's own comment had asserted "the callers are not parallel" — true,
 // and beside the point. The racing writer was never a caller.
 //
-// # Three real mechanisms, not one abstract rule
+// # Nine copies, and every one of them recorded a different real incident
 //
-// Before this package, three separate copies of this type existed, each
-// written for a different concrete hazard, and between them they are the
-// argument for the guard:
+// Before this package there were NINE hand-rolled copies of this type under
+// four names — `lockedBuffer` (×3), `syncBuffer`, `syncLogBuffer` (×2),
+// `syncBuf` and `safeBuffer` (×2). They had drifted apart in API: some
+// exposed String only, some added Bytes, one added a WriteString with a
+// deliberately non-standard signature, and only two of the nine made Bytes
+// return a copy.
 //
-//   - a `BinlogSyncer` from an earlier subtest, still emitting after Close;
+// Their doc comments are preserved here because each was written from a
+// measured failure, and together they are the argument for the guard:
+//
+//   - a `BinlogSyncer` from an earlier subtest, still emitting after Close
+//     (CI run 35043003665);
 //   - a CDC open that runs on its own goroutine and blocks at slot creation by
 //     design, so its WARN write races the test's poll;
 //   - a JSON handler written from the streamer's pump, the orchestrator's main
-//     goroutine and the test goroutine at once.
+//     goroutine and the test goroutine at once;
+//   - the streamer, the CDC pump and go-mysql's binlogsyncer all logging while
+//     the test read `buf.String()` — CI run 26134035839, latent since the
+//     helper landed and exposed only when a longer-running pin arrived;
+//   - a heartbeat goroutine logging on a ticker while the test polled
+//     (surfaced by v0.48.0 CI, invisible locally because a CGO_ENABLED=0
+//     Windows build silently disables `-race`);
+//   - a pgtrigger pump writing WARN lines while the test read them;
+//   - the grow-gate owner goroutine in migcore;
+//   - a slot-health probe loop writing from its own goroutine.
+//
+// One of the nine was guarded pre-emptively, by an author who wrote that these
+// tests do not log from goroutines "but the buffer is guarded anyway so a
+// future one can". That is the right instinct and the reason this type is now
+// the default rather than a remedy applied after a `-race` failure.
 //
 // # Bytes copies, and that is load-bearing
 //
@@ -63,8 +84,8 @@ import (
 // goroutine while a test reads from another. The zero value is ready to use.
 //
 // It carries the accessor set the capture sites in this repo actually call —
-// String, Bytes, Len and Reset — so it is a drop-in for the `bytes.Buffer` it
-// replaces without reshaping the assertions around it.
+// String, Bytes, Len, Reset and WriteString — so it is a drop-in for the
+// `bytes.Buffer` it replaces without reshaping the assertions around it.
 type Buffer struct {
 	mu  sync.Mutex
 	buf bytes.Buffer
@@ -76,6 +97,26 @@ func (b *Buffer) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.Write(p)
+}
+
+// WriteString appends a string, mirroring [bytes.Buffer.WriteString].
+//
+// The signature is deliberately the standard one, and that choice is NOT free.
+// One of the private copies this package replaced declared
+// `WriteString(string)` with no return value, and its doc explained exactly
+// why: errcheck carries a default exclusion for `bytes.Buffer.WriteString` BY
+// TYPE, which a wrapper does not inherit, so every call site discarding the
+// result must spell `_, _ =`. That prediction was right — golangci-lint
+// flagged the one such call site in the tree as soon as this landed.
+//
+// The standard shape is kept anyway: a type whose entire claim is "drop-in for
+// bytes.Buffer" should not quietly diverge from bytes.Buffer's own signature,
+// and one `_, _ =` is a smaller cost than a method that looks like the
+// standard library's and behaves differently.
+func (b *Buffer) WriteString(s string) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.WriteString(s)
 }
 
 // String returns the captured output. Safe to call while a logger is still

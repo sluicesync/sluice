@@ -15,7 +15,6 @@ package sqlitetrigger
 // than a timing-dependent size-under-load, so they are CI-stable.
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -29,6 +28,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines/internal/triggercdc"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 func walBytes(t *testing.T, dbPath string) int64 {
@@ -332,7 +332,7 @@ func (f *failingCheckpointExecutor) checkpointWAL(context.Context) error {
 // on, and one success resets the streak so the next failure is DEBUG
 // again.
 func TestWALCheckpointFailureEscalatesToWarn(t *testing.T) {
-	buf := &bytes.Buffer{}
+	buf := &logcapture.Buffer{}
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 	t.Cleanup(func() { slog.SetDefault(prev) })

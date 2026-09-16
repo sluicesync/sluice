@@ -4,7 +4,6 @@
 package mysql
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"database/sql/driver"
@@ -14,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 // Audit 2026-09-15 A0915-MYSQL-MEDIUM-1: rowSkippingWarningCodes
@@ -255,7 +256,7 @@ func TestReportLoadDataWarnings_ReplayShortfallBeyondDuplicatesRefuses(t *testin
 	})
 
 	t.Run("a replay whose shortfall IS its duplicates still converges", func(t *testing.T) {
-		var buf bytes.Buffer
+		var buf logcapture.Buffer
 		prev := slog.Default()
 		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 		defer slog.SetDefault(prev)

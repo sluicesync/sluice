@@ -38,6 +38,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 // expectDDLHalt opens a reader at resumeFrom, runs apply, and requires the
@@ -171,7 +172,7 @@ func TestCDCReader_DDLRefusal_ForeignSchemaMarkers(t *testing.T) {
 		mustExec(`ALTER TABLE public.mrow SET SCHEMA other`)
 		from := tipPos()
 
-		logs := &syncLogBuffer{}
+		logs := &logcapture.Buffer{}
 		prev := slog.Default()
 		slog.SetDefault(slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
 		t.Cleanup(func() { slog.SetDefault(prev) })

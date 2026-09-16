@@ -15,20 +15,20 @@ package postgres
 // documented read-side gap — see translate.ColumnCollation).
 
 import (
-	"bytes"
 	"log/slog"
 	"strings"
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 // captureCollationWarn installs a WARN-level JSON slog handler into a
 // buffer for the test's duration, restoring the previous default on
 // cleanup (same shape as captureKeylessWarn).
-func captureCollationWarn(t *testing.T) *bytes.Buffer {
+func captureCollationWarn(t *testing.T) *logcapture.Buffer {
 	t.Helper()
-	buf := &bytes.Buffer{}
+	buf := &logcapture.Buffer{}
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 	t.Cleanup(func() { slog.SetDefault(prev) })

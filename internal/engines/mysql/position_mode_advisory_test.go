@@ -4,18 +4,19 @@
 package mysql
 
 import (
-	"bytes"
 	"context"
 	"log/slog"
 	"strings"
 	"testing"
+
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 // captureLogsAt swaps the default slog handler for one writing to a
 // buffer at the given level, restoring it when the test ends.
-func captureLogsAt(t *testing.T, level slog.Level) *bytes.Buffer {
+func captureLogsAt(t *testing.T, level slog.Level) *logcapture.Buffer {
 	t.Helper()
-	buf := &bytes.Buffer{}
+	buf := &logcapture.Buffer{}
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: level})))
 	t.Cleanup(func() { slog.SetDefault(prev) })

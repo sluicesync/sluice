@@ -21,17 +21,16 @@
 package pgtrigger
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
 	"log/slog"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 // gapFreePollInterval keeps the matrix quick while still giving the
@@ -346,29 +345,9 @@ func TestCDCReader_GapFreedom_SkipsAnAbortedHole(t *testing.T) {
 	assertSameSet(t, collectLabels(t, out, 1), []string{"after"})
 }
 
-// syncLogBuffer is a mutex-guarded log sink: the pump goroutine writes
-// WARN lines while the test goroutine reads them, so a bare bytes.Buffer
-// would be a -race finding in the test itself.
-type syncLogBuffer struct {
-	mu sync.Mutex
-	b  bytes.Buffer
-}
-
-func (s *syncLogBuffer) Write(p []byte) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.b.Write(p)
-}
-
-func (s *syncLogBuffer) String() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.b.String()
-}
-
 // waitForLog polls the captured logs until marker appears or the
 // deadline passes.
-func waitForLog(t *testing.T, logs *syncLogBuffer, marker string, d time.Duration) {
+func waitForLog(t *testing.T, logs *logcapture.Buffer, marker string, d time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(d)
 	for time.Now().Before(deadline) {
@@ -402,7 +381,7 @@ func TestCDCReader_CeilingStall_WarnsWhileHeldAndResumes(t *testing.T) {
 
 	setupCaptureTable(t, ctx, dsn, "ceiling_stall")
 
-	logs := &syncLogBuffer{}
+	logs := &logcapture.Buffer{}
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
 	t.Cleanup(func() { slog.SetDefault(prev) })

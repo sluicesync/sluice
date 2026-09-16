@@ -27,7 +27,6 @@
 package mysql
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
@@ -37,13 +36,14 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 const skippedWarnMarker = "target lacks this table"
 
-func captureSkipWarns(t *testing.T) *bytes.Buffer {
+func captureSkipWarns(t *testing.T) *logcapture.Buffer {
 	t.Helper()
-	buf := &bytes.Buffer{}
+	buf := &logcapture.Buffer{}
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 	t.Cleanup(func() { slog.SetDefault(prev) })

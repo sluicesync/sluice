@@ -21,22 +21,22 @@ package mysql
 // classes; the matrix below exercises each independently.
 
 import (
-	"bytes"
 	"context"
 	"log/slog"
 	"strings"
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 // captureSlogWarn installs a JSON slog handler that writes into a
 // buffer for the duration of the test, then restores the previous
 // default. Used by every test in this file to assert WARN-or-no-WARN
 // behaviour without coupling to stderr.
-func captureSlogWarn(t *testing.T) *bytes.Buffer {
+func captureSlogWarn(t *testing.T) *logcapture.Buffer {
 	t.Helper()
-	buf := &bytes.Buffer{}
+	buf := &logcapture.Buffer{}
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{
 		Level: slog.LevelWarn,

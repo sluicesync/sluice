@@ -4,7 +4,6 @@
 package pipeline
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"log"
@@ -15,56 +14,9 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/logcapture"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
-
-// safeBuffer is a mutex-protected [bytes.Buffer] wrapper used as the
-// slog handler's writer in [captureSlog]. Without the mutex, concurrent
-// goroutines writing to slog.Default (streamer + CDC pump +
-// go-mysql-org binlogsyncer all log from background goroutines while
-// the test reads buf.String()) race on the underlying Buffer growth —
-// caught by CI run 26134035839 in
-// TestBackup_RecordsEndPosition_MySQLIntegration after Chunk E's new
-// pin pulled the binlogsyncer-while-test-reads pattern into a -race
-// run. The race was latent: present since the helper landed, exposed
-// only by the longer-running streamer goroutines Chunk E exercised.
-//
-// API-compatible with [*bytes.Buffer] for the methods existing callers
-// use (.String, .Bytes, .Len, .Write). .Bytes returns a defensive copy
-// so the caller can read without holding the mutex (and writes that
-// race the read can't corrupt the returned slice).
-type safeBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
-}
-
-func (s *safeBuffer) Write(p []byte) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.buf.Write(p)
-}
-
-func (s *safeBuffer) String() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.buf.String()
-}
-
-func (s *safeBuffer) Bytes() []byte {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	// Defensive copy — internal slice may grow concurrently with the
-	// caller's use of the returned bytes.
-	out := make([]byte, s.buf.Len())
-	copy(out, s.buf.Bytes())
-	return out
-}
-
-func (s *safeBuffer) Len() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.buf.Len()
-}
 
 // captureSlog swaps slog.Default with a text handler writing into a
 // thread-safe buffer for the duration of the test, restoring the
@@ -87,7 +39,7 @@ func (s *safeBuffer) Len() int {
 //
 // So capture and restore the std log package's writer and flags by hand.
 // [TestCaptureSlogRestoresTheStdLogSink] is the pin.
-func captureSlog(t *testing.T) *safeBuffer {
+func captureSlog(t *testing.T) *logcapture.Buffer {
 	t.Helper()
 	prev := slog.Default()
 	prevWriter, prevFlags := log.Writer(), log.Flags()
@@ -96,7 +48,7 @@ func captureSlog(t *testing.T) *safeBuffer {
 		log.SetOutput(prevWriter)
 		log.SetFlags(prevFlags)
 	})
-	buf := &safeBuffer{}
+	buf := &logcapture.Buffer{}
 	slog.SetDefault(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	return buf
 }
@@ -125,7 +77,7 @@ func TestCaptureSlogRestoresTheStdLogSink(t *testing.T) {
 		log.SetFlags(outerFlags)
 	}()
 
-	original := &safeBuffer{}
+	original := &logcapture.Buffer{}
 	log.SetOutput(original)
 
 	// Premise check, named rather than assumed: this test can only observe

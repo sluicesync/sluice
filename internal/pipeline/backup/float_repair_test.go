@@ -4,7 +4,6 @@
 package backup
 
 import (
-	"bytes"
 	"context"
 	"log/slog"
 	"math"
@@ -12,6 +11,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/logcapture"
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
@@ -358,7 +358,7 @@ func TestFloatExactPatchReader_ZeroPatchedTripwire(t *testing.T) {
 		// The default posture must not stay SILENT where strict refuses —
 		// symmetric with the over-cap / unrepairable rounded-fallbacks, which
 		// both WARN. No error, but a loud WARN naming the table.
-		var logBuf bytes.Buffer
+		var logBuf logcapture.Buffer
 		prev := slog.Default()
 		slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 		t.Cleanup(func() { slog.SetDefault(prev) })
@@ -381,7 +381,7 @@ func TestFloatExactPatchReader_ZeroPatchedTripwire(t *testing.T) {
 		// legit empty-at-snapshot case).
 		emptyInner := func() *fakeInnerReader { return &fakeInnerReader{rows: nil} }
 		for _, strict := range []bool{true, false} {
-			var logBuf bytes.Buffer
+			var logBuf logcapture.Buffer
 			prev := slog.Default()
 			slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 
@@ -425,7 +425,7 @@ func TestFloatExactPatchReader_ZeroPatchedTripwire(t *testing.T) {
 		// BOTH postures, but never refuse. Pre-fix this shape was the one
 		// SILENT cell of the tripwire matrix.
 		for _, strict := range []bool{true, false} {
-			var logBuf bytes.Buffer
+			var logBuf logcapture.Buffer
 			prev := slog.Default()
 			slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 
@@ -446,7 +446,7 @@ func TestFloatExactPatchReader_ZeroPatchedTripwire(t *testing.T) {
 		// exactCount==0 && streamed==0: a genuinely empty table has nothing
 		// to signal — no error, no WARN.
 		for _, strict := range []bool{true, false} {
-			var logBuf bytes.Buffer
+			var logBuf logcapture.Buffer
 			prev := slog.Default()
 			slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 

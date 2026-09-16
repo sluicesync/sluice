@@ -4,13 +4,13 @@
 package appliershared
 
 import (
-	"bytes"
 	"context"
 	"log/slog"
 	"strings"
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 // TestWarnSkippedTable_HintIsOpAware pins the one skip surface that knows
@@ -20,7 +20,7 @@ import (
 // remedy. Every op the appliers pass is graded, not one representative.
 func TestWarnSkippedTable_HintIsOpAware(t *testing.T) {
 	capture := func(op string) string {
-		var buf bytes.Buffer
+		var buf logcapture.Buffer
 		prev := slog.Default()
 		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 		defer slog.SetDefault(prev)

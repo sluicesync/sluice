@@ -19,20 +19,20 @@ package mysql
 // dialects (the Bug 74 lesson).
 
 import (
-	"bytes"
 	"log/slog"
 	"strings"
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 // captureCollationWarnMySQL installs a WARN-level JSON slog handler
 // into a buffer for the test's duration (same shape as the PG
 // package's captureCollationWarn).
-func captureCollationWarnMySQL(t *testing.T) *bytes.Buffer {
+func captureCollationWarnMySQL(t *testing.T) *logcapture.Buffer {
 	t.Helper()
-	buf := &bytes.Buffer{}
+	buf := &logcapture.Buffer{}
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 	t.Cleanup(func() { slog.SetDefault(prev) })

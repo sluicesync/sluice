@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 // Bug 157 Q2 pins. emitCrossEngineTranslationNotices is the shared
@@ -75,7 +76,7 @@ func benignSchema() *ir.Schema {
 // captured buffer's current contents.
 func captureWarnLogs(t *testing.T) func() string {
 	t.Helper()
-	var buf syncBuffer
+	var buf logcapture.Buffer
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 	t.Cleanup(func() { slog.SetDefault(prev) })

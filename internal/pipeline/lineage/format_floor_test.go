@@ -4,7 +4,6 @@
 package lineage
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"log/slog"
@@ -12,6 +11,7 @@ import (
 	"testing"
 
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 // captureWarnings swaps the default slog logger for one writing JSON to a
@@ -20,7 +20,7 @@ import (
 // warning in this package does), so the seam is the default logger.
 func captureWarnings(t *testing.T, fn func(ctx context.Context)) []map[string]any {
 	t.Helper()
-	var buf bytes.Buffer
+	var buf logcapture.Buffer
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 	defer slog.SetDefault(prev)

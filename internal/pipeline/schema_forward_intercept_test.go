@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 // addColForwardTable builds a single-table test fixture with cols
@@ -916,7 +917,7 @@ func TestRefuseComputedDefaults_WarnsWhenProjectionDroppedTheDefault(t *testing.
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			var buf syncBuffer
+			var buf logcapture.Buffer
 			prev := slog.Default()
 			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 			defer slog.SetDefault(prev)

@@ -6,7 +6,6 @@
 package postgres
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"log/slog"
@@ -15,6 +14,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/appliershared"
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 // TestSchemaReader_ExcludesControlTableRoster pins roadmap item 65b on
@@ -48,7 +48,7 @@ func TestSchemaReader_ExcludesControlTableRoster(t *testing.T) {
 		}
 	}()
 
-	var logs bytes.Buffer
+	var logs logcapture.Buffer
 	prevLogger := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
 	defer slog.SetDefault(prevLogger)

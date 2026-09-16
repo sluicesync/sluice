@@ -4,7 +4,6 @@
 package appliershared
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"log/slog"
@@ -13,6 +12,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 // TestSchema covers the small fallback rule. The applier's configured
@@ -130,7 +130,7 @@ func TestTruncateToken(t *testing.T) {
 // silent drift in either must fail here.
 func TestWarnKeyless(t *testing.T) {
 	capture := func(f func()) string {
-		buf := &bytes.Buffer{}
+		buf := &logcapture.Buffer{}
 		prev := slog.Default()
 		slog.SetDefault(slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 		defer slog.SetDefault(prev)

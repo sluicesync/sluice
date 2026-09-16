@@ -4,7 +4,6 @@
 package mysql
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"database/sql/driver"
@@ -15,6 +14,7 @@ import (
 	"sync"
 	"testing"
 
+	"sluicesync.dev/sluice/internal/logcapture"
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
@@ -327,7 +327,7 @@ func TestPreflightReplicaSource(t *testing.T) {
 // ALL as the bookkeeping clear, and states the TOCTOU it accepts. Not
 // parallel: it swaps the default slog handler.
 func TestPreflightReplicaSource_StoppedChannelsAcceptedWithInfo(t *testing.T) {
-	var buf bytes.Buffer
+	var buf logcapture.Buffer
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
 	defer slog.SetDefault(prev)

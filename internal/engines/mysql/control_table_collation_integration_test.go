@@ -21,7 +21,6 @@
 package mysql
 
 import (
-	"bytes"
 	"context"
 	"log/slog"
 	"strings"
@@ -29,6 +28,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 // TestMigrateProgressKeysAreCaseAndAccentSensitive is the pin for the
@@ -193,7 +193,7 @@ func TestLegacyControlTableCollationWarns(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	var buf bytes.Buffer
+	var buf logcapture.Buffer
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 	t.Cleanup(func() { slog.SetDefault(prev) })

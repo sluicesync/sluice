@@ -4,11 +4,12 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"log/slog"
 	"strings"
 	"testing"
+
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 // TestBuildTargetTelemetry_QuietSuppressesEnableLog pins the ADR-0156 panel-leak
@@ -33,7 +34,7 @@ func TestBuildTargetTelemetry_QuietSuppressesEnableLog(t *testing.T) {
 		{"quiet suppresses enable INFO", true, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			var buf bytes.Buffer
+			var buf logcapture.Buffer
 			prev := slog.Default()
 			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
 			defer slog.SetDefault(prev)

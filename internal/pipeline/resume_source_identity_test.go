@@ -4,7 +4,6 @@
 package pipeline
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"log/slog"
@@ -14,6 +13,7 @@ import (
 	"unicode/utf8"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/logcapture"
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
@@ -250,7 +250,7 @@ func TestRefuseForeignSourceOnResume_Matrix(t *testing.T) {
 func TestRefuseForeignSourceOnResume_WarnsWhenUndiscriminated(t *testing.T) {
 	capture := func(t *testing.T, recorded, live string, discriminating bool) string {
 		t.Helper()
-		var buf bytes.Buffer
+		var buf logcapture.Buffer
 		prev := slog.Default()
 		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 		t.Cleanup(func() { slog.SetDefault(prev) })

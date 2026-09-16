@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/logcapture"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
@@ -246,7 +247,7 @@ func TestFilterChangesEmptyFilterPassthrough(t *testing.T) {
 func TestFilterChangesDebugLogOnly(t *testing.T) {
 	prev := slog.Default()
 	t.Cleanup(func() { slog.SetDefault(prev) })
-	var buf syncBuffer
+	var buf logcapture.Buffer
 	// Set the handler to Info: a debug-level message should NOT
 	// appear in the buffer.
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))

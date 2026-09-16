@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 // scopedReader is a minimal [ir.TableScoper] that behaves the way the real
@@ -79,14 +80,18 @@ func TestUnmatchedCensus_SurvivesTheScopePushDown(t *testing.T) {
 		}
 		schema := r.readSchema()
 
-		var buf safeBuffer
+		var buf logcapture.Buffer
 		prev := slog.Default()
 		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 		defer slog.SetDefault(prev)
 		if err := ApplyTableFilter(context.Background(), schema, f); err != nil {
 			// An "excluded every table" error is a legitimate outcome for
 			// some cells; the caller asserts on the log either way.
-			buf.WriteString("\nERR: " + err.Error())
+			// `_, _ =` because logcapture.Buffer mirrors bytes.Buffer's
+			// (int, error) signature, and errcheck's default exclusion for
+			// bytes.Buffer.WriteString is BY TYPE, so a wrapper does not
+			// inherit it. The error cannot be non-nil.
+			_, _ = buf.WriteString("\nERR: " + err.Error())
 		}
 		return buf.String(), schema
 	}
@@ -250,7 +255,7 @@ func TestFanOutReportsOnceAgainstTheWholeUniverse(t *testing.T) {
 	}
 
 	capture := func(fn func()) string {
-		var buf safeBuffer
+		var buf logcapture.Buffer
 		prev := slog.Default()
 		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 		defer slog.SetDefault(prev)

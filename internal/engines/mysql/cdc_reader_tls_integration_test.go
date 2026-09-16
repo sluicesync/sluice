@@ -24,7 +24,6 @@
 package mysql
 
 import (
-	"bytes"
 	"context"
 	"log/slog"
 	"strings"
@@ -32,15 +31,16 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 // captureWarnLogs swaps the default slog handler for a WARN-level
 // buffer for the duration of the test. Same pattern as
 // rls_warn_integration_test.go; the engines-mysql integration tests
 // run sequentially, so the process-global swap is safe here.
-func captureWarnLogs(t *testing.T) *bytes.Buffer {
+func captureWarnLogs(t *testing.T) *logcapture.Buffer {
 	t.Helper()
-	var buf bytes.Buffer
+	var buf logcapture.Buffer
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 	t.Cleanup(func() { slog.SetDefault(prev) })

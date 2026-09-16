@@ -4,13 +4,14 @@
 package pgtrigger
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"log/slog"
 	"strings"
 	"testing"
 	"time"
+
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 // captureLogsForUnitTest redirects the default slog logger into a buffer
@@ -18,7 +19,7 @@ import (
 // from the integration file's captureWarnLogs because the -tags=integration
 // build compiles both files into one package.
 func captureLogsForUnitTest(fn func()) string {
-	var buf bytes.Buffer
+	var buf logcapture.Buffer
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 	defer slog.SetDefault(prev)

@@ -15,6 +15,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/logcapture"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
@@ -633,7 +634,7 @@ func (s *failingDeleteStore) Delete(ctx context.Context, path string) error {
 // silently — while the compaction itself still succeeds (the sweep is
 // best-effort by contract; the catalog swap already committed).
 func TestCompactChain_OrphanSweepDeleteFailure_Warns(t *testing.T) {
-	var logBuf bytes.Buffer
+	var logBuf logcapture.Buffer
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 	t.Cleanup(func() { slog.SetDefault(prev) })

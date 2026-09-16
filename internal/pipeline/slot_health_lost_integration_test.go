@@ -21,43 +21,23 @@
 package pipeline
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
 	"log/slog"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/logcapture"
 	"sluicesync.dev/sluice/internal/notify"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
 
 	"github.com/testcontainers/testcontainers-go"
 	pgtc "github.com/testcontainers/testcontainers-go/modules/postgres"
 )
-
-// syncLogBuffer is a mutex-guarded bytes.Buffer so the probe loop's
-// goroutine can write log lines while the test goroutine reads them.
-type syncLogBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
-}
-
-func (b *syncLogBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.Write(p)
-}
-
-func (b *syncLogBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.String()
-}
 
 // TestSlotHealthLostSlot_TerminalPage invalidates a real replication
 // slot (the audit's observed recipe: cap-exceeding WAL + CHECKPOINT on
@@ -179,7 +159,7 @@ func TestSlotHealthLostSlot_TerminalPage(t *testing.T) {
 
 	// Drive the REAL probe loop against the real reporter with a
 	// capturing sink and a captured slog stream.
-	logBuf := &syncLogBuffer{}
+	logBuf := &logcapture.Buffer{}
 	prevLogger := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(logBuf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	defer slog.SetDefault(prevLogger)

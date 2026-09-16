@@ -25,7 +25,6 @@
 package mysql
 
 import (
-	"bytes"
 	"context"
 	"log/slog"
 	"strings"
@@ -33,6 +32,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 func TestRLSWarn_PGtoMySQL_DropsPoliciesAndWarnsOnce(t *testing.T) {
@@ -40,7 +40,7 @@ func TestRLSWarn_PGtoMySQL_DropsPoliciesAndWarnsOnce(t *testing.T) {
 	defer cleanup()
 
 	// Capture WARN-level slog output for the test's duration.
-	buf := &bytes.Buffer{}
+	buf := &logcapture.Buffer{}
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{
 		Level: slog.LevelWarn,
@@ -135,7 +135,7 @@ func TestRLSWarn_MySQLtoPG_NoWarn(t *testing.T) {
 	dsn, cleanup := startMySQL(t)
 	defer cleanup()
 
-	buf := &bytes.Buffer{}
+	buf := &logcapture.Buffer{}
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{
 		Level: slog.LevelWarn,

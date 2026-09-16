@@ -13,7 +13,6 @@
 package mysql
 
 import (
-	"bytes"
 	"context"
 	"log/slog"
 	"strconv"
@@ -21,6 +20,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 // byteBatchTable returns an ir.Table with cols non-generated columns,
@@ -289,7 +289,7 @@ func TestInsertBatcher_StatementCountRegression(t *testing.T) {
 // (the zero-value-safe default).
 func TestNoteTierCPUBoundTarget(t *testing.T) {
 	capture := func(fn func()) string {
-		var buf bytes.Buffer
+		var buf logcapture.Buffer
 		prev := slog.Default()
 		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
 		defer slog.SetDefault(prev)

@@ -17,6 +17,8 @@ import (
 
 	"gocloud.dev/blob"
 
+	"sluicesync.dev/sluice/internal/logcapture"
+
 	// Memory blob driver for prefix tests — no creds, no network.
 	_ "gocloud.dev/blob/memblob"
 )
@@ -284,9 +286,9 @@ func TestBlobStore_AnnotateURL_FileDirMode(t *testing.T) {
 // 0666-minus-umask files) must warn in favour of --output-dir's
 // hardened LocalStore; non-file schemes must stay silent.
 func TestBlobStore_FileURLWarnsWorldReadable(t *testing.T) {
-	capture := func(t *testing.T) *bytes.Buffer {
+	capture := func(t *testing.T) *logcapture.Buffer {
 		t.Helper()
-		buf := &bytes.Buffer{}
+		buf := &logcapture.Buffer{}
 		prev := slog.Default()
 		slog.SetDefault(slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 		t.Cleanup(func() { slog.SetDefault(prev) })

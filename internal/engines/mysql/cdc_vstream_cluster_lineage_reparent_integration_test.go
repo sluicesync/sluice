@@ -32,7 +32,6 @@
 package mysql
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -43,8 +42,10 @@ import (
 	"testing"
 	"time"
 
-	"sluicesync.dev/sluice/internal/ir"
 	topodata "vitess.io/vitess/go/vt/proto/topodata"
+
+	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 // tabletSocketFor is primaryTabletSocket generalised to any tablet uid.
@@ -177,7 +178,7 @@ func capturePosition(t *testing.T, cc *chaosCluster, table string, wantRows int)
 // captured log text.
 func warmResume(t *testing.T, cc *chaosCluster, pos ir.Position, label string) (error, string) {
 	t.Helper()
-	var buf bytes.Buffer
+	var buf logcapture.Buffer
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	defer slog.SetDefault(prev)

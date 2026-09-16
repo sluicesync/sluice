@@ -4,13 +4,14 @@
 package notify
 
 import (
-	"bytes"
 	"context"
 	"log/slog"
 	"strings"
 	"testing"
 
 	mail "github.com/wneessen/go-mail"
+
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 func TestSMTPConfig_Configured(t *testing.T) {
@@ -94,7 +95,7 @@ func TestSMTPConfig_Validate_PlaintextCredentialsWarns(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			var buf bytes.Buffer
+			var buf logcapture.Buffer
 			prev := slog.Default()
 			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 			t.Cleanup(func() { slog.SetDefault(prev) })

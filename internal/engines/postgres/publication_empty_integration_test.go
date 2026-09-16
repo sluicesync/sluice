@@ -26,13 +26,14 @@
 package postgres
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"log/slog"
 	"strings"
 	"testing"
 	"time"
+
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 func TestEnsurePublication_EmptyPublicationWarnsButDoesNotRefuse(t *testing.T) {
@@ -69,7 +70,7 @@ func TestEnsurePublication_EmptyPublicationWarnsButDoesNotRefuse(t *testing.T) {
 	// t.Parallel), so the global swap is bounded to each call.
 	callCapturingLog := func(t *testing.T, name string) (string, error) {
 		t.Helper()
-		var buf bytes.Buffer
+		var buf logcapture.Buffer
 		prev := slog.Default()
 		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 		defer slog.SetDefault(prev)

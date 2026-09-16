@@ -19,20 +19,22 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/logcapture"
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // captureLogs routes slog.Default() into a buffer for the test's
 // duration — the package-documented pattern for asserting log output.
 //
-// The buffer is a syncBuffer, not a bare bytes.Buffer, and that is
+// The buffer is a [logcapture.Buffer], not a bare bytes.Buffer, and that is
 // load-bearing rather than defensive: slog.SetDefault is GLOBAL, so any
 // goroutine anywhere in this test binary — including one a parallel test
 // started and has not joined — writes through this handler while the calling
-// test reads it. See syncBuffer's own doc comment in heartbeat_test.go.
-func captureLogs(t *testing.T) *syncBuffer {
+// test reads it. See the logcapture package doc, which records the nine
+// separate measured incidents that established this.
+func captureLogs(t *testing.T) *logcapture.Buffer {
 	t.Helper()
-	buf := &syncBuffer{}
+	buf := &logcapture.Buffer{}
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	t.Cleanup(func() { slog.SetDefault(prev) })

@@ -13,6 +13,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/logcapture"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
@@ -134,7 +135,7 @@ func runIncrementalCapturingWarnings(t *testing.T, parentVersion int, vstreamSha
 		clockNow:      func() time.Time { return now },
 	}
 
-	var buf syncBuffer
+	var buf logcapture.Buffer
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 	runErr := b.Run(context.Background())

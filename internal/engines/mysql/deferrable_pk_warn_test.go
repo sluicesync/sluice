@@ -16,18 +16,18 @@
 package mysql
 
 import (
-	"bytes"
 	"log/slog"
 	"strings"
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 // captureWarnings swaps the default slog handler for one writing to a buffer.
-func captureWarnings(t *testing.T) *bytes.Buffer {
+func captureWarnings(t *testing.T) *logcapture.Buffer {
 	t.Helper()
-	var buf bytes.Buffer
+	var buf logcapture.Buffer
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 	t.Cleanup(func() { slog.SetDefault(prev) })

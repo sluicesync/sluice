@@ -4,7 +4,6 @@
 package config
 
 import (
-	"bytes"
 	"errors"
 	"log/slog"
 	"os"
@@ -13,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"sluicesync.dev/sluice/internal/logcapture"
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
@@ -299,7 +299,7 @@ func TestEnvVars_UnknownVarWarnsLoudly(t *testing.T) {
 	t.Setenv("SLUICE_STAGE_DIR", t.TempDir())
 	t.Setenv("SLUICE_METRICS_SINK_HTTP", "http://127.0.0.1:1/metrics")
 
-	var logBuf bytes.Buffer
+	var logBuf logcapture.Buffer
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, nil)))
 	t.Cleanup(func() { slog.SetDefault(prev) })
@@ -375,7 +375,7 @@ func TestEnvVars_ConfigDeclaredKeysetEnvVarDoesNotWarn(t *testing.T) {
 // returns everything it logged.
 func captureLoadWarnings(t *testing.T, path string) string {
 	t.Helper()
-	var logBuf bytes.Buffer
+	var logBuf logcapture.Buffer
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, nil)))
 	t.Cleanup(func() { slog.SetDefault(prev) })

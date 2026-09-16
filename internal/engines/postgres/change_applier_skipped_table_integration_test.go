@@ -28,7 +28,6 @@
 package postgres
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"log/slog"
@@ -37,6 +36,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 // skippedWarnMarker is the load-bearing fragment of the once-per-table
@@ -45,9 +45,9 @@ const skippedWarnMarker = "target lacks this table"
 
 // captureSkipWarns installs a WARN-level JSON slog handler for the
 // test's duration (same pattern as the MySQL keyless-warn pins).
-func captureSkipWarns(t *testing.T) *bytes.Buffer {
+func captureSkipWarns(t *testing.T) *logcapture.Buffer {
 	t.Helper()
-	buf := &bytes.Buffer{}
+	buf := &logcapture.Buffer{}
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 	t.Cleanup(func() { slog.SetDefault(prev) })

@@ -24,13 +24,13 @@
 package backup
 
 import (
-	"bytes"
 	"context"
 	"crypto/ed25519"
 	"log/slog"
 	"strings"
-	"sync"
 	"testing"
+
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 func TestUnverifiableSignedArtifact_DistinguishesRelabelFromNoKey(t *testing.T) {
@@ -139,28 +139,11 @@ func TestDescribeVerifyMaterial_DistinguishesEachCombination(t *testing.T) {
 // captureBackupSlog redirects the default logger into a buffer for the
 // duration of a test. Concurrency-safe because these tests do not log from
 // goroutines, but the buffer is guarded anyway so a future one can.
-func captureBackupSlog(t *testing.T) *syncBuf {
+func captureBackupSlog(t *testing.T) *logcapture.Buffer {
 	t.Helper()
 	prev := slog.Default()
 	t.Cleanup(func() { slog.SetDefault(prev) })
-	buf := &syncBuf{}
+	buf := &logcapture.Buffer{}
 	slog.SetDefault(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	return buf
-}
-
-type syncBuf struct {
-	mu sync.Mutex
-	b  bytes.Buffer
-}
-
-func (s *syncBuf) Write(p []byte) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.b.Write(p)
-}
-
-func (s *syncBuf) String() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.b.String()
 }

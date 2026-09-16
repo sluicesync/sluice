@@ -21,6 +21,7 @@ import (
 	"sluicesync.dev/sluice/internal/crypto"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/logcapture"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
@@ -75,7 +76,7 @@ func writeExportChunk(t *testing.T, store irbackup.Store, path string, cols []*i
 	for i, c := range cols {
 		names[i] = c.Name
 	}
-	var buf bytes.Buffer
+	var buf logcapture.Buffer
 	w, err := blobcodec.NewChunkWriter(&buf, names, cek, codec, aad)
 	if err != nil {
 		t.Fatalf("NewChunkWriter: %v", err)
@@ -288,7 +289,7 @@ func TestParquetExport_ForceOverwriteDeletesStaleParquet(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var logBuf bytes.Buffer
+	var logBuf logcapture.Buffer
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelInfo})))
 	t.Cleanup(func() { slog.SetDefault(prev) })
@@ -368,7 +369,7 @@ func TestParquetExport_ForceOverwriteFirstExportLeavesForeignParquet(t *testing.
 		}
 	}
 
-	var logBuf bytes.Buffer
+	var logBuf logcapture.Buffer
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 	t.Cleanup(func() { slog.SetDefault(prev) })
@@ -422,7 +423,7 @@ func TestParquetExport_ForceOverwriteSweepIsTopLevelOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var logBuf bytes.Buffer
+	var logBuf logcapture.Buffer
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelInfo})))
 	t.Cleanup(func() { slog.SetDefault(prev) })

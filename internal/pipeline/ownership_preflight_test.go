@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 func TestIsPlanetScaleEphemeralRole(t *testing.T) {
@@ -44,7 +46,7 @@ func (f fakeRoleReporter) CurrentRole(_ context.Context) (string, error) {
 // and returns everything it logged.
 func captureWarn(t *testing.T, fn func()) string {
 	t.Helper()
-	var buf syncBuffer
+	var buf logcapture.Buffer
 	old := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	defer slog.SetDefault(old)

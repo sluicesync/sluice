@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 // TestApplyTableFilter_EmitsTheUnmatchedMarker grades the WIRING, which the
@@ -36,7 +37,7 @@ func TestApplyTableFilter_EmitsTheUnmatchedMarker(t *testing.T) {
 
 	capture := func(t *testing.T, patterns []string, include bool) string {
 		t.Helper()
-		var buf safeBuffer
+		var buf logcapture.Buffer
 		prev := slog.Default()
 		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 		defer slog.SetDefault(prev)

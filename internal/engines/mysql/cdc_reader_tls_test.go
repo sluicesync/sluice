@@ -4,7 +4,6 @@
 package mysql
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -13,6 +12,8 @@ import (
 	"testing"
 
 	"github.com/go-sql-driver/mysql"
+
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 // TestBinlogTLSFromDSN pins the DSN tls= → binlog-stream TLS mapping
@@ -218,7 +219,7 @@ func TestWarnBinlogTransport(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			var buf bytes.Buffer
+			var buf logcapture.Buffer
 			prev := slog.Default()
 			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 			t.Cleanup(func() { slog.SetDefault(prev) })
@@ -251,7 +252,7 @@ func TestWarnBinlogTransport_VerifyCAInfo(t *testing.T) {
 	}
 	r := &CDCReader{binlogTLS: verifyCA, binlogTLSMode: "verify-ca"}
 
-	var buf bytes.Buffer
+	var buf logcapture.Buffer
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
 	t.Cleanup(func() { slog.SetDefault(prev) })

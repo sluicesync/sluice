@@ -4,11 +4,12 @@
 package sqlitetrigger
 
 import (
-	"bytes"
 	"database/sql"
 	"log/slog"
 	"strings"
 	"testing"
+
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 // These pin the SQT-2 pair (audit 2026-08-11): the REPLACE implicit-delete
@@ -25,9 +26,9 @@ import (
 
 // captureSlogWarn installs a WARN-level JSON slog handler into a buffer for
 // the test's duration (the house pattern; see mysql/rls_warn_test.go).
-func captureSlogWarn(t *testing.T) *bytes.Buffer {
+func captureSlogWarn(t *testing.T) *logcapture.Buffer {
 	t.Helper()
-	buf := &bytes.Buffer{}
+	buf := &logcapture.Buffer{}
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{
 		Level: slog.LevelWarn,

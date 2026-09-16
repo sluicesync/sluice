@@ -4,11 +4,12 @@
 package mysql
 
 import (
-	"bytes"
 	"context"
 	"log/slog"
 	"strings"
 	"testing"
+
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 // A row the server DROPPED is refused in every sql_mode (audit 2026-09-09
@@ -65,7 +66,7 @@ func TestDecideBulkWriteWarnings_ASkippedRowRefusesInEverySQLMode(t *testing.T) 
 		// returned, which the server caps at @@max_error_count. Claiming
 		// "N values were clamped" when only a few were read would report a
 		// row the server DROPPED beyond the cap as a coercion.
-		var buf bytes.Buffer
+		var buf logcapture.Buffer
 		prev := slog.Default()
 		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 		defer slog.SetDefault(prev)

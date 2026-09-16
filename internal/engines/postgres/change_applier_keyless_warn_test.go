@@ -13,18 +13,19 @@ package postgres
 // honest wording from silently regressing back to the over-promise.
 
 import (
-	"bytes"
 	"context"
 	"log/slog"
 	"strings"
 	"testing"
+
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 // captureKeylessWarn installs a WARN-level JSON slog handler into a buffer
 // for the test's duration, restoring the previous default on cleanup.
-func captureKeylessWarn(t *testing.T) *bytes.Buffer {
+func captureKeylessWarn(t *testing.T) *logcapture.Buffer {
 	t.Helper()
-	buf := &bytes.Buffer{}
+	buf := &logcapture.Buffer{}
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 	t.Cleanup(func() { slog.SetDefault(prev) })

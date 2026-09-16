@@ -4,7 +4,6 @@
 package mysql
 
 import (
-	"bytes"
 	"context"
 	"log/slog"
 	"reflect"
@@ -13,6 +12,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 // fakeResult is a minimal [sql.Result] for unit-testing the
@@ -27,11 +27,11 @@ func (r fakeResult) RowsAffected() (int64, error) { return r.rowsAffected, nil }
 // captureSlog swaps slog.Default with a text handler writing into
 // buf for the duration of the test, restoring the previous default
 // on cleanup. Mirrors the helper in internal/pipeline/migrate_test.go.
-func captureSlog(t *testing.T) *bytes.Buffer {
+func captureSlog(t *testing.T) *logcapture.Buffer {
 	t.Helper()
 	prev := slog.Default()
 	t.Cleanup(func() { slog.SetDefault(prev) })
-	var buf bytes.Buffer
+	var buf logcapture.Buffer
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	return &buf
 }

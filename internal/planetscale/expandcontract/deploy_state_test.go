@@ -18,7 +18,6 @@
 package expandcontract
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"log/slog"
@@ -26,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"sluicesync.dev/sluice/internal/logcapture"
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
@@ -490,9 +490,9 @@ func TestPollDeadline_ZeroMeansUnbounded(t *testing.T) {
 
 // captureWarnLogs redirects the default slog logger into a buffer for the
 // duration of a test so the WARN-level advisories can be asserted.
-func captureWarnLogs(t *testing.T) *bytes.Buffer {
+func captureWarnLogs(t *testing.T) *logcapture.Buffer {
 	t.Helper()
-	buf := &bytes.Buffer{}
+	buf := &logcapture.Buffer{}
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 	t.Cleanup(func() { slog.SetDefault(prev) })

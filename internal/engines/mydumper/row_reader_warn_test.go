@@ -4,7 +4,6 @@
 package mydumper
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"log/slog"
@@ -12,15 +11,16 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 // captureSlog swaps the default slog logger for a buffer-backed one for
 // the duration of the test. The reader goroutine's writes happen-before
 // the row channel closes, so reading the buffer after a full drain is
 // race-free.
-func captureSlog(t *testing.T) *bytes.Buffer {
+func captureSlog(t *testing.T) *logcapture.Buffer {
 	t.Helper()
-	var buf bytes.Buffer
+	var buf logcapture.Buffer
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
 	t.Cleanup(func() { slog.SetDefault(prev) })

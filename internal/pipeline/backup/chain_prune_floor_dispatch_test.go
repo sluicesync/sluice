@@ -4,7 +4,6 @@
 package backup
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -17,6 +16,7 @@ import (
 	"sluicesync.dev/sluice/internal/crypto"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/logcapture"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
@@ -379,7 +379,7 @@ func TestCompactRetiresSignatureSiblings(t *testing.T) {
 // matches compaction's, whose identical pin is
 // TestCompactChain_OrphanSweepDeleteFailure_Warns.
 func TestPruneChain_OrphanSweepDeleteFailure_Warns(t *testing.T) {
-	var logBuf bytes.Buffer
+	var logBuf logcapture.Buffer
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 	t.Cleanup(func() { slog.SetDefault(prev) })

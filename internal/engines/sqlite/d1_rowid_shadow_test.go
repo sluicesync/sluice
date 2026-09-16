@@ -4,7 +4,6 @@
 package sqlite
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"log/slog"
@@ -16,6 +15,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/logcapture"
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
@@ -336,7 +336,7 @@ func assertRowCountMismatch(t *testing.T, err error) {
 // delivered total is not comparable and the reader WARNs — naming all three
 // numbers — instead of refusing.
 func TestD1RowReader_CountBracketWarnsOnConcurrentWrites(t *testing.T) {
-	var logBuf bytes.Buffer
+	var logBuf logcapture.Buffer
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 	defer slog.SetDefault(prev)

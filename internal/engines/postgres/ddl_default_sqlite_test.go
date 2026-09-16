@@ -4,12 +4,12 @@
 package postgres
 
 import (
-	"bytes"
 	"log/slog"
 	"strings"
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 // TestTranslateSQLiteDefaultExpr pins the portable-SQLite-default → PG map
@@ -96,7 +96,7 @@ func TestTranslateSQLiteDefaultExpr(t *testing.T) {
 // expression. The warn (not silent drop) is the load-bearing half of the
 // loud-failure tenet on this path.
 func TestEmitDefault_SQLiteNonPortableWarns(t *testing.T) {
-	var buf bytes.Buffer
+	var buf logcapture.Buffer
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 	defer slog.SetDefault(prev)

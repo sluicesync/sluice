@@ -10,9 +10,9 @@ import (
 	"testing"
 )
 
-// The guard's own pins. This type is about to have ~56 callers, so a guard
-// that did not work would be WORSE than the unguarded buffer it replaces:
-// every one of those sites would carry a false assurance.
+// The guard's own pins. This type is referenced by 91 files across 18
+// packages, so a guard that did not work would be WORSE than the unguarded
+// buffer it replaces: every one of those sites would carry a false assurance.
 //
 // These run under `-race` in CI's Test job like any other unit test, which is
 // where the concurrency assertions below actually earn their keep — without
@@ -91,8 +91,8 @@ func TestBuffer_BytesReturnsACopy(t *testing.T) {
 }
 
 // TestBuffer_AccessorsMatchBytesBuffer keeps the drop-in claim honest: the
-// sweep swaps this type in for a bytes.Buffer at ~56 sites WITHOUT reshaping
-// the assertions around it, so the accessors must behave the same.
+// sweep swapped this type in for a bytes.Buffer across the whole tree WITHOUT
+// reshaping the assertions around it, so the accessors must behave the same.
 func TestBuffer_AccessorsMatchBytesBuffer(t *testing.T) {
 	var guarded Buffer
 	var plain bytes.Buffer
@@ -111,6 +111,16 @@ func TestBuffer_AccessorsMatchBytesBuffer(t *testing.T) {
 	}
 	if guarded.Len() != plain.Len() {
 		t.Errorf("Len = %d; bytes.Buffer = %d", guarded.Len(), plain.Len())
+	}
+
+	// WriteString mirrors bytes.Buffer's, so a collapsed helper that called it
+	// keeps compiling and keeps meaning the same thing.
+	if _, err := guarded.WriteString("tail"); err != nil {
+		t.Fatalf("WriteString: %v", err)
+	}
+	plain.WriteString("tail")
+	if guarded.String() != plain.String() {
+		t.Errorf("WriteString diverges from bytes.Buffer: %q vs %q", guarded.String(), plain.String())
 	}
 
 	guarded.Reset()
@@ -135,8 +145,8 @@ func TestBuffer_ZeroValueIsReady(t *testing.T) {
 	if b.Len() != 0 || b.String() != "" || len(b.Bytes()) != 0 {
 		t.Fatalf("zero value not empty: len=%d str=%q", b.Len(), b.String())
 	}
-	if _, err := b.Write([]byte("ok")); err != nil {
-		t.Fatalf("Write on zero value: %v", err)
+	if _, err := b.WriteString("ok"); err != nil {
+		t.Fatalf("WriteString on zero value: %v", err)
 	}
 	if b.String() != "ok" {
 		t.Errorf("zero value after Write = %q", b.String())

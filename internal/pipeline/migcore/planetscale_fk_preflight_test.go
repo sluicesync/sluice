@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/logcapture"
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
@@ -33,7 +34,7 @@ func (f *fakeFKChecker) ForeignKeyStatus(context.Context) (ir.PlanetScaleForeign
 // process default), so the tests using it do not call t.Parallel.
 func captureLogs(t *testing.T, fn func()) string {
 	t.Helper()
-	var buf safeBuffer
+	var buf logcapture.Buffer
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	defer slog.SetDefault(prev)

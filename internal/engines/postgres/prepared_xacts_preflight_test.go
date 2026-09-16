@@ -4,7 +4,6 @@
 package postgres
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"database/sql/driver"
@@ -14,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 // preparedXactsDriver is a minimal fake driver whose DSN selects the
@@ -86,9 +87,9 @@ func newPreparedXactsDB(t *testing.T, scenario string) *sql.DB {
 
 // capturePreparedXactWarnLog swaps the default slog handler for a
 // WARN-level text handler writing into the returned buffer.
-func capturePreparedXactWarnLog(t *testing.T) *bytes.Buffer {
+func capturePreparedXactWarnLog(t *testing.T) *logcapture.Buffer {
 	t.Helper()
-	var buf bytes.Buffer
+	var buf logcapture.Buffer
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 	t.Cleanup(func() { slog.SetDefault(prev) })

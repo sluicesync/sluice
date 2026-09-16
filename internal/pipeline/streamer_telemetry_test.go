@@ -4,7 +4,6 @@
 package pipeline
 
 import (
-	"bytes"
 	"context"
 	"log/slog"
 	"strings"
@@ -13,6 +12,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/appliercontrol"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 // fakeTelemetry is a scriptable [ir.TargetTelemetry] for the ADR-0107
@@ -50,7 +50,7 @@ func TestEmitTargetTelemetryMetrics_AllKnown(t *testing.T) {
 		ActiveConnKnown:       true,
 		MaxConnKnown:          true,
 	}
-	var buf bytes.Buffer
+	var buf logcapture.Buffer
 	emitTargetTelemetryMetrics(&buf, "s1", snap)
 	out := buf.String()
 	for _, want := range []string{
@@ -79,7 +79,7 @@ func TestEmitTargetTelemetryMetrics_UnknownOmitted(t *testing.T) {
 		CPUKnown:  true,
 		// Mem / Storage / Lag / Conn all UNKNOWN.
 	}
-	var buf bytes.Buffer
+	var buf logcapture.Buffer
 	emitTargetTelemetryMetrics(&buf, "s1", snap)
 	out := buf.String()
 	if !strings.Contains(out, `sluice_target_cpu_util{stream_id="s1"} 0.9000`) {
@@ -139,7 +139,7 @@ func TestHandleMetrics_TelemetryNoSignalEmitsComment(t *testing.T) {
 // --- storage-headroom WARN edge-trigger (use (b)) ---
 
 func TestStorageHeadroomTick_EdgeFiresOncePerCrossing(t *testing.T) {
-	var buf bytes.Buffer
+	var buf logcapture.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
 	prov := &fakeTelemetry{ok: true, snap: ir.TargetHealthSnapshot{
 		SampledAt:             freshNow(),
@@ -186,7 +186,7 @@ func TestStorageHeadroomTick_EdgeFiresOncePerCrossing(t *testing.T) {
 // unknown-storage / stale snapshots never warn and never disturb the
 // latch.
 func TestStorageHeadroomTick_NoSignalNeverWarns(t *testing.T) {
-	var buf bytes.Buffer
+	var buf logcapture.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
 	ctx := context.Background()
 

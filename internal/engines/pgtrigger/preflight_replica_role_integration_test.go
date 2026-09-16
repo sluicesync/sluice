@@ -20,20 +20,21 @@
 package pgtrigger
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"log/slog"
 	"strings"
 	"testing"
 	"time"
+
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 // captureWarnLogs redirects the default slog logger into a buffer for the
 // duration of fn and returns everything logged.
 func captureWarnLogs(t *testing.T, fn func()) string {
 	t.Helper()
-	var buf bytes.Buffer
+	var buf logcapture.Buffer
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 	defer slog.SetDefault(prev)

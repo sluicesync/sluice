@@ -13,7 +13,6 @@ package backup
 // not just the helper's own pin.
 
 import (
-	"bytes"
 	"context"
 	"log/slog"
 	"strings"
@@ -22,14 +21,15 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/logcapture"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
 
 // captureMaintenanceSlog swaps the default slog logger for a
 // buffer-backed one for the duration of the test (single-goroutine use).
-func captureMaintenanceSlog(t *testing.T) *bytes.Buffer {
+func captureMaintenanceSlog(t *testing.T) *logcapture.Buffer {
 	t.Helper()
-	var buf bytes.Buffer
+	var buf logcapture.Buffer
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
 	t.Cleanup(func() { slog.SetDefault(prev) })
