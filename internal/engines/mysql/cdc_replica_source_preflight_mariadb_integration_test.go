@@ -87,7 +87,30 @@ func TestMariaDB_CDCReader_ReplicaSourcePreflight_NamedConnection(t *testing.T) 
 	}
 	configure := func(t *testing.T) {
 		t.Helper()
-		applyMySQL(t, dsn, `CHANGE MASTER 'conn1' TO MASTER_HOST='192.0.2.10', MASTER_PORT=3306,
+		// Self-healing precondition: if a previous subtest's teardown did not
+		// run to completion, conn1 still exists and this cell would assert on
+		// inherited state. Clear it first — that cascade is how one slow
+		// teardown became TWO failures on CI (run 35035194041, 2026-09-15:
+		// the deferred STOP blew its deadline here, and the next subtest then
+		// failed its own "want 1 connection" precondition).
+		if countStatusRows(t, dsn, "SHOW ALL REPLICAS STATUS") > 0 {
+			applyMySQL(t, dsn, "STOP REPLICA 'conn1'; RESET REPLICA 'conn1' ALL")
+		}
+		// MASTER_HOST is an address that REFUSES a connection immediately, not
+		// a black-holed one, and that difference is load-bearing for teardown.
+		// MEASURED on mariadb:11.4 (2026-09-15): pointed at 192.0.2.10
+		// (TEST-NET-1, packets dropped) the IO thread sits in "Connecting" and
+		// `STOP REPLICA 'conn1'` blocks until the connect attempt gives up —
+		// 18s locally, and past applyMySQL's 30s deadline on the CI runner,
+		// which failed the deferred teardown; MASTER_CONNECT_RETRY=1 with
+		// slave_net_timeout=10 only narrowed it to 7s. Pointed at 127.0.0.1:1
+		// the connect is refused at once, so the IO thread is between retries
+		// and STOP returns in 0–1s (three repeats), while the states both arms
+		// assert are unchanged: IO "Connecting" with SQL "Yes" while started,
+		// No/No after STOP. The MySQL sibling is unaffected either way — it
+		// stops in ~2s against the same black-holed address — so this is a
+		// MariaDB-specific teardown property, not a shared one.
+		applyMySQL(t, dsn, `CHANGE MASTER 'conn1' TO MASTER_HOST='127.0.0.1', MASTER_PORT=1,
 			MASTER_USER='repl', MASTER_PASSWORD='replpw'`)
 		// Anti-vacuity floor: this scenario must BE the bare-blind shape —
 		// the bare spelling empty, the ALL spelling listing the named
@@ -172,7 +195,11 @@ func TestMariaDB_CDCReader_ReplicaSourcePreflight_NamedConnectionLogUpdatesOn(t 
 	dsn, cleanup := newMariaDBDedicatedForCDC(t, mariadb114Image, "--log-slave-updates=ON")
 	defer cleanup()
 
-	applyMySQL(t, dsn, `CHANGE MASTER 'conn1' TO MASTER_HOST='192.0.2.10', MASTER_PORT=3306,
+	// Same refusing address as the sibling above, for one convention in this
+	// file: this cell never STARTs the connection, so its teardown never
+	// blocked — but a future cell that does start one would hit the 18s stop
+	// described there.
+	applyMySQL(t, dsn, `CHANGE MASTER 'conn1' TO MASTER_HOST='127.0.0.1', MASTER_PORT=1,
 		MASTER_USER='repl', MASTER_PASSWORD='replpw'`)
 	defer applyMySQL(t, dsn, "RESET REPLICA 'conn1' ALL")
 
