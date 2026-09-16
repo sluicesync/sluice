@@ -23,7 +23,7 @@ import (
 //
 // That is enough for the door it serves: two `migrate --resume` runs
 // pointed at DIFFERENT dumps name different directories and are refused,
-// which is the silent-adoption case (audit 2026-09-15 F-1 — before this
+// which is the silent-adoption case (audit 2026-09-15 A0915-VF2-F1 — before this
 // existed, every mydumper source rendered ONE identity). The residual is
 // narrow and in the safe direction: two dumps of different databases
 // staged into the SAME directory path, one after the other, compare

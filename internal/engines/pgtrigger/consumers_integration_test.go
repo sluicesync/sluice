@@ -35,7 +35,7 @@ func openTriggerReader(t *testing.T, ctx context.Context, dsn string) *CDCReader
 }
 
 // TestChangeLogConsumerID_RawInvalidByteIsRefusedAndTheEscapedFormInserts is
-// the real-server half of audit 2026-09-15 F-4.
+// the real-server half of audit 2026-09-15 A0915-VF2-F4.
 //
 // The registry's consumer_id is a TEXT PRIMARY KEY on the SOURCE, and PostgreSQL
 // refuses an invalid byte sequence in a TEXT column with SQLSTATE 22021. The

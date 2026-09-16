@@ -18,7 +18,7 @@ import (
 )
 
 // identityEngine is a stubEngine that DOES describe its identity — the
-// shape every registered engine has since audit 2026-09-15 F-1. The
+// shape every registered engine has since audit 2026-09-15 A0915-VF2-F1. The
 // bare stubEngine, which does not, is the other half of the dispatch and
 // is exercised beside it.
 type identityEngine struct {
@@ -294,7 +294,7 @@ func TestRefuseForeignSourceOnResume_WarnsWhenUndiscriminated(t *testing.T) {
 // produce two different FIELDS is the engines' half, and it is graded
 // against real engines by docsync.TestSourceIdentityIsInjectiveThroughRealDSNs.
 // Both halves are needed: an injective framing over a colliding
-// extractor is exactly the vacuous door audit 2026-09-15 F-1 found.
+// extractor is exactly the vacuous door audit 2026-09-15 A0915-VF2-F1 found.
 func TestRenderSourceIdentity_InjectiveAndStorable(t *testing.T) {
 	t.Parallel()
 

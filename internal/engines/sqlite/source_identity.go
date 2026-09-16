@@ -19,7 +19,7 @@ import (
 // shapes, so EVERY SQLite source — every file, every dump — rendered one
 // identity and `migrate --resume` pointed at a second database adopted
 // the first one's completed copy, exiting 0 having copied nothing
-// (audit 2026-09-15 F-1).
+// (audit 2026-09-15 A0915-VF2-F1).
 //
 // [dsnFormParts] is the shared normaliser the read and write paths both
 // use, so the three accepted spellings collapse the way the connection

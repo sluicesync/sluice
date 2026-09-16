@@ -27,7 +27,7 @@ const defaultSchema = "public"
 //
 // Both accepted forms are read, and the KEY/VALUE form is read the way
 // libpq reads it rather than the way a whitespace split does. That
-// distinction is the finding (audit 2026-09-15 F-3): a `strings.Fields`
+// distinction is the finding (audit 2026-09-15 A0915-VF2-F3): a `strings.Fields`
 // walk taking the FIRST `dbname=` rendered `host=h dbname='a b'` and
 // `host=h dbname='a c'` identically, took `a` from `dbname=a dbname=b`
 // where libpq and pgx take `b`, and read `x` out of

@@ -27,7 +27,7 @@ import (
 
 // sourceIdentityExempt is the fail-by-default exemption map for
 // [TestEverySourceEngineDescribesItsIdentity]. It is EMPTY on purpose
-// (audit 2026-09-15 F-1): every engine can be a `migrate --resume`
+// (audit 2026-09-15 A0915-VF2-F1): every engine can be a `migrate --resume`
 // SOURCE against a target that stores migration state, so every one of
 // them must be able to say which source a DSN names. An entry here needs
 // a reason, and the reason would have to explain why a resume pointed at
@@ -119,7 +119,7 @@ var sourceIdentityDSNs = map[string]identityDSNs{
 }
 
 // TestEverySourceEngineDescribesItsIdentity is the registry-derived
-// roster for audit 2026-09-15 F-1: `migrate --resume` refuses a foreign
+// roster for audit 2026-09-15 A0915-VF2-F1: `migrate --resume` refuses a foreign
 // source, and that refusal is only as good as the identity it compares.
 //
 // SCOPE, so the name cannot be read as broader than the truth. It grades
@@ -252,7 +252,7 @@ func TestEverySourceEngineDescribesItsIdentity(t *testing.T) {
 	}
 	if len(exempted) > 0 {
 		t.Errorf("sourceIdentityExempt is expected to be EMPTY (every engine describes its source identity "+
-			"since audit 2026-09-15 F-1); it exempts %v", exempted)
+			"since audit 2026-09-15 A0915-VF2-F1); it exempts %v", exempted)
 	}
 	registered := map[string]bool{}
 	for _, n := range names {
@@ -280,7 +280,7 @@ func isMySQLFamilyName(name string) bool {
 }
 
 // TestSourceIdentityIsInjectiveThroughRealDSNs is the other half of the
-// door's injectivity, and the half audit 2026-09-15 F-3 found broken.
+// door's injectivity, and the half audit 2026-09-15 A0915-VF2-F3 found broken.
 //
 // The pipeline's own test grades the FRAMING — fields in, one string out
 // — and says so. It cannot grade the step before it, because the

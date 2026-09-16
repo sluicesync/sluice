@@ -1080,7 +1080,7 @@ func (m *Migrator) openResumeContext(ctx context.Context, resetting bool) (resum
 	// --resume adopts prior state, so an id alone can no longer make this
 	// run inherit a copy made from a different source
 	// (A0915-STATE-MEDIUM-1). The ENGINE answers for its own DSN grammar
-	// (ir.SourceIdentityDescriber, audit 2026-09-15 F-1); `discriminating`
+	// (ir.SourceIdentityDescriber, audit 2026-09-15 A0915-VF2-F1); `discriminating`
 	// is false when that answer names no dataset, which the door WARNs
 	// about rather than reading as proof. Per-database in the
 	// multi-database fan-out, which clones this Migrator with a

@@ -464,7 +464,7 @@ func TestChangeLogConsumerID_CutsOnARuneBoundary(t *testing.T) {
 		}
 	}
 
-	// The audit 2026-09-15 F-4 cells: a byte that was ALREADY invalid.
+	// The audit 2026-09-15 A0915-VF2-F4 cells: a byte that was ALREADY invalid.
 	// The rune-boundary cut alone could never repair one — utf8.RuneStart
 	// is TRUE for 0xFF, so the cut steps straight over it — and an id
 	// under the clamp is not cut at all, so the length loop above could

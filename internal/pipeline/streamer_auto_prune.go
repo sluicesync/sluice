@@ -121,7 +121,7 @@ func ChangeLogConsumerID(streamID, targetEngine, targetDSN string) string {
 	// true for 0xFF, so a byte that was ALREADY invalid — an operator's
 	// --stream-id carrying raw bytes, a DSN that does — survived the cut
 	// untouched and the registry write was still refused; and an id under
-	// the 512-byte clamp was never cut at all (audit 2026-09-15 F-4).
+	// the 512-byte clamp was never cut at all (audit 2026-09-15 A0915-VF2-F4).
 	// [storableIdentity], not storableDiagnostic: this is an identity, and
 	// it must not collapse two streams onto one row. Pinned by
 	// TestChangeLogConsumerID_CutsOnARuneBoundary.

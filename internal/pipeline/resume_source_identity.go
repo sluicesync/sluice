@@ -30,7 +30,7 @@
 // of this file parsed DSNs in the orchestrator and knew three shapes —
 // Postgres URI, libpq key/value, and the go-sql-driver `@tcp(`/`@unix(`
 // forms — returning "" for everything else. The damage was not a missing
-// feature but a VACUOUS door, and it was wide (audit 2026-09-15 F-1,
+// feature but a VACUOUS door, and it was wide (audit 2026-09-15 A0915-VF2-F1,
 // measured by the reviewer against byte-identical copies of the shipped
 // functions): two different SQLite files, two different D1 databases,
 // two mydumper dumps, two flat files, and two MySQL DSNs spelled
