@@ -183,9 +183,29 @@ jobs:
             echo "leak check: no org configured; skipping."
             exit 0
           fi
-          leaked=$(curl -sS -H "Authorization: ${PLANETSCALE_SERVICE_TOKEN_ID}:${PLANETSCALE_SERVICE_TOKEN}" \
-            "https://api.planetscale.com/v1/organizations/${PLANETSCALE_ORG}/databases?per_page=100" \
-            | grep -o '"name":"nekiverify-[^"]*"' | wc -l)
+          # This step runs under `-e -o pipefail`, and `grep` EXITS 1 when it
+          # matches nothing. The original one-liner therefore failed the step
+          # in exactly the healthy case — zero leaked databases — which is how
+          # run 35532480478 reported a leak-check failure while the operator
+          # confirmed the org was empty. A guard that reds when all is well
+          # teaches people to ignore the one signal protecting spend, so the
+          # API call and the count are now separated and each is allowed to
+          # come back empty on its own terms.
+          if ! body=$(curl -sS -H "Authorization: ${PLANETSCALE_SERVICE_TOKEN_ID}:${PLANETSCALE_SERVICE_TOKEN}" \
+            "https://api.planetscale.com/v1/organizations/${PLANETSCALE_ORG}/databases?per_page=100"); then
+            echo "::warning::leak check: the PlanetScale API call failed, so teardown could NOT be confirmed this run. Check the org by hand."
+            exit 0
+          fi
+          # grep exits 1 on no match, so `|| true` guards the whole pipeline
+          # under `pipefail` while wc still prints its 0.
+          #
+          # grep -o | wc -l counts OCCURRENCES, not matching lines. That is not
+          # a style choice: the API returns the entire database list on ONE
+          # line, so a line-based count (grep -c) reports 1 no matter how many
+          # databases leaked — it would warn correctly and then state a wrong
+          # number, which is worse than not counting at all.
+          leaked=$(printf '%s' "$body" | grep -o '"name":"nekiverify-[^"]*"' | wc -l || true)
+          leaked=$(printf '%s' "${leaked:-0}" | tr -d '[:space:]')
           if [ "$leaked" -gt 0 ]; then
             echo "::warning::${leaked} nekiverify-* database(s) still exist. Each run's t.Cleanup should delete its own; the next run's sweep will remove any older than 3h. A RECURRING count here means teardown is failing and the sweep is carrying the whole burden."
           else

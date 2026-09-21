@@ -442,25 +442,56 @@ func nekiConcurrentCopyLimitHoldsOnTheCluster(ctx context.Context, t *testing.T,
 				measured+1, measured, nekiConcurrentCopyLimit, refusal, censusNote)
 		}
 
-		// The SQLSTATE is already guaranteed to be 53300 — the loop refuses to
-		// treat anything else as a limit, and re-asserting it here would be a
-		// check that cannot fail.
+		// What is worth grading here is the refusal's MESSAGE: sluice's
+		// operator-facing remedy for this condition quotes the platform's own
+		// wording, so a reworded refusal leaves sluice explaining a sentence
+		// the operator is not reading.
 		//
-		// What is still worth grading is the MESSAGE. sluice's operator-facing
-		// remedy for this condition quotes the platform's own wording, so a
-		// reworded refusal leaves sluice explaining a sentence the operator is
-		// not reading.
+		// This block used to open by asserting the SQLSTATE "is already
+		// guaranteed to be 53300". It is not — see the branch below, which is
+		// what that false guarantee cost.
 		if refusal != nil {
+			// NOT "guaranteed by the loop above" — that comment was true when
+			// it was written and was falsified by a later change, which is the
+			// shape CLAUDE.md warns about. `refusal` is a PLAIN error in three
+			// places, none of which carries a SQLSTATE:
+			//
+			//   - a router close DURING the burst (no SQLSTATE, wrapped);
+			//   - the same in the settle window;
+			//   - the synthesized late-53300 summary above, added with the
+			//     deferred-refusal measurement and not wrapped at all.
+			//
+			// Run 35532480478 (2026-09-20) took the third: the burst reached
+			// its probe ceiling without a refusal, 4 sessions came back 53300
+			// on release, the summary error was synthesized, and this line
+			// dereferenced a nil *pgconn.PgError and PANICKED — killing the
+			// test binary and with it every arm after this one, on a live
+			// (billed) Neki cluster. Discarding errors.As's boolean is what
+			// let a false comment read as a guarantee.
 			var pgErr *pgconn.PgError
-			_ = errors.As(refusal, &pgErr) // guaranteed by the loop above
-			t.Logf("the concurrency refusal reads: %s (SQLSTATE %s)", pgErr.Message, pgErr.Code)
+			if !errors.As(refusal, &pgErr) {
+				t.Logf("NEKI-COPYLIMIT: the refusal carries no SQLSTATE to grade (%v) — it arrived as a "+
+					"connection close or as the synthesized late-refusal summary, not as a server-sent "+
+					"PgError. The measurement above stands; only the WORDING check below needs a real "+
+					"53300, so it is skipped rather than failed.", refusal)
+			} else {
+				// The SQLSTATE is already guaranteed to be 53300 by the branch
+				// that produced this PgError, and re-asserting it here would be
+				// a check that cannot fail.
+				//
+				// What is still worth grading is the MESSAGE. sluice's
+				// operator-facing remedy for this condition quotes the
+				// platform's own wording, so a reworded refusal leaves sluice
+				// explaining a sentence the operator is not reading.
+				t.Logf("the concurrency refusal reads: %s (SQLSTATE %s)", pgErr.Message, pgErr.Code)
 
-			lower := strings.ToLower(pgErr.Message)
-			if !strings.Contains(lower, "copy") && !strings.Contains(lower, "concurrent") {
-				t.Errorf("the 53300 refusal no longer mentions COPY or concurrency (%q).\n\n"+
-					"The code is what sluice classifies on, so nothing breaks — but the operator-facing "+
-					"remedy paraphrases this wording, and a refusal about something else arriving under "+
-					"53300 would make that remedy misleading rather than merely stale.", pgErr.Message)
+				lower := strings.ToLower(pgErr.Message)
+				if !strings.Contains(lower, "copy") && !strings.Contains(lower, "concurrent") {
+					t.Errorf("the 53300 refusal no longer mentions COPY or concurrency (%q).\n\n"+
+						"The code is what sluice classifies on, so nothing breaks — but the operator-facing "+
+						"remedy paraphrases this wording, and a refusal about something else arriving under "+
+						"53300 would make that remedy misleading rather than merely stale.", pgErr.Message)
+				}
 			}
 		}
 	})

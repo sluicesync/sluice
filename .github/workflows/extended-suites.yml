@@ -177,36 +177,48 @@ jobs:
         with:
           go-version-file: go.mod
 
-      # The reshard harness hardcodes vitess/lite:latest (vrVitessImage
-      # in vitess_cluster_reshard_integration_test.go). Pull the GHCR
-      # :latest mirror and retag it locally so testcontainers'
-      # PullIfNotPresent finds it without touching docker.io. The
-      # sluice-vitess mirror predates the sluice-mirror-* naming rule, so
-      # the helper gets the mirror ref explicitly via --mirror; it adds
-      # the docker.io ::warning fallback the bare pull+tag lacked.
+      # The reshard harness hardcodes vitess/lite:latest (vrVitessImage in
+      # vitess_cluster_reshard_integration_test.go), so whatever we pull has to
+      # end up under that local name. We pull a PINNED DIGEST and retag it.
       #
-      # IMAGE-TIMING DEPENDENCY (do not treat this leg's reshard tests as
-      # base-image-independent): sluice-vitess:latest is republished by the
-      # Sunday 06:00 UTC prebake (build-prebaked-images.yml) right before this
-      # workflow's 10:00 schedule, so a schedule run always gets the FRESH
-      # image while an ad-hoc workflow_dispatch may hit an older cached one.
-      # The post-SwitchTraffic "new-tablet-not-serving" window (roadmap 72(b))
-      # is sensitive to that image's vttablet/vtgate healthcheck timing — a
-      # fresh image widened it enough to make
-      # TestVitessReshard_RelaxSkewReshardMidStream deterministically red on the
-      # reopen's first Recv. The item 72(b) fix (a narrow retriable carve-out in
-      # classifyReaderError + the reshard-reopen PRIMARY-pin) landed in v0.131.4
-      # and demonstrably works (run 32874285337: all retries hit the PRIMARY),
-      # but the fresh image widened the PRIMARY's healthcheck-settling window
-      # past the ride-out budget, so the test REMAINS QUARANTINED (see the run
-      # step's count + roadmap 72(b)) until the image window is fixed.
-      - name: Pull the GHCR :latest mirror and retag as vitess/lite:latest
+      # PINNED 2026-09-20, and this leg is the reason the pin exists. It was the
+      # ONLY leg riding a floating tag — every other leg in this workflow pins
+      # v24.0.1 — and sluice-vitess:latest is republished by the Sunday 06:00 UTC
+      # prebake (build-prebaked-images.yml) a few hours before this workflow's
+      # schedule, so every scheduled run got a FRESH image. The post-SwitchTraffic
+      # "new-tablet-not-serving" window (roadmap 72(b)) is sensitive to that
+      # image's vttablet/vtgate healthcheck timing.
+      #
+      # On 2026-09-20 a fresh image took out TWO of the four exactly-once oracles
+      # — StreamerFollowsReshardEndToEnd and ChaosExactlyOnce — both green on
+      # 09-06 and 09-13. That also falsified the premise the
+      # RelaxSkewReshardMidStream quarantine was scoped on ("the no-toxiproxy
+      # sibling passes in the same run"). Measured, not inferred: the green 09-13
+      # run (34761999726) pulled sha256:9270ca63… and the red 09-20 run
+      # (35515339149) pulled sha256:4310886e…
+      #
+      # The digest below is the one that was GREEN on 2026-09-13. The retry budget
+      # was deliberately NOT raised: roadmap 72(b) says in as many words, do NOT
+      # inflate the retry budget to chase the image window.
+      #
+      # ci-ghcr-pull.sh, NOT ci-mirror-pull.sh --mirror: the mirror helper falls
+      # back to a docker.io pull of the STOCK ref on a miss with only a
+      # ::warning, which for a pin is silent RE-FLOATING — the leg would quietly
+      # go back to upstream vitess/lite:latest, the exact coupling this pin
+      # removes. ci-ghcr-pull.sh retries and then fails loudly.
+      #
+      # Fresh-image coverage is not lost: vitess-version-matrix.yml is what sweeps
+      # versions. This leg's job is sluice's reshard correctness, which wants a
+      # fixed substrate. Lift the pin when the image's healthcheck-settling window
+      # is fixed, together with the RelaxSkewReshardMidStream quarantine.
+      - name: Pull the PINNED Vitess image and retag as vitess/lite:latest
         env:
           GHCR_USER: ${{ github.actor }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          bash scripts/ci-mirror-pull.sh \
-            --mirror ghcr.io/sluicesync/sluice-vitess:latest vitess/lite:latest
+          PINNED='ghcr.io/sluicesync/sluice-vitess@sha256:9270ca630ad44457ae745c1031cf6232667bdebdac06da2d7c407b022374ad7e'
+          bash scripts/ci-ghcr-pull.sh "$PINNED"
+          docker tag "$PINNED" vitess/lite:latest
 
       - name: Run the reshard suite
         run: |
