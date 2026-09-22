@@ -6,6 +6,7 @@ package ir
 import (
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -219,6 +220,62 @@ func TestUnmarshalTable_OldWireLeavesConstraintNamedFalse(t *testing.T) {
 	}
 	if out.PrimaryKey.Name != "orders_pk" {
 		t.Errorf("PrimaryKey.Name = %q; want orders_pk", out.PrimaryKey.Name)
+	}
+}
+
+// TestMarshalTable_IndexColumnCollationRoundTrip pins GC-5's per-index-
+// column collation across the backup / schema-history wire on both
+// carriers — a secondary index and the primary key — and, on the SAME
+// table, that an entry carrying no collation writes NO key at all: the
+// `omitempty` is what keeps every existing chain's schema fingerprint
+// byte-identical (Bug 216's lesson — a field that marshals on every
+// manifest partitions the field by release).
+func TestMarshalTable_IndexColumnCollationRoundTrip(t *testing.T) {
+	in := &Table{
+		Name: "accounts",
+		Columns: []*Column{
+			{Name: "code", Type: Text{Size: TextLong}},
+			{Name: "email", Type: Text{Size: TextLong}},
+		},
+		PrimaryKey: &Index{Unique: true, Columns: []IndexColumn{{Column: "code", Collation: "NOCASE", CollationDialect: "sqlite"}}},
+		Indexes: []*Index{
+			{
+				Name: "accounts_email_key", Unique: true, ConstraintBacked: true,
+				Columns: []IndexColumn{{Column: "email", Collation: "NOCASE", CollationDialect: "sqlite", Desc: true}},
+			},
+			{Name: "accounts_email_idx", Columns: []IndexColumn{{Column: "email"}}},
+		},
+	}
+	b, err := MarshalTable(in)
+	if err != nil {
+		t.Fatalf("MarshalTable: %v", err)
+	}
+	if n := strings.Count(string(b), `"Collation"`); n != 2 {
+		t.Errorf("wire carries %d Collation keys; want exactly 2 (the PK and the unique) — an empty entry must write none (json=%s)", n, b)
+	}
+	out, err := UnmarshalTable(b)
+	if err != nil {
+		t.Fatalf("UnmarshalTable: %v", err)
+	}
+	if !reflect.DeepEqual(in.PrimaryKey, out.PrimaryKey) || !reflect.DeepEqual(in.Indexes, out.Indexes) {
+		t.Errorf("index-column collation did not round-trip:\n in: %#v %#v\nout: %#v %#v\njson=%s",
+			in.PrimaryKey, in.Indexes, out.PrimaryKey, out.Indexes, b)
+	}
+}
+
+// TestUnmarshalTable_OldWireLeavesIndexColumnCollationEmpty pins the
+// cross-version contract: a manifest written before GC-5 carries no
+// Collation key, and must decode to an empty (default-comparison) entry —
+// what that binary itself would have emitted. Additive wire, no format bump.
+func TestUnmarshalTable_OldWireLeavesIndexColumnCollationEmpty(t *testing.T) {
+	const oldWire = `{"Name":"accounts","Indexes":[{"Name":"accounts_email_key","Unique":true,"Columns":[{"Column":"email","Desc":false,"Length":0}]}]}`
+	out, err := UnmarshalTable([]byte(oldWire))
+	if err != nil {
+		t.Fatalf("UnmarshalTable: %v", err)
+	}
+	c := out.Indexes[0].Columns[0]
+	if c.Collation != "" || c.CollationDialect != "" {
+		t.Errorf("an older manifest decoded a collation %q/%q — a restore would refuse or emit a comparison the writing binary never carried", c.Collation, c.CollationDialect)
 	}
 }
 

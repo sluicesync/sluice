@@ -697,10 +697,18 @@ func TestD1SchemaReader_UniqueConstraintAutoIndex(t *testing.T) {
 				{"seq": 0, "name": "sqlite_autoindex_users_1", "unique": 1, "origin": "u", "partial": 0},
 				{"seq": 1, "name": "users_handle_uq", "unique": 1, "origin": "c", "partial": 0},
 			})
-		case strings.Contains(sql, "index_info('sqlite_autoindex_users_1')"):
-			return http.StatusOK, d1OK([]map[string]any{{"seqno": 0, "cid": 1, "name": "email"}})
-		case strings.Contains(sql, "index_info('users_handle_uq')"):
-			return http.StatusOK, d1OK([]map[string]any{{"seqno": 0, "cid": 2, "name": "handle"}})
+		case strings.Contains(sql, "index_xinfo('sqlite_autoindex_users_1')"):
+			// index_xinfo shape: the trailing key=0 rowid entry SQLite
+			// appends to every index must be skipped (GC-5).
+			return http.StatusOK, d1OK([]map[string]any{
+				{"seqno": 0, "cid": 1, "name": "email", "desc": 0, "coll": "BINARY", "key": 1},
+				{"seqno": 1, "cid": -1, "name": nil, "desc": 0, "coll": "BINARY", "key": 0},
+			})
+		case strings.Contains(sql, "index_xinfo('users_handle_uq')"):
+			return http.StatusOK, d1OK([]map[string]any{
+				{"seqno": 0, "cid": 2, "name": "handle", "desc": 1, "coll": "NOCASE", "key": 1},
+				{"seqno": 1, "cid": -1, "name": nil, "desc": 0, "coll": "BINARY", "key": 0},
+			})
 		default:
 			return http.StatusOK, d1OK(nil)
 		}
@@ -721,6 +729,14 @@ func TestD1SchemaReader_UniqueConstraintAutoIndex(t *testing.T) {
 	named := indexByName(users, "users_handle_uq")
 	if named == nil || !named.Unique || named.ConstraintBacked {
 		t.Errorf("named CREATE UNIQUE INDEX = %+v; want verbatim name, Unique, NOT ConstraintBacked", named)
+	}
+	// GC-5: the index_xinfo DESC and non-default collation ride the column.
+	if named != nil && (len(named.Columns) != 1 || !named.Columns[0].Desc ||
+		named.Columns[0].Collation != "NOCASE" || named.Columns[0].CollationDialect != sqliteDialect) {
+		t.Errorf("users_handle_uq columns = %+v; want handle DESC COLLATE NOCASE tagged sqlite", named.Columns)
+	}
+	if auto != nil && (auto.Columns[0].Collation != "" || auto.Columns[0].Desc) {
+		t.Errorf("BINARY default collation must not be carried: %+v", auto.Columns)
 	}
 	for _, idx := range users.Indexes {
 		if strings.HasPrefix(idx.Name, "sqlite_") {
@@ -814,14 +830,16 @@ func TestD1SchemaReader_SchemaFeatures(t *testing.T) {
 				{"seq": 0, "name": "calc_lname_idx", "unique": 0, "origin": "c", "partial": 0},
 				{"seq": 1, "name": "calc_active_idx", "unique": 0, "origin": "c", "partial": 1},
 			})
-		case strings.Contains(sql, "index_info('calc_active_idx')"):
+		case strings.Contains(sql, "index_xinfo('calc_active_idx')"):
 			return http.StatusOK, d1OK([]map[string]any{
-				{"seqno": 0, "cid": 1, "name": "name"},
+				{"seqno": 0, "cid": 1, "name": "name", "desc": 0, "coll": "BINARY", "key": 1},
+				{"seqno": 1, "cid": -1, "name": nil, "desc": 0, "coll": "BINARY", "key": 0},
 			})
-		case strings.Contains(sql, "index_info('calc_lname_idx')"):
-			// Expression entry: NULL column name.
+		case strings.Contains(sql, "index_xinfo('calc_lname_idx')"):
+			// Expression entry: NULL column name, cid -2.
 			return http.StatusOK, d1OK([]map[string]any{
-				{"seqno": 0, "cid": -2, "name": nil},
+				{"seqno": 0, "cid": -2, "name": nil, "desc": 0, "coll": "BINARY", "key": 1},
+				{"seqno": 1, "cid": -1, "name": nil, "desc": 0, "coll": "BINARY", "key": 0},
 			})
 		case strings.Contains(sql, "foreign_key_list"):
 			return http.StatusOK, d1OK(nil)

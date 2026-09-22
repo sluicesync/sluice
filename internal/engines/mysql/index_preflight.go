@@ -5,6 +5,7 @@ package mysql
 
 import (
 	"errors"
+	"fmt"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -50,6 +51,15 @@ func (Engine) PreflightIndexes(s *ir.Schema) error {
 		if table == nil {
 			continue
 		}
+		// GC-5: the PRIMARY KEY is walked for its one refusable attribute —
+		// a foreign-dialect collation on a key column, which emitTableDef
+		// refuses at CREATE TABLE. (The predicate walk above it still has
+		// nothing to ask of a PK.)
+		if pk := table.PrimaryKey; pk != nil {
+			if err := refuseUnrepresentableCollation(pk.Columns, "mysql: primary key on "+table.Name, true); err != nil {
+				return err
+			}
+		}
 		for _, idx := range table.Indexes {
 			if idx == nil {
 				continue
@@ -58,6 +68,10 @@ func (Engine) PreflightIndexes(s *ir.Schema) error {
 				continue
 			}
 			if err := refuseUnrepresentablePredicate(idx, "mysql: table "+table.Name); err != nil {
+				return err
+			}
+			if err := refuseUnrepresentableCollation(idx.Columns, fmt.Sprintf("mysql: index %q", idx.Name),
+				idx.Unique || idx.ConstraintBacked); err != nil {
 				return err
 			}
 		}

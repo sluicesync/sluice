@@ -100,6 +100,34 @@ var sqliteIndexShapes = []struct {
 			Columns: []ir.IndexColumn{{Column: "email"}},
 		},
 	},
+	{
+		// GC-5: a SQLite-dialect collation is this target's own vocabulary
+		// and is emitted verbatim — refusing it would break every
+		// SQLite→SQLite migrate of a NOCASE key.
+		name: "UNIQUE over a sqlite-dialect NOCASE column",
+		idx: &ir.Index{
+			Name: "users_email_key", Unique: true,
+			Columns: []ir.IndexColumn{{Column: "email", Collation: "NOCASE", CollationDialect: "sqlite"}},
+		},
+	},
+	{
+		// GC-5: a collation from another engine's vocabulary cannot be
+		// enforced here; on a uniqueness-enforcing key it is refused.
+		name: "UNIQUE over a foreign-dialect collation",
+		idx: &ir.Index{
+			Name: "users_email_key", Unique: true,
+			Columns: []ir.IndexColumn{{Column: "email", Collation: "und-x-icu", CollationDialect: "postgres"}},
+		},
+		wantRefused: true,
+	},
+	{
+		// …and on a NON-unique index it is dropped with a WARN, not refused.
+		name: "non-unique index over a foreign-dialect collation",
+		idx: &ir.Index{
+			Name:    "users_email_idx",
+			Columns: []ir.IndexColumn{{Column: "email", Collation: "und-x-icu", CollationDialect: "postgres"}},
+		},
+	},
 }
 
 func TestPreflightIndexesAgreesWithTheEmitter(t *testing.T) {

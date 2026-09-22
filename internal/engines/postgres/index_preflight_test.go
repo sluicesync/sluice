@@ -135,6 +135,55 @@ var pgIndexShapes = []pgPreflightTable{
 		}),
 		emit: emitViaCreateIndex,
 	},
+	// GC-5: a SQLite NOCASE collation on a key column is part of the
+	// constraint and Postgres cannot enforce it — refused at every
+	// uniqueness-enforcing site, dropped with a WARN on a non-unique index.
+	{
+		name: "PRIMARY KEY over a NOCASE column",
+		table: pgTableWith(&ir.Index{
+			Name: "PRIMARY", Unique: true, Columns: []ir.IndexColumn{nocaseCol("email")},
+		}),
+		emit: emitViaTableDef, wantRefused: true,
+	},
+	{
+		name: "UNIQUE index over a NOCASE column (CREATE INDEX route)",
+		table: pgTableWith(nil, &ir.Index{
+			Name: "uq_email", Unique: true, Columns: []ir.IndexColumn{nocaseCol("email")},
+		}),
+		emit: emitViaCreateIndex, wantRefused: true,
+	},
+	{
+		name: "constraint-backed UNIQUE over a NOCASE column (ADD CONSTRAINT route)",
+		table: pgTableWith(nil, &ir.Index{
+			Name: "uq_email", Unique: true, ConstraintBacked: true, Columns: []ir.IndexColumn{nocaseCol("email")},
+		}),
+		emit: emitViaAddConstraint, wantRefused: true,
+	},
+	{
+		name: "non-unique index over a NOCASE column",
+		table: pgTableWith(nil, &ir.Index{
+			Name: "idx_email", Columns: []ir.IndexColumn{nocaseCol("email")},
+		}),
+		emit: emitViaCreateIndex,
+	},
+	{
+		// GC-22: a constraint-backed name is emitted VERBATIM in the
+		// constraints phase — after the copy — and a SQLite-generated
+		// `<table>_<cols>_key` is not bounded. The emitter refuses >63 bytes;
+		// the preflight must agree, before any data moves.
+		name: "constraint-backed UNIQUE whose name exceeds 63 bytes",
+		table: pgTableWith(nil, &ir.Index{
+			Name: strings.Repeat("x", 64), Unique: true, ConstraintBacked: true,
+			Columns: []ir.IndexColumn{{Column: "email"}},
+		}),
+		emit: emitViaAddConstraint, wantRefused: true,
+	},
+}
+
+// nocaseCol is an index entry compared under SQLite's NOCASE — the shape the
+// SQLite reader carries for `email TEXT COLLATE NOCASE UNIQUE` (GC-5).
+func nocaseCol(name string) ir.IndexColumn {
+	return ir.IndexColumn{Column: name, Collation: "NOCASE", CollationDialect: "sqlite"}
 }
 
 func TestPreflightIndexesAgreesWithTheEmitter(t *testing.T) {

@@ -72,6 +72,9 @@ func (Engine) PreflightIndexes(s *ir.Schema) error {
 			if err := refuseUnrepresentablePrefix(pk.Columns, where, primaryKeyKey); err != nil {
 				return err
 			}
+			if err := refuseUnrepresentableCollation(pk.Columns, where, primaryKeyKey); err != nil {
+				return err
+			}
 		}
 		for _, idx := range table.Indexes {
 			if idx == nil {
@@ -85,6 +88,11 @@ func (Engine) PreflightIndexes(s *ir.Schema) error {
 				return err
 			}
 			if err := refuseUnrepresentablePrefix(idx.Columns, where, indexKeyKind(idx.Unique)); err != nil {
+				return err
+			}
+			// The fourth (GC-5): a foreign-dialect collation on a
+			// uniqueness-enforcing key, the same verdict the emitter gives.
+			if err := refuseUnrepresentableCollation(idx.Columns, where, indexKeyKind(idx.Unique)); err != nil {
 				return err
 			}
 		}

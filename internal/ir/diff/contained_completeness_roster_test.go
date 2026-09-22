@@ -381,6 +381,26 @@ var indexColumnFieldProbes = map[string]containedFieldProbe{
 			return nil
 		},
 	},
+	"Collation": {
+		// GC-5, the same class as Length: a key column's collation decides
+		// which values count as equal, so a target that lost NOCASE admits
+		// rows the source rejects.
+		mutate: func(s *ir.Schema) {
+			s.Tables[0].Indexes[0].Columns[0].Collation = "NOCASE"
+			s.Tables[0].Indexes[0].Columns[0].CollationDialect = "sqlite"
+		},
+		wantInSummary: "index mismatch",
+		wantInDiff: func(d SchemaDiff) error {
+			id, err := oneIndexDiff(d)
+			if err != nil {
+				return err
+			}
+			if !strings.Contains(id.ActualColumns, "COLLATE NOCASE") {
+				return fmt.Errorf("ActualColumns does not carry the collation: %+v", id)
+			}
+			return nil
+		},
+	},
 }
 
 var indexColumnFieldExempt = map[string]string{
@@ -390,6 +410,8 @@ var indexColumnFieldExempt = map[string]string{
 		"index searches, not what the table admits",
 	"ExpressionDialect": "a provenance tag on the expression TEXT — same class as Column.GeneratedExprDialect; the expression body IS " +
 		"rendered into the compared column list",
+	"CollationDialect": "a provenance tag on the collation NAME — same class as ExpressionDialect; the collation itself IS rendered " +
+		"into the compared column list (the Collation probe)",
 }
 
 // ---- ir.ForeignKey ----

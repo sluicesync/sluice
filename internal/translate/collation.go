@@ -76,6 +76,31 @@ func ColumnCollation(t ir.Type) (charset, collation string) {
 	return "", ""
 }
 
+// ForeignIndexCollations lists the entries of cols whose carried INDEX
+// collation ([ir.IndexColumn.Collation]) a writer of targetDialect cannot
+// enforce — every entry whose CollationDialect differs from targetDialect
+// — as "column (collation)" strings in index order. An entry carrying no
+// collation is never foreign. The writer decides what to do with the
+// list: on a key that enforces uniqueness the collation is part of the
+// constraint and the key is refused; on a non-unique index it is dropped
+// with a WARN (GC-5). Unlike [DroppedCollationColumns], the dialect is an
+// explicit tag rather than charset-presence, so "sqlite" is a real dialect
+// here — the SQLite writer enforces its own collations verbatim.
+func ForeignIndexCollations(cols []ir.IndexColumn, targetDialect string) []string {
+	var out []string
+	for _, c := range cols {
+		if c.Collation == "" || c.CollationDialect == targetDialect {
+			continue
+		}
+		name := c.Column
+		if name == "" {
+			name = "(" + c.Expression + ")"
+		}
+		out = append(out, name+" ("+c.Collation+")")
+	}
+	return out
+}
+
 // DroppedCollationColumns lists the columns of tbl whose carried
 // collation a writer of targetDialect cannot emit ("column (collation)"
 // per entry, declaration order). A writer drops exactly these — the

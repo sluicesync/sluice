@@ -108,6 +108,26 @@ var mysqlIndexShapes = []struct {
 			Predicate: "deleted_at IS NULL", PredicateDialect: "sqlite",
 		},
 	},
+	{
+		// GC-5: a SQLite NOCASE collation on a UNIQUE key is part of the
+		// constraint; no MySQL collation folds ASCII case only, so the key
+		// cannot be reproduced by spelling and is refused.
+		name: "UNIQUE over a NOCASE column",
+		idx: &ir.Index{
+			Name: "users_email_nocase_uniq", Unique: true,
+			Columns: []ir.IndexColumn{{Column: "email", Collation: "NOCASE", CollationDialect: "sqlite"}},
+		},
+		wantRefused: true,
+	},
+	{
+		// …and on a NON-unique index it is an ordering/cost choice: dropped
+		// with a WARN, never refused.
+		name: "non-unique index over a NOCASE column",
+		idx: &ir.Index{
+			Name:    "users_email_nocase_idx",
+			Columns: []ir.IndexColumn{{Column: "email", Collation: "NOCASE", CollationDialect: "sqlite"}},
+		},
+	},
 }
 
 // TestPreflightIndexesAgreesWithTheEmitter is the verdict-agreement gate. The

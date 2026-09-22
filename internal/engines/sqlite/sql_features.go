@@ -525,15 +525,41 @@ func parseIndexColEntry(raw string) indexColEntry {
 type indexInfoEntry struct {
 	name   string
 	isExpr bool
+	// desc and coll come from PRAGMA index_xinfo (GC-5): the entry's sort
+	// direction and the collation it compares under. coll is SQLite's own
+	// name — BINARY (the default), NOCASE, RTRIM, or a registered one.
+	desc bool
+	coll string
 }
 
-// buildIndexColumns combines the PRAGMA index_info entries with the CREATE INDEX
-// SQL to produce IR index columns. A plain-column index (no NULL-name entries)
-// is built from index_info alone — byte-identical to the pre-ADR-0133 reader.
-// An expression index carries each NULL-name entry's expression (tagged
-// "sqlite") parsed from the CREATE INDEX list; if that list can't be cleanly
-// parsed into the same number of entries, the whole index is WARN-skipped
-// (ok=false) rather than carrying a guessed expression (ADR-0133 §A.4).
+// sqliteDefaultCollation is the comparison every SQLite index column uses
+// unless declared otherwise, and the one every target already has — so it
+// is never carried into the IR.
+const sqliteDefaultCollation = "BINARY"
+
+// applyIndexEntryAttributes stamps one index_xinfo entry's direction and
+// collation onto its IR column. A non-default collation is carried under
+// the "sqlite" dialect tag so a target that cannot enforce the same
+// comparison refuses (unique) or warns (non-unique), and a SQLite target
+// emits it verbatim (GC-5).
+func applyIndexEntryAttributes(c *ir.IndexColumn, e indexInfoEntry) {
+	c.Desc = e.desc
+	if e.coll == "" || strings.EqualFold(e.coll, sqliteDefaultCollation) {
+		return
+	}
+	c.Collation = e.coll
+	c.CollationDialect = sqliteDialect
+}
+
+// buildIndexColumns combines the PRAGMA index_xinfo entries with the CREATE
+// INDEX SQL to produce IR index columns. A plain-column index (no NULL-name
+// entries) is built from index_xinfo alone — the pre-ADR-0133 column set, now
+// carrying each entry's DESC and non-default collation (GC-5; the reader used
+// index_info, which exposes neither). An expression index carries each
+// NULL-name entry's expression (tagged "sqlite") parsed from the CREATE INDEX
+// list; if that list can't be cleanly parsed into the same number of entries,
+// the whole index is WARN-skipped (ok=false) rather than carrying a guessed
+// expression (ADR-0133 §A.4).
 func buildIndexColumns(ctx context.Context, tableName, indexName string, entries []indexInfoEntry, createIndexSQL string) (cols []ir.IndexColumn, exprCount int, ok bool) {
 	hasExpr := false
 	for _, e := range entries {
@@ -546,6 +572,7 @@ func buildIndexColumns(ctx context.Context, tableName, indexName string, entries
 		cols = make([]ir.IndexColumn, len(entries))
 		for i, e := range entries {
 			cols[i] = ir.IndexColumn{Column: e.name}
+			applyIndexEntryAttributes(&cols[i], e)
 		}
 		return cols, 0, true
 	}
@@ -566,14 +593,38 @@ func buildIndexColumns(ctx context.Context, tableName, indexName string, entries
 			cols[i] = ir.IndexColumn{
 				Expression:        parsed[i].text,
 				ExpressionDialect: sqliteDialect,
-				Desc:              parsed[i].desc,
 			}
 			exprCount++
 		} else {
 			cols[i] = ir.IndexColumn{Column: e.name}
 		}
+		// Direction and collation come from the catalog for both entry
+		// kinds; the parsed DESC only ever restated what index_xinfo reports.
+		applyIndexEntryAttributes(&cols[i], e)
 	}
 	return cols, exprCount, true
+}
+
+// applyPrimaryKeyIndexAttributes carries the PK auto-index's per-column
+// DESC and non-default collation onto t.PrimaryKey, matched by column name
+// (the table_xinfo pk ordering and the index's key entries agree). Only a
+// NON-rowid-alias key has such an index; the alias is INTEGER and carries
+// neither attribute. A `code TEXT COLLATE NOCASE PRIMARY KEY` is the shape
+// this exists for: the collation is part of the key's uniqueness (GC-5).
+func applyPrimaryKeyIndexAttributes(t *ir.Table, entries []indexInfoEntry) {
+	if t.PrimaryKey == nil {
+		return
+	}
+	for _, e := range entries {
+		if e.isExpr {
+			continue
+		}
+		for i := range t.PrimaryKey.Columns {
+			if t.PrimaryKey.Columns[i].Column == e.name {
+				applyIndexEntryAttributes(&t.PrimaryKey.Columns[i], e)
+			}
+		}
+	}
 }
 
 // warnTableVerbatim emits ONE WARN per table that carries any "sqlite"-dialect

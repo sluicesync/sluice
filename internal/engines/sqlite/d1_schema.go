@@ -236,13 +236,20 @@ func (r *D1SchemaReader) readIndexes(ctx context.Context, t *ir.Table) (pkIndexP
 		if err != nil {
 			return false, err
 		}
-		if origin == "pk" {
-			pkIndexPresent = true
-			continue
-		}
 		name, err := rowString(row, "name")
 		if err != nil {
 			return false, err
+		}
+		if origin == "pk" {
+			// Captured from table_xinfo; the index contributes only the
+			// per-column DESC / collation, as in the file engine (GC-5).
+			pkIndexPresent = true
+			entries, err := r.readIndexColumns(ctx, name)
+			if err != nil {
+				return false, err
+			}
+			applyPrimaryKeyIndexAttributes(t, entries)
+			continue
 		}
 		unique, err := rowInt(row, "unique")
 		if err != nil {
@@ -291,21 +298,38 @@ func (r *D1SchemaReader) readIndexes(ctx context.Context, t *ir.Table) (pkIndexP
 	return pkIndexPresent, nil
 }
 
-// readIndexColumns returns the index_info entries of one index in position
-// order; an entry with a NULL column name is an expression entry (isExpr) whose
-// text lives in the CREATE INDEX SQL — mirrors the file engine.
+// readIndexColumns returns the KEY entries of one index in position order
+// from PRAGMA index_xinfo (auxiliary key=0 entries skipped); an entry with a
+// NULL column name is an expression entry (isExpr) whose text lives in the
+// CREATE INDEX SQL — mirrors the file engine, including the per-entry DESC
+// and collation carry (GC-5).
 func (r *D1SchemaReader) readIndexColumns(ctx context.Context, indexName string) ([]indexInfoEntry, error) {
-	rows, err := r.client.queryRows(ctx, "PRAGMA index_info("+quotePragmaArg(indexName)+")")
+	rows, err := r.client.queryRows(ctx, "PRAGMA index_xinfo("+quotePragmaArg(indexName)+")")
 	if err != nil {
 		return nil, err
 	}
 	var entries []indexInfoEntry
 	for _, row := range rows {
+		key, err := rowInt(row, "key")
+		if err != nil {
+			return nil, err
+		}
+		if key == 0 {
+			continue
+		}
 		name, present, err := rowNullString(row, "name")
 		if err != nil {
 			return nil, err
 		}
-		entries = append(entries, indexInfoEntry{name: name, isExpr: !present})
+		desc, err := rowInt(row, "desc")
+		if err != nil {
+			return nil, err
+		}
+		coll, _, err := rowNullString(row, "coll")
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, indexInfoEntry{name: name, isExpr: !present, desc: desc == 1, coll: coll})
 	}
 	return entries, nil
 }

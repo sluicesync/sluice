@@ -62,6 +62,35 @@ func TestColumnCollation(t *testing.T) {
 	}
 }
 
+// TestForeignIndexCollations pins the per-index-column scan (GC-5): an
+// entry tagged with the target's own dialect is enforceable and never
+// listed, a foreign one lists (an expression entry under its expression),
+// and an entry with no collation is never foreign — for every target
+// dialect, including "sqlite", which is a real producer here.
+func TestForeignIndexCollations(t *testing.T) {
+	cols := []ir.IndexColumn{
+		{Column: "email", Collation: "NOCASE", CollationDialect: "sqlite"},
+		{Column: "code"},
+		{Expression: "lower(name)", Collation: "und-x-icu", CollationDialect: "postgres"},
+	}
+	cases := []struct {
+		target string
+		want   []string
+	}{
+		{"sqlite", []string{"(lower(name)) (und-x-icu)"}},
+		{"postgres", []string{"email (NOCASE)"}},
+		{"mysql", []string{"email (NOCASE)", "(lower(name)) (und-x-icu)"}},
+	}
+	for _, tc := range cases {
+		if got := ForeignIndexCollations(cols, tc.target); !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("%s target: foreign = %v; want %v", tc.target, got, tc.want)
+		}
+	}
+	if got := ForeignIndexCollations(nil, "postgres"); got != nil {
+		t.Errorf("nil columns: foreign = %v; want nil", got)
+	}
+}
+
 // TestDroppedCollationColumns pins the per-table drop scan each writer
 // WARNs from: same-dialect collations survive, foreign ones list, and
 // an unknown target dialect (sqlite) treats every collation as foreign.

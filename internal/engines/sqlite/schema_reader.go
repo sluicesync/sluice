@@ -333,13 +333,16 @@ func (r *SchemaReader) readIndexes(ctx context.Context, t *ir.Table) (pkIndexPre
 		return false, err
 	}
 	for _, m := range metas {
-		if m.origin == "pk" {
-			pkIndexPresent = true
-			continue // captured from table_xinfo
-		}
 		entries, err := r.readIndexColumns(ctx, m.name)
 		if err != nil {
 			return false, err
+		}
+		if m.origin == "pk" {
+			// The key itself is captured from table_xinfo; its index only
+			// contributes per-column DESC / collation (GC-5).
+			pkIndexPresent = true
+			applyPrimaryKeyIndexAttributes(t, entries)
+			continue
 		}
 		// The CREATE INDEX SQL is needed only for an expression index or a
 		// partial index; an ordinary plain-column index reads from index_info
@@ -462,13 +465,17 @@ func (r *SchemaReader) indexListMetas(ctx context.Context, table string) ([]idxM
 	return metas, nil
 }
 
-// readIndexColumns returns the index_info entries of one index in position
-// order. An entry whose column name is NULL is an expression entry (isExpr
-// true); its expression text lives in the CREATE INDEX SQL.
+// readIndexColumns returns the KEY entries of one index in position order,
+// from PRAGMA index_xinfo — index_info plus each entry's `desc`, `coll` and
+// `key` (GC-5). Auxiliary entries (key = 0: the rowid, or a WITHOUT ROWID
+// table's remaining PK columns, which SQLite appends to every index) are
+// skipped, so the column set is exactly what index_info returned. An entry
+// whose column name is NULL is an expression entry (isExpr true); its
+// expression text lives in the CREATE INDEX SQL.
 func (r *SchemaReader) readIndexColumns(ctx context.Context, indexName string) ([]indexInfoEntry, error) {
-	rows, err := r.db.QueryContext(ctx, "PRAGMA index_info("+quotePragmaArg(indexName)+")")
+	rows, err := r.db.QueryContext(ctx, "PRAGMA index_xinfo("+quotePragmaArg(indexName)+")")
 	if err != nil {
-		return nil, fmt.Errorf("sqlite: index_info(%q): %w", indexName, err)
+		return nil, fmt.Errorf("sqlite: index_xinfo(%q): %w", indexName, err)
 	}
 	defer func() { _ = rows.Close() }()
 
@@ -478,14 +485,20 @@ func (r *SchemaReader) readIndexColumns(ctx context.Context, indexName string) (
 			seqno int
 			cid   int
 			name  sql.NullString
+			desc  int
+			coll  string
+			key   int
 		)
-		if err := rows.Scan(&seqno, &cid, &name); err != nil {
-			return nil, fmt.Errorf("sqlite: scan index_info(%q): %w", indexName, err)
+		if err := rows.Scan(&seqno, &cid, &name, &desc, &coll, &key); err != nil {
+			return nil, fmt.Errorf("sqlite: scan index_xinfo(%q): %w", indexName, err)
 		}
-		entries = append(entries, indexInfoEntry{name: name.String, isExpr: !name.Valid})
+		if key == 0 {
+			continue
+		}
+		entries = append(entries, indexInfoEntry{name: name.String, isExpr: !name.Valid, desc: desc == 1, coll: coll})
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("sqlite: iterate index_info(%q): %w", indexName, err)
+		return nil, fmt.Errorf("sqlite: iterate index_xinfo(%q): %w", indexName, err)
 	}
 	return entries, nil
 }

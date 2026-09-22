@@ -845,6 +845,27 @@ type IndexColumn struct {
 	// AM has a default opclass for the column type (the common case
 	// for btree/gin/gist over built-in types).
 	OperatorClass string
+
+	// Collation is the collation this index column compares under, in the
+	// SOURCE engine's own vocabulary, set only when it differs from that
+	// engine's default comparison — so the common case carries nothing and
+	// an older manifest decodes identically. CollationDialect tags the
+	// vocabulary, following the Expression / ExpressionDialect precedent
+	// (the per-column collation on ir.Text keys its dialect on charset
+	// presence, which an index column has no charset to key on). "sqlite"
+	// is the only producer today: the SQLite/D1 readers carry NOCASE /
+	// RTRIM off PRAGMA index_xinfo and never BINARY, the default (GC-5).
+	//
+	// A writer of a different dialect cannot enforce the same comparison.
+	// On a key that enforces uniqueness the collation is part of the
+	// CONSTRAINT — `email TEXT COLLATE NOCASE UNIQUE` refuses 'A@X' after
+	// 'a@x', a BINARY unique admits both — so such a key is REFUSED before
+	// any data moves; on a non-unique index it changes cost and order, not
+	// which rows are legal, and is dropped with a marked WARN. A same-
+	// dialect writer emits it verbatim. `omitempty` keeps the wire and the
+	// backup schema fingerprint byte-identical whenever it is empty.
+	Collation        string `json:",omitempty"`
+	CollationDialect string `json:",omitempty"`
 }
 
 // FKAction is the action to take on a referenced row's UPDATE or DELETE.

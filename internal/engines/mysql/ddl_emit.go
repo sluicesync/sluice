@@ -1477,6 +1477,11 @@ func (m mysqlEmitter) emitTableDefWithDomainChecks(table *ir.Table, inlineCheckS
 					"it mid-way and satisfy by COMMIT — the classic bulk key shift UPDATE t SET id = id + 1 — "+
 					"aborts on the target with a duplicate-key error; verify any such workload before cutover")
 		}
+		// GC-5: a PRIMARY KEY enforces uniqueness by definition, so a
+		// foreign-dialect collation on one of its columns is refused here.
+		if err := checkIndexColumnCollation(table.PrimaryKey.Columns, "mysql: primary key on "+table.Name, true); err != nil {
+			return "", err
+		}
 		sb.WriteString("  PRIMARY KEY ")
 		sb.WriteString(emitIndexColumnList(table.PrimaryKey.Columns, m.backslashEscapes))
 		if hasInlineIdx || hasUserChecks || hasDomainChecks {
@@ -1495,6 +1500,10 @@ func (m mysqlEmitter) emitTableDefWithDomainChecks(table *ir.Table, inlineCheckS
 		// it never reaches emitAddIndexClause's check. A source partial UNIQUE
 		// index on the auto-increment column lands here.
 		if err := checkIndexPredicate(inlineIdx, "mysql: table "+table.Name+" (inline auto-increment key)"); err != nil {
+			return "", err
+		}
+		if err := checkIndexColumnCollation(inlineIdx.Columns,
+			"mysql: table "+table.Name+" (inline auto-increment key)", inlineIdx.Unique); err != nil {
 			return "", err
 		}
 		sb.WriteString("  ")
@@ -1522,6 +1531,10 @@ func (m mysqlEmitter) emitTableDefWithDomainChecks(table *ir.Table, inlineCheckS
 		// the column list directly (audit 2026-08-01 S8). A partial unique
 		// index promoted as the PK-less table's copy key would arrive widened.
 		if err := checkIndexPredicate(copyUniqueIdx, "mysql: table "+table.Name+" (inline copy unique key)"); err != nil {
+			return "", err
+		}
+		if err := checkIndexColumnCollation(copyUniqueIdx.Columns,
+			"mysql: table "+table.Name+" (inline copy unique key)", true); err != nil {
 			return "", err
 		}
 		sb.WriteString("  UNIQUE KEY ")
@@ -1646,6 +1659,60 @@ func checkIndexPredicate(idx *ir.Index, where string) error {
 	return nil
 }
 
+// checkIndexColumnCollation decides what happens to a per-column INDEX
+// COLLATION carried from another engine's vocabulary when the target is
+// MySQL (GC-5 — the collation sibling of [checkIndexPredicate], same two-way
+// policy). No reader produces a "mysql" index-column collation today (MySQL
+// has no per-index-column collation; a MySQL key compares under its
+// column's collation), so every carried one is foreign here. SQLite's
+// NOCASE folds ASCII case only and RTRIM ignores trailing spaces; no MySQL
+// collation is either (utf8mb4_0900_ai_ci also folds accents and Unicode
+// case), so neither can be reproduced by spelling:
+//
+//   - On a key that ENFORCES UNIQUENESS the collation is part of the
+//     constraint, and a key compared under the column's MySQL collation
+//     admits rows the source rejects AND rejects rows it holds. Refused.
+//   - On a NON-unique index it changes ordering and cost, not which rows
+//     are legal, so it is dropped with a marked WARN.
+func checkIndexColumnCollation(cols []ir.IndexColumn, where string, enforcesUniqueness bool) error {
+	if err := refuseUnrepresentableCollation(cols, where, enforcesUniqueness); err != nil {
+		return err
+	}
+	foreign := translate.ForeignIndexCollations(cols, "mysql")
+	if len(foreign) == 0 {
+		return nil
+	}
+	slog.Warn(
+		"INDEX-COLLATION-DROPPED: index column collation dropped: MySQL cannot enforce a collation from "+
+			"another engine's vocabulary, so this non-unique index compares under the column's own "+
+			"collation. This changes the index's ordering and cost, not which rows are legal",
+		slog.String("context", where),
+		slog.String("columns", strings.Join(foreign, ", ")),
+	)
+	return nil
+}
+
+// refuseUnrepresentableCollation is the REFUSAL half of
+// [checkIndexColumnCollation], split out so [Engine.PreflightIndexes] can
+// ask the question before any data moves without re-emitting the WARN.
+func refuseUnrepresentableCollation(cols []ir.IndexColumn, where string, enforcesUniqueness bool) error {
+	if !enforcesUniqueness {
+		return nil
+	}
+	foreign := translate.ForeignIndexCollations(cols, "mysql")
+	if len(foreign) == 0 {
+		return nil
+	}
+	return fmt.Errorf(
+		"%s: column(s) %s compare under a collation from another engine's vocabulary, which MySQL cannot "+
+			"enforce. On a key that enforces uniqueness the collation is part of the CONSTRAINT: which "+
+			"values the source treats as equal is what the key refuses, and a MySQL key compared under the "+
+			"column's own collation would admit rows the source rejects (and reject rows it holds) — "+
+			"silently. Re-create the key on the source over a BINARY-collated column, or exclude the table",
+		where, strings.Join(foreign, ", "),
+	)
+}
+
 // refuseUnrepresentablePredicate is the REFUSAL half of
 // [checkIndexPredicate] — the same condition and the same message, with the
 // advisory WARN left behind.
@@ -1745,6 +1812,10 @@ func emitAddIndexClause(idx *ir.Index, backslashEscapes bool) (string, error) {
 	// inline sites carry their own call, since they render a column list
 	// directly and never reach here.
 	if err := checkIndexPredicate(idx, "mysql"); err != nil {
+		return "", err
+	}
+	// GC-5, at the same chokepoint and for the same reason.
+	if err := checkIndexColumnCollation(idx.Columns, fmt.Sprintf("mysql: index %q", idx.Name), idx.Unique); err != nil {
 		return "", err
 	}
 

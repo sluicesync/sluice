@@ -1713,6 +1713,62 @@ func checkIndexPrefixLength(cols []ir.IndexColumn, where string, enforcesUniquen
 	return nil
 }
 
+// checkIndexColumnCollation decides what happens to a per-column INDEX
+// COLLATION carried from another engine's vocabulary when the target is
+// Postgres (GC-5 — the collation sibling of [checkIndexPrefixLength], same
+// two-way policy). No reader produces a "postgres" index-column collation
+// today (the PG reader does not read indcollation), so every carried one is
+// foreign here; SQLite's NOCASE has no PG equivalent (a case-insensitive
+// unique on PG is a nondeterministic ICU collation, citext, or an index over
+// lower(col) — a different schema, not a spelling) and RTRIM has none at all:
+//
+//   - On a key that ENFORCES UNIQUENESS the collation is part of the
+//     constraint — `email TEXT COLLATE NOCASE UNIQUE` refuses 'A@X' after
+//     'a@x' and a PG unique over the same column admits both — so the key
+//     is refused rather than silently widened.
+//   - On a NON-unique index it changes ordering and cost, not which rows
+//     are legal, so it is dropped with a marked WARN.
+func checkIndexColumnCollation(cols []ir.IndexColumn, where string, enforcesUniqueness bool) error {
+	if err := refuseUnrepresentableCollation(cols, where, enforcesUniqueness); err != nil {
+		return err
+	}
+	foreign := translate.ForeignIndexCollations(cols, "postgres")
+	if len(foreign) == 0 {
+		return nil
+	}
+	slog.Warn(
+		"INDEX-COLLATION-DROPPED: index column collation dropped: Postgres cannot enforce a collation from "+
+			"another engine's vocabulary, so this non-unique index compares under the column's own "+
+			"collation. This changes the index's ordering and cost, not which rows are legal",
+		slog.String("context", where),
+		slog.String("columns", strings.Join(foreign, ", ")),
+	)
+	return nil
+}
+
+// refuseUnrepresentableCollation is the REFUSAL half of
+// [checkIndexColumnCollation], split out so [Engine.PreflightIndexes] can
+// ask the question before any data moves without re-emitting the WARN.
+func refuseUnrepresentableCollation(cols []ir.IndexColumn, where string, enforcesUniqueness bool) error {
+	if !enforcesUniqueness {
+		return nil
+	}
+	foreign := translate.ForeignIndexCollations(cols, "postgres")
+	if len(foreign) == 0 {
+		return nil
+	}
+	return fmt.Errorf(
+		"%s: column(s) %s compare under a collation from another engine's vocabulary, which Postgres "+
+			"cannot enforce. On a key that enforces uniqueness the collation is part of the CONSTRAINT: "+
+			"which values the source treats as equal is what the key refuses, and a Postgres key over the "+
+			"column's own collation would admit rows the source rejects — silently. Reproduce a "+
+			"case-insensitive key with a unique expression index over the lower-cased column or a citext "+
+			"column on the target, re-create the key on the source over a BINARY-collated column, or "+
+			"exclude the table",
+		where, strings.Join(foreign, ", "),
+	)
+}
+
 // refuseUnrepresentablePrefix is the REFUSAL half of
 // [checkIndexPrefixLength] — the same condition and the same message, with
 // the advisory WARN left behind.
@@ -1777,6 +1833,9 @@ func refuseUnrepresentablePrefix(cols []ir.IndexColumn, where string, enforcesUn
 // Same-dialect / untagged expressions pass through verbatim.
 func emitIndexColumnList(cols []ir.IndexColumn, opts emitOpts, where string, enforcesUniqueness bool) (string, error) {
 	if err := checkIndexPrefixLength(cols, where, enforcesUniqueness); err != nil {
+		return "", err
+	}
+	if err := checkIndexColumnCollation(cols, where, enforcesUniqueness); err != nil {
 		return "", err
 	}
 	parts := make([]string, len(cols))
@@ -2227,8 +2286,11 @@ func emitAddUniqueConstraint(schema, tableName string, idx *ir.Index) (string, e
 	// a UNIQUE CONSTRAINT enforces uniqueness by definition. Sharing the
 	// helper rather than the loop is what keeps the two from drifting
 	// (audit 2026-08-01 S8).
-	if err := checkIndexPrefixLength(idx.Columns,
-		fmt.Sprintf("postgres: unique constraint %q on %s.%s", idx.Name, schema, tableName), true); err != nil {
+	constraintWhere := fmt.Sprintf("postgres: unique constraint %q on %s.%s", idx.Name, schema, tableName)
+	if err := checkIndexPrefixLength(idx.Columns, constraintWhere, true); err != nil {
+		return "", err
+	}
+	if err := checkIndexColumnCollation(idx.Columns, constraintWhere, true); err != nil {
 		return "", err
 	}
 

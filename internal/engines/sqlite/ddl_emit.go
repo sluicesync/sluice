@@ -476,9 +476,11 @@ func emitTableDef(table *ir.Table) (string, error) {
 	// PRIMARY KEY constrains the data by definition, and pk.Unique is NOT a
 	// reliable stand-in (the CDC readers build a PrimaryKey with it unset).
 	if table.PrimaryKey != nil {
-		if err := refuseUnrepresentablePrefix(
-			table.PrimaryKey.Columns, "sqlite: primary key on "+table.Name, primaryKeyKey,
-		); err != nil {
+		pkWhere := "sqlite: primary key on " + table.Name
+		if err := refuseUnrepresentablePrefix(table.PrimaryKey.Columns, pkWhere, primaryKeyKey); err != nil {
+			return "", err
+		}
+		if err := checkIndexColumnCollation(table.PrimaryKey.Columns, pkWhere, primaryKeyKey); err != nil {
 			return "", err
 		}
 	}
@@ -517,7 +519,11 @@ func emitTableDef(table *ir.Table) (string, error) {
 
 	// Table-level PRIMARY KEY for the composite / non-integer case only.
 	if table.PrimaryKey != nil && inlinePKCol == "" {
-		parts = append(parts, "PRIMARY KEY "+quoteIndexColumnList(table.PrimaryKey.Columns))
+		pkCols, err := quoteIndexColumnList(table.PrimaryKey.Columns, "sqlite: primary key on "+table.Name)
+		if err != nil {
+			return "", err
+		}
+		parts = append(parts, "PRIMARY KEY "+pkCols)
 	}
 
 	// User CHECK constraints, in the IR's preserved source order.
@@ -596,6 +602,13 @@ func emitCreateIndex(tableName string, idx *ir.Index) (string, error) {
 	if err := checkIndexPrefixLength(idx.Columns, where, indexKeyKind(idx.Unique)); err != nil {
 		return "", err
 	}
+	if err := checkIndexColumnCollation(idx.Columns, where, indexKeyKind(idx.Unique)); err != nil {
+		return "", err
+	}
+	colList, err := emitIndexColumnList(idx.Columns, where)
+	if err != nil {
+		return "", err
+	}
 
 	var sb strings.Builder
 	sb.WriteString("CREATE ")
@@ -607,7 +620,7 @@ func emitCreateIndex(tableName string, idx *ir.Index) (string, error) {
 	sb.WriteString(" ON ")
 	sb.WriteString(quoteIdent(tableName))
 	sb.WriteByte(' ')
-	sb.WriteString(emitIndexColumnList(idx.Columns))
+	sb.WriteString(colList)
 	if idx.Predicate != "" {
 		sb.WriteString(" WHERE ")
 		sb.WriteString(idx.Predicate)
@@ -654,11 +667,12 @@ func emitCreateView(v *ir.View) string {
 	return "CREATE VIEW IF NOT EXISTS " + quoteIdent(v.Name) + " AS " + body
 }
 
-// emitIndexColumnList renders an index/PK column list, honouring DESC and
-// carrying an expression entry verbatim. Per-column collation / NULLS
-// ordering / operator class are PG-isms SQLite doesn't take here; a plain
-// column or DESC column covers the round-trip cases.
-func emitIndexColumnList(cols []ir.IndexColumn) string {
+// emitIndexColumnList renders an index column list, honouring DESC, a
+// same-dialect per-column COLLATE (GC-5), and carrying an expression entry
+// verbatim. NULLS ordering / operator class are PG-isms SQLite doesn't take
+// here. A FOREIGN-dialect collation has already been refused or WARN-dropped
+// by [checkIndexColumnCollation] at the caller, so only "sqlite" ones render.
+func emitIndexColumnList(cols []ir.IndexColumn, where string) (string, error) {
 	parts := make([]string, len(cols))
 	for i, c := range cols {
 		var seg string
@@ -667,28 +681,114 @@ func emitIndexColumnList(cols []ir.IndexColumn) string {
 		} else {
 			seg = quoteIdent(c.Column)
 		}
+		coll, err := emitIndexColumnCollation(c, where)
+		if err != nil {
+			return "", err
+		}
+		seg += coll
 		if c.Desc {
 			seg += " DESC"
 		}
 		parts[i] = seg
 	}
-	return "(" + strings.Join(parts, ", ") + ")"
+	return "(" + strings.Join(parts, ", ") + ")", nil
+}
+
+// emitIndexColumnCollation renders ` COLLATE <name>` for a same-dialect
+// index-column collation, or "" when the entry carries none (or a foreign
+// one, which the caller has already dropped with a WARN). The name lands
+// BARE in the DDL, so it is shape-checked before interpolation (the ADR-0183
+// rule): SQLite's built-ins and any registered collation are identifiers; a
+// value carrying a quote, a space or a `;` is refused, never interpolated.
+func emitIndexColumnCollation(c ir.IndexColumn, where string) (string, error) {
+	if c.Collation == "" || c.CollationDialect != sqliteDialect {
+		return "", nil
+	}
+	if !isBareIdent(c.Collation) {
+		return "", fmt.Errorf("%s: index-column collation %q is not a bare identifier; refusing to interpolate it",
+			where, c.Collation)
+	}
+	return " COLLATE " + c.Collation, nil
 }
 
 // quoteIndexColumnList is the plain-column form used for the table-level
 // PRIMARY KEY clause (PK columns are always real columns, never
-// expressions, in the IR).
+// expressions, in the IR), honouring a same-dialect COLLATE and DESC on a
+// key column — `PRIMARY KEY ("code" COLLATE NOCASE)` is how SQLite spells a
+// case-insensitive key, and dropping it would widen the key (GC-5).
 //
 // It drops IndexColumn.Length, which is correct ONLY because [emitTableDef]
 // has already refused a prefixed PRIMARY KEY outright (roadmap item 120).
 // Until that refusal existed this function silently widened the key — the
 // prefix vanished here and nothing else looked at it.
-func quoteIndexColumnList(cols []ir.IndexColumn) string {
+func quoteIndexColumnList(cols []ir.IndexColumn, where string) (string, error) {
 	names := make([]string, len(cols))
 	for i, c := range cols {
-		names[i] = quoteIdent(c.Column)
+		coll, err := emitIndexColumnCollation(c, where)
+		if err != nil {
+			return "", err
+		}
+		names[i] = quoteIdent(c.Column) + coll
+		if c.Desc {
+			names[i] += " DESC"
+		}
 	}
-	return "(" + strings.Join(names, ", ") + ")"
+	return "(" + strings.Join(names, ", ") + ")", nil
+}
+
+// checkIndexColumnCollation decides what happens to a per-column index
+// COLLATION the SQLite target cannot enforce — one tagged with another
+// engine's dialect (GC-5, the collation sibling of [checkIndexPrefixLength];
+// same two-way policy, same reason):
+//
+//   - On a key that ENFORCES UNIQUENESS the collation is part of the
+//     constraint: which pairs of values count as equal is what the key
+//     refuses. A key compared under a different collation admits rows the
+//     source rejects (or rejects rows it holds) — silently, at exit 0.
+//     Refused.
+//   - On a NON-unique index it changes ordering and cost, not which rows
+//     are legal, so it is dropped with a marked WARN.
+//
+// A same-dialect ("sqlite") collation is enforced verbatim by the emitters
+// and never reaches either branch.
+func checkIndexColumnCollation(cols []ir.IndexColumn, where string, kind keyKind) error {
+	if err := refuseUnrepresentableCollation(cols, where, kind); err != nil {
+		return err
+	}
+	foreign := translate.ForeignIndexCollations(cols, sqliteDialect)
+	if len(foreign) == 0 {
+		return nil
+	}
+	slog.Warn(
+		"INDEX-COLLATION-DROPPED: index column collation dropped: SQLite cannot enforce a collation from "+
+			"another engine's vocabulary, so this non-unique index compares under SQLite's default BINARY "+
+			"collation. This changes the index's ordering and cost, not which rows are legal",
+		slog.String("context", where),
+		slog.String("columns", strings.Join(foreign, ", ")),
+	)
+	return nil
+}
+
+// refuseUnrepresentableCollation is the REFUSAL half of
+// [checkIndexColumnCollation], split out for the same reason as
+// [refuseUnrepresentablePrefix]: [Engine.PreflightIndexes] asks the question
+// before any data moves without re-emitting the advisory WARN.
+func refuseUnrepresentableCollation(cols []ir.IndexColumn, where string, kind keyKind) error {
+	if !kind.enforcesUniqueness() {
+		return nil
+	}
+	foreign := translate.ForeignIndexCollations(cols, sqliteDialect)
+	if len(foreign) == 0 {
+		return nil
+	}
+	return fmt.Errorf(
+		"%s: column(s) %s compare under a collation from another engine's vocabulary, which SQLite cannot "+
+			"enforce. On a key that enforces uniqueness the collation is part of the CONSTRAINT: which "+
+			"values the source treats as equal is what the key refuses, and a SQLite key compared under "+
+			"its default BINARY collation would admit rows the source rejects (or reject rows it holds) — "+
+			"silently. Re-create the key on the source over a BINARY-collated column, or exclude the table",
+		where, strings.Join(foreign, ", "),
+	)
 }
 
 // quoteColumnList renders a parenthesised, comma-separated list of quoted

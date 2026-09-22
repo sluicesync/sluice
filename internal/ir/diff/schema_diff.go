@@ -1434,6 +1434,13 @@ func renderIndexColumns(idx *ir.Index) string {
 				seg += fmt.Sprintf("(%d)", c.Length)
 			}
 		}
+		// A per-column collation is part of a unique key's CONSTRAINT (which
+		// values count as equal), so a target that lost it admits rows the
+		// source rejects — the same reason the prefix length renders (GC-5).
+		// The dialect tag is provenance and is not rendered.
+		if c.Collation != "" {
+			seg += " COLLATE " + c.Collation
+		}
 		if c.Desc {
 			seg += " DESC"
 		}

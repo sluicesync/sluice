@@ -167,6 +167,21 @@ until then, edit the source expression or re-add the object on the target if it 
 (MySQL has no partial-index support, so a SQLite partial index lands as a full index on a
 MySQL target — its predicate is not representable there.)
 
+**Index-column collations (`COLLATE NOCASE` / `RTRIM`) are carried, and a key the target
+cannot enforce is refused before any data moves.** SQLite compares an index column under
+the collation it was declared with, so `email TEXT COLLATE NOCASE UNIQUE` refuses `'A@X'`
+after `'a@x'`; sluice reads that per column from `PRAGMA index_xinfo` (`BINARY`, the
+default, is never carried). A SQLite target emits it verbatim and enforces the same key.
+Postgres and MySQL have no spelling for `NOCASE` or `RTRIM`, so on a `PRIMARY KEY`, a
+`UNIQUE` or a constraint-backed unique the migration is **refused at preflight**, naming the
+column and collation — the alternative was a BINARY unique that admits rows the source
+rejects, at exit 0 (reproduce a case-insensitive key on the target with an expression index
+over the lower-cased column, or `citext` on Postgres, then exclude the table from sluice's
+index carry by re-creating the key on the source over a BINARY column). On a **non-unique**
+index the collation only changes ordering and cost, so it is dropped with an
+**`INDEX-COLLATION-DROPPED`** WARN naming the columns. A `COLLATE` on a column that is part
+of no index is not yet read and lands under the target's default collation without a WARN.
+
 ## Continuous sync: the `sqlite-trigger` CDC source (ADR-0135)
 
 Beyond the one-shot `migrate`, a **local SQLite file** can be a continuous-sync source —

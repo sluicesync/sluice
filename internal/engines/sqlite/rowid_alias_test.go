@@ -89,6 +89,9 @@ func rowidAliasMatrix() []rowidAliasCell {
 		{"column-constraint PK", "CREATE TABLE t(id %s PRIMARY KEY, v TEXT)%s"},
 		{"column-constraint PK DESC", "CREATE TABLE t(id %s PRIMARY KEY DESC, v TEXT)%s"},
 		{"table-constraint PK", "CREATE TABLE t(id %s, v TEXT, PRIMARY KEY(id))%s"},
+		// The documented asymmetry: DESC in the table-constraint form still
+		// aliases, unlike the column-constraint form above.
+		{"table-constraint PK DESC", "CREATE TABLE t(id %s, v TEXT, PRIMARY KEY(id DESC))%s"},
 	}
 	storages := []struct{ name, suffix string }{
 		{"rowid", ""},
@@ -105,10 +108,25 @@ func rowidAliasMatrix() []rowidAliasCell {
 			}
 		}
 	}
-	cells = append(cells, rowidAliasCell{
-		name: "INTEGER/AUTOINCREMENT keyword/rowid",
-		ddl:  "CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)",
-	})
+	cells = append(
+		cells,
+		rowidAliasCell{
+			name: "INTEGER/AUTOINCREMENT keyword/rowid",
+			ddl:  "CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)",
+		},
+		// A STRICT table admits only INT/INTEGER/REAL/TEXT/BLOB/ANY, so it
+		// gets one row on the aliasing spelling rather than the whole matrix.
+		rowidAliasCell{
+			name: "INTEGER/column-constraint PK/rowid STRICT",
+			ddl:  "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT) STRICT",
+		},
+		// A QUOTED type name: whatever SQLite decides, the measurement and
+		// the catalog answer must agree — the reader never sees the spelling.
+		rowidAliasCell{
+			name: `"INTEGER" quoted/column-constraint PK/rowid`,
+			ddl:  `CREATE TABLE t(id "INTEGER" PRIMARY KEY, v TEXT)`,
+		},
+	)
 	return cells
 }
 

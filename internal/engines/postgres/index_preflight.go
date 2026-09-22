@@ -69,16 +69,35 @@ func (Engine) PreflightIndexes(s *ir.Schema) error {
 			if err := refuseUnrepresentablePrefix(pk.Columns, where, true); err != nil {
 				return err
 			}
+			if err := refuseUnrepresentableCollation(pk.Columns, where, true); err != nil {
+				return err
+			}
 		}
 		for _, idx := range table.Indexes {
 			if idx == nil {
 				continue
 			}
 			where := fmt.Sprintf("postgres: index %q on %s", idx.Name, table.Name)
-			if err := refuseUnrepresentablePrefix(
-				idx.Columns, where, idx.Unique || idx.ConstraintBacked,
-			); err != nil {
+			enforces := idx.Unique || idx.ConstraintBacked
+			if err := refuseUnrepresentablePrefix(idx.Columns, where, enforces); err != nil {
 				return err
+			}
+			// GC-5: a foreign-dialect collation on a uniqueness-enforcing
+			// key — the same verdict [emitIndexColumnList] and
+			// [emitAddUniqueConstraint] give, one phase earlier.
+			if err := refuseUnrepresentableCollation(idx.Columns, where, enforces); err != nil {
+				return err
+			}
+			// A ConstraintBacked name is emitted VERBATIM by
+			// [emitAddUniqueConstraint] (no pgIndexName transform, hence no
+			// transform-site length check), and a SQLite-generated
+			// `<table>_<cols>_key` is not bounded (GC-22). The emitter
+			// refuses >63 bytes in the constraints phase — after the copy;
+			// this is the same refusal before any data moves.
+			if idx.ConstraintBacked {
+				if err := validatePGIdentifier("unique constraint", idx.Name, idx.Name, table.Name); err != nil {
+					return err
+				}
 			}
 		}
 	}
