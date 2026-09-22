@@ -673,6 +673,62 @@ func TestD1SchemaReader_RowidAliasNeedsNoPKIndex(t *testing.T) {
 	}
 }
 
+// TestD1SchemaReader_UniqueConstraintAutoIndex is the D1 half of GC-22: an
+// index_list row of origin 'u' (the shape the driver produces for an inline
+// UNIQUE, pinned in TestSQLiteUniqueAutoIndex_ReservedNameIsRefusedByTheDriver)
+// is carried under the generated `<table>_<cols>_key` name, Unique and
+// ConstraintBacked — the reserved `sqlite_autoindex_` name never enters the
+// IR — while an origin 'c' index keeps its name verbatim.
+func TestD1SchemaReader_UniqueConstraintAutoIndex(t *testing.T) {
+	client := startMockD1(t, func(sql string, _ []string) (int, []byte) {
+		switch {
+		case strings.Contains(sql, "SELECT sql FROM sqlite_master"):
+			return http.StatusOK, d1OK([]map[string]any{{"sql": nil}})
+		case strings.Contains(sql, "FROM sqlite_master"):
+			return http.StatusOK, d1OK([]map[string]any{{"name": "users"}})
+		case strings.Contains(sql, "table_xinfo('users')"):
+			return http.StatusOK, d1OK([]map[string]any{
+				{"cid": 0, "name": "id", "type": "INTEGER", "notnull": 0, "dflt_value": nil, "pk": 1, "hidden": 0},
+				{"cid": 1, "name": "email", "type": "TEXT", "notnull": 1, "dflt_value": nil, "pk": 0, "hidden": 0},
+				{"cid": 2, "name": "handle", "type": "TEXT", "notnull": 0, "dflt_value": nil, "pk": 0, "hidden": 0},
+			})
+		case strings.Contains(sql, "index_list('users')"):
+			return http.StatusOK, d1OK([]map[string]any{
+				{"seq": 0, "name": "sqlite_autoindex_users_1", "unique": 1, "origin": "u", "partial": 0},
+				{"seq": 1, "name": "users_handle_uq", "unique": 1, "origin": "c", "partial": 0},
+			})
+		case strings.Contains(sql, "index_info('sqlite_autoindex_users_1')"):
+			return http.StatusOK, d1OK([]map[string]any{{"seqno": 0, "cid": 1, "name": "email"}})
+		case strings.Contains(sql, "index_info('users_handle_uq')"):
+			return http.StatusOK, d1OK([]map[string]any{{"seqno": 0, "cid": 2, "name": "handle"}})
+		default:
+			return http.StatusOK, d1OK(nil)
+		}
+	})
+	r := &D1SchemaReader{client: client}
+	sch, err := r.ReadSchema(context.Background())
+	if err != nil {
+		t.Fatalf("ReadSchema: %v", err)
+	}
+	users := sch.Tables[0]
+	if len(users.Indexes) != 2 {
+		t.Fatalf("users indexes = %+v; want 2", users.Indexes)
+	}
+	auto := indexByName(users, "users_email_key")
+	if auto == nil || !auto.Unique || !auto.ConstraintBacked || len(auto.Columns) != 1 || auto.Columns[0].Column != "email" {
+		t.Errorf("UNIQUE-constraint auto-index = %+v; want users_email_key, Unique, ConstraintBacked, (email)", auto)
+	}
+	named := indexByName(users, "users_handle_uq")
+	if named == nil || !named.Unique || named.ConstraintBacked {
+		t.Errorf("named CREATE UNIQUE INDEX = %+v; want verbatim name, Unique, NOT ConstraintBacked", named)
+	}
+	for _, idx := range users.Indexes {
+		if strings.HasPrefix(idx.Name, "sqlite_") {
+			t.Errorf("reserved auto-index name %q reached the IR", idx.Name)
+		}
+	}
+}
+
 // TestD1SchemaReader_ExcludesChangeLogTables pins the d1-trigger cold-start
 // correctness guard (ADR-0136), widened to the FULL control-table roster
 // (roadmap item 65b): a `d1-trigger`-instrumented or promoted-ex-target D1

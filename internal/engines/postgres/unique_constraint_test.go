@@ -37,6 +37,27 @@ func TestEmitAddUniqueConstraint(t *testing.T) {
 		}
 	})
 
+	t.Run("a name over 63 bytes is refused, not silently truncated by PG", func(t *testing.T) {
+		// GC-22: the SQLite/D1 readers carry a UNIQUE constraint's auto-index
+		// under a generated `<table>_<cols>_key` name with no length bound,
+		// and this path emits the name verbatim (no pgIndexName transform,
+		// so no transform-site length check) — the ceiling is refused here.
+		idx := &ir.Index{
+			Name:             strings.Repeat("x", 64),
+			Unique:           true,
+			ConstraintBacked: true,
+			Columns:          []ir.IndexColumn{{Column: "email"}},
+		}
+		_, err := emitAddUniqueConstraint("public", "t", idx)
+		if err == nil || !strings.Contains(err.Error(), "63") {
+			t.Fatalf("emitAddUniqueConstraint(64-byte name) = %v; want the identifier-too-long refusal", err)
+		}
+		idx.Name = strings.Repeat("x", 63)
+		if _, err := emitAddUniqueConstraint("public", "t", idx); err != nil {
+			t.Fatalf("emitAddUniqueConstraint(63-byte name) = %v; want accepted", err)
+		}
+	})
+
 	t.Run("multi column preserves order", func(t *testing.T) {
 		idx := &ir.Index{
 			Name:             "t_a_b_unique",

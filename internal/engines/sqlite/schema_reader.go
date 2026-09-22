@@ -319,11 +319,14 @@ func markRowidAutoIncrement(t *ir.Table, pkIndexPresent bool) {
 // readIndexes populates t.Indexes from PRAGMA index_list / index_info and
 // reports whether the catalog holds a primary-key index (origin 'pk') — the
 // fact [markRowidAutoIncrement] needs. The PK index itself is skipped (the PK
-// is captured from table_xinfo). Expression-index entries (a NULL column name
-// in index_info) carry their indexed expression (parsed from the CREATE INDEX
-// SQL, tagged "sqlite") rather than being dropped; a partial index carries its
-// WHERE predicate too (ADR-0133). An expression index whose column list can't
-// be cleanly parsed is WARN-skipped rather than carrying a guessed column set.
+// is captured from table_xinfo). A UNIQUE-constraint auto-index (origin 'u')
+// is carried as a constraint-backed unique index under a sluice-generated
+// name — see [uniqueConstraintIndex]. Expression-index entries (a NULL column
+// name in index_info) carry their indexed expression (parsed from the CREATE
+// INDEX SQL, tagged "sqlite") rather than being dropped; a partial index
+// carries its WHERE predicate too (ADR-0133). An expression index whose
+// column list can't be cleanly parsed is WARN-skipped rather than carrying a
+// guessed column set.
 func (r *SchemaReader) readIndexes(ctx context.Context, t *ir.Table) (pkIndexPresent bool, err error) {
 	metas, err := r.indexListMetas(ctx, t.Name)
 	if err != nil {
@@ -351,6 +354,10 @@ func (r *SchemaReader) readIndexes(ctx context.Context, t *ir.Table) (pkIndexPre
 		if !ok {
 			continue // expression index that couldn't be parsed — WARN-skipped
 		}
+		if m.origin == "u" {
+			t.Indexes = append(t.Indexes, uniqueConstraintIndex(t.Name, cols))
+			continue
+		}
 		idx := &ir.Index{
 			Name:    m.name,
 			Columns: cols,
@@ -368,6 +375,43 @@ func (r *SchemaReader) readIndexes(ctx context.Context, t *ir.Table) (pkIndexPre
 		t.Indexes = append(t.Indexes, idx)
 	}
 	return pkIndexPresent, nil
+}
+
+// uniqueConstraintIndex is the IR carry of a SQLite UNIQUE constraint's
+// auto-index (PRAGMA index_list origin 'u' — an inline `email TEXT UNIQUE` or
+// a table-level `UNIQUE (a, b)`). Shared by the file and d1 readers.
+//
+// SQLite names that index `sqlite_autoindex_<table>_<N>`, and every object
+// name beginning `sqlite_` is reserved: a SQLite target refuses
+// `CREATE UNIQUE INDEX IF NOT EXISTS "sqlite_autoindex_t_1"` with "object name
+// reserved for internal use" (IF NOT EXISTS does not suppress it), and it did
+// so in the index phase — AFTER the whole copy (GC-22). So the auto-index is
+// carried the way the source declared it, as a CONSTRAINT: ConstraintBacked,
+// so a Postgres target re-emits `ADD CONSTRAINT … UNIQUE` (the shape it would
+// have given the same inline UNIQUE) while MySQL and SQLite emit a unique
+// index, the only shape they have — and under the name Postgres itself
+// generates for an inline UNIQUE, `<table>_<col>[_<col>…]_key`, which is
+// legal on every target, embeds the table so it is schema-unique by
+// construction, and lets schema diff/drift match it by name (an unnamed index
+// is invisible there). A user index that happens to carry the same name is
+// refused by the target namespace gates, loudly, rather than silently
+// no-opped. Uniqueness is never relaxed: the index is Unique on every target.
+//
+// ConstraintNamed stays false: the name is sluice's, not one the operator
+// wrote, so a Postgres target must not treat it as an identity to preserve.
+func uniqueConstraintIndex(table string, cols []ir.IndexColumn) *ir.Index {
+	parts := make([]string, 0, len(cols)+2)
+	parts = append(parts, table)
+	for _, c := range cols {
+		parts = append(parts, c.Column)
+	}
+	parts = append(parts, "key")
+	return &ir.Index{
+		Name:             strings.Join(parts, "_"),
+		Columns:          cols,
+		Unique:           true,
+		ConstraintBacked: true,
+	}
 }
 
 // hasExprEntry reports whether any index_info entry is an expression (NULL

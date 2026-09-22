@@ -266,6 +266,12 @@ func (r *D1SchemaReader) readIndexes(ctx context.Context, t *ir.Table) (pkIndexP
 		if !ok {
 			continue // expression index that couldn't be parsed — WARN-skipped
 		}
+		if origin == "u" {
+			// A UNIQUE-constraint auto-index: the reserved `sqlite_autoindex_`
+			// name never enters the IR (GC-22) — same carry as the file engine.
+			t.Indexes = append(t.Indexes, uniqueConstraintIndex(t.Name, cols))
+			continue
+		}
 		idx := &ir.Index{
 			Name:    name,
 			Columns: cols,

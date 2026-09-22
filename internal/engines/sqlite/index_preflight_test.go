@@ -80,6 +80,26 @@ var sqliteIndexShapes = []struct {
 			Columns: []ir.IndexColumn{{Expression: "lower(email)", Length: 20}},
 		},
 	},
+	{
+		// GC-22: a name SQLite reserves (`sqlite_` prefix — the shape of a
+		// UNIQUE constraint's auto-index as an older binary carried it) is
+		// refused by the driver at CREATE; the preflight must refuse it
+		// before the copy, and the emitter with the same text.
+		name: "index under SQLite's reserved sqlite_ prefix",
+		idx: &ir.Index{
+			Name: "sqlite_autoindex_users_1", Unique: true, Columns: []ir.IndexColumn{{Column: "email"}},
+		},
+		wantRefused: true,
+	},
+	{
+		// The control for the row above: the generated name the reader now
+		// carries a UNIQUE constraint under must pass.
+		name: "generated UNIQUE-constraint name",
+		idx: &ir.Index{
+			Name: "users_email_key", Unique: true, ConstraintBacked: true,
+			Columns: []ir.IndexColumn{{Column: "email"}},
+		},
+	},
 }
 
 func TestPreflightIndexesAgreesWithTheEmitter(t *testing.T) {

@@ -590,6 +590,9 @@ func emitCreateIndex(tableName string, idx *ir.Index) (string, error) {
 		return "", fmt.Errorf("sqlite: emitCreateIndex: index %q has no columns", idx.Name)
 	}
 	where := fmt.Sprintf("sqlite: index %q on table %s", idx.Name, tableName)
+	if err := refuseReservedIndexName(idx.Name, where); err != nil {
+		return "", err
+	}
 	if err := checkIndexPrefixLength(idx.Columns, where, indexKeyKind(idx.Unique)); err != nil {
 		return "", err
 	}
@@ -610,6 +613,36 @@ func emitCreateIndex(tableName string, idx *ir.Index) (string, error) {
 		sb.WriteString(idx.Predicate)
 	}
 	return sb.String(), nil
+}
+
+// reservedObjectNamePrefix is the namespace SQLite keeps for itself: any
+// object name beginning `sqlite_` (case-insensitive) is refused at CREATE with
+// "object name reserved for internal use", and IF NOT EXISTS does not
+// suppress it (ground-truthed on modernc.org/sqlite in
+// TestSQLiteUniqueAutoIndex_ReservedNameIsRefusedByTheDriver).
+const reservedObjectNamePrefix = "sqlite_"
+
+// refuseReservedIndexName refuses an index whose name SQLite itself would
+// refuse, so the refusal lands BEFORE the copy (via [Engine.PreflightIndexes])
+// instead of in the index phase after every row has been written. The one
+// producer of such a name inside sluice — the reader's carry of a UNIQUE
+// constraint's `sqlite_autoindex_<t>_<N>` — is gone ([uniqueConstraintIndex]),
+// so what reaches here is a manifest written by an older binary or a foreign
+// IR; the remedy names the shape rather than a rename the operator cannot do.
+// Called from [emitCreateIndex] (the late door, the same text) and from the
+// preflight walk, so the two cannot drift.
+func refuseReservedIndexName(name, where string) error {
+	if !strings.HasPrefix(strings.ToLower(name), reservedObjectNamePrefix) {
+		return nil
+	}
+	return fmt.Errorf(
+		"%s: the name begins with %q, which SQLite reserves for its own objects and refuses at CREATE "+
+			"(\"object name reserved for internal use\"; IF NOT EXISTS does not suppress it). A name of this "+
+			"shape is SQLite's auto-index for a UNIQUE constraint, which a current sluice carries under a "+
+			"generated `<table>_<columns>_key` name — re-read the source with a current binary, or for a "+
+			"backup written by an older one, restore it to a Postgres or MySQL target",
+		where, reservedObjectNamePrefix,
+	)
 }
 
 // emitCreateView renders CREATE VIEW IF NOT EXISTS for a regular view.

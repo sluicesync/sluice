@@ -655,9 +655,12 @@ type Index struct {
 	// to a bare index breaks that surface (restore-parity TRIAGE #4).
 	// The PG writer re-emits these as `ALTER TABLE ... ADD CONSTRAINT`
 	// in the constraints phase instead of `CREATE UNIQUE INDEX` in the
-	// index phase. Only the PG reader sets it (MySQL UNIQUE is always
-	// an index under the hood; SQLite's inline UNIQUE auto-indexes are
-	// unnamed) — engines without the distinction ignore it and emit a
+	// index phase. Set by the PG reader, and by the SQLite/D1 readers
+	// for a UNIQUE constraint's auto-index (`sqlite_autoindex_<t>_<N>`,
+	// a reserved name no SQLite target can re-create — it is carried
+	// under a generated `<table>_<cols>_key` name instead, GC-22). MySQL
+	// leaves it false (a MySQL UNIQUE is always an index under the
+	// hood) — engines without the distinction ignore it and emit a
 	// plain unique index. Meaningful only when Unique is true.
 	ConstraintBacked bool
 

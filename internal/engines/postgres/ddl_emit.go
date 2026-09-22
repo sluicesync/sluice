@@ -2198,12 +2198,17 @@ func emitAddForeignKey(schema, childTable string, fk *ir.ForeignKey) (string, er
 // emitAddUniqueConstraint produces the ALTER TABLE ... ADD CONSTRAINT
 // statement for a UNIQUE constraint carried as a ConstraintBacked
 // unique index (TRIAGE #4). The constraint name is the source index
-// name VERBATIM — a ConstraintBacked index is only ever produced by
-// the PG reader, whose names are schema-unique by construction, so the
+// name VERBATIM — a ConstraintBacked index comes from the PG reader,
+// whose names are schema-unique by construction, or from the SQLite/D1
+// readers' carry of a UNIQUE constraint's auto-index, whose generated
+// `<table>_<cols>_key` name embeds the table (GC-22) — so the
 // cross-engine pgIndexName table-prefix disambiguation does not apply
 // (and would break `ON CONFLICT ON CONSTRAINT <source-name>` on the
-// target). INCLUDE payload columns carry (PG 11+ supports UNIQUE ...
-// INCLUDE); expression entries are a sluice-bug condition — PG forbids
+// target). The SQLite-generated name is not bounded, so the 63-byte
+// ceiling is refused here the way every other emitted identifier is
+// ([validatePGIdentifier]) rather than left to PG's silent truncation.
+// INCLUDE payload columns carry (PG 11+ supports UNIQUE ... INCLUDE);
+// expression entries are a sluice-bug condition — PG forbids
 // expressions in a UNIQUE constraint, so a ConstraintBacked index can
 // never carry one, and hitting it means the reader mis-flagged a plain
 // expression index.
@@ -2213,6 +2218,9 @@ func emitAddUniqueConstraint(schema, tableName string, idx *ir.Index) (string, e
 	}
 	if idx.Name == "" || len(idx.Columns) == 0 {
 		return "", fmt.Errorf("postgres: emitAddUniqueConstraint: constraint on %q has no name or no columns", tableName)
+	}
+	if err := validatePGIdentifier("unique constraint", idx.Name, idx.Name, tableName); err != nil {
+		return "", err
 	}
 	// This function renders its own column list rather than calling
 	// [emitIndexColumnList], so it needs the prefix-length gate explicitly —

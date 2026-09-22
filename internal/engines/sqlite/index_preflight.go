@@ -78,6 +78,12 @@ func (Engine) PreflightIndexes(s *ir.Schema) error {
 				continue
 			}
 			where := fmt.Sprintf("sqlite: index %q on table %s", idx.Name, table.Name)
+			// The third question (GC-22): a name SQLite reserves is refused
+			// by the driver at CREATE, and before this walk asked it the
+			// refusal arrived in the index phase, after the whole copy.
+			if err := refuseReservedIndexName(idx.Name, where); err != nil {
+				return err
+			}
 			if err := refuseUnrepresentablePrefix(idx.Columns, where, indexKeyKind(idx.Unique)); err != nil {
 				return err
 			}
