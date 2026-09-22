@@ -213,8 +213,11 @@ type AddTable struct {
 	//
 	// Trade-off: LiveMode skips the `stop_requested_at` refusal in
 	// favour of an explicit invariant check (snapshot-LSN ≥ slot
-	// confirmed_flush_lsn captured at publication-add time). PG-only
-	// in this phase — engines without publications refuse with a
+	// confirmed_flush_lsn captured at publication-add time). Two
+	// engine pairs take the live path — see preflightLive: a
+	// publication-bearing source (PG, publication-add) and a binlog
+	// source whose TARGET applier exposes RecordLiveAddedTable (the
+	// MySQL filter-flip, ADR-0034). Any other pair refuses with a
 	// clear error directing the operator at the drained add-table
 	// flow. The CLI flag is `--no-drain` on `sluice schema add-table`.
 	LiveMode bool

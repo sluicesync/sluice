@@ -93,7 +93,7 @@ The JSON shape is stable; tooling can rely on the field names.
 ## Common error shapes
 
 - **`--target-driver=mysql`** → refuses with `matview refresh is PostgreSQL-only (MySQL has no materialized view concept)`. Use this command only against Postgres targets.
-- **Unknown matview name** (`--matview=foo` where `foo` does not exist in `--target-schema`) → the command runs and the requested matview simply doesn't appear in the output. No error. Validate the name list against `\dv+` first if the operator wants strict-error behaviour.
+- **Unknown matview name** (`--matview=foo` where `foo` does not exist in `--target-schema`) → refuses **before any `REFRESH` runs**, naming every missing matview: `matview refresh: 1 requested matview(s) not found in target schema: foo`. Non-zero exit; nothing is refreshed, including the names that did resolve. A typo in a cron job is therefore a loud failure on the first run, not a silent no-op (pinned by `TestMatviewRefresh_MissingMatview_LoudFailure`).
 - **Concurrent refresh without unique index** → the matview is **skipped**, not failed. The run continues with the remaining matviews. The skip is surfaced in both text and JSON output.
 - **Connection / authentication failure** → exits non-zero with the DSN-level error on stderr.
 

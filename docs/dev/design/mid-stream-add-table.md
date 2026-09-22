@@ -126,7 +126,7 @@ This is real engineering work — ~1000-1500 LOC minimum, plus tests, plus ADR. 
 
 ## Phase 2 status (live add, no drain)
 
-**Shipped.** Phase 2 lives behind `sluice schema add-table TABLE --no-drain` (PG-only first). See [`adr-0030-mid-stream-live-add-table.md`](adr/adr-0030-mid-stream-live-add-table.md) for the full correctness story.
+**Shipped.** Phase 2 lives behind `sluice schema add-table TABLE --no-drain` (PG first, v0.24.0; the MySQL-family binlog source → MySQL-family target path followed in v0.27.0 via the streamer filter-flip, [`adr-0034-mysql-phase-2-live-add-table.md`](adr/adr-0034-mysql-phase-2-live-add-table.md)). See [`adr-0030-mid-stream-live-add-table.md`](adr/adr-0030-mid-stream-live-add-table.md) for the full correctness story.
 
 The implementation chose **Strategy C variant (c)** — single-slot, publication-add-then-snapshot ordering — over Strategy B (dual-slot). Re-reading Phase 1's orchestrator after it shipped revealed that the publication-add → snapshot ordering already implements the correctness shape; the only thing keeping Phase 1 from being live-safe was the conservative `stop_requested_at` refusal in `preflightStream`. Phase 2 lifts that refusal in favour of:
 

@@ -59,7 +59,7 @@ type SchemaAddTableCmd struct {
 
 	SlotName string `help:"Override the temporary replication-slot name used for the snapshot capture on engines with a slot concept (Postgres). Defaults to 'sluice_addtable_<table>'. Engines without slots ignore this flag." placeholder:"NAME"`
 
-	NoDrain bool `help:"Phase 2 live add: run add-table against an actively-streaming sync without first running 'sync stop --wait'. PG-only in this release; MySQL sources still require the drained workflow. See ADR-0030 for the correctness story." name:"no-drain"`
+	NoDrain bool `help:"Phase 2 live add: run add-table against an actively-streaming sync without first running 'sync stop --wait'. Two live paths: a Postgres source (publication-add, ADR-0030) and a MySQL-family binlog source writing to a MySQL-family target (streamer filter-flip via sluice_cdc_state.live_added_tables, ADR-0034, v0.27.0). Any other pair refuses loudly and names the drained workflow. The PG path is strict zero-loss since v0.32.0 (ADR-0036); the MySQL filter-flip path keeps ADR-0034's best-effort caveat for writes landing during the streamer's poll lag — use the drained flow there for strict zero-loss." name:"no-drain"`
 
 	TargetSchema string `help:"Per-source target schema namespace (Postgres-only). Must match the active stream's --target-schema, or be omitted to inherit the recorded value (Bug 46 / ADR-0031). When the active stream was started with --target-schema=NAME, the new table lands in NAME (rather than 'public') so CDC events the active stream's applier routes to NAME.<table> arrive at a real table. Mismatch (operator-supplied flag differs from recorded) refuses loudly. MySQL operators use a different --target DSN database instead." placeholder:"NAME"`
 
