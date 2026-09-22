@@ -38,6 +38,25 @@ const (
 	pgVersionUniqueWithoutOverlaps  = 180000
 )
 
+// pgVersionGeneratedColumns is the first server version with generated
+// columns at all — PG 12, which added `pg_attribute.attgenerated`. Below
+// it the column does not exist and referencing it would 42703 the whole
+// column read, so [populateColumns] substitutes an empty-string select
+// expression there (no column can be generated, so the empty string is exact).
+//
+// pgVersionVirtualGeneratedColumns is the first server version that
+// accepts `GENERATED ALWAYS AS (…) VIRTUAL` — PG 18, whose
+// `attgenerated` then carries 'v' beside the 's' every earlier version
+// wrote. Ground-truthed 2026-09-22 on 18.6 and 16.15: 16 rejects the
+// VIRTUAL keyword with a syntax error, and 18 makes VIRTUAL the DEFAULT
+// when neither keyword is written. Both directions are pinned on real
+// servers by TestGeneratedColumns_StorageClass_PG18 and
+// TestGeneratedColumns_StorageClass_DefaultImage.
+const (
+	pgVersionGeneratedColumns        = 120000
+	pgVersionVirtualGeneratedColumns = 180000
+)
+
 // pgVersionConstraintParentID is the first server version whose
 // pg_constraint carries `conparentid` — PG 11, which is also the first
 // version that can create the internal per-partition FK clones the column

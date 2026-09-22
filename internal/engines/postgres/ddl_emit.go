@@ -43,6 +43,15 @@ type emitOpts struct {
 	// nil / empty means "no extension passthrough" — ir.ExtensionType
 	// columns surface a clear refusal naming the missing flag.
 	EnabledExtensions map[string]bool
+
+	// VirtualGeneratedColumns reports that the target server accepts
+	// `GENERATED ALWAYS AS (…) VIRTUAL` — PG 18+
+	// ([pgVersionVirtualGeneratedColumns]), probed once at
+	// OpenSchemaWriter. The zero value is the safe default: a writer
+	// whose version is unknown promotes VIRTUAL to STORED (which every
+	// version accepts) and says so, rather than emitting a keyword a
+	// pre-18 server rejects with a syntax error.
+	VirtualGeneratedColumns bool
 }
 
 // emitColumnType returns the Postgres DDL fragment for a column type
@@ -713,6 +722,90 @@ func generatedEnumCheckName(tableName, columnName string) string {
 	return tableName + "_" + columnName + "_enum_chk"
 }
 
+// generatedVirtualPromotedMarker is the grep-stable token the two
+// VIRTUAL→STORED promotion WARNs below carry, so an operator can find
+// every column whose storage class changed on the way to this target.
+const generatedVirtualPromotedMarker = "GENERATED-VIRTUAL-PROMOTED-TO-STORED"
+
+// generatedStorageClause renders the ` STORED` / ` VIRTUAL` tail of a
+// generated column and owns the one promotion this writer performs.
+//
+// A STORED column (the only kind PG 12–17 can hold, and what every
+// reader defaulted to before GC-6) always emits STORED. A VIRTUAL column
+// — a PG 18 source read through attgenerated='v', or a MySQL VIRTUAL
+// column, which MySQL has carried as GeneratedStored=false since ADR-0016
+// — stays VIRTUAL when the target accepts it and is promoted to STORED
+// with a WARN otherwise. An earlier revision of this site WARNed
+// "postgres has no VIRTUAL support" on EVERY VIRTUAL column: true when
+// written, false since PG 18 (gap census 2026-09-22 D5), so the same
+// premise that made the reader collapse the axis made the writer
+// announce a promotion it no longer needed to make.
+//
+// Two promotion reasons, each named in its WARN:
+//
+//   - the target predates PG 18 ([emitOpts.VirtualGeneratedColumns]
+//     false). STORED is the closest correct representation: the
+//     invariant survives, only the storage tradeoff changes (STORED
+//     takes disk; VIRTUAL is computed on read). Refusing would force
+//     operators into the per-column mappings hook for what is almost
+//     always a benign translation.
+//   - the column is INDEXED. PG 18 refuses `CREATE INDEX` on a virtual
+//     generated column ("indexes on virtual generated columns are not
+//     supported", measured 2026-09-22 on 18.6), while MySQL indexes
+//     VIRTUAL columns freely — so a faithful VIRTUAL here would turn a
+//     working MySQL→PG 18 migration into a loud index-phase failure.
+//     The promotion keeps the index buildable; a PG source can never
+//     reach this branch, since PG itself would not have let the index
+//     exist.
+//
+// Both promotions are visible at `schema preview` (the same emitter
+// renders it) and carry [generatedVirtualPromotedMarker].
+func generatedStorageClause(table *ir.Table, c *ir.Column, opts emitOpts) string {
+	if c.GeneratedStored {
+		return " STORED"
+	}
+	if !opts.VirtualGeneratedColumns {
+		slog.Warn(
+			"postgres: "+generatedVirtualPromotedMarker+": promoting VIRTUAL generated column to STORED — the target server predates PostgreSQL 18, the first version with VIRTUAL generated columns",
+			slog.String("table", tableNameForLog(table)),
+			slog.String("column", c.Name),
+		)
+		return " STORED"
+	}
+	if columnIsIndexed(table, c.Name) {
+		slog.Warn(
+			"postgres: "+generatedVirtualPromotedMarker+": promoting INDEXED VIRTUAL generated column to STORED — PostgreSQL 18 does not support indexes on virtual generated columns, and the source carries an index on this column",
+			slog.String("table", tableNameForLog(table)),
+			slog.String("column", c.Name),
+		)
+		return " STORED"
+	}
+	return " VIRTUAL"
+}
+
+// columnIsIndexed reports whether any index on table — the primary key
+// included — references the named column. nil-safe on table.
+func columnIsIndexed(table *ir.Table, column string) bool {
+	if table == nil {
+		return false
+	}
+	indexes := table.Indexes
+	if table.PrimaryKey != nil {
+		indexes = append([]*ir.Index{table.PrimaryKey}, indexes...)
+	}
+	for _, ix := range indexes {
+		if ix == nil {
+			continue
+		}
+		for _, ic := range ix.Columns {
+			if ic.Column == column {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // emitColumnDef returns the full DDL fragment for a single column,
 // suitable for inclusion in a CREATE TABLE column list:
 //
@@ -788,23 +881,6 @@ func emitColumnDef(table *ir.Table, c *ir.Column, opts emitOpts) (string, error)
 		if err := refuseNonPortableSQLiteExprPG("generated column", c.Name, c.GeneratedExpr, c.GeneratedExprDialect); err != nil {
 			return "", err
 		}
-		// Postgres only supports STORED generated columns. If a
-		// MySQL source provides a VIRTUAL column (GeneratedStored=
-		// false), the closest correct PG representation is STORED
-		// — the invariant survives but the storage tradeoff
-		// changes (STORED takes disk; VIRTUAL doesn't). Emit a
-		// warning so the operator sees the silent promotion.
-		// Source-engine VIRTUAL columns are rare on production
-		// schemas; refusing here would force operators into the
-		// per-column mappings hook for what's almost always a
-		// benign translation.
-		if !c.GeneratedStored {
-			slog.Warn(
-				"postgres: promoting source-engine VIRTUAL generated column to STORED (postgres has no VIRTUAL support)",
-				slog.String("table", tableNameForLog(table)),
-				slog.String("column", c.Name),
-			)
-		}
 		sb.WriteString(" GENERATED ALWAYS AS (")
 		body := translateGeneratedExpr(c, table, opts)
 		// Bug 25 (v0.10.1): for enum-typed generated columns we
@@ -815,7 +891,8 @@ func emitColumnDef(table *ir.Table, c *ir.Column, opts emitOpts) (string, error)
 		// gone because it triggered PG's "generation expression is
 		// not immutable" error: enum_in is STABLE not IMMUTABLE.)
 		sb.WriteString(body)
-		sb.WriteString(") STORED")
+		sb.WriteByte(')')
+		sb.WriteString(generatedStorageClause(table, c, opts))
 	}
 	if !c.Nullable {
 		sb.WriteString(" NOT NULL")

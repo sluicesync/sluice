@@ -94,10 +94,20 @@ func (Engine) NormalizeForCDCComparison(t *ir.Table) *ir.Table {
 		return nil
 	}
 	out := *t
-	// ADR-0091: drop STORED generated columns. pgoutput's
+	// ADR-0091: drop generated columns of EITHER storage class. pgoutput's
 	// RelationMessage EXCLUDES generated columns (pre-PG18 they are not
-	// published over logical replication at all), so [projectRelation]
-	// never sees them and the CDC-projected IR omits them entirely. The
+	// published over logical replication at all; on PG 18 a STORED column
+	// is published only under a publication created WITH
+	// (publish_generated_columns = stored), which sluice never creates,
+	// and a VIRTUAL column is never published at all — measured
+	// 2026-09-22 on 18.6: pg_publication_tables.attnames omits it under
+	// both publication shapes, pinned by
+	// TestGeneratedColumns_StorageClass_PG18), so [projectRelation]
+	// never sees them and the CDC-projected IR omits them entirely. A
+	// VIRTUAL column therefore behaves mid-sync exactly as a STORED one
+	// does today: absent from the wire, never written by the applier,
+	// re-derived on the target because the target column is generated
+	// too (GC-6). The
 	// cold-start SchemaReader reads them from pg_attribute, so without
 	// this filter the classifier's [diffColumns] sees the generated
 	// column as present-in-pre / absent-in-post → a phantom

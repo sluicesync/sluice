@@ -1092,7 +1092,17 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 	// (pgvector dimension; future PostGIS subtype/SRID). -1 is the
 	// "no typmod" sentinel pgattribute uses; per-extension catalog
 	// entries decode it into the IR's Modifiers vector.
-	const q = `
+	//
+	// The generated-column STORAGE CLASS is version-gated (the
+	// [serverVersionNum] precedent populateIndexes uses): `attgenerated`
+	// exists on PG 12+ only, and referencing it on an older server would
+	// 42703 the whole column read, so the query substitutes '' there —
+	// exact, since no column can be generated before PG 12.
+	version, err := serverVersionNum(ctx, r.db)
+	if err != nil {
+		return fmt.Errorf("postgres: column read: %w", err)
+	}
+	q := `
 		SELECT
 			c.table_name,
 			c.column_name,
@@ -1134,7 +1144,18 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 			-- caused silent constraint loss on PG→PG migrate;
 			-- v0.95.1 detects the 'd' and refuses loudly.
 			COALESCE(pt.typtype::text, '') AS column_type_kind,
-			COALESCE(pt.typname, '')       AS column_type_name
+			COALESCE(pt.typname, '')       AS column_type_name,
+			-- GC-6 (gap census 2026-09-22 S1/D5): the generated column's
+			-- storage class. information_schema.columns.is_generated says
+			-- only ALWAYS/NEVER; pg_attribute.attgenerated is the one
+			-- catalog column that distinguishes 's' (STORED) from 'v'
+			-- (VIRTUAL, PG 18+). Read here for the same reason the three
+			-- CDC-side readers (pgtrigger/setup.go, cdc_generated_pk.go,
+			-- replica_identity_preflight.go) already read it: the
+			-- schema reader was the one door that did not, and it
+			-- carried every VIRTUAL column as STORED on a written false
+			-- premise.
+			` + generatedStorageClassExpr(version) + ` AS att_generated
 		FROM   information_schema.columns c
 		-- The namespace is joined rather than looked up by a scalar
 		-- subquery in the ON clause. The subquery form was CORRELATED (on
@@ -1187,6 +1208,7 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 			&cr.formatType,
 			&cr.columnTypeKind,
 			&cr.columnTypeName,
+			&cr.attGenerated,
 		); err != nil {
 			return err
 		}
@@ -1215,7 +1237,7 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 // information_schema.columns projection plus the pg_attribute / pg_type
 // augmentation (collation, atttypmod, format_type, DOMAIN kind/name).
 // Bundling it lets the per-column translation read as a single
-// columnFromRow call instead of a 19-value scan threaded through a helper
+// columnFromRow call instead of a 20-value scan threaded through a helper
 // signature.
 type columnRow struct {
 	tableName, colName  string
@@ -1236,6 +1258,30 @@ type columnRow struct {
 	formatType          string
 	columnTypeKind      string
 	columnTypeName      string
+	// attGenerated is pg_attribute.attgenerated: 's' STORED, 'v'
+	// VIRTUAL (PG 18+), '' for a plain column — or for every column on
+	// a pre-12 server, where the catalog column is version-gated out.
+	attGenerated string
+}
+
+// pg_attribute.attgenerated values. PG 12–17 only ever write 's'; PG 18
+// added 'v' and made it the default spelling of a bare
+// `GENERATED ALWAYS AS (…)`.
+const (
+	pgAttGeneratedStored  = "s"
+	pgAttGeneratedVirtual = "v"
+)
+
+// generatedStorageClassExpr returns the select expression populateColumns
+// reads the storage class through: the real catalog column on PG 12+,
+// a constant empty string below it (no generated columns exist there, so it is
+// exact rather than a degradation — the same version-gated
+// catalog-read shape as [uniqueConstraintAttrExprs]).
+func generatedStorageClassExpr(version int) string {
+	if version >= pgVersionGeneratedColumns {
+		return "COALESCE(a.attgenerated::text, '')"
+	}
+	return "''"
 }
 
 // columnLookups bundles the side tables populateColumns resolves once up
@@ -1499,12 +1545,27 @@ func (r *SchemaReader) columnFromRow(cr columnRow, lk columnLookups) (*ir.Column
 		}
 	}
 
-	// Postgres only supports STORED generated columns today;
-	// is_generated = 'ALWAYS' implies STORED. The expression
-	// passes through verbatim — translation policy is "loud
-	// failure beats silent corruption", so non-portable
-	// expressions surface as a target rejection at apply time
-	// rather than a guess at translation.
+	// The storage class comes from pg_attribute.attgenerated, not from
+	// is_generated: information_schema says only ALWAYS/NEVER, and an
+	// earlier revision of this block asserted "Postgres only supports
+	// STORED generated columns today; ALWAYS implies STORED" and set
+	// GeneratedStored unconditionally — true when written, false since
+	// PG 18 added VIRTUAL (gap census 2026-09-22 S1/D5). A PG 18 VIRTUAL
+	// column read that way was re-created STORED on the target: the
+	// on-read semantics and the zero-disk tradeoff were silently gone.
+	//
+	// 's' → STORED, 'v' → VIRTUAL. The one remaining defaulting branch
+	// is a generated column whose attgenerated is '' — impossible on
+	// PG 12+ (every generated column carries 's' or 'v'; pinned by
+	// TestColumnFromRow_GeneratedStorageClass) and unreachable below 12
+	// (no generated columns exist to reach here). It resolves to STORED
+	// so a hand-built or truncated row can never mint a VIRTUAL column
+	// the source did not declare.
+	//
+	// The expression passes through verbatim — translation policy is
+	// "loud failure beats silent corruption", so non-portable
+	// expressions surface as a target rejection at apply time rather
+	// than a guess at translation.
 	if strings.EqualFold(isGenerated, "ALWAYS") && genExpr != "" {
 		// ADR-0044: gate generated-column expressions identically
 		// to DEFAULTs — the recon confirmed both ride the same
@@ -1516,7 +1577,7 @@ func (r *SchemaReader) columnFromRow(cr columnRow, lk columnLookups) (*ir.Column
 			return nil, err
 		}
 		col.GeneratedExpr = genExpr
-		col.GeneratedStored = true
+		col.GeneratedStored = cr.attGenerated != pgAttGeneratedVirtual
 		col.GeneratedExprDialect = dialectName
 	}
 	return col, nil

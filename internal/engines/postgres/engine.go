@@ -21,6 +21,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5/stdlib"
@@ -230,7 +231,19 @@ func (e Engine) OpenSchemaWriter(ctx context.Context, dsn string) (ir.SchemaWrit
 		return nil, err
 	}
 	isNekiSW, _ := probeIsNeki(ctx, cfg.serverKey(), db)
-	return &SchemaWriter{db: db, schema: cfg.schema, hasPostGIS: hasGIS, isNeki: isNekiSW}, nil
+	// The version probe is best-effort by design: a failure leaves 0,
+	// which every version-gated emit reads as "not supported" and
+	// renders in the spelling all versions accept (see
+	// SchemaWriter.serverVersionNum). It must not fail the open — a
+	// target that cannot answer SHOW server_version_num still takes
+	// every pre-GC-6 DDL exactly as before.
+	version, err := serverVersionNum(ctx, db)
+	if err != nil {
+		slog.WarnContext(ctx, "postgres: schema writer: server version probe failed; version-gated DDL (VIRTUAL generated columns) will use the pre-PG-18 spelling",
+			slog.String("error", err.Error()))
+		version = 0
+	}
+	return &SchemaWriter{db: db, schema: cfg.schema, hasPostGIS: hasGIS, isNeki: isNekiSW, serverVersionNum: version}, nil
 }
 
 // OpenRowReader returns a [RowReader] bound to the database identified

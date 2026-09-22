@@ -128,6 +128,15 @@ type SchemaWriter struct {
 	// nil (the default, and on the whole-schema CreateIndexes path) is a
 	// no-op. May be invoked from any build worker goroutine.
 	tableIndexedCallback func(table *ir.Table)
+
+	// serverVersionNum is the target's server_version_num, probed once
+	// at [Engine.OpenSchemaWriter] and threaded into every emitOpts so
+	// the emitter can gate DDL the target's version decides — today
+	// `GENERATED ALWAYS AS (…) VIRTUAL` (PG 18+, GC-6). 0 means
+	// "unknown" (a hand-built writer, or a probe that failed at open),
+	// and every gate reads 0 as "not supported": the zero value is the
+	// spelling every version accepts.
+	serverVersionNum int
 }
 
 // SetIndexBuildMem implements [ir.IndexBuildTuner]. Called by the
@@ -1205,13 +1214,15 @@ func (w *SchemaWriter) AnalyzeTable(ctx context.Context, table *ir.Table) error 
 
 // emitOpts builds the [emitOpts] value to thread into every
 // emitter helper for this writer's lifetime. Centralised so
-// adding a new field (HasPostGIS → +TargetSchema → +EnabledExtensions)
-// doesn't fan out across half a dozen call-sites.
+// adding a new field (HasPostGIS → +TargetSchema → +EnabledExtensions
+// → +VirtualGeneratedColumns) doesn't fan out across half a dozen
+// call-sites.
 func (w *SchemaWriter) emitOpts() emitOpts {
 	return emitOpts{
-		HasPostGIS:        w.hasPostGIS,
-		TargetSchema:      w.qualifyingSchema(),
-		EnabledExtensions: w.enabledExtensions,
+		HasPostGIS:              w.hasPostGIS,
+		TargetSchema:            w.qualifyingSchema(),
+		EnabledExtensions:       w.enabledExtensions,
+		VirtualGeneratedColumns: w.serverVersionNum >= pgVersionVirtualGeneratedColumns,
 	}
 }
 

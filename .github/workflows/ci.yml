@@ -377,7 +377,11 @@ jobs:
       # required shards; and the PG17 FAILOVER-flag tests
       # (cdc_reader_integration_test.go) boot stock postgres:17 (its cold
       # docker.io pull mid-test flaked TestServerVersionNum_PG17 on three
-      # tag runs, v0.99.29/31/32, before being pre-pulled). Task #36:
+      # tag runs, v0.99.29/31/32, before being pre-pulled); the GC-6
+      # storage-class pin (generated_storage_class_integration_test.go,
+      # engines-postgres shard) boots stock postgres:18 for the same
+      # reason — VIRTUAL generated columns exist only from 18, and the
+      # per-PR shard's pre-baked image is 16. Task #36:
       # after a further full docker.io outage failed a PR shard on
       # postgres:16 through the whole 5-attempt retry budget, these now
       # come from the GHCR mirrors (pure retags published by
@@ -395,6 +399,7 @@ jobs:
           bash scripts/ci-mirror-pull.sh \
             postgres:16 \
             postgres:17 \
+            postgres:18 \
             mysql:8.0 \
             mariadb:11.4 \
             mariadb:10.11

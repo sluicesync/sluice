@@ -1619,11 +1619,15 @@ func isSpace(b byte) bool {
 //
 // **PG immutability caveat.** PG's `TO_CHAR` is `STABLE`, not
 // `IMMUTABLE` (it depends on `lc_time` and other session GUCs), so
-// a STORED generated column using the rewritten output will fail
-// with "generation expression is not immutable". The rewrite makes
-// the cross-engine syntax valid; the immutability constraint is the
-// operator's call (use VIRTUAL on PG ≥18, an immutable wrapper
-// function, or `--expr-override` to drop the column).
+// a generated column using the rewritten output will fail with
+// "generation expression is not immutable" — STORED and VIRTUAL
+// alike. An earlier revision of this note advised "use VIRTUAL on
+// PG ≥18" as a way out; measured 2026-09-22 on 18.6, PG 18 applies
+// the immutability rule to VIRTUAL columns too (gap census D5, the
+// third home of the VIRTUAL premise). The rewrite makes the
+// cross-engine syntax valid; the immutability constraint is the
+// operator's call (an immutable wrapper function, or
+// `--expr-override` to drop the column).
 func rewriteDATEFORMAT(expr string) string {
 	return rewriteFunctionCalls(expr, "DATE_FORMAT", func(args []string) string {
 		if len(args) != 2 {

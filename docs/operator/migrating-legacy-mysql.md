@@ -238,6 +238,10 @@ Three MariaDB-specific notes:
   behave identically across MariaDB versions. Background:
   [the field note](https://sluicesync.com/field-notes/mariadb-no-pad-attribute-column/).
 
+## VIRTUAL generated columns on a Postgres target (`GENERATED-VIRTUAL-PROMOTED-TO-STORED`)
+
+MySQL lets a generated column be `VIRTUAL` (computed on read, no storage) and lets you index it. PostgreSQL gained `VIRTUAL` generated columns in 18 and refuses `CREATE INDEX` on one. sluice carries the storage class faithfully where the target can hold it and says so where it cannot: on a PostgreSQL target at 18 or newer a VIRTUAL column stays VIRTUAL; on an older target it is created STORED (the expression and every value are unchanged, only the disk-vs-compute tradeoff moves), and on PG 18+ an **indexed** VIRTUAL column is created STORED so its index can build. Each promotion is one WARN at schema apply — and at `schema preview` — marked `GENERATED-VIRTUAL-PROMOTED-TO-STORED`, naming the table and column. Nothing is dropped and no value changes; grep the log for the marker if disk growth on the target surprises you. A PostgreSQL 18 source declaring VIRTUAL (or the bare form, which 18 spells VIRTUAL) rides the same path and lands VIRTUAL on an 18+ target.
+
 ## Migrating, then tightening
 
 A reasonable workflow for moving legacy data onto a new strict-mode
