@@ -2159,11 +2159,16 @@ func loadColumnTypes(ctx context.Context, db *sql.DB, schema, table string) (map
 			return nil, fmt.Errorf("postgres: applier: translate %s.%s: %w", table, colName, err)
 		}
 		col := &ir.Column{Name: colName, Type: typ}
-		// Postgres only supports STORED generated columns today;
-		// is_generated = 'ALWAYS' implies STORED (same reading as
-		// SchemaReader.populateColumns). Carrying the expression on
-		// the Column makes [ir.Column.IsGenerated] truthful, which is
-		// what the builders' generated-column filter keys on.
+		// The applier's projection carries the expression so
+		// [ir.Column.IsGenerated] is truthful — that is what the
+		// builders' generated-column filter keys on — and it does NOT
+		// read the storage class: an earlier revision asserted "Postgres
+		// only supports STORED generated columns today" here (gap census
+		// 2026-09-22 D5, the fifth home of that premise; PG 18 has
+		// VIRTUAL). GeneratedStored is set to true only because this
+		// projection is never emitted as DDL and nothing here keys on
+		// it; the schema reader (populateColumns) is where the real
+		// classification from pg_attribute.attgenerated lives.
 		if strings.EqualFold(isGenerated, "ALWAYS") && genExpr != "" {
 			col.GeneratedExpr = genExpr
 			col.GeneratedStored = true

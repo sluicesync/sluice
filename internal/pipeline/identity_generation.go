@@ -100,6 +100,39 @@ func restoreIdentityGeneration(ctx context.Context, sw ir.SchemaWriter, schema *
 	return restorer.RestoreIdentityGeneration(ctx, schema)
 }
 
+// logIdentityGap is `schema diff`'s one line about the axis it does not
+// compare (the columnFieldExempt named gap in internal/ir/diff): when
+// both sides carry identity columns, say that ALWAYS/BY DEFAULT and the
+// sequence options are not graded — instead of being silent about a
+// target that `sync`, `restore` or a pre-created-table migrate
+// deliberately left BY DEFAULT. Silent when either side has no identity
+// column (every MySQL/SQLite side), so the common diff stays quiet.
+func logIdentityGap(ctx context.Context, expected, actual *ir.Schema) {
+	if expected == nil || actual == nil {
+		return
+	}
+	hasIdentity := func(s *ir.Schema) bool {
+		for _, t := range s.Tables {
+			if t == nil {
+				continue
+			}
+			for _, c := range t.Columns {
+				if c != nil && c.Identity != nil {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	if !hasIdentity(expected) || !hasIdentity(actual) {
+		return
+	}
+	slog.InfoContext(ctx, "schema diff: IDENTITY-ALWAYS-DOWNGRADED is not graded here — identity generation mode "+
+		"(GENERATED ALWAYS vs BY DEFAULT) and identity sequence options (START/INCREMENT/MINVALUE/MAXVALUE/CACHE/CYCLE) "+
+		"are a named gap of this diff; a target left BY DEFAULT by sync, restore, chain restore or a pre-created-table "+
+		"migrate reports no drift for it. Compare information_schema.columns.identity_generation and pg_sequence by hand")
+}
+
 // identityAlwaysColumns counts the columns whose source declared
 // GENERATED ALWAYS AS IDENTITY — the pre-scan that keeps the phase a
 // no-op (no dispatch, no log line) for the overwhelmingly common schema

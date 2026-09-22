@@ -809,17 +809,34 @@ const generatedVirtualPromotedMarker = "GENERATED-VIRTUAL-PROMOTED-TO-STORED"
 //     takes disk; VIRTUAL is computed on read). Refusing would force
 //     operators into the per-column mappings hook for what is almost
 //     always a benign translation.
-//   - the column is INDEXED. PG 18 refuses `CREATE INDEX` on a virtual
-//     generated column ("indexes on virtual generated columns are not
-//     supported", measured 2026-09-22 on 18.6), while MySQL indexes
-//     VIRTUAL columns freely — so a faithful VIRTUAL here would turn a
-//     working MySQL→PG 18 migration into a loud index-phase failure.
-//     The promotion keeps the index buildable; a PG source can never
-//     reach this branch, since PG itself would not have let the index
-//     exist.
+//   - the column is something PG 18 will not let a VIRTUAL column be
+//     ([virtualBlockedBy]): indexed (plainly or through an expression
+//     index), a FOREIGN KEY member, a UNIQUE member, or of a
+//     user-defined type. PostgreSQL 18 refuses every one of those on a
+//     virtual generated column and accepts all of them on STORED
+//     (measured 2026-09-22 on 18.6 — "indexes on virtual generated
+//     columns are not supported", "unique constraints on …", "foreign key
+//     constraints on …", "cannot have a user-defined type", "cannot have
+//     a domain type"), while MySQL allows each of them on a VIRTUAL
+//     column — so a faithful VIRTUAL here would turn a working MySQL→PG
+//     18 migration into a loud CREATE / index / constraint-phase failure.
+//     A PG source can never reach this branch, since PG itself would not
+//     have let the shape exist.
 //
-// Both promotions are visible at `schema preview` (the same emitter
-// renders it) and carry [generatedVirtualPromotedMarker].
+// What the predicate CANNOT see statically is the generation EXPRESSION:
+// PG 18 also refuses a virtual column whose expression calls a
+// user-defined function or names a user-defined type ("generation
+// expression uses user-defined function" / "… user-defined type"), and
+// an ADR-0016 translation can land on an extension function (digest,
+// citext) sluice does not parse for. That class is caught at CREATE
+// TABLE by [SchemaWriter.createTableRetryingVirtualPromotion], which
+// retries the table once with every VIRTUAL column promoted and names
+// the server's own reason — the loud fallback for a rule set PG says is
+// "not yet supported" and will keep evolving.
+//
+// Every promotion is visible at `schema preview` (the same emitter
+// renders it, bar the server-driven retry) and carries
+// [generatedVirtualPromotedMarker].
 func generatedStorageClause(table *ir.Table, c *ir.Column, opts emitOpts) string {
 	if c.GeneratedStored {
 		return " STORED"
@@ -832,15 +849,102 @@ func generatedStorageClause(table *ir.Table, c *ir.Column, opts emitOpts) string
 		)
 		return " STORED"
 	}
-	if columnIsIndexed(table, c.Name) {
+	if reason := virtualBlockedBy(table, c); reason != "" {
 		slog.Warn(
-			"postgres: "+generatedVirtualPromotedMarker+": promoting INDEXED VIRTUAL generated column to STORED — PostgreSQL 18 does not support indexes on virtual generated columns, and the source carries an index on this column",
+			"postgres: "+generatedVirtualPromotedMarker+": promoting VIRTUAL generated column to STORED — PostgreSQL 18 does not support this shape on a virtual generated column",
 			slog.String("table", tableNameForLog(table)),
 			slog.String("column", c.Name),
+			slog.String("reason", reason),
 		)
 		return " STORED"
 	}
 	return " VIRTUAL"
+}
+
+// virtualBlockedBy names the first statically visible reason PG 18
+// refuses c as a VIRTUAL generated column, or "" when none applies:
+// index membership (plain or expression), FOREIGN KEY membership, UNIQUE
+// membership, or a user-defined column type. nil-safe on table.
+func virtualBlockedBy(table *ir.Table, c *ir.Column) string {
+	// A DOMAIN wrapper is itself the user-defined type PG refuses
+	// ("cannot have a domain type"), so it is asked about first, as the
+	// wrapper; the base type is then asked about as storage.
+	if _, isDomain := ir.DomainOf(c); isDomain {
+		return "user-defined column type"
+	}
+	switch ir.UnwrapDomain(c.Type).(type) {
+	case ir.Enum, ir.ExtensionType, ir.VerbatimType:
+		return "user-defined column type"
+	}
+	if table == nil {
+		return ""
+	}
+	if table.PrimaryKey != nil && indexReferencesColumn(table.PrimaryKey, c.Name) {
+		return "primary key member"
+	}
+	for _, ix := range table.Indexes {
+		if ix == nil || !indexReferencesColumn(ix, c.Name) {
+			continue
+		}
+		if ix.Unique {
+			return "unique index/constraint member"
+		}
+		return "indexed"
+	}
+	for _, fk := range table.ForeignKeys {
+		if fk == nil {
+			continue
+		}
+		for _, col := range fk.Columns {
+			if col == c.Name {
+				return "foreign key member"
+			}
+		}
+	}
+	return ""
+}
+
+// indexReferencesColumn reports whether ix names column, either as a
+// plain entry or inside an expression entry. The expression test is a
+// word-boundary match on the identifier — a superset of "references"
+// that can only ever promote one column too many (to STORED, which PG
+// accepts), never leave a refused VIRTUAL behind.
+func indexReferencesColumn(ix *ir.Index, column string) bool {
+	for _, ic := range ix.Columns {
+		if ic.Column == column {
+			return true
+		}
+		if ic.Expression != "" && expressionMentionsIdentifier(ic.Expression, column) {
+			return true
+		}
+	}
+	return false
+}
+
+// expressionMentionsIdentifier reports whether expr contains ident as a
+// whole word (case-insensitively, so a folded PG identifier and a
+// MySQL-cased one both match).
+func expressionMentionsIdentifier(expr, ident string) bool {
+	lower := strings.ToLower(expr)
+	needle := strings.ToLower(ident)
+	for start := 0; ; {
+		i := strings.Index(lower[start:], needle)
+		if i < 0 {
+			return false
+		}
+		i += start
+		end := i + len(needle)
+		before := i == 0 || !isIdentByte(lower[i-1])
+		after := end == len(lower) || !isIdentByte(lower[end])
+		if before && after {
+			return true
+		}
+		start = i + 1
+	}
+}
+
+func isIdentByte(b byte) bool {
+	return b == '_' || (b >= '0' && b <= '9') || (b >= 'a' && b <= 'z')
 }
 
 // columnIsIndexed reports whether any index on table — the primary key
@@ -854,13 +958,8 @@ func columnIsIndexed(table *ir.Table, column string) bool {
 		indexes = append([]*ir.Index{table.PrimaryKey}, indexes...)
 	}
 	for _, ix := range indexes {
-		if ix == nil {
-			continue
-		}
-		for _, ic := range ix.Columns {
-			if ic.Column == column {
-				return true
-			}
+		if ix != nil && indexReferencesColumn(ix, column) {
+			return true
 		}
 	}
 	return false

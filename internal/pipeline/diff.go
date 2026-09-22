@@ -394,6 +394,7 @@ func (d *Differ) Run(ctx context.Context) (*irdiff.SchemaDiff, error) {
 		TargetCannotHoldRowLevelSecurity: !d.Target.Capabilities().PostgresBackend,
 		TranslateExpectedCheckExpr:       translateExpected,
 	})
+	logIdentityGap(ctx, expected, actual)
 
 	// ---- 4. Resolve missing-table DDL via the target engine's
 	// PreviewDDL surface so the text renderer can include real CREATE

@@ -38,11 +38,17 @@ const (
 	pgVersionUniqueWithoutOverlaps  = 180000
 )
 
-// pgVersionGeneratedColumns is the first server version with generated
-// columns at all — PG 12, which added `pg_attribute.attgenerated`. Below
-// it the column does not exist and referencing it would 42703 the whole
-// column read, so [populateColumns] substitutes an empty-string select
-// expression there (no column can be generated, so the empty string is exact).
+// pgVersionSchemaReaderFloor is the oldest server the schema reader can
+// read at all — PG 12. [populateColumns] references
+// `pg_collation.collisdeterministic` and `pg_attribute.attgenerated`
+// unconditionally, and both arrived in 12; on an older server the
+// column read 42703s before anything else runs. Recorded here because
+// no earlier home named a floor: an earlier revision version-gated the
+// attgenerated read to 12+ "for PG 10/11", which was dead code — the
+// same query had already required 12 through collisdeterministic (the
+// value-fidelity review's finding). The CDC lane's floor is separate
+// (pgoutput, PG 10) and lower than this; `cutover` is documented at
+// 12–18 in docs/production-readiness.md.
 //
 // pgVersionVirtualGeneratedColumns is the first server version that
 // accepts `GENERATED ALWAYS AS (…) VIRTUAL` — PG 18, whose
@@ -53,7 +59,7 @@ const (
 // servers by TestGeneratedColumns_StorageClass_PG18 and
 // TestGeneratedColumns_StorageClass_DefaultImage.
 const (
-	pgVersionGeneratedColumns        = 120000
+	pgVersionSchemaReaderFloor       = 120000
 	pgVersionVirtualGeneratedColumns = 180000
 )
 

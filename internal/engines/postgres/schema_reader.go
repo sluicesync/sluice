@@ -376,7 +376,11 @@ func (r *SchemaReader) ReadSchema(ctx context.Context) (*ir.Schema, error) {
 			return nil, fmt.Errorf("postgres: read domain checks: %w", err)
 		}
 
-		if err := r.populateColumns(ctx, tables, enumValues, geomInfo, geogInfo, domainChecks, serialSeqs, identitySeqs); err != nil {
+		partitionRoots, err := r.partitionRoots(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("postgres: read partition roots: %w", err)
+		}
+		if err := r.populateColumns(ctx, tables, enumValues, geomInfo, geogInfo, domainChecks, serialSeqs, identitySeqs, partitionRoots); err != nil {
 			return nil, fmt.Errorf("postgres: read columns: %w", err)
 		}
 		if err := r.populateIndexes(ctx, tables); err != nil {
@@ -1086,23 +1090,17 @@ func isUndefinedRelationErr(err error) bool {
 // server_encoding is global — so the Charset field on the IR types
 // stays empty for PG sources. MySQL writers accept that as "use the
 // table / database default."
-func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*ir.Table, enumValues map[string][]string, geomInfo, geogInfo map[string]geometryColumnInfo, domainChecks map[string][]ir.DomainCheck, serialSeqs map[string]pgSequenceOwner, identitySeqs map[pgSequenceOwner]ir.IdentityOptions) error {
+func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*ir.Table, enumValues map[string][]string, geomInfo, geogInfo map[string]geometryColumnInfo, domainChecks map[string][]ir.DomainCheck, serialSeqs map[string]pgSequenceOwner, identitySeqs map[pgSequenceOwner]ir.IdentityOptions, partitionRoots map[string]string) error {
 	// COALESCE(a.atttypmod, -1) supplies the per-column typmod for
 	// extension-owned types whose modifiers ride on atttypmod
 	// (pgvector dimension; future PostGIS subtype/SRID). -1 is the
 	// "no typmod" sentinel pgattribute uses; per-extension catalog
 	// entries decode it into the IR's Modifiers vector.
 	//
-	// The generated-column STORAGE CLASS is version-gated (the
-	// [serverVersionNum] precedent populateIndexes uses): `attgenerated`
-	// exists on PG 12+ only, and referencing it on an older server would
-	// 42703 the whole column read, so the query substitutes '' there —
-	// exact, since no column can be generated before PG 12.
-	version, err := serverVersionNum(ctx, r.db)
-	if err != nil {
-		return fmt.Errorf("postgres: column read: %w", err)
-	}
-	q := `
+	// This query references PG 12+ catalog columns unconditionally
+	// (pg_collation.collisdeterministic, pg_attribute.attgenerated);
+	// PG 12 is the schema reader's floor — see [pgVersionSchemaReaderFloor].
+	const q = `
 		SELECT
 			c.table_name,
 			c.column_name,
@@ -1155,7 +1153,7 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 			-- schema reader was the one door that did not, and it
 			-- carried every VIRTUAL column as STORED on a written false
 			-- premise.
-			` + generatedStorageClassExpr(version) + ` AS att_generated,
+			COALESCE(a.attgenerated::text, '') AS att_generated,
 			-- GC-3 (gap census S4): the identity column's generation mode,
 			-- 'ALWAYS' or 'BY DEFAULT', which is_identity collapses to a
 			-- bool. Read here so the writer can say which ALWAYS columns it
@@ -1225,12 +1223,13 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 		}
 
 		col, err := r.columnFromRow(cr, columnLookups{
-			enumValues:   enumValues,
-			geomInfo:     geomInfo,
-			geogInfo:     geogInfo,
-			domainChecks: domainChecks,
-			serialSeqs:   serialSeqs,
-			identitySeqs: identitySeqs,
+			enumValues:     enumValues,
+			geomInfo:       geomInfo,
+			geogInfo:       geogInfo,
+			domainChecks:   domainChecks,
+			serialSeqs:     serialSeqs,
+			identitySeqs:   identitySeqs,
+			partitionRoots: partitionRoots,
 		})
 		if err != nil {
 			return err
@@ -1266,8 +1265,7 @@ type columnRow struct {
 	columnTypeKind      string
 	columnTypeName      string
 	// attGenerated is pg_attribute.attgenerated: 's' STORED, 'v'
-	// VIRTUAL (PG 18+), '' for a plain column — or for every column on
-	// a pre-12 server, where the catalog column is version-gated out.
+	// VIRTUAL (PG 18+), '' for a plain column.
 	attGenerated string
 	// identityGeneration is information_schema.columns.identity_generation:
 	// 'ALWAYS', 'BY DEFAULT', or '' for a non-identity column.
@@ -1282,16 +1280,49 @@ const (
 	pgAttGeneratedVirtual = "v"
 )
 
-// generatedStorageClassExpr returns the select expression populateColumns
-// reads the storage class through: the real catalog column on PG 12+,
-// a constant empty string below it (no generated columns exist there, so it is
-// exact rather than a degradation — the same version-gated
-// catalog-read shape as [uniqueConstraintAttrExprs]).
-func generatedStorageClassExpr(version int) string {
-	if version >= pgVersionGeneratedColumns {
-		return "COALESCE(a.attgenerated::text, '')"
+// partitionRoots maps every declarative-partition CHILD in the bound
+// schema (any depth) to its ROOT partitioned table (relkind 'p' with no
+// parent of its own). Identity resolution needs it: PostgreSQL 17+
+// allows an identity column on a partitioned table, and the catalog
+// then says `is_identity = YES` on every partition child while the only
+// deptype='i' sequence hangs off the ROOT's column (PG's own
+// getIdentitySequence walks up the same way). Measured 2026-09-22 on
+// 18.6: `pp1.id` reports ALWAYS with `attidentity = 'a'`, and the sole
+// 'i' row is `pp_id_seq → pp.id`.
+func (r *SchemaReader) partitionRoots(ctx context.Context) (map[string]string, error) {
+	const q = `
+		WITH RECURSIVE up AS (
+			SELECT i.inhrelid AS child, i.inhparent AS parent
+			FROM   pg_inherits i
+			JOIN   pg_class    c ON c.oid = i.inhrelid
+			JOIN   pg_namespace n ON n.oid = c.relnamespace
+			WHERE  n.nspname = $1
+			  AND  c.relkind IN ('r', 'p')
+			UNION ALL
+			SELECT up.child, i.inhparent
+			FROM   up
+			JOIN   pg_inherits i ON i.inhrelid = up.parent
+		)
+		SELECT cc.relname, pc.relname
+		FROM   up
+		JOIN   pg_class cc ON cc.oid = up.child
+		JOIN   pg_class pc ON pc.oid = up.parent
+		WHERE  pc.relkind = 'p'
+		  AND  NOT EXISTS (SELECT 1 FROM pg_inherits j WHERE j.inhrelid = up.parent)`
+	rows, err := r.catalogQuery(ctx, q, r.schema)
+	if err != nil {
+		return nil, err
 	}
-	return "''"
+	defer func() { _ = rows.Close() }()
+	roots := map[string]string{}
+	for rows.Next() {
+		var child, root string
+		if err := rows.Scan(&child, &root); err != nil {
+			return nil, err
+		}
+		roots[child] = root
+	}
+	return roots, rows.Err()
 }
 
 // columnLookups bundles the side tables populateColumns resolves once up
@@ -1305,6 +1336,10 @@ type columnLookups struct {
 	domainChecks map[string][]ir.DomainCheck
 	serialSeqs   map[string]pgSequenceOwner
 	identitySeqs map[pgSequenceOwner]ir.IdentityOptions
+	// partitionRoots maps a partition child to its root partitioned
+	// table, for resolving a child identity column's sequence through
+	// the root (see [SchemaReader.partitionRoots]).
+	partitionRoots map[string]string
 }
 
 // columnFromRow translates one scanned catalog row into an [ir.Column]:
@@ -1606,10 +1641,31 @@ func (r *SchemaReader) columnFromRow(cr columnRow, lk columnLookups) (*ir.Column
 	if strings.EqualFold(isIdentity, "YES") {
 		opts, ok := lk.identitySeqs[pgSequenceOwner{table: tableName, column: colName}]
 		if !ok {
+			// A partition child (PG 17+ identity on a partitioned
+			// table) owns no sequence of its own: the catalog reports
+			// the child column as identity while the deptype='i'
+			// sequence hangs off the ROOT's column. Resolve through
+			// the root the way PostgreSQL itself does. Measured, and
+			// the reason this branch exists: the first cut of this
+			// refusal fired on every such child, inside ReadSchema and
+			// before the Bug-100 partition preflight whose recovery is
+			// `--exclude-table=<parent>` — a remedy-less message on a
+			// working configuration.
+			if root, isChild := lk.partitionRoots[tableName]; isChild {
+				opts, ok = lk.identitySeqs[pgSequenceOwner{table: root, column: colName}]
+			}
+		}
+		if !ok {
+			shape := "no partition parent"
+			if root, isChild := lk.partitionRoots[tableName]; isChild {
+				shape = fmt.Sprintf("a partition of %q, whose column %q has no identity sequence either", root, colName)
+			}
 			return nil, fmt.Errorf("postgres: column %s.%s is an identity column (is_identity = YES, identity_generation = %q) "+
-				"but no identity-backed sequence (pg_depend deptype 'i') was found for it in schema %q; "+
-				"refusing to carry the column with guessed sequence options",
-				tableName, colName, cr.identityGeneration, r.schema)
+				"but no identity-backed sequence (pg_depend deptype 'i') was found for it in schema %q (%s); "+
+				"refusing to carry the column with guessed sequence options — exclude the table with "+
+				"`--exclude-table=%s` (a partitioned parent is refused by the partition preflight with the same remedy), "+
+				"or report the catalog shape",
+				tableName, colName, cr.identityGeneration, r.schema, shape, tableName)
 		}
 		opts.Always = strings.EqualFold(cr.identityGeneration, "ALWAYS")
 		col.Identity = &opts

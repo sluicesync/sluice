@@ -470,23 +470,40 @@ func (w *SchemaWriter) primeOneSequence(
 	}
 	action.SourceValue = src.Value
 
-	// Resolve the target's owning sequence.
-	const seqQuery = `SELECT pg_catalog.pg_get_serial_sequence($1, $2)`
-	tableArg := quoteIdent(w.schema) + "." + quoteIdent(table.Name)
-	var seqName sql.NullString
-	if err := w.db.QueryRowContext(ctx, seqQuery, tableArg, column).Scan(&seqName); err != nil {
-		return action, fmt.Errorf("pg_get_serial_sequence: %w", err)
+	// Resolve the target's owning sequence — name, direction and
+	// bounds, the target's own account (the same independent value
+	// SyncIdentitySequences keys on).
+	seq, ok, err := w.readTargetIdentitySequence(ctx, table, column)
+	if err != nil {
+		return action, err
 	}
-	if !seqName.Valid || seqName.String == "" {
+	if !ok {
 		action.Outcome = "skipped"
 		action.Reason = "target has no owning sequence — IR declares identity but pg_get_serial_sequence returned NULL"
 		return action, nil
 	}
+	// Direction-aware since identity sequence options ride the IR (gap
+	// census 2026-09-22 S5): a faithfully re-created descending identity
+	// advances DOWNWARD, so source+margin, the bounds clamp and every
+	// ahead/behind comparison flip with it — the same shape
+	// primeOneStandaloneSequence has had since item 51. Before this the
+	// walk was ascending-only, which on a descending target either
+	// primed onto issued ids or errored on setval's bounds check.
+	dir := int64(1)
+	if seq.increment < 0 {
+		dir = -1
+	}
+	ahead := func(a, b int64) bool {
+		if dir < 0 {
+			return a < b
+		}
+		return a > b
+	}
 
 	// Read the target's current last-issued value via pg_sequences.
-	seqSchema, seqLocal, err := splitQualifiedSequence(seqName.String)
+	seqSchema, seqLocal, err := splitQualifiedSequence(seq.name)
 	if err != nil {
-		return action, fmt.Errorf("split target sequence name %q: %w", seqName.String, err)
+		return action, fmt.Errorf("split target sequence name %q: %w", seq.name, err)
 	}
 	// pg_sequences exposes last_value as NULL when the sequence has
 	// never been called; non-NULL once nextval() has issued at least
@@ -509,40 +526,47 @@ func (w *SchemaWriter) primeOneSequence(
 	}
 	action.TargetBefore = targetBefore
 
-	applyValue := src.Value + margin
-	if applyValue < 1 {
-		// Defensive: PG setval refuses values below the sequence's
-		// minvalue (default 1). When source is 0 (never called) and
-		// margin is somehow zero, snap to 1 so we still leave the
-		// sequence in a usable shape.
-		applyValue = 1
+	applyValue := src.Value + dir*margin
+	// Clamp into the sequence's declared bounds — setval outside
+	// [MinValue, MaxValue] errors. For the ascending default this is
+	// the old "snap to minvalue 1" defensive branch (source 0 = never
+	// called, margin 0); for a descending sequence the same clamp
+	// holds at MinValue.
+	if dir > 0 && applyValue > seq.maxValue {
+		applyValue = seq.maxValue
+	}
+	if applyValue < seq.minValue {
+		applyValue = seq.minValue
+	}
+	if dir < 0 && applyValue > seq.maxValue {
+		applyValue = seq.maxValue
 	}
 
-	// Refusal: target is ahead of source+margin by more than margin.
-	// (target > applyValue + margin) means the operator likely ran
+	// Refusal: target is beyond source+margin by more than margin, in
+	// the sequence's own direction — the operator likely ran
 	// post-cutover INSERTs that advanced the target past where the
 	// would-be priming pass would land it.
-	if targetBefore > applyValue+margin {
+	if ahead(targetBefore, applyValue+dir*margin) {
 		action.Outcome = "refused"
-		action.Reason = fmt.Sprintf("target value %d is ahead of source+margin (%d+%d=%d) by more than the idempotency tolerance; manual re-snapshot recommended",
-			targetBefore, src.Value, margin, applyValue)
+		action.Reason = fmt.Sprintf("target value %d is ahead of source+margin (%d%+d=%d) by more than the idempotency tolerance; manual re-snapshot recommended",
+			targetBefore, src.Value, dir*margin, applyValue)
 		action.TargetAfter = targetBefore
 		return action, nil
 	}
 
-	// No-op: target is already at or above the would-be apply point.
+	// No-op: target is already at or beyond the would-be apply point.
 	// Idempotent re-run lands here.
-	if targetBefore >= applyValue {
+	if !ahead(applyValue, targetBefore) {
 		action.Outcome = "noop"
 		action.TargetAfter = targetBefore
 		return action, nil
 	}
 
 	// Prime: setval to applyValue with is_called=true so next nextval
-	// returns applyValue+1.
+	// returns applyValue+increment.
 	const setvalQuery = `SELECT pg_catalog.setval($1, $2, true)`
-	if _, err := w.db.ExecContext(ctx, setvalQuery, seqName.String, applyValue); err != nil {
-		return action, fmt.Errorf("pg_catalog.setval(%q, %d, true): %w", seqName.String, applyValue, err)
+	if _, err := w.db.ExecContext(ctx, setvalQuery, seq.name, applyValue); err != nil {
+		return action, fmt.Errorf("pg_catalog.setval(%q, %d, true): %w", seq.name, applyValue, err)
 	}
 	action.Outcome = "primed"
 	action.TargetAfter = applyValue

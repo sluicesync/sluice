@@ -36,6 +36,16 @@ import (
 // Docker provider is available.
 func startPostgres(t *testing.T) (sourceDSN, targetDSN string, cleanup func()) {
 	t.Helper()
+	return startPostgresImage(t, pgPrebakedImage)
+}
+
+// startPostgresImage is startPostgres for an explicit image — the pinned
+// postgres:17 / postgres:18 legs boot a version the pre-baked 16 image
+// cannot stand in for (identity on partitioned tables, VIRTUAL generated
+// columns). Both stock tags are pre-pulled via their GHCR mirrors in
+// ci.yml.
+func startPostgresImage(t *testing.T, image string) (sourceDSN, targetDSN string, cleanup func()) {
+	t.Helper()
 	testcontainers.SkipIfProviderIsNotHealthy(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -45,7 +55,7 @@ func startPostgres(t *testing.T) (sourceDSN, targetDSN string, cleanup func()) {
 		ctx,
 		// Task #68: pre-baked PG image. See
 		// pg_prebaked_integration_test.go for the full rationale.
-		pgPrebakedImage,
+		image,
 		pgtc.WithDatabase("source_db"),
 		pgtc.WithUsername("test"),
 		pgtc.WithPassword("test"),

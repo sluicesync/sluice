@@ -13,7 +13,10 @@
 package postgres
 
 import (
+	"errors"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -86,14 +89,113 @@ func TestColumnFromRow_GeneratedStorageClass(t *testing.T) {
 	})
 }
 
-// TestGeneratedStorageClassExpr pins the version gate on the catalog
-// read: the real column on PG 12+, a constant below it.
-func TestGeneratedStorageClassExpr(t *testing.T) {
-	if got := generatedStorageClassExpr(pgVersionGeneratedColumns); !strings.Contains(got, "attgenerated") {
-		t.Errorf("PG 12 expression = %q; want the attgenerated read", got)
+// TestSchemaReaderFloorIsDocumented pins the reader's stated floor to the
+// operator doc: the column read requires PG 12 catalog columns
+// unconditionally, and docs/production-readiness.md must say so.
+func TestSchemaReaderFloorIsDocumented(t *testing.T) {
+	if pgVersionSchemaReaderFloor != 120000 {
+		t.Fatalf("pgVersionSchemaReaderFloor = %d; the column read references PG 12 catalog columns", pgVersionSchemaReaderFloor)
 	}
-	if got := generatedStorageClassExpr(pgVersionGeneratedColumns - 1); got != "''" {
-		t.Errorf("PG 11 expression = %q; want the constant ''", got)
+	doc, err := os.ReadFile(filepath.Join("..", "..", "..", "docs", "production-readiness.md"))
+	if err != nil {
+		t.Fatalf("read doc: %v", err)
+	}
+	if !strings.Contains(string(doc), "PostgreSQL 12 or newer") {
+		t.Error("docs/production-readiness.md does not state the PostgreSQL 12 schema-read floor")
+	}
+}
+
+// TestVirtualBlockedBy pins the static half of the PG 18 VIRTUAL
+// predicate across every shape PostgreSQL refuses: plain index,
+// expression index, primary key, unique index, foreign key, and each
+// user-defined column type — and the two shapes it must NOT block (a
+// plain built-in column; an expression index over a DIFFERENT column).
+func TestVirtualBlockedBy(t *testing.T) {
+	gen := func(typ ir.Type) *ir.Column {
+		return &ir.Column{Name: "v", Type: typ, Nullable: true, GeneratedExpr: "(c * 3)"}
+	}
+	intCol := gen(ir.Integer{Width: 32})
+	cases := []struct {
+		name  string
+		table *ir.Table
+		col   *ir.Column
+		want  string
+		// skipEmit: the type needs a real definition / enabled extension to
+		// render; the predicate is what this cell grades.
+		skipEmit bool
+	}{
+		{"plain column, nothing on it", &ir.Table{Name: "t"}, intCol, "", false},
+		{"expression index over another column", &ir.Table{Name: "t", Indexes: []*ir.Index{{Columns: []ir.IndexColumn{{Expression: "(vv + 1)"}}}}}, intCol, "", false},
+		{"plain index", &ir.Table{Name: "t", Indexes: []*ir.Index{{Columns: []ir.IndexColumn{{Column: "v"}}}}}, intCol, "indexed", false},
+		{"expression index", &ir.Table{Name: "t", Indexes: []*ir.Index{{Columns: []ir.IndexColumn{{Expression: "(v + 1)"}}}}}, intCol, "indexed", false},
+		{"expression index, upper-cased identifier", &ir.Table{Name: "t", Indexes: []*ir.Index{{Columns: []ir.IndexColumn{{Expression: "UPPER(V)"}}}}}, intCol, "indexed", false},
+		{"unique index", &ir.Table{Name: "t", Indexes: []*ir.Index{{Unique: true, Columns: []ir.IndexColumn{{Column: "v"}}}}}, intCol, "unique index/constraint member", false},
+		{"primary key", &ir.Table{Name: "t", PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "v"}}}}, intCol, "primary key member", false},
+		{"foreign key", &ir.Table{Name: "t", ForeignKeys: []*ir.ForeignKey{{Columns: []string{"v"}, ReferencedTable: "p"}}}, intCol, "foreign key member", false},
+		{"enum type", &ir.Table{Name: "t"}, gen(ir.Enum{Values: []string{"a"}}), "user-defined column type", false},
+		{"domain type", &ir.Table{Name: "t"}, gen(ir.Domain{Name: "posint", BaseType: ir.Integer{Width: 32}}), "user-defined column type", false},
+		{"extension type", &ir.Table{Name: "t"}, gen(ir.ExtensionType{}), "user-defined column type", true},
+		{"verbatim type", &ir.Table{Name: "t"}, gen(ir.VerbatimType{}), "user-defined column type", true},
+		{"nil table", nil, intCol, "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := virtualBlockedBy(tc.table, tc.col); got != tc.want {
+				t.Errorf("virtualBlockedBy = %q; want %q", got, tc.want)
+			}
+			if tc.skipEmit {
+				return
+			}
+			// The predicate is what the emitter promotes on: every
+			// blocked shape must render STORED on a VIRTUAL-capable target.
+			got, err := emitColumnDef(tc.table, tc.col, emitOpts{VirtualGeneratedColumns: true})
+			if err != nil {
+				t.Fatalf("emitColumnDef: %v", err)
+			}
+			wantTail := ") VIRTUAL"
+			if tc.want != "" {
+				wantTail = ") STORED"
+			}
+			if _, isEnum := tc.col.Type.(ir.Enum); isEnum {
+				wantTail = ") STORED" // Bug 25 renders enum generated columns as TEXT; still STORED
+			}
+			if !strings.HasSuffix(got, wantTail) {
+				t.Errorf("emitted %q; want the %q tail", got, wantTail)
+			}
+		})
+	}
+}
+
+// TestIsVirtualGeneratedRefusal pins the server-string matcher behind
+// the CREATE TABLE retry: every listed refusal matches, an unrelated
+// error does not, and promoteVirtualColumns copies rather than mutates.
+func TestIsVirtualGeneratedRefusal(t *testing.T) {
+	for _, s := range pgVirtualGeneratedRefusals {
+		if _, ok := isVirtualGeneratedRefusal(errors.New("ERROR: " + s + " (SQLSTATE 0A000)")); !ok {
+			t.Errorf("%q not recognised", s)
+		}
+	}
+	if _, ok := isVirtualGeneratedRefusal(errors.New("ERROR: relation \"t\" already exists")); ok {
+		t.Error("an unrelated error matched the VIRTUAL refusal set")
+	}
+	if _, ok := isVirtualGeneratedRefusal(nil); ok {
+		t.Error("nil matched")
+	}
+
+	tbl := &ir.Table{Name: "t", Columns: []*ir.Column{
+		{Name: "c", Type: ir.Integer{Width: 32}},
+		{Name: "v", Type: ir.Integer{Width: 32}, GeneratedExpr: "(c*2)", GeneratedStored: false},
+		{Name: "s", Type: ir.Integer{Width: 32}, GeneratedExpr: "(c*3)", GeneratedStored: true},
+	}}
+	promoted, had := promoteVirtualColumns(tbl)
+	if !had {
+		t.Fatal("promoteVirtualColumns reported no VIRTUAL column")
+	}
+	if !promoted.Columns[1].GeneratedStored || tbl.Columns[1].GeneratedStored {
+		t.Errorf("promotion: copy STORED=%v, input STORED=%v; want true/false (input never mutated)", promoted.Columns[1].GeneratedStored, tbl.Columns[1].GeneratedStored)
+	}
+	if _, had := promoteVirtualColumns(&ir.Table{Name: "t", Columns: tbl.Columns[:1]}); had {
+		t.Error("a table with no VIRTUAL column reported one")
 	}
 }
 
