@@ -8,9 +8,9 @@ VStream gRPC API. That extra layer adds failure modes that don't
 exist with vanilla MySQL `binlog`. This doc names them, says what
 you can do about each, and flags what's coming with Vitess 24.
 
-If `sluice sync health` (see `docs/dev/design/sync-health-monitoring.md`)
-is reporting non-zero `lag_seconds` or `seconds_since_last_event`,
-start here. Sluice's VStream client lives in
+If `sluice sync health` is reporting a climbing `seconds_since_last_apply`
+on a source you know is busy, or `/metrics` shows `sluice_sync_lag_seconds`
+climbing (see "Detection: what to watch" below), start here. Sluice's VStream client lives in
 `internal/engines/mysql/cdc_vstream.go`; DSN flags
 (`vstream_shards`, `vstream_auto_discover_shards`, etc.) are in
 `docs/managed-services.md`.
@@ -33,7 +33,7 @@ VStream is a chain of three things on the source side:
 ```
 
 A "delay" can show up as: events arriving slowly, events not
-arriving at all (`seconds_since_last_event` climbing while the
+arriving at all (`seconds_since_last_apply` climbing while the
 source is clearly active), or the stream terminating cleanly and
 refusing to resume. Each manifests differently.
 
@@ -197,7 +197,7 @@ migration's data movement.
   outside maintenance.
 - Unplanned failover: sluice's outer loop reconnects from the
   persisted CDC position. A single brief
-  `seconds_since_last_event` spike is almost always transient.
+  `seconds_since_last_apply` spike is almost always transient.
 - Reshard: confirm sluice handles cleanly — typed
   `ShardLayoutChangedError` → log line → `Reopen` retry. If the
   streamer terminates with `mysql/vstream: shard layout changed`
@@ -279,20 +279,31 @@ Some delays are properties of the underlying system:
 
 ## Detection: what to watch
 
-Metrics from `docs/dev/design/sync-health-monitoring.md`:
+Gauges on the `/metrics` endpoint (`sync start --metrics-listen`;
+the full reference table, pinned against the real scrape output by a
+CI test, is in `docs/operator/running-as-a-service.md`):
 
-- **`sluice_lag_seconds`**: source-event timestamp vs. now. Most
+- **`sluice_sync_lag_seconds`**: seconds the target trails the
+  source's latest applied commit, frozen at each apply. Most
   meaningful. Sustained > 60s on a write-active source = worth
-  investigating; > 10 minutes = real incident.
-- **`sluice_seconds_since_last_event`**: distinguishes "source
-  quiet" from "stream broken" only when combined with knowledge
-  of source write activity. On real PlanetScale the heartbeat-log
-  cadence is ~60s (not the requested 5s), so on a healthy stream this
-  sits under ~60s; a throttle stall that withholds heartbeats makes
-  it climb without bound.
-- **`sluice_streamer_state`**: `streaming` → `stopping` /
-  `stopped` without operator-issued `sync stop` is the loud
-  signal. Wire alerting on this transition.
+  investigating; > 10 minutes = real incident. It is **omitted** after
+  ~30s with no applied change — sustained idle is UNKNOWN, not zero —
+  so alert on the series going absent as well as on its value.
+- **`sluice_seconds_since_last_apply`**: wall-clock seconds since the
+  stream's most recent applier commit. It ages on a *quiet* source
+  too, so it distinguishes "source quiet" from "stream broken" only
+  when combined with knowledge of source write activity. Heartbeats
+  are not applies: on real PlanetScale the heartbeat-log cadence is
+  ~60s (not the requested 5s), and this gauge keeps climbing through
+  a heartbeat-only stall exactly as it does through an idle spell.
+- **There is no stream-state gauge.** A `streaming` → `stopping` /
+  `stopped` transition without an operator-issued `sync stop` is the
+  loud signal, and it surfaces as the `sync start` process exiting
+  non-zero (alert on the service unit / container restart) and in
+  `sluice sync health --max-stale-seconds N` (`state: STALE …`, exit
+  non-zero). On `/metrics` the nearest proxy is the process's scrape
+  disappearing, or `count(sluice_stream_known)` dropping below the
+  expected stream count.
 
 PlanetScale-side signals to combine:
 
@@ -307,11 +318,13 @@ with PS deploy timestamps.
 For a mid-stream throttle/idle stall (cause #2), watch for the
 rate-limited WARN `alive (heartbeats flowing) but NO change events
 for Ns` — it fires once per quiet spell when heartbeats keep
-arriving but no change events do. Pair it with `sluice_lag_seconds`
-climbing while `sluice_seconds_since_last_event` stays comparatively
-low (heartbeats still arriving): that combination is the
+arriving but no change events do. Pair it with `sluice_sync_lag_seconds`
+climbing (or going absent after ~30s without an apply) while the WARN
+keeps reporting heartbeats: that combination is the
 throttle/large-transaction signature, because vtgate strips the
-in-band `throttled` flag (see cause #2). On real PlanetScale a
+in-band `throttled` flag (see cause #2). The WARN, not a metric, is
+what carries the heartbeat-vs-change-event distinction — `/metrics`
+has no last-event gauge, only the last-apply one. On real PlanetScale a
 *genuinely idle* source does **not** fire this WARN — vtgate keeps
 emitting periodic VGTID/position events on an idle stream, which
 re-arm sluice's soft-idle timer, so mere idleness stays quiet; the
@@ -405,10 +418,10 @@ rollouts.
 Forward-looking; tracks against `docs/dev/roadmap.md` and the
 proto-ADR in `docs/dev/design/sync-health-monitoring.md`.
 
-1. **Ship `sluice sync health` and `--metrics-listen`** so the
-   `sluice_lag_seconds`, `sluice_seconds_since_last_event`,
-   `sluice_streamer_state` triple is observable without parsing
-   logs.
+1. **Shipped: `sluice sync health` (v0.13.0) and `--metrics-listen`
+   (v0.14.0)** — the lag and last-apply gauges above are observable
+   without parsing logs. A stream-state gauge and a last-EVENT (as
+   opposed to last-apply) gauge remain design-only in the proto-ADR.
 2. **VStream-specific health context in `sync status`** — for the
    PlanetScale flavor, surface the active shard's GTID and a
    "healthy / reconnecting / terminated" summary from
@@ -420,7 +433,9 @@ proto-ADR in `docs/dev/design/sync-health-monitoring.md`.
    `CDCBinlogDumpGTID` and sharing decoder code with the vanilla
    MySQL flavor.
 5. **Reshard recovery polish** — structured log on each reopen
-   plus a `sluice_vstream_reshards_total` counter.
+   plus a `sluice_vstream_reshards_total` counter (not built; the
+   name is a proposal, not a series `/metrics` emits).
+   <!-- metric-name-exempt: sluice_vstream_reshards_total - named as planned future work, not a live series -->
 
 ## Reference: source-code map
 
