@@ -112,18 +112,51 @@ func emitColumnType(t ir.Type) (string, error) {
 	}
 }
 
+// pkColumnRole says how a column takes part in the table's single-column
+// integer PRIMARY KEY. On SQLite that role is decided by SPELLING alone —
+// `INTEGER PRIMARY KEY` (inline, or `INTEGER` + `PRIMARY KEY(col)`) is the
+// auto-assigning rowid alias, and every other integer spelling is an
+// ordinary key SQLite never auto-assigns — so the emitter must choose the
+// spelling from what the source measured (Integer.AutoIncrement), not from
+// the column being an integer (GC-4).
+type pkColumnRole int
+
+const (
+	// pkColumnNone: not the sole integer PK column (or no such key).
+	pkColumnNone pkColumnRole = iota
+	// pkColumnRowidAlias: emitted inline as `INTEGER PRIMARY KEY`, the
+	// auto-assigning rowid alias the source's AutoIncrement flag reports.
+	pkColumnRowidAlias
+	// pkColumnNoAlias: the source key does NOT auto-assign, so the column is
+	// spelled [nonAliasIntegerPKType] and the key goes in the table-level
+	// PRIMARY KEY clause — the one combination that keeps SQLite from
+	// inventing an auto-assigning key the source never had.
+	pkColumnNoAlias
+)
+
+// nonAliasIntegerPKType is the declared type a non-auto-assigning integer
+// primary key is spelled with. It is a wart with a purpose: the rowid alias
+// is triggered by the declared type being EXACTLY `INTEGER`, and
+// [emitColumnType] spells every ir.Integer that way, so the only way to land
+// a single-column integer PK that stays an ordinary key (a source
+// `BIGINT PRIMARY KEY`, or a `WITHOUT ROWID` table's `INTEGER PRIMARY KEY`)
+// is a different spelling. `BIGINT` keeps INTEGER affinity, so values and the
+// read-back IR type (Integer{Width: 64}) are unchanged; only the alias is
+// avoided. Ground-truthed by TestRowidAlias_ReaderAndWriterMatchTheDriver.
+const nonAliasIntegerPKType = "BIGINT"
+
 // emitColumnDef renders one column's inline CREATE TABLE fragment:
 //
 //	"name" TYPE [PRIMARY KEY] [GENERATED] [NOT NULL] [DEFAULT ...]
 //
-// inlinePK is true for the single-column INTEGER primary key, which MUST
-// be declared inline as `INTEGER PRIMARY KEY` to become SQLite's rowid
-// alias (the auto-continuing identity the reader reports as
-// Integer.AutoIncrement). For a rowid alias NOT NULL is deliberately
-// omitted so a future NULL insert auto-assigns (the verified
+// role is [pkColumnRowidAlias] for the single-column auto-assigning integer
+// primary key, which MUST be declared inline as `INTEGER PRIMARY KEY` to
+// become SQLite's rowid alias (the auto-continuing identity the reader
+// reports as Integer.AutoIncrement). For a rowid alias NOT NULL is
+// deliberately omitted so a future NULL insert auto-assigns (the verified
 // auto-increment behaviour, ADR-0134 §4); explicit-id bulk-copy rows are
-// unaffected.
-func emitColumnDef(c *ir.Column, inlinePK bool) (string, error) {
+// unaffected. [pkColumnNoAlias] spells the column so it does NOT alias.
+func emitColumnDef(c *ir.Column, role pkColumnRole) (string, error) {
 	if c == nil {
 		return "", errors.New("sqlite: emitColumnDef: column is nil")
 	}
@@ -145,6 +178,10 @@ func emitColumnDef(c *ir.Column, inlinePK bool) (string, error) {
 	typeStr, err := emitColumnType(c.Type)
 	if err != nil {
 		return "", fmt.Errorf("sqlite: column %q: %w", c.Name, err)
+	}
+	inlinePK := role == pkColumnRowidAlias
+	if role == pkColumnNoAlias {
+		typeStr = nonAliasIntegerPKType
 	}
 
 	var sb strings.Builder
@@ -414,11 +451,17 @@ func emitTableDef(table *ir.Table) (string, error) {
 		return "", fmt.Errorf("sqlite: emitTableDef: table %q has no columns", table.Name)
 	}
 
-	// A single-column INTEGER primary key is emitted inline on the column
-	// (`INTEGER PRIMARY KEY`) so it becomes SQLite's rowid alias — the
-	// auto-continuing identity the reader reports as Integer.AutoIncrement.
-	// A composite or non-integer PK uses a table-level PRIMARY KEY clause.
-	inlinePKCol := soleIntegerPKColumn(table)
+	// A single-column AUTO-ASSIGNING integer primary key is emitted inline on
+	// the column (`INTEGER PRIMARY KEY`) so it becomes SQLite's rowid alias —
+	// the auto-continuing identity the reader reports as Integer.AutoIncrement.
+	// A single-column integer PK that does NOT auto-assign on the source is
+	// spelled so it does not alias here either ([pkColumnNoAlias]); it, a
+	// composite PK and a non-integer PK use a table-level PRIMARY KEY clause.
+	pkCol, pkAlias := soleIntegerPKColumn(table)
+	inlinePKCol := ""
+	if pkAlias {
+		inlinePKCol = pkCol
+	}
 
 	// A PRIMARY KEY column carrying a MySQL prefix length is unrepresentable
 	// here, and dropping the prefix WEAKENS the key — the target then admits
@@ -442,7 +485,14 @@ func emitTableDef(table *ir.Table) (string, error) {
 
 	parts := make([]string, 0, len(table.Columns)+len(table.CheckConstraints)+len(table.ForeignKeys)+2)
 	for _, col := range table.Columns {
-		def, err := emitColumnDef(col, col.Name == inlinePKCol)
+		role := pkColumnNone
+		switch col.Name {
+		case inlinePKCol:
+			role = pkColumnRowidAlias
+		case pkCol:
+			role = pkColumnNoAlias
+		}
+		def, err := emitColumnDef(col, role)
 		if err != nil {
 			return "", err
 		}
@@ -500,27 +550,28 @@ func emitTableDef(table *ir.Table) (string, error) {
 	return sb.String(), nil
 }
 
-// soleIntegerPKColumn returns the column name of a single-column INTEGER
-// primary key (the rowid-alias case), or "" when the table has no PK, a
-// composite PK, an expression PK entry, or a non-integer PK column.
-func soleIntegerPKColumn(table *ir.Table) string {
+// soleIntegerPKColumn returns the column name of a single-column integer
+// primary key and whether that key auto-assigns on the source
+// (Integer.AutoIncrement — the rowid-alias case), or "" when the table has
+// no PK, a composite PK, an expression PK entry, or a non-integer PK column.
+func soleIntegerPKColumn(table *ir.Table) (name string, rowidAlias bool) {
 	if table.PrimaryKey == nil || len(table.PrimaryKey.Columns) != 1 {
-		return ""
+		return "", false
 	}
-	name := table.PrimaryKey.Columns[0].Column
+	name = table.PrimaryKey.Columns[0].Column
 	if name == "" {
-		return "" // expression PK entry — not a column reference
+		return "", false // expression PK entry — not a column reference
 	}
 	for _, c := range table.Columns {
 		if c.Name != name {
 			continue
 		}
-		if _, ok := c.Type.(ir.Integer); ok {
-			return name
+		if iv, ok := c.Type.(ir.Integer); ok {
+			return name, iv.AutoIncrement
 		}
-		return ""
+		return "", false
 	}
-	return ""
+	return "", false
 }
 
 // emitCreateIndex renders a CREATE INDEX for a non-PK secondary index.

@@ -59,9 +59,11 @@ func (r *D1SchemaReader) ReadSchema(ctx context.Context) (*ir.Schema, error) {
 			return nil, err
 		}
 		applyGeneratedAndChecks(ctx, t, createSQL, genStored)
-		if err := r.readIndexes(ctx, t); err != nil {
+		pkIndexPresent, err := r.readIndexes(ctx, t)
+		if err != nil {
 			return nil, err
 		}
+		markRowidAutoIncrement(t, pkIndexPresent)
 		tables = append(tables, t)
 		byName[name] = t
 	}
@@ -119,7 +121,8 @@ func (r *D1SchemaReader) tableNames(ctx context.Context) ([]string, error) {
 
 // readColumnsAndPK populates t.Columns (affinity-resolved IR types, nullability,
 // defaults) and t.PrimaryKey from PRAGMA table_xinfo, reusing the file engine's
-// [resolveColumnType] / [parseDefault] / [markRowidAutoIncrement]. The `hidden`
+// [resolveColumnType] / [parseDefault] (the rowid-alias mark follows in
+// ReadSchema once the index catalog is read — [markRowidAutoIncrement]). The `hidden`
 // column (table_xinfo superset of table_info) identifies generated columns
 // (2 = VIRTUAL, 3 = STORED) and hidden virtual-table columns (1, skipped) —
 // the SAME rules as the file engine; the returned name→stored map drives the
@@ -190,13 +193,8 @@ func (r *D1SchemaReader) readColumnsAndPK(ctx context.Context, t *ir.Table) (map
 			pkCols[i] = ir.IndexColumn{Column: e.name}
 		}
 		t.PrimaryKey = &ir.Index{Columns: pkCols, Unique: true}
-
-		// A single-column INTEGER-affinity PK is SQLite's rowid alias
-		// (auto-assigning); mark it so the target emits identity/AUTO_INCREMENT
-		// — the same rule as the file engine.
-		if len(pkEntries) == 1 {
-			markRowidAutoIncrement(t, pkEntries[0].name)
-		}
+		// Rowid-alias detection waits for the index catalog — the same
+		// [markRowidAutoIncrement] rule as the file engine (GC-4).
 	}
 	return genStored, nil
 }
@@ -221,44 +219,47 @@ func (r *D1SchemaReader) objectSQL(ctx context.Context, objType, name string) (s
 	return s, nil
 }
 
-// readIndexes populates t.Indexes from PRAGMA index_list / index_info. The PK
-// index (origin 'pk') is skipped (captured from table_xinfo); expression and
-// partial indexes carry their expression/predicate (parsed from the CREATE
-// INDEX SQL, tagged "sqlite") — identical behaviour to the file engine via the
-// shared [buildIndexColumns] / [extractIndexPredicate] helpers (ADR-0133).
-func (r *D1SchemaReader) readIndexes(ctx context.Context, t *ir.Table) error {
+// readIndexes populates t.Indexes from PRAGMA index_list / index_info and
+// reports whether the catalog holds a PK index (origin 'pk') — the rowid-alias
+// fact [markRowidAutoIncrement] needs. The PK index itself is skipped
+// (captured from table_xinfo); expression and partial indexes carry their
+// expression/predicate (parsed from the CREATE INDEX SQL, tagged "sqlite") —
+// identical behaviour to the file engine via the shared [buildIndexColumns] /
+// [extractIndexPredicate] helpers (ADR-0133).
+func (r *D1SchemaReader) readIndexes(ctx context.Context, t *ir.Table) (pkIndexPresent bool, err error) {
 	listRows, err := r.client.queryRows(ctx, "PRAGMA index_list("+quotePragmaArg(t.Name)+")")
 	if err != nil {
-		return err
+		return false, err
 	}
 	for _, row := range listRows {
 		origin, _, err := rowNullString(row, "origin")
 		if err != nil {
-			return err
+			return false, err
 		}
 		if origin == "pk" {
+			pkIndexPresent = true
 			continue
 		}
 		name, err := rowString(row, "name")
 		if err != nil {
-			return err
+			return false, err
 		}
 		unique, err := rowInt(row, "unique")
 		if err != nil {
-			return err
+			return false, err
 		}
 		partial, err := rowInt(row, "partial")
 		if err != nil {
-			return err
+			return false, err
 		}
 		entries, err := r.readIndexColumns(ctx, name)
 		if err != nil {
-			return err
+			return false, err
 		}
 		var createSQL string
 		if partial == 1 || hasExprEntry(entries) {
 			if createSQL, err = r.objectSQL(ctx, "index", name); err != nil {
-				return err
+				return false, err
 			}
 		}
 		cols, exprCount, ok := buildIndexColumns(ctx, t.Name, name, entries, createSQL)
@@ -281,7 +282,7 @@ func (r *D1SchemaReader) readIndexes(ctx context.Context, t *ir.Table) error {
 		warnIndexVerbatim(ctx, t.Name, name, hasPred, exprCount)
 		t.Indexes = append(t.Indexes, idx)
 	}
-	return nil
+	return pkIndexPresent, nil
 }
 
 // readIndexColumns returns the index_info entries of one index in position

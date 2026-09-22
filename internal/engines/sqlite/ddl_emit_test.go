@@ -118,7 +118,10 @@ func TestEmitTableDef(t *testing.T) {
 	tbl := &ir.Table{
 		Name: "posts",
 		Columns: []*ir.Column{
-			{Name: "id", Type: ir.Integer{Width: 64}, Nullable: false},
+			// AutoIncrement is what makes the key the inline rowid alias; a
+			// sole integer PK without it is spelled so it does NOT alias
+			// (GC-4, TestEmitTableDef_NonAliasIntegerPKSpelling).
+			{Name: "id", Type: ir.Integer{Width: 64, AutoIncrement: true}, Nullable: false},
 			{Name: "user_id", Type: ir.Integer{Width: 64}, Nullable: false},
 			{Name: "body", Type: ir.Text{}, Nullable: true},
 			{Name: "qty", Type: ir.Integer{Width: 32}, Nullable: false, Default: ir.DefaultLiteral{Value: "0"}},

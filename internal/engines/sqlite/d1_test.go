@@ -623,6 +623,56 @@ func TestD1SchemaReader_ReadSchema(t *testing.T) {
 	}
 }
 
+// TestD1SchemaReader_RowidAliasNeedsNoPKIndex is the D1 half of the GC-4
+// class: the alias verdict comes from the index catalog (an origin='pk'
+// entry means the key is NOT the rowid alias), the same rule as the file
+// engine, which TestRowidAlias_ReaderAndWriterMatchTheDriver ground-truths on
+// the real driver. The mock hands back the two catalog shapes the driver
+// produces for `id INTEGER PRIMARY KEY` (no PK index) and `id BIGINT
+// PRIMARY KEY` (a PK auto-index) and the reader must mark only the first.
+func TestD1SchemaReader_RowidAliasNeedsNoPKIndex(t *testing.T) {
+	client := startMockD1(t, func(sql string, _ []string) (int, []byte) {
+		switch {
+		case strings.Contains(sql, "SELECT sql FROM sqlite_master"):
+			return http.StatusOK, d1OK([]map[string]any{{"sql": nil}})
+		case strings.Contains(sql, "FROM sqlite_master"):
+			return http.StatusOK, d1OK([]map[string]any{{"name": "alias"}, {"name": "plain"}})
+		case strings.Contains(sql, "table_xinfo('alias')"):
+			return http.StatusOK, d1OK([]map[string]any{
+				{"cid": 0, "name": "id", "type": "INTEGER", "notnull": 0, "dflt_value": nil, "pk": 1, "hidden": 0},
+			})
+		case strings.Contains(sql, "table_xinfo('plain')"):
+			return http.StatusOK, d1OK([]map[string]any{
+				{"cid": 0, "name": "id", "type": "BIGINT", "notnull": 0, "dflt_value": nil, "pk": 1, "hidden": 0},
+			})
+		case strings.Contains(sql, "index_list('plain')"):
+			return http.StatusOK, d1OK([]map[string]any{
+				{"seq": 0, "name": "sqlite_autoindex_plain_1", "unique": 1, "origin": "pk", "partial": 0},
+			})
+		default:
+			return http.StatusOK, d1OK(nil)
+		}
+	})
+	r := &D1SchemaReader{client: client}
+	sch, err := r.ReadSchema(context.Background())
+	if err != nil {
+		t.Fatalf("ReadSchema: %v", err)
+	}
+	want := map[string]bool{"alias": true, "plain": false}
+	for _, tbl := range sch.Tables {
+		iv, ok := tbl.Columns[0].Type.(ir.Integer)
+		if !ok {
+			t.Fatalf("%s.id type = %#v; want ir.Integer", tbl.Name, tbl.Columns[0].Type)
+		}
+		if iv.AutoIncrement != want[tbl.Name] {
+			t.Errorf("%s.id AutoIncrement = %v; want %v", tbl.Name, iv.AutoIncrement, want[tbl.Name])
+		}
+		if tbl.Name == "plain" && len(tbl.Indexes) != 0 {
+			t.Errorf("plain carried the PK auto-index as a secondary index: %+v", tbl.Indexes)
+		}
+	}
+}
+
 // TestD1SchemaReader_ExcludesChangeLogTables pins the d1-trigger cold-start
 // correctness guard (ADR-0136), widened to the FULL control-table roster
 // (roadmap item 65b): a `d1-trigger`-instrumented or promoted-ex-target D1
