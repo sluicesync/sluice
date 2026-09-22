@@ -2142,16 +2142,27 @@ type SchemaSetter interface {
 // parentheses when composing it into the WHERE so a disjunctive predicate
 // (`a OR b`) can't escape the chunk/keyset bounds it is ANDed with.
 //
-// The pipeline threads it onto every source reader a `migrate` run opens
-// (the primary + each parallel chunk/table reader) via
-// [migcore.ApplyRowFilters], and onto the SOURCE verifier for `verify`.
-// Engines that don't implement it cause the pipeline to refuse `--where`
-// loudly rather than silently copy every row — the loud-failure tenet.
+// The pipeline threads it via [migcore.ApplyRowFilters] onto every source
+// reader a `migrate` run opens (the primary + each parallel chunk/table
+// reader), onto the SOURCE verifier for `verify`, and — since ADR-0173
+// Phase 2 — onto every reader the `sync` cold start opens: the snapshot
+// stream (streamer_coldstart.go), each snapshot-pinned parallel reader
+// (streamer_coldstart_parallel.go) and the forwarded-ADD-COLUMN backfill
+// reader (schema_forward_engage.go). The CDC leg evaluates the same
+// predicate client-side ([FilteredCDCPreflighter] below is its
+// before-image precondition), so the snapshot and the stream stay
+// consistent. Engines that don't implement it cause the pipeline to refuse
+// `--where` loudly rather than silently copy every row — the loud-failure
+// tenet.
 //
-// MySQL and Postgres implement it (on both RowReader and SchemaReader);
-// SQLite/D1/flat-file sources do NOT (v1), so `--where` against them is
-// refused. Phase 1 is migrate-only; `sync` does NOT thread it (a filtered
-// snapshot with an unfiltered CDC leg would be inconsistent — Phase 2).
+// Pinned (`var _ ir.RowFilterSetter = …` in each package's
+// capabilities_assert.go): mysql on SchemaReader, RowReader and the VStream
+// snapshot rows (so mysql/mariadb/planetscale/vitess), postgres on
+// SchemaReader and RowReader, and pgtrigger on postgres.RowReader (so
+// postgres-trigger). SQLite/D1/flat-file sources do NOT, so `--where`
+// against them is refused. docsync's TestMigrateWhereEngineListMatchesTheCode
+// derives the operator-facing engine list from those pins rather than from
+// this comment.
 type RowFilterSetter interface {
 	// SetRowFilters records the source-name-keyed predicate map. An empty
 	// or nil map disables filtering (the default). Implementations store
