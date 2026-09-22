@@ -348,8 +348,23 @@ only what the wire protocol delivers:
   replica-identity key-flag. It **omits** generated columns (pre-PG18
   they're unpublished), secondary indexes, CHECK constraints,
   nullability, defaults, comments.
-- MySQL's binlog path re-reads `information_schema` on a DDL boundary,
-  so its CDC projection is full-fidelity (matches the cold-start read).
+- MySQL's binlog path (`projectTableIR`) re-reads `information_schema`
+  on a DDL boundary, but its `tableSchema` is columns + PK by design, so
+  the projection is `{Schema, Name, Columns, PrimaryKey}` — columns at
+  full fidelity (types incl. charset/collation, nullability, defaults),
+  **no secondary indexes, no CHECK constraints**. It is NOT full-fidelity
+  against the cold-start read; an earlier revision of this section said
+  it was, and the MySQL normalizer preserved `Indexes` on that premise,
+  so every binlog-source table with a named secondary index refused its
+  first post-cold-start ADD COLUMN as a phantom `DropIndex` + `AddColumn`
+  combo (GC-1, audit backlog 2026-09-22 — the multi-shape refusal fires
+  before the seed-guard below). The MySQL normalizer now strips
+  `Indexes` for every flavor and `CheckConstraints` (ADR-0065); only
+  the VStream flavors additionally strip `PrimaryKey` and
+  charset/collation (F7c).
+- MySQL's VStream path (`projectVStreamFields`) carries columns only —
+  no primary key, no secondary indexes, no CHECKs, and not reliably
+  charset/collation.
 
 `pipeline.ClassifyShape(seed, firstCDCSnapshot)` therefore sees the
 fields the CDC projection drops as a **phantom delta**: a PG generated
@@ -391,9 +406,13 @@ applied to schema forwarding: when in doubt, do **not** destroy.
 **Engine limitation that follows:** because pgoutput carries no
 secondary-index / generated-column / CHECK metadata, those shapes
 **cannot be forwarded on a PG source via CDC at all** (the wire never
-signals them). They forward on a **MySQL source** (full-fidelity
-`information_schema` re-read). This is documented, not a bug — the wire
-doesn't carry the signal.
+signals them). On a **MySQL source** the `information_schema` re-read
+carries generated columns (they are ordinary `information_schema.columns`
+rows), so those forward — but it does NOT load secondary indexes or
+CHECK constraints (§1d footnote 3), so index-only and CHECK-only DDL
+produce no boundary on any MySQL source and are not forwarded (roadmap
+item 24 / ADR-0103). This is documented, not a bug — the wire (or the
+reader's deliberately narrow boundary re-read) doesn't carry the signal.
 
 ### 6. Shape A unaffected
 

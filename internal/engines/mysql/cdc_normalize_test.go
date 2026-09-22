@@ -38,25 +38,36 @@ func normTestTable() *ir.Table {
 	}
 }
 
-// TestNormalizeForCDCComparison_Vanilla_PreservesPrimaryKey pins that the
-// binlog (vanilla) flavor keeps PrimaryKey + Indexes (its CDC projection
-// re-reads information_schema and carries them) and strips only
-// CheckConstraints (ADR-0065 — the boundary projection omits CHECKs).
-func TestNormalizeForCDCComparison_Vanilla_PreservesPrimaryKey(t *testing.T) {
-	out := Engine{Flavor: FlavorVanilla}.NormalizeForCDCComparison(normTestTable())
-	if out.PrimaryKey == nil {
-		t.Error("vanilla: PrimaryKey was stripped; binlog CDC re-reads information_schema and DOES carry it")
-	}
-	if len(out.Indexes) != 1 {
-		t.Errorf("vanilla: Indexes len = %d; want 1 (binlog carries secondary indexes)", len(out.Indexes))
-	}
-	if out.CheckConstraints != nil {
-		t.Error("vanilla: CheckConstraints not stripped (ADR-0065: boundary projection omits CHECKs)")
-	}
-	// Binlog re-reads information_schema, so charset/collation ARE carried
-	// — they must be preserved (a real charset ALTER still classifies).
-	if v, ok := out.Columns[1].Type.(ir.Varchar); !ok || v.Charset != "utf8mb4" {
-		t.Errorf("vanilla: email charset = %v; want utf8mb4 preserved", out.Columns[1].Type)
+// TestNormalizeForCDCComparison_Binlog_PreservesPrimaryKeyStripsIndexes
+// pins what the binlog flavors (vanilla + MariaDB — the roster is
+// derived from usesVStream in binlogFlavors) keep and strip, field by
+// field, to match the fidelity of projectTableIR's boundary projection:
+// PrimaryKey kept (the projection carries it — Bug 89), charset /
+// collation kept (loadTableSchema reads them), Indexes stripped (GC-1:
+// the projection is columns + PK, it never carried secondary indexes),
+// CheckConstraints stripped (ADR-0065). This test pins the normalizer's
+// output alone; the pin that BINDS it to the projection is
+// TestNormalizeForCDCComparison_Binlog_SeedAgreesWithBoundaryProjection —
+// an earlier revision of this test asserted "binlog carries secondary
+// indexes" and proved nothing about the projection.
+func TestNormalizeForCDCComparison_Binlog_PreservesPrimaryKeyStripsIndexes(t *testing.T) {
+	for _, f := range binlogFlavors(t) {
+		out := Engine{Flavor: f}.NormalizeForCDCComparison(normTestTable())
+		if out.PrimaryKey == nil {
+			t.Errorf("%s: PrimaryKey was stripped; projectTableIR DOES carry it", f)
+		}
+		if out.Indexes != nil {
+			t.Errorf("%s: Indexes NOT stripped (len %d); projectTableIR carries no secondary indexes, so the seed must not either (GC-1 phantom index-drop)", f, len(out.Indexes))
+		}
+		if out.CheckConstraints != nil {
+			t.Errorf("%s: CheckConstraints not stripped (ADR-0065: boundary projection omits CHECKs)", f)
+		}
+		// loadTableSchema reads character_set_name / collation_name, so
+		// charset/collation ARE carried by the binlog projection — they
+		// must be preserved (a real charset ALTER still classifies).
+		if v, ok := out.Columns[1].Type.(ir.Varchar); !ok || v.Charset != "utf8mb4" {
+			t.Errorf("%s: email charset = %v; want utf8mb4 preserved", f, out.Columns[1].Type)
+		}
 	}
 }
 

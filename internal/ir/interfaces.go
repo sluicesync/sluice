@@ -1309,12 +1309,13 @@ type ShapeDeltaApplier interface {
 //     `numeric`; pgoutput emits typmod=-1 which the OID mapper
 //     interprets as (0, 0) without flipping Unconstrained).
 //
-// MySQL implements it too (ADR-0065 / ADR-0091 F7c): its binlog
+// MySQL implements it too (ADR-0065 / ADR-0091 F7c / GC-1): its binlog
 // TableMapEvent decoder re-reads information_schema on schema-change
-// boundaries so COLUMNS already match the SchemaReader's, but CHECK
-// constraints are never re-read at the boundary, and the VStream
-// flavor's FieldEvent projection additionally omits PrimaryKey /
-// Indexes and per-column charset/collation.
+// boundaries so COLUMNS already match the SchemaReader's, but the
+// boundary projection is columns + PrimaryKey only — secondary Indexes
+// and CHECK constraints are never re-read at the boundary — and the
+// VStream flavor's FieldEvent projection additionally omits PrimaryKey
+// and per-column charset/collation.
 //
 // The normalization is a comparison LENS and the pipeline intercepts
 // apply it to BOTH sides of every classifier comparison — the

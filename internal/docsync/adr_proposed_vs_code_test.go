@@ -59,6 +59,11 @@ var adrProposedButCitedExempt = map[string]string{
 		"(\"sluice has no surface this feature serves today\"). The two citations in engines/pgtrigger/setup.go are " +
 		"operator hints naming it as the reason sluice has no column-scope filter — i.e. they cite the NON-adoption. " +
 		"Proposed is the correct status and the citations are correct too.",
+	"adr-0103-forward-index-ddl-during-cdc.md": "Demand-gated design for forwarding index-only DDL during CDC; " +
+		"nothing in it is built. The citations in engines/mysql/cdc_normalize.go and engines/postgres/cdc_normalize.go " +
+		"(GC-1, audit backlog 2026-09-22) name it as the path NOT yet taken — the seed normalizers strip Indexes " +
+		"precisely because no CDC boundary projection carries them today, and ADR-0103 Phase 1(a) is where that " +
+		"strip would be lifted. Proposed is the correct status and the citations record the non-adoption.",
 }
 
 // adrCitedIDsFloor is the anti-vacuity floor on how many DISTINCT ADR ids

@@ -34,23 +34,46 @@ import "sluicesync.dev/sluice/internal/ir"
 // constraint admits / refuses at INSERT/UPDATE time (loud-failure
 // by default — MySQL 8.0+ enforces CHECK by default).
 //
+// Secondary indexes (GC-1, audit backlog 2026-09-22): NEITHER flavor's
+// CDC projection carries them. The binlog path re-reads
+// information_schema on a DDL boundary, but its `tableSchema` is
+// columns + PK column names by design (indexes are not consulted on a
+// row event, so the reader does not pay to load them on every cache
+// miss), and [projectTableIR] publishes exactly {Schema, Name, Columns,
+// PrimaryKey}. An earlier revision of this file asserted the opposite —
+// "a real MySQL-binlog index delta still classifies" — and preserved
+// Indexes on the seed for the binlog flavors, so the seed's every
+// secondary index diffed against the first post-cold-start boundary as
+// a phantom ShapeKindDropIndex. Alone that is absorbed by the
+// routeForwardBoundary seed-guard; alongside the real ADD COLUMN that
+// caused the boundary it is a two-class combo, and ClassifyShape's
+// multi-shape refusal fires BEFORE the seed-guard — halting every
+// binlog-source sync at its first source DDL on any table with a named
+// secondary index. Stripping Indexes for every flavor makes the seed
+// match what the projection can carry, exactly as the PG normalizer
+// strips what pgoutput omits. Consequence, unchanged from before (the
+// projection never carried them): index-only DDL produces no boundary
+// on a binlog source and is not forwarded — roadmap item 24 / ADR-0103,
+// whose Phase 1(a) (load information_schema.statistics at the boundary
+// and track a separate forwardIndexSig) is the path to forwarding it,
+// and the point at which this strip must be lifted for the binlog
+// flavors. Pinned as an argument, not two facts, by
+// TestNormalizeForCDCComparison_Binlog_SeedAgreesWithBoundaryProjection.
+//
 // F7c (ADR-0091): the VStream (PlanetScale / Vitess) flavor's CDC
-// projection is LOWER fidelity than the binlog flavor's. The binlog
-// path re-reads information_schema on a DDL boundary, so its CDC IR
-// carries {Schema, Name, Columns, PrimaryKey} (matching the SchemaReader
-// for those fields). The VStream path projects from the FieldEvent's
+// projection is LOWER fidelity still. The binlog projection carries the
+// PRIMARY key (Bug 89); the VStream path projects from the FieldEvent's
 // per-column metadata ONLY ([projectVStreamFields] builds an ir.Table
-// with Columns but NO PrimaryKey and NO Indexes — the FIELD wire never
-// carries them). So a VStream-source cold-start seed (a full SchemaReader
-// read, which DOES carry the PRIMARY key) diffed against the first CDC
-// SchemaSnapshot surfaces a PHANTOM index-drop of the PRIMARY key —
-// classified as a multi-shape combo alongside a real ADD COLUMN and
-// refused, so the ADD never forwards (the soak's 42703/1054 second
-// facet). Stripping PrimaryKey / Indexes from the seed for the VStream
-// flavor makes the seed match the projection's fidelity, exactly as the
-// PG normalizer strips what pgoutput omits. CREATE/DROP INDEX therefore
-// cannot be forwarded on a VStream source (the wire never signals them)
-// — a documented limitation, symmetric with PG-source indexes.
+// with Columns but NO PrimaryKey — the FIELD wire never carries it). So
+// a VStream-source cold-start seed (a full SchemaReader read, which DOES
+// carry the PRIMARY key) diffed against the first CDC SchemaSnapshot
+// surfaces a PHANTOM index-drop of the PRIMARY key — classified as a
+// multi-shape combo alongside a real ADD COLUMN and refused, so the ADD
+// never forwards (the soak's 42703/1054 second facet). Stripping
+// PrimaryKey from the seed for the VStream flavor makes the seed match
+// the projection's fidelity. CREATE/DROP INDEX therefore cannot be
+// forwarded on a VStream source either (the wire never signals them) —
+// a documented limitation, symmetric with PG-source indexes.
 //
 // Returns a new *ir.Table (deep-enough copy that mutating the
 // returned struct cannot mutate the input). Idempotent on repeated
@@ -65,24 +88,30 @@ func (e Engine) NormalizeForCDCComparison(t *ir.Table) *ir.Table {
 	// (neither binlog nor VStream re-reads CHECK constraints on a
 	// boundary).
 	out.CheckConstraints = nil
-	// F7c: the VStream FIELD projection carries neither the PRIMARY key
-	// nor secondary indexes; strip them from the seed so a VStream-source
-	// seed→firstCDC diff doesn't surface a phantom index-drop. The binlog
-	// flavor DOES carry PrimaryKey, so it is preserved there (a real
-	// MySQL-binlog index/PK delta still classifies). It also cannot
-	// reliably carry per-column CHARACTER SET / COLLATE (vtgate's
-	// FieldEvent.column_type omits the charset suffix for the common case),
-	// so zero those type sub-fields too — otherwise the SchemaReader's
-	// populated Charset/Collation diffs against the empty CDC projection as
-	// a phantom AlterColumnType (the soak's third facet). The CDC side
-	// already lands empty (vtgate's FieldEvent.column_type omits the
-	// CHARACTER SET suffix in the common case), so normalizing the seed to
-	// match closes the asymmetry; a charset-only ALTER consequently cannot
-	// be forwarded on a VStream source — a documented limitation in line
-	// with the wire's fidelity (ADR-0091 §1d).
+	// GC-1: no MySQL CDC projection carries secondary indexes — the
+	// binlog projectTableIR is columns + PK, the VStream FIELD
+	// projection is columns only — so strip them from the seed for every
+	// flavor. See the file-level docstring for the phantom-combo this
+	// closes and for ADR-0103 as the path to lifting it.
+	out.Indexes = nil
+	// F7c: the VStream FIELD projection carries no PRIMARY key; strip it
+	// from the seed so a VStream-source seed→firstCDC diff doesn't surface
+	// a phantom index-drop of the PK. The binlog flavor DOES carry
+	// PrimaryKey (projectTableIR projects it from tableSchema.PrimaryKey),
+	// so it is preserved there. VStream also cannot reliably carry
+	// per-column CHARACTER SET / COLLATE (vtgate's FieldEvent.column_type
+	// omits the charset suffix for the common case), so zero those type
+	// sub-fields too — otherwise the SchemaReader's populated
+	// Charset/Collation diffs against the empty CDC projection as a
+	// phantom AlterColumnType (the soak's third facet). The CDC side
+	// already lands empty, so normalizing the seed to match closes the
+	// asymmetry; a charset-only ALTER consequently cannot be forwarded on
+	// a VStream source — a documented limitation in line with the wire's
+	// fidelity (ADR-0091 §1d). The binlog loader (loadTableSchema) reads
+	// character_set_name / collation_name, so the binlog flavors keep
+	// them and a real charset ALTER still classifies there.
 	if e.Flavor.usesVStream() {
 		out.PrimaryKey = nil
-		out.Indexes = nil
 		out.Columns = normalizeColumnsForVStreamCDC(t.Columns)
 	}
 	return &out

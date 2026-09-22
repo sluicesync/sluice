@@ -161,9 +161,12 @@ func (Engine) NormalizeForCDCComparison(t *ir.Table) *ir.Table {
 	// that would forward a DropShapeIndex and drop the index on the
 	// target. PrimaryKey is intentionally preserved (projectRelation
 	// carries it from the key-flag). CREATE/DROP INDEX therefore cannot
-	// be forwarded on PG via pgoutput — a documented limitation; MySQL's
-	// information_schema re-read CDC projection carries indexes and does
-	// forward them.
+	// be forwarded on PG via pgoutput — a documented limitation shared
+	// with every MySQL flavor: the binlog boundary projection is columns
+	// + PK and the MySQL normalizer strips Indexes for the same reason
+	// (GC-1; an earlier revision of this comment claimed the binlog
+	// projection carried and forwarded them — it never did, see
+	// ADR-0103). No source forwards index-only DDL today.
 	out.Indexes = nil
 	return &out
 }
