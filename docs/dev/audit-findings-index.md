@@ -98,6 +98,8 @@ the GC entry rather than indexed separately.
 - GC-25 filed
 - GC-26 filed
 - GC-27 filed
+- GC-28 filed
+- GC-29 filed
 
 ### Tier 4 — peer-tool capability gaps
 
