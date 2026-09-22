@@ -95,6 +95,7 @@ the GC entry rather than indexed separately.
 - GC-22 filed
 - GC-23 filed
 - GC-24 filed
+- GC-25 filed
 
 ### Tier 4 — peer-tool capability gaps
 
