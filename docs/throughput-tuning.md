@@ -7,8 +7,17 @@ or cross-host workloads usually want at least one of the items below.
 
 ## Per-batch CDC throughput: `--apply-batch-size`
 
-Default: `1` (conservative, one source change per target transaction).
-Production tuning: `100`–`500`.
+Default: `auto` on `sync start` ([ADR-0089](adr/adr-0089-adaptive-apply-batch-size-default.md),
+which supersedes ADR-0017's default-value clause): the ADR-0052 AIMD
+controller adapts the batch size within `[1, ceiling]` to a p95-latency
+target, where the ceiling is the engine default (1000 on mysql/postgres,
+100 on planetscale). There is no value to hand-pick out of the box.
+The incremental-replay leg of `sync from-backup run` defaults to `100`
+(a replay has no adaptive controller). Pass an integer to pin a static
+cap (`--apply-batch-size=100`; `1` is the pre-ADR-0089 conservative
+one-change-per-transaction behaviour), or `--no-auto-tune` to keep a
+static cap with the floor at 1. Tables with no usable identity key
+are never batched regardless (the ADR-0089 keyless guard).
 
 The applier amortises per-tx commit overhead by batching CDC changes.
 v0.3.0 testing measured the per-change applier at ~6.5 rows/sec on
@@ -16,11 +25,12 @@ PG→MySQL CDC for a 5000-row source transaction. With
 `--apply-batch-size=100` the same workload reaches ~600 rows/sec on
 local Docker; production hardware sees 3–100× improvements depending
 on source transaction shape and network latency. See
-[ADR-0017](adr/adr-0017-batched-cdc-apply.md).
+[ADR-0017](adr/adr-0017-batched-cdc-apply.md) for the batching design
+and ADR-0089 for the adaptive default.
 
 ## Concurrent CDC apply: `--apply-concurrency`
 
-Default: `auto:N` — fast out of the box as of ADR-0106. The merged CDC change stream is fanned across N in-order lanes by primary-key hash (same key → same lane → applied in source order, so dependent INSERT→UPDATE→DELETE on a row never reorder), each lane committing concurrently on its own dedicated backend with its own AIMD batch-size controller. On a high-latency cross-region link a serial applier is RTT-bound and falls below the source write rate; concurrent lanes lift aggregate apply throughput toward N× (live-validated ~4× on a 2-shard Vitess→PlanetScale-MySQL link).
+Default: `0`, meaning `auto:N` — fast out of the box as of ADR-0106. The merged CDC change stream is fanned across N in-order lanes by primary-key hash (same key → same lane → applied in source order, so dependent INSERT→UPDATE→DELETE on a row never reorder), each lane committing concurrently on its own dedicated backend with its own AIMD batch-size controller. On a high-latency cross-region link a serial applier is RTT-bound and falls below the source write rate; concurrent lanes lift aggregate apply throughput toward N× (live-validated ~4× on a 2-shard Vitess→PlanetScale-MySQL link).
 
 `N` is conservative and connection-budget-bounded, matching the cold-copy axes' `auto:4` so the whole pipeline has one mental model — sluice fans out ~4-wide by default, bounded by your target:
 
@@ -153,9 +163,9 @@ path for that statement.
 
 `sluice sync start`'s initial cold-start copy parallelizes across tables like `sluice migrate` does, but the mechanism — and the default — depends on the source flavor, because each flavor has a different consistency story for "N readers, one CDC handoff position":
 
-- **Postgres source:** parallel by default. The exported-snapshot fast path (ADR-0079) reuses migrate's full cross-table × within-table pool, every reader pinned to the one exported snapshot, budget-clamped by the target's connection-slot probe. `--table-parallelism` / `--bulk-parallelism` apply.
-- **Self-managed (non-Vitess) MySQL source:** parallel by default — `--copy-table-parallelism` auto-resolves to `min(4, table count)` FTWRL-coordinated pinned-snapshot readers (ADR-0101; the same cross-table auto:4 migrate uses). Consistency is identical to the serial path: one FTWRL cut, one binlog position, no stitch. Sources without the RELOAD privilege (RDS, Aurora, restricted users) fall back to the serial single-snapshot copy with a loud WARN — consistency preserved, concurrency lost; grant RELOAD to restore it. `--copy-table-parallelism=1` (or DSN `copy_table_parallelism=1`) is the serial opt-out. Target-side write concurrency is `readers × --copy-fanout-degree`; the operator owns `W × D ≤ --max-target-connections` (MySQL has no connection-slot probe).
-- **Vitess / PlanetScale (VStream) source:** sequential single-stream by default, DELIBERATELY — the cold-copy INFO log names the knob. N concurrent COPY streams are one flag away (`--vstream-copy-table-parallelism`, ADR-0099), but the default stays 1 because the stream count K is not persisted in the resume token: a changed default would silently re-derive a different table→stream partition for an interrupted copy resumed across a version upgrade (ADR-0099 §5). If you set K > 1, resume with the same K.
+- **Postgres source:** parallel by default. The exported-snapshot fast path (ADR-0079) reuses migrate's full cross-table × within-table pool, every reader pinned to the one exported snapshot, budget-clamped by the target's connection-slot probe. `--table-parallelism` (default `0` = auto: 4 tables) and `--bulk-parallelism` (default `0` = auto: `min(8, NumCPU)` readers per table) apply.
+- **Self-managed (non-Vitess) MySQL source:** parallel by default — `--copy-table-parallelism` (default `0` = auto) resolves to `min(4, table count)` FTWRL-coordinated pinned-snapshot readers (ADR-0101; the same cross-table auto:4 migrate uses). Consistency is identical to the serial path: one FTWRL cut, one binlog position, no stitch. Sources without the RELOAD privilege (RDS, Aurora, restricted users) fall back to the serial single-snapshot copy with a loud WARN — consistency preserved, concurrency lost; grant RELOAD to restore it. `--copy-table-parallelism=1` (or DSN `copy_table_parallelism=1`) is the serial opt-out. Target-side write concurrency is `readers × D`, where `D` is `--copy-fanout-degree` (default `0` = auto: 4 writer workers; `1` disables fan-out); the operator owns `W × D ≤ --max-target-connections` (MySQL has no connection-slot probe).
+- **Vitess / PlanetScale (VStream) source:** sequential single-stream by default, DELIBERATELY — the cold-copy INFO log names the knob. N concurrent COPY streams are one flag away (`--vstream-copy-table-parallelism`, ADR-0099; default `0` = unset, which falls back to the DSN's `vstream_copy_table_parallelism` and then to the engine default of 1), but the default stays serial because the stream count K is not persisted in the resume token: a changed default would silently re-derive a different table→stream partition for an interrupted copy resumed across a version upgrade (ADR-0099 §5). If you set K > 1, resume with the same K.
 - **Trigger-CDC flavors (pgtrigger / sqlite-trigger / d1-trigger):** serial by design — the snapshot/anchor consistency argument is bound to a single connection; there is no parallel knob. The cold-start INFO log says so.
 
 ## VStream FLOAT exact re-read: `--no-float-exact-reread` (PlanetScale/Vitess source)
@@ -164,15 +174,18 @@ vttablet's rowstreamer streams a VStream cold-start COPY over the text protocol,
 
 By **default**, `sluice sync start` (and `sluice backup full`) on a PlanetScale/Vitess source **repairs** this: after the bulk copy completes and before CDC begins, sluice re-reads each single-precision `FLOAT` column exactly from the source over a separate SQL connection and UPDATEs the copied rows by primary key (on backup, it patches the archived rows). `DOUBLE` columns and the CDC leg are already exact and untouched.
 
-The cost is one extra source read pass over each table that has a single-precision `FLOAT` column and a primary key — bounded to the PK + FLOAT columns. On the **sync** path it is cursor-paginated and streamed (O(1) memory). On the **backup** path it buffers a per-table primary-key → `FLOAT` map (the VStream COPY delivers rows out of primary-key order, so a bounded merge-join isn't safe), capped at `--float-reread-max-rows` (default 2,000,000 rows ≈ a few hundred MB; the VStream backup sweep is serial, so only one table's map is held at once). A `FLOAT`-bearing table larger than the cap falls back **loudly** — never buffered unbounded (no silent OOM): archived rounded with a WARN by default, or refused under `--strict-float`; raise `--float-reread-max-rows` to repair a bigger table exactly. On a schema with no single-precision `FLOAT` columns, or a non-VStream source, there is zero cost.
+The cost is one extra source read pass over each table that has a single-precision `FLOAT` column and a primary key — bounded to the PK + FLOAT columns. On the **sync** path it is cursor-paginated and streamed (O(1) memory). On the **backup** path it buffers a per-table primary-key → `FLOAT` map (the VStream COPY delivers rows out of primary-key order, so a bounded merge-join isn't safe), capped at `--float-reread-max-rows` (default `0` = 2,000,000 rows ≈ a few hundred MB; the VStream backup sweep is serial, so only one table's map is held at once). A `FLOAT`-bearing table larger than the cap falls back **loudly** — never buffered unbounded (no silent OOM): archived rounded with a WARN by default, or refused under `--strict-float`; raise `--float-reread-max-rows` to repair a bigger table exactly. On a schema with no single-precision `FLOAT` columns, or a non-VStream source, there is zero cost.
 
 `--no-float-exact-reread` skips the re-read: the `FLOAT` columns retain the 6-significant-digit rounding, and a loud WARN names each affected column. Use it only if you don't care about sub-6-significant-digit `FLOAT` precision (or specifically want the backup's within-row consistency — see `docs/managed-services.md`). A **keyless** table (no primary key to target the re-read) can't be repaired regardless — it WARNs and retains the rounding.
 
 ## Parallel within-table bulk copy: `--bulk-parallelism` + `--bulk-parallel-min-rows`
 
-Default: `min(8, NumCPU)` parallel readers per table; tables under
-`--bulk-parallel-min-rows` (default `80000` as of v0.62.0; previously
-`100000`) stay on the single-reader path.
+`--bulk-parallelism` (default `0` = auto: `min(8, NumCPU)`) parallel
+readers per table; tables under `--bulk-parallel-min-rows` (default `0` = auto: a base of 80,000
+rows as of v0.62.0 — previously 100,000 — dialled down on many-table
+schemas to `80000 / table-count`, floored at 10,000, so a
+many-medium-table migrate still engages within-table parallelism; an
+explicit value is never auto-lowered) stay on the single-reader path.
 
 Tables above the threshold split into N PK ranges and copy
 concurrently. The pgcopydb-class signature feature for multi-TB
@@ -261,22 +274,27 @@ high-bandwidth workloads, not for cross-region high-latency ones.
 For workloads with huge rows (TEXT columns at MB scale, BYTEA blobs,
 JSON documents) the per-batch memory accumulation can grow into the
 hundreds of MB at typical row-count batches. `--max-buffer-bytes`
-caps each batch's accumulated byte size, flushing whichever cap
-hits first. See [ADR-0028](adr/adr-0028-memory-bounded-streaming.md)
+(default `67108864`, 64 MiB, on `migrate`, `sync start`, `restore` and
+`sync from-backup run` alike) caps each batch's accumulated byte size,
+flushing whichever cap hits first. See [ADR-0028](adr/adr-0028-memory-bounded-streaming.md)
 for the full rationale and the audit of where memory accumulates.
 
 ## Post-load statistics refresh: `--analyze-after`
 
 A freshly bulk-loaded table has stale planner statistics, so the
 first post-cutover queries plan badly until autovacuum or a
-background ANALYZE catches up. `migrate --analyze-after` closes
-that window at cutover time: once constraints and views are in
-place, sluice runs one per-table statistics refresh on the target
-(Postgres `ANALYZE`, MySQL `ANALYZE TABLE`, SQLite `ANALYZE`) —
-the same reason pgcopydb runs a per-table `VACUUM ANALYZE` by
-default. Advisory: a per-table failure WARNs and never fails the
-migration. Default off. Migrate-only — a sync target's statistics
-churn under continuous CDC apply, so the flag doesn't apply there.
+background ANALYZE catches up. `--analyze-after` (default `off`) closes
+that window: once constraints and views are in place, sluice runs
+one per-table statistics refresh on the target (Postgres `ANALYZE`,
+MySQL `ANALYZE TABLE`, SQLite `ANALYZE`) — the same reason pgcopydb
+runs a per-table `VACUUM ANALYZE` by default. Advisory: a per-table
+failure WARNs and never fails the run. It applies to both `migrate`
+(at cutover time) and `sync start` (once the cold-start copy
+completes, before CDC begins; the steady-state CDC apply is
+unaffected, since a live target's statistics churn under continuous
+apply anyway) — the two commands share the copy phase, and the
+copy-phase parity gate (`TestCopyPhaseFlagParityMigratorStreamer`)
+requires the flag on both.
 
 ## Socket write deadline and the copy stall warning (automatic, no flag)
 

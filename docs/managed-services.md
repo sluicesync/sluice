@@ -319,7 +319,8 @@ FK-bearing source without stripping FKs from it first, or when
 FKs are managed out-of-band. Mutually exclusive with
 `--allow-degraded-fks` (opposite intents: one skips FK creation,
 the other creates FKs and tolerates dirty rows by retrying as
-`NOT VALID` — PG-target only).
+`NOT VALID` — PG-target only, and a `migrate`-only flag: `sync
+start` has no `NOT VALID` retry today).
 
 **Pre-copy foreign-key preflight.** Because the constraint phase is
 the LAST phase, an FK problem on a PlanetScale target used to surface
