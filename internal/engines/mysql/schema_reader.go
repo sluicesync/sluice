@@ -397,8 +397,20 @@ func checkConstraintsQuery(flavor Flavor) string {
 // current_timestamp() with empty extra — the ATOMIC companion of the
 // catalog-query gate, see roadmap item 73), [translateDefault]
 // everywhere else (byte-identical to the historical behavior).
-func (r *SchemaReader) translateColumnDefault(def sql.NullString, extra string, typ ir.Type) ir.DefaultValue {
-	if r.flavor == FlavorMariaDB {
+//
+// It is the ONE implementation behind BOTH information_schema.columns
+// readers — [SchemaReader.populateColumns] (the cold-start seed) and
+// [loadTableSchema] (the CDC boundary projection) — so the two cannot
+// disagree about the same catalog row. Bug 286: loadTableSchema used to
+// call translateDefault directly on every flavor, on the premise that
+// its consumers re-emit nothing; the ADR-0091 forward-add-column
+// intercept re-emits the projected Default verbatim into the target's
+// ADD COLUMN, so on a MariaDB source a nullable defaultless column
+// landed as DEFAULT 'NULL' (the four-character string) and 'abc' with
+// MariaDB's quote characters kept inside the literal. Pinned by
+// TestLoadTableSchema_DefaultAgreesWithSeed_EveryBinlogFlavor.
+func (f Flavor) translateColumnDefault(def sql.NullString, extra string, typ ir.Type) ir.DefaultValue {
+	if f == FlavorMariaDB {
 		return translateMariaDBDefault(def, extra, typ)
 	}
 	return translateDefault(def, extra, typ)
@@ -732,7 +744,7 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 			Name:     colName,
 			Type:     typ,
 			Nullable: strings.EqualFold(isNullable, "YES"),
-			Default:  r.translateColumnDefault(defaultVal, meta.Extra, typ),
+			Default:  r.flavor.translateColumnDefault(defaultVal, meta.Extra, typ),
 			Comment:  comment,
 		}
 		applyGenerated(col, genExpr, meta.Extra, r.flavor)
@@ -1072,14 +1084,12 @@ func loadTableSchema(ctx context.Context, db *sql.DB, schema, table string, flav
 			Name:     colName,
 			Type:     typ,
 			Nullable: strings.EqualFold(isNullable, "YES"),
-			// Deliberately NOT flavor-dispatched (unlike the SchemaReader's
-			// translateColumnDefault): this loader serves the CDC applier,
-			// which uses Default for nothing it re-emits — column presence
-			// and generated-ness are what the builders consume. Routing
-			// MariaDB here through translateMariaDBDefault would change
-			// applier-side behaviour this chunk has no pin for; if a future
-			// consumer re-emits these defaults, add the dispatch WITH one.
-			Default: translateDefault(defaultVal, meta.Extra, typ),
+			// Flavor-dispatched exactly as the SchemaReader's seed is: the
+			// CDC reader's boundary projection of this Default is what the
+			// ADR-0091 forward-add-column intercept re-emits into the
+			// target's ADD COLUMN (Bug 286), and what the boundary
+			// classifier diffs against the seed.
+			Default: flavor.translateColumnDefault(defaultVal, meta.Extra, typ),
 			Comment: comment,
 		}
 		applyGenerated(col, genExpr, meta.Extra, flavor)
