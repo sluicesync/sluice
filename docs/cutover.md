@@ -98,23 +98,28 @@ MySQL → PG (the inverse cross-engine direction) is also supported when source 
 
 `sluice` does not ship a one-button rollback. Operators wanting to retain a rollback path during the cutover window have two procedural options:
 
-### Procedural option 1: Hot-standby reverse direction (recommended for high-stakes cutovers)
+### Procedural option 1: Hot-standby reverse direction — a re-copy into an EMPTY standby, armed before the flip
 
-Set up a second sluice instance in the *opposite* direction *before* the traffic flip. After cutover, the old source becomes the *target* of a reverse-direction CDC stream from the new target:
+A reverse-direction sluice instance (new target → a standby) can keep a rollback database continuously fresh after the flip. **It cannot be pointed at the old source as it stands.** sluice's `migrate` is built for a target it fills: against a database whose tables already hold the data it refuses (`SLUICE-E-COLDSTART-TARGET-NOT-EMPTY`), and both ways past that refusal defeat the purpose: `--force-cold-start` skips the probe and the copy then collides with every row already present, while `--reset-target-data` drops every table on the old source and re-copies it from the new target — a full bulk rewrite of the one database you are keeping so you can fall back to it, during which no rollback path exists at all. There is no supported way today to start a reverse CDC stream from the drain point without a copy; that design is [ADR-0188](adr/adr-0188-cutover-rollback-stream.md) (proposed, not built).
+
+So the supported shape is a reverse re-copy into a **separate, empty** standby, and it is only a rollback path once that copy has completed and the reverse stream has caught up — arm it well before the flip:
 
 ```sh
-# Before traffic flip, on a second machine / process:
-sluice migrate --config reverse-direction.yaml   # cold-start old-source from new-target
+# Before the traffic flip, on a second machine / process, into an EMPTY standby:
+sluice migrate --config reverse-direction.yaml   # cold-start the standby from new-target
 sluice sync start --config reverse-direction.yaml
+# Wait for the copy to finish and the stream to report zero lag (sync health) BEFORE flipping traffic.
 
-# Both directions now run in parallel.
-# - Forward (sluice-1): old-source → new-target  (still draining residual)
-# - Reverse (sluice-2): new-target → old-source  (now the active path; old-source is hot-standby)
+# After the flip:
+# - Forward (sluice-1): old-source → new-target  (stopped and drained; see "When to run cutover")
+# - Reverse (sluice-2): new-target → standby      (the rollback path; standby is hot)
 ```
 
-If something goes wrong post-flip (target hits a bug, query plans regress, unexpected behavior surfaces), flip traffic back to old source — it's been continuously synced from new target via sluice-2. Once the operator commits to the new target, stop sluice-2 and let the old source decommission.
+If something goes wrong post-flip (target hits a bug, query plans regress, unexpected behavior surfaces), stop sluice-2, run `sluice cutover` in the reverse direction to prime the standby's sequences, and flip traffic to the standby. Once the operator commits to the new target, stop sluice-2 and decommission the standby. The forward stream must be stopped before the reverse starts, or a change echoes new-target → standby → new-target; sluice does not detect that loop.
 
-Cross-reference: [`docs/use-cases.md`](use-cases.md#cross-engine-mysql--postgres-consolidation) covers the bidirectional-during-transition shape in more detail (including same-engine version-upgrade variants, not just cross-engine).
+Cross-engine caveat: a reverse stream is a fresh translation of values the application now writes natively on the new engine. A value the old engine cannot hold (a Postgres `jsonb`, array or `uuid` written after a MySQL → Postgres cutover) is refused loudly by the reverse stream rather than coerced — which halts the rollback path exactly when it is needed. For a cross-engine cutover, option 2 is the honest rollback plan unless the application is known to stay inside both type systems.
+
+Cross-reference: [`docs/use-cases.md`](use-cases.md#cross-engine-mysql--postgres-consolidation) covers the bidirectional-during-transition shape (including same-engine version-upgrade variants, not just cross-engine).
 
 ### Procedural option 2: Periodic snapshot of the new target
 

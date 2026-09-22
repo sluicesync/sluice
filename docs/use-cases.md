@@ -87,7 +87,7 @@ The shape that motivated sluice's existence: a polyglot architecture (MySQL for 
 
 - **One-time consolidation onto Postgres.** Existing MySQL has the operational system-of-record; Postgres has the analytics layer. The org wants to drop MySQL.
 - **One-time consolidation onto MySQL.** Postgres-heavy stack with a small Postgres team and a much larger MySQL team — operational simplification by moving to the engine the team knows.
-- **Bidirectional during a transition.** Engineering teams are mid-migration to PG. Some services have moved, some haven't. Running sluice MySQL → PG keeps the PG side fresh; running sluice PG → MySQL (a *different* sluice instance, opposite direction) keeps the MySQL side fresh as a hot standby. This is the procedural "rollback-friendly cutover" — both sides are continuously synced until the operator commits to the destination.
+- **Bidirectional during a transition.** Engineering teams are mid-migration to PG. Some services have moved, some haven't. Running sluice MySQL → PG keeps the PG side fresh; running sluice PG → MySQL (a *different* sluice instance, opposite direction) keeps a MySQL **standby** fresh as a rollback path. Each direction is its own one-way sluice into a target sluice fills: the reverse instance cannot be pointed at the original MySQL source (its tables already hold the data, and `migrate` refuses a populated target rather than skipping rows that are already there), and the two must never run against the same pair at once or a change echoes around the loop. See [`docs/cutover.md`](cutover.md#rollback-after-cutover) for the arm-before-the-flip procedure and the cross-engine caveat.
 
 ### sluice procedure
 
@@ -96,12 +96,12 @@ The shape that motivated sluice's existence: a polyglot architecture (MySQL for 
 sluice migrate --config mysql-to-pg.yaml
 sluice sync start --config mysql-to-pg.yaml
 
-# Direction 2 (optional, hot-standby for rollback): PG → MySQL reverse path
-sluice migrate --config pg-to-mysql.yaml
-sluice sync start --config pg-to-mysql.yaml
+# Direction 2 (optional, rollback path): PG → an EMPTY MySQL standby, armed before the flip
+sluice migrate --config pg-to-mysql-standby.yaml
+sluice sync start --config pg-to-mysql-standby.yaml
 ```
 
-The two configs name different stream IDs, different source-target pairings, and run as independent processes. sluice has no opinion about whether both directions are running; the source-of-truth question is the operator's.
+The two configs name different stream IDs and different source-target pairings, and run as independent processes. sluice has no opinion about which side is the source of truth; that question is the operator's, and so is stopping the forward stream before the reverse one starts.
 
 ### Load-bearing capability
 
