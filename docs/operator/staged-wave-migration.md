@@ -42,7 +42,7 @@ sluice schema add-table users \
     --stream-id appdb --no-drain
 ```
 
-`add-table` creates the table on the target, bulk-copies its rows from a consistent snapshot, extends the source publication, and hands the table to the running CDC stream — the same gapless snapshot→CDC boundary a cold start gets. It prompts for typed confirmation (the table name) unless you pass `--yes`.
+`add-table` creates the table on the target, bulk-copies its rows from a consistent snapshot, extends the source publication, and hands the table to the running CDC stream — the same gapless snapshot→CDC boundary a cold start gets. On a terminal it prompts for typed confirmation (the table name) unless you pass `--yes`; on a non-terminal stdin (a script, CI, an agent) it refuses with `SLUICE-E-CONFIRMATION-REQUIRED` instead of prompting.
 
 `--no-drain` is Postgres-only in this release. On a **MySQL-family source** the drained workflow applies: `sluice sync stop --wait`, then `schema add-table`, then `sluice sync start` again (a re-run with the same `--stream-id` warm-resumes; it does not re-snapshot).
 

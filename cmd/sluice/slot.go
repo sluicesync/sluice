@@ -109,7 +109,8 @@ func printPlatformSlotNotes(slots []ir.SlotInfo) {
 
 // SlotDropCmd drops a named replication slot. Destructive; refuses
 // loudly (a ClassRefusal coded error, exit 3) without --yes rather
-// than prompting — every sluice command is non-interactive.
+// than prompting, terminal or not — the strictest tier of the
+// destructive-prompt policy in confirm_door.go.
 type SlotDropCmd struct {
 	SourceDriver string `help:"Source engine name (e.g. postgres). See 'sluice engines'." required:"" placeholder:"NAME" group:"source"`
 	Source       string `help:"Source database DSN." required:"" env:"SLUICE_SOURCE" placeholder:"DSN" group:"source"`
@@ -133,10 +134,10 @@ func (s *SlotDropCmd) Run(_ *Globals) error {
 		return errors.New("slot name is required")
 	}
 
-	// Non-interactive by contract (AGENTS.md): rather than prompt (which
-	// on a non-TTY reads EOF and silently no-ops), refuse loudly and name
-	// the remedy before touching the source. --yes is the explicit opt-in
-	// every destructive op needs.
+	// Agent contract (AGENTS.md): rather than prompt (which on a non-TTY
+	// reads EOF and silently no-ops — the GC-13 shape `trigger teardown`
+	// had), refuse loudly and name the remedy before touching the
+	// source. --yes is the explicit opt-in every destructive op needs.
 	if !s.Yes {
 		return &sluicecode.CodedError{
 			Code: sluicecode.CodeConfirmationRequired,
@@ -327,14 +328,16 @@ func confirmDestructive(in io.Reader, out io.Writer, prompt string) (bool, error
 	return answer == "y" || answer == "yes", nil
 }
 
-// errConfirmDeclined is the typed-confirmation abort sentinel: the
-// operator answered a destructive-action prompt with anything other
-// than the expected token. It is a non-nil error on purpose — an
-// aborted run must exit non-zero (the taxonomy's generic 1: no data
-// work was attempted, but the command did NOT complete) and, under
-// --format json, render status "aborted" rather than "completed"
-// (see envelope.go). exitcode_test.go pins the exit code.
-var errConfirmDeclined = errors.New("aborted: destructive-action confirmation declined (type the confirmation token to proceed, or pass --yes)")
+// errConfirmDeclined is the confirmation abort sentinel: the operator
+// answered a destructive-action prompt with anything other than the
+// expected token (or "y", for the y/N tier). It is a non-nil error on
+// purpose — an aborted run must exit non-zero (the taxonomy's generic
+// 1: no data work was attempted, but the command did NOT complete) and,
+// under --format json, render status "aborted" rather than "completed"
+// (see envelope.go). exitcode_test.go pins the exit code. It can only
+// be reached on a terminal: the door in confirm_door.go refuses a
+// non-TTY stdin before any prompt is printed.
+var errConfirmDeclined = errors.New("aborted: destructive-action confirmation declined (answer the prompt to proceed, or pass --yes)")
 
 // confirmTypedDestructive prompts the operator and accepts only an
 // exact match (after trim) against the supplied expected token. The

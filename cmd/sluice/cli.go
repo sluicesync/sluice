@@ -268,7 +268,7 @@ type MigrateCmd struct {
 
 	ResetTargetData bool `help:"Destructive recovery: DELETE the migrate-state row, DROP every source-schema table on the target, then run a fresh cold-start. Use after a wedged-state recovery (e.g. slot-missing fall-through). Requires confirmation (type 'reset') unless --yes is set. Mutually exclusive with --resume. See ADR-0023."`
 
-	Yes bool `help:"Skip the destructive-action confirmation prompt for --reset-target-data." short:"y"`
+	Yes bool `help:"Confirm --reset-target-data. Required when stdin is not a terminal (scripts, CI, agents): without it the command refuses with SLUICE-E-CONFIRMATION-REQUIRED instead of prompting. On a terminal it skips the typed 'reset' prompt." short:"y"`
 
 	BulkBatchSize int `help:"Bulk-copy batch size for resume-mid-table checkpointing. Each batch commits with an updated cursor in sluice_migrate_state.table_progress, so a crash mid-table resumes without re-copying the prefix. Tables without a PK fall back to truncate-and-redo regardless. Lower values shorten the replay window on crash; higher values amortise per-tx commit overhead. Only consulted on the resume path; cold-start migrations use the faster plain-INSERT / COPY path. Default 5000." default:"5000" placeholder:"N"`
 
@@ -504,13 +504,8 @@ func (m *MigrateCmd) run(g *Globals, env *envelopeRun) error {
 	}
 
 	if m.ResetTargetData && !m.Yes {
-		ok, err := confirmTypedDestructive(kongContext(), os.Stdin, destructivePromptWriter(env),
-			"This will DROP tables on the target. Type 'reset' to confirm: ", "reset")
-		if err != nil {
+		if err := confirmResetTargetData(kongContext(), destructivePromptWriter(env)); err != nil {
 			return err
-		}
-		if !ok {
-			return errConfirmDeclined
 		}
 	}
 
@@ -1032,7 +1027,7 @@ type SyncFromBackupCmd struct {
 
 	AtChainID string `help:"Operator-asserted resumption: the broker treats the target as currently being at chain ID <ID>; writes a fresh sluice_cdc_state row and transitions to live polling from there. Use after a manual 'sluice restore --from=<chain-url>'. Mutually exclusive with --reset-target-data." placeholder:"BACKUP-ID"`
 
-	Yes bool `help:"Skip the destructive-action confirmation prompt for --reset-target-data." short:"y"`
+	Yes bool `help:"Confirm --reset-target-data. Required when stdin is not a terminal (scripts, CI, agents): without it the command refuses with SLUICE-E-CONFIRMATION-REQUIRED instead of prompting. On a terminal it skips the typed 'reset' prompt." short:"y"`
 
 	// ADR-0148 / audit MED-A1 gap #12: a --reset-target-data cold start runs a
 	// chain restore whose segment-0 full builds the deferred indexes — the same
@@ -1104,13 +1099,8 @@ func (s *SyncFromBackupCmd) Run(g *Globals) error {
 	if s.ResetTargetData && !s.Yes {
 		// No --format envelope on this command, so the prompt stays on
 		// stdout (text mode's traditional stream).
-		ok, err := confirmTypedDestructive(ctx, os.Stdin, os.Stdout,
-			"This will DROP tables on the target. Type 'reset' to confirm: ", "reset")
-		if err != nil {
+		if err := confirmResetTargetData(ctx, os.Stdout); err != nil {
 			return err
-		}
-		if !ok {
-			return errConfirmDeclined
 		}
 	}
 
@@ -1286,7 +1276,7 @@ type SyncStartCmd struct {
 
 	SchemaAlreadyApplied bool `help:"Skip every DDL phase during cold-start (CREATE TABLE / CREATE INDEX / ADD FOREIGN KEY / CREATE VIEW / SyncIdentitySequences / EnsureControlTable). Operator promises the target's catalog matches the source's AND the sluice_cdc_state control table is pre-created. Use this on PlanetScale branches with Safe Migrations enabled (GitHub #17), or on Atlas/Liquibase-managed schemas where DDL goes through a separate pipeline. The cold-start preflight refusal is also skipped — bulk-copy runs into operator-prepared empty tables; sluice does NOT validate the schema match."`
 
-	Yes bool `help:"Skip the destructive-action confirmation prompt for --reset-target-data." short:"y"`
+	Yes bool `help:"Confirm --reset-target-data. Required when stdin is not a terminal (scripts, CI, agents): without it the command refuses with SLUICE-E-CONFIRMATION-REQUIRED instead of prompting. On a terminal it skips the typed 'reset' prompt." short:"y"`
 
 	ApplyBatchSize string `help:"Batch up to N CDC changes per target transaction, OR 'auto' to use the engine-default ceiling (1000 mysql/postgres, 100 planetscale). Default 'auto' (ADR-0089): the ADR-0052 AIMD controller adapts the batch size within [1, ceiling] to a p95-latency target, for >10x throughput over single-row apply. Pass --apply-batch-size=1 for the pre-ADR-0089 conservative one-change-per-tx behaviour, or --no-auto-tune to keep a static cap (floor stays 1). Tables with NO usable identity key (no PRIMARY KEY and no unique index) are never batched — each such change commits alone (batch=1 semantics) so replay-on-crash cannot amplify duplicates (ADR-0089 keyless guard); PRIMARY-KEY and UNIQUE tables batch normally (ADR-0010 idempotency). Schema-change events (TRUNCATE) flush the in-progress batch." default:"auto" placeholder:"N|auto"`
 
@@ -2090,13 +2080,8 @@ func (s *SyncStartCmd) run(g *Globals, env *envelopeRun) error {
 	}
 
 	if s.ResetTargetData && !s.Yes {
-		ok, err := confirmTypedDestructive(kongContext(), os.Stdin, destructivePromptWriter(env),
-			"This will DROP tables on the target. Type 'reset' to confirm: ", "reset")
-		if err != nil {
+		if err := confirmResetTargetData(kongContext(), destructivePromptWriter(env)); err != nil {
 			return err
-		}
-		if !ok {
-			return errConfirmDeclined
 		}
 	}
 

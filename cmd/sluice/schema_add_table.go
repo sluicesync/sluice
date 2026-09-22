@@ -78,7 +78,7 @@ type SchemaAddTableCmd struct {
 	InjectShardColumn string `help:"Re-pass the Shape A discriminator column NAME=VALUE if this stream was started with --inject-shard-column on 'sync start'. Currently refuses loudly: Shape A add-table mid-stream is Phase 2 per ADR-0048 DP-3 — use the drained model: 'sync stop --wait' -> schema migrate (including add-table) -> 'sync start' re-run with the same --stream-id (a restart warm-resumes from the persisted position; there is no resume flag)." placeholder:"NAME=VALUE"`
 
 	DryRun bool `help:"Print the plan (which table, source publication update, target DDL summary) without modifying the source publication, target schema, or capturing a snapshot." short:"n"`
-	Yes    bool `help:"Skip the typed-confirmation prompt." short:"y"`
+	Yes    bool `help:"Confirm the add. Required when stdin is not a terminal (scripts, CI, agents): without it the command refuses with SLUICE-E-CONFIRMATION-REQUIRED instead of prompting. On a terminal it skips the typed table-name prompt." short:"y"`
 
 	ControlKeyspace string `name:"control-keyspace" help:"MySQL/PlanetScale/Vitess target only: the unsharded sidecar keyspace the stream's control tables live in (see 'sync start --control-keyspace'). Omit to auto-detect on a sharded target; must match what the stream was started with. Empty + unsharded/non-Vitess target = the default keyspace." placeholder:"KEYSPACE"`
 }
@@ -153,8 +153,12 @@ func (s *SchemaAddTableCmd) Run(g *Globals) error {
 	// Same friction tier as --reset-target-data: this is a target-
 	// schema mutation and a source-side publication update; the
 	// operator should be deliberate. Dry-run skips the prompt — it
-	// doesn't modify anything.
+	// doesn't modify anything. Same door as every other prompt site:
+	// no terminal on stdin, no prompt — a coded refusal instead.
 	if !s.Yes && !s.DryRun {
+		if err := refuseUnlessTerminal(fmt.Sprintf("adding table %q to the stream", s.Table)); err != nil {
+			return err
+		}
 		ok, err := confirmTypedDestructive(kongContext(), os.Stdin, os.Stdout,
 			fmt.Sprintf("This will create table %q on the target, bulk-copy its rows, and extend the source publication. Type %q to confirm: ", s.Table, s.Table),
 			s.Table)

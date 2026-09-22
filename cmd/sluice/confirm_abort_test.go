@@ -55,6 +55,29 @@ func withCommandIO(t *testing.T, stdin string, fn func()) (stdout, stderr string
 	return string(outB), string(errB)
 }
 
+// asTerminalStdin makes the destructive-prompt door see a terminal for the
+// rest of the test, so the prompt-path tests below can drive the prompt
+// from a pipe. Without it every withCommandIO run is the NON-terminal
+// shape (a pipe is exactly what an agent or CI hands the process) and the
+// door refuses before any prompt is printed — see TestDestructivePromptDoor.
+func asTerminalStdin(t *testing.T) {
+	t.Helper()
+	orig := stdinIsTerminal
+	stdinIsTerminal = func() bool { return true }
+	t.Cleanup(func() { stdinIsTerminal = orig })
+}
+
+// asPipedStdin pins the door's non-terminal branch explicitly rather than
+// relying on isatty's verdict on the test pipe (which is also false, and
+// TestDefaultStdinIsTerminal_PipeIsNot proves it — but a test that pins
+// a policy should not depend on the probe it is not testing).
+func asPipedStdin(t *testing.T) {
+	t.Helper()
+	orig := stdinIsTerminal
+	stdinIsTerminal = func() bool { return false }
+	t.Cleanup(func() { stdinIsTerminal = orig })
+}
+
 const confirmPromptText = "Type 'reset' to confirm"
 
 // TestResetTargetDataConfirm_CommandPaths pins the destructive-confirm
@@ -71,6 +94,7 @@ const confirmPromptText = "Type 'reset' to confirm"
 //     a DIFFERENT, downstream error (no DB in unit tests), proving the
 //     gate consumed the answer rather than short-circuiting.
 func TestResetTargetDataConfirm_CommandPaths(t *testing.T) {
+	asTerminalStdin(t)
 	// Each command's runner returns the Run error and plants a fast,
 	// dial-free failure point directly AFTER the prompt (bogus
 	// --inject-shard-column / --apply-batch-size / an empty chain
@@ -216,6 +240,7 @@ func TestResetTargetDataConfirm_CommandPaths(t *testing.T) {
 //
 // The command has no --format flag, so only the text shape applies.
 func TestSchemaAddTableConfirm_CommandPath(t *testing.T) {
+	asTerminalStdin(t)
 	run := func() error {
 		cmd := &SchemaAddTableCmd{}
 		cmd.SourceDriver = "postgres"

@@ -262,9 +262,9 @@ func (c *TriggerSetupCmd) runSQLiteLike(
 // source proceeds cleanly via DROP ... IF EXISTS.
 //
 // Destructive: drops sluice_change_log (unless --keep-data) and every
-// per-table sluice-installed trigger. Mirrors `sluice slot drop`: a
-// confirmation prompt fires by default; --yes skips it for
-// scripted/CI use.
+// per-table sluice-installed trigger. Without --yes it asks a y/N
+// question on a terminal and refuses (SLUICE-E-CONFIRMATION-REQUIRED)
+// anywhere else — see confirmTeardown and the door in confirm_door.go.
 type TriggerTeardownCmd struct {
 	SourceDriver string   `help:"Trigger-CDC source engine to tear down: 'postgres-trigger' (default), 'sqlite-trigger', or 'd1-trigger'." enum:"postgres-trigger,sqlite-trigger,d1-trigger" default:"postgres-trigger"`
 	DSN          string   `help:"Source DSN (PG DSN for postgres-trigger; SQLite file path for sqlite-trigger; d1:// form for d1-trigger, token via CLOUDFLARE_API_TOKEN)." required:"" placeholder:"DSN"`
@@ -272,7 +272,7 @@ type TriggerTeardownCmd struct {
 	Schema       string   `help:"PG schema. Defaults to the DSN's 'schema' query parameter. Ignored for sqlite-trigger / d1-trigger." placeholder:"NAME"`
 	KeepData     bool     `help:"Retain sluice_change_log (and the meta table) for forensics. Default drops them — the engine's promise is to remove every trace from the source."`
 	DryRun       bool     `help:"Print the DDL and exit." short:"n"`
-	Yes          bool     `help:"Skip the destructive-action confirmation prompt. Mirrors 'slot drop --yes'." short:"y"`
+	Yes          bool     `help:"Confirm the destructive teardown. Required when stdin is not a terminal (scripts, CI, agents): without it the command refuses with SLUICE-E-CONFIRMATION-REQUIRED instead of prompting. On a terminal it skips the y/N prompt." short:"y"`
 }
 
 // Run implements `sluice trigger teardown`.
@@ -286,23 +286,8 @@ func (c *TriggerTeardownCmd) Run(g *Globals) error {
 	case triggerDriverD1:
 		return c.runSQLiteLike(g, "d1-trigger", "Cloudflare D1 source", sqlitetrigger.TeardownD1)
 	}
-	// The destructive-confirmation prompt reads stdin / writes stdout, so it
-	// MUST run before any live view owns the terminal.
-	if !c.DryRun && !c.Yes {
-		prompt := "Tear down the sluice trigger engine on the source (drop per-table triggers"
-		if c.KeepData {
-			prompt += "; keep the change-log table)? [y/N] "
-		} else {
-			prompt += " AND the sluice_change_log table)? [y/N] "
-		}
-		ok, err := confirmDestructive(os.Stdin, os.Stdout, prompt)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			fmt.Fprintln(os.Stdout, "aborted")
-			return nil
-		}
+	if err := c.confirmTeardown("source"); err != nil {
+		return err
 	}
 
 	// ADR-0155: pretty TTY view for an interactive teardown. --dry-run
@@ -355,6 +340,42 @@ func (c *TriggerTeardownCmd) Run(g *Globals) error {
 	return nil
 }
 
+// confirmTeardown is the one destructive-confirmation door for every
+// teardown driver (the PG path and both SQLite-family paths used to carry
+// a copy each). It returns nil when the teardown may proceed: --yes or
+// --dry-run given, or the operator answered y on a terminal. It reads
+// stdin / writes stdout, so it MUST run before any live view owns the
+// terminal.
+//
+// Two non-nil shapes, both non-zero exits: stdin not a terminal (an agent,
+// a script, CI) → the coded SLUICE-E-CONFIRMATION-REQUIRED refusal, fired
+// before the prompt is even printed; the operator declining on a terminal
+// → errConfirmDeclined. Until audit GC-13 the decline path printed
+// "aborted" and returned nil — on a non-TTY that was exit 0 with the
+// trigger engine still installed.
+func (c *TriggerTeardownCmd) confirmTeardown(sourceLabel string) error {
+	if c.DryRun || c.Yes {
+		return nil
+	}
+	if err := refuseUnlessTerminal("tearing down the sluice trigger engine on the " + sourceLabel); err != nil {
+		return err
+	}
+	prompt := "Tear down the sluice trigger engine on the " + sourceLabel + " (drop per-table triggers"
+	if c.KeepData {
+		prompt += "; keep the change-log table)? [y/N] "
+	} else {
+		prompt += " AND the sluice_change_log table)? [y/N] "
+	}
+	ok, err := confirmDestructive(os.Stdin, os.Stdout, prompt)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errConfirmDeclined
+	}
+	return nil
+}
+
 // runSQLiteLike handles `sluice trigger teardown` for the SQLite-family engines —
 // 'sqlite-trigger' (ADR-0135, a local file) and 'd1-trigger' (ADR-0136, a live
 // D1 over HTTP). Both drop the per-table capture triggers and (unless
@@ -368,23 +389,8 @@ func (c *TriggerTeardownCmd) runSQLiteLike(
 	label, sourceLabel string,
 	teardownFn func(context.Context, string, sqlitetrigger.TeardownOptions) (*sqlitetrigger.Plan, error),
 ) error {
-	// The destructive-confirmation prompt reads stdin / writes stdout, so it
-	// MUST run before any live view owns the terminal.
-	if !c.DryRun && !c.Yes {
-		prompt := "Tear down the sluice trigger engine on the " + sourceLabel + " (drop per-table triggers"
-		if c.KeepData {
-			prompt += "; keep the change-log table)? [y/N] "
-		} else {
-			prompt += " AND the sluice_change_log table)? [y/N] "
-		}
-		ok, err := confirmDestructive(os.Stdin, os.Stdout, prompt)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			fmt.Fprintln(os.Stdout, "aborted")
-			return nil
-		}
+	if err := c.confirmTeardown(sourceLabel); err != nil {
+		return err
 	}
 	pretty := wantPrettyProgress(g, false, c.DryRun, false)
 	runCtx, cancel := context.WithCancel(kongContext())

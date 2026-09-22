@@ -1,6 +1,6 @@
 # AGENTS.md — driving sluice as an AI agent
 
-sluice is a single-binary CLI that migrates and continuously syncs databases (MySQL ↔ Postgres in all four directions, plus SQLite / Cloudflare D1 import and sync). It is built for you: **every command is non-interactive** (flags, environment variables, optional YAML config — there are no prompts, ever), destructive operations require explicit opt-in flags, and ambiguous states refuse loudly with a named remedy instead of proceeding. This file is the operating guide for agents *using* the CLI; contributor/development guidance lives in `CLAUDE.md` and `CONTRIBUTING.md`.
+sluice is a single-binary CLI that migrates and continuously syncs databases (MySQL ↔ Postgres in all four directions, plus SQLite / Cloudflare D1 import and sync). It is built for you: **no command ever blocks on a prompt when you drive it** (flags, environment variables, optional YAML config). A destructive command asks for confirmation only when stdin is a real terminal and `--yes` is absent; on a pipe, a CI runner, or any other non-terminal stdin it refuses with `SLUICE-E-CONFIRMATION-REQUIRED` (exit 3) before touching anything — pass `--yes` to proceed. Destructive operations require explicit opt-in flags, and ambiguous states refuse loudly with a named remedy instead of proceeding. This file is the operating guide for agents *using* the CLI; contributor/development guidance lives in `CLAUDE.md` and `CONTRIBUTING.md`.
 
 ## Command taxonomy
 
@@ -18,7 +18,7 @@ sluice is a single-binary CLI that migrates and continuously syncs databases (My
 
 - `--reset-target-data` — drops/truncates target tables before copy
 - `--force-cold-start` — bypasses the populated-target safety preflight
-- `--yes` — suppresses the reset confirmation; **on `expand-contract` it confirms the contract leg — a `DROP COLUMN` deploy request against the production branch** (without it the run stops after verify and prints the resume command)
+- `--yes` — the destructive-confirmation opt-in on `--reset-target-data`, `schema add-table`, `trigger teardown`, `slot drop` and `sync decommission`; without it these refuse with `SLUICE-E-CONFIRMATION-REQUIRED` (exit 3) unless a human is at a terminal to answer the prompt. **On `expand-contract` it confirms the contract leg — a `DROP COLUMN` deploy request against the production branch** (without it the run stops after verify and prints the resume command)
 - `backup prune` / `backup compact` without `--dry-run` — irreversibly drop backup history
 - `sync decommission --yes` — drops a finished stream's replication slot + per-stream publication on the source and clears its control row on the target; the stream can never warm-resume after (preview with `--dry-run`, which needs no `--yes`)
 
