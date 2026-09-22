@@ -474,6 +474,28 @@ func TestMigrate_PG_TargetSchema_EnumColumn(t *testing.T) {
 		t.Errorf("customer_svc.orders count = %d; want 3", count)
 	}
 
+	// GC-3's post-copy identity restore must find the table under the
+	// TARGET schema. The first cut qualified the ALTER by the IR's source
+	// schema and failed this run with 42P01 on `"public"."orders"` (CI on
+	// 0d24fd53). The independent expected value is the target's own
+	// refusal: an explicit id into a restored GENERATED ALWAYS column is
+	// SQLSTATE 428C9, and only a column that was actually restored under
+	// customer_svc can produce it.
+	var identityGeneration string
+	if err := db.QueryRowContext(ctx, `SELECT identity_generation FROM information_schema.columns WHERE table_schema = 'customer_svc' AND table_name = 'orders' AND column_name = 'id'`).Scan(&identityGeneration); err != nil {
+		t.Fatalf("identity_generation: %v", err)
+	}
+	if identityGeneration != "ALWAYS" {
+		t.Errorf("customer_svc.orders.id identity_generation = %q; want ALWAYS (restore did not reach the --target-schema table)", identityGeneration)
+	}
+	_, err = db.ExecContext(ctx, `INSERT INTO customer_svc.orders (id, status, total) VALUES (999, 'pending', 1.00)`)
+	if err == nil {
+		t.Fatal("explicit id into a restored GENERATED ALWAYS column was accepted; want SQLSTATE 428C9")
+	}
+	if !strings.Contains(err.Error(), "428C9") {
+		t.Errorf("explicit-id refusal = %v; want SQLSTATE 428C9", err)
+	}
+
 	// The enum type lives in the per-source namespace. Its NAME is the
 	// preserved source type name `order_status` (Bug 19c, v0.69.0): a
 	// same-engine PG→PG migration carries the source enum type name

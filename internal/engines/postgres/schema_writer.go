@@ -1864,8 +1864,19 @@ func (w *SchemaWriter) AlterAddColumn(ctx context.Context, table *ir.Table, cols
 // for table. Shared across the ADR-0054 Phase 2c ShapeDeltaApplier
 // methods so quoting + schema-override stay consistent.
 func (w *SchemaWriter) qualifyTable(table *ir.Table) string {
+	// An explicit `--target-schema` re-homes EVERY table under w.schema —
+	// that is where CreateTablesWithoutConstraints put it — so a
+	// post-create ALTER must be qualified by the writer's schema, never
+	// by the IR's source schema. Without the override the IR's own schema
+	// wins (a multi-schema source lands each table in its own schema).
+	// The first cut of GC-3's identity restore hit this: it issued
+	// `ALTER TABLE "public"."orders"` on a `--target-schema customer_svc`
+	// migrate and failed 42P01 (CI on 0d24fd53,
+	// TestMigrate_PG_TargetSchema_EnumColumn). Fixed here rather than at
+	// that one call site because the same helper qualifies every
+	// shape-delta and CHECK applier — see TestQualifyTable_TargetSchemaWins.
 	schemaName := w.schema
-	if table.Schema != "" {
+	if table.Schema != "" && !w.schemaExplicit {
 		schemaName = table.Schema
 	}
 	return quoteIdent(schemaName) + "." + quoteIdent(table.Name)
