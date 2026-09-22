@@ -54,6 +54,52 @@ other eighteen.
 
 ---
 
+## 2026-09-22 — Gap census: object classes × stated capabilities × peer tools
+
+Indexed 2026-09-22 by the census pass itself. The IDs are the backlog's
+own `GC-n` spellings; each GC entry consolidates one or more worker
+finding ids (A-postgres S1…, A-mysql F0…, A-sqlite A-1…, C-docs C1…,
+C-code C-1…), which live only in the gitignored
+`workspace/gap-census-2026-09-22/` reports and are cited by name inside
+the GC entry rather than indexed separately.
+
+### Tier 1 — silent alteration or loss
+
+- GC-1 filed
+- GC-2 filed
+- GC-3 filed
+- GC-4 filed
+- GC-5 filed
+- GC-6 filed
+- GC-7 filed
+- GC-8 filed
+- GC-9 filed
+- GC-10 filed
+
+### Tier 2 — stated capabilities the code does not have
+
+- GC-11 filed
+- GC-12 filed
+- GC-13 filed
+- GC-14 filed
+- GC-15 filed
+- GC-16 filed
+- GC-17 filed
+- GC-18 filed
+- GC-19 filed
+- GC-20 filed
+- GC-21 filed
+
+### Tier 3 — loud but broken
+
+- GC-22 filed
+- GC-23 filed
+- GC-24 filed
+
+### Tier 4 — peer-tool capability gaps
+
+- Tier-4 items are numbered 1–7 in the backlog section and carry no GC id: prose (feature candidates, not findings; items 1 and 2 are the build recommendations, 7 is the re-confirmed out-of-scope list).
+
 ## 2026-09-15 — Tier-3 blind audit at the v0.153.1 release commit, plus the pre-tag VF/PP reviews
 
 Indexed 2026-09-15 by the CI/gate remediation pass, which also added
