@@ -170,8 +170,8 @@ information_schema re-read, which bounds the matrix:
 | ALTER COLUMN TYPE (cross-engine) | ✅ forward (GAP #3) | ✅ forward (GAP #1/#3) |
 | ALTER NULLABILITY | ✅ forward (GAP #2)¹ | ❌ refuse² |
 | REORDER | ✅ no-op (name-based decode) | ✅ no-op |
-| CREATE / DROP INDEX | ❌ refuse³ | ❌ refuse² |
-| ADD / DROP / MODIFY CHECK | ❌ refuse³ | ❌ refuse² |
+| CREATE / DROP INDEX | ⛔ not forwarded — no boundary³ | ❌ refuse² |
+| ADD / DROP / MODIFY CHECK | ⛔ not forwarded — no boundary³ | ❌ refuse² |
 | RENAME COLUMN | ❌ refuse (§3) | ✅ forward via attnum (F7b, §3) |
 | RENAME TABLE / multi-shape combo | ❌ refuse | ❌ refuse |
 
