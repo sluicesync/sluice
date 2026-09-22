@@ -119,9 +119,12 @@ The honest list. Every entry is loud, off-default, or a schema-object (not value
 
 **Five expression-translator rules stay deferred** (`GREATEST`/`LEAST`, `REGEXP_LIKE`, `FIND_IN_SET`, `CONVERT_TZ`, `INET_ATON`/`INET_NTOA`) — each has a semantic divergence that makes auto-rewrite a masking risk; each fails loudly and has an escape hatch: `--expr-override TABLE.COLUMN=EXPR` for generated columns, `--exclude-table` or a source-side rewrite for CHECK/DEFAULT sites (the override rewrites only generated-column bodies). Full per-rule analysis: [translator-catalog](translator-catalog.md).
 
-**Cross-engine view bodies are emitted verbatim.** A view definition that doesn't parse on the target surfaces as a loud target-side rejection at apply time; `--view-override` supplies the translated body. PG materialized views refresh via `sluice matview refresh` (PG-only).
+**Cross-engine view bodies are emitted verbatim.** A view definition that doesn't parse on the target surfaces as a loud target-side rejection at apply time. There is no flag that supplies a translated body (an earlier version of this entry named a `--view-override` that was never built); the workarounds that exist are `--exclude-view <name>` (or `--skip-views` to leave every view to out-of-band tooling) and then creating the view on the target by hand, or rewriting the view body on the source into a form both engines parse. PG materialized views refresh via `sluice matview refresh` (PG-only).
 
 **Multi-source MySQL fan-in has no per-table rename.** Aggregating N MySQL sources into one target database relies on DSN/database choice for namespacing; there is no `--rename-table SOURCE=TARGET` flag (PG multi-source uses `--target-schema`). Zero demand to date; tracked as roadmap item 9.
+<!-- cli-flag-exempt: rename-table - named as absent; the entry says there is no such flag -->
+<!-- cli-flag-exempt: view-override - named as never built; the entry corrects an earlier version of itself -->
+<!-- cli-command-exempt: matview refresh - real command; listed here only because the entry above names it alongside the exempt flags -->
 
 **No Arrow / columnar in-flight format.** The analytics exit is `backup export-as-parquet` (one Parquet file per table); Arrow as an IR row representation is deliberately deferred with zero current demand.
 

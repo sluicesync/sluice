@@ -14,6 +14,7 @@ The user wants a copy of production with PII masked/hashed/tokenized — for sta
 - Source + target DSNs (env: `SLUICE_SOURCE` / `SLUICE_TARGET`) and drivers.
 - The columns to redact and the strategy per column.
 - For **keyed** (deterministic) strategies (`hash:hmac-sha256`, `tokenize:dict`): a keyset via `--keyset-source` (see step 2b). **Note the flag is `--keyset-source`, not `--redact-key-source`** (the Phase-1 `--redact-key-source` flag was removed).
+  <!-- cli-flag-exempt: redact-key-source - a REMOVED flag, named so an agent does not reach for it -->
 
 ## Steps
 

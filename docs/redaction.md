@@ -357,6 +357,7 @@ versioned, operator-controlled **keyset**. Both keyed strategies —
 from the keyset. There is no other key path: the Phase 1
 `--redact-key-source` flag and the built-in v0.61.0 `tokenize:dict`
 key were removed (clean break — sluice is pre-users). **Any rule
+<!-- cli-flag-exempt: redact-key-source - a REMOVED flag, named so operators know it is gone -->
 using `hash:hmac-sha256` or `tokenize:dict` requires
 `--keyset-source`**; sluice refuses loudly at preflight otherwise.
 

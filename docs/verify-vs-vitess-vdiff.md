@@ -102,7 +102,8 @@ no row data crosses the wire. Cheap. Statistical confidence
 follows the binomial: with N=100 samples per table, ~99% chance
 of detecting a 5% corruption rate; ~50% chance of detecting a
 single bad row in a million-row table. Operators wanting higher
-confidence raise N or use full mode.
+confidence raise N (`--sample-rows-per-table`); full mode is not
+built (next section), so today N is the only lever.
 
 ### `--depth full` (planned)
 

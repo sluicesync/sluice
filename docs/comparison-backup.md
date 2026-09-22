@@ -124,7 +124,7 @@ The gap closed in two measured stages, each confirming its decomposition:
    (a wash), while `SpeedBetterCompression` cost +76% wall for −2% size
    and lowering encoder concurrency only serialized the long-pole table.
    `SpeedDefault` (klauspost default concurrency = GOMAXPROCS) is the
-   right operating point; no `--compression-level` knob is warranted
+   right operating point; no compression-level knob is warranted
    (every non-default setting measured was a net loss). The frontier
    that remains is read throughput, not codec CPU.
 

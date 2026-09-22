@@ -78,13 +78,14 @@ bulk-copy.
 ### Step 2: producer starts the continuous stream
 
 ```sh
+# The producer has no --stream-id: it is identified by the chain it
+# extends (the parent full in --output-dir, or --since to pick one).
 sluice backup stream run \
     --source-driver postgres \
     --source 'postgres://...source...' \
     --output-dir /var/backups/myapp \
     --rollover-window 10s \
-    --retain-rotate-at-chain-length 20 \
-    --stream-id myapp-producer
+    --retain-rotate-at-chain-length 20
 ```
 
 Operationally a long-running process — run it under systemd / k8s /
@@ -227,7 +228,6 @@ sluice backup stream run \
     --output-dir /var/backups/myapp \
     --rollover-window 10s \
     --retain-rotate-at-chain-length 20 \
-    --stream-id myapp-producer \
     --force
 ```
 

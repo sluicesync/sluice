@@ -68,8 +68,10 @@ the underlying Vitess version (see "Versions" below).
 
 - Check PlanetScale's per-cluster replication-lag graphs.
 - Restart the stream: `sluice sync stop --wait` then `sluice sync
-  start --resume`. This forces vtgate to re-pick a tablet — if a
-  fresher replica exists, you'll land on it.
+  start` again with the same `--stream-id` (a re-run warm-resumes from
+  the persisted position; there is no resume flag on `sync start`).
+  This forces vtgate to re-pick a tablet — if a fresher replica
+  exists, you'll land on it.
 - If lag is consistently high under normal write load, the source
   is under-provisioned; that's a PlanetScale support conversation,
   not a sluice fix.

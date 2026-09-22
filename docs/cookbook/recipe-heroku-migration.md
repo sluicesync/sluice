@@ -136,14 +136,17 @@ heroku pg:psql --app myapp -- pg_dump --schema-only > schema.sql
 # Step 2: apply to target, review, edit
 psql ... target -f schema.sql
 
-# Step 3: sluice migrate with the schema already in place
+# Step 3: sluice migrate with the schema already in place. There is no
+# "skip DDL" flag on migrate: since v0.99.258 (ADR-0166) a fresh migrate
+# SKIPS every pre-existing target table whose column shape matches what
+# it would create, and refuses loudly (SLUICE-E-TARGET-TABLE-SHAPE-
+# MISMATCH) on one that drifted — so the pg_dump'd schema is simply
+# recognised and the copy proceeds into it.
 sluice migrate \
     --source-driver postgres \
     --source "$(heroku config:get DATABASE_URL --app myapp)?sslmode=require" \
     --target-driver postgres \
-    --target ... \
-    --schema-only=false \
-    --no-create-schema
+    --target ...
 ```
 
 This is sometimes preferred over a full `sluice migrate` for Heroku
