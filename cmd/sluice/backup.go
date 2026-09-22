@@ -816,6 +816,8 @@ func (b *BackupFullCmd) run(g *Globals, env *envelopeRun) error {
 	if err != nil {
 		return fmt.Errorf("--source-driver: %w", err)
 	}
+	// ADR-0118 inert-flag WARN: the VStream FLOAT trio on a non-VStream source.
+	warnInertFlags(context.Background(), "backup full", b.SourceDriver, "")
 	// Value-fidelity flags (task 2.5): a backup reads source values, so its reader
 	// honors --zero-date / --sqlite-date-encoding / --mysql-sql-mode.
 	if source, err = applySourceEngineOptions(source, g); err != nil {
@@ -2014,7 +2016,9 @@ func (r *RestoreCmd) run(g *Globals, env *envelopeRun) error {
 	// sidecar) and record it on the target engine BEFORE it opens the applier —
 	// this is the same engine that reaches ChainRestore's OpenChangeApplier, so
 	// EnsureControlTable + the incremental position writes land in the sidecar
-	// keyspace. Inert on non-MySQL targets and on a single-full restore.
+	// keyspace. Inert on non-MySQL targets (the ADR-0118 inert-flag WARN says
+	// so) and on a single-full restore.
+	warnInertFlags(ctx, "restore", "", r.TargetDriver)
 	if target, err = applyControlKeyspace(ctx, target, r.ControlKeyspace, r.Target); err != nil {
 		return err
 	}

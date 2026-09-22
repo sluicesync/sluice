@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 
+	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
 )
 
@@ -48,26 +49,6 @@ func sequenceMarginDeprecatedAliasUsed(args []string) bool {
 	return flagPassedIn(args, "cutover-sequence-margin")
 }
 
-// inertParallelismFlagUsed reports whether the operator EXPLICITLY set one of
-// the FAST-cold-start parallelism flags (ADR-0118 finding 1) on a source whose
-// `sync start` cold-start never takes the ADR-0079 fast path (so the flag is
-// inert — the MySQL/VStream cold-copy parallelism is the engine-internal
-// copy-table axis instead). Returns the flag
-// name that tripped it (for the message) and true; "" / false otherwise. Pure
-// over (args, source) so both the source-class gate and the per-flag detection
-// are unit-pinned.
-func inertParallelismFlagUsed(args []string, source ir.Engine) (string, bool) {
-	if source == nil || !sourceHasSerialColdStart(source) {
-		return "", false
-	}
-	for _, name := range []string{"bulk-parallelism", "table-parallelism", "bulk-parallel-min-rows"} {
-		if flagPassedIn(args, name) {
-			return name, true
-		}
-	}
-	return "", false
-}
-
 // warnDeprecatedSequenceMargin emits the ADR-0118 finding 3 one-time
 // deprecation WARN — but ONLY when the operator passed the OLD
 // --cutover-sequence-margin alias specifically (the canonical
@@ -86,48 +67,95 @@ func warnDeprecatedSequenceMargin() {
 	})
 }
 
-// warnInertParallelismFlags emits the ADR-0118 finding 1(b) one-time WARN when
-// the operator EXPLICITLY set one of the FAST-cold-start parallelism flags on a
-// `sync start` whose source engine has no effect for them — MySQL (binlog) or
-// PlanetScale/Vitess (VStream). Those flags govern only the ADR-0079 PG-source
-// fast cold-start; a MySQL/VStream source's cold-copy parallelism is the
-// engine-internal copy-table axis (--copy-fanout-degree /
-// --vstream-copy-table-parallelism / --copy-table-parallelism — the native
-// axis defaults to auto:4 since the perf-parity gap-3 chunk). This turns the
-// silent no-op into a loud
-// one — the loud-failure tenet applied to a UX hazard — without changing any
-// behaviour.
-var warnInertParallelismFlagsOnce sync.Once
+// inertFlagMarker is the grep-stable token every ADR-0118 inert-flag WARN
+// carries, so an operator reading a log can find every accepted-and-dropped
+// flag with one search (the same discipline as POSITION-MODE /
+// STALE-CAPTURE-FUNCTION). The gate in inert_flag_gate_test.go pins it.
+const inertFlagMarker = "INERT-FLAG"
 
-func warnInertParallelismFlags(ctx context.Context, source ir.Engine) {
-	name, ok := inertParallelismFlagUsed(os.Args[1:], source)
-	if !ok {
-		return
+// inertFlagsUsed returns the registry rows whose flag the operator EXPLICITLY
+// passed (by argv spelling, never by resolved value) on command and whose
+// inertWhen predicate holds for the resolved engines — i.e. the flags that
+// are about to be accepted and silently dropped. Pure over
+// (args, command, source, target) so the per-row × per-engine matrix is
+// unit-pinned without touching os.Args/slog. A nil engine never satisfies a
+// predicate (the caller's own resolveEngine refuses an unknown driver; this
+// pass has nothing to judge), so a command that carries only one side passes
+// nil for the other.
+func inertFlagsUsed(args []string, command string, source, target ir.Engine) []inertFlag {
+	var hits []inertFlag
+	for _, row := range inertFlagRegistry {
+		if row.command != command || !flagPassedIn(args, row.flag) {
+			continue
+		}
+		if row.inertWhen(source, target) {
+			hits = append(hits, row)
+		}
 	}
-	warnInertParallelismFlagsOnce.Do(func() {
-		slog.WarnContext(ctx,
-			"--"+name+" has no effect for a MySQL/VStream source on `sync start` "+
-				"(it governs the ADR-0079 PG-source fast cold-start only); "+
-				"use --copy-fanout-degree to tune VStream cold-copy write concurrency, "+
-				"and --vstream-copy-table-parallelism / --copy-table-parallelism for the read axis.")
-	})
+	return hits
 }
 
-// sourceHasSerialColdStart reports whether the named source engine never takes
-// the ADR-0079 fast cold-start on `sync start` — i.e. the FAST-cold-start
-// parallelism flags (--bulk-parallelism / --table-parallelism /
-// --bulk-parallel-min-rows) are inert for it. True for the MySQL family
-// (binlog — whose cold-copy parallelism is the engine-internal
-// --copy-table-parallelism axis, auto:4 by default) and PlanetScale/Vitess
-// (VStream); false for Postgres, whose ADR-0079 fast cold-start honors them.
-// The name is historical (these sources' cold-copy is no longer serial by
-// default); it survives because the predicate is pinned by name in tests.
-// Keyed on the engine registry name so a new MySQL flavor slots in by name.
-func sourceHasSerialColdStart(source ir.Engine) bool {
-	switch source.Name() {
-	case "mysql", "planetscale", "vitess":
-		return true
-	default:
-		return false
+// warnedInertFlags dedupes the WARN per (command, flag) for the process
+// lifetime — kong dispatches one Run per process, but a command's engine
+// resolution can run more than once (a multi-namespace fan-out, a retry),
+// and the WARN is a one-time notice, not a per-attempt one.
+var warnedInertFlags sync.Map
+
+// warnInertFlags emits the ADR-0118 finding 1(b) one-time WARN for every
+// registry row of command whose flag the operator explicitly set on a run
+// where the row's capability predicate says it is inert. The engines are
+// resolved by driver NAME from the registry (an empty or unknown name
+// resolves to nil and judges nothing — the command's own resolveEngine is
+// the refusal for that), so every entry point wires this with one line,
+// before or after its own resolution, and never has to thread a wrapped
+// engine value in. The WARN names the flag, the command, the engine it is
+// inert on and WHY (the row's reason), and carries the INERT-FLAG marker.
+// This turns the silent no-op into a loud one — the loud-failure tenet
+// applied to a UX hazard — without changing any behaviour.
+func warnInertFlags(ctx context.Context, command, sourceDriver, targetDriver string) {
+	source := engineByNameOrNil(sourceDriver)
+	target := engineByNameOrNil(targetDriver)
+	for _, row := range inertFlagsUsed(os.Args[1:], command, source, target) {
+		key := row.command + " --" + row.flag
+		if _, dup := warnedInertFlags.LoadOrStore(key, true); dup {
+			continue
+		}
+		slog.WarnContext(ctx, inertFlagMarker+": --"+row.flag+" has no effect on `"+row.command+"` "+
+			row.inertOn(source, target)+" — "+row.reason,
+			slog.String("flag", "--"+row.flag),
+			slog.String("command", row.command))
 	}
+}
+
+// warnInertFleetControlKeyspace is the `sync run` (fleet YAML) sibling of the
+// `sync start --control-keyspace` registry row. A fleet spec has no argv, so
+// the registry's spelling signal cannot reach it; the honest "explicitly
+// set" signal for a string key whose default is empty is "non-empty", and
+// the two coincide for this key. It reuses the row's predicate and reason
+// so the fleet operator reads the same sentence a CLI operator would. The
+// other registry flags have no fleet-spec key (SyncSpec carries none of the
+// cold-start tuning knobs), so this is the only fleet sibling — the wiring
+// roster in inert_flag_gate_test.go does not reach it; the sync_run tests do.
+func warnInertFleetControlKeyspace(ctx context.Context, streamID, keyspace string, target ir.Engine) {
+	if keyspace == "" || !targetLacksControlKeyspace(nil, target) {
+		return
+	}
+	slog.WarnContext(ctx, inertFlagMarker+": control-keyspace has no effect on `sync run` against a "+target.Name()+" target — "+reasonNoKeyspace,
+		slog.String("stream_id", streamID),
+		slog.String("command", "sync run"))
+}
+
+// engineByNameOrNil is the registry lookup with the "unknown → nil" edge the
+// WARN pass wants: it must never refuse (the command's own resolveEngine
+// owns that) and never panic on an empty --source-driver (diagnose /
+// sync health take an optional source).
+func engineByNameOrNil(name string) ir.Engine {
+	if name == "" {
+		return nil
+	}
+	e, ok := engines.Get(name)
+	if !ok {
+		return nil
+	}
+	return e
 }

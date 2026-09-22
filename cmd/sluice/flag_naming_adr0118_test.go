@@ -161,37 +161,55 @@ func TestADR0118_SequenceMarginDeprecationWarnGate(t *testing.T) {
 	}
 }
 
-// ---- Finding 1(b) WARN: fires ONLY when an inert parallelism flag is
-//      EXPLICITLY set on a MySQL/VStream source — not on a PG source, and not
-//      when unset.
+// ---- Finding 1(b) WARN: fires ONLY when an inert flag is EXPLICITLY set on a
+//      source it is inert for — never on a source that honours it, never when
+//      unset. Since GC-19 the registry decides by CAPABILITY, not by engine
+//      name, so the trigger-CDC / mydumper / flat-file sources — which the old
+//      `case "mysql","planetscale","vitess"` allowlist silently missed — are
+//      pinned here alongside the MySQL family. The full row × engine matrix
+//      is TestInertFlagPredicates_EngineMatrix; this keeps the original
+//      finding's shape readable.
 
 func TestADR0118_InertParallelismWarnGate(t *testing.T) {
-	mysqlEng := mustEngine(t, "mysql")
-	vstreamEng := mustEngine(t, "planetscale")
-	pgEng := mustEngine(t, "postgres")
-
+	const cmd = "sync start"
 	cases := []struct {
 		name     string
 		args     []string
-		source   ir.Engine
+		source   string // driver name; "" = nil source
 		wantFlag string
 		wantOK   bool
 	}{
-		{"bulk-parallelism on mysql → warn", []string{"sync", "start", "--bulk-parallelism=8"}, mysqlEng, "bulk-parallelism", true},
-		{"table-parallelism on vstream → warn", []string{"sync", "start", "--table-parallelism=4"}, vstreamEng, "table-parallelism", true},
-		{"bulk-parallel-min-rows on mysql → warn", []string{"sync", "start", "--bulk-parallel-min-rows=100"}, mysqlEng, "bulk-parallel-min-rows", true},
-		{"bulk-parallelism on PG → NO warn (it's honored there)", []string{"sync", "start", "--bulk-parallelism=8"}, pgEng, "", false},
-		{"unset on mysql → NO warn", []string{"sync", "start"}, mysqlEng, "", false},
-		{"nil source → NO warn", []string{"sync", "start", "--bulk-parallelism=8"}, nil, "", false},
-		{"unrelated flag on mysql → NO warn", []string{"sync", "start", "--apply-concurrency=4"}, mysqlEng, "", false},
+		{"bulk-parallelism on mysql → warn", []string{"sync", "start", "--bulk-parallelism=8"}, "mysql", "bulk-parallelism", true},
+		{"table-parallelism on vstream → warn", []string{"sync", "start", "--table-parallelism=4"}, "planetscale", "table-parallelism", true},
+		{"bulk-parallel-min-rows on mysql → warn", []string{"sync", "start", "--bulk-parallel-min-rows=100"}, "mysql", "bulk-parallel-min-rows", true},
+		{"bulk-batch-size on vitess → warn (GC-19: shared the sentence, missed the WARN)", []string{"sync", "start", "--bulk-batch-size=100"}, "vitess", "bulk-batch-size", true},
+		// GC-19's second narrowness: the sources the name allowlist missed.
+		{"bulk-parallelism on sqlite-trigger → warn", []string{"sync", "start", "--bulk-parallelism=8"}, "sqlite-trigger", "bulk-parallelism", true},
+		{"bulk-parallelism on d1-trigger → warn", []string{"sync", "start", "--bulk-parallelism=8"}, "d1-trigger", "bulk-parallelism", true},
+		{"bulk-parallelism on postgres-trigger → warn", []string{"sync", "start", "--bulk-parallelism=8"}, "postgres-trigger", "bulk-parallelism", true},
+		{"bulk-parallelism on mydumper → warn", []string{"sync", "start", "--bulk-parallelism=8"}, "mydumper", "bulk-parallelism", true},
+		{"bulk-parallelism on csv → warn", []string{"sync", "start", "--bulk-parallelism=8"}, "csv", "bulk-parallelism", true},
+		{"bulk-parallelism on mariadb → warn", []string{"sync", "start", "--bulk-parallelism=8"}, "mariadb", "bulk-parallelism", true},
+		{"bulk-parallelism on PG → NO warn (it's honored there)", []string{"sync", "start", "--bulk-parallelism=8"}, "postgres", "", false},
+		{"unset on mysql → NO warn", []string{"sync", "start"}, "mysql", "", false},
+		{"nil source → NO warn", []string{"sync", "start", "--bulk-parallelism=8"}, "", "", false},
+		{"unrelated flag on mysql → NO warn", []string{"sync", "start", "--apply-concurrency=4"}, "mysql", "", false},
 		// Default-value-but-explicit still warns (spelling, not value).
-		{"bulk-parallelism at default value 0 on mysql → warn", []string{"sync", "start", "--bulk-parallelism=0"}, mysqlEng, "bulk-parallelism", true},
+		{"bulk-parallelism at default value 0 on mysql → warn", []string{"sync", "start", "--bulk-parallelism=0"}, "mysql", "bulk-parallelism", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			gotFlag, gotOK := inertParallelismFlagUsed(tc.args, tc.source)
+			var source ir.Engine
+			if tc.source != "" {
+				source = mustEngine(t, tc.source)
+			}
+			hits := inertFlagsUsed(tc.args, cmd, source, nil)
+			gotFlag, gotOK := "", false
+			if len(hits) > 0 {
+				gotFlag, gotOK = hits[0].flag, true
+			}
 			if gotOK != tc.wantOK || gotFlag != tc.wantFlag {
-				t.Errorf("inertParallelismFlagUsed = (%q,%v); want (%q,%v)", gotFlag, gotOK, tc.wantFlag, tc.wantOK)
+				t.Errorf("inertFlagsUsed = (%q,%v); want (%q,%v)", gotFlag, gotOK, tc.wantFlag, tc.wantOK)
 			}
 		})
 	}

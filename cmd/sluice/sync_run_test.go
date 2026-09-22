@@ -5,12 +5,14 @@ package main
 
 import (
 	"context"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"sluicesync.dev/sluice/internal/logcapture"
 	"sluicesync.dev/sluice/internal/pipeline"
 )
 
@@ -520,6 +522,38 @@ func TestBuildStreamerFromSpec_ControlKeyspace(t *testing.T) {
 		spec := pgSpec("a", "slot_a")
 		if _, err := buildStreamerFromSpec(context.Background(), &spec, testFleetGlobals()); err != nil {
 			t.Fatalf("buildStreamerFromSpec with unset control-keyspace: %v", err)
+		}
+	})
+	// GC-19: the fleet path has no argv, so the ADR-0118 inert-flag registry
+	// cannot reach it; warnInertFleetControlKeyspace is its one sibling and
+	// keys on "non-empty" instead. Pinned on the postgres target (the fleet
+	// fixture's mysql target honours the key and must stay silent).
+	t.Run("set control-keyspace on a postgres target → INERT-FLAG WARN, no error", func(t *testing.T) {
+		var buf logcapture.Buffer
+		prev := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		defer slog.SetDefault(prev)
+		spec := mysqlSpec("a") // mysqlSpec targets a postgres engine
+		spec.ControlKeyspace = "sidecar"
+		if _, err := buildStreamerFromSpec(context.Background(), &spec, testFleetGlobals()); err != nil {
+			t.Fatalf("buildStreamerFromSpec: %v", err)
+		}
+		if !strings.Contains(buf.String(), inertFlagMarker+": control-keyspace has no effect on `sync run` against a postgres target") {
+			t.Errorf("expected the INERT-FLAG WARN for a fleet control-keyspace on a postgres target; log:\n%s", buf.String())
+		}
+	})
+	t.Run("set control-keyspace on a mysql target → no INERT-FLAG WARN", func(t *testing.T) {
+		var buf logcapture.Buffer
+		prev := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		defer slog.SetDefault(prev)
+		spec := pgSpec("a", "slot_a")
+		spec.ControlKeyspace = "sidecar"
+		if _, err := buildStreamerFromSpec(context.Background(), &spec, testFleetGlobals()); err != nil {
+			t.Fatalf("buildStreamerFromSpec: %v", err)
+		}
+		if strings.Contains(buf.String(), inertFlagMarker) {
+			t.Errorf("mysql target honours control-keyspace; must not WARN:\n%s", buf.String())
 		}
 	})
 }

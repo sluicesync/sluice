@@ -973,7 +973,8 @@ func buildStreamerFromSpec(ctx context.Context, spec *SyncSpec, g *Globals) (*pi
 	// sidecar control keyspace on the MySQL/VStream target so a sharded-target
 	// fleet sync routes its CDC control tables to the right unsharded keyspace.
 	// Empty defers to the same auto-detect; a non-MySQL or unsharded target is
-	// inert (returned unchanged).
+	// inert (returned unchanged) — and the non-MySQL case says so (ADR-0118).
+	warnInertFleetControlKeyspace(ctx, spec.StreamID, spec.ControlKeyspace, target)
 	if target, err = applyControlKeyspace(ctx, target, spec.ControlKeyspace, spec.Target); err != nil {
 		return nil, err
 	}

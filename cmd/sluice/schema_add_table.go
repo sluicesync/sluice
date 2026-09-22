@@ -108,7 +108,9 @@ func (s *SchemaAddTableCmd) Run(g *Globals) error {
 	}
 	// Sidecar control keyspace (explicit flag or auto-detect) so the
 	// live-add's control-table reads/writes hit the same qualified tables the
-	// running stream uses. Inert on non-MySQL / unsharded targets.
+	// running stream uses. Inert on non-MySQL / unsharded targets (the
+	// ADR-0118 inert-flag WARN names the non-MySQL case).
+	warnInertFlags(kongContext(), "schema add-table", s.SourceDriver, s.TargetDriver)
 	if target, err = applyControlKeyspace(kongContext(), target, s.ControlKeyspace, s.Target); err != nil {
 		return err
 	}

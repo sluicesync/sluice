@@ -120,6 +120,9 @@ func (c *TriggerSetupCmd) Run(g *Globals) error {
 	if len(c.Tables) == 0 {
 		return errors.New("--tables is required for v1 (pass --tables=t1,t2,...)")
 	}
+	// ADR-0118 inert-flag WARN: --schema on a flat-namespace source. Fired
+	// before the driver dispatch so the sqlite-like branches get it too.
+	warnInertFlags(context.Background(), "trigger setup", c.SourceDriver, "")
 	switch c.SourceDriver {
 	case triggerDriverSQLite:
 		return c.runSQLiteLike(g, triggerDriverSQLite, sqlitetrigger.Setup)
@@ -280,6 +283,7 @@ func (c *TriggerTeardownCmd) Run(g *Globals) error {
 	if c.DSN == "" {
 		return errors.New("--dsn is required")
 	}
+	warnInertFlags(context.Background(), "trigger teardown", c.SourceDriver, "")
 	switch c.SourceDriver {
 	case triggerDriverSQLite:
 		return c.runSQLiteLike(g, "sqlite-trigger", "SQLite source", sqlitetrigger.Teardown)
@@ -483,6 +487,7 @@ func (c *TriggerPruneCmd) Run(g *Globals) error {
 	}
 
 	ctx := kongContext()
+	warnInertFlags(ctx, "trigger prune", c.SourceDriver, c.TargetDriver)
 
 	// Step 1 — read the durably-applied frontier from the TARGET (the only safe
 	// lower bound). Refuses loudly when no durable position exists.

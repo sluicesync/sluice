@@ -4,6 +4,10 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Fixed
+
+**The ADR-0118 inert-flag WARN now reaches every flag whose `--help` says it is inert, on every engine it is inert on (GC-19).** The finding 1(b) WARN covered three `sync start` flags by name and keyed on a `mysql`/`planetscale`/`vitess` allowlist, so `--bulk-batch-size` (same sentence, three lines below), both `--index-build-*`, the VStream FLOAT trio, `--copy-table-parallelism`, `--reap-stale-backends`, `--control-keyspace` and more were accepted and dropped silently — and even the covered three were silent on a trigger-CDC, mydumper or flat-file source. The WARN is now a data-driven registry (`cmd/sluice/inert_flags.go`, 37 rows across `migrate`, `sync start`, `backup full`, `restore`, the `sync` lifecycle commands, `cutover`, `diagnose` and `trigger setup/teardown/prune`) whose predicates are derived from the capability the pipeline dispatches on (`ir.SnapshotImporterOpener` for the ADR-0079 fast-lane knobs, `Capabilities().CDC`, `ir.TargetConnectionBudgetProber`, `ir.TargetStaleBackendReaper`, `PostgresBackend`, `SchemaScope`) rather than engine names. Every WARN carries the grep-stable `INERT-FLAG` marker. `TestInertFlagWarnCoversEveryInertMarkedFlag` walks the real kong model for inert-marker phrases and fails the build on any inert-marked flag that is neither registered nor exempt with a written reason; `TestInertFlagPredicates_EngineMatrix` pins every row against every registered engine. The `--max-target-connections` help text no longer claims MySQL is the inert target (the MySQL engine implements `ir.TargetConnectionBudgetProber`; the inert targets are SQLite/D1 and the trigger-CDC targets). The `sync run` fleet path gets the one sibling it can have — a `control-keyspace` key against a non-MySQL target now WARNs.
+
 ## [0.154.0] - 2026-09-15
 
 ### Fixed

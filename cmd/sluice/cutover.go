@@ -91,6 +91,9 @@ func (c *CutoverCmd) Run(g *Globals) error {
 	// its default never trips this). Mirrors the ADR-0091
 	// --forward-schema-add-column posture.
 	warnDeprecatedSequenceMargin()
+	// ADR-0118 inert-flag WARN (--target-schema on a flat-namespace target;
+	// cutover has no ValidateTargetSchema door, so this is its only signal).
+	warnInertFlags(context.Background(), "cutover", c.SourceDriver, c.TargetDriver)
 
 	source, err := resolveEngine(c.SourceDriver)
 	if err != nil {

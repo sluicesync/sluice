@@ -113,6 +113,8 @@ func (d *DiagnoseCmd) Run(_ *Globals) error {
 		if err != nil {
 			return operationalError{err: fmt.Errorf("--source-driver: %w", err)}
 		}
+		// ADR-0118 inert-flag WARN: --slot-name reads PG slot state only.
+		warnInertFlags(context.Background(), "diagnose", d.SourceDriver, d.TargetDriver)
 		req.SourceEngine = source
 		req.SourceDSN = d.Source
 		// RESOLVED here, not in the bundle: --slot-name is a suffix, so

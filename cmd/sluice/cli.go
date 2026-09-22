@@ -280,7 +280,7 @@ type MigrateCmd struct {
 
 	TableParallelism int `help:"Every source: number of tables copied CONCURRENTLY during bulk copy — the cross-table axis (pgcopydb --table-jobs), composed with the within-table --bulk-parallelism axis. Closes the many-medium-table gap where each table sat below the within-table-split threshold and the table loop ran them serially, leaving cores idle. The two axes MULTIPLY: at most --table-parallelism × (effective --bulk-parallelism) connections open against the target at once, and that PRODUCT is bounded by the target's connection budget (and --max-target-connections) at a single chokepoint — within-table parallelism is satisfied first, the table axis gets whatever remains. 0 (default) = auto: 4 (pgcopydb's --table-jobs default), bounded by the budget split. 1 disables cross-table concurrency (one table at a time). Only the migrate path uses this; the sync cold-start path stays serial by design. See ADR-0076." default:"0" placeholder:"N"`
 
-	MaxTargetConnections int `help:"Explicit ceiling on the number of connections the bulk-copy pool opens against the target (connection-resilience item 4). 0 (default) = auto: sluice probes the target's connection-slot budget (Postgres max_connections / role / database limits minus in-use and a small reserve) and caps --bulk-parallelism to fit, refusing loudly if no budget is free. When set, it's an explicit upper bound the auto-cap further bounds — it never raises --bulk-parallelism. Inert against engines without a connection-slot model (MySQL target)." default:"0" placeholder:"N"`
+	MaxTargetConnections int `help:"Explicit ceiling on the number of connections the bulk-copy pool opens against the target (connection-resilience item 4). 0 (default) = auto: sluice probes the target's connection-slot budget (Postgres max_connections / role / database limits minus in-use and a small reserve) and caps --bulk-parallelism to fit, refusing loudly if no budget is free. When set, it's an explicit upper bound the auto-cap further bounds — it never raises --bulk-parallelism. Inert against a target that declares no connection-budget probe — SQLite/D1 and the trigger-CDC targets; MySQL and Postgres both probe (the ADR-0118 INERT-FLAG WARN names the case)." default:"0" placeholder:"N"`
 
 	ReapStaleBackends bool `help:"Terminate sluice's OWN orphaned backends on the target during the cold-start preflight (connection-resilience Phase 2, item 2). Detection runs ALWAYS and reports loudly; this flag authorises pg_terminate_backend on each orphan. An orphan is a backend whose application_name carries the 'sluice/' prefix, owned by the connecting role, NOT the current session, and either idle-in-transaction or holding a lock on a relation sluice is about to write — typically a SIGKILL'd / OOM'd prior run whose server-side COPY backend still holds a target-table lock and a connection slot. Default off — detect-and-report is the safe baseline, because a legitimately-running concurrent sluice process on the same target is a real possibility (the report is shown first so you can tell them apart). Termination is always scoped to your own sluice backends; it never touches another role's or a non-sluice session, and needs no superuser grant. Inert against engines without a backend model (MySQL target)."`
 
@@ -661,6 +661,8 @@ func (m *MigrateCmd) resolveEngines(ctx context.Context, g *Globals, cfg *config
 	if err != nil {
 		return nil, nil, cleanup, fmt.Errorf("--target-driver: %w", err)
 	}
+	// ADR-0118 inert-flag WARN (by argv spelling; see inertFlagRegistry).
+	warnInertFlags(ctx, "migrate", m.SourceDriver, m.TargetDriver)
 
 	// --infer-types is SQLite/D1/flat-file-only (ADR-0144, ADR-0163). Refuse
 	// loudly here — before any DSN dialing — against any other source;
@@ -1344,7 +1346,7 @@ type SyncStartCmd struct {
 
 	RawCopyFormat string `help:"FAST cold-start (ADR-0079, same-engine PG→PG) only: wire format for the raw-copy passthrough fast lane (ADR-0078). 'text' (default) is cross-major safe; 'binary' is used only when source and target server majors match (downgrades to text loudly otherwise); 'auto' requests binary. The lane engages ONLY for a no-transform copy (no --redact / --type-override / --expr-override / --inject-shard-column). Inert on MySQL/VStream sources (no raw-copy lane there)." default:"text" enum:"text,binary,auto" placeholder:"text|binary|auto"`
 
-	MaxTargetConnections int `help:"Explicit ceiling on the target connection budget (connection-resilience item 4). On cold-start, sluice probes the target's connection-slot budget (Postgres max_connections / role / database limits minus in-use and a small reserve) and refuses loudly if no slot is free for the copy + CDC connections. 0 (default) = auto (probe-and-refuse-on-exhaustion, no operator ceiling). On the ADR-0079 FAST cold-start (PG source) it also bounds the cross-table × within-table copy + index-build connection product (plus the reserved CDC slot); on the serial cold-start it's the loud-refusal floor plus an explicit ceiling. Inert against engines without a connection-slot model (MySQL target)." default:"0" placeholder:"N"`
+	MaxTargetConnections int `help:"Explicit ceiling on the target connection budget (connection-resilience item 4). On cold-start, sluice probes the target's connection-slot budget (Postgres max_connections / role / database limits minus in-use and a small reserve) and refuses loudly if no slot is free for the copy + CDC connections. 0 (default) = auto (probe-and-refuse-on-exhaustion, no operator ceiling). On the ADR-0079 FAST cold-start (PG source) it also bounds the cross-table × within-table copy + index-build connection product (plus the reserved CDC slot); on the serial cold-start it's the loud-refusal floor plus an explicit ceiling. Inert against a target that declares no connection-budget probe — SQLite/D1 and the trigger-CDC targets; MySQL and Postgres both probe (the ADR-0118 INERT-FLAG WARN names the case)." default:"0" placeholder:"N"`
 
 	ReapStaleBackends bool `help:"Terminate sluice's OWN orphaned backends on the target during the cold-start preflight (connection-resilience Phase 2, item 2). Detection runs ALWAYS and reports loudly; this flag authorises pg_terminate_backend on each orphan. An orphan is a backend whose application_name carries the 'sluice/' prefix, owned by the connecting role, NOT the current session, and either idle-in-transaction or holding a lock on a relation sluice is about to write — typically a SIGKILL'd / OOM'd prior run whose server-side COPY backend still holds a target-table lock and a connection slot. Default off — detect-and-report is the safe baseline, because a legitimately-running concurrent sluice process on the same target is a real possibility (the report is shown first so you can tell them apart). Termination is always scoped to your own sluice backends; it never touches another role's or a non-sluice session, and needs no superuser grant. Inert against engines without a backend model (MySQL target)."`
 
@@ -2394,8 +2396,8 @@ func (s *SyncStartCmd) resolveEngines(ctx context.Context, g *Globals) (source, 
 	}
 
 	// The inert-flag WARN detects by the literal argv spelling, not the
-	// resolved value — see warnInertParallelismFlags.
-	warnInertParallelismFlags(kongContext(), source)
+	// resolved value — see warnInertFlags / inertFlagRegistry.
+	warnInertFlags(ctx, "sync start", s.SourceDriver, s.TargetDriver)
 
 	// Precedence is unchanged: the per-source DSN param still wins over
 	// these defaults inside each engine.
@@ -2559,6 +2561,7 @@ func (s *SyncStatusCmd) Run(g *Globals) error {
 	if err != nil {
 		return fmt.Errorf("--target-driver: %w", err)
 	}
+	warnInertFlags(ctx, "sync status", "", s.TargetDriver)
 	if target, err = applyControlKeyspace(ctx, target, s.ControlKeyspace, s.Target); err != nil {
 		return err
 	}
@@ -2657,6 +2660,7 @@ func (s *SyncStopCmd) Run(_ *Globals) error {
 	}
 
 	ctx := kongContext()
+	warnInertFlags(ctx, "sync stop", "", s.TargetDriver)
 	if target, err = applyControlKeyspace(ctx, target, s.ControlKeyspace, s.Target); err != nil {
 		return err
 	}

@@ -124,6 +124,7 @@ func (s *SyncHealthCmd) Run(_ *Globals) error {
 	defer func() { _ = finalize(runErr) }()
 
 	ctx := kongContext()
+	warnInertFlags(ctx, "sync health", s.SourceDriver, s.TargetDriver)
 	if target, err = applyControlKeyspace(ctx, target, s.ControlKeyspace, s.Target); err != nil {
 		return operationalError{err: err}
 	}

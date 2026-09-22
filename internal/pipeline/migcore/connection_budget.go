@@ -55,7 +55,8 @@ func ResolveTargetCopyParallelism(
 ) (int, ir.ConnectionBudget, error) {
 	prober, ok := target.(ir.TargetConnectionBudgetProber)
 	if !ok {
-		// Engine has no connection-slot model (today: MySQL). The budget
+		// Engine has no connection-slot model (today: SQLite/D1 and the
+		// trigger-CDC targets; MySQL and Postgres both probe). The budget
 		// step is a no-op; the requested parallelism stands.
 		return requested, ir.ConnectionBudget{}, nil
 	}

@@ -74,6 +74,7 @@ func (s *SyncDecommissionCmd) Run(_ *Globals) error {
 	}
 
 	ctx := kongContext()
+	warnInertFlags(ctx, "sync decommission", s.SourceDriver, s.TargetDriver)
 	if target, err = applyControlKeyspace(ctx, target, s.ControlKeyspace, s.Target); err != nil {
 		return err
 	}
