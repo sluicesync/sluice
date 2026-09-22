@@ -175,6 +175,22 @@ func emitColumnDef(c *ir.Column, role pkColumnRole) (string, error) {
 			slog.String("column", c.Name),
 		)
 	}
+	// A Postgres identity's ALWAYS mode and sequence options (gap census
+	// 2026-09-22 S4/S5) have no SQLite form: the rowid alias accepts
+	// explicit values and always steps by one. Said once per column here
+	// rather than dropped silently — same placement rule as the ON UPDATE
+	// WARN above, ahead of the two success paths.
+	if c.Identity.LostOnEngineWithoutIdentityAxis() {
+		slog.Warn(
+			"sqlite: IDENTITY-OPTIONS-NOT-CARRIED: source identity column's GENERATED ALWAYS mode and/or sequence options "+
+				"(START/INCREMENT/MINVALUE/CACHE/CYCLE) have no SQLite equivalent; the column lands as a rowid alias that "+
+				"accepts explicit values and steps by one",
+			slog.String("column", c.Name),
+			slog.Bool("always", c.Identity.Always),
+			slog.Int64("increment", c.Identity.Increment),
+			slog.Int64("start", c.Identity.Start),
+		)
+	}
 	typeStr, err := emitColumnType(c.Type)
 	if err != nil {
 		return "", fmt.Errorf("sqlite: column %q: %w", c.Name, err)

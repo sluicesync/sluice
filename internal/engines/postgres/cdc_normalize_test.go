@@ -326,6 +326,26 @@ func TestNormalizeForCDCComparison_PG(t *testing.T) {
 		}
 	})
 
+	t.Run("Identity_zeroed_gc3", func(t *testing.T) {
+		// pgoutput carries no identity_generation and no sequence
+		// options; the cold-start SchemaReader populates Column.Identity
+		// on every identity column (GC-3) while projectRelation leaves
+		// it nil. Without this zeroing every identity column would read
+		// as altered on every CDC boundary — the Bug 86 shape again.
+		in := &ir.Table{
+			Columns: []*ir.Column{
+				{Name: "id", Type: ir.Integer{Width: 64, AutoIncrement: true}, Identity: &ir.IdentityOptions{Always: true, Start: 1, Increment: 10, MinValue: 1, MaxValue: 1 << 62, Cache: 1}},
+			},
+		}
+		out := eng.NormalizeForCDCComparison(in)
+		if out.Columns[0].Identity != nil {
+			t.Errorf("Identity = %+v; want nil (pgoutput RelationMessage cannot carry identity_generation or pg_sequence options)", *out.Columns[0].Identity)
+		}
+		if in.Columns[0].Identity == nil {
+			t.Error("input Identity was mutated; normalizer must return a new struct")
+		}
+	})
+
 	t.Run("Comment_zeroed_bug86", func(t *testing.T) {
 		// pgoutput's RelationMessage does not carry pg_description.
 		in := &ir.Table{

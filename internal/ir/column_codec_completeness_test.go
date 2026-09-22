@@ -122,6 +122,7 @@ func TestColumnCodecRoundTripsEveryWireField(t *testing.T) {
 		GeneratedStored:          true,
 		GeneratedExprDialect:     "mysql",
 		OnUpdateCurrentTimestamp: true,
+		Identity:                 &IdentityOptions{Always: true, Start: 3, Increment: 10, MinValue: 1, MaxValue: 1000, Cache: 50, Cycle: true},
 	}
 
 	wireT := reflect.TypeOf(columnWire{})

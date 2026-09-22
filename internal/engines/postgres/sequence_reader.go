@@ -19,9 +19,11 @@ import (
 // first-class schema object sluice must carry:
 //
 //   - IDENTITY-backed (pg_depend deptype 'i'): implicit storage for a
-//     `GENERATED ... AS IDENTITY` column. Never surfaced — the column
-//     itself carries Integer.AutoIncrement and the writer re-emits the
-//     identity clause.
+//     `GENERATED ... AS IDENTITY` column. Never surfaced as a Sequence
+//     object — the column itself carries Integer.AutoIncrement and the
+//     writer re-emits the identity clause — but its OPTIONS ride on
+//     [ir.Column.Identity] (gap census 2026-09-22 S5) so the re-emitted
+//     clause reproduces them.
 //   - serial-backed (deptype 'a', factory-default options, referenced
 //     ONLY by its owning column's default): the classic
 //     `SERIAL`/`BIGSERIAL` shape. sluice deliberately modernizes these
@@ -55,15 +57,20 @@ type pgSequenceRef struct {
 }
 
 // readSequences loads every user sequence in the bound schema and
-// splits them into the standalone set (returned as IR, sorted by
-// name — the catalog query orders by relname) and the
-// serial-collapsible map consumed by populateColumns' auto-increment
-// classification (sequence name → owning column). Identity-backed and
-// extension-owned sequences are skipped entirely.
-func (r *SchemaReader) readSequences(ctx context.Context) ([]*ir.Sequence, map[string]pgSequenceOwner, error) {
+// splits them three ways: the standalone set (returned as IR, sorted by
+// name — the catalog query orders by relname), the serial-collapsible
+// map consumed by populateColumns' auto-increment classification
+// (sequence name → owning column), and the identity-backed map (owning
+// column → the sequence's options), which populateColumns carries onto
+// [ir.Column.Identity]. Before the gap-census S5 fix the identity
+// sequences were skipped outright, so a `GENERATED … AS IDENTITY
+// (INCREMENT 10 START 3)` re-created on the target with factory
+// options — a sharded-ID scheme silently became `INCREMENT 1`.
+// Extension-owned sequences are skipped entirely.
+func (r *SchemaReader) readSequences(ctx context.Context) (standalone []*ir.Sequence, serial map[string]pgSequenceOwner, identity map[pgSequenceOwner]ir.IdentityOptions, err error) {
 	extMembers, err := r.extensionMemberRelations(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	// One row per sequence: options from pg_sequence, plus the owning
@@ -96,7 +103,7 @@ func (r *SchemaReader) readSequences(ctx context.Context) ([]*ir.Sequence, map[s
 
 	rows, err := r.catalogQuery(ctx, q, r.schema)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	defer func() { _ = rows.Close() }()
 
@@ -108,6 +115,7 @@ func (r *SchemaReader) readSequences(ctx context.Context) ([]*ir.Sequence, map[s
 		ownerCol string
 	}
 	var seqs []seqRow
+	identity = map[pgSequenceOwner]ir.IdentityOptions{}
 	for rows.Next() {
 		var (
 			name, dataType                     string
@@ -120,11 +128,23 @@ func (r *SchemaReader) readSequences(ctx context.Context) ([]*ir.Sequence, map[s
 			&start, &increment, &minv, &maxv, &cch, &cycle,
 			&deptype, &ownerNS, &ownerT, &ownerCol,
 		); err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		// Identity-backed sequences are implicit column storage; the
-		// identity clause re-creates them on the target.
+		// identity clause re-creates them on the target — WITH their
+		// options, which is why they are captured here (keyed by the
+		// owning column; an identity sequence always lives in its
+		// table's schema, and the reader is bound to one schema) rather
+		// than skipped as they were before the S5 fix.
 		if deptype == "i" {
+			identity[pgSequenceOwner{table: ownerT, column: ownerCol}] = ir.IdentityOptions{
+				Start:     start,
+				Increment: increment,
+				MinValue:  minv,
+				MaxValue:  maxv,
+				Cache:     cch,
+				Cycle:     cycle,
+			}
 			continue
 		}
 		// Bug 96 discipline: extension-owned sequences belong to the
@@ -151,19 +171,18 @@ func (r *SchemaReader) readSequences(ctx context.Context) ([]*ir.Sequence, map[s
 		})
 	}
 	if err := rows.Err(); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if len(seqs) == 0 {
-		return nil, nil, nil
+		return nil, nil, identity, nil
 	}
 
 	refs, err := r.readSequenceDefaultRefs(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
-	var standalone []*ir.Sequence
-	serial := map[string]pgSequenceOwner{}
+	serial = map[string]pgSequenceOwner{}
 	for _, sr := range seqs {
 		if r.isSerialCollapsible(sr.seq, sr.deptype, sr.ownerNS, sr.ownerTbl, sr.ownerCol, refs[sr.seq.Name]) {
 			serial[sr.seq.Name] = pgSequenceOwner{table: sr.ownerTbl, column: sr.ownerCol}
@@ -179,11 +198,11 @@ func (r *SchemaReader) readSequences(ctx context.Context) ([]*ir.Sequence, map[s
 			sr.seq.OwnedByColumn = sr.ownerCol
 		}
 		if err := r.readSequencePosition(ctx, sr.seq); err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		standalone = append(standalone, sr.seq)
 	}
-	return standalone, serial, nil
+	return standalone, serial, identity, nil
 }
 
 // readSequenceDefaultRefs maps each sequence name in the bound schema

@@ -546,6 +546,13 @@ type columnWire struct {
 	// the schema and restore rebuilds from it, so a field missing here is
 	// schema loss on the restore path (audit 2026-08-01 S7).
 	OnUpdateCurrentTimestamp bool `json:"on_update_current_timestamp,omitempty"`
+	// Identity rides the wire for the same reason (gap census 2026-09-22
+	// S4/S5): a restore that lost it would re-create every ALWAYS
+	// identity as BY DEFAULT and every sharded `INCREMENT 10` identity as
+	// `INCREMENT 1`. Append-only: a manifest written before the field
+	// decodes nil, which the Postgres writer renders exactly as the
+	// writing binary did (TestUnmarshalColumn_OldWireLeavesIdentityNil).
+	Identity *IdentityOptions `json:"identity,omitempty"`
 }
 
 // MarshalJSON for [Column] emits the tagged-union envelope for Type
@@ -565,6 +572,7 @@ func (c *Column) MarshalJSON() ([]byte, error) {
 		GeneratedExprDialect: c.GeneratedExprDialect,
 
 		OnUpdateCurrentTimestamp: c.OnUpdateCurrentTimestamp,
+		Identity:                 c.Identity,
 	}
 	tb, err := MarshalType(c.Type)
 	if err != nil {
@@ -602,6 +610,7 @@ func (c *Column) UnmarshalJSON(b []byte) error {
 	c.GeneratedStored = w.GeneratedStored
 	c.GeneratedExprDialect = w.GeneratedExprDialect
 	c.OnUpdateCurrentTimestamp = w.OnUpdateCurrentTimestamp
+	c.Identity = w.Identity
 	t, err := UnmarshalType(w.Type)
 	if err != nil {
 		return fmt.Errorf("column %q type: %w", w.Name, err)

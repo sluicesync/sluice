@@ -686,6 +686,15 @@ func (w *recordingSchemaWriter) CreateViews(context.Context, *ir.Schema) error {
 	return nil
 }
 
+// RestoreIdentityGeneration implements ir.IdentityGenerationRestorer so the
+// GC-3 post-copy phase tests can assert its position. Existing exact-phase-
+// list tests are unaffected: the pipeline dispatches it only when the schema
+// carries a GENERATED ALWAYS identity column, and sampleSchema has none.
+func (w *recordingSchemaWriter) RestoreIdentityGeneration(context.Context, *ir.Schema) error {
+	*w.phaseLog = append(*w.phaseLog, "RestoreIdentityGeneration")
+	return nil
+}
+
 // AnalyzeTable implements ir.TableAnalyzer so the --analyze-after phase
 // tests can assert its position. Existing exact-phase-list tests are
 // unaffected: the phase only runs when Migrator.AnalyzeAfter is set.

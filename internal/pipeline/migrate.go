@@ -1021,16 +1021,9 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 		return m.rowFilterFKOrphanRefusal(sw, schema, err, err)
 	}
 
-	// Roadmap item 109: any FK the constraints phase added metadata-only (the
-	// statement-wall recovery under foreign_key_checks=0) skipped InnoDB's
-	// child-row validation. PROVE those child rows actually satisfy the FK with
-	// a bounded chunked orphan scan — recovering the loud-failure signal without
-	// re-incurring the wall. No-op unless a metadata-only add happened (an armed
-	// VStream migrate whose FK walled); a violation drops the FK and refuses
-	// (SLUICE-E-FK-SOURCE-ORPHAN). The constraints phase re-runs idempotently on
-	// --resume, so a refusal re-derives deterministically rather than a resume
-	// silently completing with the FK absent.
-	if err := m.verifyUnvalidatedForeignKeys(ctx, sw, schema); err != nil {
+	// Post-copy gates: the item-109 FK orphan proof, then the GC-3
+	// GENERATED ALWAYS restore (migrate only, last) — see [Migrator.postCopyGates].
+	if err := m.postCopyGates(ctx, rc, state, sw, schema, createSchema); err != nil {
 		return err
 	}
 

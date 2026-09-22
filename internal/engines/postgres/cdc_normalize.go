@@ -142,6 +142,11 @@ func (Engine) NormalizeForCDCComparison(t *ir.Table) *ir.Table {
 		newCol.Nullable = false
 		newCol.Default = nil
 		newCol.Comment = ""
+		// Column.Identity (GC-3) is catalog-only, like the AutoIncrement
+		// bit normalizeTypeForCDCComparison zeroes: pgoutput carries no
+		// identity_generation and no sequence options, so the projection
+		// always has nil and the seed must match it.
+		newCol.Identity = nil
 		out.Columns = append(out.Columns, &newCol)
 	}
 	// ADR-0065 (task #22 CHECK sub-shape): pgoutput's RelationMessage

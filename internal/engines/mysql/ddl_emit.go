@@ -981,6 +981,25 @@ func (m mysqlEmitter) emitColumnDef(tableName string, c *ir.Column) (string, err
 		return "", fmt.Errorf("mysql: column %q: %w", c.Name, err)
 	}
 
+	// A Postgres identity's ALWAYS mode and sequence options (gap census
+	// 2026-09-22 S4/S5) have no MySQL form: AUTO_INCREMENT accepts
+	// explicit values, and its step is the server-wide
+	// auto_increment_increment/offset pair, not a column attribute. Said
+	// once per column here rather than dropped silently; the emit itself
+	// is the plain AUTO_INCREMENT emitIntegerType always rendered.
+	if c.Identity.LostOnEngineWithoutIdentityAxis() {
+		slog.Warn(
+			"mysql: IDENTITY-OPTIONS-NOT-CARRIED: source identity column's GENERATED ALWAYS mode and/or sequence options "+
+				"(START/INCREMENT/MINVALUE/CACHE/CYCLE) have no MySQL equivalent; the column lands as a plain AUTO_INCREMENT that "+
+				"accepts explicit values and steps by the server's auto_increment_increment",
+			slog.String("table", tableName),
+			slog.String("column", c.Name),
+			slog.Bool("always", c.Identity.Always),
+			slog.Int64("increment", c.Identity.Increment),
+			slog.Int64("start", c.Identity.Start),
+		)
+	}
+
 	var sb strings.Builder
 	sb.WriteString(quoteIdent(c.Name))
 	sb.WriteByte(' ')

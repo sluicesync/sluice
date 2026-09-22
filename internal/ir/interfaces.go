@@ -2792,6 +2792,29 @@ type TableAnalyzer interface {
 	AnalyzeTable(ctx context.Context, table *Table) error
 }
 
+// IdentityGenerationRestorer is the OPTIONAL surface a [SchemaWriter]
+// implements when its target has an identity-generation axis the bulk
+// copy had to relax (gap census 2026-09-22 S4). Postgres creates every
+// `GENERATED ALWAYS AS IDENTITY` column as `BY DEFAULT` so COPY can land
+// the source's ids; RestoreIdentityGeneration puts ALWAYS back on every
+// column whose [Column.Identity] says the source had it, after every
+// row-writing phase is done.
+//
+// The orchestrator calls it from `migrate` ONLY, and the reason is a
+// property of the OTHER paths rather than of migrate: a `sync` cold
+// start, a `restore` and a chain restore each hand the target to a
+// change applier that writes explicit ids (CDC rows, incremental links),
+// which an ALWAYS column refuses with SQLSTATE 428C9 — so on those paths
+// the target must stay BY DEFAULT, and the writer's once-per-run WARN
+// (IDENTITY-ALWAYS-DOWNGRADED) is the operator's signal that it did.
+// Engines with no such axis (MySQL AUTO_INCREMENT, SQLite's rowid alias)
+// do not implement the surface and the phase is skipped.
+//
+// Must be idempotent: migrate re-runs it on `--resume`.
+type IdentityGenerationRestorer interface {
+	RestoreIdentityGeneration(ctx context.Context, s *Schema) error
+}
+
 // TableScoper is the optional surface a [SchemaReader] can implement
 // to accept the operator's table filter *before* the schema scan, so
 // per-column type validation is scoped to the tables that will

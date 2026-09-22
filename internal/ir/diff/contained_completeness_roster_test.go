@@ -221,6 +221,11 @@ var columnFieldExempt = map[string]string{
 		"first: PG/SQLite targets cannot hold the attribute and sluice's own emit WARNs-and-drops it there, so a bare comparison would report " +
 		"irreconcilable drift on every MySQL→PG diff, get suppressed, and hide real drift alongside it. Filed in docs/dev/audit-backlog.md " +
 		"(G-6 follow-on entry)",
+	"Identity": "NOT COMPARED — a NAMED GAP of the OnUpdateCurrentTimestamp shape (gap census 2026-09-22 S4/S5): `schema diff` cannot tell an " +
+		"operator that a target identity is BY DEFAULT where the source is ALWAYS, or that its sequence options differ. A bare comparison " +
+		"would report DELIBERATE, documented state as drift on every path but migrate — sync cold start, restore and chain restore keep " +
+		"BY DEFAULT on purpose (their appliers write explicit ids), and MySQL/SQLite targets cannot hold the axis at all — so it needs the " +
+		"same target-cannot-hold suppression first. The runtime signal is the writer's once-per-run IDENTITY-ALWAYS-DOWNGRADED WARN",
 	"GeneratedStored": "STORED vs VIRTUAL computes the same values from the same expression — a storage/latency property that cannot change " +
 		"which rows are legal or what they contain, same class as the index Kind/Method exemption on IndexDiff",
 	"GeneratedExprDialect": "a provenance tag on the expression TEXT, not a schema property: the expected side is dialect-tagged by the " +

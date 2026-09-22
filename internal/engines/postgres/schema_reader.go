@@ -332,7 +332,7 @@ func (r *SchemaReader) ReadSchema(ctx context.Context) (*ir.Schema, error) {
 	// references the factory-default sequence owned by exactly that
 	// column; every other nextval() shape keeps its expression default
 	// and the sequence is carried in Schema.Sequences.
-	sequences, serialSeqs, err := r.readSequences(ctx)
+	sequences, serialSeqs, identitySeqs, err := r.readSequences(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: read sequences: %w", err)
 	}
@@ -376,7 +376,7 @@ func (r *SchemaReader) ReadSchema(ctx context.Context) (*ir.Schema, error) {
 			return nil, fmt.Errorf("postgres: read domain checks: %w", err)
 		}
 
-		if err := r.populateColumns(ctx, tables, enumValues, geomInfo, geogInfo, domainChecks, serialSeqs); err != nil {
+		if err := r.populateColumns(ctx, tables, enumValues, geomInfo, geogInfo, domainChecks, serialSeqs, identitySeqs); err != nil {
 			return nil, fmt.Errorf("postgres: read columns: %w", err)
 		}
 		if err := r.populateIndexes(ctx, tables); err != nil {
@@ -1086,7 +1086,7 @@ func isUndefinedRelationErr(err error) bool {
 // server_encoding is global — so the Charset field on the IR types
 // stays empty for PG sources. MySQL writers accept that as "use the
 // table / database default."
-func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*ir.Table, enumValues map[string][]string, geomInfo, geogInfo map[string]geometryColumnInfo, domainChecks map[string][]ir.DomainCheck, serialSeqs map[string]pgSequenceOwner) error {
+func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*ir.Table, enumValues map[string][]string, geomInfo, geogInfo map[string]geometryColumnInfo, domainChecks map[string][]ir.DomainCheck, serialSeqs map[string]pgSequenceOwner, identitySeqs map[pgSequenceOwner]ir.IdentityOptions) error {
 	// COALESCE(a.atttypmod, -1) supplies the per-column typmod for
 	// extension-owned types whose modifiers ride on atttypmod
 	// (pgvector dimension; future PostGIS subtype/SRID). -1 is the
@@ -1155,7 +1155,12 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 			-- schema reader was the one door that did not, and it
 			-- carried every VIRTUAL column as STORED on a written false
 			-- premise.
-			` + generatedStorageClassExpr(version) + ` AS att_generated
+			` + generatedStorageClassExpr(version) + ` AS att_generated,
+			-- GC-3 (gap census S4): the identity column's generation mode,
+			-- 'ALWAYS' or 'BY DEFAULT', which is_identity collapses to a
+			-- bool. Read here so the writer can say which ALWAYS columns it
+			-- lands as BY DEFAULT and migrate can restore them after the copy.
+			COALESCE(c.identity_generation, '') AS identity_generation
 		FROM   information_schema.columns c
 		-- The namespace is joined rather than looked up by a scalar
 		-- subquery in the ON clause. The subquery form was CORRELATED (on
@@ -1209,6 +1214,7 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 			&cr.columnTypeKind,
 			&cr.columnTypeName,
 			&cr.attGenerated,
+			&cr.identityGeneration,
 		); err != nil {
 			return err
 		}
@@ -1224,6 +1230,7 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 			geogInfo:     geogInfo,
 			domainChecks: domainChecks,
 			serialSeqs:   serialSeqs,
+			identitySeqs: identitySeqs,
 		})
 		if err != nil {
 			return err
@@ -1262,6 +1269,9 @@ type columnRow struct {
 	// VIRTUAL (PG 18+), '' for a plain column — or for every column on
 	// a pre-12 server, where the catalog column is version-gated out.
 	attGenerated string
+	// identityGeneration is information_schema.columns.identity_generation:
+	// 'ALWAYS', 'BY DEFAULT', or '' for a non-identity column.
+	identityGeneration string
 }
 
 // pg_attribute.attgenerated values. PG 12–17 only ever write 's'; PG 18
@@ -1294,6 +1304,7 @@ type columnLookups struct {
 	geogInfo     map[string]geometryColumnInfo
 	domainChecks map[string][]ir.DomainCheck
 	serialSeqs   map[string]pgSequenceOwner
+	identitySeqs map[pgSequenceOwner]ir.IdentityOptions
 }
 
 // columnFromRow translates one scanned catalog row into an [ir.Column]:
@@ -1579,6 +1590,29 @@ func (r *SchemaReader) columnFromRow(cr columnRow, lk columnLookups) (*ir.Column
 		col.GeneratedExpr = genExpr
 		col.GeneratedStored = cr.attGenerated != pgAttGeneratedVirtual
 		col.GeneratedExprDialect = dialectName
+	}
+
+	// GC-3 (gap census S4 + S5): an identity column carries its
+	// generation mode and its backing sequence's options on
+	// Column.Identity, beside the AutoIncrement bit is_identity collapses
+	// to. The options come from readSequences' identity map; a column
+	// PostgreSQL calls an identity column without a deptype='i' sequence
+	// behind it is a catalog sluice does not understand, and refusing is
+	// what keeps a zero-valued IdentityOptions (rendered as `START WITH 0
+	// INCREMENT BY 0`) from ever reaching a target. SERIAL columns that
+	// classifyAutoIncrement modernizes to identity keep Identity nil:
+	// their sequence is serial-collapsible by definition (factory
+	// options), and BY DEFAULT is what a serial always was.
+	if strings.EqualFold(isIdentity, "YES") {
+		opts, ok := lk.identitySeqs[pgSequenceOwner{table: tableName, column: colName}]
+		if !ok {
+			return nil, fmt.Errorf("postgres: column %s.%s is an identity column (is_identity = YES, identity_generation = %q) "+
+				"but no identity-backed sequence (pg_depend deptype 'i') was found for it in schema %q; "+
+				"refusing to carry the column with guessed sequence options",
+				tableName, colName, cr.identityGeneration, r.schema)
+		}
+		opts.Always = strings.EqualFold(cr.identityGeneration, "ALWAYS")
+		col.Identity = &opts
 	}
 	return col, nil
 }
