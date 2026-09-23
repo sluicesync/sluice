@@ -4,6 +4,11 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Corrected
+
+**Correction (Bug 287): the wrong-DEFAULT fixes in v0.155.1 (Bug 286) and v0.156.0 (GC-29) also left rows ALREADY ON THE TARGET silently wrong, and their notes said those rows were intact.** When the forwarded `ADD COLUMN` ran on a Postgres target, Postgres filled every existing row with the column's DEFAULT — the wrong one. The source filled its own existing rows with the declared DEFAULT, but that fill writes no binlog row event, so CDC never corrected the target's copy. Measured by the v0.156.0 regression cycle: on v0.155.1 a forwarded `VARBINARY(4) DEFAULT 0xFF00` / `BINARY(3) DEFAULT 0xFF00AA` left the pre-existing target rows at `ff` / `ff0000` against the source's `ff00` / `ff00aa`; on v0.155.0 a MariaDB source left them holding the four-character string `NULL` and `'abc'` with its quotes. Rows written after the `ADD COLUMN` carry explicit values and were correct, as stated; the sentences "Rows are intact" and "Replicated rows were always correct" were wrong about the rows that already existed. **If you were affected** — a MariaDB binlog source that forwarded an `ADD COLUMN … DEFAULT` on v0.99.271–v0.155.0, or a MySQL binlog source that forwarded an `ADD COLUMN` with a BINARY/VARBINARY default containing a NUL byte on v0.155.1 or earlier — then besides correcting the column's DEFAULT (`ALTER TABLE … ALTER COLUMN … SET DEFAULT …`), repair that column on the rows that existed on the target when the column was added: re-copy the table, or update the column on those rows from the source's values. The target cannot tell you which rows those are by value alone, because the wrong default is also what a legitimately defaulted row would hold; compare against the source. v0.156.0 lands the declared DEFAULT, so the existing rows are filled correctly (measured, both shapes).
+
+
 ## [0.156.0] - 2026-09-23
 
 ### Changed
