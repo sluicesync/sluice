@@ -200,11 +200,13 @@ type BackupStream struct {
 	// AcceptUnforwardedSchemaChange is the one-shot acknowledgement of an
 	// UNFORWARDED-SCHEMA-CHANGE refusal a previous run recorded in
 	// stream_state.json (`--accept-unforwarded-schema-change`). Without it
-	// Run refuses before the CDC pump opens; with it the record is dropped
-	// by the initial state write and the reader takes a fresh baseline.
-	// Zero-value safe: false keeps refusing. See
+	// Run refuses before the CDC pump opens; with the recorded refusal's
+	// fingerprint (printed in the refusal) the record is dropped by the
+	// initial state write and the reader takes a fresh baseline. A value that
+	// names a different refusal is refused. Zero-value safe: empty keeps
+	// refusing. See
 	// [BackupStream.refuseRecordedUnforwardedChange].
-	AcceptUnforwardedSchemaChange bool
+	AcceptUnforwardedSchemaChange string
 
 	// RolloverHook is an optional shell command invoked after each
 	// rollover commits successfully. The hook receives env vars

@@ -31,11 +31,18 @@ func engineRefusal(what string) error {
 // persisted-refusal surface; every other method panics via the nil embed.
 type fakeRefusalStore struct {
 	ir.ChangeApplier
-	msg      string
-	has      bool
-	readErr  error
-	cleared  int
-	recorded []string
+	msg       string
+	has       bool
+	readErr   error
+	cleared   int
+	recorded  []string
+	ensureErr error
+	ensured   int
+}
+
+func (f *fakeRefusalStore) EnsureUnforwardedRefusalStorage(context.Context) error {
+	f.ensured++
+	return f.ensureErr
 }
 
 func (f *fakeRefusalStore) RecordUnforwardedRefusal(_ context.Context, _, msg string) error {
@@ -117,14 +124,14 @@ func TestStreamerUnforwardedDoor_ZeroValueRefuses(t *testing.T) {
 // Streamer restarted after a new refusal refuses again.
 func TestStreamerUnforwardedDoor_AckClearsAndIsConsumed(t *testing.T) {
 	store := &fakeRefusalStore{msg: "UNFORWARDED-SCHEMA-CHANGE: recorded", has: true}
-	s := &Streamer{AcceptUnforwardedSchemaChange: true}
+	s := &Streamer{AcceptUnforwardedSchemaChange: unforwardedRefusalFingerprint(store.msg)}
 	if err := s.phaseRefuseRecordedUnforwardedChange(context.Background(), store, "s1"); err != nil {
 		t.Fatalf("acknowledged start refused: %v", err)
 	}
 	if store.cleared != 1 || store.has {
 		t.Fatalf("acknowledged start did not clear the record (cleared=%d has=%v)", store.cleared, store.has)
 	}
-	if s.AcceptUnforwardedSchemaChange {
+	if s.AcceptUnforwardedSchemaChange != "" {
 		t.Error("the acknowledgement was not consumed")
 	}
 	store.msg, store.has = "UNFORWARDED-SCHEMA-CHANGE: a second one", true
@@ -137,7 +144,7 @@ func TestStreamerUnforwardedDoor_AckClearsAndIsConsumed(t *testing.T) {
 // store; a read failure refuses rather than starting unchecked.
 func TestStreamerUnforwardedDoor_NothingRecorded(t *testing.T) {
 	store := &fakeRefusalStore{}
-	if err := (&Streamer{AcceptUnforwardedSchemaChange: true}).phaseRefuseRecordedUnforwardedChange(context.Background(), store, "s1"); err != nil {
+	if err := (&Streamer{AcceptUnforwardedSchemaChange: "0123456789ab"}).phaseRefuseRecordedUnforwardedChange(context.Background(), store, "s1"); err != nil {
 		t.Fatalf("no record, yet refused: %v", err)
 	}
 	if store.cleared != 0 {
@@ -242,7 +249,7 @@ func TestBackupStream_UnforwardedRefusalSurvivesARestart(t *testing.T) {
 	parent.BackupID = irbackup.ComputeBackupID(parent)
 	writeParentFullManifest(t, store, parent)
 
-	newStream := func(src *refusingCDCEngine, ack bool) *BackupStream {
+	newStream := func(src *refusingCDCEngine, ack string) *BackupStream {
 		return &BackupStream{
 			Source:                        src,
 			SourceDSN:                     "src",
@@ -260,7 +267,7 @@ func TestBackupStream_UnforwardedRefusalSurvivesARestart(t *testing.T) {
 	}
 
 	first := src(true)
-	if err := newStream(first, false).Run(context.Background()); !errors.Is(err, ir.ErrUnforwardedSchemaChange) {
+	if err := newStream(first, "").Run(context.Background()); !errors.Is(err, ir.ErrUnforwardedSchemaChange) {
 		t.Fatalf("first run: %v; want the refusal", err)
 	}
 	state, err := readStreamState(context.Background(), store, DefaultStreamStateFilename)
@@ -269,7 +276,7 @@ func TestBackupStream_UnforwardedRefusalSurvivesARestart(t *testing.T) {
 	}
 
 	restarted := src(false)
-	err = newStream(restarted, false).Run(context.Background())
+	err = newStream(restarted, "").Run(context.Background())
 	if !errors.Is(err, ir.ErrUnforwardedSchemaChange) || !strings.Contains(err.Error(), unforwardedRefusalAckFlag) ||
 		!strings.Contains(err.Error(), "take a new full backup") {
 		t.Fatalf("restart without the acknowledgement: %v; want the recorded refusal replayed", err)
@@ -281,8 +288,16 @@ func TestBackupStream_UnforwardedRefusalSurvivesARestart(t *testing.T) {
 		t.Fatal("a refusing restart dropped the record")
 	}
 
+	wrongAck := src(false)
+	if err := newStream(wrongAck, "000000000000").Run(context.Background()); !errors.Is(err, ir.ErrUnforwardedSchemaChange) || !strings.Contains(err.Error(), "names a different refusal") {
+		t.Fatalf("restart with a mismatched fingerprint: %v; want the replay naming the mismatch", err)
+	}
+	if wrongAck.opens != 0 {
+		t.Errorf("a mismatched acknowledgement opened %d CDC reader(s)", wrongAck.opens)
+	}
+
 	acked := src(false)
-	if err := newStream(acked, true).Run(context.Background()); err != nil {
+	if err := newStream(acked, unforwardedRefusalFingerprint(state.UnforwardedRefusal)).Run(context.Background()); err != nil {
 		t.Fatalf("acknowledged restart: %v", err)
 	}
 	if acked.opens == 0 {
@@ -310,5 +325,48 @@ func TestStreamStateHeartbeat_PreservesTheRecordedRefusal(t *testing.T) {
 	got, err := readStreamState(ctx, store, path)
 	if err != nil || got == nil || got.UnforwardedRefusal != "recorded" {
 		t.Errorf("heartbeat dropped the recorded refusal: %+v (err %v)", got, err)
+	}
+}
+
+// TestStreamerUnforwardedDoor_MismatchedFingerprintRefuses pins the
+// 2026-09-23 second-pass review's finding 4: the acknowledgement is bound to
+// the refusal it names. A fingerprint of a different refusal — the shape of
+// a flag left in a systemd ExecStart that meets the NEXT refusal on the next
+// automatic restart — refuses, keeps the record, and says why.
+func TestStreamerUnforwardedDoor_MismatchedFingerprintRefuses(t *testing.T) {
+	store := &fakeRefusalStore{msg: "UNFORWARDED-SCHEMA-CHANGE: the second refusal", has: true}
+	stale := unforwardedRefusalFingerprint("UNFORWARDED-SCHEMA-CHANGE: the first refusal")
+	err := (&Streamer{AcceptUnforwardedSchemaChange: stale}).phaseRefuseRecordedUnforwardedChange(context.Background(), store, "s1")
+	if !errors.Is(err, ir.ErrUnforwardedSchemaChange) {
+		t.Fatalf("a stale acknowledgement was applied to a different refusal: %v", err)
+	}
+	for _, want := range []string{"names a different refusal", stale, unforwardedRefusalFingerprint(store.msg)} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal missing %q: %v", want, err)
+		}
+	}
+	if store.cleared != 0 || !store.has {
+		t.Error("a mismatched acknowledgement cleared the record")
+	}
+}
+
+// TestStreamerUnforwardedDoor_StorageUnavailableFailsTheStart pins the
+// docs-sweep finding: a target whose control table lacks the column and
+// cannot gain it (a `--schema-already-applied` table owned by another role,
+// a PlanetScale safe-migrations branch) must fail the START loudly. Before,
+// the start proceeded, the first refusal could not be recorded, and the
+// restart after it accepted the change silently.
+func TestStreamerUnforwardedDoor_StorageUnavailableFailsTheStart(t *testing.T) {
+	store := &fakeRefusalStore{ensureErr: errors.New("ALTER TABLE sluice_cdc_state ADD COLUMN unforwarded_refusal: must be owner of table")}
+	err := (&Streamer{}).phaseRefuseRecordedUnforwardedChange(context.Background(), store, "s1")
+	if err == nil || !strings.Contains(err.Error(), "must be owner of table") || !strings.Contains(err.Error(), "cannot record") {
+		t.Fatalf("a target that cannot record a refusal started anyway: %v", err)
+	}
+	if errors.Is(err, ir.ErrUnforwardedSchemaChange) {
+		t.Error("the storage failure wraps the refusal sentinel; the fleet would treat a configuration fault as a recorded refusal")
+	}
+	ok := &fakeRefusalStore{}
+	if err := (&Streamer{}).phaseRefuseRecordedUnforwardedChange(context.Background(), ok, "s1"); err != nil || ok.ensured != 1 {
+		t.Errorf("healthy storage: err=%v ensured=%d; want nil and one ensure", err, ok.ensured)
 	}
 }

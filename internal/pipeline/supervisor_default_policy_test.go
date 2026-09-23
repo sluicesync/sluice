@@ -25,6 +25,8 @@ import (
 	"fmt"
 	"testing"
 	"time"
+
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestSupervisor_DefaultPolicyRestartsForever pins the unreachable-terminal
@@ -99,21 +101,19 @@ type terminalTestErr struct{ msg string }
 func (e terminalTestErr) Error() string  { return e.msg }
 func (e terminalTestErr) Terminal() bool { return true }
 
-// TestSupervisor_TerminalFailureIsNotRestarted pins the 2026-09-23 pre-tag
-// review's F1: under the restart-forever default, a failure whose producer
-// asserted no retry can succeed ([ir.TerminalError]) is run ONCE and marked
-// failed. Restarting it had been at best a loop; for the
-// UNFORWARDED-SCHEMA-CHANGE refusal the restart took a fresh baseline and
-// accepted the refused change silently. The retriable twin above
-// (TestSupervisor_DefaultPolicyRestartsForever) is the control: same
-// policy, non-terminal error, restarted.
-func TestSupervisor_TerminalFailureIsNotRestarted(t *testing.T) {
+// TestSupervisor_UnforwardedRefusalIsNotRestarted pins the 2026-09-23 pre-tag
+// review's F1: under the restart-forever default, an UNFORWARDED-SCHEMA-CHANGE
+// refusal is run ONCE and marked failed — a restart could only refuse again,
+// or, had the refusal's recording failed, re-baseline and accept the change.
+// TestSupervisor_OtherTerminalFailuresAreStillRestarted is the control for
+// the scope.
+func TestSupervisor_UnforwardedRefusalIsNotRestarted(t *testing.T) {
 	var attempts int
 	refused := SupervisedSync{
 		ID: "refused",
 		Runner: runnerFunc(func(_ context.Context) error {
 			attempts++
-			return fmt.Errorf("pipeline: source cdc reader: %w", terminalTestErr{"UNFORWARDED-SCHEMA-CHANGE on public.t"})
+			return fmt.Errorf("pipeline: source cdc reader: %w", fmt.Errorf("%w on public.t: %w", ir.ErrUnforwardedSchemaChange, terminalTestErr{"refused"}))
 		}),
 	}
 	policy := RestartPolicy{BackoffBase: time.Millisecond, BackoffCap: 2 * time.Millisecond, HealthyRunThreshold: time.Hour}
@@ -129,5 +129,29 @@ func TestSupervisor_TerminalFailureIsNotRestarted(t *testing.T) {
 	snap := sup.Snapshot()
 	if len(snap) != 1 || snap[0].State != SyncFailed {
 		t.Errorf("snapshot = %+v; want the sync in state %q", snap, SyncFailed)
+	}
+}
+
+// TestSupervisor_OtherTerminalFailuresAreStillRestarted pins the SCOPE of
+// the no-restart rule. A generic [ir.TerminalError] is terminal only to the
+// in-process retry; several (a dead snapshot-pinned copy connection, an
+// in-doubt raw-copy commit) are recovered by a fresh run, which is what the
+// supervisor provides. Widening the rule to every terminal error — the first
+// cut of F1 — silently took that recovery away from fleet legs.
+func TestSupervisor_OtherTerminalFailuresAreStillRestarted(t *testing.T) {
+	var attempts int
+	sy := SupervisedSync{
+		ID: "dead-snapshot",
+		Runner: runnerFunc(func(_ context.Context) error {
+			attempts++
+			return fmt.Errorf("pipeline: copy: %w", terminalTestErr{"snapshot-pinned connection died; re-run the copy"})
+		}),
+	}
+	policy := RestartPolicy{BackoffBase: time.Millisecond, BackoffCap: 2 * time.Millisecond, HealthyRunThreshold: time.Hour}
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	_ = NewSupervisor([]SupervisedSync{sy}, policy).Run(ctx)
+	if attempts < 2 {
+		t.Errorf("a generic terminal failure was run %d time(s); want it restarted — the no-restart rule is scoped to UNFORWARDED-SCHEMA-CHANGE", attempts)
 	}
 }

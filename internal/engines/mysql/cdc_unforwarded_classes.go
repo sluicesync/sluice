@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"fmt"
 	"math/big"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -578,7 +579,7 @@ func diffTableFacts(prior, cur *mysqlTableFacts, tablesNow map[string]*mysqlTabl
 		// VALUE riding a retype (`MODIFY x BIGINT DEFAULT 7` from INT DEFAULT 5)
 		// reaches a MySQL target through MODIFY COLUMN but not a Postgres one,
 		// whose forwarded ALTER TYPE carries no DEFAULT.
-		case pc.def != cc.def && (!retyped || !sameDefaultValue(pc.def, cc.def)):
+		case pc.def != cc.def && (!retyped || !sameDefaultValue(pc.typ, cc.typ, pc.def, cc.def)):
 			deltas = append(deltas, fmt.Sprintf("ALTER COLUMN %q SET DEFAULT %s (was %s)", curName, cc.def, pc.def))
 		}
 		if pc.extra != cc.extra {
@@ -847,31 +848,51 @@ func unforwardedChangeError(schema, table string, deltas []string) error {
 		"and sluice cannot forward: %s. The target (or the backup chain) does not have this change, so continuing would leave it "+
 		"silently weaker than the source. Remedy: "+
 		"(1) apply the same change to the target yourself (for `backup stream`, take a new full backup instead); "+
-		"(2) restart with the SAME --stream-id and --accept-unforwarded-schema-change. sluice records this refusal, so a restart "+
-		"WITHOUT that flag refuses again; the flag takes a fresh baseline of these objects, so passing it WITHOUT step 1 "+
+		"(2) restart with the SAME --stream-id: sluice records this refusal, so that start refuses again and prints its "+
+		"fingerprint; start once more with --accept-unforwarded-schema-change=<that fingerprint>. The flag takes a fresh baseline "+
+		"of these objects, so passing it WITHOUT step 1 "+
 		"accepts the difference permanently and nothing will report it again",
 		unforwardedChangeMarker, schema, table, strings.Join(deltas, "; ")))
 }
 
 // sameDefaultValue reports whether two catalog renderings of a column
 // default denote the same value — the only difference a retype is allowed
-// to make to a default. Numeric spellings compare as exact rationals
-// (`0` = `0.00`, `5` = `5.0`); anything else compares as text after
-// removing one pair of surrounding single quotes (MariaDB reports string
-// defaults quoted). Anything it cannot prove equal is different, so the
-// door refuses rather than exempts.
-func sameDefaultValue(a, b string) bool {
-	unquote := func(s string) string {
-		if len(s) >= 2 && s[0] == '\'' && s[len(s)-1] == '\'' {
-			return s[1 : len(s)-1]
-		}
-		return s
-	}
-	a, b = unquote(a), unquote(b)
+// to make to a default. Identical text is the same value. Otherwise only a
+// NUMERIC column retyped to a NUMERIC column may differ in spelling, and
+// only between plain decimal literals (`0` = `0.00`, measured on MySQL 8.0):
+// `big.Rat` alone would also equate `007`/`7`, `0x61`/`0x0061`, `1/2`/`0.5`
+// and `1_000`/`1000`, and those are different defaults on a VARCHAR or a
+// VARBINARY (2026-09-23 second-pass review, finding 3). Anything it cannot
+// prove equal is different, so the door refuses rather than exempts.
+func sameDefaultValue(priorType, curType, a, b string) bool {
 	if a == b {
 		return true
+	}
+	if !numericColumnType(priorType) || !numericColumnType(curType) ||
+		!plainDecimal.MatchString(a) || !plainDecimal.MatchString(b) {
+		return false
 	}
 	ra, okA := new(big.Rat).SetString(a)
 	rb, okB := new(big.Rat).SetString(b)
 	return okA && okB && ra.Cmp(rb) == 0
+}
+
+// plainDecimal is an optionally signed decimal with an optional fraction,
+// and nothing else — no base prefix, exponent, underscore or fraction bar.
+var plainDecimal = regexp.MustCompile(`^-?\d+(\.\d+)?$`) // RE2's \d is ASCII-only
+
+// numericColumnType reports a MySQL numeric COLUMN_TYPE (`int(11)`,
+// `decimal(5,2) unsigned`, `double`, …). BIT is deliberately excluded: its
+// defaults are bit-literals, not decimals.
+func numericColumnType(columnType string) bool {
+	base := strings.ToLower(strings.TrimSpace(columnType))
+	if i := strings.IndexAny(base, "( "); i >= 0 {
+		base = base[:i]
+	}
+	switch base {
+	case "tinyint", "smallint", "mediumint", "int", "integer", "bigint",
+		"decimal", "numeric", "dec", "fixed", "float", "double", "real":
+		return true
+	}
+	return false
 }

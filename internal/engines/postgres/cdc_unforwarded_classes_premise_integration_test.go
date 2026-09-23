@@ -30,6 +30,9 @@ import (
 //  4. ALTER TYPE int→bigint alone on a defaulted column: no delta.
 //  5. DROP of an EXCLUDE with an expression element: a delta (conkey
 //     carries attnum 0 for the expression).
+//  6. A CHECK replaced, and an FK's ON DELETE changed, in the same window
+//     as a rename of a column they read: a delta each (second-pass review
+//     finding 2 — the rename exemption had still reached both kinds).
 func TestRelationFacts_DiffPremisesOnARealServer(t *testing.T) {
 	dsn, cleanup := startPostgresForCDC(t)
 	defer cleanup()
@@ -48,10 +51,12 @@ func TestRelationFacts_DiffPremisesOnARealServer(t *testing.T) {
 		}
 	}
 	exec(`CREATE EXTENSION IF NOT EXISTS btree_gist`)
+	exec(`CREATE TABLE prem_parent (id INT PRIMARY KEY)`)
 	exec(`CREATE TABLE prem (
 		id INT PRIMARY KEY,
 		tenant TEXT NOT NULL,
 		amt INT DEFAULT 0,
+		parent_id INT CONSTRAINT prem_parent_fk REFERENCES prem_parent(id) ON DELETE CASCADE,
 		s TIMESTAMP, e TIMESTAMP,
 		CONSTRAINT prem_amt_pos CHECK (amt >= 0),
 		CONSTRAINT prem_no_overlap EXCLUDE USING gist (tenant WITH =, tsrange(s, e) WITH &&))`)
@@ -95,6 +100,12 @@ func TestRelationFacts_DiffPremisesOnARealServer(t *testing.T) {
 	step("retype plus SET DEFAULT in one statement",
 		`ALTER TABLE prem ALTER COLUMN amount TYPE numeric, ALTER COLUMN amount SET DEFAULT 7`,
 		`ALTER COLUMN "amount" SET DEFAULT 7`)
+	step("CHECK replaced beside a rename of the column it reads",
+		`ALTER TABLE prem RENAME COLUMN amount TO amt2; ALTER TABLE prem DROP CONSTRAINT prem_amt_pos, ADD CONSTRAINT prem_amt_pos CHECK (amt2 > 100)`,
+		`CONSTRAINT "prem_amt_pos" changed`)
+	step("FK action changed beside a rename of its column",
+		`ALTER TABLE prem RENAME COLUMN parent_id TO parent; ALTER TABLE prem DROP CONSTRAINT prem_parent_fk, ADD CONSTRAINT prem_parent_fk FOREIGN KEY (parent) REFERENCES prem_parent(id) ON DELETE RESTRICT`,
+		`CONSTRAINT "prem_parent_fk" changed`)
 	step("drop of an EXCLUDE with an expression element",
 		`ALTER TABLE prem DROP CONSTRAINT prem_no_overlap`,
 		`DROP CONSTRAINT "prem_no_overlap"`)

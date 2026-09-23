@@ -39,6 +39,16 @@ var ErrUnforwardedSchemaChange = errors.New("UNFORWARDED-SCHEMA-CHANGE")
 // (SQLite, D1, the trigger-CDC SQLite/D1 variants, flatfile, mydumper) refuse
 // to be a sync target at OpenChangeApplier, so there is nothing to persist.
 type UnforwardedRefusalStore interface {
+	// EnsureUnforwardedRefusalStorage makes sure a refusal CAN be recorded —
+	// that the control table carries the column — and is called at every
+	// start, before any change stream opens. It detects first and adds the
+	// column only when missing. An error is fatal to the start: a stream that
+	// could not record a refusal would have it accepted silently by the next
+	// restart, and a `--schema-already-applied` target (which never runs
+	// EnsureControlTable) would otherwise find that out only when a refusal
+	// fires.
+	EnsureUnforwardedRefusalStorage(ctx context.Context) error
+
 	// RecordUnforwardedRefusal stores msg on streamID's row, replacing any
 	// earlier record. The row must exist — the CDC anchor creates it before
 	// any change stream opens, so a refusal always has one — and a missing

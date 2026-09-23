@@ -66,3 +66,11 @@ func (a *ChangeApplier) ClearUnforwardedRefusal(ctx context.Context, streamID st
 	}
 	return err
 }
+
+// EnsureUnforwardedRefusalStorage implements [ir.UnforwardedRefusalStore]:
+// detect-then-ALTER (a PlanetScale safe-migrations target refuses the ALTER
+// with the usual coded error naming the statement, at start rather than when
+// a refusal later needs recording).
+func (a *ChangeApplier) EnsureUnforwardedRefusalStorage(ctx context.Context) error {
+	return ensureUnforwardedRefusalColumn(ctx, a.db, a.controlKeyspace)
+}

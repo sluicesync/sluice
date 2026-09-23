@@ -5,6 +5,8 @@ package pipeline
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -75,14 +77,35 @@ type recordedUnforwardedRefusalError struct {
 	recorded string
 	// remedy is the surface-specific step (1).
 	remedy string
+	// mismatched is the acknowledgement the operator passed when it names a
+	// DIFFERENT refusal than the recorded one; empty when none was passed.
+	mismatched string
 }
 
 func (e *recordedUnforwardedRefusalError) Error() string {
-	return fmt.Sprintf("pipeline: %s: a previous run stopped on this refusal and it is still recorded (%s); "+
-		"a restart without %s refuses again, because a restarted reader baselines the source catalog that already "+
-		"carries the change and would accept it silently. Remedy: (1) %s; (2) restart with %s, which clears the record "+
-		"and takes a fresh baseline — passing it WITHOUT step 1 accepts the difference permanently. Recorded refusal: %s",
-		ir.ErrUnforwardedSchemaChange, e.where, unforwardedRefusalAckFlag, e.remedy, unforwardedRefusalAckFlag, e.recorded)
+	fp := unforwardedRefusalFingerprint(e.recorded)
+	mismatch := ""
+	if e.mismatched != "" {
+		mismatch = fmt.Sprintf(" The acknowledgement passed (%s=%s) names a different refusal than the one recorded, so it was not applied.", unforwardedRefusalAckFlag, e.mismatched)
+	}
+	return fmt.Sprintf("pipeline: %s: a previous run stopped on this refusal and it is still recorded (%s; fingerprint %s); "+
+		"a restart refuses again until it is acknowledged, because a restarted reader baselines the source catalog that already "+
+		"carries the change and would accept it silently.%s Remedy: (1) %s; (2) restart ONCE with %s=%s, which clears THIS record "+
+		"and takes a fresh baseline — passing it WITHOUT step 1 accepts the difference permanently. The value is this refusal's "+
+		"fingerprint, so an acknowledgement left in a service definition cannot clear a later, different refusal. Recorded refusal: %s",
+		ir.ErrUnforwardedSchemaChange, e.where, fp, mismatch, e.remedy, unforwardedRefusalAckFlag, fp, e.recorded)
+}
+
+// unforwardedRefusalFingerprint identifies one recorded refusal: the first
+// 12 hex digits of the SHA-256 of its stored text. The acknowledgement must
+// quote it, which binds `--accept-unforwarded-schema-change` to the refusal
+// the operator actually read — a flag left in a systemd ExecStart (with
+// Restart=on-failure) or a wrapper script would otherwise clear, and so
+// accept, the NEXT refusal on the next automatic restart (2026-09-23
+// second-pass review, finding 4).
+func unforwardedRefusalFingerprint(recorded string) string {
+	sum := sha256.Sum256([]byte(recorded))
+	return hex.EncodeToString(sum[:])[:12]
 }
 
 func (e *recordedUnforwardedRefusalError) Unwrap() error            { return ir.ErrUnforwardedSchemaChange }
@@ -131,6 +154,15 @@ func (s *Streamer) phaseRefuseRecordedUnforwardedChange(ctx context.Context, app
 	if !ok {
 		return nil
 	}
+	// Storage first: a target that cannot hold the record would let a refusal
+	// that fires later go unrecorded, and the restart after it would accept
+	// the change silently. `--schema-already-applied` skips EnsureControlTable,
+	// so this is the only place such a target learns it before that happens.
+	if err := store.EnsureUnforwardedRefusalStorage(ctx); err != nil {
+		return connectHint(fmt.Errorf("pipeline: the target cannot record an UNFORWARDED-SCHEMA-CHANGE refusal (sluice_cdc_state.unforwarded_refusal is missing and could not be added), "+
+			"so a stream that stopped on one would have it accepted silently by the next restart; add the column (the error below names the statement — on a PlanetScale "+
+			"safe-migrations branch ship it with `sluice deploy-ddl`), then start again: %w", err))
+	}
 	recorded, found, err := store.ReadUnforwardedRefusal(ctx, streamID)
 	if err != nil {
 		return connectHint(fmt.Errorf("pipeline: read the recorded unforwarded-schema-change refusal: %w", err))
@@ -138,11 +170,12 @@ func (s *Streamer) phaseRefuseRecordedUnforwardedChange(ctx context.Context, app
 	if !found {
 		return nil
 	}
-	if !s.AcceptUnforwardedSchemaChange {
+	if s.AcceptUnforwardedSchemaChange != unforwardedRefusalFingerprint(recorded) {
 		return &recordedUnforwardedRefusalError{
-			where:    fmt.Sprintf("stream %q, sluice_cdc_state.unforwarded_refusal on the target", streamID),
-			recorded: recorded,
-			remedy:   syncUnforwardedRefusalRemedy,
+			where:      fmt.Sprintf("stream %q, sluice_cdc_state.unforwarded_refusal on the target", streamID),
+			recorded:   recorded,
+			remedy:     syncUnforwardedRefusalRemedy,
+			mismatched: s.AcceptUnforwardedSchemaChange,
 		}
 	}
 	if err := store.ClearUnforwardedRefusal(ctx, streamID); err != nil {
@@ -150,7 +183,7 @@ func (s *Streamer) phaseRefuseRecordedUnforwardedChange(ctx context.Context, app
 	}
 	// One-shot within the process too: a supervisor restarting this same
 	// Streamer after a NEW refusal must not find it pre-accepted.
-	s.AcceptUnforwardedSchemaChange = false
+	s.AcceptUnforwardedSchemaChange = ""
 	slog.WarnContext(
 		ctx, "accepted a recorded unforwarded-schema-change refusal ("+unforwardedRefusalAckFlag+"); "+
 			"the record is cleared and the reader takes a fresh baseline, so the accepted difference will not be reported again",
@@ -176,13 +209,15 @@ func (s *Streamer) recordUnforwardedRefusal(ctx context.Context, applier ir.Chan
 	}
 	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), unforwardedRefusalWriteTimeout)
 	defer cancel()
-	if err := store.RecordUnforwardedRefusal(writeCtx, streamID, storableUnforwardedRefusal(runErr.Error())); err != nil {
+	stored := storableUnforwardedRefusal(runErr.Error())
+	if err := store.RecordUnforwardedRefusal(writeCtx, streamID, stored); err != nil {
 		logUnforwardedRefusalNotRecorded(ctx, slog.String("stream_id", streamID), err.Error(), runErr)
 		return
 	}
 	slog.InfoContext(
 		ctx, "recorded the unforwarded-schema-change refusal on the target; every restart refuses until "+unforwardedRefusalAckFlag,
 		slog.String("stream_id", streamID),
+		slog.String("fingerprint", unforwardedRefusalFingerprint(stored)),
 	)
 }
 
@@ -218,11 +253,12 @@ func (b *BackupStream) refuseRecordedUnforwardedChange(ctx context.Context, stat
 	if prior == nil || prior.UnforwardedRefusal == "" {
 		return nil
 	}
-	if !b.AcceptUnforwardedSchemaChange {
+	if b.AcceptUnforwardedSchemaChange != unforwardedRefusalFingerprint(prior.UnforwardedRefusal) {
 		return &recordedUnforwardedRefusalError{
-			where:    "the backup destination's " + statePath,
-			recorded: prior.UnforwardedRefusal,
-			remedy:   backupUnforwardedRefusalRemedy,
+			where:      "the backup destination's " + statePath,
+			recorded:   prior.UnforwardedRefusal,
+			remedy:     backupUnforwardedRefusalRemedy,
+			mismatched: b.AcceptUnforwardedSchemaChange,
 		}
 	}
 	slog.WarnContext(
@@ -262,5 +298,6 @@ func (b *BackupStream) recordUnforwardedRefusal(ctx context.Context, statePath s
 	slog.InfoContext(
 		ctx, "recorded the unforwarded-schema-change refusal in the stream state; every restart refuses until "+unforwardedRefusalAckFlag,
 		slog.String("state_path", statePath),
+		slog.String("fingerprint", unforwardedRefusalFingerprint(prior.UnforwardedRefusal)),
 	)
 }

@@ -358,6 +358,7 @@ func diffRelationFacts(prior, cur *pgRelationFacts) []string {
 	// Columns present in both, and which of them were renamed or re-typed
 	// this boundary.
 	renamedOrRetyped := map[int16]bool{}
+	retypedOnly := map[int16]bool{}
 	for attnum, pc := range prior.columns {
 		cc, ok := cur.columns[attnum]
 		if !ok {
@@ -369,6 +370,7 @@ func diffRelationFacts(prior, cur *pgRelationFacts) []string {
 		retyped := pc.typ != cc.typ
 		if retyped {
 			renamedOrRetyped[attnum] = true
+			retypedOnly[attnum] = true
 		}
 		if pc.notNull != cc.notNull {
 			verb := "DROP NOT NULL"
@@ -428,7 +430,7 @@ func diffRelationFacts(prior, cur *pgRelationFacts) []string {
 		switch {
 		case !ok:
 			deltas = append(deltas, fmt.Sprintf("ADD CONSTRAINT %q %s", name, cc.display))
-		case pc.compare != cc.compare && !touches(cc.attnums, renamedOrRetyped):
+		case pc.compare != cc.compare && !constraintChangeExplained(cc, renamedOrRetyped, retypedOnly, touches):
 			deltas = append(deltas, fmt.Sprintf("CONSTRAINT %q changed: %s -> %s", name, pc.display, cc.display))
 		}
 	}
@@ -623,8 +625,37 @@ func unforwardedChangeError(schema, table string, deltas []string) error {
 		"and sluice cannot forward: %s. The target (or the backup chain) does not have this change, so continuing would leave it "+
 		"silently weaker than the source — for a policy or row level security change, a security boundary. Remedy: "+
 		"(1) apply the same change to the target yourself (for `backup stream`, take a new full backup instead); "+
-		"(2) restart with the SAME --stream-id and --accept-unforwarded-schema-change. sluice records this refusal, so a restart "+
-		"WITHOUT that flag refuses again; the flag takes a fresh baseline of these objects, so passing it WITHOUT step 1 "+
+		"(2) restart with the SAME --stream-id: sluice records this refusal, so that start refuses again and prints its "+
+		"fingerprint; start once more with --accept-unforwarded-schema-change=<that fingerprint>. The flag takes a fresh baseline "+
+		"of these objects, so passing it WITHOUT step 1 "+
 		"accepts the difference permanently and nothing will report it again",
 		unforwardedChangeMarker, schema, table, strings.Join(deltas, "; ")))
+}
+
+// constraintChangeExplained reports whether a changed constraint's new
+// comparison value is fully explained by a column change the pipeline
+// already forwards, per how the kind is compared:
+//
+//   - FOREIGN KEY: never. It compares on a structured, attnum-based tuple
+//     that neither a rename nor a retype of its columns changes, so any
+//     difference is a real edit (e.g. ON DELETE CASCADE → RESTRICT made in
+//     the same window as a rename — measured on PG 16).
+//   - CHECK: only when it reads a RETYPED column (PG re-renders the
+//     constant's cast, `(0)::numeric`). Its node tree is rename-invariant,
+//     so a rename explains nothing — a CHECK replaced beside a rename is a
+//     real change (measured).
+//   - PRIMARY KEY / UNIQUE / EXCLUDE: compared as pg_get_constraintdef
+//     text, which names columns, so a rename or retype of a column it keys
+//     on explains a text change. Residual, stated: such a constraint
+//     REPLACED in the same window as a rename of one of its columns is
+//     still exempt (GC-34).
+func constraintChangeExplained(cc pgConstraintFact, renamedOrRetyped, retypedOnly map[int16]bool, touches func([]int16, map[int16]bool) bool) bool {
+	switch cc.kind {
+	case "f":
+		return false
+	case "c":
+		return touches(cc.attnums, retypedOnly)
+	default:
+		return touches(cc.attnums, renamedOrRetyped)
+	}
 }

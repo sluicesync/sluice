@@ -8,6 +8,7 @@ package postgres
 import (
 	"context"
 	"errors"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -95,5 +96,58 @@ func TestUnforwardedRefusalStore_RoundTrip(t *testing.T) {
 	}
 	if pos, ok, err := applier.ReadPosition(ctx, "s1"); err != nil || !ok || pos.Token != "tok" {
 		t.Errorf("position = (%+v, %v, %v); the refusal store must not touch it", pos, ok, err)
+	}
+}
+
+// TestUnforwardedRefusalStore_NonOwnerRoleRecords pins the 2026-09-23
+// second-pass review's finding 1: a role with only DML grants on a control
+// table another role owns — the `--schema-already-applied` setup — must be
+// able to RECORD a refusal when the column already exists. PostgreSQL checks
+// ownership before IF NOT EXISTS, so the store's earlier unconditional
+// ALTER failed with "must be owner of table", the refusal was never written,
+// and the next restart accepted the change silently.
+func TestUnforwardedRefusalStore_NonOwnerRoleRecords(t *testing.T) {
+	dsn, cleanup := startPostgresForApplier(t)
+	defer cleanup()
+	applyPGApplier(t, dsn, `
+		CREATE TABLE "public"."sluice_cdc_state" (
+			stream_id           VARCHAR(255) NOT NULL,
+			source_position     TEXT         NOT NULL,
+			updated_at          TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			unforwarded_refusal TEXT         NULL,
+			PRIMARY KEY (stream_id)
+		);
+		INSERT INTO "public"."sluice_cdc_state" (stream_id, source_position) VALUES ('s1', 'tok');
+		CREATE ROLE sluice_dml LOGIN PASSWORD 'dml';
+		GRANT USAGE ON SCHEMA public TO sluice_dml;
+		GRANT SELECT, INSERT, UPDATE, DELETE ON "public"."sluice_cdc_state" TO sluice_dml;
+	`)
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatalf("parse dsn: %v", err)
+	}
+	u.User = url.UserPassword("sluice_dml", "dml")
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	applier, err := Engine{}.OpenChangeApplier(ctx, u.String())
+	if err != nil {
+		t.Fatalf("OpenChangeApplier as the DML-only role: %v", err)
+	}
+	defer func() {
+		if c, ok := applier.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+	store, ok := applier.(ir.UnforwardedRefusalStore)
+	if !ok {
+		t.Fatal("postgres applier does not implement ir.UnforwardedRefusalStore")
+	}
+	const msg = `UNFORWARDED-SCHEMA-CHANGE on public.t: ADD CONSTRAINT "u" UNIQUE (name)`
+	if err := store.RecordUnforwardedRefusal(ctx, "s1", msg); err != nil {
+		t.Fatalf("RecordUnforwardedRefusal as a non-owner with the column present: %v — the refusal would not survive a restart", err)
+	}
+	got, ok, err := store.ReadUnforwardedRefusal(ctx, "s1")
+	if err != nil || !ok || got != msg {
+		t.Fatalf("read back = (%q, %v, %v); want the recorded refusal", got, ok, err)
 	}
 }

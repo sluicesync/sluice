@@ -464,15 +464,17 @@ type Streamer struct {
 	// [ir.ErrUnforwardedSchemaChange] records the refusal on the stream's
 	// control-table row, and every later start refuses again before any
 	// change stream opens — because a fresh reader baselines the catalog
-	// that already carries the change and would accept it silently. True
-	// clears the record, logs what was accepted, and continues on a fresh
-	// baseline; it is consumed by that clear, so a later refusal in the same
-	// process is not pre-accepted.
+	// that already carries the change and would accept it silently. The
+	// value is the recorded refusal's FINGERPRINT (printed in the refusal):
+	// only a match clears the record, logs what was accepted, and continues on
+	// a fresh baseline, so an acknowledgement left in a service definition
+	// cannot clear a later, different refusal. It is consumed by the clear, so
+	// a later refusal in the same process is not pre-accepted either.
 	//
-	// Zero-value safe by construction: false keeps refusing, which is the
+	// Zero-value safe by construction: empty keeps refusing, which is the
 	// only safe default for every Streamer construction (CLI, fleet,
 	// tests). See [Streamer.phaseRefuseRecordedUnforwardedChange].
-	AcceptUnforwardedSchemaChange bool
+	AcceptUnforwardedSchemaChange string
 
 	// SchemaAlreadyApplied, when true, declares that the target's
 	// schema (and the `sluice_cdc_state` control table) have been

@@ -525,17 +525,21 @@ func (s *Supervisor) superviseOne(ctx context.Context, sy SupervisedSync) {
 		// sync ran healthy for long enough before dying.
 		consecutive := s.recordFailure(sy.ID, err, ran >= s.policy.HealthyRunThreshold)
 
-		// A failure whose producer asserted that no retry can succeed
-		// ([ir.TerminalError]) is not restarted. Restarting it is at best a
-		// loop that fails identically until the cap; for the
-		// UNFORWARDED-SCHEMA-CHANGE refusal (GC-2) it was worse — the restart
-		// took a fresh baseline that already contained the refused change and
-		// accepted it silently (the 2026-09-23 pre-tag review, F1).
-		if ir.IsTerminal(err) {
+		// An UNFORWARDED-SCHEMA-CHANGE refusal (GC-2) is not restarted. It is
+		// recorded on the target and replayed at every start, so a restart
+		// could only refuse again — and if that recording ever failed, the
+		// restart would take a fresh baseline and accept the refused change
+		// silently (the 2026-09-23 pre-tag review, F1). Scoped to this
+		// sentinel ON PURPOSE, not to every [ir.TerminalError]: several
+		// terminal errors are terminal only to the in-process retry and are
+		// recovered by exactly the fresh run this loop provides (a dead
+		// snapshot-pinned copy connection, an in-doubt raw-copy commit —
+		// both of whose own messages say "re-run").
+		if errors.Is(err, ir.ErrUnforwardedSchemaChange) {
 			args := make([]any, 0, 4)
 			args = append(args, slog.String("stream_id", sy.ID), slog.String("err", err.Error()))
 			args = append(args, sluicecode.Attrs(err)...)
-			slog.ErrorContext(ctx, "supervisor: sync refused terminally; not restarting (a restart cannot succeed)", args...)
+			slog.ErrorContext(ctx, "supervisor: sync refused an unforwarded schema change; not restarting (apply the change to the target, then start this leg once outside the fleet with --accept-unforwarded-schema-change set to the fingerprint the refusal prints; the fleet has no acknowledgement key)", args...)
 			s.setState(sy.ID, SyncFailed, err)
 			return
 		}

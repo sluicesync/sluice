@@ -9,6 +9,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -28,7 +29,7 @@ import (
 type unforwardedRestartCase struct {
 	sourceDSN, targetDSN string
 	apply                func(t *testing.T, dsn, sqlText string)
-	newStreamer          func(ack bool) *Streamer
+	newStreamer          func(ack string) *Streamer
 	table                string
 	// ddl is the source change the door refuses; targetFix is the same
 	// change applied to the target — the remedy the acknowledgement is
@@ -78,7 +79,7 @@ func runUnforwardedRefusalRestart(t *testing.T, tc unforwardedRestartCase) {
 	}
 
 	// ---- 1. The stream refuses, and records it. ----
-	cancel, runErr := run(tc.newStreamer(false))
+	cancel, runErr := run(tc.newStreamer(""))
 	defer cancel()
 	if !waitForPGRowCount(t, tc.targetDSN, tc.table, 1, 90*time.Second) {
 		t.Fatalf("cold copy never landed")
@@ -106,7 +107,7 @@ func runUnforwardedRefusalRestart(t *testing.T, tc unforwardedRestartCase) {
 	}
 
 	// ---- 2. A plain restart refuses at startup. ----
-	cancel2, runErr2 := run(tc.newStreamer(false))
+	cancel2, runErr2 := run(tc.newStreamer(""))
 	var second error
 	select {
 	case second = <-runErr2:
@@ -131,11 +132,34 @@ func runUnforwardedRefusalRestart(t *testing.T, tc unforwardedRestartCase) {
 		t.Fatal("the refusing restart cleared the record")
 	}
 
+	// ---- 2b. An acknowledgement naming a DIFFERENT refusal is refused. ----
+	// The fingerprint binds the flag to the refusal the operator read, so a
+	// value left in a service definition cannot pre-accept a later one.
+	fp := regexp.MustCompile(`fingerprint ([0-9a-f]{12})`).FindStringSubmatch(second.Error())
+	if fp == nil {
+		t.Fatalf("the replay does not print the refusal's fingerprint: %v", second)
+	}
+	cancelW, runErrW := run(tc.newStreamer("000000000000"))
+	var wrong error
+	select {
+	case wrong = <-runErrW:
+	case <-time.After(45 * time.Second):
+		stopRun(cancelW, runErrW)
+		t.Fatal("a restart with a mismatched fingerprint did not refuse")
+	}
+	cancelW()
+	if !errors.Is(wrong, ir.ErrUnforwardedSchemaChange) || !strings.Contains(wrong.Error(), "names a different refusal") {
+		t.Fatalf("mismatched acknowledgement ended with %v; want the replay naming the mismatch", wrong)
+	}
+	if _, ok := recorded(); !ok {
+		t.Fatal("a mismatched acknowledgement cleared the record")
+	}
+
 	// ---- 3. Apply the change to the target, then acknowledge. ----
 	if _, err := tgtDB.Exec(tc.targetFix); err != nil {
 		t.Fatalf("apply the change to the target: %v", err)
 	}
-	cancel3, runErr3 := run(tc.newStreamer(true))
+	cancel3, runErr3 := run(tc.newStreamer(fp[1]))
 	defer stopRun(cancel3, runErr3)
 	if !waitForPGRowCount(t, tc.targetDSN, tc.table, 3, 60*time.Second) {
 		select {
@@ -169,7 +193,7 @@ func TestStreamer_PGSource_UnforwardedRefusal_SurvivesRestart(t *testing.T) {
 	runUnforwardedRefusalRestart(t, unforwardedRestartCase{
 		sourceDSN: sourceDSN, targetDSN: targetDSN,
 		apply: applyPGDDL,
-		newStreamer: func(ack bool) *Streamer {
+		newStreamer: func(ack string) *Streamer {
 			return &Streamer{
 				Source: pgEng, Target: pgEng,
 				SourceDSN: sourceDSN, TargetDSN: targetDSN,
@@ -206,7 +230,7 @@ func TestStreamer_MySQLSource_UnforwardedRefusal_SurvivesRestart(t *testing.T) {
 	runUnforwardedRefusalRestart(t, unforwardedRestartCase{
 		sourceDSN: sourceDSN, targetDSN: targetDSN,
 		apply: applyDDLMySQL,
-		newStreamer: func(ack bool) *Streamer {
+		newStreamer: func(ack string) *Streamer {
 			return &Streamer{
 				Source: myEng, Target: pgEng,
 				SourceDSN: sourceDSN, TargetDSN: targetDSN,

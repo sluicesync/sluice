@@ -51,7 +51,9 @@ func TestTableFacts_DiffPremisesOnARealServer(t *testing.T) {
 		id INT PRIMARY KEY,
 		b BINARY(3) DEFAULT 0x610000,
 		vb VARBINARY(4) DEFAULT 0x6100FF,
-		amt INT DEFAULT 0
+		amt INT DEFAULT 0,
+		s VARCHAR(10) DEFAULT '007',
+		vb2 VARBINARY(4) DEFAULT 0x61
 	) ENGINE=InnoDB`)
 	qn := schema + ".prem"
 	read := func() *mysqlTableFacts {
@@ -83,4 +85,6 @@ func TestTableFacts_DiffPremisesOnARealServer(t *testing.T) {
 	step("VARBINARY default changed after its first NUL", `ALTER TABLE prem ALTER COLUMN vb SET DEFAULT 0x610001`, `ALTER COLUMN "vb" SET DEFAULT 0x610001`)
 	step("retype re-renders the default spelling only", `ALTER TABLE prem MODIFY amt DECIMAL(5,2) DEFAULT 0`, "")
 	step("retype that also changes the default value", `ALTER TABLE prem MODIFY amt BIGINT DEFAULT 7`, `ALTER COLUMN "amt" SET DEFAULT 7`)
+	step("text retype that changes 007 to 7", `ALTER TABLE prem MODIFY s VARCHAR(20) DEFAULT '7'`, `ALTER COLUMN "s" SET DEFAULT 7`)
+	step("binary retype that changes 0x61 to 0x0061", `ALTER TABLE prem MODIFY vb2 VARBINARY(8) DEFAULT 0x0061`, `ALTER COLUMN "vb2" SET DEFAULT 0x0061`)
 }

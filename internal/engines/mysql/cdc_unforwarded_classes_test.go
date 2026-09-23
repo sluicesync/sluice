@@ -475,3 +475,32 @@ func TestUnforwardedBaseline_PassesOnWhatItWasHandedWhenNeverStarted(t *testing.
 		t.Fatalf("a reader that was handed a baseline and never started returned %v; want the handed baseline", middle.UnforwardedBaseline())
 	}
 }
+
+// TestSameDefaultValue pins what a retype may change about a default: only
+// the spelling of a plain decimal on a numeric column. The false rows are
+// the 2026-09-23 second-pass review's finding 3 — values big.Rat alone
+// equated, which are different defaults on a text or binary column.
+func TestSameDefaultValue(t *testing.T) {
+	cases := []struct {
+		pt, ct, a, b string
+		want         bool
+	}{
+		{"int", "decimal(5,2)", "0", "0.00", true},
+		{"int(11)", "bigint", "5", "5", true},
+		{"decimal(5,2)", "decimal(7,3)", "1.50", "1.500", true},
+		{"varchar(10)", "varchar(20)", "abc", "abc", true},
+		{"int", "bigint", "5", "7", false},
+		{"varchar(10)", "varchar(20)", "007", "7", false},
+		{"varbinary(4)", "varbinary(8)", "0x61", "0x0061", false},
+		{"int", "bigint", "0x61", "97", false},
+		{"decimal(5,2)", "decimal(5,2)", "1/2", "0.5", false},
+		{"int", "bigint", "1_000", "1000", false},
+		{"int", "bigint", "1e3", "1000", false},
+		{"bit(8)", "bit(16)", "b'1'", "b'01'", false},
+	}
+	for _, c := range cases {
+		if got := sameDefaultValue(c.pt, c.ct, c.a, c.b); got != c.want {
+			t.Errorf("sameDefaultValue(%q→%q, %q, %q) = %v; want %v", c.pt, c.ct, c.a, c.b, got, c.want)
+		}
+	}
+}
