@@ -247,6 +247,16 @@ type CDCReader struct {
 	// the project tenets call out.
 	schemaCache map[string]*tableSchema
 
+	// unforwardedBaseline is the StreamChanges-time fingerprint of the
+	// schema objects the boundary projection does not carry (unique keys,
+	// foreign keys, CHECKs, column defaults and attributes), keyed by
+	// qualified name; each schemaCache rebuild of an in-scope table is
+	// diffed against it (GC-2's binlog sibling; see
+	// cdc_unforwarded_classes.go). Written by StreamChanges before the pump
+	// starts, then read and written only on the pump goroutine; nil leaves
+	// the door inert.
+	unforwardedBaseline map[string]*mysqlTableFacts
+
 	// schemaLoader is the seam tableFor loads through. nil — the value every
 	// production construction gets — means the real loadTableSchema; tests
 	// override it to inject a transient source failure on the dispatch path.
@@ -763,6 +773,16 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 		return nil, fmt.Errorf("mysql: cdc: scope name rule: %w", err)
 	}
 	r.lowerCaseTableNames = lct
+
+	// GC-2: the baseline every post-DDL schemaCache rebuild's
+	// unforwarded-class diff compares against. After the scope-name rule
+	// (the baseline is filtered by databaseInScope, which folds by it) and
+	// BEFORE the start position resolves, so a DDL landing between the two
+	// is absent from the baseline and refused at its table's first rebuild
+	// rather than absorbed.
+	if err := r.captureUnforwardedBaseline(ctx); err != nil {
+		return nil, err
+	}
 
 	startPos, err := r.resolveStartPosition(ctx, from)
 	if err != nil {
@@ -1582,9 +1602,22 @@ func (r *CDCReader) dispatchRows(
 		)
 	}
 
+	_, cached := r.schemaCache[qn]
 	tbl, err := r.tableFor(ctx, qn)
 	if err != nil {
 		return fmt.Errorf("mysql: cdc: load schema for %s: %w", qn, err)
+	}
+	// GC-2: a rebuild — the table's first row after a start or after an
+	// in-scope DDL cleared the cache — is where a schema change becomes
+	// visible, so it is where the classes the boundary projection does not
+	// carry (keys, foreign keys, CHECKs, defaults) are diffed against the
+	// StreamChanges baseline. Below the scope gate, before the boundary is
+	// emitted and before any row: a refused change forwards nothing. See
+	// cdc_unforwarded_classes.go.
+	if !cached {
+		if err := r.gradeUnforwardedClasses(ctx, qn); err != nil {
+			return err
+		}
 	}
 
 	// Audit CDC-4: tableFor's contract ("the information_schema lookup at

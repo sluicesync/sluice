@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -72,6 +73,14 @@ import (
 func classifyReaderError(err error) error {
 	if err == nil {
 		return nil
+	}
+	// A producer that already decided "never retry" ([terminalMySQLError])
+	// is returned as-is, BEFORE any text or sentinel heuristic below can
+	// read its message — the unforwarded-class refusal quotes operator
+	// catalog text (a column DEFAULT, a CHECK clause), which may contain
+	// any transient shape's wording.
+	if ir.IsTerminal(err) {
+		return err
 	}
 	// ADR-0093: VStream purged-GTID resume. When the persisted resume
 	// position is older than the source's retained binlogs (gtid_purged
@@ -543,3 +552,29 @@ func isVStreamMessageTooLargeError(err error) bool {
 	return strings.Contains(msg, "grpc: received message") &&
 		strings.Contains(msg, "larger than max")
 }
+
+// terminalMySQLError is a refusal whose producer knows no retry can
+// succeed: this engine's [ir.TerminalError]. Its one producer today is the
+// unforwarded-class door (cdc_unforwarded_classes.go), where a retry is
+// not merely futile but harmful — the retry's fresh StreamChanges takes a
+// new baseline that already contains the refused change, so the second
+// attempt would accept it silently.
+//
+// It implements [ir.RetriableError] with a false answer as well, for the
+// reason postgres.terminalPGError documents: errors.As unwraps THROUGH a
+// type that lacks the interface being asked about, so a wrapper that
+// implemented only Terminal would still answer "retriable" to a consumer
+// asking the RetriableError question of a retriable cause inside it.
+// [classifyReaderError] returns it untouched.
+type terminalMySQLError struct{ err error }
+
+func (e *terminalMySQLError) Error() string            { return e.err.Error() }
+func (e *terminalMySQLError) Unwrap() error            { return e.err }
+func (e *terminalMySQLError) Terminal() bool           { return true }
+func (e *terminalMySQLError) Retriable() bool          { return false }
+func (e *terminalMySQLError) RetryHint() time.Duration { return 0 }
+
+var (
+	_ ir.TerminalError  = (*terminalMySQLError)(nil)
+	_ ir.RetriableError = (*terminalMySQLError)(nil)
+)
