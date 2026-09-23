@@ -1048,6 +1048,11 @@ func loadTableSchema(ctx context.Context, db *sql.DB, schema, table string, flav
 	defer rows.Close()
 
 	out := &tableSchema{Schema: schema, Name: table}
+	// The same NUL-truncated binary-default recovery the SchemaReader's
+	// populateColumns runs (GC-29): the boundary projection's Default is
+	// what the ADR-0091 intercept re-emits, so a truncated `0x27` for a
+	// declared `0x2700` would otherwise land on the target silently.
+	var pending []pendingBinaryDefault
 	for rows.Next() {
 		var (
 			colName    string
@@ -1094,6 +1099,9 @@ func loadTableSchema(ctx context.Context, db *sql.DB, schema, table string, flav
 		}
 		applyGenerated(col, genExpr, meta.Extra, flavor)
 		out.Columns = append(out.Columns, col)
+		if binaryLiteralDefaultNeedsRecovery(typ, meta.Extra, defaultVal) {
+			pending = append(pending, pendingBinaryDefault{table: table, col: col})
+		}
 		// Capture the MariaDB native fixed-width kind (uuid/inet4/inet6)
 		// parallel to Columns. The IR collapses inet4/inet6 to ir.Inet, so
 		// the CDC binlog decode (ADR-0171) recovers the exact width from
@@ -1110,6 +1118,15 @@ func loadTableSchema(ctx context.Context, db *sql.DB, schema, table string, flav
 	}
 	if len(out.Columns) == 0 {
 		return nil, fmt.Errorf("mysql: table %s.%s has no columns (does it exist?)", schema, table)
+	}
+	if len(pending) > 0 {
+		// One SHOW CREATE for this table. The stand-in ir.Table carries no
+		// Comment, so the pass recovers only the binary defaults — a
+		// tableSchema has no comment to recover.
+		sr := &SchemaReader{db: db, schema: schema, flavor: flavor}
+		if err := sr.recoverFromShowCreate(ctx, map[string]*ir.Table{table: {Name: table}}, pending); err != nil {
+			return nil, fmt.Errorf("mysql: loadTableSchema %s.%s: binary default recovery: %w", schema, table, err)
+		}
 	}
 
 	// Bug 88 (DELETE) / Bug 193 (UPDATE): the CDC reader's emit paths

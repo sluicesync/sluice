@@ -4,6 +4,10 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Fixed
+
+**MySQL binlog `sync`: a forwarded `ADD COLUMN` with a BINARY/VARBINARY default containing a NUL byte now lands the declared bytes on the target (GC-29, silent).** MySQL's `information_schema.columns.COLUMN_DEFAULT` cuts such a default off at its first NUL byte. The cold-start schema read already re-reads `SHOW CREATE TABLE` to recover the true bytes, but the CDC reader's per-table re-read at a DDL boundary did not, and schema-forward re-emitted the truncated value as the target column's DEFAULT. Affected shapes: a leading NUL (`DEFAULT 0x00` landed as the two ASCII bytes `0x`), any VARBINARY with a NUL (`0xFF00` landed as `0xFF`), and a NUL mid-value on BINARY (`0xFF00AA` landed as `0xFF0000`). A BINARY default whose only NULs are trailing was unaffected, because the target DEFAULT is padded to the column's width. Replicated rows were always correct (they carry explicit values); the harm is the value every later target-side write that omits the column received. MariaDB sources were unaffected (MariaDB escapes NULs instead of truncating). The boundary re-read now runs the same recovery, one `SHOW CREATE TABLE` per table that has such a default.
+
 ## [0.155.1] - 2026-09-22
 
 ### Fixed

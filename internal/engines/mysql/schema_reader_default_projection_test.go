@@ -33,6 +33,11 @@ type catalogColumnRow struct {
 	numScale   driver.Value
 	dtPrec     driver.Value
 	want       ir.DefaultValue
+
+	// showCreate is the column's DEFAULT clause as SHOW CREATE TABLE
+	// prints it — the authoritative bytes the NUL-truncation recovery
+	// re-reads. Empty for a row that never triggers the recovery.
+	showCreate string
 }
 
 // bug286CatalogRows returns the Bug 286 shape matrix as flavor f's server
@@ -94,6 +99,58 @@ func bug286CatalogRows(f Flavor) []catalogColumnRow {
 	}
 }
 
+// gc29BinaryCatalogRows returns the GC-29 shapes: BINARY/VARBINARY literal
+// defaults whose information_schema COLUMN_DEFAULT MySQL C-string-truncates
+// at the first NUL byte (the table in binary_default_recovery.go's doc),
+// paired with the SHOW CREATE clause that carries the true bytes, in both
+// forms SHOW CREATE uses — the quoted escaped string (every byte < 0x80)
+// and the hex literal (any byte >= 0x80) — plus a NUL-free control.
+//
+//	b1 BINARY(2)    DEFAULT 0x2700    → "0x27"     (well-formed but SHORT)
+//	b2 BINARY(1)    DEFAULT 0x00      → "0x"       (empty)
+//	b3 BINARY(3)    DEFAULT 0xFFEEDD  → "0xFFEEDD" (faithful)
+//	b4 VARBINARY(4) DEFAULT 0xFF00    → "0xFF"     (well-formed but SHORT)
+//	b5 BINARY(3)    DEFAULT 0xFF00AA  → "0xFF"     (SHORT mid-value; width padding cannot repair it)
+//
+// MariaDB escape-encodes NULs in a quoted COLUMN_DEFAULT instead of
+// truncating (translateMariaDBDefault's doc), so the recovery never fires
+// there; these rows are the MySQL-convention flavors' catalog surface.
+func gc29BinaryCatalogRows() []catalogColumnRow {
+	valid := func(s string) sql.NullString { return sql.NullString{String: s, Valid: true} }
+	hexDef := func(h string) ir.DefaultValue { return ir.DefaultExpression{Expr: h, Dialect: hexLiteralDialect} }
+	bin := func(name, dataType string, width int64, def, showCreate string, want ir.DefaultValue) catalogColumnRow {
+		return catalogColumnRow{
+			name: name, def: valid(def), nullable: "YES",
+			dataType: dataType, columnType: fmt.Sprintf("%s(%d)", dataType, width), charMaxLen: width,
+			want: want, showCreate: showCreate,
+		}
+	}
+	return []catalogColumnRow{
+		bin("b1", "binary", 2, "0x27", `'''\0'`, hexDef("0x2700")),
+		bin("b2", "binary", 1, "0x", `'\0'`, hexDef("0x00")),
+		bin("b3", "binary", 3, "0xFFEEDD", "0xFFEEDD", hexDef("0xFFEEDD")),
+		bin("b4", "varbinary", 4, "0xFF", "0xFF00", hexDef("0xFF00")),
+		bin("b5", "binary", 3, "0xFF", "0xFF00AA", hexDef("0xFF00AA")),
+	}
+}
+
+// showCreateTableW renders the SHOW CREATE TABLE text for the fake's one
+// table: one indented line per column, the DEFAULT clause only where the
+// row carries one, in the shape parseShowCreateColumnDefault reads.
+func showCreateTableW(rows []catalogColumnRow) string {
+	var b strings.Builder
+	b.WriteString("CREATE TABLE `w` (\n")
+	for _, r := range rows {
+		b.WriteString("  `" + r.name + "` " + r.columnType)
+		if r.showCreate != "" {
+			b.WriteString(" DEFAULT " + r.showCreate)
+		}
+		b.WriteString(",\n")
+	}
+	b.WriteString("  PRIMARY KEY (`id`)\n) ENGINE=InnoDB")
+	return b.String()
+}
+
 // catalogFakeDriver serves ONE table's catalog rows to both catalog readers
 // through the real database/sql path: the SchemaReader's per-database
 // columnsQuery (the cold-start seed), loadTableSchema's per-table query
@@ -121,6 +178,9 @@ func (catalogFakeConn) Begin() (driver.Tx, error) {
 
 func (c catalogFakeConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
 	switch {
+	case strings.HasPrefix(query, "SHOW CREATE TABLE "):
+		// The NUL-truncated binary-default recovery's authoritative re-read.
+		return &catalogFakeRows{cols: []string{"Table", "Create Table"}, vals: [][]driver.Value{{"w", showCreateTableW(c.rows)}}}, nil
 	case strings.Contains(query, "information_schema.statistics"):
 		return &catalogFakeRows{cols: []string{"column_name"}, vals: [][]driver.Value{{"id"}}}, nil
 	case strings.Contains(query, "information_schema.columns") && strings.Contains(query, "ORDER  BY table_name, ordinal_position"):
@@ -209,10 +269,20 @@ func newCatalogFakeDB(t *testing.T, name string, rows []catalogColumnRow) *sql.D
 // bypassed the ADR-0058 §2a volatility door and killed the stream with a
 // raw SQLSTATE 22007. The flavor roster is derived from the registry
 // (binlogFlavors), so a new binlog flavor cannot escape the pin.
+//
+// GC-29 is the same seed-vs-projection split one pass later: the seed ran
+// the SHOW CREATE recovery for NUL-truncated BINARY/VARBINARY literal
+// defaults and loadTableSchema did not, so a forwarded `ADD COLUMN b
+// BINARY(2) DEFAULT 0x2700` projected the truncated `0x27` and the
+// intercept re-emitted it. The gc29BinaryCatalogRows carry that shape on
+// every MySQL-convention flavor.
 func TestLoadTableSchema_DefaultAgreesWithSeed_EveryBinlogFlavor(t *testing.T) {
 	ctx := context.Background()
 	for _, f := range binlogFlavors(t) {
 		rows := bug286CatalogRows(f)
+		if f != FlavorMariaDB {
+			rows = append(rows, gc29BinaryCatalogRows()...)
+		}
 		db := newCatalogFakeDB(t, fmt.Sprintf("sluice-catalog-test-%s-%d", t.Name(), f), rows)
 
 		// The cold-start seed.
