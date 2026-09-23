@@ -60,9 +60,16 @@ fi
 # was the only thing standing in that path — and it was standing in the wrong
 # place. A guard whose motivating incidents are all in the class it cannot
 # see is worse than none, because its presence reads as coverage.
+#
+# Both loops below end `done || true`: under `set -e`, a while loop's
+# status is its last body command's, so a final file with no hit returned
+# 1 and killed the hook silently on nearly every commit. `grep -a` is
+# load-bearing too: without it GNU grep treats a NUL in a binary-looking
+# file as a line break, so `\x00` never matched and this guard could not
+# fire. Both measured 2026-09-22; the PowerShell hook was unaffected.
 nul_hits=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.(md|go|yml|yaml|sh|ps1|txt)$' | while read -r f; do
-	[ -f "$f" ] && LC_ALL=C grep -qP '\x00' "$f" && echo "$f"
-done)
+	[ -f "$f" ] && LC_ALL=C grep -qaP '\x00' "$f" && echo "$f"
+done || true)
 if [ -n "$nul_hits" ]; then
 	red "pre-commit: staged text file(s) contain a literal NUL byte:"
 	echo "$nul_hits"
@@ -79,7 +86,7 @@ fi
 # Above the early return for the same reason as the NUL guard.
 conflict_hits=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.(md|go|yml|yaml|sh|ps1|txt)$' | while read -r f; do
 	[ -f "$f" ] && grep -Eq '^(<{7}|>{7}) |^<{7}$|^>{7}$' "$f" && echo "$f"
-done)
+done || true)
 if [ -n "$conflict_hits" ]; then
 	red "pre-commit: staged text file(s) contain a merge-conflict marker:"
 	echo "$conflict_hits"
