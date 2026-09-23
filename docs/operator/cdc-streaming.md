@@ -538,6 +538,32 @@ Before creating the slot, sluice reads `pg_prepared_xacts` and warns under `PREP
 
 The same marker also carries the probe's own failure — if sluice could not read `pg_prepared_xacts` (permissions, a timeout), it says so rather than implying the cluster is clear. A warning that could not rule the condition out is not the same as one that ruled it in, and the message distinguishes them.
 
+## PostgreSQL and MySQL-family sources: a schema change the stream cannot carry ends it (`UNFORWARDED-SCHEMA-CHANGE`)
+
+Logical replication (pgoutput) describes a table by its column names and types, nothing more. So these source-side changes cannot reach the target through the stream: `ADD`/`DROP CONSTRAINT` (primary key, `UNIQUE`, foreign key, `EXCLUDE`, `CHECK`), `ENABLE`/`FORCE ROW LEVEL SECURITY`, `CREATE`/`ALTER`/`DROP POLICY`, `SET`/`DROP NOT NULL`, `SET`/`DROP DEFAULT`, and identity changes. Before this door existed each one was ignored silently, and the target stayed weaker than the source. The worst shape was one statement: `ALTER TABLE t ADD COLUMN x int, ADD CONSTRAINT fk FOREIGN KEY (x) REFERENCES p(id)` forwarded the column and dropped the foreign key.
+
+MySQL and MariaDB binlog sources have the same gap for a different reason: sluice re-reads only a table's columns after a DDL. There the door covers primary key, `UNIQUE`, foreign key and `CHECK` changes (including `NOT ENFORCED` on MySQL), and `DEFAULT`, `EXTRA` or generation-expression changes on an existing column. Nullability is already carried by the column forward.
+
+When the stream starts, sluice records these objects for every table (the baseline). On Postgres, each such DDL makes the server resend the table's description before the next change it decodes for that table. On MySQL, the DDL clears sluice's schema cache and the next row on the table rebuilds it. At that point sluice reads the table again and compares. On any difference, `sync` and `backup stream` end with `UNFORWARDED-SCHEMA-CHANGE`, naming each change. The stream does not retry on its own: a retry would take a new baseline and accept the change without a word.
+
+To continue:
+
+1. Apply the same change to the target yourself. For `backup stream`, take a new full backup instead; a chain restored from the old full would lack the change.
+2. Restart with the same `--stream-id`.
+
+**The restart takes a fresh baseline, so restarting without step 1 accepts the difference permanently** and nothing reports it again.
+
+Changes sluice already forwards are not refused: adding, dropping or retyping a column (ADR-0091), including the attributes of a newly added column and a constraint that disappears because its column was dropped. A foreign key is compared by what it references, not its text, so renaming the table it points at is not a refusal.
+
+What this does not catch, stated so it is not read as broader:
+
+- A change made while the stream was stopped, or during the cold-start copy, is already in the baseline.
+- An automatic retry after a transient error (a dropped connection, say) also starts the stream again and takes a fresh baseline. A transient failure that lands between the DDL and the table's next write therefore accepts the change without a refusal.
+- MySQL only: `DROP COLUMN b` shrinks a composite `UNIQUE (a, b)` to `UNIQUE (a)`, and sluice refuses that, because it cannot tell whether the target shrank the key the same way (Postgres drops the whole index instead). Apply the same drop on the target and restart.
+- PlanetScale and Vitess (VStream) sources are not covered yet.
+- Detection needs a later write to the same table. A change on a table nobody writes to again is not seen until someone does.
+- Plain (non-constraint) indexes are not compared. Index DDL is the documented not-forwarded case, and refusing on every source `CREATE INDEX` would end streams on routine tuning.
+
 ## MySQL-family sources: resume signals (`POSITION-MODE`, `UNVERIFIED-INSTANCE-IDENTITY`, `SOURCE-INSTANCE-IDENTITY-CHANGED`)
 
 A warm resume — `sync start` with an existing `--stream-id`, `backup incremental`, chain replay, the backup→CDC handoff — asks the source two questions before it opens the stream: *has the source purged anything this position still needs?* (the retention check; a "no" is the position-invalid refusal that takes the auto-resnapshot route, or a hard stop under `--no-auto-resnapshot`) and, since v0.137.2/v0.138.0, *did this source ever produce this position at all?* (the identity/lineage check — a refusal, but **not** always the same route: a verdict of *different lineage* is TERMINAL and does not auto-resnapshot — since v0.146.0 for the MySQL file/pos `@@server_uuid` mismatch, since v0.148.2 for the GTID, MariaDB and VStream arms (the `FOREIGN-LINEAGE-REFUSED` section above) — because a different lineage means a different server rather than the same server having advanced; only a verdict of *this same server has moved past the position* still takes the auto-resnapshot route). The second question exists because a replaced, restored, reset or rebuilt instance answers the first one with "nothing purged" and then streams its own unrelated history as the continuation, at exit 0. How it is asked depends on the position's mode, and two grep-stable log markers tell you which check a resume is running without.

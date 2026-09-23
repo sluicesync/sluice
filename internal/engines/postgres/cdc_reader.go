@@ -273,6 +273,14 @@ type CDCReader struct {
 	// (non-streamer callers) means no prior and the pre-SLM-1c prime.
 	schemaSeed map[string]*ir.Table
 
+	// unforwardedBaseline is the StreamChanges-time fingerprint of the
+	// schema objects pgoutput does not carry (constraints, RLS, policies,
+	// nullability, defaults), keyed by relation OID; each in-scope
+	// RelationMessage is diffed against it (GC-2; see
+	// cdc_unforwarded_classes.go). Read and written only on the pump
+	// goroutine after StreamChanges; nil leaves the door inert.
+	unforwardedBaseline map[uint32]*pgRelationFacts
+
 	// mu guards err. The pump writes; callers read via Err after
 	// the channel closes.
 	mu  sync.Mutex
@@ -596,6 +604,12 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 		return nil, err
 	}
 	if err := checkWALLevel(ctx, r.db); err != nil {
+		return nil, err
+	}
+	// GC-2: the baseline every RelationMessage's unforwarded-class diff
+	// compares against. Taken before the replication connection opens, so
+	// no decoded change can precede it.
+	if err := r.captureUnforwardedBaseline(ctx); err != nil {
 		return nil, err
 	}
 
@@ -1253,6 +1267,9 @@ func (r *CDCReader) dispatchWAL(
 		if err := r.gradeRelationSchemaRace(relations, m.RelationID, entry); err != nil {
 			return err
 		}
+		if err := r.gradeUnforwardedClasses(ctx, m.RelationID, entry); err != nil {
+			return err
+		}
 		// Replace the cache entry with the new shape so subsequent DML on
 		// this OID decodes against the post-DDL column set (the gate
 		// passed, so the boundary is forwarded downstream).
@@ -1288,6 +1305,9 @@ func (r *CDCReader) dispatchWAL(
 			return fmt.Errorf("postgres: cdc: relation %s.%s: %w", m.Namespace, m.RelationName, err)
 		}
 		if err := r.gradeRelationSchemaRace(relations, m.RelationID, entry); err != nil {
+			return err
+		}
+		if err := r.gradeUnforwardedClasses(ctx, m.RelationID, entry); err != nil {
 			return err
 		}
 		// Replace the cache entry with the new shape so subsequent DML on
