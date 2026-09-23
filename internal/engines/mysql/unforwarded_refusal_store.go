@@ -7,6 +7,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 
 	"sluicesync.dev/sluice/internal/appliershared"
 	"sluicesync.dev/sluice/internal/ir"
@@ -72,5 +73,15 @@ func (a *ChangeApplier) ClearUnforwardedRefusal(ctx context.Context, streamID st
 // with the usual coded error naming the statement, at start rather than when
 // a refusal later needs recording).
 func (a *ChangeApplier) EnsureUnforwardedRefusalStorage(ctx context.Context) error {
-	return ensureUnforwardedRefusalColumn(ctx, a.db, a.controlKeyspace)
+	if err := ensureUnforwardedRefusalColumn(ctx, a.db, a.controlKeyspace); err != nil {
+		return err
+	}
+	// A column that exists but this role cannot UPDATE fails the same way
+	// later, when a refusal needs recording. A no-row UPDATE is privilege-
+	// checked like any other and writes nothing (third-pass review, finding 5).
+	probe := "UPDATE " + controlTableRef(a.controlKeyspace, controlTableName) + " SET " + appliershared.UnforwardedRefusalColumn + " = " + appliershared.UnforwardedRefusalColumn + " WHERE 1 = 0"
+	if _, err := a.db.ExecContext(ctx, probe); err != nil {
+		return fmt.Errorf("mysql: the unforwarded_refusal column is not writable by this role: %w", err)
+	}
+	return nil
 }

@@ -209,7 +209,7 @@ func (s *Streamer) recordUnforwardedRefusal(ctx context.Context, applier ir.Chan
 	}
 	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), unforwardedRefusalWriteTimeout)
 	defer cancel()
-	stored := storableUnforwardedRefusal(runErr.Error())
+	stored := recordedUnforwardedRefusalText(runErr)
 	if err := store.RecordUnforwardedRefusal(writeCtx, streamID, stored); err != nil {
 		logUnforwardedRefusalNotRecorded(ctx, slog.String("stream_id", streamID), err.Error(), runErr)
 		return
@@ -290,7 +290,7 @@ func (b *BackupStream) recordUnforwardedRefusal(ctx context.Context, statePath s
 	if prior == nil {
 		prior = &streamState{}
 	}
-	prior.UnforwardedRefusal = storableUnforwardedRefusal(runErr.Error())
+	prior.UnforwardedRefusal = recordedUnforwardedRefusalText(runErr)
 	if err := writeStreamState(writeCtx, b.Store, statePath, prior); err != nil {
 		logUnforwardedRefusalNotRecorded(ctx, slog.String("state_path", statePath), err.Error(), runErr)
 		return
@@ -300,4 +300,18 @@ func (b *BackupStream) recordUnforwardedRefusal(ctx context.Context, statePath s
 		slog.String("state_path", statePath),
 		slog.String("fingerprint", unforwardedRefusalFingerprint(prior.UnforwardedRefusal)),
 	)
+}
+
+// recordedUnforwardedRefusalText is what a record stores: the refusal,
+// prefixed with the moment it was recorded, made storable. The timestamp is
+// a NONCE for the fingerprint, not decoration — the refusal text alone has
+// no position or time in it, so the SAME change recurring (a nightly job
+// that disables and re-enables row level security, say) would produce the
+// same text, the same fingerprint, and be cleared by an acknowledgement left
+// in a service definition from the first time (2026-09-23 third-pass
+// review, finding 1). Both record paths go through here, so the fingerprint
+// printed at record time and the one the door compares are computed over
+// the same stored string.
+func recordedUnforwardedRefusalText(runErr error) string {
+	return storableUnforwardedRefusal("[recorded " + time.Now().UTC().Format(time.RFC3339Nano) + "] " + runErr.Error())
 }

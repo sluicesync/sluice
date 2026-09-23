@@ -57,6 +57,7 @@ func TestRelationFacts_DiffPremisesOnARealServer(t *testing.T) {
 		tenant TEXT NOT NULL,
 		amt INT DEFAULT 0,
 		parent_id INT CONSTRAINT prem_parent_fk REFERENCES prem_parent(id) ON DELETE CASCADE,
+		code INT CONSTRAINT prem_code_uq UNIQUE,
 		s TIMESTAMP, e TIMESTAMP,
 		CONSTRAINT prem_amt_pos CHECK (amt >= 0),
 		CONSTRAINT prem_no_overlap EXCLUDE USING gist (tenant WITH =, tsrange(s, e) WITH &&))`)
@@ -106,6 +107,16 @@ func TestRelationFacts_DiffPremisesOnARealServer(t *testing.T) {
 	step("FK action changed beside a rename of its column",
 		`ALTER TABLE prem RENAME COLUMN parent_id TO parent; ALTER TABLE prem DROP CONSTRAINT prem_parent_fk, ADD CONSTRAINT prem_parent_fk FOREIGN KEY (parent) REFERENCES prem_parent(id) ON DELETE RESTRICT`,
 		`CONSTRAINT "prem_parent_fk" changed`)
+	step("FK ON DELETE to SET NULL",
+		`ALTER TABLE prem DROP CONSTRAINT prem_parent_fk, ADD CONSTRAINT prem_parent_fk FOREIGN KEY (parent) REFERENCES prem_parent(id) ON DELETE SET NULL`,
+		`CONSTRAINT "prem_parent_fk" changed`)
+	step("FK SET NULL narrowed to a column list (confdelsetcols only)",
+		`ALTER TABLE prem DROP CONSTRAINT prem_parent_fk, ADD CONSTRAINT prem_parent_fk FOREIGN KEY (parent) REFERENCES prem_parent(id) ON DELETE SET NULL (parent)`,
+		`CONSTRAINT "prem_parent_fk" changed`)
+	step("UNIQUE replaced beside a retype of its column",
+		`ALTER TABLE prem ALTER COLUMN code TYPE bigint, DROP CONSTRAINT prem_code_uq, ADD CONSTRAINT prem_code_uq UNIQUE NULLS NOT DISTINCT (code)`,
+		`CONSTRAINT "prem_code_uq" changed`)
+	step("retype alone under a UNIQUE", `ALTER TABLE prem ALTER COLUMN code TYPE numeric`, "")
 	step("drop of an EXCLUDE with an expression element",
 		`ALTER TABLE prem DROP CONSTRAINT prem_no_overlap`,
 		`DROP CONSTRAINT "prem_no_overlap"`)

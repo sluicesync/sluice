@@ -201,6 +201,7 @@ func readRelationFacts(ctx context.Context, db *sql.DB, relid uint32) (map[uint3
 		       COALESCE(pg_catalog.array_to_string(con.confkey, ','), ''),
 		       con.confupdtype::text, con.confdeltype::text, con.confmatchtype::text,
 		       con.condeferrable, con.condeferred,
+		       COALESCE(pg_catalog.to_jsonb(con)->>'confdelsetcols', ''),
 		       COALESCE(pg_catalog.regexp_replace(con.conbin::text, ':location -?[0-9]+', '', 'g'), '')
 		FROM   pg_constraint con
 		JOIN   pg_class c ON c.oid = con.conrelid
@@ -212,10 +213,11 @@ func readRelationFacts(ctx context.Context, db *sql.DB, relid uint32) (map[uint3
 			name, kind, def, conkey, confkey string
 			updType, delType, matchType      string
 			deferrable, deferred             bool
+			delSetCols                       string
 			nodeTree                         string
 		)
 		if err := rows.Scan(&oid, &name, &kind, &def, &conkey, &confrelid, &confkey,
-			&updType, &delType, &matchType, &deferrable, &deferred, &nodeTree); err != nil {
+			&updType, &delType, &matchType, &deferrable, &deferred, &delSetCols, &nodeTree); err != nil {
 			return err
 		}
 		f := out[oid]
@@ -230,8 +232,8 @@ func readRelationFacts(ctx context.Context, db *sql.DB, relid uint32) (map[uint3
 			// deliberately NOT compared: ADD … NOT VALID then VALIDATE is the
 			// standard zero-downtime pattern, and a NOT VALID target constraint
 			// enforces every new row exactly as a validated one does.
-			compare = fmt.Sprintf("fk conkey=%s confrelid=%d confkey=%s upd=%s del=%s match=%s deferrable=%t deferred=%t",
-				conkey, confrelid, confkey, updType, delType, matchType, deferrable, deferred)
+			compare = fmt.Sprintf("fk conkey=%s confrelid=%d confkey=%s upd=%s del=%s delsetcols=%s match=%s deferrable=%t deferred=%t",
+				conkey, confrelid, confkey, updType, delType, delSetCols, matchType, deferrable, deferred)
 		case "c":
 			// The stored node tree with parse positions stripped: it names
 			// columns by attnum, so a column rename leaves it unchanged (measured
@@ -357,7 +359,7 @@ func diffRelationFacts(prior, cur *pgRelationFacts) []string {
 
 	// Columns present in both, and which of them were renamed or re-typed
 	// this boundary.
-	renamedOrRetyped := map[int16]bool{}
+	renamedOnly := map[int16]bool{}
 	retypedOnly := map[int16]bool{}
 	for attnum, pc := range prior.columns {
 		cc, ok := cur.columns[attnum]
@@ -365,11 +367,10 @@ func diffRelationFacts(prior, cur *pgRelationFacts) []string {
 			continue
 		}
 		if pc.name != cc.name {
-			renamedOrRetyped[attnum] = true
+			renamedOnly[attnum] = true
 		}
 		retyped := pc.typ != cc.typ
 		if retyped {
-			renamedOrRetyped[attnum] = true
 			retypedOnly[attnum] = true
 		}
 		if pc.notNull != cc.notNull {
@@ -430,7 +431,7 @@ func diffRelationFacts(prior, cur *pgRelationFacts) []string {
 		switch {
 		case !ok:
 			deltas = append(deltas, fmt.Sprintf("ADD CONSTRAINT %q %s", name, cc.display))
-		case pc.compare != cc.compare && !constraintChangeExplained(cc, renamedOrRetyped, retypedOnly, touches):
+		case pc.compare != cc.compare && !constraintChangeExplained(cc, renamedOnly, retypedOnly, touches):
 			deltas = append(deltas, fmt.Sprintf("CONSTRAINT %q changed: %s -> %s", name, pc.display, cc.display))
 		}
 	}
@@ -643,19 +644,21 @@ func unforwardedChangeError(schema, table string, deltas []string) error {
 //   - CHECK: only when it reads a RETYPED column (PG re-renders the
 //     constant's cast, `(0)::numeric`). Its node tree is rename-invariant,
 //     so a rename explains nothing — a CHECK replaced beside a rename is a
-//     real change (measured).
+//     real change (measured). Residual, stated: a CHECK REPLACED in the
+//     same window as a retype of a column it reads is exempt (GC-34).
 //   - PRIMARY KEY / UNIQUE / EXCLUDE: compared as pg_get_constraintdef
-//     text, which names columns, so a rename or retype of a column it keys
-//     on explains a text change. Residual, stated: such a constraint
-//     REPLACED in the same window as a rename of one of its columns is
-//     still exempt (GC-34).
-func constraintChangeExplained(cc pgConstraintFact, renamedOrRetyped, retypedOnly map[int16]bool, touches func([]int16, map[int16]bool) bool) bool {
+//     text, which names columns but not their types, so only a RENAME of a
+//     column it keys on explains a text change (measured: a retype leaves
+//     the text unchanged, so it explains nothing — third-pass review
+//     finding 2). Residual, stated: such a constraint REPLACED in the same
+//     window as a rename of one of its columns is still exempt (GC-34).
+func constraintChangeExplained(cc pgConstraintFact, renamedOnly, retypedOnly map[int16]bool, touches func([]int16, map[int16]bool) bool) bool {
 	switch cc.kind {
 	case "f":
 		return false
 	case "c":
 		return touches(cc.attnums, retypedOnly)
 	default:
-		return touches(cc.attnums, renamedOrRetyped)
+		return touches(cc.attnums, renamedOnly)
 	}
 }

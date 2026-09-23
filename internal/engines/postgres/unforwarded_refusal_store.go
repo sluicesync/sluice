@@ -92,5 +92,16 @@ func (a *ChangeApplier) ClearUnforwardedRefusal(ctx context.Context, streamID st
 // carries the column passes, and one that cannot add a missing column fails
 // the start loudly instead of failing to record a refusal later.
 func (a *ChangeApplier) EnsureUnforwardedRefusalStorage(ctx context.Context) error {
-	return ensureUnforwardedRefusalColumn(ctx, a.db, a.controlSchema)
+	if err := ensureUnforwardedRefusalColumn(ctx, a.db, a.controlSchema); err != nil {
+		return err
+	}
+	// A column that exists but this role cannot UPDATE (a column-level grant
+	// that predates it, say) fails the same way later, when a refusal needs
+	// recording. PostgreSQL checks UPDATE privilege at plan time, so a no-row
+	// UPDATE proves it and writes nothing (third-pass review, finding 5).
+	probe := "UPDATE " + controlTableRef(a.controlSchema) + " SET " + appliershared.UnforwardedRefusalColumn + " = " + appliershared.UnforwardedRefusalColumn + " WHERE false"
+	if _, err := a.db.ExecContext(ctx, probe); err != nil {
+		return fmt.Errorf("postgres: the unforwarded_refusal column is not writable by this role: %w", err)
+	}
+	return nil
 }

@@ -142,6 +142,9 @@ func TestUnforwardedRefusalStore_NonOwnerRoleRecords(t *testing.T) {
 	if !ok {
 		t.Fatal("postgres applier does not implement ir.UnforwardedRefusalStore")
 	}
+	if err := store.EnsureUnforwardedRefusalStorage(ctx); err != nil {
+		t.Fatalf("EnsureUnforwardedRefusalStorage as a DML role with the column present: %v", err)
+	}
 	const msg = `UNFORWARDED-SCHEMA-CHANGE on public.t: ADD CONSTRAINT "u" UNIQUE (name)`
 	if err := store.RecordUnforwardedRefusal(ctx, "s1", msg); err != nil {
 		t.Fatalf("RecordUnforwardedRefusal as a non-owner with the column present: %v — the refusal would not survive a restart", err)
@@ -149,5 +152,47 @@ func TestUnforwardedRefusalStore_NonOwnerRoleRecords(t *testing.T) {
 	got, ok, err := store.ReadUnforwardedRefusal(ctx, "s1")
 	if err != nil || !ok || got != msg {
 		t.Fatalf("read back = (%q, %v, %v); want the recorded refusal", got, ok, err)
+	}
+}
+
+// TestUnforwardedRefusalStore_EnsureRefusesAnUnwritableColumn pins the
+// third-pass review's finding 5: the startup storage check must prove the
+// role can WRITE the column, not only that it exists — a role without
+// UPDATE would otherwise pass the check and then fail to record a refusal,
+// and the next restart would accept the change silently.
+func TestUnforwardedRefusalStore_EnsureRefusesAnUnwritableColumn(t *testing.T) {
+	dsn, cleanup := startPostgresForApplier(t)
+	defer cleanup()
+	applyPGApplier(t, dsn, `
+		CREATE TABLE "public"."sluice_cdc_state" (
+			stream_id           VARCHAR(255) NOT NULL,
+			source_position     TEXT         NOT NULL,
+			updated_at          TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			unforwarded_refusal TEXT         NULL,
+			PRIMARY KEY (stream_id)
+		);
+		CREATE ROLE sluice_ro LOGIN PASSWORD 'ro';
+		GRANT USAGE ON SCHEMA public TO sluice_ro;
+		GRANT SELECT, INSERT ON "public"."sluice_cdc_state" TO sluice_ro;
+	`)
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatalf("parse dsn: %v", err)
+	}
+	u.User = url.UserPassword("sluice_ro", "ro")
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	applier, err := Engine{}.OpenChangeApplier(ctx, u.String())
+	if err != nil {
+		t.Fatalf("OpenChangeApplier as the read/insert role: %v", err)
+	}
+	defer func() {
+		if c, ok := applier.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+	err = applier.(ir.UnforwardedRefusalStore).EnsureUnforwardedRefusalStorage(ctx)
+	if err == nil || !strings.Contains(err.Error(), "not writable") {
+		t.Fatalf("EnsureUnforwardedRefusalStorage for a role without UPDATE = %v; want the not-writable refusal", err)
 	}
 }

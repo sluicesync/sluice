@@ -172,7 +172,7 @@ func TestStreamerRecordUnforwardedRefusal(t *testing.T) {
 	if len(store.recorded) != 1 {
 		t.Fatalf("recorded %d times; want 1", len(store.recorded))
 	}
-	if got := store.recorded[0]; got != storableUnforwardedRefusal(refusal.Error()) || strings.ContainsRune(got, 0) {
+	if got := store.recorded[0]; !strings.HasPrefix(got, "[recorded ") || !strings.HasSuffix(got, storableUnforwardedRefusal(refusal.Error())) || strings.ContainsRune(got, 0) {
 		t.Errorf("recorded %q; want the storable form of the refusal", got)
 	}
 }
@@ -368,5 +368,23 @@ func TestStreamerUnforwardedDoor_StorageUnavailableFailsTheStart(t *testing.T) {
 	ok := &fakeRefusalStore{}
 	if err := (&Streamer{}).phaseRefuseRecordedUnforwardedChange(context.Background(), ok, "s1"); err != nil || ok.ensured != 1 {
 		t.Errorf("healthy storage: err=%v ensured=%d; want nil and one ensure", err, ok.ensured)
+	}
+}
+
+// TestRecordedUnforwardedRefusalText_IdenticalRefusalsGetDistinctFingerprints
+// pins the third-pass review's finding 1: the same refusal recorded twice —
+// the same change recurring later — must not share a fingerprint, or an
+// acknowledgement left in a service definition from the first time clears
+// the second.
+func TestRecordedUnforwardedRefusalText_IdenticalRefusalsGetDistinctFingerprints(t *testing.T) {
+	refusal := fmt.Errorf("%w on public.t: row level security DISABLED", ir.ErrUnforwardedSchemaChange)
+	first := recordedUnforwardedRefusalText(refusal)
+	time.Sleep(time.Millisecond)
+	second := recordedUnforwardedRefusalText(refusal)
+	if unforwardedRefusalFingerprint(first) == unforwardedRefusalFingerprint(second) {
+		t.Fatalf("two recordings of the same refusal share fingerprint %s; a stale acknowledgement would clear the recurrence", unforwardedRefusalFingerprint(first))
+	}
+	if !strings.Contains(first, "UNFORWARDED-SCHEMA-CHANGE") || !strings.Contains(first, "row level security DISABLED") {
+		t.Errorf("the recorded text lost the refusal: %q", first)
 	}
 }
