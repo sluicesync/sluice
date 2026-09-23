@@ -22,6 +22,7 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -89,5 +90,44 @@ func TestSupervisor_PositiveLimitStillExits(t *testing.T) {
 	}
 	if !errors.Is(err, sentinel) {
 		t.Errorf("error = %v; want it to wrap %v", err, sentinel)
+	}
+}
+
+// terminalTestErr asserts [ir.TerminalError].
+type terminalTestErr struct{ msg string }
+
+func (e terminalTestErr) Error() string  { return e.msg }
+func (e terminalTestErr) Terminal() bool { return true }
+
+// TestSupervisor_TerminalFailureIsNotRestarted pins the 2026-09-23 pre-tag
+// review's F1: under the restart-forever default, a failure whose producer
+// asserted no retry can succeed ([ir.TerminalError]) is run ONCE and marked
+// failed. Restarting it had been at best a loop; for the
+// UNFORWARDED-SCHEMA-CHANGE refusal the restart took a fresh baseline and
+// accepted the refused change silently. The retriable twin above
+// (TestSupervisor_DefaultPolicyRestartsForever) is the control: same
+// policy, non-terminal error, restarted.
+func TestSupervisor_TerminalFailureIsNotRestarted(t *testing.T) {
+	var attempts int
+	refused := SupervisedSync{
+		ID: "refused",
+		Runner: runnerFunc(func(_ context.Context) error {
+			attempts++
+			return fmt.Errorf("pipeline: source cdc reader: %w", terminalTestErr{"UNFORWARDED-SCHEMA-CHANGE on public.t"})
+		}),
+	}
+	policy := RestartPolicy{BackoffBase: time.Millisecond, BackoffCap: 2 * time.Millisecond, HealthyRunThreshold: time.Hour}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	sup := NewSupervisor([]SupervisedSync{refused}, policy)
+	_ = sup.Run(ctx)
+
+	if attempts != 1 {
+		t.Errorf("a terminal failure was run %d times; want exactly 1 — a restart re-baselines the unforwarded-schema-change door and accepts the refused change", attempts)
+	}
+	snap := sup.Snapshot()
+	if len(snap) != 1 || snap[0].State != SyncFailed {
+		t.Errorf("snapshot = %+v; want the sync in state %q", snap, SyncFailed)
 	}
 }

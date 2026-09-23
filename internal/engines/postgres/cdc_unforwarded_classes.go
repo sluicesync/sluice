@@ -56,11 +56,25 @@ import (
 //     shape above.
 //   - a constraint that disappears because a column it keys on is gone:
 //     the target's own DROP COLUMN removes it too.
-//   - a constraint or policy whose text changed because a column it
-//     references was renamed or re-typed: the rename/type change itself
-//     is classified (and forwarded or refused) by the pipeline.
-//   - a column's DEFAULT / generation expression re-rendered by a type
-//     change.
+//   - a PRIMARY KEY, UNIQUE or EXCLUDE whose definition text changed
+//     because a column it keys on was renamed or re-typed: the rename/type
+//     change itself is classified (and forwarded or refused) by the
+//     pipeline. CHECKs and POLICIES need no such exemption for a rename:
+//     they compare on their stored node tree (positions stripped), which
+//     names columns by attnum, so a rename leaves them unchanged and a
+//     real edit in the same window is still seen. A CHECK is still exempt
+//     on a retype of a column it reads (PG re-renders `(0)::numeric`).
+//   - a generation expression re-rendered by a type change. A plain
+//     DEFAULT is NOT exempt on a retype: PG does not re-render it
+//     (measured: int→bigint keeps `0`), and the forwarded ALTER TYPE
+//     carries no DEFAULT.
+//   - an attnum of 0 in conkey is an expression element, never a lost
+//     column.
+//
+// Constraint VALIDITY is not compared: ADD … NOT VALID then VALIDATE is
+// the standard zero-downtime pattern, and a NOT VALID target constraint
+// enforces new rows exactly as a validated one does. Every rule above is
+// grounded on a real server by TestRelationFacts_DiffPremisesOnARealServer.
 //
 // FOREIGN KEYs compare on their structured catalog fields (referenced
 // relation OID and attnums, actions, match, deferrability, validity), not
@@ -73,7 +87,10 @@ import (
 //   - The baseline is taken at StreamChanges, so a change made while the
 //     stream was stopped, or during a cold start's bulk copy (between the
 //     snapshot and StreamChanges), is IN the baseline and never refused.
-//     A restart re-baselines, which is why the refusal says so. Closing
+//     Precisely: anything made after the last ACKNOWLEDGED position and
+//     before StreamChanges — a DDL a lagging stream had not reached yet
+//     when it stopped counts too, because the baseline is the current
+//     catalog while replay starts from the persisted position. Closing
 //     this needs a source↔target comparison, not a source↔source one
 //     (filed as the periodic full-diff follow-up to GC-2).
 //   - Detection needs a RelationMessage, which needs a decoded change on
@@ -83,6 +100,15 @@ import (
 //     after the one being decoded can be reported early (still a real
 //     change), and a change reverted before the read is missed (net no
 //     change).
+//   - Not compared at all: column COLLATION (`ALTER COLUMN … TYPE text
+//     COLLATE "C"`), constraint and index storage (tablespace, fillfactor —
+//     these DO change pg_get_constraintdef, so they refuse loudly rather
+//     than slip), and policies/RLS on a PARTITIONED root (only the root
+//     carries them while leaves get the messages; moot while Bug 100
+//     refuses partitioned sources). A constraint RENAME refuses as
+//     DROP+ADD.
+//   - `backup incremental` opens a fresh reader every run, so a change
+//     between two incrementals is always in the next one's baseline.
 //   - Plain (non-constraint) indexes are deliberately NOT compared: index
 //     DDL is the documented not-forwarded tradeoff for this lane
 //     (docs/production-readiness.md), it never alters what a row may
@@ -100,7 +126,7 @@ type pgRelationFacts struct {
 	rlsEnabled   bool
 	rlsForced    bool
 	constraints  map[string]pgConstraintFact
-	policies     map[string]string
+	policies     map[string]pgPolicyFact
 	columns      map[int16]pgColumnFact
 }
 
@@ -112,6 +138,13 @@ type pgConstraintFact struct {
 	compare string
 	display string
 	attnums []int16
+}
+
+// pgPolicyFact is one pg_policy row: compare is what the diff equates,
+// display is the readable form for the refusal text.
+type pgPolicyFact struct {
+	compare string
+	display string
 }
 
 // pgColumnFact is one live pg_attribute row.
@@ -144,7 +177,7 @@ func readRelationFacts(ctx context.Context, db *sql.DB, relid uint32) (map[uint3
 		var oid uint32
 		f := &pgRelationFacts{
 			constraints: map[string]pgConstraintFact{},
-			policies:    map[string]string{},
+			policies:    map[string]pgPolicyFact{},
 			columns:     map[int16]pgColumnFact{},
 		}
 		if err := rows.Scan(&oid, &f.schema, &f.name, &f.rlsEnabled, &f.rlsForced); err != nil {
@@ -167,7 +200,8 @@ func readRelationFacts(ctx context.Context, db *sql.DB, relid uint32) (map[uint3
 		       con.confrelid::oid,
 		       COALESCE(pg_catalog.array_to_string(con.confkey, ','), ''),
 		       con.confupdtype::text, con.confdeltype::text, con.confmatchtype::text,
-		       con.condeferrable, con.condeferred, con.convalidated
+		       con.condeferrable, con.condeferred,
+		       COALESCE(pg_catalog.regexp_replace(con.conbin::text, ':location -?[0-9]+', '', 'g'), '')
 		FROM   pg_constraint con
 		JOIN   pg_class c ON c.oid = con.conrelid
 		JOIN   pg_namespace n ON n.oid = c.relnamespace
@@ -177,10 +211,11 @@ func readRelationFacts(ctx context.Context, db *sql.DB, relid uint32) (map[uint3
 			oid, confrelid                   uint32
 			name, kind, def, conkey, confkey string
 			updType, delType, matchType      string
-			deferrable, deferred, validated  bool
+			deferrable, deferred             bool
+			nodeTree                         string
 		)
 		if err := rows.Scan(&oid, &name, &kind, &def, &conkey, &confrelid, &confkey,
-			&updType, &delType, &matchType, &deferrable, &deferred, &validated); err != nil {
+			&updType, &delType, &matchType, &deferrable, &deferred, &nodeTree); err != nil {
 			return err
 		}
 		f := out[oid]
@@ -188,9 +223,21 @@ func readRelationFacts(ctx context.Context, db *sql.DB, relid uint32) (map[uint3
 			return nil
 		}
 		compare := def
-		if kind == "f" {
-			compare = fmt.Sprintf("fk conkey=%s confrelid=%d confkey=%s upd=%s del=%s match=%s deferrable=%t deferred=%t validated=%t",
-				conkey, confrelid, confkey, updType, delType, matchType, deferrable, deferred, validated)
+		switch kind {
+		case "f":
+			// Structured, so a rename of the referenced table or column (which
+			// rewrites the definition text here) is not a change. Validity is
+			// deliberately NOT compared: ADD … NOT VALID then VALIDATE is the
+			// standard zero-downtime pattern, and a NOT VALID target constraint
+			// enforces every new row exactly as a validated one does.
+			compare = fmt.Sprintf("fk conkey=%s confrelid=%d confkey=%s upd=%s del=%s match=%s deferrable=%t deferred=%t",
+				conkey, confrelid, confkey, updType, delType, matchType, deferrable, deferred)
+		case "c":
+			// The stored node tree with parse positions stripped: it names
+			// columns by attnum, so a column rename leaves it unchanged (measured
+			// on PG 16) and a real edit made in the same window as the rename is
+			// still seen. Validity is not part of it, for the reason above.
+			compare = "check " + nodeTree
 		}
 		f.constraints[name] = pgConstraintFact{kind: kind, compare: compare, display: def, attnums: parseAttnums(conkey)}
 		return nil
@@ -204,7 +251,9 @@ func readRelationFacts(ctx context.Context, db *sql.DB, relid uint32) (map[uint3
 		       COALESCE((SELECT pg_catalog.string_agg(CASE WHEN r = 0 THEN 'public' ELSE pg_catalog.pg_get_userbyid(r)::text END, ',' ORDER BY 1)
 		                 FROM pg_catalog.unnest(p.polroles) AS r), ''),
 		       COALESCE(pg_catalog.pg_get_expr(p.polqual, p.polrelid), ''),
-		       COALESCE(pg_catalog.pg_get_expr(p.polwithcheck, p.polrelid), '')
+		       COALESCE(pg_catalog.pg_get_expr(p.polwithcheck, p.polrelid), ''),
+		       COALESCE(pg_catalog.regexp_replace(p.polqual::text, ':location -?[0-9]+', '', 'g'), ''),
+		       COALESCE(pg_catalog.regexp_replace(p.polwithcheck::text, ':location -?[0-9]+', '', 'g'), '')
 		FROM   pg_policy p
 		JOIN   pg_class c ON c.oid = p.polrelid
 		JOIN   pg_namespace n ON n.oid = c.relnamespace
@@ -213,13 +262,21 @@ func readRelationFacts(ctx context.Context, db *sql.DB, relid uint32) (map[uint3
 			oid              uint32
 			name, cmd, roles string
 			using, check     string
+			usingTree        string
+			checkTree        string
 			permissive       bool
 		)
-		if err := rows.Scan(&oid, &name, &cmd, &permissive, &roles, &using, &check); err != nil {
+		if err := rows.Scan(&oid, &name, &cmd, &permissive, &roles, &using, &check, &usingTree, &checkTree); err != nil {
 			return err
 		}
 		if f := out[oid]; f != nil {
-			f.policies[name] = fmt.Sprintf("cmd=%s permissive=%t roles=[%s] using=(%s) with_check=(%s)", cmd, permissive, roles, using, check)
+			// Compared on the stored node trees (attnum-based, positions
+			// stripped), so a column rename is not a policy change and a policy
+			// edited in the same window as a rename is still one.
+			f.policies[name] = pgPolicyFact{
+				compare: fmt.Sprintf("cmd=%s permissive=%t roles=[%s] using=%s with_check=%s", cmd, permissive, roles, usingTree, checkTree),
+				display: fmt.Sprintf("cmd=%s permissive=%t roles=[%s] using=(%s) with_check=(%s)", cmd, permissive, roles, using, check),
+			}
 		}
 		return nil
 	})
@@ -301,7 +358,6 @@ func diffRelationFacts(prior, cur *pgRelationFacts) []string {
 	// Columns present in both, and which of them were renamed or re-typed
 	// this boundary.
 	renamedOrRetyped := map[int16]bool{}
-	anyRenamed := false
 	for attnum, pc := range prior.columns {
 		cc, ok := cur.columns[attnum]
 		if !ok {
@@ -309,7 +365,6 @@ func diffRelationFacts(prior, cur *pgRelationFacts) []string {
 		}
 		if pc.name != cc.name {
 			renamedOrRetyped[attnum] = true
-			anyRenamed = true
 		}
 		retyped := pc.typ != cc.typ
 		if retyped {
@@ -328,7 +383,14 @@ func diffRelationFacts(prior, cur *pgRelationFacts) []string {
 		if !retyped && pc.generated != cc.generated {
 			deltas = append(deltas, fmt.Sprintf("ALTER COLUMN %q generated-ness changed", cc.name))
 		}
-		if !retyped && pc.def != cc.def {
+		// A retype does NOT re-render a plain DEFAULT (measured on PG 16:
+		// int→bigint keeps `0`, int→text keeps `5`, timestamp→timestamptz keeps
+		// `now()`), so a default changed in the same statement as a retype is
+		// still a change — the forwarded ALTER TYPE carries no DEFAULT. Only a
+		// generation expression is exempt on a retype, since it is part of the
+		// column the forward rebuilds.
+		generatedRetype := retyped && (pc.generated != "" || cc.generated != "")
+		if pc.def != cc.def && !generatedRetype {
 			switch {
 			case cc.def == "":
 				deltas = append(deltas, fmt.Sprintf("ALTER COLUMN %q DROP DEFAULT (was %s)", cc.name, pc.def))
@@ -350,6 +412,9 @@ func diffRelationFacts(prior, cur *pgRelationFacts) []string {
 	}
 	lostColumn := func(attnums []int16) bool {
 		for _, a := range attnums {
+			if a == 0 {
+				continue // an expression element (EXCLUDE, expression index): not a column
+			}
 			if _, ok := cur.columns[a]; !ok {
 				return true
 			}
@@ -386,11 +451,12 @@ func diffRelationFacts(prior, cur *pgRelationFacts) []string {
 	}
 	for _, name := range sortedFactKeys(cur.policies) {
 		pp, ok := prior.policies[name]
+		cp := cur.policies[name]
 		switch {
 		case !ok:
-			deltas = append(deltas, fmt.Sprintf("CREATE POLICY %q (%s)", name, cur.policies[name]))
-		case pp != cur.policies[name] && !anyRenamed:
-			deltas = append(deltas, fmt.Sprintf("ALTER POLICY %q: %s -> %s", name, pp, cur.policies[name]))
+			deltas = append(deltas, fmt.Sprintf("CREATE POLICY %q (%s)", name, cp.display))
+		case pp.compare != cp.compare:
+			deltas = append(deltas, fmt.Sprintf("ALTER POLICY %q: %s -> %s", name, pp.display, cp.display))
 		}
 	}
 	for _, name := range sortedFactKeys(prior.policies) {
@@ -459,7 +525,14 @@ func (r *CDCReader) UnforwardedBaseline() any {
 	r.unforwarded.mu.Lock()
 	defer r.unforwarded.mu.Unlock()
 	if r.unforwarded.facts == nil {
-		return nil
+		// Never captured (an attempt that failed between being handed a
+		// baseline and StreamChanges): pass on what it was handed, or a
+		// chain of transients would drop the baseline at the first
+		// attempt that failed early and the next would absorb the change.
+		if r.unforwarded.carried == nil {
+			return nil
+		}
+		return r.unforwarded.carried
 	}
 	out := make(pgUnforwardedBaseline, len(r.unforwarded.facts))
 	for k, v := range r.unforwarded.facts {

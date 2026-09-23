@@ -111,6 +111,8 @@ func bug286CatalogRows(f Flavor) []catalogColumnRow {
 //	b3 BINARY(3)    DEFAULT 0xFFEEDD  → "0xFFEEDD" (faithful)
 //	b4 VARBINARY(4) DEFAULT 0xFF00    → "0xFF"     (well-formed but SHORT)
 //	b5 BINARY(3)    DEFAULT 0xFF00AA  → "0xFF"     (SHORT mid-value; width padding cannot repair it)
+//	b6 VARBINARY(4) DEFAULT 0x6100    → "0x61"     (VARBINARY in SHOW CREATE's quoted form)
+//	b7 BINARY(4)    DEFAULT 0x00410042 → "0x"      (leading and interleaved NULs, quoted form)
 //
 // MariaDB escape-encodes NULs in a quoted COLUMN_DEFAULT instead of
 // truncating (translateMariaDBDefault's doc), so the recovery never fires
@@ -131,6 +133,8 @@ func gc29BinaryCatalogRows() []catalogColumnRow {
 		bin("b3", "binary", 3, "0xFFEEDD", "0xFFEEDD", hexDef("0xFFEEDD")),
 		bin("b4", "varbinary", 4, "0xFF", "0xFF00", hexDef("0xFF00")),
 		bin("b5", "binary", 3, "0xFF", "0xFF00AA", hexDef("0xFF00AA")),
+		bin("b6", "varbinary", 4, "0x61", `'a\0'`, hexDef("0x6100")),
+		bin("b7", "binary", 4, "0x", `'\0A\0B'`, hexDef("0x00410042")),
 	}
 }
 

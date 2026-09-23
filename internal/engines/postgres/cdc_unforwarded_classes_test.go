@@ -27,7 +27,10 @@ func gc2Base() *pgRelationFacts {
 			"t_pkey": {kind: "p", compare: "PRIMARY KEY (id)", display: "PRIMARY KEY (id)", attnums: []int16{1}},
 			"x_pos":  {kind: "c", compare: "CHECK ((x > 0))", display: "CHECK ((x > 0))", attnums: []int16{2}},
 		},
-		policies: map[string]string{"iso": "cmd=* permissive=true roles=[public] using=((tenant = CURRENT_USER)) with_check=()"},
+		policies: map[string]pgPolicyFact{"iso": {
+			compare: "cmd=* permissive=true roles=[public] using={OPEXPR :args ({VAR :varattno 3})} with_check=",
+			display: "cmd=* permissive=true roles=[public] using=((tenant = CURRENT_USER)) with_check=()",
+		}},
 		columns: map[int16]pgColumnFact{
 			1: {name: "id", typ: "integer", notNull: true},
 			2: {name: "x", typ: "integer"},
@@ -42,7 +45,7 @@ func cloneFacts(f *pgRelationFacts) *pgRelationFacts {
 	for k, v := range f.constraints {
 		out.constraints[k] = v
 	}
-	out.policies = map[string]string{}
+	out.policies = map[string]pgPolicyFact{}
 	for k, v := range f.policies {
 		out.policies[k] = v
 	}
@@ -85,8 +88,10 @@ func TestDiffRelationFacts_RefusesEveryUncarriedClass(t *testing.T) {
 		{"disable row level security", func(f *pgRelationFacts) { f.rlsEnabled = false }, "row level security DISABLED"},
 		{"force row level security", func(f *pgRelationFacts) { f.rlsForced = true }, "FORCE row level security ENABLED"},
 		{"drop policy", func(f *pgRelationFacts) { delete(f.policies, "iso") }, `DROP POLICY "iso"`},
-		{"create policy", func(f *pgRelationFacts) { f.policies["ro"] = "cmd=r" }, `CREATE POLICY "ro"`},
-		{"alter policy", func(f *pgRelationFacts) { f.policies["iso"] = "cmd=* using=(true)" }, `ALTER POLICY "iso"`},
+		{"create policy", func(f *pgRelationFacts) { f.policies["ro"] = pgPolicyFact{compare: "cmd=r", display: "cmd=r"} }, `CREATE POLICY "ro"`},
+		{"alter policy", func(f *pgRelationFacts) {
+			f.policies["iso"] = pgPolicyFact{compare: "cmd=* using={CONST true}", display: "cmd=* using=(true)"}
+		}, `ALTER POLICY "iso"`},
 		{"set not null", func(f *pgRelationFacts) {
 			c := f.columns[2]
 			c.notNull = true
@@ -112,6 +117,15 @@ func TestDiffRelationFacts_RefusesEveryUncarriedClass(t *testing.T) {
 			c.identity = "a"
 			f.columns[1] = c
 		}, `identity none -> GENERATED ALWAYS`},
+		{"retype plus SET DEFAULT in one statement (the retype must not exempt it)", func(f *pgRelationFacts) {
+			f.columns[2] = pgColumnFact{name: "x", typ: "bigint", def: "7"}
+		}, `ALTER COLUMN "x" SET DEFAULT 7`},
+		{"rename plus a policy edit in the same window (the rename must not exempt it)", func(f *pgRelationFacts) {
+			c := f.columns[3]
+			c.name = "org"
+			f.columns[3] = c
+			f.policies["iso"] = pgPolicyFact{compare: "cmd=* using={CONST true}", display: "cmd=* using=(true)"}
+		}, `ALTER POLICY "iso"`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -148,15 +162,19 @@ func TestDiffRelationFacts_ExemptsConsequencesOfHandledColumnChanges(t *testing.
 		}},
 		{"rename column rewrites its constraint and the policy text", nil, func(f *pgRelationFacts) {
 			f.columns[3] = pgColumnFact{name: "org", typ: "text", notNull: true, def: "'a'::text"}
-			f.policies["iso"] = "cmd=* permissive=true roles=[public] using=((org = CURRENT_USER)) with_check=()"
+			// The readable text follows the rename; the stored node tree names
+			// the column by attnum and does not (measured on PG 16).
+			p := f.policies["iso"]
+			p.display = "cmd=* permissive=true roles=[public] using=((org = CURRENT_USER)) with_check=()"
+			f.policies["iso"] = p
 			c := f.columns[1]
 			c.name = "pk"
 			f.columns[1] = c
 			f.constraints["t_pkey"] = pgConstraintFact{kind: "p", compare: "PRIMARY KEY (pk)", display: "PRIMARY KEY (pk)", attnums: []int16{1}}
 		}},
-		{"retype re-renders the default and the check", func(f *pgRelationFacts) { f.columns[2] = pgColumnFact{name: "x", typ: "integer", def: "0"} }, func(f *pgRelationFacts) {
-			f.columns[2] = pgColumnFact{name: "x", typ: "bigint", def: "0::bigint"}
-			f.constraints["x_pos"] = pgConstraintFact{kind: "c", compare: "CHECK ((x > (0)::bigint))", display: "CHECK ((x > (0)::bigint))", attnums: []int16{2}}
+		{"retype re-renders the check", func(f *pgRelationFacts) { f.columns[2] = pgColumnFact{name: "x", typ: "integer", def: "0"} }, func(f *pgRelationFacts) {
+			f.columns[2] = pgColumnFact{name: "x", typ: "numeric", def: "0"}
+			f.constraints["x_pos"] = pgConstraintFact{kind: "c", compare: "CHECK ((x > (0)::numeric))", display: "CHECK ((x > (0)::numeric))", attnums: []int16{2}}
 		}},
 	}
 	for _, tc := range cases {
@@ -278,5 +296,39 @@ func TestUnforwardedBaseline_CarriedAcrossReaders(t *testing.T) {
 	other.SetUnforwardedBaseline(map[string]int{"not": 1})
 	if err := other.captureUnforwardedBaseline(t.Context()); err == nil {
 		t.Error("a foreign value was adopted as a baseline; it must be ignored")
+	}
+}
+
+// TestDiffRelationFacts_ExcludeExpressionElementIsNotALostColumn: an
+// EXCLUDE (or any constraint) with an expression element records attnum 0
+// in conkey — measured `{2,0}` for `EXCLUDE USING gist (room WITH =,
+// tsrange(s, e) WITH &&)`. Attnum 0 is not a column, so it must not make
+// a DROP CONSTRAINT look like the cascade of a dropped column.
+func TestDiffRelationFacts_ExcludeExpressionElementIsNotALostColumn(t *testing.T) {
+	base := gc2Base()
+	base.constraints["no_overlap"] = pgConstraintFact{kind: "x", compare: "EXCLUDE …", display: "EXCLUDE USING gist (x WITH =, tsrange(a, b) WITH &&)", attnums: []int16{2, 0}}
+	cur := cloneFacts(base)
+	delete(cur.constraints, "no_overlap")
+	deltas := diffRelationFacts(base, cur)
+	if !strings.Contains(strings.Join(deltas, "; "), `DROP CONSTRAINT "no_overlap"`) {
+		t.Errorf("deltas = %q; want the EXCLUDE drop refused — attnum 0 is an expression, not a dropped column", deltas)
+	}
+}
+
+// TestUnforwardedBaseline_PassesOnWhatItWasHandedWhenNeverStarted pins the
+// 2026-09-23 pre-tag review's F2: an attempt can fail between being handed
+// a baseline and StreamChanges (a seed-loader read, a standby/wal_level
+// check). Its snapshot must be what it was handed — a nil there dropped the
+// chain, and the attempt after it took a fresh baseline that absorbed the
+// change.
+func TestUnforwardedBaseline_PassesOnWhatItWasHandedWhenNeverStarted(t *testing.T) {
+	first := &CDCReader{}
+	first.unforwarded.facts = map[uint32]*pgRelationFacts{16400: gc2Base()}
+	middle := &CDCReader{}
+	middle.SetUnforwardedBaseline(first.UnforwardedBaseline())
+	// middle never reaches StreamChanges.
+	got, ok := middle.UnforwardedBaseline().(pgUnforwardedBaseline)
+	if !ok || got[16400] == nil {
+		t.Fatalf("a reader that was handed a baseline and never started returned %v; want the handed baseline", middle.UnforwardedBaseline())
 	}
 }

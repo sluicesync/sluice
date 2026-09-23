@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
@@ -523,6 +524,21 @@ func (s *Supervisor) superviseOne(ctx context.Context, sy SupervisedSync) {
 		// this goroutine. Reset the consecutive counter first if the
 		// sync ran healthy for long enough before dying.
 		consecutive := s.recordFailure(sy.ID, err, ran >= s.policy.HealthyRunThreshold)
+
+		// A failure whose producer asserted that no retry can succeed
+		// ([ir.TerminalError]) is not restarted. Restarting it is at best a
+		// loop that fails identically until the cap; for the
+		// UNFORWARDED-SCHEMA-CHANGE refusal (GC-2) it was worse — the restart
+		// took a fresh baseline that already contained the refused change and
+		// accepted it silently (the 2026-09-23 pre-tag review, F1).
+		if ir.IsTerminal(err) {
+			args := make([]any, 0, 4)
+			args = append(args, slog.String("stream_id", sy.ID), slog.String("err", err.Error()))
+			args = append(args, sluicecode.Attrs(err)...)
+			slog.ErrorContext(ctx, "supervisor: sync refused terminally; not restarting (a restart cannot succeed)", args...)
+			s.setState(sy.ID, SyncFailed, err)
+			return
+		}
 
 		if s.policy.MaxConsecutiveFailures > 0 && consecutive >= s.policy.MaxConsecutiveFailures {
 			// Terminal for this sync: attach the stable error code +

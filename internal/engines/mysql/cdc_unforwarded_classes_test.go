@@ -40,6 +40,7 @@ func gc2MySQLBase() *mysqlTableFacts {
 			"a":      {typ: "int", nullable: true},
 			"b":      {typ: "bigint", nullable: true},
 			"g":      {typ: "int", nullable: true, extra: "STORED GENERATED", generated: "(`x` + 1)"},
+			"amt":    {typ: "int", nullable: true, def: "0", hasDef: true},
 		},
 		constraints: map[string]mysqlConstraintFact{
 			"PRIMARY KEY PRIMARY": {kind: kindPrimaryKey, name: "PRIMARY", columns: []string{"id"}},
@@ -136,6 +137,9 @@ func TestDiffTableFacts_RefusesEveryUncarriedClass(t *testing.T) {
 			c.def, c.hasDef = "", false
 			f.columns["tenant"] = c
 		}, `ALTER COLUMN "tenant" DROP DEFAULT (was a)`},
+		{"retype that also changes the default value (reaches no Postgres target)", func(f *mysqlTableFacts) {
+			f.columns["amt"] = mysqlColumnFact{typ: "bigint", nullable: true, def: "7", hasDef: true}
+		}, `ALTER COLUMN "amt" SET DEFAULT 7 (was 0)`},
 		{"retype that discards the default (MODIFY without DEFAULT)", func(f *mysqlTableFacts) {
 			f.columns["tenant"] = mysqlColumnFact{typ: "varchar(40)"}
 		}, `ALTER COLUMN "tenant" DROP DEFAULT`},
@@ -217,8 +221,10 @@ func TestDiffTableFacts_ExemptsConsequencesOfHandledColumnChanges(t *testing.T) 
 			delete(f.columns, "x")
 			f.constraints["CHECK x_pos"] = mysqlConstraintFact{kind: kindCheck, name: "x_pos", detail: "((`y` > 0))"}
 		}},
-		{"retype re-renders the default value", func(f *mysqlTableFacts) {
-			f.columns["tenant"] = mysqlColumnFact{typ: "char(20)", def: "a ", hasDef: true}
+		// Measured on MySQL 8.0: INT DEFAULT 0 retyped to DECIMAL(5,2) reads
+		// back `0.00` — the spelling changes, the value does not.
+		{"retype re-renders the default spelling", func(f *mysqlTableFacts) {
+			f.columns["amt"] = mysqlColumnFact{typ: "decimal(5,2)", nullable: true, def: "0.00", hasDef: true}
 		}},
 	}
 	for _, tc := range cases {
@@ -454,5 +460,18 @@ func TestUnforwardedBaseline_CarriedAcrossReaders(t *testing.T) {
 	other.SetUnforwardedBaseline(map[uint32]int{1: 1})
 	if err := other.captureUnforwardedBaseline(t.Context()); err == nil {
 		t.Error("a foreign value was adopted as a baseline; it must be ignored")
+	}
+}
+
+// TestUnforwardedBaseline_PassesOnWhatItWasHandedWhenNeverStarted: the
+// binlog twin of the Postgres pin (2026-09-23 pre-tag review, F2).
+func TestUnforwardedBaseline_PassesOnWhatItWasHandedWhenNeverStarted(t *testing.T) {
+	first := &CDCReader{}
+	first.unforwarded.facts = map[string]*mysqlTableFacts{"src.t": gc2MySQLBase()}
+	middle := &CDCReader{}
+	middle.SetUnforwardedBaseline(first.UnforwardedBaseline())
+	got, ok := middle.UnforwardedBaseline().(mysqlUnforwardedBaseline)
+	if !ok || got["src.t"] == nil {
+		t.Fatalf("a reader that was handed a baseline and never started returned %v; want the handed baseline", middle.UnforwardedBaseline())
 	}
 }

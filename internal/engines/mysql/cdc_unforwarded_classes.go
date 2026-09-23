@@ -7,6 +7,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math/big"
 	"slices"
 	"sort"
 	"strings"
@@ -105,10 +106,20 @@ import (
 //   - A DEFAULT or generation expression re-rendered by a type change
 //     (measured: MySQL 8.0 reports `0` as `0.00` after `MODIFY x
 //     DECIMAL(5,2) DEFAULT 0` on an INT DEFAULT 0 column). Only the
-//     VALUE is exempt: a type change that ADDS or REMOVES a default — the
+//     SPELLING is exempt, judged by [sameDefaultValue] (numerically or
+//     textually equal): a changed VALUE riding a retype reaches a MySQL
+//     target through MODIFY COLUMN but not a Postgres one, whose forwarded
+//     ALTER TYPE carries no DEFAULT, so it refuses (2026-09-23 pre-tag
+//     review F6). A type change that ADDS or REMOVES a default — the
 //     classic `MODIFY x BIGINT` that silently discards `DEFAULT 5` — is
 //     refused, and so is an EXTRA change riding a type change (`MODIFY id
 //     BIGINT` without AUTO_INCREMENT removes it).
+//   - BINARY/VARBINARY literal defaults are compared on their TRUE bytes,
+//     re-read from SHOW CREATE TABLE ([binaryHexDefault]): information_schema
+//     cuts them at the first NUL, so a change after it (0x610000 →
+//     0x6100FF) read identically there (review F5, GC-29's sibling).
+//     Both rules are grounded on a real server by
+//     TestTableFacts_DiffPremisesOnARealServer.
 //   - A foreign key whose REFERENCED table or column changed because the
 //     parent was renamed: exempt only when the old referenced table / each
 //     old referenced column no longer exists on the server, i.e. the
@@ -273,6 +284,13 @@ func readColumnFacts(ctx context.Context, db *sql.DB, flavor Flavor, args []any,
 		return err
 	}
 	defer rows.Close()
+	// BINARY/VARBINARY literal defaults: information_schema cuts them at the
+	// first NUL byte, so a change after it is invisible there (0x610000 →
+	// 0x6100FF both read "0x61", measured on MySQL 8.4). Collected here and
+	// re-read from SHOW CREATE TABLE below — the same recovery the schema
+	// readers run (GC-29, binary_default_recovery.go).
+	type binaryDefault struct{ schema, table, column string }
+	var pending []binaryDefault
 	for rows.Next() {
 		var (
 			s, t, col, typ, nullable, extra, gen string
@@ -282,8 +300,52 @@ func readColumnFacts(ctx context.Context, db *sql.DB, flavor Flavor, args []any,
 			return err
 		}
 		get(s, t).columns[col] = columnFact(flavor, typ, nullable, def, extra, gen)
+		if binaryHexDefault(typ, extra, def) {
+			pending = append(pending, binaryDefault{s, t, col})
+		}
 	}
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	showCreate := map[string]string{}
+	for _, p := range pending {
+		key := p.schema + "." + p.table
+		stmt, ok := showCreate[key]
+		if !ok {
+			var name string
+			q := "SHOW CREATE TABLE `" + mysqlQuoteIdent(p.schema) + "`.`" + mysqlQuoteIdent(p.table) + "`"
+			if err := db.QueryRowContext(ctx, q).Scan(&name, &stmt); err != nil {
+				return fmt.Errorf("recover binary defaults of %s: %w", key, err)
+			}
+			showCreate[key] = stmt
+		}
+		c := get(p.schema, p.table).columns[p.column]
+		if raw, ok := parseShowCreateColumnDefault(stmt, p.column); ok {
+			c.def = bytesToHexLiteral(raw)
+		} else {
+			// Unparseable: keep the truncated value but mark it, so it can
+			// never compare equal to a recovered one by accident.
+			c.def = "unrecovered:" + c.def
+		}
+		get(p.schema, p.table).columns[p.column] = c
+	}
+	return nil
+}
+
+// binaryHexDefault reports a BINARY/VARBINARY column whose literal default
+// information_schema rendered as a (possibly NUL-truncated) hex literal —
+// the columns whose true bytes only SHOW CREATE TABLE carries. MariaDB
+// reports these quoted and escape-encoded, never as `0x…`, so it never
+// matches there.
+func binaryHexDefault(columnType, extra string, def sql.NullString) bool {
+	if !def.Valid || strings.Contains(strings.ToUpper(extra), "DEFAULT_GENERATED") {
+		return false
+	}
+	t := strings.ToLower(columnType)
+	if !strings.HasPrefix(t, "binary(") && !strings.HasPrefix(t, "varbinary(") {
+		return false
+	}
+	return hasHexLiteralPrefix(def.String)
 }
 
 // columnFact folds one columns row into the compared form.
@@ -511,7 +573,12 @@ func diffTableFacts(prior, cur *mysqlTableFacts, tablesNow map[string]*mysqlTabl
 			deltas = append(deltas, fmt.Sprintf("ALTER COLUMN %q DROP DEFAULT (was %s)", curName, pc.def))
 		case !pc.hasDef && cc.hasDef:
 			deltas = append(deltas, fmt.Sprintf("ALTER COLUMN %q SET DEFAULT %s", curName, cc.def))
-		case pc.def != cc.def && !retyped:
+		// A retype re-renders a default's SPELLING (INT 0 → DECIMAL(5,2)
+		// `0.00`, measured on MySQL 8.0) and only that is exempt: a changed
+		// VALUE riding a retype (`MODIFY x BIGINT DEFAULT 7` from INT DEFAULT 5)
+		// reaches a MySQL target through MODIFY COLUMN but not a Postgres one,
+		// whose forwarded ALTER TYPE carries no DEFAULT.
+		case pc.def != cc.def && (!retyped || !sameDefaultValue(pc.def, cc.def)):
 			deltas = append(deltas, fmt.Sprintf("ALTER COLUMN %q SET DEFAULT %s (was %s)", curName, cc.def, pc.def))
 		}
 		if pc.extra != cc.extra {
@@ -665,7 +732,11 @@ func (r *CDCReader) UnforwardedBaseline() any {
 	r.unforwarded.mu.Lock()
 	defer r.unforwarded.mu.Unlock()
 	if r.unforwarded.facts == nil {
-		return nil
+		// Never captured: pass on what it was handed (see the Postgres twin).
+		if r.unforwarded.carried == nil {
+			return nil
+		}
+		return r.unforwarded.carried
 	}
 	out := make(mysqlUnforwardedBaseline, len(r.unforwarded.facts))
 	for k, v := range r.unforwarded.facts {
@@ -779,4 +850,27 @@ func unforwardedChangeError(schema, table string, deltas []string) error {
 		"(2) restart with the SAME --stream-id. The restart takes a fresh baseline of these objects, so restarting WITHOUT step 1 "+
 		"accepts the difference permanently and nothing will report it again",
 		unforwardedChangeMarker, schema, table, strings.Join(deltas, "; "))
+}
+
+// sameDefaultValue reports whether two catalog renderings of a column
+// default denote the same value — the only difference a retype is allowed
+// to make to a default. Numeric spellings compare as exact rationals
+// (`0` = `0.00`, `5` = `5.0`); anything else compares as text after
+// removing one pair of surrounding single quotes (MariaDB reports string
+// defaults quoted). Anything it cannot prove equal is different, so the
+// door refuses rather than exempts.
+func sameDefaultValue(a, b string) bool {
+	unquote := func(s string) string {
+		if len(s) >= 2 && s[0] == '\'' && s[len(s)-1] == '\'' {
+			return s[1 : len(s)-1]
+		}
+		return s
+	}
+	a, b = unquote(a), unquote(b)
+	if a == b {
+		return true
+	}
+	ra, okA := new(big.Rat).SetString(a)
+	rb, okB := new(big.Rat).SetString(b)
+	return okA && okB && ra.Cmp(rb) == 0
 }

@@ -91,6 +91,8 @@ func TestStreamer_AddColumnForward_MySQLToPostgres_BinaryDefaultNUL(t *testing.T
 		{"b3", "b3 BINARY(3) DEFAULT 0xFFEEDD", "ffeedd"},
 		{"b4", "b4 VARBINARY(4) DEFAULT 0xFF00", "ff00"},
 		{"b5", "b5 BINARY(3) DEFAULT 0xFF00AA", "ff00aa"},
+		{"b6", "b6 VARBINARY(4) DEFAULT 0x6100", "6100"},
+		{"b7", "b7 BINARY(4) DEFAULT 0x00410042", "00410042"},
 	}
 
 	nextID := 3
