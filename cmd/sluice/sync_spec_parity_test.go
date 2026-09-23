@@ -47,6 +47,12 @@ var syncStartFleetExclusions = map[string]string{
 	"reset-target-data":         "destructive one-shot recovery; requires typed confirmation, meaningless as standing config",
 	"restart-from-scratch":      "destructive one-shot recovery; a standing 'always restart' key would re-copy on every supervisor restart",
 	"no-auto-resnapshot":        "recovery-posture override tied to the interactive recovery flow above; not in the curated subset (ADR-0122 §3)",
+	// A standing syncs.yaml key would pre-accept EVERY future refusal on every
+	// supervisor restart — exactly the silent re-baseline the persisted refusal
+	// exists to prevent. A fleet leg is acknowledged by one `sync start
+	// --accept-unforwarded-schema-change` for that stream id, which clears the
+	// record on the target the fleet leg then resumes against.
+	"accept-unforwarded-schema-change": "one-shot acknowledgement of a recorded UNFORWARDED-SCHEMA-CHANGE refusal; as standing config it would silently accept every future refusal on each restart",
 
 	// ---- position-from-manifest / broker resume family (cli-only) ----
 	"position-from-manifest": "one-shot resume-from-backup entry point; the fleet path is `sync from-backup` (the broker)",

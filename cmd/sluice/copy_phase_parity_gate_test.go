@@ -207,8 +207,9 @@ var migrateSyncDivergenceReason = map[string]string{
 	"shard-coordination-retry-period":   reasonShapeALiveDDL,
 
 	// ---- sync-only: the rest ----
-	"where-strict-collation": "inapplicable: ADR-0174 Piece 1's strictness applies to the CDC leg's CLIENT-SIDE predicate evaluator (buildWhereCDCFilter is its only consumer). migrate pushes --where down to the source, which applies its own collation natively — there is no client-side re-evaluation to be strict about",
-	"schema-already-applied": "GAP: the promise \"the target catalog is already correct, skip the DDL phases\" is equally meaningful for a migrate that is only moving rows, but only the Streamer has the flag and the SkipSchemaApply plumbing. Not wired to the Migrator; filed 2026-08-01",
+	"accept-unforwarded-schema-change": "inapplicable: acknowledges a refusal the CDC readers' unforwarded-schema-change door (GC-2) recorded on the stream's sluice_cdc_state row; migrate opens no change stream and keeps no stream row, so there is no refusal to record or acknowledge",
+	"where-strict-collation":           "inapplicable: ADR-0174 Piece 1's strictness applies to the CDC leg's CLIENT-SIDE predicate evaluator (buildWhereCDCFilter is its only consumer). migrate pushes --where down to the source, which applies its own collation natively — there is no client-side re-evaluation to be strict about",
+	"schema-already-applied":           "GAP: the promise \"the target catalog is already correct, skip the DDL phases\" is equally meaningful for a migrate that is only moving rows, but only the Streamer has the flag and the SkipSchemaApply plumbing. Not wired to the Migrator; filed 2026-08-01",
 }
 
 // commandFlagNames enumerates one command's flags through kong's REAL model

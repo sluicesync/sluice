@@ -619,11 +619,12 @@ func (r *CDCReader) gradeUnforwardedClasses(ctx context.Context, relationID uint
 }
 
 func unforwardedChangeError(schema, table string, deltas []string) error {
-	return fmt.Errorf("postgres: cdc: %s on %s.%s: the source changed schema objects that logical replication does not carry "+
+	return markUnforwardedRefusal(fmt.Errorf("postgres: cdc: %s on %s.%s: the source changed schema objects that logical replication does not carry "+
 		"and sluice cannot forward: %s. The target (or the backup chain) does not have this change, so continuing would leave it "+
 		"silently weaker than the source — for a policy or row level security change, a security boundary. Remedy: "+
 		"(1) apply the same change to the target yourself (for `backup stream`, take a new full backup instead); "+
-		"(2) restart with the SAME --stream-id. The restart takes a fresh baseline of these objects, so restarting WITHOUT step 1 "+
+		"(2) restart with the SAME --stream-id and --accept-unforwarded-schema-change. sluice records this refusal, so a restart "+
+		"WITHOUT that flag refuses again; the flag takes a fresh baseline of these objects, so passing it WITHOUT step 1 "+
 		"accepts the difference permanently and nothing will report it again",
-		unforwardedChangeMarker, schema, table, strings.Join(deltas, "; "))
+		unforwardedChangeMarker, schema, table, strings.Join(deltas, "; ")))
 }

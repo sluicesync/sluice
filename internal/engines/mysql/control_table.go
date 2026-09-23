@@ -340,6 +340,12 @@ func ensureControlTable(ctx context.Context, db *sql.DB, controlKeyspace string)
 	if err := ensureCrossEngineParityColumn(ctx, db, controlKeyspace, "rows_applied", "BIGINT NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
+	// unforwarded_refusal: the persisted UNFORWARDED-SCHEMA-CHANGE refusal,
+	// so a restarted stream refuses again instead of re-baselining past the
+	// change. NULL == "no refusal recorded" (legacy rows).
+	if err := ensureUnforwardedRefusalColumn(ctx, db, controlKeyspace); err != nil {
+		return err
+	}
 	// source_position TEXT → LONGTEXT widen (roadmap item 65a): tables
 	// created by a pre-widen binary carry the 64 KB TEXT column.
 	return ensureLongTextPositionColumn(ctx, db, controlKeyspace, controlTableName, "source_position", "LONGTEXT NOT NULL")
@@ -362,6 +368,7 @@ func controlTableDDL(controlKeyspace string) string {
 	source_dsn_fingerprint VARCHAR(255) NULL,
 	target_schema          VARCHAR(255) NULL,
 	rows_applied           BIGINT       NOT NULL DEFAULT 0,
+	unforwarded_refusal    TEXT         NULL,
 	PRIMARY KEY (stream_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
 }

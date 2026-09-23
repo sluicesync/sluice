@@ -138,6 +138,11 @@ var (
 	_ ir.SourceFingerprintRecorder      = (*ChangeApplier)(nil)
 	_ ir.StreamCleaner                  = (*ChangeApplier)(nil)
 	_ ir.StreamIDSetter                 = (*ChangeApplier)(nil)
+	// The persisted UNFORWARDED-SCHEMA-CHANGE refusal. Runtime-dispatched from
+	// the streamer's startup door and its end-of-run record; a drift here
+	// would silently stop both, and every process restart would re-baseline
+	// past a refused schema change again.
+	_ ir.UnforwardedRefusalStore = (*ChangeApplier)(nil)
 
 	// Binlog CDC reader optional surfaces.
 	_ ir.CDCDatabaseScoper = (*CDCReader)(nil)

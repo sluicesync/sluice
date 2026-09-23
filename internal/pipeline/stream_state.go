@@ -87,6 +87,18 @@ type streamState struct {
 	// indistinguishable from a crashed owner and the next stream has
 	// to wait out the staleness window — see [priorHandedOff].
 	StoppedAt *time.Time `json:"stopped_at,omitempty"`
+
+	// UnforwardedRefusal, when non-empty, is an UNFORWARDED-SCHEMA-CHANGE
+	// refusal ([ir.ErrUnforwardedSchemaChange]) a previous run ended on:
+	// the chain does not carry a source schema change the CDC stream cannot
+	// forward. The next `backup stream run` refuses until
+	// --accept-unforwarded-schema-change (see
+	// [BackupStream.refuseRecordedUnforwardedChange]) — a restarted reader
+	// would baseline the already-changed catalog and accept it silently.
+	// Every writer of this file preserves it: the read-modify-write paths
+	// carry the prior value, and the one full rewrite (the initial state
+	// write at start) runs only after the door has passed.
+	UnforwardedRefusal string `json:"unforwarded_schema_change_refusal,omitempty"`
 }
 
 // readStreamState loads the state file at path from store. Returns
@@ -173,6 +185,13 @@ func writeStreamStateMergeHeartbeat(ctx context.Context, store irbackup.Store, p
 	if prior != nil && prior.StopRequestedAt != nil && s.StopRequestedAt == nil {
 		s.StopRequestedAt = prior.StopRequestedAt
 		stopObserved = true
+	}
+	// A recorded unforwarded-schema-change refusal is never the heartbeat's
+	// to drop: this stream's in-memory state was built before any record
+	// existed, so writing it verbatim would erase one another writer (or
+	// this stream's own exit path, racing a heartbeat) put there.
+	if prior != nil && s.UnforwardedRefusal == "" {
+		s.UnforwardedRefusal = prior.UnforwardedRefusal
 	}
 	if err := writeStreamState(ctx, store, path, s); err != nil {
 		return stopObserved, err

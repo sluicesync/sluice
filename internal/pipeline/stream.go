@@ -197,6 +197,15 @@ type BackupStream struct {
 	// when the bypass is exercised.
 	Force bool
 
+	// AcceptUnforwardedSchemaChange is the one-shot acknowledgement of an
+	// UNFORWARDED-SCHEMA-CHANGE refusal a previous run recorded in
+	// stream_state.json (`--accept-unforwarded-schema-change`). Without it
+	// Run refuses before the CDC pump opens; with it the record is dropped
+	// by the initial state write and the reader takes a fresh baseline.
+	// Zero-value safe: false keeps refusing. See
+	// [BackupStream.refuseRecordedUnforwardedChange].
+	AcceptUnforwardedSchemaChange bool
+
 	// RolloverHook is an optional shell command invoked after each
 	// rollover commits successfully. The hook receives env vars
 	// SLUICE_ROLLOVER_MANIFEST_PATH, SLUICE_ROLLOVER_PARENT_BACKUP_ID,
@@ -368,6 +377,11 @@ func (b *BackupStream) Run(ctx context.Context) (err error) {
 			b.recordCleanExit(ctx, init.statePath, init.state.PID, init.state.Host, init.now)
 		}
 	}()
+	// A fresh UNFORWARDED-SCHEMA-CHANGE refusal is the one error return
+	// that DOES write the state file: the refusal must outlive this
+	// process, or the next run re-baselines past the change the chain
+	// does not carry. The error itself is returned unchanged.
+	defer func() { b.recordUnforwardedRefusal(ctx, init.statePath, err) }()
 	// The pump is returned OPEN and the stop channel already registered, so
 	// arm both teardowns BEFORE the signed-chain probe: its refusal (and its
 	// cancel arm below) exits Run, and leaving the defers below it leaked a
@@ -730,6 +744,13 @@ func (b *BackupStream) newRolloverLoop(ctx context.Context) (*rolloverInit, erro
 	//    lineage root — it's a stream-level liveness file, not
 	//    per-segment).
 	if err := b.preflightStreamState(ctx, statePath, rolloverWindow, pid, host, now()); err != nil {
+		return nil, err
+	}
+
+	// 1.1. The persisted unforwarded-schema-change refusal: replay a
+	//    recorded one unless acknowledged, before the CDC pump opens (a
+	//    fresh pump would baseline the already-changed catalog).
+	if err := b.refuseRecordedUnforwardedChange(ctx, statePath); err != nil {
 		return nil, err
 	}
 

@@ -1276,6 +1276,8 @@ type SyncStartCmd struct {
 
 	NoAutoResnapshot bool `help:"Suppress the automatic re-snapshot when a resume hits a purged/invalid source position. By default (parity with the self-hosted binlog path, ADR-0093) a resume from a position older than the source's retained binlogs — routine on PlanetScale's binlog-retention window — auto-recovers with a fresh cold-start re-snapshot: on an idempotent source (VStream/PlanetScale) the upsert copy absorbs the overlap and the target is NOT dropped; on a non-idempotent source (native MySQL binlog) the in-scope target tables are dropped and recreated first so the plain-INSERT copy starts clean (the cdc-state row is preserved). With this flag set, sluice instead fails LOUDLY with an actionable error naming the recovery commands (--restart-from-scratch / --reset-target-data), so the operator decides — useful when a full re-snapshot is expensive (very large tables) and should be a deliberate choice. Gates BOTH the pre-flight fall-through and the reactive VStream recovery."`
 
+	AcceptUnforwardedSchemaChange bool `name:"accept-unforwarded-schema-change" help:"One-shot acknowledgement of a recorded UNFORWARDED-SCHEMA-CHANGE refusal. When a stream stops because the source changed a constraint, policy, row level security or default that CDC cannot forward, sluice records the refusal on the target and every later start refuses again. Apply the same change to the target FIRST, then restart once with this flag: it clears the record and takes a fresh baseline of those objects, so passing it without applying the change accepts the difference permanently."`
+
 	SchemaAlreadyApplied bool `help:"Skip every DDL phase during cold-start (CREATE TABLE / CREATE INDEX / ADD FOREIGN KEY / CREATE VIEW / SyncIdentitySequences / EnsureControlTable). Operator promises the target's catalog matches the source's AND the sluice_cdc_state control table is pre-created. Use this on PlanetScale branches with Safe Migrations enabled (GitHub #17), or on Atlas/Liquibase-managed schemas where DDL goes through a separate pipeline. The cold-start preflight refusal is also skipped — bulk-copy runs into operator-prepared empty tables; sluice does NOT validate the schema match."`
 
 	Yes bool `help:"Confirm --reset-target-data. Required when stdin is not a terminal (scripts, CI, agents): without it the command refuses with SLUICE-E-CONFIRMATION-REQUIRED instead of prompting. On a terminal it skips the typed 'reset' prompt." short:"y"`
@@ -2212,34 +2214,37 @@ func (s *SyncStartCmd) run(g *Globals, env *envelopeRun) error {
 		// this opt-out field IS auto-recover); --no-auto-resnapshot flips it
 		// to a loud terminal failure instead.
 		SuppressAutoResnapshotOnInvalidPosition: s.NoAutoResnapshot,
-		SchemaAlreadyApplied:                    s.SchemaAlreadyApplied,
-		ApplyBatchSize:                          applyBatchSize,
-		AutoTune:                                !s.NoAutoTune,
-		ApplyTuneTargetLatency:                  s.ApplyTuneTargetLatency,
-		MaxBufferBytes:                          s.MaxBufferBytes,
-		IndexBuildMem:                           indexBuildMem,
-		IndexBuildParallelism:                   s.IndexBuildParallelism,
-		IndexBuildFallback:                      indexFallback, // ADR-0148 / audit MED-A1: nil unless armed (see above)
-		MaxTargetConnections:                    s.MaxTargetConnections,
-		BulkParallelism:                         s.BulkParallelism,
-		TableParallelism:                        s.TableParallelism,
-		BulkParallelMinRows:                     s.BulkParallelMinRows,
-		BulkBatchSize:                           s.BulkBatchSize,
-		CopyFanoutDegree:                        s.CopyFanoutDegree,
-		NoIntraTableStealing:                    s.NoIntraTableStealing,
-		NoFloatExactReread:                      s.NoFloatExactReread,
-		StrictFloat:                             s.StrictFloat,
-		RawCopyFormat:                           parseRawCopyFormat(s.RawCopyFormat),
-		ReapStaleBackends:                       s.ReapStaleBackends,
-		ApplyExecTimeout:                        s.ApplyExecTimeout,
-		ApplyDelay:                              s.ApplyDelay,
-		ApplyConcurrency:                        s.ApplyConcurrency,
-		ApplyRetryAttempts:                      s.ApplyRetryAttempts,
-		ApplyRetryBackoffBase:                   s.ApplyRetryBackoffBase,
-		ApplyRetryBackoffCap:                    s.ApplyRetryBackoffCap,
-		MetricsListen:                           s.MetricsListen,
-		BuildVersion:                            version,
-		BuildCommit:                             commit,
+		// One-shot acknowledgement of a recorded UNFORWARDED-SCHEMA-CHANGE
+		// refusal; the zero value (every non-CLI construction) keeps refusing.
+		AcceptUnforwardedSchemaChange: s.AcceptUnforwardedSchemaChange,
+		SchemaAlreadyApplied:          s.SchemaAlreadyApplied,
+		ApplyBatchSize:                applyBatchSize,
+		AutoTune:                      !s.NoAutoTune,
+		ApplyTuneTargetLatency:        s.ApplyTuneTargetLatency,
+		MaxBufferBytes:                s.MaxBufferBytes,
+		IndexBuildMem:                 indexBuildMem,
+		IndexBuildParallelism:         s.IndexBuildParallelism,
+		IndexBuildFallback:            indexFallback, // ADR-0148 / audit MED-A1: nil unless armed (see above)
+		MaxTargetConnections:          s.MaxTargetConnections,
+		BulkParallelism:               s.BulkParallelism,
+		TableParallelism:              s.TableParallelism,
+		BulkParallelMinRows:           s.BulkParallelMinRows,
+		BulkBatchSize:                 s.BulkBatchSize,
+		CopyFanoutDegree:              s.CopyFanoutDegree,
+		NoIntraTableStealing:          s.NoIntraTableStealing,
+		NoFloatExactReread:            s.NoFloatExactReread,
+		StrictFloat:                   s.StrictFloat,
+		RawCopyFormat:                 parseRawCopyFormat(s.RawCopyFormat),
+		ReapStaleBackends:             s.ReapStaleBackends,
+		ApplyExecTimeout:              s.ApplyExecTimeout,
+		ApplyDelay:                    s.ApplyDelay,
+		ApplyConcurrency:              s.ApplyConcurrency,
+		ApplyRetryAttempts:            s.ApplyRetryAttempts,
+		ApplyRetryBackoffBase:         s.ApplyRetryBackoffBase,
+		ApplyRetryBackoffCap:          s.ApplyRetryBackoffCap,
+		MetricsListen:                 s.MetricsListen,
+		BuildVersion:                  version,
+		BuildCommit:                   commit,
 		// ADR-0107: nil unless the operator opted into PlanetScale telemetry.
 		// telemetryProviderOrNil returns a TRUE nil interface when off, so the
 		// streamer's `TargetTelemetry != nil` guards stay exact (no typed-nil

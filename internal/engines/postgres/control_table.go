@@ -163,7 +163,11 @@ func ensureControlTable(ctx context.Context, db *sql.DB, schema string) error {
 	if _, err := db.ExecContext(ctx, alter); err != nil {
 		return fmt.Errorf("postgres: ensure control table: add rows_applied: %w", err)
 	}
-	return nil
+	// Migration path for deployments that pre-date the persisted refusal:
+	// the unforwarded_refusal column holds an UNFORWARDED-SCHEMA-CHANGE
+	// refusal so a restarted stream refuses again instead of re-baselining
+	// past the change. NULL on legacy rows (== "no refusal recorded").
+	return ensureUnforwardedRefusalColumn(ctx, db, schema)
 }
 
 // skippedTablesTableRef is controlTableRef's counterpart for the

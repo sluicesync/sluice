@@ -181,6 +181,11 @@ var (
 	_ ir.StreamCleaner                  = (*ChangeApplier)(nil)
 	_ ir.StreamIDSetter                 = (*ChangeApplier)(nil)
 	_ ir.UpsertKeyPreflighter           = (*ChangeApplier)(nil)
+	// The persisted UNFORWARDED-SCHEMA-CHANGE refusal. Runtime-dispatched from
+	// the streamer's startup door and its end-of-run record; a drift here
+	// would silently stop both, and every process restart would re-baseline
+	// past a refused schema change again.
+	_ ir.UnforwardedRefusalStore = (*ChangeApplier)(nil)
 	// audit 2026-07-26 ARCH-1: implemented and runtime-dispatched
 	// (vacuum_health_notify.go) but never pinned, so a receiver or signature
 	// change would leave every build and test GREEN while the alerter silently

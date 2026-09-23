@@ -65,7 +65,7 @@ The restart policies below key off the exit status, so here is the contract. slu
 | 0 | Success / clean drain. |
 | 1 | Generic runtime failure (also: `verify`/`diff`/`sync-health` found drift — those commands' long-standing per-command meaning). |
 | 2 | Config error — the `--config` file could not be loaded or parsed (the read-side check commands have always used 2 for "could not run the check at all"). |
-| 3 | Named refusal — sluice refused to proceed and named the remedy (e.g. cold-start into a populated target). Restarting without acting on the hint fails identically, so pair `Restart=on-failure` with an alert on repeated exit-3s rather than counting on the retry. |
+| 3 | Named refusal — sluice refused to proceed and named the remedy (e.g. cold-start into a populated target). Restarting without acting on the hint fails identically, so pair `Restart=on-failure` with an alert on repeated exit-3s rather than counting on the retry. `UNFORWARDED-SCHEMA-CHANGE` behaves the same way on restart — the refusal is recorded and every later start refuses again until `--accept-unforwarded-schema-change` ([cdc-streaming](cdc-streaming.md)) — but it carries no error code yet, so it exits 1, not 3. |
 | 80 | Usage error — kong (the CLI parser) rejects unknown flags/commands with exit 80 before sluice runs. |
 
 Codes 0 and 1 have meant this since the first release; 2 and 3 were carved out of the generic 1 later, so a script checking `!= 0` is unaffected while a script checking `== 1` specifically may need updating. Details and the error-code registry: [error-codes](error-codes.md).

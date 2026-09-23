@@ -546,12 +546,16 @@ MySQL and MariaDB binlog sources have the same gap for a different reason: sluic
 
 When the stream starts, sluice records these objects for every table (the baseline). On Postgres, each such DDL makes the server resend the table's description before the next change it decodes for that table. On MySQL, the DDL clears sluice's schema cache and the next row on the table rebuilds it. At that point sluice reads the table again and compares. On any difference, `sync` and `backup stream` end with `UNFORWARDED-SCHEMA-CHANGE`, naming each change. The refusal is never retried automatically. An automatic retry after some OTHER transient error (a dropped connection, say) keeps the baseline the stream started with, so a change made just before that error is still refused.
 
+**The refusal is recorded and survives a restart.** `sync` records it on the stream's row of the target's `sluice_cdc_state` table (column `unforwarded_refusal`); `backup stream` records it in the destination's `stream_state.json`. Every later start of that stream reads the record before it opens a change stream and refuses again, quoting the recorded refusal, on every start path (warm resume, multi-database resume, `--restart-from-scratch`, `--reset-target-data`). This matters under a supervisor: a restarted reader would baseline the source catalog that already has the change, so without the record a `Restart=on-failure` unit, a pod restart or a fleet restart would accept the change silently.
+
 To continue:
 
 1. Apply the same change to the target yourself. For `backup stream`, take a new full backup instead; a chain restored from the old full would lack the change.
-2. Restart with the same `--stream-id`.
+2. Restart once with the same `--stream-id` and `--accept-unforwarded-schema-change` (the same flag on `backup stream run`). It clears the record, logs a WARN naming what was accepted, and takes a fresh baseline. The flag is one-shot: it acknowledges the refusal that is recorded now, not later ones, so drop it from the command line afterwards.
 
-**The restart takes a fresh baseline, so restarting without step 1 accepts the difference permanently** and nothing reports it again.
+**The acknowledgement takes a fresh baseline, so passing it without step 1 accepts the difference permanently** and nothing reports it again. A fleet (`sync run`) leg has no `syncs.yaml` key for it on purpose, since standing config would pre-accept every future refusal: stop the leg, run `sluice sync start --stream-id <id> … --accept-unforwarded-schema-change` once for that stream, stop it with `sluice sync stop`, and start the fleet again.
+
+If sluice cannot write the record (the target is unreachable at that moment, say), it logs an ERROR saying a restart will NOT refuse again. Treat that line as "do not restart until the change is applied to the target".
 
 Changes sluice already forwards are not refused: adding, dropping or retyping a column (ADR-0091), including the attributes of a newly added column and a constraint that disappears because its column was dropped. A foreign key is compared by what it references, not its text, so renaming the table it points at is not a refusal.
 

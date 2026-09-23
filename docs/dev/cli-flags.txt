@@ -170,6 +170,7 @@ backup prune --require-signature
 backup prune --sign
 backup prune --sign-key
 backup prune --verify-key
+backup stream run --accept-unforwarded-schema-change
 backup stream run --azure-key-vault-id
 backup stream run --azure-wrap-algorithm
 backup stream run --backup-endpoint
@@ -548,6 +549,7 @@ sync health --target
 sync health --target-driver
 sync run --dashboard-listen
 sync run --dry-run
+sync start --accept-unforwarded-schema-change
 sync start --all-databases
 sync start --all-schemas
 sync start --allow-cross-shard-merge

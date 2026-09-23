@@ -458,6 +458,22 @@ type Streamer struct {
 	// have it happen automatically.
 	SuppressAutoResnapshotOnInvalidPosition bool
 
+	// AcceptUnforwardedSchemaChange is the operator's one-shot
+	// acknowledgement of a recorded UNFORWARDED-SCHEMA-CHANGE refusal
+	// (`--accept-unforwarded-schema-change`). A run that ends with
+	// [ir.ErrUnforwardedSchemaChange] records the refusal on the stream's
+	// control-table row, and every later start refuses again before any
+	// change stream opens — because a fresh reader baselines the catalog
+	// that already carries the change and would accept it silently. True
+	// clears the record, logs what was accepted, and continues on a fresh
+	// baseline; it is consumed by that clear, so a later refusal in the same
+	// process is not pre-accepted.
+	//
+	// Zero-value safe by construction: false keeps refusing, which is the
+	// only safe default for every Streamer construction (CLI, fleet,
+	// tests). See [Streamer.phaseRefuseRecordedUnforwardedChange].
+	AcceptUnforwardedSchemaChange bool
+
 	// SchemaAlreadyApplied, when true, declares that the target's
 	// schema (and the `sluice_cdc_state` control table) have been
 	// pre-created out-of-band. Sluice skips every DDL phase during
@@ -1769,7 +1785,7 @@ func invalidPositionOptOutError(err error) error {
 // Returns nil on clean ctx cancellation; non-nil on any phase
 // failure. Resources (snapshot stream, target writers, applier)
 // are released before return regardless of outcome.
-func (s *Streamer) runOnce(ctx context.Context) error {
+func (s *Streamer) runOnce(ctx context.Context) (err error) {
 	// ---- 0. Validate + resolve identity ----
 	// Field-surface validation, per-attempt state reset, slot-name +
 	// engine-default-exclusion conventions, stream-id resolution.
@@ -1795,6 +1811,12 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 	if ownsApplier {
 		defer migcore.CloseIf(applier)
 	}
+	// A fresh UNFORWARDED-SCHEMA-CHANGE refusal is persisted on the way
+	// out, while the applier is still open, so the next start refuses
+	// again instead of re-baselining past it (see
+	// unforwarded_refusal_persist.go). The error itself is returned
+	// unchanged.
+	defer func() { s.recordUnforwardedRefusal(ctx, applier, streamID, err) }()
 	// ADR-0054 Phase 2d: release shape-coordination resources when
 	// engaged (SchemaWriter for per-shape DDL; the lease store /
 	// prober live on the applier and are released by migcore.CloseIf above).
@@ -1965,6 +1987,16 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 	// ---- 3.5. Dry-run: print plan and exit before any state mutation. ----
 	if s.DryRun {
 		return s.logDryRunPlan(ctx, streamID, persisted, found)
+	}
+
+	// ---- 3.55. The persisted unforwarded-schema-change refusal ----
+	// Before ANY change stream opens, on every dispatch branch below: a
+	// refusal a previous run recorded is replayed unless the operator
+	// acknowledged it (--accept-unforwarded-schema-change). A cold start
+	// with no row finds nothing — the refusal is recorded ON the row the
+	// CDC anchor creates, so it cannot exist before one.
+	if err := s.phaseRefuseRecordedUnforwardedChange(ctx, applier, streamID); err != nil {
+		return err
 	}
 
 	// ---- 3.6. Fetch the applier's LSN-feedback tracker (if any) ----

@@ -1154,6 +1154,8 @@ type BackupStreamCmd struct {
 
 	Force bool `help:"Bypass the concurrent-writer check at startup (refuses to start when an existing stream_state.json shows a recent last_rollover_at from a different pid/host). Operator-confirmed: 'I'm taking over this destination from a previous stream that may still be running.'"`
 
+	AcceptUnforwardedSchemaChange bool `name:"accept-unforwarded-schema-change" help:"One-shot acknowledgement of a recorded UNFORWARDED-SCHEMA-CHANGE refusal. When a stream stops because the source changed a constraint, policy, row level security or default that CDC cannot forward, sluice records the refusal in the destination's stream_state.json and every later run refuses again. Take a new full backup FIRST so the chain carries the change, then restart once with this flag: it clears the record and takes a fresh baseline of those objects, so passing it without the new full backup leaves the chain without the change permanently."`
+
 	RolloverHook string `help:"Shell command to invoke after each rollover commits successfully. Receives env vars SLUICE_ROLLOVER_MANIFEST_PATH, SLUICE_ROLLOVER_PARENT_BACKUP_ID, SLUICE_ROLLOVER_BACKUP_ID, SLUICE_ROLLOVER_CHANGES, SLUICE_ROLLOVER_BYTES, SLUICE_ROLLOVER_ELAPSED_MS. Hook errors are WARN-logged but don't fail the stream. 30s timeout." placeholder:"CMD"`
 
 	// ADR-0118 finding 2: the retry knobs are the same concept the sync
@@ -1244,26 +1246,29 @@ func (b *BackupStreamCmd) Run(g *Globals) error {
 		return err
 	}
 	stream := &pipeline.BackupStream{
-		Source:                    source,
-		SourceDSN:                 b.Source,
-		Store:                     store,
-		ParentRef:                 b.Since,
-		SlotName:                  pipeline.ResolveSlotName(b.SlotName),
-		RolloverWindow:            b.RolloverWindow,
-		RolloverMaxChanges:        b.RolloverMaxChanges,
-		RolloverMaxBytes:          b.RolloverMaxBytes,
-		ChunkChanges:              b.ChunkSize,
-		IncludeEmptyRollovers:     b.IncludeEmpty,
-		Force:                     b.Force,
-		RolloverHook:              b.RolloverHook,
-		SluiceVersion:             version,
-		Encryption:                encConfig,
-		RetryAttempts:             b.RetryAttempts,
-		RetryBackoffBase:          b.RetryBackoffBase,
-		RetryBackoffCap:           b.RetryBackoffCap,
-		RetainRotateAt:            b.RetainRotateAt,
-		RetainRotateAtChainLength: b.RetainRotateAtChainLength,
-		Codec:                     codec,
+		Source:                source,
+		SourceDSN:             b.Source,
+		Store:                 store,
+		ParentRef:             b.Since,
+		SlotName:              pipeline.ResolveSlotName(b.SlotName),
+		RolloverWindow:        b.RolloverWindow,
+		RolloverMaxChanges:    b.RolloverMaxChanges,
+		RolloverMaxBytes:      b.RolloverMaxBytes,
+		ChunkChanges:          b.ChunkSize,
+		IncludeEmptyRollovers: b.IncludeEmpty,
+		Force:                 b.Force,
+		// One-shot acknowledgement of a recorded UNFORWARDED-SCHEMA-CHANGE
+		// refusal; the zero value keeps refusing.
+		AcceptUnforwardedSchemaChange: b.AcceptUnforwardedSchemaChange,
+		RolloverHook:                  b.RolloverHook,
+		SluiceVersion:                 version,
+		Encryption:                    encConfig,
+		RetryAttempts:                 b.RetryAttempts,
+		RetryBackoffBase:              b.RetryBackoffBase,
+		RetryBackoffCap:               b.RetryBackoffCap,
+		RetainRotateAt:                b.RetainRotateAt,
+		RetainRotateAtChainLength:     b.RetainRotateAtChainLength,
+		Codec:                         codec,
 	}
 
 	// ADR-0156 phase 2: the TTY-aware live panel for the rolling-incremental
