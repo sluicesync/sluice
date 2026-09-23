@@ -416,6 +416,14 @@ sluice deploy-ddl --org <org> --database <db> --ddl '<one statement>'
 
 It is also the general escape hatch for any ad-hoc schema change on a safe-migrations branch — the safety wrapper (freshness gate, tolerant deploy poller, cleanup) applies to whatever single statement you pass.
 
+**Upgrading to v0.156.0 or later with an existing `sluice_cdc_state`: ship one ALTER.** v0.156.0 adds the `unforwarded_refusal` column, which records an `UNFORWARDED-SCHEMA-CHANGE` refusal so a restart refuses again ([cdc-streaming](operator/cdc-streaming.md)). A fresh bootstrap already has it, because `sluice control-tables ddl` prints it in the CREATE. But `CREATE TABLE IF NOT EXISTS` is a no-op on a table that already exists, and sluice's detect-then-ALTER is refused on a safe-migrations branch. What happens next depends on the start mode. A start without `--schema-already-applied` fails with `SLUICE-E-PS-DIRECT-DDL-BLOCKED`, naming the statement. A start with `--schema-already-applied`, the usual safe-migrations setup, skips that ensure but fails anyway: every start first makes sure a refusal could be recorded, because a stream that could not record one would have it accepted silently by the next restart. So ship the column once after upgrading, before restarting your streams:
+
+```
+sluice deploy-ddl --org <org> --database <db> --ddl 'ALTER TABLE `sluice_cdc_state` ADD COLUMN `unforwarded_refusal` TEXT NULL'
+```
+
+With a `--control-keyspace` sidecar, qualify the table with that keyspace. Once the column exists, sluice issues no DDL for it.
+
 ### Sharded targets: control tables and `--control-keyspace`
 
 A continuous sync stores three control tables on the target

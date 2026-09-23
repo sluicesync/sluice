@@ -23,6 +23,26 @@ full restart, refusing a bad reload loudly while the live fleet keeps running. S
 deferred: per-process MySQL overrides changing on reload, per-sync PlanetScale
 telemetry, and the TUI / dashboard layer.
 
+**Amendment (2026-09-23, v0.156.0): one failure is NOT restarted.** §1's
+"restarted on a bounded backoff" and §2's "restart forever" have a single
+exception. The exception is a sync that ends with `UNFORWARDED-SCHEMA-CHANGE`
+(`ir.ErrUnforwardedSchemaChange`, GC-2). `superviseOne` in
+`internal/pipeline/supervisor.go` marks that sync `failed` at once, logs it at
+ERROR, and does not restart it. The refusal is recorded on the target and
+replayed at every start, so a restart could only refuse again. And if the
+recording had failed, a restart would take a fresh baseline that already
+contains the refused change and accept it silently. The exception is scoped
+to that sentinel on purpose, not to every terminal error. Several terminal
+errors are terminal only to the in-process retry, and the fresh run this
+loop provides is exactly what recovers them. Pinned by
+`TestSupervisor_UnforwardedRefusalIsNotRestarted` and
+`TestSupervisor_OtherTerminalFailuresAreStillRestarted`. There is no
+`syncs.yaml` key for the acknowledgement, because standing config would
+pre-accept refusals. The operator starts that stream once outside the fleet
+with `--accept-unforwarded-schema-change=<fingerprint>`, stops it, then
+restarts the fleet or sends it a SIGHUP. A §7 reload starts a failed sync
+that is still configured. See `docs/operator/cdc-streaming.md`.
+
 **Concurrency chunk.** The supervisor is N goroutines over shared status state.
 Failure isolation is the load-bearing property and is pinned by a unit test with
 stubbed runners. `-race` can't run locally (CGO off); the CI `-race` integration
@@ -66,7 +86,9 @@ Each sync runs in its OWN goroutine under an internal supervise loop:
   cancel) → the sync is `stopped`, not restarted.
 - A non-nil return with a LIVE ctx is a crash/terminal error → the sync is logged
   loudly, backed off, and restarted (re-entering the Streamer's own cold-start /
-  warm-resume-from-persisted-position path). Peers are untouched.
+  warm-resume-from-persisted-position path). Peers are untouched. (Exception
+  since 2026-09-23: `UNFORWARDED-SCHEMA-CHANGE` is marked `failed` and not
+  restarted. See the Status amendment.)
 - A ctx cancel (Ctrl-C / SIGTERM) stops EVERY sync's loop cleanly; `Supervisor.Run`
   returns nil.
 
@@ -84,7 +106,8 @@ MaxConsecutiveFailures=0}`. Exponential backoff `base * 2^(n-1)` capped at
 the stream made progress" so a sync that ran for hours then died doesn't carry
 restart debt. `MaxConsecutiveFailures=0` (the default, zero-value-safe) means
 restart forever with the capped backoff — a sync whose source comes back recovers
-on its own. A positive cap transitions the sync to a terminal `failed` state after
+on its own. (The one failure never restarted, whatever the cap, is
+`UNFORWARDED-SCHEMA-CHANGE`. See the 2026-09-23 Status amendment.) A positive cap transitions the sync to a terminal `failed` state after
 N consecutive failures (logged loudly, peers unaffected) — chosen as the default in
 the failure-isolation TEST so the pin is deterministic, not as the production
 default.

@@ -540,7 +540,7 @@ The same marker also carries the probe's own failure — if sluice could not rea
 
 ## PostgreSQL and MySQL-family sources: a schema change the stream cannot carry ends it (`UNFORWARDED-SCHEMA-CHANGE`)
 
-Logical replication (pgoutput) describes a table by its column names and types, nothing more. So these source-side changes cannot reach the target through the stream: `ADD`/`DROP CONSTRAINT` (primary key, `UNIQUE`, foreign key, `EXCLUDE`, `CHECK`), `ENABLE`/`FORCE ROW LEVEL SECURITY`, `CREATE`/`ALTER`/`DROP POLICY`, `SET`/`DROP NOT NULL`, `SET`/`DROP DEFAULT`, and identity changes. Before this door existed each one was ignored silently, and the target stayed weaker than the source. The worst shape was one statement: `ALTER TABLE t ADD COLUMN x int, ADD CONSTRAINT fk FOREIGN KEY (x) REFERENCES p(id)` forwarded the column and dropped the foreign key.
+Logical replication (pgoutput) describes a table by its column names and types, nothing more. So these source-side changes cannot reach the target through the stream: `ADD`/`DROP CONSTRAINT` (primary key, `UNIQUE`, foreign key, `EXCLUDE`, `CHECK`), `ENABLE`/`FORCE ROW LEVEL SECURITY`, `CREATE`/`ALTER`/`DROP POLICY`, `SET`/`DROP NOT NULL`, `SET`/`DROP DEFAULT`, and identity changes. Before v0.156.0 each one was ignored silently, and the target stayed weaker than the source. The worst shape was one statement: `ALTER TABLE t ADD COLUMN x int, ADD CONSTRAINT fk FOREIGN KEY (x) REFERENCES p(id)` forwarded the column and dropped the foreign key.
 
 MySQL and MariaDB binlog sources have the same gap for a different reason: sluice re-reads only a table's columns after a DDL. There the door covers primary key, `UNIQUE`, foreign key and `CHECK` changes (including `NOT ENFORCED` on MySQL), and `DEFAULT`, `EXTRA` or generation-expression changes on an existing column. Nullability is already carried by the column forward.
 
@@ -548,21 +548,40 @@ When the stream starts, sluice records these objects for every table (the baseli
 
 **The refusal is recorded and survives a restart.** `sync` records it on the stream's row of the target's `sluice_cdc_state` table (column `unforwarded_refusal`); `backup stream` records it in the destination's `stream_state.json`. Every later start of that stream reads the record before it opens a change stream and refuses again, quoting the recorded refusal, on every start path (warm resume, multi-database resume, `--restart-from-scratch`, `--reset-target-data`). This matters under a supervisor: a restarted reader would baseline the source catalog that already has the change, so without the record a `Restart=on-failure` unit, a pod restart or a fleet restart would accept the change silently.
 
+The refusal carries no `SLUICE-E-*` code, so the process exits **1**, not 3, and a JSON log line or envelope has no `code` or `hint` to branch on. Match on the marker `UNFORWARDED-SCHEMA-CHANGE` in the message instead.
+
+**The replayed refusal prints a fingerprint.** The refusal that stops the stream names the changes. The next start replays the recorded refusal and adds `fingerprint <12 hex digits>`, the first 12 hex digits of the SHA-256 of the recorded text, and the exact acknowledgement to pass (`--accept-unforwarded-schema-change=<fingerprint>`). So to get the fingerprint, start the stream once without the flag and read the refusal.
+
 To continue:
 
 1. Apply the same change to the target yourself. For `backup stream`, take a new full backup instead; a chain restored from the old full would lack the change.
-2. Restart once with the same `--stream-id` and `--accept-unforwarded-schema-change` (the same flag on `backup stream run`). It clears the record, logs a WARN naming what was accepted, and takes a fresh baseline. The flag is one-shot: it acknowledges the refusal that is recorded now, not later ones, so drop it from the command line afterwards.
+2. Start once with the same `--stream-id` and `--accept-unforwarded-schema-change=<fingerprint>` (the same flag on `backup stream run`). It clears the record, logs a WARN naming what was accepted, and takes a fresh baseline.
 
-**The acknowledgement takes a fresh baseline, so passing it without step 1 accepts the difference permanently** and nothing reports it again. A fleet (`sync run`) leg has no `syncs.yaml` key for it on purpose, since standing config would pre-accept every future refusal: stop the leg, run `sluice sync start --stream-id <id> … --accept-unforwarded-schema-change` once for that stream, stop it with `sluice sync stop`, and start the fleet again.
+**The acknowledgement is bound to one refusal.** Only the fingerprint of the refusal recorded now clears it. A value naming any other refusal is refused, with the message saying the acknowledgement "names a different refusal than the one recorded, so it was not applied". An empty value keeps refusing. Once the flag has cleared the record, the running process treats it as spent, so a later refusal in the same process is not pre-accepted. This is what makes a flag left behind in a systemd `ExecStart` line or a wrapper script harmless: it cannot clear the next, different refusal on the next automatic restart. Remove it from the command line anyway.
 
-If sluice cannot write the record (the target is unreachable at that moment, say), it logs an ERROR saying a restart will NOT refuse again. Treat that line as "do not restart until the change is applied to the target".
+**The acknowledgement takes a fresh baseline, so passing it without step 1 accepts the difference permanently** and nothing reports it again.
 
-Changes sluice already forwards are not refused: adding, dropping or retyping a column (ADR-0091), including the attributes of a newly added column and a constraint that disappears because its column was dropped. A foreign key is compared by what it references, not its text, so renaming the table it points at is not a refusal.
+**Fleet legs (`sync run`).** The supervisor does not restart a leg that stopped with `UNFORWARDED-SCHEMA-CHANGE`. It marks the leg `failed` and logs it at ERROR; other legs keep running. There is deliberately no `syncs.yaml` key for the acknowledgement, because standing config would pre-accept refusals. To acknowledge:
+
+1. Apply the change to the target (the leg is already stopped).
+2. Start that stream once outside the fleet: `sluice sync start --stream-id <id> … --accept-unforwarded-schema-change=<fingerprint>`, with the leg's own source, target and flags.
+3. Stop it with `sluice sync stop --stream-id <id> … --wait`.
+4. Restart the fleet process. On Linux and macOS a `SIGHUP` also works: a reload starts a failed leg that is still in `syncs.yaml`.
+
+Every other leg failure is restarted on backoff, as before.
+
+If sluice cannot write the record (the target is unreachable at that moment, say), it logs an ERROR saying a restart will NOT refuse again. Treat that line as "do not restart until the change is applied to the target". A target whose control table lacks the `unforwarded_refusal` column, where sluice cannot add it, never gets that far: every `sync start` first makes sure a refusal could be recorded, and fails before streaming when it could not. A Postgres role that does not own the table cannot add the column, and a PlanetScale safe-migrations branch refuses the ALTER. See [schema-change-runbook](../schema-change-runbook.md) and [managed-services](../managed-services.md) for adding it after an upgrade.
+
+Changes sluice already forwards are not refused: adding, dropping or retyping a column (ADR-0091), including the attributes of a newly added column and a constraint that disappears because its column was dropped. A retype does not excuse a new DEFAULT *value*. The forwarded type change carries no DEFAULT on a Postgres target, so a retype that also changes the default value refuses. Only a re-spelling of the same value is exempt (MySQL renders `0` as `0.00` after a move to `DECIMAL`), plus, on Postgres, a generation expression re-rendered by the retype. A foreign key is compared by what it references, not its text, so renaming the table it points at is not a refusal. Constraint validity is not compared, so `ADD … NOT VALID` followed by `VALIDATE CONSTRAINT` does not refuse.
 
 What this does not catch, stated so it is not read as broader:
 
-- A change made while the stream was stopped, or during the cold-start copy, is already in the baseline.
-- MySQL only: `DROP COLUMN b` shrinks a composite `UNIQUE (a, b)` to `UNIQUE (a)`, and sluice refuses that, because it cannot tell whether the target shrank the key the same way (Postgres drops the whole index instead). Apply the same drop on the target and restart.
+- A change made while the stream was stopped, or during the cold-start copy, is already in the baseline. More precisely: anything made after the last position the target acknowledged and before the stream started, including a DDL a lagging stream had not reached yet when it stopped.
+- Upgrading does not find an old gap. A change a pre-v0.156.0 stream ignored is in the first baseline the new release takes.
+- `backup incremental` opens a fresh reader every run, so a change between two incrementals is in the next run's baseline.
+- Postgres only: column collation and policies or RLS on a partitioned root are not compared. A change to a constraint's storage (tablespace, fillfactor) changes its definition text, so it refuses rather than slipping through. A constraint rename refuses as a drop plus an add.
+- A downgrade to an older binary ignores a recorded refusal, so a downgrade followed by a restart accepts the change silently.
+- MySQL only: `DROP COLUMN b` shrinks a composite `UNIQUE (a, b)` to `UNIQUE (a)`, and sluice refuses that, because it cannot tell whether the target shrank the key the same way (Postgres drops the whole index instead). Apply the same drop on the target and acknowledge the refusal as above.
 - PlanetScale and Vitess (VStream) sources are not covered yet.
 - Detection needs a later write to the same table. A change on a table nobody writes to again is not seen until someone does.
 - Plain (non-constraint) indexes are not compared. Index DDL is the documented not-forwarded case, and refusing on every source `CREATE INDEX` would end streams on routine tuning.

@@ -31,9 +31,9 @@ sluice's command taxonomy (see `AGENTS.md`) is the gate:
 
 - **Read-only** commands (`--dry-run`, `verify`, `schema preview`/`diff`, `sync health`/`status`, `backup verify`, `engines`) run freely.
 - **State-changing** commands (`migrate`, `sync start`/`run`, `backup *`, `restore`, `cutover`, …) run only as part of an approved task.
-- **Destructive flags** (`--reset-target-data`, `--force-cold-start`, `--yes`, `backup prune`/`compact` without `--dry-run`) are **NEVER** passed without explicit human approval for *that specific invocation*.
+- **Destructive flags** (`--reset-target-data`, `--force-cold-start`, `--yes`, `backup prune`/`compact` without `--dry-run`) and `--accept-unforwarded-schema-change` are **NEVER** passed without explicit human approval for *that specific invocation*. The acknowledgement flag accepts a source/target schema difference permanently unless the change was applied to the target first.
 
-Every skill also follows sluice's own discipline: **verify by reading state back, never trust an exit code alone**, and treat `status:"refused"` / exit 3 as a decision point — surface `error.hint` and wait, don't retry unchanged.
+Every skill also follows sluice's own discipline: **verify by reading state back, never trust an exit code alone**, and treat `status:"refused"` / exit 3 as a decision point — surface `error.hint` and wait, don't retry unchanged. The same applies to an exit-1 `UNFORWARDED-SCHEMA-CHANGE`, which has no error code yet.
 
 ## Getting started
 

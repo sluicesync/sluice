@@ -205,6 +205,32 @@ subscription rather than a tweak):
    value is perf-only for indexes and cross-engine-hazardous for
    checks, so both are deferred, not built.
 
+**Amendment (2026-09-23, v0.156.0, GC-2): the unforwarded classes now
+REFUSE instead of passing silently.** Footnote 2's "not silent
+corruption" was false for the benign arm. An ADD CHECK, a new policy,
+`ENABLE ROW LEVEL SECURITY`, a SET DEFAULT, or a foreign key added
+alongside a forwarded ADD COLUMN left the target weaker than the source
+at exit 0. Footnote 3's MySQL CHECK row had the same defect. Nothing is
+forwarded yet, and the matrix's ✅ rows are unchanged. But on a Postgres
+source and on a MySQL/MariaDB binlog source, a change the stream does not
+carry now ends the stream with the marker `UNFORWARDED-SCHEMA-CHANGE`. That
+covers a constraint change (PK, UNIQUE, FK, CHECK, plus EXCLUDE on PG), an
+RLS or policy change, NOT NULL on PG, a DEFAULT change, and an identity,
+EXTRA or generation change. The detection is a catalog fingerprint taken
+when the stream starts and re-read at each relation re-send (PG) or schema
+rebuild (MySQL). This is the "out-of-band catalog" check footnote 2 anticipated,
+as a refusal rather than a forward. The refusal is persisted and replayed
+on every start until it is acknowledged with
+`--accept-unforwarded-schema-change=<fingerprint>`. The door is
+`internal/engines/postgres/cdc_unforwarded_classes.go` and
+`internal/engines/mysql/cdc_unforwarded_classes.go`, and the persistence is
+`internal/pipeline/unforwarded_refusal_persist.go`. Operator procedure:
+`docs/operator/cdc-streaming.md`, section "a schema change the stream
+cannot carry ends it". Plain (non-constraint) CREATE/DROP INDEX is
+still not compared: it remains the index-DDL gap of ADR-0103. VStream
+sources (PlanetScale, Vitess) are unchanged: their reader never runs this
+door.
+
 This matrix is the **source of truth** for operator docs and for any
 "does shape X forward?" question. The Consequences section's "behavior
 change on upgrade" applies only to the ✅ rows.

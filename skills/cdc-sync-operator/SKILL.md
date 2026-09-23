@@ -24,7 +24,11 @@ The user wants ongoing replication (not a one-shot migrate): a cold-start snapsh
 
 4. **Monitor freshness (cron/agent-friendly).** `sluice sync health --format json --target-driver <drv> --target "$SLUICE_TARGET" --stream-id <id> [--max-stale-seconds N] [--max-lag-bytes N]`. **Exit 0** healthy, **exit 1** a threshold breached (stale/lag) OR the stream has durably skipped events for tables the target lacks (`skipped_tables` in the JSON; no threshold — resolves via `schema add-table`, an explicit table filter, or — when the cause is revoked privileges rather than a missing table (information_schema hides tables the apply role cannot see) — restoring the grant, after which the skip clears on the next change with no re-snapshot), **exit 2** operational (stream not found / connect). Add `--source-driver`/`--source` for source-position + byte-lag (PG only). For a human view use `sluice sync status [--watch 2s] [--all --config <fleet>]`.
 
-5. **Resume semantics.** A stopped/crashed stream warm-resumes from its persisted position on the next `sync start` — re-streaming only the un-applied tail. On PlanetScale, a resume from a purged binlog position auto-recovers with a fresh re-snapshot by default (see `planetscale-migration`; `--no-auto-resnapshot` makes that a loud decision instead).
+5. **Resume semantics.** A stopped or crashed stream usually warm-resumes from its persisted position on the next `sync start`, re-streaming only the un-applied tail. **The exception is a stream that stopped with `UNFORWARDED-SCHEMA-CHANGE`** (Postgres and MySQL/MariaDB binlog sources). The source changed a constraint, policy, RLS, `NOT NULL`, default or similar that CDC cannot forward. The refusal is recorded on the target, so every later start refuses again, on every start path. It exits **1 with no error code**, not 3, so do not treat it as an ordinary codeless failure. The replayed refusal prints `fingerprint <12 hex>`. Recovery is a decision point that needs human approval:
+   1. A human applies the same change to the target.
+   2. Only then, start once with `--accept-unforwarded-schema-change=<that fingerprint>`.
+   
+   The flag clears only that refusal and takes a fresh baseline, so passing it without step 1 accepts the source/target difference permanently. Never add it on your own, and never leave it on a standing command line. On PlanetScale, a resume from a purged binlog position auto-recovers with a fresh re-snapshot by default (see `planetscale-migration`; `--no-auto-resnapshot` makes that a loud decision instead).
 
 6. **Manage the PG replication slot** (recovery/diagnostics). `sluice slot list --source-driver postgres --source "$SLUICE_SOURCE"` shows every slot (name/active/wal_status/LSNs). `sluice slot drop <name>` removes an abandoned slot (`--if-exists`, `--force` if a consumer is attached, `--yes` is REQUIRED — `slot drop` never prompts; without it the command refuses with `SLUICE-E-CONFIRMATION-REQUIRED`) — dropping an in-use slot breaks that stream, so treat it as gated.
 
@@ -37,9 +41,9 @@ The user wants ongoing replication (not a one-shot migrate): a cold-start snapsh
 - **Freshness:** seconds-since-last-apply, byte-lag (PG), any breached threshold named.
 - **Slot state (PG):** the stream's slot name + activity, any abandoned slot flagged.
 - **Cutover result:** primed/noop/refused per the cutover report; any refusal surfaced as a decision point.
-- **Destructive steps (if any):** `--reset-target-data --yes` / `--restart-from-scratch` / `--force-cold-start` / `slot drop` — named and flagged as needing explicit human approval.
+- **Destructive or approval-gated steps (if any):** `--reset-target-data --yes` / `--restart-from-scratch` / `--force-cold-start` / `slot drop` / `--accept-unforwarded-schema-change`, each named and flagged as needing explicit human approval.
 
-Never pass `--reset-target-data --yes`, `--restart-from-scratch`, or `--force-cold-start` without approval for that specific invocation; on any `status:"refused"` / exit 3, surface `error.hint` and stop.
+Never pass `--reset-target-data --yes`, `--restart-from-scratch`, `--force-cold-start` or `--accept-unforwarded-schema-change` without approval for that specific invocation. On any `status:"refused"` / exit 3, and on an exit-1 `UNFORWARDED-SCHEMA-CHANGE`, surface the message and stop.
 
 ## References (canonical — don't duplicate)
 `docs/operator/cdc-streaming.md` · `docs/operator/running-as-a-service.md` · `docs/cookbook/recipe-bidirectional-cutover.md` · `AGENTS.md` (taxonomy, envelope, destructive flags) · `sluice sync start --help` / `sluice sync health --help` / `sluice cutover --help` / `sluice slot --help`.

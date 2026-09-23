@@ -18,7 +18,7 @@ The user has multiple source→target sync streams and wants one supervised proc
 
 1. **Validate the fleet config (dry-run first).** `sluice sync run --config syncs.yaml --dry-run` loads and validates every leg without starting them. Fix any config error (exit 2) before running for real.
 
-2. **Run the fleet.** `sluice sync run --config syncs.yaml`. The supervisor starts each leg, isolates failures (one leg crashing doesn't take down the others), and restarts crashed legs with bounded backoff per the `restart:` policy (`backoff-base`, `backoff-cap`, `healthy-run-threshold`, `max-consecutive-failures`).
+2. **Run the fleet.** `sluice sync run --config syncs.yaml`. The supervisor starts each leg, isolates failures (one leg crashing doesn't take down the others), and restarts crashed legs with bounded backoff per the `restart:` policy (`backoff-base`, `backoff-cap`, `healthy-run-threshold`, `max-consecutive-failures`). **One exception:** a leg that stopped with `UNFORWARDED-SCHEMA-CHANGE` (the source changed a constraint, policy, RLS or default that CDC cannot forward) is **not** restarted. It shows `failed`, with an ERROR log line, while the other legs keep running. Every other failure is restarted as usual. Do not try to un-fail it with a restart or a `SIGHUP`, because it refuses again. Route it to the acknowledgement flow in `cdc-sync-operator`. That flow needs human approval, because `--accept-unforwarded-schema-change` has no `syncs.yaml` key and runs as a one-off `sync start` outside the fleet.
 
 3. **(Optional) serve the read-only dashboard.** Add `--dashboard-listen :9300` to expose an HTML view + a `/api/fleet` JSON API. **NO AUTHENTICATION** — bind to localhost or a trusted network only. If the address can't bind, the fleet refuses to start (rather than silently running blind).
 
@@ -30,9 +30,9 @@ The user has multiple source→target sync streams and wants one supervised proc
 - **Fleet composition:** N legs, each `stream-id` → source→target, and the restart policy in effect.
 - **Startup result:** dry-run validation outcome; which legs came up; any leg refused/looping and why.
 - **Monitoring surface:** the `sync status --all` roll-up and per-leg `sync health` verdicts (+ exit codes); the dashboard/TUI address if enabled (with the no-auth caveat).
-- **Per-leg issues:** any breached threshold or restart-looping leg named, routed to `sluice-error-triage` / `cdc-sync-operator`.
+- **Per-leg issues:** name any breached threshold, restart-looping leg, or `failed` leg, and route it to `sluice-error-triage` / `cdc-sync-operator`. For a `failed` leg, quote the message, and name `UNFORWARDED-SCHEMA-CHANGE` explicitly when it appears.
 
-Per-leg recovery that needs a destructive flag (`--reset-target-data`, `slot drop`, …) is still approval-gated — surface it, don't auto-apply. Keep tokens/URLs in env, never in the committed YAML.
+Per-leg recovery that needs a destructive flag (`--reset-target-data`, `slot drop`, …) or `--accept-unforwarded-schema-change` is still approval-gated. Surface it; don't auto-apply it. Keep tokens/URLs in env, never in the committed YAML.
 
 ## References (canonical — don't duplicate)
 `AGENTS.md` (taxonomy, envelope, env-first credentials) · `docs/operator/running-as-a-service.md` · `skills/cdc-sync-operator/SKILL.md` (per-leg lifecycle) · `sluice sync run --help` / `sluice sync tui --help` / `sluice sync status --help`.

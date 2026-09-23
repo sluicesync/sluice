@@ -21,6 +21,7 @@ sluice is a single-binary CLI that migrates and continuously syncs databases (My
 - `--yes` — the destructive-confirmation opt-in on `--reset-target-data`, `schema add-table`, `trigger teardown`, `slot drop` and `sync decommission`; without it these refuse with `SLUICE-E-CONFIRMATION-REQUIRED` (exit 3) unless a human is at a terminal to answer the prompt. **On `expand-contract` it confirms the contract leg — a `DROP COLUMN` deploy request against the production branch** (without it the run stops after verify and prints the resume command)
 - `backup prune` / `backup compact` without `--dry-run` — irreversibly drop backup history
 - `sync decommission --yes` — drops a finished stream's replication slot + per-stream publication on the source and clears its control row on the target; the stream can never warm-resume after (preview with `--dry-run`, which needs no `--yes`)
+- `--accept-unforwarded-schema-change=<fingerprint>` (`sync start`, `backup stream run`) — acknowledges a recorded `UNFORWARDED-SCHEMA-CHANGE` refusal. It accepts a source/target schema difference permanently unless the change was applied to the target first (for `backup stream`, unless a new full backup was taken first). A human applies the change; only then pass the fingerprint the replayed refusal prints, once. This refusal exits **1 with no error code**, not 3, but it is still a decision point: every restart refuses again until it is acknowledged, so do not retry it
 
 ## The standard workflow
 
@@ -62,7 +63,7 @@ Stable machine-parsable error codes (`SLUICE-E-*`) with remedy hints ride on the
 | 3 | named refusal — sluice declined by policy; the error names the remedy |
 | 80 | CLI usage/parse error (kong) |
 
-`!= 0` always means not-success. On exit 3, do not retry unchanged — surface `error.hint` to the human and wait for a decision (the remedy is often a destructive flag that needs approval).
+`!= 0` always means not-success. On exit 3, do not retry unchanged — surface `error.hint` to the human and wait for a decision (the remedy is often a destructive flag that needs approval). One refusal has no code yet and exits 1: a message containing `UNFORWARDED-SCHEMA-CHANGE` from `sync start` / `sync run` / `backup stream run`. Treat it exactly like exit 3. Do not retry, surface the message, and wait (see the `--accept-unforwarded-schema-change` entry above).
 
 ## Where to read more
 
