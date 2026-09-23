@@ -478,6 +478,9 @@ func (s *Streamer) coldStartMultiDatabase(
 	// 2026-09-06 finding 1, OBSERVED on postgres:16). The cold-start loader
 	// is static and cannot fail; the error return is the warm-resume
 	// witness's.
+	// GC-32: a cold start re-baselines the unforwarded-schema-change door
+	// (see the single-stream cold-start site).
+	s.unforwardedBaselineFrom = nil
 	if err := s.wireReaderSchemaSeedFrom(ctx, stream.Changes, staticSchemaSeed(readerSeed)); err != nil {
 		closeStream()
 		return nil, stop, migcore.WrapWithHint(migcore.PhaseCDC, err)

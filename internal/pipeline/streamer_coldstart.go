@@ -1492,6 +1492,11 @@ func (s *Streamer) coldStartBeginCDC(ctx context.Context, stream *ir.SnapshotStr
 	// captured. Without it the arming above is inert until the reader has
 	// emitted a boundary of its own. The cold-start loader is static and
 	// cannot fail; the error return is the warm-resume witness's.
+	// GC-32: a cold start just built the target from the current source
+	// schema, so the unforwarded-schema-change door starts from a fresh
+	// baseline — a baseline carried from an earlier attempt would refuse a
+	// change the re-copy already carried.
+	s.unforwardedBaselineFrom = nil
 	if err := s.wireReaderSchemaSeed(ctx, stream.Changes); err != nil {
 		_ = stream.Close()
 		return nil, stop, migcore.WrapWithHint(migcore.PhaseCDC, err)

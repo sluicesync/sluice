@@ -10,6 +10,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 )
 
 // The unforwarded-class door, binlog lane (GC-2's MySQL-family sibling;
@@ -45,7 +46,9 @@ import (
 // after every in-scope DDL), dispatchRows fingerprints that one table
 // again and diffs ([diffTableFacts]). A delta ends the stream with the
 // grep-stable marker UNFORWARDED-SCHEMA-CHANGE as a [terminalMySQLError]:
-// an automatic retry would re-baseline and accept the change silently.
+// a retry cannot succeed (the next reader is handed this baseline and
+// refuses again; GC-32), and without the carry it would re-baseline and
+// accept the change silently.
 //
 // What is compared: unique keys (PRIMARY and every UNIQUE index, from
 // STATISTICS so a prefix length or a functional key part is part of the
@@ -115,11 +118,13 @@ import (
 // # Scope, stated so it cannot be read as broader
 //
 //   - The baseline is taken at StreamChanges, so a change made while the
-//     stream was stopped, during a cold start's bulk copy, or before an
-//     ADR-0038 in-process RETRY re-opens the stream (a retry is a fresh
-//     StreamChanges, and so is a restart) is IN the baseline and never
-//     refused. That includes a change whose grading was interrupted by a
-//     transient failure of the grading read itself. The refusal says so.
+//     stream was stopped, or during a cold start's bulk copy, is IN the
+//     baseline and never refused; so is anything an operator restart
+//     re-baselines, which the refusal says. An ADR-0038 in-process RETRY
+//     does NOT re-baseline: the pipeline hands the next reader this one's
+//     baseline (GC-32), which also covers a transient failure of the
+//     grading read itself. (A killed binlog dump thread never reaches
+//     that retry: go-mysql's syncer reconnects inside the same reader.)
 //     Closing this needs a source↔target comparison, not a source↔source
 //     one (the periodic full-diff follow-up to GC-2).
 //   - Detection needs a rebuild, which needs a row event on the table
@@ -637,24 +642,82 @@ func sortedFactKeys[V any](m map[string]V) []string {
 	return keys
 }
 
+// mysqlUnforwardedBaseline is the door's baseline as it crosses from one
+// reader to the next through the pipeline (GC-32). Opaque to the
+// pipeline: it only moves the value between readers of this engine.
+type mysqlUnforwardedBaseline map[string]*mysqlTableFacts
+
+// unforwardedDoorState holds the door's baseline. The pump reads and
+// writes facts; [CDCReader.UnforwardedBaseline] reads it from the
+// pipeline between retry attempts, so it is guarded. A facts entry is
+// never mutated in place — a re-baseline replaces the pointer — so a
+// shallow map copy is a consistent snapshot.
+type unforwardedDoorState struct {
+	mu      sync.Mutex
+	facts   map[string]*mysqlTableFacts
+	carried mysqlUnforwardedBaseline
+}
+
+// UnforwardedBaseline returns a snapshot of this reader's baseline for
+// the NEXT reader of the same run (GC-32; the Postgres twin's doc states
+// why). nil before StreamChanges or when the door is inert.
+func (r *CDCReader) UnforwardedBaseline() any {
+	r.unforwarded.mu.Lock()
+	defer r.unforwarded.mu.Unlock()
+	if r.unforwarded.facts == nil {
+		return nil
+	}
+	out := make(mysqlUnforwardedBaseline, len(r.unforwarded.facts))
+	for k, v := range r.unforwarded.facts {
+		out[k] = v
+	}
+	return out
+}
+
+// SetUnforwardedBaseline hands this reader the previous reader's baseline
+// (GC-32); StreamChanges then starts from it instead of the live catalog.
+// Must be called before StreamChanges. A value from another engine is
+// ignored and the reader takes its own baseline.
+func (r *CDCReader) SetUnforwardedBaseline(b any) {
+	carried, ok := b.(mysqlUnforwardedBaseline)
+	if !ok {
+		return
+	}
+	r.unforwarded.mu.Lock()
+	defer r.unforwarded.mu.Unlock()
+	r.unforwarded.carried = carried
+}
+
 // captureUnforwardedBaseline fingerprints every table in the stream's
-// database scope at StreamChanges. A nil catalog pool leaves the door
-// inert (unit-test readers built as struct literals).
+// database scope at StreamChanges — or, on a retry within one run, adopts
+// the previous reader's baseline (GC-32). A nil catalog pool leaves the
+// door inert (unit-test readers built as struct literals).
 func (r *CDCReader) captureUnforwardedBaseline(ctx context.Context) error {
 	if r.db == nil {
 		return nil
 	}
-	facts, err := readTableFacts(ctx, r.db, r.flavor, "", "")
-	if err != nil {
-		return fmt.Errorf("mysql: cdc: baseline the schema objects the binlog lane does not forward: %w", err)
-	}
-	baseline := make(map[string]*mysqlTableFacts, len(facts))
-	for qn, f := range facts {
-		if r.databaseInScope(f.schema) {
+	r.unforwarded.mu.Lock()
+	carried := r.unforwarded.carried
+	r.unforwarded.mu.Unlock()
+	baseline := make(map[string]*mysqlTableFacts, len(carried))
+	if carried != nil {
+		for qn, f := range carried {
 			baseline[qn] = f
 		}
+	} else {
+		facts, err := readTableFacts(ctx, r.db, r.flavor, "", "")
+		if err != nil {
+			return fmt.Errorf("mysql: cdc: baseline the schema objects the binlog lane does not forward: %w", err)
+		}
+		for qn, f := range facts {
+			if r.databaseInScope(f.schema) {
+				baseline[qn] = f
+			}
+		}
 	}
-	r.unforwardedBaseline = baseline
+	r.unforwarded.mu.Lock()
+	r.unforwarded.facts = baseline
+	r.unforwarded.mu.Unlock()
 	return nil
 }
 
@@ -667,7 +730,11 @@ func (r *CDCReader) captureUnforwardedBaseline(ctx context.Context) error {
 // passes is re-baselined so an exempt change (a forwarded DROP COLUMN's
 // cascade) is not re-diffed at the next rebuild.
 func (r *CDCReader) gradeUnforwardedClasses(ctx context.Context, qn string) error {
-	if r.unforwardedBaseline == nil || r.db == nil {
+	r.unforwarded.mu.Lock()
+	armed := r.unforwarded.facts != nil
+	prior := r.unforwarded.facts[qn]
+	r.unforwarded.mu.Unlock()
+	if !armed || r.db == nil {
 		return nil
 	}
 	schema, table := splitQualified(qn)
@@ -679,29 +746,28 @@ func (r *CDCReader) gradeUnforwardedClasses(ctx context.Context, qn string) erro
 	if cur == nil {
 		return nil // dropped since the row was written; the DML path owns that
 	}
-	prior := r.unforwardedBaseline[qn]
-	if prior == nil {
-		r.unforwardedBaseline[qn] = cur
-		return nil
-	}
-	tablesNow := map[string]*mysqlTableFacts{}
-	for _, ref := range fkParentsToRead(prior, cur) {
-		if _, done := tablesNow[ref]; done {
-			continue
+	if prior != nil {
+		tablesNow := map[string]*mysqlTableFacts{}
+		for _, ref := range fkParentsToRead(prior, cur) {
+			if _, done := tablesNow[ref]; done {
+				continue
+			}
+			refSchema, refTable := splitQualified(ref)
+			parent, err := readTableFacts(ctx, r.db, r.flavor, refSchema, refTable)
+			if err != nil {
+				return fmt.Errorf("mysql: cdc: table %s: read referenced table %s: %w", qn, ref, err)
+			}
+			if f := parent[ref]; f != nil {
+				tablesNow[ref] = f
+			}
 		}
-		refSchema, refTable := splitQualified(ref)
-		parent, err := readTableFacts(ctx, r.db, r.flavor, refSchema, refTable)
-		if err != nil {
-			return fmt.Errorf("mysql: cdc: table %s: read referenced table %s: %w", qn, ref, err)
-		}
-		if f := parent[ref]; f != nil {
-			tablesNow[ref] = f
+		if deltas := diffTableFacts(prior, cur, tablesNow); len(deltas) > 0 {
+			return &terminalMySQLError{err: unforwardedChangeError(schema, table, deltas)}
 		}
 	}
-	if deltas := diffTableFacts(prior, cur, tablesNow); len(deltas) > 0 {
-		return &terminalMySQLError{err: unforwardedChangeError(schema, table, deltas)}
-	}
-	r.unforwardedBaseline[qn] = cur
+	r.unforwarded.mu.Lock()
+	r.unforwarded.facts[qn] = cur
+	r.unforwarded.mu.Unlock()
 	return nil
 }
 

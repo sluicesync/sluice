@@ -406,10 +406,53 @@ func TestUnforwardedDoor_WiredIntoTheBinlogReader(t *testing.T) {
 // schema pool (unit-test struct literals) neither baselines nor grades.
 func TestUnforwardedDoor_InertWithoutACatalogPool(t *testing.T) {
 	r := &CDCReader{}
-	if err := r.captureUnforwardedBaseline(t.Context()); err != nil || r.unforwardedBaseline != nil {
-		t.Errorf("baseline without a pool: err=%v baseline=%v; want inert", err, r.unforwardedBaseline)
+	if err := r.captureUnforwardedBaseline(t.Context()); err != nil || r.UnforwardedBaseline() != nil {
+		t.Errorf("baseline without a pool: err=%v baseline=%v; want inert", err, r.UnforwardedBaseline())
 	}
 	if err := r.gradeUnforwardedClasses(t.Context(), "db.t"); err != nil {
 		t.Errorf("grade without a pool: %v; want inert", err)
+	}
+}
+
+// TestUnforwardedBaseline_CarriedAcrossReaders pins GC-32 on the binlog
+// lane: a reader handed the previous reader's baseline starts from it and
+// does NOT read the catalog. The pool points at a port nothing listens on,
+// so a fresh read fails and only adoption succeeds.
+func TestUnforwardedBaseline_CarriedAcrossReaders(t *testing.T) {
+	db, err := sql.Open("mysql", "nobody:x@tcp(127.0.0.1:1)/none?timeout=1s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	fresh := &CDCReader{db: db}
+	if err := fresh.captureUnforwardedBaseline(t.Context()); err == nil {
+		t.Fatal("a reader with no carried baseline did not read the catalog (the unreachable pool should have failed it); this test cannot discriminate")
+	}
+
+	prev := &CDCReader{}
+	prev.unforwarded.facts = map[string]*mysqlTableFacts{"src.t": gc2MySQLBase()}
+	carried := prev.UnforwardedBaseline()
+	if carried == nil {
+		t.Fatal("UnforwardedBaseline returned nil for a reader with a baseline")
+	}
+
+	next := &CDCReader{db: db}
+	next.SetUnforwardedBaseline(carried)
+	if err := next.captureUnforwardedBaseline(t.Context()); err != nil {
+		t.Fatalf("captureUnforwardedBaseline with a carried baseline: %v — it re-read the catalog, so a retry would absorb a pending change (GC-32)", err)
+	}
+	if next.unforwarded.facts["src.t"] == nil {
+		t.Errorf("next reader's baseline = %v; want the carried entry", next.unforwarded.facts)
+	}
+	next.unforwarded.facts["src.u"] = gc2MySQLBase()
+	if _, leaked := prev.unforwarded.facts["src.u"]; leaked {
+		t.Error("the carried baseline aliases the previous reader's map")
+	}
+
+	other := &CDCReader{db: db}
+	other.SetUnforwardedBaseline(map[uint32]int{1: 1})
+	if err := other.captureUnforwardedBaseline(t.Context()); err == nil {
+		t.Error("a foreign value was adopted as a baseline; it must be ignored")
 	}
 }

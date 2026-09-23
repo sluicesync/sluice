@@ -8,12 +8,15 @@ package pipeline
 import (
 	"context"
 	"database/sql"
+	"log"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/logcapture"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
 
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
@@ -314,4 +317,108 @@ func TestStreamer_MariaDBSource_UnforwardedSchemaChange_Refuses(t *testing.T) {
 	t.Run("control_forwarded_column_changes_do_not_refuse", func(t *testing.T) {
 		runUnforwardedControl(t, mariaEng, sourceDSN, targetDSN, applyMariaDBSQL)
 	})
+}
+
+// TestStreamer_MySQLSource_UnforwardedSchemaChange_SurvivesTransientRetry
+// is GC-32's binlog-lane pin, the twin of the Postgres one: the binlog
+// dump thread is killed right after a source DDL, the ADR-0038 loop
+// retries with a fresh reader, and that reader must compare the table's
+// next row against the PRE-DDL baseline it was handed — a fresh catalog
+// read would already contain the change and accept it silently.
+func TestStreamer_MySQLSource_UnforwardedSchemaChange_SurvivesTransientRetry(t *testing.T) {
+	sourceDSN, _, cleanup := startMySQLBinlog(t)
+	defer cleanup()
+	_, targetDSN, pgCleanup := startPostgres(t)
+	defer pgCleanup()
+	myEng, ok := engines.Get("mysql")
+	if !ok {
+		t.Fatal("mysql engine not registered")
+	}
+	pgEng, ok := engines.Get("postgres")
+	if !ok {
+		t.Fatal("postgres engine not registered")
+	}
+	// The retry is asserted from the pipeline's own log line, so capture it
+	// (and restore both loggers after, as the other capture sites do).
+	logBuf := &logcapture.Buffer{}
+	prevDefault := slog.Default()
+	prevWriter, prevFlags := log.Writer(), log.Flags()
+	slog.SetDefault(slog.New(slog.NewTextHandler(logBuf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	defer func() {
+		slog.SetDefault(prevDefault)
+		log.SetOutput(prevWriter)
+		log.SetFlags(prevFlags)
+	}()
+	retried := func() bool { return strings.Contains(logBuf.String(), "transient error; retrying") }
+
+	applyDDLMySQL(t, sourceDSN, `CREATE TABLE gc32 (id INT PRIMARY KEY, name VARCHAR(20)) ENGINE=InnoDB; INSERT INTO gc32 VALUES (1, 'a'); CREATE TABLE gc32_side (id INT PRIMARY KEY) ENGINE=InnoDB; INSERT INTO gc32_side VALUES (1);`)
+	streamer := &Streamer{
+		Source: myEng, Target: pgEng,
+		SourceDSN: sourceDSN, TargetDSN: targetDSN,
+		StreamID:              "test-gc32-mysql",
+		ApplyRetryAttempts:    5,
+		ApplyRetryBackoffBase: 50 * time.Millisecond,
+		ApplyRetryBackoffCap:  500 * time.Millisecond,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runErr := make(chan error, 1)
+	go func() { runErr <- streamer.Run(ctx) }()
+	if !waitForRowCount(t, targetDSN, "gc32", 1, 90*time.Second) {
+		t.Fatalf("cold copy never landed")
+	}
+	applyDDLMySQL(t, sourceDSN, `INSERT INTO gc32 VALUES (2, 'b');`)
+	if !waitForRowCount(t, targetDSN, "gc32", 2, 60*time.Second) {
+		t.Fatalf("pre-DDL CDC row never landed")
+	}
+
+	applyDDLMySQL(t, sourceDSN, `ALTER TABLE gc32 ADD CONSTRAINT gc32_name_uq UNIQUE (name);`)
+
+	// The transient must reach the PIPELINE's retry loop, which is what opens
+	// a fresh reader. Killing the binlog dump thread does NOT: go-mysql's
+	// syncer reconnects internally and the same reader (and its baseline)
+	// carries on — measured, and the reason this pin does not use it. A
+	// dropped TARGET connection does: the next apply fails 57P01, the
+	// ADR-0038 loop retries, and the retry opens a new reader. The side
+	// table's row forces that apply before gc32's next row is read.
+	tgtDB, err := sql.Open("pgx", targetDSN)
+	if err != nil {
+		t.Fatalf("open target: %v", err)
+	}
+	defer func() { _ = tgtDB.Close() }()
+	var killed int
+	if err := tgtDB.QueryRow(`SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity
+		WHERE datname = current_database() AND pid <> pg_backend_pid() AND backend_type = 'client backend'`).Scan(&killed); err != nil {
+		t.Fatalf("terminate target connections: %v", err)
+	}
+	if killed == 0 {
+		t.Fatal("no target connection to terminate; the test cannot inject its transient")
+	}
+	applyDDLMySQL(t, sourceDSN, `INSERT INTO gc32_side VALUES (2);`)
+	deadline := time.Now().Add(60 * time.Second)
+	for pollRowCount(targetDSN, "gc32_side") < 2 {
+		select {
+		case err := <-runErr:
+			t.Fatalf("stream ended instead of retrying the dropped target connection: %v", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the side row never landed after the dropped target connection")
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if !retried() {
+		t.Fatal("the pipeline never retried; the transient did not reach the retry loop, so this run does not test GC-32")
+	}
+	applyDDLMySQL(t, sourceDSN, `INSERT INTO gc32 VALUES (3, 'c');`)
+
+	var got error
+	select {
+	case got = <-runErr:
+	case <-time.After(60 * time.Second):
+		t.Fatal("stream did not refuse within 60s — the retry re-baselined and accepted the change (GC-32)")
+	}
+	if got == nil || !strings.Contains(got.Error(), "UNFORWARDED-SCHEMA-CHANGE") || !strings.Contains(got.Error(), "gc32_name_uq") {
+		t.Fatalf("stream ended with %v; want UNFORWARDED-SCHEMA-CHANGE naming gc32_name_uq", got)
+	}
 }

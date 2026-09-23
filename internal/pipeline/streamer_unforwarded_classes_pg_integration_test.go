@@ -218,3 +218,91 @@ func TestStreamer_PGSource_UnforwardedSchemaChange_Refuses(t *testing.T) {
 		}
 	})
 }
+
+// TestStreamer_PGSource_UnforwardedSchemaChange_SurvivesTransientRetry is
+// GC-32's end-to-end pin. The door's baseline lives in the CDC reader and
+// an automatic retry opens a fresh one; before the carry, the fresh
+// reader's catalog read already contained a change made before the
+// transient, so a dropped replication connection between a source DDL and
+// the table's next write accepted the change silently. Here the walsender
+// is terminated right after the DDL, the ADR-0038 loop retries, and the
+// stream must still refuse naming the change — graded on the refusal
+// text, which the retried stream can only produce if it compared against
+// the PRE-DDL baseline.
+func TestStreamer_PGSource_UnforwardedSchemaChange_SurvivesTransientRetry(t *testing.T) {
+	sourceDSN, targetDSN, cleanup := startPostgresLogical(t)
+	defer cleanup()
+	pgEng, ok := engines.Get("postgres")
+	if !ok {
+		t.Fatal("postgres engine not registered")
+	}
+	srcDB, err := sql.Open("pgx", sourceDSN)
+	if err != nil {
+		t.Fatalf("open source: %v", err)
+	}
+	defer func() { _ = srcDB.Close() }()
+
+	applyPGDDL(t, sourceDSN, `CREATE TABLE gc32 (id INT PRIMARY KEY, name TEXT); INSERT INTO gc32 VALUES (1, 'a');`)
+	streamer := &Streamer{
+		Source: pgEng, Target: pgEng,
+		SourceDSN: sourceDSN, TargetDSN: targetDSN,
+		StreamID:              "test-gc32",
+		ApplyRetryAttempts:    5,
+		ApplyRetryBackoffBase: 50 * time.Millisecond,
+		ApplyRetryBackoffCap:  500 * time.Millisecond,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runErr := make(chan error, 1)
+	go func() { runErr <- streamer.Run(ctx) }()
+	if !waitForPGRowCount(t, targetDSN, "gc32", 1, 60*time.Second) {
+		t.Fatalf("cold copy never landed")
+	}
+	applyPGDDL(t, sourceDSN, `INSERT INTO gc32 VALUES (2, 'b');`)
+	if !waitForPGRowCount(t, targetDSN, "gc32", 2, 60*time.Second) {
+		t.Fatalf("pre-DDL CDC row never landed")
+	}
+
+	// The DDL alone emits nothing on the wire; the transient lands before
+	// the write that would surface it.
+	applyPGDDL(t, sourceDSN, `ALTER TABLE gc32 ADD CONSTRAINT gc32_name_uq UNIQUE (name);`)
+	var killed int
+	if err := srcDB.QueryRow(`SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE backend_type = 'walsender'`).Scan(&killed); err != nil {
+		t.Fatalf("terminate walsender: %v", err)
+	}
+	if killed == 0 {
+		t.Fatal("no walsender to terminate; the test cannot inject its transient")
+	}
+	// Give the retry loop time to reopen before the write, so the write is
+	// decoded by the SECOND reader — the one that must carry the baseline.
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		var n int
+		if err := srcDB.QueryRow(`SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'walsender'`).Scan(&n); err != nil {
+			t.Fatalf("poll walsender: %v", err)
+		}
+		if n > 0 {
+			break
+		}
+		select {
+		case err := <-runErr:
+			t.Fatalf("stream ended instead of retrying the terminated connection: %v", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the stream never reconnected after the terminated walsender")
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	applyPGDDL(t, sourceDSN, `INSERT INTO gc32 VALUES (3, 'c');`)
+
+	var got error
+	select {
+	case got = <-runErr:
+	case <-time.After(60 * time.Second):
+		t.Fatal("stream did not refuse within 60s — the retry re-baselined and accepted the change (GC-32)")
+	}
+	if got == nil || !strings.Contains(got.Error(), "UNFORWARDED-SCHEMA-CHANGE") || !strings.Contains(got.Error(), `ADD CONSTRAINT "gc32_name_uq" UNIQUE (name)`) {
+		t.Fatalf("stream ended with %v; want UNFORWARDED-SCHEMA-CHANGE naming the UNIQUE", got)
+	}
+}

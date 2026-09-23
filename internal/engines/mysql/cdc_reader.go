@@ -247,15 +247,15 @@ type CDCReader struct {
 	// the project tenets call out.
 	schemaCache map[string]*tableSchema
 
-	// unforwardedBaseline is the StreamChanges-time fingerprint of the
+	// unforwarded holds the StreamChanges-time fingerprint of the
 	// schema objects the boundary projection does not carry (unique keys,
 	// foreign keys, CHECKs, column defaults and attributes), keyed by
 	// qualified name; each schemaCache rebuild of an in-scope table is
 	// diffed against it (GC-2's binlog sibling; see
-	// cdc_unforwarded_classes.go). Written by StreamChanges before the pump
-	// starts, then read and written only on the pump goroutine; nil leaves
-	// the door inert.
-	unforwardedBaseline map[string]*mysqlTableFacts
+	// cdc_unforwarded_classes.go). Written by the pump; snapshotted by the
+	// pipeline between retry attempts (GC-32), hence its own mutex. No
+	// facts leaves the door inert.
+	unforwarded unforwardedDoorState
 
 	// schemaLoader is the seam tableFor loads through. nil — the value every
 	// production construction gets — means the real loadTableSchema; tests

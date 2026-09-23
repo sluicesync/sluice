@@ -544,7 +544,7 @@ Logical replication (pgoutput) describes a table by its column names and types, 
 
 MySQL and MariaDB binlog sources have the same gap for a different reason: sluice re-reads only a table's columns after a DDL. There the door covers primary key, `UNIQUE`, foreign key and `CHECK` changes (including `NOT ENFORCED` on MySQL), and `DEFAULT`, `EXTRA` or generation-expression changes on an existing column. Nullability is already carried by the column forward.
 
-When the stream starts, sluice records these objects for every table (the baseline). On Postgres, each such DDL makes the server resend the table's description before the next change it decodes for that table. On MySQL, the DDL clears sluice's schema cache and the next row on the table rebuilds it. At that point sluice reads the table again and compares. On any difference, `sync` and `backup stream` end with `UNFORWARDED-SCHEMA-CHANGE`, naming each change. The stream does not retry on its own: a retry would take a new baseline and accept the change without a word.
+When the stream starts, sluice records these objects for every table (the baseline). On Postgres, each such DDL makes the server resend the table's description before the next change it decodes for that table. On MySQL, the DDL clears sluice's schema cache and the next row on the table rebuilds it. At that point sluice reads the table again and compares. On any difference, `sync` and `backup stream` end with `UNFORWARDED-SCHEMA-CHANGE`, naming each change. The refusal is never retried automatically. An automatic retry after some OTHER transient error (a dropped connection, say) keeps the baseline the stream started with, so a change made just before that error is still refused.
 
 To continue:
 
@@ -558,7 +558,6 @@ Changes sluice already forwards are not refused: adding, dropping or retyping a 
 What this does not catch, stated so it is not read as broader:
 
 - A change made while the stream was stopped, or during the cold-start copy, is already in the baseline.
-- An automatic retry after a transient error (a dropped connection, say) also starts the stream again and takes a fresh baseline. A transient failure that lands between the DDL and the table's next write therefore accepts the change without a refusal.
 - MySQL only: `DROP COLUMN b` shrinks a composite `UNIQUE (a, b)` to `UNIQUE (a)`, and sluice refuses that, because it cannot tell whether the target shrank the key the same way (Postgres drops the whole index instead). Apply the same drop on the target and restart.
 - PlanetScale and Vitess (VStream) sources are not covered yet.
 - Detection needs a later write to the same table. A change on a table nobody writes to again is not seen until someone does.

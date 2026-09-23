@@ -108,6 +108,11 @@ var (
 	// process, so without the seed a stopped-stream timestamp⇄timestamptz
 	// swap primed silently on every warm resume. Same reasoning as above.
 	_ schemaSeedSetter = (*postgres.CDCReader)(nil)
+	// GC-32: the unforwarded-schema-change baseline carry. A method renamed
+	// on either reader would make the assertion miss, and every automatic
+	// retry would silently re-baseline again — the defect GC-32 closed.
+	_ unforwardedBaselineCarrier = (*mysql.CDCReader)(nil)
+	_ unforwardedBaselineCarrier = (*postgres.CDCReader)(nil)
 )
 
 // unpinnedPipelineSurfaces is the FROZEN remainder: pipeline-local interfaces

@@ -1520,6 +1520,12 @@ type Streamer struct {
 	// is wired, so each attempt derives its own.
 	readerSchemaSeed schemaSeedLoader
 
+	// unforwardedBaselineFrom is the last CDC reader this Run opened, kept so
+	// the next attempt's reader starts from its unforwarded-schema-change
+	// baseline rather than a fresh catalog read (GC-32). Cleared at Run entry
+	// so a new Run — an operator restart — re-baselines.
+	unforwardedBaselineFrom ir.CDCReader
+
 	// resolvedApplyConcurrency is the per-attempt resolution of the operator's
 	// [ApplyConcurrency] field (ADR-0106, item 31): `0 → auto:N`, `1 → 1`
 	// (explicit serial), `N > 1 → N`. Computed once per [runOnce] attempt by
@@ -1576,6 +1582,10 @@ type Streamer struct {
 // Resources (snapshot stream, target writers, applier) are
 // released by each [runOnce] iteration regardless of outcome.
 func (s *Streamer) Run(ctx context.Context) error {
+	// GC-32: an operator restart re-baselines the unforwarded-schema-change
+	// door; retries inside this Run carry it.
+	s.unforwardedBaselineFrom = nil
+
 	// Driver/host mismatch pre-flight — runs once here (the DSNs can't
 	// change between retry attempts) and before any reader/writer is
 	// opened. Refuses e.g. the vanilla mysql driver pointed at a

@@ -273,13 +273,14 @@ type CDCReader struct {
 	// (non-streamer callers) means no prior and the pre-SLM-1c prime.
 	schemaSeed map[string]*ir.Table
 
-	// unforwardedBaseline is the StreamChanges-time fingerprint of the
+	// unforwarded holds the StreamChanges-time fingerprint of the
 	// schema objects pgoutput does not carry (constraints, RLS, policies,
 	// nullability, defaults), keyed by relation OID; each in-scope
 	// RelationMessage is diffed against it (GC-2; see
-	// cdc_unforwarded_classes.go). Read and written only on the pump
-	// goroutine after StreamChanges; nil leaves the door inert.
-	unforwardedBaseline map[uint32]*pgRelationFacts
+	// cdc_unforwarded_classes.go). Written by the pump; snapshotted by the
+	// pipeline between retry attempts (GC-32), hence its own mutex. No
+	// facts leaves the door inert.
+	unforwarded unforwardedDoorState
 
 	// mu guards err. The pump writes; callers read via Err after
 	// the channel closes.

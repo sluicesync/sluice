@@ -556,9 +556,9 @@ func isVStreamMessageTooLargeError(err error) bool {
 // terminalMySQLError is a refusal whose producer knows no retry can
 // succeed: this engine's [ir.TerminalError]. Its one producer today is the
 // unforwarded-class door (cdc_unforwarded_classes.go), where a retry is
-// not merely futile but harmful — the retry's fresh StreamChanges takes a
-// new baseline that already contains the refused change, so the second
-// attempt would accept it silently.
+// futile — the next reader is handed this reader's baseline (GC-32) and
+// refuses the same change again — and, were that carry ever lost, harmful:
+// a fresh baseline would already contain the change and accept it.
 //
 // It implements [ir.RetriableError] with a false answer as well, for the
 // reason postgres.terminalPGError documents: errors.As unwraps THROUGH a

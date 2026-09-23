@@ -631,6 +631,9 @@ func (s *Streamer) wireReaderSchemaSeedFrom(ctx context.Context, r ir.CDCReader,
 }
 
 func (s *Streamer) wireReaderSchemaSeed(ctx context.Context, r ir.CDCReader) error {
+	// GC-32: the unforwarded-schema-change baseline rides this helper because
+	// every reader-open site calls it; see unforwarded_baseline_carry.go.
+	s.wireUnforwardedBaseline(r)
 	load := s.readerSchemaSeed
 	s.readerSchemaSeed = nil
 	if load == nil {

@@ -484,10 +484,15 @@ func (b *BackupStream) Run(ctx context.Context) (err error) {
 					return ctx.Err()
 				}
 				migcore.CloseIf(cdc)
+				prevCDC := cdc
 				cdc, err = openCDCReaderWithSlot(ctx, b.Source, b.SourceDSN, b.SlotName)
 				if err != nil {
 					return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("stream: reopen cdc reader after transient: %w", err))
 				}
+				// GC-32: the reopened pump keeps the closed one's
+				// unforwarded-schema-change baseline; a fresh read would
+				// absorb a change made before the transient.
+				carryUnforwardedBaseline(prevCDC, cdc)
 				// The fresh pump needs chain-consumer ack mode re-armed
 				// (it's per-reader state, set before StreamChanges).
 				holdChainAck(cdc)

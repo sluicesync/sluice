@@ -4,6 +4,7 @@
 package postgres
 
 import (
+	"database/sql"
 	"errors"
 	"os"
 	"strings"
@@ -230,5 +231,52 @@ func TestUnforwardedDoor_BothProtocolArmsCallIt(t *testing.T) {
 	}
 	if !strings.Contains(src, "r.captureUnforwardedBaseline(ctx)") {
 		t.Error("StreamChanges no longer captures the baseline; the door is inert")
+	}
+}
+
+// TestUnforwardedBaseline_CarriedAcrossReaders pins GC-32 on this engine:
+// a reader handed the previous reader's baseline starts from it and does
+// NOT read the catalog. Discriminating by construction — the pool points
+// at a port nothing listens on, so a fresh catalog read fails and only
+// adoption succeeds.
+func TestUnforwardedBaseline_CarriedAcrossReaders(t *testing.T) {
+	db, err := sql.Open("pgx", "postgres://nobody@127.0.0.1:1/none?sslmode=disable&connect_timeout=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	fresh := &CDCReader{db: db}
+	if err := fresh.captureUnforwardedBaseline(t.Context()); err == nil {
+		t.Fatal("a reader with no carried baseline did not read the catalog (the unreachable pool should have failed it); this test cannot discriminate")
+	}
+
+	prev := &CDCReader{}
+	prev.unforwarded.facts = map[uint32]*pgRelationFacts{16400: gc2Base()}
+	carried := prev.UnforwardedBaseline()
+	if carried == nil {
+		t.Fatal("UnforwardedBaseline returned nil for a reader with a baseline")
+	}
+
+	next := &CDCReader{db: db}
+	next.SetUnforwardedBaseline(carried)
+	if err := next.captureUnforwardedBaseline(t.Context()); err != nil {
+		t.Fatalf("captureUnforwardedBaseline with a carried baseline: %v — it re-read the catalog, so a retry would absorb a pending change (GC-32)", err)
+	}
+	if got := next.unforwarded.facts[16400]; got == nil || got.name != "t" {
+		t.Errorf("next reader's baseline = %v; want the carried entry for OID 16400", next.unforwarded.facts)
+	}
+
+	// The snapshot is a copy: a later re-baseline on the new reader must not
+	// reach back into the old one's map.
+	next.unforwarded.facts[16401] = gc2Base()
+	if _, leaked := prev.unforwarded.facts[16401]; leaked {
+		t.Error("the carried baseline aliases the previous reader's map")
+	}
+
+	other := &CDCReader{db: db}
+	other.SetUnforwardedBaseline(map[string]int{"not": 1})
+	if err := other.captureUnforwardedBaseline(t.Context()); err == nil {
+		t.Error("a foreign value was adopted as a baseline; it must be ignored")
 	}
 }

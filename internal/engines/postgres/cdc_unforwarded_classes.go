@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // The unforwarded-class door (GC-2, gap census 2026-09-22).
@@ -40,8 +41,9 @@ import (
 // BASELINE. At each RelationMessage for an in-scope relation it
 // fingerprints that one relation again and diffs ([diffRelationFacts]).
 // A delta ends the stream with the grep-stable marker
-// UNFORWARDED-SCHEMA-CHANGE, as a TERMINAL error: an automatic retry
-// would re-baseline and accept the change silently.
+// UNFORWARDED-SCHEMA-CHANGE, as a TERMINAL error: a retry cannot succeed
+// (the next reader is handed this baseline and refuses again; GC-32), and
+// without the carry it would re-baseline and accept the change silently.
 //
 // # What the diff exempts, and why each is safe
 //
@@ -426,18 +428,87 @@ func identityWord(code string) string {
 	}
 }
 
+// pgUnforwardedBaseline is the door's baseline as it crosses from one
+// reader to the next through the pipeline (GC-32). Opaque to the
+// pipeline: it only moves the value between readers of this engine.
+type pgUnforwardedBaseline map[uint32]*pgRelationFacts
+
+// unforwardedDoorState holds the door's baseline. The pump reads and
+// writes facts; [CDCReader.UnforwardedBaseline] reads it from the
+// pipeline between retry attempts, so it is guarded. A facts entry is
+// never mutated in place — a re-baseline replaces the pointer — so a
+// shallow map copy is a consistent snapshot.
+type unforwardedDoorState struct {
+	mu      sync.Mutex
+	facts   map[uint32]*pgRelationFacts
+	carried pgUnforwardedBaseline
+}
+
+// UnforwardedBaseline returns a snapshot of this reader's baseline — the
+// StreamChanges fingerprint plus every re-baseline a passing relation
+// made since — for the NEXT reader of the same run (GC-32). nil before
+// StreamChanges or when the door is inert.
+//
+// Why it exists: the baseline lives in the reader, and an automatic retry
+// after a transient error opens a fresh reader. Re-reading the catalog
+// there would take a baseline that already contains any change made
+// between the DDL and the failure, and accept it silently. Carrying the
+// previous reader's baseline across the retry means only an operator
+// restart re-baselines, which is the documented, deliberate case.
+func (r *CDCReader) UnforwardedBaseline() any {
+	r.unforwarded.mu.Lock()
+	defer r.unforwarded.mu.Unlock()
+	if r.unforwarded.facts == nil {
+		return nil
+	}
+	out := make(pgUnforwardedBaseline, len(r.unforwarded.facts))
+	for k, v := range r.unforwarded.facts {
+		out[k] = v
+	}
+	return out
+}
+
+// SetUnforwardedBaseline hands this reader the previous reader's baseline
+// (GC-32); StreamChanges then starts from it instead of the live catalog.
+// Must be called before StreamChanges. A value from another engine is
+// ignored and the reader takes its own baseline.
+func (r *CDCReader) SetUnforwardedBaseline(b any) {
+	carried, ok := b.(pgUnforwardedBaseline)
+	if !ok {
+		return
+	}
+	r.unforwarded.mu.Lock()
+	defer r.unforwarded.mu.Unlock()
+	r.unforwarded.carried = carried
+}
+
 // captureUnforwardedBaseline fingerprints every user table at
-// StreamChanges. A nil catalog pool leaves the door inert (unit-test
-// readers built without one).
+// StreamChanges — or, on a retry within one run, adopts the previous
+// reader's baseline (GC-32). A nil catalog pool leaves the door inert
+// (unit-test readers built without one).
 func (r *CDCReader) captureUnforwardedBaseline(ctx context.Context) error {
 	if r.db == nil {
 		return nil
 	}
-	facts, err := readRelationFacts(ctx, r.db, 0)
-	if err != nil {
-		return fmt.Errorf("postgres: cdc: baseline the schema objects logical replication does not carry: %w", err)
+	r.unforwarded.mu.Lock()
+	carried := r.unforwarded.carried
+	r.unforwarded.mu.Unlock()
+	var facts map[uint32]*pgRelationFacts
+	if carried == nil {
+		var err error
+		facts, err = readRelationFacts(ctx, r.db, 0)
+		if err != nil {
+			return fmt.Errorf("postgres: cdc: baseline the schema objects logical replication does not carry: %w", err)
+		}
+	} else {
+		facts = make(map[uint32]*pgRelationFacts, len(carried))
+		for k, v := range carried {
+			facts[k] = v
+		}
 	}
-	r.unforwardedBaseline = facts
+	r.unforwarded.mu.Lock()
+	r.unforwarded.facts = facts
+	r.unforwarded.mu.Unlock()
 	return nil
 }
 
@@ -448,7 +519,11 @@ func (r *CDCReader) captureUnforwardedBaseline(ctx context.Context) error {
 // here; a relation that passes is re-baselined so an exempt change (a
 // forwarded DROP COLUMN's cascade) is not re-diffed at the next boundary.
 func (r *CDCReader) gradeUnforwardedClasses(ctx context.Context, relationID uint32, entry *relationCacheEntry) error {
-	if r.unforwardedBaseline == nil || r.db == nil || !r.relationInScope(entry.Schema, entry.Name) {
+	r.unforwarded.mu.Lock()
+	armed := r.unforwarded.facts != nil
+	prior := r.unforwarded.facts[relationID]
+	r.unforwarded.mu.Unlock()
+	if !armed || r.db == nil || !r.relationInScope(entry.Schema, entry.Name) {
 		return nil
 	}
 	facts, err := readRelationFacts(ctx, r.db, relationID)
@@ -459,15 +534,14 @@ func (r *CDCReader) gradeUnforwardedClasses(ctx context.Context, relationID uint
 	if cur == nil {
 		return nil // dropped since the message was written; the DML path owns that
 	}
-	prior := r.unforwardedBaseline[relationID]
-	if prior == nil {
-		r.unforwardedBaseline[relationID] = cur
-		return nil
+	if prior != nil {
+		if deltas := diffRelationFacts(prior, cur); len(deltas) > 0 {
+			return &terminalPGError{err: unforwardedChangeError(entry.Schema, entry.Name, deltas)}
+		}
 	}
-	if deltas := diffRelationFacts(prior, cur); len(deltas) > 0 {
-		return &terminalPGError{err: unforwardedChangeError(entry.Schema, entry.Name, deltas)}
-	}
-	r.unforwardedBaseline[relationID] = cur
+	r.unforwarded.mu.Lock()
+	r.unforwarded.facts[relationID] = cur
+	r.unforwarded.mu.Unlock()
 	return nil
 }
 
