@@ -206,6 +206,19 @@ type fdLane struct {
 	// streamParams is appended to the Streamer's source DSN only (the
 	// VStream endpoint parameters, which a plain SQL session rejects).
 	streamParams string
+
+	// shardColumn, when engaged, runs the lane as a Shape A fan-in stream
+	// (--inject-shard-column): every forward then goes through the
+	// ADR-0054 boundary router instead of the single-stream forwarder.
+	shardColumn ShardColumnSpec
+
+	// oneAlter forwards the whole matrix as ONE multi-column ADD COLUMN
+	// (one boundary) instead of one ALTER per shape. A Shape A lane needs
+	// it: its lease is single-use per table until the GC sweep retires the
+	// applied row, so a second DDL on `w` refuses loudly (Bug 262b, open).
+	// Every shape still reaches the router's per-column carry, retarget and
+	// emit. A oneAlter lane cannot carry a halt with a prelude.
+	oneAlter bool
 }
 
 // fdDesignedRefusal is the ADR-0058 §2a volatile-DEFAULT refusal.
@@ -388,6 +401,8 @@ func fdStartStream(t *testing.T, lane fdLane, src, tgt, streamID string) *fdStre
 		TargetDSN: tgt,
 		StreamID:  streamID,
 		SlotName:  strings.ReplaceAll(streamID, "-", "_"),
+
+		InjectShardColumn: lane.shardColumn,
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &fdStream{lane: lane, src: src, tgt: tgt, runErr: make(chan error, 1), cancel: cancel}
@@ -420,6 +435,19 @@ func (s *fdStream) forward(t *testing.T, sh fdShape, id int) {
 	fdExec(t, s.lane.src, s.src, fmt.Sprintf("INSERT INTO w (id, name) VALUES (%d, 'after-%s')", id, sh.col))
 }
 
+// forwardAll runs ONE source ALTER adding every shape, then one source
+// INSERT with id — a single boundary carrying all the added columns.
+func (s *fdStream) forwardAll(t *testing.T, shapes []fdShape, id int) {
+	t.Helper()
+	adds := make([]string, len(shapes))
+	for i, sh := range shapes {
+		adds[i] = "ADD COLUMN " + fdQuote(s.lane.src, sh.col) + " " + sh.def
+	}
+	fdExec(t, s.lane.src, s.src, "ALTER TABLE w "+strings.Join(adds, ", "))
+	time.Sleep(s.lane.settle)
+	fdExec(t, s.lane.src, s.src, fmt.Sprintf("INSERT INTO w (id, name) VALUES (%d, 'after-all')", id))
+}
+
 func (s *fdStream) stop(t *testing.T) {
 	t.Helper()
 	s.cancel()
@@ -437,6 +465,11 @@ func runForwardedDefaultLane(t *testing.T, lane fdLane) {
 	t.Helper()
 	if lane.freshPair == nil && len(lane.halts) > 1 {
 		t.Fatalf("%s: a lane without freshPair can carry at most one halt cell", lane.name)
+	}
+	for _, h := range lane.halts {
+		if lane.oneAlter && len(h.prelude) > 0 {
+			t.Fatalf("%s: a oneAlter lane cannot run halt %s's prelude (a second DDL on w)", lane.name, h.shape.col)
+		}
 	}
 	// A halt cell ends its stream, so it leaves the matrix.
 	halting := make(map[string]bool, len(lane.halts))
@@ -484,15 +517,22 @@ func runForwardedDefaultLane(t *testing.T, lane fdLane) {
 
 	// One ALTER per shape, one post-ALTER row each as the liveness
 	// signal. Shape i's pre-existing rows are therefore ids
-	// 1 .. fdSeedRows+i.
-	for i, sh := range lane.shapes {
-		id := fdSeedRows + i + 1
-		s.forward(t, sh, id)
-		s.waitRows(t, "forward "+sh.col+" "+sh.def, id)
-	}
+	// 1 .. fdSeedRows+i. A oneAlter lane has one ALTER, so every shape's
+	// pre-existing rows are the seed rows.
 	cells := make([]fdCell, len(lane.shapes))
-	for i, sh := range lane.shapes {
-		cells[i] = fdCell{shape: sh, maxID: fdSeedRows + i}
+	if lane.oneAlter {
+		s.forwardAll(t, lane.shapes, fdSeedRows+1)
+		s.waitRows(t, "forward the whole matrix in one ALTER", fdSeedRows+1)
+		for i, sh := range lane.shapes {
+			cells[i] = fdCell{shape: sh, maxID: fdSeedRows}
+		}
+	} else {
+		for i, sh := range lane.shapes {
+			id := fdSeedRows + i + 1
+			s.forward(t, sh, id)
+			s.waitRows(t, "forward "+sh.col+" "+sh.def, id)
+			cells[i] = fdCell{shape: sh, maxID: fdSeedRows + i}
+		}
 	}
 	fdGrade(t, lane, lane.sourceDSN, lane.targetDSN, cells)
 
@@ -783,6 +823,42 @@ func TestStreamer_AddColumnForward_PreexistingRowDefaults_MySQLToPostgres(t *tes
 	})
 }
 
+// TestStreamer_AddColumnForward_PreexistingRowDefaults_ShapeAMySQLToPostgres
+// is the MySQL binlog → Postgres lane as a Shape A fan-in stream. The
+// binlog carries each DEFAULT in-band, so the router's carry reads nothing
+// here; what this lane grades is the rest of the router's DEFAULT path —
+// in-band defaults reaching the target through its retarget and apply,
+// and the ADR-0058 §2a door, which the router did not have until GC-36 (1)
+// (a CURRENT_TIMESTAMP default was forwarded and filled pre-existing rows
+// with the target's clock). One ALTER for the matrix — see oneAlter.
+func TestStreamer_AddColumnForward_PreexistingRowDefaults_ShapeAMySQLToPostgres(t *testing.T) {
+	src, _, srcCleanup := startMySQLBinlog(t)
+	defer srcCleanup()
+	_, tgt, tgtCleanup := startPostgres(t)
+	defer tgtCleanup()
+	all := fdMySQLShapes()
+	runForwardedDefaultLane(t, fdLane{
+		name: "shapeA mysql->postgres", sourceEngine: "mysql", targetEngine: "postgres",
+		sourceDSN: src, targetDSN: tgt, src: fdMySQL, tgt: fdPG,
+		shapes:      all,
+		shardColumn: ShardColumnSpec{Name: "source_shard_id", Value: "shard_a"},
+		oneAlter:    true,
+		knownWrong:  map[string]fdKnownWrong{},
+		halts: []fdHalt{
+			fdLoud(t, all, "i_ubigmax", "out of range for type bigint",
+				"BIGINT UNSIGNED forwards as PG bigint; its max DEFAULT overflows the target ALTER"),
+			fdLoud(t, all, "x_blobexpr", "is of type bytea but default expression is of type integer",
+				"MySQL's (0x00FF) expression DEFAULT is re-emitted verbatim on PG, where 0x00FF lexes as an integer"),
+			fdLoud(t, all, "x_bit", "does not match type bit(8)",
+				"BIT(8) DEFAULT b'1010' is emitted as a 4-bit literal PG will not widen"),
+			fdRefused(t, all, "j_obj"),
+			fdRefused(t, all, "j_kv"),
+			fdDesignedRefusal(fdMySQLNow),
+		},
+		freshPair: fdFreshPairs(fdMySQL, fdPG, src, tgt),
+	})
+}
+
 // TestStreamer_AddColumnForward_PreexistingRowDefaults_MySQLToMySQL
 // grades the MySQL 8 binlog → MySQL lane. Source and target are separate
 // servers: sharing one measured 218s against 55s, every forward ~4x
@@ -995,6 +1071,42 @@ func TestStreamer_AddColumnForward_PreexistingRowDefaults_PostgresToPostgres(t *
 			// KNOWN LOUD DEFECT: a column of an existing enum type is
 			// forwarded as a synthesised w_<col>_enum type that rejects the
 			// source's own label on the first carried row.
+			fdLoud(t, all, "e_mood", `invalid input value for enum w_e_mood_enum: "ok"`,
+				"PG enum column forwarded as a synthesised enum without the source labels"),
+			fdDesignedRefusal(fdPGNow),
+		},
+		freshPair: fdFreshPairs(fdPG, fdPG, src, tgt),
+	})
+}
+
+// TestStreamer_AddColumnForward_PreexistingRowDefaults_ShapeAPostgresToPostgres
+// grades the Postgres pgoutput → Postgres lane as a Shape A fan-in stream
+// (--inject-shard-column), whose ADD COLUMN is forwarded by the ADR-0054
+// boundary router, not the single-stream forwarder the other lanes grade
+// (GC-36 (1)). The router shares the carry and the §2a door with that
+// forwarder but has its own retarget, apply and takeover arms, so it gets
+// the whole family matrix rather than one representative.
+//
+// One shard: the pre-existing-row fill is the holder's ALTER either way,
+// and the multi-shard question — do peers agree on the carried DEFAULT —
+// is the lease checksum's, pinned by
+// TestRouteBoundary_AddColumn_PeerWithADifferentDefaultRefuses and, on
+// real servers across three sources, by
+// TestPhase2e_PG_StreamerHarness_3SourcesToTarget_ExactlyOnceApply.
+func TestStreamer_AddColumnForward_PreexistingRowDefaults_ShapeAPostgresToPostgres(t *testing.T) {
+	src, tgt, cleanup := startPostgresLogical(t)
+	defer cleanup()
+	all := fdPGShapes()
+	runForwardedDefaultLane(t, fdLane{
+		name: "shapeA postgres->postgres", sourceEngine: "postgres", targetEngine: "postgres",
+		sourceDSN: src, targetDSN: tgt, src: fdPG, tgt: fdPG,
+		shapes:      all,
+		shardColumn: ShardColumnSpec{Name: "source_shard_id", Value: "shard_a"},
+		oneAlter:    true,
+		knownWrong:  map[string]fdKnownWrong{},
+		halts: []fdHalt{
+			fdLoud(t, all, "d_numfree", "numeric precision 0 must be between 1 and 1000",
+				"unconstrained NUMERIC forwarded with precision 0"),
 			fdLoud(t, all, "e_mood", `invalid input value for enum w_e_mood_enum: "ok"`,
 				"PG enum column forwarded as a synthesised enum without the source labels"),
 			fdDesignedRefusal(fdPGNow),

@@ -126,11 +126,24 @@ func (s *Streamer) engageShardCoordination(ctx context.Context, applier ir.Chang
 	}
 	s.shapeWriter = sw
 
+	// GC-36 (1): the router reads an added column's DEFAULT from THIS
+	// stream's own source — the one catalog guaranteed to hold a column this
+	// stream's boundary just added (see [BoundaryRouter.sourceDefaults]).
+	// Pgoutput and the VStream FieldEvent carry no DEFAULT, so without the
+	// read every pre-existing consolidated row lands NULL. Failing to open
+	// it refuses: coordinating without it is that silent outcome.
+	sr, err := s.Source.OpenSchemaReader(ctx, s.SourceDSN)
+	if err != nil {
+		s.closeShardCoordination()
+		return fmt.Errorf("pipeline: engage shard consolidation: open source schema reader: %w", err)
+	}
+	s.shapeSourceSchemaReader = sr
+
 	// The engine pair drives the router's per-boundary resolve to the
 	// target's shape (dialect + bound namespace) — Bug 262.
-	router, err := NewBoundaryRouter(mgr, shapeApplier, prober, s.Source.Name(), s.Target.Name())
+	router, err := NewBoundaryRouter(mgr, shapeApplier, prober, s.Source.Name(), s.Target.Name(), newSourceDefaultReaders(sr))
 	if err != nil {
-		_ = closeIfErrIgnored(sw)
+		s.closeShardCoordination()
 		return fmt.Errorf("pipeline: engage shard consolidation: %w", err)
 	}
 	s.boundaryRouter = router
@@ -155,9 +168,9 @@ func (s *Streamer) refuseEngineMissingCoordination(missingSurface string) error 
 	)
 }
 
-// closeShardCoordination releases the SchemaWriter opened by
-// engageShardCoordination. Idempotent — safe to call on streams that
-// never engaged.
+// closeShardCoordination releases the SchemaWriter and source
+// SchemaReader opened by engageShardCoordination. Idempotent — safe to
+// call on streams that never engaged.
 func (s *Streamer) closeShardCoordination() {
 	if s == nil {
 		return
@@ -165,6 +178,10 @@ func (s *Streamer) closeShardCoordination() {
 	if s.shapeWriter != nil {
 		_ = closeIfErrIgnored(s.shapeWriter)
 		s.shapeWriter = nil
+	}
+	if s.shapeSourceSchemaReader != nil {
+		_ = closeIfErrIgnored(s.shapeSourceSchemaReader)
+		s.shapeSourceSchemaReader = nil
 	}
 	s.boundaryRouter = nil
 	s.leaseMgr = nil

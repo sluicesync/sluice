@@ -33,6 +33,8 @@ package pipeline
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -67,6 +69,30 @@ type BoundaryRouter struct {
 	sourceEngine string
 	targetEngine string
 
+	// sourceDefaults reads an added column's DEFAULT from THIS stream's own
+	// source catalog — the ADR-0058 §2a volatility probe and the carried IR
+	// default ([carryAddedColumnDefaults]). Neither pgoutput nor the VStream
+	// FieldEvent carries a DEFAULT, so without the carry an ADD COLUMN …
+	// DEFAULT d reached the target bare and every row the consolidated table
+	// already held — every shard's — stayed NULL where the sources hold d
+	// (GC-36 (1), the Bug 287 class on the fan-in path).
+	//
+	// Why this stream's own source and not some canonical shard: the
+	// boundary being routed was observed in THIS stream's change stream, so
+	// its source is the one catalog guaranteed to already hold the column (a
+	// peer shard may not have run the DDL yet), and there is no designated
+	// shard to prefer. What the choice cannot prove alone — that every shard
+	// declares the same DEFAULT — is enforced through the lease checksum:
+	// the carried defaults are folded into ddl_text
+	// ([leaseDDLTextWithCarriedDefaults]), so a peer whose source declares
+	// a different DEFAULT observes a checksum mismatch and refuses loudly
+	// rather than accepting the holder's fill of its rows.
+	//
+	// The zero value (no readers) carries nothing — only a unit harness with
+	// no source reader builds one; [Streamer.engageShardCoordination] always
+	// wires both.
+	sourceDefaults sourceDefaultReaders
+
 	// observePollInterval controls how often the observer loop polls
 	// the lease row when a peer holds the lease. Default 2 seconds;
 	// tests can shrink it via NewBoundaryRouter's option-arg path
@@ -90,10 +116,21 @@ type BoundaryRouter struct {
 // coordination. A same-engine pair is a type pass-through; the
 // namespace scrub applies to every pair.
 //
+// defaults reads added-column DEFAULTs from this stream's own source
+// (see [BoundaryRouter.sourceDefaults]); a caller with a live source
+// passes [newSourceDefaultReaders] over a source SchemaReader, and only a
+// harness without one passes the zero value.
+//
 // observeTimeout defaults to 2 × LeaseDuration when zero — the same
 // observer-wait cap ADR-0054 §3 recommends. observePollInterval
 // defaults to 2 seconds.
-func NewBoundaryRouter(mgr *LeaseManager, applier ir.ShapeDeltaApplier, prober ShardConsolidationProber, sourceEngine, targetEngine string) (*BoundaryRouter, error) {
+func NewBoundaryRouter(
+	mgr *LeaseManager,
+	applier ir.ShapeDeltaApplier,
+	prober ShardConsolidationProber,
+	sourceEngine, targetEngine string,
+	defaults sourceDefaultReaders,
+) (*BoundaryRouter, error) {
 	if mgr == nil {
 		return nil, errors.New("pipeline: NewBoundaryRouter: lease manager is nil")
 	}
@@ -109,6 +146,7 @@ func NewBoundaryRouter(mgr *LeaseManager, applier ir.ShapeDeltaApplier, prober S
 		prober:              prober,
 		sourceEngine:        sourceEngine,
 		targetEngine:        targetEngine,
+		sourceDefaults:      defaults,
 		observePollInterval: 2 * time.Second,
 		observeTimeout:      2 * mgr.cfg.LeaseDuration,
 	}, nil
@@ -168,6 +206,14 @@ func (r *BoundaryRouter) RouteBoundary(
 		)
 		return nil
 	}
+	if shape.Kind == ShapeKindAddColumn {
+		// Before the lease: the carried DEFAULT is part of what the lease
+		// agrees on (it enters ddlText), and a refusal here holds nothing.
+		post, ddlText, err = r.resolveAddedColumnDefaults(ctx, tableName, post, shape, ddlText)
+		if err != nil {
+			return fmt.Errorf("pipeline: route boundary: %w", err)
+		}
+	}
 
 	checksum := ChecksumDDLText(ddlText)
 
@@ -182,6 +228,83 @@ func (r *BoundaryRouter) RouteBoundary(
 	default:
 		return fmt.Errorf("pipeline: route boundary: acquire: %w", err)
 	}
+}
+
+// resolveAddedColumnDefaults runs the single-stream forwarder's two ADD
+// COLUMN DEFAULT steps on a Shape A boundary, from this stream's own
+// source ([BoundaryRouter.sourceDefaults]):
+//
+//  1. [refuseComputedDefaults] — the ADR-0058 §2a door. A volatile DEFAULT
+//     (now(), nextval(), …) would be evaluated once by the TARGET at ALTER
+//     time, so every pre-existing row would hold the target's instant
+//     rather than the one each source filled in. The router had no such
+//     door; before the carry a PG/VStream source's volatile default was
+//     dropped (NULL), and a MySQL binlog source's in-band one was forwarded
+//     and filled with the target's clock.
+//  2. [carryAddedColumnDefaults] — the added columns' IR DEFAULT, onto a
+//     copy of post that the apply and the takeover probe then consume.
+//
+// It returns that copy and ddlText with the carried defaults folded in
+// ([leaseDDLTextWithCarriedDefaults]). Both refusals end with the
+// fleet-wide [RecoveryHint], not the single-stream one.
+func (r *BoundaryRouter) resolveAddedColumnDefaults(
+	ctx context.Context,
+	tableName string,
+	post *ir.Table,
+	shape Shape,
+	ddlText string,
+) (*ir.Table, string, error) {
+	deps := schemaForwardDeps{
+		defaultProber:  r.sourceDefaults.prober,
+		defaultCarrier: r.sourceDefaults.carrier,
+		recoveryHint:   RecoveryHint,
+	}
+	// post is the source's CDC projection, so its namespace and name are
+	// the SOURCE table's — what the source catalog read needs.
+	snap := ir.SchemaSnapshot{Schema: post.Schema, Table: post.Name, IR: post}
+	if err := refuseComputedDefaults(ctx, deps, tableName, snap, shape.AddedColumns); err != nil {
+		return nil, "", err
+	}
+	carried, carriedCols, err := carryAddedColumnDefaults(ctx, deps, tableName, snap, shape.AddedColumns)
+	if err != nil {
+		return nil, "", err
+	}
+	return carried, leaseDDLTextWithCarriedDefaults(ddlText, carriedCols), nil
+}
+
+// leaseDDLTextWithCarriedDefaults appends the carried DEFAULTs to a Shape A
+// boundary's lease ddl_text, so the checksum every peer compares covers
+// them. ddlText is derived from the CDC projection, which on a Postgres or
+// VStream source has no DEFAULT at all: without this, two shards declaring
+// different defaults for the same added column would agree on the
+// checksum, and the holder's default would silently fill every other
+// shard's pre-existing rows on the consolidated target. With it the peer
+// refuses with [ErrLeaseChecksumMismatch].
+//
+// Only a real carried default (not [ir.DefaultNone]) contributes, so a
+// boundary that carried nothing — every non-ADD-COLUMN shape, every column
+// the stream carried in-band (a MySQL binlog source), every column with no
+// default — keeps exactly the ddl_text it had before the carry existed,
+// and a fleet mixing binaries still agrees on it. A mixed fleet DOES
+// disagree on an ADD COLUMN whose default was carried: the older binary
+// forwards it without the default, so that mismatch refusal is the
+// correct outcome, not a compatibility break to engineer around.
+//
+// The suffix is a SHA-256 of the carried columns' IR (name, type,
+// default) rather than the text itself, keeping ddl_text bounded whatever
+// the default's length.
+func leaseDDLTextWithCarriedDefaults(ddlText string, carried []*ir.Column) string {
+	if len(carried) == 0 {
+		return ddlText
+	}
+	payload, err := ir.MarshalTable(&ir.Table{Columns: carried})
+	if err != nil {
+		// Still distinct per column set, and still refuses on divergence
+		// between peers that hit the same marshal error.
+		return fmt.Sprintf("%s+carried-defaults:marshal-err:%v", ddlText, err)
+	}
+	sum := sha256.Sum256(payload)
+	return ddlText + "+carried-defaults:" + hex.EncodeToString(sum[:])
 }
 
 // handleHeldLease runs when this stream successfully acquired the

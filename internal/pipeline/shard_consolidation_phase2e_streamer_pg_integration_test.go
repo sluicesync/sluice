@@ -562,6 +562,12 @@ func TestPhase2e_PG_StreamerHarness_3SourcesToTarget_ExactlyOnceApply(t *testing
 	// this the right shape to assert.)
 	assertPhase2eColumnExistsExactlyOnce(t, h.targetDSN, "users", "active")
 
+	// GC-36 (1): every shard's seed row existed on the target before the
+	// ALTER, so the holder's ADD COLUMN filled all three — and pgoutput
+	// carries no DEFAULT, so before the router carried the source's they
+	// all held NULL. Graded against each row's OWN source.
+	assertPhase2eSeedRowsMatchTheirSources(t, h, 3, "active")
+
 	// Phase D — drive post-DDL INSERTs on every source. The applier's
 	// CDC pipeline must absorb them with the active column populated
 	// (default TRUE).
@@ -844,6 +850,43 @@ func assertPhase2ePostDDLRowsHaveActive(t *testing.T, dsn string) {
 	}
 	if n != 0 {
 		t.Errorf("%d post-DDL rows have active NOT TRUE; want 0 (CDC didn't carry the column default)", n)
+	}
+}
+
+// assertPhase2eSeedRowsMatchTheirSources compares col on the first n
+// shards' seed rows — rows that were already on the consolidated target
+// when a forwarded ADD COLUMN ran — against the value each shard's own
+// source holds for that row. The source is the independent expected
+// value: its fill of its existing rows emits no row event, so only the
+// forwarded ALTER's DEFAULT can have put a value on the target's copy.
+func assertPhase2eSeedRowsMatchTheirSources(t *testing.T, h *phase2eHarness, n int, col string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	read := func(dsn, q string, args ...any) string {
+		db, err := sql.Open("pgx", dsn)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		defer func() { _ = db.Close() }()
+		var v sql.NullString
+		if err := db.QueryRowContext(ctx, q, args...).Scan(&v); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		if !v.Valid {
+			return "<NULL>"
+		}
+		return v.String
+	}
+	for i := 0; i < n; i++ {
+		label := phase2eShardLabels()[i]
+		email := label + "_seed@example.com"
+		want := read(h.sourceDSNs[i], `SELECT `+col+`::text FROM users WHERE email = $1`, email)
+		got := read(h.targetDSN, `SELECT `+col+`::text FROM "public"."users" WHERE source_shard_id = $1 AND email = $2`, label, email)
+		if got != want {
+			t.Errorf("%s seed row: target %s = %s, its source holds %s — the forwarded ADD COLUMN filled a pre-existing row "+
+				"with a value its source does not hold (GC-36 (1))", label, col, got, want)
+		}
 	}
 }
 

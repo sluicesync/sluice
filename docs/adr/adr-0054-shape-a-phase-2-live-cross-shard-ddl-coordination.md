@@ -673,6 +673,38 @@ The general lesson is filed as a gate rather than a note —
 shared-pipeline-phase field is left unassigned at any production construction
 site.
 
+## Implementation note (2026-09-23) — the forwarded ADD COLUMN had no DEFAULT (GC-36 (1))
+
+DP-E has the router apply "the delta between two IR snapshots". On a
+Postgres or VStream source the post snapshot is the change stream's
+projection, and neither pgoutput's relation message nor the VStream field
+event carries a column DEFAULT — so an `ADD COLUMN … DEFAULT d` reached the
+consolidated target bare, and every shard's pre-existing rows held NULL
+where the sources hold `d` (the source's own fill writes no row event, so
+nothing corrected them). The single-stream forwarder had the same defect
+and was fixed first (`carrySourceDefaults`, Bug 287 class).
+
+`RouteBoundary` now runs the single-stream forwarder's two DEFAULT steps
+before the lease: the ADR-0058 §2a volatility door (which the router never
+had — a MySQL-source `CURRENT_TIMESTAMP` default was forwarded and every
+pre-existing row got the target's clock) and `carryAddedColumnDefaults`,
+reading through a source SchemaReader `engageShardCoordination` opens on
+the stream's OWN `SourceDSN` (engagement refuses if it cannot).
+
+**Which shard's catalog.** The stream routing the boundary observed it in its
+own change stream, so its source is the one catalog guaranteed to already
+hold the column; a peer shard may not have run the DDL yet, and there is no
+designated shard to prefer. That choice alone cannot prove every shard
+declares the same DEFAULT, so the carried defaults (IR name/type/default,
+SHA-256) are appended to the lease `ddl_text` —
+`leaseDDLTextWithCarriedDefaults` — and a peer whose source declares a
+different DEFAULT gets `ErrLeaseChecksumMismatch` (DP-B's divergence
+refusal) instead of accepting the holder's fill of its rows. A boundary
+that carried nothing (no default, an in-band MySQL binlog default, any
+non-ADD-COLUMN shape) keeps its `ddl_text` byte-identical, so checksums
+there are unchanged across binaries; a mixed fleet disagrees only on an ADD
+COLUMN whose default was carried, which the older binary forwards wrongly.
+
 ## Out of scope (Phase 3+)
 
 - **Operator-issued DDL through sluice**: a future `sluice schema

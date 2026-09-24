@@ -337,6 +337,27 @@ func newSourceDefaultCarrier(sr ir.SchemaReader) defaultProberFunc {
 	}
 }
 
+// sourceDefaultReaders is the pair of source-catalog DEFAULT reads a
+// forwarded ADD COLUMN needs, both over one source SchemaReader: prober
+// for the ADR-0058 §2a volatility classification (raw catalog text where
+// the engine offers it — Bug 91) and carrier for the IR default the ALTER
+// carries. The Shape A boundary router holds one
+// ([BoundaryRouter.sourceDefaults]); the single-stream forwarder keeps the
+// same two functions on its [schemaForwardDeps]. The zero value reads
+// nothing (a unit harness with no source).
+type sourceDefaultReaders struct {
+	prober  defaultProberFunc
+	carrier defaultProberFunc
+}
+
+// newSourceDefaultReaders builds both reads over sr.
+func newSourceDefaultReaders(sr ir.SchemaReader) sourceDefaultReaders {
+	return sourceDefaultReaders{
+		prober:  newSourceDefaultProber(sr),
+		carrier: newSourceDefaultCarrier(sr),
+	}
+}
+
 // readSchemaColumnDefault reads the source schema and returns the named
 // column's IR DEFAULT ([ir.DefaultNone] when it has none), or an error when
 // the column is not in the catalog.

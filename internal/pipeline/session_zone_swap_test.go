@@ -149,7 +149,7 @@ func TestIntercept_SessionZoneSwapAtFirstBoundary_NeverReachesAlterColumnType(t 
 		store := newFakeLeaseStore(clock.Now)
 		applier := &fakeShapeApplier{}
 		mgr := newTestLeaseManager(t, store, "stream-a", LeaseConfig{LeaseDuration: time.Hour, RenewDeadline: 30 * time.Minute, RetryPeriod: 5 * time.Minute}, clock)
-		router, err := NewBoundaryRouter(mgr, applier, &fakeProber{}, "postgres", "postgres")
+		router, err := NewBoundaryRouter(mgr, applier, &fakeProber{}, "postgres", "postgres", sourceDefaultReaders{})
 		if err != nil {
 			t.Fatalf("NewBoundaryRouter: %v", err)
 		}

@@ -1440,6 +1440,13 @@ type Streamer struct {
 	// lifetime; closed alongside other streamer resources.
 	shapeWriter ir.SchemaWriter
 
+	// shapeSourceSchemaReader is the source-side schema reader the
+	// BoundaryRouter reads an added column's DEFAULT through (the §2a
+	// probe and the carried default, GC-36 (1)) — the Shape A sibling of
+	// [addColumnForwardSchemaReader]. Opened and closed with
+	// [shapeWriter].
+	shapeSourceSchemaReader ir.SchemaReader
+
 	// addColumnForwardWriter is the SchemaWriter the ADR-0058
 	// single-stream ADD COLUMN forwarding intercept uses to issue
 	// [ir.SchemaDeltaApplier.AlterAddColumn] against the target.

@@ -89,6 +89,58 @@ func TestStreamer_AddColumnForward_PreexistingRowDefaults_VStreamToPostgres(t *t
 	})
 }
 
+// TestStreamer_AddColumnForward_PreexistingRowDefaults_ShapeAVStreamToPostgres
+// is the VStream lane run as a Shape A fan-in stream (--inject-shard-column),
+// so its ADD COLUMN goes through the ADR-0054 boundary router (GC-36 (1)):
+// the router's carry reads the DEFAULT the FIELD event drops back through
+// the planetscale SchemaReader. The matrix is forwarded as ONE multi-column
+// ALTER (oneAlter — Bug 262b makes the Shape A lease single-use per table),
+// which is also why the YEAR cell, a loud defect only on a stream's SECOND
+// forward, is graded here as a matrix cell.
+func TestStreamer_AddColumnForward_PreexistingRowDefaults_ShapeAVStreamToPostgres(t *testing.T) {
+	keyspaces := []string{"commerce"}
+	for i := 0; i < fdVStreamHaltKeyspaces; i++ {
+		keyspaces = append(keyspaces, fmt.Sprintf("s_halt%d", i))
+	}
+	mysqlDSN, grpcEndpoint, _, cleanupSrc := startVTTestServerKeyspaces(t, keyspaces, 1)
+	defer cleanupSrc()
+	targetDSN, cleanupTgt := startPGTarget(t)
+	defer cleanupTgt()
+
+	all := fdMySQLShapes()
+	runForwardedDefaultLane(t, fdLane{
+		name: "shapeA vstream->postgres", sourceEngine: "planetscale", targetEngine: "postgres",
+		sourceDSN: mysqlDSN, targetDSN: targetDSN, src: fdMySQL, tgt: fdPG,
+		streamParams: fmt.Sprintf("&vstream_endpoint=%s&vstream_transport=plaintext&vstream_auth=none&vstream_shards=0", grpcEndpoint),
+		settle:       time.Second,
+		shapes:       all,
+		shardColumn:  ShardColumnSpec{Name: "source_shard_id", Value: "shard_a"},
+		oneAlter:     true,
+		knownWrong:   map[string]fdKnownWrong{},
+		halts: []fdHalt{
+			// The same target-side loud defects as the single-stream VStream
+			// lane: each fails the target ALTER once its DEFAULT is carried.
+			fdLoud(t, all, "i_ubigmax", "out of range for type bigint",
+				"BIGINT UNSIGNED forwards as PG bigint; its max DEFAULT overflows the target ALTER"),
+			fdLoud(t, all, "x_blobexpr", "is of type bytea but default expression is of type integer",
+				"MySQL's (0x00FF) expression DEFAULT is re-emitted verbatim on PG, where 0x00FF lexes as an integer"),
+			fdLoud(t, all, "x_bit", "does not match type bit(8)",
+				"BIT(8) DEFAULT b'1010' is emitted as a 4-bit literal PG will not widen"),
+			fdRefused(t, all, "j_obj"),
+			fdRefused(t, all, "j_kv"),
+			fdDesignedRefusal(fdMySQLNow),
+		},
+		freshPair: func(t *testing.T, tag string) (string, string) {
+			t.Helper()
+			src, err := buildMySQLDSN(mysqlDSN, "s_"+tag)
+			if err != nil {
+				t.Fatalf("halt keyspace DSN: %v", err)
+			}
+			return src, fdFreshDB(t, fdPG, targetDSN, "t_"+tag)
+		},
+	})
+}
+
 // fdVStreamHaltKeyspaces is how many spare keyspaces the VStream lane
 // boots for its halt cells; runForwardedDefaultLane names them
 // s_halt0, s_halt1, … in halt order.

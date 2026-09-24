@@ -101,12 +101,21 @@ func (nonSupportingApplier) ClearStopRequested(context.Context, string) error   
 // shape-writer probe succeeds on the supporting-applier path.
 type stubNamedEngine struct {
 	name string
+
+	// schema is what OpenSchemaReader's reader returns (the source catalog
+	// the Shape A router reads added-column DEFAULTs from, GC-36 (1));
+	// schemaReaderErr, when set, fails the open instead.
+	schema          *ir.Schema
+	schemaReaderErr error
 }
 
 func (e stubNamedEngine) Name() string                  { return e.name }
 func (e stubNamedEngine) Capabilities() ir.Capabilities { return ir.Capabilities{} }
 func (e stubNamedEngine) OpenSchemaReader(context.Context, string) (ir.SchemaReader, error) {
-	return nil, errors.New("not implemented")
+	if e.schemaReaderErr != nil {
+		return nil, e.schemaReaderErr
+	}
+	return &fixedSchemaReader{schema: e.schema}, nil
 }
 
 func (e stubNamedEngine) OpenSchemaWriter(context.Context, string) (ir.SchemaWriter, error) {
@@ -344,7 +353,7 @@ type engineWithoutOrderer struct {
 func (e engineWithoutOrderer) Name() string                  { return e.name }
 func (e engineWithoutOrderer) Capabilities() ir.Capabilities { return ir.Capabilities{} }
 func (e engineWithoutOrderer) OpenSchemaReader(context.Context, string) (ir.SchemaReader, error) {
-	return nil, errors.New("not implemented")
+	return &fixedSchemaReader{}, nil
 }
 
 func (e engineWithoutOrderer) OpenSchemaWriter(context.Context, string) (ir.SchemaWriter, error) {
@@ -415,5 +424,71 @@ func TestEngage_InheritsNoGCDefaultWhenSurfacesMissing(t *testing.T) {
 	}
 	if mgr.gcDeps != nil {
 		t.Error("gcDeps should be nil when applier doesn't implement deleter/orderer (no-GC default)")
+	}
+}
+
+// TestEngage_RouterReadsAddedColumnDefaultsFromTheSource is the wiring pin
+// for GC-36 (1): the engaged router reads an added column's DEFAULT
+// through the stream's OWN source SchemaReader (Source.OpenSchemaReader on
+// SourceDSN) and hands the applier the column with it. The router-side
+// behaviour is pinned by TestRouteBoundary_AddColumn_*; this pins that
+// engagement wires it rather than leaving the zero-value readers.
+func TestEngage_RouterReadsAddedColumnDefaultsFromTheSource(t *testing.T) {
+	t.Parallel()
+	catalog := &ir.Schema{Tables: []*ir.Table{{Schema: "public", Name: "w", Columns: []*ir.Column{
+		{Name: "id", Type: ir.Integer{Width: 64}},
+		{Name: "a", Type: ir.Integer{Width: 32}, Default: ir.DefaultLiteral{Value: "42"}},
+	}}}}
+	s := &Streamer{
+		StreamID:          "stream-a",
+		InjectShardColumn: ShardColumnSpec{Name: "source_shard_id", Value: "us-east-1"},
+		Source:            stubNamedEngine{name: "src-stub", schema: catalog},
+		Target:            stubNamedEngine{name: "stub"},
+	}
+	if err := s.engageShardCoordination(context.Background(), newSupportingApplier()); err != nil {
+		t.Fatalf("engageShardCoordination: %v", err)
+	}
+	defer s.closeShardCoordination()
+	router := s.ShardConsolidationBoundaryRouter()
+	if router == nil {
+		t.Fatal("no boundary router")
+	}
+	applier := &capturingShapeApplier{}
+	router.applier = applier // observe what the engaged router hands the target
+
+	pre := &ir.Table{Schema: "public", Name: "w", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}}
+	post := &ir.Table{Schema: "public", Name: "w", Columns: []*ir.Column{
+		{Name: "id", Type: ir.Integer{Width: 64}},
+		{Name: "a", Type: ir.Integer{Width: 32}},
+	}}
+	if err := router.RouteBoundary(context.Background(), "public.w", pre, post, "ir-schema:w:x", 2, ir.Position{}); err != nil {
+		t.Fatalf("RouteBoundary: %v", err)
+	}
+	if len(applier.seen) != 1 {
+		t.Fatalf("applier calls = %d; want 1", len(applier.seen))
+	}
+	if got := applier.seen[0].col.Default; got != (ir.DefaultLiteral{Value: "42"}) {
+		t.Errorf("engaged router added column a with DEFAULT %#v; want the source catalog's 42", got)
+	}
+}
+
+// TestEngage_RefusesWhenTheSourceSchemaReaderWillNotOpen: without the
+// source reader the router cannot carry an added column's DEFAULT, so
+// engagement refuses rather than coordinating silently without it, and
+// leaves nothing half-open.
+func TestEngage_RefusesWhenTheSourceSchemaReaderWillNotOpen(t *testing.T) {
+	t.Parallel()
+	s := &Streamer{
+		StreamID:          "stream-a",
+		InjectShardColumn: ShardColumnSpec{Name: "source_shard_id", Value: "us-east-1"},
+		Source:            stubNamedEngine{name: "src-stub", schemaReaderErr: errors.New("source unreachable")},
+		Target:            stubNamedEngine{name: "stub"},
+	}
+	err := s.engageShardCoordination(context.Background(), newSupportingApplier())
+	if err == nil || !strings.Contains(err.Error(), "source unreachable") {
+		t.Fatalf("engageShardCoordination = %v; want a refusal carrying the open error", err)
+	}
+	if s.ShardConsolidationBoundaryRouter() != nil || s.ShardConsolidationLeaseManager() != nil || s.shapeWriter != nil {
+		t.Error("a refused engagement left coordination state behind")
 	}
 }
