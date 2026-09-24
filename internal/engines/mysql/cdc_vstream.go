@@ -2074,6 +2074,12 @@ func decodeVStreamRow(row *query.Row, fields []*query.Field, tableName string, z
 				}
 			}
 		}
+		// GC-37 (i): vstreamer renders an ENUM/SET cell as the label text
+		// its own lossy catalog holds, so a label with a character outside
+		// the BMP arrives as '?b' — refuse it (enum_label_loss.go).
+		if err := refuseVStreamLostLabel(tableName, f, v); err != nil {
+			return nil, false, err
+		}
 		out[f.GetName()] = v
 	}
 	return out, true, nil

@@ -504,6 +504,13 @@ type tableSchema struct {
 	// only by [loadTableSchema], production's sole constructor; a
 	// hand-built *tableSchema leaves it empty and the guard skips.
 	DataTypes []string
+
+	// LostLabels is parallel to Columns: for an ENUM/SET column whose
+	// catalog may have written a label character outside the BMP as '?',
+	// which of its labels (see enum_label_loss.go, GC-37 (i)); nil entries
+	// otherwise, and nil altogether when no column has one. Populated only
+	// by [loadTableSchema].
+	LostLabels [][]bool
 }
 
 // SetCDCDatabaseScope implements [ir.CDCDatabaseScoper]. It switches
@@ -1631,6 +1638,9 @@ func (r *CDCReader) dispatchRows(
 	if err := verifyTableMapMatchesSchema(ev, tbl); err != nil {
 		return err
 	}
+	// GC-37 (i): the labels the catalog may have lost, and the TABLE_MAP's
+	// own labels for them when the source runs binlog_row_metadata=FULL.
+	lbl := binlogLabelGuardFor(tbl, ev.Table)
 
 	// ADR-0049 Chunk B1: after a DDL invalidated the schema cache,
 	// the first row event per table forces tableFor to rebuild the
@@ -1686,7 +1696,7 @@ func (r *CDCReader) dispatchRows(
 			if err := refusePartialRowImage(tbl, skippedColumnsFor(ev, i), "insert", "write"); err != nil {
 				return err
 			}
-			row, err := decodeBinlogRow(raw, tbl.Columns, tbl.NativeKinds, r.flavor, tbl.Name, r.zeroDate)
+			row, err := decodeBinlogRow(raw, tbl.Columns, tbl.NativeKinds, r.flavor, tbl.Name, r.zeroDate, lbl)
 			if err != nil {
 				return fmt.Errorf("mysql: cdc: decode insert: %w", err)
 			}
@@ -1730,11 +1740,11 @@ func (r *CDCReader) dispatchRows(
 			if err := refusePartialRowImage(tbl, skippedColumnsFor(ev, i+1), "update", "after"); err != nil {
 				return err
 			}
-			before, err := decodeBinlogRow(ev.Rows[i], tbl.Columns, tbl.NativeKinds, r.flavor, tbl.Name, r.zeroDate)
+			before, err := decodeBinlogRow(ev.Rows[i], tbl.Columns, tbl.NativeKinds, r.flavor, tbl.Name, r.zeroDate, lbl)
 			if err != nil {
 				return fmt.Errorf("mysql: cdc: decode update before: %w", err)
 			}
-			after, err := decodeBinlogRow(ev.Rows[i+1], tbl.Columns, tbl.NativeKinds, r.flavor, tbl.Name, r.zeroDate)
+			after, err := decodeBinlogRow(ev.Rows[i+1], tbl.Columns, tbl.NativeKinds, r.flavor, tbl.Name, r.zeroDate, lbl)
 			if err != nil {
 				return fmt.Errorf("mysql: cdc: decode update after: %w", err)
 			}
@@ -1805,7 +1815,7 @@ func (r *CDCReader) dispatchRows(
 					return err
 				}
 			}
-			before, err := decodeBinlogRow(raw, tbl.Columns, tbl.NativeKinds, r.flavor, tbl.Name, r.zeroDate)
+			before, err := decodeBinlogRow(raw, tbl.Columns, tbl.NativeKinds, r.flavor, tbl.Name, r.zeroDate, lbl)
 			if err != nil {
 				return fmt.Errorf("mysql: cdc: decode delete: %w", err)
 			}
@@ -3869,7 +3879,7 @@ func stripBackticks(s string) string {
 // excludes the column from the target SQL — the target's GENERATED
 // clause then recomputes the value rather than freezing the source-
 // side result.
-func decodeBinlogRow(raw []any, cols []*ir.Column, natives []mariadbNativeKind, flavor Flavor, tableName string, zeroDate zeroDateMode) (ir.Row, error) {
+func decodeBinlogRow(raw []any, cols []*ir.Column, natives []mariadbNativeKind, flavor Flavor, tableName string, zeroDate zeroDateMode, labels binlogLabelGuard) (ir.Row, error) {
 	if len(raw) != len(cols) {
 		return nil, fmt.Errorf("row has %d values; schema has %d columns", len(raw), len(cols))
 	}
@@ -3902,6 +3912,12 @@ func decodeBinlogRow(raw []any, cols []*ir.Column, natives []mariadbNativeKind, 
 		}
 		if err != nil {
 			return nil, fmt.Errorf("column %q: %w", col.Name, err)
+		}
+		// GC-37 (i): an ENUM index / SET bitmask mapped through a label the
+		// catalog may have written as '?' — recover it from the TABLE_MAP or
+		// refuse (ENUM-LABEL-NOT-RECOVERABLE). See enum_label_loss.go.
+		if v, err = labels.recoverLostLabels(tableName, i, col, raw[i], v); err != nil {
+			return nil, err
 		}
 		if _, isBool := col.Type.(ir.Boolean); isBool {
 			// Vector D: a TINYINT(1) value outside {0,1} would be collapsed

@@ -142,15 +142,41 @@ func TestMigrate_SupplementaryCharEnumLabel_Refuses(t *testing.T) {
 // as if they were UTF-8, so the post-ALTER row the lane uses as its
 // liveness signal fails to apply (MySQL Error 3988 / MariaDB 1366 / PG
 // "contains a NUL byte", measured). That is GC-37 (j), not a DEFAULT.
+//
+// And less s_enumq, whose genuine '?' ENUM label is graded as a halt
+// (supplementaryForwardHalts) rather than a cell.
 func supplementaryForwardShapes(mariadb bool) []fdShape {
 	var out []fdShape
 	for _, sh := range supplementaryTextDefaults(mariadb) {
-		if sh[0] == "s_utf16" {
+		if sh[0] == "s_utf16" || sh[0] == "s_enumq" {
 			continue
 		}
 		out = append(out, fdShape{col: sh[0], def: sh[1], fam: fdText})
 	}
 	return out
+}
+
+// supplementaryForwardHalts is the genuine-'?' ENUM label, forwarded. Its
+// DEFAULT carries (the migrate lanes grade it), and the ALTER lands, but
+// the first row the binlog carries with that label cannot be told apart
+// from a label the catalog rewrote from a character outside the BMP — so
+// without binlog_row_metadata=FULL (these lanes run MINIMAL) the stream
+// ends with ENUM-LABEL-NOT-RECOVERABLE by design (GC-37 (i),
+// internal/engines/mysql/enum_label_loss.go). The pre-existing rows are
+// still graded: the target's fill '?b' against the source's.
+func supplementaryForwardHalts(t *testing.T, mariadb bool) []fdHalt {
+	t.Helper()
+	for _, sh := range supplementaryTextDefaults(mariadb) {
+		if sh[0] == "s_enumq" {
+			h := fdHalt{
+				shape: fdShape{col: sh[0], def: sh[1], fam: fdText},
+				want:  []string{"enum-label-not-recoverable"},
+			}
+			return []fdHalt{h.afterAlter()}
+		}
+	}
+	t.Fatal("supplementaryForwardHalts: no s_enumq shape")
+	return nil
 }
 
 // The forwarded-ADD-COLUMN lanes run with the backfill suppressed: the
@@ -168,6 +194,7 @@ func TestStreamer_AddColumnForward_SupplementaryCharTextDefaults_MySQLToMySQL(t 
 		name: "mysql->mysql supplementary", sourceEngine: "mysql", targetEngine: "mysql",
 		sourceDSN: src, targetDSN: tgt, src: fdMySQL, tgt: fdMySQL,
 		shapes: supplementaryForwardShapes(false), knownWrong: map[string]fdKnownWrong{},
+		halts:            supplementaryForwardHalts(t, false),
 		suppressBackfill: true,
 	})
 }
@@ -181,6 +208,7 @@ func TestStreamer_AddColumnForward_SupplementaryCharTextDefaults_MySQLToPostgres
 		name: "mysql->postgres supplementary", sourceEngine: "mysql", targetEngine: "postgres",
 		sourceDSN: src, targetDSN: tgt, src: fdMySQL, tgt: fdPG,
 		shapes: supplementaryForwardShapes(false), knownWrong: map[string]fdKnownWrong{},
+		halts:            supplementaryForwardHalts(t, false),
 		suppressBackfill: true,
 	})
 }
@@ -195,6 +223,7 @@ func TestStreamer_AddColumnForward_SupplementaryCharTextDefaults_MariaDBToMariaD
 		name: "mariadb->mariadb supplementary", sourceEngine: "mariadb", targetEngine: "mariadb",
 		sourceDSN: src, targetDSN: tgt, src: fdMySQL, tgt: fdMySQL,
 		shapes: supplementaryForwardShapes(true), knownWrong: map[string]fdKnownWrong{},
+		halts:            supplementaryForwardHalts(t, true),
 		suppressBackfill: true,
 	})
 }

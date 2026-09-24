@@ -369,7 +369,7 @@ func TestDecodeBinlogRow(t *testing.T) {
 	}
 	raw := []any{int64(7), []byte("alice@example.com"), int64(1)}
 
-	row, err := decodeBinlogRow(raw, cols, nil, FlavorVanilla, "users", zeroDateInherit)
+	row, err := decodeBinlogRow(raw, cols, nil, FlavorVanilla, "users", zeroDateInherit, binlogLabelGuard{})
 	if err != nil {
 		t.Fatalf("decodeBinlogRow: %v", err)
 	}
@@ -395,7 +395,7 @@ func TestDecodeBinlogRow_TinyInt1OutOfRangeRefuses(t *testing.T) {
 		{Name: "active", Type: ir.Boolean{}},
 	}
 	// active=2 (out of range) -> refuses, coded, names the column + remedy.
-	_, err := decodeBinlogRow([]any{int64(1), int64(2)}, cols, nil, FlavorVanilla, "users", zeroDateInherit)
+	_, err := decodeBinlogRow([]any{int64(1), int64(2)}, cols, nil, FlavorVanilla, "users", zeroDateInherit, binlogLabelGuard{})
 	if err == nil {
 		t.Fatal("decodeBinlogRow(active=2): want a refusal, got nil")
 	}
@@ -410,7 +410,7 @@ func TestDecodeBinlogRow_TinyInt1OutOfRangeRefuses(t *testing.T) {
 		t.Errorf("refusal hint missing the --type-override remedy; hint=%q", ce.Hint)
 	}
 	// An in-range bool column decodes to bool without refusing.
-	row, err := decodeBinlogRow([]any{int64(3), int64(1)}, cols, nil, FlavorVanilla, "users", zeroDateInherit)
+	row, err := decodeBinlogRow([]any{int64(3), int64(1)}, cols, nil, FlavorVanilla, "users", zeroDateInherit, binlogLabelGuard{})
 	if err != nil {
 		t.Fatalf("decodeBinlogRow (in-range): %v", err)
 	}
@@ -423,7 +423,7 @@ func TestDecodeBinlogRowColumnCountMismatch(t *testing.T) {
 	cols := []*ir.Column{
 		{Name: "id", Type: ir.Integer{Width: 64}},
 	}
-	if _, err := decodeBinlogRow([]any{int64(1), int64(2)}, cols, nil, FlavorVanilla, "t", zeroDateInherit); err == nil {
+	if _, err := decodeBinlogRow([]any{int64(1), int64(2)}, cols, nil, FlavorVanilla, "t", zeroDateInherit, binlogLabelGuard{}); err == nil {
 		t.Error("expected error for column count mismatch")
 	}
 }

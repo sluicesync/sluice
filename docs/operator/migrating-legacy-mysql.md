@@ -168,36 +168,29 @@ The MySQL driver-level overrides (UTF-8 charset, `time_zone='+00:00'`,
 sluice issues post-handshake; if you want to fully control all of
 those, pass them in the DSN params and sluice respects them.
 
-## ENUM/SET labels with 4-byte UTF-8 (emoji, supplementary plane)
+## ENUM/SET labels with 4-byte UTF-8 (emoji, supplementary plane) (`ENUM-LABEL-NOT-RECOVERABLE`)
 
-This is a **MySQL server-side limitation, not a sluice bug**. MySQL's
-data dictionary silently substitutes `?` for supplementary-plane
-characters in ENUM/SET labels at `CREATE TABLE` time, regardless of
-the column's character set. `CHARSET=utf8mb4` does not change this;
-`SET NAMES utf8mb4` before the CREATE does not change this;
-`mysqldump` reproduces the same loss. The label is already gone from
-the source server's catalog by the time sluice ever sees the column.
-
-Sluice surfaces this at schema-read time via a WARN line of the form:
+MySQL and MariaDB keep an ENUM/SET label such as `'😀b'` intact in the table the server executes against — a row holding it reads back from `SELECT` as the real bytes — but every catalog surface writes the character outside the Basic Multilingual Plane as `?`: `information_schema.COLUMNS.COLUMN_TYPE`, `SHOW CREATE TABLE` and `mysqldump` all print `enum('?b',…)`, whatever the column's character set and the session's results charset. (Characters inside the BMP, such as `é` or most CJK, survive; emoji and other 4-byte characters do not.) Measured on MySQL 8.0.46 and MariaDB 11.4. sluice reads the schema from the catalog, so the target's ENUM is created with the `'?b'` label, and sluice surfaces that at schema-read time with a WARN:
 
 ```
 mysql: enum labels contain '?' — likely MySQL data-dictionary
 truncation of 4-byte UTF-8 (Bug 106). column_type=enum('a','?')
 ```
 
-If the source's row data happens to contain non-`?` values for the
-column, the target write will loud-fail at row INSERT (PG: `invalid
-input value for enum`; MySQL → MySQL: same data-dictionary loss on
-both sides so the write succeeds). Recovery options:
+What happens to the rows:
 
-- `--type-override=TABLE.COL=text` — emit the column as PG TEXT (or
-  MySQL VARCHAR) on the target so the actual row values land
-  faithfully; ENUM enforcement is lost but the data round-trips.
-- Fix the source ENUM labels to use ASCII (or 3-byte UTF-8 — CJK
-  characters survive; only emoji / mathematical symbols / etc. are
-  4-byte) via `ALTER TABLE` before migration.
-- Ignore the warning if your source legitimately uses `?` as a label
-  and the runtime doesn't surface a false positive.
+- **Copy** (`migrate`, a `sync` cold start, `backup` fulls, mydumper): the copy reads each row's true label text, which the target's `'?b'` label rejects — a loud failure at the row's INSERT (Postgres `invalid input value for enum`, MySQL `Error 1265 Data truncated`).
+- **CDC** (`sync`, `backup stream`) from a binlog source: the binlog identifies an ENUM value by position and a SET by bitmask, and sluice names them through the catalog's labels. A row using a label the catalog rewrote therefore stops the stream with `ENUM-LABEL-NOT-RECOVERABLE`, naming the table, column and label — **unless the source runs `binlog_row_metadata=FULL`**, in which case each row event carries the server's own labels and sluice uses them (checked against the catalog everywhere the catalog did not write `?`). Before v0.156.1 such a row landed on the target as the catalog's `'?b'`, silently, at exit 0; if you streamed such a column on an earlier release, compare it against the source.
+- **CDC from PlanetScale / Vitess (VStream)**: vttablet renders the label through the same lossy catalog before sluice sees it, and there is no metadata to recover from, so a row using such a label stops the stream with `ENUM-LABEL-NOT-RECOVERABLE`.
+
+A label that genuinely **is** `'?b'` on a `utf8mb4`/`utf16`/`utf32` column looks exactly like a rewritten one to the catalog, so it is refused the same way — on a binlog source, `binlog_row_metadata=FULL` lets it stream; on VStream, rename it. A `'?'` label on a charset that cannot hold a 4-byte character (`latin1`, `utf8mb3`, …) is always genuine and is never refused. Only rows that actually use such a label are refused; a table whose rows never do, or a table excluded from the stream, streams normally.
+
+Recovery:
+
+- On a binlog source, `SET PERSIST binlog_row_metadata = 'FULL'` and restart the stream. Note that the target's ENUM still carries the `'?b'` label, so a recovered `'😀b'` then fails loudly at the target's INSERT unless the column was widened (next bullet) or the labels renamed.
+- Rename the source labels to BMP characters (ASCII, or 3-byte UTF-8) via `ALTER TABLE … MODIFY` before migrating.
+- For `migrate`, `--type-override=TABLE.COL=text` emits the column as TEXT on the target so the copy's true label text lands faithfully; ENUM enforcement is lost. For `sync`, the same override also needs `binlog_row_metadata=FULL` on the source for the CDC half.
+- Exclude the table.
 
 ## MariaDB sources and targets
 

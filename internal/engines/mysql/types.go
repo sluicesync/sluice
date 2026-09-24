@@ -405,15 +405,19 @@ func int64Ptr(p *int64) int64 {
 	return *p
 }
 
-// warnIfLikelyTruncatedEnumLabel emits an INFO-level warning when an
-// ENUM/SET label looks like a MySQL-truncated 4-byte UTF-8 sequence
-// (Bug 106 / v0.92.2). MySQL's data dictionary silently substitutes
-// `?` for supplementary-plane characters at CREATE TABLE time
-// regardless of the column's charset; mysqldump reproduces the same
-// loss. There is no recovery from sluice's side — the original code
-// point is gone before sluice ever sees the column. The warning gives
-// operators visibility so they can investigate before the runtime
-// row-INSERT loud-fails ("invalid input value for enum ..." on PG).
+// warnIfLikelyTruncatedEnumLabel emits a warning when an ENUM/SET label
+// looks like a 4-byte UTF-8 character the catalog rewrote (Bug 106 /
+// v0.92.2). Every catalog surface — information_schema, SHOW CREATE
+// TABLE, mysqldump — writes a supplementary-plane character in a label
+// as `?`, regardless of the column's charset. The v0.92.2 reading of this
+// ("the original code point is gone before sluice ever sees the column")
+// was wrong, MEASURED 2026-09-24 on MySQL 8.0.46 and MariaDB 11.4: the
+// server keeps the true label (a row reads back as F09F988062 for `😀b`),
+// and the binlog's TABLE_MAP carries it under binlog_row_metadata=FULL.
+// Its other half was wrong too: the copy's INSERT loud-fails, but the
+// binlog decode mapped a CDC row's index to the '?' label at exit 0 —
+// closed by GC-37 (i) (enum_label_loss.go), which refuses or recovers.
+// This warning stays as the early, schema-read-time notice.
 //
 // Heuristic (deliberately narrow to keep false positives low): warn
 // only when the column_type string contains a `?` character. A bare
@@ -429,6 +433,6 @@ func warnIfLikelyTruncatedEnumLabel(columnType, kind string, values []string) {
 		"mysql: "+kind+" labels contain '?' — likely MySQL data-dictionary truncation of 4-byte UTF-8 (Bug 106)",
 		slog.String("column_type", columnType),
 		slog.Any("labels", values),
-		slog.String("hint", "MySQL's data dictionary silently truncates supplementary-plane (4-byte UTF-8) characters in ENUM/SET labels to '?' at CREATE TABLE time, regardless of CHARSET=utf8mb4. mysqldump reproduces the same loss. If this column's source rows contain non-'?' values, the target write will loud-fail at row INSERT. Recovery: widen this column to VARCHAR/TEXT via --type-override; or fix the source ENUM labels to ASCII before migration; or ignore this warning if your data legitimately uses '?' as a label."),
+		slog.String("hint", "MySQL's catalog (information_schema, SHOW CREATE TABLE, mysqldump) writes a supplementary-plane (4-byte UTF-8) character in an ENUM/SET label as '?', regardless of CHARSET=utf8mb4, while the server itself keeps the true label. A copied row holding such a label loud-fails at the target's INSERT; a CDC row holding one stops the stream with ENUM-LABEL-NOT-RECOVERABLE, unless the source runs binlog_row_metadata=FULL, which lets the binlog reader recover the true label (VStream cannot). Recovery: rename the source labels to Basic Multilingual Plane characters; for migrate, widen the column to VARCHAR/TEXT via --type-override (the copy carries the true text). A label that genuinely is '?' streams only under binlog_row_metadata=FULL."),
 	)
 }

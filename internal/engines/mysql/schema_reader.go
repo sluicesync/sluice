@@ -1154,9 +1154,15 @@ func loadTableSchema(ctx context.Context, db *sql.DB, schema, table string, flav
 		// the TABLE_MAP guard can ask "was this event recorded under this
 		// shape?" without re-querying. See cdc_table_map_guard.go.
 		out.DataTypes = append(out.DataTypes, meta.DataType)
+		// GC-37 (i): which ENUM/SET labels the catalog may have written as
+		// '?' in place of a character outside the BMP. See enum_label_loss.go.
+		out.LostLabels = append(out.LostLabels, lostEnumSetLabels(meta.Charset, typ))
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
+	}
+	if !anyLostLabel(out.LostLabels) {
+		out.LostLabels = nil
 	}
 	if len(out.Columns) == 0 {
 		return nil, fmt.Errorf("mysql: table %s.%s has no columns (does it exist?)", schema, table)
