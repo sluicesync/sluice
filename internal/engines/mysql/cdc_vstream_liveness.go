@@ -11,6 +11,8 @@ import (
 	gomysql "github.com/go-sql-driver/mysql"
 	"vitess.io/vitess/go/vt/proto/binlogdata"
 	"vitess.io/vitess/go/vt/proto/topodata"
+
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // defaultVStreamLivenessWindow is the Phase-1 wall-clock window a VStream
@@ -220,6 +222,10 @@ type vstreamLiveness struct {
 	// which is as good as another).
 	events chan bool
 
+	// held carries "the pump is blocked handing a change to its consumer"
+	// ([consumerHeld]). One slot, non-blocking send, like events.
+	held chan struct{}
+
 	// done is closed by [stop] to tear the watchdog goroutine down on pump
 	// exit. A nil-safe sentinel: a disabled watchdog (phase1Window<=0)
 	// leaves events/done nil and observe/stop short-circuit.
@@ -298,6 +304,7 @@ func startVStreamLivenessWithTimer(ctx context.Context, phase1Window, phase2Wind
 	// Buffer of 1 is sufficient: a pending re-arm signal is as good as any
 	// number of them, and the watchdog drains one per loop iteration.
 	l.events = make(chan bool, 1)
+	l.held = make(chan struct{}, 1)
 	l.done = make(chan struct{})
 	l.finished = make(chan struct{})
 	go func() {
@@ -400,6 +407,17 @@ func (l *vstreamLiveness) run(ctx context.Context, phase1Window, phase2Window, s
 			return
 		case <-l.done:
 			return
+		case <-l.held:
+			// The pump is parked on its consumer, not on the source: the
+			// silence is backpressure, neither a hung stream (hard timer)
+			// nor a throttle or idle spell (soft timer), so re-arm both.
+			// Before serving is proven there is nothing to hold — the pump
+			// only sends what the stream delivered — and Phase 1 stays an
+			// absolute deadline.
+			if phase2 {
+				reset(phase2Window)
+				armSoft()
+			}
 		case proof := <-l.events:
 			switch {
 			case !phase2 && proof:
@@ -490,6 +508,72 @@ func (l *vstreamLiveness) observe(provesServing bool) {
 		default:
 		}
 	}
+}
+
+// consumerHeld records that the pump is blocked handing a change to its
+// consumer. Non-blocking and nil-safe, like [observe]; a pending signal
+// already covers another.
+func (l *vstreamLiveness) consumerHeld() {
+	if l == nil || l.held == nil {
+		return
+	}
+	select {
+	case l.held <- struct{}{}:
+	default:
+	}
+}
+
+// vstreamHeldSignalInterval is how often a pump parked on its consumer
+// tells the watchdog so ([sendHeld]) — far inside every watchdog window.
+var vstreamHeldSignalInterval = time.Second
+
+// sendHeld is [send] for a VStream pump whose liveness watchdog is live: a
+// consumer that stops taking changes parks the pump here, where it is not
+// calling Recv, so without the signal the watchdog read the stall as a hung
+// stream. Measured on vttestserver: a consumer stalled 75s ended the stream
+// at the 45s Phase-2 window ("stream produced no events for 45s after data
+// had been flowing"), a retryable error the pipeline answers by
+// reconnecting — and during a forwarded ADD COLUMN's backfill, which holds
+// the consumer for a pass over the table, an attempt that ends that way
+// settles the backfill as unconfirmed: a terminal
+// ADD-COLUMN-BACKFILL-INCOMPLETE. live nil is the plain send.
+func sendHeld(ctx context.Context, out chan<- ir.Change, c ir.Change, live *vstreamLiveness) error {
+	if live == nil {
+		return send(ctx, out, c)
+	}
+	select {
+	case out <- c:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+	tick := time.NewTicker(vstreamHeldSignalInterval)
+	defer tick.Stop()
+	for {
+		select {
+		case out <- c:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-tick.C:
+			live.consumerHeld()
+		}
+	}
+}
+
+// send is the CDC reader pump's [sendHeld]: every change its dispatch
+// emits goes through it, on the pump goroutine that owns r.live.
+func (r *vstreamCDCReader) send(ctx context.Context, out chan<- ir.Change, c ir.Change) error {
+	return sendHeld(ctx, out, c, r.live)
+}
+
+// send is the snapshot stream's post-COPY CDC pump's [sendHeld], the
+// sibling of [vstreamCDCReader.send]. (The COPY pump hands rows to the
+// buffer the ReadRows drain empties; it waits on that buffer's byte budget,
+// not on this channel, under its own ~10-minute COPY window.)
+func (s *vstreamSnapshotStream) send(ctx context.Context, out chan<- ir.Change, c ir.Change) error {
+	return sendHeld(ctx, out, c, s.cdcLive)
 }
 
 // stop tears the watchdog goroutine down on pump teardown so it exits

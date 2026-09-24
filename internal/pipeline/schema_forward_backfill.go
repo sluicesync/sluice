@@ -157,12 +157,14 @@ func (s *Streamer) addedColumnBackfill(streamID string, catalog ir.SchemaReader)
 }
 
 // sourcePrimaryKeyResolver returns the source catalog's primary key for a
-// table, read through sr — for a change stream whose boundary projection
-// carries none. The VStream FIELD event is one: it names each column's
-// PRI_KEY flag but not the key's column ORDER, which the cursor's
-// ORDER BY must follow for the page query to walk the key's index rather
-// than sort the table on every page. One schema read per forwarded ADD
-// COLUMN, the same cost as the DEFAULT probe beside it.
+// table, read through sr. The backfill keys on it in preference to the
+// change stream's projection ([backfillTableWithPrimaryKey]): a Postgres
+// projection's key is the REPLICA IDENTITY, which under FULL is every
+// column; and the VStream FIELD event names each column's PRI_KEY flag but
+// not the key's column ORDER, which the cursor's ORDER BY must follow for
+// the page query to walk the key's index rather than sort the table on
+// every page. One full source schema read per forwarded ADD COLUMN
+// boundary (the DEFAULT prober and carrier add one per added column).
 func sourcePrimaryKeyResolver(sr ir.SchemaReader) func(ctx context.Context, schema, table string) (*ir.Index, error) {
 	return func(ctx context.Context, schema, table string) (*ir.Index, error) {
 		sch, err := sr.ReadSchema(ctx)
@@ -342,7 +344,7 @@ func runBackfillForAddedColumn(
 	if snap.IR == nil {
 		return errors.New("backfill: snapshot has nil IR")
 	}
-	table, err := backfillTableWithPrimaryKey(ctx, bf, snap)
+	table, err := backfillTableWithPrimaryKey(ctx, bf, snap, addedCols)
 	if err != nil {
 		return err
 	}
@@ -364,6 +366,13 @@ func runBackfillForAddedColumn(
 	for i, c := range table.PrimaryKey.Columns {
 		pkColNames[i] = c.Column
 	}
+	// Read only the key and the carried columns — the chain fill's
+	// narrowing (projectFillTable). Everything else would be read and
+	// thrown away, and on a table with large columns that is most of the
+	// pass. The operator's --where is a WHERE clause the reader renders
+	// against the base table, so a predicate naming a column that is not
+	// selected still applies.
+	read := projectFillTable(table, pkColNames, columnsNamed(table, addedNames))
 	slog.InfoContext(
 		ctx, "forward-add-column: backfilling the added columns on the rows the target already held, from the source",
 		"table", table.Name,
@@ -380,7 +389,7 @@ func runBackfillForAddedColumn(
 			return ctx.Err()
 		default:
 		}
-		rows, err := reader.ReadRowsBatch(ctx, table, cursor, batchSize)
+		rows, err := reader.ReadRowsBatch(ctx, read, cursor, batchSize)
 		if err != nil {
 			return fmt.Errorf("read rows batch: %w", err)
 		}
@@ -441,18 +450,37 @@ func runBackfillForAddedColumn(
 // ([schemaForwardBackfill.primaryKey]) when the change stream's projection
 // did not carry one. A key that names a column the projection lacks, or no
 // key anywhere, is refused — cursor pagination is unsafe without one.
-func backfillTableWithPrimaryKey(ctx context.Context, bf *schemaForwardBackfill, snap ir.SchemaSnapshot) (*ir.Table, error) {
+//
+// The catalog's key is preferred over the projection's whenever a resolver
+// is wired, because the projection's "primary key" is the change stream's
+// REPLICA IDENTITY, not the table's key. On a Postgres table with REPLICA
+// IDENTITY FULL — required for every filtered (--where) sync, and common
+// beyond it — pgoutput flags EVERY column as a key column, the added one
+// included. Keyed on that, each synthetic Update's WHERE demanded the
+// target already hold the source's value in the column being filled, so it
+// matched no row and the backfill completed with every pre-existing row
+// still NULL, at exit 0 (measured on Postgres 16 before this preference).
+// A key that names an added column is refused for the same reason whatever
+// its source: those rows cannot be addressed by a value they do not have yet.
+func backfillTableWithPrimaryKey(ctx context.Context, bf *schemaForwardBackfill, snap ir.SchemaSnapshot, added []*ir.Column) (*ir.Table, error) {
 	table := snap.IR
-	if table.PrimaryKey != nil && len(table.PrimaryKey.Columns) > 0 {
-		return table, nil
-	}
-	var pk *ir.Index
+	pk := table.PrimaryKey
 	if bf.primaryKey != nil {
 		resolved, err := bf.primaryKey(ctx, snap.Schema, snap.Table)
 		if err != nil {
 			return nil, fmt.Errorf("backfill: resolve the primary key of %q: %w", table.Name, err)
 		}
 		pk = resolved
+	}
+	for _, kc := range keyColumns(pk) {
+		if slices.ContainsFunc(added, func(c *ir.Column) bool { return c != nil && c.Name == kc }) {
+			return nil, fmt.Errorf("backfill: the key of %q (%v) includes the added column %q, so the rows that "+
+				"predate the ADD COLUMN cannot be addressed by it — refusing rather than issuing UPDATEs that "+
+				"match no row", table.Name, keyColumns(pk), kc)
+		}
+	}
+	if pk == table.PrimaryKey && pk != nil && len(pk.Columns) > 0 {
+		return table, nil
 	}
 	if pk == nil || len(pk.Columns) == 0 {
 		// No PK — can't safely iterate. Refuse loudly. Tables
@@ -500,6 +528,29 @@ func backfillColumnNames(table *ir.Table, added []*ir.Column) []string {
 		names = append(names, c.Name)
 	}
 	return names
+}
+
+// keyColumns returns the column names of an index (nil-safe).
+func keyColumns(idx *ir.Index) []string {
+	if idx == nil {
+		return nil
+	}
+	names := make([]string, len(idx.Columns))
+	for i, c := range idx.Columns {
+		names[i] = c.Column
+	}
+	return names
+}
+
+// columnsNamed returns table's columns named in names, in names' order.
+func columnsNamed(table *ir.Table, names []string) []*ir.Column {
+	cols := make([]*ir.Column, 0, len(names))
+	for _, name := range names {
+		if i := slices.IndexFunc(table.Columns, func(c *ir.Column) bool { return c != nil && c.Name == name }); i >= 0 {
+			cols = append(cols, table.Columns[i])
+		}
+	}
+	return cols
 }
 
 // synthesizeBackfillUpdate constructs the backfill's [ir.Update] for one

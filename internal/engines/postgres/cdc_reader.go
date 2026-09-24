@@ -222,6 +222,11 @@ type CDCReader struct {
 	// a tracker).
 	appliedLSN *lsnTracker
 
+	// pumpKA is the pump goroutine's keepalive state, installed by the
+	// pump before its loop and read only on that goroutine (by send, via
+	// dispatchWAL). nil outside a running pump.
+	pumpKA *pumpKeepalive
+
 	// holdAck + ackCeil implement the chain-consumer ack mode used by
 	// `backup incremental` / `backup stream` (which have no applier
 	// and therefore no lsnTracker). Without it, the no-tracker
@@ -1096,26 +1101,30 @@ func (r *CDCReader) pump(ctx context.Context, conn *pgconn.PgConn, startLSN pglo
 	firstSeenRelLSN := map[uint32]pglogrepl.LSN{}
 	var inStream bool // pgoutput v2 streaming-in-progress flag
 
-	nextKeepalive := time.Now().Add(keepaliveInterval)
+	// ka is shared with [CDCReader.send] so a send that blocks on a slow
+	// consumer keeps the walsender alive too (see send). Installed here,
+	// on the pump goroutine, and read only from it.
+	ka := &pumpKeepalive{
+		conn:        conn,
+		startLSN:    startLSN,
+		streamedLSN: &streamedLSN,
+		next:        time.Now().Add(keepaliveInterval),
+	}
+	r.pumpKA = ka
+	defer func() { r.pumpKA = nil }()
 
 	for {
 		// Send a keepalive when the deadline expires (or if the server
 		// asked for an immediate reply on a previous keepalive, which
-		// zeroes nextKeepalive).
-		if time.Now().After(nextKeepalive) {
-			ack := r.ackLSN(streamedLSN, startLSN)
-			if err := pglogrepl.SendStandbyStatusUpdate(ctx, conn, pglogrepl.StandbyStatusUpdate{
-				WALWritePosition: ack,
-				WALFlushPosition: ack,
-				WALApplyPosition: ack,
-			}); err != nil {
-				r.setErr(classifyReaderError(fmt.Errorf("postgres: cdc: standby status update: %w", err)))
+		// zeroes ka.next).
+		if time.Now().After(ka.next) {
+			if err := r.sendStandbyStatus(ctx, ka); err != nil {
+				r.setErr(classifyReaderError(err))
 				return
 			}
-			nextKeepalive = time.Now().Add(keepaliveInterval)
 		}
 
-		recvCtx, cancel := context.WithDeadline(ctx, nextKeepalive)
+		recvCtx, cancel := context.WithDeadline(ctx, ka.next)
 		raw, err := conn.ReceiveMessage(recvCtx)
 		cancel()
 		if err != nil {
@@ -1180,7 +1189,7 @@ func (r *CDCReader) pump(ctx context.Context, conn *pgconn.PgConn, startLSN pglo
 			if pkm.ReplyRequested {
 				// Force the next loop iteration to send an update
 				// before the deadline fires.
-				nextKeepalive = time.Time{}
+				ka.next = time.Time{}
 			}
 
 		case pglogrepl.XLogDataByteID:
@@ -1353,7 +1362,7 @@ func (r *CDCReader) dispatchWAL(
 		if err != nil {
 			return err
 		}
-		return send(ctx, out, ir.TxBegin{Position: pos, CommitTime: m.CommitTime})
+		return r.send(ctx, out, ir.TxBegin{Position: pos, CommitTime: m.CommitTime})
 
 	case *pglogrepl.CommitMessage:
 		*streamedLSN = m.CommitLSN
@@ -1405,7 +1414,7 @@ func (r *CDCReader) dispatchWAL(
 		if err != nil {
 			return err
 		}
-		return send(ctx, out, ir.TxCommit{Position: pos, CommitTime: m.CommitTime})
+		return r.send(ctx, out, ir.TxCommit{Position: pos, CommitTime: m.CommitTime})
 
 	case *pglogrepl.InsertMessageV2:
 		r.diagRowEvent(ctx, "insert", relations, m.RelationID, xld, *currentTxnStartLSN, *currentTxnLSN, firstSeenRelLSN)
@@ -1448,14 +1457,14 @@ func (r *CDCReader) dispatchWAL(
 		if err != nil {
 			return err
 		}
-		return send(ctx, out, ir.TxBegin{Position: pos, CommitTime: *currentTxnCommitTime})
+		return r.send(ctx, out, ir.TxBegin{Position: pos, CommitTime: *currentTxnCommitTime})
 	case *pglogrepl.StreamStopMessageV2:
 		*inStream = false
 		pos, err := r.positionAt(*currentTxnLSN)
 		if err != nil {
 			return err
 		}
-		return send(ctx, out, ir.TxCommit{Position: pos, CommitTime: *currentTxnCommitTime})
+		return r.send(ctx, out, ir.TxCommit{Position: pos, CommitTime: *currentTxnCommitTime})
 
 	case *pglogrepl.StreamAbortMessageV2:
 		// ADR-0055: refuse loudly. sluice runs pgoutput with
@@ -1583,7 +1592,7 @@ func (r *CDCReader) emitInsert(
 	if err != nil {
 		return err
 	}
-	return send(ctx, out, ir.Insert{
+	return r.send(ctx, out, ir.Insert{
 		Position:   pos,
 		Schema:     rel.Schema,
 		Table:      rel.Name,
@@ -1667,7 +1676,7 @@ func (r *CDCReader) emitUpdate(
 	if err != nil {
 		return err
 	}
-	return send(ctx, out, ir.Update{
+	return r.send(ctx, out, ir.Update{
 		Position:   pos,
 		Schema:     rel.Schema,
 		Table:      rel.Name,
@@ -1788,7 +1797,7 @@ func (r *CDCReader) emitDelete(
 	if err != nil {
 		return err
 	}
-	return send(ctx, out, ir.Delete{
+	return r.send(ctx, out, ir.Delete{
 		Position:   pos,
 		Schema:     rel.Schema,
 		Table:      rel.Name,
@@ -1912,7 +1921,7 @@ func (r *CDCReader) emitTruncate(
 		if !r.schemaInScope(rel.Schema) {
 			continue // out-of-scope schema; drop
 		}
-		if err := send(ctx, out, ir.Truncate{
+		if err := r.send(ctx, out, ir.Truncate{
 			Position:        pos,
 			Schema:          rel.Schema,
 			Table:           rel.Name,
@@ -2074,6 +2083,97 @@ func send(ctx context.Context, out chan<- ir.Change, c ir.Change) error {
 	}
 }
 
+// blockedKeepaliveInterval is how often the pump sends a standby status
+// update while it is parked handing a change to a consumer that is not
+// taking it (see [CDCReader.send]). Tighter than [keepaliveInterval]
+// because the idle path has a second line of defence this path lacks:
+// when a server with wal_sender_timeout below keepaliveInterval asks for
+// a reply, the idle pump reads the request and answers at once — a
+// blocked pump is not reading, so it cannot see the request, and its
+// unsolicited update is the only thing resetting the walsender's timer.
+// One tiny message a second while blocked is negligible against a stall
+// that is, by construction, already seconds long.
+var blockedKeepaliveInterval = time.Second
+
+// pumpKeepalive is the pump goroutine's keepalive state, reachable from
+// [CDCReader.send] so a send that blocks can keep the walsender alive.
+// Owned exclusively by the pump goroutine: the pump installs it before
+// its loop and every reader of it (send, reached only from dispatchWAL)
+// runs on that goroutine, which is also the only goroutine that touches
+// conn — pgconn is not safe for concurrent use.
+type pumpKeepalive struct {
+	conn     *pgconn.PgConn
+	startLSN pglogrepl.LSN
+	// streamedLSN is the pump's own local, so a status sent mid-dispatch
+	// reports exactly what the pump's loop would.
+	streamedLSN *pglogrepl.LSN
+	// next is the pump loop's keepalive deadline; a status sent while
+	// blocked pushes it out as a loop-sent one would.
+	next time.Time
+}
+
+// sendStandbyStatus reports the slot ack. The value is [CDCReader.ackLSN]
+// — the applier-confirmed LSN when a tracker is wired, clamped by the
+// chain-consumer ceiling — and never the streamed LSN on a tracked
+// stream, whichever path sends it.
+func (r *CDCReader) sendStandbyStatus(ctx context.Context, ka *pumpKeepalive) error {
+	ack := r.ackLSN(*ka.streamedLSN, ka.startLSN)
+	if err := pglogrepl.SendStandbyStatusUpdate(ctx, ka.conn, pglogrepl.StandbyStatusUpdate{
+		WALWritePosition: ack,
+		WALFlushPosition: ack,
+		WALApplyPosition: ack,
+	}); err != nil {
+		return fmt.Errorf("postgres: cdc: standby status update: %w", err)
+	}
+	ka.next = time.Now().Add(keepaliveInterval)
+	return nil
+}
+
+// send pushes c onto out and, while the consumer is not taking it, keeps
+// the replication connection alive.
+//
+// Without this, a consumer that stops reading for longer than the
+// server's wal_sender_timeout (60s by default) got the connection
+// dropped: the pump sends its standby status from the same loop that
+// feeds out, so a pump parked on a full channel sent nothing, and the
+// walsender — hearing no reply — terminated it. The stream then
+// reconnected through a retryable error. A forwarded ADD COLUMN's
+// backfill stalls the consumer for the length of one pass over the
+// table, so from v0.156.1 (backfill on by default) that stopped being a
+// rare long-apply edge and became routine on any large table — and there
+// the retry is not benign: it ends the attempt with the backfill
+// unconfirmed, which is a terminal ADD-COLUMN-BACKFILL-INCOMPLETE.
+//
+// Outside the pump (unit harnesses that call emit* directly) there is no
+// keepalive state and this is the plain [send].
+func (r *CDCReader) send(ctx context.Context, out chan<- ir.Change, c ir.Change) error {
+	ka := r.pumpKA
+	if ka == nil {
+		return send(ctx, out, c)
+	}
+	select {
+	case out <- c:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+	tick := time.NewTicker(blockedKeepaliveInterval)
+	defer tick.Stop()
+	for {
+		select {
+		case out <- c:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-tick.C:
+			if err := r.sendStandbyStatus(ctx, ka); err != nil {
+				return err
+			}
+		}
+	}
+}
+
 // maybeSnapshotSchema is the ADR-0049 Chunk B3 boundary path. On
 // every pgoutput RelationMessage it projects the just-built,
 // already-IR-typed relationCacheEntry into an [ir.Table] (the
@@ -2126,7 +2226,7 @@ func (r *CDCReader) maybeSnapshotSchema(
 	if err != nil {
 		return err
 	}
-	if err := send(ctx, out, ir.SchemaSnapshot{
+	if err := r.send(ctx, out, ir.SchemaSnapshot{
 		Position: pos,
 		Schema:   rel.Schema,
 		Table:    rel.Name,

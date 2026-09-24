@@ -256,8 +256,8 @@ type RawDefaultReader interface {
 // volatile sequence defaults from the classifier (Bug 91).
 //
 // This is wasteful at scale (ReadSchema reads every table the source
-// exposes), but the intercept calls it at most once per ADD COLUMN
-// forward — a rare event. A future refinement could add a
+// exposes), but the intercept calls it once per added column of a forwarded
+// ADD COLUMN — a rare event. A future refinement could add a
 // per-column probe interface to [ir.SchemaReader]; until then,
 // ReadSchema is the only available surface every shipping engine
 // implements.
@@ -298,7 +298,10 @@ func newSourceDefaultProber(sr ir.SchemaReader) defaultProberFunc {
 // IR — never the raw catalog text the prober may prefer for volatility
 // classification, because the carried value is EMITTED, possibly into a
 // different engine, and only the IR form goes through the target emitter's
-// translation. Same single-read cost as the prober; once per ADD COLUMN.
+// translation. One full source ReadSchema per call, and the intercept calls it
+// once per ADDED COLUMN (a multi-column ALTER pays it per column) — the
+// same per-column cost as the prober, plus the backfill's own key read
+// ([sourcePrimaryKeyResolver]); perf-parity-matrix row 32.
 func newSourceDefaultCarrier(sr ir.SchemaReader) defaultProberFunc {
 	return func(ctx context.Context, schema, table, column string) (ir.DefaultValue, error) {
 		return readSchemaColumnDefault(ctx, sr, schema, table, column)

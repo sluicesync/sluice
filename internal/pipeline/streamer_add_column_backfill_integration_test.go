@@ -676,3 +676,63 @@ func abAssertShardRows(t *testing.T, tgt, shard, want string) {
 		t.Errorf("%s: %d pre-existing rows on the target, want %d", shard, n, fdSeedRows)
 	}
 }
+
+// TestStreamer_AddColumnBackfill_WhereOnAnUnreadColumn_PostgresToPostgres
+// pins the backfill's narrowed read under a filtered sync. The read selects
+// only the key and the added columns (perf-parity gap 35); the operator's
+// --where names `name`, which the read no longer selects. The predicate is
+// a WHERE clause over the base table, so it must still scope the pass.
+//
+// Independent expected value: the SOURCE's own dj for every in-scope row
+// (read back with SELECT), and the absence of the out-of-scope row on the
+// target.
+func TestStreamer_AddColumnBackfill_WhereOnAnUnreadColumn_PostgresToPostgres(t *testing.T) {
+	src, tgt, cleanup := startPostgresLogical(t)
+	defer cleanup()
+	lane := fdLane{
+		name: "backfill postgres->postgres --where", sourceEngine: "postgres", targetEngine: "postgres",
+		sourceDSN: src, targetDSN: tgt, src: fdPG, tgt: fdPG,
+		rowFilters: map[string]string{"w": "name <> 'seed2'"},
+	}
+	const streamID = "test-ac-backfill-where"
+	s := fdStartStream(t, lane, src, tgt, streamID)
+	defer s.cancel()
+	s.waitRows(t, "cold start (seed2 filtered out)", fdSeedRows-1)
+	fdExec(t, fdPG, src, abInsert(fdPG, fdSeedRows+1, nil))
+	s.waitRows(t, "first CDC row", fdSeedRows)
+
+	fdExec(t, fdPG, src, `ALTER TABLE w ADD COLUMN dj TEXT NOT NULL DEFAULT 'v'; ALTER TABLE w ALTER COLUMN dj DROP DEFAULT`)
+	fdExec(t, fdPG, src, abInsert(fdPG, fdSeedRows+2, map[string]string{"dj": "'x'"}))
+	s.waitRows(t, "after the ADD COLUMN", fdSeedRows+1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	read := func(dsn string) map[int]string {
+		db, err := sql.Open(fdPG.driver(), dsn)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		defer func() { _ = db.Close() }()
+		vals, err := fdColumnValues(ctx, db, fdPG, fdShape{col: "dj", fam: fdText}, fdSeedRows+1)
+		if err != nil {
+			t.Fatalf("read dj: %v", err)
+		}
+		return vals
+	}
+	want := read(src)
+	delete(want, 2) // out of scope: the filter excludes it
+	got := read(tgt)
+	if _, has := got[2]; has {
+		t.Errorf("the out-of-scope row id=2 is on the target: the --where did not scope the copy")
+	}
+	if len(got) != len(want) {
+		t.Fatalf("target holds rows %v; want exactly the in-scope rows %v", got, want)
+	}
+	for id, w := range want {
+		if got[id] != w {
+			t.Errorf("pre-existing row id=%d: target dj = %s, want the source's %s", id, got[id], w)
+		}
+	}
+	abWaitNoRecordedRefusal(t, fdPG, tgt, streamID, time.Minute)
+	abStopWithoutFalseRefusal(t, s)
+}

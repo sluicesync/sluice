@@ -780,6 +780,12 @@ type vstreamSnapshotStream struct {
 	// soft WARN only.
 	idleWarnWindow time.Duration
 
+	// cdcLive is the post-COPY CDC pump's liveness watchdog, set and
+	// cleared by [vstreamSnapshotStream.pump] and read only on its goroutine
+	// (by [vstreamSnapshotStream.send], via dispatchCDCEvent), so a send
+	// parked on the consumer can say so. nil outside that pump.
+	cdcLive *vstreamLiveness
+
 	// fields caches column metadata keyed by [fieldCacheKey]. Shared
 	// between COPY-phase row decoding and post-COPY change decoding —
 	// FIELD events arrive in both phases, and a row cannot be decoded
@@ -2446,6 +2452,8 @@ func (s *vstreamSnapshotStream) pump(ctx context.Context, streamCancel context.C
 			slog.WarnContext(ctx, vstreamIdleWarnMessage(s.idleWarnWindow, s.keyspace, s.shards))
 		})
 	defer live.stop()
+	s.cdcLive = live
+	defer func() { s.cdcLive = nil }()
 
 	for {
 		// Honour caller cancellation independently of the stream's
@@ -2645,7 +2653,7 @@ func (s *vstreamSnapshotStream) maybeSnapshotSchemaCDC(ctx context.Context, fe *
 		return err
 	}
 
-	if err := send(ctx, out, ir.SchemaSnapshot{
+	if err := s.send(ctx, out, ir.SchemaSnapshot{
 		Position: pos,
 		Schema:   keyspace,
 		Table:    table,
@@ -2713,7 +2721,7 @@ func (s *vstreamSnapshotStream) dispatchCDCRow(ctx context.Context, ev *binlogda
 		}
 		switch {
 		case afterOK && !beforeOK:
-			if err := send(ctx, out, ir.Insert{
+			if err := s.send(ctx, out, ir.Insert{
 				Position: pos,
 				Schema:   rev.GetKeyspace(),
 				Table:    tableName,
@@ -2722,7 +2730,7 @@ func (s *vstreamSnapshotStream) dispatchCDCRow(ctx context.Context, ev *binlogda
 				return err
 			}
 		case beforeOK && afterOK:
-			if err := send(ctx, out, ir.Update{
+			if err := s.send(ctx, out, ir.Update{
 				Position: pos,
 				Schema:   rev.GetKeyspace(),
 				Table:    tableName,
@@ -2732,7 +2740,7 @@ func (s *vstreamSnapshotStream) dispatchCDCRow(ctx context.Context, ev *binlogda
 				return err
 			}
 		case beforeOK && !afterOK:
-			if err := send(ctx, out, ir.Delete{
+			if err := s.send(ctx, out, ir.Delete{
 				Position: pos,
 				Schema:   rev.GetKeyspace(),
 				Table:    tableName,
@@ -2773,7 +2781,7 @@ func (s *vstreamSnapshotStream) dispatchCDCDDL(ctx context.Context, ev *binlogda
 			if err != nil {
 				return err
 			}
-			if err := send(ctx, out, ir.Truncate{
+			if err := s.send(ctx, out, ir.Truncate{
 				Position: pos,
 				Schema:   truncSchema,
 				Table:    truncTable,

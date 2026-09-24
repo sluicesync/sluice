@@ -697,13 +697,16 @@ func projectRelation(rel *relationCacheEntry) *ir.Table {
 		cols[i] = &ir.Column{Name: c.Name, Type: containSRIDSentinel(c.Type), StableID: c.StableID}
 	}
 	tbl := &ir.Table{Schema: rel.Schema, Name: rel.Name, Columns: cols}
-	// Bug 89: surface PK column names from the RelationMessage's
-	// per-column KeyColumn flag. ADR-0058 backfill (and any future per-PK
-	// path consuming a CDC-emitted SchemaSnapshot) needs the PK to drive
-	// cursor-paginated iteration. KeyColumn=true on a pgoutput Relation
-	// is set for replica-identity columns; with REPLICA IDENTITY DEFAULT
-	// (the default) this is the PK column set, which is what
-	// runBackfillForAddedColumn requires.
+	// Bug 89: surface the key columns from the RelationMessage's
+	// per-column KeyColumn flag. KeyColumn=true on a pgoutput Relation
+	// marks the REPLICA IDENTITY columns, so this "PrimaryKey" is the
+	// table's key only under REPLICA IDENTITY DEFAULT. Under USING INDEX
+	// it is that unique index; under FULL it is EVERY column — including,
+	// at an ADD COLUMN boundary, the column just added. A consumer that
+	// needs the table's real key must not trust it: the ADR-0058 backfill
+	// keyed on it once and issued UPDATEs whose WHERE demanded the value
+	// being filled, matching no row (the pipeline now prefers the source
+	// catalog's key — backfillTableWithPrimaryKey).
 	var pkCols []ir.IndexColumn
 	for _, c := range rel.Columns {
 		if c.KeyColumn {

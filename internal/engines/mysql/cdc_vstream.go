@@ -171,6 +171,11 @@ type vstreamCDCReader struct {
 	// method is nil-safe.
 	shardProgress *shardProgressWatchdog
 
+	// live is the pump's liveness watchdog, set and cleared by [pump] and
+	// read only on its goroutine (by [vstreamCDCReader.send], via dispatch),
+	// so a send parked on the consumer can say so. nil outside a pump.
+	live *vstreamLiveness
+
 	// conn is the underlying gRPC client connection. Held for the
 	// reader's lifetime so multiple StreamChanges calls (currently
 	// disallowed; reserved for a future API change) would share it.
@@ -1413,6 +1418,8 @@ func (r *vstreamCDCReader) pump(
 			slog.WarnContext(ctx, vstreamIdleWarnMessage(r.idleWarnWindow, r.keyspace, r.shards))
 		})
 	defer live.stop()
+	r.live = live
+	defer func() { r.live = nil }()
 
 	// PER-SHARD progress watchdog (item 23, B-1): WARNs when one shard's
 	// GTID component freezes while a peer keeps advancing — the
@@ -1620,7 +1627,7 @@ func (r *vstreamCDCReader) dispatchDDL(ctx context.Context, ev *binlogdata.VEven
 			if err != nil {
 				return err
 			}
-			if err := send(ctx, out, ir.Truncate{
+			if err := r.send(ctx, out, ir.Truncate{
 				Position: pos,
 				Schema:   truncSchema,
 				Table:    truncTable,
@@ -1781,7 +1788,7 @@ func (r *vstreamCDCReader) maybeSnapshotSchema(ctx context.Context, fe *binlogda
 		return err
 	}
 
-	if err := send(ctx, out, ir.SchemaSnapshot{
+	if err := r.send(ctx, out, ir.SchemaSnapshot{
 		Position: pos,
 		Schema:   keyspace,
 		Table:    table,
@@ -1864,7 +1871,7 @@ func (r *vstreamCDCReader) dispatchRow(ctx context.Context, ev *binlogdata.VEven
 		}
 		switch {
 		case afterOK && !beforeOK:
-			if err := send(ctx, out, ir.Insert{
+			if err := r.send(ctx, out, ir.Insert{
 				Position:   pos,
 				Schema:     rev.GetKeyspace(),
 				Table:      tableName,
@@ -1874,7 +1881,7 @@ func (r *vstreamCDCReader) dispatchRow(ctx context.Context, ev *binlogdata.VEven
 				return err
 			}
 		case beforeOK && afterOK:
-			if err := send(ctx, out, ir.Update{
+			if err := r.send(ctx, out, ir.Update{
 				Position:   pos,
 				Schema:     rev.GetKeyspace(),
 				Table:      tableName,
@@ -1885,7 +1892,7 @@ func (r *vstreamCDCReader) dispatchRow(ctx context.Context, ev *binlogdata.VEven
 				return err
 			}
 		case beforeOK && !afterOK:
-			if err := send(ctx, out, ir.Delete{
+			if err := r.send(ctx, out, ir.Delete{
 				Position:   pos,
 				Schema:     rev.GetKeyspace(),
 				Table:      tableName,

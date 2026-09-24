@@ -342,9 +342,14 @@ func (b *mysqlBatchTx) dispatchInsert(ctx context.Context, streamID string, c ir
 //
 // The cost of the C-10 fallback is throughput, not correctness: a table whose
 // updates carry partial after-images loses ADR-0140 coalescing and goes back to
-// one round trip per UPDATE. That is the same rate the serial path always had,
-// and it is bounded to tables with out-of-line columns on a PG source (or a
-// target column the source lacks, per the paragraph above).
+// one round trip per UPDATE. That is the same rate the serial path always had.
+// It is NOT bounded to tables with out-of-line columns on a PG source (plus a
+// target column the source lacks, per the paragraph above), as this comment
+// once said: the forwarded ADD COLUMN backfill (default-on since v0.156.1)
+// and the chain ADD COLUMN fill's replay both emit exactly this shape — key
+// plus the added columns — so every pre-existing row of every forwarded ADD
+// COLUMN, from any source, costs one round trip here. perf-parity gap 36
+// (open): the floatrepair batched UPDATE-join is the precedent for a fix.
 func (b *mysqlBatchTx) dispatchUpdate(ctx context.Context, streamID string, c ir.Change, upd ir.Update) (bool, error) {
 	schema := b.a.routedSchema(upd.Schema)
 	pk, err := b.a.pkFor(ctx, b.tx, schema, upd.Table)

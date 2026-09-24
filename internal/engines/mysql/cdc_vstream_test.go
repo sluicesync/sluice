@@ -1989,6 +1989,70 @@ func TestVStreamLiveness_SoftIdle_RealEventReArmsAndReLatches(t *testing.T) {
 	}
 }
 
+// TestVStreamLiveness_ConsumerHeldReArmsBothTimers pins perf-parity gap
+// 37's watchdog half: a pump parked on its consumer is neither a hung stream
+// nor an idle/throttled one, so the held signal re-arms the HARD timer (the
+// stream is not wedged) AND the SOFT timer (no idle WARN for backpressure).
+// Before serving is proven it does nothing: Phase 1 stays absolute.
+func TestVStreamLiveness_ConsumerHeldReArmsBothTimers(t *testing.T) {
+	ft := newFakeTimerPair()
+	live := startVStreamLivenessWithTimer(context.Background(), time.Minute, time.Second, 100*time.Millisecond,
+		failingTimeout(t, "phase-1"),
+		failingTimeout(t, "phase-2"),
+		func() { t.Error("soft idle WARN fired for consumer backpressure") },
+		ft.factory())
+	defer live.stop()
+
+	live.consumerHeld() // Phase 1: must not re-arm anything
+	select {
+	case d := <-ft.hard.resets:
+		t.Fatalf("a held signal before serving was proven re-armed the Phase-1 deadline to %v", d)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	live.observe(true) // Phase 2
+	ft.hard.awaitReset(t, time.Second)
+	ft.soft.awaitReset(t, 100*time.Millisecond)
+	for range 5 {
+		live.consumerHeld()
+		ft.hard.awaitReset(t, time.Second)
+		ft.soft.awaitReset(t, 100*time.Millisecond)
+	}
+}
+
+// TestSendHeld_SignalsWhileTheConsumerIsNotReading pins sendHeld's half: a
+// send the consumer does not take tells the watchdog so, and a send it
+// takes at once does not.
+func TestSendHeld_SignalsWhileTheConsumerIsNotReading(t *testing.T) {
+	prev := vstreamHeldSignalInterval
+	vstreamHeldSignalInterval = 5 * time.Millisecond
+	defer func() { vstreamHeldSignalInterval = prev }()
+
+	live := &vstreamLiveness{held: make(chan struct{}, 1)}
+	ready := make(chan ir.Change, 1)
+	if err := sendHeld(context.Background(), ready, ir.Insert{Table: "t"}, live); err != nil {
+		t.Fatalf("sendHeld (free channel): %v", err)
+	}
+	select {
+	case <-live.held:
+		t.Fatal("a send the consumer took at once signalled backpressure")
+	default:
+	}
+
+	blocked := make(chan ir.Change) // nobody reading yet
+	done := make(chan error, 1)
+	go func() { done <- sendHeld(context.Background(), blocked, ir.Insert{Table: "t"}, live) }()
+	select {
+	case <-live.held:
+	case <-time.After(2 * time.Second):
+		t.Fatal("a send parked on its consumer never told the watchdog")
+	}
+	<-blocked
+	if err := <-done; err != nil {
+		t.Fatalf("sendHeld (blocked, then taken): %v", err)
+	}
+}
+
 // TestVStreamLiveness_SoftIdle_NeverDuringPhase1 pins that the soft WARN is
 // strictly a Phase-2 concept: while Phase 1 is un-cleared the soft timer is
 // disarmed, and even a stale soft fire before serving is proven must not

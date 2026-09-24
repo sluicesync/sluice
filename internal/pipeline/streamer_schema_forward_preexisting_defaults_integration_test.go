@@ -223,6 +223,9 @@ type fdLane struct {
 	// suppressBackfill runs the lane with --no-backfill-added-column, so
 	// the pre-existing rows hold what the forwarded ALTER alone filled.
 	suppressBackfill bool
+
+	// rowFilters runs the lane as a filtered sync (--where).
+	rowFilters map[string]string
 }
 
 // fdDesignedRefusal is the ADR-0058 §2a volatile-DEFAULT refusal.
@@ -378,6 +381,10 @@ func fdStartStream(t *testing.T, lane fdLane, src, tgt, streamID string) *fdStre
 		// starts; only the column that uses it arrives mid-stream.
 		fdExec(t, lane.src, src, `CREATE TYPE fd_mood AS ENUM ('sad', 'ok')`)
 		fdExec(t, lane.src, src, `CREATE TABLE w (id BIGINT PRIMARY KEY, name VARCHAR(80) NOT NULL)`)
+		if lane.rowFilters != nil {
+			// A filtered sync needs full before-images to judge row moves.
+			fdExec(t, lane.src, src, `ALTER TABLE w REPLICA IDENTITY FULL`)
+		}
 	} else {
 		fdExec(t, lane.src, src, `CREATE TABLE w (id BIGINT NOT NULL PRIMARY KEY, name VARCHAR(80) NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`)
 	}
@@ -409,6 +416,8 @@ func fdStartStream(t *testing.T, lane fdLane, src, tgt, streamID string) *fdStre
 		InjectShardColumn: lane.shardColumn,
 
 		SuppressAddedColumnBackfill: lane.suppressBackfill,
+
+		RowFilters: lane.rowFilters,
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &fdStream{lane: lane, src: src, tgt: tgt, runErr: make(chan error, 1), cancel: cancel}

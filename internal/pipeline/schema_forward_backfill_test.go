@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -37,14 +38,18 @@ type pagedBackfillReader struct {
 
 	page int
 	err  error
+
+	// read is the table the last page was asked for.
+	read *ir.Table
 }
 
 func (p *pagedBackfillReader) ReadRows(context.Context, *ir.Table) (<-chan ir.Row, error) {
 	return nil, errors.New("not used")
 }
 
-func (p *pagedBackfillReader) ReadRowsBatch(_ context.Context, _ *ir.Table, after []any, limit int) (<-chan ir.Row, error) {
+func (p *pagedBackfillReader) ReadRowsBatch(_ context.Context, table *ir.Table, after []any, limit int) (<-chan ir.Row, error) {
 	p.page++
+	p.read = table
 	p.err = nil
 	start := 0
 	for len(after) == 1 && start < len(p.rows) && p.rows[start]["id"].(int64) <= after[0].(int64) {
@@ -109,6 +114,36 @@ func TestRunBackfill_PagesTheWholeTable(t *testing.T) {
 		if u.Before["id"] != int64(i+1) || u.After["flag"] != "v" {
 			t.Errorf("update %d = before %v after %v; want id=%d flag=v", i, u.Before, u.After, i+1)
 		}
+	}
+}
+
+// TestRunBackfill_ReadsOnlyTheKeyAndTheAddedColumns pins the read's
+// narrowing (perf-parity gap 35): the post-ALTER table carries a large
+// column the backfill never writes, and the reader must not be asked for it.
+func TestRunBackfill_ReadsOnlyTheKeyAndTheAddedColumns(t *testing.T) {
+	reader := &pagedBackfillReader{rows: backfillRows(2)}
+	bf := &schemaForwardBackfill{reader: staticBackfillReader(reader), streamID: "s", batchSize: 3}
+	snap := addColForwardSnap(addColForwardTable(
+		"dj",
+		&ir.Column{Name: "payload", Type: ir.Text{}, Nullable: true},
+		&ir.Column{Name: "flag", Type: ir.Text{}, Nullable: true},
+	))
+	out := make(chan ir.Change, 4)
+	if err := runBackfillForAddedColumn(context.Background(), bf, snap, []*ir.Column{{Name: "flag", Type: ir.Text{}}}, out); err != nil {
+		t.Fatalf("runBackfillForAddedColumn: %v", err)
+	}
+	if reader.read == nil {
+		t.Fatal("the reader was never asked for a page")
+	}
+	got := make([]string, 0, len(reader.read.Columns))
+	for _, c := range reader.read.Columns {
+		got = append(got, c.Name)
+	}
+	if !slices.Equal(got, []string{"id", "flag"}) {
+		t.Fatalf("the backfill read columns %v; want only the key and the added column [id flag] — every other column is read and discarded", got)
+	}
+	if reader.read.PrimaryKey == nil || len(reader.read.PrimaryKey.Columns) != 1 || reader.read.PrimaryKey.Columns[0].Column != "id" {
+		t.Fatalf("the narrowed read lost its primary key (%v); the page cursor needs it", reader.read.PrimaryKey)
 	}
 }
 
@@ -198,6 +233,44 @@ func TestRunBackfill_PrimaryKeyFromTheCatalog(t *testing.T) {
 		if err := runBackfillForAddedColumn(context.Background(), bf, keyless, added, make(chan ir.Change, 4)); err == nil {
 			t.Errorf("%s: backfill ran without a usable primary key; want a refusal", name)
 		}
+	}
+}
+
+// TestRunBackfill_ReplicaIdentityFullKeyIsNotTheKey pins the key choice
+// under a Postgres REPLICA IDENTITY FULL table, whose projection flags every
+// column — the added one included — as a key column. Keyed on that, the
+// UPDATE's WHERE demanded the value being filled and matched no target row,
+// silently. The catalog's key must win; and a key naming the added column
+// must refuse even when nothing better is available.
+func TestRunBackfill_ReplicaIdentityFullKeyIsNotTheKey(t *testing.T) {
+	full := backfillTestSnap()
+	tbl := *full.IR
+	tbl.PrimaryKey = &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}, {Column: "flag"}}}
+	full.IR = &tbl
+	added := []*ir.Column{{Name: "flag", Type: ir.Text{}}}
+
+	bf := &schemaForwardBackfill{
+		reader:    staticBackfillReader(&pagedBackfillReader{rows: backfillRows(2)}),
+		batchSize: 10,
+		primaryKey: func(context.Context, string, string) (*ir.Index, error) {
+			return &ir.Index{Name: "w_pkey", Columns: []ir.IndexColumn{{Column: "id"}}}, nil
+		},
+	}
+	out := make(chan ir.Change, 4)
+	if err := runBackfillForAddedColumn(context.Background(), bf, full, added, out); err != nil {
+		t.Fatalf("catalog key over a FULL-identity projection: %v", err)
+	}
+	close(out)
+	for _, u := range drainUpdates(t, out) {
+		if _, keyed := u.Before["flag"]; keyed || len(u.Before) != 1 {
+			t.Fatalf("the backfill's WHERE is %v; want only the catalog key id — a WHERE on the column being filled matches no target row", u.Before)
+		}
+	}
+
+	bf = &schemaForwardBackfill{reader: staticBackfillReader(&pagedBackfillReader{rows: backfillRows(2)}), batchSize: 10}
+	err := runBackfillForAddedColumn(context.Background(), bf, full, added, make(chan ir.Change, 4))
+	if err == nil || !strings.Contains(err.Error(), `includes the added column "flag"`) {
+		t.Fatalf("err = %v; want a refusal naming the added column in the key", err)
 	}
 }
 
