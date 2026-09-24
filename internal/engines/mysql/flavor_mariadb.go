@@ -166,7 +166,7 @@ func translateMariaDBDefault(def sql.NullString, extra string, typ ir.Type) ir.D
 			// fall-back posture as bitLiteralBits).
 			return ir.DefaultLiteral{Value: raw}
 		}
-		if isBinaryFamilyType(typ) && len(val) > 0 {
+		if _, isBlob := typ.(ir.Blob); (isBinaryFamilyType(typ) || isBlob) && len(val) > 0 {
 			// Re-encode the decoded bytes as MySQL's bare hex-literal form
 			// so the IR (and the emitted DDL) is byte-identical to what the
 			// same logical schema produces via a MySQL 8 read — including
@@ -175,6 +175,14 @@ func translateMariaDBDefault(def sql.NullString, extra string, typ ir.Type) ir.D
 			// This value is PROVISIONAL: a byte >= 0x80 outside valid UTF-8
 			// already reads as '?', and both catalog readers overwrite it
 			// from a DEFAULT() probe (recoverMariaDBBinaryDefaults, GC-36).
+			//
+			// BLOB is included because MariaDB, unlike MySQL, takes a literal
+			// DEFAULT there (GC-36 item 4). As a DefaultLiteral its raw bytes
+			// are ambiguous once they hold a backslash: the Postgres writer
+			// hands the text to bytea input, which reads `\\` and `\x…` as
+			// escapes, and the MySQL writer refuses it
+			// (BLOB-DEFAULT-LITERAL-ENCODING). The hex expression carries
+			// the same bytes with no reading to choose.
 			return ir.DefaultExpression{Expr: fmt.Sprintf("0x%X", val), Dialect: hexLiteralDialect}
 		}
 		return ir.DefaultLiteral{Value: string(val)}

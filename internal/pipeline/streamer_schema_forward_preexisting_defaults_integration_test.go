@@ -52,8 +52,10 @@ import (
 //   - fdText: MySQL `CAST(c AS CHAR)`, PG `c::text`. Covers strings,
 //     enums, integers, decimals, floats (the shapes use exactly
 //     representable values, so no engine's shortest-round-trip printer
-//     is being compared against another's), DATE, TIME, YEAR, JSON, UUID,
-//     arrays. Nothing is trimmed or case-folded.
+//     is being compared against another's), DATE, TIME, YEAR, JSON, UUID.
+//     Nothing is trimmed or case-folded.
+//   - fdArray: a PG array as the JSON document a MySQL target stores it
+//     as — PG `to_jsonb(c)::text`, MySQL `CAST(c AS CHAR)`.
 //   - fdBool: rendered as fdText; PG's `true`/`false` are then mapped to
 //     MySQL's `1`/`0`. Only those two exact tokens are rewritten, so a
 //     `2`, a NULL or any other spelling still compares as itself.
@@ -114,6 +116,11 @@ const (
 	// scale. Only zeros right of a point are dropped, so a truncated 1 still
 	// differs from 1.1, and an integer's own zeros are never touched.
 	fdDecimal
+	// fdArray renders a Postgres array as the JSON document MySQL stores it
+	// as (docs/type-mapping.md: array → JSON): PG `to_jsonb(c)::text`, MySQL
+	// `CAST(c AS CHAR)`. Both print jsonb/JSON's normalised form (`[1, 2]`),
+	// element order, NULL elements and nesting kept.
+	fdArray
 )
 
 // fdDialect is which engine's SQL a grading query is written in.
@@ -229,6 +236,8 @@ func fdCanonExpr(d fdDialect, fam fdFamily, col string) string {
 			return "to_char(" + c + ", 'YYYY-MM-DD HH24:MI:SS.US')"
 		case fdTime:
 			return "to_char('2000-01-01'::date + " + c + ", 'HH24:MI:SS.US')"
+		case fdArray:
+			return "to_jsonb(" + c + ")::text"
 		case fdBinary:
 			return "encode(" + c + ", 'hex')"
 		case fdBit:
@@ -787,17 +796,8 @@ func TestStreamer_AddColumnForward_PreexistingRowDefaults_MySQLToMySQL(t *testin
 	runForwardedDefaultLane(t, fdLane{
 		name: "mysql->mysql", sourceEngine: "mysql", targetEngine: "mysql",
 		sourceDSN: src, targetDSN: tgt, src: fdMySQL, tgt: fdMySQL,
-		shapes: all,
-		knownWrong: map[string]fdKnownWrong{
-			// KNOWN DEFECT (silent; a WARN is logged, the stream stays green):
-			// the MySQL emitter drops every DEFAULT on a TEXT/BLOB/JSON column
-			// ("MySQL forbids DEFAULTs on JSON/TEXT/BLOB", Error 1101) — true
-			// of a LITERAL default, false of the parenthesised EXPRESSION
-			// default MySQL >= 8.0.13 accepts, which is exactly what the
-			// source declared. Every row that already existed lands NULL.
-			"s_textexpr": {target: fdNull, defect: "TEXT expression DEFAULT dropped on the MySQL target"},
-			"x_blobexpr": {target: fdNull, defect: "BLOB expression DEFAULT dropped on the MySQL target"},
-		},
+		shapes:     all,
+		knownWrong: map[string]fdKnownWrong{},
 		halts: []fdHalt{
 			fdRefused(t, all, "j_obj"),
 			fdRefused(t, all, "j_kv"),
@@ -858,19 +858,6 @@ func fdMariaDBShapes() []fdShape {
 	}
 }
 
-// fdMariaDBToMariaDBKnownWrong is the MariaDB-target defect: the
-// MySQL-family emitter drops every DEFAULT on a
-// TEXT/BLOB/JSON column ("MySQL forbids DEFAULTs on JSON/TEXT/BLOB",
-// Error 1101, logged as a WARN) — but MariaDB accepts a literal DEFAULT
-// on TEXT and on JSON (a LONGTEXT alias), so the source's declared value
-// is simply lost and every row that already existed lands NULL.
-func fdMariaDBToMariaDBKnownWrong() map[string]fdKnownWrong {
-	out := map[string]fdKnownWrong{}
-	out["s_text"] = fdKnownWrong{target: fdNull, defect: "TEXT literal DEFAULT dropped on the MariaDB target"}
-	out["j_json"] = fdKnownWrong{target: fdNull, defect: "JSON literal DEFAULT dropped on the MariaDB target"}
-	return out
-}
-
 // TestStreamer_AddColumnForward_PreexistingRowDefaults_MariaDBToPostgres
 // grades the MariaDB 11.4 binlog → Postgres lane.
 func TestStreamer_AddColumnForward_PreexistingRowDefaults_MariaDBToPostgres(t *testing.T) {
@@ -908,8 +895,10 @@ func TestStreamer_AddColumnForward_PreexistingRowDefaults_MariaDBToMariaDB(t *te
 	runForwardedDefaultLane(t, fdLane{
 		name: "mariadb->mariadb", sourceEngine: "mariadb", targetEngine: "mariadb",
 		sourceDSN: src, targetDSN: tgt, src: fdMySQL, tgt: fdMySQL,
-		shapes:     all,
-		knownWrong: fdMariaDBToMariaDBKnownWrong(),
+		shapes: all,
+		// No known-wrong cells: the high-byte binary defaults (GC-36 item 5) and
+		// the TEXT/JSON literal defaults (GC-36 item 4) are both fixed.
+		knownWrong: map[string]fdKnownWrong{},
 		halts: []fdHalt{
 			// KNOWN LOUD DEFECT: the forwarded column lands, then the first
 			// row carrying the source's unsigned max fails to apply.
@@ -964,8 +953,8 @@ func fdPGShapes() []fdShape {
 		{"d_numfree", "NUMERIC DEFAULT 1.10", fdDecimal},
 		{"t_interval", "INTERVAL DEFAULT '1 day 02:00:00'", fdText},
 		{"n_inet", "INET DEFAULT '10.0.0.1'", fdInet},
-		{"a_int", "INTEGER[] DEFAULT '{1,2}'", fdText},
-		{"a_text", `TEXT[] DEFAULT '{a,"b c"}'`, fdText},
+		{"a_int", "INTEGER[] DEFAULT '{1,2}'", fdArray},
+		{"a_text", `TEXT[] DEFAULT '{a,"b c"}'`, fdArray},
 		{"e_mood", "fd_mood DEFAULT 'ok'", fdText},
 	}
 }
@@ -976,25 +965,6 @@ var fdPGNow = fdShape{"t_now", "TIMESTAMPTZ DEFAULT now()", fdDateTime}
 // fdPrelude is a defaultless forward that makes a halt cell's shape
 // the stream's second forwarded column.
 var fdPrelude = fdShape{"p_first", "TEXT", fdText}
-
-// fdDefaultDropped is the KNOWN DEFECT of every lane whose change
-// stream cannot carry a DEFAULT — Postgres pgoutput and VStream (silent,
-// CRITICAL class; the stream stays green and logs only the roadmap item
-// 78b WARN). The projection carries none, and the ADR-0058 intercept
-// probes the source's default (newSourceDefaultProber) ONLY to classify
-// its volatility in refuseComputedDefaults — it never puts the probed
-// value on the forwarded column. So the target ALTER is emitted with NO
-// default, and every row that already existed holds NULL where the
-// source holds the declared default: NOT NULL columns included. The
-// columns are named one by one so a fix flips each cell to NOW-CORRECT
-// and forces the list to shrink with it.
-func fdDefaultDropped(defect string, cols ...string) map[string]fdKnownWrong {
-	out := make(map[string]fdKnownWrong, len(cols))
-	for _, c := range cols {
-		out[c] = fdKnownWrong{target: fdNull, defect: defect}
-	}
-	return out
-}
 
 // TestStreamer_AddColumnForward_PreexistingRowDefaults_PostgresToPostgres
 // grades the Postgres pgoutput → Postgres lane.
@@ -1045,17 +1015,10 @@ func TestStreamer_AddColumnForward_PreexistingRowDefaults_PostgresToMySQL(t *tes
 		name: "postgres->mysql", sourceEngine: "postgres", targetEngine: "mysql",
 		sourceDSN: src, targetDSN: tgt, src: fdPG, tgt: fdMySQL,
 		shapes: all,
-		// Since the carrySourceDefaults fix the Postgres DEFAULT reaches this
-		// lane. What remains wrong is target-side:
-		knownWrong: fdMerge(
-			// KNOWN DEFECT (target emitter): the MySQL writer drops a DEFAULT on a
-			// TEXT / BLOB / JSON column with a WARN, although MySQL >= 8.0.13
-			// accepts an expression default there — the same root as the
-			// MySQL → MySQL TEXT/BLOB cells.
-			fdDefaultDropped("MySQL emitter drops a DEFAULT on a TEXT / BLOB / JSON target column",
-				"s_text", "s_empty", "s_quote", "s_bslash", "s_estr", "s_unicode", "s_nullword", "s_nn",
-				"x_bytea", "x_bytea2", "x_bytea3", "x_byteaempty", "j_jsonb", "j_jsonbkv", "a_int", "a_text"),
-		),
+		// No known-wrong cells: the default is carried (f73bb946), the MySQL
+		// emitter lands TEXT/BLOB/JSON defaults (GC-36 item 4), and an
+		// unconstrained NUMERIC forwards as DECIMAL(65,30) (GC-36 item 3).
+		knownWrong: map[string]fdKnownWrong{},
 		halts: []fdHalt{
 			// A designed type refusal, not a DEFAULT defect: MySQL has no
 			// type that holds a PG interval's range.
@@ -1075,15 +1038,4 @@ func TestStreamer_AddColumnForward_PreexistingRowDefaults_PostgresToMySQL(t *tes
 		},
 		freshPair: fdFreshPairs(fdPG, fdMySQL, src, tgt),
 	})
-}
-
-// fdMerge unions known-wrong maps (later maps win on a shared column).
-func fdMerge(maps ...map[string]fdKnownWrong) map[string]fdKnownWrong {
-	out := map[string]fdKnownWrong{}
-	for _, m := range maps {
-		for k, v := range m {
-			out[k] = v
-		}
-	}
-	return out
 }

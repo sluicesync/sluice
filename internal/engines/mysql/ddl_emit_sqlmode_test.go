@@ -33,7 +33,7 @@ func TestEmitterBackslashPolicy_WholeTree(t *testing.T) {
 			{Name: "e", Type: ir.Enum{Values: []string{`a\b`}}, Nullable: false},
 			{
 				// Varchar (not TEXT) so MySQL permits the DEFAULT clause —
-				// mysqlForbidsDefault suppresses DEFAULT on BLOB/TEXT/GEOMETRY/JSON.
+				// fitDefaultToColumn reshapes (or, on stdEmitter, drops) a DEFAULT on BLOB/TEXT/GEOMETRY/JSON.
 				Name:    "s",
 				Type:    ir.Varchar{Length: 32},
 				Default: ir.DefaultLiteral{Value: `d\e`},

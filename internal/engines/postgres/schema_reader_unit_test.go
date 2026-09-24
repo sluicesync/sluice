@@ -46,6 +46,16 @@ func TestStripTypeCast(t *testing.T) {
 		// Suffix with brackets is NOT a recognised type name; leave
 		// the value alone rather than guess.
 		{"ARRAY[1,2]::integer[]", "ARRAY[1,2]::integer[]"},
+		{"ARRAY[]::text[]", "ARRAY[]::text[]"},
+		{"('{1}'::integer[] || '{2}'::integer[])::integer[]", "('{1}'::integer[] || '{2}'::integer[])::integer[]"},
+
+		// ...except off one string literal, which is the whole value of
+		// an array-literal DEFAULT (GC-36 item 4).
+		{"'{1,2}'::integer[]", "'{1,2}'"},
+		{`'{a,"b c"}'::text[]`, `'{a,"b c"}'`},
+		{"'{\"it''s\"}'::character varying(5)[]", "'{\"it''s\"}'"},
+		{"'{}'::text[]", "'{}'"},
+		{"'a' || 'b'::text[]", "'a' || 'b'::text[]"},
 
 		// Suffix with operators / arithmetic is not a type name.
 		{"(x + y)::int", "(x + y)"},

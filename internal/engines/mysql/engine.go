@@ -153,9 +153,14 @@ func (e Engine) OpenSchemaWriter(ctx context.Context, dsn string) (ir.SchemaWrit
 	// is non-fatal: zero-value inlineCheckSupported (false) preserves
 	// the pre-v0.97.0 WARN-only behavior, which is the safe default
 	// — no inline CHECK is emitted, no regression from prior releases.
+	// The same probe tells the emitter what DEFAULT a TEXT/BLOB/JSON/
+	// GEOMETRY column accepts (GC-36 item 4); a failure leaves the
+	// conservative zero value, which drops such a DEFAULT with a WARN on
+	// CREATE TABLE and refuses it on a forwarded ADD COLUMN.
 	var version string
 	if err := db.QueryRowContext(ctx, "SELECT VERSION()").Scan(&version); err == nil {
 		w.inlineCheckSupported = mysqlVersionSupportsInlineCheck(version)
+		w.emitter.lobDefaults = lobDefaultFormFor(version)
 	}
 	return w, nil
 }

@@ -1049,6 +1049,14 @@ func (w *SchemaWriter) AlterAddColumn(ctx context.Context, table *ir.Table, cols
 		// See CHANGELOG v0.73.1.
 		emitCol := *col
 		emitCol.Nullable = true
+		// A DEFAULT emitColumnDef would drop (a TEXT/BLOB/JSON/GEOMETRY
+		// default the target cannot hold faithfully) is refused here rather
+		// than dropped: the ADD COLUMN fills every row the table already
+		// holds with the DEFAULT, and the source's own fill emitted no row
+		// event that could correct them (GC-36 item 4).
+		if lost := w.emitter.lobDefaultLoss(&emitCol); lost != "" {
+			return refuseLOBDefaultNotCarried(table.Name, col.Name, lost)
+		}
 		def, err := w.emitter.emitColumnDef(table.Name, &emitCol)
 		if err != nil {
 			return fmt.Errorf("alter add column: emit %q: %w", col.Name, err)

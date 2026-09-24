@@ -57,6 +57,15 @@ type mysqlEmitter struct {
 	// stdEmitter and every unit construction emit the MySQL-8 form,
 	// byte-identical to the pre-item-73 behaviour.
 	flavor Flavor
+
+	// lobDefaults is what the target server accepts as a DEFAULT on a
+	// TEXT/BLOB/JSON/GEOMETRY column, from the SELECT VERSION() probe at
+	// [Engine.OpenSchemaWriter] (GC-36 item 4; see ddl_emit_lob_default.go).
+	// Keyed on the server's own version string rather than the flavor, so
+	// a MariaDB server reached through the plain mysql driver is answered
+	// as MariaDB. The zero value (stdEmitter, a failed probe) is the
+	// conservative lobDefaultNone.
+	lobDefaults lobDefaultForm
 }
 
 // newMySQLEmitter resolves the DDL-emit policy from an engine's --mysql-sql-mode
@@ -1068,25 +1077,18 @@ func (m mysqlEmitter) emitColumnDef(tableName string, c *ir.Column) (string, err
 	if warnDropNonPortableSQLiteDefaultMySQL(tableName, c) {
 		// DEFAULT dropped loudly; no clause emitted.
 	} else if dflt, ok := m.emitDefault(c.Default, c.Type); ok {
-		// MySQL forbids DEFAULT on BLOB, TEXT, GEOMETRY, and JSON
-		// columns — the server rejects CREATE TABLE with Error 1101
-		// ("can't have a default value"). Cross-engine PG → MySQL
-		// hits this whenever a PG source carries `jsonb NOT NULL
-		// DEFAULT '{}'::jsonb` (and the symmetric shapes on text /
-		// bytea / geometry); pre-fix the migration died at CREATE
-		// TABLE on the target with no recovery path.
-		//
-		// Smallest correct fix: drop the DEFAULT clause for these
-		// types and warn loudly so the operator knows the column
-		// will not auto-populate on the target. The follow-up note
-		// fires when the column is also NOT NULL — that's the
-		// failure-prone shape (INSERTs without an explicit value
-		// will fail on the target).
-		if mysqlForbidsDefault(c.Type) {
-			logSuppressedDefault(c, dflt)
+		// A TEXT/BLOB/JSON/GEOMETRY column takes its DEFAULT only in the
+		// parenthesised form MySQL 8.0.13+ and MariaDB accept, and only
+		// when the value can be rendered faithfully for the family — see
+		// fitDefaultToColumn (GC-36 item 4). One that cannot is dropped
+		// here with a WARN; CREATE TABLE's copied rows carry their own
+		// values. AlterAddColumn refuses the same verdict instead, because
+		// there the DEFAULT is the value of every pre-existing row.
+		if body, lost := m.fitDefaultToColumn(c, dflt); lost != "" {
+			logSuppressedDefault(tableName, c, dflt, lost)
 		} else {
 			sb.WriteString(" DEFAULT ")
-			sb.WriteString(dflt)
+			sb.WriteString(body)
 		}
 	}
 	// ON UPDATE CURRENT_TIMESTAMP re-stamps the column on every UPDATE that
@@ -2541,55 +2543,6 @@ func emitColumnList(cols []string) string {
 		parts[i] = quoteIdent(c)
 	}
 	return "(" + strings.Join(parts, ", ") + ")"
-}
-
-// mysqlForbidsDefault reports whether the given IR type maps to a
-// MySQL column type that rejects a DEFAULT clause at CREATE TABLE
-// (Error 1101: "BLOB, TEXT, GEOMETRY or JSON column ... can't have a
-// default value"). The four families are MySQL's hard-coded set —
-// the restriction is documented at
-// https://dev.mysql.com/doc/refman/8.0/en/data-type-defaults.html.
-// ir.Array also maps because emitColumnType routes it to JSON.
-//
-// It asks the STORAGE type, not the declared one (Bug 233): a DOMAIN
-// over `text` emits a MySQL LONGTEXT column, and Error 1101 is MySQL's
-// rule about the COLUMN's type, so a `CREATE DOMAIN d AS text DEFAULT
-// 'x'` column had its DEFAULT emitted and the CREATE TABLE failed.
-func mysqlForbidsDefault(t ir.Type) bool {
-	t = ir.UnwrapDomain(t)
-	switch t.(type) {
-	case ir.JSON, ir.Text, ir.Blob, ir.Geometry, ir.Array:
-		return true
-	}
-	// PG-extension types that translate to forbidding MySQL types:
-	// hstore → JSON falls under the JSON case via the writer's
-	// translator (emitColumnType emits "JSON"), but the IR shape
-	// here is still ir.ExtensionType. Match on that.
-	if ext, ok := t.(ir.ExtensionType); ok && ext.Extension == "hstore" {
-		return true
-	}
-	return false
-}
-
-// logSuppressedDefault emits a WARN that names the column whose
-// DEFAULT clause was suppressed because MySQL rejects DEFAULTs on
-// the column's type family. The follow-up note fires when the
-// column is also NOT NULL — without the default, INSERTs that don't
-// specify a value will fail on the target. Operator workflow: drop
-// the NOT NULL on the source, or supply the value at write time.
-func logSuppressedDefault(c *ir.Column, suppressed string) {
-	slog.Warn(
-		"cross-engine: dropping DEFAULT on MySQL forbidding-type column; MySQL forbids DEFAULTs on JSON/TEXT/BLOB/GEOMETRY (Error 1101)",
-		slog.String("column", c.Name),
-		slog.String("type", fmt.Sprintf("%T", c.Type)),
-		slog.String("suppressed_default", suppressed),
-	)
-	if !c.Nullable {
-		slog.Warn(
-			"cross-engine: column is NOT NULL; INSERTs without an explicit value will fail. Consider DROP NOT NULL on source or supply the value at write time",
-			slog.String("column", c.Name),
-		)
-	}
 }
 
 // typeName returns a human-readable name for an IR type, used in

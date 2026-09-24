@@ -125,9 +125,9 @@ var geometrySRIDRoster = map[string]geometrySRIDVerdict{
 			"mariadb REF_SYSTEM_ID spelling), which is the per-COLUMN carriage working as " +
 			"designed; no value passes through.",
 	},
-	"mysql.mysqlForbidsDefault": {
+	"mysql.mysqlLOBFamily": {
 		sridNotCarried,
-		"schema policy: answers whether MySQL permits a DEFAULT on this type family.",
+		"schema policy: names the large-object family (TEXT/BLOB/JSON/GEOMETRY) a type is emitted as, which decides the form its DEFAULT takes.",
 	},
 	"postgres.emitColumnType": {
 		sridNotCarried,

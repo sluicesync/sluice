@@ -1570,7 +1570,7 @@ func (r *SchemaReader) columnFromRow(cr columnRow, lk columnLookups) (*ir.Column
 		Name:     colName,
 		Type:     typ,
 		Nullable: strings.EqualFold(isNullable, "YES"),
-		Default:  translateDefault(columnDefault, meta.IsAutoIncrement),
+		Default:  byteaDefaultAsHexBytes(typ, translateDefault(columnDefault, meta.IsAutoIncrement)),
 	}
 
 	// ADR-0044 Tier-3 schema-read gate (DEFAULT case). When the
@@ -2820,6 +2820,42 @@ func translateDefault(d sql.NullString, autoIncrement bool) ir.DefaultValue {
 	return ir.DefaultExpression{Expr: s, Dialect: dialectName}
 }
 
+// byteaDefaultAsHexBytes re-tags a bytea column's literal DEFAULT as the
+// engine-neutral hex-bytes expression every writer renders byte-exactly
+// (`0x<HEX>`, dialect "hexbytes" — the form the MySQL reader already gives
+// a BINARY/VARBINARY default). As a DefaultLiteral the value is Postgres's
+// bytea TEXT (`\x00ab00`), and nothing downstream can tell that from six
+// raw bytes that happen to spell it: the MySQL writer turned every PG
+// bytea default into a dropped DEFAULT (GC-36 item 4), and a raw-bytes
+// literal cannot be told apart from it at all (BLOB-DEFAULT-LITERAL-
+// ENCODING in the mysql package).
+//
+// The reading is decided by provenance, not by the content: this session
+// pins `bytea_output = hex` ([afterConnectSessionPins]), so pg_get_expr
+// renders a bytea constant only as `\x` + even hex. A literal of any other
+// shape is left untouched rather than guessed at. The empty value `\x`
+// becomes the empty literal, which every reading agrees on and which a
+// `0x` expression could not spell.
+func byteaDefaultAsHexBytes(typ ir.Type, d ir.DefaultValue) ir.DefaultValue {
+	lit, ok := d.(ir.DefaultLiteral)
+	if !ok {
+		return d
+	}
+	if _, isBytea := ir.UnwrapDomain(typ).(ir.Blob); !isBytea {
+		return d
+	}
+	digits, ok := strings.CutPrefix(lit.Value, `\x`)
+	switch {
+	case !ok:
+		return d
+	case digits == "":
+		return ir.DefaultLiteral{Value: ""}
+	case !isHexASCII([]byte(digits)):
+		return d
+	}
+	return ir.DefaultExpression{Expr: "0x" + strings.ToUpper(digits), Dialect: hexLiteralDialect}
+}
+
 // stripTypeCast removes a trailing ::sometype that Postgres adds to
 // column_default values. Returns the input unchanged if no cast is
 // present.
@@ -2851,7 +2887,12 @@ func stripTypeCast(s string) string {
 		return s
 	}
 	suffix := s[idx+2:]
+	arrayCast := false
 	for _, r := range suffix {
+		if r == '[' || r == ']' {
+			arrayCast = true
+			continue
+		}
 		// De-Morgan'd: each clause is "r is NOT in <range>"; the
 		// cumulative AND yields "r is none of the allowed chars".
 		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') &&
@@ -2860,7 +2901,26 @@ func stripTypeCast(s string) string {
 			return s
 		}
 	}
+	// An array cast strips only off a single string literal — the
+	// `'{1,2}'::integer[]` pg_get_expr prints for an array-literal DEFAULT,
+	// whose literal is the whole value (GC-36 item 4: left as an expression,
+	// no MySQL writer could carry it, and every pre-existing row of a
+	// forwarded ADD COLUMN landed NULL). Anything else keeps its cast: the
+	// type of `ARRAY[]::text[]` exists only in the cast.
+	if arrayCast && !isSingleQuotedLiteral(s[:idx]) {
+		return s
+	}
 	return s[:idx]
+}
+
+// isSingleQuotedLiteral reports whether s is exactly one single-quoted SQL
+// string literal (doubled quotes inside it allowed).
+func isSingleQuotedLiteral(s string) bool {
+	if len(s) < 2 || s[0] != '\'' || s[len(s)-1] != '\'' {
+		return false
+	}
+	body := s[1 : len(s)-1]
+	return !strings.Contains(strings.ReplaceAll(body, "''", ""), "'")
 }
 
 // topLevelCastIndex returns the byte offset of the last `::` operator
