@@ -609,7 +609,9 @@ SAME --stream-id (there is no resume flag) ….
 
 **Pinned by:**
 
-- `internal/pipeline/schema_forward_volatility_test.go` —
+- `internal/pipeline/migcore/default_volatility_test.go` (moved from
+  `internal/pipeline/schema_forward_volatility_test.go` on 2026-09-23 so
+  backup-chain replay can share the classifier; GC-36 (2)) —
   `TestClassifyDefaultVolatility_Class` (53-cell matrix covering the
   volatility families × {PG-syntax, MySQL-syntax,
   refuse-on-uncertainty, allowlist-deterministic}) and

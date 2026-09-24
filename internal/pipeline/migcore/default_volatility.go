@@ -1,7 +1,7 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-package pipeline
+package migcore
 
 // ADR-0058 §2a — text-based volatility detection on ADD COLUMN
 // DEFAULT expressions.
@@ -27,6 +27,12 @@ package pipeline
 // on the known-deterministic allowlist triggers refusal. Better to
 // over-refuse and force the operator to use the drained-model recovery
 // than to silently corrupt.
+//
+// Two consumers, which is why it lives in migcore: the live forward
+// (pipeline's refuseComputedDefaults, which refuses) and backup-chain
+// replay ([ApplyAlterDelta]'s ADD COLUMN arm, which cannot refuse a
+// chain already captured and so names the column instead — see
+// [warnUnreproducibleAddColumnFill]).
 
 import (
 	"fmt"
@@ -142,7 +148,7 @@ var funcNameRE = regexp.MustCompile(`(?i)\b([a-z_][a-z0-9_]*)\s*\(`)
 // PG accepts without parens. Captures the identifier (group 1).
 var bareNameRE = regexp.MustCompile(`(?i)\b([a-z_][a-z0-9_]*)\b`)
 
-// classifyDefaultVolatility examines a DEFAULT expression text and
+// ClassifyDefaultVolatility examines a DEFAULT expression text and
 // returns:
 //
 //   - (true, "") when the expression is safe to forward — a literal
@@ -156,7 +162,7 @@ var bareNameRE = regexp.MustCompile(`(?i)\b([a-z_][a-z0-9_]*)\b`)
 // §2a explicitly takes the conservative path: better to over-refuse
 // than to silently forward a DEFAULT whose target-session evaluation
 // would diverge from the source's per-row insert values.
-func classifyDefaultVolatility(expr string) (safe bool, reason string) {
+func ClassifyDefaultVolatility(expr string) (safe bool, reason string) {
 	trimmed := strings.TrimSpace(expr)
 	if trimmed == "" {
 		return true, ""
@@ -221,14 +227,14 @@ func classifyDefaultVolatility(expr string) (safe bool, reason string) {
 	return true, ""
 }
 
-// classifyDefaultValueVolatility wraps [classifyDefaultVolatility] on
+// ClassifyDefaultValueVolatility wraps [ClassifyDefaultVolatility] on
 // an [ir.DefaultValue]. Returns (true, "") for [ir.DefaultNone] and
 // [ir.DefaultLiteral] (both unambiguously safe). For
 // [ir.DefaultExpression], delegates to the text-scan. For nil (the
 // CDC-projection case where Default isn't carried), treats as no-info
 // and returns (true, "") — the intercept's probe surfaces the
 // source's canonical Default and re-classifies via this function.
-func classifyDefaultValueVolatility(d ir.DefaultValue) (safe bool, reason string) {
+func ClassifyDefaultValueVolatility(d ir.DefaultValue) (safe bool, reason string) {
 	switch v := d.(type) {
 	case nil:
 		// No info — caller must probe the source. Treat as safe at
@@ -240,7 +246,7 @@ func classifyDefaultValueVolatility(d ir.DefaultValue) (safe bool, reason string
 	case ir.DefaultLiteral:
 		return true, ""
 	case ir.DefaultExpression:
-		return classifyDefaultVolatility(v.Expr)
+		return ClassifyDefaultVolatility(v.Expr)
 	default:
 		return false, fmt.Sprintf("unrecognized DefaultValue type %T", d)
 	}

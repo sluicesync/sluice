@@ -826,7 +826,7 @@ func applyAddColumnForward(
 //   - If the column's [ir.Column.Default] is already populated as a
 //     non-nil [ir.DefaultValue] (i.e. the test harness wired the IR
 //     directly, or a future CDC reader carries the field), classify
-//     the in-band value via [classifyDefaultValueVolatility].
+//     the in-band value via [migcore.ClassifyDefaultValueVolatility].
 //   - Otherwise (the production CDC case — pgoutput's RelationMessage
 //     and MySQL's TableMapEvent both drop the DEFAULT), the
 //     deps.defaultProber is called to surface the source's canonical
@@ -838,7 +838,7 @@ func applyAddColumnForward(
 //   - If the prober returns an error, refuse loudly with the probe
 //     error wrapped (refuse-on-uncertainty).
 //
-// Detection is text-based — see [classifyDefaultVolatility]. The
+// Detection is text-based — see [migcore.ClassifyDefaultVolatility]. The
 // allowlist + denylist is the documented examples from ADR-0058 §2a
 // (NOW, nextval, random) plus the obvious cousins across PG and
 // MySQL. Unknown function names trigger refusal (better safe than
@@ -872,7 +872,7 @@ func refuseComputedDefaults(
 			}
 			def = probed
 		}
-		safe, reason := classifyDefaultValueVolatility(def)
+		safe, reason := migcore.ClassifyDefaultValueVolatility(def)
 		if !safe {
 			exprText := defaultExpressionText(def)
 			return fmt.Errorf(

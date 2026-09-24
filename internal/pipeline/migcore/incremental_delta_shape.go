@@ -881,6 +881,7 @@ func applyAlterAspect(
 		}
 		slog.InfoContext(ctx, ac.Origin+": schema delta — applied ADD COLUMN",
 			append(ac.logAttrs(d.Table), "added_columns", len(added))...)
+		warnUnreproducibleAddColumnFill(ctx, ac, d)
 	case AlterAspectColumnType, AlterAspectColumnNullable:
 		if shapeApplier == nil {
 			return alterDeltaRefusal(ac, d.Table, aspect,
@@ -937,6 +938,74 @@ func applyAlterAspect(
 			"this sluice build has an apply disposition for the aspect but no emit path for it (development gap)")
 	}
 	return nil
+}
+
+// AddColumnFillNotReproducibleMarker is the grep-stable token on the WARN
+// [warnUnreproducibleAddColumnFill] emits.
+const AddColumnFillNotReproducibleMarker = "ADD-COLUMN-FILL-NOT-REPRODUCIBLE"
+
+// warnUnreproducibleAddColumnFill names every column a replayed ADD
+// COLUMN just filled with a value the source's rows provably do not hold.
+//
+// The replayed `ADD COLUMN c … DEFAULT d` fills every row that pre-dates
+// the source's ALTER — the rows the earlier links restored, and the
+// window's own pre-ALTER events, which replay after it without a value
+// for c — by evaluating d on the TARGET, now. The source filled its own
+// rows by evaluating d at its ALTER, and that fill wrote no row event, so
+// the chain carries no value for those rows at all: the replayed DEFAULT
+// is the only thing that puts one there. For a constant DEFAULT the two
+// fills agree (every stable family is pinned by
+// TestIncrementalBackup_ChainRestore_AddColumnDefaults).
+// For a time, session, random or sequence DEFAULT — anything the ADR-0058
+// §2a classifier does not prove constant — they cannot: the restored rows
+// get the restore's clock, not the source's.
+//
+// A WARN rather than a refusal, deliberately. The live forward REFUSES the
+// same column (refuseComputedDefaults), because there the operator can
+// still recover before anything diverges. A chain is already captured; the
+// source's values are in none of its links, and refusing would discard
+// every later link of the chain — there is no point-in-time stop — to
+// protect one column's pre-existing rows. So the column is named, with the
+// repair, and the rest of the chain restores.
+//
+// What this cannot see, stated rather than implied: a DEFAULT changed
+// AFTER the ADD COLUMN within the same window (`ADD COLUMN c … DEFAULT
+// 'v'` followed by `ALTER COLUMN c DROP DEFAULT` — the shape Django emits
+// for every AddField with a default). The delta records the window-END
+// default, so the replay fills with that one (NULL, in Django's case) and
+// nothing in the manifest says the source's rows hold 'v'. That arm needs
+// the fill value captured at backup time, which the manifest has no field
+// for; it is pinned known-wrong by the same gate, not fixed here.
+func warnUnreproducibleAddColumnFill(ctx context.Context, ac AlterDeltaContext, d *irbackup.SchemaDeltaEntry) {
+	for _, c := range AddedColumns(d.Before, d.After) {
+		if c == nil {
+			continue
+		}
+		safe, reason := ClassifyDefaultValueVolatility(c.Default)
+		if safe {
+			continue
+		}
+		slog.WarnContext(ctx, ac.Origin+": "+AddColumnFillNotReproducibleMarker+
+			" — every row that pre-dates the source's ALTER got this column's DEFAULT evaluated on the target, at restore time; "+
+			"the source filled the same rows at its own ALTER with values no link of the chain carries, so they differ. "+
+			"Repair: copy the column's values for those rows from the source (or re-take a full backup after the ALTER and restore from it)",
+			append(ac.logAttrs(d.Table),
+				"column", c.Name,
+				"default", defaultText(c.Default),
+				"reason", reason)...)
+	}
+}
+
+// defaultText renders a DEFAULT for a log line.
+func defaultText(d ir.DefaultValue) string {
+	switch v := d.(type) {
+	case ir.DefaultExpression:
+		return v.Expr
+	case ir.DefaultLiteral:
+		return v.Value
+	default:
+		return ""
+	}
 }
 
 // applyAlterIndexAspect emits the index DDL for one index aspect. A

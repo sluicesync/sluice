@@ -1,7 +1,7 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-package pipeline
+package migcore
 
 import (
 	"strings"
@@ -111,9 +111,9 @@ func TestClassifyDefaultVolatility_Class(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			safe, reason := classifyDefaultVolatility(tc.expr)
+			safe, reason := ClassifyDefaultVolatility(tc.expr)
 			if safe != tc.wantSafe {
-				t.Errorf("classifyDefaultVolatility(%q) safe = %v; want %v (reason=%q)",
+				t.Errorf("ClassifyDefaultVolatility(%q) safe = %v; want %v (reason=%q)",
 					tc.expr, safe, tc.wantSafe, reason)
 			}
 			if !tc.wantSafe && !strings.Contains(strings.ToLower(reason), tc.wantReason) {
@@ -149,9 +149,9 @@ func TestClassifyDefaultValueVolatility_IRTypes(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			safe, reason := classifyDefaultValueVolatility(tc.val)
+			safe, reason := ClassifyDefaultValueVolatility(tc.val)
 			if safe != tc.wantSafe {
-				t.Errorf("classifyDefaultValueVolatility(%v) safe = %v; want %v (reason=%q)",
+				t.Errorf("ClassifyDefaultValueVolatility(%v) safe = %v; want %v (reason=%q)",
 					tc.val, safe, tc.wantSafe, reason)
 			}
 		})
