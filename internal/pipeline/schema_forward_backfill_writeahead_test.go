@@ -166,7 +166,7 @@ func TestBackfillWriteAhead_CompareAndClear(t *testing.T) {
 	durable := func(s *Streamer, table string) {
 		e := s.addedColumnBackfills.open(table, []string{"flag"})
 		s.addedColumnBackfills.finished(e, nil)
-		s.addedColumnBackfills.markWatermark(e, testPos(5))
+		s.addedColumnBackfills.markFloors(e, testPos(5))
 	}
 
 	t.Run("durable: cleared", func(t *testing.T) {
@@ -199,7 +199,7 @@ func TestBackfillWriteAhead_CompareAndClear(t *testing.T) {
 	t.Run("not durable: replaced by the attempt-end refusal, not cleared", func(t *testing.T) {
 		store := &fakeRefusalStore{}
 		s, applier := writeAheadStreamer(store)
-		applier.pos = testPos(3) // short of the watermark
+		applier.pos = testPos(3) // short of the floor
 		_ = s.addedColumnBackfills.writeAhead(ctx, "public.dj", []string{"flag"})
 		durable(s, "public.dj")
 		var gap *addedColumnBackfillIncompleteError
@@ -251,7 +251,7 @@ func TestBackfillWriteAhead_ClearedMidRun(t *testing.T) {
 	_ = s.addedColumnBackfills.writeAhead(ctx, "public.dj", []string{"flag"})
 	e := s.addedColumnBackfills.open("public.dj", []string{"flag"})
 	s.addedColumnBackfills.finished(e, nil)
-	s.addedColumnBackfills.markWatermark(e, testPos(5))
+	s.addedColumnBackfills.markFloors(e, testPos(5))
 
 	stop := s.watchAddedColumnBackfillDurability(ctx, applier, "s")
 	defer stop()

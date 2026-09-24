@@ -4,8 +4,8 @@
 // The binding half of the laneapply decode-type-stability premise
 // (2026-08-07 invariant sweep). Two facts were each pinned and nothing
 // bound them: this package's change-chunk round trip WIDENS a sized
-// integer to its 64-bit form, and internal/laneapply tags a key value by
-// its Go kind. Chain-restore's incremental replay and the from-backup
+// integer to its 64-bit form, and internal/laneapply encoded a key value
+// by its Go kind (by value since 2026-09-24). Chain-restore's incremental replay and the from-backup
 // broker feed chunk-decoded changes into the concurrent lane router at a
 // default concurrency of 4, so if the two sides ever disagreed about a
 // kind, one row's INSERT and its later DELETE would land on two lanes and
@@ -149,28 +149,61 @@ func TestCanonicalKeyValue_SurvivesTheBackupRoundTrip(t *testing.T) {
 	}
 }
 
-// TestCanonicalKeyValue_FamiliesStillDoNotAlias is the other direction of
-// the widening change: aliasing the integer WIDTHS onto one tag must not
-// have aliased the FAMILIES. int64(1), uint64(1), "1", true and nil are five
-// different keys and must stay five different hashes.
-func TestCanonicalKeyValue_FamiliesStillDoNotAlias(t *testing.T) {
+// TestCanonicalKeyValue_OneValueOneEncodingAcrossKinds pins the direction
+// that matters (see laneapply.Router.LaneFor): every Go kind a reader may
+// legitimately hand for ONE key value encodes alike, because a row whose
+// value encodes two ways is split across lanes and its changes commit in
+// no defined order.
+//
+// This test used to assert the opposite for int64/uint64 and string/[]byte
+// ("five different keys"), which is what made the 2026-09-24 value-fidelity
+// finding 2 a gate-defended defect: a MySQL INT UNSIGNED key reads as int64
+// through the text-protocol copy reader and uint64 through the binlog, and
+// a backup chain's ADD COLUMN fill carries the first into a stream of the
+// second, so the fill's UPDATE and the window's INSERT of one row took two
+// lanes. Aliasing two DIFFERENT keys costs only balance.
+func TestCanonicalKeyValue_OneValueOneEncodingAcrossKinds(t *testing.T) {
+	for _, group := range []struct {
+		name  string
+		kinds []any
+	}{
+		{"seven", []any{int8(7), int16(7), int32(7), int(7), int64(7), uint8(7), uint16(7), uint32(7), uint(7), uint64(7), "7", []byte("7")}},
+		{"zero", []any{int64(0), uint64(0), "0", []byte("0")}},
+		{"max int64", []any{int64(9223372036854775807), uint64(9223372036854775807), "9223372036854775807"}},
+		{"text", []any{"k-42", []byte("k-42")}},
+	} {
+		want := canonicalKeyBytes(group.kinds[0])
+		for _, v := range group.kinds[1:] {
+			if got := canonicalKeyBytes(v); got != want {
+				t.Errorf("%s: %T %v canonicalises to %q; want %q (the same value from another reader must take the same lane)",
+					group.name, v, v, got, want)
+			}
+		}
+	}
+}
+
+// TestCanonicalKeyValue_DistinctValuesStayDistinct keeps the encoding
+// honest in the other direction, where it costs only balance: values that
+// differ must still encode differently — a negative integer is not its
+// absolute value, nil and bool are not byte-strings — or the lane hash
+// degenerates.
+func TestCanonicalKeyValue_DistinctValuesStayDistinct(t *testing.T) {
 	seen := map[string]string{}
 	for _, tc := range []struct {
 		name string
 		v    any
 	}{
-		{"int64", int64(1)},
-		{"uint64", uint64(1)},
-		{"string", "1"},
-		{"bytes", []byte("1")},
+		{"int64 1", int64(1)},
+		{"int64 -1", int64(-1)},
+		{"uint64 max", uint64(18446744073709551615)},
+		{"string 1a", "1a"},
 		{"bool", true},
 		{"nil", nil},
 		{"float64", float64(1)},
 	} {
 		got := canonicalKeyBytes(tc.v)
 		if prev, dup := seen[got]; dup {
-			t.Errorf("%s and %s both canonicalise to %q — two different keys would share a lane slot and, worse, "+
-				"a routing decision would depend on which one arrived", tc.name, prev, got)
+			t.Errorf("%s and %s both canonicalise to %q", tc.name, prev, got)
 		}
 		seen[got] = tc.name
 	}
@@ -178,29 +211,6 @@ func TestCanonicalKeyValue_FamiliesStillDoNotAlias(t *testing.T) {
 	// every case, or "all distinct" is a statement about empty strings.
 	if len(seen) != 7 {
 		t.Fatalf("distinct canonical encodings = %d; want 7", len(seen))
-	}
-}
-
-// TestCanonicalKeyValue_WidthsAliasWithinAFamily states the property the
-// widening buys, separately from the round trip, so a reader can see it
-// without running the codec.
-func TestCanonicalKeyValue_WidthsAliasWithinAFamily(t *testing.T) {
-	signed := []any{int8(7), int16(7), int32(7), int(7), int64(7)}
-	want := canonicalKeyBytes(int64(7))
-	for _, v := range signed {
-		if got := canonicalKeyBytes(v); got != want {
-			t.Errorf("%T(7) canonicalises to %q; want %q (every signed width must share the int64 encoding)", v, got, want)
-		}
-	}
-	unsigned := []any{uint8(7), uint16(7), uint32(7), uint(7), uint64(7)}
-	wantU := canonicalKeyBytes(uint64(7))
-	for _, v := range unsigned {
-		if got := canonicalKeyBytes(v); got != wantU {
-			t.Errorf("%T(7) canonicalises to %q; want %q (every unsigned width must share the uint64 encoding)", v, got, wantU)
-		}
-	}
-	if want == wantU {
-		t.Fatal("the signed and unsigned families collapsed onto one encoding — the width aliasing went one step too far")
 	}
 }
 

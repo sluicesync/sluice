@@ -56,21 +56,93 @@ func TestBoundaryBackfill_OnlyOnAddColumn(t *testing.T) {
 	}
 }
 
-// TestBackfillWatermark: the watermark is the first POSITIONED, non-schema
-// change forwarded after the backfill.
+// TestBackfillWatermark: a backfill's floors are the last POSITIONED,
+// non-snapshot change forwarded BEFORE it and the boundary snapshot's own
+// position — never a change after it.
 func TestBackfillWatermark(t *testing.T) {
 	var ledger addedColumnBackfillLedger
 	e := ledger.open("public.dj", []string{"flag"})
 	ledger.finished(e, nil)
 	var w backfillWatermark
-	w.await(&boundaryBackfill{bf: &schemaForwardBackfill{ledger: &ledger}, owed: e})
+	w.observe(ir.TxBegin{Position: testPos(4)})
+	w.observe(ir.SchemaSnapshot{Position: testPos(9)}) // a schema anchor is not a stream position
+	w.observe(ir.Insert{})                             // no position token
+	w.await(&boundaryBackfill{bf: &schemaForwardBackfill{ledger: &ledger}, snap: ir.SchemaSnapshot{Position: testPos(2)}, owed: e})
+	w.observe(ir.Insert{Position: testPos(8)}) // after the backfill: not a floor
+	if len(e.floors) != 2 || e.floors[0] != testPos(4) || e.floors[1] != testPos(2) {
+		t.Fatalf("floors = %+v; want [4 (the last change before the backfill), 2 (the snapshot)]", e.floors)
+	}
+}
 
-	w.observe(ir.SchemaSnapshot{Position: testPos(3)}) // a schema anchor is not a checkpoint
-	w.observe(ir.TxBegin{})                            // no position token
-	w.observe(ir.Insert{Position: testPos(8)})
-	w.observe(ir.Insert{Position: testPos(9)})
-	if e.watermark != testPos(8) {
-		t.Fatalf("watermark = %+v; want the first positioned change after the backfill (8)", e.watermark)
+// gtidSetOrderer orders test positions the way a MySQL GTID set (or a
+// VStream VGTID) orders: a token is a comma-separated set of transaction
+// ids, and p is at or after anchor when p ⊇ anchor — a partial order.
+type gtidSetOrderer struct{}
+
+func (gtidSetOrderer) PositionAtOrAfter(p, anchor ir.Position) (bool, error) {
+	have := map[string]bool{}
+	for _, id := range strings.Split(p.Token, ",") {
+		have[id] = true
+	}
+	for _, id := range strings.Split(anchor.Token, ",") {
+		if !have[id] {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+type gtidTestEngine struct {
+	ir.Engine
+	gtidSetOrderer
+}
+
+func gtidPos(set string) ir.Position { return ir.Position{Engine: "test", Token: set} }
+
+// TestSettleAddedColumnBackfills_RowPositionsExcludeTheirOwnTransaction is
+// the 2026-09-24 value-fidelity finding 1, per source shape. On a MySQL
+// GTID or VStream source a row's position is the executed set WITHOUT its
+// own transaction, so the boundary snapshot (S+ddl) and the first row after
+// the backfill (still S+ddl) carry the same position — which the serial
+// applier persists the moment it applies the snapshot, before any
+// backfilled row. That persisted position must NOT prove the backfill
+// durable; only the TxCommit that folds in the next transaction (S+ddl+g)
+// may. On Postgres the snapshot and the transaction's rows carry its
+// CommitLSN and its TxCommit the strictly later end LSN; file/pos is a
+// total order.
+func TestSettleAddedColumnBackfills_RowPositionsExcludeTheirOwnTransaction(t *testing.T) {
+	cases := []struct {
+		name      string
+		source    ir.Engine
+		last      ir.Position // the last change forwarded before the backfill (its TxBegin)
+		snap      ir.Position
+		persisted ir.Position
+		durable   bool
+	}{
+		{name: "gtid: persisted = the snapshot's set (applied before any backfilled row)", source: gtidTestEngine{}, last: gtidPos("s,ddl"), snap: gtidPos("s,ddl"), persisted: gtidPos("s,ddl")},
+		{name: "gtid: an earlier transaction's commit (s+ddl+x) landed before the backfill", source: gtidTestEngine{}, last: gtidPos("s,ddl,x"), snap: gtidPos("s,ddl"), persisted: gtidPos("s,ddl,x")},
+		{name: "gtid: the next transaction's commit folds its own gtid", source: gtidTestEngine{}, last: gtidPos("s,ddl"), snap: gtidPos("s,ddl"), persisted: gtidPos("s,ddl,g"), durable: true},
+		{name: "gtid: an unrelated set (another lineage) proves nothing", source: gtidTestEngine{}, last: gtidPos("s,ddl"), snap: gtidPos("s,ddl"), persisted: gtidPos("other")},
+		{name: "lsn: persisted = the transaction's CommitLSN its rows carry", source: orderedTestEngine{}, last: testPos(100), snap: testPos(90), persisted: testPos(100)},
+		{name: "lsn: persisted = its TxCommit end LSN", source: orderedTestEngine{}, last: testPos(100), snap: testPos(90), persisted: testPos(101), durable: true},
+		{name: "lsn: a first-touch snapshot at 0/0 is not the only floor", source: orderedTestEngine{}, last: testPos(100), snap: testPos(0), persisted: testPos(50)},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := &Streamer{Source: c.source}
+			e := s.addedColumnBackfills.open("public.dj", []string{"flag"})
+			s.addedColumnBackfills.finished(e, nil)
+			var w backfillWatermark
+			w.observe(ir.TxBegin{Position: c.last})
+			w.await(&boundaryBackfill{bf: &schemaForwardBackfill{ledger: &s.addedColumnBackfills}, snap: ir.SchemaSnapshot{Position: c.snap}, owed: e})
+			// The first row after the backfill carries the pre-transaction
+			// position — the old watermark, which proved nothing.
+			w.observe(ir.Insert{Position: c.last})
+			owed := s.settleDurableAddedColumnBackfills(context.Background(), ledgerTestApplier{pos: c.persisted, ok: true}, "s")
+			if got := len(owed) == 0; got != c.durable {
+				t.Fatalf("backfill proven durable = %v with persisted %q, floors %+v; want %v", got, c.persisted.Token, e.floors, c.durable)
+			}
+		})
 	}
 }
 
@@ -96,40 +168,42 @@ type orderedTestEngine struct {
 // TestSettleAddedColumnBackfills pins the attempt-exit settle: an owed
 // backfill leaves the ledger only when it finished AND the applier's
 // persisted position — read back from the target, the independent evidence
-// — has reached the first change after it. Everything else ends the attempt
+// — is strictly past its floors. Everything else ends the attempt
 // with ADD-COLUMN-BACKFILL-INCOMPLETE, terminal and wrapping
 // ErrUnforwardedSchemaChange so the run's recorder persists it.
 func TestSettleAddedColumnBackfills(t *testing.T) {
 	runErr := errors.New("some other attempt error")
 	cases := []struct {
-		name      string
-		emitted   bool
-		cause     error
-		watermark ir.Position
-		applier   ledgerTestApplier
-		source    ir.Engine
-		wantGap   bool
+		name    string
+		emitted bool
+		cause   error
+		floor   ir.Position
+		applier ledgerTestApplier
+		source  ir.Engine
+		wantGap bool
 	}{
-		{name: "finished, persisted past the watermark", emitted: true, watermark: testPos(5), applier: ledgerTestApplier{pos: testPos(7), ok: true}, source: orderedTestEngine{}},
-		{name: "finished, persisted exactly at the watermark", emitted: true, watermark: testPos(7), applier: ledgerTestApplier{pos: testPos(7), ok: true}, source: orderedTestEngine{}},
+		{name: "finished, persisted past the floor", emitted: true, floor: testPos(5), applier: ledgerTestApplier{pos: testPos(7), ok: true}, source: orderedTestEngine{}},
+		// Equal is not past: a position the applier could have persisted
+		// before the backfill's rows committed proves nothing about them.
+		{name: "finished, persisted exactly at the floor", emitted: true, floor: testPos(7), applier: ledgerTestApplier{pos: testPos(7), ok: true}, source: orderedTestEngine{}, wantGap: true},
 		// The applier returns its persisted position tagged with the TARGET
 		// engine (a PG source's token under Engine "mysql"); it must be
 		// re-tagged, or every cross-engine settle refuses.
-		{name: "persisted position tagged with the target engine", emitted: true, watermark: testPos(5), applier: ledgerTestApplier{pos: ir.Position{Engine: "mysql", Token: "7"}, ok: true}, source: orderedTestEngine{}},
+		{name: "persisted position tagged with the target engine", emitted: true, floor: testPos(5), applier: ledgerTestApplier{pos: ir.Position{Engine: "mysql", Token: "7"}, ok: true}, source: orderedTestEngine{}},
 		{name: "stopped early", cause: errors.New("connection reset"), applier: ledgerTestApplier{pos: testPos(7), ok: true}, source: orderedTestEngine{}, wantGap: true},
-		{name: "finished, no change after it yet", emitted: true, applier: ledgerTestApplier{pos: testPos(7), ok: true}, source: orderedTestEngine{}, wantGap: true},
-		{name: "finished, persisted short of the watermark", emitted: true, watermark: testPos(9), applier: ledgerTestApplier{pos: testPos(7), ok: true}, source: orderedTestEngine{}, wantGap: true},
-		{name: "position unreadable", emitted: true, watermark: testPos(5), applier: ledgerTestApplier{err: errors.New("boom")}, source: orderedTestEngine{}, wantGap: true},
-		{name: "no persisted position", emitted: true, watermark: testPos(5), applier: ledgerTestApplier{}, source: orderedTestEngine{}, wantGap: true},
-		{name: "source cannot order positions", emitted: true, watermark: testPos(5), applier: ledgerTestApplier{pos: testPos(7), ok: true}, wantGap: true},
+		{name: "finished, floors not yet recorded", emitted: true, applier: ledgerTestApplier{pos: testPos(7), ok: true}, source: orderedTestEngine{}, wantGap: true},
+		{name: "finished, persisted short of the floor", emitted: true, floor: testPos(9), applier: ledgerTestApplier{pos: testPos(7), ok: true}, source: orderedTestEngine{}, wantGap: true},
+		{name: "position unreadable", emitted: true, floor: testPos(5), applier: ledgerTestApplier{err: errors.New("boom")}, source: orderedTestEngine{}, wantGap: true},
+		{name: "no persisted position", emitted: true, floor: testPos(5), applier: ledgerTestApplier{}, source: orderedTestEngine{}, wantGap: true},
+		{name: "source cannot order positions", emitted: true, floor: testPos(5), applier: ledgerTestApplier{pos: testPos(7), ok: true}, wantGap: true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			s := &Streamer{Source: c.source}
 			e := s.addedColumnBackfills.open("public.dj", []string{"flag"})
 			s.addedColumnBackfills.finished(e, c.cause)
-			if c.emitted && c.cause == nil {
-				s.addedColumnBackfills.markWatermark(e, c.watermark)
+			if c.emitted && c.cause == nil && c.floor.Token != "" {
+				s.addedColumnBackfills.markFloors(e, c.floor)
 			}
 			got := s.settleAddedColumnBackfills(context.Background(), c.applier, "s", runErr)
 			if !c.wantGap {

@@ -125,8 +125,8 @@ func interceptSchemaSnapshotsForCoordination(
 	}
 	go func() {
 		defer close(out)
-		// The first positioned change after a backfill is its durability
-		// watermark (schema_forward_backfill_ledger.go).
+		// Tracks the last positioned change, which a backfill's durability
+		// proof must pass (schema_forward_backfill_ledger.go).
 		var watermark backfillWatermark
 		for {
 			select {

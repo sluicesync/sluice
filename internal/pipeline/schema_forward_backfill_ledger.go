@@ -25,12 +25,14 @@ package pipeline
 // Every backfill a forwarded boundary owes is entered here the moment its
 // ALTER has landed, and leaves only when the attempt that ran it can prove
 // it reached the target: every row's Update was handed to the applier, AND
-// the applier's persisted position has reached the first change that
-// followed the backfill in the channel (its watermark). The applier commits
-// in channel order and checkpoints only at transaction boundaries, so a
-// persisted position at or past the watermark means every backfilled row
-// before it is durable. Anything else — a failed page, a stop or Ctrl-C
-// mid-backfill, an apply retry that reopened the stream before the
+// the applier's persisted position is STRICTLY past every position that
+// preceded or accompanied the backfill in the channel (its floors). The
+// applier persists a position only once everything ahead of it in the
+// channel has committed, so such a position can only belong to a change
+// after the backfill, and every backfilled row before it is durable — see
+// [backfillWatermark] for why "strictly", per source. Anything else — a
+// failed page, a stop or Ctrl-C mid-backfill, an apply retry that reopened
+// the stream before the
 // backfilled rows committed — settles as ADD-COLUMN-BACKFILL-INCOMPLETE at
 // the end of the attempt: a terminal error that wraps
 // [ir.ErrUnforwardedSchemaChange], so the run's existing refusal recorder
@@ -41,7 +43,7 @@ package pipeline
 // intercept's belief that it finished.
 //
 // Deliberately conservative: a stop that lands after the backfilled rows
-// committed but before the applier checkpointed past the watermark refuses
+// committed but before the applier checkpointed past the floors refuses
 // too. A false refusal costs one acknowledged restart; a false "complete"
 // is the silent loss this exists to prevent.
 //
@@ -142,9 +144,13 @@ type addedColumnBackfillEntry struct {
 	emitted bool
 	// cause is why the backfill stopped short, when it did.
 	cause error
-	// watermark is the position of the first change forwarded after the
-	// backfill; the zero Position until one is.
-	watermark ir.Position
+	// floors are the positions the applier's persisted position must be
+	// STRICTLY past before the backfill counts as durable: the last
+	// positioned change forwarded before the backfill, and the boundary
+	// snapshot's position (which every backfilled Update carries). nil until
+	// the backfill has handed its last row to the applier (see
+	// [backfillWatermark.await]).
+	floors []ir.Position
 }
 
 // open enters an owed backfill. nil-safe (a unit harness has no ledger).
@@ -278,16 +284,23 @@ func (l *addedColumnBackfillLedger) finished(e *addedColumnBackfillEntry, err er
 	e.cause = err
 }
 
-// markWatermark records the position of the first change forwarded after
-// e's backfill. A change without a position token cannot anchor it and is
-// skipped by the caller.
-func (l *addedColumnBackfillLedger) markWatermark(e *addedColumnBackfillEntry, pos ir.Position) {
+// markFloors records the positions e's durability proof must pass (see
+// [addedColumnBackfillEntry.floors]). Positions without a token cannot
+// anchor anything and are dropped; an entry left with no floor is never
+// proven durable.
+func (l *addedColumnBackfillLedger) markFloors(e *addedColumnBackfillEntry, floors ...ir.Position) {
 	if l == nil || e == nil {
 		return
 	}
+	kept := make([]ir.Position, 0, len(floors))
+	for _, f := range floors {
+		if f.Token != "" {
+			kept = append(kept, f)
+		}
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	e.watermark = pos
+	e.floors = kept
 }
 
 // settle removes every entry durable reports as having reached the target
@@ -311,38 +324,73 @@ func (l *addedColumnBackfillLedger) settle(durable func(e *addedColumnBackfillEn
 	return owed
 }
 
-// backfillWatermark hands the watermark to the backfill a boundary just
-// ran: the first change the intercept forwards after it that carries a
-// position. Held by each intercept goroutine; zero cost when nothing is
-// awaiting one.
+// backfillWatermark gives the backfill a boundary just ran its durability
+// floors (see [addedColumnBackfillEntry.floors]): it remembers the last
+// positioned non-snapshot change the intercept forwarded, and when the
+// backfill has handed its last row to the applier it records that position
+// and the boundary snapshot's as the floors. Held by each intercept
+// goroutine; one struct copy per change.
+//
+// # Why the floor is the last change BEFORE the backfill, strictly
+//
+// It used to be the first positioned change AFTER the backfill, reached
+// "at or after" — which is no evidence on a source whose row positions
+// exclude their own transaction (a MySQL GTID set, a VStream VGTID). There
+// the first row after the backfill carries the same position as the
+// boundary snapshot, which the serial applier persists the moment it
+// applies the snapshot — before any backfilled row — so the settle
+// "proved" the backfill durable while it was still in flight (the
+// 2026-09-24 value-fidelity review, finding 1). The rule is now stated per
+// the applier's own contract instead: the applier persists a position only
+// once every change ahead of it in the channel has committed (serial and
+// batched: in channel order, the position in the same transaction as the
+// data or at a source-transaction boundary after it; lanes: the contiguous
+// frontier). And every change at or before the backfill carries a position
+// no later than the floors — the non-snapshot changes arrive in position
+// order (the readers' resume contract: MySQL item 132, Postgres A2-1,
+// VStream C-1), and the snapshot and every backfilled Update carry the
+// snapshot's position. So a persisted position STRICTLY past every floor
+// can only have been written for a change after the backfill, which the
+// applier committed after the backfill's rows. The independent expected
+// value is therefore any position the target could not have persisted
+// before the backfill committed; per source, the first one that arrives:
+//
+//   - Postgres: the TxCommit of the transaction whose Relation re-send
+//     carried the ALTER (its TransactionEndLSN is strictly past that
+//     transaction's CommitLSN, which its TxBegin and rows carry).
+//   - MySQL GTID (MariaDB included): that transaction's TxCommit, whose set
+//     folds in its own GTID; its TxBegin and rows carry the set without it.
+//   - MySQL file/pos: any later event's LogPos; in practice the XID.
+//   - VStream (no transaction markers): the first position-bearing change
+//     whose VGTID advanced past the boundary transaction. An application
+//     write is not required for one: measured on vttestserver with no
+//     write after the last ADD COLUMN, Vitess's own source-side writes
+//     advanced the persisted VGTID past the floors within the test's
+//     window (TestStreamer_AddColumnBackfill_VStreamToPostgres runs with
+//     no trailing write). Whether every PlanetScale deployment produces one
+//     is UNVERIFIED PREMISE; where none arrives, nothing proves the
+//     backfill and a stop refuses — the conservative direction.
 type backfillWatermark struct {
-	ledger  *addedColumnBackfillLedger
-	pending *addedColumnBackfillEntry
+	last ir.Position
 }
 
-// await arms the watermark for b's entry (nil-safe for a boundary that owed
-// nothing, or a backfill that did not finish — which cannot become durable).
+// await records the floors for b's entry (nil-safe for a boundary that
+// owed nothing). Called after the backfill handed every row to the channel.
 func (w *backfillWatermark) await(b *boundaryBackfill) {
 	if b == nil || b.bf == nil || b.owed == nil {
 		return
 	}
-	w.ledger, w.pending = b.bf.ledger, b.owed
+	b.bf.ledger.markFloors(b.owed, w.last, b.snap.Position)
 }
 
-// observe is called with every change the intercept forwards.
+// observe is called with every non-snapshot change the intercept forwards.
 func (w *backfillWatermark) observe(c ir.Change) {
-	if w.pending == nil {
-		return
-	}
 	if _, isSnap := c.(ir.SchemaSnapshot); isSnap {
-		return // a schema anchor's position is not a data checkpoint
+		return // a schema anchor's position is metadata, not a stream position
 	}
-	pos := c.Pos()
-	if pos.Token == "" {
-		return
+	if pos := c.Pos(); pos.Token != "" {
+		w.last = pos
 	}
-	w.ledger.markWatermark(w.pending, pos)
-	w.pending = nil
 }
 
 // addedColumnBackfillIncompleteError ends an attempt that still owes a
@@ -482,7 +530,7 @@ func (s *Streamer) watchAddedColumnBackfillDurability(ctx context.Context, appli
 
 // settleDurableAddedColumnBackfills drops from the ledger every backfill
 // proven to have reached the target — finished, and the applier's persisted
-// position (read back from the target) at or past its watermark — and
+// position (read back from the target) strictly past its floors — and
 // returns copies of the rest.
 func (s *Streamer) settleDurableAddedColumnBackfills(ctx context.Context, applier ir.ChangeApplier, streamID string) []addedColumnBackfillEntry {
 	readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), addedColumnBackfillSettleTimeout)
@@ -494,7 +542,7 @@ func (s *Streamer) settleDurableAddedColumnBackfills(ctx context.Context, applie
 	)
 	orderer, _ := s.Source.(ir.PositionOrderer)
 	return s.addedColumnBackfills.settle(func(e *addedColumnBackfillEntry) bool {
-		if !e.emitted || e.watermark.Token == "" || orderer == nil || applier == nil {
+		if !e.emitted || len(e.floors) == 0 || orderer == nil || applier == nil {
 			return false
 		}
 		if !read {
@@ -509,12 +557,29 @@ func (s *Streamer) settleDurableAddedColumnBackfills(ctx context.Context, applie
 		if !havePos {
 			return false
 		}
-		// The applier hands its persisted position back tagged with the
-		// TARGET engine; the token is the source's. Re-tag it with the
-		// watermark's own engine (the same source) before ordering, as
-		// warm resume does (retagPositionForSource) — measured: an untagged
-		// PG → MySQL compare refused every settle.
-		reached, err := orderer.PositionAtOrAfter(retagPositionForSource(persisted, e.watermark.Engine), e.watermark)
-		return err == nil && reached
+		for _, floor := range e.floors {
+			// The applier hands its persisted position back tagged with
+			// the TARGET engine; the token is the source's. Re-tag it with
+			// the floor's own engine (the same source) before ordering, as
+			// warm resume does (retagPositionForSource) — measured: an
+			// untagged PG → MySQL compare refused every settle.
+			if !strictlyAfter(orderer, retagPositionForSource(persisted, floor.Engine), floor) {
+				return false
+			}
+		}
+		return true
 	})
+}
+
+// strictlyAfter reports whether p is strictly past floor under the source's
+// order: at or after it, and not also at or before it (equal positions, and
+// the unordered pairs a GTID set's partial order allows, both answer
+// false). An ordering error answers false — unproven, so still owed.
+func strictlyAfter(orderer ir.PositionOrderer, p, floor ir.Position) bool {
+	after, err := orderer.PositionAtOrAfter(p, floor)
+	if err != nil || !after {
+		return false
+	}
+	before, err := orderer.PositionAtOrAfter(floor, p)
+	return err == nil && !before
 }

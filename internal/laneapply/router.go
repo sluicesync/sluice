@@ -111,15 +111,19 @@ func NewRouter(lanes int) *Router {
 
 // LaneFor returns the lane index in [0, lanes) for a change to `qualified`
 // (schema.table) whose ordered primary-key column values are pkVals. The
-// hash is FNV-1a over the qualified name and a canonical, type-tagged
-// encoding of each key value, so two values from DIFFERENT families that
-// render the same (int64(5) vs the string "5") never alias — a correctness
-// requirement, not just balance.
+// hash is FNV-1a over the qualified name and a canonical encoding of each
+// key value ([WriteCanonicalKeyValue]).
 //
-// The property the same-lane guarantee actually needs is the converse, and
-// it is worth stating separately because it is the one that can rot: the
-// SAME row must always hash identically, so every producer that can place a
-// value in a given key column must place the same Go KIND there.
+// The two directions of a hash mistake are NOT symmetric, and the encoding
+// is built around that. Two DIFFERENT keys that encode alike merely share a
+// lane: their changes serialise where they could have run in parallel —
+// balance, never correctness (nothing downstream treats a shared lane as
+// a shared key; coalescing uses [valuesEqualForKey]). ONE row whose value
+// encodes two ways lands on two lanes, and its changes commit in no
+// defined order — silent loss. So the property that matters, and the one
+// that can rot, is that the SAME row always hashes identically: every
+// producer that can place a value in a given key column must produce the
+// same canonical bytes, whatever Go kind it chose.
 //
 // ACROSS CHANGE KINDS that holds, and it is structural rather than lucky:
 // every CDC reader in the tree decodes the before- and after-images with one
@@ -139,11 +143,21 @@ func NewRouter(lanes int) *Router {
 // onto another, and float32 onto float64. Those streams are 100%
 // chunk-sourced today, so a run stays self-consistent — by stream
 // composition, which nothing enforces. What IS enforced is that the fold is
-// harmless: [WriteCanonicalKeyValue] aliases the sized integer kinds onto
-// the same tag their widened form gets, and
-// TestCanonicalKeyValue_SurvivesTheBackupRoundTrip binds the two packages so
-// a change to either side fails the build rather than splitting a row across
-// two lanes.
+// harmless: [WriteCanonicalKeyValue] encodes by VALUE rather than by Go
+// kind, and TestCanonicalKeyValue_SurvivesTheBackupRoundTrip binds the two
+// packages so a change to either side fails the build rather than
+// splitting a row across two lanes.
+//
+// And a single stream CAN mix provenances now: a backup chain's ADD COLUMN
+// fill (pipeline `incremental_add_column_fill.go`) is read with the COPY
+// reader and replayed in the same chunk as the window's CDC changes. On
+// MySQL that put two kinds in one unsigned key column — the text-protocol
+// copy read hands back int64 for an INT UNSIGNED, the binlog decoder
+// uint64 (the value contract, docs/value-types.md, permits both) — and the
+// old kind-tagged encoding ('i' vs 'u') routed the fill's UPDATE and the
+// window's INSERT of one row to different lanes, where the UPDATE could
+// commit first and match nothing (the 2026-09-24 value-fidelity review,
+// finding 2). The encoding is now value-canonical across those kinds.
 func (r *Router) LaneFor(qualified string, pkVals []any) int {
 	if r.lanes <= 1 {
 		return 0
@@ -158,69 +172,75 @@ func (r *Router) LaneFor(qualified string, pkVals []any) int {
 	return int(h.Sum64() % uint64(r.lanes))
 }
 
-// WriteCanonicalKeyValue writes a deterministic, type-tagged byte encoding
-// of a single primary-key value to h. The tag prefix ensures values of
-// different FAMILIES never collide on identical byte content (int64(49) vs
-// the string "1"). An unrecognised kind falls back to the fmt-style %v
-// rendering under a generic tag — deterministic for the scalar/byte-slice
-// kinds that reach a primary key.
+// WriteCanonicalKeyValue writes a deterministic byte encoding of a single
+// primary-key value to h, canonical by VALUE rather than by Go kind (see
+// [Router.LaneFor] for why aliasing is safe and splitting is not). One tag,
+// 's', covers every kind that is a sequence of bytes or renders to one
+// exactly: an integer of ANY width and signedness as its decimal text, a
+// string as its bytes, a []byte as its bytes. So each of the kinds a
+// reader may legitimately produce for one key column encodes alike:
 //
-// Within the signed- and unsigned-integer families the tag is deliberately
-// SHARED across widths, so int8/16/32/int and int64 render identically (and
-// likewise for the unsigned side). That is not a convenience: the backup
-// change-chunk round trip widens every sized integer to its 64-bit form
-// (`blobcodec.encodeValue`), so a replayed chunk hands the router int64
-// where the live reader handed it int32. Aliasing the widths makes that fold
-// invisible to the lane hash BY CONSTRUCTION; before 2026-08-07 int32 fell
-// to the `'?'` fallback and int64 to `'i'`, which would have split one row
-// across two lanes the day a stream mixed provenances. Held by
-// TestCanonicalKeyValue_SurvivesTheBackupRoundTrip.
+//   - int8/16/32/int/int64 and their unsigned twins — the backup
+//     change-chunk round trip widens every sized integer to its 64-bit form
+//     (`blobcodec.encodeValue`, the 2026-08-07 sweep), and the value
+//     contract lets an unsigned column arrive as int64 OR uint64 depending
+//     on the reader (text-protocol copy vs binlog; the 2026-09-24 sweep).
+//   - an integer and its decimal text in bytes — the MySQL decoder keeps an
+//     integer the driver returned as []byte as []byte (`decodeInteger`).
+//   - string and []byte — a reader that hands raw bytes for a text key
+//     where another hands a string.
 //
-// KNOWN RESIDUAL, stated rather than implied: the same fold normalises
-// time.Time to UTC and float32 to float64, and both of those land in the
-// `'?'` fallback where %v is not width-neutral for an offset-bearing
-// timestamp. A temporal or float PRIMARY KEY is the only way to reach it,
-// and the round-trip test grades those cells so the exposure is measured
-// rather than assumed.
+// nil and bool keep their own tags; they cannot be the same row as a
+// byte-string. An unrecognised kind falls back to the fmt-style %v
+// rendering under a generic tag — deterministic for the scalar kinds that
+// reach a primary key.
+//
+// Checked and NOT aliased, with the reason:
+//
+//   - Decimal: a string on every reader (docs/value-types.md), so it is
+//     covered by the string arm; two readers rendering one value with
+//     different scale ("1.5" vs "1.50") would still split. For MySQL the
+//     copy read and the binlog agree, bound on a real server by
+//     mysql's TestLaneKey_CopyReadAndBinlogRouteAlike, which reads every
+//     key family through both readers (it also measured the unsigned
+//     split this encoding closes: int64 from the copy read, uint64 from the
+//     binlog, for TINYINT..INT UNSIGNED). The Postgres copy-read vs
+//     pgoutput pair is NOT bound — Postgres has no unsigned integers, so
+//     the integer arm cannot split there, but its numeric and temporal
+//     renders are UNVERIFIED PREMISE across the two readers.
+//   - float32 vs float64, and time.Time offset vs UTC: KNOWN RESIDUAL, the
+//     backup fold normalises both and they land in the '?' fallback, where
+//     %v is not width-neutral for an offset-bearing timestamp. Only a float
+//     or temporal PRIMARY KEY reaches it; the round-trip test grades those
+//     cells so the exposure is measured rather than assumed.
 func WriteCanonicalKeyValue(h io.Writer, v any) {
 	switch t := v.(type) {
 	case nil:
 		_, _ = h.Write([]byte{'N'})
 	case int64:
-		_, _ = h.Write([]byte{'i'})
-		_, _ = h.Write([]byte(strconv.FormatInt(t, 10)))
+		writeByteString(h, strconv.FormatInt(t, 10))
 	case int:
-		_, _ = h.Write([]byte{'i'})
-		_, _ = h.Write([]byte(strconv.FormatInt(int64(t), 10)))
+		writeByteString(h, strconv.FormatInt(int64(t), 10))
 	case int32:
-		_, _ = h.Write([]byte{'i'})
-		_, _ = h.Write([]byte(strconv.FormatInt(int64(t), 10)))
+		writeByteString(h, strconv.FormatInt(int64(t), 10))
 	case int16:
-		_, _ = h.Write([]byte{'i'})
-		_, _ = h.Write([]byte(strconv.FormatInt(int64(t), 10)))
+		writeByteString(h, strconv.FormatInt(int64(t), 10))
 	case int8:
-		_, _ = h.Write([]byte{'i'})
-		_, _ = h.Write([]byte(strconv.FormatInt(int64(t), 10)))
+		writeByteString(h, strconv.FormatInt(int64(t), 10))
 	case uint64:
-		_, _ = h.Write([]byte{'u'})
-		_, _ = h.Write([]byte(strconv.FormatUint(t, 10)))
+		writeByteString(h, strconv.FormatUint(t, 10))
 	case uint:
-		_, _ = h.Write([]byte{'u'})
-		_, _ = h.Write([]byte(strconv.FormatUint(uint64(t), 10)))
+		writeByteString(h, strconv.FormatUint(uint64(t), 10))
 	case uint32:
-		_, _ = h.Write([]byte{'u'})
-		_, _ = h.Write([]byte(strconv.FormatUint(uint64(t), 10)))
+		writeByteString(h, strconv.FormatUint(uint64(t), 10))
 	case uint16:
-		_, _ = h.Write([]byte{'u'})
-		_, _ = h.Write([]byte(strconv.FormatUint(uint64(t), 10)))
+		writeByteString(h, strconv.FormatUint(uint64(t), 10))
 	case uint8:
-		_, _ = h.Write([]byte{'u'})
-		_, _ = h.Write([]byte(strconv.FormatUint(uint64(t), 10)))
+		writeByteString(h, strconv.FormatUint(uint64(t), 10))
 	case string:
-		_, _ = h.Write([]byte{'s'})
-		_, _ = h.Write([]byte(t))
+		writeByteString(h, t)
 	case []byte:
-		_, _ = h.Write([]byte{'b'})
+		_, _ = h.Write([]byte{'s'})
 		_, _ = h.Write(t)
 	case bool:
 		if t {
@@ -235,6 +255,12 @@ func WriteCanonicalKeyValue(h io.Writer, v any) {
 		_, _ = h.Write([]byte{'?'})
 		_, _ = fmt.Fprintf(h, "%v", t)
 	}
+}
+
+// writeByteString writes the byte-string arm of [WriteCanonicalKeyValue].
+func writeByteString(h io.Writer, s string) {
+	_, _ = h.Write([]byte{'s'})
+	_, _ = io.WriteString(h, s)
 }
 
 // PKValuesFromRow extracts the ordered primary-key values from a change for
