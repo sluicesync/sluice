@@ -8,7 +8,9 @@ identified by the F12 (online schema evolution) and F16 (backfill of
 already-shipped rows) Reddit-research findings (task #40). Sluice now optionally
 forwards `ALTER TABLE … ADD COLUMN` from source to target through the
 live CDC apply path, with an opt-in source-side backfill of rows that
-shipped to the target before the ALTER landed.
+shipped to the target before the ALTER landed. **Since v0.156.1 the backfill is
+ON by default** (opt out with `--no-backfill-added-column`); see the
+implementation note at the end.
 
 ADD COLUMN is the **only** shape v0.79.0 forwards on the live single-
 stream path. DROP COLUMN, ALTER COLUMN TYPE, RENAME COLUMN, CHECK
@@ -676,7 +678,7 @@ commands were written wrong. The verbatim refusal message quoted in
 
 ## Implementation note (2026-09-24) — §1c is now default-on; §1c/§2c's resume never existed
 
-**Pending landing; not yet in a release.** Three things this ADR decided or claimed changed together.
+**Shipped v0.156.1.** Three things this ADR decided or claimed changed together.
 
 **§1c's backfill is on by default** (opt out with `--no-backfill-added-column`; `--backfill-added-column` is a deprecated no-op; the Streamer field is `SuppressAddedColumnBackfill`, opt-out so every non-CLI construction gets it). §1c kept it opt-in on the argument that "the trivial-default case doesn't need backfill" because the target fills existing rows with the same DEFAULT the source did. That premise is false whenever the DEFAULT the forward carries is not the one the source filled its rows with: the forward reads the column's DEFAULT when the boundary reaches the intercept, which is after a `DROP DEFAULT` / `SET DEFAULT` later in the same window (Django emits `ADD COLUMN … DEFAULT 'v'` then `DROP DEFAULT` for every `AddField` with a default — measured: every pre-existing target row NULL, at exit 0), and a non-constant DEFAULT that survives to the probe is refused by §2a but one dropped after it is not. Only the rows themselves are evidence. The backfill now also runs on the Shape A fan-in (it was a silent no-op under `--inject-shard-column`); each shard's stream fills its own shard's rows, the applier's shard stamp being in the UPDATE's WHERE.
 

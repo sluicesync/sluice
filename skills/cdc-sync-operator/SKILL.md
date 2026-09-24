@@ -28,6 +28,8 @@ The user wants ongoing replication (not a one-shot migrate): a cold-start snapsh
    1. A human applies the same change to the target.
    2. Only then, start once with `--accept-unforwarded-schema-change=<that fingerprint>`.
    
+   **Variant: the message also contains `ADD-COLUMN-BACKFILL-INCOMPLETE`.** A forwarded `ADD COLUMN`'s backfill of the rows the target already held did not provably finish (a stop, crash or error interrupted it). The column already exists on the target, so step 1 is different: a human copies the added column's values FROM THE SOURCE for the rows that predate the `ADD COLUMN` (or re-copies with `--restart-from-scratch` on the acknowledged start). Then acknowledge the fingerprint as above.
+   
    The flag clears only that refusal and takes a fresh baseline, so passing it without step 1 accepts the source/target difference permanently. Never add it on your own, and never leave it on a standing command line. On PlanetScale, a resume from a purged binlog position auto-recovers with a fresh re-snapshot by default (see `planetscale-migration`; `--no-auto-resnapshot` makes that a loud decision instead).
 
 6. **Manage the PG replication slot** (recovery/diagnostics). `sluice slot list --source-driver postgres --source "$SLUICE_SOURCE"` shows every slot (name/active/wal_status/LSNs). `sluice slot drop <name>` removes an abandoned slot (`--if-exists`, `--force` if a consumer is attached, `--yes` is REQUIRED — `slot drop` never prompts; without it the command refuses with `SLUICE-E-CONFIRMATION-REQUIRED`) — dropping an in-use slot breaks that stream, so treat it as gated.

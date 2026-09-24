@@ -733,7 +733,7 @@ intercept when Shape A is engaged, exactly as ADR-0058 did.
 ### Neutral
 
 - `--forward-schema-add-column` deprecated, not removed (one cycle).
-- `--backfill-added-column` semantics unchanged.
+- `--backfill-added-column` semantics unchanged (at the time; since v0.156.1 the backfill is on by default and `--backfill-added-column` is a deprecated no-op — see ADR-0058's implementation note).
 
 ## Tests
 
