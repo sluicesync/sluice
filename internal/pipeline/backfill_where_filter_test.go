@@ -35,6 +35,7 @@ func (r *recordingRowFilterReader) ReadRows(context.Context, *ir.Table) (<-chan 
 	return nil, nil
 }
 func (r *recordingRowFilterReader) SetRowFilters(f map[string]string) { r.got = f }
+func (r *recordingRowFilterReader) Err() error                        { return nil }
 
 func TestBackfillReaderReceivesRowFilters(t *testing.T) {
 	rr := &recordingRowFilterReader{}
@@ -47,6 +48,35 @@ func TestBackfillReaderReceivesRowFilters(t *testing.T) {
 		t.Errorf("backfill reader received %v; want the stream's --where set. Without it the backfill "+
 			"paginates the ENTIRE table on a filtered sync, defeating the bounded-read-volume property the "+
 			"filter exists for (audit SL-11).", rr.got)
+	}
+}
+
+// rowFilterReaderEngine opens a recordingRowFilterReader as its row reader.
+type rowFilterReaderEngine struct {
+	ir.Engine
+	rr *recordingRowFilterReader
+}
+
+func (rowFilterReaderEngine) Name() string { return "mysql" }
+func (e rowFilterReaderEngine) OpenRowReader(context.Context, string) (ir.RowReader, error) {
+	return e.rr, nil
+}
+
+// TestAddedColumnBackfillReaderOpensWithRowFilters pins the call site, not
+// just the helper above: the reader the default-on added-column backfill
+// opens (lazily, at the first forwarded ADD COLUMN) carries the stream's
+// --where set.
+func TestAddedColumnBackfillReaderOpensWithRowFilters(t *testing.T) {
+	rr := &recordingRowFilterReader{}
+	s := &Streamer{
+		Source:     rowFilterReaderEngine{rr: rr},
+		RowFilters: map[string]string{"orders": "region = 'EU'"},
+	}
+	if _, err := s.openAddedColumnBackfillReader(context.Background()); err != nil {
+		t.Fatalf("openAddedColumnBackfillReader: %v", err)
+	}
+	if rr.got["orders"] != "region = 'EU'" {
+		t.Errorf("the added-column backfill's reader received %v; want the stream's --where set (audit SL-11)", rr.got)
 	}
 }
 

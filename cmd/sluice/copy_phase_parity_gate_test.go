@@ -133,6 +133,7 @@ var migrateSyncDivergenceReason = map[string]string{
 	"schema-changes":                reasonCDCSource,
 	"forward-schema-add-column":     reasonCDCSource,
 	"backfill-added-column":         reasonCDCSource,
+	"no-backfill-added-column":      "inapplicable: opts out of the backfill that follows a schema change FORWARDED mid-stream (ADR-0058 §1c); `migrate` copies one snapshot and forwards no schema changes",
 	"no-auto-resnapshot":            reasonCDCSource,
 	"restart-from-scratch":          reasonCDCSource,
 	"source-heartbeat-interval":     reasonCDCSource,

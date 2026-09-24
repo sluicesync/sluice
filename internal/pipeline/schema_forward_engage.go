@@ -19,8 +19,6 @@ import (
 	"log/slog"
 	"strings"
 
-	"sluicesync.dev/sluice/internal/pipeline/migcore"
-
 	"sluicesync.dev/sluice/internal/ir"
 )
 
@@ -89,9 +87,11 @@ func (s *Streamer) schemaDeltaAppliesToTarget() bool {
 }
 
 // engageAddColumnForward opens the target SchemaWriter the ADR-0058
-// intercept uses for ALTER TABLE … ADD COLUMN, and (when backfill is
-// requested) the source RowReader for the bounded backfill SELECT.
-// Stores both on the Streamer; [closeAddColumnForward] releases them.
+// intercept uses for ALTER TABLE … ADD COLUMN and the source SchemaReader
+// its DEFAULT probe and carry read through. Stores both on the Streamer;
+// [closeAddColumnForward] releases them. The added-column backfill's row
+// reader opens later, on the first forwarded ADD COLUMN
+// ([Streamer.addedColumnBackfill]).
 //
 // Refuse-loudly cases:
 //   - --forward-schema-add-column set AND --inject-shard-column set:
@@ -104,10 +104,6 @@ func (s *Streamer) schemaDeltaAppliesToTarget() bool {
 //     engine-name + recovery message. Every shipping engine
 //     implements it; this guard catches future engines added
 //     without the surface.
-//   - --backfill-added-column set AND source RowReader does not
-//     implement [ir.BatchedRowReader]: refuse with the same shape.
-//     Every shipping engine implements [ir.BatchedRowReader] via
-//     ADR-0018.
 //
 // Idempotent: re-running with already-set fields is a no-op (the
 // existing fields are reused; no double-close in cleanup).
@@ -118,6 +114,12 @@ func (s *Streamer) engageAddColumnForward(ctx context.Context) error {
 				"forwarding is now on by default and covers every unambiguous shape. "+
 				"Use --schema-changes=refuse to restore loud-refuse-on-DDL; the flag "+
 				"will be removed in a future release.")
+	}
+	if s.BackfillAddedColumn {
+		slog.InfoContext(ctx,
+			"--backfill-added-column is deprecated and has no effect: the added-column "+
+				"backfill is now on by default (pass --no-backfill-added-column to opt out); "+
+				"the flag will be removed in a future release.")
 	}
 	if !s.forwardSchemaEnabled() {
 		return nil
@@ -184,48 +186,16 @@ func (s *Streamer) engageAddColumnForward(ctx context.Context) error {
 		}
 		s.addColumnForwardSchemaReader = sr
 	}
-	if s.BackfillAddedColumn && s.addColumnForwardReader == nil {
-		rr, err := s.Source.OpenRowReader(ctx, s.SourceDSN)
-		if err != nil {
-			_ = closeIfErrIgnored(s.addColumnForwardWriter)
-			s.addColumnForwardWriter = nil
-			return fmt.Errorf("pipeline: engage add-column-forward backfill: open row reader: %w", err)
-		}
-		if _, ok := rr.(ir.BatchedRowReader); !ok {
-			_ = closeIfErrIgnored(rr)
-			_ = closeIfErrIgnored(s.addColumnForwardWriter)
-			s.addColumnForwardWriter = nil
-			return s.refuseSourceMissingBatchedReader()
-		}
-		// Carry --where into the backfill read (audit 2026-07-26 SL-11).
-		// The backfill intercept is wired DOWNSTREAM of the row-filter
-		// intercept, so its synthetic Updates never pass through route() — it
-		// paginated the ENTIRE table and emitted one Update per source row,
-		// out-of-scope ones included. They matched zero target rows and were
-		// swallowed at DEBUG, so nothing leaked, but the filter's whole point
-		// on a subset sync — bounded source read volume — was silently
-		// defeated.
-		//
-		// Filtering at the READER rather than reordering the intercepts is
-		// deliberate: the synthetic Update carries a PK-only Before, so
-		// routing it through route() would trip the image-completeness belt on
-		// every backfill row. Pushing the predicate into the source SELECT
-		// also means the out-of-scope rows are never read at all, which is the
-		// property the operator asked for.
-		if err := migcore.ApplyRowFilters(rr, s.RowFilters, s.Source.Name()); err != nil {
-			_ = closeIfErrIgnored(rr)
-			_ = closeIfErrIgnored(s.addColumnForwardWriter)
-			s.addColumnForwardWriter = nil
-			return fmt.Errorf("pipeline: engage add-column-forward backfill: %w", err)
-		}
-		s.addColumnForwardReader = rr
-	}
+	// The added-column backfill's source row reader is NOT opened here:
+	// it opens on the first forwarded ADD COLUMN ([lazyBackfillReader]).
 	return nil
 }
 
-// closeAddColumnForward releases the SchemaWriter + (optional)
-// RowReader + SchemaReader opened by [engageAddColumnForward].
-// Idempotent — safe to call on streams that never engaged.
+// closeAddColumnForward releases the SchemaWriter + SchemaReader opened by
+// [engageAddColumnForward] and the added-column backfill's source row
+// reader, if a forwarded ADD COLUMN opened one — on either the single-stream
+// or the Shape A path. Idempotent — safe to call on streams that never
+// engaged.
 func (s *Streamer) closeAddColumnForward() {
 	if s == nil {
 		return
@@ -234,10 +204,8 @@ func (s *Streamer) closeAddColumnForward() {
 		_ = closeIfErrIgnored(s.addColumnForwardWriter)
 		s.addColumnForwardWriter = nil
 	}
-	if s.addColumnForwardReader != nil {
-		_ = closeIfErrIgnored(s.addColumnForwardReader)
-		s.addColumnForwardReader = nil
-	}
+	s.addedColumnBackfillReader.Close()
+	s.addedColumnBackfillReader = nil
 	if s.addColumnForwardSchemaReader != nil {
 		_ = closeIfErrIgnored(s.addColumnForwardSchemaReader)
 		s.addColumnForwardSchemaReader = nil
@@ -413,26 +381,5 @@ func (s *Streamer) refuseEngineMissingAddColumnForward(missingSurface string) er
 			"--forward-schema-add-column to use the drained model "+
 			"(stop the stream, run schema migrate, resume)",
 		engineName, missingSurface,
-	)
-}
-
-// refuseSourceMissingBatchedReader is the corresponding refusal when
-// --backfill-added-column is set but the source engine's RowReader
-// doesn't implement [ir.BatchedRowReader] (the PK-cursor surface from
-// ADR-0018). Names the source engine + the recovery flag (drop the
-// backfill flag; forwarding still works, just without per-row
-// repopulation of already-shipped rows).
-func (s *Streamer) refuseSourceMissingBatchedReader() error {
-	engineName := ""
-	if s.Source != nil {
-		engineName = s.Source.Name()
-	}
-	return fmt.Errorf(
-		"pipeline: source engine %q does not implement BatchedRowReader "+
-			"(ADR-0018), required by --backfill-added-column. Recovery: "+
-			"drop --backfill-added-column; the target ALTER still forwards "+
-			"and existing target rows carry the column's DEFAULT (NULL if "+
-			"none)",
-		engineName,
 	)
 }

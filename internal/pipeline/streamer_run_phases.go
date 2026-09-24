@@ -1099,7 +1099,15 @@ func (s *Streamer) phaseWireInterceptChain(applyCtx context.Context, changes <-c
 	// through. One-sided normalization is the TRIAGE-#3 phantom-alter
 	// regression shape.
 	snapshotNormalizer, _ := s.Source.(ir.CDCSchemaSnapshotNormalizer)
-	filtered = interceptSchemaSnapshotsForCoordination(applyCtx, filtered, s.coldStartSeedSnapshots, s.boundaryRouter, snapshotNormalizer, &s.schemaSnapshotErr)
+	// The added-column backfill runs on the Shape A path too: each shard's
+	// stream fills ITS OWN shard's pre-existing consolidated rows from ITS
+	// own source once the lease holder's ALTER has landed (the applier
+	// stamps the shard discriminator into the UPDATE's WHERE).
+	var shapeABackfill *schemaForwardBackfill
+	if s.boundaryRouter != nil {
+		shapeABackfill = s.addedColumnBackfill(streamID, s.shapeSourceSchemaReader)
+	}
+	filtered = interceptSchemaSnapshotsForCoordination(applyCtx, filtered, s.coldStartSeedSnapshots, s.boundaryRouter, snapshotNormalizer, shapeABackfill, &s.schemaSnapshotErr)
 	// ADR-0058: when --forward-schema-add-column is set AND Shape A is
 	// NOT engaged, wrap the changes channel with the
 	// [interceptAddColumnForward] intercept. The intercept observes
@@ -1128,15 +1136,9 @@ func (s *Streamer) phaseWireInterceptChain(applyCtx context.Context, changes <-c
 				deps.defaultProber = newSourceDefaultProber(s.addColumnForwardSchemaReader)
 				deps.defaultCarrier = newSourceDefaultCarrier(s.addColumnForwardSchemaReader)
 			}
-			if s.BackfillAddedColumn {
-				if br, ok := s.addColumnForwardReader.(ir.BatchedRowReader); ok {
-					deps.backfill = &schemaForwardBackfill{
-						reader:    br,
-						streamID:  streamID,
-						batchSize: migcore.DefaultBulkBatchSize,
-					}
-				}
-			}
+			// Default-on (ADR-0058 §1c): nil only under
+			// --no-backfill-added-column.
+			deps.backfill = s.addedColumnBackfill(streamID, s.addColumnForwardSchemaReader)
 			filtered = interceptAddColumnForward(applyCtx, filtered, s.coldStartSeedSnapshots, deps, &s.schemaSnapshotErr)
 		}
 	}

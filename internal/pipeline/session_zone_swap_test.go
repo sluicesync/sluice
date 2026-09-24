@@ -159,7 +159,7 @@ func TestIntercept_SessionZoneSwapAtFirstBoundary_NeverReachesAlterColumnType(t 
 		var errStore atomic.Pointer[error]
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		out := interceptSchemaSnapshotsForCoordination(ctx, in, []ir.SchemaSnapshot{{Table: seed.Name, IR: seed}}, router, nil, &errStore)
+		out := interceptSchemaSnapshotsForCoordination(ctx, in, []ir.SchemaSnapshot{{Table: seed.Name, IR: seed}}, router, nil, nil, &errStore)
 		_ = drainChanges(t, out, 2*time.Second)
 		if e := errStore.Load(); e != nil {
 			return applier, *e

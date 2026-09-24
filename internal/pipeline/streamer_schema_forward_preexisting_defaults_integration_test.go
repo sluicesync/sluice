@@ -219,6 +219,10 @@ type fdLane struct {
 	// Every shape still reaches the router's per-column carry, retarget and
 	// emit. A oneAlter lane cannot carry a halt with a prelude.
 	oneAlter bool
+
+	// suppressBackfill runs the lane with --no-backfill-added-column, so
+	// the pre-existing rows hold what the forwarded ALTER alone filled.
+	suppressBackfill bool
 }
 
 // fdDesignedRefusal is the ADR-0058 §2a volatile-DEFAULT refusal.
@@ -403,6 +407,8 @@ func fdStartStream(t *testing.T, lane fdLane, src, tgt, streamID string) *fdStre
 		SlotName:  strings.ReplaceAll(streamID, "-", "_"),
 
 		InjectShardColumn: lane.shardColumn,
+
+		SuppressAddedColumnBackfill: lane.suppressBackfill,
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &fdStream{lane: lane, src: src, tgt: tgt, runErr: make(chan error, 1), cancel: cancel}
@@ -1104,6 +1110,9 @@ func TestStreamer_AddColumnForward_PreexistingRowDefaults_ShapeAPostgresToPostgr
 		shardColumn: ShardColumnSpec{Name: "source_shard_id", Value: "shard_a"},
 		oneAlter:    true,
 		knownWrong:  map[string]fdKnownWrong{},
+		// d_numfree was a halt cell here ("numeric precision 0") until GC-36
+		// item 3 fixed the unconstrained-numeric projection, which this lane
+		// shares; it is a graded matrix cell now.
 		halts: []fdHalt{
 			fdLoud(t, all, "e_mood", `invalid input value for enum w_e_mood_enum: "ok"`,
 				"PG enum column forwarded as a synthesised enum without the source labels"),

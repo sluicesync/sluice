@@ -15,10 +15,11 @@ package pipeline
 // per-shape dispatch (applyShapeDelta) the boundary router uses.
 //
 // Forwarded shapes (every unambiguous one):
-//   - ADD COLUMN — via [ir.SchemaDeltaApplier.AlterAddColumn], with an
-//     optional source-side bounded backfill of already-shipped rows
-//     when --backfill-added-column is set, and a computed-DEFAULT
-//     volatility refusal (ADR-0058 §2a).
+//   - ADD COLUMN — via [ir.SchemaDeltaApplier.AlterAddColumn], followed
+//     by the default-on source-side backfill of the rows the target
+//     already held (schema_forward_backfill.go; opt out with
+//     --no-backfill-added-column), and a computed-DEFAULT volatility
+//     refusal (ADR-0058 §2a).
 //   - DROP COLUMN, ALTER COLUMN TYPE / NULLABILITY, CREATE / DROP
 //     INDEX, ADD / DROP / MODIFY CHECK — via applyShapeForward, after
 //     retargeting the post IR to the target dialect + scrubbing its
@@ -45,7 +46,6 @@ package pipeline
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"sync/atomic"
@@ -77,9 +77,10 @@ type schemaForwardDeps struct {
 	// translate.RetargetForEngine call.
 	targetEngineName string
 
-	// backfill, when non-nil, enables source-side backfill of already-
-	// shipped target rows after the ALTER lands. Built by the Streamer
-	// when --backfill-added-column is set; nil otherwise.
+	// backfill, when non-nil, fills the added column on the rows the
+	// target already held from the source's own values after the ALTER
+	// lands (ADR-0058 §1c). Built by [Streamer.addedColumnBackfill] —
+	// non-nil unless the operator passed --no-backfill-added-column.
 	backfill *schemaForwardBackfill
 
 	// defaultProber, when non-nil, returns the source's canonical
@@ -149,16 +150,28 @@ func (d schemaForwardDeps) hint(tableName string) string {
 // COLUMN forward, not once per row).
 type defaultProberFunc func(ctx context.Context, schema, table, column string) (ir.DefaultValue, error)
 
-// schemaForwardBackfill bundles the source-read + applier-write side
-// of the optional backfill loop. Held by [schemaForwardDeps] when
-// --backfill-added-column is set.
+// schemaForwardBackfill bundles the source-read side of the added-column
+// backfill (ADR-0058 §1c). Held by [schemaForwardDeps] — and by the Shape A
+// boundary intercept — unless the operator opted out with
+// --no-backfill-added-column; built by [Streamer.addedColumnBackfill].
 type schemaForwardBackfill struct {
-	// reader is the source-side row reader used for the bounded
-	// SELECT pk, new_col iteration. Must implement
-	// [ir.BatchedRowReader]; non-implementers cause the constructor
-	// to refuse loudly (every shipping engine implements it via
-	// ADR-0018, but a future engine or a test stub might not).
-	reader ir.BatchedRowReader
+	// reader returns the source-side row reader the bounded PK-cursor
+	// iteration pages through, opening it on first use
+	// ([lazyBackfillReader]). An error — including a source reader
+	// that does not implement [ir.BatchedRowReader] — refuses the
+	// boundary loudly.
+	reader func(ctx context.Context) (ir.BatchedRowReader, error)
+
+	// primaryKey, when non-nil, resolves the table's primary key from the
+	// source catalog for a boundary whose projection carries none (the
+	// VStream FIELD event; [sourcePrimaryKeyResolver]). nil in unit tests,
+	// which put the key on the snapshot IR.
+	primaryKey func(ctx context.Context, schema, table string) (*ir.Index, error)
+
+	// ledger records every backfill a forwarded boundary owes until the
+	// attempt that ran it can prove it reached the target
+	// ([addedColumnBackfillLedger]). nil (unit tests) records nothing.
+	ledger *addedColumnBackfillLedger
 
 	// streamID is the per-stream identifier used for log
 	// correlation.
@@ -249,6 +262,9 @@ func interceptAddColumnForward(
 	}
 	go func() {
 		defer close(out)
+		// The first positioned change after a backfill is its durability
+		// watermark (schema_forward_backfill_ledger.go).
+		var watermark backfillWatermark
 		for {
 			select {
 			case c, ok := <-in:
@@ -257,6 +273,7 @@ func interceptAddColumnForward(
 				}
 				snap, isSnap := c.(ir.SchemaSnapshot)
 				if !isSnap {
+					watermark.observe(c)
 					if !forwardChange(ctx, out, c) {
 						return
 					}
@@ -294,7 +311,7 @@ func interceptAddColumnForward(
 					}
 					continue
 				}
-				if err := routeForwardBoundary(ctx, deps, key, pre, post, snap, preIsSeed, out); err != nil {
+				if err := routeForwardBoundary(ctx, deps, key, pre, post, snap, preIsSeed); err != nil {
 					slog.ErrorContext(
 						ctx, "forward-add-column intercept: refuse",
 						"table", key,
@@ -310,12 +327,34 @@ func interceptAddColumnForward(
 					errStore.Store(&wrapped)
 					return
 				}
+				// An ADD COLUMN owes the rows the target already held a
+				// backfill from the source; it is on the ledger from here.
+				owed, err := planBoundaryBackfill(deps.backfill, key, pre, post, snap, deps.hint)
+				if err != nil {
+					wrapped := fmt.Errorf("pipeline: forward schema add-column: %w", err)
+					errStore.Store(&wrapped)
+					return
+				}
 				// Forward the snapshot to the applier so the
 				// ADR-0049 schema-history row still records the
 				// version on the same tx as the position write.
 				if !forwardChange(ctx, out, c) {
 					return
 				}
+				// Then run the backfill — after the snapshot, so the
+				// applier has dropped its pre-ALTER view of the table,
+				// and ahead of every change that follows.
+				if err := owed.run(ctx, out); err != nil {
+					slog.ErrorContext(
+						ctx, "forward-add-column intercept: added-column backfill failed",
+						"table", key,
+						"error", err,
+					)
+					wrapped := fmt.Errorf("pipeline: forward schema add-column: %w", err)
+					errStore.Store(&wrapped)
+					return
+				}
+				watermark.await(owed)
 			case <-ctx.Done():
 				return
 			}
@@ -353,7 +392,6 @@ func routeForwardBoundary(
 	pre, post *ir.Table,
 	snap ir.SchemaSnapshot,
 	preIsSeed bool,
-	out chan<- ir.Change,
 ) error {
 	shape, err := ClassifyShape(pre, post)
 	if err != nil {
@@ -411,7 +449,7 @@ func routeForwardBoundary(
 		// ADD COLUMN keeps its dedicated path: computed-DEFAULT
 		// volatility refusal (ADR-0058 §2a) + optional source-side
 		// backfill of already-shipped rows.
-		return applyAddColumnForward(ctx, deps, tableName, snap, shape, out)
+		return applyAddColumnForward(ctx, deps, tableName, snap, shape)
 	case ShapeKindRenameColumn:
 		// ADR-0091 §3 + F7b — a rename and a drop+add-of-same-type are
 		// indistinguishable from the IR delta ALONE, and guessing wrong
@@ -785,16 +823,17 @@ func resolveChecksByName(src []*ir.CheckConstraint, byName map[string]*ir.CheckC
 //     rewrite — same path the broker + chain-restore use).
 //  3. Call deps.applier.AlterAddColumn(ctx, retargetedTable,
 //     retargetedAdded). Idempotent via the engine's IF NOT EXISTS.
-//  4. If deps.backfill is non-nil, emit synthetic [ir.Update] events
-//     for already-shipped rows so the new column is populated from
-//     source values rather than just the column's DEFAULT.
+//
+// The added-column backfill is NOT run here: it follows the boundary's
+// snapshot downstream ([boundaryBackfill]), so the applier has
+// refreshed its view of the table before the first backfilled value
+// reaches it.
 func applyAddColumnForward(
 	ctx context.Context,
 	deps schemaForwardDeps,
 	tableName string,
 	snap ir.SchemaSnapshot,
 	shape Shape,
-	out chan<- ir.Change,
 ) error {
 	if err := refuseComputedDefaults(ctx, deps, tableName, snap, shape.AddedColumns); err != nil {
 		return err
@@ -822,17 +861,39 @@ func applyAddColumnForward(
 		"table", tableName,
 		"added_columns", columnNames(retargetedAdded),
 	)
-	if deps.backfill == nil {
+	return nil
+}
+
+// backfillAddedColumns runs the added-column backfill for one forwarded
+// ADD COLUMN boundary — or, when the operator opted out (bf nil), says what
+// that leaves behind. Reached through [boundaryBackfill.run].
+//
+// The backfill reads with the SOURCE IR (snap.IR), not the retargeted IR —
+// the BatchedRowReader is engine-specific (the PG reader expects PG types
+// in its query). The applier consumes the Updates like any CDC event, so
+// cross-engine value translation happens in its existing per-event path.
+func backfillAddedColumns(
+	ctx context.Context,
+	bf *schemaForwardBackfill,
+	tableName string,
+	snap ir.SchemaSnapshot,
+	added []*ir.Column,
+	out chan<- ir.Change,
+) error {
+	if bf == nil {
+		slog.WarnContext(
+			ctx,
+			"forward-add-column: backfill suppressed (--no-backfill-added-column) — the rows the target already "+
+				"held keep the target's fill for the added column (the DEFAULT the forward carried, NULL if none), "+
+				"not the values the source holds for them; a DEFAULT dropped or changed on the source after the "+
+				"ADD COLUMN, or a non-constant one, leaves them different. Rows changed after this point are unaffected",
+			"table", tableName,
+			"added_columns", columnNames(added),
+		)
 		return nil
 	}
-	// Backfill uses the SOURCE IR (snap.IR), not the retargeted IR —
-	// the BatchedRowReader is engine-specific (PG reader expects PG
-	// types in its query). The applier consumes Update events with
-	// the same source-IR column shape; cross-engine value translation
-	// happens inside the applier's existing per-event dispatch path.
-	if err := runBackfillForAddedColumn(ctx, deps.backfill, snap, shape.AddedColumns, out); err != nil {
-		return fmt.Errorf("backfill on %q: %w. %s",
-			tableName, err, forwardRecoveryHint(tableName))
+	if err := runBackfillForAddedColumn(ctx, bf, snap, added, out); err != nil {
+		return fmt.Errorf("backfill on %q: %w", tableName, err)
 	}
 	return nil
 }
@@ -956,7 +1017,7 @@ func refuseComputedDefaults(
 					"where the source holds the default value. Rows changed after this point are unaffected. "+
 					"Remedy: apply the default on the target and backfill the existing rows "+
 					"(ALTER TABLE ... ALTER COLUMN ... SET DEFAULT, then UPDATE ... WHERE <col> IS NULL), "+
-					"or re-run the forward with --backfill-added-column so sluice populates them from source values",
+					"or leave the added-column backfill on (it is unless --no-backfill-added-column) so sluice populates them from source values",
 				"table", tableName,
 				"column", c.Name,
 				"source_default", defaultExpressionText(def),
@@ -1035,142 +1096,6 @@ func retargetAddedColumns(post *ir.Table, added []*ir.Column, sourceEngine, targ
 		}
 	}
 	return retargetedTable, retargetedAdded
-}
-
-// runBackfillForAddedColumn drives the bounded source-side SELECT
-// loop for the just-ALTERed table. Emits synthetic [ir.Update] events
-// to out, one per source row, carrying PK columns in Before and the
-// added column values in After.
-//
-// Idempotency: the synthesized Updates carry the SchemaSnapshot's
-// Position; a crash-and-resume replays from the SchemaSnapshot, the
-// ALTER is idempotent via IF NOT EXISTS, and the Updates re-issue
-// against the same PK range. The applier's UPDATE path is
-// idempotent (re-applying SET new_col=$1 WHERE pk=$2 is a no-op when
-// the value already matches).
-//
-// Refuse-loudly cases:
-//   - Source ReadRowsBatch error → caller wraps + persists for retry.
-//   - Out-channel closed (ctx cancelled) → forwardChange returns
-//     false; the function returns the ctx error.
-func runBackfillForAddedColumn(
-	ctx context.Context,
-	bf *schemaForwardBackfill,
-	snap ir.SchemaSnapshot,
-	addedCols []*ir.Column,
-	out chan<- ir.Change,
-) error {
-	if bf == nil || bf.reader == nil {
-		return errors.New("backfill: missing reader")
-	}
-	if snap.IR == nil {
-		return errors.New("backfill: snapshot has nil IR")
-	}
-	table := snap.IR
-	if table.PrimaryKey == nil || len(table.PrimaryKey.Columns) == 0 {
-		// No PK — can't safely iterate. Refuse loudly. Tables
-		// without a PK are also rejected by the bulk-copy
-		// orchestrator (ADR-0018); same recovery hint applies.
-		return fmt.Errorf(
-			"backfill: table %q has no primary key — cursor-paginated "+
-				"backfill is unsafe without a PK",
-			table.Name,
-		)
-	}
-	batchSize := bf.batchSize
-	if batchSize <= 0 {
-		batchSize = migcore.DefaultBulkBatchSize
-	}
-	addedNames := make(map[string]struct{}, len(addedCols))
-	for _, c := range addedCols {
-		if c != nil {
-			addedNames[c.Name] = struct{}{}
-		}
-	}
-	pkColNames := make([]string, len(table.PrimaryKey.Columns))
-	for i, c := range table.PrimaryKey.Columns {
-		pkColNames[i] = c.Column
-	}
-	var cursor []any
-	total := 0
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-		rows, err := bf.reader.ReadRowsBatch(ctx, table, cursor, batchSize)
-		if err != nil {
-			return fmt.Errorf("read rows batch: %w", err)
-		}
-		batchCount := 0
-		var lastRow ir.Row
-		for r := range rows {
-			update := synthesizeBackfillUpdate(snap, r, pkColNames, addedNames)
-			if !forwardChange(ctx, out, update) {
-				return ctx.Err()
-			}
-			lastRow = r
-			batchCount++
-		}
-		if batchCount == 0 {
-			break
-		}
-		total += batchCount
-		// Advance the cursor to the last row's PK so the next batch
-		// is strictly greater. Matches the bulk-copy resume cursor
-		// (ADR-0018).
-		nextCursor := make([]any, len(pkColNames))
-		for i, name := range pkColNames {
-			nextCursor[i] = lastRow[name]
-		}
-		cursor = nextCursor
-		if batchCount < batchSize {
-			// Final batch — fewer rows than the limit means we've
-			// reached the end of the table.
-			break
-		}
-	}
-	slog.InfoContext(
-		ctx, "forward-add-column: backfill complete",
-		"table", table.Name,
-		"stream_id", bf.streamID,
-		"rows_backfilled", total,
-		"added_columns", columnNames(addedCols),
-	)
-	return nil
-}
-
-// synthesizeBackfillUpdate constructs an [ir.Update] from a source
-// row for the backfill loop. Before carries the PK columns (the
-// UPDATE's WHERE predicate); After carries the added columns (the
-// UPDATE's SET clause). The applier's existing buildUpdateSQL
-// consumes this shape directly — see ADR-0058 §1c for the rationale.
-//
-// Position is set to the SchemaSnapshot's Position so the applier's
-// position-write stays anchored at the ALTER boundary; resume after
-// a crash replays the same UPDATEs against the same PK range.
-func synthesizeBackfillUpdate(
-	snap ir.SchemaSnapshot,
-	row ir.Row,
-	pkColNames []string,
-	addedNames map[string]struct{},
-) ir.Update {
-	before := make(ir.Row, len(pkColNames))
-	for _, name := range pkColNames {
-		before[name] = row[name]
-	}
-	after := make(ir.Row, len(addedNames))
-	for name := range addedNames {
-		after[name] = row[name]
-	}
-	return ir.Update{
-		Position: snap.Position,
-		Schema:   snap.Schema,
-		Table:    snap.Table,
-		Before:   before,
-		After:    after,
-	}
 }
 
 // columnNames returns the Name slice for cols. For log lines.

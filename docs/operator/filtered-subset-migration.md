@@ -130,7 +130,7 @@ An `UPDATE` that moves a row *into* scope becomes a target `INSERT` (the target 
 
   A **MariaDB** source's native `inet4` / `inet6` columns deliver the address bare and cannot hold a network at all, so write `ip = '10.0.0.1'`, and a literal naming a network is refused outright — no stored value could ever equal it. A source engine that has not declared its rendering refuses network comparisons rather than guessing, since guessing wrong is silent in exactly the way described above.
 
-- **`--backfill-added-column` respects `--where`.** The backfill that fills a newly-added column reads only the rows the filter admits, so a filtered sync keeps its bounded source-read volume when a schema change lands.
+- **The added-column backfill respects `--where`.** The backfill that fills a newly-added column (on by default; `--no-backfill-added-column` opts out) reads only the rows the filter admits, so a filtered sync keeps its bounded source-read volume when a schema change lands.
 
 **`--where-strict-collation` (opt-out).** A compliance operator who wants the strict byte-exact guarantee can pass `--where-strict-collation` on `sync start`: it disables the ci/ai faithful-comparator path so a case/accent-insensitive column's `=` is **refused** rather than reproduced. Byte-exact collations (`*_bin`, deterministic named, the default) are unaffected. The default (flag omitted) is the faithful behavior above.
 

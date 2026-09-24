@@ -103,7 +103,7 @@ var syncStartFleetExclusions = map[string]string{
 	"reap-stale-backends":               "backend-reaping authorization; not yet curated into the fleet subset",
 	"enable-pg-extension":               "extension passthrough opt-in; not yet curated into the fleet subset",
 	"forward-schema-add-column":         "DEPRECATED alias of schema-changes; must never gain a spec key",
-	"backfill-added-column":             "ADD-COLUMN backfill opt-in (ADR-0058 §1c); not yet curated into the fleet subset",
+	"backfill-added-column":             "deprecated no-op: the added-column backfill is default-on; its opt-out, no-backfill-added-column, IS a fleet key",
 	"shard-coordination-lease-duration": "Shape-A lease tuning (ADR-0054); not yet curated into the fleet subset",
 	"shard-coordination-renew-deadline": "see shard-coordination-lease-duration",
 	"shard-coordination-retry-period":   "see shard-coordination-lease-duration",

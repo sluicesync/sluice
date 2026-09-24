@@ -604,6 +604,7 @@ sync start --max-target-connections
 sync start --metrics-listen
 sync start --no-auto-resnapshot
 sync start --no-auto-tune
+sync start --no-backfill-added-column
 sync start --no-coordinate-live-ddl
 sync start --no-float-exact-reread
 sync start --no-intra-table-stealing

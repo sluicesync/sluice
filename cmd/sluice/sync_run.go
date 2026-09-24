@@ -184,6 +184,12 @@ type SyncSpec struct {
 	PollInterval  time.Duration `koanf:"poll-interval"`
 	SchemaChanges string        `koanf:"schema-changes"`
 
+	// NoBackfillAddedColumn is `--no-backfill-added-column`: opt out of the
+	// default-on source-side backfill of a forwarded ADD COLUMN (ADR-0058
+	// §1c). Omitted ⇒ false ⇒ backfill on, the same default `sync start`
+	// has.
+	NoBackfillAddedColumn bool `koanf:"no-backfill-added-column"`
+
 	// Notify sinks. The webhook/slack URLs and the SMTP password are
 	// credentials; supply them via the SLUICE_NOTIFY_* env vars, not in
 	// the committed YAML (same env-only contract as `sync start`).
@@ -1040,6 +1046,8 @@ func buildStreamerFromSpec(ctx context.Context, spec *SyncSpec, g *Globals) (*pi
 		HeartbeatInterval: orDefault(spec.HeartbeatInterval, defaultHeartbeatInterval),
 		PollInterval:      spec.PollInterval,
 		SchemaChanges:     firstNonEmpty(spec.SchemaChanges, defaultSchemaChanges),
+
+		SuppressAddedColumnBackfill: spec.NoBackfillAddedColumn,
 
 		NotifyWebhookURL:      spec.NotifyWebhook,
 		NotifySlackWebhookURL: spec.NotifySlack,

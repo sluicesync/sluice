@@ -382,6 +382,40 @@ func TestMySQLPositionOrderer_VStream_ShapeMismatch(t *testing.T) {
 	}
 }
 
+// TestMySQLPositionOrderer_MariaDBGTID pins the MariaDB arm: a MariaDB GTID
+// set ("domain-server-seq" per domain) is ordered per domain by sequence.
+// Before it existed every MariaDB GTID position failed to parse under the
+// MySQL-flavor parser, so nothing could order two of them.
+func TestMySQLPositionOrderer_MariaDBGTID(t *testing.T) {
+	e := Engine{Flavor: FlavorMariaDB}
+	cases := []struct {
+		name      string
+		p, anchor string
+		want      bool
+	}{
+		{"later sequence is at-or-after", "0-1-9", "0-1-5", true},
+		{"equal is at-or-after (reflexive)", "0-1-5", "0-1-5", true},
+		{"earlier sequence is not", "0-1-4", "0-1-5", false},
+		{"a domain the anchor names and p lacks is not", "0-1-9", "0-1-5,1-2-3", false},
+		{"multi-domain superset", "0-1-9,1-2-4", "0-1-5,1-2-3", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := e.PositionAtOrAfter(gtidPos(t, c.p), gtidPos(t, c.anchor))
+			if err != nil {
+				t.Fatalf("unexpected err: %v", err)
+			}
+			if got != c.want {
+				t.Errorf("PositionAtOrAfter(p=%q, anchor=%q) = %v; want %v", c.p, c.anchor, got, c.want)
+			}
+		})
+	}
+	// The vanilla flavor still refuses the MariaDB shape loudly.
+	if _, err := (Engine{Flavor: FlavorVanilla}).PositionAtOrAfter(gtidPos(t, "0-1-9"), gtidPos(t, "0-1-5")); err == nil {
+		t.Error("vanilla flavor ordered a MariaDB GTID set; want the MySQL-flavor parse refusal")
+	}
+}
+
 // TestStripGTIDFlavor pins the MySQL56/ prefix handling in isolation:
 // go-mysql's ParseMysqlGTIDSet rejects the prefixed form, so the orderer
 // MUST strip it. Case-insensitive; no-op for already-bare sets.

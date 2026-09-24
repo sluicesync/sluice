@@ -94,6 +94,9 @@ func (e Engine) PositionAtOrAfter(p, anchor ir.Position) (bool, error) {
 
 	switch pp.Mode {
 	case positionModeGTID:
+		if e.Flavor == FlavorMariaDB {
+			return mariaDBGTIDAtOrAfter(pp.GTIDSet, ap.GTIDSet)
+		}
 		return gtidAtOrAfter(pp.GTIDSet, ap.GTIDSet)
 	case positionModeFilePos:
 		// Cross-instance binlog filenames are not comparable (the
@@ -157,6 +160,28 @@ func splitBinlogName(name string) (base string, seq uint64, ok bool) {
 		return "", 0, false
 	}
 	return name[:i], seq, true
+}
+
+// mariaDBGTIDAtOrAfter is [gtidAtOrAfter] for a MariaDB source, whose GTID
+// state is one (domain, server_id, seq) per replication domain
+// ("0-1-5,1-2-9") that the MySQL-flavor parser rejects outright — so every
+// MariaDB GTID position failed to order before this existed, which the
+// added-column backfill ledger (pipeline) measured as a refused stop on
+// every MariaDB lane. p is at or after anchor when, for every domain the
+// anchor names, p names it too with a sequence at least as high —
+// go-mysql's MariadbGTIDSet.Contain. A stream reads one lineage (sluice
+// binds a MariaDB position to it, cdc_position.go), so per-domain sequence
+// order is the order of that lineage.
+func mariaDBGTIDAtOrAfter(p, anchor string) (bool, error) {
+	pSet, err := gomysql.ParseMariadbGTIDSet(p)
+	if err != nil {
+		return false, fmt.Errorf("mysql: position-orderer: parse p mariadb gtid set %q: %w", p, err)
+	}
+	aSet, err := gomysql.ParseMariadbGTIDSet(anchor)
+	if err != nil {
+		return false, fmt.Errorf("mysql: position-orderer: parse anchor mariadb gtid set %q: %w", anchor, err)
+	}
+	return pSet.Contain(aSet), nil
 }
 
 // gtidAtOrAfter reports whether GTID set p is at or after anchor —

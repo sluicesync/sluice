@@ -90,7 +90,7 @@ func TestIntercept_ShapeA_LensAppliedToPostSide(t *testing.T) {
 	var errStore atomic.Pointer[error]
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	out := interceptSchemaSnapshotsForCoordination(ctx, in, seed, router, nullableStrippingLens{}, &errStore)
+	out := interceptSchemaSnapshotsForCoordination(ctx, in, seed, router, nullableStrippingLens{}, nil, &errStore)
 	got := drainChanges(t, out, 2*time.Second)
 	if e := errStore.Load(); e != nil {
 		t.Fatalf("lens-covered delta must classify as no-op, not refuse: %v", *e)
@@ -140,7 +140,7 @@ func TestIntercept_ShapeA_NoLens_PhantomAlterStillFires(t *testing.T) {
 	var errStore atomic.Pointer[error]
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	out := interceptSchemaSnapshotsForCoordination(ctx, in, seed, router, nil, &errStore)
+	out := interceptSchemaSnapshotsForCoordination(ctx, in, seed, router, nil, nil, &errStore)
 	drainChanges(t, out, 2*time.Second)
 	calls := applier.callNames()
 	if len(calls) != 1 || calls[0] != "AlterColumnNullability" {

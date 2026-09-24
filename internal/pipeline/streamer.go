@@ -1214,16 +1214,32 @@ type Streamer struct {
 	// deprecation cycle so existing configs/flags keep working.
 	ForwardSchemaAddColumn bool
 
-	// BackfillAddedColumn enables source-side bounded backfill of
-	// already-shipped target rows after a forwarded ADD COLUMN
-	// lands. Only consulted when [ForwardSchemaAddColumn] is true.
-	// ADR-0058 §1c.
-	//
-	// When set, the intercept opens a [ir.BatchedRowReader] against
-	// the source and emits synthetic [ir.Update] events for every
-	// row already on the target, populating the new column with the
-	// source's per-row value rather than the column's DEFAULT.
+	// BackfillAddedColumn is the DEPRECATED ADR-0058 §1c opt-in. The
+	// backfill it enabled is now the default (see
+	// [SuppressAddedColumnBackfill]); setting it logs a one-time notice
+	// at engage time and changes nothing. Kept for one deprecation cycle
+	// so existing `--backfill-added-column` scripts keep working.
 	BackfillAddedColumn bool
+
+	// SuppressAddedColumnBackfill opts OUT of the source-side backfill
+	// that runs after every forwarded ADD COLUMN (ADR-0058 §1c, default-on
+	// since the Django AddField finding). The backfill reads the new
+	// column's values from the source for the rows the target already
+	// held and writes them as synthetic [ir.Update] events, because
+	// nothing else ever does: a target ADD COLUMN fills its pre-existing
+	// rows with the DEFAULT the forward carried — the source's default at
+	// the moment the boundary was observed, not the one the source filled
+	// its own rows with. `ADD COLUMN c … DEFAULT 'v'` followed by
+	// `ALTER COLUMN c DROP DEFAULT` (what Django emits for every AddField
+	// with a default) left every pre-existing target row NULL where the
+	// source holds 'v', at exit 0.
+	//
+	// Named for the opt-out so the zero value is the safe one: every
+	// construction that is not the CLI — fleet specs, tests, the broker —
+	// gets the backfill (the v0.99.51 trap). The CLI sets it from
+	// `--no-backfill-added-column`. With it set, pre-existing target rows
+	// keep the target's fill and a WARN says so for every forwarded column.
+	SuppressAddedColumnBackfill bool
 
 	// ApplyRetryAttempts caps the number of consecutive retriable
 	// apply failures the streamer will absorb before giving up and
@@ -1456,11 +1472,21 @@ type Streamer struct {
 	// [closeAddColumnForward] alongside other streamer resources.
 	addColumnForwardWriter ir.SchemaWriter
 
-	// addColumnForwardReader is the source-side row reader used by
-	// the ADR-0058 backfill loop (only opened when
-	// [BackfillAddedColumn] is true). Owned by the Streamer's Run
-	// lifetime.
-	addColumnForwardReader ir.RowReader
+	// addedColumnBackfillReader is the source-side row reader the
+	// ADR-0058 §1c backfill reads through, shared by the single-stream
+	// forwarder and the Shape A boundary intercept (exactly one of the two
+	// is active per Run). It opens on the FIRST forwarded ADD COLUMN, not
+	// at engage ([lazyBackfillReader]): most streams never forward one,
+	// and a source whose row reader cannot paginate must not be refused at
+	// start for a backfill it will never run. Owned by the Streamer's Run
+	// lifetime; closed by [closeAddColumnForward].
+	addedColumnBackfillReader *lazyBackfillReader
+
+	// addedColumnBackfills records every added-column backfill a forwarded
+	// boundary owes until the attempt that ran it proves it reached the
+	// target; the rest end the attempt as ADD-COLUMN-BACKFILL-INCOMPLETE
+	// ([Streamer.settleAddedColumnBackfills]). Shared across attempts.
+	addedColumnBackfills addedColumnBackfillLedger
 
 	// addColumnForwardSchemaReader is the source-side schema reader
 	// used by the ADR-0058 §2a volatility probe (Bug 90 closure,
@@ -1826,6 +1852,11 @@ func (s *Streamer) runOnce(ctx context.Context) (err error) {
 	// unforwarded_refusal_persist.go). The error itself is returned
 	// unchanged.
 	defer func() { s.recordUnforwardedRefusal(ctx, applier, streamID, err) }()
+	// An added-column backfill this attempt owes and cannot prove reached
+	// the target ends it as ADD-COLUMN-BACKFILL-INCOMPLETE — a refusal the
+	// defer above then records, because a restart does not resume it
+	// (schema_forward_backfill_ledger.go). Declared after, so it runs first.
+	defer func() { err = s.settleAddedColumnBackfills(ctx, applier, streamID, err) }()
 	// ADR-0054 Phase 2d: release shape-coordination resources when
 	// engaged (SchemaWriter for per-shape DDL; the lease store /
 	// prober live on the applier and are released by migcore.CloseIf above).

@@ -97,6 +97,7 @@ func interceptSchemaSnapshotsForCoordination(
 	seed []ir.SchemaSnapshot,
 	router *BoundaryRouter,
 	normalizer ir.CDCSchemaSnapshotNormalizer,
+	backfill *schemaForwardBackfill,
 	errStore *atomic.Pointer[error],
 ) <-chan ir.Change {
 	if router == nil {
@@ -124,6 +125,9 @@ func interceptSchemaSnapshotsForCoordination(
 	}
 	go func() {
 		defer close(out)
+		// The first positioned change after a backfill is its durability
+		// watermark (schema_forward_backfill_ledger.go).
+		var watermark backfillWatermark
 		for {
 			select {
 			case c, ok := <-in:
@@ -132,6 +136,7 @@ func interceptSchemaSnapshotsForCoordination(
 				}
 				snap, isSnap := c.(ir.SchemaSnapshot)
 				if !isSnap {
+					watermark.observe(c)
 					select {
 					case out <- c:
 					case <-ctx.Done():
@@ -200,6 +205,16 @@ func interceptSchemaSnapshotsForCoordination(
 					errStore.Store(&wrapped)
 					return
 				}
+				// The ALTER has landed (applied here or observed from the
+				// lease holder): an ADD COLUMN owes THIS shard's
+				// pre-existing rows a backfill from THIS stream's source,
+				// on the ledger from here.
+				owed, err := planBoundaryBackfill(backfill, key, pre, post, snap, RecoveryHint)
+				if err != nil {
+					wrapped := fmt.Errorf("pipeline: shard consolidation: %w", err)
+					errStore.Store(&wrapped)
+					return
+				}
 				// Forward the snapshot to the applier so the
 				// ADR-0049 schema-history write still records the
 				// version (the existing per-engine SchemaSnapshot
@@ -210,6 +225,20 @@ func interceptSchemaSnapshotsForCoordination(
 				case <-ctx.Done():
 					return
 				}
+				// Then run the backfill — after the snapshot, so the
+				// applier has dropped its pre-ALTER view of the table,
+				// and ahead of every change that follows.
+				if err := owed.run(ctx, out); err != nil {
+					slog.ErrorContext(
+						ctx, "shard consolidation intercept: added-column backfill failed",
+						"table", key,
+						"error", err,
+					)
+					wrapped := fmt.Errorf("pipeline: shard consolidation: %w", err)
+					errStore.Store(&wrapped)
+					return
+				}
+				watermark.await(owed)
 			case <-ctx.Done():
 				return
 			}

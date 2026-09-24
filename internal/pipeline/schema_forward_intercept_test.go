@@ -719,7 +719,10 @@ func TestSynthesizeBackfillUpdate(t *testing.T) {
 	tbl := addColForwardTable("users", &ir.Column{Name: "nickname", Type: ir.Varchar{Length: 100}, Nullable: true})
 	snap := addColForwardSnap(tbl)
 	row := ir.Row{"id": int64(42), "nickname": "alpha"}
-	upd := synthesizeBackfillUpdate(snap, row, []string{"id"}, map[string]struct{}{"nickname": {}})
+	upd, err := synthesizeBackfillUpdate(snap, row, []string{"id"}, []string{"nickname"})
+	if err != nil {
+		t.Fatalf("synthesizeBackfillUpdate: %v", err)
+	}
 	if upd.Schema != "public" {
 		t.Errorf("Schema = %q; want public", upd.Schema)
 	}
@@ -802,7 +805,7 @@ func TestForwardAddColumn_Backfill_EmitsUpdates(t *testing.T) {
 		sourceEngineName: "postgres",
 		targetEngineName: "postgres",
 		backfill: &schemaForwardBackfill{
-			reader:    reader,
+			reader:    staticBackfillReader(reader),
 			streamID:  "test-stream",
 			batchSize: 100,
 		},
@@ -856,7 +859,7 @@ func TestForwardAddColumn_Backfill_NoPK_Refuses(t *testing.T) {
 		sourceEngineName: "postgres",
 		targetEngineName: "postgres",
 		backfill: &schemaForwardBackfill{
-			reader:    reader,
+			reader:    staticBackfillReader(reader),
 			streamID:  "test-stream",
 			batchSize: 100,
 		},
@@ -939,7 +942,7 @@ func TestRefuseComputedDefaults_WarnsWhenProjectionDroppedTheDefault(t *testing.
 				t.Errorf("warned=%v, want %v — %s\nlog: %s", got, c.wantWarn, c.wantWhy, buf.String())
 			}
 			if c.wantWarn {
-				for _, want := range []string{"orders", "region", "--backfill-added-column"} {
+				for _, want := range []string{"orders", "region", "added-column backfill"} {
 					if !strings.Contains(buf.String(), want) {
 						t.Errorf("WARN omits %q — an operator cannot act on it without the table, column, and remedy\nlog: %s", want, buf.String())
 					}
