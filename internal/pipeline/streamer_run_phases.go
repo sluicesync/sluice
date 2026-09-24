@@ -1126,6 +1126,7 @@ func (s *Streamer) phaseWireInterceptChain(applyCtx context.Context, changes <-c
 			}
 			if s.addColumnForwardSchemaReader != nil {
 				deps.defaultProber = newSourceDefaultProber(s.addColumnForwardSchemaReader)
+				deps.defaultCarrier = newSourceDefaultCarrier(s.addColumnForwardSchemaReader)
 			}
 			if s.BackfillAddedColumn {
 				if br, ok := s.addColumnForwardReader.(ir.BatchedRowReader); ok {

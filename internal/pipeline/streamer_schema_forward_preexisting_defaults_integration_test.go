@@ -99,6 +99,10 @@ const (
 	fdBit
 	fdSet
 	fdInet
+	// fdTime renders a time of day as HH:MM:SS.ffffff on both engines, so a
+	// PG `time` and the MySQL `TIME(6)` it maps to compare equal when their
+	// values are.
+	fdTime
 )
 
 // fdDialect is which engine's SQL a grading query is written in.
@@ -212,6 +216,8 @@ func fdCanonExpr(d fdDialect, fam fdFamily, col string) string {
 		switch fam {
 		case fdDateTime:
 			return "to_char(" + c + ", 'YYYY-MM-DD HH24:MI:SS.US')"
+		case fdTime:
+			return "to_char('2000-01-01'::date + " + c + ", 'HH24:MI:SS.US')"
 		case fdBinary:
 			return "encode(" + c + ", 'hex')"
 		case fdBit:
@@ -227,6 +233,8 @@ func fdCanonExpr(d fdDialect, fam fdFamily, col string) string {
 		switch fam {
 		case fdDateTime:
 			return "DATE_FORMAT(" + c + ", '%Y-%m-%d %H:%i:%s.%f')"
+		case fdTime:
+			return "TIME_FORMAT(" + c + ", '%H:%i:%s.%f')"
 		case fdBinary:
 			return "LOWER(HEX(" + c + "))"
 		case fdBit:
@@ -942,7 +950,7 @@ func fdPGShapes() []fdShape {
 		{"t_ts", "TIMESTAMP DEFAULT '2024-01-02 03:04:05'", fdDateTime},
 		{"t_ts6", "TIMESTAMP(6) DEFAULT '2024-01-02 03:04:05.123456'", fdDateTime},
 		{"t_tstz", "TIMESTAMPTZ DEFAULT '2024-01-02 03:04:05+02'", fdDateTime},
-		{"t_time", "TIME DEFAULT '12:34:56'", fdText},
+		{"t_time", "TIME DEFAULT '12:34:56'", fdTime},
 		{"x_bytea", `BYTEA DEFAULT '\x00ab00'`, fdBinary},
 		{"x_bytea2", `BYTEA DEFAULT '\xab00cd'`, fdBinary},
 		{"x_bytea3", `BYTEA DEFAULT '\xdead'`, fdBinary},
@@ -986,32 +994,6 @@ func fdDefaultDropped(defect string, cols ...string) map[string]fdKnownWrong {
 	return out
 }
 
-// fdExcept returns cols without drop — a lane's dropped-default list
-// minus the shapes that halt before their ALTER lands there.
-func fdExcept(cols []string, drop ...string) []string {
-	out := make([]string, 0, len(cols))
-	for _, c := range cols {
-		keep := true
-		for _, d := range drop {
-			keep = keep && c != d
-		}
-		if keep {
-			out = append(out, c)
-		}
-	}
-	return out
-}
-
-// fdPGDroppedCols is every Postgres-source shape with a non-NULL default.
-var fdPGDroppedCols = []string{
-	"s_plain", "s_text", "s_empty", "s_quote", "s_bslash", "s_estr", "s_unicode",
-	"s_nullword", "s_char", "s_nn", "i_int", "i_neg", "i_nn", "i_small",
-	"i_bigmax", "i_bigmin", "d_num", "d_numneg", "f_real", "f_double",
-	"b_bool", "b_boolf", "t_date", "t_ts", "t_ts6", "t_tstz", "t_time",
-	"x_bytea", "x_bytea2", "x_bytea3", "x_byteaempty", "j_jsonb", "j_jsonbkv",
-	"u_uuid", "g_expr", "d_numfree", "t_interval", "n_inet", "a_int", "a_text", "e_mood",
-}
-
 // TestStreamer_AddColumnForward_PreexistingRowDefaults_PostgresToPostgres
 // grades the Postgres pgoutput → Postgres lane.
 func TestStreamer_AddColumnForward_PreexistingRowDefaults_PostgresToPostgres(t *testing.T) {
@@ -1021,8 +1003,11 @@ func TestStreamer_AddColumnForward_PreexistingRowDefaults_PostgresToPostgres(t *
 	runForwardedDefaultLane(t, fdLane{
 		name: "postgres->postgres", sourceEngine: "postgres", targetEngine: "postgres",
 		sourceDSN: src, targetDSN: tgt, src: fdPG, tgt: fdPG,
-		shapes:     all,
-		knownWrong: fdDefaultDropped("Postgres-source DEFAULT never forwarded", fdExcept(fdPGDroppedCols, "d_numfree")...),
+		shapes: all,
+		// No known-wrong cells: every Postgres-source DEFAULT is carried into
+		// the forwarded ADD COLUMN since the carrySourceDefaults fix (all were
+		// dropped before it — every pre-existing target row held NULL).
+		knownWrong: map[string]fdKnownWrong{},
 		halts: []fdHalt{
 			// KNOWN LOUD DEFECT: a jsonb column added mid-stream lands on the
 			// PG target, then the first row carrying it fails to apply — but
@@ -1044,7 +1029,7 @@ func TestStreamer_AddColumnForward_PreexistingRowDefaults_PostgresToPostgres(t *
 			// forwarded as a synthesised w_<col>_enum type that rejects the
 			// source's own label on the first carried row.
 			fdLoud(t, all, "e_mood", `invalid input value for enum w_e_mood_enum: "ok"`,
-				"PG enum column forwarded as a synthesised enum without the source labels").afterAlter(),
+				"PG enum column forwarded as a synthesised enum without the source labels"),
 			fdDesignedRefusal(fdPGNow),
 		},
 		freshPair: fdFreshPairs(fdPG, fdPG, src, tgt),
@@ -1062,8 +1047,25 @@ func TestStreamer_AddColumnForward_PreexistingRowDefaults_PostgresToMySQL(t *tes
 	runForwardedDefaultLane(t, fdLane{
 		name: "postgres->mysql", sourceEngine: "postgres", targetEngine: "mysql",
 		sourceDSN: src, targetDSN: tgt, src: fdPG, tgt: fdMySQL,
-		shapes:     all,
-		knownWrong: fdDefaultDropped("Postgres-source DEFAULT never forwarded", fdExcept(fdPGDroppedCols, "t_interval", "e_mood")...),
+		shapes: all,
+		// Since the carrySourceDefaults fix the Postgres DEFAULT reaches this
+		// lane. What remains wrong is target-side:
+		knownWrong: fdMerge(
+			// KNOWN DEFECT (target emitter): the MySQL writer drops a DEFAULT on a
+			// TEXT / BLOB / JSON column with a WARN, although MySQL >= 8.0.13
+			// accepts an expression default there — the same root as the
+			// MySQL → MySQL TEXT/BLOB cells.
+			fdDefaultDropped("MySQL emitter drops a DEFAULT on a TEXT / BLOB / JSON target column",
+				"s_text", "s_empty", "s_quote", "s_bslash", "s_estr", "s_unicode", "s_nullword", "s_nn",
+				"x_bytea", "x_bytea2", "x_bytea3", "x_byteaempty", "j_jsonb", "j_jsonbkv", "a_int", "a_text"),
+			map[string]fdKnownWrong{
+				// KNOWN DEFECT (type mapping, not only the default): an unconstrained
+				// NUMERIC forwarded to MySQL becomes a scale-0 DECIMAL, so the
+				// default 1.10 lands as 1 — and so does every carried value. The
+				// Postgres → Postgres lane refuses the same column loudly.
+				"d_numfree": {target: "1", defect: "unconstrained NUMERIC forwarded to MySQL as a scale-0 DECIMAL"},
+			},
+		),
 		halts: []fdHalt{
 			// A designed type refusal, not a DEFAULT defect: MySQL has no
 			// type that holds a PG interval's range.
@@ -1073,8 +1075,25 @@ func TestStreamer_AddColumnForward_PreexistingRowDefaults_PostgresToMySQL(t *tes
 			// as an empty ENUM() and MySQL rejects its syntax.
 			fdLoud(t, all, "e_mood", "error 1064",
 				"PG enum column forwarded to MySQL as an empty ENUM()"),
+			// KNOWN LOUD DEFECT, surfaced by the carrySourceDefaults fix (before it
+			// the default was dropped and every pre-existing row landed NULL):
+			// a TIMESTAMPTZ literal default carrying a UTC offset reaches MySQL
+			// untranslated and the ALTER is rejected.
+			fdLoud(t, all, "t_tstz", "error 1067",
+				"PG TIMESTAMPTZ literal default with an offset is not translated for MySQL"),
 			fdDesignedRefusal(fdPGNow),
 		},
 		freshPair: fdFreshPairs(fdPG, fdMySQL, src, tgt),
 	})
+}
+
+// fdMerge unions known-wrong maps (later maps win on a shared column).
+func fdMerge(maps ...map[string]fdKnownWrong) map[string]fdKnownWrong {
+	out := map[string]fdKnownWrong{}
+	for _, m := range maps {
+		for k, v := range m {
+			out[k] = v
+		}
+	}
+	return out
 }

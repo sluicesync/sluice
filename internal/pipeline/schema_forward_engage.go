@@ -321,40 +321,59 @@ func newSourceDefaultProber(sr ir.SchemaReader) defaultProberFunc {
 			return ir.DefaultExpression{Expr: raw}, nil
 		}
 
-		sch, err := sr.ReadSchema(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("read source schema: %w", err)
-		}
-		for _, t := range sch.Tables {
-			if t == nil {
-				continue
-			}
-			// Match on table name; schema may be empty on MySQL
-			// (the SchemaReader convention) so prefer name-match
-			// when the caller's schema is empty OR the catalog's
-			// schema is empty.
-			if t.Name != table {
-				continue
-			}
-			if schema != "" && t.Schema != "" && schema != t.Schema {
-				continue
-			}
-			for _, c := range t.Columns {
-				if c == nil || c.Name != column {
-					continue
-				}
-				if c.Default == nil {
-					return ir.DefaultNone{}, nil
-				}
-				return c.Default, nil
-			}
-		}
-		// Column not found — surface as a probe error so the
-		// intercept refuses-on-uncertainty rather than silently
-		// passing.
-		return nil, fmt.Errorf("column %q on %q.%q not present in source catalog",
-			column, schema, table)
+		return readSchemaColumnDefault(ctx, sr, schema, table, column)
 	}
+}
+
+// newSourceDefaultCarrier returns the [schemaForwardDeps.defaultCarrier]:
+// the column's DEFAULT as the source SchemaReader translates it into the
+// IR — never the raw catalog text the prober may prefer for volatility
+// classification, because the carried value is EMITTED, possibly into a
+// different engine, and only the IR form goes through the target emitter's
+// translation. Same single-read cost as the prober; once per ADD COLUMN.
+func newSourceDefaultCarrier(sr ir.SchemaReader) defaultProberFunc {
+	return func(ctx context.Context, schema, table, column string) (ir.DefaultValue, error) {
+		return readSchemaColumnDefault(ctx, sr, schema, table, column)
+	}
+}
+
+// readSchemaColumnDefault reads the source schema and returns the named
+// column's IR DEFAULT ([ir.DefaultNone] when it has none), or an error when
+// the column is not in the catalog.
+func readSchemaColumnDefault(ctx context.Context, sr ir.SchemaReader, schema, table, column string) (ir.DefaultValue, error) {
+	sch, err := sr.ReadSchema(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("read source schema: %w", err)
+	}
+	for _, t := range sch.Tables {
+		if t == nil {
+			continue
+		}
+		// Match on table name; schema may be empty on MySQL
+		// (the SchemaReader convention) so prefer name-match
+		// when the caller's schema is empty OR the catalog's
+		// schema is empty.
+		if t.Name != table {
+			continue
+		}
+		if schema != "" && t.Schema != "" && schema != t.Schema {
+			continue
+		}
+		for _, c := range t.Columns {
+			if c == nil || c.Name != column {
+				continue
+			}
+			if c.Default == nil {
+				return ir.DefaultNone{}, nil
+			}
+			return c.Default, nil
+		}
+	}
+	// Column not found — surface as a probe error so the
+	// intercept refuses-on-uncertainty rather than silently
+	// passing.
+	return nil, fmt.Errorf("column %q on %q.%q not present in source catalog",
+		column, schema, table)
 }
 
 // refuseEngineMissingAddColumnForward is the shared shape of the

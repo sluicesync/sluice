@@ -95,6 +95,18 @@ type schemaForwardDeps struct {
 	// path — refuse-on-uncertainty.
 	defaultProber defaultProberFunc
 
+	// defaultCarrier, when non-nil, returns the source column's DEFAULT as the
+	// source SchemaReader translates it into the IR — the value a cold-start
+	// migrate would emit. It is CARRIED into the forwarded ADD COLUMN
+	// ([carrySourceDefaults]) because the target fills every pre-existing row
+	// with the column's DEFAULT at ALTER time and no row event ever corrects
+	// them: a forward without it left those rows NULL where the source holds
+	// the default (the pre-existing-row gate, Bug 287 class). Distinct from
+	// [schemaForwardDeps.defaultProber], which may return RAW catalog text
+	// for the volatility classification (Bug 91) and is not emittable across
+	// engines.
+	defaultCarrier defaultProberFunc
+
 	// normalizer is the SOURCE engine's optional Bug 84/86 comparison
 	// lens ([ir.CDCSchemaSnapshotNormalizer]; nil → identity). Applied
 	// to every incoming CDC snapshot before it is classified or cached
@@ -770,8 +782,12 @@ func applyAddColumnForward(
 	if err := refuseComputedDefaults(ctx, deps, tableName, snap, shape.AddedColumns); err != nil {
 		return err
 	}
+	post, err := carrySourceDefaults(ctx, deps, tableName, snap, shape.AddedColumns)
+	if err != nil {
+		return err
+	}
 	retargetedTable, retargetedAdded := retargetAddedColumns(
-		snap.IR, shape.AddedColumns,
+		post, shape.AddedColumns,
 		deps.sourceEngineName, deps.targetEngineName,
 	)
 	if err := deps.applier.AlterAddColumn(ctx, retargetedTable, retargetedAdded); err != nil {
@@ -884,7 +900,9 @@ func refuseComputedDefaults(
 		// finding a real default is what says something is actually lost. A
 		// column with genuinely no default reaches neither condition and stays
 		// quiet.
-		if c.Default == nil && !isDefaultNone(def) {
+		// Reached only when no carrier is wired (a test harness); with one,
+		// [carrySourceDefaults] puts the default on the forwarded column.
+		if c.Default == nil && !isDefaultNone(def) && deps.defaultCarrier == nil {
 			slog.WarnContext(
 				ctx,
 				"forward-add-column: the source's column DEFAULT cannot be carried through this source's change stream — "+
@@ -1118,4 +1136,68 @@ func columnNames(cols []*ir.Column) []string {
 		}
 	}
 	return out
+}
+
+// carrySourceDefaults returns the table the forwarded ADD COLUMN is built
+// from, with each added column whose in-band DEFAULT the change stream did
+// not carry given the source's own DEFAULT (via
+// [schemaForwardDeps.defaultCarrier]).
+//
+// Why it is load-bearing: when the target runs `ADD COLUMN … DEFAULT d`, it
+// fills every row it ALREADY holds with d, and the source's own fill of its
+// existing rows writes no row event, so nothing downstream ever corrects
+// the target's copy. A forward that omitted the default therefore left
+// every pre-existing target row NULL where the source holds d — for
+// NOT NULL columns too — at exit 0 with only a WARN. Measured by
+// TestStreamer_ForwardedDefault_* on PG→PG, PG→MySQL and VStream→PG,
+// whose change streams carry no DEFAULT at all.
+//
+// The value carried is the SchemaReader's translated IR default, so the
+// target's emitter treats it exactly as it treats the same column on a
+// cold-start migrate (a cross-engine default is translated, or dropped
+// or refused by the same rules). A column that already carries an in-band
+// DEFAULT (the MySQL binlog projection) is left alone, and so is the shared
+// snapshot: the result is a copy. A read failure refuses — forwarding the
+// column without its default is exactly the silent outcome this prevents.
+func carrySourceDefaults(
+	ctx context.Context,
+	deps schemaForwardDeps,
+	tableName string,
+	snap ir.SchemaSnapshot,
+	added []*ir.Column,
+) (*ir.Table, error) {
+	if deps.defaultCarrier == nil || snap.IR == nil {
+		return snap.IR, nil
+	}
+	missing := map[string]bool{}
+	for _, c := range added {
+		if c != nil && c.Default == nil {
+			missing[c.Name] = true
+		}
+	}
+	if len(missing) == 0 {
+		return snap.IR, nil
+	}
+	out := *snap.IR
+	out.Columns = append([]*ir.Column(nil), snap.IR.Columns...)
+	for i, c := range out.Columns {
+		if c == nil || !missing[c.Name] || c.Default != nil {
+			continue
+		}
+		d, err := deps.defaultCarrier(ctx, snap.Schema, snap.Table, c.Name)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"read the source DEFAULT for ADD COLUMN %q on %q: %w (refusing: forwarding the column without its "+
+					"default would leave every row already on the target without the value the source filled in). %s",
+				c.Name, tableName, err, forwardRecoveryHint(tableName),
+			)
+		}
+		if d == nil {
+			continue
+		}
+		carried := *c
+		carried.Default = d
+		out.Columns[i] = &carried
+	}
+	return &out, nil
 }

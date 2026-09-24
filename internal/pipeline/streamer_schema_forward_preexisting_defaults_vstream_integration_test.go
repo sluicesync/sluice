@@ -51,14 +51,11 @@ func TestStreamer_AddColumnForward_PreexistingRowDefaults_VStreamToPostgres(t *t
 		streamParams: fmt.Sprintf("&vstream_endpoint=%s&vstream_transport=plaintext&vstream_auth=none&vstream_shards=0", grpcEndpoint),
 		settle:       time.Second,
 		shapes:       all,
-		knownWrong: fdDefaultDropped("VStream-source DEFAULT never forwarded",
-			"s_plain", "s_empty", "s_quote", "s_bslash", "s_unicode", "s_nullword",
-			"s_char", "s_nn", "s_textexpr", "i_int", "i_neg", "i_nn", "i_small",
-			"i_bigmax", "i_bigmin", "i_ubigmax", "d_dec", "d_decneg", "f_float",
-			"f_double", "b_bool", "b_boolf", "t_date", "t_dt", "t_dt6", "t_dtnn",
-			"t_ts", "t_time", "t_year", "x_bin", "x_vbin", "x_vbinplain",
-			"x_binstr", "x_vbinempty", "x_blobexpr", "x_bit", "e_enum", "e_enumq",
-			"e_set", "g_expr"),
+		// No known-wrong cells since the carrySourceDefaults fix: the VStream
+		// FIELD projection carries no DEFAULT, and the source SchemaReader's
+		// default is now carried into the forwarded ADD COLUMN (before it,
+		// every pre-existing target row held NULL).
+		knownWrong: map[string]fdKnownWrong{},
 		halts: []fdHalt{
 			// KNOWN LOUD DEFECTS (the ALTER lands, the first carried row
 			// cannot apply). The unsigned max is refused as out of range /
@@ -66,8 +63,14 @@ func TestStreamer_AddColumnForward_PreexistingRowDefaults_VStreamToPostgres(t *t
 			// the value in it does not. A YEAR column added mid-stream
 			// reaches PG as bytea hex text ("\x32303234"), but only when it
 			// is not the stream's first forward, hence the prelude.
-			fdLoud(t, all, "i_ubigmax", "18446744073709551615",
-				"BIGINT UNSIGNED forwards as PG bigint; the unsigned max row cannot apply").afterAlter(),
+			// With the DEFAULT now carried, the unsigned max fails at the ALTER
+			// itself, exactly as on the MySQL → Postgres lane.
+			fdLoud(t, all, "i_ubigmax", "out of range for type bigint",
+				"BIGINT UNSIGNED forwards as PG bigint; its max DEFAULT overflows the target ALTER"),
+			fdLoud(t, all, "x_blobexpr", "is of type bytea but default expression is of type integer",
+				"MySQL's (0x00FF) expression DEFAULT is re-emitted verbatim on PG, where 0x00FF lexes as an integer"),
+			fdLoud(t, all, "x_bit", "does not match type bit(8)",
+				"BIT(8) DEFAULT b'1010' is emitted as a 4-bit literal PG will not widen"),
 			fdLoud(t, all, "t_year", `invalid input syntax for type smallint: "\x32303234"`,
 				"a mid-stream-added YEAR column's VStream value reaches PG as bytea hex text").
 				afterAlter().after(fdPrelude),
@@ -89,4 +92,4 @@ func TestStreamer_AddColumnForward_PreexistingRowDefaults_VStreamToPostgres(t *t
 // fdVStreamHaltKeyspaces is how many spare keyspaces the VStream lane
 // boots for its halt cells; runForwardedDefaultLane names them
 // s_halt0, s_halt1, … in halt order.
-const fdVStreamHaltKeyspaces = 6
+const fdVStreamHaltKeyspaces = 8
