@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -38,6 +39,10 @@ type catalogColumnRow struct {
 	// prints it — the authoritative bytes the NUL-truncation recovery
 	// re-reads. Empty for a row that never triggers the recovery.
 	showCreate string
+
+	// probeHex is HEX(DEFAULT(col)) as MariaDB returns it — the true bytes
+	// the GC-36 DEFAULT() probe re-reads. Empty for a row never probed.
+	probeHex string
 }
 
 // bug286CatalogRows returns the Bug 286 shape matrix as flavor f's server
@@ -138,6 +143,75 @@ func gc29BinaryCatalogRows() []catalogColumnRow {
 	}
 }
 
+// gc36MariaDBBinaryCatalogRows returns the GC-36 shapes: MariaDB
+// BINARY/VARBINARY literal defaults whose quoted COLUMN_DEFAULT the server
+// stores with every non-UTF-8 byte replaced by '?', paired with the
+// DEFAULT() probe's true bytes — the family matrix of {leading, mid,
+// trailing, width-padding} NUL × bytes >= 0x80 × {BINARY, VARBINARY} ×
+// the quote and backslash escapes, plus the controls whose catalog text is
+// faithful (valid UTF-8 high bytes, a TRUE '?', pure ASCII) and the empty
+// default that is never probed. Every COLUMN_DEFAULT below is the text
+// mariadb:11.4.13 reported for the declared DDL in the comment (measured
+// 2026-09-23; 10.6.28 and 10.11.19 identical for the rows measured there).
+// want is the declared literal, width-padded for BINARY — the independent
+// expected value, not the probe's echo.
+func gc36MariaDBBinaryCatalogRows() []catalogColumnRow {
+	valid := func(s string) sql.NullString { return sql.NullString{String: s, Valid: true} }
+	hexDef := func(h string) ir.DefaultValue { return ir.DefaultExpression{Expr: h, Dialect: hexLiteralDialect} }
+	bin := func(name, dataType string, width int64, catalog, probe, want string) catalogColumnRow {
+		return catalogColumnRow{
+			name: name, def: valid(catalog), nullable: "YES",
+			dataType: dataType, columnType: fmt.Sprintf("%s(%d)", dataType, width), charMaxLen: width,
+			want: hexDef(want), probeHex: probe,
+		}
+	}
+	return []catalogColumnRow{
+		bin("m1", "binary", 3, `'\0?\0'`, "00AB00", "0x00AB00"),                     // DEFAULT 0x00AB00: leading + trailing NUL
+		bin("m2", "varbinary", 4, `'?\0?'`, "AB00CD", "0xAB00CD"),                   // DEFAULT 0xAB00CD: mid NUL
+		bin("m3", "varbinary", 3, `'??\0'`, "FFFE00", "0xFFFE00"),                   // DEFAULT 0xFFFE00: trailing NUL
+		bin("m4", "binary", 4, `'?\0\0\0'`, "FF000000", "0xFF000000"),               // DEFAULT 0xFF: width padding
+		bin("m5", "varbinary", 4, `'''?'''`, "27FF27", "0x27FF27"),                  // DEFAULT 0x27FF27: quotes
+		bin("m6", "binary", 3, `'\\?\\'`, "5C805C", "0x5C805C"),                     // DEFAULT 0x5C805C: backslashes
+		bin("m7", "varbinary", 6, `'''?\\\0'`, "27FF5C00", "0x27FF5C00"),            // DEFAULT 0x27FF5C00: all three
+		bin("m8", "varbinary", 4, `'????'`, "80818283", "0x80818283"),               // DEFAULT 0x80818283: every byte lost
+		bin("m9", "varbinary", 8, `'????'`, "F09F9880", "0xF09F9880"),               // DEFAULT 0xF09F9880: 4-byte UTF-8 (utf8mb3 catalog)
+		bin("m10", "varbinary", 4, "'\xDE\xAD'", "DEAD", "0xDEAD"),                  // DEFAULT 0xDEAD: valid UTF-8, faithful
+		bin("m11", "varbinary", 4, `'??'`, "3F3F", "0x3F3F"),                        // DEFAULT 0x3F3F: a TRUE '?'
+		bin("m12", "varbinary", 4, `'???'`, "3FAB3F", "0x3FAB3F"),                   // DEFAULT 0x3FAB3F: true '?' around a lost byte
+		bin("m13", "varbinary", 6, "'\\n\\r\x1a\t?'", "0A0D1A09AB", "0x0A0D1A09AB"), // control bytes + a lost byte
+		bin("m14", "binary", 4, `'ab\0\0'`, "61620000", "0x61620000"),               // DEFAULT 'ab': ASCII control
+		{
+			// DEFAULT '': no bytes to lose, never probed.
+			name: "m15", def: valid("''"), nullable: "YES",
+			dataType: "varbinary", columnType: "varbinary(4)", charMaxLen: int64(4),
+			want: ir.DefaultLiteral{Value: ""},
+		},
+	}
+}
+
+// gc36MariaDB118BinaryCatalogRows is the same class as MariaDB 11.8+
+// reports it: a lossless lowercase x'<hex>' literal (BINARY width-padded,
+// measured on 11.8.9 and 12.3), which must land on the same IR as the
+// probed ≤11.4 form and MySQL 8 — never probed, since nothing was lost.
+func gc36MariaDB118BinaryCatalogRows() []catalogColumnRow {
+	valid := func(s string) sql.NullString { return sql.NullString{String: s, Valid: true} }
+	bin := func(name, dataType string, width int64, catalog, want string) catalogColumnRow {
+		return catalogColumnRow{
+			name: name, def: valid(catalog), nullable: "YES",
+			dataType: dataType, columnType: fmt.Sprintf("%s(%d)", dataType, width), charMaxLen: width,
+			want: ir.DefaultExpression{Expr: want, Dialect: hexLiteralDialect},
+		}
+	}
+	return []catalogColumnRow{
+		bin("x1", "binary", 3, "x'00ab00'", "0x00AB00"),        // DEFAULT 0x00AB00
+		bin("x2", "varbinary", 4, "x'ab00cd'", "0xAB00CD"),     // DEFAULT 0xAB00CD
+		bin("x3", "binary", 4, "x'ff000000'", "0xFF000000"),    // DEFAULT 0xFF: width padding
+		bin("x4", "varbinary", 6, "x'27ff5c00'", "0x27FF5C00"), // DEFAULT 0x27FF5C00
+		bin("x5", "varbinary", 4, "x'3f3f'", "0x3F3F"),         // DEFAULT 0x3F3F
+		bin("x6", "binary", 4, "x'61620000'", "0x61620000"),    // DEFAULT 'ab'
+	}
+}
+
 // showCreateTableW renders the SHOW CREATE TABLE text for the fake's one
 // table: one indented line per column, the DEFAULT clause only where the
 // row carries one, in the shape parseShowCreateColumnDefault reads.
@@ -185,6 +259,22 @@ func (c catalogFakeConn) QueryContext(_ context.Context, query string, _ []drive
 	case strings.HasPrefix(query, "SHOW CREATE TABLE "):
 		// The NUL-truncated binary-default recovery's authoritative re-read.
 		return &catalogFakeRows{cols: []string{"Table", "Create Table"}, vals: [][]driver.Value{{"w", showCreateTableW(c.rows)}}}, nil
+	case strings.HasPrefix(query, "SELECT HEX(DEFAULT("):
+		// The GC-36 MariaDB DEFAULT() probe: one row, one HEX per named
+		// column, in the order the query names them.
+		byName := map[string]catalogColumnRow{}
+		for _, r := range c.rows {
+			byName[r.name] = r
+		}
+		var vals []driver.Value
+		for _, m := range probedColumnRE.FindAllStringSubmatch(query, -1) {
+			r, ok := byName[m[1]]
+			if !ok || r.probeHex == "" {
+				return nil, fmt.Errorf("catalog fake: DEFAULT() probe of unexpected column %q", m[1])
+			}
+			vals = append(vals, r.probeHex)
+		}
+		return &catalogFakeRows{cols: make([]string, len(vals)), vals: [][]driver.Value{vals}}, nil
 	case strings.Contains(query, "information_schema.statistics"):
 		return &catalogFakeRows{cols: []string{"column_name"}, vals: [][]driver.Value{{"id"}}}, nil
 	case strings.Contains(query, "information_schema.columns") && strings.Contains(query, "ORDER  BY table_name, ordinal_position"):
@@ -205,6 +295,9 @@ func (c catalogFakeConn) QueryContext(_ context.Context, query string, _ []drive
 	}
 	return nil, fmt.Errorf("catalog fake: unexpected query %q", query)
 }
+
+// probedColumnRE extracts each column name a DEFAULT() probe names.
+var probedColumnRE = regexp.MustCompile("DEFAULT\\(`sluice_t`\\.`([^`]+)`\\)")
 
 // body renders the row's columns from column_default onward in the
 // readers' SELECT order; withSRID inserts the srs_id slot the
@@ -280,12 +373,20 @@ func newCatalogFakeDB(t *testing.T, name string, rows []catalogColumnRow) *sql.D
 // BINARY(2) DEFAULT 0x2700` projected the truncated `0x27` and the
 // intercept re-emitted it. The gc29BinaryCatalogRows carry that shape on
 // every MySQL-convention flavor.
+//
+// GC-36 is MariaDB's version of GC-29: its catalog stores every non-UTF-8
+// byte of a quoted binary default as '?', so both readers must replace the
+// catalog value from the DEFAULT() probe, or 0x00AB00 projects as 0x003F00.
+// The gc36MariaDBBinaryCatalogRows carry that shape on the mariadb flavor.
 func TestLoadTableSchema_DefaultAgreesWithSeed_EveryBinlogFlavor(t *testing.T) {
 	ctx := context.Background()
 	for _, f := range binlogFlavors(t) {
 		rows := bug286CatalogRows(f)
 		if f != FlavorMariaDB {
 			rows = append(rows, gc29BinaryCatalogRows()...)
+		} else {
+			rows = append(rows, gc36MariaDBBinaryCatalogRows()...)
+			rows = append(rows, gc36MariaDB118BinaryCatalogRows()...)
 		}
 		db := newCatalogFakeDB(t, fmt.Sprintf("sluice-catalog-test-%s-%d", t.Name(), f), rows)
 

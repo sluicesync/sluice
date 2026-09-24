@@ -118,7 +118,10 @@ import (
 //   - BINARY/VARBINARY literal defaults are compared on their TRUE bytes,
 //     re-read from SHOW CREATE TABLE ([binaryHexDefault]): information_schema
 //     cuts them at the first NUL, so a change after it (0x610000 →
-//     0x6100FF) read identically there (review F5, GC-29's sibling).
+//     0x6100FF) read identically there (review F5, GC-29's sibling). On
+//     MariaDB they are re-read by a DEFAULT() probe instead: its catalog
+//     stores every non-UTF-8 byte as '?', so 0x00AB00 → 0x00CD00 read
+//     identically there (GC-36, [recoverMariaDBBinaryDefaults]).
 //     Both rules are grounded on a real server by
 //     TestTableFacts_DiffPremisesOnARealServer.
 //   - A foreign key whose REFERENCED table or column changed because the
@@ -292,6 +295,10 @@ func readColumnFacts(ctx context.Context, db *sql.DB, flavor Flavor, args []any,
 	// readers run (GC-29, binary_default_recovery.go).
 	type binaryDefault struct{ schema, table, column string }
 	var pending []binaryDefault
+	// MariaDB reports the same defaults quoted, with every non-UTF-8 byte
+	// stored as '?' (GC-36), so 0x00AB00 → 0x00CD00 read '\0?\0' both
+	// times; those are re-read by the schema readers' DEFAULT() probe.
+	mariadbPending := map[string][]pendingMariaDBBinaryDefault{}
 	for rows.Next() {
 		var (
 			s, t, col, typ, nullable, extra, gen string
@@ -304,9 +311,25 @@ func readColumnFacts(ctx context.Context, db *sql.DB, flavor Flavor, args []any,
 		if binaryHexDefault(typ, extra, def) {
 			pending = append(pending, binaryDefault{s, t, col})
 		}
+		if flavor == FlavorMariaDB && mariadbBinaryDefaultNeedsProbe(isBinaryColumnType(typ), def) {
+			facts := get(s, t)
+			mariadbPending[s] = append(mariadbPending[s], pendingMariaDBBinaryDefault{
+				table: t, column: col, catalog: def.String,
+				set: func(hexLiteral string) {
+					c := facts.columns[col]
+					c.def = hexLiteral
+					facts.columns[col] = c
+				},
+			})
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return err
+	}
+	for _, s := range sortedKeys(mariadbPending) {
+		if err := recoverMariaDBBinaryDefaults(ctx, db, s, mariadbPending[s]); err != nil {
+			return fmt.Errorf("recover binary defaults: %w", err)
+		}
 	}
 	showCreate := map[string]string{}
 	for _, p := range pending {
@@ -337,16 +360,19 @@ func readColumnFacts(ctx context.Context, db *sql.DB, flavor Flavor, args []any,
 // information_schema rendered as a (possibly NUL-truncated) hex literal —
 // the columns whose true bytes only SHOW CREATE TABLE carries. MariaDB
 // reports these quoted and escape-encoded, never as `0x…`, so it never
-// matches there.
+// matches there (its loss is different; see mariadbBinaryDefaultNeedsProbe).
 func binaryHexDefault(columnType, extra string, def sql.NullString) bool {
 	if !def.Valid || strings.Contains(strings.ToUpper(extra), "DEFAULT_GENERATED") {
 		return false
 	}
+	return isBinaryColumnType(columnType) && hasHexLiteralPrefix(def.String)
+}
+
+// isBinaryColumnType reports a BINARY(n)/VARBINARY(n) COLUMN_TYPE — the
+// catalog-string form of [isBinaryFamilyType].
+func isBinaryColumnType(columnType string) bool {
 	t := strings.ToLower(columnType)
-	if !strings.HasPrefix(t, "binary(") && !strings.HasPrefix(t, "varbinary(") {
-		return false
-	}
-	return hasHexLiteralPrefix(def.String)
+	return strings.HasPrefix(t, "binary(") || strings.HasPrefix(t, "varbinary(")
 }
 
 // columnFact folds one columns row into the compared form.

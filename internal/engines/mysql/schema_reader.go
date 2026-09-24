@@ -694,6 +694,10 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 	// Collected here so the recovery runs one SHOW CREATE per affected table,
 	// not per column (and shares that fetch with table-comment recovery).
 	var pending []pendingBinaryDefault
+	// MariaDB's sibling loss (GC-36): a quoted binary default whose non-UTF-8
+	// bytes information_schema stored as '?', re-read by a DEFAULT() probe
+	// (see recoverMariaDBBinaryDefaults).
+	var mariadbPending []pendingMariaDBBinaryDefault
 
 	for rows.Next() {
 		var (
@@ -753,8 +757,16 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 		if binaryLiteralDefaultNeedsRecovery(typ, meta.Extra, defaultVal) {
 			pending = append(pending, pendingBinaryDefault{table: tableName, col: col})
 		}
+		if r.flavor == FlavorMariaDB && mariadbBinaryDefaultNeedsProbe(isBinaryFamilyType(typ), defaultVal) {
+			mariadbPending = append(mariadbPending, pendingMariaDBBinaryDefault{
+				table: tableName, column: colName, catalog: defaultVal.String, set: setIRDefault(col),
+			})
+		}
 	}
 	if err := rows.Err(); err != nil {
+		return err
+	}
+	if err := recoverMariaDBBinaryDefaults(ctx, r.db, r.schema, mariadbPending); err != nil {
 		return err
 	}
 	// One SHOW CREATE pass recovers BOTH the NUL-truncated binary defaults
@@ -1053,6 +1065,9 @@ func loadTableSchema(ctx context.Context, db *sql.DB, schema, table string, flav
 	// what the ADR-0091 intercept re-emits, so a truncated `0x27` for a
 	// declared `0x2700` would otherwise land on the target silently.
 	var pending []pendingBinaryDefault
+	// And the seed's MariaDB DEFAULT() probe for '?'-mangled binary
+	// defaults (GC-36).
+	var mariadbPending []pendingMariaDBBinaryDefault
 	for rows.Next() {
 		var (
 			colName    string
@@ -1102,6 +1117,11 @@ func loadTableSchema(ctx context.Context, db *sql.DB, schema, table string, flav
 		if binaryLiteralDefaultNeedsRecovery(typ, meta.Extra, defaultVal) {
 			pending = append(pending, pendingBinaryDefault{table: table, col: col})
 		}
+		if flavor == FlavorMariaDB && mariadbBinaryDefaultNeedsProbe(isBinaryFamilyType(typ), defaultVal) {
+			mariadbPending = append(mariadbPending, pendingMariaDBBinaryDefault{
+				table: table, column: colName, catalog: defaultVal.String, set: setIRDefault(col),
+			})
+		}
 		// Capture the MariaDB native fixed-width kind (uuid/inet4/inet6)
 		// parallel to Columns. The IR collapses inet4/inet6 to ir.Inet, so
 		// the CDC binlog decode (ADR-0171) recovers the exact width from
@@ -1118,6 +1138,9 @@ func loadTableSchema(ctx context.Context, db *sql.DB, schema, table string, flav
 	}
 	if len(out.Columns) == 0 {
 		return nil, fmt.Errorf("mysql: table %s.%s has no columns (does it exist?)", schema, table)
+	}
+	if err := recoverMariaDBBinaryDefaults(ctx, db, schema, mariadbPending); err != nil {
+		return nil, fmt.Errorf("mysql: loadTableSchema %s.%s: binary default recovery: %w", schema, table, err)
 	}
 	if len(pending) > 0 {
 		// One SHOW CREATE for this table. The stand-in ir.Table carries no

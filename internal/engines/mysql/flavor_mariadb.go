@@ -16,6 +16,7 @@ package mysql
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -111,7 +112,13 @@ func (u upsertSpelling) newRowRef(col string) string {
 //	DEFAULT b'1010'             b'1010' (same as MySQL)
 //	BINARY(2) DEFAULT X'4142'   'AB'    (quoted raw bytes, NULs escape-
 //	                            encoded — NOT the MySQL 0x4142 hex form,
-//	                            and NOT NUL-truncated)
+//	                            and NOT NUL-truncated; but every byte not
+//	                            in a well-formed UTF-8 sequence is stored
+//	                            as '?' — GC-36, re-read by the readers'
+//	                            DEFAULT() probe) on 10.6–11.4; from 11.8
+//	                            (11.8.9 and 12.3 measured) x'4142' — a
+//	                            lowercase hex literal, lossless, BINARY
+//	                            width-padded
 //	DEFAULT uuid() / (1+1)      uuid() / (1 + 1) (bare expression text)
 //
 // So the discriminator is the surface form itself: SQL NULL and the
@@ -144,6 +151,13 @@ func translateMariaDBDefault(def sql.NullString, extra string, typ ir.Type) ir.D
 		}
 		return ir.DefaultLiteral{Value: bitsToDecimal(bits)}
 	}
+	if b, ok := mariadbHexLiteralBytes(raw); ok && isBinaryFamilyType(typ) {
+		// MariaDB 11.8+'s spelling of a binary literal default. Re-encoded
+		// to the same bare hex-literal form as the quoted branch below, so
+		// every MariaDB line and MySQL 8 land on one IR value; without it
+		// this fell through to the expression branch as `x'00ab00'`.
+		return ir.DefaultExpression{Expr: bytesToHexLiteral(b), Dialect: hexLiteralDialect}
+	}
 	if strings.HasPrefix(raw, "'") {
 		val, end, ok := scanMySQLQuotedString(raw)
 		if !ok || end != len(raw) {
@@ -158,6 +172,9 @@ func translateMariaDBDefault(def sql.NullString, extra string, typ ir.Type) ir.D
 			// same logical schema produces via a MySQL 8 read — including
 			// NUL-bearing defaults, which MariaDB escape-encodes instead of
 			// C-truncating, so no SHOW CREATE recovery pass is needed here.
+			// This value is PROVISIONAL: a byte >= 0x80 outside valid UTF-8
+			// already reads as '?', and both catalog readers overwrite it
+			// from a DEFAULT() probe (recoverMariaDBBinaryDefaults, GC-36).
 			return ir.DefaultExpression{Expr: fmt.Sprintf("0x%X", val), Dialect: hexLiteralDialect}
 		}
 		return ir.DefaultLiteral{Value: string(val)}
@@ -173,6 +190,20 @@ func translateMariaDBDefault(def sql.NullString, extra string, typ ir.Type) ir.D
 	// a literal value's own escapes.
 	expr := canonMariaDBTimestampExpr(normalizeShowCreateExpressionText(raw))
 	return ir.DefaultExpression{Expr: expr, Dialect: "mysql"}
+}
+
+// mariadbHexLiteralBytes decodes the whole of raw as an x'<hex>' literal —
+// non-empty, even-length, either case of x and of the digits. Anything else
+// (including trailing text) is not this form.
+func mariadbHexLiteralBytes(raw string) ([]byte, bool) {
+	if len(raw) < 5 || (raw[0] != 'x' && raw[0] != 'X') || raw[1] != '\'' || raw[len(raw)-1] != '\'' {
+		return nil, false
+	}
+	b, err := hex.DecodeString(raw[2 : len(raw)-1])
+	if err != nil {
+		return nil, false
+	}
+	return b, true
 }
 
 // mariadbNumericDefault reports whether raw has the shape of the

@@ -858,28 +858,14 @@ func fdMariaDBShapes() []fdShape {
 	}
 }
 
-// fdMariaDBBinaryHighBytes is a KNOWN DEFECT of every MariaDB-source
-// lane (silent, CRITICAL class — the stream stays green): each byte
-// >= 0x80 of a BINARY/VARBINARY literal DEFAULT reaches the target as
-// 0x3f ("?"), so every row that already existed holds mangled bytes.
-// NULs survive (GC-29's fix holds); high bytes do not. MySQL 8 sources
-// carry the same DDL faithfully on both targets.
-func fdMariaDBBinaryHighBytes() map[string]fdKnownWrong {
-	const defect = "MariaDB binary DEFAULT: bytes >= 0x80 become 0x3f"
-	return map[string]fdKnownWrong{
-		"x_bin":  {target: "003f00", defect: defect},
-		"x_vbin": {target: "3f003f", defect: defect},
-	}
-}
-
-// fdMariaDBToMariaDBKnownWrong adds the MariaDB-target defect to the
-// source one: the MySQL-family emitter drops every DEFAULT on a
+// fdMariaDBToMariaDBKnownWrong is the MariaDB-target defect: the
+// MySQL-family emitter drops every DEFAULT on a
 // TEXT/BLOB/JSON column ("MySQL forbids DEFAULTs on JSON/TEXT/BLOB",
 // Error 1101, logged as a WARN) — but MariaDB accepts a literal DEFAULT
 // on TEXT and on JSON (a LONGTEXT alias), so the source's declared value
 // is simply lost and every row that already existed lands NULL.
 func fdMariaDBToMariaDBKnownWrong() map[string]fdKnownWrong {
-	out := fdMariaDBBinaryHighBytes()
+	out := map[string]fdKnownWrong{}
 	out["s_text"] = fdKnownWrong{target: fdNull, defect: "TEXT literal DEFAULT dropped on the MariaDB target"}
 	out["j_json"] = fdKnownWrong{target: fdNull, defect: "JSON literal DEFAULT dropped on the MariaDB target"}
 	return out
@@ -897,7 +883,7 @@ func TestStreamer_AddColumnForward_PreexistingRowDefaults_MariaDBToPostgres(t *t
 		name: "mariadb->postgres", sourceEngine: "mariadb", targetEngine: "postgres",
 		sourceDSN: src, targetDSN: tgt, src: fdMySQL, tgt: fdPG,
 		shapes:     all,
-		knownWrong: fdMariaDBBinaryHighBytes(),
+		knownWrong: map[string]fdKnownWrong{},
 		halts: []fdHalt{
 			fdLoud(t, all, "i_ubigmax", "out of range for type bigint",
 				"BIGINT UNSIGNED forwards as PG bigint; its max DEFAULT overflows the target ALTER"),

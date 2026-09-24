@@ -168,6 +168,19 @@ var hexDecodeRoster = map[string]hexSiteVerdict{
 			"prefix can only be MySQL's hex literal. Not a row value, and the alternative " +
 			"reading (a quoted string) is a different token the caller dispatches on first.",
 	},
+	"mysql.mariadbHexLiteralBytes": {
+		decidedByGrammar,
+		"MariaDB 11.8+'s COLUMN_DEFAULT `x'<hex>'` production, matched over the WHOLE value; " +
+			"a string literal opens with `'`, and the caller takes this branch only on a " +
+			"BINARY/VARBINARY column. Not a row value. Pinned by TestMariaDBHexLiteralBytes " +
+			"and, live, by TestMariaDBBinaryDefault_HighBytes_OnARealServer (11.8 / 12.3).",
+	},
+	"mysql.probeMariaDBColumnDefaults": {
+		decidedByProvenance,
+		"the decoded string is the server's HEX(DEFAULT(col)) from a projection sluice wrote " +
+			"(GC-36), so it is a rendering by construction, never source bytes; the result is " +
+			"then reconciled against the catalog text (reconcileMariaDBBinaryDefault).",
+	},
 
 	// ---- Dump / file engines. ----
 	"mydumper.scanBareHexValue": {
