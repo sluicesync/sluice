@@ -38,6 +38,7 @@ type fakeRefusalStore struct {
 	recorded  []string
 	ensureErr error
 	ensured   int
+	recordErr error
 }
 
 func (f *fakeRefusalStore) EnsureUnforwardedRefusalStorage(context.Context) error {
@@ -46,6 +47,9 @@ func (f *fakeRefusalStore) EnsureUnforwardedRefusalStorage(context.Context) erro
 }
 
 func (f *fakeRefusalStore) RecordUnforwardedRefusal(_ context.Context, _, msg string) error {
+	if f.recordErr != nil {
+		return f.recordErr
+	}
 	f.recorded = append(f.recorded, msg)
 	f.msg, f.has = msg, true
 	return nil

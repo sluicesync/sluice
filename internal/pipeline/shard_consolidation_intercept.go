@@ -209,7 +209,7 @@ func interceptSchemaSnapshotsForCoordination(
 				// lease holder): an ADD COLUMN owes THIS shard's
 				// pre-existing rows a backfill from THIS stream's source,
 				// on the ledger from here.
-				owed, err := planBoundaryBackfill(backfill, key, pre, post, snap, RecoveryHint)
+				owed, err := planBoundaryBackfill(ctx, backfill, key, pre, post, snap, RecoveryHint)
 				if err != nil {
 					wrapped := fmt.Errorf("pipeline: shard consolidation: %w", err)
 					errStore.Store(&wrapped)

@@ -1106,6 +1106,12 @@ func (s *Streamer) phaseWireInterceptChain(applyCtx context.Context, changes <-c
 	var shapeABackfill *schemaForwardBackfill
 	if s.boundaryRouter != nil {
 		shapeABackfill = s.addedColumnBackfill(streamID, s.shapeSourceSchemaReader)
+		// The lease holder's ALTER is preceded by the backfill's durable
+		// write-ahead record (schema_forward_backfill_ledger.go).
+		s.boundaryRouter.beforeAddColumn = nil
+		if shapeABackfill != nil {
+			s.boundaryRouter.beforeAddColumn = shapeABackfill.writeAhead
+		}
 	}
 	filtered = interceptSchemaSnapshotsForCoordination(applyCtx, filtered, s.coldStartSeedSnapshots, s.boundaryRouter, snapshotNormalizer, shapeABackfill, &s.schemaSnapshotErr)
 	// ADR-0058: when --forward-schema-add-column is set AND Shape A is

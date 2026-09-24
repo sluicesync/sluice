@@ -23,7 +23,7 @@ func TestBoundaryBackfill_OnlyOnAddColumn(t *testing.T) {
 	var ledger addedColumnBackfillLedger
 	bf := &schemaForwardBackfill{reader: staticBackfillReader(reader), streamID: "s", batchSize: 10, ledger: &ledger}
 
-	owed, err := planBoundaryBackfill(bf, "public.dj", pre, post, snap, forwardRecoveryHint)
+	owed, err := planBoundaryBackfill(context.Background(), bf, "public.dj", pre, post, snap, forwardRecoveryHint)
 	if err != nil || owed == nil {
 		t.Fatalf("ADD COLUMN boundary planned %v, %v; want a backfill", owed, err)
 	}
@@ -44,7 +44,7 @@ func TestBoundaryBackfill_OnlyOnAddColumn(t *testing.T) {
 
 	// A no-op boundary (same table both sides) owes nothing and reads nothing.
 	reader.page = 0
-	none, err := planBoundaryBackfill(bf, "public.dj", post, post, snap, forwardRecoveryHint)
+	none, err := planBoundaryBackfill(context.Background(), bf, "public.dj", post, post, snap, forwardRecoveryHint)
 	if err != nil || none != nil {
 		t.Fatalf("no-op boundary planned %v, %v; want nothing", none, err)
 	}

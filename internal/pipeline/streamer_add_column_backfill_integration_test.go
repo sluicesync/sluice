@@ -94,7 +94,45 @@ func abRun(t *testing.T, lane fdLane, cells []abCell) {
 		graded = append(graded, fdCell{shape: fdShape{col: c.col, def: c.label, fam: c.fam}, maxID: id - 1})
 	}
 	fdGrade(t, lane, lane.sourceDSN, lane.targetDSN, graded)
+	// The write-ahead record each backfill left on the target is cleared
+	// WHILE the stream runs, once the backfills are durable — a hard kill
+	// from here on must not come back refusing.
+	abWaitNoRecordedRefusal(t, lane.tgt, lane.targetDSN, "test-ac-backfill", time.Minute)
 	abStopWithoutFalseRefusal(t, s)
+	abWaitNoRecordedRefusal(t, lane.tgt, lane.targetDSN, "test-ac-backfill", 0)
+}
+
+// abRecordedRefusal reads the stream's recorded refusal off the target's
+// control row (the write-ahead record, an attempt-end refusal, or none).
+func abRecordedRefusal(t *testing.T, d fdDialect, dsn, streamID string) (string, bool) {
+	t.Helper()
+	db, err := sql.Open(d.driver(), dsn)
+	if err != nil {
+		t.Fatalf("open target: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	var msg sql.NullString
+	if err := db.QueryRow(`SELECT unforwarded_refusal FROM sluice_cdc_state WHERE stream_id = '` + streamID + `'`).Scan(&msg); err != nil {
+		t.Fatalf("read the recorded refusal: %v", err)
+	}
+	return msg.String, msg.Valid
+}
+
+// abWaitNoRecordedRefusal waits up to within for the stream's control row
+// to hold no recorded refusal (0: check once).
+func abWaitNoRecordedRefusal(t *testing.T, d fdDialect, dsn, streamID string, within time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for {
+		msg, has := abRecordedRefusal(t, d, dsn, streamID)
+		if !has {
+			return
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatalf("the target still records a refusal after every backfill reached it (a hard kill now would restart refusing): %s", msg)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
 }
 
 // abStopWithoutFalseRefusal stops a stream whose backfills all reached the
@@ -482,6 +520,118 @@ func TestStreamer_AddColumnBackfill_InterruptedRefusesOnRestart_PostgresToPostgr
 	var replay *recordedUnforwardedRefusalError
 	if !errors.As(runErr, &replay) || !strings.Contains(runErr.Error(), addColumnBackfillIncompleteMarker) {
 		t.Fatalf("restart returned %v; want the recorded %s refusal", runErr, addColumnBackfillIncompleteMarker)
+	}
+}
+
+// TestStreamer_AddColumnBackfill_HardKillRefusesOnRestart_PostgresToPostgres
+// pins the write-ahead half of the ledger (schema_forward_backfill_ledger.go,
+// "The write-ahead record"). The interruption pin above is made loud by the
+// attempt's EXIT PATH; a SIGKILL, an OOM kill or power loss runs none, so
+// before the write-ahead record a hard kill mid-backfill restarted past the
+// boundary with the rest of the table unfilled, silently. The first run here
+// skips its exit-path settle (simulateHardKillForTest) and must end WITHOUT
+// the attempt-end refusal — proving the restart's refusal comes from the
+// record written before the ALTER and nothing else. The restart must refuse
+// with it, and acknowledging its fingerprint must clear it and start.
+func TestStreamer_AddColumnBackfill_HardKillRefusesOnRestart_PostgresToPostgres(t *testing.T) {
+	src, tgt, cleanup := startPostgresLogical(t)
+	defer cleanup()
+	const (
+		rows     = 60000
+		streamID = "test-ac-backfill-hardkill"
+	)
+	fdExec(t, fdPG, src, `CREATE TABLE w (id BIGINT PRIMARY KEY, name VARCHAR(80) NOT NULL)`)
+	fdExec(t, fdPG, src, fmt.Sprintf(`INSERT INTO w SELECT g, 'r' FROM generate_series(1, %d) g`, rows))
+	pgEng, ok := engines.Get("postgres")
+	if !ok {
+		t.Fatal("postgres engine not registered")
+	}
+	start := func(hardKill bool, ack string) (context.CancelFunc, chan error) {
+		s := &Streamer{
+			Source: pgEng, Target: pgEng, SourceDSN: src, TargetDSN: tgt, StreamID: streamID, SlotName: "test_ac_backfill_hardkill",
+			AcceptUnforwardedSchemaChange: ack,
+			simulateHardKillForTest:       hardKill,
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() { done <- s.Run(ctx) }()
+		return cancel, done
+	}
+	cancel, done := start(true, "")
+	defer cancel()
+	if !waitForPGRowCount(t, tgt, "w", rows, 2*time.Minute) {
+		t.Fatal("cold copy never landed")
+	}
+	fdExec(t, fdPG, src, fmt.Sprintf(`INSERT INTO w VALUES (%d, 'warm')`, rows+1))
+	if !waitForPGRowCount(t, tgt, "w", rows+1, time.Minute) {
+		t.Fatal("first CDC row never landed")
+	}
+	fdExec(t, fdPG, src, `ALTER TABLE w ADD COLUMN dj TEXT NOT NULL DEFAULT 'v'; ALTER TABLE w ALTER COLUMN dj DROP DEFAULT`)
+	fdExec(t, fdPG, src, fmt.Sprintf(`INSERT INTO w VALUES (%d, 'boundary', 'x')`, rows+2))
+	db, err := sql.Open("pgx", tgt)
+	if err != nil {
+		t.Fatalf("open target: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	deadline := time.Now().Add(time.Minute)
+	for {
+		var n int
+		if err := db.QueryRow(`SELECT count(*) FROM w WHERE id <= $1 AND dj IS NOT NULL`, rows+1).Scan(&n); err == nil && n > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no backfilled row ever reached the target")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	cancel() // the "kill" lands inside the backfill; the exit path settles nothing
+	var runErr error
+	select {
+	case runErr = <-done:
+	case <-time.After(time.Minute):
+		t.Fatal("Run did not return after the stop")
+	}
+	var nulls int
+	if err := db.QueryRow(`SELECT count(*) FROM w WHERE id <= $1 AND dj IS NULL`, rows+1).Scan(&nulls); err != nil {
+		t.Fatalf("count unfilled rows: %v", err)
+	}
+	t.Logf("killed with %d of %d pre-existing rows unfilled; Run returned: %v", nulls, rows+1, runErr)
+	if nulls == 0 {
+		t.Fatal("the kill landed after the backfill completed; the pin did not exercise an interruption")
+	}
+	if runErr != nil && strings.Contains(runErr.Error(), addColumnBackfillIncompleteMarker) {
+		t.Fatalf("the simulated hard kill still settled on its exit path (%v); the pin would not isolate the write-ahead record", runErr)
+	}
+	if msg, has := abRecordedRefusal(t, fdPG, tgt, streamID); !has || !strings.Contains(msg, "without settling it") {
+		t.Fatalf("after a hard kill mid-backfill the target holds %q (present %v); want the write-ahead %s record", msg, has, addColumnBackfillIncompleteMarker)
+	}
+
+	// The restart refuses on the write-ahead record.
+	_, done2 := start(false, "")
+	select {
+	case runErr = <-done2:
+	case <-time.After(2 * time.Minute):
+		t.Fatal("the restart did not refuse; it is running past the killed backfill")
+	}
+	var replay *recordedUnforwardedRefusalError
+	if !errors.As(runErr, &replay) || !strings.Contains(runErr.Error(), addColumnBackfillIncompleteMarker) {
+		t.Fatalf("restart returned %v; want the recorded %s refusal", runErr, addColumnBackfillIncompleteMarker)
+	}
+
+	// Acknowledging its fingerprint clears it, and the stream starts.
+	cancel3, done3 := start(false, unforwardedRefusalFingerprint(replay.recorded))
+	defer cancel3()
+	fdExec(t, fdPG, src, fmt.Sprintf(`INSERT INTO w VALUES (%d, 'after-ack', 'y')`, rows+3))
+	if !waitForPGRowCount(t, tgt, "w", rows+3, 2*time.Minute) {
+		select {
+		case err := <-done3:
+			t.Fatalf("the acknowledged restart ended: %v", err)
+		default:
+		}
+		t.Fatal("the acknowledged restart never applied a new row")
+	}
+	if msg, has := abRecordedRefusal(t, fdPG, tgt, streamID); has {
+		t.Fatalf("the acknowledged record is still on the target: %s", msg)
 	}
 }
 

@@ -93,6 +93,13 @@ type BoundaryRouter struct {
 	// wires both.
 	sourceDefaults sourceDefaultReaders
 
+	// beforeAddColumn, when set, runs before this stream applies an ADD
+	// COLUMN as the lease holder (or as a takeover re-apply): the durable
+	// write-ahead record of the backfill the ALTER makes owed
+	// ([schemaForwardBackfill.writeAhead]). An error refuses the apply. nil
+	// when the stream opted out of the backfill.
+	beforeAddColumn func(ctx context.Context, tableName string, columns []string) error
+
 	// observePollInterval controls how often the observer loop polls
 	// the lease row when a peer holds the lease. Default 2 seconds;
 	// tests can shrink it via NewBoundaryRouter's option-arg path
@@ -338,7 +345,7 @@ func (r *BoundaryRouter) handleHeldLease(
 
 	if !lease.Takeover() {
 		// Normal lease-holder path: apply the shape, then finalize.
-		if err := r.applyShape(ctx, target, targetShape); err != nil {
+		if err := r.applyShape(ctx, lease.tableName, target, targetShape); err != nil {
 			return fmt.Errorf("pipeline: route boundary: apply shape %s: %w", shape.Kind, err)
 		}
 		return r.mgr.Apply(ctx, lease, schemaVersion, ddlText, checksum, anchor)
@@ -372,7 +379,7 @@ func (r *BoundaryRouter) handleHeldLease(
 			"stream_id", r.mgr.streamID,
 			"shape", shape.Kind.String(),
 		)
-		if err := r.applyShape(ctx, target, targetShape); err != nil {
+		if err := r.applyShape(ctx, lease.tableName, target, targetShape); err != nil {
 			return fmt.Errorf("pipeline: route boundary: takeover apply shape %s: %w", shape.Kind, err)
 		}
 		return r.mgr.Apply(ctx, lease, schemaVersion, ddlText, checksum, anchor)
@@ -392,7 +399,16 @@ func (r *BoundaryRouter) handleHeldLease(
 // the single-stream ADR-0091 forwarding intercept use the identical
 // proven dispatch. target / shape are the [retargetShapeForTarget]
 // outputs — handleHeldLease resolves them once per boundary.
-func (r *BoundaryRouter) applyShape(ctx context.Context, target *ir.Table, shape Shape) error {
+//
+// An ADD COLUMN first records the backfill it makes owed
+// ([BoundaryRouter.beforeAddColumn]) under tableName, the boundary's own
+// key, so the plan-time write for the same boundary is a no-op.
+func (r *BoundaryRouter) applyShape(ctx context.Context, tableName string, target *ir.Table, shape Shape) error {
+	if shape.Kind == ShapeKindAddColumn && r.beforeAddColumn != nil {
+		if err := r.beforeAddColumn(ctx, tableName, columnNames(shape.AddedColumns)); err != nil {
+			return fmt.Errorf("%w. %s", err, RecoveryHint(tableName))
+		}
+	}
 	return applyShapeDelta(ctx, r.applier, target, shape)
 }
 

@@ -1488,6 +1488,16 @@ type Streamer struct {
 	// ([Streamer.settleAddedColumnBackfills]). Shared across attempts.
 	addedColumnBackfills addedColumnBackfillLedger
 
+	// simulateHardKillForTest makes the attempt's exit path skip the
+	// backfill settle — what a SIGKILL, an OOM kill or power loss does — so
+	// a real-server test can pin that the write-ahead record alone makes
+	// the restart refuse. Never set outside tests.
+	simulateHardKillForTest bool
+
+	// backfillDurabilityIntervalForTest, when > 0, replaces
+	// [addedColumnBackfillDurabilityInterval] for the mid-run settle.
+	backfillDurabilityIntervalForTest time.Duration
+
 	// addColumnForwardSchemaReader is the source-side schema reader
 	// used by the ADR-0058 §2a volatility probe (Bug 90 closure,
 	// v0.79.1). Always opened alongside [addColumnForwardWriter] when
@@ -1857,6 +1867,11 @@ func (s *Streamer) runOnce(ctx context.Context) (err error) {
 	// defer above then records, because a restart does not resume it
 	// (schema_forward_backfill_ledger.go). Declared after, so it runs first.
 	defer func() { err = s.settleAddedColumnBackfills(ctx, applier, streamID, err) }()
+	// The owed backfills' write-ahead record goes through this attempt's
+	// applier, and is cleared mid-run once they are durable; the watch is
+	// declared after the settle, so it has stopped before the settle runs.
+	s.addedColumnBackfills.bind(applier, streamID)
+	defer s.watchAddedColumnBackfillDurability(ctx, applier, streamID)()
 	// ADR-0054 Phase 2d: release shape-coordination resources when
 	// engaged (SchemaWriter for per-shape DDL; the lease store /
 	// prober live on the applier and are released by migcore.CloseIf above).

@@ -36,8 +36,9 @@ package pipeline
 // An interrupted backfill does NOT resume — the boundary is not seen again
 // by a reopened stream. What stands between that and silent loss is the
 // ledger in schema_forward_backfill_ledger.go, which ends the run with the
-// recorded ADD-COLUMN-BACKFILL-INCOMPLETE refusal; its residual (a process
-// killed without running its exit path) is stated there.
+// recorded ADD-COLUMN-BACKFILL-INCOMPLETE refusal — written to the target
+// before the ALTER, so a process killed without running its exit path
+// restarts refusing too; its residuals are stated there.
 
 import (
 	"context"
@@ -244,6 +245,7 @@ type boundaryBackfill struct {
 // function of its inputs, so the two cannot disagree, and neither the
 // router nor the forwarder needs the change channel for it.
 func planBoundaryBackfill(
+	ctx context.Context,
 	bf *schemaForwardBackfill,
 	tableName string,
 	pre, post *ir.Table,
@@ -260,9 +262,25 @@ func planBoundaryBackfill(
 	}
 	b := &boundaryBackfill{bf: bf, tableName: tableName, snap: snap, added: shape.AddedColumns, hint: hint}
 	if bf != nil {
+		// Written before the ALTER on the paths that apply it; this is the
+		// write for a Shape A stream that only observed a peer's ALTER, and
+		// a no-op when the pre-ALTER write already covers the table.
+		if err := bf.writeAhead(ctx, tableName, columnNames(shape.AddedColumns)); err != nil {
+			return nil, fmt.Errorf("%w. %s", err, hint(tableName))
+		}
 		b.owed = bf.ledger.open(tableName, columnNames(shape.AddedColumns))
 	}
 	return b, nil
+}
+
+// writeAhead durably records the backfill tableName's added columns owe
+// ([addedColumnBackfillLedger.writeAhead]). nil-safe: an opted-out stream
+// owes none.
+func (bf *schemaForwardBackfill) writeAhead(ctx context.Context, tableName string, columns []string) error {
+	if bf == nil {
+		return nil
+	}
+	return bf.ledger.writeAhead(ctx, tableName, columns)
 }
 
 // run executes the planned backfill (or, opted out, reports what that

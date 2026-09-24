@@ -329,7 +329,7 @@ func interceptAddColumnForward(
 				}
 				// An ADD COLUMN owes the rows the target already held a
 				// backfill from the source; it is on the ledger from here.
-				owed, err := planBoundaryBackfill(deps.backfill, key, pre, post, snap, deps.hint)
+				owed, err := planBoundaryBackfill(ctx, deps.backfill, key, pre, post, snap, deps.hint)
 				if err != nil {
 					wrapped := fmt.Errorf("pipeline: forward schema add-column: %w", err)
 					errStore.Store(&wrapped)
@@ -852,6 +852,12 @@ func applyAddColumnForward(
 	// type policy is shared with migrate, so the warning about it is too.
 	emitCrossEngineTranslationNotices(ctx, addedColumnsSchema(post, shape.AddedColumns),
 		deps.sourceEngineName, deps.targetEngineName, "sync schema-forward")
+	// The backfill this ALTER makes owed is recorded on the target first, so
+	// a process killed before the backfill settles restarts refusing
+	// (schema_forward_backfill_ledger.go, "The write-ahead record").
+	if err := deps.backfill.writeAhead(ctx, tableName, columnNames(shape.AddedColumns)); err != nil {
+		return fmt.Errorf("%w. %s", err, forwardRecoveryHint(tableName))
+	}
 	if err := deps.applier.AlterAddColumn(ctx, retargetedTable, retargetedAdded); err != nil {
 		return fmt.Errorf("alter add column on %q: %w. %s",
 			tableName, err, forwardRecoveryHint(tableName))
