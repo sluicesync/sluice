@@ -790,6 +790,12 @@ func applyAddColumnForward(
 		post, shape.AddedColumns,
 		deps.sourceEngineName, deps.targetEngineName,
 	)
+	// The forwarded column gets the same up-front translation notices a
+	// cold-start copy of it would have (an unconstrained PG numeric landing
+	// as MySQL DECIMAL(65,30), a wide varchar down-mapped to TEXT, …): the
+	// type policy is shared with migrate, so the warning about it is too.
+	emitCrossEngineTranslationNotices(ctx, addedColumnsSchema(post, shape.AddedColumns),
+		deps.sourceEngineName, deps.targetEngineName, "sync schema-forward")
 	if err := deps.applier.AlterAddColumn(ctx, retargetedTable, retargetedAdded); err != nil {
 		return fmt.Errorf("alter add column on %q: %w. %s",
 			tableName, err, forwardRecoveryHint(tableName))
@@ -812,6 +818,29 @@ func applyAddColumnForward(
 			tableName, err, forwardRecoveryHint(tableName))
 	}
 	return nil
+}
+
+// addedColumnsSchema is the one-table schema of just the forwarded added
+// columns, resolved by name against post (the raw source IR the ALTER is
+// built from — shape.AddedColumns come off the comparison lens), for the
+// cross-engine translation-notice scanners.
+func addedColumnsSchema(post *ir.Table, added []*ir.Column) *ir.Schema {
+	if post == nil {
+		return nil
+	}
+	names := make(map[string]bool, len(added))
+	for _, c := range added {
+		if c != nil {
+			names[c.Name] = true
+		}
+	}
+	tbl := &ir.Table{Schema: post.Schema, Name: post.Name}
+	for _, c := range post.Columns {
+		if c != nil && names[c.Name] {
+			tbl.Columns = append(tbl.Columns, c)
+		}
+	}
+	return &ir.Schema{Tables: []*ir.Table{tbl}}
 }
 
 // refuseComputedDefaults walks the added columns and returns an

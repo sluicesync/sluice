@@ -73,6 +73,10 @@ import (
 //     appends the mask, so PG renders `host(c)` ONLY when the mask is the
 //     full width of the family (the one mask a bare address implies) and
 //     `c::text` otherwise — a narrowed mask still shows.
+//   - fdDecimal: fdText with trailing zeros RIGHT OF A POINT dropped on
+//     both sides (PG `trim_scale`, MySQL the same trim in SQL), because
+//     an unconstrained numeric lands on MySQL at DECIMAL(65,30)'s display
+//     scale. A truncated value (1 for 1.10) still differs.
 //
 // SQL NULL renders as <NULL> on both sides and compares as itself.
 //
@@ -103,6 +107,13 @@ const (
 	// PG `time` and the MySQL `TIME(6)` it maps to compare equal when their
 	// values are.
 	fdTime
+	// fdDecimal is fdText with trailing FRACTIONAL zeros (and a then-bare
+	// point) dropped on both sides: an unconstrained PG numeric lands on
+	// MySQL as DECIMAL(65,30) by the migrate policy, so 1.10 reads back as
+	// 1.100000000000000000000000000000 — the same value at a wider display
+	// scale. Only zeros right of a point are dropped, so a truncated 1 still
+	// differs from 1.1, and an integer's own zeros are never touched.
+	fdDecimal
 )
 
 // fdDialect is which engine's SQL a grading query is written in.
@@ -226,6 +237,8 @@ func fdCanonExpr(d fdDialect, fam fdFamily, col string) string {
 			return "array_to_string(" + c + ", ',', '<NULL-ELEMENT>')"
 		case fdInet:
 			return "CASE WHEN masklen(" + c + ") = CASE family(" + c + ") WHEN 4 THEN 32 ELSE 128 END THEN host(" + c + ") ELSE " + c + "::text END"
+		case fdDecimal:
+			return "trim_scale(" + c + ")::text"
 		default:
 			return c + "::text"
 		}
@@ -239,6 +252,9 @@ func fdCanonExpr(d fdDialect, fam fdFamily, col string) string {
 			return "LOWER(HEX(" + c + "))"
 		case fdBit:
 			return "CAST(" + c + "+0 AS CHAR)"
+		case fdDecimal:
+			s := "CAST(" + c + " AS CHAR)"
+			return "CASE WHEN LOCATE('.', " + s + ") > 0 THEN TRIM(TRAILING '.' FROM TRIM(TRAILING '0' FROM " + s + ")) ELSE " + s + " END"
 		default:
 			return "CAST(" + c + " AS CHAR)"
 		}
@@ -959,7 +975,7 @@ func fdPGShapes() []fdShape {
 		{"j_jsonbkv", `JSONB DEFAULT '{"a": 1}'`, fdText},
 		{"u_uuid", "UUID DEFAULT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'", fdText},
 		{"g_expr", "INTEGER DEFAULT (1 + 2)", fdText},
-		{"d_numfree", "NUMERIC DEFAULT 1.10", fdText},
+		{"d_numfree", "NUMERIC DEFAULT 1.10", fdDecimal},
 		{"t_interval", "INTERVAL DEFAULT '1 day 02:00:00'", fdText},
 		{"n_inet", "INET DEFAULT '10.0.0.1'", fdInet},
 		{"a_int", "INTEGER[] DEFAULT '{1,2}'", fdText},
@@ -1020,11 +1036,6 @@ func TestStreamer_AddColumnForward_PreexistingRowDefaults_PostgresToPostgres(t *
 			fdLoud(t, all, "j_jsonbkv", "invalid input syntax for type json",
 				"a jsonb column forwarded after another forward fails to apply its first row").
 				afterAlter().after(fdPrelude),
-			// KNOWN LOUD DEFECT: an unconstrained NUMERIC added mid-stream
-			// is emitted as NUMERIC(0,…) (pgoutput's typmod -1 read as a
-			// precision), which the target ALTER rejects.
-			fdLoud(t, all, "d_numfree", "numeric precision 0 must be between 1 and 1000",
-				"unconstrained NUMERIC forwarded with precision 0"),
 			// KNOWN LOUD DEFECT: a column of an existing enum type is
 			// forwarded as a synthesised w_<col>_enum type that rejects the
 			// source's own label on the first carried row.
@@ -1058,13 +1069,6 @@ func TestStreamer_AddColumnForward_PreexistingRowDefaults_PostgresToMySQL(t *tes
 			fdDefaultDropped("MySQL emitter drops a DEFAULT on a TEXT / BLOB / JSON target column",
 				"s_text", "s_empty", "s_quote", "s_bslash", "s_estr", "s_unicode", "s_nullword", "s_nn",
 				"x_bytea", "x_bytea2", "x_bytea3", "x_byteaempty", "j_jsonb", "j_jsonbkv", "a_int", "a_text"),
-			map[string]fdKnownWrong{
-				// KNOWN DEFECT (type mapping, not only the default): an unconstrained
-				// NUMERIC forwarded to MySQL becomes a scale-0 DECIMAL, so the
-				// default 1.10 lands as 1 — and so does every carried value. The
-				// Postgres → Postgres lane refuses the same column loudly.
-				"d_numfree": {target: "1", defect: "unconstrained NUMERIC forwarded to MySQL as a scale-0 DECIMAL"},
-			},
 		),
 		halts: []fdHalt{
 			// A designed type refusal, not a DEFAULT defect: MySQL has no

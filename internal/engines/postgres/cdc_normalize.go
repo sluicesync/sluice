@@ -30,7 +30,8 @@ import "sluicesync.dev/sluice/internal/ir"
 //
 // The `id` column's `Integer.AutoIncrement` was the smoking-gun field
 // for the catalogued repro. The other known-asymmetric fields
-// (Char/Varchar/Text Collation, Decimal.Unconstrained) are normalized
+// (Char/Varchar/Text Collation; Decimal.Unconstrained, which the CDC side
+// has carried too since GC-36) are normalized
 // pre-emptively because the same Bug 84 shape will fire on any column
 // whose SchemaReader projection populates them — different sluice-
 // testing rigs use different column types and we'd rather close the
@@ -216,16 +217,33 @@ func normalizeTypeForCDCComparison(t ir.Type) ir.Type {
 		v.Determinism = ir.CollationDeterminismUnknown
 		return v
 	case ir.Decimal:
-		// The SchemaReader sets Unconstrained=true for bare `numeric`
-		// (no precision/scale declared); the CDC OID-to-type mapper
-		// emits Decimal{Precision:0, Scale:0, Unconstrained:false} for
-		// typmod=-1. Collapse both to the (0,0,false) shape so the
-		// comparison treats them as equivalent.
-		if v.Unconstrained {
-			v.Unconstrained = false
-			v.Precision = 0
-			v.Scale = 0
+		// Both registries now project a bare `numeric` as
+		// Unconstrained=true (the CDC OID mapper decoded typmod -1 as
+		// Decimal{0,0} until GC-36). The legacy {0,0} spelling still
+		// collapses INTO the unconstrained form — never the reverse:
+		// normalized types can reach a forwarded ADD COLUMN payload, and
+		// {0,0} emits NUMERIC(0,0) / DECIMAL(0,0), the GC-36 defect
+		// itself. PG refuses numeric(0,…) at CREATE, so no declared
+		// column can be {0,0}.
+		if v.Unconstrained || (v.Precision == 0 && v.Scale == 0) {
+			return ir.Decimal{Unconstrained: true}
 		}
+		return v
+	case ir.Array:
+		// pgoutput carries an array column's typmod, but the CDC projection
+		// resolves the ELEMENT at typmod -1 by design (see [oidToType]'s
+		// array arm and the TYPMOD-PROJECTION-GATE refuse list), while the
+		// SchemaReader threads the typmod onto the element (Bug 195). So a
+		// `numeric(10,2)[]` / `varchar(20)[]` / `char(3)[]` /
+		// `timestamp(3)[]` column read one way at cold start and another at
+		// the first boundary: a phantom AlterColumnType, which alongside a
+		// real ADD COLUMN is the multi-shape combo refusal — every sync on
+		// such a table halted at its first forwarded column (found by the
+		// GC-36 seed-vs-projection agreement test). Erasing the element's
+		// modifier on both sides loses no detectable signal: a typmod-only
+		// ALTER of an array column refuses at the reader
+		// ([checkSchemaRace]) before it could reach this comparison.
+		v.Element = normalizeTypeForCDCComparison(eraseArrayElementModifier(v.Element))
 		return v
 	case ir.DateTime:
 		// Bug 86 (v0.78.1) + TRIAGE #3 regression fix: the temporal
@@ -309,6 +327,31 @@ func normalizeTypeForCDCComparison(t ir.Type) ir.Type {
 		// can't be classifier-detected via CDC — but pgoutput doesn't carry
 		// it anyway, and a new label simply applies as text on the target.
 		return ir.Enum{}
+	}
+	return t
+}
+
+// eraseArrayElementModifier maps an array element to what the CDC
+// projection resolves it to at typmod -1 — the modifier-free form of its
+// family — so [normalizeTypeForCDCComparison]'s ir.Array arm compares the
+// seed's element (modifier threaded from atttypmod) and the projection's
+// (modifier absent) at the family level. Each arm is the -1 reading of the
+// matching [oidToType] arm: numeric → unconstrained, bpchar / varchar →
+// unbounded Text (a one-byte "char" element too, which the schema reader
+// reads as unbounded "character"), temporal → the bare form. Families
+// without a modifier pass through.
+func eraseArrayElementModifier(t ir.Type) ir.Type {
+	switch v := t.(type) {
+	case ir.Decimal:
+		return ir.Decimal{Unconstrained: true}
+	case ir.Char, ir.Varchar:
+		return ir.Text{Size: ir.TextLong}
+	case ir.DateTime:
+		return ir.DateTime{PrecisionUnspecified: true}
+	case ir.Time:
+		return ir.Time{WithTimeZone: v.WithTimeZone, PrecisionUnspecified: true}
+	case ir.Timestamp:
+		return ir.Timestamp{WithTimeZone: v.WithTimeZone, PrecisionUnspecified: true}
 	}
 	return t
 }

@@ -102,13 +102,33 @@ var scalarFamilies = []struct {
 	// through numericTypmod, so the declared form must agree exactly.
 	{dataType: "numeric", oidName: "pgtype.NumericOID", oid: pgtype.NumericOID, typmod: 655366, meta: columnMeta{AttTypmod: 655366, NumPrec: i64p(10), NumScale: i64p(2)}},
 	{dataType: "decimal", oidName: "pgtype.NumericOID", oid: pgtype.NumericOID, typmod: 655366, meta: columnMeta{AttTypmod: 655366, NumPrec: i64p(10), NumScale: i64p(2)}},
-	{
-		dataType: "numeric", oidName: "pgtype.NumericOID", variant: "unconstrained",
-		oid: pgtype.NumericOID, typmod: -1,
-		asymmetry: "a bare `numeric` reads as ir.Decimal{Unconstrained:true} from information_schema " +
-			"(both modifiers NULL — catalog Bug 69) and as ir.Decimal{0,0} from typmod -1, because the " +
-			"wire cannot distinguish arbitrary-precision from an undeclared modifier.",
-	},
+	// The typmod -1 (bare) variant of EVERY typmod-capable family (GC-36):
+	// the representatives above all carry a declared modifier, and the
+	// bare form is exactly where the two registries decode a DIFFERENT
+	// input (information_schema NULLs vs typmod -1). A bare `numeric`
+	// stood here under a written asymmetry claiming "the wire cannot
+	// distinguish arbitrary-precision from an undeclared modifier" — false
+	// (on a numeric column they are the same thing) — and the CDC side's
+	// Decimal{0,0} forwarded a mid-stream ADD COLUMN as NUMERIC(0,0).
+	{dataType: "numeric", oidName: "pgtype.NumericOID", variant: "bare", oid: pgtype.NumericOID, typmod: -1},
+	{dataType: "decimal", oidName: "pgtype.NumericOID", variant: "bare", oid: pgtype.NumericOID, typmod: -1},
+	{dataType: "character varying", oidName: "pgtype.VarcharOID", variant: "bare", oid: pgtype.VarcharOID, typmod: -1},
+	{dataType: "character", oidName: "pgtype.BPCharOID", variant: "bare", oid: pgtype.BPCharOID, typmod: -1},
+	// Bare `bit varying` is UNBOUNDED in PG, yet both registries read it as
+	// bit varying(1) — they agree, so this gate is green; the shared
+	// reading is its own (loud: a longer value is rejected at write) wart,
+	// named in the GC-36 report, not a registry split.
+	{dataType: "bit varying", oidName: "pgtype.VarbitOID", variant: "bare", oid: pgtype.VarbitOID, typmod: -1},
+	// Declared-precision temporal and interval variants — the base rows
+	// below are the bare forms.
+	{dataType: "time without time zone", oidName: "pgtype.TimeOID", variant: "declared", oid: pgtype.TimeOID, typmod: 3, meta: columnMeta{AttTypmod: 3, DTPrec: i64p(3)}},
+	{dataType: "time with time zone", oidName: "pgtype.TimetzOID", variant: "declared", oid: pgtype.TimetzOID, typmod: 3, meta: columnMeta{AttTypmod: 3, DTPrec: i64p(3)}},
+	{dataType: "timestamp without time zone", oidName: "pgtype.TimestampOID", variant: "declared", oid: pgtype.TimestampOID, typmod: 3, meta: columnMeta{AttTypmod: 3, DTPrec: i64p(3)}},
+	{dataType: "timestamp with time zone", oidName: "pgtype.TimestamptzOID", variant: "declared", oid: pgtype.TimestamptzOID, typmod: 3, meta: columnMeta{AttTypmod: 3, DTPrec: i64p(3)}},
+	// interval(3): (INTERVAL_FULL_RANGE << 16) | 3. Neither registry
+	// carries interval modifiers (ir.Interval has none); the typmod
+	// projection gate refuses a typmod-only interval ALTER for that reason.
+	{dataType: "interval", oidName: "pgtype.IntervalOID", variant: "declared", oid: pgtype.IntervalOID, typmod: (0x7FFF << 16) | 3, meta: columnMeta{AttTypmod: (0x7FFF << 16) | 3}},
 	{dataType: "character varying", oidName: "pgtype.VarcharOID", oid: pgtype.VarcharOID, typmod: 14, meta: columnMeta{CharMaxLen: i64p(10)}},
 	{
 		dataType: "character varying", oidName: "pgtype.VarcharOID", variant: "collated",

@@ -97,19 +97,19 @@ func TestNormalizeForCDCComparison_PG(t *testing.T) {
 		}
 	})
 
-	t.Run("Decimal_Unconstrained_collapsed", func(t *testing.T) {
-		in := &ir.Table{
-			Columns: []*ir.Column{
-				{Name: "amount", Type: ir.Decimal{Unconstrained: true}},
-			},
-		}
-		out := eng.NormalizeForCDCComparison(in)
-		got := out.Columns[0].Type.(ir.Decimal)
-		if got.Unconstrained {
-			t.Errorf("Decimal.Unconstrained = true; want false (pgoutput emits typmod=-1 as (0,0))")
-		}
-		if got.Precision != 0 || got.Scale != 0 {
-			t.Errorf("Decimal{P=%d S=%d}; want (0,0) after normalize", got.Precision, got.Scale)
+	t.Run("Decimal_bare_canonical_is_unconstrained", func(t *testing.T) {
+		// Both spellings of a bare numeric — the registries' shared
+		// Unconstrained form and the legacy {0,0} the CDC mapper produced
+		// before GC-36 — collapse to Unconstrained, never to {0,0}: a
+		// normalized type can reach a forwarded ADD COLUMN, and {0,0}
+		// emits NUMERIC(0,0) / DECIMAL(0,0).
+		for _, in := range []ir.Decimal{{Unconstrained: true}, {}} {
+			out := eng.NormalizeForCDCComparison(&ir.Table{
+				Columns: []*ir.Column{{Name: "amount", Type: in}},
+			})
+			if got := out.Columns[0].Type; got != (ir.Decimal{Unconstrained: true}) {
+				t.Errorf("normalize(%#v) = %#v; want ir.Decimal{Unconstrained:true}", in, got)
+			}
 		}
 	})
 

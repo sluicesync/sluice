@@ -752,6 +752,19 @@ func oidToType(oid uint32, typmod int32) (ir.Type, error) {
 	case pgtype.Float8OID:
 		return ir.Float{Precision: ir.FloatDouble}, nil
 	case pgtype.NumericOID:
+		// Registry-parity with the schema reader's "numeric" arm (GC-36):
+		// typmod -1 on a numeric column IS the arbitrary-precision
+		// declaration — a DOMAIN's modifier is unwrapped before this call
+		// ([resolveWireColumnType]), and an array element is resolved at -1
+		// by design (see the array arm below), where bare is the honest
+		// widest reading. Projecting it as Decimal{0,0} forwarded a
+		// mid-stream `ADD COLUMN … numeric` as NUMERIC(0,0) — refused by a
+		// Postgres target, and on a MySQL target a DECIMAL(0,0) that
+		// truncated the default AND every carried value to an integer at
+		// exit 0 (catalog Bug 69's shape, on the CDC lane).
+		if typmod < 4 {
+			return ir.Decimal{Unconstrained: true}, nil
+		}
 		p, s := numericTypmod(typmod)
 		return ir.Decimal{Precision: p, Scale: s}, nil
 
@@ -765,7 +778,16 @@ func oidToType(oid uint32, typmod int32) (ir.Type, error) {
 		}
 		return ir.Varchar{Length: l}, nil
 	case pgtype.BPCharOID:
-		return ir.Char{Length: charTypmod(typmod)}, nil
+		// A bpchar with no length (typmod -1: a bare `bpchar` column, and
+		// every `char(n)[]` element, which resolves at -1 by design) is
+		// UNBOUNDED in PG. Land it on Text/long exactly as the schema
+		// reader's "character" arm does (GC-36): Char{0} emitted CHAR(0),
+		// refused by a PG target and on a MySQL target a column that can
+		// hold only the empty string.
+		if l := charTypmod(typmod); l > 0 {
+			return ir.Char{Length: l}, nil
+		}
+		return ir.Text{Size: ir.TextLong}, nil
 	case pgtype.QCharOID:
 		// PG's internal single-byte "char" type (distinct from CHARACTER(n)).
 		// Mirrors the schema reader's `_char` → "character" mapping
