@@ -403,6 +403,10 @@ type CDCReader struct {
 	pendingGTID string
 	inSourceTx  bool
 
+	// resend drops the events go-mysql re-sends after it silently
+	// re-dials the source mid-stream (cdc_reader_resend.go).
+	resend binlogResendGuard
+
 	// binlogChecksumAlg is the checksum algorithm the current binlog
 	// file's FORMAT_DESCRIPTION declares; payloadDepth is > 0 while the
 	// dispatcher is inside a TRANSACTION_PAYLOAD's inner events. Together
@@ -977,6 +981,7 @@ func (r *CDCReader) startStreamer(p binlogPos) (*replication.BinlogStreamer, err
 	// (item 132). Reset before the mode switch so BOTH modes get it.
 	r.pendingGTID = ""
 	r.inSourceTx = false
+	r.resend = binlogResendGuard{}
 	// The MariaDB lineage anchor rides every position this stream
 	// persists, unchanged from the start position (mariadb_lineage.go):
 	// lineage identity is established at the anchor, continuity past it
@@ -1054,7 +1059,7 @@ func (r *CDCReader) pump(ctx context.Context, streamer *replication.BinlogStream
 		if isRowRelevantEvent(ev) {
 			r.suppressNoEventsWatchdog()
 		}
-		if err := r.dispatch(ctx, ev, out); err != nil {
+		if err := r.deliver(ctx, ev, out); err != nil {
 			// A cancelled dispatch is the teardown, not a fault. tableFor
 			// runs a live information_schema query and the channel send
 			// parks on ctx.Done, so an ordinary Close reaches this branch
@@ -2250,6 +2255,7 @@ func (r *CDCReader) foldPendingGTID() error {
 	if err := r.gtidSet.Update(gtid); err != nil {
 		return fmt.Errorf("mysql: cdc: gtid update %q: %w", gtid, err)
 	}
+	r.resend.lastFolded = gtid
 	return nil
 }
 

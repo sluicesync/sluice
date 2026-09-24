@@ -32,9 +32,9 @@ import (
 //
 // So the grading is on the rows, against the source's own count: every row
 // of one large transaction written while the consumer is stalled arrives
-// (no loss), and the reader records no error. That rows arrive MORE than
-// once is a pinned KNOWN-WRONG cell (below). Whether the dump thread was
-// replaced is logged — it is the measurement, not the pass condition.
+// exactly once (no loss, no re-delivery), and the reader records no error.
+// The dump thread being replaced is the precondition — without it the cell
+// measured nothing.
 //
 // Per-test GTID container (startMySQLGTIDForCDC), so SET GLOBAL touches no
 // other test.
@@ -127,28 +127,38 @@ func TestCDCReader_BlockedConsumerPastNetWriteTimeout(t *testing.T) {
 			dups++
 		}
 	}
-	// KNOWN-WRONG (perf-parity gap 37, MySQL arm — measured 2026-09-24 on
-	// mysql 8.0 with GTID on: dump thread replaced, 101,936 of 150,000 rows
-	// delivered twice). The server drops the dump thread mid-transaction,
-	// go-mysql re-dials from the last COMPLETED transaction's GTID set, and
-	// the in-flight transaction is re-sent from its start — its earlier rows
-	// reach the applier twice (how the re-sent transaction's boundaries
-	// interleave with the first, partial delivery is not measured). Row
-	// images are absolute and replay in order, so
-	// the expected outcome is convergence or a loud duplicate-key refusal,
-	// NOT loss — but that is unmeasured end to end. This cell pins the
-	// re-send so a fix (dedupe the re-sent transaction in the reader, or
-	// keep the binlog socket drained while the consumer is blocked) flips it
-	// deliberately rather than silently.
-	if dups == 0 {
-		t.Errorf("KNOWN-WRONG cell flipped: no row was re-delivered across a consumer stall past net_write_timeout " +
-			"(the dump thread ids above show whether the server still dropped it). If the re-send is fixed, make this assert dups == 0 and update perf-parity gap 37")
-	} else {
-		t.Logf("KNOWN-WRONG (gap 37, MySQL arm): %d of %d rows re-delivered after go-mysql re-dialled mid-transaction", dups, rows)
+	// The server drops the dump thread mid-transaction and go-mysql re-dials
+	// from the executed set EXCLUDING the in-flight transaction, which it
+	// re-sends from its first event (measured 2026-09-24 on mysql 8.0 with
+	// GTID on, before the fix: 101,936 of 150,000 rows delivered twice; end
+	// to end that re-applied prefix stopped the stream on a unique-key
+	// collision — TestStreamer_MySQLBinlogResend_*). The reader now drops
+	// the events it already delivered (cdc_reader_resend.go), so every row
+	// arrives exactly once. The drop itself is the precondition, not the
+	// pass condition: a run where the server never dropped the dump thread
+	// measured nothing.
+	if equalIDs(dumpBefore, dumpAfter) {
+		t.Fatalf("VACUOUS: the binlog dump thread was never replaced (before %v, after %v), so no re-send happened to deduplicate", dumpBefore, dumpAfter)
+	}
+	if dups != 0 {
+		t.Errorf("%d of %d rows were delivered more than once after go-mysql re-dialled mid-transaction; "+
+			"the reader must drop the re-sent events it already delivered", dups, rows)
 	}
 	if err := rdr.Err(); err != nil {
 		t.Errorf("the reader recorded an error across the stall: %v", err)
 	}
+}
+
+func equalIDs(a, b []int64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // binlogDumpThreadIDs lists the server's binlog dump threads.
