@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"sluicesync.dev/sluice/internal/crypto"
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
@@ -30,29 +31,48 @@ import (
 //
 // An `ALTER TABLE users ADD COLUMN c … DEFAULT d` taken on the source
 // between the full and an incremental fills every row the source already
-// held with d, and that fill writes no row event. On restore, the rows the
-// full brought back therefore get c ONLY from the replayed ADD COLUMN's
-// DEFAULT. Each cell is graded per row against the SOURCE's own value
-// (read back by id), so the expected value is independent of the manifest
-// the restore replays.
+// held with d, and that fill writes no row event. Each cell is graded per
+// row against the SOURCE's own value (read back by id), so the expected
+// value is independent of the manifest the restore replays.
 //
-// Three capture lanes, because the delta is recorded by two orchestrators
-// (IncrementalBackup.Run, BackupStream's rollover) and read from two
-// source catalogs: PG `backup incremental`, PG `backup stream`, MySQL
-// `backup incremental`. The replay side (migcore.ApplyAlterDelta) is shared
-// by chain restore and the broker, so it is one lane on the replay axis.
+// Four capture lanes, because the delta is recorded by two orchestrators
+// (IncrementalBackup.Run, BackupStream's rollover) and read from two source
+// catalogs, plus the two capture lanes encrypted. The replay side
+// (migcore.ApplyAlterDelta) is shared by chain restore and the broker, so
+// it is one lane on the replay axis.
 //
-// GROUND TRUTH that reframed GC-36 (2): the recorded delta's After shape is
-// a CATALOG read at window end (ReadSchema), not the CDC projection, so a
-// constant DEFAULT is carried on every lane — the stable cells are green
-// with no fix. What is lost is everything the window-END catalog does not
-// say about the ALTER-TIME fill; those cells are knownWrong with the
-// defect named, and a cell that starts reading back the source value
-// fails the test so its entry gets removed.
+// The pre-existing rows are ids 1-3 (restored by the full) and id 4,
+// inserted IN the window but BEFORE the ALTERs, so its own INSERT carries
+// no value for the added columns: a fill replayed anywhere but after the
+// window's events would miss it. Id 5 is inserted after every ALTER and
+// carries its values in its row event.
+//
+// What the replayed ADD COLUMN cannot reproduce — a DEFAULT dropped or
+// changed later in the window (Django's AddField), a non-constant DEFAULT —
+// is carried by the capture-time fill (captureAddColumnFill), so every cell
+// must read back the source. The `d_` twins re-run each constant family as
+// a Django AddField, so every value family reaches the target through the
+// fill rather than through the replayed DEFAULT (Bug 74: the class, not a
+// representative).
 func TestIncrementalBackup_ChainRestore_AddColumnDefaults(t *testing.T) {
 	t.Run("pg-incremental", func(t *testing.T) { runACDLane(t, acdPGLane(false)) })
 	t.Run("pg-stream", func(t *testing.T) { runACDLane(t, acdPGLane(true)) })
-	t.Run("mysql-incremental", func(t *testing.T) { runACDLane(t, acdMySQLLane()) })
+	t.Run("mysql-incremental", func(t *testing.T) { runACDLane(t, acdMySQLLane(false)) })
+	t.Run("mysql-stream", func(t *testing.T) { runACDLane(t, acdMySQLLane(true)) })
+	// The fill's chunks are sealed after the window's, at the next ordinals
+	// of the same run namespace, through each lane's own CEK resolution —
+	// so an encrypted chain must open them under the ADR-0152 binding on
+	// both sealers, in both key modes.
+	t.Run("pg-incremental-encrypted-per-chunk", func(t *testing.T) {
+		lane := acdPGLane(false)
+		lane.encrypt = crypto.EncryptModePerChunk
+		runACDLane(t, lane)
+	})
+	t.Run("pg-stream-encrypted-per-chain", func(t *testing.T) {
+		lane := acdPGLane(true)
+		lane.encrypt = crypto.EncryptModePerChain
+		runACDLane(t, lane)
+	})
 }
 
 // acdCell is one ADD COLUMN shape.
@@ -64,12 +84,6 @@ type acdCell struct {
 	// post is the column's explicit value on the post-ALTER row, for a
 	// column that no longer has a default to omit it against.
 	post string
-	// knownWrong names the defect when the restored pre-existing rows are
-	// measured wrong today; empty means they must equal the source.
-	knownWrong string
-	// wantFillWarn: the replay must name this column under
-	// migcore.AddColumnFillNotReproducibleMarker.
-	wantFillWarn bool
 }
 
 // acdLane is one (source engine, capture orchestrator) combination.
@@ -86,13 +100,47 @@ type acdLane struct {
 	render func(col string) string
 	cells  []acdCell
 	stream bool
+	// preInWindow inserts id 4 in the window, before the ALTERs. Empty
+	// when the seed holds id 4 instead: the MySQL binlog reader refuses,
+	// loudly, to decode an event recorded under an older table shape once
+	// information_schema has moved on — and these captures run after the
+	// DDL. (A live `backup stream` decodes that INSERT before the ALTER.)
+	preInWindow string
+	// encrypt, when set, is the key mode every link is encrypted under.
+	encrypt string
 }
 
-// Known-wrong reasons, shared across lanes.
-const (
-	acdWindowEndDefault   = "the delta records the window-END DEFAULT; the source filled its rows with the ALTER-time one (no manifest field carries it)"
-	acdEvaluatedAtRestore = "a non-constant DEFAULT is evaluated on the target at restore time; the source's ALTER-time values are in no link (named by ADD-COLUMN-FILL-NOT-REPRODUCIBLE)"
-)
+// acdPassphrase keys the encrypted lanes.
+const acdPassphrase = "acd-fill-test-passphrase"
+
+// encryption returns the lane's encryption for a backup write — first is
+// the full, which mints the chain's salt; every later writer rebinds to it.
+func (l acdLane) encryption(t *testing.T, first bool) *lineage.BackupEncryption {
+	t.Helper()
+	if l.encrypt == "" {
+		return nil
+	}
+	enc := &lineage.BackupEncryption{Envelope: newTestPassphraseEnvelope(t, acdPassphrase), Mode: l.encrypt}
+	if !first {
+		enc.RebuildForChain = passphraseRebuildHook(acdPassphrase)
+	}
+	return enc
+}
+
+// acdDjangoTwins returns cells plus, for every constant nullable `c_` cell,
+// a `d_` twin that drops the default after the ADD — Django's AddField. The
+// twin's pre-existing rows can only get the source's value from the fill.
+func acdDjangoTwins(cells []acdCell) []acdCell {
+	out := append([]acdCell(nil), cells...)
+	for _, c := range cells {
+		if !strings.HasPrefix(c.col, "c_") || c.then != "" || strings.Contains(c.def, "NOT NULL") {
+			continue
+		}
+		twin := "d_" + strings.TrimPrefix(c.col, "c_")
+		out = append(out, acdCell{col: twin, def: c.def, then: fmt.Sprintf("ALTER TABLE users ALTER COLUMN %s DROP DEFAULT", twin), post: "NULL"})
+	}
+	return out
+}
 
 func acdPGLane(stream bool) acdLane {
 	return acdLane{
@@ -115,10 +163,11 @@ func acdPGLane(stream bool) acdLane {
 			return ir.Position{Engine: "postgres", Token: fmt.Sprintf(`{"slot":"sluice_slot","lsn":%q}`, lsn)},
 				func() { dropPGLogicalSlot(t, src, "sluice_slot") }
 		},
-		exec:   applyDDL,
-		render: func(col string) string { return fmt.Sprintf(`%q::text`, col) },
-		stream: stream,
-		cells: []acdCell{
+		exec:        applyDDL,
+		preInWindow: "INSERT INTO users (email) VALUES ('pre@x')",
+		render:      func(col string) string { return fmt.Sprintf(`%q::text`, col) },
+		stream:      stream,
+		cells: acdDjangoTwins([]acdCell{
 			{col: "c_text", def: `TEXT DEFAULT 'abc'`},
 			{col: "c_varchar", def: `VARCHAR(10) DEFAULT 'vv'`},
 			{col: "c_int", def: `INTEGER DEFAULT 42`},
@@ -135,18 +184,21 @@ func acdPGLane(stream bool) acdLane {
 			{col: "c_nn_text", def: `TEXT NOT NULL DEFAULT 'nn'`},
 			{col: "c_nn_int", def: `INTEGER NOT NULL DEFAULT 7`},
 			// Django's AddField: the default exists only for the ALTER.
-			{col: "x_django", def: `TEXT DEFAULT 'dj'`, then: `ALTER TABLE users ALTER COLUMN x_django DROP DEFAULT`, post: `'p'`, knownWrong: acdWindowEndDefault},
-			{col: "x_django_nn", def: `INTEGER NOT NULL DEFAULT 5`, then: `ALTER TABLE users ALTER COLUMN x_django_nn DROP DEFAULT`, post: `9`, knownWrong: acdWindowEndDefault},
-			{col: "x_reset", def: `TEXT DEFAULT 'first'`, then: `ALTER TABLE users ALTER COLUMN x_reset SET DEFAULT 'second'`, knownWrong: acdWindowEndDefault},
+			{col: "x_django", def: `TEXT DEFAULT 'dj'`, then: `ALTER TABLE users ALTER COLUMN x_django DROP DEFAULT`, post: `'p'`},
+			{col: "x_django_nn", def: `INTEGER NOT NULL DEFAULT 5`, then: `ALTER TABLE users ALTER COLUMN x_django_nn DROP DEFAULT`, post: `9`},
+			{col: "x_reset", def: `TEXT DEFAULT 'first'`, then: `ALTER TABLE users ALTER COLUMN x_reset SET DEFAULT 'second'`},
+			// The in-window race: a pre-existing row updated after the ADD
+			// keeps its update, then the default goes away.
+			{col: "x_race", def: `TEXT DEFAULT 'r0'`, then: `UPDATE users SET x_race = 'upd' WHERE id = 2; ALTER TABLE users ALTER COLUMN x_race DROP DEFAULT`, post: `NULL`},
 			// PG stores now()'s ALTER-time value as the fill (a STABLE
 			// default); clock_timestamp() rewrites the table per row.
-			{col: "x_now", def: `TIMESTAMPTZ DEFAULT now()`, knownWrong: acdEvaluatedAtRestore, wantFillWarn: true},
-			{col: "x_clock", def: `TIMESTAMPTZ DEFAULT clock_timestamp()`, knownWrong: acdEvaluatedAtRestore, wantFillWarn: true},
-		},
+			{col: "x_now", def: `TIMESTAMPTZ DEFAULT now()`},
+			{col: "x_clock", def: `TIMESTAMPTZ DEFAULT clock_timestamp()`},
+		}),
 	}
 }
 
-func acdMySQLLane() acdLane {
+func acdMySQLLane(stream bool) acdLane {
 	return acdLane{
 		engine: "mysql",
 		driver: "mysql",
@@ -157,19 +209,20 @@ func acdMySQLLane() acdLane {
 				email VARCHAR(255) NOT NULL,
 				PRIMARY KEY (id)
 			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-			INSERT INTO users (email) VALUES ('a@x'), ('b@x'), ('c@x');`,
+			INSERT INTO users (email) VALUES ('a@x'), ('b@x'), ('c@x'), ('pre@x');`,
 		startPos: func(t *testing.T, src string) (ir.Position, func()) {
 			file, pos := readMySQLBinlogPos(t, src)
 			return ir.Position{Engine: "mysql", Token: fmt.Sprintf(`{"mode":"file_pos","file":%q,"pos":%d}`, file, pos)}, func() {}
 		},
 		exec: applyDDLMySQL,
 		render: func(col string) string {
-			if strings.HasPrefix(col, "c_bin") {
+			if strings.Contains(col, "_bin") {
 				return fmt.Sprintf("HEX(`%s`)", col)
 			}
 			return fmt.Sprintf("CAST(`%s` AS CHAR)", col)
 		},
-		cells: []acdCell{
+		stream: stream,
+		cells: acdDjangoTwins([]acdCell{
 			{col: "c_varchar", def: `VARCHAR(10) DEFAULT 'vv'`},
 			{col: "c_int", def: `INT DEFAULT 42`},
 			{col: "c_bigint", def: `BIGINT DEFAULT -9000000000`},
@@ -180,24 +233,32 @@ func acdMySQLLane() acdLane {
 			{col: "c_date", def: `DATE DEFAULT '2020-01-02'`},
 			{col: "c_enum", def: `ENUM('a','b') DEFAULT 'b'`},
 			{col: "c_binary", def: `VARBINARY(4) DEFAULT 0x00FF`},
-			// MySQL 8.0.13+ expression defaults on TEXT/BLOB/JSON reach the
-			// chain replay and land on the MySQL target since GC-36 (4).
+			// MySQL 8.0.13+ expression defaults on TEXT/BLOB/JSON.
 			{col: "c_text", def: `TEXT DEFAULT ('abc')`},
 			{col: "c_bin_blob", def: `BLOB DEFAULT (0x00FF)`},
 			{col: "c_json", def: `JSON DEFAULT ('{"a": 1}')`},
 			{col: "c_nn_varchar", def: `VARCHAR(10) NOT NULL DEFAULT 'nn'`},
 			{col: "c_nn_int", def: `INT NOT NULL DEFAULT 7`},
-			{col: "x_django", def: `VARCHAR(10) DEFAULT 'dj'`, then: "ALTER TABLE users ALTER COLUMN x_django DROP DEFAULT", post: `'p'`, knownWrong: acdWindowEndDefault},
-			{col: "x_django_nn", def: `INT NOT NULL DEFAULT 5`, then: "ALTER TABLE users ALTER COLUMN x_django_nn DROP DEFAULT", post: `9`, knownWrong: acdWindowEndDefault},
-			{col: "x_reset", def: `VARCHAR(10) DEFAULT 'first'`, then: "ALTER TABLE users ALTER COLUMN x_reset SET DEFAULT 'second'", knownWrong: acdWindowEndDefault},
-			{col: "x_now", def: `DATETIME(6) DEFAULT CURRENT_TIMESTAMP(6)`, knownWrong: acdEvaluatedAtRestore, wantFillWarn: true},
-		},
+			{col: "x_django", def: `VARCHAR(10) DEFAULT 'dj'`, then: "ALTER TABLE users ALTER COLUMN x_django DROP DEFAULT", post: `'p'`},
+			{col: "x_django_nn", def: `INT NOT NULL DEFAULT 5`, then: "ALTER TABLE users ALTER COLUMN x_django_nn DROP DEFAULT", post: `9`},
+			{col: "x_reset", def: `VARCHAR(10) DEFAULT 'first'`, then: "ALTER TABLE users ALTER COLUMN x_reset SET DEFAULT 'second'"},
+			{col: "x_race", def: `VARCHAR(10) DEFAULT 'r0'`, then: "UPDATE users SET x_race = 'upd' WHERE id = 2; ALTER TABLE users ALTER COLUMN x_race DROP DEFAULT", post: `NULL`},
+			{col: "x_now", def: `DATETIME(6) DEFAULT CURRENT_TIMESTAMP(6)`},
+		}),
 	}
 }
 
-// runACDLane takes a full, applies every cell's ADD COLUMN (then its
-// follow-up) plus one post-ALTER write, captures one incremental with the
-// lane's orchestrator, chain-restores into the fresh target and grades.
+// acdPreRows are the ids that exist before the window's ALTERs; acdPostID
+// is the row inserted after them.
+const (
+	acdPreRows = 4
+	acdPostID  = 5
+)
+
+// runACDLane takes a full, inserts one row, applies every cell's ADD COLUMN
+// (then its follow-up) plus one post-ALTER write, captures one incremental
+// with the lane's orchestrator, chain-restores into the fresh target and
+// grades.
 func runACDLane(t *testing.T, lane acdLane) {
 	src, tgt, cleanup := lane.start(t)
 	defer cleanup()
@@ -215,7 +276,7 @@ func runACDLane(t *testing.T, lane acdLane) {
 	defer teardown()
 
 	ctx := context.Background()
-	if err := (&backup.Backup{Source: eng, SourceDSN: src, Store: store, SluiceVersion: "test"}).Run(ctx); err != nil {
+	if err := (&backup.Backup{Source: eng, SourceDSN: src, Store: store, SluiceVersion: "test", Encryption: lane.encryption(t, true)}).Run(ctx); err != nil {
 		t.Fatalf("Backup.Run: %v", err)
 	}
 	full, err := lineage.ReadManifest(ctx, store)
@@ -227,6 +288,10 @@ func runACDLane(t *testing.T, lane acdLane) {
 	full.BackupID = irbackup.ComputeBackupID(full)
 	if err := lineage.WriteManifestAt(ctx, store, lineage.ManifestFileName, full); err != nil {
 		t.Fatalf("rewrite full: %v", err)
+	}
+
+	if lane.preInWindow != "" {
+		lane.exec(t, src, lane.preInWindow)
 	}
 
 	var window []string
@@ -245,25 +310,38 @@ func runACDLane(t *testing.T, lane acdLane) {
 		}
 	}
 	window = append(window, fmt.Sprintf("INSERT INTO users (%s) VALUES (%s)", strings.Join(cols, ", "), strings.Join(vals, ", ")))
-	lane.exec(t, src, strings.Join(window, ";\n")+";")
 
+	captureLogs := &logcapture.Buffer{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(captureLogs, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	lane.exec(t, src, strings.Join(window, ";\n")+";")
 	if lane.stream {
-		acdRunStream(t, eng, src, store, full.BackupID)
+		acdRunStream(t, eng, src, store, full.BackupID, lane.encryption(t, false))
 	} else {
 		incrCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-		defer cancel()
-		if err := (&IncrementalBackup{
+		err := (&IncrementalBackup{
 			Source: eng, SourceDSN: src, Store: store, ParentRef: full.BackupID,
-			Window: 15 * time.Second, MaxChanges: 10, ChunkChanges: 10, SluiceVersion: "test",
-		}).Run(incrCtx); err != nil {
+			Window: 8 * time.Second, ChunkChanges: 3, SluiceVersion: "test", Encryption: lane.encryption(t, false),
+		}).Run(incrCtx)
+		cancel()
+		if err != nil {
+			slog.SetDefault(prev)
 			t.Fatalf("IncrementalBackup.Run: %v", err)
 		}
 	}
+	slog.SetDefault(prev)
+	if strings.Contains(captureLogs.String(), AddColumnFillNotCapturedMarker) {
+		t.Errorf("capture named a fill it could not record on a keyed table: %s", captureLogs.String())
+	}
+	acdAssertFillRecorded(t, store, lane)
 
 	logBuf := &logcapture.Buffer{}
-	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(logBuf, &slog.HandlerOptions{Level: slog.LevelInfo})))
-	restoreErr := (&backup.Restore{Target: eng, TargetDSN: tgt, Store: store}).Run(ctx)
+	restore := &backup.Restore{Target: eng, TargetDSN: tgt, Store: store}
+	if lane.encrypt != "" {
+		restore.Envelope = envelopeFromManifest(t, store, acdPassphrase)
+	}
+	restoreErr := restore.Run(ctx)
 	slog.SetDefault(prev)
 	if restoreErr != nil {
 		t.Fatalf("Restore.Run: %v", restoreErr)
@@ -272,22 +350,77 @@ func runACDLane(t *testing.T, lane acdLane) {
 	if !strings.Contains(logs, "applied ADD COLUMN") {
 		t.Fatalf("restore applied no ADD COLUMN — the gate graded nothing it claims to (logs: %s)", logs)
 	}
+	// Every added column's fill was captured, so the restore reproduces the
+	// source and has nothing to name. (Chains without a fill record — those
+	// an older build captured — are TestApplyAlterDelta_NamesAnUnreproducibleAddColumnFill.)
+	for _, line := range strings.Split(logs, "\n") {
+		if strings.Contains(line, migcore.AddColumnFillNotReproducibleMarker) {
+			t.Errorf("restore named a column whose fill the chain carries: %s", line)
+		}
+	}
 
 	for _, c := range lane.cells {
-		acdGradeCell(t, lane, src, tgt, c, logs)
+		acdGradeCell(t, lane, src, tgt, c)
+	}
+}
+
+// acdAssertFillRecorded checks the capture stamped a fill covering every
+// added column on the incremental's delta. Structural only — the values are
+// graded against the source by acdGradeCell.
+func acdAssertFillRecorded(t *testing.T, store irbackup.Store, lane acdLane) {
+	t.Helper()
+	records, err := lineage.ListAllManifestsViaWalk(context.Background(), store)
+	if err != nil {
+		t.Fatalf("list manifests: %v", err)
+	}
+	var fill *irbackup.AddColumnFill
+	for _, r := range records {
+		for _, d := range r.Manifest.SchemaDelta {
+			if d != nil && d.AddColumnFill != nil {
+				fill = d.AddColumnFill
+				acdAssertChunksSealed(t, r.Manifest, lane)
+			}
+		}
+	}
+	if fill == nil {
+		// Error, not Fatal: the per-row grades below are the evidence that
+		// matters, and they must still run.
+		t.Error("no incremental recorded an ADD COLUMN fill")
+		return
+	}
+	if fill.Skipped != "" || fill.Rows != acdPreRows+1 || len(fill.Columns) != len(lane.cells) {
+		t.Errorf("fill = %+v; want every one of %d columns captured over %d rows", fill, len(lane.cells), acdPreRows+1)
+	}
+}
+
+// acdAssertChunksSealed checks an encrypted lane's fill-bearing incremental
+// really is encrypted, in its key mode — so the lane's green is a statement
+// about sealed fill chunks and not a plaintext run.
+func acdAssertChunksSealed(t *testing.T, m *irbackup.Manifest, lane acdLane) {
+	t.Helper()
+	if lane.encrypt == "" {
+		return
+	}
+	for i, c := range m.ChangeChunks {
+		switch {
+		case c.Encryption == nil:
+			t.Errorf("change chunk %d (%s) is plaintext on an encrypted lane", i, c.File)
+		case lane.encrypt == crypto.EncryptModePerChunk && len(c.Encryption.WrappedCEK) == 0:
+			t.Errorf("change chunk %d (%s) carries no per-chunk CEK", i, c.File)
+		}
 	}
 }
 
 // acdRunStream runs `backup stream` until at least one rollover has
 // committed and the count has settled, then stops it.
-func acdRunStream(t *testing.T, eng ir.Engine, src string, store irbackup.Store, parent string) {
+func acdRunStream(t *testing.T, eng ir.Engine, src string, store irbackup.Store, parent string, enc *lineage.BackupEncryption) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	stream := &BackupStream{
 		Source: eng, SourceDSN: src, Store: store, ParentRef: parent,
 		RolloverWindow: 2 * time.Second, RolloverMaxChanges: 10, RolloverMaxBytes: 1 << 30,
-		ChunkChanges: 100, SluiceVersion: "test",
+		ChunkChanges: 3, SluiceVersion: "test", Encryption: enc,
 	}
 	done := make(chan error, 1)
 	go func() { done <- stream.Run(ctx) }()
@@ -322,52 +455,29 @@ func acdRunStream(t *testing.T, eng ir.Engine, src string, store irbackup.Store,
 	}
 }
 
-// acdGradeCell grades one cell's rows and its fill WARN.
-func acdGradeCell(t *testing.T, lane acdLane, src, tgt string, c acdCell, logs string) {
+// acdGradeCell grades one cell's rows against the source.
+func acdGradeCell(t *testing.T, lane acdLane, src, tgt string, c acdCell) {
 	t.Helper()
 	want := acdColumnByID(t, lane, src, c.col)
 	got := acdColumnByID(t, lane, tgt, c.col)
-	if len(want) != 4 || len(got) != len(want) {
-		t.Errorf("%s: row counts source=%d target=%d; want 4 each", c.col, len(want), len(got))
+	if len(want) != acdPostID || len(got) != len(want) {
+		t.Errorf("%s: row counts source=%d target=%d; want %d each", c.col, len(want), len(got), acdPostID)
 		return
 	}
-	// The post-ALTER row carries an explicit value in its row event, so
-	// it must match on every cell; ids 1-3 are the pre-existing rows.
+	// The post-ALTER row carries an explicit value in its row event, so a
+	// miss there is the replay, not the fill.
+	if got[acdPostID] != want[acdPostID] {
+		t.Errorf("%s (%s): the post-ALTER row id=%d reads %q, source %q — the row event's own value did not land",
+			c.col, c.def, acdPostID, got[acdPostID], want[acdPostID])
+	}
 	var wrong []string
-	for id := int64(1); id <= 4; id++ {
-		if got[id] == want[id] {
-			continue
+	for id := int64(1); id <= acdPreRows; id++ {
+		if got[id] != want[id] {
+			wrong = append(wrong, fmt.Sprintf("id=%d source %q target %q", id, want[id], got[id]))
 		}
-		if id == 4 {
-			t.Errorf("%s (%s): the post-ALTER row id=4 reads %q, source %q — the row event's own value did not land", c.col, c.def, got[id], want[id])
-			continue
-		}
-		wrong = append(wrong, fmt.Sprintf("id=%d source %q target %q", id, want[id], got[id]))
 	}
-	switch {
-	case c.knownWrong == "" && len(wrong) > 0:
+	if len(wrong) > 0 {
 		t.Errorf("%s (%s): WRONG — pre-existing rows restored without the source's fill: %s", c.col, c.def, strings.Join(wrong, "; "))
-	case c.knownWrong != "" && len(wrong) == 0:
-		t.Errorf("%s (%s): NOW-CORRECT — known-wrong cell reads back the source value on every pre-existing row; remove its knownWrong (%s)", c.col, c.def, c.knownWrong)
-	case c.knownWrong != "":
-		t.Logf("%s (%s): KNOWN-WRONG (%s): %s", c.col, c.def, c.knownWrong, strings.Join(wrong, "; "))
-	}
-
-	// Per line: other WARNs (the MySQL emitter's dropped-default one) name
-	// the same column.
-	warned := false
-	for _, line := range strings.Split(logs, "\n") {
-		if strings.Contains(line, migcore.AddColumnFillNotReproducibleMarker) &&
-			strings.Contains(line, fmt.Sprintf(`"column":%q`, c.col)) {
-			warned = true
-		}
-	}
-	if c.wantFillWarn && !warned {
-		t.Errorf("%s (%s): restore did not name the column under %s — its pre-existing rows differ from the source silently",
-			c.col, c.def, migcore.AddColumnFillNotReproducibleMarker)
-	}
-	if !c.wantFillWarn && warned {
-		t.Errorf("%s (%s): restore named a constant DEFAULT under %s", c.col, c.def, migcore.AddColumnFillNotReproducibleMarker)
 	}
 }
 

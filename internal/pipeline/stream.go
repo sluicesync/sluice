@@ -1477,6 +1477,14 @@ func (b *BackupStream) runRollover(
 		if err := b.refreshSchemaAndAttachDelta(ctx, manifest, beforeSchema); err != nil {
 			return out, err
 		}
+		// The ADD COLUMN fill, the incremental lane's twin (see
+		// [captureAddColumnFill]). Skipped with the refresh on a
+		// cancelled window: no delta, so nothing to fill.
+		fillBytes, err := captureAddColumnFill(ctx, b.Source, b.SourceDSN, newFillChunkBuffer(b, manifest, chainCEK), chunkSize)
+		if err != nil {
+			return out, fmt.Errorf("rollover: %w", err)
+		}
+		out.TotalBytes += fillBytes
 	}
 
 	// Stamp the CDC-position fold version FIRST (item 57) so ComputeBackupID
@@ -1687,6 +1695,7 @@ func (b *BackupStream) captureWindow(
 	// the window ctx + out for the boundary select cases below.
 	cb := &changeChunkBuffer{
 		b:            b,
+		sealer:       b,
 		manifest:     manifest,
 		runNamespace: changeChunkRunNamespace(manifest),
 		chainCEK:     chainCEK,
@@ -1813,8 +1822,17 @@ func (b *BackupStream) captureWindow(
 // flushTo / open / processChange share it while keeping captureWindow's
 // select loop under the complexity ceiling. Single-goroutine: every
 // method runs on captureWindow's own goroutine.
+//
+// It also writes the ADD COLUMN fill chunks both capture lanes append after
+// their window closes ([captureAddColumnFill]), which is why sealing a chunk
+// goes through sealer rather than b: the one-shot `backup incremental`
+// lane has no [BackupStream].
 type changeChunkBuffer struct {
+	// b is the stream whose window this is, for processChange's
+	// segment-dedup floor and advancement test. Nil on a fill buffer,
+	// which never calls processChange.
 	b            *BackupStream
+	sealer       changeChunkSealer
 	manifest     *irbackup.Manifest
 	runNamespace string
 	chainCEK     []byte
@@ -1856,7 +1874,7 @@ func (cb *changeChunkBuffer) flushTo(putCtx context.Context, out *captureOutcome
 	path := changeChunkPath(cb.runNamespace, cb.chunkIdx)
 	hash := cb.writer.Hash()
 	nb := int64(cb.buf.Len())
-	if err := cb.b.segStore.Put(putCtx, path, cb.buf); err != nil {
+	if err := cb.sealer.changeChunkStore().Put(putCtx, path, cb.buf); err != nil {
 		return fmt.Errorf("store put %q: %w", path, err)
 	}
 	ci := &irbackup.ChunkInfo{
@@ -1864,7 +1882,7 @@ func (cb *changeChunkBuffer) flushTo(putCtx context.Context, out *captureOutcome
 		RowCount: cb.writer.ChangeCount(),
 		SHA256:   hash,
 	}
-	if cb.b.Encryption != nil {
+	if cb.sealer.changeChunksEncrypted() {
 		ci.Encryption = &irbackup.ChunkEncryption{
 			Algorithm:  crypto.AlgorithmAESGCM,
 			NonceLen:   crypto.NonceLen,
@@ -1887,7 +1905,7 @@ func (cb *changeChunkBuffer) flushTo(putCtx context.Context, out *captureOutcome
 // chunk arrives.
 func (cb *changeChunkBuffer) open() error {
 	cb.buf = &bytes.Buffer{}
-	cek, wrapped, err := cb.b.resolveChunkCEK(cb.chainCEK)
+	cek, wrapped, err := cb.sealer.resolveChunkCEK(cb.chainCEK)
 	if err != nil {
 		return fmt.Errorf("resolve chunk cek: %w", err)
 	}
@@ -1896,7 +1914,7 @@ func (cb *changeChunkBuffer) open() error {
 	// will record it at (chunkIdx only advances at flush, so open and
 	// flush agree; the ordinal guards change-REPLAY order).
 	path := changeChunkPath(cb.runNamespace, cb.chunkIdx)
-	w, err := blobcodec.NewChangeChunkWriter(cb.buf, cek, cb.b.segCodec, irbackup.ChangeChunkAADForWrite(cb.manifest, path, cb.chunkIdx, cek))
+	w, err := blobcodec.NewChangeChunkWriter(cb.buf, cek, cb.sealer.changeChunkCodec(), irbackup.ChangeChunkAADForWrite(cb.manifest, path, cb.chunkIdx, cek))
 	if err != nil {
 		return fmt.Errorf("open chunk: %w", err)
 	}

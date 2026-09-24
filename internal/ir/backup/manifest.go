@@ -657,6 +657,45 @@ type SchemaDeltaEntry struct {
 	// After is the table's shape at the end of the incremental's
 	// window. Nil for SchemaDeltaDropTable.
 	After *ir.Table `json:"after,omitempty"`
+
+	// AddColumnFill records what the capture did about the values the
+	// source filled this delta's ADDED columns with. Set only on an
+	// alter_table delta that adds a non-generated column, by a build that
+	// captures the fill; nil everywhere else, including on every delta an
+	// older build wrote. See [AddColumnFill].
+	AddColumnFill *AddColumnFill `json:"add_column_fill,omitempty"`
+}
+
+// AddColumnFill is the capture-time record of an ADD COLUMN's fill.
+//
+// `ALTER TABLE t ADD COLUMN c … DEFAULT d` fills every row t already holds,
+// and that fill writes no row event, so the change stream carries nothing
+// that describes it. The delta's After records only the WINDOW-END default,
+// which is not the value the source filled with when the default was
+// dropped or changed later in the window (Django's AddField) or is
+// re-evaluated per call (now(), gen_random_uuid()). So the capture reads the
+// added columns' actual values back from the source after the window closes
+// and records them in the incremental's own change chunks, as ordinary
+// key-addressed updates that replay after every event of the window.
+//
+// The updates carry the data; this record only says they are there, and its
+// one reader is the restore-side ADD-COLUMN-FILL-NOT-REPRODUCIBLE WARN,
+// which must not fire for a column whose fill replays and must fire for
+// every added column whose fill was skipped. An older reader ignores the
+// field (manifest decoding is lenient) and still replays the updates, which
+// is what makes the capture work without a format change.
+type AddColumnFill struct {
+	// Columns are the added, non-generated columns the fill covers, in the
+	// table's column order.
+	Columns []string `json:"columns"`
+
+	// Rows is the number of fill updates recorded for the table.
+	Rows int64 `json:"rows"`
+
+	// Skipped, when non-empty, says why no fill was recorded (a table with
+	// no primary key cannot address its rows). The restore then names every
+	// column in Columns, whatever its default.
+	Skipped string `json:"skipped,omitempty"`
 }
 
 // SchemaHistoryEntry is one ADR-0049 (Chunk D) per-table schema-history

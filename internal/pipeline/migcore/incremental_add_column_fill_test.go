@@ -17,12 +17,30 @@ import (
 
 // TestApplyAlterDelta_NamesAnUnreproducibleAddColumnFill pins the replay
 // side of GC-36 (2) on every DEFAULT family a recorded ADD COLUMN can
-// carry: a constant (none, literal, quoted/numeric/boolean expression)
-// replays the source's fill and stays quiet; a time, session, random,
-// sequence or unknown-function DEFAULT is named under
-// [AddColumnFillNotReproducibleMarker], on both replay origins. The real-
-// server half is TestIncrementalBackup_ChainRestore_AddColumnDefaults.
+// carry, for each of the three shapes a delta's fill record can take, on
+// both replay origins:
+//
+//   - no record (a chain an older build captured): a constant (none,
+//     literal, quoted/numeric/boolean expression) replays the source's fill
+//     and stays quiet; a time, session, random, sequence or unknown-function
+//     DEFAULT is named under [AddColumnFillNotReproducibleMarker].
+//   - a captured fill: the source's values replay after the window, so no
+//     default is named, whatever its family.
+//   - a skipped fill: every added column is named, whatever its default —
+//     a constant may have been dropped later in the window.
+//
+// The real-server half is TestIncrementalBackup_ChainRestore_AddColumnDefaults.
 func TestApplyAlterDelta_NamesAnUnreproducibleAddColumnFill(t *testing.T) {
+	records := []struct {
+		name string
+		fill *irbackup.AddColumnFill
+		// warn maps the default's legacy verdict to this record's verdict.
+		warn func(legacy bool) bool
+	}{
+		{"legacy", nil, func(legacy bool) bool { return legacy }},
+		{"captured", &irbackup.AddColumnFill{Columns: []string{"filled"}, Rows: 3}, func(bool) bool { return false }},
+		{"skipped", &irbackup.AddColumnFill{Columns: []string{"filled"}, Skipped: "no primary key"}, func(bool) bool { return true }},
+	}
 	for _, tc := range []struct {
 		name string
 		def  ir.DefaultValue
@@ -43,34 +61,37 @@ func TestApplyAlterDelta_NamesAnUnreproducibleAddColumnFill(t *testing.T) {
 		{"sequence", ir.DefaultExpression{Expr: "nextval('s'::regclass)"}, true},
 		{"unknown-function", ir.DefaultExpression{Expr: "my_func()"}, true},
 	} {
-		for _, origin := range []string{"chain restore", "broker"} {
-			t.Run(tc.name+"/"+origin, func(t *testing.T) {
-				before := baseTable()
-				after := cloneTable(before)
-				after.Columns = append(after.Columns, &ir.Column{Name: "filled", Type: ir.Varchar{Length: 32}, Nullable: true, Default: tc.def})
+		for _, rec := range records {
+			for _, origin := range []string{"chain restore", "broker"} {
+				t.Run(tc.name+"/"+rec.name+"/"+origin, func(t *testing.T) {
+					before := baseTable()
+					after := cloneTable(before)
+					after.Columns = append(after.Columns, &ir.Column{Name: "filled", Type: ir.Varchar{Length: 32}, Nullable: true, Default: tc.def})
 
-				buf := &logcapture.Buffer{}
-				prev := slog.Default()
-				slog.SetDefault(slog.New(slog.NewJSONHandler(buf, nil)))
-				defer slog.SetDefault(prev)
+					buf := &logcapture.Buffer{}
+					prev := slog.Default()
+					slog.SetDefault(slog.New(slog.NewJSONHandler(buf, nil)))
+					defer slog.SetDefault(prev)
 
-				w := &recordingSchemaWriter{}
-				if err := ApplyAlterDelta(context.Background(), w, &irbackup.SchemaDeltaEntry{
-					Kind: irbackup.SchemaDeltaAlterTable, Table: before.Name, Before: before, After: after,
-				}, AlterDeltaContext{SourceEngine: "postgres", TargetEngine: "postgres", Origin: origin}); err != nil {
-					t.Fatalf("ApplyAlterDelta: %v", err)
-				}
-				if len(w.addedColumns) != 1 {
-					t.Fatalf("addedColumns = %+v; want [filled] — the WARN never refuses the column", w.addedColumns)
-				}
-				logs := buf.String()
-				warned := strings.Contains(logs, AddColumnFillNotReproducibleMarker) &&
-					strings.Contains(logs, `"column":"filled"`) &&
-					strings.Contains(logs, fmt.Sprintf(`"msg":"%s: `, origin))
-				if warned != tc.warn {
-					t.Errorf("warned = %v; want %v (default %#v)\nlogs: %s", warned, tc.warn, tc.def, logs)
-				}
-			})
+					w := &recordingSchemaWriter{}
+					if err := ApplyAlterDelta(context.Background(), w, &irbackup.SchemaDeltaEntry{
+						Kind: irbackup.SchemaDeltaAlterTable, Table: before.Name, Before: before, After: after,
+						AddColumnFill: rec.fill,
+					}, AlterDeltaContext{SourceEngine: "postgres", TargetEngine: "postgres", Origin: origin}); err != nil {
+						t.Fatalf("ApplyAlterDelta: %v", err)
+					}
+					if len(w.addedColumns) != 1 {
+						t.Fatalf("addedColumns = %+v; want [filled] — the WARN never refuses the column", w.addedColumns)
+					}
+					logs := buf.String()
+					warned := strings.Contains(logs, AddColumnFillNotReproducibleMarker) &&
+						strings.Contains(logs, `"column":"filled"`) &&
+						strings.Contains(logs, fmt.Sprintf(`"msg":"%s: `, origin))
+					if want := rec.warn(tc.warn); warned != want {
+						t.Errorf("warned = %v; want %v (default %#v, fill %+v)\nlogs: %s", warned, want, tc.def, rec.fill, logs)
+					}
+				})
+			}
 		}
 	}
 }

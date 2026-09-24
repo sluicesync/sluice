@@ -30,6 +30,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -945,20 +946,31 @@ func applyAlterAspect(
 const AddColumnFillNotReproducibleMarker = "ADD-COLUMN-FILL-NOT-REPRODUCIBLE"
 
 // warnUnreproducibleAddColumnFill names every column a replayed ADD
-// COLUMN just filled with a value the source's rows provably do not hold.
+// COLUMN just filled with a value the source's rows may not hold.
 //
 // The replayed `ADD COLUMN c … DEFAULT d` fills every row that pre-dates
 // the source's ALTER — the rows the earlier links restored, and the
 // window's own pre-ALTER events, which replay after it without a value
-// for c — by evaluating d on the TARGET, now. The source filled its own
-// rows by evaluating d at its ALTER, and that fill wrote no row event, so
-// the chain carries no value for those rows at all: the replayed DEFAULT
-// is the only thing that puts one there. For a constant DEFAULT the two
-// fills agree (every stable family is pinned by
-// TestIncrementalBackup_ChainRestore_AddColumnDefaults).
-// For a time, session, random or sequence DEFAULT — anything the ADR-0058
-// §2a classifier does not prove constant — they cannot: the restored rows
-// get the restore's clock, not the source's.
+// for c — by evaluating the WINDOW-END d on the TARGET, now. The source
+// filled its own rows by evaluating d at its ALTER, and that fill wrote no
+// row event. Two populations of chain differ in what they carry for it:
+//
+//   - A delta carrying a captured [irbackup.AddColumnFill] (this build's
+//     capture, see pipeline.captureAddColumnFill): the source's actual
+//     values for c ride the SAME link's change chunks as key-addressed
+//     updates that replay after every event of the window, so whatever
+//     the replayed DEFAULT put there is overwritten. Silent — there is
+//     nothing to name. A fill the capture had to SKIP (no primary key to
+//     address rows by) names EVERY added column, whatever its default,
+//     because the capture no longer knows whether the default held.
+//   - A delta with no fill record (captured by an older build): the
+//     replayed DEFAULT is the only thing that fills those rows. For a
+//     constant it matches the source's fill — unless the default was
+//     dropped or changed later in the window (Django's AddField), which
+//     the window-end catalog cannot show and this WARN therefore cannot
+//     see; for a time, session, random or sequence DEFAULT — anything the
+//     ADR-0058 §2a classifier does not prove constant — it cannot match.
+//     Those are named.
 //
 // A WARN rather than a refusal, deliberately. The live forward REFUSES the
 // same column (refuseComputedDefaults), because there the operator can
@@ -967,27 +979,31 @@ const AddColumnFillNotReproducibleMarker = "ADD-COLUMN-FILL-NOT-REPRODUCIBLE"
 // every later link of the chain — there is no point-in-time stop — to
 // protect one column's pre-existing rows. So the column is named, with the
 // repair, and the rest of the chain restores.
-//
-// What this cannot see, stated rather than implied: a DEFAULT changed
-// AFTER the ADD COLUMN within the same window (`ADD COLUMN c … DEFAULT
-// 'v'` followed by `ALTER COLUMN c DROP DEFAULT` — the shape Django emits
-// for every AddField with a default). The delta records the window-END
-// default, so the replay fills with that one (NULL, in Django's case) and
-// nothing in the manifest says the source's rows hold 'v'. That arm needs
-// the fill value captured at backup time, which the manifest has no field
-// for; it is pinned known-wrong by the same gate, not fixed here.
 func warnUnreproducibleAddColumnFill(ctx context.Context, ac AlterDeltaContext, d *irbackup.SchemaDeltaEntry) {
+	fill := d.AddColumnFill
 	for _, c := range AddedColumns(d.Before, d.After) {
 		if c == nil {
 			continue
 		}
-		safe, reason := ClassifyDefaultValueVolatility(c.Default)
-		if safe {
+		var reason string
+		switch {
+		case fill == nil:
+			safe, why := ClassifyDefaultValueVolatility(c.Default)
+			if safe {
+				continue
+			}
+			reason = why + " (the chain was captured by a sluice that did not record the ALTER-time fill)"
+		case fill.Skipped != "" && slices.Contains(fill.Columns, c.Name):
+			reason = "the capture recorded no fill for this column: " + fill.Skipped
+		default:
+			// Captured — the fill replays after the window's events. A
+			// column absent from Columns is a generated one, which the
+			// target computes itself.
 			continue
 		}
 		slog.WarnContext(ctx, ac.Origin+": "+AddColumnFillNotReproducibleMarker+
 			" — every row that pre-dates the source's ALTER got this column's DEFAULT evaluated on the target, at restore time; "+
-			"the source filled the same rows at its own ALTER with values no link of the chain carries, so they differ. "+
+			"the source filled the same rows at its own ALTER with values no link of the chain carries, so they may differ. "+
 			"Repair: copy the column's values for those rows from the source (or re-take a full backup after the ALTER and restore from it)",
 			append(ac.logAttrs(d.Table),
 				"column", c.Name,

@@ -118,8 +118,10 @@ func driveStreamLane(t *testing.T, chunkSize, events int, body string) *irbackup
 		CreatedAt:     time.Unix(0, 0).UTC(),
 		Kind:          irbackup.BackupKindIncremental,
 	}
+	stream := &BackupStream{segStore: newMemStore(), segCodec: blobcodec.CodecGzip}
 	cb := &changeChunkBuffer{
-		b:            &BackupStream{segStore: newMemStore(), segCodec: blobcodec.CodecGzip},
+		b:            stream,
+		sealer:       stream,
 		manifest:     m,
 		runNamespace: changeChunkRunNamespace(m),
 	}

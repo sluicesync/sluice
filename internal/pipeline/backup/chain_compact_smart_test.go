@@ -510,6 +510,48 @@ func TestSmart_TxBoundaries_PreserveF3(t *testing.T) {
 	}
 }
 
+// TestSmart_AddColumnFill_SurvivesCollapse pins that smart compaction keeps
+// the capture-time ADD COLUMN fill (pipeline.captureAddColumnFill): a window
+// whose own events end at 130, then the fill — key-addressed partial
+// updates framed at the SAME closing position. A row the window INSERTed
+// before the ALTER (id 2, no value for the added column) collapses with its
+// fill update into one INSERT carrying the fill's value; a row only the fill
+// touches (id 1) passes through as its update; and the stream still ENDS on
+// the closing position, so restore's F1 tail check holds.
+func TestSmart_AddColumnFill_SurvivesCollapse(t *testing.T) {
+	schema := usersSchema()
+	schema.Tables[0].Columns = append(schema.Tables[0].Columns, &ir.Column{Name: "added", Type: ir.Text{}, Nullable: true})
+	emitted, _ := runPolicy(t, schema, []ir.Change{
+		ir.TxBegin{Position: pos(100)},
+		ir.Insert{Position: pos(110), Schema: "public", Table: "users", Row: ir.Row{"id": int64(2), "name": "pre"}},
+		ir.TxCommit{Position: pos(130)},
+		// The fill.
+		ir.TxBegin{Position: pos(130)},
+		ir.Update{Position: pos(130), Schema: "public", Table: "users", Before: ir.Row{"id": int64(1)}, After: ir.Row{"id": int64(1), "added": "dj"}},
+		ir.Update{Position: pos(130), Schema: "public", Table: "users", Before: ir.Row{"id": int64(2)}, After: ir.Row{"id": int64(2), "added": "dj"}},
+		ir.TxCommit{Position: pos(130)},
+	})
+	var ins *ir.Insert
+	var upd *ir.Update
+	for _, e := range emitted {
+		switch v := e.(type) {
+		case ir.Insert:
+			ins = &v
+		case ir.Update:
+			upd = &v
+		}
+	}
+	if ins == nil || ins.Row["id"] != int64(2) || ins.Row["name"] != "pre" || ins.Row["added"] != "dj" {
+		t.Errorf("collapsed insert = %+v; want id 2 with name AND the fill's value (%s)", ins, kindsOf(emitted))
+	}
+	if upd == nil || upd.Before["id"] != int64(1) || upd.After["added"] != "dj" {
+		t.Errorf("fill-only update = %+v; want id 1's fill passed through (%s)", upd, kindsOf(emitted))
+	}
+	if last := emitted[len(emitted)-1]; last.Pos() != pos(130) {
+		t.Errorf("stream ends at %+v (%s); want the closing position — F1 would refuse the link", last.Pos(), kindsOf(emitted))
+	}
+}
+
 // ----- The pass-through (PKStrategyNone) escape hatch -----
 
 func TestSmart_PKStrategyNone_PassesThroughEverything(t *testing.T) {

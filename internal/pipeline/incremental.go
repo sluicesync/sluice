@@ -523,6 +523,12 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 		}
 		manifest.SchemaHash = refreshedHash
 	}
+	// 5b. The ADD COLUMN fill — the source's values for the rows an added
+	//     column filled, which no change event carries. After the window
+	//     and the delta, so it orders behind every event it could race.
+	if _, err := captureAddColumnFill(ctx, b.Source, b.SourceDSN, newFillChunkBuffer(b, manifest, chainCEK), chunkSize); err != nil {
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("incremental: %w", err))
+	}
 
 	// 6. Compute BackupID and finalise. Stamp the CDC-position fold version
 	// FIRST (item 57) so ComputeBackupID folds CDCPositionCommitsAfterRows into

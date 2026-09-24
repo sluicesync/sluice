@@ -123,6 +123,14 @@ var canonExempt = map[string]string{
 		"here rather than added to the canon because canon v5 is an ON-DISK CONTRACT: a new token in it would " +
 		"invalidate every v5 signature already in the field, to bind a field whose transitive binding is already exact.",
 
+	"SchemaDeltaEntry.AddColumnFill": "an advisory, not a replay input. The fill's VALUES ride this manifest's own change " +
+		"chunks, whose list, SHA and order are folded here, so they are exactly as authentic as every other change. The " +
+		"record only tells the restore-side ADD-COLUMN-FILL-NOT-REPRODUCIBLE WARN (migcore.warnUnreproducibleAddColumnFill) " +
+		"that those updates exist: deleting it makes a restore name a column it restores correctly (loud, never silent), " +
+		"and forging it can at most SILENCE that WARN on a link whose fill was never captured — the replay does exactly " +
+		"what it would have done anyway. Left out of the canon because canon v5 is an on-disk contract (see " +
+		"Manifest.Redaction) and binding an advisory is not worth invalidating every signature in the field.",
+
 	"TableManifest.Partial": "read only by the backup RESUME classifier (tableManifestFullyComplete), which reads " +
 		"the prior IN-PROGRESS manifest — never signed. No restore/verify/export path consults it.",
 
@@ -240,8 +248,11 @@ func TestCanonicalManifestBytes_ExemptFieldsStayInvisible(t *testing.T) {
 		"Manifest.ProgressSidecar":             func(m *Manifest) { m.ProgressSidecar = &ProgressSidecarRef{File: "p.jsonl", AttemptID: "a"} },
 		"Manifest.CDCPositionCommitsAfterRows": func(m *Manifest) { m.CDCPositionCommitsAfterRows = true },
 		"Manifest.Redaction":                   func(m *Manifest) { m.Redaction = &RedactionInfo{RuleCount: 1, Fingerprint: "0123456789abcdef"} },
-		"TableManifest.Partial":                func(m *Manifest) { m.Tables[0].Partial = true },
-		"ChunkInfo.Encryption":                 func(m *Manifest) { m.Tables[0].Chunks[0].Encryption = &ChunkEncryption{Algorithm: "AES-256-GCM"} },
+		"SchemaDeltaEntry.AddColumnFill": func(m *Manifest) {
+			m.SchemaDelta[0].AddColumnFill = &AddColumnFill{Columns: []string{"c"}, Rows: 3}
+		},
+		"TableManifest.Partial": func(m *Manifest) { m.Tables[0].Partial = true },
+		"ChunkInfo.Encryption":  func(m *Manifest) { m.Tables[0].Chunks[0].Encryption = &ChunkEncryption{Algorithm: "AES-256-GCM"} },
 	}
 	// The two maps must agree: an exemption with no invisibility check is
 	// an unverified claim, and a check for a non-exempt field is stale.
