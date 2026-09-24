@@ -43,6 +43,11 @@ type catalogColumnRow struct {
 	// probeHex is HEX(DEFAULT(col)) as MariaDB returns it — the true bytes
 	// the GC-36 DEFAULT() probe re-reads. Empty for a row never probed.
 	probeHex string
+
+	// probeUTF8Hex is HEX(CONVERT(DEFAULT(col) USING utf8mb4)) — the true
+	// text the GC-37 (h) probe re-reads for a character default that read
+	// back with a '?'. Empty for a row never probed.
+	probeUTF8Hex string
 }
 
 // bug286CatalogRows returns the Bug 286 shape matrix as flavor f's server
@@ -102,6 +107,53 @@ func bug286CatalogRows(f Flavor) []catalogColumnRow {
 		vc("c5", pick(valid("''"), valid("")), "NO", ir.DefaultLiteral{Value: ""}),
 		vc("c6", pick(valid("'it''s'"), valid("it's")), "YES", ir.DefaultLiteral{Value: "it's"}),
 	}
+}
+
+// gc37hTextCatalogRows returns the GC-37 (h) shapes as flavor f's server
+// reports them: character-column literal defaults whose supplementary
+// characters information_schema's utf8mb3 COLUMN_DEFAULT stores as '?',
+// paired with the utf8mb4 DEFAULT() probe's true text, plus the controls
+// that must NOT change — a genuine '?', BMP non-ASCII, a default with no
+// '?' (never probed). Every COLUMN_DEFAULT below is what mysql:8.0.46 /
+// mariadb:11.4.13 reported for the declared DDL in the comment (measured
+// 2026-09-24); the probe hex is what both returned.
+func gc37hTextCatalogRows(f Flavor) []catalogColumnRow {
+	valid := func(s string) sql.NullString { return sql.NullString{String: s, Valid: true} }
+	catalog := func(text string) sql.NullString {
+		if f == FlavorMariaDB {
+			return valid("'" + strings.ReplaceAll(text, "'", "''") + "'")
+		}
+		return valid(text)
+	}
+	col := func(name, dataType, columnType, text, probe, want string) catalogColumnRow {
+		return catalogColumnRow{
+			name: name, def: catalog(text), nullable: "YES",
+			dataType: dataType, columnType: columnType,
+			want: ir.DefaultLiteral{Value: want}, probeUTF8Hex: probe,
+		}
+	}
+	rows := []catalogColumnRow{
+		col("t1", "varchar", "varchar(20)", "?x", "F09F988078", "😀x"),             // DEFAULT '😀x'
+		col("t2", "char", "char(4)", "?", "F09F9880", "😀"),                        // DEFAULT '😀'
+		col("t3", "varchar", "varchar(20)", "?", "3F", "?"),                       // DEFAULT '?': a genuine '?'
+		col("t4", "varchar", "varchar(20)", "???", "3FF09F98803F", "?😀?"),         // DEFAULT '?😀?': genuine '?' around a lost one
+		col("t5", "varchar", "varchar(20)", "é?", "C3A9F09F9880", "é😀"),           // DEFAULT 'é😀': the BMP character survives
+		col("t6", "varchar", "varchar(20)", "it's?", "69742773F09F9880", "it's😀"), // quote doubling on MariaDB
+		col("t7", "enum", "enum('a','?b')", "?b", "3F62", "?b"),                   // ENUM DEFAULT '?b': a genuine '?' label
+		{
+			// DEFAULT 'é€': no '?', so never probed (the fake refuses a probe
+			// of a column without probeUTF8Hex).
+			name: "t8", def: catalog("é€"), nullable: "YES",
+			dataType: "varchar", columnType: "varchar(10)", want: ir.DefaultLiteral{Value: "é€"},
+		},
+	}
+	if f == FlavorMariaDB {
+		// MariaDB takes a literal DEFAULT on TEXT, and stores one '?' per
+		// BYTE of the lost character there (measured: TEXT DEFAULT '😀z'
+		// → '????z').
+		rows = append(rows, col("t9", "text", "text", "????z", "F09F98807A", "😀z"))
+	}
+	return rows
 }
 
 // gc29BinaryCatalogRows returns the GC-29 shapes: BINARY/VARBINARY literal
@@ -259,6 +311,21 @@ func (c catalogFakeConn) QueryContext(_ context.Context, query string, _ []drive
 	case strings.HasPrefix(query, "SHOW CREATE TABLE "):
 		// The NUL-truncated binary-default recovery's authoritative re-read.
 		return &catalogFakeRows{cols: []string{"Table", "Create Table"}, vals: [][]driver.Value{{"w", showCreateTableW(c.rows)}}}, nil
+	case strings.HasPrefix(query, "SELECT HEX(CONVERT(DEFAULT("):
+		// The GC-37 (h) text probe: the same shape, converted to utf8mb4.
+		byName := map[string]catalogColumnRow{}
+		for _, r := range c.rows {
+			byName[r.name] = r
+		}
+		var vals []driver.Value
+		for _, m := range probedColumnRE.FindAllStringSubmatch(query, -1) {
+			r, ok := byName[m[1]]
+			if !ok || r.probeUTF8Hex == "" {
+				return nil, fmt.Errorf("catalog fake: utf8mb4 DEFAULT() probe of unexpected column %q", m[1])
+			}
+			vals = append(vals, r.probeUTF8Hex)
+		}
+		return &catalogFakeRows{cols: make([]string, len(vals)), vals: [][]driver.Value{vals}}, nil
 	case strings.HasPrefix(query, "SELECT HEX(DEFAULT("):
 		// The GC-36 MariaDB DEFAULT() probe: one row, one HEX per named
 		// column, in the order the query names them.
@@ -307,10 +374,18 @@ func (r catalogColumnRow) body(withSRID bool) []driver.Value {
 	if r.def.Valid {
 		def = r.def.String
 	}
+	// information_schema reports a character set only for a character
+	// column; a binary string, a number or a temporal reads NULL (the
+	// readers' IFNULL → ""). The GC-37 (h) text recovery keys on it.
+	charset, collation := "", ""
+	switch r.dataType {
+	case "char", "varchar", "tinytext", "text", "mediumtext", "longtext", "enum", "set":
+		charset, collation = "utf8mb4", "utf8mb4_general_ci"
+	}
 	vals := []driver.Value{
 		def, r.nullable, r.dataType,
 		r.charMaxLen, r.numPrec, r.numScale, r.dtPrec,
-		"utf8mb4", "utf8mb4_general_ci",
+		charset, collation,
 	}
 	if withSRID {
 		vals = append(vals, int64(0))
@@ -388,6 +463,7 @@ func TestLoadTableSchema_DefaultAgreesWithSeed_EveryBinlogFlavor(t *testing.T) {
 			rows = append(rows, gc36MariaDBBinaryCatalogRows()...)
 			rows = append(rows, gc36MariaDB118BinaryCatalogRows()...)
 		}
+		rows = append(rows, gc37hTextCatalogRows(f)...)
 		db := newCatalogFakeDB(t, fmt.Sprintf("sluice-catalog-test-%s-%d", t.Name(), f), rows)
 
 		// The cold-start seed.

@@ -124,6 +124,12 @@ import (
 //     identically there (GC-36, [recoverMariaDBBinaryDefaults]).
 //     Both rules are grounded on a real server by
 //     TestTableFacts_DiffPremisesOnARealServer.
+//   - Character-column literal defaults are compared on their TRUE text
+//     when the catalog shows a '?': information_schema stores a character
+//     utf8mb3 cannot hold as '?' on both flavors, so '😀x' → '😁x' read
+//     '?x' both times (GC-37 (h), [recoverTextDefaults]). Grounded on
+//     MySQL and every MariaDB LTS line by
+//     TestTextDefault_SupplementaryChars_OnARealServer.
 //   - A foreign key whose REFERENCED table or column changed because the
 //     parent was renamed: exempt only when the old referenced table / each
 //     old referenced column no longer exists on the server, i.e. the
@@ -281,7 +287,8 @@ func readTableFacts(ctx context.Context, db *sql.DB, flavor Flavor, schema, tabl
 func readColumnFacts(ctx context.Context, db *sql.DB, flavor Flavor, args []any, get func(s, t string) *mysqlTableFacts) error {
 	rows, err := db.QueryContext(ctx, `
 		SELECT table_schema, table_name, column_name, column_type, is_nullable,
-		       column_default, IFNULL(extra, ''), IFNULL(generation_expression, '')
+		       column_default, IFNULL(extra, ''), IFNULL(generation_expression, ''),
+		       IFNULL(character_set_name, '')
 		FROM   information_schema.columns
 		WHERE  `+unforwardedScopeFilter(""), args...)
 	if err != nil {
@@ -299,12 +306,16 @@ func readColumnFacts(ctx context.Context, db *sql.DB, flavor Flavor, args []any,
 	// stored as '?' (GC-36), so 0x00AB00 → 0x00CD00 read '\0?\0' both
 	// times; those are re-read by the schema readers' DEFAULT() probe.
 	mariadbPending := map[string][]pendingMariaDBBinaryDefault{}
+	// A character default holding a supplementary character reads back as
+	// '?' on both flavors (GC-37 (h)), so '😀' → '😁' read '?' both times;
+	// re-read by the schema readers' utf8mb4 DEFAULT() probe.
+	textPending := map[string][]pendingTextDefault{}
 	for rows.Next() {
 		var (
-			s, t, col, typ, nullable, extra, gen string
-			def                                  sql.NullString
+			s, t, col, typ, nullable, extra, gen, charset string
+			def                                           sql.NullString
 		)
-		if err := rows.Scan(&s, &t, &col, &typ, &nullable, &def, &extra, &gen); err != nil {
+		if err := rows.Scan(&s, &t, &col, &typ, &nullable, &def, &extra, &gen, &charset); err != nil {
 			return err
 		}
 		get(s, t).columns[col] = columnFact(flavor, typ, nullable, def, extra, gen)
@@ -322,6 +333,17 @@ func readColumnFacts(ctx context.Context, db *sql.DB, flavor Flavor, args []any,
 				},
 			})
 		}
+		if text, ok := textDefaultCatalogText(flavor, charset, extra, def); ok {
+			facts := get(s, t)
+			textPending[s] = append(textPending[s], pendingTextDefault{
+				table: t, column: col, catalog: text, charset: charset,
+				set: func(recovered string) {
+					c := facts.columns[col]
+					c.def = textDefaultFact(flavor, recovered)
+					facts.columns[col] = c
+				},
+			})
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return err
@@ -329,6 +351,11 @@ func readColumnFacts(ctx context.Context, db *sql.DB, flavor Flavor, args []any,
 	for _, s := range sortedKeys(mariadbPending) {
 		if err := recoverMariaDBBinaryDefaults(ctx, db, s, mariadbPending[s]); err != nil {
 			return fmt.Errorf("recover binary defaults: %w", err)
+		}
+	}
+	for _, s := range sortedKeys(textPending) {
+		if err := recoverTextDefaults(ctx, db, s, flavor, textPending[s]); err != nil {
+			return fmt.Errorf("recover text defaults: %w", err)
 		}
 	}
 	showCreate := map[string]string{}

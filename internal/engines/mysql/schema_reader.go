@@ -698,6 +698,10 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 	// bytes information_schema stored as '?', re-read by a DEFAULT() probe
 	// (see recoverMariaDBBinaryDefaults).
 	var mariadbPending []pendingMariaDBBinaryDefault
+	// Character columns whose literal default read back with a '?', which is
+	// how information_schema stores a character utf8mb3 cannot hold (GC-37 (h),
+	// text_default_recovery.go); re-read by the utf8mb4 DEFAULT() probe.
+	var textPending []pendingTextDefault
 
 	for rows.Next() {
 		var (
@@ -762,11 +766,20 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 				table: tableName, column: colName, catalog: defaultVal.String, set: setIRDefault(col),
 			})
 		}
+		if text, ok := textDefaultCatalogText(r.flavor, meta.Charset, meta.Extra, defaultVal); ok {
+			textPending = append(textPending, pendingTextDefault{
+				table: tableName, column: colName, catalog: text, charset: meta.Charset,
+				check: enumSetDefaultCheck(typ), set: setTextIRDefault(col),
+			})
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return err
 	}
 	if err := recoverMariaDBBinaryDefaults(ctx, r.db, r.schema, mariadbPending); err != nil {
+		return err
+	}
+	if err := recoverTextDefaults(ctx, r.db, r.schema, r.flavor, textPending); err != nil {
 		return err
 	}
 	// One SHOW CREATE pass recovers BOTH the NUL-truncated binary defaults
@@ -1068,6 +1081,9 @@ func loadTableSchema(ctx context.Context, db *sql.DB, schema, table string, flav
 	// And the seed's MariaDB DEFAULT() probe for '?'-mangled binary
 	// defaults (GC-36).
 	var mariadbPending []pendingMariaDBBinaryDefault
+	// And the seed's text-default recovery (GC-37 (h)): a character default
+	// holding a supplementary character reads back as '?'.
+	var textPending []pendingTextDefault
 	for rows.Next() {
 		var (
 			colName    string
@@ -1122,6 +1138,12 @@ func loadTableSchema(ctx context.Context, db *sql.DB, schema, table string, flav
 				table: table, column: colName, catalog: defaultVal.String, set: setIRDefault(col),
 			})
 		}
+		if text, ok := textDefaultCatalogText(flavor, meta.Charset, meta.Extra, defaultVal); ok {
+			textPending = append(textPending, pendingTextDefault{
+				table: table, column: colName, catalog: text, charset: meta.Charset,
+				check: enumSetDefaultCheck(typ), set: setTextIRDefault(col),
+			})
+		}
 		// Capture the MariaDB native fixed-width kind (uuid/inet4/inet6)
 		// parallel to Columns. The IR collapses inet4/inet6 to ir.Inet, so
 		// the CDC binlog decode (ADR-0171) recovers the exact width from
@@ -1141,6 +1163,9 @@ func loadTableSchema(ctx context.Context, db *sql.DB, schema, table string, flav
 	}
 	if err := recoverMariaDBBinaryDefaults(ctx, db, schema, mariadbPending); err != nil {
 		return nil, fmt.Errorf("mysql: loadTableSchema %s.%s: binary default recovery: %w", schema, table, err)
+	}
+	if err := recoverTextDefaults(ctx, db, schema, flavor, textPending); err != nil {
+		return nil, fmt.Errorf("mysql: loadTableSchema %s.%s: text default recovery: %w", schema, table, err)
 	}
 	if len(pending) > 0 {
 		// One SHOW CREATE for this table. The stand-in ir.Table carries no

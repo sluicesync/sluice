@@ -87,6 +87,14 @@ func NormalizeExpressionText(s string) string {
 	return normalizeShowCreateExpressionText(s)
 }
 
+// EnumSetDefaultCheck exposes [enumSetDefaultCheck] to the mydumper schema
+// parser: a recovered ENUM/SET default that is not one of the column's
+// labels as read means the labels lost characters too (GC-37 (i)), so both
+// readers refuse it in the same words. nil for any other type.
+func EnumSetDefaultCheck(t ir.Type) func(string) error {
+	return enumSetDefaultCheck(t)
+}
+
 // Dialect tags for [ir.DefaultExpression] values whose surface syntax is
 // engine-specific but whose value is neutral, re-exported so the mydumper
 // schema parser emits the exact tags the writers' default paths dispatch on.

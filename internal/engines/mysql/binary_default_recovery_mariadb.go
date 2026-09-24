@@ -100,7 +100,7 @@ func recoverMariaDBBinaryDefaults(ctx context.Context, db *sql.DB, schema string
 		for i, p := range ps {
 			names[i] = p.column
 		}
-		got, err := probeMariaDBColumnDefaults(ctx, db, schema, table, names)
+		got, err := probeColumnDefaults(ctx, db, schema, table, names, false)
 		if err != nil {
 			return err
 		}
@@ -114,14 +114,22 @@ func recoverMariaDBBinaryDefaults(ctx context.Context, db *sql.DB, schema string
 	return nil
 }
 
-// probeMariaDBColumnDefaults evaluates DEFAULT(col) for each named column of
+// probeColumnDefaults evaluates DEFAULT(col) for each named column of
 // schema.table in one statement and returns the raw bytes in cols' order. The
 // empty outer join yields exactly one row whatever the table holds; HEX keeps
-// the result ASCII so the connection's result charset cannot mangle it.
-func probeMariaDBColumnDefaults(ctx context.Context, db *sql.DB, schema, table string, cols []string) ([][]byte, error) {
+// the result ASCII so the connection's result charset cannot mangle it. With
+// asUTF8 the value is first converted to utf8mb4, so a character column of any
+// charset comes back as UTF-8 (the text recovery, text_default_recovery.go);
+// without it the column's own bytes come back (the binary recovery). Works on
+// both flavors.
+func probeColumnDefaults(ctx context.Context, db *sql.DB, schema, table string, cols []string, asUTF8 bool) ([][]byte, error) {
 	exprs := make([]string, len(cols))
 	for i, c := range cols {
-		exprs[i] = "HEX(DEFAULT(`sluice_t`.`" + mysqlQuoteIdent(c) + "`))"
+		d := "DEFAULT(`sluice_t`.`" + mysqlQuoteIdent(c) + "`)"
+		if asUTF8 {
+			d = "CONVERT(" + d + " USING utf8mb4)"
+		}
+		exprs[i] = "HEX(" + d + ")"
 	}
 	q := "SELECT " + strings.Join(exprs, ", ") +
 		" FROM (SELECT 1) AS `sluice_one` LEFT JOIN `" + mysqlQuoteIdent(schema) + "`.`" + mysqlQuoteIdent(table) +
@@ -132,8 +140,8 @@ func probeMariaDBColumnDefaults(ctx context.Context, db *sql.DB, schema, table s
 		dest[i] = &hexes[i]
 	}
 	if err := db.QueryRowContext(ctx, q).Scan(dest...); err != nil {
-		return nil, fmt.Errorf("mysql: probe the true bytes of %s.%s's binary column defaults (DEFAULT() read; "+
-			"information_schema replaces every non-UTF-8 byte with '?'): %w", schema, table, err)
+		return nil, fmt.Errorf("mysql: probe the true values of %s.%s's column defaults (DEFAULT() read; "+
+			"information_schema stores what utf8mb3 cannot hold as '?'): %w", schema, table, err)
 	}
 	out := make([][]byte, len(cols))
 	for i, h := range hexes {

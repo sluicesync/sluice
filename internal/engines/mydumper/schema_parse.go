@@ -567,6 +567,9 @@ func parseCreateTable(stmt, file string) (*ir.Table, error) {
 	if err := b.checkCharsets(); err != nil {
 		return t, err
 	}
+	if err := b.decodeHexTextDefaults(); err != nil {
+		return nil, err
+	}
 	return t, nil
 }
 
@@ -582,6 +585,10 @@ type tableBuilder struct {
 	// columnCharsets records each string-family column's EXPLICIT charset
 	// (empty = inherit the table default) for [checkCharsets].
 	columnCharsets map[string]string
+
+	// hexTextDefaults are the character columns whose DEFAULT is a 0x…
+	// literal, decoded once checkCharsets passed ([decodeHexTextDefaults]).
+	hexTextDefaults []hexTextDefault
 }
 
 // parseBodyItem dispatches one table-body item: a key/constraint

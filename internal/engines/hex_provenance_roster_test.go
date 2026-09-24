@@ -175,11 +175,12 @@ var hexDecodeRoster = map[string]hexSiteVerdict{
 			"BINARY/VARBINARY column. Not a row value. Pinned by TestMariaDBHexLiteralBytes " +
 			"and, live, by TestMariaDBBinaryDefault_HighBytes_OnARealServer (11.8 / 12.3).",
 	},
-	"mysql.probeMariaDBColumnDefaults": {
+	"mysql.probeColumnDefaults": {
 		decidedByProvenance,
-		"the decoded string is the server's HEX(DEFAULT(col)) from a projection sluice wrote " +
-			"(GC-36), so it is a rendering by construction, never source bytes; the result is " +
-			"then reconciled against the catalog text (reconcileMariaDBBinaryDefault).",
+		"the decoded string is the server's HEX(DEFAULT(col)) (or HEX(CONVERT(DEFAULT(col) USING " +
+			"utf8mb4))) from a projection sluice wrote (GC-36, GC-37 (h)), so it is a rendering by " +
+			"construction, never source bytes; the result is then reconciled against the catalog " +
+			"text (reconcileMariaDBBinaryDefault / reconcileTextDefault).",
 	},
 
 	// ---- Dump / file engines. ----
@@ -187,6 +188,13 @@ var hexDecodeRoster = map[string]hexSiteVerdict{
 		decidedByGrammar,
 		"the INSERT lexer is AT a `0x` literal by dispatch; SQL has no other production " +
 			"there, so the token kind (litHex) comes from the grammar, never from the bytes.",
+	},
+	"mydumper.stringHexDefault": {
+		decidedByGrammar,
+		"a CREATE TABLE DEFAULT token the schema lexer classified as a hex literal (tokHexLit: " +
+			"`0x…` / `x'…'`), on a column the TYPE says is a character column (GC-37 (h)); a quoted " +
+			"string default is a different token. Not a row value. Pinned by " +
+			"TestParseCreateTable_HexTextDefault.",
 	},
 	"mydumper.scanQuotedHexValue": {
 		decidedByGrammar,

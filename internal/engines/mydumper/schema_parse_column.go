@@ -4,8 +4,11 @@
 package mydumper
 
 import (
+	"encoding/hex"
+	"fmt"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"sluicesync.dev/sluice/internal/engines/mysql"
 	"sluicesync.dev/sluice/internal/ir"
@@ -74,6 +77,11 @@ func (b *tableBuilder) parseColumnDef() error {
 	}
 	col.Type = irType
 	col.Default = attrs.def.toIR(irType)
+	if attrs.def.kind == defHexLit && isStringFamily(irType) {
+		// Decoded once the table's charsets are known — see
+		// [tableBuilder.decodeHexTextDefaults].
+		b.hexTextDefaults = append(b.hexTextDefaults, hexTextDefault{col: col, text: attrs.def.text, tok: nameTok})
+	}
 
 	// Effective charset defaults to the table's; record the explicit one
 	// for the checkCharsets gate.
@@ -86,6 +94,70 @@ func (b *tableBuilder) parseColumnDef() error {
 
 	b.table.Columns = append(b.table.Columns, col)
 	return nil
+}
+
+// isStringFamily reports a character column (a charset-carrying type).
+func isStringFamily(t ir.Type) bool {
+	switch t.(type) {
+	case ir.Char, ir.Varchar, ir.Text, ir.Enum, ir.Set:
+		return true
+	}
+	return false
+}
+
+// hexTextDefault is a character column whose DEFAULT the dump spells as a
+// 0x… literal, awaiting [tableBuilder.decodeHexTextDefaults].
+type hexTextDefault struct {
+	col  *ir.Column
+	text string
+	tok  token
+}
+
+// decodeHexTextDefaults replaces each character column's 0x… DEFAULT with
+// the text it spells (GC-37 (h)). mydumper writes SHOW CREATE TABLE, and
+// MySQL prints a character default its utf8mb3 metadata cannot hold —
+// anything outside the Basic Multilingual Plane — as a hex literal of the
+// column's bytes (measured on 8.0.46: VARCHAR DEFAULT '😀x' → DEFAULT
+// 0xF09F988078). Carried as the literal it used to be, the target's
+// default became the twelve-character string "0xF09F988078".
+//
+// It runs after [tableBuilder.checkCharsets] passed, so every string
+// column's charset is UTF-8-compatible and its bytes decode as UTF-8; a
+// table that failed that gate is deferred whole (Bug 188) and never reaches
+// here, so a utf16 column's UTF-16 bytes are never read as text. A decode
+// that is still not UTF-8 refuses rather than guess, and an ENUM/SET
+// default must be one of the labels as read — the live reader's refusal,
+// shared ([mysql.EnumSetDefaultCheck]).
+//
+// MariaDB's SHOW CREATE prints such a default as '?' instead, which no
+// reader can recover and which is indistinguishable from a genuine '?', so a
+// MariaDB dump carries it as written (GC-37 (h), beside (f) for binary).
+func (b *tableBuilder) decodeHexTextDefaults() error {
+	for _, h := range b.hexTextDefaults {
+		text, err := stringHexDefault(h.text, h.col.Type)
+		if err != nil {
+			return b.p.errAt(h.tok, "column %s: DEFAULT %s: %v", h.col.Name, h.text, err)
+		}
+		h.col.Default = ir.DefaultLiteral{Value: text}
+	}
+	return nil
+}
+
+// stringHexDefault decodes one 0x… character default as UTF-8 text.
+func stringHexDefault(text string, t ir.Type) (string, error) {
+	b, err := hex.DecodeString(strings.TrimPrefix(strings.TrimPrefix(text, "0x"), "0X"))
+	if err != nil {
+		return "", err
+	}
+	if !utf8.Valid(b) {
+		return "", fmt.Errorf("the default's bytes (%s) are not UTF-8", text)
+	}
+	if check := mysql.EnumSetDefaultCheck(t); check != nil {
+		if err := check(string(b)); err != nil {
+			return "", err
+		}
+	}
+	return string(b), nil
 }
 
 // columnAttrs collects the side-band results of the column attribute loop
