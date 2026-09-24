@@ -92,7 +92,6 @@ type acdLane struct {
 const (
 	acdWindowEndDefault   = "the delta records the window-END DEFAULT; the source filled its rows with the ALTER-time one (no manifest field carries it)"
 	acdEvaluatedAtRestore = "a non-constant DEFAULT is evaluated on the target at restore time; the source's ALTER-time values are in no link (named by ADD-COLUMN-FILL-NOT-REPRODUCIBLE)"
-	acdMySQLEmitterDrop   = "GC-36 (4): the MySQL target emitter drops a TEXT/BLOB/JSON DEFAULT (with a WARN) although MySQL 8.0.13+ accepts the expression form"
 )
 
 func acdPGLane(stream bool) acdLane {
@@ -182,11 +181,10 @@ func acdMySQLLane() acdLane {
 			{col: "c_enum", def: `ENUM('a','b') DEFAULT 'b'`},
 			{col: "c_binary", def: `VARBINARY(4) DEFAULT 0x00FF`},
 			// MySQL 8.0.13+ expression defaults on TEXT/BLOB/JSON reach the
-			// chain replay and are dropped by the MySQL target emitter —
-			// the GC-36 (4) defect, on this path too.
-			{col: "c_text", def: `TEXT DEFAULT ('abc')`, knownWrong: acdMySQLEmitterDrop},
-			{col: "c_bin_blob", def: `BLOB DEFAULT (0x00FF)`, knownWrong: acdMySQLEmitterDrop},
-			{col: "c_json", def: `JSON DEFAULT ('{"a": 1}')`, knownWrong: acdMySQLEmitterDrop},
+			// chain replay and land on the MySQL target since GC-36 (4).
+			{col: "c_text", def: `TEXT DEFAULT ('abc')`},
+			{col: "c_bin_blob", def: `BLOB DEFAULT (0x00FF)`},
+			{col: "c_json", def: `JSON DEFAULT ('{"a": 1}')`},
 			{col: "c_nn_varchar", def: `VARCHAR(10) NOT NULL DEFAULT 'nn'`},
 			{col: "c_nn_int", def: `INT NOT NULL DEFAULT 7`},
 			{col: "x_django", def: `VARCHAR(10) DEFAULT 'dj'`, then: "ALTER TABLE users ALTER COLUMN x_django DROP DEFAULT", post: `'p'`, knownWrong: acdWindowEndDefault},

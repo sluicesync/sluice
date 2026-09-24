@@ -1105,8 +1105,6 @@ func TestStreamer_AddColumnForward_PreexistingRowDefaults_ShapeAPostgresToPostgr
 		oneAlter:    true,
 		knownWrong:  map[string]fdKnownWrong{},
 		halts: []fdHalt{
-			fdLoud(t, all, "d_numfree", "numeric precision 0 must be between 1 and 1000",
-				"unconstrained NUMERIC forwarded with precision 0"),
 			fdLoud(t, all, "e_mood", `invalid input value for enum w_e_mood_enum: "ok"`,
 				"PG enum column forwarded as a synthesised enum without the source labels"),
 			fdDesignedRefusal(fdPGNow),
