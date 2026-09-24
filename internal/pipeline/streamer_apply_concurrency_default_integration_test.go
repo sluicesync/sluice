@@ -115,7 +115,7 @@ func TestStreamer_ApplyConcurrencyDefault_EngagesAndConvergesWithSerial(t *testi
 		runErr := make(chan error, 1)
 		go func() { runErr <- streamer.Run(streamCtx) }()
 
-		waitForSourceSlotWatching(t, sourceDSN, 120*time.Second, runErr, logs)
+		waitForSourceSlotNamedWatching(t, sourceDSN, "sluice_slot_"+streamID, 120*time.Second, runErr, logs)
 
 		srcDB, err := sql.Open("pgx", sourceDSN)
 		if err != nil {

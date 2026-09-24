@@ -243,6 +243,18 @@ func waitForSourceSlot(t *testing.T, sourceDSN string, timeout time.Duration) {
 // flake that reproduces 0/12 in isolation (~2s, 60x under the gate).
 func waitForSourceSlotWatching(t *testing.T, sourceDSN string, timeout time.Duration, runErr <-chan error, logs fmt.Stringer) {
 	t.Helper()
+	waitForSourceSlotNamedWatching(t, sourceDSN, "sluice%", timeout, runErr, logs)
+}
+
+// waitForSourceSlotNamedWatching is [waitForSourceSlotWatching] scoped to
+// the slots matching slotPattern (a LIKE pattern). A test that runs several
+// streams in sequence against ONE source must wait for its own leg's slot:
+// an earlier leg's slot survives its cancel, so the unscoped wait returns
+// before the new leg has created its slot, the workload lands before that
+// leg's snapshot, and the leg can converge through its cold-start copy and be
+// cancelled while it is still starting up (CI run 36062897305).
+func waitForSourceSlotNamedWatching(t *testing.T, sourceDSN, slotPattern string, timeout time.Duration, runErr <-chan error, logs fmt.Stringer) {
+	t.Helper()
 	db, err := sql.Open("pgx", sourceDSN)
 	if err != nil {
 		t.Fatalf("waitForSourceSlotWatching: open source: %v", err)
@@ -254,7 +266,7 @@ func waitForSourceSlotWatching(t *testing.T, sourceDSN string, timeout time.Dura
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		var n int
 		qErr := db.QueryRowContext(ctx,
-			`SELECT COUNT(*) FROM pg_replication_slots WHERE slot_name LIKE 'sluice%'`).Scan(&n)
+			`SELECT COUNT(*) FROM pg_replication_slots WHERE slot_name LIKE $1`, slotPattern).Scan(&n)
 		cancel()
 		if qErr == nil && n > 0 {
 			return
