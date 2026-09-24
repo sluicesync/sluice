@@ -45,6 +45,7 @@ import (
 	"database/sql"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -93,7 +94,20 @@ import (
 // removes it.)
 func startShardedVTTestServer(t *testing.T, keyspace string, numShards int) (mysqlDSN, grpcEndpoint string, restartSource func(t *testing.T), cleanup func()) {
 	t.Helper()
+	return startVTTestServerKeyspaces(t, []string{keyspace}, numShards)
+}
+
+// startVTTestServerKeyspaces is [startShardedVTTestServer] with several
+// keyspaces, each with numShards shards. The returned DSN names the
+// first; buildMySQLDSN re-points it at another.
+func startVTTestServerKeyspaces(t *testing.T, keyspaces []string, numShards int) (mysqlDSN, grpcEndpoint string, restartSource func(t *testing.T), cleanup func()) {
+	t.Helper()
 	testcontainers.SkipIfProviderIsNotHealthy(t)
+	keyspace := keyspaces[0]
+	shards := make([]string, len(keyspaces))
+	for i := range shards {
+		shards[i] = strconv.Itoa(numShards)
+	}
 
 	const (
 		basePort      = 33574
@@ -124,8 +138,8 @@ func startShardedVTTestServer(t *testing.T, keyspace string, numShards int) (mys
 		ExposedPorts: []string{mysqlPortBase, grpcPortBase},
 		Env: map[string]string{
 			"PORT":            fmt.Sprintf("%d", basePort),
-			"KEYSPACES":       keyspace,
-			"NUM_SHARDS":      fmt.Sprintf("%d", numShards),
+			"KEYSPACES":       strings.Join(keyspaces, ","),
+			"NUM_SHARDS":      strings.Join(shards, ","),
 			"MYSQL_BIND_HOST": "0.0.0.0",
 		},
 		WaitingFor: readiness,
