@@ -185,8 +185,23 @@ func TestSnapshotStream_ReleaseRowsClosesSnapshotTx(t *testing.T) {
 	// source DB. A connection in `idle in transaction` is the smoking
 	// gun for Bug 21's symptom; this assertion would fail pre-fix
 	// because CloseFn used to be the only release path.
+	//
+	// Polled, within a fixed bound. ReleaseRows' last step closes the
+	// slot-creation replication conn, which sends Terminate and returns;
+	// the walsender backend then exits asynchronously, and until it does
+	// pg_stat_activity still lists it as `idle in transaction` (it held
+	// the exported snapshot). The second CI occurrence (run 36066974521,
+	// 2026-09-24) self-diagnosed through the Phase A listing below as
+	// exactly that session: backend_type=walsender, last query
+	// CREATE_REPLICATION_SLOT … EXPORT_SNAPSHOT, no xact_start. Bug 21's
+	// symptom is a transaction that never ends, so a bound of seconds
+	// still fails it; the ALTER below remains the behavioural check.
+	deadline := time.Now().Add(5 * time.Second)
+	for countIdleInTxSessionsQuiet(t, ctx, dsn) != 0 && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
 	if n := countIdleInTxSessions(t, ctx, dsn); n != 0 {
-		t.Errorf("expected 0 idle-in-transaction sessions after ReleaseRows; got %d", n)
+		t.Errorf("expected 0 idle-in-transaction sessions within 5s of ReleaseRows; got %d", n)
 	}
 
 	// ALTER on the source must succeed quickly — pre-fix it would
@@ -209,6 +224,26 @@ func TestSnapshotStream_ReleaseRowsClosesSnapshotTx(t *testing.T) {
 	if err := stream.ReleaseRows(); err != nil {
 		t.Errorf("second ReleaseRows: %v; want nil", err)
 	}
+}
+
+// countIdleInTxSessionsQuiet is [countIdleInTxSessions] without the
+// per-session listing, for polling.
+func countIdleInTxSessionsQuiet(t *testing.T, ctx context.Context, dsn string) int {
+	t.Helper()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	var n int
+	if err := db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM pg_stat_activity
+		WHERE datname  = current_database()
+		  AND state    = 'idle in transaction'
+		  AND pid     <> pg_backend_pid()`).Scan(&n); err != nil {
+		t.Fatalf("count idle-in-tx: %v", err)
+	}
+	return n
 }
 
 // countIdleInTxSessions returns the number of `idle in transaction`
