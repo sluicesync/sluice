@@ -702,6 +702,10 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 	// how information_schema stores a character utf8mb3 cannot hold (GC-37 (h),
 	// text_default_recovery.go); re-read by the utf8mb4 DEFAULT() probe.
 	var textPending []pendingTextDefault
+	// Expression defaults and generation expressions holding non-ASCII text,
+	// which neither flavor's information_schema renders faithfully (Bug 288,
+	// expr_text_recovery.go); recovered against SHOW CREATE TABLE.
+	var exprPending []pendingExprText
 
 	for rows.Next() {
 		var (
@@ -757,6 +761,7 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 		}
 		applyGenerated(col, genExpr, meta.Extra, r.flavor)
 		t.Columns = append(t.Columns, col)
+		exprPending = appendColumnExprPending(exprPending, r.flavor, tableName, col, defaultVal, meta.Extra, genExpr)
 
 		if binaryLiteralDefaultNeedsRecovery(typ, meta.Extra, defaultVal) {
 			pending = append(pending, pendingBinaryDefault{table: tableName, col: col})
@@ -780,6 +785,9 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 		return err
 	}
 	if err := recoverTextDefaults(ctx, r.db, r.schema, r.flavor, textPending); err != nil {
+		return err
+	}
+	if err := recoverExprTexts(ctx, r.db, r.schema, r.flavor, exprPending); err != nil {
 		return err
 	}
 	// One SHOW CREATE pass recovers BOTH the NUL-truncated binary defaults
@@ -806,6 +814,8 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 
 	// Group rows by (table, index_name).
 	collected := map[tableObjectKey]*ir.Index{}
+	// Functional key parts holding non-ASCII text (Bug 288).
+	var exprPending []pendingExprText
 
 	for rows.Next() {
 		var (
@@ -858,10 +868,20 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 			// etc.) instead of emitting them verbatim.
 			entry.Expression = r.normalizeExpr(expression)
 			entry.ExpressionDialect = dialectName
+			if exprTextNeedsRecovery(r.flavor, expression) {
+				part := len(idx.Columns)
+				exprPending = append(exprPending, pendingExprText{
+					table: tableName, kind: exprSiteIndex, name: indexName, catalog: expression,
+					set: func(recovered string) { idx.Columns[part].Expression = r.normalizeExpr(recovered) },
+				})
+			}
 		}
 		idx.Columns = append(idx.Columns, entry)
 	}
 	if err := rows.Err(); err != nil {
+		return err
+	}
+	if err := recoverExprTexts(ctx, r.db, r.schema, r.flavor, exprPending); err != nil {
 		return err
 	}
 
@@ -1019,6 +1039,8 @@ func (r *SchemaReader) populateCheckConstraints(ctx context.Context, tables map[
 	}
 	defer rows.Close()
 
+	// CHECK clauses holding non-ASCII text (Bug 288).
+	var exprPending []pendingExprText
 	for rows.Next() {
 		var tableName, name, clause string
 		if err := rows.Scan(&tableName, &name, &clause); err != nil {
@@ -1028,13 +1050,23 @@ func (r *SchemaReader) populateCheckConstraints(ctx context.Context, tables map[
 		if !ok {
 			continue
 		}
-		t.CheckConstraints = append(t.CheckConstraints, &ir.CheckConstraint{
+		cc := &ir.CheckConstraint{
 			Name:        name,
 			Expr:        r.normalizeExpr(clause),
 			ExprDialect: dialectName,
-		})
+		}
+		t.CheckConstraints = append(t.CheckConstraints, cc)
+		if exprTextNeedsRecovery(r.flavor, clause) {
+			exprPending = append(exprPending, pendingExprText{
+				table: tableName, kind: exprSiteCheck, name: name, catalog: clause,
+				set: func(recovered string) { cc.Expr = r.normalizeExpr(recovered) },
+			})
+		}
 	}
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	return recoverExprTexts(ctx, r.db, r.schema, r.flavor, exprPending)
 }
 
 // loadTableSchema reads just the column list for a single table from
@@ -1084,6 +1116,8 @@ func loadTableSchema(ctx context.Context, db *sql.DB, schema, table string, flav
 	// And the seed's text-default recovery (GC-37 (h)): a character default
 	// holding a supplementary character reads back as '?'.
 	var textPending []pendingTextDefault
+	// And the seed's expression-text recovery (Bug 288).
+	var exprPending []pendingExprText
 	for rows.Next() {
 		var (
 			colName    string
@@ -1130,6 +1164,7 @@ func loadTableSchema(ctx context.Context, db *sql.DB, schema, table string, flav
 		}
 		applyGenerated(col, genExpr, meta.Extra, flavor)
 		out.Columns = append(out.Columns, col)
+		exprPending = appendColumnExprPending(exprPending, flavor, table, col, defaultVal, meta.Extra, genExpr)
 		if binaryLiteralDefaultNeedsRecovery(typ, meta.Extra, defaultVal) {
 			pending = append(pending, pendingBinaryDefault{table: table, col: col})
 		}
@@ -1172,6 +1207,9 @@ func loadTableSchema(ctx context.Context, db *sql.DB, schema, table string, flav
 	}
 	if err := recoverTextDefaults(ctx, db, schema, flavor, textPending); err != nil {
 		return nil, fmt.Errorf("mysql: loadTableSchema %s.%s: text default recovery: %w", schema, table, err)
+	}
+	if err := recoverExprTexts(ctx, db, schema, flavor, exprPending); err != nil {
+		return nil, fmt.Errorf("mysql: loadTableSchema %s.%s: expression text recovery: %w", schema, table, err)
 	}
 	if len(pending) > 0 {
 		// One SHOW CREATE for this table. The stand-in ir.Table carries no

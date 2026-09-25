@@ -116,3 +116,78 @@ func TestVStream_TextDefault_SupplementaryChars_ThroughVTGate(t *testing.T) {
 		t.Errorf("ReadSchema with a utf16 supplementary-character default: err = %v; want the named refusal", err)
 	}
 }
+
+// TestVStream_ExprText_NonASCII_ThroughVTGate is Bug 288's pin for the
+// flavors that read the catalog through vtgate (PlanetScale, self-hosted
+// Vitess): information_schema passes through to the tablet's mysqld, so an
+// expression's non-ASCII text arrives double-encoded there too, and the
+// recovery's SHOW CREATE TABLE read must pass through vtgate. The
+// independent expected value is the server's own evaluation of the default
+// and the generated column, read back through the row path.
+func TestVStream_ExprText_NonASCII_ThroughVTGate(t *testing.T) {
+	mysqlDSN, _, keyspace, cleanup := startVTTestServer(t)
+	defer cleanup()
+	db, err := sql.Open("mysql", mysqlDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	if _, err := db.ExecContext(ctx, "CREATE TABLE xr (id BIGINT PRIMARY KEY, "+
+		"d VARCHAR(40) DEFAULT (concat('é😀','中')), g VARCHAR(60) AS (concat('ß😀', id)) VIRTUAL, "+
+		"b VARCHAR(40), CONSTRAINT xr_chk CHECK (b <> 'é😀'))"); err != nil {
+		t.Fatal(err)
+	}
+	var def string
+	if err := db.QueryRowContext(ctx, `SELECT column_default FROM information_schema.columns
+		WHERE table_schema = ? AND table_name = 'xr' AND column_name = 'd'`, keyspace).Scan(&def); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(def, "é") {
+		t.Fatalf("vtgate reports d's default faithfully (%q); the recovery is not exercised — re-measure the premise", def)
+	}
+	if _, err := db.ExecContext(ctx, "INSERT INTO xr (id, b) VALUES (1, 'x')"); err != nil {
+		t.Fatal(err)
+	}
+	var gotD, gotG string
+	if err := db.QueryRowContext(ctx, "SELECT d, g FROM xr WHERE id = 1").Scan(&gotD, &gotG); err != nil {
+		t.Fatal(err)
+	}
+	if gotD != "é😀中" || gotG != "ß😀1" {
+		t.Fatalf("the server evaluates d=%q g=%q; the fixture declares é😀中 / ß😀1", gotD, gotG)
+	}
+	sr, err := Engine{Flavor: FlavorVitess}.OpenSchemaReader(ctx, mysqlDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeIfCloser(sr)
+	schema, err := sr.ReadSchema(ctx)
+	if err != nil {
+		t.Fatalf("ReadSchema through vtgate: %v", err)
+	}
+	for _, tbl := range schema.Tables {
+		if tbl.Name != "xr" {
+			continue
+		}
+		for _, c := range tbl.Columns {
+			switch c.Name {
+			case "d":
+				if e, ok := c.Default.(ir.DefaultExpression); !ok || !strings.Contains(e.Expr, "é😀") || !strings.Contains(e.Expr, "中") {
+					t.Errorf("d default = %#v; want the declared text", c.Default)
+				}
+			case "g":
+				if !strings.Contains(c.GeneratedExpr, "ß😀") {
+					t.Errorf("g generated = %q; want the declared text", c.GeneratedExpr)
+				}
+			}
+		}
+		for _, cc := range tbl.CheckConstraints {
+			if cc.Name == "xr_chk" && !strings.Contains(cc.Expr, "é😀") {
+				t.Errorf("xr_chk = %q; want the declared text", cc.Expr)
+			}
+		}
+		return
+	}
+	t.Fatal("xr not read")
+}

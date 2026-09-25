@@ -310,6 +310,10 @@ func readColumnFacts(ctx context.Context, db *sql.DB, flavor Flavor, args []any,
 	// '?' on both flavors (GC-37 (h)), so '😀' → '😁' read '?' both times;
 	// re-read by the schema readers' utf8mb4 DEFAULT() probe.
 	textPending := map[string][]pendingTextDefault{}
+	// An expression default or generation expression holding a character
+	// beyond the BMP reads back as '?' on MariaDB (Bug 288), so '😀' → '😁'
+	// inside one read identically both times; recovered from SHOW CREATE.
+	exprPending := map[string][]pendingExprText{}
 	for rows.Next() {
 		var (
 			s, t, col, typ, nullable, extra, gen, charset string
@@ -319,6 +323,29 @@ func readColumnFacts(ctx context.Context, db *sql.DB, flavor Flavor, args []any,
 			return err
 		}
 		get(s, t).columns[col] = columnFact(flavor, typ, nullable, def, extra, gen)
+		if flavor == FlavorMariaDB {
+			facts := get(s, t)
+			if text, ok := exprDefaultCatalogText(flavor, extra, def); ok && exprTextNeedsRecovery(flavor, text) {
+				exprPending[s] = append(exprPending[s], pendingExprText{
+					table: t, kind: exprSiteColumn, name: col, catalog: text,
+					set: func(recovered string) {
+						c := facts.columns[col]
+						c.def = recovered
+						facts.columns[col] = c
+					},
+				})
+			}
+			if gen != "" && exprTextNeedsRecovery(flavor, gen) {
+				exprPending[s] = append(exprPending[s], pendingExprText{
+					table: t, kind: exprSiteColumn, name: col, catalog: gen,
+					set: func(recovered string) {
+						c := facts.columns[col]
+						c.generated = recovered
+						facts.columns[col] = c
+					},
+				})
+			}
+		}
 		if binaryHexDefault(typ, extra, def) {
 			pending = append(pending, binaryDefault{s, t, col})
 		}
@@ -356,6 +383,11 @@ func readColumnFacts(ctx context.Context, db *sql.DB, flavor Flavor, args []any,
 	for _, s := range sortedKeys(textPending) {
 		if err := recoverTextDefaults(ctx, db, s, flavor, textPending[s]); err != nil {
 			return fmt.Errorf("recover text defaults: %w", err)
+		}
+	}
+	for _, s := range sortedKeys(exprPending) {
+		if err := recoverExprTexts(ctx, db, s, flavor, exprPending[s]); err != nil {
+			return fmt.Errorf("recover expression text: %w", err)
 		}
 	}
 	showCreate := map[string]string{}
@@ -537,6 +569,10 @@ func readCheckFacts(ctx context.Context, db *sql.DB, flavor Flavor, args []any, 
 		return err
 	}
 	defer rows.Close()
+	// MariaDB's '?' for a character beyond the BMP (Bug 288); see
+	// readColumnFacts. MySQL's double-encoded CHECK_CLAUSE is a bijection
+	// of the stored text, so it compares faithfully as read.
+	exprPending := map[string][]pendingExprText{}
 	for rows.Next() {
 		var s, t, name, clause, isEnforced string
 		if err := rows.Scan(&s, &t, &name, &clause, &isEnforced); err != nil {
@@ -549,13 +585,32 @@ func readCheckFacts(ctx context.Context, db *sql.DB, flavor Flavor, args []any, 
 		if flavor == FlavorMariaDB && isMariaDBJSONMarker(f, clause) {
 			continue
 		}
-		detail := "(" + clause + ")"
+		suffix := ""
 		if strings.EqualFold(isEnforced, "NO") {
-			detail += " NOT ENFORCED"
+			suffix = " NOT ENFORCED"
 		}
-		f.constraints[kindCheck+" "+name] = mysqlConstraintFact{kind: kindCheck, name: name, detail: detail}
+		key := kindCheck + " " + name
+		f.constraints[key] = mysqlConstraintFact{kind: kindCheck, name: name, detail: "(" + clause + ")" + suffix}
+		if flavor == FlavorMariaDB && exprTextNeedsRecovery(flavor, clause) {
+			exprPending[s] = append(exprPending[s], pendingExprText{
+				table: t, kind: exprSiteCheck, name: name, catalog: clause,
+				set: func(recovered string) {
+					c := f.constraints[key]
+					c.detail = "(" + recovered + ")" + suffix
+					f.constraints[key] = c
+				},
+			})
+		}
 	}
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, s := range sortedKeys(exprPending) {
+		if err := recoverExprTexts(ctx, db, s, flavor, exprPending[s]); err != nil {
+			return fmt.Errorf("recover expression text: %w", err)
+		}
+	}
+	return nil
 }
 
 // isMariaDBJSONMarker reports whether clause is MariaDB's auto
