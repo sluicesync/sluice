@@ -337,7 +337,16 @@ func readColumnFacts(ctx context.Context, db *sql.DB, flavor Flavor, args []any,
 		if inScope != nil && !inScope(s) {
 			continue
 		}
-		get(s, t).columns[col] = columnFact(flavor, typ, nullable, def, extra, gen)
+		// Expression text is compared and displayed at value level on MySQL
+		// (see [mysqlDoorExprText]); MariaDB's is recovered below instead.
+		factDef, factGen := def, gen
+		if _, isExpr := exprDefaultCatalogText(flavor, extra, def); isExpr {
+			factDef.String = mysqlDoorExprText(flavor, def.String)
+		}
+		if gen != "" {
+			factGen = mysqlDoorExprText(flavor, gen)
+		}
+		get(s, t).columns[col] = columnFact(flavor, typ, nullable, factDef, extra, factGen)
 		if flavor == FlavorMariaDB {
 			facts := get(s, t)
 			if text, ok := exprDefaultCatalogText(flavor, extra, def); ok && exprTextNeedsRecovery(flavor, text) {
@@ -515,7 +524,7 @@ func readKeyFacts(ctx context.Context, db *sql.DB, flavor Flavor, args []any, ou
 		c.columns = append(c.columns, col)
 		switch {
 		case expression != "":
-			c.detail += fmt.Sprintf(" part%d=(%s)", len(c.columns), expression)
+			c.detail += fmt.Sprintf(" part%d=(%s)", len(c.columns), mysqlDoorExprText(flavor, expression))
 		case subPart > 0:
 			c.detail += fmt.Sprintf(" part%d-prefix=%d", len(c.columns), subPart)
 		}
@@ -605,7 +614,7 @@ func readCheckFacts(ctx context.Context, db *sql.DB, flavor Flavor, args []any, 
 			suffix = " NOT ENFORCED"
 		}
 		key := kindCheck + " " + name
-		f.constraints[key] = mysqlConstraintFact{kind: kindCheck, name: name, detail: "(" + clause + ")" + suffix}
+		f.constraints[key] = mysqlConstraintFact{kind: kindCheck, name: name, detail: "(" + mysqlDoorExprText(flavor, clause) + ")" + suffix}
 		if flavor == FlavorMariaDB && exprTextNeedsRecovery(flavor, clause) {
 			exprPending[s] = append(exprPending[s], pendingExprText{
 				table: t, kind: exprSiteCheck, name: name, catalog: clause,

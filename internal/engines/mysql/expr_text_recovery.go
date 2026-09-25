@@ -647,3 +647,42 @@ func decodeMySQLISExprForCompare(catalog string) (string, bool) {
 	}
 	return escapeISExpressionLayer(value), true
 }
+
+// mysqlDoorExprText is the MySQL unforwarded-schema-change door's compared
+// AND displayed form of a raw catalog expression (a CHECK clause, an
+// expression DEFAULT, a generation expression, a functional key part):
+// its VALUE-level spelling — the byte widening undone and each literal
+// decoded by its introducer ([decodeMySQLISExprForCompare]), then the
+// read boundary's portable normalization (introducers and identifier
+// backticks stripped, [normalizeMySQLExpressionText]).
+//
+// Why value-level: MySQL re-spells a CHECK's literals on ANY later ALTER
+// TABLE — measured on 8.0.46, a latin1-session CHECK (a <> 'xÃ©') read back
+// as _latin1'…' before an unrelated ADD COLUMN and _utf8mb4'…' after, and
+// the same for a pure-ASCII _latin1'plain' — so comparing the raw text
+// halted the stream on a change nobody made, and displayed the clause as
+// mojibake an operator could copy onto the target.
+//
+// Detection stays exact: normalization only drops introducers and
+// identifier quoting, so two expressions whose literal VALUES, identifiers
+// or operators differ still differ. When the decode refuses (a charset it
+// cannot read, a cp1252-range latin1 byte), the raw text is used — it is a
+// one-to-one rendering of the stored bytes, so a real change still shows,
+// and no new refusal path is added at the boundary; the cost is that such
+// an expression can still false-refuse on MySQL's re-spelling, loudly.
+// MariaDB's texts are compared as recovered (its SHOW CREATE is faithful
+// and it does not re-spell).
+func mysqlDoorExprText(flavor Flavor, raw string) string {
+	if flavor == FlavorMariaDB {
+		return raw
+	}
+	text := raw
+	if exprTextNeedsRecovery(flavor, raw) {
+		decoded, ok := decodeMySQLISExprForCompare(raw)
+		if !ok {
+			return raw
+		}
+		text = decoded
+	}
+	return normalizeMySQLExpressionText(text)
+}

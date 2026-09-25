@@ -387,3 +387,109 @@ func exprDefaultText(v ir.DefaultValue) string {
 	}
 	return ""
 }
+
+// TestUnforwardedDoor_MySQLExpressionText_ValueLevel pins the MySQL arm of
+// the unforwarded-schema-change door against its expression texts, on a
+// real server. MySQL re-spells a CHECK's literals on ANY later ALTER TABLE —
+// a latin1-session CHECK reads `_latin1'…'` before an unrelated ADD COLUMN
+// and `_utf8mb4'…'` after (measured, for a non-ASCII AND a pure-ASCII
+// literal) — so the door, comparing the raw widened text, halted the stream
+// on a change nobody made and displayed the clause as mojibake an operator
+// could copy onto the target. It now compares and displays the value-level
+// text ([mysqlDoorExprText]). The three cells:
+//
+//	(a) latin1 CHECKs + an unrelated ADD COLUMN from a utf8mb4 session → no delta;
+//	(b) a genuine CHECK and expression-DEFAULT change é → ê → deltas that show
+//	    é and ê as themselves (exact substrings, no Ã©);
+//	(c) a latin1 CHECK's VALUE changed → a delta.
+//
+// The independent expected value is the DDL each cell ran: whether it
+// changed a value, and to what.
+func TestUnforwardedDoor_MySQLExpressionText_ValueLevel(t *testing.T) {
+	dsn, _ := startMySQL(t)
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	inSession := func(cs string, stmts ...string) {
+		t.Helper()
+		conn, err := db.Conn(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = conn.Close() }()
+		// Restore utf8mb4 before the connection returns to the pool, or the
+		// catalog reads below would be transcoded by a latin1 session.
+		for _, q := range append(append([]string{"SET NAMES " + cs}, stmts...), "SET NAMES utf8mb4") {
+			if _, err := conn.ExecContext(ctx, q); err != nil {
+				t.Fatalf("%s: %v", q, err)
+			}
+		}
+	}
+	read := func(table string) *mysqlTableFacts {
+		t.Helper()
+		facts, err := readTableFacts(ctx, db, FlavorVanilla, "sluice_test", table, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return facts[qualifiedName("sluice_test", table)]
+	}
+	step := func(table, cs string, ddl ...string) string {
+		t.Helper()
+		prior := read(table)
+		inSession(cs, ddl...)
+		return strings.Join(diffTableFacts(prior, read(table), nil), "; ")
+	}
+	checkClause := func(name string) string {
+		t.Helper()
+		var c string
+		if err := db.QueryRowContext(ctx, `SELECT check_clause FROM information_schema.check_constraints
+			WHERE constraint_schema = 'sluice_test' AND constraint_name = ?`, name).Scan(&c); err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+
+	// (a) latin1 CHECKs — non-ASCII and pure ASCII — survive an unrelated
+	// ADD COLUMN from a utf8mb4 session.
+	inSession("latin1", "CREATE TABLE da (id INT PRIMARY KEY, a VARCHAR(20), b VARCHAR(20), "+
+		"CONSTRAINT da_ck CHECK (a <> 'x\xc3\xa9'), CONSTRAINT da_ck2 CHECK (b <> 'plain')) DEFAULT CHARSET utf8mb4")
+	before := checkClause("da_ck2")
+	if deltas := step("da", "utf8mb4", "ALTER TABLE da ADD COLUMN z INT"); deltas != "" {
+		t.Errorf("(a) an unrelated ADD COLUMN produced deltas %q; want none", deltas)
+	}
+	if after := checkClause("da_ck2"); before == after {
+		t.Fatalf("(a) MySQL did not re-spell the CHECK (%q both times); the cell no longer exercises the premise — re-measure", before)
+	}
+
+	// (b) a genuine change é → ê, shown as itself.
+	if _, err := db.ExecContext(ctx, "CREATE TABLE db2 (id INT PRIMARY KEY, a VARCHAR(20) DEFAULT (concat('xé','')), "+
+		"CONSTRAINT db2_ck CHECK (a <> 'yé'))"); err != nil {
+		t.Fatal(err)
+	}
+	deltas := step("db2", "utf8mb4",
+		"ALTER TABLE db2 DROP CHECK db2_ck", "ALTER TABLE db2 ADD CONSTRAINT db2_ck CHECK (a <> 'yê')",
+		"ALTER TABLE db2 ALTER COLUMN a SET DEFAULT (concat('xê',''))")
+	for _, want := range []string{
+		"CHECK ((a <> 'yé')) -> CHECK ((a <> 'yê'))",
+		"SET DEFAULT (concat('xê','')) (was (concat('xé','')))",
+	} {
+		if !strings.Contains(deltas, want) {
+			t.Errorf("(b) deltas %q do not show %q", deltas, want)
+		}
+	}
+	if strings.Contains(deltas, "Ã") {
+		t.Errorf("(b) deltas %q carry mojibake", deltas)
+	}
+
+	// (c) a latin1 CHECK's value changed is still a delta, shown as its
+	// latin1 value.
+	deltas = step("da", "latin1", "ALTER TABLE da DROP CHECK da_ck",
+		"ALTER TABLE da ADD CONSTRAINT da_ck CHECK (a <> 'y\xc3\xa9')")
+	if !strings.Contains(deltas, "(a <> 'xÃ©')") || !strings.Contains(deltas, "(a <> 'yÃ©')") {
+		t.Errorf("(c) a latin1 CHECK value change: deltas %q; want xÃ© → yÃ© shown", deltas)
+	}
+}
