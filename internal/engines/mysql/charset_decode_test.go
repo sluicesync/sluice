@@ -209,6 +209,31 @@ func TestDecodeVStreamRow_CharsetByCollation(t *testing.T) {
 			t.Errorf("%s = %#v, %v; want %#v", tc.name, got[tc.field.Name], err, tc.want)
 		}
 	}
+	// Third review: vttablet types a `_bin`-collated character column as
+	// BINARY/VARBINARY/BLOB with the column's collation ID (MEASURED); it is
+	// text, decoded by that collation. A true binary column stays bytes.
+	for _, tc := range []struct {
+		name  string
+		field *query.Field
+		raw   []byte
+		want  any
+	}{
+		{"VARCHAR latin1_bin (VARBINARY 47)", &query.Field{Name: "c", Type: query.Type_VARBINARY, Charset: 47, ColumnType: "varchar(16)"}, []byte{0xE9}, "é"},
+		{"TEXT latin1_bin (BLOB 47)", &query.Field{Name: "c", Type: query.Type_BLOB, Charset: 47, ColumnType: "text"}, []byte{0xE9}, "é"},
+		{"CHAR cp1251_bin (BINARY 50)", &query.Field{Name: "c", Type: query.Type_BINARY, Charset: 50, ColumnType: "char(4)"}, []byte{0xC0}, "А"},
+		{"VARCHAR utf8mb4_bin (VARBINARY 46)", &query.Field{Name: "c", Type: query.Type_VARBINARY, Charset: 46, ColumnType: "varchar(8)"}, []byte{0xC3, 0xA9}, "é"},
+		{"a true VARBINARY", &query.Field{Name: "c", Type: query.Type_VARBINARY, Charset: 63, ColumnType: "varbinary(4)"}, []byte{0xE9}, []byte{0xE9}},
+		{"a true BLOB with no collation", &query.Field{Name: "c", Type: query.Type_BLOB, ColumnType: "blob"}, []byte{0xE9}, []byte{0xE9}},
+	} {
+		got, _, err := decodeVStreamRow(row(tc.raw), []*query.Field{tc.field}, "t", zeroDateInherit)
+		if err != nil || fmt.Sprintf("%#v", got["c"]) != fmt.Sprintf("%#v", tc.want) {
+			t.Errorf("%s = %#v, %v; want %#v", tc.name, got["c"], err, tc.want)
+		}
+	}
+	if _, _, err := decodeVStreamRow(row([]byte{0xD6, 0xD0}), []*query.Field{{Name: "c", Type: query.Type_VARBINARY, ColumnType: "varchar(8)"}}, "t", zeroDateInherit); !errors.Is(err, errCharsetNotDecodable) {
+		t.Errorf("an unnamed-collation _bin text column (gbk_bin, collation 0) with non-ASCII: err = %v; want %s", err, charsetNotDecodableMarker)
+	}
+
 	amb := &query.Field{Name: "e", Type: query.Type_ENUM, Charset: 8, ColumnType: "enum('é','Ã©')"}
 	if _, _, err := decodeVStreamRow(row([]byte{0xC3, 0xA9}), []*query.Field{amb}, "t", zeroDateInherit); !errors.Is(err, errCharsetNotDecodable) {
 		t.Errorf("ambiguous ENUM cell: err = %v; want %s", err, charsetNotDecodableMarker)

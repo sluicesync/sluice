@@ -142,7 +142,10 @@ func cdcCharsetLane(t *testing.T, dsn string, skip map[string]bool, start func(c
 			v VARCHAR(16) CHARACTER SET %[2]s NULL,
 			x TEXT CHARACTER SET %[2]s NULL,
 			e ENUM('%[3]s','b') CHARACTER SET %[2]s NULL,
-			s SET('%[3]s','b') CHARACTER SET %[2]s NULL)`, p.table, c.cs, label)
+			s SET('%[3]s','b') CHARACTER SET %[2]s NULL,
+			cb CHAR(6) CHARACTER SET %[2]s COLLATE %[2]s_bin NULL,
+			vb VARCHAR(16) CHARACTER SET %[2]s COLLATE %[2]s_bin NULL,
+			xb TEXT CHARACTER SET %[2]s COLLATE %[2]s_bin NULL)`, p.table, c.cs, label)
 		if _, err := db.Exec(ddl); err != nil {
 			t.Fatalf("%s: create: %v", c.cs, err)
 		}
@@ -179,8 +182,9 @@ func cdcCharsetLane(t *testing.T, dsn string, skip map[string]bool, start func(c
 		for _, s := range p.samples {
 			all = append(all, lit(p.cs, s))
 		}
-		insert := fmt.Sprintf("INSERT INTO %s (k, c, v, x, e, s) VALUES (%s, %s, %s, CONCAT(%s), 1, 1)",
-			p.table, lit(p.cs, s1), lit(p.cs, s1), lit(p.cs, s2), strings.Join(all, ","))
+		insert := fmt.Sprintf("INSERT INTO %s (k, c, v, x, e, s, cb, vb, xb) VALUES (%s, %s, %s, CONCAT(%s), 1, 1, %s, %s, CONCAT(%s))",
+			p.table, lit(p.cs, s1), lit(p.cs, s1), lit(p.cs, s2), strings.Join(all, ","),
+			lit(p.cs, s1), lit(p.cs, s2), strings.Join(all, ","))
 		if _, err := db.Exec(insert); err != nil {
 			t.Fatalf("%s: insert: %v", p.cs, err)
 		}
@@ -204,12 +208,17 @@ func cdcCharsetLane(t *testing.T, dsn string, skip map[string]bool, start func(c
 		if !reflect.DeepEqual(ins.Row["s"], []string{t1}) {
 			t.Errorf("%s insert s (SET) = %#v; want [%q]", p.cs, ins.Row["s"], t1)
 		}
+		// The `_bin`-collated columns: vttablet types them BINARY/VARBINARY/
+		// BLOB (third review, MEASURED); they are text all the same.
+		wantStr(p.cs+" insert cb (CHAR _bin)", ins.Row["cb"], t1)
+		wantStr(p.cs+" insert vb (VARCHAR _bin)", ins.Row["vb"], t2)
+		wantStr(p.cs+" insert xb (TEXT _bin)", ins.Row["xb"], string(xb))
 
 		if _, err := db.Exec(fmt.Sprintf("INSERT INTO %s (k) VALUES ('n')", p.table)); err != nil {
 			t.Fatal(err)
 		}
 		nullRow, _ := next(p.cs + " NULL insert").(ir.Insert)
-		for _, col := range []string{"c", "v", "x", "e", "s"} {
+		for _, col := range []string{"c", "v", "x", "e", "s", "cb", "vb", "xb"} {
 			if nullRow.Row[col] != nil {
 				t.Errorf("%s NULL row %s = %#v; want NULL", p.cs, col, nullRow.Row[col])
 			}

@@ -1808,7 +1808,7 @@ func (b *BackupStream) captureWindow(
 				out.SourceClosed = true
 				if errReader, ok := cdc.(interface{ Err() error }); ok {
 					if e := errReader.Err(); e != nil {
-						return out, fmt.Errorf("cdc reader: %w", e)
+						return out, backupCaptureReaderErr(e)
 					}
 				}
 				if err := flush(); err != nil {

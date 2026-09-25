@@ -1304,7 +1304,7 @@ func (b *IncrementalBackup) captureWindow(
 				// we got.
 				if errReader, ok := cdc.(interface{ Err() error }); ok {
 					if e := errReader.Err(); e != nil {
-						return endPos, totalChanges, advanced, fmt.Errorf("cdc reader: %w", e)
+						return endPos, totalChanges, advanced, backupCaptureReaderErr(e)
 					}
 				}
 				if err := flush(); err != nil {

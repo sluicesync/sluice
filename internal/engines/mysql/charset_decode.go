@@ -474,6 +474,56 @@ func stringTypeCharset(t ir.Type) (string, bool) {
 	return "", false
 }
 
+// decodeVStreamText converts a VStream character cell to UTF-8 by its
+// field's collation (GC-37 (j)): vttablet sends it in the column's OWN
+// charset (MEASURED: latin1 'é' arrived as the one byte 0xE9), where the
+// bulk copy gets UTF-8 from the server. A value it cannot convert becomes a
+// sentinel the row decoder turns into a loud stream error (the cell decoder
+// has no error channel).
+func decodeVStreamText(field *query.Field, raw []byte) any {
+	s, err := lookupCollationCharset(field.GetCharset()).decode(raw, "", field.GetName())
+	if err != nil {
+		return &vstreamCharsetError{cause: err}
+	}
+	return s
+}
+
+// vstreamBinaryCollationID is MySQL's `binary` collation — the one a true
+// BINARY/VARBINARY/BLOB column carries.
+const vstreamBinaryCollationID = 63
+
+// isVStreamBinaryCollatedText reports whether a BINARY/VARBINARY/BLOB field
+// is really a CHARACTER column with a `_bin` collation. vttablet types a
+// CHAR/VARCHAR/TEXT column collated latin1_bin, cp1251_bin, utf8mb4_bin, …
+// as BINARY/VARBINARY/BLOB and tags it with the column's collation ID, not
+// 63 (MEASURED on vttestserver, GC-37 (j) third review: `VARCHAR … COLLATE
+// latin1_bin` arrived as VARBINARY charset 47, `TEXT … latin1_bin` as BLOB
+// 47, `CHAR … cp1251_bin` as BINARY 50). Before this, such a cell was carried
+// as its stored bytes — the pre-fix defect this whole file exists to close,
+// surviving for every `_bin` collation.
+//
+// The column_type decides (`varchar(16)` vs `varbinary(16)`): it is the
+// column's declaration, where the collation ID cannot tell a true binary
+// column (63) from an unnamed-collation text one (vttablet's 0 for gbk and
+// friends) or a hand-built field with none. Only with no column_type does
+// the ID decide, and then only a named, non-binary collation counts.
+func isVStreamBinaryCollatedText(field *query.Field) bool {
+	switch field.GetType() {
+	case query.Type_BINARY, query.Type_VARBINARY, query.Type_BLOB:
+	default:
+		return false
+	}
+	if ct := strings.TrimSpace(field.GetColumnType()); ct != "" {
+		switch leadingTypeWord(strings.ToLower(ct)) {
+		case "char", "varchar", "tinytext", "text", "mediumtext", "longtext":
+			return true
+		}
+		return false
+	}
+	c := field.GetCharset()
+	return c != 0 && c != vstreamBinaryCollationID
+}
+
 // resolveVStreamEnumSetText decodes a VStream ENUM or SET cell of a
 // non-UTF-8 column (review F2, MEASURED on vttestserver).
 //

@@ -104,6 +104,32 @@ func TestVStream_CDCCharsetDDLReplay_GuardRefuses(t *testing.T) {
 			cancel()
 			t.Fatalf("StreamChanges: %v", err)
 		}
+		if c.to == "utf8mb4" {
+			// Third review item 1a: a replay INTO a UTF-8 charset is carried
+			// as v0.156.2 carried it — the stored byte 0xE9 passed through,
+			// invalid UTF-8 and loud downstream — and not refused. The anchor
+			// may replay too; look for row 2.
+			got := drainVTTestChanges(t, ctx, changes, 3, 45*time.Second)
+			slog.SetDefault(prev)
+			if err := rdr.(*vstreamCDCReader).Err(); err != nil {
+				t.Errorf("%s: err = %v; a replay into a UTF-8 charset is not refused", c.name, err)
+			}
+			found := false
+			for _, ch := range got {
+				if ins, ok := ch.(ir.Insert); ok && fmt.Sprint(ins.Row["id"]) == "2" {
+					found = true
+					if ins.Row["v"] != "\xe9" {
+						t.Errorf("%s: replayed v = %q; want the stored byte 0xE9 carried as-is (the v0.156.2 behaviour)", c.name, ins.Row["v"])
+					}
+				}
+			}
+			if !found {
+				t.Errorf("%s: row 2 never replayed", c.name)
+			}
+			_ = rdr.(interface{ Close() error }).Close()
+			cancel()
+			continue
+		}
 		// Drain until the stream ends at the refusal (or times out).
 		_ = drainVTTestChanges(t, ctx, changes, 10, 45*time.Second)
 		slog.SetDefault(prev)
@@ -140,6 +166,48 @@ func TestVStream_CDCCharsetDDLLive_NoGuardRefusal(t *testing.T) {
 		}
 		if ins, _ := g[0].(ir.Insert); ins.Row["v"] != "é" {
 			t.Errorf("live row v = %q; want %q", ins.Row["v"], "é")
+		}
+	}
+}
+
+// TestVStream_CDCCharsetDDLLive_RoutineDDLNoRefusal: the routine DDLs the
+// third review MEASURED refusing a LIVE VStream (charset names compared,
+// collations not, UTF-8 targets guarded) — a collation-only CONVERT on a
+// pure-utf8mb4 table, a restated utf8mb4 MODIFY, and latin1 collation-only
+// changes — must pass, each with a row streamed just before it so the guard
+// compares against a live FIELD shape.
+func TestVStream_CDCCharsetDDLLive_RoutineDDLNoRefusal(t *testing.T) {
+	mysqlDSN, grpcEndpoint, _, cleanup := startVTTestServer(t)
+	defer cleanup()
+	applyVTTestSQL(t, mysqlDSN, `CREATE TABLE u (id INT NOT NULL PRIMARY KEY, v VARCHAR(64) CHARACTER SET utf8mb4 NULL)`)
+	applyVTTestSQL(t, mysqlDSN, `CREATE TABLE l1 (id INT NOT NULL PRIMARY KEY, v VARCHAR(16) CHARACTER SET latin1 NULL)`)
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+	drain, streamErr := vstreamStart(t, mysqlDSN, grpcEndpoint)(ctx)
+	id := 0
+	for _, step := range []struct{ table, value, ddl string }{
+		{"u", "_utf8mb4 X'C3A9'", "ALTER TABLE u CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"},
+		{"u", "_utf8mb4 X'C3A9'", "ALTER TABLE u MODIFY v VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci"},
+		{"l1", "_latin1 X'E9'", "ALTER TABLE l1 MODIFY v VARCHAR(16) COLLATE latin1_bin"},
+		{"l1", "_latin1 X'E9'", "ALTER TABLE l1 MODIFY v VARCHAR(16) CHARACTER SET latin1 COLLATE latin1_general_ci"},
+		{"l1", "_latin1 X'E9'", "ALTER TABLE l1 CONVERT TO CHARACTER SET latin1 COLLATE latin1_swedish_ci"},
+		{"u", "_utf8mb4 X'C3A9'", ""},
+		{"l1", "_latin1 X'E9'", ""},
+	} {
+		id++
+		applyVTTestSQL(t, mysqlDSN, fmt.Sprintf("INSERT INTO %s VALUES (%d, %s)", step.table, id, step.value))
+		got := drain(1)
+		if err := streamErr(); err != nil {
+			t.Fatalf("live stream: err = %v before row %d; want no refusal", err, id)
+		}
+		if len(got) != 1 {
+			t.Fatalf("row %d of %s did not stream", id, step.table)
+		}
+		if ins, _ := got[0].(ir.Insert); ins.Row["v"] != "é" {
+			t.Errorf("live row %d of %s: v = %q; want %q", id, step.table, ins.Row["v"], "é")
+		}
+		if step.ddl != "" {
+			applyVTTestSQL(t, mysqlDSN, step.ddl)
 		}
 	}
 }

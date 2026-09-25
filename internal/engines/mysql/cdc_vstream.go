@@ -2262,16 +2262,7 @@ func decodeVStreamCell(field *query.Field, raw []byte) any {
 		// past 15 digits, and the IR contract says string.
 		return v.ToString()
 	case query.Type_VARCHAR, query.Type_TEXT, query.Type_CHAR:
-		// GC-37 (j): vttablet sends a character cell in the column's OWN
-		// charset (MEASURED: latin1 'é' arrived as the one byte 0xE9), where
-		// the bulk copy gets UTF-8 from the server. Convert by the field's
-		// collation, or hand up a sentinel the row decoder turns into a
-		// loud stream error (no error channel here).
-		s, err := lookupCollationCharset(field.GetCharset()).decode(raw, "", field.GetName())
-		if err != nil {
-			return &vstreamCharsetError{cause: err}
-		}
-		return s
+		return decodeVStreamText(field, raw)
 	case query.Type_ENUM:
 		// GC-37 (j) review F2: a non-UTF-8 ENUM cell is UTF-8 label text in
 		// CDC but the STORED bytes in COPY (MEASURED), with identical FIELD
@@ -2317,9 +2308,17 @@ func decodeVStreamCell(field *query.Field, raw []byte) any {
 		// same string shape; matching here keeps cross-engine
 		// time-only columns consistent.
 		return v.ToString()
-	case query.Type_JSON, query.Type_BLOB, query.Type_VARBINARY:
+	case query.Type_JSON:
+		return copyBytes(raw)
+	case query.Type_BLOB, query.Type_VARBINARY:
+		if isVStreamBinaryCollatedText(field) {
+			return decodeVStreamText(field, raw)
+		}
 		return copyBytes(raw)
 	case query.Type_BINARY:
+		if isVStreamBinaryCollatedText(field) {
+			return decodeVStreamText(field, raw)
+		}
 		// Fixed-width BINARY(N): re-pad a short payload to the declared
 		// width, closing the VStream sibling of the binlog-lane
 		// pad-strip fix (adversarial-corpus finding, 2026-08-22 — the

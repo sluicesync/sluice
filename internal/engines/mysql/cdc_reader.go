@@ -85,6 +85,13 @@ type CDCReader struct {
 	serverCollations      map[uint64]string
 	serverCollationsTried time.Time
 
+	// serverCollationNames / serverCollationDefaults are the source's
+	// collation name → charset table and per-charset defaults, which the
+	// charset-DDL guard names a DDL's collation by ([guardCollationNamer]).
+	serverCollationNames      map[string]string
+	serverCollationDefaults   map[string]string
+	serverCollationNamesTried time.Time
+
 	// charsetUnrecordedWarned records the tables CHARSET-HISTORY-UNRECORDED
 	// was already logged for (charset_ddl_guard.go).
 	charsetUnrecordedWarned map[string]bool
@@ -1386,7 +1393,7 @@ func (r *CDCReader) dispatch(ctx context.Context, ev *replication.BinlogEvent, o
 			// GC-37 (j): a charset DDL whose new charset the cached shape already
 			// carries means this stream is replaying history the cache
 			// misdecoded — refuse BEFORE the cache that proves it is cleared.
-			if err := r.binlogCharsetDDLGuard(string(e.Query), stmtSchema); err != nil {
+			if err := r.binlogCharsetDDLGuard(ctx, string(e.Query), stmtSchema); err != nil {
 				return err
 			}
 			// SLM-1: the cache about to be cleared is the last shape each

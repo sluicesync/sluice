@@ -46,30 +46,31 @@ var vstreamCopyCharsetTables = []struct{ table, cs, v, label string }{
 	{"cp_utf16", "utf16", "00E9", "é"},
 }
 
-// serverRowHexes returns, per id, the server's UTF-8 hex of v, x, e, s.
-func serverRowHexes(t *testing.T, db *sql.DB, table string) map[string][4]string {
+// serverRowHexes returns, per id, the server's UTF-8 hex of v, x, e, s and
+// vb (a `_bin`-collated VARCHAR, which vttablet types VARBINARY).
+func serverRowHexes(t *testing.T, db *sql.DB, table string) map[string][5]string {
 	t.Helper()
 	rows, err := db.Query(fmt.Sprintf(`SELECT id, HEX(CONVERT(v USING utf8mb4)), HEX(CONVERT(x USING utf8mb4)),
-		HEX(CONVERT(e USING utf8mb4)), HEX(CONVERT(s USING utf8mb4)) FROM %s`, table))
+		HEX(CONVERT(e USING utf8mb4)), HEX(CONVERT(s USING utf8mb4)), HEX(CONVERT(vb USING utf8mb4)) FROM %s`, table))
 	if err != nil {
 		t.Fatalf("%s: server read: %v", table, err)
 	}
 	defer func() { _ = rows.Close() }()
-	out := map[string][4]string{}
+	out := map[string][5]string{}
 	for rows.Next() {
 		var id string
-		var v, x, e, s sql.NullString
-		if err := rows.Scan(&id, &v, &x, &e, &s); err != nil {
+		var v, x, e, s, vb sql.NullString
+		if err := rows.Scan(&id, &v, &x, &e, &s, &vb); err != nil {
 			t.Fatal(err)
 		}
-		out[id] = [4]string{v.String, x.String, e.String, s.String}
+		out[id] = [5]string{v.String, x.String, e.String, s.String, vb.String}
 	}
 	return out
 }
 
-// emittedHexes renders an emitted row's v, x, e, s the way serverRowHexes
+// emittedHexes renders an emitted row's v, x, e, s, vb the way serverRowHexes
 // does (SET elements comma-joined).
-func emittedHexes(r ir.Row) [4]string {
+func emittedHexes(r ir.Row) [5]string {
 	h := func(v any) string {
 		switch x := v.(type) {
 		case string:
@@ -81,7 +82,7 @@ func emittedHexes(r ir.Row) [4]string {
 		}
 		return fmt.Sprintf("<%T>", v)
 	}
-	return [4]string{h(r["v"]), h(r["x"]), h(r["e"]), h(r["s"])}
+	return [5]string{h(r["v"]), h(r["x"]), h(r["e"]), h(r["s"]), h(r["vb"])}
 }
 
 func vstreamCopyCharsetLane(t *testing.T, parallelism int) {
@@ -97,9 +98,10 @@ func vstreamCopyCharsetLane(t *testing.T, parallelism int) {
 		label := strings.ReplaceAll(c.label, "'", "''")
 		applyVTTestSQL(t, mysqlDSN, fmt.Sprintf(`CREATE TABLE %s (id INT NOT NULL PRIMARY KEY,
 			v VARCHAR(16) CHARACTER SET %[2]s NULL, x TEXT CHARACTER SET %[2]s NULL,
-			e ENUM('%[3]s','b') CHARACTER SET %[2]s NULL, s SET('%[3]s','b') CHARACTER SET %[2]s NULL)`, c.table, c.cs, label))
+			e ENUM('%[3]s','b') CHARACTER SET %[2]s NULL, s SET('%[3]s','b') CHARACTER SET %[2]s NULL,
+			vb VARCHAR(16) CHARACTER SET %[2]s COLLATE %[2]s_bin NULL)`, c.table, c.cs, label))
 		applyVTTestSQL(t, mysqlDSN, fmt.Sprintf(`INSERT INTO %s VALUES
-			(1, _%[2]s X'%[3]s', CONCAT(_%[2]s X'%[3]s', _%[2]s X'%[3]s'), 1, 3), (2, NULL, NULL, NULL, NULL)`, c.table, c.cs, c.v))
+			(1, _%[2]s X'%[3]s', CONCAT(_%[2]s X'%[3]s', _%[2]s X'%[3]s'), 1, 3, _%[2]s X'%[3]s'), (2, NULL, NULL, NULL, NULL, NULL)`, c.table, c.cs, c.v))
 		names = append(names, c.table)
 	}
 	time.Sleep(3 * time.Second)
@@ -121,6 +123,7 @@ func vstreamCopyCharsetLane(t *testing.T, parallelism int) {
 			{Name: "x", Type: ir.Text{}},
 			{Name: "e", Type: ir.Text{}},
 			{Name: "s", Type: ir.Text{}},
+			{Name: "vb", Type: ir.Varchar{Length: 16}},
 		}, PrimaryKey: &ir.Index{Name: "PRIMARY", Unique: true, Columns: []ir.IndexColumn{{Column: "id"}}}}
 		ch, err := stream.Rows.ReadRows(ctx, tbl)
 		if err != nil {
@@ -132,7 +135,7 @@ func vstreamCopyCharsetLane(t *testing.T, parallelism int) {
 			got++
 			id := fmt.Sprint(r["id"])
 			if emittedHexes(r) != want[id] {
-				t.Errorf("%s (%s) COPY row %s = %v; server %v (v, x, e, s as UTF-8 hex)", c.table, c.cs, id, emittedHexes(r), want[id])
+				t.Errorf("%s (%s) COPY row %s = %v; server %v (v, x, e, s, vb as UTF-8 hex)", c.table, c.cs, id, emittedHexes(r), want[id])
 			}
 		}
 		if err := stream.Rows.Err(); err != nil {
@@ -153,7 +156,7 @@ func vstreamCopyCharsetLane(t *testing.T, parallelism int) {
 	}
 	time.Sleep(time.Second)
 	for _, c := range vstreamCopyCharsetTables {
-		applyVTTestSQL(t, mysqlDSN, fmt.Sprintf(`INSERT INTO %s VALUES (3, _%[2]s X'%[3]s', _%[2]s X'%[3]s', 1, 1)`, c.table, c.cs, c.v))
+		applyVTTestSQL(t, mysqlDSN, fmt.Sprintf(`INSERT INTO %s VALUES (3, _%[2]s X'%[3]s', _%[2]s X'%[3]s', 1, 1, _%[2]s X'%[3]s')`, c.table, c.cs, c.v))
 		want := serverRowHexes(t, db, c.table)["3"]
 		got := drainVTTestChanges(t, ctx, changes, 1, 45*time.Second)
 		if len(got) != 1 {

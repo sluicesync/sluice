@@ -50,12 +50,30 @@ import (
 // charset to, then replays from before the value. want is the inserted value.
 type charsetReplayCase struct {
 	name, from, to, valueHex, want string
+	// alter, when set, is the ALTER to run (%s is the table) in place of the
+	// plain MODIFY to charset to.
+	alter string
+}
+
+// mariaDBAlterSyntaxReplayCases are utf8mb4 'é' replayed across a change to
+// latin1 spelled in MariaDB-only syntax the Vitess parser refuses or
+// truncates at (MEASURED), a quoted charset, and a MariaDB-only collation
+// name. The last case is one the parser cannot classify even after the
+// prefix is normalised, which the fail-safe refuses.
+var mariaDBAlterSyntaxReplayCases = []charsetReplayCase{
+	{name: "ALTER TABLE IF EXISTS", alter: "ALTER TABLE IF EXISTS %s MODIFY v VARCHAR(16) CHARACTER SET latin1 NULL"},
+	{name: "ALTER ONLINE TABLE", alter: "ALTER ONLINE TABLE %s MODIFY v VARCHAR(16) CHARACTER SET latin1 NULL"},
+	{name: "WAIT n", alter: "ALTER TABLE %s WAIT 5 MODIFY v VARCHAR(16) CHARACTER SET latin1 NULL"},
+	{name: "NOWAIT", alter: "ALTER TABLE %s NOWAIT MODIFY v VARCHAR(16) CHARACTER SET latin1 NULL"},
+	{name: "quoted charset", alter: "ALTER TABLE %s MODIFY v VARCHAR(16) CHARACTER SET 'latin1' NULL"},
+	{name: "MariaDB-only collation name", alter: "ALTER TABLE %s MODIFY v VARCHAR(16) COLLATE latin1_swedish_nopad_ci NULL"},
+	{name: "unclassifiable (column IF EXISTS) — the fail-safe", alter: "ALTER TABLE %s MODIFY COLUMN IF EXISTS v VARCHAR(16) CHARACTER SET latin1 NULL"},
 }
 
 var charsetReplayCases = []charsetReplayCase{
-	{"utf8mb4 é → latin1", "utf8mb4", "latin1", "C3A9", "é"},
-	{"latin1 € → cp1251", "latin1", "cp1251", "80", "€"},
-	{"latin1 é → utf8mb4", "latin1", "utf8mb4", "E9", "é"},
+	{name: "utf8mb4 é → latin1", from: "utf8mb4", to: "latin1", valueHex: "C3A9", want: "é"},
+	{name: "latin1 € → cp1251", from: "latin1", to: "cp1251", valueHex: "80", want: "€"},
+	{name: "latin1 é → utf8mb4", from: "latin1", to: "utf8mb4", valueHex: "E9", want: "é"},
 }
 
 // replayAcrossCharsetDDL runs one case against dsn and returns what the
@@ -77,7 +95,11 @@ func replayAcrossCharsetDDL(t *testing.T, dsn string, flavor Flavor, c charsetRe
 	_ = stream.Close()
 
 	applyMySQL(t, dsn, fmt.Sprintf("INSERT INTO %s VALUES (1, _%s X'%s')", table, c.from, c.valueHex))
-	applyMySQL(t, dsn, fmt.Sprintf("ALTER TABLE %s MODIFY v VARCHAR(16) CHARACTER SET %s NULL", table, c.to))
+	alter := fmt.Sprintf("ALTER TABLE %s MODIFY v VARCHAR(16) CHARACTER SET %s NULL", table, c.to)
+	if c.alter != "" {
+		alter = fmt.Sprintf(c.alter, table)
+	}
+	applyMySQL(t, dsn, alter)
 
 	rdr, err := eng.OpenCDCReader(ctx, dsn)
 	if err != nil {
@@ -121,8 +143,10 @@ func assertCharsetDDLGuardRefusal(t *testing.T, what string, streamErr error) {
 	if !errors.As(streamErr, &ce) || ce.Code != sluicecode.CodeCDCSchemaReplayMismatch {
 		t.Fatalf("%s: stream error = %v; want the charset-DDL guard's %s", what, streamErr, sluicecode.CodeCDCSchemaReplayMismatch)
 	}
-	if msg := streamErr.Error(); !strings.Contains(msg, "ALREADY carries that charset") || !strings.Contains(msg, "--restart-from-scratch") {
-		t.Errorf("%s: the refusal is not the charset-DDL guard's, or does not name the re-snapshot remedy: %v", what, streamErr)
+	msg := streamErr.Error()
+	guard := strings.Contains(msg, "ALREADY carries that charset") || strings.Contains(msg, "could not parse it or could not name its collation")
+	if !guard || !strings.Contains(msg, "--restart-from-scratch") || !strings.Contains(msg, "take a fresh full backup") {
+		t.Errorf("%s: the refusal is not the charset-DDL guard's, or does not name the re-copy for sync and for a backup chain: %v", what, streamErr)
 	}
 }
 
@@ -202,8 +226,11 @@ func TestCDCReplay_AcrossCharsetDDL_DecodesWritten_MariaDBMinimal(t *testing.T) 
 // TestCDCReplay_AcrossCharsetDDL_GuardRefuses_MariaDBNoLog: under MariaDB's
 // default binlog_row_metadata=NO_LOG the TABLE_MAP carries no charset, so
 // the replayed rows are decoded by the current catalog; the charset-DDL
-// guard must refuse when the replay reaches the DDL, for every direction.
-// Drains up to 10 changes: the stream ends at the refusal.
+// guard must refuse when the replay reaches a DDL into a non-UTF-8 charset.
+// A replay into utf8mb4 is NOT refused (third review, item 1a): its old
+// bytes are carried by passthrough exactly as v0.156.2 carried them — here
+// latin1 0xE9, invalid UTF-8, which every target and the backup codec
+// refuse loudly. Drains up to 10 changes: the stream ends at the refusal.
 func TestCDCReplay_AcrossCharsetDDL_GuardRefuses_MariaDBNoLog(t *testing.T) {
 	dsn, cleanup := newMariaDBDedicatedForCDC(t, mariadb114Image)
 	defer cleanup()
@@ -211,10 +238,23 @@ func TestCDCReplay_AcrossCharsetDDL_GuardRefuses_MariaDBNoLog(t *testing.T) {
 		var buf logcapture.Buffer
 		prev := slog.Default()
 		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		// Drain past the ALTER in every case — a refusal ends the stream
+		// early; a non-refusing one runs to the drain timeout — so the UTF-8
+		// case's "not refused" is read after the stream has reached the DDL.
 		got, err := replayAcrossCharsetDDL(t, dsn, FlavorMariaDB, c, fmt.Sprintf("r%d", i), 10)
 		slog.SetDefault(prev)
-		t.Logf("%s: emitted before the refusal: %#v", c.name, got)
-		assertCharsetDDLGuardRefusal(t, c.name, err)
+		if c.to == "utf8mb4" {
+			if err != nil {
+				t.Errorf("%s: err = %v; a replay into a UTF-8 charset is carried as v0.156.2 carried it, not refused", c.name, err)
+			} else if len(got) != 1 {
+				t.Errorf("%s: got %d changes; want the replayed insert", c.name, len(got))
+			} else if ins, _ := got[0].(ir.Insert); ins.Row["v"] != "\xe9" {
+				t.Errorf("%s: replayed v = %q; want the stored byte 0xE9 carried as-is (the v0.156.2 behaviour)", c.name, ins.Row["v"])
+			}
+		} else {
+			t.Logf("%s: emitted before the refusal: %#v", c.name, got)
+			assertCharsetDDLGuardRefusal(t, c.name, err)
+		}
 		// The table's current charset is what the rows were decoded by; the
 		// WARN names a table only when that is non-UTF-8.
 		if warned := strings.Contains(buf.String(), charsetHistoryUnrecordedMarker); warned != (c.to != "utf8mb4") {
@@ -224,11 +264,96 @@ func TestCDCReplay_AcrossCharsetDDL_GuardRefuses_MariaDBNoLog(t *testing.T) {
 	}
 }
 
+// TestCDCReplay_MariaDBAlterSyntax_GuardRefuses_MariaDBNoLog: a replay into
+// latin1 whose ALTER is spelled in MariaDB-only syntax, a quoted charset or a
+// MariaDB-only collation name must refuse exactly like the plain spelling —
+// before the third review each of these was silently unclassified — and one
+// the parser cannot classify at all refuses through the fail-safe.
+func TestCDCReplay_MariaDBAlterSyntax_GuardRefuses_MariaDBNoLog(t *testing.T) {
+	dsn, cleanup := newMariaDBDedicatedForCDC(t, mariadb114Image)
+	defer cleanup()
+	for i, c := range mariaDBAlterSyntaxReplayCases {
+		c.from, c.to, c.valueHex, c.want = "utf8mb4", "latin1", "C3A9", "é"
+		_, err := replayAcrossCharsetDDL(t, dsn, FlavorMariaDB, c, fmt.Sprintf("s%d", i), 10)
+		assertCharsetDDLGuardRefusal(t, c.name, err)
+		// Which guard refused matters: every spelling but the last must be
+		// CLASSIFIED (the fail-safe would refuse them too, and would hide a
+		// normaliser or namer that stopped working).
+		failSafe := i == len(mariaDBAlterSyntaxReplayCases)-1
+		if err != nil && strings.Contains(err.Error(), "could not parse it or could not name its collation") != failSafe {
+			t.Errorf("%s: refused by the wrong door (want fail-safe = %v): %v", c.name, failSafe, err)
+		}
+	}
+}
+
 // TestCDCLive_CharsetDDL_NoGuardRefusal_MariaDBNoLog: the guard's other
-// direction. A stream that is LIVE when the charset DDL runs — its shape
+// direction. A stream that is LIVE when a charset DDL runs — its shape
 // loaded before the DDL — must not refuse, and must decode rows on both
-// sides of it by the charset they were written in.
+// sides of it by the charset they were written in. The third review
+// MEASURED the routine DDLs below refusing a live stream (charset names
+// compared, collations not, UTF-8 targets guarded), where v0.156.2 refused
+// none; each runs here with a row decoded just before it, so the guard
+// compares against a live cached shape every time.
 func TestCDCLive_CharsetDDL_NoGuardRefusal_MariaDBNoLog(t *testing.T) {
+	dsn, cleanup := newMariaDBDedicatedForCDC(t, mariadb114Image)
+	defer cleanup()
+	charsetLiveDDLLane(t, dsn)
+}
+
+// charsetLiveDDLLane runs the live no-refusal sequence on a binlog source.
+func charsetLiveDDLLane(t *testing.T, dsn string) {
+	t.Helper()
+	applyMySQL(t, dsn, "CREATE TABLE u (id INT NOT NULL PRIMARY KEY, v VARCHAR(64) CHARACTER SET utf8mb4 NULL) ENGINE=InnoDB")
+	applyMySQL(t, dsn, "CREATE TABLE l1 (id INT NOT NULL PRIMARY KEY, v VARCHAR(16) CHARACTER SET latin1 NULL) ENGINE=InnoDB")
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	eng := Engine{Flavor: FlavorMariaDB}
+	stream, err := eng.OpenSnapshotStream(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenSnapshotStream: %v", err)
+	}
+	resumeFrom := stream.Position
+	_ = stream.Close()
+	rdr, err := eng.OpenCDCReader(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenCDCReader: %v", err)
+	}
+	defer func() { _ = rdr.(interface{ Close() error }).Close() }()
+	changes, err := rdr.StreamChanges(ctx, resumeFrom)
+	if err != nil {
+		t.Fatalf("StreamChanges: %v", err)
+	}
+	id := 0
+	for _, step := range []struct{ table, value, ddl string }{
+		{"u", "_utf8mb4 X'C3A9'", "ALTER TABLE u CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"},
+		{"u", "_utf8mb4 X'C3A9'", "ALTER TABLE u MODIFY v VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci"},
+		{"l1", "_latin1 X'E9'", "ALTER TABLE l1 MODIFY v VARCHAR(16) COLLATE latin1_bin"},
+		{"l1", "_latin1 X'E9'", "ALTER TABLE l1 MODIFY v VARCHAR(16) CHARACTER SET latin1 COLLATE latin1_general_ci"},
+		{"l1", "_latin1 X'E9'", "ALTER TABLE l1 CONVERT TO CHARACTER SET latin1 COLLATE latin1_swedish_ci"},
+		{"u", "_utf8mb4 X'C3A9'", ""},
+		{"l1", "_latin1 X'E9'", ""},
+	} {
+		id++
+		applyMySQL(t, dsn, fmt.Sprintf("INSERT INTO %s VALUES (%d, %s)", step.table, id, step.value))
+		got := drainChanges(t, ctx, changes, 1, 20*time.Second)
+		if err := rdr.(*CDCReader).Err(); err != nil {
+			t.Fatalf("live stream: err = %v after the DDL before row %d; want no refusal", err, id)
+		}
+		if len(got) != 1 {
+			t.Fatalf("row %d of %s did not stream", id, step.table)
+		}
+		if ins, _ := got[0].(ir.Insert); ins.Row["v"] != "é" {
+			t.Errorf("live row %d of %s: v = %q; want %q", id, step.table, ins.Row["v"], "é")
+		}
+		if step.ddl != "" {
+			applyMySQL(t, dsn, step.ddl)
+		}
+	}
+}
+
+// TestCDCLive_CharsetDDLIntoLatin1_NoGuardRefusal_MariaDBNoLog is the first
+// review's live pin: a live change INTO latin1 decodes both sides exactly.
+func TestCDCLive_CharsetDDLIntoLatin1_NoGuardRefusal_MariaDBNoLog(t *testing.T) {
 	dsn, cleanup := newMariaDBDedicatedForCDC(t, mariadb114Image)
 	defer cleanup()
 	applyMySQL(t, dsn, "CREATE TABLE l (id INT NOT NULL PRIMARY KEY, v VARCHAR(16) CHARACTER SET utf8mb4 NULL) ENGINE=InnoDB")
