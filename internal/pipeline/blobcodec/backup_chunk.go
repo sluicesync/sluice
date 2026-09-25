@@ -238,6 +238,13 @@ func (w *ChunkWriter) WriteRow(row ir.Row, columns []*ir.Column) error {
 	if w.closed {
 		return errors.New("chunk writer closed")
 	}
+	// Before either write core: both encode a non-UTF-8 string as U+FFFD
+	// (backup_value_utf8.go).
+	for _, c := range columns {
+		if err := refuseNonUTF8Value(c.Name, "", row[c.Name]); err != nil {
+			return err
+		}
+	}
 	b, ok := appendRowJSON(w.encBuf[:0], row, w.columnNamesSorted(columns))
 	if ok {
 		w.encBuf = b

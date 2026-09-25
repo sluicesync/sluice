@@ -564,7 +564,7 @@ func (s *backupChunkStreamer) writeRow(ctx context.Context, row ir.Row) error {
 		return fmt.Errorf("redact row: %w", err)
 	}
 	if err := s.writer.WriteRow(row, s.cols); err != nil {
-		return fmt.Errorf("write row: %w", err)
+		return fmt.Errorf("write row of %q: %w", s.table.Name, err)
 	}
 	s.rowsTotal.Add(1)
 	// Roll on whichever limit arrives first. The byte ceiling is what

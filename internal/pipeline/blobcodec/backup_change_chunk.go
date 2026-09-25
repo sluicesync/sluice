@@ -453,9 +453,9 @@ func encodeChange(c ir.Change) (*changeWire, error) {
 	}
 	switch x := c.(type) {
 	case ir.Insert:
-		row, err := encodeRowValues(x.Row)
+		row, err := encodeRowValues(x.Row, "row")
 		if err != nil {
-			return nil, err
+			return nil, changeTableErr(x.Schema, x.Table, err)
 		}
 		return &changeWire{
 			Kind:     changeKindInsert,
@@ -465,13 +465,13 @@ func encodeChange(c ir.Change) (*changeWire, error) {
 			Position: x.Position,
 		}, nil
 	case ir.Update:
-		before, err := encodeRowValues(x.Before)
+		before, err := encodeRowValues(x.Before, "before-image")
 		if err != nil {
-			return nil, err
+			return nil, changeTableErr(x.Schema, x.Table, err)
 		}
-		after, err := encodeRowValues(x.After)
+		after, err := encodeRowValues(x.After, "after-image")
 		if err != nil {
-			return nil, err
+			return nil, changeTableErr(x.Schema, x.Table, err)
 		}
 		return &changeWire{
 			Kind:     changeKindUpdate,
@@ -482,9 +482,9 @@ func encodeChange(c ir.Change) (*changeWire, error) {
 			Position: x.Position,
 		}, nil
 	case ir.Delete:
-		before, err := encodeRowValues(x.Before)
+		before, err := encodeRowValues(x.Before, "before-image")
 		if err != nil {
-			return nil, err
+			return nil, changeTableErr(x.Schema, x.Table, err)
 		}
 		return &changeWire{
 			Kind:     changeKindDelete,
@@ -578,12 +578,17 @@ func decodeChange(w *changeWire) (ir.Change, error) {
 // are the same the map[string]any form produced, so the on-wire JSON is
 // unchanged. nil rows (legitimate for Truncate / TxBegin / TxCommit and for
 // Update / Delete with no before-image) round-trip to nil.
-func encodeRowValues(r ir.Row) (map[string]json.RawMessage, error) {
+func encodeRowValues(r ir.Row, role string) (map[string]json.RawMessage, error) {
 	if r == nil {
 		return nil, nil
 	}
 	out := make(map[string]json.RawMessage, len(r))
 	for k, v := range r {
+		// encodeValue's JSON would write a non-UTF-8 string as U+FFFD
+		// (backup_value_utf8.go); refuse it with the column named.
+		if err := refuseNonUTF8Value(k, role, v); err != nil {
+			return nil, err
+		}
 		raw, err := json.Marshal(encodeValue(v))
 		if err != nil {
 			return nil, fmt.Errorf("encode row column %q: %w", k, err)
