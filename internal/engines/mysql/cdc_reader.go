@@ -3909,7 +3909,22 @@ func decodeBinlogRow(raw []any, cols []*ir.Column, natives []mariadbNativeKind, 
 			row[col.Name] = v
 			continue
 		}
-		v, err := decodeValue(raw[i], col.Type)
+		// GC-37 (j): the row image carries a character column's value in the
+		// column's OWN charset, where the bulk copy gets it from the server
+		// already converted to UTF-8 — convert it here, by the declared
+		// charset, or refuse (charset_decode.go). Before-images go through
+		// the same call, so a key compared in a later WHERE is converted too.
+		cellRaw := raw[i]
+		if cc := stringColumnCharset(col.Type); cc != nil {
+			if b, ok := binlogStringBytes(cellRaw); ok {
+				s, cerr := cc.decode(b, tableName, col.Name)
+				if cerr != nil {
+					return nil, cerr
+				}
+				cellRaw = s
+			}
+		}
+		v, err := decodeValue(cellRaw, col.Type)
 		if err != nil {
 			var zd *zeroDateValueError
 			if errors.As(err, &zd) {

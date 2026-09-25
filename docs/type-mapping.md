@@ -260,6 +260,10 @@ The expressions a table stores — an expression `DEFAULT (…)`, a generated co
 
 A mydumper dump of a MySQL source carries each expression as `SHOW CREATE TABLE` printed it, so a character beyond the BMP in an expression is already `????` in the dump and is not recovered (audit backlog GC-37 (k)).
 
+### MySQL-family character columns in a non-UTF-8 character set
+
+A `CHAR`/`VARCHAR`/`TEXT` column declared `latin1`, `sjis`, `utf16` or any other non-UTF-8 charset maps to the same IR string type as a `utf8mb4` one, and its value is always carried as UTF-8 — the IR's string contract. The bulk copy gets UTF-8 from the server (it reads over a `utf8mb4` connection); the change stream gets the column's stored bytes (the binlog row image and the VStream row event both carry them in the column's own charset) and converts them by the declared charset — every 8-bit charset, `latin1` as MySQL's cp1252 variant, the Japanese, Korean and GB charsets, and the UTF-16/UTF-32/UCS-2 family, each table graded against the server's own conversion over its whole code space. A value it cannot convert faithfully — non-ASCII `big5`, and on VStream non-ASCII `gbk`/`big5`/`tis620`/`gb18030`, which vttablet sends with no collation — refuses with `CHARSET-NOT-DECODABLE`. Before v0.156.3 the change stream carried the stored bytes as they were. Operator detail and repair: [migrating-legacy-mysql](operator/migrating-legacy-mysql.md).
+
 ### Extension-passthrough types (`--enable-pg-extension`)
 
 Postgres extension types — `hstore`, `citext`, `pgvector` (`vector`), `pg_trgm` (operator classes), PostGIS (`geometry`/`geography`) — are opt-in via `--enable-pg-extension EXT` (repeatable), per [ADR-0032](adr/adr-0032-pg-extension-passthrough.md). The flag is required because the target must actually have `CREATE EXTENSION <ext>` run; a pre-flight refuses cleanly if it doesn't.

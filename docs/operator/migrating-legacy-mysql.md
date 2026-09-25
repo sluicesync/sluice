@@ -192,6 +192,20 @@ Recovery:
 - For `migrate`, `--type-override=TABLE.COL=text` emits the column as TEXT on the target so the copy's true label text lands faithfully; ENUM enforcement is lost. For `sync`, the same override also needs `binlog_row_metadata=FULL` on the source for the CDC half.
 - Exclude the table.
 
+## Columns in a non-UTF-8 character set: the change stream (`CHARSET-NOT-DECODABLE`)
+
+A legacy schema's text columns are often declared `latin1`, `cp1251`, `sjis`, `gbk`, `utf16` or another non-UTF-8 character set. The bulk copy (`migrate`, a `sync` cold start, `backup` fulls) never sees their bytes: it reads over a `utf8mb4` connection, so the server converts every value to UTF-8 first. The change stream does see them — the binlog row image (MySQL and MariaDB) and the VStream row event (PlanetScale / Vitess) both carry a character column's value as the bytes stored in its own charset. Since v0.156.3 sluice converts those bytes to UTF-8 by the column's declared charset, so `sync`, `backup stream` and `backup incremental` carry exactly what the bulk copy carries: every 8-bit charset, `latin1` (which in MySQL is cp1252, with 0x81/0x8D/0x8F/0x90/0x9D mapped to the C1 controls), the Japanese, Korean and GB charsets, `utf16`/`utf16le`/`utf32`/`ucs2`, and `swe7` (not ASCII-compatible: `{` is `ä`). Every conversion table is graded against the server's own `CONVERT(… USING utf8mb4)` over its whole code space, on MySQL 8.0 and MariaDB 11.4. Keys are converted too, so a row updated or deleted by a non-ASCII text key is found on the target.
+
+What refuses instead, with `CHARSET-NOT-DECODABLE` naming the table, column and charset:
+
+- A `big5` value that is not pure ASCII: no available table matches MySQL's `big5` (the common one disagrees in 267 places), so sluice refuses rather than guess. Pure-ASCII `big5` values stream normally.
+- On PlanetScale / Vitess, any non-ASCII value in a `gbk`, `big5`, `tis620` or `gb18030` column: vttablet sends those columns with no collation (ID 0), so the stream cannot tell which charset the bytes are in. Pure-ASCII values stream normally. (The binlog lanes convert `gbk`, `tis620` and `gb18030` normally — their charset comes from the catalog.)
+- A byte sequence that is not a character of its declared charset (which a stored column cannot normally hold), and the few `tis620` bytes MySQL itself converts to U+FFFD (0xA0, 0xDB–0xDE).
+
+To proceed past a refusal, convert the column to `utf8mb4` on the source (`ALTER TABLE … MODIFY … CHARACTER SET utf8mb4`), or exclude the table.
+
+**If you streamed such a column on v0.156.2 or earlier:** every change-stream value of a non-UTF-8 column that was not pure ASCII was carried as its raw stored bytes. Most of those were invalid UTF-8 and failed loudly at the target — but a value whose bytes happened to be valid UTF-8 landed as a *different* character at exit 0 (a `latin1` `Ã©` landed as `é`, a `cp1251` `Г©` as `é`, every `swe7` value was wrong), a row keyed on such a value was never found by a later UPDATE or DELETE, and **`backup stream` / `backup incremental` stored every non-ASCII value of such a column as `�` (U+FFFD)**, silently. Compare those columns against the source for rows changed after cutover, and take a fresh full backup of any chain that captured them.
+
 ## MariaDB sources and targets
 
 Everything above applies to MariaDB too — it is a first-class

@@ -2050,6 +2050,11 @@ func decodeVStreamRow(row *query.Row, fields []*query.Field, tableName string, z
 		// reason (no error channel in the cell decoder). There is no
 		// policy knob for it — the SRID cannot be carried on this path
 		// at all — so it becomes a loud stream error naming the column.
+		// GC-37 (j): a character cell that does not decode in its column's
+		// charset — same sentinel idiom, named with the table.
+		if ce, isCharset := v.(*vstreamCharsetError); isCharset {
+			return nil, false, fmt.Errorf("mysql/vstream: table %q: %w", tableName, ce.cause)
+		}
 		if gs, isSRID := v.(*vstreamGeometrySRIDError); isSRID {
 			return nil, false, fmt.Errorf("mysql/vstream: column %q: %w", f.GetName(), gs.err())
 		}
@@ -2242,7 +2247,22 @@ func decodeVStreamCell(field *query.Field, raw []byte) any {
 		// NUMERIC stays textual — float64 round-trips lose precision
 		// past 15 digits, and the IR contract says string.
 		return v.ToString()
-	case query.Type_VARCHAR, query.Type_TEXT, query.Type_CHAR, query.Type_ENUM:
+	case query.Type_VARCHAR, query.Type_TEXT, query.Type_CHAR:
+		// GC-37 (j): vttablet sends a character cell in the column's OWN
+		// charset (MEASURED: latin1 'é' arrived as the one byte 0xE9), where
+		// the bulk copy gets UTF-8 from the server. Convert by the field's
+		// collation, or hand up a sentinel the row decoder turns into a
+		// loud stream error (no error channel here).
+		s, err := lookupCollationCharset(field.GetCharset()).decode(raw, "", field.GetName())
+		if err != nil {
+			return &vstreamCharsetError{cause: err}
+		}
+		return s
+	case query.Type_ENUM:
+		// NOT converted, unlike the arm above: vttablet renders an ENUM/SET
+		// cell as the LABEL text from its own catalog, already UTF-8, while
+		// still tagging it with the column's collation — MEASURED on
+		// vttestserver, converting it turned a latin1 label 'é' into 'Ã©'.
 		return v.ToString()
 	case query.Type_SET:
 		s := v.ToString()
