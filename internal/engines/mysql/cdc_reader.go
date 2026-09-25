@@ -92,6 +92,10 @@ type CDCReader struct {
 	serverCollationDefaults   map[string]string
 	serverCollationNamesTried time.Time
 
+	// charsetShapes is what a backup capture lane reads to catch a replay
+	// whose window ends before the charset ALTER (charset_ddl_guard.go).
+	charsetShapes charsetShapeLedger
+
 	// charsetUnrecordedWarned records the tables CHARSET-HISTORY-UNRECORDED
 	// was already logged for (charset_ddl_guard.go).
 	charsetUnrecordedWarned map[string]bool
@@ -1396,6 +1400,7 @@ func (r *CDCReader) dispatch(ctx context.Context, ev *replication.BinlogEvent, o
 			if err := r.binlogCharsetDDLGuard(ctx, string(e.Query), stmtSchema); err != nil {
 				return err
 			}
+			r.charsetShapes.crossedAlter(string(e.Query))
 			// SLM-1: the cache about to be cleared is the last shape each
 			// decoded table was known by — keep that as the refusal's prev
 			// before it is gone, so the rebuild after this DDL has something

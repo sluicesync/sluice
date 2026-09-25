@@ -280,3 +280,144 @@ func TestVStream_CopyCharsetDecode_EnumIndexZero(t *testing.T) {
 		t.Errorf("CDC row 3 e = %#v; want \"\"", ins.Row["e"])
 	}
 }
+
+// TestVStream_CopyCharsetDecode_BinCollatedEnumSet (fourth review): a
+// `_bin`-collated ENUM/SET arrives typed BINARY/VARBINARY/BLOB like its
+// CHAR/VARCHAR/TEXT siblings, and before the fix bypassed the label resolver
+// — MEASURED on a latin1_bin ENUM('é','x'): COPY []byte E9, CDC []byte C3A9,
+// where the bulk copy carries the label 'é'. latin1_bin and utf8mb4_bin
+// ENUM and SET through COPY and CDC, graded against the server's own
+// HEX(CONVERT(col USING utf8mb4)); then the é/Ã© ambiguity refuses in COPY
+// exactly as the non-_bin column does.
+func TestVStream_CopyCharsetDecode_BinCollatedEnumSet(t *testing.T) {
+	mysqlDSN, grpcEndpoint, _, cleanup := startVTTestServer(t)
+	defer cleanup()
+	db, err := sql.Open("mysql", mysqlDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	applyVTTestSQL(t, mysqlDSN, `CREATE TABLE be (id INT NOT NULL PRIMARY KEY,
+		e1 ENUM('é','x') CHARACTER SET latin1 COLLATE latin1_bin NULL,
+		s1 SET('é','x') CHARACTER SET latin1 COLLATE latin1_bin NULL,
+		e8 ENUM('é','x') CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NULL,
+		s8 SET('é','x') CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NULL)`)
+	applyVTTestSQL(t, mysqlDSN, `INSERT INTO be VALUES (1, 'é', 'é,x', 'é', 'é,x'), (2, 'x', '', 'x', ''), (3, NULL, NULL, NULL, NULL)`)
+	server := func() map[string][4]string {
+		rows, err := db.Query(`SELECT id, HEX(CONVERT(e1 USING utf8mb4)), HEX(CONVERT(s1 USING utf8mb4)),
+			HEX(CONVERT(e8 USING utf8mb4)), HEX(CONVERT(s8 USING utf8mb4)) FROM be`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = rows.Close() }()
+		out := map[string][4]string{}
+		for rows.Next() {
+			var id string
+			var a, b, c, d sql.NullString
+			if err := rows.Scan(&id, &a, &b, &c, &d); err != nil {
+				t.Fatal(err)
+			}
+			out[id] = [4]string{a.String, b.String, c.String, d.String}
+		}
+		return out
+	}
+	emitted := func(r ir.Row) [4]string {
+		h := func(v any) string {
+			switch x := v.(type) {
+			case string:
+				return strings.ToUpper(hex.EncodeToString([]byte(x)))
+			case []string:
+				return strings.ToUpper(hex.EncodeToString([]byte(strings.Join(x, ","))))
+			case nil:
+				return ""
+			}
+			return fmt.Sprintf("<%T>", v)
+		}
+		return [4]string{h(r["e1"]), h(r["s1"]), h(r["e8"]), h(r["s8"])}
+	}
+	time.Sleep(3 * time.Second)
+	dsn := fmt.Sprintf("%s&vstream_endpoint=%s&vstream_transport=plaintext&vstream_auth=none&vstream_shards=0", mysqlDSN, grpcEndpoint)
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+	stream, err := Engine{Flavor: FlavorPlanetScale}.OpenSnapshotStreamForTables(ctx, dsn, []string{"be"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = stream.Close() }()
+	ch, err := stream.Rows.ReadRows(ctx, &ir.Table{Name: "be", Columns: []*ir.Column{
+		{Name: "id", Type: ir.Integer{Width: 32}},
+		{Name: "e1", Type: ir.Text{}},
+		{Name: "s1", Type: ir.Text{}},
+		{Name: "e8", Type: ir.Text{}},
+		{Name: "s8", Type: ir.Text{}},
+	}, PrimaryKey: &ir.Index{Name: "PRIMARY", Unique: true, Columns: []ir.IndexColumn{{Column: "id"}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := server()
+	seen := 0
+	for r := range ch {
+		seen++
+		if id := fmt.Sprint(r["id"]); emitted(r) != want[id] {
+			t.Errorf("COPY row %s = %v; server %v (e1, s1, e8, s8 as UTF-8 hex)", id, emitted(r), want[id])
+		}
+	}
+	if err := stream.Rows.Err(); err != nil {
+		t.Fatalf("COPY: %v", err)
+	}
+	if seen != 3 {
+		t.Fatalf("COPY emitted %d rows; want 3", seen)
+	}
+	if err := stream.WaitCopyComplete(ctx); err != nil {
+		t.Fatalf("WaitCopyComplete: %v", err)
+	}
+	changes, err := stream.Changes.StreamChanges(ctx, stream.Position)
+	if err != nil {
+		t.Fatalf("StreamChanges: %v", err)
+	}
+	time.Sleep(time.Second)
+	applyVTTestSQL(t, mysqlDSN, `INSERT INTO be VALUES (4, 'é', 'é,x', 'é', 'x')`)
+	got := drainVTTestChanges(t, ctx, changes, 1, 45*time.Second)
+	if len(got) != 1 {
+		t.Fatalf("CDC insert did not stream (stream error: %v)", stream.Changes.(interface{ Err() error }).Err())
+	}
+	if ins, _ := got[0].(ir.Insert); emitted(ins.Row) != server()["4"] {
+		t.Errorf("CDC row 4 = %v; server %v", emitted(ins.Row), server()["4"])
+	}
+}
+
+// TestVStream_CopyCharsetDecode_BinCollatedAmbiguousLabelsRefuse is the
+// ambiguity pin for a `_bin` ENUM: 'Ã©' stored as C3A9 is a member read as
+// latin1 AND read as UTF-8 ('é'); before the fix it silently became 'é'.
+func TestVStream_CopyCharsetDecode_BinCollatedAmbiguousLabelsRefuse(t *testing.T) {
+	mysqlDSN, grpcEndpoint, _, cleanup := startVTTestServer(t)
+	defer cleanup()
+	applyVTTestSQL(t, mysqlDSN, `CREATE TABLE ambb (id INT NOT NULL PRIMARY KEY, e ENUM('é','Ã©','b') CHARACTER SET latin1 COLLATE latin1_bin NULL)`)
+	applyVTTestSQL(t, mysqlDSN, `INSERT INTO ambb VALUES (1, 'é'), (2, 'Ã©')`)
+	time.Sleep(3 * time.Second)
+	dsn := fmt.Sprintf("%s&vstream_endpoint=%s&vstream_transport=plaintext&vstream_auth=none&vstream_shards=0", mysqlDSN, grpcEndpoint)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	stream, err := Engine{Flavor: FlavorPlanetScale}.OpenSnapshotStreamForTables(ctx, dsn, []string{"ambb"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = stream.Close() }()
+	ch, err := stream.Rows.ReadRows(ctx, &ir.Table{Name: "ambb", Columns: []*ir.Column{
+		{Name: "id", Type: ir.Integer{Width: 32}}, {Name: "e", Type: ir.Text{}},
+	}, PrimaryKey: &ir.Index{Name: "PRIMARY", Unique: true, Columns: []ir.IndexColumn{{Column: "id"}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for r := range ch {
+		if fmt.Sprint(r["id"]) == "2" {
+			t.Fatalf("the ambiguous row was emitted as e=%#v; want a refusal", r["e"])
+		}
+		if r["e"] != "é" {
+			t.Errorf("row %v e = %#v; want é", r["id"], r["e"])
+		}
+	}
+	if err := stream.Rows.Err(); !errors.Is(err, errCharsetNotDecodable) || !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("COPY error = %v; want %s naming the ambiguity", err, charsetNotDecodableMarker)
+	}
+}

@@ -476,52 +476,9 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 	if err := assertDataWindowEndPositionInvariant(manifest); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseCDC, err)
 	}
-
-	// 5. Read source schema at window end and diff against the start
-	//    snapshot to populate SchemaDelta. The window may produce
-	//    zero deltas (the common case — most incrementals carry no
-	//    DDL); the Diff helper returns an empty slice in that case.
-	afterSchema, err := b.readSourceSchema(ctx)
-	if err != nil {
-		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("incremental: read source schema (end): %w", err))
-	}
-	manifest.SchemaDelta = migcore.DiffSchemas(beforeSchema, afterSchema)
-	if len(manifest.SchemaDelta) > 0 {
-		// The end-state schema is more useful for restore-side
-		// targeting than the start-state. Swap it in so the manifest's
-		// recorded Schema reflects the post-window source shape.
-		manifest.Schema = afterSchema
-		afterHash, err := irbackup.ComputeSchemaHash(afterSchema)
-		if err != nil {
-			return fmt.Errorf("incremental: hash source schema (end): %w", err)
-		}
-		// Phase 3.1 records the post-window schema hash so the chain
-		// walker can detect a schema change between adjacent
-		// incrementals (their start-of-window hash should match the
-		// previous incremental's end-of-window hash).
-		manifest.SchemaHash = afterHash
-	} else {
-		// item 51: even a no-DDL window must carry the END-of-window
-		// standalone-sequence positions - positions advance with DML,
-		// so the delta gate above never re-stamps for them, and the
-		// chain-tail re-prime would otherwise read positions the
-		// window's own changes already consumed. ComputeSchemaHash
-		// canonicalizes positions away, so the swap is hash-invisible
-		// for POSITION-only drift — but sequence OPTIONS changed inside
-		// a no-DDL window DO shift the fingerprint, and chain-restore
-		// now verifies recorded-vs-recomputed (ADR-0152), so the hash
-		// is re-stamped over the swapped schema. Recorded hash ==
-		// hash(recorded schema) is the invariant; the adjacent-link
-		// continuity reading stays intact because the next link's
-		// before-hash is computed from THIS recorded schema. (Pre-
-		// ADR-0152 manifests skipped the re-stamp; the chain-restore
-		// verifier carries a named WARN carve-out for that shape.)
-		manifest.Schema = schemaWithRefreshedSequences(manifest.Schema, afterSchema)
-		refreshedHash, err := irbackup.ComputeSchemaHash(manifest.Schema)
-		if err != nil {
-			return fmt.Errorf("incremental: hash refreshed schema: %w", err)
-		}
-		manifest.SchemaHash = refreshedHash
+	// 5. The end-of-window schema, its delta and hash.
+	if err := b.attachWindowEndSchema(ctx, cdc, manifest, beforeSchema); err != nil {
+		return err
 	}
 	// 5b. The ADD COLUMN fill — the source's values for the rows an added
 	//     column filled, which no change event carries. After the window
@@ -1910,4 +1867,59 @@ func warnIfParentChainUnrestorable(ctx context.Context, parent *irbackup.Manifes
 		slog.Int("affected_expressions", len(problems)),
 		slog.String("first", problems[0]),
 	)
+}
+
+// attachWindowEndSchema reads the source schema at window end, refuses a
+// charset replay the window decoded without reaching its ALTER (GC-37 (j),
+// [refuseUnrecordedCharsetReplay]), and records the SchemaDelta against the
+// window-start snapshot plus the matching schema and hash. The window may
+// produce zero deltas (the common case — most incrementals carry no DDL);
+// the Diff helper returns an empty slice in that case.
+func (b *IncrementalBackup) attachWindowEndSchema(ctx context.Context, cdc ir.CDCReader, manifest *irbackup.Manifest, beforeSchema *ir.Schema) error {
+	afterSchema, err := b.readSourceSchema(ctx)
+	if err != nil {
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("incremental: read source schema (end): %w", err))
+	}
+	if err := refuseUnrecordedCharsetReplay(cdc, beforeSchema, afterSchema); err != nil {
+		return fmt.Errorf("incremental: %w", err)
+	}
+	manifest.SchemaDelta = migcore.DiffSchemas(beforeSchema, afterSchema)
+	if len(manifest.SchemaDelta) > 0 {
+		// The end-state schema is more useful for restore-side
+		// targeting than the start-state. Swap it in so the manifest's
+		// recorded Schema reflects the post-window source shape.
+		manifest.Schema = afterSchema
+		afterHash, err := irbackup.ComputeSchemaHash(afterSchema)
+		if err != nil {
+			return fmt.Errorf("incremental: hash source schema (end): %w", err)
+		}
+		// Phase 3.1 records the post-window schema hash so the chain
+		// walker can detect a schema change between adjacent
+		// incrementals (their start-of-window hash should match the
+		// previous incremental's end-of-window hash).
+		manifest.SchemaHash = afterHash
+		return nil
+	}
+	// item 51: even a no-DDL window must carry the END-of-window
+	// standalone-sequence positions - positions advance with DML,
+	// so the delta gate above never re-stamps for them, and the
+	// chain-tail re-prime would otherwise read positions the
+	// window's own changes already consumed. ComputeSchemaHash
+	// canonicalizes positions away, so the swap is hash-invisible
+	// for POSITION-only drift — but sequence OPTIONS changed inside
+	// a no-DDL window DO shift the fingerprint, and chain-restore
+	// now verifies recorded-vs-recomputed (ADR-0152), so the hash
+	// is re-stamped over the swapped schema. Recorded hash ==
+	// hash(recorded schema) is the invariant; the adjacent-link
+	// continuity reading stays intact because the next link's
+	// before-hash is computed from THIS recorded schema. (Pre-
+	// ADR-0152 manifests skipped the re-stamp; the chain-restore
+	// verifier carries a named WARN carve-out for that shape.)
+	manifest.Schema = schemaWithRefreshedSequences(manifest.Schema, afterSchema)
+	refreshedHash, err := irbackup.ComputeSchemaHash(manifest.Schema)
+	if err != nil {
+		return fmt.Errorf("incremental: hash refreshed schema: %w", err)
+	}
+	manifest.SchemaHash = refreshedHash
+	return nil
 }

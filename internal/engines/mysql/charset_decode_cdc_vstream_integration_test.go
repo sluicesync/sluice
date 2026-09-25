@@ -212,6 +212,49 @@ func TestVStream_CDCCharsetDDLLive_RoutineDDLNoRefusal(t *testing.T) {
 	}
 }
 
+// TestVStream_CharsetUnrecordedShapes pins the VStream reader's side of the
+// backup lanes' window check (fourth review, item 2): after a row streams,
+// the reader reports the shape it decoded the table by — charset and
+// collation from the FIELD event — and stops reporting the table once the
+// stream crosses an ALTER on it. (The binlog reader's side is pinned end to
+// end by the pipeline's MariaDB NO_LOG backup lanes.)
+func TestVStream_CharsetUnrecordedShapes(t *testing.T) {
+	mysqlDSN, grpcEndpoint, _, cleanup := startVTTestServer(t)
+	defer cleanup()
+	applyVTTestSQL(t, mysqlDSN, `CREATE TABLE sh (id INT NOT NULL PRIMARY KEY, v VARCHAR(16) CHARACTER SET latin1 NULL)`)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	dsn := fmt.Sprintf("%s&vstream_endpoint=%s&vstream_transport=plaintext&vstream_auth=none&vstream_shards=0", mysqlDSN, grpcEndpoint)
+	rdr, err := Engine{Flavor: FlavorPlanetScale}.OpenCDCReader(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rdr.(interface{ Close() error }).Close() }()
+	changes, err := rdr.StreamChanges(ctx, ir.Position{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(2 * time.Second)
+	reporter := rdr.(interface {
+		CharsetUnrecordedShapes() map[string]map[string][2]string
+	})
+	applyVTTestSQL(t, mysqlDSN, `INSERT INTO sh VALUES (1, 'plain')`)
+	if got := drainVTTestChanges(t, ctx, changes, 1, 45*time.Second); len(got) != 1 {
+		t.Fatal("the row did not stream")
+	}
+	if got := reporter.CharsetUnrecordedShapes()["sh"]["v"]; got != [2]string{"latin1", "latin1_swedish_ci"} {
+		t.Fatalf("reported shape sh.v = %v; want latin1/latin1_swedish_ci", got)
+	}
+	applyVTTestSQL(t, mysqlDSN, `ALTER TABLE sh MODIFY v VARCHAR(16) CHARACTER SET cp1251 NULL`)
+	applyVTTestSQL(t, mysqlDSN, `INSERT INTO sh VALUES (2, _cp1251 X'C0')`)
+	if got := drainVTTestChanges(t, ctx, changes, 1, 45*time.Second); len(got) != 1 {
+		t.Fatalf("the row after the ALTER did not stream (stream error: %v)", rdr.(*vstreamCDCReader).Err())
+	}
+	if _, ok := reporter.CharsetUnrecordedShapes()["sh"]; ok {
+		t.Error("sh is still reported after the stream crossed an ALTER on it")
+	}
+}
+
 func TestVStream_CDCCharsetDecode_UnnamedCharsetsRefuse(t *testing.T) {
 	samples := map[string]string{"gbk": "D6D0", "big5": "A4A4", "tis620": "A1", "gb18030": "81308130"}
 	for cs := range vstreamUnnamedCharsets {

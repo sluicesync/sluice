@@ -72,9 +72,11 @@ package mysql
 //     between the replayed rows and the DDL — a sync restart, every
 //     `backup incremental` run boundary — hands the next session a table
 //     with no decoded rows, which reaches the DDL with nothing to compare
-//     (MEASURED with two incremental runs on MariaDB NO_LOG). The
-//     principled fix compares against the schema persisted for the resume
-//     position; it is filed (audit backlog GC-37 (p)).
+//     (MEASURED with two incremental runs on MariaDB NO_LOG). For the
+//     backup lanes that window is now closed at the window boundary instead
+//     ([charsetShapeLedger], pipeline.refuseUnrecordedCharsetReplay); for a
+//     sync restart it is not (audit backlog GC-37 (q)). The principled fix
+//     compares against the schema persisted for the resume position (GC-37 (p)).
 //   - A replay into a UTF-8 charset is carried as v0.156.2 carried it (see
 //     Scope).
 //   - A `MODIFY` with no charset or collation clause still resets a column
@@ -728,6 +730,7 @@ func (r *CDCReader) noteDecodedWithoutWrittenCharset(tbl *tableSchema) {
 		return
 	}
 	tbl.decodedWithoutWrittenCharset = true
+	r.charsetShapes.note(tbl.Name, binlogShape(tbl))
 	var nonUTF8 []string
 	for _, col := range tbl.Columns {
 		if cs, isString := stringTypeCharset(col.Type); isString && lookupColumnCharset(cs) != nil {
@@ -780,13 +783,7 @@ func vstreamCharsetDDLGuard(stmt, keyspace string, fields map[string][]*query.Fi
 		return nil
 	}
 	for key, fs := range fields {
-		name := key
-		if _, after, found := strings.Cut(name, "/"); found {
-			name = after
-		}
-		if i := strings.LastIndex(name, "."); i >= 0 {
-			name = name[i+1:]
-		}
+		name := vstreamFieldKeyTable(key)
 		if !strings.EqualFold(name, c.table) {
 			continue
 		}
@@ -804,6 +801,18 @@ func vstreamCharsetDDLGuard(stmt, keyspace string, fields map[string][]*query.Fi
 	return nil
 }
 
+// vstreamFieldKeyTable is the table name of a FIELD cache key
+// (`shard/keyspace.table`).
+func vstreamFieldKeyTable(key string) string {
+	if _, after, found := strings.Cut(key, "/"); found {
+		key = after
+	}
+	if i := strings.LastIndex(key, "."); i >= 0 {
+		key = key[i+1:]
+	}
+	return key
+}
+
 // isVStreamTextField reports whether a VStream field is character data.
 // That includes a `_bin`-collated character column, which vttablet types as
 // BINARY/VARBINARY/BLOB ([isVStreamBinaryCollatedText]).
@@ -812,7 +821,7 @@ func isVStreamTextField(f *query.Field) bool {
 	case query.Type_VARCHAR, query.Type_CHAR, query.Type_TEXT, query.Type_ENUM, query.Type_SET:
 		return true
 	}
-	return isVStreamBinaryCollatedText(f)
+	return isVStreamBinaryCollatedText(f) || vstreamEnumSetKind(f) != ""
 }
 
 // warnVStreamCharsetUnrecorded logs CHARSET-HISTORY-UNRECORDED once per
@@ -840,4 +849,102 @@ func warnVStreamCharsetUnrecorded(warned map[string]bool, table string, fs []*qu
 		"refused when the stream reaches an ALTER that names it; one done any other way (an implicit MODIFY, a deploy "+
 		"request or other online schema change) is not seen — re-snapshot a table after such a change while a stream is behind it",
 		"table", table, "columns", strings.Join(nonUTF8, ", "))
+}
+
+// charsetShapeLedger is what a reader tells a backup capture lane about the
+// tables it decoded with no written-charset record (GC-37 (j) fourth review,
+// item 2): per table, the charset/collation shape its rows were last decoded
+// by, and whether the session has crossed an ALTER naming the table.
+//
+// The charset-DDL guard sees a replay only when the stream reaches the
+// ALTER. A window that ends BEFORE it — every `backup incremental` run
+// boundary, a `backup stream` rollover — commits the misdecoded rows first
+// (MEASURED on MariaDB NO_LOG). The lane cannot see the ALTER either, but it
+// can see its effect: it reads the source schema at window start and at
+// window end. If a column's charset changed between the two, and the shape
+// this reader decoded the table's rows by is already the END one while the
+// session never crossed an ALTER on the table, those rows are pre-ALTER rows
+// (binlog order puts every post-ALTER row after the ALTER event) decoded by
+// the post-ALTER charset. A reader whose shape still shows the START charset
+// was live, and decoded them right. The lane applies that rule
+// (pipeline.refuseUnrecordedCharsetReplay); this ledger supplies the shapes.
+//
+// A crossed table stays excluded for the session: a second charset change
+// to a table the session already crossed an ALTER on is not re-checked.
+// Safe for concurrent use: the reader's pump writes, the lane reads.
+type charsetShapeLedger struct {
+	mu      sync.Mutex
+	shapes  map[string]map[string]charsetSpec
+	crossed map[string]bool
+}
+
+// note records the shape a table's rows are being decoded by.
+func (l *charsetShapeLedger) note(table string, shape map[string]charsetSpec) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.shapes == nil {
+		l.shapes = map[string]map[string]charsetSpec{}
+	}
+	l.shapes[strings.ToLower(table)] = shape
+}
+
+// crossedAlter records that the session crossed stmt, when it is an ALTER
+// TABLE: the table's later shapes were loaded after it.
+func (l *charsetShapeLedger) crossedAlter(stmt string) {
+	_, _, table, isAlter := normalizeAlterPrefix(stmt)
+	if !isAlter || table == "" {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.crossed == nil {
+		l.crossed = map[string]bool{}
+	}
+	l.crossed[strings.ToLower(table)] = true
+}
+
+// snapshot is the engine-neutral view a capture lane reads: table → column
+// → {charset, collation}, crossed tables left out.
+func (l *charsetShapeLedger) snapshot() map[string]map[string][2]string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := make(map[string]map[string][2]string, len(l.shapes))
+	for table, shape := range l.shapes {
+		if l.crossed[table] {
+			continue
+		}
+		cols := make(map[string][2]string, len(shape))
+		for col, s := range shape {
+			cols[col] = [2]string{s.charset, s.collation}
+		}
+		out[table] = cols
+	}
+	return out
+}
+
+// charsetShapeReporter mirrors the pipeline's backup-lane surface
+// (pipeline.charsetShapeReporter). The pipeline pins the exported binlog
+// reader; the VStream reader's type is unexported, so it is pinned here — a
+// renamed method would otherwise make the lane's assertion quietly miss and
+// the window check stop refusing.
+type charsetShapeReporter interface {
+	CharsetUnrecordedShapes() map[string]map[string][2]string
+}
+
+var (
+	_ charsetShapeReporter = (*CDCReader)(nil)
+	_ charsetShapeReporter = (*vstreamCDCReader)(nil)
+)
+
+// CharsetUnrecordedShapes reports, per table this reader decoded with no
+// written-charset record (MariaDB binlog_row_metadata=NO_LOG), the shape its
+// rows were last decoded by — see [charsetShapeLedger].
+func (r *CDCReader) CharsetUnrecordedShapes() map[string]map[string][2]string {
+	return r.charsetShapes.snapshot()
+}
+
+// CharsetUnrecordedShapes is the VStream twin: every table, since VStream
+// records no written charset at all.
+func (r *vstreamCDCReader) CharsetUnrecordedShapes() map[string]map[string][2]string {
+	return r.charsetShapes.snapshot()
 }

@@ -113,6 +113,12 @@ var (
 	// retry would silently re-baseline again — the defect GC-32 closed.
 	_ unforwardedBaselineCarrier = (*mysql.CDCReader)(nil)
 	_ unforwardedBaselineCarrier = (*postgres.CDCReader)(nil)
+	// GC-37 (j) fourth review: the backup lanes' charset-replay window check
+	// (refuseUnrecordedCharsetReplay) guards a REFUSAL — if this assertion
+	// quietly stopped matching, a window that decoded rows by the wrong
+	// charset would commit them again. The VStream reader is pinned
+	// in-package (mysql.charsetShapeReporter) because its type is unexported.
+	_ charsetShapeReporter = (*mysql.CDCReader)(nil)
 )
 
 // unpinnedPipelineSurfaces is the FROZEN remainder: pipeline-local interfaces

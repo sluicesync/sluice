@@ -268,3 +268,28 @@ func TestVStreamCharsetDDLGuard(t *testing.T) {
 		t.Errorf("the refusal must name the re-copy for both sync and a backup chain: %v", err)
 	}
 }
+
+// TestCharsetShapeLedger: the engine side of the capture lanes' check (item
+// 2) — a noted shape is reported until the session crosses an ALTER naming
+// the table (in any spelling the prefix walk reads), and another table's
+// ALTER does not hide it.
+func TestCharsetShapeLedger(t *testing.T) {
+	var l charsetShapeLedger
+	l.note("CR", map[string]charsetSpec{"v": {"latin1", "latin1_swedish_ci"}})
+	l.note("other", map[string]charsetSpec{"w": {"cp1251", ""}})
+	if got := l.snapshot()["cr"]["v"]; got != [2]string{"latin1", "latin1_swedish_ci"} {
+		t.Fatalf("snapshot cr.v = %v; want latin1/latin1_swedish_ci (table names lower-cased)", got)
+	}
+	l.crossedAlter("ALTER TABLE other ADD COLUMN z INT")
+	if _, ok := l.snapshot()["cr"]; !ok {
+		t.Error("an ALTER on another table hid cr")
+	}
+	l.crossedAlter("ALTER ONLINE TABLE IF EXISTS `d`.`Cr` NOWAIT MODIFY v VARCHAR(16)")
+	snap := l.snapshot()
+	if _, ok := snap["cr"]; ok {
+		t.Error("cr is still reported after the session crossed an ALTER on it")
+	}
+	if _, ok := snap["other"]; ok {
+		t.Error("other is still reported after the session crossed an ALTER on it")
+	}
+}

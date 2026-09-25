@@ -524,6 +524,73 @@ func isVStreamBinaryCollatedText(field *query.Field) bool {
 	return c != 0 && c != vstreamBinaryCollationID
 }
 
+// vstreamEnumSetKind reports whether a VStream field is an ENUM ("enum") or
+// SET ("set") column, else "". A `_bin`-collated ENUM/SET arrives typed
+// BINARY/VARBINARY/BLOB like its CHAR/VARCHAR/TEXT siblings (GC-37 (j)
+// fourth review, MEASURED: latin1_bin ENUM('é','x') carried []byte E9 in
+// COPY and C3A9 in CDC), so for those the column_type decides.
+func vstreamEnumSetKind(field *query.Field) string {
+	switch field.GetType() {
+	case query.Type_ENUM:
+		return "enum"
+	case query.Type_SET:
+		return "set"
+	case query.Type_BINARY, query.Type_VARBINARY, query.Type_BLOB:
+		switch k := leadingTypeWord(strings.ToLower(strings.TrimSpace(field.GetColumnType()))); k {
+		case "enum", "set":
+			return k
+		}
+	}
+	return ""
+}
+
+// decodeVStreamBinaryCollatedCell decodes a BINARY/VARBINARY/BLOB field
+// that is really a `_bin`-collated character column: an ENUM/SET through
+// the label resolver, a CHAR/VARCHAR/TEXT through its collation. ok is false
+// for a true binary column, which stays bytes.
+func decodeVStreamBinaryCollatedCell(field *query.Field, raw []byte) (any, bool) {
+	switch vstreamEnumSetKind(field) {
+	case "enum":
+		return decodeVStreamEnum(field, raw), true
+	case "set":
+		return decodeVStreamSet(field, raw), true
+	}
+	if isVStreamBinaryCollatedText(field) {
+		return decodeVStreamText(field, raw), true
+	}
+	return nil, false
+}
+
+// decodeVStreamEnum decodes an ENUM cell. GC-37 (j) review F2: a non-UTF-8
+// ENUM cell is UTF-8 label text in CDC but the STORED bytes in COPY
+// (MEASURED), with identical FIELD events — resolved against the column's
+// own labels.
+func decodeVStreamEnum(field *query.Field, raw []byte) any {
+	if s, ok, err := resolveVStreamEnumSetText(field, raw); ok {
+		if err != nil {
+			return &vstreamCharsetError{cause: err}
+		}
+		return s
+	}
+	return string(raw)
+}
+
+// decodeVStreamSet decodes a SET cell the same way, split into members (an
+// empty SET is an empty slice, not nil — docs/value-types.md).
+func decodeVStreamSet(field *query.Field, raw []byte) any {
+	s := string(raw)
+	if rs, ok, err := resolveVStreamEnumSetText(field, raw); ok {
+		if err != nil {
+			return &vstreamCharsetError{cause: err}
+		}
+		s = rs
+	}
+	if s == "" {
+		return []string{}
+	}
+	return strings.Split(s, ",")
+}
+
 // resolveVStreamEnumSetText decodes a VStream ENUM or SET cell of a
 // non-UTF-8 column (review F2, MEASURED on vttestserver).
 //
@@ -549,9 +616,9 @@ func resolveVStreamEnumSetText(field *query.Field, raw []byte) (value string, ok
 	if cc == nil {
 		return "", false, nil
 	}
-	kind := "enum"
-	if field.GetType() == query.Type_SET {
-		kind = "set"
+	kind := vstreamEnumSetKind(field)
+	if kind == "" {
+		kind = "enum"
 	}
 	// No column_type means vttablet sent no label metadata (only hand-built
 	// fields in unit tests lack it): nothing to resolve against, so the

@@ -229,6 +229,9 @@ type vstreamCDCReader struct {
 	// was already logged for (charset_ddl_guard.go).
 	charsetUnrecordedWarned map[string]bool
 
+	// charsetShapes: see [charsetShapeLedger].
+	charsetShapes charsetShapeLedger
+
 	// snapshotSig is the per-table structural fingerprint of the
 	// schema-history version last emitted as an [ir.SchemaSnapshot]
 	// (ADR-0049 Chunk B2). Keyed by the same fieldCacheKey as fields.
@@ -1514,6 +1517,7 @@ func (r *vstreamCDCReader) dispatch(ctx context.Context, ev *binlogdata.VEvent, 
 			r.charsetUnrecordedWarned = map[string]bool{}
 		}
 		warnVStreamCharsetUnrecorded(r.charsetUnrecordedWarned, key, fe.GetFields())
+		r.charsetShapes.note(vstreamFieldKeyTable(key), vstreamShape(fe.GetFields()))
 		return r.maybeSnapshotSchema(ctx, fe, out)
 
 	case binlogdata.VEventType_ROW:
@@ -1655,6 +1659,7 @@ func (r *vstreamCDCReader) dispatchDDL(ctx context.Context, ev *binlogdata.VEven
 	if err := vstreamCharsetDDLGuard(stmt, r.keyspace, r.fields); err != nil {
 		return err
 	}
+	r.charsetShapes.crossedAlter(stmt)
 	r.invalidateFieldsForDDL(stmt)
 	return nil
 }
@@ -2264,28 +2269,9 @@ func decodeVStreamCell(field *query.Field, raw []byte) any {
 	case query.Type_VARCHAR, query.Type_TEXT, query.Type_CHAR:
 		return decodeVStreamText(field, raw)
 	case query.Type_ENUM:
-		// GC-37 (j) review F2: a non-UTF-8 ENUM cell is UTF-8 label text in
-		// CDC but the STORED bytes in COPY (MEASURED), with identical FIELD
-		// events — resolved against the column's own labels.
-		if s, ok, err := resolveVStreamEnumSetText(field, raw); ok {
-			if err != nil {
-				return &vstreamCharsetError{cause: err}
-			}
-			return s
-		}
-		return v.ToString()
+		return decodeVStreamEnum(field, raw)
 	case query.Type_SET:
-		s := v.ToString()
-		if rs, ok, err := resolveVStreamEnumSetText(field, raw); ok {
-			if err != nil {
-				return &vstreamCharsetError{cause: err}
-			}
-			s = rs
-		}
-		if s == "" {
-			return []string{}
-		}
-		return strings.Split(s, ",")
+		return decodeVStreamSet(field, raw)
 	case query.Type_DATE, query.Type_DATETIME, query.Type_TIMESTAMP:
 		tv, err := parseVStreamDateTime(t, raw)
 		if err != nil {
@@ -2311,13 +2297,13 @@ func decodeVStreamCell(field *query.Field, raw []byte) any {
 	case query.Type_JSON:
 		return copyBytes(raw)
 	case query.Type_BLOB, query.Type_VARBINARY:
-		if isVStreamBinaryCollatedText(field) {
-			return decodeVStreamText(field, raw)
+		if cell, ok := decodeVStreamBinaryCollatedCell(field, raw); ok {
+			return cell
 		}
 		return copyBytes(raw)
 	case query.Type_BINARY:
-		if isVStreamBinaryCollatedText(field) {
-			return decodeVStreamText(field, raw)
+		if cell, ok := decodeVStreamBinaryCollatedCell(field, raw); ok {
+			return cell
 		}
 		// Fixed-width BINARY(N): re-pad a short payload to the declared
 		// width, closing the VStream sibling of the binlog-lane

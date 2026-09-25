@@ -1486,7 +1486,7 @@ func (b *BackupStream) runRollover(
 	// cancelled window is captured there as a SchemaDelta against the
 	// drain-commit's terminal manifest.
 	if !errors.Is(captureErr, context.Canceled) && !errors.Is(captureErr, context.DeadlineExceeded) {
-		if err := b.refreshSchemaAndAttachDelta(ctx, manifest, beforeSchema); err != nil {
+		if err := b.refreshSchemaAndAttachDelta(ctx, cdc, manifest, beforeSchema); err != nil {
 			return out, err
 		}
 		// The ADD COLUMN fill, the incremental lane's twin (see
@@ -1553,6 +1553,7 @@ func warnReplayOnlyRollover(ctx context.Context, manifest *irbackup.Manifest, ca
 // loud-failure beats silent stale-manifest. Bug 38 fix (v0.20.1).
 func (b *BackupStream) refreshSchemaAndAttachDelta(
 	ctx context.Context,
+	cdc ir.CDCReader,
 	manifest *irbackup.Manifest,
 	beforeSchema *ir.Schema,
 ) error {
@@ -1564,6 +1565,11 @@ func (b *BackupStream) refreshSchemaAndAttachDelta(
 	afterSchema, err := sr.ReadSchema(ctx)
 	if err != nil {
 		return fmt.Errorf("rollover: read source schema: %w", err)
+	}
+	// GC-37 (j): a charset change this rollover's rows were decoded across
+	// without the stream reaching its ALTER refuses before the commit.
+	if err := refuseUnrecordedCharsetReplay(cdc, beforeSchema, afterSchema); err != nil {
+		return fmt.Errorf("rollover: %w", err)
 	}
 	delta := migcore.DiffSchemas(beforeSchema, afterSchema)
 	if len(delta) == 0 {
