@@ -62,6 +62,20 @@ func TestLaneKey_CopyReadAndBinlogRouteAlike(t *testing.T) {
 		{"varbinary", "VARBINARY(8)", "0x0102FF"},
 		{"decimal", "DECIMAL(10,2)", "1.50"},
 		{"date", "DATE", "'2026-09-24'"},
+		// GC-37 (j) review: non-UTF-8 text keys. The copy reader gets them
+		// converted by the server; the binlog now converts them by the
+		// column's charset — both must hand the router the same UTF-8 key.
+		{"latin1_e_acute", "VARCHAR(16) CHARACTER SET latin1", "_latin1 X'E9'"},
+		{"latin1_C3A9", "VARCHAR(16) CHARACTER SET latin1", "_latin1 X'C3A9'"},
+		{"latin1_char_trailing_spaces", "CHAR(8) CHARACTER SET latin1", "_latin1 X'E92020'"},
+		{"utf16_char", "CHAR(4) CHARACTER SET utf16", "_utf16 X'00E9'"},
+		{"utf16le_char", "CHAR(4) CHARACTER SET utf16le", "_utf16le X'E900'"},
+		{"ucs2_char", "CHAR(4) CHARACTER SET ucs2", "_ucs2 X'00E9'"},
+		{"utf32_char", "CHAR(4) CHARACTER SET utf32", "_utf32 X'000000E9'"},
+		{"sjis", "VARCHAR(16) CHARACTER SET sjis", "_sjis X'82A0'"},
+		{"swe7", "VARCHAR(16) CHARACTER SET swe7", "_swe7 X'7B'"},
+		{"gbk", "VARCHAR(16) CHARACTER SET gbk", "_gbk X'D6D0'"},
+		{"cp1251", "VARCHAR(16) CHARACTER SET cp1251", "_cp1251 X'C0'"},
 	}
 	ddl := ""
 	for i, c := range cells {

@@ -73,7 +73,7 @@ func TestDecodeBinlogRow_LostEnumSetLabels(t *testing.T) {
 
 	decode := func(g binlogLabelGuard, e, s any) (ir.Row, error) {
 		t.Helper()
-		return decodeBinlogRow([]any{int32(1), e, s}, cols, nil, FlavorVanilla, "t", zeroDateInherit, g)
+		return decodeBinlogRow([]any{int32(1), e, s}, cols, nil, FlavorVanilla, "t", zeroDateInherit, g, nil)
 	}
 
 	t.Run("no TABLE_MAP labels: an index onto a lost label refuses", func(t *testing.T) {

@@ -77,6 +77,14 @@ type CDCReader struct {
 	// different protocol and needs the REPLICATION SLAVE privilege.
 	db *sql.DB
 
+	// serverCollations is the source server's own collation-ID → charset
+	// table, loaded once on first use. It is what names a TABLE_MAP column
+	// collation in [binlogColumnCharsets] — MariaDB 11.4's default
+	// utf8mb4_uca1400_* IDs are in no static table (MEASURED). See
+	// [loadServerCollations].
+	serverCollationsOnce sync.Once
+	serverCollations     map[uint64]string
+
 	// flavor is the MySQL-family flavor this reader streams from. The
 	// zero value (FlavorVanilla) keeps the MySQL-8 binlog path byte-
 	// identical; FlavorMariaDB flavor-branches the format-sensitive
@@ -1646,6 +1654,13 @@ func (r *CDCReader) dispatchRows(
 	// GC-37 (i): the labels the catalog may have lost, and the TABLE_MAP's
 	// own labels for them when the source runs binlog_row_metadata=FULL.
 	lbl := binlogLabelGuardFor(tbl, ev.Table)
+	// GC-37 (j): the charset each character column was WRITTEN in, from the
+	// TABLE_MAP — refused as a CDC-4 replay mismatch when the catalog no
+	// longer declares it. See [binlogColumnCharsets].
+	cs, err := binlogColumnCharsets(tbl, ev.Table, r.collationCharsets(ctx))
+	if err != nil {
+		return err
+	}
 
 	// ADR-0049 Chunk B1: after a DDL invalidated the schema cache,
 	// the first row event per table forces tableFor to rebuild the
@@ -1701,7 +1716,7 @@ func (r *CDCReader) dispatchRows(
 			if err := refusePartialRowImage(tbl, skippedColumnsFor(ev, i), "insert", "write"); err != nil {
 				return err
 			}
-			row, err := decodeBinlogRow(raw, tbl.Columns, tbl.NativeKinds, r.flavor, tbl.Name, r.zeroDate, lbl)
+			row, err := decodeBinlogRow(raw, tbl.Columns, tbl.NativeKinds, r.flavor, tbl.Name, r.zeroDate, lbl, cs)
 			if err != nil {
 				return fmt.Errorf("mysql: cdc: decode insert: %w", err)
 			}
@@ -1745,11 +1760,11 @@ func (r *CDCReader) dispatchRows(
 			if err := refusePartialRowImage(tbl, skippedColumnsFor(ev, i+1), "update", "after"); err != nil {
 				return err
 			}
-			before, err := decodeBinlogRow(ev.Rows[i], tbl.Columns, tbl.NativeKinds, r.flavor, tbl.Name, r.zeroDate, lbl)
+			before, err := decodeBinlogRow(ev.Rows[i], tbl.Columns, tbl.NativeKinds, r.flavor, tbl.Name, r.zeroDate, lbl, cs)
 			if err != nil {
 				return fmt.Errorf("mysql: cdc: decode update before: %w", err)
 			}
-			after, err := decodeBinlogRow(ev.Rows[i+1], tbl.Columns, tbl.NativeKinds, r.flavor, tbl.Name, r.zeroDate, lbl)
+			after, err := decodeBinlogRow(ev.Rows[i+1], tbl.Columns, tbl.NativeKinds, r.flavor, tbl.Name, r.zeroDate, lbl, cs)
 			if err != nil {
 				return fmt.Errorf("mysql: cdc: decode update after: %w", err)
 			}
@@ -1820,7 +1835,7 @@ func (r *CDCReader) dispatchRows(
 					return err
 				}
 			}
-			before, err := decodeBinlogRow(raw, tbl.Columns, tbl.NativeKinds, r.flavor, tbl.Name, r.zeroDate, lbl)
+			before, err := decodeBinlogRow(raw, tbl.Columns, tbl.NativeKinds, r.flavor, tbl.Name, r.zeroDate, lbl, cs)
 			if err != nil {
 				return fmt.Errorf("mysql: cdc: decode delete: %w", err)
 			}
@@ -3885,7 +3900,7 @@ func stripBackticks(s string) string {
 // excludes the column from the target SQL — the target's GENERATED
 // clause then recomputes the value rather than freezing the source-
 // side result.
-func decodeBinlogRow(raw []any, cols []*ir.Column, natives []mariadbNativeKind, flavor Flavor, tableName string, zeroDate zeroDateMode, labels binlogLabelGuard) (ir.Row, error) {
+func decodeBinlogRow(raw []any, cols []*ir.Column, natives []mariadbNativeKind, flavor Flavor, tableName string, zeroDate zeroDateMode, labels binlogLabelGuard, charsets []*columnCharset) (ir.Row, error) {
 	if len(raw) != len(cols) {
 		return nil, fmt.Errorf("row has %d values; schema has %d columns", len(raw), len(cols))
 	}
@@ -3910,12 +3925,18 @@ func decodeBinlogRow(raw []any, cols []*ir.Column, natives []mariadbNativeKind, 
 			continue
 		}
 		// GC-37 (j): the row image carries a character column's value in the
-		// column's OWN charset, where the bulk copy gets it from the server
-		// already converted to UTF-8 — convert it here, by the declared
-		// charset, or refuse (charset_decode.go). Before-images go through
-		// the same call, so a key compared in a later WHERE is converted too.
+		// charset it was WRITTEN in, where the bulk copy gets it from the
+		// server already converted to UTF-8 — convert it here, or refuse
+		// (charset_decode.go). charsets is that written charset per column
+		// ([binlogColumnCharsets], from the TABLE_MAP); nil falls back to the
+		// catalog. Before-images go through the same call, so a key compared
+		// in a later WHERE is converted too.
 		cellRaw := raw[i]
-		if cc := stringColumnCharset(col.Type); cc != nil {
+		cc := stringColumnCharset(col.Type)
+		if charsets != nil {
+			cc = charsets[i]
+		}
+		if cc != nil {
 			if b, ok := binlogStringBytes(cellRaw); ok {
 				s, cerr := cc.decode(b, tableName, col.Name)
 				if cerr != nil {

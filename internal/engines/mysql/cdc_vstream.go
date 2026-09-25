@@ -2259,13 +2259,24 @@ func decodeVStreamCell(field *query.Field, raw []byte) any {
 		}
 		return s
 	case query.Type_ENUM:
-		// NOT converted, unlike the arm above: vttablet renders an ENUM/SET
-		// cell as the LABEL text from its own catalog, already UTF-8, while
-		// still tagging it with the column's collation — MEASURED on
-		// vttestserver, converting it turned a latin1 label 'é' into 'Ã©'.
+		// GC-37 (j) review F2: a non-UTF-8 ENUM cell is UTF-8 label text in
+		// CDC but the STORED bytes in COPY (MEASURED), with identical FIELD
+		// events — resolved against the column's own labels.
+		if s, ok, err := resolveVStreamEnumSetText(field, raw); ok {
+			if err != nil {
+				return &vstreamCharsetError{cause: err}
+			}
+			return s
+		}
 		return v.ToString()
 	case query.Type_SET:
 		s := v.ToString()
+		if rs, ok, err := resolveVStreamEnumSetText(field, raw); ok {
+			if err != nil {
+				return &vstreamCharsetError{cause: err}
+			}
+			s = rs
+		}
 		if s == "" {
 			return []string{}
 		}

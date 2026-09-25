@@ -45,19 +45,32 @@ package mysql
 // decode — and any non-ASCII big5 value, whose MySQL table no library
 // matches — REFUSES loudly (CHARSET-NOT-DECODABLE) naming the table, column
 // and charset, never a guess.
+//
+// Which charset: on the binlog, the one the value was WRITTEN in, from the
+// TABLE_MAP ([binlogColumnCharsets]) — a replay across a charset DDL refuses
+// rather than decoding old bytes by the new charset. On VStream, the field's
+// collation, which vttablet reports as CURRENT for a replayed row (MEASURED;
+// a stated limitation). A VStream ENUM/SET cell is resolved against the
+// column's labels, because vttablet sends it in two forms
+// ([resolveVStreamEnumSetText]).
 
 import (
 	"bytes"
+	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 
+	"github.com/go-mysql-org/go-mysql/replication"
 	"golang.org/x/text/encoding/simplifiedchinese"
 	"vitess.io/vitess/go/mysql/collations"
 	vtcharset "vitess.io/vitess/go/mysql/collations/charset"
 	"vitess.io/vitess/go/mysql/collations/colldata"
+	"vitess.io/vitess/go/vt/proto/query"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -85,8 +98,12 @@ type columnCharset struct {
 // passthroughCharset reports whether a MySQL character set's stored bytes
 // are already the value's UTF-8. ascii is a strict subset (MySQL refuses a
 // byte ≥ 0x80 in it); binary columns are bytes, not text, and never reach
-// here as a string. An empty name — a column read without its charset —
-// keeps the bytes as they are, which is what every path did before.
+// here as a string. An empty name keeps the bytes as they are (review F4,
+// documented rather than refused): the production schema loaders always
+// read CHARACTER_SET_NAME for a character column, so an empty one comes only
+// from hand-built schemas — and on the binlog the TABLE_MAP's charset
+// ([binlogColumnCharsets]) supersedes the catalog's whenever it is written,
+// empty or not.
 func passthroughCharset(name string) bool {
 	switch name {
 	case "", "utf8mb4", "utf8mb3", "utf8", "ascii", "binary":
@@ -223,9 +240,8 @@ func (cc *columnCharset) decode(b []byte, table, column string) (string, error) 
 			return string(b), nil
 		}
 		return "", fmt.Errorf("%w: %s is declared CHARACTER SET %s, which sluice has no faithful conversion table for, "+
-			"so its non-ASCII change-stream value cannot be carried as text; the bulk copy converts it on the server, the change stream cannot. "+
-			"Convert the column to utf8mb4 on the source (ALTER TABLE … MODIFY … CHARACTER SET utf8mb4), or exclude the table",
-			errCharsetNotDecodable, where, cc.name)
+			"so its non-ASCII change-stream value cannot be carried as text; the bulk copy converts it on the server, the change stream cannot. %s",
+			errCharsetNotDecodable, where, cc.name, charsetRefusalRemedy)
 	}
 	var (
 		out []byte
@@ -237,12 +253,23 @@ func (cc *columnCharset) decode(b []byte, table, column string) (string, error) 
 		out, err = vtcharset.Convert(nil, vtcharset.Charset_utf8mb4{}, b, cc.vt)
 	}
 	if err != nil || !utf8.Valid(out) {
-		return "", fmt.Errorf("%w: %s (CHARACTER SET %s): the change-stream value 0x%X does not decode in its declared character set "+
-			"(%v), so it cannot be carried as text without guessing. Check the stored value on the source "+
-			"(SELECT HEX(%s)), or convert the column to utf8mb4", errCharsetNotDecodable, where, cc.name, b, err, column)
+		// The value itself is deliberately NOT in the message: it is row
+		// data, and a refusal lands in logs. The converter's own error is
+		// dropped for the same reason (Vitess's names the input bytes).
+		return "", fmt.Errorf("%w: %s (CHARACTER SET %s): a change-stream value of %d bytes does not decode in its declared character set, "+
+			"so it cannot be carried as text without guessing (inspect it on the source with SELECT HEX(%s)). %s",
+			errCharsetNotDecodable, where, cc.name, len(b), column, charsetRefusalRemedy)
 	}
 	return string(out), nil
 }
+
+// charsetRefusalRemedy is the remedy every [errCharsetNotDecodable] refusal
+// ends with. It is convert-THEN-RE-SNAPSHOT, never convert-and-resume: a
+// resume replays binlog history written in the OLD charset, which is exactly
+// what [binlogColumnCharsets] then refuses as a replay mismatch (and, on a
+// source without TABLE_MAP charsets, would decode by the new charset).
+const charsetRefusalRemedy = "To carry it, convert the column to utf8mb4 on the source (ALTER TABLE … MODIFY … CHARACTER SET utf8mb4) " +
+	"and re-snapshot the table (sync --restart-from-scratch), or exclude the table; resuming after the ALTER replays history written in the old charset"
 
 // binlogStringBytes returns the stored bytes of a binlog row-image cell for
 // a character column: go-mysql hands CHAR/VARCHAR/TEXT back as a string or a
@@ -256,6 +283,249 @@ func binlogStringBytes(raw any) ([]byte, bool) {
 		return v, true
 	}
 	return nil, false
+}
+
+// mysqlUnlistedCollations are MySQL collation IDs (SHOW COLLATION; fixed
+// across 5.7 and 8.x) for the charsets Vitess's collation environment does
+// not name, so a TABLE_MAP collation in one of them still resolves.
+var mysqlUnlistedCollations = map[uint64]string{
+	1: "big5", 84: "big5", // big5_chinese_ci, big5_bin
+	28: "gbk", 87: "gbk", // gbk_chinese_ci, gbk_bin
+	18: "tis620", 89: "tis620", // tis620_thai_ci, tis620_bin
+	248: "gb18030", 249: "gb18030", 250: "gb18030", // gb18030_chinese_ci, _bin, _unicode_520_ci
+}
+
+// charsetNameForCollationID names the charset of a MySQL collation ID, or
+// "" when sluice cannot name it.
+func charsetNameForCollationID(id uint64) string {
+	if name := collationEnv().LookupCharsetName(collations.ID(id)); name != "" {
+		return name
+	}
+	return mysqlUnlistedCollations[id]
+}
+
+// loadServerCollations reads the source server's collation-ID → charset
+// table: MariaDB's COLLATION_CHARACTER_SET_APPLICABILITY (the only place its
+// per-charset uca1400 IDs are listed — its COLLATIONS rows for them have a
+// NULL ID), else information_schema.COLLATIONS (MySQL, where every
+// collation has an ID). A failure returns nil, and naming falls back to the
+// static tables ([charsetNameForCollationID]) — an unnamed ID then decodes
+// by the catalog, the stated limitation.
+func loadServerCollations(ctx context.Context, db *sql.DB) map[uint64]string {
+	if db == nil {
+		return nil
+	}
+	for _, q := range []string{
+		`SELECT ID, CHARACTER_SET_NAME FROM information_schema.COLLATION_CHARACTER_SET_APPLICABILITY WHERE ID IS NOT NULL`,
+		`SELECT ID, CHARACTER_SET_NAME FROM information_schema.COLLATIONS WHERE ID IS NOT NULL`,
+	} {
+		if m := queryCollationIDs(ctx, db, q); len(m) > 0 {
+			return m
+		}
+	}
+	return nil
+}
+
+func queryCollationIDs(ctx context.Context, db *sql.DB, q string) map[uint64]string {
+	rows, err := db.QueryContext(ctx, q)
+	if err != nil {
+		return nil
+	}
+	defer func() { _ = rows.Close() }()
+	m := map[uint64]string{}
+	for rows.Next() {
+		var id uint64
+		var cs string
+		if err := rows.Scan(&id, &cs); err != nil {
+			return nil
+		}
+		m[id] = cs
+	}
+	if rows.Err() != nil {
+		return nil
+	}
+	return m
+}
+
+// collationCharsets is the reader's naming function for TABLE_MAP collation
+// IDs: the server's own table first, the static tables second.
+func (r *CDCReader) collationCharsets(ctx context.Context) func(uint64) string {
+	r.serverCollationsOnce.Do(func() {
+		lctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
+		r.serverCollations = loadServerCollations(lctx, r.db)
+	})
+	server := r.serverCollations
+	return func(id uint64) string {
+		if cs := server[id]; cs != "" {
+			return cs
+		}
+		return charsetNameForCollationID(id)
+	}
+}
+
+// canonicalCharsetName folds the two spellings of the same charset that
+// the catalog and the collation environment can disagree on.
+func canonicalCharsetName(name string) string {
+	name = strings.ToLower(strings.TrimSpace(name))
+	if name == "utf8" {
+		return "utf8mb3"
+	}
+	return name
+}
+
+// binlogColumnCharsets resolves, per column of one rows event, the charset
+// its character values were WRITTEN in — which is what the bytes are in,
+// and which the catalog may no longer say.
+//
+// The catalog ([tableSchema]) answers as of NOW; a resume replaying history
+// recorded before a charset DDL (a warm resume after downtime, a lagging
+// stream, a cold-start handoff whose copy spanned the DDL) would otherwise
+// decode old bytes by the new charset — MEASURED: utf8mb4 'é' decoded as
+// latin1 'Ã©', latin1 '€' as cp1251 'Ђ', both at exit 0. The TABLE_MAP that
+// precedes every rows event carries each character column's collation
+// (MySQL: under the default binlog_row_metadata=MINIMAL — measured), so:
+//
+//   - TABLE_MAP names a charset that DIFFERS from the catalog's: the event
+//     was written under a charset the table no longer has. Refuse with the
+//     CDC-4 replay-mismatch class ([errCDCSchemaReplayMismatch]) — the
+//     same remedy, re-snapshot, because no decode of this history is
+//     faithful to the table as it now is.
+//   - TABLE_MAP names the catalog's charset (or the catalog recorded none):
+//     decode by it.
+//   - TABLE_MAP carries no collation for the column, or one sluice cannot
+//     name: fall back to the catalog. This is the LIMITATION, stated: MariaDB
+//     writes no column charsets under its default binlog_row_metadata=NO_LOG
+//     (and MySQL builds that disable the metadata likewise), so on such a
+//     source a charset DDL that ran between the resume position and now is
+//     NOT detected, and replayed values are decoded by the current charset.
+//     Set binlog_row_metadata=MINIMAL (or FULL) on the source to close it.
+//
+// A nil return means "decode by the catalog" for every column.
+func binlogColumnCharsets(tbl *tableSchema, tm *replication.TableMapEvent, nameOf func(uint64) string) ([]*columnCharset, error) {
+	if nameOf == nil {
+		nameOf = charsetNameForCollationID
+	}
+	if tm == nil {
+		return nil, nil
+	}
+	collationsByCol := tm.CollationMap()
+	if len(collationsByCol) == 0 {
+		return nil, nil
+	}
+	out := make([]*columnCharset, len(tbl.Columns))
+	for i, col := range tbl.Columns {
+		catalog, isString := stringTypeCharset(col.Type)
+		if !isString {
+			continue
+		}
+		id, ok := collationsByCol[i]
+		recorded := canonicalCharsetName(nameOf(id))
+		if !ok || recorded == "" {
+			out[i] = lookupColumnCharset(catalog)
+			continue
+		}
+		if c := canonicalCharsetName(catalog); c != "" && c != recorded {
+			return nil, errCDCSchemaReplayMismatch(tbl, fmt.Sprintf(
+				"column %q was recorded in CHARACTER SET %s but the table now declares %s",
+				col.Name, recorded, c,
+			))
+		}
+		out[i] = lookupColumnCharset(recorded)
+	}
+	return out, nil
+}
+
+// stringTypeCharset returns the declared charset of an IR string type, and
+// whether t is one.
+func stringTypeCharset(t ir.Type) (string, bool) {
+	switch v := t.(type) {
+	case ir.Char:
+		return v.Charset, true
+	case ir.Varchar:
+		return v.Charset, true
+	case ir.Text:
+		return v.Charset, true
+	}
+	return "", false
+}
+
+// resolveVStreamEnumSetText decodes a VStream ENUM or SET cell of a
+// non-UTF-8 column (review F2, MEASURED on vttestserver).
+//
+// vttablet hands the SAME column over in two forms depending on which of its
+// streamers produced the row: the vstreamer (CDC, and the catch-up that runs
+// between COPY chunks) renders the label as UTF-8 text from its catalog,
+// while the rowstreamer (COPY) reads under `set names binary` and hands over
+// the STORED bytes in the column's charset — latin1 'é' as 0xE9. The FIELD
+// event is identical in both (same collation, same flags), and a catch-up
+// row arrives on the same event stream as a COPY row, so the phase cannot
+// be told from the caller. What does tell them apart is the field's own
+// label list (column_type, UTF-8): the true value is a member of it. So the
+// cell is read both ways and the reading that IS a member is taken. When
+// both readings are members and differ — labels that are each other's
+// mojibake, like latin1 'é' and 'Ã©' with the cell bytes C3A9 — the value is
+// genuinely ambiguous and refuses (CHARSET-NOT-DECODABLE) rather than pick.
+// A cell neither reading makes a member of refuses too.
+//
+// ok=false means the column is not a non-UTF-8 ENUM/SET (or its labels do
+// not parse) and the caller keeps its existing handling.
+func resolveVStreamEnumSetText(field *query.Field, raw []byte) (value string, ok bool, err error) {
+	cc := lookupCollationCharset(field.GetCharset())
+	if cc == nil {
+		return "", false, nil
+	}
+	kind := "enum"
+	if field.GetType() == query.Type_SET {
+		kind = "set"
+	}
+	// No column_type means vttablet sent no label metadata (only hand-built
+	// fields in unit tests lack it): nothing to resolve against, so the
+	// caller keeps its UTF-8 reading. A column_type that is present but does
+	// not parse is a label list sluice cannot read, and refuses.
+	if field.GetColumnType() == "" {
+		return "", false, nil
+	}
+	labels, perr := parseEnumOrSet(field.GetColumnType(), kind)
+	if perr != nil || len(labels) == 0 {
+		return "", true, fmt.Errorf("%w: column %q (CHARACTER SET %s, %s): its label list %q does not parse, so a value cannot be resolved against it",
+			errCharsetNotDecodable, field.GetName(), cc.name, strings.ToUpper(kind), field.GetColumnType())
+	}
+	member := make(map[string]bool, len(labels))
+	for _, l := range labels {
+		member[l] = true
+	}
+	isMember := func(s string) bool {
+		if kind == "enum" {
+			return member[s]
+		}
+		if s == "" {
+			return true
+		}
+		for _, part := range strings.Split(s, ",") {
+			if !member[part] {
+				return false
+			}
+		}
+		return true
+	}
+	asUTF8 := string(raw)
+	cdcForm := utf8.ValidString(asUTF8) && isMember(asUTF8)
+	copyText, derr := cc.decode(raw, "", field.GetName())
+	copyForm := derr == nil && isMember(copyText)
+	switch {
+	case cdcForm && copyForm && asUTF8 != copyText:
+		return "", true, fmt.Errorf("%w: column %q (CHARACTER SET %s, %s): a change-stream value is a member of the column's labels "+
+			"read both as UTF-8 and as %s, and the two readings differ — vttablet sends this column in either form depending on "+
+			"the streamer, so the value is ambiguous. Rename one of the labels that are each other's mis-encoding, or exclude the table",
+			errCharsetNotDecodable, field.GetName(), cc.name, strings.ToUpper(kind), cc.name)
+	case cdcForm:
+		return asUTF8, true, nil
+	case copyForm:
+		return copyText, true, nil
+	}
+	return "", true, fmt.Errorf("%w: column %q (CHARACTER SET %s, %s): a change-stream value is not a member of the column's labels "+
+		"in either of the forms vttablet sends. %s", errCharsetNotDecodable, field.GetName(), cc.name, strings.ToUpper(kind), charsetRefusalRemedy)
 }
 
 // vstreamCharsetError is the sentinel [decodeVStreamCell] returns as a cell
@@ -276,13 +546,8 @@ func isASCII(b []byte) bool {
 // stringColumnCharset returns the converter for an IR string type's
 // declared charset, or nil for any other type or a UTF-8-family charset.
 func stringColumnCharset(t ir.Type) *columnCharset {
-	switch v := t.(type) {
-	case ir.Char:
-		return lookupColumnCharset(v.Charset)
-	case ir.Varchar:
-		return lookupColumnCharset(v.Charset)
-	case ir.Text:
-		return lookupColumnCharset(v.Charset)
+	if cs, ok := stringTypeCharset(t); ok {
+		return lookupColumnCharset(cs)
 	}
 	return nil
 }

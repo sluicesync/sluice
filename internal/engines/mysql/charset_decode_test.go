@@ -5,12 +5,16 @@ package mysql
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
+	gomysql "github.com/go-mysql-org/go-mysql/mysql"
+	"github.com/go-mysql-org/go-mysql/replication"
 	"vitess.io/vitess/go/vt/proto/query"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // TestDecodeBinlogRow_ConvertsNonUTF8CharsetColumns pins GC-37 (j) at the
@@ -41,7 +45,7 @@ func TestDecodeBinlogRow_ConvertsNonUTF8CharsetColumns(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			cols := []*ir.Column{{Name: "c", Type: tc.typ}}
-			row, err := decodeBinlogRow([]any{tc.raw}, cols, nil, FlavorVanilla, "t", zeroDateInherit, binlogLabelGuard{})
+			row, err := decodeBinlogRow([]any{tc.raw}, cols, nil, FlavorVanilla, "t", zeroDateInherit, binlogLabelGuard{}, nil)
 			if err != nil {
 				t.Fatalf("decodeBinlogRow: %v", err)
 			}
@@ -49,6 +53,58 @@ func TestDecodeBinlogRow_ConvertsNonUTF8CharsetColumns(t *testing.T) {
 				t.Errorf("c = %q (%X); want %q", row["c"], row["c"], tc.want)
 			}
 		})
+	}
+}
+
+// TestBinlogColumnCharsets_WrittenCharsetWins pins review F1 at the unit
+// level: the TABLE_MAP's per-column collation (what the bytes were WRITTEN
+// in) decides the decode, a disagreement with the catalog refuses as a
+// CDC-4 replay mismatch, and an absent TABLE_MAP collation (MariaDB NO_LOG)
+// falls back to the catalog — the stated limitation.
+func TestBinlogColumnCharsets_WrittenCharsetWins(t *testing.T) {
+	tbl := &tableSchema{Schema: "d", Name: "t", Columns: []*ir.Column{
+		{Name: "id", Type: ir.Integer{Width: 32}},
+		{Name: "v", Type: ir.Varchar{Length: 16, Charset: "latin1"}},
+	}}
+	tm := func(cols ...uint64) *replication.TableMapEvent {
+		return &replication.TableMapEvent{
+			ColumnCount:   2,
+			ColumnType:    []byte{gomysql.MYSQL_TYPE_LONG, gomysql.MYSQL_TYPE_VARCHAR},
+			ColumnMeta:    []uint16{0, 16},
+			ColumnCharset: cols,
+		}
+	}
+
+	cs, err := binlogColumnCharsets(tbl, tm(8), nil) // latin1_swedish_ci, as the catalog says
+	if err != nil || cs[1] == nil || cs[1].name != "latin1" {
+		t.Fatalf("matching TABLE_MAP: cs=%v err=%v; want latin1", cs, err)
+	}
+	row, err := decodeBinlogRow([]any{int32(1), []byte{0xE9}}, tbl.Columns, nil, FlavorVanilla, "t", zeroDateInherit, binlogLabelGuard{}, cs)
+	if err != nil || row["v"] != "é" {
+		t.Fatalf("decode by the written latin1 = %q, %v; want é", row["v"], err)
+	}
+
+	// Written utf8mb4 (255), catalog now latin1: a replay across the DDL.
+	var ce *sluicecode.CodedError
+	if _, err := binlogColumnCharsets(tbl, tm(255), nil); !errors.As(err, &ce) || ce.Code != sluicecode.CodeCDCSchemaReplayMismatch ||
+		!strings.Contains(err.Error(), "utf8mb4") || !strings.Contains(err.Error(), "latin1") {
+		t.Fatalf("replayed utf8mb4 under a latin1 catalog: err = %v; want %s naming both charsets", err, sluicecode.CodeCDCSchemaReplayMismatch)
+	}
+
+	// No TABLE_MAP charsets (MariaDB NO_LOG): fall back to the catalog.
+	if cs, err := binlogColumnCharsets(tbl, tm(), nil); err != nil || cs != nil {
+		t.Fatalf("no TABLE_MAP charsets: cs=%v err=%v; want nil (decode by the catalog)", cs, err)
+	}
+
+	// An ID only the server's own table names (MariaDB utf8mb4_uca1400_ai_ci)
+	// still refuses against a latin1 catalog when the resolver names it.
+	if _, err := binlogColumnCharsets(tbl, tm(2304), func(id uint64) string {
+		if id == 2304 {
+			return "utf8mb4"
+		}
+		return ""
+	}); !errors.As(err, &ce) {
+		t.Fatalf("a server-named collation: err = %v; want a replay-mismatch refusal", err)
 	}
 }
 
@@ -69,14 +125,14 @@ func TestDecodeBinlogRow_RefusesWhatItCannotDecode(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cols := []*ir.Column{{Name: "c", Type: tc.typ}}
-			_, err := decodeBinlogRow([]any{tc.raw}, cols, nil, FlavorVanilla, "t", zeroDateInherit, binlogLabelGuard{})
+			_, err := decodeBinlogRow([]any{tc.raw}, cols, nil, FlavorVanilla, "t", zeroDateInherit, binlogLabelGuard{}, nil)
 			if !errors.Is(err, errCharsetNotDecodable) || !strings.Contains(err.Error(), `table "t" column "c"`) {
 				t.Fatalf("err = %v; want %s naming the table and column", err, charsetNotDecodableMarker)
 			}
 		})
 	}
 	row, err := decodeBinlogRow([]any{nil}, []*ir.Column{{Name: "c", Type: ir.Varchar{Length: 1, Charset: "latin1"}}},
-		nil, FlavorVanilla, "t", zeroDateInherit, binlogLabelGuard{})
+		nil, FlavorVanilla, "t", zeroDateInherit, binlogLabelGuard{}, nil)
 	if err != nil || row["c"] != nil {
 		t.Fatalf("NULL latin1 = %#v, %v; want nil", row["c"], err)
 	}
@@ -85,8 +141,9 @@ func TestDecodeBinlogRow_RefusesWhatItCannotDecode(t *testing.T) {
 // TestDecodeVStreamRow_CharsetByCollation pins the VStream arm: a
 // character cell is converted by its field's collation; collation 0 — what
 // vttablet sends for a charset it does not name (gbk, big5, tis620,
-// gb18030; MEASURED) — passes pure ASCII and refuses anything else; an
-// ENUM cell, which vttablet renders as UTF-8 label text, is NOT converted.
+// gb18030; MEASURED) — passes pure ASCII and refuses anything else; a
+// non-UTF-8 ENUM/SET cell is resolved against the column's own labels in
+// both the CDC (UTF-8) and COPY (stored bytes) forms.
 func TestDecodeVStreamRow_CharsetByCollation(t *testing.T) {
 	row := func(vals ...[]byte) *query.Row {
 		r := &query.Row{}
@@ -113,7 +170,33 @@ func TestDecodeVStreamRow_CharsetByCollation(t *testing.T) {
 	}
 	got, _, err = decodeVStreamRow(row([]byte("é")), []*query.Field{enumLatin1}, "t", zeroDateInherit)
 	if err != nil || got["e"] != "é" {
-		t.Errorf("latin1 ENUM label = %q, %v; want é unconverted (vttablet renders labels as UTF-8)", got["e"], err)
+		t.Errorf("latin1 ENUM label with no parseable column_type = %q, %v; want é unconverted", got["e"], err)
+	}
+
+	// Review F2: a non-UTF-8 ENUM/SET cell is UTF-8 label text in CDC and
+	// the STORED bytes in COPY; both must resolve to the member label, and
+	// a cell that is a member under both readings refuses.
+	enumCT := &query.Field{Name: "e", Type: query.Type_ENUM, Charset: 8, ColumnType: "enum('é','x')"}
+	setCT := &query.Field{Name: "s", Type: query.Type_SET, Charset: 8, ColumnType: "set('é','x')"}
+	for _, tc := range []struct {
+		name  string
+		field *query.Field
+		raw   []byte
+		want  any
+	}{
+		{"ENUM CDC form (UTF-8 label)", enumCT, []byte("é"), "é"},
+		{"ENUM COPY form (stored latin1)", enumCT, []byte{0xE9}, "é"},
+		{"SET CDC form", setCT, []byte("é,x"), []string{"é", "x"}},
+		{"SET COPY form", setCT, []byte{0xE9, ',', 'x'}, []string{"é", "x"}},
+	} {
+		got, _, err := decodeVStreamRow(row(tc.raw), []*query.Field{tc.field}, "t", zeroDateInherit)
+		if err != nil || fmt.Sprint(got[tc.field.Name]) != fmt.Sprint(tc.want) {
+			t.Errorf("%s = %#v, %v; want %#v", tc.name, got[tc.field.Name], err, tc.want)
+		}
+	}
+	amb := &query.Field{Name: "e", Type: query.Type_ENUM, Charset: 8, ColumnType: "enum('é','Ã©')"}
+	if _, _, err := decodeVStreamRow(row([]byte{0xC3, 0xA9}), []*query.Field{amb}, "t", zeroDateInherit); !errors.Is(err, errCharsetNotDecodable) {
+		t.Errorf("ambiguous ENUM cell: err = %v; want %s", err, charsetNotDecodableMarker)
 	}
 	if cc := lookupCollationCharset(9999); cc == nil || !cc.unsupported {
 		t.Errorf("an unnamed non-zero collation resolved to %+v; want an unsupported charset that refuses", cc)

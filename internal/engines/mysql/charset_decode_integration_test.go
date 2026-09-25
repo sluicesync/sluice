@@ -16,7 +16,10 @@
 // sequence the server does NOT accept cannot be stored, so it is not graded
 // for equality — but it must not decode to a DIFFERENT character than the
 // server's substitution silently implies: sluice either refuses it or the
-// cell is counted and reported (it is unreachable from a stored column).
+// cell is counted and reported. That such a sequence cannot reach sluice from
+// a stored column (the server refuses to store it) is an UNVERIFIED PREMISE:
+// the count is logged per charset so a change in it is visible, but no test
+// asserts that a server-invalid sequence cannot be stored.
 
 package mysql
 
@@ -209,7 +212,7 @@ func gradeCharsetsAgainstServer(t *testing.T, dsn string) {
 		if valid < 100 && !asciiOnly {
 			t.Errorf("%s: only %d server-valid sequences graded; the code space did not reach the charset", cs, valid)
 		}
-		t.Logf("%-9s graded %6d server-valid sequences exactly; %d server-invalid sequences sluice decodes (unreachable from a stored column)",
+		t.Logf("%-9s graded %6d server-valid sequences exactly; %d server-invalid sequences sluice decodes (UNVERIFIED PREMISE: unreachable from a stored column)",
 			cs, valid, invalidDecoded)
 		graded++
 	}

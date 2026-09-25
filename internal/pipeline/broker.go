@@ -1101,6 +1101,8 @@ func (b *SyncFromBackup) applyIncremental(
 	batchSize int,
 	parentResumeID string,
 ) (int64, error) {
+	// GC-37 (j): see [ChainRestore.applyIncremental] — the same WARN.
+	migcore.WarnLegacyCharsetIncrement(ctx, "sync from-backup", link.Manifest)
 	// 1. Schema deltas first.
 	if len(link.Manifest.SchemaDelta) > 0 {
 		if err := b.applySchemaDeltas(ctx, link); err != nil {

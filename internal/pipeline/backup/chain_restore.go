@@ -1083,6 +1083,10 @@ func (r *ChainRestore) applyIncremental(
 	applier ir.ChangeApplier,
 	batchSize int,
 ) error {
+	// GC-37 (j): an incremental a pre-v0.156.3 sluice captured may hold U+FFFD
+	// for a non-UTF-8 column's non-ASCII values — name them (WARN; the values
+	// are not in the chain, so refusing would recover nothing).
+	migcore.WarnLegacyCharsetIncrement(ctx, "chain restore", link.Manifest)
 	// 1. Schema deltas first. Phase 3.2 same-engine: AddTable goes
 	//    through CreateTablesWithoutConstraints (the table has no
 	//    rows yet on the target — they arrive via the change
