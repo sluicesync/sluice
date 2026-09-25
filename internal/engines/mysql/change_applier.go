@@ -1890,7 +1890,7 @@ func (a *ChangeApplier) colTypesFor(ctx context.Context, _ *sql.Tx, schema, tabl
 	// not interleave with row events on the applier side.
 	// schema is the already-resolved target database (see pkFor) — used
 	// verbatim for the lookup; the routing decision lives in the caller.
-	tbl, err := loadTableSchema(ctx, a.db, schema, table, a.flavor)
+	tbl, err := loadTableColumnTypes(ctx, a.db, schema, table, a.flavor)
 	if err != nil {
 		// Audit C-11: classify "the target lacks this table" STRUCTURALLY
 		// (an information_schema.TABLES existence probe — never the error

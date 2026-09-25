@@ -787,7 +787,7 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 	if err := recoverTextDefaults(ctx, r.db, r.schema, r.flavor, textPending); err != nil {
 		return err
 	}
-	if err := recoverExprTexts(ctx, r.db, r.schema, r.flavor, exprPending); err != nil {
+	if err := recoverExprTexts(ctx, r.db, r.schema, r.flavor, exprPending, nil); err != nil {
 		return err
 	}
 	// One SHOW CREATE pass recovers BOTH the NUL-truncated binary defaults
@@ -881,7 +881,7 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	if err := recoverExprTexts(ctx, r.db, r.schema, r.flavor, exprPending); err != nil {
+	if err := recoverExprTexts(ctx, r.db, r.schema, r.flavor, exprPending, nil); err != nil {
 		return err
 	}
 
@@ -1066,7 +1066,7 @@ func (r *SchemaReader) populateCheckConstraints(ctx context.Context, tables map[
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	return recoverExprTexts(ctx, r.db, r.schema, r.flavor, exprPending)
+	return recoverExprTexts(ctx, r.db, r.schema, r.flavor, exprPending, nil)
 }
 
 // loadTableSchema reads just the column list for a single table from
@@ -1077,6 +1077,19 @@ func (r *SchemaReader) populateCheckConstraints(ctx context.Context, tables map[
 // Indexes and foreign keys are not loaded — the CDC dispatcher only
 // needs column names and types to decode row events.
 func loadTableSchema(ctx context.Context, db *sql.DB, schema, table string, flavor Flavor) (*tableSchema, error) {
+	return loadTableSchemaWith(ctx, db, schema, table, flavor, true)
+}
+
+// loadTableColumnTypes is [loadTableSchema] for a caller that needs only the
+// column list and types — the TARGET-side applier's type cache. It skips the
+// expression-text recovery (Bug 288), which only rewrites Default and
+// GeneratedExpr, so a target whose expressions carry text the recovery
+// would refuse cannot stop a stream that never reads them.
+func loadTableColumnTypes(ctx context.Context, db *sql.DB, schema, table string, flavor Flavor) (*tableSchema, error) {
+	return loadTableSchemaWith(ctx, db, schema, table, flavor, false)
+}
+
+func loadTableSchemaWith(ctx context.Context, db *sql.DB, schema, table string, flavor Flavor, recoverExprs bool) (*tableSchema, error) {
 	const q = `
 		SELECT
 			column_name,
@@ -1208,8 +1221,10 @@ func loadTableSchema(ctx context.Context, db *sql.DB, schema, table string, flav
 	if err := recoverTextDefaults(ctx, db, schema, flavor, textPending); err != nil {
 		return nil, fmt.Errorf("mysql: loadTableSchema %s.%s: text default recovery: %w", schema, table, err)
 	}
-	if err := recoverExprTexts(ctx, db, schema, flavor, exprPending); err != nil {
-		return nil, fmt.Errorf("mysql: loadTableSchema %s.%s: expression text recovery: %w", schema, table, err)
+	if recoverExprs {
+		if err := recoverExprTexts(ctx, db, schema, flavor, exprPending, nil); err != nil {
+			return nil, fmt.Errorf("mysql: loadTableSchema %s.%s: expression text recovery: %w", schema, table, err)
+		}
 	}
 	if len(pending) > 0 {
 		// One SHOW CREATE for this table. The stand-in ir.Table carries no

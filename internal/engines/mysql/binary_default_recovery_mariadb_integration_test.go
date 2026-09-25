@@ -148,7 +148,7 @@ func TestMariaDBBinaryDefault_HighBytes_OnARealServer(t *testing.T) {
 
 			read := func() *mysqlTableFacts {
 				t.Helper()
-				facts, err := readTableFacts(ctx, db, FlavorMariaDB, schema, "gc36")
+				facts, err := readTableFacts(ctx, db, FlavorMariaDB, schema, "gc36", nil)
 				if err != nil {
 					t.Fatal(err)
 				}

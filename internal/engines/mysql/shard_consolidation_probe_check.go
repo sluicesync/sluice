@@ -80,14 +80,14 @@ func (a *ChangeApplier) ProbeModifyCheck(ctx context.Context, table *ir.Table, o
 		// silently did before the 2026-08-11 escaping fix, for every
 		// literal-carrying CHECK, in both directions.
 		//
-		// On a MySQL target the raw clause is also double-encoded (its bytes
-		// read as Latin-1, Bug 288) while the recorded side was recovered, so
-		// undo that first. It is a comparison only: a clause the undo cannot
+		// On a MySQL target the raw clause also has every stored byte widened
+		// (Bug 288) while the recorded side was recovered, so decode it the
+		// same way first. It is a comparison only: a clause the decode cannot
 		// read stays as read and compares unequal — loud, never carried.
 		observed := newExpr
-		if a.flavor != FlavorMariaDB {
-			if undone, ok := undoISLatin1(newExpr); ok {
-				observed = undone
+		if a.flavor != FlavorMariaDB && exprTextNeedsRecovery(a.flavor, newExpr) {
+			if decoded, ok := decodeMySQLISExprForCompare(newExpr); ok {
+				observed = decoded
 			}
 		}
 		if mysqlCheckExprsEquivalent(normalizeExprForFlavor(a.flavor, observed), newConstraint.Expr) {

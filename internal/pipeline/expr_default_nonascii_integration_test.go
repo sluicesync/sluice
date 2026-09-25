@@ -26,7 +26,16 @@
 
 package pipeline
 
-import "testing"
+import (
+	"context"
+	"database/sql"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"sluicesync.dev/sluice/internal/engines"
+)
 
 // exprDefaultShapes is the expression-default matrix: plain ASCII (the
 // control that must not change), each UTF-8 length — two bytes (é, ß),
@@ -148,4 +157,105 @@ func TestStreamer_AddColumnForward_NonASCIIExpressionDefaults_MariaDBToMariaDB(t
 		shapes: exprDefaultForwardShapes(true), knownWrong: map[string]fdKnownWrong{},
 		suppressBackfill: true,
 	})
+}
+
+// latin1SessionExec runs statements on ONE connection whose session charset
+// is latin1, so the literals in them are stored as latin1 bytes — the table
+// a client configured for latin1 creates.
+func latin1SessionExec(t *testing.T, dsn string, stmts ...string) {
+	t.Helper()
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	for _, q := range append([]string{"SET NAMES latin1"}, stmts...) {
+		if _, err := conn.ExecContext(ctx, q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+}
+
+// exprLatin1Lane is the pre-tag review's F1/F3 pin through migrate: a table
+// created from a latin1 session, whose expression literals are stored as
+// latin1 bytes — C3A9 (the value Ã©) and E9 (é) — in a DEFAULT, a STORED
+// generated column and a CHECK. The first cut of the Bug 288 recovery read
+// C3A9 as é (silently wrong on every surface) and refused E9 outright.
+//
+// Independent expected value: the source server's own fill of a row naming
+// only its key, against the target's own fill of the same; and for the
+// CHECK, the target must refuse the value the source refuses and accept one
+// it accepts. Nothing is read through sluice or any catalog.
+func exprLatin1Lane(t *testing.T, targetEngine, src, tgt string, tgtDialect fdDialect) {
+	t.Helper()
+	latin1SessionExec(t, src, "CREATE TABLE lx (id BIGINT NOT NULL PRIMARY KEY, "+
+		"a VARCHAR(20) DEFAULT ('\xc3\xa9'), e VARCHAR(20) DEFAULT ('caf\xe9'), "+
+		"g VARCHAR(20) GENERATED ALWAYS AS (concat('\xc3\xa9', e)) STORED, "+
+		"CONSTRAINT lx_ck CHECK (a <> 'x\xc3\xa9')) DEFAULT CHARSET utf8mb4")
+	fdExec(t, fdMySQL, src, "INSERT INTO lx (id) VALUES (1)")
+	srcEng, _ := engines.Get("mysql")
+	tgtEng, _ := engines.Get(targetEngine)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	if err := (&Migrator{Source: srcEng, Target: tgtEng, SourceDSN: src, TargetDSN: tgt}).Run(ctx); err != nil {
+		t.Fatalf("Migrator.Run: %v", err)
+	}
+	fdExec(t, tgtDialect, tgt, "INSERT INTO lx (id) VALUES (2)")
+	read := func(d fdDialect, dsn string, id int) []string {
+		t.Helper()
+		db, err := sql.Open(d.driver(), dsn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = db.Close() }()
+		var out []string
+		for _, col := range []string{"a", "e", "g"} {
+			var v sql.NullString
+			q := "SELECT " + fdCanonExpr(d, fdText, col) + " FROM lx WHERE id = " + strconv.Itoa(id)
+			if err := db.QueryRowContext(ctx, q).Scan(&v); err != nil {
+				t.Fatalf("%s: %v", q, err)
+			}
+			out = append(out, col+"="+v.String)
+		}
+		return out
+	}
+	srcVals, tgtVals := read(fdMySQL, src, 1), read(tgtDialect, tgt, 2)
+	if strings.Join(srcVals, ",") != "a=Ã©,e=café,g=Ã©café" {
+		t.Fatalf("the source evaluates %v; the fixture expects a=Ã©, e=café, g=Ã©café (fix the fixture)", srcVals)
+	}
+	if strings.Join(tgtVals, ",") != strings.Join(srcVals, ",") {
+		t.Errorf("the target's own fill %v differs from the source's %v", tgtVals, srcVals)
+	}
+	tgtDB, err := sql.Open(tgtDialect.driver(), tgt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tgtDB.Close() }()
+	if _, err := tgtDB.ExecContext(ctx, "INSERT INTO lx (id, a) VALUES (3, 'xÃ©')"); err == nil {
+		t.Error("the target accepted a = 'xÃ©', which the source's CHECK refuses")
+	}
+	if _, err := tgtDB.ExecContext(ctx, "INSERT INTO lx (id, a) VALUES (4, 'xé')"); err != nil {
+		t.Errorf("the target refused a = 'xé', which the source's CHECK accepts: %v", err)
+	}
+}
+
+func TestMigrate_Latin1SessionExpressions_MySQLToMySQL(t *testing.T) {
+	src, tgt, cleanup := startMySQL(t)
+	defer cleanup()
+	exprLatin1Lane(t, "mysql", src, tgt, fdMySQL)
+}
+
+func TestMigrate_Latin1SessionExpressions_MySQLToPostgres(t *testing.T) {
+	src, _, myCleanup := startMySQL(t)
+	defer myCleanup()
+	_, tgt, pgCleanup := startPostgres(t)
+	defer pgCleanup()
+	exprLatin1Lane(t, "postgres", src, tgt, fdPG)
 }

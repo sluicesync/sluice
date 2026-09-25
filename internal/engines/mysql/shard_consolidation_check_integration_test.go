@@ -261,6 +261,53 @@ func TestShardConsolidationProber_MySQL_ModifyCheck(t *testing.T) {
 	}
 }
 
+// TestShardConsolidationProber_MySQL_ModifyCheck_NonASCII pins the probe's
+// Bug 288 decode. The recorded CHECK comes from the SOURCE read, which
+// recovers non-ASCII expression text; the observed one is the TARGET's raw
+// CHECK_CLAUSE, whose stored bytes MySQL's information_schema widens (é
+// reads back as Ã©). Without the decode a modify that DID land compares as
+// divergent and the takeover refuses as Inconsistent. The control is a
+// recorded expression that differs at the non-ASCII character, which must
+// still be Inconsistent.
+func TestShardConsolidationProber_MySQL_ModifyCheck_NonASCII(t *testing.T) {
+	dsn, cleanup := startMySQLForApplier(t)
+	defer cleanup()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := db.ExecContext(ctx, "CREATE TABLE `chk_probe_na` ("+
+		"id INT PRIMARY KEY, note VARCHAR(40), CONSTRAINT chk_new CHECK (note <> 'é😀'))"); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	var raw string
+	if err := db.QueryRowContext(ctx, `SELECT check_clause FROM information_schema.check_constraints
+		WHERE constraint_schema = DATABASE() AND constraint_name = 'chk_new'`).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(raw, "é") {
+		t.Fatalf("the target's CHECK_CLAUSE is faithful (%q); the probe's decode is not exercised — re-measure", raw)
+	}
+	a, err := Engine{}.OpenChangeApplier(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenChangeApplier: %v", err)
+	}
+	defer func() { _ = a.(interface{ Close() error }).Close() }()
+	applier := a.(*ChangeApplier)
+	table := &ir.Table{Name: "chk_probe_na"}
+	outcome, err := applier.ProbeModifyCheck(ctx, table, "chk_old", &ir.CheckConstraint{Name: "chk_new", Expr: "(note <> 'é😀')", ExprDialect: "mysql"})
+	if err != nil || outcome != ir.ProbeOutcomeApplied {
+		t.Errorf("landed non-ASCII CHECK: outcome = %v, err = %v; want Applied", outcome, err)
+	}
+	outcome, err = applier.ProbeModifyCheck(ctx, table, "chk_old", &ir.CheckConstraint{Name: "chk_new", Expr: "(note <> 'è😀')", ExprDialect: "mysql"})
+	if err == nil || outcome != ir.ProbeOutcomeInconsistent {
+		t.Errorf("a CHECK differing at the non-ASCII character: outcome = %v, err = %v; want Inconsistent", outcome, err)
+	}
+}
+
 // TestAlterAddCheck_CrossEngineRefusesLoudly_MySQL pins the safety
 // floor on the MySQL side: a PG-tagged Expr with `->>` refuses
 // BEFORE issuing SQL.

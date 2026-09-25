@@ -173,18 +173,18 @@ func TestVStream_ExprText_NonASCII_ThroughVTGate(t *testing.T) {
 		for _, c := range tbl.Columns {
 			switch c.Name {
 			case "d":
-				if e, ok := c.Default.(ir.DefaultExpression); !ok || !strings.Contains(e.Expr, "é😀") || !strings.Contains(e.Expr, "中") {
-					t.Errorf("d default = %#v; want the declared text", c.Default)
+				if e, ok := c.Default.(ir.DefaultExpression); !ok || e.Expr != "concat('é😀','中')" {
+					t.Errorf("d default = %#v; want exactly concat('é😀','中')", c.Default)
 				}
 			case "g":
-				if !strings.Contains(c.GeneratedExpr, "ß😀") {
-					t.Errorf("g generated = %q; want the declared text", c.GeneratedExpr)
+				if c.GeneratedExpr != "concat('ß😀',id)" {
+					t.Errorf("g generated = %q; want exactly concat('ß😀',id)", c.GeneratedExpr)
 				}
 			}
 		}
 		for _, cc := range tbl.CheckConstraints {
-			if cc.Name == "xr_chk" && !strings.Contains(cc.Expr, "é😀") {
-				t.Errorf("xr_chk = %q; want the declared text", cc.Expr)
+			if cc.Name == "xr_chk" && cc.Expr != "(b <> 'é😀')" {
+				t.Errorf("xr_chk = %q; want exactly (b <> 'é😀')", cc.Expr)
 			}
 		}
 		return

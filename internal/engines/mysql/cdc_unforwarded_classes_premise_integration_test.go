@@ -58,7 +58,7 @@ func TestTableFacts_DiffPremisesOnARealServer(t *testing.T) {
 	qn := schema + ".prem"
 	read := func() *mysqlTableFacts {
 		t.Helper()
-		facts, err := readTableFacts(ctx, db, FlavorVanilla, schema, "prem")
+		facts, err := readTableFacts(ctx, db, FlavorVanilla, schema, "prem", nil)
 		if err != nil {
 			t.Fatal(err)
 		}

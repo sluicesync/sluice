@@ -257,8 +257,13 @@ func unforwardedScopeFilter(prefix string) string {
 // catalog queries regardless of how many tables are read. The caller
 // filters the all-tables form by database scope, which is where the
 // server's identifier-folding rule lives.
-func readTableFacts(ctx context.Context, db *sql.DB, flavor Flavor, schema, table string) (map[string]*mysqlTableFacts, error) {
+func readTableFacts(ctx context.Context, db *sql.DB, flavor Flavor, schema, table string, inScope func(schema string) bool) (map[string]*mysqlTableFacts, error) {
 	out := map[string]*mysqlTableFacts{}
+	// drop forgets a table dropped between the catalog read and a SHOW CREATE
+	// TABLE the expression recovery needed for it (see [recoverExprTexts]).
+	drop := func(s string) func(t string) {
+		return func(t string) { delete(out, qualifiedName(s, t)) }
+	}
 	args := []any{table, schema, table}
 	get := func(s, t string) *mysqlTableFacts {
 		qn := qualifiedName(s, t)
@@ -269,7 +274,7 @@ func readTableFacts(ctx context.Context, db *sql.DB, flavor Flavor, schema, tabl
 		}
 		return f
 	}
-	if err := readColumnFacts(ctx, db, flavor, args, get); err != nil {
+	if err := readColumnFacts(ctx, db, flavor, args, inScope, get, drop); err != nil {
 		return nil, fmt.Errorf("read columns: %w", err)
 	}
 	if err := readKeyFacts(ctx, db, flavor, args, out); err != nil {
@@ -278,19 +283,23 @@ func readTableFacts(ctx context.Context, db *sql.DB, flavor Flavor, schema, tabl
 	if err := readForeignKeyFacts(ctx, db, args, out); err != nil {
 		return nil, fmt.Errorf("read foreign keys: %w", err)
 	}
-	if err := readCheckFacts(ctx, db, flavor, args, out); err != nil {
+	if err := readCheckFacts(ctx, db, flavor, args, out, drop); err != nil {
 		return nil, fmt.Errorf("read check constraints: %w", err)
 	}
 	return out, nil
 }
 
-func readColumnFacts(ctx context.Context, db *sql.DB, flavor Flavor, args []any, get func(s, t string) *mysqlTableFacts) error {
+func readColumnFacts(ctx context.Context, db *sql.DB, flavor Flavor, args []any, inScope func(string) bool, get func(s, t string) *mysqlTableFacts, drop func(s string) func(t string)) error {
 	rows, err := db.QueryContext(ctx, `
-		SELECT table_schema, table_name, column_name, column_type, is_nullable,
-		       column_default, IFNULL(extra, ''), IFNULL(generation_expression, ''),
-		       IFNULL(character_set_name, '')
-		FROM   information_schema.columns
-		WHERE  `+unforwardedScopeFilter(""), args...)
+		SELECT c.table_schema, c.table_name, c.column_name, c.column_type, c.is_nullable,
+		       c.column_default, IFNULL(c.extra, ''), IFNULL(c.generation_expression, ''),
+		       IFNULL(c.character_set_name, '')
+		FROM   information_schema.columns c
+		JOIN   information_schema.tables tb
+		  ON   tb.table_schema = c.table_schema
+		 AND   tb.table_name   = c.table_name
+		 AND   tb.table_type   = 'BASE TABLE'
+		WHERE  `+unforwardedScopeFilter("c."), args...)
 	if err != nil {
 		return err
 	}
@@ -322,12 +331,18 @@ func readColumnFacts(ctx context.Context, db *sql.DB, flavor Flavor, args []any,
 		if err := rows.Scan(&s, &t, &col, &typ, &nullable, &def, &extra, &gen, &charset); err != nil {
 			return err
 		}
+		// Out-of-scope schemas are dropped here, before any recovery reads
+		// them: the all-tables baseline spans the whole server, and a table
+		// the stream never emits must not be able to fail its start.
+		if inScope != nil && !inScope(s) {
+			continue
+		}
 		get(s, t).columns[col] = columnFact(flavor, typ, nullable, def, extra, gen)
 		if flavor == FlavorMariaDB {
 			facts := get(s, t)
 			if text, ok := exprDefaultCatalogText(flavor, extra, def); ok && exprTextNeedsRecovery(flavor, text) {
 				exprPending[s] = append(exprPending[s], pendingExprText{
-					table: t, kind: exprSiteColumn, name: col, catalog: text,
+					table: t, kind: exprSiteDefault, name: col, catalog: text,
 					set: func(recovered string) {
 						c := facts.columns[col]
 						c.def = recovered
@@ -337,7 +352,7 @@ func readColumnFacts(ctx context.Context, db *sql.DB, flavor Flavor, args []any,
 			}
 			if gen != "" && exprTextNeedsRecovery(flavor, gen) {
 				exprPending[s] = append(exprPending[s], pendingExprText{
-					table: t, kind: exprSiteColumn, name: col, catalog: gen,
+					table: t, kind: exprSiteGenerated, name: col, catalog: gen,
 					set: func(recovered string) {
 						c := facts.columns[col]
 						c.generated = recovered
@@ -386,7 +401,7 @@ func readColumnFacts(ctx context.Context, db *sql.DB, flavor Flavor, args []any,
 		}
 	}
 	for _, s := range sortedKeys(exprPending) {
-		if err := recoverExprTexts(ctx, db, s, flavor, exprPending[s]); err != nil {
+		if err := recoverExprTexts(ctx, db, s, flavor, exprPending[s], drop(s)); err != nil {
 			return fmt.Errorf("recover expression text: %w", err)
 		}
 	}
@@ -552,7 +567,7 @@ func readForeignKeyFacts(ctx context.Context, db *sql.DB, args []any, out map[st
 // unique per TABLE, MySQL 8's per schema and its check_constraints has no
 // table_name) and, on MySQL, ENFORCED. MariaDB's auto json_valid CHECK on
 // a JSON column is dropped: it is the type, not a constraint.
-func readCheckFacts(ctx context.Context, db *sql.DB, flavor Flavor, args []any, out map[string]*mysqlTableFacts) error {
+func readCheckFacts(ctx context.Context, db *sql.DB, flavor Flavor, args []any, out map[string]*mysqlTableFacts, drop func(s string) func(t string)) error {
 	enforced, tableJoin := `IFNULL(tc.enforced, 'YES')`, ""
 	if flavor == FlavorMariaDB {
 		enforced, tableJoin = `'YES'`, "\n\t\t AND   cc.table_name        = tc.table_name"
@@ -606,7 +621,7 @@ func readCheckFacts(ctx context.Context, db *sql.DB, flavor Flavor, args []any, 
 		return err
 	}
 	for _, s := range sortedKeys(exprPending) {
-		if err := recoverExprTexts(ctx, db, s, flavor, exprPending[s]); err != nil {
+		if err := recoverExprTexts(ctx, db, s, flavor, exprPending[s], drop(s)); err != nil {
 			return fmt.Errorf("recover expression text: %w", err)
 		}
 	}
@@ -885,7 +900,7 @@ func (r *CDCReader) captureUnforwardedBaseline(ctx context.Context) error {
 			baseline[qn] = f
 		}
 	} else {
-		facts, err := readTableFacts(ctx, r.db, r.flavor, "", "")
+		facts, err := readTableFacts(ctx, r.db, r.flavor, "", "", r.databaseInScope)
 		if err != nil {
 			return fmt.Errorf("mysql: cdc: baseline the schema objects the binlog lane does not forward: %w", err)
 		}
@@ -918,7 +933,7 @@ func (r *CDCReader) gradeUnforwardedClasses(ctx context.Context, qn string) erro
 		return nil
 	}
 	schema, table := splitQualified(qn)
-	facts, err := readTableFacts(ctx, r.db, r.flavor, schema, table)
+	facts, err := readTableFacts(ctx, r.db, r.flavor, schema, table, nil)
 	if err != nil {
 		return fmt.Errorf("mysql: cdc: table %s: read the schema objects the binlog lane does not forward: %w", qn, err)
 	}
@@ -933,7 +948,7 @@ func (r *CDCReader) gradeUnforwardedClasses(ctx context.Context, qn string) erro
 				continue
 			}
 			refSchema, refTable := splitQualified(ref)
-			parent, err := readTableFacts(ctx, r.db, r.flavor, refSchema, refTable)
+			parent, err := readTableFacts(ctx, r.db, r.flavor, refSchema, refTable, nil)
 			if err != nil {
 				return fmt.Errorf("mysql: cdc: table %s: read referenced table %s: %w", qn, ref, err)
 			}

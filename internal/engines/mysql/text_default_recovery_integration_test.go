@@ -137,7 +137,7 @@ func TestTextDefault_SupplementaryChars_OnARealServer(t *testing.T) {
 
 			read := func() *mysqlTableFacts {
 				t.Helper()
-				facts, err := readTableFacts(ctx, db, sv.flavor, schema, "gc37h")
+				facts, err := readTableFacts(ctx, db, sv.flavor, schema, "gc37h", nil)
 				if err != nil {
 					t.Fatal(err)
 				}
