@@ -23,10 +23,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 // TestSupervisor_DefaultPolicyRestartsForever pins the unreachable-terminal
@@ -129,6 +132,54 @@ func TestSupervisor_UnforwardedRefusalIsNotRestarted(t *testing.T) {
 	snap := sup.Snapshot()
 	if len(snap) != 1 || snap[0].State != SyncFailed {
 		t.Errorf("snapshot = %+v; want the sync in state %q", snap, SyncFailed)
+	}
+}
+
+// TestSupervisor_UnforwardedRefusalLogNamesTheRightRepair pins the fleet
+// log's remedy per refusal kind. An interrupted added-column backfill wraps
+// the same sentinel, but its column is already on the target and the repair
+// is the SOURCE's values — "apply the change to the target" is the wrong
+// instruction there (found by the v0.156.1 site-drift pass). The plain
+// refusal is the control, so the branch cannot pass by always printing the
+// backfill text.
+func TestSupervisor_UnforwardedRefusalLogNamesTheRightRepair(t *testing.T) {
+	cases := []struct {
+		name, msg, want, notWant string
+	}{
+		{"plain", "on public.t: a CHECK changed", "apply the change to the target", "copy the added column"},
+		{"backfill", addColumnBackfillIncompleteMarker + ": public.t (c): the backfill stopped early", "copy the added column's values from the source", "apply the change to the target"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			prev := slog.Default()
+			t.Cleanup(func() { slog.SetDefault(prev) })
+			var logBuf logcapture.Buffer
+			slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, nil)))
+
+			sy := SupervisedSync{
+				ID: "refused",
+				Runner: runnerFunc(func(_ context.Context) error {
+					return fmt.Errorf("%w: %s", ir.ErrUnforwardedSchemaChange, tc.msg)
+				}),
+			}
+			policy := RestartPolicy{BackoffBase: time.Millisecond, BackoffCap: 2 * time.Millisecond, HealthyRunThreshold: time.Hour}
+			ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+			defer cancel()
+			_ = NewSupervisor([]SupervisedSync{sy}, policy).Run(ctx)
+
+			var line string
+			for _, l := range strings.Split(logBuf.String(), "\n") {
+				if strings.Contains(l, "not restarting") {
+					line = l
+				}
+			}
+			if line == "" {
+				t.Fatalf("no supervisor refusal line logged; log:\n%s", logBuf.String())
+			}
+			if !strings.Contains(line, tc.want) || strings.Contains(line, tc.notWant) {
+				t.Errorf("refusal line = %q; want it to contain %q and not %q", line, tc.want, tc.notWant)
+			}
+		})
 	}
 }
 
