@@ -47,10 +47,12 @@ package mysql
 // and charset, never a guess.
 //
 // Which charset: on the binlog, the one the value was WRITTEN in, from the
-// TABLE_MAP ([binlogColumnCharsets]) — a replay across a charset DDL refuses
-// rather than decoding old bytes by the new charset. On VStream, the field's
-// collation, which vttablet reports as CURRENT for a replayed row (MEASURED;
-// a stated limitation). A VStream ENUM/SET cell is resolved against the
+// TABLE_MAP ([binlogColumnCharsets]), so a replay across a charset DDL
+// decodes old bytes by the old charset. Where the source records none
+// (MariaDB NO_LOG), and on VStream — whose field collation vttablet reports
+// as CURRENT for a replayed row (MEASURED) — by the catalog, with the
+// charset-DDL guard (charset_ddl_guard.go) refusing a replay when it reaches
+// the DDL. A VStream ENUM/SET cell is resolved against the
 // column's labels, because vttablet sends it in two forms
 // ([resolveVStreamEnumSetText]).
 
@@ -265,9 +267,11 @@ func (cc *columnCharset) decode(b []byte, table, column string) (string, error) 
 
 // charsetRefusalRemedy is the remedy every [errCharsetNotDecodable] refusal
 // ends with. It is convert-THEN-RE-SNAPSHOT, never convert-and-resume: a
-// resume replays binlog history written in the OLD charset, which is exactly
-// what [binlogColumnCharsets] then refuses as a replay mismatch (and, on a
-// source without TABLE_MAP charsets, would decode by the new charset).
+// resume replays history written in the OLD charset — a big5 value that
+// refuses here refuses again on the replay ([binlogColumnCharsets] decodes
+// by the recorded big5), and a source without TABLE_MAP charsets, or
+// VStream, would decode it by the new charset until the charset-DDL guard
+// refuses at the DDL.
 const charsetRefusalRemedy = "To carry it, convert the column to utf8mb4 on the source (ALTER TABLE … MODIFY … CHARACTER SET utf8mb4) " +
 	"and re-snapshot the table (sync --restart-from-scratch), or exclude the table; resuming after the ALTER replays history written in the old charset"
 
@@ -309,8 +313,8 @@ func charsetNameForCollationID(id uint64) string {
 // per-charset uca1400 IDs are listed — its COLLATIONS rows for them have a
 // NULL ID), else information_schema.COLLATIONS (MySQL, where every
 // collation has an ID). A failure returns nil, and naming falls back to the
-// static tables ([charsetNameForCollationID]) — an unnamed ID then decodes
-// by the catalog, the stated limitation.
+// static tables ([charsetNameForCollationID]) — an ID they do not name then
+// refuses, and the load is retried ([CDCReader.collationCharsets]).
 func loadServerCollations(ctx context.Context, db *sql.DB) map[uint64]string {
 	if db == nil {
 		return nil
@@ -349,12 +353,18 @@ func queryCollationIDs(ctx context.Context, db *sql.DB, q string) map[uint64]str
 
 // collationCharsets is the reader's naming function for TABLE_MAP collation
 // IDs: the server's own table first, the static tables second.
+//
+// A failed load is NOT cached (review item 5): it is retried, at most once
+// per [serverCollationsRetry], so a transient failure at startup does not
+// leave a MariaDB MINIMAL source's uca1400 collation IDs unnamed — and every
+// rows event carrying one refused — for the reader's lifetime. Only the reader goroutine calls this, so the fields need no lock.
 func (r *CDCReader) collationCharsets(ctx context.Context) func(uint64) string {
-	r.serverCollationsOnce.Do(func() {
+	if r.serverCollations == nil && time.Since(r.serverCollationsTried) >= serverCollationsRetry {
+		r.serverCollationsTried = time.Now()
 		lctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-		defer cancel()
 		r.serverCollations = loadServerCollations(lctx, r.db)
-	})
+		cancel()
+	}
 	server := r.serverCollations
 	return func(id uint64) string {
 		if cs := server[id]; cs != "" {
@@ -363,6 +373,11 @@ func (r *CDCReader) collationCharsets(ctx context.Context) func(uint64) string {
 		return charsetNameForCollationID(id)
 	}
 }
+
+// serverCollationsRetry bounds how often a failed collation-table load is
+// retried, so a persistent failure costs one query per interval, not one
+// per rows event.
+const serverCollationsRetry = 30 * time.Second
 
 // canonicalCharsetName folds the two spellings of the same charset that
 // the catalog and the collation environment can disagree on.
@@ -386,20 +401,20 @@ func canonicalCharsetName(name string) string {
 // precedes every rows event carries each character column's collation
 // (MySQL: under the default binlog_row_metadata=MINIMAL — measured), so:
 //
-//   - TABLE_MAP names a charset that DIFFERS from the catalog's: the event
-//     was written under a charset the table no longer has. Refuse with the
-//     CDC-4 replay-mismatch class ([errCDCSchemaReplayMismatch]) — the
-//     same remedy, re-snapshot, because no decode of this history is
-//     faithful to the table as it now is.
-//   - TABLE_MAP names the catalog's charset (or the catalog recorded none):
-//     decode by it.
-//   - TABLE_MAP carries no collation for the column, or one sluice cannot
-//     name: fall back to the catalog. This is the LIMITATION, stated: MariaDB
-//     writes no column charsets under its default binlog_row_metadata=NO_LOG
-//     (and MySQL builds that disable the metadata likewise), so on such a
-//     source a charset DDL that ran between the resume position and now is
-//     NOT detected, and replayed values are decoded by the current charset.
-//     Set binlog_row_metadata=MINIMAL (or FULL) on the source to close it.
+//   - TABLE_MAP names a charset sluice can name: decode by it, whatever the
+//     catalog now says. The bytes are in that charset, so the decode is
+//     value-exact across a charset DDL (MEASURED: the three replay cases
+//     above decode to the inserted values on MySQL 8 and MariaDB MINIMAL).
+//   - TABLE_MAP names a collation ID neither the source's collation table
+//     nor sluice's static ones name: refuse with the CDC-4 replay-mismatch
+//     class ([errCDCSchemaReplayMismatch]) — decoding by the catalog would
+//     be a guess exactly where the server said something else.
+//   - TABLE_MAP carries no collations at all (MariaDB's default
+//     binlog_row_metadata=NO_LOG): return nil, decode by the catalog, and
+//     let the charset-DDL guard ([CDCReader.binlogCharsetDDLGuard]) catch a
+//     replay when the stream reaches the DDL. Setting MINIMAL on the source
+//     records charsets only for history written AFTER the change; binlogs
+//     already written stay unrecorded.
 //
 // A nil return means "decode by the catalog" for every column.
 func binlogColumnCharsets(tbl *tableSchema, tm *replication.TableMapEvent, nameOf func(uint64) string) ([]*columnCharset, error) {
@@ -420,17 +435,26 @@ func binlogColumnCharsets(tbl *tableSchema, tm *replication.TableMapEvent, nameO
 			continue
 		}
 		id, ok := collationsByCol[i]
-		recorded := canonicalCharsetName(nameOf(id))
-		if !ok || recorded == "" {
+		if !ok {
 			out[i] = lookupColumnCharset(catalog)
 			continue
 		}
-		if c := canonicalCharsetName(catalog); c != "" && c != recorded {
+		recorded := canonicalCharsetName(nameOf(id))
+		if recorded == "" {
+			// The server stated the charset these bytes were written in and
+			// sluice cannot name it (neither the source's collation table nor
+			// the static ones list the ID): decoding by the catalog would be a
+			// guess exactly where the evidence says it may be wrong.
 			return nil, errCDCSchemaReplayMismatch(tbl, fmt.Sprintf(
-				"column %q was recorded in CHARACTER SET %s but the table now declares %s",
-				col.Name, recorded, c,
+				"column %q was recorded under collation ID %d, which neither the source's collation table nor sluice's names, "+
+					"so the charset its bytes were written in is unknown", col.Name, id,
 			))
 		}
+		// The WRITTEN charset decides, even where the catalog now declares
+		// another (a replay across an ALTER … CHARACTER SET): the bytes are in
+		// the charset the TABLE_MAP names, so decoding by it is value-exact —
+		// including after the CONVERT TO utf8mb4 the CHARSET-NOT-DECODABLE
+		// remedy recommends, which then needs no re-snapshot.
 		out[i] = lookupColumnCharset(recorded)
 	}
 	return out, nil
@@ -497,7 +521,11 @@ func resolveVStreamEnumSetText(field *query.Field, raw []byte) (value string, ok
 	}
 	isMember := func(s string) bool {
 		if kind == "enum" {
-			return member[s]
+			// '' is ENUM index 0, the error value a non-strict INSERT IGNORE
+			// of an invalid label stores; it is a value the column can hold
+			// though no label spells it (review item 2 — refusing it was a
+			// loud regression from v0.156.2, which carried it).
+			return s == "" || member[s]
 		}
 		if s == "" {
 			return true

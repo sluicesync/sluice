@@ -48,17 +48,22 @@ func TestWarnLegacyCharsetIncrement(t *testing.T) {
 		return buf.String()
 	}
 
-	out := run(&irbackup.Manifest{SourceEngine: "mysql", SluiceVersion: "0.156.2", Schema: schema})
+	out := run(&irbackup.Manifest{Kind: irbackup.BackupKindIncremental, SourceEngine: "mysql", SluiceVersion: "0.156.2", Schema: schema})
 	if !strings.Contains(out, LegacyCharsetIncrementMarker) || !strings.Contains(out, "l1 (latin1)") || !strings.Contains(out, "sj (sjis)") {
 		t.Fatalf("pre-fix mysql incremental: log = %q; want the marker naming l1 and sj", out)
+	}
+	if !strings.Contains(out, "U+FFFD") || !strings.Contains(out, "different character") {
+		t.Errorf("the WARN must name both recorded forms (U+FFFD and a different character): %q", out)
 	}
 	if strings.Contains(out, "u8") || strings.Contains(out, "id") {
 		t.Errorf("the WARN named a column the pre-fix stream carried faithfully: %q", out)
 	}
 	for name, m := range map[string]*irbackup.Manifest{
-		"fixed version":   {SourceEngine: "mysql", SluiceVersion: "0.156.3", Schema: schema},
-		"postgres source": {SourceEngine: "postgres", SluiceVersion: "0.156.2", Schema: schema},
-		"no schema":       {SourceEngine: "mysql", SluiceVersion: "0.156.2"},
+		"fixed version":              {Kind: irbackup.BackupKindIncremental, SourceEngine: "mysql", SluiceVersion: "0.156.3", Schema: schema},
+		"postgres source":            {Kind: irbackup.BackupKindIncremental, SourceEngine: "postgres", SluiceVersion: "0.156.2", Schema: schema},
+		"no schema":                  {Kind: irbackup.BackupKindIncremental, SourceEngine: "mysql", SluiceVersion: "0.156.2"},
+		"a full":                     {Kind: irbackup.BackupKindFull, SourceEngine: "mysql", SluiceVersion: "0.156.2", Schema: schema},
+		"legacy empty kind (a full)": {SourceEngine: "mysql", SluiceVersion: "0.156.2", Schema: schema},
 	} {
 		if out := run(m); out != "" {
 			t.Errorf("%s: logged %q; want nothing", name, out)

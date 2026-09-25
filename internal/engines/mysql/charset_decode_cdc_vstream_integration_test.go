@@ -18,10 +18,13 @@ package mysql
 import (
 	"context"
 	"fmt"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 // vstreamUnnamedCharsets are the charsets vttablet tags with collation 0.
@@ -55,65 +58,90 @@ func TestVStream_CDCCharsetDecode(t *testing.T) {
 	cdcCharsetLane(t, mysqlDSN, vstreamUnnamedCharsets, vstreamStart(t, mysqlDSN, grpcEndpoint))
 }
 
-// TestVStream_CDCCharsetDecode_ReplayAcrossCharsetDDLLimitation is the
-// VStream twin of the binlog replay pin (charset_decode_replay_integration_
-// test.go): events recorded in utf8mb4, the column converted to latin1, then
-// a resume from before them.
+// TestVStream_CDCCharsetDDLReplay_GuardRefuses is the VStream twin of the
+// binlog replay pin (charset_decode_replay_integration_test.go): a value
+// recorded in one charset, the column converted, then a resume from before
+// the value.
 //
 // MEASURED on vttestserver: vttablet's FIELD event for the replayed row
-// carries the column's CURRENT collation (latin1), so the value written as
-// utf8mb4 'é' is decoded as latin1 'Ã©', silently. Unlike the binlog's
-// TABLE_MAP, the VStream row event carries no independent statement of the
-// charset it was written in, so sluice cannot detect this. That is the
-// documented LIMITATION (charset_decode.go, migrating-legacy-mysql.md:
-// re-snapshot a table after a charset DDL on a VStream source whenever the
-// stream was behind it). This pin asserts the known-wrong value on purpose:
-// if vttablet starts reporting the historical collation (schema tracking),
-// it fails, and the limitation must be revisited. Whether PlanetScale's
-// vttablets run with schema tracking — which might change this — is an
-// UNVERIFIED PREMISE.
-func TestVStream_CDCCharsetDecode_ReplayAcrossCharsetDDLLimitation(t *testing.T) {
+// carries the column's CURRENT collation, so without a guard the value
+// written as utf8mb4 'é' was decoded as latin1 'Ã©' at exit 0. VStream
+// carries no statement of the written charset, so the charset-DDL guard must
+// refuse (SLUICE-E-CDC-SCHEMA-REPLAY-MISMATCH) when the replay reaches the
+// DDL — for every direction. Rows before the DDL are emitted first; that is
+// the documented window the re-snapshot remedy repairs.
+func TestVStream_CDCCharsetDDLReplay_GuardRefuses(t *testing.T) {
 	mysqlDSN, grpcEndpoint, _, cleanup := startVTTestServer(t)
 	defer cleanup()
-	applyVTTestSQL(t, mysqlDSN, `CREATE TABLE rep (id INT NOT NULL PRIMARY KEY, v VARCHAR(16) CHARACTER SET utf8mb4 NULL)`)
+	dsn := fmt.Sprintf("%s&vstream_endpoint=%s&vstream_transport=plaintext&vstream_auth=none&vstream_shards=0", mysqlDSN, grpcEndpoint)
+	for i, c := range charsetReplayCases {
+		table := fmt.Sprintf("rep%d", i)
+		applyVTTestSQL(t, mysqlDSN, fmt.Sprintf("CREATE TABLE %s (id INT NOT NULL PRIMARY KEY, v VARCHAR(16) CHARACTER SET %s NULL)", table, c.from))
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+
+		drain, _ := vstreamStart(t, mysqlDSN, grpcEndpoint)(ctx)
+		applyVTTestSQL(t, mysqlDSN, fmt.Sprintf("INSERT INTO %s VALUES (1, 'anchor')", table))
+		anchor := drain(1)
+		if len(anchor) != 1 {
+			cancel()
+			t.Fatalf("%s: the anchor row did not stream", c.name)
+		}
+		resumeFrom := anchor[0].Pos()
+
+		applyVTTestSQL(t, mysqlDSN, fmt.Sprintf("INSERT INTO %s VALUES (2, _%s X'%s')", table, c.from, c.valueHex))
+		applyVTTestSQL(t, mysqlDSN, fmt.Sprintf("ALTER TABLE %s MODIFY v VARCHAR(16) CHARACTER SET %s NULL", table, c.to))
+
+		var buf logcapture.Buffer
+		prev := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		rdr, err := Engine{Flavor: FlavorPlanetScale}.OpenCDCReader(ctx, dsn)
+		if err != nil {
+			cancel()
+			t.Fatalf("OpenCDCReader: %v", err)
+		}
+		changes, err := rdr.StreamChanges(ctx, resumeFrom)
+		if err != nil {
+			cancel()
+			t.Fatalf("StreamChanges: %v", err)
+		}
+		// Drain until the stream ends at the refusal (or times out).
+		_ = drainVTTestChanges(t, ctx, changes, 10, 45*time.Second)
+		slog.SetDefault(prev)
+		assertCharsetDDLGuardRefusal(t, c.name, rdr.(*vstreamCDCReader).Err())
+		if warned := strings.Contains(buf.String(), charsetHistoryUnrecordedMarker); warned != (c.to != "utf8mb4") {
+			t.Errorf("%s: %s logged = %v; want %v (current charset %s)", c.name, charsetHistoryUnrecordedMarker, warned, c.to != "utf8mb4", c.to)
+		}
+		_ = rdr.(interface{ Close() error }).Close()
+		cancel()
+	}
+}
+
+// TestVStream_CDCCharsetDDLLive_NoGuardRefusal: the guard's other direction.
+// A stream LIVE across the DDL has cached the pre-DDL collation and must not
+// refuse; rows on both sides decode by the charset they were written in.
+func TestVStream_CDCCharsetDDLLive_NoGuardRefusal(t *testing.T) {
+	mysqlDSN, grpcEndpoint, _, cleanup := startVTTestServer(t)
+	defer cleanup()
+	applyVTTestSQL(t, mysqlDSN, `CREATE TABLE live (id INT NOT NULL PRIMARY KEY, v VARCHAR(16) CHARACTER SET utf8mb4 NULL)`)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
-
-	drain, _ := vstreamStart(t, mysqlDSN, grpcEndpoint)(ctx)
-	applyVTTestSQL(t, mysqlDSN, `INSERT INTO rep VALUES (1, 'anchor')`)
-	anchor := drain(1)
-	if len(anchor) != 1 {
-		t.Fatal("the anchor row did not stream")
+	drain, streamErr := vstreamStart(t, mysqlDSN, grpcEndpoint)(ctx)
+	applyVTTestSQL(t, mysqlDSN, `INSERT INTO live VALUES (1, _utf8mb4 X'C3A9')`)
+	before := drain(1)
+	applyVTTestSQL(t, mysqlDSN, `ALTER TABLE live MODIFY v VARCHAR(16) CHARACTER SET latin1 NULL`)
+	applyVTTestSQL(t, mysqlDSN, `INSERT INTO live VALUES (2, _latin1 X'E9')`)
+	after := drain(1)
+	if err := streamErr(); err != nil {
+		t.Fatalf("live stream across a charset DDL: err = %v; want no refusal", err)
 	}
-	resumeFrom := anchor[0].Pos()
-
-	applyVTTestSQL(t, mysqlDSN, `INSERT INTO rep VALUES (2, _utf8mb4 X'C3A9')`)
-	applyVTTestSQL(t, mysqlDSN, `ALTER TABLE rep MODIFY v VARCHAR(16) CHARACTER SET latin1 NULL`)
-
-	dsn := fmt.Sprintf("%s&vstream_endpoint=%s&vstream_transport=plaintext&vstream_auth=none&vstream_shards=0", mysqlDSN, grpcEndpoint)
-	rdr, err := Engine{Flavor: FlavorPlanetScale}.OpenCDCReader(ctx, dsn)
-	if err != nil {
-		t.Fatalf("OpenCDCReader: %v", err)
-	}
-	defer func() { _ = rdr.(interface{ Close() error }).Close() }()
-	changes, err := rdr.StreamChanges(ctx, resumeFrom)
-	if err != nil {
-		t.Fatalf("StreamChanges: %v", err)
-	}
-	// A VStream position is "before this transaction", so the anchor may
-	// replay too; look for row 2 among what arrives.
-	for _, c := range drainVTTestChanges(t, ctx, changes, 3, 45*time.Second) {
-		ins, ok := c.(ir.Insert)
-		if !ok || fmt.Sprint(ins.Row["id"]) != "2" {
-			continue
+	for _, g := range [][]ir.Change{before, after} {
+		if len(g) != 1 {
+			t.Fatalf("got %d changes around the DDL; want 1 each side", len(g))
 		}
-		if ins.Row["v"] != "Ã©" {
-			t.Fatalf("replayed row 2 v = %q; the documented limitation says %q (utf8mb4 é decoded by the post-DDL latin1) — "+
-				"if this changed, revisit the VStream limitation in charset_decode.go and migrating-legacy-mysql.md", ins.Row["v"], "Ã©")
+		if ins, _ := g[0].(ir.Insert); ins.Row["v"] != "é" {
+			t.Errorf("live row v = %q; want %q", ins.Row["v"], "é")
 		}
-		return
 	}
-	t.Fatalf("row 2 never replayed (stream error: %v)", rdr.(*vstreamCDCReader).Err())
 }
 
 func TestVStream_CDCCharsetDecode_UnnamedCharsetsRefuse(t *testing.T) {

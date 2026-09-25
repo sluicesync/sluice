@@ -1938,6 +1938,16 @@ func verifyBackupScan(ctx context.Context, store irbackup.Store, opts VerifyOpti
 		}
 	}
 
+	// GC-37 (j): the same LEGACY-CHARSET-INCREMENT WARN restore and sync
+	// from-backup log. An incremental a pre-v0.156.3 sluice captured hashes
+	// clean while holding U+FFFD (or a different character) for a non-UTF-8
+	// column's non-ASCII values, so "all chunks OK" alone would say the chain
+	// is sound. A WARN, not a refusal, for the reason restore gives: the
+	// values are not in the chain to recover.
+	for _, rec := range records {
+		migcore.WarnLegacyCharsetIncrement(ctx, "backup verify", rec.Manifest)
+	}
+
 	// The manifest-integrity preflights restore runs, run here from the
 	// SAME LIST (Bug 217, then Bug 218 — found by the v0.104.4 and
 	// v0.104.5 regression cycles asking, twice, whether verify agreed

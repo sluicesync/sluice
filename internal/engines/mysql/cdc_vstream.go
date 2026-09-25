@@ -225,6 +225,10 @@ type vstreamCDCReader struct {
 	// decoding.
 	fields map[string][]*query.Field
 
+	// charsetUnrecordedWarned records the tables CHARSET-HISTORY-UNRECORDED
+	// was already logged for (charset_ddl_guard.go).
+	charsetUnrecordedWarned map[string]bool
+
 	// snapshotSig is the per-table structural fingerprint of the
 	// schema-history version last emitted as an [ir.SchemaSnapshot]
 	// (ADR-0049 Chunk B2). Keyed by the same fieldCacheKey as fields.
@@ -1506,6 +1510,10 @@ func (r *vstreamCDCReader) dispatch(ctx context.Context, ev *binlogdata.VEvent, 
 		}
 		key := fieldCacheKey(fe.GetShard(), fe.GetTableName())
 		r.fields[key] = fe.GetFields()
+		if r.charsetUnrecordedWarned == nil {
+			r.charsetUnrecordedWarned = map[string]bool{}
+		}
+		warnVStreamCharsetUnrecorded(r.charsetUnrecordedWarned, key, fe.GetFields())
 		return r.maybeSnapshotSchema(ctx, fe, out)
 
 	case binlogdata.VEventType_ROW:
@@ -1641,6 +1649,12 @@ func (r *vstreamCDCReader) dispatchDDL(ctx context.Context, ev *binlogdata.VEven
 		// reports.
 	}
 
+	// GC-37 (j): a charset DDL whose new charset the cached FIELD shape
+	// already carries means this stream is replaying rows it decoded by the
+	// post-DDL charset — refuse BEFORE the cache that proves it is dropped.
+	if err := vstreamCharsetDDLGuard(stmt, r.keyspace, r.fields); err != nil {
+		return err
+	}
 	r.invalidateFieldsForDDL(stmt)
 	return nil
 }

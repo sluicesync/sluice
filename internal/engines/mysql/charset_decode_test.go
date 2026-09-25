@@ -58,9 +58,10 @@ func TestDecodeBinlogRow_ConvertsNonUTF8CharsetColumns(t *testing.T) {
 
 // TestBinlogColumnCharsets_WrittenCharsetWins pins review F1 at the unit
 // level: the TABLE_MAP's per-column collation (what the bytes were WRITTEN
-// in) decides the decode, a disagreement with the catalog refuses as a
-// CDC-4 replay mismatch, and an absent TABLE_MAP collation (MariaDB NO_LOG)
-// falls back to the catalog — the stated limitation.
+// in) decides the decode even where the catalog disagrees, an ID nothing
+// names refuses as a CDC-4 replay mismatch, and an absent TABLE_MAP
+// collation (MariaDB NO_LOG) falls back to the catalog, where the
+// charset-DDL guard takes over.
 func TestBinlogColumnCharsets_WrittenCharsetWins(t *testing.T) {
 	tbl := &tableSchema{Schema: "d", Name: "t", Columns: []*ir.Column{
 		{Name: "id", Type: ir.Integer{Width: 32}},
@@ -84,11 +85,15 @@ func TestBinlogColumnCharsets_WrittenCharsetWins(t *testing.T) {
 		t.Fatalf("decode by the written latin1 = %q, %v; want é", row["v"], err)
 	}
 
-	// Written utf8mb4 (255), catalog now latin1: a replay across the DDL.
-	var ce *sluicecode.CodedError
-	if _, err := binlogColumnCharsets(tbl, tm(255), nil); !errors.As(err, &ce) || ce.Code != sluicecode.CodeCDCSchemaReplayMismatch ||
-		!strings.Contains(err.Error(), "utf8mb4") || !strings.Contains(err.Error(), "latin1") {
-		t.Fatalf("replayed utf8mb4 under a latin1 catalog: err = %v; want %s naming both charsets", err, sluicecode.CodeCDCSchemaReplayMismatch)
+	// Written utf8mb4 (255), catalog now latin1 — a replay across the DDL:
+	// review item 4, the WRITTEN charset decides, value-exact, no refusal.
+	cs, err = binlogColumnCharsets(tbl, tm(255), nil)
+	if err != nil {
+		t.Fatalf("replayed utf8mb4 under a latin1 catalog: err = %v; want the written charset used", err)
+	}
+	row, err = decodeBinlogRow([]any{int32(1), "\xC3\xA9"}, tbl.Columns, nil, FlavorVanilla, "t", zeroDateInherit, binlogLabelGuard{}, cs)
+	if err != nil || row["v"] != "é" {
+		t.Fatalf("utf8mb4 C3A9 under a latin1 catalog decoded as %q, %v; want é (the written charset)", row["v"], err)
 	}
 
 	// No TABLE_MAP charsets (MariaDB NO_LOG): fall back to the catalog.
@@ -97,14 +102,23 @@ func TestBinlogColumnCharsets_WrittenCharsetWins(t *testing.T) {
 	}
 
 	// An ID only the server's own table names (MariaDB utf8mb4_uca1400_ai_ci)
-	// still refuses against a latin1 catalog when the resolver names it.
-	if _, err := binlogColumnCharsets(tbl, tm(2304), func(id uint64) string {
+	// decodes by that charset.
+	cs, err = binlogColumnCharsets(tbl, tm(2304), func(id uint64) string {
 		if id == 2304 {
 			return "utf8mb4"
 		}
 		return ""
-	}); !errors.As(err, &ce) {
-		t.Fatalf("a server-named collation: err = %v; want a replay-mismatch refusal", err)
+	})
+	if err != nil || cs[1] != nil { // utf8mb4 is the passthrough (nil converter)
+		t.Fatalf("a server-named utf8mb4 collation: cs=%v err=%v; want the utf8mb4 passthrough", cs, err)
+	}
+
+	// A written collation NO table names: the evidence exists and cannot be
+	// read, so it refuses rather than falling back to the catalog.
+	var ce *sluicecode.CodedError
+	if _, err := binlogColumnCharsets(tbl, tm(9999), func(uint64) string { return "" }); !errors.As(err, &ce) ||
+		ce.Code != sluicecode.CodeCDCSchemaReplayMismatch || !strings.Contains(err.Error(), "9999") {
+		t.Fatalf("an unnameable written collation: err = %v; want %s naming the ID", err, sluicecode.CodeCDCSchemaReplayMismatch)
 	}
 }
 
@@ -188,6 +202,7 @@ func TestDecodeVStreamRow_CharsetByCollation(t *testing.T) {
 		{"ENUM COPY form (stored latin1)", enumCT, []byte{0xE9}, "é"},
 		{"SET CDC form", setCT, []byte("é,x"), []string{"é", "x"}},
 		{"SET COPY form", setCT, []byte{0xE9, ',', 'x'}, []string{"é", "x"}},
+		{"ENUM index 0 ('')", enumCT, []byte{}, ""},
 	} {
 		got, _, err := decodeVStreamRow(row(tc.raw), []*query.Field{tc.field}, "t", zeroDateInherit)
 		if err != nil || fmt.Sprint(got[tc.field.Name]) != fmt.Sprint(tc.want) {

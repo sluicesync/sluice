@@ -793,6 +793,10 @@ type vstreamSnapshotStream struct {
 	// pump both write it; ReadRows never touches it).
 	fields map[string][]*query.Field
 
+	// charsetUnrecordedWarned records the tables CHARSET-HISTORY-UNRECORDED
+	// was already logged for (charset_ddl_guard.go).
+	charsetUnrecordedWarned map[string]bool
+
 	// snapshotSig is the per-table structural fingerprint of the last
 	// ir.SchemaSnapshot emitted on the POST-COPY CDC phase — the
 	// true-delta gate that mirrors [vstreamCDCReader.snapshotSig]
@@ -2014,6 +2018,10 @@ func (s *vstreamSnapshotStream) dispatchCopyEventLocked(ev *binlogdata.VEvent) (
 		}
 		key := fieldCacheKey(fe.GetShard(), fe.GetTableName())
 		s.fields[key] = fe.GetFields()
+		if s.charsetUnrecordedWarned == nil {
+			s.charsetUnrecordedWarned = map[string]bool{}
+		}
+		warnVStreamCharsetUnrecorded(s.charsetUnrecordedWarned, key, fe.GetFields())
 		return false, nil
 
 	case binlogdata.VEventType_ROW:
@@ -2523,6 +2531,10 @@ func (s *vstreamSnapshotStream) dispatchCDCEvent(ctx context.Context, ev *binlog
 		}
 		key := fieldCacheKey(fe.GetShard(), fe.GetTableName())
 		s.fields[key] = fe.GetFields()
+		if s.charsetUnrecordedWarned == nil {
+			s.charsetUnrecordedWarned = map[string]bool{}
+		}
+		warnVStreamCharsetUnrecorded(s.charsetUnrecordedWarned, key, fe.GetFields())
 		// F7c: emit the ADR-0049 SchemaSnapshot boundary on a true-delta
 		// FIELD signature change, exactly as [vstreamCDCReader.dispatch]
 		// does. Without this the cold-start→CDC path silently dropped the
@@ -2799,6 +2811,10 @@ func (s *vstreamSnapshotStream) dispatchCDCDDL(ctx context.Context, ev *binlogda
 	// long-established table tripped the loud floor. These two dispatch
 	// methods are hand-mirrored, and the earlier sweep carried over the
 	// CLASSIFICATION half of the fix but not the RECOVERY half.
+	// GC-37 (j): see [vstreamCDCReader.dispatchDDL] — the same guard.
+	if err := vstreamCharsetDDLGuard(stmt, s.keyspace, s.fields); err != nil {
+		return err
+	}
 	s.invalidateFieldsForDDL(stmt)
 	return nil
 }

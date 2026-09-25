@@ -82,8 +82,12 @@ type CDCReader struct {
 	// collation in [binlogColumnCharsets] — MariaDB 11.4's default
 	// utf8mb4_uca1400_* IDs are in no static table (MEASURED). See
 	// [loadServerCollations].
-	serverCollationsOnce sync.Once
-	serverCollations     map[uint64]string
+	serverCollations      map[uint64]string
+	serverCollationsTried time.Time
+
+	// charsetUnrecordedWarned records the tables CHARSET-HISTORY-UNRECORDED
+	// was already logged for (charset_ddl_guard.go).
+	charsetUnrecordedWarned map[string]bool
 
 	// flavor is the MySQL-family flavor this reader streams from. The
 	// zero value (FlavorVanilla) keeps the MySQL-8 binlog path byte-
@@ -497,6 +501,11 @@ type tableSchema struct {
 	Name       string
 	Columns    []*ir.Column
 	PrimaryKey []string
+
+	// decodedWithoutWrittenCharset is set once a rows event of this table was
+	// decoded with no TABLE_MAP charset (MariaDB NO_LOG): the charset-DDL
+	// replay guard (charset_ddl_guard.go) applies only to such a table.
+	decodedWithoutWrittenCharset bool
 
 	// NativeKinds is parallel to Columns: NativeKinds[i] is the MariaDB
 	// native fixed-width kind of Columns[i] (uuid/inet4/inet6) or
@@ -1374,6 +1383,12 @@ func (r *CDCReader) dispatch(ctx context.Context, ev *replication.BinlogEvent, o
 		// using a stale column list.
 		stmtSchema := string(e.Schema)
 		if stmtSchema == "" || r.databaseInScope(stmtSchema) {
+			// GC-37 (j): a charset DDL whose new charset the cached shape already
+			// carries means this stream is replaying history the cache
+			// misdecoded — refuse BEFORE the cache that proves it is cleared.
+			if err := r.binlogCharsetDDLGuard(string(e.Query), stmtSchema); err != nil {
+				return err
+			}
 			// SLM-1: the cache about to be cleared is the last shape each
 			// decoded table was known by — keep that as the refusal's prev
 			// before it is gone, so the rebuild after this DDL has something
@@ -1660,6 +1675,9 @@ func (r *CDCReader) dispatchRows(
 	cs, err := binlogColumnCharsets(tbl, ev.Table, r.collationCharsets(ctx))
 	if err != nil {
 		return err
+	}
+	if cs == nil {
+		r.noteDecodedWithoutWrittenCharset(tbl)
 	}
 
 	// ADR-0049 Chunk B1: after a DDL invalidated the schema cache,

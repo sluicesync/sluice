@@ -207,3 +207,73 @@ func TestVStream_CopyCharsetDecode_AmbiguousLabelsRefuse(t *testing.T) {
 		t.Fatalf("COPY error = %v; want %s naming the ambiguity", err, charsetNotDecodableMarker)
 	}
 }
+
+// TestVStream_CopyCharsetDecode_EnumIndexZero: MySQL's ENUM index 0 — the
+// empty string an invalid value is stored as under a non-strict insert — is
+// a legal value of every ENUM, listed or not. A latin1 ENUM holding it must
+// COPY and stream through CDC as "", never refuse as "not a member". The
+// expected value is the server's own read of the cell (checked below: ” at
+// index 0).
+func TestVStream_CopyCharsetDecode_EnumIndexZero(t *testing.T) {
+	mysqlDSN, grpcEndpoint, _, cleanup := startVTTestServer(t)
+	defer cleanup()
+	db, err := sql.Open("mysql", mysqlDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	applyVTTestSQL(t, mysqlDSN, `CREATE TABLE ez (id INT NOT NULL PRIMARY KEY, e ENUM('é','b') CHARACTER SET latin1 NULL)`)
+	applyVTTestSQL(t, mysqlDSN, `INSERT IGNORE INTO ez VALUES (1, 'not-a-label')`)
+	applyVTTestSQL(t, mysqlDSN, `INSERT INTO ez VALUES (2, 'é')`)
+	var idx int
+	var val string
+	if err := db.QueryRow(`SELECT e+0, e FROM ez WHERE id = 1`).Scan(&idx, &val); err != nil || idx != 0 || val != "" {
+		t.Fatalf("setup: row 1 is (index %d, %q), err %v; want the index-0 empty string", idx, val, err)
+	}
+	time.Sleep(3 * time.Second)
+	dsn := fmt.Sprintf("%s&vstream_endpoint=%s&vstream_transport=plaintext&vstream_auth=none&vstream_shards=0", mysqlDSN, grpcEndpoint)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	stream, err := Engine{Flavor: FlavorPlanetScale}.OpenSnapshotStreamForTables(ctx, dsn, []string{"ez"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = stream.Close() }()
+	ch, err := stream.Rows.ReadRows(ctx, &ir.Table{Name: "ez", Columns: []*ir.Column{
+		{Name: "id", Type: ir.Integer{Width: 32}}, {Name: "e", Type: ir.Text{}},
+	}, PrimaryKey: &ir.Index{Name: "PRIMARY", Unique: true, Columns: []ir.IndexColumn{{Column: "id"}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"1": "", "2": "é"}
+	seen := 0
+	for r := range ch {
+		seen++
+		if id := fmt.Sprint(r["id"]); r["e"] != want[id] {
+			t.Errorf("COPY row %s e = %#v; want %q", id, r["e"], want[id])
+		}
+	}
+	if err := stream.Rows.Err(); err != nil {
+		t.Fatalf("COPY of an ENUM holding index 0: %v; want it copied as \"\"", err)
+	}
+	if seen != 2 {
+		t.Fatalf("COPY emitted %d rows; want 2", seen)
+	}
+	if err := stream.WaitCopyComplete(ctx); err != nil {
+		t.Fatalf("WaitCopyComplete: %v", err)
+	}
+
+	changes, err := stream.Changes.StreamChanges(ctx, stream.Position)
+	if err != nil {
+		t.Fatalf("StreamChanges: %v", err)
+	}
+	time.Sleep(time.Second)
+	applyVTTestSQL(t, mysqlDSN, `INSERT IGNORE INTO ez VALUES (3, 'not-a-label')`)
+	got := drainVTTestChanges(t, ctx, changes, 1, 45*time.Second)
+	if len(got) != 1 {
+		t.Fatalf("CDC insert of index 0 did not stream (stream error: %v)", stream.Changes.(interface{ Err() error }).Err())
+	}
+	if ins, _ := got[0].(ir.Insert); ins.Row["e"] != "" {
+		t.Errorf("CDC row 3 e = %#v; want \"\"", ins.Row["e"])
+	}
+}
