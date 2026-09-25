@@ -234,7 +234,6 @@ type boundaryBackfill struct {
 	tableName string
 	snap      ir.SchemaSnapshot
 	added     []*ir.Column
-	hint      func(tableName string) string
 	owed      *addedColumnBackfillEntry
 }
 
@@ -262,7 +261,7 @@ func planBoundaryBackfill(
 	if shape.Kind != ShapeKindAddColumn {
 		return nil, nil
 	}
-	b := &boundaryBackfill{bf: bf, tableName: tableName, snap: snap, added: shape.AddedColumns, hint: hint}
+	b := &boundaryBackfill{bf: bf, tableName: tableName, snap: snap, added: shape.AddedColumns}
 	if bf != nil {
 		// Written before the ALTER on the paths that apply it; this is the
 		// write for a Shape A stream that only observed a peer's ALTER, and
@@ -297,7 +296,12 @@ func (b *boundaryBackfill) run(ctx context.Context, out chan<- ir.Change) error 
 		b.bf.ledger.finished(b.owed, err)
 	}
 	if err != nil {
-		return fmt.Errorf("%w. %s", err, b.hint(b.tableName))
+		// Not the caller's generic forward hint ("apply the schema change
+		// yourself, then resume"): the ALTER already landed, the attempt ends
+		// as ADD-COLUMN-BACKFILL-INCOMPLETE, and following that hint leaves
+		// the pre-existing rows wrong (Bug 290, the third Bug 289 surface).
+		return fmt.Errorf("%w. Recovery: this run ends with %s, and a restart refuses until it is acknowledged; %s, then start once with %s set to the fingerprint the refused start prints",
+			err, addColumnBackfillIncompleteMarker, backfillIncompleteRepair, unforwardedRefusalAckFlag)
 	}
 	return nil
 }

@@ -4,6 +4,10 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Fixed
+
+**`sync`: a failed added-column backfill's own ERROR line now names the source-values repair, instead of "apply the schema change yourself, then resume" (Bug 290, loud but misleading).** The third surface of Bug 289's wrong remedy, found by the v0.156.2 regression cycle: v0.156.2 fixed the startup refusal and the fleet supervisor's log, but the backfill failure itself still appended the generic forward recovery hint — drained model, apply the change on the target, restart from the persisted position. The `ALTER` has already landed by then and the attempt ends as `ADD-COLUMN-BACKFILL-INCOMPLETE`, so following that line leaves the rows that predate the `ADD COLUMN` holding the target's fill. It now says the run ends with that refusal and gives the same repair the refusal does — copy the added column's values from the source (or re-copy), then acknowledge the fingerprint — on single-stream forwarding and on the Shape A fan-in alike. Two siblings on the same path were checked and keep the generic hint deliberately: a shape that cannot be classified, and a write-ahead record that cannot be written, both refuse **before** the `ALTER` is applied, so no backfill is owed there. The next restart already refused and led with the right repair on v0.156.2, so no rows were lost to this line alone.
+
 ## [0.156.2] - 2026-09-25
 
 ### Fixed

@@ -164,6 +164,36 @@ func TestRunBackfill_PageErrorReportedThroughErrIsRefused(t *testing.T) {
 	}
 }
 
+// TestBoundaryBackfill_FailureNamesTheSourceRepair pins Bug 290: a failed
+// backfill's own error must not end with the generic forward hint ("apply
+// the schema change yourself, then resume") — the ALTER already landed, the
+// attempt ends as ADD-COLUMN-BACKFILL-INCOMPLETE, and that hint leaves the
+// pre-existing rows wrong. Same repair text as the startup door and the
+// fleet log (Bug 289), so the three cannot disagree.
+func TestBoundaryBackfill_FailureNamesTheSourceRepair(t *testing.T) {
+	cause := errors.New("connection reset mid-page")
+	reader := &pagedBackfillReader{rows: backfillRows(7), failPage: 2, failAfter: 1, failErr: cause}
+	b := &boundaryBackfill{
+		bf:        &schemaForwardBackfill{reader: staticBackfillReader(reader), streamID: "s", batchSize: 3},
+		tableName: "public.t",
+		snap:      backfillTestSnap(),
+		added:     []*ir.Column{{Name: "flag", Type: ir.Text{}}},
+	}
+	err := b.run(context.Background(), make(chan ir.Change, 16))
+	if !errors.Is(err, cause) {
+		t.Fatalf("err = %v; want the page cause surfaced", err)
+	}
+	msg := err.Error()
+	for _, want := range []string{addColumnBackfillIncompleteMarker, backfillIncompleteRepair, unforwardedRefusalAckFlag} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("backfill failure missing %q: %v", want, msg)
+		}
+	}
+	if strings.Contains(msg, forwardRecoveryHint("public.t")) {
+		t.Errorf("backfill failure carries the generic forward hint, which leaves the rows wrong: %v", msg)
+	}
+}
+
 // TestRunBackfill_MissingAddedColumnIsRefused: a source row without the
 // added column is a reader that did not project it; writing NULL for it is
 // the loss the backfill exists to prevent.
