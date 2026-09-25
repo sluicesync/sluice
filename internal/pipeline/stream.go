@@ -1420,6 +1420,18 @@ func (b *BackupStream) runRollover(
 		StopRequested: captured.StopRequested,
 	}
 
+	// A failed capture that is not a cancellation commits nothing: Run either
+	// retries it (a retriable pump error, reopening from the parent) or
+	// returns it, and neither reads out.Manifest. So stop here, before the
+	// schema refresh and the ADD COLUMN fill below — both would read the
+	// source and upload fill chunks for a window that is never committed,
+	// and a failure in either would replace the capture's own error (a
+	// BACKUP-VALUE-NOT-UTF8 refusal, say) with its own. Only a cancelled
+	// window goes on, to the drain-commit.
+	if captureErr != nil && !errors.Is(captureErr, context.Canceled) && !errors.Is(captureErr, context.DeadlineExceeded) {
+		return out, captureErr
+	}
+
 	// Empty rollover handling: when no changes captured AND the
 	// operator hasn't asked to include them, return outcome with
 	// Manifest=nil so the caller skips the manifest write. Applies

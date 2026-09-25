@@ -38,8 +38,12 @@ package blobcodec
 // (`encodeCursorValue` in internal/ir), and it already does so byte-exact.
 
 import (
+	"encoding"
+	"encoding/json"
 	"fmt"
+	"reflect"
 	"strconv"
+	"time"
 	"unicode/utf8"
 
 	"sluicesync.dev/sluice/internal/ir"
@@ -56,15 +60,21 @@ const maxUTF8WalkDepth = 256
 
 // invalidUTF8At reports where v holds a string (or a map key) that is not
 // valid UTF-8: "" for v itself, otherwise a path such as `[2]`, `{"k"}` or
-// `key "k…"`. It covers every shape [encodeValue] writes as JSON text —
-// string, []string, []any and map[string]any, recursively. Byte slices are
-// not text and are carried base64 under the "bytes" envelope, so they are
-// never inspected.
+// `key "k…"`. It must reach every string [encodeValue] can hand to the JSON
+// encoder. The value contract's own shapes are switched on directly: the
+// scalars that hold no text, string, []string, []any and map[string]any.
+// Anything else falls through [encodeValue] to json.Marshal's reflection,
+// so it is walked the same way ([reflectInvalidUTF8]). Byte slices are not
+// text and are carried base64 under the "bytes" envelope, so they are never
+// inspected — which includes a JSON document carried as []byte.
 func invalidUTF8At(v any, depth int) (string, bool) {
 	if depth > maxUTF8WalkDepth {
 		return " (nested deeper than " + strconv.Itoa(maxUTF8WalkDepth) + " levels; not checked)", true
 	}
 	switch x := v.(type) {
+	case nil, bool, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64,
+		float32, float64, []byte, time.Time:
+		return "", false
 	case string:
 		return "", !utf8.ValidString(x)
 	case []string:
@@ -73,12 +83,14 @@ func invalidUTF8At(v any, depth int) (string, bool) {
 				return "[" + strconv.Itoa(i) + "]", true
 			}
 		}
+		return "", false
 	case []any:
 		for i, e := range x {
 			if p, bad := invalidUTF8At(e, depth+1); bad {
 				return "[" + strconv.Itoa(i) + "]" + p, true
 			}
 		}
+		return "", false
 	case map[string]any:
 		for k, e := range x {
 			if !utf8.ValidString(k) {
@@ -86,6 +98,82 @@ func invalidUTF8At(v any, depth int) (string, bool) {
 			}
 			if p, bad := invalidUTF8At(e, depth+1); bad {
 				return fmt.Sprintf("{%q}", k) + p, true
+			}
+		}
+		return "", false
+	}
+	return reflectInvalidUTF8(reflect.ValueOf(v), depth)
+}
+
+// reflectInvalidUTF8 walks a value outside the value contract's shapes,
+// which [encodeValue] hands to json.Marshal unchanged. It mirrors what
+// json.Marshal writes as JSON text: a json.Marshaler's output (so a
+// json.RawMessage's bytes), an encoding.TextMarshaler's text, strings of any
+// named type, and the elements, map keys and values, pointees, interface
+// values and serialised struct fields that hold them. Without it a *string,
+// a map[string]string, a named string type, a struct with a string field or
+// a json.RawMessage all passed and were written as U+FFFD (pre-land review
+// of 230e8153, Gap A).
+func reflectInvalidUTF8(rv reflect.Value, depth int) (string, bool) {
+	if depth > maxUTF8WalkDepth {
+		return " (nested deeper than " + strconv.Itoa(maxUTF8WalkDepth) + " levels; not checked)", true
+	}
+	if !rv.IsValid() {
+		return "", false
+	}
+	if (rv.Kind() == reflect.Pointer || rv.Kind() == reflect.Interface) && rv.IsNil() {
+		return "", false // json.Marshal writes null
+	}
+	if rv.CanInterface() {
+		switch m := rv.Interface().(type) {
+		case json.Marshaler:
+			b, err := m.MarshalJSON()
+			if err != nil {
+				return "", false // json.Marshal fails loudly on its own
+			}
+			return " (as JSON)", !utf8.Valid(b)
+		case encoding.TextMarshaler:
+			b, err := m.MarshalText()
+			if err != nil {
+				return "", false
+			}
+			return " (as text)", !utf8.Valid(b)
+		}
+	}
+	switch rv.Kind() {
+	case reflect.String:
+		return "", !utf8.ValidString(rv.String())
+	case reflect.Pointer, reflect.Interface:
+		return reflectInvalidUTF8(rv.Elem(), depth+1)
+	case reflect.Slice, reflect.Array:
+		if rv.Type().Elem().Kind() == reflect.Uint8 {
+			return "", false // bytes: base64 for a slice, numbers for an array
+		}
+		for i := 0; i < rv.Len(); i++ {
+			if p, bad := reflectInvalidUTF8(rv.Index(i), depth+1); bad {
+				return "[" + strconv.Itoa(i) + "]" + p, true
+			}
+		}
+	case reflect.Map:
+		iter := rv.MapRange()
+		for iter.Next() {
+			k := iter.Key()
+			if p, bad := reflectInvalidUTF8(k, depth+1); bad {
+				return fmt.Sprintf(" key %q%s", fmt.Sprint(k.Interface()), p), true
+			}
+			if p, bad := reflectInvalidUTF8(iter.Value(), depth+1); bad {
+				return fmt.Sprintf("{%q}", fmt.Sprint(k.Interface())) + p, true
+			}
+		}
+	case reflect.Struct:
+		t := rv.Type()
+		for i := 0; i < rv.NumField(); i++ {
+			f := t.Field(i)
+			if (!f.IsExported() && !f.Anonymous) || f.Tag.Get("json") == "-" {
+				continue // json.Marshal does not write it
+			}
+			if p, bad := reflectInvalidUTF8(rv.Field(i), depth+1); bad {
+				return "." + f.Name + p, true
 			}
 		}
 	}
@@ -107,8 +195,11 @@ func refuseNonUTF8Value(column, role string, v any) error {
 	}
 	return &nonUTF8ValueError{msg: fmt.Sprintf("%s: %s holds a string that is not valid UTF-8 (%q); the backup codec is JSON and would "+
 		"silently write each invalid byte as U+FFFD, so the backup would verify and restore a different value. The "+
-		"source value is intact. A text value must reach sluice decoded from its column's character set — this is a "+
-		"reader defect for that source and column type; store the bytes as a binary type instead, or exclude the column",
+		"source value is intact. Either the source holds bytes that are not valid text in a text column (a SQLite TEXT "+
+		"value written from raw bytes, a Postgres SQL_ASCII database, legacy bytes in a MySQL utf8mb4 column) or its "+
+		"reader did not convert them from the column's character set. Repair the value at the source or store it as a "+
+		"binary type (BLOB / bytea); to back up the rest meanwhile, `backup full` can leave the table out "+
+		"(--exclude-table) or null the column (--redact <table>.<column>=null)",
 		nonUTF8ValueMarker, where, truncateForMessage(v))}
 }
 

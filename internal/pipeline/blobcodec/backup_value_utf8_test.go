@@ -5,6 +5,7 @@ package blobcodec
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"io"
 	"reflect"
@@ -186,6 +187,101 @@ func TestBackupCodec_ValidUTF8RoundTrips(t *testing.T) {
 			}
 		})
 	}
+}
+
+// legacyText is a named string type — outside the value contract's
+// switch, so it reaches the reflective walk.
+type legacyText string
+
+// noteStruct is a struct carrying text in an exported field.
+type noteStruct struct{ Note string }
+
+// reflectiveShapes are the Go types outside the value contract that
+// encodeValue hands to json.Marshal unchanged (the pre-land review's Gap A
+// overlay): every one passed the first cut and read back "caf�".
+func reflectiveShapes(bad string) map[string]any {
+	ok := "ok"
+	b := bad
+	return map[string]any{
+		"*string":               &b,
+		"[]*string":             []*string{&ok, &b},
+		"map[string]string":     map[string]string{"k": bad},
+		"map[string]string key": map[string]string{bad: "v"},
+		"map[string]*string":    map[string]*string{"k": &b},
+		"[][]string":            [][]string{{"ok"}, {bad}},
+		"named string type":     legacyText(bad),
+		"struct field":          noteStruct{Note: bad},
+		"json.RawMessage":       json.RawMessage(`"` + bad + `"`),
+	}
+}
+
+// TestBackupCodec_RefusesNonUTF8OutsideTheValueContract grades the
+// reflective walk through both write cores: every non-contract shape ×
+// every invalid family refuses, and the same shape holding valid text
+// is accepted.
+func TestBackupCodec_RefusesNonUTF8OutsideTheValueContract(t *testing.T) {
+	cols := []*ir.Column{{Name: "id"}, {Name: "note"}}
+	pos := ir.Position{Engine: "postgres", Token: "0/10"}
+	write := func(v any) (dataErr, changeErr error) {
+		w, err := NewChunkWriter(&bytes.Buffer{}, []string{"id", "note"}, nil, CodecNone, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		dataErr = w.WriteRow(ir.Row{"id": int64(1), "note": v}, cols)
+		cw, err := NewChangeChunkWriter(&bytes.Buffer{}, nil, CodecNone, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		changeErr = cw.WriteChange(ir.Insert{Position: pos, Schema: "public", Table: "t", Row: ir.Row{"id": int64(1), "note": v}})
+		return dataErr, changeErr
+	}
+	for fam, bad := range invalidUTF8Family {
+		for shape, v := range reflectiveShapes(bad) {
+			t.Run(fam+"/"+shape, func(t *testing.T) {
+				dataErr, changeErr := write(v)
+				assertNonUTF8Refusal(t, dataErr, `"note`)
+				assertNonUTF8Refusal(t, changeErr, `"note`)
+			})
+		}
+	}
+	for shape, v := range reflectiveShapes("café 中 😀") {
+		t.Run("valid/"+shape, func(t *testing.T) {
+			dataErr, changeErr := write(v)
+			if dataErr != nil || changeErr != nil {
+				t.Errorf("valid text in a %s was refused: data=%v change=%v", shape, dataErr, changeErr)
+			}
+		})
+	}
+}
+
+// TestChunkWriter_RefusalIsPerColumnAndCoversTheLegacyCore pins two edges:
+// an invalid value in a later column, after a valid one, is still found and
+// named; and a row the fast encoder declines (a struct value) — which goes
+// to writeRowLegacy — is checked the same way, while the same row with
+// valid text still writes.
+func TestChunkWriter_RefusalIsPerColumnAndCoversTheLegacyCore(t *testing.T) {
+	cols := []*ir.Column{{Name: "a"}, {Name: "b"}, {Name: "c"}}
+	names := []string{"a", "b", "c"}
+	newW := func() *ChunkWriter {
+		w, err := NewChunkWriter(&bytes.Buffer{}, names, nil, CodecNone, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return w
+	}
+
+	err := newW().WriteRow(ir.Row{"a": "fine", "b": int64(1), "c": "caf\xe9"}, cols)
+	assertNonUTF8Refusal(t, err, `"c"`)
+
+	legacyRow := ir.Row{"a": noteStruct{Note: "fine"}, "b": int64(1), "c": "ok"}
+	if _, ok := appendRowJSON(nil, legacyRow, sortedColumnNames(cols)); ok {
+		t.Fatal("fixture: the fast encoder accepted a struct value; this row no longer exercises writeRowLegacy")
+	}
+	if err := newW().WriteRow(legacyRow, cols); err != nil {
+		t.Fatalf("a valid row on the legacy core was refused: %v", err)
+	}
+	legacyRow["c"] = "caf\xe9"
+	assertNonUTF8Refusal(t, newW().WriteRow(legacyRow, cols), `"c"`)
 }
 
 func assertNonUTF8Refusal(t *testing.T, err error, column string) {
