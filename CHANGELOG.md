@@ -4,6 +4,10 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Fixed
+
+**`sync`: a restart refused on `ADD-COLUMN-BACKFILL-INCOMPLETE` now leads with the right repair, instead of "apply the same change to the target" (Bug 289, loud but misleading).** v0.156.1's refusal for an interrupted added-column backfill wraps the same sentinel as `UNFORWARDED-SCHEMA-CHANGE`, and the startup refusal and the fleet supervisor's log both printed that refusal's generic step (1). For this refusal it is the wrong step: the column is already on the target, and the rows that predate the `ADD COLUMN` need the source's values. An operator who followed it and then acknowledged the fingerprint left those rows wrong permanently, with nothing further to report them; the correct repair was present only inside the embedded recorded text. Both surfaces now pick step (1) from the refusal itself through one shared helper — copy the added column's values from the source (or re-copy with `--restart-from-scratch` on the acknowledged start). The engines' own `UNFORWARDED-SCHEMA-CHANGE` messages describe genuine unforwarded changes and are unchanged; `backup stream` records no backfill refusal. **If you acknowledged an `ADD-COLUMN-BACKFILL-INCOMPLETE` on v0.156.1 after applying only a target change,** compare the added column against the source for the rows that predate the `ADD COLUMN` and repair them.
+
 ## [0.156.1] - 2026-09-24
 
 ### Changed

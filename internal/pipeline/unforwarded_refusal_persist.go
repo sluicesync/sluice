@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
@@ -132,6 +133,25 @@ func freshUnforwardedRefusal(err error) bool {
 // syncUnforwardedRefusalRemedy is step (1) of the `sync` remedy.
 const syncUnforwardedRefusalRemedy = "apply the same change to the target yourself"
 
+// backfillIncompleteRepair is step (1) for an [addColumnBackfillIncompleteMarker]
+// refusal, which wraps the same sentinel but whose column is already on the
+// target: its pre-existing rows need the SOURCE's values, and "apply the same
+// change to the target" followed by the acknowledgement would leave them
+// wrong permanently (Bug 289).
+const backfillIncompleteRepair = "copy the added column's values from the source to the target for the rows that predate the ADD COLUMN, keyed by primary key (or re-copy by passing --restart-from-scratch on the acknowledged start)"
+
+// syncUnforwardedRepairFor picks step (1) for a `sync` refusal from its text.
+// Every surface that prints a `sync` remedy for [ir.ErrUnforwardedSchemaChange]
+// goes through it — the startup door and the fleet supervisor — so the two
+// cannot drift apart again. Matched on the marker because a replayed record
+// carries only the recorded text.
+func syncUnforwardedRepairFor(text string) string {
+	if strings.Contains(text, addColumnBackfillIncompleteMarker) {
+		return backfillIncompleteRepair
+	}
+	return syncUnforwardedRefusalRemedy
+}
+
 // phaseRefuseRecordedUnforwardedChange is the startup door: it runs on every
 // attempt that reaches the change-stream dispatch — before any CDC reader
 // opens — and refuses when the stream's control-table row carries a
@@ -174,7 +194,7 @@ func (s *Streamer) phaseRefuseRecordedUnforwardedChange(ctx context.Context, app
 		return &recordedUnforwardedRefusalError{
 			where:      fmt.Sprintf("stream %q, sluice_cdc_state.unforwarded_refusal on the target", streamID),
 			recorded:   recorded,
-			remedy:     syncUnforwardedRefusalRemedy,
+			remedy:     syncUnforwardedRepairFor(recorded),
 			mismatched: s.AcceptUnforwardedSchemaChange,
 		}
 	}

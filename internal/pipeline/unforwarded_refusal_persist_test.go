@@ -123,6 +123,27 @@ func TestStreamerUnforwardedDoor_ZeroValueRefuses(t *testing.T) {
 	}
 }
 
+// TestStreamerUnforwardedDoor_BackfillIncompleteNamesTheSourceRepair pins
+// Bug 289: a replayed ADD-COLUMN-BACKFILL-INCOMPLETE record must lead with
+// the source-values repair, not "apply the same change to the target" — an
+// operator who followed that and acknowledged left the added column's
+// pre-existing rows wrong permanently. The recorded text is what the door
+// sees, so this drives it through the store exactly as a restart does.
+func TestStreamerUnforwardedDoor_BackfillIncompleteNamesTheSourceRepair(t *testing.T) {
+	store := &fakeRefusalStore{msg: "[recorded 2026-09-24T00:00:00Z] UNFORWARDED-SCHEMA-CHANGE: " + addColumnBackfillIncompleteMarker + ": public.t (c): the backfill stopped early", has: true}
+	err := (&Streamer{}).phaseRefuseRecordedUnforwardedChange(context.Background(), store, "s1")
+	if err == nil {
+		t.Fatal("the zero-value Streamer proceeded past a recorded backfill refusal")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "(1) "+backfillIncompleteRepair) {
+		t.Errorf("step (1) is not the source-values repair: %v", msg)
+	}
+	if strings.Contains(msg, "(1) "+syncUnforwardedRefusalRemedy) {
+		t.Errorf("step (1) is the generic apply-to-target remedy, which leaves the rows wrong once acknowledged: %v", msg)
+	}
+}
+
 // TestStreamerUnforwardedDoor_AckClearsAndIsConsumed: the acknowledgement
 // clears the record, lets the start proceed, and is spent — the same
 // Streamer restarted after a new refusal refuses again.

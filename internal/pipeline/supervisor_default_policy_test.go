@@ -146,8 +146,8 @@ func TestSupervisor_UnforwardedRefusalLogNamesTheRightRepair(t *testing.T) {
 	cases := []struct {
 		name, msg, want, notWant string
 	}{
-		{"plain", "on public.t: a CHECK changed", "apply the change to the target", "copy the added column"},
-		{"backfill", addColumnBackfillIncompleteMarker + ": public.t (c): the backfill stopped early", "copy the added column's values from the source", "apply the change to the target"},
+		{"plain", "on public.t: a CHECK changed", syncUnforwardedRefusalRemedy, backfillIncompleteRepair},
+		{"backfill", addColumnBackfillIncompleteMarker + ": public.t (c): the backfill stopped early", backfillIncompleteRepair, syncUnforwardedRefusalRemedy},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

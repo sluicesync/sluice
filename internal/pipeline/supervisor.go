@@ -10,7 +10,6 @@ import (
 	"log/slog"
 	"runtime/debug"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -540,15 +539,9 @@ func (s *Supervisor) superviseOne(ctx context.Context, sy SupervisedSync) {
 			args := make([]any, 0, 4)
 			args = append(args, slog.String("stream_id", sy.ID), slog.String("err", err.Error()))
 			args = append(args, sluicecode.Attrs(err)...)
-			// The repair differs for an interrupted added-column backfill: the
-			// column is already on the target and its pre-existing rows need the
-			// SOURCE's values, so "apply the change to the target" would be the
-			// wrong instruction. Matched on the marker because a replayed record
-			// carries only the recorded text.
-			repair := "apply the change to the target"
-			if strings.Contains(err.Error(), addColumnBackfillIncompleteMarker) {
-				repair = "copy the added column's values from the source to the target for the rows that predate the ADD COLUMN, or plan a re-copy"
-			}
+			// The repair differs for an interrupted added-column backfill; see
+			// [syncUnforwardedRepairFor], shared with the startup door.
+			repair := syncUnforwardedRepairFor(err.Error())
 			slog.ErrorContext(ctx, "supervisor: sync refused an unforwarded schema change; not restarting ("+repair+", then start this leg once outside the fleet with --accept-unforwarded-schema-change set to the fingerprint the refusal prints; the fleet has no acknowledgement key)", args...)
 			s.setState(sy.ID, SyncFailed, err)
 			return
