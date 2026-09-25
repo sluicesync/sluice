@@ -9,6 +9,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -45,14 +46,13 @@ var fdNumfreeValues = []string{
 // It is carried as the LAST row, and graded separately per lane.
 const fdNumfreeOverScale = "0.1234567890123456789012345678901"
 
-// fdNumfreeOverScaleOnMySQL is what a MySQL target holds for it, MEASURED:
-// KNOWN SILENT DEFECT, not introduced by GC-36 and not fixed by it. A
-// strict-mode INSERT rounds excess FRACTIONAL digits into DECIMAL(65,30)
-// with a note, not an error, so the CDC applier lands the rounded value at
-// exit 0 (integer-part overflow, by contrast, is Error 1264). The
-// DECIMAL(65,30) policy's up-front WARN names the limit but no row is
-// refused. Pinned here so a fix — a per-row refusal — turns this red.
-const fdNumfreeOverScaleOnMySQL = "0.12345678901234567890123456789"
+// fdNumfreeOverScaleRefused is what a MySQL target does with it: REFUSE, with
+// the DECIMAL-SCALE-EXCEEDED marker (GC-37 (c)). Before the fix this cell
+// was a pinned known-wrong one: a strict-mode INSERT rounds excess
+// FRACTIONAL digits into DECIMAL(65,30) with a Note, not an error, so the
+// CDC applier landed 0.123456789012345678901234567890 at exit 0 (measured).
+// The empty string is the "refused" expectation to runNumfreeCarryLane.
+const fdNumfreeOverScaleRefused = ""
 
 // TestStreamer_AddColumnForward_UnconstrainedNumeric_CarriesValues_PostgresToPostgres
 // grades the Postgres → Postgres lane: bare NUMERIC on the target.
@@ -80,12 +80,14 @@ func TestStreamer_AddColumnForward_UnconstrainedNumeric_CarriesValues_PostgresTo
 		sourceDSN: src, targetDSN: tgt, src: fdPG, tgt: fdMySQL,
 	}, "SELECT COLUMN_TYPE FROM information_schema.COLUMNS "+
 		"WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'w' AND COLUMN_NAME = 'v'", "decimal(65,30)",
-		fdNumfreeOverScaleOnMySQL)
+		fdNumfreeOverScaleRefused)
 }
 
 // runNumfreeCarryLane forwards `ADD COLUMN v NUMERIC`, carries every
 // fdNumfreeValues row plus the over-scale row, and grades them; wantOverScale
-// is what the target must hold for the over-scale row.
+// is what the target must hold for the over-scale row, or
+// fdNumfreeOverScaleRefused when the stream must STOP on it with the
+// DECIMAL-SCALE-EXCEEDED refusal instead of rounding it.
 func runNumfreeCarryLane(t *testing.T, lane fdLane, typeQuery, wantType, wantOverScale string) {
 	t.Helper()
 	s := fdStartStream(t, lane, lane.sourceDSN, lane.targetDSN, "test-fwd-numfree")
@@ -102,7 +104,26 @@ func runNumfreeCarryLane(t *testing.T, lane fdLane, typeQuery, wantType, wantOve
 		fdExec(t, lane.src, lane.sourceDSN, fmt.Sprintf("INSERT INTO w (id, name, v) VALUES (%d, 'v%d', %s)", fdSeedRows+i+1, i, v))
 	}
 	lastID := fdSeedRows + len(values)
-	s.waitRows(t, "carried values", lastID)
+	refused := wantOverScale == fdNumfreeOverScaleRefused
+	if refused {
+		// The over-scale row stops the stream loudly instead of landing rounded
+		// (GC-37 (c)). The rows before it land unless the applier coalesced them
+		// into the same flush as the refused row (lanes), so the grade below
+		// checks every row that DID land, and that the over-scale one did not.
+		// The refusal may arrive wrapped by the backfill ledger's
+		// ADD-COLUMN-BACKFILL-INCOMPLETE (the attempt ended before its backfill
+		// was confirmed), which names the cause it wraps.
+		select {
+		case err := <-s.runErr:
+			if err == nil || !strings.Contains(err.Error(), "DECIMAL-SCALE-EXCEEDED") {
+				t.Fatalf("%s: over-scale row: stream ended with %v; want the DECIMAL-SCALE-EXCEEDED refusal", lane.name, err)
+			}
+		case <-time.After(90 * time.Second):
+			t.Fatalf("%s: over-scale row: the stream kept running — the row was neither refused nor (necessarily) rounded; want the DECIMAL-SCALE-EXCEEDED refusal", lane.name)
+		}
+	} else {
+		s.waitRows(t, "carried values", lastID)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
@@ -130,18 +151,33 @@ func runNumfreeCarryLane(t *testing.T, lane fdLane, typeQuery, wantType, wantOve
 	}
 	srcVals := read(lane.src, lane.sourceDSN)
 	tgtVals := read(lane.tgt, lane.targetDSN)
-	if len(srcVals) != lastID || len(tgtVals) != lastID {
+	if len(srcVals) != lastID || (!refused && len(tgtVals) != lastID) {
 		t.Fatalf("%s: want %d rows each side; source %d, target %d", lane.name, lastID, len(srcVals), len(tgtVals))
 	}
+	if refused {
+		if _, landed := tgtVals[lastID]; landed {
+			t.Errorf("%s: over-scale row landed as [%s] although the stream refused it", lane.name, tgtVals[lastID])
+		}
+		if len(tgtVals) < fdSeedRows {
+			t.Fatalf("%s: target holds %d rows; the seed rows must be there (anti-vacuity)", lane.name, len(tgtVals))
+		}
+	}
 	for id := 1; id < lastID; id++ {
-		if srcVals[id] != tgtVals[id] {
+		got, landed := tgtVals[id]
+		if refused && (!landed || id <= fdSeedRows) {
+			// A row that did not land was in the refused flush; a pre-existing
+			// row's backfill can be in it too, which the backfill ledger's own
+			// ADD-COLUMN-BACKFILL-INCOMPLETE refusal reports loudly.
+			continue
+		}
+		if srcVals[id] != got {
 			t.Errorf("%s: id=%d: target holds [%s], source [%s] — the carried value did not survive the forwarded column", lane.name, id, tgtVals[id], srcVals[id])
 		}
 	}
 	if srcVals[lastID] != fdNumfreeOverScale {
 		t.Fatalf("%s: source holds [%s] for the over-scale row; want [%s]", lane.name, srcVals[lastID], fdNumfreeOverScale)
 	}
-	if tgtVals[lastID] != wantOverScale {
+	if !refused && tgtVals[lastID] != wantOverScale {
 		t.Errorf("%s: over-scale row: target holds [%s], recorded [%s], source [%s] — the known behaviour changed; if the target now matches the source or the row is refused, update the pin",
 			lane.name, tgtVals[lastID], wantOverScale, srcVals[lastID])
 	}
@@ -150,5 +186,7 @@ func runNumfreeCarryLane(t *testing.T, lane fdLane, typeQuery, wantType, wantOve
 		t.Fatalf("%s: source rendering is not what was written (id=1 [%s], id=%d [%s]) — the grade is not measuring the carried values",
 			lane.name, srcVals[1], fdSeedRows+1, srcVals[fdSeedRows+1])
 	}
-	s.stop(t)
+	if !refused {
+		s.stop(t)
+	}
 }

@@ -119,7 +119,7 @@ func (m mysqlEmitter) emitColumnType(t ir.Type) (string, error) {
 			// loudly by translate.UnconstrainedNumericNoticeError at
 			// both `schema preview` and `migrate` preflight (catalog
 			// Bug 69; mirrors the bigint-unsigned precedent).
-			return "DECIMAL(65,30)", nil
+			return fmt.Sprintf("DECIMAL(%d,%d)", mysqlUnconstrainedDecimalPrecision, mysqlUnconstrainedDecimalScale), nil
 		}
 		if v.Scale < 0 {
 			// PG 15+ negative numeric scale (numeric(p,-s), values rounded
@@ -1064,6 +1064,12 @@ func (m mysqlEmitter) emitColumnDef(tableName string, c *ir.Column) (string, err
 	// translator refuses the same class, so portable-path emission can
 	// never carry one either.
 	if err := refuseBackslashSQLiteDefaultMySQL(c.Name, c.Default); err != nil {
+		return "", err
+	}
+	// GC-37 (c): a DECIMAL DEFAULT literal with fractional digits past the
+	// target scale would be stored ROUNDED (Note 1265) — on CREATE TABLE and
+	// on a forwarded ADD COLUMN alike, both of which emit through here.
+	if err := refuseDecimalDefaultScaleLoss(tableName, c); err != nil {
 		return "", err
 	}
 	// Value-divergence pre-flight (review follow-up to the SEC-1 sweep): a

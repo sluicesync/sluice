@@ -891,7 +891,7 @@ func flattenArgs(batch []ir.Row, table *ir.Table) ([]any, error) {
 // under ANY statement protocol. It fires before the driver ever sees the
 // value; every other branch is infallible.
 func prepareValue(v any, col *ir.Column) (any, error) {
-	if err := refuseUnrepresentableFloat(v, col); err != nil {
+	if err := refuseUnrepresentableValue(v, col); err != nil {
 		return nil, err
 	}
 	if v == nil {
