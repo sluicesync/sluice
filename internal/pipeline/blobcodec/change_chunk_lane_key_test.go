@@ -15,8 +15,10 @@ package blobcodec
 
 import (
 	"bytes"
+	"encoding/json"
 	"hash/fnv"
 	"io"
+	"math"
 	"testing"
 	"time"
 
@@ -149,6 +151,29 @@ func TestCanonicalKeyValue_SurvivesTheBackupRoundTrip(t *testing.T) {
 	}
 }
 
+// TestCanonicalKeyValue_SurvivesThePreservedNumberRoundTrip is the
+// postgres-trigger arm of the round-trip gate: a chain read with
+// [ChangeChunkReader.PreserveNumbers] hands a float key back as a
+// json.Number in encoding/json's rendering ("1.5e-07"), and the same key
+// arrives from the live stream as numeric's plain decimal ("0.00000015").
+// Every float key must keep its canonical bytes across that round trip, or
+// an ADD COLUMN fill's UPDATE (a float64 from the copy reader) and a later
+// change event for the same row take two lanes (2026-09-25 pre-tag review,
+// item 4).
+func TestCanonicalKeyValue_SurvivesThePreservedNumberRoundTrip(t *testing.T) {
+	for _, v := range []any{
+		float64(1.5e-7), float64(1e21), float64(1.5), float64(0.1), float64(123456789.123456789),
+		float64(5e-324), float64(1.7976931348623157e308), float64(-2.5e-300), float64(3), float64(0),
+		json.Number("0.00000015"), json.Number("10.50"), int64(42), "k-42",
+	} {
+		got := readOneInsert(t, ir.Row{"id": v}, true)["id"]
+		if before, after := canonicalKeyBytes(v), canonicalKeyBytes(got); before != after {
+			t.Errorf("%T %v: canonical key bytes %q before the pgtrigger round trip, %q after (read back as %T %v)",
+				v, v, before, after, got, got)
+		}
+	}
+}
+
 // TestCanonicalKeyValue_OneValueOneEncodingAcrossKinds pins the direction
 // that matters (see laneapply.Router.LaneFor): every Go kind a reader may
 // legitimately hand for ONE key value encodes alike, because a row whose
@@ -171,6 +196,21 @@ func TestCanonicalKeyValue_OneValueOneEncodingAcrossKinds(t *testing.T) {
 		{"zero", []any{int64(0), uint64(0), "0", []byte("0")}},
 		{"max int64", []any{int64(9223372036854775807), uint64(9223372036854775807), "9223372036854775807"}},
 		{"text", []any{"k-42", []byte("k-42")}},
+		// A float key, from every producer of it (2026-09-25 pre-tag review
+		// item 4): the copy reader's float64, the postgres-trigger stream's
+		// json.Number (numeric's rendering of float8out — plain decimal),
+		// and the same float after a backup round trip on a pgtrigger chain
+		// (PreserveNumbers hands back json.Number in Go's rendering).
+		{"tiny float", []any{float64(1.5e-7), json.Number("0.00000015"), json.Number("1.5e-07"), json.Number("1.5e-7")}},
+		{"huge float", []any{float64(1e21), json.Number("1000000000000000000000"), json.Number("1e+21")}},
+		{"plain float", []any{float64(1.5), json.Number("1.5"), "1.5"}},
+		// An integral float: the stream normalises it to int64.
+		{"integral float", []any{float64(3), int64(3), json.Number("3")}},
+		{"zero float", []any{float64(0), math.Copysign(0, -1), int64(0)}},
+		// A numeric key: the copy reader's string and the stream's
+		// json.Number render the stored scale alike — trailing zeros kept.
+		{"numeric scale", []any{"10.50", json.Number("10.50"), []byte("10.50")}},
+		{"float32", []any{float32(0.1), json.Number("0.1")}},
 	} {
 		want := canonicalKeyBytes(group.kinds[0])
 		for _, v := range group.kinds[1:] {
@@ -199,7 +239,7 @@ func TestCanonicalKeyValue_DistinctValuesStayDistinct(t *testing.T) {
 		{"string 1a", "1a"},
 		{"bool", true},
 		{"nil", nil},
-		{"float64", float64(1)},
+		{"float64 1.5", float64(1.5)},
 	} {
 		got := canonicalKeyBytes(tc.v)
 		if prev, dup := seen[got]; dup {

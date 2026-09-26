@@ -34,6 +34,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"strings"
 
 	"sluicesync.dev/sluice/internal/crypto"
 	"sluicesync.dev/sluice/internal/ir"
@@ -81,6 +82,10 @@ type ChangeChunkWriter struct {
 	// Manifest, NOT the per-row JSONL stream (they have no row payload,
 	// and the change-chunk codec dispatches on the row-shaped kinds).
 	snapshots []ir.SchemaSnapshot
+
+	// carriedExactNumber records that a change this chunk encoded carried a
+	// [json.Number] at any depth (see [ChangeChunkWriter.CarriedExactNumber]).
+	carriedExactNumber bool
 }
 
 // NewChangeChunkWriter wraps out (typically a pipe-buffer destined
@@ -161,6 +166,9 @@ func (w *ChangeChunkWriter) WriteChange(c ir.Change) error {
 	if s, ok := c.(ir.SchemaSnapshot); ok {
 		w.snapshots = append(w.snapshots, s)
 		return nil
+	}
+	if !w.carriedExactNumber {
+		w.carriedExactNumber = changeCarriesJSONNumber(c)
 	}
 	wire, err := encodeChange(c)
 	if err != nil {
@@ -403,6 +411,90 @@ func (r *ChangeChunkReader) PreserveNumbers() { r.preserveNumbers = true }
 // float column, as the live path requires.
 func NumbersArePreserved(sourceEngine string) bool {
 	return sourceEngine == PreservedNumberEngine
+}
+
+// CarriedExactNumber reports whether any change this writer encoded carried
+// a [json.Number] — at the top level of a row image or inside a list or map
+// value. It is what the capture lanes read to stamp their segment
+// [irbackup.FormatVersionExactNumbers], so an older binary, whose reader
+// would round the number through a float64, refuses the segment instead.
+func (w *ChangeChunkWriter) CarriedExactNumber() bool { return w.carriedExactNumber }
+
+// changeCarriesJSONNumber reports whether a row-bearing change holds a
+// [json.Number] anywhere in its images.
+func changeCarriesJSONNumber(c ir.Change) bool {
+	switch x := c.(type) {
+	case ir.Insert:
+		return rowCarriesJSONNumber(x.Row)
+	case ir.Update:
+		return rowCarriesJSONNumber(x.Before) || rowCarriesJSONNumber(x.After)
+	case ir.Delete:
+		return rowCarriesJSONNumber(x.Before)
+	}
+	return false
+}
+
+func rowCarriesJSONNumber(r ir.Row) bool {
+	for _, v := range r {
+		if valueCarriesJSONNumber(v) {
+			return true
+		}
+	}
+	return false
+}
+
+// valueCarriesJSONNumber walks exactly the containers [encodeValue] walks
+// (and the natural JSON structures a reader may hand over): a json.Number
+// anywhere below them is an exact-text number in the chunk — unless a
+// float64 carries it exactly (see [float64RoundTripsExactly]), in which
+// case a pre-v0.156.4 reader restores it byte-for-byte and stamping the
+// segment would lock older binaries out of it for nothing. That exemption
+// is what keeps the common shape — a jsonb column holding small integers,
+// which the reader leaves as json.Number inside the object — readable
+// everywhere.
+func valueCarriesJSONNumber(v any) bool {
+	switch x := v.(type) {
+	case json.Number:
+		return !float64RoundTripsExactly(x)
+	case []any:
+		for _, e := range x {
+			if valueCarriesJSONNumber(e) {
+				return true
+			}
+		}
+	case map[string]any:
+		for _, e := range x {
+			if valueCarriesJSONNumber(e) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// maxExactIntegerDigits bounds the integers [float64RoundTripsExactly]
+// accepts: every integer of at most 15 digits is below 2^53, so float64
+// holds it exactly, and encoding/json renders an integral float64 below
+// 1e21 as its plain digits — the same text the chunk carried.
+const maxExactIntegerDigits = 15
+
+// float64RoundTripsExactly reports whether an older reader's float64
+// decode of n renders back to n's exact text: a plain integer (optional
+// '-', no leading zero, at most [maxExactIntegerDigits] digits). "-0" is
+// excluded — float64 keeps the sign but the reader that produced n kept
+// it as text on purpose. Anything with a point or an exponent is not
+// exempt, whatever its value: that is the class the tier exists for.
+func float64RoundTripsExactly(n json.Number) bool {
+	s := strings.TrimPrefix(n.String(), "-")
+	if s == "" || len(s) > maxExactIntegerDigits || (s[0] == '0' && (len(s) > 1 || n.String() != "0")) {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // PreservedNumberEngine is the one source engine whose change chunks are

@@ -147,9 +147,16 @@ func TestChooseFormatVersion_Bug116(t *testing.T) {
 // chunk-binding contracts, this test catches the regression at build
 // time.
 func TestBackupFormatVersion_Bumped(t *testing.T) {
-	if BackupFormatVersion != FormatVersionPositionlessFull {
-		t.Errorf("BackupFormatVersion = %d; want FormatVersionPositionlessFull=%d (current ceiling)",
-			BackupFormatVersion, FormatVersionPositionlessFull)
+	if BackupFormatVersion != FormatVersionExactNumbers {
+		t.Errorf("BackupFormatVersion = %d; want FormatVersionExactNumbers=%d (current ceiling)",
+			BackupFormatVersion, FormatVersionExactNumbers)
+	}
+	// Above the positionless tier: a 12-stamped segment keeps every lower
+	// `>=` fold, and the AAD encoding does not change between 11 and 12
+	// (which is what makes the mid-capture stamp safe for sealed chunks).
+	if FormatVersionExactNumbers <= FormatVersionPositionlessFull {
+		t.Errorf("FormatVersionExactNumbers (%d) must be strictly greater than FormatVersionPositionlessFull (%d)",
+			FormatVersionExactNumbers, FormatVersionPositionlessFull)
 	}
 	// The ladder is strictly ascending — the AAD gates are `>=` comparisons,
 	// so a reordered constant would silently reroute a whole tier's chunks

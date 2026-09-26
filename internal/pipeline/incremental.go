@@ -1185,6 +1185,7 @@ func (b *IncrementalBackup) captureWindow(
 		if err := writer.Close(); err != nil {
 			return fmt.Errorf("close chunk: %w", err)
 		}
+		stampExactNumbersOnSeal(manifest, writer)
 		path := changeChunkPath(runNamespace, chunkIdx)
 		hash := writer.Hash()
 		if err := b.segStore.Put(ctx, path, buf); err != nil {

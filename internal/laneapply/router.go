@@ -4,10 +4,13 @@
 package laneapply
 
 import (
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"io"
+	"math"
 	"strconv"
+	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -242,6 +245,22 @@ func WriteCanonicalKeyValue(h io.Writer, v any) {
 	case []byte:
 		_, _ = h.Write([]byte{'s'})
 		_, _ = h.Write(t)
+	case json.Number:
+		writeByteString(h, plainDecimal(t.String()))
+	case float64:
+		if s, ok := floatKeyText(t, 64); ok {
+			writeByteString(h, s)
+			return
+		}
+		_, _ = h.Write([]byte{'?'})
+		_, _ = fmt.Fprintf(h, "%v", t)
+	case float32:
+		if s, ok := floatKeyText(float64(t), 32); ok {
+			writeByteString(h, s)
+			return
+		}
+		_, _ = h.Write([]byte{'?'})
+		_, _ = fmt.Fprintf(h, "%v", t)
 	case bool:
 		if t {
 			_, _ = h.Write([]byte{'B', '1'})
@@ -255,6 +274,89 @@ func WriteCanonicalKeyValue(h io.Writer, v any) {
 		_, _ = h.Write([]byte{'?'})
 		_, _ = fmt.Fprintf(h, "%v", t)
 	}
+}
+
+// floatKeyText renders a finite float as the text a Postgres change stream
+// carries for the same key — its shortest round-trip digits, written as a
+// plain decimal ([plainDecimal]) — so a float key read by the copy reader
+// (float64) and the same key from the postgres-trigger stream (a
+// json.Number holding numeric's rendering of float8out, e.g. "0.00000015"
+// for 1.5e-07, or an int64 for an integral value) take ONE lane. A zero of
+// either sign renders "0" (numeric has no negative zero, and the stream's
+// integral zero is int64 0). ok is false for NaN/±Inf, which keep the
+// generic '?' fallback.
+//
+// bits is the float's own width: a float32 renders its shortest float32
+// digits, matching float4out. A real widened to float64 before it reaches
+// here (the value contract widens single precision) renders its float64
+// digits instead — a KNOWN RESIDUAL for a `real` primary key, which splits
+// against the stream's float4 rendering exactly as it did before this arm
+// existed.
+func floatKeyText(f float64, bits int) (string, bool) {
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return "", false
+	}
+	if f == 0 {
+		return "0", true
+	}
+	return plainDecimal(strconv.FormatFloat(f, 'g', -1, bits)), true
+}
+
+// maxKeyExponent bounds [plainDecimal]'s expansion: a float64's exponent
+// never exceeds ±324, and a key past this is rendered as written rather
+// than expanded into an arbitrarily long string.
+const maxKeyExponent = 1100
+
+// plainDecimal rewrites a decimal number written with an exponent as the
+// plain decimal Postgres's numeric type renders for the same text — every
+// mantissa digit kept, the point moved, zeros padded — so "1.5e-07"
+// becomes "0.00000015" and "1e+21" becomes "1000000000000000000000".
+// Text without an exponent is returned UNCHANGED, trailing zeros and all,
+// which is what keeps a numeric key's copy-read string ("1.50") and its
+// change-stream json.Number ("1.50") on one lane, and every integer on
+// exactly the encoding it had before. Anything that is not a plain signed
+// decimal, or whose exponent is past [maxKeyExponent], is returned as
+// written: deterministic, and only ever an aliasing question.
+func plainDecimal(s string) string {
+	e := strings.IndexAny(s, "eE")
+	if e < 0 {
+		return s
+	}
+	mant, expText := s[:e], s[e+1:]
+	exp, err := strconv.Atoi(expText)
+	if err != nil || exp > maxKeyExponent || exp < -maxKeyExponent {
+		return s
+	}
+	sign := ""
+	if strings.HasPrefix(mant, "-") || strings.HasPrefix(mant, "+") {
+		if mant[0] == '-' {
+			sign = "-"
+		}
+		mant = mant[1:]
+	}
+	intPart, fracPart, _ := strings.Cut(mant, ".")
+	if intPart == "" && fracPart == "" || strings.Trim(intPart+fracPart, "0123456789") != "" {
+		return s
+	}
+	digits := intPart + fracPart
+	point := len(intPart) + exp // position of the decimal point within digits
+	var whole, frac string
+	switch {
+	case point <= 0:
+		whole, frac = "0", strings.Repeat("0", -point)+digits
+	case point >= len(digits):
+		whole, frac = digits+strings.Repeat("0", point-len(digits)), ""
+	default:
+		whole, frac = digits[:point], digits[point:]
+	}
+	whole = strings.TrimLeft(whole, "0")
+	if whole == "" {
+		whole = "0"
+	}
+	if frac == "" {
+		return sign + whole
+	}
+	return sign + whole + "." + frac
 }
 
 // writeByteString writes the byte-string arm of [WriteCanonicalKeyValue].

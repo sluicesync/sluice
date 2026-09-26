@@ -418,8 +418,12 @@ func xvTopFormatFlags() []string {
 // Version 11 is the first such tier: it is stamped by the SHAPE of the
 // source (a full that finalizes without a CDC position on a source whose
 // reader resumes from one), and a Postgres primary always records an LSN.
+//
+// Version 12 is the second: it is stamped on a postgres-trigger CDC
+// SEGMENT whose chunks carried an exact-text number — never on a full.
 var xvShapeStampedTiers = map[int]string{
 	irbackup.FormatVersionPositionlessFull: "TestBackup_CrossVersionPositionlessFull (internal/pipeline/backup)",
+	irbackup.FormatVersionExactNumbers:     "TestBackup_CrossVersionExactNumbers (internal/pipeline)",
 }
 
 // xvBackupFullTopFormat writes a full stamped at the current top format

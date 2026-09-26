@@ -260,7 +260,11 @@ import (
 // position, every incremental, and every CDC-less full (no change
 // stream exists that any binary could extend it with) keep their
 // feature-minimum version.
-const BackupFormatVersion = 11
+//
+// v0.156.4 introduces FormatVersion=12 for a postgres-trigger CDC segment
+// whose change chunks carry an EXACT-TEXT number — see
+// [FormatVersionExactNumbers].
+const BackupFormatVersion = 12
 
 // FormatVersionLegacy / FormatVersionSecurityMetadata name the
 // historically-recorded values so callers don't sprinkle bare ints
@@ -434,7 +438,52 @@ const (
 	// positionless full at an OLDER recorded version is one a pre-bump
 	// binary wrote — exactly what the reader refusal still exists for.
 	FormatVersionPositionlessFull = 11
+
+	// FormatVersionExactNumbers marks a CDC segment (incremental /
+	// streaming) from a postgres-trigger source whose change chunks carry
+	// at least one number as its EXACT source text — the reader's
+	// json.Number for a numeric, a numeric[] element or a jsonb leaf
+	// (v0.156.4+). The chunk bytes were always exact; what lost the digits
+	// was the READER, which decoded every bare JSON number as a float64
+	// (`123456789012345678.123456789012` restored as `123456789012345680`,
+	// `10.50` as `10.5`, `1e-400` as `0`). v0.156.4 reads a
+	// postgres-trigger chain's numbers exactly — and an older binary,
+	// ignoring nothing it could see, still restores, brokers or
+	// smart-compacts such a segment through the float64 path at exit 0,
+	// and compaction writes the rounding into the chunk bytes for good.
+	// The Bug-116 class with the lost thing being PRECISION: the bump makes
+	// every pre-v0.156.4 reader refuse the manifest at its own ceiling.
+	//
+	// Proportional: stamped by [StampExactNumbers] only on an incremental
+	// whose writer actually encoded such a number; every other segment,
+	// every full (a postgres-trigger full reads through the delegated
+	// postgres row reader, which delivers numerics as strings) and every
+	// other engine's chain keep their feature-minimum version. A segment
+	// written by an older binary is NOT restamped — it carries no stamp,
+	// and a v0.156.4+ reader still reads its numbers exactly (the reader
+	// rule keys on the source engine, not on this version).
+	//
+	// Above the positionless tier so a 12-stamped manifest keeps every
+	// lower `>=` fold (CDC position at 8, injective AAD at 9, redaction at
+	// 10); none of those change between 11 and 12, which is also why
+	// raising a segment to 12 mid-capture never changes an already-sealed
+	// chunk's AAD encoding.
+	FormatVersionExactNumbers = 12
 )
+
+// StampExactNumbers raises m.FormatVersion to [FormatVersionExactNumbers]
+// when carried is true and m is a CDC segment (incremental). carried is the
+// writer's report that a chunk of this segment encoded an exact-text
+// number AND the segment's source reads back exactly (the caller decides
+// both: this package names no engine). Idempotent; a no-op for a full and
+// when carried is false. MUST run before [ComputeBackupID] — the id folds
+// on the recorded version (8+ and 10+ folds apply to a 12-stamped
+// manifest), so stamping after the id would leave the two disagreeing.
+func StampExactNumbers(m *Manifest, carried bool) {
+	if m != nil && carried && canonicalKind(m.Kind) == BackupKindIncremental {
+		m.FormatVersion = max(m.FormatVersion, FormatVersionExactNumbers)
+	}
+}
 
 // StampCDCPositionBinding raises m.FormatVersion to
 // [FormatVersionCDCPositionBinding] when the manifest carries
@@ -573,6 +622,7 @@ var minimumReaderVersion = map[int]string{
 	FormatVersionInjectiveChunkAAD:     "v0.104.0",
 	FormatVersionRedaction:             "v0.144.0",
 	FormatVersionPositionlessFull:      "v0.154.0",
+	FormatVersionExactNumbers:          "v0.156.4",
 }
 
 // MinimumReaderVersion names the earliest sluice release that can read a

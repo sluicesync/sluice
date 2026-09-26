@@ -540,7 +540,12 @@ jobs:
   # which pins the one tier no `backup full` flag can reach — it is stamped
   # by the SHAPE of the source (a MySQL server with its binary log off), so
   # it boots its own mysql:8.0 containers rather than the PG image below.
-  # Both guards count 2 accordingly; a third suite bumps them again.
+  # THREE since the FormatVersion-12 bump (2026-09-25): internal/pipeline's
+  # TestBackup_CrossVersionExactNumbers pins the exact-numbers tier, stamped
+  # only on a postgres-trigger segment that carried an exact-text number.
+  # Each tier suite runs against its OWN below-tier binary
+  # (CROSSVER_BELOW_<NAME>_*), so the next bump does not strand them.
+  # Both guards count 3 accordingly; a fourth suite bumps them again.
   crossversion:
     name: Cross-version backup compat
     if: ${{ github.event_name == 'schedule' || github.event.inputs.suite == 'all' || github.event.inputs.suite == 'crossversion' }}
@@ -571,8 +576,8 @@ jobs:
       - name: Assert the -run filter matches the suite (vacuous-green guard)
         run: |
           matched=$(go test -tags='integration crossversion' -list '^TestBackup_CrossVersion' ./internal/pipeline/ ./internal/pipeline/backup/ | grep -c '^Test' || true)
-          if [ "$matched" -ne 2 ]; then
-            echo "::error::crossversion: -run filter matches ${matched} top-level tests, expected 2 (chain-compat + positionless-full). A rename emptied the filter or a cross-version test joined/left the leg — update the filter, this guard, and scripts/check-run-filter-coverage.sh together."
+          if [ "$matched" -ne 3 ]; then
+            echo "::error::crossversion: -run filter matches ${matched} top-level tests, expected 3 (chain-compat + positionless-full + exact-numbers). A rename emptied the filter or a cross-version test joined/left the leg — update the filter, this guard, and scripts/check-run-filter-coverage.sh together."
             exit 1
           fi
 
@@ -597,8 +602,8 @@ jobs:
           # runs fails the parent by name — so this outer check is
           # specifically for the case where a whole suite silently didn't.)
           passed=$(grep -c '^--- PASS: TestBackup_CrossVersion' crossversion.out || true)
-          if [ "$passed" -ne 2 ]; then
-            echo "::error::crossversion: ${passed} top-level tests PASSed, expected 2 — a suite was skipped or didn't run (vacuous green). See the run log."
+          if [ "$passed" -ne 3 ]; then
+            echo "::error::crossversion: ${passed} top-level tests PASSed, expected 3 — a suite was skipped or didn't run (vacuous green). See the run log."
             exit 1
           fi
 

@@ -8,13 +8,17 @@ package pipeline
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
+	"math/big"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/engines/pgtrigger"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
@@ -32,13 +36,21 @@ var pgTriggerNumericCells = []struct {
 	f4 string // real
 	na string // numeric[]
 	js string // jsonb
+	fa string // double precision[]
 }{
-	{101, "123456789012345678.123456789012", "123456789012345678.123456789012", "1.5", "1.25", "{1.1,22222222222222222222.2}", `{"big": 12345678901234567890, "dec": 0.1234567890123456789012345678901234567890}`},
-	{102, "0.1234567890123456789012345678901234567890", "0.123456789012", "0.1", "0.1", "{{1.5,2.25},{-3.125,NULL}}", `{"n": [1.0, 2.50, 9007199254740993]}`},
-	{103, "-98765432109876543210.5", "-12345678901234567890.5", "-2.5e-300", "3.4e38", "{0.000000000000000000001}", `{"neg": -0.0000000000000000001}`},
-	{104, "1.500000", "1.500000000000", "123456789.123456789", "1", "{}", `{"zero": 0, "t": 1.500}`},
-	{105, "12345678901234567890", "12345678901234567890", "9007199254740993", "16777217", "{12345678901234567890}", `{"i": 9223372036854775808}`},
-	{106, "NaN", "0", "NaN", "Infinity", "{NaN}", `{"s": "1.5"}`},
+	{101, "123456789012345678.123456789012", "123456789012345678.123456789012", "1.5", "1.25", "{1.1,22222222222222222222.2}", `{"big": 12345678901234567890, "dec": 0.1234567890123456789012345678901234567890}`, "{1.5,2.25}"},
+	{102, "0.1234567890123456789012345678901234567890", "0.123456789012", "0.1", "0.1", "{{1.5,2.25},{-3.125,NULL}}", `{"n": [1.0, 2.50, 9007199254740993]}`, "{{0.1,NULL},{1.5e-7,1e21}}"},
+	{103, "-98765432109876543210.5", "-12345678901234567890.5", "-2.5e-300", "3.4e38", "{0.000000000000000000001}", `{"neg": -0.0000000000000000001}`, "{-2.5e-300}"},
+	{104, "1.500000", "1.500000000000", "123456789.123456789", "1", "{}", `{"zero": 0, "t": 1.500}`, "{}"},
+	{105, "12345678901234567890", "12345678901234567890", "9007199254740993", "16777217", "{12345678901234567890}", `{"i": 9223372036854775808}`, "{9007199254740993}"},
+	{106, "NaN", "0", "NaN", "Infinity", "{NaN}", `{"s": "1.5"}`, "{NaN,Infinity}"},
+	// Below the smallest float64 (1e-400 → the float64 decode returned 0,
+	// nil — silently), a trailing-zero scale on an UNCONSTRAINED numeric
+	// (10.50 → 10.5), and a subnormal-range magnitude (1.234567e-320, where a
+	// float64 keeps only a few significant digits).
+	{107, "1e-400", "0", "1.234567e-320", "1.5e-7", "{1e-400,10.50}", `{"u": 1e-400, "t": 10.50}`, "{5e-324,NULL}"},
+	{108, "10.50", "10.500000000000", "1e21", "1.4e-45", "{1.234567e-320}", `{"sub": 1.234567e-320}`, "{1.234567e-320}"},
+	{109, "1.234567e-320", "0.000000000001", "5e-324", "3.4028235e38", "{10.50,1.500}", `{"z": 0.0}`, "{0.1,123456789.123456789}"},
 }
 
 // TestBackupChain_PGTrigger_NumericValuesRestoreExactly pins that a
@@ -54,14 +66,14 @@ func TestBackupChain_PGTrigger_NumericValuesRestoreExactly(t *testing.T) {
 		CREATE TABLE nums (
 			id BIGINT PRIMARY KEY,
 			nu NUMERIC, np NUMERIC(38,12), f8 DOUBLE PRECISION, f4 REAL,
-			na NUMERIC[], js JSONB
+			na NUMERIC[], js JSONB, fa DOUBLE PRECISION[]
 		);
-		INSERT INTO nums (id, nu, np, f8, f4, na, js) VALUES (1, 1, 1, 1, 1, '{1}', '{"seed": 1}');
+		INSERT INTO nums (id, nu, np, f8, f4, na, js, fa) VALUES (1, 1, 1, 1, 1, '{1}', '{"seed": 1}', '{1}');
 		-- Written BEFORE the full: graded through the full's data chunks
 		-- (the delegated postgres row reader), a different path.
-		INSERT INTO nums (id, nu, np, f8, f4, na, js) VALUES (2,
+		INSERT INTO nums (id, nu, np, f8, f4, na, js, fa) VALUES (2,
 			'98765432109876543210.123456789012345678901234567890', '-123456789012345678.123456789012',
-			'0.1', '0.1', '{1.10,2.200}', '{"big": 12345678901234567890}');
+			'0.1', '0.1', '{1.10,2.200}', '{"big": 12345678901234567890}', '{0.1,1.5e-7}');
 	`)
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
@@ -81,17 +93,22 @@ func TestBackupChain_PGTrigger_NumericValuesRestoreExactly(t *testing.T) {
 	// too. MaxChanges below counts exactly these.
 	for _, c := range pgTriggerNumericCells {
 		applyDDL(t, sourceDSN, fmt.Sprintf(
-			`INSERT INTO nums (id, nu, np, f8, f4, na, js) VALUES (%d, '%s', '%s', '%s', '%s', '%s', '%s');`,
-			c.id, c.nu, c.np, c.f8, c.f4, c.na, c.js,
+			`INSERT INTO nums (id, nu, np, f8, f4, na, js, fa) VALUES (%d, '%s', '%s', '%s', '%s', '%s', '%s', '%s');`,
+			c.id, c.nu, c.np, c.f8, c.f4, c.na, c.js, c.fa,
 		))
 	}
 	c0 := pgTriggerNumericCells[0]
 	applyDDL(t, sourceDSN, fmt.Sprintf(
-		`UPDATE nums SET nu = '%s', np = '%s', f8 = '%s', f4 = '%s', na = '%s', js = '%s' WHERE id = 1;`,
-		c0.nu, c0.np, c0.f8, c0.f4, c0.na, c0.js,
+		`UPDATE nums SET nu = '%s', np = '%s', f8 = '%s', f4 = '%s', na = '%s', js = '%s', fa = '%s' WHERE id = 1;`,
+		c0.nu, c0.np, c0.f8, c0.f4, c0.na, c0.js, c0.fa,
 	))
 
 	runTriggerChainIncrementalAndRestoreN(ctx, t, src, sourceDSN, store, "postgres", targetDSN, len(pgTriggerNumericCells)+1)
+	if got := incrementalFormatVersions(ctx, t, store); len(got) != 1 || got[0] != irbackup.FormatVersionExactNumbers {
+		t.Errorf("incremental format versions = %v; want one segment stamped FormatVersionExactNumbers=%d — its chunks carry "+
+			"exact-text numbers a pre-v0.156.4 reader would round, so it must refuse the segment instead",
+			got, irbackup.FormatVersionExactNumbers)
+	}
 
 	want := pgNumsText(t, sourceDSN)
 	got := pgNumsText(t, targetDSN)
@@ -112,6 +129,23 @@ func TestBackupChain_PGTrigger_NumericValuesRestoreExactly(t *testing.T) {
 	}
 }
 
+// incrementalFormatVersions returns the recorded FormatVersion of every
+// incremental manifest in store.
+func incrementalFormatVersions(ctx context.Context, t *testing.T, store irbackup.Store) []int {
+	t.Helper()
+	records, err := lineage.ListAllManifestsViaWalk(ctx, store)
+	if err != nil {
+		t.Fatalf("ListAllManifestsViaWalk: %v", err)
+	}
+	var out []int
+	for _, r := range records {
+		if r.Manifest.Kind == irbackup.BackupKindIncremental {
+			out = append(out, r.Manifest.FormatVersion)
+		}
+	}
+	return out
+}
+
 // pgNumsText reads every column of nums as the server's own text rendering.
 func pgNumsText(t *testing.T, dsn string) map[int64]map[string]string {
 	t.Helper()
@@ -121,7 +155,7 @@ func pgNumsText(t *testing.T, dsn string) map[int64]map[string]string {
 	}
 	defer func() { _ = db.Close() }()
 	rows, err := db.QueryContext(context.Background(),
-		`SELECT id, nu::text, np::text, f8::text, f4::text, na::text, js::text FROM nums ORDER BY id`)
+		`SELECT id, nu::text, np::text, f8::text, f4::text, na::text, js::text, fa::text FROM nums ORDER BY id`)
 	if err != nil {
 		t.Fatalf("read nums: %v", err)
 	}
@@ -129,11 +163,11 @@ func pgNumsText(t *testing.T, dsn string) map[int64]map[string]string {
 	out := map[int64]map[string]string{}
 	for rows.Next() {
 		var id int64
-		var nu, np, f8, f4, na, js sql.NullString
-		if err := rows.Scan(&id, &nu, &np, &f8, &f4, &na, &js); err != nil {
+		var nu, np, f8, f4, na, js, fa sql.NullString
+		if err := rows.Scan(&id, &nu, &np, &f8, &f4, &na, &js, &fa); err != nil {
 			t.Fatalf("scan: %v", err)
 		}
-		out[id] = map[string]string{"nu": nu.String, "np": np.String, "f8": f8.String, "f4": f4.String, "na": na.String, "js": js.String}
+		out[id] = map[string]string{"nu": nu.String, "np": np.String, "f8": f8.String, "f4": f4.String, "na": na.String, "js": js.String, "fa": fa.String}
 	}
 	if err := rows.Err(); err != nil {
 		t.Fatalf("rows: %v", err)
@@ -202,6 +236,183 @@ func TestBackupChain_PGTrigger_NumericValuesRestoreExactly_ToMySQL(t *testing.T)
 	}
 }
 
+// TestBackupChain_PGTrigger_FloatsAndArraysRestoreExactly_ToMySQL extends
+// the MySQL lane to the other number families a postgres-trigger chain
+// hands the MySQL applier as json.Number: float8 → DOUBLE, real → FLOAT and
+// numeric[] → JSON. Values are chosen so the target type can hold each one
+// exactly, so a difference is the chain's loss and not the mapping's.
+// Independent expected value: the source's own `col::text`, compared by
+// value (DOUBLE renders its own shortest spelling; a FLOAT is read as a
+// DOUBLE because MySQL displays FLOAT to six significant digits; a JSON array's
+// elements are compared as exact decimals).
+func TestBackupChain_PGTrigger_FloatsAndArraysRestoreExactly_ToMySQL(t *testing.T) {
+	sourceDSN, _, pgCleanup := startPostgres(t)
+	defer pgCleanup()
+	_, mysqlTarget, myCleanup := startMySQL(t)
+	defer myCleanup()
+	applyDDL(t, sourceDSN, `
+		CREATE TABLE floatsmy (id BIGINT PRIMARY KEY, f8 DOUBLE PRECISION, f4 REAL, na NUMERIC[]);
+		INSERT INTO floatsmy (id, f8, f4, na) VALUES (1, 1, 1, '{1}');
+	`)
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+	if _, err := pgtrigger.Setup(ctx, sourceDSN, pgtrigger.SetupOptions{Tables: []string{"floatsmy"}, Schema: "public"}); err != nil {
+		t.Fatalf("pgtrigger.Setup: %v", err)
+	}
+	src, ok := engines.Get(pgtrigger.EngineName)
+	if !ok {
+		t.Fatal("postgres-trigger engine not registered")
+	}
+	store := runTriggerChainFull(ctx, t, src, sourceDSN, pgtrigger.EngineName, func(tok string) (int64, error) {
+		return pgtrigger.AppliedLastID(tok)
+	})
+	cells := []struct{ id, f8, f4, na string }{
+		{"301", "1.5e-7", "1.25", "{1.5,2.25,-3.125}"},
+		{"302", "0.1", "0.1", "{10.50,NULL}"},
+		{"303", "-2.5e-300", "3.4e38", "{0.000001}"},
+		{"304", "1e21", "1.5e-7", "{}"},
+		{"305", "123456789.123456789", "16777217", "{12345.6789}"},
+	}
+	for _, c := range cells {
+		applyDDL(t, sourceDSN, fmt.Sprintf(`INSERT INTO floatsmy (id, f8, f4, na) VALUES (%s, '%s', '%s', '%s');`, c.id, c.f8, c.f4, c.na))
+	}
+	runTriggerChainIncrementalAndRestoreN(ctx, t, src, sourceDSN, store, "mysql", mysqlTarget, len(cells))
+
+	want := floatRowsText(t, "pgx", sourceDSN, `SELECT id, f8::text, f4::text, array_to_json(na)::text FROM floatsmy ORDER BY id`)
+	got := floatRowsText(t, "mysql", mysqlTarget, `SELECT id, CAST(f8 AS CHAR), CAST(CAST(f4 AS DOUBLE) AS CHAR), CAST(na AS CHAR) FROM floatsmy ORDER BY id`)
+	if len(got) != len(want) {
+		t.Fatalf("restored %d rows; source has %d", len(got), len(want))
+	}
+	for id, w := range want {
+		g := got[id]
+		if g == nil {
+			t.Errorf("row %d missing from the restore", id)
+			continue
+		}
+		if !sameFloat(g[0], w[0], 64) {
+			t.Errorf("row %d f8: restored %q; source %q", id, g[0], w[0])
+		}
+		if !sameFloat(g[1], w[1], 32) {
+			t.Errorf("row %d f4: restored %q; source %q", id, g[1], w[1])
+		}
+		if !sameJSONNumbers(t, g[2], w[2]) {
+			t.Errorf("row %d na: restored %q; source %q", id, g[2], w[2])
+		}
+	}
+}
+
+// TestBackupChain_PGTrigger_OverScaleRestoreRefuses_ToMySQL pins the win the
+// exact read buys on a MySQL target: a numeric with 31 fractional digits used
+// to reach the MySQL applier as a float64 and land rounded; it now reaches it
+// as the exact json.Number, and the DECIMAL scale guard refuses it with
+// DECIMAL-SCALE-EXCEEDED instead of rounding it into DECIMAL(65,30).
+func TestBackupChain_PGTrigger_OverScaleRestoreRefuses_ToMySQL(t *testing.T) {
+	sourceDSN, _, pgCleanup := startPostgres(t)
+	defer pgCleanup()
+	_, mysqlTarget, myCleanup := startMySQL(t)
+	defer myCleanup()
+	applyDDL(t, sourceDSN, `
+		CREATE TABLE overscale (id BIGINT PRIMARY KEY, nu NUMERIC);
+		INSERT INTO overscale (id, nu) VALUES (1, 1);
+	`)
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+	if _, err := pgtrigger.Setup(ctx, sourceDSN, pgtrigger.SetupOptions{Tables: []string{"overscale"}, Schema: "public"}); err != nil {
+		t.Fatalf("pgtrigger.Setup: %v", err)
+	}
+	src, ok := engines.Get(pgtrigger.EngineName)
+	if !ok {
+		t.Fatal("postgres-trigger engine not registered")
+	}
+	store := runTriggerChainFull(ctx, t, src, sourceDSN, pgtrigger.EngineName, func(tok string) (int64, error) {
+		return pgtrigger.AppliedLastID(tok)
+	})
+	applyDDL(t, sourceDSN, `INSERT INTO overscale (id, nu) VALUES (2, '0.1234567890123456789012345678901');`)
+	runTriggerChainIncrementalAndRestoreN(ctx, t, src, sourceDSN, store, "", "", 1)
+
+	eng, ok := engines.Get("mysql")
+	if !ok {
+		t.Fatal("mysql engine not registered")
+	}
+	err := (&backup.ChainRestore{Target: eng, TargetDSN: mysqlTarget, Store: store}).Run(ctx)
+	if err == nil || !strings.Contains(err.Error(), "DECIMAL-SCALE-EXCEEDED") {
+		t.Fatalf("chain restore of a 31-fractional-digit numeric into MySQL = %v; want a DECIMAL-SCALE-EXCEEDED refusal (the value "+
+			"must not be rounded into DECIMAL(65,30))", err)
+	}
+}
+
+// floatRowsText reads (id, a, b, c) rows as text.
+func floatRowsText(t *testing.T, driver, dsn, query string) map[int64][]string {
+	t.Helper()
+	db, err := sql.Open(driver, dsn)
+	if err != nil {
+		t.Fatalf("open %s: %v", driver, err)
+	}
+	defer func() { _ = db.Close() }()
+	rows, err := db.QueryContext(context.Background(), query)
+	if err != nil {
+		t.Fatalf("query %s: %v", driver, err)
+	}
+	defer func() { _ = rows.Close() }()
+	out := map[int64][]string{}
+	for rows.Next() {
+		var id int64
+		var a, b, c sql.NullString
+		if err := rows.Scan(&id, &a, &b, &c); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		out[id] = []string{a.String, b.String, c.String}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	return out
+}
+
+// sameFloat compares two server renderings of a float by value at the
+// column's own width.
+func sameFloat(a, b string, bits int) bool {
+	x, errA := strconv.ParseFloat(a, bits)
+	y, errB := strconv.ParseFloat(b, bits)
+	return errA == nil && errB == nil && x == y
+}
+
+// sameJSONNumbers compares two JSON arrays element by element as exact
+// decimals (a number or a numeric string on either side; null matches null).
+func sameJSONNumbers(t *testing.T, a, b string) bool {
+	t.Helper()
+	parse := func(s string) []any {
+		if s == "" {
+			return nil
+		}
+		dec := json.NewDecoder(strings.NewReader(s))
+		dec.UseNumber()
+		var v []any
+		if err := dec.Decode(&v); err != nil {
+			t.Fatalf("parse JSON array %q: %v", s, err)
+		}
+		return v
+	}
+	x, y := parse(a), parse(b)
+	if len(x) != len(y) {
+		return false
+	}
+	for i := range x {
+		if (x[i] == nil) != (y[i] == nil) {
+			return false
+		}
+		if x[i] == nil {
+			continue
+		}
+		ra, okA := new(big.Rat).SetString(fmt.Sprint(x[i]))
+		rb, okB := new(big.Rat).SetString(fmt.Sprint(y[i]))
+		if !okA || !okB || ra.Cmp(rb) != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // numericColumnsText reads (id, a, b) rows as text.
 func numericColumnsText(t *testing.T, driver, dsn, query string) map[int64][]string {
 	t.Helper()
@@ -243,9 +454,9 @@ func TestSyncFromBackup_PGTriggerChain_NumericValuesExact(t *testing.T) {
 		CREATE TABLE nums (
 			id BIGINT PRIMARY KEY,
 			nu NUMERIC, np NUMERIC(38,12), f8 DOUBLE PRECISION, f4 REAL,
-			na NUMERIC[], js JSONB
+			na NUMERIC[], js JSONB, fa DOUBLE PRECISION[]
 		);
-		INSERT INTO nums (id, nu, np, f8, f4, na, js) VALUES (1, 1, 1, 1, 1, '{1}', '{"seed": 1}');
+		INSERT INTO nums (id, nu, np, f8, f4, na, js, fa) VALUES (1, 1, 1, 1, 1, '{1}', '{"seed": 1}', '{1}');
 	`)
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
@@ -276,8 +487,8 @@ func TestSyncFromBackup_PGTriggerChain_NumericValuesExact(t *testing.T) {
 	}
 	for _, c := range pgTriggerNumericCells {
 		applyDDL(t, sourceDSN, fmt.Sprintf(
-			`INSERT INTO nums (id, nu, np, f8, f4, na, js) VALUES (%d, '%s', '%s', '%s', '%s', '%s', '%s');`,
-			c.id, c.nu, c.np, c.f8, c.f4, c.na, c.js,
+			`INSERT INTO nums (id, nu, np, f8, f4, na, js, fa) VALUES (%d, '%s', '%s', '%s', '%s', '%s', '%s', '%s');`,
+			c.id, c.nu, c.np, c.f8, c.f4, c.na, c.js, c.fa,
 		))
 	}
 	runTriggerChainIncrementalAndRestoreN(ctx, t, src, sourceDSN, store, "", "", len(pgTriggerNumericCells))

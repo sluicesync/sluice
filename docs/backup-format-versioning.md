@@ -150,10 +150,40 @@ Every backup chain root manifest carries a `FormatVersion` field:
   version 11 does not open) and then finishes without a position refuses at
   finalize instead of writing a full that is either unrestorable or silently
   extendable. Start a fresh full with `--force-overwrite`.
+- **`FormatVersion=12`** — an **exact-numbers** change segment
+  (`v0.156.4+`): a `postgres-trigger` incremental / `backup stream` segment
+  (and the ADD COLUMN fill segment, which shares the stream's sealing path)
+  at least one of whose change chunks carried a number the capture holds
+  exactly — an unconstrained `numeric`, a `jsonb` number, a
+  `double precision`/`real` value or an array element of those. Exempt:
+  integers the capture already delivers as `int64`, and plain integers of
+  at most 15 digits inside a `jsonb` document (a `float64` holds those
+  exactly, so an older binary restores them byte-for-byte — the
+  cross-version suite pins that). Not exempt, deliberately: a
+  `numeric(p,s)` value with `s > 0` is captured with its scale
+  (`1.000000000000`), so a segment touching one is stamped even though a
+  scale-constrained target column would re-pad it — the stamp sees the
+  chunk, not the column type. Through v0.156.3 every binary decoded
+  such a number out of the chunk as a Go `float64`, so `10.50` restored as
+  `10.5`, a 20-digit `numeric` lost its tail, and `1e-400` restored as `0`
+  — silently, at exit 0. v0.156.4 decodes these chunks exactly, but the
+  bytes on disk did not change (the chunk has always stored the number as
+  written), so an older binary reading a v0.156.4 chain would round it
+  again. The bump makes it refuse at its own ceiling instead. Proportional:
+  a full, a segment from any other source engine, and a trigger segment
+  whose changes carried only integers, text and the other non-numeric
+  families keep their previous version and stay readable everywhere. The
+  stamp is applied as each segment's chunks seal and is never applied by
+  compaction (which rewrites a manifest under its recorded backup id). A
+  pre-bump `postgres-trigger` chain — written at version 8–11 by any older
+  binary — needs no rewrite: a v0.156.4+ binary keys exact decoding on the
+  manifest's source engine, not on this version, so it restores those
+  chains exactly too.
 
 If your backups don't use RLS, EXCLUDE constraints, or standalone
 sequences, you don't encrypt, sign or redact, and your source records a
-CDC position (or has no CDC at all), you'll never see a version
+CDC position (or has no CDC at all), and no `postgres-trigger` change
+segment of yours carries a non-integer number, you'll never see a version
 above 1 on a finalized manifest and cross-version restore behaves
 exactly as it did pre-v0.94.1. If your backups *do* use any of them,
 you get the guarantee that older sluice can't silently land a restored
@@ -429,7 +459,7 @@ The contract is pinned by three integration tests:
   - Agreement between the internal `chooseFormatVersion` and the
     exported `FormatVersionFor`
   - The constant invariant that `BackupFormatVersion` equals the
-    highest declared tier — `FormatVersionInjectiveChunkAAD` today
+    highest declared tier — `FormatVersionExactNumbers` today
     (defense-in-depth for the "constants drift on a future bump"
     failure mode)
 - **`TestBackupFormatVersion_Bumped`** — pins the constant invariant

@@ -91,6 +91,14 @@ func TestBackupChain_PGTrigger_PostFullRowsReachTheRestore(t *testing.T) {
 
 	gotRows := pgQueryOne[int64](t, targetDSN, "SELECT COUNT(*) FROM events")
 	gotSum := pgQueryOne[int64](t, targetDSN, "SELECT COALESCE(SUM(n), 0) FROM events")
+	// The control for the exact-number stamp: this chain carries integers and
+	// text only, so its segment keeps the feature-minimum version and older
+	// binaries still read it.
+	for _, v := range incrementalFormatVersions(ctx, t, store) {
+		if v >= irbackup.FormatVersionExactNumbers {
+			t.Errorf("an integer/text-only postgres-trigger segment was stamped FormatVersion %d; the exact-number stamp must be proportional", v)
+		}
+	}
 	if gotRows != wantRows || gotSum != wantSum {
 		t.Fatalf("chain restore: target rows/sum = %d/%d; source (read AFTER the post-full writes) = %d/%d — the "+
 			"window between the full's sweep and the incremental's anchor is missing from the chain", gotRows, gotSum, wantRows, wantSum)

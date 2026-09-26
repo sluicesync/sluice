@@ -112,10 +112,14 @@ func xpLoadBinaries(t *testing.T) xpBinaries {
 		return n
 	}
 	b := xpBinaries{
-		oldBin:    get("CROSSVER_OLD_BIN"),
+		// OLD is this tier's OWN below-tier binary, not the top-tier OLD:
+		// since the FormatVersion-12 bump the newest release below the TOP
+		// tier stamps 11 and reads a positionless full (see THE FOURTH AXIS
+		// in scripts/crossversion-build.sh).
+		oldBin:    get("CROSSVER_BELOW_POSITIONLESS_BIN"),
 		newBin:    get("CROSSVER_NEW_BIN"),
-		oldTag:    get("CROSSVER_OLD_TAG"),
-		oldFormat: getInt("CROSSVER_OLD_FORMAT"),
+		oldTag:    get("CROSSVER_BELOW_POSITIONLESS_TAG"),
+		oldFormat: getInt("CROSSVER_BELOW_POSITIONLESS_FORMAT"),
 		newFormat: getInt("CROSSVER_NEW_FORMAT"),
 	}
 	// The non-vacuity guards. NEW must be THIS tree (the tier under test is

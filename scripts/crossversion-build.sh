@@ -54,6 +54,10 @@
 #   CROSSVER_EPOCH_WORKTREE                — its throwaway tag worktree
 #   CROSSVER_PEER_BIN / _TAG / _FORMAT     — the SAME-format peer binary
 #   CROSSVER_PEER_WORKTREE                 — its throwaway tag worktree
+#   CROSSVER_BELOW_<NAME>_BIN / _TAG / _FORMAT / _TIER
+#                                          — per shape-stamped tier suite,
+#                                            the newest release below that
+#                                            tier (see THE FOURTH AXIS)
 #
 # THE THIRD AXIS: THE SAME-FORMAT PEER (roadmap item 104 / Bug 216). Cells
 # 1-5 all read OLD-written chains with a NEWER binary, or assert a refusal.
@@ -262,6 +266,57 @@ fi
 git worktree prune
 git worktree add --detach "$peer_worktree" "$peer_tag" >/dev/null
 
+# ---------------------------------------------------------------------
+# THE FOURTH AXIS: ONE BELOW-TIER BINARY PER SHAPE-STAMPED TIER.
+#
+# A tier suite (the positionless-full suite for 11, the exact-numbers
+# suite for 12) asserts that a release BELOW its tier refuses what the
+# tier stamps. Through FormatVersion 11 that release was simply OLD — and
+# the next bump broke it: OLD advances to the newest release below the
+# NEW top tier, which is AT the older tier and reads it (the 12 bump,
+# 2026-09-25, made OLD v0.156.3 = format 11, and the positionless suite
+# would have Fatal'd on its own non-vacuity guard). So each tier suite
+# gets its own binary, derived against its OWN tier's constant read from
+# this tree — the newest tag strictly below it — and never moves again
+# when the top tier does. When it coincides with OLD it reuses OLD's
+# build rather than compiling the same tag twice.
+#
+# read_tier NAME — the value of a FormatVersion constant in manifest.go.
+read_tier() {
+	sed -n "s/^[[:space:]]*$1 *= *\([0-9][0-9]*\).*/\1/p" "$manifest_file" | head -1
+}
+
+# below_tag TIER — "TAG VERSION" of the newest tag stamping below TIER.
+below_tag() {
+	for t in $(git tag --list 'v*' --sort=-v:refname); do
+		v=$(git show "$t:$manifest_file" 2>/dev/null | read_format_version || true)
+		[ -n "$v" ] || continue
+		if [ "$v" -lt "$1" ]; then
+			echo "$t $v"
+			return 0
+		fi
+	done
+	return 1
+}
+
+tier_suites="POSITIONLESS:FormatVersionPositionlessFull EXACT_NUMBERS:FormatVersionExactNumbers"
+tier_lines=
+for entry in $tier_suites; do
+	name=${entry%%:*}
+	const=${entry#*:}
+	tier=$(read_tier "$const")
+	if [ -z "$tier" ]; then
+		echo "::error::crossversion-build: could not read $const from $manifest_file — the tier suite $name has no tier to derive a binary below."
+		exit 1
+	fi
+	pair=$(below_tag "$tier" || true)
+	if [ -z "$pair" ]; then
+		echo "::error::crossversion-build: no tag stamps below $const=$tier — the $name tier suite would assert a refusal no binary can make."
+		exit 1
+	fi
+	tier_lines="$tier_lines $name:$tier:${pair% *}:${pair#* }"
+done
+
 exe=
 case "$(go env GOOS)" in
 windows) exe=".exe" ;;
@@ -310,3 +365,34 @@ emit CROSSVER_PEER_BIN "$peer_bin"
 emit CROSSVER_PEER_TAG "$peer_tag"
 emit CROSSVER_PEER_FORMAT "$peer_version"
 emit CROSSVER_PEER_WORKTREE "$peer_worktree"
+
+# The below-tier binaries (see THE FOURTH AXIS above). Emitted as
+# CROSSVER_BELOW_<NAME>_{BIN,TAG,FORMAT,TIER}.
+for line in $tier_lines; do
+	name=${line%%:*}
+	rest=${line#*:}
+	tier=${rest%%:*}
+	rest=${rest#*:}
+	tag=${rest%%:*}
+	version=${rest#*:}
+	if [ "$tag" = "$old_tag" ]; then
+		bin=$old_bin
+		echo "crossversion-build: BELOW_$name (tier $tier) is OLD $old_tag — reusing its build"
+	else
+		lower=$(echo "$name" | tr 'A-Z_' 'a-z-')
+		bin="$out_dir/sluice-below-$lower$exe"
+		wt=${RUNNER_TEMP:-/tmp}/sluice-crossversion-below-$lower
+		if [ -e "$wt" ]; then
+			git worktree remove --force "$wt" >/dev/null 2>&1 || rm -rf "$wt"
+		fi
+		git worktree prune
+		git worktree add --detach "$wt" "$tag" >/dev/null
+		echo "crossversion-build: building BELOW_$name $tag (BackupFormatVersion=$version, below tier $tier) from $wt"
+		(cd "$wt" && go build -ldflags "-X main.version=${tag#v}" -o "$bin" ./cmd/sluice)
+		emit "CROSSVER_BELOW_${name}_WORKTREE" "$wt"
+	fi
+	emit "CROSSVER_BELOW_${name}_BIN" "$bin"
+	emit "CROSSVER_BELOW_${name}_TAG" "$tag"
+	emit "CROSSVER_BELOW_${name}_FORMAT" "$version"
+	emit "CROSSVER_BELOW_${name}_TIER" "$tier"
+done

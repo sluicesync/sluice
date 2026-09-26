@@ -1889,6 +1889,7 @@ func (cb *changeChunkBuffer) flushTo(putCtx context.Context, out *captureOutcome
 	if err := cb.writer.Close(); err != nil {
 		return fmt.Errorf("close chunk: %w", err)
 	}
+	stampExactNumbersOnSeal(cb.manifest, cb.writer)
 	path := changeChunkPath(cb.runNamespace, cb.chunkIdx)
 	hash := cb.writer.Hash()
 	nb := int64(cb.buf.Len())
