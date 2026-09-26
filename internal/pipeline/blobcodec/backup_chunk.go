@@ -851,6 +851,15 @@ func nonFiniteFromString(s string) (float64, error) {
 // decodeValue is the inverse of [encodeValue]. Bare JSON values pass
 // through; tagged envelopes are unwrapped to their native Go shape.
 func decodeValue(raw json.RawMessage) (any, error) {
+	return decodeValueWith(raw, false)
+}
+
+// decodeValueWith is [decodeValue] with the bare-number rule chosen by the
+// caller. numbersExact decodes every bare JSON number — at any depth,
+// including inside list and map envelopes and naturally-decoded
+// structures — as a [json.Number] carrying its exact source text instead
+// of a float64. See [ChangeChunkReader.PreserveNumbers] for why and when.
+func decodeValueWith(raw json.RawMessage, numbersExact bool) (any, error) {
 	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
 		return nil, nil
 	}
@@ -864,13 +873,13 @@ func decodeValue(raw json.RawMessage) (any, error) {
 			if tagRaw, ok := probe["_t"]; ok {
 				var tag string
 				if err := json.Unmarshal(tagRaw, &tag); err == nil {
-					return decodeTaggedValue(tag, probe["v"])
+					return decodeTaggedValue(tag, probe["v"], numbersExact)
 				}
 			}
 			// Not a tagged envelope — decode the map naturally.
 			out := make(map[string]any, len(probe))
 			for k, v := range probe {
-				dv, err := decodeValue(v)
+				dv, err := decodeValueWith(v, numbersExact)
 				if err != nil {
 					return nil, fmt.Errorf("map key %q: %w", k, err)
 				}
@@ -881,6 +890,14 @@ func decodeValue(raw json.RawMessage) (any, error) {
 	}
 	// Fall back to natural JSON decoding.
 	var natural any
+	if numbersExact {
+		dec := json.NewDecoder(bytes.NewReader(raw))
+		dec.UseNumber()
+		if err := dec.Decode(&natural); err != nil {
+			return nil, fmt.Errorf("decode value: %w", err)
+		}
+		return natural, nil
+	}
 	if err := json.Unmarshal(raw, &natural); err != nil {
 		return nil, fmt.Errorf("decode value: %w", err)
 	}
@@ -892,7 +909,7 @@ func decodeValue(raw json.RawMessage) (any, error) {
 // chunk header would have already gated the file open, so an unknown
 // tag this far in indicates either a bug or a disk-corruption shape
 // the loud-failure tenet prefers to surface.
-func decodeTaggedValue(tag string, payload json.RawMessage) (any, error) {
+func decodeTaggedValue(tag string, payload json.RawMessage, numbersExact bool) (any, error) {
 	switch tag {
 	case "bytes":
 		var s string
@@ -956,7 +973,7 @@ func decodeTaggedValue(tag string, payload json.RawMessage) (any, error) {
 		}
 		out := make([]any, len(arr))
 		for i, e := range arr {
-			dv, err := decodeValue(e)
+			dv, err := decodeValueWith(e, numbersExact)
 			if err != nil {
 				return nil, fmt.Errorf("list[%d]: %w", i, err)
 			}
@@ -976,7 +993,7 @@ func decodeTaggedValue(tag string, payload json.RawMessage) (any, error) {
 		}
 		out := make(map[string]any, len(m))
 		for k, v := range m {
-			dv, err := decodeValue(v)
+			dv, err := decodeValueWith(v, numbersExact)
 			if err != nil {
 				return nil, fmt.Errorf("map[%q]: %w", k, err)
 			}

@@ -260,6 +260,10 @@ type ChangeChunkReader struct {
 
 	encrypted   bool
 	consumedSrc bool
+
+	// preserveNumbers decodes bare JSON numbers as json.Number (see
+	// [ChangeChunkReader.PreserveNumbers]).
+	preserveNumbers bool
 }
 
 // NewChangeChunkReader opens a change-event chunk for reading, verifying
@@ -360,6 +364,53 @@ func NewChangeChunkReader(src io.ReadCloser, expectedSHA256 string, cek []byte, 
 	return r, nil
 }
 
+// PreserveNumbers makes every subsequent [ChangeChunkReader.ReadChange]
+// decode a bare JSON number — a row value's top level, a list or map
+// envelope's elements, a naturally-decoded JSON structure's leaves — as a
+// [json.Number] carrying its exact text, instead of a float64.
+//
+// The chunk bytes already hold the exact digits: [encodeValue] has no
+// json.Number arm, so the value's own marshaller writes its literal text.
+// What lost them was the float64 decode. A postgres-trigger change stream
+// hands the codec json.Number for every non-integer numeric, every
+// numeric[] element and every jsonb number leaf (its reader keeps them
+// exact on purpose — see pgtrigger's normalizePayloadValue), so a chain
+// restored `123456789012345678.123456789012` as `123456789012345680` at
+// exit 0, and a jsonb `12345678901234567890` as `12345678901234567000`.
+//
+// It is opt-in per chunk, chosen by the caller from the owning manifest
+// ([NumbersArePreserved]), not the default, because the rule changes a
+// decoded value's Go type: a float64 a CDC reader produced (every other
+// engine's Float column) would come back as json.Number. On a
+// postgres-trigger chain that is exactly the type its live change stream
+// hands every consumer, so restore, the broker and compaction see what
+// the live path sees. Existing chains are repaired by this alone: their
+// chunks were always written this way.
+func (r *ChangeChunkReader) PreserveNumbers() { r.preserveNumbers = true }
+
+// NumbersArePreserved reports whether change chunks written for a source
+// engine must be read with [ChangeChunkReader.PreserveNumbers]. True for
+// postgres-trigger only.
+//
+// Premise, pinned by TestNumbersArePreserved_PGTriggerCarriesNoFloats in
+// the pgtrigger package: that engine's change stream carries no float64 or
+// float32 values — integers become int64, every other number stays
+// json.Number — so every bare number in its change chunks is a json.Number
+// the reader produced. A change chunk can still carry a float64 from the
+// ADD COLUMN fill (captured through the row reader, not the change
+// stream); it round-trips exactly as json.Number too (its text is the
+// shortest float64 rendering) and every writer accepts json.Number for a
+// float column, as the live path requires.
+func NumbersArePreserved(sourceEngine string) bool {
+	return sourceEngine == PreservedNumberEngine
+}
+
+// PreservedNumberEngine is the one source engine whose change chunks are
+// read with [ChangeChunkReader.PreserveNumbers]. Kept as a literal here
+// (blobcodec imports no engine package) and bound to
+// pgtrigger.EngineName by the pgtrigger package's test.
+const PreservedNumberEngine = "postgres-trigger"
+
 // ReadChange returns the next [ir.Change] from the chunk, or
 // (nil, io.EOF) at end-of-stream.
 func (r *ChangeChunkReader) ReadChange() (ir.Change, error) {
@@ -373,7 +424,7 @@ func (r *ChangeChunkReader) ReadChange() (ir.Change, error) {
 	if err := json.Unmarshal(r.scanner.Bytes(), &wire); err != nil {
 		return nil, fmt.Errorf("change chunk reader: record decode: %w", err)
 	}
-	c, err := decodeChange(&wire)
+	c, err := decodeChange(&wire, r.preserveNumbers)
 	if err != nil {
 		return nil, fmt.Errorf("change chunk reader: decode change: %w", err)
 	}
@@ -513,13 +564,13 @@ func encodeChange(c ir.Change) (*changeWire, error) {
 // Row / Before / After maps are the JSON-decoded form; we re-run
 // decodeValue on each entry so tagged envelopes bounce back to their
 // Go-native shape.
-func decodeChange(w *changeWire) (ir.Change, error) {
+func decodeChange(w *changeWire, numbersExact bool) (ir.Change, error) {
 	if w == nil {
 		return nil, errors.New("decode change: nil wire")
 	}
 	switch w.Kind {
 	case changeKindInsert:
-		row, err := decodeRowValues(w.Row)
+		row, err := decodeRowValues(w.Row, numbersExact)
 		if err != nil {
 			return nil, err
 		}
@@ -530,11 +581,11 @@ func decodeChange(w *changeWire) (ir.Change, error) {
 			Row:      row,
 		}, nil
 	case changeKindUpdate:
-		before, err := decodeRowValues(w.Before)
+		before, err := decodeRowValues(w.Before, numbersExact)
 		if err != nil {
 			return nil, err
 		}
-		after, err := decodeRowValues(w.After)
+		after, err := decodeRowValues(w.After, numbersExact)
 		if err != nil {
 			return nil, err
 		}
@@ -546,7 +597,7 @@ func decodeChange(w *changeWire) (ir.Change, error) {
 			After:    after,
 		}, nil
 	case changeKindDelete:
-		before, err := decodeRowValues(w.Before)
+		before, err := decodeRowValues(w.Before, numbersExact)
 		if err != nil {
 			return nil, err
 		}
@@ -602,13 +653,13 @@ func encodeRowValues(r ir.Row, role string) (map[string]json.RawMessage, error) 
 // json.RawMessage (the EXACT wire bytes — see changeWire: this is the Bug-172
 // fix, avoiding the map[string]any float64 round-trip), so decodeValue branches
 // on the tagged envelope directly with no precision loss.
-func decodeRowValues(m map[string]json.RawMessage) (ir.Row, error) {
+func decodeRowValues(m map[string]json.RawMessage, numbersExact bool) (ir.Row, error) {
 	if m == nil {
 		return nil, nil
 	}
 	out := make(ir.Row, len(m))
 	for k, v := range m {
-		dec, err := decodeValue(v)
+		dec, err := decodeValueWith(v, numbersExact)
 		if err != nil {
 			return nil, fmt.Errorf("decode row column %q: %w", k, err)
 		}

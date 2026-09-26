@@ -1380,6 +1380,9 @@ func (b *SyncFromBackup) streamOneChunkWithPosition(
 		// its GCM auth tag here → coded refusal (SEC-1).
 		return lineage.CodeChunkAuthError(fmt.Errorf("open chunk reader: %w", err))
 	}
+	if blobcodec.NumbersArePreserved(owner.SourceEngine) {
+		cr.PreserveNumbers()
+	}
 	for {
 		change, rErr := cr.ReadChange()
 		if errors.Is(rErr, io.EOF) {

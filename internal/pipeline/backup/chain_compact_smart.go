@@ -1613,6 +1613,9 @@ func applySmartCompactionToIncrementalSized(
 			// (parity across restore/replay/compact; SEC-1).
 			return nil, lineage.CodeChunkAuthError(fmt.Errorf("open chunk %q: %w", ch.File, err))
 		}
+		if blobcodec.NumbersArePreserved(im.SourceEngine) {
+			ccr.PreserveNumbers()
+		}
 		for {
 			c, err := ccr.ReadChange()
 			if errors.Is(err, io.EOF) {

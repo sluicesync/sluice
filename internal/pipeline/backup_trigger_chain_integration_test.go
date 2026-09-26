@@ -164,12 +164,20 @@ func runTriggerChainFull(ctx context.Context, t *testing.T, src ir.Engine, sourc
 // the link starts exactly where the full ended.
 func runTriggerChainIncrementalAndRestore(ctx context.Context, t *testing.T, src ir.Engine, sourceDSN string, store *blobcodec.LocalStore, targetDSN string) {
 	t.Helper()
+	runTriggerChainIncrementalAndRestoreN(ctx, t, src, sourceDSN, store, "postgres", targetDSN, triggerChainPostFullRows)
+}
+
+// runTriggerChainIncrementalAndRestoreN is [runTriggerChainIncrementalAndRestore]
+// with the incremental closing on maxChanges post-full changes and
+// the chain restored into the named target engine.
+func runTriggerChainIncrementalAndRestoreN(ctx context.Context, t *testing.T, src ir.Engine, sourceDSN string, store *blobcodec.LocalStore, target, targetDSN string, maxChanges int) {
+	t.Helper()
 	incr := &IncrementalBackup{
 		Source:        src,
 		SourceDSN:     sourceDSN,
 		Store:         store,
 		Window:        45 * time.Second,
-		MaxChanges:    triggerChainPostFullRows,
+		MaxChanges:    maxChanges,
 		ChunkChanges:  25,
 		SluiceVersion: "test",
 	}
@@ -195,12 +203,22 @@ func runTriggerChainIncrementalAndRestore(ctx context.Context, t *testing.T, src
 	if link.StartPosition != full.EndPosition {
 		t.Fatalf("incremental StartPosition = %+v; want the full's EndPosition %+v", link.StartPosition, full.EndPosition)
 	}
-	pgEng, ok := engines.Get("postgres")
-	if !ok {
-		t.Fatal("postgres engine not registered")
+	if target == "" {
+		return // the caller replays the chain itself (the broker lane)
 	}
-	if err := (&backup.ChainRestore{Target: pgEng, TargetDSN: targetDSN, Store: store}).Run(ctx); err != nil {
-		t.Fatalf("ChainRestore.Run: %v", err)
+	restoreTriggerChain(ctx, t, store, target, targetDSN)
+}
+
+// restoreTriggerChain chain-restores store into targetDSN through the
+// registered target engine.
+func restoreTriggerChain(ctx context.Context, t *testing.T, store *blobcodec.LocalStore, target, targetDSN string) {
+	t.Helper()
+	eng, ok := engines.Get(target)
+	if !ok {
+		t.Fatalf("%s engine not registered", target)
+	}
+	if err := (&backup.ChainRestore{Target: eng, TargetDSN: targetDSN, Store: store}).Run(ctx); err != nil {
+		t.Fatalf("ChainRestore.Run into %s: %v", target, err)
 	}
 }
 

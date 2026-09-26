@@ -218,6 +218,10 @@ func (t chunkReadTarget) readChanges(ctx context.Context) (chunkReadResult, erro
 	if err != nil {
 		return chunkReadResult{}, err
 	}
+	// No PreserveNumbers: this path decodes each change only to prove it
+	// decodes and discards the value, so the bare-number rule cannot change
+	// what it reports (chain restore, the broker and smart compaction, which
+	// USE the values, opt in from the owning manifest).
 	cr, err := blobcodec.NewChangeChunkReader(src, t.chunk.SHA256, t.cek, t.codec, t.aad)
 	if err != nil {
 		return chunkReadResult{}, t.classify(fmt.Errorf("open change chunk reader: %w", err))

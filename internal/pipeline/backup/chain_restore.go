@@ -1597,6 +1597,9 @@ func (r *ChainRestore) streamOneChangeChunk(
 		// change chunk fails its GCM auth tag here → coded refusal (SEC-1).
 		return lineage.CodeChunkAuthError(fmt.Errorf("open chunk reader: %w", err))
 	}
+	if blobcodec.NumbersArePreserved(link.Manifest.SourceEngine) {
+		cr.PreserveNumbers()
+	}
 	for {
 		change, err := cr.ReadChange()
 		if errors.Is(err, io.EOF) {
