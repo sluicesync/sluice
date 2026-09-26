@@ -4,6 +4,8 @@
 package laneapply
 
 import (
+	"encoding/json"
+	"math"
 	"strings"
 	"testing"
 )
@@ -38,5 +40,28 @@ func TestPlainDecimal(t *testing.T) {
 		if got := plainDecimal(in); got != want {
 			t.Errorf("plainDecimal(%q) = %q; want %q", in, got, want)
 		}
+	}
+}
+
+// TestCanonicalKey_NegativeZeroNumberIsTheIntegralZero pins the json.Number
+// arm's negative-zero rule (v0.156.4 review): a float key's -0 carried by an
+// ADD COLUMN fill as json.Number("-0") must encode exactly as the stream's
+// integral 0 and as a float64 -0, or the fill and a later update of that row
+// can take different lanes. Other zero spellings keep their text ("0.00" is
+// a numeric key's own rendering and must still match its copy-read string).
+func TestCanonicalKey_NegativeZeroNumberIsTheIntegralZero(t *testing.T) {
+	enc := func(v any) string {
+		var b strings.Builder
+		WriteCanonicalKeyValue(&b, v)
+		return b.String()
+	}
+	zero := enc(int64(0))
+	for _, v := range []any{json.Number("-0"), json.Number("0"), math.Copysign(0, -1), float64(0)} {
+		if got := enc(v); got != zero {
+			t.Errorf("key %#v encodes %q; want the integral zero's %q", v, got, zero)
+		}
+	}
+	if got, want := enc(json.Number("0.00")), enc("0.00"); got != want {
+		t.Errorf("json.Number(\"0.00\") encodes %q; want the copy-read string's %q", got, want)
 	}
 }

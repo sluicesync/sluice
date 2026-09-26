@@ -246,7 +246,14 @@ func WriteCanonicalKeyValue(h io.Writer, v any) {
 		_, _ = h.Write([]byte{'s'})
 		_, _ = h.Write(t)
 	case json.Number:
-		writeByteString(h, plainDecimal(t.String()))
+		s := plainDecimal(t.String())
+		if s == "-0" {
+			// A float key's negative zero, carried by an ADD COLUMN fill as a
+			// json.Number, is the stream's integral 0 (numeric has no
+			// negative zero): one lane, as [floatKeyText] does for float64.
+			s = "0"
+		}
+		writeByteString(h, s)
 	case float64:
 		if s, ok := floatKeyText(t, 64); ok {
 			writeByteString(h, s)
@@ -291,7 +298,12 @@ func WriteCanonicalKeyValue(h io.Writer, v any) {
 // here (the value contract widens single precision) renders its float64
 // digits instead — a KNOWN RESIDUAL for a `real` primary key, which splits
 // against the stream's float4 rendering exactly as it did before this arm
-// existed.
+// existed. A SECOND KNOWN RESIDUAL: NaN and ±Inf float keys keep the '?'
+// fallback here, while the postgres-trigger stream carries them as the
+// strings "NaN" / "Infinity" / "-Infinity" (to_jsonb renders non-finite
+// floats as strings), so such a key splits between the copy read and the
+// stream, and a split can reorder two writes to the same row across lanes
+// (the same shape as the `real` residual above).
 func floatKeyText(f float64, bits int) (string, bool) {
 	if math.IsNaN(f) || math.IsInf(f, 0) {
 		return "", false
