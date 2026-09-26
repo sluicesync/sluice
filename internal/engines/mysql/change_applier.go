@@ -2170,9 +2170,35 @@ func prepareApplierValue(v any, colTypes map[string]*ir.Column, colName string) 
 	}
 	col, ok := colTypes[colName]
 	if !ok || col == nil {
-		return prepareValue(v, nil)
+		col = columnByFoldedName(colTypes, colName)
 	}
 	return prepareValue(v, col)
+}
+
+// columnByFoldedName is the case-insensitive fallback for a row key that is
+// not an exact key of the target's column map (GC-37 (c) review, finding 4).
+// MySQL matches column names case-insensitively, so a pre-existing target
+// whose column is `Amount` where the source says `amount` takes the write —
+// and before this fallback the value reached the driver with NO descriptor,
+// skipping every typed guard (the DECIMAL scale refusal among them) and
+// every typed shaping rule. The typed rules are the correct ones for the
+// column MySQL will actually write, so resolving the descriptor only makes
+// the value prep match what an exact-case target already gets. An
+// ambiguous fold (two target columns differing only in case — impossible on
+// MySQL, whose column names are case-insensitive) resolves to nil, the
+// pre-fallback behaviour.
+func columnByFoldedName(colTypes map[string]*ir.Column, colName string) *ir.Column {
+	var found *ir.Column
+	for name, c := range colTypes {
+		if c == nil || !strings.EqualFold(name, colName) {
+			continue
+		}
+		if found != nil {
+			return nil
+		}
+		found = c
+	}
+	return found
 }
 
 // (sortedKeys is shared with the schema reader — see schema_reader.go

@@ -4,6 +4,7 @@
 package mysql
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -44,6 +45,15 @@ func TestDecimalDigitsBeyondScale(t *testing.T) {
 		{"", 30, 0},
 		{"1.2.3", 0, 0},
 		{"1e", 0, 0},
+		// Extreme exponents (review finding 3): bounded, no panic, no
+		// allocation proportional to the exponent.
+		{"1e-9223372036854775808", 30, 1<<40 - 30},
+		{"1e9223372036854775807", 0, 0},
+		{"1e-10000000000", 30, 10000000000 - 30},
+		{"1e-99999999999999999999", 30, 1<<40 - 30},
+		{"1e99999999999999999999", 30, 0},
+		{"0e-9223372036854775808", 30, 0},
+		{"000.000e-50", 30, 0},
 	}
 	for _, c := range cases {
 		if got := decimalDigitsBeyondScale(c.s, c.scale); got != c.want {
@@ -67,6 +77,12 @@ func TestPrepareValue_RefusesDecimalScaleLoss(t *testing.T) {
 		{"constrained", &ir.Column{Name: "v", Type: ir.Decimal{Precision: 10, Scale: 2}}, "1.234"},
 		{"domain", &ir.Column{Name: "v", Type: ir.Domain{Name: "money", BaseType: ir.Decimal{Unconstrained: true}}}, over},
 		{"rounds-up-to-integer", &ir.Column{Name: "v", Type: ir.Decimal{Unconstrained: true}}, "-0.99999999999999999999999999999999"},
+		// Every non-string kind a reader can deliver for a decimal column
+		// (review findings 1 and 2).
+		{"json-number", &ir.Column{Name: "v", Type: ir.Decimal{Unconstrained: true}}, json.Number(over)},
+		{"bytes", &ir.Column{Name: "v", Type: ir.Decimal{Unconstrained: true}}, []byte(over)},
+		{"float64-retyped", &ir.Column{Name: "v", Type: ir.Decimal{Precision: 10, Scale: 2}}, float64(1.2345)},
+		{"float32-retyped", &ir.Column{Name: "v", Type: ir.Decimal{Precision: 10, Scale: 2}}, float32(1.2345)},
 	}
 	for _, c := range refuse {
 		_, err := prepareValue(c.v, c.col)
@@ -93,11 +109,34 @@ func TestPrepareValue_RefusesDecimalScaleLoss(t *testing.T) {
 		{"text-column", &ir.Column{Name: "v", Type: ir.Text{}}, over},
 		{"nil-descriptor", nil, over},
 		{"null", &ir.Column{Name: "v", Type: ir.Decimal{Unconstrained: true}}, nil},
+		{"json-number-at-scale", &ir.Column{Name: "v", Type: ir.Decimal{Unconstrained: true}}, json.Number("0.123456789012345678901234567890")},
+		{"bytes-at-scale", &ir.Column{Name: "v", Type: ir.Decimal{Unconstrained: true}}, []byte("1.5000")},
+		{"float64-at-scale", &ir.Column{Name: "v", Type: ir.Decimal{Precision: 10, Scale: 2}}, float64(1.25)},
+		{"int64", &ir.Column{Name: "v", Type: ir.Decimal{Precision: 10, Scale: 2}}, int64(12345)},
 	}
 	for _, c := range pass {
 		if _, err := prepareValue(c.v, c.col); err != nil {
 			t.Errorf("%s: %v was refused, want accepted: %v", c.name, c.v, err)
 		}
+	}
+}
+
+// TestPrepareApplierValue_CaseFoldedColumnIsTyped pins review finding 4: a
+// row key that differs only in case from the target column (a pre-existing
+// target: MySQL matches column names case-insensitively) used to get NO
+// descriptor, so the scale guard never ran and the value rounded silently.
+func TestPrepareApplierValue_CaseFoldedColumnIsTyped(t *testing.T) {
+	colTypes := map[string]*ir.Column{"Amount": {Name: "Amount", Type: ir.Decimal{Unconstrained: true}}}
+	if _, err := prepareApplierValue("0.1234567890123456789012345678901", colTypes, "amount"); err == nil ||
+		!strings.Contains(err.Error(), decimalScaleExceededMarker) {
+		t.Errorf("case-mismatched key: err = %v; want the %s refusal", err, decimalScaleExceededMarker)
+	}
+	if _, err := prepareApplierValue("1.5", colTypes, "amount"); err != nil {
+		t.Errorf("case-mismatched key, in-scale value refused: %v", err)
+	}
+	// An unknown column still takes the untyped path.
+	if _, err := prepareApplierValue("0.1234567890123456789012345678901", colTypes, "other"); err != nil {
+		t.Errorf("unknown column: %v; want the untyped passthrough", err)
 	}
 }
 

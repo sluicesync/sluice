@@ -34,6 +34,8 @@ package mysql
 // caller of the DEFAULT emit.
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -83,13 +85,18 @@ func decimalDigitsBeyondScale(s string, scale int) int {
 	if s[0] == '-' || s[0] == '+' {
 		s = s[1:]
 	}
-	exp := 0
+	var exp int64
 	if i := strings.IndexAny(s, "eE"); i >= 0 {
-		e, err := strconv.Atoi(s[i+1:])
-		if err != nil {
-			return 0
+		e, err := strconv.ParseInt(s[i+1:], 10, 64)
+		if err != nil && !errors.Is(err, strconv.ErrRange) {
+			return 0 // not a number; the server refuses it on its own
 		}
-		exp = e
+		// Clamp: any exponent this large is past every DECIMAL either way
+		// (a negative one is all fraction, a positive one integer overflow
+		// the server refuses), and clamping keeps the arithmetic below
+		// from overflowing int64. ParseInt returns ±MaxInt64 on ErrRange.
+		const expBound = int64(1) << 40
+		exp = max(min(e, expBound), -expBound)
 		s = s[:i]
 	}
 	intPart, frac := s, ""
@@ -104,23 +111,29 @@ func decimalDigitsBeyondScale(s string, scale int) int {
 		}
 	}
 	// Place the decimal point exp positions right of where it is written,
-	// then count the significant (non-trailing-zero) digits after it.
-	digits := intPart + frac
-	point := len(intPart) + exp
-	var fraction string
-	switch {
-	case point >= len(digits):
-		fraction = ""
-	case point <= 0:
-		fraction = strings.Repeat("0", -point) + digits
-	default:
-		fraction = digits[point:]
+	// then count the significant (non-trailing-zero) digits after it —
+	// arithmetically, never allocating in proportion to the exponent (an
+	// NDJSON or mydumper number token can carry `1e-9223372036854775808`).
+	sig := strings.TrimRight(intPart+frac, "0") // significant digit span, from the left
+	if strings.Trim(sig, "0") == "" {
+		return 0 // the value is zero
 	}
-	fracDigits := len(strings.TrimRight(fraction, "0"))
-	if fracDigits <= scale {
+	point := int64(len(intPart)) + exp
+	fracDigits := int64(len(sig)) - point // digits of sig right of the point
+	if fracDigits <= int64(scale) {
 		return 0
 	}
-	return fracDigits - scale
+	return clampToInt(fracDigits - int64(scale))
+}
+
+// clampToInt bounds n into an int (a huge negative exponent yields a digit
+// count past any real column's scale; its exact size does not matter).
+func clampToInt(n int64) int {
+	const maxInt = int64(^uint(0) >> 1)
+	if n > maxInt {
+		return int(maxInt)
+	}
+	return int(n)
 }
 
 // refuseUnrepresentableValue runs [prepareValue]'s value guards — the ones
@@ -142,7 +155,7 @@ func refuseDecimalScaleLoss(v any, col *ir.Column) error {
 	if col == nil {
 		return nil
 	}
-	s, ok := v.(string)
+	s, ok := decimalValueText(v)
 	if !ok {
 		return nil
 	}
@@ -164,6 +177,42 @@ func refuseDecimalScaleLoss(v any, col *ir.Column) error {
 			decimalScaleExceededMarker, columnNameForError(col), s, lost, scale, decimalScaleRemedy,
 		),
 	)
+}
+
+// decimalValueText renders the value a reader delivered for a DECIMAL
+// column as decimal text, and false for a kind that cannot carry a
+// fractional digit. Every Go type a reader can deliver for a decimal
+// column, by reader (GC-37 (c) review, finding 1):
+//
+//   - string — postgres (pgoutput + copy), mysql (binlog + copy, which also
+//     map []byte/int64/uint64 to string), VStream, sqlite/d1, mydumper,
+//     flatfile, and every decimal leaf of the IR contract.
+//   - json.Number — postgres-trigger for every NON-integer numeric (its
+//     change payload is to_jsonb, decoded with UseNumber; integers become
+//     int64). A named string type: the first cut's `v.(string)` missed it,
+//     and the reviewer reproduced 31 fractional digits landing ROUNDED
+//     through pgtrigger → MySQL at exit 0.
+//   - []byte — a database/sql scan lane that did not normalise.
+//   - float64 / float32 — a float source column retyped to DECIMAL with
+//     --type-override (the CDC reader types values by the SOURCE schema);
+//     the driver binds the double and MySQL rounds it with a Note. Rendered
+//     with 'f', -1: the shortest text that round-trips the value the
+//     driver would send.
+//   - int64 / int / uint64 / … — no fractional digits; nothing to check.
+func decimalValueText(v any) (string, bool) {
+	switch x := v.(type) {
+	case string:
+		return x, true
+	case json.Number:
+		return string(x), true
+	case []byte:
+		return string(x), true
+	case float64:
+		return strconv.FormatFloat(x, 'f', -1, 64), true
+	case float32:
+		return strconv.FormatFloat(float64(x), 'f', -1, 32), true
+	}
+	return "", false
 }
 
 // decimalScaleRemedy is the shared remedy text.
