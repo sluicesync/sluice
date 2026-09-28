@@ -31,6 +31,7 @@ import (
 
 	"github.com/jackc/pgx/v5/stdlib"
 
+	"sluicesync.dev/sluice/internal/applymarks"
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/laneapply"
 )
@@ -249,6 +250,10 @@ type laneApplierAdapter struct {
 	streamID       string
 	laneDB         *sql.DB
 	laneCommitHook func(buf []laneChange) error
+
+	// fence is the orchestrator's ADR-0190 amendment-A clearance: the lanes
+	// write only the fenced transaction's apply marks.
+	fence applymarks.LaneFence
 }
 
 // RouteForChange decodes the row change's schema/table, loads the PK columns,
@@ -407,7 +412,7 @@ func (la *laneApplierAdapter) ApplyLaneBatch(ctx context.Context, _ int, batch [
 			return 0, fmt.Errorf("postgres: applier: redact: %w", err)
 		}
 		la.a.stampShardChange(c)
-		skip, err := la.laneApplyMarks(ctx, c)
+		skip, marks, err := la.laneApplyMarks(ctx, c)
 		if err != nil {
 			_ = b.Rollback()
 			return 0, err
@@ -415,10 +420,24 @@ func (la *laneApplierAdapter) ApplyLaneBatch(ctx context.Context, _ int, batch [
 		if skip {
 			continue
 		}
-		// The skip signal is ignored on the lane path: the orchestrator counts
-		// rows_applied at ROUTE time (gated by SkipsRowChange, PG-2), and the
-		// lane advances the frontier by every seq it drains regardless of skips.
-		if _, err := la.a.dispatchPipelined(ctx, b, la.streamID, c); err != nil {
+		// The C-11 skip signal does not feed rows_applied on the lane path —
+		// the orchestrator counts it at ROUTE time (gated by SkipsRowChange,
+		// PG-2), and the lane advances the frontier by every seq it drains
+		// regardless of skips. It gates only the change's apply marks: a
+		// skipped change wrote no row, so it vouches for nothing.
+		skippedTable, err := la.a.dispatchPipelined(ctx, b, la.streamID, c)
+		if err != nil {
+			_ = b.Rollback()
+			return 0, err
+		}
+		if !skippedTable {
+			b.marks.Add(marks)
+		}
+	}
+	// ADR-0190: the lane's admitted apply marks ride this transaction, with
+	// its rows.
+	if pl, first := b.marks.Plan(&la.a.marks, false); first {
+		if err := la.a.queueApplyMarks(b, pl); err != nil {
 			_ = b.Rollback()
 			return 0, err
 		}
@@ -444,6 +463,11 @@ func (la *laneApplierAdapter) ApplyLaneBatch(ctx context.Context, _ int, batch [
 	if err := la.a.flushAndCommit(b); err != nil {
 		return 0, err
 	}
+	// Before the lane returns — so before the orchestrator advances the
+	// frontier past these changes and a checkpoint can close their
+	// transaction — record the marks as durable, or that checkpoint would not
+	// know to delete them.
+	b.marks.Committed(&la.a.marks)
 	return len(batch), nil
 }
 
@@ -477,13 +501,14 @@ func (la *laneApplierAdapter) applyLaneBatchSerial(ctx context.Context, batch []
 		_ = tx.Rollback()
 		return 0, err
 	}
+	var txMarks applymarks.TxMarks
 	for _, c := range batch {
 		if err := la.a.redactChange(ctx, c); err != nil {
 			_ = tx.Rollback()
 			return 0, fmt.Errorf("postgres: applier: redact: %w", err)
 		}
 		la.a.stampShardChange(c)
-		skip, err := la.laneApplyMarks(ctx, c)
+		skip, marks, err := la.laneApplyMarks(ctx, c)
 		if err != nil {
 			_ = tx.Rollback()
 			return 0, err
@@ -491,9 +516,19 @@ func (la *laneApplierAdapter) applyLaneBatchSerial(ctx context.Context, batch []
 		if skip {
 			continue
 		}
-		// Skip signal ignored on the lane path (see ApplyLaneBatch): rows_applied
-		// is counted at route time via SkipsRowChange (PG-2).
-		if _, err := la.a.dispatch(ctx, tx, la.streamID, c); err != nil {
+		// The C-11 skip signal gates only the change's apply marks (see
+		// ApplyLaneBatch).
+		skippedTable, err := la.a.dispatch(ctx, tx, la.streamID, c)
+		if err != nil {
+			_ = tx.Rollback()
+			return 0, err
+		}
+		if !skippedTable {
+			txMarks.Add(marks)
+		}
+	}
+	if pl, first := txMarks.Plan(&la.a.marks, false); first {
+		if err := la.a.execApplyMarksTx(ctx, tx, pl); err != nil {
 			_ = tx.Rollback()
 			return 0, err
 		}
@@ -511,20 +546,30 @@ func (la *laneApplierAdapter) applyLaneBatchSerial(ctx context.Context, batch []
 	if err := la.a.commitWithTimeout(tx); err != nil {
 		return 0, fmt.Errorf("postgres: applier: lane commit: %w", err)
 	}
+	txMarks.Committed(&la.a.marks)
 	return len(batch), nil
 }
 
-// laneApplyMarks is a lane's ADR-0190 check for one change: skip reports that
-// the apply marks prove it already applied. A lane batch deliberately writes
-// NO marks of its own — see the Tracker's sweepLocked for the invariant that
-// rests on (a lane commits a later transaction's changes while an earlier
-// one's checkpoint is still pending, which a same-transaction mark cannot be
-// ordered against). The barrier path, which checkpoints first, does write
-// them.
-func (la *laneApplierAdapter) laneApplyMarks(ctx context.Context, c ir.Change) (skip bool, err error) {
+// laneApplyMarks is a lane's ADR-0190 decision for one change: skip reports
+// that the apply marks prove it already applied, and marks are the ones the
+// lane writes with it — only those of the transaction the orchestrator's mark
+// fence cleared (amendment A, applymarks.LaneFence). Marks the fence does not
+// admit are dropped and the change applies unmarked.
+func (la *laneApplierAdapter) laneApplyMarks(ctx context.Context, c ir.Change) (skip bool, marks []applymarks.Mark, err error) {
 	decision, err := la.a.decideApplyMarks(ctx, c)
-	return decision.Skip, err
+	if err != nil || decision.Skip {
+		return decision.Skip, nil, err
+	}
+	return false, la.fence.Admitted(decision.Marks), nil
 }
+
+// ApplyMarkTx implements [laneapply.LaneApplier].
+func (la *laneApplierAdapter) ApplyMarkTx(ctx context.Context, c ir.Change) string {
+	return la.a.applyMarkFenceTx(ctx, c)
+}
+
+// ApplyMarksFenced implements [laneapply.LaneApplier].
+func (la *laneApplierAdapter) ApplyMarksFenced(txID string) { la.fence.Open(txID) }
 
 // ClassifyError maps a raw lane error to the engine's classified error so the
 // orchestrator can derive retriability (the single source of truth — a PG

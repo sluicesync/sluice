@@ -70,6 +70,9 @@ func (s *countingSeam) SkipsRowChange(_ context.Context, c ir.Change) bool {
 	return table == s.missingTable
 }
 
+func (s *countingSeam) ApplyMarkTx(context.Context, ir.Change) string { return "" }
+func (s *countingSeam) ApplyMarksFenced(string)                       {}
+
 func (s *countingSeam) total() int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()

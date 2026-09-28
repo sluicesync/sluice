@@ -17,6 +17,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/applymarks"
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/logcapture"
 )
 
@@ -44,20 +45,20 @@ import (
 // file/pos, MariaDB, Postgres pgoutput) lets the applier write an apply mark
 // with the rows of every non-idempotent change, in the same target
 // transaction, and skip on restart what a mark proves already landed. So on
-// the serial per-change, serial batched and lanes-per-change paths the same
-// crash now CONVERGES — target == source, the position advances, no refusal —
-// graded against the source's own final table state (the independent
-// expected value).
+// every path — serial per-change, serial batched, lanes per-change and lanes
+// batched — the same crash now CONVERGES: target == source, the position
+// advances, no refusal, graded against the source's own final table state
+// (the independent expected value).
 //
-// The lane BATCH path (lanes_batched) is deliberately still the pre-ADR-0190
-// loud collision: lane batches CHECK marks but write none. ADR-0190 §3's
-// lane protocol (each lane writes its marks in its own transaction) can,
-// with two transactions in the lane post-commit window sharing a key, skip
-// the later transaction's change after the earlier one's re-applied change
-// resurrected a row — a loud collision turned silent. The implementation
-// note in the ADR carries the analysis and the proposed amendment; until the
-// operator decides it, this cell pins the old loud behaviour, so the
-// amendment flips it here on purpose.
+// The lane BATCH path writes its marks under ADR-0190 amendment A: before a
+// transaction's first marked change reaches a lane, the coordinator drains
+// the lanes and checkpoints, so a lane never commits a transaction's marks
+// alongside an earlier, un-checkpointed transaction's changes. Without it, T1
+// updating a key and T2 deleting it in one lane batch, killed before the
+// checkpoint passed T1, replays T1's update (recreating the key) and skips
+// T2's delete on its own mark — silent. lane_post_commit_window builds that
+// window on purpose: it holds the stream's position row locked, so every
+// checkpoint blocks while the lanes keep committing.
 //
 // The contract that holds in every cell: a kill mid-transaction never
 // persists a position past the transaction, never damages a row the
@@ -296,8 +297,8 @@ type crashMidTxnCell struct {
 	// fixedCap turns the ADR-0052 batch-size controller off, so the batch
 	// size is exactly the configured one.
 	fixedCap bool
-	// converges: the restart converges exactly (ADR-0190). False for the one
-	// path that writes no marks — see the file comment.
+	// converges: the restart converges exactly (ADR-0190). False for a cell
+	// whose marks are refused or unavailable.
 	converges bool
 
 	// body is the source transaction (crashMidTxnSource when empty).
@@ -321,7 +322,7 @@ func runCrashMidTxnSuite(t *testing.T, src crashSource, tgt resendTarget, pins c
 		// cap flushes mid-transaction, and the marks ride each flush.
 		{name: "serial_batched_over_cap", concurrency: 1, batch: 5, fixedCap: true, converges: true},
 		{name: "lanes_per_change", concurrency: 0, batch: 0, converges: true},
-		{name: "lanes_batched", concurrency: 0, batch: 1000},
+		{name: "lanes_batched", concurrency: 0, batch: 1000, converges: true},
 		{name: "pkchange_serial_per_change", concurrency: 1, batch: 0, body: crashMidTxnPKChangeSource, converges: true},
 		{name: "pkchange_lanes_batched", concurrency: 0, batch: 1000, body: crashMidTxnPKChangeSource, converges: true},
 	}
@@ -346,6 +347,13 @@ func runCrashMidTxnSuite(t *testing.T, src crashSource, tgt resendTarget, pins c
 					execTarget(t, tgt, "UPDATE sluice_cdc_apply_marks SET change_digest = 'tampered' WHERE stream_id = ?", streamID)
 				},
 				wantRefusal: applymarks.MismatchMarker,
+			},
+			// Stale marks — another transaction's — are never evidence: one on a
+			// key the replay applies skips nothing, and one on a key nothing
+			// touches is retired by the restart sweep alone.
+			crashMidTxnCell{
+				name: "stale_mark_swept", concurrency: 1, batch: 0, converges: true,
+				tamper: plantStaleMark,
 			},
 			// A changed row-filter scope refuses rather than trusting a mark.
 			crashMidTxnCell{
@@ -373,6 +381,9 @@ func runCrashMidTxnSuite(t *testing.T, src crashSource, tgt resendTarget, pins c
 			runCrashMidTxnCell(t, src, tgt, cell)
 		})
 	}
+	t.Run("lane_post_commit_window", func(t *testing.T) {
+		runCrashLanePostCommitWindow(t, src, tgt)
+	})
 	if pins&crashPinsColdStart != 0 {
 		t.Run("cold_start_clears_marks", func(t *testing.T) {
 			runCrashColdStartClearsMarks(t, src, tgt)
@@ -555,12 +566,12 @@ func runCrashMidTxnCell(t *testing.T, src crashSource, tgt resendTarget, cell cr
 			t.Errorf("%d apply marks survived the position passing their transactions (garbage collection): %v", len(left), marksPerTable(left))
 		}
 	default:
-		// KNOWN LOUD: the path writes no marks (lanes_batched — see the file
-		// comment), or its marks are unavailable (marks_unavailable).
+		// KNOWN LOUD: the marks are unavailable (marks_unavailable), so the
+		// restart behaves exactly as before ADR-0190.
 		if caughtUp || restartErr == nil {
 			diff := diffResendRows(dumpCrashSource(t, src), tgt.dump(t))
-			t.Fatalf("cell changed: the restart after a kill mid-transaction resumed (caught up %v, error %v). "+
-				"If the lane-mark amendment landed, make this cell converge; otherwise find out why. Diff:\n%s", caughtUp, restartErr, diff)
+			t.Fatalf("cell changed: the restart after a kill mid-transaction resumed (caught up %v, error %v); find out why. Diff:\n%s",
+				caughtUp, restartErr, diff)
 		}
 		if !isUniqueCollision(restartErr) {
 			t.Errorf("the restart stopped, but not on the unique collision GC-38 (l) describes: %v", restartErr)
@@ -606,6 +617,120 @@ func runCrashColdStartClearsMarks(t *testing.T, src crashSource, tgt resendTarge
 	}
 	if diff := diffResendRows(dumpCrashSource(t, src), tgt.dump(t)); diff != "" {
 		t.Errorf("the re-snapshot diverged:\n%s", diff)
+	}
+}
+
+// runCrashLanePostCommitWindow is ADR-0190 amendment A's own cell. Two source
+// transactions on one row of the secondary-unique table — T1 updates row 7,
+// T2 deletes it — reach the lane BATCH path while the stream's position row
+// is held locked on the target, so every checkpoint blocks and the lanes
+// commit into the window between a lane commit and the checkpoint that would
+// pass it. The kill lands in that window.
+//
+// Without the mark fence a lane can commit T2's delete, with its mark, behind
+// T1's update; the restart from before T1 re-applies T1's update (row 7's
+// mark is T2's, which proves nothing about T1, so it recreates the row) and
+// skips T2's delete on its own mark — row 7 left on the target, at exit 0.
+// With the fence, T2's first marked change waits for the checkpoint past T1,
+// which the lock holds back, so T2 never commits before the kill; the restart
+// skips T1 on its mark and applies T2. Graded against the source's table.
+func runCrashLanePostCommitWindow(t *testing.T, src crashSource, tgt resendTarget) {
+	cell := crashMidTxnCell{concurrency: 0, batch: 1000}
+	fx := newCrashStreamFixture(t, src, tgt, cell)
+	defer fx.teardown()
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	defer cancel1()
+	run1 := make(chan error, 1)
+	go func() { run1 <- fx.newStreamer().Run(ctx1) }()
+	waitResend(t, run1, 120*time.Second, "the cold copy", func() bool { return len(tgt.dump(t)) >= 200 })
+	src.exec(t, fmt.Sprintf(`INSERT INTO rs (id, u, v, pad) VALUES (%d, NULL, 'live', 'l')`, crashSentinelLive))
+	waitResend(t, run1, 60*time.Second, "the first CDC row", func() bool { return tgt.has(crashSentinelLive) })
+	posBefore := settledPosition(t, tgt, fx.streamID)
+
+	release := holdRowLock(t, driverOf(tgt), tgt.dsn,
+		fmt.Sprintf(`SELECT 1 FROM sluice_cdc_state WHERE stream_id = '%s' FOR UPDATE`, fx.streamID))
+	released := false
+	defer func() {
+		if !released {
+			release()
+		}
+	}()
+	src.txn(t, `UPDATE rs SET v = 't1' WHERE id = 7;`)
+	src.txn(t, `DELETE FROM rs WHERE id = 7;`)
+	// T1 reaching the target (or, without the fence, T1 and T2 both) proves
+	// the lanes committed into the window no checkpoint can close.
+	landed := waitResendSoft(run1, 30*time.Second, func() bool {
+		return countTarget(tgt, "SELECT COUNT(*) FROM rs WHERE id = 7 AND v = 't1'") == 1 ||
+			countTarget(tgt, "SELECT COUNT(*) FROM rs WHERE id = 7") == 0
+	})
+	if !landed {
+		t.Fatal("T1 never reached the target: the window was not built, so this cell would pass vacuously")
+	}
+	time.Sleep(2 * time.Second) // let T2 reach the fence (or, without one, its lane)
+	cancel1()
+	select {
+	case <-run1:
+	case <-time.After(60 * time.Second):
+		t.Fatal("the first stream did not return after cancel")
+	}
+	posAfterKill := tgt.readPos(fx.streamID)
+	release()
+	released = true
+	if posAfterKill != posBefore {
+		t.Fatalf("the position moved (%q → %q) while its row was held locked: the window closed before the kill, so the cell measured nothing",
+			posBefore, posAfterKill)
+	}
+	marks := targetMarks(t, tgt, fx.streamID)
+	if txs := distinctTxs(marks); len(txs) > 1 {
+		t.Errorf("apply marks exist for %d transactions at the kill (%v); the fence allows at most the one after the position", len(txs), txs)
+	}
+	t.Logf("apply marks at the kill: %d (%v); row 7 at the kill: %d", len(marks), marksPerTable(marks),
+		countTarget(tgt, "SELECT COUNT(*) FROM rs WHERE id = 7"))
+
+	caughtUp, restartErr := resumeCrashStreamWith(t, fx.newStreamer, nil, src, tgt, true, fx.streamID, posAfterKill)
+	if !caughtUp || restartErr != nil {
+		t.Fatalf("the restart after a kill in the lane post-commit window did not converge: caught up %v, error %v", caughtUp, restartErr)
+	}
+	assertCrashConverged(t, src, tgt)
+	if left := targetMarks(t, tgt, fx.streamID); len(left) > 0 {
+		t.Errorf("%d apply marks survived the position passing their transactions (garbage collection): %v", len(left), marksPerTable(left))
+	}
+}
+
+// plantStaleMark writes two marks of a transaction that is never
+// re-delivered. One sits on row 100's key, which the restart's replay DOES
+// apply (the blocked statement never reached the target): it is consulted and
+// must prove nothing — and the replay's own mark then overwrites it (same
+// key), so it cannot grade the sweep. The other sits on row 150's key, which
+// nothing touches: nothing overwrites it and no transaction close names it,
+// so only the restart sweep can retire it. Their table name and scope are
+// copied from a real mark, and the test's key digest is first checked against
+// the engine's (row 1's mark): a digest that matched no key would never be
+// consulted.
+func plantStaleMark(t *testing.T, tgt resendTarget, streamID string) {
+	t.Helper()
+	db, err := sql.Open(driverOf(tgt), tgt.dsn)
+	if err != nil {
+		t.Fatalf("open target: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	row1, _ := applymarks.KeyDigest(ir.Row{"id": int64(1)}, []string{"id"})
+	row100, _ := applymarks.KeyDigest(ir.Row{"id": int64(100)}, []string{"id"})
+	find := "SELECT table_name, scope_digest FROM sluice_cdc_apply_marks WHERE stream_id = ? AND key_digest = ?"
+	plant := "INSERT INTO sluice_cdc_apply_marks (stream_id, table_name, key_digest, tx_id, seq, change_digest, scope_digest) VALUES (?, ?, ?, ?, ?, ?, ?)"
+	if tgt.engine == "postgres" {
+		find = "SELECT table_name, scope_digest FROM sluice_cdc_apply_marks WHERE stream_id = $1 AND key_digest = $2"
+		plant = "INSERT INTO sluice_cdc_apply_marks (stream_id, table_name, key_digest, tx_id, seq, change_digest, scope_digest) VALUES ($1, $2, $3, $4, $5, $6, $7)"
+	}
+	var table, scope string
+	if err := db.QueryRow(find, streamID, row1).Scan(&table, &scope); err != nil {
+		t.Fatalf("no apply mark on row 1's key (%v): the test's key digest does not match the engine's, so a planted mark would never be consulted", err)
+	}
+	row150, _ := applymarks.KeyDigest(ir.Row{"id": int64(150)}, []string{"id"})
+	for _, key := range []string{row100, row150} {
+		if _, err := db.Exec(plant, streamID, table, key, "stale:never-redelivered", 1_000_000, "stale", scope); err != nil {
+			t.Fatalf("plant a stale mark: %v", err)
+		}
 	}
 }
 

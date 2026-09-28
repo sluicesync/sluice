@@ -12,8 +12,8 @@ package mysql
 // state the design cannot tolerate — so a mark write never rides a separate
 // transaction).
 //
-// Which paths write, which check (the delivered subset; see the ADR-0190
-// implementation note):
+// Which paths write (every apply path; see ADR-0190 "Implementation status"
+// and amendment A):
 //
 //   - per-change (Apply / applyOneImpl) and the serial batch loop write marks
 //     with their rows and delete a transaction's marks with the position
@@ -21,7 +21,9 @@ package mysql
 //   - the lane barrier (applyBarrierNoPosition) writes marks — its
 //     pre-barrier checkpoint has already persisted the position up to the
 //     barrier's own transaction;
-//   - lane batches CHECK marks but write none, and the frontier checkpoint
+//   - lane batches write the marks of the transaction the coordinator's mark
+//     fence cleared (amendment A: it drained the lanes and persisted the
+//     position at that transaction's start first), and the frontier checkpoint
 //     deletes the marks of every transaction it passes.
 //
 // The mark table is created only by EnsureControlTable and only when absent
@@ -236,6 +238,21 @@ func (a *ChangeApplier) applyMarksSkip(ctx context.Context, c ir.Change) bool {
 	}
 	s, err := a.applyMarkSubject(ctx, c)
 	return err == nil && a.marks.Skips(c, s)
+}
+
+// applyMarkFenceTx is the lane coordinator's route-time question (ADR-0190
+// amendment A): the transaction whose apply mark c would write, or "" when it
+// writes none. A subject probe that fails answers the transaction — fencing
+// costs only a drain, and the apply path raises the probe error itself.
+func (a *ChangeApplier) applyMarkFenceTx(ctx context.Context, c ir.Change) string {
+	id := ir.ApplyIDOf(c)
+	if !a.marks.Enabled() || id.IsZero() {
+		return ""
+	}
+	if s, err := a.applyMarkSubject(ctx, c); err == nil && !a.marks.WouldMark(c, s) {
+		return ""
+	}
+	return id.TxID
 }
 
 // execApplyMarksTx runs a plan on the apply transaction.

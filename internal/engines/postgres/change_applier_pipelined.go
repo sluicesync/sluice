@@ -102,8 +102,8 @@ type pgxBatchTx struct {
 	stmts   []queuedStmt
 
 	// marks is the batch's ADR-0190 apply-mark bookkeeping on the serial
-	// batch path (queued with the data, committed with it). Unused on the
-	// lane path, whose batches write no marks.
+	// batch AND lane paths (queued with the data, committed with it; a lane
+	// adds only the marks its mark fence admits).
 	marks applymarks.TxMarks
 
 	released bool

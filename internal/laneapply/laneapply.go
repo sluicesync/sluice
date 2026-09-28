@@ -216,6 +216,22 @@ type LaneApplier interface {
 	// and for any probe error (fail toward counting; never abort the run from
 	// here — a genuine metadata error surfaces loudly on the apply path).
 	SkipsRowChange(ctx context.Context, c ir.Change) bool
+
+	// ApplyMarkTx reports the source transaction (its [ir.ApplyID] TxID)
+	// whose ADR-0190 apply mark a lane would write when it applies c, or ""
+	// when c writes none (no identity, marks disabled, an idempotent class, or
+	// a change the marks prove already applied). It is asked at ROUTE time and
+	// has no side effect; an implementation that cannot tell (a metadata probe
+	// failed) answers the TxID, because the fence it triggers costs only a
+	// drain. See [Orchestrator.fenceApplyMarks].
+	ApplyMarkTx(ctx context.Context, c ir.Change) string
+
+	// ApplyMarksFenced clears the lanes to write txID's apply marks: the
+	// orchestrator has drained every lane to the transaction's first marked
+	// change and persisted the checkpoint, so the position sits at the
+	// transaction's start (ADR-0190 amendment A). A lane must write NO mark of
+	// any other transaction — it applies such a change unmarked instead.
+	ApplyMarksFenced(txID string)
 }
 
 // retriable reports whether the raw lane error is one the ADR-0038 streamer
@@ -466,6 +482,10 @@ type Orchestrator struct {
 	// marks it then deletes with the position. Coordinator-goroutine-only.
 	curTx    string
 	closedTx map[uint64]string
+
+	// fencedTx is the transaction the last ADR-0190 mark fence cleared the
+	// lanes for (see fenceApplyMarks). Coordinator-goroutine-only.
+	fencedTx string
 
 	cancel context.CancelFunc
 
@@ -888,6 +908,9 @@ func (o *Orchestrator) routeRow(ctx context.Context, seq uint64, c ir.Change) er
 		// mis-routed).
 		return o.barrier(ctx, seq, c)
 	}
+	if err := o.fenceApplyMarks(ctx, seq, c); err != nil {
+		return err
+	}
 	lane := o.router.LaneForRoute(route)
 	// Push the {seq, change} envelope so the lane reads the sequence and its
 	// change inherently paired (the FIFO-alignment fix — no sibling seq
@@ -900,6 +923,43 @@ func (o *Orchestrator) routeRow(ctx context.Context, seq uint64, c ir.Change) er
 	}
 	o.sinceCheckpoint++
 	return o.maybeCheckpoint(ctx)
+}
+
+// fenceApplyMarks is ADR-0190 amendment A (operator-approved 2026-09-28):
+// before the FIRST change of a source transaction that will write an apply
+// mark reaches a lane, drain every lane to that change's predecessor and
+// persist the checkpoint — the barrier's own prefix — then clear the lanes to
+// write the transaction's marks. The persisted position then sits at the
+// transaction's start, so no EARLIER transaction can ever be re-delivered
+// alongside its marks; and the next transaction's fence drains this one and
+// moves the position past it, deleting its marks in that checkpoint. Marks
+// therefore only ever exist for the first transaction after the persisted
+// position, which is what makes the same-transaction skip rule sufficient.
+//
+// Without it a lane batch could commit T1's update of a key and T2's delete
+// of it together, T2's mark on the key; a crash before the checkpoint passed
+// T1 replays T1's update (a mark of another transaction proves nothing, so it
+// re-applies and recreates the key) and then skips T2's delete on its own
+// mark — the key left on the target at exit 0. applymarks.LaneFence carries
+// the full counterexample.
+//
+// The cost is one drain + checkpoint per source transaction that sends a
+// marked change to a lane — none for an idempotent-only transaction (the
+// PK-only steady state) or a stream whose reader stamps no identity.
+func (o *Orchestrator) fenceApplyMarks(ctx context.Context, seq uint64, c ir.Change) error {
+	tx := o.la.ApplyMarkTx(ctx, c)
+	if tx == "" || tx == o.fencedTx {
+		return nil
+	}
+	if err := o.frontier.WaitForFrontier(ctx, seq-1); err != nil {
+		return err
+	}
+	if err := o.writeCheckpoint(ctx); err != nil {
+		return err
+	}
+	o.fencedTx = tx
+	o.la.ApplyMarksFenced(tx)
+	return nil
 }
 
 // barrier applies a globally-ordered event (Truncate / SchemaSnapshot /

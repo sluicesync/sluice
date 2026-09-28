@@ -28,6 +28,7 @@ import (
 	"log/slog"
 	"time"
 
+	"sluicesync.dev/sluice/internal/applymarks"
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/laneapply"
 )
@@ -234,6 +235,10 @@ type laneApplierAdapter struct {
 	streamID       string
 	laneDB         *sql.DB
 	laneCommitHook func(buf []laneChange) error
+
+	// fence is the orchestrator's ADR-0190 amendment-A clearance: the lanes
+	// write only the fenced transaction's apply marks.
+	fence applymarks.LaneFence
 }
 
 // RouteForChange decodes the row change's schema/table, loads the PK columns,
@@ -352,12 +357,10 @@ func (la *laneApplierAdapter) ApplyLaneBatch(ctx context.Context, _ int, batch [
 			return 0, fmt.Errorf("mysql: applier: redact: %w", err)
 		}
 		la.a.stampShardChange(c)
-		// ADR-0190: a lane CHECKS the apply marks but writes none of its
-		// own — see the Tracker's sweepLocked for the invariant that rests
-		// on (a lane commits a later transaction's changes while an earlier
-		// one's checkpoint is still pending, which a same-transaction mark
-		// cannot be ordered against). The barrier path, which checkpoints
-		// first, does write them.
+		// ADR-0190: a change the apply marks prove already applied is
+		// dropped; an applied one writes its marks in this transaction —
+		// only those of the transaction the orchestrator's mark fence
+		// cleared (amendment A, applymarks.LaneFence).
 		decision, err := la.a.decideApplyMarks(ctx, c)
 		if err != nil {
 			_ = tx.Rollback()
@@ -366,12 +369,18 @@ func (la *laneApplierAdapter) ApplyLaneBatch(ctx context.Context, _ int, batch [
 		if decision.Skip {
 			continue
 		}
-		// Skip signal ignored on the lane path: the orchestrator counts
-		// rows_applied at ROUTE time (gated by SkipsRowChange, PG-2), and the
-		// lane advances the frontier by every seq it drains regardless of skips.
-		if _, err := btx.dispatch(ctx, la.streamID, c); err != nil {
+		// The C-11 skip signal does not feed rows_applied on the lane path —
+		// the orchestrator counts it at ROUTE time (gated by SkipsRowChange,
+		// PG-2), and the lane advances the frontier by every seq it drains
+		// regardless of skips. It gates only the change's apply marks: a
+		// skipped change wrote no row, so it vouches for nothing.
+		skippedTable, err := btx.dispatch(ctx, la.streamID, c)
+		if err != nil {
 			_ = tx.Rollback()
 			return 0, err
+		}
+		if !skippedTable {
+			btx.marks.Add(la.fence.Admitted(decision.Marks))
 		}
 	}
 	// Flush the trailing coalesced run (upsert-run or delete-run; ADR-0140)
@@ -380,6 +389,12 @@ func (la *laneApplierAdapter) ApplyLaneBatch(ctx context.Context, _ int, batch [
 	if err := btx.flushPending(ctx); err != nil {
 		_ = tx.Rollback()
 		return 0, err
+	}
+	if pl, first := btx.marks.Plan(&la.a.marks, false); first {
+		if err := la.a.execApplyMarksTx(ctx, tx, pl); err != nil {
+			_ = tx.Rollback()
+			return 0, err
+		}
 	}
 	// Test seam: force a commit-path failure deterministically (the lane
 	// analogue of the serial path's removed pipelineTestCommitHook). nil in
@@ -400,8 +415,21 @@ func (la *laneApplierAdapter) ApplyLaneBatch(ctx context.Context, _ int, batch [
 	if err := la.a.commitWithTimeout(tx); err != nil {
 		return 0, fmt.Errorf("mysql: applier: lane commit: %w", err)
 	}
+	// Before the lane returns — so before the orchestrator advances the
+	// frontier past these changes and a checkpoint can close their
+	// transaction — record the marks as durable, or that checkpoint would not
+	// know to delete them.
+	btx.marks.Committed(&la.a.marks)
 	return len(batch), nil
 }
+
+// ApplyMarkTx implements [laneapply.LaneApplier].
+func (la *laneApplierAdapter) ApplyMarkTx(ctx context.Context, c ir.Change) string {
+	return la.a.applyMarkFenceTx(ctx, c)
+}
+
+// ApplyMarksFenced implements [laneapply.LaneApplier].
+func (la *laneApplierAdapter) ApplyMarksFenced(txID string) { la.fence.Open(txID) }
 
 // ClassifyError maps a raw lane error to the engine's classified error so the
 // orchestrator can derive retriability (the single source of truth — a Vitess

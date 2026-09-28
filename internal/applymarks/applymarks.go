@@ -254,6 +254,16 @@ func (t *Tracker) Skips(c ir.Change, s Subject) bool {
 	return err == nil && d.Skip
 }
 
+// WouldMark reports, with no side effect, whether [Tracker.Decide] would have
+// c write a mark — or would refuse it. The lane coordinator asks it at ROUTE
+// time to decide whether the change needs a mark fence (see [LaneFence]); a
+// refusal answers true because fencing first costs only a drain, and the
+// apply path raises the refusal either way.
+func (t *Tracker) WouldMark(c ir.Change, s Subject) bool {
+	d, _, err := t.verdict(c, s)
+	return err != nil || (!d.Skip && len(d.Marks) > 0)
+}
+
 // verdict is [Tracker.Decide] without its bookkeeping. involved is false
 // when the change neither consults nor writes a mark — no identity, the
 // tracker disabled, or an idempotent class on a table with nothing on record.
@@ -395,10 +405,11 @@ func (t *Tracker) CloseTxs(txIDs []string) {
 // the commit's mark deletion, so their marks never outlive the one
 // transaction in flight; the lane barrier writes marks only after its
 // pre-barrier checkpoint has persisted the position up to the barrier's own
-// transaction; and lane batches write none (ADR-0190 implementation note:
-// a lane transaction's marks could outlive an earlier, unpersisted
-// transaction, which the same-transaction skip rule cannot order against).
-// So at the first close, every loaded mark is either that transaction's —
+// transaction; and a lane writes a transaction's marks only once the
+// coordinator's mark fence has done the same for it ([LaneFence], ADR-0190
+// amendment A) — and the next transaction's fence moves the position past it,
+// deleting them. So at the first close, every loaded mark is either that
+// transaction's —
 // now passed — or stale, left behind by a position that moved without this
 // binary's bookkeeping (an older binary, a run with marks unavailable, an
 // external position write). Stale marks are harmless to the skip rule (a

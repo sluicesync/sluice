@@ -231,8 +231,8 @@ type mysqlBatchTx struct {
 	ctx context.Context
 
 	// marks is the batch's ADR-0190 apply-mark bookkeeping on the serial
-	// batch path (written with the data, committed with it). Unused on the
-	// lane path, whose batches write no marks.
+	// batch AND lane paths (written with the data, committed with it; a lane
+	// adds only the marks its mark fence admits).
 	marks applymarks.TxMarks
 }
 

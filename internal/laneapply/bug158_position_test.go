@@ -58,6 +58,10 @@ func (s *recordingSeam) ApplyBarrierChange(_ context.Context, c ir.Change) error
 // SkipsRowChange: this stub applies every table, so nothing is ever skipped.
 func (s *recordingSeam) SkipsRowChange(context.Context, ir.Change) bool { return false }
 
+// No apply marks: the stub stream carries no identity.
+func (s *recordingSeam) ApplyMarkTx(context.Context, ir.Change) string { return "" }
+func (s *recordingSeam) ApplyMarksFenced(string)                       {}
+
 func (s *recordingSeam) lastCheckpoint() (string, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
