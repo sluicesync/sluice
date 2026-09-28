@@ -779,8 +779,9 @@ func (t *Tracker) warnUntrusted(m Mark, first *string) {
 	slog.Warn("apply-marks: "+UntrustedMarker+": a durable apply mark names a replayed change's own transaction, but "+
 		"that transaction was not the first this run re-delivered — marks only ever exist for the first transaction "+
 		"after the persisted position, so the position moved behind it and the mark is not evidence. The change is "+
-		"APPLIED, not skipped: a unique collision may stop the stream loudly, and nothing is skipped silently. Report "+
-		"this with the log around it (ADR-0190 amendment B)",
+		"APPLIED, not skipped: nothing is skipped silently, but the re-apply is not always loud — a unique collision stops "+
+		"the stream, while on a keyless table it can add a duplicate row (ADR-0089 at-least-once), so compare that table "+
+		"against the source. Report this with the log around it (ADR-0190 amendment B)",
 		slog.String("stream_id", t.streamID), slog.String("mark_tx_id", m.TxID),
 		slog.String("first_tx_id", firstTx), slog.String("table", m.Table))
 }
