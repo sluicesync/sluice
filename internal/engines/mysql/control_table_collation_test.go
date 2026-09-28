@@ -42,6 +42,10 @@ var controlDDLPredicateColumns = map[string][]string{
 	// lease_holder_stream_id = ?` — a case-folded holder id would let
 	// the wrong stream extend or release another's lease.
 	"sluice_shard_consolidation_lease": {"lease_holder_stream_id"},
+	// The ADR-0190 garbage collection deletes `WHERE stream_id = ? AND
+	// tx_id IN (…)`; a case-folded tx_id could delete another
+	// transaction's marks.
+	"sluice_cdc_apply_marks": {"tx_id"},
 }
 
 // controlDDLs is every control-table CREATE the MySQL engine emits,
@@ -55,6 +59,7 @@ func controlDDLs(t *testing.T) map[string]string {
 		schemaHistoryTableName:           schemaHistoryTableDDL(""),
 		cdcQueryTimeoutRaiseTableName:    cdcQueryTimeoutRaiseTableDDL(""),
 		skippedTablesTableName:           skippedTablesTableDDL(""),
+		applyMarksTableName:              applyMarksTableDDL(""),
 		migrateStateTableName:            migrateStateHeaderDDL(),
 		migrateProgressTableName:         migrateProgressDDL(),
 		keysetTableName:                  keysetTableDDL(),

@@ -407,6 +407,14 @@ func (la *laneApplierAdapter) ApplyLaneBatch(ctx context.Context, _ int, batch [
 			return 0, fmt.Errorf("postgres: applier: redact: %w", err)
 		}
 		la.a.stampShardChange(c)
+		skip, err := la.laneApplyMarks(ctx, c)
+		if err != nil {
+			_ = b.Rollback()
+			return 0, err
+		}
+		if skip {
+			continue
+		}
 		// The skip signal is ignored on the lane path: the orchestrator counts
 		// rows_applied at ROUTE time (gated by SkipsRowChange, PG-2), and the
 		// lane advances the frontier by every seq it drains regardless of skips.
@@ -475,6 +483,14 @@ func (la *laneApplierAdapter) applyLaneBatchSerial(ctx context.Context, batch []
 			return 0, fmt.Errorf("postgres: applier: redact: %w", err)
 		}
 		la.a.stampShardChange(c)
+		skip, err := la.laneApplyMarks(ctx, c)
+		if err != nil {
+			_ = tx.Rollback()
+			return 0, err
+		}
+		if skip {
+			continue
+		}
 		// Skip signal ignored on the lane path (see ApplyLaneBatch): rows_applied
 		// is counted at route time via SkipsRowChange (PG-2).
 		if _, err := la.a.dispatch(ctx, tx, la.streamID, c); err != nil {
@@ -498,6 +514,18 @@ func (la *laneApplierAdapter) applyLaneBatchSerial(ctx context.Context, batch []
 	return len(batch), nil
 }
 
+// laneApplyMarks is a lane's ADR-0190 check for one change: skip reports that
+// the apply marks prove it already applied. A lane batch deliberately writes
+// NO marks of its own — see the Tracker's sweepLocked for the invariant that
+// rests on (a lane commits a later transaction's changes while an earlier
+// one's checkpoint is still pending, which a same-transaction mark cannot be
+// ordered against). The barrier path, which checkpoints first, does write
+// them.
+func (la *laneApplierAdapter) laneApplyMarks(ctx context.Context, c ir.Change) (skip bool, err error) {
+	decision, err := la.a.decideApplyMarks(ctx, c)
+	return decision.Skip, err
+}
+
 // ClassifyError maps a raw lane error to the engine's classified error so the
 // orchestrator can derive retriability (the single source of truth — a PG
 // serialization (40001) / deadlock (40P01) abort satisfies
@@ -512,7 +540,7 @@ func (la *laneApplierAdapter) ClassifyError(err error) error {
 // guard; this does only the durable write. The F7 synchronous_commit pin is
 // applied (the position is durable per ADR-0007's hardening), and each error
 // is classified exactly as the serial position write would be.
-func (la *laneApplierAdapter) WriteCheckpoint(ctx context.Context, pos ir.Position, rowsApplied int64) error {
+func (la *laneApplierAdapter) WriteCheckpoint(ctx context.Context, pos ir.Position, rowsApplied int64, closedTxs []string) error {
 	a := la.a
 	// H-4: the frontier checkpoint is the concurrent path's position-write
 	// boundary, so flush the coalesced skip ledger the W lanes accumulated
@@ -529,6 +557,14 @@ func (la *laneApplierAdapter) WriteCheckpoint(ctx context.Context, pos ir.Positi
 		_ = tx.Rollback()
 		return classifyApplierError(err)
 	}
+	// ADR-0190: this position passes closedTxs, so their apply marks go in
+	// the same transaction as the position.
+	a.marks.CloseTxs(closedTxs)
+	marks := a.marks.Plan(nil, true)
+	if err := a.execApplyMarksTx(ctx, tx, marks); err != nil {
+		_ = tx.Rollback()
+		return classifyApplierError(err)
+	}
 	posCtx, posCancel := a.execTimeoutCtx(ctx)
 	werr := writePositionTx(posCtx, tx, a.controlSchema, la.streamID, pos.Token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, rowsApplied)
 	posCancel()
@@ -539,6 +575,7 @@ func (la *laneApplierAdapter) WriteCheckpoint(ctx context.Context, pos ir.Positi
 	if err := a.commitWithTimeout(tx); err != nil {
 		return classifyApplierError(fmt.Errorf("postgres: applier: checkpoint commit: %w", err))
 	}
+	a.marks.Committed(marks)
 	return nil
 }
 
@@ -576,7 +613,9 @@ func (la *laneApplierAdapter) SkipsRowChange(ctx context.Context, c ir.Change) b
 	}
 	schema, table := laneapply.RowChangeSchemaTable(c)
 	_, err := la.a.colTypesFor(ctx, la.a.routedSchema(schema), table)
-	return errors.Is(err, errUnknownTable)
+	// ADR-0190: a change the apply marks prove already applied is dropped by
+	// the lane too, and counts toward rows_applied no more than a C-11 skip.
+	return errors.Is(err, errUnknownTable) || la.a.applyMarksSkip(ctx, c)
 }
 
 // applyBatchConcurrent is the ADR-0105 concurrent key-hash apply entry,

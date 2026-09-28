@@ -92,6 +92,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/appliershared"
+	"sluicesync.dev/sluice/internal/applymarks"
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/laneapply"
 )
@@ -228,6 +229,11 @@ type mysqlBatchTx struct {
 	// within a single RunOneBatch call under this ctx, so storing it on the
 	// handle is the correct lifetime (mirrors PG's pgxBatchTx.ctx).
 	ctx context.Context
+
+	// marks is the batch's ADR-0190 apply-mark bookkeeping on the serial
+	// batch path (written with the data, committed with it). Unused on the
+	// lane path, whose batches write no marks.
+	marks applymarks.TxMarks
 }
 
 // beginCoalescingBatchTx opens the batch *sql.Tx and wraps it in a

@@ -810,12 +810,17 @@ func (f *whereCDCFilter) route(c ir.Change) ([]ir.Change, error) {
 			return nil, nil // never in scope
 		case !before && after:
 			// move-IN: the target never had this row → INSERT the after-image.
+			// The rewrite keeps the UPDATE's ADR-0190 identity: it is the
+			// same source change, rewritten the same way on every delivery
+			// under the same --where (a changed --where refuses on the
+			// marks' scope digest).
 			return []ir.Change{ir.Insert{
 				Position:   e.Position,
 				Schema:     e.Schema,
 				Table:      e.Table,
 				Row:        e.After,
 				CommitTime: e.CommitTime,
+				ApplyID:    e.ApplyID,
 			}}, nil
 		default:
 			// move-OUT (before && !after): DELETE by key so the now-out-of-
@@ -842,6 +847,7 @@ func (f *whereCDCFilter) route(c ir.Change) ([]ir.Change, error) {
 				Table:      e.Table,
 				Before:     narrowed,
 				CommitTime: e.CommitTime,
+				ApplyID:    e.ApplyID,
 			}}, nil
 		}
 	default:

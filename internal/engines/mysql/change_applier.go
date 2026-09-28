@@ -17,6 +17,7 @@ import (
 	"github.com/go-sql-driver/mysql"
 
 	"sluicesync.dev/sluice/internal/appliershared"
+	"sluicesync.dev/sluice/internal/applymarks"
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/redact"
 )
@@ -495,6 +496,17 @@ type ChangeApplier struct {
 	// the schedule's derivation and what the sampling deliberately
 	// weakens). Atomic for the same W-goroutine reason as warnedClamp.
 	clampProbes atomic.Int64
+
+	// marks is the stream's ADR-0190 exactly-once apply-mark tracker,
+	// loaded at the start of every apply run (see apply_marks.go). Internally
+	// locked — the ADR-0104 lanes consult it from W goroutines. Its zero
+	// value is disabled: every change applies and no mark is written, which
+	// is what a construction that never runs an apply loop gets.
+	marks applymarks.Tracker
+
+	// applyMarksEnsureErr is why EnsureControlTable could not create the
+	// mark table, reported by the APPLY-MARKS-UNAVAILABLE WARN at apply start.
+	applyMarksEnsureErr error
 }
 
 // activeSchemaVersion is one entry in the ADR-0049 Chunk C applier
@@ -893,7 +905,15 @@ func (a *ChangeApplier) EnsureControlTable(ctx context.Context) error {
 	// Audit C-11: the unknown-target-table skip ledger. Additive; created
 	// empty and written only when a stream carries changes for a table
 	// the target lacks.
-	return ensureSkippedTablesTable(ctx, a.db, a.controlKeyspace)
+	if err := ensureSkippedTablesTable(ctx, a.db, a.controlKeyspace); err != nil {
+		return err
+	}
+	// ADR-0190: the apply-mark table is best-effort by operator decision — a
+	// safe-migrations branch or a role that cannot create it runs without
+	// marks (the APPLY-MARKS-UNAVAILABLE WARN at apply start names why)
+	// rather than refusing to start.
+	a.applyMarksEnsureErr = ensureApplyMarksTable(ctx, a.db, a.controlKeyspace)
+	return nil
 }
 
 // CompactSchemaHistoryBelow implements [ir.SchemaHistoryCompactor]
@@ -985,6 +1005,11 @@ func (a *ChangeApplier) ClearStopRequested(ctx context.Context, streamID string)
 func (a *ChangeApplier) ClearStream(ctx context.Context, streamID string) error {
 	if streamID == "" {
 		return errors.New("mysql: applier: ClearStream: streamID is empty")
+	}
+	// A stream's ADR-0190 apply marks describe its CDC position; the row
+	// that holds that position is going, so they go first.
+	if err := clearApplyMarks(ctx, a.db, a.controlKeyspace, streamID); err != nil {
+		return err
 	}
 	return clearStream(ctx, a.db, a.controlKeyspace, streamID)
 }
@@ -1108,7 +1133,13 @@ func (a *ChangeApplier) Apply(ctx context.Context, streamID string, changes <-ch
 	// transaction, which ADR-0010's idempotent apply absorbs: re-delivery,
 	// never loss. Changes OUTSIDE a source transaction (DDL-anchored
 	// Truncate/SchemaSnapshot arrive in their own implicit-commit groups)
-	// keep the position-with-data write unchanged.
+	// keep the position-with-data write unchanged. Where the idempotent
+	// replay cannot absorb a re-delivery (a unique value the transaction
+	// freed and reused), the ADR-0190 apply marks skip what already landed.
+	if err := a.startApplyMarks(ctx, streamID); err != nil {
+		return err
+	}
+	defer a.marks.LogRunSummary(ctx, "mysql")
 	inSourceTx := false
 	pendingRows := int64(0)
 	for {
@@ -1127,6 +1158,9 @@ func (a *ChangeApplier) Apply(ctx context.Context, streamID string, changes <-ch
 				pendingRows = 0
 				continue
 			case ir.TxCommit:
+				// The commit position write deletes the transaction's apply
+				// marks in its own target transaction (ADR-0190 GC).
+				a.marks.CloseOpen()
 				if err := a.persistSourceTxCommit(ctx, streamID, c, pendingRows); err != nil {
 					return err
 				}
@@ -1251,6 +1285,17 @@ func (a *ChangeApplier) applyOneImpl(ctx context.Context, streamID string, c ir.
 	// change before dispatch. Empty shardColumn is a no-op fast
 	// path — single-source streams pay zero cost.
 	a.stampShardChange(c)
+	// ADR-0190: a change the apply marks prove already applied is skipped —
+	// before any transaction opens, so it writes nothing at all, and it
+	// reports skipped so it counts toward neither rows_applied nor the skip
+	// ledger. A mark that contradicts the change refuses (terminal).
+	decision, err := a.decideApplyMarks(ctx, c)
+	if err != nil {
+		return false, err
+	}
+	if decision.Skip {
+		return true, nil
+	}
 	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, classifyApplierError(fmt.Errorf("mysql: applier: begin tx: %w", err))
@@ -1275,6 +1320,19 @@ func (a *ChangeApplier) applyOneImpl(ctx context.Context, streamID string, c ir.
 	// (PG-2) even though it may be a row-level DML change.
 	skipped, err = a.dispatch(ctx, tx, streamID, c)
 	if err != nil {
+		_ = tx.Rollback()
+		return false, classifyApplierError(err)
+	}
+	// The change's apply marks ride this transaction — written only when the
+	// change actually applied (a C-11 skip wrote no row, so it vouches for
+	// nothing). With the position (writePosition) the plan also deletes the
+	// marks of every transaction that position passes.
+	var pending applymarks.Pending
+	if !skipped {
+		pending.Add(decision.Marks)
+	}
+	marks := a.marks.Plan(&pending, writePosition)
+	if err := a.execApplyMarksTx(ctx, tx, marks); err != nil {
 		_ = tx.Rollback()
 		return false, classifyApplierError(err)
 	}
@@ -1311,6 +1369,7 @@ func (a *ChangeApplier) applyOneImpl(ctx context.Context, streamID string, c ir.
 		// position persisted, resume re-delivers.
 		return false, applierErrorOrShutdown(ctx, fmt.Errorf("mysql: applier: commit: %w", err))
 	}
+	a.marks.Committed(marks)
 	// ADR-0049 Chunk C cache-after-commit invariant: a SchemaSnapshot
 	// updates the active-version cache ONLY after its tx has
 	// committed durably. A failed dispatch or commit short-circuits
@@ -1339,6 +1398,13 @@ func (a *ChangeApplier) persistSourceTxCommit(ctx context.Context, streamID stri
 	if err != nil {
 		return classifyApplierError(fmt.Errorf("mysql: applier: begin tx (commit position): %w", err))
 	}
+	// ADR-0190: the position passes the committed transaction, so its apply
+	// marks go in the same target transaction.
+	marks := a.marks.Plan(nil, true)
+	if err := a.execApplyMarksTx(ctx, tx, marks); err != nil {
+		_ = tx.Rollback()
+		return applierErrorOrShutdown(ctx, err)
+	}
 	posCtx, posCancel := a.execTimeoutCtx(ctx)
 	err = writePositionTx(posCtx, tx, a.controlKeyspace, streamID, c.Pos().Token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, rowsApplied, a.upsert)
 	posCancel()
@@ -1349,6 +1415,7 @@ func (a *ChangeApplier) persistSourceTxCommit(ctx context.Context, streamID stri
 	if err := a.commitWithTimeout(tx); err != nil {
 		return applierErrorOrShutdown(ctx, fmt.Errorf("mysql: applier: commit (commit position): %w", err))
 	}
+	a.marks.Committed(marks)
 	return nil
 }
 

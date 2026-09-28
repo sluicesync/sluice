@@ -80,5 +80,6 @@ func (e Engine) ControlTableDDL() []ir.ControlTableStatement {
 		{Table: shardConsolidationLeaseTableName, DDL: shardConsolidationLeaseTableDDL("")},
 		{Table: cdcQueryTimeoutRaiseTableName, DDL: cdcQueryTimeoutRaiseTableDDL("")},
 		{Table: skippedTablesTableName, DDL: skippedTablesTableDDL("")},
+		{Table: applyMarksTableName, DDL: applyMarksTableDDL("")},
 	}
 }

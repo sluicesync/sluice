@@ -20,6 +20,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"sluicesync.dev/sluice/internal/appliershared"
+	"sluicesync.dev/sluice/internal/applymarks"
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/redact"
 )
@@ -511,6 +512,17 @@ type ChangeApplier struct {
 	// sync.Once serialises it.
 	fkBypassOnce sync.Once
 	fkBypassOK   bool
+
+	// marks is the stream's ADR-0190 exactly-once apply-mark tracker,
+	// loaded at the start of every apply run (see apply_marks.go). Internally
+	// locked — the ADR-0105 lanes consult it from W goroutines. Its zero
+	// value is disabled: every change applies and no mark is written, which
+	// is what a construction that never runs an apply loop gets.
+	marks applymarks.Tracker
+
+	// applyMarksEnsureErr is why EnsureControlTable could not create the
+	// mark table, reported by the APPLY-MARKS-UNAVAILABLE WARN at apply start.
+	applyMarksEnsureErr error
 }
 
 // activeSchemaVersion is one entry in the ADR-0049 Chunk C applier
@@ -990,12 +1002,27 @@ func (a *ChangeApplier) EnsureControlTable(ctx context.Context) error {
 	// else, and on a Neki that does not route them. The list is every table
 	// the bundle above creates — TestEveryPostgresControlTableIsPlacedOnNeki
 	// holds it to the package's table-name constants.
-	return ensureNekiControlTablePlacement(ctx, a.db, a.isNeki, a.serverKey, a.controlSchema, []string{
+	if err := ensureNekiControlTablePlacement(ctx, a.db, a.isNeki, a.serverKey, a.controlSchema, []string{
 		controlTableName,
 		schemaHistoryTableName,
 		shardConsolidationLeaseTableName,
 		skippedTablesTableName,
+	}); err != nil {
+		return err
+	}
+	// ADR-0190: the apply-mark table is best-effort by operator decision —
+	// a role or target that cannot create it runs without marks (the
+	// APPLY-MARKS-UNAVAILABLE WARN at apply start names why) rather than
+	// refusing to start.
+	a.applyMarksEnsureErr = retryOnCatalogRace(ctx, func() error {
+		return ensureApplyMarksTable(ctx, a.db, a.controlSchema)
 	})
+	if a.applyMarksEnsureErr == nil {
+		return ensureNekiControlTablePlacement(ctx, a.db, a.isNeki, a.serverKey, a.controlSchema, []string{
+			applyMarksTableName,
+		})
+	}
+	return nil
 }
 
 // retryOnCatalogRace wraps fn with a bounded retry on the narrow
@@ -1166,6 +1193,11 @@ func (a *ChangeApplier) ClearStopRequested(ctx context.Context, streamID string)
 func (a *ChangeApplier) ClearStream(ctx context.Context, streamID string) error {
 	if streamID == "" {
 		return errors.New("postgres: applier: ClearStream: streamID is empty")
+	}
+	// A stream's ADR-0190 apply marks describe its CDC position; the row
+	// that holds that position is going, so they go first.
+	if err := clearApplyMarks(ctx, a.db, a.controlSchema, streamID); err != nil {
+		return err
 	}
 	return clearStream(ctx, a.db, a.controlSchema, streamID)
 }
@@ -1371,7 +1403,13 @@ func (a *ChangeApplier) Apply(ctx context.Context, streamID string, changes <-ch
 	// feedback (PG→PG) moves to commit granularity with it, which is the
 	// granularity confirmed_flush advances at server-side anyway. A crash
 	// mid-transaction resumes at the last commit and re-delivers the whole
-	// transaction; ADR-0010's idempotent apply absorbs the replay.
+	// transaction; ADR-0010's idempotent apply absorbs the replay — and where
+	// it cannot (a unique value the transaction freed and reused), the
+	// ADR-0190 apply marks the replay consults skip what already landed.
+	if err := a.startApplyMarks(ctx, streamID); err != nil {
+		return err
+	}
+	defer a.marks.LogRunSummary(ctx, "postgres")
 	inSourceTx := false
 	pendingRows := int64(0)
 	for {
@@ -1390,6 +1428,9 @@ func (a *ChangeApplier) Apply(ctx context.Context, streamID string, changes <-ch
 				pendingRows = 0
 				continue
 			case ir.TxCommit:
+				// The commit position write deletes the transaction's apply
+				// marks in its own target transaction (ADR-0190 GC).
+				a.marks.CloseOpen()
 				if err := a.persistSourceTxCommit(ctx, streamID, c, pendingRows); err != nil {
 					return err
 				}
@@ -1446,6 +1487,13 @@ func (a *ChangeApplier) persistSourceTxCommit(ctx context.Context, streamID stri
 	if err != nil {
 		return classifyApplierError(fmt.Errorf("postgres: applier: begin tx (commit position): %w", err))
 	}
+	// ADR-0190: the position passes the committed transaction, so its apply
+	// marks go in the same target transaction.
+	marks := a.marks.Plan(nil, true)
+	if err := a.execApplyMarksTx(ctx, tx, marks); err != nil {
+		_ = tx.Rollback()
+		return applierErrorOrShutdown(ctx, err)
+	}
 	token := c.Pos().Token
 	posCtx, posCancel := a.execTimeoutCtx(ctx)
 	err = writePositionTx(posCtx, tx, a.controlSchema, streamID, token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, rowsApplied)
@@ -1457,6 +1505,7 @@ func (a *ChangeApplier) persistSourceTxCommit(ctx context.Context, streamID stri
 	if err := a.commitWithTimeout(tx); err != nil {
 		return applierErrorOrShutdown(ctx, fmt.Errorf("postgres: applier: commit (commit position): %w", err))
 	}
+	a.marks.Committed(marks)
 	a.reportAppliedToken(ctx, token)
 	return nil
 }
@@ -1524,6 +1573,17 @@ func (a *ChangeApplier) applyOneImpl(ctx context.Context, streamID string, c ir.
 	// change before dispatch. Empty shardColumn is a no-op fast
 	// path — single-source streams pay zero cost.
 	a.stampShardChange(c)
+	// ADR-0190: a change the apply marks prove already applied is skipped —
+	// before any transaction opens, so it writes nothing at all, and it
+	// reports skipped so it counts toward neither rows_applied nor the skip
+	// ledger. A mark that contradicts the change refuses (terminal).
+	decision, err := a.decideApplyMarks(ctx, c)
+	if err != nil {
+		return false, err
+	}
+	if decision.Skip {
+		return true, nil
+	}
 	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, classifyApplierError(fmt.Errorf("postgres: applier: begin tx: %w", err))
@@ -1546,6 +1606,19 @@ func (a *ChangeApplier) applyOneImpl(ctx context.Context, streamID string, c ir.
 	// (PG-2) even though it may be a row-level DML change.
 	skipped, err = a.dispatch(ctx, tx, streamID, c)
 	if err != nil {
+		_ = tx.Rollback()
+		return false, classifyApplierError(err)
+	}
+	// The change's apply marks ride this transaction — written only when the
+	// change actually applied (a C-11 skip wrote no row, so it vouches for
+	// nothing). With the position (writePosition) the plan also deletes the
+	// marks of every transaction that position passes.
+	var pending applymarks.Pending
+	if !skipped {
+		pending.Add(decision.Marks)
+	}
+	marks := a.marks.Plan(&pending, writePosition)
+	if err := a.execApplyMarksTx(ctx, tx, marks); err != nil {
 		_ = tx.Rollback()
 		return false, classifyApplierError(err)
 	}
@@ -1583,6 +1656,7 @@ func (a *ChangeApplier) applyOneImpl(ctx context.Context, streamID string, c ir.
 		// resume re-delivers.
 		return false, applierErrorOrShutdown(ctx, fmt.Errorf("postgres: applier: commit: %w", err))
 	}
+	a.marks.Committed(marks)
 	// ADR-0049 Chunk C cache-after-commit invariant: a SchemaSnapshot
 	// updates the active-version cache ONLY after its tx has
 	// committed durably. A failed dispatch or commit short-circuits

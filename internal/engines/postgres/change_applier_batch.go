@@ -66,6 +66,7 @@ import (
 	"fmt"
 
 	"sluicesync.dev/sluice/internal/appliershared"
+	"sluicesync.dev/sluice/internal/applymarks"
 	"sluicesync.dev/sluice/internal/ir"
 )
 
@@ -97,6 +98,11 @@ func (a *ChangeApplier) ApplyBatch(ctx context.Context, streamID string, changes
 	if maxBatchSize <= 1 {
 		return a.Apply(ctx, streamID, changes)
 	}
+	// ADR-0190: load (or disable) the stream's apply marks for this run.
+	if err := a.startApplyMarks(ctx, streamID); err != nil {
+		return err
+	}
+	defer a.marks.LogRunSummary(ctx, "postgres")
 	// ADR-0105 item 26: when the operator wired the key-hash apply LANE count
 	// (--apply-concurrency W) > 1 and a dedicated pool can be opened, route to
 	// the shared concurrent key-hash apply path — W in-order lanes committing
@@ -186,11 +192,31 @@ func (a *ChangeApplier) batchConfig() *appliershared.BatchConfig {
 			return a.beginSerialBatchTx(ctx)
 		},
 		Dispatch: func(ctx context.Context, tx appliershared.BatchTx, streamID string, c ir.Change) (bool, error) {
-			if b, ok := tx.(*pgxBatchTx); ok {
-				return a.dispatchPipelined(ctx, b, streamID, c)
+			// ADR-0190: a change the apply marks prove already applied is
+			// dropped here and reported skipped (no rows_applied); an applied
+			// one's marks join the batch transaction.
+			decision, err := a.decideApplyMarks(ctx, c)
+			if err != nil || decision.Skip {
+				return decision.Skip, err
 			}
-			return a.dispatch(ctx, tx.(*sql.Tx), streamID, c)
+			var skipped bool
+			var marks *applymarks.TxMarks
+			if b, ok := tx.(*pgxBatchTx); ok {
+				skipped, err = a.dispatchPipelined(ctx, b, streamID, c)
+				marks = &b.marks
+			} else {
+				s := tx.(*serialBatchTx)
+				skipped, err = a.dispatch(ctx, s.tx, streamID, c)
+				marks = &s.marks
+			}
+			if err == nil && !skipped {
+				marks.Add(decision.Marks)
+			}
+			return skipped, err
 		},
+		// ADR-0190: the position write that persists a TxCommit deletes the
+		// committed transaction's marks, so close it first.
+		OnSourceTxCommit: a.marks.CloseOpen,
 		// ApplyOne is unreachable while TransactionalDDL is true (PG
 		// schema events ride the batch tx); filled so the seam stays
 		// total.
@@ -200,6 +226,14 @@ func (a *ChangeApplier) batchConfig() *appliershared.BatchConfig {
 		Classify:   classifyApplierError,
 		WritePosition: func(ctx context.Context, tx appliershared.BatchTx, streamID, token string, rowsApplied int64) error {
 			if b, ok := tx.(*pgxBatchTx); ok {
+				// ADR-0190: this position passes every closed transaction, so
+				// their marks are deleted — and the batch's own marks written —
+				// in this same batch.
+				if pl, first := b.marks.Plan(&a.marks, true); first {
+					if err := a.queueApplyMarks(b, pl); err != nil {
+						return err
+					}
+				}
 				// Queue the position upsert onto the batch; it flushes with
 				// the data in Commit's single SendBatch (ADR-0092).
 				a.writePositionPipelined(b, streamID, token, rowsApplied)
@@ -209,9 +243,15 @@ func (a *ChangeApplier) batchConfig() *appliershared.BatchConfig {
 				// so it commits independently and a failure surfaces here.
 				return a.flushSkippedTables(ctx)
 			}
+			s := tx.(*serialBatchTx)
+			if pl, first := s.marks.Plan(&a.marks, true); first {
+				if err := a.execApplyMarksTx(ctx, s.tx, pl); err != nil {
+					return err
+				}
+			}
 			posCtx, posCancel := a.execTimeoutCtx(ctx)
 			defer posCancel()
-			if err := writePositionTx(posCtx, tx.(*sql.Tx), a.controlSchema, streamID, token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, rowsApplied); err != nil {
+			if err := writePositionTx(posCtx, s.tx, a.controlSchema, streamID, token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, rowsApplied); err != nil {
 				return err
 			}
 			// H-4: the shared loop calls WritePosition at exactly the
@@ -223,10 +263,33 @@ func (a *ChangeApplier) batchConfig() *appliershared.BatchConfig {
 			return a.flushSkippedTables(ctx)
 		},
 		Commit: func(tx appliershared.BatchTx) error {
+			// ADR-0190: a flush with no position write (mid-transaction) still
+			// writes its changes' marks — with the rows, in this transaction.
 			if b, ok := tx.(*pgxBatchTx); ok {
-				return a.flushAndCommit(b)
+				if pl, first := b.marks.Plan(&a.marks, false); first {
+					if err := a.queueApplyMarks(b, pl); err != nil {
+						_ = b.Rollback()
+						return err
+					}
+				}
+				if err := a.flushAndCommit(b); err != nil {
+					return err
+				}
+				b.marks.Committed(&a.marks)
+				return nil
 			}
-			return a.commitWithTimeout(tx.(*sql.Tx))
+			s := tx.(*serialBatchTx)
+			if pl, first := s.marks.Plan(&a.marks, false); first {
+				if err := a.execApplyMarksTx(s.ctx, s.tx, pl); err != nil {
+					_ = s.tx.Rollback()
+					return err
+				}
+			}
+			if err := a.commitWithTimeout(s.tx); err != nil {
+				return err
+			}
+			s.marks.Committed(&a.marks)
+			return nil
 		},
 		// AfterCommit reports the just-committed LSN to the slot-ack
 		// feedback tracker (Bug 15, ADR-0020). It runs AFTER tx.Commit
@@ -241,6 +304,19 @@ func (a *ChangeApplier) batchConfig() *appliershared.BatchConfig {
 		IsKeylessTable:      a.isKeylessInsert,
 	}
 }
+
+// serialBatchTx is the serial fall-back's batch handle: the *sql.Tx plus the
+// batch's ADR-0190 apply-mark bookkeeping (the pipelined *pgxBatchTx carries
+// the same), and the batch's context for the Commit closure, which takes
+// none.
+type serialBatchTx struct {
+	tx    *sql.Tx
+	ctx   context.Context
+	marks applymarks.TxMarks
+}
+
+// Rollback satisfies [appliershared.BatchTx].
+func (s *serialBatchTx) Rollback() error { return s.tx.Rollback() }
 
 // beginSerialBatchTx opens the legacy serial *sql.Tx batch transaction —
 // the ADR-0092 fall-back when the pipelined raw-conn escape is
@@ -265,7 +341,7 @@ func (a *ChangeApplier) beginSerialBatchTx(ctx context.Context) (appliershared.B
 		_ = tx.Rollback()
 		return nil, classifyApplierError(err)
 	}
-	return tx, nil
+	return &serialBatchTx{tx: tx, ctx: ctx}, nil
 }
 
 // isKeylessInsert is the ADR-0089 keyless-guard predicate the shared

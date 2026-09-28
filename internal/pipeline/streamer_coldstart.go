@@ -72,6 +72,12 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	resumingCopy := resumeFrom.Engine != "" || resumeFrom.Token != ""
 	stop = func() {}
 
+	// ADR-0190: the copy re-seeds the target, so the stream's apply marks go
+	// first.
+	if err := clearApplyMarksForColdStart(ctx, applier, streamID); err != nil {
+		return nil, stop, err
+	}
+
 	// Read + gate the source schema: open the source SchemaReader, read
 	// + filter the schema, and run every source-side preflight against
 	// the still-open reader. A nil schema with nil error is the

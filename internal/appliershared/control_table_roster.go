@@ -42,6 +42,7 @@ func ControlTableNames() []string {
 		ControlTableName,                 // sluice_cdc_state
 		ShardConsolidationLeaseTableName, // sluice_shard_consolidation_lease
 		SkippedTablesTableName,           // sluice_cdc_skipped_tables (audit C-11)
+		ApplyMarksTableName,              // sluice_cdc_apply_marks (ADR-0190)
 
 		// internal/migratestate (HeaderTableName / ProgressTableName —
 		// literal to keep this package's dependency surface at ir only).

@@ -259,6 +259,15 @@ type BatchConfig struct {
 	// (ADR-0092) before the underlying pgx.Tx commits.
 	Commit func(tx BatchTx) error
 
+	// OnSourceTxCommit, when non-nil, runs each time the loop consumes an
+	// [ir.TxCommit], BEFORE the position write that persists it (commitBatch
+	// on an in-batch boundary, writeBoundaryOnly on an empty one). The
+	// engine closes its ADR-0190 apply-mark bookkeeping here, so that very
+	// position write deletes the committed transaction's marks in the same
+	// target transaction. It is a notification only; the loop's flush and
+	// position logic are unchanged whether or not it is set.
+	OnSourceTxCommit func()
+
 	// AfterCommit, when non-nil, runs after a successful commit with
 	// the batch's position token — PG's slot-ack feedback report
 	// (Bug 15, ADR-0020). Deliberately after Commit: a crash between
@@ -567,6 +576,7 @@ func runOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 				// carries atBoundary=true regardless, but clearing the flag
 				// keeps it accurate for any later flush in this batch run.
 				*inSourceTx = false
+				noteSourceTxCommit(cfg)
 				return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, true, pending, false)
 			}
 			if _, isTxBegin := c.(ir.TxBegin); isTxBegin {
@@ -729,6 +739,7 @@ func waitForFirstChange(ctx context.Context, cfg *BatchConfig, streamID string, 
 				continue
 			case ir.TxCommit:
 				*inSourceTx = false
+				noteSourceTxCommit(cfg)
 				if cfg.CheckpointOnlyAtTxBoundary {
 					if err := writeBoundaryOnly(ctx, cfg, streamID, c.Pos().Token, pending); err != nil {
 						return nil, false, err
@@ -866,6 +877,14 @@ func writeBoundaryOnly(ctx context.Context, cfg *BatchConfig, streamID, token st
 		cfg.AfterCommit(ctx, token)
 	}
 	return nil
+}
+
+// noteSourceTxCommit fires the optional [BatchConfig.OnSourceTxCommit]
+// notification.
+func noteSourceTxCommit(cfg *BatchConfig) {
+	if cfg.OnSourceTxCommit != nil {
+		cfg.OnSourceTxCommit()
+	}
 }
 
 // isSchemaEvent reports whether c is a schema-changing event the

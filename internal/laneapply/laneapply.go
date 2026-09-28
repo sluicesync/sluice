@@ -92,6 +92,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -169,7 +170,14 @@ type LaneApplier interface {
 	// across every lane; see the orchestrator's boundaryRowDML tracking). 0
 	// when the boundary advanced with no intervening DML (e.g. a Truncate
 	// boundary).
-	WriteCheckpoint(ctx context.Context, pos ir.Position, rowsApplied int64) error
+	//
+	// closedTxs names every source transaction (its [ir.ApplyID] TxID) whose
+	// commit this checkpoint passes and that the orchestrator has not handed
+	// to an earlier checkpoint — the ADR-0190 garbage collection: those
+	// transactions are never re-delivered once this position is durable, so
+	// the engine deletes their apply marks IN THE SAME transaction as the
+	// position. Empty on a stream whose reader stamps no identity.
+	WriteCheckpoint(ctx context.Context, pos ir.Position, rowsApplied int64, closedTxs []string) error
 
 	// ApplyBarrierChange applies one barrier-path change on the coordinator
 	// backend (writing its position + data atomically per ADR-0007), and —
@@ -451,6 +459,14 @@ type Orchestrator struct {
 	// position-run heuristic above. Coordinator-goroutine-only (no lock).
 	sawTxMarker bool
 
+	// curTx is the ADR-0190 TxID of the source transaction the coordinator
+	// is inside (the identity its row changes carry), and closedTx maps each
+	// TxCommit's seq to the transaction it closed. writeCheckpoint hands every
+	// closed transaction at or below its boundary to the engine, whose apply
+	// marks it then deletes with the position. Coordinator-goroutine-only.
+	curTx    string
+	closedTx map[uint64]string
+
 	cancel context.CancelFunc
 
 	wg       sync.WaitGroup
@@ -495,6 +511,7 @@ func NewOrchestrator(cfg Config, la LaneApplier) *Orchestrator {
 		laneIn:          make([]chan LaneChange, lanes),
 		laneControllers: cfg.LaneControllers,
 		boundaryRowDML:  make(map[uint64]uint64),
+		closedTx:        make(map[uint64]string),
 	}
 	// Buffer each lane a batch's worth so the coordinator's routing isn't
 	// gated on a lane's per-change commit latency (the whole point — lanes
@@ -658,6 +675,7 @@ func (o *Orchestrator) handle(ctx context.Context, seq uint64, c ir.Change) erro
 	switch c.(type) {
 	case ir.TxBegin:
 		o.sawTxMarker = true
+		o.curTx = ""
 		// Boundary marker, no lane work — mark committed so the contiguous
 		// frontier can advance past it as soon as this seq (and all lower) are
 		// committed. C-2 (Tier-3 audit): the tx's OWN rows carry HIGHER seqs and
@@ -676,9 +694,16 @@ func (o *Orchestrator) handle(ctx context.Context, seq uint64, c ir.Change) erro
 		// had lower seqs and were processed first); TxCommit itself is not DML.
 		o.frontier.RecordTxBoundary(seq, c.Pos())
 		o.boundaryRowDML[seq] = o.cumRowDML
+		if o.curTx != "" {
+			o.closedTx[seq] = o.curTx
+			o.curTx = ""
+		}
 		o.frontier.MarkCommitted(seq)
 		return o.maybeCheckpoint(ctx)
 	case ir.Insert, ir.Update, ir.Delete:
+		if id := ir.ApplyIDOf(c); !id.IsZero() {
+			o.curTx = id.TxID
+		}
 		// Count the row-level DML change (routed OR — via routeRow's ok=false
 		// fall-through — barriered; both are counted here exactly once, before
 		// the lane/barrier applies it). The counter is only realized at a
@@ -1245,7 +1270,8 @@ func (o *Orchestrator) writeCheckpoint(ctx context.Context) error {
 	if ok && cum > o.lastWrittenCum {
 		delta = int64(cum - o.lastWrittenCum)
 	}
-	if err := o.la.WriteCheckpoint(ctx, pos, delta); err != nil {
+	closed := o.closedTxsUpTo(seq)
+	if err := o.la.WriteCheckpoint(ctx, pos, delta, closed); err != nil {
 		return err
 	}
 	o.lastWrittenSeq = seq
@@ -1253,7 +1279,30 @@ func (o *Orchestrator) writeCheckpoint(ctx context.Context) error {
 		o.lastWrittenCum = cum
 	}
 	o.pruneBoundaryRowDML(seq)
+	for s := range o.closedTx {
+		if s <= seq {
+			delete(o.closedTx, s)
+		}
+	}
 	return nil
+}
+
+// closedTxsUpTo lists, in seq order, the transactions whose commit lies at or
+// below seq and has not been handed to a persisted checkpoint yet — the
+// ADR-0190 marks this checkpoint deletes. Coordinator-goroutine-only.
+func (o *Orchestrator) closedTxsUpTo(seq uint64) []string {
+	var seqs []uint64
+	for s := range o.closedTx {
+		if s <= seq {
+			seqs = append(seqs, s)
+		}
+	}
+	slices.Sort(seqs)
+	txs := make([]string, 0, len(seqs))
+	for _, s := range seqs {
+		txs = append(txs, o.closedTx[s])
+	}
+	return txs
 }
 
 // pruneBoundaryRowDML drops boundaryRowDML entries at or below the just-

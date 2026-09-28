@@ -272,6 +272,13 @@ func (s *Streamer) resumeStoppedColdStart(
 		return nil, nil, true, err
 	}
 
+	// ADR-0190: this resume inherits a cold start's copy, whose own entry
+	// already cleared the stream's apply marks; clearing again keeps every
+	// path that re-seeds the target visibly under the same rule.
+	if err := clearApplyMarksForColdStart(ctx, applier, streamID); err != nil {
+		return nil, nil, true, err
+	}
+
 	return s.resumeStoppedColdStartFromVerifiedState(ctx, streamCtx, lsnTracker, applier, streamID, store, verifier, state, schema)
 }
 

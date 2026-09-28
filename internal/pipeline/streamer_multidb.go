@@ -195,6 +195,11 @@ func (s *Streamer) coldStartMultiDatabase(
 	if err := s.validateMultiDatabaseStream(); err != nil {
 		return nil, stop, err
 	}
+	// ADR-0190: the copy re-seeds the target, so the stream's apply marks go
+	// first.
+	if err := clearApplyMarksForColdStart(ctx, applier, streamID); err != nil {
+		return nil, stop, err
+	}
 
 	opener, ok := s.Source.(ir.MultiDatabaseSnapshotOpener)
 	if !ok {

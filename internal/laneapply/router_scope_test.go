@@ -93,8 +93,9 @@ func (s *scopedSeam) ApplyLaneBatch(_ context.Context, lane int, batch []ir.Chan
 	return len(batch), nil
 }
 
-func (s *scopedSeam) ClassifyError(err error) error                             { return err }
-func (s *scopedSeam) WriteCheckpoint(context.Context, ir.Position, int64) error { return nil }
+func (s *scopedSeam) ClassifyError(err error) error { return err }
+
+func (s *scopedSeam) WriteCheckpoint(context.Context, ir.Position, int64, []string) error { return nil }
 
 func (s *scopedSeam) ApplyBarrierChange(context.Context, ir.Change) error {
 	s.mu.Lock()

@@ -23,6 +23,7 @@ import (
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
 
+	"sluicesync.dev/sluice/internal/applymarks"
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/netdeadline"
 	"sluicesync.dev/sluice/internal/sluicecode"
@@ -425,6 +426,11 @@ type CDCReader struct {
 	// from folding the staged GTID early and reintroducing the defect.
 	pendingGTID string
 	inSourceTx  bool
+
+	// applyIDs stamps each row change with its ADR-0190 identity: the
+	// transaction the dispatcher is inside and a per-table ordinal. See
+	// cdc_apply_identity.go.
+	applyIDs applymarks.Sequencer
 
 	// resend drops the events go-mysql re-sends after it silently
 	// re-dials the source mid-stream (cdc_reader_resend.go).
@@ -1009,6 +1015,7 @@ func (r *CDCReader) startStreamer(p binlogPos) (*replication.BinlogStreamer, err
 	// (item 132). Reset before the mode switch so BOTH modes get it.
 	r.pendingGTID = ""
 	r.inSourceTx = false
+	r.applyIDs.End()
 	r.resend = binlogResendGuard{}
 	// The MariaDB lineage anchor rides every position this stream
 	// persists, unchanged from the start position (mariadb_lineage.go):
@@ -1179,6 +1186,10 @@ func (r *CDCReader) dispatch(ctx context.Context, ev *replication.BinlogEvent, o
 		return nil
 
 	case *replication.GTIDEvent:
+		// A new group: whatever transaction the previous group opened is
+		// over, in either position mode, so its ADR-0190 identity must not
+		// reach a later row.
+		r.applyIDs.End()
 		// STAGE the new GTID — it joins the running executed set at this
 		// transaction's commit, not at its start (item 132; see
 		// [CDCReader.pendingGTID]). In file/pos mode we don't maintain a
@@ -1229,6 +1240,7 @@ func (r *CDCReader) dispatch(ctx context.Context, ev *replication.BinlogEvent, o
 			return r.foldPendingGTID()
 		}
 		r.inSourceTx = true
+		r.applyIDs.Begin(r.transactionIdentity(ev.Header))
 		pos, err := r.positionFor(ev.Header)
 		if err != nil {
 			return err
@@ -1272,6 +1284,7 @@ func (r *CDCReader) dispatch(ctx context.Context, ev *replication.BinlogEvent, o
 			// transaction's start, so the emitted TxBegin (and every row
 			// after it) must carry the PRE-transaction set (item 132).
 			r.inSourceTx = true
+			r.applyIDs.Begin(r.transactionIdentity(ev.Header))
 			pos, err := r.positionFor(ev.Header)
 			if err != nil {
 				return err
@@ -1291,6 +1304,7 @@ func (r *CDCReader) dispatch(ctx context.Context, ev *replication.BinlogEvent, o
 				return err
 			}
 			r.inSourceTx = false
+			r.applyIDs.End()
 			pos, err := r.positionFor(ev.Header)
 			if err != nil {
 				return err
@@ -1445,6 +1459,7 @@ func (r *CDCReader) dispatch(ctx context.Context, ev *replication.BinlogEvent, o
 			return err
 		}
 		r.inSourceTx = false
+		r.applyIDs.End()
 		pos, err := r.positionFor(ev.Header)
 		if err != nil {
 			return err
@@ -1756,6 +1771,7 @@ func (r *CDCReader) dispatchRows(
 				Table:      tbl.Name,
 				Row:        row,
 				CommitTime: commitTime,
+				ApplyID:    r.applyIDs.Next(qn),
 			}); err != nil {
 				return err
 			}
@@ -1836,6 +1852,7 @@ func (r *CDCReader) dispatchRows(
 				Before:     before,
 				After:      after,
 				CommitTime: commitTime,
+				ApplyID:    r.applyIDs.Next(qn),
 			}); err != nil {
 				return err
 			}
@@ -1898,6 +1915,7 @@ func (r *CDCReader) dispatchRows(
 				Table:      tbl.Name,
 				Before:     before,
 				CommitTime: commitTime,
+				ApplyID:    r.applyIDs.Next(qn),
 			}); err != nil {
 				return err
 			}
@@ -2171,6 +2189,7 @@ func (r *CDCReader) stageGTID(gtid string) error {
 		return err
 	}
 	r.inSourceTx = false
+	r.applyIDs.End()
 	// A new group also means any XA body group is over (the XA protocol
 	// permits no rows after XA END, and the body group ends at PREPARE) —
 	// clearing here keeps a malformed stream from wedging the refusal window

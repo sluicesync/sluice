@@ -64,6 +64,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
 
+	"sluicesync.dev/sluice/internal/applymarks"
 	"sluicesync.dev/sluice/internal/ir"
 )
 
@@ -99,6 +100,11 @@ type pgxBatchTx struct {
 	tx      pgx.Tx     // native tx on conn
 	batch   *pgx.Batch // accumulates data statements + position upsert
 	stmts   []queuedStmt
+
+	// marks is the batch's ADR-0190 apply-mark bookkeeping on the serial
+	// batch path (queued with the data, committed with it). Unused on the
+	// lane path, whose batches write no marks.
+	marks applymarks.TxMarks
 
 	released bool
 }

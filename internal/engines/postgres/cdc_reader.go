@@ -20,6 +20,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
 
+	"sluicesync.dev/sluice/internal/applymarks"
 	"sluicesync.dev/sluice/internal/diagnose"
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/netdeadline"
@@ -256,6 +257,10 @@ type CDCReader struct {
 	// reference frame — silent-loss class.
 	systemID string
 	timeline int32
+
+	// applyIDs stamps each row change with its ADR-0190 identity (see
+	// cdc_apply_identity.go). Pump-goroutine-only.
+	applyIDs applymarks.Sequencer
 
 	// schemaForward relaxes the mid-stream schema-change gate
 	// (checkSchemaRace) for the ADR-0091 forward-routable shapes (DROP
@@ -1066,6 +1071,9 @@ func (r *CDCReader) pump(ctx context.Context, conn *pgconn.PgConn, startLSN pglo
 	defer close(out)
 	defer closeReplConnGraceful(conn)
 
+	// A (re)start resumes at a transaction boundary; nothing of a previous
+	// connection's in-flight transaction may stamp a row of this one.
+	r.applyIDs.End()
 	relations := map[uint32]*relationCacheEntry{}
 	// snapshotSig is the per-relation structural fingerprint of the
 	// schema-history version last emitted as an [ir.SchemaSnapshot]
@@ -1358,7 +1366,7 @@ func (r *CDCReader) dispatchWAL(
 		// open a fresh target transaction aligned to this source
 		// transaction. Per-change appliers treat the event as a
 		// no-op. See ADR-0027.
-		pos, err := r.positionAt(m.FinalLSN)
+		pos, err := r.openTransaction(m.FinalLSN)
 		if err != nil {
 			return err
 		}
@@ -1410,7 +1418,7 @@ func (r *CDCReader) dispatchWAL(
 			return fmt.Errorf("postgres: cdc: commit message at %s carries transaction end LSN %s, which does not follow the commit record — cannot derive a post-commit resume position",
 				m.CommitLSN, m.TransactionEndLSN)
 		}
-		pos, err := r.positionAt(m.TransactionEndLSN)
+		pos, err := r.closeTransaction(m.TransactionEndLSN)
 		if err != nil {
 			return err
 		}
@@ -1444,6 +1452,7 @@ func (r *CDCReader) dispatchWAL(
 
 	case *pglogrepl.StreamStartMessageV2:
 		*inStream = true
+		r.applyIDs.End() // a streamed chunk's rows carry no ADR-0190 identity (never skippable)
 		// pgoutput v2 streaming-in-progress: large source
 		// transactions arrive in chunks separated by StreamStart /
 		// StreamStop pairs (ADR-0027). Treat each chunk as its own
@@ -1598,6 +1607,7 @@ func (r *CDCReader) emitInsert(
 		Table:      rel.Name,
 		Row:        row,
 		CommitTime: commitTime,
+		ApplyID:    r.applyIDs.Next(rel.Schema + "." + rel.Name),
 	})
 }
 
@@ -1683,6 +1693,7 @@ func (r *CDCReader) emitUpdate(
 		Before:     before,
 		After:      after,
 		CommitTime: commitTime,
+		ApplyID:    r.applyIDs.Next(rel.Schema + "." + rel.Name),
 	})
 }
 
@@ -1803,6 +1814,7 @@ func (r *CDCReader) emitDelete(
 		Table:      rel.Name,
 		Before:     before,
 		CommitTime: commitTime,
+		ApplyID:    r.applyIDs.Next(rel.Schema + "." + rel.Name),
 	})
 }
 

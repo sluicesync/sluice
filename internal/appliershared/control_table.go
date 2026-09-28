@@ -54,6 +54,13 @@ const ControlTableName = "sluice_cdc_state"
 // default database.
 const ShardConsolidationLeaseTableName = "sluice_shard_consolidation_lease"
 
+// ApplyMarksTableName is the ADR-0190 per-target control table holding the
+// exactly-once apply marks: one row per (stream, target table, key) naming
+// the last change of a not-yet-checkpointed source transaction that reached
+// that key. Written in the same target transaction as the rows it vouches
+// for; see internal/applymarks.
+const ApplyMarksTableName = "sluice_cdc_apply_marks"
+
 // ControlTableConfig is the dialect seam for the shared control-table
 // CRUD (ADR-0081 tier c). Each engine keeps one package-level value
 // (the fields are engine constants, not per-stream state) and passes

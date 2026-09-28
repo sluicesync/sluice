@@ -694,6 +694,30 @@ the VStream snapshot reader rather than on a type every flavor reaches. The
 flavor sentence beside it is the part the gate cannot check, so read both
 together.
 
+## A crash in the middle of a source transaction: exactly-once apply marks (`APPLY-MARK-MISMATCH`, `APPLY-MARKS-UNAVAILABLE`)
+
+A restart re-delivers everything after the stream's persisted position, and the position only ever advances at a source transaction's commit. When a process dies partway through applying a source transaction, the target already holds part of that transaction, and the restart replays the whole transaction on top of it. Most changes replay harmlessly (sluice's apply is an idempotent upsert), but a transaction that frees a unique value and reuses it, swaps one through a temporary, or changes a primary key does not: before ADR-0190 the replay collided (`23505` / `Error 1062`) and every restart stopped on the same collision, recoverable only with `--restart-from-scratch`.
+
+sluice now writes an **apply mark** for every change whose replay is not idempotent, in the SAME target transaction as the change's own row, into the control table `sluice_cdc_apply_marks`. A mark names the source transaction and the change's position within it. On a restart, every change of an interrupted transaction first consults the marks for its keys, and a change a mark proves already landed is skipped — so the restart converges exactly and the position moves on. A mark and the row it vouches for commit together or not at all, so the target can never hold one without the other.
+
+**Which changes write a mark.** A change to a table with a UNIQUE index or constraint besides its primary key; a change that alters a primary key (it marks the old key and the new one); and every change to a table with no key at all. A table with only a primary key writes no marks — its changes replay idempotently — so an ordinary primary-key workload pays nothing. Keyless tables are the one place this changes what you can expect beyond the collision: a keyless table's rows used to duplicate when a transaction was replayed after a crash (at-least-once, ADR-0089); on the covered sources they now land exactly once.
+
+**Which sources are covered.** The marks rely on the source's reader giving every change a stable identity that a re-delivery reproduces exactly. The MySQL and MariaDB binlog readers do (the transaction's own GTID, or in file/position mode the server's `server_uuid`, binlog file and the transaction's start offset), and so does the Postgres logical-replication reader (the transaction's commit LSN). The PlanetScale and Vitess VStream reader and the trigger-CDC sources (`postgres-trigger`, `sqlite-trigger`, `d1-trigger`) do not yet: their changes carry no identity, are never skipped, and replay exactly as they did before.
+
+<!-- apply-identity-engine-packages: mysql, postgres -->
+
+The marker above lists the engine PACKAGES whose readers stamp an identity, and `internal/docsync` holds it to the code — together with a roster of the files allowed to stamp one, which is what keeps "VStream and the trigger-CDC sources are unchanged" a checked statement. The `mysql` package also holds the VStream reader, which does not stamp; read the sentence beside the marker for which readers are meant.
+
+**Which apply paths.** The per-change path (`--apply-batch-size 1`), the serial batched path (`--apply-concurrency 1`) and the barrier of the concurrent lane path (primary-key changes, keyless tables) write marks. The concurrent lane path's ordinary batches — the default, `--apply-concurrency auto` with batching — CHECK the marks but do not write their own yet: on that path a crash mid-transaction in a table with a secondary unique index can still stop the restart on the same collision as before, and the recovery is still `--restart-from-scratch`. If exactly-once replay across a crash matters more to you than lane throughput for such tables, run the stream with `--apply-concurrency 1`.
+
+**Clean-up.** A transaction's marks are deleted by the same target transaction that persists a position past it, so the table holds only the marks of transactions the persisted position has not passed yet — normally none, and after a crash those of the one interrupted transaction. Every cold start (`--restart-from-scratch`, `--reset-target-data`, the automatic re-snapshot) deletes the stream's marks before it copies anything.
+
+**`APPLY-MARK-MISMATCH`** (terminal) means a replayed change and the mark that should vouch for it disagree: the mark names the same position in the same transaction but a different change, or it was written under a different `--where` row filter than the one the stream runs with now. sluice refuses rather than skipping, because a skip on doubtful evidence could drop a change the target never received. For a changed `--where`, re-run with the filter the stream was established with; otherwise re-copy with `sync start --restart-from-scratch`, which also clears the stream's marks.
+
+**`APPLY-MARKS-UNAVAILABLE`** (a WARN at the start of an apply run) means the mark table cannot be used: it could not be created (a PlanetScale branch with safe migrations enabled, a role without `CREATE`), it is absent on a `--schema-already-applied` target, or the role lacks `SELECT`, `INSERT`, `UPDATE` or `DELETE` on it. The stream then runs exactly as it did before ADR-0190 — nothing is lost, and a crash mid-transaction may stop the restart on a unique collision. To enable the marks, let sluice create the table (or, on a MySQL-family target, ship the statement `sluice control-tables ddl` prints) and grant the apply role those four privileges.
+
+An older sluice binary ignores the table entirely and replays as it always has.
+
 ## See also
 
 - [ADR-0038](../adr/adr-0038-applier-retry-on-transient-errors.md) —

@@ -4,6 +4,7 @@
 package ir
 
 import (
+	"context"
 	"errors"
 	"time"
 )
@@ -160,6 +161,73 @@ func UnqualifiedTableName(qualifiedName string) string {
 	return qualifiedName
 }
 
+// ApplyID is a row change's stable identity within its source
+// transaction (ADR-0190): TxID names the source transaction, Seq is the
+// change's ordinal among that transaction's changes to the SAME table,
+// counted by the reader before any sluice-side filter.
+//
+// The READER assigns it — never the pipeline or the applier — so a
+// pipeline filter, an --include-table change or a live add-table cannot
+// shift it, and a re-delivery of the same transaction numbers every
+// change exactly as the first delivery did. That stability is the whole
+// contract: an applier skips a re-delivered change only when a durable
+// apply mark written with the change's own data names the same (TxID,
+// Seq), so an identity that could drift would skip work the target never
+// received.
+//
+// The zero value means "no identity": a reader that does not declare
+// [ApplyIdentityProvider] (VStream, every trigger-CDC engine, a backup
+// chunk replay) leaves it zero, and an applier NEVER skips a change with
+// a zero identity — today's at-least-once replay, exactly.
+type ApplyID struct {
+	TxID string
+	Seq  uint64
+}
+
+// IsZero reports whether id carries no identity.
+func (id ApplyID) IsZero() bool { return id.TxID == "" }
+
+// ApplyIDOf returns a row change's [ApplyID], or the zero value for a
+// change kind that carries none (Truncate, Tx boundaries,
+// SchemaSnapshot).
+func ApplyIDOf(c Change) ApplyID {
+	switch v := c.(type) {
+	case Insert:
+		return v.ApplyID
+	case Update:
+		return v.ApplyID
+	case Delete:
+		return v.ApplyID
+	}
+	return ApplyID{}
+}
+
+// ApplyIdentityProvider is the optional [CDCReader] capability declaring
+// that the reader stamps a stable [ApplyID] on every row change of a
+// source transaction (ADR-0190). It is a declaration, not a switch: an
+// applier consults each change's own identity, and a reader without this
+// capability simply produces zero identities. The declaration is what a
+// doc or a gate that names "the sources exactly-once apply marks cover"
+// derives that set from.
+type ApplyIdentityProvider interface {
+	// StampsApplyIdentity is a marker method; implementations return
+	// true.
+	StampsApplyIdentity() bool
+}
+
+// ApplyMarksClearer is the optional [ChangeApplier] surface that deletes a
+// stream's ADR-0190 apply marks. Every cold start calls it before its copy:
+// the copy re-seeds the target, so a mark naming a transaction of the old
+// stream can never again vouch for anything. The skip rule only trusts a
+// mark whose TxID the replayed change shares, so an old mark is inert while
+// source transaction identities stay unique — the clear is what keeps it
+// inert across the one event that can recycle them, a source whose history
+// was reset (a new binlog lineage, RESET MASTER), which always lands here as
+// a cold start. Idempotent; tolerant of a target that has no mark table.
+type ApplyMarksClearer interface {
+	ClearApplyMarks(ctx context.Context, streamID string) error
+}
+
 // Insert is a row-insertion change event.
 type Insert struct {
 	Position Position
@@ -170,6 +238,9 @@ type Insert struct {
 	// [Change.SourceCommitTime]. Zero when the source/path does not
 	// supply one.
 	CommitTime time.Time
+	// ApplyID is the change's identity within its source transaction
+	// (ADR-0190); zero when the reader supplies none.
+	ApplyID ApplyID
 }
 
 func (Insert) isChange()                     {}
@@ -190,6 +261,9 @@ type Update struct {
 	// CommitTime is the source-side commit timestamp; see
 	// [Change.SourceCommitTime].
 	CommitTime time.Time
+	// ApplyID is the change's identity within its source transaction
+	// (ADR-0190); zero when the reader supplies none.
+	ApplyID ApplyID
 }
 
 func (Update) isChange()                     {}
@@ -207,6 +281,9 @@ type Delete struct {
 	// CommitTime is the source-side commit timestamp; see
 	// [Change.SourceCommitTime].
 	CommitTime time.Time
+	// ApplyID is the change's identity within its source transaction
+	// (ADR-0190); zero when the reader supplies none.
+	ApplyID ApplyID
 }
 
 func (Delete) isChange()                     {}

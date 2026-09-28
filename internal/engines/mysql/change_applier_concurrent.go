@@ -352,6 +352,20 @@ func (la *laneApplierAdapter) ApplyLaneBatch(ctx context.Context, _ int, batch [
 			return 0, fmt.Errorf("mysql: applier: redact: %w", err)
 		}
 		la.a.stampShardChange(c)
+		// ADR-0190: a lane CHECKS the apply marks but writes none of its
+		// own — see the Tracker's sweepLocked for the invariant that rests
+		// on (a lane commits a later transaction's changes while an earlier
+		// one's checkpoint is still pending, which a same-transaction mark
+		// cannot be ordered against). The barrier path, which checkpoints
+		// first, does write them.
+		decision, err := la.a.decideApplyMarks(ctx, c)
+		if err != nil {
+			_ = tx.Rollback()
+			return 0, err
+		}
+		if decision.Skip {
+			continue
+		}
 		// Skip signal ignored on the lane path: the orchestrator counts
 		// rows_applied at ROUTE time (gated by SkipsRowChange, PG-2), and the
 		// lane advances the frontier by every seq it drains regardless of skips.
@@ -402,7 +416,7 @@ func (la *laneApplierAdapter) ClassifyError(err error) error {
 // relaxation). The orchestrator owns the frontier read + the seq-monotone
 // guard; this does only the durable write, wrapping each error in
 // classifyApplierError exactly as the GA writeCheckpoint did.
-func (la *laneApplierAdapter) WriteCheckpoint(ctx context.Context, pos ir.Position, rowsApplied int64) error {
+func (la *laneApplierAdapter) WriteCheckpoint(ctx context.Context, pos ir.Position, rowsApplied int64, closedTxs []string) error {
 	a := la.a
 	// H-4: the frontier checkpoint is the concurrent path's position-write
 	// boundary, so flush the coalesced skip ledger the W lanes accumulated
@@ -417,6 +431,14 @@ func (la *laneApplierAdapter) WriteCheckpoint(ctx context.Context, pos ir.Positi
 	if err != nil {
 		return classifyApplierError(fmt.Errorf("mysql: applier: checkpoint begin: %w", err))
 	}
+	// ADR-0190: this position passes closedTxs, so their apply marks go in
+	// the same transaction as the position.
+	a.marks.CloseTxs(closedTxs)
+	marks := a.marks.Plan(nil, true)
+	if err := a.execApplyMarksTx(posCtx, tx, marks); err != nil {
+		_ = tx.Rollback()
+		return classifyApplierError(err)
+	}
 	if err := writePositionTx(posCtx, tx, a.controlKeyspace, la.streamID, pos.Token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, rowsApplied, a.upsert); err != nil {
 		_ = tx.Rollback()
 		return classifyApplierError(fmt.Errorf("mysql: applier: checkpoint position write: %w", err))
@@ -424,6 +446,7 @@ func (la *laneApplierAdapter) WriteCheckpoint(ctx context.Context, pos ir.Positi
 	if err := a.commitWithTimeout(tx); err != nil {
 		return classifyApplierError(fmt.Errorf("mysql: applier: checkpoint commit: %w", err))
 	}
+	a.marks.Committed(marks)
 	return nil
 }
 
@@ -461,7 +484,9 @@ func (la *laneApplierAdapter) SkipsRowChange(ctx context.Context, c ir.Change) b
 	}
 	schema, table := laneapply.RowChangeSchemaTable(c)
 	_, err := la.a.colTypesFor(ctx, nil, la.a.routedSchema(schema), table)
-	return errors.Is(err, errUnknownTargetTable)
+	// ADR-0190: a change the apply marks prove already applied is dropped by
+	// the lane too, and counts toward rows_applied no more than a C-11 skip.
+	return errors.Is(err, errUnknownTargetTable) || la.a.applyMarksSkip(ctx, c)
 }
 
 // applyBatchConcurrent is the ADR-0104 concurrent key-hash apply entry,

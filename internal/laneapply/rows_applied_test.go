@@ -53,7 +53,7 @@ func (s *countingSeam) ApplyLaneBatch(_ context.Context, _ int, batch []ir.Chang
 
 func (s *countingSeam) ClassifyError(err error) error { return err }
 
-func (s *countingSeam) WriteCheckpoint(_ context.Context, _ ir.Position, rowsApplied int64) error {
+func (s *countingSeam) WriteCheckpoint(_ context.Context, _ ir.Position, rowsApplied int64, _ []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.rowsDeltas = append(s.rowsDeltas, rowsApplied)

@@ -86,6 +86,11 @@ func (a *ChangeApplier) ApplyBatch(ctx context.Context, streamID string, changes
 	if maxBatchSize <= 1 {
 		return a.Apply(ctx, streamID, changes)
 	}
+	// ADR-0190: load (or disable) the stream's apply marks for this run.
+	if err := a.startApplyMarks(ctx, streamID); err != nil {
+		return err
+	}
+	defer a.marks.LogRunSummary(ctx, "mysql")
 	// ADR-0104 item 23(c): when the operator wired the key-hash apply LANE
 	// count (--apply-concurrency W) > 1 and a dedicated pool can be opened,
 	// route to the concurrent key-hash apply path — W in-order lanes
@@ -154,14 +159,38 @@ func (a *ChangeApplier) batchConfig() *appliershared.BatchConfig {
 		// single-row path (same prepareApplierValue → `?` binding).
 		BeginTx: a.beginCoalescingBatchTx,
 		Dispatch: func(ctx context.Context, tx appliershared.BatchTx, streamID string, c ir.Change) (bool, error) {
-			return tx.(*mysqlBatchTx).dispatch(ctx, streamID, c)
+			// ADR-0190: a change the apply marks prove already applied is
+			// dropped here and reported skipped (no rows_applied); an applied
+			// one's marks join the batch transaction.
+			decision, err := a.decideApplyMarks(ctx, c)
+			if err != nil || decision.Skip {
+				return decision.Skip, err
+			}
+			b := tx.(*mysqlBatchTx)
+			skipped, err := b.dispatch(ctx, streamID, c)
+			if err == nil && !skipped {
+				b.marks.Add(decision.Marks)
+			}
+			return skipped, err
 		},
-		ApplyOne:   a.applyOne,
-		Redact:     a.redactChange,
-		StampShard: a.stampShardChange,
-		Classify:   classifyApplierError,
+		// ADR-0190: the position write that persists a TxCommit deletes the
+		// committed transaction's marks, so close it first.
+		OnSourceTxCommit: a.marks.CloseOpen,
+		ApplyOne:         a.applyOne,
+		Redact:           a.redactChange,
+		StampShard:       a.stampShardChange,
+		Classify:         classifyApplierError,
 		WritePosition: func(ctx context.Context, tx appliershared.BatchTx, streamID, token string, rowsApplied int64) error {
-			if err := tx.(*mysqlBatchTx).writePosition(ctx, streamID, token, rowsApplied); err != nil {
+			b := tx.(*mysqlBatchTx)
+			// ADR-0190: this position passes every closed transaction, so
+			// their marks are deleted — and the batch's own written — in this
+			// same transaction.
+			if pl, first := b.marks.Plan(&a.marks, true); first {
+				if err := a.execApplyMarksTx(ctx, b.tx, pl); err != nil {
+					return err
+				}
+			}
+			if err := b.writePosition(ctx, streamID, token, rowsApplied); err != nil {
 				return err
 			}
 			// H-4: the shared loop calls WritePosition at exactly the
@@ -174,7 +203,21 @@ func (a *ChangeApplier) batchConfig() *appliershared.BatchConfig {
 			return a.flushSkippedTables(ctx)
 		},
 		Commit: func(tx appliershared.BatchTx) error {
-			return tx.(*mysqlBatchTx).commit()
+			// ADR-0190: a flush with no position write (mid-transaction)
+			// still writes its changes' marks — with the rows, in this
+			// transaction.
+			b := tx.(*mysqlBatchTx)
+			if pl, first := b.marks.Plan(&a.marks, false); first {
+				if err := a.execApplyMarksTx(b.ctx, b.tx, pl); err != nil {
+					_ = b.Rollback()
+					return err
+				}
+			}
+			if err := b.commit(); err != nil {
+				return err
+			}
+			b.marks.Committed(&a.marks)
+			return nil
 		},
 		// AfterCommit stays nil (MySQL has no slot-ack tracker).
 		// CacheSchemaSnapshot stays nil: SchemaSnapshots route through

@@ -153,13 +153,14 @@ func TestControlTablesDDLCmd_PrintsBootstrapSet(t *testing.T) {
 		"-- sluice_shard_consolidation_lease\n",
 		"-- sluice_cdc_query_timeout_raise\n",
 		"-- sluice_cdc_skipped_tables\n",
+		"-- sluice_cdc_apply_marks\n",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output missing %q:\n%s", want, out)
 		}
 	}
-	if got := strings.Count(out, "CREATE TABLE IF NOT EXISTS"); got != 7 {
-		t.Errorf("CREATE statements = %d; want 7", got)
+	if got := strings.Count(out, "CREATE TABLE IF NOT EXISTS"); got != 8 {
+		t.Errorf("CREATE statements = %d; want 8", got)
 	}
 	// Pasteable: every non-empty line is SQL or a -- comment.
 	for _, line := range strings.Split(out, "\n") {
