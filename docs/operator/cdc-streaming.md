@@ -694,7 +694,7 @@ the VStream snapshot reader rather than on a type every flavor reaches. The
 flavor sentence beside it is the part the gate cannot check, so read both
 together.
 
-## A crash in the middle of a source transaction: exactly-once apply marks (`APPLY-MARK-MISMATCH`, `APPLY-MARKS-UNAVAILABLE`)
+## A crash in the middle of a source transaction: exactly-once apply marks (`APPLY-MARK-MISMATCH`, `APPLY-MARKS-UNAVAILABLE`, `APPLY-MARK-UNTRUSTED`)
 
 A restart re-delivers everything after the stream's persisted position, and the position only ever advances at a source transaction's commit. When a process dies partway through applying a source transaction, the target already holds part of that transaction, and the restart replays the whole transaction on top of it. Most changes replay harmlessly (sluice's apply is an idempotent upsert), but a transaction that frees a unique value and reuses it, swaps one through a temporary, or changes a primary key does not: before ADR-0190 the replay collided (`23505` / `Error 1062`) and every restart stopped on the same collision, recoverable only with `--restart-from-scratch`.
 
@@ -715,6 +715,8 @@ The marker above lists the engine PACKAGES whose readers stamp an identity, and 
 **`APPLY-MARK-MISMATCH`** (terminal) means a replayed change and the mark that should vouch for it disagree: the mark names the same position in the same transaction but a different change, or it was written under a different `--where` row filter than the one the stream runs with now. sluice refuses rather than skipping, because a skip on doubtful evidence could drop a change the target never received. For a changed `--where`, re-run with the filter the stream was established with; otherwise re-copy with `sync start --restart-from-scratch`, which also clears the stream's marks.
 
 **`APPLY-MARKS-UNAVAILABLE`** (a WARN at the start of an apply run) means the mark table cannot be used: it could not be created (a PlanetScale branch with safe migrations enabled, a role without `CREATE`), it is absent on a `--schema-already-applied` target, or the role lacks `SELECT`, `INSERT`, `UPDATE` or `DELETE` on it. The stream then runs exactly as it did before ADR-0190 — nothing is lost, and a crash mid-transaction may stop the restart on a unique collision. To enable the marks, let sluice create the table (or, on a MySQL-family target, ship the statement `sluice control-tables ddl` prints) and grant the apply role those four privileges.
+
+**`APPLY-MARK-UNTRUSTED`** (a WARN, at most once per apply run) means a restart met a mark of a transaction that was not the first one it re-delivered. Marks only ever exist for the first transaction after the persisted position, so this means the position had moved behind them; sluice then treats the mark as no evidence and APPLIES the change rather than skipping it — a unique collision may stop the stream loudly, and nothing is skipped silently. It is a safety net: every known way for the position to move behind the marks is fixed (a schema change reaching a table inside a transaction used to persist the schema event's own, earlier, position on the serial batched path), so please report it with the log around it.
 
 An older sluice binary ignores the table entirely and replays as it always has.
 

@@ -60,10 +60,11 @@ import (
 // window on purpose: it holds the stream's position row locked, so every
 // checkpoint blocks while the lanes keep committing.
 //
-// The contract that holds in every cell: a kill mid-transaction never
-// persists a position past the transaction, never damages a row the
-// transaction did not touch, and at the kill the target holds apply marks for
-// at most ONE transaction (the invariant the restart sweep rests on).
+// The contract that holds in every cell: a kill mid-transaction never MOVES
+// the persisted position (past the transaction or behind an earlier one),
+// never damages a row the transaction did not touch, and at the kill every
+// apply mark names the interrupted transaction — the first a restart
+// re-delivers (amendment B; derived from the source where cheap).
 //
 // The kill is a context cancel with the target holding a row lock on a row a
 // LATE statement touches, so the applier has committed everything before it
@@ -154,6 +155,20 @@ type crashSource struct {
 	// configure names the stream's per-cell source resources (a Postgres
 	// slot and publication; nothing on MySQL) and returns their teardown.
 	configure func(t *testing.T, s *Streamer, suffix string) (teardown func())
+
+	// ddlBefore (run before the cold copy, may be empty) and ddlMid (run
+	// between two transactions) are a source-dialect DDL on po, so po's next
+	// row arrives inside a transaction with a SchemaSnapshot stamped at the
+	// DDL's own position. dropBefore / dropMid are the DROP COLUMN variant,
+	// empty where it is not run.
+	ddlBefore, ddlMid   string
+	dropBefore, dropMid string
+	// lastTxID derives the ADR-0190 identity of the source's most recently
+	// committed transaction from the source's OWN bookkeeping (its GTID
+	// state, its binlog) — the independent expected value for "the marks
+	// name the interrupted transaction". nil where there is no cheap
+	// derivation (Postgres: the commit LSN is not queryable after the fact).
+	lastTxID func(t *testing.T) string
 }
 
 func mysqlCrashSource(engine, dsn string) crashSource {
@@ -184,6 +199,9 @@ func mysqlCrashSource(engine, dsn string) crashSource {
 		configure: func(*testing.T, *Streamer, string) func() {
 			return func() {}
 		},
+		ddlBefore: `ALTER TABLE po ADD COLUMN extra INT NULL`,
+		ddlMid:    `ALTER TABLE po DROP COLUMN extra`,
+		lastTxID:  func(t *testing.T) string { return mysqlLastTxID(t, engine, dsn) },
 	}
 }
 
@@ -224,7 +242,98 @@ func pgCrashSource(dsn string) crashSource {
 				_, _ = db.Exec(`SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name LIKE $1`, "%crash_"+suffix)
 			}
 		},
+		ddlMid:     `ALTER TABLE po ALTER COLUMN v TYPE VARCHAR(64)`,
+		dropBefore: `ALTER TABLE po ADD COLUMN extra INT NULL`,
+		dropMid:    `ALTER TABLE po DROP COLUMN extra`,
 	}
+}
+
+// mysqlLastTxID derives the ADR-0190 transaction identity the binlog reader
+// gives the source's most recently committed transaction, from the source's
+// own state: MariaDB's @@gtid_binlog_pos; MySQL GTID mode's last GNO of
+// @@server_uuid in @@gtid_executed; MySQL file/pos mode's server_uuid, the
+// current binlog file and the end offset of its last BEGIN (the opening
+// event the reader names the transaction by).
+func mysqlLastTxID(t *testing.T, engine, dsn string) string {
+	t.Helper()
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("open source: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	if engine == "mariadb" {
+		var p string
+		if err := db.QueryRow(`SELECT @@gtid_binlog_pos`).Scan(&p); err != nil || strings.Contains(p, ",") {
+			t.Fatalf("@@gtid_binlog_pos = %q (err %v); want one domain's last GTID", p, err)
+		}
+		return p
+	}
+	var uuid, mode string
+	if err := db.QueryRow(`SELECT @@server_uuid, @@gtid_mode`).Scan(&uuid, &mode); err != nil {
+		t.Fatalf("read server_uuid / gtid_mode: %v", err)
+	}
+	if mode == "ON" {
+		var executed string
+		if err := db.QueryRow(`SELECT @@global.gtid_executed`).Scan(&executed); err != nil {
+			t.Fatalf("read gtid_executed: %v", err)
+		}
+		for _, set := range strings.Split(strings.ReplaceAll(executed, "\n", ""), ",") {
+			set = strings.TrimSpace(set)
+			if !strings.HasPrefix(set, uuid+":") {
+				continue
+			}
+			intervals := strings.Split(strings.TrimPrefix(set, uuid+":"), ":")
+			last := intervals[len(intervals)-1]
+			return uuid + ":" + last[strings.LastIndex(last, "-")+1:]
+		}
+		t.Fatalf("gtid_executed %q holds no transaction of %s", executed, uuid)
+	}
+	logs := queryStringRows(t, db, `SHOW BINARY LOGS`)
+	file := logs[len(logs)-1]["Log_name"]
+	var begin string
+	for _, ev := range queryStringRows(t, db, "SHOW BINLOG EVENTS IN '"+file+"'") {
+		if ev["Event_type"] == "Query" && ev["Info"] == "BEGIN" {
+			begin = ev["End_log_pos"]
+		}
+	}
+	if begin == "" {
+		t.Fatalf("no BEGIN in %s", file)
+	}
+	return fmt.Sprintf("filepos:%s:%s:%s", uuid, file, begin)
+}
+
+// queryStringRows runs q and returns every row as column → text.
+func queryStringRows(t *testing.T, db *sql.DB, q string) []map[string]string {
+	t.Helper()
+	rows, err := db.Query(q)
+	if err != nil {
+		t.Fatalf("%s: %v", q, err)
+	}
+	defer func() { _ = rows.Close() }()
+	cols, err := rows.Columns()
+	if err != nil {
+		t.Fatalf("%s: %v", q, err)
+	}
+	var out []map[string]string
+	for rows.Next() {
+		vals := make([]sql.RawBytes, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		row := make(map[string]string, len(cols))
+		for i, c := range cols {
+			row[c] = string(vals[i])
+		}
+		out = append(out, row)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("%s: %v", q, err)
+	}
+	return out
 }
 
 func TestStreamer_CrashMidTxn_MySQLGTID_ToPostgres(t *testing.T) {
@@ -355,6 +464,20 @@ func runCrashMidTxnSuite(t *testing.T, src crashSource, tgt resendTarget, pins c
 				name: "stale_mark_swept", concurrency: 1, batch: 0, converges: true,
 				tamper: plantStaleMark,
 			},
+			// ADR-0190 §8: marks are per KEY, so a restart with a different
+			// lane count — or none — reads them the same way.
+			crashMidTxnCell{
+				name: "lane_count_changed_4_to_2", concurrency: 4, batch: 1000, converges: true,
+				restart: func(s *Streamer) { s.ApplyConcurrency = 2 },
+			},
+			crashMidTxnCell{
+				name: "lane_count_changed_lanes_to_serial", concurrency: 4, batch: 1000, converges: true,
+				restart: func(s *Streamer) { s.ApplyConcurrency = 1 },
+			},
+			crashMidTxnCell{
+				name: "lane_count_changed_serial_to_lanes", concurrency: 1, batch: 0, converges: true,
+				restart: func(s *Streamer) { s.ApplyConcurrency, s.ApplyBatchSize = 4, 1000 },
+			},
 			// A changed row-filter scope refuses rather than trusting a mark.
 			crashMidTxnCell{
 				name: "scope_change", concurrency: 1, batch: 0,
@@ -384,6 +507,27 @@ func runCrashMidTxnSuite(t *testing.T, src crashSource, tgt resendTarget, pins c
 	t.Run("lane_post_commit_window", func(t *testing.T) {
 		runCrashLanePostCommitWindow(t, src, tgt)
 	})
+	// A schema event inside the interrupted transaction (the 2026-09-28
+	// CRITICAL): the serial batched path is the one that regressed; lanes and
+	// per-change are the controls.
+	schemaCells := []crashMidTxnCell{
+		{name: "schema_event_mid_txn_serial_batched", concurrency: 1, batch: 1000, fixedCap: true},
+		{name: "schema_event_mid_txn_lanes_batched", concurrency: 0, batch: 1000},
+		{name: "schema_event_mid_txn_serial_per_change", concurrency: 1, batch: 0},
+	}
+	for _, cell := range schemaCells {
+		t.Run(cell.name, func(t *testing.T) {
+			runCrashSchemaEventMidTxn(t, src, tgt, cell, src.ddlBefore, src.ddlMid)
+		})
+	}
+	if src.dropMid != "" {
+		// The separate LOUD defect the same regression caused (audit backlog
+		// GC-38 (l) follow-up): a DROP COLUMN's 0/0 snapshot position replayed
+		// rows from before the DDL and crash-looped on the dropped column.
+		t.Run("schema_drop_column_mid_txn_serial_batched", func(t *testing.T) {
+			runCrashSchemaEventMidTxn(t, src, tgt, schemaCells[0], src.dropBefore, src.dropMid)
+		})
+	}
 	if pins&crashPinsColdStart != 0 {
 		t.Run("cold_start_clears_marks", func(t *testing.T) {
 			runCrashColdStartClearsMarks(t, src, tgt)
@@ -498,17 +642,49 @@ func runCrashToKill(t *testing.T, src crashSource, tgt resendTarget, fx crashStr
 	released = true
 
 	if posAfterKill != posBefore {
-		t.Errorf("the persisted position MOVED across a kill mid-transaction: %q before the transaction, %q after — "+
-			"a position past a partly applied transaction skips its remainder on resume (silent loss)", posBefore, posAfterKill)
+		t.Errorf("the persisted position MOVED across a kill mid-transaction (either direction is a defect): %q before the "+
+			"transaction, %q after — past a partly applied transaction skips its remainder on resume; behind an earlier "+
+			"transaction replays it ahead of this one's marks (both silent)", posBefore, posAfterKill)
 	}
-	// The invariant the restart sweep rests on (applymarks sweepLocked): the
-	// target holds apply marks for at most ONE transaction.
-	marks := targetMarks(t, tgt, fx.streamID)
-	if txs := distinctTxs(marks); len(txs) > 1 {
-		t.Errorf("apply marks exist for %d transactions at the kill (%v); the design allows at most the one in flight", len(txs), txs)
-	}
-	t.Logf("apply marks at the kill: %d (%v)", len(marks), marksPerTable(marks))
+	assertMarksNameTheInterruptedTx(t, src, tgt, fx.streamID, "")
 	return prefixApplied
+}
+
+// assertMarksNameTheInterruptedTx asserts the invariant the restart sweep and
+// the APPLY-MARK-UNTRUSTED check rest on (ADR-0190 amendment B): at a kill,
+// every durable mark names ONE transaction — the one the restart re-delivers
+// first. With the position unchanged across the kill (asserted by the
+// caller), that is the interrupted transaction, whose identity is derived
+// from the SOURCE's own state where cheap (want == "" → src.lastTxID).
+func assertMarksNameTheInterruptedTx(t *testing.T, src crashSource, tgt resendTarget, streamID, want string) {
+	t.Helper()
+	marks := targetMarks(t, tgt, streamID)
+	txs := distinctTxs(marks)
+	if len(txs) > 1 {
+		t.Errorf("apply marks exist for %d transactions at the kill (%v); only the first a restart re-delivers may have any", len(txs), txs)
+	}
+	if want == "" && src.lastTxID != nil && len(txs) > 0 {
+		want = src.lastTxID(t)
+	}
+	for _, tx := range txs {
+		if want != "" && tx != want {
+			t.Errorf("apply marks at the kill name transaction %q; the only transaction a mark may name is the interrupted one, "+
+				"the first a restart re-delivers — %q per the source", tx, want)
+		}
+	}
+	t.Logf("apply marks at the kill: %d (%v), transactions %v", len(marks), marksPerTable(marks), txs)
+}
+
+// assertNoUntrustedMark fails when a restart logged APPLY-MARK-UNTRUSTED:
+// the run met a mark of a transaction it did not deliver first, which means
+// the position had moved behind the marks — converging only because the
+// runtime check caught it is still a defect in whatever moved the position.
+func assertNoUntrustedMark(t *testing.T, logs string) {
+	t.Helper()
+	if strings.Contains(logs, applymarks.UntrustedMarker) {
+		t.Errorf("the restart logged %s: a durable mark named a transaction the run did not re-deliver first — the "+
+			"persisted position moved behind the marks", applymarks.UntrustedMarker)
+	}
 }
 
 func runCrashMidTxnCell(t *testing.T, src crashSource, tgt resendTarget, cell crashMidTxnCell) {
@@ -560,6 +736,7 @@ func runCrashMidTxnCell(t *testing.T, src crashSource, tgt resendTarget, cell cr
 			t.Fatalf("the restart after a kill mid-transaction did not converge: caught up %v, error %v", caughtUp, restartErr)
 		}
 		assertCrashConverged(t, src, tgt)
+		assertNoUntrustedMark(t, logs)
 		// GC: the position passed the crashed transaction (and the sentinel's),
 		// so their marks are gone — deleted with the position that passed them.
 		if left := targetMarks(t, tgt, fx.streamID); len(left) > 0 {
@@ -656,6 +833,10 @@ func runCrashLanePostCommitWindow(t *testing.T, src crashSource, tgt resendTarge
 		}
 	}()
 	src.txn(t, `UPDATE rs SET v = 't1' WHERE id = 7;`)
+	t1 := ""
+	if src.lastTxID != nil {
+		t1 = src.lastTxID(t) // the first transaction the restart must re-deliver
+	}
 	src.txn(t, `DELETE FROM rs WHERE id = 7;`)
 	// T1 reaching the target (or, without the fence, T1 and T2 both) proves
 	// the lanes committed into the window no checkpoint can close.
@@ -680,18 +861,93 @@ func runCrashLanePostCommitWindow(t *testing.T, src crashSource, tgt resendTarge
 		t.Fatalf("the position moved (%q → %q) while its row was held locked: the window closed before the kill, so the cell measured nothing",
 			posBefore, posAfterKill)
 	}
-	marks := targetMarks(t, tgt, fx.streamID)
-	if txs := distinctTxs(marks); len(txs) > 1 {
-		t.Errorf("apply marks exist for %d transactions at the kill (%v); the fence allows at most the one after the position", len(txs), txs)
-	}
-	t.Logf("apply marks at the kill: %d (%v); row 7 at the kill: %d", len(marks), marksPerTable(marks),
-		countTarget(tgt, "SELECT COUNT(*) FROM rs WHERE id = 7"))
+	assertMarksNameTheInterruptedTx(t, src, tgt, fx.streamID, t1)
+	t.Logf("row 7 at the kill: %d", countTarget(tgt, "SELECT COUNT(*) FROM rs WHERE id = 7"))
 
 	caughtUp, restartErr := resumeCrashStreamWith(t, fx.newStreamer, nil, src, tgt, true, fx.streamID, posAfterKill)
 	if !caughtUp || restartErr != nil {
 		t.Fatalf("the restart after a kill in the lane post-commit window did not converge: caught up %v, error %v", caughtUp, restartErr)
 	}
 	assertCrashConverged(t, src, tgt)
+	assertNoUntrustedMark(t, fx.logBuf.String())
+	if left := targetMarks(t, tgt, fx.streamID); len(left) > 0 {
+		t.Errorf("%d apply marks survived the position passing their transactions (garbage collection): %v", len(left), marksPerTable(left))
+	}
+}
+
+// runCrashSchemaEventMidTxn is the 2026-09-28 pre-land review's CRITICAL,
+// as a cell. A DDL on po (ddlMid) is followed by T-1, one INSERT of row 500
+// into the secondary-unique table; then T deletes row 500 (a marked change),
+// writes po's first post-DDL row — which reaches the applier as a
+// SchemaSnapshot stamped with the DDL's OWN position, from before T-1 — and
+// blocks on a target row lock. The kill lands there.
+//
+// Before the fix the serial batched path persisted the snapshot's position
+// mid-transaction, regressing the stream behind T-1 while T's delete and its
+// mark were durable; the restart replayed T-1 (re-creating row 500) and then
+// skipped T's delete on its own mark: row 500 left on the target at exit 0.
+// The pins, each on its own evidence: the position did not move across the
+// kill (a regression is a move); the marks name T, per the source; the
+// restart converges to the source's table; and it did so without the
+// APPLY-MARK-UNTRUSTED runtime check having to fire (which would mean the
+// position moved and only the check saved the run).
+func runCrashSchemaEventMidTxn(t *testing.T, src crashSource, tgt resendTarget, cell crashMidTxnCell, ddlBefore, ddlMid string) {
+	fx := newCrashStreamFixture(t, src, tgt, cell)
+	defer fx.teardown()
+	if ddlBefore != "" {
+		src.exec(t, ddlBefore)
+	}
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	defer cancel1()
+	run1 := make(chan error, 1)
+	go func() { run1 <- fx.newStreamer().Run(ctx1) }()
+	waitResend(t, run1, 120*time.Second, "the cold copy", func() bool { return len(tgt.dump(t)) >= 200 })
+	src.exec(t, `INSERT INTO po (id, v) VALUES (100, 'live')`)
+	src.exec(t, fmt.Sprintf(`INSERT INTO rs (id, u, v, pad) VALUES (%d, NULL, 'live', 'l')`, crashSentinelLive))
+	waitResend(t, run1, 60*time.Second, "the first CDC rows", func() bool {
+		return tgt.has(crashSentinelLive) && countTarget(tgt, "SELECT COUNT(*) FROM po WHERE id = 100") == 1
+	})
+	src.exec(t, ddlMid)
+	src.txn(t, `INSERT INTO rs (id, u, v, pad) VALUES (500, 'x500', 't1', 'p');`) // T-1
+	waitResend(t, run1, 60*time.Second, "T-1", func() bool { return countTarget(tgt, "SELECT COUNT(*) FROM rs WHERE id = 500") == 1 })
+	posBefore := settledPosition(t, tgt, fx.streamID)
+
+	release := holdRowLock(t, driverOf(tgt), tgt.dsn, `SELECT id FROM rs WHERE id = 100 FOR UPDATE`)
+	released := false
+	defer func() {
+		if !released {
+			release()
+		}
+	}()
+	src.txn(t, `DELETE FROM rs WHERE id = 500;
+INSERT INTO po (id, v) VALUES (501, 'n');
+UPDATE rs SET v = 'blocked' WHERE id = 100;
+`) // T
+	if !waitResendSoft(run1, 30*time.Second, func() bool { return countTarget(tgt, "SELECT COUNT(*) FROM rs WHERE id = 500") == 0 }) {
+		t.Fatal("T's delete never reached the target: no prefix, so this cell would pass vacuously")
+	}
+	time.Sleep(3 * time.Second) // let the snapshot's flush and the blocked statement happen
+	cancel1()
+	select {
+	case <-run1:
+	case <-time.After(60 * time.Second):
+		t.Fatal("the first stream did not return after cancel")
+	}
+	posAfterKill := tgt.readPos(fx.streamID)
+	release()
+	released = true
+	if posAfterKill != posBefore {
+		t.Errorf("the persisted position MOVED across a kill mid-transaction (either direction is a defect): %q after T-1, %q "+
+			"after the kill — a schema event inside T persisted its DDL-anchored position", posBefore, posAfterKill)
+	}
+	assertMarksNameTheInterruptedTx(t, src, tgt, fx.streamID, "")
+
+	caughtUp, restartErr := resumeCrashStreamWith(t, fx.newStreamer, nil, src, tgt, true, fx.streamID, posAfterKill)
+	if !caughtUp || restartErr != nil {
+		t.Fatalf("the restart after a kill mid-transaction with a schema event did not converge: caught up %v, error %v", caughtUp, restartErr)
+	}
+	assertCrashConverged(t, src, tgt)
+	assertNoUntrustedMark(t, fx.logBuf.String())
 	if left := targetMarks(t, tgt, fx.streamID); len(left) > 0 {
 		t.Errorf("%d apply marks survived the position passing their transactions (garbage collection): %v", len(left), marksPerTable(left))
 	}

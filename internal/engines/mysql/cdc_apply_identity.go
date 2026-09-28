@@ -5,6 +5,7 @@ package mysql
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/go-mysql-org/go-mysql/replication"
 
@@ -53,11 +54,27 @@ import (
 // provably splits what the primary wrote as one event). Were it ever false,
 // the tripwire (applymarks.MismatchMarker) refuses rather than skips.
 
+// anonymousGTIDSource is the all-zero source id go-mysql reports for an
+// ANONYMOUS_GTID_EVENT — a transaction written with gtid_mode OFF or
+// OFF_PERMISSIVE — which it parses as a GTID event. Every anonymous
+// transaction parses to the same "00000000-0000-0000-0000-000000000000:0",
+// so it names no transaction at all: such a transaction gets NO identity
+// (it never skips), never a shared one. sluice itself takes gtid_mode
+// ON_PERMISSIVE as GTID mode (gtidModeOnFor), where anonymous transactions
+// can exist; what keeps them out of the stream is the SERVER refusing to send
+// one to a GTID auto-position dump (ER_CANT_REPLICATE_ANONYMOUS_WITH_AUTO_
+// POSITION) — an UNVERIFIED PREMISE here, no test pins it, so this check
+// stops depending on it (pinned by TestTransactionIdentity_AnonymousGTIDHasNone).
+const anonymousGTIDSource = "00000000-0000-0000-0000-000000000000:"
+
 // transactionIdentity names the transaction whose opening event hdr is (see
 // the file comment), or "" when this position mode cannot name it stably.
 func (r *CDCReader) transactionIdentity(hdr *replication.EventHeader) string {
 	switch r.posMode {
 	case positionModeGTID:
+		if strings.HasPrefix(r.pendingGTID, anonymousGTIDSource) {
+			return ""
+		}
 		return r.pendingGTID
 	case positionModeFilePos:
 		if r.serverUUID == "" || hdr == nil {

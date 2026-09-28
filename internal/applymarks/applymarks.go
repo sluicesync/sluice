@@ -81,6 +81,15 @@ const MismatchMarker = "APPLY-MARK-MISMATCH"
 // operator decision 2 in ADR-0190 — no new refusal.
 const UnavailableMarker = "APPLY-MARKS-UNAVAILABLE"
 
+// UntrustedMarker is the grep-stable token of the WARN a run logs when a
+// durable mark names the replayed change's own transaction but that
+// transaction is NOT the first one this run delivered. Marks only ever exist
+// for the first transaction after the persisted position (ADR-0190 amendment
+// B), so such a mark means the position moved behind it — the 2026-09-28
+// SchemaSnapshot regression was one way — and it is not evidence: the change
+// applies (a loud collision at worst, never a silent skip).
+const UntrustedMarker = "APPLY-MARK-UNTRUSTED"
+
 // Mark is one row of the sluice_cdc_apply_marks control table: the last
 // change of transaction TxID that reached one key of one target table.
 type Mark struct {
@@ -164,7 +173,12 @@ type Tracker struct {
 	closed       map[string]bool
 	swept        bool
 
-	skipped atomic.Int64
+	// firstTx is the first identity-carrying transaction this apply run
+	// delivered — the only one a loaded mark may vouch for (see consult).
+	// First writer wins; Load resets it.
+	firstTx         atomic.Pointer[string]
+	warnedUntrusted atomic.Bool
+	skipped         atomic.Int64
 }
 
 // Load resets the tracker to the stream's durable marks and enables it. The
@@ -189,6 +203,8 @@ func (t *Tracker) Load(streamID, scope string, marks []Mark) {
 		t.dirty[m.TxID] = true
 	}
 	t.skipped.Store(0)
+	t.firstTx.Store(nil)
+	t.warnedUntrusted.Store(false)
 	t.enabled.Store(true)
 }
 
@@ -245,7 +261,9 @@ func (t *Tracker) Decide(c ir.Change, s Subject) (Decision, error) {
 	return d, err
 }
 
-// Skips reports, with no side effect, whether [Tracker.Decide] would skip c.
+// Skips reports whether [Tracker.Decide] would skip c, with no side effect but
+// noting the run's first delivered transaction (and the once-per-run
+// [UntrustedMarker] WARN).
 // The lane coordinator asks it at ROUTE time so a change the marks prove
 // already applied does not advance rows_applied; a refusal answers false
 // (the apply path raises it).
@@ -254,7 +272,7 @@ func (t *Tracker) Skips(c ir.Change, s Subject) bool {
 	return err == nil && d.Skip
 }
 
-// WouldMark reports, with no side effect, whether [Tracker.Decide] would have
+// WouldMark reports, with no side effect but those of [Tracker.Skips], whether [Tracker.Decide] would have
 // c write a mark — or would refuse it. The lane coordinator asks it at ROUTE
 // time to decide whether the change needs a mark fence (see [LaneFence]); a
 // refusal answers true because fencing first costs only a drain, and the
@@ -275,6 +293,10 @@ func (t *Tracker) verdict(c ir.Change, s Subject) (d Decision, involved bool, er
 	if id.IsZero() {
 		return Decision{}, false, nil
 	}
+	// Every apply path consults the tracker for its changes in source order
+	// before any later change reaches it (the lane coordinator at route
+	// time), so the first identity seen is the first transaction delivered.
+	t.firstTx.CompareAndSwap(nil, &id.TxID)
 	marked, pkChange := s.classOf(c)
 	checked := t.loadedTables[s.Table]
 	if !marked && !checked {
@@ -327,6 +349,15 @@ func (t *Tracker) consult(id ir.ApplyID, table string, keys []string, digest str
 			// No mark, or a mark of another transaction: a TxID is unique per
 			// source transaction, so a foreign one proves nothing about this
 			// change.
+			continue
+		}
+		if first := t.firstTx.Load(); first == nil || *first != m.TxID {
+			// Amendment B as a runtime check: marks only exist for the first
+			// transaction after the persisted position, so a mark of THIS
+			// transaction when it was not delivered first means the position
+			// moved behind it — and the earlier transaction just replayed may
+			// have re-created what the mark says is done. Not evidence.
+			t.warnUntrusted(m, first)
 			continue
 		}
 		if m.ScopeDigest != t.scope {
@@ -733,6 +764,25 @@ func WarnUnavailable(ctx context.Context, engine, streamID string, cause error) 
 		"enable the marks, let sluice create the table (or, on a MySQL-family target, ship the DDL `sluice control-tables "+
 		"ddl` prints) and grant this role SELECT, INSERT, UPDATE and DELETE on it",
 		slog.String("stream_id", streamID), slog.String("cause", msg))
+}
+
+// warnUntrusted logs the [UntrustedMarker] WARN, once per apply run. first
+// is the run's first delivered transaction (nil only if none was noted).
+func (t *Tracker) warnUntrusted(m Mark, first *string) {
+	if !t.warnedUntrusted.CompareAndSwap(false, true) {
+		return
+	}
+	firstTx := ""
+	if first != nil {
+		firstTx = *first
+	}
+	slog.Warn("apply-marks: "+UntrustedMarker+": a durable apply mark names a replayed change's own transaction, but "+
+		"that transaction was not the first this run re-delivered — marks only ever exist for the first transaction "+
+		"after the persisted position, so the position moved behind it and the mark is not evidence. The change is "+
+		"APPLIED, not skipped: a unique collision may stop the stream loudly, and nothing is skipped silently. Report "+
+		"this with the log around it (ADR-0190 amendment B)",
+		slog.String("stream_id", t.streamID), slog.String("mark_tx_id", m.TxID),
+		slog.String("first_tx_id", firstTx), slog.String("table", m.Table))
 }
 
 // RefusalError is the terminal refusal this package raises. It is terminal

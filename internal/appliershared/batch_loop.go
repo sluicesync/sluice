@@ -119,8 +119,8 @@ type BatchConfig struct {
 
 	// CheckpointOnlyAtTxBoundary, when true, makes the loop persist the
 	// resume position ONLY on a source-transaction boundary flush
-	// (TxCommit) or a DDL flush (Truncate / SchemaSnapshot, which
-	// implicit-commit on MySQL and ride their own tx on PG) — never on a
+	// (TxCommit) or a DDL flush OUTSIDE a source transaction (Truncate /
+	// SchemaSnapshot; see [schemaEventAtBoundary]) — never on a
 	// row-cap / byte-cap / idle / keyless / channel-close flush that lands
 	// mid-transaction. The batch's DATA still commits on every flush
 	// (memory stays bounded, ADR-0028); only the *position write* is gated.
@@ -216,11 +216,13 @@ type BatchConfig struct {
 	// returns false.
 	Dispatch func(ctx context.Context, tx BatchTx, streamID string, c ir.Change) (skipped bool, err error)
 
-	// ApplyOne is the engine's per-change apply path (own tx, position
-	// write included). The loop calls it only on the
-	// TransactionalDDL=false branches, where a schema event must apply
-	// outside the batch tx.
-	ApplyOne func(ctx context.Context, streamID string, c ir.Change) error
+	// ApplyOne is the engine's per-change apply path (own tx). The loop
+	// calls it only on the TransactionalDDL=false branches, where a schema
+	// event must apply outside the batch tx. writePosition is false when
+	// the event arrives INSIDE a source transaction — see
+	// [schemaEventAtBoundary] for why its position must not be persisted
+	// there.
+	ApplyOne func(ctx context.Context, streamID string, c ir.Change, writePosition bool) error
 
 	// Redact applies the operator's PII rules to a change's row data
 	// before dispatch (Phase 1.5); the loop wraps a refusal as
@@ -472,7 +474,7 @@ func runOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 	// IsZero guard skips observing these rare schema-event paths (they
 	// were never meaningful AIMD-row-throughput signals).
 	if !cfg.TransactionalDDL && isSchemaEvent(first) {
-		if err := cfg.ApplyOne(ctx, streamID, first); err != nil {
+		if err := cfg.ApplyOne(ctx, streamID, first, schemaEventAtBoundary(*inSourceTx)); err != nil {
 			return 0, ir.Position{}, false, err
 		}
 		return 1, first.Pos(), false, nil
@@ -525,10 +527,10 @@ func runOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 	// after commitBatch reports nil (Chunk C cache-after-commit).
 	if cfg.TransactionalDDL {
 		if _, isTruncate := first.(ir.Truncate); isTruncate {
-			return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, true, pending, *inSourceTx)
+			return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, schemaEventAtBoundary(*inSourceTx), pending, *inSourceTx)
 		}
 		if snap, isSnap := first.(ir.SchemaSnapshot); isSnap {
-			if err := commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, true, pending, *inSourceTx); err != nil {
+			if err := commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, schemaEventAtBoundary(*inSourceTx), pending, *inSourceTx); err != nil {
 				return 0, ir.Position{}, false, err
 			}
 			cfg.CacheSchemaSnapshot(snap)
@@ -603,7 +605,7 @@ func runOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 					return 0, ir.Position{}, false, err
 				}
 				logBatchCommitted(ctx, cfg.EngineName, streamID, n, lastPos.Token)
-				if err := cfg.ApplyOne(ctx, streamID, c); err != nil {
+				if err := cfg.ApplyOne(ctx, streamID, c, schemaEventAtBoundary(*inSourceTx)); err != nil {
 					return 0, ir.Position{}, false, err
 				}
 				return 1, c.Pos(), false, nil
@@ -635,10 +637,10 @@ func runOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 			// arrive in later batches) are applied.
 			if cfg.TransactionalDDL {
 				if _, isTruncate := c.(ir.Truncate); isTruncate {
-					return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, true, pending, *inSourceTx)
+					return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, schemaEventAtBoundary(*inSourceTx), pending, *inSourceTx)
 				}
 				if snap, isSnap := c.(ir.SchemaSnapshot); isSnap {
-					if err := commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, true, pending, *inSourceTx); err != nil {
+					if err := commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, schemaEventAtBoundary(*inSourceTx), pending, *inSourceTx); err != nil {
 						return 0, ir.Position{}, false, err
 					}
 					// ADR-0049 Chunk C cache-after-commit: see the
@@ -885,6 +887,33 @@ func noteSourceTxCommit(cfg *BatchConfig) {
 	if cfg.OnSourceTxCommit != nil {
 		cfg.OnSourceTxCommit()
 	}
+}
+
+// schemaEventAtBoundary reports whether a schema event (Truncate /
+// SchemaSnapshot) is a position boundary — whether its flush may persist its
+// own position. Only OUTSIDE a source transaction: a DDL-anchored event with
+// no transaction around it (a MySQL TRUNCATE, which implicit-commits; a
+// marker-less source's snapshot) is a statement boundary.
+//
+// INSIDE a source transaction it is not, whatever its position says. A
+// reader emits a table's SchemaSnapshot lazily, at the table's first row
+// after a DDL — inside whatever transaction that row belongs to — and stamps
+// it with the DDL's own position (MySQL: the DDL anchor; Postgres: the
+// RelationMessage's WAL start, 0/0), which can lie BEFORE earlier,
+// already-applied transactions. Persisting it regressed the stream behind
+// them while the current transaction's rows and ADR-0190 apply marks were
+// already durable: the restart replayed the earlier transaction first (its
+// upsert re-created a row) and then skipped the current transaction's delete
+// of that row on its own mark — silent, at exit 0 (the 2026-09-28 pre-land
+// review's CRITICAL). It is also why a PG→PG stream that crashed after a
+// DROP COLUMN replayed rows from before the DDL and crash-looped on "column
+// does not exist". So inside a transaction the event's data commits and the
+// position stays at the last boundary, exactly like any other mid-transaction
+// flush; the transaction's TxCommit persists the next one. The per-change
+// path has deferred the same way since CDCPOS-2, and the lane path's frontier
+// never records a SchemaSnapshot at all (Bug 158).
+func schemaEventAtBoundary(inSourceTx bool) bool {
+	return !inSourceTx
 }
 
 // isSchemaEvent reports whether c is a schema-changing event the

@@ -176,7 +176,7 @@ func (a *ChangeApplier) batchConfig() *appliershared.BatchConfig {
 		// ADR-0190: the position write that persists a TxCommit deletes the
 		// committed transaction's marks, so close it first.
 		OnSourceTxCommit: a.marks.CloseOpen,
-		ApplyOne:         a.applyOne,
+		ApplyOne:         a.applySchemaEvent,
 		Redact:           a.redactChange,
 		StampShard:       a.stampShardChange,
 		Classify:         classifyApplierError,

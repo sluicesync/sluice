@@ -220,7 +220,7 @@ func (a *ChangeApplier) batchConfig() *appliershared.BatchConfig {
 		// ApplyOne is unreachable while TransactionalDDL is true (PG
 		// schema events ride the batch tx); filled so the seam stays
 		// total.
-		ApplyOne:   a.applyOne,
+		ApplyOne:   a.applySchemaEvent,
 		Redact:     a.redactChange,
 		StampShard: a.stampShardChange,
 		Classify:   classifyApplierError,

@@ -125,8 +125,12 @@ func testConfig(t *testing.T, rec *recorder, transactionalDDL bool) *BatchConfig
 			rec.add("dispatch:" + c.Pos().Token)
 			return false, nil
 		},
-		ApplyOne: func(_ context.Context, _ string, c ir.Change) error {
-			rec.add("applyOne:" + c.Pos().Token)
+		ApplyOne: func(_ context.Context, _ string, c ir.Change, writePosition bool) error {
+			if writePosition {
+				rec.add("applyOne:" + c.Pos().Token)
+			} else {
+				rec.add("applyOne(no position):" + c.Pos().Token)
+			}
 			return nil
 		},
 		Redact:     func(context.Context, ir.Change) error { return nil },
@@ -759,12 +763,12 @@ func TestRunBatchLoop_RowsApplied_CheckpointOnly_BoundaryInBatch(t *testing.T) {
 // TestRunBatchLoop_RowsApplied_CheckpointOnly_CarrySurvivesSchemaEventInterlude
 // pins the one carry arm the suite above did not reach (2026-08-22 invariant
 // sweep): on the TransactionalDDL=false (MySQL-target) path, a schema event
-// arriving MID-SOURCE-TRANSACTION (a PG source's transactional Truncate — a
-// MySQL source's DDL implicit-commits and can never land here) first flushes
+// arriving MID-SOURCE-TRANSACTION (a PG source's transactional Truncate, or
+// any source's lazily-emitted SchemaSnapshot) first flushes
 // the in-flight batch. Under CheckpointOnlyAtTxBoundary that flush is mid-tx,
 // so it must SKIP the position write and defer its DML into the carry; the
-// event then applies alone via ApplyOne (whose own mid-tx position story is
-// pinned per-engine by TestApply_PerChangePositionDeferredToTxCommit), and the
+// event then applies alone via ApplyOne WITHOUT its position (see
+// TestRunBatchLoop_SchemaEventInsideSourceTx_NeverPersistsItsPosition), and the
 // carried DML must land in the NEXT boundary write — neither dropped by the
 // interlude nor written at the schema-event flush.
 //
@@ -791,7 +795,7 @@ func TestRunBatchLoop_RowsApplied_CheckpointOnly_CarrySurvivesSchemaEventInterlu
 	// via ApplyOne; the boundary write carries the deferred 2.
 	assertEvents(t, rec, []string{
 		"begin", "dispatch:p1", "dispatch:p2", "commit", // mid-tx flush: data only, carry=2
-		"applyOne:ddl",                        // the interlude
+		"applyOne(no position):ddl",           // the interlude, position withheld
 		"begin", "writePosition:tc", "commit", // boundary: dedicated position-only tx
 	})
 	if got, want := rec.rowsDeltas, []int64{2}; !equalInt64(got, want) {

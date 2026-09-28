@@ -1211,6 +1211,17 @@ func (a *ChangeApplier) applyOne(ctx context.Context, streamID string, c ir.Chan
 	return err
 }
 
+// applySchemaEvent is the shared batch loop's [appliershared.BatchConfig]
+// ApplyOne — every schema event the batched path applies (it can never share
+// the batch tx: DDL implicit-commits). The loop chooses the position write,
+// and withholds it for an event inside a source transaction: a lazily-emitted
+// SchemaSnapshot carries its DDL's position, which can lie before
+// transactions already applied (appliershared schemaEventAtBoundary).
+func (a *ChangeApplier) applySchemaEvent(ctx context.Context, streamID string, c ir.Change, writePosition bool) error {
+	_, err := a.applyOneImpl(ctx, streamID, c, writePosition)
+	return err
+}
+
 // applyBarrierNoPosition applies one barrier-path change (Truncate /
 // SchemaSnapshot) WITHOUT writing the stream position. Used by the concurrent
 // (ADR-0104) barrier path, where the resume position is owned exclusively by

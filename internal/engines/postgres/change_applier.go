@@ -1537,6 +1537,16 @@ func (a *ChangeApplier) applyOne(ctx context.Context, streamID string, c ir.Chan
 	return err
 }
 
+// applySchemaEvent is the shared batch loop's [appliershared.BatchConfig]
+// ApplyOne: applyOne with the position write chosen by the loop, which
+// withholds it for a schema event inside a source transaction (see
+// appliershared schemaEventAtBoundary). Unreachable on this engine while
+// TransactionalDDL is true; filled so the seam stays total.
+func (a *ChangeApplier) applySchemaEvent(ctx context.Context, streamID string, c ir.Change, writePosition bool) error {
+	_, err := a.applyOneImpl(ctx, streamID, c, writePosition)
+	return err
+}
+
 // applyBarrierNoPosition applies one barrier-path change (Truncate /
 // SchemaSnapshot) on the coordinator backend WITHOUT writing the stream
 // position. It is the concurrent (ADR-0104/ADR-0105) barrier apply: on that
