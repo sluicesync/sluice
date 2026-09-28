@@ -605,18 +605,58 @@ func nekiCensusReading(running, withSidecars, measured int) string {
 // repository only as prose and as one hand-built string in a unit test, while
 // the engine grades NK013, NK205 and NK213 and nothing else in the NK3xx
 // range — so the shape is known to be real and still carries no verdict.
-func nekiShardKeyRequiredOnInsert(ctx context.Context, t *testing.T, db *sql.DB, tenant int) {
+//
+// # The NEKI-NK306-DIAG instrumentation (Phase A, temporary)
+//
+// Twice (runs 34932058458 and 36347111193) the CONTROL insert below hung —
+// for 1008 s under the old shared budget, and for this arm's whole 90 s
+// budget since — immediately after the concurrent-COPY probe, while the
+// very next arm on the same pool ran in a quarter of a second. The error was
+// a bare `context deadline exceeded`, which is the spelling `database/sql`
+// produces when a POOLED connection's reset ping never came back (see
+// [nekiDiagnosePooledConn]), not the one for a statement that timed out while
+// running.
+//
+// So before the control insert, [nekiDiagnosePooledConn] pings the pooled
+// connection under a 10 s budget and, if it does not answer, takes the
+// router census and runs the same control insert (id 90003, removed again at
+// once) on a FRESH connection. Its `VERDICT=` line is the yes/no. It is
+// instrumentation only: the fresh-connection outcome feeds no assertion, and
+// this arm still passes only if the control insert ON THE POOL succeeds and
+// the shard-key-less INSERT is refused with NK306. Remove it (and dsn) once a
+// run has answered the question.
+func nekiShardKeyRequiredOnInsert(ctx context.Context, t *testing.T, db *sql.DB, dsn string, tenant int) {
 	t.Helper()
 
 	t.Run("PREMISE: an INSERT omitting the shard key is refused with NK306", func(t *testing.T) {
+		diag := nekiDiagnosePooledConn(ctx, t, db, dsn, 10*time.Second, func(ctx context.Context, fresh *sql.DB) error {
+			if _, err := fresh.ExecContext(
+				ctx,
+				`INSERT INTO sk_good (tenant_id, id, v) VALUES ($1, 90003, 'nk306-diag-fresh-conn')`,
+				tenant,
+			); err != nil {
+				return err
+			}
+			if _, err := fresh.ExecContext(ctx,
+				`DELETE FROM sk_good WHERE tenant_id = $1 AND id = 90003`, tenant); err != nil {
+				t.Logf("%s: could not remove the fresh-connection row (tenant %d, id 90003): %v",
+					nekiNK306DiagMarker, tenant, err)
+			}
+			return nil
+		})
+
 		// Anti-vacuity FIRST, and in this direction deliberately: if the
 		// well-formed INSERT does not work, the refusal below proves nothing
 		// about shard keys — it would just mean the table is unusable.
+		controlStart := time.Now()
 		if _, err := db.ExecContext(
 			ctx,
 			`INSERT INTO sk_good (tenant_id, id, v) VALUES ($1, 90001, 'shard-key-present')`,
 			tenant,
 		); err != nil {
+			t.Logf("%s: the control insert ON THE POOL failed after %s (diagnosis VERDICT=%s): %v [bare-deadline=%t]",
+				nekiNK306DiagMarker, time.Since(controlStart).Round(time.Millisecond), diag.verdict, err,
+				nekiIsBareDeadline(err))
 			t.Fatalf("the CONTROL insert — which names the shard key — failed: %v\n\n"+
 				"Nothing below is evidence about shard keys while this does not work", err)
 		}

@@ -184,7 +184,13 @@ func TestNekiverify_ShardedRefusalPremises(t *testing.T) {
 		t.Fatal("nekiverify: the fixture was never provisioned, so no arm below has anything to run against")
 	}
 	db := openFixtureDB(t, fx)
-	defer func() { _ = db.Close() }()
+	// t.Cleanup, not defer: cleanups run AFTER deferred calls, and the restore
+	// arm registers a PARENT-scoped cleanup that drops its nk_restored tables
+	// through db. A deferred Close ran first and both DROPs failed with
+	// "sql: database is closed" (run 36347111193). Registered here, before any
+	// arm, it runs after every arm's cleanup (cleanups are LIFO) and before
+	// the fixture's database is deleted.
+	t.Cleanup(func() { _ = db.Close() })
 
 	var tenantA, tenantB int
 	nekiArm(ctx, t, "discover two tenants on distinct shards", 3*time.Minute, func(ctx context.Context) {
@@ -218,7 +224,7 @@ func TestNekiverify_ShardedRefusalPremises(t *testing.T) {
 		nekiConcurrentCopyLimitHoldsOnTheCluster(ctx, t, fx, []int{tenantA, tenantB})
 	})
 	nekiArm(ctx, t, "shard key required on INSERT (NK306)", 90*time.Second, func(ctx context.Context) {
-		nekiShardKeyRequiredOnInsert(ctx, t, db, tenantA)
+		nekiShardKeyRequiredOnInsert(ctx, t, db, fx.dsn, tenantA)
 	})
 	nekiArm(ctx, t, "hostile shard-key routing corpus", 2*time.Minute, func(ctx context.Context) {
 		nekiShardKeyRoutingCorpus(ctx, t, db, fx.shards)
