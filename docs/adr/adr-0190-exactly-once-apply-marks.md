@@ -1,6 +1,6 @@
 # ADR-0190: Exactly-once apply marks — a restart skips the changes of an interrupted source transaction that already reached the target
 
-- **Status:** Proposed — DESIGN ONLY, 2026-09-26. Operator decision on GC-38 (l) (option (a) chosen over (b) net-effect replay and (c) transaction-aligned apply; see §"Alternatives considered"). Nothing here is implemented; the build waits on this ADR's approval and on the open questions at the end.
+- **Status:** Accepted 2026-09-28 (operator answered the open questions — see "Operator decisions" below); proposed 2026-09-26 as DESIGN ONLY. Operator decision on GC-38 (l) (option (a) chosen over (b) net-effect replay and (c) transaction-aligned apply; see §"Alternatives considered"). Nothing here is implemented; the build waits on this ADR's approval and on the open questions at the end.
 - **Date:** 2026-09-26
 - **Related:** [ADR-0007](adr-0007-position-persistence.md) (position written in the batch's own transaction); [ADR-0010](adr-0010-idempotent-applier.md) (idempotent UPSERT apply, the assumption this ADR finds is not enough); [ADR-0027](adr-0027-source-transaction-boundary-cdc-batching.md) (source-transaction cohesion on the serial batched path); [ADR-0089](adr-0089-default-adaptive-apply-batch-size.md) (its keyless guard: keyless tables are at-least-once); [ADR-0104](adr-0104-mysql-pipelined-cdc-apply.md) / [ADR-0105](adr-0105-postgres-concurrent-cdc-apply.md) (the lane path and its position relaxation); audit backlog GC-38 (l) (the measurement); `internal/pipeline/streamer_crash_midtxn_integration_test.go` (the gate that pins today's contract and will flip its loud cells when this lands).
 
@@ -172,7 +172,15 @@ The pin matrix is source (MySQL GTID, MySQL file/pos, MariaDB, Postgres, VStream
 
 **Out of scope:** the `sync from-backup` broker (a follow-up with chain-record identity), chain restore, keyless-table exactly-once beyond the crash-replay window (ADR-0089's other cases), and any change to the position's cadence or format.
 
-## Open questions for the operator
+## Operator decisions (2026-09-28)
+
+1. **Marked classes:** non-idempotent classes only (secondary-unique tables, PK changes, keyless tables); every change still CHECKS marks.
+2. **Missing mark table:** WARN `APPLY-MARKS-UNAVAILABLE` and run without marks (today's behaviour); no new refusal.
+3. **Keyless tables:** included, in Phase 2.
+4. **The broker (`sync from-backup`):** NOT in this ADR — a separate ADR later.
+5. **VStream reader change:** accepted as Phase 4.
+
+## Open questions for the operator (as proposed; answered above)
 
 1. **Marked classes.** This ADR marks only non-idempotent classes (secondary-unique tables, PK changes, keyless tables) to avoid doubling writes for PK-only workloads. The alternative — mark every change — is simpler to prove and costs one extra write per changed row. Recommendation: the classes.
 2. **Missing mark table** (safe-migrations branch, non-owner role, `--schema-already-applied`). Recommendation: WARN (`APPLY-MARKS-UNAVAILABLE`) and run without marks, which is today's behaviour; the alternative is to refuse to start.
