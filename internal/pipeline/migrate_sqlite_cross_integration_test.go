@@ -967,16 +967,17 @@ func TestMigrate_SQLiteColumnDefaultToPostgres(t *testing.T) {
 	defer func() { _ = pg.Close() }()
 	ctx := ctx2min(t)
 
-	// 1. The portable default landed as a real PG DEFAULT referencing
-	//    CURRENT_TIMESTAMP (the translated keyword), not the SQLite spelling.
+	// 1. The portable default landed as a real PG DEFAULT rendering SQLite's
+	//    UTC text for this TEXT column (GC-39 item 3), not the SQLite spelling
+	//    and not the session-zone CURRENT_TIMESTAMP.
 	var installedDefault sql.NullString
 	if err := pg.QueryRowContext(ctx,
 		`SELECT column_default FROM information_schema.columns
 		 WHERE table_name = 'flyway_schema_history' AND column_name = 'installed_on'`).Scan(&installedDefault); err != nil {
 		t.Fatalf("query installed_on default: %v", err)
 	}
-	if !installedDefault.Valid || !strings.Contains(strings.ToUpper(installedDefault.String), "CURRENT_TIMESTAMP") {
-		t.Errorf("installed_on column_default = %#v; want a CURRENT_TIMESTAMP default (portable translation)", installedDefault)
+	if d := strings.ToLower(installedDefault.String); !installedDefault.Valid || !strings.Contains(d, "to_char") || !strings.Contains(d, "utc") {
+		t.Errorf("installed_on column_default = %#v; want the UTC to_char rendering (portable translation)", installedDefault)
 	}
 
 	// 2. Insert omitting installed_on → the server default supplies a value.
@@ -989,8 +990,8 @@ func TestMigrate_SQLiteColumnDefaultToPostgres(t *testing.T) {
 		`SELECT installed_on FROM flyway_schema_history WHERE installed_rank = 2`).Scan(&installedOn); err != nil {
 		t.Fatalf("select inserted installed_on: %v", err)
 	}
-	if !installedOn.Valid || installedOn.String == "" {
-		t.Errorf("inserted installed_on = %#v; want a non-empty server-supplied timestamp", installedOn)
+	if _, err := time.Parse(time.DateTime, installedOn.String); !installedOn.Valid || err != nil || len(installedOn.String) != len(time.DateTime) {
+		t.Errorf("inserted installed_on = %#v; want a server-supplied timestamp in SQLite's 'YYYY-MM-DD HH:MM:SS' shape", installedOn)
 	}
 	// The migrated row's explicit value carried unchanged.
 	var baseline string

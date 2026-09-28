@@ -540,8 +540,15 @@ func translateDefaultExpr(table *ir.Table, c *ir.Column, d ir.DefaultExpression,
 	// dropping it with a named, loud warning is far better than failing
 	// the whole migration — loud, never silent.
 	if d.Dialect == sqliteSourceDialect {
-		if pg, ok := translateSQLiteDefaultExpr(d.Expr); ok {
-			return pg, true
+		// A current-instant default is rendered for the column's type in
+		// UTC (GC-39 item 3). One with no faithful spelling on this type
+		// drops below — never the general translator, which refuses the
+		// bare CURRENT_* keywords anyway.
+		shape := translate.ClassifySQLiteNowDefault(d.Expr)
+		if shape != translate.SQLiteNowNone {
+			if pg, ok := sqliteNowDefaultPG(shape, c.Type); ok {
+				return pg, true
+			}
 		}
 		// Three shapes are held back from the general translator so the
 		// arm keeps its never-abort contract (a bad DEFAULT must warn-drop,
@@ -567,7 +574,8 @@ func translateDefaultExpr(table *ir.Table, c *ir.Column, d ir.DefaultExpression,
 		trimmedExpr := strings.TrimSpace(d.Expr)
 		bareBool := strings.EqualFold(trimmedExpr, "TRUE") || strings.EqualFold(trimmedExpr, "FALSE")
 		_, boolCol := c.Type.(ir.Boolean)
-		eligible := !translate.SQLiteExprHasDoubleQuotedToken(d.Expr) &&
+		eligible := shape == translate.SQLiteNowNone &&
+			!translate.SQLiteExprHasDoubleQuotedToken(d.Expr) &&
 			!translate.SQLiteExprHasHexLiteral(d.Expr) &&
 			(!bareBool || boolCol)
 		if eligible {

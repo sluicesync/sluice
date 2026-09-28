@@ -206,12 +206,10 @@ var pgCatalogQualificationExempt = map[string]string{
 	// visible). Qualifying a pattern would silently stop it matching —
 	// the rewriter that qualified the tree did exactly that to the
 	// auto-increment detector before review caught it.
-	"postgres/ddl_default_sqlite.go:translateSQLiteDefaultExpr:date": "SQLite source default-expression pattern",
-	"postgres/ddl_default_sqlite.go:translateSQLiteDefaultExpr:time": "SQLite source default-expression pattern",
-	"postgres/expr_translate.go:rewriteCASTCharCharset:char":         "MySQL source CAST type-spec pattern",
-	"postgres/expr_translate.go:rewriteCASTCharCharset:varchar":      "PG target type spec assembled from a bare varchar( fragment plus a length; a type, not a call",
-	"postgres/schema_reader.go:isAutoIncrement:nextval":              "pattern over pg_get_expr output, which spells pg_catalog functions unqualified",
-	"postgres/sequence_reader.go:parseNextvalSequence:nextval":       "pattern over pg_get_expr output, which spells pg_catalog functions unqualified",
+	"postgres/expr_translate.go:rewriteCASTCharCharset:char":    "MySQL source CAST type-spec pattern",
+	"postgres/expr_translate.go:rewriteCASTCharCharset:varchar": "PG target type spec assembled from a bare varchar( fragment plus a length; a type, not a call",
+	"postgres/schema_reader.go:isAutoIncrement:nextval":         "pattern over pg_get_expr output, which spells pg_catalog functions unqualified",
+	"postgres/sequence_reader.go:parseNextvalSequence:nextval":  "pattern over pg_get_expr output, which spells pg_catalog functions unqualified",
 }
 
 type catalogCall struct {

@@ -50,6 +50,31 @@ var controlCfg = &appliershared.ControlTableConfig{
 	ErrStreamNotFound: errStreamNotFound,
 }
 
+// utcNowSQL is the one expression every control table writes into its
+// naive TIMESTAMP columns (GC-39 item 2). The columns are TIMESTAMP
+// WITHOUT TIME ZONE, pgx reads them back as UTC, and the callers age them
+// against time.Now() — sync health's --max-stale-seconds,
+// sluice_seconds_since_last_apply, sync status. CURRENT_TIMESTAMP is a
+// timestamptz, so storing it into a naive column casts through the
+// SESSION TimeZone and keeps that zone's wall-clock digits: measured on a
+// database set to America/Los_Angeles every freshly-written row read seven
+// hours old (false stale alarms), and on Asia/Tokyo nine hours in the
+// FUTURE, so a stalled stream read as fresh and the stall alarm failed
+// open. timezone('utc', now()) yields the UTC digits whatever the session
+// zone, which is what migration_state.go already writes.
+//
+// Every write states it EXPLICITLY rather than relying on the column
+// DEFAULT: CREATE TABLE IF NOT EXISTS never touches an existing table, so a
+// deployment created by an older binary keeps its CURRENT_TIMESTAMP
+// default, and changing that default needs table ownership a sync role may
+// not have. The defaults are updated too, for tables created from now on.
+// Rows an older binary wrote stay skewed until their next write — the
+// position row rewrites on every checkpoint, so it self-heals at once.
+// TestControlTables_TimestampsAreUTC_UnderANonUTCDatabaseZone pins both
+// skew directions; TestControlTableSQL_WritesUTCIntoNaiveTimestamps holds
+// every control-table statement in this package to it.
+const utcNowSQL = "pg_catalog.timezone('utc', pg_catalog.now())"
+
 // controlTableRef returns the schema-qualified, quoted reference to
 // the sluice_cdc_state table. Postgres has namespaced schemas (unlike
 // MySQL's flat per-connection database), so every control-table
@@ -84,7 +109,7 @@ func ensureControlTable(ctx context.Context, db *sql.DB, schema string) error {
 		CREATE TABLE IF NOT EXISTS ` + tableRef + ` (
 			stream_id         VARCHAR(255) NOT NULL,
 			source_position   TEXT         NOT NULL,
-			updated_at        TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at        TIMESTAMP    NOT NULL DEFAULT (` + utcNowSQL + `),
 			stop_requested_at TIMESTAMP    NULL,
 			PRIMARY KEY (stream_id)
 		)`
@@ -196,8 +221,8 @@ func ensureSkippedTablesTable(ctx context.Context, db *sql.DB, schema string) er
 			skip_count       BIGINT       NOT NULL,
 			first_position   TEXT         NOT NULL,
 			last_position    TEXT         NOT NULL,
-			first_skipped_at TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			last_skipped_at  TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			first_skipped_at TIMESTAMP    NOT NULL DEFAULT (` + utcNowSQL + `),
+			last_skipped_at  TIMESTAMP    NOT NULL DEFAULT (` + utcNowSQL + `),
 			PRIMARY KEY (stream_id, table_name)
 		)`
 	if _, err := db.ExecContext(ctx, ddl); err != nil {
@@ -215,16 +240,18 @@ func ensureSkippedTablesTable(ctx context.Context, db *sql.DB, schema string) er
 // apply path — serial, batched, pipelined, and the ADR-0104/0105 concurrent
 // lanes; the count is at-least-once (documented on
 // [ir.SkippedTableRecord.SkipCount]). The timestamps stay DB-generated
-// (CURRENT_TIMESTAMP, unchanged from the pre-H-4 per-event ledger) — the
-// accumulator carries counts and position tokens, not clocks.
+// (the target's UTC clock, [utcNowSQL] — written explicitly on insert too,
+// because a ledger table created by an older binary still carries the
+// session-zone CURRENT_TIMESTAMP default) — the accumulator carries counts
+// and position tokens, not clocks.
 func upsertSkippedTable(ctx context.Context, db *sql.DB, schema, streamID, table string, e appliershared.SkipLedgerEntry) error {
 	tableRef := skippedTablesTableRef(schema)
-	q := "INSERT INTO " + tableRef + " (stream_id, table_name, skip_count, first_position, last_position) " +
-		"VALUES ($1, $2, $3, $4, $5) " +
+	q := "INSERT INTO " + tableRef + " (stream_id, table_name, skip_count, first_position, last_position, first_skipped_at, last_skipped_at) " +
+		"VALUES ($1, $2, $3, $4, $5, " + utcNowSQL + ", " + utcNowSQL + ") " +
 		"ON CONFLICT (stream_id, table_name) DO UPDATE SET " +
 		"skip_count = " + tableRef + ".skip_count + EXCLUDED.skip_count, " +
 		"last_position = EXCLUDED.last_position, " +
-		"last_skipped_at = CURRENT_TIMESTAMP"
+		"last_skipped_at = " + utcNowSQL
 	if _, err := db.ExecContext(ctx, q, streamID, table, e.Count, e.FirstPos, e.LastPos); err != nil {
 		return fmt.Errorf("postgres: record skipped table %s: %w", table, err)
 	}
@@ -297,7 +324,7 @@ func tryAcquireShardLease(ctx context.Context, db *sql.DB, schema, tableName, st
 			applied_schema_version,
 			created_at
 		)
-		VALUES ($1, $2, $3, 0, CURRENT_TIMESTAMP)
+		VALUES ($1, $2, $3, 0, ` + utcNowSQL + `)
 		ON CONFLICT (target_table_full_name)
 		DO UPDATE SET
 			lease_holder_stream_id = EXCLUDED.lease_holder_stream_id,
@@ -380,7 +407,7 @@ func recordShardLeaseDDLText(ctx context.Context, db *sql.DB, schema, tableName,
 func finalizeShardLeaseApply(ctx context.Context, db *sql.DB, schema, tableName, streamID, ddlText, ddlChecksum string, version int64, anchorPos, anchorEngine string) (finalized bool, err error) {
 	q := "UPDATE " + shardLeaseTableRef(schema) + " SET " +
 		"ddl_text = $1, ddl_checksum = $2, " +
-		"applied_schema_version = $3, applied_at = CURRENT_TIMESTAMP, " +
+		"applied_schema_version = $3, applied_at = " + utcNowSQL + ", " +
 		"anchor_position = NULLIF($4, ''), source_engine = NULLIF($5, '') " +
 		"WHERE target_table_full_name = $6 " +
 		"AND lease_holder_stream_id = $7 " +
@@ -443,7 +470,7 @@ func ensureShardConsolidationLeaseTable(ctx context.Context, db *sql.DB, schema 
 			ddl_checksum                  VARCHAR(64)  NULL,
 			applied_schema_version        BIGINT       NOT NULL DEFAULT 0,
 			applied_at                    TIMESTAMP    NULL,
-			created_at                    TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			created_at                    TIMESTAMP    NOT NULL DEFAULT (` + utcNowSQL + `),
 			anchor_position               TEXT         NULL,
 			source_engine                 TEXT         NULL,
 			PRIMARY KEY (target_table_full_name)
@@ -597,9 +624,11 @@ func isUndefinedColumnErr(err error) bool {
 // dialect (ON CONFLICT here vs row-alias ON DUPLICATE KEY on MySQL),
 // so each engine byte-owns it.
 //
-// The updated_at column is refreshed on every upsert via
-// CURRENT_TIMESTAMP — diagnostic info for operators inspecting the
-// control table by hand. stop_requested_at is left untouched: a
+// The updated_at column is refreshed on every upsert with the target's
+// UTC clock ([utcNowSQL]) — it is what sync health --max-stale-seconds,
+// sluice_seconds_since_last_apply and sync status age against the
+// wall clock, so it must be UTC whatever the session zone (GC-39 item 2).
+// stop_requested_at is left untouched: a
 // position write is the streamer making forward progress, which
 // must not clear an in-flight stop request.
 //
@@ -672,7 +701,7 @@ func writePositionTx(ctx context.Context, tx *sql.Tx, schema, streamID, token, s
 func buildWritePositionSQL(schema, streamID, token, slotName, publicationName, rowFilterHash, sourceFingerprint, targetSchema string, rowsApplied int64) (stmt string, args []any) {
 	tableRef := controlTableRef(schema)
 	q := "INSERT INTO " + tableRef + " (stream_id, source_position, updated_at, slot_name, publication_name, row_filter_hash, source_dsn_fingerprint, target_schema, rows_applied) " +
-		"VALUES ($1, $2, CURRENT_TIMESTAMP, NULLIF($3, ''), NULLIF($4, ''), NULLIF($5, ''), NULLIF($6, ''), NULLIF($7, ''), $8) " +
+		"VALUES ($1, $2, " + utcNowSQL + ", NULLIF($3, ''), NULLIF($4, ''), NULLIF($5, ''), NULLIF($6, ''), NULLIF($7, ''), $8) " +
 		"ON CONFLICT (stream_id) DO UPDATE SET " +
 		"source_position = EXCLUDED.source_position, " +
 		"updated_at = EXCLUDED.updated_at, " +
@@ -712,7 +741,7 @@ func readStopRequested(ctx context.Context, db *sql.DB, schema, streamID string)
 // bookkeeping. The shared skeleton's matched-rows branch (a single
 // UPDATE with a zero-rows check) applies — see controlCfg.
 func requestStop(ctx context.Context, db *sql.DB, schema, streamID string) error {
-	q := "UPDATE " + controlTableRef(schema) + " SET stop_requested_at = CURRENT_TIMESTAMP WHERE stream_id = $1"
+	q := "UPDATE " + controlTableRef(schema) + " SET stop_requested_at = " + utcNowSQL + " WHERE stream_id = $1"
 	return appliershared.RequestStop(ctx, db, controlCfg, "", q, streamID)
 }
 

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -204,7 +205,9 @@ func dsnShapeHint(dsn string) string {
 //     immune to the SESSION time_zone variable (binlog encodes UTC
 //     epoch directly) but susceptible to a separate process-local-TZ
 //     formatting bug; that one is fixed in cdc_reader.go via
-//     TimestampStringLocation.
+//     TimestampStringLocation. A DSN `time_zone=` naming anything but
+//     UTC reopens exactly that corruption, so it is refused
+//     ([refuseNonUTCSessionTimeZone], GC-39 item 1).
 //
 // The DSN must include a database name; sluice operates against an
 // explicit schema rather than connecting at the server level.
@@ -235,7 +238,7 @@ func parseDSN(dsn string) (*mysql.Config, error) {
 	if err := refuseExplicitInterpolationUnsafeCharset(cfg, dsn); err != nil {
 		return nil, err
 	}
-	return finishParseDSN(cfg), nil
+	return finishParseDSN(cfg)
 }
 
 // parseServerDSN is the database-OPTIONAL sibling of [parseDSN], used
@@ -265,14 +268,14 @@ func parseServerDSN(dsn string) (*mysql.Config, error) {
 	if err := refuseExplicitInterpolationUnsafeCharset(cfg, dsn); err != nil {
 		return nil, err
 	}
-	return finishParseDSN(cfg), nil
+	return finishParseDSN(cfg)
 }
 
 // finishParseDSN applies the sluice-required parameter adjustments to a
 // parsed [mysql.Config] — the shared tail of [parseDSN] and
 // [parseServerDSN]. Split out so the only difference between the two
 // entry points is whether an empty DBName is an error.
-func finishParseDSN(cfg *mysql.Config) *mysql.Config {
+func finishParseDSN(cfg *mysql.Config) (*mysql.Config, error) {
 	// Route plain-TCP query connections through the keep-alive dialer.
 	// Long-lived pools (the change applier, schema reader) would
 	// otherwise sit idle behind cloud NAT and stall on a dropped
@@ -300,7 +303,7 @@ func finishParseDSN(cfg *mysql.Config) *mysql.Config {
 	// and unix sockets alike, without a conn wrapper. The go-mysql BINLOG
 	// syncer does not read this cfg and is wired separately in cdc_reader.go.
 	//
-	// Two-tier override, matching sql_mode / time_zone / the source session
+	// Two-tier override, matching sql_mode / the source session
 	// timeouts above: an operator's `writeTimeout=` DSN parameter wins
 	// absolutely. ParseDSN collapses "absent" and an explicit `writeTimeout=0s`
 	// into the same zero Duration, so the two are indistinguishable here and
@@ -316,6 +319,9 @@ func finishParseDSN(cfg *mysql.Config) *mysql.Config {
 	// quotes for a literal time-zone offset string.
 	if cfg.Params == nil {
 		cfg.Params = map[string]string{}
+	}
+	if err := refuseNonUTCSessionTimeZone(cfg.Params); err != nil {
+		return nil, err
 	}
 	if _, ok := cfg.Params["time_zone"]; !ok {
 		cfg.Params["time_zone"] = "'+00:00'"
@@ -354,7 +360,71 @@ func finishParseDSN(cfg *mysql.Config) *mysql.Config {
 		cfg.Collation = "utf8mb4_general_ci"
 	}
 
-	return cfg
+	return cfg, nil
+}
+
+// utcOffsetZone matches the numeric session time_zone spellings of UTC
+// (`+00:00`, `-00:00`, `+0:00`, `00:00`).
+var utcOffsetZone = regexp.MustCompile(`^[+-]?0?0:00$`)
+
+// utcNamedZones are the named-zone spellings of UTC (compared
+// case-insensitively). A named zone needs the server's time-zone tables;
+// where they are not loaded the SET fails at connect, loudly.
+var utcNamedZones = map[string]bool{
+	"utc": true, "etc/utc": true, "uct": true, "etc/uct": true, "gmt": true, "etc/gmt": true,
+	"universal": true, "etc/universal": true, "zulu": true, "etc/zulu": true,
+}
+
+// refuseNonUTCSessionTimeZone refuses a DSN `time_zone=` parameter that
+// does not name UTC (GC-39 item 1, marker DSN-TIME-ZONE-NOT-UTC).
+//
+// sluice reads every MySQL TIMESTAMP with cfg.Loc = UTC and writes every
+// time.Time as UTC wall-clock text, which is only the stored instant when
+// the SESSION zone is UTC — the reason [finishParseDSN] injects
+// `time_zone='+00:00'`. That injection used to yield to an operator's own
+// `time_zone=`, and under any other zone the server converts a TIMESTAMP
+// to session wall-clock on read and from it on write while the driver
+// keeps calling the digits UTC: a cold copy, an INSERT and a LOAD DATA
+// all shifted every TIMESTAMP by the offset, silently (measured on a real
+// server under `+09:00`: a stored 12:00Z read back as 21:00Z, and a
+// written 12:00Z landed as 03:00Z). DATETIME is naive and was unaffected.
+//
+// Refusing, rather than overriding the value with a WARN, is deliberate:
+// the parameter is the operator's explicit instruction, sluice cannot
+// honour it without corrupting TIMESTAMP columns, and a WARN in a busy
+// log is the silent outcome with extra steps. Every UTC spelling passes,
+// so a DSN that pinned UTC itself keeps working.
+//
+// The key is matched as MySQL matches a variable name — case-insensitive,
+// with an optional @@ / @@session. prefix — because the driver sends each
+// parameter as `SET <key>=<value>`, so `TIME_ZONE=` sets the same session
+// variable while escaping an exact-key lookup (and, sent alongside the
+// injected `time_zone`, would race it in the driver's map order).
+func refuseNonUTCSessionTimeZone(params map[string]string) error {
+	for key, val := range params {
+		name := strings.ToLower(key)
+		name = strings.TrimPrefix(name, "@@")
+		name = strings.TrimPrefix(name, "session.")
+		if name != "time_zone" || sessionTimeZoneIsUTC(val) {
+			continue
+		}
+		return fmt.Errorf("mysql: DSN-TIME-ZONE-NOT-UTC: refusing the DSN parameter %s=%s: sluice reads and writes "+
+			"MySQL TIMESTAMP values as UTC instants and pins every session to time_zone='+00:00'; under any other "+
+			"session zone every TIMESTAMP it copies or writes would be shifted by the zone's offset, silently. "+
+			"Remove %s from the DSN (DATETIME columns are naive and unaffected either way), or set it to '+00:00'",
+			key, val, key)
+	}
+	return nil
+}
+
+// sessionTimeZoneIsUTC reports whether a time_zone parameter value, as the
+// driver will send it (optionally quoted), names UTC.
+func sessionTimeZoneIsUTC(val string) bool {
+	s := strings.TrimSpace(val)
+	if len(s) >= 2 && (s[0] == '\'' || s[0] == '"') && s[len(s)-1] == s[0] {
+		s = strings.TrimSpace(s[1 : len(s)-1])
+	}
+	return utcOffsetZone.MatchString(s) || utcNamedZones[strings.ToLower(s)]
 }
 
 // parseDSNForFlavor is the flavor-aware sibling of [parseDSN] — the ONE choke
@@ -672,7 +742,8 @@ const sourceReadSessionTimeoutSeconds = 600
 // source-side defense, not a target one.
 //
 // An operator-supplied DSN value for either key wins absolutely (same
-// two-tier override shape as sql_mode / time_zone above): the helper only
+// two-tier override shape as sql_mode above; time_zone is not overridable
+// to a non-UTC value — see [refuseNonUTCSessionTimeZone]): the helper only
 // sets a key that is absent, so a deliberate per-source tuning is never
 // clobbered. The numeric value is emitted bare (no SQL quotes) — these are
 // integer session variables, unlike the quoted string literals time_zone /

@@ -796,7 +796,16 @@ func (m mysqlEmitter) emitDefault(d ir.DefaultValue, t ir.Type) (string, bool) {
 			// a silently different stored value — and by construction
 			// the residues contain no bare column references for the
 			// requote to legitimately fix.
-			if my, ok := translate.SQLiteExprToMySQL(expr); ok {
+			//
+			// A current-instant spelling is rendered for the column's type
+			// in UTC first (GC-39 item 3); one this target cannot carry
+			// is not emitted, and emitColumnDef has already WARNed.
+			if body, lost, handled := m.sqliteNowDefaultMySQL(v, t); handled {
+				if lost != "" {
+					return "", false
+				}
+				expr = body
+			} else if my, ok := translate.SQLiteExprToMySQL(expr); ok {
 				expr = requoteMySQLReservedIdents(my)
 			}
 		default:
@@ -1080,7 +1089,7 @@ func (m mysqlEmitter) emitColumnDef(tableName string, c *ir.Column) (string, err
 	// default with exit 0. Outside the proven-faithful verbatim residues,
 	// drop the DEFAULT with a loud warn (PG-arm parity — a DEFAULT is
 	// non-data metadata affecting only post-migration inserts).
-	if warnDropNonPortableSQLiteDefaultMySQL(tableName, c) {
+	if m.warnDropSQLiteNowDefaultMySQL(tableName, c) || warnDropNonPortableSQLiteDefaultMySQL(tableName, c) {
 		// DEFAULT dropped loudly; no clause emitted.
 	} else if dflt, ok := m.emitDefault(c.Default, c.Type); ok {
 		// A TEXT/BLOB/JSON/GEOMETRY column takes its DEFAULT only in the
@@ -2488,6 +2497,11 @@ func refuseBackslashSQLiteDefaultMySQL(colName string, d ir.DefaultValue) error 
 func warnDropNonPortableSQLiteDefaultMySQL(tableName string, c *ir.Column) bool {
 	v, ok := c.Default.(ir.DefaultExpression)
 	if !ok || v.Dialect != sqliteSourceDialect {
+		return false
+	}
+	// Current-instant spellings are rendered per column type in UTC by
+	// sqliteNowDefaultMySQL, which owns their drop (GC-39 item 3).
+	if s := translate.ClassifySQLiteNowDefault(v.Expr); s != translate.SQLiteNowNone && s != translate.SQLiteNowEpoch {
 		return false
 	}
 	if _, ok := translate.SQLiteExprToMySQL(v.Expr); ok {

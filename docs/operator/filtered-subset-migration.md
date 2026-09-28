@@ -67,6 +67,16 @@ sluice verify --source-driver postgres --source "$SRC" --target-driver postgres 
 
 (Plain `verify` without the predicate is still useful: it will *correctly* flag `source=100 target=50` for a filtered table — that's the check confirming the subset is a subset.)
 
+### Temporal literals: which session time zone the predicate runs in
+
+A `--where` is evaluated by the source database in **sluice's session**, and a timestamp literal without an offset is read in that session's time zone:
+
+- **MySQL, MariaDB, PlanetScale, Vitess:** sluice pins every session to `time_zone='+00:00'`, so `created_at >= '2026-01-01 00:00:00'` on a `TIMESTAMP` column means midnight **UTC**, whatever the server's own default (a DSN `time_zone=` other than UTC is refused, `DSN-TIME-ZONE-NOT-UTC`). A `DATETIME` column holds no zone and is compared as written.
+- **Postgres:** the session zone is **not** pinned. It is the server's, database's or role's default `TimeZone`, or `PGTZ` / a `timezone=` DSN parameter where sluice runs. On a `timestamptz` column, `created_at >= '2026-01-01 00:00:00'` means midnight in **that** zone; on a naive `timestamp` column the literal is compared as written.
+- **SQLite / D1:** `datetime('now')` and friends are UTC.
+
+Write temporal boundaries with an explicit offset — `created_at >= '2026-01-01 00:00:00+00'` on Postgres, a `TIMESTAMP` literal compared in UTC on MySQL — and the subset does not depend on where sluice happens to run. **`verify --where` cannot catch a boundary that landed in the wrong zone:** it renders the same predicate in the same kind of session, so it agrees with the copy by construction; check the boundary rows yourself (`SELECT min(created_at), max(created_at)` on the target) when the cut matters. The same applies to `sluice backfill` / `sluice expand-contract` `--set` and `--where`.
+
 ## The one gotcha: referential integrity
 
 This is the load-bearing caveat. **Filtering a *parent* table orphans its children.** The child rows you copied still reference parent rows the filter excluded, so the deferred `ADD CONSTRAINT FOREIGN KEY` fails with SQLSTATE 23503 on the target.

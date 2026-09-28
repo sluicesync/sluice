@@ -1102,8 +1102,18 @@ func (p *sqParser) parsePrimary() (sqNode, bool) {
 			p.pos++
 			return verbatimNode{text: "NULL"}, true
 		case "CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME":
-			p.pos++
-			return verbatimNode{text: up}, true
+			// Not portable as a bare keyword (GC-39 item 3): SQLite
+			// evaluates it in UTC and yields TEXT, while the same
+			// keyword on Postgres or MySQL evaluates in the target
+			// SESSION's zone and yields a temporal value, so a verbatim
+			// carry stamps session-zone digits. SQLite admits these only
+			// in a DEFAULT (it rejects non-deterministic functions in
+			// CHECK, index and generated expressions), and a DEFAULT that
+			// is exactly one of them is translated per target column
+			// type from [ClassifySQLiteNowDefault] before this translator
+			// runs. Reaching here means it sits inside a composite
+			// DEFAULT, which the callers drop loudly.
+			return nil, false
 		case "CAST":
 			return p.parseCast()
 		}

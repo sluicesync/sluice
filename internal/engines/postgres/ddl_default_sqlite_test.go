@@ -10,83 +10,93 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/logcapture"
+	"sluicesync.dev/sluice/internal/translate"
 )
 
-// TestTranslateSQLiteDefaultExpr pins the portable-SQLite-default → PG map
-// (D1/SQLite robustness Chunk A) across the FULL mappable set — every
-// "current instant" family × every accepted surface form (function-call,
-// SQL keyword, parens, case, whitespace, double-quoted 'now') — AND a
-// representative non-mappable set, which must return ok=false so the caller
-// loud-drops instead of guessing.
-func TestTranslateSQLiteDefaultExpr(t *testing.T) {
-	mappable := []struct {
-		in   string
-		want string
-	}{
-		// datetime / CURRENT_TIMESTAMP family.
-		{"datetime('now')", "CURRENT_TIMESTAMP"},
-		{"(datetime('now'))", "CURRENT_TIMESTAMP"},
-		{"DATETIME('now')", "CURRENT_TIMESTAMP"},
-		{"  datetime ( 'now' )  ", "CURRENT_TIMESTAMP"},
-		{`datetime("now")`, "CURRENT_TIMESTAMP"}, // double-quoted misfeature
-		{`(DateTime ( "now" ))`, "CURRENT_TIMESTAMP"},
-		{"CURRENT_TIMESTAMP", "CURRENT_TIMESTAMP"},
-		{"current_timestamp", "CURRENT_TIMESTAMP"},
-		{"(CURRENT_TIMESTAMP)", "CURRENT_TIMESTAMP"},
-		// date / CURRENT_DATE family.
-		{"date('now')", "CURRENT_DATE"},
-		{"(date('now'))", "CURRENT_DATE"},
-		{"DATE('now')", "CURRENT_DATE"},
-		{`date("now")`, "CURRENT_DATE"},
-		{"CURRENT_DATE", "CURRENT_DATE"},
-		{"current_date", "CURRENT_DATE"},
-		// time / CURRENT_TIME family.
-		{"time('now')", "CURRENT_TIME"},
-		{"(time('now'))", "CURRENT_TIME"},
-		{"TIME('now')", "CURRENT_TIME"},
-		{`time("now")`, "CURRENT_TIME"},
-		{"CURRENT_TIME", "CURRENT_TIME"},
-		{"current_time", "CURRENT_TIME"},
+// TestSQLiteNowDefaultPG_ShapeByColumnType pins the whole shape × column
+// type matrix of [sqliteNowDefaultPG] (GC-39 item 3), including every
+// drop cell. Every rendered spelling except timestamptz's and the epoch's
+// reads the UTC wall clock — never a session-zone CURRENT_* keyword; the
+// integration pin TestMigrate_SQLiteNowDefaults_AreUTC_OnANonUTCTarget
+// grades the values against a real server's own UTC clock.
+func TestSQLiteNowDefaultPG_ShapeByColumnType(t *testing.T) {
+	utcSecond := "pg_catalog.date_trunc('second', " + utcNowSQL + ")"
+	types := map[string]ir.Type{
+		"timestamp":   ir.Timestamp{},
+		"timestamptz": ir.Timestamp{WithTimeZone: true},
+		"datetime":    ir.DateTime{},
+		"date":        ir.Date{},
+		"time":        ir.Time{},
+		"timetz":      ir.Time{WithTimeZone: true},
+		"text":        ir.Text{},
+		"varchar":     ir.Varchar{Length: 32},
+		"char":        ir.Char{Length: 19},
+		"integer":     ir.Integer{Width: 64},
 	}
-	for _, tc := range mappable {
-		t.Run("ok/"+tc.in, func(t *testing.T) {
-			got, ok := translateSQLiteDefaultExpr(tc.in)
-			if !ok {
-				t.Fatalf("translateSQLiteDefaultExpr(%q) ok=false; want a portable mapping to %q", tc.in, tc.want)
-			}
-			if got != tc.want {
-				t.Errorf("translateSQLiteDefaultExpr(%q) = %q; want %q", tc.in, got, tc.want)
-			}
-		})
+	shapes := map[string]translate.SQLiteNowShape{
+		"datetime": translate.SQLiteNowDateTime, "isoz": translate.SQLiteNowISOZ,
+		"date": translate.SQLiteNowDate, "time": translate.SQLiteNowTime, "epoch": translate.SQLiteNowEpoch,
 	}
+	epoch := "pg_catalog.floor(extract(epoch from pg_catalog.now()))"
+	toChar := func(f string) string { return "pg_catalog.to_char(" + utcNowSQL + ", '" + f + "')" }
+	want := map[string]string{ // "<type>/<shape>" → spelling; absent = dropped
+		"timestamp/datetime": utcSecond, "timestamp/isoz": utcSecond,
+		"timestamp/date":    "pg_catalog.date_trunc('day', " + utcNowSQL + ")",
+		"datetime/datetime": utcSecond, "datetime/isoz": utcSecond,
+		"datetime/date":        "pg_catalog.date_trunc('day', " + utcNowSQL + ")",
+		"timestamptz/datetime": "pg_catalog.date_trunc('second', pg_catalog.now())",
+		"timestamptz/isoz":     "pg_catalog.date_trunc('second', pg_catalog.now())",
+		"date/datetime":        "(" + utcNowSQL + ")::date", "date/isoz": "(" + utcNowSQL + ")::date",
+		"date/date": "(" + utcNowSQL + ")::date",
+		"time/time": utcSecond + "::time",
+	}
+	for _, ty := range []string{"text", "varchar", "char"} {
+		want[ty+"/datetime"] = toChar("YYYY-MM-DD HH24:MI:SS")
+		want[ty+"/isoz"] = toChar(`YYYY-MM-DD"T"HH24:MI:SS"Z"`)
+		want[ty+"/date"] = toChar("YYYY-MM-DD")
+		want[ty+"/time"] = toChar("HH24:MI:SS")
+	}
+	for ty := range types {
+		want[ty+"/epoch"] = epoch
+	}
+	for tyName, ty := range types {
+		for shName, sh := range shapes {
+			key := tyName + "/" + shName
+			got, ok := sqliteNowDefaultPG(sh, ty)
+			exp, mapped := want[key]
+			switch {
+			case mapped && (!ok || got != exp):
+				t.Errorf("%s: got (%q, %v); want %q", key, got, ok, exp)
+			case !mapped && ok:
+				t.Errorf("%s: got %q; want a loud drop (no faithful spelling)", key, got)
+			}
+			if ok && strings.Contains(strings.ToUpper(got), "CURRENT_") {
+				t.Errorf("%s: %q reads a session-zone CURRENT_* keyword", key, got)
+			}
+		}
+	}
+}
 
-	nonMappable := []string{
-		"julianday('now')",
-		// NOTE: several strftime('now') spellings moved to the SUPPORTED
-		// set — see TestTranslateSQLiteStrftimeDefault. These remain
-		// non-portable: a PARTIAL format has no provably-equivalent PG
-		// form (guessing is how a DEFAULT silently changes meaning), and
-		// a non-'now' base is not a current-instant expression at all.
-		"strftime('%Y', 'now')",
-		"strftime('%Y-%m-%d', mycol)",
-		"strftime('%Y-%m-%d', 'now', '+1 month')",
-		"unixepoch('now')",
-		"datetime('now', '+1 day')", // modifier — not the bare "now"
-		"date('now', 'localtime')",
-		`"draft"`,   // double-quoted-string misfeature
-		`'literal'`, // (would be DefaultLiteral upstream, but if it reaches here it's not portable-fn)
-		"now()",     // not a SQLite spelling
-		"42",
-		"",
-		"(a) + (b)", // parens that don't wrap the whole
-		"randomblob(16)",
+// TestEmitDefault_SQLiteNowUnmappableDropsLoudly: a recognised
+// current-instant DEFAULT on a column type with no faithful spelling must
+// take the loud drop, never fall through to a verbatim CURRENT_* keyword.
+func TestEmitDefault_SQLiteNowUnmappableDropsLoudly(t *testing.T) {
+	var buf logcapture.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	defer slog.SetDefault(prev)
+
+	col := &ir.Column{
+		Name:    "opened",
+		Type:    ir.Time{},
+		Default: ir.DefaultExpression{Expr: "CURRENT_DATE", Dialect: "sqlite"},
 	}
-	for _, in := range nonMappable {
-		t.Run("notok/"+in, func(t *testing.T) {
-			if got, ok := translateSQLiteDefaultExpr(in); ok {
-				t.Errorf("translateSQLiteDefaultExpr(%q) = (%q, true); want ok=false (non-portable → loud drop)", in, got)
-			}
-		})
+	got, ok := emitDefault(&ir.Table{Name: "t"}, col, emitOpts{})
+	if ok || got != "" {
+		t.Fatalf("emitDefault = (%q, %v); want a drop", got, ok)
+	}
+	if !strings.Contains(buf.String(), "dropped non-portable SQLite DEFAULT") {
+		t.Errorf("drop was not loud: log %q", buf.String())
 	}
 }
 
@@ -143,8 +153,8 @@ func TestEmitColumnDef_SQLiteDefaultPortableAndDrop(t *testing.T) {
 	if err != nil {
 		t.Fatalf("emitColumnDef(portable): %v", err)
 	}
-	if !strings.Contains(def, "DEFAULT CURRENT_TIMESTAMP") {
-		t.Errorf("portable column def = %q; want it to contain `DEFAULT CURRENT_TIMESTAMP`", def)
+	if want := "DEFAULT pg_catalog.date_trunc('second', " + utcNowSQL + ")"; !strings.Contains(def, want) {
+		t.Errorf("portable column def = %q; want it to contain %q", def, want)
 	}
 
 	nonPortable := &ir.Column{

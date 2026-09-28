@@ -377,7 +377,12 @@ var gapPatterns = []gapPattern{
 		name:     "CONVERT_TZ",
 		rule:     23,
 		severity: SeverityLoud,
-		note:     "PG has no CONVERT_TZ function. Equivalent: `(ts AT TIME ZONE 'from' AT TIME ZONE 'to')`. Semantics depend on the column's timestamp-vs-timestamptz type; verify against it before adopting the equivalent.",
+		note: "PG has no CONVERT_TZ function, and the equivalent depends on the column's type (measured on PG 16, GC-39 item 4). " +
+			"On a `timestamp` (a MySQL DATETIME): `((ts AT TIME ZONE 'from') AT TIME ZONE 'to')`. " +
+			"On a `timestamptz` (a MySQL TIMESTAMP): `(ts AT TIME ZONE 'to')` — the value already names its instant, and the two-step form " +
+			"there returns a timestamptz shifted by the 'from' offset. " +
+			"A MySQL numeric offset is ISO (`'+05:00'` is UTC+5) but a PG zone STRING is POSIX (`'+05:00'` is UTC-5, as is `'Etc/GMT+5'`): " +
+			"spell an offset `AT TIME ZONE INTERVAL '+05:00'` or use a named zone.",
 	},
 	{
 		name:     "INET_ATON",

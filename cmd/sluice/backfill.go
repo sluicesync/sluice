@@ -29,7 +29,7 @@ type BackfillCmd struct {
 	Table  string `help:"Table to backfill." required:"" placeholder:"TABLE"`
 
 	Set   []string `help:"Assignment 'col = <expr>' applied to every matched row (repeatable; required except with --verify-only). The expression is native SQL for the engine, emitted verbatim — split at the FIRST '=', so expressions may themselves contain '='." placeholder:"'COL = EXPR'" sep:"none"`
-	Where string   `help:"Native-SQL predicate scoping which rows are backfilled. Make it self-describing (e.g. 'new_col IS NULL') so re-runs and crash-resume skip already-done rows." placeholder:"PREDICATE"`
+	Where string   `help:"Native-SQL predicate scoping which rows are backfilled. Make it self-describing (e.g. 'new_col IS NULL') so re-runs and crash-resume skip already-done rows. --set and --where run in the session's zone: UTC on the MySQL family, NOT pinned on Postgres — write timestamp literals with an offset." placeholder:"PREDICATE"`
 
 	BatchSize  int  `help:"Rows per bounded UPDATE batch (keyset-chunked walk of the primary key). 0 uses sluice's bulk-copy default." placeholder:"N"`
 	DryRun     bool `help:"Print the generated per-chunk UPDATE statement and an affected-row estimate, then exit without writing anything." xor:"dryrunverify,dryrunverifyonly"`

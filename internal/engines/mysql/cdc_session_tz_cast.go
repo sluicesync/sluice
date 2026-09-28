@@ -27,7 +27,11 @@ import (
 //
 // sluice pins `time_zone='+00:00'` on every connection it opens
 // (connect.go's finishParseDSN), so the TARGET side of a forwarded MODIFY
-// is deterministic. The SOURCE operator's ALTER ran under THEIR session,
+// is deterministic. Until GC-39 item 1 that pin yielded to a DSN
+// `time_zone=` parameter, which made this sentence false for any operator
+// who set one; a non-UTC value is now refused at DSN parse
+// (DSN-TIME-ZONE-NOT-UTC, pinned by TestFinishParseDSN_TimeZoneSpellings),
+// so it holds. The SOURCE operator's ALTER ran under THEIR session,
 // and MySQL's shipped default is `time_zone=SYSTEM` — the host zone. So
 // the divergence does not need two deliberately-mismatched settings the
 // way the PG case does; it is the DEFAULT outcome on any non-UTC source

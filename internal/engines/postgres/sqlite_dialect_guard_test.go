@@ -172,8 +172,11 @@ func TestTranslateDefaultExpr_HexLiteralBytea(t *testing.T) {
 func TestWriterDialectGuard_DefaultExpr_SQLite(t *testing.T) {
 	opts := emitOpts{}
 
-	if got, ok := guardDefault(ir.DefaultExpression{Expr: "datetime('now')", Dialect: "sqlite"}, opts); !ok || got != "CURRENT_TIMESTAMP" {
-		t.Errorf("sqlite portable default = (%q, %v); want (CURRENT_TIMESTAMP, true)", got, ok)
+	// A current-instant default is rendered for the column's type in UTC
+	// (GC-39 item 3; the full matrix is TestSQLiteNowDefaultPG_ShapeByColumnType).
+	tsCol := &ir.Column{Name: "c", Type: ir.Timestamp{}}
+	if got, ok := translateDefaultExpr(nil, tsCol, ir.DefaultExpression{Expr: "datetime('now')", Dialect: "sqlite"}, opts); !ok || got != "pg_catalog.date_trunc('second', "+utcNowSQL+")" {
+		t.Errorf("sqlite current-instant default on a timestamp = (%q, %v); want the UTC wall clock", got, ok)
 	}
 
 	// The portable general subset (the parseDefault-misclassification fix's

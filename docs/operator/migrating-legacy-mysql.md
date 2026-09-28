@@ -162,11 +162,13 @@ This matters most for a PostgreSQL source with a `NOT VALID` CHECK: MySQL has no
 
 ## What `--mysql-sql-mode=''` does NOT change
 
-The MySQL driver-level overrides (UTF-8 charset, `time_zone='+00:00'`,
-`utf8mb4` collation, the keep-alive dialer) stay regardless of
-`--mysql-sql-mode`. The flag only controls the `sql_mode` SET that
-sluice issues post-handshake; if you want to fully control all of
-those, pass them in the DSN params and sluice respects them.
+The MySQL driver-level overrides (UTF-8 charset, `time_zone='+00:00'`, `utf8mb4` collation, the keep-alive dialer) stay regardless of `--mysql-sql-mode`. The flag only controls the `sql_mode` SET that sluice issues post-handshake. The charset and collation can be set in the DSN params and sluice respects them; `time_zone` cannot be moved off UTC.
+
+### Session time zone (`DSN-TIME-ZONE-NOT-UTC`)
+
+sluice reads and writes every MySQL `TIMESTAMP` as a UTC instant, which is only correct when the session's `time_zone` is UTC, so it sets `time_zone='+00:00'` on every connection. A DSN `time_zone=` parameter naming any other zone is **refused** at connect with an error marked `DSN-TIME-ZONE-NOT-UTC`; remove the parameter (or set it to `'+00:00'`). Any spelling of UTC is accepted — `'+00:00'`, `'+0:00'`, `'-00:00'`, `'UTC'`, `'Etc/UTC'`, `'GMT'` and the like, quoted or URL-encoded — and the check matches the variable name case-insensitively (`TIME_ZONE=`, `@@session.time_zone=`), as MySQL does. `SYSTEM` is refused because the server host's zone is not knowable from the DSN.
+
+Through v0.156.4 this page said the reverse — that a `time_zone` in the DSN params was respected — and it was: sluice then kept reading `TIMESTAMP` values as if they were UTC, so every `TIMESTAMP` a cold copy read, and every one an INSERT or `LOAD DATA` wrote into a MySQL target, was shifted by the zone's offset, silently (measured on a real server under `+09:00`: a stored 12:00Z read back as 21:00Z, and a written 12:00Z landed as 03:00Z). `DATETIME` columns hold no zone and were not affected, and the binlog CDC stream carries `TIMESTAMP` as an epoch and was not affected either. If a DSN of yours carried a non-UTC `time_zone`, the `TIMESTAMP` columns it copied or wrote are off by that offset; re-copy those tables (or correct them with `CONVERT_TZ` by the offset) after removing the parameter. This was GC-39 item 1.
 
 ## ENUM/SET labels with 4-byte UTF-8 (emoji, supplementary plane) (`ENUM-LABEL-NOT-RECOVERABLE`)
 

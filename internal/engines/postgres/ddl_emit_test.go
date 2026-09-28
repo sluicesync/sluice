@@ -736,9 +736,13 @@ func TestEmitDefault(t *testing.T) {
 		// (datetime('now')) translates to the PG keyword instead of
 		// emitting verbatim (which aborted CREATE TABLE).
 		{
-			"sqlite portable: datetime('now') → CURRENT_TIMESTAMP",
+			// Rendered per column TYPE in UTC (GC-39 item 3); this
+			// table's column is untyped, so there is no faithful
+			// spelling and it drops loudly rather than falling back to
+			// the session-zone CURRENT_TIMESTAMP.
+			"sqlite current-instant on an untyped column drops",
 			ir.DefaultExpression{Expr: "datetime('now')", Dialect: "sqlite"},
-			"CURRENT_TIMESTAMP", true,
+			"", false,
 		},
 		// A non-portable SQLite default (julianday) is DROPPED — no DEFAULT
 		// clause, ok=false — rather than emitted verbatim. (The loud warn

@@ -54,7 +54,10 @@ type schemaHistoryQueryer interface {
 // cdc-state rows is unaffected.
 //
 // anchor_position and ir_schema_json are TEXT (PG TEXT is unbounded).
-// created_at defaults to CURRENT_TIMESTAMP for operator diagnostics.
+// created_at is the target's UTC clock ([utcNowSQL], written explicitly by
+// the insert — a table created by an older binary keeps a session-zone
+// CURRENT_TIMESTAMP default), for operator diagnostics (diagnose orders
+// by it); resume resolution never reads it (see ir.ResolveSchemaVersion).
 //
 // source_engine is the engine tag of the anchor token's producer (the
 // source-side engine that emitted the [ir.SchemaSnapshot]). It is
@@ -85,7 +88,7 @@ func ensureSchemaHistoryTable(ctx context.Context, db *sql.DB, schema string) er
 			anchor_position TEXT         NOT NULL,
 			ir_schema_json  TEXT         NOT NULL,
 			source_engine   TEXT         NULL,
-			created_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			created_at      TIMESTAMP    NOT NULL DEFAULT (` + utcNowSQL + `),
 			PRIMARY KEY (version_key)
 		)`
 	if _, err := db.ExecContext(ctx, ddl); err != nil {
@@ -159,8 +162,8 @@ func buildWriteSchemaVersionSQL(schema, streamID, schemaName, table string, anch
 	tableRef := quoteIdent(schema) + "." + quoteIdent(schemaHistoryTableName)
 	vk := ir.SchemaVersionKey(streamID, schemaName, table, anchor.Token)
 	q := "INSERT INTO " + tableRef + " " +
-		"(version_key, stream_id, schema_name, table_name, anchor_position, ir_schema_json, source_engine) " +
-		"VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, '')) " +
+		"(version_key, stream_id, schema_name, table_name, anchor_position, ir_schema_json, source_engine, created_at) " +
+		"VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, ''), " + utcNowSQL + ") " +
 		"ON CONFLICT (version_key) DO UPDATE SET " +
 		"ir_schema_json = EXCLUDED.ir_schema_json, " +
 		"source_engine = COALESCE(EXCLUDED.source_engine, " + tableRef + ".source_engine)"

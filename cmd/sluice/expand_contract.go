@@ -38,7 +38,7 @@ type ExpandContractCmd struct {
 	ContractDDL string `name:"contract-ddl" help:"Verbatim DROP COLUMN DDL for the contract leg. Optional: without it the run stops after verify with resume instructions. Runs only after a clean verify AND --yes." placeholder:"DDL"`
 
 	Set   []string `help:"Backfill assignment 'col = <expr>' for the migrate leg (repeatable; native SQL, emitted verbatim — the ADR-0159 --set)." placeholder:"'COL = EXPR'" sep:"none"`
-	Where string   `help:"Self-describing native-SQL guard (e.g. 'new_col IS NULL'). Required: it scopes the backfill AND is the verify gate that authorizes the contract step." required:"" placeholder:"PREDICATE"`
+	Where string   `help:"Self-describing native-SQL guard (e.g. 'new_col IS NULL'). Required: it scopes the backfill AND is the verify gate that authorizes the contract step. It runs in the session's zone (UTC on the MySQL family) — write timestamp literals with an offset." required:"" placeholder:"PREDICATE"`
 
 	BatchSize    int           `help:"Rows per bounded backfill UPDATE. 0 uses sluice's bulk-copy default." placeholder:"N"`
 	Yes          bool          `help:"Confirm the contract leg (a destructive DROP COLUMN deploy request). Without it the run stops after verify and prints the exact resume command." short:"y" xor:"dryrunyes"`

@@ -47,10 +47,6 @@ func TestSQLiteExprToPG_Portable(t *testing.T) {
 		{"cast(x AS text)", "CAST(x AS TEXT)"},
 		{"cast(x AS real)", "CAST(x AS DOUBLE PRECISION)"},
 		{"cast(x AS numeric)", "CAST(x AS NUMERIC)"},
-		// current-instant keywords
-		{"CURRENT_TIMESTAMP", "CURRENT_TIMESTAMP"},
-		{"current_date", "CURRENT_DATE"},
-		{"CURRENT_TIME", "CURRENT_TIME"},
 		// a realistic combined gencol body
 		{"coalesce(a, 'x') || '-' || cast(n AS text)", "(COALESCE(a, 'x') || '-' || CAST(n AS TEXT))"},
 	}
@@ -93,8 +89,6 @@ func TestSQLiteExprToMySQL_Portable(t *testing.T) {
 		// cast: text + real only
 		{"cast(x AS text)", "CAST(x AS CHAR)"},
 		{"cast(x AS real)", "CAST(x AS DOUBLE)"},
-		// current-instant keywords
-		{"CURRENT_TIMESTAMP", "CURRENT_TIMESTAMP"},
 		{"coalesce(a, 'x') || cast(n AS text)", "CONCAT(COALESCE(a, 'x'), CAST(n AS CHAR))"},
 	}
 	for _, c := range cases {
@@ -290,6 +284,14 @@ func TestSQLiteExpr_NonPortableBoth(t *testing.T) {
 		"date(d, '+1 day')",
 		"time(d)",
 		"datetime('now', '-1 hour')",
+		// current-instant keywords (GC-39 item 3): UTC TEXT on SQLite,
+		// a session-zone temporal on both targets. A DEFAULT that is
+		// exactly one of them is translated per column type upstream
+		// (ClassifySQLiteNowDefault); inside a composite it is refused.
+		"CURRENT_TIMESTAMP",
+		"current_date",
+		"CURRENT_TIME",
+		"CURRENT_TIMESTAMP || ''",
 		// explicitly excluded functions
 		"glob('a*', x)",
 		"typeof(x)",
