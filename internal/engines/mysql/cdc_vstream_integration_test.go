@@ -916,6 +916,12 @@ func drainVTTestChanges(
 			if _, ok := c.(ir.SchemaSnapshot); ok {
 				continue
 			}
+			// Likewise the transaction boundaries the reader emits since
+			// ADR-0190 phase 4: count only row changes.
+			switch c.(type) {
+			case ir.TxBegin, ir.TxCommit:
+				continue
+			}
 			got = append(got, c)
 		case <-deadline.C:
 			t.Logf("timed out after %v with %d/%d changes", timeout, len(got), want)

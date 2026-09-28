@@ -439,11 +439,13 @@ type Orchestrator struct {
 	lastWrittenCum uint64
 
 	// prevSeq / prevPos drive the position-run boundary heuristic used ONLY on
-	// marker-LESS streams (VStream — see sawTxMarker): a checkpoint boundary is
-	// the highest seq sharing a given source position, detected when the NEXT
-	// event carries a different position. This is safe ONLY when within-tx
-	// events share a position token (VStream's VGTID is stable within a source
-	// transaction); it must NOT be used for MySQL file/pos, where every binlog
+	// marker-LESS streams (the trigger sources — see sawTxMarker): a checkpoint
+	// boundary is the highest seq sharing a given source position, detected
+	// when the NEXT event carries a different position. This is safe ONLY when
+	// within-tx events share a position token or every event is its own
+	// transaction (the trigger sources: one change-log id per change; VStream,
+	// whose VGTID is stable within a source transaction, was marker-less too
+	// until ADR-0190 phase 4); it must NOT be used for MySQL file/pos, where every binlog
 	// event has a distinct LogPos so a mid-transaction ROW position would be
 	// recorded as a "boundary" yet is unresumable ("no corresponding table map
 	// event" on warm-resume — the bug this heuristic caused on the concurrent
@@ -456,6 +458,12 @@ type Orchestrator struct {
 	// as a checkpoint boundary on a marker-LESS stream. Kept in lockstep
 	// with prevSeq / prevPos. Coordinator-goroutine-only.
 	prevCum uint64
+	// prevTx is the ADR-0190 TxID of the change at prevSeq ("" without one).
+	// On a marker-less stream each identity-carrying change is its own
+	// transaction (the trigger sources), so the boundary that settles prevSeq
+	// closes prevTx — the lane path's stand-in for a TxCommit. Kept in
+	// lockstep with prevSeq. Coordinator-goroutine-only.
+	prevTx string
 
 	// lastNotedSeq is the highest prevSeq already handed to the frontier as a
 	// boundary (by noteBoundary or the idle-checkpoint flush). It dedups the
@@ -471,7 +479,7 @@ type Orchestrator struct {
 	// the stream. It selects the boundary-detection strategy (see handle):
 	// marker streams (binlog-MySQL, Postgres) record a checkpoint boundary ONLY
 	// at the real boundary events (TxCommit, and the DDL-boundary Truncate),
-	// while marker-LESS streams (VStream) fall back to the prevSeq/prevPos
+	// while marker-LESS streams (the trigger sources) fall back to the prevSeq/prevPos
 	// position-run heuristic above. Coordinator-goroutine-only (no lock).
 	sawTxMarker bool
 
@@ -681,11 +689,13 @@ func (o *Orchestrator) handle(ctx context.Context, seq uint64, c ir.Change) erro
 	//     point, so the same rule applies — and never persisting a mid-tx
 	//     position is strictly safer.
 	//
-	//   - MARKER-LESS streams — VStream — emit only row changes whose position
-	//     token (the VGTID) is STABLE within a source transaction and changes
-	//     only at the tx boundary, with no Tx* markers to anchor on. For these
-	//     the prevSeq/prevPos position-run heuristic (noteBoundary) correctly
-	//     finds the boundary as the last change of each run.
+	//   - MARKER-LESS streams — the trigger sources — emit only row changes,
+	//     each with its own distinct change-log id and no Tx* markers to anchor
+	//     on. For these the prevSeq/prevPos position-run heuristic
+	//     (noteBoundary) finds the boundary as the last change of each run —
+	//     every change. (VStream was the other marker-less stream, its VGTID
+	//     stable within a transaction, until ADR-0190 phase 4 made its reader
+	//     emit each shard transaction's BEGIN/COMMIT.)
 	//
 	// sawTxMarker latches once a TxBegin/TxCommit is seen, selecting the marker
 	// path. SchemaSnapshot is excluded from BOTH: its token is metadata-anchored
@@ -740,10 +750,10 @@ func (o *Orchestrator) handle(ctx context.Context, seq uint64, c ir.Change) erro
 		if !o.la.SkipsRowChange(ctx, c) {
 			o.cumRowDML++
 		}
-		// Marker-less (VStream) only: the position-run heuristic. On a marker
+		// Marker-less (trigger sources) only: the position-run heuristic. On a marker
 		// stream a row position is mid-transaction and must NOT be a boundary.
 		if !o.sawTxMarker {
-			o.noteBoundary(seq, c.Pos())
+			o.noteBoundary(seq, c.Pos(), ir.ApplyIDOf(c).TxID)
 		}
 		return o.routeRow(ctx, seq, c)
 	default:
@@ -758,7 +768,7 @@ func (o *Orchestrator) handle(ctx context.Context, seq uint64, c ir.Change) erro
 				o.boundaryRowDML[seq] = o.cumRowDML
 			}
 		} else if !isSchemaSnapshot(c) {
-			o.noteBoundary(seq, c.Pos())
+			o.noteBoundary(seq, c.Pos(), "")
 		}
 		return o.barrier(ctx, seq, c)
 	}
@@ -797,7 +807,8 @@ func isSchemaSnapshot(c ir.Change) bool {
 //     engines that REACH this function do not implement it: sqlite-trigger
 //     (and d1-trigger) and pgtrigger are marker-less and have no orderer,
 //     while postgres and binlog-MySQL have one and take the marker path,
-//     where noteBoundary is never called. Only VStream is both. A gate built
+//     where noteBoundary is never called — as does VStream (which has one)
+//     since ADR-0190 phase 4 made it a marker stream. A gate built
 //     on the orderer would therefore miss the two engines that produced the
 //     defect while reading as though it covered the marker-less path — the
 //     coverage-narrower-than-its-name shape.
@@ -821,14 +832,13 @@ func isSchemaSnapshot(c ir.Change) bool {
 // What would change this: an engine that reaches noteBoundary AND implements
 // [ir.PositionOrderer] on the source side. Then the assertion is worth adding,
 // and it would have real coverage.
-func (o *Orchestrator) noteBoundary(seq uint64, pos ir.Position) {
+func (o *Orchestrator) noteBoundary(seq uint64, pos ir.Position, txID string) {
 	if o.prevSeq != 0 && pos.Token != o.prevPos.Token && o.prevSeq > o.lastNotedSeq {
-		o.frontier.RecordTxBoundary(o.prevSeq, o.prevPos)
-		o.boundaryRowDML[o.prevSeq] = o.prevCum
-		o.lastNotedSeq = o.prevSeq
+		o.settlePrev()
 	}
 	o.prevSeq = seq
 	o.prevPos = pos
+	o.prevTx = txID
 	// Snapshot the cum for THIS change; the caller has already incremented
 	// cumRowDML for a DML change, so prevCum = count of DML with seq ≤ seq.
 	o.prevCum = o.cumRowDML
@@ -847,8 +857,9 @@ func (o *Orchestrator) noteBoundary(seq uint64, pos ir.Position) {
 //   - pgtrigger: every row carries a DISTINCT, monotone position token (the
 //     change-log id), so a settled prevSeq IS a resume-safe point — no
 //     in-flight successor shares its token.
-//   - VStream: the VGTID is STABLE within a source transaction (see handle()'s
-//     doc and the prevSeq doc), so a settled prevSeq can sit MID-transaction on
+//   - VStream — a marker stream since ADR-0190 phase 4, so this no longer
+//     applies to it; kept because the premise below is still pinned. The
+//     VGTID is STABLE within a source transaction, so a settled prevSeq could sit MID-transaction on
 //     a shared token. That is still safe ONLY because of a load-bearing wire-
 //     ordering premise: the reader advances r.currentVgtid to the tx's VGTID
 //     only on the TRAILING VGTID event (`mysql/cdc_vstream.go:1383`), so rows
@@ -869,10 +880,20 @@ func (o *Orchestrator) noteBoundary(seq uint64, pos ir.Position) {
 // stream (prevSeq stays 0).
 func (o *Orchestrator) flushPendingBoundary() {
 	if o.prevSeq != 0 && o.prevSeq > o.lastNotedSeq {
-		o.frontier.RecordTxBoundary(o.prevSeq, o.prevPos)
-		o.boundaryRowDML[o.prevSeq] = o.prevCum
-		o.lastNotedSeq = o.prevSeq
+		o.settlePrev()
 	}
+}
+
+// settlePrev records prevSeq as a checkpoint boundary on a marker-less
+// stream, and closes the ADR-0190 transaction of the change there (see
+// prevTx): the checkpoint that persists this boundary deletes its marks.
+func (o *Orchestrator) settlePrev() {
+	o.frontier.RecordTxBoundary(o.prevSeq, o.prevPos)
+	o.boundaryRowDML[o.prevSeq] = o.prevCum
+	if o.prevTx != "" {
+		o.closedTx[o.prevSeq] = o.prevTx
+	}
+	o.lastNotedSeq = o.prevSeq
 }
 
 // routeRow routes a keyed row-change to its lane, or falls to the barrier

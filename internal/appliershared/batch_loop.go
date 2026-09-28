@@ -578,7 +578,8 @@ func runOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 				// carries atBoundary=true regardless, but clearing the flag
 				// keeps it accurate for any later flush in this batch run.
 				*inSourceTx = false
-				noteSourceTxCommit(cfg)
+				// commitBatch notes the commit (ADR-0190): its position write is
+				// outside the source transaction now.
 				return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, true, pending, false)
 			}
 			if _, isTxBegin := c.(ir.TxBegin); isTxBegin {
@@ -807,6 +808,14 @@ func commitBatch(ctx context.Context, cfg *BatchConfig, tx BatchTx, streamID, to
 	// never advanced its durable position at all, for the life of the stream
 	// (audit 2026-08-01 S3).
 	skipPosition := cfg.CheckpointOnlyAtTxBoundary && inSourceTx && !atBoundary
+	if !skipPosition && !inSourceTx {
+		// A position write OUTSIDE a source transaction passes every change
+		// applied so far — on a marker-less stream (the trigger sources,
+		// whose every change is its own ADR-0190 transaction) there is no
+		// TxCommit to say so, so this write does. Its apply marks are then
+		// closed: deleted in this transaction, or never written at all.
+		noteSourceTxCommit(cfg)
+	}
 	if !skipPosition {
 		if err := cfg.WritePosition(ctx, tx, streamID, token, *pending+int64(rowDML)); err != nil {
 			_ = tx.Rollback()

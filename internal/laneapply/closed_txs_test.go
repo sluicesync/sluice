@@ -67,3 +67,44 @@ func TestOrchestrator_CheckpointHandsEveryClosedTransactionOnce(t *testing.T) {
 		t.Fatalf("checkpoints handed closed transactions %v (per checkpoint %v); want [tx1 tx3], each once, in order", all, seam.closed)
 	}
 }
+
+// TestOrchestrator_MarkerlessBoundaryClosesItsChange pins the lane path's
+// ADR-0190 phase-5 close on a marker-LESS stream: each identity-carrying
+// change is its own transaction (a trigger source's change-log id), and the
+// boundary that settles it hands that transaction to the checkpoint that
+// persists it — the stand-in for a TxCommit the stream never sends. A change
+// with no identity closes nothing.
+func TestOrchestrator_MarkerlessBoundaryClosesItsChange(t *testing.T) {
+	tok := func(n string) ir.Position { return ir.Position{Engine: "postgres-trigger", Token: n} }
+	ins := func(p, id, tx string) ir.Change {
+		return ir.Insert{
+			Position: tok(p), Schema: "ks", Table: "t", Row: ir.Row{"id": id},
+			ApplyID: ir.ApplyID{TxID: tx, Seq: func() uint64 {
+				if tx == "" {
+					return 0
+				}
+				return 1
+			}()},
+		}
+	}
+	stream := []ir.Change{
+		ins("1", "a", "trg:1"), ins("2", "b", "trg:2"), ins("3", "c", ""), ins("4", "a", "trg:4"),
+	}
+	seam := &closedTxSeam{}
+	o := NewOrchestrator(Config{Lanes: 3, MaxBatchSize: 4}, seam)
+	ch := make(chan ir.Change, len(stream))
+	for _, c := range stream {
+		ch <- c
+	}
+	close(ch)
+	if err := o.Run(context.Background(), ch); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	var all []string
+	for _, c := range seam.closed {
+		all = append(all, c...)
+	}
+	if len(all) != 3 || all[0] != "trg:1" || all[1] != "trg:2" || all[2] != "trg:4" {
+		t.Fatalf("checkpoints handed closed transactions %v (per checkpoint %v); want [trg:1 trg:2 trg:4], each once, in order", all, seam.closed)
+	}
+}

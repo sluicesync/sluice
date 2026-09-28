@@ -292,7 +292,13 @@ func runResendCell(t *testing.T, srcDSN, wantMode string, tgt resendTarget, conc
 func waitResend(t *testing.T, runErr chan error, d time.Duration, what string, done func() bool) {
 	t.Helper()
 	if !waitResendSoft(runErr, d, done) {
-		t.Fatalf("timed out waiting for %s", what)
+		select {
+		case err := <-runErr:
+			runErr <- err
+			t.Fatalf("the stream stopped before %s: %v", what, err)
+		default:
+			t.Fatalf("timed out waiting for %s", what)
+		}
 	}
 }
 

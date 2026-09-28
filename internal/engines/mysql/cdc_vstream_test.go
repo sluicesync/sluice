@@ -367,18 +367,18 @@ func TestVStreamReader_DDLTruncateOtherKeyspace(t *testing.T) {
 	}
 }
 
-// TestVStreamReader_HeartbeatBeginCommitNoOp confirms transaction-
-// boundary and heartbeat events are dropped silently. They're
+// TestVStreamReader_BookkeepingEventsNoOp confirms heartbeat and other
+// bookkeeping events are dropped silently. They're
 // important for the wire protocol but produce no IR events.
-func TestVStreamReader_HeartbeatBeginCommitNoOp(t *testing.T) {
+func TestVStreamReader_BookkeepingEventsNoOp(t *testing.T) {
 	r := &vstreamCDCReader{fields: make(map[string][]*query.Field)}
 	out := make(chan ir.Change, 8)
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
 
+	// BEGIN and COMMIT are NOT bookkeeping since ADR-0190 phase 4: they reach
+	// the applier as TxBegin / TxCommit (TestVStream_TransactionBoundariesAndIdentity).
 	for _, typ := range []binlogdata.VEventType{
-		binlogdata.VEventType_BEGIN,
-		binlogdata.VEventType_COMMIT,
 		binlogdata.VEventType_HEARTBEAT,
 		binlogdata.VEventType_GTID,
 		binlogdata.VEventType_OTHER,

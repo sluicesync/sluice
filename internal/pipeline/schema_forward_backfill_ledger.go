@@ -361,7 +361,9 @@ func (l *addedColumnBackfillLedger) settle(durable func(e *addedColumnBackfillEn
 //   - MySQL GTID (MariaDB included): that transaction's TxCommit, whose set
 //     folds in its own GTID; its TxBegin and rows carry the set without it.
 //   - MySQL file/pos: any later event's LogPos; in practice the XID.
-//   - VStream (no transaction markers): the first position-bearing change
+//   - VStream: that shard transaction's TxCommit (the reader emits its
+//     BEGIN/COMMIT since ADR-0190 phase 4), whose VGTID has advanced past
+//     the transaction; or, as before, the first later position-bearing change
 //     whose VGTID advanced past the boundary transaction. An application
 //     write is not required for one: measured on vttestserver with no
 //     write after the last ADD COLUMN, Vitess's own source-side writes

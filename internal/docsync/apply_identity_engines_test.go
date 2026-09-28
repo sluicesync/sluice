@@ -10,20 +10,20 @@
 // STAMP an identity. That is an operator-visible engine set, and CLAUDE.md's
 // rule puts every such claim behind a marker:
 //
-//	<!-- apply-identity-engine-packages: mysql, postgres -->
+//	<!-- apply-identity-engine-packages: mysql, pgtrigger, postgres, sqlite-trigger -->
 //
 // The marker names PACKAGES, for the reason the idempotent-copy marker does:
-// the mysql package holds the binlog reader (which stamps) AND the VStream
-// reader (which does not, until ADR-0190 phase 4), so a package→flavor
-// mapping would claim PlanetScale and Vitess are covered. The prose beside
-// the marker must say which readers; this gate checks the part it can.
+// one package can hold several readers (mysql holds the binlog reader and
+// both VStream dispatchers; sqlite-trigger also serves the d1-trigger engine),
+// so the prose beside the marker must say which readers; this gate checks
+// the part it can.
 //
-// The second half is the STAMP roster, and it is what makes "VStream and the
-// trigger-CDC sources are unchanged by ADR-0190" a checked statement rather
-// than a promise: every `ApplyID:` field set in an ir.Insert / ir.Update /
-// ir.Delete literal anywhere under internal/engines must sit in a file on the
-// roster below. A reader that starts stamping identities (phase 4, phase 5)
-// fails here until the roster, the capability pin and the doc move together.
+// The second half is the STAMP roster, and it is what keeps "which readers
+// stamp" a checked statement rather than a promise: every `ApplyID:` field
+// set in an ir.Insert / ir.Update / ir.Delete literal anywhere under
+// internal/engines must sit in a file on the roster below. A reader that
+// starts stamping identities fails here until the roster, the capability pin
+// and the doc move together.
 
 package docsync
 
@@ -40,10 +40,19 @@ import (
 )
 
 // applyIDStampRoster is every file allowed to set an ir.ApplyID on a change
-// it emits — the binlog reader and the pgoutput reader (ADR-0190 phase 1).
+// it emits: the binlog and pgoutput readers (ADR-0190 phase 1); BOTH VStream
+// dispatchers — the tail reader and the snapshot stream's post-COPY pump,
+// which must stamp alike (phase 4, premise pinned by
+// TestVStream_ApplyIdentity_StableAcrossMidStreamResume); and the trigger
+// readers, one per change-log dialect (phase 5; the d1-trigger engine rides
+// the sqlite-trigger reader).
 var applyIDStampRoster = map[string]bool{
-	"mysql/cdc_reader.go":    true,
-	"postgres/cdc_reader.go": true,
+	"mysql/cdc_reader.go":           true,
+	"postgres/cdc_reader.go":        true,
+	"mysql/cdc_vstream.go":          true,
+	"mysql/cdc_vstream_snapshot.go": true,
+	"pgtrigger/cdc_reader.go":       true,
+	"sqlite-trigger/cdc_reader.go":  true,
 }
 
 func TestApplyIdentityEngineListMatchesTheCode(t *testing.T) {
@@ -88,9 +97,9 @@ func TestApplyIdentityEngineListMatchesTheCode(t *testing.T) {
 			t.Errorf("%s is on the stamp roster but sets no ir.ApplyID — the roster is stale or the scan is broken", file)
 		}
 	}
-	// Anti-vacuity: each rostered reader stamps Insert, Update and Delete.
-	if sites < 6 {
-		t.Fatalf("the scan found only %d ApplyID stamp sites (%v); two readers × three change kinds is six", sites, stamps)
+	// Anti-vacuity: each of the six rostered readers stamps Insert, Update and Delete.
+	if sites < 18 {
+		t.Fatalf("the scan found only %d ApplyID stamp sites (%v); six readers × three change kinds is eighteen", sites, stamps)
 	}
 }
 

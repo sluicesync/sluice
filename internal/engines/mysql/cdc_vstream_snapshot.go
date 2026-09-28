@@ -846,6 +846,12 @@ type vstreamSnapshotStream struct {
 	// transaction's VGTID event. Guarded by mu.
 	currentVgtid []shardGtid
 
+	// tx is the post-COPY CDC phase's ADR-0190 transaction bookkeeping — the
+	// same vstreamTxState the tail reader uses, so a change delivered here and
+	// re-delivered by the tail reader after a restart carries one identity.
+	// COPY rows never reach it (they ride the bulk queues). CDC-pump-only.
+	tx vstreamTxState
+
 	// reshardFollowed records that this stream has performed at least one
 	// reshard-follow reopen ([reopenAfterReshard]). It gates the transient
 	// post-SwitchTraffic primary-routable-window recovery
@@ -2575,8 +2581,26 @@ func (s *vstreamSnapshotStream) dispatchCDCEvent(ctx context.Context, ev *binlog
 		// arm (cdc_vstream_statement_dml.go).
 		return s.statementDMLRefusal(ev)
 
+	case binlogdata.VEventType_BEGIN:
+		// ADR-0190 phase 4 — the mirror of [vstreamCDCReader.dispatch]'s
+		// BEGIN / COMMIT arms (see there).
+		s.tx.begin(ctx, ev, s.currentVgtid)
+		pos, err := s.positionFor()
+		if err != nil {
+			return err
+		}
+		return s.send(ctx, out, ir.TxBegin{Position: pos, CommitTime: vstreamEventCommitTime(ev)})
+
+	case binlogdata.VEventType_COMMIT:
+		s.tx.commit()
+		pos, err := s.positionFor()
+		if err != nil {
+			return err
+		}
+		return s.send(ctx, out, ir.TxCommit{Position: pos, CommitTime: vstreamEventCommitTime(ev)})
+
 	default:
-		// BEGIN, COMMIT, HEARTBEAT, GTID, OTHER, VERSION, LASTPK,
+		// HEARTBEAT, GTID, OTHER, VERSION, LASTPK,
 		// SAVEPOINT, ROLLBACK, COPY_COMPLETED (a stray one), etc. —
 		// all bookkeeping. Drop silently.
 		return nil
@@ -2738,6 +2762,7 @@ func (s *vstreamSnapshotStream) dispatchCDCRow(ctx context.Context, ev *binlogda
 				Schema:   rev.GetKeyspace(),
 				Table:    tableName,
 				Row:      after,
+				ApplyID:  s.tx.next(tableName),
 			}); err != nil {
 				return err
 			}
@@ -2748,6 +2773,7 @@ func (s *vstreamSnapshotStream) dispatchCDCRow(ctx context.Context, ev *binlogda
 				Table:    tableName,
 				Before:   before,
 				After:    after,
+				ApplyID:  s.tx.next(tableName),
 			}); err != nil {
 				return err
 			}
@@ -2757,6 +2783,7 @@ func (s *vstreamSnapshotStream) dispatchCDCRow(ctx context.Context, ev *binlogda
 				Schema:   rev.GetKeyspace(),
 				Table:    tableName,
 				Before:   before,
+				ApplyID:  s.tx.next(tableName),
 			}); err != nil {
 				return err
 			}
@@ -2951,6 +2978,8 @@ func (s *vstreamSnapshotStream) launchCDCPump(ctx context.Context, out chan ir.C
 	s.cdcPumpCancel = pumpCancel
 	streamCancel := s.grpcCancel
 	s.mu.Unlock()
+	// A (re)opened CDC phase starts at a transaction boundary.
+	s.tx.reset()
 	go func() {
 		defer close(done)
 		s.pump(pumpCtx, streamCancel, out)

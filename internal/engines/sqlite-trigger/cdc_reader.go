@@ -637,6 +637,9 @@ func (r *CDCReader) buildChange(id int64, op, tbl string, beforeJSON, afterJSON 
 	if err != nil {
 		return nil, fmt.Errorf("encode position (id=%d): %w", id, err)
 	}
+	// ADR-0190 phase 5: the change-log id names the change (the D1 sibling
+	// shares this reader and its position codec's engine name).
+	applyID := triggercdc.ChangeApplyID(EngineName, id)
 	var before, after ir.Row
 	if beforeJSON.Valid {
 		if before, err = r.decodeImage(tbl, beforeJSON.String, id); err != nil {
@@ -651,9 +654,9 @@ func (r *CDCReader) buildChange(id int64, op, tbl string, beforeJSON, afterJSON 
 
 	switch op {
 	case "I":
-		return ir.Insert{Position: pos, Table: tbl, Row: after, CommitTime: ct}, nil
+		return ir.Insert{Position: pos, Table: tbl, Row: after, CommitTime: ct, ApplyID: applyID}, nil
 	case "U":
-		return ir.Update{Position: pos, Table: tbl, Before: before, After: after, CommitTime: ct}, nil
+		return ir.Update{Position: pos, Table: tbl, Before: before, After: after, CommitTime: ct, ApplyID: applyID}, nil
 	case "D":
 		if before == nil {
 			// Defensive — the DELETE trigger always records OLD. A NULL here is
@@ -661,7 +664,7 @@ func (r *CDCReader) buildChange(id int64, op, tbl string, beforeJSON, afterJSON 
 			// delete with no WHERE.
 			return nil, fmt.Errorf("delete event id=%d has NULL before image", id)
 		}
-		return ir.Delete{Position: pos, Table: tbl, Before: before, CommitTime: ct}, nil
+		return ir.Delete{Position: pos, Table: tbl, Before: before, CommitTime: ct, ApplyID: applyID}, nil
 	default:
 		return nil, fmt.Errorf("unknown op %q at id=%d", op, id)
 	}
@@ -761,3 +764,9 @@ func commitTime(capturedAt sql.NullString) time.Time {
 
 // Compile-time check that [CDCReader] implements [ir.CDCReader].
 var _ ir.CDCReader = (*CDCReader)(nil)
+
+// StampsApplyIdentity implements [ir.ApplyIdentityProvider]: every change
+// carries its change-log id as its ADR-0190 identity (triggercdc.ChangeApplyID).
+func (r *CDCReader) StampsApplyIdentity() bool { return true }
+
+var _ ir.ApplyIdentityProvider = (*CDCReader)(nil)

@@ -8,6 +8,7 @@ package pipeline
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -17,6 +18,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/applymarks"
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/engines/pgtrigger"
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/logcapture"
 )
@@ -165,10 +167,42 @@ type crashSource struct {
 	dropBefore, dropMid string
 	// lastTxID derives the ADR-0190 identity of the source's most recently
 	// committed transaction from the source's OWN bookkeeping (its GTID
-	// state, its binlog) — the independent expected value for "the marks
-	// name the interrupted transaction". nil where there is no cheap
-	// derivation (Postgres: the commit LSN is not queryable after the fact).
+	// state, its binlog, its change log) — the independent expected value for
+	// "the marks name the interrupted transaction". nil where there is no
+	// cheap derivation (Postgres: the commit LSN is not queryable after the
+	// fact).
 	lastTxID func(t *testing.T) string
+
+	// streamDSN, when set, is the DSN the Streamer opens (a VStream source's
+	// DSN carries gRPC parameters the plain SQL driver would try to SET);
+	// dsn stays the one the harness's own SQL uses.
+	streamDSN string
+	// afterSetup runs after setup on every fixture (installing capture
+	// triggers, waiting for a schema tracker).
+	afterSetup func(t *testing.T)
+
+	// markerless marks a source that emits no transaction boundaries (the
+	// trigger sources, whose every change is its own ADR-0190 transaction).
+	// Its persisted position legitimately ADVANCES inside a source
+	// transaction — every flush persists it with the data — so the kill
+	// contract is "never backwards" (positionOrdinal) rather than
+	// "unchanged", and the transaction the marks may name is the first
+	// change after the persisted position (firstTxAfter, from the source's
+	// change log).
+	markerless      bool
+	positionOrdinal func(t *testing.T, token string) int64
+	firstTxAfter    func(t *testing.T, token string) string
+	// noKeyless: the source cannot capture a keyless table (postgres-trigger
+	// refuses one loudly by design), so kl is neither warmed nor graded.
+	noKeyless bool
+}
+
+// streamerDSN is the DSN the stream under test opens.
+func (s crashSource) streamerDSN() string {
+	if s.streamDSN != "" {
+		return s.streamDSN
+	}
+	return s.dsn
 }
 
 func mysqlCrashSource(engine, dsn string) crashSource {
@@ -382,6 +416,98 @@ func TestStreamer_CrashMidTxn_Postgres_ToMySQL(t *testing.T) {
 	runCrashMidTxnSuite(t, pgCrashSource(src), mysqlResendTarget(t, tgt), crashPinsRefusals|crashPinsKeyless)
 }
 
+// The postgres-trigger source (ADR-0190 phase 5). No refusal, keyless or
+// cold-start group: the serial paths write no marks on a marker-less source
+// (its position is persisted with every flush), so there is nothing to
+// tamper with, and postgres-trigger refuses a keyless table by design.
+func TestStreamer_CrashMidTxn_PgTrigger_ToPostgres(t *testing.T) {
+	src, _, cleanup := startPostgresLogical(t)
+	defer cleanup()
+	// The target is a SEPARATE instance: the kill holds a target row lock in
+	// an open transaction, and on a shared instance that transaction holds
+	// back the snapshot xmin postgres-trigger's gap-free poll waits on, so
+	// nothing would be delivered before the kill.
+	_, tgt, tgtCleanup := startPostgresLogical(t)
+	defer tgtCleanup()
+	runCrashMidTxnSuite(t, pgTriggerCrashSource(src), pgResendTarget(tgt), 0)
+}
+
+func TestStreamer_CrashMidTxn_PgTrigger_ToMySQL(t *testing.T) {
+	src, _, cleanup := startPostgresLogical(t)
+	defer cleanup()
+	_, tgt, tgtCleanup := startMySQL(t)
+	defer tgtCleanup()
+	runCrashMidTxnSuite(t, pgTriggerCrashSource(src), mysqlResendTarget(t, tgt), 0)
+}
+
+// pgTriggerCrashSource is a postgres-trigger source over the same tables
+// (kl excepted: a keyless table is refused by the capture trigger), with the
+// capture triggers installed on every fixture. Every change is its own
+// ADR-0190 transaction, named by its change-log id, so the source-derived
+// expected identities come from sluice_change_log itself.
+func pgTriggerCrashSource(dsn string) crashSource {
+	src := pgCrashSource(dsn)
+	src.engine = pgtrigger.EngineName
+	src.setup = `
+		DROP TABLE IF EXISTS rs, po, kl;
+		CREATE TABLE rs (
+			id  BIGINT PRIMARY KEY,
+			u   VARCHAR(32) NULL CONSTRAINT rs_u UNIQUE,
+			v   VARCHAR(32) NOT NULL,
+			pad TEXT NOT NULL
+		);
+		INSERT INTO rs (id, u, v, pad) SELECT n, NULL, 'seed', 's' FROM generate_series(1, 200) AS n;
+		UPDATE rs SET u = 'x' WHERE id = 5;
+		UPDATE rs SET u = 'y' WHERE id = 6;
+		CREATE TABLE po (id BIGINT PRIMARY KEY, v VARCHAR(32) NOT NULL);
+		INSERT INTO po (id, v) VALUES (1, 'a'), (2, 'b');`
+	src.configure = func(*testing.T, *Streamer, string) func() { return func() {} }
+	src.ddlMid, src.dropBefore, src.dropMid = "", "", ""
+	src.noKeyless = true
+	src.afterSetup = func(t *testing.T) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		if _, err := pgtrigger.Setup(ctx, dsn, pgtrigger.SetupOptions{Tables: []string{"rs", "po"}, Schema: "public"}); err != nil {
+			t.Fatalf("pgtrigger.Setup: %v", err)
+		}
+	}
+	changeLogID := func(t *testing.T, q string, args ...any) string {
+		t.Helper()
+		db, err := sql.Open("pgx", dsn)
+		if err != nil {
+			t.Fatalf("open source: %v", err)
+		}
+		defer func() { _ = db.Close() }()
+		var id sql.NullInt64
+		if err := db.QueryRow(q, args...).Scan(&id); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		if !id.Valid {
+			return ""
+		}
+		return fmt.Sprintf("%s:%d", pgtrigger.EngineName, id.Int64)
+	}
+	src.markerless = true
+	src.positionOrdinal = func(t *testing.T, token string) int64 {
+		t.Helper()
+		var p struct {
+			LastID int64 `json:"last_id"`
+		}
+		if err := json.Unmarshal([]byte(token), &p); err != nil {
+			t.Fatalf("decode trigger position %q: %v", token, err)
+		}
+		return p.LastID
+	}
+	src.firstTxAfter = func(t *testing.T, token string) string {
+		return changeLogID(t, `SELECT min(id) FROM public.`+pgtrigger.ChangeLogTable+` WHERE id > $1`, src.positionOrdinal(t, token))
+	}
+	src.lastTxID = func(t *testing.T) string {
+		return changeLogID(t, `SELECT max(id) FROM public.`+pgtrigger.ChangeLogTable)
+	}
+	return src
+}
+
 // crashPins selects the optional pin groups a source × target pair runs: the
 // main path matrix runs everywhere; the rest are engine-neutral decisions
 // graded on enough pairs to reach both target engines and both source
@@ -516,6 +642,9 @@ func runCrashMidTxnSuite(t *testing.T, src crashSource, tgt resendTarget, pins c
 		{name: "schema_event_mid_txn_serial_per_change", concurrency: 1, batch: 0},
 	}
 	for _, cell := range schemaCells {
+		if src.ddlMid == "" {
+			break // a source without a schema-event path of its own (the trigger sources)
+		}
 		t.Run(cell.name, func(t *testing.T) {
 			runCrashSchemaEventMidTxn(t, src, tgt, cell, src.ddlBefore, src.ddlMid)
 		})
@@ -546,6 +675,9 @@ type crashStreamFixture struct {
 func newCrashStreamFixture(t *testing.T, src crashSource, tgt resendTarget, cell crashMidTxnCell) crashStreamFixture {
 	t.Helper()
 	src.exec(t, src.setup)
+	if src.afterSetup != nil {
+		src.afterSetup(t)
+	}
 	tgt.drop(t)
 	execTargetQuiet(tgt, "DROP TABLE IF EXISTS po")
 	execTargetQuiet(tgt, "DROP TABLE IF EXISTS kl")
@@ -570,7 +702,7 @@ func newCrashStreamFixture(t *testing.T, src crashSource, tgt resendTarget, cell
 		s := &Streamer{
 			Source:           srcEng,
 			Target:           tgtEng,
-			SourceDSN:        src.dsn,
+			SourceDSN:        src.streamerDSN(),
 			TargetDSN:        tgt.dsn,
 			StreamID:         streamID,
 			ApplyConcurrency: cell.concurrency,
@@ -606,10 +738,12 @@ func runCrashToKill(t *testing.T, src crashSource, tgt resendTarget, fx crashStr
 	// idle flush turns into a mid-transaction commit, and the cohesive cell
 	// would no longer measure cohesion.
 	src.exec(t, `INSERT INTO po (id, v) VALUES (100, 'live')`)
-	src.exec(t, `INSERT INTO kl (k, v) VALUES (100, 'live')`)
+	if !src.noKeyless {
+		src.exec(t, `INSERT INTO kl (k, v) VALUES (100, 'live')`)
+	}
 	src.exec(t, fmt.Sprintf(`INSERT INTO rs (id, u, v, pad) VALUES (%d, NULL, 'live', 'l')`, crashSentinelLive))
 	waitResend(t, run1, 60*time.Second, "the first CDC rows", func() bool {
-		return tgt.has(crashSentinelLive) && countTarget(tgt, "SELECT COUNT(*) FROM kl WHERE k = 100") == 1
+		return tgt.has(crashSentinelLive) && (src.noKeyless || countTarget(tgt, "SELECT COUNT(*) FROM kl WHERE k = 100") == 1)
 	})
 	// The lane path checkpoints on an idle tick, so the persisted position
 	// may lag the live row briefly: wait for it to settle before the
@@ -641,27 +775,49 @@ func runCrashToKill(t *testing.T, src crashSource, tgt resendTarget, fx crashStr
 	release()
 	released = true
 
-	if posAfterKill != posBefore {
+	assertKillPosition(t, src, posBefore, posAfterKill)
+	assertMarksNameTheInterruptedTx(t, src, tgt, fx.streamID, posAfterKill, "")
+	return prefixApplied
+}
+
+// assertKillPosition grades the persisted position across the kill. On a
+// source with transaction boundaries it must not move at all: past a partly
+// applied transaction skips its remainder on resume, behind an earlier one
+// replays it ahead of this one's marks (both silent). A marker-less source
+// persists its position WITH the data at every flush, so it legitimately
+// advances inside a source transaction — but never backwards.
+func assertKillPosition(t *testing.T, src crashSource, before, after string) {
+	t.Helper()
+	if src.markerless {
+		if b, a := src.positionOrdinal(t, before), src.positionOrdinal(t, after); a < b {
+			t.Errorf("the persisted position moved BACKWARDS across the kill (%d → %d): an applied change would replay", b, a)
+		}
+		return
+	}
+	if after != before {
 		t.Errorf("the persisted position MOVED across a kill mid-transaction (either direction is a defect): %q before the "+
 			"transaction, %q after — past a partly applied transaction skips its remainder on resume; behind an earlier "+
-			"transaction replays it ahead of this one's marks (both silent)", posBefore, posAfterKill)
+			"transaction replays it ahead of this one's marks (both silent)", before, after)
 	}
-	assertMarksNameTheInterruptedTx(t, src, tgt, fx.streamID, "")
-	return prefixApplied
 }
 
 // assertMarksNameTheInterruptedTx asserts the invariant the restart sweep and
 // the APPLY-MARK-UNTRUSTED check rest on (ADR-0190 amendment B): at a kill,
 // every durable mark names ONE transaction — the one the restart re-delivers
-// first. With the position unchanged across the kill (asserted by the
-// caller), that is the interrupted transaction, whose identity is derived
-// from the SOURCE's own state where cheap (want == "" → src.lastTxID).
-func assertMarksNameTheInterruptedTx(t *testing.T, src crashSource, tgt resendTarget, streamID, want string) {
+// first. The expected identity, when want is "", is derived where it can be:
+// from the position persisted at the kill (posAtKill — the transaction the
+// restart re-delivers first begins exactly there; src.firstTxAfter), else
+// from the source's own state (src.lastTxID, which with the position
+// unchanged across the kill is the interrupted transaction).
+func assertMarksNameTheInterruptedTx(t *testing.T, src crashSource, tgt resendTarget, streamID, posAtKill, want string) {
 	t.Helper()
 	marks := targetMarks(t, tgt, streamID)
 	txs := distinctTxs(marks)
 	if len(txs) > 1 {
 		t.Errorf("apply marks exist for %d transactions at the kill (%v); only the first a restart re-delivers may have any", len(txs), txs)
+	}
+	if want == "" && src.firstTxAfter != nil && len(txs) > 0 {
+		want = src.firstTxAfter(t, posAtKill)
 	}
 	if want == "" && src.lastTxID != nil && len(txs) > 0 {
 		want = src.lastTxID(t)
@@ -704,7 +860,9 @@ func runCrashMidTxnCell(t *testing.T, src crashSource, tgt resendTarget, cell cr
 	if n := perTable["po"]; n != 0 && body == crashMidTxnSource {
 		t.Errorf("the PK-only table po wrote %d apply marks; its changes are idempotent and must write none (operator decision 1)", n)
 	}
-	if prefixApplied && cell.converges && cell.tamper == nil && len(marks) == 0 {
+	// A marker-less source persists its position with every flush, so a serial
+	// path never replays an applied change and writes no mark — by design.
+	if prefixApplied && cell.converges && cell.tamper == nil && len(marks) == 0 && !src.markerless {
 		t.Errorf("a prefix of a non-idempotent transaction reached the target with no apply mark — the restart has nothing to skip on")
 	}
 	if cell.tamper != nil {
@@ -834,7 +992,7 @@ func runCrashLanePostCommitWindow(t *testing.T, src crashSource, tgt resendTarge
 	}()
 	src.txn(t, `UPDATE rs SET v = 't1' WHERE id = 7;`)
 	t1 := ""
-	if src.lastTxID != nil {
+	if src.lastTxID != nil && src.firstTxAfter == nil { // else derived from the position at the kill
 		t1 = src.lastTxID(t) // the first transaction the restart must re-deliver
 	}
 	src.txn(t, `DELETE FROM rs WHERE id = 7;`)
@@ -861,7 +1019,7 @@ func runCrashLanePostCommitWindow(t *testing.T, src crashSource, tgt resendTarge
 		t.Fatalf("the position moved (%q → %q) while its row was held locked: the window closed before the kill, so the cell measured nothing",
 			posBefore, posAfterKill)
 	}
-	assertMarksNameTheInterruptedTx(t, src, tgt, fx.streamID, t1)
+	assertMarksNameTheInterruptedTx(t, src, tgt, fx.streamID, posAfterKill, t1)
 	t.Logf("row 7 at the kill: %d", countTarget(tgt, "SELECT COUNT(*) FROM rs WHERE id = 7"))
 
 	caughtUp, restartErr := resumeCrashStreamWith(t, fx.newStreamer, nil, src, tgt, true, fx.streamID, posAfterKill)
@@ -940,7 +1098,7 @@ UPDATE rs SET v = 'blocked' WHERE id = 100;
 		t.Errorf("the persisted position MOVED across a kill mid-transaction (either direction is a defect): %q after T-1, %q "+
 			"after the kill — a schema event inside T persisted its DDL-anchored position", posBefore, posAfterKill)
 	}
-	assertMarksNameTheInterruptedTx(t, src, tgt, fx.streamID, "")
+	assertMarksNameTheInterruptedTx(t, src, tgt, fx.streamID, posAfterKill, "")
 
 	caughtUp, restartErr := resumeCrashStreamWith(t, fx.newStreamer, nil, src, tgt, true, fx.streamID, posAfterKill)
 	if !caughtUp || restartErr != nil {
@@ -1055,10 +1213,11 @@ func assertCrashConverged(t *testing.T, src crashSource, tgt resendTarget) {
 	if diff := diffResendRows(dumpCrashSource(t, src), tgt.dump(t)); diff != "" {
 		t.Errorf("rs diverged after the restart:\n%s", diff)
 	}
-	for _, q := range []string{
-		"SELECT CONCAT(id, '|', v) FROM po",
-		"SELECT CONCAT(k, '|', v) FROM kl",
-	} {
+	queries := []string{"SELECT CONCAT(id, '|', v) FROM po"}
+	if !src.noKeyless {
+		queries = append(queries, "SELECT CONCAT(k, '|', v) FROM kl")
+	}
+	for _, q := range queries {
 		want, got := sortedRows(t, src.driver, src.dsn, q), sortedRows(t, driverOf(tgt), tgt.dsn, q)
 		if strings.Join(want, ",") != strings.Join(got, ",") {
 			t.Errorf("%q diverged after the restart:\n  source %v\n  target %v", q, want, got)

@@ -759,7 +759,7 @@ func (r *CDCReader) poll(ctx context.Context, lastSeen int64) (pollBatch, error)
 
 		switch op {
 		case "I":
-			b.events = append(b.events, ir.Insert{Position: pos, Schema: schema, Table: table, Row: afterRow, CommitTime: commitTime})
+			b.events = append(b.events, ir.Insert{Position: pos, Schema: schema, Table: table, Row: afterRow, CommitTime: commitTime, ApplyID: triggercdc.ChangeApplyID(EngineName, id)})
 		case "U":
 			// `before`/`after` completeness is a deliberate
 			// capture-payload mode choice (ADR-0068), NOT a REPLICA
@@ -774,7 +774,7 @@ func (r *CDCReader) poll(ctx context.Context, lastSeen int64) (pollBatch, error)
 			// the applier builds its WHERE from `before` and SET from
 			// `after` — both correct and idempotent for any of the
 			// modes, with no reader/applier code change.
-			b.events = append(b.events, ir.Update{Position: pos, Schema: schema, Table: table, Before: beforeRow, After: afterRow, CommitTime: commitTime})
+			b.events = append(b.events, ir.Update{Position: pos, Schema: schema, Table: table, Before: beforeRow, After: afterRow, CommitTime: commitTime, ApplyID: triggercdc.ChangeApplyID(EngineName, id)})
 		case "D":
 			// Delete events carry only OLD; the applier's PK-only
 			// path uses Before to identify the row.
@@ -785,7 +785,7 @@ func (r *CDCReader) poll(ctx context.Context, lastSeen int64) (pollBatch, error)
 				// is correct.
 				return pollBatch{}, fmt.Errorf("delete event id=%d has NULL before_jsonb", id)
 			}
-			b.events = append(b.events, ir.Delete{Position: pos, Schema: schema, Table: table, Before: beforeRow, CommitTime: commitTime})
+			b.events = append(b.events, ir.Delete{Position: pos, Schema: schema, Table: table, Before: beforeRow, CommitTime: commitTime, ApplyID: triggercdc.ChangeApplyID(EngineName, id)})
 		default:
 			return pollBatch{}, fmt.Errorf("unknown op %q at id=%d", op, id)
 		}
@@ -1144,6 +1144,12 @@ func readChangeLogAnchor(ctx context.Context, q anchorQuerier, schema string) (i
 // the addition of an Err method (the load-bearing loud-failure
 // surface for streaming readers — see [ir.RowReader] Err doc).
 var _ ir.CDCReader = (*CDCReader)(nil)
+
+// StampsApplyIdentity implements [ir.ApplyIdentityProvider]: every change
+// carries its change-log id as its ADR-0190 identity (triggercdc.ChangeApplyID).
+func (r *CDCReader) StampsApplyIdentity() bool { return true }
+
+var _ ir.ApplyIdentityProvider = (*CDCReader)(nil)
 
 // SetCDCScopePredicate implements [ir.CDCScopePredicateSetter]: the
 // pipeline hands this reader the sync's effective table scope so

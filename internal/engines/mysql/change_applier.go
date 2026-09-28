@@ -1342,6 +1342,14 @@ func (a *ChangeApplier) applyOneImpl(ctx context.Context, streamID string, c ir.
 	if !skipped {
 		pending.Add(decision.Marks)
 	}
+	if writePosition {
+		// The position is written only OUTSIDE a source transaction here (a
+		// change inside one defers it to its TxCommit), so it passes every
+		// change applied so far — each change of a marker-less stream is its
+		// own ADR-0190 transaction, and closes with it (appliershared
+		// commitBatch's rule, on the per-change path).
+		a.marks.CloseOpen()
+	}
 	marks := a.marks.Plan(&pending, writePosition)
 	if err := a.execApplyMarksTx(ctx, tx, marks); err != nil {
 		_ = tx.Rollback()

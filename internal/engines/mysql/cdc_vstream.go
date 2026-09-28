@@ -281,6 +281,11 @@ type vstreamCDCReader struct {
 	// every ir.Change.
 	currentVgtid []shardGtid
 
+	// tx is the ADR-0190 transaction bookkeeping (cdc_vstream_apply_identity.go):
+	// the BEGIN/COMMIT boundaries this reader emits and the identity it stamps
+	// on each row. Dispatch-goroutine-only.
+	tx vstreamTxState
+
 	// mu guards err and streamStarted. The streaming goroutine writes err;
 	// callers read via Err after the channel closes.
 	mu  sync.Mutex
@@ -1044,6 +1049,7 @@ func (r *vstreamCDCReader) StreamChanges(ctx context.Context, from ir.Position) 
 	}
 
 	r.currentVgtid = startPos
+	r.tx.copying = copyingFrom(startPos)
 
 	req, err := r.buildVStreamRequest(startPos)
 	if err != nil {
@@ -1564,9 +1570,37 @@ func (r *vstreamCDCReader) dispatch(ctx context.Context, ev *binlogdata.VEvent, 
 		// suppress statement ones.
 		return r.statementDMLRefusal(ev)
 
-	case binlogdata.VEventType_BEGIN,
-		binlogdata.VEventType_COMMIT,
-		binlogdata.VEventType_HEARTBEAT,
+	case binlogdata.VEventType_BEGIN:
+		// ADR-0190 phase 4: the shard transaction's boundaries reach the
+		// applier (source-transaction cohesion, the TxCommit resume point)
+		// and its rows carry the identity vstreamTxState stamps. TxBegin
+		// carries the pre-transaction position, as the rows do.
+		r.tx.begin(ctx, ev, r.currentVgtid)
+		pos, err := r.positionFor()
+		if err != nil {
+			return err
+		}
+		return r.send(ctx, out, ir.TxBegin{Position: pos, CommitTime: vstreamEventCommitTime(ev)})
+
+	case binlogdata.VEventType_COMMIT:
+		// The shard's VGTID event precedes its COMMIT, so this is the
+		// post-transaction position — the resume point past it.
+		r.tx.commit()
+		pos, err := r.positionFor()
+		if err != nil {
+			return err
+		}
+		return r.send(ctx, out, ir.TxCommit{Position: pos, CommitTime: vstreamEventCommitTime(ev)})
+
+	case binlogdata.VEventType_COPY_COMPLETED:
+		// The stream-wide COPY_COMPLETED (no keyspace, no shard) ends the
+		// COPY: transactions after it are source transactions.
+		if ev.GetKeyspace() == "" && ev.GetShard() == "" {
+			r.tx.copying = false
+		}
+		return nil
+
+	case binlogdata.VEventType_HEARTBEAT,
 		binlogdata.VEventType_GTID,
 		binlogdata.VEventType_OTHER,
 		binlogdata.VEventType_VERSION,
@@ -1896,6 +1930,7 @@ func (r *vstreamCDCReader) dispatchRow(ctx context.Context, ev *binlogdata.VEven
 				Table:      tableName,
 				Row:        after,
 				CommitTime: commitTime,
+				ApplyID:    r.tx.next(tableName),
 			}); err != nil {
 				return err
 			}
@@ -1907,6 +1942,7 @@ func (r *vstreamCDCReader) dispatchRow(ctx context.Context, ev *binlogdata.VEven
 				Before:     before,
 				After:      after,
 				CommitTime: commitTime,
+				ApplyID:    r.tx.next(tableName),
 			}); err != nil {
 				return err
 			}
@@ -1917,6 +1953,7 @@ func (r *vstreamCDCReader) dispatchRow(ctx context.Context, ev *binlogdata.VEven
 				Table:      tableName,
 				Before:     before,
 				CommitTime: commitTime,
+				ApplyID:    r.tx.next(tableName),
 			}); err != nil {
 				return err
 			}
@@ -2713,6 +2750,8 @@ func (r *vstreamCDCReader) startPump(
 ) {
 	done := make(chan struct{})
 	r.pumpDone = done
+	// A (re)opened stream starts at a transaction boundary.
+	r.tx.reset()
 	go func() {
 		defer close(done)
 		r.pump(ctx, cancel, tabletType, stream, out)
