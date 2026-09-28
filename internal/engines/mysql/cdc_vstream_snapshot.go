@@ -2584,7 +2584,9 @@ func (s *vstreamSnapshotStream) dispatchCDCEvent(ctx context.Context, ev *binlog
 	case binlogdata.VEventType_BEGIN:
 		// ADR-0190 phase 4 — the mirror of [vstreamCDCReader.dispatch]'s
 		// BEGIN / COMMIT arms (see there).
-		s.tx.begin(ctx, ev, s.currentVgtid)
+		if !s.tx.begin(ctx, ev, s.currentVgtid) {
+			return nil
+		}
 		pos, err := s.positionFor()
 		if err != nil {
 			return err
@@ -2592,7 +2594,9 @@ func (s *vstreamSnapshotStream) dispatchCDCEvent(ctx context.Context, ev *binlog
 		return s.send(ctx, out, ir.TxBegin{Position: pos, CommitTime: vstreamEventCommitTime(ev)})
 
 	case binlogdata.VEventType_COMMIT:
-		s.tx.commit()
+		if !s.tx.commit() {
+			return nil
+		}
 		pos, err := s.positionFor()
 		if err != nil {
 			return err

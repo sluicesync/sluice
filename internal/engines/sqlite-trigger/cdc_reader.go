@@ -617,7 +617,7 @@ func (r *CDCReader) poll(ctx context.Context, lastSeen int64) (events []ir.Chang
 		if rc.id > newLast {
 			newLast = rc.id
 		}
-		ev, err := r.buildChange(rc.id, rc.op, rc.tbl, rc.before, rc.after, commitTime(rc.capturedAt))
+		ev, err := r.buildChange(rc.id, rc.op, rc.tbl, rc.before, rc.after, rc.capturedAt)
 		if err != nil {
 			return nil, lastSeen, err
 		}
@@ -632,14 +632,19 @@ func (r *CDCReader) poll(ctx context.Context, lastSeen int64) (events []ir.Chang
 
 // buildChange decodes one change-log row into the appropriate [ir.Change],
 // reconstructing the faithful before/after images via the shared decoder.
-func (r *CDCReader) buildChange(id int64, op, tbl string, beforeJSON, afterJSON sql.NullString, ct time.Time) (ir.Change, error) {
+func (r *CDCReader) buildChange(id int64, op, tbl string, beforeJSON, afterJSON, capturedAt sql.NullString) (ir.Change, error) {
+	ct := commitTime(capturedAt)
 	pos, err := encodePos(sqliteTriggerPos{LastID: id})
 	if err != nil {
 		return nil, fmt.Errorf("encode position (id=%d): %w", id, err)
 	}
 	// ADR-0190 phase 5: the change-log id names the change (the D1 sibling
-	// shares this reader and its position codec's engine name).
-	applyID := triggercdc.ChangeApplyID(EngineName, id)
+	// shares this reader and its position codec's engine name), stamped with
+	// captured_at exactly as stored so a lowered sqlite_sequence cannot
+	// re-issue a name an old mark still holds (triggercdc.ChangeApplyID). A
+	// NULL captured_at (hand-edited log) yields no identity, never a
+	// repeatable one.
+	applyID := triggercdc.ChangeApplyID(EngineName, id, capturedAt.String)
 	var before, after ir.Row
 	if beforeJSON.Valid {
 		if before, err = r.decodeImage(tbl, beforeJSON.String, id); err != nil {

@@ -10,7 +10,8 @@ import (
 )
 
 // ChangeApplyID is the ADR-0190 identity of the change-log row id (phase 5):
-// each captured change is its OWN transaction, `<engine>:<id>`, ordinal 1.
+// each captured change is its OWN transaction, `<engine>:<id>:<stamp>`,
+// ordinal 1 (the stamp is explained below).
 //
 // # What the change log gives, and why this shape
 //
@@ -41,6 +42,46 @@ import (
 //     marker-less boundary closes the change before it, deleting its marks.
 //
 // The engine prefix keeps one source's ids from ever naming another's.
-func ChangeApplyID(engine string, id int64) ir.ApplyID {
-	return ir.ApplyID{TxID: engine + ":" + strconv.FormatInt(id, 10), Seq: 1}
+//
+// # Why the id alone is not enough: the stamp
+//
+// A mark is only as good as the promise that its TxID never names two
+// different changes, and the change-log id breaks that promise the moment its
+// sequence is reset. That happens by operator action, not by accident: the
+// SQLite / D1 watermark refusal once told the operator to set the sequence
+// "to the watermark or higher", and exactly the watermark W re-issues W+1;
+// on pgtrigger an `ALTER SEQUENCE … RESTART` or a teardown / re-setup is
+// undetectable by the gap-free guard. A mark left by the change that held id
+// W+1 before the reset would then match the NEW W+1 — same TxID, same
+// ordinal — and on a keyless table, where the digest tripwire agrees on
+// identical content and no key collision is loud, the new change would be
+// skipped at exit 0.
+//
+// So the TxID also carries a stamp: a value the change log PERSISTS with the
+// row (so every re-delivery of the same change yields it byte-identically and
+// the crash suites still converge) and that a later capture cannot repeat.
+// The engines supply it:
+//
+//   - pgtrigger: the capturing transaction's `pg_current_xact_id()` (the
+//     `txid` column) — 64-bit and epoch-extended, so it never wraps and is
+//     never reissued within a cluster, and a sequence reset does not touch it;
+//   - SQLite / D1: the row's `captured_at` TEXT exactly as stored
+//     (millisecond wall clock). A reset change is captured after an
+//     operator's intervention, so it cannot share the millisecond of the
+//     change it collides with.
+//
+// UNVERIFIED PREMISE (named, not tested): the SQLite / D1 stamp assumes the
+// source's wall clock does not step back onto the exact millisecond of the
+// marked change across the operator's reset; the pgtrigger stamp assumes the
+// source is the same cluster (a restore from a physical backup rewinds the
+// txid counter). Either failure needs a reset AND a coincidence on top of it.
+//
+// An empty stamp returns the zero ApplyID — no mark, no skip, the pre-ADR
+// behaviour — rather than an identity that could repeat. (captured_at is
+// NOT NULL, so that is only a defence against a hand-edited change log.)
+func ChangeApplyID(engine string, id int64, stamp string) ir.ApplyID {
+	if stamp == "" {
+		return ir.ApplyID{}
+	}
+	return ir.ApplyID{TxID: engine + ":" + strconv.FormatInt(id, 10) + ":" + stamp, Seq: 1}
 }

@@ -743,6 +743,11 @@ func (r *CDCReader) poll(ctx context.Context, lastSeen int64) (pollBatch, error)
 		}
 		_ = pkRow // §2: pk_jsonb is part of before_jsonb / after_jsonb already
 
+		// ADR-0190 phase 5: the change-log id names the change, stamped with
+		// the capturing transaction's txid so a restarted id sequence cannot
+		// re-issue a name an old mark still holds (triggercdc.ChangeApplyID).
+		applyID := triggercdc.ChangeApplyID(EngineName, id, strconv.FormatInt(txid, 10))
+
 		var beforeRow, afterRow ir.Row
 		if beforeJSON.Valid {
 			beforeRow, err = decodeJSONBRow(beforeJSON.String)
@@ -759,7 +764,7 @@ func (r *CDCReader) poll(ctx context.Context, lastSeen int64) (pollBatch, error)
 
 		switch op {
 		case "I":
-			b.events = append(b.events, ir.Insert{Position: pos, Schema: schema, Table: table, Row: afterRow, CommitTime: commitTime, ApplyID: triggercdc.ChangeApplyID(EngineName, id)})
+			b.events = append(b.events, ir.Insert{Position: pos, Schema: schema, Table: table, Row: afterRow, CommitTime: commitTime, ApplyID: applyID})
 		case "U":
 			// `before`/`after` completeness is a deliberate
 			// capture-payload mode choice (ADR-0068), NOT a REPLICA
@@ -774,7 +779,7 @@ func (r *CDCReader) poll(ctx context.Context, lastSeen int64) (pollBatch, error)
 			// the applier builds its WHERE from `before` and SET from
 			// `after` — both correct and idempotent for any of the
 			// modes, with no reader/applier code change.
-			b.events = append(b.events, ir.Update{Position: pos, Schema: schema, Table: table, Before: beforeRow, After: afterRow, CommitTime: commitTime, ApplyID: triggercdc.ChangeApplyID(EngineName, id)})
+			b.events = append(b.events, ir.Update{Position: pos, Schema: schema, Table: table, Before: beforeRow, After: afterRow, CommitTime: commitTime, ApplyID: applyID})
 		case "D":
 			// Delete events carry only OLD; the applier's PK-only
 			// path uses Before to identify the row.
@@ -785,19 +790,15 @@ func (r *CDCReader) poll(ctx context.Context, lastSeen int64) (pollBatch, error)
 				// is correct.
 				return pollBatch{}, fmt.Errorf("delete event id=%d has NULL before_jsonb", id)
 			}
-			b.events = append(b.events, ir.Delete{Position: pos, Schema: schema, Table: table, Before: beforeRow, CommitTime: commitTime, ApplyID: triggercdc.ChangeApplyID(EngineName, id)})
+			b.events = append(b.events, ir.Delete{Position: pos, Schema: schema, Table: table, Before: beforeRow, CommitTime: commitTime, ApplyID: applyID})
 		default:
 			return pollBatch{}, fmt.Errorf("unknown op %q at id=%d", op, id)
 		}
+		// The watermark rides the bigserial id alone; txid is consumed above
+		// only as the apply-identity stamp (the settled-ceiling arm consumes
+		// it inside the SQL — [pollQuery] / [settledCeilingSQL]). committed
+		// is the sync-lag commit timestamp (roadmap item 45).
 		b.lastID = id
-		// txid is scanned (the SELECT projects it for schema-shape
-		// stability with the trigger's audit table) but not consumed in
-		// Go: the watermark rides the bigserial id alone, and the
-		// settled-ceiling arm consumes txid inside the SQL (see
-		// [pollQuery] / [settledCeilingSQL]). It becomes load-bearing in
-		// Go if/when transactional batching lands. committed is consumed
-		// above as the sync-lag commit timestamp (roadmap item 45).
-		_ = txid
 	}
 	if err := rows.Err(); err != nil {
 		return pollBatch{}, fmt.Errorf("iter rows: %w", err)

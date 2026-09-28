@@ -9,6 +9,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -479,15 +480,18 @@ func pgTriggerCrashSource(dsn string) crashSource {
 			t.Fatalf("open source: %v", err)
 		}
 		defer func() { _ = db.Close() }()
-		var id sql.NullInt64
-		if err := db.QueryRow(q, args...).Scan(&id); err != nil {
+		// The identity is `<engine>:<id>:<txid>` (triggercdc.ChangeApplyID):
+		// read both from the change log itself, not from the reader.
+		var id, txid sql.NullInt64
+		if err := db.QueryRow(q, args...).Scan(&id, &txid); err != nil && !errors.Is(err, sql.ErrNoRows) {
 			t.Fatalf("%s: %v", q, err)
 		}
 		if !id.Valid {
 			return ""
 		}
-		return fmt.Sprintf("%s:%d", pgtrigger.EngineName, id.Int64)
+		return fmt.Sprintf("%s:%d:%d", pgtrigger.EngineName, id.Int64, txid.Int64)
 	}
+	const logRow = `SELECT id, txid FROM public.` + pgtrigger.ChangeLogTable
 	src.markerless = true
 	src.positionOrdinal = func(t *testing.T, token string) int64 {
 		t.Helper()
@@ -500,10 +504,10 @@ func pgTriggerCrashSource(dsn string) crashSource {
 		return p.LastID
 	}
 	src.firstTxAfter = func(t *testing.T, token string) string {
-		return changeLogID(t, `SELECT min(id) FROM public.`+pgtrigger.ChangeLogTable+` WHERE id > $1`, src.positionOrdinal(t, token))
+		return changeLogID(t, logRow+` WHERE id > $1 ORDER BY id LIMIT 1`, src.positionOrdinal(t, token))
 	}
 	src.lastTxID = func(t *testing.T) string {
-		return changeLogID(t, `SELECT max(id) FROM public.`+pgtrigger.ChangeLogTable)
+		return changeLogID(t, logRow+` ORDER BY id DESC LIMIT 1`)
 	}
 	return src
 }

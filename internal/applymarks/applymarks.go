@@ -88,6 +88,11 @@ const UnavailableMarker = "APPLY-MARKS-UNAVAILABLE"
 // B), so such a mark means the position moved behind it — the 2026-09-28
 // SchemaSnapshot regression was one way — and it is not evidence: the change
 // applies (a loud collision at worst, never a silent skip).
+//
+// On a SHARDED VStream source it is EXPECTED after a crash, not a defect: a
+// restart resumes every shard at once and may deliver another shard's
+// transaction before the interrupted one, so that one's marks are set aside
+// here and exactly-once across a crash is best-effort there (ADR-0190 phase 4).
 const UntrustedMarker = "APPLY-MARK-UNTRUSTED"
 
 // Mark is one row of the sluice_cdc_apply_marks control table: the last
@@ -781,7 +786,9 @@ func (t *Tracker) warnUntrusted(m Mark, first *string) {
 		"after the persisted position, so the position moved behind it and the mark is not evidence. The change is "+
 		"APPLIED, not skipped: nothing is skipped silently, but the re-apply is not always loud — a unique collision stops "+
 		"the stream, while on a keyless table it can add a duplicate row (ADR-0089 at-least-once), so compare that table "+
-		"against the source. Report this with the log around it (ADR-0190 amendment B)",
+		"against the source. On a sharded Vitess / PlanetScale keyspace this is expected after a crash (a restart may "+
+		"deliver another shard's transaction first); on any other source report it with the log around it (ADR-0190 "+
+		"amendment B)",
 		slog.String("stream_id", t.streamID), slog.String("mark_tx_id", m.TxID),
 		slog.String("first_tx_id", firstTx), slog.String("table", m.Table))
 }

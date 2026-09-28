@@ -102,10 +102,16 @@ func verifyChangeLogWatermark(ctx context.Context, exec executor, driver string,
 		)
 	}
 	if st.floor < watermark {
+		// The remedy says STRICTLY above although floor == watermark passes
+		// this check: seq = W makes the next id W+1, visible to the poll, but
+		// W+1 may be exactly the change a crash interrupted, whose ADR-0190
+		// apply mark still names it. The mark's captured_at stamp keeps the
+		// re-issued id from matching (triggercdc.ChangeApplyID); the remedy
+		// should not lean on that.
 		return sluicecode.Wrap(
 			sluicecode.CodeCDCChangeLogIDReuse,
 			"Restore the sequence above every id the stream has consumed: `UPDATE sqlite_sequence SET seq = "+
-				"<the stream's watermark or higher> WHERE name = '"+ChangeLogTable+"'`, then restart the "+
+				"<a value strictly above the stream's watermark — the highest id the log ever issued, if you know it> WHERE name = '"+ChangeLogTable+"'`, then restart the "+
 				"stream. If the watermark is not trustworthy, re-cold-start the sync instead.",
 			fmt.Errorf(
 				"%s: the %q change log can re-issue ids the stream has already consumed: the next id will be "+

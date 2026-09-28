@@ -151,19 +151,39 @@ func TestVStream_NoIdentityDuringCopyOrInterleaving(t *testing.T) {
 		"BEGIN", "ir.Insert vstream:main/80-:MySQL56/b:1-9#1", "COMMIT",
 	})
 
-	// Interleaved: a second BEGIN before the first COMMIT.
+	// Interleaved: a second BEGIN before the first COMMIT, then both groups
+	// finish. From the nested BEGIN until nothing is open, no row carries an
+	// identity, and the emission stays balanced — ONE bracket spanning both
+	// groups, closed by the COMMIT that leaves nothing open — on both
+	// dispatchers. The trailing un-interleaved transaction proves the state
+	// recovers.
+	interleaved := []*binlogdata.VEvent{
+		evs[0], evs[1], evs[2], evs[3], evs[7], evs[8], evs[4], evs[5], evs[6], evs[9], evs[10],
+		evs[7], evs[8], evs[9], evs[10],
+	}
+	wantInterleaved := []string{
+		"BEGIN", "ir.Insert vstream:main/-80:MySQL56/a:1-5#1", "ir.Insert #0", "ir.Insert #0", "COMMIT",
+		"BEGIN", "ir.Insert vstream:main/80-:MySQL56/b:1-10#1", "COMMIT",
+	}
 	r = &vstreamCDCReader{keyspace: "main", fields: map[string][]*query.Field{}, currentVgtid: vstreamTwoShardStart()}
 	out = make(chan ir.Change, 32)
-	interleaved := []*binlogdata.VEvent{evs[0], evs[1], evs[2], evs[3], evs[7], evs[8], evs[4]}
 	for _, ev := range interleaved {
 		if err := r.dispatch(ctx, ev, out); err != nil {
 			t.Fatal(err)
 		}
 	}
 	close(out)
-	assertShape(t, "interleaved", vstreamEmitted(t, drainChannel(out)), []string{
-		"BEGIN", "ir.Insert vstream:main/-80:MySQL56/a:1-5#1", "BEGIN", "ir.Insert #0", "ir.Insert #0",
-	})
+	assertShape(t, "interleaved (tail reader)", vstreamEmitted(t, drainChannel(out)), wantInterleaved)
+
+	snap := &vstreamSnapshotStream{keyspace: "main", fields: map[string][]*query.Field{}, currentVgtid: vstreamTwoShardStart()}
+	out = make(chan ir.Change, 32)
+	for _, ev := range interleaved {
+		if err := snap.dispatchCDCEvent(ctx, ev, out); err != nil {
+			t.Fatal(err)
+		}
+	}
+	close(out)
+	assertShape(t, "interleaved (snapshot stream)", vstreamEmitted(t, drainChannel(out)), wantInterleaved)
 }
 
 func TestVStreamTxIdentity(t *testing.T) {

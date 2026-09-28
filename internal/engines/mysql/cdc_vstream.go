@@ -1574,8 +1574,11 @@ func (r *vstreamCDCReader) dispatch(ctx context.Context, ev *binlogdata.VEvent, 
 		// ADR-0190 phase 4: the shard transaction's boundaries reach the
 		// applier (source-transaction cohesion, the TxCommit resume point)
 		// and its rows carry the identity vstreamTxState stamps. TxBegin
-		// carries the pre-transaction position, as the rows do.
-		r.tx.begin(ctx, ev, r.currentVgtid)
+		// carries the pre-transaction position, as the rows do. An
+		// interleaved BEGIN is not emitted (vstreamTxState.begin).
+		if !r.tx.begin(ctx, ev, r.currentVgtid) {
+			return nil
+		}
 		pos, err := r.positionFor()
 		if err != nil {
 			return err
@@ -1584,8 +1587,11 @@ func (r *vstreamCDCReader) dispatch(ctx context.Context, ev *binlogdata.VEvent, 
 
 	case binlogdata.VEventType_COMMIT:
 		// The shard's VGTID event precedes its COMMIT, so this is the
-		// post-transaction position — the resume point past it.
-		r.tx.commit()
+		// post-transaction position — the resume point past it. Only the
+		// COMMIT that leaves nothing open is emitted.
+		if !r.tx.commit() {
+			return nil
+		}
 		pos, err := r.positionFor()
 		if err != nil {
 			return err

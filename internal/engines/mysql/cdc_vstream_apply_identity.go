@@ -40,8 +40,9 @@ import (
 //     would share one "transaction" — and the rows are a table scan, not a
 //     source transaction;
 //   - a shard component that is not a GTID set (empty, "current");
-//   - rows of a transaction whose BEGIN arrived while another was open
-//     (interleaved groups break the premise above; WARNed once).
+//   - every row from a BEGIN that arrives while another transaction is open
+//     until the last open one commits (interleaved groups break the premise
+//     above — an UNVERIFIED PREMISE, see vstreamTxState.begin; WARNed once).
 //
 // Both VStream dispatchers — the tail reader and the snapshot stream's
 // post-COPY pump — go through vstreamTxState, so an original delivery on the
@@ -64,11 +65,12 @@ func vstreamTxIdentity(vgtid []shardGtid, keyspace, shard string) string {
 }
 
 // vstreamTxState is one VStream dispatcher's transaction bookkeeping: the
-// ADR-0190 stamper and whether a shard transaction is open. Owned by the
-// single dispatch goroutine.
+// ADR-0190 stamper and how many shard transactions are open (more than one
+// only when vtgate interleaved them — see begin). Owned by the single
+// dispatch goroutine.
 type vstreamTxState struct {
 	seq     applymarks.Sequencer
-	open    bool
+	depth   int
 	warned  bool
 	copying bool
 }
@@ -76,37 +78,66 @@ type vstreamTxState struct {
 // reset closes any transaction — a stream (re)start re-delivers from a
 // boundary, so nothing opened before it continues.
 func (s *vstreamTxState) reset() {
-	s.open = false
+	s.depth = 0
 	s.seq.End()
 }
 
-// begin opens the shard transaction ev starts.
-func (s *vstreamTxState) begin(ctx context.Context, ev *binlogdata.VEvent, vgtid []shardGtid) {
-	if s.open {
-		// A BEGIN inside an open transaction: vtgate interleaved two shard
-		// transactions, and the ordinal of neither is then guaranteed to
-		// repeat on a re-delivery. Neither gets an identity.
+// begin opens the shard transaction ev starts, and reports whether the
+// dispatcher emits its [ir.TxBegin].
+//
+// UNVERIFIED PREMISE: vtgate does not interleave shard transactions — each
+// arrives as one contiguous BEGIN … COMMIT group. The multi-shard premise
+// test (TestVStream_ApplyIdentity_StableAcrossMidStreamResume) saw no
+// interleave across 15 transactions on two shards, which is evidence, not a
+// guarantee across vtgate versions. So a BEGIN inside an open transaction is
+// handled rather than assumed away:
+//
+//   - the rest of the stream until every open transaction commits carries NO
+//     identity (the ordinal of neither is guaranteed to repeat on a
+//     re-delivery), so nothing in it can ever be skipped — the pre-ADR
+//     replay;
+//   - the emission stays balanced: the nested BEGIN and all but the last
+//     COMMIT are not emitted, so the applier sees ONE source transaction
+//     spanning the interleaved groups and persists no position inside it —
+//     the conservative bracket, where the alternative (a TxCommit while
+//     another group is still open) would hand it a boundary that is not one.
+//
+// It WARNs rather than refuses, deliberately: the interleaved rows lose only
+// their exactly-once optimisation and apply exactly as they did before
+// ADR-0190, so no value is at risk, and a refusal would turn a shape the
+// stream handled correctly into an outage.
+func (s *vstreamTxState) begin(ctx context.Context, ev *binlogdata.VEvent, vgtid []shardGtid) bool {
+	s.depth++
+	if s.depth > 1 {
 		if !s.warned {
 			s.warned = true
 			slog.WarnContext(ctx, "mysql/vstream: two shard transactions arrived interleaved; their changes carry no "+
-				"ADR-0190 apply identity (they replay as before, never skipped)",
+				"ADR-0190 apply identity (they replay as before, never skipped), and they apply as one source "+
+				"transaction",
 				slog.String("keyspace", ev.GetKeyspace()), slog.String("shard", ev.GetShard()))
 		}
 		s.seq.Begin("")
-		return
+		return false
 	}
-	s.open = true
 	if s.copying {
 		s.seq.Begin("")
-		return
+		return true
 	}
 	s.seq.Begin(vstreamTxIdentity(vgtid, ev.GetKeyspace(), ev.GetShard()))
+	return true
 }
 
-// commit closes the open transaction.
-func (s *vstreamTxState) commit() {
-	s.open = false
+// commit closes a transaction, and reports whether the dispatcher emits its
+// [ir.TxCommit]: only the one that leaves no transaction open (see begin). A
+// COMMIT with nothing open is emitted as it always was.
+func (s *vstreamTxState) commit() bool {
+	if s.depth > 1 {
+		s.depth--
+		return false
+	}
+	s.depth = 0
 	s.seq.End()
+	return true
 }
 
 // next stamps the transaction's next row change to table.
