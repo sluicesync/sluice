@@ -29,7 +29,7 @@ import (
 // clock whatever the session zone:
 //
 //	column                   datetime / ISO-Z shape      date shape             time shape
-//	TIMESTAMP (zoned)        CURRENT_TIMESTAMP(p)        —                      —
+//	TIMESTAMP (any ir.Timestamp) CURRENT_TIMESTAMP(p)        —                      —
 //	DATETIME (naive)         UTC_TIMESTAMP()             UTC midnight           —
 //	DATE                     UTC_DATE()                  UTC_DATE()             —
 //	TIME                     —                           —                      UTC_TIME()
@@ -55,13 +55,15 @@ func (m mysqlEmitter) sqliteNowDefaultMySQL(d ir.DefaultValue, t ir.Type) (body,
 	noFaithful := fmt.Sprintf("a SQLite current-instant DEFAULT has no faithful spelling on a %T column", ir.UnwrapDomain(t))
 	switch tv := ir.UnwrapDomain(t).(type) {
 	case ir.Timestamp:
-		if tv.WithTimeZone {
-			if dateTimeLike {
-				return matchTimestampDefaultPrecision("CURRENT_TIMESTAMP", t), "", true
-			}
-			return "", noFaithful, true
+		// Every ir.Timestamp, naive or not, is emitted as MySQL TIMESTAMP
+		// (emitColumnType), which stores an instant converted from the
+		// session zone — so CURRENT_TIMESTAMP is the correct default, and
+		// UTC_TIMESTAMP() would be converted from the session zone a second
+		// time (the pre-tag review measured the double shift under +09:00).
+		if dateTimeLike {
+			return matchTimestampDefaultPrecision("CURRENT_TIMESTAMP", t), "", true
 		}
-		body = sqliteNowNaiveDateTimeMySQL(shape)
+		return "", noFaithful, true
 	case ir.DateTime:
 		body = sqliteNowNaiveDateTimeMySQL(shape)
 	case ir.Date:

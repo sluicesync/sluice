@@ -402,10 +402,15 @@ var utcNamedZones = map[string]bool{
 // injected `time_zone`, would race it in the driver's map order).
 func refuseNonUTCSessionTimeZone(params map[string]string) error {
 	for key, val := range params {
-		name := strings.ToLower(key)
-		name = strings.TrimPrefix(name, "@@")
-		name = strings.TrimPrefix(name, "session.")
-		if name != "time_zone" || sessionTimeZoneIsUTC(val) {
+		name, global := timeZoneParamScope(key)
+		if name != "time_zone" {
+			continue
+		}
+		if global {
+			return fmt.Errorf("mysql: DSN-TIME-ZONE-NOT-UTC: refusing the DSN parameter %s=%s: it would SET the "+
+				"server-wide GLOBAL time_zone for every client, not this session's; remove it from the DSN", key, val)
+		}
+		if sessionTimeZoneIsUTC(val) {
 			continue
 		}
 		return fmt.Errorf("mysql: DSN-TIME-ZONE-NOT-UTC: refusing the DSN parameter %s=%s: sluice reads and writes "+
@@ -415,6 +420,43 @@ func refuseNonUTCSessionTimeZone(params map[string]string) error {
 			key, val, key)
 	}
 	return nil
+}
+
+// timeZoneParamScope normalises a DSN parameter KEY the way MySQL reads
+// the left-hand side of the `SET <key> = <val>` the driver sends it as
+// (the driver passes the key raw — never URL-decoded, never quoted):
+// case-insensitive, an optional `@@`, and an optional scope written
+// either as a `session.` / `local.` / `global.` prefix or as a leading
+// `SESSION` / `LOCAL` / `GLOBAL` word. It returns the bare variable name
+// and whether the scope was GLOBAL. The mydumper SET parser's
+// isTimeZoneVariable is the sibling reading the same grammar.
+func timeZoneParamScope(key string) (name string, global bool) {
+	fields := strings.Fields(strings.ToLower(key))
+	if len(fields) == 0 {
+		return "", false
+	}
+	if len(fields) == 2 {
+		switch fields[0] {
+		case "session", "local":
+		case "global":
+			global = true
+		default:
+			return "", false
+		}
+		fields = fields[1:]
+	}
+	if len(fields) != 1 {
+		return "", false
+	}
+	name = strings.TrimPrefix(fields[0], "@@")
+	for _, scope := range []string{"session.", "local.", "global."} {
+		if strings.HasPrefix(name, scope) {
+			name = strings.TrimPrefix(name, scope)
+			global = global || scope == "global."
+			break
+		}
+	}
+	return name, global
 }
 
 // sessionTimeZoneIsUTC reports whether a time_zone parameter value, as the
@@ -897,7 +939,7 @@ func openDB(ctx context.Context, cfg *mysql.Config, sqlMode *string) (*sql.DB, e
 	if err != nil {
 		return nil, fmt.Errorf("mysql: build connector: %w", err)
 	}
-	db := sql.OpenDB(connector)
+	db := sql.OpenDB(utcSessionConnector{connector})
 
 	if err := db.PingContext(ctx); err != nil {
 		_ = db.Close()

@@ -22,8 +22,17 @@ import (
 // holding session-clock SQL must earn an entry here or use [utcNowSQL].
 var utcGateExemptFiles = map[string]string{
 	"postgres/expr_translate.go":  "translates a MySQL source expression (NOW()/CURRENT_TIMESTAMP(N)) into the user's own generated/DEFAULT/CHECK expression",
-	"postgres/ddl_emit.go":        "the literal is WARN prose describing a source column's ON UPDATE CURRENT_TIMESTAMP, not SQL",
 	"postgres/reserved_idents.go": "a reserved-keyword list for identifier quoting, not SQL",
+}
+
+// utcGateExemptLiterals exempts single literals, not files, where the file
+// also carries SQL the gate must keep policing: key "<pkg>/<file>", value
+// a substring identifying the one literal. Each must still match a literal
+// (a stale entry fails).
+var utcGateExemptLiterals = map[string]string{
+	// WARN prose naming a MySQL source column's ON UPDATE CURRENT_TIMESTAMP;
+	// the rest of ddl_emit.go (every DEFAULT it renders) stays in scope.
+	"postgres/ddl_emit.go": "source column re-stamps itself on UPDATE (ON UPDATE CURRENT_TIMESTAMP)",
 }
 
 var (
@@ -67,6 +76,7 @@ func TestControlTableSQL_WritesUTCIntoNaiveTimestamps(t *testing.T) {
 	var (
 		filesScanned, tableDDLs, utcRefs int
 		violations                       []string
+		literalExemptUsed                = map[string]bool{}
 	)
 	for _, dir := range []string{".", filepath.Join("..", "pgtrigger")} {
 		entries, err := os.ReadDir(dir)
@@ -104,6 +114,10 @@ func TestControlTableSQL_WritesUTCIntoNaiveTimestamps(t *testing.T) {
 				if _, exempt := utcGateExemptFiles[rel]; exempt {
 					return true
 				}
+				if lit, ok := utcGateExemptLiterals[rel]; ok && strings.Contains(s, lit) {
+					literalExemptUsed[rel] = true
+					return true
+				}
 				if m := sessionClockSQL.FindString(s); m != "" {
 					violations = append(violations, fset.Position(lit.Pos()).String()+": "+m)
 				}
@@ -123,6 +137,11 @@ func TestControlTableSQL_WritesUTCIntoNaiveTimestamps(t *testing.T) {
 	}
 	for _, v := range violations {
 		t.Errorf("%s — writes the SESSION clock; a sluice-owned naive TIMESTAMP must be written with utcNowSQL (GC-39 item 2), or the file must earn a utcGateExemptFiles entry", v)
+	}
+	for rel, lit := range utcGateExemptLiterals {
+		if !literalExemptUsed[rel] {
+			t.Errorf("utcGateExemptLiterals[%s] = %q matches no literal any more — remove the stale exemption", rel, lit)
+		}
 	}
 	for rel := range utcGateExemptFiles {
 		parts := strings.SplitN(rel, "/", 2)

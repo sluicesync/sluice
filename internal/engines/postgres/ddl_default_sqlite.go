@@ -40,14 +40,22 @@ const sqliteSourceDialect = "sqlite"
 // A timestamptz column holds an instant, so a bare now() is already
 // correct whatever the session zone. The text arm reproduces the bytes
 // SQLite would have stored, which is what the migrated rows in that column
-// look like. The epoch shape is zone-free and keeps its numeric form on
-// any column. Every blank cell drops loudly: a DATE default on a time
-// column, say, has no value SQLite would have stored there that a
-// Postgres expression reproduces.
+// look like. The epoch shape is zone-free and keeps its numeric form on a
+// numeric or text column (elsewhere PG would reject it at CREATE TABLE and
+// abort the migration, so it drops). Every blank cell drops loudly: a DATE
+// default on a time column, say, has no value SQLite would have stored
+// there that a Postgres expression reproduces.
 func sqliteNowDefaultPG(shape translate.SQLiteNowShape, t ir.Type) (string, bool) {
 	const utcSecond = "pg_catalog.date_trunc('second', " + utcNowSQL + ")"
 	if shape == translate.SQLiteNowEpoch {
-		return "pg_catalog.floor(extract(epoch from pg_catalog.now()))", true
+		// Only where the number can land: on a temporal (or any other)
+		// column PG rejects the double precision at CREATE TABLE, which
+		// would abort the whole migration instead of dropping one DEFAULT.
+		switch ir.UnwrapDomain(t).(type) {
+		case ir.Integer, ir.Decimal, ir.Float, ir.Text, ir.Varchar, ir.Char:
+			return "pg_catalog.floor(extract(epoch from pg_catalog.now()))", true
+		}
+		return "", false
 	}
 	dateTimeLike := shape == translate.SQLiteNowDateTime || shape == translate.SQLiteNowISOZ
 	switch v := ir.UnwrapDomain(t).(type) {

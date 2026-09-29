@@ -30,6 +30,8 @@ func TestFinishParseDSN_TimeZoneSpellings(t *testing.T) {
 		"time_zone=%27Etc%2FUTC%27",
 		"time_zone='GMT'",
 		"TIME_ZONE='+00:00'",
+		"LOCAL time_zone='+00:00'",
+		"@@local.time_zone=%27UTC%27",
 	}
 	for _, q := range accepted {
 		for name, parse := range map[string]func(string) error{
@@ -65,6 +67,15 @@ func TestFinishParseDSN_TimeZoneSpellings(t *testing.T) {
 		"Time_Zone='+09:00'", // …so every casing reaches the same session variable
 		"@@time_zone='+09:00'",
 		"@@session.time_zone='+09:00'",
+		// The pre-tag review's F1 spellings: scope prefixes and words the
+		// driver sends raw in SET <key>=<val>.
+		"@@local.time_zone='+09:00'",
+		"@@LOCAL.time_zone='+09:00'",
+		"LOCAL time_zone='+09:00'",
+		"SESSION time_zone='+09:00'",
+		// GLOBAL would change the server for every client: refused whatever the value.
+		"@@global.time_zone='+00:00'",
+		"GLOBAL time_zone='UTC'",
 	}
 	for _, q := range refused {
 		for name, parse := range map[string]func(string) error{

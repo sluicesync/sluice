@@ -9,7 +9,9 @@ import (
 	"context"
 	"database/sql"
 	"path/filepath"
+	"slices"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -31,23 +33,39 @@ type sqliteNowCell struct {
 	// "instant" (a zoned column, read as epoch seconds), or a Go layout the
 	// stored TEXT must parse under EXACTLY — SQLite's own text shape.
 	grade string
+	// dropOn names the targets ("postgres", "mysql") where the cell has no
+	// faithful spelling: the migration must still succeed and the column
+	// carry NO default (a row inserted without it holds NULL).
+	dropOn []string
 }
 
 var sqliteNowCells = []sqliteNowCell{
-	{"dt_kw", "DATETIME DEFAULT CURRENT_TIMESTAMP", "ts"},
-	{"dt_fn", "DATETIME DEFAULT (datetime('now'))", "ts"},
-	{"ts_kw", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP", "ts"},
-	{"d_fn", "DATE DEFAULT (date('now'))", "date"},
-	{"d_kw", "DATE DEFAULT CURRENT_DATE", "date"},
-	{"t_kw", "TIME DEFAULT CURRENT_TIME", "time"},
-	{"txt_dt", "TEXT DEFAULT CURRENT_TIMESTAMP", "2006-01-02 15:04:05"},
-	{"txt_isoz", "TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))", "2006-01-02T15:04:05Z"},
-	{"txt_d", "TEXT DEFAULT (date('now'))", "2006-01-02"},
-	{"txt_t", "TEXT DEFAULT (time('now'))", "15:04:05"},
+	{"dt_kw", "DATETIME DEFAULT CURRENT_TIMESTAMP", "ts", nil},
+	{"dt_fn", "DATETIME DEFAULT (datetime('now'))", "ts", nil},
+	{"ts_kw", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP", "ts", nil},
+	{"d_fn", "DATE DEFAULT (date('now'))", "date", nil},
+	{"d_kw", "DATE DEFAULT CURRENT_DATE", "date", nil},
+	{"t_kw", "TIME DEFAULT CURRENT_TIME", "time", nil},
+	{"txt_dt", "TEXT DEFAULT CURRENT_TIMESTAMP", "2006-01-02 15:04:05", nil},
+	{"txt_isoz", "TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))", "2006-01-02T15:04:05Z", nil},
+	{"txt_d", "TEXT DEFAULT (date('now'))", "2006-01-02", nil},
+	{"txt_t", "TEXT DEFAULT (time('now'))", "15:04:05", nil},
 	// --infer-types promotes these by name hint from the seeded row's
 	// values: all-Z values to a zoned timestamp, naive ones to a naive one.
-	{"created_at", "TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))", "instant"},
-	{"updated_at", "TEXT DEFAULT CURRENT_TIMESTAMP", "ts"},
+	{"created_at", "TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))", "instant", nil},
+	{"updated_at", "TEXT DEFAULT CURRENT_TIMESTAMP", "ts", nil},
+	// Pre-tag review additions: other text families, the space strftime
+	// form, the date shape on a DATETIME, the epoch form, and drop cells.
+	{"vc_dt", "VARCHAR(32) DEFAULT CURRENT_TIMESTAMP", "2006-01-02 15:04:05", nil},
+	{"ch_d", "CHAR(10) DEFAULT (date('now'))", "2006-01-02", nil},
+	{"txt_sp", "TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now'))", "2006-01-02 15:04:05", nil},
+	{"dt_d", "DATETIME DEFAULT (date('now'))", "midnight", nil},
+	// The epoch form keeps its pre-GC-39 handling: numeric on Postgres,
+	// dropped on MySQL (strftime is outside the MySQL translator).
+	{"ep", "INTEGER DEFAULT (strftime('%s','now'))", "epoch", []string{"mysql"}},
+	{"dt_ep", "DATETIME DEFAULT (strftime('%s','now'))", "", []string{"postgres", "mysql"}},
+	{"t_d", "TIME DEFAULT CURRENT_DATE", "", []string{"postgres", "mysql"}},
+	{"d_t", "DATE DEFAULT CURRENT_TIME", "", []string{"postgres", "mysql"}},
 }
 
 func seedSQLiteNowDefaults(t *testing.T) string {
@@ -62,7 +80,11 @@ func seedSQLiteNowDefaults(t *testing.T) string {
 	for _, c := range sqliteNowCells {
 		ddl += ", " + c.col + " " + c.decl
 	}
-	for _, s := range []string{ddl + ")", "INSERT INTO ev (id) VALUES (1)"} {
+	// The seed row takes every default except the mismatched-shape cells'
+	// (an epoch in a DATETIME, a date in a TIME…), which the copy would
+	// rightly refuse to decode; those cells grade only the target DEFAULT.
+	const seed = "INSERT INTO ev (id, dt_ep, t_d, d_t) VALUES (1, NULL, NULL, NULL)"
+	for _, s := range []string{ddl + ")", seed} {
 		if _, err := db.ExecContext(context.Background(), s); err != nil {
 			t.Fatalf("seed %q: %v", s, err)
 		}
@@ -157,6 +179,13 @@ func runSQLiteNowMatrix(t *testing.T, engine, driver, target string, zones []str
 			if err := db.QueryRowContext(ctx, valueQuery(c), id).Scan(&got); err != nil {
 				t.Fatalf("read %s: %v", c.col, err)
 			}
+			if slices.Contains(c.dropOn, engine) {
+				if got.Valid {
+					t.Errorf("%s (%s) under %s: stored %q; want NULL — the DEFAULT has no faithful spelling here and must be dropped",
+						c.col, c.decl, zone, got.String)
+				}
+				continue
+			}
 			if !got.Valid {
 				t.Errorf("%s under %s: NULL — the DEFAULT was not carried", c.col, zone)
 				continue
@@ -176,13 +205,40 @@ func gradeSQLiteNowValue(grade, got string, now time.Time, tol time.Duration) st
 		}
 		return ""
 	}
+	// A temporal column's text is graded against an EXACT layout: SQLite
+	// stores whole seconds, so a non-zero fraction is a failure. A MySQL
+	// DATETIME(6)/TIME(6) prints six zero digits for a whole second, which
+	// is the only fraction accepted.
+	wholeSeconds := func(s, layout string) (time.Time, string) {
+		s = strings.TrimSuffix(s, ".000000")
+		v, err := time.Parse(layout, s)
+		if err != nil || v.Format(layout) != s {
+			return time.Time{}, "not an exact whole-second " + layout + " value"
+		}
+		return v, ""
+	}
 	switch grade {
 	case "ts":
-		v, err := time.Parse(time.DateTime, got)
-		if err != nil {
-			return "not a timestamp: " + err.Error()
+		v, msg := wholeSeconds(got, time.DateTime)
+		if msg != "" {
+			return msg
 		}
 		return near(v)
+	case "midnight":
+		v, msg := wholeSeconds(got, time.DateTime)
+		if msg != "" {
+			return msg
+		}
+		if v.Format(time.TimeOnly) != "00:00:00" {
+			return "not a midnight"
+		}
+		return gradeSQLiteNowValue("date", v.Format(time.DateOnly), now, tol)
+	case "epoch":
+		sec, err := strconv.ParseInt(got, 10, 64)
+		if err != nil {
+			return "not an integer epoch: " + err.Error()
+		}
+		return near(time.Unix(sec, 0).UTC())
 	case "instant":
 		sec, err := strconv.ParseFloat(got, 64)
 		if err != nil {
@@ -195,9 +251,9 @@ func gradeSQLiteNowValue(grade, got string, now time.Time, tol time.Duration) st
 		}
 		return ""
 	case "time":
-		v, err := time.Parse(time.TimeOnly, got)
-		if err != nil {
-			return "not a time: " + err.Error()
+		v, msg := wholeSeconds(got, time.TimeOnly)
+		if msg != "" {
+			return msg
 		}
 		d := time.Duration(v.Hour())*time.Hour + time.Duration(v.Minute())*time.Minute + time.Duration(v.Second())*time.Second -
 			(time.Duration(now.Hour())*time.Hour + time.Duration(now.Minute())*time.Minute + time.Duration(now.Second())*time.Second)

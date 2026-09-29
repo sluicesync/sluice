@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/go-sql-driver/mysql"
 )
 
 // TestSessionTimeZone_NonUTCShiftsTimestamp_AndTheDSNDoorRefusesIt binds
@@ -41,10 +43,17 @@ func TestSessionTimeZone_NonUTCShiftsTimestamp_AndTheDSNDoorRefusesIt(t *testing
 		t.Fatalf("parseDSN: %v", err)
 	}
 	cfg.Params["time_zone"] = "'+09:00'"
-	shifted, err := openDB(ctx, cfg, nil)
-	if err != nil {
-		t.Fatalf("openDB under +09:00: %v", err)
+	// The post-connect check (utcSessionConnector) refuses this session —
+	// the independent door, reached here because the parser was bypassed.
+	if _, err := openDB(ctx, cfg, nil); err == nil || !strings.Contains(err.Error(), "DSN-TIME-ZONE-NOT-UTC") {
+		t.Errorf("openDB with a +09:00 session that slipped the DSN parser = %v; want the post-connect DSN-TIME-ZONE-NOT-UTC refusal", err)
 	}
+	// The premise itself: sluice's driver config without that door.
+	rawConnector, err := mysql.NewConnector(cfg)
+	if err != nil {
+		t.Fatalf("connector: %v", err)
+	}
+	shifted := sql.OpenDB(rawConnector)
 	var ts, dt time.Time
 	if err := shifted.QueryRowContext(ctx, "SELECT ts, dt FROM tz_door WHERE id = 1").Scan(&ts, &dt); err != nil {
 		t.Fatalf("read under +09:00: %v", err)
@@ -80,6 +89,49 @@ func TestSessionTimeZone_NonUTCShiftsTimestamp_AndTheDSNDoorRefusesIt(t *testing
 	if _, err := parseDSN(dsn + "&time_zone=%27%2B09%3A00%27"); err == nil || !strings.Contains(err.Error(), "DSN-TIME-ZONE-NOT-UTC") {
 		t.Fatalf("parseDSN with time_zone='+09:00' = %v; want the DSN-TIME-ZONE-NOT-UTC refusal", err)
 	}
+	// The review's F1 race, end to end: a scoped key the parser did not
+	// know used to reach the server beside the injected '+00:00' in random
+	// map order, leaving a fraction of the pool on +09:00. Planted past the
+	// parser, every fresh connection must now either be refused or be UTC.
+	cfg, err = parseDSN(dsn)
+	if err != nil {
+		t.Fatalf("parseDSN: %v", err)
+	}
+	cfg.Params["@@local.time_zone"] = "'+09:00'"
+	connector, err := mysql.NewConnector(stripVStreamParams(cfg))
+	if err != nil {
+		t.Fatalf("connector: %v", err)
+	}
+	pool := sql.OpenDB(utcSessionConnector{connector})
+	pool.SetMaxIdleConns(0) // every Conn below is a fresh physical connection
+	refused := 0
+	for i := 0; i < 30; i++ {
+		c, err := pool.Conn(ctx)
+		if err != nil {
+			if !strings.Contains(err.Error(), "DSN-TIME-ZONE-NOT-UTC") {
+				t.Fatalf("fresh connection %d: %v", i, err)
+			}
+			refused++
+			continue
+		}
+		var zone string
+		if err := c.QueryRowContext(ctx, "SELECT @@session.time_zone").Scan(&zone); err != nil {
+			t.Fatalf("read zone: %v", err)
+		}
+		if !sessionTimeZoneIsUTC(zone) {
+			t.Errorf("fresh connection %d was handed out on session zone %q", i, zone)
+		}
+		_ = c.Close()
+	}
+	_ = pool.Close()
+	if refused == 0 {
+		// Each connection lands on +09:00 with roughly even odds (Go map
+		// order), so zero in 30 means the planted key never reached a
+		// session and this cell graded nothing.
+		t.Error("no fresh connection was refused: the planted @@local.time_zone never reached a session — vacuous cell")
+	}
+	t.Logf("racy-key pool: %d of 30 fresh connections refused, the rest verified UTC", refused)
+
 	for _, spelling := range []string{"", "&time_zone=%27%2B00%3A00%27", "&time_zone=%27-00%3A00%27"} {
 		cfg, err := parseDSN(dsn + spelling)
 		if err != nil {

@@ -627,11 +627,14 @@ func parseFKAction(s string) ir.FKAction {
 // A DefaultExpression tagged "sqlite" is handled by the target writer at
 // CREATE TABLE time. The Postgres writer (D1/SQLite robustness Chunk A +
 // the ADR-0133 translator) translates the portable subset — the "current
-// instant" spellings (datetime('now')/CURRENT_TIMESTAMP → CURRENT_TIMESTAMP,
-// date('now')/CURRENT_DATE, time('now')/CURRENT_TIME) plus the shared
-// SQLite→PG expression allowlist ('a' || 'b', arithmetic, coalesce, …) —
-// and DROPS any other SQLite-only expression (julianday(...),
-// strftime(...), the double-quoted-string misfeature, …) with a LOUD
+// instant" spellings (CURRENT_TIMESTAMP/DATE/TIME, datetime/date/time('now')
+// and the whole-format strftime(…,'now') forms), rendered per target
+// column TYPE on the UTC clock because SQLite's 'now' is UTC and the
+// targets' CURRENT_* keywords are session-zone (GC-39 item 3;
+// translate.ClassifySQLiteNowDefault), plus the shared SQLite→PG
+// expression allowlist ('a' || 'b', arithmetic, coalesce, …) — and DROPS
+// any other SQLite-only expression (julianday(...), other strftime(...)
+// formats, the double-quoted-string misfeature, …) with a LOUD
 // per-column warn naming the table+column — never emitted verbatim (which
 // aborted the whole migration at CREATE TABLE) and never silently dropped.
 // The MySQL target routes the portable subset through the SQLite→MySQL

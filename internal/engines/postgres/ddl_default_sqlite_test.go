@@ -56,7 +56,7 @@ func TestSQLiteNowDefaultPG_ShapeByColumnType(t *testing.T) {
 		want[ty+"/date"] = toChar("YYYY-MM-DD")
 		want[ty+"/time"] = toChar("HH24:MI:SS")
 	}
-	for ty := range types {
+	for _, ty := range []string{"integer", "text", "varchar", "char"} {
 		want[ty+"/epoch"] = epoch
 	}
 	for tyName, ty := range types {

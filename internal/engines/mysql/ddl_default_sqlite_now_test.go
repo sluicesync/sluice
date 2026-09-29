@@ -39,9 +39,13 @@ func TestSQLiteNowDefaultMySQL_ShapeByColumnType(t *testing.T) {
 	dtFmt := "(DATE_FORMAT(UTC_TIMESTAMP(), '%Y-%m-%d %H:%i:%s'))"
 	want := map[string]string{ // "<type>/<shape>" → body; absent = dropped
 		"timestamptz/datetime": "CURRENT_TIMESTAMP(6)", "timestamptz/keyword": "CURRENT_TIMESTAMP(6)",
-		"timestamptz/isoz":   "CURRENT_TIMESTAMP(6)",
-		"timestamp/datetime": "(UTC_TIMESTAMP())", "timestamp/keyword": "(UTC_TIMESTAMP())",
-		"timestamp/isoz": "(UTC_TIMESTAMP())", "timestamp/date": "(CAST(UTC_DATE() AS DATETIME))",
+		"timestamptz/isoz": "CURRENT_TIMESTAMP(6)",
+		// A naive ir.Timestamp still emits MySQL TIMESTAMP (emitColumnType),
+		// an instant column: UTC_TIMESTAMP() there would be converted from
+		// the session zone a second time (pre-tag review F2), and the date
+		// shape has no faithful spelling — dropped.
+		"timestamp/datetime": "CURRENT_TIMESTAMP(6)", "timestamp/keyword": "CURRENT_TIMESTAMP(6)",
+		"timestamp/isoz":    "CURRENT_TIMESTAMP(6)",
 		"datetime/datetime": "(UTC_TIMESTAMP())", "datetime/keyword": "(UTC_TIMESTAMP())",
 		"datetime/isoz": "(UTC_TIMESTAMP())", "datetime/date": "(CAST(UTC_DATE() AS DATETIME))",
 		"date/datetime": "(UTC_DATE())", "date/keyword": "(UTC_DATE())", "date/isoz": "(UTC_DATE())",
@@ -76,7 +80,7 @@ func TestSQLiteNowDefaultMySQL_ShapeByColumnType(t *testing.T) {
 				t.Errorf("%s: %q reads the session-zone clock", key, body)
 			}
 			lbody, llost, _ := legacy.sqliteNowDefaultMySQL(d, ty)
-			if tyName == "timestamptz" && mapped {
+			if (tyName == "timestamptz" || tyName == "timestamp") && mapped {
 				if lbody != exp {
 					t.Errorf("%s on a pre-8.0.13 target: got %q; the zoned TIMESTAMP keyword needs no expression support", key, lbody)
 				}
