@@ -932,12 +932,16 @@ func (o *Orchestrator) routeRow(ctx context.Context, seq uint64, c ir.Change) er
 	// deadlock: the frontier advances from the LOWER-seq changes already routed
 	// into the lanes, independent of this wait; a permanently-stuck lane wedges
 	// the apply regardless. The barrier path's full drain (drainLanes to
-	// seq-1) is a stricter special case of the same wait, and this wait goes
-	// through drainLanes too, so it wakes a lane holding a partial batch
-	// rather than waiting out the idle grace — every coordinator wait on the
-	// frontier is a drainLanes call.
+	// seq-1) is a stricter special case of the same wait. This one
+	// deliberately does NOT go through drainLanes: the cap fires because a lane
+	// is BUSY (backpressure behind a hot table), not idle-grace-bound, and in
+	// the row-28 hot-table case it recurs about once per committed batch — a
+	// flush sentinel each time could cut the hot lane's batches below what its
+	// AIMD controller would choose (unmeasured). So it keeps v0.156.4's plain
+	// wait; it is the one named exemption in
+	// TestOrchestrator_FrontierWaitsGoThroughDrainLanes.
 	if seq > o.lookAheadCap {
-		if err := o.drainLanes(ctx, seq-o.lookAheadCap); err != nil {
+		if err := o.frontier.WaitForFrontier(ctx, seq-o.lookAheadCap); err != nil {
 			return err
 		}
 	}
@@ -1038,9 +1042,11 @@ func (o *Orchestrator) fenceApplyMarks(ctx context.Context, seq uint64, c ir.Cha
 
 // drainLanes blocks until every change at or below target is durable across
 // the lanes — the shared prefix of [Orchestrator.barrier] and
-// [Orchestrator.fenceApplyMarks], and the look-ahead cap's wait in
-// [Orchestrator.routeRow]. It is the coordinator's ONLY wait on the frontier
-// (TestOrchestrator_FrontierWaitsGoThroughDrainLanes holds that).
+// [Orchestrator.fenceApplyMarks]: the barrier and the fence wake the lanes.
+// The look-ahead cap in [Orchestrator.routeRow] deliberately does not (it is
+// busy-lane backpressure, not an idle stall — see there);
+// TestOrchestrator_FrontierWaitsGoThroughDrainLanes holds that it is the only
+// other wait on the frontier.
 //
 // It first hands each lane a flush sentinel, queued behind everything the
 // coordinator has already routed to it, so a lane holding a partial batch
