@@ -81,16 +81,13 @@ func ApplyApplyConcurrency(target any, lanes int) {
 
 // ApplyExactlyOnceLanes plumbs `sync start --exactly-once-lanes` (ADR-0190
 // amendment C) to a target applier that implements
-// [ir.ExactlyOnceLanesSetter]. off is a no-op — the applier's zero value
-// already is the default, so only the opt-in needs a call. Streamer-only:
-// the broker and chain replay carry no apply identities, so their lanes
-// have no marks to write either way.
+// [ir.ExactlyOnceLanesSetter]. The value is set in both directions, so an
+// applier reused across a restart can never keep a stale opt-in. Streamer-
+// only: the broker and chain replay carry no apply identities, so their
+// lanes have no marks to write either way.
 func ApplyExactlyOnceLanes(target any, on bool) {
-	if !on {
-		return
-	}
 	if setter, ok := target.(ir.ExactlyOnceLanesSetter); ok {
-		setter.SetExactlyOnceLanes(true)
+		setter.SetExactlyOnceLanes(on)
 	}
 }
 

@@ -931,10 +931,13 @@ func (o *Orchestrator) routeRow(ctx context.Context, seq uint64, c ir.Change) er
 	// set — the RouteScopeTable hot-table-pinned-to-one-lane pathology). No
 	// deadlock: the frontier advances from the LOWER-seq changes already routed
 	// into the lanes, independent of this wait; a permanently-stuck lane wedges
-	// the apply regardless. The barrier path's full drain (WaitForFrontier
-	// seq-1) is a stricter special case of the same wait.
+	// the apply regardless. The barrier path's full drain (drainLanes to
+	// seq-1) is a stricter special case of the same wait, and this wait goes
+	// through drainLanes too, so it wakes a lane holding a partial batch
+	// rather than waiting out the idle grace — every coordinator wait on the
+	// frontier is a drainLanes call.
 	if seq > o.lookAheadCap {
-		if err := o.frontier.WaitForFrontier(ctx, seq-o.lookAheadCap); err != nil {
+		if err := o.drainLanes(ctx, seq-o.lookAheadCap); err != nil {
 			return err
 		}
 	}
@@ -1035,7 +1038,9 @@ func (o *Orchestrator) fenceApplyMarks(ctx context.Context, seq uint64, c ir.Cha
 
 // drainLanes blocks until every change at or below target is durable across
 // the lanes — the shared prefix of [Orchestrator.barrier] and
-// [Orchestrator.fenceApplyMarks].
+// [Orchestrator.fenceApplyMarks], and the look-ahead cap's wait in
+// [Orchestrator.routeRow]. It is the coordinator's ONLY wait on the frontier
+// (TestOrchestrator_FrontierWaitsGoThroughDrainLanes holds that).
 //
 // It first hands each lane a flush sentinel, queued behind everything the
 // coordinator has already routed to it, so a lane holding a partial batch

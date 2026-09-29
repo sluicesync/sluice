@@ -200,6 +200,11 @@ type crashSource struct {
 	markerless      bool
 	positionOrdinal func(t *testing.T, token string) int64
 	firstTxAfter    func(t *testing.T, token string) string
+	// blockedOrdinal is the position ordinal (change-log id) of the
+	// transaction's blocking statement — `UPDATE rs SET v = 'blocked' WHERE
+	// id = 100` — read from the source's own change log: the first change the
+	// kill leaves unapplied. Marker-less sources only.
+	blockedOrdinal func(t *testing.T) int64
 	// noKeyless: the source cannot capture a keyless table (postgres-trigger
 	// refuses one loudly by design), so kl is neither warmed nor graded.
 	noKeyless bool
@@ -516,6 +521,21 @@ func pgTriggerCrashSource(dsn string) crashSource {
 	src.lastTxID = func(t *testing.T) string {
 		return changeLogID(t, logRow+` ORDER BY id DESC LIMIT 1`)
 	}
+	src.blockedOrdinal = func(t *testing.T) int64 {
+		t.Helper()
+		db, err := sql.Open("pgx", dsn)
+		if err != nil {
+			t.Fatalf("open source: %v", err)
+		}
+		defer func() { _ = db.Close() }()
+		var id int64
+		q := `SELECT id FROM public.` + pgtrigger.ChangeLogTable +
+			` WHERE table_name = 'rs' AND after_jsonb->>'v' = 'blocked' ORDER BY id DESC LIMIT 1`
+		if err := db.QueryRow(q).Scan(&id); err != nil {
+			t.Fatalf("find the blocking statement in the change log: %v", err)
+		}
+		return id
+	}
 	return src
 }
 
@@ -551,14 +571,24 @@ type crashMidTxnCell struct {
 	converges bool
 	// exactlyOnceLanes is `sync start --exactly-once-lanes` (amendment C).
 	exactlyOnceLanes bool
-	// markerlessConverges: on a marker-less source (the trigger engines) the
-	// cell converges even though converges is false. Every trigger change is
-	// its own transaction, so the lane path's checkpoint may persist a
-	// position past every change a lane committed — and at this cell's kill
-	// it has (0 marks at the kill even with --exactly-once-lanes: the
-	// checkpoint that passed them deleted them), leaving nothing applied to
-	// replay. A marker stream cannot checkpoint inside the source transaction.
-	markerlessConverges bool
+	// markerlessLoudOrConverges: on a marker-less source (the trigger
+	// engines) the default lane cell's outcome is EITHER convergence OR the
+	// loud unique collision, and both are accepted. Every trigger change is
+	// its own transaction, so the lane checkpoint persists a position INSIDE
+	// the source transaction; the restart replays, unmarked, only the changes
+	// between that position and the blocking statement, and whether that
+	// window contains a collision-prone shape depends on where the checkpoint
+	// happened to sit and which of those changes a lane had committed —
+	// timing, not the product. MEASURED (2026-09-29): the position sat at
+	// change-log id 102 / 104 with the blocking statement at 109, and both
+	// pairs converged. The convergence was first explained as "the checkpoint
+	// had passed every applied change", checked as "position = blocking
+	// statement − 1", and that check FAILED: the blocking statement shares the
+	// secondary-unique table's single lane batch with the changes just before
+	// it, so the window 103..108 was most likely never committed — but that is
+	// not asserted per change, so the cell does not rely on it and accepts
+	// both outcomes. logMarkerlessReplayWindow records the window every run.
+	markerlessLoudOrConverges bool
 
 	// body is the source transaction (crashMidTxnSource when empty).
 	body string
@@ -590,7 +620,7 @@ func runCrashMidTxnSuite(t *testing.T, src crashSource, tgt resendTarget, pins c
 		// prefix and stop on the collision — the documented pre-ADR outcome,
 		// loud and recoverable, pinned as the expected default. Its barrier
 		// change (the primary-key update 900010 → 900011) still marks.
-		{name: "lanes_batched", concurrency: 0, batch: 1000, markerlessConverges: true},
+		{name: "lanes_batched", concurrency: 0, batch: 1000, markerlessLoudOrConverges: true},
 		// ... and with --exactly-once-lanes it converges.
 		{name: "lanes_batched_exactly_once", concurrency: 0, batch: 1000, exactlyOnceLanes: true, converges: true},
 		{name: "pkchange_serial_per_change", concurrency: 1, batch: 0, body: crashMidTxnPKChangeSource, converges: true},
@@ -826,6 +856,26 @@ func runCrashToKill(t *testing.T, src crashSource, tgt resendTarget, fx crashStr
 	return prefixApplied
 }
 
+// logMarkerlessReplayWindow records, at the kill of a markerlessLoudOrConverges
+// cell, the unmarked window the restart will replay — from the persisted
+// position to the blocking statement (the first change the kill leaves
+// unapplied, per the source's change log) — and checks the two facts that do
+// NOT depend on timing: the default lanes wrote no apply mark, and the
+// position never passed the blocking statement (it was never applied).
+func logMarkerlessReplayWindow(t *testing.T, src crashSource, tgt resendTarget, streamID string) {
+	t.Helper()
+	pos := src.positionOrdinal(t, tgt.readPos(streamID))
+	blocked := src.blockedOrdinal(t)
+	if marks := targetMarks(t, tgt, streamID); len(marks) != 0 {
+		t.Errorf("the default lane path wrote %d apply marks (%v); without --exactly-once-lanes the lanes write none",
+			len(marks), marksPerTable(marks))
+	}
+	if pos >= blocked {
+		t.Errorf("the persisted position (change-log id %d) is at or past the blocking statement %d, which never applied", pos, blocked)
+	}
+	t.Logf("unmarked replay window at the kill: change-log ids %d..%d (position %d, blocking statement %d)", pos+1, blocked-1, pos, blocked)
+}
+
 // assertKillPosition grades the persisted position across the kill. On a
 // source with transaction boundaries it must not move at all: past a partly
 // applied transaction skips its remainder on resume, behind an earlier one
@@ -896,10 +946,11 @@ func runCrashMidTxnCell(t *testing.T, src crashSource, tgt resendTarget, cell cr
 	if body == "" {
 		body = crashMidTxnSource
 	}
-	if cell.markerlessConverges && src.markerless {
-		cell.converges = true
-	}
+	either := cell.markerlessLoudOrConverges && src.markerless
 	prefixApplied := runCrashToKill(t, src, tgt, fx, cell, body)
+	if either {
+		logMarkerlessReplayWindow(t, src, tgt, fx.streamID)
+	}
 	if prefixApplied == cell.cohesive {
 		t.Errorf("prefix committed before the kill = %v; want %v for this path (cohesive %v)", prefixApplied, !cell.cohesive, cell.cohesive)
 	}
@@ -931,6 +982,22 @@ func runCrashMidTxnCell(t *testing.T, src crashSource, tgt resendTarget, cell cr
 	}
 
 	switch {
+	case either:
+		// Pre-ADR at-least-once on a marker-less source: whether the unmarked
+		// replay window collides depends on where the checkpoint sat (see
+		// markerlessLoudOrConverges). Both outcomes are the documented
+		// contract; a SILENT divergence is not, and assertCrashDamageConfined
+		// above already graded the untouched rows.
+		if caughtUp && restartErr == nil {
+			assertCrashConverged(t, src, tgt)
+			t.Logf("default lanes on a marker-less source: the unmarked replay converged")
+			break
+		}
+		if !isUniqueCollision(restartErr) {
+			t.Fatalf("default lanes on a marker-less source: the restart neither converged nor stopped on the unique "+
+				"collision (caught up %v, error %v)", caughtUp, restartErr)
+		}
+		t.Logf("default lanes on a marker-less source: the unmarked replay stopped on the collision, loudly: %v", restartErr)
 	case cell.wantRefusal != "":
 		if caughtUp || restartErr == nil || !strings.Contains(restartErr.Error(), cell.wantRefusal) {
 			t.Fatalf("the restart must refuse with %q; caught up %v, error %v", cell.wantRefusal, caughtUp, restartErr)
