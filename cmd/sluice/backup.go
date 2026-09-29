@@ -1911,16 +1911,16 @@ type RestoreCmd struct {
 	TargetSchema string `help:"Per-source target schema namespace (Postgres-only). When set, restored tables land in the named schema rather than the DSN's default. Mirrors 'sluice migrate --target-schema' / 'sync start --target-schema' (ADR-0031). PG-only: flat-namespace engines (MySQL) refuse at validate time — operators use a different --target DSN database instead. The schema is auto-created on the target if it doesn't exist. v0.56.0+ closure of the v0.55.0 cycle's UX-gap finding." placeholder:"NAME"`
 
 	// A CHAIN restore (full + incrementals) replays CDC change chunks, and its
-	// incremental leg writes the three control tables ChainRestore's
+	// incremental leg writes the CDC control tables ChainRestore's
 	// EnsureControlTable creates (sluice_cdc_state, sluice_cdc_schema_history,
-	// sluice_shard_consolidation_lease). On a SHARDED PlanetScale/Vitess target
+	// sluice_shard_consolidation_lease and the rest of the roster). On a SHARDED PlanetScale/Vitess target
 	// those vindex-less tables are rejected ("table ... does not have a primary
 	// vindex"), so the restore needs the same sidecar-keyspace escape hatch
 	// `sync start` grew — resolved + recorded via applyControlKeyspace so the
 	// control-keyspace-configured target engine is the one that reaches
 	// ChainRestore's OpenChangeApplier. A single FULL restore writes no control
 	// tables, so this flag is inert there.
-	ControlKeyspace string `name:"control-keyspace" help:"MySQL/PlanetScale/Vitess target only: the unsharded sidecar keyspace a CHAIN restore's CDC control tables live in (see 'sync start --control-keyspace'). A chain restore's incremental replay writes sluice_cdc_state / sluice_cdc_schema_history / sluice_shard_consolidation_lease; a SHARDED target rejects those vindex-less tables, so point this at a separate unsharded keyspace to unblock that case. Omit to auto-detect the sole unsharded sidecar on a sharded target (loud refusal if zero or several candidates). Empty + unsharded/non-Vitess target = the default keyspace (unchanged). Inert on non-MySQL targets and on a single-full restore." placeholder:"KEYSPACE"`
+	ControlKeyspace string `name:"control-keyspace" help:"MySQL/PlanetScale/Vitess target only: the unsharded sidecar keyspace a CHAIN restore's CDC control tables live in (see 'sync start --control-keyspace'). A chain restore's incremental replay writes the CDC control tables (sluice_cdc_state, sluice_cdc_schema_history, sluice_shard_consolidation_lease and the rest of the set 'sync start --control-keyspace' lists); a SHARDED target rejects those vindex-less tables, so point this at a separate unsharded keyspace to unblock that case. Omit to auto-detect the sole unsharded sidecar on a sharded target (loud refusal if zero or several candidates). Empty + unsharded/non-Vitess target = the default keyspace (unchanged). Inert on non-MySQL targets and on a single-full restore." placeholder:"KEYSPACE"`
 
 	// PlanetScale target-health telemetry (ADR-0107) — OPTIONAL. When set, the
 	// restore clamps the AUTO --table-parallelism × --bulk-parallelism product

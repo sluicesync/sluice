@@ -74,6 +74,8 @@ genuinely non-idempotent case.
 The guard caps the *batch*, not the *replay window*. **Keyless CDC is at-least-once**, and
 this guard does not — cannot — change that:
 
+> **Superseded for covered sources by [ADR-0190](adr-0190-exactly-once-apply-marks.md) (v0.156.5).** Durable per-source-transaction apply marks now let a restart skip the keyless rows a crashed transaction already applied, so keyless CDC is exactly-once across a crash on the sources and paths ADR-0190 covers. It stays at-least-once, as described below, for VStream COPY-phase rows, interleaved shard transactions, the `APPLY-MARK-UNTRUSTED` fallback, and any target where the mark table is unavailable (`APPLY-MARKS-UNAVAILABLE`). The batch guard in this ADR is unchanged.
+
 - A keyless `INSERT` is non-idempotent (no key to upsert on; [ADR-0010]).
 - Crash-resume granularity is the **source transaction**, not the row: the source position
   (a GTID for MySQL/Vitess, an LSN for Postgres) only advances at the source transaction's
@@ -106,7 +108,8 @@ case. Corrected in the Bug 143 pass.
 - **No new silent-duplication exposure**: class-3 keyless tables are clamped to batch=1
   semantics, the same blast radius as before this change. (Keyless CDC remains at-least-once
   — see "Delivery semantics" above; this change neither introduces nor cures that, and the
-  WARN now states it honestly — Bug 143.)
+  WARN now states it honestly — Bug 143; [ADR-0190](adr-0190-exactly-once-apply-marks.md) later
+  made it exactly-once for covered sources.)
 - Conservative operators opt back via `--apply-batch-size=1` or `--no-auto-tune`.
 - Reverses the explicit "default unchanged / opt-in" decisions of ADR-0017 and ADR-0052 —
   recorded as superseded-in-part above.

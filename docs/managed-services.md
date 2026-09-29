@@ -416,6 +416,8 @@ sluice deploy-ddl --org <org> --database <db> --ddl '<one statement>'
 
 It is also the general escape hatch for any ad-hoc schema change on a safe-migrations branch — the safety wrapper (freshness gate, tolerant deploy poller, cleanup) applies to whatever single statement you pass.
 
+**Upgrading to v0.156.5 or later on a branch bootstrapped earlier: ship one CREATE for the apply marks.** v0.156.5 adds the `sluice_cdc_apply_marks` control table (exactly-once apply across a crash in the middle of a source transaction, ADR-0190; [cdc-streaming](operator/cdc-streaming.md)). sluice creates it itself where it can, but a safe-migrations branch refuses that CREATE, so a branch bootstrapped before v0.156.5 does not have it. That is not a refusal: every apply run logs `APPLY-MARKS-UNAVAILABLE` and runs exactly as before, without the crash-mid-transaction protection. To enable it, ship the `sluice_cdc_apply_marks` statement that `sluice control-tables ddl` prints, with `sluice deploy-ddl`.
+
 **Upgrading to v0.156.0 or later with an existing `sluice_cdc_state`: ship one ALTER.** v0.156.0 adds the `unforwarded_refusal` column, which records an `UNFORWARDED-SCHEMA-CHANGE` refusal so a restart refuses again ([cdc-streaming](operator/cdc-streaming.md)). A fresh bootstrap already has it, because `sluice control-tables ddl` prints it in the CREATE. But `CREATE TABLE IF NOT EXISTS` is a no-op on a table that already exists, and sluice's detect-then-ALTER is refused on a safe-migrations branch. What happens next depends on the start mode. A start without `--schema-already-applied` fails with `SLUICE-E-PS-DIRECT-DDL-BLOCKED`, naming the statement. A start with `--schema-already-applied`, the usual safe-migrations setup, skips that ensure but fails anyway: every start first makes sure a refusal could be recorded, because a stream that could not record one would have it accepted silently by the next restart. So ship the column once after upgrading, before restarting your streams:
 
 ```
@@ -426,9 +428,10 @@ With a `--control-keyspace` sidecar, qualify the table with that keyspace. Once 
 
 ### Sharded targets: control tables and `--control-keyspace`
 
-A continuous sync stores three control tables on the target
+A continuous sync stores its CDC control tables on the target
 (`sluice_cdc_state`, `sluice_cdc_schema_history`,
-`sluice_shard_consolidation_lease`). A SHARDED Vitess/PlanetScale
+`sluice_shard_consolidation_lease`, `sluice_cdc_skipped_tables`,
+`sluice_cdc_query_timeout_raise`, `sluice_cdc_apply_marks`). A SHARDED Vitess/PlanetScale
 target keyspace requires a primary vindex on every table, which
 the control tables don't have — so a sync against a sharded
 target otherwise dies with `VT09001: table sluice_cdc_state does

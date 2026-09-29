@@ -152,6 +152,19 @@ integers > 2^53 and for offline imports — it is simple and exact for those. Us
 `--source-driver d1` when the database has large integers (snowflake IDs, nanosecond
 timestamps, large counters); it is the only path that reads them losslessly.
 
+## "now" DEFAULTs: rendered per column type, on the UTC clock
+
+SQLite evaluates a `CURRENT_TIMESTAMP` / `datetime('now')` / `strftime(…, 'now')` DEFAULT in UTC. Since v0.156.5 sluice carries it onto the target's UTC clock, spelled for the target column's type; before v0.156.5 the target evaluated it in the writing session's time zone, so a non-UTC session stamped local wall-clock digits into columns that had held UTC.
+
+| Target column | Postgres | MySQL |
+|---|---|---|
+| naive timestamp / `DATETIME` | `date_trunc('second', timezone('utc', now()))` | `UTC_TIMESTAMP()` |
+| `timestamptz` / MySQL `TIMESTAMP` | `date_trunc('second', now())` (an instant) | `CURRENT_TIMESTAMP` (an instant) |
+| `date` / `time` | the UTC date / time | `UTC_DATE()` / `UTC_TIME()` |
+| text / varchar / char | SQLite's exact text form, via `to_char` | SQLite's exact text form, via `DATE_FORMAT` |
+
+Only five `strftime` formats are recognised: `%Y-%m-%d %H:%M:%S`, `%Y-%m-%dT%H:%M:%SZ`, `%Y-%m-%d`, `%H:%M:%S` and the epoch `%s`. The zone-free epoch form lands on Postgres only on an integer, decimal, float or text column. Any other format, and any column type with no faithful spelling, has its DEFAULT **dropped with a WARN** naming the column rather than degraded to a session-zone keyword. MySQL accepts expression DEFAULTs from 8.0.13 (MariaDB 10.2.1); on an older server, or one whose version sluice could not read, every cell except the `TIMESTAMP` one is dropped with a WARN.
+
 ## Schema features: generated columns, CHECK constraints, partial/expression indexes
 
 Generated columns, CHECK constraints, and partial/expression indexes ARE carried into the

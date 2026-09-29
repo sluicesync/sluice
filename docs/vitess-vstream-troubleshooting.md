@@ -341,7 +341,8 @@ signature rather than expecting a named throttled app.
 When a **PlanetScale branch is the sluice _target_** (`--target-driver=planetscale`),
 the password's role must allow DDL: on a cold-start sluice creates the destination
 tables and its control tables (`sluice_cdc_state`, `sluice_cdc_schema_history`,
-`sluice_shard_consolidation_lease`). A `reader`/`writer`/`readwriter`-role password
+`sluice_shard_consolidation_lease`, `sluice_cdc_skipped_tables`,
+`sluice_cdc_query_timeout_raise`, `sluice_cdc_apply_marks`). A `reader`/`writer`/`readwriter`-role password
 is **denied DDL** on a production branch and the cold-start fails immediately at the
 control-table step:
 

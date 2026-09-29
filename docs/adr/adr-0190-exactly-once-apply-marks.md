@@ -175,7 +175,7 @@ The pin matrix is source (MySQL GTID, MySQL file/pos, MariaDB, Postgres, VStream
 ## Operator decisions (2026-09-28)
 
 1. **Marked classes:** non-idempotent classes only (secondary-unique tables, PK changes, keyless tables); every change still CHECKS marks.
-2. **Missing mark table:** WARN `APPLY-MARKS-UNAVAILABLE` and run without marks (today's behaviour); no new refusal.
+2. **Missing mark table:** WARN `APPLY-MARKS-UNAVAILABLE` and run without marks (today's behaviour); no new refusal. The one exception (recorded 2026-09-28): on a PlanetScale Neki target a table that exists but cannot be placed in an unsharded shard group refuses with `SLUICE-E-TARGET-CONTROL-TABLE-PLACEMENT`, like every other control table there — degrading would leave a sharded mark table read inconsistently.
 3. **Keyless tables:** included, in Phase 2.
 4. **The broker (`sync from-backup`):** NOT in this ADR — a separate ADR later.
 5. **VStream reader change:** accepted as Phase 4.

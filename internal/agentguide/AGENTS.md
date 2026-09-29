@@ -63,7 +63,7 @@ Stable machine-parsable error codes (`SLUICE-E-*`) with remedy hints ride on the
 | 3 | named refusal — sluice declined by policy; the error names the remedy |
 | 80 | CLI usage/parse error (kong) |
 
-`!= 0` always means not-success. On exit 3, do not retry unchanged — surface `error.hint` to the human and wait for a decision (the remedy is often a destructive flag that needs approval). One refusal has no code yet and exits 1: a message containing `UNFORWARDED-SCHEMA-CHANGE` from `sync start` / `sync run` / `backup stream run`. Treat it exactly like exit 3. Do not retry, surface the message, and wait (see the `--accept-unforwarded-schema-change` entry above).
+`!= 0` always means not-success. On exit 3, do not retry unchanged — surface `error.hint` to the human and wait for a decision (the remedy is often a destructive flag that needs approval). One refusal has no code yet and exits 1: a message containing `UNFORWARDED-SCHEMA-CHANGE` from `sync start` / `sync run` / `backup stream run`. Treat it exactly like exit 3. Do not retry, surface the message, and wait (see the `--accept-unforwarded-schema-change` entry above). The same holds for three more uncoded exit-1 refusals: `APPLY-MARK-MISMATCH` (a restart's re-delivered change contradicts its apply mark; the remedy, `--restart-from-scratch`, is destructive), `CHARSET-NOT-DECODABLE` (a value in a column's declared charset has no faithful conversion) and `DSN-TIME-ZONE-NOT-UTC` (a MySQL DSN `time_zone` that is not UTC; remove it or set `'+00:00'`).
 
 ## Where to read more
 
