@@ -986,6 +986,19 @@ type Streamer struct {
 	// `sync start --apply-concurrency=W` flag is the operator knob.
 	ApplyConcurrency int
 
+	// ExactlyOnceLanes is `sync start --exactly-once-lanes` (ADR-0190
+	// amendment C, operator 2026-09-29): on the concurrent lane path, write
+	// apply marks for the changes the lanes apply, behind the
+	// checkpoint-before-mark fence, so a crash mid-transaction on a
+	// secondary-unique table converges instead of stopping on a unique
+	// collision. OPT-IN, and the zero value is the default (the v0.99.51
+	// trap): the fence drains the lanes once per such source transaction, which
+	// measured ~99.9% slower on a secondary-unique-heavy workload. The serial
+	// paths and the lane BARRIER (keyless tables, primary-key changes) write
+	// marks regardless; every lane change checks them either way. Plumbed to
+	// every applier implementing [ir.ExactlyOnceLanesSetter].
+	ExactlyOnceLanes bool
+
 	// AutoTune controls whether the AIMD apply-batch-size controller
 	// (ADR-0052) is engaged for this stream. Per ADR-0052 DP-1 the
 	// default is "on" — operators pass `--no-auto-tune` to opt out.

@@ -122,6 +122,7 @@ var migrateSyncDivergenceReason = map[string]string{
 	"apply-retry-backoff-base":  reasonCDCApply,
 	"apply-retry-backoff-cap":   reasonCDCApply,
 	"apply-tune-target-latency": reasonCDCApply,
+	"exactly-once-lanes":        reasonCDCApply,
 	"no-auto-tune":              reasonCDCApply,
 	"poll-interval":             reasonCDCApply,
 	"heartbeat-interval":        reasonCDCApply,

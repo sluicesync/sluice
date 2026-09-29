@@ -148,6 +148,11 @@ type ChangeApplier struct {
 	// [SetApplyConcurrency]. See change_applier_concurrent.go.
 	applyConcurrency int
 
+	// exactlyOnceLanes is `sync start --exactly-once-lanes` (ADR-0190
+	// amendment C): the lanes write apply marks behind the orchestrator's
+	// mark fence. Off by default — see [ir.ExactlyOnceLanesSetter].
+	exactlyOnceLanes bool
+
 	// laneControllers are the ADR-0105 per-lane AIMD controllers, one per
 	// concurrent apply lane in lane-index order (laneControllers[i] drives
 	// lane i). Set by [SetLaneAIMDControllers] when the streamer engages
@@ -645,6 +650,12 @@ func (a *ChangeApplier) SetApplyConcurrency(lanes int) {
 		lanes = 0
 	}
 	a.applyConcurrency = lanes
+}
+
+// SetExactlyOnceLanes implements [ir.ExactlyOnceLanesSetter] (ADR-0190
+// amendment C). Idempotent.
+func (a *ChangeApplier) SetExactlyOnceLanes(on bool) {
+	a.exactlyOnceLanes = on
 }
 
 // SetLaneAIMDControllers implements [ir.LaneAIMDSetter] (ADR-0105). Records

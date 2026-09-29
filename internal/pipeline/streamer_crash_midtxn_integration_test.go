@@ -53,6 +53,13 @@ import (
 // advances, no refusal, graded against the source's own final table state
 // (the independent expected value).
 //
+// EXCEPT, by default, the lane BATCH path's secondary-unique changes
+// (amendment C, operator 2026-09-29): the lanes write marks only with
+// --exactly-once-lanes, because the fence below measured ~99.9% slower on a
+// workload made of them. Without it lanes_batched stops on the collision
+// again, as before ADR-0190 — pinned as the EXPECTED default, not a failure —
+// while its barrier changes still mark, and the _exactly_once cells converge.
+//
 // The lane BATCH path writes its marks under ADR-0190 amendment A: before a
 // transaction's first marked change reaches a lane, the coordinator drains
 // the lanes and checkpoints, so a lane never commits a transaction's marks
@@ -537,8 +544,21 @@ type crashMidTxnCell struct {
 	// size is exactly the configured one.
 	fixedCap bool
 	// converges: the restart converges exactly (ADR-0190). False for a cell
-	// whose marks are refused or unavailable.
+	// whose marks are refused or unavailable, or — the default since
+	// amendment C — a lane cell whose secondary-unique changes the lanes
+	// apply unmarked: it stops on the loud GC-38 (l) collision, as before
+	// ADR-0190.
 	converges bool
+	// exactlyOnceLanes is `sync start --exactly-once-lanes` (amendment C).
+	exactlyOnceLanes bool
+	// markerlessConverges: on a marker-less source (the trigger engines) the
+	// cell converges even though converges is false. Every trigger change is
+	// its own transaction, so the lane path's checkpoint may persist a
+	// position past every change a lane committed — and at this cell's kill
+	// it has (0 marks at the kill even with --exactly-once-lanes: the
+	// checkpoint that passed them deleted them), leaving nothing applied to
+	// replay. A marker stream cannot checkpoint inside the source transaction.
+	markerlessConverges bool
 
 	// body is the source transaction (crashMidTxnSource when empty).
 	body string
@@ -560,9 +580,23 @@ func runCrashMidTxnSuite(t *testing.T, src crashSource, tgt resendTarget, pins c
 		// The same path with the transaction LARGER than one batch: the row
 		// cap flushes mid-transaction, and the marks ride each flush.
 		{name: "serial_batched_over_cap", concurrency: 1, batch: 5, fixedCap: true, converges: true},
+		// An apply batch size of 1 or less takes the per-change Apply path
+		// whatever the lane count (Streamer.ApplyBatchSize > 1 gates
+		// ApplyBatch, the only entry to the lanes), so this cell is serial by
+		// construction and keeps its marks by default.
 		{name: "lanes_per_change", concurrency: 0, batch: 0, converges: true},
-		{name: "lanes_batched", concurrency: 0, batch: 1000, converges: true},
+		// The lane path by DEFAULT (amendment C): the lanes write no marks, so
+		// the transaction's secondary-unique changes replay unmarked onto the
+		// prefix and stop on the collision — the documented pre-ADR outcome,
+		// loud and recoverable, pinned as the expected default. Its barrier
+		// change (the primary-key update 900010 → 900011) still marks.
+		{name: "lanes_batched", concurrency: 0, batch: 1000, markerlessConverges: true},
+		// ... and with --exactly-once-lanes it converges.
+		{name: "lanes_batched_exactly_once", concurrency: 0, batch: 1000, exactlyOnceLanes: true, converges: true},
 		{name: "pkchange_serial_per_change", concurrency: 1, batch: 0, body: crashMidTxnPKChangeSource, converges: true},
+		// The barrier keeps its marks by default: the key change converges on
+		// the lane path without the flag, its lane changes CHECKING the
+		// barrier's marks (the insert of key 10 is skipped on them).
 		{name: "pkchange_lanes_batched", concurrency: 0, batch: 1000, body: crashMidTxnPKChangeSource, converges: true},
 	}
 	if pins&crashPinsKeyless != 0 {
@@ -596,14 +630,18 @@ func runCrashMidTxnSuite(t *testing.T, src crashSource, tgt resendTarget, pins c
 			},
 			// ADR-0190 §8: marks are per KEY, so a restart with a different
 			// lane count — or none — reads them the same way.
+			// (The first two need the lanes to have WRITTEN marks, so they run
+			// with --exactly-once-lanes.)
 			crashMidTxnCell{
-				name: "lane_count_changed_4_to_2", concurrency: 4, batch: 1000, converges: true,
+				name: "lane_count_changed_4_to_2", concurrency: 4, batch: 1000, exactlyOnceLanes: true, converges: true,
 				restart: func(s *Streamer) { s.ApplyConcurrency = 2 },
 			},
 			crashMidTxnCell{
-				name: "lane_count_changed_lanes_to_serial", concurrency: 4, batch: 1000, converges: true,
+				name: "lane_count_changed_lanes_to_serial", concurrency: 4, batch: 1000, exactlyOnceLanes: true, converges: true,
 				restart: func(s *Streamer) { s.ApplyConcurrency = 1 },
 			},
+			// Marks written by the serial path, CHECKED by default lanes that
+			// write none (amendment C): the restart still converges.
 			crashMidTxnCell{
 				name: "lane_count_changed_serial_to_lanes", concurrency: 1, batch: 0, converges: true,
 				restart: func(s *Streamer) { s.ApplyConcurrency, s.ApplyBatchSize = 4, 1000 },
@@ -635,7 +673,10 @@ func runCrashMidTxnSuite(t *testing.T, src crashSource, tgt resendTarget, pins c
 		})
 	}
 	t.Run("lane_post_commit_window", func(t *testing.T) {
-		runCrashLanePostCommitWindow(t, src, tgt)
+		runCrashLanePostCommitWindow(t, src, tgt, true)
+	})
+	t.Run("lane_post_commit_window_default", func(t *testing.T) {
+		runCrashLanePostCommitWindow(t, src, tgt, false)
 	})
 	// A schema event inside the interrupted transaction (the 2026-09-28
 	// CRITICAL): the serial batched path is the one that regressed; lanes and
@@ -712,6 +753,7 @@ func newCrashStreamFixture(t *testing.T, src crashSource, tgt resendTarget, cell
 			ApplyConcurrency: cell.concurrency,
 			ApplyBatchSize:   cell.batch,
 			AutoTune:         cell.batch > 1 && !cell.fixedCap,
+			ExactlyOnceLanes: cell.exactlyOnceLanes,
 		}
 		if td := src.configure(t, s, suffix); teardown == nil {
 			teardown = td
@@ -854,6 +896,9 @@ func runCrashMidTxnCell(t *testing.T, src crashSource, tgt resendTarget, cell cr
 	if body == "" {
 		body = crashMidTxnSource
 	}
+	if cell.markerlessConverges && src.markerless {
+		cell.converges = true
+	}
 	prefixApplied := runCrashToKill(t, src, tgt, fx, cell, body)
 	if prefixApplied == cell.cohesive {
 		t.Errorf("prefix committed before the kill = %v; want %v for this path (cohesive %v)", prefixApplied, !cell.cohesive, cell.cohesive)
@@ -973,8 +1018,15 @@ func runCrashColdStartClearsMarks(t *testing.T, src crashSource, tgt resendTarge
 // With the fence, T2's first marked change waits for the checkpoint past T1,
 // which the lock holds back, so T2 never commits before the kill; the restart
 // skips T1 on its mark and applies T2. Graded against the source's table.
-func runCrashLanePostCommitWindow(t *testing.T, src crashSource, tgt resendTarget) {
-	cell := crashMidTxnCell{concurrency: 0, batch: 1000}
+//
+// exactlyOnce false is the DEFAULT lane path (amendment C): the lanes write
+// no marks and never fence, so T1 and T2 both commit into the window with no
+// mark, and the restart replays them unmarked — T1's update re-creates row 7
+// (an idempotent upsert) and T2's delete removes it again. Nothing can be
+// skipped without a mark, so the window is harmless there; the cell pins
+// exactly that: no mark at the kill, and a converged restart.
+func runCrashLanePostCommitWindow(t *testing.T, src crashSource, tgt resendTarget, exactlyOnce bool) {
+	cell := crashMidTxnCell{concurrency: 0, batch: 1000, exactlyOnceLanes: exactlyOnce}
 	fx := newCrashStreamFixture(t, src, tgt, cell)
 	defer fx.teardown()
 	ctx1, cancel1 := context.WithCancel(context.Background())
@@ -1023,7 +1075,19 @@ func runCrashLanePostCommitWindow(t *testing.T, src crashSource, tgt resendTarge
 		t.Fatalf("the position moved (%q → %q) while its row was held locked: the window closed before the kill, so the cell measured nothing",
 			posBefore, posAfterKill)
 	}
-	assertMarksNameTheInterruptedTx(t, src, tgt, fx.streamID, posAfterKill, t1)
+	if exactlyOnce {
+		// T1's update is a marked lane change the fence admitted (its
+		// checkpoint had nothing new to write under the lock), so its mark
+		// must be on the target: without it this cell would pass on the
+		// idempotent replay alone and grade nothing about the lane marks.
+		if len(targetMarks(t, tgt, fx.streamID)) == 0 {
+			t.Error("no apply mark at the kill with --exactly-once-lanes: the lanes wrote none, so the fence went ungraded")
+		}
+		assertMarksNameTheInterruptedTx(t, src, tgt, fx.streamID, posAfterKill, t1)
+	} else if marks := targetMarks(t, tgt, fx.streamID); len(marks) > 0 {
+		t.Errorf("the default lane path wrote %d apply marks (%v); without --exactly-once-lanes the lanes write none",
+			len(marks), marksPerTable(marks))
+	}
 	t.Logf("row 7 at the kill: %d", countTarget(tgt, "SELECT COUNT(*) FROM rs WHERE id = 7"))
 
 	caughtUp, restartErr := resumeCrashStreamWith(t, fx.newStreamer, nil, src, tgt, true, fx.streamID, posAfterKill)

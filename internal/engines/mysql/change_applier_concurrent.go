@@ -359,8 +359,9 @@ func (la *laneApplierAdapter) ApplyLaneBatch(ctx context.Context, _ int, batch [
 		la.a.stampShardChange(c)
 		// ADR-0190: a change the apply marks prove already applied is
 		// dropped; an applied one writes its marks in this transaction —
-		// only those of the transaction the orchestrator's mark fence
-		// cleared (amendment A, applymarks.LaneFence).
+		// only with --exactly-once-lanes (amendment C), and only those of
+		// the transaction the orchestrator's mark fence cleared (amendment
+		// A, applymarks.LaneFence). Without it the change still CHECKS.
 		decision, err := la.a.decideApplyMarks(ctx, c)
 		if err != nil {
 			_ = tx.Rollback()
@@ -379,7 +380,7 @@ func (la *laneApplierAdapter) ApplyLaneBatch(ctx context.Context, _ int, batch [
 			_ = tx.Rollback()
 			return 0, err
 		}
-		if !skippedTable {
+		if !skippedTable && la.a.exactlyOnceLanes {
 			btx.marks.Add(la.fence.Admitted(decision.Marks))
 		}
 	}
@@ -547,11 +548,12 @@ func (a *ChangeApplier) applyBatchConcurrent(ctx context.Context, streamID strin
 		laneCommitHook: laneCommitHookForTest, // nil in production
 	}
 	orch := laneapply.NewOrchestrator(laneapply.Config{
-		Lanes:           lanes,
-		MaxBatchSize:    maxBatchSize,
-		LaneControllers: a.laneControllers,
-		MaxBufferBytes:  byteCap,
-		IdleFlushPeriod: defaultIdleFlushPeriod,
+		Lanes:            lanes,
+		MaxBatchSize:     maxBatchSize,
+		LaneControllers:  a.laneControllers,
+		MaxBufferBytes:   byteCap,
+		IdleFlushPeriod:  defaultIdleFlushPeriod,
+		ExactlyOnceLanes: a.exactlyOnceLanes,
 	}, adapter)
 	if err := orch.Run(ctx, changes); err != nil {
 		return err

@@ -128,6 +128,7 @@ func (s *Streamer) openApplier(ctx context.Context) (ir.ChangeApplier, bool, err
 		migcore.ApplyTargetSchema(s.Applier, s.TargetSchema)
 		applyExecTimeout(s.Applier, s.ApplyExecTimeout)
 		migcore.ApplyApplyConcurrency(s.Applier, s.resolvedApplyConcurrency)
+		migcore.ApplyExactlyOnceLanes(s.Applier, s.ExactlyOnceLanes)
 		applyRedactor(s.Applier, s.Redactor)
 		if err := checkShardColumnSupport(s.Applier, s.InjectShardColumn, "sync"); err != nil {
 			return nil, false, migcore.WrapWithHint(migcore.PhaseConnect, err)
@@ -154,6 +155,7 @@ func (s *Streamer) openApplier(ctx context.Context) (ir.ChangeApplier, bool, err
 	migcore.ApplyTargetSchema(a, s.TargetSchema)
 	applyExecTimeout(a, s.ApplyExecTimeout)
 	migcore.ApplyApplyConcurrency(a, s.resolvedApplyConcurrency)
+	migcore.ApplyExactlyOnceLanes(a, s.ExactlyOnceLanes)
 	applyRedactor(a, s.Redactor)
 	if err := checkShardColumnSupport(a, s.InjectShardColumn, "sync"); err != nil {
 		migcore.CloseIf(a)

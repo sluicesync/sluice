@@ -144,6 +144,7 @@ type SyncSpec struct {
 	Where []string `koanf:"where"`
 
 	ApplyConcurrency int    `koanf:"apply-concurrency"`
+	ExactlyOnceLanes bool   `koanf:"exactly-once-lanes"`
 	ApplyBatchSize   string `koanf:"apply-batch-size"`
 	NoAutoTune       bool   `koanf:"no-auto-tune"`
 
@@ -1031,6 +1032,7 @@ func buildStreamerFromSpec(ctx context.Context, spec *SyncSpec, g *Globals) (*pi
 		ApplyBatchSize:   applyBatchSize,
 		AutoTune:         !spec.NoAutoTune,
 		ApplyConcurrency: spec.ApplyConcurrency,
+		ExactlyOnceLanes: spec.ExactlyOnceLanes,
 		ApplyDelay:       spec.ApplyDelay,
 		// N-11: nil = key omitted → the `sync start` flag default; an explicit
 		// 0 passes through as 0 ("0 disables" / no orchestrator cap), exactly

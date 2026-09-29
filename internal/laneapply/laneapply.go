@@ -309,14 +309,31 @@ const maxInLaneRetries = 10
 type LaneChange struct {
 	Seq    uint64
 	Change ir.Change
+
+	// flush marks the coordinator's drain sentinel (see
+	// [Orchestrator.drainLanes]): no change, no seq — it tells the lane to
+	// commit the partial batch it holds now instead of waiting out the idle
+	// grace. Never applied, never counted on the frontier.
+	flush bool
 }
 
 // Config configures an [Orchestrator]. Zero values are safe: Lanes < 1 is
 // clamped to serial, MaxBatchSize < 1 to 1, and a zero MaxBufferBytes /
 // IdleFlushPeriod falls back to the package defaults. There are no
-// default-on bools (the v0.99.51 zero-value trap): the only behavioral
-// switch is the lane count itself.
+// default-on bools (the v0.99.51 zero-value trap): ExactlyOnceLanes is
+// opt-in, so its zero value is the default.
 type Config struct {
+	// ExactlyOnceLanes turns on ADR-0190's apply marks for the changes the
+	// LANES apply (amendment C, operator 2026-09-29): the mark fence before
+	// a transaction's first marked lane change, and the lanes' mark writes.
+	// Off (the zero value, the default), the lanes write no marks and the
+	// coordinator never fences — a lane change still CHECKS the marks the
+	// barrier and serial paths wrote, and a crash mid-transaction can still
+	// stop on the loud GC-38 (l) collision for a secondary-unique table, as
+	// before ADR-0190. See [Orchestrator.fenceApplyMarks] for the cost it
+	// buys back and the soundness argument for the partial coverage.
+	ExactlyOnceLanes bool
+
 	// Lanes is the lane count W (--apply-concurrency). < 1 clamps to 1.
 	Lanes int
 
@@ -385,12 +402,13 @@ const defaultFrontierLookAheadCap = 1 << 20 // 1,048,576
 // persists the resume position only up to a fully-durable source-tx
 // boundary, via the [LaneApplier] seam.
 type Orchestrator struct {
-	la           LaneApplier
-	maxBatchSize int
-	lanes        int
-	byteCap      int64
-	idlePeriod   time.Duration
-	lookAheadCap uint64 // coordinator-side frontier look-ahead bound (Config.LookAheadCap)
+	la               LaneApplier
+	maxBatchSize     int
+	lanes            int
+	byteCap          int64
+	idlePeriod       time.Duration
+	lookAheadCap     uint64 // coordinator-side frontier look-ahead bound (Config.LookAheadCap)
+	exactlyOnceLanes bool   // Config.ExactlyOnceLanes: fence and write lane marks
 
 	router   *Router
 	frontier *Frontier
@@ -528,18 +546,19 @@ func NewOrchestrator(cfg Config, la LaneApplier) *Orchestrator {
 		lookAheadCap = defaultFrontierLookAheadCap
 	}
 	o := &Orchestrator{
-		la:              la,
-		maxBatchSize:    maxBatchSize,
-		lanes:           lanes,
-		byteCap:         byteCap,
-		idlePeriod:      idlePeriod,
-		lookAheadCap:    uint64(lookAheadCap),
-		router:          NewRouter(lanes),
-		frontier:        NewFrontier(),
-		laneIn:          make([]chan LaneChange, lanes),
-		laneControllers: cfg.LaneControllers,
-		boundaryRowDML:  make(map[uint64]uint64),
-		closedTx:        make(map[uint64]string),
+		la:               la,
+		maxBatchSize:     maxBatchSize,
+		lanes:            lanes,
+		byteCap:          byteCap,
+		idlePeriod:       idlePeriod,
+		lookAheadCap:     uint64(lookAheadCap),
+		exactlyOnceLanes: cfg.ExactlyOnceLanes,
+		router:           NewRouter(lanes),
+		frontier:         NewFrontier(),
+		laneIn:           make([]chan LaneChange, lanes),
+		laneControllers:  cfg.LaneControllers,
+		boundaryRowDML:   make(map[uint64]uint64),
+		closedTx:         make(map[uint64]string),
 	}
 	// Buffer each lane a batch's worth so the coordinator's routing isn't
 	// gated on a lane's per-change commit latency (the whole point — lanes
@@ -967,12 +986,43 @@ func (o *Orchestrator) routeRow(ctx context.Context, seq uint64, c ir.Change) er
 // The cost is one drain + checkpoint per source transaction that sends a
 // marked change to a lane — none for an idempotent-only transaction (the
 // PK-only steady state) or a stream whose reader stamps no identity.
+//
+// # Opt-in (amendment C, operator 2026-09-29)
+//
+// That cost is paid per TRANSACTION, and a secondary-unique-heavy workload
+// is one marked transaction after another: measured, the default lane path
+// fell from 7557 to ~10 transactions/s (MySQL → Postgres). So the fence runs
+// only with [Config.ExactlyOnceLanes]; off, it is a no-op, the lane fence
+// never opens, and the lanes write no marks. That partial coverage is sound
+// because the invariant this fence exists for — marks only ever exist for
+// the first transaction after the persisted position — is kept by every path
+// that still writes marks WITHOUT this fence:
+//
+//   - a barrier (keyless change, PK-changing update) drains every lane to its
+//     predecessor and checkpoints BEFORE it applies, so the position sits at
+//     its transaction's start when its marks commit — the fence's own prefix;
+//   - the serial paths never move the position inside a source transaction
+//     (ADR-0027 cohesion, CDCPOS-2, schemaEventAtBoundary) and write it with
+//     the data at its commit, so their marks name the transaction starting at
+//     the persisted position (phases 1–3, pinned by the crash suite);
+//   - every checkpoint that passes a transaction deletes its marks in the
+//     same write (closedTx), whichever path wrote them.
+//
+// And no mark is ever evidence for another path's change unless it names the
+// same transaction and key with a HIGHER-or-equal ordinal: the barrier's
+// drain means every earlier change of its transaction (lower seq, lower
+// ordinal) is durable when its mark commits, so the per-key prefix the skip
+// rule relies on holds; an unmarked lane change later in the transaction
+// carries a higher ordinal and is never skipped by it.
 func (o *Orchestrator) fenceApplyMarks(ctx context.Context, seq uint64, c ir.Change) error {
+	if !o.exactlyOnceLanes {
+		return nil
+	}
 	tx := o.la.ApplyMarkTx(ctx, c)
 	if tx == "" || tx == o.fencedTx {
 		return nil
 	}
-	if err := o.frontier.WaitForFrontier(ctx, seq-1); err != nil {
+	if err := o.drainLanes(ctx, seq-1); err != nil {
 		return err
 	}
 	if err := o.writeCheckpoint(ctx); err != nil {
@@ -981,6 +1031,35 @@ func (o *Orchestrator) fenceApplyMarks(ctx context.Context, seq uint64, c ir.Cha
 	o.fencedTx = tx
 	o.la.ApplyMarksFenced(tx)
 	return nil
+}
+
+// drainLanes blocks until every change at or below target is durable across
+// the lanes — the shared prefix of [Orchestrator.barrier] and
+// [Orchestrator.fenceApplyMarks].
+//
+// It first hands each lane a flush sentinel, queued behind everything the
+// coordinator has already routed to it, so a lane holding a partial batch
+// commits it on reaching the sentinel instead of waiting out the idle grace.
+// Without that the drain costs a full idle period (100 ms) whenever the last
+// lane to finish is holding a partial batch — which, on a stream that drains
+// once per marked transaction, capped the lane path at ~10 transactions/s
+// (the 2026-09-29 benchmark). Correctness-neutral: a lane batch's extent was
+// already arbitrary (size, byte cap, idle), the frontier advances per seq
+// only after its commit, and a checkpoint reads only the frontier — nothing
+// depends on where a batch ends. A lane with nothing buffered just reads the
+// sentinel and waits again.
+func (o *Orchestrator) drainLanes(ctx context.Context, target uint64) error {
+	if o.frontier.FrontierSeq() >= target {
+		return nil
+	}
+	for i := range o.laneIn {
+		select {
+		case o.laneIn[i] <- LaneChange{flush: true}:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return o.frontier.WaitForFrontier(ctx, target)
 }
 
 // barrier applies a globally-ordered event (Truncate / SchemaSnapshot /
@@ -1007,7 +1086,7 @@ func (o *Orchestrator) fenceApplyMarks(ctx context.Context, seq uint64, c ir.Cha
 // guarded; deferring entirely to ApplyBarrierChange makes the concurrent
 // path's invalidation byte-identical to serial.
 func (o *Orchestrator) barrier(ctx context.Context, seq uint64, c ir.Change) error {
-	if err := o.frontier.WaitForFrontier(ctx, seq-1); err != nil {
+	if err := o.drainLanes(ctx, seq-1); err != nil {
 		return err
 	}
 	if err := o.writeCheckpoint(ctx); err != nil {
@@ -1156,6 +1235,10 @@ func (o *Orchestrator) readLaneBatch(ctx context.Context, i, size int) (buf []La
 		case lc, ok := <-o.laneIn[i]:
 			if !ok {
 				return buf, true, nil
+			}
+			if lc.flush {
+				// The coordinator is draining (drainLanes): commit what we hold.
+				return buf, false, nil
 			}
 			buf = append(buf, lc)
 			batchBytes += ir.ApproximateChangeBytes(lc.Change)

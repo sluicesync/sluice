@@ -489,6 +489,17 @@ type ApplyConcurrencySetter interface {
 	SetApplyConcurrency(lanes int)
 }
 
+// ExactlyOnceLanesSetter is the optional surface a [ChangeApplier] with a
+// key-hash lane path implements to receive `sync start --exactly-once-lanes`
+// (ADR-0190 amendment C): whether the LANES write apply marks, behind the
+// checkpoint-before-mark fence. Off (the zero value, the default) the lanes
+// write none and never fence — they still check the marks the serial and
+// barrier paths write. Zero-value-safe by construction: the opt-in is the
+// only state a setter call can add.
+type ExactlyOnceLanesSetter interface {
+	SetExactlyOnceLanes(on bool)
+}
+
 // RedactorSetter is the optional surface a [ChangeApplier] can
 // implement to receive the operator-configured PII redaction
 // policy. PII Phase 1.5 (roadmap item 15a follow-on, GitHub issue

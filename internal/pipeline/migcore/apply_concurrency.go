@@ -79,6 +79,21 @@ func ApplyApplyConcurrency(target any, lanes int) {
 	}
 }
 
+// ApplyExactlyOnceLanes plumbs `sync start --exactly-once-lanes` (ADR-0190
+// amendment C) to a target applier that implements
+// [ir.ExactlyOnceLanesSetter]. off is a no-op — the applier's zero value
+// already is the default, so only the opt-in needs a call. Streamer-only:
+// the broker and chain replay carry no apply identities, so their lanes
+// have no marks to write either way.
+func ApplyExactlyOnceLanes(target any, on bool) {
+	if !on {
+		return
+	}
+	if setter, ok := target.(ir.ExactlyOnceLanesSetter); ok {
+		setter.SetExactlyOnceLanes(true)
+	}
+}
+
 // HeadroomDivisor returns the factor by which an AUTO concurrency / parallelism
 // value should be reduced given the target's LIVE resource headroom: 1 =
 // healthy (no reduction), 2 = approaching the high-water, 4 = at/over it. ok is
