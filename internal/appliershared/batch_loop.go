@@ -797,9 +797,11 @@ func commitBatch(ctx context.Context, cfg *BatchConfig, tx BatchTx, streamID, to
 	// position INSIDE a source transaction, which a MySQL binlog resume
 	// cannot start from. That requires there to BE an open source
 	// transaction. A source that emits no transaction markers at all —
-	// VStream (PlanetScale / Vitess) and every trigger-CDC engine — never
-	// opens one, so there is no mid-transaction point to land in and
-	// withholding the position buys nothing.
+	// every trigger-CDC engine, and VStream (PlanetScale / Vitess) before
+	// v0.156.5, whose reader then discarded vtgate's BEGIN/COMMIT (ADR-0190
+	// phase 4 now forwards them) — never opens one, so there is no
+	// mid-transaction point to land in and withholding the position buys
+	// nothing.
 	//
 	// It costs a great deal: the flag is set on the MySQL ChangeApplier (the
 	// TARGET) while encoding a constraint about the SOURCE, so any of those

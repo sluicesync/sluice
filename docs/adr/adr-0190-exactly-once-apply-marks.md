@@ -26,7 +26,7 @@ Sources: MySQL 8.0 GTID, MySQL 8.0 file/pos, MariaDB 11.4. Targets: Postgres 16,
 | serial batched, transaction fits one batch | nothing applied | converges exactly |
 | serial batched, transaction larger than a batch | a prefix applied | same collision |
 
-By code-reading, not measured: (1) the lane path's checkpoint is a separate write, so a crash after a transaction fully committed but before the next checkpoint replays the **whole** transaction onto its own end state — the same collision with no mid-transaction kill at all; (2) VStream emits no transaction markers, so no apply path has cohesion on PlanetScale/Vitess; (3) Postgres sources re-deliver whole transactions from the slot and share the same appliers.
+By code-reading, not measured: (1) the lane path's checkpoint is a separate write, so a crash after a transaction fully committed but before the next checkpoint replays the **whole** transaction onto its own end state — the same collision with no mid-transaction kill at all; (2) sluice's VStream reader discarded vtgate's BEGIN/COMMIT events, so no apply path had transaction cohesion on PlanetScale/Vitess (corrected 2026-09-29: an earlier wording of this sentence said VStream emits no transaction markers, which is false; phase 4 forwards them); (3) Postgres sources re-deliver whole transactions from the slot and share the same appliers.
 
 ### When rows commit and when the position is saved, per path
 
