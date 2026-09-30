@@ -228,22 +228,21 @@ type CDCReader struct {
 	// dispatchWAL). nil outside a running pump.
 	pumpKA *pumpKeepalive
 
-	// holdAck + ackCeil implement the chain-consumer ack mode used by
-	// `backup incremental` / `backup stream` (which have no applier
-	// and therefore no lsnTracker). Without it, the no-tracker
-	// keepalive fallback acks streamedLSN — which advances as the pump
-	// PARSES CommitMessages, before (or regardless of whether) the
-	// orchestrator durably commits those events to chunks. A keepalive
-	// firing between window-close and pump teardown would then push
-	// confirmed_flush_lsn past the manifest's recorded EndPosition,
-	// and the NEXT incremental would silently miss the WAL in between
-	// (the walsender fast-forwards START_REPLICATION to
-	// confirmed_flush_lsn). With holdAck set, the keepalive never
-	// advertises past max(startLSN, ackCeil); the orchestrator raises
-	// ackCeil via ReleaseSlotAckTo as windows durably commit. Both are
-	// atomics: holdAck is set before StreamChanges, ackCeil is raised
-	// from the orchestrator goroutine while the pump reads it.
-	holdAck atomic.Bool
+	// ackCeil is the slot-ack CEILING (GC-41): the highest LSN a
+	// downstream consumer has released via [CDCReader.ReleaseSlotAckTo]
+	// as DURABLY held on its side — the target's persisted control row
+	// (the pipeline's slot-ack ceiling sidecar) or a backup chain's
+	// committed manifest EndPosition. The keepalive never advertises past
+	// max(startLSN, ackCeil), UNCONDITIONALLY: the zero value means
+	// "nothing released" and floors the ack at the stream's start
+	// position, so a consumer that never releases retains WAL (visible as
+	// slot lag) rather than losing it. Before GC-41 the clamp was an
+	// opt-in mode only the backup chain engaged, and every stream without
+	// a Postgres applier's tracker acked the STREAMED LSN — which advances
+	// as the pump parses CommitMessages, ahead of any target write — so a
+	// Postgres → MySQL / SQLite / D1 sync stopped mid-batch resumed past
+	// changes it never applied: silent loss. Raised from the consumer's
+	// goroutine while the pump reads it, hence the atomic.
 	ackCeil atomic.Uint64
 
 	// systemID and timeline pin the source's identity (ADR-0051,
@@ -1056,10 +1055,10 @@ func checkSourceIdentity(ctx context.Context, slotName, persistedSysID string, p
 //     routine sends THIS value as WALWritePosition so the slot's
 //     confirmed_flush_lsn never advances past durably-applied work.
 //
-// On streams without a tracker (tests, legacy non-streamer
-// callers), the pump falls back to streamedLSN so the slot still
-// gets keepalive activity. Production paths always wire a tracker
-// via the [pipeline.Streamer].
+// Whichever of the two is used, the ack is then clamped at the
+// consumer-released ceiling ([CDCReader.ackLSN], GC-41), so on a
+// stream without a tracker it is the ceiling — never streamedLSN —
+// that bounds what the slot releases.
 //
 // done is closed when the pump has fully unwound — declared first so it
 // runs LAST, after the replication connection is closed and after the
@@ -1970,46 +1969,37 @@ func (r *CDCReader) positionAt(lsn pglogrepl.LSN) (ir.Position, error) {
 	})
 }
 
-// ackLSN picks the LSN to advertise to the upstream slot. When an
-// applier feedback tracker is wired, its value wins; until the
-// applier reports its first commit, anchor at startLSN so the slot
-// can't advance past the position the stream resumed from. Without a
-// tracker (legacy/test paths), report streamedLSN — equivalent to
-// the v0.4.0 behaviour, which is correct when no async-batched
-// apply layer is buffering ahead of the durable target write.
+// ackLSN picks the LSN to advertise to the upstream slot: never past
+// what a downstream consumer has DURABLY released (the ceiling), never
+// past what the pump has streamed, and never below the start position.
 //
-// Bug 15 (post-v0.5.0): the pre-fix branch on `applied == 0` returned
-// streamedLSN, which advances as the pump parses CommitMessages off
-// the WAL stream — well before the applier has durably committed. On
-// warm-resume against a fresh tracker (applied=0 always at startup,
-// the tracker doesn't restore from persisted state), a keepalive
-// firing in the window between stream-start and first-apply would
-// ack confirmed_flush_lsn past the position. A subsequent crash or
-// `sync stop` mid-batch then permanently lost the events between
-// persisted_position and confirmed_flush_lsn.
+// The ceiling is the load-bearing half, and it is unconditional (GC-41).
+// streamedLSN advances as the pump parses CommitMessages off the WAL —
+// well before any target write — so acking it lets confirmed_flush_lsn
+// run past changes still sitting in an apply batch, a lane, or an
+// --apply-delay hold. A stop or crash there loses them permanently: the
+// walsender fast-forwards START_REPLICATION to confirmed_flush_lsn, so
+// the resumed stream never re-sends them. The ceiling is raised only by
+// [CDCReader.ReleaseSlotAckTo], whose callers release positions they
+// hold durably: the streamer's slot-ack ceiling sidecar releases the
+// TARGET's persisted control-row position, read back from the target,
+// and the backup chain releases a manifest's EndPosition after the
+// manifest commits. Bug 15 (post-v0.5.0) was the first form of this
+// defect, on the Postgres-target path alone; GC-41 is the rest of it.
 //
-// startLSN is the LSN the pump started streaming from (cold-start:
-// snapshot LSN; warm-resume: persisted_position's LSN). It's the
-// safe floor: the slot already had events past startLSN durably-
-// applied at startup, and the applier's first commit will report a
-// higher value via the tracker.
-//
-// CORRECTION (2026-08-07 invariant sweep): that justification covers the
-// TRACKER branch only, and the holdAck branch below has no tracker by
-// construction — `backup incremental` and `backup stream` call
-// [CDCReader.HoldSlotAckAtCommitted] precisely because they run without an
-// applier. What makes startLSN a safe ack floor for THEM is a different
-// fact: their start position is the parent manifest's EndPosition, a
-// position the chain has already committed durably, so acking it releases
-// only WAL the archive holds. The one shape where that substitute argument
-// does not apply is a pre-v0.16.x parent carrying no EndPosition, where
-// `resolveStartPosition` falls back to the server's current WAL insert
-// position — "now" — and the window is documented as starting from now
-// anyway. Stated rather than implied; the ack ARITHMETIC is pinned by
-// TestCDCReader_AckLSN_ChainConsumerHold and TestAckLSN_*, and nothing
-// binds startLSN to "a position the chain committed" because the reader
-// cannot see that. UNVERIFIED PREMISE at this level, discharged by the
-// callers.
+// startLSN is the floor: the LSN the pump started streaming from (cold
+// start: the slot's snapshot LSN, already the slot's confirmed_flush_lsn
+// at creation; warm resume: the persisted position's LSN, durable by
+// definition). Acking it releases nothing the consumer lacks. For the
+// backup chain the substitute argument applies — its start position is
+// the parent manifest's EndPosition, which the chain has already
+// committed — with the one documented exception of a pre-v0.16.x parent
+// carrying no EndPosition, where `resolveStartPosition` falls back to the
+// server's current WAL insert position and the window is documented as
+// starting from now anyway. Nothing binds startLSN to "a position the
+// consumer holds" because the reader cannot see that: UNVERIFIED PREMISE
+// at this level, discharged by the callers. The arithmetic is pinned by
+// TestAckLSN_*.
 func (r *CDCReader) ackLSN(streamedLSN, startLSN pglogrepl.LSN) pglogrepl.LSN {
 	ack := streamedLSN
 	if r.appliedLSN != nil {
@@ -2019,45 +2009,26 @@ func (r *CDCReader) ackLSN(streamedLSN, startLSN pglogrepl.LSN) pglogrepl.LSN {
 			ack = applied
 		}
 	}
-	// Chain-consumer clamp (see the holdAck field): never advertise
-	// past what the backup orchestrator has durably committed, floored
-	// at startLSN so the slot stays alive on idle streams. Applied on
-	// top of (not instead of) the tracker branch so the two compose.
-	if r.holdAck.Load() {
-		ceil := pglogrepl.LSN(r.ackCeil.Load())
-		if ceil < startLSN {
-			ceil = startLSN
-		}
-		if ack > ceil {
-			ack = ceil
-		}
-	}
-	return ack
+	ceil := max(pglogrepl.LSN(r.ackCeil.Load()), startLSN)
+	return min(ack, ceil)
 }
 
-// HoldSlotAckAtCommitted switches the keepalive's slot ack into
-// chain-consumer mode: the advertised confirmed_flush_lsn never
-// passes the highest position released via [ReleaseSlotAckTo]
-// (floored at the stream's start position). `backup incremental` and
-// `backup stream` set this before StreamChanges — they have no
-// applier feedback tracker, and the no-tracker fallback (ack the
-// streamed LSN) would let a keepalive release WAL the chain has not
-// durably captured. Must be called before [CDCReader.StreamChanges].
-func (r *CDCReader) HoldSlotAckAtCommitted() {
-	r.holdAck.Store(true)
-}
-
-// ReleaseSlotAckTo raises the chain-consumer ack ceiling to pos —
-// called by the backup orchestrator after a window's manifest is
-// durably committed, so the slot releases exactly the WAL the chain
-// now carries. Ratchets monotonically (a lower position is ignored).
-// Safe to call from a different goroutine than the pump's.
+// ReleaseSlotAckTo raises the ack ceiling to pos — called by a consumer
+// once pos is durably held on its side: the streamer's slot-ack ceiling
+// sidecar after reading it back from the target's control row, the
+// backup orchestrator after a window's manifest commits. The slot then
+// releases exactly the WAL the consumer now holds. Ratchets
+// monotonically (a lower position is ignored), and a position naming a
+// DIFFERENT slot is ignored too: it is not evidence about this slot's
+// stream, and ignoring it can only hold the ack back. Safe to call from
+// a different goroutine than the pump's (slotName is immutable after
+// open; ackCeil is atomic).
 func (r *CDCReader) ReleaseSlotAckTo(pos ir.Position) error {
 	decoded, ok, err := decodePGPos(pos)
 	if err != nil {
 		return fmt.Errorf("postgres: release slot ack: %w", err)
 	}
-	if !ok || decoded.LSN == "" {
+	if !ok || decoded.LSN == "" || decoded.Slot != r.slotName {
 		return nil
 	}
 	lsn, err := pglogrepl.ParseLSN(decoded.LSN)
@@ -2125,9 +2096,7 @@ type pumpKeepalive struct {
 }
 
 // sendStandbyStatus reports the slot ack. The value is [CDCReader.ackLSN]
-// — the applier-confirmed LSN when a tracker is wired, clamped by the
-// chain-consumer ceiling — and never the streamed LSN on a tracked
-// stream, whichever path sends it.
+// — clamped at the consumer-released ceiling — whichever path sends it.
 func (r *CDCReader) sendStandbyStatus(ctx context.Context, ka *pumpKeepalive) error {
 	ack := r.ackLSN(*ka.streamedLSN, ka.startLSN)
 	if err := pglogrepl.SendStandbyStatusUpdate(ctx, ka.conn, pglogrepl.StandbyStatusUpdate{

@@ -93,10 +93,13 @@ func TestLSNTracker_ConcurrentSingleProducer(t *testing.T) {
 // lost events between persisted_position and confirmed_flush_lsn.
 //
 // The fix anchors the ack at startLSN until the applier reports
-// its first commit. Once applied > 0, the tracker takes over.
+// its first commit. Once applied > 0, the tracker takes over —
+// beneath the GC-41 ceiling, released wide open here so this test
+// grades the tracker arm alone.
 func TestAckLSN_AnchorsAtStartLSNUntilFirstApply(t *testing.T) {
 	tr := newLSNTracker()
 	r := &CDCReader{appliedLSN: tr}
+	r.ackCeil.Store(uint64(pglogrepl.LSN(0x10000)))
 
 	startLSN := pglogrepl.LSN(0x100)
 	// Pump has parsed several commits past startLSN but the applier
@@ -127,18 +130,19 @@ func TestAckLSN_AnchorsAtStartLSNUntilFirstApply(t *testing.T) {
 	}
 }
 
-// TestAckLSN_NoTrackerReturnsStreamedLSN preserves the legacy
-// behaviour for non-streamer callers (no tracker wired) — useful for
-// snapshot-stream test paths and pre-v0.5.0 compatibility shims.
-func TestAckLSN_NoTrackerReturnsStreamedLSN(t *testing.T) {
+// TestAckLSN_NoTrackerIsBoundedByTheCeiling pins the arm GC-41 closed:
+// a reader with no tracker — every Postgres → non-Postgres sync — used
+// to ack the streamed LSN, which this test once pinned as "legacy
+// behaviour". It must hold at startLSN until a durable release.
+func TestAckLSN_NoTrackerIsBoundedByTheCeiling(t *testing.T) {
 	r := &CDCReader{appliedLSN: nil}
 
 	startLSN := pglogrepl.LSN(0x100)
 	streamed := pglogrepl.LSN(0x500)
 
 	got := r.ackLSN(streamed, startLSN)
-	if got != streamed {
-		t.Errorf("with nil tracker, ackLSN = %v; want streamedLSN=%v", got, streamed)
+	if got != startLSN {
+		t.Errorf("with nil tracker and nothing released, ackLSN = %v; want startLSN=%v", got, startLSN)
 	}
 }
 

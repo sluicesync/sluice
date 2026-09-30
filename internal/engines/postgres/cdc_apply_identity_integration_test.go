@@ -69,8 +69,8 @@ func TestPGCDC_ApplyIdentity_StableAcrossRedelivery(t *testing.T) {
 
 	// ---- Delivery 1: a warm-up transaction W, then the transaction T. ----
 	rdr1 := openCDC(t, ctx, dsn, true)
-	// Keep the slot's confirmed_flush where delivery 2 must resume from.
-	rdr1.HoldSlotAckAtCommitted()
+	// Nothing is ever released to this reader, so the slot's
+	// confirmed_flush stays where delivery 2 must resume from (GC-41).
 	ch1, err := rdr1.StreamChanges(ctx, ir.Position{})
 	if err != nil {
 		t.Fatalf("delivery 1 StreamChanges: %v", err)

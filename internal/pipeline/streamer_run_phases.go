@@ -240,6 +240,8 @@ func (s *Streamer) phaseResolveStreamIdentity(ctx context.Context) (string, erro
 	// registration sidecar (a new attempt opens a new reader and must re-register).
 	s.changeLogConsumers = nil
 	s.changeLogConsumerStarted = false
+	// GC-41: and for the slot-ack releaser the ceiling sidecar feeds.
+	s.slotAck = nil
 
 	// Apply the sluice-prefix convention to the operator-supplied
 	// slot name (v0.10.2). Empty stays empty (engine default);
@@ -1024,6 +1026,13 @@ func (s *Streamer) phaseStartApplySidecars(applyCtx context.Context, applier ir.
 	s.startChangeLogConsumerRegistration(applyCtx, streamID, applier)
 
 	s.startAutoPruneChangeLog(applyCtx, streamID, applier)
+
+	// GC-41: release the target's DURABLE position to a Postgres source's
+	// slot on a cadence — the only thing that lets the slot's ack advance
+	// on a sync (the reader never acks past what is released). No slot ⇒
+	// no goroutine. Failure-isolated: a failed read holds the ack, which
+	// retains WAL and loses nothing.
+	s.startSlotAckCeiling(applyCtx, streamID, applier)
 
 	// ADR-0107 items 35 (rolling-history recorder) + 36 (threshold alerter)
 	// are NO LONGER started here — they are started earlier, in runOnce (see

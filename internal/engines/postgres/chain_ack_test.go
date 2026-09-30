@@ -21,29 +21,22 @@ func mustPos(t *testing.T, lsn pglogrepl.LSN) ir.Position {
 	return pos
 }
 
-// TestCDCReader_AckLSN_ChainConsumerHold pins the chain-consumer ack
-// clamp (task #40 half (c)): with HoldSlotAckAtCommitted set and no
-// applier tracker, the keepalive must never advertise past
-// max(startLSN, released ceiling) — the no-tracker fallback (ack the
-// streamed LSN) is exactly the silent-loss shape for backup chains
-// (events parsed by the pump but never committed to chunks would
-// release WAL the chain doesn't carry).
-func TestCDCReader_AckLSN_ChainConsumerHold(t *testing.T) {
-	r := &CDCReader{}
+// TestAckLSN_NeverPastTheReleasedCeiling pins GC-41's reader half: the
+// keepalive never advertises past max(startLSN, the highest position a
+// consumer has released), and it does so for the ZERO-VALUE reader — no
+// opt-in call. Before GC-41 the clamp was a mode only the backup chain
+// engaged, and a reader nobody engaged acked the STREAMED LSN: a Postgres
+// source synced to MySQL / SQLite / D1 released WAL for changes still in
+// an apply batch, and a stop mid-batch resumed past them (silent loss).
+func TestAckLSN_NeverPastTheReleasedCeiling(t *testing.T) {
+	r := &CDCReader{slotName: "sluice_slot"}
 	start := pglogrepl.LSN(100)
 	streamed := pglogrepl.LSN(500)
 
-	// Baseline (no hold): legacy fallback acks the streamed LSN.
-	if got := r.ackLSN(streamed, start); got != streamed {
-		t.Fatalf("no-hold ackLSN = %v; want streamed %v", got, streamed)
-	}
-
-	r.HoldSlotAckAtCommitted()
-
-	// Held, nothing released: clamp to startLSN even though the pump
-	// has streamed far past it.
+	// Nothing released: the ack holds at startLSN even though the pump
+	// has streamed far past it. This is the arm the defect lived in.
 	if got := r.ackLSN(streamed, start); got != start {
-		t.Errorf("held ackLSN = %v; want start %v (streamed must not leak)", got, start)
+		t.Fatalf("unreleased ackLSN = %v; want start %v (the streamed LSN must not leak)", got, start)
 	}
 
 	// Release to 300: ack follows the ceiling, still not streamed.
@@ -63,20 +56,45 @@ func TestCDCReader_AckLSN_ChainConsumerHold(t *testing.T) {
 	}
 
 	// Streamed below the ceiling: ack the streamed value (the clamp
-	// only caps, it never inflates).
+	// only caps, it never inflates past what the pump has seen).
 	if got := r.ackLSN(pglogrepl.LSN(250), start); got != pglogrepl.LSN(250) {
 		t.Errorf("streamed(250) under ceiling(300): ackLSN = %v; want 250", got)
 	}
 
-	// The zero position (the "from now" sentinel) is ignored without
-	// error; a FOREIGN engine's position is a loud error (a chain
-	// whose parent position belongs to another engine is corrupt —
-	// decodePGPos's cross-engine refusal propagates).
+	// A ceiling below startLSN is floored at startLSN (the start
+	// position is durable by definition).
+	if got := r.ackLSN(streamed, pglogrepl.LSN(400)); got != pglogrepl.LSN(400) {
+		t.Errorf("ceiling(300) under start(400): ackLSN = %v; want start 400", got)
+	}
+}
+
+// TestReleaseSlotAckTo_PositionShapes pins what a release accepts. The
+// zero position (the "from now" sentinel) is ignored without error; a
+// FOREIGN engine's position is a loud error (decodePGPos's cross-engine
+// refusal — a caller handing one over has a corrupt position, and saying
+// so beats a silently frozen slot); and a position naming a DIFFERENT
+// slot is ignored, because it is no evidence about this slot's stream and
+// ignoring it can only hold the ack back.
+func TestReleaseSlotAckTo_PositionShapes(t *testing.T) {
+	r := &CDCReader{slotName: "sluice_slot"}
+	start := pglogrepl.LSN(100)
+	streamed := pglogrepl.LSN(500)
+
 	if err := r.ReleaseSlotAckTo(ir.Position{}); err != nil {
 		t.Errorf("ReleaseSlotAckTo(zero position) = %v; want nil (ignored)", err)
 	}
 	if err := r.ReleaseSlotAckTo(ir.Position{Engine: "mysql", Token: "x"}); err == nil {
 		t.Error("ReleaseSlotAckTo(foreign position) = nil; want loud cross-engine error")
+	}
+	other, err := encodePGPos(pgPos{Slot: "sluice_other", LSN: pglogrepl.LSN(400).String()})
+	if err != nil {
+		t.Fatalf("encodePGPos: %v", err)
+	}
+	if err := r.ReleaseSlotAckTo(other); err != nil {
+		t.Fatalf("ReleaseSlotAckTo(other slot) = %v; want nil (ignored)", err)
+	}
+	if got := r.ackLSN(streamed, start); got != start {
+		t.Errorf("after a release naming another slot, ackLSN = %v; want start %v (ignored)", got, start)
 	}
 }
 

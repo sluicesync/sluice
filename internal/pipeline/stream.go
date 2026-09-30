@@ -509,9 +509,9 @@ func (b *BackupStream) Run(ctx context.Context) (err error) {
 				// unforwarded-schema-change baseline; a fresh read would
 				// absorb a change made before the transient.
 				carryUnforwardedBaseline(prevCDC, cdc)
-				// The fresh pump needs chain-consumer ack mode re-armed
-				// (it's per-reader state, set before StreamChanges).
-				holdChainAck(cdc)
+				// The fresh reader starts with nothing released, so its
+				// ack holds at resumeFrom (the parent's committed end)
+				// until the next rollover releases its window (GC-41).
 				resumeFrom := currentParent.EndPosition
 				changesCh, err = cdc.StreamChanges(ctx, resumeFrom)
 				if err != nil {
@@ -879,12 +879,10 @@ func (b *BackupStream) newRolloverLoop(ctx context.Context) (*rolloverInit, erro
 		return nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("stream: open cdc reader: %w", err))
 	}
 
-	// Chain-consumer ack mode (see [chainAckController]): the stream
-	// has no applier tracker, so without the hold the keepalive acks
-	// streamed-but-not-yet-committed positions; each rollover commit
-	// below releases its window via releaseChainAckTo, bounding source
-	// WAL retention to ~one rollover window.
-	holdChainAck(cdc)
+	// Slot ack (see [slotAckReleaser]): the reader never acks past what
+	// is released, and each rollover commit below releases its window via
+	// releaseChainAckTo, bounding source WAL retention to ~one rollover
+	// window.
 
 	// Trigger-CDC sources: seat the chain in the change log's consumer
 	// registry at its resume position BEFORE reading, so a peer sync's

@@ -10,47 +10,44 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 )
 
-// chainAckController is the structural seam to the engine CDC reader's
-// chain-consumer ack mode (Postgres: [postgres.CDCReader]'s
-// HoldSlotAckAtCommitted / ReleaseSlotAckTo). The backup-chain
-// orchestrators ([IncrementalBackup], [BackupStream]) have no change
-// applier, so the reader has no applied-LSN tracker — and the
-// no-tracker keepalive fallback acks the STREAMED position, which can
-// run ahead of what the orchestrator durably commits to chunks. An
-// ack past the recorded EndPosition releases source WAL the chain has
-// not captured: the next link would silently start past it (the
-// walsender fast-forwards to confirmed_flush_lsn). Hold-then-release
-// pins the ack to durably-committed window ends instead.
+// slotAckReleaser is the structural seam to a CDC reader whose source
+// keeps server-side consumer state that an ack RELEASES (Postgres: the
+// logical slot's confirmed_flush_lsn, via [postgres.CDCReader]'s
+// ReleaseSlotAckTo). Such a reader never acks past the highest position
+// released through this seam (GC-41: unconditionally, floored at the
+// stream's start), so every consumer of one owes it a release of each
+// position it holds DURABLY — or the slot retains WAL for the life of
+// the stream. There are exactly two kinds of consumer, and each releases
+// from its own durable evidence:
 //
-// Same type-assert/silently-omit shape as [lsnTrackerAttacher]:
-// engines without server-side consumer state (MySQL) don't implement
-// it and need no equivalent.
-type chainAckController interface {
-	// HoldSlotAckAtCommitted must be called before StreamChanges.
-	HoldSlotAckAtCommitted()
+//   - the backup-chain orchestrators ([IncrementalBackup], [BackupStream])
+//     release a window's EndPosition after its manifest commits
+//     ([releaseChainAckTo]);
+//   - the continuous-sync [Streamer] releases the target's persisted
+//     control-row position, read back from the target
+//     ([Streamer.startSlotAckCeiling]).
+//
+// Engines without server-side consumer state (MySQL binlog, VStream) and
+// the trigger-CDC engines (whose change-log frontier has its own
+// registry, [ir.ChangeLogConsumerRegistry]) don't implement it and need
+// no equivalent. The roster that holds every CDC call site to this is
+// TestSlotAckReleaseRoster_EveryStreamChangesSiteReleases.
+type slotAckReleaser interface {
 	// ReleaseSlotAckTo ratchets the ack ceiling to pos (monotonic).
 	ReleaseSlotAckTo(pos ir.Position) error
 }
 
-// holdChainAck switches cdc into chain-consumer ack mode when the
-// engine supports it. Call before StreamChanges.
-func holdChainAck(cdc ir.CDCReader) {
-	if holder, ok := cdc.(chainAckController); ok {
-		holder.HoldSlotAckAtCommitted()
-	}
-}
-
-// releaseChainAckTo raises the chain-consumer ack ceiling to pos after
-// a window has been durably committed. Failures are logged, not
-// fatal: an un-released ack only delays WAL release (retention-side
-// pressure), it never loses chain data — the loud path is reserved
-// for the opposite direction (acking too far).
+// releaseChainAckTo raises the ack ceiling to pos after a backup-chain
+// window has been durably committed. Failures are logged, not fatal: an
+// un-released ack only delays WAL release (retention-side pressure), it
+// never loses chain data — the loud path is reserved for the opposite
+// direction (acking too far).
 func releaseChainAckTo(ctx context.Context, cdc ir.CDCReader, pos ir.Position) {
-	holder, ok := cdc.(chainAckController)
+	releaser, ok := cdc.(slotAckReleaser)
 	if !ok {
 		return
 	}
-	if err := holder.ReleaseSlotAckTo(pos); err != nil {
+	if err := releaser.ReleaseSlotAckTo(pos); err != nil {
 		slog.WarnContext(
 			ctx, "backup: release slot ack failed; source WAL release is delayed until the next chain link",
 			slog.String("err", err.Error()),

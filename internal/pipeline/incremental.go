@@ -329,15 +329,13 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 	}
 	defer migcore.CloseIf(cdc)
 
-	// Chain-consumer ack mode: without an applier there is no LSN
-	// tracker, and the reader's no-tracker keepalive fallback acks the
-	// STREAMED position — which can run ahead of what this run durably
-	// commits (events parsed by the pump but past the window close are
-	// discarded). An ack past the recorded EndPosition releases WAL
-	// the chain has not captured, silently gapping the next link. Hold
-	// the ack at the stream's start; the committed end is released
-	// after the manifest write below.
-	holdChainAck(cdc)
+	// Slot ack: a slot-keeping reader holds its ack at the stream's start
+	// until something is released (GC-41 — see [slotAckReleaser]); the
+	// streamed position can run ahead of what this run durably commits
+	// (events parsed by the pump past the window close are discarded), and
+	// an ack past the recorded EndPosition would release WAL the chain has
+	// not captured. The committed end is released after the manifest write
+	// below.
 
 	// Trigger-CDC sources: seat the chain in the change log's consumer
 	// registry at its resume position BEFORE reading, so a peer sync's

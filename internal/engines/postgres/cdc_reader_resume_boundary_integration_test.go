@@ -180,9 +180,9 @@ func TestPGCDC_TxCommitPositionIsPostCommit(t *testing.T) {
 	// first and the closed one is not re-delivered.
 	applyPGSQL(t, dsn, `INSERT INTO txpos VALUES (2, 'b');`)
 	rdr2 := openCDC(t, ctx, dsn, true)
-	// Keep the slot's confirmed_flush at this session's start so
-	// session 3 can resume from a point inside what this session read.
-	rdr2.HoldSlotAckAtCommitted()
+	// Nothing is released to this reader, so the slot's confirmed_flush
+	// stays at this session's start and session 3 can resume from a
+	// point inside what this session read (GC-41).
 	ch2, err := rdr2.StreamChanges(ctx, commit1)
 	if err != nil {
 		t.Fatalf("session 2 StreamChanges(commit of tx 1): %v", err)

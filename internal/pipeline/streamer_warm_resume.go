@@ -147,6 +147,8 @@ func (s *Streamer) warmResume(ctx context.Context, persisted ir.Position, lsnTra
 	// Roadmap item 115: and its consumer-registry companion, which the
 	// registration sidecar needs even when this stream never prunes.
 	s.captureChangeLogConsumerRegistry(cdc)
+	// GC-41: the slot-ack releaser the apply-phase ceiling sidecar feeds.
+	s.captureSlotAckReleaser(cdc)
 	return changes, stop, nil
 }
 

@@ -119,6 +119,12 @@ var (
 	// charset would commit them again. The VStream reader is pinned
 	// in-package (mysql.charsetShapeReporter) because its type is unexported.
 	_ charsetShapeReporter = (*mysql.CDCReader)(nil)
+	// GC-41: the ONLY input that lets a Postgres slot's ack advance. The
+	// reader never acks past what is released, so an assertion that quietly
+	// stopped matching would not lose data — it would freeze
+	// confirmed_flush_lsn and retain source WAL without bound, silently.
+	// Pinned so a rename fails the build instead.
+	_ slotAckReleaser = (*postgres.CDCReader)(nil)
 )
 
 // unpinnedPipelineSurfaces is the FROZEN remainder: pipeline-local interfaces
@@ -136,7 +142,6 @@ var (
 // work rather than a design question.
 var unpinnedPipelineSurfaces = map[string]string{
 	"RawDefaultReader":            "not yet pinned",
-	"chainAckController":          "not yet pinned",
 	"currentRoleReporter":         "not yet pinned",
 	"currentWALPositionReader":    "not yet pinned",
 	"liveAddedTablesReader":       "not yet pinned",

@@ -1409,6 +1409,14 @@ type Streamer struct {
 	// goroutine, so a plain bool suffices. Reset per attempt.
 	changeLogConsumerStarted bool
 
+	// slotAck is the per-attempt CDC reader cast to [slotAckReleaser] when
+	// its source keeps a slot an ack releases (Postgres; nil for every
+	// other source). The apply-phase slot-ack ceiling sidecar
+	// ([Streamer.startSlotAckCeiling]) releases the target's durable
+	// position through it (GC-41). Reset to nil per attempt alongside
+	// sourceErrFn; populated where sourceErrFn is.
+	slotAck slotAckReleaser
+
 	// runOnceFn is a test seam: when non-nil, [Run] / [runWithRetry]
 	// invoke it in place of [runOnce]. Production always leaves it nil
 	// (runOnceCall defaults to s.runOnce), so behaviour is identical;
@@ -2073,10 +2081,15 @@ func (s *Streamer) runOnce(ctx context.Context) (err error) {
 	// keepalive path. The tracker is opaque (typed `any`) so the
 	// pipeline package stays engine-neutral; the matching reader's
 	// AttachLSNTracker type-asserts internally. Cross-engine pairs
-	// (PG applier → MySQL reader, etc.) harmlessly hand a value the
-	// reader doesn't recognise; nothing breaks because the reader's
-	// fallback path (streamed-LSN keepalive) is correct for engines
-	// without an async-batched apply layer.
+	// hand a value the reader doesn't recognise, and the reader is then
+	// bounded by the slot-ack ceiling alone ([Streamer.startSlotAckCeiling]).
+	// CORRECTION (GC-41): this comment used to call the reader's
+	// untracked fallback — acking the STREAMED LSN — "correct for engines
+	// without an async-batched apply layer". No such target existed: MySQL
+	// batches (auto-1000) and runs lanes, and every target's apply loop
+	// buffers ahead of its durable position write, so a Postgres →
+	// non-Postgres sync stopped mid-batch resumed past changes it never
+	// applied. The reader no longer has a streamed-LSN fallback.
 	var lsnTracker any
 	if provider, ok := applier.(lsnTrackerProvider); ok {
 		lsnTracker = provider.LSNTracker()

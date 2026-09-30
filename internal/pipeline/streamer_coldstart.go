@@ -1551,6 +1551,8 @@ func (s *Streamer) coldStartBeginCDC(ctx context.Context, stream *ir.SnapshotStr
 	// is visible to a peer's pruner); this re-capture covers the paths that
 	// reach CDC without it and is a no-op when it already ran.
 	s.captureChangeLogConsumerRegistry(stream.Changes)
+	// GC-41: the slot-ack releaser the apply-phase ceiling sidecar feeds.
+	s.captureSlotAckReleaser(stream.Changes)
 	// stream stays alive for the rest of Run; the returned stop closure
 	// closes it when Run unwinds, joining the engine-side streaming
 	// goroutine deterministically (no longer left to process-exit

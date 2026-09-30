@@ -500,6 +500,8 @@ func (s *Streamer) coldStartMultiDatabase(
 	if errer, ok := stream.Changes.(interface{ Err() error }); ok {
 		s.sourceErrFn = errer.Err
 	}
+	// GC-41: a multi-schema Postgres stream reads one slot like any other.
+	s.captureSlotAckReleaser(stream.Changes)
 	return changes, stop, nil
 }
 
@@ -704,6 +706,8 @@ func (s *Streamer) warmResumeMultiDatabase(
 	if errer, ok := cdc.(interface{ Err() error }); ok {
 		s.sourceErrFn = errer.Err
 	}
+	// GC-41: a multi-schema Postgres stream reads one slot like any other.
+	s.captureSlotAckReleaser(cdc)
 	return changes, stop, nil
 }
 
