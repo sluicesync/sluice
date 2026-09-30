@@ -803,6 +803,11 @@ func writeState(ctx context.Context, rc resumeContext, state ir.MigrationState) 
 // per-chunk checkpoints all land through here so a 10k-table schema
 // never re-encodes the whole progress map per checkpoint. Same nil-
 // store no-op contract as writeState.
+//
+// A table's COMPLETE row is written on a ctx a stop cannot cancel (see
+// [recordCommittedWorkCtx]): the rows it vouches for have already
+// committed, so the record of them must not be the casualty of a stop that
+// lands between that commit and this write.
 func writeTableProgress(ctx context.Context, rc resumeContext, tableName string, entry ir.TableProgress) error {
 	if !rc.enabled {
 		return nil
@@ -814,10 +819,30 @@ func writeTableProgress(ctx context.Context, rc resumeContext, tableName string,
 	if !rc.throttle.allow(tableName, entry.State != ir.TableProgressInProgress, time.Now()) {
 		return nil
 	}
+	if entry.State == ir.TableProgressComplete {
+		var cancel context.CancelFunc
+		ctx, cancel = recordCommittedWorkCtx(ctx)
+		defer cancel()
+	}
 	if err := rc.store.WriteTableProgress(ctx, rc.migrationID, tableName, entry); err != nil {
 		return fmt.Errorf("pipeline: write table progress: %w", err)
 	}
 	return nil
+}
+
+// recordCommittedWorkCtx is the context for writing down work that has
+// ALREADY committed on the target — detached from the run's cancellation,
+// bounded by [stopDrainTimeout]. It is the progress-row sibling of the
+// cold-start CDC anchor ([coldStartAnchorWriteTimeout]): the same stop,
+// landing between a table's last committed chunk and its COMPLETE row, used
+// to lose that row, so a sync's stopped-cold-start resume could no longer
+// prove the copy finished and fell through to a fresh cold start — a full
+// re-copy, or, on a source at its replication-slot ceiling, the
+// REPLICATION-HEADROOM refusal (CI run 36778297813, reproduced by delaying
+// this write). `migrate --resume` lost the same row and re-copied a table
+// it had finished. Writing it anyway can only record the truth.
+func recordCommittedWorkCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), stopDrainTimeout)
 }
 
 // headerOnly strips the TableProgress map off a state value before a
