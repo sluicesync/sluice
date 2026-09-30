@@ -159,6 +159,41 @@ func TestControlTables_DMLOnlyRole(t *testing.T) {
 		}
 	})
 
+	// Bug 293 (GC-41 (d)): the arm above drives the serial Apply, which is
+	// why it never saw the default lane path panic at its first checkpoint
+	// (CloseTxs on a tracker Disable()d and never loaded). This arm runs the
+	// DEFAULT shape — batch size > 1, W lanes — with the mark table still
+	// absent, across three checkpoints.
+	t.Run("marks-missing-lanes", func(t *testing.T) {
+		exec(`CREATE TABLE gc40_log (v TEXT NOT NULL)`)
+		exec(`GRANT SELECT, INSERT, UPDATE, DELETE ON gc40_log TO ` + role)
+		logs.Reset()
+		a, err := start()
+		if err != nil {
+			t.Fatalf("EnsureControlTable with the mark table absent: %v", err)
+		}
+		defer func() { _ = a.Close() }()
+		a.SetApplyConcurrency(4)
+		applyLaneTxsAcrossCheckpoints(ctx, t, a, "gc40-lanes", 3, func(n int64) []ir.Change {
+			return []ir.Change{
+				ir.Insert{Schema: "public", Table: "gc40_items", Row: ir.Row{"id": 100 + n, "code": fmt.Sprintf("l%d", n)}},
+				ir.Insert{Schema: "public", Table: "gc40_log", Row: ir.Row{"v": fmt.Sprintf("l%d", n)}},
+			}
+		})
+		if !strings.Contains(logs.String(), applymarks.UnavailableMarker) {
+			t.Errorf("no %s WARN with the mark table absent:\n%s", applymarks.UnavailableMarker, logs.String())
+		}
+		for _, q := range []string{
+			`SELECT count(*) FROM gc40_items WHERE id BETWEEN 101 AND 103`,
+			`SELECT count(*) FROM gc40_log`,
+		} {
+			var n int
+			if err := admin.QueryRowContext(ctx, q).Scan(&n); err != nil || n != 3 {
+				t.Errorf("%s = %d (err %v); want 3 — the lanes did not converge (the keyless table must hold each row once)", q, n, err)
+			}
+		}
+	})
+
 	t.Run("column-missing", func(t *testing.T) {
 		exec(`ALTER TABLE public.sluice_cdc_state DROP COLUMN rows_applied`)
 		defer func() {

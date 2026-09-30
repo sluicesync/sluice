@@ -216,6 +216,22 @@ func (t *Tracker) Load(streamID, scope string, marks []Mark) {
 // Disable turns the tracker into a no-op: every change applies and no mark is
 // written — today's behaviour exactly. The engine calls it when the mark
 // table is unavailable ([UnavailableMarker]).
+//
+// # Inert by gate (Bug 293, GC-41 (d))
+//
+// A disabled tracker — and the zero Tracker, which starts disabled — has
+// never been through [Tracker.Load], so its maps are nil. Rather than also
+// make the maps here, EVERY method that touches them returns first when the
+// tracker is disabled: the guard [Tracker.Plan] and [Tracker.Committed]
+// always carried, now one rule for the whole method set. It covers the zero
+// value as well as Disable (a map made here would not), and a disabled run
+// accumulates no bookkeeping nobody reads. v0.156.5 shipped
+// [Tracker.CloseTxs] without the guard: on a stream behind
+// APPLY-MARKS-UNAVAILABLE the default lane path's first checkpoint wrote into
+// the nil closed map and panicked, the position never advanced, and every
+// restart replayed and panicked again — a keyless table gaining a duplicate
+// row each time. TestTracker_DisabledIsInertOnEveryMethod walks the method
+// set by reflection, so a new method is covered without being listed.
 func (t *Tracker) Disable() {
 	t.enabled.Store(false)
 }
@@ -394,6 +410,9 @@ func (s Subject) classOf(c ir.Change) (marked, pkChange bool) {
 // noteOpen records that the stream is inside transaction txID. The serial
 // paths close it with [Tracker.CloseOpen] at the transaction's commit.
 func (t *Tracker) noteOpen(txID string) {
+	if !t.enabled.Load() {
+		return
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.open[txID] = true
@@ -406,6 +425,9 @@ func (t *Tracker) noteOpen(txID string) {
 // whole and in order on every identity-carrying source, so this is exactly
 // the transaction the commit closes.
 func (t *Tracker) CloseOpen() {
+	if !t.enabled.Load() {
+		return
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	for tx := range t.open {
@@ -419,7 +441,7 @@ func (t *Tracker) CloseOpen() {
 // coordinator's form of [Tracker.CloseOpen], naming the transactions a
 // checkpoint boundary covers.
 func (t *Tracker) CloseTxs(txIDs []string) {
-	if len(txIDs) == 0 {
+	if !t.enabled.Load() || len(txIDs) == 0 {
 		return
 	}
 	t.mu.Lock()
@@ -449,7 +471,8 @@ func (t *Tracker) CloseTxs(txIDs []string) {
 // now passed — or stale, left behind by a position that moved without this
 // binary's bookkeeping (an older binary, a run with marks unavailable, an
 // external position write). Stale marks are harmless to the skip rule (a
-// TxID never recurs) but would otherwise live forever. Callers hold t.mu.
+// TxID never recurs) but would otherwise live forever. Callers hold t.mu and
+// have checked the tracker is enabled, so its maps exist (see Disable).
 func (t *Tracker) sweepLocked() {
 	if t.swept {
 		return
