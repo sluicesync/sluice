@@ -1,6 +1,6 @@
 # ADR-0190: Exactly-once apply marks — a restart skips the changes of an interrupted source transaction that already reached the target
 
-- **Status:** Accepted 2026-09-28 (operator answered the open questions — see "Operator decisions" below); proposed 2026-09-26 as DESIGN ONLY. Operator decision on GC-38 (l) (option (a) chosen over (b) net-effect replay and (c) transaction-aligned apply; see §"Alternatives considered"). Phases 1–5 implemented, unreleased (phases 4–5 diverge from §1 where the implementation-status notes say so) — see "Implementation status" below. Two AMENDMENTS, operator-approved 2026-09-28, supersede §3 where they differ: (A) a lane writes a transaction's marks only after a checkpoint-before-mark fence, and (B) the restart sweep rests on an invariant rather than on timing — see "Amendments", which also records the pre-land review's Finding 1 (that invariant was false on the serial batched path; fixed, and now checked at runtime). AMENDMENT C (operator, 2026-09-29): the LANES' marks — and amendment A's fence — are opt-in (`sync start --exactly-once-lanes`) after a benchmark measured the fence ~99.9% slower on secondary-unique-heavy work; the serial paths and the lane barrier keep their marks by default, and a drain no longer waits out the lanes' idle grace.
+- **Status:** Accepted 2026-09-28 (operator answered the open questions — see "Operator decisions" below); proposed 2026-09-26 as DESIGN ONLY. Operator decision on GC-38 (l) (option (a) chosen over (b) net-effect replay and (c) transaction-aligned apply; see §"Alternatives considered"). Phases 1–5 implemented, unreleased (phases 4–5 diverge from §1 where the implementation-status notes say so) — see "Implementation status" below. Two AMENDMENTS, operator-approved 2026-09-28, supersede §3 where they differ: (A) a lane writes a transaction's marks only after a checkpoint-before-mark fence, and (B) the restart sweep rests on an invariant rather than on timing — see "Amendments", which also records the pre-land review's Finding 1 (that invariant was false on the serial batched path; fixed, and now checked at runtime). AMENDMENT C (operator, 2026-09-29): the LANES' marks — and amendment A's fence — are opt-in (`sync start --exactly-once-lanes`) after a benchmark measured the fence ~99.9% slower on secondary-unique-heavy work; the serial paths and the lane barrier keep their marks by default, and a drain no longer waits out the lanes' idle grace. AMENDMENT D (PROPOSED 2026-09-30, design only, not approved): the fence's checkpoint rides the marked lane batch's own transaction. It is sound only with the drain kept and an "anchored" rule on the other lanes, and fix #3 (the per-key fence) is found incompatible with amendment A. See "Amendment D".
 - **Date:** 2026-09-26
 - **Related:** [ADR-0007](adr-0007-position-persistence.md) (position written in the batch's own transaction); [ADR-0010](adr-0010-idempotent-applier.md) (idempotent UPSERT apply, the assumption this ADR finds is not enough); [ADR-0027](adr-0027-source-transaction-boundary-cdc-batching.md) (source-transaction cohesion on the serial batched path); [ADR-0089](adr-0089-default-adaptive-apply-batch-size.md) (its keyless guard: keyless tables are at-least-once); [ADR-0104](adr-0104-mysql-pipelined-cdc-apply.md) / [ADR-0105](adr-0105-postgres-concurrent-cdc-apply.md) (the lane path and its position relaxation); audit backlog GC-38 (l) (the measurement); `internal/pipeline/streamer_crash_midtxn_integration_test.go` (the gate: every apply path converges after a kill mid-transaction — the lanes' secondary-unique changes only with `--exactly-once-lanes`, amendment C).
 
@@ -239,7 +239,242 @@ Every other engine's `OpenChangeApplier` refuses (SQLite, D1, the trigger-CDC so
 - (iii) for a BARRIER mark: the barrier checkpoints after its drain, and the checkpoint is the highest recorded boundary at or below the frontier — on a marker stream the TxCommit of the transaction before the barrier's own (the barrier's transaction has not committed yet), on a marker-less stream the settled predecessor. So when a barrier's marks commit, the persisted position sits at its transaction's start: the fence's own prefix, for free. For a SERIAL mark: the serial paths never move the position inside a source transaction (ADR-0027 cohesion, CDCPOS-2, `schemaEventAtBoundary`). And whichever path wrote a transaction's marks, the checkpoint or position write that passes its commit deletes them in the same target transaction (`closedTx` → `CloseTxs`).
 - **The mixed case** — a transaction T whose barrier writes marks, with unmarked secondary-unique lane changes around it, followed by unmarked lane transactions T+1…, crash, replay. The position is at T's start (iii); marks name only T. The replay delivers T first (so `firstTx` = T and T's marks are trusted): T's changes before the barrier on the barrier's key are skipped on its mark (durable by (ii)); the barrier is skipped; T's other changes and T+1… carry no mark and re-apply — idempotent upserts, or the pre-ADR loud unique collision on a secondary-unique table. No skip is possible on T+1… (no mark names them), and no change of T is skipped that is not durable. So the partial coverage can turn a convergence into the documented LOUD collision, never into a silent skip. Pinned: `lanes_batched` (default: the barrier marks — 2 at the kill — and the lanes do not; the restart stops on `23505` / `1062`, and a second restart stops the same way, on every marker source; on the marker-less trigger sources the cell accepts EITHER convergence or the loud collision, because each change is its own transaction and the lane checkpoint sits inside the source transaction, so the unmarked replay window — logged every run, measured at change-log ids 103..108 and 105..108 below the blocking statement 109 — decides it by timing; measured: converged on both pairs), `pkchange_lanes_batched` and `keyless_lanes_batched` (default: converge on the barrier's marks), `lane_count_changed_serial_to_lanes` (serial marks CHECKED by default lanes: converges), and `lane_post_commit_window_default` (no mark at the kill; the idempotent replay converges — without marks the amendment-A window cannot produce a skip).
 
-**Follow-up plan (not in this change).** Fix #2: write the fence's checkpoint in the marked batch's OWN lane transaction, so the fence costs no separate synchronous position write and a secondary-unique table's lane runs at about serial parity — then reconsider the default. Fix #3: a per-KEY fence (drain only the lane that holds the key's predecessor) — which reopens amendment A's option B territory and needs its own soundness argument; future.
+**Follow-up plan (not in this change).** Fix #2: write the fence's checkpoint in the marked batch's OWN lane transaction, so the fence costs no separate synchronous position write and a secondary-unique table's lane runs at about serial parity — then reconsider the default. Fix #3: a per-KEY fence (drain only the lane that holds the key's predecessor) — which reopens amendment A's option B territory and needs its own soundness argument; future. (Both are worked through in amendment D below: #2 is sound with two conditions, #3 is not compatible with amendment A.)
+
+### Amendment D (proposed 2026-09-30): the fence's checkpoint rides the marked lane batch's own transaction — PROPOSED, design only
+
+**Status: PROPOSED — design only, no code.** Nothing here is implemented. It changes amendment A's fence *mechanics* only; amendment A's invariant, amendment B's sweep and its runtime check, and amendment C's opt-in (`--exactly-once-lanes`) all stand. Open questions for the operator are at the end (D-Q1…D-Q5).
+
+**Verdict.** Fix #2 — fold the fence's position write into the target transaction of the lane batch that carries the transaction's first marked change — is **sound only with two conditions**, and both are load-bearing:
+
+1. **The drain stays.** The folded position must be the transaction's START (the anchor below), and the anchor is only a legal position once every change before the transaction's first marked change is durable on every lane. A fold that writes "whatever the frontier currently allows" instead is unsound (counterexample V1).
+2. **No other lane may commit a mark of the transaction before the fold commits** (the *anchored* rule). A fold that clears every lane at once is unsound as an invariant (counterexample V2); the Finding-1 (b) runtime check (`APPLY-MARK-UNTRUSTED`) happens to rescue it, but this ADR's rule is that the invariant holds without the check.
+
+**The key invariant** is amendment B's, made tighter: **the mark set moves from transaction T−1 to transaction T in the same target transaction that moves the persisted position from T−1's start to T's start.** Today those are two commits (the checkpoint deletes T−1's marks and moves the position, then a lane commits T's marks); each is safe alone. Under the fold they are one commit, so no crash can land between them.
+
+**Expected cost.** On a stream made of marked transactions, the fold removes one of the two synchronous target commits the fence pays today, which leaves one target transaction per source transaction carrying the same statements as the serial path's `commitBatch` (data, mark upsert, closed-mark delete, position). The model estimate is ~0.9–1.0× `--apply-concurrency 1` on the fencebench workload A (today ~0.49×) and about twice today's flag-on figure on the 20% mix (workload C). Neither number has been measured; §D.6 gives the acceptance thresholds. Fix #3 is rejected (§D.5).
+
+#### D.1 Where the cost comes from (measured, 2026-09-29, `f0596df6`, fencebench round 2)
+
+Medians of three runs, source transactions/s, with the drain's wake fix in place. `eol` = `--exactly-once-lanes`, `serial` = `--apply-concurrency 1`, `lanes` = the default.
+
+| Pair, RTT | Workload | lanes (default) | serial | eol | eol ÷ serial |
+|---|---|---|---|---|---|
+| MySQL → PG, 0 ms | A (every transaction touches a secondary-unique table) | 7,281.6 | 226.9 | 112.3 | 0.49 |
+| MySQL → PG, 5 ms | A | 4,773.3 | 27.1 | 13.8 | 0.51 |
+| MySQL → MySQL, 0 ms | A | 8,875.7 | 78.3 | 36.5 | 0.47 |
+| PG → PG, 0 ms | A | 7,281.6 | 235.0 | 114.9 | 0.49 |
+| MySQL → PG, 0 ms | C (20% of transactions secondary-unique) | 15,873.0 | 230.4 | 406.9 | 1.77 |
+| MySQL → PG, 5 ms | C | 11,363.6 | 26.8 | 57.1 | 2.13 |
+| MySQL → MySQL, 0 ms | C | 4,231.3 | 76.3 | 135.8 | 1.78 |
+| MySQL → PG, 0 ms | D (half the rows are PK-changing updates — lane barriers) | 104.3 | 229.5 | 103.7 | 0.45 |
+
+The constant 0.47–0.51 on workload A is the arithmetic of commits. With the wake fix, each marked transaction on the lane path pays (1) a drain of every lane to seq−1, (2) a separate synchronous checkpoint transaction (`fenceApplyMarks` → `writeCheckpoint` → `WriteCheckpoint`: BEGIN, the closed-mark DELETE, the position UPSERT, COMMIT), and then (3) the lane commit that carries the marks. The serial path pays one commit per source transaction. On workload A every transaction touches table `u`, which is table-scoped onto one lane, so the lanes add no concurrency to offset the extra commit. Workload D shows the same factor on the DEFAULT path, flag or not: the barrier's pre-apply checkpoint is the same separate commit (sibling D-S1, §D.7).
+
+#### D.2 The algorithm
+
+Terms. For a marked transaction T whose first marked lane change has sequence `s`: the **anchor** is the checkpoint boundary `CheckpointPosition()` returns once the frontier is at least `s−1` — the highest recorded boundary at or below `s−1`. On a marker stream that is T−1's `TxCommit` (T's `TxBegin` is not a boundary, and T's own rows before `s` are never boundaries on a marker stream). On a marker-less stream it is the change at `s−1` (`handle` runs `noteBoundary(s)` before `routeRow(s)`, which settles it). Either way it is T's start. A **fold ticket** is `{Tx, Seq: s, Pos, RowsApplied, ClosedTxs}`. T is **anchored** once the persisted position is at T's start.
+
+**Coordinator side, in `fenceApplyMarks(ctx, seq=s, c)`,** replacing today's drain-then-`writeCheckpoint`:
+
+1. As today, it runs only with `ExactlyOnceLanes`, when `ApplyMarkTx(c)` names a transaction T.
+2. If T is the transaction already fenced (`fencedTx == T`), go to step 8.
+3. `drainLanes(ctx, s−1)`, unchanged — the wake sentinel on every lane, then the frontier wait. **Preserves:** every change with seq ≤ s−1 is durable on every lane, which is the precondition for the anchor to be a legal position (position ≤ durable data).
+4. Flush the coalesced skip ledger (`flushSkippedTables`, through a new seam method), a no-op unless a target table was absent. **Preserves:** H-4 — the ledger is durable before any position that covers the skips it records. This is the only synchronous write left at the fence, and it is empty in the steady state.
+5. Read the anchor with `frontier.CheckpointPosition()`.
+   - **(5a) No boundary recorded yet in this run** (`ok == false`). Then T is the first transaction this run delivers, so the persisted run-start position is already T's start (the same fact today's no-op `writeCheckpoint` relies on). T is anchored with no ticket.
+   - **(5b) Anchor already persisted** (`seq ≤ lastWrittenSeq`). This happens when T's own earlier barrier, or an idle or count checkpoint, already wrote it. T is anchored with no ticket.
+   - **(5c) Otherwise** build the ticket: `Pos`; `RowsApplied = boundaryRowDML[anchor] − lastWrittenCum`, exactly as `writeCheckpoint` computes it; and `ClosedTxs = closedTxsUpTo(anchor)`. Then **claim** the anchor: set `lastWrittenSeq`, `lastWrittenCum`, and prune `boundaryRowDML` and `closedTx`, exactly as a successful `writeCheckpoint` does. **Preserves:** seq-monotonicity. Between the claim and the fold's commit, every coordinator `writeCheckpoint` (count cadence, idle tick, the next barrier's post-apply write) returns in memory before touching the engine, because the frontier cannot pass `s−1` until the fold commits and no boundary at or below `s−1` is above the claim.
+6. `LaneFence.Open(T, anchored)`, where `anchored` is true in cases 5a and 5b and false in 5c. Then `fencedTx = T`, `foldSeq = s`, and `foldLane = LaneForRoute(route)`. Routing is decided before the fence, and the fence does not change it.
+7. Push `s`'s envelope to `foldLane` **carrying the ticket** (`LaneChange.fold`). Go to step 9.
+8. (A later marked change c of the same T.) If T is not yet anchored and c routes to a lane **other than** `foldLane`, wait for the fold first: `drainLanes(ctx, foldSeq, foldLane)`, which sends a wake sentinel to `foldLane` only. After step 3 the frontier is `foldSeq−1`, so `frontier ≥ foldSeq` means exactly that the fold committed. A change routed to `foldLane` itself needs no wait, because a lane commits its batches in order. **Preserves:** the anchored rule, on the coordinator side.
+9. Route normally.
+
+**Lane side, in `ApplyLaneBatch(ctx, lane, batch, fold)`,** a new parameter carrying the ticket of any envelope in `buf`:
+
+- **At most one ticket per batch.** Ticket T+1 is issued only after a drain that requires ticket T's batch to have committed. The orchestrator asserts this rather than assuming it: a second ticket in one `buf` is a coordinator bug and fails the run loudly (`FOLD-TICKET-DUPLICATE`, a named check).
+- **On an in-lane split** (`applyLaneBatch`'s halving), the ticket rides the sub-batch that contains the ticket's envelope. The algorithm does not rely on `s` being first in its batch, though it always is: the drain's sentinel ends every batch that holds a seq below `s`.
+- **Mark admission:** `LaneFence.Admits(ms, fold)` accepts T's marks when this batch carries T's ticket **or** T is anchored. Otherwise the marks are dropped and the change applies unmarked, which is today's fallback (loud at worst, never a skip). **Preserves:** the anchored rule, on the lane side. It covers a route-time verdict that the apply-time verdict contradicts, which `LaneFence` already guards against for the same reason.
+- **The fold's statements,** in the lane's own transaction and in this order:
+  1. the data, as today (including MySQL's trailing `flushPending`);
+  2. `marks.CloseTxs(fold.ClosedTxs)`, then `Plan(gc=true)`, executed as the admitted-mark upserts plus the closed-mark delete, which is the same plan `WriteCheckpoint` runs;
+  3. the position write, **last**: `writePositionTx(..., fold.Pos.Token, ..., fold.RowsApplied)`. On Postgres this is `writePositionPipelined` in the same `SendBatch`, so it adds no round trip. On MySQL it is one more statement on the lane's `*sql.Tx`. The position comes last so that the stream's `sluice_cdc_state` row lock is held only across COMMIT.
+  4. COMMIT.
+  5. `Committed(plan)`, then `LaneFence.Anchor(T)`, both **before** the lane returns and so before the frontier advances past `s`.
+- **In-place retry.** A fold batch retries in place on an error raised **before** COMMIT (serialization, deadlock, tx-killer — the existing split-and-retry). An error from the COMMIT step itself — the Bug-56 watchdog firing, or the connection dying mid-COMMIT — has an unknown outcome, and on a fold batch it is **fatal to the run**. The ADR-0038 re-entry then re-reads the position and the marks. This is the one retry-semantics change, and it is load-bearing: if a COMMIT that actually succeeded were retried in place, the retry would add `RowsApplied` a second time. It would also make the retry decide from a tracker whose `Committed` never ran for the durable plan.
+
+**What does not change.** The position format, the mark table, the skip rule, `consult`'s first-transaction check, the sweep, the barrier (see sibling D-S1), `WriteCheckpoint` itself (still used by the count cadence, the idle tick, the barrier and the end of a run), and every flag-off path. With `--exactly-once-lanes` off, `fenceApplyMarks` still returns before step 2, so no ticket is ever created.
+
+#### D.3 Soundness, point by point
+
+The skip rule is sound iff amendment C's (i)–(iii) hold. (i) is untouched. (ii), the per-key prefix: T's marks on lane L are written in the batch that applies the changes they cover, and lane FIFO keeps T's earlier changes to that key at lower seqs in the same batch or an earlier committed one. The fold adds nothing to either. Everything below is (iii): *marks exist only for the first transaction after the persisted position.*
+
+- **The GC rule, "a position write passing a transaction deletes its marks".** The fold's position (the anchor) passes exactly `ClosedTxs = closedTxsUpTo(anchor)`, the same set `writeCheckpoint` would hand for the same anchor, and the fold deletes those transactions' marks in the same transaction. T itself is not in the set: its `TxCommit` seq is above `s`. On the first close of a run, the sweep adds every loaded transaction to `closed`, as it does today. A loaded stale mark that names T itself would mean invariant B was already broken (a pre-existing position regression). In that case `Plan(gc=true)` drops T's pending marks and deletes T's durable ones, so T's changes in the fold batch apply unmarked, and `consult`'s first-transaction check had already set those marks aside with `APPLY-MARK-UNTRUSTED`. That is loud at worst, never a skip.
+- **The frontier and persisted-position monotonicity.** Two components now write the position: the coordinator (`WriteCheckpoint`, on the primary pool) and the fold (on a lane connection). Their writes are **totally ordered by the frontier**:
+  - A fold for anchor `a` is issued only when the frontier is at least `a`.
+  - That fold commits before the frontier can reach `s > a`.
+  - A coordinator write of any boundary above `a` needs the frontier at or beyond that boundary, and every such boundary is at least `s`, so it happens after the fold commits.
+  - The next fold (T+1) is issued only after a drain that includes `s`.
+  - A write at or below `a` after the claim is refused in memory by the seq guard.
+
+  So the sequence of persisted positions stays non-decreasing in seq, and position ≤ durable data still holds, because the anchor needs only seqs ≤ `s−1`, which step 3 made durable. The claim-before-commit window is safe because, if the fold never commits, the run fails (a lane error cancels it), and the next run rebuilds the orchestrator from the durable position.
+- **A crash between the fold's commit and the other lanes' commits.** At that instant:
+  - the position is T's start;
+  - the only durable marks are T's, on lane L's keys (other lanes' T marks are gated until the fold commits, and T−1's marks were deleted by the fold);
+  - other lanes may hold T's unmarked changes and later transactions' unmarked changes, committed or not.
+
+  The restart delivers T first, so `firstTx = T` and T's marks are trusted. T's changes on L's keys are skipped up to their mark's ordinal (durable by (ii)). Everything else re-applies: idempotent, or the pre-ADR loud collision where a gated or dropped mark was never written. No mark names a later transaction, so nothing later can be skipped. This is the mixed case of amendment C with the fold's mark set in place of the barrier's.
+- **A crash before the fold commits.** Nothing of the fold is durable. The position is T−1's start (from T−1's fold) or earlier, and the durable marks are T−1's only (T's are gated on every lane). That is exactly the state amendment A leaves between two fences.
+- **Mixed barrier and lane marks.**
+  - *Lane fold first, then a barrier of T at `q > s`.* The barrier's `drainLanes(q−1)` waits for the fold. Its pre-apply `writeCheckpoint` is a no-op (the anchor is claimed and nothing above it is durable-and-recorded). Its marks commit after the fold, with the position already at T's start.
+  - *Barrier of T first, then a lane change of T.* The barrier's own pre-apply checkpoint persisted T's start synchronously, so the lane fence hits 5b: no ticket, anchored immediately.
+  - *Barrier of T+1 while T's fold is in flight.* The barrier drains, which includes `s`, before it does anything.
+
+  In every order, (iii) holds for the barrier's marks by amendment C's argument.
+- **A lane batch holding changes from several transactions (a batch spanning the fence).**
+  - *Below `s`:* impossible after step 3. Were it possible it would still be safe: those seqs would be in the fold's own transaction, and the drain covers the other lanes.
+  - *Above `s`, the common case:* the fold batch may continue with T's later changes, T's commit, and whole unmarked transactions T+1… up to the next fence's sentinel. A later transaction's change whose apply-time verdict is "marked" is refused admission (`tx ≠ T`) and applies unmarked. T+1's first *route-time* marked change triggers T+1's fence, whose sentinel ends this batch.
+- **A lane-count change between runs.** The fold persists nothing routing-dependent. The ticket is in-memory per run, marks are per key (§2), and the position format is unchanged. The runs before and after may be any mix of serial, flag-off lanes, today's fence and the fold. Each leaves the durable state inside the same invariant, "marks name only the first transaction after the position", so any successor starts from a legal state. `lane_count_changed_*` stays green by construction, and is re-run (§D.6).
+- **Trigger sources (marker-less; every change is its own transaction).** T is one change at `s`. The anchor is the change at `s−1`, settled by `noteBoundary(s)` before `routeRow(s)`; `ClosedTxs` is `{T−1}` via `settlePrev` → `closedTx`. Each marked trigger change costs one lane commit plus the drain, instead of two commits. The idle tick may settle `s` itself as a boundary while the fold is in flight; its `writeCheckpoint` cannot choose it until the frontier reaches `s`, which is after the fold commits.
+- **VStream, multi-shard.** Nothing shard-specific changes. The anchor is the merged VGTID at T−1's commit, the same token today's fence checkpoint writes. A sharded restart may still deliver another shard's transaction first, and T's marks are then set aside with `APPLY-MARK-UNTRUSTED` (review hardening (3), best-effort, loud at worst). The fold can neither widen nor close that gap. Interleaved shard groups still arrive as one bracket, which is one T.
+
+**Must the position write move to the lane's connection? Yes.** Only the lane's own transaction makes "T's marks durable ⇔ position at T's start" atomic. The single-writer question for `sluice_cdc_state`, by writer:
+
+| Writer of the stream's row | Where | Relation to the fold |
+|---|---|---|
+| Lane checkpoint `WriteCheckpoint` | coordinator, primary pool | totally ordered with every fold by the frontier (above); never concurrent in the database, because its in-memory guard short-circuits while a fold is in flight |
+| **The fold** (new) | lane pool. It is opened from the SAME config as the primary applier pool (`pipelineCfg: cfg` in both engines' `OpenChangeApplier`; PG adds the same `roleApplier` tag), so the lane connection holds the same privileges on `sluice_cdc_state` the checkpoint uses. No new grant is needed. | at most one in flight per stream (a ticket is issued only after the previous one committed) |
+| `requestStop` (`sluice sync stop`, another process) | single-statement UPDATE of `stop_requested_at` | row-lock serialisation only. The position upsert's `ON CONFLICT` / `ON DUPLICATE KEY` sets do not list `stop_requested_at`, so the flag survives either order, as it does against today's checkpoint. The fold holds the row lock only across COMMIT (position statement last), so a stop request waits at most that long. No cycle: a one-statement transaction waits on nothing else. |
+| `clearStopRequested` | Streamer start, before any apply | not concurrent |
+| unforwarded-refusal store UPDATE | stream exit path | not concurrent with a running orchestrator; row-lock serialisation at worst |
+| `ClearStream` DELETE | `--reset-target-data` / decommission, with the stream stopped | not concurrent |
+| "heartbeat" writers | none on this row: `WriteHeartbeat` writes the SOURCE heartbeat table, `heartbeatShardLease` the shard-consolidation lease table, and `pipeline/stream.go`'s heartbeat the backup stream state | n/a |
+
+Deadlock analysis. The fold's lock order is data rows → mark rows → the `sluice_cdc_state` row, and nothing after the state row but COMMIT, so no cycle can close through that row. On the mark table, the fold is the *only* writer from the fence until its commit: other lanes' T marks are gated, no other transaction is fenced, and the coordinator writes none in that window. That rules out the upsert-versus-closed-delete deadlock two concurrent mark writers could otherwise hit, including MySQL next-key locks on the delete's scan. After the fold commits, the mark-table concurrency is exactly today's.
+
+**Two things found while checking, both PRE-EXISTING and not introduced here, filed for triage:**
+
+- **D-F1 (UNVERIFIED — needs a reproduction before any grade is trusted).** Under `--control-keyspace` on a sharded Vitess target, `writePositionTx`'s own comment says the control-keyspace write and the data write "span two keyspaces, so vtgate can only best-effort the cross-keyspace commit (no 2PC)". Marks live in the same sidecar keyspace (`controlTableRef(controlKeyspace, applyMarksTableName)`), and `applyMarksUsable` enables them there. §5's row "Mark written but the rows not — Impossible" therefore rests on a single-keyspace premise that the sidecar configuration does not meet. A torn commit that lands the marks but not the rows would skip an unapplied change on restart, which is **silent**. It already applies to the serial paths and to the barrier by default, not only to the lanes. The same question applies to a Neki target whose control tables are in the unsharded shard group while the data is in sharded groups (UNVERIFIED PREMISE: that Neki commits across shard groups atomically). The fold adds no new harm to this class: its position is T's START, which depends only on data made durable before the fold began, so a torn fold that lands the position without the rows loses nothing the position vouches for. But the fold must not ship with the class unexamined. A likely remedy is to treat marks as unavailable (`APPLY-MARKS-UNAVAILABLE`) whenever the mark table and the data cannot share one atomic commit.
+- **D-F2 (UNVERIFIED, noticed in passing).** Neither lane adapter's `WriteCheckpoint` calls `reportAppliedToken`, the Postgres slot-ack feedback the serial paths call after a position commit (`change_applier_batch.go`'s `AfterCommit`; `persistSourceTxCommit`). If nothing else reports on the lane path, a PG → PG stream on lanes never advances `confirmed_flush_lsn` past its start, and WAL is retained. Whatever the checkpoint's post-commit hook turns out to be, the fold must run the same one. The gate below holds the two post-commit sequences identical.
+
+#### D.4 Simpler variants that are NOT sound
+
+- **V1 — fold without the drain** (write whatever `CheckpointPosition()` returns now, in the batch carrying T's first marked change). Take T−1 = {update `rs` row 7 on lane L; insert into `po`, a PK-only table on lane M} and T = {delete `rs` row 7}. Lane M is slow, so T−1's `po` insert is not durable, and the anchor lags to T−2's commit. L commits T−1's update of row 7, then T's delete with T's mark and the lagging position. Crash. The restart replays from T−1's start. T−1's update finds row 7's mark naming T, which proves nothing about T−1, so it re-applies and **re-creates row 7**. T's delete then finds its own mark and is skipped. Row 7 survives at exit 0. This is amendment A's counterexample with the position failing to advance. `consult`'s first-transaction check happens to catch it (T−1 was delivered first, so T's mark is untrusted and the delete re-applies), but that is defence in depth, and the invariant is broken.
+- **V2 — fold, but open the fence to every lane at once** (no anchored rule). T = {update `rs` (lane L, carries the ticket); delete `rs2` row 9 (a second secondary-unique table, lane M)}, and T−1 updated `rs2` row 9. M commits T's delete with its mark before L's fold commits. Crash. The position is still T−1's start, T−1's marks are still durable, and T's mark on row 9 is durable too, so marks exist for two transactions, which violates (iii). The restart replays T−1's update of row 9, which finds T's mark and re-applies (re-creating the row), then skips T's delete. The same runtime check rescues it with an `APPLY-MARK-UNTRUSTED` WARN, which the crash gate treats as a failure on any converging cell. It is rejected for the same reason as V1.
+- **V3 — fold T's COMMIT position** (write T's end rather than its start, in T's last lane batch). The coordinator cannot know at route time which batch is last, and T's changes on other lanes may not be durable. The position would lead the data, breaking the relaxation every lane checkpoint rests on (`persisted_position ≤ all-durably-committed-data`).
+- **V4 — drain only since the last fence** (skip the drain when the transactions in between were unmarked). The anchor must be T's start, and the position is one scalar across every lane, so an in-flight unmarked transaction U on another lane holds it back. The fold would have to write U's start, and then a restart delivers U first, T's marks are untrusted, and exactly-once degrades to loud. A relaxed invariant ("marks only for the first *marked* transaction after the position") might make this sound. It would need its own argument, including a change to `consult`'s first-transaction check. It is not proposed (D-Q4).
+
+#### D.5 Fix #3 (per-key fence): not compatible with amendment A
+
+Two independent reasons. **First, it buys nothing under the current skip rule.** The router already sends every change to a marked key through one lane in source order — a secondary-unique table is table-scoped, and a PK change is a barrier — so "wait only for the lane holding the key's predecessor" waits on the lane's own FIFO, which already holds. **Second, amendment A's condition is global.** When T's mark on k becomes durable, no earlier transaction may be re-delivered. The persisted position is one scalar for the whole stream, so meeting that condition requires every earlier change on every lane to be durable: that is the full drain. A per-key fence that does not move the position reproduces amendment A's counterexample verbatim (T1 updates k, T2 deletes k, one lane, a crash before the position passes T1). Making it sound means giving up (iii) for a cross-transaction skip rule — amendment A's rejected option B. That needs:
+
+- an order on TxIDs, which are opaque today;
+- a staleness guard;
+- a new sweep, because B's "first close retires everything" no longer holds;
+- a replacement for `consult`'s first-transaction check, which would otherwise distrust every mark after the first transaction and degrade exactly-once to loud.
+
+So #3 needs its own ADR. The rest of this amendment does not depend on it.
+
+#### D.6 Testing plan
+
+**Existing cells that must stay green,** on every pair the suite runs today — six binlog / pgoutput pairs (`TestStreamer_CrashMidTxn_{MySQLGTID,MariaDB,MySQLFilePos}_ToPostgres`, `…_MySQLGTID_ToMySQL`, `…_Postgres_{ToPostgres,ToMySQL}`), plus `…_VStream_{ToPostgres,ToMySQL}` and `…_PgTrigger_{ToPostgres,ToMySQL}`: every `_exactly_once` crash cell, `pkchange_*`, `keyless_*`, `lane_count_changed_*`, `stale_mark_swept`, `cold_start_clears_marks`, `schema_event_mid_txn_*`, and every default-path cell. The default path must not change at all.
+
+**Reworked cell.** `lane_post_commit_window` (`runCrashLanePostCommitWindow`, exactly-once) keeps its shape, but what it grades changes:
+
+- T1's fence hits 5b (the sentinel's commit was settled by the idle tick), so T1's lane batch carries no ticket and commits its mark.
+- T2's **fold** is what blocks on the held `sluice_cdc_state` row lock (today it is T2's synchronous fence checkpoint).
+- New assertions: at the kill, row 7 still exists with `v = 't1'` (T2's delete is not durable: no mark lands without its position), and the marks name T1 only.
+- Anti-vacuity: before the kill, the target's lock-wait view (`pg_stat_activity` `wait_event_type = 'Lock'` / `performance_schema.data_lock_waits`) shows the waiter is a lane-pool connection, not the coordinator's. That is independent evidence that the fold, not a checkpoint, is the blocked writer.
+
+**New cells** (added to `runCrashMidTxnSuite` so that every source × target pair runs them):
+
+- `fold_landed_siblings_pending` — the new window. T updates `rs` (secondary-unique; carries the ticket) and then `po` (PK-only, on another lane), and a target row lock holds `po`'s row, so the fold commits while the sibling lane is blocked. At the kill:
+  - the position is T's start, derived from the source (the existing `assertMarksNameTheInterruptedTx` helpers);
+  - the marks name T only;
+  - T's `rs` rows are present and its `po` row is absent.
+
+  The restart converges, logs no `APPLY-MARK-UNTRUSTED`, and leaves no mark. Anti-vacuity: the harness computes `laneapply.NewRouter(W).LaneForRoute` for both routes and fails if they share a lane, because the window then does not exist.
+- `fold_multi_lane_gated` — the anchored rule. T touches `rs` and a second secondary-unique table `rs2` that routes to a different lane, and a target row lock on a later `rs` row of T blocks the fold batch. At the kill: **no mark of T on the target at all** (the `rs2` change was held by step 8), the `rs2` row is unchanged, and the position has not moved. The restart converges.
+- `fold_then_barrier_same_tx` and `barrier_then_fold_same_tx` — the mixed orders of §D.3. The kill is blocked on a statement after both; the restart converges. Unit pins also assert that the second order issues no ticket.
+- `lane_count_changed_after_fold_{2_to_4,lanes_to_serial}` — kill in the `fold_landed_siblings_pending` state, restart at a different lane count, converge.
+- On the postgres-trigger pairs, the reworked `lane_post_commit_window` *is* the per-change fold cell (consecutive marked changes, each its own transaction). It also asserts that the marks name `min(id) > persisted last_id` from `sluice_change_log`.
+
+**Engine-level atomicity pins,** one per lane write core, since the fold's statements run on each core's own transaction (the Bug 74 lesson applied to write cores): PG pipelined (`ApplyLaneBatch`), PG serial fall-back (`applyLaneBatchSerial`, forced through `errPipelineUnavailable`), and MySQL coalescing (`mysqlBatchTx`). The test is `TestLaneApplyBatch_FoldIsOneTransaction`:
+
+- A fold batch fails at `laneCommitHookForTest` after the position is queued. The position row, the mark table and the data must all be unchanged.
+- The same batch then commits. All three must be present, and `rows_applied` must have moved by exactly `RowsApplied`.
+- A second test, `TestLaneApplyBatch_FoldCommitOutcomeUnknownIsFatal`, holds that a COMMIT-step error on a fold batch is not retried in place.
+
+**Orchestrator unit pins** (fake seam, no database):
+
+- `TestOrchestrator_FoldTicket`: one ticket per marked transaction, carrying the anchor, `ClosedTxs` and the `RowsApplied` delta, on the envelope `s`, never on a flag-off run. This supersedes the event log in `TestOrchestrator_MarkFence`.
+- `TestOrchestrator_FenceIssuesNoSynchronousCheckpoint`: on a stream of N marked transactions, the seam's `WriteCheckpoint` is called zero times by fences. This is the performance claim as a deterministic gate; a correctness suite cannot see it.
+- `TestOrchestrator_AnchoredRule`: a fake seam delays lane L's fold commit, and no batch admitting T's marks commits on another lane first.
+- `TestOrchestrator_PositionWritesTotallyOrdered`: every persisted position, fold or checkpoint, interleaved under randomised lane delays, is non-decreasing in seq and never above the frontier at its write.
+- `TestOrchestrator_FoldRidesTheSplitSubBatch`.
+- `TestLaneFence_AdmitsOnlyWithTicketOrAnchored`.
+
+**Gate updates:**
+
+- `TestOrchestrator_FrontierWaitsGoThroughDrainLanes` is unchanged in intent; step 8's wait goes through `drainLanes` with a lane subset.
+- A new AST roster, `TestLanePositionWriterRoster`, classifies every call to `writePositionTx` / `writePositionPipelined` / `buildWritePositionSQL` reachable from a `laneApplierAdapter` method as `WriteCheckpoint` or `fold`, per engine, with an anti-vacuity floor of 2 per engine. It also requires the two sites' post-commit sequences (`Committed`, and whatever D-F2 resolves to) to be identical.
+
+**Mutation plan.** Each mutation follows the CLAUDE.md protocol: checkpoint commit immediately before, confirm the mutant applied, run, confirm the named gate is the one that fired, revert with a targeted edit.
+
+| # | Mutant | Must fail, by its own assertion |
+|---|---|---|
+| M1 | drop step 3's drain (V1) | `TestOrchestrator_PositionWritesTotallyOrdered` ("above the frontier"); a V1-shaped crash cell's "marks name the first re-delivered transaction". Also check that `assertNoUntrustedMark` fires, since the runtime check will have rescued convergence. |
+| M2 | fold writes the marks but not the position | `fold_landed_siblings_pending`'s "marks for at most one transaction" (T−1's survive beside T's) |
+| M3 | `Admits` ignores the anchored rule (V2) | `TestOrchestrator_AnchoredRule`; `fold_multi_lane_gated`'s "no mark of T at the kill" |
+| M4 | fold skips `CloseTxs` | GC assertion "no mark left" after convergence, and "marks for at most one transaction" |
+| M5 | no claim at step 5c | `rows_applied` double-count (`rows_applied_test.go`-style unit); `TestOrchestrator_FenceIssuesNoSynchronousCheckpoint` |
+| M6 | keep today's synchronous fence checkpoint AND add the fold | correctness stays green — only `TestOrchestrator_FenceIssuesNoSynchronousCheckpoint` catches it, which is why that gate exists |
+| M7 | ticket on the wrong half after a split | `TestOrchestrator_FoldRidesTheSplitSubBatch` |
+| M8 | a COMMIT-step error on a fold batch retried in place | `TestLaneApplyBatch_FoldCommitOutcomeUnknownIsFatal` |
+
+The reverse direction: each new crash cell carries its own anti-vacuity check (lanes differ; the fold was the blocked writer; the fold ran — a DEBUG counter of folds per run, asserted ≥ 1 in every `_exactly_once` lanes cell).
+
+**Re-running the fencebench harness.** It lives in this session's scratchpad (`…/scratchpad/fencebench/`: `fb/main.go`, `cell.sh`, `driver2.sh`, `summ.sh`), which is **ephemeral**. It should be committed under `benchmarks/fencebench/` before the implementation lands (D-Q5). To run it:
+
+1. Bring up the four fencebench containers and the two `tc` sidecars: `fb-mysrc :13306`, `fb-mydst :13307`, `fb-pgsrc :15432`, `fb-pgdst :15433`, `fb-tc-pgdst`, `fb-tc-mydst`.
+2. Build the implementation commit to `sluice-fold.exe` and add `fold) BIN=$S/sluice-fold.exe;;` to `cell.sh`'s `BINK` case.
+3. Copy `driver2.sh` to `driver3.sh` with arms `"head serial" "head eol" "fold eol" "fold lanes"`. In `nfor`, give `fold/eol` the serial sizes (4000 at 0 ms, 800 at 5 ms) on A and D, and 16000 / 3000 on C.
+4. Run each of `my2pg 0`, `my2pg 5`, `my2my 0` and `pg2pg 0` over three reps, then `bash summ.sh driver3.out`.
+
+**Acceptance:**
+
+- On workload A, the `fold-eol` median is **≥ 0.8× `head-serial`** on every pair × latency; the model says 0.9–1.0×.
+- On C, `fold-eol` is ≥ 1.5× `head-eol`.
+- On B and D, `fold-eol` is within ±10% of `head-eol` (the fold does not reach them).
+- `fold-lanes` (flag off) is within noise of `head-lanes`. The fold must cost nothing when off.
+- `VERIFY OK` in every cell.
+
+A result below the A threshold goes back through the three-phase protocol, instrumenting the drain wait and the fold commit separately, rather than being tuned by guesswork.
+
+**`-race`:** this is a concurrency chunk (new shared state `LaneFence.anchored`, a coordinator claim that is released by a lane commit, a lane-subset drain), so CI's `-race` Integration job goes green before any tag.
+
+#### D.7 Scope and siblings
+
+| Sibling | Verdict |
+|---|---|
+| MySQL lane adapter (`mysql/change_applier_concurrent.go` `ApplyLaneBatch`, coalescing `mysqlBatchTx`) | IN — fold statements after `flushPending`, position via `writePositionTx` on the lane `*sql.Tx` |
+| Postgres lane adapter, pipelined (`ApplyLaneBatch` → `flushAndCommit`) | IN — `queueApplyMarks` then `writePositionPipelined` in the same `SendBatch` |
+| Postgres lane adapter, serial fall-back (`applyLaneBatchSerial`) | IN — `execApplyMarksTx` then `writePositionTx` on the lane `*sql.Tx` |
+| Lanes per-change (`--apply-batch-size 1` with lanes) | IN by construction — the same `ApplyLaneBatch` with batches of one |
+| Serial per-change / serial batched | OUT — they already write the position in the data transaction (one commit per source transaction); nothing to fold |
+| `sync from-backup` broker (`broker.go`) and chain replay (`backup/chain_restore.go`) | OUT, twice over: both reach the orchestrator through `migcore.ApplyApplyConcurrency` but never `migcore.ApplyExactlyOnceLanes` (called only from `streamer_run_phases.go`, two sites), so `ExactlyOnceLanes` is false and `fenceApplyMarks` returns at its first line; and their changes carry no `ApplyID`, so `ApplyMarkTx` answers `""` regardless. A pin, `TestReplayPathsNeverFold`, should assert both, because two reasons are only worth having if each is checked. |
+| Every other `laneapply.LaneApplier` implementor | none in production (the two adapters above); the `internal/laneapply` test seams (`testSeam`, `countingSeam`/`fenceSeam`, `recordingSeam`, `routingSeam`, `scopedSeam`) gain the new parameter |
+| **D-S1 — the barrier's pre-apply checkpoint** | SAME SHAPE, NOT IN THIS AMENDMENT. `barrier` pays drain + synchronous `writeCheckpoint` + `ApplyBarrierChange`, which is two commits per barrier by DEFAULT, flag or not. Workload D measured the default lanes at 104.3 vs serial 229.5 (0.45×). Folding the pre-apply position into `ApplyBarrierChange`'s own transaction is the same argument and simpler (it runs on the coordinator's connection, so there is no second writer and no anchored rule). But it is sound only for ROW barriers (keyless, PK-changing, malformed): a MySQL `TRUNCATE` and a DDL-bearing SchemaSnapshot implicitly commit, so they cannot share a transaction with a position. It also reaches the broker and chain replay, whose barriers take the same path. Proposed as its own follow-up (D-Q3). |
+
+**Perf-parity.** Row 44's flag-ON sentence ("the fence still costs ONE lane drain + ONE synchronous position write…, ≥2 round trips per transaction… GAP #44 stays open") becomes: one drain + zero synchronous writes at the fence (the skip-ledger flush is empty in the steady state), with the position folded into the marked lane transaction, on both engines and all three lane write cores. The trigger-source sentence becomes "one lane commit per marked change". GAP #44 closes only on the fencebench acceptance above, not on this design. A new GAP should be filed for D-S1 (the barrier's two commits, default-on, on the sync lanes, the broker and chain replay), citing workload D. Cells unreached: broker and chain replay (exempt, above); `migrate` has no apply loop (`reasonCDCApply`).
+
+#### D.8 Open questions for the operator
+
+- **D-Q1. Coverage versus wait for multi-lane marked transactions.** The design waits (step 8) before routing a transaction's marked change to a second lane, until the fold commits. The alternative is no wait: that lane applies the change **unmarked**, which is sound but loses exactly-once for that change and is loud at worst on a crash. Recommendation: the wait. It is paid only by transactions that touch two secondary-unique tables on different lanes, and it costs at most one lane commit, which is less than today's fence.
+- **D-Q2. The default.** Amendment C said "then reconsider the default". Even at the expected ~serial parity, `--exactly-once-lanes` on workload A would run at ~230 transactions/s against the default lanes' ~7,300: still ~30× slower on secondary-unique-heavy work, because the drain serialises every marked transaction at its start. Recommendation: **keep it opt-in**. Revisit only with a design that removes the drain, which means a changed invariant (V4 / D-Q4).
+- **D-Q3. Sibling D-S1** (fold the ROW barrier's pre-apply checkpoint). It is default-on, it reaches the broker and chain replay, and it is ~2× on barrier-heavy work. Should it be its own ADR amendment or chunk, or be bundled here? Recommendation: separate, after this one measures.
+- **D-Q4. Relaxing the drain** (V4's "first marked transaction" invariant). Worth an ADR, or closed? It is the only route to making mixed workloads (C) cheaper than one drain per marked transaction.
+- **D-Q5. Findings D-F1 and D-F2, and the harness.** D-F1 is a possible silent class under `--control-keyspace` / Neki that already exists on the default serial and barrier paths. It needs a reproduction and a grade before this amendment is implemented, since the fold would extend the same premise to lane batches. D-F2 needs a one-question check. And fencebench should move from the session scratchpad into `benchmarks/` so the acceptance run is repeatable by anyone.
 
 ## Implementation status (2026-09-28, phases 1–5; NOT released)
 
