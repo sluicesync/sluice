@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"sort"
 	"strings"
 	"text/tabwriter"
@@ -462,11 +463,11 @@ func writeColdStartsText(out io.Writer, coldStarts []ir.MigrationState, now time
 			phase = "starting"
 		}
 		if _, err := fmt.Fprintf(
-			tw, "%s\t%s\t%s\t%s ago\n",
+			tw, "%s\t%s\t%s\t%s\n",
 			coldStartStreamID(st.MigrationID),
 			phase,
 			st.StartedAt.UTC().Format(time.RFC3339),
-			now.Sub(st.UpdatedAt).Round(time.Second),
+			progressAgeText(now, st.UpdatedAt),
 		); err != nil {
 			return err
 		}
@@ -486,6 +487,19 @@ func writeColdStartsText(out io.Writer, coldStarts []ir.MigrationState, now time
 	return err
 }
 
+// progressAgeText renders a cold start's "LAST PROGRESS WRITE" age. A
+// progress row dated past the skew tolerance carries no readable age (a
+// migrate-state table created before v0.99.263 defaulted to the session
+// clock — GC-40 LOW-1/2), so it renders under the marker rather than as a
+// negative duration an operator could read as "just now".
+func progressAgeText(now, updatedAt time.Time) string {
+	age, readable := pipeline.ControlTimestampAge(now, updatedAt)
+	if !readable {
+		return fmt.Sprintf("%s (+%s)", pipeline.ControlTimestampInFutureMarker, (-age).Round(time.Second))
+	}
+	return age.Round(time.Second).String() + " ago"
+}
+
 func writeEmptyText(out io.Writer, streamID string) error {
 	if streamID != "" {
 		_, err := fmt.Fprintf(out, "no stream %q on target\n", streamID)
@@ -500,12 +514,19 @@ func writeEmptyText(out io.Writer, streamID string) error {
 // Computed against the same `now` the row table uses for age (so the
 // summary's ages and the rows' ages line up consistent within a render).
 func writeSummaryText(out io.Writer, streams []ir.StreamStatus, now time.Time) {
-	oldest, newest := agesSpan(streams, now)
+	span := agesSpan(streams, now)
+	oldest, newest := humanAgo(span.oldest), humanAgo(span.newest)
+	if span.inFuture > 0 {
+		oldest = fmt.Sprintf("unknown (%d %s)", span.inFuture, pipeline.ControlTimestampInFutureMarker)
+	}
+	if !span.newestKnown {
+		newest = "unknown"
+	}
 	fmt.Fprintf(
 		out,
 		"SUMMARY: %d %s, oldest=%s, most-recent=%s\n\n",
 		len(streams), pluralize("stream", len(streams)),
-		humanAgo(oldest), humanAgo(newest),
+		oldest, newest,
 	)
 }
 
@@ -518,27 +539,47 @@ func pluralize(word string, n int) string {
 	return word + "s"
 }
 
-// agesSpan returns the (oldest, most-recent) update ages over the
-// given streams against `now`. Returns (0,0) for an empty slice so
-// the caller can't trip on uninitialised values; the empty-slice
-// path doesn't reach this function in practice because renderStatusText
-// short-circuits on len==0 first.
-func agesSpan(streams []ir.StreamStatus, now time.Time) (oldest, newest time.Duration) {
-	if len(streams) == 0 {
-		return 0, 0
-	}
-	oldest = now.Sub(streams[0].UpdatedAt)
-	newest = oldest
-	for _, st := range streams[1:] {
-		age := now.Sub(st.UpdatedAt)
-		if age > oldest {
-			oldest = age
+// ageSpan is the summary's view of a set of stream ages.
+type ageSpan struct {
+	oldest, newest time.Duration
+	newestKnown    bool // at least one row had a readable age
+	inFuture       int  // rows dated past the skew tolerance (GC-40 (c))
+}
+
+// agesSpan returns the (oldest, most-recent) update ages over the given
+// streams against `now`, read through [pipeline.ControlTimestampAge].
+//
+// A future-dated row has no readable age, and the summary fails CLOSED on
+// it, as sluice_seconds_since_last_apply does with +Inf (GC-40 L3): it is
+// left out of most-recent, and it makes the OLDEST age unknowable — reported
+// as the maximum duration, so an `oldest_seconds > N` check trips — with
+// the count in inFuture. Never a negative age a consumer could read as
+// "just applied". The zero value is returned for an empty slice; the
+// renderers short-circuit before it.
+func agesSpan(streams []ir.StreamStatus, now time.Time) ageSpan {
+	var s ageSpan
+	for _, st := range streams {
+		age, readable := pipeline.ControlTimestampAge(now, st.UpdatedAt)
+		if !readable {
+			s.inFuture++
+			continue
 		}
-		if age < newest {
-			newest = age
+		age = max(age, 0)
+		if age > s.oldest {
+			s.oldest = age
 		}
+		if !s.newestKnown || age < s.newest {
+			s.newest = age
+		}
+		s.newestKnown = true
 	}
-	return oldest, newest
+	if s.inFuture > 0 {
+		s.oldest = time.Duration(math.MaxInt64)
+	}
+	if !s.newestKnown && s.inFuture > 0 {
+		s.newest = time.Duration(math.MaxInt64)
+	}
+	return s
 }
 
 // renderStatusJSON marshals streams as a JSON document keyed for
@@ -579,6 +620,12 @@ func renderStatusJSON(out io.Writer, streams []ir.StreamStatus, leases []ir.Shar
 		Count         int   `json:"count"`
 		OldestSeconds int64 `json:"oldest_seconds"`
 		NewestSeconds int64 `json:"newest_seconds"`
+
+		// ControlTimestampInFuture counts rows dated past the skew
+		// tolerance (GC-40 L3). They are left out of newest_seconds, and
+		// any one of them makes oldest_seconds the maximum (the oldest age
+		// cannot be read), so an oldest_seconds threshold fails closed.
+		ControlTimestampInFuture int `json:"control_timestamp_in_future_count,omitempty"`
 	}
 	// ADR-0054 §6 — per-lease block. Field names mirror the storage
 	// columns for jq predictability; the `state` field is the
@@ -612,6 +659,12 @@ func renderStatusJSON(out io.Writer, streams []ir.StreamStatus, leases []ir.Shar
 		UpdatedAt        time.Time `json:"updated_at"`
 		LastProgressAgeS int64     `json:"last_progress_age_seconds"`
 		LastError        string    `json:"last_error,omitempty"`
+
+		// ControlTimestampInFuture: the progress row's updated_at reads
+		// past the skew tolerance in the future (a pre-v0.99.263 migrate-state
+		// table's session-clock default, or clock skew — GC-40 LOW-1/2), so
+		// last_progress_age_seconds is the raw negative reading.
+		ControlTimestampInFuture bool `json:"control_timestamp_in_future,omitempty"`
 	}
 	type jsonDoc struct {
 		GeneratedAt time.Time    `json:"generated_at"`
@@ -644,7 +697,7 @@ func renderStatusJSON(out io.Writer, streams []ir.StreamStatus, leases []ir.Shar
 			ControlTimestampInFuture: !readable,
 		})
 	}
-	oldest, newest := agesSpan(streams, now)
+	span := agesSpan(streams, now)
 	leasesJSON := make([]jsonLease, 0, len(leases))
 	for _, l := range leases {
 		state := classifyLeaseForJSON(l, now)
@@ -681,13 +734,16 @@ func renderStatusJSON(out io.Writer, streams []ir.StreamStatus, leases []ir.Shar
 		if phase == "" {
 			phase = "starting"
 		}
+		age, readable := pipeline.ControlTimestampAge(now, cs.UpdatedAt)
 		coldStartsJSON = append(coldStartsJSON, jsonColdStart{
 			StreamID:         coldStartStreamID(cs.MigrationID),
 			Phase:            phase,
 			StartedAt:        cs.StartedAt.UTC(),
 			UpdatedAt:        cs.UpdatedAt.UTC(),
-			LastProgressAgeS: int64(now.Sub(cs.UpdatedAt).Seconds()),
+			LastProgressAgeS: int64(age.Seconds()),
 			LastError:        cs.LastError,
+
+			ControlTimestampInFuture: !readable,
 		})
 	}
 	if len(coldStartsJSON) == 0 {
@@ -697,8 +753,10 @@ func renderStatusJSON(out io.Writer, streams []ir.StreamStatus, leases []ir.Shar
 		GeneratedAt: now.UTC(),
 		Summary: jsonSummary{
 			Count:         len(streams),
-			OldestSeconds: int64(oldest.Seconds()),
-			NewestSeconds: int64(newest.Seconds()),
+			OldestSeconds: int64(span.oldest.Seconds()),
+			NewestSeconds: int64(span.newest.Seconds()),
+
+			ControlTimestampInFuture: span.inFuture,
 		},
 		Streams:    out2,
 		Leases:     leasesJSON,

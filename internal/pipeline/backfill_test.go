@@ -612,6 +612,24 @@ func TestBackfill_ConcurrentRunHeartbeatGuard(t *testing.T) {
 		}
 	})
 
+	// GC-40 LOW-1/2: a heartbeat a legacy session-clock default dated nine
+	// hours ahead still refuses (fail closed), but under the marker and
+	// without claiming a live run; one inside the skew tolerance is the
+	// ordinary fresh refusal.
+	t.Run("future-dated heartbeat refuses under the marker", func(t *testing.T) {
+		ex, store, b := setup(backfillPhaseRunning, now.Add(9*time.Hour))
+		b.Restart = true
+		_, err := b.Run(context.Background())
+		wantBackfillCode(t, err, sluicecode.CodeBackfillConcurrentRun)
+		if err == nil || !strings.Contains(err.Error(), ControlTimestampInFutureMarker) || strings.Contains(err.Error(), "looks live") {
+			t.Errorf("err = %v; want the %s refusal, not the live-run claim", err, ControlTimestampInFutureMarker)
+		}
+		id := BackfillMigrationID(b.Table, b.Sets, b.Where)
+		if _, ok := store.headers[id]; !ok || ex.execCalls != 0 {
+			t.Errorf("the refusal touched state (row kept=%v, execCalls=%d)", ok, ex.execCalls)
+		}
+	})
+
 	t.Run("stale heartbeat proceeds", func(t *testing.T) {
 		ex, _, b := setup(backfillPhaseRunning, now.Add(-backfillHeartbeatFreshFor-time.Second))
 		res, err := b.Run(context.Background())

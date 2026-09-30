@@ -4,7 +4,7 @@ sluice is a single-binary CLI that migrates and continuously syncs databases (My
 
 ## Command taxonomy
 
-**Read-only — safe to run without approval.** These never modify either database: `sluice schema preview`, `sluice schema diff`, `sluice verify`, `sluice sync health`, `sluice sync status`, `sluice engines`, `sluice backup verify`, `sluice control-tables ddl` (prints CREATE statements; opens no connection), `sluice backfill --verify-only` (counts rows matching `--where`; no UPDATEs, no control-table writes), and **any command with `--dry-run`** (`expand-contract --dry-run` and `deploy-ddl --dry-run` additionally make zero control-plane calls).
+**Read-only — safe to run without approval.** These never modify either database: `sluice schema preview`, `sluice schema diff`, `sluice verify`, `sluice sync health`, `sluice sync status`, `sluice engines`, `sluice backup verify`, `sluice control-tables ddl` (prints the control tables' CREATE statements — on `--engine postgres` also the ADD COLUMN / CREATE INDEX / UTC-DEFAULT follow-ups; opens no connection), `sluice backfill --verify-only` (counts rows matching `--where`; no UPDATEs, no control-table writes), and **any command with `--dry-run`** (`expand-contract --dry-run` and `deploy-ddl --dry-run` additionally make zero control-plane calls).
 
 **State-changing — run only as part of an approved task.** These write to the target (and create bookkeeping objects — see `docs/database-objects` on the docs site): `sluice migrate`, `sluice sync start`, `sluice sync run`, `sluice backup *` (writes to the backup store; `backup export-as-parquet` is read-only against the chain but writes Parquet files to its destination), `sluice restore`, `sluice cutover`, `sluice schema add-table`, `sluice trigger setup/teardown/prune`.
 
@@ -28,7 +28,7 @@ sluice is a single-binary CLI that migrates and continuously syncs databases (My
 1. **Preview first**: `sluice migrate --dry-run --format json ...` — emits the full plan as JSON. Show it to the human before proceeding. To see the target DDL alone, `sluice schema preview` renders it with cross-engine translation notes.
 2. **Run**: `sluice migrate --format json ...` — one JSON result envelope on stdout (see below).
 3. **Verify**: `sluice verify --format json ...` — never report a migration done without it.
-4. For continuous sync: `sync start --dry-run` → `sync start` → poll `sync health --format json` (exits 1 on breached thresholds or on durably skipped tables — cron/agent-friendly).
+4. For continuous sync: `sync start --dry-run` → `sync start` → poll `sync health --format json` (exits 1 on breached thresholds, on durably skipped tables, or on `CONTROL-TIMESTAMP-IN-FUTURE` — a stream row dated more than 60s ahead, whatever `--max-stale-seconds` says — cron/agent-friendly).
 
 ## Credentials: env-first, never in argv
 

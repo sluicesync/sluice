@@ -72,7 +72,9 @@ sluice backfill \
 A PlanetScale branch with **safe migrations enabled refuses every direct DDL statement** (Error 1105, "direct DDL is disabled") — including sluice's own `CREATE TABLE IF NOT EXISTS` for its control tables, and the user-table CREATEs a fresh `migrate` or `sync` cold-start issues. sluice surfaces this as the coded refusal `SLUICE-E-PS-DIRECT-DDL-BLOCKED`, naming the exact refused statement, and the way through is the governed channel:
 
 ```bash
-# 1. Print the exact CREATE statements for sluice's control tables (read-only, no credentials)
+# 1. Print the exact CREATE statements for sluice's control tables (read-only, no credentials).
+#    The default engine prints the MySQL dialect; --engine postgres prints the Postgres set,
+#    each CREATE followed by the ADD COLUMN / CREATE INDEX / UTC-DEFAULT statements later releases added.
 sluice control-tables ddl
 
 # 2. Ship each statement via a deploy request (dev branch → apply → deploy → cleanup, one command)
@@ -102,7 +104,7 @@ sluice deploy-ddl --org myorg --database mydb \
     --ddl 'ALTER TABLE `sluice_cdc_state` ADD COLUMN `unforwarded_refusal` TEXT NULL'
 ```
 
-The same applies on a Postgres target when sluice's role does not own the control table. That is usually the `--schema-already-applied` setup, with the table pre-created by another role. Postgres checks ownership before `IF NOT EXISTS`, so only the owner can add the column: `ALTER TABLE sluice_cdc_state ADD COLUMN unforwarded_refusal TEXT NULL` (schema-qualified if the control table is not in `public`). Once the column exists, a DML-only role records and clears refusals without any DDL.
+The same applies on a Postgres target when sluice's role does not own the control table. That is usually the `--schema-already-applied` setup, with the table pre-created by another role. Postgres checks ownership before `IF NOT EXISTS`, so only the owner can add the column: `ALTER TABLE sluice_cdc_state ADD COLUMN unforwarded_refusal TEXT NULL` (schema-qualified if the control table is not in `public`). Once the column exists, a DML-only role records and clears refusals without any DDL. More generally, every Postgres control-table ensure now checks the catalog first and runs only the DDL whose table, column, index or UTC default is missing; when that DDL is needed and this role cannot run it, the start stops with **`CONTROL-TABLE-DDL-REQUIRED`**, naming the object and the exact statement. Have the owner run it, or run the whole idempotent set `sluice control-tables ddl --engine postgres` prints once.
 
 Indexes: the deferred index build can also hit the safe-migrations block (or the ~900s statement-time wall) *after* the copy — on `migrate`, on `restore`, and on the `sync start` cold-start alike. Arm the automatic deploy-request index-build fallback (ADR-0148) with `--planetscale-org <org>` plus the service-token env vars (optionally `--planetscale-database` / `--planetscale-branch` / `--planetscale-deploy-timeout`) on whichever of those commands you are running, and the still-pending indexes build through a dev branch + deploy request on the already-copied data, no re-copy. Unarmed, the refusal is `SLUICE-E-INDEX-DIRECT-DDL-DISABLED`.
 

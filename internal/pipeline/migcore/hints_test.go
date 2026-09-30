@@ -136,7 +136,7 @@ func TestHintForRegistry(t *testing.T) {
 			err: fmt.Errorf("postgres: ping: %w", &pgconn.PgError{
 				Severity: "FATAL", Code: "3D000", Message: `database "wrongname" does not exist`,
 			}),
-			want: "verify the database name in the target DSN",
+			want: "verify the database name in that DSN",
 		},
 		{
 			name:  "connect: unknown database (MySQL errno 1049, marked by the engine)",
@@ -144,7 +144,7 @@ func TestHintForRegistry(t *testing.T) {
 			err: fmt.Errorf("mysql: ping: %w", ir.WithMarker(&mysql.MySQLError{
 				Number: 1049, SQLState: [5]byte{'4', '2', '0', '0', '0'}, Message: "Unknown database 'wrongname'",
 			}, ir.ErrDatabaseNotFound)),
-			want: "verify the database name in the target DSN",
+			want: "verify the database name in that DSN",
 		},
 		{
 			name:  "schema-apply: permission denied for schema",

@@ -32,8 +32,10 @@ func bootstrapControlTables(schema string) []controlTable {
 func (e Engine) ControlTableDDLGuidance() []string {
 	return []string{
 		"Run as the tables' owner, or a role with CREATE on the schema. Every statement",
-		"is idempotent, and brings an older-shape table to the current one. Afterwards",
-		"a sync role needs only SELECT, INSERT, UPDATE and DELETE on these tables.",
+		"is idempotent. Together they create a missing table, add the columns and indexes",
+		"later releases added, and re-point the timestamp DEFAULTs sluice's writes rely on",
+		"at UTC (a table created before v0.99.263 defaulted to the session clock).",
+		"Afterwards a sync role needs only SELECT, INSERT, UPDATE and DELETE on these tables.",
 		"The statements name schema " + bootstrapSchema + "; if your target DSN sets ?schema=, use that schema instead.",
 	}
 }

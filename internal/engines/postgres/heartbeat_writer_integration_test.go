@@ -374,6 +374,46 @@ func TestEnsureHeartbeatTable_PermissionDenied(t *testing.T) {
 	}
 }
 
+// TestEnsureHeartbeatTable_DMLOnlyRole pins GC-40 (a) and its L4 review
+// finding on a real Postgres: a source role with no CREATE on the schema,
+// against a heartbeat table an owner pre-created, starts heartbeating once it
+// holds INSERT/DELETE on the table AND USAGE on the BIGSERIAL id sequence;
+// without the sequence grant the ensure says so, on the degrade path, instead
+// of every later INSERT failing.
+func TestEnsureHeartbeatTable_DMLOnlyRole(t *testing.T) {
+	dsn, cleanup := startPostgresForCDC(t)
+	defer cleanup()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	const table = "sluice_heartbeat_dml_test"
+	applyPGSQL(t, dsn, `CREATE TABLE public.`+table+` (id BIGSERIAL PRIMARY KEY, ts TIMESTAMPTZ NOT NULL DEFAULT now(), stream_id TEXT NOT NULL)`)
+	applyPGSQL(t, dsn, `CREATE ROLE hbdml LOGIN PASSWORD 'hbdml'`)
+	applyPGSQL(t, dsn, `REVOKE CREATE ON SCHEMA public FROM PUBLIC`)
+	applyPGSQL(t, dsn, `GRANT USAGE ON SCHEMA public TO hbdml`)
+	applyPGSQL(t, dsn, `GRANT SELECT, INSERT, DELETE ON public.`+table+` TO hbdml`)
+
+	sr, err := Engine{}.OpenSchemaReader(ctx, rewriteDSNCredentials(t, dsn, "hbdml", "hbdml"))
+	if err != nil {
+		t.Fatalf("OpenSchemaReader as hbdml: %v", err)
+	}
+	defer closeReader(t, sr)
+	pgsr := sr.(*SchemaReader)
+
+	err = pgsr.EnsureHeartbeatTable(ctx, table)
+	if !errors.Is(err, ir.ErrHeartbeatPermission) || !strings.Contains(err.Error(), "USAGE on its id sequence") {
+		t.Fatalf("without sequence USAGE: %v; want the sequence-grant diagnosis on the degrade path", err)
+	}
+
+	applyPGSQL(t, dsn, `GRANT USAGE ON SEQUENCE public.`+table+`_id_seq TO hbdml`)
+	if err := pgsr.EnsureHeartbeatTable(ctx, table); err != nil {
+		t.Fatalf("DML-only role on a pre-created table: %v", err)
+	}
+	if err := pgsr.WriteHeartbeat(ctx, table, "s1"); err != nil {
+		t.Fatalf("WriteHeartbeat as the DML-only role: %v", err)
+	}
+}
+
 // rewriteDSNCredentials replaces the user/password in a PG DSN so the
 // permission-denied test can connect as the restricted role.
 // startPostgresForCDC returns a DSN like:

@@ -80,7 +80,7 @@ func TestEmitMetrics_FutureDatedRowFailsClosed(t *testing.T) {
 
 // TestControlTimestampAge_EveryAgeConsumerRoutesThroughIt is the GC-40 (c)
 // roster gate. It walks every non-test Go file under cmd/ and internal/ and
-// finds each call that ages a `.UpdatedAt` field directly — `x.Sub(y.UpdatedAt)`
+// finds each call that ages a `.UpdatedAt` field directly — `x.Sub(y.UpdatedAt)`, `y.UpdatedAt.Sub(x)`, `time.Until(y.UpdatedAt)`
 // or `time.Since(y.UpdatedAt)`. Such a call reads a negative (future-dated)
 // age as fresh, which is the fail-open GC-40 (c) closed; a freshness
 // consumer must go through [ControlTimestampAge] instead. Every remaining
@@ -89,25 +89,24 @@ func TestEmitMetrics_FutureDatedRowFailsClosed(t *testing.T) {
 // identifier of the aged value, and every listed exemption must still
 // match (a stale entry fails too).
 //
-// Reach, stated: the gate sees the `.UpdatedAt` spelling only. An age taken
-// from a copied local (`t := st.UpdatedAt; now.Sub(t)`) is outside it.
+// Reach, stated: it sees `.UpdatedAt` aged by Sub (as argument or receiver),
+// time.Since or time.Until. Outside it: an age taken from a copied local
+// (`t := st.UpdatedAt; now.Sub(t)`), a freshness test spelled as a
+// comparison (`x.UpdatedAt.Before(cutoff)`, After, Compare — not matched
+// because row-vs-row ordering uses the same spelling and is not an age),
+// and any timestamp field not named UpdatedAt.
 func TestControlTimestampAge_EveryAgeConsumerRoutesThroughIt(t *testing.T) {
-	exempt := map[string]string{
-		// ir.MigrationState rows: migration_state.go has written UTC since
-		// before GC-39, so no binary produced the zone-shifted row, and
-		// these ages describe cold-start progress, not stream freshness.
-		"cmd/sluice/status_render.go:writeColdStartsText:st": "cold-start progress row (sluice_migration_state, always UTC)",
-		"cmd/sluice/status_render.go:renderStatusJSON:cs":    "cold-start progress row (sluice_migration_state, always UTC)",
-		"cmd/sluice/sync_health.go:coldStartInFlight:st":     "cold-start progress row on the not-found (exit 2) path",
-		// The summary aggregates are the raw per-row ages by design; each
-		// row the aggregate spans is flagged individually in the same
-		// render (AGE cell / control_timestamp_in_future).
-		"cmd/sluice/status_render.go:agesSpan:streams": "aggregate of raw ages; each future-dated row is flagged in the same render",
-		"cmd/sluice/status_render.go:agesSpan:st":      "aggregate of raw ages; each future-dated row is flagged in the same render",
-		// A negative heartbeat age reads as FRESH, and fresh REFUSES a
-		// second concurrent backfill: the fail-closed direction.
-		"internal/pipeline/backfill.go:runWalk:state": "concurrent-run guard; a future-dated heartbeat refuses (fail closed)",
-	}
+	// The migrate-state ages (cold-start progress, the backfill heartbeat)
+	// were exempt here once, on the premise that sluice_migrate_state was
+	// always written in UTC. It was not: a table created before v0.99.263
+	// defaults its timestamps to CURRENT_TIMESTAMP and the writes rely on
+	// the default (GC-40 LOW-1/2), so those readers route through
+	// ControlTimestampAge too.
+	// The status summary's aggregate (agesSpan) was exempt too, as "raw by
+	// design"; the second GC-40 review showed a raw negative there fails
+	// open for an oldest_seconds consumer, so it routes now as well. Empty
+	// is the expected state; an entry needs a reason a reviewer can check.
+	exempt := map[string]string{}
 
 	root := filepath.Join("..", "..")
 	fset := token.NewFileSet()
@@ -156,10 +155,17 @@ func TestControlTimestampAge_EveryAgeConsumerRoutesThroughIt(t *testing.T) {
 						routed++
 						return true
 					}
-					if sel.Sel.Name != "Sub" && sel.Sel.Name != "Since" {
+					if sel.Sel.Name != "Sub" && sel.Sel.Name != "Since" && sel.Sel.Name != "Until" {
 						return true
 					}
-					for _, arg := range call.Args {
+					// The aged value as an argument (now.Sub(x.UpdatedAt),
+					// time.Since/Until(x.UpdatedAt)) or as the receiver
+					// (x.UpdatedAt.Sub(now)).
+					operands := append([]ast.Expr{}, call.Args...)
+					if sel.Sel.Name == "Sub" {
+						operands = append(operands, sel.X)
+					}
+					for _, arg := range operands {
 						base, ok := updatedAtBase(arg)
 						if !ok {
 							continue
@@ -182,14 +188,15 @@ func TestControlTimestampAge_EveryAgeConsumerRoutesThroughIt(t *testing.T) {
 	}
 
 	// Anti-vacuity: the walk covered the tree, and the consumers that were
-	// routed are still routed (health, status text, status JSON, the
+	// routed are still routed (health, status text, status JSON, the cold-start
+	// text and JSON ages, the status summary, the backfill heartbeat guard, the
 	// metric, the live panel). Errorf, not Fatalf, so a detection below
 	// is reported beside a floor breach rather than hidden behind it.
 	if files < 500 {
 		t.Errorf("walked only %d Go files; the gate is not seeing the tree", files)
 	}
-	if routed < 5 {
-		t.Errorf("found %d ControlTimestampAge call sites, want >= 5; a consumer stopped routing through it", routed)
+	if routed < 9 {
+		t.Errorf("found %d ControlTimestampAge call sites, want >= 9; a consumer stopped routing through it", routed)
 	}
 	for _, v := range violations {
 		t.Errorf("%s ages a .UpdatedAt directly: a future-dated row would read as fresh (GC-40 (c)); route it through pipeline.ControlTimestampAge or exempt it here with a reason", v)

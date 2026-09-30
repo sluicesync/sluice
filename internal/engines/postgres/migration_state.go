@@ -116,8 +116,13 @@ func newMigrationStateStore(db *sql.DB, schema string, isNeki bool, serverKey st
 				// The timestamps are supplied by the COLUMN DEFAULTS rather
 				// than written into the statement, which is what MySQL's
 				// sibling has always done (its DEFAULT + ON UPDATE
-				// CURRENT_TIMESTAMP). The UTC contract above is unchanged —
-				// the defaults are the same timezone('utc', now()) — and on
+				// CURRENT_TIMESTAMP). The UTC contract above holds only while
+				// the defaults are timezone('utc', now()): a table created
+				// before v0.99.263 still defaulted to CURRENT_TIMESTAMP, so
+				// every write here stored the session zone's digits, and
+				// EnsureControlTable re-points those defaults (utcDefaults,
+				// GC-40 LOW-1; pinned by
+				// TestMigrateState_LegacySessionClockDefault_UnderTokyo). On
 				// conflict `EXCLUDED.updated_at` carries the row PROPOSED for
 				// insertion, defaults included, so the refresh is still a
 				// server-clock read.
@@ -234,6 +239,10 @@ func migrateStateTables(schema string) []controlTable {
 				{"copy_shape", "copy_shape TEXT NULL"},
 				{"source_identity", "source_identity TEXT NULL"},
 			},
+			// The upserts leave started_at/updated_at to these DEFAULTs (the Neki
+			// router note on UpsertHeader), so a pre-v0.99.263 table's
+			// CURRENT_TIMESTAMP default must be re-pointed (GC-40 LOW-1).
+			utcDefaults: []string{"started_at", "updated_at"},
 		},
 		{
 			name:   migrateProgressTableName,
@@ -246,6 +255,7 @@ func migrateStateTables(schema string) []controlTable {
 			updated_at      TIMESTAMP    NOT NULL DEFAULT (pg_catalog.timezone('utc', pg_catalog.now())),
 			PRIMARY KEY (migration_id, table_name)
 		)`,
+			utcDefaults: []string{"updated_at"},
 		},
 	}
 }

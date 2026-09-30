@@ -22,7 +22,7 @@ The pain shape: PlanetScale-Fivetran customers regularly find out days late that
 
 Add two new operator surfaces, each with a clear lane:
 
-1. **`sluice sync health` (one-shot probe)** — read the target's `sluice_cdc_state` and source's current position; emit a structured report with lag and liveness metrics. Cron-friendly. Exits 0 on healthy, 1 on unhealthy, 2 on operational error. Operators script this for cheap external monitoring without sluice running its own daemon.
+1. **`sluice sync health` (one-shot probe)** — read the target's `sluice_cdc_state` and source's current position; emit a structured report with lag and liveness metrics. Cron-friendly. Exits 0 on healthy, 1 on unhealthy, 2 on operational error. (Since GC-40 (c), "unhealthy" includes state `UNKNOWN` / `CONTROL-TIMESTAMP-IN-FUTURE`: a stream row whose `updated_at` reads more than 60 s in the future has no readable age, and trips exit 1 whatever `--max-stale-seconds` says, including 0.) Operators script this for cheap external monitoring without sluice running its own daemon.
 
 2. **`--metrics-listen ADDR` flag on `sluice sync start`** — when set, the running streamer exposes a Prometheus-format `/metrics` endpoint at the given address. Same data the `sync health` probe reports, surfaced for scrape-based monitoring without polling overhead. Off by default; opt-in.
 

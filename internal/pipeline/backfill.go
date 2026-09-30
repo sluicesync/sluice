@@ -589,7 +589,24 @@ func (b *Backfiller) runWalk(ctx context.Context, ex ir.BackfillExecutor, table 
 	// slips through (documented residual), and a kill -9'd run keeps the
 	// spec refused for at most one window.
 	if found && state.Phase == backfillPhaseRunning {
-		if age := b.nowFunc()().Sub(state.UpdatedAt); age < backfillHeartbeatFreshFor {
+		age, readable := ControlTimestampAge(b.nowFunc()(), state.UpdatedAt)
+		if !readable {
+			// GC-40 LOW-1/2: a heartbeat dated in the future says nothing
+			// about whether another runner is live — the shape a
+			// migrate-state table created before v0.99.263 wrote on an
+			// east-of-UTC database (its session-clock DEFAULT; the ensure
+			// above has now re-pointed it, or refused). Still a refusal, so
+			// the guard fails closed, but it names the real cause instead of
+			// claiming a live run.
+			return sluicecode.Wrap(
+				sluicecode.CodeBackfillConcurrentRun,
+				fmt.Sprintf("confirm no other backfill of this spec is running, then remove its row from sluice_migrate_state (migration_id %s) or wait until the stored heartbeat passes; a new run writes UTC", migID),
+				fmt.Errorf("backfill: spec %s: %s: its state heartbeat is dated %s in the future, so whether another runner is live cannot be read from it "+
+					"(a sluice_migrate_state table created before v0.99.263 stored local time on a database zone east of UTC, or the target's clock runs ahead of this host's)",
+					migID, ControlTimestampInFutureMarker, (-age).Round(time.Second)),
+			)
+		}
+		if age < backfillHeartbeatFreshFor {
 			return sluicecode.Wrap(
 				sluicecode.CodeBackfillConcurrentRun,
 				fmt.Sprintf("wait for the running backfill to finish (its heartbeat goes stale after %s without a committed chunk), or investigate why it is still walking — do NOT --restart around a live run", backfillHeartbeatFreshFor),

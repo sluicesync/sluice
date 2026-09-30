@@ -79,6 +79,23 @@ func TestConnectHint_DoesNotExist_RealServers(t *testing.T) {
 		if got := code(err); got != sluicecode.CodeConnectDatabaseMissing {
 			t.Errorf("a missing Postgres database was coded %q; want %s:\n%v", got, sluicecode.CodeConnectDatabaseMissing, err)
 		}
+
+		// The SOURCE side reaches the same hint, and the hint must not
+		// point at the target DSN.
+		missingSrc, derr := buildPGDSN(sourceDSN, "gc40b_no_such_src_db")
+		if derr != nil {
+			t.Fatal(derr)
+		}
+		err = run(t, &Streamer{
+			Source: pgEng, Target: pgEng, SourceDSN: missingSrc, TargetDSN: targetDSN,
+			StreamID: "gc40b-missing-src-db",
+		})
+		if got := code(err); got != sluicecode.CodeConnectDatabaseMissing {
+			t.Errorf("a missing Postgres SOURCE database was coded %q; want %s:\n%v", got, sluicecode.CodeConnectDatabaseMissing, err)
+		}
+		if strings.Contains(err.Error(), "target DSN") {
+			t.Errorf("a missing SOURCE database's hint names the target DSN:\n%v", err)
+		}
 	})
 
 	t.Run("mysql", func(t *testing.T) {

@@ -14,6 +14,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,6 +30,9 @@ type ensureScript struct {
 	present bool
 	missing []string
 	execErr error
+
+	legacyDefaults []string // columns the default probe reports as not UTC
+	sessionUTC     bool     // what the session-zone probe answers
 
 	mu       sync.Mutex
 	executed []string
@@ -64,8 +68,23 @@ func (c ensureConn) ExecContext(_ context.Context, query string, _ []driver.Name
 	return driver.RowsAffected(0), nil
 }
 
-func (c ensureConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
+func (c ensureConn) QueryContext(_ context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
 	switch {
+	case strings.Contains(query, "pg_attrdef"):
+		// Every UTC-default column already defaults to the UTC expression,
+		// unless the script names it as a legacy session-clock default.
+		asked, _ := args[1].Value.([]string)
+		var rows [][]driver.Value
+		for _, d := range c.s.legacyDefaults {
+			if slices.Contains(asked, d) {
+				rows = append(rows, []driver.Value{d})
+			}
+		}
+		return &ensureRows{cols: []string{"name"}, rows: rows}, nil
+	case strings.Contains(query, "has_sequence_privilege"):
+		return &ensureRows{cols: []string{"ok"}, rows: [][]driver.Value{{true}}}, nil
+	case strings.Contains(query, "current_setting('TimeZone')"):
+		return &ensureRows{cols: []string{"utc"}, rows: [][]driver.Value{{c.s.sessionUTC}}}, nil
 	case strings.Contains(query, "unnest"):
 		rows := make([][]driver.Value, 0, len(c.s.missing))
 		for _, m := range c.s.missing {
@@ -194,6 +213,77 @@ func TestControlTableEnsure_RefusalNamesTheMissingObject(t *testing.T) {
 	}
 }
 
+// TestControlTableEnsure_RefusalWordsTheCause pins that the refusal words
+// its cause from the error, one branch each: absent on a path that never
+// creates, 42501 (the privilege remedy), 3F000 (the DSN's schema=), anything
+// else (the raw cause, no privilege claim) — and a 42501 from the catalog
+// probe itself names the missing schema USAGE.
+func TestControlTableEnsure_RefusalWordsTheCause(t *testing.T) {
+	pg := func(code string) error { return &pgconn.PgError{Code: code, Message: "x"} }
+	tbl := skippedTablesTable("public")
+	for _, c := range []struct {
+		name      string
+		err       error
+		want, not []string
+	}{
+		{"absent, never created here", errTableAbsent, []string{"never creates control tables", "control-tables ddl --engine postgres"}, []string{"may not"}},
+		{"42501", pg("42501"), []string{"this role may not create it", `CREATE on schema "public"`}, nil},
+		{"3F000", pg("3F000"), []string{`schema "public" does not exist`, "schema= parameter"}, []string{"may not"}},
+		{"lock timeout", pg("55P03"), []string{"the statement that fixes it failed", "SQLSTATE 55P03"}, []string{"may not", "CREATE on schema"}},
+	} {
+		msg := tbl.ddlRequired("does not exist", tbl.create, c.err).Error()
+		for _, w := range c.want {
+			if !strings.Contains(msg, w) {
+				t.Errorf("%s: %q lacks %q", c.name, msg, w)
+			}
+		}
+		for _, n := range c.not {
+			if strings.Contains(msg, n) {
+				t.Errorf("%s: %q claims %q", c.name, msg, n)
+			}
+		}
+		if !strings.Contains(msg, ControlTableDDLRequiredMarker) {
+			t.Errorf("%s: no marker in %q", c.name, msg)
+		}
+	}
+	if msg := tbl.detectError("table", pg("42501")).Error(); !strings.Contains(msg, `lacks USAGE on schema "public"`) {
+		t.Errorf("probe 42501 = %q; want the USAGE diagnosis", msg)
+	}
+}
+
+// TestControlTableEnsure_LegacySessionClockDefault pins GC-40 LOW-1/2's
+// decision matrix for a migrate-state table created before v0.99.263, whose
+// writes rely on a DEFAULT CURRENT_TIMESTAMP: the ensure re-points the default
+// when it can; when it cannot, it refuses on a non-UTC session (every write
+// would store local digits) and only WARNs on a UTC one (harmless there).
+func TestControlTableEnsure_LegacySessionClockDefault(t *testing.T) {
+	denied := &pgconn.PgError{Code: "42501", Message: "must be owner of table sluice_migrate_state"}
+	ensure := func(s *ensureScript) error {
+		return (&MigrationStateStore{db: newEnsureDB(t, s), schema: "public"}).EnsureControlTable(context.Background())
+	}
+
+	s := &ensureScript{present: true, legacyDefaults: []string{"started_at", "updated_at"}}
+	if err := ensure(s); err != nil {
+		t.Fatalf("owner re-pointing the defaults: %v", err)
+	}
+	if got := s.ddl(); len(got) != 3 || !strings.Contains(got[0], `ALTER COLUMN "started_at" SET DEFAULT (`+utcNowSQL+`)`) {
+		t.Errorf("executed %q; want the SET DEFAULT for each legacy column of both tables", got)
+	}
+
+	s = &ensureScript{present: true, legacyDefaults: []string{"updated_at"}, execErr: denied, sessionUTC: false}
+	err := ensure(s)
+	for _, want := range []string{ControlTableDDLRequiredMarker, "session-clock DEFAULT on updated_at", "SET DEFAULT"} {
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("non-UTC session, role cannot ALTER: %v; want a refusal containing %q", err, want)
+		}
+	}
+
+	s = &ensureScript{present: true, legacyDefaults: []string{"updated_at"}, execErr: denied, sessionUTC: true}
+	if err := ensure(s); err != nil {
+		t.Errorf("UTC session, role cannot ALTER: %v; want a WARN and a start", err)
+	}
+}
+
 // TestControlTableDDLLiterals_OnlyInDetectFirstBuilders is the roster gate
 // for GC-40 (a). It walks every non-test Go file in this package and finds
 // each string literal that creates or extends a table or index with
@@ -203,6 +293,14 @@ func TestControlTableEnsure_RefusalNamesTheMissingObject(t *testing.T) {
 // doors, or in the user-schema DDL emitters — anything else is a new ensure
 // that would issue DDL on every start and stop a DML-only role. Every entry
 // must still match (a stale entry fails too).
+//
+// Reach, stated: string LITERALS containing an IF NOT EXISTS form (CREATE
+// TABLE / ADD COLUMN / CREATE INDEX / ADD VALUE) in internal/engines/postgres
+// only. It does not see a CREATE or ALTER spelled without IF NOT EXISTS, a
+// statement assembled from fragments that never hold the phrase in one
+// literal, or the pgtrigger package; the zero-DDL behaviour of the
+// controlTable builders and the two hand-written doors is what
+// TestControlTableEnsure_IssuesZeroDDLWhenCurrent checks.
 func TestControlTableDDLLiterals_OnlyInDetectFirstBuilders(t *testing.T) {
 	allowed := map[string]string{
 		"control_table.go:cdcStateTable":                      "controlTable builder",
@@ -213,8 +311,8 @@ func TestControlTableDDLLiterals_OnlyInDetectFirstBuilders(t *testing.T) {
 		"keyset_store.go:keysetTable":                         "controlTable builder",
 		"target_metrics_history.go:targetMetricsHistoryTable": "controlTable builder",
 		"control_table_ensure.go:addColumnDDL":                "run by controlTable.ensureColumns for a missing column only",
-		"apply_marks.go:applyMarksTableDDL":                   "run by ensureApplyMarksTable behind applyMarksTableExists",
-		"heartbeat_writer.go:EnsureHeartbeatTable":            "run behind relationPresent",
+		"apply_marks.go:applyMarksTableDDL":                   "run by ensureApplyMarksTable behind applyMarksTableExists (detection checked behaviourally: TestControlTableEnsure_IssuesZeroDDLWhenCurrent, apply marks)",
+		"heartbeat_writer.go:EnsureHeartbeatTable":            "run behind relationPresent (detection checked behaviourally: TestControlTableEnsure_IssuesZeroDDLWhenCurrent, heartbeat)",
 		"ddl_emit.go:emitTableDef":                            "user-schema DDL for migrate/cold start, not a control table",
 		"schema_writer.go:AlterAddColumn":                     "user-schema ADD COLUMN, not a control table",
 		"schema_writer.go:buildOneIndex":                      "user-schema index build, not a control table",

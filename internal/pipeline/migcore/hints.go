@@ -284,9 +284,12 @@ var hintRegistry = []errorHint{
 	{
 		phase: PhaseConnect,
 		match: ir.IsDatabaseNotFound,
-		// Not "--target": a fleet `sync run` reaches connect too and takes
-		// its endpoints from the config, not from a --target flag.
-		hint: "verify the database name in the target DSN",
+		// Names neither side: the same connect phase opens the SOURCE too
+		// (`backup`, which has no target; add-table's source reader), and the
+		// wrapped error above already says which connection failed. Not
+		// "--target"/"--source" either: a fleet `sync run` takes its
+		// endpoints from the config, not from flags.
+		hint: "the database this connection's DSN names does not exist on that server — verify the database name in that DSN (the error above says which connection it is)",
 		code: sluicecode.CodeConnectDatabaseMissing,
 	},
 

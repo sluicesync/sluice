@@ -29,7 +29,10 @@ import (
 //
 // Exit codes:
 //   - 0 healthy.
-//   - 1 stale (a threshold was breached).
+//   - 1 stale (a threshold was breached), skipping (a nonzero skipped-table
+//     ledger), or UNKNOWN: the stream row's updated_at reads more than 60s
+//     in the future (CONTROL-TIMESTAMP-IN-FUTURE) — whatever
+//     --max-stale-seconds says, including 0.
 //   - 2 operational error (couldn't connect, stream not found, etc.).
 type SyncHealthCmd struct {
 	TargetDriver string `help:"Target engine name (e.g. mysql, postgres). See 'sluice engines'." required:"" placeholder:"NAME" group:"target"`
@@ -40,7 +43,7 @@ type SyncHealthCmd struct {
 	Source       string `help:"Source database DSN (optional). See --source-driver." env:"SLUICE_SOURCE" placeholder:"DSN" group:"source"`
 	SlotName     string `help:"Replication-slot name on the source (PG-only, requires --source). Used to read per-slot CDC-decode spill counters from pg_stat_replication_slots (PG 14+). Defaults to 'sluice_slot' — sluice's built-in slot name — when --source-driver=postgres is set and this flag is unset." placeholder:"NAME" group:"source"`
 
-	MaxStaleSeconds int   `help:"Threshold: exit 1 if target's last apply was more than N seconds ago. 0 disables the check (informational only)." default:"0" placeholder:"N"`
+	MaxStaleSeconds int   `help:"Threshold: exit 1 if target's last apply was more than N seconds ago. 0 disables this threshold. Independently of N (including 0), exit 1 with CONTROL-TIMESTAMP-IN-FUTURE when the stream row's updated_at reads more than 60s in the future — its age cannot be read." default:"0" placeholder:"N"`
 	MaxLagBytes     int64 `help:"Threshold (PG-only, requires --source): exit 1 if source LSN is more than N bytes ahead of target. 0 disables. MySQL leaves this informational; GTID sets aren't byte-distance comparable." default:"0" placeholder:"N"`
 
 	Format string `help:"Output format: 'text' (default) or 'json' (machine-readable for alertmanager / scripting pipes)." default:"text" enum:"text,json" placeholder:"FORMAT"`
@@ -68,7 +71,9 @@ type HealthResult struct {
 	// --max-stale-seconds says, under CONTROL-TIMESTAMP-IN-FUTURE: a
 	// negative age is below every threshold, which is exactly how a stream
 	// stalled under a pre-v0.156.5 row used to pass as healthy.
-	// SecondsSinceLastApply keeps the raw negative value so the skew shows.
+	// SecondsSinceLastApply keeps the raw negative value so the skew shows,
+	// and Stale is set too (JSON "stale": true), so a consumer reading only
+	// .stale fails closed; the text state and exit reason say UNKNOWN.
 	TimestampInFuture bool `json:"control_timestamp_in_future,omitempty"`
 
 	// Source-side fields (populated only when --source-driver +
@@ -216,13 +221,13 @@ func (s *SyncHealthCmd) Run(_ *Globals) error {
 		// it is progressing.
 		if cs, ok := coldStartInFlight(ctx, target, s.Target, s.StreamID); ok {
 			return operationalError{err: fmt.Errorf(
-				"stream %q is COLD STARTING (phase %s, last progress write %s ago) and has not written its "+
+				"stream %q is COLD STARTING (phase %s, last progress write %s) and has not written its "+
 					"CDC anchor yet — expected during a cold start, not a stall. Its stream row appears only "+
 					"after the copy, the index build and the FLOAT exact re-read finish; `sluice sync status` "+
 					"shows the progress, and the PHASE advancing is what tells you it is working. That age "+
 					"moves when the phase does, so a long copy of one large table holds it still on a "+
 					"perfectly healthy run — it means the run is gone only if the phase has stopped too",
-				s.StreamID, cs.phase, cs.age.Round(time.Second),
+				s.StreamID, cs.phase, cs.lastWrite,
 			)}
 		}
 		return operationalError{err: fmt.Errorf("stream %q not found on target", s.StreamID)}
@@ -435,8 +440,11 @@ func evaluateHealth(streams []ir.StreamStatus, streamID string, maxStaleSeconds 
 		age, readable := pipeline.ControlTimestampAge(now, st.UpdatedAt)
 		r.SecondsSinceLastApply = int64(age.Seconds())
 		if !readable {
-			// Decided before, and independently of, the threshold.
+			// Decided before, and independently of, the threshold. Stale is
+			// set too: a JSON consumer reading only .stale must not see
+			// "false" for a reading the probe cannot show is fresh.
 			r.TimestampInFuture = true
+			r.Stale = true
 			return r
 		}
 		if maxStaleSeconds > 0 && r.SecondsSinceLastApply > int64(maxStaleSeconds) {
@@ -573,7 +581,10 @@ func (e controlTimestampInFutureError) Error() string {
 // last progress write.
 type coldStartProgress struct {
 	phase ir.MigrationPhase
-	age   time.Duration
+	// lastWrite is the rendered age of the last progress write
+	// ([progressAgeText]): "12s ago", or the CONTROL-TIMESTAMP-IN-FUTURE
+	// marker for a row a legacy session-clock default dated ahead.
+	lastWrite string
 }
 
 // coldStartInFlight reports whether streamID currently has a cold start
@@ -611,7 +622,7 @@ func coldStartInFlight(ctx context.Context, target ir.Engine, dsn, streamID stri
 			// honest answer.
 			return coldStartProgress{}, false
 		}
-		return coldStartProgress{phase: st.Phase, age: time.Since(st.UpdatedAt)}, true
+		return coldStartProgress{phase: st.Phase, lastWrite: progressAgeText(time.Now(), st.UpdatedAt)}, true
 	}
 	return coldStartProgress{}, false
 }

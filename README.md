@@ -320,7 +320,7 @@ Commands:
   backfill                 Backfill/transform a column in place — keyset-chunked, resumable, online-safe (ADR-0159).
   expand-contract          Drive the full expand→migrate→contract pattern on PlanetScale (ADR-0162).
   deploy-ddl               Ship ONE verbatim DDL statement to a PlanetScale branch via a deploy request (ADR-0165).
-  control-tables ddl       Print sluice's control-table CREATE statements for safe-migrations bootstrap.
+  control-tables ddl       Print the statements that create sluice's control tables (safe-migrations bootstrap; on postgres, also the ADD COLUMN / CREATE INDEX / UTC-DEFAULT follow-ups for a DML-only sync role).
   trigger setup            Install trigger-CDC state (postgres-trigger / sqlite-trigger / d1-trigger).
   trigger teardown         Remove every trace of the trigger engine from the source database.
   trigger prune            Reap durably-applied rows from a trigger change-log (ADR-0137).

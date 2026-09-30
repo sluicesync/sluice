@@ -76,9 +76,28 @@ func (r *SchemaReader) EnsureHeartbeatTable(ctx context.Context, tableName strin
 	// heartbeats at all.
 	present, err := relationPresent(ctx, r.db, tableRef)
 	if err != nil {
+		if isPGPermissionDenied(err) {
+			return errors.Join(ir.ErrHeartbeatPermission, err)
+		}
 		return fmt.Errorf("postgres: ensure heartbeat table %q: detect: %w", tableName, err)
 	}
 	if present {
+		// The id is BIGSERIAL, so every INSERT draws from its sequence: a
+		// role granted INSERT on the table but not USAGE on the sequence
+		// fails every heartbeat. Say so now, with the grant, on the same
+		// degrade path a denied write takes.
+		var seqOK bool
+		if err := r.db.QueryRowContext(ctx,
+			`SELECT COALESCE(pg_catalog.has_sequence_privilege(pg_catalog.pg_get_serial_sequence($1, 'id'), 'USAGE'), true)`,
+			tableRef).Scan(&seqOK); err != nil {
+			return fmt.Errorf("postgres: ensure heartbeat table %q: detect id sequence privilege: %w", tableName, err)
+		}
+		if !seqOK {
+			return errors.Join(ir.ErrHeartbeatPermission, fmt.Errorf(
+				"postgres: heartbeat table %s exists but this role lacks USAGE on its id sequence, so every heartbeat INSERT would fail — "+
+					"GRANT USAGE ON SEQUENCE <the id column's sequence, normally %s_id_seq> TO this role", tableRef, tableName,
+			))
+		}
 		return nil
 	}
 	ddl := `

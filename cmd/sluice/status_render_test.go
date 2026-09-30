@@ -417,7 +417,8 @@ func TestAgesSpan_OldestVsNewest(t *testing.T) {
 		makeStream("b", 1*time.Second, "mysql", "y"),
 		makeStream("c", 1*time.Hour, "mysql", "z"),
 	}
-	oldest, newest := agesSpan(streams, fixedNow)
+	span := agesSpan(streams, fixedNow)
+	oldest, newest := span.oldest, span.newest
 	if oldest != 1*time.Hour {
 		t.Errorf("oldest = %v; want 1h", oldest)
 	}

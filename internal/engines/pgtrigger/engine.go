@@ -233,6 +233,15 @@ func (e Engine) OpenChangeApplier(ctx context.Context, dsn string) (ir.ChangeApp
 	return e.pg.OpenChangeApplier(ctx, dsn)
 }
 
+// ControlTableDDL delegates to the composed [postgres.Engine]: a
+// postgres-trigger TARGET's control tables are the Postgres applier's own
+// (OpenChangeApplier above), so `sluice control-tables ddl --engine
+// postgres-trigger` prints exactly the Postgres set.
+func (e Engine) ControlTableDDL() []ir.ControlTableStatement { return e.pg.ControlTableDDL() }
+
+// ControlTableDDLGuidance delegates to the composed [postgres.Engine].
+func (e Engine) ControlTableDDLGuidance() []string { return e.pg.ControlTableDDLGuidance() }
+
 // OpenSnapshotStream is implemented trigger-natively in cdc_snapshot.go
 // (Bug 94): a REPEATABLE READ bulk-copy snapshot anchored at the
 // capture log's contiguous committed-prefix high-water, handed off to
