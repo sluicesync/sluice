@@ -61,6 +61,16 @@ type HealthResult struct {
 	Threshold             int    `json:"max_stale_seconds_threshold,omitempty"`
 	Stale                 bool   `json:"stale"`
 
+	// TimestampInFuture reports that the stream row's updated_at reads
+	// later than this host's clock by more than
+	// [pipeline.ControlTimestampSkewTolerance] (GC-40 (c)). The age is then
+	// no evidence of freshness, so the probe trips (exit 1) whatever
+	// --max-stale-seconds says, under CONTROL-TIMESTAMP-IN-FUTURE: a
+	// negative age is below every threshold, which is exactly how a stream
+	// stalled under a pre-v0.156.5 row used to pass as healthy.
+	// SecondsSinceLastApply keeps the raw negative value so the skew shows.
+	TimestampInFuture bool `json:"control_timestamp_in_future,omitempty"`
+
 	// Source-side fields (populated only when --source-driver +
 	// --source were supplied). The orchestrator opens a SchemaReader
 	// against the source, type-asserts to ir.HealthReporter, calls
@@ -218,6 +228,8 @@ func (s *SyncHealthCmd) Run(_ *Globals) error {
 		return operationalError{err: fmt.Errorf("stream %q not found on target", s.StreamID)}
 	}
 	switch {
+	case result.TimestampInFuture:
+		return controlTimestampInFutureError{streamID: s.StreamID, secondsAgo: result.SecondsSinceLastApply}
 	case result.Stale:
 		return staleStreamError{streamID: s.StreamID, secondsAgo: result.SecondsSinceLastApply, threshold: s.MaxStaleSeconds}
 	case result.LagBytesStale:
@@ -420,7 +432,13 @@ func evaluateHealth(streams []ir.StreamStatus, streamID string, maxStaleSeconds 
 		r.Found = true
 		r.Position = truncatePositionToken(st.Position.Token, 60)
 		r.UpdatedAt = st.UpdatedAt.UTC().Format(time.RFC3339)
-		r.SecondsSinceLastApply = int64(now.Sub(st.UpdatedAt).Seconds())
+		age, readable := pipeline.ControlTimestampAge(now, st.UpdatedAt)
+		r.SecondsSinceLastApply = int64(age.Seconds())
+		if !readable {
+			// Decided before, and independently of, the threshold.
+			r.TimestampInFuture = true
+			return r
+		}
 		if maxStaleSeconds > 0 && r.SecondsSinceLastApply > int64(maxStaleSeconds) {
 			r.Stale = true
 		}
@@ -448,6 +466,8 @@ func renderHealthText(w io.Writer, r HealthResult) error {
 	}
 	state := "healthy"
 	switch {
+	case r.TimestampInFuture:
+		state = fmt.Sprintf("UNKNOWN (%s: updated_at is %ds in the future)", pipeline.ControlTimestampInFutureMarker, -r.SecondsSinceLastApply)
 	case r.Stale:
 		state = fmt.Sprintf("STALE (last apply %ds ago, threshold %ds)", r.SecondsSinceLastApply, r.Threshold)
 	case r.LagBytesStale:
@@ -459,6 +479,11 @@ func renderHealthText(w io.Writer, r HealthResult) error {
 		"stream: %s\nfound: true\nstate: %s\nposition: %s\nupdated_at: %s\nseconds_since_last_apply: %d\n",
 		r.StreamID, state, r.Position, r.UpdatedAt, r.SecondsSinceLastApply); err != nil {
 		return err
+	}
+	if r.TimestampInFuture {
+		if _, err := fmt.Fprintf(w, "control_timestamp_remedy: %s\n", pipeline.ControlTimestampInFutureRemedy); err != nil {
+			return err
+		}
 	}
 	if r.SourceProbeAvailable {
 		if _, err := fmt.Fprintf(w, "source_position: %s\n", r.SourcePosition); err != nil {
@@ -525,6 +550,22 @@ func (e staleStreamError) Error() string {
 	}
 	return fmt.Sprintf("stream %q stale: last apply %ds ago, threshold %ds",
 		e.streamID, e.secondsAgo, e.threshold)
+}
+
+// controlTimestampInFutureError is the exit-1 verdict for a stream row
+// whose updated_at reads later than this host's clock by more than the skew
+// tolerance (GC-40 (c)). Same alerting class as staleStreamError: the probe
+// cannot show the stream is applying, so it must not exit 0.
+type controlTimestampInFutureError struct {
+	streamID   string
+	secondsAgo int64
+}
+
+func (controlTimestampInFutureError) ExitCode() int { return 1 }
+
+func (e controlTimestampInFutureError) Error() string {
+	return fmt.Sprintf("stream %q: %s: updated_at is %ds in the future — %s",
+		e.streamID, pipeline.ControlTimestampInFutureMarker, -e.secondsAgo, pipeline.ControlTimestampInFutureRemedy)
 }
 
 // coldStartProgress is the little that `sync health` needs to tell a

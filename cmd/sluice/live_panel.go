@@ -316,11 +316,15 @@ func pollLiveStatus(ctx context.Context, applier ir.ChangeApplier, wantID string
 			// flip the panel to the CDC body. Absence stays "unknown" — never a
 			// fabricated 0-second freshness (the *Known honesty contract).
 			if !st.UpdatedAt.IsZero() {
+				// A row dated past the skew tolerance (GC-40 (c)) has no
+				// readable age either, so it too stays "unknown" until
+				// this run's first position write corrects it.
+				freshness, readable := pipeline.ControlTimestampAge(time.Now(), st.UpdatedAt)
 				sink.EnterCDC()
 				sink.Status(progress.LiveStatus{
 					Position:    st.Position.Token,
-					Freshness:   time.Since(st.UpdatedAt),
-					Known:       true,
+					Freshness:   freshness,
+					Known:       readable,
 					RowsApplied: st.RowsApplied,
 					PolledAt:    time.Now(),
 				})

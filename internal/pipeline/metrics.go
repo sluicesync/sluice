@@ -466,8 +466,10 @@ func emitMetrics(w io.Writer, streams []ir.StreamStatus, now time.Time) {
 	fmt.Fprintln(w, "# HELP sluice_seconds_since_last_apply Wall-clock seconds since the stream's most recent applier commit.")
 	fmt.Fprintln(w, "# TYPE sluice_seconds_since_last_apply gauge")
 	for _, s := range streams {
-		fmt.Fprintf(w, `sluice_seconds_since_last_apply{stream_id=%q} %d`+"\n",
-			s.StreamID, int64(now.Sub(s.UpdatedAt).Seconds()))
+		// The helper writes its marker comment (if any) first, so it
+		// lands directly above the sample it explains.
+		sample := secondsSinceLastApplySample(w, s.StreamID, now, s.UpdatedAt)
+		fmt.Fprintf(w, `sluice_seconds_since_last_apply{stream_id=%q} %s`+"\n", s.StreamID, sample)
 	}
 	fmt.Fprintln(w)
 
@@ -481,6 +483,27 @@ func emitMetrics(w io.Writer, streams []ir.StreamStatus, now time.Time) {
 	fmt.Fprintln(w, "# HELP sluice_metrics_scrape_unix_seconds Unix timestamp of this scrape, for scraper-side staleness detection.")
 	fmt.Fprintln(w, "# TYPE sluice_metrics_scrape_unix_seconds gauge")
 	fmt.Fprintf(w, "sluice_metrics_scrape_unix_seconds %d\n", now.Unix())
+}
+
+// secondsSinceLastApplySample renders one stream's
+// sluice_seconds_since_last_apply value, never a negative number (GC-40 (c)).
+//
+// A row inside [ControlTimestampSkewTolerance] of the future is the scraper's
+// clock trailing the target's, so it reads 0 — just applied. A row further in
+// the future carries no freshness evidence (see
+// [ControlTimestampInFutureMarker]) and emits +Inf, preceded by a comment
+// line carrying the marker: +Inf is a valid Prometheus sample that exceeds
+// every threshold, so an `> N` stall alert FIRES on it. The two
+// alternatives both fail open — an omitted series and NaN each make every
+// comparison false, which is what the negative number did.
+func secondsSinceLastApplySample(w io.Writer, streamID string, now, updatedAt time.Time) string {
+	age, readable := ControlTimestampAge(now, updatedAt)
+	if !readable {
+		fmt.Fprintf(w, "# %s stream_id=%q: updated_at is %ds in the future; reported as +Inf until the stream's next position write\n",
+			ControlTimestampInFutureMarker, streamID, int64(-age.Seconds()))
+		return "+Inf"
+	}
+	return strconv.FormatInt(max(int64(age.Seconds()), 0), 10)
 }
 
 // emitAIMDMetrics renders the AIMD apply-batch-size controller's

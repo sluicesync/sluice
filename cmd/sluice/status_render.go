@@ -314,12 +314,19 @@ func renderStatusText(out io.Writer, streams []ir.StreamStatus, leases []ir.Shar
 	if _, err := fmt.Fprintln(tw, "STREAM\tUPDATED\tAGE\tPOSITION"); err != nil {
 		return err
 	}
+	inFuture := 0
 	for _, st := range streams {
+		age, readable := pipeline.ControlTimestampAge(now, st.UpdatedAt)
+		ageCell := humanAgo(age)
+		if !readable {
+			inFuture++
+			ageCell = fmt.Sprintf("%s (+%s)", pipeline.ControlTimestampInFutureMarker, (-age).Round(time.Second))
+		}
 		if _, err := fmt.Fprintf(
 			tw, "%s\t%s\t%s\t%s\n",
 			st.StreamID,
 			st.UpdatedAt.UTC().Format(time.RFC3339),
-			humanAgo(now.Sub(st.UpdatedAt)),
+			ageCell,
 			truncatePositionToken(st.Position.Token, 60),
 		); err != nil {
 			return err
@@ -327,6 +334,14 @@ func renderStatusText(out io.Writer, streams []ir.StreamStatus, leases []ir.Shar
 	}
 	if err := tw.Flush(); err != nil {
 		return err
+	}
+	// GC-40 (c): a future-dated row has no readable age, and an AGE cell
+	// alone would leave the operator to guess why.
+	if inFuture > 0 {
+		if _, err := fmt.Fprintf(out, "\n%d %s marked %s: %s\n",
+			inFuture, pluralize("stream", inFuture), pipeline.ControlTimestampInFutureMarker, pipeline.ControlTimestampInFutureRemedy); err != nil {
+			return err
+		}
 	}
 	// ADR-0054 §6: append the consolidation-lease one-line summary
 	// when any leases exist. Shape: "Shape A: N tables, M applied, K
@@ -553,6 +568,12 @@ func renderStatusJSON(out io.Writer, streams []ir.StreamStatus, leases []ir.Shar
 		SlotName             string       `json:"slot_name,omitempty"`
 		SourceDSNFingerprint string       `json:"source_dsn_fingerprint,omitempty"`
 		TargetSchema         string       `json:"target_schema,omitempty"`
+
+		// ControlTimestampInFuture flags a row whose updated_at reads later
+		// than this host's clock past the skew tolerance (GC-40 (c)):
+		// age_seconds is then the raw negative reading and says nothing
+		// about freshness. omitempty keeps every other document unchanged.
+		ControlTimestampInFuture bool `json:"control_timestamp_in_future,omitempty"`
 	}
 	type jsonSummary struct {
 		Count         int   `json:"count"`
@@ -607,6 +628,7 @@ func renderStatusJSON(out io.Writer, streams []ir.StreamStatus, leases []ir.Shar
 
 	out2 := make([]jsonStream, 0, len(streams))
 	for _, st := range streams {
+		age, readable := pipeline.ControlTimestampAge(now, st.UpdatedAt)
 		out2 = append(out2, jsonStream{
 			StreamID: st.StreamID,
 			Position: jsonPosition{
@@ -614,10 +636,12 @@ func renderStatusJSON(out io.Writer, streams []ir.StreamStatus, leases []ir.Shar
 				Token:  st.Position.Token,
 			},
 			UpdatedAt:            st.UpdatedAt.UTC(),
-			AgeSeconds:           int64(now.Sub(st.UpdatedAt).Seconds()),
+			AgeSeconds:           int64(age.Seconds()),
 			SlotName:             st.SlotName,
 			SourceDSNFingerprint: st.SourceDSNFingerprint,
 			TargetSchema:         st.TargetSchema,
+
+			ControlTimestampInFuture: !readable,
 		})
 	}
 	oldest, newest := agesSpan(streams, now)

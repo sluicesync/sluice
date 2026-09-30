@@ -720,6 +720,12 @@ The marker above lists the engine PACKAGES whose readers stamp an identity, and 
 
 An older sluice binary ignores the table entirely and replays as it always has.
 
+## A stream row dated in the future is unknown, not fresh (`CONTROL-TIMESTAMP-IN-FUTURE`)
+
+`sync health`, `sync status` (and the `sync status --all` fleet view), `sluice_seconds_since_last_apply` and the live panel all age a stream by its `sluice_cdc_state.updated_at` against the clock of the host they run on. A row that reads more than 60 s in the future says nothing about how recently the stream applied, and a negative age is below every staleness threshold, so it is reported as unknown under **`CONTROL-TIMESTAMP-IN-FUTURE`** rather than as fresh: `sync health` exits 1 whatever `--max-stale-seconds` says (state `UNKNOWN`, JSON `control_timestamp_in_future: true`), `sync status` shows the marker in the AGE column and `control_timestamp_in_future` in its JSON, the metric reads `+Inf` so a `> N` alert fires, and the live panel shows the freshness as unknown. Up to 60 s is treated as clock skew and aged normally.
+
+Two things produce such a row. A sluice older than v0.156.5 wrote `updated_at` in the database's local time on a Postgres target whose zone is east of UTC (hours in the future, e.g. 9 h on `Asia/Tokyo`); and the target's clock can run more than 60 s ahead of the host reading it. The stream's next position write corrects the row, so a running stream clears it at its next checkpoint — but a stream that is stalled or stopped never writes one, which is exactly the stream the probe exists to catch: restart it with `sluice sync start` and check again, and check NTP on both hosts.
+
 ## See also
 
 - [ADR-0038](../adr/adr-0038-applier-retry-on-transient-errors.md) —
