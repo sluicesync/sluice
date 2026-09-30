@@ -83,6 +83,14 @@ func TestSlotAckReleaseRoster_EveryStreamChangesSiteReleases(t *testing.T) {
 					"reader's slot would never be released and would retain source WAL for the life of the "+
 					"stream (GC-41)", key)
 			}
+			// A warm resume meets the reader's SLOT-ACKED-PAST-TARGET-POSITION
+			// door; the operator's acknowledgement must reach it on every
+			// such path, or --accept-slot-acked-past-position works on one
+			// resume path and silently not on another.
+			if strings.Contains(strings.ToLower(key), "warmresume") && !funcCalls[key]["wireSlotAckedPastAcceptance"] {
+				t.Errorf("%s is a warm-resume site but never calls wireSlotAckedPastAcceptance — the operator's "+
+					"--accept-slot-acked-past-position cannot reach its reader (GC-41 MEDIUM-1)", key)
+			}
 		case slotAckChain:
 			if !fileCalls[file]["releaseChainAckTo"] {
 				t.Errorf("%s is classified as a backup-chain site but %s never calls releaseChainAckTo — "+

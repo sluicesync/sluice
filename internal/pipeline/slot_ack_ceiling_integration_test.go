@@ -30,7 +30,7 @@ import (
 // acked the STREAMED LSN. With the target blocked (LOCK TABLES) the 200 rows
 // behind the lock were parsed, acked to the slot, and never applied; the
 // ungraceful stop (context cancel — the Ctrl-C shape) dropped them, and the
-// warm resume started past them. Measured pre-fix: 21 target rows against 221
+// warm resume started past them. Measured with the fix removed: 22 target rows against 221
 // source rows, at exit 0.
 //
 // Two independent checks, neither derived from sluice's own bookkeeping: the
@@ -105,7 +105,13 @@ func TestStreamer_PostgresToMySQL_SlotAckNeverPassesTheDurablePosition(t *testin
 	// a single 200-row transaction acked early is re-delivered whole and the
 	// loss stays invisible to the row count. With 200 transactions, every one
 	// before the acked position is gone.
-	insertRowsOneTxEach(t, pgSrc, table, seedRows+2, seedRows+1+blocked)
+	//
+	// preBlocked is taken after the FIRST blocked transaction, so it is
+	// strictly past the persisted position a run that releases nothing would
+	// still ack at (its start) — a WAL read before any new write can equal it.
+	insertRowsOneTxEach(t, pgSrc, table, seedRows+2, seedRows+2)
+	preBlocked := currentWALLSN(t, pgSrc)
+	insertRowsOneTxEach(t, pgSrc, table, seedRows+3, seedRows+1+blocked)
 
 	// ---- Watch ~2.5 keepalives: the slot must never pass the target. ----
 	ackViolations := watchSlotAckAgainstPersisted(t, pgSrc, slot, 25*time.Second, func() (pglogrepl.LSN, bool) {
@@ -132,8 +138,18 @@ func TestStreamer_PostgresToMySQL_SlotAckNeverPassesTheDurablePosition(t *testin
 	waitForRowCountMySQLQuoted(t, dsn, table, want, 2*time.Minute)
 	time.Sleep(3 * time.Second) // let a straggler (a duplicate would be a PK error) surface
 	got := pollRowCountMySQLQuoted(dsn, table)
+	// The upper bound alone stays green if nothing is ever released (the
+	// slot then never passes anything). The ceiling must also ADVANCE: once
+	// the blocked rows are applied, the slot passes the WAL taken after the
+	// first of them within three keepalives.
+	advanced := waitSlotPasses(t, pgSrc, slot, preBlocked, 3*10*time.Second)
 	cancel2()
 	<-run2
+	if !advanced {
+		c, _ := readConfirmedFlushLSN(t, pgSrc, slot)
+		t.Errorf("confirmed_flush_lsn %s never passed the pre-batch WAL %s after the rows landed on the MySQL "+
+			"target — the slot-ack ceiling is not releasing the target's durable position (GC-41)", c, preBlocked)
+	}
 
 	for _, v := range ackViolations {
 		t.Errorf("confirmed_flush_lsn %s passed the target's persisted position %s at %s — the slot was "+
@@ -276,13 +292,21 @@ func watchSlotAckAgainstPersisted(t *testing.T, pgDSN, slot string, d time.Durat
 	var out []ackViolation
 	compared := 0
 	for deadline := time.Now().Add(d); time.Now().Before(deadline); time.Sleep(500 * time.Millisecond) {
-		// Persisted first, then confirmed: persisted only grows, so reading it
-		// first can only make a sample look WORSE, never hide a violation.
-		p, ok := persisted()
+		// Confirmed first, then persisted. The slot is released only to
+		// values read back from the persisted row, and that row only moves
+		// forward on this binary (transaction-boundary checkpoints; see
+		// postgres/cdc_resume_ack.go), so confirmed at t0 <=
+		// persisted at t0 <= persisted at t1: this order cannot manufacture a
+		// violation out of a race between the two reads, while a real one —
+		// a slot past what the target holds — persists across the gap and is
+		// still seen. (The first cut read persisted first under a comment
+		// claiming that made a sample look worse, never better; it was the
+		// order that could raise a false alarm.)
+		c, ok := readConfirmedFlushLSN(t, pgDSN, slot)
 		if !ok {
 			continue
 		}
-		c, ok := readConfirmedFlushLSN(t, pgDSN, slot)
+		p, ok := persisted()
 		if !ok {
 			continue
 		}

@@ -512,6 +512,22 @@ Since v0.148.2 every MySQL-family lane — binlog GTID, binlog file/pos (`@@serv
 
 What to do when you see it: first confirm the DSN points at the database you mean — the three shapes above are indistinguishable from the position alone. If the replacement **is** intended, re-copy deliberately: `sluice sync start … --restart-from-scratch` (keeps the cdc-state row) or `--reset-target-data` (clears it too). Nothing happens until you say so.
 
+## PostgreSQL sources: a slot acknowledged past the target's position is refused (`SLOT-ACKED-PAST-TARGET-POSITION`)
+
+When a `sync` resumes, it starts from the position the target recorded in `sluice_cdc_state`. PostgreSQL decodes from the **later** of that position and the replication slot's `confirmed_flush_lsn`, so if the slot has been acknowledged past the target's position, every change committed in between is skipped and never reaches the target. Since this release a warm resume compares the two first — on single-schema and multi-schema resumes, and on the resume that finishes a stopped cold start — and refuses with `SLOT-ACKED-PAST-TARGET-POSITION`, naming the slot, both LSNs and the remedy. The run exits non-zero and is not retried.
+
+How a slot gets there:
+
+- **A stop on v0.156.6 or earlier of a Postgres → MySQL-family sync** (MySQL, MariaDB, PlanetScale, Vitess). Those releases acknowledged the slot at the position the reader had *streamed*, ahead of the target's writes, so a Ctrl-C, crash, or apply error that ended the run while changes sat in an apply batch left the slot past them. A graceful `sync stop` that drained its batch did not. Postgres → Postgres was exposed the same way before v0.99.130.
+- **A target restored from a backup, or failed over to a replica**, holding an older `sluice_cdc_state` row than the slot has been acknowledged to.
+- **A slot dropped and recreated** after the stream wrote its position — for example a `--restart-from-scratch` (whose "slot already exists" refusal says to drop the slot) that was interrupted before its copy finished, leaving the old row next to a slot created at "now".
+
+A stream written by this release never trips it: the slot is only ever released to the position the target has persisted, and that position never moves backward.
+
+What to do: re-copy with `sluice sync start … --restart-from-scratch` (or re-copy the affected tables). If you have verified the target already holds every change up to the slot's position — for instance every change in the gap was to a table outside this stream's filter — start once with `--accept-slot-acked-past-position=<confirmed_flush_lsn>`, using the LSN the refusal prints. It is bound to that LSN, so a slot that has moved since refuses again, and it is a command-line flag only (not a `syncs.yaml` key), so it cannot pre-accept a later refusal. One legitimate upgrade shape can also trip the check: a Postgres → Postgres stream last written by an older release whose final persisted position was a mid-transaction schema-change anchor; its resume was lossless, and the acknowledgement is the right answer there.
+
+**Check after upgrading.** A stream that already resumed on v0.156.6 or earlier after such a stop was fast-forwarded past its gap at that resume, and this check cannot see it any more (the target has since persisted positions past the slot). For each Postgres → MySQL-family stream that was stopped by Ctrl-C, a crash, or an apply error on one of those releases, compare `pg_replication_slots.confirmed_flush_lsn` with the LSN in the target's `sluice_cdc_state.source_position` *before* its first resume on this release; if the slot is past it, re-copy. For a stream that has already resumed, compare row counts (or `sluice verify`) against the source.
+
 ## A full backup that recorded no end position cannot root a chain (`POSITIONLESS-FULL-ROOT`)
 
 Every `backup incremental` and `backup stream` resumes the source's change stream from the position its parent recorded. A full backup normally records one at the end of its row sweep — a Postgres LSN, a MySQL GTID set or file/position, a VStream vgtid — and that position is the only thing that makes the chain contiguous: the incremental covers everything from *there* forward, and the full covered everything up to it.

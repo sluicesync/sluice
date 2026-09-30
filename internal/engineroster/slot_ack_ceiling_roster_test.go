@@ -43,14 +43,27 @@ import (
 // The citations the applier-class entries carry: which ReadPosition, why it
 // is durable, and the test that grades it end to end.
 const (
-	pgReadPosition = "postgres.ChangeApplier.ReadPosition reads sluice_cdc_state.source_position, written in the " +
-		"same transaction as the data on the serial paths and in WriteCheckpoint's own transaction after the " +
-		"lanes' data commits on the concurrent path; graded by " +
-		"TestStreamer_PostgresToPostgres_SlotAckFollowsTheDurablePosition"
-	mysqlReadPosition = "mysql.ChangeApplier.ReadPosition reads sluice_cdc_state.source_position, written in the " +
-		"same transaction as the data on the serial paths and in WriteCheckpoint's own transaction after the " +
-		"lanes' data commits on the concurrent path; graded by " +
+	pgReadPosition = "postgres.ChangeApplier.ReadPosition reads sluice_cdc_state.source_position, written with or after the " +
+		"data it covers (in the same transaction on the serial paths; in WriteCheckpoint's own transaction after the " +
+		"lanes' data commits on the concurrent path); graded by " +
+		"TestStreamer_PostgresToPostgres_SlotAckFollowsTheDurablePosition. UNVERIFIED PREMISE on a PlanetScale Neki " +
+		"(sharded Postgres) target: the argument assumes a ReadPosition routed through the Neki router sees the " +
+		"committed control row (read-your-writes for the row's placement); no test runs the sidecar against Neki"
+	mysqlReadPosition = "mysql.ChangeApplier.ReadPosition reads sluice_cdc_state.source_position, written with or after the " +
+		"data it covers (in the same transaction on the serial paths; in WriteCheckpoint's own transaction after the " +
+		"lanes' data commits on the concurrent path); graded by " +
 		"TestStreamer_PostgresToMySQL_SlotAckNeverPassesTheDurablePosition"
+	// vitessControlKeyspace qualifies "same transaction" for the Vitess
+	// flavors: with --control-keyspace the control row lives in another
+	// keyspace, and a vtgate transaction_mode=MULTI commit spanning two
+	// keyspaces is NOT atomic — shards commit in first-touch order and stop
+	// at the first failure. The row is durable only AFTER its data because
+	// the batch hooks touch the data keyspace first (GC-41 (c), data before
+	// control); a control row that committed before its data would release
+	// the slot past rows that never landed.
+	vitessControlKeyspace = ". Under vtgate MULTI with --control-keyspace the position is not in the data's " +
+		"transaction; it is durable after the data only because the apply hooks commit data before control " +
+		"(GC-41 (c))"
 )
 
 // slotAckCeilingRoster classifies every registered engine as a sync TARGET.
@@ -63,8 +76,8 @@ var slotAckCeilingRoster = map[string]struct {
 
 	"mysql":       {true, mysqlReadPosition},
 	"mariadb":     {true, "MySQL flavor: the same ChangeApplier. " + mysqlReadPosition},
-	"planetscale": {true, "MySQL flavor: the same ChangeApplier. " + mysqlReadPosition},
-	"vitess":      {true, "MySQL flavor: the same ChangeApplier. " + mysqlReadPosition},
+	"planetscale": {true, "MySQL flavor: the same ChangeApplier. " + mysqlReadPosition + vitessControlKeyspace},
+	"vitess":      {true, "MySQL flavor: the same ChangeApplier. " + mysqlReadPosition + vitessControlKeyspace},
 
 	"mydumper":       {false, "a MySQL dump-format reader; source-only"},
 	"sqlite":         {false, "SQLite has no change-apply; migrate target only"},

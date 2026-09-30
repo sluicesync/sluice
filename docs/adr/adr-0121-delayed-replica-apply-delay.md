@@ -221,3 +221,7 @@ introduced).
 - **Per-transaction explicit hold at `TxBegin`.** Functionally equivalent to the
   per-change gate (shared commit timestamp), but more code and a special-case for
   sources that omit boundary events. The uniform per-change gate subsumes it.
+
+## Amendment 2026-09-30 — GC-41: the delay window is bounded by the target's durable position, not a tracker
+
+The fix recorded above (the `AttachLSNTracker(any)` signature that finally attached ADR-0020's tracker) is superseded: GC-41 deleted the tracker, because it existed for the Postgres target only and the lane checkpoint never fed it. The property this ADR needs — the slot ack trails what the target durably holds, however far `--apply-delay` runs the reader ahead — now comes from the reader's unconditional ack ceiling, raised only from the position the streamer reads back from the target (ADR-0020 amendment), and holds for every target engine rather than only Postgres. The compile-time `AttachLSNTracker` pin cited above is gone with the method.

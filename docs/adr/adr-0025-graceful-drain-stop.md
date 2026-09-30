@@ -130,3 +130,7 @@ A `sync stop --wait` against a streamer running an older sluice version (one tha
 
 - Unit test `TestPollStopSignal_SetsObservedOnFlag` (`internal/pipeline/stop_signal_test.go`) pins the observed-flag contract.
 - Unit tests `TestWaitForStopComplete_FlagClears` / `_Timeout` / `_ContextCancel` / `_NonPollingApplier` (`cmd/sluice/sync_stop_test.go`) cover the four CLI poll paths: success, timeout, outer-ctx cancel, and graceful degradation when the applier doesn't implement `ReadStopRequested`.
+
+## Amendment 2026-09-30 — GC-41: the tracker this ADR relies on is gone
+
+The graceful-drain shape (`streamCtx` / `applyCtx`, the stop-signal poll and its watchdog) is unchanged. The load-bearing ack half is not: the "Context" and "Verification" sections above describe ADR-0020's `lsnTracker`, which GC-41 deleted — it was fed only by the Postgres applier, and never by that applier's lane checkpoint. The rule this ADR depends on still holds by a different mechanism: the Postgres reader never acks past `max(startLSN, ackCeil)`, and `ackCeil` is raised only by the streamer's slot-ack ceiling sidecar from the position read back from the target (see ADR-0020's amendment). `TestAckLSN_AnchorsAtStartLSNUntilFirstApply` keeps its name and its contract — the ack holds at `startLSN` until something durable is released — and now lives in `internal/engines/postgres/chain_ack_test.go`; the `lsn_tracker_test.go` it cites above no longer exists.

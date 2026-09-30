@@ -1278,6 +1278,8 @@ type SyncStartCmd struct {
 
 	AcceptUnforwardedSchemaChange string `name:"accept-unforwarded-schema-change" placeholder:"FINGERPRINT" help:"One-shot acknowledgement of a recorded UNFORWARDED-SCHEMA-CHANGE refusal, given as the fingerprint the refusal prints. When a stream stops because the source changed a constraint, policy, row level security or default that CDC cannot forward, sluice records the refusal on the target and every later start refuses again. Apply the same change to the target FIRST, then restart once with this flag set to that fingerprint: it clears that record and takes a fresh baseline of those objects, so passing it without applying the change accepts the difference permanently. It also acknowledges ADD-COLUMN-BACKFILL-INCOMPLETE (a forwarded ADD COLUMN whose backfill did not provably reach the target), whose remedy is different: the column already exists on the target, so copy its values from the source for the rows that predate the ADD COLUMN (or re-copy with --restart-from-scratch) FIRST, then acknowledge. A fingerprint of a different refusal is refused, so the flag cannot pre-accept a later refusal if it is left in a service definition."`
 
+	AcceptSlotAckedPastPosition string `name:"accept-slot-acked-past-position" placeholder:"LSN" help:"One-shot acknowledgement of a SLOT-ACKED-PAST-TARGET-POSITION refusal (Postgres source), given as the confirmed_flush_lsn the refusal prints. A warm resume refuses when the source slot has been acknowledged past the position the target persisted, because PostgreSQL would skip every change committed in between and the target does not hold them (a stop on v0.156.6 or earlier of a Postgres to MySQL-family sync, a target restored to an older state, or a slot recreated after the stream wrote its position). The remedy is a re-copy (--restart-from-scratch). Pass this flag only after verifying the target already holds every change up to that LSN: the stream then resumes and the gap is skipped. An LSN that does not match the slot is refused, so the flag cannot pre-accept a later refusal if it is left in a service definition."`
+
 	SchemaAlreadyApplied bool `help:"Skip every DDL phase during cold-start (CREATE TABLE / CREATE INDEX / ADD FOREIGN KEY / CREATE VIEW / SyncIdentitySequences / EnsureControlTable). Operator promises the target's catalog matches the source's AND the sluice_cdc_state control table is pre-created. Use this on PlanetScale branches with Safe Migrations enabled (GitHub #17), or on Atlas/Liquibase-managed schemas where DDL goes through a separate pipeline. The cold-start preflight refusal is also skipped — bulk-copy runs into operator-prepared empty tables; sluice does NOT validate the schema match."`
 
 	Yes bool `help:"Confirm --reset-target-data. Required when stdin is not a terminal (scripts, CI, agents): without it the command refuses with SLUICE-E-CONFIRMATION-REQUIRED instead of prompting. On a terminal it skips the typed 'reset' prompt." short:"y"`
@@ -2221,35 +2223,38 @@ func (s *SyncStartCmd) run(g *Globals, env *envelopeRun) error {
 		// One-shot acknowledgement of a recorded UNFORWARDED-SCHEMA-CHANGE
 		// refusal; the zero value (every non-CLI construction) keeps refusing.
 		AcceptUnforwardedSchemaChange: s.AcceptUnforwardedSchemaChange,
-		SchemaAlreadyApplied:          s.SchemaAlreadyApplied,
-		ApplyBatchSize:                applyBatchSize,
-		AutoTune:                      !s.NoAutoTune,
-		ApplyTuneTargetLatency:        s.ApplyTuneTargetLatency,
-		MaxBufferBytes:                s.MaxBufferBytes,
-		IndexBuildMem:                 indexBuildMem,
-		IndexBuildParallelism:         s.IndexBuildParallelism,
-		IndexBuildFallback:            indexFallback, // ADR-0148 / audit MED-A1: nil unless armed (see above)
-		MaxTargetConnections:          s.MaxTargetConnections,
-		BulkParallelism:               s.BulkParallelism,
-		TableParallelism:              s.TableParallelism,
-		BulkParallelMinRows:           s.BulkParallelMinRows,
-		BulkBatchSize:                 s.BulkBatchSize,
-		CopyFanoutDegree:              s.CopyFanoutDegree,
-		NoIntraTableStealing:          s.NoIntraTableStealing,
-		NoFloatExactReread:            s.NoFloatExactReread,
-		StrictFloat:                   s.StrictFloat,
-		RawCopyFormat:                 parseRawCopyFormat(s.RawCopyFormat),
-		ReapStaleBackends:             s.ReapStaleBackends,
-		ApplyExecTimeout:              s.ApplyExecTimeout,
-		ApplyDelay:                    s.ApplyDelay,
-		ApplyConcurrency:              s.ApplyConcurrency,
-		ExactlyOnceLanes:              s.ExactlyOnceLanes,
-		ApplyRetryAttempts:            s.ApplyRetryAttempts,
-		ApplyRetryBackoffBase:         s.ApplyRetryBackoffBase,
-		ApplyRetryBackoffCap:          s.ApplyRetryBackoffCap,
-		MetricsListen:                 s.MetricsListen,
-		BuildVersion:                  version,
-		BuildCommit:                   commit,
+		// One-shot acknowledgement of SLOT-ACKED-PAST-TARGET-POSITION (GC-41);
+		// the zero value (every non-CLI construction) keeps refusing.
+		AcceptSlotAckedPastPosition: s.AcceptSlotAckedPastPosition,
+		SchemaAlreadyApplied:        s.SchemaAlreadyApplied,
+		ApplyBatchSize:              applyBatchSize,
+		AutoTune:                    !s.NoAutoTune,
+		ApplyTuneTargetLatency:      s.ApplyTuneTargetLatency,
+		MaxBufferBytes:              s.MaxBufferBytes,
+		IndexBuildMem:               indexBuildMem,
+		IndexBuildParallelism:       s.IndexBuildParallelism,
+		IndexBuildFallback:          indexFallback, // ADR-0148 / audit MED-A1: nil unless armed (see above)
+		MaxTargetConnections:        s.MaxTargetConnections,
+		BulkParallelism:             s.BulkParallelism,
+		TableParallelism:            s.TableParallelism,
+		BulkParallelMinRows:         s.BulkParallelMinRows,
+		BulkBatchSize:               s.BulkBatchSize,
+		CopyFanoutDegree:            s.CopyFanoutDegree,
+		NoIntraTableStealing:        s.NoIntraTableStealing,
+		NoFloatExactReread:          s.NoFloatExactReread,
+		StrictFloat:                 s.StrictFloat,
+		RawCopyFormat:               parseRawCopyFormat(s.RawCopyFormat),
+		ReapStaleBackends:           s.ReapStaleBackends,
+		ApplyExecTimeout:            s.ApplyExecTimeout,
+		ApplyDelay:                  s.ApplyDelay,
+		ApplyConcurrency:            s.ApplyConcurrency,
+		ExactlyOnceLanes:            s.ExactlyOnceLanes,
+		ApplyRetryAttempts:          s.ApplyRetryAttempts,
+		ApplyRetryBackoffBase:       s.ApplyRetryBackoffBase,
+		ApplyRetryBackoffCap:        s.ApplyRetryBackoffCap,
+		MetricsListen:               s.MetricsListen,
+		BuildVersion:                version,
+		BuildCommit:                 commit,
 		// ADR-0107: nil unless the operator opted into PlanetScale telemetry.
 		// telemetryProviderOrNil returns a TRUE nil interface when off, so the
 		// streamer's `TargetTelemetry != nil` guards stay exact (no typed-nil

@@ -237,6 +237,10 @@ type CDCReader struct {
 	// goroutine while the pump reads it, hence the atomic.
 	ackCeil atomic.Uint64
 
+	// foreignSlotWarned rate-limits ReleaseSlotAckTo's foreign-slot WARN
+	// to once per slot name.
+	foreignSlotWarned sync.Map
+
 	// systemID and timeline pin the source's identity (ADR-0051,
 	// research finding F5). Populated from IDENTIFY_SYSTEM at the
 	// start of each StreamChanges call. Emitted on every change's
@@ -252,6 +256,12 @@ type CDCReader struct {
 	// applyIDs stamps each row change with its ADR-0190 identity (see
 	// cdc_apply_identity.go). Pump-goroutine-only.
 	applyIDs applymarks.Sequencer
+
+	// ackedPastAccepted is the operator's one-shot acknowledgement of a
+	// SLOT-ACKED-PAST-TARGET-POSITION refusal: the exact
+	// confirmed_flush_lsn they verified the target against. Set by
+	// [CDCReader.AcceptSlotAckedPastPosition] before StreamChanges.
+	ackedPastAccepted string
 
 	// schemaForward relaxes the mid-stream schema-change gate
 	// (checkSchemaRace) for the ADR-0091 forward-routable shapes (DROP
@@ -850,6 +860,12 @@ func (r *CDCReader) resolveStartPosition(
 		lsn, err := pglogrepl.ParseLSN(decoded.LSN)
 		if err != nil {
 			return 0, fmt.Errorf("postgres: parse resume LSN: %w", err)
+		}
+		// GC-41 MEDIUM-1: the walsender starts decoding at
+		// max(lsn, confirmed_flush_lsn), so a slot acked past the
+		// persisted position would silently skip the gap.
+		if err := r.checkSlotNotAckedPast(ctx, info.ConfirmedFlush, lsn); err != nil {
+			return 0, err
 		}
 		return lsn, nil
 	}
@@ -1962,15 +1978,29 @@ func (r *CDCReader) ackLSN(streamedLSN, startLSN pglogrepl.LSN) pglogrepl.LSN {
 // releases exactly the WAL the consumer now holds. Ratchets
 // monotonically (a lower position is ignored), and a position naming a
 // DIFFERENT slot is ignored too: it is not evidence about this slot's
-// stream, and ignoring it can only hold the ack back. Safe to call from
-// a different goroutine than the pump's (slotName is immutable after
-// open; ackCeil is atomic).
+// stream, and ignoring it can only hold the ack back — but it means a
+// second writer shares this stream's control row, so it WARNs once per
+// foreign slot name. Safe to call from a different goroutine than the
+// pump's (slotName is immutable after open; ackCeil is atomic;
+// foreignSlotWarned is a sync.Map).
 func (r *CDCReader) ReleaseSlotAckTo(pos ir.Position) error {
 	decoded, ok, err := decodePGPos(pos)
 	if err != nil {
 		return fmt.Errorf("postgres: release slot ack: %w", err)
 	}
-	if !ok || decoded.LSN == "" || decoded.Slot != r.slotName {
+	if !ok || decoded.LSN == "" {
+		return nil
+	}
+	if decoded.Slot != r.slotName {
+		if _, warned := r.foreignSlotWarned.LoadOrStore(decoded.Slot, true); !warned {
+			slog.Warn(
+				"postgres: cdc: the stream's persisted position names a different replication slot than this reader's; "+
+					"not releasing it (the slot keeps retaining WAL). Two streams may be writing the same "+
+					"sluice_cdc_state row — check that no other sync shares this stream id",
+				slog.String("reader_slot", r.slotName),
+				slog.String("position_slot", decoded.Slot),
+			)
+		}
 		return nil
 	}
 	lsn, err := pglogrepl.ParseLSN(decoded.LSN)
@@ -2649,9 +2679,13 @@ func checkWALLevel(ctx context.Context, db *sql.DB) error {
 // slotState carries the bits of pg_replication_slots the CDC reader
 // uses for cold-start validation. WALStatus drives the can-we-resume?
 // decision; see checkSlotUsable for the state-transition table.
+// ConfirmedFlush is the slot's confirmed_flush_lsn as text ("" when the
+// server reports none); a warm resume holds it to the persisted position
+// ([checkSlotNotAckedPast]).
 type slotState struct {
-	SlotName  string
-	WALStatus string
+	SlotName       string
+	WALStatus      string
+	ConfirmedFlush string
 }
 
 // slotInfo returns the slot's state, or nil when no row exists. The
@@ -2663,10 +2697,10 @@ type slotState struct {
 // be absent and this query would error; sluice's Engine.Capabilities
 // lists pgoutput-v2 (PG 14+) as the baseline, so this is safe.
 func slotInfo(ctx context.Context, db *sql.DB, name string) (*slotState, error) {
-	const q = `SELECT slot_name, COALESCE(wal_status, '') FROM pg_replication_slots WHERE slot_name = $1`
+	const q = `SELECT slot_name, COALESCE(wal_status, ''), COALESCE(confirmed_flush_lsn::text, '') FROM pg_replication_slots WHERE slot_name = $1`
 	row := db.QueryRowContext(ctx, q, name)
 	var s slotState
-	if err := row.Scan(&s.SlotName, &s.WALStatus); err != nil {
+	if err := row.Scan(&s.SlotName, &s.WALStatus, &s.ConfirmedFlush); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}

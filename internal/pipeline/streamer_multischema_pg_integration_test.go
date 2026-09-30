@@ -145,6 +145,7 @@ func TestStreamer_MultiSchema_PostgresToPostgres(t *testing.T) {
 	}
 
 	// ---- Write MORE while stopped, then restart → WARM-RESUME ----
+	preStopped := currentWALLSN(t, pgSource)
 	applyPGDDL(t, pgSource, `
 		INSERT INTO sales.widgets   (id, name) VALUES (5, 'a-five');
 		INSERT INTO billing.widgets (id, name) VALUES (6, 'b-six');
@@ -183,6 +184,15 @@ func TestStreamer_MultiSchema_PostgresToPostgres(t *testing.T) {
 	// Zero loss / zero dup: EXACT source==target parity on both schemas.
 	assertPGSchemaParity(t, pgSource, pgTarget, "sales", "widgets")
 	assertPGSchemaParity(t, pgSource, pgTarget, "billing", "widgets")
+
+	// GC-41: the multi-schema warm resume captures its slot for the ack
+	// ceiling too — the one database-wide slot passes the WAL written while
+	// the stream was stopped, within three keepalives of it landing.
+	if !waitSlotPasses(t, pgSource, "sluice_slot", preStopped, 3*10*time.Second) {
+		c, _ := readConfirmedFlushLSN(t, pgSource, "sluice_slot")
+		t.Errorf("multi-schema slot confirmed_flush_lsn %s never passed %s after the resume applied past it — the "+
+			"slot-ack ceiling is not releasing on the multi-database warm-resume path (GC-41)", c, preStopped)
+	}
 }
 
 // TestStreamer_MultiSchema_PostgresToMySQL is scenario (b): each source

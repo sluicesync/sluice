@@ -54,6 +54,12 @@ var syncStartFleetExclusions = map[string]string{
 	// record on the target the fleet leg then resumes against.
 	"accept-unforwarded-schema-change": "one-shot acknowledgement of a recorded UNFORWARDED-SCHEMA-CHANGE refusal; as standing config it would silently accept every future refusal on each restart",
 
+	// Same reasoning as the line above, for the warm-resume slot door: a
+	// standing key would pre-accept a skipped gap on every restart. The flag
+	// is also bound to one confirmed_flush_lsn value, so a stale key would
+	// refuse anyway once the slot moved.
+	"accept-slot-acked-past-position": "one-shot acknowledgement of a SLOT-ACKED-PAST-TARGET-POSITION refusal bound to one confirmed_flush_lsn; as standing config it would pre-accept a skipped gap on each restart",
+
 	// ---- position-from-manifest / broker resume family (cli-only) ----
 	"position-from-manifest": "one-shot resume-from-backup entry point; the fleet path is `sync from-backup` (the broker)",
 	"strict-preflight":       "modifier of --position-from-manifest's soft warnings; travels with it",

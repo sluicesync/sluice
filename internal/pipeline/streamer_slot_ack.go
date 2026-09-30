@@ -126,3 +126,27 @@ func releaseDurableSlotAck(
 	}
 	return false
 }
+
+// slotAckedPastAcceptor is the structural seam to a slot-keeping reader's
+// warm-resume door (Postgres: SLOT-ACKED-PAST-TARGET-POSITION, which refuses
+// a resume whose slot was acknowledged past the persisted position). The
+// door itself runs inside the reader's StreamChanges on every resume, so it
+// needs no wiring; only the operator's one-shot acknowledgement does.
+type slotAckedPastAcceptor interface {
+	AcceptSlotAckedPastPosition(confirmedFlush string)
+}
+
+// wireSlotAckedPastAcceptance hands the operator's acknowledgement to a
+// slot-keeping reader before a warm resume's StreamChanges. Called from
+// every warm-resume site — warmResume (also the stopped-cold-start resume)
+// and warmResumeMultiDatabase — and held to it by
+// TestSlotAckReleaseRoster_EveryStreamChangesSiteReleases. An empty value is
+// a no-op, so the door refuses.
+func (s *Streamer) wireSlotAckedPastAcceptance(reader any) {
+	if s.AcceptSlotAckedPastPosition == "" {
+		return
+	}
+	if a, ok := reader.(slotAckedPastAcceptor); ok {
+		a.AcceptSlotAckedPastPosition(s.AcceptSlotAckedPastPosition)
+	}
+}

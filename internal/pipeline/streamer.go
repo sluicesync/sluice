@@ -450,6 +450,15 @@ type Streamer struct {
 	// tests). See [Streamer.phaseRefuseRecordedUnforwardedChange].
 	AcceptUnforwardedSchemaChange string
 
+	// AcceptSlotAckedPastPosition is the operator's one-shot
+	// acknowledgement of a SLOT-ACKED-PAST-TARGET-POSITION warm-resume
+	// refusal (`--accept-slot-acked-past-position`), given as the exact
+	// confirmed_flush_lsn the refusal printed (GC-41). Zero-value safe:
+	// empty keeps refusing, for every construction (fleet, tests). Handed
+	// to a slot-keeping reader on every warm-resume path
+	// ([Streamer.wireSlotAckedPastAcceptance]).
+	AcceptSlotAckedPastPosition string
+
 	// SchemaAlreadyApplied, when true, declares that the target's
 	// schema (and the `sluice_cdc_state` control table) have been
 	// pre-created out-of-band. Sluice skips every DDL phase during

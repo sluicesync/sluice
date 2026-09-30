@@ -109,6 +109,8 @@ func (s *Streamer) warmResume(ctx context.Context, persisted ir.Position) (chang
 			setter.SetServerSideRowFilters(s.serverSideRowFilters)
 		}
 	}
+	// GC-41: the operator's acknowledgement of a slot acked past the target.
+	s.wireSlotAckedPastAcceptance(cdc)
 	changes, err = cdc.StreamChanges(ctx, persisted)
 	if err != nil {
 		migcore.CloseIf(cdc)

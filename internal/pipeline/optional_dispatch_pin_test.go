@@ -125,6 +125,11 @@ var (
 	// confirmed_flush_lsn and retain source WAL without bound, silently.
 	// Pinned so a rename fails the build instead.
 	_ slotAckReleaser = (*postgres.CDCReader)(nil)
+	// GC-41 MEDIUM-1: the operator's one-shot acknowledgement of the
+	// warm-resume SLOT-ACKED-PAST-TARGET-POSITION refusal. A rename would
+	// make the flag silently inert and the refusal permanent — loud, but
+	// with the documented override gone.
+	_ slotAckedPastAcceptor = (*postgres.CDCReader)(nil)
 )
 
 // unpinnedPipelineSurfaces is the FROZEN remainder: pipeline-local interfaces
