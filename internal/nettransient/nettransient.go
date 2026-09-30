@@ -53,6 +53,8 @@ import (
 	"net"
 	"strings"
 	"syscall"
+
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TextShapes is the canonical lower-cased substring corpus for
@@ -169,16 +171,6 @@ func IsTransientShape(err error) bool {
 	return false
 }
 
-// sqlStater is the structural surface a SQLSTATE-carrying driver error
-// exposes — pgx's *pgconn.PgError implements it (SQLState() returns .Code).
-// Matched structurally (errors.As onto the interface) so this package needs
-// no driver import and the pipeline consumer stays engine-neutral; the
-// go-sql-driver *MySQLError carries its SQLState as a field, not a method,
-// so MySQL errors never match here (see the asymmetry note below).
-type sqlStater interface {
-	SQLState() string
-}
-
 // IsConnectionAvailabilitySQLState reports whether err carries a SQLSTATE
 // from the Postgres CONNECTION-AVAILABILITY transient set — the structured
 // shapes a connect/ping/read hits when the server is restarting, promoting,
@@ -211,14 +203,17 @@ type sqlStater interface {
 // connections, not a connect-phase one, and adding it without connect-phase
 // evidence would widen the retry surface on speculation.
 func IsConnectionAvailabilitySQLState(err error) bool {
-	if err == nil {
+	// Read structurally through ir.SQLStater (pgx's *pgconn.PgError
+	// implements it; pinned in the postgres engine), so this package needs
+	// no driver import and the pipeline consumer stays engine-neutral; the
+	// go-sql-driver *MySQLError carries its SQLState as a field, not a
+	// method, so MySQL errors never match here (see the asymmetry note
+	// above).
+	code, ok := ir.SQLStateOf(err)
+	if !ok {
 		return false
 	}
-	var st sqlStater
-	if !errors.As(err, &st) {
-		return false
-	}
-	switch code := st.SQLState(); code {
+	switch code {
 	case "57P01", "57P02", "57P03":
 		return true
 	default:

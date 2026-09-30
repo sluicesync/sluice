@@ -17,6 +17,7 @@ import (
 
 	"github.com/go-sql-driver/mysql"
 
+	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/netdeadline"
 	"sluicesync.dev/sluice/internal/netkeepalive"
 )
@@ -943,9 +944,24 @@ func openDB(ctx context.Context, cfg *mysql.Config, sqlMode *string) (*sql.DB, e
 
 	if err := db.PingContext(ctx); err != nil {
 		_ = db.Close()
-		return nil, fmt.Errorf("mysql: ping: %w", err)
+		return nil, fmt.Errorf("mysql: ping: %w", markDatabaseNotFound(err))
 	}
 	return db, nil
+}
+
+// errnoBadDB is MySQL's ER_BAD_DB_ERROR, "Unknown database 'x'".
+const errnoBadDB = 1049
+
+// markDatabaseNotFound classifies errno 1049 as [ir.ErrDatabaseNotFound] so
+// the engine-neutral hint layer can name a missing database structurally:
+// the driver error carries only the generic SQLSTATE 42000, so there is no
+// standard code to read (GC-40 (b)). The text is unchanged.
+func markDatabaseNotFound(err error) error {
+	var mysqlErr *mysql.MySQLError
+	if errors.As(err, &mysqlErr) && mysqlErr.Number == errnoBadDB {
+		return ir.WithMarker(err, ir.ErrDatabaseNotFound)
+	}
+	return err
 }
 
 // injectSessionSQLMode adds `SET SESSION sql_mode='...'` to cfg.Params so the

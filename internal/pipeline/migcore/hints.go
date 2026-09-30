@@ -19,10 +19,13 @@ package migcore
 //     anything beyond the most common 5-10 errors is noise. If a
 //     hint would only fire on an obscure SQLSTATE that 99% of
 //     operators will never hit, it doesn't belong here.
-//   - Substring matching is intentional. v1 doesn't try to extract
-//     SQLSTATE codes or structured fields from driver errors —
-//     case-insensitive substrings are good enough and survive minor
-//     wording changes between database versions.
+//   - Substring matching is the default: case-insensitive substrings
+//     survive minor wording changes between database versions. The
+//     exception is a substring that several unrelated classes share —
+//     "does not exist" names a missing database, relation, column, type
+//     and role alike — where an entry matches on structure instead
+//     (errorHint.match / errorHint.sqlStates, GC-40 (b)): a hint that
+//     names the wrong object sends the operator to the wrong fix.
 //   - Hints never replace the original error. They're appended after
 //     a newline with a "hint:" prefix; the underlying error stays
 //     intact for [errors.Is]/[errors.As] traversal.
@@ -44,8 +47,10 @@ package migcore
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
+	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
@@ -72,6 +77,19 @@ type errorHint struct {
 
 	// contains is matched case-insensitively against err.Error().
 	contains string
+
+	// match, when set, decides the entry from the error's STRUCTURE and
+	// contains is not consulted. It is for a class whose message text is
+	// shared with an unrelated one: "does not exist" names a missing
+	// database, relation, column, type and role alike (GC-40 (b)).
+	match func(error) bool
+
+	// sqlStates, when set, narrows a contains match: an error that exposes
+	// a SQLSTATE ([ir.SQLStateOf] — every Postgres server error) matches
+	// only if it is one of these. An error exposing none (a MySQL driver
+	// error, a message flattened on the way up) keeps the substring match,
+	// which is what these entries did before they were narrowed.
+	sqlStates []string
 
 	// hint is the line emitted after the wrapped error. No leading
 	// "hint:" prefix; that's added by WrapWithHint.
@@ -151,6 +169,20 @@ const (
 		"indexed so the constraints can be added out-of-band afterward"
 )
 
+// The Postgres SQLSTATEs the narrowed "does not exist" entries accept
+// (GC-40 (b)). The same words also name a missing type, operator class or
+// collation (42704), a function (42883), a role (42704) or a database
+// (3D000), none of which is a missing table or column.
+const (
+	sqlStateUndefinedTable    = "42P01"
+	sqlStateUndefinedColumn   = "42703"
+	sqlStateInvalidSchemaName = "3F000"
+)
+
+// missingRelationOrColumnStates is the index/constraint entries' set: the
+// relation, its schema, or one of its columns is gone.
+var missingRelationOrColumnStates = []string{sqlStateUndefinedTable, sqlStateUndefinedColumn, sqlStateInvalidSchemaName}
+
 // hintRegistry is the ordered list of hints. Order matters because
 // the first match wins — put more-specific entries before more-
 // general ones. Each entry's comment explains when it fires.
@@ -160,11 +192,17 @@ var hintRegistry = []errorHint{
 	// "Table 'x.y' doesn't exist". Both point at the same root
 	// cause: schema-apply silently failed or wrote into a
 	// different schema/database than the bulk-copy target uses.
+	//
+	// Narrowed to the relation/schema SQLSTATEs (GC-40 (b) sibling sweep):
+	// a Postgres "column … does not exist" (42703) or "type … does not
+	// exist" (42704) is not a missing TABLE, and falls through to the
+	// copy-table catch-all below instead of being told the table is gone.
 	{
-		phase:    PhaseBulkCopy,
-		contains: "does not exist",
-		hint:     "target table not found — did the schema-apply phase fail or apply to a different schema?",
-		code:     sluicecode.CodeBulkCopyTargetMissing,
+		phase:     PhaseBulkCopy,
+		contains:  "does not exist",
+		sqlStates: []string{sqlStateUndefinedTable, sqlStateInvalidSchemaName},
+		hint:      "target table not found — did the schema-apply phase fail or apply to a different schema?",
+		code:      sluicecode.CodeBulkCopyTargetMissing,
 	},
 	{
 		phase:    PhaseBulkCopy,
@@ -232,13 +270,20 @@ var hintRegistry = []errorHint{
 		hint:     "verify the DSN username and password",
 		code:     sluicecode.CodeConnectAuthFailed,
 	},
-	// Connect-phase "database does not exist": PG emits
-	// "database \"foo\" does not exist". The substring is narrow
-	// enough that scoping to PhaseConnect avoids overlap with the
-	// bulk-copy "does not exist" hint above.
+	// Connect-phase "database does not exist", matched on STRUCTURE
+	// ([ir.IsDatabaseNotFound]: Postgres SQLSTATE 3D000, or MySQL errno
+	// 1049 marked at the MySQL connect chokepoint). It used to match the
+	// bare substring "does not exist", on the theory that scoping to
+	// PhaseConnect made it narrow enough — it did not: the connect phase
+	// also ensures the target's control tables, so a `relation
+	// "sluice_cdc_state" does not exist` (42P01) on a
+	// `--schema-already-applied` target was reported as a missing database
+	// with the remedy "verify the database name" (GC-40 (b),
+	// sluice-testing Bug 292). MySQL's own wording ("Unknown database")
+	// never matched the substring at all.
 	{
-		phase:    PhaseConnect,
-		contains: "does not exist",
+		phase: PhaseConnect,
+		match: ir.IsDatabaseNotFound,
 		// Not "--target": a fleet `sync run` reaches connect too and takes
 		// its endpoints from the config, not from a --target flag.
 		hint: "verify the database name in the target DSN",
@@ -298,8 +343,9 @@ var hintRegistry = []errorHint{
 	// schema-apply phase never created, which is what a partially-applied or
 	// hand-edited target schema looks like at this phase.
 	{
-		phase:    PhaseIndexes,
-		contains: "does not exist",
+		phase:     PhaseIndexes,
+		contains:  "does not exist",
+		sqlStates: missingRelationOrColumnStates,
 		hint: "the relation or column this index names is not on the target — but the table existed " +
 			"and took rows during the copy, so this is not a schema-apply failure. Something dropped or " +
 			"altered it between the copy and the index build (concurrent DDL against the target, or the " +
@@ -320,8 +366,9 @@ var hintRegistry = []errorHint{
 		code: sluicecode.CodeIndexTargetMissing,
 	},
 	{
-		phase:    PhaseConstraints,
-		contains: "does not exist",
+		phase:     PhaseConstraints,
+		contains:  "does not exist",
+		sqlStates: missingRelationOrColumnStates,
 		hint: "the relation or column this constraint names is not on the target — but the table existed " +
 			"and took rows during the copy, so this is not a schema-apply failure. For a FOREIGN KEY the " +
 			"missing side is often the PARENT table, which a table-filtered run may never have been asked " +
@@ -430,11 +477,21 @@ func matchErrorHint(phase string, err error) (errorHint, bool) {
 		return errorHint{}, false
 	}
 	msg := strings.ToLower(err.Error())
+	state, hasState := ir.SQLStateOf(err)
 	for _, h := range hintRegistry {
 		if h.phase != "" && h.phase != phase {
 			continue
 		}
+		if h.match != nil {
+			if h.match(err) {
+				return h, true
+			}
+			continue
+		}
 		if !strings.Contains(msg, strings.ToLower(h.contains)) {
+			continue
+		}
+		if h.sqlStates != nil && hasState && !slices.Contains(h.sqlStates, state) {
 			continue
 		}
 		return h, true

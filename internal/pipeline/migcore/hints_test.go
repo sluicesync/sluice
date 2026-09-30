@@ -5,11 +5,81 @@ package migcore
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
+	"github.com/go-sql-driver/mysql"
+	"github.com/jackc/pgx/v5/pgconn"
+
+	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
+
+// TestDoesNotExistClassification_EveryObjectKind pins GC-40 (b)
+// (sluice-testing Bug 292) across the whole "does not exist" family, per
+// engine: the words name a missing database, relation, column, type or
+// schema alike, and only the SQLSTATE (Postgres) or the engine's marker
+// (MySQL errno 1049) tells them apart. Each row is the driver error type the
+// engine really returns, wrapped the way the pipeline wraps it.
+func TestDoesNotExistClassification_EveryObjectKind(t *testing.T) {
+	pg := func(code, msg string) error {
+		return fmt.Errorf("pipeline: ensure control table: %w", &pgconn.PgError{Severity: "ERROR", Code: code, Message: msg})
+	}
+	my := func(n uint16, msg string, marker error) error {
+		err := error(&mysql.MySQLError{Number: n, Message: msg})
+		if marker != nil {
+			err = ir.WithMarker(err, marker)
+		}
+		return fmt.Errorf("mysql: ping: %w", err)
+	}
+	for _, c := range []struct {
+		name  string
+		phase string
+		err   error
+		want  sluicecode.Code // "" = no hint
+	}{
+		// Connect: only a missing DATABASE is database-missing.
+		{"pg 3D000 database", PhaseConnect, pg("3D000", `database "nope" does not exist`), sluicecode.CodeConnectDatabaseMissing},
+		{"pg 42P01 relation (Bug 292)", PhaseConnect, pg("42P01", `relation "public.sluice_cdc_state" does not exist`), ""},
+		{"pg 42703 column", PhaseConnect, pg("42703", `column "unforwarded_refusal" does not exist`), ""},
+		{"pg 42704 type", PhaseConnect, pg("42704", `type "citext" does not exist`), ""},
+		{"pg 3F000 schema", PhaseConnect, pg("3F000", `schema "ctl" does not exist`), ""},
+		{"pg 42704 role", PhaseConnect, pg("42704", `role "sluice" does not exist`), ""},
+		{"mysql 1049 unknown database", PhaseConnect, my(1049, "Unknown database 'nope'", ir.ErrDatabaseNotFound), sluicecode.CodeConnectDatabaseMissing},
+		{"mysql 1146 table", PhaseConnect, my(1146, "Table 'app.sluice_cdc_state' doesn't exist", nil), ""},
+		{"text only, no structure", PhaseConnect, errors.New(`relation "sluice_cdc_state" does not exist`), ""},
+
+		// Bulk copy: a missing table or schema, not a column or type.
+		{"copy pg 42P01", PhaseBulkCopy, pg("42P01", `relation "users" does not exist`), sluicecode.CodeBulkCopyTargetMissing},
+		{"copy pg 3F000", PhaseBulkCopy, pg("3F000", `schema "app" does not exist`), sluicecode.CodeBulkCopyTargetMissing},
+		{"copy pg 42703", PhaseBulkCopy, pg("42703", `column "x" of relation "users" does not exist`), ""},
+		{"copy pg 42704", PhaseBulkCopy, pg("42704", `type "mood" does not exist`), ""},
+		{"copy mysql 1146", PhaseBulkCopy, my(1146, "Table 'app.users' doesn't exist", nil), sluicecode.CodeBulkCopyTargetMissing},
+
+		// Index / constraint: relation, schema or column — not an operator
+		// class, collation or type (42704), which the old substring sent to
+		// the "dropped between the copy and the index build" remedy.
+		{"index pg 42P01", PhaseIndexes, pg("42P01", `relation "users" does not exist`), sluicecode.CodeIndexTargetMissing},
+		{"index pg 42703", PhaseIndexes, pg("42703", `column "email" does not exist`), sluicecode.CodeIndexTargetMissing},
+		{"index pg 42704 opclass", PhaseIndexes, pg("42704", `operator class "gin_trgm_ops" does not exist for access method "gin"`), ""},
+		{"index pg 42704 collation", PhaseIndexes, pg("42704", `collation "und-x-icu" for encoding "UTF8" does not exist`), ""},
+		{"constraint pg 42P01", PhaseConstraints, pg("42P01", `relation "parents" does not exist`), sluicecode.CodeConstraintTargetMissing},
+		{"constraint pg 42703", PhaseConstraints, pg("42703", `column "parent_id" referenced in foreign key constraint does not exist`), sluicecode.CodeConstraintTargetMissing},
+		{"constraint pg 42883 function", PhaseConstraints, pg("42883", `function is_valid(integer) does not exist`), ""},
+		{"index mysql 1146 (no SQLSTATE: substring kept)", PhaseIndexes, my(1146, "Table 'app.users' doesn't exist", nil), sluicecode.CodeIndexTargetMissing},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			h, ok := matchErrorHint(c.phase, c.err)
+			switch {
+			case c.want == "" && ok:
+				t.Errorf("%v classified as %s; want no hint", c.err, h.code)
+			case c.want != "" && (!ok || h.code != c.want):
+				t.Errorf("%v classified as %q (matched %v); want %s", c.err, h.code, ok, c.want)
+			}
+		})
+	}
+}
 
 // TestHintForRegistry covers each registry entry: a representative
 // real-world error message (loosely based on the engines we ship)
@@ -61,10 +131,20 @@ func TestHintForRegistry(t *testing.T) {
 			want:  "verify the DSN username and password",
 		},
 		{
-			name:  "connect: database does not exist",
+			name:  "connect: database does not exist (Postgres SQLSTATE 3D000)",
 			phase: PhaseConnect,
-			err:   errors.New(`pq: database "wrongname" does not exist`),
-			want:  "verify the database name in the target DSN",
+			err: fmt.Errorf("postgres: ping: %w", &pgconn.PgError{
+				Severity: "FATAL", Code: "3D000", Message: `database "wrongname" does not exist`,
+			}),
+			want: "verify the database name in the target DSN",
+		},
+		{
+			name:  "connect: unknown database (MySQL errno 1049, marked by the engine)",
+			phase: PhaseConnect,
+			err: fmt.Errorf("mysql: ping: %w", ir.WithMarker(&mysql.MySQLError{
+				Number: 1049, SQLState: [5]byte{'4', '2', '0', '0', '0'}, Message: "Unknown database 'wrongname'",
+			}, ir.ErrDatabaseNotFound)),
+			want: "verify the database name in the target DSN",
 		},
 		{
 			name:  "schema-apply: permission denied for schema",

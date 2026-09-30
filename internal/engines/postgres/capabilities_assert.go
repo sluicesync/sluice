@@ -4,6 +4,8 @@
 package postgres
 
 import (
+	"github.com/jackc/pgx/v5/pgconn"
+
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
@@ -250,4 +252,12 @@ var (
 	// confirmed_flush_lsn-ahead silent-loss window (an incremental that
 	// SUCCEEDS while missing every write in (parent, confirmed_flush]).
 	_ irbackup.ChainResumePreflighter = Engine{}
+
+	// GC-40 (b): the engine-neutral hint layer reads a Postgres server
+	// error's SQLSTATE through ir.SQLStater — 3D000 is what names a missing
+	// database, where the text "does not exist" also matches a missing
+	// relation or column. The premise is the DRIVER's method set, so it is
+	// pinned here: if pgx dropped SQLState(), ir.SQLStateOf would go blind
+	// silently and every Postgres missing-database hint with it.
+	_ ir.SQLStater = (*pgconn.PgError)(nil)
 )
