@@ -1069,12 +1069,33 @@ func writePositionTx(ctx context.Context, tx *sql.Tx, controlKeyspace, streamID,
 	// still rides the SAME per-change *sql.Tx as the data write (ADR-0007 /
 	// ADR-0049 #4a atomicity) — it is deliberately NOT decoupled onto a
 	// separate connection. On a sharded target that makes the position write
-	// and the data write span two keyspaces, so vtgate can only best-effort
-	// the cross-keyspace commit (no 2PC). That is acceptable here: the
-	// sharded-target apply is already cross-shard / non-atomic, and keyed
-	// idempotent apply makes a torn resume safe (a position that committed
-	// without its data, or vice versa, replays cleanly on restart). Empty
-	// controlKeyspace is unchanged single-keyspace, genuinely atomic behaviour.
+	// and the data write span two keyspaces, and vtgate's default
+	// transaction_mode=MULTI has no 2PC: it commits the shards one by one in
+	// the order the transaction first touched them and stops at the first
+	// failure. So the commit can tear, and which way it tears is set by
+	// statement ORDER:
+	//
+	//   - data touched first → data commits first → a tear leaves the
+	//     position (and the apply marks) BEHIND the data, and the change
+	//     replays: keyed idempotent apply absorbs it, and a non-idempotent
+	//     class is where it would be with no marks at all (a loud collision
+	//     at worst; keyless tables at-least-once). Nothing is lost.
+	//   - control touched first → a tear leaves the position PAST data that
+	//     never committed, and nothing ever re-delivers it. Silent loss.
+	//
+	// Hence the rule every write core follows: DATA BEFORE CONTROL — every
+	// row statement of a transaction is sent before its first control-table
+	// statement (the apply marks, then this position). v0.156.5–v0.156.6's
+	// batch paths broke it (GC-41 (c)) and lost the torn transaction's rows.
+	// Pinned per write core by TestWriteCoreStatementOrder (the recorded
+	// statement order of every core, derived from an AST roster of the
+	// control writers' callers) and against a real tear by
+	// TestVStream_ControlKeyspaceTornCommit_PositionStaysBehindData (a
+	// data-shard connection killed between the statements and COMMIT on
+	// vttestserver). This premise — MULTI's first-touch commit order — is
+	// the measured behaviour of vtcombo 25; the tear test is its check.
+	// Empty controlKeyspace is unchanged single-keyspace, genuinely atomic
+	// behaviour.
 	if _, err := tx.ExecContext(ctx, writePositionUpsertSQL(controlKeyspace, upsert), streamID, token, slotName, publicationName, rowFilterHash, sourceFingerprint, targetSchema, rowsApplied); err != nil {
 		return fmt.Errorf("mysql: write position: %w", err)
 	}

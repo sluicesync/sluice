@@ -509,6 +509,29 @@ func (b *mysqlBatchTx) flushPending(ctx context.Context) error {
 	return b.flushDeletes(ctx)
 }
 
+// writeApplyMarks drains the coalesced data runs and only THEN writes the
+// transaction's ADR-0190 apply marks (gc as [applymarks.TxMarks.Plan] takes
+// it) — the batch paths' half of the data-before-control rule on
+// [writePositionTx]. Every batch and lane path writes its marks through
+// here, so none can send a control statement ahead of the rows it vouches
+// for.
+//
+// v0.156.5 and v0.156.6 did not (GC-41 (c)): the batch WritePosition and
+// Commit hooks wrote the marks first and flushed the data after, so under a
+// vtgate transaction_mode=MULTI target with a --control-keyspace sidecar the
+// control shard was touched — and so committed — first. A data-shard
+// failure at COMMIT then left the marks and a position past rows that
+// never landed: silent loss, reproduced on vttestserver.
+func (b *mysqlBatchTx) writeApplyMarks(ctx context.Context, gc bool) error {
+	if err := b.flushPending(ctx); err != nil {
+		return err
+	}
+	if pl, first := b.marks.Plan(&b.a.marks, gc); first {
+		return b.a.execApplyMarksTx(ctx, b.tx, pl)
+	}
+	return nil
+}
+
 // flushUpserts emits the buffered upsert-run as one multi-row INSERT on the open
 // tx (via [buildMultiRowInsertSQL] — byte-identical value encoding to the
 // single-row path) and clears it. A no-op when the run is empty.

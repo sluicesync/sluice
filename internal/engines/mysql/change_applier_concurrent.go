@@ -385,17 +385,12 @@ func (la *laneApplierAdapter) ApplyLaneBatch(ctx context.Context, _ int, batch [
 		}
 	}
 	// Flush the trailing coalesced run (upsert-run or delete-run; ADR-0140)
-	// before commit so all of the lane's data is durable in this tx (the lane
-	// writes no position — the orchestrator's frontier checkpoint owns it).
-	if err := btx.flushPending(ctx); err != nil {
+	// so all of the lane's data is in this tx, and only then its apply marks
+	// (data before control, GC-41 (c)). The lane writes no position — the
+	// orchestrator's frontier checkpoint owns it.
+	if err := btx.writeApplyMarks(ctx, false); err != nil {
 		_ = tx.Rollback()
 		return 0, err
-	}
-	if pl, first := btx.marks.Plan(&la.a.marks, false); first {
-		if err := la.a.execApplyMarksTx(ctx, tx, pl); err != nil {
-			_ = tx.Rollback()
-			return 0, err
-		}
 	}
 	// Test seam: force a commit-path failure deterministically (the lane
 	// analogue of the serial path's removed pipelineTestCommitHook). nil in

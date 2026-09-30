@@ -184,11 +184,10 @@ func (a *ChangeApplier) batchConfig() *appliershared.BatchConfig {
 			b := tx.(*mysqlBatchTx)
 			// ADR-0190: this position passes every closed transaction, so
 			// their marks are deleted — and the batch's own written — in this
-			// same transaction.
-			if pl, first := b.marks.Plan(&a.marks, true); first {
-				if err := a.execApplyMarksTx(ctx, b.tx, pl); err != nil {
-					return err
-				}
+			// same transaction, after the batch's rows (data before control,
+			// GC-41 (c): see writeApplyMarks).
+			if err := b.writeApplyMarks(ctx, true); err != nil {
+				return err
 			}
 			if err := b.writePosition(ctx, streamID, token, rowsApplied); err != nil {
 				return err
@@ -205,13 +204,11 @@ func (a *ChangeApplier) batchConfig() *appliershared.BatchConfig {
 		Commit: func(tx appliershared.BatchTx) error {
 			// ADR-0190: a flush with no position write (mid-transaction)
 			// still writes its changes' marks — with the rows, in this
-			// transaction.
+			// transaction, after them (GC-41 (c): see writeApplyMarks).
 			b := tx.(*mysqlBatchTx)
-			if pl, first := b.marks.Plan(&a.marks, false); first {
-				if err := a.execApplyMarksTx(b.ctx, b.tx, pl); err != nil {
-					_ = b.Rollback()
-					return err
-				}
+			if err := b.writeApplyMarks(b.ctx, false); err != nil {
+				_ = b.Rollback()
+				return err
 			}
 			if err := b.commit(); err != nil {
 				return err

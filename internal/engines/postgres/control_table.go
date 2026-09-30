@@ -633,6 +633,19 @@ func isUndefinedColumnErr(err error) bool {
 // makes durable; it is ADDED to the row's cumulative rows_applied in the
 // SAME upsert so the counter advances atomically with the position
 // (ADR-0156 phase 2). 0 for a no-data position write.
+//
+// Data before control (GC-41 (c)): every Postgres write core sends a
+// transaction's row statements before its first control-table statement —
+// the apply marks, then this position — the order the MySQL applier needs
+// because vtgate's MULTI commit can tear in first-touch order (see the
+// MySQL writePositionTx). On a single Postgres server the order is moot: the
+// commit is atomic. UNVERIFIED PREMISE: that a sharded Postgres target
+// (Neki) whose control tables and data land on different shards either
+// commits atomically or, like vtgate, commits in first-touch order so that
+// data-first leaves a tear behind the data. Nothing here measures Neki's
+// cross-shard commit; what IS pinned is the order itself, on every
+// Postgres core, by TestWriteCoreStatementOrder, so the premise is the
+// only thing left to establish.
 func writePositionTx(ctx context.Context, tx *sql.Tx, schema, streamID, token, slotName, publicationName, rowFilterHash, sourceFingerprint, targetSchema string, rowsApplied int64) error {
 	q, args := buildWritePositionSQL(schema, streamID, token, slotName, publicationName, rowFilterHash, sourceFingerprint, targetSchema, rowsApplied)
 	if _, err := tx.ExecContext(ctx, q, args...); err != nil {

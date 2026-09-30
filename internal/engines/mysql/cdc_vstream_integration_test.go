@@ -70,6 +70,35 @@ func startVTTestServer(t *testing.T) (mysqlDSN, grpcEndpoint, keyspace string, c
 // timeouts accordingly.
 func startVTTestServerWithShards(t *testing.T, numShards int) (mysqlDSN, grpcEndpoint, keyspace string, cleanup func()) {
 	t.Helper()
+	keyspace = "test"
+	vt := bootVTTestServer(t, keyspace, fmt.Sprintf("%d", numShards))
+	return vt.dsn(keyspace), vt.grpcEndpoint, keyspace, vt.terminate
+}
+
+// vtTestServer is one booted vttestserver: its container (for a test that
+// must reach the embedded mysqld underneath vtgate), the host and mapped
+// vtgate MySQL port, and the gRPC endpoint.
+type vtTestServer struct {
+	container    testcontainers.Container
+	host         string
+	mysqlPort    int
+	grpcEndpoint string
+	terminate    func()
+}
+
+// dsn is the vtgate MySQL DSN for keyspace.
+func (vt vtTestServer) dsn(keyspace string) string {
+	// vttestserver doesn't require auth on its embedded MySQL; the
+	// user/passwd are arbitrary. parseTime=true keeps the driver decoding
+	// TIMESTAMP into time.Time so the IR contract holds.
+	return fmt.Sprintf("root@tcp(%s:%d)/%s?parseTime=true&interpolateParams=true", vt.host, vt.mysqlPort, keyspace)
+}
+
+// bootVTTestServer boots vitess/vttestserver with vttestserver's own
+// KEYSPACES / NUM_SHARDS spellings (comma-separated, one shard count per
+// keyspace).
+func bootVTTestServer(t *testing.T, keyspaces, numShards string) vtTestServer {
+	t.Helper()
 	testcontainers.SkipIfProviderIsNotHealthy(t)
 
 	const (
@@ -77,8 +106,6 @@ func startVTTestServerWithShards(t *testing.T, numShards int) (mysqlDSN, grpcEnd
 		mysqlPortBase = "33577/tcp"
 		grpcPortBase  = "33575/tcp"
 	)
-
-	keyspace = "test"
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -88,8 +115,8 @@ func startVTTestServerWithShards(t *testing.T, numShards int) (mysqlDSN, grpcEnd
 		ExposedPorts: []string{mysqlPortBase, grpcPortBase},
 		Env: map[string]string{
 			"PORT":       fmt.Sprintf("%d", basePort),
-			"KEYSPACES":  keyspace,
-			"NUM_SHARDS": fmt.Sprintf("%d", numShards),
+			"KEYSPACES":  keyspaces,
+			"NUM_SHARDS": numShards,
 			// Without an override, vttestserver binds the MySQL
 			// listener to 127.0.0.1 (container-local), which makes
 			// the host-side port mapping useless. 0.0.0.0 binds on
@@ -150,16 +177,13 @@ func startVTTestServerWithShards(t *testing.T, numShards int) (mysqlDSN, grpcEnd
 		t.Fatalf("mapped grpc port: %v", err)
 	}
 
-	mysqlDSN = fmt.Sprintf(
-		// vttestserver doesn't require auth on its embedded MySQL;
-		// the user/passwd are arbitrary. parseTime=true keeps the
-		// driver decoding TIMESTAMP into time.Time so the IR
-		// contract holds.
-		"root@tcp(%s:%d)/%s?parseTime=true&interpolateParams=true",
-		host, mysqlPort.Num(), keyspace,
-	)
-	grpcEndpoint = fmt.Sprintf("%s:%d", host, grpcPort.Num())
-	return mysqlDSN, grpcEndpoint, keyspace, terminate
+	return vtTestServer{
+		container:    container,
+		host:         host,
+		mysqlPort:    int(mysqlPort.Num()),
+		grpcEndpoint: fmt.Sprintf("%s:%d", host, grpcPort.Num()),
+		terminate:    terminate,
+	}
 }
 
 // TestVStream_VTTestServer_BasicChangeStream is the spine
