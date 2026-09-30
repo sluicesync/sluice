@@ -7,10 +7,22 @@ package mysql
 //
 // The engine-neutral decision logic lives in internal/applymarks; this file
 // is the MySQL half: the sluice_cdc_apply_marks table, its availability
-// check, and the SQL each apply path runs INSIDE its own target transaction
-// (a mark committed without its rows, or rows without their mark, is the one
-// state the design cannot tolerate — so a mark write never rides a separate
-// transaction).
+// check, and the SQL each apply path runs INSIDE its own target transaction,
+// so on a target whose commit is atomic a mark and its rows land together or
+// not at all — a mark write never rides a separate transaction.
+//
+// One target does not commit atomically: vtgate in transaction_mode=MULTI
+// with the marks in a --control-keyspace sidecar commits the data shard and
+// the control shard one after the other (GC-41 (c)). There the two torn
+// states are NOT equal. A mark committed without its rows is the one the
+// design cannot tolerate — the replay would SKIP rows that never landed,
+// silently — so every write core sends its rows before its marks
+// (mysqlBatchTx.writeApplyMarks; TestWriteCoreStatementOrder), and a tear
+// leaves the other state, rows without their mark. That one is tolerated by
+// choice: the replay re-applies them with nothing to skip them, which is
+// today's behaviour without marks — a loud collision on a secondary-unique or
+// PK-changing change, a duplicate on a keyless table. So on that target a
+// marked class is at-least-once (or loud), not exactly-once.
 //
 // Which paths write (every apply path; see ADR-0190 "Implementation status"
 // and amendment A):
@@ -38,6 +50,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	gomysql "github.com/go-sql-driver/mysql"
 
 	"sluicesync.dev/sluice/internal/appliershared"
 	"sluicesync.dev/sluice/internal/applymarks"
@@ -182,7 +196,9 @@ func clearApplyMarks(ctx context.Context, db *sql.DB, controlKeyspace, streamID 
 // startApplyMarks loads the stream's marks at the start of an apply run, or
 // disables them — with the APPLY-MARKS-UNAVAILABLE WARN, and today's
 // behaviour — when the table cannot be used. A load failure on a usable
-// table is an ordinary (classified) apply error.
+// table, and a TRANSIENT failure of the availability probe itself
+// (applyMarksProbeTransient), is an ordinary classified apply error the
+// retry loop rides out.
 func (a *ChangeApplier) startApplyMarks(ctx context.Context, streamID string) error {
 	unusable := applyMarksUsable(ctx, a.db, a.controlKeyspace)
 	if unusable == nil {
@@ -193,8 +209,32 @@ func (a *ChangeApplier) startApplyMarks(ctx context.Context, streamID string) er
 		a.marks.Load(streamID, a.rowFilterHash, marks)
 		return nil
 	}
+	if transient := applyMarksProbeTransient(unusable); transient != nil {
+		return transient
+	}
 	a.marks.Disable()
 	applymarks.WarnUnavailable(ctx, "mysql", streamID, errors.Join(a.applyMarksEnsureErr, unusable))
+	return nil
+}
+
+// applyMarksProbeTransient returns unusable classified when it is a transient
+// failure of the availability probe (a lost connection, a timeout, a
+// reparent — [applymarks.Transient] over classifyApplierError), and nil when
+// it is a definite verdict: the table absent, a privilege or unsupported
+// statement refused, or anything else the classifier calls terminal. The
+// classifier's schema-drift arm (1146 no such table, 1054 unknown column) is
+// definite HERE even though it is retriable for a user table: a mark table
+// that vanished between the existence check and the probe, or lacks a column,
+// cannot be used, and waiting for an operator to fix it would be the new
+// refusal operator decision 2 rules out (GC-41 (f)).
+func applyMarksProbeTransient(unusable error) error {
+	var me *gomysql.MySQLError
+	if errors.As(unusable, &me) && (me.Number == 1146 || me.Number == 1054) {
+		return nil
+	}
+	if c := classifyApplierError(unusable); applymarks.Transient(c) {
+		return c
+	}
 	return nil
 }
 

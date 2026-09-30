@@ -29,8 +29,9 @@ import (
 // statement. On one Postgres server the commit is atomic and the order is
 // moot; the pin exists so the order stays right for a target where it is
 // not (the Neki UNVERIFIED PREMISE on writePositionTx). The set of cores
-// comes from the AST roster (writeCoreClass), and each mixing run must
-// produce the mixed transactions it is built to.
+// comes from the AST roster (writeCoreClass), and each run must produce the
+// mixed transactions it is built to — a floor PER RUN, not per core (the
+// lanes run drives four cores and proves its floor in aggregate).
 func TestWriteCoreStatementOrder(t *testing.T) {
 	dsn, cleanup := startPostgresForApplier(t)
 	defer cleanup()

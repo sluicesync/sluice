@@ -1078,8 +1078,9 @@ func writePositionTx(ctx context.Context, tx *sql.Tx, controlKeyspace, streamID,
 	//   - data touched first → data commits first → a tear leaves the
 	//     position (and the apply marks) BEHIND the data, and the change
 	//     replays: keyed idempotent apply absorbs it, and a non-idempotent
-	//     class is where it would be with no marks at all (a loud collision
-	//     at worst; keyless tables at-least-once). Nothing is lost.
+	//     class is where it would be with no marks at all — a loud
+	//     collision, or a duplicate on a table with no usable unique key
+	//     (at-least-once; see apply_marks.go).
 	//   - control touched first → a tear leaves the position PAST data that
 	//     never committed, and nothing ever re-delivers it. Silent loss.
 	//
@@ -1087,6 +1088,16 @@ func writePositionTx(ctx context.Context, tx *sql.Tx, controlKeyspace, streamID,
 	// row statement of a transaction is sent before its first control-table
 	// statement (the apply marks, then this position). v0.156.5–v0.156.6's
 	// batch paths broke it (GC-41 (c)) and lost the torn transaction's rows.
+	//
+	// What the rule guarantees is exactly one thing: control can never
+	// commit past its data. It says nothing about a tear BETWEEN TWO DATA
+	// shards — one transaction whose rows land on two shards (a sharded
+	// target keyspace, or a primary-vindex change vtgate runs as a delete on
+	// one shard and an insert on another) can commit one shard and lose the
+	// other with the position still behind both, which a replay repairs only
+	// where the replayed change is idempotent. That class is not closed by
+	// ordering and is triaged separately; do not read this comment as
+	// covering it.
 	// Pinned per write core by TestWriteCoreStatementOrder (the recorded
 	// statement order of every core, derived from an AST roster of the
 	// control writers' callers) and against a real tear by

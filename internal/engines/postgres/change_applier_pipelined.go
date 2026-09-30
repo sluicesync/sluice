@@ -368,8 +368,9 @@ func (a *ChangeApplier) dispatchPipelined(ctx context.Context, b *pgxBatchTx, st
 
 	case ir.SchemaSnapshot:
 		// Persist the boundary's IR schema onto the SAME tx as the position
-		// write (ADR-0049 locked decision #4a). writeSchemaVersionPgx queues
-		// the history upsert onto the batch. A nil IR is a hard error,
+		// write (ADR-0049 locked decision #4a): buildWriteSchemaVersionSQL renders
+		// the history upsert and it is queued onto the batch after the rows
+		// already queued (data before control). A nil IR is a hard error,
 		// identical to the serial dispatch.
 		if v.IR == nil {
 			return false, errors.New("postgres: applier: schema snapshot has nil IR table")

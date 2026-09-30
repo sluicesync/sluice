@@ -139,7 +139,7 @@ func writeSchemaVersion(ctx context.Context, exec schemaHistoryExecer, schema, s
 
 // buildWriteSchemaVersionSQL returns the schema-history upsert (sql, args)
 // shared by the serial exec path ([writeSchemaVersion]) and the ADR-0092
-// pipelined queue path ([writeSchemaVersionPgx]). Single-sourcing the
+// pipelined queue path ([ChangeApplier.dispatchPipelined]'s SchemaSnapshot arm). Single-sourcing the
 // build keeps the ADR-0049 row shape + COALESCE-on-source_engine semantics
 // identical across the two callers.
 //

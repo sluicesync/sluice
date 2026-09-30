@@ -821,7 +821,11 @@ func commitBatch(ctx context.Context, cfg *BatchConfig, tx BatchTx, streamID, to
 				slog.Int("rows_attempted", rows),
 				slog.String("err", err.Error()),
 			)
-			return err
+			// Classified like the commit arm below (GC-41 (g)): on an
+			// engine that coalesces rows (MySQL, ADR-0139) the position
+			// write is where most of the batch's DATA is first sent, so a
+			// transient here is as retriable as one at COMMIT.
+			return cfg.Classify(err)
 		}
 	}
 	if err := cfg.Commit(tx); err != nil {
@@ -871,7 +875,7 @@ func writeBoundaryOnly(ctx context.Context, cfg *BatchConfig, streamID, token st
 			slog.String("stream_id", streamID),
 			slog.String("err", err.Error()),
 		)
-		return err
+		return cfg.Classify(err)
 	}
 	if err := cfg.Commit(tx); err != nil {
 		return cfg.Classify(fmt.Errorf("%s: applier: boundary commit: %w", cfg.EngineName, err))

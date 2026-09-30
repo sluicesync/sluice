@@ -702,6 +702,19 @@ func buildMultiRowInsertSQL(schema, table string, rows []ir.Row, pk []string, co
 // COPY's re-sent rows upsert instead of 1062-ing); a truly keyless table never
 // collides, so the clause is inert and behaviour is effectively plain INSERT.
 // See the ChangeApplier package doc for the full resume-idempotency contract.
+//
+// DO NOT move a vtgate flavor to the VALUES() spelling (GC-41 (e)). On a
+// sharded target vtgate refuses an ON DUPLICATE KEY UPDATE that assigns a
+// primary-vindex column — unless the assignment is spelled literally
+// `col = VALUES(col)`, which it accepts and runs as an insert on the NEW
+// value's shard: measured on vttestserver, a row moved from cust=1 to cust=4
+// left {10,1,a} on -80 and {10,4,moved} on 80-, a duplicate primary key across
+// shards at exit 0. The row-alias spelling is refused loudly
+// (SHARDED-TARGET-VINDEX-UPDATE). That refusal is an OVER-refusal for changes
+// that do not actually move the vindex value (GC-41 (e), open) — the fix for
+// it is to leave unchanged columns out of the SET list, never to switch the
+// spelling. Pinned by TestUpsertSpelling_VitessFamilyNeverUsesValuesFunc and
+// TestVStream_ShardedTarget_VindexMoveRefusesLoudly.
 func onDuplicateKeyUpdateClause(cols, pk []string, upsert upsertSpelling) string {
 	var sb strings.Builder
 	if len(pk) > 0 {

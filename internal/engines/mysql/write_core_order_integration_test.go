@@ -32,11 +32,15 @@ import (
 // The cores are not a hand list: the set this test must drive is
 // Cores(writeCoreClass), which TestWriteCoreRoster_EveryControlWriterCallerIsClassified
 // derives from the package's AST, and a core the roster names but no run
-// below claims fails here. Each mixing core must also produce at least the
-// mixed (data + control) transactions its run is built to produce — the
-// shape the rule can be broken in — so a run that silently stopped writing
-// marks cannot pass vacuously; each control-only core must write control
-// and no data.
+// below claims fails here. Each run must also produce at least the mixed
+// (data + control) transactions it is built to produce — the shape the rule
+// can be broken in — and at least one control write, so a run that silently
+// stopped writing marks cannot pass vacuously. Reach, stated: both floors are
+// PER RUN, not per core. A run that drives several cores (serial +
+// commit-position; lane batch + checkpoint + barrier) proves its floor in
+// aggregate, not that each of its cores produced a mixed transaction; the
+// mutation runs in the GC-41 (c) commit are what show the batch and lane
+// cores individually red.
 //
 // Classification is applyorder.Classify's (by text; its reach is in the
 // package doc). The Postgres twin lives in that package.

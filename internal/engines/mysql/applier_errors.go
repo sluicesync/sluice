@@ -200,6 +200,28 @@ func isReadOnlyTargetSignal(err error) bool {
 		strings.Contains(msg, "running with the --read-only")
 }
 
+// shardedTargetVindexUpdateMarker is the grep-stable token of the apply
+// refusal vtgate raises when a change would assign a primary-vindex column
+// on a sharded target (GC-41 (e)). The wrapped error keeps the dispatch
+// frame, which names the table; vtgate's own message names the vindex.
+const shardedTargetVindexUpdateMarker = "SHARDED-TARGET-VINDEX-UPDATE"
+
+// vindexUpdateRemedy is the refusal's remedy text. It covers both shapes the
+// class has today: a change that really moves a row's vindex value, which
+// vtgate cannot apply at all, and — until the open over-refusal is fixed — an
+// UPDATE that merely re-states an unchanged vindex column.
+const vindexUpdateRemedy = "the target keyspace is sharded and this change assigns a primary-vindex column, which vtgate refuses; " +
+	"a change that moves a row's vindex value cannot be applied through vtgate (delete the row on the target and re-copy it, " +
+	"or sync into an unsharded keyspace), and sluice also refuses an update that only re-states an unchanged vindex column " +
+	"(a known over-refusal; the supported scope is in docs/managed-services.md)"
+
+// isVindexUpdateRefusal reports whether a 1235 message is vtgate's refusal to
+// assign a vindex column, in either measured spelling.
+func isVindexUpdateRefusal(msg string) bool {
+	m := strings.ToLower(msg)
+	return strings.Contains(m, "vt12001") && strings.Contains(m, "vindex")
+}
+
 // classifyApplierError inspects err and returns a value satisfying
 // [ir.RetriableError] when err matches one of the documented MySQL /
 // Vitess transient shapes. Returns err unchanged for non-retriable
@@ -386,6 +408,17 @@ func classifyApplierError(err error) error {
 			// Message-gated AND-gate; an unrelated 1290 stays terminal.
 			if isReadOnlyTargetSignal(err) {
 				return &retriableMySQLError{err: err}
+			}
+		case 1235:
+			// vtgate refusing to assign a primary-vindex column on a sharded
+			// target (GC-41 (e)): VT12001 "you cannot UPDATE primary vindex
+			// columns" for an UPDATE, "DML cannot update vindex column" for an
+			// ON DUPLICATE KEY UPDATE. Terminal either way; the marker gives
+			// the operator the class and the remedy instead of a bare 1235.
+			// Idempotent: an error classified twice (a hook's classified
+			// error re-classified by the batch loop) is marked once.
+			if isVindexUpdateRefusal(mysqlErr.Message) && !strings.Contains(err.Error(), shardedTargetVindexUpdateMarker) {
+				return &terminalMySQLError{err: fmt.Errorf("%s: %s: %w", shardedTargetVindexUpdateMarker, vindexUpdateRemedy, err)}
 			}
 		case 1062:
 			// Explicit non-retriable per ADR-0038 — reaches the

@@ -787,11 +787,25 @@ func WarnUnavailable(ctx context.Context, engine, streamID string, cause error) 
 		msg = cause.Error()
 	}
 	slog.WarnContext(ctx, engine+": applier: "+UnavailableMarker+": the sluice_cdc_apply_marks table cannot be used, so "+
-		"this run applies WITHOUT exactly-once apply marks (ADR-0190). Nothing is lost: a restart after a crash in the "+
-		"middle of a source transaction replays it as sluice always has, and may stop loudly on a unique collision. To "+
+		"this run applies WITHOUT exactly-once apply marks (ADR-0190). A restart after a crash in the middle of a "+
+		"source transaction replays it as sluice always has: it may stop loudly on a unique collision, and a table with "+
+		"no usable unique key may gain a duplicate of a replayed row. To "+
 		"enable the marks, let sluice create the table (or have a role that may create it run the DDL `sluice "+
 		"control-tables ddl --engine <target engine>` prints) and grant this role SELECT, INSERT, UPDATE and DELETE on it",
 		slog.String("stream_id", streamID), slog.String("cause", msg))
+}
+
+// Transient reports whether classified — a mark-table availability probe's
+// failure, already run through the engine's applier classifier — is a
+// transient the apply retry loop should ride out, as opposed to a definite
+// verdict that this role cannot use the table (absent, no privilege,
+// unsupported), which is the only thing that may disable the marks. GC-41
+// (f): v0.156.5 disabled them on ANY probe error, so a target flapping on the
+// retry right after a crash — exactly when marks matter — replayed without
+// them behind a misleading APPLY-MARKS-UNAVAILABLE.
+func Transient(classified error) bool {
+	var re ir.RetriableError
+	return errors.As(classified, &re) && re.Retriable()
 }
 
 // warnUntrusted logs the [UntrustedMarker] WARN, once per apply run. first

@@ -461,12 +461,37 @@ the shards and the specific new table(s). An unsharded keyspace
 passes untouched, and a transient shard-discovery failure WARNs
 and proceeds.
 
-Continuous **sync into a sharded DATA keyspace IS supported** when
-the operator has pre-created and vindexed the tables on the
-platform (with or without `--schema-already-applied`): the create
-step finds every table already present, no-ops its `CREATE TABLE
-IF NOT EXISTS`, and sluice streams rows into the correctly-routed
-tables. Only a table sluice would have to create anew is refused.
+Continuous sync into a sharded DATA keyspace whose tables the
+operator has pre-created and vindexed on the platform (with or
+without `--schema-already-applied`) gets past the create step: it
+finds every table already present, no-ops its `CREATE TABLE IF NOT
+EXISTS`, and only a table sluice would have to create anew is
+refused. **The apply that follows is narrower than that, and today
+it is scoped like this** (measured on a 2-shard vttestserver, audit
+backlog GC-41 (e), open):
+
+- **Primary vindex on a column that is NOT the primary key:** vtgate
+  refuses every row write sluice sends (its upserts and updates
+  assign the vindex column), so the stream stops on the first one.
+  Not supported.
+- **Primary vindex on the primary key:** inserts and deletes apply,
+  and so do updates on the batched paths; an UPDATE sent by the
+  per-change path — `--apply-batch-size 1`, the broker and chain
+  restore, a partial after-image (including the default-on ADD
+  COLUMN backfill), an empty before-image, a keyless table, or any
+  primary-key change — is refused, because it re-states the vindex
+  column even when its value is unchanged.
+- **A change that really moves a row's vindex value** (a primary-key
+  change, or a new value in the vindex column) cannot be applied
+  through vtgate at all.
+
+Each refusal is loud — `SHARDED-TARGET-VINDEX-UPDATE`, naming the
+table, the position left where it was — never a silent write. (The
+one silent shape vtgate admits, an `ON DUPLICATE KEY UPDATE col =
+VALUES(col)` that re-inserts the row on its new shard and leaves the
+old copy behind, is a spelling sluice never sends to a Vitess-family
+target; `TestUpsertSpelling_VitessFamilyNeverUsesValuesFunc` pins
+that.)
 (An earlier build refused such a sync up front at schema-writer
 open — the schema-forward path opens the writer even on warm
 resume — which over-refused this supported flow; the door now sits

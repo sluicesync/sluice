@@ -15,7 +15,7 @@ import (
 // CONTROL rule orders (GC-41 (c); see writePositionTx). Completeness is
 // enforced below: every function taking a transaction is classified in
 // txFuncClass, and each "control" one must be listed here.
-var controlTxWriters = []string{"execApplyMarksTx", "writePositionTx", "writeSchemaVersion"}
+var controlTxWriters = []string{"execApplyMarksTx", "writePositionTx", "writeSchemaVersion", "writePositionUpsertSQL", "applyMarkStatements", "schemaVersionUpsertSQL"}
 
 // txFuncClass classifies every function in the package that takes a
 // transaction (*sql.Tx or the schema-history execers): "control" writes a
@@ -42,6 +42,9 @@ var txFuncClass = map[string]string{
 // write core it is, as TestWriteCoreStatementOrder drives it.
 var writeCoreClass = map[string]string{
 	"ChangeApplier.dispatch":                applyorder.Helper,
+	"ChangeApplier.execApplyMarksTx":        applyorder.Helper, // the executors, reached from the SQL builders
+	"writePositionTx":                       applyorder.Helper,
+	"writeSchemaVersion":                    applyorder.Helper,
 	"ChangeApplier.applyOneImpl":            applyorder.Helper,
 	"mysqlBatchTx.writeApplyMarks":          applyorder.Helper,
 	"mysqlBatchTx.writePosition":            applyorder.Helper,
@@ -71,6 +74,14 @@ var writeCoreClass = map[string]string{
 // transaction and every path up to a write core, and fails on any it has not
 // been told about — so a new write core (or a new control writer) cannot
 // escape TestWriteCoreStatementOrder by not being listed.
+//
+// Reach, stated: the walk starts at the named executors AND at the SQL
+// builders they render with (writePositionUpsertSQL, applyMarkStatements,
+// schemaVersionUpsertSQL), so a new caller of a builder is caught too. What it
+// cannot see is a control statement spelled inline and sent through a generic
+// executor (txExec) — that is reached only by TestWriteCoreStatementOrder's
+// by-text Classify, and only on the cores that test drives.
+
 func TestWriteCoreRoster_EveryControlWriterCallerIsClassified(t *testing.T) {
 	funcs, err := applyorder.ParseFuncs(".")
 	if err != nil {

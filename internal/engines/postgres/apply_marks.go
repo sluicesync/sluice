@@ -7,10 +7,19 @@ package postgres
 //
 // The engine-neutral decision logic lives in internal/applymarks; this file
 // is the Postgres half: the sluice_cdc_apply_marks table, its availability
-// check, and the SQL each apply path runs INSIDE its own target transaction
-// (a mark committed without its rows, or rows without their mark, is the one
-// state the design cannot tolerate — so a mark write never rides a separate
-// transaction).
+// check, and the SQL each apply path runs INSIDE its own target transaction,
+// so on a single Postgres server a mark and its rows commit together or not
+// at all — a mark write never rides a separate transaction.
+//
+// Of the two torn states a non-atomic commit could leave, a mark without its
+// rows is the one the design cannot tolerate (the replay would silently SKIP
+// rows that never landed); rows without their mark replay with today's
+// no-marks outcome — a loud collision, or a duplicate on a keyless table. So
+// every write core queues or sends its rows before its marks
+// (TestWriteCoreStatementOrder), the order the MySQL applier needs under
+// vtgate MULTI (GC-41 (c); see mysql/apply_marks.go). UNVERIFIED PREMISE: that
+// a sharded Postgres target (Neki) holding the marks on another shard either
+// commits atomically or tears in that order — see writePositionTx.
 //
 // Which paths write (every apply path; see ADR-0190 "Implementation status"
 // and amendment A):
@@ -33,6 +42,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"sluicesync.dev/sluice/internal/appliershared"
 	"sluicesync.dev/sluice/internal/applymarks"
@@ -203,7 +214,9 @@ func clearApplyMarks(ctx context.Context, db *sql.DB, schema, streamID string) e
 // startApplyMarks loads the stream's marks at the start of an apply run, or
 // disables them — with the APPLY-MARKS-UNAVAILABLE WARN, and today's
 // behaviour — when the table cannot be used. A load failure on a usable
-// table is an ordinary (classified) apply error.
+// table, and a TRANSIENT failure of the availability probe itself
+// (applyMarksProbeTransient), is an ordinary classified apply error the
+// retry loop rides out.
 func (a *ChangeApplier) startApplyMarks(ctx context.Context, streamID string) error {
 	unusable := applyMarksUsable(ctx, a.db, a.controlSchema)
 	if unusable == nil {
@@ -214,8 +227,31 @@ func (a *ChangeApplier) startApplyMarks(ctx context.Context, streamID string) er
 		a.marks.Load(streamID, a.rowFilterHash, marks)
 		return nil
 	}
+	if transient := applyMarksProbeTransient(unusable); transient != nil {
+		return transient
+	}
 	a.marks.Disable()
 	applymarks.WarnUnavailable(ctx, "postgres", streamID, errors.Join(a.applyMarksEnsureErr, unusable))
+	return nil
+}
+
+// applyMarksProbeTransient returns unusable classified when it is a transient
+// failure of the availability probe (a lost connection, a timeout, an admin
+// shutdown — [applymarks.Transient] over classifyApplierError), and nil when
+// it is a definite verdict: the table absent, a privilege refused, or
+// anything else the classifier calls terminal. The classifier's schema-drift
+// arm (42P01 undefined table, 42703 undefined column) and 3F000 (no such
+// schema) are definite HERE even where retriable for a user table: a mark
+// table that cannot be resolved cannot be used, and waiting for an operator
+// would be the new refusal operator decision 2 rules out (GC-41 (f)).
+func applyMarksProbeTransient(unusable error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(unusable, &pgErr) && (pgErr.Code == "42P01" || pgErr.Code == "42703" || pgErr.Code == "3F000") {
+		return nil
+	}
+	if c := classifyApplierError(unusable); applymarks.Transient(c) {
+		return c
+	}
 	return nil
 }
 

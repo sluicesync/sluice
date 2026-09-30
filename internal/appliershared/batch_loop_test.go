@@ -532,6 +532,40 @@ func TestRunOneBatch_DispatchErrorRollsBackAndClassifies(t *testing.T) {
 	assertEvents(t, rec, []string{"begin", "dispatch:p1", "tx.Rollback"})
 }
 
+// TestRunBatchLoop_PositionWriteErrorIsClassified pins GC-41 (g): both
+// position-write sites — commitBatch's and writeBoundaryOnly's — route a
+// failure through the engine's classifier, like the commit arm always did.
+// Before, they returned it raw, so on MySQL (whose position write first
+// flushes the coalesced rows, ADR-0139) a transient there — or vtgate's
+// SHARDED-TARGET-VINDEX-UPDATE refusal — reached the retry loop unclassified.
+func TestRunBatchLoop_PositionWriteErrorIsClassified(t *testing.T) {
+	boom := errors.New("boom")
+	cases := map[string]struct {
+		changes    []ir.Change
+		batchSize  int
+		checkpoint bool
+	}{
+		"commitBatch": {changes: []ir.Change{insertAt("p1")}, batchSize: 10},
+		"writeBoundaryOnly": {
+			changes:    []ir.Change{ir.TxBegin{Position: pos("p1")}, insertAt("p1"), ir.TxCommit{Position: pos("p1")}},
+			batchSize:  1,
+			checkpoint: true,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			rec := &recorder{}
+			cfg := testConfig(t, rec, false)
+			cfg.CheckpointOnlyAtTxBoundary = tc.checkpoint
+			cfg.WritePosition = func(context.Context, BatchTx, string, string, int64) error { return boom }
+			err := RunBatchLoop(context.Background(), cfg, "stream", feed(true, tc.changes...), tc.batchSize)
+			if !errors.Is(err, boom) || !strings.HasPrefix(err.Error(), "classified: ") {
+				t.Fatalf("err = %v; want the position-write error routed through Classify", err)
+			}
+		})
+	}
+}
+
 // TestRunOneBatch_ByteCapFlushes pins the ADR-0028 byte-cap flush and
 // the ADR-0052 DP-4(b) byte-cap-dominant advisory to the provider.
 func TestRunOneBatch_ByteCapFlushes(t *testing.T) {

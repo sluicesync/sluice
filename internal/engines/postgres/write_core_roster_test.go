@@ -18,7 +18,7 @@ import (
 // "control" one must be listed here.
 var controlTxWriters = []string{
 	"execApplyMarksTx", "queueApplyMarks", "writePositionTx", "writePositionPipelined",
-	"writeSchemaVersion", "buildWriteSchemaVersionSQL",
+	"writeSchemaVersion", "buildWriteSchemaVersionSQL", "buildWritePositionSQL", "applyMarkStatements",
 }
 
 // txFuncClass classifies every function in the package that takes a
@@ -54,6 +54,10 @@ var txFuncClass = map[string]string{
 // TestWriteCoreStatementOrder drives it.
 var writeCoreClass = map[string]string{
 	"writeSchemaVersion":                      applyorder.Helper,
+	"writePositionTx":                         applyorder.Helper, // the executors, reached from the SQL builders
+	"ChangeApplier.execApplyMarksTx":          applyorder.Helper,
+	"ChangeApplier.queueApplyMarks":           applyorder.Helper,
+	"ChangeApplier.writePositionPipelined":    applyorder.Helper,
 	"ChangeApplier.dispatch":                  applyorder.Helper,
 	"ChangeApplier.dispatchPipelined":         applyorder.Helper,
 	"ChangeApplier.applyOneImpl":              applyorder.Helper,
@@ -73,7 +77,11 @@ var writeCoreClass = map[string]string{
 // TestWriteCoreRoster_EveryControlWriterCallerIsClassified is the MySQL
 // gate's Postgres twin (GC-41 (c)): derived from the package's AST, so a new
 // write core or control writer cannot escape TestWriteCoreStatementOrder by
-// not being listed.
+// not being listed. Reach, stated: the walk starts at the executors and the
+// SQL builders (buildWritePositionSQL, applyMarkStatements,
+// buildWriteSchemaVersionSQL); a control statement spelled inline and sent
+// through txExec or pgxBatchTx.queue is reached only by the integration
+// test's by-text Classify, on the cores it drives.
 func TestWriteCoreRoster_EveryControlWriterCallerIsClassified(t *testing.T) {
 	funcs, err := applyorder.ParseFuncs(".")
 	if err != nil {
