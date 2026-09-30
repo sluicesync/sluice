@@ -2,7 +2,9 @@
 
 ## Status
 
-Accepted. Implemented in `internal/engines/postgres/lsn_tracker.go` (the producer/consumer holder), `internal/engines/postgres/cdc_reader.go` (consumer-side wiring on the keepalive path), `internal/engines/postgres/change_applier{,_batch}.go` (producer-side reporting on commit), and `internal/pipeline/streamer.go` (cross-engine wiring via the `lsnTrackerProvider` / `lsnTrackerAttacher` structural interfaces).
+Accepted; the RULE stands, the MECHANISM was replaced by GC-41 (2026-09-30, unreleased) — see the amendment at the end. The paragraph below describes the original implementation.
+
+Implemented in `internal/engines/postgres/lsn_tracker.go` (the producer/consumer holder), `internal/engines/postgres/cdc_reader.go` (consumer-side wiring on the keepalive path), `internal/engines/postgres/change_applier{,_batch}.go` (producer-side reporting on commit), and `internal/pipeline/streamer.go` (cross-engine wiring via the `lsnTrackerProvider` / `lsnTrackerAttacher` structural interfaces).
 
 ## Context
 
@@ -64,3 +66,20 @@ The tracker uses a CAS loop on a single `atomic.Uint64` to enforce monotonic adv
 ## Migration notes
 
 No state-format changes. Pre-v0.5.0 streams resume cleanly: the persisted `source_position` is the last applied change's commit-LSN, which is what the new tracker would have reported anyway. The slot's `confirmed_flush_lsn` may have advanced past applied work for streams that were stopped mid-batch on the old code; on warm-resume the new reader's tracker is freshly allocated (applied=0) and the keepalive falls back to streamedLSN until the applier reports its first commit. That's correct: the slot stays pinned to its current `confirmed_flush_lsn`; new applies advance it from that floor. The pre-existing Bug 15 surface (lost rows from a previous stop) cannot be retroactively recovered — the WAL has been recycled — but the stream itself stays usable post-resume.
+
+## Amendment 2026-09-30 — GC-41: the tracker is replaced by a durable-position ceiling
+
+The rule is unchanged: the slot is acknowledged only to WAL whose changes the consumer holds durably. The applied-LSN tracker that implemented it had two defects, both found by the 2026-09-30 slot-acknowledgement triage:
+
+- **(a) CRITICAL, silent loss — it existed for one target engine.** Only the Postgres applier provided `LSNTracker()`. For every other target the reader fell back to acking the STREAMED LSN, and the streamer's comment called that fallback "correct for engines without an async-batched apply layer" — no such target existed. A Postgres → MySQL-family sync stopped mid-batch resumed past the buffered changes (measured 22 rows against 221).
+- **(b) HIGH, unbounded WAL retention — within that engine, one write path never reported.** The concurrent lanes' checkpoint (`laneApplierAdapter.WriteCheckpoint`) persisted the position but never reported it, so on the default `--apply-concurrency auto` path the tracker stayed at 0 and the slot was acked at the stream's start LSN for the life of the stream (v0.99.130, when the tracker was first actually attached, through v0.156.6).
+
+Both are the same shape: a feedback input that is correct only while every position-writing site in every engine remembers to feed it. The replacement has no such input:
+
+- The reader never acks past `max(startLSN, ackCeil)`, **unconditionally** (the zero value holds at the start position). `ackCeil` is raised only by `ReleaseSlotAckTo`.
+- The streamer's apply-phase sidecar (`startSlotAckCeiling`, `internal/pipeline/streamer_slot_ack.go`) reads the stream's persisted position back from the TARGET through the mandatory `ChangeApplier.ReadPosition` and releases it. The evidence it reads IS the durable write, whichever engine, batch size, lane count or apply path wrote it. The backup chain releases committed manifest ends through the same seam, as before, without the former opt-in `HoldSlotAckAtCommitted`.
+- `lsn_tracker.go`, `LSNTracker()`, `AttachLSNTracker`, the applier's `reportAppliedToken`, the shared batch loop's `AfterCommit` hook and the pipeline's `lsnTrackerProvider` / `lsnTrackerAttacher` are deleted.
+
+Gates: `TestSlotAckInputsRoster_EveryInputIsDurableEvidence` (every field `ackLSN` reads is listed as durable evidence; the ceiling moves only in `ReleaseSlotAckTo`), `TestSlotAckReleaseRoster_EveryStreamChangesSiteReleases` (every pipeline `StreamChanges` site hands its reader to a release mechanism), `TestSlotAckCeilingRoster_EveryRegisteredEngine` (every registered engine classified: a sync target whose `ReadPosition` reads the durable row, or checked as having no applier), and end to end `TestStreamer_PostgresToMySQL_SlotAckNeverPassesTheDurablePosition` and `TestStreamer_PostgresToPostgres_SlotAckFollowsTheDurablePosition` (W ∈ {1, 4, 0}).
+
+Cost relative to the tracker: one primary-key read of `sluice_cdc_state` per 5 s interval, and the slot trails the target's durable position by up to one interval plus the 10 s keepalive rather than one keepalive.

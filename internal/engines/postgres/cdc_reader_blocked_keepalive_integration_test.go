@@ -35,10 +35,10 @@ import (
 //     from pg_replication_slots) is the same before and after the stall;
 //   - the stream carries on: the reader records no error and a row written
 //     AFTER the stall is delivered;
-//   - no early ack: with an applier tracker attached that never reports an
-//     applied LSN, the slot's confirmed_flush_lsn is where it was before
+//   - no early ack: with nothing ever released to the reader (GC-41), the
+//     slot's confirmed_flush_lsn is where it was before
 //     any change was written — the blocked-path status must report the
-//     applier-confirmed position, never the streamed one.
+//     released position, never the streamed one.
 func TestCDCReader_BlockedConsumerKeepsTheWalsenderAlive(t *testing.T) {
 	dsn, cleanup := startPostgresForCDC(t)
 	defer cleanup()
@@ -65,8 +65,8 @@ func TestCDCReader_BlockedConsumerKeepsTheWalsenderAlive(t *testing.T) {
 		t.Fatalf("OpenCDCReader returned %T, want *CDCReader", rdrAny)
 	}
 	defer func() { _ = rdr.Close() }()
-	// A tracker that never reports: the only correct ack is the start.
-	rdr.AttachLSNTracker(newLSNTracker())
+	// Nothing is released to this reader, so the only correct ack is the
+	// start (GC-41: the ceiling holds at startLSN until a release).
 
 	changes, err := rdr.StreamChanges(ctx, ir.Position{})
 	if err != nil {
@@ -112,7 +112,7 @@ func TestCDCReader_BlockedConsumerKeepsTheWalsenderAlive(t *testing.T) {
 		`SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = '%s'`, defaultSlot,
 	))
 	if flushAfter != flushBefore {
-		t.Fatalf("confirmed_flush_lsn advanced from %s to %s during the stall although the applier confirmed nothing: a status sent while blocked acked past the applier", flushBefore, flushAfter)
+		t.Fatalf("confirmed_flush_lsn advanced from %s to %s during the stall although nothing was released: a status sent while blocked acked past the released ceiling", flushBefore, flushAfter)
 	}
 
 	// The stream carries on: a row written after the stall arrives.

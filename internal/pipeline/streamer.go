@@ -50,32 +50,6 @@ type publicationPostSlotVerifier interface {
 	VerifyPublicationScope(ctx context.Context, dsn string, tables []string) error
 }
 
-// lsnTrackerProvider is the optional applier-side surface for
-// engines that produce applied-LSN feedback (Bug 15, ADR-0020). The
-// applier owns the tracker; the streamer fetches it via this
-// interface and hands it to the matching CDC reader via
-// [lsnTrackerAttacher].
-//
-// Returns an opaque value (typed `any`) so the pipeline package
-// stays free of engine-specific types. The matching CDC reader
-// type-asserts internally — only same-engine pairs (PG applier ↔
-// PG reader) actually wire anything; cross-engine pairs harmlessly
-// hand an unrelated value to the attacher and the attacher's type-
-// assertion fails closed.
-type lsnTrackerProvider interface {
-	LSNTracker() any
-}
-
-// lsnTrackerAttacher is the optional CDC-reader-side surface for
-// engines that consume applied-LSN feedback (Bug 15, ADR-0020). On
-// a successful type-assertion of the opaque tracker to its native
-// shape, the reader keeps a pointer and uses it on its keepalive
-// path; on failure it ignores the value and falls back to streamed-
-// LSN keepalives.
-type lsnTrackerAttacher interface {
-	AttachLSNTracker(t any)
-}
-
 // slotNameSetter is the optional applier-side surface for engines
 // that record the active stream's replication-slot name on the
 // per-target control table (Phase 2 mid-stream live add-table,
@@ -2075,25 +2049,19 @@ func (s *Streamer) runOnce(ctx context.Context) (err error) {
 		return err
 	}
 
-	// ---- 3.6. Fetch the applier's LSN-feedback tracker (if any) ----
-	// Slot-ack-after-apply (Bug 15, ADR-0020): the postgres applier
-	// exposes a tracker the matching CDC reader reads from on its
-	// keepalive path. The tracker is opaque (typed `any`) so the
-	// pipeline package stays engine-neutral; the matching reader's
-	// AttachLSNTracker type-asserts internally. Cross-engine pairs
-	// hand a value the reader doesn't recognise, and the reader is then
-	// bounded by the slot-ack ceiling alone ([Streamer.startSlotAckCeiling]).
-	// CORRECTION (GC-41): this comment used to call the reader's
-	// untracked fallback — acking the STREAMED LSN — "correct for engines
-	// without an async-batched apply layer". No such target existed: MySQL
-	// batches (auto-1000) and runs lanes, and every target's apply loop
-	// buffers ahead of its durable position write, so a Postgres →
-	// non-Postgres sync stopped mid-batch resumed past changes it never
-	// applied. The reader no longer has a streamed-LSN fallback.
-	var lsnTracker any
-	if provider, ok := applier.(lsnTrackerProvider); ok {
-		lsnTracker = provider.LSNTracker()
-	}
+	// Slot-ack-after-apply (Bug 15, ADR-0020, GC-41) needs nothing here:
+	// the stream sites below capture a slot-keeping reader and the
+	// apply-phase sidecar releases the target's durable position to it
+	// ([Streamer.startSlotAckCeiling]). This step used to fetch the
+	// Postgres applier's applied-LSN tracker, under a comment calling the
+	// reader's untracked fallback — acking the STREAMED LSN — "correct for
+	// engines without an async-batched apply layer". No such target
+	// existed: MySQL batches (auto-1000) and runs lanes, and every target's
+	// apply loop buffers ahead of its durable position write, so a
+	// Postgres → non-Postgres sync stopped mid-batch resumed past changes
+	// it never applied (GC-41 (a)); and the tracker itself never heard
+	// from the lane checkpoint, so it pinned the slot on Postgres targets
+	// (GC-41 (b)). Both the tracker and the fallback are gone.
 
 	// ---- 4. Branch: cold start vs warm resume ----
 	//
@@ -2121,8 +2089,7 @@ func (s *Streamer) runOnce(ctx context.Context) (err error) {
 	// The persisted position is by definition unrecoverable; the
 	// only path forward is cold-start (re-snapshot + fresh slot).
 	// We log a loud WARN naming the slot/position so monitoring
-	// catches the recovery event, then re-enter coldStart with the
-	// same lsnTracker. Bug 9's pre-flight refusal still gates
+	// catches the recovery event, then re-enter coldStart. Bug 9's pre-flight refusal still gates
 	// destructive dest-table operations — auto-fall-through does
 	// not silently destroy data.
 	//
@@ -2161,7 +2128,7 @@ func (s *Streamer) runOnce(ctx context.Context) (err error) {
 	// is unchanged. warmResumed is the ADR-0049 Chunk C cache-prime
 	// discriminator: only a true warm-resume primes from storage.
 	var warmResumed bool
-	changes, stop, warmResumed, err = s.phaseOpenChangeStream(ctx, streamCtx, lsnTracker, applier, streamID, persisted, found)
+	changes, stop, warmResumed, err = s.phaseOpenChangeStream(ctx, streamCtx, applier, streamID, persisted, found)
 	if err != nil {
 		return err
 	}

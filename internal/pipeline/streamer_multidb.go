@@ -185,7 +185,6 @@ func (s *Streamer) resolveStreamDatabases(ctx context.Context) (selected []strin
 // drops + recreates first), keeping the cdc-state row.
 func (s *Streamer) coldStartMultiDatabase(
 	ctx context.Context,
-	lsnTracker any,
 	applier ir.ChangeApplier,
 	streamID string,
 	fresh freshCopyReason,
@@ -459,11 +458,6 @@ func (s *Streamer) coldStartMultiDatabase(
 		)
 	}
 
-	if lsnTracker != nil {
-		if attacher, ok := stream.Changes.(lsnTrackerAttacher); ok {
-			attacher.AttachLSNTracker(lsnTracker)
-		}
-	}
 	if s.PollInterval > 0 {
 		if setter, ok := stream.Changes.(pollIntervalSetter); ok {
 			setter.SetPollInterval(s.PollInterval)
@@ -546,7 +540,6 @@ func (s *Streamer) coldStartMultiDatabase(
 func (s *Streamer) warmResumeMultiDatabase(
 	ctx context.Context,
 	persisted ir.Position,
-	lsnTracker any,
 	applier ir.ChangeApplier,
 	streamID string,
 ) (changes <-chan ir.Change, stop func(), err error) {
@@ -670,11 +663,6 @@ func (s *Streamer) warmResumeMultiDatabase(
 		)
 	}
 
-	if lsnTracker != nil {
-		if attacher, ok := cdc.(lsnTrackerAttacher); ok {
-			attacher.AttachLSNTracker(lsnTracker)
-		}
-	}
 	if s.PollInterval > 0 {
 		if setter, ok := cdc.(pollIntervalSetter); ok {
 			setter.SetPollInterval(s.PollInterval)

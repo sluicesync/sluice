@@ -270,13 +270,6 @@ type BatchConfig struct {
 	// position logic are unchanged whether or not it is set.
 	OnSourceTxCommit func()
 
-	// AfterCommit, when non-nil, runs after a successful commit with
-	// the batch's position token — PG's slot-ack feedback report
-	// (Bug 15, ADR-0020). Deliberately after Commit: a crash between
-	// the two only loses one tracker update, which the next batch's
-	// report supersedes.
-	AfterCommit func(ctx context.Context, token string)
-
 	// CacheSchemaSnapshot, when non-nil, runs after a SchemaSnapshot
 	// batch commits on the TransactionalDDL=true path (ADR-0049
 	// Chunk C cache-after-commit invariant: never on a rolled-back
@@ -757,17 +750,18 @@ func waitForFirstChange(ctx context.Context, cfg *BatchConfig, streamID string, 
 	}
 }
 
-// commitBatch writes the position then commits the open tx, then
-// fires the optional AfterCommit hook (PG's slot-ack report — see the
-// [BatchConfig.AfterCommit] doc for the crash-window reasoning).
+// commitBatch writes the position then commits the open tx.
 // Returns a wrapped error on either failure with a rollback already
 // attempted on the position-write path. This ordering IS the ADR-0007
-// position-and-data atomicity contract; do not reorder.
+// position-and-data atomicity contract; do not reorder. (It is also
+// what a Postgres source's slot ack rests on: the slot is released only
+// to the position this write makes durable, read back from the target —
+// GC-41.)
 //
 // atBoundary reports whether `token` is a safe source-transaction /
 // DDL boundary resume point. When [BatchConfig.CheckpointOnlyAtTxBoundary]
-// is set and atBoundary is false, the position write (and the AfterCommit
-// slot-ack) is SKIPPED: the batch's data still commits, but the persisted
+// is set and atBoundary is false, the position write is SKIPPED: the
+// batch's data still commits, but the persisted
 // position retains its last boundary value so warm-resume re-reads the
 // whole in-flight transaction (see the CheckpointOnlyAtTxBoundary doc for
 // why MySQL file/pos cannot resume mid-transaction). When the flag is
@@ -847,9 +841,6 @@ func commitBatch(ctx context.Context, cfg *BatchConfig, tx BatchTx, streamID, to
 		return nil
 	}
 	*pending = 0
-	if cfg.AfterCommit != nil {
-		cfg.AfterCommit(ctx, token)
-	}
 	return nil
 }
 
@@ -861,7 +852,7 @@ func commitBatch(ctx context.Context, cfg *BatchConfig, tx BatchTx, streamID, to
 // boundary checkpoint can advance. The rows are already durable (serial
 // in-order apply), so persisting the boundary afterward never moves the
 // position ahead of durable data (ADR-0007). Mirrors commitBatch's
-// position-then-commit-then-AfterCommit ordering for the one-row-less case.
+// position-then-commit ordering for the one-row-less case.
 //
 // It carries *pending (row-level DML committed in prior mid-tx flushes
 // whose position write was skipped) into the boundary position write so
@@ -886,9 +877,6 @@ func writeBoundaryOnly(ctx context.Context, cfg *BatchConfig, streamID, token st
 		return cfg.Classify(fmt.Errorf("%s: applier: boundary commit: %w", cfg.EngineName, err))
 	}
 	*pending = 0
-	if cfg.AfterCommit != nil {
-		cfg.AfterCommit(ctx, token)
-	}
 	return nil
 }
 

@@ -70,7 +70,7 @@ func TestColdStartBeginCDC_CancelledStopKeepsTheSlot(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // the operator's Ctrl-C, landing in the handoff window
 
-	_, _, err := s.coldStartBeginCDC(ctx, stream, applier, "stream-1", nil)
+	_, _, err := s.coldStartBeginCDC(ctx, stream, applier, "stream-1")
 	if err == nil {
 		t.Fatal("expected the cancelled handoff to return an error; got nil")
 	}
@@ -112,7 +112,7 @@ func TestColdStartBeginCDC_GenuineAnchorFailureStillAbandons(t *testing.T) {
 	applier := &failingAnchorApplier{err: wantErr}
 	s := &Streamer{Source: stubEngine{}, Target: stubEngine{}}
 
-	_, _, err := s.coldStartBeginCDC(context.Background(), stream, applier, "stream-1", nil)
+	_, _, err := s.coldStartBeginCDC(context.Background(), stream, applier, "stream-1")
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("err = %v; want the underlying anchor-write failure", err)
 	}

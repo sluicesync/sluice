@@ -18,10 +18,9 @@ import (
 // publication scope → snapshot → bulk-copy → start CDC from
 // snapshot's position.
 //
-// lsnTracker is the opaque applied-LSN feedback channel (Bug 15,
-// ADR-0020) — attached to the snapshot stream's CDC reader before
-// StreamChanges so the keepalive path uses applied-LSN from the
-// first ack onwards.
+// A Postgres source's slot ack is bounded by the target's durable
+// position: coldStartBeginCDC captures the reader for the apply-phase
+// slot-ack ceiling sidecar (GC-41).
 //
 // applier and streamID are the engine-side handles for the optional
 // `--reset-target-data` recovery path (ADR-0023): when [s.ResetTargetData]
@@ -65,7 +64,7 @@ import (
 // auto-resnapshot path took the default branch with force=false and ALWAYS
 // dead-ended on the populated-target refusal (a re-snapshot of an existing
 // stream is populated by definition) — the live Track-B/D finding.
-func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.ChangeApplier, streamID string, resumeFrom ir.Position, fresh freshCopyReason) (changes <-chan ir.Change, stop func(), err error) {
+func (s *Streamer) coldStart(ctx context.Context, applier ir.ChangeApplier, streamID string, resumeFrom ir.Position, fresh freshCopyReason) (changes <-chan ir.Change, stop func(), err error) {
 	// resumingCopy is the interrupted-cold-start discriminator: a non-zero
 	// resume position. It gates the seeded snapshot open and the preflight
 	// skip in the phases below. Read once here so the call sites can't drift.
@@ -348,7 +347,7 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	// Persist the cold-start CDC anchor (GitHub #15), then start CDC
 	// from the snapshot's position. The returned stop closure closes
 	// the snapshot stream when Run unwinds.
-	return s.coldStartBeginCDC(ctx, stream, applier, streamID, lsnTracker)
+	return s.coldStartBeginCDC(ctx, stream, applier, streamID)
 }
 
 // coldStartReadSourceSchema opens the source SchemaReader, reads and
@@ -1395,7 +1394,7 @@ const coldStartAnchorWriteTimeout = stopDrainTimeout
 // snapshot stream so the engine-side streaming goroutine is joined
 // deterministically when Run unwinds; on error paths the stream is
 // closed here and the returned stop is the no-op.
-func (s *Streamer) coldStartBeginCDC(ctx context.Context, stream *ir.SnapshotStream, applier ir.ChangeApplier, streamID string, lsnTracker any) (changes <-chan ir.Change, stop func(), err error) {
+func (s *Streamer) coldStartBeginCDC(ctx context.Context, stream *ir.SnapshotStream, applier ir.ChangeApplier, streamID string) (changes <-chan ir.Change, stop func(), err error) {
 	stop = func() {}
 	// Join the engine's COPY-completion barrier BEFORE reading
 	// stream.Position. On most engines draining Rows to EOF already
@@ -1461,11 +1460,6 @@ func (s *Streamer) coldStartBeginCDC(ctx context.Context, stream *ir.SnapshotStr
 		)
 	}
 
-	if lsnTracker != nil {
-		if attacher, ok := stream.Changes.(lsnTrackerAttacher); ok {
-			attacher.AttachLSNTracker(lsnTracker)
-		}
-	}
 	// Roadmap item 18(c): apply operator-supplied --poll-interval to
 	// poll-based CDC readers on the cold-start path too. Same
 	// type-assert/silent-ignore shape as warmResume.

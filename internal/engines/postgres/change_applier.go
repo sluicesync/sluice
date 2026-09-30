@@ -15,7 +15,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
@@ -373,16 +372,6 @@ type ChangeApplier struct {
 	// read in the INSERT/UPDATE/DELETE dispatch arms. Applier-goroutine-
 	// owned (same single-goroutine contract as the other caches).
 	schemaDirtyTables map[string]bool
-
-	// lsnFeedback is the slot-ack-after-apply tracker (Bug 15,
-	// ADR-0020). The applier reports the LSN of each successfully-
-	// committed change here; the [CDCReader] reads from the same
-	// tracker on its keepalive path so the slot's
-	// confirmed_flush_lsn never advances past durably-applied
-	// work. nil tracker means "no feedback wired" — the applier
-	// runs as before, and the reader falls back to streamed-LSN
-	// keepalives.
-	lsnFeedback *lsnTracker
 
 	// maxBufferBytes is the soft byte-size cap on the in-flight
 	// batch's buffered change values during ApplyBatch. Implements
@@ -907,50 +896,6 @@ func (a *ChangeApplier) execTimeoutCtx(ctx context.Context) (context.Context, co
 func (a *ChangeApplier) commitWithTimeout(tx *sql.Tx) error {
 	return appliershared.RunWithDeadline(a.execTimeout, tx.Commit)
 }
-
-// LSNTracker returns the applier's applied-LSN feedback channel.
-// The [pipeline.Streamer] uses the structural interface
-// `lsnTrackerProvider` to fetch this and hand it to the
-// [CDCReader]'s `AttachLSNTracker`. Lazily allocated so callers
-// that never wire the streamer (tests, direct API users) don't pay
-// the cost.
-func (a *ChangeApplier) LSNTracker() any {
-	if a.lsnFeedback == nil {
-		a.lsnFeedback = newLSNTracker()
-	}
-	return a.lsnFeedback
-}
-
-// reportAppliedToken extracts the LSN from a position token and
-// reports it to the tracker. Token-parse errors are logged at debug
-// level rather than propagated — losing one tracker update doesn't
-// invalidate the batch we just successfully committed, and a malformed
-// token is itself worth surfacing via a debug line for diagnosis.
-//
-// No-op when no tracker is wired (the legacy v0.4.0 shape) or when
-// the token doesn't carry a valid LSN. Single-call cost is one JSON
-// unmarshal + one LSN parse + one atomic CAS.
-func (a *ChangeApplier) reportAppliedToken(ctx context.Context, token string) {
-	if a.lsnFeedback == nil {
-		return
-	}
-	lsn, err := lsnFromPositionToken(token)
-	if err != nil {
-		slog.DebugContext(ctx, "postgres: applier: applied-LSN report skipped (parse failure)",
-			slog.String("err", err.Error()))
-		return
-	}
-	if lsn == 0 {
-		return
-	}
-	a.lsnFeedback.ReportApplied(lsn)
-}
-
-// _ keeps pglogrepl in the import list when the file is built
-// without the lsn_tracker.go's symbols being referenced from this
-// translation unit (defensive for future refactors that move the
-// helper around).
-var _ pglogrepl.LSN
 
 // Close releases the underlying connection pool(s) — both the
 // per-change pool and the lazily-opened ADR-0092 pipelined pool.
@@ -1517,7 +1462,6 @@ func (a *ChangeApplier) persistSourceTxCommit(ctx context.Context, streamID stri
 		return applierErrorOrShutdown(ctx, fmt.Errorf("postgres: applier: commit (commit position): %w", err))
 	}
 	a.marks.Committed(marks)
-	a.reportAppliedToken(ctx, token)
 	return nil
 }
 
@@ -1537,10 +1481,9 @@ func applierErrorOrShutdown(ctx context.Context, err error) error {
 
 // applyOne dispatches a single change to its SQL form, runs the
 // data write, and writes the position update — all in the same
-// transaction. After a successful commit, the change's LSN is
-// reported to the slot-ack feedback tracker (Bug 15, ADR-0020) so
-// the [CDCReader]'s keepalive routine can advance
-// confirmed_flush_lsn past this change.
+// transaction. The committed position is what releases the source
+// slot past this change: the streamer reads it back from the control
+// table (Bug 15, ADR-0020, GC-41).
 func (a *ChangeApplier) applyOne(ctx context.Context, streamID string, c ir.Change) error {
 	// The skip signal is consumed inside applyOneImpl's own position write
 	// here (writePosition=true), so this wrapper discards it.
@@ -1692,9 +1635,6 @@ func (a *ChangeApplier) applyOneImpl(ctx context.Context, streamID string, c ir.
 	// above; the cache is never mutated on the rolled-back path.
 	if snap, isSnap := c.(ir.SchemaSnapshot); isSnap {
 		a.cacheActiveSchemaAfterCommit(snap)
-	}
-	if writePosition {
-		a.reportAppliedToken(ctx, token)
 	}
 	return skipped, nil
 }

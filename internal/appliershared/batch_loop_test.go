@@ -192,19 +192,18 @@ func schemaEvents(token string) map[string]ir.Change {
 
 // TestRunBatchLoop_PositionWriteThenCommitOrdering pins the ADR-0007 /
 // ADR-0010 ordering at the seam: every batch is data dispatches →
-// position write on the SAME tx → commit → AfterCommit hook, in that
-// order, exactly once per batch.
+// position write on the SAME tx → commit, in that order, exactly once
+// per batch.
 func TestRunBatchLoop_PositionWriteThenCommitOrdering(t *testing.T) {
 	rec := &recorder{}
 	cfg := testConfig(t, rec, false)
-	cfg.AfterCommit = func(_ context.Context, token string) { rec.add("afterCommit:" + token) }
 
 	ch := feed(true, insertAt("p1"), insertAt("p2"))
 	if err := RunBatchLoop(context.Background(), cfg, "stream", ch, 10); err != nil {
 		t.Fatalf("RunBatchLoop: %v", err)
 	}
 	assertEvents(t, rec, []string{
-		"begin", "dispatch:p1", "dispatch:p2", "writePosition:p2", "commit", "afterCommit:p2",
+		"begin", "dispatch:p1", "dispatch:p2", "writePosition:p2", "commit",
 	})
 }
 

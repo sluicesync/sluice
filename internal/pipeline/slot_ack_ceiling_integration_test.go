@@ -145,6 +145,118 @@ func TestStreamer_PostgresToMySQL_SlotAckNeverPassesTheDurablePosition(t *testin
 	}
 }
 
+// TestStreamer_PostgresToPostgres_SlotAckFollowsTheDurablePosition is the
+// GC-41 (b) pin: on a Postgres target, confirmed_flush_lsn must ADVANCE with
+// the target's durable position on every apply path — and never pass it.
+// Before GC-41 the Postgres applier fed the reader an applied-LSN tracker from
+// its serial commit paths only; the concurrent lanes' checkpoint
+// (laneApplierAdapter.WriteCheckpoint) never reported, so at W=4 and at the
+// default W=0 (auto) the tracker stayed at 0 and the slot was acked at the
+// stream's start LSN for the life of the stream while the persisted position
+// advanced — unbounded source WAL retention, silently. W=1 was fine.
+//
+// The bound: within three reader keepalives (10 s each) of the batch landing
+// on the target, the slot must have passed the WAL position taken just before
+// the batch was written. The independent evidence is the source server's own
+// pg_current_wal_lsn() and pg_replication_slots, not sluice's bookkeeping.
+func TestStreamer_PostgresToPostgres_SlotAckFollowsTheDurablePosition(t *testing.T) {
+	srcDSN, dstDSN, cleanup := startPostgresLogical(t)
+	defer cleanup()
+	pgEng, _ := engines.Get("postgres")
+
+	for _, w := range []int{1, 4, 0} {
+		t.Run(fmt.Sprintf("W=%d", w), func(t *testing.T) {
+			table := fmt.Sprintf("gc41_pg_w%d", w)
+			id := fmt.Sprintf("gc41_pg_w%d", w)
+			slot := "sluice_" + id
+			applyPGDDL(t, srcDSN, fmt.Sprintf(`
+				CREATE TABLE %s (id INT PRIMARY KEY, v TEXT NOT NULL);
+				INSERT INTO %s SELECT g, 'seed' FROM generate_series(1, 10) g;`, table, table))
+
+			s := &Streamer{
+				Source: pgEng, Target: pgEng, SourceDSN: srcDSN, TargetDSN: dstDSN,
+				StreamID: id, SlotName: slot, PublicationName: "pub_" + id,
+				Filter:           migcore.TableFilter{Include: []string{table}},
+				ApplyBatchSize:   1000,
+				ApplyConcurrency: w,
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			runErr := make(chan error, 1)
+			go func() { runErr <- s.Run(ctx) }()
+			defer func() {
+				cancel()
+				<-runErr
+			}()
+			if !waitForRowCount(t, dstDSN, table, 10, 2*time.Minute) {
+				t.Fatal("cold start never copied the seed rows")
+			}
+
+			preBatch := currentWALLSN(t, srcDSN)
+			const batch = 300
+			insertRowsOneTxEach(t, srcDSN, table, 11, 10+batch)
+			if !waitForRowCount(t, dstDSN, table, 10+batch, 2*time.Minute) {
+				t.Fatalf("the %d-row batch never landed on the target", batch)
+			}
+
+			deadline := time.Now().Add(3 * 10 * time.Second)
+			var confirmed pglogrepl.LSN
+			for {
+				c, ok := readConfirmedFlushLSN(t, srcDSN, slot)
+				if p, pok := readPersistedLSNPG(dstDSN, id); ok && pok && c > p {
+					t.Fatalf("confirmed_flush_lsn %s passed the target's persisted position %s (GC-41)", c, p)
+				}
+				confirmed = c
+				if ok && c >= preBatch {
+					break
+				}
+				if time.Now().After(deadline) {
+					p, _ := readPersistedLSNPG(dstDSN, id)
+					t.Fatalf("W=%d: confirmed_flush_lsn is %s, still behind the pre-batch WAL %s three keepalives "+
+						"after the batch landed (target persisted %s) — the slot is not following the durable "+
+						"position and retains source WAL without bound (GC-41 (b))", w, confirmed, preBatch, p)
+				}
+				time.Sleep(time.Second)
+			}
+		})
+	}
+}
+
+// currentWALLSN reads the source's current WAL insert position.
+func currentWALLSN(t *testing.T, dsn string) pglogrepl.LSN {
+	t.Helper()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	var s string
+	if err := db.QueryRow("SELECT pg_current_wal_lsn()::text").Scan(&s); err != nil {
+		t.Fatalf("pg_current_wal_lsn: %v", err)
+	}
+	lsn, err := pglogrepl.ParseLSN(s)
+	if err != nil {
+		t.Fatalf("parse %q: %v", s, err)
+	}
+	return lsn
+}
+
+// readPersistedLSNPG reads the stream's persisted source LSN from a Postgres
+// target's control row.
+func readPersistedLSNPG(dsn, streamID string) (pglogrepl.LSN, bool) {
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		return 0, false
+	}
+	defer func() { _ = db.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var token string
+	if db.QueryRowContext(ctx, "SELECT source_position FROM sluice_cdc_state WHERE stream_id = $1", streamID).Scan(&token) != nil {
+		return 0, false
+	}
+	return lsnOfPositionToken(token)
+}
+
 // ackViolation is one sample where the slot's acked position was past the
 // target's durable one.
 type ackViolation struct {

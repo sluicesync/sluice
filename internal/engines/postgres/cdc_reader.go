@@ -215,14 +215,6 @@ type CDCReader struct {
 	// first StreamChanges and after a completed Close.
 	pumpDone chan struct{}
 
-	// appliedLSN is the slot-ack-after-apply tracker (Bug 15,
-	// ADR-0020). Non-nil values come from the streamer wiring;
-	// when nil, the keepalive routine reports the streamed LSN
-	// (legacy v0.4.0 shape — preserved so non-streamer callers
-	// like the cdc-snapshot test paths don't need to construct
-	// a tracker).
-	appliedLSN *lsnTracker
-
 	// pumpKA is the pump goroutine's keepalive state, installed by the
 	// pump before its loop and read only on that goroutine (by send, via
 	// dispatchWAL). nil outside a running pump.
@@ -313,50 +305,6 @@ type CDCReader struct {
 func (r *CDCReader) SetSchemaForward(enabled bool) {
 	r.schemaForward = enabled
 }
-
-// AttachLSNTracker installs an applied-LSN feedback channel from
-// the [ChangeApplier]. The tracker's value is what the keepalive
-// routine reports as confirmed_flush_lsn; until the applier reports
-// its first commit, the reader falls back to startLSN so the slot
-// stays alive on idle streams. See ADR-0020.
-//
-// The parameter is `any` so this satisfies the pipeline's engine-neutral
-// `lsnTrackerAttacher` interface (`AttachLSNTracker(any)`) — the streamer
-// fetches the opaque tracker via `lsnTrackerProvider.LSNTracker() any` and
-// hands it here without importing the engine's concrete type. A value that
-// isn't this engine's *lsnTracker (a cross-engine applier's feedback handle)
-// is ignored, falling back to streamed-LSN keepalives.
-//
-// LOAD-BEARING (ADR-0121 discovery): the previous signature took the concrete
-// `*lsnTracker`, which did NOT match the pipeline's `AttachLSNTracker(any)`
-// interface, so the streamer's type-assertion failed silently and the tracker
-// was NEVER attached on the cold-start / warm-resume paths — the keepalive
-// fell back to acking the STREAMED (decoded) LSN, letting confirmed_flush_lsn
-// advance past un-applied changes. With lockstep apply (streamed ≈ applied)
-// that was a near-zero loss window, but `--apply-delay` (ADR-0121) runs the
-// reader far ahead of the applier, turning it into active silent loss on a
-// crash mid-delay-window (held changes the slot already acked are not
-// re-sent on resume). The `any` signature is the documented intent; this
-// finally engages the ADR-0020 slot-ack-after-apply behaviour on the
-// streamer path. Concurrency-adjacent → CI `-race` integration gate.
-//
-// Must be called before [StreamChanges]; calling it on a running
-// reader is racy with the pump goroutine and will be ignored.
-func (r *CDCReader) AttachLSNTracker(t any) {
-	lt, ok := t.(*lsnTracker)
-	if !ok {
-		return
-	}
-	r.appliedLSN = lt
-}
-
-// Compile-time pin of the pipeline's engine-neutral attacher contract
-// (pipeline.lsnTrackerAttacher = AttachLSNTracker(any)). The streamer wires the
-// applier's LSN tracker into the reader via THIS exact structural interface; a
-// drift back to a concrete-typed signature would make that type-assertion fail
-// silently again (ADR-0121) and re-disable slot-ack-after-apply. Keeping the
-// shape here fails the build instead.
-var _ interface{ AttachLSNTracker(any) } = (*CDCReader)(nil)
 
 // SetCDCDatabaseScope implements [ir.CDCDatabaseScoper] (ADR-0075 Phase
 // 2b). It switches the reader from its default single-schema view to a
@@ -1043,22 +991,17 @@ func checkSourceIdentity(ctx context.Context, slotName, persistedSysID string, p
 // cadence — when it times out, we send a StandbyStatusUpdate and go
 // back to receiving.
 //
-// Two LSNs are tracked side-by-side (Bug 15, ADR-0020):
+// Two LSNs are tracked side-by-side (Bug 15, ADR-0020, GC-41):
 //
 //   - streamedLSN: the highest commit-LSN the pump has parsed off
-//     the WAL stream. Advances as soon as a CommitMessage is seen.
-//     Used internally for keepalive bookkeeping and as the fallback
-//     ack value when no applier feedback is wired.
-//   - appliedLSN (via r.appliedLSN tracker, when non-nil): the
-//     highest LSN whose data has been committed to the target. The
-//     applier's commit path reports this back; the keepalive
-//     routine sends THIS value as WALWritePosition so the slot's
-//     confirmed_flush_lsn never advances past durably-applied work.
-//
-// Whichever of the two is used, the ack is then clamped at the
-// consumer-released ceiling ([CDCReader.ackLSN], GC-41), so on a
-// stream without a tracker it is the ceiling — never streamedLSN —
-// that bounds what the slot releases.
+//     the WAL stream. Advances as soon as a CommitMessage is seen,
+//     long before the change reaches the target.
+//   - the ack ceiling (r.ackCeil): the highest LSN the consumer has
+//     released as durably held — for a sync, the target's persisted
+//     position read back from the target. The keepalive sends
+//     min(streamedLSN, max(startLSN, ceiling)) as WALWritePosition
+//     ([CDCReader.ackLSN]), so the slot's confirmed_flush_lsn never
+//     advances past durably-applied work.
 //
 // done is closed when the pump has fully unwound — declared first so it
 // runs LAST, after the replication connection is closed and after the
@@ -1241,10 +1184,9 @@ func (r *CDCReader) pump(ctx context.Context, conn *pgconn.PgConn, startLSN pglo
 // LSN bookkeeping; Relation messages refresh the cache.
 //
 // streamedLSN tracks the highest commit-LSN parsed off the wire and
-// is updated on each CommitMessage. It is NOT what the slot ack uses
-// when an applier feedback tracker is wired — the keepalive routine
-// reads from r.appliedLSN to honour the slot-ack-after-apply rule
-// (Bug 15, ADR-0020).
+// is updated on each CommitMessage. It only ever CAPS the slot ack:
+// the keepalive never advertises past the consumer-released ceiling
+// ([CDCReader.ackLSN], GC-41).
 func (r *CDCReader) dispatchWAL(
 	ctx context.Context,
 	xld pglogrepl.XLogData,
@@ -1987,6 +1929,14 @@ func (r *CDCReader) positionAt(lsn pglogrepl.LSN) (ir.Position, error) {
 // manifest commits. Bug 15 (post-v0.5.0) was the first form of this
 // defect, on the Postgres-target path alone; GC-41 is the rest of it.
 //
+// There is deliberately ONE input. ADR-0020's applied-LSN tracker — fed
+// by the Postgres applier's commit paths — was a second, and it is gone:
+// it existed for one target engine, and within that engine the
+// concurrent lanes' checkpoint never reported to it, so on the default
+// lane path it sat at 0 and pinned confirmed_flush_lsn at startLSN for
+// the life of the stream (unbounded source WAL retention, GC-41 (b)).
+// Every input is enumerated by TestSlotAckInputsRoster_EveryInputIsDurableEvidence.
+//
 // startLSN is the floor: the LSN the pump started streaming from (cold
 // start: the slot's snapshot LSN, already the slot's confirmed_flush_lsn
 // at creation; warm resume: the persisted position's LSN, durable by
@@ -2001,16 +1951,8 @@ func (r *CDCReader) positionAt(lsn pglogrepl.LSN) (ir.Position, error) {
 // at this level, discharged by the callers. The arithmetic is pinned by
 // TestAckLSN_*.
 func (r *CDCReader) ackLSN(streamedLSN, startLSN pglogrepl.LSN) pglogrepl.LSN {
-	ack := streamedLSN
-	if r.appliedLSN != nil {
-		if applied := r.appliedLSN.LoadApplied(); applied == 0 {
-			ack = startLSN
-		} else {
-			ack = applied
-		}
-	}
 	ceil := max(pglogrepl.LSN(r.ackCeil.Load()), startLSN)
-	return min(ack, ceil)
+	return min(streamedLSN, ceil)
 }
 
 // ReleaseSlotAckTo raises the ack ceiling to pos — called by a consumer

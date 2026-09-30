@@ -225,7 +225,7 @@ func TestColdStartMultiDatabase_UnloggedCensusRefusesBeforeOpening(t *testing.T)
 		TargetDSN:      "tgt",
 		DatabaseFilter: DatabaseFilter{Include: []string{"s1"}},
 	}
-	_, stop, err := s.coldStartMultiDatabase(context.Background(), nil, nil, "sid", freshCopyNone)
+	_, stop, err := s.coldStartMultiDatabase(context.Background(), nil, "sid", freshCopyNone)
 	if stop != nil {
 		stop()
 	}
@@ -258,7 +258,7 @@ func TestWarmResumeMultiDatabase_UnloggedCensusRefusesBeforeOpening(t *testing.T
 		DatabaseFilter: DatabaseFilter{Include: []string{"s1"}},
 	}
 	_, stop, err := s.warmResumeMultiDatabase(
-		context.Background(), ir.Position{Engine: "stub", Token: "tok"}, nil, nil, "sid",
+		context.Background(), ir.Position{Engine: "stub", Token: "tok"}, nil, "sid",
 	)
 	if stop != nil {
 		stop()

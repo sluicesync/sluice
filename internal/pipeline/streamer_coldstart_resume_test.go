@@ -391,7 +391,7 @@ func TestResumeIsReachedOnlyFromTheDefaultCase(t *testing.T) {
 func TestResumeStoppedColdStart_UnsupportedSourceIsNotHandled(t *testing.T) {
 	s := &Streamer{Source: stubEngine{}, Target: stubEngine{}}
 	ctx := context.Background()
-	changes, stop, handled, err := s.resumeStoppedColdStart(ctx, ctx, nil, nil, "s1")
+	changes, stop, handled, err := s.resumeStoppedColdStart(ctx, ctx, nil, "s1")
 	if handled || err != nil || changes != nil || stop != nil {
 		t.Fatalf("a source with no anchor verifier was handled (handled=%v err=%v); every non-PostgreSQL "+
 			"source must keep today's behaviour exactly", handled, err)

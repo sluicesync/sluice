@@ -17,7 +17,7 @@
 // Post-fix: the CDC reader's slot-missing branch wraps its error
 // with [ir.ErrPositionInvalid]; the streamer detects this via
 // errors.Is, logs a WARN, and falls through to coldStart with the
-// same lsnTracker. Bug 9's pre-flight refusal still gates populated
+// same stream id. Bug 9's pre-flight refusal still gates populated
 // dest — this test drops dest tables before the fall-through to
 // exercise the recovery path itself.
 

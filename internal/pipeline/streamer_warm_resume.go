@@ -15,14 +15,12 @@ import (
 // warmResume opens a CDC reader on the source and starts streaming
 // from the persisted position. No snapshot, no bulk-copy.
 //
-// lsnTracker is the opaque applied-LSN feedback channel (Bug 15,
-// ADR-0020). Attached to the reader before StreamChanges so the
-// keepalive path uses applied-LSN from the very first ack — no
-// window where the slot could advance past un-applied work just
-// because the reader was constructed before the tracker was
-// passed through. nil tracker means the engine doesn't support
-// LSN feedback (the pre-v0.5.0 shape) or the applier isn't a
-// matching engine; the reader falls back to streamed-LSN.
+// A Postgres source's slot ack is bounded by the target's durable
+// position: the reader holds its ack at the persisted position it
+// resumes from until the apply-phase slot-ack ceiling sidecar releases
+// a later durable one (GC-41). There is no window in which the slot
+// can advance past un-applied work, because the reader has no other
+// ack input.
 //
 // Warm resume reuses the publication scope established at cold
 // start; we don't re-read the schema or re-call EnsurePublication
@@ -40,7 +38,7 @@ import (
 // via captureSlog, surfaces a cross-test DATA RACE under `-race`. The
 // closure is always non-nil (no-op on error paths, which clean up
 // inline) so the caller can defer it unconditionally.
-func (s *Streamer) warmResume(ctx context.Context, persisted ir.Position, lsnTracker any) (changes <-chan ir.Change, stop func(), err error) {
+func (s *Streamer) warmResume(ctx context.Context, persisted ir.Position) (changes <-chan ir.Change, stop func(), err error) {
 	stop = func() {}
 	slog.InfoContext(
 		ctx, "warm resume from persisted position",
@@ -49,11 +47,6 @@ func (s *Streamer) warmResume(ctx context.Context, persisted ir.Position, lsnTra
 	cdc, err := openCDCReaderWithOptionalSlot(ctx, s.Source, s.SourceDSN, s.SlotName)
 	if err != nil {
 		return nil, stop, migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("pipeline: open cdc reader: %w", err))
-	}
-	if lsnTracker != nil {
-		if attacher, ok := cdc.(lsnTrackerAttacher); ok {
-			attacher.AttachLSNTracker(lsnTracker)
-		}
 	}
 	// Roadmap item 18(c): apply operator-supplied --poll-interval to
 	// poll-based CDC readers (today: postgres-trigger). Push-based

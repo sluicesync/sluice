@@ -14,10 +14,10 @@
 // 43-row gap in the v0.4.0 night soak was exactly this surface.
 //
 // The fix: only ack to the slot the LSN whose data has been
-// committed to dst. The applier reports applied LSNs to a tracker
-// the keepalive routine reads from; until the applier reports its
-// first commit, the keepalive falls back to the streamed-LSN so
-// the slot stays alive on idle streams. See [lsnTracker] and
+// committed to dst. Since GC-41 the streamer reads the durable position
+// back from dst and releases it to the reader, whose keepalive never
+// acks past the released ceiling (floored at the resume position, so
+// the slot stays alive on idle streams). See [Streamer.startSlotAckCeiling] and
 // [CDCReader.ackLSN] for the implementation.
 //
 // This test mirrors workspace/bug15_repro.sh from the testing

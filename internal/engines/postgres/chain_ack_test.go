@@ -68,6 +68,29 @@ func TestAckLSN_NeverPastTheReleasedCeiling(t *testing.T) {
 	}
 }
 
+// TestAckLSN_AnchorsAtStartLSNUntilFirstApply is the Bug 15 regression
+// guard, re-grounded on the GC-41 ceiling (the ADR-0020 tracker it first
+// graded is gone). Before anything durable is released the ack holds at
+// startLSN however far the pump has streamed; each durable release then
+// moves it, never past the streamed position.
+func TestAckLSN_AnchorsAtStartLSNUntilFirstApply(t *testing.T) {
+	r := &CDCReader{slotName: "sluice_slot"}
+	startLSN := pglogrepl.LSN(0x100)
+	streamed := pglogrepl.LSN(0x500)
+
+	if got := r.ackLSN(streamed, startLSN); got != startLSN {
+		t.Errorf("before any release, ackLSN = %v; want startLSN=%v (got streamedLSN — Bug 15 regression)", got, startLSN)
+	}
+	for _, applied := range []pglogrepl.LSN{0x300, 0x450} {
+		if err := r.ReleaseSlotAckTo(mustPos(t, applied)); err != nil {
+			t.Fatalf("ReleaseSlotAckTo(%v): %v", applied, err)
+		}
+		if got := r.ackLSN(streamed, startLSN); got != applied {
+			t.Errorf("after the durable release of %v, ackLSN = %v; want %v", applied, got, applied)
+		}
+	}
+}
+
 // TestReleaseSlotAckTo_PositionShapes pins what a release accepts. The
 // zero position (the "from now" sentinel) is ignored without error; a
 // FOREIGN engine's position is a loud error (decodePGPos's cross-engine

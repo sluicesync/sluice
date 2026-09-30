@@ -147,8 +147,6 @@ var unpinnedPipelineSurfaces = map[string]string{
 	"liveAddedTablesReader":       "not yet pinned",
 	"liveAddedTablesWriter":       "not yet pinned",
 	"lsnComparer":                 "not yet pinned",
-	"lsnTrackerAttacher":          "not yet pinned",
-	"lsnTrackerProvider":          "not yet pinned",
 	"pollIntervalSetter":          "not yet pinned",
 	"publicationAdder":            "not yet pinned",
 	"publicationEnsurer":          "not yet pinned",

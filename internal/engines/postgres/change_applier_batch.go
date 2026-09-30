@@ -42,9 +42,7 @@ package postgres
 // DDL is transactional, so a Truncate / SchemaSnapshot dispatches
 // onto the batch tx and flushes as its own batch — the event's
 // position write rides the SAME tx, ADR-0049 locked decision #4a);
-// BeginTx pins `SET LOCAL synchronous_commit = on` (F7); AfterCommit
-// reports the applied LSN to the slot-ack feedback tracker (Bug 15,
-// ADR-0020). Schema-changing events flush the in-progress batch and
+// BeginTx pins `SET LOCAL synchronous_commit = on` (F7). Schema-changing events flush the in-progress batch and
 // apply alone so the applier's column-type cache invalidation stays
 // contained: "everything before the schema event is durable; the
 // schema event itself is its own transaction; everything after is a
@@ -161,8 +159,9 @@ func (a *ChangeApplier) batchConfig() *appliershared.BatchConfig {
 		// degrade-to-serial, and under the ADR-0107 headroom clamp.
 		//
 		// The cost is bounded and the ADR-0020 concern is not what it looks
-		// like. Withholding the position also withholds the AfterCommit
-		// slot-ack, but only for the span of ONE source transaction, and only
+		// like. Withholding the position also withholds the slot ack (the
+		// slot is released only to the persisted position, GC-41), but only
+		// for the span of ONE source transaction, and only
 		// when the loop is genuinely INSIDE one (commitBatch's inSourceTx
 		// guard — the audit-2026-08-01 S3 fix — so a marker-less source like
 		// VStream or any trigger-CDC engine is completely unaffected). The
@@ -291,15 +290,6 @@ func (a *ChangeApplier) batchConfig() *appliershared.BatchConfig {
 			s.marks.Committed(&a.marks)
 			return nil
 		},
-		// AfterCommit reports the just-committed LSN to the slot-ack
-		// feedback tracker (Bug 15, ADR-0020). It runs AFTER tx.Commit
-		// succeeds, so a crash between the data commit and the report
-		// only loses one tracker update — the next batch's commit will
-		// report a higher LSN that supersedes it. The slot retains the
-		// WAL until that next report in exchange. Crash before
-		// tx.Commit means the data isn't durable either, and the
-		// reader's keepalive will keep ack'ing the previous floor.
-		AfterCommit:         a.reportAppliedToken,
 		CacheSchemaSnapshot: a.cacheActiveSchemaAfterCommit,
 		IsKeylessTable:      a.isKeylessInsert,
 	}

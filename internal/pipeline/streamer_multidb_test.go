@@ -99,7 +99,7 @@ func TestStreamer_WarmResumeMultiDatabase_RefusesNonServerSource(t *testing.T) {
 		DatabaseFilter: DatabaseFilter{Include: []string{"app_db"}},
 	}
 	_, stop, err := s.warmResumeMultiDatabase(
-		context.Background(), ir.Position{Engine: "stub", Token: "tok"}, nil, nil, "sid",
+		context.Background(), ir.Position{Engine: "stub", Token: "tok"}, nil, "sid",
 	)
 	if stop != nil {
 		stop() // no-op closure on the error path; call to satisfy the contract
@@ -125,7 +125,7 @@ func TestStreamer_WarmResumeMultiDatabase_PropagatesValidation(t *testing.T) {
 		TargetSchema: "analytics", // incompatible with multi-database mode
 	}
 	_, stop, err := s.warmResumeMultiDatabase(
-		context.Background(), ir.Position{Engine: "stub", Token: "tok"}, nil, nil, "sid",
+		context.Background(), ir.Position{Engine: "stub", Token: "tok"}, nil, "sid",
 	)
 	if stop != nil {
 		stop()

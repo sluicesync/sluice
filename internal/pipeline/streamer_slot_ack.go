@@ -30,7 +30,11 @@ import (
 // commits to an applied-LSN tracker, no other engine's applier did, and the
 // reader acked the STREAMED LSN for every non-Postgres target — past rows
 // still sitting in a MySQL batch, so a stop mid-batch resumed past them
-// (silent loss). A feedback design is correct only while every
+// (silent loss). And the Postgres lane checkpoint, the one write path in
+// that engine that never reported, left the tracker at 0 and pinned
+// confirmed_flush_lsn at the start position for the life of a
+// concurrent-lane stream (unbounded source WAL retention, GC-41 (b)); the
+// tracker is gone. A feedback design is correct only while every
 // position-writing site in every engine remembers to call it; the read-back
 // needs no site to remember anything, because the evidence it reads IS the
 // durable write. It is the same shape the trigger-CDC change-log registry

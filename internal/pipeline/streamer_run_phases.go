@@ -673,7 +673,7 @@ func sourceAutoResnapshotOnInvalidPosition(source ir.Engine) bool {
 // at the persisted position — the ADR-0049 Chunk C cache-prime
 // discriminator (see the comment kept on the declaration this named
 // return replaced, now at the call site).
-func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, lsnTracker any, applier ir.ChangeApplier, streamID string, persisted ir.Position, found bool) (changes <-chan ir.Change, stop func(), warmResumed bool, err error) {
+func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, applier ir.ChangeApplier, streamID string, persisted ir.Position, found bool) (changes <-chan ir.Change, stop func(), warmResumed bool, err error) {
 	// warmResumed tracks whether the apply loop is about to consume
 	// from a CDC reader opened at the persisted position (vs. a fresh
 	// post-snapshot reader). The ADR-0049 Chunk C cache prime keys on
@@ -718,9 +718,9 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, lsnTrac
 			// forceFresh = RestartFromScratch (ResetTargetData has its own
 			// destructive drop+clear branch inside; restart re-copies onto the
 			// populated target).
-			changes, stop, err = s.coldStartMultiDatabase(streamCtx, lsnTracker, applier, streamID, restartReason(s.RestartFromScratch))
+			changes, stop, err = s.coldStartMultiDatabase(streamCtx, applier, streamID, restartReason(s.RestartFromScratch))
 		case found:
-			changes, stop, err = s.warmResumeMultiDatabase(streamCtx, persisted, lsnTracker, applier, streamID)
+			changes, stop, err = s.warmResumeMultiDatabase(streamCtx, persisted, applier, streamID)
 			warmResumed = err == nil
 			// Slot-missing fall-through (ADR-0022), multi-database analogue:
 			// if the persisted server-wide position references binlog the
@@ -756,14 +756,14 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, lsnTrac
 				// =false here so the gate refuses LOUDLY (the ADR-0075 Phase 2b
 				// deliberate-recovery contract; TestStreamer_MultiSchema_
 				// SlotLossRefusesLoudly). Same engine-aware gate as single-DB.
-				changes, stop, err = s.coldStartMultiDatabase(streamCtx, lsnTracker, applier, streamID, autoResnapshotReason(s.Source))
+				changes, stop, err = s.coldStartMultiDatabase(streamCtx, applier, streamID, autoResnapshotReason(s.Source))
 				warmResumed = false
 			}
 		default:
-			changes, stop, err = s.coldStartMultiDatabase(streamCtx, lsnTracker, applier, streamID, freshCopyNone)
+			changes, stop, err = s.coldStartMultiDatabase(streamCtx, applier, streamID, freshCopyNone)
 		}
 	case s.ResetTargetData:
-		changes, stop, err = s.coldStart(streamCtx, lsnTracker, applier, streamID, ir.Position{}, freshCopyNone)
+		changes, stop, err = s.coldStart(streamCtx, applier, streamID, ir.Position{}, freshCopyNone)
 	case s.RestartFromScratch:
 		// Force a fresh cold-start from row 0, ignoring any persisted
 		// position (incl. a mid-COPY cursor). The cold-start gate
@@ -780,7 +780,7 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, lsnTrac
 			ctx, "restart-from-scratch: forcing a fresh cold-start, ignoring the persisted position",
 			slog.String("stream_id", streamID),
 		)
-		changes, stop, err = s.coldStart(streamCtx, lsnTracker, applier, streamID, ir.Position{}, freshCopyOperatorRestart)
+		changes, stop, err = s.coldStart(streamCtx, applier, streamID, ir.Position{}, freshCopyOperatorRestart)
 	case resumeCopyFrom.Token != "" || resumeCopyFrom.Engine != "":
 		// Interrupted cold-start: resume the bulk COPY from the persisted
 		// cursor (seeded snapshot stream → batched bulk-COPY writer), then
@@ -795,7 +795,7 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, lsnTrac
 			slog.String("stream_id", streamID),
 			slog.String("position_token", truncateDryRunToken(persisted.Token, 60)),
 		)
-		changes, stop, err = s.coldStart(streamCtx, lsnTracker, applier, streamID, resumeCopyFrom, freshCopyNone)
+		changes, stop, err = s.coldStart(streamCtx, applier, streamID, resumeCopyFrom, freshCopyNone)
 	case found:
 		// SLM-1 / SLM-1b: a warm resume's prior shape per table is the
 		// target's zone witness, with the retained schema-history version
@@ -812,7 +812,7 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, lsnTrac
 		if s.schemaDeltaAppliesToTarget() {
 			s.readerSchemaSeed = s.warmResumeSchemaSeedLoader(applier, streamID, persisted)
 		}
-		changes, stop, err = s.warmResume(streamCtx, persisted, lsnTracker)
+		changes, stop, err = s.warmResume(streamCtx, persisted)
 		warmResumed = err == nil
 		// A foreign-lineage verdict never satisfies ErrPositionInvalid, so
 		// the fall-through below cannot engage on it; frame it as the
@@ -863,7 +863,7 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, lsnTrac
 			// (TestStreamer_MultiSchema_SlotLossRefusesLoudly). The operator's
 			// explicit --restart-from-scratch is unaffected (forces fresh for
 			// any engine); this governs only the AUTOMATIC fall-through.
-			changes, stop, err = s.coldStart(streamCtx, lsnTracker, applier, streamID, ir.Position{}, autoResnapshotReason(s.Source))
+			changes, stop, err = s.coldStart(streamCtx, applier, streamID, ir.Position{}, autoResnapshotReason(s.Source))
 			// coldStart supersedes the warm resume — schema-history
 			// stays brand-new from the applier's perspective (the
 			// snapshot bulk-copy reset effective state).
@@ -887,7 +887,7 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, lsnTrac
 		// this one has applied nothing. Its copy is a cold start's, so it
 		// gets the brand-new-stream sentinel, exactly as coldStart does.
 		if resumedChanges, resumedStop, handled, resumeErr := s.resumeStoppedColdStart(
-			ctx, streamCtx, lsnTracker, applier, streamID,
+			ctx, streamCtx, applier, streamID,
 		); handled {
 			if resumeErr != nil {
 				if resumedStop != nil {
@@ -897,7 +897,7 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, lsnTrac
 			}
 			return resumedChanges, resumedStop, false, nil
 		}
-		changes, stop, err = s.coldStart(streamCtx, lsnTracker, applier, streamID, ir.Position{}, freshCopyNone)
+		changes, stop, err = s.coldStart(streamCtx, applier, streamID, ir.Position{}, freshCopyNone)
 	}
 	return changes, stop, warmResumed, err
 }

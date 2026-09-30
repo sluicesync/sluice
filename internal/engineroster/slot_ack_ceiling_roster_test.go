@@ -46,7 +46,7 @@ const (
 	pgReadPosition = "postgres.ChangeApplier.ReadPosition reads sluice_cdc_state.source_position, written in the " +
 		"same transaction as the data on the serial paths and in WriteCheckpoint's own transaction after the " +
 		"lanes' data commits on the concurrent path; graded by " +
-		"TestStreamer_PostgresToPostgres_StopRestartNoLoss"
+		"TestStreamer_PostgresToPostgres_SlotAckFollowsTheDurablePosition"
 	mysqlReadPosition = "mysql.ChangeApplier.ReadPosition reads sluice_cdc_state.source_position, written in the " +
 		"same transaction as the data on the serial paths and in WriteCheckpoint's own transaction after the " +
 		"lanes' data commits on the concurrent path; graded by " +

@@ -149,7 +149,6 @@ const coldStartTargetEmptiedMarker = "COLD-START-TARGET-EMPTIED"
 // then repeats).
 func (s *Streamer) resumeStoppedColdStart(
 	ctx, streamCtx context.Context,
-	lsnTracker any,
 	applier ir.ChangeApplier,
 	streamID string,
 ) (changes <-chan ir.Change, stop func(), handled bool, err error) {
@@ -279,7 +278,7 @@ func (s *Streamer) resumeStoppedColdStart(
 		return nil, nil, true, err
 	}
 
-	return s.resumeStoppedColdStartFromVerifiedState(ctx, streamCtx, lsnTracker, applier, streamID, store, verifier, state, schema)
+	return s.resumeStoppedColdStartFromVerifiedState(ctx, streamCtx, applier, streamID, store, verifier, state, schema)
 }
 
 // resumeCopyShapeGate is the copy-shape gate of [Streamer.resumeStoppedColdStart]:
@@ -342,7 +341,6 @@ func (s *Streamer) resumeCopyShapeGate(ctx context.Context, streamID string, sta
 // "resume it", so each half reads on one screen.
 func (s *Streamer) resumeStoppedColdStartFromVerifiedState(
 	ctx, streamCtx context.Context,
-	lsnTracker any,
 	applier ir.ChangeApplier,
 	streamID string,
 	store ir.MigrationStateStore,
@@ -459,7 +457,7 @@ func (s *Streamer) resumeStoppedColdStartFromVerifiedState(
 	// anchor row holds the position, and the slot holds the WAL from
 	// that position onward — which is precisely the state a cold start
 	// that ran to completion leaves behind.
-	changes, stop, err = s.warmResume(streamCtx, anchor, lsnTracker)
+	changes, stop, err = s.warmResume(streamCtx, anchor)
 	return changes, stop, true, err
 }
 

@@ -12,9 +12,10 @@
 // target's applied LSN, PG could garbage-collect WAL before sluice has
 // durably applied the changes, leading to silent unrecoverable loss on
 // target crash. ADR-0020's slot-ack-after-apply fix is the production-
-// code path that maintains the invariant; this test pins that the
+// code path that maintains the invariant (since GC-41, the consumer-released
+// ceiling fed from the durable position); this test pins that the
 // invariant holds continuously during a real CDC stream so any future
-// refactor of the keepalive / tracker / dispatch path that breaks it
+// refactor of the keepalive / release / dispatch path that breaks it
 // is caught at test time rather than at user-visible-corruption time.
 //
 // The pin is empirical: it polls pg_replication_slots.confirmed_flush_lsn
@@ -169,8 +170,8 @@ func TestCDCReader_ConfirmedFlushInvariant_PinF3(t *testing.T) {
 	defer cancel()
 
 	// Open the applier first and ensure the control table — the
-	// LSN tracker we wire in next depends on the applier path
-	// running reportAppliedToken() during ApplyBatch.
+	// release loop wired in next reads the position ApplyBatch
+	// persists there.
 	applier, err := eng.OpenChangeApplier(ctx, dsn)
 	if err != nil {
 		t.Fatalf("OpenChangeApplier: %v", err)
@@ -194,35 +195,43 @@ func TestCDCReader_ConfirmedFlushInvariant_PinF3(t *testing.T) {
 		}
 	}()
 
-	// Wire applier→reader LSN tracker so the slot only advances
-	// past the applied position. Without this, the reader falls
-	// back to streamedLSN — the invariant is much weaker (it
-	// effectively pins "did sluice ack correctly," not "did sluice
-	// ack-after-apply").
+	// Release the applier's DURABLE position to the reader the way the
+	// pipeline's slot-ack ceiling sidecar does (GC-41): read it back from
+	// the control table and hand it to ReleaseSlotAckTo. (That the ack
+	// then ADVANCES is graded end to end by the pipeline's
+	// TestStreamer_PostgresToPostgres_SlotAckFollowsTheDurablePosition; this
+	// test grades the upper bound.)
 	rdr, ok := rdrIface.(*CDCReader)
 	if !ok {
 		t.Fatalf("OpenCDCReader returned %T; want *CDCReader", rdrIface)
 	}
-	pgApplier, ok := applier.(*ChangeApplier)
-	if !ok {
-		t.Fatalf("OpenChangeApplier returned %T; want *ChangeApplier", applier)
-	}
-	tracker, ok := pgApplier.LSNTracker().(*lsnTracker)
-	if !ok {
-		t.Fatalf("ChangeApplier.LSNTracker() did not return *lsnTracker")
-	}
-	rdr.AttachLSNTracker(tracker)
 
 	changes, err := rdr.StreamChanges(ctx, ir.Position{})
 	if err != nil {
 		t.Fatalf("StreamChanges: %v", err)
 	}
+	releaseCtx, releaseCancel := context.WithCancel(ctx)
+	defer releaseCancel()
+	go func() {
+		tick := time.NewTicker(200 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			select {
+			case <-releaseCtx.Done():
+				return
+			case <-tick.C:
+			}
+			if pos, found, err := applier.ReadPosition(releaseCtx, "f3-invariant-pin"); err == nil && found {
+				_ = rdr.ReleaseSlotAckTo(pos)
+			}
+		}
+	}()
 
 	// Drive the applier in a goroutine; the reader's channel is the
 	// source of changes for ApplyBatch. ApplyBatch returns when the
 	// changes channel closes (Close() on the reader does this) or
-	// when ctx cancels. Pick a batch size > 1 so the tracker's
-	// "report after applied commit" path actually matters.
+	// when ctx cancels. Pick a batch size > 1 so the ack-after-
+	// durable-commit rule actually matters.
 	// Separate apply context so we can cancel ApplyBatch directly at
 	// teardown without waiting for the reader's async Close path to
 	// propagate. CDCReader.Close() cancels the streamer ctx but the
@@ -321,7 +330,7 @@ func TestCDCReader_ConfirmedFlushInvariant_PinF3(t *testing.T) {
 	// distinct BEGIN/INSERT/COMMIT WAL sequences and the applier
 	// sees 25 TxBegin/Insert/TxCommit triplets. Each commit advances
 	// the persisted source_position; the slot's confirmed_flush
-	// follows via the tracker.
+	// follows via the release loop above.
 	const numTxns = 25
 	for i := 1; i <= numTxns; i++ {
 		applyPGSQL(t, dsn, fmt.Sprintf(
