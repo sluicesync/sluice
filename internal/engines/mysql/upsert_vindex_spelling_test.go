@@ -4,6 +4,7 @@
 package mysql
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -63,6 +64,10 @@ func TestClassifyApplierError_VindexUpdateRefusalIsMarkedTerminal(t *testing.T) 
 		}
 		if !ir.IsTerminal(err) || applymarks.Transient(err) {
 			t.Errorf("%q: want terminal, not retriable", msg)
+		}
+		// The fleet supervisor keys on the sentinel to stop restarting the leg.
+		if !errors.Is(err, ir.ErrShardedTargetVindexUpdate) {
+			t.Errorf("%q: refusal does not wrap ir.ErrShardedTargetVindexUpdate: %v", msg, err)
 		}
 	}
 	other := classifyApplierError(&gomysql.MySQLError{Number: 1235, Message: "This version of MySQL doesn't yet support 'x'"})

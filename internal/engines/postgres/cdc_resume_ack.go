@@ -9,6 +9,8 @@ import (
 	"log/slog"
 
 	"github.com/jackc/pglogrepl"
+
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // GC-41 MEDIUM-1: a warm resume must not start behind the slot's
@@ -75,7 +77,9 @@ import (
 // as the escape — rather than losing anything.
 
 // SlotAckedPastTargetPositionMarker is the grep-stable marker of the
-// warm-resume refusal.
+// warm-resume refusal. The refusal wraps [ir.ErrSlotAckedPastTargetPosition],
+// whose text is this marker, so the fleet supervisor can see that a restart
+// would refuse again.
 const SlotAckedPastTargetPositionMarker = "SLOT-ACKED-PAST-TARGET-POSITION"
 
 // AcceptSlotAckedPastPosition records the operator's one-shot
@@ -124,7 +128,7 @@ func (r *CDCReader) checkSlotNotAckedPast(ctx context.Context, confirmedFlush st
 		return nil
 	}
 	return &terminalPGError{err: fmt.Errorf(
-		"postgres: %s: replication slot %q has confirmed_flush_lsn %s, past the position this stream resumes from (%s, "+
+		"postgres: %w: replication slot %q has confirmed_flush_lsn %s, past the position this stream resumes from (%s, "+
 			"read from the target's sluice_cdc_state). PostgreSQL starts decoding at the later of the two, so every change "+
 			"committed between %s and %s would be skipped, and the target does not hold them. Causes: a stop of a Postgres → "+
 			"MySQL-family sync on sluice v0.156.6 or earlier (the slot was acknowledged past changes still in an apply "+
@@ -132,6 +136,6 @@ func (r *CDCReader) checkSlotNotAckedPast(ctx context.Context, confirmedFlush st
 			"stream's position was written (e.g. an interrupted --restart-from-scratch). Remedy: re-copy with "+
 			"`sync start --restart-from-scratch` (or re-copy the affected tables). If you have verified the target already "+
 			"holds every change up to %s, start once with --accept-slot-acked-past-position=%s",
-		SlotAckedPastTargetPositionMarker, r.slotName, flush, resume, resume, flush, flush, flush,
+		ir.ErrSlotAckedPastTargetPosition, r.slotName, flush, resume, resume, flush, flush, flush,
 	)}
 }

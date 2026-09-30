@@ -5,6 +5,7 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -39,6 +40,10 @@ func TestCheckSlotNotAckedPast(t *testing.T) {
 	}
 	if !ir.IsTerminal(err) {
 		t.Error("refusal is not terminal: a retry would resume the same gap")
+	}
+	// The fleet supervisor keys on the sentinel to stop restarting the leg.
+	if !errors.Is(err, ir.ErrSlotAckedPastTargetPosition) || ir.ErrSlotAckedPastTargetPosition.Error() != SlotAckedPastTargetPositionMarker {
+		t.Errorf("refusal does not wrap ir.ErrSlotAckedPastTargetPosition (whose text must be the marker): %v", err)
 	}
 
 	r.AcceptSlotAckedPastPosition("0/2002")

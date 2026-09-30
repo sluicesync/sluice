@@ -10,8 +10,12 @@
 //
 //   - the heartbeat table exists with the expected schema;
 //   - rows accumulate at the expected cadence;
-//   - the slot's confirmed_flush_lsn / restart_lsn advance — proving
-//     the writes generate WAL the slot consumer sees as progress;
+//   - the writes advance the server's WAL head (pg_current_wal_lsn).
+//     This does NOT show the slot advancing: nothing consumes it here,
+//     and sluice's stream publication does not carry the heartbeat
+//     table, so whether a heartbeat moves confirmed_flush_lsn depends on
+//     the server (PG 15+ skips the resulting empty transactions) and is
+//     not pinned by this file;
 //   - PruneHeartbeat removes rows older than the window without
 //     touching newer ones;
 //   - EnsureHeartbeatTable on a low-privilege role surfaces

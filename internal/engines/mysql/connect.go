@@ -408,17 +408,18 @@ func refuseNonUTCSessionTimeZone(params map[string]string) error {
 			continue
 		}
 		if global {
-			return fmt.Errorf("mysql: DSN-TIME-ZONE-NOT-UTC: refusing the DSN parameter %s=%s: it would SET the "+
-				"server-wide GLOBAL time_zone for every client, not this session's; remove it from the DSN", key, val)
+			return fmt.Errorf("mysql: %w: refusing the DSN parameter %s=%s: it would SET the "+
+				"server-wide GLOBAL time_zone for every client, not this session's; remove it from the DSN",
+				ir.ErrDSNTimeZoneNotUTC, key, val)
 		}
 		if sessionTimeZoneIsUTC(val) {
 			continue
 		}
-		return fmt.Errorf("mysql: DSN-TIME-ZONE-NOT-UTC: refusing the DSN parameter %s=%s: sluice reads and writes "+
+		return fmt.Errorf("mysql: %w: refusing the DSN parameter %s=%s: sluice reads and writes "+
 			"MySQL TIMESTAMP values as UTC instants and pins every session to time_zone='+00:00'; under any other "+
 			"session zone every TIMESTAMP it copies or writes would be shifted by the zone's offset, silently. "+
 			"Remove %s from the DSN (DATETIME columns are naive and unaffected either way), or set it to '+00:00'",
-			key, val, key)
+			ir.ErrDSNTimeZoneNotUTC, key, val, key)
 	}
 	return nil
 }

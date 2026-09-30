@@ -4,8 +4,11 @@
 package mysql
 
 import (
+	"errors"
 	"strings"
 	"testing"
+
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestFinishParseDSN_TimeZoneSpellings pins GC-39 item 1 through the real
@@ -83,7 +86,7 @@ func TestFinishParseDSN_TimeZoneSpellings(t *testing.T) {
 			"parseServerDSN": func(d string) error { _, err := parseServerDSN(d); return err },
 		} {
 			err := parse(base + q)
-			if err == nil || !strings.Contains(err.Error(), "DSN-TIME-ZONE-NOT-UTC") {
+			if !errors.Is(err, ir.ErrDSNTimeZoneNotUTC) || !strings.Contains(err.Error(), "DSN-TIME-ZONE-NOT-UTC") {
 				t.Errorf("%s(%q) = %v; want the DSN-TIME-ZONE-NOT-UTC refusal", name, q, err)
 			}
 		}

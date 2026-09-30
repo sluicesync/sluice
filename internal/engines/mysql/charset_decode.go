@@ -81,8 +81,11 @@ import (
 // that cannot be converted to UTF-8 faithfully ends the stream with.
 const charsetNotDecodableMarker = "CHARSET-NOT-DECODABLE"
 
-// errCharsetNotDecodable is wrapped by every refusal of this file.
-var errCharsetNotDecodable = errors.New(charsetNotDecodableMarker)
+// errCharsetNotDecodable is wrapped by every refusal of this file. It is the
+// engine-neutral [ir.ErrCharsetNotDecodable], whose text is
+// charsetNotDecodableMarker, so the fleet supervisor can see that a restart
+// would refuse the same value again.
+var errCharsetNotDecodable = ir.ErrCharsetNotDecodable
 
 // columnCharset converts one column's stored bytes to UTF-8. The zero value
 // (and a nil pointer) is a UTF-8-family column: the bytes ARE the value.

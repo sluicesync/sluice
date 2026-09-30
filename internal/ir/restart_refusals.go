@@ -1,0 +1,42 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
+package ir
+
+import "errors"
+
+// The sentinels below classify engine refusals that a fresh run of the same
+// stream repeats exactly, because the condition they refuse lives in durable
+// state the next start reads back: the source's replication slot, the change
+// stream a restart re-delivers, or the DSN. The engine wraps its refusal with
+// %w; like [ErrUnforwardedSchemaChange], each sentinel's text IS the refusal's
+// grep-stable marker, so the message reads the same with or without it.
+//
+// The pipeline's fleet supervisor keys on them to stop restarting a leg that
+// hit one. Under its restart-forever default (max-consecutive-failures 0) such
+// a leg would otherwise refuse behind backoff indefinitely while the fleet
+// looked healthy. None of these is a coded (SLUICE-E-*) refusal: each exits 1
+// from a single command.
+
+// ErrSlotAckedPastTargetPosition classifies the Postgres warm-resume refusal
+// raised when the source replication slot's confirmed_flush_lsn is past the
+// position the target persisted (GC-41 (h)). A restart reads the same slot
+// and the same control row, so it refuses again until the operator re-copies
+// or acknowledges with `--accept-slot-acked-past-position`.
+var ErrSlotAckedPastTargetPosition = errors.New("SLOT-ACKED-PAST-TARGET-POSITION")
+
+// ErrShardedTargetVindexUpdate classifies the MySQL-family apply refusal
+// raised when vtgate refuses a change that assigns a primary-vindex column on
+// a sharded target (GC-41 (e)). The change sits after the persisted position,
+// so a restart re-delivers it and vtgate refuses it again.
+var ErrShardedTargetVindexUpdate = errors.New("SHARDED-TARGET-VINDEX-UPDATE")
+
+// ErrCharsetNotDecodable classifies the MySQL-family refusal of a value whose
+// declared character set has no faithful conversion to UTF-8. The value is in
+// the source row or binlog event a restart reads again.
+var ErrCharsetNotDecodable = errors.New("CHARSET-NOT-DECODABLE")
+
+// ErrDSNTimeZoneNotUTC classifies the MySQL-family refusal of a DSN whose
+// time_zone parameter is not UTC (GC-39). The DSN is configuration; a restart
+// reads the same one.
+var ErrDSNTimeZoneNotUTC = errors.New("DSN-TIME-ZONE-NOT-UTC")

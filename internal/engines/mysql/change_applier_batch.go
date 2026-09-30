@@ -216,7 +216,6 @@ func (a *ChangeApplier) batchConfig() *appliershared.BatchConfig {
 			b.marks.Committed(&a.marks)
 			return nil
 		},
-		// AfterCommit stays nil (MySQL has no slot-ack tracker).
 		// CacheSchemaSnapshot stays nil: SchemaSnapshots route through
 		// applyOne (TransactionalDDL=false), which owns the ADR-0049
 		// cache-after-commit update itself.

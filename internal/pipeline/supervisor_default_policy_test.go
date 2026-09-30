@@ -28,6 +28,7 @@ import (
 	"testing"
 	"time"
 
+	"sluicesync.dev/sluice/internal/applymarks"
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/logcapture"
 )
@@ -203,6 +204,66 @@ func TestSupervisor_OtherTerminalFailuresAreStillRestarted(t *testing.T) {
 	defer cancel()
 	_ = NewSupervisor([]SupervisedSync{sy}, policy).Run(ctx)
 	if attempts < 2 {
-		t.Errorf("a generic terminal failure was run %d time(s); want it restarted — the no-restart rule is scoped to UNFORWARDED-SCHEMA-CHANGE", attempts)
+		t.Errorf("a generic terminal failure was run %d time(s); want it restarted — the no-restart rule is scoped to "+
+			"UNFORWARDED-SCHEMA-CHANGE and refusalsARestartRepeats", attempts)
+	}
+}
+
+// TestSupervisor_RefusalsARestartRepeatsAreNotRestarted pins, one sentinel at
+// a time and at the shipped restart-forever default, that a leg ending on a
+// refusal a restart would repeat is run ONCE, marked failed, and logged with
+// its marker. Each case wraps the sentinel the way its engine does (inside a
+// terminal error, under a pipeline frame); APPLY-MARK-MISMATCH uses the real
+// applymarks.RefusalError, which matches through its Is method rather than a
+// %w chain. The roster floor keeps a new list entry from going unpinned.
+func TestSupervisor_RefusalsARestartRepeatsAreNotRestarted(t *testing.T) {
+	cases := map[string]error{
+		"SLOT-ACKED-PAST-TARGET-POSITION": fmt.Errorf("postgres: %w: replication slot \"s\": %w", ir.ErrSlotAckedPastTargetPosition, terminalTestErr{"refused"}),
+		"SHARDED-TARGET-VINDEX-UPDATE":    fmt.Errorf("%w: remedy: %w", ir.ErrShardedTargetVindexUpdate, terminalTestErr{"VT12001"}),
+		"APPLY-MARK-MISMATCH":             &applymarks.RefusalError{},
+		"CHARSET-NOT-DECODABLE":           fmt.Errorf("%w: table \"t\" column \"c\"", ir.ErrCharsetNotDecodable),
+		"DSN-TIME-ZONE-NOT-UTC":           fmt.Errorf("mysql: %w: refusing the DSN parameter time_zone=x", ir.ErrDSNTimeZoneNotUTC),
+	}
+
+	if len(cases) != len(refusalsARestartRepeats) {
+		t.Fatalf("%d cases for %d refusalsARestartRepeats entries; pin every entry", len(cases), len(refusalsARestartRepeats))
+	}
+	for _, sentinel := range refusalsARestartRepeats {
+		if _, ok := cases[sentinel.Error()]; !ok {
+			t.Errorf("refusalsARestartRepeats entry %q has no case", sentinel.Error())
+		}
+	}
+
+	for marker, refusal := range cases {
+		t.Run(marker, func(t *testing.T) {
+			prev := slog.Default()
+			t.Cleanup(func() { slog.SetDefault(prev) })
+			var logBuf logcapture.Buffer
+			slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, nil)))
+
+			var attempts int
+			sy := SupervisedSync{
+				ID: "refused",
+				Runner: runnerFunc(func(_ context.Context) error {
+					attempts++
+					return fmt.Errorf("pipeline: sync: %w", refusal)
+				}),
+			}
+			policy := RestartPolicy{BackoffBase: time.Millisecond, BackoffCap: 2 * time.Millisecond, HealthyRunThreshold: time.Hour}
+			ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+			defer cancel()
+			sup := NewSupervisor([]SupervisedSync{sy}, policy)
+			_ = sup.Run(ctx)
+
+			if attempts != 1 {
+				t.Errorf("%s was run %d times; want exactly 1 — every restart refuses again", marker, attempts)
+			}
+			if snap := sup.Snapshot(); len(snap) != 1 || snap[0].State != SyncFailed {
+				t.Errorf("snapshot = %+v; want the sync in state %q", snap, SyncFailed)
+			}
+			if !strings.Contains(logBuf.String(), "not restarting") || !strings.Contains(logBuf.String(), "marker="+marker) {
+				t.Errorf("no not-restarting line naming marker=%s; log:\n%s", marker, logBuf.String())
+			}
+		})
 	}
 }

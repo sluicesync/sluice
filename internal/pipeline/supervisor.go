@@ -530,11 +530,11 @@ func (s *Supervisor) superviseOne(ctx context.Context, sy SupervisedSync) {
 		// could only refuse again — and if that recording ever failed, the
 		// restart would take a fresh baseline and accept the refused change
 		// silently (the 2026-09-23 pre-tag review, F1). Scoped to this
-		// sentinel ON PURPOSE, not to every [ir.TerminalError]: several
-		// terminal errors are terminal only to the in-process retry and are
-		// recovered by exactly the fresh run this loop provides (a dead
-		// snapshot-pinned copy connection, an in-doubt raw-copy commit —
-		// both of whose own messages say "re-run").
+		// sentinel and [refusalsARestartRepeats] ON PURPOSE, not to every
+		// [ir.TerminalError]: several terminal errors are terminal only to
+		// the in-process retry and are recovered by exactly the fresh run
+		// this loop provides (a dead snapshot-pinned copy connection, an
+		// in-doubt raw-copy commit — both of whose own messages say "re-run").
 		if errors.Is(err, ir.ErrUnforwardedSchemaChange) {
 			args := make([]any, 0, 4)
 			args = append(args, slog.String("stream_id", sy.ID), slog.String("err", err.Error()))
@@ -543,6 +543,25 @@ func (s *Supervisor) superviseOne(ctx context.Context, sy SupervisedSync) {
 			// [syncUnforwardedRepairFor], shared with the startup door.
 			repair := syncUnforwardedRepairFor(err.Error())
 			slog.ErrorContext(ctx, "supervisor: sync refused an unforwarded schema change; not restarting ("+repair+", then start this leg once outside the fleet with --accept-unforwarded-schema-change set to the fingerprint the refusal prints; the fleet has no acknowledgement key)", args...)
+			s.setState(sy.ID, SyncFailed, err)
+			return
+		}
+
+		// The other refusals a restart repeats exactly: see
+		// [refusalsARestartRepeats] for the list and why it is a list.
+		if marker := refusalARestartRepeats(err); marker != nil {
+			args := make([]any, 0, 5)
+			args = append(
+				args,
+				slog.String("stream_id", sy.ID),
+				slog.String("marker", marker.Error()),
+				slog.String("err", err.Error()),
+			)
+			args = append(args, sluicecode.Attrs(err)...)
+			slog.ErrorContext(ctx, "supervisor: sync refused with a condition every restart would refuse again; not restarting "+
+				"(apply the remedy the error names; a remedy that needs a flag, such as --restart-from-scratch or "+
+				"--accept-slot-acked-past-position, is run once with `sync start` outside the fleet, which has no key for either)",
+				args...)
 			s.setState(sy.ID, SyncFailed, err)
 			return
 		}

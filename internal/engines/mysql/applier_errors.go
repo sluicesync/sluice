@@ -14,6 +14,7 @@ import (
 
 	gomysql "github.com/go-sql-driver/mysql"
 
+	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/nettransient"
 )
 
@@ -203,7 +204,9 @@ func isReadOnlyTargetSignal(err error) bool {
 // shardedTargetVindexUpdateMarker is the grep-stable token of the apply
 // refusal vtgate raises when a change would assign a primary-vindex column
 // on a sharded target (GC-41 (e)). The wrapped error keeps the dispatch
-// frame, which names the table; vtgate's own message names the vindex.
+// frame, which names the table; vtgate's own message names the vindex. The
+// refusal wraps [ir.ErrShardedTargetVindexUpdate], whose text is this marker,
+// so the fleet supervisor can see that a restart would refuse again.
 const shardedTargetVindexUpdateMarker = "SHARDED-TARGET-VINDEX-UPDATE"
 
 // vindexUpdateRemedy is the refusal's remedy text. It covers both shapes the
@@ -418,7 +421,7 @@ func classifyApplierError(err error) error {
 			// Idempotent: an error classified twice (a hook's classified
 			// error re-classified by the batch loop) is marked once.
 			if isVindexUpdateRefusal(mysqlErr.Message) && !strings.Contains(err.Error(), shardedTargetVindexUpdateMarker) {
-				return &terminalMySQLError{err: fmt.Errorf("%s: %s: %w", shardedTargetVindexUpdateMarker, vindexUpdateRemedy, err)}
+				return &terminalMySQLError{err: fmt.Errorf("%w: %s: %w", ir.ErrShardedTargetVindexUpdate, vindexUpdateRemedy, err)}
 			}
 		case 1062:
 			// Explicit non-retriable per ADR-0038 — reaches the

@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pglogrepl"
 
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
@@ -92,6 +93,12 @@ func TestStreamer_PostgresToMySQL_WarmResumeRefusesASlotAckedPastTheTarget(t *te
 	err := runBounded(t, newStreamer(""))
 	if err == nil || !strings.Contains(err.Error(), slotAckedPastMarker) {
 		t.Fatalf("warm resume with the slot acked past the target returned %v; want %s", err, slotAckedPastMarker)
+	}
+	// What Streamer.Run returns is what a fleet leg's supervisor sees: the
+	// sentinel must survive every wrap between the reader and here, or the
+	// leg would be restarted into the same refusal forever.
+	if refusalARestartRepeats(err) != ir.ErrSlotAckedPastTargetPosition { //nolint:errorlint // identity of the returned sentinel is the property
+		t.Errorf("the refusal Streamer.Run returned does not carry ir.ErrSlotAckedPastTargetPosition: %v", err)
 	}
 	for _, want := range []string{confirmed.String(), persisted.String(), slot, "--restart-from-scratch"} {
 		if !strings.Contains(err.Error(), want) {
@@ -187,6 +194,9 @@ func TestStreamer_PostgresToPostgres_WarmResumeRefusesASlotAckedPastTheTarget(t 
 		err := runBounded(t, newStreamer(id, 1000, 1, table))
 		if err == nil || !strings.Contains(err.Error(), slotAckedPastMarker) {
 			t.Fatalf("resume onto a slot recreated after the position returned %v; want %s", err, slotAckedPastMarker)
+		}
+		if refusalARestartRepeats(err) != ir.ErrSlotAckedPastTargetPosition { //nolint:errorlint // identity of the returned sentinel is the property
+			t.Errorf("the refusal Streamer.Run returned does not carry ir.ErrSlotAckedPastTargetPosition: %v", err)
 		}
 	})
 

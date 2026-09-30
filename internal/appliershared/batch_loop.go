@@ -109,8 +109,10 @@ const DefaultIdleFlushPeriod = 100 * time.Millisecond
 // flush triggers, rollback handling, commit ordering — is shared
 // control flow that lives in this package.
 //
-// All func fields except AfterCommit and CacheSchemaSnapshot are
-// required; ApplyOne is required only when TransactionalDDL is false.
+// All func fields except OnSourceTxCommit and IsKeylessTable are
+// required, with two by-path exceptions: ApplyOne is required only when
+// TransactionalDDL is false, and CacheSchemaSnapshot only when it is
+// true (that path calls it unguarded).
 type BatchConfig struct {
 	// EngineName prefixes every log line and error this loop emits
 	// ("mysql: applier: …", "postgres: applier: …") so operator-facing
