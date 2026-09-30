@@ -69,6 +69,18 @@ func (r *SchemaReader) EnsureHeartbeatTable(ctx context.Context, tableName strin
 		schema = "public"
 	}
 	tableRef := quoteIdent(schema) + "." + quoteIdent(tableName)
+	// Detect first (GC-40 (a)): PostgreSQL checks CREATE on the schema
+	// before it evaluates IF NOT EXISTS, so a source role holding only
+	// INSERT/DELETE on a heartbeat table an owner pre-created would
+	// otherwise take the permission-degrade path below and write no
+	// heartbeats at all.
+	present, err := relationPresent(ctx, r.db, tableRef)
+	if err != nil {
+		return fmt.Errorf("postgres: ensure heartbeat table %q: detect: %w", tableName, err)
+	}
+	if present {
+		return nil
+	}
 	ddl := `
 		CREATE TABLE IF NOT EXISTS ` + tableRef + ` (
 			id        BIGSERIAL    PRIMARY KEY,

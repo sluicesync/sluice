@@ -61,6 +61,17 @@ func openKeysetStore(ctx context.Context, dsn string) (redact.KeysetStore, error
 // TIMESTAMP stamps, composite PK (name, generation), one active row
 // per name. Idempotent.
 func (s *mysqlKeysetStore) EnsureKeysetTable(ctx context.Context) error {
+	// Detect first (GC-40 (a)): MySQL checks the CREATE privilege before
+	// IF NOT EXISTS, so a DML-only role — or a safe-migrations branch —
+	// would be refused on a table that is already there.
+	exists, err := controlTableExists(ctx, s.db, "", keysetTableName)
+	if err != nil {
+		return fmt.Errorf("mysql: ensure keyset table: %w", err)
+	}
+	if exists {
+		warnLegacyControlTableCollation(ctx, s.db, "", keysetTableName, "name")
+		return nil
+	}
 	ddl := keysetTableDDL()
 	if _, err := s.db.ExecContext(ctx, ddl); err != nil {
 		// The safe-migrations refusal is classified into the coded

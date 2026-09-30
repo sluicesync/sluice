@@ -32,6 +32,7 @@ var (
 	_ ir.CDCReaderWithSlotOpener        = Engine{}
 	_ ir.CDCSchemaSnapshotNormalizer    = Engine{}
 	_ ir.ConnectionSlotClassifier       = Engine{}
+	_ ir.ControlTableDDLProvider        = Engine{} // `sluice control-tables ddl --engine postgres` (GC-40 (a))
 	_ ir.CrossEngineExtensionTranslator = Engine{}
 	_ ir.DatabaseDSNDeriver             = Engine{}
 	_ ir.DatabaseLister                 = Engine{}

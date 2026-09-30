@@ -64,6 +64,16 @@ func wrapControlTableBootstrapError(err error, statement string) error {
 	)
 }
 
+// ControlTableDDLGuidance implements [ir.ControlTableDDLProvider]: the
+// PlanetScale safe-migrations recipe this set exists for.
+func (e Engine) ControlTableDDLGuidance() []string {
+	return []string{
+		"On a PlanetScale branch with safe migrations enabled, direct DDL is refused",
+		"(Error 1105), so ship each statement via a deploy request:",
+		"  sluice deploy-ddl --org <org> --database <db> --ddl '<statement>'",
+	}
+}
+
 // ControlTableDDL implements [ir.ControlTableDDLProvider]: the CREATE
 // statements for sluice's migrate-state and cdc-state control tables,
 // single-sourced from the same builders the Ensure* paths execute so

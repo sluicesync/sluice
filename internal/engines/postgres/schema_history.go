@@ -46,10 +46,8 @@ type schemaHistoryQueryer interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 }
 
-// ensureSchemaHistoryTable creates the per-target
-// sluice_cdc_schema_history table in the named schema if it doesn't
-// exist. Idempotent — second-and-later calls are no-ops courtesy of
-// CREATE TABLE IF NOT EXISTS. ADDITIVE: it never touches
+// schemaHistoryTable is the per-target sluice_cdc_schema_history table in
+// the named schema. ADDITIVE: it never touches
 // sluice_cdc_state or any existing data; a target that already has
 // cdc-state rows is unaffected.
 //
@@ -77,10 +75,12 @@ type schemaHistoryQueryer interface {
 // hazard force it) so the two stores stay structurally congruent and
 // the key derivation has a single source of truth. Natural columns
 // remain stored (NOT NULL) so the resolver round-trips the full anchor.
-func ensureSchemaHistoryTable(ctx context.Context, db *sql.DB, schema string) error {
-	tableRef := quoteIdent(schema) + "." + quoteIdent(schemaHistoryTableName)
-	ddl := `
-		CREATE TABLE IF NOT EXISTS ` + tableRef + ` (
+func schemaHistoryTable(schema string) controlTable {
+	return controlTable{
+		name:   schemaHistoryTableName,
+		schema: schema,
+		create: `
+		CREATE TABLE IF NOT EXISTS ` + quoteIdent(schema) + "." + quoteIdent(schemaHistoryTableName) + ` (
 			version_key     CHAR(64)     NOT NULL,
 			stream_id       VARCHAR(255) NOT NULL,
 			schema_name     VARCHAR(255) NOT NULL,
@@ -90,23 +90,20 @@ func ensureSchemaHistoryTable(ctx context.Context, db *sql.DB, schema string) er
 			source_engine   TEXT         NULL,
 			created_at      TIMESTAMP    NOT NULL DEFAULT (` + utcNowSQL + `),
 			PRIMARY KEY (version_key)
-		)`
-	if _, err := db.ExecContext(ctx, ddl); err != nil {
-		return fmt.Errorf("postgres: ensure schema-history table: %w", err)
+		)`,
+		// v0.70.0 tables pre-date the source_engine column (Bug 78 fix,
+		// v0.70.1). NULLABLE: legacy rows have NULL, the read path falls
+		// back to engineNamePostgres (the pre-fix behaviour, which is
+		// correct for same-engine streams — same-engine chain-restore
+		// worked pre-fix).
+		columns: []controlColumn{{"source_engine", "source_engine TEXT NULL"}},
 	}
-	// Migration path for v0.70.0 deployments whose
-	// sluice_cdc_schema_history table pre-dates the source_engine column
-	// (Bug 78 fix, v0.70.1). NULLABLE: legacy rows have NULL, the read
-	// path falls back to engineNamePostgres (the pre-fix behaviour, which
-	// is correct for same-engine streams — same-engine chain-restore
-	// worked pre-fix). ADD COLUMN IF NOT EXISTS is supported in every PG
-	// version sluice targets; mirrors the additive migrations in
-	// control_table.go.
-	alter := "ALTER TABLE " + tableRef + " ADD COLUMN IF NOT EXISTS source_engine TEXT NULL"
-	if _, err := db.ExecContext(ctx, alter); err != nil {
-		return fmt.Errorf("postgres: ensure schema-history table: add source_engine: %w", err)
-	}
-	return nil
+}
+
+// ensureSchemaHistoryTable brings sluice_cdc_schema_history to its current
+// shape, issuing only the DDL that is missing.
+func ensureSchemaHistoryTable(ctx context.Context, db *sql.DB, schema string) error {
+	return schemaHistoryTable(schema).ensure(ctx, db)
 }
 
 // writeSchemaVersion serializes t via the ADR-0049 decision-#1 codec

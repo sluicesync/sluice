@@ -363,10 +363,12 @@ func TestSourceIdentityColumnDeclaredOnBothEngines(t *testing.T) {
 		createDecl    string
 		idempotentAdd string
 	}{
+		// Postgres declares it as a controlTable column, which
+		// controlTable.ensure adds when missing (GC-40 (a)).
 		{
 			path:          "../engines/postgres/migration_state.go",
 			createDecl:    "source_identity TEXT",
-			idempotentAdd: "ADD COLUMN IF NOT EXISTS source_identity TEXT NULL",
+			idempotentAdd: `{"source_identity", "source_identity TEXT NULL"}`,
 		},
 		{
 			path:          "../engines/mysql/migration_state.go",

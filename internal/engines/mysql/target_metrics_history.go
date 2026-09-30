@@ -45,6 +45,17 @@ const targetMetricsHistoryTableName = "sluice_target_metrics_history"
 // Same MySQL-can't-CREATE-in-an-explicit-tx caveat as ensureControlTable —
 // run from the *sql.DB pool, not a per-change tx.
 func ensureTargetMetricsHistoryTable(ctx context.Context, db *sql.DB) error {
+	// Detect first (GC-40 (a)): MySQL checks the CREATE privilege before
+	// IF NOT EXISTS, so a DML-only role — or a safe-migrations branch —
+	// would be refused on a table that is already there.
+	exists, err := controlTableExists(ctx, db, "", targetMetricsHistoryTableName)
+	if err != nil {
+		return fmt.Errorf("mysql: ensure target-metrics-history table: %w", err)
+	}
+	if exists {
+		warnLegacyControlTableCollation(ctx, db, "", targetMetricsHistoryTableName, "stream_id")
+		return nil
+	}
 	ddl := targetMetricsHistoryTableDDL()
 	if _, err := db.ExecContext(ctx, ddl); err != nil {
 		// Coded bootstrap classification (roadmap item 66):

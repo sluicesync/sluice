@@ -32,9 +32,9 @@ import (
 
 const targetMetricsHistoryTableName = "sluice_target_metrics_history"
 
-// ensureTargetMetricsHistoryTable creates the per-target
-// sluice_target_metrics_history table in the named schema if it doesn't
-// exist. Idempotent. ADDITIVE: never touches sluice_cdc_state /
+// targetMetricsHistoryTable is the per-target
+// sluice_target_metrics_history table in the named schema.
+// ADDITIVE: never touches sluice_cdc_state /
 // schema_history / user data.
 //
 // id is a BIGSERIAL surrogate PK (rows are append-only; the natural
@@ -42,9 +42,13 @@ const targetMetricsHistoryTableName = "sluice_target_metrics_history"
 // connection columns are NULLABLE so the *Known=false "unobserved" case is
 // stored as NULL, not a misleading 0. Index on (stream_id, sampled_at) for
 // the ListTargetMetricsHistory ORDER BY sampled_at DESC LIMIT scan.
-func ensureTargetMetricsHistoryTable(ctx context.Context, db *sql.DB, schema string) error {
+func targetMetricsHistoryTable(schema string) controlTable {
 	tableRef := quoteIdent(schema) + "." + quoteIdent(targetMetricsHistoryTableName)
-	ddl := `
+	idxName := "idx_" + targetMetricsHistoryTableName + "_stream_sampled"
+	return controlTable{
+		name:   targetMetricsHistoryTableName,
+		schema: schema,
+		create: `
 		CREATE TABLE IF NOT EXISTS ` + tableRef + ` (
 			id                      BIGSERIAL    NOT NULL,
 			stream_id               VARCHAR(255) NOT NULL,
@@ -60,16 +64,18 @@ func ensureTargetMetricsHistoryTable(ctx context.Context, db *sql.DB, schema str
 			active_connections      INTEGER      NULL,
 			max_connections         INTEGER      NULL,
 			PRIMARY KEY (id)
-		)`
-	if _, err := db.ExecContext(ctx, ddl); err != nil {
-		return fmt.Errorf("postgres: ensure target-metrics-history table: %w", err)
+		)`,
+		indexes: []controlIndex{{
+			name: idxName,
+			ddl:  "CREATE INDEX IF NOT EXISTS " + idxName + " ON " + tableRef + " (stream_id, sampled_at)",
+		}},
 	}
-	idx := "CREATE INDEX IF NOT EXISTS idx_" + targetMetricsHistoryTableName + "_stream_sampled " +
-		"ON " + tableRef + " (stream_id, sampled_at)"
-	if _, err := db.ExecContext(ctx, idx); err != nil {
-		return fmt.Errorf("postgres: ensure target-metrics-history index: %w", err)
-	}
-	return nil
+}
+
+// ensureTargetMetricsHistoryTable brings the history table and its index to
+// their current shape, issuing only the DDL that is missing.
+func ensureTargetMetricsHistoryTable(ctx context.Context, db *sql.DB, schema string) error {
+	return targetMetricsHistoryTable(schema).ensure(ctx, db)
 }
 
 // EnsureTargetMetricsHistory implements [ir.TargetMetricsHistoryStore].

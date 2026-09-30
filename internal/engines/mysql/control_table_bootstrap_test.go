@@ -278,6 +278,18 @@ func TestEnsurePathsIssueZeroDDLWhenCurrent(t *testing.T) {
 		{"migrate state", func(ctx context.Context, db *sql.DB) error {
 			return newMigrationStateStore(db, upsertRowAlias).EnsureControlTable(ctx)
 		}},
+		{"skipped tables", func(ctx context.Context, db *sql.DB) error {
+			return ensureSkippedTablesTable(ctx, db, "")
+		}},
+		// GC-40 (a): the three sites that still issued an unconditional
+		// CREATE TABLE IF NOT EXISTS.
+		{"keysets", func(ctx context.Context, db *sql.DB) error {
+			return (&mysqlKeysetStore{db: db}).EnsureKeysetTable(ctx)
+		}},
+		{"target metrics history", ensureTargetMetricsHistoryTable},
+		{"heartbeat", func(ctx context.Context, db *sql.DB) error {
+			return (&SchemaReader{db: db}).EnsureHeartbeatTable(ctx, "sluice_heartbeat")
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -174,13 +174,62 @@ func TestControlTablesDDLCmd_PrintsBootstrapSet(t *testing.T) {
 }
 
 // TestControlTablesDDLCmd_RefusesEngineWithoutTheSurface pins the
-// capability refusal: postgres does not (yet) publish control-table
-// DDL, and the refusal names the supported family instead of printing
-// nothing.
+// capability refusal: sqlite does not publish control-table DDL, and the
+// refusal names the supported engines instead of printing nothing.
 func TestControlTablesDDLCmd_RefusesEngineWithoutTheSurface(t *testing.T) {
-	c := parseInto(t, "control-tables", "ddl", "--engine=postgres").ControlTables.DDL
+	c := parseInto(t, "control-tables", "ddl", "--engine=sqlite").ControlTables.DDL
 	err := c.Run()
 	if err == nil || !strings.Contains(err.Error(), "does not publish") {
-		t.Fatalf("Run with postgres = %v; want the capability refusal", err)
+		t.Fatalf("Run with sqlite = %v; want the capability refusal", err)
+	}
+}
+
+// TestControlTablesDDLCmd_PostgresPrintsTheFullShape pins the GC-40 (a)
+// Postgres printer through the real CLI parse: every control table a run
+// ensures, each CREATE followed by the ADD COLUMN statements later releases
+// added (so tables an owner creates from this output are already current,
+// and a DML-only role then starts without DDL), under the Postgres guidance
+// rather than the PlanetScale recipe.
+func TestControlTablesDDLCmd_PostgresPrintsTheFullShape(t *testing.T) {
+	c := parseInto(t, "control-tables", "ddl", "--engine=postgres").ControlTables.DDL
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	captured := make(chan string, 1)
+	go func() {
+		raw, _ := io.ReadAll(r)
+		captured <- string(raw)
+	}()
+	orig := os.Stdout
+	os.Stdout = w
+	runErr := c.Run()
+	os.Stdout = orig
+	_ = w.Close()
+	out := <-captured
+	if runErr != nil {
+		t.Fatalf("Run: %v", runErr)
+	}
+	for _, want := range []string{
+		"-- Run as the tables' owner",
+		`CREATE TABLE IF NOT EXISTS "public"."sluice_cdc_state"`,
+		`ALTER TABLE "public"."sluice_cdc_state" ADD COLUMN IF NOT EXISTS rows_applied BIGINT NOT NULL DEFAULT 0;`,
+		`ALTER TABLE "public"."sluice_cdc_state" ADD COLUMN IF NOT EXISTS unforwarded_refusal TEXT NULL;`,
+		`CREATE TABLE IF NOT EXISTS "public"."sluice_cdc_apply_marks"`,
+		"-- sluice_migrate_state\n",
+		"-- sluice_migrate_table_progress\n",
+		"-- sluice_cdc_schema_history\n",
+		"-- sluice_shard_consolidation_lease\n",
+		"-- sluice_cdc_skipped_tables\n",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "deploy-ddl") {
+		t.Errorf("the Postgres set carries the PlanetScale deploy-ddl recipe:\n%s", out)
+	}
+	if got := strings.Count(out, "CREATE TABLE IF NOT EXISTS"); got != 7 {
+		t.Errorf("CREATE statements = %d; want 7", got)
 	}
 }

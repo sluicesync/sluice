@@ -23,35 +23,32 @@ func markUnforwardedRefusal(err error) error {
 }
 
 // ensureUnforwardedRefusalColumn adds sluice_cdc_state's unforwarded_refusal
-// column when missing. Called from [ensureControlTable] and again from
-// [ChangeApplier.RecordUnforwardedRefusal] — a refusal must land even on a
+// column when missing. [ensureControlTable] adds it with the rest of
+// [cdcStateTable]'s columns; this entry point is for
+// [ChangeApplier.RecordUnforwardedRefusal] and
+// [ChangeApplier.EnsureUnforwardedRefusalStorage] — a refusal must land even on a
 // control table this binary never ensured (a `--schema-already-applied` run
 // skips EnsureControlTable), because a refusal that fails to persist is
 // accepted by the next restart.
+//
+// Detect FIRST ([controlTable.ensureColumns]). PostgreSQL checks table
+// ownership before it evaluates IF NOT EXISTS, so an unconditional ALTER
+// fails with "must be owner of table" for a DML-only role even when the
+// column is already there (measured on PG 16) — the
+// `--schema-already-applied` setup, with the control table pre-created by
+// another role, is exactly that role. An ALTER that failed here meant the
+// refusal was never recorded and the next restart accepted the change
+// (2026-09-23 pre-tag review, second pass, finding 1). A control table that
+// does not exist at all is refused by name (GC-40 (a)/(b)), not with the
+// ALTER's bare "relation … does not exist".
 func ensureUnforwardedRefusalColumn(ctx context.Context, db *sql.DB, schema string) error {
-	// Detect FIRST. PostgreSQL checks table ownership before it evaluates
-	// IF NOT EXISTS, so an unconditional ALTER fails with "must be owner of
-	// table" for a DML-only role even when the column is already there
-	// (measured on PG 16) — the `--schema-already-applied` setup, with the
-	// control table pre-created by another role, is exactly that role. An
-	// ALTER that failed here meant the refusal was never recorded and the
-	// next restart accepted the change (2026-09-23 pre-tag review, second
-	// pass, finding 1).
-	var present bool
-	if err := db.QueryRowContext(ctx, `SELECT EXISTS (
-		SELECT 1 FROM pg_catalog.pg_attribute
-		WHERE attrelid = pg_catalog.to_regclass($1) AND attname = $2 AND NOT attisdropped)`,
-		controlTableRef(schema), appliershared.UnforwardedRefusalColumn).Scan(&present); err != nil {
-		return fmt.Errorf("postgres: ensure control table: detect %s: %w", appliershared.UnforwardedRefusalColumn, err)
-	}
-	if present {
-		return nil
-	}
-	alter := "ALTER TABLE " + controlTableRef(schema) + " ADD COLUMN IF NOT EXISTS " + appliershared.UnforwardedRefusalColumn + " TEXT NULL"
-	if _, err := db.ExecContext(ctx, alter); err != nil {
-		return fmt.Errorf("postgres: ensure control table: add %s: %w", appliershared.UnforwardedRefusalColumn, err)
-	}
-	return nil
+	return cdcStateTable(schema).ensureColumns(ctx, db, []controlColumn{unforwardedRefusalColumn})
+}
+
+// unforwardedRefusalColumn is sluice_cdc_state's persisted-refusal column.
+var unforwardedRefusalColumn = controlColumn{
+	name: appliershared.UnforwardedRefusalColumn,
+	def:  appliershared.UnforwardedRefusalColumn + " TEXT NULL",
 }
 
 // RecordUnforwardedRefusal implements [ir.UnforwardedRefusalStore].

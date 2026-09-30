@@ -4861,26 +4861,35 @@ type BackfillExecutorOpener interface {
 }
 
 // ControlTableStatement names one sluice control table together with
-// the exact CREATE statement the engine executes to create it.
+// one exact DDL statement the engine executes for it.
 type ControlTableStatement struct {
 	// Table is the control table's unqualified name (e.g.
 	// "sluice_cdc_state").
 	Table string
 
-	// DDL is the CREATE statement, byte-identical to what the engine's
-	// own Ensure* path executes — single-sourced so the printed
-	// bootstrap DDL can never drift from what sluice would create.
+	// DDL is the statement, byte-identical to what the engine's own
+	// Ensure* path executes — single-sourced so the printed bootstrap
+	// DDL can never drift from what sluice would create. The MySQL
+	// family prints one CREATE per table; Postgres prints each table's
+	// CREATE followed by the ADD COLUMN / CREATE INDEX statements later
+	// releases added, all idempotent.
 	DDL string
 }
 
 // ControlTableDDLProvider is the optional engine surface behind
-// `sluice control-tables ddl`: it renders the CREATE statements for
-// sluice's own control tables (migrate-state + cdc-state) so an
-// operator can pre-create them through a governed channel when the
-// target refuses direct DDL — the PlanetScale safe-migrations
-// bootstrap (ship each statement via `sluice deploy-ddl`). Same shape
-// as [MigrationStateStoreOpener]: optional, type-asserted at the call
-// site. The MySQL family (all flavors) implements it.
+// `sluice control-tables ddl`: it renders the statements for sluice's
+// own control tables (migrate-state + cdc-state) so an operator can
+// create them ahead of a run — through a governed channel when the
+// target refuses direct DDL (the PlanetScale safe-migrations bootstrap,
+// shipping each statement via `sluice deploy-ddl`), or as the owner on
+// a Postgres target whose sync role holds only DML (GC-40 (a)). Same
+// shape as [MigrationStateStoreOpener]: optional, type-asserted at the
+// call site. The MySQL family (all flavors) and Postgres implement it.
 type ControlTableDDLProvider interface {
 	ControlTableDDL() []ControlTableStatement
+
+	// ControlTableDDLGuidance is the engine's comment lines for the head
+	// of the printed set (without the leading "-- "): how the statements
+	// are meant to be applied on that engine.
+	ControlTableDDLGuidance() []string
 }

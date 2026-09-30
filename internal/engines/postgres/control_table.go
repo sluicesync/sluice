@@ -90,109 +90,69 @@ func shardLeaseTableRef(schema string) string {
 	return quoteIdent(schema) + "." + quoteIdent(shardConsolidationLeaseTableName)
 }
 
-// ensureControlTable creates the per-target sluice_cdc_state table
-// in the named schema if it doesn't exist. Idempotent — second-and-
-// later calls are no-ops courtesy of CREATE TABLE IF NOT EXISTS.
+// cdcStateTable is the per-target sluice_cdc_state table in the named
+// schema. Postgres has namespaced schemas, so the table lives in the
+// schema passed in (taken from the DSN's `schema` query parameter,
+// default "public"); the Streamer reads it from the engine config and
+// threads it through.
 //
-// Postgres has namespaced schemas, so the table lives in the schema
-// passed in (taken from the DSN's `schema` query parameter, default
-// "public"). The Streamer reads the schema from the engine config
-// and threads it through.
-//
-// The stop_requested_at column is added with ADD COLUMN IF NOT
-// EXISTS so v0.2.x deployments that pre-date the column pick it up
-// transparently on the next call. Existing rows keep their data;
-// the new column starts NULL (i.e. "no stop requested").
-func ensureControlTable(ctx context.Context, db *sql.DB, schema string) error {
-	tableRef := controlTableRef(schema)
-	ddl := `
-		CREATE TABLE IF NOT EXISTS ` + tableRef + ` (
+// The columns after the CREATE are the migration path for tables an
+// older release created; each is added only when missing
+// ([controlTable.ensure]), and existing rows keep their data.
+func cdcStateTable(schema string) controlTable {
+	return controlTable{
+		name:   controlTableName,
+		schema: schema,
+		create: `
+		CREATE TABLE IF NOT EXISTS ` + controlTableRef(schema) + ` (
 			stream_id         VARCHAR(255) NOT NULL,
 			source_position   TEXT         NOT NULL,
 			updated_at        TIMESTAMP    NOT NULL DEFAULT (` + utcNowSQL + `),
 			stop_requested_at TIMESTAMP    NULL,
 			PRIMARY KEY (stream_id)
-		)`
-	if _, err := db.ExecContext(ctx, ddl); err != nil {
-		return fmt.Errorf("postgres: ensure control table: %w", err)
+		)`,
+		columns: []controlColumn{
+			// Pre-`sync stop` deployments. NULL is "no stop requested".
+			{"stop_requested_at", "stop_requested_at TIMESTAMP NULL"},
+			// Pre-Phase-2 (v0.24.0): lets `sluice schema add-table
+			// --no-drain` recover the active stream's slot name without
+			// operator input. NULL on legacy rows; the position-write path
+			// UPSERTs the streamer's resolved slot name on every apply tx.
+			{"slot_name", "slot_name TEXT NULL"},
+			// Pre-ADR-0176-prerequisite: slot_name's exact sibling — the
+			// publication the stream reads through, so a warm resume
+			// ratchets onto the SAME publication it cold-started with. NULL
+			// on legacy rows (== "engine default `sluice_pub`").
+			{"publication_name", "publication_name TEXT NULL"},
+			// Pre-D0-2 (audit 2026-07-23): the canonical hash of the
+			// `--where` subset PUSHED into the publication row filter, so
+			// `sync start` refuses loudly when the current flags drift from
+			// what the server filters on. NULL on legacy rows (== "not
+			// recorded; drift unknown — allow").
+			{"row_filter_hash", "row_filter_hash TEXT NULL"},
+			// Pre-v0.25.0: stream-id collision detection (ADR-0031), the
+			// truncated SHA-256 of the source DSN's host+port+database.
+			{"source_dsn_fingerprint", "source_dsn_fingerprint TEXT NULL"},
+			// Pre-v0.25.1: the operator's `--target-schema NAME` (ADR-0031),
+			// so a later `sluice schema add-table` knows which namespace the
+			// active stream routes to. NULL == "the DSN default". Bug 46.
+			{"target_schema", "target_schema TEXT NULL"},
+			// Pre-ADR-0156-phase-2: the lifetime cumulative rows-applied
+			// counter behind `sync start`'s live panel. DEFAULT 0 backfills
+			// legacy rows (pre-upgrade applies were never tracked).
+			{"rows_applied", "rows_applied BIGINT NOT NULL DEFAULT 0"},
+			// The persisted UNFORWARDED-SCHEMA-CHANGE refusal, so a
+			// restarted stream refuses again instead of re-baselining past
+			// the change. NULL == "no refusal recorded".
+			unforwardedRefusalColumn,
+		},
 	}
-	// Migration path for pre-`sync stop` deployments: the CREATE
-	// TABLE IF NOT EXISTS above is a no-op on existing tables, so
-	// the new column has to be added explicitly. ADD COLUMN IF NOT
-	// EXISTS is supported in every PG version sluice targets.
-	alter := "ALTER TABLE " + tableRef + " ADD COLUMN IF NOT EXISTS stop_requested_at TIMESTAMP NULL"
-	if _, err := db.ExecContext(ctx, alter); err != nil {
-		return fmt.Errorf("postgres: ensure control table: add stop_requested_at: %w", err)
-	}
-	// Migration path for pre-Phase-2 (v0.24.0) deployments: the
-	// slot_name column lets `sluice schema add-table --no-drain`
-	// recover the active stream's slot name without operator input.
-	// NULL on legacy rows; the position-write path UPSERTs the
-	// streamer's resolved slot name on every apply tx.
-	alter = "ALTER TABLE " + tableRef + " ADD COLUMN IF NOT EXISTS slot_name TEXT NULL"
-	if _, err := db.ExecContext(ctx, alter); err != nil {
-		return fmt.Errorf("postgres: ensure control table: add slot_name: %w", err)
-	}
-	// Migration path for pre-ADR-0176-prerequisite deployments: the
-	// publication_name column is slot_name's exact sibling — it records
-	// the publication the stream reads through, so a warm resume can
-	// ratchet onto the SAME publication the stream cold-started with
-	// without the operator re-passing --publication-name. NULL on
-	// legacy rows (== "engine default `sluice_pub`", byte-identical to
-	// pre-column behaviour); the position-write path UPSERTs the
-	// streamer's effective publication name on every apply tx.
-	alter = "ALTER TABLE " + tableRef + " ADD COLUMN IF NOT EXISTS publication_name TEXT NULL"
-	if _, err := db.ExecContext(ctx, alter); err != nil {
-		return fmt.Errorf("postgres: ensure control table: add publication_name: %w", err)
-	}
-	// Migration path for pre-D0-2 (audit 2026-07-23) deployments: the
-	// row_filter_hash column is publication_name's exact sibling — it
-	// records the canonical hash of the `--where` subset PUSHED into the
-	// publication row filter (durable source-side state a warm resume
-	// never re-ensures), so `sync start` can refuse loudly when the
-	// current flags drift from what the server is filtering on. NULL on
-	// legacy rows (== "not recorded; drift unknown — allow"); the
-	// position-write path UPSERTs the streamer's current hash on every
-	// apply tx.
-	alter = "ALTER TABLE " + tableRef + " ADD COLUMN IF NOT EXISTS row_filter_hash TEXT NULL"
-	if _, err := db.ExecContext(ctx, alter); err != nil {
-		return fmt.Errorf("postgres: ensure control table: add row_filter_hash: %w", err)
-	}
-	// Migration path for pre-v0.25.0 deployments: the
-	// source_dsn_fingerprint column powers stream-id collision
-	// detection (ADR-0031). NULL on legacy rows; the streamer's
-	// startup write upserts the truncated SHA-256 of the source
-	// DSN's host+port+database tuple on every apply tx.
-	alter = "ALTER TABLE " + tableRef + " ADD COLUMN IF NOT EXISTS source_dsn_fingerprint TEXT NULL"
-	if _, err := db.ExecContext(ctx, alter); err != nil {
-		return fmt.Errorf("postgres: ensure control table: add source_dsn_fingerprint: %w", err)
-	}
-	// Migration path for pre-v0.25.1 deployments: the target_schema
-	// column records the operator-supplied `--target-schema NAME`
-	// (ADR-0031) on each position-write so a later
-	// `sluice schema add-table` knows which namespace the active
-	// stream's CDC applier is routing events to. NULL on legacy
-	// rows / streams that didn't pass --target-schema (treated as
-	// "use the DSN default schema"). Bug 46.
-	alter = "ALTER TABLE " + tableRef + " ADD COLUMN IF NOT EXISTS target_schema TEXT NULL"
-	if _, err := db.ExecContext(ctx, alter); err != nil {
-		return fmt.Errorf("postgres: ensure control table: add target_schema: %w", err)
-	}
-	// Migration path for pre-ADR-0156-phase-2 deployments: the
-	// rows_applied column is the lifetime cumulative row-level-DML-applied
-	// counter surfaced in `sync start`'s live panel. NOT NULL DEFAULT 0
-	// backfills legacy rows to 0 (an honest cumulative starting point —
-	// pre-upgrade applies were never tracked). ADD COLUMN IF NOT EXISTS is
-	// supported in every PG version sluice targets.
-	alter = "ALTER TABLE " + tableRef + " ADD COLUMN IF NOT EXISTS rows_applied BIGINT NOT NULL DEFAULT 0"
-	if _, err := db.ExecContext(ctx, alter); err != nil {
-		return fmt.Errorf("postgres: ensure control table: add rows_applied: %w", err)
-	}
-	// Migration path for deployments that pre-date the persisted refusal:
-	// the unforwarded_refusal column holds an UNFORWARDED-SCHEMA-CHANGE
-	// refusal so a restarted stream refuses again instead of re-baselining
-	// past the change. NULL on legacy rows (== "no refusal recorded").
-	return ensureUnforwardedRefusalColumn(ctx, db, schema)
+}
+
+// ensureControlTable brings sluice_cdc_state to its current shape,
+// issuing only the DDL that is missing ([controlTable.ensure]; GC-40 (a)).
+func ensureControlTable(ctx context.Context, db *sql.DB, schema string) error {
+	return cdcStateTable(schema).ensure(ctx, db)
 }
 
 // skippedTablesTableRef is controlTableRef's counterpart for the
@@ -201,11 +161,10 @@ func skippedTablesTableRef(schema string) string {
 	return quoteIdent(schema) + "." + quoteIdent(skippedTablesTableName)
 }
 
-// ensureSkippedTablesTable creates the audit-C-11 skip ledger in the
-// named schema if it doesn't exist. Idempotent; strictly additive — it
-// never touches sluice_cdc_state data. The table is written only when
-// a stream actually carries changes for a table the target lacks, so
-// on a healthy sync it is created empty and never grows.
+// skippedTablesTable is the audit-C-11 skip ledger. Strictly additive —
+// it never touches sluice_cdc_state data. The table is written only when
+// a stream actually carries changes for a table the target lacks, so on
+// a healthy sync it is created empty and never grows.
 //
 // Column notes: (stream_id, table_name) mirror sluice_cdc_state's
 // VARCHAR(255) key-column convention (ADR-0007 — MySQL PK-width
@@ -213,8 +172,11 @@ func skippedTablesTableRef(schema string) string {
 // first_position / last_position hold the engine-opaque source
 // position tokens VERBATIM (TEXT — a persisted round-trip surface,
 // never parsed on this path).
-func ensureSkippedTablesTable(ctx context.Context, db *sql.DB, schema string) error {
-	ddl := `
+func skippedTablesTable(schema string) controlTable {
+	return controlTable{
+		name:   skippedTablesTableName,
+		schema: schema,
+		create: `
 		CREATE TABLE IF NOT EXISTS ` + skippedTablesTableRef(schema) + ` (
 			stream_id        VARCHAR(255) NOT NULL,
 			table_name       VARCHAR(255) NOT NULL,
@@ -224,11 +186,13 @@ func ensureSkippedTablesTable(ctx context.Context, db *sql.DB, schema string) er
 			first_skipped_at TIMESTAMP    NOT NULL DEFAULT (` + utcNowSQL + `),
 			last_skipped_at  TIMESTAMP    NOT NULL DEFAULT (` + utcNowSQL + `),
 			PRIMARY KEY (stream_id, table_name)
-		)`
-	if _, err := db.ExecContext(ctx, ddl); err != nil {
-		return fmt.Errorf("postgres: ensure skipped-tables table: %w", err)
+		)`,
 	}
-	return nil
+}
+
+// ensureSkippedTablesTable creates the skip ledger when it is absent.
+func ensureSkippedTablesTable(ctx context.Context, db *sql.DB, schema string) error {
+	return skippedTablesTable(schema).ensure(ctx, db)
 }
 
 // upsertSkippedTable folds ONE COALESCED batch of skips (audit H-4) into
@@ -446,10 +410,8 @@ func selectShardLease(ctx context.Context, db *sql.DB, schema, tableName string)
 	return appliershared.SelectShardLease(ctx, db, controlCfg, q, tableName)
 }
 
-// ensureShardConsolidationLeaseTable creates the per-target
-// sluice_shard_consolidation_lease control table (ADR-0054 §1) in the
-// named schema if it doesn't exist. Idempotent — second-and-later
-// calls are no-ops courtesy of CREATE TABLE IF NOT EXISTS. ADDITIVE:
+// shardConsolidationLeaseTable is the per-target
+// sluice_shard_consolidation_lease control table (ADR-0054 §1). ADDITIVE:
 // never touches sluice_cdc_state, sluice_cdc_schema_history, or any
 // existing data.
 //
@@ -459,10 +421,12 @@ func selectShardLease(ctx context.Context, db *sql.DB, schema, tableName string)
 // mutex semantics, and the heartbeat goroutine extends expires_at on
 // the holder's RetryPeriod cadence. See ADR-0054 §1 for the state
 // machine and §2 for the timing defaults.
-func ensureShardConsolidationLeaseTable(ctx context.Context, db *sql.DB, schema string) error {
-	tableRef := shardLeaseTableRef(schema)
-	ddl := `
-		CREATE TABLE IF NOT EXISTS ` + tableRef + ` (
+func shardConsolidationLeaseTable(schema string) controlTable {
+	return controlTable{
+		name:   shardConsolidationLeaseTableName,
+		schema: schema,
+		create: `
+		CREATE TABLE IF NOT EXISTS ` + shardLeaseTableRef(schema) + ` (
 			target_table_full_name        VARCHAR(512) NOT NULL,
 			lease_holder_stream_id        VARCHAR(64)  NULL,
 			lease_expires_at              TIMESTAMP    NULL,
@@ -474,26 +438,21 @@ func ensureShardConsolidationLeaseTable(ctx context.Context, db *sql.DB, schema 
 			anchor_position               TEXT         NULL,
 			source_engine                 TEXT         NULL,
 			PRIMARY KEY (target_table_full_name)
-		)`
-	if _, err := db.ExecContext(ctx, ddl); err != nil {
-		return fmt.Errorf("postgres: ensure shard consolidation lease table: %w", err)
+		)`,
+		// v0.75.0 tables pre-date the v0.76.0 anchor columns. Task #21 (lease
+		// GC sweep) reads anchor_position; legacy rows have NULL and are
+		// defensively retained by the sweeper.
+		columns: []controlColumn{
+			{"anchor_position", "anchor_position TEXT NULL"},
+			{"source_engine", "source_engine TEXT NULL"},
+		},
 	}
-	// Migration path for v0.75.0 deployments whose
-	// sluice_shard_consolidation_lease table pre-dates the v0.76.0
-	// anchor columns. ADD COLUMN IF NOT EXISTS is supported in every
-	// PG version sluice targets; mirrors the additive migrations on
-	// sluice_cdc_state + sluice_cdc_schema_history. Task #21 (lease GC
-	// sweep) reads anchor_position; legacy rows have NULL and are
-	// defensively retained by the sweeper.
-	for _, alter := range []string{
-		"ALTER TABLE " + tableRef + " ADD COLUMN IF NOT EXISTS anchor_position TEXT NULL",
-		"ALTER TABLE " + tableRef + " ADD COLUMN IF NOT EXISTS source_engine TEXT NULL",
-	} {
-		if _, err := db.ExecContext(ctx, alter); err != nil {
-			return fmt.Errorf("postgres: ensure shard consolidation lease table: add anchor columns: %w", err)
-		}
-	}
-	return nil
+}
+
+// ensureShardConsolidationLeaseTable brings the lease table to its current
+// shape, issuing only the DDL that is missing.
+func ensureShardConsolidationLeaseTable(ctx context.Context, db *sql.DB, schema string) error {
+	return shardConsolidationLeaseTable(schema).ensure(ctx, db)
 }
 
 // readPosition returns the persisted source_position for streamID,

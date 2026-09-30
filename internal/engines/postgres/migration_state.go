@@ -30,7 +30,6 @@ package postgres
 import (
 	"context"
 	"database/sql"
-	"fmt"
 
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/migratestate"
@@ -187,24 +186,22 @@ func (s *MigrationStateStore) Close() error {
 	return s.db.Close()
 }
 
-// EnsureControlTable creates the per-target migrate-state tables in
-// the configured schema if they don't exist, and adds the ADR-0082
-// state_format column to a header table created by a ≤v0.99.x
-// binary. Idempotent — safe to call on every start.
+// migrateStateTables are the per-target migrate-state header and progress
+// tables in schema, as [controlTable.ensure] guarantees them.
 //
-// state_format DEFAULT 1: an existing row that pre-dates the column
-// reads back as FormatLegacyBlob, which is exactly what it is — Read
-// detects it and the first write upgrades it to per-table progress
-// rows.
-func (s *MigrationStateStore) EnsureControlTable(ctx context.Context) error {
-	hdr := quoteIdent(s.schema) + "." + quoteIdent(migrateStateTableName)
-	prog := quoteIdent(s.schema) + "." + quoteIdent(migrateProgressTableName)
-	// Timestamp defaults use timezone('utc', now()) — naive UTC digits —
-	// not CURRENT_TIMESTAMP, whose session-TZ cast skews the read-back
-	// (M1.3; see the UpsertHeader comment). The upserts always supply
-	// both columns explicitly, so the defaults only matter for rows
-	// written by hand or by future statements that omit them.
-	hdrDDL := `
+// Timestamp defaults use timezone('utc', now()) — naive UTC digits — not
+// CURRENT_TIMESTAMP, whose session-TZ cast skews the read-back (M1.3; see
+// the UpsertHeader comment). The upserts always supply both columns
+// explicitly, so the defaults only matter for rows written by hand or by
+// future statements that omit them.
+func migrateStateTables(schema string) []controlTable {
+	hdr := quoteIdent(schema) + "." + quoteIdent(migrateStateTableName)
+	prog := quoteIdent(schema) + "." + quoteIdent(migrateProgressTableName)
+	return []controlTable{
+		{
+			name:   migrateStateTableName,
+			schema: schema,
+			create: `
 		CREATE TABLE IF NOT EXISTS ` + hdr + ` (
 			migration_id    VARCHAR(255) NOT NULL,
 			phase           VARCHAR(32)  NOT NULL,
@@ -217,45 +214,51 @@ func (s *MigrationStateStore) EnsureControlTable(ctx context.Context) error {
 			copy_shape      TEXT         NULL,
 			source_identity TEXT         NULL,
 			PRIMARY KEY (migration_id)
-		)`
-	if _, err := s.db.ExecContext(ctx, hdrDDL); err != nil {
-		return fmt.Errorf("postgres: ensure migrate-state table: %w", err)
-	}
-	addFormat := "ALTER TABLE " + hdr +
-		" ADD COLUMN IF NOT EXISTS state_format INT NOT NULL DEFAULT 1"
-	if _, err := s.db.ExecContext(ctx, addFormat); err != nil {
-		return fmt.Errorf("postgres: ensure migrate-state table: add state_format: %w", err)
-	}
-	// snapshot_anchor + copy_shape (A0909-STOP-1): NULLable and
-	// defaultless, so an existing row keeps reading as "nothing
-	// recorded" — which is what it is. Same additive shape as
-	// state_format above. The two are always written together; they are
-	// separate columns rather than one because an operator inspecting
-	// the row in psql should be able to read the position without
-	// parsing a fingerprint out of it.
-	// source_identity (A0915-STATE-MEDIUM-1) joins them on the same
-	// additive terms: NULLable and defaultless, so a row an older binary
-	// wrote keeps reading as "no identity recorded" — which is the truth
-	// about it, and what the resume door WARNs on rather than refusing.
-	for _, add := range []string{
-		"ALTER TABLE " + hdr + " ADD COLUMN IF NOT EXISTS snapshot_anchor TEXT NULL",
-		"ALTER TABLE " + hdr + " ADD COLUMN IF NOT EXISTS copy_shape TEXT NULL",
-		"ALTER TABLE " + hdr + " ADD COLUMN IF NOT EXISTS source_identity TEXT NULL",
-	} {
-		if _, err := s.db.ExecContext(ctx, add); err != nil {
-			return fmt.Errorf("postgres: ensure migrate-state table: %s: %w", add, err)
-		}
-	}
-	progDDL := `
+		)`,
+			columns: []controlColumn{
+				// ADR-0082, for a header created by a ≤v0.99.x binary. DEFAULT
+				// 1: a row that pre-dates the column reads back as
+				// FormatLegacyBlob, which is exactly what it is — Read detects
+				// it and the first write upgrades it to per-table progress rows.
+				{"state_format", "state_format INT NOT NULL DEFAULT 1"},
+				// snapshot_anchor + copy_shape (A0909-STOP-1): NULLable and
+				// defaultless, so an existing row keeps reading as "nothing
+				// recorded" — which is what it is. The two are always written
+				// together; they are separate columns so an operator in psql
+				// can read the position without parsing a fingerprint out of
+				// it. source_identity (A0915-STATE-MEDIUM-1) joins them on the
+				// same terms: a row an older binary wrote reads as "no
+				// identity recorded", which the resume door WARNs on rather
+				// than refusing.
+				{"snapshot_anchor", "snapshot_anchor TEXT NULL"},
+				{"copy_shape", "copy_shape TEXT NULL"},
+				{"source_identity", "source_identity TEXT NULL"},
+			},
+		},
+		{
+			name:   migrateProgressTableName,
+			schema: schema,
+			create: `
 		CREATE TABLE IF NOT EXISTS ` + prog + ` (
 			migration_id    VARCHAR(255) NOT NULL,
 			table_name      VARCHAR(255) NOT NULL,
 			progress        TEXT         NOT NULL,
 			updated_at      TIMESTAMP    NOT NULL DEFAULT (pg_catalog.timezone('utc', pg_catalog.now())),
 			PRIMARY KEY (migration_id, table_name)
-		)`
-	if _, err := s.db.ExecContext(ctx, progDDL); err != nil {
-		return fmt.Errorf("postgres: ensure migrate-state progress table: %w", err)
+		)`,
+		},
+	}
+}
+
+// EnsureControlTable brings the per-target migrate-state tables to their
+// current shape, issuing only the DDL that is missing ([controlTable.ensure];
+// GC-40 (a)). Safe to call on every start, and by a role holding only DML on
+// tables another role created.
+func (s *MigrationStateStore) EnsureControlTable(ctx context.Context) error {
+	for _, t := range migrateStateTables(s.schema) {
+		if err := t.ensure(ctx, s.db); err != nil {
+			return err
+		}
 	}
 	// Sharded PlanetScale Neki: both tables would be routed by the default
 	// shard group and every breadcrumb write refused (NK306) — which is the

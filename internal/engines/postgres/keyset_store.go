@@ -62,14 +62,13 @@ func openKeysetStore(ctx context.Context, dsn string) (redact.KeysetStore, error
 	return &pgKeysetStore{db: db, schema: cfg.schema, isNeki: isNekiK, serverKey: cfg.serverKey()}, nil
 }
 
-// EnsureKeysetTable creates sluice_keysets if absent. Schema per
-// ADR-0041 §"Persistence shape": BYTEA bytes, TIMESTAMPTZ stamps,
-// composite PK (name, generation), one active row per name.
-// Idempotent.
-func (s *pgKeysetStore) EnsureKeysetTable(ctx context.Context) error {
-	tableRef := quoteIdent(s.schema) + "." + quoteIdent(keysetTableName)
-	ddl := `
-		CREATE TABLE IF NOT EXISTS ` + tableRef + ` (
+// keysetTable is sluice_keysets in schema.
+func keysetTable(schema string) controlTable {
+	return controlTable{
+		name:   keysetTableName,
+		schema: schema,
+		create: `
+		CREATE TABLE IF NOT EXISTS ` + quoteIdent(schema) + "." + quoteIdent(keysetTableName) + ` (
 			name        TEXT        NOT NULL,
 			generation  INTEGER     NOT NULL,
 			bytes       BYTEA       NOT NULL,
@@ -77,9 +76,18 @@ func (s *pgKeysetStore) EnsureKeysetTable(ctx context.Context) error {
 			retired_at  TIMESTAMPTZ NULL,
 			active      BOOLEAN     NOT NULL DEFAULT false,
 			PRIMARY KEY (name, generation)
-		)`
-	if _, err := s.db.ExecContext(ctx, ddl); err != nil {
-		return fmt.Errorf("postgres: ensure keyset table: %w", err)
+		)`,
+	}
+}
+
+// EnsureKeysetTable creates sluice_keysets if absent. Schema per
+// ADR-0041 §"Persistence shape": BYTEA bytes, TIMESTAMPTZ stamps,
+// composite PK (name, generation), one active row per name.
+// Idempotent, and issues no DDL when the table exists
+// ([controlTable.ensure]; GC-40 (a)).
+func (s *pgKeysetStore) EnsureKeysetTable(ctx context.Context) error {
+	if err := keysetTable(s.schema).ensure(ctx, s.db); err != nil {
+		return err
 	}
 	return ensureNekiControlTablePlacement(ctx, s.db, s.isNeki, s.serverKey, s.schema, []string{keysetTableName})
 }

@@ -15,7 +15,7 @@ import (
 // (ADR-0165). Today that is the bootstrap DDL printer; future
 // control-table tooling (roadmap item 65) slots in here.
 type ControlTablesCmd struct {
-	DDL ControlTablesDDLCmd `cmd:"" help:"Print the exact CREATE statements for sluice's control tables (migrate-state + cdc-state), for bootstrapping a target that refuses direct DDL."`
+	DDL ControlTablesDDLCmd `cmd:"" help:"Print the exact statements that create sluice's control tables (migrate-state + cdc-state), for bootstrapping a target that refuses direct DDL or a Postgres target whose sync role holds only DML."`
 }
 
 // ControlTablesDDLCmd implements `sluice control-tables ddl`: print
@@ -27,7 +27,7 @@ type ControlTablesCmd struct {
 // credentials, no org/database, and its output composes with any
 // channel (deploy-ddl, the pscale UI, a reviewed migration file).
 type ControlTablesDDLCmd struct {
-	Engine string `help:"Engine whose control-table dialect to print. The bootstrap consumer is PlanetScale (safe migrations blocks direct DDL); mysql/vitess print the same dialect." default:"planetscale" placeholder:"NAME"`
+	Engine string `help:"Engine whose control-table dialect to print. The default bootstrap consumer is PlanetScale (safe migrations blocks direct DDL); mysql/vitess print the same dialect. postgres prints the Postgres set, for an owner to run so a DML-only sync role can start." default:"planetscale" placeholder:"NAME"`
 }
 
 // Run implements `sluice control-tables ddl`. Output is pure SQL plus
@@ -39,14 +39,14 @@ func (c *ControlTablesDDLCmd) Run() error {
 	}
 	provider, ok := engine.(ir.ControlTableDDLProvider)
 	if !ok {
-		return fmt.Errorf("control-tables ddl: engine %q does not publish its control-table DDL (supported: the mysql family — mysql, planetscale, vitess)", engine.Name())
+		return fmt.Errorf("control-tables ddl: engine %q does not publish its control-table DDL (supported: the mysql family — mysql, planetscale, vitess — and postgres)", engine.Name())
 	}
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "-- sluice control tables (%s dialect) — the migrate-state + cdc-state set\n", engine.Name())
-	fmt.Fprintf(&b, "-- On a PlanetScale branch with safe migrations enabled, direct DDL is refused\n")
-	fmt.Fprintf(&b, "-- (Error 1105), so ship each statement via a deploy request:\n")
-	fmt.Fprintf(&b, "--   sluice deploy-ddl --org <org> --database <db> --ddl '<statement>'\n")
+	for _, line := range provider.ControlTableDDLGuidance() {
+		fmt.Fprintf(&b, "-- %s\n", line)
+	}
 	for _, stmt := range provider.ControlTableDDL() {
 		fmt.Fprintf(&b, "\n-- %s\n%s;\n", stmt.Table, stmt.DDL)
 	}

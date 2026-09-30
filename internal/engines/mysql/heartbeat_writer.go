@@ -72,6 +72,17 @@ func (r *SchemaReader) EnsureHeartbeatTable(ctx context.Context, tableName strin
 	if !validHeartbeatTableName(tableName) {
 		return fmt.Errorf("mysql: EnsureHeartbeatTable: tableName %q contains invalid characters; allow [A-Za-z0-9_]", tableName)
 	}
+	// Detect first (GC-40 (a)): MySQL checks the CREATE privilege before
+	// IF NOT EXISTS, so a source user holding only INSERT/DELETE on a
+	// heartbeat table an admin pre-created would otherwise take the
+	// permission-degrade path below and write no heartbeats at all.
+	exists, err := controlTableExists(ctx, r.db, "", tableName)
+	if err != nil {
+		return fmt.Errorf("mysql: ensure heartbeat table %q: %w", tableName, err)
+	}
+	if exists {
+		return nil
+	}
 	ddl := "CREATE TABLE IF NOT EXISTS `" + tableName + "` (" +
 		"id        BIGINT       NOT NULL AUTO_INCREMENT, " +
 		"ts        TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP, " +

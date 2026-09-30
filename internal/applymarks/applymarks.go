@@ -766,8 +766,8 @@ func WarnUnavailable(ctx context.Context, engine, streamID string, cause error) 
 	slog.WarnContext(ctx, engine+": applier: "+UnavailableMarker+": the sluice_cdc_apply_marks table cannot be used, so "+
 		"this run applies WITHOUT exactly-once apply marks (ADR-0190). Nothing is lost: a restart after a crash in the "+
 		"middle of a source transaction replays it as sluice always has, and may stop loudly on a unique collision. To "+
-		"enable the marks, let sluice create the table (or, on a MySQL-family target, ship the DDL `sluice control-tables "+
-		"ddl` prints) and grant this role SELECT, INSERT, UPDATE and DELETE on it",
+		"enable the marks, let sluice create the table (or have a role that may create it run the DDL `sluice "+
+		"control-tables ddl --engine <target engine>` prints) and grant this role SELECT, INSERT, UPDATE and DELETE on it",
 		slog.String("stream_id", streamID), slog.String("cause", msg))
 }
 
