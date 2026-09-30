@@ -98,6 +98,7 @@ Both are the doc-lags-code shape the working agreements name. A note *about* bac
     - **L3:** the status summary fails closed on a future row (oldest unknown = max, count reported), and health JSON sets `stale: true` with the flag.
     - **L4:** the heartbeat ensure checks `USAGE` on the `BIGSERIAL` sequence.
     - **L5:** both gates state their reach, and the age roster also matches receiver `Sub` and `time.Until`.
+  - **(d) OPEN, LOW, misleading remedy text.** The Postgres source heartbeat's degrade WARN still carries a `hint` saying the role "lacks CREATE TABLE … pre-create", even when the cause is the missing `USAGE` on the heartbeat's `BIGSERIAL` sequence. Only its `err` field names the `GRANT USAGE ON SEQUENCE`. Word the hint from the cause, the way `CONTROL-TABLE-DDL-REQUIRED` now does. Found by the v0.156.6 notes drafter.
   - **RESIDUAL-1, ACCEPTED.** A pre-v0.156.5 row on a zone `O` east of UTC reads HEALTHY for `d ∈ [O−60s, O+threshold]` after the write. No positive per-row signal exists: v0.156.5 added no version stamp, and a legacy table DEFAULT is no evidence because every current write names `updated_at`. The only exposed stream is one that stalled before the upgrade. The window's edges are pinned by `TestEvaluateHealth_LegacyRowWindow`.
 
 ### Tier 4 — peer-tool capability gaps (features; ranked by silent-loss relevance, then demand)
