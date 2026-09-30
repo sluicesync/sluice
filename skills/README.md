@@ -31,9 +31,9 @@ sluice's command taxonomy (see `AGENTS.md`) is the gate:
 
 - **Read-only** commands (`--dry-run`, `verify`, `schema preview`/`diff`, `sync health`/`status`, `backup verify`, `engines`) run freely.
 - **State-changing** commands (`migrate`, `sync start`/`run`, `backup *`, `restore`, `cutover`, …) run only as part of an approved task.
-- **Destructive flags** (`--reset-target-data`, `--force-cold-start`, `--yes`, `backup prune`/`compact` without `--dry-run`) and `--accept-unforwarded-schema-change` are **NEVER** passed without explicit human approval for *that specific invocation*. The acknowledgement flag accepts a source/target schema difference permanently unless the change was applied to the target first.
+- **Destructive flags** (`--reset-target-data`, `--force-cold-start`, `--yes`, `backup prune`/`compact` without `--dry-run`) and the acknowledgement flags `--accept-unforwarded-schema-change` and `--accept-slot-acked-past-position` are **NEVER** passed without explicit human approval for *that specific invocation*. `--accept-unforwarded-schema-change` accepts a source/target schema difference permanently unless the change was applied to the target first; `--accept-slot-acked-past-position` resumes past a gap of changes the slot already released, which are skipped unless a human verified the target holds them.
 
-Every skill also follows sluice's own discipline: **verify by reading state back, never trust an exit code alone**, and treat `status:"refused"` / exit 3 as a decision point — surface `error.hint` and wait, don't retry unchanged. The same applies to an exit-1 `UNFORWARDED-SCHEMA-CHANGE`, which has no error code yet.
+Every skill also follows sluice's own discipline: **verify by reading state back, never trust an exit code alone**, and treat `status:"refused"` / exit 3 as a decision point — surface `error.hint` and wait, don't retry unchanged. The same applies to an exit-1 `UNFORWARDED-SCHEMA-CHANGE` and the other codeless refusals `AGENTS.md` lists (including `SLOT-ACKED-PAST-TARGET-POSITION` and `SHARDED-TARGET-VINDEX-UPDATE`), which have no error code yet.
 
 ## Getting started
 

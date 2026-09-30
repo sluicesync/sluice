@@ -446,6 +446,23 @@ zero or several. Empty + unsharded/non-Vitess target = unchanged
 (bare table names in the default keyspace); inert on non-MySQL
 targets.
 
+**What a sidecar keyspace costs: the commit can tear.** The
+position write (and the apply marks) still ride the same target
+transaction as the rows, but with the control tables in another
+keyspace that transaction spans shards, and vtgate commits it
+shard by shard with no two-phase commit. sluice sends every row
+before any control-table write, so the data shard commits first.
+A tear therefore leaves rows committed with the position (and the
+marks) behind them, never a position past rows that did not land:
+the restart re-delivers the change and applies it again. For the
+classes [apply marks](operator/cdc-streaming.md) cover, that makes
+them at-least-once or loud here rather than exactly-once: a
+secondary-unique or primary-key-changing change stops on a unique
+collision, and a keyless table can gain a duplicate row. Nothing
+is skipped silently. The ordering covers the control keyspace
+only: a transaction whose rows span two DATA shards is not made
+atomic, and a tear between data shards is not covered by it.
+
 Note the boundary this section lives inside: the hazard is sluice
 CREATING a new table in a sharded keyspace — a sluice-created
 table carries no vindex, so nothing sluice writes there could
@@ -486,7 +503,10 @@ backlog GC-41 (e), open):
   through vtgate at all.
 
 Each refusal is loud — `SHARDED-TARGET-VINDEX-UPDATE`, naming the
-table, the position left where it was — never a silent write. (The
+table, the position left where it was — never a silent write. It
+carries no error code and exits 1. A restart re-delivers the same
+change and refuses again, so under `sync run` the leg is marked
+failed and not restarted. (The
 one silent shape vtgate admits, an `ON DUPLICATE KEY UPDATE col =
 VALUES(col)` that re-inserts the row on its new shard and leaves the
 old copy behind, is a spelling sluice never sends to a Vitess-family
@@ -494,9 +514,11 @@ target; `TestUpsertSpelling_VitessFamilyNeverUsesValuesFunc` pins
 that.)
 (An earlier build refused such a sync up front at schema-writer
 open — the schema-forward path opens the writer even on warm
-resume — which over-refused this supported flow; the door now sits
-at the create step so opening a writer to forward an `ALTER`, or to
-stream into existing tables, is harmless.) `schema diff` and
+resume — which refused this flow outright, including the part the
+scope above supports; the door now sits at the create step, so
+opening a writer to forward an `ALTER`, or to stream into existing
+tables, does not refuse, and the apply is bounded by the scope
+above.) `schema diff` and
 `preview` are read-only — they open the writer only to render DDL
 suggestions and never call the create path — so they inspect a
 sharded target without refusing.
@@ -745,7 +767,16 @@ than a default float.
 target's measured headroom; engine-general across MySQL and Postgres).
 Each lane runs its own AIMD controller and recovers in-lane from a
 PlanetScale tx-killer / deadlock (shrink + idempotent split-retry, no
-stream restart). Exactly-once is preserved for keyed tables. Pass
+stream restart). The resume position advances only to a source
+transaction boundary durable across all lanes, so a restart never
+skips a change, and a replay into a primary-key-only table
+converges idempotently. Tables with a secondary UNIQUE index, keyless
+tables and primary-key changes rely on apply marks for exactly-once
+across a crash; on the lanes a secondary-unique table is marked only
+with `--exactly-once-lanes`, and with a sidecar control keyspace a
+torn commit makes the marked classes at-least-once or loud (see
+[throughput tuning](throughput-tuning.md) and the `--control-keyspace`
+section above). Pass
 `--apply-concurrency 1` to force the legacy serial apply.
 
 ## Neon (Postgres)

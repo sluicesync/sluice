@@ -139,3 +139,12 @@ clamp composes with (does not replace) the ADR-0020 applier tracker.
   verification, late-created-slot refusal, missing-slot guidance,
   existing-slot refusal, uncommitted-Close-drops-slot /
   committed-Close-keeps-slot).
+
+## Amendment 2026-09-30 — GC-41: the hold is unconditional and the tracker is gone
+
+§3 above describes the implementation as it landed; two of its names no longer exist, and the text is kept as the record of that decision.
+
+- `HoldSlotAckAtCommitted()` is deleted. The Postgres CDC reader now never acks past `max(startLSN, released ceiling)` for every consumer, not only for a chain consumer that opted in, so there is nothing to switch on. `ReleaseSlotAckTo(pos)` is unchanged, and the backup-chain orchestrators still release each window's EndPosition after its manifest commits (`releaseChainAckTo`, `internal/pipeline/chain_ack.go`).
+- "Composes with the ADR-0020 applier tracker" no longer applies: GC-41 deleted that tracker. A continuous sync now releases through the same `ReleaseSlotAckTo` seam, from the position it reads back from the target's control row (ADR-0020 amendment, `internal/pipeline/streamer_slot_ack.go`).
+
+The chain-consumer property this ADR relies on — the slot never acknowledges WAL a committed manifest does not cover — is unchanged, and it now holds by default rather than by a call each orchestrator had to remember.
