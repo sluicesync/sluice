@@ -75,6 +75,19 @@ func (e *SourceEnd) Reached(ctx context.Context) {
 //     them there unseen. Every in-tree writer drains to the close; this
 //     makes that a checked fact rather than a promise.
 //
+// No one clause is enough. The first alone passes a stage that dropped
+// rows after the source ended, and a writer that left buffered rows; the
+// third alone passes a stream every stage closed on a cancel. Where a tee
+// reads the source, the first is in fact implied by the other two — a tee
+// that did not see the end either is still open (so its output is not
+// consumed to a close) or exited on ctx (so ctx is not live) — and it is
+// kept as the direct observation the other two are an argument for. Where
+// a pump or exporter decides the end itself (copyChunkFast, the raw
+// byte-pipe), it is the only clause that sees a pump that stopped early
+// without an error. The ctx clause relies on one premise of the
+// [ir.RowReader] contract: a reader closes its stream early only on the
+// context it was handed, or reports why on Err.
+//
 // The second clause is a named wart. A stop landing in the microseconds
 // between the writer's final commit and this check reads as interrupted
 // although every row committed; the price is a loud re-copy of one table,
