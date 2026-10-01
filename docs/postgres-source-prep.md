@@ -173,14 +173,17 @@ Three fixes, narrowest first:
 -- (a) nominate an existing immediate NOT NULL UNIQUE index (cheapest WAL)
 ALTER TABLE orders REPLICA IDENTITY USING INDEX orders_pubid_key;
 
--- (b) publish the whole old row — always works, including for keyless tables,
---     at the cost of WAL volume on every UPDATE/DELETE
+-- (b) publish the whole old row — passes the check, including for keyless tables,
+--     at the cost of WAL volume on every UPDATE/DELETE (see the caveat below
+--     for a table whose only key is DEFERRABLE)
 ALTER TABLE orders REPLICA IDENTITY FULL;
 
 -- (c) make the key immediate (NOT DEFERRABLE is the default)
 ALTER TABLE orders DROP CONSTRAINT orders_pkey;
 ALTER TABLE orders ADD  CONSTRAINT orders_pkey PRIMARY KEY (id);
 ```
+
+**`REPLICA IDENTITY FULL` on a table whose only key is `DEFERRABLE`.** It clears the refusal, but sluice still addresses each `UPDATE` and `DELETE` by that key: it narrows the published old row to the primary key, because comparing every column would miss rows whose values do not round-trip exactly. A `DEFERRABLE` key may be shared by two rows in the middle of a source transaction that shifts or swaps key values (`UPDATE orders SET id = id + 1`), so a change in that transaction can match two target rows. Since v0.156.8 the stream stops there with `SLUICE-E-CDC-KEY-MATCHED-MULTIPLE-ROWS`, rolls the change back, and needs a re-copy (`sync start --reset-target-data`) to continue. Through v0.156.7 the change was applied and a row was silently lost or overwritten. If your application shifts keys, prefer (c): an immediate key is never shared by two rows, even mid-transaction, so every change names exactly one row. Check first that the application's key-shifting statements still succeed without `DEFERRABLE`.
 
 Or take the table out of the sync entirely with `--exclude-table` — **on a single-schema sync**, where the publication is scoped `FOR TABLE`, an excluded table never joins it and its writes are unaffected. That escape does NOT exist on a multi-schema sync: a database-wide logical slot needs a `FOR ALL TABLES` publication, so an excluded table is published anyway and its writes break regardless. There the only remedies are a primary key or `REPLICA IDENTITY FULL` on the table itself, or not running the multi-schema sync; since v0.141.0 sluice warns (`UNSELECTED-NAMESPACE-EXPOSURE`) naming each table this will affect. The refusal names each offending table, why it failed, and (where one exists) the index you could nominate.
 
@@ -226,7 +229,7 @@ The failure mode: Patroni's slot-sync (and PG 17's native equivalent, gated by `
 **Mitigations, ranked:**
 
 1. **Keep the slot consumer running.** Sluice's PG CDC reader sends `pg_send_standby_status_update` every 10 seconds whether or not events are flowing (see `internal/engines/postgres/cdc_reader.go`'s keepalive loop). As long as `sluice sync start` is the active consumer, the slot is "active" from the primary's perspective and the standby's sync will keep pace. **Don't run sluice as a one-shot during low-traffic windows; run it continuously.**
-2. **For low-traffic source databases**, inject lightweight WAL activity from the source side — e.g. a periodic `INSERT INTO heartbeat (ts) VALUES (now())` against a small dedicated table, or a `SELECT pg_logical_emit_message(false, 'sluice-heartbeat', '')`. The latter writes to WAL without modifying any user data; sluice does not request logical messages, so `pgoutput` never sends it. Either only helps while sluice is connected: after v0.156.7 the reader advances the slot to the server's WAL position whenever WAL is written anywhere on the server (GC-41 (j)), so any such write moves it. Through v0.156.7, on Postgres 15+, neither write advanced the slot at all — `pgoutput` skips a transaction outside the stream's publication — and only a write to a table the stream publishes did; on Postgres 14 and earlier the `INSERT` did, when made in the stream's own database.
+2. **For low-traffic source databases**, inject lightweight WAL activity from the source side — e.g. a periodic `INSERT INTO heartbeat (ts) VALUES (now())` against a small dedicated table, or a `SELECT pg_logical_emit_message(false, 'sluice-heartbeat', '')`. The latter writes to WAL without modifying any user data; sluice does not request logical messages, so `pgoutput` never sends it. Either only helps while sluice is connected: since v0.156.8 the reader advances the slot to the server's WAL position whenever WAL is written anywhere on the server (GC-41 (j)), so any such write moves it. Through v0.156.7, on Postgres 15+, neither write advanced the slot at all — `pgoutput` skips a transaction outside the stream's publication — and only a write to a table the stream publishes did; on Postgres 14 and earlier the `INSERT` did, when made in the stream's own database.
 3. **Tune the sync window upward.** `logical_slot_sync_timeout` can be increased; on Patroni, the equivalent knobs are `loop_wait` (default 10s) and the `dcs.permanent_slots` consistency policy. Bigger windows = more tolerance for idle slots, but at the cost of slower failover detection.
 4. **Accept the risk** and rely on sluice's slot-missing fall-through (Item F, ADR-0022) — a re-invoked `sync start` detects the lost slot, drops it, and falls through to cold-start. Operationally heavy but always works. Pair with `--reset-target-data` if the target also needs to be wiped.
 

@@ -71,7 +71,7 @@ For **measured initial-copy throughput head-to-heads**, see [`docs/comparison-pg
 
 ## Source-side heartbeat writer (F17, v0.82.0)
 
-**Capability claim.** Opt-in `--source-heartbeat-interval=30s`. Sluice writes a tiny periodic row to a sluice-owned table on the source; the INSERT generates WAL (PG) / binlog (MySQL) so the CDC consumer's position advances even against a quiet source. Default OFF (it's a behavioural change on the source DB). On Postgres it is no longer what advances the slot: since GC-41 (j) (after v0.156.7) the slot follows the server's WAL position whenever WAL is written anywhere on the server, and on Postgres 15+ the heartbeat never could, because `pgoutput` skips its transactions (its table is outside the publication).
+**Capability claim.** Opt-in `--source-heartbeat-interval=30s`. Sluice writes a tiny periodic row to a sluice-owned table on the source; the INSERT generates WAL (PG) / binlog (MySQL) so the CDC consumer's position advances even against a quiet source. Default OFF (it's a behavioural change on the source DB). On Postgres it is no longer what advances the slot: since v0.156.8 (GC-41 (j)) the slot follows the server's WAL position whenever WAL is written anywhere on the server, and on Postgres 15+ the heartbeat never could, because `pgoutput` skips its transactions (its table is outside the publication).
 
 **Why this matters.** The complement to F13: F13 *detects* slot-retention pressure; F17 *prevents* it. On low-traffic source DBs (off-hours, weekends, dev environments), the slot's `restart_lsn` stagnates and the slot eventually evicts. F17 keeps the heartbeat moving so the consumer's claim stays current.
 
