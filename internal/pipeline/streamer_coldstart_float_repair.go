@@ -397,7 +397,7 @@ func repairFloatTable(ctx context.Context, br ir.BatchedRowReader, rr ir.RowRead
 		}
 		// An empty or short page is the end of the table only if the page
 		// closed naturally (GC-41 (i)); a stop closes it the same way.
-		if err := end.Confirm(ctx, ft.srcRead.Name); err != nil {
+		if err := end.Confirm(ctx, ft.srcRead.Name, teed); err != nil {
 			return err
 		}
 		if batchCount == 0 {

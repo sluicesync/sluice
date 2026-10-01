@@ -551,7 +551,7 @@ func copyTableWithCursor(
 		// copyChunkFast guards. Since GC-41 (i) the guard is the batch's
 		// source-end signal, which also refuses a page the writer returned
 		// from before it closed.
-		if err := end.Confirm(ctx, table.Name); err != nil {
+		if err := end.Confirm(ctx, table.Name, stamped); err != nil {
 			return err
 		}
 

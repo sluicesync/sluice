@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"sync/atomic"
+
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // ErrCopyInterrupted marks a copy that stopped before its source reached
@@ -55,27 +57,52 @@ func (e *SourceEnd) Reached(ctx context.Context) {
 }
 
 // Confirm is the completion verdict, asked once the writer has returned
-// nil and before anything is recorded. It returns nil only when:
+// nil and before anything is recorded. handed is every channel the writer
+// was given (one, or the fan-out's per-worker channels; none for the raw
+// byte-pipe, whose importer is fed by the exporter's own end). It returns
+// nil only when:
 //
-//   - the source reached its natural end ([SourceEnd.Reached]), so the
-//     writer was handed the whole table and did not return early; and
+//   - the source reached its natural end ([SourceEnd.Reached]);
 //   - ctx is still live, so no stage between the source and the writer
 //     dropped rows on a cancel. Every such stage drops ONLY on ctx.Done
 //     (an error-driven close is surfaced by its own errFn / the reader's
 //     sticky Err), and cancellation is monotone, so a live ctx here means
-//     none of them ever took that branch.
+//     none of them ever took that branch; and
+//   - the writer consumed every handed channel to its close. A source end
+//     says the rows were READ, not that the writer took them: a source
+//     small enough to sit in the stage buffers ends before the writer has
+//     consumed anything, so a writer that returns nil early would leave
+//     them there unseen. Every in-tree writer drains to the close; this
+//     makes that a checked fact rather than a promise.
 //
 // The second clause is a named wart. A stop landing in the microseconds
 // between the writer's final commit and this check reads as interrupted
 // although every row committed; the price is a loud re-copy of one table,
 // never loss. It is the residue of the stop-time window GC-41 (i) was
 // filed for, shrunk from "the whole progress-row write" to this call.
-func (e *SourceEnd) Confirm(ctx context.Context, table string) error {
+func (e *SourceEnd) Confirm(ctx context.Context, table string, handed ...<-chan ir.Row) error {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("%w: table %q: %w", ErrCopyInterrupted, table, err)
 	}
 	if !e.drained.Load() {
 		return fmt.Errorf("%w: table %q: the row stream closed before the source reported its end", ErrCopyInterrupted, table)
 	}
+	for _, ch := range handed {
+		if !consumedToClose(ch) {
+			return fmt.Errorf("%w: table %q: the writer returned with rows it was handed still unread", ErrCopyInterrupted, table)
+		}
+	}
 	return nil
+}
+
+// consumedToClose reports whether ch is closed with nothing left in it,
+// without blocking: a receive that yields a row means the writer left it
+// behind, and one that would block means the stream never closed.
+func consumedToClose(ch <-chan ir.Row) bool {
+	select {
+	case _, ok := <-ch:
+		return !ok
+	default:
+		return false
+	}
 }

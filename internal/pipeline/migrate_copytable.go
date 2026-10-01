@@ -60,7 +60,7 @@ func copyTableIdempotent(ctx context.Context, rr ir.RowReader, rw ir.RowWriter, 
 	if err := migcore.ReaderStreamErr(rr, table); err != nil {
 		return err
 	}
-	return end.Confirm(copyCtx, table.Name)
+	return end.Confirm(copyCtx, table.Name, redacted)
 }
 
 // copyTable opens the source-side row stream, hands it off to the
@@ -150,7 +150,7 @@ func copyTable(ctx context.Context, rr ir.RowReader, rw ir.RowWriter, table *ir.
 	// write loops return nil whenever "closed" wins their select. Only
 	// the source-end signal says the source drained (GC-41 (i)) — every
 	// caller records COMPLETE on this function's nil.
-	if err := end.Confirm(copyCtx, table.Name); err != nil {
+	if err := end.Confirm(copyCtx, table.Name, stamped); err != nil {
 		return 0, err
 	}
 	// The count is read AFTER the writer drained the stream, so it is
@@ -231,7 +231,7 @@ func copyTableColdStartIdempotent(ctx context.Context, rr ir.RowReader, rw ir.Ro
 	if err := migcore.ReaderStreamErr(rr, table); err != nil {
 		return 0, err
 	}
-	if err := end.Confirm(copyCtx, table.Name); err != nil {
+	if err := end.Confirm(copyCtx, table.Name, stamped); err != nil {
 		return 0, err
 	}
 	// The count is the ROWS THE READER DELIVERED, which on this path can

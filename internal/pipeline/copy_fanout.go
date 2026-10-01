@@ -203,7 +203,7 @@ func copyTablePlainParallel(
 	if err := migcore.ReaderStreamErr(rr, table); err != nil {
 		return 0, err
 	}
-	if err := end.Confirm(copyCtx, table.Name); err != nil {
+	if err := end.Confirm(copyCtx, table.Name, workers...); err != nil {
 		return 0, err
 	}
 	// The count is read after every worker joined inside WriteRowsParallel,
@@ -314,7 +314,7 @@ func copyTableColdStartIdempotentParallel(
 	if err := migcore.ReaderStreamErr(rr, table); err != nil {
 		return 0, err
 	}
-	if err := end.Confirm(copyCtx, table.Name); err != nil {
+	if err := end.Confirm(copyCtx, table.Name, workers...); err != nil {
 		return 0, err
 	}
 	// The count is the ROWS THE READER DELIVERED, which on this path can

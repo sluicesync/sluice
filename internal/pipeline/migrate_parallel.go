@@ -1082,7 +1082,7 @@ func copyChunk(
 		// LastPK cursor. Mirrors the copyChunkFast pump guard. Since GC-41
 		// (i) the guard is the batch's source-end signal, which also refuses
 		// a page the writer returned from before it closed.
-		if err := end.Confirm(ctx, table.Name); err != nil {
+		if err := end.Confirm(ctx, table.Name, stamped); err != nil {
 			return err
 		}
 
@@ -1344,7 +1344,7 @@ func copyChunkFast(
 	// The source-end verdict is taken FIRST, while streamCtx is still
 	// only what the run made it: the cancel below is ours and must not
 	// read as a stop.
-	confirmErr := end.Confirm(streamCtx, table.Name)
+	confirmErr := end.Confirm(streamCtx, table.Name, stamped)
 
 	// WriteRows may have returned without draining `out` — on an error,
 	// or (a writer bug the source-end verdict above already refuses) on

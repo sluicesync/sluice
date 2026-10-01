@@ -82,4 +82,23 @@ func TestSourceEnd_ConfirmNeedsANaturalEndAndALiveRun(t *testing.T) {
 	if err := lateEnd.Confirm(live, "t"); !errors.Is(err, ErrCopyInterrupted) {
 		t.Errorf("a close observed after the stop counted as a natural end: %v", err)
 	}
+
+	// The writer-consumption clause, over the channels the writer was
+	// handed: closed and empty passes; a row left behind, or a channel
+	// that never closed, does not.
+	consumed := make(chan ir.Row)
+	close(consumed)
+	leftBehind := make(chan ir.Row, 1)
+	leftBehind <- ir.Row{"id": 1}
+	close(leftBehind)
+	neverClosed := make(chan ir.Row)
+	if err := drained.Confirm(live, "t", consumed, consumed); err != nil {
+		t.Errorf("channels consumed to their close were refused: %v", err)
+	}
+	if err := drained.Confirm(live, "t", consumed, leftBehind); !errors.Is(err, ErrCopyInterrupted) {
+		t.Errorf("a writer that left a handed row unread was confirmed: %v", err)
+	}
+	if err := drained.Confirm(live, "t", neverClosed); !errors.Is(err, ErrCopyInterrupted) {
+		t.Errorf("a writer that returned before its input closed was confirmed: %v", err)
+	}
 }

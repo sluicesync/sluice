@@ -341,6 +341,44 @@ func TestStopMidCopy_DropBetweenADrainedTeeAndTheWriterIsRefused(t *testing.T) {
 	assertNoCompleteRow(t, store.fakeStateStore, "s", []string{"a"})
 }
 
+// earlyReturnWriter takes `take` rows and returns nil — a writer that
+// stopped consuming without an error, with the run still live.
+type earlyReturnWriter struct{ take int }
+
+func (w earlyReturnWriter) WriteRows(_ context.Context, _ *ir.Table, rows <-chan ir.Row) error {
+	for i := 0; i < w.take; i++ {
+		<-rows
+	}
+	return nil
+}
+
+// The other clauses of the verdict: no stop at all, the run live
+// throughout, and a writer that returned nil having taken 2 rows. Two
+// source sizes, because they are caught by different clauses: 1000 rows
+// over-fill the stage buffers, so the tee never reaches the source's end
+// (the source-end clause); 10 rows sit wholly in the buffers, so the
+// source DID end and only the handed-channel consumption clause sees the
+// 8 rows the writer left behind.
+func TestStopMidCopy_AWriterThatReturnsBeforeTheEndIsRefused(t *testing.T) {
+	for _, n := range []int{10, 1000} {
+		t.Run(fmt.Sprintf("source-rows=%d", n), func(t *testing.T) {
+			t.Parallel()
+			reader := &drainedThenClosedReader{n: n, closed: make(chan struct{})}
+			store := ctxHonouringStateStore{newFakeStateStore()}
+			var phaseLog []string
+			err := runBulkCopyWithOpts(context.Background(), stopMidCopySchema("a"), reader,
+				&recordingSchemaWriter{phaseLog: &phaseLog}, earlyReturnWriter{take: 2}, bulkCopyOpts{
+					Recording:        resumeContext{store: store, migrationID: "s", enabled: true, noResume: true},
+					CopyFanoutDegree: 1,
+				})
+			if err == nil {
+				t.Errorf("a copy whose writer returned nil after 2 of %d rows returned nil", n)
+			}
+			assertNoCompleteRow(t, store.fakeStateStore, "s", []string{"a"})
+		})
+	}
+}
+
 // The positive control: the same reader, writer and store with nothing
 // stopping the run record every table COMPLETE with its real row count.
 // Without it, a harness that could never record COMPLETE would pass every
