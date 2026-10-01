@@ -38,6 +38,15 @@ import (
 // recovery — drop that slot, re-run with --reset-target-data — copies
 // everything. The independent expected value is the SOURCE's own row
 // count, read from the source, never from anything sluice recorded.
+//
+// What this cell does NOT discriminate, stated rather than implied: with
+// the whole GC-41 (i) fix reverted (Confirm always nil, ReaderStreamErr
+// forgiving ctx errors) it stayed green 3 runs of 3. The bad resolution
+// of the writer race needs the writer's batch to be EMPTY when "closed"
+// wins — otherwise its final flush runs on the cancelled ctx and fails —
+// and the large-table chunked lane already carried ctx guards. It is the
+// end-to-end behaviour check; the discriminating pins are the unit cells,
+// whose writer resolves the race the bad way every time.
 func TestStreamer_StopMidColdCopy_ThenResume_EveryRowArrives(t *testing.T) {
 	for _, target := range []string{"postgres", "mysql"} {
 		t.Run(target, func(t *testing.T) { runStopMidColdCopyThenResume(t, target) })
