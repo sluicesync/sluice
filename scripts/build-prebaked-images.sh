@@ -529,6 +529,12 @@ bake_vitess() {
 # cannot drift either.
 mirror_stock_refs() {
     echo "postgres:16"
+    # PG 14 is not a matrix leg; it is the control in the required
+    # pipeline-rest-streamer shard's GC-41 (j) pin
+    # (TestStreamer_PostgresIdleSource_SlotFollowsKeepaliveBoundary: PG 14
+    # decodes empty transactions, 15+ skips them). Mirrored so that shard
+    # never cold-pulls docker.io.
+    echo "postgres:14"
     grep -vE '^[[:space:]]*#|^[[:space:]]*$' "$PG_VERSIONS_FILE"
     echo "mysql:8.0"
     grep -vE '^[[:space:]]*#|^[[:space:]]*$' "$MYSQL_VERSIONS_FILE"

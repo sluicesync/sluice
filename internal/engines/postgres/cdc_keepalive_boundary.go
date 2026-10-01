@@ -61,14 +61,25 @@ import (
 // enumerates every ack input, and there is no new one.
 //
 // The premise "a keepalive never passes the commit of a transaction
-// delivered after it" is a fact about the walsender, so it gets a runtime
-// check: [keepaliveBoundary.commit] compares every delivered commit against
-// the highest keepalive boundary emitted, and on a violation the pump logs
-// [KeepaliveBoundaryPassedCommitMarker] at ERROR and stands no further
-// keepalive in for the rest of the connection. It does not stop the stream:
-// the transaction that exposed the violation is being delivered now, and a
-// stop would leave the persisted position above it — a refusal there would
-// cause exactly the loss the check exists to report.
+// delivered after it" is a fact about the walsender, CITED FROM POSTGRES
+// SOURCE, not measured: XLogSendLogical sets sentPtr only after
+// LogicalDecodingProcessRecord has written the commit's output, and
+// WalSndKeepalive queues into the same FIFO PqSendBuffer, so a keepalive
+// cannot overtake output queued before it. Safety rests on that ordering.
+//
+// [keepaliveBoundary.commit] is a tripwire on it, not a guard: it compares
+// every delivered commit against the highest keepalive boundary emitted and,
+// on a violation, logs [KeepaliveBoundaryPassedCommitMarker] at ERROR and
+// stands no further keepalive in for the rest of the connection. It only
+// observes an uninterrupted connection. In the window that would actually
+// lose data — the boundary persisted and acked, then a stop, crash or
+// reconnect before the late commit arrives — the resumed stream starts past
+// that commit and never delivers it, so the tripwire never fires. It does not
+// stop the stream either: the transaction that exposed the violation is
+// being delivered now, and a stop would leave the persisted position above
+// it — a refusal there would cause exactly the loss the check exists to
+// report. (A durable record of a firing, so the next start refuses loudly,
+// is filed under GC-41 (j) as a follow-up.)
 //
 // # Shape of the boundary
 //
