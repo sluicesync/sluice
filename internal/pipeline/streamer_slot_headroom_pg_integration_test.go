@@ -224,7 +224,14 @@ func TestStreamer_WarmResume_PG_FullSlots_NeverProbesRefuses(t *testing.T) {
 	// the stream and DROPPED the slot — which makes "wait for the slot to
 	// go inactive" unsatisfiable at ANY budget. Fixed at the source (see
 	// [coldStartAnchorWriteTimeout]) and pinned by
-	// TestStreamer_ColdStartStopInHandoff_PG_KeepsSlotAndResumes. The
+	// TestStreamer_ColdStartStopInHandoff_PG_KeepsSlotAndResumes. A SECOND
+	// window of the same shape red this test on run 36778297813: the cancel
+	// landed after the rows committed but before the table's COMPLETE
+	// progress row was written, the row was lost with the cancelled ctx,
+	// the stopped-cold-start resume could not prove the copy finished, and
+	// the warm resume fell through to a fresh cold start — refused on
+	// headroom. Fixed at the source ([recordCommittedWorkCtx]) and pinned by
+	// TestTableCompleteRowSurvivesAStop. The
 	// budget stays generous because it costs nothing when the wait
 	// succeeds in milliseconds, which is what a clean close does.
 	if ok, why := waitForSluiceSlotInactive(t, src, "sluice_slot", 180*time.Second); !ok {
