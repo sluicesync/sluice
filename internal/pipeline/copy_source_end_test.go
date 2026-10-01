@@ -342,12 +342,21 @@ func TestStopMidCopy_DropBetweenADrainedTeeAndTheWriterIsRefused(t *testing.T) {
 }
 
 // earlyReturnWriter takes `take` rows and returns nil — a writer that
-// stopped consuming without an error, with the run still live.
-type earlyReturnWriter struct{ take int }
+// stopped consuming without an error, with the run still live. When the
+// whole source fits in the stage buffers (total <= 64) it first waits
+// for the rest to be buffered for it, so the source has really ended by
+// the time it returns; otherwise the cell would race the tee to the end.
+type earlyReturnWriter struct{ take, total int }
 
 func (w earlyReturnWriter) WriteRows(_ context.Context, _ *ir.Table, rows <-chan ir.Row) error {
 	for i := 0; i < w.take; i++ {
 		<-rows
+	}
+	if w.total <= 64 {
+		for len(rows) < w.total-w.take {
+			time.Sleep(time.Millisecond)
+		}
+		time.Sleep(10 * time.Millisecond) // the tee's close follows its last send
 	}
 	return nil
 }
@@ -367,7 +376,7 @@ func TestStopMidCopy_AWriterThatReturnsBeforeTheEndIsRefused(t *testing.T) {
 			store := ctxHonouringStateStore{newFakeStateStore()}
 			var phaseLog []string
 			err := runBulkCopyWithOpts(context.Background(), stopMidCopySchema("a"), reader,
-				&recordingSchemaWriter{phaseLog: &phaseLog}, earlyReturnWriter{take: 2}, bulkCopyOpts{
+				&recordingSchemaWriter{phaseLog: &phaseLog}, earlyReturnWriter{take: 2, total: n}, bulkCopyOpts{
 					Recording:        resumeContext{store: store, migrationID: "s", enabled: true, noResume: true},
 					CopyFanoutDegree: 1,
 				})
