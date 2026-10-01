@@ -200,6 +200,8 @@ func (a *ChangeApplier) invalidateMetadataCaches(qn string) {
 	// negative skip verdict too, so the table is picked up at the barrier
 	// rather than waiting out skipVerdictTTL.
 	delete(a.skipVerdictCache, qn)
+	// GC-42: a boundary can add or drop the table's key; re-read it.
+	a.rowKeyCache.Delete(qn)
 }
 
 // --- Concurrent apply: MySQL adapter for the laneapply seam (ADR-0105) ---

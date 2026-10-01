@@ -153,7 +153,7 @@ func TestBuildUpdateSQLOmitsTheShardKeyFromSetButKeepsItInWhere(t *testing.T) {
 		"id":        {Name: "id"},
 		"v":         {Name: "v"},
 	}
-	stmt, args, err := buildUpdateSQL("public", "orders",
+	stmt, args, err := buildUpdateSQL(addressEveryMatch, "public", "orders",
 		shardKeyRow(int64(3), "old"), shardKeyRow(int64(3), "new"), colTypes, []string{"tenant_id"})
 	if err != nil {
 		t.Fatalf("build: %v", err)

@@ -77,8 +77,8 @@ type queuedStmt struct {
 	table  string
 	kind   string // "insert" / "update" / "delete" / "truncate" / "schema-snapshot" / "position"
 
-	// keyScoped is the GC-42 multi-row check for an UPDATE/DELETE that is not
-	// exempt, read against the statement's command tag at flush; nil otherwise.
+	// keyScoped is the GC-42 multi-row check every UPDATE/DELETE carries,
+	// read against the statement's command tag at flush; nil otherwise.
 	keyScoped *keyScopedWrite
 }
 
@@ -324,7 +324,11 @@ func (a *ChangeApplier) dispatchPipelined(ctx context.Context, b *pgxBatchTx, st
 		if err != nil {
 			return false, fmt.Errorf("postgres: applier: resolve shard key for %s.%s: %w", schema, v.Table, err)
 		}
-		stmt, args, err := buildUpdateSQL(schema, v.Table, v.Before, v.After, colTypes, shardKeys)
+		addr, err := a.rowAddressFor(ctx, schema, v.Table, v.Before, colTypes)
+		if err != nil {
+			return false, err
+		}
+		stmt, args, err := buildUpdateSQL(addr, schema, v.Table, v.Before, v.After, colTypes, shardKeys)
 		if err != nil {
 			return false, fmt.Errorf("postgres: applier: build update for %s.%s: %w", schema, v.Table, err)
 		}
@@ -335,7 +339,7 @@ func (a *ChangeApplier) dispatchPipelined(ctx context.Context, b *pgxBatchTx, st
 		}
 		a.noteUnenforcedDeferrable(ctx, schema, v.Table)
 		b.queue(stmt, args,
-			queuedStmt{schema: schema, table: v.Table, kind: "update", keyScoped: guardKeyScopedWrite("update", v.Before, colTypes)})
+			queuedStmt{schema: schema, table: v.Table, kind: "update", keyScoped: guardKeyScopedWrite("update", v.Before)})
 		return false, nil
 
 	case ir.Delete:
@@ -347,12 +351,16 @@ func (a *ChangeApplier) dispatchPipelined(ctx context.Context, b *pgxBatchTx, st
 		if err != nil {
 			return false, fmt.Errorf("postgres: applier: column types for %s.%s: %w", schema, v.Table, err)
 		}
-		stmt, args, err := buildDeleteSQL(schema, v.Table, v.Before, colTypes)
+		addr, err := a.rowAddressFor(ctx, schema, v.Table, v.Before, colTypes)
+		if err != nil {
+			return false, err
+		}
+		stmt, args, err := buildDeleteSQL(addr, schema, v.Table, v.Before, colTypes)
 		if err != nil {
 			return false, fmt.Errorf("postgres: applier: build delete for %s.%s: %w", schema, v.Table, err)
 		}
 		a.noteUnenforcedDeferrable(ctx, schema, v.Table)
-		b.queue(stmt, args, queuedStmt{schema: schema, table: v.Table, kind: "delete", keyScoped: guardKeyScopedWrite("delete", v.Before, colTypes)})
+		b.queue(stmt, args, queuedStmt{schema: schema, table: v.Table, kind: "delete", keyScoped: guardKeyScopedWrite("delete", v.Before)})
 		return false, nil
 
 	case ir.Truncate:
@@ -496,11 +504,6 @@ func (a *ChangeApplier) sendBatchUnderDeadline(b *pgxBatchTx) error {
 	// br.Exec must be called once per queued statement to drain the
 	// pipeline; the server executed them in queue order.
 	var firstErr error
-	// GC-42 G1: the per-statement count comes back on each tag. A count
-	// above one is only NOTED here — grading it may need a catalog read, and
-	// the pipeline must be drained first — then graded below, after Close and
-	// before the caller's COMMIT.
-	var multi []multiRowMatch
 	for i := range b.stmts {
 		tag, execErr := br.Exec()
 		if execErr != nil && firstErr == nil {
@@ -511,32 +514,19 @@ func (a *ChangeApplier) sendBatchUnderDeadline(b *pgxBatchTx) error {
 			// a 25P02). Every exec error is loud.
 			firstErr = a.attributeQueuedError(b.stmts[i], execErr)
 		}
-		if execErr == nil && b.stmts[i].keyScoped != nil && tag.RowsAffected() > 1 {
-			multi = append(multi, multiRowMatch{stmt: b.stmts[i], matched: tag.RowsAffected()})
+		if execErr == nil && firstErr == nil {
+			// GC-42 G1, graded from the count alone. The statements behind
+			// a refused one still ran server-side (the pipeline was already
+			// sent) — the caller rolls the whole transaction back, so none
+			// of it lands.
+			s := b.stmts[i]
+			firstErr = s.keyScoped.verdict(s.schema, s.table, tag.RowsAffected())
 		}
 	}
 	if closeErr := br.Close(); closeErr != nil && firstErr == nil {
 		firstErr = fmt.Errorf("postgres: applier: pipelined batch close: %w", closeErr)
 	}
-	if firstErr != nil {
-		return firstErr
-	}
-	// Every statement has run but nothing is committed: a refusal here makes
-	// the caller roll the whole transaction back, so none of it lands. The
-	// key read uses the primary pool, not this pinned backend.
-	for _, m := range multi {
-		if err := m.stmt.keyScoped.verdictOn(ctx, a, m.stmt.schema, m.stmt.table, m.matched); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// multiRowMatch is a queued UPDATE/DELETE whose command tag reported more
-// than one affected row, waiting for its G1 verdict.
-type multiRowMatch struct {
-	stmt    queuedStmt
-	matched int64
+	return firstErr
 }
 
 // attributeQueuedError wraps a per-statement execution error with the same

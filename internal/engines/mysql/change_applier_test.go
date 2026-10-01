@@ -123,7 +123,7 @@ func TestBuildUpdateSQL(t *testing.T) {
 	before := ir.Row{"id": int64(7), "email": "old@example.com"}
 	after := ir.Row{"id": int64(7), "email": "new@example.com", "active": false}
 
-	gotSQL, gotArgs, err := buildUpdateSQL("src", "users", before, after, nil)
+	gotSQL, gotArgs, err := buildUpdateSQL(addressEveryMatch, "src", "users", before, after, nil)
 	if err != nil {
 		t.Fatalf("buildUpdateSQL: %v", err)
 	}
@@ -140,7 +140,7 @@ func TestBuildUpdateSQL(t *testing.T) {
 
 func TestBuildDeleteSQL(t *testing.T) {
 	before := ir.Row{"id": int64(7), "email": "alice@example.com"}
-	gotSQL, gotArgs, err := buildDeleteSQL("src", "users", before, nil)
+	gotSQL, gotArgs, err := buildDeleteSQL(addressEveryMatch, "src", "users", before, nil)
 	if err != nil {
 		t.Fatalf("buildDeleteSQL: %v", err)
 	}
@@ -398,7 +398,7 @@ func TestBuildSQL_FiltersGeneratedColumns(t *testing.T) {
 	t.Run("UPDATE SET excludes generated column", func(t *testing.T) {
 		before := ir.Row{"id": int64(1), "price": "9.99", "cost": "4.50", "margin": "5.49"}
 		after := ir.Row{"id": int64(1), "price": "12.99", "cost": "4.50", "margin": "8.49"}
-		gotSQL, _, err := buildUpdateSQL("src", "products", before, after, colTypes)
+		gotSQL, _, err := buildUpdateSQL(addressEveryMatch, "src", "products", before, after, colTypes)
 		if err != nil {
 			t.Fatalf("buildUpdateSQL: %v", err)
 		}
@@ -411,7 +411,7 @@ func TestBuildSQL_FiltersGeneratedColumns(t *testing.T) {
 
 	t.Run("DELETE WHERE excludes generated column", func(t *testing.T) {
 		before := ir.Row{"id": int64(1), "price": "9.99", "cost": "4.50", "margin": "5.49"}
-		gotSQL, _, err := buildDeleteSQL("src", "products", before, colTypes)
+		gotSQL, _, err := buildDeleteSQL(addressEveryMatch, "src", "products", before, colTypes)
 		if err != nil {
 			t.Fatalf("buildDeleteSQL: %v", err)
 		}

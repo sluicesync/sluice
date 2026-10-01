@@ -235,7 +235,7 @@ func TestBuildSQL_VerbatimTypeCasts(t *testing.T) {
 	t.Run("UPDATE SET clause carries the cast", func(t *testing.T) {
 		before := ir.Row{"id": int64(1)}
 		after := ir.Row{"id": int64(1), "price": "$50.00", "lsn": "0/100"}
-		gotSQL, _, err := buildUpdateSQL("public", "t", before, after, colTypes, nil)
+		gotSQL, _, err := buildUpdateSQL(addressEveryMatch, "public", "t", before, after, colTypes, nil)
 		if err != nil {
 			t.Fatalf("buildUpdateSQL: %v", err)
 		}
@@ -251,7 +251,7 @@ func TestBuildSQL_VerbatimTypeCasts(t *testing.T) {
 
 	t.Run("WHERE equality predicate casts both sides", func(t *testing.T) {
 		before := ir.Row{"id": int64(1), "price": "$50.00"}
-		gotSQL, _, err := buildDeleteSQL("public", "t", before, colTypes)
+		gotSQL, _, err := buildDeleteSQL(addressEveryMatch, "public", "t", before, colTypes)
 		if err != nil {
 			t.Fatalf("buildDeleteSQL: %v", err)
 		}
@@ -345,7 +345,7 @@ func TestBuildUpdateSQL(t *testing.T) {
 	before := ir.Row{"id": int64(7), "email": "old@example.com"}
 	after := ir.Row{"id": int64(7), "email": "new@example.com", "active": false}
 
-	gotSQL, gotArgs, err := buildUpdateSQL("public", "users", before, after, nil, nil)
+	gotSQL, gotArgs, err := buildUpdateSQL(addressEveryMatch, "public", "users", before, after, nil, nil)
 	if err != nil {
 		t.Fatalf("buildUpdateSQL: %v", err)
 	}
@@ -382,7 +382,7 @@ func TestBuildUpdateSQL_EmptyAfterImageIsRefused(t *testing.T) {
 		for name, after := range afters {
 			t.Run(name+"/shardKeys="+strings.Join(shardKeys, ","), func(t *testing.T) {
 				t.Parallel()
-				stmt, _, err := buildUpdateSQL("public", "t", before, after, colTypes, shardKeys)
+				stmt, _, err := buildUpdateSQL(addressEveryMatch, "public", "t", before, after, colTypes, shardKeys)
 				if !errors.Is(err, appliershared.ErrEmptySetClause) {
 					t.Fatalf("stmt=%q err=%v; want a refusal wrapping appliershared.ErrEmptySetClause — pre-fix this "+
 						"was a silent no-op on every non-sharded target", stmt, err)
@@ -393,7 +393,7 @@ func TestBuildUpdateSQL_EmptyAfterImageIsRefused(t *testing.T) {
 	// The legitimate empty statement is untouched: an after-image whose
 	// only column is an UNCHANGED shard key trims to nothing and returns
 	// ("", nil) with no error.
-	stmt, _, err := buildUpdateSQL("public", "t", ir.Row{"id": int64(7), "v": "x"}, ir.Row{"id": int64(7)},
+	stmt, _, err := buildUpdateSQL(addressEveryMatch, "public", "t", ir.Row{"id": int64(7), "v": "x"}, ir.Row{"id": int64(7)},
 		map[string]*ir.Column{"id": {Name: "id"}, "v": {Name: "v"}}, []string{"id"})
 	if err != nil || stmt != "" {
 		t.Fatalf("unchanged-shard-key-only update: stmt=%q err=%v; want the empty no-work statement and no error", stmt, err)
@@ -402,7 +402,7 @@ func TestBuildUpdateSQL_EmptyAfterImageIsRefused(t *testing.T) {
 
 func TestBuildDeleteSQL(t *testing.T) {
 	before := ir.Row{"id": int64(7), "email": "alice@example.com"}
-	gotSQL, gotArgs, err := buildDeleteSQL("public", "users", before, nil)
+	gotSQL, gotArgs, err := buildDeleteSQL(addressEveryMatch, "public", "users", before, nil)
 	if err != nil {
 		t.Fatalf("buildDeleteSQL: %v", err)
 	}
@@ -685,7 +685,7 @@ func TestBuildSQL_FiltersGeneratedColumns(t *testing.T) {
 	t.Run("UPDATE SET and WHERE both exclude generated column", func(t *testing.T) {
 		before := ir.Row{"id": int64(1), "price": "9.99", "cost": "4.50", "margin": "5.49"}
 		after := ir.Row{"id": int64(1), "price": "12.99", "cost": "4.50", "margin": "8.49"}
-		gotSQL, _, err := buildUpdateSQL("public", "products", before, after, colTypes, nil)
+		gotSQL, _, err := buildUpdateSQL(addressEveryMatch, "public", "products", before, after, colTypes, nil)
 		if err != nil {
 			t.Fatalf("buildUpdateSQL: %v", err)
 		}
@@ -697,7 +697,7 @@ func TestBuildSQL_FiltersGeneratedColumns(t *testing.T) {
 
 	t.Run("DELETE WHERE excludes generated column", func(t *testing.T) {
 		before := ir.Row{"id": int64(1), "price": "9.99", "cost": "4.50", "margin": "5.49"}
-		gotSQL, _, err := buildDeleteSQL("public", "products", before, colTypes)
+		gotSQL, _, err := buildDeleteSQL(addressEveryMatch, "public", "products", before, colTypes)
 		if err != nil {
 			t.Fatalf("buildDeleteSQL: %v", err)
 		}

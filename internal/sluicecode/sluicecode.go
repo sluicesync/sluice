@@ -625,8 +625,8 @@ const (
 
 	// CodeCDCKeyMatchedMultipleRows fires when a CDC UPDATE or DELETE that
 	// names its row by key matched MORE than one row on the target (GC-42,
-	// marker KEY-SCOPED-WRITE-MATCHED-MULTIPLE-ROWS); only a keyless table
-	// addressed by its whole row is exempt. The main cause is a DEFERRABLE
+	// marker KEY-SCOPED-WRITE-MATCHED-MULTIPLE-ROWS); there is no exemption — a
+	// keyless whole-row write is addressed to one row. The main cause is a DEFERRABLE
 	// primary key on a Postgres target mid-way through a source transaction
 	// that moves key values through each other: a key-narrowed change carries
 	// only the old key, two target rows share it, and applying it would

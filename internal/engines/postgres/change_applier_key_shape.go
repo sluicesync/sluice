@@ -27,12 +27,13 @@ package postgres
 // statement with [guardKeyScopedWrite] and [ChangeApplier.sendBatchUnderDeadline]
 // grades the command tags. TestKeyScopedWriteRoster holds both to it.
 //
-// The guard costs NOTHING on the healthy path: the affected-row count comes
-// back with every statement, and only a count above one needs the table's
-// key shape (is it keyless, and does the before-image cover the whole row?)
-// to choose between refusing and the keyless exemption. That catalog read
-// ([ChangeApplier.tableHasRowKey]) runs only then — never once per table, never
-// on a timer — mirroring the MySQL applier.
+// The guard reads only the affected-row count each statement already returns,
+// so it costs nothing on the healthy path. It has no exemption: its sibling,
+// the keyless one-row address ([ChangeApplier.rowAddressFor]), makes a keyless
+// table's whole-row write touch exactly one of its identical copies — before
+// it, that write deleted or rewrote EVERY copy, silent since v0.1.0. Choosing
+// the address needs the table's key for whole-row writes only, read once per
+// table per run ([ChangeApplier.tableHasRowKey]).
 //
 // # Replica mode and the deferred re-check: detected, not changed
 //
@@ -92,8 +93,8 @@ const (
 // tableRowKeySQL reports whether a TARGET table has a PRIMARY KEY or a
 // NOT NULL, non-partial, non-expression unique index — of ANY deferrability:
 // a deferrable key still identifies one row once its transaction commits,
-// which is exactly the promise a multi-row match breaks. Read only on the
-// rare multi-row path ([keyScopedWrite.verdict]).
+// which is exactly the promise a multi-row match breaks. Read only for a
+// whole-row write ([ChangeApplier.rowAddressFor]).
 const tableRowKeySQL = `
 	SELECT EXISTS (
 		SELECT 1 FROM pg_index ix
@@ -132,17 +133,119 @@ const tableDeferrableSQL = `
 	WHERE n.nspname = $1 AND c.relname = $2`
 
 // tableHasRowKey reports whether the TARGET table has a key
-// ([tableRowKeySQL]). Not cached: it runs only when a write already matched
-// more than one row, which ends in a refusal or a keyless exemption — rare
-// by construction. It reads on the primary pool, never on an apply
-// transaction or a pinned pipelined backend. A probe error is returned:
-// guessing "keyless" would exempt the write — the silent direction.
+// ([tableRowKeySQL]), cached per table for the applier run and dropped on a
+// schema boundary. It is read only for a write whose before-image covers the
+// whole row ([ChangeApplier.rowAddressFor]) — a key-narrowed write needs no
+// key knowledge — on the primary pool, never on an apply transaction or a
+// pinned pipelined backend. A probe error is returned: guessing either way
+// would decide how many rows the write may touch.
 func (a *ChangeApplier) tableHasRowKey(ctx context.Context, schema, table string) (bool, error) {
+	qn := schemaTableKey(schema, table)
+	if keyed, ok := a.cachedRowKey(qn); ok {
+		return keyed, nil
+	}
 	var keyed bool
 	if err := a.db.QueryRowContext(ctx, tableRowKeySQL, schema, table).Scan(&keyed); err != nil {
 		return false, fmt.Errorf("postgres: applier: read the key of %s.%s: %w", schema, table, err)
 	}
+	a.storeRowKey(qn, keyed)
 	return keyed, nil
+}
+
+func (a *ChangeApplier) cachedRowKey(qn string) (keyed, ok bool) {
+	a.cacheMu.RLock()
+	defer a.cacheMu.RUnlock()
+	keyed, ok = a.rowKeyCache[qn]
+	return keyed, ok
+}
+
+func (a *ChangeApplier) storeRowKey(qn string, keyed bool) {
+	a.cacheMu.Lock()
+	defer a.cacheMu.Unlock()
+	if a.rowKeyCache == nil {
+		a.rowKeyCache = make(map[string]bool)
+	}
+	a.rowKeyCache[qn] = keyed
+}
+
+// rowAddress is how an UPDATE/DELETE's WHERE reaches its row.
+type rowAddress int
+
+const (
+	// addressEveryMatch: the WHERE as built. Right for a keyed table — the
+	// key makes the match unique — and for a key-narrowed before-image,
+	// where the multi-row guard refuses any second match.
+	addressEveryMatch rowAddress = iota
+	// addressOneRow: exactly one of the rows the whole-row WHERE matches. A
+	// keyless table can hold identical rows, a source changes ONE of them,
+	// and its whole image matches every copy — before GC-42's keyless fix
+	// the target deleted or rewrote them all (silent since v0.1.0). Which
+	// copy is immaterial: they are identical in every column.
+	addressOneRow
+)
+
+// rowAddressFor picks the address for a write: addressOneRow exactly when the
+// target table has no key AND the before-image names every non-generated
+// target column (a whole-row predicate). A key-narrowed image against a
+// keyless table keeps addressEveryMatch, so a second match is refused rather
+// than resolved by picking a row the source may not have meant.
+func (a *ChangeApplier) rowAddressFor(ctx context.Context, schema, table string, before ir.Row, colTypes map[string]*ir.Column) (rowAddress, error) {
+	if !appliershared.WholeRowImage(before, colTypes) {
+		return addressEveryMatch, nil
+	}
+	keyed, err := a.tableHasRowKey(ctx, schema, table)
+	if err != nil || keyed {
+		return addressEveryMatch, err
+	}
+	return addressOneRow, nil
+}
+
+// rowTargetSQL renders the WHERE body for addr. The one-row form addresses
+// the physical row by (tableoid, ctid): ctid alone repeats across the
+// partitions (or inheritance children) of the table the statement names, so
+// a bare `ctid = …` against a partitioned parent would also hit the other
+// partitions' rows at that position. The inner predicate is the same
+// NULL-aware whole-row WHERE, so a NULL column still matches its NULL.
+func rowTargetSQL(tableRef, whereSQL string, addr rowAddress) string {
+	if addr != addressOneRow {
+		return whereSQL
+	}
+	return "(tableoid, ctid) = (SELECT tableoid, ctid FROM " + tableRef + " WHERE " + whereSQL + " LIMIT 1)"
+}
+
+// keyScopedWrite is the G1 check carried by an UPDATE/DELETE.
+type keyScopedWrite struct {
+	op     string // "update" / "delete"
+	before ir.Row
+}
+
+// guardKeyScopedWrite returns the G1 check for a write. Every UPDATE/DELETE
+// carries one: a key-scoped write may match at most one row (its key), and a
+// keyless whole-row write is addressed to one row ([addressOneRow]), so more
+// than one is never right.
+func guardKeyScopedWrite(op string, before ir.Row) *keyScopedWrite {
+	return &keyScopedWrite{op: op, before: before}
+}
+
+// verdict refuses a write that matched more than one row. Decided from the
+// count alone — the healthy path reads nothing.
+func (k *keyScopedWrite) verdict(schema, table string, matched int64) error {
+	if k == nil || matched <= 1 {
+		return nil
+	}
+	return appliershared.RefuseKeyScopedMultiMatch(engineNamePostgres, k.op, schema, table, k.before, matched)
+}
+
+// checkKeyScopedResult is G1 on the serial path: it reads the exec's
+// affected-row count and grades it. pgx's stdlib driver always reports the
+// count (from the command tag), so a read error is a driver change the guard
+// must not paper over, and is returned.
+func checkKeyScopedResult(op, schema, table string, before ir.Row, res sql.Result) error {
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("postgres: applier: read rows affected by %s on %s.%s: %w", op, schema, table, err)
+	}
+	return guardKeyScopedWrite(op, before).verdict(schema, table, n)
 }
 
 // markDeferrableChecked records that qn's deferrable constraints have been
@@ -202,56 +305,6 @@ func (a *ChangeApplier) noteUnenforcedDeferrable(ctx context.Context, schema, ta
 		slog.String("hint", "give the target the same constraint as the source (if the source has no such constraint, "+
 			"drop it on the target or make it NOT DEFERRABLE so a violating row is refused at its statement); "+
 			"`REINDEX TABLE <table>` checks whether any violating row already landed"))
-}
-
-// keyScopedWrite is the G1 check carried by an UPDATE/DELETE: what the
-// verdict needs if the statement matched more than one row.
-type keyScopedWrite struct {
-	op       string // "update" / "delete"
-	before   ir.Row
-	colTypes map[string]*ir.Column
-}
-
-// guardKeyScopedWrite returns the G1 check for a write. Every UPDATE/DELETE
-// carries one; whether it is exempt is decided only if it matches more than
-// one row ([keyScopedWrite.verdict]).
-func guardKeyScopedWrite(op string, before ir.Row, colTypes map[string]*ir.Column) *keyScopedWrite {
-	return &keyScopedWrite{op: op, before: before, colTypes: colTypes}
-}
-
-// verdict refuses a write that matched more than one row, unless the target
-// is keyless and the before-image is the whole row
-// ([appliershared.KeyScopedWriteExempt]). keyed is consulted ONLY when
-// matched > 1, so the healthy path reads no catalog.
-func (k *keyScopedWrite) verdict(schema, table string, matched int64, keyed func() (bool, error)) error {
-	if k == nil || matched <= 1 {
-		return nil
-	}
-	isKeyed, err := keyed()
-	if err != nil {
-		return err
-	}
-	if appliershared.KeyScopedWriteExempt(isKeyed, k.before, k.colTypes) {
-		return nil
-	}
-	return appliershared.RefuseKeyScopedMultiMatch(engineNamePostgres, k.op, schema, table, k.before, matched)
-}
-
-// verdictOn is [keyScopedWrite.verdict] with the key read from the target.
-func (k *keyScopedWrite) verdictOn(ctx context.Context, a *ChangeApplier, schema, table string, matched int64) error {
-	return k.verdict(schema, table, matched, func() (bool, error) { return a.tableHasRowKey(ctx, schema, table) })
-}
-
-// checkKeyScopedResult is G1 on the serial path: it reads the exec's
-// affected-row count and grades it. pgx's stdlib driver always reports the
-// count (from the command tag), so a read error is a driver change the guard
-// must not paper over, and is returned.
-func (a *ChangeApplier) checkKeyScopedResult(ctx context.Context, op, schema, table string, before ir.Row, colTypes map[string]*ir.Column, res sql.Result) error {
-	n, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("postgres: applier: read rows affected by %s on %s.%s: %w", op, schema, table, err)
-	}
-	return guardKeyScopedWrite(op, before, colTypes).verdictOn(ctx, a, schema, table, n)
 }
 
 // annotateDeferredCheckFailure marks a COMMIT refused by a deferred

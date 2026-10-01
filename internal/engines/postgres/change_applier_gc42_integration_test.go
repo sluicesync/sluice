@@ -675,9 +675,9 @@ func gc42WarnedFor(log, table string) bool {
 //     before-image (a keyed source under REPLICA IDENTITY FULL): the target
 //     has no key, but the WHERE is not the whole row, so it is not exempt.
 //
-// Then the two things the guard must NOT refuse: a write that matches zero
-// rows (ADR-0010 resume idempotency) and a keyless table's identical rows
-// addressed by the whole row (the ADR-0089 caveat).
+// And the one thing it must NOT refuse: a write that matches zero rows
+// (ADR-0010 resume idempotency). A keyless table's identical rows are
+// TestGC42_KeylessIdenticalRows'.
 func TestGC42_MultiRowMatchRefused(t *testing.T) {
 	type cell struct {
 		name, ddl, seed string
@@ -711,9 +711,6 @@ func TestGC42_MultiRowMatchRefused(t *testing.T) {
 				ir.Delete{Schema: "public", Table: table, Before: ir.Row{"id": int64(98)}},
 			}
 		}, gc42Converge},
-		{"keyless_exempt", `CREATE TABLE %[1]s (id int, v text)`, `INSERT INTO %[1]s VALUES (1,'a'),(1,'a'),(2,'b')`, func(table string) []ir.Change {
-			return []ir.Change{ir.Delete{Schema: "public", Table: table, Before: ir.Row{"id": int64(1), "v": "a"}}}
-		}, gc42Converge},
 	}
 	for _, env := range gc42Envs(t) {
 		for _, c := range cells {
@@ -731,6 +728,63 @@ func TestGC42_MultiRowMatchRefused(t *testing.T) {
 						if !strings.Contains(err.Error(), table) {
 							t.Errorf("the refusal does not name the table: %v", err)
 						}
+					}
+				})
+			}
+		}
+	}
+}
+
+// TestGC42_KeylessIdenticalRows pins that a change to ONE of several
+// identical rows of a keyless table reaches exactly one target row. The
+// source (a keyless table under REPLICA IDENTITY FULL, a trigger source, a
+// MySQL binlog full image) deletes or updates one physical row and sends its
+// whole image; the applier's whole-row WHERE matches every identical copy, and
+// before the fix it deleted or rewrote them all — silent, at exit 0, since
+// v0.1.0. The partitioned cell is the reason the one-row address is
+// (tableoid, ctid) and not ctid alone: a ctid repeats across partitions, so a
+// bare `ctid = …` against the parent also hits the other partition's row.
+func TestGC42_KeylessIdenticalRows(t *testing.T) {
+	type cell struct {
+		name, ddl, seed string
+		rows            func(table string) []ir.Change
+		wantState       string
+	}
+	const plain = `CREATE TABLE %[1]s (id int, v text)`
+	cells := []cell{
+		{"delete", plain, `INSERT INTO %[1]s VALUES (1,'a'),(1,'a'),(2,'b')`, func(table string) []ir.Change {
+			return []ir.Change{ir.Delete{Schema: "public", Table: table, Before: ir.Row{"id": int64(1), "v": "a"}}}
+		}, "(1,a) (2,b)"},
+		{"update", plain, `INSERT INTO %[1]s VALUES (1,'a'),(1,'a')`, func(table string) []ir.Change {
+			return []ir.Change{ir.Update{Schema: "public", Table: table, Before: ir.Row{"id": int64(1), "v": "a"}, After: ir.Row{"id": int64(1), "v": "z"}}}
+		}, "(1,a) (1,z)"},
+		{"delete_null", plain, `INSERT INTO %[1]s VALUES (1,NULL),(1,NULL)`, func(table string) []ir.Change {
+			return []ir.Change{ir.Delete{Schema: "public", Table: table, Before: ir.Row{"id": int64(1), "v": nil}}}
+		}, "(1,)"},
+		{
+			"partitioned", `CREATE TABLE %[1]s (id int, v text) PARTITION BY LIST (id);
+			CREATE TABLE %[1]s_p1 PARTITION OF %[1]s FOR VALUES IN (1);
+			CREATE TABLE %[1]s_p2 PARTITION OF %[1]s FOR VALUES IN (2);`,
+			`INSERT INTO %[1]s VALUES (1,'a'),(1,'a'),(2,'b')`, func(table string) []ir.Change {
+				return []ir.Change{ir.Delete{Schema: "public", Table: table, Before: ir.Row{"id": int64(1), "v": "a"}}}
+			}, "(1,a) (2,b)",
+		},
+	}
+	for _, env := range gc42Envs(t) {
+		for _, c := range cells {
+			for _, p := range gc42Paths(1000) {
+				t.Run(env.name+"/"+c.name+"/"+p.name, func(t *testing.T) {
+					table := gc42Name(t, "kl", env.name, c.name, p.name)
+					gc42Table(t, env, table, c.ddl, c.seed)
+					if env.role != "" && c.name == "partitioned" {
+						for _, part := range []string{"_p1", "_p2"} {
+							applyPGApplier(t, env.adminDSN, fmt.Sprintf(`ALTER TABLE %s%s OWNER TO %s;`, table, part, env.role))
+						}
+					}
+					err := gc42Apply(t, env, p, table, gc42Tx(table, c.rows(table)...))
+					gc42Assert(t, err, gc42Converge, "")
+					if got := gc42State(t, env.adminDSN, table); got != c.wantState {
+						t.Errorf("target = %q; want %q — one of the identical rows, not all of them", got, c.wantState)
 					}
 				})
 			}

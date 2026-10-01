@@ -54,9 +54,10 @@ func (e *keyScopedMultiMatchError) Terminal() bool { return true }
 // that was a silent loss at exit 0. No applier can recover the intended row
 // from a narrowed before-image, so refusing is the decision, not a fallback.
 //
-// Callers skip only the writes [KeyScopedWriteExempt] exempts (a keyless
-// table addressed by its whole row). Zero rows stays tolerated (ADR-0010
-// resume idempotency); only MORE than one is refused.
+// It applies to EVERY UPDATE/DELETE, decided from the count alone: a keyed
+// table's key matches one row, and a keyless table's whole-row write is
+// addressed to one row ([WholeRowImage]), so a second match is never right.
+// Zero rows stays tolerated (ADR-0010 resume idempotency).
 //
 // The key VALUES are named because they are what an operator must query to
 // triage. They are post-redaction (the applier redacts before dispatch), so
@@ -75,22 +76,24 @@ func RefuseKeyScopedMultiMatch(engine, op, schema, table string, before ir.Row, 
 	})
 }
 
-// KeyScopedWriteExempt reports whether an UPDATE/DELETE is exempt from the
-// multi-row check: the target table has no key (keyed is false: no PRIMARY
-// KEY and no NOT NULL unique index) AND the before-image names every
-// non-generated target column, so the WHERE is the whole row. Two rows that
-// match a whole-row predicate are identical, and which one goes is the
-// ADR-0089 keyless caveat, not a mis-addressed write.
+// WholeRowImage reports whether a before-image names every non-generated
+// target column, so a WHERE built from it is the whole row. It is the first
+// half of the keyless one-row address (GC-42): against a table with no key
+// (no PRIMARY KEY and no NOT NULL unique index), a whole-row WHERE matches
+// every IDENTICAL copy of the row, while the source changed exactly one of
+// them — so the appliers address one row instead (Postgres by
+// (tableoid, ctid), MySQL with LIMIT 1). Which copy is immaterial: they are
+// identical in every column.
 //
-// Keylessness alone is NOT enough, because the before-image's narrowing
-// follows the SOURCE: a source with a key under REPLICA IDENTITY FULL (or a
-// trigger source) sends a before-image of only its key columns, and against
-// an operator-made keyless target `DELETE … WHERE id = 2` would delete every
-// row with that id. Such a write is checked like any keyed one. An empty
-// colTypes (an unknown target shape) cannot prove the image covers the row,
-// so it is not exempt.
-func KeyScopedWriteExempt(keyed bool, before ir.Row, colTypes map[string]*ir.Column) bool {
-	return !keyed && len(colTypes) > 0 && len(MissingNonGeneratedColumns(before, colTypes)) == 0
+// Keylessness alone is NOT enough to pick one row, because the before-image's
+// narrowing follows the SOURCE: a keyed source under REPLICA IDENTITY FULL (or
+// a trigger source) sends only its key columns, and against an operator-made
+// keyless target `DELETE … WHERE id = 2` matches rows that DIFFER in other
+// columns — picking one would be a guess. Such a write keeps its every-match
+// WHERE, and the multi-row check refuses a second match. An empty colTypes (an
+// unknown target shape) cannot prove the image covers the row.
+func WholeRowImage(before ir.Row, colTypes map[string]*ir.Column) bool {
+	return len(colTypes) > 0 && len(MissingNonGeneratedColumns(before, colTypes)) == 0
 }
 
 // verbFor is the operator-facing consequence of a multi-matched op.

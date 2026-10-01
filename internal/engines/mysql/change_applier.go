@@ -495,6 +495,12 @@ type ChangeApplier struct {
 	// Mirrors RowWriter.warnedClamp on the bulk side.
 	warnedClamp sync.Map
 
+	// rowKeyCache maps qualified "schema.table" → bool: whether the target
+	// table has a key, read for whole-row writes to choose the keyless
+	// one-row address (GC-42, [ChangeApplier.tableHasRowKey]). A sync.Map for
+	// the same reason as warnedClamp; dropped on a schema boundary.
+	rowKeyCache sync.Map
+
 	// clampProbes counts the value-writing statements considered for the
 	// relaxed-mode Vector B probe, driving the [warningsCheckDue] sampling
 	// schedule (shared with the batched bulk path — see row_writer.go for
@@ -1526,7 +1532,11 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		if err != nil {
 			return false, fmt.Errorf("mysql: applier: column types for %s.%s: %w", schema, v.Table, err)
 		}
-		stmt, args, err := buildUpdateSQL(schema, v.Table, v.Before, v.After, colTypes)
+		addr, err := a.rowAddressFor(ctx, schema, v.Table, v.Before, colTypes)
+		if err != nil {
+			return false, err
+		}
+		stmt, args, err := buildUpdateSQL(addr, schema, v.Table, v.Before, v.After, colTypes)
 		if err != nil {
 			return false, fmt.Errorf("mysql: applier: build update for %s.%s: %w", schema, v.Table, err)
 		}
@@ -1542,9 +1552,9 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		}
 		// Nothing here may run a statement on tx before the Vector B probe
 		// below reads the UPDATE's diagnostics area: logZeroRowsAffected and
-		// checkKeyScopedResult read the driver-cached rows-affected count, and
-		// the latter's key probe (only when it exceeds one) runs on the pool.
-		if err := a.checkKeyScopedResult(ctx, "update", schema, v.Table, v.Before, colTypes, res); err != nil {
+		// checkKeyScopedResult read only the driver-cached rows-affected count
+		// (rowAddressFor's key probe ran on the pool, before the UPDATE).
+		if err := checkKeyScopedResult("update", schema, v.Table, v.Before, res); err != nil {
 			return false, err
 		}
 		logZeroRowsAffected(ctx, "update", schema, v.Table, res)
@@ -1559,7 +1569,11 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		if err != nil {
 			return false, fmt.Errorf("mysql: applier: column types for %s.%s: %w", schema, v.Table, err)
 		}
-		stmt, args, err := buildDeleteSQL(schema, v.Table, v.Before, colTypes)
+		addr, err := a.rowAddressFor(ctx, schema, v.Table, v.Before, colTypes)
+		if err != nil {
+			return false, err
+		}
+		stmt, args, err := buildDeleteSQL(addr, schema, v.Table, v.Before, colTypes)
 		if err != nil {
 			return false, fmt.Errorf("mysql: applier: build delete for %s.%s: %w", schema, v.Table, err)
 		}
@@ -1568,7 +1582,7 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		if err != nil {
 			return false, fmt.Errorf("mysql: applier: delete from %s.%s: %w", schema, v.Table, err)
 		}
-		if err := a.checkKeyScopedResult(ctx, "delete", schema, v.Table, v.Before, colTypes, res); err != nil {
+		if err := checkKeyScopedResult("delete", schema, v.Table, v.Before, res); err != nil {
 			return false, err
 		}
 		logZeroRowsAffected(ctx, "delete", schema, v.Table, res)
@@ -1730,35 +1744,30 @@ func (a *ChangeApplier) reportApplyClampWarnings(ctx context.Context, tx *sql.Tx
 // checkKeyScopedResult is the MySQL half of GC-42's class guard: an UPDATE or
 // DELETE that touched more than one row is refused
 // ([appliershared.RefuseKeyScopedMultiMatch]) and the caller rolls the
-// transaction back — unless [appliershared.KeyScopedWriteExempt] exempts it (a
-// keyless table addressed by its whole row). "Keyed" means what it means on
-// Postgres: a PRIMARY KEY or a unique index over NOT NULL columns.
+// transaction back. Decided from the count alone: a keyed table's key matches
+// one row, and a keyless table's whole-row write carries LIMIT 1
+// ([addressOneRow]), so a second row is never right.
 //
-// On MySQL it is a backstop, not a live path. MySQL has no DEFERRABLE
-// constraint — InnoDB checks a PRIMARY KEY and every UNIQUE index per row, and
-// sluice sets neither unique_checks=0 nor anything else that relaxes it — so
-// the Postgres mechanism (a key transiently shared mid-transaction) cannot
-// arise, and a before-image that carries a target key matches at most one
-// row. What remains is a before-image that does NOT carry one: a Postgres
-// source under REPLICA IDENTITY USING INDEX narrows the before-image to that
-// index's columns, and a target without the matching unique index would match
-// every row sharing them; and a key-narrowed before-image against a keyless
-// target.
-//
-// The healthy path costs nothing: the count is driver-cached, and the key
-// probe runs only when it exceeds one — on the applier's pool, NOT on the
-// apply tx, because any statement on the tx resets the diagnostics area the
-// UPDATE arm's reportApplyClampWarnings reads afterwards.
+// On MySQL it is a backstop. MySQL has no DEFERRABLE constraint — InnoDB
+// checks a PRIMARY KEY and every UNIQUE index per row, and sluice sets neither
+// unique_checks=0 nor anything else that relaxes it — so the Postgres
+// mechanism (a key transiently shared mid-transaction) cannot arise. What
+// remains is a before-image that does not carry a target key: one narrowed to
+// columns the target does not hold unique (a Postgres source under REPLICA
+// IDENTITY USING INDEX), or a key-narrowed one against a keyless target. It
+// reads only the driver-cached count, so it runs no statement on the tx and
+// leaves the UPDATE's diagnostics area for reportApplyClampWarnings.
 //
 // RowsAffected is MySQL's CHANGED-rows count (the driver does not set
-// CLIENT_FOUND_ROWS), so a matched row whose values were already the
-// after-image is not counted. More than one changed row is still proof of a
-// multi-row match; the undercount needs two matched rows already identical
-// to the after-image, which a keyed table cannot hold. The coalesced
-// `DELETE … WHERE pk IN (…)` (change_applier_multirow.go) is keyed by the
-// target's own PRIMARY KEY, so each listed key matches at most one row by
-// construction and it carries no check.
-func (a *ChangeApplier) checkKeyScopedResult(ctx context.Context, op, schema, table string, before ir.Row, colTypes map[string]*ir.Column, res sql.Result) error {
+// CLIENT_FOUND_ROWS): a matched row already equal to the after-image is not
+// counted, so a two-row match where one row already held the after-image
+// reports 1 and passes. That undercount is benign for the statement at hand —
+// the uncounted row was left as it was — but it means the check sees a
+// multi-row UPDATE only when at least two rows CHANGE; a DELETE's count is
+// exact. The coalesced `DELETE … WHERE pk IN (…)` (change_applier_multirow.go)
+// is keyed by the target's own PRIMARY KEY, so each listed key matches at most
+// one row by construction and it carries no check.
+func checkKeyScopedResult(op, schema, table string, before ir.Row, res sql.Result) error {
 	n, err := res.RowsAffected()
 	if err != nil {
 		return fmt.Errorf("mysql: applier: read rows affected by %s on %s.%s: %w", op, schema, table, err)
@@ -1766,22 +1775,22 @@ func (a *ChangeApplier) checkKeyScopedResult(ctx context.Context, op, schema, ta
 	if n <= 1 {
 		return nil
 	}
-	keyed, err := a.tableHasRowKey(ctx, schema, table)
-	if err != nil {
-		return err
-	}
-	if appliershared.KeyScopedWriteExempt(keyed, before, colTypes) {
-		return nil
-	}
 	return appliershared.RefuseKeyScopedMultiMatch(engineNameMySQL, op, schema, table, before, n)
 }
 
 // tableHasRowKey reports whether the table has a PRIMARY KEY or a unique
 // index whose every part is a NOT NULL column (a functional key part has no
-// column and does not count). Read on the applier's pool — see
-// [ChangeApplier.checkKeyScopedResult] for why not on the apply tx. A probe
-// error is returned: guessing either way would decide a refusal blind.
+// column and does not count) — Postgres's notion of a key, so both appliers
+// choose the one-row address ([rowAddressFor]) for the same tables. Read only
+// for a whole-row write, once per table per applier run, on the applier's
+// pool (never on the apply tx, whose diagnostics area the UPDATE arm's
+// reportApplyClampWarnings still has to read). A probe error is returned:
+// guessing either way would decide how many rows the write may touch.
 func (a *ChangeApplier) tableHasRowKey(ctx context.Context, schema, table string) (bool, error) {
+	qn := qualifiedName(schema, table)
+	if keyed, ok := a.rowKeyCache.Load(qn); ok {
+		return keyed.(bool), nil
+	}
 	const q = `SELECT COUNT(*) FROM (
 		SELECT index_name FROM information_schema.statistics
 		WHERE table_schema = ? AND table_name = ? AND non_unique = 0
@@ -1791,6 +1800,7 @@ func (a *ChangeApplier) tableHasRowKey(ctx context.Context, schema, table string
 	if err := a.db.QueryRowContext(ctx, q, schema, table).Scan(&n); err != nil {
 		return false, fmt.Errorf("mysql: applier: key probe for %s.%s: %w", schema, table, err)
 	}
+	a.rowKeyCache.Store(qn, n > 0)
 	return n > 0, nil
 }
 
@@ -2201,7 +2211,11 @@ func buildInsertSQL(schema, table string, row ir.Row, pk []string, colTypes map[
 // stream nor the row, and the coalescing path never reached it at all.
 // See [appliershared.RefuseNoRowPredicate] for why refusing beats every
 // alternative, and why both engines make the same call.
-func buildUpdateSQL(schema, table string, before, after ir.Row, colTypes map[string]*ir.Column) (sqlStmt string, args []any, err error) {
+//
+// addr says how the WHERE reaches the row ([rowAddress]): every match, or
+// exactly one of the identical rows a keyless table's whole-row WHERE
+// matches (GC-42; `LIMIT 1`).
+func buildUpdateSQL(addr rowAddress, schema, table string, before, after ir.Row, colTypes map[string]*ir.Column) (sqlStmt string, args []any, err error) {
 	if len(appliershared.NonGeneratedRowKeys(before, colTypes)) == 0 {
 		return "", nil, appliershared.RefuseNoRowPredicate(engineNameMySQL, "update", schema, table, before)
 	}
@@ -2218,14 +2232,15 @@ func buildUpdateSQL(schema, table string, before, after ir.Row, colTypes map[str
 	args = make([]any, 0, len(setArgs)+len(whereArgs))
 	args = append(args, setArgs...)
 	args = append(args, whereArgs...)
-	return "UPDATE " + tableRef + " SET " + setSQL + " WHERE " + whereSQL, args, nil
+	return "UPDATE " + tableRef + " SET " + setSQL + " WHERE " + whereSQL + addr.limitSQL(), args, nil
 }
 
 // buildDeleteSQL builds a DELETE statement using the Before image
-// as the WHERE predicate. An unusable before-image is refused for the
+// as the WHERE predicate, reaching the row(s) as addr says (see
+// [buildUpdateSQL]). An unusable before-image is refused for the
 // same reason as [buildUpdateSQL] — and the stakes are higher, since a
 // predicate-less DELETE that reached the server would empty the table.
-func buildDeleteSQL(schema, table string, before ir.Row, colTypes map[string]*ir.Column) (sqlStmt string, args []any, err error) {
+func buildDeleteSQL(addr rowAddress, schema, table string, before ir.Row, colTypes map[string]*ir.Column) (sqlStmt string, args []any, err error) {
 	if len(appliershared.NonGeneratedRowKeys(before, colTypes)) == 0 {
 		return "", nil, appliershared.RefuseNoRowPredicate(engineNameMySQL, "delete", schema, table, before)
 	}
@@ -2234,7 +2249,55 @@ func buildDeleteSQL(schema, table string, before ir.Row, colTypes map[string]*ir
 	if err != nil {
 		return "", nil, err
 	}
-	return "DELETE FROM " + tableRef + " WHERE " + whereSQL, whereArgs, nil
+	return "DELETE FROM " + tableRef + " WHERE " + whereSQL + addr.limitSQL(), whereArgs, nil
+}
+
+// rowAddress is how an UPDATE/DELETE's WHERE reaches its row (GC-42).
+type rowAddress int
+
+const (
+	// addressEveryMatch: the WHERE as built. Right for a keyed table — the
+	// key makes the match unique — and for a key-narrowed before-image,
+	// where the multi-row check refuses any second match.
+	addressEveryMatch rowAddress = iota
+	// addressOneRow: exactly one of the rows the whole-row WHERE matches. A
+	// keyless table can hold identical rows, a source changes ONE of them,
+	// and its whole image matches every copy — before GC-42's keyless fix
+	// the target deleted or rewrote them all (silent since v0.1.0). Which
+	// copy is immaterial: they are identical in every column.
+	//
+	// Spelled `LIMIT 1`, which MySQL accepts on single-table UPDATE and
+	// DELETE. Two consequences, both loud and both confined to keyless
+	// tables: the server classes LIMIT without ORDER BY as unsafe for
+	// STATEMENT-based binary logging (warning 1592 when the TARGET logs in
+	// STATEMENT format — with sluice's relaxed `--mysql-sql-mode=''` that
+	// warning reaches the clamp WARN), and a sharded Vitess keyspace may
+	// refuse a multi-shard DML with LIMIT.
+	addressOneRow
+)
+
+// limitSQL is the statement suffix addr needs.
+func (addr rowAddress) limitSQL() string {
+	if addr == addressOneRow {
+		return " LIMIT 1"
+	}
+	return ""
+}
+
+// rowAddressFor picks the address for a write: addressOneRow exactly when the
+// target table has no key AND the before-image is the whole row
+// ([appliershared.WholeRowImage]). A key-narrowed image against a keyless
+// table keeps addressEveryMatch, so a second match is refused rather than
+// resolved by picking a row the source may not have meant.
+func (a *ChangeApplier) rowAddressFor(ctx context.Context, schema, table string, before ir.Row, colTypes map[string]*ir.Column) (rowAddress, error) {
+	if !appliershared.WholeRowImage(before, colTypes) {
+		return addressEveryMatch, nil
+	}
+	keyed, err := a.tableHasRowKey(ctx, schema, table)
+	if err != nil || keyed {
+		return addressEveryMatch, err
+	}
+	return addressOneRow, nil
 }
 
 // buildTruncateSQL builds a TRUNCATE TABLE statement.

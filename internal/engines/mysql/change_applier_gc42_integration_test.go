@@ -44,29 +44,38 @@ func TestGC42_MySQLMultiRowMatchRefused(t *testing.T) {
 		name, ddl string
 		row       func(table string) ir.Change
 		refused   bool
+		wantState string // when not refused and non-empty: the target afterwards
 	}{
 		{"upd", pkTable, func(table string) ir.Change {
 			return ir.Update{Schema: "target_db", Table: table, Before: ir.Row{"u": "x"}, After: ir.Row{"u": "x", "v": "z"}}
-		}, true},
+		}, true, ""},
 		{"del", pkTable, func(table string) ir.Change {
 			return ir.Delete{Schema: "target_db", Table: table, Before: ir.Row{"u": "x"}}
-		}, true},
+		}, true, ""},
 		// Keyed by a NOT NULL unique index alone, as Postgres counts it.
 		{"uniq", "CREATE TABLE %[1]s (k VARCHAR(8) NOT NULL UNIQUE, u VARCHAR(8) NOT NULL, v VARCHAR(8)); INSERT INTO %[1]s VALUES ('1','x','a'),('2','x','b');", func(table string) ir.Change {
 			return ir.Delete{Schema: "target_db", Table: table, Before: ir.Row{"u": "x"}}
-		}, true},
+		}, true, ""},
 		// A keyless target fed a key-narrowed before-image is not exempt.
 		{"kl_narrow", "CREATE TABLE %[1]s (id INT, v VARCHAR(8)); INSERT INTO %[1]s VALUES (2,'a'),(2,'b');", func(table string) ir.Change {
 			return ir.Delete{Schema: "target_db", Table: table, Before: ir.Row{"id": int64(2)}}
-		}, true},
-		// A keyless table addressed by its whole row is (ADR-0089 caveat).
-		{"kl_whole", "CREATE TABLE %[1]s (id INT, v VARCHAR(8)); INSERT INTO %[1]s VALUES (1,'a'),(1,'a');", func(table string) ir.Change {
+		}, true, ""},
+		// One of two identical rows of a keyless table, addressed by the
+		// whole row: exactly ONE copy changes (LIMIT 1); before the GC-42
+		// keyless fix every copy did.
+		{"kl_whole", "CREATE TABLE %[1]s (id INT, v VARCHAR(8)); INSERT INTO %[1]s VALUES (1,'a'),(1,'a'),(2,'b');", func(table string) ir.Change {
 			return ir.Delete{Schema: "target_db", Table: table, Before: ir.Row{"id": int64(1), "v": "a"}}
-		}, false},
+		}, false, "1,a,2,b"},
+		{"kl_update", "CREATE TABLE %[1]s (id INT, v VARCHAR(8)); INSERT INTO %[1]s VALUES (1,'a'),(1,'a');", func(table string) ir.Change {
+			return ir.Update{Schema: "target_db", Table: table, Before: ir.Row{"id": int64(1), "v": "a"}, After: ir.Row{"id": int64(1), "v": "z"}}
+		}, false, "1,a,1,z"},
+		{"kl_null", "CREATE TABLE %[1]s (id INT, v VARCHAR(8)); INSERT INTO %[1]s VALUES (1,NULL),(1,NULL);", func(table string) ir.Change {
+			return ir.Delete{Schema: "target_db", Table: table, Before: ir.Row{"id": int64(1), "v": nil}}
+		}, false, "1"},
 		// Zero rows stays tolerated (ADR-0010 resume idempotency).
 		{"zero", pkTable, func(table string) ir.Change {
 			return ir.Delete{Schema: "target_db", Table: table, Before: ir.Row{"u": "absent"}}
-		}, false},
+		}, false, ""},
 	}
 	for _, p := range paths {
 		for _, c := range cells {
@@ -107,6 +116,11 @@ func TestGC42_MySQLMultiRowMatchRefused(t *testing.T) {
 				if !c.refused {
 					if err != nil {
 						t.Fatalf("want the write applied; got %v", err)
+					}
+					if c.wantState != "" {
+						if got, _ := queryScalarString(t, dsn, state); got != c.wantState {
+							t.Errorf("target = %q; want %q — one of the identical rows, not all of them", got, c.wantState)
+						}
 					}
 					return
 				}

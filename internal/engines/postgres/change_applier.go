@@ -279,7 +279,7 @@ type ChangeApplier struct {
 	// dispatch tree can touch from W goroutines under the ADR-0105
 	// concurrent key-hash apply path: pkCache, colTypeCache,
 	// conflictKeyCache, warnedKeyless, nonPKUniqueCache, warnedRouteProbe,
-	// deferrableChecked and schemaDirtyTables. EVERY access
+	// deferrableChecked, rowKeyCache and schemaDirtyTables. EVERY access
 	// to those maps goes through the guarded accessors in
 	// change_applier_concurrent.go and change_applier_key_shape.go — there is
 	// no direct map access elsewhere
@@ -337,6 +337,12 @@ type ChangeApplier struct {
 	// once per table, again after a schema boundary (GC-42,
 	// change_applier_key_shape.go).
 	deferrableChecked map[string]bool
+
+	// rowKeyCache maps "schema.table" → whether the TARGET table has a key
+	// (PK or NOT NULL unique), read only for a whole-row write, to choose
+	// the one-row address for a keyless table (GC-42); dropped on a schema
+	// boundary.
+	rowKeyCache map[string]bool
 
 	// colTypeCache maps "schema.table" → column-name → *ir.Column. It
 	// is the input to prepareValue for every value the applier
@@ -1776,7 +1782,11 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		if err != nil {
 			return false, fmt.Errorf("postgres: applier: resolve shard key for %s.%s: %w", schema, v.Table, err)
 		}
-		stmt, args, err := buildUpdateSQL(schema, v.Table, v.Before, v.After, colTypes, shardKeys)
+		addr, err := a.rowAddressFor(ctx, schema, v.Table, v.Before, colTypes)
+		if err != nil {
+			return false, err
+		}
+		stmt, args, err := buildUpdateSQL(addr, schema, v.Table, v.Before, v.After, colTypes, shardKeys)
 		if err != nil {
 			return false, fmt.Errorf("postgres: applier: build update for %s.%s: %w", schema, v.Table, err)
 		}
@@ -1800,7 +1810,7 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		if err != nil {
 			return false, fmt.Errorf("postgres: applier: update %s.%s: %w", schema, v.Table, err)
 		}
-		if err := a.checkKeyScopedResult(ctx, "update", schema, v.Table, v.Before, colTypes, res); err != nil {
+		if err := checkKeyScopedResult("update", schema, v.Table, v.Before, res); err != nil {
 			return false, err
 		}
 		logZeroRowsAffected(ctx, "update", schema, v.Table, res)
@@ -1815,7 +1825,11 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		if err != nil {
 			return false, fmt.Errorf("postgres: applier: column types for %s.%s: %w", schema, v.Table, err)
 		}
-		stmt, args, err := buildDeleteSQL(schema, v.Table, v.Before, colTypes)
+		addr, err := a.rowAddressFor(ctx, schema, v.Table, v.Before, colTypes)
+		if err != nil {
+			return false, err
+		}
+		stmt, args, err := buildDeleteSQL(addr, schema, v.Table, v.Before, colTypes)
 		if err != nil {
 			return false, fmt.Errorf("postgres: applier: build delete for %s.%s: %w", schema, v.Table, err)
 		}
@@ -1825,7 +1839,7 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		if err != nil {
 			return false, fmt.Errorf("postgres: applier: delete from %s.%s: %w", schema, v.Table, err)
 		}
-		if err := a.checkKeyScopedResult(ctx, "delete", schema, v.Table, v.Before, colTypes, res); err != nil {
+		if err := checkKeyScopedResult("delete", schema, v.Table, v.Before, res); err != nil {
 			return false, err
 		}
 		logZeroRowsAffected(ctx, "delete", schema, v.Table, res)
@@ -2832,7 +2846,11 @@ func buildInsertSQL(schema, table string, row ir.Row, key []string, colTypes map
 // That is the ONLY way an empty statement comes back — an after-image
 // that had nothing settable to begin with is refused, below, before the
 // shard-key trim runs.
-func buildUpdateSQL(schema, table string, before, after ir.Row, colTypes map[string]*ir.Column, shardKeys []string) (sqlStmt string, args []any, err error) {
+//
+// addr says how the WHERE reaches the row ([rowAddress]): every match, or
+// exactly one of the identical rows a keyless table's whole-row WHERE
+// matches (GC-42).
+func buildUpdateSQL(addr rowAddress, schema, table string, before, after ir.Row, colTypes map[string]*ir.Column, shardKeys []string) (sqlStmt string, args []any, err error) {
 	// Audit 2026-08-05 C-9: refuse a before-image with nothing usable as a
 	// predicate, in the same words the MySQL applier uses. Pre-fix this
 	// rendered `UPDATE t SET … WHERE ` and PG answered 42601 "syntax error
@@ -2875,14 +2893,15 @@ func buildUpdateSQL(schema, table string, before, after ir.Row, colTypes map[str
 	args = make([]any, 0, len(setArgs)+len(whereArgs))
 	args = append(args, setArgs...)
 	args = append(args, whereArgs...)
-	return "UPDATE " + tableRef + " SET " + setSQL + " WHERE " + whereSQL, args, nil
+	return "UPDATE " + tableRef + " SET " + setSQL + " WHERE " + rowTargetSQL(tableRef, whereSQL, addr), args, nil
 }
 
 // buildDeleteSQL builds a DELETE statement using the Before image
-// as the WHERE predicate. An unusable before-image is refused for the
+// as the WHERE predicate, reaching the row(s) as addr says (see
+// [buildUpdateSQL]). An unusable before-image is refused for the
 // same reason as [buildUpdateSQL] — and the stakes are higher, since a
 // predicate-less DELETE that reached the server would empty the table.
-func buildDeleteSQL(schema, table string, before ir.Row, colTypes map[string]*ir.Column) (sqlStmt string, args []any, err error) {
+func buildDeleteSQL(addr rowAddress, schema, table string, before ir.Row, colTypes map[string]*ir.Column) (sqlStmt string, args []any, err error) {
 	if len(appliershared.NonGeneratedRowKeys(before, colTypes)) == 0 {
 		return "", nil, appliershared.RefuseNoRowPredicate(engineNamePostgres, "delete", schema, table, before)
 	}
@@ -2891,7 +2910,7 @@ func buildDeleteSQL(schema, table string, before ir.Row, colTypes map[string]*ir
 	if err != nil {
 		return "", nil, err
 	}
-	return "DELETE FROM " + tableRef + " WHERE " + whereSQL, whereArgs, nil
+	return "DELETE FROM " + tableRef + " WHERE " + rowTargetSQL(tableRef, whereSQL, addr), whereArgs, nil
 }
 
 // buildTruncateSQL builds a TRUNCATE TABLE statement, appending the
