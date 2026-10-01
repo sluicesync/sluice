@@ -386,6 +386,12 @@ func repairFloatTable(ctx context.Context, br ir.BatchedRowReader, rr ir.RowRead
 			cancel()
 			return fmt.Errorf("write batch: %w", err)
 		}
+		// An empty or short page is the end of the table only if the page
+		// closed naturally (GC-41 (i)); a stop closes it the same way. The
+		// verdict is taken before our own cancel below, as copyChunkFast
+		// does, and reported after the Bug-68 check so a decode failure
+		// keeps its own message.
+		confirmErr := end.Confirm(ctx, ft.srcRead.Name, teed)
 		cancel()
 
 		// Loud-failure gate (Bug 68): the batched reader decodes on a
@@ -395,10 +401,8 @@ func repairFloatTable(ctx context.Context, br ir.BatchedRowReader, rr ir.RowRead
 		if err := migcore.ReaderStreamErr(rr, ft.srcRead); err != nil {
 			return err
 		}
-		// An empty or short page is the end of the table only if the page
-		// closed naturally (GC-41 (i)); a stop closes it the same way.
-		if err := end.Confirm(ctx, ft.srcRead.Name, teed); err != nil {
-			return err
+		if confirmErr != nil {
+			return confirmErr
 		}
 		if batchCount == 0 {
 			return nil

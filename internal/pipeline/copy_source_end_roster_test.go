@@ -58,10 +58,21 @@ var knownCopyEntryPoints = []string{
 // (a writer wrapper delegating to an inner writer) is not an entry point
 // and is skipped. Outside the walk: internal/pipeline/backup (backupTable
 // reads its stream directly with no writer; it carries its own end-of-
-// stream ctx check, pinned by nothing here) and the engine packages (the
-// writers themselves, whose select race this signal makes irrelevant).
-// The gate checks presence and order, not that the Confirm's SourceEnd is
-// the one the function's own source fed — the unit cells in
+// stream ctx check, pinned by nothing here), backup.Restore's
+// restoreChunkGroup and the chain restore that drives it (they take
+// writeFn := rw.WriteRows; their source end is the chunk producer, which
+// reports a row count only after streaming every chunk to its end and
+// checking it against the manifest's recorded RowCount — evidence
+// independent of the writer — and reports an error on a cancel), and the
+// engine packages (the writers themselves, whose select race this signal
+// makes irrelevant).
+//
+// What the matcher sees, stated: any selector naming one of
+// copyWriteMethods (a call or a method value), so a plain function-typed
+// value or an interface wrapped by a helper with another name escapes it;
+// and `.Confirm(` by NAME, not by type — the gate checks presence and
+// order, not that the Confirm is a migcore.SourceEnd's or that its
+// SourceEnd is the one this function's source fed. The unit cells in
 // copy_source_end_test.go are the behavioural half.
 func TestCopyEntryPointRoster_EveryWriteConsultsTheSourceEnd(t *testing.T) {
 	fset := token.NewFileSet()
@@ -90,15 +101,15 @@ func TestCopyEntryPointRoster_EveryWriteConsultsTheSourceEnd(t *testing.T) {
 			firstWrite, confirmAfter := token.NoPos, false
 			ast.Inspect(fn.Body, func(n ast.Node) bool {
 				switch n := n.(type) {
-				case *ast.CallExpr:
-					sel, ok := n.Fun.(*ast.SelectorExpr)
-					if !ok {
-						return true
-					}
-					if copyWriteMethods[sel.Sel.Name] && firstWrite == token.NoPos {
+				case *ast.SelectorExpr:
+					// Any mention, not only a call: a method value
+					// (writeFn := rw.WriteRows) moves rows just the same.
+					if copyWriteMethods[n.Sel.Name] && firstWrite == token.NoPos {
 						firstWrite = n.Pos()
 					}
-					if sel.Sel.Name == "Confirm" && firstWrite != token.NoPos && n.Pos() > firstWrite {
+				case *ast.CallExpr:
+					sel, ok := n.Fun.(*ast.SelectorExpr)
+					if ok && sel.Sel.Name == "Confirm" && firstWrite != token.NoPos && n.Pos() > firstWrite {
 						confirmAfter = true
 					}
 				case *ast.AssignStmt:

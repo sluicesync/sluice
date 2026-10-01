@@ -1042,6 +1042,9 @@ func copyChunk(
 			cancel()
 			return fmt.Errorf("redact chunk %d batch: %w", chunkIndex, err)
 		}
+		// The source-end verdict, taken before our own cancel (as
+		// copyChunkFast does) and reported after the Bug-68 check below.
+		confirmErr := end.Confirm(ctx, table.Name, stamped)
 		cancel()
 
 		// ADR-0042 Phase A — per-batch wall (read+redact+write
@@ -1081,10 +1084,10 @@ func copyChunk(
 		// SKIP it → silent loss of the unread tail. Returning the cancellation
 		// keeps the chunk NOT-complete so the retry re-runs it from its durable
 		// LastPK cursor. Mirrors the copyChunkFast pump guard. Since GC-41
-		// (i) the guard is the batch's source-end signal, which also refuses
-		// a page the writer returned from before it closed.
-		if err := end.Confirm(ctx, table.Name, stamped); err != nil {
-			return err
+		// (i) the guard is the batch's source-end verdict (taken above),
+		// which also refuses a page the writer left unconsumed.
+		if confirmErr != nil {
+			return confirmErr
 		}
 
 		if batchCount == 0 {

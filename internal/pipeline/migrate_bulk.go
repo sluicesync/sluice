@@ -524,6 +524,9 @@ func copyTableWithCursor(
 			cancel()
 			return fmt.Errorf("redact batch: %w", err)
 		}
+		// The source-end verdict, taken before our own cancel (as
+		// copyChunkFast does) and reported after the Bug-68 check below.
+		confirmErr := end.Confirm(ctx, table.Name, stamped)
 		cancel() // batch goroutines unwind cleanly
 
 		// Loud-failure gate (Bug 68): the batched reader scans/decodes
@@ -551,10 +554,10 @@ func copyTableWithCursor(
 		// tail. Returning the cancellation keeps the table NOT-complete so the
 		// resume re-runs it from its durable LastPK. Mirrors the copyChunk /
 		// copyChunkFast guards. Since GC-41 (i) the guard is the batch's
-		// source-end signal, which also refuses a page the writer returned
-		// from before it closed.
-		if err := end.Confirm(ctx, table.Name, stamped); err != nil {
-			return err
+		// source-end verdict (taken above), which also refuses a page the
+		// writer left unconsumed.
+		if confirmErr != nil {
+			return confirmErr
 		}
 
 		if batchCount == 0 {
