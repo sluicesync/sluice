@@ -72,11 +72,17 @@ const (
 // failure on an unrelated PR — exactly the shape this line just cost us.
 // `quay.io/minio/minio:latest` resolved to this release on 2026-09-11.
 //
-// Not GHCR-mirrored like the postgres/mysql/mariadb images: those mirrors are
-// published by build-prebaked-images.sh from docker.io refs and this one is
-// not on docker.io at all. If quay proves flaky in CI, mirroring it is the
-// next move rather than going back to a floating tag.
-const minioImage = "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z"
+// OUR GHCR MIRROR, NOT QUAY. MinIO then took quay private too: after
+// 2026-09-20 an anonymous pull of any quay minio/* repo is a 401
+// `access to the requested resource is not authorized`. CI never noticed,
+// because its pre-pull step fetched this mirror and retagged it to the quay
+// name; every run WITHOUT that step (a local or DooD
+// scripts/race-integration.ps1 run, a review agent) asked quay and failed at
+// container start. Naming the mirror here makes every environment take the
+// same path. The mirror is public, so no login is needed, and it is FROZEN:
+// build-prebaked-images.sh's mirror_frozen_refs no longer refreshes it from
+// the retired upstream, but fails the bake if the copy ever goes missing.
+const minioImage = "ghcr.io/sluicesync/sluice-mirror-minio:RELEASE.2025-09-07T16-13-09Z"
 
 // startMinIO boots a MinIO container with default credentials,
 // creates a single bucket the test can write into, and returns the

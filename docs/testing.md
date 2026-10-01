@@ -102,7 +102,7 @@ So the question worth answering precisely is which backends a real server has ev
 
 | scheme | exercised against | how |
 | --- | --- | --- |
-| `s3://` | MinIO (`quay.io/minio/minio`) | round-trip, conditional-put chain guard, cross-engine backup→restore, resumable backup |
+| `s3://` | MinIO (`ghcr.io/sluicesync/sluice-mirror-minio`, a frozen copy of `quay.io/minio/minio`) | round-trip, conditional-put chain guard, cross-engine backup→restore, resumable backup |
 | `gs://` | fake-gcs-server | round-trip + prefix handling, conditional-put chain guard |
 | `azblob://` | Azurite | round-trip + prefix handling, conditional-put chain guard |
 | `file://` | — | **not exercised** through the blob path; the hardened `LocalStore` is the supported local backend and has its own coverage, and `fileblob` exists for URL-scheme parity |

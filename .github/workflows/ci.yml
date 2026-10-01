@@ -441,17 +441,21 @@ jobs:
       # something we notice on our own schedule.
       #
       # The tags are duplicated from the Go constants (blob_store_integration_test.go
-      # and blob_store_gcs_azure_integration_test.go). Drift is non-fatal —
-      # ci-mirror-pull.sh ::warning-falls-back to the source registry — so this
-      # degrades to the pre-mirror behaviour rather than failing the shard.
+      # and blob_store_gcs_azure_integration_test.go). For fake-gcs-server and
+      # azurite drift is non-fatal — ci-mirror-pull.sh ::warning-falls-back to
+      # the source registry. MinIO has NO source registry left (quay minio/*
+      # went private after 2026-09-20, Docker Hub's was removed 2026-09-11), so
+      # its constant names the frozen GHCR mirror itself and it is pulled
+      # directly, with no fallback to fall to.
       - name: Pre-pull the blob-store emulators via their GHCR mirrors (source-registry fallback)
         if: matrix.shard.name == 'pipeline-rest-other'
         env:
           GHCR_USER: ${{ github.actor }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          bash scripts/ci-ghcr-pull.sh \
+            ghcr.io/sluicesync/sluice-mirror-minio:RELEASE.2025-09-07T16-13-09Z
           bash scripts/ci-mirror-pull.sh \
-            quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z \
             fsouza/fake-gcs-server:1.56.1 \
             mcr.microsoft.com/azure-storage/azurite:3.37.0
 

@@ -567,13 +567,33 @@ mirror_stock_refs() {
     # discovering it mid-release.
     #
     # Keep the tags in step with the constants in
-    # internal/pipeline/blob_store_integration_test.go and
     # blob_store_gcs_azure_integration_test.go. Drift is not fatal —
     # ci-mirror-pull.sh falls back to the source registry with a ::warning —
     # but it silently gives up the protection above.
-    echo "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z"
+    #
+    # MinIO is NOT in this list any more: see mirror_frozen_refs.
     echo "fsouza/fake-gcs-server:1.56.1"
     echo "mcr.microsoft.com/azure-storage/azurite:3.37.0"
+}
+
+# mirror_frozen_refs emits stock refs whose UPSTREAM IS GONE, so the GHCR
+# mirror is now the only copy and the bake must not try to refresh it.
+#
+# quay.io/minio/minio went private on or after 2026-09-20 (the last green
+# bake): an anonymous registry pull of any minio/* repo on quay — minio/minio
+# and minio/mc alike — now answers 401 `UNAUTHORIZED: access to the requested
+# resource is not authorized`, while other public quay repos still answer
+# 200. Docker Hub's minio/minio had already been removed (2026-09-11). The
+# mirror published on 2026-09-20 survived, which is exactly what it was for.
+# Re-pulling a pinned, immutable tag bought nothing anyway; it only made the
+# bake depend on a vendor that has left.
+#
+# A frozen ref is CHECKED, not skipped: if its GHCR copy disappears (a
+# package deleted in the UI, a retention policy), nothing can recreate it and
+# every test that boots it will fail, so the bake fails loudly here instead.
+# Never delete the ghcr.io/sluicesync/sluice-mirror-minio package.
+mirror_frozen_refs() {
+    echo "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z"
 }
 
 # bake_mirrors MIRRORS each stock ref to GHCR. Pure retag, never a build —
@@ -594,6 +614,17 @@ bake_mirrors() {
         fi
         docker rmi "$target" "$stock" >/dev/null 2>&1 || true
     done < <(mirror_stock_refs)
+
+    while IFS= read -r stock; do
+        [[ -z "$stock" ]] && continue
+        target="$(bash "$CI_MIRROR_PULL" --print-ref "$stock")"
+        if docker manifest inspect "$target" >/dev/null 2>&1; then
+            log "frozen mirror ${target} present (upstream ${stock} retired; not refreshed)"
+        else
+            log "ERROR: frozen mirror ${target} is MISSING and its upstream ${stock} is retired — nothing can republish it; every consumer of it will fail"
+            exit 1
+        fi
+    done < <(mirror_frozen_refs)
 }
 
 # --- Main -------------------------------------------------------------
