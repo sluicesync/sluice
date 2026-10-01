@@ -30,10 +30,19 @@ var lanePositionClass = map[string]string{
 // postCommitHook: see the Postgres twin.
 var postCommitHook = regexp.MustCompile(`^(report|release|notify|ack)|Report|Release|Notify|AfterCommit|Ack([A-Z]|$)`)
 
+// laneCommitCall is the COMMIT each position-writing lane core makes.
+var laneCommitCall = map[string]string{
+	"laneApplierAdapter.WriteCheckpoint": "commitWithTimeout",
+	"laneApplierAdapter.ApplyLaneBatch":  "commitWithTimeout",
+}
+
 // TestLanePositionWriterRoster is the Postgres gate's MySQL twin: every
 // laneApplierAdapter method that can reach a position writer is classified,
-// a checkpoint and a fold writer both exist, and the fold's write core
-// leaves the checkpoint's post-commit trail (Committed, and any hook).
+// a checkpoint and a fold writer both exist, the fold's write core leaves the
+// checkpoint's post-commit trail (Committed, and any hook), and it anchors
+// its fold only after its COMMIT. Reach as the twin states; no
+// synchronous_commit check here — MySQL's commit durability is server
+// configuration, the same for both writers.
 func TestLanePositionWriterRoster(t *testing.T) {
 	funcs, err := applyorder.ParseFuncs(".")
 	if err != nil {
@@ -80,6 +89,14 @@ func TestLanePositionWriterRoster(t *testing.T) {
 				t.Errorf("%s (%s) does not call %s, which the checkpoint calls after its commit — the two position "+
 					"writers must leave the same post-commit trail", key, class, h)
 			}
+		}
+		commit, ok := laneCommitCall[key]
+		if !ok || !calls[commit] {
+			t.Errorf("%s (%s) does not call its COMMIT %q (laneCommitCall)", key, class, commit)
+			continue
+		}
+		if class == "fold-core" && !funcs[key].Before(commit, "Anchor") {
+			t.Errorf("%s anchors its fold before (or without) its COMMIT %s", key, commit)
 		}
 	}
 	slices.Sort(hooks)

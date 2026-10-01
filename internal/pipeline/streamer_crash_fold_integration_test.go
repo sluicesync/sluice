@@ -7,6 +7,7 @@ package pipeline
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	gomysql "github.com/go-sql-driver/mysql"
+	"github.com/jackc/pglogrepl"
 
 	"sluicesync.dev/sluice/internal/laneapply"
 )
@@ -72,6 +74,11 @@ INSERT INTO po (id, v) VALUES (12, 'after');
 	t.Run("lane_count_changed_after_fold_lanes_to_serial", func(t *testing.T) {
 		runCrashFoldLanded(t, src, tgt, 4, func(s *Streamer) { s.ApplyConcurrency = 1 })
 	})
+	if src.engine == "postgres" {
+		// Only the Postgres logical-replication reader emits GC-41 (j)
+		// keepalive boundaries.
+		t.Run("fold_anchored_on_keepalive_boundary", func(t *testing.T) { runCrashFoldAfterKeepalive(t, src, tgt) })
+	}
 }
 
 // crashTargetSchema is the schema the target's lane router qualifies a table
@@ -346,5 +353,109 @@ func runCrashFoldBarrier(t *testing.T, src crashSource, tgt resendTarget, body s
 	release()
 	released = true
 	assertMarksNameTheInterruptedTx(t, src, tgt, fx.streamID, posAfterKill, "")
+	crashFoldConverge(t, src, tgt, fx, nil, posAfterKill)
+}
+
+// runCrashFoldAfterKeepalive is fold_landed_siblings_pending with a GC-41 (j)
+// keepalive boundary as the fold's anchor: the Postgres reader turns the
+// walsender's keepalive position into an empty TxBegin/TxCommit while no
+// source transaction is open, so on an idle-but-busy server the last
+// boundary before T is that keepalive, not T-1's commit.
+//
+// To make the keepalive the anchor of a FOLD (not a position an idle
+// checkpoint already persisted, which would anchor T at its fence with no
+// ticket), T-1 — an update of a PK-only row — is held on its lane by a target
+// row lock, so the frontier cannot reach T-1's commit or the keepalive
+// boundary after it. Foreign WAL in another database makes the walsender's
+// keepalive position move. Then T arrives, the lock is released, T's fence
+// drains, and the highest boundary at or below T's first marked change is
+// the keepalive: the fold persists it. T's sibling-lane change stays locked,
+// and the kill lands with the fold committed.
+//
+// Independent evidence the anchor WAS a keepalive boundary: the position
+// persisted at the kill lies beyond pg_current_wal_lsn() read on the source
+// right after T-1 committed — no source transaction of the stream's tables
+// committed between T-1 and T, so nothing but a keepalive boundary can sit
+// there. The restart must converge with no APPLY-MARK-UNTRUSTED.
+func runCrashFoldAfterKeepalive(t *testing.T, src crashSource, tgt resendTarget) {
+	const lanes = 4
+	fx := newCrashStreamFixture(t, src, tgt, crashMidTxnCell{concurrency: lanes, batch: 1000, exactlyOnceLanes: true})
+	defer fx.teardown()
+	x := crashFoldSiblingKey(t, tgt, lanes)
+	held := int64(20) // T-1's row, any seeded po row but T's sibling
+	if x == held {
+		held = 21
+	}
+	cancel1, run1, posBefore := crashFoldWarm(t, src, tgt, fx)
+	defer cancel1()
+
+	noiseDB := fmt.Sprintf("fold_noise_%d", time.Now().UnixNano()%1e9)
+	pgExec(t, src.dsn, "CREATE DATABASE "+noiseDB)
+	noiseDSN, err := buildPGDSN(src.dsn, noiseDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pgExec(t, noiseDSN, "CREATE TABLE noise (id BIGSERIAL PRIMARY KEY, v TEXT)")
+	stopNoise := make(chan struct{})
+	noiseDone := make(chan struct{})
+	go func() {
+		defer close(noiseDone)
+		writeForeignWAL(noiseDSN, stopNoise)
+	}()
+	defer func() {
+		close(stopNoise)
+		<-noiseDone
+	}()
+
+	releaseT1 := holdRowLock(t, driverOf(tgt), tgt.dsn, fmt.Sprintf(`SELECT id FROM po WHERE id = %d FOR UPDATE`, held))
+	releaseX := holdRowLock(t, driverOf(tgt), tgt.dsn, fmt.Sprintf(`SELECT id FROM po WHERE id = %d FOR UPDATE`, x))
+	t1Released, xReleased := false, false
+	defer func() {
+		if !t1Released {
+			releaseT1()
+		}
+		if !xReleased {
+			releaseX()
+		}
+	}()
+	src.exec(t, fmt.Sprintf(`UPDATE po SET v = 'tm1' WHERE id = %d`, held)) // T-1, held on its lane
+	afterT1 := currentWALLSN(t, src.dsn)
+	// A keepalive boundary needs 10 s since the last boundary and a keepalive
+	// from the walsender; wait well past two of them.
+	time.Sleep(30 * time.Second)
+	src.txn(t, fmt.Sprintf("UPDATE rs SET v = 'k1' WHERE id = 7;\nUPDATE po SET v = 'kx' WHERE id = %d;\n", x))
+	time.Sleep(time.Second) // let T reach its fence, which waits on T-1
+	releaseT1()
+	t1Released = true
+	if !waitResendSoft(run1, 30*time.Second, func() bool { return countTarget(tgt, "SELECT COUNT(*) FROM rs WHERE id = 7 AND v = 'k1'") == 1 }) {
+		t.Fatal("T's fold never committed after T-1 was released: the cell built nothing")
+	}
+	time.Sleep(2 * time.Second)
+	posAfterKill := crashFoldKill(t, tgt, cancel1, run1, fx.streamID)
+	releaseX()
+	xReleased = true
+
+	var tok struct {
+		LSN string `json:"lsn"`
+	}
+	if err := json.Unmarshal([]byte(posAfterKill), &tok); err != nil {
+		t.Fatalf("decode the persisted position %q: %v", posAfterKill, err)
+	}
+	persisted, err := pglogrepl.ParseLSN(tok.LSN)
+	if err != nil {
+		t.Fatalf("parse the persisted LSN %q: %v", tok.LSN, err)
+	}
+	if posAfterKill == posBefore || persisted <= afterT1 {
+		t.Fatalf("the position at the kill (%s) is not past the WAL read right after T-1 committed (%s): no keepalive "+
+			"boundary anchored the fold, so the cell measured an ordinary commit anchor", persisted, afterT1)
+	}
+	if n := countTarget(tgt, fmt.Sprintf("SELECT COUNT(*) FROM po WHERE id = %d AND v = 's'", x)); n != 1 {
+		t.Errorf("T's po row %d changed at the kill (%d rows at the seed value)", x, n)
+	}
+	if len(targetMarks(t, tgt, fx.streamID)) == 0 {
+		t.Error("no apply mark at the kill: T's fold wrote none")
+	}
+	assertMarksNameTheInterruptedTx(t, src, tgt, fx.streamID, posAfterKill, "")
+	t.Logf("fold anchored at keepalive boundary %s (WAL after T-1: %s)", persisted, afterT1)
 	crashFoldConverge(t, src, tgt, fx, nil, posAfterKill)
 }

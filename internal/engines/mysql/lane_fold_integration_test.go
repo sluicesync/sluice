@@ -163,6 +163,14 @@ func TestLaneApplyBatch_FoldIsOneTransaction(t *testing.T) {
 // ticket is not. The COMMIT-step error is real: the commit hook (which runs
 // after every statement, the position included) kills the lane's connection
 // from another session, so the COMMIT itself is what fails.
+//
+// Reach, stated: this pins the CLASSIFICATION only. A connection killed
+// before COMMIT is a known rollback, not the committed-but-unacknowledged
+// outcome the rule exists for; that shape is pinned on Postgres alone
+// (TestLaneApplyBatch_FoldCommitStepErrorIsOutcomeUnknown there, a
+// synchronous-standby wait abandoned by the watchdog). Building it on MySQL
+// needs semi-synchronous replication with a replica that never acknowledges,
+// which this suite does not run.
 func TestLaneApplyBatch_FoldCommitStepErrorIsOutcomeUnknown(t *testing.T) {
 	dsn, cleanup := startMySQLForApplier(t)
 	defer cleanup()

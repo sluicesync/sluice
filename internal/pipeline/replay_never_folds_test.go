@@ -14,87 +14,135 @@ import (
 	"testing"
 )
 
+// switchSites are the only places the --exactly-once-lanes switch may be
+// written, per form, keyed by file (relative to the module root). Every other
+// write fails TestReplayPathsNeverFold.
+var switchSites = map[string][]string{
+	// sync start and the fleet spec build a Streamer from the operator's flag.
+	"ExactlyOnceLanes:": {
+		"cmd/sluice/cli.go", "cmd/sluice/sync_run.go",
+		// each lane adapter hands the applier's own switch to laneapply.Config.
+		"internal/engines/mysql/change_applier_concurrent.go", "internal/engines/postgres/change_applier_concurrent.go",
+	},
+	// the streamer plumbs Streamer.ExactlyOnceLanes to the applier.
+	"ApplyExactlyOnceLanes": {"internal/pipeline/streamer_run_phases.go"},
+	// migcore's plumbing is the only caller of the applier's setter.
+	"SetExactlyOnceLanes": {"internal/pipeline/migcore/apply_concurrency.go"},
+}
+
+// replayFile reports whether path (relative to the module root) is on a
+// replay path: the `sync from-backup` broker, the backup package (chain
+// restore, chain replay), and the change-chunk codec that decodes the
+// replayed changes (blobcodec/backup_change_chunk.go, decodeChange).
+func replayFile(path string) bool {
+	return strings.HasPrefix(path, "internal/pipeline/broker") ||
+		strings.HasPrefix(path, "internal/pipeline/backup/") ||
+		path == "internal/pipeline/blobcodec/backup_change_chunk.go"
+}
+
 // TestReplayPathsNeverFold holds ADR-0190 amendment D's scope exemption
 // (§D.7): the `sync from-backup` broker and chain replay reach the lane
 // orchestrator through migcore.ApplyApplyConcurrency, and neither can ever
 // issue a fold ticket — for TWO independent reasons, each checked here
 // because two reasons are only worth having if each holds:
 //
-//  1. only the streamer turns --exactly-once-lanes on: migcore.
-//     ApplyExactlyOnceLanes is called from streamer_run_phases.go and from no
-//     other file under internal/pipeline, so the orchestrator's fence returns
-//     at its first line for them;
-//  2. their changes carry no ADR-0190 identity: no file on the replay paths
-//     (broker*.go, the backup package) mentions ApplyID, so ApplyMarkTx
-//     answers "" regardless.
+//  1. only `sync start` (and the fleet spec) turns --exactly-once-lanes on.
+//     Every write of the switch across internal/ and cmd/ is held to
+//     switchSites, in all three forms it can take: a composite-literal
+//     `ExactlyOnceLanes:` field (a Streamer, a laneapply.Config), a call of
+//     migcore.ApplyExactlyOnceLanes, and a call of the applier's
+//     SetExactlyOnceLanes; and an assignment to an applier's
+//     `exactlyOnceLanes` field must sit inside SetExactlyOnceLanes. So the
+//     orchestrator's fence returns at its first line on a replay path.
+//  2. replayed changes carry no ADR-0190 identity: no replay-path file
+//     (replayFile) mentions ApplyID, so ApplyMarkTx answers "" regardless.
 //
-// The anti-vacuity floor: the walk must find both replay paths' calls to
-// ApplyApplyConcurrency, so a walk that misses the replay files cannot pass.
+// Reach, stated: a write of the switch through reflection, or a new field
+// spelled otherwise, is outside this AST walk; reason 2 checks identifiers
+// in the named files only, so a replay path that moved into a new file
+// would need adding to replayFile. The anti-vacuity floor: the walk must
+// find both replay paths' calls to ApplyApplyConcurrency and every listed
+// switch site.
 func TestReplayPathsNeverFold(t *testing.T) {
 	fset := token.NewFileSet()
-	var exactlyOnce, concurrency, identity []string
-	err := filepath.WalkDir(".", func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() {
-			if d.Name() == "testdata" {
-				return filepath.SkipDir
+	found := map[string][]string{}
+	var concurrency, identity, strays []string
+	for _, root := range []string{"../../internal", "../../cmd"} {
+		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if d.IsDir() {
+				if d.Name() == "testdata" {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+				return nil
+			}
+			f, err := parser.ParseFile(fset, path, nil, 0)
+			if err != nil {
+				return err
+			}
+			rel := strings.TrimPrefix(filepath.ToSlash(path), "../../")
+			for _, decl := range f.Decls {
+				fn, _ := decl.(*ast.FuncDecl)
+				ast.Inspect(decl, func(n ast.Node) bool {
+					switch n := n.(type) {
+					case *ast.KeyValueExpr:
+						if k, ok := n.Key.(*ast.Ident); ok && k.Name == "ExactlyOnceLanes" {
+							found["ExactlyOnceLanes:"] = append(found["ExactlyOnceLanes:"], rel)
+						}
+					case *ast.SelectorExpr:
+						switch n.Sel.Name {
+						case "ApplyExactlyOnceLanes", "SetExactlyOnceLanes":
+							found[n.Sel.Name] = append(found[n.Sel.Name], rel)
+						case "ApplyApplyConcurrency":
+							concurrency = append(concurrency, rel)
+						}
+					case *ast.AssignStmt:
+						for _, lhs := range n.Lhs {
+							if sel, ok := lhs.(*ast.SelectorExpr); ok && sel.Sel.Name == "exactlyOnceLanes" &&
+								(fn == nil || fn.Name.Name != "SetExactlyOnceLanes") {
+								strays = append(strays, rel)
+							}
+						}
+					case *ast.Ident: // a field key, a selector's field, a type: any mention
+						if n.Name == "ApplyID" && replayFile(rel) {
+							identity = append(identity, rel)
+						}
+					}
+					return true
+				})
 			}
 			return nil
-		}
-		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
-			return nil
-		}
-		f, err := parser.ParseFile(fset, path, nil, 0)
-		if err != nil {
-			return err
-		}
-		path = filepath.ToSlash(path)
-		ast.Inspect(f, func(n ast.Node) bool {
-			switch n := n.(type) {
-			case *ast.SelectorExpr:
-				switch n.Sel.Name {
-				case "ApplyExactlyOnceLanes":
-					exactlyOnce = append(exactlyOnce, path)
-				case "ApplyApplyConcurrency":
-					concurrency = append(concurrency, path)
-				}
-			case *ast.Ident: // a field key, a selector's field, a type: any mention
-				if n.Name == "ApplyID" {
-					identity = append(identity, path)
-				}
-			}
-			return true
 		})
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("walk internal/pipeline: %v", err)
-	}
-	for _, p := range exactlyOnce {
-		if p != "streamer_run_phases.go" {
-			t.Errorf("%s turns --exactly-once-lanes on; only the streamer may (a replay path that did could fold a fence)", p)
+		if err != nil {
+			t.Fatalf("walk %s: %v", root, err)
 		}
 	}
-	if !slices.Contains(exactlyOnce, "streamer_run_phases.go") {
-		t.Error("streamer_run_phases.go no longer calls migcore.ApplyExactlyOnceLanes — the walk or this gate is stale")
+	for form, allowed := range switchSites {
+		for _, p := range found[form] {
+			if !slices.Contains(allowed, p) {
+				t.Errorf("%s writes the --exactly-once-lanes switch (%s) and is not one of %v: a replay path that turned "+
+					"it on could fold a fence", p, form, allowed)
+			}
+		}
+		for _, p := range allowed {
+			if !slices.Contains(found[form], p) {
+				t.Errorf("switchSites lists %s for %s, which no longer writes it — the walk or this gate is stale", p, form)
+			}
+		}
 	}
-	isReplay := func(p string) bool { return strings.HasPrefix(p, "broker") || strings.HasPrefix(p, "backup/") }
+	for _, p := range strays {
+		t.Errorf("%s assigns an applier's exactlyOnceLanes outside SetExactlyOnceLanes", p)
+	}
 	for _, p := range identity {
-		if isReplay(p) {
-			t.Errorf("%s, on a replay path, mentions ApplyID: replayed changes must carry no ADR-0190 identity", p)
-		}
+		t.Errorf("%s, on a replay path, mentions ApplyID: replayed changes must carry no ADR-0190 identity", p)
 	}
-	var replays []string
-	for _, p := range concurrency {
-		if isReplay(p) {
-			replays = append(replays, p)
-		}
-	}
-	slices.Sort(replays)
-	if !slices.Contains(replays, "broker.go") || !slices.Contains(replays, "backup/chain_restore.go") {
-		t.Fatalf("the walk found the replay paths' lane wiring in %v; want broker.go and backup/chain_restore.go — it is not "+
-			"reaching the files this gate is about", replays)
+	if !slices.Contains(concurrency, "internal/pipeline/broker.go") || !slices.Contains(concurrency, "internal/pipeline/backup/chain_restore.go") {
+		t.Fatalf("the walk found the lane wiring in %v; want broker.go and backup/chain_restore.go among them — it is not "+
+			"reaching the files this gate is about", concurrency)
 	}
 }

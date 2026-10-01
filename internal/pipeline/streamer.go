@@ -978,8 +978,8 @@ type Streamer struct {
 	// trap): the fence drains the lanes once per such source transaction, which
 	// measured ~99.9% slower on a secondary-unique-heavy workload (amendment
 	// C), and still ~97% slower than the default lanes once its position write
-	// rode the lane's own commit (amendment D: ~0.86-0.88x
-	// --apply-concurrency 1 there). The serial
+	// rode the lane's own commit (amendment D: 0.86-0.97x
+	// --apply-concurrency 1 there, ADR-0190 §D.9). The serial
 	// paths and the lane BARRIER (keyless tables, primary-key changes) write
 	// marks regardless; every lane change checks them either way. Plumbed to
 	// every applier implementing [ir.ExactlyOnceLanesSetter].

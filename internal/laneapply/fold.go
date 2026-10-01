@@ -19,8 +19,10 @@ import (
 //
 // Pos is the ANCHOR: the highest checkpoint boundary at or below the marked
 // change's predecessor once the fence's drain made every such change
-// durable — the fenced transaction's START (on a marker stream the previous
-// transaction's TxCommit; on a marker-less one the change before). So the
+// durable — the fenced transaction's START (on a marker stream the last
+// recorded boundary, a TxCommit or a GC-41 (j) keepalive boundary, which is
+// an empty TxBegin/TxCommit pair the Postgres reader emits between source
+// transactions; on a marker-less one the change before). So the
 // position the fold persists vouches only for data that was durable before
 // the fold began, and the fenced transaction's marks become durable in the
 // same commit that moves the position to its start: no crash can land
@@ -87,8 +89,11 @@ func (e *commitOutcomeUnknownError) Unwrap() error { return e.err }
 // add the ticket's RowsApplied to rows_applied a second time, and would
 // decide from an apply-mark tracker whose bookkeeping never recorded the
 // durable plan. So the run fails instead, and the streamer's ADR-0038
-// re-entry re-reads the persisted position and the marks — the truth either
-// way. Errors raised BEFORE the COMMIT (a statement's serialization abort,
+// re-entry re-reads the persisted position and the marks — the truth, once
+// the outcome has settled. A COMMIT the watchdog abandoned can still land
+// after that read; every commit path shares that, and ADR-0190 §D.2 records
+// what is known of it (a review built only loud outcomes; unverified beyond
+// that). Errors raised BEFORE the COMMIT (a statement's serialization abort,
 // deadlock, tx-killer) leave nothing durable and keep the ordinary in-lane
 // retry. nil stays nil.
 func CommitOutcomeUnknown(err error) error {

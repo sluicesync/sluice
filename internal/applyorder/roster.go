@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -24,6 +25,26 @@ type Func struct {
 	Key    string
 	Params []string
 	Calls  map[string]bool
+	// Order is every call (and method value) of the body by bare name, in
+	// source order, for gates that grade sequence (see [Func.Before]).
+	Order []string
+	// Strings are the body's string literals, unquoted.
+	Strings []string
+}
+
+// Before reports whether the body calls both a and b and EVERY call of b
+// follows its first call of a — so one stray b ahead of a fails it.
+func (f *Func) Before(a, b string) bool {
+	firstA, firstB := -1, -1
+	for i, c := range f.Order {
+		if c == a && firstA < 0 {
+			firstA = i
+		}
+		if c == b && firstB < 0 {
+			firstB = i
+		}
+	}
+	return firstA >= 0 && firstB > firstA
 }
 
 // ParseFuncs reads every non-test .go file in dir. Calls — and method values,
@@ -66,11 +87,19 @@ func ParseFuncs(dir string) (map[string]*Func, error) {
 				case *ast.CallExpr:
 					if id, ok := n.Fun.(*ast.Ident); ok {
 						fn.Calls[id.Name] = true
+						fn.Order = append(fn.Order, id.Name)
 					}
 				case *ast.SelectorExpr:
 					// A method call AND a method value (a.applySchemaEvent
 					// handed to a config struct): both reach the method.
 					fn.Calls[n.Sel.Name] = true
+					fn.Order = append(fn.Order, n.Sel.Name)
+				case *ast.BasicLit:
+					if n.Kind == token.STRING {
+						if s, err := strconv.Unquote(n.Value); err == nil {
+							fn.Strings = append(fn.Strings, s)
+						}
+					}
 				}
 				return true
 			})
