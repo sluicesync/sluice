@@ -20,6 +20,11 @@ func TestRefuseKeyScopedMultiMatch(t *testing.T) {
 	if !errors.Is(err, ErrKeyScopedWriteMatchedMultipleRows) {
 		t.Fatalf("not matchable by the sentinel: %v", err)
 	}
+	// The fleet supervisor keys on the ir sentinel and logs its text as the
+	// marker (TestSupervisor_RefusalsARestartRepeatsAreNotRestarted).
+	if !errors.Is(err, ir.ErrKeyScopedWriteMatchedMultipleRows) || ErrKeyScopedWriteMatchedMultipleRows.Error() != KeyScopedWriteMultiMatchMarker {
+		t.Fatalf("the sentinel is not ir's, or its text %q is not the marker", ErrKeyScopedWriteMatchedMultipleRows.Error())
+	}
 	if !ir.IsTerminal(err) {
 		t.Fatal("not terminal")
 	}

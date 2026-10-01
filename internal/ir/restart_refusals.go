@@ -15,8 +15,10 @@ import "errors"
 // The pipeline's fleet supervisor keys on them to stop restarting a leg that
 // hit one. Under its restart-forever default (max-consecutive-failures 0) such
 // a leg would otherwise refuse behind backoff indefinitely while the fleet
-// looked healthy. None of these is a coded (SLUICE-E-*) refusal: each exits 1
-// from a single command.
+// looked healthy. All but [ErrKeyScopedWriteMatchedMultipleRows] are codeless
+// refusals that exit 1 from a single command; that one is the coded
+// SLUICE-E-CDC-KEY-MATCHED-MULTIPLE-ROWS refusal, listed because a restart
+// repeats it, which a coded refusal does not by itself promise.
 
 // ErrSlotAckedPastTargetPosition classifies the Postgres warm-resume refusal
 // raised when the source replication slot's confirmed_flush_lsn is past the
@@ -40,3 +42,10 @@ var ErrCharsetNotDecodable = errors.New("CHARSET-NOT-DECODABLE")
 // time_zone parameter is not UTC (GC-39). The DSN is configuration; a restart
 // reads the same one.
 var ErrDSNTimeZoneNotUTC = errors.New("DSN-TIME-ZONE-NOT-UTC")
+
+// ErrKeyScopedWriteMatchedMultipleRows classifies the apply refusal of an
+// UPDATE or DELETE that names its row by key and matched more than one target
+// row (GC-42, SLUICE-E-CDC-KEY-MATCHED-MULTIPLE-ROWS). The apply transaction is
+// rolled back, and a restart replays the same source changes in order onto the
+// same committed rows, so the write matches them again.
+var ErrKeyScopedWriteMatchedMultipleRows = errors.New("KEY-SCOPED-WRITE-MATCHED-MULTIPLE-ROWS")

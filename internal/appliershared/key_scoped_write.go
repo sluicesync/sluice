@@ -4,7 +4,6 @@
 package appliershared
 
 import (
-	"errors"
 	"fmt"
 	"strings"
 
@@ -13,13 +12,17 @@ import (
 )
 
 // KeyScopedWriteMultiMatchMarker is the grep-stable marker every applier's
-// [RefuseKeyScopedMultiMatch] refusal carries.
+// [RefuseKeyScopedMultiMatch] refusal carries; it is the text of
+// [ErrKeyScopedWriteMatchedMultipleRows] (TestRefuseKeyScopedMultiMatch).
 const KeyScopedWriteMultiMatchMarker = "KEY-SCOPED-WRITE-MATCHED-MULTIPLE-ROWS"
 
 // ErrKeyScopedWriteMatchedMultipleRows is the sentinel for an UPDATE or
 // DELETE that identifies its row by key and matched more than one row on a
-// target table. Errors wrapping it are matchable with [errors.Is].
-var ErrKeyScopedWriteMatchedMultipleRows = errors.New("key-scoped write matched more than one target row")
+// target table. Errors wrapping it are matchable with [errors.Is]. It IS
+// [ir.ErrKeyScopedWriteMatchedMultipleRows], whose text is the marker, so the
+// fleet supervisor, which keys on the ir sentinel, does not restart a leg
+// that hit it.
+var ErrKeyScopedWriteMatchedMultipleRows = ir.ErrKeyScopedWriteMatchedMultipleRows
 
 // keyScopedMultiMatchHint is the CodedError hint: the remedy, stripped of
 // the diagnosis the message carries.

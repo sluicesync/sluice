@@ -28,9 +28,11 @@ import (
 	"testing"
 	"time"
 
+	"sluicesync.dev/sluice/internal/appliershared"
 	"sluicesync.dev/sluice/internal/applymarks"
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/logcapture"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // TestSupervisor_DefaultPolicyRestartsForever pins the unreachable-terminal
@@ -215,7 +217,10 @@ func TestSupervisor_OtherTerminalFailuresAreStillRestarted(t *testing.T) {
 // its marker. Each case wraps the sentinel the way its engine does (inside a
 // terminal error, under a pipeline frame); APPLY-MARK-MISMATCH uses the real
 // applymarks.RefusalError, which matches through its Is method rather than a
-// %w chain. The roster floor keeps a new list entry from going unpinned.
+// %w chain, and KEY-SCOPED-WRITE-MATCHED-MULTIPLE-ROWS the real coded refusal
+// from appliershared. The roster floor keeps a new list entry from going
+// unpinned; TestSupervisor_RefusalsARestartCanClearAreStillRestarted is the
+// other direction.
 func TestSupervisor_RefusalsARestartRepeatsAreNotRestarted(t *testing.T) {
 	cases := map[string]error{
 		"SLOT-ACKED-PAST-TARGET-POSITION": fmt.Errorf("postgres: %w: replication slot \"s\": %w", ir.ErrSlotAckedPastTargetPosition, terminalTestErr{"refused"}),
@@ -223,6 +228,10 @@ func TestSupervisor_RefusalsARestartRepeatsAreNotRestarted(t *testing.T) {
 		"APPLY-MARK-MISMATCH":             &applymarks.RefusalError{},
 		"CHARSET-NOT-DECODABLE":           fmt.Errorf("%w: table \"t\" column \"c\"", ir.ErrCharsetNotDecodable),
 		"DSN-TIME-ZONE-NOT-UTC":           fmt.Errorf("mysql: %w: refusing the DSN parameter time_zone=x", ir.ErrDSNTimeZoneNotUTC),
+		// Coded (SLUICE-E-CDC-KEY-MATCHED-MULTIPLE-ROWS): built by the real
+		// shared constructor every applier calls, so the alias between the
+		// appliershared and ir sentinels is part of what is pinned.
+		"KEY-SCOPED-WRITE-MATCHED-MULTIPLE-ROWS": appliershared.RefuseKeyScopedMultiMatch("postgres", "delete", "public", "t", ir.Row{"id": int64(2)}, 2),
 	}
 
 	if len(cases) != len(refusalsARestartRepeats) {
@@ -263,6 +272,40 @@ func TestSupervisor_RefusalsARestartRepeatsAreNotRestarted(t *testing.T) {
 			}
 			if !strings.Contains(logBuf.String(), "not restarting") || !strings.Contains(logBuf.String(), "marker="+marker) {
 				t.Errorf("no not-restarting line naming marker=%s; log:\n%s", marker, logBuf.String())
+			}
+		})
+	}
+}
+
+// TestSupervisor_RefusalsARestartCanClearAreStillRestarted pins the other half
+// of the list's decisions: a coded refusal that clears without a change to the
+// leg, and the Postgres DEFERRED-KEY-CHECK-FAILED-AT-COMMIT refusal (whose
+// batch-loop cause depends on arrival timing), are restarted under the cap
+// like any other failure. Each wraps the same way its raise site does.
+func TestSupervisor_RefusalsARestartCanClearAreStillRestarted(t *testing.T) {
+	cases := map[string]error{
+		"SLUICE-E-CDC-REPLICATION-HEADROOM": sluicecode.Wrap(sluicecode.CodeCDCReplicationHeadroom, "free a slot",
+			terminalTestErr{"max_replication_slots exhausted"}),
+		"DEFERRED-KEY-CHECK-FAILED-AT-COMMIT": fmt.Errorf("postgres: applier: commit: %w",
+			fmt.Errorf("DEFERRED-KEY-CHECK-FAILED-AT-COMMIT: a DEFERRABLE constraint's commit-time check refused the target transaction (t_pk): %w",
+				terminalTestErr{"ERROR: duplicate key value violates unique constraint \"t_pk\" (SQLSTATE 23505)"})),
+	}
+	for name, refusal := range cases {
+		t.Run(name, func(t *testing.T) {
+			var attempts int
+			sy := SupervisedSync{
+				ID: "clears",
+				Runner: runnerFunc(func(_ context.Context) error {
+					attempts++
+					return fmt.Errorf("pipeline: sync: %w", refusal)
+				}),
+			}
+			policy := RestartPolicy{BackoffBase: time.Millisecond, BackoffCap: 2 * time.Millisecond, HealthyRunThreshold: time.Hour}
+			ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+			defer cancel()
+			_ = NewSupervisor([]SupervisedSync{sy}, policy).Run(ctx)
+			if attempts < 2 {
+				t.Errorf("%s was run %d time(s); want it restarted — a restart can clear it", name, attempts)
 			}
 		})
 	}

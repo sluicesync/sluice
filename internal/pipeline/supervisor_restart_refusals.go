@@ -29,9 +29,13 @@ import (
 // without any change to this leg (SLUICE-E-CDC-REPLICATION-HEADROOM once
 // another slot is freed, SLUICE-E-TARGET-TABLE-BLOCKED-BY-WORKFLOW once the
 // MoveTables move completes or is reversed), so honouring the class would
-// take that recovery away. They stay under the failure cap.
+// take that recovery away. They stay under the failure cap unless listed here
+// individually, with the reason a restart repeats them. The registry carries
+// no per-code "a restart repeats it" attribute yet; until it does, a coded
+// refusal is listed only after its raise site has been read for that
+// property (audit backlog, gate proposals: the restart-repeats attribute).
 //
-// # The enumeration (every codeless exit-1 refusal AGENTS.md tells an agent not to retry)
+// # The enumeration (every codeless exit-1 refusal AGENTS.md tells an agent not to retry, plus the coded ones a restart repeats)
 //
 //   - UNFORWARDED-SCHEMA-CHANGE (incl. ADD-COLUMN-BACKFILL-INCOMPLETE): not
 //     restarted, by its own branch in superviseOne.
@@ -46,11 +50,32 @@ import (
 //     binlog event a restart reads again.
 //   - DSN-TIME-ZONE-NOT-UTC: listed. The DSN is the leg's configuration; a
 //     restart parses the same one.
+//   - KEY-SCOPED-WRITE-MATCHED-MULTIPLE-ROWS (coded,
+//     SLUICE-E-CDC-KEY-MATCHED-MULTIPLE-ROWS): listed. The refused write's
+//     transaction is rolled back, and a restart replays the same source
+//     changes, in source order, onto the same committed rows, so the key is
+//     shared by the same rows when the write comes round again. Batch and
+//     lane boundaries may fall differently on the replay, but they only move
+//     where the earlier changes commit, not what the write finds. (A replay
+//     that commits a deferrable key's shared state before the write refuses
+//     with DEFERRED-KEY-CHECK-FAILED-AT-COMMIT instead, which is below.)
+//   - DEFERRED-KEY-CHECK-FAILED-AT-COMMIT (Postgres target, codeless): NOT
+//     listed. It is the COMMIT of a target transaction that a deferrable
+//     constraint's re-check refused, and one of its causes is a source
+//     transaction split across target transactions by the batch loop's idle
+//     flush, byte cap or AIMD-sized row cap (appliershared.RunBatchLoop). Those
+//     boundaries depend on arrival timing, and a restart replays a backlog
+//     that is all available at once, so the replay can hold the transaction
+//     in one target transaction and succeed. Its other causes (a key change
+//     applied alone as a lane barrier, --apply-batch-size 1, a target
+//     stricter than its source) do repeat, and they stay under the failure
+//     cap with the coded refusals above. It carries no sentinel either: the
+//     SQLSTATE in its chain is the only handle.
 //
 // Each engine refusal wraps its sentinel with %w; the engine packages pin
 // that (TestCheckSlotNotAckedPast, TestClassifyApplierError_VindexUpdateRefusalIsMarkedTerminal,
 // TestFinishParseDSN_TimeZoneSpellings, TestDecodeBinlogRow_RefusesWhatItCannotDecode,
-// TestRestartRefusalSentinelsAreTheMarkers). A wrapper between the engine and
+// TestRestartRefusalSentinelsAreTheMarkers, TestRefuseKeyScopedMultiMatch). A wrapper between the engine and
 // the runner that dropped the chain would degrade a leg to the old restart
 // loop, never to a silent skip.
 var refusalsARestartRepeats = []error{
@@ -59,6 +84,7 @@ var refusalsARestartRepeats = []error{
 	applymarks.ErrMismatch,
 	ir.ErrCharsetNotDecodable,
 	ir.ErrDSNTimeZoneNotUTC,
+	ir.ErrKeyScopedWriteMatchedMultipleRows,
 }
 
 // refusalARestartRepeats returns the listed sentinel err carries, or nil.
