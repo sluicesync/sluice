@@ -16,10 +16,9 @@ name: Report scheduled red
 # The set of workflows consumed here is held to the repo's actual
 # scheduled set by scripts/check-schedule-consumers.sh in the Lint job:
 # a new `schedule:` trigger that is neither listed below nor in the
-# guard's documented EXEMPT set fails CI. build-prebaked-images is the
-# one deliberate exemption (a transient image-build/registry failure
-# self-heals on the next schedule and is not a correctness gate) — its
-# reason lives in that guard.
+# guard's documented EXEMPT set fails CI. That set is empty: the guard
+# records why build-prebaked-images stopped being exempt (its 2026-09-27
+# red could not self-heal, and nothing filed it).
 
 on:
   workflow_run:
@@ -31,6 +30,7 @@ on:
       - "MySQL version matrix"
       - "Vitess version matrix"
       - "Neki Verify"
+      - "Build pre-baked CI images"
     types: [completed]
 
 # Least privilege: this workflow only touches the issue tracker.

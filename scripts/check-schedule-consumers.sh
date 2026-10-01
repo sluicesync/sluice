@@ -22,12 +22,17 @@ WF_DIR=.github/workflows
 CONSUMER="$WF_DIR/report-red.yml"
 
 # Filenames deliberately NOT consumed, each with a reason. A red here is not a
-# correctness regression that needs a standing triage issue.
-#   build-prebaked-images.yml — its red is a transient image-build / GHCR
-#   registry failure that self-heals on the next scheduled build; the CI jobs
-#   that consume those images fall back to building locally, so a stale/absent
-#   prebaked image degrades speed, not correctness.
-EXEMPT_WORKFLOWS="build-prebaked-images.yml"
+# correctness regression that needs a standing triage issue. Currently none.
+#
+# build-prebaked-images.yml WAS exempt until 2026-10-01, on the premise that
+# its red was "a transient image-build / GHCR registry failure that self-heals
+# on the next scheduled build" and that consumers "fall back". Both were false
+# the first time it mattered: MinIO took quay.io private, the mirrors leg went
+# red from the 2026-09-27 scheduled run on and could never self-heal, and the
+# mirrors' fallback is to the very upstream that had gone. Nothing filed it.
+# The bake is how a vendor retiring a registry path gets noticed on our
+# schedule rather than mid-release, so its red is now consumed like the rest.
+EXEMPT_WORKFLOWS=""
 
 if [ ! -f "$CONSUMER" ]; then
 	echo "check-schedule-consumers: consumer $CONSUMER is missing — the scheduled-red gate has no home. Failing."
