@@ -720,8 +720,11 @@ func runOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 //     the position write, this is the ONLY place the boundary can be
 //     persisted, so writeBoundaryOnly advances it in a dedicated
 //     position-only tx (the rows are already durable via serial in-order
-//     apply). Without the flag (PG) this is a pure no-op — PG already
-//     advanced its position on the rows' own flushes.
+//     apply). It is also how an empty transaction — a Postgres reader's
+//     keepalive boundary (GC-41 (j)) — reaches the target, which is what
+//     releases the slot of an idle stream on this path. Without the flag
+//     this is a pure no-op; no engine applier leaves it unset (see
+//     [BatchConfig.CheckpointOnlyAtTxBoundary]).
 func waitForFirstChange(ctx context.Context, cfg *BatchConfig, streamID string, changes <-chan ir.Change, pending *int64, inSourceTx *bool) (first ir.Change, channelClosed bool, err error) {
 	for {
 		select {

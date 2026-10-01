@@ -14,6 +14,7 @@ package pipeline
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -33,6 +34,15 @@ import (
 // self-contained).
 func startPostgresLogical(t *testing.T) (sourceDSN, targetDSN string, cleanup func()) {
 	t.Helper()
+	// Task #68: pre-baked PG image. See pg_prebaked_integration_test.go
+	// for the full rationale.
+	return startPostgresLogicalImage(t, pgPrebakedImage, 8)
+}
+
+// startPostgresLogicalImage is [startPostgresLogical] on a given image, with
+// room for maxSlots replication slots and walsenders.
+func startPostgresLogicalImage(t *testing.T, image string, maxSlots int) (sourceDSN, targetDSN string, cleanup func()) {
+	t.Helper()
 	testcontainers.SkipIfProviderIsNotHealthy(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -40,9 +50,7 @@ func startPostgresLogical(t *testing.T) (sourceDSN, targetDSN string, cleanup fu
 
 	container, err := pgtc.Run(
 		ctx,
-		// Task #68: pre-baked PG image. See
-		// pg_prebaked_integration_test.go for the full rationale.
-		pgPrebakedImage,
+		image,
 		pgtc.WithDatabase("source_db"),
 		pgtc.WithUsername("test"),
 		pgtc.WithPassword("test"),
@@ -52,8 +60,8 @@ func startPostgresLogical(t *testing.T) (sourceDSN, targetDSN string, cleanup fu
 			ContainerRequest: testcontainers.ContainerRequest{
 				Cmd: []string{
 					"-c", "wal_level=logical",
-					"-c", "max_wal_senders=8",
-					"-c", "max_replication_slots=8",
+					"-c", fmt.Sprintf("max_wal_senders=%d", maxSlots),
+					"-c", fmt.Sprintf("max_replication_slots=%d", maxSlots),
 				},
 			},
 		}),

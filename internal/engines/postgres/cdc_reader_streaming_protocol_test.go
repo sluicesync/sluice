@@ -129,6 +129,7 @@ func TestStreamAbortMessageV2_RefusesLoudly(t *testing.T) {
 		&currentTxnCommitTime,
 		&streamedLSN,
 		&inStream,
+		newKeepaliveBoundary(0, time.Time{}),
 		firstSeenRelLSN,
 		out,
 	)
@@ -210,6 +211,7 @@ func TestStreamAbortMessageV2_ErrorPropagatesAsUnclassified(t *testing.T) {
 		&currentTxnCommitTime,
 		&streamedLSN,
 		&inStream,
+		newKeepaliveBoundary(0, time.Time{}),
 		firstSeenRelLSN,
 		out,
 	)

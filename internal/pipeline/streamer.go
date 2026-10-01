@@ -1309,14 +1309,16 @@ type Streamer struct {
 	// SourceHeartbeatInterval, when > 0, enables the F17 source-side
 	// heartbeat writer (ADR-0061). The streamer attaches a per-stream
 	// goroutine that periodically INSERTs a row into the sluice-owned
-	// heartbeat table on the source DB; the INSERT generates WAL /
-	// binlog traffic so the consumer's position advances even against
-	// an otherwise-idle source. Zero (the default) leaves the source
-	// untouched — F17 is opt-in because the INSERT is a behaviour
-	// change on the source DB that operators on regulated systems must
-	// explicitly enable. Operators on low-traffic / idle-prone sources
-	// set --source-heartbeat-interval=30s (typical) to prevent slot
-	// eviction / binlog rotation past the consumer's position.
+	// heartbeat table on the source DB; the INSERT generates binlog
+	// traffic so a MySQL consumer's position advances even against an
+	// otherwise-idle source. On Postgres it is not what moves the slot:
+	// the heartbeat table is outside the publication, so PG 15+ decodes
+	// nothing for it, and the reader instead advances to the walsender's
+	// read position whenever WAL is written anywhere on the server
+	// (GC-41 (j), postgres/cdc_keepalive_boundary.go). Zero (the default)
+	// leaves the source untouched — F17 is opt-in because the INSERT is
+	// a behaviour change on the source DB that operators on regulated
+	// systems must explicitly enable.
 	SourceHeartbeatInterval time.Duration
 
 	// SourceHeartbeatPruneWindow is the age threshold for the periodic

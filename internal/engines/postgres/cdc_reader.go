@@ -1011,7 +1011,9 @@ func checkSourceIdentity(ctx context.Context, slotName, persistedSysID string, p
 //
 //   - streamedLSN: the highest commit-LSN the pump has parsed off
 //     the WAL stream. Advances as soon as a CommitMessage is seen,
-//     long before the change reaches the target.
+//     long before the change reaches the target — or, between
+//     transactions, to a keepalive's ServerWALEnd once the pump has
+//     emitted a boundary there (GC-41 (j), cdc_keepalive_boundary.go).
 //   - the ack ceiling (r.ackCeil): the highest LSN the consumer has
 //     released as durably held — for a sync, the target's persisted
 //     position read back from the target. The keepalive sends
@@ -1066,6 +1068,9 @@ func (r *CDCReader) pump(ctx context.Context, conn *pgconn.PgConn, startLSN pglo
 	// catalog snapshot lagged the catalog change.
 	firstSeenRelLSN := map[uint32]pglogrepl.LSN{}
 	var inStream bool // pgoutput v2 streaming-in-progress flag
+	// kb decides when a keepalive may stand in for a commit (GC-41 (j),
+	// cdc_keepalive_boundary.go).
+	kb := newKeepaliveBoundary(startLSN, time.Now())
 
 	// ka is shared with [CDCReader.send] so a send that blocks on a slow
 	// consumer keeps the walsender alive too (see send). Installed here,
@@ -1157,6 +1162,16 @@ func (r *CDCReader) pump(ctx context.Context, conn *pgconn.PgConn, startLSN pglo
 				// before the deadline fires.
 				ka.next = time.Time{}
 			}
+			// GC-41 (j): with no transaction open, the walsender's read
+			// position is a boundary the consumer can persist — without it
+			// a stream whose tables are idle never moves its slot.
+			if err := r.standKeepaliveIn(ctx, pkm.ServerWALEnd, inStream, kb, &streamedLSN, out); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				r.setErr(classifyReaderError(err))
+				return
+			}
 
 		case pglogrepl.XLogDataByteID:
 			xld, err := pglogrepl.ParseXLogData(copyData.Data[1:])
@@ -1175,7 +1190,7 @@ func (r *CDCReader) pump(ctx context.Context, conn *pgconn.PgConn, startLSN pglo
 			// — so a routine connection fault there surfaced here and, parked
 			// raw, was TERMINAL on exactly the shape nettransient exists to
 			// ride out.
-			if err := r.dispatchWAL(ctx, xld, relations, snapshotSig, &currentTxnLSN, &currentTxnStartLSN, &currentTxnCommitTime, &streamedLSN, &inStream, firstSeenRelLSN, out); err != nil {
+			if err := r.dispatchWAL(ctx, xld, relations, snapshotSig, &currentTxnLSN, &currentTxnStartLSN, &currentTxnCommitTime, &streamedLSN, &inStream, kb, firstSeenRelLSN, out); err != nil {
 				// A cancelled dispatch is the teardown, not a fault — the
 				// ctx-guard the MySQL binlog sibling already carries (cdc_reader.go
 				// dispatch site). dispatchWAL runs LIVE catalog queries and the
@@ -1200,9 +1215,11 @@ func (r *CDCReader) pump(ctx context.Context, conn *pgconn.PgConn, startLSN pglo
 // LSN bookkeeping; Relation messages refresh the cache.
 //
 // streamedLSN tracks the highest commit-LSN parsed off the wire and
-// is updated on each CommitMessage. It only ever CAPS the slot ack:
-// the keepalive never advertises past the consumer-released ceiling
-// ([CDCReader.ackLSN], GC-41).
+// is updated on each CommitMessage (and, between transactions, by a
+// keepalive boundary — cdc_keepalive_boundary.go). It only ever CAPS the
+// slot ack: the keepalive never advertises past the consumer-released
+// ceiling ([CDCReader.ackLSN], GC-41). kb records each Begin and Commit
+// so the pump knows when a keepalive may stand in for a commit.
 func (r *CDCReader) dispatchWAL(
 	ctx context.Context,
 	xld pglogrepl.XLogData,
@@ -1213,6 +1230,7 @@ func (r *CDCReader) dispatchWAL(
 	currentTxnCommitTime *time.Time,
 	streamedLSN *pglogrepl.LSN,
 	inStream *bool,
+	kb *keepaliveBoundary,
 	firstSeenRelLSN map[uint32]pglogrepl.LSN,
 	out chan<- ir.Change,
 ) error {
@@ -1307,6 +1325,7 @@ func (r *CDCReader) dispatchWAL(
 		// BeginMessage, so capture it here and carry it onto every row
 		// event of this transaction below.
 		*currentTxnCommitTime = m.CommitTime
+		kb.begin()
 		// ADR-0036 M1: log txn-start (WAL position of the BEGIN record)
 		// alongside the txn's final commit LSN. Lets the diagnostic test
 		// detect transactions that straddle the publication-add LSN
@@ -1330,56 +1349,7 @@ func (r *CDCReader) dispatchWAL(
 		return r.send(ctx, out, ir.TxBegin{Position: pos, CommitTime: m.CommitTime})
 
 	case *pglogrepl.CommitMessage:
-		*streamedLSN = m.CommitLSN
-		slog.DebugContext(
-			ctx, "cdc.diag: txn commit",
-			slog.String("phase", "commit"),
-			slog.String("txn_start_lsn", currentTxnStartLSN.String()),
-			slog.String("txn_commit_lsn", m.CommitLSN.String()),
-			slog.String("wal_start", xld.WALStart.String()),
-		)
-		// Source-tx commit boundary: flush whatever the applier has
-		// in flight as one target transaction. The empty-source-tx
-		// case (BEGIN immediately followed by COMMIT with no row
-		// events) is harmless — the applier's flush path skips when
-		// no rows have accumulated. See ADR-0027.
-		//
-		// The TxCommit carries the POST-commit point — TransactionEndLSN,
-		// the first byte after the commit record — not CommitLSN, the
-		// commit record's start (audit 2026-09-01 A2-1; the Postgres
-		// sibling of item 132). The two differ in exactly the way that
-		// matters for resume: logical decoding skips a transaction only
-		// when its commit record starts BEFORE the requested start LSN
-		// (SnapBuildXactNeedsSkip is `origptr < start_decoding_at`), so a
-		// resume from CommitLSN re-delivered the whole transaction it had
-		// just acknowledged — its RelationMessage rendered from the
-		// historic catalog AND its rows — while a resume from
-		// TransactionEndLSN begins at the next one. Every applier persists
-		// this position at a clean source-tx boundary (batched:
-		// CheckpointOnlyAtTxBoundary; per-change: persistSourceTxCommit;
-		// concurrent: the frontier's RecordTxBoundary), so every warm
-		// resume after a clean stop replayed the last applied transaction,
-		// and a mid-stream DDL refusal re-fired on that replay after the
-		// operator had applied the DDL on the target exactly as the hint
-		// said — the drained-model recovery could not run. Row events and
-		// TxBegin keep the PRE-transaction point (BeginMessage.FinalLSN ==
-		// CommitLSN): a position persisted mid-transaction still
-		// re-delivers the transaction whole, which ADR-0010 idempotency
-		// absorbs. TestPGCDC_TxCommitPositionIsPostCommit pins both
-		// directions on a real server.
-		if m.TransactionEndLSN <= m.CommitLSN {
-			// pgoutput stamps end_lsn on every commit, strictly past the
-			// commit record. A wire that does not is not one this position
-			// convention can resume from — refuse rather than persist a
-			// point that would re-deliver (or worse, skip) on resume.
-			return fmt.Errorf("postgres: cdc: commit message at %s carries transaction end LSN %s, which does not follow the commit record — cannot derive a post-commit resume position",
-				m.CommitLSN, m.TransactionEndLSN)
-		}
-		pos, err := r.closeTransaction(m.TransactionEndLSN)
-		if err != nil {
-			return err
-		}
-		return r.send(ctx, out, ir.TxCommit{Position: pos, CommitTime: m.CommitTime})
+		return r.dispatchCommit(ctx, xld, m, *currentTxnStartLSN, streamedLSN, kb, out)
 
 	case *pglogrepl.InsertMessageV2:
 		r.diagRowEvent(ctx, "insert", relations, m.RelationID, xld, *currentTxnStartLSN, *currentTxnLSN, firstSeenRelLSN)
@@ -1473,6 +1443,69 @@ func (r *CDCReader) dispatchWAL(
 		// — see its dedicated case immediately above (ADR-0055).
 		return nil
 	}
+}
+
+// dispatchCommit handles a CommitMessage: it advances the streamed LSN,
+// records the commit on kb, and emits the transaction's TxCommit.
+//
+// Source-tx commit boundary: the applier flushes whatever it has in flight
+// as one target transaction (ADR-0027). An empty source transaction (BEGIN
+// then COMMIT with no row events — PG 14's form of a transaction outside the
+// publication, and the shape of a keepalive boundary) writes no rows, but
+// every apply path still persists its position; that is what moves the
+// slot on an idle stream (GC-41 (j)).
+//
+// The TxCommit carries the POST-commit point — TransactionEndLSN, the first
+// byte after the commit record — not CommitLSN, the commit record's start
+// (audit 2026-09-01 A2-1; the Postgres sibling of item 132). The two differ
+// in exactly the way that matters for resume: logical decoding skips a
+// transaction only when its commit record starts BEFORE the requested start
+// LSN (SnapBuildXactNeedsSkip is `origptr < start_decoding_at`), so a resume
+// from CommitLSN re-delivered the whole transaction it had just
+// acknowledged — its RelationMessage rendered from the historic catalog AND
+// its rows — while a resume from TransactionEndLSN begins at the next one.
+// Every applier persists this position at a clean source-tx boundary
+// (batched: CheckpointOnlyAtTxBoundary; per-change: persistSourceTxCommit;
+// concurrent: the frontier's RecordTxBoundary), so every warm resume after a
+// clean stop replayed the last applied transaction, and a mid-stream DDL
+// refusal re-fired on that replay after the operator had applied the DDL on
+// the target exactly as the hint said — the drained-model recovery could not
+// run. Row events and TxBegin keep the PRE-transaction point
+// (BeginMessage.FinalLSN == CommitLSN): a position persisted
+// mid-transaction still re-delivers the transaction whole, which ADR-0010
+// idempotency absorbs. TestPGCDC_TxCommitPositionIsPostCommit pins both
+// directions on a real server.
+func (r *CDCReader) dispatchCommit(
+	ctx context.Context,
+	xld pglogrepl.XLogData,
+	m *pglogrepl.CommitMessage,
+	txnStartLSN pglogrepl.LSN,
+	streamedLSN *pglogrepl.LSN,
+	kb *keepaliveBoundary,
+	out chan<- ir.Change,
+) error {
+	*streamedLSN = m.CommitLSN
+	slog.DebugContext(
+		ctx, "cdc.diag: txn commit",
+		slog.String("phase", "commit"),
+		slog.String("txn_start_lsn", txnStartLSN.String()),
+		slog.String("txn_commit_lsn", m.CommitLSN.String()),
+		slog.String("wal_start", xld.WALStart.String()),
+	)
+	if m.TransactionEndLSN <= m.CommitLSN {
+		// pgoutput stamps end_lsn on every commit, strictly past the
+		// commit record. A wire that does not is not one this position
+		// convention can resume from — refuse rather than persist a
+		// point that would re-deliver (or worse, skip) on resume.
+		return fmt.Errorf("postgres: cdc: commit message at %s carries transaction end LSN %s, which does not follow the commit record — cannot derive a post-commit resume position",
+			m.CommitLSN, m.TransactionEndLSN)
+	}
+	r.noteCommit(ctx, kb, m.CommitLSN, m.TransactionEndLSN)
+	pos, err := r.closeTransaction(m.TransactionEndLSN)
+	if err != nil {
+		return err
+	}
+	return r.send(ctx, out, ir.TxCommit{Position: pos, CommitTime: m.CommitTime})
 }
 
 // diagRowEvent emits ADR-0036 (Path D Phase A) DEBUG-level diagnostic
@@ -1932,8 +1965,9 @@ func (r *CDCReader) positionAt(lsn pglogrepl.LSN) (ir.Position, error) {
 // past what the pump has streamed, and never below the start position.
 //
 // The ceiling is the load-bearing half, and it is unconditional (GC-41).
-// streamedLSN advances as the pump parses CommitMessages off the WAL —
-// well before any target write — so acking it lets confirmed_flush_lsn
+// streamedLSN advances as the pump parses CommitMessages off the WAL (and
+// to keepalive boundaries between them, GC-41 (j)) — well before any
+// target write — so acking it lets confirmed_flush_lsn
 // run past changes still sitting in an apply batch, a lane, or an
 // --apply-delay hold. A stop or crash there loses them permanently: the
 // walsender fast-forwards START_REPLICATION to confirmed_flush_lsn, so

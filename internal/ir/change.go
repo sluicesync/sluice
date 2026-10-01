@@ -363,8 +363,9 @@ func (e TxBegin) SourceCommitTime() time.Time { return e.CommitTime }
 // for the design rationale. A [BatchedChangeApplier] that observes
 // TxCommit flushes the in-flight target transaction at this boundary
 // (subject to the empty-source-tx skip — a TxBegin → TxCommit pair
-// with no row events between them does not produce an empty target
-// commit).
+// with no row events between them flushes no rows, though every apply
+// path still persists its position: a Postgres reader emits such pairs
+// as keepalive boundaries so an idle stream's slot advances, GC-41 (j)).
 //
 // Position carries the source-side POST-commit point — the position a
 // resume starts AFTER this transaction from, never one that re-delivers

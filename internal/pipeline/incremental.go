@@ -1402,7 +1402,11 @@ func (b *IncrementalBackup) captureWindow(
 // strictly precedes its OWN rows, so CDCPositionCommitsAfterRows stays false
 // for Postgres and this assertion keeps running there. Before the fix the
 // EndPosition was the commit record's start, an LSN no other record can
-// occupy, so the coincidence was impossible on Postgres.
+// occupy, so the coincidence was impossible on Postgres. A keepalive
+// boundary (GC-41 (j), postgres/cdc_keepalive_boundary.go) is a second
+// TxCommit of that kind — the walsender's read position, where the next
+// record may also start — and reaches the same false positive under the
+// same two exits, with the same verdict.
 func assertDataWindowEndPositionInvariant(manifest *irbackup.Manifest) error {
 	if manifest.CDCPositionCommitsAfterRows || manifestChangeRecordCount(manifest) == 0 {
 		return nil

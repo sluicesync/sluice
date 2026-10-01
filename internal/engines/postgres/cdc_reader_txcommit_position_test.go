@@ -57,7 +57,7 @@ func dispatchOne(t *testing.T, r *CDCReader, payload []byte) (ir.Change, error) 
 		context.Background(),
 		pglogrepl.XLogData{WALStart: 0x50, ServerWALEnd: 0x200, ServerTime: time.Now(), WALData: payload},
 		relations, snapshotSig,
-		&currentTxnLSN, &currentTxnStartLSN, &currentTxnCommitTime, &streamedLSN, &inStream,
+		&currentTxnLSN, &currentTxnStartLSN, &currentTxnCommitTime, &streamedLSN, &inStream, newKeepaliveBoundary(0, time.Time{}),
 		firstSeenRelLSN, out,
 	)
 	select {
