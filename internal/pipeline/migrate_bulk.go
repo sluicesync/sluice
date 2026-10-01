@@ -542,8 +542,10 @@ func copyTableWithCursor(
 		// single-reader --resume cursor path). The cross-table copy pool
 		// (ADR-0076) cancels its errgroup ctx on the FIRST table's terminal
 		// error so peers unwind; a peer table cancelled here closes its batch
-		// channel early (batchCount==0 or short), and migcore.ReaderStreamErr filters
-		// ctx.Canceled to nil — so without this check the cancelled table
+		// channel early (batchCount==0 or short), and migcore.ReaderStreamErr used
+		// to forgive ctx.Canceled (it no longer does, GC-41 (i); a reader that
+		// closes quietly on a cancel still gives it nothing to see) — so
+		// without this check the cancelled table
 		// returns nil, the caller marks it State=Complete, and a later --resume
 		// SKIPS it with only a partial copy on disk → silent loss of its unread
 		// tail. Returning the cancellation keeps the table NOT-complete so the

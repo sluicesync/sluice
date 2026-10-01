@@ -77,17 +77,26 @@ func CloseIf(v any) {
 // batch's child context on purpose once the writer has drained it, and
 // the reader might record that cancel. It cannot: every in-tree reader
 // stores its sticky error BEFORE it closes the row channel (the PG,
-// MySQL, SQLite and D1 stream goroutines; mydumper and the VStream queue
-// record nothing on a cancel at all), and a batch's cancel runs only
-// after the writer saw that close. So a context error here means the
-// stream was cut short by a cancel of the context it was read under, and
-// the forgiveness had one real effect: a stopped copy returned nil, which
-// the whole-table copies then recorded COMPLETE. Every caller that relied
-// on it re-checks its own ctx right after this call, so it now gets the
-// same refusal one line earlier, wrapped in [ErrCopyInterrupted]. A
-// future reader that records a cancel after its close would cost a loud
-// spurious refusal, never a silent one. Pinned by
-// TestReaderStreamErr_ContextErrorIsAnInterruption.
+// MySQL, SQLite and D1 stream goroutines; mydumper records nothing on a
+// cancel), and a batch's cancel runs only after the writer saw that
+// close. So a context error here means the stream was cut short by a
+// cancel, and the forgiveness had one real effect: a stopped copy
+// returned nil, which the whole-table copies then recorded COMPLETE.
+//
+// The cancel need not be the COPY's own context, and that case makes this
+// check the only one that refuses. The VStream snapshot stream's shutdown
+// (cancelCopyForShutdown) records context.Canceled and marks the COPY
+// complete, so its per-table queue closes with no row lost to any stage
+// and the copy's context still live: the source-end verdict
+// ([SourceEnd.Confirm]) passes, and only this sticky error says the table
+// was not fully read. Pinned by
+// TestStopMidCopy_AReaderStoppedByItsOwnShutdownIsRefused.
+//
+// Every caller that relied on the forgiveness re-checks its own ctx right
+// after this call, so it now gets the same refusal one line earlier,
+// wrapped in [ErrCopyInterrupted]. A future reader that records a cancel
+// after its close would cost a loud spurious refusal, never a silent one.
+// Pinned by TestReaderStreamErr_ContextErrorIsAnInterruption.
 func ReaderStreamErr(rr ir.RowReader, table *ir.Table) error {
 	err := rr.Err()
 	if err == nil {

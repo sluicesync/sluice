@@ -44,7 +44,13 @@ type SourceEnd struct{ drained atomic.Bool }
 
 // Reached records that the source stream ended NATURALLY — the reader
 // closed its channel at end of data, or a batched loop read its terminal
-// short page. It counts only while ctx is live: a close observed after
+// short page. (The batched loops read "short page" as "end of range" on
+// the [ir.BatchedRowReader] full-page contract. The one code path that
+// could short a page for another reason — [ReadChunkBatch]'s Go-side
+// filterByUpperBound fallback, which clips client-side after the LIMIT —
+// is unreachable today because every shipping batched reader implements
+// [ir.BoundedBatchedRowReader]. UNVERIFIED PREMISE for a future reader
+// that does not; nothing here would notice.) It counts only while ctx is live: a close observed after
 // ctx ended may be the reader unwinding on that cancel, and the two are
 // indistinguishable from here, so the ambiguous case is recorded as
 // not-drained (a loud re-copy, never a skipped tail). Because cancellation

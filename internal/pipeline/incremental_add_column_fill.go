@@ -253,8 +253,9 @@ func emitTableFill(
 		}
 		n++
 	}
-	// A cancelled read closes the channel early, and ReaderStreamErr
-	// deliberately forgives cancellation — so a short fill must be refused
+	// A cancelled read closes the channel early, and a reader that closes
+	// quietly on a cancel gives ReaderStreamErr nothing to see (it no longer
+	// forgives a recorded one, GC-41 (i)) — so a short fill must be refused
 	// here, or it would be recorded as the whole table.
 	if err := ctx.Err(); err != nil {
 		return 0, err

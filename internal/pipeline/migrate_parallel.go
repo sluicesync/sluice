@@ -1074,8 +1074,9 @@ func copyChunk(
 		// ctx-cancellation must NOT read as a clean end-of-chunk. A peer
 		// chunk's retriable source-read drop cancels the shared errgroup ctx;
 		// the reader then closes this chunk's batch channel early (batchCount==0
-		// or short), and migcore.ReaderStreamErr filters ctx.Canceled to nil — so
-		// without this check the chunk would break-out and be marked
+		// or short), and migcore.ReaderStreamErr used to forgive ctx.Canceled
+		// (no longer, GC-41 (i); a reader that closes quietly on a cancel still
+		// gives it nothing to see) — so without this check the chunk would break-out and be marked
 		// State=Complete with a partial copy, and the whole-table retry would
 		// SKIP it → silent loss of the unread tail. Returning the cancellation
 		// keeps the chunk NOT-complete so the retry re-runs it from its durable
@@ -1295,16 +1296,17 @@ func copyChunkFast(
 			// CRITICAL (ADR-0109 sibling-cancel silent-loss fix): a
 			// ctx-cancellation must NOT read as a clean end-of-chunk. The
 			// reader closes its page channel early on cancellation (yielding
-			// batchCount==0 or a short page), and migcore.ReaderStreamErr DELIBERATELY
-			// filters ctx.Canceled/DeadlineExceeded to nil (benign-cancel) — so
-			// without this check a chunk cancelled by a PEER chunk's retriable
+			// batchCount==0 or a short page). migcore.ReaderStreamErr used to
+			// forgive ctx.Canceled/DeadlineExceeded (no longer, GC-41 (i)), and a
+			// reader that closes quietly on a cancel records nothing for it to
+			// see — so without this check a chunk cancelled by a PEER chunk's retriable
 			// source-read drop (errgroup cancels gctx) would post pumpErr<-nil,
 			// be recorded State=Complete with a PARTIAL/EMPTY copy, and the
 			// whole-table retry would then SKIP it (chunk already "complete") →
 			// silent loss of the chunk's unread tail. Surfacing the cancellation
 			// leaves the chunk NOT-complete so the retry re-runs it from its
 			// durable cursor. (Checked before the batchCount/short-page verdicts,
-			// which is where the benign-cancel close lands.)
+			// which is where a cancel's early close lands.)
 			if err := streamCtx.Err(); err != nil {
 				pumpErr <- err
 				return

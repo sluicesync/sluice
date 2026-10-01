@@ -177,7 +177,7 @@ const (
 // retries ONLY a classified transient (connection-reset / EOF / invalid-
 // connection / vttablet-unavailable). Any non-retriable (terminal) error
 // — including a real decode fault, a non-retriable query error, or a
-// ctx-cancel that survived migcore.ReaderStreamErr's benign-cancel filter —
+// ctx-cancel (migcore.ErrCopyInterrupted since GC-41 (i)) —
 // returns unchanged, exactly as today (no retry, no truncate). On retry the
 // helper backs off (honoring ctx.Done()), opens a fresh reader, runs the
 // attempt, closes the reader, and tries again. On budget exhaustion it

@@ -5,6 +5,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // GC-41 (i): a copy counts as complete ONLY when its source drained to
@@ -32,10 +34,12 @@ import (
 // The cells are the class, not one representative: every copy shape the
 // serial and group loops dispatch to (plain and idempotent, single
 // writer and the ADR-0097 fan-out) × both ways a reader ends a stream on
-// a cancel (closes quietly with Err nil, as the VStream queue and
-// mydumper do; or records ctx.Err() on its sticky error, as the PG,
-// MySQL, SQLite and D1 readers do) × {the serial table loop, the
-// ADR-0100 group loop}, plus `migrate`'s whole-table copy.
+// a cancel of the copy's context (closes quietly with Err nil, as the
+// VStream queue and mydumper do; or records ctx.Err() on its sticky
+// error, as the PG, MySQL, SQLite and D1 readers do) × {the serial table
+// loop, the ADR-0100 group loop}, plus `migrate`'s whole-table copy. A
+// reader stopped by ITS OWN shutdown, with the copy's context still live,
+// is the separate cell TestStopMidCopy_AReaderStoppedByItsOwnShutdownIsRefused.
 
 // stopMidCopyReader emits rowsBeforeStop rows per table, signals that it
 // has, and then behaves as a table with more rows to come: it blocks
@@ -386,6 +390,52 @@ func TestStopMidCopy_AWriterThatReturnsBeforeTheEndIsRefused(t *testing.T) {
 			assertNoCompleteRow(t, store.fakeStateStore, "s", []string{"a"})
 		})
 	}
+}
+
+// shutdownStoppedReader is the VStream snapshot stream's shutdown shape
+// (cancelCopyForShutdown): it emits some rows, records context.Canceled
+// on its sticky error, and closes — while the copy's own context is live.
+type shutdownStoppedReader struct {
+	mu  sync.Mutex
+	err error
+}
+
+func (r *shutdownStoppedReader) ReadRows(context.Context, *ir.Table) (<-chan ir.Row, error) {
+	ch := make(chan ir.Row, 8)
+	for i := 0; i < 5; i++ {
+		ch <- ir.Row{"id": int64(i)}
+	}
+	r.mu.Lock()
+	r.err = context.Canceled
+	r.mu.Unlock()
+	close(ch)
+	return ch, nil
+}
+
+func (r *shutdownStoppedReader) Err() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.err
+}
+
+// A reader stopped by its own shutdown: the stream closes with nothing
+// dropped downstream and the copy's context still live, so every clause
+// of the source-end verdict passes. Only ReaderStreamErr refusing the
+// recorded cancel stands between this and a COMPLETE row for a table
+// that was not fully read.
+func TestStopMidCopy_AReaderStoppedByItsOwnShutdownIsRefused(t *testing.T) {
+	t.Parallel()
+	store := ctxHonouringStateStore{newFakeStateStore()}
+	var phaseLog []string
+	err := runBulkCopyWithOpts(context.Background(), stopMidCopySchema("a"), &shutdownStoppedReader{},
+		&recordingSchemaWriter{phaseLog: &phaseLog}, &closedWinsWriter{}, bulkCopyOpts{
+			Recording:        resumeContext{store: store, migrationID: "s", enabled: true, noResume: true},
+			CopyFanoutDegree: 1,
+		})
+	if !errors.Is(err, migcore.ErrCopyInterrupted) {
+		t.Errorf("a copy whose reader recorded its own shutdown's cancel returned %v, want ErrCopyInterrupted", err)
+	}
+	assertNoCompleteRow(t, store.fakeStateStore, "s", []string{"a"})
 }
 
 // The positive control: the same reader, writer and store with nothing
