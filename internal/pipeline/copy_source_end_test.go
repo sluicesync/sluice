@@ -26,10 +26,13 @@ import (
 // fix nothing downstream could tell that nil from a finished table, so
 // the caller recorded the table COMPLETE — with the rows it had so far —
 // and kept iterating, recording every later table COMPLETE with 0 rows.
-// The only thing that kept it from becoming durable was that the
-// COMPLETE write ran on the same cancelled context and failed; the
-// detached write GC-41 (i) wanted (recordCommittedWorkCtx) removed that
-// accident, and a resume then skipped the table's tail for good.
+// On THESE loops the only thing that kept it from becoming durable was
+// that the COMPLETE write ran on the same cancelled context and failed;
+// the detached write GC-41 (i) wanted (recordCommittedWorkCtx) removed
+// that accident, and a resume then skipped the table's tail for good.
+// `migrate`'s overlapped index phase never had the accident — a peer's
+// failure left a live context to write through — see
+// copy_source_end_overlap_test.go.
 //
 // The cells are the class, not one representative: every copy shape the
 // serial and group loops dispatch to (plain and idempotent, single
