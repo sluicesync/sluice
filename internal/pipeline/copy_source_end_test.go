@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -267,6 +268,77 @@ func TestStopMidCopyRecordsNoCompleteRow(t *testing.T) {
 			assertNoCompleteRow(t, store.fakeStateStore, "m", []string{"a"})
 		})
 	}
+}
+
+// drainedThenClosedReader emits n rows and ends NATURALLY, then signals.
+type drainedThenClosedReader struct {
+	n      int
+	closed chan struct{}
+}
+
+func (r *drainedThenClosedReader) ReadRows(ctx context.Context, _ *ir.Table) (<-chan ir.Row, error) {
+	ch := make(chan ir.Row)
+	go func() {
+		defer close(r.closed)
+		defer close(ch)
+		for i := 0; i < r.n; i++ {
+			select {
+			case ch <- ir.Row{"id": int64(i)}:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return ch, nil
+}
+
+func (*drainedThenClosedReader) Err() error { return nil }
+
+// heldWriter does not start draining until released — a target that is
+// slow while the stop lands.
+type heldWriter struct {
+	release chan struct{}
+	closedWinsWriter
+}
+
+func (w *heldWriter) WriteRows(ctx context.Context, t *ir.Table, rows <-chan ir.Row) error {
+	<-w.release
+	return w.closedWinsWriter.WriteRows(ctx, t, rows)
+}
+
+// The source drained, but a stage BETWEEN the tee and the writer dropped
+// rows on the stop: the tee saw a natural end, so the source-end half of
+// the verdict alone would pass. Only Confirm's live-run clause catches it.
+// The shard stamp is engaged so a buffered stage sits in that gap; 100
+// rows over-fill the stamp's buffer, so it is parked mid-send when the
+// stop lands and drops what it holds. (Should the tee not yet have seen
+// the end when the stop lands, the cell still refuses, on the other
+// clause — it can be weaker than intended, never red without cause.)
+func TestStopMidCopy_DropBetweenADrainedTeeAndTheWriterIsRefused(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	reader := &drainedThenClosedReader{n: 100, closed: make(chan struct{})}
+	writer := &heldWriter{release: make(chan struct{})}
+	go func() {
+		<-reader.closed
+		time.Sleep(50 * time.Millisecond) // let the tee observe the close
+		cancel()
+		close(writer.release)
+	}()
+	store := ctxHonouringStateStore{newFakeStateStore()}
+	var phaseLog []string
+	err := runBulkCopyWithOpts(ctx, stopMidCopySchema("a"), reader,
+		&recordingSchemaWriter{phaseLog: &phaseLog}, writer, bulkCopyOpts{
+			Recording:        resumeContext{store: store, migrationID: "s", enabled: true, noResume: true},
+			Shard:            ShardColumnSpec{Name: "shard", Value: "s1"},
+			CopyFanoutDegree: 1, // the single-writer WriteRows below is the one held
+		})
+	if err == nil {
+		t.Errorf("a copy whose stamp stage dropped rows on the stop returned nil; the writer wrote %d of 100",
+			writer.written.Load())
+	}
+	assertNoCompleteRow(t, store.fakeStateStore, "s", []string{"a"})
 }
 
 // The positive control: the same reader, writer and store with nothing
