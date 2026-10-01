@@ -72,26 +72,29 @@ func CloseIf(v any) {
 // table name and the originating reader error are both visible in
 // the operator-facing message.
 //
-// context.Canceled / context.DeadlineExceeded are deliberately NOT
-// treated as a stream failure. The batched + parallel copy paths
-// cancel each batch's child context on purpose once the writer has
-// drained it (the Bug-9 clean-unwind shape); the reader goroutine
-// observes that cancel and stores it on its sticky error. That is a
-// benign orchestrator-driven teardown, not a data-integrity failure.
-// A genuine parent-context abort (operator Ctrl-C, deadline) is still
-// surfaced — the writer returns the same ctx error and the
-// orchestrator's own ctx checks fire — so suppressing it here cannot
-// hide a real cancellation, only the self-inflicted per-batch one.
-// The Bug-68 failure class (a scan/decode error) is never a context
-// error; it is a `postgres: column …` / `mysql: scan: …` value, so
-// this filter is precise.
+// A context error on the reader is NOT forgiven (GC-41 (i)). It used to
+// be, on the theory that the batched and parallel copies cancel each
+// batch's child context on purpose once the writer has drained it, and
+// the reader might record that cancel. It cannot: every in-tree reader
+// stores its sticky error BEFORE it closes the row channel (the PG,
+// MySQL, SQLite and D1 stream goroutines; mydumper and the VStream queue
+// record nothing on a cancel at all), and a batch's cancel runs only
+// after the writer saw that close. So a context error here means the
+// stream was cut short by a cancel of the context it was read under, and
+// the forgiveness had one real effect: a stopped copy returned nil, which
+// the whole-table copies then recorded COMPLETE. Every caller that relied
+// on it re-checks its own ctx right after this call, so it now gets the
+// same refusal one line earlier, wrapped in [ErrCopyInterrupted]. A
+// future reader that records a cancel after its close would cost a loud
+// spurious refusal, never a silent one. Pinned by
+// TestReaderStreamErr_ContextErrorIsAnInterruption.
 func ReaderStreamErr(rr ir.RowReader, table *ir.Table) error {
 	err := rr.Err()
 	if err == nil {
 		return nil
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return nil
+		return fmt.Errorf("%w: source row stream for table %q: %w", ErrCopyInterrupted, table.Name, err)
 	}
 	return fmt.Errorf("source row stream for table %q failed: %w", table.Name, err)
 }

@@ -597,8 +597,15 @@ func kickOffRowCount(ctx context.Context, rr ir.RowReader, table *ir.Table, pt *
 // bounded buffer (see [migcore.RowChanBuffer]) so source decode and target
 // write overlap instead of rendezvous-alternating; back-pressure is
 // preserved because the buffer is bounded.
-func teeRows(ctx context.Context, src <-chan ir.Row, onRow func(ir.Row)) <-chan ir.Row {
+//
+// The returned [migcore.SourceEnd] reports how src ended (GC-41 (i)): the
+// tee is the stage that reads the source, so it is where a natural end of
+// table is told apart from an unwind on ctx. The copy entry point must ask
+// [migcore.SourceEnd.Confirm] after its writer returns nil — a closed
+// downstream channel alone means nothing.
+func teeRows(ctx context.Context, src <-chan ir.Row, onRow func(ir.Row)) (<-chan ir.Row, *migcore.SourceEnd) {
 	out := make(chan ir.Row, migcore.RowChanBuffer)
+	end := &migcore.SourceEnd{}
 	go func() {
 		defer close(out)
 		for {
@@ -607,6 +614,7 @@ func teeRows(ctx context.Context, src <-chan ir.Row, onRow func(ir.Row)) <-chan 
 				return
 			case row, ok := <-src:
 				if !ok {
+					end.Reached(ctx)
 					return
 				}
 				onRow(row)
@@ -618,5 +626,5 @@ func teeRows(ctx context.Context, src <-chan ir.Row, onRow func(ir.Row)) <-chan 
 			}
 		}
 	}()
-	return out
+	return out, end
 }

@@ -1027,7 +1027,7 @@ func copyChunk(
 
 		var batchCount int64
 		tracker := migcore.NewPKTracker(pkCols)
-		teed := teePKAndCount(batchCtx, filtered, tracker, &batchCount, pt.observeRow)
+		teed, end := teePKAndCount(batchCtx, filtered, tracker, &batchCount, pt.observeRow)
 		// PII Phase 1: same redact-wrap as [copyTable].
 		redacted, redactErrFn := redactRows(batchCtx, teed, redactor, table.Schema, table.Name, table.Columns, pkCols, "")
 		// ADR-0048 Shape A: per-row discriminator stamp (see
@@ -1079,8 +1079,10 @@ func copyChunk(
 		// State=Complete with a partial copy, and the whole-table retry would
 		// SKIP it → silent loss of the unread tail. Returning the cancellation
 		// keeps the chunk NOT-complete so the retry re-runs it from its durable
-		// LastPK cursor. Mirrors the copyChunkFast pump guard.
-		if err := ctx.Err(); err != nil {
+		// LastPK cursor. Mirrors the copyChunkFast pump guard. Since GC-41
+		// (i) the guard is the batch's source-end signal, which also refuses
+		// a page the writer returned from before it closed.
+		if err := end.Confirm(ctx, table.Name); err != nil {
 			return err
 		}
 
@@ -1241,6 +1243,7 @@ func copyChunkFast(
 	defer cancel()
 
 	tracker := migcore.NewPKTracker(pkCols)
+	end := &migcore.SourceEnd{} // the pump reads the source; see [migcore.SourceEnd]
 	var rowCount int64
 
 	// pump pages the reader cursor-by-cursor (memory-bounded: one
@@ -1307,6 +1310,7 @@ func copyChunkFast(
 				return
 			}
 			if batchCount == 0 {
+				end.Reached(streamCtx)
 				pumpErr <- nil // clean end of chunk range
 				return
 			}
@@ -1317,6 +1321,7 @@ func copyChunkFast(
 			}
 			cursor = newCursor
 			if batchCount < int64(limit) {
+				end.Reached(streamCtx)
 				pumpErr <- nil // short page => end of data within chunk
 				return
 			}
@@ -1336,31 +1341,38 @@ func copyChunkFast(
 	// proven-empty cold chunk).
 	writeErr := rw.WriteRows(streamCtx, table, stamped)
 
-	// On a writer-side error WriteRows may have returned without
-	// draining `out`, leaving the pump blocked on `out <- row`.
-	// Cancel streamCtx first so the pump's select hits <-Done() and
-	// posts its terminal status to the buffered pumpErr — otherwise
-	// the <-pumpErr below would deadlock against the blocked pump.
-	if writeErr != nil {
-		cancel()
-	}
+	// The source-end verdict is taken FIRST, while streamCtx is still
+	// only what the run made it: the cancel below is ours and must not
+	// read as a stop.
+	confirmErr := end.Confirm(streamCtx, table.Name)
 
-	// Drain the pump's terminal status. On the success path WriteRows
-	// returned because the pump closed `out`, so pumpErr is already
-	// buffered; on the error path the cancel above guarantees the
-	// pump posts within a scheduler tick. The cap-1 buffer makes the
+	// WriteRows may have returned without draining `out` — on an error,
+	// or (a writer bug the source-end verdict above already refuses) on
+	// a nil — leaving the pump blocked on `out <- row`. Cancel streamCtx
+	// first so the pump's select hits <-Done() and posts its terminal
+	// status to the buffered pumpErr; otherwise the <-pumpErr below would
+	// deadlock against the blocked pump. A pump that already ended has
+	// posted, so the cancel cannot change its status.
+	cancel()
+
+	// Drain the pump's terminal status. The cap-1 buffer makes the
 	// receive race-free either way.
 	pErr := <-pumpErr
 	if writeErr != nil {
 		return fmt.Errorf("write chunk %d (fast loader): %w", chunkIndex, writeErr)
 	}
 	if pErr != nil {
-		cancel()
 		return pErr
 	}
 	if err := redactErrFn(); err != nil {
-		cancel()
 		return fmt.Errorf("redact chunk %d (fast loader): %w", chunkIndex, err)
+	}
+	// The pump posting nil says its source ended naturally; it does not
+	// say the redact/stamp stages downstream of it forwarded every row
+	// before a stop closed them — [migcore.SourceEnd.Confirm]'s live-ctx
+	// clause does (GC-41 (i)).
+	if confirmErr != nil {
+		return confirmErr
 	}
 	// Both the pump (writer side closed) and WriteRows have returned;
 	// rowCount is now stable.

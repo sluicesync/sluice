@@ -381,7 +381,7 @@ func repairFloatTable(ctx context.Context, br ir.BatchedRowReader, rr ir.RowRead
 		}
 		tracker := migcore.NewPKTracker(ft.pkColumns)
 		var batchCount int64
-		teed := teePKAndCount(batchCtx, rowsCh, tracker, &batchCount, nil)
+		teed, end := teePKAndCount(batchCtx, rowsCh, tracker, &batchCount, nil)
 		if err := fw.UpdateFloatColumnsByPK(batchCtx, tgt, ft.pkColumns, teed); err != nil {
 			cancel()
 			return fmt.Errorf("write batch: %w", err)
@@ -395,7 +395,9 @@ func repairFloatTable(ctx context.Context, br ir.BatchedRowReader, rr ir.RowRead
 		if err := migcore.ReaderStreamErr(rr, ft.srcRead); err != nil {
 			return err
 		}
-		if err := ctx.Err(); err != nil {
+		// An empty or short page is the end of the table only if the page
+		// closed naturally (GC-41 (i)); a stop closes it the same way.
+		if err := end.Confirm(ctx, ft.srcRead.Name); err != nil {
 			return err
 		}
 		if batchCount == 0 {

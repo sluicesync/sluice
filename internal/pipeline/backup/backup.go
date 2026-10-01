@@ -1642,6 +1642,16 @@ func (b *Backup) backupTable(
 			return ctx.Err()
 		case row, ok := <-rows:
 			if !ok {
+				// A stop closes the reader's channel exactly as end of
+				// table does, and this select may take the close over
+				// ctx.Done. Only a close seen with ctx live is the end of
+				// the table (GC-41 (i)); the entry must not be flipped
+				// Partial=false on a truncated stream. (Today the cancelled
+				// ctx also fails finishTable's store write — every store
+				// honours it — but that is an accident this must not ride.)
+				if err := ctx.Err(); err != nil {
+					return fmt.Errorf("%w: table %q: %w", migcore.ErrCopyInterrupted, table.Name, err)
+				}
 				if err := s.flush(ctx); err != nil {
 					return err
 				}

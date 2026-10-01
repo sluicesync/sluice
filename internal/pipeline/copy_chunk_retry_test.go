@@ -26,7 +26,10 @@ func (noopRowReader) Err() error { return nil }
 
 type noopRowWriter struct{}
 
-func (noopRowWriter) WriteRows(context.Context, *ir.Table, <-chan ir.Row) error { return nil }
+func (noopRowWriter) WriteRows(_ context.Context, _ *ir.Table, rows <-chan ir.Row) error {
+	drainRowsLikeAWriter(rows)
+	return nil
+}
 
 // slotRetryEngine is a fake ir.Engine whose OpenRowReader / OpenRowWriter
 // fail the first failOpens times with a configurable error, then succeed.

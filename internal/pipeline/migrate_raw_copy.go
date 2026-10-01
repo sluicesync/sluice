@@ -34,6 +34,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/config"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/redact"
 )
 
@@ -305,6 +306,10 @@ func runRawCopyChunk(ctx context.Context, exp ir.RawCopyExporter, imp ir.RawCopy
 	defer stall.Stop()
 
 	var rowsCopied int64
+	// The exporter is the stage that reads the source: its nil is the
+	// server's own end-of-COPY, recorded as the source-end signal the
+	// verdict below consults (GC-41 (i)).
+	end := &migcore.SourceEnd{}
 	g, gctx := errgroup.WithContext(ctx)
 
 	// Importer: drains the pipe reader. On error, close the reader with
@@ -337,10 +342,14 @@ func runRawCopyChunk(ctx context.Context, exp ir.RawCopyExporter, imp ir.RawCopy
 			_ = pw.CloseWithError(err)
 			return err
 		}
+		end.Reached(gctx)
 		return pw.Close()
 	})
 
 	if err := g.Wait(); err != nil {
+		return 0, fmt.Errorf("raw copy %q: %w", table.Name, err)
+	}
+	if err := end.Confirm(ctx, table.Name); err != nil {
 		return 0, fmt.Errorf("raw copy %q: %w", table.Name, err)
 	}
 	if rawCopyTakenObserver != nil {

@@ -26,7 +26,8 @@ type recordingGateWriter struct {
 	setCallNum int
 }
 
-func (w *recordingGateWriter) WriteRows(context.Context, *ir.Table, <-chan ir.Row) error {
+func (w *recordingGateWriter) WriteRows(_ context.Context, _ *ir.Table, rows <-chan ir.Row) error {
+	drainRowsLikeAWriter(rows)
 	return nil
 }
 

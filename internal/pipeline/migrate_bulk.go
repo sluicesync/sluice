@@ -505,7 +505,7 @@ func copyTableWithCursor(
 
 		var batchCount int64
 		tracker := migcore.NewPKTracker(pkCols)
-		teed := teePKAndCount(batchCtx, rowsCh, tracker, &batchCount, pt.observeRow)
+		teed, end := teePKAndCount(batchCtx, rowsCh, tracker, &batchCount, pt.observeRow)
 		// PII Phase 1: same redact-wrap as [copyTable]. nil/empty
 		// Registry is the no-op fast path.
 		redacted, redactErrFn := redactRows(batchCtx, teed, redactor, table.Schema, table.Name, table.Columns, pkCols, "")
@@ -548,8 +548,10 @@ func copyTableWithCursor(
 		// SKIPS it with only a partial copy on disk → silent loss of its unread
 		// tail. Returning the cancellation keeps the table NOT-complete so the
 		// resume re-runs it from its durable LastPK. Mirrors the copyChunk /
-		// copyChunkFast guards.
-		if err := ctx.Err(); err != nil {
+		// copyChunkFast guards. Since GC-41 (i) the guard is the batch's
+		// source-end signal, which also refuses a page the writer returned
+		// from before it closed.
+		if err := end.Confirm(ctx, table.Name); err != nil {
 			return err
 		}
 
@@ -609,8 +611,13 @@ func copyTableWithCursor(
 // the per-batch loop wants all three. onRow gets the row itself so
 // observers like [progressTicker.observeRow] can sum its byte cost
 // alongside the count.
-func teePKAndCount(ctx context.Context, src <-chan ir.Row, tracker *migcore.PKTracker, count *int64, onRow func(ir.Row)) <-chan ir.Row {
+//
+// The returned [migcore.SourceEnd] reports how the batch's source ended,
+// exactly as [teeRows]'s does: an empty or short batch is end-of-table
+// only if [migcore.SourceEnd.Confirm] says the page closed naturally.
+func teePKAndCount(ctx context.Context, src <-chan ir.Row, tracker *migcore.PKTracker, count *int64, onRow func(ir.Row)) (<-chan ir.Row, *migcore.SourceEnd) {
 	out := make(chan ir.Row, migcore.RowChanBuffer)
+	end := &migcore.SourceEnd{}
 	go func() {
 		defer close(out)
 		for {
@@ -619,6 +626,7 @@ func teePKAndCount(ctx context.Context, src <-chan ir.Row, tracker *migcore.PKTr
 				return
 			case row, ok := <-src:
 				if !ok {
+					end.Reached(ctx)
 					return
 				}
 				tracker.Observe(row)
@@ -634,5 +642,5 @@ func teePKAndCount(ctx context.Context, src <-chan ir.Row, tracker *migcore.PKTr
 			}
 		}
 	}()
-	return out
+	return out, end
 }

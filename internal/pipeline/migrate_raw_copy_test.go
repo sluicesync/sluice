@@ -39,7 +39,11 @@ type fakeRawImporter struct {
 	majorErr error
 }
 
-func (fakeRawImporter) WriteRows(context.Context, *ir.Table, <-chan ir.Row) error { return nil }
+func (fakeRawImporter) WriteRows(_ context.Context, _ *ir.Table, rows <-chan ir.Row) error {
+	drainRowsLikeAWriter(rows)
+	return nil
+}
+
 func (f fakeRawImporter) ServerMajorVersion(context.Context) (int, error) {
 	return f.major, f.majorErr
 }

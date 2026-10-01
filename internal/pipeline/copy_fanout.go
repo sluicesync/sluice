@@ -179,7 +179,7 @@ func copyTablePlainParallel(
 	kickOffRowCount(copyCtx, rr, table, pt)
 	defer func() { pt.Stop(ctx, retErr) }()
 
-	teed := teeRows(copyCtx, rows, pt.observeRow)
+	teed, end := teeRows(copyCtx, rows, pt.observeRow)
 	redacted, redactErrFn := redactRows(copyCtx, teed, redactor, table.Schema, table.Name, table.Columns, migcore.TablePKColumns(table), "")
 	stamped, _ := shardStampRows(copyCtx, redacted, shard.Name, shard.Value)
 
@@ -197,12 +197,18 @@ func copyTablePlainParallel(
 		return 0, fmt.Errorf("redact rows: %w", err)
 	}
 	// The writers returned without error, but the reader may have aborted
-	// mid-table on a scan/decode failure (Bug 68). Surface it loudly so a
-	// silently-truncated table never reports success.
-	//
+	// mid-table on a scan/decode failure (Bug 68), or a stop may have
+	// closed the stream (GC-41 (i)). Surface either loudly so a
+	// truncated table never reports success.
+	if err := migcore.ReaderStreamErr(rr, table); err != nil {
+		return 0, err
+	}
+	if err := end.Confirm(copyCtx, table.Name); err != nil {
+		return 0, err
+	}
 	// The count is read after every worker joined inside WriteRowsParallel,
 	// so it is the whole item's — same discipline as [copyTable]'s.
-	return pt.rows.Load(), migcore.ReaderStreamErr(rr, table)
+	return pt.rows.Load(), nil
 }
 
 // copyTableColdStartIdempotentMaybeParallel routes a cold-start
@@ -284,7 +290,7 @@ func copyTableColdStartIdempotentParallel(
 	kickOffRowCount(copyCtx, rr, table, pt)
 	defer func() { pt.Stop(ctx, retErr) }()
 
-	teed := teeRows(copyCtx, rows, pt.observeRow)
+	teed, end := teeRows(copyCtx, rows, pt.observeRow)
 	redacted, redactErrFn := redactRows(copyCtx, teed, redactor, table.Schema, table.Name, table.Columns, migcore.TablePKColumns(table), "")
 	stamped, _ := shardStampRows(copyCtx, redacted, shard.Name, shard.Value)
 
@@ -302,14 +308,20 @@ func copyTableColdStartIdempotentParallel(
 		return 0, fmt.Errorf("redact rows: %w", err)
 	}
 	// The writers returned without error, but the reader may have
-	// aborted mid-table on a scan/decode failure (Bug 68). Surface it
-	// loudly so a silently-truncated table never reports success.
-	//
+	// aborted mid-table on a scan/decode failure (Bug 68), or a stop may
+	// have closed the stream (GC-41 (i)). Surface either loudly so a
+	// truncated table never reports success.
+	if err := migcore.ReaderStreamErr(rr, table); err != nil {
+		return 0, err
+	}
+	if err := end.Confirm(copyCtx, table.Name); err != nil {
+		return 0, err
+	}
 	// The count is the ROWS THE READER DELIVERED, which on this path can
 	// exceed the rows the target ends up holding: the VStream COPY
 	// re-emits (Bug 125) and the upsert absorbs the duplicates. Recorded
 	// as-is rather than "corrected" to a number nothing measured.
-	return pt.rows.Load(), migcore.ReaderStreamErr(rr, table)
+	return pt.rows.Load(), nil
 }
 
 // partitionRowsByPK launches one dispatcher goroutine that reads every

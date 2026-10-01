@@ -56,7 +56,8 @@ type recordingTruncatingRowWriter struct {
 	phaseLog *[]string
 }
 
-func (w *recordingTruncatingRowWriter) WriteRows(_ context.Context, table *ir.Table, _ <-chan ir.Row) error {
+func (w *recordingTruncatingRowWriter) WriteRows(_ context.Context, table *ir.Table, rows <-chan ir.Row) error {
+	drainRowsLikeAWriter(rows)
 	*w.phaseLog = append(*w.phaseLog, "WriteRows:"+table.Name)
 	return nil
 }

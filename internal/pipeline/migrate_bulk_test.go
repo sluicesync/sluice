@@ -85,7 +85,7 @@ func TestTeePKAndCount(t *testing.T) {
 	tr := migcore.NewPKTracker([]string{"id"})
 	var count int64
 	tickCount := int64(0)
-	out := teePKAndCount(context.Background(), src, tr, &count, func(_ ir.Row) {
+	out, end := teePKAndCount(context.Background(), src, tr, &count, func(_ ir.Row) {
 		atomic.AddInt64(&tickCount, 1)
 	})
 
@@ -105,6 +105,9 @@ func TestTeePKAndCount(t *testing.T) {
 	got, ok := tr.LastPK()
 	if !ok || got[0] != int64(3) {
 		t.Errorf("lastPK = %v ok=%v; want [3] true", got, ok)
+	}
+	if err := end.Confirm(context.Background(), "t"); err != nil {
+		t.Errorf("a source the tee drained to its close was not confirmed: %v", err)
 	}
 }
 
@@ -260,12 +263,18 @@ func (fakeDisqualifyingReader) DisqualifiesBatchedRead(*ir.Table) (disqualified 
 // fakePlainWriter implements only ir.RowWriter.
 type fakePlainWriter struct{}
 
-func (fakePlainWriter) WriteRows(context.Context, *ir.Table, <-chan ir.Row) error { return nil }
+func (fakePlainWriter) WriteRows(_ context.Context, _ *ir.Table, rows <-chan ir.Row) error {
+	drainRowsLikeAWriter(rows)
+	return nil
+}
 
 // fakeBatchableWriter implements both RowWriter and IdempotentRowWriter.
 type fakeBatchableWriter struct{}
 
-func (fakeBatchableWriter) WriteRows(context.Context, *ir.Table, <-chan ir.Row) error { return nil }
+func (fakeBatchableWriter) WriteRows(_ context.Context, _ *ir.Table, rows <-chan ir.Row) error {
+	drainRowsLikeAWriter(rows)
+	return nil
+}
 
 func (fakeBatchableWriter) WriteRowsIdempotent(_ context.Context, _ *ir.Table, rows <-chan ir.Row) error {
 	for range rows {

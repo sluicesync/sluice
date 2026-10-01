@@ -947,7 +947,8 @@ type recordingRowWriterEmpty struct {
 	empty    bool
 }
 
-func (w *recordingRowWriterEmpty) WriteRows(_ context.Context, table *ir.Table, _ <-chan ir.Row) error {
+func (w *recordingRowWriterEmpty) WriteRows(_ context.Context, table *ir.Table, rows <-chan ir.Row) error {
+	drainRowsLikeAWriter(rows)
 	*w.phaseLog = append(*w.phaseLog, "WriteRows:"+table.Name)
 	return nil
 }

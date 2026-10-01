@@ -34,12 +34,15 @@ func copyTableIdempotent(ctx context.Context, rr ir.RowReader, rw ir.RowWriter, 
 	kickOffRowCount(copyCtx, rr, table, pt)
 	defer func() { pt.Stop(ctx, retErr) }()
 
-	teed := teeRows(copyCtx, rows, pt.observeRow)
+	teed, end := teeRows(copyCtx, rows, pt.observeRow)
 	// PII Phase 1: same wrap as [copyTable] — nil/empty Registry
 	// short-circuits to pass-through.
 	redacted, redactErrFn := redactRows(copyCtx, teed, redactor, table.Schema, table.Name, table.Columns, migcore.TablePKColumns(table), streamID)
-	idem, ok := rw.(ir.IdempotentRowWriter)
-	if !ok {
+	if idem, ok := rw.(ir.IdempotentRowWriter); ok {
+		if err := idem.WriteRowsIdempotent(copyCtx, table, redacted); err != nil {
+			return fmt.Errorf("write rows (idempotent): %w", err)
+		}
+	} else {
 		slog.DebugContext(
 			ctx, "add-table: row writer does not implement IdempotentRowWriter; falling back to plain WriteRows (the [publication-add, snapshot-open] overlap window may surface as a duplicate-key error under sustained load)",
 			slog.String("table", table.Name),
@@ -47,20 +50,17 @@ func copyTableIdempotent(ctx context.Context, rr ir.RowReader, rw ir.RowWriter, 
 		if err := rw.WriteRows(copyCtx, table, redacted); err != nil {
 			return fmt.Errorf("write rows: %w", err)
 		}
-		if err := redactErrFn(); err != nil {
-			return fmt.Errorf("redact rows: %w", err)
-		}
-		// The writer drained the stream; surface any sticky reader
-		// error so a mid-stream decode abort fails loudly (Bug 68).
-		return migcore.ReaderStreamErr(rr, table)
-	}
-	if err := idem.WriteRowsIdempotent(copyCtx, table, redacted); err != nil {
-		return fmt.Errorf("write rows (idempotent): %w", err)
 	}
 	if err := redactErrFn(); err != nil {
 		return fmt.Errorf("redact rows: %w", err)
 	}
-	return migcore.ReaderStreamErr(rr, table)
+	// The writer drained the stream; surface any sticky reader error so
+	// a mid-stream decode abort fails loudly (Bug 68), and refuse a
+	// stream a stop cut short (GC-41 (i)) — same tail as [copyTable].
+	if err := migcore.ReaderStreamErr(rr, table); err != nil {
+		return err
+	}
+	return end.Confirm(copyCtx, table.Name)
 }
 
 // copyTable opens the source-side row stream, hands it off to the
@@ -115,7 +115,7 @@ func copyTable(ctx context.Context, rr ir.RowReader, rw ir.RowWriter, table *ir.
 	kickOffRowCount(copyCtx, rr, table, pt)
 	defer func() { pt.Stop(ctx, retErr) }()
 
-	teed := teeRows(copyCtx, rows, pt.observeRow)
+	teed, end := teeRows(copyCtx, rows, pt.observeRow)
 	// PII Phase 1: wrap the row stream with redaction if the operator
 	// has configured rules. nil/empty Registry is a zero-cost
 	// passthrough — redactRows returns the teed channel verbatim.
@@ -142,12 +142,22 @@ func copyTable(ctx context.Context, rr ir.RowReader, rw ir.RowWriter, table *ir.
 	// The writer returned without error, but it may have observed a
 	// truncated stream because the reader aborted mid-table on a
 	// scan/decode failure. Surface that loudly (Bug 68).
-	//
+	if err := migcore.ReaderStreamErr(rr, table); err != nil {
+		return 0, err
+	}
+	// Nor is a nil from the writer proof the table is copied: a stop
+	// closes the stream exactly as end-of-table does, and the engine
+	// write loops return nil whenever "closed" wins their select. Only
+	// the source-end signal says the source drained (GC-41 (i)) — every
+	// caller records COMPLETE on this function's nil.
+	if err := end.Confirm(copyCtx, table.Name); err != nil {
+		return 0, err
+	}
 	// The count is read AFTER the writer drained the stream, so it is
 	// the whole table's; on the error paths above it is deliberately 0
 	// rather than partial, because a partial count recorded against a
 	// failed copy would read as an expectation nothing has to meet.
-	return pt.rows.Load(), migcore.ReaderStreamErr(rr, table)
+	return pt.rows.Load(), nil
 }
 
 // copyTableColdStartIdempotent is the upsert-form of [copyTable] used
@@ -209,7 +219,7 @@ func copyTableColdStartIdempotent(ctx context.Context, rr ir.RowReader, rw ir.Ro
 	kickOffRowCount(copyCtx, rr, table, pt)
 	defer func() { pt.Stop(ctx, retErr) }()
 
-	teed := teeRows(copyCtx, rows, pt.observeRow)
+	teed, end := teeRows(copyCtx, rows, pt.observeRow)
 	redacted, redactErrFn := redactRows(copyCtx, teed, redactor, table.Schema, table.Name, table.Columns, migcore.TablePKColumns(table), "")
 	stamped, _ := shardStampRows(copyCtx, redacted, shard.Name, shard.Value)
 	if err := idem.WriteRowsIdempotent(copyCtx, table, stamped); err != nil {
@@ -218,10 +228,16 @@ func copyTableColdStartIdempotent(ctx context.Context, rr ir.RowReader, rw ir.Ro
 	if err := redactErrFn(); err != nil {
 		return 0, fmt.Errorf("redact rows: %w", err)
 	}
+	if err := migcore.ReaderStreamErr(rr, table); err != nil {
+		return 0, err
+	}
+	if err := end.Confirm(copyCtx, table.Name); err != nil {
+		return 0, err
+	}
 	// The count is the ROWS THE READER DELIVERED, which on this path can
 	// exceed what the target ends up holding: the VStream COPY re-emits
 	// (Bug 125) and the upsert absorbs the duplicates. Recorded as-is
 	// rather than "corrected" to a number nothing measured. 0 on every
 	// error path above, never partial (same discipline as [copyTable]).
-	return pt.rows.Load(), migcore.ReaderStreamErr(rr, table)
+	return pt.rows.Load(), nil
 }

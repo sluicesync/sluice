@@ -718,7 +718,8 @@ type recordingRowWriter struct {
 	mu       *sync.Mutex // shared with the owning recordingEngine; guards phaseLog
 }
 
-func (w *recordingRowWriter) WriteRows(_ context.Context, table *ir.Table, _ <-chan ir.Row) error {
+func (w *recordingRowWriter) WriteRows(_ context.Context, table *ir.Table, rows <-chan ir.Row) error {
+	drainRowsLikeAWriter(rows)
 	// Guard the shared phaseLog append: the ADR-0076 cross-table pool calls
 	// WriteRows on sibling writers concurrently. (Schema-phase appends run
 	// strictly before/after the copy pool, so they need no lock.)

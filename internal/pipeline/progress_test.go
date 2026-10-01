@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // TestProgressTicker_StopEmitsCompleteLine verifies the deferred-Stop
@@ -328,7 +329,7 @@ func TestTeeRows_ForwardsAndCounts(t *testing.T) {
 	close(src)
 
 	var counted int
-	out := teeRows(context.Background(), src, func(_ ir.Row) { counted++ })
+	out, end := teeRows(context.Background(), src, func(_ ir.Row) { counted++ })
 
 	received := make([]ir.Row, 0, 3)
 	for r := range out {
@@ -340,6 +341,9 @@ func TestTeeRows_ForwardsAndCounts(t *testing.T) {
 	if counted != 3 {
 		t.Errorf("counted %d rows; want 3", counted)
 	}
+	if err := end.Confirm(context.Background(), "t"); err != nil {
+		t.Errorf("a source the tee drained to its close was not confirmed: %v", err)
+	}
 }
 
 // TestTeeRows_CtxCancelStopsForwarding verifies the tee terminates
@@ -350,7 +354,7 @@ func TestTeeRows_CtxCancelStopsForwarding(t *testing.T) {
 	defer close(src)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	out := teeRows(ctx, src, func(_ ir.Row) {})
+	out, end := teeRows(ctx, src, func(_ ir.Row) {})
 
 	// Push one row asynchronously; the tee must take it.
 	go func() { src <- ir.Row{"id": 1} }()
@@ -377,5 +381,10 @@ func TestTeeRows_CtxCancelStopsForwarding(t *testing.T) {
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Errorf("tee did not close out channel after ctx cancel")
+	}
+	// The close a cancel produced must not read as end-of-table
+	// (GC-41 (i)) — even judged against a context that is still live.
+	if err := end.Confirm(context.Background(), "t"); !errors.Is(err, migcore.ErrCopyInterrupted) {
+		t.Errorf("a stream the tee closed on ctx cancel was confirmed as drained: %v", err)
 	}
 }
