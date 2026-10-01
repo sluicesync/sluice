@@ -239,6 +239,14 @@ func classifyApplierError(err error) error {
 		return nil
 	}
 
+	// A producer that asserts recovery is impossible wins over every test
+	// below ([ir.TerminalError]) — the Postgres classifier's first check,
+	// added here with the first terminal refusal this applier raises
+	// (GC-42's key-scoped multi-row match).
+	if ir.IsTerminal(err) {
+		return err
+	}
+
 	// Driver-level "bad connection" / EOF — auto-reconnect on retry.
 	// These wrap as the bare sentinels; check via errors.Is for the
 	// standard cases the driver returns.

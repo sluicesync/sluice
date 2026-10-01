@@ -40,7 +40,8 @@ import (
 //
 // Every read/write of pkCache, colTypeCache, conflictKeyCache,
 // warnedKeyless, nonPKUniqueCache, warnedRouteProbe and schemaDirtyTables
-// funnels through these so the
+// funnels through these (keyShapeCache and warnedDeferredOff through their
+// twins in change_applier_key_shape.go) so the
 // concurrent key-hash lanes (which call dispatch from W goroutines) never
 // touch a map unguarded. The load-on-miss callers use the RLock-check →
 // unlock → DB-load → Lock-store pattern so a cache miss does NOT serialize
@@ -200,6 +201,9 @@ func (a *ChangeApplier) invalidateMetadataCaches(qn string) {
 	delete(a.pkCache, qn)
 	delete(a.conflictKeyCache, qn)
 	delete(a.nonPKUniqueCache, qn)
+	// GC-42: a boundary can add or drop a DEFERRABLE key or the table's key
+	// altogether; re-read the shape rather than wait out keyShapeTTL.
+	delete(a.keyShapeCache, qn)
 	// P-1: a same-stream DDL creating/altering the table drops its negative
 	// skip verdict too, so it is picked up at the barrier rather than
 	// waiting out skipVerdictTTL.
@@ -313,6 +317,15 @@ func (la *laneApplierAdapter) RouteForChange(ctx context.Context, c ir.Change) (
 //   - pg_constraint contype='x': EXCLUSION constraints. Same cross-key
 //     conflict with a different operator — two rows with different primary
 //     keys can be mutually exclusive, so their changes are dependent.
+//
+// Neither half filters on pg_index.indimmediate, and must not (GC-42): a
+// DEFERRABLE unique or exclusion constraint conflicts across primary keys
+// exactly like an immediate one — and where its deferred re-check runs (an
+// apply role without the replica privilege), splitting a value swap across
+// two lanes would fail that check at the first lane's commit.
+// A deferrable PRIMARY KEY needs no entry here: a change that moves the key
+// already routes to the barrier (PKChangedUpdate), and a table whose only
+// key is deferrable cannot be applied at all (SLUICE-E-TARGET-DEFERRABLE-KEY).
 //
 // Anything this misses routes a table onto the FAST path, so its predicates
 // only ever widen.

@@ -88,7 +88,9 @@ import (
 // Update and Delete are NOT keyed on the conflict key: they identify
 // the target row via the full Before-image WHERE predicate
 // ([buildWhereClause]), so the Insert conflict-key resolution above
-// does not affect them.
+// does not affect them. An Update or Delete that matches MORE than one row
+// is refused rather than applied, unless it is a keyless table's whole-row
+// match (GC-42, change_applier_key_shape.go).
 //
 // # Lifecycle
 //
@@ -276,10 +278,11 @@ type ChangeApplier struct {
 	// cacheMu guards the lazily-populated metadata caches the lane
 	// dispatch tree can touch from W goroutines under the ADR-0105
 	// concurrent key-hash apply path: pkCache, colTypeCache,
-	// conflictKeyCache, warnedKeyless, nonPKUniqueCache, warnedRouteProbe
-	// and schemaDirtyTables. EVERY access
+	// conflictKeyCache, warnedKeyless, nonPKUniqueCache, warnedRouteProbe,
+	// keyShapeCache, warnedDeferredOff and schemaDirtyTables. EVERY access
 	// to those maps goes through the guarded accessors in
-	// change_applier_concurrent.go — there is no direct map access elsewhere
+	// change_applier_concurrent.go and change_applier_key_shape.go — there is
+	// no direct map access elsewhere
 	// in the dispatch call tree — so a missed-lock race cannot hide from the
 	// -race gate. The serial path takes the same lock; the cost is one RLock
 	// + map read per cache hit (negligible). activeSchema is NOT guarded
@@ -328,6 +331,13 @@ type ChangeApplier struct {
 	// fallback is WARNed at most once per table rather than per change.
 	nonPKUniqueCache map[string]bool
 	warnedRouteProbe map[string]bool
+
+	// keyShapeCache maps "schema.table" → the TARGET table's GC-42 key
+	// shape (keyed? which DEFERRABLE constraints?), read with a TTL — see
+	// change_applier_key_shape.go. warnedDeferredOff tracks tables whose
+	// one-time DEFERRED-KEY-CHECK-OFF-IN-REPLICA-MODE WARN has fired.
+	keyShapeCache     map[string]keyShapeEntry
+	warnedDeferredOff map[string]bool
 
 	// colTypeCache maps "schema.table" → column-name → *ir.Column. It
 	// is the input to prepareValue for every value the applier
@@ -761,13 +771,21 @@ func (a *ChangeApplier) forceSynchronousCommitOn(ctx context.Context, tx *sql.Tx
 	return nil
 }
 
-// replicaRoleSQL is the statement that, run inside an apply tx, makes target
-// FK constraints and user triggers NOT fire for the rest of that tx — PG
-// implements FK enforcement and user triggers as system/user triggers, and
-// `session_replication_role = replica` suppresses both. SET LOCAL scopes it
-// to the apply tx so a returned pooled backend is never left in replica role
-// for non-apply work. It is the canonical logical-replication apply technique
-// (what PG's own logical replication does).
+// replicaRoleSQL is the statement that, run inside an apply tx, makes every
+// ordinary ('O'-enabled) trigger on the target NOT fire for the rest of that
+// tx. PG implements FK enforcement and user triggers as triggers, so both are
+// suppressed — that is the point (Bug 164). It ALSO implements the deferred
+// re-check of a DEFERRABLE primary key, unique constraint or exclusion
+// constraint as an internal trigger (unique_key_recheck), so replica mode
+// switches those checks off too and a duplicate commits into an index that
+// still claims uniqueness. Only NON-deferrable keys stay enforced, because
+// their check runs inside the index insertion itself, not in a trigger. The
+// applier names the gap per table rather than leaving replica mode for it
+// (GC-42; change_applier_key_shape.go says why).
+// SET LOCAL scopes it to the apply tx so a returned pooled backend is never
+// left in replica role for non-apply work. It is the canonical
+// logical-replication apply technique (what PG's own logical replication
+// does).
 const replicaRoleSQL = "SET LOCAL session_replication_role = replica"
 
 // bypassForeignKeyEnforcement bypasses target FK + user-trigger enforcement
@@ -784,7 +802,9 @@ const replicaRoleSQL = "SET LOCAL session_replication_role = replica"
 // correct CDC semantics: constraint integrity is the SOURCE's responsibility
 // (already validated there), so the target faithfully mirrors the source —
 // including the source's own FK-inconsistencies — and replicated rows do NOT
-// double-fire target triggers.
+// double-fire target triggers. It also switches off a DEFERRABLE key's
+// deferred re-check (see [replicaRoleSQL]); the applier WARNs per table
+// (DEFERRED-KEY-CHECK-OFF-IN-REPLICA-MODE) instead of leaving replica mode.
 //
 // No-op when the apply role lacks the privilege to SET
 // session_replication_role (a one-time WARN already fired in the probe); the
@@ -892,9 +912,11 @@ func (a *ChangeApplier) execTimeoutCtx(ctx context.Context) (context.Context, co
 // commitWithTimeout runs tx.Commit() under the per-exec watchdog
 // (see [appliershared.RunWithDeadline] for the semantics and Bug 56 /
 // v0.52.1 rationale). Thin wrapper that exists so callers don't have
-// to thread the closure manually.
+// to thread the closure manually. A commit refused by a DEFERRABLE
+// constraint's re-check comes back marked (GC-42; it fires only on an apply
+// role without the replica privilege).
 func (a *ChangeApplier) commitWithTimeout(tx *sql.Tx) error {
-	return appliershared.RunWithDeadline(a.execTimeout, tx.Commit)
+	return annotateDeferredCheckFailure(appliershared.RunWithDeadline(a.execTimeout, tx.Commit))
 }
 
 // Close releases the underlying connection pool(s) — both the
@@ -1730,6 +1752,11 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		if err != nil {
 			return false, fmt.Errorf("postgres: applier: build insert for %s.%s: %w", schema, v.Table, err)
 		}
+		// GC-42: read the key shape here too, so a DEFERRABLE constraint that
+		// replica mode leaves unchecked is named on an insert-only table.
+		if _, err := a.keyShapeFor(ctx, schema, v.Table); err != nil {
+			return false, err
+		}
 		if _, err := a.txExec(ctx, tx, stmt, a.execDMLArgs(schema, v.Table, args)...); err != nil {
 			return false, fmt.Errorf("postgres: applier: insert into %s.%s: %w", schema, v.Table, err)
 		}
@@ -1765,13 +1792,22 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 			// row's payload cannot be absorbed as "satisfied".
 			return false, nil
 		}
+		shape, err := a.keyShapeFor(ctx, schema, v.Table)
+		if err != nil {
+			return false, err
+		}
 		// Update misses are tolerated (zero rows affected) for resume
 		// idempotency; the same caveat as MySQL applies — see the
 		// MySQL applier's dispatch comment for the rationale and the
-		// debug-log defence-in-depth.
+		// debug-log defence-in-depth. MORE than one row is refused unless
+		// the write is a keyless table's whole-row match (GC-42,
+		// change_applier_key_shape.go).
 		res, err := a.txExec(ctx, tx, stmt, a.execDMLArgs(schema, v.Table, args)...)
 		if err != nil {
 			return false, fmt.Errorf("postgres: applier: update %s.%s: %w", schema, v.Table, err)
+		}
+		if err := checkKeyScopedResult(shape, "update", schema, v.Table, v.Before, colTypes, res); err != nil {
+			return false, err
 		}
 		logZeroRowsAffected(ctx, "update", schema, v.Table, res)
 		return false, nil
@@ -1789,9 +1825,17 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		if err != nil {
 			return false, fmt.Errorf("postgres: applier: build delete for %s.%s: %w", schema, v.Table, err)
 		}
+		shape, err := a.keyShapeFor(ctx, schema, v.Table)
+		if err != nil {
+			return false, err
+		}
+		// The write GC-42's loss came through: more than one row is refused.
 		res, err := a.txExec(ctx, tx, stmt, a.execDMLArgs(schema, v.Table, args)...)
 		if err != nil {
 			return false, fmt.Errorf("postgres: applier: delete from %s.%s: %w", schema, v.Table, err)
+		}
+		if err := checkKeyScopedResult(shape, "delete", schema, v.Table, v.Before, colTypes, res); err != nil {
+			return false, err
 		}
 		logZeroRowsAffected(ctx, "delete", schema, v.Table, res)
 		return false, nil

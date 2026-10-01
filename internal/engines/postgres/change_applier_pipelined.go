@@ -76,6 +76,10 @@ type queuedStmt struct {
 	schema string
 	table  string
 	kind   string // "insert" / "update" / "delete" / "truncate" / "schema-snapshot" / "position"
+
+	// keyScoped is the GC-42 multi-row check for an UPDATE/DELETE that is not
+	// exempt, read against the statement's command tag at flush; nil otherwise.
+	keyScoped *keyScopedWrite
 }
 
 // pgxBatchTx is the ADR-0092 pipelined-apply transaction handle. It pins
@@ -297,6 +301,10 @@ func (a *ChangeApplier) dispatchPipelined(ctx context.Context, b *pgxBatchTx, st
 		if err != nil {
 			return false, fmt.Errorf("postgres: applier: build insert for %s.%s: %w", schema, v.Table, err)
 		}
+		// GC-42: names a DEFERRABLE constraint replica mode leaves unchecked.
+		if _, err := a.keyShapeFor(ctx, schema, v.Table); err != nil {
+			return false, err
+		}
 		b.queue(stmt, args, queuedStmt{schema: schema, table: v.Table, kind: "insert"})
 		return false, nil
 
@@ -326,7 +334,12 @@ func (a *ChangeApplier) dispatchPipelined(ctx context.Context, b *pgxBatchTx, st
 			// there is nothing to write, and the change is satisfied.
 			return false, nil
 		}
-		b.queue(stmt, args, queuedStmt{schema: schema, table: v.Table, kind: "update"})
+		shape, err := a.keyShapeFor(ctx, schema, v.Table)
+		if err != nil {
+			return false, err
+		}
+		b.queue(stmt, args,
+			queuedStmt{schema: schema, table: v.Table, kind: "update", keyScoped: guardKeyScopedWrite(shape, "update", v.Before, colTypes)})
 		return false, nil
 
 	case ir.Delete:
@@ -342,7 +355,11 @@ func (a *ChangeApplier) dispatchPipelined(ctx context.Context, b *pgxBatchTx, st
 		if err != nil {
 			return false, fmt.Errorf("postgres: applier: build delete for %s.%s: %w", schema, v.Table, err)
 		}
-		b.queue(stmt, args, queuedStmt{schema: schema, table: v.Table, kind: "delete"})
+		shape, err := a.keyShapeFor(ctx, schema, v.Table)
+		if err != nil {
+			return false, err
+		}
+		b.queue(stmt, args, queuedStmt{schema: schema, table: v.Table, kind: "delete", keyScoped: guardKeyScopedWrite(shape, "delete", v.Before, colTypes)})
 		return false, nil
 
 	case ir.Truncate:
@@ -458,7 +475,7 @@ func (a *ChangeApplier) flushAndCommitStep(b *pgxBatchTx) (atCommit bool, err er
 	commitErr := b.tx.Commit(ctx)
 	cancel()
 	if commitErr != nil {
-		return true, classifyApplierError(fmt.Errorf("postgres: applier: commit: %w", commitErr))
+		return true, classifyApplierError(fmt.Errorf("postgres: applier: commit: %w", annotateDeferredCheckFailure(commitErr)))
 	}
 	return false, nil
 }
@@ -487,7 +504,7 @@ func (a *ChangeApplier) sendBatchUnderDeadline(b *pgxBatchTx) error {
 	// pipeline; the server executed them in queue order.
 	var firstErr error
 	for i := range b.stmts {
-		_, execErr := br.Exec()
+		tag, execErr := br.Exec()
 		if execErr != nil && firstErr == nil {
 			// No missing-table absorption here: the C-11 skip resolves
 			// at queue-build time in dispatchPipelined (a failed
@@ -495,6 +512,14 @@ func (a *ChangeApplier) sendBatchUnderDeadline(b *pgxBatchTx) error {
 			// it would only convert the position write behind it into
 			// a 25P02). Every exec error is loud.
 			firstErr = a.attributeQueuedError(b.stmts[i], execErr)
+		}
+		if execErr == nil && firstErr == nil {
+			// GC-42 G1: the per-statement count comes back on the tag. The
+			// statements behind a refused one still ran server-side (the
+			// pipeline was already sent) — the caller rolls the whole
+			// transaction back, so none of it lands.
+			s := b.stmts[i]
+			firstErr = s.keyScoped.check(s.schema, s.table, tag.RowsAffected())
 		}
 	}
 	if closeErr := br.Close(); closeErr != nil && firstErr == nil {

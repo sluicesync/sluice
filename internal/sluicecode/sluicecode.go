@@ -623,6 +623,19 @@ const (
 	// table with no retry and no recovery (Bug 211).
 	CodeTargetDeferrableKey Code = "SLUICE-E-TARGET-DEFERRABLE-KEY"
 
+	// CodeCDCKeyMatchedMultipleRows fires when a CDC UPDATE or DELETE that
+	// names its row by key matched MORE than one row on the target (GC-42,
+	// marker KEY-SCOPED-WRITE-MATCHED-MULTIPLE-ROWS); only a keyless table
+	// addressed by its whole row is exempt. The main cause is a DEFERRABLE
+	// primary key on a Postgres target mid-way through a source transaction
+	// that moves key values through each other: a key-narrowed change carries
+	// only the old key, two target rows share it, and applying it would
+	// update or delete a row the source never touched — silently, because the
+	// commit-time re-check passes on the final state.
+	// Terminal: the same change against the same state matches the same
+	// rows.
+	CodeCDCKeyMatchedMultipleRows Code = "SLUICE-E-CDC-KEY-MATCHED-MULTIPLE-ROWS"
+
 	// CodeSourceReplicaIdentity is CodeTargetDeferrableKey's source-side
 	// sibling — the same `pg_index.indimmediate` bit, the opposite end of
 	// the pipeline. Postgres will not use a DEFERRABLE key's index as a
@@ -945,6 +958,8 @@ var registry = map[Code]Info{
 	CodeSequencePositionUnreadable: {ClassRefusal, "sluice cannot read where a sequence actually is: the target's router refuses to read a sequence as a relation (PlanetScale Neki, NK013), leaving pg_catalog.pg_sequences as the only reader, and that view's last_value is privilege-gated — NULL for a role without SELECT/USAGE, which is indistinguishable from a sequence that has never been called. Refused rather than reporting the sequence's start value as its position: the source capture writes that number into the IR and the target is primed from it, so an invented low position makes the target re-issue values the copied rows already hold. Grant the role SELECT (or USAGE) on the sequence and re-run"},
 
 	CodeSourceReplicaIdentity: {ClassRefusal, "PG-source cold start refused before the publication was scoped: an in-scope source table has no usable replica identity (its only key is DEFERRABLE, it has no key at all, REPLICA IDENTITY is NOTHING, or the identity includes a STORED GENERATED column Postgres does not publish) — publishing its UPDATEs/DELETEs would make Postgres reject the SOURCE APPLICATION's own writes to it; make the key immediate, point REPLICA IDENTITY USING INDEX at an immediate NOT NULL UNIQUE index, or exclude the table — REPLICA IDENTITY FULL fixes the first three shapes but NOT the generated one"},
+
+	CodeCDCKeyMatchedMultipleRows: {ClassRefusal, "a CDC UPDATE or DELETE that names its row by key matched more than one row on the target — on Postgres, typically a DEFERRABLE key a source transaction moved key values through — so applying it would touch rows the source never named; the apply transaction is rolled back and the stream stops rather than silently losing or overwriting a row (marker KEY-SCOPED-WRITE-MATCHED-MULTIPLE-ROWS)"},
 
 	CodeTargetDeferrableKey: {ClassRefusal, "refused before applying anything: a target table's primary key (or only usable unique key) is DEFERRABLE, and Postgres rejects a deferrable constraint as an `ON CONFLICT` arbiter — so sluice's idempotent apply/copy upsert cannot key on it; recreate the target constraint as immediate (NOT DEFERRABLE), pre-create the target table with an immediate key, or take the table out of scope"},
 

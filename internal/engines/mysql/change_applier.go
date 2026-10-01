@@ -1540,9 +1540,13 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		if err != nil {
 			return false, fmt.Errorf("mysql: applier: update %s.%s: %w", schema, v.Table, err)
 		}
-		// logZeroRowsAffected reads the driver-cached rows-affected count
-		// (no SQL round-trip), so the diagnostics area is still the
-		// UPDATE's when the Vector B probe below reads it.
+		// Nothing here may run a statement on tx before the Vector B probe
+		// below reads the UPDATE's diagnostics area: logZeroRowsAffected and
+		// checkKeyScopedResult read the driver-cached rows-affected count, and
+		// the latter's key probe (only when it exceeds one) runs on the pool.
+		if err := a.checkKeyScopedResult(ctx, "update", schema, v.Table, v.Before, colTypes, res); err != nil {
+			return false, err
+		}
 		logZeroRowsAffected(ctx, "update", schema, v.Table, res)
 		return false, a.reportApplyClampWarnings(ctx, tx, schema, v.Table)
 
@@ -1563,6 +1567,9 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		res, err := a.txExec(ctx, tx, stmt, args...)
 		if err != nil {
 			return false, fmt.Errorf("mysql: applier: delete from %s.%s: %w", schema, v.Table, err)
+		}
+		if err := a.checkKeyScopedResult(ctx, "delete", schema, v.Table, v.Before, colTypes, res); err != nil {
+			return false, err
 		}
 		logZeroRowsAffected(ctx, "delete", schema, v.Table, res)
 		return false, nil
@@ -1718,6 +1725,73 @@ func (a *ChangeApplier) reportApplyClampWarnings(ctx context.Context, tx *sql.Tx
 			"rejects the value loudly and the stream stops at the offending change"),
 	)
 	return nil
+}
+
+// checkKeyScopedResult is the MySQL half of GC-42's class guard: an UPDATE or
+// DELETE that touched more than one row is refused
+// ([appliershared.RefuseKeyScopedMultiMatch]) and the caller rolls the
+// transaction back — unless [appliershared.KeyScopedWriteExempt] exempts it (a
+// keyless table addressed by its whole row). "Keyed" means what it means on
+// Postgres: a PRIMARY KEY or a unique index over NOT NULL columns.
+//
+// On MySQL it is a backstop, not a live path. MySQL has no DEFERRABLE
+// constraint — InnoDB checks a PRIMARY KEY and every UNIQUE index per row, and
+// sluice sets neither unique_checks=0 nor anything else that relaxes it — so
+// the Postgres mechanism (a key transiently shared mid-transaction) cannot
+// arise, and a before-image that carries a target key matches at most one
+// row. What remains is a before-image that does NOT carry one: a Postgres
+// source under REPLICA IDENTITY USING INDEX narrows the before-image to that
+// index's columns, and a target without the matching unique index would match
+// every row sharing them; and a key-narrowed before-image against a keyless
+// target.
+//
+// The healthy path costs nothing: the count is driver-cached, and the key
+// probe runs only when it exceeds one — on the applier's pool, NOT on the
+// apply tx, because any statement on the tx resets the diagnostics area the
+// UPDATE arm's reportApplyClampWarnings reads afterwards.
+//
+// RowsAffected is MySQL's CHANGED-rows count (the driver does not set
+// CLIENT_FOUND_ROWS), so a matched row whose values were already the
+// after-image is not counted. More than one changed row is still proof of a
+// multi-row match; the undercount needs two matched rows already identical
+// to the after-image, which a keyed table cannot hold. The coalesced
+// `DELETE … WHERE pk IN (…)` (change_applier_multirow.go) is keyed by the
+// target's own PRIMARY KEY, so each listed key matches at most one row by
+// construction and it carries no check.
+func (a *ChangeApplier) checkKeyScopedResult(ctx context.Context, op, schema, table string, before ir.Row, colTypes map[string]*ir.Column, res sql.Result) error {
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("mysql: applier: read rows affected by %s on %s.%s: %w", op, schema, table, err)
+	}
+	if n <= 1 {
+		return nil
+	}
+	keyed, err := a.tableHasRowKey(ctx, schema, table)
+	if err != nil {
+		return err
+	}
+	if appliershared.KeyScopedWriteExempt(keyed, before, colTypes) {
+		return nil
+	}
+	return appliershared.RefuseKeyScopedMultiMatch(engineNameMySQL, op, schema, table, before, n)
+}
+
+// tableHasRowKey reports whether the table has a PRIMARY KEY or a unique
+// index whose every part is a NOT NULL column (a functional key part has no
+// column and does not count). Read on the applier's pool — see
+// [ChangeApplier.checkKeyScopedResult] for why not on the apply tx. A probe
+// error is returned: guessing either way would decide a refusal blind.
+func (a *ChangeApplier) tableHasRowKey(ctx context.Context, schema, table string) (bool, error) {
+	const q = `SELECT COUNT(*) FROM (
+		SELECT index_name FROM information_schema.statistics
+		WHERE table_schema = ? AND table_name = ? AND non_unique = 0
+		GROUP BY index_name
+		HAVING SUM(nullable = 'YES' OR column_name IS NULL) = 0) k`
+	var n int
+	if err := a.db.QueryRowContext(ctx, q, schema, table).Scan(&n); err != nil {
+		return false, fmt.Errorf("mysql: applier: key probe for %s.%s: %w", schema, table, err)
+	}
+	return n > 0, nil
 }
 
 // logZeroRowsAffected emits a debug-level log line when a target Exec

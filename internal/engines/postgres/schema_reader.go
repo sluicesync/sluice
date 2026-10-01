@@ -1993,10 +1993,26 @@ func warnWeakenedUniqueConstraint(ctx context.Context, tableName string, idx *ir
 		slog.String("table", tableName),
 		slog.String("constraint", idx.Name),
 		slog.String("dropped_attributes", strings.Join(attrs, "; ")),
-		slog.String("hint", "if the attribute is load-bearing, recreate the constraint with it on the target "+
-			"after migration (ALTER TABLE ... DROP CONSTRAINT / ADD CONSTRAINT ... with the attribute) and "+
-			"verify no rows already violate it"),
+		slog.String("hint", weakenedUniqueHint(idx)),
 	)
+}
+
+// weakenedUniqueHint is the C3 WARN's remedy. Re-adding DEFERRABLE on the
+// target is not a plain restoration under `sync`, and until GC-42 the hint
+// implied it was: the Postgres applier's replica mode (the FK bypass) skips
+// the deferred re-check, so during CDC the constraint holds only what the
+// source sends (DEFERRED-KEY-CHECK-OFF-IN-REPLICA-MODE names it per table).
+func weakenedUniqueHint(idx *ir.Index) string {
+	hint := "if the attribute is load-bearing, recreate the constraint with it on the target after migration " +
+		"(ALTER TABLE ... DROP CONSTRAINT / ADD CONSTRAINT ... with the attribute) and verify no rows already violate it"
+	if idx.ConstraintDeferrable {
+		hint += "; for DEFERRABLE under `sync` (Postgres target): while sluice applies changes with " +
+			"session_replication_role=replica (an apply role that may set it) the deferred check does not run, so the " +
+			"constraint is only as good as the source's own (DEFERRED-KEY-CHECK-OFF-IN-REPLICA-MODE); with a role that " +
+			"may not, the check runs and a source transaction split across target transactions is refused at commit " +
+			"(DEFERRED-KEY-CHECK-FAILED-AT-COMMIT)"
+	}
+	return hint
 }
 
 // newIndexFromRow builds the [ir.Index] shell the first time a given

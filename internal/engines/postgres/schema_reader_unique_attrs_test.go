@@ -137,3 +137,19 @@ func TestWarnWeakenedUniqueConstraint(t *testing.T) {
 		t.Errorf("must be a WARN-level line:\n%s", out)
 	}
 }
+
+// TestWeakenedUniqueHint_DeferrableNamesTheApplyCost pins GC-42's correction
+// to the C3 hint: re-adding DEFERRABLE on the target is not free under
+// `sync`, and the hint must say what it costs — and only when DEFERRABLE is
+// one of the weakened attributes.
+func TestWeakenedUniqueHint_DeferrableNamesTheApplyCost(t *testing.T) {
+	deferrable := weakenedUniqueHint(&ir.Index{ConstraintBacked: true, ConstraintDeferrable: true})
+	for _, want := range []string{"session_replication_role=replica", "DEFERRED-KEY-CHECK-OFF-IN-REPLICA-MODE", "DEFERRED-KEY-CHECK-FAILED-AT-COMMIT"} {
+		if !strings.Contains(deferrable, want) {
+			t.Errorf("DEFERRABLE hint lacks %q: %s", want, deferrable)
+		}
+	}
+	if plain := weakenedUniqueHint(&ir.Index{ConstraintBacked: true, ConstraintNullsNotDistinct: true}); strings.Contains(plain, "session_replication_role") {
+		t.Errorf("a non-DEFERRABLE hint carries the DEFERRABLE clause: %s", plain)
+	}
+}
