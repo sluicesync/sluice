@@ -44,38 +44,52 @@ func TestAnnotateDeferredCheckFailure(t *testing.T) {
 	}
 }
 
-// TestKeyScopedWriteCheck pins G1's arithmetic and its exemption: only a
+// TestKeyScopedWriteVerdict pins G1's decision and its laziness: the table's
+// key is read ONLY when a write matched more than one row, and then only a
 // keyless table addressed by its WHOLE row is exempt — a keyless target fed a
 // key-narrowed before-image (a keyed source under REPLICA IDENTITY FULL) is
-// checked like a keyed one.
-func TestKeyScopedWriteCheck(t *testing.T) {
+// refused like a keyed one.
+func TestKeyScopedWriteVerdict(t *testing.T) {
 	cols := map[string]*ir.Column{"id": {Name: "id"}, "v": {Name: "v"}}
 	keyBefore := ir.Row{"id": int64(2)}
 	wholeRow := ir.Row{"id": int64(2), "v": "a"}
+	lookups := 0
+	keyed := func(answer bool) func() (bool, error) {
+		return func() (bool, error) { lookups++; return answer, nil }
+	}
 
-	keyed := guardKeyScopedWrite(tableKeyShape{keyed: true}, "delete", wholeRow, cols)
 	for _, n := range []int64{0, 1} {
-		if err := keyed.check("public", "s", n); err != nil {
+		if err := guardKeyScopedWrite("delete", keyBefore, cols).verdict("public", "s", n, keyed(true)); err != nil {
 			t.Errorf("%d rows refused: %v", n, err)
 		}
 	}
-	if err := keyed.check("public", "s", 2); !errors.Is(err, appliershared.ErrKeyScopedWriteMatchedMultipleRows) {
-		t.Errorf("2 rows not refused: %v", err)
+	if lookups != 0 {
+		t.Fatalf("the key was read %d times for writes that matched at most one row; the healthy path must read nothing", lookups)
 	}
 
-	exempt := guardKeyScopedWrite(tableKeyShape{}, "delete", wholeRow, cols)
-	if exempt != nil {
-		t.Fatal("a keyless table addressed by its whole row got a check")
+	refused := []struct {
+		name   string
+		keyed  bool
+		before ir.Row
+	}{
+		{"keyed table, key-narrowed image", true, keyBefore},
+		{"keyed table, whole-row image", true, wholeRow},
+		{"keyless table, key-narrowed image", false, keyBefore},
 	}
-	if err := exempt.check("public", "s", 5); err != nil {
-		t.Errorf("a nil check refused: %v", err)
+	for _, c := range refused {
+		err := guardKeyScopedWrite("delete", c.before, cols).verdict("public", "s", 2, keyed(c.keyed))
+		if !errors.Is(err, appliershared.ErrKeyScopedWriteMatchedMultipleRows) {
+			t.Errorf("%s: 2 rows not refused: %v", c.name, err)
+		}
 	}
-
-	narrowed := guardKeyScopedWrite(tableKeyShape{}, "delete", keyBefore, cols)
-	if err := narrowed.check("public", "s", 2); !errors.Is(err, appliershared.ErrKeyScopedWriteMatchedMultipleRows) {
-		t.Errorf("a keyless table addressed by a key-only before-image was exempted: %v", err)
+	if err := guardKeyScopedWrite("delete", wholeRow, cols).verdict("public", "s", 5, keyed(false)); err != nil {
+		t.Errorf("a keyless table addressed by its whole row was refused: %v", err)
 	}
-	if guardKeyScopedWrite(tableKeyShape{}, "delete", wholeRow, nil) == nil {
+	if err := guardKeyScopedWrite("delete", wholeRow, nil).verdict("public", "s", 2, keyed(false)); err == nil {
 		t.Error("an unknown target shape cannot prove a whole-row predicate, yet it was exempted")
+	}
+	probeErr := errors.New("catalog unreachable")
+	if err := guardKeyScopedWrite("delete", wholeRow, cols).verdict("public", "s", 2, func() (bool, error) { return false, probeErr }); !errors.Is(err, probeErr) {
+		t.Errorf("a failed key read must surface, not exempt: %v", err)
 	}
 }

@@ -25,7 +25,14 @@ package postgres
 // reads the exec result through [checkKeyScopedResult];
 // [ChangeApplier.dispatchPipelined] (batch and lanes) tags the queued
 // statement with [guardKeyScopedWrite] and [ChangeApplier.sendBatchUnderDeadline]
-// reads its command tag. TestKeyScopedWriteRoster holds both to it.
+// grades the command tags. TestKeyScopedWriteRoster holds both to it.
+//
+// The guard costs NOTHING on the healthy path: the affected-row count comes
+// back with every statement, and only a count above one needs the table's
+// key shape (is it keyless, and does the before-image cover the whole row?)
+// to choose between refusing and the keyless exemption. That catalog read
+// ([ChangeApplier.tableHasRowKey]) runs only then — never once per table, never
+// on a timer — mirroring the MySQL applier.
 //
 // # Replica mode and the deferred re-check: detected, not changed
 //
@@ -40,7 +47,7 @@ package postgres
 // downstream), and it turned a converging key shift under REPLICA IDENTITY
 // USING INDEX into a permanent refusal. G1 alone closes the loss; what
 // replica mode leaves is a constraint-enforcement gap — the rows still match
-// the source — named by a one-time WARN ([ChangeApplier.noteUnenforcedDeferrable]).
+// the source — named by a WARN ([ChangeApplier.noteUnenforcedDeferrable]).
 //
 // Why a WARN and not a refusal at startup for a target STRICTER than its
 // source (a deferrable constraint the source lacks): the harm needs the
@@ -60,7 +67,6 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
-	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 
@@ -73,8 +79,8 @@ import (
 // an apply role WITHOUT the replica privilege.
 const deferredCheckFailedMarker = "DEFERRED-KEY-CHECK-FAILED-AT-COMMIT"
 
-// deferredCheckOffMarker is the grep-stable marker on the one-time WARN that
-// a table's deferrable constraint is not re-checked under replica mode.
+// deferredCheckOffMarker is the grep-stable marker on the WARN that a table's
+// deferrable constraint is not re-checked under replica mode.
 const deferredCheckOffMarker = "DEFERRED-KEY-CHECK-OFF-IN-REPLICA-MODE"
 
 // The SQLSTATEs a deferred re-check raises at COMMIT.
@@ -83,132 +89,106 @@ const (
 	pgExclusionViolation = "23P01"
 )
 
-// tableKeyShape is what the applier needs to know about a TARGET table's keys
-// for GC-42.
-type tableKeyShape struct {
-	// keyed reports a PRIMARY KEY or a NOT NULL, non-partial, non-expression
-	// unique index — of ANY deferrability: a deferrable key still identifies
-	// one row once its transaction commits, which is exactly the promise a
-	// multi-row match breaks.
-	keyed bool
+// tableRowKeySQL reports whether a TARGET table has a PRIMARY KEY or a
+// NOT NULL, non-partial, non-expression unique index — of ANY deferrability:
+// a deferrable key still identifies one row once its transaction commits,
+// which is exactly the promise a multi-row match breaks. Read only on the
+// rare multi-row path ([keyScopedWrite.verdict]).
+const tableRowKeySQL = `
+	SELECT EXISTS (
+		SELECT 1 FROM pg_index ix
+		JOIN pg_class c ON c.oid = ix.indrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1 AND c.relname = $2
+		  AND (ix.indisprimary OR (
+		       ix.indisunique AND ix.indpred IS NULL AND ix.indexprs IS NULL
+		       AND NOT EXISTS (
+		           SELECT 1 FROM pg_attribute a
+		           WHERE a.attrelid = ix.indrelid
+		             AND a.attnum = ANY (ix.indkey::int2[])
+		             AND NOT a.attnotnull))))`
 
-	// deferrable names the table's DEFERRABLE primary key, unique and
-	// exclusion constraints, comma-joined; empty when there are none.
-	deferrable string
-}
-
-// keyShapeEntry is a cached [tableKeyShape] with the time it was read.
-type keyShapeEntry struct {
-	shape    tableKeyShape
-	loadedAt time.Time
-}
-
-// keyShapeTTL bounds how long a cached [tableKeyShape] is trusted. A schema
-// boundary drops the entry outright ([ChangeApplier.invalidateMetadataCaches]);
-// the TTL covers what no stream event announces — an operator adding or
-// dropping a key on the target mid-stream.
-var keyShapeTTL = 30 * time.Second
-
-// tableKeyShapeSQL reads [tableKeyShape] from the TARGET catalog in one round
-// trip. The deferrable list reads pg_constraint.condeferrable for p/u/x and,
-// as a cross-check that does not depend on a constraint row existing, every
-// unique or exclusion index whose pg_index.indimmediate is false.
-const tableKeyShapeSQL = `
-	SELECT
-		EXISTS (
-			SELECT 1 FROM pg_index ix
+// tableDeferrableSQL names a TARGET table's DEFERRABLE primary key, unique
+// and exclusion constraints, comma-joined (empty when there are none). It reads
+// pg_constraint.condeferrable for p/u/x and, as a cross-check that does not
+// depend on a constraint row existing, every unique or exclusion index whose
+// pg_index.indimmediate is false.
+const tableDeferrableSQL = `
+	SELECT COALESCE((
+		SELECT pg_catalog.string_agg(d.name, ', ' ORDER BY d.name) FROM (
+			SELECT co.conname::text AS name
+			FROM pg_constraint co
+			WHERE co.conrelid = c.oid AND co.contype IN ('p', 'u', 'x') AND co.condeferrable
+			UNION
+			SELECT ic.relname::text
+			FROM pg_index ix JOIN pg_class ic ON ic.oid = ix.indexrelid
 			WHERE ix.indrelid = c.oid
-			  AND (ix.indisprimary OR (
-			       ix.indisunique AND ix.indpred IS NULL AND ix.indexprs IS NULL
-			       AND NOT EXISTS (
-			           SELECT 1 FROM pg_attribute a
-			           WHERE a.attrelid = ix.indrelid
-			             AND a.attnum = ANY (ix.indkey::int2[])
-			             AND NOT a.attnotnull)))
-		),
-		COALESCE((
-			SELECT pg_catalog.string_agg(d.name, ', ' ORDER BY d.name) FROM (
-				SELECT co.conname::text AS name
-				FROM pg_constraint co
-				WHERE co.conrelid = c.oid AND co.contype IN ('p', 'u', 'x') AND co.condeferrable
-				UNION
-				SELECT ic.relname::text
-				FROM pg_index ix JOIN pg_class ic ON ic.oid = ix.indexrelid
-				WHERE ix.indrelid = c.oid
-				  AND (ix.indisunique OR ix.indisexclusion)
-				  AND NOT ix.indimmediate
-			) d
-		), '')
+			  AND (ix.indisunique OR ix.indisexclusion)
+			  AND NOT ix.indimmediate
+		) d
+	), '')
 	FROM pg_class c
 	JOIN pg_namespace n ON n.oid = c.relnamespace
 	WHERE n.nspname = $1 AND c.relname = $2`
 
-// keyShapeFor returns the cached [tableKeyShape] for a routed table, reading
-// the target catalog on a miss or an expired entry, and names an unenforced
-// deferrable constraint the first time it sees one. A probe error is
-// returned, never defaulted: guessing "keyless" would narrow G1 — the silent
-// direction. A table the catalog does not have reads as the zero shape; the
-// dispatch arms resolve that case first (the C-11 skip).
-func (a *ChangeApplier) keyShapeFor(ctx context.Context, schema, table string) (tableKeyShape, error) {
-	qn := schemaTableKey(schema, table)
-	if s, ok := a.cachedKeyShape(qn); ok {
-		return s, nil
+// tableHasRowKey reports whether the TARGET table has a key
+// ([tableRowKeySQL]). Not cached: it runs only when a write already matched
+// more than one row, which ends in a refusal or a keyless exemption — rare
+// by construction. It reads on the primary pool, never on an apply
+// transaction or a pinned pipelined backend. A probe error is returned:
+// guessing "keyless" would exempt the write — the silent direction.
+func (a *ChangeApplier) tableHasRowKey(ctx context.Context, schema, table string) (bool, error) {
+	var keyed bool
+	if err := a.db.QueryRowContext(ctx, tableRowKeySQL, schema, table).Scan(&keyed); err != nil {
+		return false, fmt.Errorf("postgres: applier: read the key of %s.%s: %w", schema, table, err)
 	}
-	var s tableKeyShape
-	err := a.db.QueryRowContext(ctx, tableKeyShapeSQL, schema, table).Scan(&s.keyed, &s.deferrable)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return tableKeyShape{}, fmt.Errorf("postgres: applier: read key shape of %s: %w", qn, err)
-	}
-	a.storeKeyShape(qn, s)
-	a.noteUnenforcedDeferrable(ctx, qn, s)
-	return s, nil
+	return keyed, nil
 }
 
-// cachedKeyShape is the cacheMu-guarded read of keyShapeCache (see the
-// accessor note in change_applier_concurrent.go); an entry older than
-// [keyShapeTTL] reads as a miss.
-func (a *ChangeApplier) cachedKeyShape(qn string) (tableKeyShape, bool) {
-	a.cacheMu.RLock()
-	defer a.cacheMu.RUnlock()
-	e, ok := a.keyShapeCache[qn]
-	if !ok || time.Since(e.loadedAt) >= keyShapeTTL {
-		return tableKeyShape{}, false
-	}
-	return e.shape, true
-}
-
-func (a *ChangeApplier) storeKeyShape(qn string, s tableKeyShape) {
+// markDeferrableChecked records that qn's deferrable constraints have been
+// read for this run and reports whether THIS call recorded it, so the read
+// (and its WARN) happens once per table even under concurrent lanes. A schema
+// boundary forgets the mark ([ChangeApplier.invalidateMetadataCaches]).
+func (a *ChangeApplier) markDeferrableChecked(qn string) (firstTime bool) {
 	a.cacheMu.Lock()
 	defer a.cacheMu.Unlock()
-	if a.keyShapeCache == nil {
-		a.keyShapeCache = make(map[string]keyShapeEntry)
+	if a.deferrableChecked == nil {
+		a.deferrableChecked = make(map[string]bool)
 	}
-	a.keyShapeCache[qn] = keyShapeEntry{shape: s, loadedAt: time.Now()}
-}
-
-// markWarnedDeferredOff records that the deferred-check WARN has been emitted
-// for qn and reports whether THIS call recorded it, so it fires once per
-// table even under concurrent lanes.
-func (a *ChangeApplier) markWarnedDeferredOff(qn string) (firstTime bool) {
-	a.cacheMu.Lock()
-	defer a.cacheMu.Unlock()
-	if a.warnedDeferredOff == nil {
-		a.warnedDeferredOff = make(map[string]bool)
-	}
-	if a.warnedDeferredOff[qn] {
+	if a.deferrableChecked[qn] {
 		return false
 	}
-	a.warnedDeferredOff[qn] = true
+	a.deferrableChecked[qn] = true
 	return true
 }
 
-// noteUnenforcedDeferrable WARNs, once per table, that a deferrable
-// constraint on it is not re-checked during apply: the applier runs in
-// replica mode, which switches the re-check off. A role without the replica
-// privilege never leaves origin, so its checks fire and there is nothing to
-// say. Detection only — see the file header for why apply is not changed.
-func (a *ChangeApplier) noteUnenforcedDeferrable(ctx context.Context, qn string, s tableKeyShape) {
-	if s.deferrable == "" || !a.foreignKeyBypassAvailable(ctx) || !a.markWarnedDeferredOff(qn) {
+// noteUnenforcedDeferrable WARNs that a deferrable constraint on the table is
+// not re-checked during apply: the applier runs in replica mode, which
+// switches the re-check off. It reads the catalog ONCE per table per applier
+// run (on first touch, again after a schema boundary) and only in replica
+// mode — a role without the replica privilege never leaves origin, so its
+// checks fire and there is nothing to say. Detection only, and never a reason
+// to stop the apply: a probe error is logged and the table is not re-read.
+//
+// Per table on first touch, rather than one catalog sweep at open: the
+// applier's scope is not known at open (multi-database routing, `schema
+// add-table`, a routed schema), and a sweep would read every table of a
+// target the stream may barely touch.
+func (a *ChangeApplier) noteUnenforcedDeferrable(ctx context.Context, schema, table string) {
+	qn := schemaTableKey(schema, table)
+	if !a.foreignKeyBypassAvailable(ctx) || !a.markDeferrableChecked(qn) {
+		return
+	}
+	var deferrable string
+	if err := a.db.QueryRowContext(ctx, tableDeferrableSQL, schema, table).Scan(&deferrable); err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			slog.WarnContext(ctx, "postgres: applier: could not read the table's DEFERRABLE constraints for the "+
+				deferredCheckOffMarker+" check; continuing without it",
+				slog.String("table", qn), slog.String("err", err.Error()))
+		}
+		return
+	}
+	if deferrable == "" {
 		return
 	}
 	slog.WarnContext(ctx,
@@ -218,52 +198,60 @@ func (a *ChangeApplier) noteUnenforcedDeferrable(ctx context.Context, qn string,
 			"the source sent them, so if the target's constraint is stricter than the source's (the source lacks it) the "+
 			"table can hold rows the constraint forbids, and REINDEX TABLE would fail on them",
 		slog.String("table", qn),
-		slog.String("deferrable_constraints", s.deferrable),
+		slog.String("deferrable_constraints", deferrable),
 		slog.String("hint", "give the target the same constraint as the source (if the source has no such constraint, "+
 			"drop it on the target or make it NOT DEFERRABLE so a violating row is refused at its statement); "+
 			"`REINDEX TABLE <table>` checks whether any violating row already landed"))
 }
 
-// keyScopedWrite is the G1 check carried by a queued UPDATE/DELETE, read
-// against the statement's command tag at flush time.
+// keyScopedWrite is the G1 check carried by an UPDATE/DELETE: what the
+// verdict needs if the statement matched more than one row.
 type keyScopedWrite struct {
-	op     string // "update" / "delete"
-	before ir.Row
+	op       string // "update" / "delete"
+	before   ir.Row
+	colTypes map[string]*ir.Column
 }
 
-// guardKeyScopedWrite returns the G1 check for a write, or nil when it is
-// exempt ([appliershared.KeyScopedWriteExempt]: a keyless table addressed by
-// its whole row).
-func guardKeyScopedWrite(s tableKeyShape, op string, before ir.Row, colTypes map[string]*ir.Column) *keyScopedWrite {
-	if appliershared.KeyScopedWriteExempt(s.keyed, before, colTypes) {
+// guardKeyScopedWrite returns the G1 check for a write. Every UPDATE/DELETE
+// carries one; whether it is exempt is decided only if it matches more than
+// one row ([keyScopedWrite.verdict]).
+func guardKeyScopedWrite(op string, before ir.Row, colTypes map[string]*ir.Column) *keyScopedWrite {
+	return &keyScopedWrite{op: op, before: before, colTypes: colTypes}
+}
+
+// verdict refuses a write that matched more than one row, unless the target
+// is keyless and the before-image is the whole row
+// ([appliershared.KeyScopedWriteExempt]). keyed is consulted ONLY when
+// matched > 1, so the healthy path reads no catalog.
+func (k *keyScopedWrite) verdict(schema, table string, matched int64, keyed func() (bool, error)) error {
+	if k == nil || matched <= 1 {
 		return nil
 	}
-	return &keyScopedWrite{op: op, before: before}
-}
-
-// check refuses a key-scoped write that matched more than one row. A nil
-// check (exempt) and zero or one row pass.
-func (k *keyScopedWrite) check(schema, table string, matched int64) error {
-	if k == nil || matched <= 1 {
+	isKeyed, err := keyed()
+	if err != nil {
+		return err
+	}
+	if appliershared.KeyScopedWriteExempt(isKeyed, k.before, k.colTypes) {
 		return nil
 	}
 	return appliershared.RefuseKeyScopedMultiMatch(engineNamePostgres, k.op, schema, table, k.before, matched)
 }
 
+// verdictOn is [keyScopedWrite.verdict] with the key read from the target.
+func (k *keyScopedWrite) verdictOn(ctx context.Context, a *ChangeApplier, schema, table string, matched int64) error {
+	return k.verdict(schema, table, matched, func() (bool, error) { return a.tableHasRowKey(ctx, schema, table) })
+}
+
 // checkKeyScopedResult is G1 on the serial path: it reads the exec's
-// affected-row count and refuses more than one. pgx's stdlib driver always
-// reports the count (from the command tag), so a read error is a driver
-// change the guard must not paper over, and is returned.
-func checkKeyScopedResult(s tableKeyShape, op, schema, table string, before ir.Row, colTypes map[string]*ir.Column, res sql.Result) error {
-	k := guardKeyScopedWrite(s, op, before, colTypes)
-	if k == nil {
-		return nil
-	}
+// affected-row count and grades it. pgx's stdlib driver always reports the
+// count (from the command tag), so a read error is a driver change the guard
+// must not paper over, and is returned.
+func (a *ChangeApplier) checkKeyScopedResult(ctx context.Context, op, schema, table string, before ir.Row, colTypes map[string]*ir.Column, res sql.Result) error {
 	n, err := res.RowsAffected()
 	if err != nil {
 		return fmt.Errorf("postgres: applier: read rows affected by %s on %s.%s: %w", op, schema, table, err)
 	}
-	return k.check(schema, table, n)
+	return guardKeyScopedWrite(op, before, colTypes).verdictOn(ctx, a, schema, table, n)
 }
 
 // annotateDeferredCheckFailure marks a COMMIT refused by a deferred

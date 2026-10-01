@@ -301,10 +301,9 @@ func (a *ChangeApplier) dispatchPipelined(ctx context.Context, b *pgxBatchTx, st
 		if err != nil {
 			return false, fmt.Errorf("postgres: applier: build insert for %s.%s: %w", schema, v.Table, err)
 		}
-		// GC-42: names a DEFERRABLE constraint replica mode leaves unchecked.
-		if _, err := a.keyShapeFor(ctx, schema, v.Table); err != nil {
-			return false, err
-		}
+		// GC-42: names a DEFERRABLE constraint replica mode leaves unchecked
+		// (one catalog read per table per run).
+		a.noteUnenforcedDeferrable(ctx, schema, v.Table)
 		b.queue(stmt, args, queuedStmt{schema: schema, table: v.Table, kind: "insert"})
 		return false, nil
 
@@ -334,12 +333,9 @@ func (a *ChangeApplier) dispatchPipelined(ctx context.Context, b *pgxBatchTx, st
 			// there is nothing to write, and the change is satisfied.
 			return false, nil
 		}
-		shape, err := a.keyShapeFor(ctx, schema, v.Table)
-		if err != nil {
-			return false, err
-		}
+		a.noteUnenforcedDeferrable(ctx, schema, v.Table)
 		b.queue(stmt, args,
-			queuedStmt{schema: schema, table: v.Table, kind: "update", keyScoped: guardKeyScopedWrite(shape, "update", v.Before, colTypes)})
+			queuedStmt{schema: schema, table: v.Table, kind: "update", keyScoped: guardKeyScopedWrite("update", v.Before, colTypes)})
 		return false, nil
 
 	case ir.Delete:
@@ -355,11 +351,8 @@ func (a *ChangeApplier) dispatchPipelined(ctx context.Context, b *pgxBatchTx, st
 		if err != nil {
 			return false, fmt.Errorf("postgres: applier: build delete for %s.%s: %w", schema, v.Table, err)
 		}
-		shape, err := a.keyShapeFor(ctx, schema, v.Table)
-		if err != nil {
-			return false, err
-		}
-		b.queue(stmt, args, queuedStmt{schema: schema, table: v.Table, kind: "delete", keyScoped: guardKeyScopedWrite(shape, "delete", v.Before, colTypes)})
+		a.noteUnenforcedDeferrable(ctx, schema, v.Table)
+		b.queue(stmt, args, queuedStmt{schema: schema, table: v.Table, kind: "delete", keyScoped: guardKeyScopedWrite("delete", v.Before, colTypes)})
 		return false, nil
 
 	case ir.Truncate:
@@ -503,6 +496,11 @@ func (a *ChangeApplier) sendBatchUnderDeadline(b *pgxBatchTx) error {
 	// br.Exec must be called once per queued statement to drain the
 	// pipeline; the server executed them in queue order.
 	var firstErr error
+	// GC-42 G1: the per-statement count comes back on each tag. A count
+	// above one is only NOTED here — grading it may need a catalog read, and
+	// the pipeline must be drained first — then graded below, after Close and
+	// before the caller's COMMIT.
+	var multi []multiRowMatch
 	for i := range b.stmts {
 		tag, execErr := br.Exec()
 		if execErr != nil && firstErr == nil {
@@ -513,19 +511,32 @@ func (a *ChangeApplier) sendBatchUnderDeadline(b *pgxBatchTx) error {
 			// a 25P02). Every exec error is loud.
 			firstErr = a.attributeQueuedError(b.stmts[i], execErr)
 		}
-		if execErr == nil && firstErr == nil {
-			// GC-42 G1: the per-statement count comes back on the tag. The
-			// statements behind a refused one still ran server-side (the
-			// pipeline was already sent) — the caller rolls the whole
-			// transaction back, so none of it lands.
-			s := b.stmts[i]
-			firstErr = s.keyScoped.check(s.schema, s.table, tag.RowsAffected())
+		if execErr == nil && b.stmts[i].keyScoped != nil && tag.RowsAffected() > 1 {
+			multi = append(multi, multiRowMatch{stmt: b.stmts[i], matched: tag.RowsAffected()})
 		}
 	}
 	if closeErr := br.Close(); closeErr != nil && firstErr == nil {
 		firstErr = fmt.Errorf("postgres: applier: pipelined batch close: %w", closeErr)
 	}
-	return firstErr
+	if firstErr != nil {
+		return firstErr
+	}
+	// Every statement has run but nothing is committed: a refusal here makes
+	// the caller roll the whole transaction back, so none of it lands. The
+	// key read uses the primary pool, not this pinned backend.
+	for _, m := range multi {
+		if err := m.stmt.keyScoped.verdictOn(ctx, a, m.stmt.schema, m.stmt.table, m.matched); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// multiRowMatch is a queued UPDATE/DELETE whose command tag reported more
+// than one affected row, waiting for its G1 verdict.
+type multiRowMatch struct {
+	stmt    queuedStmt
+	matched int64
 }
 
 // attributeQueuedError wraps a per-statement execution error with the same

@@ -279,7 +279,7 @@ type ChangeApplier struct {
 	// dispatch tree can touch from W goroutines under the ADR-0105
 	// concurrent key-hash apply path: pkCache, colTypeCache,
 	// conflictKeyCache, warnedKeyless, nonPKUniqueCache, warnedRouteProbe,
-	// keyShapeCache, warnedDeferredOff and schemaDirtyTables. EVERY access
+	// deferrableChecked and schemaDirtyTables. EVERY access
 	// to those maps goes through the guarded accessors in
 	// change_applier_concurrent.go and change_applier_key_shape.go — there is
 	// no direct map access elsewhere
@@ -332,12 +332,11 @@ type ChangeApplier struct {
 	nonPKUniqueCache map[string]bool
 	warnedRouteProbe map[string]bool
 
-	// keyShapeCache maps "schema.table" → the TARGET table's GC-42 key
-	// shape (keyed? which DEFERRABLE constraints?), read with a TTL — see
-	// change_applier_key_shape.go. warnedDeferredOff tracks tables whose
-	// one-time DEFERRED-KEY-CHECK-OFF-IN-REPLICA-MODE WARN has fired.
-	keyShapeCache     map[string]keyShapeEntry
-	warnedDeferredOff map[string]bool
+	// deferrableChecked records the tables whose DEFERRABLE constraints were
+	// read for the DEFERRED-KEY-CHECK-OFF-IN-REPLICA-MODE WARN this run —
+	// once per table, again after a schema boundary (GC-42,
+	// change_applier_key_shape.go).
+	deferrableChecked map[string]bool
 
 	// colTypeCache maps "schema.table" → column-name → *ir.Column. It
 	// is the input to prepareValue for every value the applier
@@ -1752,11 +1751,9 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		if err != nil {
 			return false, fmt.Errorf("postgres: applier: build insert for %s.%s: %w", schema, v.Table, err)
 		}
-		// GC-42: read the key shape here too, so a DEFERRABLE constraint that
-		// replica mode leaves unchecked is named on an insert-only table.
-		if _, err := a.keyShapeFor(ctx, schema, v.Table); err != nil {
-			return false, err
-		}
+		// GC-42: names a DEFERRABLE constraint replica mode leaves unchecked
+		// (one catalog read per table per run).
+		a.noteUnenforcedDeferrable(ctx, schema, v.Table)
 		if _, err := a.txExec(ctx, tx, stmt, a.execDMLArgs(schema, v.Table, args)...); err != nil {
 			return false, fmt.Errorf("postgres: applier: insert into %s.%s: %w", schema, v.Table, err)
 		}
@@ -1792,10 +1789,7 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 			// row's payload cannot be absorbed as "satisfied".
 			return false, nil
 		}
-		shape, err := a.keyShapeFor(ctx, schema, v.Table)
-		if err != nil {
-			return false, err
-		}
+		a.noteUnenforcedDeferrable(ctx, schema, v.Table)
 		// Update misses are tolerated (zero rows affected) for resume
 		// idempotency; the same caveat as MySQL applies — see the
 		// MySQL applier's dispatch comment for the rationale and the
@@ -1806,7 +1800,7 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		if err != nil {
 			return false, fmt.Errorf("postgres: applier: update %s.%s: %w", schema, v.Table, err)
 		}
-		if err := checkKeyScopedResult(shape, "update", schema, v.Table, v.Before, colTypes, res); err != nil {
+		if err := a.checkKeyScopedResult(ctx, "update", schema, v.Table, v.Before, colTypes, res); err != nil {
 			return false, err
 		}
 		logZeroRowsAffected(ctx, "update", schema, v.Table, res)
@@ -1825,16 +1819,13 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		if err != nil {
 			return false, fmt.Errorf("postgres: applier: build delete for %s.%s: %w", schema, v.Table, err)
 		}
-		shape, err := a.keyShapeFor(ctx, schema, v.Table)
-		if err != nil {
-			return false, err
-		}
+		a.noteUnenforcedDeferrable(ctx, schema, v.Table)
 		// The write GC-42's loss came through: more than one row is refused.
 		res, err := a.txExec(ctx, tx, stmt, a.execDMLArgs(schema, v.Table, args)...)
 		if err != nil {
 			return false, fmt.Errorf("postgres: applier: delete from %s.%s: %w", schema, v.Table, err)
 		}
-		if err := checkKeyScopedResult(shape, "delete", schema, v.Table, v.Before, colTypes, res); err != nil {
+		if err := a.checkKeyScopedResult(ctx, "delete", schema, v.Table, v.Before, colTypes, res); err != nil {
 			return false, err
 		}
 		logZeroRowsAffected(ctx, "delete", schema, v.Table, res)
