@@ -79,7 +79,7 @@ func (s *scopedSeam) RouteForChange(_ context.Context, c ir.Change) (Route, bool
 	return r, ok, nil
 }
 
-func (s *scopedSeam) ApplyLaneBatch(_ context.Context, lane int, batch []ir.Change) (int, error) {
+func (s *scopedSeam) ApplyLaneBatch(_ context.Context, lane int, batch []ir.Change, _ *FoldTicket) (int, error) {
 	if s.applyDelay > 0 {
 		time.Sleep(s.applyDelay)
 	}
@@ -111,7 +111,7 @@ func (s *scopedSeam) ApplyBarrierChange(context.Context, ir.Change) error {
 func (s *scopedSeam) SkipsRowChange(context.Context, ir.Change) bool { return false }
 
 func (s *scopedSeam) ApplyMarkTx(context.Context, ir.Change) string { return "" }
-func (s *scopedSeam) ApplyMarksFenced(string)                       {}
+func (s *scopedSeam) ApplyMarksFenced(string, bool)                 {}
 
 // TestRouteRow_HonoursTableScope drives the whole orchestrator with a seam
 // that reports RouteScopeTable and asserts every change landed on ONE lane, in

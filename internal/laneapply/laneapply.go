@@ -61,9 +61,12 @@
 // Instead the checkpoint coordinator persists the merged position in a
 // SEPARATE transaction (via [LaneApplier.WriteCheckpoint]), and ONLY up to
 // a source-transaction boundary whose every change is durably committed
-// across all lanes (the contiguous frontier). This RELAXES ADR-0007's
-// per-batch atomicity to the weaker — but still exactly-once-preserving —
-// invariant:
+// across all lanes (the contiguous frontier). (With --exactly-once-lanes, a
+// mark fence's position rides a lane's own transaction instead — a
+// [FoldTicket] — but it is the same frontier-chosen boundary, durable before
+// the fold began, so nothing below changes; ADR-0190 amendment D.) This
+// RELAXES ADR-0007's per-batch atomicity to the weaker — but still
+// exactly-once-preserving — invariant:
 //
 //	persisted_position ≤ all-durably-committed-data, always.
 //
@@ -144,7 +147,17 @@ type LaneApplier interface {
 	// split-on-retriable-error and the frontier advance; this method applies
 	// one (sub-)batch atomically and returns the RAW (unclassified) error so
 	// the orchestrator's retriable/split decision inspects the original.
-	ApplyLaneBatch(ctx context.Context, lane int, batch []ir.Change) (committed int, err error)
+	//
+	// fold, when non-nil, is ADR-0190 amendment D's [FoldTicket]: the batch
+	// carries the fenced transaction's first marked change, and the engine
+	// writes, in THIS transaction and in this order, the data, the marks
+	// (closing fold.ClosedTxs: its own upserts and their deletes, the plan
+	// WriteCheckpoint would run), and then fold.Pos with fold.RowsApplied —
+	// last. Once the commit lands, and before returning, it records the marks
+	// durable and anchors fold.Tx on its lane fence, so a later batch on any
+	// lane may write that transaction's marks. A COMMIT-step error of a fold
+	// batch must be wrapped with [CommitOutcomeUnknown].
+	ApplyLaneBatch(ctx context.Context, lane int, batch []ir.Change, fold *FoldTicket) (committed int, err error)
 
 	// ClassifyError maps a raw driver error to a classified error exposing
 	// the [ir.RetriableError] surface (Retriable() → split-and-retry vs
@@ -228,10 +241,17 @@ type LaneApplier interface {
 
 	// ApplyMarksFenced clears the lanes to write txID's apply marks: the
 	// orchestrator has drained every lane to the transaction's first marked
-	// change and persisted the checkpoint, so the position sits at the
-	// transaction's start (ADR-0190 amendment A). A lane must write NO mark of
-	// any other transaction — it applies such a change unmarked instead.
-	ApplyMarksFenced(txID string)
+	// change (ADR-0190 amendment A). A lane must write NO mark of any other
+	// transaction — it applies such a change unmarked instead.
+	//
+	// anchored reports whether the persisted position already sits at the
+	// transaction's start. When it does not, the anchor rides a [FoldTicket]
+	// on the batch carrying the transaction's first marked change (amendment
+	// D), and until that batch commits only it may write the transaction's
+	// marks — the "anchored" rule. A lane batch admitting them earlier would
+	// make them durable while the position still sits at the previous
+	// transaction's start: marks for two transactions at once.
+	ApplyMarksFenced(txID string, anchored bool)
 }
 
 // retriable reports whether the raw lane error is one the ADR-0038 streamer
@@ -315,6 +335,12 @@ type LaneChange struct {
 	// commit the partial batch it holds now instead of waiting out the idle
 	// grace. Never applied, never counted on the frontier.
 	flush bool
+
+	// fold is the [FoldTicket] the coordinator attached to a fenced
+	// transaction's first marked change (ADR-0190 amendment D): whichever
+	// (sub-)batch carries this envelope writes the fenced checkpoint in its
+	// own transaction. nil on every other envelope.
+	fold *FoldTicket
 }
 
 // Config configures an [Orchestrator]. Zero values are safe: Lanes < 1 is
@@ -510,8 +536,18 @@ type Orchestrator struct {
 	closedTx map[uint64]string
 
 	// fencedTx is the transaction the last ADR-0190 mark fence cleared the
-	// lanes for (see fenceApplyMarks). Coordinator-goroutine-only.
+	// lanes for (see fenceApplyMarks). foldSeq is the seq of the envelope
+	// carrying its [FoldTicket] — 0 when it needed none, being anchored at the
+	// fence — and foldLane the lane that envelope was routed to.
+	// Coordinator-goroutine-only.
 	fencedTx string
+	foldSeq  uint64
+	foldLane int
+
+	// folds counts the fold tickets this run issued — the evidence, logged
+	// when the run ends, that amendment D's path ran at all.
+	// Coordinator-goroutine-only.
+	folds int
 
 	cancel context.CancelFunc
 
@@ -583,6 +619,7 @@ func (o *Orchestrator) Run(ctx context.Context, changes <-chan ir.Change) error 
 	ctx, cancel := context.WithCancel(ctx)
 	o.cancel = cancel
 	defer cancel()
+	defer o.logFolds(ctx)
 
 	o.wg.Add(o.lanes)
 	for i := 0; i < o.lanes; i++ {
@@ -955,16 +992,17 @@ func (o *Orchestrator) routeRow(ctx context.Context, seq uint64, c ir.Change) er
 		// mis-routed).
 		return o.barrier(ctx, seq, c)
 	}
-	if err := o.fenceApplyMarks(ctx, seq, c); err != nil {
+	lane := o.router.LaneForRoute(route)
+	fold, err := o.fenceApplyMarks(ctx, seq, c, lane)
+	if err != nil {
 		return err
 	}
-	lane := o.router.LaneForRoute(route)
 	// Push the {seq, change} envelope so the lane reads the sequence and its
 	// change inherently paired (the FIFO-alignment fix — no sibling seq
 	// channel to drift out of step). The select honours ctx cancel so a
 	// stalled lane during shutdown doesn't wedge the coordinator.
 	select {
-	case o.laneIn[lane] <- LaneChange{Seq: seq, Change: c}:
+	case o.laneIn[lane] <- LaneChange{Seq: seq, Change: c, fold: fold}:
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -974,14 +1012,14 @@ func (o *Orchestrator) routeRow(ctx context.Context, seq uint64, c ir.Change) er
 
 // fenceApplyMarks is ADR-0190 amendment A (operator-approved 2026-09-28):
 // before the FIRST change of a source transaction that will write an apply
-// mark reaches a lane, drain every lane to that change's predecessor and
-// persist the checkpoint — the barrier's own prefix — then clear the lanes to
-// write the transaction's marks. The persisted position then sits at the
-// transaction's start, so no EARLIER transaction can ever be re-delivered
-// alongside its marks; and the next transaction's fence drains this one and
-// moves the position past it, deleting its marks in that checkpoint. Marks
-// therefore only ever exist for the first transaction after the persisted
-// position, which is what makes the same-transaction skip rule sufficient.
+// mark reaches a lane, drain every lane to that change's predecessor, move
+// the persisted position to the transaction's start — the barrier's own
+// prefix — and clear the lanes to write the transaction's marks. No EARLIER
+// transaction can then ever be re-delivered alongside its marks; and the
+// next transaction's fence drains this one and moves the position past it,
+// deleting its marks in that same write. Marks therefore only ever exist for
+// the first transaction after the persisted position, which is what makes the
+// same-transaction skip rule sufficient.
 //
 // Without it a lane batch could commit T1's update of a key and T2's delete
 // of it together, T2's mark on the key; a crash before the checkpoint passed
@@ -990,9 +1028,36 @@ func (o *Orchestrator) routeRow(ctx context.Context, seq uint64, c ir.Change) er
 // mark — the key left on the target at exit 0. applymarks.LaneFence carries
 // the full counterexample.
 //
-// The cost is one drain + checkpoint per source transaction that sends a
-// marked change to a lane — none for an idempotent-only transaction (the
-// PK-only steady state) or a stream whose reader stamps no identity.
+// The cost is one drain per source transaction that sends a marked change to
+// a lane — none for an idempotent-only transaction (the PK-only steady state)
+// or a stream whose reader stamps no identity.
+//
+// # The position rides the marked batch (amendment D, 2026-10-01)
+//
+// Amendment A wrote that position in its own synchronous checkpoint, then the
+// lane committed the marks: two target commits per marked transaction, which
+// the 2026-09-29 benchmark measured at ~0.49x the serial path. The fence now
+// CLAIMS the anchor instead ([Orchestrator.claimAnchor]) and hands it to the
+// lane as a [FoldTicket] on the marked change's own envelope; the lane writes
+// it last in the transaction that commits the marks, so "the marks name T"
+// and "the position sits at T's start" become durable in ONE commit. Two
+// conditions make that sound, and both are kept here:
+//
+//   - the drain stays: the anchor is a legal position only once every change
+//     before the marked one is durable on every lane (without it the fold
+//     would persist a lagging position under the marks — amendment D's V1);
+//   - the anchored rule: until the fold commits, no lane but the fold's may
+//     commit the transaction's marks. The coordinator waits for the fold
+//     before routing a later marked change of the transaction to another lane
+//     (step 8 below; operator decision D-Q1), and the lane re-checks at apply
+//     time ([LaneApplier.ApplyMarksFenced]'s anchored flag) — without it a
+//     second lane could make the transaction's marks durable beside the
+//     previous transaction's (amendment D's V2).
+//
+// It returns the ticket the marked change's envelope carries, or nil when the
+// transaction needed none: it was already anchored at the fence — the run's
+// first transaction, or a position a barrier or an idle checkpoint already
+// wrote — so the lanes may write its marks at once.
 //
 // # Opt-in (amendment C, operator 2026-09-29)
 //
@@ -1021,23 +1086,49 @@ func (o *Orchestrator) routeRow(ctx context.Context, seq uint64, c ir.Change) er
 // ordinal) is durable when its mark commits, so the per-key prefix the skip
 // rule relies on holds; an unmarked lane change later in the transaction
 // carries a higher ordinal and is never skipped by it.
-func (o *Orchestrator) fenceApplyMarks(ctx context.Context, seq uint64, c ir.Change) error {
+func (o *Orchestrator) fenceApplyMarks(ctx context.Context, seq uint64, c ir.Change, lane int) (*FoldTicket, error) {
 	if !o.exactlyOnceLanes {
-		return nil
+		return nil, nil
 	}
 	tx := o.la.ApplyMarkTx(ctx, c)
-	if tx == "" || tx == o.fencedTx {
-		return nil
+	if tx == "" {
+		return nil, nil
 	}
+	if tx == o.fencedTx {
+		// A later marked change of the fenced transaction (step 8). On the
+		// fold's own lane it needs no wait — a lane commits its batches in
+		// order — but on any other lane it waits for the fold to commit: once
+		// the drain to seq-1 made the frontier foldSeq-1, reaching foldSeq
+		// means exactly that.
+		if o.foldSeq != 0 && lane != o.foldLane && !o.foldAnchored() {
+			return nil, o.drainLanes(ctx, o.foldSeq, o.foldLane)
+		}
+		return nil, nil
+	}
+	// Every change before this one durable on every lane: the precondition
+	// for the anchor to be a legal position (position ≤ durable data).
 	if err := o.drainLanes(ctx, seq-1); err != nil {
-		return err
+		return nil, err
 	}
-	if err := o.writeCheckpoint(ctx); err != nil {
-		return err
+	fold := o.claimAnchor()
+	o.fencedTx, o.foldSeq, o.foldLane = tx, 0, lane
+	if fold != nil {
+		fold.Tx = tx
+		o.foldSeq = seq
+		o.folds++
 	}
-	o.fencedTx = tx
-	o.la.ApplyMarksFenced(tx)
-	return nil
+	o.la.ApplyMarksFenced(tx, fold == nil)
+	return fold, nil
+}
+
+// logFolds reports, once per run, how many fence checkpoints the run folded
+// into lane transactions (ADR-0190 amendment D). Silent on a run with none —
+// every run without --exactly-once-lanes.
+func (o *Orchestrator) logFolds(ctx context.Context) {
+	if o.folds > 0 {
+		slog.InfoContext(ctx, "laneapply: --exactly-once-lanes wrote each mark fence's position in the marked lane batch's own transaction (ADR-0190 amendment D)",
+			slog.Int("folded_fences", o.folds))
+	}
 }
 
 // drainLanes blocks until every change at or below target is durable across
@@ -1048,9 +1139,11 @@ func (o *Orchestrator) fenceApplyMarks(ctx context.Context, seq uint64, c ir.Cha
 // TestOrchestrator_FrontierWaitsGoThroughDrainLanes holds that it is the only
 // other wait on the frontier.
 //
-// It first hands each lane a flush sentinel, queued behind everything the
-// coordinator has already routed to it, so a lane holding a partial batch
-// commits it on reaching the sentinel instead of waiting out the idle grace.
+// It first hands a flush sentinel to each lane in only — every lane when only
+// is empty; the fence's wait for one fold names just the fold's lane —
+// queued behind everything the coordinator has already routed to it, so a
+// lane holding a partial batch commits it on reaching the sentinel instead
+// of waiting out the idle grace.
 // Without that the drain costs a full idle period (100 ms) whenever the last
 // lane to finish is holding a partial batch — which, on a stream that drains
 // once per marked transaction, capped the lane path at ~10 transactions/s
@@ -1059,11 +1152,14 @@ func (o *Orchestrator) fenceApplyMarks(ctx context.Context, seq uint64, c ir.Cha
 // only after its commit, and a checkpoint reads only the frontier — nothing
 // depends on where a batch ends. A lane with nothing buffered just reads the
 // sentinel and waits again.
-func (o *Orchestrator) drainLanes(ctx context.Context, target uint64) error {
+func (o *Orchestrator) drainLanes(ctx context.Context, target uint64, only ...int) error {
 	if o.frontier.FrontierSeq() >= target {
 		return nil
 	}
 	for i := range o.laneIn {
+		if len(only) > 0 && !slices.Contains(only, i) {
+			continue
+		}
 		select {
 		case o.laneIn[i] <- LaneChange{flush: true}:
 		case <-ctx.Done():
@@ -1138,8 +1234,12 @@ func (o *Orchestrator) barrier(ctx context.Context, seq uint64, c ir.Change) err
 // size, so a loaded cross-region target converges in-lane instead of
 // dropping the whole run on the first abort.
 //
-// A lane writes NO position — the coordinator's seq-frontier owns the
-// merged resume point (the ADR-0104 position relaxation). The lane never
+// A lane writes no position of its own — the coordinator's seq-frontier owns
+// the merged resume point (the ADR-0104 position relaxation). The one
+// position a lane ever writes is one the coordinator chose and claimed: a
+// mark fence's anchor, folded into the batch carrying the fenced
+// transaction's first marked change (a [FoldTicket], ADR-0190 amendment D).
+// The lane never
 // sees keyless / schema / Tx-boundary events (the coordinator's
 // routing/barrier handles those), so this loop is deliberately lean.
 //
@@ -1293,6 +1393,13 @@ func (o *Orchestrator) readLaneBatch(ctx context.Context, i, size int) (buf []La
 // storm instead of waiting out the controller's slow per-tx-killer descent).
 // committed is 0 on any error path (the run is cancelling; the cap is moot).
 func (o *Orchestrator) applyLaneBatch(ctx context.Context, lane int, ctrl ir.BatchSizeController, buf []LaneChange) (committed int, err error) {
+	// The (sub-)batch's fold ticket, if it carries one (ADR-0190 amendment D;
+	// a split hands it to the half holding its envelope). A COMMIT-step error
+	// of a fold batch is never retried in place — see CommitOutcomeUnknown.
+	fold, err := foldOf(buf)
+	if err != nil {
+		return 0, err
+	}
 	// Single change: bounded retry-in-place. A transient single-row tx-killer
 	// recovers within the budget; persistent failure (the target cannot accept
 	// even one row) is fatal — surface loudly so warm-resume / the operator can
@@ -1304,10 +1411,13 @@ func (o *Orchestrator) applyLaneBatch(ctx context.Context, lane int, ctrl ir.Bat
 			if ctx.Err() != nil {
 				return 0, ctx.Err()
 			}
-			rawErr = o.commitObserve(ctx, lane, ctrl, buf)
+			rawErr = o.commitObserve(ctx, lane, ctrl, buf, fold)
 			if rawErr == nil {
 				o.frontier.MarkCommitted(buf[0].Seq) // advance only on durable commit
 				return 1, nil
+			}
+			if fold != nil && IsCommitOutcomeUnknown(rawErr) {
+				return 0, o.foldCommitUnknownFatal(fold, rawErr)
 			}
 			if !retriable(o.la, rawErr) {
 				return 0, o.la.ClassifyError(rawErr)
@@ -1324,12 +1434,15 @@ func (o *Orchestrator) applyLaneBatch(ctx context.Context, lane int, ctrl ir.Bat
 		if ctx.Err() != nil {
 			return 0, ctx.Err()
 		}
-		rawErr = o.commitObserve(ctx, lane, ctrl, buf)
+		rawErr = o.commitObserve(ctx, lane, ctrl, buf, fold)
 		if rawErr == nil {
 			for _, e := range buf { // advance only on durable commit
 				o.frontier.MarkCommitted(e.Seq)
 			}
 			return len(buf), nil
+		}
+		if fold != nil && IsCommitOutcomeUnknown(rawErr) {
+			return 0, o.foldCommitUnknownFatal(fold, rawErr)
 		}
 		if !retriable(o.la, rawErr) {
 			return 0, o.la.ClassifyError(rawErr) // non-retriable → fatal
@@ -1371,9 +1484,9 @@ func (o *Orchestrator) applyLaneBatch(ctx context.Context, lane int, ctrl ir.Bat
 // surfaces a raw driver error lacks — observing the classified error is what
 // drives the tx-killer multiplicative decrease). Returns the RAW commit
 // error so the caller's retriable/split decision inspects the original.
-func (o *Orchestrator) commitObserve(ctx context.Context, lane int, ctrl ir.BatchSizeController, buf []LaneChange) error {
+func (o *Orchestrator) commitObserve(ctx context.Context, lane int, ctrl ir.BatchSizeController, buf []LaneChange, fold *FoldTicket) error {
 	start := time.Now()
-	rawErr := o.applyOnce(ctx, lane, buf)
+	rawErr := o.applyOnce(ctx, lane, buf, fold)
 	if ctrl != nil {
 		ctrl.ObserveBatch(ctx, time.Since(start), len(buf), o.la.ClassifyError(rawErr))
 	}
@@ -1381,14 +1494,15 @@ func (o *Orchestrator) commitObserve(ctx context.Context, lane int, ctrl ir.Batc
 }
 
 // applyOnce drives the seam's ApplyLaneBatch with the envelope buffer
-// converted to the raw []ir.Change the engine dispatches. It returns the raw
-// (unclassified) error so the caller's retry predicate inspects the original.
-func (o *Orchestrator) applyOnce(ctx context.Context, lane int, buf []LaneChange) error {
+// converted to the raw []ir.Change the engine dispatches, and buf's fold
+// ticket. It returns the raw (unclassified) error so the caller's retry
+// predicate inspects the original.
+func (o *Orchestrator) applyOnce(ctx context.Context, lane int, buf []LaneChange, fold *FoldTicket) error {
 	changes := make([]ir.Change, len(buf))
 	for i, e := range buf {
 		changes[i] = e.Change
 	}
-	_, err := o.la.ApplyLaneBatch(ctx, lane, changes)
+	_, err := o.la.ApplyLaneBatch(ctx, lane, changes, fold)
 	return err
 }
 
@@ -1425,12 +1539,40 @@ func (o *Orchestrator) maybeCheckpoint(ctx context.Context) error {
 // position relaxation: the persisted position lags the durable data but can
 // never lead it.
 func (o *Orchestrator) writeCheckpoint(ctx context.Context) error {
+	ck, ok := o.nextCheckpoint()
+	if !ok {
+		return nil
+	}
+	if err := o.la.WriteCheckpoint(ctx, ck.pos, ck.rowsApplied, ck.closedTxs); err != nil {
+		return err
+	}
+	o.checkpointWritten(ck)
+	return nil
+}
+
+// checkpoint is one position write the frontier allows: the boundary, the
+// rows_applied increment it carries, and the transactions it closes.
+type checkpoint struct {
+	seq         uint64
+	pos         ir.Position
+	rowsApplied int64
+	closedTxs   []string
+	cum         uint64
+	hasCum      bool
+}
+
+// nextCheckpoint computes the position write the frontier allows now, or
+// ok=false when there is nothing new to persist. Shared by writeCheckpoint
+// and a mark fence's fold ([Orchestrator.claimAnchor]), so the two writers
+// compute the same thing for the same boundary.
+func (o *Orchestrator) nextCheckpoint() (checkpoint, bool) {
 	pos, seq, ok := o.frontier.CheckpointPosition()
 	// Seq-monotone guard: never write a boundary at or below the last one
 	// persisted (prevents regression below a barrier's direct apply write,
-	// and skips redundant re-writes of the same point).
+	// and skips redundant re-writes of the same point). It is also what holds
+	// every coordinator checkpoint off while a claimed fold is in flight.
 	if !ok || seq <= o.lastWrittenSeq {
-		return nil
+		return checkpoint{}, false
 	}
 	// rows_applied delta: the DML that became durable (frontier ≥ seq) and is
 	// now covered by the persisted position, since the last checkpoint. cum is
@@ -1440,26 +1582,27 @@ func (o *Orchestrator) writeCheckpoint(ctx context.Context) error {
 	// the next checkpoint still computes its delta from the true baseline
 	// rather than re-counting from 0 — a missed boundary defers its rows, it
 	// never over-counts. cum is monotone in seq, so delta is never negative.
-	cum, ok := o.boundaryRowDML[seq]
-	var delta int64
-	if ok && cum > o.lastWrittenCum {
-		delta = int64(cum - o.lastWrittenCum)
+	cum, hasCum := o.boundaryRowDML[seq]
+	ck := checkpoint{seq: seq, pos: pos, closedTxs: o.closedTxsUpTo(seq), cum: cum, hasCum: hasCum}
+	if hasCum && cum > o.lastWrittenCum {
+		ck.rowsApplied = int64(cum - o.lastWrittenCum)
 	}
-	closed := o.closedTxsUpTo(seq)
-	if err := o.la.WriteCheckpoint(ctx, pos, delta, closed); err != nil {
-		return err
+	return ck, true
+}
+
+// checkpointWritten advances the persisted-checkpoint bookkeeping past ck —
+// after its write committed, or, for a fold, when the fence claims it.
+func (o *Orchestrator) checkpointWritten(ck checkpoint) {
+	o.lastWrittenSeq = ck.seq
+	if ck.hasCum {
+		o.lastWrittenCum = ck.cum
 	}
-	o.lastWrittenSeq = seq
-	if ok {
-		o.lastWrittenCum = cum
-	}
-	o.pruneBoundaryRowDML(seq)
+	o.pruneBoundaryRowDML(ck.seq)
 	for s := range o.closedTx {
-		if s <= seq {
+		if s <= ck.seq {
 			delete(o.closedTx, s)
 		}
 	}
-	return nil
 }
 
 // closedTxsUpTo lists, in seq order, the transactions whose commit lies at or

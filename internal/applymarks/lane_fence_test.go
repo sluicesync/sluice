@@ -59,24 +59,57 @@ func TestWouldMark_AgreesWithDecide(t *testing.T) {
 	}
 }
 
-func TestLaneFence(t *testing.T) {
+// TestLaneFence_AdmitsOnlyWithTicketOrAnchored pins amendment A's fence and
+// amendment D's anchored rule on the lane side: nothing before a fence; the
+// fenced transaction's marks only; and, until its fold commits, only in the
+// batch carrying the fold ticket — then in every batch once it is anchored,
+// or at once when the fence opened it anchored.
+func TestLaneFence_AdmitsOnlyWithTicketOrAnchored(t *testing.T) {
 	var f LaneFence
 	a := []Mark{{TxID: txA}, {TxID: txA}}
-	if f.Admits(a) {
+	if f.Admits(a, "") || f.Admits(a, txA) {
 		t.Fatal("the zero fence admitted marks; it must admit nothing until a transaction is fenced")
 	}
-	if !f.Admits(nil) {
+	if !f.Admits(nil, "") {
 		t.Fatal("an empty mark set is trivially admitted")
 	}
-	f.Open(txA)
-	if !f.Admits(a) {
-		t.Fatal("the fenced transaction's marks were refused")
+
+	// Fenced, not anchored: the fold's batch only.
+	f.Open(txA, false)
+	if !f.Admits(a, txA) {
+		t.Fatal("the fold's own batch was refused the fenced transaction's marks")
 	}
-	if f.Admits([]Mark{{TxID: txA}, {TxID: txB}}) {
+	if f.Admits(a, "") {
+		t.Fatal("a batch with no fold ticket admitted an unanchored transaction's marks (the anchored rule)")
+	}
+	if f.Admits(a, txB) {
+		t.Fatal("a batch carrying ANOTHER transaction's ticket admitted an unanchored transaction's marks")
+	}
+	if f.Admits([]Mark{{TxID: txA}, {TxID: txB}}, txA) {
 		t.Fatal("a set carrying another transaction's mark was admitted")
 	}
-	f.Open(txB)
-	if f.Admits(a) {
+
+	// Anchored by the fold's commit: every batch.
+	f.Anchor(txB) // the wrong transaction: no effect
+	if f.Admits(a, "") {
+		t.Fatal("anchoring another transaction anchored the fenced one")
+	}
+	f.Anchor(txA)
+	if !f.Admits(a, "") {
+		t.Fatal("an anchored transaction's marks were refused to a batch without its ticket")
+	}
+
+	// The next fence moves on; opened anchored, it admits at once.
+	f.Open(txB, true)
+	if f.Admits(a, "") || f.Admits(a, txA) {
 		t.Fatal("a transaction stayed admitted after the fence moved to the next one")
+	}
+	if !f.Admits([]Mark{{TxID: txB}}, "") {
+		t.Fatal("a transaction fenced already anchored was refused")
+	}
+	// A late Anchor of the previous transaction must not disturb it.
+	f.Anchor(txA)
+	if !f.Admits([]Mark{{TxID: txB}}, "") || f.Admits(a, "") {
+		t.Fatal("a late Anchor of the previous transaction changed the fence")
 	}
 }

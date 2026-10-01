@@ -48,6 +48,7 @@ var writeCoreClass = map[string]string{
 	"ChangeApplier.applyOneImpl":            applyorder.Helper,
 	"mysqlBatchTx.writeApplyMarks":          applyorder.Helper,
 	"mysqlBatchTx.writePosition":            applyorder.Helper,
+	"laneApplierAdapter.writeFold":          applyorder.Helper, // ADR-0190 amendment D: ApplyLaneBatch's fold batches
 	"mysqlBatchTx.applySerial":              applyorder.Helper,
 	"mysqlBatchTx.dispatch":                 applyorder.Helper,
 	"mysqlBatchTx.dispatchInsert":           applyorder.Helper,

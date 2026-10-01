@@ -47,7 +47,7 @@ func (s *countingSeam) RouteForChange(_ context.Context, c ir.Change) (Route, bo
 	return Route{Qualified: "ks.t", PKVals: []any{id}, Scope: RouteScopeKey}, true, nil
 }
 
-func (s *countingSeam) ApplyLaneBatch(_ context.Context, _ int, batch []ir.Change) (int, error) {
+func (s *countingSeam) ApplyLaneBatch(_ context.Context, _ int, batch []ir.Change, _ *FoldTicket) (int, error) {
 	return len(batch), nil
 }
 
@@ -71,7 +71,7 @@ func (s *countingSeam) SkipsRowChange(_ context.Context, c ir.Change) bool {
 }
 
 func (s *countingSeam) ApplyMarkTx(context.Context, ir.Change) string { return "" }
-func (s *countingSeam) ApplyMarksFenced(string)                       {}
+func (s *countingSeam) ApplyMarksFenced(string, bool)                 {}
 
 func (s *countingSeam) total() int64 {
 	s.mu.Lock()

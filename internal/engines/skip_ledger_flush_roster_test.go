@@ -35,9 +35,10 @@ type skipFlushEntry struct {
 }
 
 // skipLedgerFlushRoster is fail-by-default over every function under
-// internal/engines/{mysql,postgres} whose body calls writePositionTx or
-// writePositionPipelined — i.e. every place a CDC resume position can become
-// durable. Keys are "<pkgdir>.<RecvType>.<FuncName>" ("-" for a plain
+// internal/engines/{mysql,postgres} whose body calls writePositionTx,
+// writePositionPipelined or mysqlBatchTx.writePosition — i.e. every place a
+// CDC resume position can become durable. Keys are
+// "<pkgdir>.<RecvType>.<FuncName>" ("-" for a plain
 // function's receiver).
 //
 // The invariant this holds (appliershared/skipped_tables.go, C-11/H-4): the
@@ -73,9 +74,20 @@ var skipLedgerFlushRoster = map[string]skipFlushEntry{
 	},
 	"mysql.mysqlBatchTx.writePosition": {
 		flushExempt,
-		"in-tx helper: flushes pending DATA, not the skip ledger. Its only production driver is the batch " +
+		"in-tx helper: flushes pending DATA, not the skip ledger. Its production drivers are the batch " +
 			"loop's WritePosition closure (mysql.ChangeApplier.batchConfig), which calls flushSkippedTables " +
-			"after this returns and before Commit — held mechanically by the companion check below.",
+			"after this returns and before Commit, and the lane fold (mysql.laneApplierAdapter.writeFold), " +
+			"which flushes before it — both found by the writePosition marker and graded below.",
+	},
+	"mysql.ChangeApplier.batchConfig": {
+		flushesTheLedger,
+		"the batch-loop WritePosition closure calls mysqlBatchTx.writePosition, then flushSkippedTables, " +
+			"before the batch commits.",
+	},
+	"mysql.laneApplierAdapter.writeFold": {
+		flushesTheLedger,
+		"ADR-0190 amendment D: a mark fence's position folded into a lane batch; the flush precedes the " +
+			"position, as in WriteCheckpoint.",
 	},
 
 	// --- Postgres ---
@@ -95,6 +107,15 @@ var skipLedgerFlushRoster = map[string]skipFlushEntry{
 	"postgres.laneApplierAdapter.WriteCheckpoint": {
 		flushesTheLedger,
 		"ADR-0104 frontier checkpoint; flush precedes it.",
+	},
+	"postgres.laneApplierAdapter.queueFold": {
+		flushesTheLedger,
+		"ADR-0190 amendment D: a mark fence's position folded into a pipelined lane batch; the flush " +
+			"precedes the queued position, as in WriteCheckpoint.",
+	},
+	"postgres.laneApplierAdapter.execFold": {
+		flushesTheLedger,
+		"the same fold on the serial fall-back's *sql.Tx; the flush precedes the position.",
 	},
 	"postgres.ChangeApplier.WritePosition": {
 		flushExempt,
@@ -118,8 +139,9 @@ var skipFlushCompanionMustFlush = []string{
 //
 // A function qualifies when a non-test file under internal/engines/mysql or
 // internal/engines/postgres declares it and its body (closures included)
-// calls writePositionTx or writePositionPipelined. The writePositionTx
-// definitions themselves are excluded (they are the marker, not a caller).
+// calls writePositionTx, writePositionPipelined or writePosition. The
+// writePositionTx definitions themselves are excluded (they are the marker,
+// not a caller).
 // The grade is syntactic presence of a flushSkippedTables call in the same
 // declaration — it proves a flush is WIRED at the boundary, not that its
 // ordering is correct; ordering is what the per-path pins and comments at
@@ -225,7 +247,7 @@ type posWriteSite struct {
 func (s posWriteSite) String() string { return "declared at " + s.at }
 
 // findPositionWritingFuncs walks internal/engines/{mysql,postgres} and returns
-// every function whose body calls writePositionTx or writePositionPipelined,
+// every function whose body calls writePositionTx, writePositionPipelined or writePosition,
 // keyed "<pkgdir>.<RecvType>.<FuncName>". FuncDecls NAMED writePositionTx are
 // excluded (definitions, not callers).
 func findPositionWritingFuncs(t *testing.T) map[string]posWriteSite {
@@ -235,7 +257,10 @@ func findPositionWritingFuncs(t *testing.T) map[string]posWriteSite {
 		if fn.Name.Name == "writePositionTx" {
 			return
 		}
-		if !bodyCallsAny(fn.Body, "writePositionTx", "writePositionPipelined") {
+		// writePosition is mysqlBatchTx's in-transaction helper: its callers
+		// write a position as surely as writePositionTx's (the lane fold,
+		// ADR-0190 amendment D, was the second), so they are found too.
+		if !bodyCallsAny(fn.Body, "writePositionTx", "writePositionPipelined", "writePosition") {
 			return
 		}
 		out[key] = posWriteSite{at: at, callsFlush: bodyCallsAny(fn.Body, "flushSkippedTables")}

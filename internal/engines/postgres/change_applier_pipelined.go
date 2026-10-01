@@ -430,12 +430,23 @@ func (a *ChangeApplier) writePositionPipelined(b *pgxBatchTx, streamID, token st
 // Every exec error is loud; the C-11 unknown-table skip resolves at
 // queue-build time in dispatchPipelined, never here (see the Truncate
 // arm for why result-read absorption was unsound).
-func (a *ChangeApplier) flushAndCommit(b *pgxBatchTx) (err error) {
+func (a *ChangeApplier) flushAndCommit(b *pgxBatchTx) error {
+	_, err := a.flushAndCommitStep(b)
+	return err
+}
+
+// flushAndCommitStep is [ChangeApplier.flushAndCommit] reporting, with a
+// non-nil error, whether it was raised by the COMMIT itself (atCommit) —
+// after every statement executed, so with an outcome the caller cannot know
+// — rather than by the flush, which leaves nothing durable. A lane batch
+// carrying an ADR-0190 fold ticket needs the difference
+// (laneapply.CommitOutcomeUnknown).
+func (a *ChangeApplier) flushAndCommitStep(b *pgxBatchTx) (atCommit bool, err error) {
 	defer b.release()
 
 	if execErr := a.sendBatchUnderDeadline(b); execErr != nil {
 		_ = b.tx.Rollback(context.Background())
-		return classifyApplierError(execErr)
+		return false, classifyApplierError(execErr)
 	}
 
 	// Commit under the per-exec deadline (Bug 56 / v0.52.1: a half-closed
@@ -447,9 +458,9 @@ func (a *ChangeApplier) flushAndCommit(b *pgxBatchTx) (err error) {
 	commitErr := b.tx.Commit(ctx)
 	cancel()
 	if commitErr != nil {
-		return classifyApplierError(fmt.Errorf("postgres: applier: commit: %w", commitErr))
+		return true, classifyApplierError(fmt.Errorf("postgres: applier: commit: %w", commitErr))
 	}
-	return nil
+	return false, nil
 }
 
 // sendBatchUnderDeadline flushes the accumulated batch (data statements +

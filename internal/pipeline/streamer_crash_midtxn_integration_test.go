@@ -224,7 +224,7 @@ func mysqlCrashSource(engine, dsn string) crashSource {
 		dsn:    dsn,
 		driver: "mysql",
 		setup: `
-			DROP TABLE IF EXISTS rs; DROP TABLE IF EXISTS po; DROP TABLE IF EXISTS kl;
+			DROP TABLE IF EXISTS rs; DROP TABLE IF EXISTS po; DROP TABLE IF EXISTS ru; DROP TABLE IF EXISTS rv; DROP TABLE IF EXISTS kl;
 			CREATE TABLE rs (
 				id  BIGINT NOT NULL PRIMARY KEY,
 				u   VARCHAR(32) NULL,
@@ -238,7 +238,11 @@ func mysqlCrashSource(engine, dsn string) crashSource {
 			UPDATE rs SET u = 'x' WHERE id = 5;
 			UPDATE rs SET u = 'y' WHERE id = 6;
 			CREATE TABLE po (id BIGINT NOT NULL PRIMARY KEY, v VARCHAR(32) NOT NULL) ENGINE=InnoDB;
-			INSERT INTO po (id, v) VALUES (1, 'a'), (2, 'b');
+			INSERT INTO po (id, v) VALUES (1, 'a'), (2, 'b'), ` + crashFoldPOSeed + `;
+			CREATE TABLE ru (id BIGINT NOT NULL PRIMARY KEY, u VARCHAR(32) NULL, v VARCHAR(32) NOT NULL, UNIQUE KEY ru_u (u)) ENGINE=InnoDB;
+			CREATE TABLE rv (id BIGINT NOT NULL PRIMARY KEY, u VARCHAR(32) NULL, v VARCHAR(32) NOT NULL, UNIQUE KEY rv_u (u)) ENGINE=InnoDB;
+			INSERT INTO ru (id, v) VALUES (9, 'seed');
+			INSERT INTO rv (id, v) VALUES (9, 'seed');
 			CREATE TABLE kl (k INT NOT NULL, v VARCHAR(32) NOT NULL) ENGINE=InnoDB;
 			INSERT INTO kl (k, v) VALUES (0, 'seed');`,
 		exec: func(t *testing.T, stmts string) { applyDDLMySQL(t, dsn, stmts) },
@@ -258,7 +262,7 @@ func pgCrashSource(dsn string) crashSource {
 		dsn:    dsn,
 		driver: "pgx",
 		setup: `
-			DROP TABLE IF EXISTS rs, po, kl;
+			DROP TABLE IF EXISTS rs, po, ru, rv, kl;
 			CREATE TABLE rs (
 				id  BIGINT PRIMARY KEY,
 				u   VARCHAR(32) NULL CONSTRAINT rs_u UNIQUE,
@@ -269,7 +273,7 @@ func pgCrashSource(dsn string) crashSource {
 			UPDATE rs SET u = 'x' WHERE id = 5;
 			UPDATE rs SET u = 'y' WHERE id = 6;
 			CREATE TABLE po (id BIGINT PRIMARY KEY, v VARCHAR(32) NOT NULL);
-			INSERT INTO po (id, v) VALUES (1, 'a'), (2, 'b');
+			INSERT INTO po (id, v) VALUES (1, 'a'), (2, 'b'), ` + crashFoldPOSeed + `;` + pgCrashFoldTables + `
 			CREATE TABLE kl (k INT NOT NULL, v VARCHAR(32) NOT NULL);
 			ALTER TABLE kl REPLICA IDENTITY FULL;
 			INSERT INTO kl (k, v) VALUES (0, 'seed');`,
@@ -462,7 +466,7 @@ func pgTriggerCrashSource(dsn string) crashSource {
 	src := pgCrashSource(dsn)
 	src.engine = pgtrigger.EngineName
 	src.setup = `
-		DROP TABLE IF EXISTS rs, po, kl;
+		DROP TABLE IF EXISTS rs, po, ru, rv, kl;
 		CREATE TABLE rs (
 			id  BIGINT PRIMARY KEY,
 			u   VARCHAR(32) NULL CONSTRAINT rs_u UNIQUE,
@@ -473,7 +477,7 @@ func pgTriggerCrashSource(dsn string) crashSource {
 		UPDATE rs SET u = 'x' WHERE id = 5;
 		UPDATE rs SET u = 'y' WHERE id = 6;
 		CREATE TABLE po (id BIGINT PRIMARY KEY, v VARCHAR(32) NOT NULL);
-		INSERT INTO po (id, v) VALUES (1, 'a'), (2, 'b');`
+		INSERT INTO po (id, v) VALUES (1, 'a'), (2, 'b'), ` + crashFoldPOSeed + `;` + pgCrashFoldTables
 	src.configure = func(*testing.T, *Streamer, string) func() { return func() {} }
 	src.ddlMid, src.dropBefore, src.dropMid = "", "", ""
 	src.noKeyless = true
@@ -481,7 +485,7 @@ func pgTriggerCrashSource(dsn string) crashSource {
 		t.Helper()
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
-		if _, err := pgtrigger.Setup(ctx, dsn, pgtrigger.SetupOptions{Tables: []string{"rs", "po"}, Schema: "public"}); err != nil {
+		if _, err := pgtrigger.Setup(ctx, dsn, pgtrigger.SetupOptions{Tables: []string{"rs", "po", "ru", "rv"}, Schema: "public"}); err != nil {
 			t.Fatalf("pgtrigger.Setup: %v", err)
 		}
 	}
@@ -708,6 +712,9 @@ func runCrashMidTxnSuite(t *testing.T, src crashSource, tgt resendTarget, pins c
 	t.Run("lane_post_commit_window_default", func(t *testing.T) {
 		runCrashLanePostCommitWindow(t, src, tgt, false)
 	})
+	// ADR-0190 amendment D: the fold's window, its anchored rule, the mixed
+	// barrier orders and a lane-count change after a fold.
+	crashFoldCells(t, src, tgt)
 	// A schema event inside the interrupted transaction (the 2026-09-28
 	// CRITICAL): the serial batched path is the one that regressed; lanes and
 	// per-change are the controls.
@@ -754,8 +761,9 @@ func newCrashStreamFixture(t *testing.T, src crashSource, tgt resendTarget, cell
 		src.afterSetup(t)
 	}
 	tgt.drop(t)
-	execTargetQuiet(tgt, "DROP TABLE IF EXISTS po")
-	execTargetQuiet(tgt, "DROP TABLE IF EXISTS kl")
+	for _, table := range []string{"po", "ru", "rv", "kl"} {
+		execTargetQuiet(tgt, "DROP TABLE IF EXISTS "+table)
+	}
 
 	logBuf := &logcapture.Buffer{}
 	prev := slog.Default()
@@ -1129,6 +1137,11 @@ func runCrashLanePostCommitWindow(t *testing.T, src crashSource, tgt resendTarge
 		t.Fatal("T1 never reached the target: the window was not built, so this cell would pass vacuously")
 	}
 	time.Sleep(2 * time.Second) // let T2 reach the fence (or, without one, its lane)
+	// Amendment D: T2's position rides its own lane batch (a fold), so the
+	// writer the held control row blocks is a LANE transaction that has
+	// already deleted row 7 — not a coordinator checkpoint, which touches
+	// only control tables. The target's own lock view is the evidence.
+	foldBlocked := exactlyOnce && waitResendSoft(run1, 15*time.Second, func() bool { return lockWaiterHolds(tgt, "rs") })
 	cancel1()
 	select {
 	case <-run1:
@@ -1143,6 +1156,15 @@ func runCrashLanePostCommitWindow(t *testing.T, src crashSource, tgt resendTarge
 			posBefore, posAfterKill)
 	}
 	if exactlyOnce {
+		if !foldBlocked {
+			t.Error("no transaction holding a lock on rs waited on the stream's control row: T2's fold was not the blocked " +
+				"writer (amendment D folds T2's position into the lane batch that deletes row 7)")
+		}
+		// No mark lands without its position: T2's delete, its mark and its
+		// position were one transaction, and it never committed.
+		if n := countTarget(tgt, "SELECT COUNT(*) FROM rs WHERE id = 7 AND v = 't1'"); n != 1 {
+			t.Errorf("row 7 with T1's value is %d rows at the kill; want 1 — T2's delete became durable without its position", n)
+		}
 		// T1's update is a marked lane change the fence admitted (its
 		// checkpoint had nothing new to write under the lock), so its mark
 		// must be on the target: without it this cell would pass on the
@@ -1348,7 +1370,11 @@ func assertCrashConverged(t *testing.T, src crashSource, tgt resendTarget) {
 	if diff := diffResendRows(dumpCrashSource(t, src), tgt.dump(t)); diff != "" {
 		t.Errorf("rs diverged after the restart:\n%s", diff)
 	}
-	queries := []string{"SELECT CONCAT(id, '|', v) FROM po"}
+	queries := []string{
+		"SELECT CONCAT(id, '|', v) FROM po",
+		"SELECT CONCAT(id, '|', COALESCE(u, '<null>'), '|', v) FROM ru",
+		"SELECT CONCAT(id, '|', COALESCE(u, '<null>'), '|', v) FROM rv",
+	}
 	if !src.noKeyless {
 		queries = append(queries, "SELECT CONCAT(k, '|', v) FROM kl")
 	}

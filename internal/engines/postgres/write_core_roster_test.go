@@ -19,6 +19,7 @@ import (
 var controlTxWriters = []string{
 	"execApplyMarksTx", "queueApplyMarks", "writePositionTx", "writePositionPipelined",
 	"writeSchemaVersion", "buildWriteSchemaVersionSQL", "buildWritePositionSQL", "applyMarkStatements",
+	"queueFold", "execFold",
 }
 
 // txFuncClass classifies every function in the package that takes a
@@ -29,6 +30,8 @@ var txFuncClass = map[string]string{
 	"ChangeApplier.execApplyMarksTx":            "control",
 	"ChangeApplier.queueApplyMarks":             "control",
 	"ChangeApplier.writePositionPipelined":      "control",
+	"laneApplierAdapter.queueFold":              "control", // ADR-0190 amendment D: marks, then the fold's position
+	"laneApplierAdapter.execFold":               "control", // the same on the serial fall-back's *sql.Tx
 	"writePositionTx":                           "control",
 	"writeSchemaVersion":                        "control",
 	"compactSchemaHistoryBelow":                 "neutral", // runs on a.db, never inside an apply transaction
@@ -39,6 +42,7 @@ var txFuncClass = map[string]string{
 	"ChangeApplier.forceSynchronousCommitOn":    "neutral",
 	"ChangeApplier.commitWithTimeout":           "neutral",
 	"ChangeApplier.flushAndCommit":              "neutral", // sends the queue in queue order, then commits
+	"ChangeApplier.flushAndCommitStep":          "neutral", // the same, reporting whether the COMMIT raised the error
 	"ChangeApplier.sendBatchUnderDeadline":      "neutral",
 	"ChangeApplier.conflictKeyFor":              "neutral",
 	"loadConflictKey":                           "neutral",
@@ -58,6 +62,8 @@ var writeCoreClass = map[string]string{
 	"ChangeApplier.execApplyMarksTx":          applyorder.Helper,
 	"ChangeApplier.queueApplyMarks":           applyorder.Helper,
 	"ChangeApplier.writePositionPipelined":    applyorder.Helper,
+	"laneApplierAdapter.queueFold":            applyorder.Helper, // reached by ApplyLaneBatch's fold batches
+	"laneApplierAdapter.execFold":             applyorder.Helper, // reached by applyLaneBatchSerial's
 	"ChangeApplier.dispatch":                  applyorder.Helper,
 	"ChangeApplier.dispatchPipelined":         applyorder.Helper,
 	"ChangeApplier.applyOneImpl":              applyorder.Helper,

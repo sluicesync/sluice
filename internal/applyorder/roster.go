@@ -174,6 +174,32 @@ func TakingAny(funcs map[string]*Func, typeNames ...string) []string {
 	return out
 }
 
+// Reaching returns the keys of every function that calls one of targets, by
+// bare name, directly or through other functions of the package — the same
+// over-approximating bare-name matching as [ParseFuncs].
+func Reaching(funcs map[string]*Func, targets []string) map[string]bool {
+	reach := map[string]bool{}
+	names := map[string]bool{}
+	for _, t := range targets {
+		names[t] = true
+	}
+	for changed := true; changed; {
+		changed = false
+		for key, fn := range funcs {
+			if reach[key] {
+				continue
+			}
+			for callee := range fn.Calls {
+				if names[callee] {
+					reach[key], names[bareName(key)], changed = true, true, true
+					break
+				}
+			}
+		}
+	}
+	return reach
+}
+
 // Cores is the set of write-core names a classification names.
 func Cores(class map[string]string) map[string]bool {
 	out := map[string]bool{}

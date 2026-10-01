@@ -18,6 +18,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/applyorder"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/laneapply"
 )
 
 // TestWriteCoreStatementOrder is GC-41 (c)'s per-core pin on a real MySQL:
@@ -104,6 +105,10 @@ func TestWriteCoreStatementOrder(t *testing.T) {
 		cores     []string
 		wantMixed int // mixed transactions the run must produce; 0 = control-only
 		do        func() error
+		// foldLast: every committed transaction writing the position must
+		// end with it — the ADR-0190 amendment D fold writes the position
+		// LAST, so the stream's control row is locked only across COMMIT.
+		foldLast bool
 	}
 	runs := []run{{
 		// Apply: a change outside a source transaction (data + marks +
@@ -160,14 +165,32 @@ func TestWriteCoreStatementOrder(t *testing.T) {
 			}
 			a.exactlyOnceLanes = true
 			defer func() { a.exactlyOnceLanes = false }()
-			lane.fence.Open("l-1")
-			if _, err := lane.ApplyLaneBatch(ctx, 0, []ir.Change{item("l-1", 1), item("l-1", 2)}); err != nil {
+			lane.fence.Open("l-1", true)
+			if _, err := lane.ApplyLaneBatch(ctx, 0, []ir.Change{item("l-1", 1), item("l-1", 2)}, nil); err != nil {
 				return err
 			}
 			if err := lane.WriteCheckpoint(ctx, pos(), 2, []string{"l-1"}); err != nil {
 				return err
 			}
 			return lane.ApplyBarrierChange(ctx, logRow("l-2", 1))
+		},
+	}, {
+		// A fold batch (ADR-0190 amendment D): the fenced transaction's rows,
+		// its marks with the closed transaction's deleted, then the anchor
+		// position — one mixed transaction, data first, position last.
+		cores:     []string{"lane-batch"},
+		wantMixed: 1,
+		foldLast:  true,
+		do: func() error {
+			if err := a.startApplyMarks(ctx, testStreamID); err != nil {
+				return err
+			}
+			a.exactlyOnceLanes = true
+			defer func() { a.exactlyOnceLanes = false }()
+			lane.fence.Open("l-3", false)
+			_, err := lane.ApplyLaneBatch(ctx, 0, []ir.Change{item("l-3", 1), item("l-3", 2)},
+				&laneapply.FoldTicket{Tx: "l-3", Pos: pos(), RowsApplied: 1, ClosedTxs: []string{"l-2"}})
+			return err
 		},
 	}}
 
@@ -191,6 +214,11 @@ func TestWriteCoreStatementOrder(t *testing.T) {
 			}
 			if tx.Has(applyorder.Control) {
 				control++
+			}
+			if r.foldLast && tx.Mixed() {
+				if last := tx.Stmts[len(tx.Stmts)-1]; !strings.Contains(last, "sluice_cdc_state") {
+					t.Errorf("%s: a fold transaction did not write the position last (it ended with %q)\n  statements: %q", name, last, tx.Stmts)
+				}
 			}
 		}
 		if mixed < r.wantMixed {

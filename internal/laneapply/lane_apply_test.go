@@ -64,7 +64,7 @@ func (s *testSeam) RouteForChange(context.Context, ir.Change) (Route, bool, erro
 	return Route{}, false, nil
 }
 
-func (s *testSeam) ApplyLaneBatch(ctx context.Context, _ int, batch []ir.Change) (int, error) {
+func (s *testSeam) ApplyLaneBatch(ctx context.Context, _ int, batch []ir.Change, _ *FoldTicket) (int, error) {
 	if err := s.commit(ctx, batch); err != nil {
 		return 0, err
 	}
@@ -80,7 +80,7 @@ func (s *testSeam) ApplyBarrierChange(context.Context, ir.Change) error { return
 func (s *testSeam) SkipsRowChange(context.Context, ir.Change) bool { return false }
 
 func (s *testSeam) ApplyMarkTx(context.Context, ir.Change) string { return "" }
-func (s *testSeam) ApplyMarksFenced(string)                       {}
+func (s *testSeam) ApplyMarksFenced(string, bool)                 {}
 
 // fakeLaneController is a deterministic [ir.BatchSizeController] stand-in for
 // the per-lane AIMD pins: NextBatchSize returns the current size; ObserveBatch
@@ -447,7 +447,7 @@ func (s *routingSeam) RouteForChange(context.Context, ir.Change) (Route, bool, e
 	return Route{Qualified: "ks.t", PKVals: []any{int64(1)}, Scope: RouteScopeKey}, true, nil
 }
 
-func (s *routingSeam) ApplyLaneBatch(ctx context.Context, _ int, batch []ir.Change) (int, error) {
+func (s *routingSeam) ApplyLaneBatch(ctx context.Context, _ int, batch []ir.Change, _ *FoldTicket) (int, error) {
 	if err := s.commit(ctx, batch); err != nil {
 		return 0, err
 	}
@@ -462,7 +462,7 @@ func (s *routingSeam) WriteCheckpoint(context.Context, ir.Position, int64, []str
 func (s *routingSeam) ApplyBarrierChange(context.Context, ir.Change) error { return nil }
 func (s *routingSeam) SkipsRowChange(context.Context, ir.Change) bool      { return false }
 func (s *routingSeam) ApplyMarkTx(context.Context, ir.Change) string       { return "" }
-func (s *routingSeam) ApplyMarksFenced(string)                             {}
+func (s *routingSeam) ApplyMarksFenced(string, bool)                       {}
 
 // TestLaneApply_Run_TargetFailureNotMaskedAsCtxCancel is THE regression pin:
 // a lane whose target write fails (a non-retriable connection error here)

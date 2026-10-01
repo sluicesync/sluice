@@ -35,7 +35,7 @@ func (s *recordingSeam) RouteForChange(_ context.Context, c ir.Change) (Route, b
 	return Route{}, false, nil
 }
 
-func (s *recordingSeam) ApplyLaneBatch(_ context.Context, _ int, batch []ir.Change) (int, error) {
+func (s *recordingSeam) ApplyLaneBatch(_ context.Context, _ int, batch []ir.Change, _ *FoldTicket) (int, error) {
 	return len(batch), nil
 }
 
@@ -60,7 +60,7 @@ func (s *recordingSeam) SkipsRowChange(context.Context, ir.Change) bool { return
 
 // No apply marks: the stub stream carries no identity.
 func (s *recordingSeam) ApplyMarkTx(context.Context, ir.Change) string { return "" }
-func (s *recordingSeam) ApplyMarksFenced(string)                       {}
+func (s *recordingSeam) ApplyMarksFenced(string, bool)                 {}
 
 func (s *recordingSeam) lastCheckpoint() (string, bool) {
 	s.mu.Lock()

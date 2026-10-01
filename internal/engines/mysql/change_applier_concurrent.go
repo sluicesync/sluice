@@ -320,8 +320,9 @@ func (a *ChangeApplier) tableHasNonPKUniqueIndex(ctx context.Context, schema, ta
 // ApplyLaneBatch dispatches every change in batch onto a single lane
 // transaction and commits it (the body of the GA commitLaneBatch). Redaction
 // + shard-stamp happen FIRST, in the SAME order the serial RunOneBatch path
-// uses, so value encoding is byte-identical; the lane writes NO position (the
-// orchestrator's frontier owns it). Returns len(batch) on success, the RAW
+// uses, so value encoding is byte-identical; the lane writes no position of
+// its own (the orchestrator's frontier owns it; a fold ticket's is the one
+// exception, below). Returns len(batch) on success, the RAW
 // (unclassified) error on failure so the orchestrator's retry predicate can
 // inspect it; on any failure the tx is rolled back. The `lane` index is
 // accepted for the seam contract but unused by the MySQL adapter: the lane
@@ -340,17 +341,24 @@ func (a *ChangeApplier) tableHasNonPKUniqueIndex(ctx context.Context, schema, ta
 // reuses buildMultiRowInsertSQL / buildMultiRowDeleteSQL (byte-identical value
 // binding to the serial single-row path).
 //
+// A batch carrying a fold ticket (ADR-0190 amendment D) also writes the mark
+// fence's position, last, in this same transaction — see writeFold.
+//
 // The *sql.Tx is rolled back on every error path and committed via
 // commitWithTimeout on success; sqlclosecheck can't track that
 // commit-or-rollback discipline across the dispatch loop, so it's suppressed.
 //
 //nolint:sqlclosecheck
-func (la *laneApplierAdapter) ApplyLaneBatch(ctx context.Context, _ int, batch []ir.Change) (int, error) {
+func (la *laneApplierAdapter) ApplyLaneBatch(ctx context.Context, _ int, batch []ir.Change, fold *laneapply.FoldTicket) (int, error) {
 	tx, err := la.laneDB.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, fmt.Errorf("mysql: applier: lane begin tx: %w", err)
 	}
 	btx := &mysqlBatchTx{a: la.a, tx: tx, ctx: ctx}
+	foldTx := ""
+	if fold != nil {
+		foldTx = fold.Tx
+	}
 	for _, c := range batch {
 		if err := la.a.redactChange(ctx, c); err != nil {
 			_ = tx.Rollback()
@@ -360,8 +368,9 @@ func (la *laneApplierAdapter) ApplyLaneBatch(ctx context.Context, _ int, batch [
 		// ADR-0190: a change the apply marks prove already applied is
 		// dropped; an applied one writes its marks in this transaction —
 		// only with --exactly-once-lanes (amendment C), and only those of
-		// the transaction the orchestrator's mark fence cleared (amendment
-		// A, applymarks.LaneFence). Without it the change still CHECKS.
+		// the transaction the orchestrator's mark fence cleared, once it is
+		// anchored or in the batch that anchors it (amendments A and D,
+		// applymarks.LaneFence). Without it the change still CHECKS.
 		decision, err := la.a.decideApplyMarks(ctx, c)
 		if err != nil {
 			_ = tx.Rollback()
@@ -381,14 +390,19 @@ func (la *laneApplierAdapter) ApplyLaneBatch(ctx context.Context, _ int, batch [
 			return 0, err
 		}
 		if !skippedTable && la.a.exactlyOnceLanes {
-			btx.marks.Add(la.fence.Admitted(decision.Marks))
+			btx.marks.Add(la.fence.Admitted(decision.Marks, foldTx))
 		}
 	}
 	// Flush the trailing coalesced run (upsert-run or delete-run; ADR-0140)
 	// so all of the lane's data is in this tx, and only then its apply marks
-	// (data before control, GC-41 (c)). The lane writes no position — the
-	// orchestrator's frontier checkpoint owns it.
-	if err := btx.writeApplyMarks(ctx, false); err != nil {
+	// (data before control, GC-41 (c)). The lane writes no position of its
+	// own — the orchestrator's frontier checkpoint owns it — except a fold's.
+	if fold != nil {
+		if err := la.writeFold(ctx, btx, fold); err != nil {
+			_ = tx.Rollback()
+			return 0, err
+		}
+	} else if err := btx.writeApplyMarks(ctx, false); err != nil {
 		_ = tx.Rollback()
 		return 0, err
 	}
@@ -409,14 +423,45 @@ func (la *laneApplierAdapter) ApplyLaneBatch(ctx context.Context, _ int, batch [
 		}
 	}
 	if err := la.a.commitWithTimeout(tx); err != nil {
-		return 0, fmt.Errorf("mysql: applier: lane commit: %w", err)
+		err = fmt.Errorf("mysql: applier: lane commit: %w", err)
+		if fold != nil {
+			return 0, laneapply.CommitOutcomeUnknown(err)
+		}
+		return 0, err
 	}
 	// Before the lane returns — so before the orchestrator advances the
 	// frontier past these changes and a checkpoint can close their
 	// transaction — record the marks as durable, or that checkpoint would not
-	// know to delete them.
+	// know to delete them; and anchor a fold's transaction, so other lanes
+	// may now write its marks.
 	btx.marks.Committed(&la.a.marks)
+	if fold != nil {
+		la.fence.Anchor(fold.Tx)
+	}
 	return len(batch), nil
+}
+
+// writeFold writes a fold ticket's statements on the lane batch's own
+// transaction, after its rows (ADR-0190 amendment D): the apply marks with
+// the closed transactions' deleted — the plan WriteCheckpoint runs — and then
+// the anchor position with its rows_applied increment, LAST, so the stream's
+// control row is locked only across COMMIT. Data before control (GC-41 (c)):
+// writeApplyMarks drains the coalesced runs first.
+//
+// The skip ledger is flushed first, as WriteCheckpoint flushes it (H-4): it
+// must be durable before a position that covers the skips it records.
+func (la *laneApplierAdapter) writeFold(ctx context.Context, btx *mysqlBatchTx, fold *laneapply.FoldTicket) error {
+	if err := la.a.flushSkippedTables(ctx); err != nil {
+		return err
+	}
+	la.a.marks.CloseTxs(fold.ClosedTxs)
+	if err := btx.writeApplyMarks(ctx, true); err != nil {
+		return err
+	}
+	if err := btx.writePosition(ctx, la.streamID, fold.Pos.Token, fold.RowsApplied); err != nil {
+		return fmt.Errorf("mysql: applier: fold position write: %w", err)
+	}
+	return nil
 }
 
 // ApplyMarkTx implements [laneapply.LaneApplier].
@@ -425,7 +470,9 @@ func (la *laneApplierAdapter) ApplyMarkTx(ctx context.Context, c ir.Change) stri
 }
 
 // ApplyMarksFenced implements [laneapply.LaneApplier].
-func (la *laneApplierAdapter) ApplyMarksFenced(txID string) { la.fence.Open(txID) }
+func (la *laneApplierAdapter) ApplyMarksFenced(txID string, anchored bool) {
+	la.fence.Open(txID, anchored)
+}
 
 // ClassifyError maps a raw lane error to the engine's classified error so the
 // orchestrator can derive retriability (the single source of truth — a Vitess

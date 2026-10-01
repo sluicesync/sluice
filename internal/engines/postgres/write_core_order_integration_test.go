@@ -18,6 +18,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/applyorder"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/laneapply"
 )
 
 // TestWriteCoreStatementOrder is the MySQL GC-41 (c) pin's Postgres twin:
@@ -122,6 +123,10 @@ func TestWriteCoreStatementOrder(t *testing.T) {
 		cores     []string
 		wantMixed int // mixed transactions the run must produce; 0 = control-only
 		do        func() error
+		// foldLast: every committed mixed transaction must end with the
+		// position — the ADR-0190 amendment D fold writes it LAST, so the
+		// stream's control row is locked only across COMMIT.
+		foldLast bool
 	}
 	runs := []run{{
 		name:      "serial",
@@ -170,17 +175,41 @@ func TestWriteCoreStatementOrder(t *testing.T) {
 			}
 			a.exactlyOnceLanes = true
 			defer func() { a.exactlyOnceLanes = false }()
-			lane.fence.Open("l-1")
-			if _, err := lane.ApplyLaneBatch(ctx, 0, []ir.Change{item("l-1", 1), item("l-1", 2)}); err != nil {
+			lane.fence.Open("l-1", true)
+			if _, err := lane.ApplyLaneBatch(ctx, 0, []ir.Change{item("l-1", 1), item("l-1", 2)}, nil); err != nil {
 				return err
 			}
-			if _, err := lane.applyLaneBatchSerial(ctx, []ir.Change{item("l-1", 3)}); err != nil {
+			if _, err := lane.applyLaneBatchSerial(ctx, []ir.Change{item("l-1", 3)}, nil); err != nil {
 				return err
 			}
 			if err := lane.WriteCheckpoint(ctx, pos(), 3, []string{"l-1"}); err != nil {
 				return err
 			}
 			return lane.ApplyBarrierChange(ctx, logRow("l-2", 1))
+		},
+	}, {
+		// Fold batches (ADR-0190 amendment D) on both lane write cores: the
+		// fenced transaction's rows, its marks with the closed transaction's
+		// deleted, then the anchor position — data first, position last.
+		name:      "lane folds",
+		cores:     []string{"lane-batch", "lane-batch-serial"},
+		wantMixed: 2,
+		foldLast:  true,
+		do: func() error {
+			if err := a.startApplyMarks(ctx, testStreamID); err != nil {
+				return err
+			}
+			a.exactlyOnceLanes = true
+			defer func() { a.exactlyOnceLanes = false }()
+			lane.fence.Open("l-3", false)
+			if _, err := lane.ApplyLaneBatch(ctx, 0, []ir.Change{item("l-3", 1), item("l-3", 2)},
+				&laneapply.FoldTicket{Tx: "l-3", Pos: pos(), RowsApplied: 1, ClosedTxs: []string{"l-2"}}); err != nil {
+				return err
+			}
+			lane.fence.Open("l-4", false)
+			_, err := lane.applyLaneBatchSerial(ctx, []ir.Change{item("l-4", 1)},
+				&laneapply.FoldTicket{Tx: "l-4", Pos: pos(), RowsApplied: 2, ClosedTxs: []string{"l-3"}})
+			return err
 		},
 	}}
 
@@ -203,6 +232,11 @@ func TestWriteCoreStatementOrder(t *testing.T) {
 			}
 			if tx.Has(applyorder.Control) {
 				control++
+			}
+			if r.foldLast && tx.Mixed() {
+				if last := tx.Stmts[len(tx.Stmts)-1]; !strings.Contains(last, "sluice_cdc_state") {
+					t.Errorf("%s: a fold transaction did not write the position last (it ended with %q)\n  statements: %q", r.name, last, tx.Stmts)
+				}
 			}
 		}
 		if mixed < r.wantMixed {
