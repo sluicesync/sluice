@@ -349,7 +349,10 @@ func mariadbGTIDMaxSeqs(set string) map[string]uint64 {
 }
 
 // reanchorMariaDBLineage is called by the pump on every binlog rotation
-// it observes: the anchor moves to the new file's first event boundary
+// it observes — a rotate read from the binlog, never the artificial one a
+// dump connection opens with (GC-43 (r), cdc_rotation_boundary.go), and the
+// rotation boundary that follows is what persists the moved anchor on an
+// idle stream: the anchor moves to the new file's first event boundary
 // (offset 4) with the server's own start state for it, so the persisted
 // anchor is never older than the newest file the stream has seen and
 // routine retention cannot purge it out from under a running stream. The

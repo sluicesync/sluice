@@ -1179,11 +1179,24 @@ func (r *CDCReader) dispatch(ctx context.Context, ev *replication.BinlogEvent, o
 	switch e := ev.Event.(type) {
 	case *replication.RotateEvent:
 		r.currentFile = string(e.NextLogName)
+		if isArtificialRotate(ev.Header) {
+			// The dump connection's opening rotate names the file it starts
+			// in; it is not a rotation (cdc_rotation_boundary.go). Neither
+			// the anchor nor a boundary moves on it: re-anchoring here
+			// replaced the capture door's mid-file anchor with the start of
+			// the same file — no retention gain, and on a server's first
+			// binlog an anchor of (file, 4, "") that every fresh MariaDB
+			// instance reproduces (GC-43 (r)).
+			return nil
+		}
 		// MariaDB lineage anchor follows the stream (mariadb_lineage.go):
 		// one BINLOG_GTID_POS per rotation, so retention cannot purge the
-		// persisted anchor out from under a running stream.
+		// persisted anchor out from under a running stream — once the
+		// rotation boundary below carries it to the target.
 		r.reanchorMariaDBLineage(ctx, r.currentFile)
-		return nil
+		// GC-43 (r): the rotation is a resume-safe boundary, and on an
+		// idle stream the only one before the old file can be purged.
+		return r.emitRotationBoundary(ctx, e, out)
 
 	case *replication.GTIDEvent:
 		// A new group: whatever transaction the previous group opened is
@@ -2329,6 +2342,15 @@ func (r *CDCReader) foldPendingGTID() error {
 // currently being read until its commit event folds it in; in file/pos
 // mode it's (currentFile, LogPos).
 func (r *CDCReader) positionFor(hdr *replication.EventHeader) (ir.Position, error) {
+	return r.positionAt(r.currentFile, hdr.LogPos)
+}
+
+// positionAt builds the [ir.Position] naming binlog byte (file, pos) — the
+// file/pos bookmark; the GTID arm ignores both and encodes the running
+// executed set. positionFor is the per-event form. A rotation boundary
+// (cdc_rotation_boundary.go) names the NEXT file's first event, which no
+// event header carries.
+func (r *CDCReader) positionAt(file string, pos uint32) (ir.Position, error) {
 	switch r.posMode {
 	case positionModeGTID:
 		set := ""
@@ -2342,8 +2364,8 @@ func (r *CDCReader) positionFor(hdr *replication.EventHeader) (ir.Position, erro
 	case positionModeFilePos:
 		return encodeBinlogPos(binlogPos{
 			Mode:        positionModeFilePos,
-			File:        r.currentFile,
-			Pos:         hdr.LogPos,
+			File:        file,
+			Pos:         pos,
 			ServerUUID:  r.serverUUID,
 			LineageFile: r.lineageFile, LineagePos: r.lineagePos, LineageSet: r.lineageSet,
 		})
