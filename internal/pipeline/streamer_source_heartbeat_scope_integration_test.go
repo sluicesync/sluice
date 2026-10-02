@@ -90,15 +90,22 @@ func TestStreamer_MySQLSourceHeartbeat_AdvancesPositionWithoutSkips(t *testing.T
 		defer func() { _ = c.Close() }()
 	}
 
-	// The position the stream holds once CDC is running, before any
-	// heartbeat has had a chance to land on top of it.
-	first := gc43AwaitPosition(t, applier, streamID, "")
-
 	// No user writes from here on: only the heartbeat writes to the source.
-	gc43AwaitPosition(t, applier, streamID, first.Token)
-	if n := gc43CountMySQL(t, sourceDSN, "SELECT COUNT(*) FROM sluice_heartbeat"); n == 0 {
+	//
+	// Order matters, and each step polls rather than checking once. The
+	// heartbeat writer attaches asynchronously and its first INSERT lands
+	// one interval after that; under CI's -race build that took longer
+	// than the stream's position took to move for other reasons, so the
+	// old "position moved, now count the rows" order tripped the
+	// anti-vacuity floor with no heartbeat yet written. So: wait for
+	// heartbeat rows on the source (the floor), THEN take the position,
+	// THEN wait for it to move — a move that, with no user writes, only
+	// the heartbeats can have caused.
+	if !gc43AwaitCountMySQL(t, sourceDSN, "SELECT COUNT(*) FROM sluice_heartbeat", 1, 120*time.Second) {
 		t.Fatal("no heartbeat rows on the source; the test proved nothing about them")
 	}
+	first := gc43AwaitPosition(t, applier, streamID, "")
+	gc43AwaitPosition(t, applier, streamID, first.Token)
 
 	// A user change still arrives, so the stream is live, not merely stamping.
 	applyDDLMySQL(t, sourceDSN, "INSERT INTO hb_users VALUES (2, 'after-heartbeats');")
@@ -132,7 +139,7 @@ func TestStreamer_MySQLSourceHeartbeat_AdvancesPositionWithoutSkips(t *testing.T
 // token differs from not, and returns it.
 func gc43AwaitPosition(t *testing.T, applier ir.ChangeApplier, streamID, not string) ir.Position {
 	t.Helper()
-	deadline := time.Now().Add(60 * time.Second)
+	deadline := time.Now().Add(120 * time.Second)
 	var last ir.Position
 	for time.Now().Before(deadline) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -146,6 +153,31 @@ func gc43AwaitPosition(t *testing.T, applier ir.ChangeApplier, streamID, not str
 	}
 	t.Fatalf("persisted position for %q never moved off %q (last read %q)", streamID, not, last.Token)
 	return ir.Position{}
+}
+
+// gc43AwaitCountMySQL polls q (a single-COUNT query) until it returns at
+// least want or the timeout passes. The table may not exist yet (the
+// heartbeat writer creates it on attach), so a query error means "not
+// yet" rather than failure.
+func gc43AwaitCountMySQL(t *testing.T, dsn, q string, want int, timeout time.Duration) bool {
+	t.Helper()
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		var n int
+		err := db.QueryRowContext(ctx, q).Scan(&n)
+		cancel()
+		if err == nil && n >= want {
+			return true
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	return false
 }
 
 func gc43CountMySQL(t *testing.T, dsn, q string) int {

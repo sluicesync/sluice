@@ -655,16 +655,21 @@ jobs:
   # `vstream-pipeline` leg (weekly + dispatch), under the same guard.
   #
   # Images: vitess/vttestserver:mysql80 (Docker Hub, public — the source
-  # cluster) + the pre-baked sluice-mysql target. 35m outer / 30m inner
+  # cluster) + the pre-baked sluice-mysql target. 50m outer / 45m inner
   # timeout (inner < outer so Go's diagnostic timeout-panic fires before
   # a hard job kill), with headroom for the per-test cluster boots.
+  # Raised from 35m/30m on 2026-10-02: green runs had grown to 26–27 min
+  # and run 37036819171 hit the 30m go-test timeout mid-suite (in a test
+  # only 3 s old — the suite ran long, nothing hung). If green runs creep
+  # past ~35 min, split into two shards by test-name regex rather than
+  # raising this again.
   integration-vstream:
     name: Integration (vstream)
     runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
     # Disable ryuk on CI — see the integration job's env block.
     env:
       TESTCONTAINERS_RYUK_DISABLED: "true"
-    timeout-minutes: 35
+    timeout-minutes: 50
     # See the integration job's permissions block for the rationale.
     permissions:
       contents: read
@@ -696,7 +701,7 @@ jobs:
       - name: Run VStream integration suite (with non-vacuity guard)
         run: |
           set -o pipefail
-          go test -tags="integration vstream" -race -count=1 -timeout=30m -v -run 'TestVStream_' \
+          go test -tags="integration vstream" -race -count=1 -timeout=45m -v -run 'TestVStream_' \
             ./internal/engines/mysql/... 2>&1 | tee vstream.out
           # audit T-2: required check — a dead vttestserver/docker daemon
           # skips every TestVStream_* and exits 0, greening the check behind
