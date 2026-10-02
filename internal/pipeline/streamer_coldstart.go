@@ -919,9 +919,10 @@ func (s *Streamer) coldStartGatePreflight(ctx context.Context, schema *ir.Schema
 	// earlier version of this comment cited a test that did not exist
 	// (2026-09-15 audit, LOW: a comment naming a test that does not exist).
 	//
-	// Neither can fire on a target that is not a sharded PlanetScale Neki —
-	// the probe interfaces are unimplemented elsewhere and the preflights
-	// return nil — so every other engine pays one type assertion.
+	// Neither can fire on a target that is not sharded: placement probes only
+	// a PlanetScale Neki, the shard-key/upsert-key probe a Neki or a sharded
+	// Vitess/PlanetScale keyspace (GC-41 (e)), and every other engine pays one
+	// type assertion.
 	if err := migcore.PreflightShardPlacement(ctx, schema, rw); err != nil {
 		migcore.CloseIf(rw)
 		migcore.CloseIf(sw)

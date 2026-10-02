@@ -17,6 +17,8 @@ import (
 	"sync"
 	"time"
 
+	mysqldriver "github.com/go-sql-driver/mysql"
+
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
@@ -123,6 +125,13 @@ type RowWriter struct {
 	// makes the zero value the safe/silent default.
 	tierCPUBoundTarget bool
 	tierHintOnce       sync.Once
+
+	// vtgateCfg is the parsed DSN of a vtgate-fronted target (the planetscale
+	// and vitess flavors), which [RowWriter.ShardKeyUpsertMismatch] needs to
+	// enumerate shards. nil on every other flavor and on a bare-struct
+	// writer, which makes that preflight a no-op: the zero value is the
+	// ordinary MySQL target.
+	vtgateCfg *mysqldriver.Config
 
 	// copyDurableProgress is the durable-write reporter the cold-start
 	// COPY path wires (v0.99.9). When set, the idempotent batch writer

@@ -209,14 +209,19 @@ func isReadOnlyTargetSignal(err error) bool {
 // so the fleet supervisor can see that a restart would refuse again.
 const shardedTargetVindexUpdateMarker = "SHARDED-TARGET-VINDEX-UPDATE"
 
-// vindexUpdateRemedy is the refusal's remedy text. It covers both shapes the
-// class has today: a change that really moves a row's vindex value, which
-// vtgate cannot apply at all, and — until the open over-refusal is fixed — an
-// UPDATE that merely re-states an unchanged vindex column.
-const vindexUpdateRemedy = "the target keyspace is sharded and this change assigns a primary-vindex column, which vtgate refuses; " +
+// vindexUpdateRemedy is the refusal's remedy text. Since GC-41 (e) the
+// per-change UPDATE leaves an unchanged key column out of its SET list
+// ([dropUnchangedKeyColumns]) and a cold start refuses a table routed on a
+// vindex outside its primary key up front, so what still reaches here is a
+// change that really moves a row's vindex value — which vtgate cannot apply
+// at all — plus the narrow shapes docs/managed-services.md lists: a table on
+// such a vindex reached without that preflight (a warm restart), and a write
+// whose only assignment is a vindexed key column (an all-key table's insert,
+// an after-image of unchanged key columns alone).
+const vindexUpdateRemedy = "the target keyspace is sharded and this change assigns a vindex column, which vtgate refuses; " +
 	"a change that moves a row's vindex value cannot be applied through vtgate (delete the row on the target and re-copy it, " +
-	"or sync into an unsharded keyspace), and sluice also refuses an update that only re-states an unchanged vindex column " +
-	"(a known over-refusal; the supported scope is in docs/managed-services.md)"
+	"or sync into an unsharded keyspace); a table routed on a vindex outside its primary key needs a primary key that contains " +
+	"every vindex column; the remaining unsupported shapes are listed in docs/managed-services.md"
 
 // isVindexUpdateRefusal reports whether a 1235 message is vtgate's refusal to
 // assign a vindex column, in either measured spelling.

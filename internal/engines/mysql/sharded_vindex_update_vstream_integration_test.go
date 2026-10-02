@@ -14,31 +14,41 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
-// TestVStream_ShardedTarget_VindexMoveRefusesLoudly pins, on real vtgate, the
-// premise that keeps a vindex-moving change from silently corrupting a
-// PRE-VINDEXED sharded target (GC-41 (e)): vtgate refuses to assign a
-// primary-vindex column — Error 1235 VT12001 — for the UPDATE sluice's
-// serial path sends AND for the row-alias ON DUPLICATE KEY UPDATE its batch
-// and lane paths send. (The VALUES() spelling of the latter is ACCEPTED and
-// duplicates the row across shards; TestUpsertSpelling_VitessFamilyNeverUsesValuesFunc
-// keeps sluice off it.)
+// TestVStream_ShardedTarget_VindexMoveRefusesLoudly pins, on real vtgate, what
+// a PRE-VINDEXED sharded target does with each change shape sluice sends it
+// (GC-41 (e)).
 //
-// Keyspace "test" has two shards and two tables: t_pk (vindex hash(id), the
-// primary key) and t_np (primary key id, vindex hash(cust)). For each apply
-// path — serial Apply, the serial batch loop, the lanes — a primary-key
-// change on t_pk and a cust change on t_np must fail with 1235 and the
-// SHARDED-TARGET-VINDEX-UPDATE marker, leave BOTH physical shards exactly as
-// they were (read beneath vtgate from vt_test_-80 / vt_test_80-), and leave
-// the stream's position where it was.
+// Keyspace "test" has two shards and three tables: t_pk (vindex hash(id), the
+// primary key), t_np (primary key id, vindex hash(cust)) and t_comp (primary
+// key (tenant, id), vindex hash(tenant)).
 //
-// The scope subtests pin what docs/managed-services.md states about the
-// same target for a change that does NOT move the vindex: on t_pk the
-// batched path applies a non-key update, and the per-change path refuses the
-// same update because its UPDATE re-states the unchanged vindex column — the
-// OVER-refusal GC-41 (e) leaves open. When that is fixed the serial scope arm
-// goes red on purpose: update the doc with it.
+// The refusal arms pin the premise that keeps a vindex-moving change from
+// silently corrupting the target: vtgate refuses to assign a primary-vindex
+// column — Error 1235 VT12001 — for the UPDATE sluice's serial path sends AND
+// for the row-alias ON DUPLICATE KEY UPDATE its batch and lane paths send.
+// (The VALUES() spelling of the latter is ACCEPTED and duplicates the row
+// across shards; TestUpsertSpelling_VitessFamilyNeverUsesValuesFunc keeps
+// sluice off it.) For each apply path — serial Apply, the serial batch loop,
+// the lanes — a primary-key change on t_pk and a cust change on t_np must fail
+// with 1235 and the SHARDED-TARGET-VINDEX-UPDATE marker, leave BOTH physical
+// shards exactly as they were (read beneath vtgate from vt_test_-80 /
+// vt_test_80-), and leave the stream's position where it was.
+//
+// The apply arms pin the fix for the over-refusal: a change that does not move
+// the vindex applies on every path. Before GC-41 (e) the per-change UPDATE
+// re-stated the unchanged vindex column and vtgate refused it, so these were
+// red on the serial path, on a partial after-image (which the batch loop hands
+// to the serial path), and on an in-shard primary-key change. Each must apply,
+// leave the row on exactly one physical shard, and advance the position.
+//
+// The preflight arm pins part (a): t_np routes on a column outside its primary
+// key, which no upsert spelling can serve, so it is refused before anything is
+// written under SLUICE-E-TARGET-SHARD-KEY-NOT-IN-UPSERT-KEY, while t_pk and
+// t_comp pass.
 func TestVStream_ShardedTarget_VindexMoveRefusesLoudly(t *testing.T) {
 	vt := bootVTTestServer(t, "test,ctl", "2,1")
 	defer vt.terminate()
@@ -50,30 +60,50 @@ func TestVStream_ShardedTarget_VindexMoveRefusesLoudly(t *testing.T) {
 		t.Fatalf("open: %v", err)
 	}
 	defer func() { _ = db.Close() }()
-	for _, stmt := range []string{
-		`CREATE TABLE t_pk (id BIGINT NOT NULL PRIMARY KEY, v VARCHAR(32) NOT NULL) ENGINE=InnoDB`,
-		`ALTER VSCHEMA ON t_pk ADD VINDEX hash(id) USING hash`,
-		`CREATE TABLE t_np (id BIGINT NOT NULL PRIMARY KEY, cust BIGINT NOT NULL, v VARCHAR(32) NOT NULL) ENGINE=InnoDB`,
-		`ALTER VSCHEMA ON t_np ADD VINDEX hash(cust) USING hash`,
-		`INSERT INTO t_pk (id, v) VALUES (1, 'a')`,
-		`INSERT INTO t_np (id, cust, v) VALUES (10, 1, 'a')`,
-	} {
+	exec := func(t *testing.T, stmt string) {
+		t.Helper()
 		if _, err := db.ExecContext(ctx, stmt); err != nil {
 			t.Fatalf("%s: %v", stmt, err)
 		}
+	}
+	for _, stmt := range []string{
+		`CREATE TABLE t_pk (id BIGINT NOT NULL PRIMARY KEY, v VARCHAR(32) NOT NULL, w VARCHAR(32) NULL) ENGINE=InnoDB`,
+		`ALTER VSCHEMA ON t_pk ADD VINDEX hash(id) USING hash`,
+		`CREATE TABLE t_np (id BIGINT NOT NULL PRIMARY KEY, cust BIGINT NOT NULL, v VARCHAR(32) NOT NULL) ENGINE=InnoDB`,
+		`ALTER VSCHEMA ON t_np ADD VINDEX hash(cust) USING hash`,
+		`CREATE TABLE t_comp (tenant BIGINT NOT NULL, id BIGINT NOT NULL, v VARCHAR(32) NOT NULL, PRIMARY KEY (tenant, id)) ENGINE=InnoDB`,
+		`ALTER VSCHEMA ON t_comp ADD VINDEX hash(tenant) USING hash`,
+		`INSERT INTO t_pk (id, v, w) VALUES (1, 'a', 'x')`,
+		`INSERT INTO t_np (id, cust, v) VALUES (10, 1, 'a')`,
+		`INSERT INTO t_comp (tenant, id, v) VALUES (1, 1, 'a')`,
+	} {
+		exec(t, stmt)
 	}
 	shards := func() string {
 		t.Helper()
 		var b strings.Builder
 		for _, shard := range []string{"vt_test_-80", "vt_test_80-"} {
 			b.WriteString(shard + ":\n")
-			b.WriteString(mysqldExec(ctx, t, vt, "SELECT 't_pk', id, v FROM `"+shard+"`.t_pk ORDER BY id; SELECT 't_np', id, cust, v FROM `"+shard+"`.t_np ORDER BY id"))
+			b.WriteString(mysqldExec(ctx, t, vt, "SELECT 't_pk', id, v, w FROM `"+shard+"`.t_pk ORDER BY id; "+
+				"SELECT 't_np', id, cust, v FROM `"+shard+"`.t_np ORDER BY id; "+
+				"SELECT 't_comp', tenant, id, v FROM `"+shard+"`.t_comp ORDER BY tenant, id"))
 		}
 		return b.String()
 	}
 	before := shards()
-	if !strings.Contains(before, "t_pk\t1\ta") || !strings.Contains(before, "t_np\t10\t1\ta") {
-		t.Fatalf("premise: the seed rows are not on the physical shards:\n%s", before)
+	for _, seed := range []string{"t_pk\t1\ta\tx", "t_np\t10\t1\ta", "t_comp\t1\t1\ta"} {
+		if !strings.Contains(before, seed) {
+			t.Fatalf("premise: seed row %q is not on the physical shards:\n%s", seed, before)
+		}
+	}
+	restoreSeed := func(t *testing.T) {
+		t.Helper()
+		exec(t, `UPDATE t_pk SET v = 'a', w = 'x' WHERE id = 1`)
+		exec(t, `DELETE FROM t_comp WHERE tenant = 1`)
+		exec(t, `INSERT INTO t_comp (tenant, id, v) VALUES (1, 1, 'a')`)
+		if got := shards(); got != before {
+			t.Fatalf("could not restore the seed:\nwant:\n%s\ngot:\n%s", before, got)
+		}
 	}
 
 	eng, err := Engine{Flavor: FlavorVitess}.WithControlKeyspace("ctl")
@@ -82,16 +112,6 @@ func TestVStream_ShardedTarget_VindexMoveRefusesLoudly(t *testing.T) {
 	}
 	pos := func(n int) ir.Position {
 		return ir.Position{Engine: engineNameMySQL, Token: fmt.Sprintf(`{"gtid":"3E11FA47-71CA-11E1-9E33-C80AA9429562:1-%d"}`, n)}
-	}
-	moves := map[string]ir.Change{
-		"t_pk primary-key change": ir.Update{
-			Schema: "test", Table: "t_pk", Position: pos(2),
-			Before: ir.Row{"id": int64(1), "v": "a"}, After: ir.Row{"id": int64(2), "v": "a"},
-		},
-		"t_np vindex change": ir.Update{
-			Schema: "test", Table: "t_np", Position: pos(2),
-			Before: ir.Row{"id": int64(10), "cust": int64(1), "v": "a"}, After: ir.Row{"id": int64(10), "cust": int64(4), "v": "moved"},
-		},
 	}
 	paths := map[string]func(a *ChangeApplier, stream string, ch <-chan ir.Change) error{
 		"serial": func(a *ChangeApplier, stream string, ch <-chan ir.Change) error { return a.Apply(ctx, stream, ch) },
@@ -127,35 +147,81 @@ func TestVStream_ShardedTarget_VindexMoveRefusesLoudly(t *testing.T) {
 		close(ch)
 		return ch
 	}
-	// Scope first, while the seed row is still where it was: a non-key update
-	// of t_pk's v, which moves nothing.
-	keep := ir.Update{
-		Schema: "test", Table: "t_pk", Position: pos(2),
-		Before: ir.Row{"id": int64(1), "v": "a"}, After: ir.Row{"id": int64(1), "v": "b"},
-	}
-	t.Run("scope/serial over-refuses an unchanged vindex column", func(t *testing.T) {
-		a := open(t, "vindex-scope-serial")
-		if err := a.Apply(ctx, "vindex-scope-serial", oneTx(keep)); err == nil || !strings.Contains(err.Error(), shardedTargetVindexUpdateMarker) {
-			t.Fatalf("serial non-key update = %v; the documented over-refusal (GC-41 (e)) did not fire — if it was fixed, update docs/managed-services.md", err)
-		}
-	})
-	t.Run("scope/batch applies a non-key update", func(t *testing.T) {
-		a := open(t, "vindex-scope-batch")
-		if err := a.ApplyBatch(ctx, "vindex-scope-batch", oneTx(keep), 50); err != nil {
-			t.Fatalf("batched non-key update on a primary-key-vindexed table: %v", err)
-		}
-		var v string
-		if err := db.QueryRowContext(ctx, `SELECT v FROM t_pk WHERE id = 1`).Scan(&v); err != nil || v != "b" {
-			t.Fatalf("t_pk id=1 v = %q (err %v); want b", v, err)
-		}
-		if _, err := db.ExecContext(ctx, `UPDATE t_pk SET v = 'a' WHERE id = 1`); err != nil {
-			t.Fatalf("restore the seed: %v", err)
-		}
-	})
 
+	// The apply arms: no change here moves a vindex value.
+	applies := []struct {
+		name   string
+		change ir.Update
+		// want is the row each must leave, read through vtgate, plus the
+		// physical-shard dump line that proves it sits on one shard.
+		query, want, shardLine string
+	}{
+		{
+			name: "t_pk non-key update",
+			change: ir.Update{
+				Schema: "test", Table: "t_pk", Position: pos(2),
+				Before: ir.Row{"id": int64(1), "v": "a", "w": "x"}, After: ir.Row{"id": int64(1), "v": "b", "w": "x"},
+			},
+			query: `SELECT CONCAT(v, '/', w) FROM t_pk WHERE id = 1`, want: "b/x", shardLine: "t_pk\t1\tb\tx",
+		},
+		{
+			// The default-on ADD COLUMN backfill's shape: the key plus the
+			// columns it sets. The batch loop hands it to the serial path.
+			name: "t_pk partial after-image",
+			change: ir.Update{
+				Schema: "test", Table: "t_pk", Position: pos(2),
+				Before: ir.Row{"id": int64(1)}, After: ir.Row{"id": int64(1), "w": "y"},
+			},
+			query: `SELECT CONCAT(v, '/', w) FROM t_pk WHERE id = 1`, want: "a/y", shardLine: "t_pk\t1\ta\ty",
+		},
+		{
+			// A primary-key change that keeps the vindex column: legal on
+			// vtgate (an in-shard update), and every path sends it serially.
+			name: "t_comp in-shard key change",
+			change: ir.Update{
+				Schema: "test", Table: "t_comp", Position: pos(2),
+				Before: ir.Row{"tenant": int64(1), "id": int64(1), "v": "a"}, After: ir.Row{"tenant": int64(1), "id": int64(2), "v": "a"},
+			},
+			query: `SELECT CONCAT(id, '/', v) FROM t_comp WHERE tenant = 1`, want: "2/a", shardLine: "t_comp\t1\t2\ta",
+		},
+	}
+	for pathName, apply := range paths {
+		for _, c := range applies {
+			t.Run("applies/"+pathName+"/"+c.name, func(t *testing.T) {
+				defer restoreSeed(t)
+				stream := "vindex-ok-" + pathName + "-" + strings.ReplaceAll(c.name, " ", "-")
+				a := open(t, stream)
+				if err := apply(a, stream, oneTx(c.change)); err != nil {
+					t.Fatalf("apply = %v; a change that moves no vindex value must apply on a pre-vindexed sharded target", err)
+				}
+				var got string
+				if err := db.QueryRowContext(ctx, c.query).Scan(&got); err != nil || got != c.want {
+					t.Fatalf("%s = %q (err %v); want %q", c.query, got, err, c.want)
+				}
+				if n := strings.Count(shards(), c.shardLine); n != 1 {
+					t.Fatalf("row %q is on %d physical shards, want exactly 1:\n%s", c.shardLine, n, shards())
+				}
+				got2, ok, err := a.ReadPosition(ctx, stream)
+				if err != nil || !ok || got2.Token != pos(2).Token {
+					t.Fatalf("position = %q (ok=%v, err=%v); want %q", got2.Token, ok, err, pos(2).Token)
+				}
+			})
+		}
+	}
+
+	moves := map[string]ir.Change{
+		"t_pk primary-key change": ir.Update{
+			Schema: "test", Table: "t_pk", Position: pos(2),
+			Before: ir.Row{"id": int64(1), "v": "a", "w": "x"}, After: ir.Row{"id": int64(2), "v": "a", "w": "x"},
+		},
+		"t_np vindex change": ir.Update{
+			Schema: "test", Table: "t_np", Position: pos(2),
+			Before: ir.Row{"id": int64(10), "cust": int64(1), "v": "a"}, After: ir.Row{"id": int64(10), "cust": int64(4), "v": "moved"},
+		},
+	}
 	for pathName, apply := range paths {
 		for moveName, move := range moves {
-			t.Run(pathName+"/"+moveName, func(t *testing.T) {
+			t.Run("refuses/"+pathName+"/"+moveName, func(t *testing.T) {
 				stream := "vindex-" + pathName + "-" + strings.Fields(moveName)[0]
 				a := open(t, stream)
 				err := apply(a, stream, oneTx(move))
@@ -172,4 +238,26 @@ func TestVStream_ShardedTarget_VindexMoveRefusesLoudly(t *testing.T) {
 			})
 		}
 	}
+
+	t.Run("preflight refuses a vindex outside the primary key", func(t *testing.T) {
+		rw, err := eng.OpenRowWriter(ctx, dsn)
+		if err != nil {
+			t.Fatalf("OpenRowWriter: %v", err)
+		}
+		defer func() { _ = rw.(*RowWriter).Close() }()
+		err = migcore.PreflightShardKeyUpsert(ctx, &ir.Schema{Tables: []*ir.Table{{Name: "t_pk"}, {Name: "t_comp"}, {Name: "t_np"}}}, rw)
+		ce, ok := sluicecode.FromError(err)
+		if !ok || ce.Code != sluicecode.CodeTargetShardKeyNotInUpsertKey {
+			t.Fatalf("preflight = %v; want %s for t_np", err, sluicecode.CodeTargetShardKeyNotInUpsertKey)
+		}
+		if !strings.Contains(err.Error(), "test.t_np") || !strings.Contains(err.Error(), "(cust)") {
+			t.Fatalf("the refusal does not name the table and the vindex column: %v", err)
+		}
+		if err := migcore.PreflightShardKeyUpsert(ctx, &ir.Schema{Tables: []*ir.Table{{Name: "t_pk"}, {Name: "t_comp"}}}, rw); err != nil {
+			t.Fatalf("tables whose vindex is inside the primary key were refused: %v", err)
+		}
+		if after := shards(); after != before {
+			t.Fatalf("the preflight wrote:\n%s", after)
+		}
+	})
 }

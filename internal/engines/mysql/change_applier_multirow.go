@@ -710,10 +710,12 @@ func buildMultiRowInsertSQL(schema, table string, rows []ir.Row, pk []string, co
 // value's shard: measured on vttestserver, a row moved from cust=1 to cust=4
 // left {10,1,a} on -80 and {10,4,moved} on 80-, a duplicate primary key across
 // shards at exit 0. The row-alias spelling is refused loudly
-// (SHARDED-TARGET-VINDEX-UPDATE). That refusal is an OVER-refusal for changes
-// that do not actually move the vindex value (GC-41 (e), open) — the fix for
-// it is to leave unchanged columns out of the SET list, never to switch the
-// spelling. Pinned by TestUpsertSpelling_VitessFamilyNeverUsesValuesFunc and
+// (SHARDED-TARGET-VINDEX-UPDATE). This clause never names a primary-key
+// column, so a vindex inside the key is safe here; one outside it is refused
+// before anything is written ([RowWriter.ShardKeyUpsertMismatch], GC-41 (e)),
+// because leaving it out of the list would be the duplicating spelling too.
+// The fix for an over-refusal is never to switch the spelling. Pinned by
+// TestUpsertSpelling_VitessFamilyNeverUsesValuesFunc and
 // TestVStream_ShardedTarget_VindexMoveRefusesLoudly.
 func onDuplicateKeyUpdateClause(cols, pk []string, upsert upsertSpelling) string {
 	var sb strings.Builder

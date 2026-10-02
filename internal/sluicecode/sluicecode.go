@@ -543,6 +543,11 @@ const (
 	// degradation. The safe condition is a property of the schema — every
 	// shard-key column contained in the conflict key — so it is knowable
 	// before any data moves and the operator can fix it.
+	//
+	// A sharded Vitess/PlanetScale keyspace raises it too, for a vindex
+	// column outside the primary key (GC-41 (e)): vtgate refuses an ON
+	// DUPLICATE KEY UPDATE assigning it, and the spellings it accepts
+	// duplicate a moved row across shards.
 	CodeTargetShardKeyNotInUpsertKey Code = "SLUICE-E-TARGET-SHARD-KEY-NOT-IN-UPSERT-KEY"
 
 	// CodeTargetShardKeyUpdateUnsupported fires when a CDC change would alter

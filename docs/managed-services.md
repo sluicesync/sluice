@@ -483,24 +483,45 @@ operator has pre-created and vindexed on the platform (with or
 without `--schema-already-applied`) gets past the create step: it
 finds every table already present, no-ops its `CREATE TABLE IF NOT
 EXISTS`, and only a table sluice would have to create anew is
-refused. **The apply that follows is narrower than that, and today
-it is scoped like this** (measured on a 2-shard vttestserver, audit
-backlog GC-41 (e), open):
+refused. **The apply that follows is scoped like this** (measured on
+a 2-shard vttestserver, audit backlog GC-41 (e)):
 
-- **Primary vindex on a column that is NOT the primary key:** vtgate
-  refuses every row write sluice sends (its upserts and updates
-  assign the vindex column), so the stream stops on the first one.
-  Not supported.
-- **Primary vindex on the primary key:** inserts and deletes apply,
-  and so do updates on the batched paths; an UPDATE sent by the
-  per-change path — `--apply-batch-size 1`, the broker and chain
-  restore, a partial after-image (including the default-on ADD
-  COLUMN backfill), an empty before-image, a keyless table, or any
-  primary-key change — is refused, because it re-states the vindex
-  column even when its value is unchanged.
-- **A change that really moves a row's vindex value** (a primary-key
-  change, or a new value in the vindex column) cannot be applied
-  through vtgate at all.
+- **Every vindex column inside the primary key** (the primary vindex
+  on the primary key, or on a member of a composite one): inserts,
+  updates and deletes apply on every apply path — batched, the
+  concurrent lanes, and the per-change path (`--apply-batch-size 1`,
+  the broker and chain restore, a partial after-image including the
+  default-on ADD COLUMN backfill, a primary-key change). Since GC-41
+  (e) the per-change UPDATE leaves a key column whose value did not
+  change out of its `SET` list, so it no longer re-states the vindex
+  column; a primary-key change that keeps the vindex value (on
+  `(tenant, id)` vindexed on `tenant`, a new `id`) is an in-shard
+  update and applies.
+- **A vindex column outside the primary key** (a primary vindex on a
+  non-key column, a secondary/lookup vindex on one, or a table with no
+  primary key): not supported. vtgate refuses an `ON DUPLICATE KEY
+  UPDATE` that assigns a vindex column, and the spellings it accepts
+  duplicate a moved row across shards, so there is no write sluice can
+  send. A sync cold start (and its stopped-copy resume) reads each
+  table's vindexes with `SHOW VSCHEMA VINDEXES ON` and
+  refuses before anything is written with
+  `SLUICE-E-TARGET-SHARD-KEY-NOT-IN-UPSERT-KEY`, naming the table and
+  the column. Put every vindex column in the primary key. A warm
+  restart of an existing stream runs no such preflight; there the first
+  write vtgate refuses stops the stream with
+  `SHARDED-TARGET-VINDEX-UPDATE`, as before. If the vschema cannot be
+  read (a role without the privilege), the preflight WARNs and the same
+  write-time refusal applies.
+- **A change that really moves a row's vindex value** (a change to a
+  vindexed primary-key column, or a new value in a vindex column)
+  cannot be applied through vtgate at all.
+- **Two narrow shapes stay refused** even with the vindex in the key,
+  because the only thing left to assign is the vindexed key column: an
+  insert into a table whose EVERY column is in the primary key when
+  first key column is a vindex column (the upsert has no non-key
+  column to assign, so its no-op assignment names that one), and an
+  UPDATE whose after-image carries nothing but unchanged key columns.
+  Both are filed as the remainder of GC-41 (e).
 
 Each refusal is loud — `SHARDED-TARGET-VINDEX-UPDATE`, naming the
 table, the position left where it was — never a silent write. It

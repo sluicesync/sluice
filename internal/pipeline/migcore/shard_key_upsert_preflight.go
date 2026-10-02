@@ -20,8 +20,12 @@ import (
 // and the columns involved, or "" when every table is safe. An error means the
 // probe could not RUN and is never a verdict.
 //
-// Only the Postgres engine implements it, and only against a PlanetScale Neki
-// endpoint; every other writer is skipped and pays nothing.
+// Two engines implement it: Postgres against a PlanetScale Neki endpoint
+// (shard keys), and MySQL against a sharded Vitess/PlanetScale keyspace
+// (vindex columns, GC-41 (e)). The MySQL prober reads a table it cannot
+// probe as no verdict and returns "" with a WARN rather than an error,
+// because vtgate itself refuses the offending statement loudly; see its doc.
+// Every other writer is skipped and pays nothing.
 type ShardKeyUpsertProber interface {
 	ShardKeyUpsertMismatch(ctx context.Context, tables []*ir.Table) (detail string, err error)
 }
@@ -43,6 +47,12 @@ type ShardKeyUpsertProber interface {
 //     of the conflict key whenever the incoming row's shard key differs from
 //     the stored row's, because `ON CONFLICT` evaluates its conflict only on
 //     the shard the incoming row routes to.
+//
+// A sharded Vitess/PlanetScale keyspace has the same pair for a vindex column
+// outside the primary key (GC-41 (e)): vtgate refuses an ON DUPLICATE KEY
+// UPDATE that assigns it (VT12001), and the spellings it accepts — leaving
+// the column out, or `col = VALUES(col)` — duplicate a moved row across
+// shards. Same class, same code.
 //
 // Measured on a live 3-shard cluster 2026-09-10: two rows with `id = 3001`,
 // physically resident on different shards, at exit 0 (reported to PlanetScale).
@@ -83,11 +93,13 @@ func PreflightShardKeyUpsert(ctx context.Context, schema *ir.Schema, rw any) err
 	}
 	return &sluicecode.CodedError{
 		Code: sluicecode.CodeTargetShardKeyNotInUpsertKey,
-		Hint: "add the shard-key column(s) to the table's PRIMARY KEY on the target (or to a NOT NULL UNIQUE " +
-			"index sluice can key on), then re-run; alternatively take the table out of scope with --exclude-table",
+		Hint: "add the shard-key column(s) — on Vitess/PlanetScale, every vindex column — to the table's PRIMARY " +
+			"KEY on the target (on Neki, a NOT NULL UNIQUE index sluice can key on also works), then re-run; " +
+			"alternatively take the table out of scope with --exclude-table",
 		Err: errors.New("pipeline: " + detail +
-			"\nsluice's idempotent write is INSERT … ON CONFLICT (key) DO UPDATE, and on a sharded target that " +
-			"statement is evaluated only on the shard the incoming row routes to" +
+			"\nsluice's idempotent write is an upsert (INSERT … ON CONFLICT on Postgres, INSERT … ON DUPLICATE KEY " +
+			"UPDATE on MySQL), and on a sharded target that statement is evaluated only on the shard the incoming " +
+			"row routes to" +
 			"\nso a row whose shard key changed would be INSERTED alongside the original instead of updating it, " +
 			"leaving two rows with the same key and no error at any point" +
 			"\nrefused before anything was written"),

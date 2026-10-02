@@ -262,10 +262,18 @@ func (e Engine) OpenRowWriter(ctx context.Context, dsn string) (ir.RowWriter, er
 		_ = db.Close()
 		return nil, err
 	}
+	// GC-41 (e): only a vtgate-fronted target can route on a vindex, so
+	// only it gets the config the vindex/upsert preflight enumerates shards
+	// with ([RowWriter.ShardKeyUpsertMismatch]).
+	var vtgateCfg *mysqldriver.Config
+	if e.Flavor.usesVStream() {
+		vtgateCfg = cfg
+	}
 	return &RowWriter{
-		db:       db,
-		schema:   cfg.DBName,
-		bulkLoad: e.Capabilities().BulkLoad,
+		db:        db,
+		schema:    cfg.DBName,
+		bulkLoad:  e.Capabilities().BulkLoad,
+		vtgateCfg: vtgateCfg,
 		// Resolved --mysql-sql-mode (task 2.5): the LOAD DATA warning path keys
 		// its WARN-vs-refuse decision off whether the operator opted into the
 		// relaxed "" mode, replacing the former sessionSQLMode global read.

@@ -1536,7 +1536,14 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		if err != nil {
 			return false, err
 		}
-		stmt, args, err := buildUpdateSQL(addr, schema, v.Table, v.Before, v.After, colTypes)
+		// The primary key decides which SET entries the builder may leave
+		// out ([dropUnchangedKeyColumns], GC-41 (e)). Cached after the first
+		// change per table, like the insert arm's lookup.
+		pk, err := a.pkFor(ctx, tx, schema, v.Table)
+		if err != nil {
+			return false, fmt.Errorf("mysql: applier: pk lookup for %s.%s: %w", schema, v.Table, err)
+		}
+		stmt, args, err := buildUpdateSQL(addr, schema, v.Table, v.Before, v.After, pk, colTypes)
 		if err != nil {
 			return false, fmt.Errorf("mysql: applier: build update for %s.%s: %w", schema, v.Table, err)
 		}
@@ -2200,10 +2207,10 @@ func buildInsertSQL(schema, table string, row ir.Row, pk []string, colTypes map[
 	return buildMultiRowInsertSQL(schema, table, []ir.Row{row}, pk, colTypes, upsert)
 }
 
-// buildUpdateSQL builds an UPDATE statement. SET uses every column
-// in After (including ones whose value didn't change — unchanged-
-// column detection is a v1.5 optimization). WHERE uses every column
-// in Before with NULL-aware predicate building.
+// buildUpdateSQL builds an UPDATE statement. SET uses every column in
+// After except a primary-key column whose value did not change
+// ([dropUnchangedKeyColumns], GC-41 (e)); WHERE uses every column in
+// Before with NULL-aware predicate building.
 //
 // A before-image with nothing usable as a predicate is REFUSED (audit
 // 2026-08-05 C-9). Pre-fix this rendered `UPDATE t SET … WHERE ` and left
@@ -2215,12 +2222,12 @@ func buildInsertSQL(schema, table string, row ir.Row, pk []string, colTypes map[
 // addr says how the WHERE reaches the row ([rowAddress]): every match, or
 // exactly one of the identical rows a keyless table's whole-row WHERE
 // matches (GC-42; `LIMIT 1`).
-func buildUpdateSQL(addr rowAddress, schema, table string, before, after ir.Row, colTypes map[string]*ir.Column) (sqlStmt string, args []any, err error) {
+func buildUpdateSQL(addr rowAddress, schema, table string, before, after ir.Row, pk []string, colTypes map[string]*ir.Column) (sqlStmt string, args []any, err error) {
 	if len(appliershared.NonGeneratedRowKeys(before, colTypes)) == 0 {
 		return "", nil, appliershared.RefuseNoRowPredicate(engineNameMySQL, "update", schema, table, before)
 	}
 	tableRef := quoteIdent(schema) + "." + quoteIdent(table)
-	setSQL, setArgs, err := buildSetClause(after, colTypes)
+	setSQL, setArgs, err := buildSetClause(dropUnchangedKeyColumns(before, after, pk, colTypes), colTypes)
 	if err != nil {
 		return "", nil, err
 	}
