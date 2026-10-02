@@ -15,13 +15,14 @@ import (
 // meta-gate now enforces that mechanically, and this is the file that closes
 // pgtrigger's half of the reach gap.
 //
-// The reader's CDC pump parks two error shapes. The poll fault goes through
+// The reader's CDC pump parks three error shapes. The poll fault goes through
 // classifyPollError (which rides out the transient SQLSTATEs via
 // postgres.IsReadTransientSQLState / triggercdc.ClassifyTransient), and the §7
 // observed-DDL condition goes through refuseObservedDDL, a purpose-built
 // TERMINAL — the deliberate opposite of an unclassified park, and one the
-// transient classifier must never touch. Both are accepted; a future third
-// site that parks a raw error fails here.
+// transient classifier must never touch. The GC-43 wedged-watermark tripwire
+// (refuseStalledWatermark) is the same kind as the second. All three are
+// accepted; a future site that parks a raw error fails here.
 func TestSetErrSitesClassify(t *testing.T) {
 	errclassgate.Assert(t, errclassgate.Config{
 		Dir:    ".",
@@ -33,8 +34,11 @@ func TestSetErrSitesClassify(t *testing.T) {
 			// routing observed DDL through the transient classifier would be
 			// strictly wrong — see refuseObservedDDL's doc.
 			"refuseObservedDDL": true,
+			// The same kind: the GC-43 (a) wedged-watermark tripwire. A
+			// re-poll reads the same window, so it is terminal by nature.
+			"refuseStalledWatermark": true,
 		},
 		Allowed:  map[string]string{},
-		MinSites: 2,
+		MinSites: 3,
 	})
 }

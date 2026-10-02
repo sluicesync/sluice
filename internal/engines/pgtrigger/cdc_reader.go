@@ -121,6 +121,10 @@ type CDCReader struct {
 	// reader — so it needs no lock.
 	outOfScopeWarned map[string]bool
 
+	// excludedNoted dedupes [CDCReader.noteExcludedCapture]'s DEBUG line
+	// per table. Pump-goroutine-only, like outOfScopeWarned.
+	excludedNoted map[string]bool
+
 	// mu guards err. The pump writes; the caller reads via Err.
 	mu  sync.Mutex
 	err error
@@ -428,6 +432,10 @@ func (r *CDCReader) pump(ctx context.Context, startID int64, out chan<- ir.Chang
 			r.setErr(refuseObservedDDL(*b.ddl))
 			return
 		}
+		if watermarkStalled(b) {
+			r.setErr(refuseStalledWatermark(b))
+			return
+		}
 		for _, ev := range b.events {
 			select {
 			case <-ctx.Done():
@@ -435,10 +443,19 @@ func (r *CDCReader) pump(ctx context.Context, startID int64, out chan<- ir.Chang
 			case out <- ev:
 			}
 		}
+		// The watermark moves past every row the poll consumed, emitted
+		// or not, and that alone is progress. It is NOT persisted until
+		// the next emitted change carries a later position: a trigger
+		// stream is marker-less, and the only IR events that persist a
+		// position without a row are TxBegin/TxCommit, which would latch
+		// the lane orchestrator's sawTxMarker and stop it recording a
+		// boundary at every row thereafter (laneapply's handle). So a
+		// stop before the next in-scope change resumes from the older
+		// persisted id and re-reads the dropped rows — idempotently, and
+		// a full window at a time (the cadence below), so the re-read
+		// costs a burst of polls rather than a stall.
 		if b.lastID > lastSeen {
 			lastSeen = b.lastID
-		}
-		if len(b.events) > 0 {
 			stall.noteProgress(time.Now())
 		}
 		if b.holeAt > 0 {
@@ -463,8 +480,9 @@ func (r *CDCReader) pump(ctx context.Context, startID int64, out chan<- ir.Chang
 		// Adaptive cadence: a full batch means the source is busy;
 		// fire the next poll immediately so back-pressure has the
 		// shortest possible feedback window. Otherwise wait the
-		// configured interval.
-		if len(b.events) == r.batchSize {
+		// configured interval. "Full" counts consumed rows, not emitted
+		// ones: a window of rows the stream drops is a busy source too.
+		if b.consumed == r.batchSize {
 			timer.Reset(0)
 		} else {
 			timer.Reset(r.pollInterval)
@@ -585,6 +603,46 @@ func refuseObservedDDL(m ddlMarker) error {
 	)
 }
 
+// watermarkStalledMarker is the grep-stable marker of
+// [refuseStalledWatermark]'s refusal.
+const watermarkStalledMarker = "CHANGE-LOG-WATERMARK-STALLED"
+
+// watermarkStalled is the tripwire behind GC-43 (a), and the stall
+// signal the other two no-progress shapes already had. A poll that leaves
+// the watermark where it was is one of three things, and each must be
+// visible: a HOLE (an uncommitted id — [holeGuard.warnStuck] WARNs), a
+// CEILING cut (committed rows held behind a long-open transaction — the
+// window comes back empty and [CDCReader.maybeWarnCeilingStall] WARNs),
+// or neither — rows came back, there was no hole, and the watermark did
+// not reach them. That third shape has no legitimate cause: every row of
+// a hole-free window is in the contiguous run, and the run either emits a
+// row, drops it (advancing the watermark), or stops at a DDL marker
+// (b.ddl, handled before this). If it ever happens, nothing will change
+// on the next poll — the same window comes back and is consumed the same
+// way — so the stream is wedged, and a wedged stream that keeps polling
+// is the silent stall v0.145.0–v0.156.8 shipped. It halts instead,
+// TERMINAL: retrying re-reads the same window.
+//
+// The check grades what the poll RETURNED, not a separate probe, so it
+// cannot race a writer the way a "settled rows above the watermark" query
+// would (a row committed between the poll and the probe is not a stall).
+func watermarkStalled(b pollBatch) bool {
+	return b.ddl == nil && b.holeAt == 0 && b.seenTo > b.lastID
+}
+
+// refuseStalledWatermark renders the [watermarkStalled] refusal: a
+// purpose-built TERMINAL, since a re-poll reads the same window.
+func refuseStalledWatermark(b pollBatch) error {
+	return fmt.Errorf(
+		"pgtrigger: %s: the change-log poll read rows up to id %d with no gap, but the stream's watermark stayed at %d — "+
+			"this is a sluice bug (a consumed change-log row that did not advance the watermark), and a stream in this state "+
+			"re-reads the same window forever without applying anything, so it is halted rather than left polling. No row "+
+			"was skipped: the persisted position is unchanged. Report it with the change-log rows above that id "+
+			"(SELECT id, schema_name, table_name, op FROM <schema>.%s WHERE id > %d ORDER BY id LIMIT 20)",
+		watermarkStalledMarker, b.seenTo, b.lastID, ChangeLogTable, b.lastID,
+	)
+}
+
 // pollQuery renders the one-poll fetch: the next batch WINDOW of the
 // change log in id order, truncated at the shared settled ceiling
 // ([settledCeilingSQL] — the same expression the cold-start anchor
@@ -629,6 +687,12 @@ type pollBatch struct {
 	holeEnd int64      // lowest VISIBLE id above holeAt — the row that proves holeAt was allocated
 	seenTo  int64      // highest id observed in this poll's window
 	ddl     *ddlMarker // non-nil → §7 refuse-loudly DDL marker
+
+	// consumed counts the rows of the contiguous run this poll consumed,
+	// emitted or dropped as out of scope. It, not len(events), says
+	// whether the window came back full: a window of out-of-scope rows
+	// emits nothing and is exactly as full (GC-43 (a)).
+	consumed int
 }
 
 // poll runs one bounded fetch and consumes the contiguous committed run
@@ -678,6 +742,7 @@ func (r *CDCReader) poll(ctx context.Context, lastSeen int64) (pollBatch, error)
 			continue
 		}
 		want = id + 1
+		b.consumed++
 
 		// SECURITY SCOPE (audit 2026-09-06 S-2). The capture function is
 		// SECURITY DEFINER and, by default, EXECUTable by PUBLIC — so any
@@ -689,15 +754,32 @@ func (r *CDCReader) poll(ctx context.Context, lastSeen int64) (pollBatch, error)
 		// the dispatch filter strips a `schema.` prefix before matching —
 		// so `evil.orders` reached `<target>.orders`.
 		//
-		// The check is HERE, after the watermark advances and outside the
-		// SQL, on purpose. Filtering in the poll query would punch holes in
-		// the id sequence the window's contiguity + settled-ceiling logic
-		// reads, and the hole guard would then wait on rows that are never
-		// coming. Dropping the event after `want` has advanced keeps the
-		// stream moving and simply never emits the forged row.
+		// The check is HERE, after `want` advances and outside the SQL, on
+		// purpose. Filtering in the poll query would punch holes in the id
+		// sequence the window's contiguity + settled-ceiling logic reads,
+		// and the hole guard would then wait on rows that are never coming.
 		//
-		// A dropped row is WARNed once per (schema, table): it is either an
-		// attack or a misconfiguration, and both deserve to be visible.
+		// A dropped row MOVES THE WATERMARK (GC-43 (a)). It is inside the
+		// contiguous run — `want` already passed it — and it needs nothing
+		// applied for this stream, so the stream is done with it exactly as
+		// it is done with a row it emitted. Leaving b.lastID behind it was
+		// a SILENT STALL from v0.145.0 to v0.156.8: once a full window
+		// (batchSize rows) of out-of-scope rows sat above the watermark,
+		// every poll re-read the same window, dropped all of it, and
+		// advanced nothing — forever, at exit 0, with `sync health` green.
+		// An --include-table stream whose excluded tables took a 10k-row
+		// burst wedged permanently. The comment here used to say dropping
+		// "keeps the stream moving"; it did, only while an emitted row
+		// later in the same window carried the watermark past the drops.
+		// The in-memory advance is enough to keep the stream moving and is
+		// what a restart re-derives: the persisted token moves with the
+		// next in-scope change (see [CDCReader.pump] on why a position-only
+		// advance is not emitted).
+		//
+		// A row from a FOREIGN schema is WARNed once per (schema, table):
+		// it is either an attack or a moved table, and both deserve to be
+		// visible. A row the sync's own table filter excluded is neither —
+		// see [CDCReader.noteExcludedCapture].
 		// A DDL marker is decoded BEFORE the scope check: its relation OID
 		// is what keeps a moved captured table in scope (A0909-PG-MEDIUM-1).
 		var marker ddlMarker
@@ -705,7 +787,12 @@ func (r *CDCReader) poll(ctx context.Context, lastSeen int64) (pollBatch, error)
 			marker = decodeDDLMarker(pkJSON.String)
 		}
 		if !r.rowInCaptureScope(op, schema, table, marker.relID) {
-			r.warnOutOfScopeCapture(ctx, op, schema, table, id)
+			b.lastID = id
+			if schema == r.schema {
+				r.noteExcludedCapture(ctx, schema, table, id)
+			} else {
+				r.warnOutOfScopeCapture(ctx, op, schema, table, id)
+			}
 			continue
 		}
 
@@ -1240,11 +1327,44 @@ func (r *CDCReader) rowInCaptureScope(op, schema, table string, relID uint32) bo
 	return true
 }
 
-// warnOutOfScopeCapture reports a dropped change-log row once per
-// (schema, table). Once, because a forged table can produce rows at the
-// attacker's rate and a per-row WARN would be its own denial of service;
-// at all, because a dropped row is either an attack or a
-// misconfiguration and both need to be visible.
+// noteExcludedCapture records, once per table at DEBUG, a change-log row
+// dropped because the sync's OWN table filter (--include-table /
+// --exclude-table) excludes a table this install captures. That is the
+// operator's configuration working, the same drop the pipeline's
+// dispatch filter logs at DEBUG for every other engine, so it is not
+// WARNed.
+//
+// It is split from [CDCReader.warnOutOfScopeCapture] because that WARN's
+// moved-table probe cannot tell this case apart (GC-43 (c)): an excluded
+// table in the stream's own schema IS a captured relation, so its OID is
+// in capturedRelIDs and the probe answered "moved" — every --include-table
+// stream with a captured-but-excluded table logged CAPTURE-RELATION-MOVED,
+// claimed the table had changed schemas, and steered the operator to
+// --restart-from-scratch. The schema half of [CDCReader.rowInCaptureScope]
+// is the only half that can drop a row from a foreign schema, so the
+// caller splits on the row's schema alone.
+func (r *CDCReader) noteExcludedCapture(ctx context.Context, schema, table string, id int64) {
+	if r.excludedNoted == nil {
+		r.excludedNoted = make(map[string]bool)
+	}
+	if r.excludedNoted[table] {
+		return
+	}
+	r.excludedNoted[table] = true
+	slog.DebugContext(
+		ctx, "pgtrigger: skipping change-log rows for a captured table the sync's table filter excludes",
+		slog.String("schema", schema),
+		slog.String("table", table),
+		slog.Int64("first_change_log_id", id),
+	)
+}
+
+// warnOutOfScopeCapture reports a change-log row from a FOREIGN schema,
+// dropped, once per (schema, table). Once, because a forged table can
+// produce rows at the attacker's rate and a per-row WARN would be its own
+// denial of service; at all, because such a row is either an attack or a
+// moved table and both need to be visible. A row the sync's table filter
+// excluded never reaches here ([CDCReader.noteExcludedCapture]).
 //
 // TWO CAUSES, TWO MARKERS (audit 2026-09-15 A0915-PG-MEDIUM-1 / -2). A row
 // from a foreign schema is either a decoy (the S-2 attack, or a stale
