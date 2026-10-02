@@ -5,6 +5,8 @@ package mysql
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"math"
 	"testing"
 
@@ -17,8 +19,7 @@ import (
 // transaction open, emits a boundary-only transaction naming the resume point
 // past the file it ends; every guard skips it instead. The real-server
 // counterparts — an idle stream rotated twice, its old files purged, then
-// restarted — are TestCDCReader_RotationBoundary_* (engines/mysql) and
-// TestStreamer_IdleBinlogRotation_* (pipeline).
+// restarted — are TestStreamer_IdleBinlogRotation_* (pipeline).
 //
 // The expected positions are literals (the next file's name and offset 4) and
 // go-mysql's own GTID set algebra, never a second call into the reader.
@@ -57,19 +58,33 @@ func newFilePosRotationReader() *CDCReader {
 
 // assertRotationBoundary checks got is exactly the boundary pair: TxBegin then
 // TxCommit at one position, no ADR-0190 identity, no commit time. It returns
-// the decoded position.
+// the decoded position. Settled schema boundaries (GC-43 (r) F1) may sit
+// between the two; assertRotationBoundaryWith admits them.
 func assertRotationBoundary(t *testing.T, got []ir.Change) binlogPos {
 	t.Helper()
 	if len(got) != 2 {
 		t.Fatalf("emitted %d changes, want the boundary pair (TxBegin, TxCommit): %#v", len(got), got)
 	}
+	return assertRotationBoundaryWith(t, got)
+}
+
+func assertRotationBoundaryWith(t *testing.T, got []ir.Change) binlogPos {
+	t.Helper()
+	if len(got) < 2 {
+		t.Fatalf("emitted %d changes, want at least the boundary pair: %#v", len(got), got)
+	}
 	begin, ok := got[0].(ir.TxBegin)
 	if !ok {
 		t.Fatalf("first change is %T, want ir.TxBegin", got[0])
 	}
-	commit, ok := got[1].(ir.TxCommit)
+	commit, ok := got[len(got)-1].(ir.TxCommit)
 	if !ok {
-		t.Fatalf("second change is %T, want ir.TxCommit", got[1])
+		t.Fatalf("last change is %T, want ir.TxCommit", got[len(got)-1])
+	}
+	for _, c := range got[1 : len(got)-1] {
+		if _, ok := c.(ir.SchemaSnapshot); !ok {
+			t.Fatalf("inside the boundary transaction: %T, want only settled ir.SchemaSnapshot", c)
+		}
 	}
 	if begin.Position.Token != commit.Position.Token {
 		t.Errorf("boundary TxBegin %q and TxCommit %q differ; a row-less transaction's points coincide",
@@ -123,7 +138,7 @@ func TestRotationBoundary_GTIDCarriesFoldedStandaloneGroups(t *testing.T) {
 		queryEvent("OPTIMIZE TABLE users"), // in scope: leaves pendingDDLActive set
 		realRotate(rotationNextFile, 4),
 	)
-	p := assertRotationBoundary(t, got)
+	p := assertRotationBoundaryWith(t, got)
 	if p.Mode != positionModeGTID {
 		t.Fatalf("boundary mode = %q, want gtid", p.Mode)
 	}
@@ -140,7 +155,7 @@ func TestRotationBoundary_GTIDCarriesFoldedStandaloneGroups(t *testing.T) {
 // TestRotationBoundary_MariaDBCarriesLineage: the boundary carries the
 // standalone group's GTID and the lineage the rotate arm re-anchored. The
 // re-anchor itself needs a server (BINLOG_GTID_POS), so this drives the
-// emitter with the anchor already moved; TestCDCReader_RotationBoundary_MariaDB
+// emitter with the anchor already moved; TestStreamer_IdleBinlogRotation_MariaDB*
 // covers the arm end to end.
 func TestRotationBoundary_MariaDBCarriesLineage(t *testing.T) {
 	r := newStagingReader(t, FlavorMariaDB, "0-1-5")
@@ -157,7 +172,7 @@ func TestRotationBoundary_MariaDBCarriesLineage(t *testing.T) {
 	for c := range out {
 		got = append(got, c)
 	}
-	p := assertRotationBoundary(t, got)
+	p := assertRotationBoundaryWith(t, got)
 	if !containsGTID(t, FlavorMariaDB, p.GTIDSet, "0-1-6") {
 		t.Errorf("boundary set %q omits the standalone group 0-1-6", p.GTIDSet)
 	}
@@ -268,5 +283,129 @@ func TestRotationBoundary_GuardsSkip(t *testing.T) {
 					r.currentFile, rotationNextFile)
 			}
 		})
+	}
+}
+
+// snapshotTables lists the tables of the SchemaSnapshots in got, in order.
+func snapshotTables(got []ir.Change) []string {
+	var names []string
+	for _, c := range got {
+		if s, ok := c.(ir.SchemaSnapshot); ok {
+			names = append(names, s.Schema+"."+s.Table)
+		}
+	}
+	return names
+}
+
+// TestRotationBoundary_SettlesOwedSchemaBoundary is GC-43 (r) F1: an
+// in-scope DDL's schema boundary is emitted lazily, at the table's next row,
+// and a restart forgets it is owed — so a rotation boundary that persisted
+// past the DDL first, with no row in between, lost the forward. The boundary
+// must carry the settled snapshot, anchored at the DDL, inside its own
+// transaction; and once settled, the next rotation owes nothing.
+func TestRotationBoundary_SettlesOwedSchemaBoundary(t *testing.T) {
+	r := newStagingReader(t, FlavorVanilla, stagingUUID+":1-5")
+	dispatchAll(t, r, mysqlGTIDEvent(t, 6), queryEvent("ALTER TABLE users MODIFY id BIGINT"))
+	ddlAnchor := r.pendingDDLAnchor
+
+	got := dispatchAll(t, r, realRotate(rotationNextFile, 4))
+	assertRotationBoundaryWith(t, got)
+	if names := snapshotTables(got); len(names) != 1 || names[0] != "app.users" {
+		t.Fatalf("settled snapshots = %v, want [app.users] — the owed post-DDL boundary must precede the "+
+			"persisted position, or a restart loses the forward", names)
+	}
+	if snap := got[1].(ir.SchemaSnapshot); snap.Position != ddlAnchor {
+		t.Errorf("settled snapshot anchored at %v, want the DDL's own position %v (ADR-0049 #4c)", snap.Position, ddlAnchor)
+	}
+	if len(r.owedSchemaBoundary) != 0 {
+		t.Errorf("owed after settling: %v", r.owedSchemaBoundary)
+	}
+	if again := dispatchAll(t, r, realRotate("mysql-bin.000007", 4)); len(snapshotTables(again)) != 0 {
+		t.Errorf("the next rotation re-emitted a settled boundary: %v", snapshotTables(again))
+	}
+}
+
+// TestRotationBoundary_RealShapeChange_EveryModeSettles: a DDL that really
+// changed a table's shape settles inside the boundary in both position modes
+// (skipping in GTID mode was measured not to keep the forward; see
+// cdc_owed_schema_boundary.go).
+func TestRotationBoundary_RealShapeChange_EveryModeSettles(t *testing.T) {
+	widened := func(context.Context, *sql.DB, string, string, Flavor) (*tableSchema, error) {
+		return &tableSchema{
+			Schema: "app", Name: "users",
+			Columns: []*ir.Column{
+				{Name: "id", Type: ir.Integer{Width: 64}},
+				{Name: "extra", Type: ir.Varchar{Length: 16}, Nullable: true},
+			},
+			PrimaryKey: []string{"id"},
+		}, nil
+	}
+	t.Run("file/pos settles", func(t *testing.T) {
+		r := newStagingReader(t, FlavorVanilla, stagingUUID+":1-5")
+		r.posMode, r.gtidSet, r.currentFile, r.serverUUID = positionModeFilePos, nil, "mysql-bin.000005", stagingUUID
+		dispatchAll(t, r, queryEvent("ALTER TABLE users ADD COLUMN extra VARCHAR(16)"))
+		r.schemaLoader = widened
+		got := dispatchAll(t, r, realRotate(rotationNextFile, 4))
+		assertRotationBoundaryWith(t, got)
+		if names := snapshotTables(got); len(names) != 1 || names[0] != "app.users" {
+			t.Fatalf("settled snapshots = %v, want [app.users]", names)
+		}
+	})
+	t.Run("gtid settles", func(t *testing.T) {
+		r := newStagingReader(t, FlavorVanilla, stagingUUID+":1-5")
+		dispatchAll(t, r, mysqlGTIDEvent(t, 6), queryEvent("ALTER TABLE users ADD COLUMN extra VARCHAR(16)"))
+		r.schemaLoader = widened
+		got := dispatchAll(t, r, realRotate(rotationNextFile, 4))
+		assertRotationBoundaryWith(t, got)
+		if names := snapshotTables(got); len(names) != 1 || names[0] != "app.users" {
+			t.Fatalf("settled snapshots = %v, want [app.users]", names)
+		}
+		if len(r.owedSchemaBoundary) != 0 {
+			t.Errorf("owed after settling: %v", r.owedSchemaBoundary)
+		}
+	})
+}
+
+// TestRotationBoundary_RowSettlesTheOwedBoundary: the table's next row
+// settles it the ordinary way, and the rotation then owes nothing.
+func TestRotationBoundary_RowSettlesTheOwedBoundary(t *testing.T) {
+	r := newStagingReader(t, FlavorVanilla, stagingUUID+":1-5")
+	dispatchAll(
+		t, r,
+		mysqlGTIDEvent(t, 6), queryEvent("ALTER TABLE users MODIFY id BIGINT"),
+		mysqlGTIDEvent(t, 7), queryEvent("BEGIN"), insertRowEvent(1), xidEvent(),
+	)
+	assertRotationBoundary(t, dispatchAll(t, r, realRotate(rotationNextFile, 4)))
+}
+
+// TestRotationBoundary_OwedRebuildFailureSkips: an owed table that cannot be
+// rebuilt now leaves the boundary unsettleable, so nothing is emitted — the
+// pre-GC-43 (r) behaviour — rather than persisting past an owed forward.
+func TestRotationBoundary_OwedRebuildFailureSkips(t *testing.T) {
+	r := newStagingReader(t, FlavorVanilla, stagingUUID+":1-5")
+	dispatchAll(t, r, mysqlGTIDEvent(t, 6), queryEvent("ALTER TABLE users MODIFY id BIGINT"))
+	r.schemaLoader = func(context.Context, *sql.DB, string, string, Flavor) (*tableSchema, error) {
+		return nil, errors.New("transient: connection reset")
+	}
+	if got := dispatchAll(t, r, realRotate(rotationNextFile, 4)); len(got) != 0 {
+		t.Fatalf("emitted %d changes with an owed boundary unsettled, want none: %#v", len(got), got)
+	}
+	if _, owed := r.owedSchemaBoundary["app.users"]; !owed {
+		t.Error("a failed rebuild discharged the owed boundary")
+	}
+}
+
+// TestRotationBoundary_DroppedOwedTableSettlesEmpty: a table the DDL dropped
+// rebuilds with no columns; the lazy path would never reach it (no next row),
+// so it settles with nothing emitted and leaves no empty shape cached.
+func TestRotationBoundary_DroppedOwedTableSettlesEmpty(t *testing.T) {
+	r := newStagingReader(t, FlavorVanilla, stagingUUID+":1-5")
+	dispatchAll(t, r, mysqlGTIDEvent(t, 6), queryEvent("DROP TABLE users"))
+	r.schemaLoader = func(_ context.Context, _ *sql.DB, schema, table string, _ Flavor) (*tableSchema, error) {
+		return &tableSchema{Schema: schema, Name: table}, nil
+	}
+	assertRotationBoundary(t, dispatchAll(t, r, realRotate(rotationNextFile, 4)))
+	if _, cached := r.schemaCache["app.users"]; cached {
+		t.Error("the dropped table's empty shape was left in the decode cache")
 	}
 }

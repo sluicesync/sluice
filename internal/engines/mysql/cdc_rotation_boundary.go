@@ -46,7 +46,11 @@ import (
 // The ROTATE is the last event of file N, and the dump stream is ordered, so
 // every event of N has been dispatched ahead of it. With no transaction open
 // and no GTID staged, each of those groups has either emitted its TxCommit or
-// been folded as a standalone group (item 132). The boundary then names:
+// been folded as a standalone group (item 132). That is not yet everything a
+// group owes: an in-scope DDL's schema boundary is emitted lazily, at each
+// table's next row, and a restart forgets it is owed (GC-43 (r) F1). So the
+// boundary first settles every owed table, inside its own transaction, or is
+// skipped (cdc_owed_schema_boundary.go). The boundary then names:
 //
 //   - file/pos: (N+1, the rotate's own Position — the first event of N+1).
 //     A resume reads every event of N+1 onward, which is everything not yet
@@ -125,11 +129,21 @@ func (r *CDCReader) emitRotationBoundary(ctx context.Context, e *replication.Rot
 			slog.String("file", string(e.NextLogName)), slog.Uint64("position", e.Position))
 		return nil
 	}
+	// A DDL's boundary is emitted lazily, at the table's next row, and a
+	// restart forgets that it is owed — so settle every owed one before
+	// persisting past the DDL, or skip (cdc_owed_schema_boundary.go).
+	owed, ok := r.owedSchemaBoundaryTables(ctx)
+	if !ok {
+		return nil
+	}
 	pos, err := r.positionAt(string(e.NextLogName), uint32(e.Position))
 	if err != nil {
 		return err
 	}
 	if err := send(ctx, out, ir.TxBegin{Position: pos}); err != nil {
+		return err
+	}
+	if err := r.settleSchemaBoundaries(ctx, owed, out); err != nil {
 		return err
 	}
 	return send(ctx, out, ir.TxCommit{Position: pos})

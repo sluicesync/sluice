@@ -6,10 +6,10 @@ package postgres
 import (
 	"context"
 	"fmt"
-	"reflect"
 	"strings"
 	"sync"
 
+	"sluicesync.dev/sluice/internal/appliershared"
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
@@ -67,14 +67,19 @@ import (
 // Values arrive as `any` off the wire and two encodings of the same logical
 // value can compare unequal. That is deliberately the tolerable direction: a
 // false CHANGED verdict costs a loud, explained refusal, while a false
-// UNCHANGED verdict would drop a real shard-key change silently. reflect.
-// DeepEqual is used for exactly that bias — it is conservative, and every way
-// it is wrong lands on the loud side.
+// UNCHANGED verdict would drop a real shard-key change silently. The
+// comparison is [appliershared.SameBoundValue] for exactly that bias.
+//
+// This used to be reflect.DeepEqual, and this paragraph said `-0.0` versus
+// `0.0` resolved to CHANGED. It did not: DeepEqual compares floats with ==,
+// under which they are equal, so a float8 shard key updated from 0 to -0 was
+// dropped from SET and the target kept 0, silently (found by the GC-41 (e)
+// review of the MySQL sibling). SameBoundValue compares floats by bits.
 //
 // Both images come off ONE decoder against the same relation column type, so
 // encoding drift between them is not a live risk on this lane; the surviving
-// asymmetries (`-0.0` versus `0.0`, a `time.Time` differing only by location,
-// whitespace in a json byte slice) all resolve to CHANGED, which refuses.
+// asymmetries (a `time.Time` differing only by location, whitespace in a json
+// byte slice) resolve to CHANGED, which refuses.
 //
 // # The load-bearing premise is the BEFORE-IMAGE, not the comparison
 //
@@ -244,7 +249,7 @@ func dropUnchangedShardKeys(schema, table string, before, after ir.Row, shardKey
 				),
 			}
 		}
-		if reflect.DeepEqual(bv, av) {
+		if appliershared.SameBoundValue(bv, av) {
 			drop = append(drop, k)
 			continue
 		}

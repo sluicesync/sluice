@@ -314,6 +314,15 @@ type CDCReader struct {
 	pendingDDLAnchor ir.Position
 	pendingDDLActive bool
 
+	// owedSchemaBoundary is the set of tables whose post-DDL boundary
+	// (the [ir.SchemaSnapshot] maybeSnapshotSchemaB1 emits, or decides is
+	// not needed) is still owed. Unlike pendingDDLActive — which, despite
+	// the comment above, nothing ever clears — it empties as tables settle,
+	// so it can answer "may a position past the DDL be persisted without a
+	// restart losing its forward?" (GC-43 (r) F1; cdc_owed_schema_boundary.go).
+	// Pump goroutine only.
+	owedSchemaBoundary map[string]struct{}
+
 	// snapshotSig is the per-qualified-table structural fingerprint of
 	// the schema-history version last emitted as an
 	// [ir.SchemaSnapshot] (ADR-0049 Chunk B1). Implements DP-1
@@ -1433,6 +1442,10 @@ func (r *CDCReader) dispatch(ctx context.Context, ev *replication.BinlogEvent, o
 			// before it is gone, so the rebuild after this DDL has something
 			// to be compared against even for a table no seed covered.
 			r.retainPriorShapes()
+			// GC-43 (r) F1: every table this reader knows now owes a
+			// post-DDL boundary, until its rebuild settles it
+			// (cdc_owed_schema_boundary.go).
+			r.oweSchemaBoundaries()
 			clear(r.schemaCache)
 			r.schemaCacheClears.Add(1) // ADR-0170 no-per-tx-churn pin
 
@@ -2017,6 +2030,10 @@ func (r *CDCReader) maybeSnapshotSchemaB1(ctx context.Context, qn string, tbl *t
 	if !r.pendingDDLActive || tbl == nil {
 		return nil
 	}
+	// Whatever this returns, the table's post-DDL boundary is settled: a
+	// version written, no delta, or a refusal that stops the stream
+	// (cdc_owed_schema_boundary.go).
+	delete(r.owedSchemaBoundary, qn)
 	if r.priorSig == nil {
 		// Lazy-init: the production constructor seeds this map, but unit
 		// readers built as a struct literal may omit it.

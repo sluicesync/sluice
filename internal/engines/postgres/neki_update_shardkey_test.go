@@ -4,6 +4,7 @@
 package postgres
 
 import (
+	"math"
 	"strings"
 	"testing"
 
@@ -125,6 +126,20 @@ func TestDropUnchangedShardKeysErrsTowardRefusing(t *testing.T) {
 	}
 	if ce, ok := sluicecode.FromError(err); !ok || ce.Code != sluicecode.CodeTargetShardKeyUpdateUnsupported {
 		t.Errorf("the conservative verdict did not arrive as the shard-key refusal: %v", err)
+	}
+}
+
+// A float shard key moved from 0 to -0 IS a change: float8 stores the two
+// distinctly, and reflect.DeepEqual (the previous comparison) called them
+// equal, dropping the column from SET and leaving the target at 0 silently.
+func TestDropUnchangedShardKeysSignedZeroIsAChange(t *testing.T) {
+	t.Parallel()
+	for _, pair := range [][2]any{{0.0, math.Copysign(0, -1)}, {float32(0), float32(math.Copysign(0, -1))}} {
+		_, err := dropUnchangedShardKeys("public", "orders",
+			shardKeyRow(pair[0], "old"), shardKeyRow(pair[1], "new"), []string{"tenant_id"})
+		if ce, ok := sluicecode.FromError(err); !ok || ce.Code != sluicecode.CodeTargetShardKeyUpdateUnsupported {
+			t.Errorf("%T +0 → -0: want the shard-key-change refusal, got %v", pair[0], err)
+		}
 	}
 }
 

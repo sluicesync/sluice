@@ -4,7 +4,6 @@
 package mysql
 
 import (
-	"reflect"
 	"strings"
 
 	"sluicesync.dev/sluice/internal/appliershared"
@@ -37,8 +36,8 @@ import (
 //
 // The WHERE clause is built from the before-image, so it carries `k = ?`
 // bound to before[k] for every key column the before-image holds. A column is
-// dropped only when after[k] is reflect.DeepEqual to before[k] — the same Go
-// value, so [prepareApplierValue] binds the same argument for the SET as for
+// dropped only when after[k] is [appliershared.SameBoundValue] to before[k] —
+// the same Go value, so [prepareApplierValue] binds the same argument for the SET as for
 // the WHERE. The statement therefore assigns k the very value its own WHERE
 // pinned k to, and a matched row's k compares equal to that value under the
 // column's collation. Two cases:
@@ -74,8 +73,16 @@ import (
 // keeps the column in SET, which is the pre-GC-41 behaviour (on a vtgate
 // target, a loud refusal). A looser equality could call a real key change
 // "unchanged": time.Time.Equal, for one, treats one instant in two locations
-// as equal while the DATETIME the two render to differs. A false "unchanged"
-// cannot arise from DeepEqual, because equal values bind equal arguments.
+// as equal while the DATETIME the two render to differs.
+//
+// DeepEqual alone was NOT strict enough for floats: it compares float64 and
+// float32 with ==, under which -0.0 equals +0.0, and a MySQL DOUBLE/FLOAT
+// key stores the two distinctly (verified on mysql:8.4: a DOUBLE PRIMARY KEY
+// holds -0). A source `UPDATE … SET k = -0` therefore read as "unchanged",
+// left SET, and the target kept +0 at exit 0 (GC-41 (e) review). So equality
+// is [appliershared.SameBoundValue]: floats by bit pattern, everything else
+// by DeepEqual; its doc carries the per-family audit. A false "unchanged"
+// cannot arise from it, because equal values bind equal arguments.
 //
 // # What is left alone
 //
@@ -114,7 +121,7 @@ func dropUnchangedKeyColumns(before, after ir.Row, pk []string, colTypes map[str
 			continue
 		}
 		bv, inBefore := before[col]
-		if !inBefore || !reflect.DeepEqual(bv, av) {
+		if !inBefore || !appliershared.SameBoundValue(bv, av) {
 			continue
 		}
 		if trimmed == nil {

@@ -4,6 +4,7 @@
 package mysql
 
 import (
+	"math"
 	"reflect"
 	"testing"
 	"time"
@@ -34,6 +35,13 @@ func TestDropUnchangedKeyColumns_EveryKeyFamily(t *testing.T) {
 		{"time.Time", utc, utc.Add(time.Microsecond)},
 		{"time.Time same instant other location", utc, utc.In(time.FixedZone("X", 7200))},
 		{"float64", float64(1.5), float64(-1.5)},
+		// Signed zero: == (and so reflect.DeepEqual) calls these equal, and a
+		// DOUBLE/FLOAT key stores them distinctly (mysql:8.4). Both widths
+		// and both directions.
+		{"float64 +0 to -0", float64(0), math.Copysign(0, -1)},
+		{"float64 -0 to +0", math.Copysign(0, -1), float64(0)},
+		{"float32 +0 to -0", float32(0), float32(math.Copysign(0, -1))},
+		{"[]any float element +0 to -0", []any{1.0, 0.0}, []any{1.0, math.Copysign(0, -1)}},
 		{"bool", true, false},
 	}
 	for _, f := range families {
