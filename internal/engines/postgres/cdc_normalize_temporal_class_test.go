@@ -13,7 +13,7 @@ import (
 )
 
 // temporalClassFamilies enumerates every IR temporal family the PG
-// normalizer's bare≡(0)≡(6) collapse dispatches on — the Bug-74 "pin
+// normalizer's bare≡(6) collapse dispatches on — the Bug-74 "pin
 // the class, not the representative" discipline. make builds the
 // family's type at a given (precision, unspecified) pair; canonical is
 // the family's ONE collapsed form ({Precision:0,
@@ -59,31 +59,88 @@ var temporalClassFamilies = []struct {
 	},
 }
 
-// temporalClassMembers are every representation of the bare≡(0)≡(6)
+// temporalClassMembers are every representation of the bare≡(6)
 // equivalence class that any IR source has ever produced for a
 // same-class column:
 //
 //   - {0, unspecified}: the TRIAGE-#3 bare form — what BOTH the
 //     SchemaReader (atttypmod=-1) and the CDC projection (typmod=-1)
 //     emit today.
-//   - {0, explicit}: the pre-TRIAGE-#3 CDC projection of a bare column
-//     (temporalTypmod(-1) returned 0), and an explicitly declared (0).
 //   - {6, explicit}: the pre-TRIAGE-#3 SchemaReader materialization of
 //     a bare column (information_schema datetime_precision=6), old
 //     persisted schema-history/lease rows, and an explicitly declared
 //     (6).
+//
+// An explicit {0, false} is NOT a member (GC-44 F3): it is a declared
+// (0), which holds whole seconds only — see temporalClassOutsider.
 var temporalClassMembers = []struct {
 	name   string
 	prec   int
 	unspec bool
 }{
 	{name: "bare_unspecified", prec: 0, unspec: true},
-	{name: "explicit_0", prec: 0, unspec: false},
 	{name: "explicit_6", prec: 6, unspec: false},
 }
 
+// temporalClassOutsider is the declared (0): it used to sit in the class
+// (a pre-TRIAGE-#3 CDC mapper decoded typmod -1 as 0), and keeping it
+// there made `timestamp(0)` → `timestamp(6)` classify as no change, so the
+// forward never ran and the target rounded every following value (GC-44
+// F3). It must stay distinct from every member, in every family.
+var temporalClassOutsider = struct {
+	name   string
+	prec   int
+	unspec bool
+}{name: "explicit_0", prec: 0, unspec: false}
+
+// TestNormalizeForCDCComparison_TemporalZeroIsNotInTheClass pins GC-44 F3
+// across every temporal family: a declared (0) survives the lens
+// unchanged, and against each class member it classifies as an ALTER
+// COLUMN TYPE in both directions — the boundary the forward needs.
+func TestNormalizeForCDCComparison_TemporalZeroIsNotInTheClass(t *testing.T) {
+	t.Parallel()
+	eng := Engine{}
+	o := temporalClassOutsider
+	for _, fam := range temporalClassFamilies {
+		t.Run(fam.name+"/passthrough", func(t *testing.T) {
+			in := &ir.Table{Columns: []*ir.Column{{Name: "ts", Type: fam.make(o.prec, o.unspec)}}}
+			out := eng.NormalizeForCDCComparison(in)
+			if got := out.Columns[0].Type; !reflect.DeepEqual(got, fam.make(o.prec, o.unspec)) {
+				t.Errorf("normalize(%#v) = %#v; want unchanged — a declared (0) is not in the bare≡(6) class",
+					fam.make(o.prec, o.unspec), got)
+			}
+		})
+		for _, m := range temporalClassMembers {
+			for _, dir := range []struct {
+				name      string
+				pre, post ir.Type
+			}{
+				{"zero_to_" + m.name, fam.make(o.prec, o.unspec), fam.make(m.prec, m.unspec)},
+				{m.name + "_to_zero", fam.make(m.prec, m.unspec), fam.make(o.prec, o.unspec)},
+			} {
+				t.Run(fam.name+"/"+dir.name, func(t *testing.T) {
+					mk := func(ts ir.Type) *ir.Table {
+						return eng.NormalizeForCDCComparison(&ir.Table{Schema: "public", Name: "w", Columns: []*ir.Column{
+							{Name: "id", Type: ir.Integer{Width: 32}},
+							{Name: "ts", Type: ts, Nullable: true},
+						}})
+					}
+					shape, err := pipeline.ClassifyShape(mk(dir.pre), mk(dir.post))
+					if err != nil {
+						t.Fatalf("ClassifyShape: %v", err)
+					}
+					if shape.Kind != pipeline.ShapeKindAlterColumnType {
+						t.Errorf("ClassifyShape(%v → %v) = %s; want alter-column-type — the change would never be "+
+							"forwarded and the target would keep its precision", dir.pre, dir.post, shape.Kind)
+					}
+				})
+			}
+		}
+	}
+}
+
 // TestNormalizeForCDCComparison_TemporalClassCanonicalForm pins the
-// TRIAGE-#3 regression fix: every member of the temporal bare≡(0)≡(6)
+// TRIAGE-#3 regression fix: every member of the temporal bare≡(6)
 // class collapses to the ONE canonical bare form, for every temporal
 // family. The canonical form MUST be the bare/unspecified one — it is
 // what both current IR sources natively emit, and it is the only class
@@ -127,7 +184,7 @@ func TestNormalizeForCDCComparison_TemporalClassCanonicalForm(t *testing.T) {
 // now implement: BOTH classifier sides pass through
 // NormalizeForCDCComparison (the seed at synthesis, each CDC snapshot
 // at intake), so ANY two representations of a same-class temporal
-// column compare equal — {bare, (0), (6)} × {bare, (0), (6)}, for
+// column compare equal — {bare, (6)} × {bare, (6)}, for
 // every temporal family:
 //
 //   - An otherwise-identical table must classify ShapeKindNone (no

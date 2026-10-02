@@ -470,7 +470,7 @@ const (
 // see this column move".
 //
 // Deliberately the RAW projected type, never the [normalizeTypeForCDCComparison]
-// lens: the temporal-collapse members (bare ≡ (0) ≡ (6)) DO move the raw
+// lens: the temporal-collapse members (bare ≡ (6)) DO move the raw
 // projection (Precision/PrecisionUnspecified differ), so they emit a boundary
 // and keep their documented downstream posture (the normalizer false-negative,
 // cdc_normalize.go) — keying on the normalized form would false-refuse the

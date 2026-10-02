@@ -67,17 +67,14 @@ import "sluicesync.dev/sluice/internal/ir"
 // limitation explicit at the comparison surface.
 //
 // Bug 86 also surfaced a Type-level asymmetry on the temporal family
-// (TIMESTAMP / TIMESTAMPTZ / TIME / TIMETZ): bare, (0), and (6) are one
+// (TIMESTAMP / TIMESTAMPTZ / TIME / TIMETZ): bare and (6) are one
 // equivalence class on PG (the engine default is 6), yet different IR
-// sources have represented that class differently over time (the
-// pre-TRIAGE-#3 SchemaReader materialized bare as an explicit 6; the
-// CDC OID mapper decoded typmod=-1 as 0; TRIAGE #3 gave both sides the
-// PrecisionUnspecified state). [normalizeTypeForCDCComparison]
-// collapses every class member to the ONE canonical bare form
-// ({Precision:0, PrecisionUnspecified:true}) so any two
-// representations compare equal — see the per-type cases for the
-// canonical-form rationale and the accepted false-negative-within-
-// the-class trade-off.
+// sources have represented it differently over time (the pre-TRIAGE-#3
+// SchemaReader materialized bare as an explicit 6; TRIAGE #3 gave both
+// sides the PrecisionUnspecified state). [normalizeTypeForCDCComparison]
+// collapses both members to the ONE canonical bare form
+// ({Precision:0, PrecisionUnspecified:true}) so either representation
+// compares equal. An explicit (0) is NOT a member (GC-44 F3, below).
 //
 // The normalization is a comparison LENS: the live-coordination
 // intercepts apply it to BOTH sides of every classifier comparison —
@@ -247,15 +244,24 @@ func normalizeTypeForCDCComparison(t ir.Type) ir.Type {
 		return v
 	case ir.DateTime:
 		// Bug 86 (v0.78.1) + TRIAGE #3 regression fix: the temporal
-		// collapse class is bare ≡ (0) ≡ (6). PG's engine default is 6,
-		// so all three forms decode the same wire values; historically
-		// they also round-tripped through different representations —
-		// the pre-TRIAGE-#3 SchemaReader materialized bare as
-		// Precision=6 (persisted schema-history/lease rows from older
-		// binaries still carry that), while the CDC OID mapper decoded
-		// typmod=-1 as Precision=0. Collapse every class member to ONE
-		// canonical form so any two representations of a same-class
-		// column compare equal in [pipeline.ClassifyShape].
+		// collapse class is bare ≡ (6). PG's engine default is 6, so the
+		// two store the same values; historically they also round-tripped
+		// through different representations — the pre-TRIAGE-#3
+		// SchemaReader materialized bare as Precision=6. Collapse both to
+		// ONE canonical form so either representation of the column
+		// compares equal in [pipeline.ClassifyShape].
+		//
+		// (0) LEFT THE CLASS (GC-44 F3). This said "bare ≡ (0) ≡ (6) …
+		// all three forms decode the same wire values", which was never
+		// true of what a column HOLDS: timestamp(0) rounds every value to
+		// whole seconds. The (0) member dated from a CDC OID mapper that
+		// decoded typmod -1 as Precision 0; [temporalTypmod] has returned
+		// PrecisionUnspecified for -1 since TRIAGE #3, so an explicit
+		// {0, false} on either side now always means a declared (0).
+		// Keeping it in the class made `timestamp(0)` → `timestamp(6)`
+		// classify as no change: the forward never ran and the target
+		// kept rounding every following value, at exit 0 (measured on
+		// postgres:16 — TestStreamer_PGTimestampZeroToSixForwards).
 		//
 		// The canonical form is the BARE one ({Precision:0,
 		// PrecisionUnspecified:true}) — NOT {0,false} — for two reasons:
@@ -271,11 +277,10 @@ func normalizeTypeForCDCComparison(t ir.Type) ir.Type {
 		// which is what turned the old canonical into a phantom-alter
 		// regression on bare temporal columns.
 		//
-		// Cost (unchanged, documented since v0.78.1): a genuine ALTER
-		// between two class members — e.g. timestamp(6) → timestamp(0)
-		// — is a false-negative at the classifier. Precisions 1–5 stay
-		// distinct and still classify.
-		if v.PrecisionUnspecified || v.Precision == 0 || v.Precision == 6 {
+		// Cost: an ALTER between the two class members (bare ⇄ (6)) is
+		// not classified — it changes nothing a value can hold. Every
+		// other precision, (0) included, stays distinct and classifies.
+		if v.PrecisionUnspecified || v.Precision == 6 {
 			v.Precision = 0
 			v.PrecisionUnspecified = true
 		}
@@ -283,7 +288,7 @@ func normalizeTypeForCDCComparison(t ir.Type) ir.Type {
 	case ir.Time:
 		// Same temporal collapse class as ir.DateTime above; PG `TIME`
 		// and `TIMETZ` default to precision 6 too.
-		if v.PrecisionUnspecified || v.Precision == 0 || v.Precision == 6 {
+		if v.PrecisionUnspecified || v.Precision == 6 {
 			v.Precision = 0
 			v.PrecisionUnspecified = true
 		}
@@ -291,7 +296,7 @@ func normalizeTypeForCDCComparison(t ir.Type) ir.Type {
 	case ir.Timestamp:
 		// Same temporal collapse class; covers `TIMESTAMP WITH TIME
 		// ZONE` (TIMESTAMPTZ).
-		if v.PrecisionUnspecified || v.Precision == 0 || v.Precision == 6 {
+		if v.PrecisionUnspecified || v.Precision == 6 {
 			v.Precision = 0
 			v.PrecisionUnspecified = true
 		}
