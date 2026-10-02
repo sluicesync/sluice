@@ -5,8 +5,10 @@ package mysql
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	gomysql "github.com/go-sql-driver/mysql"
@@ -81,7 +83,7 @@ func (r *SchemaReader) EnsureHeartbeatTable(ctx context.Context, tableName strin
 		return fmt.Errorf("mysql: ensure heartbeat table %q: %w", tableName, err)
 	}
 	if exists {
-		return nil
+		return checkHeartbeatTableShape(ctx, r.db, tableName)
 	}
 	ddl := "CREATE TABLE IF NOT EXISTS `" + tableName + "` (" +
 		"id        BIGINT       NOT NULL AUTO_INCREMENT, " +
@@ -96,6 +98,75 @@ func (r *SchemaReader) EnsureHeartbeatTable(ctx context.Context, tableName strin
 		return fmt.Errorf("mysql: ensure heartbeat table %q: %w", tableName, err)
 	}
 	return nil
+}
+
+// heartbeatTableShape is the column set EnsureHeartbeatTable creates, by
+// information_schema DATA_TYPE. Unchanged since the writer shipped
+// (v0.82.0), so a table any release created matches it.
+var heartbeatTableShape = map[string]string{"id": "bigint", "ts": "timestamp", "stream_id": "varchar"}
+
+// heartbeatTableShapeText renders [heartbeatTableShape] for the refusal.
+const heartbeatTableShapeText = "(id BIGINT AUTO_INCREMENT PRIMARY KEY, ts TIMESTAMP, stream_id VARCHAR(255)) and no other column"
+
+// checkHeartbeatTableShape refuses a table already present under the
+// heartbeat's name unless it has exactly the shape EnsureHeartbeatTable
+// creates. The writer INSERTs into the table and its prune DELETEs by ts, so
+// a name that collides with a user table — a typo in
+// --source-heartbeat-table-name — would write into and delete from the
+// SOURCE's data. Exactly the three columns, with their types: any other
+// column is evidence the table holds something besides heartbeats. Only a
+// base table qualifies: a view reads back no columns here and is refused (a
+// DELETE through an updatable view deletes from the table under it).
+func checkHeartbeatTableShape(ctx context.Context, db *sql.DB, tableName string) error {
+	rows, err := db.QueryContext(ctx,
+		"SELECT c.COLUMN_NAME, c.DATA_TYPE FROM information_schema.COLUMNS c "+
+			"JOIN information_schema.TABLES t ON t.TABLE_SCHEMA = c.TABLE_SCHEMA AND t.TABLE_NAME = c.TABLE_NAME "+
+			"WHERE c.TABLE_SCHEMA = DATABASE() AND c.TABLE_NAME = ? AND t.TABLE_TYPE = 'BASE TABLE' "+
+			"ORDER BY c.ORDINAL_POSITION", tableName)
+	if err != nil {
+		return fmt.Errorf("mysql: ensure heartbeat table %q: read its columns: %w", tableName, err)
+	}
+	defer func() { _ = rows.Close() }()
+	var found []string
+	matched := 0
+	for rows.Next() {
+		var name, dataType string
+		if err := rows.Scan(&name, &dataType); err != nil {
+			return fmt.Errorf("mysql: ensure heartbeat table %q: read its columns: %w", tableName, err)
+		}
+		found = append(found, name+" "+dataType)
+		if want, ok := heartbeatTableShape[strings.ToLower(name)]; ok && strings.EqualFold(dataType, want) {
+			matched++
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("mysql: ensure heartbeat table %q: read its columns: %w", tableName, err)
+	}
+	if matched == len(heartbeatTableShape) && len(found) == len(heartbeatTableShape) {
+		return nil
+	}
+	return refuseForeignHeartbeatTable(tableName, found)
+}
+
+// refuseForeignHeartbeatTable renders the [ir.ErrHeartbeatTableNotSluices]
+// refusal.
+func refuseForeignHeartbeatTable(tableName string, found []string) error {
+	return fmt.Errorf(
+		"mysql: %w: table `%s` already exists in the source database and is not sluice's heartbeat table "+
+			"(its columns: %s; sluice's heartbeat table has exactly %s). The heartbeat would INSERT rows into it and "+
+			"DELETE its rows by ts, so sluice refuses to touch it. Pick a --source-heartbeat-table-name that does not "+
+			"exist (sluice creates it), or turn the heartbeat off (drop --source-heartbeat-interval, or pass --no-source-heartbeat)",
+		ir.ErrHeartbeatTableNotSluices, tableName, describeFoundColumns(found), heartbeatTableShapeText,
+	)
+}
+
+// describeFoundColumns renders the columns the shape check read; none means
+// the name is not a base table (a view, say).
+func describeFoundColumns(found []string) string {
+	if len(found) == 0 {
+		return "none, it is not a base table"
+	}
+	return strings.Join(found, ", ")
 }
 
 // WriteHeartbeat implements [ir.HeartbeatWriter]. INSERTs one row with

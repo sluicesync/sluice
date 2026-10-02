@@ -418,6 +418,81 @@ func TestEnsureHeartbeatTable_DMLOnlyRole(t *testing.T) {
 	}
 }
 
+// TestEnsureHeartbeatTable_RefusesATableThatIsNotSluices pins the
+// HEARTBEAT-TABLE-NOT-SLUICES door on real Postgres (also the
+// postgres-trigger source, whose schema reader embeds this one). The
+// heartbeat writer INSERTs into its table and its prune DELETEs by ts, so
+// through v0.156.8 a --source-heartbeat-table-name naming a user table wrote
+// into and deleted from source data. Arms: user tables under the name (the
+// heartbeat's columns plus one; the right names with the wrong types; a
+// view) are refused with their rows untouched; a table created with the
+// exact DDL v0.82.0 shipped is accepted; a fresh name is created.
+func TestEnsureHeartbeatTable_RefusesATableThatIsNotSluices(t *testing.T) {
+	dsn, cleanup := startPostgresForCDC(t)
+	defer cleanup()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	applyPGSQL(t, dsn, `CREATE TABLE public.hb_extra (id BIGSERIAL PRIMARY KEY, ts TIMESTAMPTZ NOT NULL DEFAULT now(), stream_id TEXT NOT NULL, note TEXT)`)
+	applyPGSQL(t, dsn, `INSERT INTO public.hb_extra (ts, stream_id, note) VALUES ('2001-01-01', 'x', 'kept-1'), ('2001-01-02', 'y', 'kept-2')`)
+	applyPGSQL(t, dsn, `CREATE TABLE public.hb_types (id SERIAL PRIMARY KEY, ts TIMESTAMP NOT NULL, stream_id TEXT NOT NULL)`)
+	applyPGSQL(t, dsn, `INSERT INTO public.hb_types (ts, stream_id) VALUES ('2001-01-01', 'z')`)
+	applyPGSQL(t, dsn, `CREATE VIEW public.hb_view AS SELECT id, ts, stream_id FROM public.hb_extra`)
+	// v0.82.0's DDL, verbatim.
+	applyPGSQL(t, dsn, `CREATE TABLE IF NOT EXISTS public.hb_legacy (
+			id        BIGSERIAL    PRIMARY KEY,
+			ts        TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+			stream_id TEXT         NOT NULL
+		)`)
+
+	sr, err := Engine{}.OpenSchemaReader(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenSchemaReader: %v", err)
+	}
+	defer closeReader(t, sr)
+	pgsr := sr.(*SchemaReader)
+
+	for table, want := range map[string]string{"hb_extra": "note text", "hb_types": "id integer", "hb_view": "columns: none"} {
+		err := pgsr.EnsureHeartbeatTable(ctx, table)
+		if !errors.Is(err, ir.ErrHeartbeatTableNotSluices) {
+			t.Errorf("%s: EnsureHeartbeatTable = %v; want HEARTBEAT-TABLE-NOT-SLUICES", table, err)
+			continue
+		}
+		for _, frag := range []string{"HEARTBEAT-TABLE-NOT-SLUICES", table, want, "--source-heartbeat-table-name"} {
+			if !strings.Contains(err.Error(), frag) {
+				t.Errorf("%s: refusal does not name %q: %v", table, frag, err)
+			}
+		}
+	}
+
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	var n int
+	var notes string
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*), string_agg(note, ',' ORDER BY id) FROM public.hb_extra`).Scan(&n, &notes); err != nil {
+		t.Fatalf("read hb_extra: %v", err)
+	}
+	if n != 2 || notes != "kept-1,kept-2" {
+		t.Errorf("hb_extra after the refusal: %d rows %q; want the 2 original rows untouched", n, notes)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM public.hb_types`).Scan(&n); err != nil || n != 1 {
+		t.Errorf("hb_types after the refusal: %d rows (err %v); want 1", n, err)
+	}
+
+	if err := pgsr.EnsureHeartbeatTable(ctx, "hb_legacy"); err != nil {
+		t.Errorf("a table with the shape every release created was refused: %v", err)
+	}
+	if err := pgsr.EnsureHeartbeatTable(ctx, "hb_fresh"); err != nil {
+		t.Fatalf("fresh name: %v", err)
+	}
+	if err := pgsr.EnsureHeartbeatTable(ctx, "hb_fresh"); err != nil {
+		t.Errorf("the table EnsureHeartbeatTable just created was refused on the next start: %v", err)
+	}
+}
+
 // rewriteDSNCredentials replaces the user/password in a PG DSN so the
 // permission-denied test can connect as the restricted role.
 // startPostgresForCDC returns a DSN like:

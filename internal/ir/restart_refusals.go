@@ -50,6 +50,17 @@ var ErrDSNTimeZoneNotUTC = errors.New("DSN-TIME-ZONE-NOT-UTC")
 // same committed rows, so the write matches them again.
 var ErrKeyScopedWriteMatchedMultipleRows = errors.New("KEY-SCOPED-WRITE-MATCHED-MULTIPLE-ROWS")
 
+// ErrHeartbeatTableNotSluices classifies the refusal raised when the source
+// heartbeat (--source-heartbeat-interval) finds a table already present
+// under its name whose shape is not the one sluice creates. Through
+// v0.156.8 the writer used such a table as it found it: it INSERTed into it
+// (succeeding when stream_id was its only required column) and, when it had
+// a ts column, its prune DELETEd every row whose ts was older than the
+// window — on the SOURCE. A --source-heartbeat-table-name naming a user
+// table could therefore delete source rows. The table and the flag are
+// durable state a restart reads back unchanged.
+var ErrHeartbeatTableNotSluices = errors.New("HEARTBEAT-TABLE-NOT-SLUICES")
+
 // ErrChangeLogWatermarkStalled classifies the trigger-CDC (postgres-trigger)
 // refusal raised when a change-log poll read a gap-free window and the
 // stream's watermark did not reach it (GC-43 (a)'s tripwire). Only a sluice

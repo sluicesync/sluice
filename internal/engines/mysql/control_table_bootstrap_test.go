@@ -83,6 +83,9 @@ func (c bootConn) ExecContext(_ context.Context, query string, _ []driver.NamedV
 
 func (c bootConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
 	switch {
+	case strings.Contains(query, "c.COLUMN_NAME, c.DATA_TYPE"):
+		// The heartbeat shape check: a current target holds sluice's table.
+		return &shapeRows{rows: [][2]string{{"id", "bigint"}, {"ts", "timestamp"}, {"stream_id", "varchar"}}}, nil
 	case strings.Contains(query, "DATA_TYPE"):
 		// The item-65a widen detect: already LONGTEXT ⇒ no DDL.
 		return &bootRows{value: "longtext"}, nil
@@ -116,6 +119,24 @@ func (r *bootRows) Next(dest []driver.Value) error {
 	}
 	dest[0] = r.value
 	r.done = true
+	return nil
+}
+
+// shapeRows serves a two-column (name, type) result, one row per entry.
+type shapeRows struct {
+	rows [][2]string
+	next int
+}
+
+func (*shapeRows) Columns() []string { return []string{"name", "type"} }
+func (*shapeRows) Close() error      { return nil }
+
+func (r *shapeRows) Next(dest []driver.Value) error {
+	if r.next >= len(r.rows) {
+		return io.EOF
+	}
+	dest[0], dest[1] = r.rows[r.next][0], r.rows[r.next][1]
+	r.next++
 	return nil
 }
 

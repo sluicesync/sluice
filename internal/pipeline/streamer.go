@@ -1990,12 +1990,17 @@ func (s *Streamer) runOnce(ctx context.Context) (err error) {
 	// It runs BEFORE the cold start, so the table it creates exists when
 	// the copy reads the source schema; a custom-named one is kept out of
 	// scope by phaseResolveStreamIdentity. Skipped on DryRun
-	// (writes are not dry-run-safe). Non-fatal on every branch: a
-	// missing engine surface, failed source open, or insufficient
-	// privilege all WARN once and leave the writer unattached. See
+	// (writes are not dry-run-safe). Non-fatal on every branch but one:
+	// a missing engine surface, failed source open, or insufficient
+	// privilege all WARN once and leave the writer unattached; a table
+	// under the heartbeat's name that is not sluice's stops the stream
+	// (HEARTBEAT-TABLE-NOT-SLUICES), before anything writes to it. See
 	// attachSourceHeartbeat for the gating logic.
 	if !s.DryRun {
-		heartbeat := s.attachSourceHeartbeat(ctx, streamID)
+		heartbeat, err := s.attachSourceHeartbeat(ctx, streamID)
+		if err != nil {
+			return fmt.Errorf("pipeline: source heartbeat: %w", err)
+		}
 		defer heartbeat.Close()
 	}
 

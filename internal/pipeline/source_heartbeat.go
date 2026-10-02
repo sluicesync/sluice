@@ -20,11 +20,14 @@ package pipeline
 // CLAUDE.md's loud-failure tenet: a brand-new sluice user pointed at a
 // regulated source shouldn't suddenly observe new tables and writes.
 //
-// **Non-fatal on every branch.** Missing engine surface (engine doesn't
-// implement [ir.HeartbeatWriter]), failed source open, insufficient
-// privilege on the source — all degrade to "WARN once, skip the writer"
-// rather than failing the streamer. The CDC consumer still works
-// without F17; the heartbeat just doesn't fire.
+// **Non-fatal on every branch but one.** Missing engine surface (engine
+// doesn't implement [ir.HeartbeatWriter]), failed source open,
+// insufficient privilege on the source — all degrade to "WARN once, skip
+// the writer" rather than failing the streamer. The CDC consumer still
+// works without F17; the heartbeat just doesn't fire. The exception is a
+// table already present under the heartbeat's name that is not sluice's
+// ([ir.ErrHeartbeatTableNotSluices]): the writer would INSERT into it and
+// prune it by ts, so the stream stops before either happens.
 //
 // The wiring mirrors [Streamer.attachSlotHealthProbe] (F13 / ADR-0059):
 // per-stream dedicated source connection, per-stream goroutine, cleanup
@@ -60,12 +63,12 @@ const DefaultSourceHeartbeatTableName = "sluice_heartbeat"
 // SAME condition [Streamer.attachSourceHeartbeat] attaches under, so a
 // stray flag value with the heartbeat off cannot hide a user table.
 //
-// Residual, named: with the heartbeat ON, a name that collides with a
-// user table hides that table from the sync. Nothing checks the shape
-// of a table EnsureHeartbeatTable finds already present, and the
-// writer's INSERT and ts-based prune would already be writing into and
-// deleting from it on the source, so the collision was harmful before
-// this exclusion existed; it is not detected here either.
+// A name that collides with a user table cannot reach the exclusion with
+// the stream running: EnsureHeartbeatTable refuses a present table whose
+// shape is not the heartbeat's ([ir.ErrHeartbeatTableNotSluices]), and
+// [Streamer.attachSourceHeartbeat] stops the stream on it. The residual is a
+// user table that happens to have exactly the heartbeat's three columns
+// and types.
 func (s *Streamer) customSourceHeartbeatTable() string {
 	if s.SourceHeartbeatInterval <= 0 || s.NoSourceHeartbeat {
 		return ""
@@ -237,20 +240,23 @@ func sourceHeartbeatLoop(
 //     operator's role lacks CREATE TABLE.
 //
 // Every skip path WARNs once and returns the noop attachment; the
-// streamer continues without the writer.
+// streamer continues without the writer. The one exception returns an
+// error that stops the stream: a table already present under the
+// heartbeat's name that is not sluice's ([ir.ErrHeartbeatTableNotSluices]),
+// refused before the writer INSERTs into it or prunes it.
 //
 // **Why a dedicated SchemaReader.** The CDC reader's connection lives
 // in replication mode and isn't safe for ad-hoc INSERTs; opening a
 // dedicated connection for the heartbeat keeps the two paths
 // independent. The per-tick INSERT + bounded prune is cheap (one short
 // statement each) so the dedicated connection's cost is trivial.
-func (s *Streamer) attachSourceHeartbeat(ctx context.Context, streamID string) *sourceHeartbeatAttachment {
+func (s *Streamer) attachSourceHeartbeat(ctx context.Context, streamID string) (*sourceHeartbeatAttachment, error) {
 	noop := &sourceHeartbeatAttachment{}
 	if s.SourceHeartbeatInterval <= 0 || s.NoSourceHeartbeat {
-		return noop
+		return noop, nil
 	}
 	if s.Source == nil || s.SourceDSN == "" {
-		return noop
+		return noop, nil
 	}
 
 	tableName := s.SourceHeartbeatTableName
@@ -267,7 +273,7 @@ func (s *Streamer) attachSourceHeartbeat(ctx context.Context, streamID string) *
 			slog.String("err", err.Error()),
 			slog.String("see", "ADR-0061"),
 		)
-		return noop
+		return noop, nil
 	}
 	writer, ok := sr.(ir.HeartbeatWriter)
 	if !ok {
@@ -279,9 +285,18 @@ func (s *Streamer) attachSourceHeartbeat(ctx context.Context, streamID string) *
 			slog.String("stream_id", streamID),
 			slog.String("engine", s.Source.Name()),
 		)
-		return noop
+		return noop, nil
 	}
 	if err := writer.EnsureHeartbeatTable(ctx, tableName); err != nil {
+		if errors.Is(err, ir.ErrHeartbeatTableNotSluices) {
+			// The one branch that is NOT degrade-and-continue: the name
+			// resolves to a table that is not sluice's, and running the
+			// stream without the writer would leave the operator believing
+			// the heartbeat is on. Nothing has been written to it; the
+			// stream stops before any other step touches the source.
+			migcore.CloseIf(sr)
+			return noop, err
+		}
 		if errors.Is(err, ir.ErrHeartbeatPermission) {
 			slog.WarnContext(
 				ctx, "source heartbeat: insufficient privilege to create heartbeat table — skipping writer",
@@ -295,7 +310,7 @@ func (s *Streamer) attachSourceHeartbeat(ctx context.Context, streamID string) *
 				slog.String("err", err.Error()),
 			)
 			migcore.CloseIf(sr)
-			return noop
+			return noop, nil
 		}
 		// Other DDL failures are also non-fatal — WARN, skip, continue.
 		slog.WarnContext(
@@ -306,7 +321,7 @@ func (s *Streamer) attachSourceHeartbeat(ctx context.Context, streamID string) *
 			slog.String("see", "ADR-0061"),
 		)
 		migcore.CloseIf(sr)
-		return noop
+		return noop, nil
 	}
 
 	probeCtx, cancel := context.WithCancel(ctx)
@@ -325,5 +340,5 @@ func (s *Streamer) attachSourceHeartbeat(ctx context.Context, streamID string) *
 		slog.Duration("prune_window", pruneWindow),
 		slog.String("see", "ADR-0061"),
 	)
-	return att
+	return att, nil
 }

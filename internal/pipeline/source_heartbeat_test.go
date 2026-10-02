@@ -327,7 +327,10 @@ func TestAttachSourceHeartbeat_OptOutInterval(t *testing.T) {
 		SourceDSN:               "fake://dsn",
 		SourceHeartbeatInterval: 0,
 	}
-	att := s.attachSourceHeartbeat(context.Background(), "stream-z")
+	att, err := s.attachSourceHeartbeat(context.Background(), "stream-z")
+	if err != nil {
+		t.Fatalf("attachSourceHeartbeat on opt-out: %v", err)
+	}
 	if att == nil {
 		t.Fatal("attachSourceHeartbeat should return non-nil even on opt-out")
 	}
@@ -346,7 +349,10 @@ func TestAttachSourceHeartbeat_OptOutFlag(t *testing.T) {
 		SourceHeartbeatInterval: 30 * time.Second,
 		NoSourceHeartbeat:       true,
 	}
-	att := s.attachSourceHeartbeat(context.Background(), "stream-z")
+	att, err := s.attachSourceHeartbeat(context.Background(), "stream-z")
+	if err != nil {
+		t.Fatalf("attachSourceHeartbeat on opt-out: %v", err)
+	}
 	if att == nil {
 		t.Fatal("attachSourceHeartbeat should return non-nil even on opt-out")
 	}
@@ -386,4 +392,51 @@ func (fakeEngineForHeartbeatTest) OpenChangeApplier(_ context.Context, _ string)
 
 func (fakeEngineForHeartbeatTest) OpenSnapshotStream(_ context.Context, _ string) (*ir.SnapshotStream, error) {
 	panic("not implemented")
+}
+
+// refusingHeartbeatSource is a source whose schema reader is a heartbeat
+// writer that refuses the table, the way an engine does on a table under
+// the heartbeat's name that is not sluice's.
+type refusingHeartbeatSource struct {
+	fakeEngineForHeartbeatTest
+	w *refusingHeartbeatReader
+}
+
+func (e refusingHeartbeatSource) OpenSchemaReader(context.Context, string) (ir.SchemaReader, error) {
+	return e.w, nil
+}
+
+type refusingHeartbeatReader struct {
+	stubHeartbeatWriter
+}
+
+func (*refusingHeartbeatReader) ReadSchema(context.Context) (*ir.Schema, error) {
+	return &ir.Schema{}, nil
+}
+
+// TestAttachSourceHeartbeat_ForeignTableStopsTheStream pins that the one
+// EnsureHeartbeatTable failure that is not degrade-and-continue reaches the
+// caller: a HEARTBEAT-TABLE-NOT-SLUICES refusal comes back as an error
+// carrying the sentinel (so runOnce stops and the fleet supervisor does not
+// restart), and the writer never INSERTs or prunes.
+func TestAttachSourceHeartbeat_ForeignTableStopsTheStream(t *testing.T) {
+	w := &refusingHeartbeatReader{}
+	w.ensureErr = fmt.Errorf("mysql: %w: table `orders` already exists", ir.ErrHeartbeatTableNotSluices)
+	s := &Streamer{
+		Source:                   refusingHeartbeatSource{w: w},
+		SourceDSN:                "fake://dsn",
+		SourceHeartbeatInterval:  10 * time.Millisecond,
+		SourceHeartbeatTableName: "orders",
+	}
+	att, err := s.attachSourceHeartbeat(context.Background(), "stream-z")
+	if !errors.Is(err, ir.ErrHeartbeatTableNotSluices) {
+		t.Fatalf("attachSourceHeartbeat = %v; want the HEARTBEAT-TABLE-NOT-SLUICES refusal returned, not degraded to a WARN", err)
+	}
+	att.Close()
+	if n := w.writeCalls.Load() + w.pruneCalls.Load(); n != 0 {
+		t.Errorf("the writer touched a refused table %d time(s)", n)
+	}
+	if refusalARestartRepeats(fmt.Errorf("pipeline: source heartbeat: %w", err)) == nil {
+		t.Error("the refusal is not on the supervisor's no-restart list")
+	}
 }

@@ -68,6 +68,12 @@ import (
 //     restarting forever behind backoff is the silent stall the refusal
 //     exists to end, while not restarting costs one `sync start` by hand
 //     (see [ir.ErrChangeLogWatermarkStalled]).
+//   - HEARTBEAT-TABLE-NOT-SLUICES (MySQL-family and Postgres sources,
+//     codeless): listed. The table under the heartbeat's name and the
+//     --source-heartbeat-table-name naming it are both unchanged by a
+//     restart, which reads the same columns and refuses again. A fleet
+//     spec carries no source-heartbeat key today, so no leg can reach it
+//     yet; it is listed so one added later is not restarted forever.
 //   - DEFERRED-KEY-CHECK-FAILED-AT-COMMIT (Postgres target, codeless): NOT
 //     listed. It is the COMMIT of a target transaction that a deferrable
 //     constraint's re-check refused, and one of its causes is a source
@@ -96,6 +102,7 @@ var refusalsARestartRepeats = []error{
 	ir.ErrDSNTimeZoneNotUTC,
 	ir.ErrKeyScopedWriteMatchedMultipleRows,
 	ir.ErrChangeLogWatermarkStalled,
+	ir.ErrHeartbeatTableNotSluices,
 }
 
 // refusalARestartRepeats returns the listed sentinel err carries, or nil.

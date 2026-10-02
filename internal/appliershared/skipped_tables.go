@@ -38,7 +38,12 @@ import (
 // durable unknown-target-table skip ledger (audit C-11): one row per
 // (stream_id, table_name) with a cumulative skip count and the first /
 // last skipped source position tokens. Rows survive restarts and
-// accumulate; they are cleared only by [ir.StreamCleaner]-style resets.
+// accumulate, and nothing in sluice deletes them: not a remedy that
+// stops the skipping (`schema add-table`, a table filter, a restored
+// grant) and not [ir.StreamCleaner] (ClearStream removes the
+// sluice_cdc_state row and apply marks only; `sync status` renders a
+// ledger a cleared stream left behind). `sync health` therefore keeps
+// exiting 1 on a row until an operator deletes it on the target.
 const SkippedTablesTableName = "sluice_cdc_skipped_tables"
 
 // SkippedTableRemedy aliases the ir-level remedy string so the

@@ -81,6 +81,11 @@ func (c ensureConn) QueryContext(_ context.Context, query string, args []driver.
 			}
 		}
 		return &ensureRows{cols: []string{"name"}, rows: rows}, nil
+	case strings.Contains(query, "pg_catalog.format_type"):
+		// The heartbeat shape check: a current target holds sluice's table.
+		return &ensureRows{cols: []string{"name", "type"}, rows: [][]driver.Value{
+			{"id", "bigint"}, {"ts", "timestamp with time zone"}, {"stream_id", "text"},
+		}}, nil
 	case strings.Contains(query, "has_sequence_privilege"):
 		return &ensureRows{cols: []string{"ok"}, rows: [][]driver.Value{{true}}}, nil
 	case strings.Contains(query, "current_setting('TimeZone')"):

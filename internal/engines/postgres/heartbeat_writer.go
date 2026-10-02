@@ -5,8 +5,10 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
@@ -82,6 +84,9 @@ func (r *SchemaReader) EnsureHeartbeatTable(ctx context.Context, tableName strin
 		return fmt.Errorf("postgres: ensure heartbeat table %q: detect: %w", tableName, err)
 	}
 	if present {
+		if err := checkHeartbeatTableShape(ctx, r.db, tableRef, tableName); err != nil {
+			return err
+		}
 		// The id is BIGSERIAL, so every INSERT draws from its sequence: a
 		// role granted INSERT on the table but not USAGE on the sequence
 		// fails every heartbeat. Say so now, with the grant, on the same
@@ -113,6 +118,72 @@ func (r *SchemaReader) EnsureHeartbeatTable(ctx context.Context, tableName strin
 		return fmt.Errorf("postgres: ensure heartbeat table %q: %w", tableName, err)
 	}
 	return nil
+}
+
+// heartbeatTableShape is the column set EnsureHeartbeatTable creates, by
+// pg_catalog.format_type. Unchanged since the writer shipped (v0.82.0), so a
+// table any release created matches it.
+var heartbeatTableShape = map[string]string{"id": "bigint", "ts": "timestamp with time zone", "stream_id": "text"}
+
+// heartbeatTableShapeText renders [heartbeatTableShape] for the refusal.
+const heartbeatTableShapeText = "(id BIGSERIAL PRIMARY KEY, ts TIMESTAMPTZ, stream_id TEXT) and no other column"
+
+// checkHeartbeatTableShape refuses a relation already present under the
+// heartbeat's name unless it has exactly the shape EnsureHeartbeatTable
+// creates. The writer INSERTs into it and its prune DELETEs by ts, so a name
+// that collides with a user table — a typo in --source-heartbeat-table-name
+// — would write into and delete from the SOURCE's data. Exactly the three
+// columns, with their types: any other column is evidence the relation holds
+// something besides heartbeats. Only an ordinary table qualifies: a view or
+// foreign table reads back no columns here and is refused (a DELETE through
+// a simple view deletes from the table under it). ref is the quoted
+// schema-qualified name.
+func checkHeartbeatTableShape(ctx context.Context, db *sql.DB, ref, tableName string) error {
+	rows, err := db.QueryContext(ctx, `
+		SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod)
+		FROM pg_catalog.pg_attribute a
+		JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+		WHERE a.attrelid = pg_catalog.to_regclass($1) AND a.attnum > 0 AND NOT a.attisdropped
+		  AND c.relkind = 'r'
+		ORDER BY a.attnum`, ref)
+	if err != nil {
+		return fmt.Errorf("postgres: ensure heartbeat table %q: read its columns: %w", tableName, err)
+	}
+	defer func() { _ = rows.Close() }()
+	var found []string
+	matched := 0
+	for rows.Next() {
+		var name, typ string
+		if err := rows.Scan(&name, &typ); err != nil {
+			return fmt.Errorf("postgres: ensure heartbeat table %q: read its columns: %w", tableName, err)
+		}
+		found = append(found, name+" "+typ)
+		if heartbeatTableShape[name] == typ {
+			matched++
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("postgres: ensure heartbeat table %q: read its columns: %w", tableName, err)
+	}
+	if matched == len(heartbeatTableShape) && len(found) == len(heartbeatTableShape) {
+		return nil
+	}
+	return fmt.Errorf(
+		"postgres: %w: relation %s already exists on the source and is not sluice's heartbeat table "+
+			"(its columns: %s; sluice's heartbeat table has exactly %s). The heartbeat would INSERT rows into it and "+
+			"DELETE its rows by ts, so sluice refuses to touch it. Pick a --source-heartbeat-table-name that does not "+
+			"exist (sluice creates it), or turn the heartbeat off (drop --source-heartbeat-interval, or pass --no-source-heartbeat)",
+		ir.ErrHeartbeatTableNotSluices, ref, describeFoundColumns(found), heartbeatTableShapeText,
+	)
+}
+
+// describeFoundColumns renders the columns the shape check read; none means
+// the relation is not an ordinary table (a view, say).
+func describeFoundColumns(found []string) string {
+	if len(found) == 0 {
+		return "none, it is not an ordinary table"
+	}
+	return strings.Join(found, ", ")
 }
 
 // WriteHeartbeat implements [ir.HeartbeatWriter]. INSERTs one row with
