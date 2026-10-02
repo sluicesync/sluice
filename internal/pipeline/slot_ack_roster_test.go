@@ -96,6 +96,13 @@ func TestSlotAckReleaseRoster_EveryStreamChangesSiteReleases(t *testing.T) {
 				t.Errorf("%s is classified as a backup-chain site but %s never calls releaseChainAckTo — "+
 					"the chain's slot would never advance (GC-41)", key, file)
 			}
+			// The reader's slot door refuses a chain resume too, and must
+			// say the position is the chain's — not a sync target's control
+			// row, with a `sync start` flag the chain has no use for.
+			if !funcCalls[key]["setResumeOrigin"] {
+				t.Errorf("%s is a backup-chain site but never calls setResumeOrigin — its reader's "+
+					"SLOT-ACKED-PAST-TARGET-POSITION refusal would name sluice_cdc_state and a sync flag (GC-41 (k))", key)
+			}
 		}
 	}
 	if len(unclassified) > 0 {

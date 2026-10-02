@@ -513,6 +513,10 @@ func (b *BackupStream) Run(ctx context.Context) (err error) {
 				// ack holds at resumeFrom (the parent's committed end)
 				// until the next rollover releases its window (GC-41).
 				resumeFrom := currentParent.EndPosition
+				// No chain preflight runs on this reopen, so the reader's
+				// slot door is the only guard here: it must name the
+				// chain, not a sync target (GC-41 (k)).
+				setResumeOrigin(cdc, ir.CDCResumeOriginBackupChain)
 				changesCh, err = cdc.StreamChanges(ctx, resumeFrom)
 				if err != nil {
 					if errors.Is(err, ir.ErrPositionInvalid) {
@@ -890,6 +894,9 @@ func (b *BackupStream) newRolloverLoop(ctx context.Context) (*rolloverInit, erro
 	// refreshed to each committed rollover's EndPosition in commitRollover
 	// (see chainConsumerID for the stated residual). A no-op elsewhere.
 	registerChainConsumer(ctx, cdc, b.Store, startPos, "stream")
+	// The resume position is the chain's: a refusal about it names the
+	// chain and a new full as the remedy (GC-41 (k)).
+	setResumeOrigin(cdc, ir.CDCResumeOriginBackupChain)
 
 	changesCh, err := cdc.StreamChanges(ctx, startPos)
 	if err != nil {

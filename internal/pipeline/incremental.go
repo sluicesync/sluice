@@ -343,6 +343,9 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 	// to the committed EndPosition in commitWindow (see chainConsumerID for
 	// the stated residual). A no-op on every other source.
 	registerChainConsumer(ctx, cdc, b.Store, startPos, "incremental")
+	// The resume position is the chain's: a refusal about it names the
+	// chain and a new full as the remedy (GC-41 (k)).
+	setResumeOrigin(cdc, ir.CDCResumeOriginBackupChain)
 
 	changesCh, err := cdc.StreamChanges(ctx, startPos)
 	if err != nil {

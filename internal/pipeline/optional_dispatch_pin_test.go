@@ -130,6 +130,11 @@ var (
 	// make the flag silently inert and the refusal permanent — loud, but
 	// with the documented override gone.
 	_ slotAckedPastAcceptor = (*postgres.CDCReader)(nil)
+	// GC-41 (k): where the resume position came from, which that refusal
+	// names with its remedy. A rename would leave every refusal unstated —
+	// accurate but unspecific — and a backup chain's no longer refusing the
+	// sync acknowledgement by name.
+	_ resumeOriginNoter = (*postgres.CDCReader)(nil)
 )
 
 // unpinnedPipelineSurfaces is the FROZEN remainder: pipeline-local interfaces

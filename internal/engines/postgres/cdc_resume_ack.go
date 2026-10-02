@@ -102,6 +102,82 @@ func (r *CDCReader) AcceptSlotAckedPastPosition(confirmedFlush string) {
 	r.ackedPastAccepted = confirmedFlush
 }
 
+// SetResumeOrigin records where the caller read the resume position from, so
+// a refusal names it and the remedy that fits (GC-41 (k)). Must be called
+// before StreamChanges; unset, the refusal names no holder.
+//
+// A backup chain has NO acknowledgement, deliberately, and this reader
+// enforces that rather than trusting its callers not to pass one: the
+// chain's own preflight refuses the same shape with "take a fresh full
+// backup" and no override (engine PreflightChainResume), so the door here
+// — which a chain reaches as a backstop after that preflight, and as the
+// only guard when `backup stream` reopens its pump after a transient error,
+// where the preflight does not run — must not answer the same question
+// differently. And the sync acknowledgement's premise cannot hold for a
+// chain: it says the TARGET already holds the gap, while the gap lies past
+// the chain's last committed end, so no link of the chain holds it, and
+// every restore crossing it would silently lack it.
+func (r *CDCReader) SetResumeOrigin(origin ir.CDCResumeOrigin) {
+	r.resumeOrigin = origin
+}
+
+// slotAckedPastWording is the part of the SLOT-ACKED-PAST-TARGET-POSITION
+// refusal that depends on where the resume position came from: what it is,
+// what holds the changes before it, why the slot can be ahead of it, and the
+// remedy, and whether --accept-slot-acked-past-position applies. Only the two
+// `sync` origins offer it: the flag exists only on `sync start`, and a backup
+// chain refuses one by design ([CDCReader.SetResumeOrigin]); an unstated
+// origin offers none rather than naming a flag its caller may not have.
+type slotAckedPastWording struct {
+	position, holder, causes, remedy string
+	acknowledgeable                  bool
+}
+
+// wordingForResumeOrigin is the refusal's wording for origin.
+func wordingForResumeOrigin(origin ir.CDCResumeOrigin) slotAckedPastWording {
+	switch origin {
+	case ir.CDCResumeOriginTargetControlRow:
+		return slotAckedPastWording{
+			position: "read from the target's sluice_cdc_state",
+			holder:   "the target does not hold them",
+			causes: "a stop of a Postgres → MySQL-family sync on sluice v0.156.6 or earlier (the slot was acknowledged " +
+				"past changes still in an apply batch); a target restored or failed over to an older state; or the slot " +
+				"dropped and recreated after this stream's position was written (e.g. an interrupted --restart-from-scratch)",
+			remedy:          "re-copy with `sync start --restart-from-scratch` (or re-copy the affected tables)",
+			acknowledgeable: true,
+		}
+	case ir.CDCResumeOriginChainHandoff:
+		return slotAckedPastWording{
+			position: "the end position of the backup chain named by --position-from-manifest",
+			holder:   "the target, restored from that chain, does not hold them",
+			causes: "the slot was created, or advanced by another consumer, after the chain's last link was captured; " +
+				"or the slot was dropped and recreated since",
+			remedy: "restore from a fresh full backup and hand off from its chain, or re-copy with " +
+				"`sync start --restart-from-scratch`",
+			acknowledgeable: true,
+		}
+	case ir.CDCResumeOriginBackupChain:
+		return slotAckedPastWording{
+			position: "the end position of the backup chain's last committed manifest",
+			holder:   "no link of the chain holds them",
+			causes: "the slot was advanced by another consumer (e.g. a `sluice sync` on the same slot), or dropped and " +
+				"recreated, after the chain's last committed window",
+			remedy: "start a new chain with a full backup (`backup full --chain-slot` anchors a slot at the backup's own " +
+				"position). A chain has no acknowledgement for this: every restore that crossed the gap would silently " +
+				"lack it",
+		}
+	default:
+		return slotAckedPastWording{
+			position: "persisted by this stream's consumer",
+			holder:   "the consumer does not hold them",
+			causes: "the slot was acknowledged past the consumer's durable position, advanced by another consumer, or " +
+				"dropped and recreated after the position was written",
+			remedy: "for `sync`, re-copy with `sync start --restart-from-scratch`; for a backup chain, start a new " +
+				"chain with a full backup",
+		}
+	}
+}
+
 // checkSlotNotAckedPast refuses a warm resume whose slot has been
 // acknowledged past resume, the persisted position's LSN. confirmedFlush is
 // the slot's confirmed_flush_lsn as text; "" (the server reports none)
@@ -117,7 +193,8 @@ func (r *CDCReader) checkSlotNotAckedPast(ctx context.Context, confirmedFlush st
 	if flush <= resume {
 		return nil
 	}
-	if accepted, perr := pglogrepl.ParseLSN(r.ackedPastAccepted); perr == nil && accepted == flush {
+	w := wordingForResumeOrigin(r.resumeOrigin)
+	if accepted, perr := pglogrepl.ParseLSN(r.ackedPastAccepted); perr == nil && accepted == flush && w.acknowledgeable {
 		slog.WarnContext(
 			ctx, "postgres: cdc: "+SlotAckedPastTargetPositionMarker+" acknowledged by the operator; resuming — every change "+
 				"committed between the two positions is skipped and was verified absent or already held",
@@ -127,15 +204,16 @@ func (r *CDCReader) checkSlotNotAckedPast(ctx context.Context, confirmedFlush st
 		)
 		return nil
 	}
+	ack := ""
+	if w.acknowledgeable {
+		ack = fmt.Sprintf(". If you have verified the target already holds every change up to %s, start once with "+
+			"--accept-slot-acked-past-position=%s", flush, flush)
+	}
 	return &terminalPGError{err: fmt.Errorf(
 		"postgres: %w: replication slot %q has confirmed_flush_lsn %s, past the position this stream resumes from (%s, "+
-			"read from the target's sluice_cdc_state). PostgreSQL starts decoding at the later of the two, so every change "+
-			"committed between %s and %s would be skipped, and the target does not hold them. Causes: a stop of a Postgres → "+
-			"MySQL-family sync on sluice v0.156.6 or earlier (the slot was acknowledged past changes still in an apply "+
-			"batch); a target restored or failed over to an older state; or the slot dropped and recreated after this "+
-			"stream's position was written (e.g. an interrupted --restart-from-scratch). Remedy: re-copy with "+
-			"`sync start --restart-from-scratch` (or re-copy the affected tables). If you have verified the target already "+
-			"holds every change up to %s, start once with --accept-slot-acked-past-position=%s",
-		ir.ErrSlotAckedPastTargetPosition, r.slotName, flush, resume, resume, flush, flush, flush,
+			"%s). PostgreSQL starts decoding at the later of the two, so every change committed between %s and %s would "+
+			"be skipped, and %s. Causes: %s. Remedy: %s%s",
+		ir.ErrSlotAckedPastTargetPosition, r.slotName, flush, resume, w.position, resume, flush, w.holder, w.causes,
+		w.remedy, ack,
 	)}
 }

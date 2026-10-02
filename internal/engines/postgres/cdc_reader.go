@@ -263,6 +263,12 @@ type CDCReader struct {
 	// [CDCReader.AcceptSlotAckedPastPosition] before StreamChanges.
 	ackedPastAccepted string
 
+	// resumeOrigin is where the caller read the resume position from, which
+	// the SLOT-ACKED-PAST-TARGET-POSITION refusal names along with the
+	// remedy that fits it. Set by [CDCReader.SetResumeOrigin] before
+	// StreamChanges.
+	resumeOrigin ir.CDCResumeOrigin
+
 	// schemaForward relaxes the mid-stream schema-change gate
 	// (checkSchemaRace) for the ADR-0091 forward-routable shapes (DROP
 	// COLUMN / ALTER COLUMN TYPE / RENAME COLUMN) so they surface as

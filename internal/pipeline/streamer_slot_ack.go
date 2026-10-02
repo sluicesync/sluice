@@ -136,13 +136,37 @@ type slotAckedPastAcceptor interface {
 	AcceptSlotAckedPastPosition(confirmedFlush string)
 }
 
-// wireSlotAckedPastAcceptance hands the operator's acknowledgement to a
-// slot-keeping reader before a warm resume's StreamChanges. Called from
-// every warm-resume site — warmResume (also the stopped-cold-start resume)
-// and warmResumeMultiDatabase — and held to it by
-// TestSlotAckReleaseRoster_EveryStreamChangesSiteReleases. An empty value is
-// a no-op, so the door refuses.
+// resumeOriginNoter is the structural seam that tells a slot-keeping reader
+// where its resume position was read from, so the warm-resume door's
+// refusal names it and the remedy that fits (GC-41 (k)): the target's
+// control row, a chain handed off by --position-from-manifest, or a backup
+// chain's last manifest.
+type resumeOriginNoter interface {
+	SetResumeOrigin(origin ir.CDCResumeOrigin)
+}
+
+// setResumeOrigin states the resume position's origin to a reader that
+// takes one; a no-op for every other reader.
+func setResumeOrigin(reader any, origin ir.CDCResumeOrigin) {
+	if n, ok := reader.(resumeOriginNoter); ok {
+		n.SetResumeOrigin(origin)
+	}
+}
+
+// wireSlotAckedPastAcceptance tells a slot-keeping reader, before a warm
+// resume's StreamChanges, where its position came from (the target's control
+// row, or the chain a --position-from-manifest start hands off from) and
+// hands it the operator's acknowledgement. Called from every warm-resume
+// site — warmResume (also the stopped-cold-start resume) and
+// warmResumeMultiDatabase — and held to it by
+// TestSlotAckReleaseRoster_EveryStreamChangesSiteReleases. An empty
+// acknowledgement is a no-op, so the door refuses.
 func (s *Streamer) wireSlotAckedPastAcceptance(reader any) {
+	origin := ir.CDCResumeOriginTargetControlRow
+	if s.PositionFromManifestStore != nil {
+		origin = ir.CDCResumeOriginChainHandoff
+	}
+	setResumeOrigin(reader, origin)
 	if s.AcceptSlotAckedPastPosition == "" {
 		return
 	}
