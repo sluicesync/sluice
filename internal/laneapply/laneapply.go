@@ -341,6 +341,12 @@ type LaneChange struct {
 	// (sub-)batch carries this envelope writes the fenced checkpoint in its
 	// own transaction. nil on every other envelope.
 	fold *FoldTicket
+
+	// txPartCommitted is true when, as the coordinator routed this change,
+	// part of its source transaction was already durable on the target
+	// ([laneSourceTx]): a refusal of the change then says its source
+	// transaction was split (Bug 294, [noteTxSplit]).
+	txPartCommitted bool
 }
 
 // Config configures an [Orchestrator]. Zero values are safe: Lanes < 1 is
@@ -534,6 +540,11 @@ type Orchestrator struct {
 	// marks it then deletes with the position. Coordinator-goroutine-only.
 	curTx    string
 	closedTx map[uint64]string
+
+	// srcTx is how much of the open source transaction is durable, for the
+	// account a refusal gives of what its rollback undid (Bug 294).
+	// Coordinator-goroutine-only.
+	srcTx laneSourceTx
 
 	// fencedTx is the transaction the last ADR-0190 mark fence cleared the
 	// lanes for (see fenceApplyMarks). foldSeq is the seq of the envelope
@@ -762,6 +773,7 @@ func (o *Orchestrator) handle(ctx context.Context, seq uint64, c ir.Change) erro
 	case ir.TxBegin:
 		o.sawTxMarker = true
 		o.curTx = ""
+		o.srcTx = laneSourceTx{open: true}
 		// Boundary marker, no lane work — mark committed so the contiguous
 		// frontier can advance past it as soon as this seq (and all lower) are
 		// committed. C-2 (Tier-3 audit): the tx's OWN rows carry HIGHER seqs and
@@ -784,6 +796,7 @@ func (o *Orchestrator) handle(ctx context.Context, seq uint64, c ir.Change) erro
 			o.closedTx[seq] = o.curTx
 			o.curTx = ""
 		}
+		o.srcTx = laneSourceTx{}
 		o.frontier.MarkCommitted(seq)
 		return o.maybeCheckpoint(ctx)
 	case ir.Insert, ir.Update, ir.Delete:
@@ -811,7 +824,11 @@ func (o *Orchestrator) handle(ctx context.Context, seq uint64, c ir.Change) erro
 		if !o.sawTxMarker {
 			o.noteBoundary(seq, c.Pos(), ir.ApplyIDOf(c).TxID)
 		}
-		return o.routeRow(ctx, seq, c)
+		if err := o.routeRow(ctx, seq, c); err != nil {
+			return err
+		}
+		o.srcTx.rowsSeen = o.srcTx.open
+		return nil
 	default:
 		// Truncate, SchemaSnapshot, or any future barrier-class event. Not
 		// row-level DML — cumRowDML is unchanged.
@@ -1002,7 +1019,7 @@ func (o *Orchestrator) routeRow(ctx context.Context, seq uint64, c ir.Change) er
 	// channel to drift out of step). The select honours ctx cancel so a
 	// stalled lane during shutdown doesn't wedge the coordinator.
 	select {
-	case o.laneIn[lane] <- LaneChange{Seq: seq, Change: c, fold: fold}:
+	case o.laneIn[lane] <- LaneChange{Seq: seq, Change: c, fold: fold, txPartCommitted: o.srcTx.partCommitted}:
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -1196,11 +1213,21 @@ func (o *Orchestrator) barrier(ctx context.Context, seq uint64, c ir.Change) err
 	if err := o.drainLanes(ctx, seq-1); err != nil {
 		return err
 	}
+	// The drain committed every earlier row of the open source transaction.
+	o.srcTx.partCommitted = o.srcTx.partCommitted || o.srcTx.rowsSeen
 	if err := o.writeCheckpoint(ctx); err != nil {
 		return err
 	}
 	if err := o.la.ApplyBarrierChange(ctx, c); err != nil {
+		if o.srcTx.partCommitted {
+			return ir.NoteSourceTxSplit(err)
+		}
 		return err
+	}
+	// And the barrier itself is now durable, inside it — unless it was a
+	// SchemaSnapshot, which carries no statement of the source transaction.
+	if !isSchemaSnapshot(c) {
+		o.srcTx.partCommitted = o.srcTx.partCommitted || o.srcTx.open
 	}
 	// ApplyBarrierChange applied the barrier's data + (for a SchemaSnapshot)
 	// the ADR-0049 history row atomically, but did NOT write the position —
@@ -1420,7 +1447,7 @@ func (o *Orchestrator) applyLaneBatch(ctx context.Context, lane int, ctrl ir.Bat
 				return 0, o.foldCommitUnknownFatal(fold, rawErr)
 			}
 			if !retriable(o.la, rawErr) {
-				return 0, o.la.ClassifyError(rawErr)
+				return 0, noteTxSplit(buf, o.la.ClassifyError(rawErr))
 			}
 		}
 		return 0, o.la.ClassifyError(rawErr)
@@ -1445,7 +1472,7 @@ func (o *Orchestrator) applyLaneBatch(ctx context.Context, lane int, ctrl ir.Bat
 			return 0, o.foldCommitUnknownFatal(fold, rawErr)
 		}
 		if !retriable(o.la, rawErr) {
-			return 0, o.la.ClassifyError(rawErr) // non-retriable → fatal
+			return 0, noteTxSplit(buf, o.la.ClassifyError(rawErr)) // non-retriable → fatal
 		}
 	}
 

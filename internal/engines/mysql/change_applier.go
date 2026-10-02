@@ -1189,6 +1189,12 @@ func (a *ChangeApplier) Apply(ctx context.Context, streamID string, changes <-ch
 			if inSourceTx {
 				skipped, err := a.applyOneImpl(ctx, streamID, c, false /* writePosition — deferred to TxCommit */)
 				if err != nil {
+					// Every change here commits in its own target transaction, so
+					// pendingRows > 0 means an earlier row of this source
+					// transaction is already durable: a refusal says so (Bug 294).
+					if pendingRows > 0 {
+						return ir.NoteSourceTxSplit(err)
+					}
 					return err
 				}
 				// PG-2: a change skipped for an absent target wrote zero rows —

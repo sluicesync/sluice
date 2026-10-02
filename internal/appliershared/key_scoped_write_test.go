@@ -5,6 +5,7 @@ package appliershared
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -42,5 +43,49 @@ func TestRefuseKeyScopedMultiMatch(t *testing.T) {
 	}
 	if up := RefuseKeyScopedMultiMatch("mysql", "update", "", "t", ir.Row{"u": "x"}, 3).Error(); !strings.Contains(up, "would overwrite") {
 		t.Errorf("an UPDATE refusal does not say it would overwrite: %s", up)
+	}
+}
+
+// TestRefuseKeyScopedMultiMatch_RollbackAccount pins Bug 294: neither the
+// message nor the hint claims "nothing was written" — false wherever an
+// earlier target transaction committed part of the source transaction — and
+// the split note an apply loop adds ([ir.NoteSourceTxSplit]) is appended
+// once, through any wrapping, without hiding the refusal from errors.Is, the
+// terminal verdict or the sluice code.
+func TestRefuseKeyScopedMultiMatch_RollbackAccount(t *testing.T) {
+	err := RefuseKeyScopedMultiMatch("postgres", "delete", "public", "s", ir.Row{"id": int64(2)}, 2)
+	c, _ := sluicecode.FromError(err)
+	for what, text := range map[string]string{"message": err.Error(), "hint": c.Hint} {
+		if strings.Contains(text, "nothing was written") {
+			t.Errorf("the %s claims nothing was written: %s", what, text)
+		}
+		if !strings.Contains(text, "may already be committed") {
+			t.Errorf("the %s does not say earlier parts of the source transaction may be committed: %s", what, text)
+		}
+		if strings.Contains(text, keyScopedMultiMatchSplitNote) {
+			t.Errorf("the %s names a split nothing reported: %s", what, text)
+		}
+	}
+	if !strings.Contains(c.Hint, "--reset-target-data") {
+		t.Errorf("the hint lost its remedy: %s", c.Hint)
+	}
+
+	// An apply path flattens the refusal into a string before the loop sees
+	// it; the note must still reach the message, exactly once.
+	wrapped := fmt.Errorf("postgres: applier: commit: %w", err)
+	noted := ir.NoteSourceTxSplit(ir.NoteSourceTxSplit(wrapped))
+	if n := strings.Count(noted.Error(), keyScopedMultiMatchSplitNote); n != 1 {
+		t.Fatalf("split note appears %d times, want 1: %s", n, noted)
+	}
+	if !errors.Is(noted, ErrKeyScopedWriteMatchedMultipleRows) || !ir.IsTerminal(noted) {
+		t.Errorf("the note hid the refusal: %v", noted)
+	}
+	if nc, ok := sluicecode.FromError(noted); !ok || nc.Code != sluicecode.CodeCDCKeyMatchedMultipleRows {
+		t.Errorf("the note hid the sluice code: %v", noted)
+	}
+	// Any other error passes through untouched.
+	other := errors.New("boom")
+	if got := ir.NoteSourceTxSplit(other); got.Error() != other.Error() || !errors.Is(got, other) {
+		t.Errorf("NoteSourceTxSplit changed an unrelated error: %v", got)
 	}
 }

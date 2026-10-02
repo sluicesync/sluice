@@ -1,0 +1,103 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
+package appliershared
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"strings"
+	"testing"
+
+	"sluicesync.dev/sluice/internal/ir"
+)
+
+// TestRunBatchLoop_KeyScopedRefusalNamesTheSplit pins Bug 294 on the shared
+// batch loop: a GC-42 refusal says its source transaction WAS split exactly
+// when an earlier batch committed part of that transaction, and keeps its own
+// "may" otherwise. The refusal is raised from both places it reaches the loop
+// — a serial dispatch, and the commit a pipelined engine grades it at — and
+// the loop's Classify flattens the error to a string first, so a note that
+// only flipped a field on the refusal would never reach the message.
+//
+// The expected value is the batch boundaries the cell's batch size and
+// transaction markers force, not anything the loop reports.
+func TestRunBatchLoop_KeyScopedRefusalNamesTheSplit(t *testing.T) {
+	refusal := func() error {
+		return RefuseKeyScopedMultiMatch("fake", "delete", "s", "t", ir.Row{"id": int64(2)}, 2)
+	}
+	cases := []struct {
+		name      string
+		changes   []ir.Change
+		batchSize int
+		refuseAt  string // dispatch of this token refuses
+		atCommit  int    // > 0: the Nth commit refuses instead
+		wantSplit bool
+	}{
+		{
+			name:      "row cap split, refused at dispatch",
+			changes:   []ir.Change{txBegin("tb"), insertAt("p1"), insertAt("p2")},
+			batchSize: 1, refuseAt: "p2", wantSplit: true,
+		},
+		{
+			name:      "row cap split, refused at the TxCommit flush's commit",
+			changes:   []ir.Change{txBegin("tb"), insertAt("p1"), insertAt("p2"), insertAt("p3"), txCommit("tc")},
+			batchSize: 2, atCommit: 2, wantSplit: true,
+		},
+		{
+			name:      "whole transaction in one batch",
+			changes:   []ir.Change{txBegin("tb"), insertAt("p1"), insertAt("p2")},
+			batchSize: 100, refuseAt: "p2", wantSplit: false,
+		},
+		{
+			name: "the previous transaction was split, this one is not",
+			changes: []ir.Change{
+				txBegin("ta"), insertAt("p1"), insertAt("p2"), txCommit("tc"),
+				txBegin("tb"), insertAt("q1"),
+			},
+			batchSize: 1, refuseAt: "q1", wantSplit: false,
+		},
+		{
+			name:      "marker-less stream: every change is its own transaction",
+			changes:   []ir.Change{insertAt("p1"), insertAt("p2")},
+			batchSize: 1, refuseAt: "p2", wantSplit: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := &recorder{}
+			cfg := testConfig(t, rec, false)
+			if tc.refuseAt != "" {
+				cfg.Dispatch = func(_ context.Context, _ BatchTx, _ string, c ir.Change) (bool, error) {
+					if c.Pos().Token == tc.refuseAt {
+						return false, refusal()
+					}
+					return false, nil
+				}
+			}
+			if tc.atCommit > 0 {
+				commits := 0
+				cfg.Commit = func(tx BatchTx) error {
+					commits++
+					if commits == tc.atCommit {
+						_ = tx.Rollback()
+						return refusal()
+					}
+					return tx.(*sql.Tx).Commit()
+				}
+			}
+			err := RunBatchLoop(context.Background(), cfg, "stream", feed(true, tc.changes...), tc.batchSize)
+			if !errors.Is(err, ErrKeyScopedWriteMatchedMultipleRows) || !ir.IsTerminal(err) {
+				t.Fatalf("want the terminal GC-42 refusal; got %v", err)
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, keyScopedMultiMatchRolledBack) {
+				t.Errorf("the refusal lost its rollback account: %s", msg)
+			}
+			if got := strings.Contains(msg, keyScopedMultiMatchSplitNote); got != tc.wantSplit {
+				t.Errorf("names the split = %v, want %v: %s", got, tc.wantSplit, msg)
+			}
+		})
+	}
+}

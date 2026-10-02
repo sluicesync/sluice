@@ -296,6 +296,24 @@ func gc42AssertCode(t *testing.T, err error, want string) {
 	}
 }
 
+// gc42AssertSplitAccount checks what a GC-42 refusal says its rollback undid
+// (Bug 294): it never claims nothing was written, and it says the source
+// transaction WAS split exactly when split — when an earlier target
+// transaction committed part of it, which the cell's target state shows.
+func gc42AssertSplitAccount(t *testing.T, err error, split bool) {
+	t.Helper()
+	msg := err.Error()
+	if strings.Contains(msg, "nothing was written") {
+		t.Errorf("the refusal claims nothing was written: %s", msg)
+	}
+	if !strings.Contains(msg, "may already be committed") {
+		t.Errorf("the refusal does not say earlier parts of the source transaction may be committed: %s", msg)
+	}
+	if got := strings.Contains(msg, "this source transaction WAS split"); got != split {
+		t.Errorf("the refusal names the split = %v, want %v: %s", got, split, msg)
+	}
+}
+
 // gc42Splits reports whether a path commits a key-changing change alone
 // (per-change, or a lane barrier) — where a transiently-shared key is
 // committed, or refused by the deferred check where that check runs.
@@ -330,12 +348,22 @@ func TestGC42_TriageRepro(t *testing.T) {
 				if got == "(3,c)" {
 					t.Fatalf("target lost (2,a): %q", got)
 				}
+				if want == gc42MultiMatch {
+					// Bug 294: the refusal names the split exactly where the
+					// key change was committed before the DELETE was refused,
+					// and never claims nothing was written.
+					gc42AssertSplitAccount(t, err, env.replica && gc42Splits(p))
+				}
 				if !env.replica || !gc42Splits(p) {
 					// Nothing committed. (Replica mode on a splitting path
 					// commits the key change before the DELETE is refused.)
 					if got != before {
 						t.Errorf("target = %q; want it untouched at %q", got, before)
 					}
+				} else if got == before {
+					// The independent evidence for the split note: the key
+					// change IS on the target.
+					t.Errorf("target = %q is untouched, so the refusal's split note would be false", got)
 				}
 			})
 		}
