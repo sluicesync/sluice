@@ -518,7 +518,7 @@ a 2-shard vttestserver, audit backlog GC-41 (e)):
 - **Two narrow shapes stay refused** even with the vindex in the key,
   because the only thing left to assign is the vindexed key column: an
   insert into a table whose EVERY column is in the primary key when
-  first key column is a vindex column (the upsert has no non-key
+  the first key column is a vindex column (the upsert has no non-key
   column to assign, so its no-op assignment names that one), and an
   UPDATE whose after-image carries nothing but unchanged key columns.
   Both are filed as the remainder of GC-41 (e).

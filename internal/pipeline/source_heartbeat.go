@@ -40,6 +40,7 @@ import (
 	"sync"
 	"time"
 
+	"sluicesync.dev/sluice/internal/appliershared"
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
@@ -50,6 +51,31 @@ import (
 // owned name operators can grep for in `information_schema` / pg_class.
 // Configurable via the CLI's `--source-heartbeat-table-name` flag.
 const DefaultSourceHeartbeatTableName = "sluice_heartbeat"
+
+// customSourceHeartbeatTable returns the heartbeat table's name when this
+// stream will write heartbeats under a name the control-table roster does
+// not carry, and "" otherwise — heartbeat off (the name is then never
+// consulted, so it claims nothing), or the default name, which the roster
+// already keeps out of every schema reader and CDC scope. Gated on the
+// SAME condition [Streamer.attachSourceHeartbeat] attaches under, so a
+// stray flag value with the heartbeat off cannot hide a user table.
+//
+// Residual, named: with the heartbeat ON, a name that collides with a
+// user table hides that table from the sync. Nothing checks the shape
+// of a table EnsureHeartbeatTable finds already present, and the
+// writer's INSERT and ts-based prune would already be writing into and
+// deleting from it on the source, so the collision was harmful before
+// this exclusion existed; it is not detected here either.
+func (s *Streamer) customSourceHeartbeatTable() string {
+	if s.SourceHeartbeatInterval <= 0 || s.NoSourceHeartbeat {
+		return ""
+	}
+	name := s.SourceHeartbeatTableName
+	if name == "" || appliershared.IsControlTable(name) {
+		return ""
+	}
+	return name
+}
 
 // DefaultSourceHeartbeatPruneWindow is the default age threshold for
 // the periodic DELETE that bounds heartbeat-table growth. One hour is

@@ -226,8 +226,14 @@ func changeAllowedWithLiveAdd(c ir.Change, base migcore.TableFilter, live *liveA
 // and the dispatch filter drops them for every reader that does not. The
 // transaction's TxBegin/TxCommit still pass, so a heartbeat still moves the
 // persisted position — which is what it is for.
+//
+// The roster carries only fixed names, so a heartbeat table renamed with
+// --source-heartbeat-table-name is not on it. The streamer marks that name
+// sluice-owned in its filter ([Streamer.customSourceHeartbeatTable]); base
+// refuses it in Allows, and it is checked again here so a live-add naming
+// it cannot readmit it either.
 func tableAllowedWithLiveAdd(unqualified string, base migcore.TableFilter, live *liveAddedFilter) bool {
-	if appliershared.IsControlTable(unqualified) {
+	if appliershared.IsControlTable(unqualified) || base.IsSluiceOwned(unqualified) {
 		return false
 	}
 	if base.Allows(unqualified) {

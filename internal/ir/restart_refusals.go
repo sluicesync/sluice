@@ -28,8 +28,8 @@ import "errors"
 var ErrSlotAckedPastTargetPosition = errors.New("SLOT-ACKED-PAST-TARGET-POSITION")
 
 // ErrShardedTargetVindexUpdate classifies the MySQL-family apply refusal
-// raised when vtgate refuses a change that assigns a primary-vindex column on
-// a sharded target (GC-41 (e)). The change sits after the persisted position,
+// raised when vtgate refuses a change that assigns a vindex column on a
+// sharded target (GC-41 (e)). The change sits after the persisted position,
 // so a restart re-delivers it and vtgate refuses it again.
 var ErrShardedTargetVindexUpdate = errors.New("SHARDED-TARGET-VINDEX-UPDATE")
 
@@ -49,3 +49,16 @@ var ErrDSNTimeZoneNotUTC = errors.New("DSN-TIME-ZONE-NOT-UTC")
 // rolled back, and a restart replays the same source changes in order onto the
 // same committed rows, so the write matches them again.
 var ErrKeyScopedWriteMatchedMultipleRows = errors.New("KEY-SCOPED-WRITE-MATCHED-MULTIPLE-ROWS")
+
+// ErrChangeLogWatermarkStalled classifies the trigger-CDC (postgres-trigger)
+// refusal raised when a change-log poll read a gap-free window and the
+// stream's watermark did not reach it (GC-43 (a)'s tripwire). Only a sluice
+// bug produces that shape. A restart resumes at or below the same watermark
+// and reads the same immutable change-log rows through the same code, so a
+// cause that lives in how a window is consumed refuses again; a cause that
+// lived only in the stopped process's memory would not, and since the
+// cause is unknown by definition that half is UNVERIFIED. It is listed
+// anyway because restarting forever behind backoff would turn the halt back
+// into the silent stall it exists to end, while not restarting costs one
+// `sync start` by hand, which the operator owes the bug report regardless.
+var ErrChangeLogWatermarkStalled = errors.New("CHANGE-LOG-WATERMARK-STALLED")

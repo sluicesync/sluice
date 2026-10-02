@@ -109,6 +109,19 @@ type TableFilter struct {
 	// difference: a comment claiming a property is a hypothesis until
 	// something fails when it stops holding.
 	engineDefaults map[string]bool
+
+	// sluiceOwned are tables sluice itself writes on the SOURCE under a
+	// name the operator chose, so the control-table roster
+	// ([appliershared.IsControlTable]) cannot list them: today the source
+	// heartbeat's table under --source-heartbeat-table-name. [Allows]
+	// refuses them whatever Include/Exclude say, so they stay out of the
+	// cold copy, the reader-side scope push-down and the CDC dispatch
+	// filter — every consumer of the filter — exactly as a roster name
+	// does. Keyed lowercase and matched case-insensitively: a MySQL server
+	// with lower_case_table_names=1 reports the table lowercased however
+	// the flag spelled it. Set via [TableFilter.WithSluiceOwnedTable]; not
+	// a pattern, so never reported as unmatched.
+	sluiceOwned map[string]bool
 }
 
 // scopeCensus records the table names the engine-side push-down was asked
@@ -177,9 +190,35 @@ func NewTableFilter(include, exclude []string) (TableFilter, error) {
 
 // IsEmpty reports whether the filter has no rules — i.e. whether
 // every table passes. Useful for skipping the post-prune
-// "filter applied" log line when there's nothing to report.
+// "filter applied" log line when there's nothing to report. A
+// sluice-owned table is a rule: a filter carrying one does not pass
+// every table, and the prune and push-down must run for it.
 func (f TableFilter) IsEmpty() bool {
-	return len(f.Include) == 0 && len(f.Exclude) == 0
+	return len(f.Include) == 0 && len(f.Exclude) == 0 && len(f.sluiceOwned) == 0
+}
+
+// WithSluiceOwnedTable returns a copy of f that also refuses name — a
+// table sluice writes on the source under an operator-chosen name (see
+// the sluiceOwned field). The receiver is not modified: TableFilter is
+// passed by value and a shared map would leak the exclusion into copies
+// the caller did not mean to change. An empty name returns f unchanged.
+func (f TableFilter) WithSluiceOwnedTable(name string) TableFilter {
+	if name == "" {
+		return f
+	}
+	owned := make(map[string]bool, len(f.sluiceOwned)+1)
+	for k := range f.sluiceOwned {
+		owned[k] = true
+	}
+	owned[strings.ToLower(name)] = true
+	f.sluiceOwned = owned
+	return f
+}
+
+// IsSluiceOwned reports whether tableName is a sluice-owned table this
+// filter refuses ([TableFilter.WithSluiceOwnedTable]).
+func (f TableFilter) IsSluiceOwned(tableName string) bool {
+	return len(f.sluiceOwned) > 0 && f.sluiceOwned[strings.ToLower(tableName)]
 }
 
 // Allows reports whether table participates in the migration. The
@@ -252,6 +291,9 @@ func LooksSchemaQualified(pattern string) bool {
 }
 
 func (f TableFilter) Allows(tableName string) bool {
+	if f.IsSluiceOwned(tableName) {
+		return false
+	}
 	if len(f.Include) > 0 {
 		return matchesAny(f.Include, tableName)
 	}
@@ -321,7 +363,10 @@ func EffectiveTableFilter(filter TableFilter, source ir.Engine, sourceDSN string
 	for _, p := range added {
 		addedSet[p] = true
 	}
-	return TableFilter{Include: nil, Exclude: merged, census: filter.census, engineDefaults: addedSet}, added
+	return TableFilter{
+		Include: nil, Exclude: merged, census: filter.census, engineDefaults: addedSet,
+		sluiceOwned: filter.sluiceOwned,
+	}, added
 }
 
 // ApplyTableFilter mutates schema.Tables in place, retaining only

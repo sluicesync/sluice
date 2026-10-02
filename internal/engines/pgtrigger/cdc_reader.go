@@ -604,7 +604,10 @@ func refuseObservedDDL(m ddlMarker) error {
 }
 
 // watermarkStalledMarker is the grep-stable marker of
-// [refuseStalledWatermark]'s refusal.
+// [refuseStalledWatermark]'s refusal. The refusal carries it as
+// [ir.ErrChangeLogWatermarkStalled], whose text it is, so the fleet
+// supervisor can key on the sentinel and not restart the leg
+// (TestRefuseStalledWatermark_CarriesTheSupervisorSentinel).
 const watermarkStalledMarker = "CHANGE-LOG-WATERMARK-STALLED"
 
 // watermarkStalled is the tripwire behind GC-43 (a), and the stall
@@ -634,12 +637,12 @@ func watermarkStalled(b pollBatch) bool {
 // purpose-built TERMINAL, since a re-poll reads the same window.
 func refuseStalledWatermark(b pollBatch) error {
 	return fmt.Errorf(
-		"pgtrigger: %s: the change-log poll read rows up to id %d with no gap, but the stream's watermark stayed at %d — "+
+		"pgtrigger: %w: the change-log poll read rows up to id %d with no gap, but the stream's watermark stayed at %d — "+
 			"this is a sluice bug (a consumed change-log row that did not advance the watermark), and a stream in this state "+
 			"re-reads the same window forever without applying anything, so it is halted rather than left polling. No row "+
 			"was skipped: the persisted position is unchanged. Report it with the change-log rows above that id "+
 			"(SELECT id, schema_name, table_name, op FROM <schema>.%s WHERE id > %d ORDER BY id LIMIT 20)",
-		watermarkStalledMarker, b.seenTo, b.lastID, ChangeLogTable, b.lastID,
+		ir.ErrChangeLogWatermarkStalled, b.seenTo, b.lastID, ChangeLogTable, b.lastID,
 	)
 }
 

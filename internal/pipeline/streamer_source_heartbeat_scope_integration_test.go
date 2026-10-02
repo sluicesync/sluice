@@ -37,6 +37,29 @@ import (
 )
 
 func TestStreamer_MySQLSourceHeartbeat_AdvancesPositionWithoutSkips(t *testing.T) {
+	gc43HeartbeatScopeCase(t, "gc43-heartbeat", "")
+}
+
+// TestStreamer_MySQLCustomHeartbeatTable_StaysOutOfScope is the same case
+// under --source-heartbeat-table-name. The roster lists only the default
+// name, and the writer creates its table BEFORE the cold-start schema read,
+// so through v0.156.8 a renamed heartbeat table was enumerated as user
+// data: created on the target, copied, and kept in sync from then on. The
+// streamer now marks the configured name sluice-owned in its filter.
+func TestStreamer_MySQLCustomHeartbeatTable_StaysOutOfScope(t *testing.T) {
+	gc43HeartbeatScopeCase(t, "gc43-custom-heartbeat", "ops_heartbeat")
+}
+
+// gc43HeartbeatScopeCase runs a MySQL→MySQL stream with the source
+// heartbeat on — under hbTable, or the default name when it is empty — and
+// asserts the heartbeats move the persisted position, never reach the skip
+// ledger, and never put their table on the target.
+func gc43HeartbeatScopeCase(t *testing.T, streamID, hbTable string) {
+	t.Helper()
+	table := hbTable
+	if table == "" {
+		table = DefaultSourceHeartbeatTableName
+	}
 	sourceDSN, targetDSN, cleanup := startMySQLBinlog(t)
 	defer cleanup()
 
@@ -49,14 +72,14 @@ func TestStreamer_MySQLSourceHeartbeat_AdvancesPositionWithoutSkips(t *testing.T
 	if !ok {
 		t.Fatal("mysql engine not registered")
 	}
-	const streamID = "gc43-heartbeat"
 	streamer := &Streamer{
-		Source:                  mysqlEng,
-		Target:                  mysqlEng,
-		SourceDSN:               sourceDSN,
-		TargetDSN:               targetDSN,
-		StreamID:                streamID,
-		SourceHeartbeatInterval: 500 * time.Millisecond,
+		Source:                   mysqlEng,
+		Target:                   mysqlEng,
+		SourceDSN:                sourceDSN,
+		TargetDSN:                targetDSN,
+		StreamID:                 streamID,
+		SourceHeartbeatInterval:  500 * time.Millisecond,
+		SourceHeartbeatTableName: hbTable,
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	runErr := make(chan error, 1)
@@ -101,7 +124,7 @@ func TestStreamer_MySQLSourceHeartbeat_AdvancesPositionWithoutSkips(t *testing.T
 	// heartbeat rows on the source (the floor), THEN take the position,
 	// THEN wait for it to move — a move that, with no user writes, only
 	// the heartbeats can have caused.
-	if !gc43AwaitCountMySQL(t, sourceDSN, "SELECT COUNT(*) FROM sluice_heartbeat", 1, 120*time.Second) {
+	if !gc43AwaitCountMySQL(t, sourceDSN, "SELECT COUNT(*) FROM `"+table+"`", 1, 120*time.Second) {
 		t.Fatal("no heartbeat rows on the source; the test proved nothing about them")
 	}
 	first := gc43AwaitPosition(t, applier, streamID, "")
@@ -130,8 +153,8 @@ func TestStreamer_MySQLSourceHeartbeat_AdvancesPositionWithoutSkips(t *testing.T
 				rec.SkipCount, rec.Table)
 		}
 	}
-	if n := gc43CountMySQL(t, targetDSN, "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = 'sluice_heartbeat'"); n != 0 {
-		t.Error("sluice_heartbeat appeared on the target")
+	if n := gc43CountMySQL(t, targetDSN, "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = '"+table+"'"); n != 0 {
+		t.Errorf("heartbeat table %q appeared on the target", table)
 	}
 }
 

@@ -1314,7 +1314,11 @@ type Streamer struct {
 	// goroutine that periodically INSERTs a row into the sluice-owned
 	// heartbeat table on the source DB; the INSERT generates binlog
 	// traffic so a MySQL consumer's position advances even against an
-	// otherwise-idle source. On Postgres it is not what moves the slot:
+	// otherwise-idle source. Since GC-43 (r) a connected binlog stream
+	// also persists its position at every rotation it reads
+	// (mysql/cdc_rotation_boundary.go), so the heartbeat matters for
+	// binlog retention only in that file's named residuals (a source
+	// restart, an XA PREPARE ending a file). On Postgres it is not what moves the slot:
 	// the heartbeat table is outside the publication, so PG 15+ decodes
 	// nothing for it, and the reader instead advances to the walsender's
 	// read position whenever WAL is written anywhere on the server
@@ -1981,8 +1985,11 @@ func (s *Streamer) runOnce(ctx context.Context) (err error) {
 	// Opt-in (gated on --source-heartbeat-interval > 0). The writer
 	// periodically INSERTs a row into a sluice-owned table on the
 	// source so the CDC consumer's position advances even against an
-	// otherwise-idle source — preventing PG slot eviction / MySQL
-	// binlog rotation past the consumer position. Skipped on DryRun
+	// otherwise-idle source (see the SourceHeartbeatInterval field for
+	// what that still buys on each engine since GC-41 (j) and GC-43 (r)).
+	// It runs BEFORE the cold start, so the table it creates exists when
+	// the copy reads the source schema; a custom-named one is kept out of
+	// scope by phaseResolveStreamIdentity. Skipped on DryRun
 	// (writes are not dry-run-safe). Non-fatal on every branch: a
 	// missing engine surface, failed source open, or insufficient
 	// privilege all WARN once and leave the writer unattached. See

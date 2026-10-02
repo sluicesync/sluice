@@ -202,8 +202,9 @@ func isReadOnlyTargetSignal(err error) bool {
 }
 
 // shardedTargetVindexUpdateMarker is the grep-stable token of the apply
-// refusal vtgate raises when a change would assign a primary-vindex column
-// on a sharded target (GC-41 (e)). The wrapped error keeps the dispatch
+// refusal vtgate raises when a change would assign a vindex column (a
+// primary-vindex column in an UPDATE, any vindex column in an ON DUPLICATE
+// KEY UPDATE) on a sharded target (GC-41 (e)). The wrapped error keeps the dispatch
 // frame, which names the table; vtgate's own message names the vindex. The
 // refusal wraps [ir.ErrShardedTargetVindexUpdate], whose text is this marker,
 // so the fleet supervisor can see that a restart would refuse again.

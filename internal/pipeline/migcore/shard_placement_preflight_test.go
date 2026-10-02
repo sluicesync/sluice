@@ -47,6 +47,11 @@ func TestPreflightShardPlacementRefusesAMismatch(t *testing.T) {
 	if !strings.Contains(err.Error(), "orders") {
 		t.Errorf("refusal does not name the offending table; operator cannot act on it: %v", err)
 	}
+	// The message is assembled from concatenated literals; a missing space at
+	// a seam jams two words together (ec405782 rendered "This usuallymeans").
+	if !strings.Contains(err.Error(), "This run has written no rows yet. This usually means the table was assigned") {
+		t.Errorf("refusal prose is malformed at a concatenation seam: %v", err)
+	}
 	if p.sawTables != 2 {
 		t.Errorf("probe saw %d tables, want 2 — the preflight must offer the whole in-scope set", p.sawTables)
 	}

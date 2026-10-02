@@ -73,8 +73,11 @@ func ControlTableNames() []string {
 
 		// internal/pipeline's source-side heartbeat table
 		// (DefaultSourceHeartbeatTableName). The name is the DEFAULT —
-		// an operator-renamed table (--source-heartbeat-table-name) is
-		// not excludable here (use --exclude-table for a custom name).
+		// an operator-renamed table (--source-heartbeat-table-name) cannot
+		// be listed here; the streamer excludes it from its own scope
+		// instead (pipeline.Streamer.customSourceHeartbeatTable). Commands
+		// that do not run the heartbeat (migrate, backup, schema diff)
+		// see a renamed table as user data; --exclude-table covers them.
 		"sluice_heartbeat",
 
 		// The trigger-CDC capture tables (pgtrigger.ChangeLogTable /

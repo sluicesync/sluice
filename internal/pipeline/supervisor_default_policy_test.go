@@ -228,6 +228,7 @@ func TestSupervisor_RefusalsARestartRepeatsAreNotRestarted(t *testing.T) {
 		"APPLY-MARK-MISMATCH":             &applymarks.RefusalError{},
 		"CHARSET-NOT-DECODABLE":           fmt.Errorf("%w: table \"t\" column \"c\"", ir.ErrCharsetNotDecodable),
 		"DSN-TIME-ZONE-NOT-UTC":           fmt.Errorf("mysql: %w: refusing the DSN parameter time_zone=x", ir.ErrDSNTimeZoneNotUTC),
+		"CHANGE-LOG-WATERMARK-STALLED":    fmt.Errorf("pgtrigger: %w: the change-log poll read rows up to id 10003 with no gap", ir.ErrChangeLogWatermarkStalled),
 		// Coded (SLUICE-E-CDC-KEY-MATCHED-MULTIPLE-ROWS): built by the real
 		// shared constructor every applier calls, so the alias between the
 		// appliershared and ir sentinels is part of what is pinned.

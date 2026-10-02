@@ -59,6 +59,15 @@ import (
 //     where the earlier changes commit, not what the write finds. (A replay
 //     that commits a deferrable key's shared state before the write refuses
 //     with DEFERRED-KEY-CHECK-FAILED-AT-COMMIT instead, which is below.)
+//   - CHANGE-LOG-WATERMARK-STALLED (postgres-trigger source, codeless):
+//     listed. A gap-free poll window the watermark did not reach is a sluice
+//     bug; a restart resumes at or below the same watermark and reads the
+//     same immutable change-log rows through the same code. A cause held
+//     only in the stopped process's memory would clear on a restart, and the
+//     cause is unknown by definition, so that half is UNVERIFIED — but
+//     restarting forever behind backoff is the silent stall the refusal
+//     exists to end, while not restarting costs one `sync start` by hand
+//     (see [ir.ErrChangeLogWatermarkStalled]).
 //   - DEFERRED-KEY-CHECK-FAILED-AT-COMMIT (Postgres target, codeless): NOT
 //     listed. It is the COMMIT of a target transaction that a deferrable
 //     constraint's re-check refused, and one of its causes is a source
@@ -75,7 +84,8 @@ import (
 // Each engine refusal wraps its sentinel with %w; the engine packages pin
 // that (TestCheckSlotNotAckedPast, TestClassifyApplierError_VindexUpdateRefusalIsMarkedTerminal,
 // TestFinishParseDSN_TimeZoneSpellings, TestDecodeBinlogRow_RefusesWhatItCannotDecode,
-// TestRestartRefusalSentinelsAreTheMarkers, TestRefuseKeyScopedMultiMatch). A wrapper between the engine and
+// TestRestartRefusalSentinelsAreTheMarkers, TestRefuseKeyScopedMultiMatch,
+// TestRefuseStalledWatermark_CarriesTheSupervisorSentinel). A wrapper between the engine and
 // the runner that dropped the chain would degrade a leg to the old restart
 // loop, never to a silent skip.
 var refusalsARestartRepeats = []error{
@@ -85,6 +95,7 @@ var refusalsARestartRepeats = []error{
 	ir.ErrCharsetNotDecodable,
 	ir.ErrDSNTimeZoneNotUTC,
 	ir.ErrKeyScopedWriteMatchedMultipleRows,
+	ir.ErrChangeLogWatermarkStalled,
 }
 
 // refusalARestartRepeats returns the listed sentinel err carries, or nil.

@@ -4,8 +4,11 @@
 package pgtrigger
 
 import (
+	"errors"
 	"strings"
 	"testing"
+
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestWatermarkStalled_OnlyTheUnexplainedShape pins GC-43 (a)'s tripwire to
@@ -37,5 +40,20 @@ func TestWatermarkStalled_OnlyTheUnexplainedShape(t *testing.T) {
 		if !strings.Contains(msg, want) {
 			t.Errorf("refusal %q does not name %q", msg, want)
 		}
+	}
+}
+
+// TestRefuseStalledWatermark_CarriesTheSupervisorSentinel pins the handle the
+// fleet supervisor keys on to stop restarting a leg that hit the stall
+// (pipeline.refusalsARestartRepeats): the refusal wraps
+// ir.ErrChangeLogWatermarkStalled, and that sentinel's text is the marker,
+// so the message reads the same as before the sentinel existed.
+func TestRefuseStalledWatermark_CarriesTheSupervisorSentinel(t *testing.T) {
+	if ir.ErrChangeLogWatermarkStalled.Error() != watermarkStalledMarker {
+		t.Errorf("sentinel text %q != marker %q", ir.ErrChangeLogWatermarkStalled.Error(), watermarkStalledMarker)
+	}
+	err := refuseStalledWatermark(pollBatch{lastID: 3, seenTo: 10003})
+	if !errors.Is(err, ir.ErrChangeLogWatermarkStalled) {
+		t.Errorf("the stall refusal does not wrap ir.ErrChangeLogWatermarkStalled; the supervisor would restart it forever: %v", err)
 	}
 }

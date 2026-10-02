@@ -326,6 +326,23 @@ func (s *Streamer) phaseResolveStreamIdentity(ctx context.Context) (string, erro
 		s.Filter = eff
 	}
 
+	// The source heartbeat's table under a custom name is sluice's, but the
+	// control-table roster lists only the default `sluice_heartbeat`. The
+	// writer creates it BEFORE the cold-start schema read (step 1c), so
+	// without this a renamed heartbeat table was enumerated as user data,
+	// created on the target and copied — and a stream that enabled the
+	// heartbeat after its cold start skipped every heartbeat row into the
+	// ledger `sync health` trips on (GC-43 (e)'s symptom, for a custom
+	// name). Excluding it in the filter reaches the cold copy, the reader
+	// push-down and the CDC dispatch at once. Idempotent across attempts.
+	if name := s.customSourceHeartbeatTable(); name != "" && !s.Filter.IsSluiceOwned(name) {
+		slog.InfoContext(
+			ctx, "excluding the custom-named source heartbeat table from the stream's scope (sluice bookkeeping, never user data)",
+			slog.String("table", name),
+		)
+		s.Filter = s.Filter.WithSluiceOwnedTable(name)
+	}
+
 	streamID := s.resolveStreamID()
 	slog.InfoContext(ctx, "stream starting", slog.String("stream_id", streamID))
 	return streamID, nil

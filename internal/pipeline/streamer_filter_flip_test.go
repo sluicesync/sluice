@@ -231,6 +231,98 @@ func TestCDCScope_ControlTablesNeverPass(t *testing.T) {
 	}
 }
 
+// TestCDCScope_CustomHeartbeatTableNeverPasses is the custom-name half of
+// GC-43 (e). The roster carries only `sluice_heartbeat`, so a heartbeat
+// renamed with --source-heartbeat-table-name was in scope: the writer
+// creates it before the cold-start schema read, so it was copied to the
+// target as user data, and a stream that enabled the heartbeat after its
+// cold start skipped every heartbeat row into the ledger `sync health`
+// trips on. Pinned THROUGH phaseResolveStreamIdentity (the layer that
+// carries the flag, the Bug-180 lesson), on both halves of the scope and
+// the cold-copy prune, under every filter mode — and the gate: with the
+// heartbeat off the name claims nothing, so a user table of that name is
+// never hidden.
+func TestCDCScope_CustomHeartbeatTableNeverPasses(t *testing.T) {
+	newStreamer := func(f migcore.TableFilter, interval time.Duration, noHB bool, name string) *Streamer {
+		return &Streamer{
+			Source: cdcCapableStub{}, Target: cdcCapableStub{}, SourceDSN: "src", TargetDSN: "dst",
+			Filter:                   f,
+			SourceHeartbeatInterval:  interval,
+			NoSourceHeartbeat:        noHB,
+			SourceHeartbeatTableName: name,
+		}
+	}
+	filters := map[string]migcore.TableFilter{
+		"empty":     {},
+		"include *": {Include: []string{"*"}},
+		"exclude":   {Exclude: []string{"audit_*"}},
+	}
+	for mode, base := range filters {
+		s := newStreamer(base, 30*time.Second, false, "ops_hb")
+		// Twice: runOnce repeats the phase on every retry attempt.
+		for range 2 {
+			if _, err := s.phaseResolveStreamIdentity(context.Background()); err != nil {
+				t.Fatalf("%s: phaseResolveStreamIdentity: %v", mode, err)
+			}
+		}
+		live := &liveAddedFilter{}
+		live.Set([]string{"ops_hb"})
+		for _, lv := range []*liveAddedFilter{nil, live} {
+			if tableAllowedWithLiveAdd("ops_hb", s.Filter, lv) {
+				t.Errorf("%s (live-added=%v): the custom heartbeat table is in the reader-side scope", mode, lv != nil)
+			}
+			if !tableAllowedWithLiveAdd("users", s.Filter, lv) {
+				t.Errorf("%s (live-added=%v): a user table fell out of scope", mode, lv != nil)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			in := make(chan ir.Change, 4)
+			in <- ir.TxBegin{}
+			in <- ir.Insert{Schema: "s", Table: "ops_hb", Row: ir.Row{"id": int64(1)}}
+			in <- ir.Insert{Schema: "s", Table: "users", Row: ir.Row{"id": int64(2)}}
+			in <- ir.TxCommit{}
+			close(in)
+			var got []string
+			for c := range filterChangesWithLiveAdd(ctx, in, s.Filter, lv) {
+				got = append(got, fmt.Sprintf("%T:%s", c, c.QualifiedName()))
+			}
+			cancel()
+			want := []string{"ir.TxBegin:", "ir.Insert:s.users", "ir.TxCommit:"}
+			if strings.Join(got, ",") != strings.Join(want, ",") {
+				t.Errorf("%s (live-added=%v): dispatch passed %v, want %v", mode, lv != nil, got, want)
+			}
+		}
+		schema := &ir.Schema{Tables: []*ir.Table{{Name: "users"}, {Name: "ops_hb"}}}
+		if err := migcore.ApplyTableFilter(context.Background(), schema, s.Filter); err != nil {
+			t.Fatalf("%s: ApplyTableFilter: %v", mode, err)
+		}
+		if len(schema.Tables) != 1 || schema.Tables[0].Name != "users" {
+			t.Errorf("%s: the cold copy would create and copy %d table(s), want only users", mode, len(schema.Tables))
+		}
+	}
+
+	// The gate. Heartbeat off, opted out, or on under the default name:
+	// the filter is untouched.
+	for _, c := range []struct {
+		name     string
+		interval time.Duration
+		noHB     bool
+		table    string
+	}{
+		{"interval 0", 0, false, "ops_hb"},
+		{"--no-source-heartbeat", 30 * time.Second, true, "ops_hb"},
+		{"default name", 30 * time.Second, false, DefaultSourceHeartbeatTableName},
+		{"empty name", 30 * time.Second, false, ""},
+	} {
+		s := newStreamer(migcore.TableFilter{}, c.interval, c.noHB, c.table)
+		if _, err := s.phaseResolveStreamIdentity(context.Background()); err != nil {
+			t.Fatalf("%s: phaseResolveStreamIdentity: %v", c.name, err)
+		}
+		if !s.Filter.IsEmpty() {
+			t.Errorf("%s: the filter gained a rule; a user table named %q would be hidden", c.name, c.table)
+		}
+	}
+}
+
 // TestFilterChangesWithLiveAdd_LiveAdmitsExcluded pins the wrapped
 // path: a base filter that excludes a table + a live-added set that
 // includes it must allow the change through. This is the load-bearing

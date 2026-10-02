@@ -86,7 +86,7 @@ func PreflightShardPlacement(ctx context.Context, schema *ir.Schema, handle any)
 			"pipeline: target table %q routes to a different shard than its rows are on: a scattering read "+
 				"returns rows that an equality-routed read on the PRIMARY KEY cannot find. In that state the "+
 				"PRIMARY KEY is NOT globally enforced, so sluice's idempotent upsert would INSERT duplicate "+
-				"rows instead of updating them — silently, at exit 0. This run has written no rows yet. This usually"+
+				"rows instead of updating them — silently, at exit 0. This run has written no rows yet. This usually "+
 				"means the table was assigned to a shard group without a reshard workflow to move its data",
 			mismatched,
 		),
