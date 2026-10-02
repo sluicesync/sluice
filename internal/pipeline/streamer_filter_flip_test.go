@@ -5,11 +5,14 @@ package pipeline
 
 import (
 	"context"
+	"fmt"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"sluicesync.dev/sluice/internal/appliershared"
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
@@ -177,14 +180,54 @@ func TestChangeAllowedWithLiveAdd_OrSemantics(t *testing.T) {
 	}
 }
 
-// TestFilterChangesWithLiveAdd_PassThroughEmpty confirms the zero-
-// allocation fast path: empty base AND nil liveAddedFilter returns
-// the input channel verbatim with no goroutine.
-func TestFilterChangesWithLiveAdd_PassThroughEmpty(t *testing.T) {
-	in := make(chan ir.Change)
-	got := filterChangesWithLiveAdd(context.Background(), in, migcore.TableFilter{}, nil)
-	if got != in {
-		t.Errorf("empty filter + nil live: filterChangesWithLiveAdd returned a wrapped channel; want the same channel pointer (zero-overhead fast path)")
+// TestCDCScope_ControlTablesNeverPass pins GC-43 (e): every name on the
+// control-table roster is out of a stream's scope, on BOTH halves of it —
+// the reader-side predicate ([tableAllowedWithLiveAdd], which
+// [Streamer.wireCDCScopePredicate] hands every reader) and the dispatch
+// filter — under an empty filter, an include pattern that matches it, and a
+// live-add naming it. The universe is the roster itself, so a control table
+// added later is covered without editing this test. A user table and the
+// transaction markers still pass: a heartbeat's TxCommit is what moves the
+// persisted position.
+func TestCDCScope_ControlTablesNeverPass(t *testing.T) {
+	roster := appliershared.ControlTableNames()
+	if len(roster) < 10 {
+		t.Fatalf("control-table roster has %d names; the walk below would prove little", len(roster))
+	}
+	live := &liveAddedFilter{}
+	live.Set(roster)
+	filters := map[string]migcore.TableFilter{
+		"empty":            {},
+		"include sluice_*": {Include: []string{"sluice_*", "users"}},
+		"exclude other":    {Exclude: []string{"audit_*"}},
+	}
+	for name, base := range filters {
+		for _, lv := range []*liveAddedFilter{nil, live} {
+			for _, table := range roster {
+				if tableAllowedWithLiveAdd(table, base, lv) {
+					t.Errorf("filter %s (live-added=%v): control table %q is in the reader-side scope", name, lv != nil, table)
+				}
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			in := make(chan ir.Change, len(roster)+3)
+			in <- ir.TxBegin{}
+			for _, table := range roster {
+				in <- ir.Insert{Schema: "s", Table: table, Row: ir.Row{"id": int64(1)}}
+			}
+			in <- ir.Insert{Schema: "s", Table: "users", Row: ir.Row{"id": int64(2)}}
+			in <- ir.TxCommit{}
+			close(in)
+			var got []string
+			for c := range filterChangesWithLiveAdd(ctx, in, base, lv) {
+				got = append(got, fmt.Sprintf("%T:%s", c, c.QualifiedName()))
+			}
+			cancel()
+			want := []string{"ir.TxBegin:", "ir.Insert:s.users", "ir.TxCommit:"}
+			if strings.Join(got, ",") != strings.Join(want, ",") {
+				t.Errorf("filter %s (live-added=%v): dispatch passed %v, want %v", name, lv != nil, got, want)
+			}
+		}
 	}
 }
 

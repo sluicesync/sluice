@@ -36,6 +36,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"sluicesync.dev/sluice/internal/appliershared"
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
@@ -143,22 +144,17 @@ func (f *liveAddedFilter) Snapshot() []string {
 // filterChangesWithLiveAdd is the live-add-aware companion to
 // [filterChanges]. The hot-path event check consults the base filter
 // AND the live-added set: a change is allowed if EITHER admits it.
-// When both base and live-add are empty (the common case for streams
-// with no filter and no live-adds yet), the function returns the input
-// channel verbatim — same zero-overhead shape as [filterChanges].
+//
+// There is no pass-through for an empty filter: control tables are out of
+// scope even when nothing else is ([tableAllowedWithLiveAdd], GC-43 (e)).
+// The pass-through this function used to have was never taken by the
+// streamer anyway, whose live-added set is always non-nil.
 //
 // The two-input shape lets the caller swap one without touching the
 // other; the streamer wires the operator-supplied [migcore.TableFilter] as
 // `base` and the running [liveAddedFilter] (whose contents change
 // over the run) as `live`.
 func filterChangesWithLiveAdd(ctx context.Context, in <-chan ir.Change, base migcore.TableFilter, live *liveAddedFilter) <-chan ir.Change {
-	// Fast path: no base filter and no live-add infra → pass-through.
-	// `live` may still be non-nil but empty; we let it through to the
-	// goroutine path because subsequent live-adds need to take effect
-	// without restarting the stream.
-	if base.IsEmpty() && live == nil {
-		return in
-	}
 	out := make(chan ir.Change)
 	go func() {
 		defer close(out)
@@ -214,7 +210,26 @@ func changeAllowedWithLiveAdd(c ir.Change, base migcore.TableFilter, live *liveA
 // tableAllowedWithLiveAdd is the name-based core of the dispatch filter,
 // shared with the reader-side scope predicate (Bug 246) so the reader's
 // policy checks and the dispatch filter can never disagree about a table.
+//
+// sluice's own control tables are never in scope, whatever the filter says
+// (GC-43 (e)). The roster ([appliershared.IsControlTable]) kept them out of
+// every schema reader, so no target ever gets one created — but nothing kept
+// their CHANGES out of the stream. The source heartbeat
+// (--source-heartbeat-interval) writes sluice_heartbeat on the source; on a
+// MySQL source those rows are in the binlog, reached the applier, found no
+// such table on the target and were counted in the skip ledger, so `sync
+// health` reported SKIPPING and exited 1, telling the operator to `schema
+// add-table` sluice's bookkeeping. A source that is itself a sluice target
+// carries sluice_cdc_state and its siblings the same way. Excluding them
+// HERE reaches both halves of the scope at once: every reader that accepts
+// the predicate drops them at the source ([Streamer.wireCDCScopePredicate]),
+// and the dispatch filter drops them for every reader that does not. The
+// transaction's TxBegin/TxCommit still pass, so a heartbeat still moves the
+// persisted position — which is what it is for.
 func tableAllowedWithLiveAdd(unqualified string, base migcore.TableFilter, live *liveAddedFilter) bool {
+	if appliershared.IsControlTable(unqualified) {
+		return false
+	}
 	if base.Allows(unqualified) {
 		return true
 	}

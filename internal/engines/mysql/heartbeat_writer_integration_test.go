@@ -209,11 +209,17 @@ func TestPruneHeartbeat_DropsOldRows(t *testing.T) {
 	}
 }
 
-// TestHeartbeat_AdvancesBinlogPosition pins the load-bearing F17
-// promise on MySQL: heartbeat writes produce binlog events. We capture
-// the master binlog position before and after the writes and assert
-// the position advanced — the byte distance is the binlog footprint of
-// F17's writes.
+// TestHeartbeat_AdvancesBinlogPosition pins that heartbeat writes reach
+// the SERVER's binlog: the tip before and after the writes, read back from
+// the server that took them. That is all it proves. It does not show that a
+// stream consumes those events, that the stream's PERSISTED position moves
+// on them, or that the applier does not trip over them — its evidence is
+// the write it just made, so it stayed green through GC-43 (e), where every
+// heartbeat row reached the applier as a skipped table and `sync health`
+// exited 1. The end-to-end promise is pinned in internal/pipeline by
+// TestStreamer_MySQLSourceHeartbeat_AdvancesPositionWithoutSkips: the
+// persisted position advances on heartbeats alone and the skip ledger stays
+// empty.
 func TestHeartbeat_AdvancesBinlogPosition(t *testing.T) {
 	dsn, cleanup := startMySQLForCDC(t)
 	defer cleanup()
