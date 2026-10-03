@@ -1131,8 +1131,14 @@ func (s *Streamer) phaseWireInterceptChain(applyCtx context.Context, changes <-c
 	// stream fills ITS OWN shard's pre-existing consolidated rows from ITS
 	// own source once the lease holder's ALTER has landed (the applier
 	// stamps the shard discriminator into the UPDATE's WHERE).
+	// GC-44: one first-boundary witness per wiring — whichever intercept
+	// runs, a table's first snapshot on THIS intercept instance is checked
+	// against the target's catalog, read lazily (or handed over from the
+	// warm-resume seed read) and memoized for the instance.
+	witness := s.firstBoundaryWitness()
 	var shapeABackfill *schemaForwardBackfill
 	if s.boundaryRouter != nil {
+		s.boundaryRouter.firstBoundary = witness
 		shapeABackfill = s.addedColumnBackfill(streamID, s.shapeSourceSchemaReader)
 		// The lease holder's ALTER is preceded by the backfill's durable
 		// write-ahead record (schema_forward_backfill_ledger.go).
@@ -1165,6 +1171,7 @@ func (s *Streamer) phaseWireInterceptChain(applyCtx context.Context, changes <-c
 				sourceEngineName: s.Source.Name(),
 				targetEngineName: s.Target.Name(),
 				normalizer:       snapshotNormalizer,
+				witness:          witness,
 			}
 			if s.addColumnForwardSchemaReader != nil {
 				deps.defaultProber = newSourceDefaultProber(s.addColumnForwardSchemaReader)
@@ -1205,6 +1212,27 @@ func (s *Streamer) phaseWireInterceptChain(applyCtx context.Context, changes <-c
 		filtered = observeSyncLagChanges(applyCtx, filtered, s.syncLag)
 	}
 	return filtered
+}
+
+// firstBoundaryWitness builds the GC-44 first-boundary witness for one
+// intercept wiring, consuming the catalog read this attempt's warm-resume
+// seed already made ([Streamer.firstBoundaryCatalog]).
+func (s *Streamer) firstBoundaryWitness() *firstBoundaryWitness {
+	initial := s.firstBoundaryCatalog
+	s.firstBoundaryCatalog = nil
+	if s.Source == nil || s.Target == nil {
+		return nil
+	}
+	w := &firstBoundaryWitness{
+		catalog:      newTargetCatalogWitness(s.loadTargetZoneWitness, initial),
+		sourceEngine: s.Source.Name(),
+		targetEngine: s.Target.Name(),
+		mappings:     s.Mappings,
+	}
+	if s.InjectShardColumn.Engaged() {
+		w.shardColumn = s.InjectShardColumn.Name
+	}
+	return w
 }
 
 // phaseSettleDispatch classifies the apply loop's outcome after

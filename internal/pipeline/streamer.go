@@ -1574,12 +1574,20 @@ type Streamer struct {
 	// boundary cache so the first CDC SchemaSnapshot is correctly
 	// classified as a real boundary (not as the cold-start anchor).
 	// Nil when --inject-shard-column is unset, --no-coordinate-live-ddl
-	// is set, or the stream is warm-resuming (warm resume doesn't run
-	// cold-start; the intercept's cache is seeded by the resumed
-	// position's first observed SchemaSnapshot, which is fine because
-	// the applier's target schema is the same as when cold-start
-	// completed).
+	// is set, or the stream is warm-resuming. This said the warm resume's
+	// first observed snapshot was a fine seed "because the applier's
+	// target schema is the same as when cold-start completed" — false for
+	// any source DDL made while the stream was stopped, or made after it
+	// restarted and before the table's first row, whose forward was then
+	// lost (GC-44). That first snapshot is now checked against the
+	// target's catalog ([firstBoundaryCatalog], schema_forward_witness.go).
 	coldStartSeedSnapshots []ir.SchemaSnapshot
+
+	// firstBoundaryCatalog is a target-catalog read this attempt already
+	// made — the SLM-1b warm-resume seed read — handed to the GC-44
+	// first-boundary witness so it need not read again. Consumed and
+	// cleared in [Streamer.phaseWireInterceptChain].
+	firstBoundaryCatalog map[string]*ir.Table
 
 	// readerSchemaSeed loads the prior shape per in-scope table handed to
 	// a CDC reader that implements [schemaSeedSetter] (SLM-1). On cold

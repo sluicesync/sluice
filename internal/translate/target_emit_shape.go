@@ -27,6 +27,23 @@ import "sluicesync.dev/sluice/internal/ir"
 // this constant cannot drift from the DDL it predicts.
 const MySQLMaterializedTemporalPrecision = 6
 
+// MySQLUnconstrainedDecimalPrecision and MySQLUnconstrainedDecimalScale
+// are what a MySQL-family target DECLARES for a source numeric with no
+// precision at all (a bare PG `numeric`): DECIMAL(65,30), MySQL's
+// documented maximum (catalog Bug 69). The emitter states it in
+// internal/engines/mysql's emitColumnType;
+// TestMaterializedDecimalMatchesTheEmitter there binds the two by driving
+// the real emitter, the same way the temporal constant above is bound.
+//
+// Found by the GC-44 anti-phantom family matrix (postgres→mysql): without
+// it the expected side read `Decimal(unconstrained)` against the
+// catalog's `Decimal(65,30)` — a phantom the first-boundary witness would
+// have forwarded on every resume, and `schema diff` reported as drift.
+const (
+	MySQLUnconstrainedDecimalPrecision = 65
+	MySQLUnconstrainedDecimalScale     = 30
+)
+
 // columnShapeRule rewrites ONE column's type into the shape the target's
 // catalog will read back, given the whole column rather than just its
 // type. Returning nil means "no rewrite" — the same convention
@@ -92,8 +109,9 @@ func targetEmitShapeRuleFor(targetEngine string) columnShapeRule {
 }
 
 // mysqlTargetEmitShape materializes the temporal precision a MySQL
-// target declares, and drops the time-zone flag MySQL's `TIME` cannot
-// carry.
+// target declares, drops the time-zone flag MySQL's `TIME` cannot carry,
+// and materializes the precision/scale it declares for an unconstrained
+// numeric ([MySQLUnconstrainedDecimalPrecision]).
 //
 // # The two axes, both measured against a real MySQL 8.0 catalog
 //
@@ -151,6 +169,24 @@ func mysqlTargetEmitShape(c *ir.Column) ir.Type {
 			return nil
 		}
 		return ir.Timestamp{Precision: MySQLMaterializedTemporalPrecision, WithTimeZone: v.WithTimeZone}
+	case ir.Decimal:
+		// The third axis: MySQL has no unbounded DECIMAL either, so a
+		// bare numeric is declared at the maximum and read back as it.
+		if !v.Unconstrained {
+			return nil
+		}
+		return ir.Decimal{Precision: MySQLUnconstrainedDecimalPrecision, Scale: MySQLUnconstrainedDecimalScale}
+	case ir.UUID, ir.Inet, ir.Cidr, ir.Macaddr:
+		// The fourth: the MySQL writer has no native UUID / network type
+		// on ANY flavor — MariaDB's own UUID / INET4 / INET6 included —
+		// and declares the text forms [retargetPGtoMySQL] names. That rule
+		// only runs for a Postgres-storage source, so a MariaDB source's
+		// native UUID / INET4 / INET6 column (same storage family as the
+		// target, no rule table) was predicted as itself against the
+		// catalog's CHAR(36) / VARCHAR(45). Found by the GC-44 anti-phantom
+		// family matrix (mariadb→mysql); bound to the emitter by
+		// TestMaterializedNetworkTypesMatchTheEmitter.
+		return retargetPGtoMySQL(v)
 	}
 	return nil
 }

@@ -97,6 +97,11 @@ var (
 	// (mysql.schemaDeltaTargetApplySetter) because their types are
 	// unexported.
 	_ schemaDeltaTargetApplySetter = (*mysql.CDCReader)(nil)
+	// GC-44 D3: the binlog lane's first-touch boundaries. Pinned because if
+	// the assertion quietly stopped matching, a DDL a resumed stream never
+	// replays would again reach the target never — the first-boundary
+	// witness only checks boundaries it is handed.
+	_ firstTouchBoundaryArmer = (*mysql.CDCReader)(nil)
 	// Its seeding half (audit 2026-09-01 SLM-1): the prior shape the
 	// refusal above compares against at a table's FIRST boundary. Same
 	// reasoning — an assertion that quietly stopped matching would leave

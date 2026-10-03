@@ -36,8 +36,9 @@ import (
 type pairStatus string
 
 const (
-	// pairIdentity — the two engines share a storage-shape family, so the
-	// catalog reads the source's own IR back and no rule is needed.
+	// pairIdentity — the two engines share a storage-shape family, so no
+	// PAIR rule is needed: the catalog reads back the source's IR as the
+	// target's own emitter shapes it (rewrittenColumns' baseline).
 	pairIdentity pairStatus = "identity"
 	// pairRule — a rule table exists and the direction is covered.
 	pairRule pairStatus = "rule"
@@ -169,9 +170,15 @@ func familyRepresentatives(t *testing.T) (reps []string, members map[string][]st
 }
 
 // rewrittenColumns runs the real compare-lane pass and counts how many
-// probe columns changed type.
+// probe columns the PAIR changed — measured against the same pass for the
+// target alone (tgt→tgt), so a target-only emitter effect
+// (targetEmitShapeRuleFor) is not mistaken for a pair rule. That baseline
+// is load-bearing since GC-44: a MySQL-family target declares UUID and the
+// network family as CHAR(36) / VARCHAR(45) / VARCHAR(30) for ANY source,
+// MariaDB's native types included, so the target-alone pass rewrites the
+// probe's p_uuid / p_inet on every pair into a MySQL family.
 func rewrittenColumns(src, tgt string) int {
-	in := retargetProbeSchema()
+	in := translate.RetargetForShapeCompare(retargetProbeSchema(), tgt, tgt)
 	out := translate.RetargetForShapeCompare(retargetProbeSchema(), src, tgt)
 	n := 0
 	for i, col := range out.Tables[0].Columns {

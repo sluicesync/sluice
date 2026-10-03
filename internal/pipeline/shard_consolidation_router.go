@@ -100,6 +100,15 @@ type BoundaryRouter struct {
 	// when the stream opted out of the backfill.
 	beforeAddColumn func(ctx context.Context, tableName string, columns []string) error
 
+	// firstBoundary checks a table's first snapshot per intercept instance
+	// against the consolidated target's catalog (GC-44 F4; read by
+	// [interceptSchemaSnapshotsForCoordination], set per wiring by
+	// [Streamer.phaseWireInterceptChain]). Shape A v1 refuses any
+	// difference rather than forwarding it: the lease protocol coordinates
+	// a boundary every shard observes, and a first boundary is observed
+	// only by the shard that restarted. nil keeps the pre-GC-44 baseline.
+	firstBoundary *firstBoundaryWitness
+
 	// observePollInterval controls how often the observer loop polls
 	// the lease row when a peer holds the lease. Default 2 seconds;
 	// tests can shrink it via NewBoundaryRouter's option-arg path

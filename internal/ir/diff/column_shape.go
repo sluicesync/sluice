@@ -69,6 +69,15 @@ type ShapeCompareOptions struct {
 	// IR can never false-refuse (only a latin1-vs-utf8mb4-style
 	// both-sides-resolved conflict does).
 	CompareCharset bool
+
+	// ColumnTypesOnly narrows the compare to column names and types:
+	// nullability and primary-key presence are left out. Its consumer is
+	// the CDC first-boundary witness (pipeline, GC-44), whose expected
+	// side is a change-stream projection that carries neither faithfully —
+	// pgoutput sends no nullability, and a REPLICA IDENTITY FULL key flag
+	// is not the table's primary key — so comparing them would refuse a
+	// healthy stream on every resume.
+	ColumnTypesOnly bool
 }
 
 // TableColumnShape compares expected (the table the migration intends
@@ -140,7 +149,7 @@ func TableColumnShapeWithOptions(expected, actual *ir.Table, opts ShapeCompareOp
 			Actual:   renderColumnShapeOpts(act, nil, opts),
 		})
 	}
-	if len(pkCols) > 0 && len(primaryKeyColumnSet(actual)) == 0 {
+	if !opts.ColumnTypesOnly && len(pkCols) > 0 && len(primaryKeyColumnSet(actual)) == 0 {
 		out = append(out, ColumnShapeMismatch{
 			Column:   PrimaryKeyMismatchColumn,
 			Expected: renderPrimaryKeyColumns(expected.PrimaryKey),
@@ -226,6 +235,9 @@ func renderColumnShapeOpts(c *ir.Column, pkCols map[string]struct{}, opts ShapeC
 				shape += " COLLATE " + collation
 			}
 		}
+	}
+	if opts.ColumnTypesOnly {
+		return shape
 	}
 	if _, isPK := pkCols[c.Name]; isPK {
 		// PK nullability is excluded from the compare; render the

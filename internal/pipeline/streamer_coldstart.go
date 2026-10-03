@@ -535,6 +535,10 @@ func (s *Streamer) coldStartPrepareSchema(schema *ir.Schema) (*ir.Schema, error)
 	// its own SOURCE projection, and a target type in its prev would read
 	// as a phantom swap on every overridden column.
 	s.readerSchemaSeed = staticSchemaSeed(rawReaderSchemaSeed(schema))
+	// A catalog read an earlier attempt of this Run made (a warm resume
+	// that fell through to this cold start) predates the tables this run
+	// is about to create; the first-boundary witness reads its own.
+	s.firstBoundaryCatalog = nil
 	// Apply per-column type overrides before the schema-write phase
 	// sees the schema. Warm resume skips this step — by then the
 	// target schema is already shaped from the cold-start run.

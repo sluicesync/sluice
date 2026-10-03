@@ -163,9 +163,23 @@ func interceptSchemaSnapshotsForCoordination(
 				cache[key] = post
 				version[key]++
 				if !hadPre {
-					// First snapshot for this table — cold-start seed,
-					// no DDL boundary to route. Forward as-is so the
-					// applier records the initial schema-history row.
+					// First snapshot for this table since this intercept
+					// was wired — no DDL boundary to route. GC-44 F4: it is
+					// the baseline only if the consolidated target agrees
+					// with it; a difference refuses (Shape A v1 does not
+					// forward a boundary only this shard observed).
+					if err := checkShapeAFirstBoundary(ctx, router.firstBoundary, key, snap.IR); err != nil {
+						slog.ErrorContext(
+							ctx, "shard consolidation intercept: first boundary refused",
+							"table", key,
+							"error", err,
+						)
+						delete(cache, key)
+						delete(version, key)
+						wrapped := fmt.Errorf("pipeline: shard consolidation: %w", err)
+						errStore.Store(&wrapped)
+						return
+					}
 					slog.DebugContext(
 						ctx, "shard consolidation intercept: seeded table cache",
 						"table", key,
@@ -245,6 +259,40 @@ func interceptSchemaSnapshotsForCoordination(
 		}
 	}()
 	return out
+}
+
+// checkShapeAFirstBoundary is the Shape A face of the target-witnessed
+// first boundary (GC-44 F4; schema_forward_witness.go): nil when the
+// consolidated target agrees with the snapshot (or cannot speak for the
+// table, or only carries extra columns — WARNed), the
+// [resumeDivergenceMarker] refusal otherwise. nil witness (a unit harness)
+// accepts.
+func checkShapeAFirstBoundary(ctx context.Context, w *firstBoundaryWitness, tableName string, post *ir.Table) error {
+	if w == nil {
+		return nil
+	}
+	v, err := w.verdict(ctx, post)
+	if err != nil {
+		return fmt.Errorf("read the consolidated target's catalog to check the first schema boundary for %q "+
+			"(the boundary is not accepted unchecked): %w", tableName, err)
+	}
+	switch v.kind {
+	case witnessMatch:
+		return nil
+	case witnessUnwitnessed:
+		slog.WarnContext(ctx,
+			"shard consolidation: the target cannot witness this table's first schema boundary; accepting it as the "+
+				"baseline — a change made to this shard's source while the stream was stopped is NOT checked",
+			"table", tableName, "reason", v.reason)
+		return nil
+	case witnessTargetOnly:
+		slog.WarnContext(ctx,
+			"shard consolidation: the consolidated target holds columns this shard's source no longer has; the "+
+				"target keeps them",
+			"table", tableName, "target_only_columns", v.targetOnly)
+		return nil
+	}
+	return resumeDivergenceRefusal(tableName, v, RecoveryHint(tableName))
 }
 
 // synthesizeColdStartSeedSnapshots builds the cold-start cache seed

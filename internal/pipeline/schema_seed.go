@@ -189,6 +189,8 @@ func (s *Streamer) loadWarmResumeSchemaSeed(ctx context.Context, applier ir.Chan
 	if err != nil {
 		return nil, err
 	}
+	// The same read serves the GC-44 first-boundary witness (D4).
+	s.firstBoundaryCatalog = witness
 	return mergeWarmResumeSeed(ctx, streamID, "", witness, history, s.Mappings)
 }
 
@@ -672,10 +674,40 @@ func (s *Streamer) wireReaderSchemaSeed(ctx context.Context, r ir.CDCReader) err
 // Streamer.schemaDeltaAppliesToTarget is false in multi-database mode by
 // construction". True when written, false the moment H5 landed — a
 // comment asserting an invariant, outliving the code it described.
+//
+// It also arms the binlog lane's first-touch boundaries (GC-44 D3,
+// [firstTouchBoundaryArmer]) wherever a schema-snapshot intercept will
+// consume them — riding this helper because the roster above already holds
+// it at every reader-open site.
 func (s *Streamer) wireSchemaDeltaArming(r ir.CDCReader) {
+	if armer, ok := r.(firstTouchBoundaryArmer); ok && s.firstTouchBoundariesConsumed() {
+		armer.ArmFirstTouchSchemaBoundaries()
+	}
 	setter, ok := r.(schemaDeltaTargetApplySetter)
 	if !ok {
 		return
 	}
 	setter.SetSchemaDeltaAppliesToTarget(s.schemaDeltaAppliesToTarget())
+}
+
+// firstTouchBoundaryArmer is the optional CDC-reader surface that makes a
+// reader emit an ir.SchemaSnapshot at each in-scope table's first row of a
+// stream, DDL or not (GC-44 D3). Implemented by the MySQL-family binlog
+// reader; Postgres (RelationMessage) and VStream (FIELD events) already
+// emit one per table per stream.
+type firstTouchBoundaryArmer interface {
+	ArmFirstTouchSchemaBoundaries()
+}
+
+// firstTouchBoundariesConsumed reports whether a schema-snapshot intercept
+// downstream will check a first-touch boundary against the target: the
+// single-stream forward intercept, or Shape A's coordination intercept.
+// Neither runs in multi-database mode (where a boundary only writes a
+// history row), so arming there would cost a history write per table per
+// resume for nothing.
+func (s *Streamer) firstTouchBoundariesConsumed() bool {
+	if s.multiDatabaseMode() {
+		return false
+	}
+	return s.singleStreamSchemaForwardActive() || (s.InjectShardColumn.Engaged() && !s.NoCoordinateLiveDDL)
 }

@@ -340,6 +340,24 @@ func HasStorageShapeMapping(sourceEngine, targetEngine string) bool {
 		retargetRuleFor(sourceEngine, targetEngine) != nil
 }
 
+// HasShapeCompareMapping reports whether [RetargetForShapeCompare] can
+// render this pair's source IR in the target's storage shapes at all —
+// same storage family, the emit-lane table, or the COMPARE-ONLY table.
+// It is the literal reading [HasStorageShapeMapping] deliberately
+// withholds for mysql→postgres.
+//
+// Its consumer is the CDC first-boundary witness (pipeline, GC-44),
+// which arms on the compare-only pair where `migrate` does not, and on
+// its own evidence: a stream that already ran a cold start over these
+// tables, a target catalog sluice itself created, and an anti-phantom
+// family matrix measured against real servers in every direction —
+// including ir.Geometry, which that consumer reads at the level the
+// change streams carry (geometry vs geography only).
+func HasShapeCompareMapping(sourceEngine, targetEngine string) bool {
+	return storageShapeFamily(sourceEngine) == storageShapeFamily(targetEngine) ||
+		shapeCompareRuleFor(sourceEngine, targetEngine) != nil
+}
+
 // retargetPGtoMySQL mirrors the PG→MySQL emit rules from
 // internal/engines/mysql/ddl_emit.go::emitColumnType. The rules track
 // the v0.7.0 auto-emit defaults (ADR §"PG-native types auto-emit").

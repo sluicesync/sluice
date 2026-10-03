@@ -45,6 +45,11 @@ var pipelineDomainDispatchExemptions = map[string]string{
 		"IR keyset loader, which pushes the chunk bound in the column's native semantics — no data loss, only " +
 		"the raw-copy fast lane declined. Admitting a domain PK to the raw-copy lane is a perf-parity widening " +
 		"that belongs in a perf chunk with a matrix cell + pin, not a silent edit in a transparency gate.",
+	"schema_forward_witness.go:reconcilePairs:e.Type": "ALREADY-UNWRAPPED: the operand is a column of " +
+		"witnessCompareTable's output, whose every type went through witnessCompareType — and that lens's " +
+		"ir.Domain arm unwraps to the storage type first. No ir.Domain can reach this switch.",
+	"schema_forward_witness.go:reconcilePairs:a.Type": "ALREADY-UNWRAPPED: the target side of the same " +
+		"pair as reconcilePairs:e.Type, lensed by the same witnessCompareType.",
 	"where_pushdown_pg.go:pgPushdownEligibleTerms:c.Type": "CONSERVATIVE-REFUSAL: the ir.Date arm is a " +
 		"fail-closed BELT on a time-bearing-literal term; a domain column is refused for server-side push-down " +
 		"one call later at pgPushdownEligibleColumn's default arm regardless, so whether this belt fires for a " +

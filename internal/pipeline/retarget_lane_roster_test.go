@@ -89,6 +89,12 @@ var retargetCallSites = map[string]struct {
 		laneEmit,
 		"CDC schema-forward ADD COLUMN: emitted via the target's SchemaDeltaApplier.",
 	},
+	"pipeline/schema_forward_witness.go:expected": {
+		laneCompare,
+		"the GC-44 first-boundary witness: a change-stream snapshot rendered as target storage and " +
+			"COMPARED against the target catalog's read-back, then discarded. A forward it decides on " +
+			"retargets the raw snapshot again on the emit lane (retargetTableScrub / retargetAddedColumns).",
+	},
 	"pipeline/broker.go:applySchemaDeltas": {
 		laneEmit,
 		"the from-backup broker's schema-delta replay: CreateTablesWithoutConstraints on the result.",

@@ -127,6 +127,13 @@ type schemaForwardDeps struct {
 	// by name against snap.IR) and downstream to the applier's
 	// schema-history write.
 	normalizer ir.CDCSchemaSnapshotNormalizer
+
+	// witness checks a boundary the intercept has no trustworthy pre-state
+	// for against the target's catalog (GC-44; schema_forward_witness.go).
+	// Always wired by [Streamer.phaseWireInterceptChain]; nil only in unit
+	// tests of the CDC→CDC paths, where a table's first snapshot keeps the
+	// pre-GC-44 baseline behaviour.
+	witness *firstBoundaryWitness
 }
 
 // hint is the recovery text for a DEFAULT refusal on tableName — the
@@ -209,6 +216,12 @@ type schemaForwardBackfill struct {
 // Seed snapshots are NOT forwarded downstream — the applier already
 // wrote the schema-history row at cold-start via the schema-apply
 // phase.
+//
+// The seed exists only on the intercept a cold start wires. Every other
+// wiring — a warm resume, a restart, an in-process retry — starts with an
+// empty cache, and a table's first snapshot there is checked against the
+// TARGET's catalog instead (deps.witness; GC-44, schema_forward_witness.go):
+// before that, it was cached as the baseline and its delta never applied.
 //
 // On any refuse-loudly error, the intercept closes the out-channel
 // and stores the error in errStore for the streamer's
@@ -301,7 +314,9 @@ func interceptAddColumnForward(
 				// boundary, and it came from CDC — so the next comparison
 				// is CDC→CDC (full guard lifts).
 				delete(seedSourced, key)
-				if !hadPre {
+				var routeErr error
+				switch {
+				case !hadPre && deps.witness == nil:
 					slog.DebugContext(
 						ctx, "forward-add-column intercept: seeded table cache",
 						"table", key,
@@ -310,20 +325,43 @@ func interceptAddColumnForward(
 						return
 					}
 					continue
+				case !hadPre || (preIsSeed && deps.witness != nil && seedBoundaryNeedsWitness(pre, post)):
+					// GC-44: no pre-state this intercept can trust — the
+					// table's first snapshot since the intercept was wired,
+					// or an ALTER COLUMN TYPE against the cold-start seed.
+					// The target is the witness (schema_forward_witness.go).
+					var witnessedPre *ir.Table
+					witnessedPre, routeErr = routeWitnessedBoundary(ctx, deps, key, post, snap)
+					if routeErr == nil && witnessedPre == nil {
+						// Nothing forwarded: accept the baseline.
+						if !forwardChange(ctx, out, c) {
+							return
+						}
+						continue
+					}
+					if routeErr == nil {
+						pre = witnessedPre
+					}
+				default:
+					routeErr = routeForwardBoundary(ctx, deps, key, pre, post, snap, preIsSeed)
 				}
-				if err := routeForwardBoundary(ctx, deps, key, pre, post, snap, preIsSeed); err != nil {
+				if routeErr != nil {
 					slog.ErrorContext(
 						ctx, "forward-add-column intercept: refuse",
 						"table", key,
-						"error", err,
+						"error", routeErr,
 					)
 					// Rewind the cache so a retry replays the same
 					// boundary from the same pre-state.
-					cache[key] = pre
+					if hadPre {
+						cache[key] = pre
+					} else {
+						delete(cache, key)
+					}
 					if preIsSeed {
 						seedSourced[key] = true
 					}
-					wrapped := fmt.Errorf("pipeline: forward schema add-column: %w", err)
+					wrapped := fmt.Errorf("pipeline: forward schema add-column: %w", routeErr)
 					errStore.Store(&wrapped)
 					return
 				}
@@ -416,13 +454,22 @@ func routeForwardBoundary(
 	// is unguarded. ADD / CREATE INDEX / ADD CHECK are non-destructive
 	// and a phantom of them cannot arise against the seed (the CDC
 	// projection is a subset of the seed's fidelity), so they pass.
+	//
+	// GC-44 D2 narrowed the guard: an ALTER COLUMN TYPE against the seed
+	// is decided by the target witness before this function is reached
+	// ([seedBoundaryNeedsWitness]) — "the target keeps the column" is not
+	// safe for a type widen, whose values the narrow column then rounds.
+	// The remaining shapes still skip, at WARN rather than INFO: a genuine
+	// one is a divergence the operator must hear about.
 	if preIsSeed && shapeIsDestructiveOrMutating(shape.Kind) {
-		slog.InfoContext(
+		slog.WarnContext(
 			ctx,
 			"schema-forward: skipping a destructive/mutating shape at the "+
 				"first post-cold-start boundary (classified against the "+
 				"cold-start seed, whose fidelity differs from the CDC "+
-				"projection — not forwarding to avoid a phantom; ADR-0091 §3)",
+				"projection — not forwarding to avoid a phantom; ADR-0091 §3). "+
+				"If the source really made this change, apply it on the target "+
+				"via the drained model",
 			"table", tableName,
 			"shape", shape.Kind.String(),
 		)

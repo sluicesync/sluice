@@ -74,6 +74,12 @@ import (
 //     restart, which reads the same columns and refuses again. A fleet
 //     spec carries no source-heartbeat key today, so no leg can reach it
 //     yet; it is listed so one added later is not restarted forever.
+//   - RESUME-SCHEMA-DIVERGENCE (every source with a schema-snapshot
+//     intercept, codeless; GC-44): listed. The check compares the source's
+//     current table shape with the target's catalog and persists nothing,
+//     so a restart reads both back unchanged and refuses again until the
+//     operator reconciles the target. Its catalog-read failure is NOT the
+//     marker and stays restartable.
 //   - DEFERRED-KEY-CHECK-FAILED-AT-COMMIT (Postgres target, codeless): NOT
 //     listed. It is the COMMIT of a target transaction that a deferrable
 //     constraint's re-check refused, and one of its causes is a source
@@ -103,6 +109,7 @@ var refusalsARestartRepeats = []error{
 	ir.ErrKeyScopedWriteMatchedMultipleRows,
 	ir.ErrChangeLogWatermarkStalled,
 	ir.ErrHeartbeatTableNotSluices,
+	ir.ErrResumeSchemaDivergence,
 }
 
 // refusalARestartRepeats returns the listed sentinel err carries, or nil.

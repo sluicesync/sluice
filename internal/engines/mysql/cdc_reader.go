@@ -323,6 +323,16 @@ type CDCReader struct {
 	// Pump goroutine only.
 	owedSchemaBoundary map[string]struct{}
 
+	// firstTouch is the GC-44 D3 first-touch boundary state
+	// (cdc_first_touch_boundary.go): armed by the streamer before
+	// StreamChanges, it makes each in-scope table's first row of the
+	// stream emit an ir.SchemaSnapshot even with no DDL pending, so the
+	// pipeline's first-boundary witness sees every table a resumed stream
+	// touches. Deliberately separate from owedSchemaBoundary: a first
+	// touch is not owed — a restart re-arms it. Pump goroutine only, except
+	// the arming setter (before StreamChanges).
+	firstTouch firstTouchBoundaries
+
 	// snapshotSig is the per-qualified-table structural fingerprint of
 	// the schema-history version last emitted as an
 	// [ir.SchemaSnapshot] (ADR-0049 Chunk B1). Implements DP-1
@@ -928,6 +938,18 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 		r.syncer.Close()
 		r.syncer = nil
 		return nil, fmt.Errorf("mysql: start binlog stream: %w", err)
+	}
+	// GC-44 D3: the first-touch boundaries of an armed stream are anchored
+	// at its start (cdc_first_touch_boundary.go). positionAt reads the
+	// GTID set / file startStreamer just installed.
+	if r.firstTouch.armed {
+		anchor, err := r.positionAt(startPos.File, startPos.Pos)
+		if err != nil {
+			r.syncer.Close()
+			r.syncer = nil
+			return nil, fmt.Errorf("mysql: first-touch boundary anchor: %w", err)
+		}
+		r.firstTouch.start(anchor)
 	}
 
 	r.noEventsSuppress = make(chan struct{})
@@ -2021,14 +2043,29 @@ func (r *CDCReader) tableFor(ctx context.Context, qn string) (*tableSchema, erro
 //     between the DDL and the first post-DDL row resolves to the
 //     post-DDL schema.
 //
+// An armed stream's first row per in-scope table is a boundary too, with
+// no DDL pending, anchored at the stream's start (GC-44 D3;
+// cdc_first_touch_boundary.go).
+//
 // A column whose type can't be reconstructed already failed loudly in
 // loadTableSchema/translateType before reaching here (tableFor
 // returned that error), so this path sees only well-formed tables;
 // its only failure surface is a blocked channel send (propagated —
 // fatal/loud, #4b).
 func (r *CDCReader) maybeSnapshotSchemaB1(ctx context.Context, qn string, tbl *tableSchema, out chan<- ir.Change) error {
-	if !r.pendingDDLActive || tbl == nil {
+	if tbl == nil {
 		return nil
+	}
+	// GC-44 D3: a table's first row of an armed stream is a boundary even
+	// with no DDL pending (cdc_first_touch_boundary.go). Taken whatever
+	// happens below, so it fires once per table per stream.
+	firstTouch := r.firstTouch.take(qn, r.scopeAllowed == nil || r.tableInScope(qn))
+	if !r.pendingDDLActive && !firstTouch {
+		return nil
+	}
+	anchor := r.pendingDDLAnchor
+	if !r.pendingDDLActive {
+		anchor = r.firstTouch.anchor
 	}
 	// Whatever this returns, the table's post-DDL boundary is settled: a
 	// version written, no delta, or a refusal that stops the stream
@@ -2120,7 +2157,7 @@ func (r *CDCReader) maybeSnapshotSchemaB1(ctx context.Context, qn string, tbl *t
 		return nil
 	}
 	if err := send(ctx, out, ir.SchemaSnapshot{
-		Position: r.pendingDDLAnchor,
+		Position: anchor,
 		Schema:   tbl.Schema,
 		Table:    tbl.Name,
 		IR:       irTbl,

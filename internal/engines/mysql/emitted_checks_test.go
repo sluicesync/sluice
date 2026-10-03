@@ -71,6 +71,64 @@ func TestMaterializedTemporalPrecisionMatchesTheEmitter(t *testing.T) {
 	}
 }
 
+// TestMaterializedDecimalMatchesTheEmitter binds the compare-lane
+// prediction for an unconstrained numeric
+// ([translate.MySQLUnconstrainedDecimalPrecision] / Scale) to the DDL this
+// emitter actually writes, the way TestMaterializedTemporalPrecisionMatchesTheEmitter
+// binds the temporal one: the materialized IR must emit byte-identical DDL
+// to the bare one. Found by the GC-44 anti-phantom family matrix.
+func TestMaterializedDecimalMatchesTheEmitter(t *testing.T) {
+	bare, err := emitColumnType(ir.Decimal{Unconstrained: true})
+	if err != nil {
+		t.Fatalf("emit bare: %v", err)
+	}
+	predicted, err := emitColumnType(ir.Decimal{
+		Precision: translate.MySQLUnconstrainedDecimalPrecision,
+		Scale:     translate.MySQLUnconstrainedDecimalScale,
+	})
+	if err != nil {
+		t.Fatalf("emit predicted: %v", err)
+	}
+	if bare != predicted {
+		t.Fatalf("the compare-lane prediction emits %q but an unconstrained numeric emits %q", predicted, bare)
+	}
+}
+
+// TestMaterializedNetworkTypesMatchTheEmitter binds the compare lane's
+// prediction for UUID and the network family on a MySQL-family target (any
+// source — a MariaDB source's native UUID / INET4 / INET6 included) to the
+// DDL this emitter writes, every member of the family.
+func TestMaterializedNetworkTypesMatchTheEmitter(t *testing.T) {
+	for _, src := range []ir.Type{
+		ir.UUID{},
+		ir.Inet{},
+		ir.Inet{Family: ir.InetFamilyAny},
+		ir.Cidr{},
+		ir.Macaddr{Width: ir.MacaddrEUI48},
+		ir.Macaddr{Width: ir.MacaddrEUI64},
+	} {
+		predicted := translate.RetargetForShapeCompare(&ir.Schema{Tables: []*ir.Table{{
+			Name: "t", Columns: []*ir.Column{{Name: "c", Type: src}},
+		}}}, "mariadb", "mysql").Tables[0].Columns[0].Type
+		if predicted == src {
+			// The catalog reads back the text form, never the source type;
+			// a prediction left at the source type is the phantom itself.
+			t.Errorf("%s: the compare lane did not materialize the writer's text form", src)
+		}
+		bare, err := emitColumnType(src)
+		if err != nil {
+			t.Fatalf("emit %s: %v", src, err)
+		}
+		got, err := emitColumnType(predicted)
+		if err != nil {
+			t.Fatalf("emit predicted %s: %v", predicted, err)
+		}
+		if got != bare {
+			t.Errorf("%s: the compare lane predicts %s (%q) but the writer emits %q", src, predicted, got, bare)
+		}
+	}
+}
+
 // TestPredictEmittedChecks_DomainMatrix pins what the MySQL writer says
 // it will synthesize, over BOTH translatable DOMAIN CHECK shapes plus
 // the un-translatable control.
