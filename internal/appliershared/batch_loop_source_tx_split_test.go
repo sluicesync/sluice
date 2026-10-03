@@ -27,14 +27,61 @@ func TestRunBatchLoop_KeyScopedRefusalNamesTheSplit(t *testing.T) {
 	refusal := func() error {
 		return RefuseKeyScopedMultiMatch("fake", "delete", "s", "t", ir.Row{"id": int64(2)}, 2)
 	}
+	snapshotAt := func(token string) ir.Change {
+		return ir.SchemaSnapshot{Position: pos(token), Schema: "s", Table: "t"}
+	}
 	cases := []struct {
-		name      string
-		changes   []ir.Change
-		batchSize int
-		refuseAt  string // dispatch of this token refuses
-		atCommit  int    // > 0: the Nth commit refuses instead
-		wantSplit bool
+		name             string
+		changes          []ir.Change
+		batchSize        int
+		transactionalDDL bool   // the Postgres shape: a schema event rides its own batch tx
+		refuseAt         string // dispatch of this token refuses
+		skip             string // dispatch of this token reports an absent target
+		atCommit         int    // > 0: the Nth commit refuses instead
+		wantSplit        bool
 	}{
+		// Bug 295: a committed batch that held no row of the transaction is
+		// not part of it. The filed repro is the first cell: the Postgres
+		// reader's lazily emitted SchemaSnapshot, flushed alone at the
+		// table's first row, ahead of the statement that is refused.
+		// Pin the class: both schema-event shapes (TransactionalDDL true and
+		// false), a skipped row, and a Truncate — each against a sibling
+		// whose batch did carry a row, which must still name the split.
+		{
+			name:             "schema snapshot flushed alone, then the transaction's first row refused (Bug 295)",
+			changes:          []ir.Change{txBegin("tb"), snapshotAt("s1"), insertAt("p1")},
+			batchSize:        100,
+			transactionalDDL: true, refuseAt: "p1", wantSplit: false,
+		},
+		{
+			name:             "schema snapshot flushed with an earlier row of the transaction",
+			changes:          []ir.Change{txBegin("tb"), insertAt("p1"), snapshotAt("s1"), insertAt("p2")},
+			batchSize:        100,
+			transactionalDDL: true, refuseAt: "p2", wantSplit: true,
+		},
+		{
+			name:      "schema snapshot applied alone without transactional DDL, then refused",
+			changes:   []ir.Change{txBegin("tb"), snapshotAt("s1"), insertAt("p1")},
+			batchSize: 100, refuseAt: "p1", wantSplit: false,
+		},
+		{
+			name:      "rows flushed ahead of a schema snapshot without transactional DDL",
+			changes:   []ir.Change{txBegin("tb"), insertAt("p1"), snapshotAt("s1"), insertAt("p2")},
+			batchSize: 100, refuseAt: "p2", wantSplit: true,
+		},
+		{
+			name:      "the only committed row was skipped for an absent target",
+			changes:   []ir.Change{txBegin("tb"), insertAt("p1"), insertAt("p2")},
+			batchSize: 1, skip: "p1", refuseAt: "p2", wantSplit: false,
+		},
+		{
+			// Deliberately conservative: the per-change path's pendingRows does
+			// not count a Truncate either, and "may" stays true.
+			name:             "a Truncate committed inside the transaction keeps the refusal's may",
+			changes:          []ir.Change{txBegin("tb"), truncateAt("x1"), insertAt("p1")},
+			batchSize:        100,
+			transactionalDDL: true, refuseAt: "p1", wantSplit: false,
+		},
 		{
 			name:      "row cap split, refused at dispatch",
 			changes:   []ir.Change{txBegin("tb"), insertAt("p1"), insertAt("p2")},
@@ -67,14 +114,13 @@ func TestRunBatchLoop_KeyScopedRefusalNamesTheSplit(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			rec := &recorder{}
-			cfg := testConfig(t, rec, false)
-			if tc.refuseAt != "" {
-				cfg.Dispatch = func(_ context.Context, _ BatchTx, _ string, c ir.Change) (bool, error) {
-					if c.Pos().Token == tc.refuseAt {
-						return false, refusal()
-					}
-					return false, nil
+			cfg := testConfig(t, rec, tc.transactionalDDL)
+			cfg.CacheSchemaSnapshot = func(ir.SchemaSnapshot) {}
+			cfg.Dispatch = func(_ context.Context, _ BatchTx, _ string, c ir.Change) (bool, error) {
+				if tc.refuseAt != "" && c.Pos().Token == tc.refuseAt {
+					return false, refusal()
 				}
+				return c.Pos().Token == tc.skip, nil
 			}
 			if tc.atCommit > 0 {
 				commits := 0

@@ -3,7 +3,11 @@
 
 package laneapply
 
-import "sluicesync.dev/sluice/internal/ir"
+import (
+	"context"
+
+	"sluicesync.dev/sluice/internal/ir"
+)
 
 // laneSourceTx is the coordinator's view of how much of the open source
 // transaction is durable on the target, for the account a refusal gives of
@@ -25,14 +29,33 @@ type laneSourceTx struct {
 	// transaction, which nothing can split.
 	open bool
 
-	// rowsSeen is true once a row change of the open transaction has been
-	// routed to a lane or applied as a barrier.
+	// rowsSeen is true once a row change of the open transaction that writes
+	// (one not skipped for an absent target) has been routed to a lane or
+	// applied as a barrier.
 	rowsSeen bool
 
 	// partCommitted is true once part of the open transaction is durable: a
 	// barrier inside it drained the lanes after a row of it was routed, or
 	// committed a statement of it itself.
 	partCommitted bool
+}
+
+// writesSourceStatement reports whether applying the barrier change c wrote a
+// statement of its source transaction to the target, for partCommitted (Bug
+// 295). A SchemaSnapshot carries none: a reader emits it lazily at a table's
+// first row, inside that row's transaction, but it is the table's shape, not
+// anything the transaction did. Neither does a row change skipped for an
+// absent target, which wrote zero rows (PG-2). A Truncate does.
+// The skip verdict is the route-time one [LaneApplier.SkipsRowChange] gives,
+// which fails toward "applied" on a probe error; so does this.
+func (o *Orchestrator) writesSourceStatement(ctx context.Context, c ir.Change) bool {
+	switch c.(type) {
+	case ir.SchemaSnapshot:
+		return false
+	case ir.Insert, ir.Update, ir.Delete:
+		return !o.la.SkipsRowChange(ctx, c)
+	}
+	return true
 }
 
 // noteTxSplit tells a refusal from a lane batch that its source transaction

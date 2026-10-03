@@ -347,7 +347,6 @@ func RunBatchLoop(ctx context.Context, cfg *BatchConfig, streamID string, change
 		if err != nil {
 			return src.noteSplit(err)
 		}
-		src.batchCommitted(batchN)
 		if batchN > 0 {
 			logBatchCommitted(ctx, cfg.EngineName, streamID, batchN, lastPos.Token)
 		}
@@ -520,10 +519,10 @@ func runOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 	// after commitBatch reports nil (Chunk C cache-after-commit).
 	if cfg.TransactionalDDL {
 		if _, isTruncate := first.(ir.Truncate); isTruncate {
-			return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, schemaEventAtBoundary(src.open), pending, src.open)
+			return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, schemaEventAtBoundary(src.open), pending, src)
 		}
 		if snap, isSnap := first.(ir.SchemaSnapshot); isSnap {
-			if err := commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, schemaEventAtBoundary(src.open), pending, src.open); err != nil {
+			if err := commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, schemaEventAtBoundary(src.open), pending, src); err != nil {
 				return 0, ir.Position{}, false, err
 			}
 			cfg.CacheSchemaSnapshot(snap)
@@ -540,7 +539,7 @@ func runOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 	// above) and has just dispatched, so the engine's key cache is populated
 	// for the lookup.
 	if cfg.IsKeylessTable != nil && cfg.IsKeylessTable(ctx, first) {
-		return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, false, pending, src.open)
+		return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, false, pending, src)
 	}
 
 	// Idle-flush timer: commit a partial batch if no further change
@@ -555,7 +554,7 @@ func runOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 		case c, ok := <-changes:
 			if !ok {
 				channelClosed = true
-				return n, lastPos, channelClosed, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, false, pending, src.open)
+				return n, lastPos, channelClosed, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, false, pending, src)
 			}
 			// Source-tx boundary handling (ADR-0027). TxCommit flushes
 			// the in-flight target tx so the apply aligns with the
@@ -573,7 +572,7 @@ func runOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 				src.open = false
 				// commitBatch notes the commit (ADR-0190): its position write is
 				// outside the source transaction now.
-				return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, true, pending, false)
+				return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, true, pending, src)
 			}
 			if _, isTxBegin := c.(ir.TxBegin); isTxBegin {
 				// From here until the matching TxCommit, a flush lands
@@ -595,7 +594,7 @@ func runOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 			// the per-change path. Return rows=1 and the event's
 			// position so the outer loop logs it as its own batch.
 			if !cfg.TransactionalDDL && isSchemaEvent(c) {
-				if err := commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, false, pending, src.open); err != nil {
+				if err := commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, false, pending, src); err != nil {
 					return 0, ir.Position{}, false, err
 				}
 				logBatchCommitted(ctx, cfg.EngineName, streamID, n, lastPos.Token)
@@ -631,10 +630,10 @@ func runOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 			// arrive in later batches) are applied.
 			if cfg.TransactionalDDL {
 				if _, isTruncate := c.(ir.Truncate); isTruncate {
-					return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, schemaEventAtBoundary(src.open), pending, src.open)
+					return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, schemaEventAtBoundary(src.open), pending, src)
 				}
 				if snap, isSnap := c.(ir.SchemaSnapshot); isSnap {
-					if err := commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, schemaEventAtBoundary(src.open), pending, src.open); err != nil {
+					if err := commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, schemaEventAtBoundary(src.open), pending, src); err != nil {
 						return 0, ir.Position{}, false, err
 					}
 					// ADR-0049 Chunk C cache-after-commit: see the
@@ -653,7 +652,7 @@ func runOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 			// (keyless CDC is at-least-once; see the IsKeylessTable doc and
 			// the first-change branch above; Bug 143).
 			if cfg.IsKeylessTable != nil && cfg.IsKeylessTable(ctx, c) {
-				return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, false, pending, src.open)
+				return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, false, pending, src)
 			}
 			// Byte-cap flush (ADR-0028): bounds the in-flight tx's
 			// buffered parameter memory on wide-row streams. Checked
@@ -678,7 +677,7 @@ func runOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 						hinter.NoteByteCapDominant(ctx, n, batchBytes, cfg.ByteCap)
 					}
 				}
-				return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, false, pending, src.open)
+				return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, false, pending, src)
 			}
 			// Reset the idle timer for each successful change so the
 			// timer measures gaps between events, not absolute time
@@ -691,14 +690,14 @@ func runOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 				slog.Int("rows", n),
 				slog.Duration("idle", DefaultIdleFlushPeriod),
 			)
-			return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, false, pending, src.open)
+			return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, false, pending, src)
 		case <-ctx.Done():
 			_ = tx.Rollback()
 			return 0, ir.Position{}, false, ctx.Err()
 		}
 	}
 
-	return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, false, pending, src.open)
+	return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, false, pending, src)
 }
 
 // waitForFirstChange blocks until the first row-bearing change of a
@@ -785,11 +784,13 @@ func waitForFirstChange(ctx context.Context, cfg *BatchConfig, streamID string, 
 //     replays the whole tx from the last boundary and re-counts once on
 //     resume (idempotent apply; the persisted counter never advanced).
 //
-// inSourceTx reports whether the loop is currently between a TxBegin and its
-// TxCommit. It is what makes "mid-transaction" mean mid-transaction rather
-// than merely "not at a boundary" (audit 2026-08-01 S3). See
-// [commitBatch] for why the distinction is load-bearing.
-func commitBatch(ctx context.Context, cfg *BatchConfig, tx BatchTx, streamID, token string, rows, rowDML int, atBoundary bool, pending *int64, inSourceTx bool) error {
+// src is the source transaction the loop is in. Its open flag is what makes
+// "mid-transaction" mean mid-transaction rather than merely "not at a
+// boundary" (audit 2026-08-01 S3; see below for why the distinction is
+// load-bearing), and a successful commit records into it how much of that
+// transaction is now durable ([sourceTxState.batchCommitted]).
+func commitBatch(ctx context.Context, cfg *BatchConfig, tx BatchTx, streamID, token string, rows, rowDML int, atBoundary bool, pending *int64, src *sourceTxState) error {
+	inSourceTx := src.open
 	// The hazard CheckpointOnlyAtTxBoundary guards is landing the resume
 	// position INSIDE a source transaction, which a MySQL binlog resume
 	// cannot start from. That requires there to BE an open source
@@ -840,6 +841,7 @@ func commitBatch(ctx context.Context, cfg *BatchConfig, tx BatchTx, streamID, to
 		)
 		return cfg.Classify(fmt.Errorf("%s: applier: commit: %w", cfg.EngineName, err))
 	}
+	src.batchCommitted(rowDML)
 	if skipPosition {
 		// Data durable, position (and thus rows_applied) deferred to the
 		// boundary. Carry this batch's DML forward AFTER the commit
@@ -931,12 +933,13 @@ type sourceTxState struct {
 	// no transaction markers at all (audit 2026-08-01 S3).
 	open bool
 
-	// splitCommitted is true once a batch has committed while the source
-	// transaction was still open — a row cap, byte cap, idle timer, keyless
-	// table or schema event flushed mid-transaction — so part of the open
-	// source transaction is durable on the target. Only a TxBegin clears it,
-	// not the TxCommit: a refusal raised by the very flush a TxCommit
-	// triggers still belongs to the transaction that was split (Bug 294).
+	// splitCommitted is true once a batch has committed a row change of the
+	// source transaction while it was still open — a row cap, byte cap, idle
+	// timer, keyless table or schema event flushed mid-transaction — so part
+	// of the open source transaction is durable on the target. Only a TxBegin
+	// clears it, not the TxCommit: a refusal raised by the very flush a
+	// TxCommit triggers still belongs to the transaction that was split (Bug
+	// 294).
 	splitCommitted bool
 }
 
@@ -946,13 +949,25 @@ func (s *sourceTxState) begin() {
 	s.splitCommitted = false
 }
 
-// batchCommitted records a batch of n changes that committed. A batch that
-// commits with the transaction still open committed part of it; one that
-// commits with it closed ended at its boundary, and a later batch starts the
-// next transaction clean.
-func (s *sourceTxState) batchCommitted(n int) {
-	if n > 0 {
-		s.splitCommitted = s.open
+// batchCommitted records a batch that committed rowDML applied row changes
+// ([appliedRowDML]). One that commits with the transaction closed ended at
+// its boundary, and a later batch starts the next transaction clean. One that
+// commits with it still open committed part of it, but only if it carried a
+// row of it: the count is the batch's applied row DML, not its size (Bug
+// 295). A Postgres reader emits a table's SchemaSnapshot lazily at the
+// table's first row, inside that row's transaction, and the loop flushes the
+// snapshot alone as a one-change batch; counting it made a refusal of the
+// transaction's very first statements claim a split the target did not have.
+// A row skipped for an absent target wrote nothing either. A Truncate inside
+// the transaction is not counted, as the per-change path's pendingRows does
+// not count it: the refusal then keeps its own "may", which stays true.
+func (s *sourceTxState) batchCommitted(rowDML int) {
+	if !s.open {
+		s.splitCommitted = false
+		return
+	}
+	if rowDML > 0 {
+		s.splitCommitted = true
 	}
 }
 

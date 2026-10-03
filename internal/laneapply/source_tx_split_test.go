@@ -65,7 +65,15 @@ func (s *splitSeam) ClassifyError(err error) error { return err }
 
 func (s *splitSeam) WriteCheckpoint(context.Context, ir.Position, int64, []string) error { return nil }
 
-func (s *splitSeam) SkipsRowChange(context.Context, ir.Change) bool { return false }
+// SkipsRowChange: a row of table "gone" has no target table, so it writes
+// nothing (the PG-2 skip).
+func (s *splitSeam) SkipsRowChange(_ context.Context, c ir.Change) bool {
+	if !ir.IsRowDMLChange(c) {
+		return false
+	}
+	_, table := RowChangeSchemaTable(c)
+	return table == "gone"
+}
 
 func (s *splitSeam) ApplyMarkTx(context.Context, ir.Change) string { return "" }
 func (s *splitSeam) ApplyMarksFenced(string, bool)                 {}
@@ -97,6 +105,9 @@ func TestOrchestrator_KeyScopedRefusalNamesTheSplit(t *testing.T) {
 	del := func(id int64) ir.Change { return ir.Delete{Schema: "s", Table: "t", Before: ir.Row{"id": id}} }
 	ins := func(id int64) ir.Change { return ir.Insert{Schema: "s", Table: "t", Row: ir.Row{"id": id}} }
 	begin, commit := ir.TxBegin{}, ir.TxCommit{}
+	snap := ir.SchemaSnapshot{Schema: "s", Table: "t"}
+	insGone := ir.Insert{Schema: "s", Table: "gone", Row: ir.Row{"id": int64(5)}}
+	updGone := ir.Update{Schema: "s", Table: "gone", Before: ir.Row{"id": int64(1)}, After: ir.Row{"id": int64(4)}}
 	cases := []struct {
 		name      string
 		changes   []ir.Change
@@ -107,6 +118,17 @@ func TestOrchestrator_KeyScopedRefusalNamesTheSplit(t *testing.T) {
 		{"barrier refusal after a routed row the drain committed", []ir.Change{begin, ins(5), upd(2, 3)}, true},
 		{"barrier refusal as the transaction's first change", []ir.Change{begin, upd(2, 3)}, false},
 		{"the previous transaction had the barrier, this one does not", []ir.Change{begin, upd(1, 4), commit, begin, del(2)}, false},
+		// Bug 295: a barrier that wrote nothing of the transaction did not
+		// commit part of it — the lazily emitted SchemaSnapshot at a table's
+		// first row, and a row skipped for an absent target, whether routed
+		// to a lane before the drain or applied as the barrier itself. Each
+		// against a refusal at both sites; the snapshot draining a routed
+		// row that DID write still names the split.
+		{"lane refusal after a schema snapshot barrier (Bug 295)", []ir.Change{begin, snap, del(2)}, false},
+		{"barrier refusal after a schema snapshot barrier", []ir.Change{begin, snap, upd(2, 3)}, false},
+		{"a schema snapshot barrier drained a routed row that wrote", []ir.Change{begin, ins(5), snap, del(2)}, true},
+		{"barrier refusal after a drained row skipped for an absent target", []ir.Change{begin, insGone, upd(2, 3)}, false},
+		{"lane refusal after a key-change barrier skipped for an absent target", []ir.Change{begin, updGone, del(2)}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -145,6 +167,9 @@ func withPos(c ir.Change, n int) ir.Change {
 		v.Position = p
 		return v
 	case ir.Delete:
+		v.Position = p
+		return v
+	case ir.SchemaSnapshot:
 		v.Position = p
 		return v
 	}

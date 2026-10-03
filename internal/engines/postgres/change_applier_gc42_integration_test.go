@@ -370,6 +370,58 @@ func TestGC42_TriageRepro(t *testing.T) {
 	}
 }
 
+// TestGC42_SchemaSnapshotInsideTheTransaction is Bug 295: the filed repro as
+// the Postgres reader delivers it in a fresh run, with the table's
+// SchemaSnapshot emitted lazily at its first row — inside the transaction,
+// on the 0/0 metadata anchor. The batch loop commits that snapshot alone,
+// which v0.156.9 counted as a committed part of the transaction, so every
+// batch cell named a split while the target held the untouched
+// pre-transaction state. The expected split is the TriageRepro one, and the
+// target state is the independent evidence for it.
+func TestGC42_SchemaSnapshotInsideTheTransaction(t *testing.T) {
+	const ddl = `CREATE TABLE %[1]s (id int, u text NOT NULL UNIQUE, CONSTRAINT %[1]s_pk PRIMARY KEY (id) DEFERRABLE INITIALLY DEFERRED)`
+	const seed = `INSERT INTO %[1]s VALUES (1,'a'),(2,'b'),(3,'c')`
+	for _, env := range gc42Envs(t) {
+		for _, p := range gc42Paths(1000) {
+			t.Run(env.name+"/"+p.name, func(t *testing.T) {
+				table := gc42Name(t, "snap", env.name, p.name)
+				gc42Table(t, env, table, ddl, seed)
+				before := gc42State(t, env.adminDSN, table)
+				snap := ir.SchemaSnapshot{
+					Position: cpos(`{"slot":"sluice_slot","lsn":"0/0"}`), Schema: "public", Table: table,
+					IR: &ir.Table{
+						Name: table,
+						Columns: []*ir.Column{
+							{Name: "id", Type: ir.Integer{Width: 32}},
+							{Name: "u", Type: ir.Text{}},
+						},
+						PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}},
+					},
+				}
+				err := gc42Apply(t, env, p, table, gc42Tx(
+					table,
+					snap,
+					ir.Update{Schema: "public", Table: table, Before: ir.Row{"id": int64(1)}, After: ir.Row{"id": int64(2), "u": "a"}},
+					ir.Delete{Schema: "public", Table: table, Before: ir.Row{"id": int64(2)}},
+				))
+				want := gc42MultiMatch
+				if !env.replica && gc42Splits(p) {
+					want = gc42DeferredFail
+				}
+				gc42Assert(t, err, want, pgUniqueViolation)
+				got := gc42State(t, env.adminDSN, table)
+				split := env.replica && gc42Splits(p)
+				if want == gc42MultiMatch {
+					gc42AssertSplitAccount(t, err, split)
+				}
+				if split == (got == before) {
+					t.Errorf("target = %q (before %q); split = %v", got, before, split)
+				}
+			})
+		}
+	}
+}
+
 // gc42Shift builds UPDATE id = id + 1 over n rows in the order the source
 // heap visits them; ascending makes every step transiently share a key. A
 // byIndex narrows the before-image the way a REPLICA IDENTITY USING

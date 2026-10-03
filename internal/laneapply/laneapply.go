@@ -816,7 +816,8 @@ func (o *Orchestrator) handle(ctx context.Context, seq uint64, c ir.Change) erro
 		// uses, so the route-time verdict matches what dispatch will do (a
 		// bulk load into a missing target would otherwise climb rows_applied
 		// with nothing written).
-		if !o.la.SkipsRowChange(ctx, c) {
+		applied := !o.la.SkipsRowChange(ctx, c)
+		if applied {
 			o.cumRowDML++
 		}
 		// Marker-less (trigger sources) only: the position-run heuristic. On a marker
@@ -827,7 +828,11 @@ func (o *Orchestrator) handle(ctx context.Context, seq uint64, c ir.Change) erro
 		if err := o.routeRow(ctx, seq, c); err != nil {
 			return err
 		}
-		o.srcTx.rowsSeen = o.srcTx.open
+		// A row skipped for an absent target writes nothing, so a later drain
+		// commits nothing of the transaction on its account (Bug 295).
+		if applied {
+			o.srcTx.rowsSeen = o.srcTx.rowsSeen || o.srcTx.open
+		}
 		return nil
 	default:
 		// Truncate, SchemaSnapshot, or any future barrier-class event. Not
@@ -1224,9 +1229,9 @@ func (o *Orchestrator) barrier(ctx context.Context, seq uint64, c ir.Change) err
 		}
 		return err
 	}
-	// And the barrier itself is now durable, inside it — unless it was a
-	// SchemaSnapshot, which carries no statement of the source transaction.
-	if !isSchemaSnapshot(c) {
+	// And the barrier itself is now durable, inside it — if it wrote a
+	// statement of the source transaction ([Orchestrator.writesSourceStatement]).
+	if o.writesSourceStatement(ctx, c) {
 		o.srcTx.partCommitted = o.srcTx.partCommitted || o.srcTx.open
 	}
 	// ApplyBarrierChange applied the barrier's data + (for a SchemaSnapshot)
