@@ -499,8 +499,8 @@ func anchorSlotExistsErr(anchorSlot string, persistChainSlot bool) error {
 				"an interrupted --chain-slot backup (re-run the SAME `backup full` command against the same destination — resume adopts the slot and its anchor; "+
 				"do NOT drop the slot to recover, that releases the WAL the resume needs), "+
 				"or another consumer (pass a different --slot-name). "+
-				"Only for a deliberate fresh start: drop it via `sluice slot drop %s` and pass --force-overwrite",
-			anchorSlot, anchorSlot,
+				"Only for a deliberate fresh start: drop it via %s and pass --force-overwrite",
+			anchorSlot, slotDropCommand(anchorSlot),
 		)
 	}
 	return fmt.Errorf(

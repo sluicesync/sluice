@@ -41,7 +41,7 @@ func TestWithPreAlterReplayWedge(t *testing.T) {
 		{"no transaction open", base, written(0), 0, false},
 		{"no refusal", nil, written(txn), txn, false},
 	} {
-		got := withPreAlterReplayWedge(tc.err, tc.prior, tc.txn)
+		got := withPreAlterReplayWedge(tc.err, tc.prior, tc.txn, "sluice_shard_a")
 		if tc.err == nil {
 			if got != nil {
 				t.Errorf("%s: %v; want nil", tc.name, got)
@@ -56,7 +56,11 @@ func TestWithPreAlterReplayWedge(t *testing.T) {
 			t.Errorf("%s: wedge named = %v, want %v: %v", tc.name, marked, tc.wedge, got)
 		}
 		if tc.wedge {
-			for _, want := range []string{"public.mt", "--schema-changes=forward", "sluice slot drop", "--restart-from-scratch", "--inject-shard-column"} {
+			for _, want := range []string{
+				"public.mt", "--schema-changes=forward", "--restart-from-scratch", "--inject-shard-column",
+				// Bug 296: the RESOLVED slot and every flag slot drop requires.
+				"sluice slot drop sluice_shard_a --source-driver=postgres --source ", "--yes",
+			} {
 				if !strings.Contains(got.Error(), want) {
 					t.Errorf("%s: the wedge note lacks %q: %v", tc.name, want, got)
 				}
@@ -65,5 +69,25 @@ func TestWithPreAlterReplayWedge(t *testing.T) {
 	}
 	if strings.Contains(schemaRaceRecoveryHint, "--forward-schema-add-column") {
 		t.Error("the reader's hint still offers the deprecated --forward-schema-add-column")
+	}
+}
+
+// TestSlotDropCommand_RunnableAsPrinted pins Bug 296's class: every slot-drop
+// recovery hint names the literal slot and carries the flags `sluice slot
+// drop` requires, and none renders the placeholder the wedge note shipped.
+func TestSlotDropCommand_RunnableAsPrinted(t *testing.T) {
+	t.Parallel()
+	got := slotDropCommand("sluice_slot")
+	for _, want := range []string{"sluice slot drop sluice_slot ", "--source-driver=postgres", "--source ", "--yes"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("slotDropCommand lacks %q: %s", want, got)
+		}
+	}
+	unusable := checkSlotUsable(&slotState{SlotName: "sluice_x", WALStatus: "lost"})
+	if unusable == nil || !strings.Contains(unusable.Error(), slotDropCommand("sluice_x")) {
+		t.Errorf("the lost-WAL hint does not render the runnable command: %v", unusable)
+	}
+	if strings.Contains(schemaRaceRecoveryHint, "<slot>") {
+		t.Error("the reader's hint renders a <slot> placeholder")
 	}
 }

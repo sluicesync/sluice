@@ -708,7 +708,7 @@ const preAlterReplayWedgeMarker = ir.PreAlterReplayWedgeMarker
 // last written by an earlier transaction, no transaction open) returns err
 // unchanged: a change in its own transaction recovers with the drained
 // model (TestStreamer_PGToPG_DrainedModelRecovery).
-func withPreAlterReplayWedge(err error, prior *relationCacheEntry, txn pglogrepl.LSN) error {
+func withPreAlterReplayWedge(err error, prior *relationCacheEntry, txn pglogrepl.LSN, slot string) error {
 	if err == nil || prior == nil || txn == 0 || prior.writtenInTxn != txn {
 		return err
 	}
@@ -717,10 +717,22 @@ func withPreAlterReplayWedge(err error, prior *relationCacheEntry, txn pglogrepl
 		"pass it (GC-44 F24). Recovery, by stream and change (docs/operator/cdc-streaming.md, \"The pre-ALTER "+
 		"replay wedge\"): a column type widening on a stream over a single database and schema, without "+
 		"--inject-shard-column, passes with one start under --schema-changes=forward (then return to "+
-		"--schema-changes=refuse if that is the stream's mode); otherwise drop the stream's replication slot (`sluice slot drop <slot> --yes`) "+
+		"--schema-changes=refuse if that is the stream's mode); otherwise drop the stream's replication slot (%s) "+
 		"and start once with --restart-from-scratch — under --inject-shard-column, first delete this shard's "+
 		"rows from the target tables, because that re-copy refuses while they are there",
-		err, preAlterReplayWedgeMarker, prior.Schema, prior.Name)
+		err, preAlterReplayWedgeMarker, prior.Schema, prior.Name, slotDropCommand(slot))
+}
+
+// slotDropCommand renders the `sluice slot drop` invocation an operator can
+// run as printed, apart from the DSN: the slot's LITERAL name (the CLI
+// never adds the sluice_ prefix) plus the --source-driver and --yes it
+// requires. Every recovery hint in this package that tells the operator to
+// drop a slot renders it here (Bug 296: the pre-ALTER replay wedge printed
+// a `<slot>` placeholder without --source-driver/--source, which exits 80
+// as printed; the slot-usability, foreign-lineage and --chain-slot hints
+// omitted the required --yes).
+func slotDropCommand(slot string) string {
+	return fmt.Sprintf("`sluice slot drop %s --source-driver=postgres --source <source DSN> --yes`", slot)
 }
 
 // projectRelation builds an [ir.Table] from a relationCacheEntry —

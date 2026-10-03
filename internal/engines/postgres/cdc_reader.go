@@ -926,15 +926,15 @@ func checkSlotUsable(info *slotState) error {
 	case "unreserved":
 		return fmt.Errorf(
 			"postgres: replication slot %q has wal_status=%q — required WAL is on the brink of being lost; "+
-				"resume immediately or recreate the slot. To recreate: `sluice slot drop %s --source-driver=postgres --source ...` then restart with empty position (forces a fresh snapshot)",
-			info.SlotName, info.WALStatus, info.SlotName,
+				"resume immediately or recreate the slot. To recreate: %s then restart with empty position (forces a fresh snapshot)",
+			info.SlotName, info.WALStatus, slotDropCommand(info.SlotName),
 		)
 	case "lost":
 		return fmt.Errorf(
 			"postgres: replication slot %q has wal_status=%q — required WAL has been permanently removed; "+
-				"the slot must be dropped and recreated. To recover: `sluice slot drop %s --source-driver=postgres --source ...` then restart with empty position (forces a fresh snapshot). "+
+				"the slot must be dropped and recreated. To recover: %s then restart with empty position (forces a fresh snapshot). "+
 				"To prevent recurrence, raise max_slot_wal_keep_size on the source — PlanetScale recommends > 4GB",
-			info.SlotName, info.WALStatus, info.SlotName,
+			info.SlotName, info.WALStatus, slotDropCommand(info.SlotName),
 		)
 	default:
 		// Future PG versions could add states. Surface verbatim
@@ -1001,9 +1001,9 @@ func checkSourceIdentity(ctx context.Context, slotName, persistedSysID string, p
 			"this indicates a source-side PITR, standby promotion, or that sluice is now pointed at a different instance — "+
 			"the persisted LSN belongs to a different timeline's reference frame and is no longer valid. "+
 			"To recover: confirm the change matches your intended PITR/promotion event, then drop the slot and persisted position so a fresh cold-start runs against the new source — "+
-			"`sluice slot drop %s --source-driver=postgres --source ...` then restart with empty position (forces a fresh snapshot): %w",
+			"%s then restart with empty position (forces a fresh snapshot): %w",
 		persistedSysID, persistedTimeline, liveSysID, liveTimeline,
-		slotName, ir.ErrPositionForeignLineage,
+		slotDropCommand(slotName), ir.ErrPositionForeignLineage,
 	)
 }
 
@@ -1264,7 +1264,7 @@ func (r *CDCReader) dispatchWAL(
 			return fmt.Errorf("postgres: cdc: relation %s.%s: %w", m.Namespace, m.RelationName, err)
 		}
 		if err := r.gradeRelationSchemaRace(relations, m.RelationID, entry); err != nil {
-			return withPreAlterReplayWedge(err, relations[m.RelationID], *currentTxnLSN)
+			return withPreAlterReplayWedge(err, relations[m.RelationID], *currentTxnLSN, r.slotName)
 		}
 		if err := r.gradeUnforwardedClasses(ctx, m.RelationID, entry); err != nil {
 			return err
@@ -1304,7 +1304,7 @@ func (r *CDCReader) dispatchWAL(
 			return fmt.Errorf("postgres: cdc: relation %s.%s: %w", m.Namespace, m.RelationName, err)
 		}
 		if err := r.gradeRelationSchemaRace(relations, m.RelationID, entry); err != nil {
-			return withPreAlterReplayWedge(err, relations[m.RelationID], *currentTxnLSN)
+			return withPreAlterReplayWedge(err, relations[m.RelationID], *currentTxnLSN, r.slotName)
 		}
 		if err := r.gradeUnforwardedClasses(ctx, m.RelationID, entry); err != nil {
 			return err
