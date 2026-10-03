@@ -715,8 +715,9 @@ func withPreAlterReplayWedge(err error, prior *relationCacheEntry, txn pglogrepl
 	return fmt.Errorf("%w %s: this transaction wrote %s.%s before this change, so every restart re-delivers "+
 		"it from its start and refuses here again whatever the target holds — the drained model above does not "+
 		"pass it (GC-44 F24). Recovery, by stream and change (docs/operator/cdc-streaming.md, \"The pre-ALTER "+
-		"replay wedge\"): a column type widening on a single-database stream passes with one start under "+
-		"--schema-changes=forward; otherwise drop the stream's replication slot (`sluice slot drop <slot> --yes`) "+
+		"replay wedge\"): a column type widening on a stream over a single database and schema, without "+
+		"--inject-shard-column, passes with one start under --schema-changes=forward (then return to "+
+		"--schema-changes=refuse if that is the stream's mode); otherwise drop the stream's replication slot (`sluice slot drop <slot> --yes`) "+
 		"and start once with --restart-from-scratch — under --inject-shard-column, first delete this shard's "+
 		"rows from the target tables, because that re-copy refuses while they are there",
 		err, preAlterReplayWedgeMarker, prior.Schema, prior.Name)

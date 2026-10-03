@@ -208,11 +208,16 @@ func TestAmbiguousNote_AMatchIsNotProof(t *testing.T) {
 // wording names the per-shard delete; both name what the reset destroys.
 func TestShardReattemptRecovery_WordedForTheCommand(t *testing.T) {
 	t.Parallel()
-	sync := shardReattemptRecovery(preflightModeSync, "mt", "source_shard_id", "shard_a")
-	for _, want := range []string{"DELETE FROM mt WHERE source_shard_id = 'shard_a'", "sibling shards' rows stay", "EVERY shard's rows"} {
+	sync := shardReattemptRecovery(preflightModeSync, "app.mt", "source_shard_id", "shard_a")
+	for _, want := range []string{"rows whose source_shard_id is shard_a", "starting with app.mt", "sibling shards' rows stay", "EVERY shard's rows"} {
 		if !strings.Contains(sync, want) {
 			t.Errorf("the sync recovery lacks %q: %s", want, sync)
 		}
+	}
+	// Sixth review: a rendered, unquoted, unqualified DELETE resolves
+	// through search_path and can hit a same-named table elsewhere.
+	if strings.Contains(sync, "DELETE FROM") {
+		t.Errorf("the sync recovery renders a runnable statement that may name the wrong table: %s", sync)
 	}
 	if strings.Contains(sync, "--resume") {
 		t.Errorf("the sync recovery offers --resume, a migrate flag: %s", sync)

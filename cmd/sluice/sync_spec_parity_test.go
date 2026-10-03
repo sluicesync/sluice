@@ -52,7 +52,7 @@ var syncStartFleetExclusions = map[string]string{
 	// exists to prevent. A fleet leg is acknowledged by one `sync start
 	// --accept-unforwarded-schema-change` for that stream id, which clears the
 	// record on the target the fleet leg then resumes against.
-	"accept-unforwarded-schema-change": "one-shot acknowledgement of a recorded UNFORWARDED-SCHEMA-CHANGE refusal; as standing config it would silently accept every future refusal on each restart",
+	"accept-unforwarded-schema-change": "one-shot acknowledgement of a recorded UNFORWARDED-SCHEMA-CHANGE refusal or of one AMBIGUOUS-SCHEMA-BOUNDARY occurrence (bound to the position the stream resumed from); a human decision per refusal, never standing fleet config",
 
 	// Same reasoning as the line above, for the warm-resume slot door: a
 	// standing key would pre-accept a skipped gap on every restart. The flag

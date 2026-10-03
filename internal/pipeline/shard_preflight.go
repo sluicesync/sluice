@@ -147,9 +147,10 @@ func shardReattemptRecovery(mode preflightMode, table, shardName string, shardVa
 	if mode == preflightModeSync {
 		return fmt.Sprintf("(b) a sync stream that already holds this shard resumes with a plain `sluice sync start` "+
 			"and the same --stream-id, which runs no cold start and no copy; a cold start that reaches this "+
-			"check is a re-copy, so first delete THIS shard's rows from every in-scope table "+
-			"(DELETE FROM %s WHERE %s = '%v'; the sibling shards' rows stay) and start it again; %s",
-			table, shardName, shardValue, wipe)
+			"check is a re-copy, so first delete THIS shard's rows — the rows whose %s is %v — from every "+
+			"in-scope target table, starting with %s (name each table with its schema or database and quote it "+
+			"for the target engine; the sibling shards' rows stay) and start it again; %s",
+			shardName, shardValue, table, wipe)
 	}
 	return "(b) if this is a re-attempt of THIS shard, use --resume to pick up where the previous run left off; " + wipe
 }
@@ -229,7 +230,7 @@ func preflightShardConsolidationFor(
 					"Recovery: (a) pick a fresh VALUE for --inject-shard-column NAME=VALUE if a sibling shard "+
 					"already used it; %s",
 				errShardConsolidationRefused, table.Name, shardName, shardValue,
-				shardReattemptRecovery(mode, table.Name, shardName, shardValue),
+				shardReattemptRecovery(mode, qualifiedTableName(table.Schema, table.Name), shardName, shardValue),
 			))
 		}
 		// Check (3): composite PK leads with the discriminator.
