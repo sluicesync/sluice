@@ -212,7 +212,8 @@ func recoverShapeA(t *testing.T, cell twfbCell, tbl string) *twfbRun {
 	switch {
 	case !errors.Is(err, errShardConsolidationRefused):
 		t.Errorf("[shape A] the re-copy over this shard's rows was not refused by the shard preflight: %v", err)
-	case strings.Contains(err.Error(), "--resume") || !strings.Contains(err.Error(), "DELETE FROM"):
+	case strings.Contains(err.Error(), "--resume") || strings.Contains(err.Error(), "DELETE FROM") ||
+		!strings.Contains(err.Error(), fmt.Sprintf("the rows whose %s is %v", cell.shard.Name, cell.shard.Value)):
 		t.Errorf("[shape A] the shard preflight's sync recovery is not the per-shard delete: %v", err)
 	}
 	cell.tgt.exec(t, fmt.Sprintf("DELETE FROM %s WHERE %s = '%v'", tbl, cell.shard.Name, cell.shard.Value))
