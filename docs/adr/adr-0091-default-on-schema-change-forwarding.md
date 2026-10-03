@@ -460,19 +460,67 @@ since v0.79.0) and the Shape A intercept since v0.73.1.
 
 The first boundary has no observed pre-state, but the stream's target
 does. So on `!hadPre` both intercepts render the snapshot as target
-storage (`--type-override`, the Shape A discriminator,
-`translate.RetargetForShapeCompare`) and compare it, column names and
-types only, against the target's read-back of the table
-(`pipeline/schema_forward_witness.go`):
+storage (the Shape A discriminator, `translate.RetargetForShapeCompare`)
+and compare it, column names and types only, against the target's
+read-back of the table (`pipeline/schema_forward_witness.go`). A
+difference against the memoized catalog is re-checked against a fresh
+read before it is acted on. A column named by `--type-override` is
+compared by presence only (below).
 
-| Verdict | Single-stream | Shape A (v1) |
+| Verdict | Single-stream | Shape A |
 |---|---|---|
 | match | accept as baseline | accept |
 | target cannot witness (table absent, no storage-shape rendering) | WARN, accept | WARN, accept |
 | target-only columns only (a DROP made while stopped) | WARN, accept | WARN, accept |
-| snapshot-only columns only | forward ADD COLUMN + backfill | refuse |
-| exactly one shared column differs within an allowlisted family (temporal precision, decimal p/s, char/varchar length, float width, int width) | forward ALTER COLUMN TYPE (zone door uses the target's type as the before) | refuse |
-| anything else (possible rename, >1 change, across families) | refuse `RESUME-SCHEMA-DIVERGENCE` | refuse |
+| snapshot-only columns only | forward ADD COLUMN + backfill | route through the lease (ADD COLUMN + this shard's backfill) |
+| exactly one shared column differs within an allowlisted family and the TARGET is narrower (temporal precision with the zone kind held, decimal on both axes, char/varchar length, float width, int width with the sign held) | forward ALTER COLUMN TYPE (zone door uses the target's type as the before) | route through the lease |
+| the same, but the TARGET is wider | WARN, keep the target's type | WARN, keep |
+| anything else (possible rename, >1 change, across families, a decimal wider on one axis and narrower on the other) | refuse `RESUME-SCHEMA-DIVERGENCE` | refuse |
+
+**Direction is load-bearing (review, before the first tag).** The first
+cut checked the family and not the direction, so a target WIDER than the
+snapshot was narrowed. A first boundary cannot tell an old shape from a
+new one: a target an operator widened on purpose was narrowed, so every
+later value needing the wider type changed (measured: `numeric(14,6)` →
+`(10,2)`, `bigint` → `integer`), and a Postgres crash in the middle of a
+transaction `UPDATE; ALTER c TYPE numeric(12,4); INSERT …` — after the
+forwarded ALTER and some committed batches — replays from the PRE-ALTER
+relation against the widened target. The review graded that replay as
+silent (rows rounded, then skipped on re-delivery by the ADR-0190 apply
+marks); measured with the rule mutated, on the serial path,
+`--exactly-once-lanes` and the default lanes, the next relation re-widened
+the column and the committed rows were re-delivered, so every value came
+back exact — that mechanism did NOT reproduce. A varchar or int narrowing
+there would refuse with 22001/22003 instead. So only a narrower TARGET is
+forwarded. The cost,
+stated: a genuine source narrowing made while the stream was stopped is
+WARNed, not forwarded (the CDC→CDC path, which observes both shapes,
+still forwards one seen live). Pinned by
+`TestTWFB_PostgresCrashMidTransaction_KeepsTheWiderTarget` and
+`TestTWFB_OperatorWidenedTarget_*`.
+
+**`--type-override` (review).** Rendering the override into the expected
+shape phantomed even for an unchanged override — a `json` override reads
+back as binary JSON on a MySQL target, `mediumtext` as `text` on Postgres,
+and `TINYINT(1)`→`smallint` crosses families against the stream's
+boolean — while an override changed or dropped between runs refused or
+ALTERed. An overridden column's type is the operator's decision, not a
+rendering of the source's, and the CDC→CDC forward does not apply
+overrides either, so the witness compares an overridden column by
+presence only: never altered, never refused. The residual — a changed
+override, or a source type change on an overridden column, is not seen
+at a first boundary — is exactly the pre-GC-44 behaviour.
+
+**Shape A (review).** The first cut refused every forwardable Shape A
+first boundary on the premise that the lease coordinates only a boundary
+every shard observes. For a fleet whose sources all changed while it was
+stopped that is false — each shard sees the change only as its first
+boundary, so every shard refused, permanently, and against the stale
+warm-resume read. A forwardable verdict is now routed through
+`RouteBoundary` against the synthesized pre-state like any live
+boundary: the holder applies once, peers observe it or find the target
+already matching. Pinned by
+`TestPhase2e_PG_FirstBoundaryWidenWhileStopped_RoutesThroughTheLeaseOnce`.
 
 The check is stateless — nothing is persisted, a restart re-derives the
 same verdict — and a refusal lands before the snapshot goes downstream,
@@ -514,15 +562,26 @@ three projection-vs-catalog differences the code did not account for:
 - MariaDB `JSON` is a LONGTEXT alias the schema reader recovers as JSON
   and the binlog boundary reads as LONGTEXT — a phantom refusal on every
   resume of a MariaDB stream with a JSON column, caught by the existing
-  `TestStreamer_MariaDBToPostgres` (the lens equates JSON with long TEXT;
-  the residual is a source JSON ⇄ LONGTEXT change made while stopped).
+  `TestStreamer_MariaDBToPostgres` (the lens equates a long-TEXT snapshot
+  with a JSON target on a MariaDB source only —
+  `translate.ProjectsJSONAsLongText`; the residual is a source JSON ⇄
+  LONGTEXT change made while stopped).
+
+The matrix also carries a `--type-override` table per direction and a
+VStream→Postgres arm (`TestStreamer_TWFBFamilyMatrix_VStreamToPostgres`,
+extended-suites vstream-pipeline leg).
 
 **Residuals, stated.** Geometry is compared at geometry-vs-geography
 only. A Postgres source cannot stream `geography` at all (refused at the
-reader). Shape A refuses any non-trivial first-boundary difference
-rather than forwarding it (the lease coordinates a boundary every shard
-observes; a first boundary is observed by one shard). A table the target
-does not hold is accepted with a WARN.
+reader). A table the target does not hold is accepted with a WARN. The
+binlog first-touch boundary's history row is anchored at the stream start
+with the live-catalog shape (GC-44 F12). A Shape A peer whose first
+boundary finds an ADD COLUMN a sibling already forwarded routes the
+columns its own retained history version lacks through the lease, so its
+rows are backfilled from its own source (F13,
+`TestPhase2e_PG_FirstBoundaryPeerAddedColumn_BackfillsEveryShard`); a peer
+with no retained version of the table — one it never streamed a change
+for since its cold start — still takes the match as its baseline.
 
 **Engine limitation that follows:** because pgoutput carries no
 secondary-index / generated-column / CHECK metadata, those shapes
