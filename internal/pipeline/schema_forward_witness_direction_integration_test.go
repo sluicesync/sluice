@@ -79,12 +79,39 @@ func TestTWFB_PostgresCrashMidTransaction_VarcharToTextConverges(t *testing.T) {
 	})
 }
 
+// TestTWFB_PostgresCrashMidTransaction_CharToVarcharRefuses is the same
+// replay from char (GC-44 F5 third review). Before the fix, char(n) ⊂
+// varchar(m ≥ n) judged the replay's pre-ALTER char(8) relation "target
+// wider" and kept it — but pgoutput sends that relation's values PADDED
+// ('updated ' for the UPDATE before the ALTER) while the source's own cast
+// stripped the padding, so the target took a value the source does not
+// hold. There is no first-boundary answer that converges, so the replay
+// refuses loudly instead of applying padded values at exit 0.
+func TestTWFB_PostgresCrashMidTransaction_CharToVarcharRefuses(t *testing.T) {
+	runTWFBCrashMidTransaction(t, twfbCrashCell{
+		table:  "t_crash_cv",
+		from:   "char(8)",
+		to:     "varchar(16)",
+		seed:   "'short'",
+		update: "'updated'",
+		insert: "'filled'",
+		exact:  "v = 'filled'",
+		// The replay's first boundary refuses; the rows the kill left
+		// committed are the post-ALTER ones and must still be exact.
+		wantRefusal: resumeDivergenceMarker,
+	})
+}
+
 // twfbCrashCell is one column type change made inside a large source
 // transaction: UPDATE row 1, ALTER from → to, INSERT many rows needing to.
 type twfbCrashCell struct {
 	table, from, to           string
 	seed, update, insert      string // SQL value expressions
 	wantType, wantRow1, exact string
+	// wantRefusal, when set, is the marker the replay must stop with: the
+	// cell then pins that the stream refused and that no row it did apply
+	// differs from the source, instead of convergence.
+	wantRefusal string
 }
 
 // runTWFBCrashMidTransaction drives c: the transaction, the target's
@@ -136,6 +163,32 @@ func runTWFBCrashMidTransaction(t *testing.T, c twfbCrashCell) {
 			break
 		}
 		time.Sleep(250 * time.Millisecond)
+	}
+	if c.wantRefusal != "" {
+		err := run.stop(t)
+		if err == nil || !strings.Contains(err.Error(), c.wantRefusal) {
+			t.Fatalf("the replay did not refuse with %s (err %v)\n%s", c.wantRefusal, err, divergenceLines(logs.String()))
+		}
+		if !strings.Contains(logs.String(), "applier: transient error; retrying") {
+			t.Fatal("VACUOUS: no retry was logged — the kill did not land mid-apply")
+		}
+		if got := cell.tgt.scalar(t, count+" WHERE id >= 10 AND NOT ("+c.exact+")"); got != "0" {
+			t.Errorf("SILENT LOSS: %s of the applied rows differ from what the source wrote", got)
+		}
+		// Row 1 is the transaction's pre-ALTER UPDATE, applied by the FIRST
+		// pass, before the kill — the live CDC→CDC forward, not the replay
+		// this cell grades. It lands as the padded wire value ("updated "),
+		// which the source's own cast stripped: GC-44 F19, measured here and
+		// filed rather than fixed. Any other value is a new defect.
+		if src, tgt := cell.src.scalar(t, "SELECT v FROM "+c.table+" WHERE id = 1"), cell.tgt.scalar(t, "SELECT v FROM "+c.table+" WHERE id = 1"); tgt != src {
+			switch tgt {
+			case "short", "short   ", "updated ":
+				t.Logf("target row 1 = %q, source %q (the GC-44 F19 residual of the live forward)", tgt, src)
+			default:
+				t.Errorf("target row 1 = %q, source %q: a value the source never held", tgt, src)
+			}
+		}
+		return
 	}
 	if err := run.stop(t); err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatalf("the stream returned %v\n%s", err, divergenceLines(logs.String()))

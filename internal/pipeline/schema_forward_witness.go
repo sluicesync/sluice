@@ -45,7 +45,11 @@ package pipeline
 //     target actually holds.
 //   - the same, but the target is WIDER → a WARN, and the target keeps its
 //     type: a first boundary cannot tell an old shape from a new one, and
-//     narrowing a target that already holds wider values is silent loss.
+//     narrowing a target that already holds wider values is silent loss —
+//     UNLESS the stream's retained history proves the source held the
+//     target's type and narrowed it ([firstBoundaryWitness.historyPriorAt]):
+//     then the narrowing is forwarded like a live one, and a target holding
+//     any other type refuses (GC-44 F5 third review).
 //   - the target carries columns the snapshot lacks, and nothing else → a
 //     WARN (a DROP COLUMN made while stopped is benign: the target keeps
 //     the column, as the drained model would).
@@ -89,6 +93,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -223,9 +228,19 @@ type firstBoundaryWitness struct {
 	catalog *targetCatalogWitness
 
 	// history is this stream's own retained schema version per table at the
-	// persisted position (nil when the warm resume loaded none). Read only
-	// by Shape A ([shapeAPeerAddedColumns]).
+	// persisted position (nil when the warm resume loaded none). Read by
+	// Shape A's peer-added check ([shapeAPeerAdded]), by the unforwarded
+	// check as a table's last accepted shape ([priorFor]), and by the
+	// narrowing rules ([firstBoundaryWitness.historyPriorAt]).
 	history []*ir.Table
+
+	// retained is what else the history says about each version (keyed by
+	// the same pointers: its anchor and every shape recorded for the table),
+	// and orderer the source engine's position order: together they tell a
+	// boundary that shows a change from a replay of a shape the stream
+	// already had ([firstBoundaryWitness.historyPriorAt]).
+	retained retainedHistory
+	orderer  ir.PositionOrderer
 
 	sourceEngine string
 	targetEngine string
@@ -294,6 +309,22 @@ type witnessVerdict struct {
 	// reason says why the target cannot witness the table
 	// (witnessUnwitnessed).
 	reason string
+	// narrowedFrom is the type the stream's retained history says the
+	// source held before it narrowed the altered column (nil unless that
+	// proof decided the verdict — [witnessOptions.priorExpected]).
+	narrowedFrom ir.Type
+}
+
+// narrowedDiffs annotates column's entry in diffs with the type the source
+// narrowed it from, for the log line or the refusal.
+func narrowedDiffs(diffs []witnessColumnDiff, column string, from ir.Type) []witnessColumnDiff {
+	out := append([]witnessColumnDiff(nil), diffs...)
+	for i := range out {
+		if out[i].column == column {
+			out[i].source = fmt.Sprintf("%s (narrowed from %s)", out[i].source, from)
+		}
+	}
+	return out
 }
 
 // errWitnessNoTable is returned by [firstBoundaryWitness.expected] when the
@@ -302,7 +333,9 @@ var errWitnessNoTable = errors.New("rendering the snapshot as target storage pro
 
 // verdict compares the snapshot table post (RAW — the shape the forward
 // paths retarget from) against the target's read-back of the same table.
-func (w *firstBoundaryWitness) verdict(ctx context.Context, post *ir.Table) (witnessVerdict, error) {
+// pos is the boundary's position, which decides whether the stream's
+// retained history may judge a narrowing ([firstBoundaryWitness.historyPriorAt]).
+func (w *firstBoundaryWitness) verdict(ctx context.Context, post *ir.Table, pos ir.Position) (witnessVerdict, error) {
 	if post == nil {
 		return witnessVerdict{kind: witnessUnwitnessed, reason: "the snapshot carries no table"}, nil
 	}
@@ -323,6 +356,11 @@ func (w *firstBoundaryWitness) verdict(ctx context.Context, post *ir.Table) (wit
 		return witnessVerdict{}, err
 	}
 	opts := w.options(post)
+	if prior := w.historyPriorAt(post.Name, pos, post); prior != nil {
+		if opts.priorExpected, err = w.expected(prior); err != nil {
+			return witnessVerdict{}, err
+		}
+	}
 	v := classifyWitness(expected, target, opts)
 	if v.kind == witnessMatch {
 		return v, nil
@@ -383,6 +421,42 @@ type witnessOptions struct {
 	// direction so a real JSON ⇄ TEXT change on any other source is still
 	// seen.
 	jsonAsLongText bool
+
+	// priorExpected is the shape the source held immediately before this
+	// boundary — the stream's retained history version, never one a replay
+	// precedes ([firstBoundaryWitness.historyPriorAt]) — rendered as target
+	// storage like the snapshot. nil when there is none. With it a target
+	// WIDER than the snapshot is no longer ambiguous: where the source
+	// narrowed the column ([sourceNarrowed]) and the target still holds the
+	// source's old type, the narrowing is forwarded as a live one would be;
+	// where the target holds anything else, it refuses (GC-44 F5 third
+	// review).
+	priorExpected *ir.Table
+}
+
+// sourceNarrowed reports whether a column whose type was prior is now
+// snapshot, a type that cannot hold every value prior could: the source
+// narrowed it, and its own ALTER converted (rounded, truncated, relabelled)
+// the values it stores. Any family [witnessWidthOrder] orders counts —
+// temporal precision, decimal on either axis, character length, float
+// width, integer width, an enum/set label removed, numeric → integer.
+func sourceNarrowed(prior, snapshot ir.Type) bool {
+	return witnessWidthOrder(prior, snapshot) == targetWider
+}
+
+// sameStorage reports whether two lens-applied types store the same
+// values: equal, or two spellings of one storage.
+func sameStorage(a, b ir.Type) bool {
+	return reflect.DeepEqual(a, b) || witnessWidthOrder(a, b) == sameWidth
+}
+
+// priorColumns indexes the prior shape's lens-applied columns by name (nil
+// when there is no prior).
+func priorColumns(priorExpected *ir.Table) map[string]*ir.Column {
+	if priorExpected == nil {
+		return nil
+	}
+	return columnsByNameIR(witnessCompareTable(priorExpected, nil))
 }
 
 // historyFor returns this stream's retained version of the table named
@@ -394,6 +468,107 @@ func (w *firstBoundaryWitness) historyFor(name string) *ir.Table {
 		}
 	}
 	return nil
+}
+
+// historyPriorAt is the table's retained version as PROOF of the shape the
+// source held before the boundary post (RAW) at pos — the evidence the
+// forward path's first boundary needs before it forwards a narrowing
+// ([sourceNarrowed]) — or nil when there is none, or when nothing proves the
+// boundary is not a REPLAY.
+//
+// The replay is why. A Postgres transaction that writes, ALTERs a column
+// and writes again is re-delivered from its start after a crash or a
+// restart, pre-ALTER relation first, while the history already holds the
+// post-ALTER version. Read against it the replay looks exactly like the
+// source NARROWING the column, and forwarding that narrows a target that is
+// exactly right (measured on postgres:16 by the crash cells: the forwarded
+// `numeric(12,4)` was narrowed back to `(10,2)`, and a forwarded `text`
+// narrowed to `varchar(16)` failed 22001 on every retry).
+//
+// So the proof here is strict: the boundary must lie STRICTLY AFTER the
+// version's anchor under the source's own order ([provenAfter]), and show a
+// shape the stream never recorded ([isReplayOf]). A MySQL source proves it
+// (a GTID set or a binlog file/position; the first-touch boundary is
+// anchored at the stream's start, past every version it resolved). A
+// Postgres source cannot: its boundaries are anchored at LSN 0/0 (the
+// relation message carries no WAL position), which also makes every
+// version of a table share one history key, so the history holds only the
+// latest shape and the replay's pre-ALTER one is not "recorded". A
+// narrowing made while a Postgres stream was stopped is therefore kept with
+// the WARN, as before (GC-44 F23). The unforwarded check, whose outcome is
+// a refusal rather than an ALTER, judges with the weaker
+// [acceptedBoundary.evidenceFor].
+func (w *firstBoundaryWitness) historyPriorAt(name string, pos ir.Position, post *ir.Table) *ir.Table {
+	if w == nil {
+		return nil
+	}
+	h := w.historyFor(name)
+	if h == nil {
+		return nil
+	}
+	r := w.retained[h]
+	if !provenAfter(w.orderer, pos, r.anchor) || isReplayOf(w.orderer, pos, post, r, h) {
+		return nil
+	}
+	return h
+}
+
+// provenAfter reports whether position p is PROVEN strictly after anchor.
+func provenAfter(orderer ir.PositionOrderer, p, anchor ir.Position) bool {
+	return provenBefore(orderer, anchor, p)
+}
+
+// isReplayOf reports whether a boundary showing post at pos may be a replay
+// of what the stream already recorded for the table — r and its resolved
+// version h — rather than a change made since:
+//
+//   - it is PROVEN to lie before the resolved version's anchor (an orderer
+//     that can compare the two — a MySQL GTID set); or
+//   - post is a shape the stream has already recorded for the table
+//     ([recordedShape]). This is the arm a Postgres source needs: its
+//     boundaries are anchored at LSN 0/0, so positions never prove a
+//     replay there, and a replay can only re-deliver a shape the stream
+//     already saw.
+//
+// Unknown order alone is not proof. The cost, stated: a source that
+// narrows a column back to a shape the table once held reads as a possible
+// replay and is kept with a WARN (GC-44 F5 third review; in-process the
+// immediate prior still catches it live).
+func isReplayOf(orderer ir.PositionOrderer, pos ir.Position, post *ir.Table, r retainedVersion, h *ir.Table) bool {
+	return provenBefore(orderer, pos, r.anchor) || recordedShape(append([]*ir.Table{h}, r.recorded...), post)
+}
+
+// recordedShape reports whether post has the same columns — names and
+// lens-applied types ([witnessCompareTable]) — as any of shapes.
+func recordedShape(shapes []*ir.Table, post *ir.Table) bool {
+	if post == nil {
+		return false
+	}
+	p := witnessCompareTable(post, nil)
+	for _, s := range shapes {
+		if s == nil {
+			continue
+		}
+		if len(irdiff.TableColumnShapeWithOptions(witnessCompareTable(s, nil), p, irdiff.ShapeCompareOptions{ColumnTypesOnly: true})) == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// provenBefore reports whether position p is PROVEN strictly before anchor:
+// the anchor is at or after p and p is not at or after the anchor. Anything
+// the orderer cannot answer is false.
+func provenBefore(orderer ir.PositionOrderer, p, anchor ir.Position) bool {
+	if orderer == nil || p.Token == "" || anchor.Token == "" {
+		return false
+	}
+	anchorAtOrAfter, err := orderer.PositionAtOrAfter(anchor, p)
+	if err != nil || !anchorAtOrAfter {
+		return false
+	}
+	pAtOrAfter, err := orderer.PositionAtOrAfter(p, anchor)
+	return err == nil && !pAtOrAfter
 }
 
 // options builds the witnessOptions for post.
@@ -419,8 +594,25 @@ func (w *firstBoundaryWitness) options(post *ir.Table) witnessOptions {
 func classifyWitness(expected, target *ir.Table, opts witnessOptions) witnessVerdict {
 	exp := witnessCompareTable(expected, nil)
 	act := witnessCompareTable(target, exp)
+	priorCols := priorColumns(opts.priorExpected)
+	// An overridden column's type is not compared below (the lens equates
+	// it); a source narrowing on one is still a change no first boundary
+	// can forward — the forward path does not apply overrides — so it
+	// refuses, judged on the source's own types before the lens equates
+	// them.
+	var narrowedPinned []witnessColumnDiff
+	for _, c := range exp.Columns {
+		if pc, ok := priorCols[c.Name]; ok && opts.pinned[c.Name] && sourceNarrowed(pc.Type, c.Type) {
+			narrowedPinned = append(narrowedPinned, witnessColumnDiff{
+				column: c.Name, source: fmt.Sprintf("%s (narrowed from %s)", c.Type, pc.Type), target: "(--type-override)",
+			})
+		}
+	}
 	reconcilePairs(exp, act, opts)
 	mismatches := irdiff.TableColumnShapeWithOptions(exp, act, irdiff.ShapeCompareOptions{ColumnTypesOnly: true})
+	if len(narrowedPinned) > 0 {
+		return witnessVerdict{kind: witnessRefuse, diffs: narrowedPinned}
+	}
 	if len(mismatches) == 0 {
 		return witnessVerdict{kind: witnessMatch}
 	}
@@ -462,6 +654,24 @@ func classifyWitness(expected, target *ir.Table, opts witnessOptions) witnessVer
 			v.kind = witnessForwardAlter
 		case targetWider:
 			v.kind = witnessTargetWider
+			pc, known := priorCols[name]
+			if !known || !sourceNarrowed(pc.Type, expCols[name].Type) {
+				break
+			}
+			// The retained history proves the source held the wider type
+			// and narrowed it. Where the target still holds that type, the
+			// narrowing is the source's own change the stream missed:
+			// forward it, as the live path would have. Where the target
+			// holds anything else (widened past the source on purpose) the
+			// rows it kept were never converted the way the source's were
+			// and no first boundary can say which type the operator wants.
+			v.narrowedFrom = pc.Type
+			v.diffs = narrowedDiffs(v.diffs, name, pc.Type)
+			if sameStorage(actCols[name].Type, pc.Type) && forwardableAlter(pc.Type) {
+				v.kind = witnessForwardAlter
+			} else {
+				v.kind = witnessRefuse
+			}
 		case sameWidth:
 			// Two spellings of one storage (a bare temporal against its
 			// engine default): nothing to do.
@@ -516,8 +726,10 @@ const (
 // relation and the rows' re-delivery, on every apply configuration measured,
 // but a narrowing that cannot hold those rows — a varchar or int — refuses
 // with 22001/22003 instead). A genuine source NARROWING is
-// therefore not forwarded at a first boundary (WARNed instead); the CDC→CDC
-// path, which sees both sides, still forwards one seen live.
+// therefore not forwarded on this order alone (WARNed instead); it is
+// forwarded only where the retained history PROVES it
+// ([firstBoundaryWitness.historyPriorAt], in [classifyWitness]), and the
+// CDC→CDC path, which sees both sides, still forwards one seen live.
 //
 // ACROSS families the order is one-sided: [targetHoldsEverySnapshotValue]
 // can only answer targetWider. A source change across families made while
@@ -540,22 +752,33 @@ func witnessWidthOrder(target, snapshot ir.Type) widthOrder {
 // the target loses nothing. Each arm states its value-fidelity argument;
 // anything not listed is not wider.
 //
-//   - varchar(n) / char(n) ⊂ text whose byte capacity covers n characters
-//     at 4 bytes each (utf8mb4's worst case; a Postgres text is unbounded).
-//     Storage keeps trailing spaces in both, so nothing is trimmed.
-//   - char(n) ⊂ varchar(m ≥ n). A char value is at most n characters as the
-//     stream delivers it — padded to n on Postgres (pgoutput sends the
-//     bpchar text), stripped on MySQL — and varchar(m) stores either
-//     unchanged. What differs is COMPARISON (bpchar ignores trailing spaces,
-//     varchar does not), not the stored value.
-//   - an integer ⊂ a decimal whose integer digits (precision − scale) hold
-//     the type's widest value (int8: 3, int16: 5, int24: 7 signed / 8
-//     unsigned, int32: 10, int64: 19 signed / 20 unsigned), or an
-//     unconstrained decimal. A decimal stores an integer exactly.
+//   - varchar(n) ⊂ text whose byte capacity covers n characters at 4 bytes
+//     each (utf8mb4's worst case; a Postgres text is unbounded). Both keep
+//     a value's trailing spaces, so nothing is trimmed.
+//   - an integer ⊂ a decimal with a non-negative scale whose integer digits
+//     (precision − scale) hold the type's widest value (int8: 3, int16: 5,
+//     int24: 7 signed / 8 unsigned, int32: 10, int64: 19 signed / 20
+//     unsigned), or an unconstrained decimal. Such a decimal stores an
+//     integer exactly; a negative scale rounds it ([decimalHoldsIntegerDigits]).
 //   - an unsigned integer ⊂ a signed integer strictly wider (uint32 ⊂ int64
 //     holds 0 … 2³²−1).
-//   - enum / set labels ⊂ a strict superset of them. The stream carries the
-//     LABEL, not the ordinal, so the target's own label order is irrelevant.
+//   - enum labels ⊂ a strict superset of them: the stream carries the
+//     LABEL, not the ordinal, and an enum stores the label it is given.
+//   - set labels ⊂ a strict superset that keeps them in the same relative
+//     order: a SET renders a value in its declaration order, so a reordered
+//     superset reads 'a,b' back as 'b,a'.
+//
+// CHAR is deliberately NOT here, in either arm it once had (char(n) ⊂
+// varchar(m ≥ n), char(n) ⊂ text — GC-44 F5 third review). The values do
+// not survive the way those arms claimed: a Postgres source sends bpchar
+// PADDED to n ('ab' as 'ab   '), while the target's rows were written
+// before the change — by a char → varchar cast, which strips the padding,
+// or by the copy of a varchar column — so the target holds 'ab' and the
+// stream sends 'ab   '. A key-scoped UPDATE or DELETE then matches no row
+// and an INSERT lands padded (measured on postgres:16: a varchar(5) key
+// changed to char(5) while the stream was stopped). A MySQL source sends
+// CHAR stripped, but nothing here proves which lane a type came from, so
+// CHAR across families refuses and the drained model converges it.
 //
 // json ⊂ jsonb is deliberately NOT here: jsonb normalizes (duplicate keys
 // collapse to the last, whitespace and key order are rewritten), so it does
@@ -568,30 +791,33 @@ func targetHoldsEverySnapshotValue(target, snapshot ir.Type) bool {
 		if t, ok := target.(ir.Text); ok {
 			return textCovers(t.Size, s.Length)
 		}
-	case ir.Char:
-		switch t := target.(type) {
-		case ir.Varchar:
-			return t.Length >= s.Length
-		case ir.Text:
-			return textCovers(t.Size, s.Length)
-		}
 	case ir.Integer:
 		switch t := target.(type) {
 		case ir.Decimal:
-			return t.Unconstrained || t.Precision-t.Scale >= integerDigits(s)
+			return decimalHoldsIntegerDigits(t, integerDigits(s))
 		case ir.Integer:
 			return s.Unsigned && !t.Unsigned && t.Width > s.Width
 		}
 	case ir.Enum:
 		if t, ok := target.(ir.Enum); ok {
-			return strictLabelSuperset(t.Values, s.Values)
+			return strictLabelSuperset(t.Values, s.Values, false)
 		}
 	case ir.Set:
 		if t, ok := target.(ir.Set); ok {
-			return strictLabelSuperset(t.Values, s.Values)
+			return strictLabelSuperset(t.Values, s.Values, true)
 		}
 	}
 	return false
+}
+
+// decimalHoldsIntegerDigits reports whether d stores every integer of up to
+// digits decimal digits unchanged: unconstrained, or a NON-NEGATIVE scale
+// with at least digits integer digits. A negative scale (Postgres 15+
+// `numeric(5,-2)`) rounds to a power of ten — `numeric(5,-2)` stores 1234
+// as 1200 — so however many integer digits precision − scale counts, it
+// holds no integer type (GC-44 F5 third review).
+func decimalHoldsIntegerDigits(d ir.Decimal, digits int) bool {
+	return d.Unconstrained || (d.Scale >= 0 && d.Precision-d.Scale >= digits)
 }
 
 // textCovers reports whether a TEXT of size holds n characters at 4 bytes
@@ -636,18 +862,29 @@ func integerDigits(i ir.Integer) int {
 // strictLabelSuperset reports whether target carries every label of
 // snapshot and at least one more. Both sides must know their labels (the
 // lens equates an enum whose labels one side does not know).
-func strictLabelSuperset(target, snapshot []string) bool {
+//
+// ordered additionally requires snapshot's labels to appear in target in
+// the SAME relative order — the SET case. A MySQL SET stores a bitmask over
+// its declared labels and renders a value in DECLARATION order, so 'a,b'
+// written into SET('b','a','c') reads back 'b,a': a different string from
+// the one the source holds, though every label survives (GC-44 F5 third
+// review, L2). An ENUM stores one label, which renders as written whatever
+// the order.
+func strictLabelSuperset(target, snapshot []string, ordered bool) bool {
 	if len(snapshot) == 0 || len(target) <= len(snapshot) {
 		return false
 	}
-	have := make(map[string]bool, len(target))
-	for _, v := range target {
-		have[v] = true
+	pos := make(map[string]int, len(target))
+	for i, v := range target {
+		pos[v] = i
 	}
+	last := -1
 	for _, v := range snapshot {
-		if !have[v] {
+		i, ok := pos[v]
+		if !ok || (ordered && i < last) {
 			return false
 		}
+		last = i
 	}
 	return true
 }
@@ -703,8 +940,32 @@ func sameFamilyWidthOrder(target, snapshot ir.Type) widthOrder {
 			return notComparable
 		}
 		return orderInts(int(t.Width), int(s.Width))
+	case ir.Array:
+		t, ok := target.(ir.Array)
+		if !ok || t.Element == nil || s.Element == nil {
+			return notComparable
+		}
+		// An array is ordered by its element — the change stream carries
+		// the element's modifier since GC-44 F5's third review (the
+		// Postgres projection threads the column typmod onto it). A target
+		// element WIDER is kept like any wider column; a NARROWER one is
+		// not forwarded (no first-boundary path ALTERs an array column's
+		// element, and the live path refuses that change at the reader),
+		// so it refuses as mixed.
+		if o := sameFamilyWidthOrder(t.Element, s.Element); o != targetNarrower {
+			return o
+		}
+		return mixedWidth
 	}
 	return notComparable
+}
+
+// forwardableAlter reports whether a first boundary may forward an ALTER
+// COLUMN TYPE on a column of type t. Array columns are never altered there
+// (see the Array arm of [sameFamilyWidthOrder]).
+func forwardableAlter(t ir.Type) bool {
+	_, isArray := t.(ir.Array)
+	return !isArray
 }
 
 // orderInts orders a target measure against a snapshot measure.
@@ -790,24 +1051,34 @@ func witnessCompareTable(t, expected *ir.Table) *ir.Table {
 
 // witnessCompareType is the comparison lens, applied to BOTH sides. Each arm
 // erases a difference measured between a change-stream projection and a
-// target read-back of a column the stream itself created — never one that
-// changes what a value can hold:
+// target read-back of a column the stream itself created. All but one
+// leave what a value can hold intact:
 //
 //   - Integer.AutoIncrement: catalog-only; no change stream carries it.
 //   - character charset/collation: pgoutput and VStream carry neither, and
-//     across engines it is translation, not drift.
+//     across engines it is translation, not drift. UNVERIFIED PREMISE —
+//     this arm is the exception: a collation change is not storage-neutral
+//     everywhere (a `_ci` → `_bin` change on a MySQL key column changes
+//     which values collide), and a stopped-time collation change is
+//     therefore not seen at a boundary. Filed as GC-44 F17.
 //   - a constraint-free Decimal{0,0} is the legacy unconstrained spelling.
-//   - Geometry: the change streams carry geometry-vs-geography and nothing
-//     else (pgoutput sends a bare OID; the SRID is recovered at apply).
+//   - Geometry: the subtype and Z/M flags are erased (the change streams
+//     do not carry them reliably); geometry-vs-geography is kept, and so is
+//     a positive SRID, which [reconcilePairs] compares when BOTH sides
+//     declare one (both lanes report an SRID they cannot establish as 0).
 //   - Enum: the type name is a Postgres catalog detail; pgoutput sends a
 //     bare OID, so its labels are unknown too, and
 //     [reconcilePairs] compares labels only when both sides carry
 //     them.
 //   - Domain: pgoutput unwraps it to its base type; the catalog reads the
 //     wrapper. Compared through the storage type.
-//   - Array: the element is resolved at typmod -1 on the wire, so its
-//     modifier is erased on both sides (an array typmod-only ALTER is
-//     refused at the Postgres reader before it can reach this).
+//   - Array: compared through its element, modifier included. The
+//     Postgres projection threads the column's typmod onto the element
+//     (GC-44 F5 third review); before it the element was resolved at typmod
+//     -1 and erased here on both sides, so `numeric(10,2)[]` →
+//     `numeric(10,4)[]` made while the stream was stopped was never seen
+//     (the reader's mid-stream gate refuses that change only for a relation
+//     it has already cached in the same stream).
 //   - JSON vs long TEXT on a MariaDB source, and overridden columns:
 //     pairwise, in [reconcilePairs].
 func witnessCompareType(t ir.Type) ir.Type {
@@ -830,7 +1101,7 @@ func witnessCompareType(t ir.Type) ir.Type {
 		}
 		return v
 	case ir.Geometry:
-		return ir.Geometry{IsGeography: v.IsGeography}
+		return ir.Geometry{IsGeography: v.IsGeography, SRID: max(v.SRID, 0)}
 	case ir.Enum:
 		return ir.Enum{Values: v.Values}
 	case ir.Domain:
@@ -840,7 +1111,9 @@ func witnessCompareType(t ir.Type) ir.Type {
 		}
 		return witnessCompareType(base)
 	case ir.Array:
-		v.Element = witnessCompareType(eraseWitnessArrayModifier(v.Element))
+		if v.Element != nil {
+			v.Element = witnessCompareType(v.Element)
+		}
 		return v
 	}
 	return t
@@ -865,6 +1138,16 @@ func witnessCompareType(t ir.Type) ir.Type {
 //     change made while the stream was stopped is not seen at the first
 //     boundary. Every other source still compares JSON and TEXT as
 //     different families.
+//   - a geometry column's SRID is compared only when BOTH sides declare a
+//     positive one. pgoutput carries no SRID, and both readers report one
+//     they cannot establish as 0 ([ir.GeometrySRIDUnknown] contained), so
+//     0 is "unknown" here; a positive SRID on each side that differs is a
+//     real change (the Postgres applier re-stamps the TARGET's SRID on
+//     every row, so new rows would carry the old label — GC-44 F5 third
+//     review). The residual, stated: a stopped-time SRID change on a
+//     Postgres source, or to or from a MySQL column with no declared SRID,
+//     is not seen (GC-44 F16) — refusing whenever the target alone knows
+//     the SRID would refuse every Postgres geometry stream on every start.
 func reconcilePairs(exp, act *ir.Table, opts witnessOptions) {
 	actCols := columnsByNameIR(act)
 	for _, e := range exp.Columns {
@@ -887,6 +1170,12 @@ func reconcilePairs(exp, act *ir.Table, opts witnessOptions) {
 				e.Type = a.Type
 			}
 		}
+		eg, eIsGeom := e.Type.(ir.Geometry)
+		ag, aIsGeom := a.Type.(ir.Geometry)
+		if eIsGeom && aIsGeom && (eg.SRID == 0 || ag.SRID == 0) {
+			eg.SRID, ag.SRID = 0, 0
+			e.Type, a.Type = eg, ag
+		}
 	}
 }
 
@@ -894,24 +1183,6 @@ func reconcilePairs(exp, act *ir.Table, opts witnessOptions) {
 func isLongText(t ir.Type) bool {
 	text, ok := t.(ir.Text)
 	return ok && text.Size == ir.TextLong
-}
-
-// eraseWitnessArrayModifier maps an array element to its modifier-free
-// form — what a change stream resolving the element at typmod -1 reads.
-func eraseWitnessArrayModifier(t ir.Type) ir.Type {
-	switch v := t.(type) {
-	case ir.Decimal:
-		return ir.Decimal{Unconstrained: true}
-	case ir.Char, ir.Varchar:
-		return ir.Text{Size: ir.TextLong}
-	case ir.DateTime:
-		return ir.DateTime{PrecisionUnspecified: true}
-	case ir.Time:
-		return ir.Time{WithTimeZone: v.WithTimeZone, PrecisionUnspecified: true}
-	case ir.Timestamp:
-		return ir.Timestamp{WithTimeZone: v.WithTimeZone, PrecisionUnspecified: true}
-	}
-	return t
 }
 
 // columnsByNameIR indexes t's columns by name.
@@ -975,7 +1246,7 @@ func routeWitnessedBoundary(
 	post *ir.Table,
 	snap ir.SchemaSnapshot,
 ) (*ir.Table, error) {
-	v, err := deps.witness.verdict(ctx, snap.IR)
+	v, err := deps.witness.verdict(ctx, snap.IR, snap.Position)
 	if err != nil {
 		// Not the divergence marker: nothing has been compared, and a fresh
 		// run may read the catalog fine.
@@ -1022,9 +1293,11 @@ func routeWitnessedBoundary(
 func logTargetWider(ctx context.Context, tableName string, v witnessVerdict) {
 	slog.WarnContext(ctx,
 		"schema-forward: the target column is WIDER than the source's at the first schema boundary after a "+
-			"(re)start; the target keeps its type (a first boundary never narrows a column — it may be a replay "+
-			"of the shape BEFORE a change the target already took, or a target widened on purpose). If the source "+
-			"really narrowed it, narrow the target yourself via the drained model",
+			"(re)start, and this stream holds no earlier shape of the table that says which side changed; the "+
+			"target keeps its type. It may be a replay of the shape BEFORE a change the target already took, or "+
+			"a target widened on purpose — or the SOURCE narrowed the column while the stream was stopped, in "+
+			"which case its own ALTER converted the rows it stores and the target's copies were not converted: "+
+			"compare them, and narrow the target (or re-copy the table) via the drained model if so",
 		"table", tableName, "difference", v.render())
 }
 

@@ -174,7 +174,7 @@ func interceptSchemaSnapshotsForCoordination(
 					// it ONCE (the holder applies, peers observe or find
 					// the target already matching). Columns a peer added are
 					// owed this shard's backfill on every arm (F13).
-					first, err := checkShapeAFirstBoundary(ctx, router.firstBoundary, key, post, snap.IR)
+					first, err := checkShapeAFirstBoundary(ctx, router.firstBoundary, key, post, snap.IR, snap.Position)
 					if err != nil {
 						slog.ErrorContext(
 							ctx, "shard consolidation intercept: first boundary refused",
@@ -207,13 +207,20 @@ func interceptSchemaSnapshotsForCoordination(
 					// FULL owed set is written before any ALTER: the
 					// router's own pre-ALTER write names only the columns
 					// it adds, and would otherwise be the record that wins.
+					// Only an owed set is written: a forward ALTER with no
+					// peer-added column owes nothing, and an empty record
+					// would never be cleared (no backfill entry ever covers
+					// it), so the next start would refuse on it (GC-44 F5
+					// third review, MEDIUM-1).
 					firstOwed = first.owed(post)
-					if err := backfill.writeAhead(ctx, key, columnNames(firstOwed)); err != nil {
-						delete(cache, key)
-						delete(version, key)
-						wrapped := fmt.Errorf("pipeline: shard consolidation: %w. %s", err, RecoveryHint(key))
-						errStore.Store(&wrapped)
-						return
+					if len(firstOwed) > 0 {
+						if err := backfill.writeAhead(ctx, key, columnNames(firstOwed)); err != nil {
+							delete(cache, key)
+							delete(version, key)
+							wrapped := fmt.Errorf("pipeline: shard consolidation: %w. %s", err, RecoveryHint(key))
+							errStore.Store(&wrapped)
+							return
+						}
 					}
 				}
 				if route {
@@ -356,16 +363,22 @@ func (b shapeAFirstBoundary) owed(post *ir.Table) []*ir.Column {
 
 // checkShapeAFirstBoundary is the Shape A face of the target-witnessed
 // first boundary (GC-44; schema_forward_witness.go). post is the
-// comparison-form snapshot table and raw the snapshot's own IR.
+// comparison-form snapshot table, raw the snapshot's own IR and pos its
+// position (which decides whether the retained history may prove a source
+// narrowing — [firstBoundaryWitness.historyPriorAt]).
 //
 // The verdict decides the route: a match, an unwitnessable table,
 // target-only columns and a WIDER target column are the baseline (each but
-// the first WARNed); columns the target lacks or one narrower column are
-// routed through the lease against a pre-state synthesized from the target,
-// so the holder applies it once and its peers observe it; anything else is
-// the [resumeDivergenceMarker] refusal.
+// the first WARNed); columns the target lacks, one narrower column, and one
+// the history proves this shard's source NARROWED while the target still
+// holds the old type are routed through the lease against a pre-state
+// synthesized from the target, so the holder applies it once and its peers
+// observe it — exactly what a live boundary of the same change does;
+// anything else is the [resumeDivergenceMarker] refusal.
 //
-// Independently of the route, on EVERY arm that does not refuse, the
+// Independently of the route, on EVERY arm that does not refuse — the
+// unwitnessable one included, since a peer's column is a matter of names —
+// the
 // columns a peer added are owed this shard's backfill ([shapeAPeerAdded]).
 // They are planned beside the route, not routed: the column is already on
 // the target, so there is nothing to apply, and routing it would make an
@@ -378,12 +391,12 @@ func (b shapeAFirstBoundary) owed(post *ir.Table) []*ir.Column {
 // the warm-resume read, older than any peer DDL since — disagrees, so a
 // peer's coordinated change is seen rather than refused. nil witness (a
 // unit harness) accepts.
-func checkShapeAFirstBoundary(ctx context.Context, w *firstBoundaryWitness, tableName string, post, raw *ir.Table) (shapeAFirstBoundary, error) {
+func checkShapeAFirstBoundary(ctx context.Context, w *firstBoundaryWitness, tableName string, post, raw *ir.Table, pos ir.Position) (shapeAFirstBoundary, error) {
 	var b shapeAFirstBoundary
 	if w == nil {
 		return b, nil
 	}
-	v, err := w.verdict(ctx, raw)
+	v, err := w.verdict(ctx, raw, pos)
 	if err != nil {
 		return b, fmt.Errorf("read the consolidated target's catalog to check the first schema boundary for %q "+
 			"(the boundary is not accepted unchecked): %w", tableName, err)
@@ -391,11 +404,14 @@ func checkShapeAFirstBoundary(ctx context.Context, w *firstBoundaryWitness, tabl
 	switch v.kind {
 	case witnessMatch:
 	case witnessUnwitnessed:
+		// No type comparison is possible, but a peer's added column is a
+		// matter of NAMES — the target either holds the column or it does
+		// not — so the peer-added check below still runs (a table the target
+		// does not hold has none to find).
 		slog.WarnContext(ctx,
 			"shard consolidation: the target cannot witness this table's first schema boundary; accepting it as the "+
 				"baseline — a change made to this shard's source while the stream was stopped is NOT checked",
 			"table", tableName, "reason", v.reason)
-		return b, nil
 	case witnessTargetOnly:
 		slog.WarnContext(ctx,
 			"shard consolidation: the consolidated target holds columns this shard's source no longer has; the "+

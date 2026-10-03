@@ -75,10 +75,12 @@ func typmodFamilyShapes() []typmodFamilyShape {
 //     numeric seeded Decimal{Unconstrained} and projected Decimal{0,0}, so
 //     the forward emitted NUMERIC(0,0) (PG target: refused) / DECIMAL(0,0)
 //     (MySQL target: every value truncated to an integer, silently).
-//     Arrays are exempt from this level BY DESIGN — the projection resolves
-//     the element at typmod -1 (oidToType's array arm; the
-//     TYPMOD-PROJECTION-GATE refuse list) — and instead must project the
-//     element at the family's widest, modifier-free form.
+//     Arrays are held to this level too since GC-44 F5's third review: the
+//     DECODE type still resolves the element at typmod -1 (oidToType's
+//     array arm; the TYPMOD-PROJECTION-GATE refuse list), but the boundary
+//     projection threads the column typmod onto the element
+//     (projectArrayElementModifier), because the pipeline's first-boundary
+//     witness compares it against the target catalog.
 //   - THROUGH THE LENS, for all: seed vs projection classifies None, and
 //     seed vs projection-plus-one-column classifies AddColumn (the GC-1
 //     probe — a phantom alter alongside a real ADD COLUMN is the multi-shape
@@ -158,14 +160,13 @@ func TestNormalizeForCDCComparison_PG_SeedAgreesWithBoundaryProjection(t *testin
 			proj := projectRelation(entry)
 			projType := proj.Columns[1].Type
 
-			if !c.isArray && !reflect.DeepEqual(seedType, projType) {
-				t.Errorf("raw split: schema reader %#v, pgoutput projection %#v — a forwarded ADD COLUMN of this column lands differently from a migrate of it", seedType, projType)
-			}
-			if c.isArray {
-				elem := projType.(ir.Array).Element
-				if want := eraseArrayElementModifier(elem); !reflect.DeepEqual(elem, want) {
-					t.Errorf("projected array element %#v carries a modifier; the projection resolves elements at typmod -1 and must land on the widest form %#v", elem, want)
-				}
+			// RAW agreement for arrays too since GC-44 F5's third review: the
+			// boundary projection threads the column typmod onto the element
+			// (projectArrayElementModifier), so the target witness can see an
+			// element modifier changed while the stream was stopped. A split
+			// here is a phantom at every first boundary of such a table.
+			if !reflect.DeepEqual(seedType, projType) {
+				t.Errorf("raw split: schema reader %#v, pgoutput projection %#v — a forwarded ADD COLUMN of this column lands differently from a migrate of it, and the first-boundary witness reads a phantom change", seedType, projType)
 			}
 
 			seedTbl := &ir.Table{Schema: "public", Name: "w", Columns: []*ir.Column{

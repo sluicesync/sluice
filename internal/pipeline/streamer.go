@@ -1598,6 +1598,23 @@ type Streamer struct {
 	// [Streamer.firstBoundaryCatalog].
 	firstBoundaryHistory []*ir.Table
 
+	// firstBoundaryRetained is the anchor of each retained version in
+	// [Streamer.firstBoundaryHistory] and [Streamer.namespaceHistory] (the
+	// same pointers), read by the same seed load: where each shape held
+	// from. The GC-44 narrowing rules use it to tell a boundary after that
+	// shape from a replay of one before it
+	// ([firstBoundaryWitness.historyPriorAt]). Consumed with them.
+	firstBoundaryRetained retainedHistory
+
+	// unforwardedColdStartPrior is the RAW source shape of every table the
+	// cold start read, captured before --type-override and Shape A rewrite
+	// it, as comparison-form snapshots: the unforwarded-stream check's prior
+	// for a table's first boundary after a cold start
+	// ([interceptSchemaChangeRefuse]), so a deliberate narrowing override is
+	// recognised as the shape the copy applied rather than refused (GC-44 F5
+	// third review). Consumed and cleared when the intercept chain is wired.
+	unforwardedColdStartPrior []ir.SchemaSnapshot
+
 	// namespaceTargetDeriver is the per-namespace target DSN deriver this
 	// attempt's multi-database open resolved — AFTER its flat-target refusal
 	// and namespace-fold preflight, which is why it is handed over rather

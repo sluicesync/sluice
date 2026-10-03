@@ -65,13 +65,36 @@ func TestJudgeUnforwardedColumns_EveryFamilyBothDirections(t *testing.T) {
 		{"integer: a sign change at the same width", ir.Integer{Width: 32}, ir.Integer{Width: 32, Unsigned: true}, false},
 		{"text into varchar: across families", ir.Varchar{Length: 65535}, ir.Text{Size: ir.TextLong}, false},
 		{"varchar into text", ir.Text{Size: ir.TextLong}, ir.Varchar{Length: 64}, true},
-		{"char into varchar(m ≥ n)", ir.Varchar{Length: 20}, ir.Char{Length: 10}, true},
+		// GC-44 F5 third review: CHAR is not held across families — a
+		// Postgres source sends bpchar PADDED while the target's rows hold
+		// the unpadded value, so a key-scoped UPDATE/DELETE matches nothing.
+		{"char into varchar(m ≥ n) refuses (bpchar arrives padded)", ir.Varchar{Length: 20}, ir.Char{Length: 10}, false},
+		{"char into text refuses (bpchar arrives padded)", ir.Text{Size: ir.TextLong}, ir.Char{Length: 10}, false},
+		// A negative scale rounds to a power of ten, so it holds no integer
+		// type whatever precision − scale counts (Postgres 15+).
+		{"smallint into numeric(5,-2) refuses", ir.Decimal{Precision: 5, Scale: -2}, ir.Integer{Width: 16}, false},
+		{"smallint into numeric(5,0)", ir.Decimal{Precision: 5}, ir.Integer{Width: 16}, true},
+		{"numeric(5,-2) into numeric(7,0): integer digits held, scale wider", ir.Decimal{Precision: 7}, ir.Decimal{Precision: 5, Scale: -2}, true},
+		{"numeric(7,0) into numeric(5,-2) refuses", ir.Decimal{Precision: 5, Scale: -2}, ir.Decimal{Precision: 7}, false},
+		{"numeric(3,0) into numeric(5,-2) refuses (mixed axes)", ir.Decimal{Precision: 5, Scale: -2}, ir.Decimal{Precision: 3}, false},
+		{"numeric(2,5) into numeric(3,6)", ir.Decimal{Precision: 3, Scale: 6}, ir.Decimal{Precision: 2, Scale: 5}, true},
+		{"numeric(3,6) into numeric(2,5) refuses", ir.Decimal{Precision: 2, Scale: 5}, ir.Decimal{Precision: 3, Scale: 6}, false},
+		// SET renders in declaration order: a reordered superset changes the
+		// string a value reads back as.
+		{"set labels under an in-order superset", ir.Set{Values: []string{"a", "b", "c"}}, ir.Set{Values: []string{"a", "b"}}, true},
+		{"set labels under a reordered superset refuse", ir.Set{Values: []string{"b", "a", "c"}}, ir.Set{Values: []string{"a", "b"}}, false},
+		{"enum labels under a reordered superset", ir.Enum{Values: []string{"b", "a", "c"}}, ir.Enum{Values: []string{"a", "b"}}, true},
+		// Arrays, compared through their element modifier.
+		{"array element: target wider", ir.Array{Element: ir.Decimal{Precision: 12, Scale: 4}}, ir.Array{Element: ir.Decimal{Precision: 10, Scale: 2}}, true},
+		{"array element: source wider", ir.Array{Element: ir.Decimal{Precision: 10, Scale: 2}}, ir.Array{Element: ir.Decimal{Precision: 10, Scale: 4}}, false},
+		{"array element: timestamp(0)[] under (6)[]", ir.Array{Element: ir.Timestamp{Precision: 6}}, ir.Array{Element: ir.Timestamp{Precision: 0}}, true},
+		{"array element: timestamp(6)[] over (0)[]", ir.Array{Element: ir.Timestamp{Precision: 0}}, ir.Array{Element: ir.Timestamp{Precision: 6}}, false},
 		{"char into varchar(m < n)", ir.Varchar{Length: 5}, ir.Char{Length: 10}, false},
 		{"integer into a decimal that holds it", ir.Decimal{Precision: 30, Scale: 0}, ir.Integer{Width: 32}, true},
 		{"integer into a decimal too narrow for it", ir.Decimal{Precision: 9, Scale: 0}, ir.Integer{Width: 32}, false},
 		{"json into jsonb (jsonb normalizes)", ir.JSON{Binary: true}, ir.JSON{}, false},
 	} {
-		j := judgeUnforwardedColumns(witnessTable(wcol("c", tc.source)), witnessTable(wcol("c", tc.target)), witnessOptions{}, nil)
+		j := judgeUnforwardedColumns(witnessTable(wcol("c", tc.source)), witnessTable(wcol("c", tc.target)), witnessOptions{}, judgedPrior{})
 		if passes := len(j.refused) == 0; passes != tc.passes {
 			t.Errorf("%s: target %s, source %s: passes = %v (refused %v), want %v",
 				tc.name, tc.target, tc.source, passes, j.refused, tc.passes)
@@ -101,7 +124,7 @@ func TestJudgeUnforwardedColumns(t *testing.T) {
 		{"one column ahead, one behind", witnessTable(wcol("a", ir.DateTime{}), wcol("b", ir.DateTime{Precision: 6})), witnessTable(wcol("a", ir.DateTime{Precision: 6}), wcol("b", ir.DateTime{})), 1, 1, 0},
 		{"across families", witnessTable(wcol("v", ir.Text{Size: ir.TextLong})), witnessTable(wcol("v", ir.Integer{Width: 32})), 1, 0, 0},
 	} {
-		j := judgeUnforwardedColumns(tc.snap, tc.target, witnessOptions{}, nil)
+		j := judgeUnforwardedColumns(tc.snap, tc.target, witnessOptions{}, judgedPrior{})
 		if len(j.refused) != tc.refused || len(j.ahead) != tc.ahead || len(j.targetOnly) != tc.targetOnly {
 			t.Errorf("%s: refused %d, ahead %d, target-only %d; want %d, %d, %d",
 				tc.name, len(j.refused), len(j.ahead), len(j.targetOnly), tc.refused, tc.ahead, tc.targetOnly)
@@ -182,7 +205,7 @@ func TestInterceptSchemaChangeRefuse(t *testing.T) {
 		w := newFakeWitness(cat, "mysql", "mysql")
 		// An earlier disagreement on this table spent the verdict's once-per-
 		// table re-read (it reads the catalog, still narrow).
-		if j, err := w.judgeUnforwarded(context.Background(), wide, nil); err != nil || len(j.refused) == 0 {
+		if j, err := w.judgeUnforwarded(context.Background(), wide, unforwardedPrior{}); err != nil || len(j.refused) == 0 {
 			t.Fatalf("the first judgement = %+v, %v; want a refusal", j, err)
 		}
 		cat.tables["w"] = wide // the operator's drained-model ALTER on the target
@@ -368,14 +391,14 @@ func TestJudgeUnforwarded_OverriddenColumnThroughTheWitness(t *testing.T) {
 		w.mappings = []config.Mapping{{Table: "w", Column: "amount", TargetType: "numeric", TargetTypeOptions: map[string]any{"precision": 12, "scale": 2}}}
 		return w
 	}
-	j, err := newW().judgeUnforwarded(ctx, after, before)
+	j, err := newW().judgeUnforwarded(ctx, after, unforwardedPrior{raw: before})
 	if err != nil || len(j.refused) != 1 || !strings.Contains(j.refused[0].target, "--type-override") {
 		t.Fatalf("live widen past the override: %+v, %v; want one refusal naming the override", j, err)
 	}
 	if err := j.settle(ctx, "src.w", unforwardedBoundaryDeps{why: "--schema-changes=refuse"}); !errors.Is(err, ir.ErrSchemaChangeRefused) {
 		t.Errorf("settle = %v; want %s", err, schemaChangeRefusedMarker)
 	}
-	if j, err := newW().judgeUnforwarded(ctx, before, before); err != nil || len(j.refused) != 0 {
+	if j, err := newW().judgeUnforwarded(ctx, before, unforwardedPrior{raw: before}); err != nil || len(j.refused) != 0 {
 		t.Errorf("unchanged source under a wider override: %+v, %v; want accepted", j, err)
 	}
 }

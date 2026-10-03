@@ -540,6 +540,12 @@ func (s *Streamer) coldStartPrepareSchema(schema *ir.Schema) (*ir.Schema, error)
 	// is about to create; the first-boundary witness reads its own.
 	s.firstBoundaryCatalog = nil
 	s.firstBoundaryHistory = nil
+	s.firstBoundaryRetained = nil
+	// GC-44 F5 third review: the unforwarded-stream check's prior for each
+	// table's first boundary — the RAW source shape, before any override
+	// rewrites a column to the operator's target type (a prior carrying the
+	// target type would read as a change on every overridden column).
+	s.unforwardedColdStartPrior = synthesizeColdStartSeedSnapshots(schema, s.Source)
 	// Apply per-column type overrides before the schema-write phase
 	// sees the schema. Warm resume skips this step — by then the
 	// target schema is already shaped from the cold-start run.

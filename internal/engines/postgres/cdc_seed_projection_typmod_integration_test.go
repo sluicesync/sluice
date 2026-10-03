@@ -117,9 +117,11 @@ func TestSeedAgreesWithPgoutputProjection_TypmodFamilies(t *testing.T) {
 		if sc.Name != pc.Name {
 			t.Fatalf("ordinal %d: seed %q vs projection %q", i, sc.Name, pc.Name)
 		}
-		if _, isArray := sc.Type.(ir.Array); isArray {
-			continue
-		}
+		// Arrays too since GC-44 F5's third review: the boundary projection
+		// threads the column typmod onto the element
+		// (projectArrayElementModifier), and the first-boundary witness
+		// compares it against the target catalog — a split here is a phantom
+		// at every first boundary of such a table.
 		if !reflect.DeepEqual(sc.Type, pc.Type) {
 			t.Errorf("%s: raw split — schema reader %#v, pgoutput projection %#v", sc.Name, sc.Type, pc.Type)
 		}

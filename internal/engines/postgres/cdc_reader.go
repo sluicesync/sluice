@@ -2446,13 +2446,20 @@ func buildRelationCacheEntry(m pglogrepl.RelationMessage, geomOID uint32, enumOI
 		if err != nil {
 			return nil, fmt.Errorf("column %q: %w", c.Name, err)
 		}
-		cols = append(cols, relationColumn{
+		col := relationColumn{
 			Name:      c.Name,
 			OID:       c.DataType,
 			TypeMod:   c.TypeModifier,
 			Type:      t,
 			KeyColumn: c.Flags&1 != 0,
-		})
+		}
+		if baseOID, baseTypmod, isDomain := resolveDomainBase(c.DataType, domainBases); isDomain {
+			col.StorageOID, col.StorageTypeMod = baseOID, baseTypmod
+			if c.TypeModifier >= 0 {
+				col.StorageTypeMod = c.TypeModifier
+			}
+		}
+		cols = append(cols, col)
 	}
 	return &relationCacheEntry{
 		Schema:          m.Namespace,

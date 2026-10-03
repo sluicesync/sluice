@@ -328,9 +328,9 @@ func TestLoadRetainedSchemaSeed(t *testing.T) {
 	}
 
 	t.Run("applier without schema history yields no seed", func(t *testing.T) {
-		got, err := loadRetainedSchemaSeed(ctx, &stubApplier{}, source, "s", persisted)
-		if err != nil || got != nil {
-			t.Fatalf("got (%v, %v); want (nil, nil)", got, err)
+		got, anchors, err := loadRetainedSchemaSeed(ctx, &stubApplier{}, source, "s", persisted)
+		if err != nil || got != nil || anchors != nil {
+			t.Fatalf("got (%v, %v, %v); want (nil, nil, nil)", got, anchors, err)
 		}
 	})
 
@@ -339,7 +339,7 @@ func TestLoadRetainedSchemaSeed(t *testing.T) {
 			historyRow("src", "events", "10", tsTable),
 			historyRow("src", "other", "5", otherTable),
 		}}
-		got, err := loadRetainedSchemaSeed(ctx, app, source, "s", persisted)
+		got, anchors, err := loadRetainedSchemaSeed(ctx, app, source, "s", persisted)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -348,6 +348,11 @@ func TestLoadRetainedSchemaSeed(t *testing.T) {
 		}
 		if got[0].Schema != "src" || got[0].Name != "events" {
 			t.Errorf("seed[0] = %s.%s; want src.events (schema/name restored from the row)", got[0].Schema, got[0].Name)
+		}
+		// GC-44 F5 third review: each version's anchor travels with it, so
+		// the narrowing rules can tell a replay from a later boundary.
+		if a, b := anchors[got[0]].anchor.Token, anchors[got[1]].anchor.Token; a != "10" || b != "5" {
+			t.Errorf("anchors = %q, %q; want the rows' own 10 and 5", a, b)
 		}
 		if _, ok := columnType(got, "events", "c").(ir.Timestamp); !ok {
 			t.Errorf("events.c seeded as %T; want the retained ir.Timestamp", columnType(got, "events", "c"))
@@ -362,7 +367,7 @@ func TestLoadRetainedSchemaSeed(t *testing.T) {
 			historyRow("src", "events", "40", dtTable),
 			historyRow("src", "events", "60", otherTable),
 		}}
-		got, err := loadRetainedSchemaSeed(ctx, app, source, "s", persisted)
+		got, anchors, err := loadRetainedSchemaSeed(ctx, app, source, "s", persisted)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -372,6 +377,9 @@ func TestLoadRetainedSchemaSeed(t *testing.T) {
 		if _, ok := columnType(got, "events", "c").(ir.DateTime); !ok {
 			t.Errorf("events.c seeded as %T; want the ir.DateTime version anchored at 40 (the greatest anchor at or before 50)", columnType(got, "events", "c"))
 		}
+		if a := anchors[got[0]].anchor.Token; a != "40" {
+			t.Errorf("anchor = %q; want the selected version's own 40", a)
+		}
 	})
 
 	t.Run("several versions and no orderer: that table resumes without a prior, the rest still seed", func(t *testing.T) {
@@ -380,7 +388,7 @@ func TestLoadRetainedSchemaSeed(t *testing.T) {
 			historyRow("src", "events", "40", dtTable),
 			historyRow("src", "other", "5", otherTable),
 		}}
-		got, err := loadRetainedSchemaSeed(ctx, app, stubEngine{}, "s", persisted)
+		got, _, err := loadRetainedSchemaSeed(ctx, app, stubEngine{}, "s", persisted)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -391,7 +399,7 @@ func TestLoadRetainedSchemaSeed(t *testing.T) {
 
 	t.Run("a history read error is loud", func(t *testing.T) {
 		app := &seedHistoryApplier{err: errors.New("control table unreachable")}
-		if _, err := loadRetainedSchemaSeed(ctx, app, source, "s", persisted); err == nil {
+		if _, _, err := loadRetainedSchemaSeed(ctx, app, source, "s", persisted); err == nil {
 			t.Fatal("read error degraded to an empty seed; the armed refusal would silently lose its prior")
 		}
 	})
@@ -400,7 +408,7 @@ func TestLoadRetainedSchemaSeed(t *testing.T) {
 		app := &seedHistoryApplier{rows: []ir.RetainedSchemaVersionRow{
 			{SchemaName: "src", TableName: "events", AnchorPosition: "10", TableJSON: []byte("{not json")},
 		}}
-		if _, err := loadRetainedSchemaSeed(ctx, app, source, "s", persisted); err == nil {
+		if _, _, err := loadRetainedSchemaSeed(ctx, app, source, "s", persisted); err == nil {
 			t.Fatal("corrupt row degraded to an empty seed")
 		}
 	})

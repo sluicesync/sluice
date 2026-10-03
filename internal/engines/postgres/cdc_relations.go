@@ -89,6 +89,14 @@ type relationColumn struct {
 	// which is the safe direction). pgoutput's RelationMessage does NOT
 	// carry attnum, hence the catalog lookup.
 	StableID int
+
+	// StorageOID / StorageTypeMod are the column's NON-domain storage type
+	// and the modifier it resolves with, set only when the wire OID is a
+	// DOMAIN ([resolveDomainBase]); zero means OID / TypeMod are already the
+	// storage. Read by [projectArrayElementModifier], so a domain over a
+	// modified array projects its element modifier too.
+	StorageOID     uint32
+	StorageTypeMod int32
 }
 
 // detectIncompatibleRelationChange compares a previously-cached relation
@@ -694,7 +702,7 @@ func projectRelation(rel *relationCacheEntry) *ir.Table {
 		// pipeline rename intercept can prove rename-vs-drop+add. It is
 		// METADATA only — SchemaSignatureOf / diffAlteredColumn ignore it,
 		// so it does not perturb the decode contract or alter-detection.
-		cols[i] = &ir.Column{Name: c.Name, Type: containSRIDSentinel(c.Type), StableID: c.StableID}
+		cols[i] = &ir.Column{Name: c.Name, Type: containSRIDSentinel(projectArrayElementModifier(c)), StableID: c.StableID}
 	}
 	tbl := &ir.Table{Schema: rel.Schema, Name: rel.Name, Columns: cols}
 	// Bug 89: surface the key columns from the RelationMessage's
@@ -717,6 +725,46 @@ func projectRelation(rel *relationCacheEntry) *ir.Table {
 		tbl.PrimaryKey = &ir.Index{Columns: pkCols}
 	}
 	return tbl
+}
+
+// projectArrayElementModifier is c's type for the schema boundary: c.Type,
+// except that an array column's element carries the modifier the column
+// declares. pgoutput sends an array column's own typmod, which IS its
+// element's (`numeric(10,2)[]` arrives with 655366, `timestamp(0)[]` with
+// 0); [oidToType] resolves the element at typmod -1 for DECODING, which
+// does not need it, and that coarser type was all the boundary carried. So
+// an element modifier changed while the stream was stopped
+// (`numeric(10,2)[]` → `(10,4)[]`, `timestamp(0)[]` → `(6)[]`) could not be
+// seen at the table's first boundary, and the target kept rounding every
+// element at exit 0 (GC-44 F5 third review; the mid-stream case refuses at
+// the TYPMOD-PROJECTION-GATE, which compares the decode types).
+//
+// The element is resolved exactly as the schema reader resolves it (the
+// column typmod threaded onto the element, Bug 195), which
+// TestNormalizeForCDCComparison_PG_SeedAgreesWithBoundaryProjection pins
+// raw, family by family. Only the boundary's IR changes: the relation
+// cache's decode type, the TYPMOD gate and the normalizer's comparison form
+// (which still erases element modifiers on both sides of ClassifyShape) do
+// not.
+func projectArrayElementModifier(c relationColumn) ir.Type {
+	oid, typmod := c.OID, c.TypeMod
+	if c.StorageOID != 0 {
+		oid, typmod = c.StorageOID, c.StorageTypeMod
+	}
+	arr, ok := c.Type.(ir.Array)
+	if !ok || typmod < 0 {
+		return c.Type
+	}
+	elemOID, ok := pgArrayElementOID[oid]
+	if !ok {
+		return c.Type
+	}
+	elem, err := oidToType(elemOID, typmod)
+	if err != nil {
+		return c.Type
+	}
+	arr.Element = elem
+	return arr
 }
 
 // oidToType maps a Postgres data-type OID (as carried in

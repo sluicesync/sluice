@@ -481,6 +481,9 @@ func (s *Streamer) coldStartMultiDatabase(
 	// GC-32: a cold start re-baselines the unforwarded-schema-change door
 	// (see the single-stream cold-start site).
 	s.unforwardedBaselineFrom = nil
+	// GC-44 F5 third review: the same raw, namespace-stamped shapes are the
+	// unforwarded-stream check's prior for each table's first boundary.
+	s.unforwardedColdStartPrior = synthesizeColdStartSeedSnapshots(&ir.Schema{Tables: readerSeed}, s.Source)
 	if err := s.wireReaderSchemaSeedFrom(ctx, stream.Changes, staticSchemaSeed(readerSeed)); err != nil {
 		closeStream()
 		return nil, stop, migcore.WrapWithHint(migcore.PhaseCDC, err)

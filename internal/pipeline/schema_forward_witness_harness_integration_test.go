@@ -299,7 +299,7 @@ const (
 	refuseLogMatch       = "schema change check: boundary matches the target"
 	refuseLogUnwitnessed = "the target cannot witness this table's schema boundary"
 	refuseLogTargetOnly  = "the target holds columns the source does not have"
-	refuseLogAhead       = "the target already holds a wider column than the source sends"
+	refuseLogAhead       = "schema change check: the target column is wider than the source's"
 )
 
 // logLinesFor returns the captured lines carrying marker whose table

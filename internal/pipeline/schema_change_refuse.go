@@ -42,9 +42,24 @@ package pipeline
 //     a transaction that wrote rows, altered the table and wrote again
 //     re-delivers its pre-ALTER relation first, against a target that
 //     already took the change;
-//   - a column only the target has is a WARN, as on the forward path;
+//   - …except where the table's prior shape proves the SOURCE NARROWED the
+//     column ([sourceNarrowed]; GC-44 F5 third review): its own ALTER
+//     converted the rows it stores and the target's copies were never
+//     converted, so that refuses. The prior is this intercept's last
+//     accepted boundary, else the retained history version, never the
+//     cold-start read, and never for a possible replay — a boundary showing
+//     a shape the stream already recorded, or one proven to lie before the
+//     prior ([acceptedBoundary.evidenceFor]);
+//   - a column only the target has refuses where that prior shows the
+//     source had it — the source's DROP COLUMN, which leaves the target
+//     holding values the source no longer has (one dropped and one added
+//     together are reported as the likely RENAME COLUMN) — and a column
+//     the source replaced under the same name refuses ([replacedColumns]);
+//   - a column only the target has, with no such prior, is a WARN, as on
+//     the forward path;
 //   - a --type-override column, whose type the lens does not compare, is
-//     judged on width alone ([overriddenColumnRefused]).
+//     judged on width alone ([overriddenColumnRefused]) and on a proven
+//     source narrowing.
 //
 // A refusal carries [ir.ErrSchemaChangeRefused] (SCHEMA-CHANGE-REFUSED) and
 // stops the stream BEFORE the boundary goes downstream, so no history row
@@ -60,9 +75,12 @@ package pipeline
 // # Durability: none needed
 //
 // Nothing is persisted. The check is a pure function of the source's current
-// table shape and the target's catalog, and both survive a restart, so the
+// table shape, the target's catalog and the stream's retained history (which
+// never records a refused boundary), and all three survive a restart, so the
 // next start refuses again — at the replayed DDL boundary, or at the first
-// touch — until the target holds what the source sends. The
+// touch — until the target holds what the source sends. (The narrowing
+// rule's history half is position-free on Postgres, whose history keeps one
+// shape per table: GC-44 F23.) The
 // UNFORWARDED-SCHEMA-CHANGE door persists its refusal because ITS evidence
 // is a source-side baseline a restart would retake; this one's evidence is
 // the target, which a restart does not move. So there is nothing to
@@ -92,6 +110,7 @@ import (
 	"fmt"
 	"log/slog"
 	"reflect"
+	"strings"
 	"sync/atomic"
 
 	"sluicesync.dev/sluice/internal/ir"
@@ -126,7 +145,32 @@ type unforwardedBoundaryDeps struct {
 	// (the forward intercept never engages under --inject-shard-column), so
 	// the hint does not offer them a flag that changes nothing.
 	forwardRemedy bool
+
+	// coldStart is the RAW source shape of every table a cold start read
+	// before this wiring ([Streamer.unforwardedColdStartPrior]; nil after a
+	// warm resume). It is a table's prior for its first boundary when the
+	// intercept has none of its own and the history has none — consulted
+	// for an overridden column's "unchanged since" test only: its fidelity
+	// differs from the change stream's (ADR-0091 §3), so it never judges a
+	// narrowing, a returning column, or the unwitnessed fallback.
+	coldStart []ir.SchemaSnapshot
+
+	// orderer is the source engine's position order, which tells a
+	// replayed boundary from a new one ([provenBefore]). nil: unknown, and
+	// the narrowing rules then apply.
+	orderer ir.PositionOrderer
 }
+
+// priorOrigin says where a table's prior shape came from, which decides
+// what it may be used for ([acceptedBoundary.judges]).
+type priorOrigin int
+
+const (
+	priorNone      priorOrigin = iota
+	priorIntercept             // this intercept's own last accepted boundary
+	priorHistory               // the stream's retained ADR-0049 version
+	priorColdStart             // the cold start's raw source read
+)
 
 // interceptSchemaChangeRefuse wraps the change channel of a stream that
 // forwards no source DDL (see the file comment). Every ir.SchemaSnapshot is
@@ -140,10 +184,12 @@ func interceptSchemaChangeRefuse(
 	errStore *atomic.Pointer[error],
 ) <-chan ir.Change {
 	out := make(chan ir.Change)
+	coldStart := newColdStartPriors(deps.coldStart)
 	go func() {
 		defer close(out)
 		// accepted holds each table's last ACCEPTED boundary — the prior
-		// shape for the unwitnessed fallback and for an overridden column.
+		// shape for the unwitnessed fallback, the narrowing, dropped- and
+		// replaced-column rules, and an overridden column.
 		accepted := map[string]acceptedBoundary{}
 		for {
 			select {
@@ -160,13 +206,21 @@ func interceptSchemaChangeRefuse(
 				}
 				key := snap.QualifiedName()
 				post := normalizeSnapshotForComparison(deps.normalizer, snap.IR)
-				if err := judgeUnforwardedBoundary(ctx, deps, key, accepted[key], post, snap); err != nil {
+				last := accepted[key]
+				if last.raw == nil {
+					last = coldStart.lookup(key, snap.Table)
+				}
+				prior, err := judgeUnforwardedBoundary(ctx, deps, key, last, post, snap)
+				if err != nil {
 					slog.ErrorContext(ctx, "schema change refused", "table", key, "error", err)
 					wrapped := fmt.Errorf("pipeline: schema change on a stream that does not forward DDL: %w", err)
 					errStore.Store(&wrapped)
 					return
 				}
-				accepted[key] = acceptedBoundary{compared: post, raw: snap.IR}
+				accepted[key] = acceptedBoundary{
+					compared: post, raw: snap.IR, position: snap.Position, origin: priorIntercept,
+					recorded: withRecorded(prior.recorded, snap.IR),
+				}
 				if !forwardChange(ctx, out, c) {
 					return
 				}
@@ -178,34 +232,87 @@ func interceptSchemaChangeRefuse(
 	return out
 }
 
-// acceptedBoundary is a table's last boundary this intercept passed on, in
-// both forms: compared (through the source engine's comparison lens, for
-// [ClassifyShape]) and raw (the snapshot's own IR, for rendering as target
-// storage the way the current boundary is).
+// acceptedBoundary is a table's prior shape, in both forms: compared
+// (through the source engine's comparison lens, for [ClassifyShape]) and
+// raw (the snapshot's own IR, for rendering as target storage the way the
+// current boundary is), with where it came from and the position from which
+// it held (zero when unknown).
 type acceptedBoundary struct {
 	compared *ir.Table
 	raw      *ir.Table
+	position ir.Position
+	origin   priorOrigin
+
+	// recorded are the shapes the stream has already seen for the table —
+	// every retained history version, then every boundary this intercept
+	// accepted. A boundary showing one of them may be a replay
+	// ([isReplayOf]) and is never evidence of a narrowing.
+	recorded []*ir.Table
 }
 
-// priorFor returns the table's last accepted shape: this intercept's own,
-// else the stream's retained ADR-0049 version at the persisted position —
-// a boundary a refusal stopped was never recorded, so after a restart the
+// evidenceFor reports whether this prior may judge a CHANGE the boundary
+// post at pos shows — a narrowing, or the unwitnessed fallback's structural
+// change: it [acceptedBoundary.judges] the boundary, and post is not a
+// shape the stream already recorded (a replay re-delivers only those; on a
+// Postgres source, whose boundaries are anchored at LSN 0/0, that is the
+// only replay test there is).
+func (p acceptedBoundary) evidenceFor(orderer ir.PositionOrderer, pos ir.Position, post *ir.Table) bool {
+	return p.judges(orderer, pos) && !recordedShape(p.recorded, post)
+}
+
+// withRecorded returns recorded with post appended unless it is already
+// there.
+func withRecorded(recorded []*ir.Table, post *ir.Table) []*ir.Table {
+	if post == nil || recordedShape(recorded, post) {
+		return recorded
+	}
+	return append(append([]*ir.Table(nil), recorded...), post)
+}
+
+// judges reports whether this prior may stand as the shape the source held
+// IMMEDIATELY before a boundary at pos — the evidence the narrowing and
+// returning-column rules act on, and the unwitnessed fallback's baseline.
+// Not a cold-start read (its fidelity differs from the change stream's,
+// ADR-0091 §3), and not when the boundary is PROVEN to lie before the
+// prior's own position: that is a replay (a Postgres transaction
+// re-delivered from its start, pre-ALTER relation first), whose shape
+// predates the prior and says nothing about what the source did since
+// ([firstBoundaryWitness.historyPriorAt] has the full argument).
+func (p acceptedBoundary) judges(orderer ir.PositionOrderer, pos ir.Position) bool {
+	switch p.origin {
+	case priorIntercept, priorHistory:
+		return !provenBefore(orderer, pos, p.position)
+	}
+	return false
+}
+
+// priorFor returns the table's prior shape: this intercept's own last
+// accepted boundary (or the cold-start read the caller substituted), else
+// the stream's retained ADR-0049 version at the persisted position — a
+// boundary a refusal stopped was never recorded, so after a restart the
 // history still holds the shape before it. The zero value when there is
-// neither.
+// neither. An intercept-own prior always wins; a history version wins over
+// the cold-start read (it is CDC-fidelity, the cold start's is not).
 func priorFor(deps unforwardedBoundaryDeps, w *firstBoundaryWitness, last acceptedBoundary, table string) acceptedBoundary {
-	if last.raw != nil || w == nil {
+	if last.origin == priorIntercept || w == nil {
 		return last
 	}
 	if hist := w.historyFor(table); hist != nil {
-		return acceptedBoundary{compared: normalizeSnapshotForComparison(deps.normalizer, hist), raw: hist}
+		r := w.retained[hist]
+		return acceptedBoundary{
+			compared: normalizeSnapshotForComparison(deps.normalizer, hist), raw: hist,
+			position: r.anchor, origin: priorHistory,
+			recorded: append([]*ir.Table{hist}, r.recorded...),
+		}
 	}
 	return last
 }
 
-// judgeUnforwardedBoundary decides one boundary: nil to pass it on, or the
-// refusal. last is the table's last accepted boundary on this intercept
-// (zero for its first), post the comparison-form snapshot table and snap
-// the raw snapshot.
+// judgeUnforwardedBoundary decides one boundary: a nil error to pass it on,
+// or the refusal. last is the table's last accepted boundary on this
+// intercept (or its cold-start read; zero when neither), post the
+// comparison-form snapshot table and snap the raw snapshot. It returns the
+// prior it judged against, whose recorded shapes the caller carries on.
 func judgeUnforwardedBoundary(
 	ctx context.Context,
 	deps unforwardedBoundaryDeps,
@@ -213,61 +320,166 @@ func judgeUnforwardedBoundary(
 	last acceptedBoundary,
 	post *ir.Table,
 	snap ir.SchemaSnapshot,
-) error {
+) (acceptedBoundary, error) {
 	var w *firstBoundaryWitness
 	if deps.witnessFor != nil {
 		w = deps.witnessFor(snap.Schema)
 	}
 	prior := priorFor(deps, w, last, snap.Table)
+	judges := prior.judges(deps.orderer, snap.Position)
+	changed := prior.evidenceFor(deps.orderer, snap.Position, snap.IR)
 	reason := "the stream has no target witness"
 	if w != nil {
-		j, err := w.judgeUnforwarded(ctx, snap.IR, prior.raw)
+		evidence := unforwardedPrior{raw: prior.raw, judges: changed}
+		if judges {
+			evidence.returned = replacedColumns(prior.raw, snap.IR)
+		}
+		j, err := w.judgeUnforwarded(ctx, snap.IR, evidence)
 		if err == nil && len(j.refused) > 0 && snap.IR != nil {
 			// The verdict re-reads a disagreeing table once per intercept;
 			// on a long-lived stream the operator may have ALTERed the target
 			// again since (the drained model, applied while this stream ran),
 			// so read it again before refusing.
 			w.catalog.forget(snap.IR.Name)
-			j, err = w.judgeUnforwarded(ctx, snap.IR, prior.raw)
+			j, err = w.judgeUnforwarded(ctx, snap.IR, evidence)
 		}
 		if err != nil {
 			// Not the marker: nothing has been compared, and a fresh run may
 			// read the catalog fine.
-			return fmt.Errorf("read the target catalog to check the schema boundary for %q "+
+			return prior, fmt.Errorf("read the target catalog to check the schema boundary for %q "+
 				"(the boundary is not accepted unchecked): %w", tableName, err)
 		}
 		if j.reason == "" {
-			return j.settle(ctx, tableName, deps)
+			return prior, j.settle(ctx, tableName, deps)
 		}
 		reason = j.reason
 	}
 	// The target cannot speak for this table: fall back to its last accepted
 	// shape, which shares the change stream's projection — this intercept's
 	// own, or the retained history version, so a refusal here repeats on the
-	// next start as long as the stream has one.
-	if prior.compared == nil {
+	// next start as long as the stream has one. Never the cold-start read
+	// (its fidelity differs, so it would refuse a phantom), and never for a
+	// possible replay (it would refuse the replay of a change the stream
+	// already took).
+	switch {
+	case prior.compared == nil || prior.origin == priorColdStart:
 		slog.WarnContext(ctx,
 			"schema change check: the target cannot witness this table's schema boundary and the stream holds "+
 				"no earlier shape for it; accepting it — a change made to the source while the stream was "+
 				"stopped is NOT checked for this table",
 			"table", tableName, "reason", reason)
-		return nil
+		return prior, nil
+	case !changed:
+		slog.DebugContext(ctx, "schema change check: an unwitnessed boundary shows a shape the stream already "+
+			"recorded (or a replay); nothing to judge", "table", tableName)
+		return prior, nil
 	}
 	shape, err := ClassifyShape(prior.compared, post)
 	if err == nil && shape.Kind == ShapeKindNone {
-		return nil
+		return prior, nil
 	}
 	what := shape.Kind.String()
 	if err != nil {
 		what = err.Error()
 	}
-	return fmt.Errorf(
+	return prior, fmt.Errorf(
 		"%w: the source changed %q (%s; the target cannot be read to compare: %s) and this stream does not "+
 			"forward schema changes (%s). Refusing before the boundary is recorded or any row after it is "+
 			"applied.%s %s",
 		ir.ErrSchemaChangeRefused, tableName, what, reason, deps.why,
 		renderDriftForRefusal(prior.compared, post), unforwardedRecoveryHint(tableName, deps.forwardRemedy, false),
 	)
+}
+
+// unforwardedPrior is what the judgement knows about the table's prior
+// shape. raw (nil when there is none) is consulted for an overridden
+// column's "unchanged since" test whatever its origin; the narrowing and
+// dropped-column rules apply only when judges is set
+// ([acceptedBoundary.evidenceFor]).
+type unforwardedPrior struct {
+	raw    *ir.Table
+	judges bool
+	// returned are columns the snapshot carries under a name the prior had,
+	// but which the source replaced ([replacedColumns]).
+	returned map[string]bool
+}
+
+// replacedColumns are the columns of post that the source REPLACED since
+// prior: the same name, a different non-zero stable column id
+// (pg_attribute.attnum) — a DROP + ADD of the same name and type, or a
+// same-type swap through renames, inside one relation message, which a
+// name-and-type comparison cannot see. The target kept the old column with
+// its OLD values, which the source no longer holds (GC-44 F5 third review).
+//
+// A DROP and a later ADD of the same name seen as two boundaries needs no
+// rule of its own: the DROP refuses while the target still holds the column
+// ([judgeUnforwardedColumns]), and once the target has dropped it too the
+// ADD refuses as a column the target lacks.
+//
+// In-process evidence only: a history version carries no stable ids (they
+// are not persisted), so the same replacement across a restart is not seen,
+// and the Postgres reader emits no boundary at all for a replacement that
+// leaves every name and type in place (GC-44 F22).
+func replacedColumns(prior, post *ir.Table) map[string]bool {
+	if post == nil || prior == nil {
+		return nil
+	}
+	priorCols := columnsByNameIR(prior)
+	var out map[string]bool
+	for _, c := range post.Columns {
+		if c == nil {
+			continue
+		}
+		if pc, ok := priorCols[c.Name]; ok && pc.StableID != 0 && c.StableID != 0 && pc.StableID != c.StableID {
+			if out == nil {
+				out = map[string]bool{}
+			}
+			out[c.Name] = true
+		}
+	}
+	return out
+}
+
+// coldStartPriors indexes the cold-start read ([unforwardedBoundaryDeps.coldStart])
+// by qualified name, with a bare-name fallback for a MySQL source whose
+// schema reader leaves Table.Schema empty while its change stream names the
+// database (the Bug 83 seed key shape, [lookupSeedCache]) — used only when
+// exactly one table carries that bare name.
+type coldStartPriors struct {
+	byKey  map[string]*ir.Table
+	byName map[string]*ir.Table
+}
+
+func newColdStartPriors(seed []ir.SchemaSnapshot) coldStartPriors {
+	p := coldStartPriors{byKey: map[string]*ir.Table{}, byName: map[string]*ir.Table{}}
+	ambiguous := map[string]bool{}
+	for _, s := range seed {
+		if s.IR == nil {
+			continue
+		}
+		p.byKey[s.QualifiedName()] = s.IR
+		if _, seen := p.byName[s.Table]; seen {
+			ambiguous[s.Table] = true
+		}
+		p.byName[s.Table] = s.IR
+	}
+	for name := range ambiguous {
+		delete(p.byName, name)
+	}
+	return p
+}
+
+// lookup returns the cold-start prior for a boundary on key / table, or the
+// zero value.
+func (p coldStartPriors) lookup(key, table string) acceptedBoundary {
+	t, ok := p.byKey[key]
+	if !ok {
+		t, ok = p.byName[table]
+	}
+	if !ok {
+		return acceptedBoundary{}
+	}
+	return acceptedBoundary{compared: t, raw: t, origin: priorColdStart}
 }
 
 // unforwardedJudgement is a boundary judged against the target, column by
@@ -282,8 +494,21 @@ type unforwardedJudgement struct {
 	// added says one of the refused columns is a source column the target
 	// lacks — the remedy is an ADD COLUMN, which the hint qualifies.
 	added bool
-	// ahead are type differences the target's type holds — the drained
-	// model applied on the target before the source.
+	// addedCols / droppedCols name the source columns the target lacks and
+	// the columns the source dropped while the target kept them; one of
+	// each is reported as the likely RENAME COLUMN it usually is.
+	addedCols   []string
+	droppedCols []string
+	// narrowed says one of the refused columns is one the source NARROWED
+	// while the target kept the wider type ([sourceNarrowed]).
+	narrowed bool
+	// returned says one of the refused columns is one the source replaced
+	// under the same name ([replacedColumns]).
+	returned bool
+	// ahead are type differences the target's type holds and no evidence
+	// says the source narrowed — the drained model applied on the target
+	// before the source, a replayed pre-ALTER shape, or a narrowing the
+	// stream has no earlier shape to recognise.
 	ahead []witnessColumnDiff
 	// targetOnly are the target's columns the source lacks.
 	targetOnly []string
@@ -296,10 +521,12 @@ type unforwardedJudgement struct {
 // whatever the verdict says: the forward verdict answers "what can be
 // forwarded", and it does not compare an overridden column's type at all,
 // while a stream that forwards nothing asks every column "can the target
-// hold what the source sends". prior is the table's last accepted RAW shape
-// (nil when there is none), consulted for an overridden column only.
-func (w *firstBoundaryWitness) judgeUnforwarded(ctx context.Context, post, prior *ir.Table) (unforwardedJudgement, error) {
-	v, err := w.verdict(ctx, post)
+// hold what the source sends". prior is what is known of the table's prior
+// shape ([unforwardedPrior]).
+func (w *firstBoundaryWitness) judgeUnforwarded(ctx context.Context, post *ir.Table, prior unforwardedPrior) (unforwardedJudgement, error) {
+	// No position: the verdict here only says whether the target can
+	// witness the table; the narrowing evidence is prior's.
+	v, err := w.verdict(ctx, post, ir.Position{})
 	if err != nil {
 		return unforwardedJudgement{}, err
 	}
@@ -317,13 +544,21 @@ func (w *firstBoundaryWitness) judgeUnforwarded(ctx context.Context, post, prior
 	if err != nil {
 		return unforwardedJudgement{}, err
 	}
-	var priorExpected *ir.Table
-	if prior != nil {
-		if priorExpected, err = w.expected(prior); err != nil {
+	judged := judgedPrior{judges: prior.judges, returned: prior.returned}
+	if prior.raw != nil {
+		if judged.expected, err = w.expected(prior.raw); err != nil {
 			return unforwardedJudgement{}, err
 		}
 	}
-	return judgeUnforwardedColumns(expected, target, w.options(post), priorExpected), nil
+	return judgeUnforwardedColumns(expected, target, w.options(post), judged), nil
+}
+
+// judgedPrior is [unforwardedPrior] with the prior shape rendered as target
+// storage, the form [judgeUnforwardedColumns] compares.
+type judgedPrior struct {
+	expected *ir.Table
+	judges   bool
+	returned map[string]bool
 }
 
 // judgeUnforwardedColumns is the pure judgement: expected (the snapshot
@@ -338,22 +573,40 @@ func (w *firstBoundaryWitness) judgeUnforwarded(ctx context.Context, post, prior
 //     across families, a sign or zone-kind change, a decimal wider on one
 //     axis and narrower on the other, and the session-zone sibling swap all
 //     refuse;
-//   - a column only the target has is noted;
+//   - a target WIDER than the source refuses after all when the prior
+//     proves the source NARROWED the column ([sourceNarrowed]): its own
+//     ALTER converted the rows it stores, the target's copies of them were
+//     never converted, and the two now differ at exit 0 (GC-44 F5 third
+//     review — a live `numeric(14,4)` → `numeric(12,2)` rounded the source
+//     and the target kept `1.2345`). Without that proof — no prior, a
+//     cold-start read, a replay — it passes with a WARN as before;
+//   - a column only the target has refuses where the prior shows the
+//     source had it (the source's DROP COLUMN; with an added column beside
+//     it, the likely RENAME COLUMN — [unforwardedJudgement.shapeNote]), and
+//     is noted otherwise;
+//   - a column the source replaced under the same name ([replacedColumns])
+//     refuses: the target kept the old column and its old values;
 //   - an OVERRIDDEN column ([overriddenColumnRefused]) is judged on width
-//     alone, because the lens does not compare its type at all.
-//
-// priorExpected is the table's last accepted shape rendered the same way
-// (nil when there is none).
-func judgeUnforwardedColumns(expected, target *ir.Table, opts witnessOptions, priorExpected *ir.Table) unforwardedJudgement {
+//     alone, because the lens does not compare its type at all, and refuses
+//     a proven source narrowing too.
+func judgeUnforwardedColumns(expected, target *ir.Table, opts witnessOptions, prior judgedPrior) unforwardedJudgement {
 	exp := witnessCompareTable(expected, nil)
 	act := witnessCompareTable(target, exp)
-	// The lens equates an overridden column's types; keep the source's own
-	// compared type first, so its width can still be judged below.
-	pinnedSource := map[string]ir.Type{}
+	// Each column's compared source type, kept before the lens equates an
+	// overridden column's types, so its width can still be judged below.
+	sourceType := map[string]ir.Type{}
 	for _, c := range exp.Columns {
-		if opts.pinned[c.Name] {
-			pinnedSource[c.Name] = c.Type
+		sourceType[c.Name] = c.Type
+	}
+	priorCols := priorColumns(prior.expected)
+	// narrowedFrom is the type a judging prior says the source held before
+	// it narrowed column (nil, false when no evidence says so).
+	narrowedFrom := func(column string) (ir.Type, bool) {
+		pc, ok := priorCols[column]
+		if !prior.judges || !ok || !sourceNarrowed(pc.Type, sourceType[column]) {
+			return nil, false
 		}
+		return pc.Type, true
 	}
 	reconcilePairs(exp, act, opts)
 	mismatches := irdiff.TableColumnShapeWithOptions(exp, act, irdiff.ShapeCompareOptions{ColumnTypesOnly: true})
@@ -367,13 +620,34 @@ func judgeUnforwardedColumns(expected, target *ir.Table, opts witnessOptions, pr
 		case inExp && !inAct:
 			j.refused = append(j.refused, d)
 			j.added = true
+			j.addedCols = append(j.addedCols, m.Column)
 		case !inExp && inAct:
+			// A column only the target has is the drained model run ahead
+			// (dropped on the target first) or an unforwarded DROP. Where a
+			// prior that judges this boundary shows the SOURCE still had the
+			// column, it is the source's DROP COLUMN — the target keeps the
+			// column with values the source no longer holds, and a refuse-mode
+			// stream refused it before GC-44 F5's reader-gate relaxation
+			// (the drained-model recovery pin, drop-column/refuse); refuse it
+			// here. With no such prior it stays the WARN.
+			if _, had := priorCols[m.Column]; had && prior.judges {
+				d.source = "(dropped on the source)"
+				j.refused = append(j.refused, d)
+				j.droppedCols = append(j.droppedCols, m.Column)
+				break
+			}
 			j.targetOnly = append(j.targetOnly, m.Column)
 		case sessionZoneSiblingSwap(a.Type, e.Type):
 			j.refused = append(j.refused, d)
 		default:
 			switch witnessWidthOrder(a.Type, e.Type) {
 			case targetWider:
+				if from, ok := narrowedFrom(m.Column); ok {
+					d.source = fmt.Sprintf("%s (narrowed from %s)", d.source, from)
+					j.refused = append(j.refused, d)
+					j.narrowed = true
+					break
+				}
 				j.ahead = append(j.ahead, d)
 			case sameWidth:
 				// Two spellings of one storage: nothing differs.
@@ -382,24 +656,43 @@ func judgeUnforwardedColumns(expected, target *ir.Table, opts witnessOptions, pr
 			}
 		}
 	}
-	var priorCols map[string]*ir.Column
-	if priorExpected != nil {
-		priorCols = columnsByNameIR(witnessCompareTable(priorExpected, nil))
-	}
-	for name, source := range pinnedSource {
-		a, held := actCols[name]
+	for _, c := range exp.Columns {
+		if !opts.pinned[c.Name] {
+			continue
+		}
+		a, held := actCols[c.Name]
 		if !held {
 			continue // judged above as a column the target lacks
 		}
-		var prior ir.Type
-		if pc, ok := priorCols[name]; ok {
-			prior = pc.Type
+		source := sourceType[c.Name]
+		var priorType ir.Type
+		if pc, ok := priorCols[c.Name]; ok {
+			priorType = pc.Type
 		}
-		if overriddenColumnRefused(a.Type, source, prior) {
+		from, narrowed := narrowedFrom(c.Name)
+		switch {
+		case overriddenColumnRefused(a.Type, source, priorType):
 			j.refused = append(j.refused, witnessColumnDiff{
-				column: name, source: source.String(), target: a.Type.String() + " (--type-override)",
+				column: c.Name, source: source.String(), target: a.Type.String() + " (--type-override)",
 			})
+		case narrowed:
+			j.refused = append(j.refused, witnessColumnDiff{
+				column: c.Name, source: fmt.Sprintf("%s (narrowed from %s)", source, from),
+				target: a.Type.String() + " (--type-override)",
+			})
+			j.narrowed = true
 		}
+	}
+	for _, c := range exp.Columns {
+		a, held := actCols[c.Name]
+		if !prior.returned[c.Name] || !held {
+			continue // a column the target lacks is judged above
+		}
+		j.refused = append(j.refused, witnessColumnDiff{
+			column: c.Name, source: sourceType[c.Name].String() + " (replaced on the source under the same name)",
+			target: a.Type.String() + " (the column the target kept, with its old values)",
+		})
+		j.returned = true
 	}
 	return j
 }
@@ -437,18 +730,21 @@ func (j unforwardedJudgement) settle(ctx context.Context, tableName string, deps
 	if len(j.refused) > 0 {
 		return fmt.Errorf(
 			"%w: the source table %q no longer matches the target, and this stream does not forward schema "+
-				"changes (%s); the target cannot hold what the source now sends (%s), so applying the rows "+
+				"changes (%s); the target cannot hold what the source now sends (%s)%s, so applying the rows "+
 				"after this boundary would change or drop their values. Refusing before the boundary is "+
 				"recorded or any row after it is applied; nothing has been written. %s",
-			ir.ErrSchemaChangeRefused, tableName, deps.why, renderWitnessDiffs(j.refused),
-			unforwardedRecoveryHint(tableName, deps.forwardRemedy, j.added),
+			ir.ErrSchemaChangeRefused, tableName, deps.why, renderWitnessDiffs(j.refused), j.shapeNote(),
+			unforwardedRecoveryHint(tableName, deps.forwardRemedy, j.added)+j.remedyNotes(),
 		)
 	}
 	if len(j.ahead) > 0 {
 		slog.WarnContext(ctx,
-			"schema change check: the target already holds a wider column than the source sends "+
-				"(applied ahead of the source — the drained model — or a replayed pre-ALTER shape); "+
-				"every value fits, accepting the boundary",
+			"schema change check: the target column is wider than the source's; every value the source sends "+
+				"from here fits, so the boundary is accepted. This is the drained model (the target changed "+
+				"ahead of the source) or a replayed pre-ALTER shape — OR a source narrowing this check has no "+
+				"earlier shape to recognise, in which case the rows the target already holds kept the values "+
+				"the source's own ALTER converted: compare them, and narrow the target or re-copy the table if "+
+				"the source did narrow it",
 			"table", tableName, "difference", renderWitnessDiffs(j.ahead))
 	}
 	if len(j.targetOnly) > 0 {
@@ -464,6 +760,39 @@ func (j unforwardedJudgement) settle(ctx context.Context, tableName string, deps
 	return nil
 }
 
+// shapeNote names the source DDL a refusal most likely saw, where the
+// column diff alone reads awkwardly: one column dropped and one the target
+// lacks is usually a RENAME COLUMN (indistinguishable from DROP + ADD
+// without a stable column id); a dropped column alone is a DROP COLUMN.
+func (j unforwardedJudgement) shapeNote() string {
+	switch {
+	case len(j.droppedCols) == 1 && len(j.addedCols) == 1:
+		return fmt.Sprintf(" — likely RENAME COLUMN %s → %s (or DROP COLUMN %s plus ADD COLUMN %s)",
+			j.droppedCols[0], j.addedCols[0], j.droppedCols[0], j.addedCols[0])
+	case len(j.droppedCols) > 0:
+		return fmt.Sprintf(" — DROP COLUMN %s on the source; the target still holds the column, with values the "+
+			"source no longer has", strings.Join(j.droppedCols, ", "))
+	}
+	return ""
+}
+
+// remedyNotes qualifies the remedy for the refusal classes whose "apply the
+// same change on the target" is not the whole story.
+func (j unforwardedJudgement) remedyNotes() string {
+	var notes string
+	if j.narrowed {
+		notes += " A column the source NARROWED: its own ALTER converted the values it stores (rounded, " +
+			"truncated or relabelled them), and the rows the target already holds were never converted — " +
+			"narrow the target column the same way (or re-copy the table) before restarting."
+	}
+	if j.returned {
+		notes += " A column the source replaced under the same name (dropped and added back, or swapped through " +
+			"renames): the target still holds the OLD column and its old values — drop and re-add it on the target, and copy the " +
+			"source's values into it, before restarting."
+	}
+	return notes
+}
+
 // renderWitnessDiffs lists column disagreements for a log line or refusal.
 func renderWitnessDiffs(diffs []witnessColumnDiff) string {
 	return witnessVerdict{diffs: diffs}.render()
@@ -477,9 +806,9 @@ func renderWitnessDiffs(diffs []witnessColumnDiff) string {
 // not followed by any backfill from this stream.
 func unforwardedRecoveryHint(tableName string, forwardRemedy, added bool) string {
 	hint := fmt.Sprintf(
-		"recovery: apply the same change to %q on the target (run 'sluice sync stop --wait' first if the "+
-			"stream is not already stopped), then re-run 'sluice sync start' with the SAME --stream-id; "+
-			"every start compares the target again, so nothing needs acknowledging.",
+		"Drained-model recovery: apply the same change to %q on the target (run 'sluice sync stop --wait' "+
+			"first if the stream is not already stopped), then re-run 'sluice sync start' with the SAME "+
+			"--stream-id; every start compares the target again, so nothing needs acknowledging.",
 		tableName,
 	)
 	if added {
@@ -540,6 +869,8 @@ func (s *Streamer) unforwardedBoundaryWitnesses(single *firstBoundaryWitness) fu
 				return s.readNamespaceTargetCatalog(ctx, namespace, deriver)
 			}, nil),
 			history:      history[namespace],
+			retained:     single.retained,
+			orderer:      single.orderer,
 			sourceEngine: single.sourceEngine,
 			targetEngine: single.targetEngine,
 			mappings:     single.mappings,

@@ -190,12 +190,22 @@ type RetainedSchemaVersion struct {
 //     pipeline's existing ADR-0022 path turns into a loud cold-start
 //     re-snapshot. Never a silent mis-decode.
 func ResolveSchemaVersion(orderer PositionOrderer, versions []RetainedSchemaVersion, p Position) (*Table, error) {
+	t, _, err := ResolveSchemaVersionAnchored(orderer, versions, p)
+	return t, err
+}
+
+// ResolveSchemaVersionAnchored is [ResolveSchemaVersion] that also returns
+// the selected version's anchor — the position from which the returned
+// shape held. A consumer comparing a later boundary with the resolved shape
+// needs it to tell a boundary AFTER that shape from a replayed one BEFORE it
+// (pipeline: the GC-44 narrowing rules, [firstBoundaryWitness.historyPriorAt]).
+func ResolveSchemaVersionAnchored(orderer PositionOrderer, versions []RetainedSchemaVersion, p Position) (*Table, Position, error) {
 	if orderer == nil {
-		return nil, errors.New("ir: schema-history resolve: engine does not implement PositionOrderer; " +
+		return nil, Position{}, errors.New("ir: schema-history resolve: engine does not implement PositionOrderer; " +
 			"position ordering is required and there is no safe fallback (loud-failure tenet)")
 	}
 	if len(versions) == 0 {
-		return nil, fmt.Errorf("ir: schema-history resolve: no retained schema version for position %+v "+
+		return nil, Position{}, fmt.Errorf("ir: schema-history resolve: no retained schema version for position %+v "+
 			"(below the retention floor / before the first boundary): %w", p, ErrPositionInvalid)
 	}
 
@@ -203,7 +213,7 @@ func ResolveSchemaVersion(orderer PositionOrderer, versions []RetainedSchemaVers
 	for i := range versions {
 		atOrAfter, err := orderer.PositionAtOrAfter(p, versions[i].Anchor)
 		if err != nil {
-			return nil, fmt.Errorf("ir: schema-history resolve: ordering p vs anchor %+v: %w",
+			return nil, Position{}, fmt.Errorf("ir: schema-history resolve: ordering p vs anchor %+v: %w",
 				versions[i].Anchor, err)
 		}
 		if !atOrAfter {
@@ -221,12 +231,12 @@ func ResolveSchemaVersion(orderer PositionOrderer, versions []RetainedSchemaVers
 		// — loud, never a guess.
 		cAfterB, err := orderer.PositionAtOrAfter(versions[i].Anchor, versions[bestIdx].Anchor)
 		if err != nil {
-			return nil, fmt.Errorf("ir: schema-history resolve: ordering anchor %+v vs anchor %+v: %w",
+			return nil, Position{}, fmt.Errorf("ir: schema-history resolve: ordering anchor %+v vs anchor %+v: %w",
 				versions[i].Anchor, versions[bestIdx].Anchor, err)
 		}
 		bAfterC, err := orderer.PositionAtOrAfter(versions[bestIdx].Anchor, versions[i].Anchor)
 		if err != nil {
-			return nil, fmt.Errorf("ir: schema-history resolve: ordering anchor %+v vs anchor %+v: %w",
+			return nil, Position{}, fmt.Errorf("ir: schema-history resolve: ordering anchor %+v vs anchor %+v: %w",
 				versions[bestIdx].Anchor, versions[i].Anchor, err)
 		}
 		switch {
@@ -259,11 +269,11 @@ func ResolveSchemaVersion(orderer PositionOrderer, versions []RetainedSchemaVers
 			// every restart, forcing a wasteful full re-snapshot each time.
 			same, serr := sameSchemaVersion(versions[i].TableJSON, versions[bestIdx].TableJSON)
 			if serr != nil {
-				return nil, fmt.Errorf("ir: schema-history resolve: compare incomparable-anchor "+
+				return nil, Position{}, fmt.Errorf("ir: schema-history resolve: compare incomparable-anchor "+
 					"schemas (anchors %+v and %+v): %w", versions[bestIdx].Anchor, versions[i].Anchor, serr)
 			}
 			if !same {
-				return nil, fmt.Errorf("ir: schema-history resolve: position %+v has two "+
+				return nil, Position{}, fmt.Errorf("ir: schema-history resolve: position %+v has two "+
 					"incomparable candidate schema versions with DIFFERENT decode contracts "+
 					"(anchors %+v and %+v); cannot pick a single in-effect schema: %w", p,
 					versions[bestIdx].Anchor, versions[i].Anchor, ErrPositionInvalid)
@@ -275,20 +285,20 @@ func ResolveSchemaVersion(orderer PositionOrderer, versions []RetainedSchemaVers
 	}
 
 	if bestIdx == -1 {
-		return nil, fmt.Errorf("ir: schema-history resolve: no retained schema version at or before "+
+		return nil, Position{}, fmt.Errorf("ir: schema-history resolve: no retained schema version at or before "+
 			"position %+v (below the retention floor / before the first boundary): %w", p, ErrPositionInvalid)
 	}
 
 	t, err := UnmarshalTable(versions[bestIdx].TableJSON)
 	if err != nil {
-		return nil, fmt.Errorf("ir: schema-history resolve: decode selected version (anchor %+v): %w",
+		return nil, Position{}, fmt.Errorf("ir: schema-history resolve: decode selected version (anchor %+v): %w",
 			versions[bestIdx].Anchor, err)
 	}
 	if t == nil {
-		return nil, fmt.Errorf("ir: schema-history resolve: selected version (anchor %+v) decoded to a "+
+		return nil, Position{}, fmt.Errorf("ir: schema-history resolve: selected version (anchor %+v) decoded to a "+
 			"nil table (corrupt history row): %w", versions[bestIdx].Anchor, ErrPositionInvalid)
 	}
-	return t, nil
+	return t, versions[bestIdx].Anchor, nil
 }
 
 // sameSchemaVersion reports whether two retained schema-version blobs

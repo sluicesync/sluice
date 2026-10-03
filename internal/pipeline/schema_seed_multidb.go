@@ -121,7 +121,7 @@ func (s *Streamer) loadMultiDatabaseWarmResumeSchemaSeed(
 	selected []string,
 	targetDeriver ir.DatabaseDSNDeriver,
 ) ([]*ir.Table, error) {
-	history, err := loadRetainedSchemaSeed(ctx, applier, s.Source, streamID, persisted)
+	history, anchors, err := loadRetainedSchemaSeed(ctx, applier, s.Source, streamID, persisted)
 	if err != nil {
 		return nil, err
 	}
@@ -147,6 +147,8 @@ func (s *Streamer) loadMultiDatabaseWarmResumeSchemaSeed(
 	// The same versions serve the unforwarded-stream check's prior shape
 	// per namespace (GC-44 F5 review).
 	s.namespaceHistory = historyByNamespace
+	s.firstBoundaryRetained = anchors
+	s.unforwardedColdStartPrior = nil // a warm resume's prior is the history
 
 	var out []*ir.Table
 	for _, namespace := range selected {

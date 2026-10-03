@@ -1192,17 +1192,27 @@ func (s *Streamer) phaseWireInterceptChain(applyCtx context.Context, changes <-c
 	// here rather than on the old unchecked pass-through
 	// (schema_change_refuse.go).
 	if s.boundaryRouter == nil && !forwarding {
+		orderer, _ := s.Source.(ir.PositionOrderer)
 		filtered = interceptSchemaChangeRefuse(applyCtx, filtered, unforwardedBoundaryDeps{
 			witnessFor:    s.unforwardedBoundaryWitnesses(witness),
 			normalizer:    snapshotNormalizer,
 			why:           s.unforwardedStreamReason(),
 			forwardRemedy: s.unforwardedForwardRemedy(),
+			// MEDIUM-2 of the third review: the cold start's RAW source read,
+			// not coldStartSeedSnapshots — that seed is synthesized only for
+			// the forwarding paths, and after --type-override has rewritten
+			// each overridden column to the operator's TARGET type, which
+			// would read as a change on every one of them.
+			coldStart: s.unforwardedColdStartPrior,
+			orderer:   orderer,
 		}, &s.schemaSnapshotErr)
 	}
 	// Clear the cold-start seed after handing it to BOTH intercepts so
 	// a streamer restart picks up a fresh seed in its next coldStart
 	// run.
 	s.coldStartSeedSnapshots = nil
+	s.unforwardedColdStartPrior = nil
+	s.firstBoundaryRetained = nil
 	// Roadmap item 46 (ADR-0121): the delayed-replica gate. When
 	// --apply-delay is set, hold each change until its source commit
 	// timestamp + delay has elapsed before forwarding it to the applier (the
@@ -1240,9 +1250,12 @@ func (s *Streamer) firstBoundaryWitness() *firstBoundaryWitness {
 	if s.Source == nil || s.Target == nil {
 		return nil
 	}
+	orderer, _ := s.Source.(ir.PositionOrderer)
 	w := &firstBoundaryWitness{
 		catalog:      newTargetCatalogWitness(s.loadTargetZoneWitness, initial),
 		history:      history,
+		retained:     s.firstBoundaryRetained,
+		orderer:      orderer,
 		sourceEngine: s.Source.Name(),
 		targetEngine: s.Target.Name(),
 		mappings:     s.Mappings,

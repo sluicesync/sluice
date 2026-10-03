@@ -227,19 +227,34 @@ func normalizeTypeForCDCComparison(t ir.Type) ir.Type {
 		}
 		return v
 	case ir.Array:
-		// pgoutput carries an array column's typmod, but the CDC projection
+		// pgoutput carries an array column's typmod, but the CDC decode type
 		// resolves the ELEMENT at typmod -1 by design (see [oidToType]'s
 		// array arm and the TYPMOD-PROJECTION-GATE refuse list), while the
-		// SchemaReader threads the typmod onto the element (Bug 195). So a
-		// `numeric(10,2)[]` / `varchar(20)[]` / `char(3)[]` /
-		// `timestamp(3)[]` column read one way at cold start and another at
-		// the first boundary: a phantom AlterColumnType, which alongside a
+		// SchemaReader threads the typmod onto the element (Bug 195). Until
+		// GC-44 F5's third review the boundary projection carried that
+		// decode type, so a `numeric(10,2)[]` / `varchar(20)[]` /
+		// `char(3)[]` / `timestamp(3)[]` column read one way at cold start
+		// and another at the first boundary — and a history version written
+		// by such a binary still does: a phantom AlterColumnType, which alongside a
 		// real ADD COLUMN is the multi-shape combo refusal — every sync on
 		// such a table halted at its first forwarded column (found by the
-		// GC-36 seed-vs-projection agreement test). Erasing the element's
-		// modifier on both sides loses no detectable signal: a typmod-only
-		// ALTER of an array column refuses at the reader
-		// ([checkSchemaRace]) before it could reach this comparison.
+		// GC-36 seed-vs-projection agreement test).
+		//
+		// Erasing the element's modifier HERE — the ClassifyShape lens —
+		// is safe only because nothing that compares through this lens can
+		// be the one to see a typmod-only array ALTER: mid-stream the reader
+		// refuses it at the TYPMOD-PROJECTION-GATE ([checkSchemaRace]),
+		// which fires only against a relation it has already cached in the
+		// same stream. It was claimed to cover every case and did not: a
+		// change made while the stream was stopped reaches the pipeline as
+		// the table's FIRST relation, where no gate runs, and was rounded
+		// into the target at exit 0 (GC-44 F5 third review). That case is
+		// now the target witness's: the boundary projection carries the
+		// element modifier ([projectArrayElementModifier]) and the
+		// pipeline's witness lens compares it against the target catalog.
+		// This lens still erases it, so the seed-vs-projection ClassifyShape
+		// stays phantom-free across binaries whose history predates the
+		// projection change.
 		v.Element = normalizeTypeForCDCComparison(eraseArrayElementModifier(v.Element))
 		return v
 	case ir.DateTime:

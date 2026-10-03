@@ -139,9 +139,13 @@ func TestClassifyWitness_VerdictTruthTable(t *testing.T) {
 			witnessTable(wcol("v", ir.Text{Size: ir.TextTiny})), witnessRefuse, nil, "",
 		},
 		{"TEXT over a VARCHAR target refuses (no cross-family forward)", witnessTable(wcol("v", ir.Text{Size: ir.TextLong})), witnessTable(wcol("v", ir.Varchar{Length: 16})), witnessRefuse, nil, ""},
-		{"CHAR(n) under VARCHAR(m≥n)", witnessTable(wcol("c", ir.Char{Length: 8})), witnessTable(wcol("c", ir.Varchar{Length: 8})), witnessTargetWider, nil, "c"},
+		// GC-44 F5 third review: CHAR across families refuses — Postgres
+		// sends bpchar padded, the target's rows hold it unpadded.
+		{"CHAR(n) under VARCHAR(m≥n) refuses", witnessTable(wcol("c", ir.Char{Length: 8})), witnessTable(wcol("c", ir.Varchar{Length: 8})), witnessRefuse, nil, ""},
 		{"CHAR(n) under VARCHAR(m<n) refuses", witnessTable(wcol("c", ir.Char{Length: 8})), witnessTable(wcol("c", ir.Varchar{Length: 4})), witnessRefuse, nil, ""},
-		{"CHAR(n) under TEXT", witnessTable(wcol("c", ir.Char{Length: 8})), witnessTable(wcol("c", ir.Text{Size: ir.TextRegular})), witnessTargetWider, nil, "c"},
+		{"CHAR(n) under TEXT refuses", witnessTable(wcol("c", ir.Char{Length: 8})), witnessTable(wcol("c", ir.Text{Size: ir.TextRegular})), witnessRefuse, nil, ""},
+		{"INT under NUMERIC(12,-2) refuses (a negative scale rounds)", witnessTable(wcol("i", ir.Integer{Width: 32})), witnessTable(wcol("i", ir.Decimal{Precision: 12, Scale: -2})), witnessRefuse, nil, ""},
+		{"SET labels under a reordered superset refuse", witnessTable(wcol("s", ir.Set{Values: []string{"a", "b"}})), witnessTable(wcol("s", ir.Set{Values: []string{"b", "a", "c"}})), witnessRefuse, nil, ""},
 		{"INT under NUMERIC(10,0)", witnessTable(wcol("i", ir.Integer{Width: 32})), witnessTable(wcol("i", ir.Decimal{Precision: 10})), witnessTargetWider, nil, "i"},
 		{"INT under NUMERIC(9,0) refuses", witnessTable(wcol("i", ir.Integer{Width: 32})), witnessTable(wcol("i", ir.Decimal{Precision: 9})), witnessRefuse, nil, ""},
 		{"BIGINT under NUMERIC(21,2)", witnessTable(wcol("i", ir.Integer{Width: 64})), witnessTable(wcol("i", ir.Decimal{Precision: 21, Scale: 2})), witnessTargetWider, nil, "i"},
@@ -231,8 +235,19 @@ func TestClassifyWitness_VerdictTruthTable(t *testing.T) {
 			witnessTable(wcol("m", ir.Domain{Name: "email", BaseType: ir.Text{Size: ir.TextLong}})), witnessMatch, nil, "",
 		},
 		{
-			"lens: array element modifier", witnessTable(wcol("a", ir.Array{Element: ir.Decimal{Unconstrained: true}})),
-			witnessTable(wcol("a", ir.Array{Element: ir.Decimal{Precision: 10, Scale: 2}})), witnessMatch, nil, "",
+			// GC-44 F5 third review: the element modifier is compared (the PG
+			// projection carries it now); TestClassifyWitness_ArrayElementEveryFamily
+			// holds the family matrix.
+			"array element modifier changed while stopped refuses", witnessTable(wcol("a", ir.Array{Element: ir.Decimal{Precision: 10, Scale: 4}})),
+			witnessTable(wcol("a", ir.Array{Element: ir.Decimal{Precision: 10, Scale: 2}})), witnessRefuse, nil, "",
+		},
+		{
+			"lens: geometry SRID unknown on one side", witnessTable(wcol("g", ir.Geometry{SRID: 0})),
+			witnessTable(wcol("g", ir.Geometry{SRID: 4326})), witnessMatch, nil, "",
+		},
+		{
+			"geometry SRID declared on both sides and different refuses", witnessTable(wcol("g", ir.Geometry{SRID: 3857})),
+			witnessTable(wcol("g", ir.Geometry{SRID: 4326})), witnessRefuse, nil, "",
 		},
 		{
 			"lens: array element family still differs", witnessTable(wcol("a", ir.Array{Element: ir.Text{Size: ir.TextLong}})),
@@ -371,14 +386,14 @@ func TestFirstBoundaryWitness_Verdict(t *testing.T) {
 	ctx := context.Background()
 	t.Run("the target does not hold the table", func(t *testing.T) {
 		cat := &fakeCatalog{tables: map[string]*ir.Table{}}
-		v, err := newFakeWitness(cat, "postgres", "postgres").verdict(ctx, witnessTable())
+		v, err := newFakeWitness(cat, "postgres", "postgres").verdict(ctx, witnessTable(), ir.Position{})
 		if err != nil || v.kind != witnessUnwitnessed {
 			t.Fatalf("verdict = %d, %v; want unwitnessed", v.kind, err)
 		}
 	})
 	t.Run("no storage-shape rendering for the pair", func(t *testing.T) {
 		cat := &fakeCatalog{tables: map[string]*ir.Table{"w": witnessTable()}}
-		v, err := newFakeWitness(cat, "postgres", "sqlite").verdict(ctx, witnessTable())
+		v, err := newFakeWitness(cat, "postgres", "sqlite").verdict(ctx, witnessTable(), ir.Position{})
 		if err != nil || v.kind != witnessUnwitnessed || cat.reads != 0 {
 			t.Fatalf("verdict = %d, %v, reads %d; want unwitnessed with no catalog read", v.kind, err, cat.reads)
 		}
@@ -387,7 +402,7 @@ func TestFirstBoundaryWitness_Verdict(t *testing.T) {
 		cat := &fakeCatalog{tables: map[string]*ir.Table{"w": witnessTable()}}
 		w := newFakeWitness(cat, "mysql", "mysql")
 		for range 3 {
-			if v, err := w.verdict(ctx, witnessTable()); err != nil || v.kind != witnessMatch {
+			if v, err := w.verdict(ctx, witnessTable(), ir.Position{}); err != nil || v.kind != witnessMatch {
 				t.Fatalf("verdict = %d, %v; want match", v.kind, err)
 			}
 		}
@@ -397,7 +412,7 @@ func TestFirstBoundaryWitness_Verdict(t *testing.T) {
 		other := witnessTable()
 		other.Name = "late"
 		for range 2 {
-			if v, _ := w.verdict(ctx, other); v.kind != witnessUnwitnessed {
+			if v, _ := w.verdict(ctx, other, ir.Position{}); v.kind != witnessUnwitnessed {
 				t.Fatalf("verdict for an absent table = %d; want unwitnessed", v.kind)
 			}
 		}
@@ -408,11 +423,11 @@ func TestFirstBoundaryWitness_Verdict(t *testing.T) {
 	t.Run("a table created after the first read is found by the refresh", func(t *testing.T) {
 		cat := &fakeCatalog{tables: map[string]*ir.Table{"w": witnessTable()}}
 		w := newFakeWitness(cat, "mysql", "mysql")
-		_, _ = w.verdict(ctx, witnessTable())
+		_, _ = w.verdict(ctx, witnessTable(), ir.Position{})
 		late := witnessTable()
 		late.Name = "late"
 		cat.tables["late"] = late
-		if v, _ := w.verdict(ctx, late); v.kind != witnessMatch {
+		if v, _ := w.verdict(ctx, late, ir.Position{}); v.kind != witnessMatch {
 			t.Fatalf("verdict = %d; want match after the refresh", v.kind)
 		}
 	})
@@ -422,7 +437,7 @@ func TestFirstBoundaryWitness_Verdict(t *testing.T) {
 		cat := &fakeCatalog{tables: map[string]*ir.Table{"w": witnessTable(wcol("ts", ir.DateTime{Precision: 6}))}}
 		w := newFakeWitness(cat, "mysql", "mysql")
 		w.catalog = newTargetCatalogWitness(cat.load, map[string]*ir.Table{"w": witnessTable(wcol("ts", ir.DateTime{Precision: 0}))})
-		v, err := w.verdict(ctx, witnessTable(wcol("ts", ir.DateTime{Precision: 6})))
+		v, err := w.verdict(ctx, witnessTable(wcol("ts", ir.DateTime{Precision: 6})), ir.Position{})
 		if err != nil || v.kind != witnessMatch {
 			t.Fatalf("verdict = %d, %v (%s); want match on the fresh read", v.kind, err, v.render())
 		}
@@ -448,13 +463,13 @@ func TestFirstBoundaryWitness_Verdict(t *testing.T) {
 		cat := &fakeCatalog{tables: map[string]*ir.Table{"orders": tgt}}
 		post := witnessTable()
 		post.Name = "Orders"
-		if v, _ := newFakeWitness(cat, "mysql", "mysql").verdict(ctx, post); v.kind != witnessMatch {
+		if v, _ := newFakeWitness(cat, "mysql", "mysql").verdict(ctx, post, ir.Position{}); v.kind != witnessMatch {
 			t.Fatalf("verdict = %d; want match", v.kind)
 		}
 	})
 	t.Run("a catalog read error is returned, not degraded", func(t *testing.T) {
 		cat := &fakeCatalog{err: errors.New("target down")}
-		if _, err := newFakeWitness(cat, "mysql", "mysql").verdict(ctx, witnessTable()); err == nil {
+		if _, err := newFakeWitness(cat, "mysql", "mysql").verdict(ctx, witnessTable(), ir.Position{}); err == nil {
 			t.Fatal("verdict swallowed a catalog read error")
 		}
 	})
@@ -466,7 +481,7 @@ func TestFirstBoundaryWitness_Verdict(t *testing.T) {
 			{Table: "w", Column: "dropped_since", TargetType: "text"},
 			{Table: "other", Column: "x", TargetType: "text"},
 		}
-		v, err := w.verdict(ctx, witnessTable(wcol("ts", ir.DateTime{Precision: 6})))
+		v, err := w.verdict(ctx, witnessTable(wcol("ts", ir.DateTime{Precision: 6})), ir.Position{})
 		if err != nil || v.kind != witnessMatch {
 			t.Fatalf("verdict = %d, %v (%s); want match", v.kind, err, v.render())
 		}
@@ -476,7 +491,7 @@ func TestFirstBoundaryWitness_Verdict(t *testing.T) {
 		cat := &fakeCatalog{tables: map[string]*ir.Table{"w": tgt}}
 		w := newFakeWitness(cat, "mysql", "mysql")
 		w.shardColumn = "_sluice_shard"
-		if v, err := w.verdict(ctx, witnessTable()); err != nil || v.kind != witnessMatch {
+		if v, err := w.verdict(ctx, witnessTable(), ir.Position{}); err != nil || v.kind != witnessMatch {
 			t.Fatalf("verdict = %d, %v (%s); want match", v.kind, err, v.render())
 		}
 	})
@@ -644,7 +659,7 @@ func TestCheckShapeAFirstBoundary_Verdicts(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			w := newFakeWitness(&fakeCatalog{tables: map[string]*ir.Table{"w": tc.tgt}}, "postgres", "postgres")
-			b, err := checkShapeAFirstBoundary(ctx, w, "w", post, post)
+			b, err := checkShapeAFirstBoundary(ctx, w, "w", post, post, ir.Position{})
 			if (err != nil) != tc.refuse {
 				t.Fatalf("err = %v, want refuse=%v", err, tc.refuse)
 			}
@@ -671,7 +686,7 @@ func TestCheckShapeAFirstBoundary_Verdicts(t *testing.T) {
 			}
 		})
 	}
-	if b, err := checkShapeAFirstBoundary(ctx, nil, "w", witnessTable(), witnessTable()); err != nil || !b.baseline() {
+	if b, err := checkShapeAFirstBoundary(ctx, nil, "w", witnessTable(), witnessTable(), ir.Position{}); err != nil || !b.baseline() {
 		t.Fatalf("a nil witness must accept: %+v, %v", b, err)
 	}
 }
@@ -705,7 +720,7 @@ func TestCheckShapeAFirstBoundary_PeerAddedOnEveryArm(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			w := newFakeWitness(&fakeCatalog{tables: map[string]*ir.Table{"w": tc.tgt}}, "postgres", "postgres")
 			w.history = history
-			b, err := checkShapeAFirstBoundary(ctx, w, "w", tc.post, tc.post)
+			b, err := checkShapeAFirstBoundary(ctx, w, "w", tc.post, tc.post, ir.Position{})
 			if err != nil {
 				t.Fatalf("err = %v", err)
 			}
@@ -731,14 +746,14 @@ func TestCheckShapeAFirstBoundary_PeerAddedOnEveryArm(t *testing.T) {
 		post := witnessTable(ts(3), tier)
 		w := newFakeWitness(&fakeCatalog{tables: map[string]*ir.Table{"w": post}}, "postgres", "postgres")
 		w.history = []*ir.Table{post}
-		if b, err := checkShapeAFirstBoundary(ctx, w, "w", post, post); err != nil || !b.baseline() {
+		if b, err := checkShapeAFirstBoundary(ctx, w, "w", post, post, ir.Position{}); err != nil || !b.baseline() {
 			t.Fatalf("decision = %+v, %v; want the baseline", b, err)
 		}
 	})
 	t.Run("no retained history: the stated residual", func(t *testing.T) {
 		post := witnessTable(ts(3), tier)
 		w := newFakeWitness(&fakeCatalog{tables: map[string]*ir.Table{"w": post}}, "postgres", "postgres")
-		if b, err := checkShapeAFirstBoundary(ctx, w, "w", post, post); err != nil || !b.baseline() {
+		if b, err := checkShapeAFirstBoundary(ctx, w, "w", post, post, ir.Position{}); err != nil || !b.baseline() {
 			t.Fatalf("decision = %+v, %v; want the baseline", b, err)
 		}
 	})

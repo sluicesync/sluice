@@ -181,7 +181,7 @@ func (s *Streamer) warmResumeSchemaSeedLoader(applier ir.ChangeApplier, streamID
 // on error — the resume is armed for a refusal whose prev they supply,
 // and proceeding without one would reopen the window silently.
 func (s *Streamer) loadWarmResumeSchemaSeed(ctx context.Context, applier ir.ChangeApplier, streamID string, persisted ir.Position) ([]*ir.Table, error) {
-	history, err := loadRetainedSchemaSeed(ctx, applier, s.Source, streamID, persisted)
+	history, anchors, err := loadRetainedSchemaSeed(ctx, applier, s.Source, streamID, persisted)
 	if err != nil {
 		return nil, err
 	}
@@ -192,6 +192,8 @@ func (s *Streamer) loadWarmResumeSchemaSeed(ctx context.Context, applier ir.Chan
 	// The same reads serve the GC-44 first-boundary witness (D4, F13).
 	s.firstBoundaryCatalog = witness
 	s.firstBoundaryHistory = history
+	s.firstBoundaryRetained = anchors
+	s.unforwardedColdStartPrior = nil // a warm resume's prior is the history
 	return mergeWarmResumeSeed(ctx, streamID, "", witness, history, s.Mappings)
 }
 
@@ -522,14 +524,14 @@ func overrideTouchesTemporal(overrides []temporalOverride, tgt, hist *ir.Table) 
 // returned, not degraded: the resume is armed for a refusal whose prev
 // this read supplies, and proceeding without it would reopen the window
 // silently.
-func loadRetainedSchemaSeed(ctx context.Context, applier ir.ChangeApplier, source ir.Engine, streamID string, persisted ir.Position) ([]*ir.Table, error) {
+func loadRetainedSchemaSeed(ctx context.Context, applier ir.ChangeApplier, source ir.Engine, streamID string, persisted ir.Position) ([]*ir.Table, retainedHistory, error) {
 	reader, ok := applier.(ir.SchemaHistoryReader)
 	if !ok {
-		return nil, nil
+		return nil, nil, nil
 	}
 	rows, err := reader.ListSchemaHistory(ctx, streamID, retainedSchemaSeedLimit)
 	if err != nil {
-		return nil, fmt.Errorf("pipeline: load retained schema seed: %w", err)
+		return nil, nil, fmt.Errorf("pipeline: load retained schema seed: %w", err)
 	}
 	if len(rows) >= retainedSchemaSeedLimit {
 		slog.WarnContext(
@@ -555,8 +557,9 @@ func loadRetainedSchemaSeed(ctx context.Context, applier ir.ChangeApplier, sourc
 		})
 	}
 	out := make([]*ir.Table, 0, len(order))
+	anchors := retainedHistory{}
 	for _, k := range order {
-		tbl, err := resolveRetainedSeedTable(orderer, versions[k], persisted)
+		tbl, anchor, err := resolveRetainedSeedTable(orderer, versions[k], persisted)
 		if err != nil {
 			if errors.Is(err, errRetainedSeedUnresolvable) {
 				slog.WarnContext(
@@ -567,7 +570,7 @@ func loadRetainedSchemaSeed(ctx context.Context, applier ir.ChangeApplier, sourc
 				)
 				continue
 			}
-			return nil, fmt.Errorf("pipeline: load retained schema seed: %s.%s: %w", k.schema, k.table, err)
+			return nil, nil, fmt.Errorf("pipeline: load retained schema seed: %s.%s: %w", k.schema, k.table, err)
 		}
 		if tbl.Schema == "" {
 			tbl.Schema = k.schema
@@ -575,7 +578,53 @@ func loadRetainedSchemaSeed(ctx context.Context, applier ir.ChangeApplier, sourc
 		if tbl.Name == "" {
 			tbl.Name = k.table
 		}
+		recorded, err := decodeRetainedVersions(versions[k])
+		if err != nil {
+			return nil, nil, fmt.Errorf("pipeline: load retained schema seed: %s.%s: %w", k.schema, k.table, err)
+		}
 		out = append(out, tbl)
+		anchors[tbl] = retainedVersion{anchor: anchor, recorded: recorded}
+	}
+	return out, anchors, nil
+}
+
+// retainedHistory maps each table [loadRetainedSchemaSeed] returned to what
+// else the history says about it ([retainedVersion]). Keyed by the returned
+// pointer, which the callers hand on unchanged (per namespace on a
+// multi-database stream). Read by [firstBoundaryWitness.historyPriorAt] and
+// the unforwarded check's prior ([priorFor]) to tell a boundary that shows
+// the source CHANGED the table from one that replays a shape it already had.
+type retainedHistory map[*ir.Table]retainedVersion
+
+// retainedVersion is one table's retained history beyond the resolved
+// version: that version's anchor (the position from which it held), and
+// every shape the stream recorded for the table, the resolved one included.
+//
+// Both answer "is this boundary a replay?", and neither alone suffices. The
+// anchor orders where positions order — a MySQL GTID set — but a Postgres
+// boundary is anchored at LSN 0/0 (the relation message carries no WAL
+// position of its own; measured on postgres:16 by the GC-44 F5 third
+// review's crash cell), so there every anchor compares equal. The recorded
+// shapes do not depend on positions: a replay re-delivers a shape the
+// stream has already recorded, while a change made since presents one it
+// has not. A narrowing back to a shape the table once had is the residual
+// (it reads as a possible replay and is kept with a WARN).
+type retainedVersion struct {
+	anchor   ir.Position
+	recorded []*ir.Table
+}
+
+// decodeRetainedVersions decodes every retained version of one table.
+func decodeRetainedVersions(versions []ir.RetainedSchemaVersion) ([]*ir.Table, error) {
+	out := make([]*ir.Table, 0, len(versions))
+	for _, v := range versions {
+		t, err := ir.UnmarshalTable(v.TableJSON)
+		if err != nil {
+			return nil, fmt.Errorf("decode retained version (anchor %+v): %w", v.Anchor, err)
+		}
+		if t != nil {
+			out = append(out, t)
+		}
 	}
 	return out, nil
 }
@@ -590,25 +639,25 @@ var errRetainedSeedUnresolvable = errors.New("no single retained version resolve
 // persisted. A single version needs no ordering; several do, and without
 // an orderer (or with an ambiguous partial order) the answer is
 // [errRetainedSeedUnresolvable] rather than a guess.
-func resolveRetainedSeedTable(orderer ir.PositionOrderer, versions []ir.RetainedSchemaVersion, persisted ir.Position) (*ir.Table, error) {
+func resolveRetainedSeedTable(orderer ir.PositionOrderer, versions []ir.RetainedSchemaVersion, persisted ir.Position) (*ir.Table, ir.Position, error) {
 	if len(versions) == 1 {
 		tbl, err := ir.UnmarshalTable(versions[0].TableJSON)
 		if err != nil {
-			return nil, err
+			return nil, ir.Position{}, err
 		}
 		if tbl == nil {
-			return nil, errors.New("retained schema version decodes to no table")
+			return nil, ir.Position{}, errors.New("retained schema version decodes to no table")
 		}
-		return tbl, nil
+		return tbl, versions[0].Anchor, nil
 	}
 	if orderer == nil {
-		return nil, fmt.Errorf("%w: %d versions retained and the source engine implements no PositionOrderer", errRetainedSeedUnresolvable, len(versions))
+		return nil, ir.Position{}, fmt.Errorf("%w: %d versions retained and the source engine implements no PositionOrderer", errRetainedSeedUnresolvable, len(versions))
 	}
-	tbl, err := ir.ResolveSchemaVersion(orderer, versions, persisted)
+	tbl, anchor, err := ir.ResolveSchemaVersionAnchored(orderer, versions, persisted)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", errRetainedSeedUnresolvable, err)
+		return nil, ir.Position{}, fmt.Errorf("%w: %w", errRetainedSeedUnresolvable, err)
 	}
-	return tbl, nil
+	return tbl, anchor, nil
 }
 
 // wireReaderSchemaSeed runs the pending seed loader for a reader that

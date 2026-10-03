@@ -179,6 +179,19 @@ func runMidTransactionAlterPin(t *testing.T, cell twfbCell, ns string, c midTran
 	if !cell.tgt.hasRow(t, tbl, 2) {
 		t.Errorf("[%s] row 2 (before the ALTER, same transaction) is missing", c.name)
 	}
+
+	// GC-44 F5 third review: one more restart after the recovery. The
+	// retained history now holds the POST-ALTER shape; if the source
+	// re-delivers the transaction, its pre-ALTER relation lies before that
+	// version's anchor and must not read as a source narrowing.
+	run = startTWFBRun(cell.streamer())
+	cell.src.exec(t, fmt.Sprintf("INSERT INTO %s VALUES (4, 'd')", tbl))
+	if !cell.tgt.waitRow(t, tbl, 4, run, 90*time.Second) {
+		t.Fatalf("[%s] the restart after recovery did not resume: row 4 never landed (stream: %v)", c.name, run.stop(t))
+	}
+	if err := run.stop(t); err != nil && !errors.Is(err, context.Canceled) {
+		t.Errorf("[%s] the restart after recovery returned %v", c.name, err)
+	}
 }
 
 // midTransactionAlterCells: a widen within one family, which the direction

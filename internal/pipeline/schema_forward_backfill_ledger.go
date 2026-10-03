@@ -186,7 +186,15 @@ func (l *addedColumnBackfillLedger) bind(applier ir.ChangeApplier, streamID stri
 // previous one. An error means the record is NOT on the target, and the
 // caller refuses the boundary. nil-safe.
 func (l *addedColumnBackfillLedger) writeAhead(ctx context.Context, table string, columns []string) error {
-	if l == nil {
+	// Nothing owed, nothing to record. A record naming no column is never
+	// cleared — only a backfill entry opened for the table covers it, and
+	// none is opened for an empty set — so it would make the next start
+	// refuse with ADD-COLUMN-BACKFILL-INCOMPLETE over a backfill that never
+	// existed (GC-44 F5 third review). Every caller — the forward
+	// intercept's ADD COLUMN, the Shape A router's pre-ALTER hook,
+	// planAddedColumnBackfill and the Shape A first boundary — is covered
+	// here whatever it passes.
+	if l == nil || len(columns) == 0 {
 		return nil
 	}
 	l.recordMu.Lock()

@@ -122,7 +122,18 @@ func TestTypmodProjectionGate_EveryTypmodFamily(t *testing.T) {
 				t.Fatalf("typmod delta %d→%d classified %v; want AlterColumnType", pair.from, pair.to, kind)
 			}
 
-			moved := !ir.SchemaSignatureOf(projectRelation(prev)).Equal(ir.SchemaSignatureOf(projectRelation(curr)))
+			// "Moved" is measured where the FORWARD intercept looks: the
+			// projection through the comparison lens it classifies with
+			// (ClassifyShape over NormalizeForCDCComparison on both sides).
+			// Since GC-44 F5's third review the raw boundary projection
+			// carries an array element's modifier (the first-boundary
+			// witness needs it), but the lens still erases it, so a
+			// typmod-only array ALTER the reader waved through would
+			// classify as no change at all — the arrays must stay on the
+			// list, and measuring the raw projection would say otherwise.
+			eng := Engine{}
+			moved := !ir.SchemaSignatureOf(eng.NormalizeForCDCComparison(projectRelation(prev))).
+				Equal(ir.SchemaSignatureOf(eng.NormalizeForCDCComparison(projectRelation(curr))))
 			switch {
 			case moved && refusesUnderBoth[oid]:
 				t.Errorf("family OID %d moves its projected signature but sits on the documented refuse list — the projection now carries this typmod; shrink the list (and ADR-0091's impl note) in this change", oid)

@@ -82,6 +82,11 @@ var postgresDomainDispatchExemptions = map[string]string{
 	"cdc_geometry_srid.go:entryHasGeometryColumn:entry.Columns[i].Type": "WIRE: same relation-cache entry, same " +
 		"argument — this only answers whether a catalog SRID lookup is worth making, over wire-projected bare " +
 		"types that are never ir.Domain.",
+	"cdc_relations.go:projectArrayElementModifier:c.Type": "WIRE: a relationColumn's Type is built by " +
+		"buildRelationCacheEntry from the wire OID (resolveWireColumnType resolves a domain OID to its BASE " +
+		"type, never ir.Domain), so unwrapping would be inert. A domain over an array is handled by OID instead: " +
+		"buildRelationCacheEntry records the domain's storage OID and modifier (StorageOID / StorageTypeMod) and " +
+		"the element lookup keys on those.",
 
 	// ---- TARGET-DERIVED: the applier's colTypes never carries ir.Domain ----
 	"change_applier.go:equalityPredicate:c.Type": "TARGET-DERIVED: the applier's colTypes come from " +
