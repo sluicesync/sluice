@@ -23,6 +23,13 @@ package pipeline
 // mode, MySQL 8 multi-database, and Postgres 16 refuse mode). The help text
 // and the multi-database log line both said such a stream refuses.
 //
+// The Postgres reader's gate stays in force on these streams
+// ([Streamer.wireSchemaDeltaArming]): a same-OID DROP / RENAME / ALTER
+// COLUMN TYPE seen mid-session is refused there, before this check. So on a
+// Postgres source this check judges what the gate lets through — a table's
+// first relation of a reader session (a change made while the stream was
+// stopped, or one replayed after a restart) and ADD COLUMN.
+//
 // # The check
 //
 // Every boundary on such a stream is compared with the target table the
@@ -38,18 +45,16 @@ package pipeline
 //     [witnessWidthOrder], placing the target at or above the source within
 //     one family — which passes with
 //     a WARN. That is the drained model run ahead of the source, which
-//     these modes exist for — and it is also what a Postgres replay shows:
-//     a transaction that wrote rows, altered the table and wrote again
-//     re-delivers its pre-ALTER relation first, against a target that
-//     already took the change;
-//   - …except where the table's prior shape proves the SOURCE NARROWED the
+//     these modes exist for;
+//   - …except where the table's prior shape says the SOURCE NARROWED the
 //     column ([sourceNarrowed]; GC-44 F5 third review): its own ALTER
 //     converted the rows it stores and the target's copies were never
 //     converted, so that refuses. The prior is this intercept's last
 //     accepted boundary, else the retained history version, never the
-//     cold-start read, and never for a possible replay — a boundary showing
-//     a shape the stream already recorded, or one proven to lie before the
-//     prior ([acceptedBoundary.evidenceFor]);
+//     cold-start read, and never one the boundary is proven to precede (a
+//     replay); a boundary proven to lie AFTER it is judged whatever shape it
+//     shows, and one whose order is unknown is judged unless it shows a
+//     shape the stream already recorded ([acceptedBoundary.evidenceFor]);
 //   - a column only the target has refuses where that prior shows the
 //     source had it — the source's DROP COLUMN, which leaves the target
 //     holding values the source no longer has (one dropped and one added
@@ -66,6 +71,26 @@ package pipeline
 // is written and no row after it is applied. Before refusing, the catalog
 // is read again once: the memo may predate the operator's own ALTER on the
 // target.
+//
+// # An AMBIGUOUS refusal (GC-44 fourth review)
+//
+// A narrowing or a DROP COLUMN whose only evidence is the prior shape, at a
+// boundary the source's positions cannot order after that prior, is one of
+// two things: a REPLAY (a transaction re-delivered from its start after a
+// restart or an ADR-0038 retry shows the table as it was BEFORE a change
+// the target already holds), or a change made to the source that this
+// stream has not applied. On a Postgres source every boundary is anchored
+// at LSN 0/0 and the history holds one shape per table (GC-44 F23), so this
+// is every such refusal there. Accepting it would be silent loss in the
+// second case, so it stays a refusal — but the usual remedy ("apply the
+// same change on the target": narrow it, drop the column) DESTROYS values
+// in the first. So the refusal names both, tells the operator to compare
+// the source's CURRENT definition with the target's, and gives the replay
+// a safe exit that every stream shape has: a one-shot
+// `--accept-unforwarded-schema-change=<fingerprint>`, the existing
+// acknowledgement, whose fingerprint here names this table and these
+// columns ([ambiguousBoundary]). Nothing is persisted for it: the next
+// start re-derives the same refusal, and the same fingerprint.
 //
 // The binlog lane emits a boundary only at a DDL unless it is armed for
 // first touch ([Streamer.firstTouchBoundariesConsumed]); it now is on these
@@ -85,7 +110,8 @@ package pipeline
 // is a source-side baseline a restart would retake; this one's evidence is
 // the target, which a restart does not move. So there is nothing to
 // acknowledge: reconciling the target is the remedy and the next start
-// confirms it.
+// confirms it — except for an AMBIGUOUS refusal (above), whose replay case
+// has nothing on the target to reconcile.
 //
 // # Where the target cannot speak
 //
@@ -156,9 +182,16 @@ type unforwardedBoundaryDeps struct {
 	coldStart []ir.SchemaSnapshot
 
 	// orderer is the source engine's position order, which tells a
-	// replayed boundary from a new one ([provenBefore]). nil: unknown, and
-	// the narrowing rules then apply.
+	// replayed boundary from a new one ([provenBefore]) and a change made
+	// after the prior from one whose order is unknown ([provenAfter]). nil:
+	// unknown, and every refusal resting on the prior is AMBIGUOUS.
 	orderer ir.PositionOrderer
+
+	// acknowledged is the operator's `--accept-unforwarded-schema-change`
+	// value ([Streamer.AcceptUnforwardedSchemaChange]). An AMBIGUOUS refusal
+	// whose fingerprint it names is accepted as the replay the operator
+	// confirmed ([ambiguousBoundary]); any other refusal ignores it.
+	acknowledged string
 }
 
 // priorOrigin says where a table's prior shape came from, which decides
@@ -245,19 +278,50 @@ type acceptedBoundary struct {
 
 	// recorded are the shapes the stream has already seen for the table —
 	// every retained history version, then every boundary this intercept
-	// accepted. A boundary showing one of them may be a replay
-	// ([isReplayOf]) and is never evidence of a narrowing.
+	// accepted. Where the source's positions cannot order a boundary after
+	// the prior, one showing a recorded shape may be a replay and is not
+	// evidence of a change ([acceptedBoundary.evidenceFor]).
 	recorded []*ir.Table
 }
 
 // evidenceFor reports whether this prior may judge a CHANGE the boundary
-// post at pos shows — a narrowing, or the unwitnessed fallback's structural
-// change: it [acceptedBoundary.judges] the boundary, and post is not a
-// shape the stream already recorded (a replay re-delivers only those; on a
-// Postgres source, whose boundaries are anchored at LSN 0/0, that is the
-// only replay test there is).
+// post at pos shows — a narrowing, a dropped column, or the unwitnessed
+// fallback's structural change. It must [acceptedBoundary.judges] the
+// boundary (not a cold-start read, not a boundary proven to precede it),
+// and then either:
+//
+//   - the boundary is PROVEN to lie after the prior ([acceptedBoundary.orders]):
+//     whatever shape it shows, the source changed the table since — even
+//     back to a shape it held before. This is the GC-44 fourth review's
+//     narrow-back: `numeric(10,2)` → `(12,4)` (the drained model) → back to
+//     `(10,2)` on a MySQL source, live or after a restart against a history
+//     holding both versions, was exempted as "a recorded shape" and kept the
+//     target's unconverted values at exit 0; or
+//   - its order is unknown and post is not a shape the stream already
+//     recorded — a replay re-delivers only those. On a Postgres source the
+//     history holds one shape per table (GC-44 F23), so a replay of the
+//     pre-ALTER relation is NOT recorded and is judged: that is an AMBIGUOUS
+//     refusal, never an acceptance ([ambiguousBoundary]).
+//
+// The cost, stated: where the order is unknown, a narrow-back to a shape
+// this stream recorded is kept with the WARN. On a Postgres source that
+// needs the narrow-back inside one reader session, where the reader's gate
+// refuses the type change first (an intercept is rebuilt with its reader
+// on every retry, so its recorded shapes never outlive the session); on
+// any other source it needs a boundary whose position the source's orderer
+// cannot place against the prior's — an equal one, or one it cannot parse.
 func (p acceptedBoundary) evidenceFor(orderer ir.PositionOrderer, pos ir.Position, post *ir.Table) bool {
-	return p.judges(orderer, pos) && !recordedShape(p.recorded, post)
+	if !p.judges(orderer, pos) {
+		return false
+	}
+	return p.orders(orderer, pos) || !recordedShape(p.recorded, post)
+}
+
+// orders reports whether the boundary at pos is PROVEN to lie strictly
+// after this prior under the source's own order, so a change it shows was
+// made after the prior held — never a replay of something before it.
+func (p acceptedBoundary) orders(orderer ir.PositionOrderer, pos ir.Position) bool {
+	return p.judges(orderer, pos) && provenAfter(orderer, pos, p.position)
 }
 
 // withRecorded returns recorded with post appended unless it is already
@@ -328,9 +392,13 @@ func judgeUnforwardedBoundary(
 	prior := priorFor(deps, w, last, snap.Table)
 	judges := prior.judges(deps.orderer, snap.Position)
 	changed := prior.evidenceFor(deps.orderer, snap.Position, snap.IR)
+	// A change the prior alone evidences, at a boundary the source's order
+	// does not place after it: a replay or a source change (the file
+	// comment's AMBIGUOUS refusal).
+	ambiguous := changed && !prior.orders(deps.orderer, snap.Position)
 	reason := "the stream has no target witness"
 	if w != nil {
-		evidence := unforwardedPrior{raw: prior.raw, judges: changed}
+		evidence := unforwardedPrior{raw: prior.raw, judges: changed, ambiguous: ambiguous}
 		if judges {
 			evidence.returned = replacedColumns(prior.raw, snap.IR)
 		}
@@ -382,12 +450,22 @@ func judgeUnforwardedBoundary(
 	if err != nil {
 		what = err.Error()
 	}
+	drift := renderDriftForRefusal(prior.compared, post)
+	remedy := unforwardedRecoveryHint(tableName, deps.forwardRemedy, false)
+	if ambiguous {
+		// Every refusal on this arm rests on the prior alone.
+		a := newAmbiguousBoundary(tableName, what+drift, deps.acknowledged, true)
+		if a.acknowledged() {
+			a.logAccepted(ctx, what)
+			return prior, nil
+		}
+		remedy = a.note() + unforwardedRecoveryHint(tableName, false, false)
+	}
 	return prior, fmt.Errorf(
 		"%w: the source changed %q (%s; the target cannot be read to compare: %s) and this stream does not "+
 			"forward schema changes (%s). Refusing before the boundary is recorded or any row after it is "+
 			"applied.%s %s",
-		ir.ErrSchemaChangeRefused, tableName, what, reason, deps.why,
-		renderDriftForRefusal(prior.compared, post), unforwardedRecoveryHint(tableName, deps.forwardRemedy, false),
+		ir.ErrSchemaChangeRefused, tableName, what, reason, deps.why, drift, remedy,
 	)
 }
 
@@ -395,10 +473,13 @@ func judgeUnforwardedBoundary(
 // shape. raw (nil when there is none) is consulted for an overridden
 // column's "unchanged since" test whatever its origin; the narrowing and
 // dropped-column rules apply only when judges is set
-// ([acceptedBoundary.evidenceFor]).
+// ([acceptedBoundary.evidenceFor]). ambiguous says the boundary is not
+// proven to lie after the prior, so a refusal those rules make is an
+// AMBIGUOUS one ([ambiguousBoundary]).
 type unforwardedPrior struct {
-	raw    *ir.Table
-	judges bool
+	raw       *ir.Table
+	judges    bool
+	ambiguous bool
 	// returned are columns the snapshot carries under a name the prior had,
 	// but which the source replaced ([replacedColumns]).
 	returned map[string]bool
@@ -505,6 +586,12 @@ type unforwardedJudgement struct {
 	// returned says one of the refused columns is one the source replaced
 	// under the same name ([replacedColumns]).
 	returned bool
+	// onPrior counts the refused columns whose refusal rests on the prior
+	// shape alone — a narrowing, a dropped column. ambiguous says the
+	// boundary is not proven to lie after that prior, so those refusals are
+	// AMBIGUOUS ([ambiguousBoundary]); set only when onPrior > 0.
+	onPrior   int
+	ambiguous bool
 	// ahead are type differences the target's type holds and no evidence
 	// says the source narrowed — the drained model applied on the target
 	// before the source, a replayed pre-ALTER shape, or a narrowing the
@@ -544,7 +631,7 @@ func (w *firstBoundaryWitness) judgeUnforwarded(ctx context.Context, post *ir.Ta
 	if err != nil {
 		return unforwardedJudgement{}, err
 	}
-	judged := judgedPrior{judges: prior.judges, returned: prior.returned}
+	judged := judgedPrior{judges: prior.judges, ambiguous: prior.ambiguous, returned: prior.returned}
 	if prior.raw != nil {
 		if judged.expected, err = w.expected(prior.raw); err != nil {
 			return unforwardedJudgement{}, err
@@ -556,9 +643,10 @@ func (w *firstBoundaryWitness) judgeUnforwarded(ctx context.Context, post *ir.Ta
 // judgedPrior is [unforwardedPrior] with the prior shape rendered as target
 // storage, the form [judgeUnforwardedColumns] compares.
 type judgedPrior struct {
-	expected *ir.Table
-	judges   bool
-	returned map[string]bool
+	expected  *ir.Table
+	judges    bool
+	ambiguous bool
+	returned  map[string]bool
 }
 
 // judgeUnforwardedColumns is the pure judgement: expected (the snapshot
@@ -578,12 +666,15 @@ type judgedPrior struct {
 //     ALTER converted the rows it stores, the target's copies of them were
 //     never converted, and the two now differ at exit 0 (GC-44 F5 third
 //     review — a live `numeric(14,4)` → `numeric(12,2)` rounded the source
-//     and the target kept `1.2345`). Without that proof — no prior, a
-//     cold-start read, a replay — it passes with a WARN as before;
+//     and the target kept `1.2345`). Without that evidence — no prior, a
+//     cold-start read, a proven replay — it passes with a WARN as before;
 //   - a column only the target has refuses where the prior shows the
 //     source had it (the source's DROP COLUMN; with an added column beside
 //     it, the likely RENAME COLUMN — [unforwardedJudgement.shapeNote]), and
 //     is noted otherwise;
+//   - a narrowing or DROP refused on the prior alone, where prior.ambiguous
+//     says the boundary is not proven to lie after it, marks the judgement
+//     AMBIGUOUS ([ambiguousBoundary]);
 //   - a column the source replaced under the same name ([replacedColumns])
 //     refuses: the target kept the old column and its old values;
 //   - an OVERRIDDEN column ([overriddenColumnRefused]) is judged on width
@@ -626,14 +717,14 @@ func judgeUnforwardedColumns(expected, target *ir.Table, opts witnessOptions, pr
 			// (dropped on the target first) or an unforwarded DROP. Where a
 			// prior that judges this boundary shows the SOURCE still had the
 			// column, it is the source's DROP COLUMN — the target keeps the
-			// column with values the source no longer holds, and a refuse-mode
-			// stream refused it before GC-44 F5's reader-gate relaxation
-			// (the drained-model recovery pin, drop-column/refuse); refuse it
-			// here. With no such prior it stays the WARN.
+			// column with values the source no longer holds; refuse it (a
+			// Postgres reader refuses the same DROP itself when it sees it
+			// inside one session). With no such prior it stays the WARN.
 			if _, had := priorCols[m.Column]; had && prior.judges {
 				d.source = "(dropped on the source)"
 				j.refused = append(j.refused, d)
 				j.droppedCols = append(j.droppedCols, m.Column)
+				j.onPrior++
 				break
 			}
 			j.targetOnly = append(j.targetOnly, m.Column)
@@ -646,6 +737,7 @@ func judgeUnforwardedColumns(expected, target *ir.Table, opts witnessOptions, pr
 					d.source = fmt.Sprintf("%s (narrowed from %s)", d.source, from)
 					j.refused = append(j.refused, d)
 					j.narrowed = true
+					j.onPrior++
 					break
 				}
 				j.ahead = append(j.ahead, d)
@@ -681,6 +773,7 @@ func judgeUnforwardedColumns(expected, target *ir.Table, opts witnessOptions, pr
 				target: a.Type.String() + " (--type-override)",
 			})
 			j.narrowed = true
+			j.onPrior++
 		}
 	}
 	for _, c := range exp.Columns {
@@ -694,6 +787,7 @@ func judgeUnforwardedColumns(expected, target *ir.Table, opts witnessOptions, pr
 		})
 		j.returned = true
 	}
+	j.ambiguous = prior.ambiguous && j.onPrior > 0
 	return j
 }
 
@@ -728,13 +822,28 @@ func overriddenColumnRefused(target, source, prior ir.Type) bool {
 // settle logs an accepted judgement or returns its refusal.
 func (j unforwardedJudgement) settle(ctx context.Context, tableName string, deps unforwardedBoundaryDeps) error {
 	if len(j.refused) > 0 {
+		diffs := renderWitnessDiffs(j.refused)
+		remedy := unforwardedRecoveryHint(tableName, deps.forwardRemedy, j.added) + j.remedyNotes()
+		if j.ambiguous {
+			// The acknowledgement can vouch only for what a replay explains:
+			// every refused column must rest on the prior alone.
+			a := newAmbiguousBoundary(tableName, diffs, deps.acknowledged, j.onPrior == len(j.refused))
+			if a.acknowledged() {
+				a.logAccepted(ctx, diffs)
+				return nil
+			}
+			// Not --schema-changes=forward: its first boundary cannot prove a
+			// narrowing or a DROP on a source whose order is unknown either
+			// (GC-44 F23), so it would keep the target with a WARN in the
+			// source-change case — the silent outcome this refusal exists for.
+			remedy = a.note() + unforwardedRecoveryHint(tableName, false, j.added) + j.remedyNotes()
+		}
 		return fmt.Errorf(
 			"%w: the source table %q no longer matches the target, and this stream does not forward schema "+
 				"changes (%s); the target cannot hold what the source now sends (%s)%s, so applying the rows "+
 				"after this boundary would change or drop their values. Refusing before the boundary is "+
 				"recorded or any row after it is applied; nothing has been written. %s",
-			ir.ErrSchemaChangeRefused, tableName, deps.why, renderWitnessDiffs(j.refused), j.shapeNote(),
-			unforwardedRecoveryHint(tableName, deps.forwardRemedy, j.added)+j.remedyNotes(),
+			ir.ErrSchemaChangeRefused, tableName, deps.why, diffs, j.shapeNote(), remedy,
 		)
 	}
 	if len(j.ahead) > 0 {
@@ -791,6 +900,93 @@ func (j unforwardedJudgement) remedyNotes() string {
 			"source's values into it, before restarting."
 	}
 	return notes
+}
+
+// ambiguousBoundaryMarker is the grep-stable word an AMBIGUOUS refusal
+// carries beside [schemaChangeRefusedMarker].
+const ambiguousBoundaryMarker = "AMBIGUOUS-SCHEMA-BOUNDARY"
+
+// ambiguousBoundary is an AMBIGUOUS refusal (the file comment): a narrowing
+// or DROP COLUMN evidenced by the prior shape alone, at a boundary the
+// source's order does not place after it — a replay, or a source change.
+//
+// Its exit for the replay case is the existing one-shot acknowledgement,
+// `--accept-unforwarded-schema-change`, given this refusal's fingerprint:
+// the operator compares the source's CURRENT definition with the target's,
+// and only when they agree acknowledges. Reused rather than a new flag
+// because it already means "I reconciled what sluice cannot verify; accept
+// exactly THIS refusal", and its fingerprint binding is what stops a value
+// left in a service definition from accepting a different one. Unlike the
+// UNFORWARDED-SCHEMA-CHANGE record, nothing is persisted: the fingerprint
+// hashes the table and the refused columns, so every start re-derives the
+// same one, and it holds for the process it is given to (the retry loop
+// re-delivers the same replay, which must stay accepted). A value naming
+// another boundary is ignored and the refusal says so.
+//
+// An acknowledgement cannot accept a boundary that also carries a
+// difference no replay explains ([unforwardedJudgement.onPrior] short of
+// every refused column — a column the target lacks, a type it cannot
+// hold): then ackable is false and the refusal points at the recovery
+// instead.
+type ambiguousBoundary struct {
+	table       string
+	fingerprint string
+	passed      string
+	ackable     bool
+}
+
+func newAmbiguousBoundary(table, detail, passed string, ackable bool) ambiguousBoundary {
+	return ambiguousBoundary{
+		table:       table,
+		fingerprint: unforwardedRefusalFingerprint(ambiguousBoundaryMarker + "\x00" + table + "\x00" + detail),
+		passed:      passed,
+		ackable:     ackable,
+	}
+}
+
+// acknowledged reports whether the operator's acknowledgement names this
+// boundary and the boundary may be acknowledged.
+func (a ambiguousBoundary) acknowledged() bool {
+	return a.ackable && a.passed != "" && a.passed == a.fingerprint
+}
+
+// logAccepted WARNs the acknowledged acceptance, naming what was kept.
+func (a ambiguousBoundary) logAccepted(ctx context.Context, difference string) {
+	slog.WarnContext(ctx,
+		"schema change check: accepted an "+ambiguousBoundaryMarker+" on the operator's acknowledgement ("+
+			unforwardedRefusalAckFlag+"): the source's current definition was confirmed to match the target, so "+
+			"this boundary is a replay of the table's shape before a change the target already holds; the target "+
+			"is kept unchanged",
+		"table", a.table, "fingerprint", a.fingerprint, "difference", difference)
+}
+
+// note is the refusal's ambiguity paragraph. It ends where the usual
+// remedy — which applies to the source-change case only — begins.
+func (a ambiguousBoundary) note() string {
+	replay := fmt.Sprintf("If they are the same, it is (1): change NOTHING on the target and start once with %s=%s, "+
+		"which accepts this boundary (this table, these columns) for that run.", unforwardedRefusalAckFlag, a.fingerprint)
+	if !a.ackable {
+		replay = "If they are the same, it is (1) — but this boundary also carries a difference a replay does not " +
+			"explain away, so it cannot be acknowledged; see the pre-ALTER replay wedge in docs/operator/cdc-streaming.md " +
+			"for the recovery."
+	}
+	mismatch := ""
+	if a.passed != "" && a.passed != a.fingerprint {
+		mismatch = fmt.Sprintf(" The acknowledgement passed (%s=%s) does not name this boundary, so it was not applied.",
+			unforwardedRefusalAckFlag, a.passed)
+	}
+	return fmt.Sprintf("%s: the only evidence that the source changed %q is the shape this stream recorded for it "+
+		"earlier, and the source's positions cannot place this boundary after that shape (a Postgres source anchors "+
+		"every schema boundary at LSN 0/0, GC-44 F23). So it is EITHER (1) a REPLAY — a transaction re-delivered "+
+		"from its start after a restart or a retried error, showing the table as it was BEFORE a change the target "+
+		"already holds; the target is right, and narrowing it or dropping its column would destroy values the source "+
+		"still has — OR (2) a change made on the source that this stream has not applied. Tell them apart by "+
+		"comparing the source's CURRENT definition of %q (psql \\d, or SHOW CREATE TABLE) with the target's. %s "+
+		"(On a Postgres source, if the replayed transaction changes the table again after this point, its reader "+
+		"then refuses that change mid-stream: the pre-ALTER replay wedge, whose recovery is in "+
+		"docs/operator/cdc-streaming.md.)%s If the source's column is narrower "+
+		"than the target's, or gone, it is (2): ",
+		ambiguousBoundaryMarker, a.table, a.table, replay, mismatch)
 }
 
 // renderWitnessDiffs lists column disagreements for a log line or refusal.

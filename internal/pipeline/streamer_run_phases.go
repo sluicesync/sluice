@@ -1205,6 +1205,11 @@ func (s *Streamer) phaseWireInterceptChain(applyCtx context.Context, changes <-c
 			// would read as a change on every one of them.
 			coldStart: s.unforwardedColdStartPrior,
 			orderer:   orderer,
+			// GC-44 fourth review: the replay exit of an AMBIGUOUS refusal.
+			// Read on every wiring (the retry loop re-delivers the same
+			// replay); the startup door has already consumed and cleared a
+			// value that named a recorded UNFORWARDED-SCHEMA-CHANGE.
+			acknowledged: s.AcceptUnforwardedSchemaChange,
 		}, &s.schemaSnapshotErr)
 	}
 	// Clear the cold-start seed after handing it to BOTH intercepts so

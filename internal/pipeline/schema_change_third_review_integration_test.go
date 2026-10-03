@@ -9,10 +9,12 @@
 //     siblings) on a stream that forwards no DDL was accepted with a WARN
 //     while the target kept the source's old, unrounded values at exit 0
 //     (reproduced on postgres:16 by the review: the target held 1.2345
-//     where the source held 1.23). It refuses now — live, and again after a
-//     restart from the retained history — and the drained model recovers
-//     it. The forward path's first boundary forwards the same narrowing
-//     made while the stream was stopped.
+//     where the source held 1.23). It refuses now — live (at the Postgres
+//     reader's own gate, restored 2026-10-03), and again after a restart
+//     from the retained history (AMBIGUOUS on Postgres: the one-version
+//     history cannot order a replay against a source change) — and the
+//     drained model recovers it. The forward path's first boundary forwards
+//     the same narrowing made while a MySQL stream was stopped.
 //   - CHAR across families: a Postgres source sends bpchar padded, so a
 //     varchar key changed to char while stopped lost every key-scoped
 //     UPDATE and DELETE and padded every INSERT. It refuses now.
@@ -75,8 +77,23 @@ func runRefuseNarrowingPin(t *testing.T, cell twfbCell, table string, c narrowin
 	cell.src.exec(t, fmt.Sprintf("INSERT INTO %s VALUES (3, '%s')", table, c.post))
 	for _, kind := range []string{"live", "restart"} {
 		err := waitRefused(t, run, 60*time.Second)
-		if err == nil || !strings.Contains(err.Error(), schemaChangeRefusedMarker) || !strings.Contains(err.Error(), "narrowed from") {
-			t.Errorf("[%s/%s] the narrowing was not refused with %s naming it (err %v)", c.name, kind, schemaChangeRefusedMarker, run.stop(t))
+		// Live, the table's relation is cached in this reader session, so the
+		// Postgres reader's own gate refuses the type change first (restored
+		// 2026-10-03). After the restart the narrowed relation is the
+		// session's first: this check judges it against the one-version
+		// history, which cannot order it — a replay or a source change — so
+		// it refuses AMBIGUOUS (GC-44 fourth review).
+		want := []string{schemaChangeRefusedMarker, "narrowed from", ambiguousBoundaryMarker}
+		if kind == "live" {
+			want = []string{"incompatible schema change mid-stream", "Drained-model recovery"}
+		}
+		for _, w := range want {
+			if err == nil || !strings.Contains(err.Error(), w) {
+				t.Errorf("[%s/%s] the narrowing was not refused with %q (err %v)", c.name, kind, w, err)
+			}
+		}
+		if err == nil {
+			t.Errorf("[%s/%s] not refused (stream: %v)", c.name, kind, run.stop(t))
 		}
 		_ = run.stop(t)
 		if cell.tgt.hasRow(t, table, 3) {
@@ -277,10 +294,22 @@ func TestStreamer_RefuseNarrowingOverrideColdStart_PostgresToPostgres(t *testing
 		t.Fatalf("the first boundary under a narrowing override refused or stalled (stream: %v)", run.stop(t))
 	}
 	cell.src.exec(t, "ALTER TABLE t_ovc ALTER COLUMN amount TYPE numeric(10,1); INSERT INTO t_ovc VALUES (3, 3.5);")
+	// Live, the relation is cached in this reader session: the Postgres
+	// reader's own gate refuses the type change first (restored
+	// 2026-10-03). The restart's first relation is this check's, judged
+	// against the one-version history: AMBIGUOUS on Postgres.
 	err := waitRefused(t, run, 60*time.Second)
 	_ = run.stop(t)
-	if err == nil || !strings.Contains(err.Error(), schemaChangeRefusedMarker) || !strings.Contains(err.Error(), "narrowed from") {
-		t.Errorf("a source narrowing under the override was not refused (err %v)", err)
+	if err == nil || !strings.Contains(err.Error(), "incompatible schema change mid-stream") {
+		t.Errorf("[live] the source narrowing was not refused at the reader (err %v)", err)
+	}
+	run = startTWFBRun(cell.streamer())
+	err = waitRefused(t, run, 60*time.Second)
+	_ = run.stop(t)
+	for _, w := range []string{schemaChangeRefusedMarker, "narrowed from", ambiguousBoundaryMarker} {
+		if err == nil || !strings.Contains(err.Error(), w) {
+			t.Errorf("[restart] a source narrowing under the override was not refused with %q (err %v)", w, err)
+		}
 	}
 	if cell.tgt.hasRow(t, "t_ovc", 3) {
 		t.Error("row 3 LANDED past the refusal")

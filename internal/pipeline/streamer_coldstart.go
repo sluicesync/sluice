@@ -1485,7 +1485,8 @@ func (s *Streamer) coldStartBeginCDC(ctx context.Context, stream *ir.SnapshotStr
 	s.wireCDCScopePredicate(stream.Changes)
 	// ADR-0091 F7a's reader-gate relaxation ([schemaForwardModeSetter]) is
 	// set inside wireSchemaDeltaArming below, which every reader-open site
-	// reaches ([Streamer.readerSchemaGateRelaxed]).
+	// reaches: relaxed only where the single-stream forward intercept runs
+	// ([Streamer.singleStreamSchemaForwardActive]).
 	//
 	// SL-2 (audit 2026-08-31): arm the reader's session-GUC cast refusal
 	// whenever ANY path re-applies an observed delta to the target — the

@@ -61,7 +61,8 @@ func (s *Streamer) warmResume(ctx context.Context, persisted ir.Position) (chang
 	s.wireCDCScopePredicate(cdc)
 	// ADR-0091 F7a's reader-gate relaxation ([schemaForwardModeSetter]) is
 	// set inside wireSchemaDeltaArming below, which every reader-open site
-	// reaches ([Streamer.readerSchemaGateRelaxed]).
+	// reaches: relaxed only where the single-stream forward intercept runs
+	// ([Streamer.singleStreamSchemaForwardActive]).
 	//
 	// SL-2 (audit 2026-08-31), warm-resume mirror: arm the reader's
 	// session-GUC cast refusal whenever ANY path re-applies an observed

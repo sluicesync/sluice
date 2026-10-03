@@ -460,14 +460,16 @@ type schemaGateStub struct {
 
 func (s *schemaGateStub) SetSchemaForward(enabled bool) { s.relaxed, s.set = enabled, true }
 
-// TestWireSchemaDeltaArming_RelaxesTheReaderGateWhereAnInterceptJudges pins
-// the reader-gate relaxation at the one helper every reader-open site
-// reaches: relaxed wherever an intercept judges boundaries against the
-// target — forward, refuse mode, multi-database, Shape A drained — and kept
-// only under Shape A's coordinated router. Before the F5 review refuse mode
-// and multi-database kept the Postgres gate, whose refusal a mid-transaction
-// ALTER replays on every restart.
-func TestWireSchemaDeltaArming_RelaxesTheReaderGateWhereAnInterceptJudges(t *testing.T) {
+// TestWireSchemaDeltaArming_ReaderGateRelaxedOnlyUnderTheForwardIntercept
+// pins the reader's own mid-stream schema gate at the one helper every
+// reader-open site reaches: relaxed ONLY where the single-stream forward
+// intercept runs (forward mode, a single database, no
+// --inject-shard-column) and kept everywhere else — refuse mode,
+// multi-database / multi-schema in either mode, Shape A drained and
+// coordinated. That is v0.156.9's behaviour, restored by operator decision
+// (2026-10-03) after the GC-44 F5 review had relaxed it on every stream an
+// intercept judges; the wedge the relaxation removed is GC-44 F24.
+func TestWireSchemaDeltaArming_ReaderGateRelaxedOnlyUnderTheForwardIntercept(t *testing.T) {
 	t.Parallel()
 	shard := ShardColumnSpec{Name: "shard", Value: "a"}
 	for _, tc := range []struct {
@@ -475,10 +477,12 @@ func TestWireSchemaDeltaArming_RelaxesTheReaderGateWhereAnInterceptJudges(t *tes
 		s    *Streamer
 		want bool
 	}{
-		{"forward", &Streamer{}, true},
-		{"--schema-changes=refuse", &Streamer{SchemaChanges: "refuse"}, true},
-		{"multi-database", &Streamer{AllDatabases: true}, true},
-		{"Shape A drained", &Streamer{InjectShardColumn: shard, NoCoordinateLiveDDL: true}, true},
+		{"forward (the zero value)", &Streamer{}, true},
+		{"explicit forward", &Streamer{SchemaChanges: "forward"}, true},
+		{"--schema-changes=refuse", &Streamer{SchemaChanges: "refuse"}, false},
+		{"multi-database", &Streamer{AllDatabases: true}, false},
+		{"multi-database refuse", &Streamer{AllDatabases: true, SchemaChanges: "refuse"}, false},
+		{"Shape A drained", &Streamer{InjectShardColumn: shard, NoCoordinateLiveDDL: true}, false},
 		{"Shape A coordinated", &Streamer{InjectShardColumn: shard}, false},
 	} {
 		r := &schemaGateStub{}

@@ -236,9 +236,10 @@ type firstBoundaryWitness struct {
 
 	// retained is what else the history says about each version (keyed by
 	// the same pointers: its anchor and every shape recorded for the table),
-	// and orderer the source engine's position order: together they tell a
-	// boundary that shows a change from a replay of a shape the stream
-	// already had ([firstBoundaryWitness.historyPriorAt]).
+	// and orderer the source engine's position order: the anchor and the
+	// order tell a boundary proven after the version from a replay
+	// ([firstBoundaryWitness.historyPriorAt]); the recorded shapes serve the
+	// unforwarded check where the order is unknown ([priorFor]).
 	retained retainedHistory
 	orderer  ir.PositionOrderer
 
@@ -356,7 +357,7 @@ func (w *firstBoundaryWitness) verdict(ctx context.Context, post *ir.Table, pos 
 		return witnessVerdict{}, err
 	}
 	opts := w.options(post)
-	if prior := w.historyPriorAt(post.Name, pos, post); prior != nil {
+	if prior := w.historyPriorAt(post.Name, pos); prior != nil {
 		if opts.priorExpected, err = w.expected(prior); err != nil {
 			return witnessVerdict{}, err
 		}
@@ -471,10 +472,10 @@ func (w *firstBoundaryWitness) historyFor(name string) *ir.Table {
 }
 
 // historyPriorAt is the table's retained version as PROOF of the shape the
-// source held before the boundary post (RAW) at pos — the evidence the
-// forward path's first boundary needs before it forwards a narrowing
-// ([sourceNarrowed]) — or nil when there is none, or when nothing proves the
-// boundary is not a REPLAY.
+// source held before the boundary at pos — the evidence the forward path's
+// first boundary needs before it forwards a narrowing ([sourceNarrowed]) —
+// or nil when there is none, or when nothing proves the boundary is not a
+// REPLAY.
 //
 // The replay is why. A Postgres transaction that writes, ALTERs a column
 // and writes again is re-delivered from its start after a crash or a
@@ -486,28 +487,29 @@ func (w *firstBoundaryWitness) historyFor(name string) *ir.Table {
 // narrowed to `varchar(16)` failed 22001 on every retry).
 //
 // So the proof here is strict: the boundary must lie STRICTLY AFTER the
-// version's anchor under the source's own order ([provenAfter]), and show a
-// shape the stream never recorded ([isReplayOf]). A MySQL source proves it
-// (a GTID set or a binlog file/position; the first-touch boundary is
-// anchored at the stream's start, past every version it resolved). A
-// Postgres source cannot: its boundaries are anchored at LSN 0/0 (the
-// relation message carries no WAL position), which also makes every
-// version of a table share one history key, so the history holds only the
-// latest shape and the replay's pre-ALTER one is not "recorded". A
-// narrowing made while a Postgres stream was stopped is therefore kept with
-// the WARN, as before (GC-44 F23). The unforwarded check, whose outcome is
-// a refusal rather than an ALTER, judges with the weaker
-// [acceptedBoundary.evidenceFor].
-func (w *firstBoundaryWitness) historyPriorAt(name string, pos ir.Position, post *ir.Table) *ir.Table {
+// version's anchor under the source's own order ([provenAfter]). That is
+// the whole test — a boundary proven after the version shows a change the
+// source made since, whatever shape it shows, including a shape the table
+// held before (the GC-44 fourth review's narrow-back: a MySQL `(12,4)` →
+// `(10,2)` made while the stream was stopped, against a history that also
+// held the older `(10,2)`, was read as "a recorded shape, possibly a
+// replay" and kept with the WARN — a replay cannot lie after the version
+// it replays past). A MySQL source proves it (a GTID set or a binlog
+// file/position; the first-touch boundary is anchored at the stream's
+// start, past every version it resolved). A Postgres source cannot: its
+// boundaries are anchored at LSN 0/0 (the relation message carries no WAL
+// position), which also makes every version of a table share one history
+// key, so the history holds only the latest shape. A narrowing made while a
+// Postgres stream was stopped is therefore kept with the WARN, as before
+// (GC-44 F23). The unforwarded check, whose outcome is a refusal rather
+// than an ALTER, judges with the weaker [acceptedBoundary.evidenceFor] and
+// marks what this test cannot prove AMBIGUOUS.
+func (w *firstBoundaryWitness) historyPriorAt(name string, pos ir.Position) *ir.Table {
 	if w == nil {
 		return nil
 	}
 	h := w.historyFor(name)
-	if h == nil {
-		return nil
-	}
-	r := w.retained[h]
-	if !provenAfter(w.orderer, pos, r.anchor) || isReplayOf(w.orderer, pos, post, r, h) {
+	if h == nil || !provenAfter(w.orderer, pos, w.retained[h].anchor) {
 		return nil
 	}
 	return h
@@ -516,26 +518,6 @@ func (w *firstBoundaryWitness) historyPriorAt(name string, pos ir.Position, post
 // provenAfter reports whether position p is PROVEN strictly after anchor.
 func provenAfter(orderer ir.PositionOrderer, p, anchor ir.Position) bool {
 	return provenBefore(orderer, anchor, p)
-}
-
-// isReplayOf reports whether a boundary showing post at pos may be a replay
-// of what the stream already recorded for the table — r and its resolved
-// version h — rather than a change made since:
-//
-//   - it is PROVEN to lie before the resolved version's anchor (an orderer
-//     that can compare the two — a MySQL GTID set); or
-//   - post is a shape the stream has already recorded for the table
-//     ([recordedShape]). This is the arm a Postgres source needs: its
-//     boundaries are anchored at LSN 0/0, so positions never prove a
-//     replay there, and a replay can only re-deliver a shape the stream
-//     already saw.
-//
-// Unknown order alone is not proof. The cost, stated: a source that
-// narrows a column back to a shape the table once held reads as a possible
-// replay and is kept with a WARN (GC-44 F5 third review; in-process the
-// immediate prior still catches it live).
-func isReplayOf(orderer ir.PositionOrderer, pos ir.Position, post *ir.Table, r retainedVersion, h *ir.Table) bool {
-	return provenBefore(orderer, pos, r.anchor) || recordedShape(append([]*ir.Table{h}, r.recorded...), post)
 }
 
 // recordedShape reports whether post has the same columns — names and
@@ -952,12 +934,49 @@ func sameFamilyWidthOrder(target, snapshot ir.Type) widthOrder {
 		// not forwarded (no first-boundary path ALTERs an array column's
 		// element, and the live path refuses that change at the reader),
 		// so it refuses as mixed.
-		if o := sameFamilyWidthOrder(t.Element, s.Element); o != targetNarrower {
-			return o
+		o := sameFamilyWidthOrder(t.Element, s.Element)
+		switch {
+		case o == targetNarrower:
+			return mixedWidth
+		case o == notComparable && arrayElementHoldsEverySnapshotValue(t.Element, s.Element):
+			return targetWider
 		}
-		return mixedWidth
+		return o
 	}
 	return notComparable
+}
+
+// arrayElementHoldsEverySnapshotValue is the cross-family "target is wider"
+// relation for an array ELEMENT, deliberately narrower than the scalar
+// [targetHoldsEverySnapshotValue]:
+//
+//   - varchar(n)[] ⊂ text[]: kept. Before GC-44 F5's third review the
+//     element modifier was erased on both sides (`varchar(n)` and `char(n)`
+//     read as text), so a `varchar(16)[]` source against a `text[]` target
+//     matched; threading the modifier made it notComparable and refused that
+//     stream on every start (GC-44 fourth review, LOW, loud). Every element
+//     value a varchar(n) carries is stored by text unchanged, trailing spaces
+//     included — the scalar arm's argument, element by element.
+//   - char(n)[] ⊂ text[]: NOT kept — refused (GC-44 F25). A Postgres source
+//     sends a bpchar element PADDED to n, while a text[] target written
+//     before the change (by a cast, or by the copy of a varchar[] column)
+//     holds it stripped: the scalar CHAR finding of the third review, per
+//     element. It matched before the third review, so this is a loud
+//     regression for a char(n)[] source against a text[] target; the drained
+//     model (`ALTER … TYPE char(n)[]` on the target, or `text[]` on the
+//     source) converges it.
+//   - every other scalar arm — integer ⊂ decimal, unsigned ⊂ wider signed,
+//     enum / set label supersets — is NOT extended to elements: each was
+//     notComparable for arrays before the third review too, and an array's
+//     encode path is per target-OID (the Bug 74 lesson), which nothing here
+//     has measured. They refuse, as they always did.
+func arrayElementHoldsEverySnapshotValue(target, snapshot ir.Type) bool {
+	s, ok := snapshot.(ir.Varchar)
+	if !ok {
+		return false
+	}
+	t, ok := target.(ir.Text)
+	return ok && textCovers(t.Size, s.Length)
 }
 
 // forwardableAlter reports whether a first boundary may forward an ALTER

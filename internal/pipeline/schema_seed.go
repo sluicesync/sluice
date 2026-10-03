@@ -600,15 +600,17 @@ type retainedHistory map[*ir.Table]retainedVersion
 // version: that version's anchor (the position from which it held), and
 // every shape the stream recorded for the table, the resolved one included.
 //
-// Both answer "is this boundary a replay?", and neither alone suffices. The
-// anchor orders where positions order — a MySQL GTID set — but a Postgres
-// boundary is anchored at LSN 0/0 (the relation message carries no WAL
-// position of its own; measured on postgres:16 by the GC-44 F5 third
-// review's crash cell), so there every anchor compares equal. The recorded
-// shapes do not depend on positions: a replay re-delivers a shape the
-// stream has already recorded, while a change made since presents one it
-// has not. A narrowing back to a shape the table once had is the residual
-// (it reads as a possible replay and is kept with a WARN).
+// The anchor answers "is this boundary a replay?" where positions order — a
+// MySQL GTID set or binlog coordinate: a boundary proven after it is a
+// change made since, whatever shape it shows (GC-44 fourth review), one
+// proven before it is a replay. A Postgres boundary is anchored at LSN 0/0
+// (the relation message carries no WAL position of its own; measured on
+// postgres:16 by the GC-44 F5 third review's crash cell), so there every
+// anchor compares equal and only the recorded shapes are left: a boundary
+// showing one of them may be a replay, one showing none is judged — and its
+// refusal is AMBIGUOUS, since the history holds one shape per table there
+// (GC-44 F23) and the replay's pre-ALTER shape is not among them
+// ([acceptedBoundary.evidenceFor]).
 type retainedVersion struct {
 	anchor   ir.Position
 	recorded []*ir.Table
@@ -727,14 +729,36 @@ func (s *Streamer) wireReaderSchemaSeed(ctx context.Context, r ir.CDCReader) err
 //
 // It also arms the binlog lane's first-touch boundaries (GC-44 D3,
 // [firstTouchBoundaryArmer]) wherever a schema-snapshot intercept will
-// consume them — riding this helper because the roster above already holds
-// it at every reader-open site.
+// consume them, and sets the reader's own mid-stream schema gate
+// ([schemaForwardModeSetter]) — both riding this helper because the roster
+// above already holds it at every reader-open site.
+//
+// THE READER GATE IS RELAXED ONLY WHERE THE FORWARD INTERCEPT RUNS
+// ([Streamer.singleStreamSchemaForwardActive]): forward mode on a
+// single-database stream without --inject-shard-column. Everywhere else —
+// refuse mode, a multi-database or multi-schema stream, Shape A coordinated
+// or drained — the Postgres reader's checkSchemaRace refuses a same-OID
+// DROP / RENAME / ALTER COLUMN TYPE seen mid-stream, exactly as through
+// v0.156.9 (operator decision 2026-10-03, reversing the GC-44 F5 review's
+// relaxation). The unforwarded-stream check ([interceptSchemaChangeRefuse])
+// judges what the gate lets through: a table's first relation of a reader
+// session (a change made while the stream was stopped) and ADD COLUMN.
+//
+// The cost of keeping the gate, stated (GC-44 F24): a transaction that
+// writes a table, changes a column's type (or drops / renames it) and
+// writes it again is re-delivered from its start on every restart, so its
+// pre-ALTER relation is cached first and the post-ALTER one is refused at
+// the reader again — whatever the operator does to the target. It is loud
+// (the reader's refusal, every start); the recovery is in
+// docs/operator/cdc-streaming.md. The relaxation removed that wedge but
+// let a same-session narrowing on these streams reach a check that could
+// not prove it (GC-44 fourth review).
 func (s *Streamer) wireSchemaDeltaArming(r ir.CDCReader) {
 	if armer, ok := r.(firstTouchBoundaryArmer); ok && s.firstTouchBoundariesConsumed() {
 		armer.ArmFirstTouchSchemaBoundaries()
 	}
-	if relaxer, ok := r.(schemaForwardModeSetter); ok {
-		relaxer.SetSchemaForward(s.readerSchemaGateRelaxed())
+	if gate, ok := r.(schemaForwardModeSetter); ok {
+		gate.SetSchemaForward(s.singleStreamSchemaForwardActive())
 	}
 	setter, ok := r.(schemaDeltaTargetApplySetter)
 	if !ok {
@@ -769,31 +793,4 @@ type firstTouchBoundaryArmer interface {
 // capture, tooling, tests) stay unarmed by never reaching the arming call.
 func (s *Streamer) firstTouchBoundariesConsumed() bool {
 	return true
-}
-
-// readerSchemaGateRelaxed reports whether a reader that gates mid-stream
-// schema changes itself ([schemaForwardModeSetter]: the Postgres
-// checkSchemaRace, the binlog nullability boundary) should hand the
-// unambiguous shapes on as boundaries instead of refusing them, because an
-// intercept downstream judges every boundary against the target: the
-// single-stream forward intercept, or the unforwarded-stream check (GC-44
-// F5). Only Shape A's coordinated router keeps the reader's own gate, as it
-// always has.
-//
-// It used to be [Streamer.singleStreamSchemaForwardActive], so refuse mode
-// and multi-database streams kept the Postgres gate — and that gate could
-// not be recovered from (GC-44 F5 review): a transaction that wrote rows,
-// altered a column and wrote again replays its pre-ALTER relation and then
-// the post-ALTER one on every restart, so the gate refused the drained
-// model's own restart forever, whatever the operator did to the target.
-// The unforwarded-stream check refuses the same change while the target
-// cannot hold it and lets the restart through once it can. RENAME TABLE,
-// DROP+CREATE and a projection-invisible typmod change stay refused at the
-// reader in every mode.
-//
-// Wired from [Streamer.wireSchemaDeltaArming], which every reader-open site
-// reaches (TestSchemaDeltaArming_ReachesEveryReaderOpenSite) — the
-// multi-database sites called no setter before.
-func (s *Streamer) readerSchemaGateRelaxed() bool {
-	return !s.InjectShardColumn.Engaged() || s.NoCoordinateLiveDDL
 }

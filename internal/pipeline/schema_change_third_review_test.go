@@ -174,13 +174,13 @@ func TestClassifyWitness_HistoryProvesSourceNarrowed(t *testing.T) {
 	})
 }
 
-// TestHistoryPriorAt_AReplayIsNotEvidence pins the replay rule both ways:
-// a boundary PROVEN before the retained version's anchor is a replay and
-// gets no prior; one at or after it, or one whose order is unknown, does.
+// TestHistoryPriorAt_AReplayIsNotEvidence pins the forward path's proof
+// rule both ways: only a boundary PROVEN strictly after the retained
+// version's anchor gets the version as its prior — whatever shape it shows;
+// one before the anchor (a replay), at it, or of unknown order does not.
 func TestHistoryPriorAt_AReplayIsNotEvidence(t *testing.T) {
 	t.Parallel()
 	wide := witnessTable(wcol("v", ir.Decimal{Precision: 12, Scale: 4}))
-	narrow := witnessTable(wcol("v", ir.Decimal{Precision: 10, Scale: 2}))
 	older := witnessTable(wcol("v", ir.Decimal{Precision: 10, Scale: 2}))
 	w := newFakeWitness(&fakeCatalog{}, "postgres", "postgres")
 	w.history = []*ir.Table{wide}
@@ -196,23 +196,26 @@ func TestHistoryPriorAt_AReplayIsNotEvidence(t *testing.T) {
 		{"strictly after the anchor", testPos(20), true},
 		{"no position (unknown order)", ir.Position{}, false},
 	} {
-		if got := w.historyPriorAt("w", tc.pos, narrow) != nil; got != tc.prior {
+		if got := w.historyPriorAt("w", tc.pos) != nil; got != tc.prior {
 			t.Errorf("%s: prior = %v, want %v", tc.name, got, tc.prior)
 		}
 	}
 	w.orderer = nil
-	if w.historyPriorAt("w", testPos(20), narrow) != nil {
+	if w.historyPriorAt("w", testPos(20)) != nil {
 		t.Error("no orderer: nothing proves the boundary is not a replay, so no prior may be used to forward")
 	}
-	// Strictly after the anchor but showing a shape the stream recorded: a
-	// replay can re-deliver only those, so it is still not proof.
+	// GC-44 fourth review: strictly after the anchor, a boundary showing a
+	// shape the table held BEFORE (MySQL history keeps every version) is
+	// the source narrowing back — not a replay, which cannot lie past the
+	// version it replays. The old recorded-shape exemption kept it with the
+	// WARN at exit 0.
 	w.orderer = numericOrderer{}
 	w.retained = retainedHistory{wide: {anchor: testPos(10), recorded: []*ir.Table{older, wide}}}
-	if w.historyPriorAt("w", testPos(20), narrow) != nil {
-		t.Error("a boundary showing a recorded shape was judged against the history")
+	if w.historyPriorAt("w", testPos(20)) == nil {
+		t.Error("a narrow-back to a recorded shape, proven after the anchor, got no prior")
 	}
-	if w.historyPriorAt("w", testPos(20), witnessTable(wcol("v", ir.Decimal{Precision: 9, Scale: 1}))) == nil {
-		t.Error("a never-recorded narrower shape past the anchor got no prior")
+	if w.historyPriorAt("w", testPos(10)) != nil {
+		t.Error("at the anchor (a Postgres 0/0 anchor is always this): nothing is proven, so no prior")
 	}
 }
 
@@ -278,17 +281,22 @@ func TestInterceptSchemaChangeRefuse_SourceNarrowing(t *testing.T) {
 			t.Fatalf("out %d, err %v; want the replay passed", len(out), err)
 		}
 	})
-	t.Run("Postgres anchors (all 0/0): a replay of recorded shapes passes, a new narrowing refuses", func(t *testing.T) {
+	// The history a Postgres source really keeps (GC-44 fourth review): ONE
+	// version per table, the latest, anchored at 0/0 — never the pre-ALTER
+	// shape a replay re-delivers (the old fixture here held {narrow, wide},
+	// which no Postgres history can hold, and so proved the replay passed).
+	// Replay and source narrowing are indistinguishable, so it refuses as
+	// AMBIGUOUS; TestInterceptSchemaChangeRefuse_AmbiguousBoundary pins the
+	// text and the acknowledgement.
+	t.Run("Postgres anchors (all 0/0), one-version history: a replay refuses as AMBIGUOUS", func(t *testing.T) {
 		d := deps(wide, wide)
 		w := d.witnessFor("")
-		w.retained = retainedHistory{wide: {anchor: testPos(0), recorded: []*ir.Table{narrow, wide}}}
-		out, err := runRefuseIntercept(t, d, refuseAt(narrow, 0), refuseAt(wide, 0))
-		if err != nil || len(out) != 2 {
-			t.Fatalf("replay: out %d, err %v; want both passed", len(out), err)
-		}
+		w.retained = retainedHistory{wide: {anchor: testPos(0), recorded: []*ir.Table{wide}}}
+		_, err := runRefuseIntercept(t, d, refuseAt(narrow, 0), refuseAt(wide, 0))
+		refused(t, err, ambiguousBoundaryMarker)
 		narrower := witnessTable(wcol("v", ir.Decimal{Precision: 9, Scale: 1}))
 		_, err = runRefuseIntercept(t, d, refuseAt(narrower, 0))
-		refused(t, err, "narrowed from")
+		refused(t, err, ambiguousBoundaryMarker)
 	})
 	t.Run("the drained-model remedy: narrow the target too, then restart", func(t *testing.T) {
 		out, err := runRefuseIntercept(t, deps(narrow, wide), refuseAt(narrow, 20))
