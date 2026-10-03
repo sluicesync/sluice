@@ -553,6 +553,14 @@ func TestStreamer_SessionTZWitness_ResidualRefusesWithoutHistory(t *testing.T) {
 		for _, dir := range zoneWitnessDirections {
 			t.Run(target.name+"/"+dir.name, func(t *testing.T) {
 				rig := newZoneWitnessRig(t, target, dir)
+				// The applied change that makes the persisted position a
+				// real CDC position goes to a SIDE table: since GC-44 D3 the
+				// binlog lane writes a history version at each table's first
+				// change of a stream (as pgoutput already did), so a change
+				// to events itself would retain the very history prior this
+				// cell must resume without. The residual is a table the
+				// stream never changed between its cold start and the stop.
+				applyDDLMySQL(t, rig.sourceDSN, "CREATE TABLE side (id BIGINT NOT NULL PRIMARY KEY) ENGINE=InnoDB;")
 				streamID := "slm1b-residual-" + target.name
 				ctx1, cancel1 := context.WithCancel(context.Background())
 				defer cancel1()
@@ -560,14 +568,8 @@ func TestStreamer_SessionTZWitness_ResidualRefusesWithoutHistory(t *testing.T) {
 				if !rig.waitRowCount(3, 90*time.Second) {
 					t.Fatal("bulk-copy never landed the seed rows")
 				}
-				// One applied change so the persisted position is a real
-				// CDC position, its post-commit write landed, then a clean
-				// stop.
 				anchor := rig.waitPersistedPosition(streamID)
-				applyDDLMySQL(t, rig.sourceDSN, "INSERT INTO events (id, c) VALUES (100, '2020-01-01 21:00:00');")
-				if !rig.waitRowID(100, 90*time.Second) {
-					t.Fatal("the CDC row never landed")
-				}
+				applyDDLMySQL(t, rig.sourceDSN, "INSERT INTO side (id) VALUES (1);")
 				rig.waitPersistedPositionPast(streamID, anchor)
 				rig.stop(cancel1, errc1)
 				if n := rig.historyRowsFor(streamID, "events"); n != 0 {
