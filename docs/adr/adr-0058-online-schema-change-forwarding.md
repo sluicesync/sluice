@@ -544,6 +544,21 @@ sibling classes that all happened to surface as the same symptom
 locus keeps the fix readable and gives future contributors three
 independent regression guards rather than one bundled patch.
 
+**Note (GC-44, v0.156.10): fold point 1 closed the cold start only.** The
+seed is consumed by the intercept a cold start wires and cleared after
+it; every later wiring of the intercept — a warm resume, a restart, an
+in-process ADR-0038 retry — started with an empty cache, so the very
+`hadPre=false` → "forward the snapshot as the anchor" shape this section
+describes came back on every resume, for every source engine, not only
+MySQL (the Streamer's own field doc said the resumed first snapshot was a
+fine seed "because the applier's target schema is the same as when
+cold-start completed" — false for any DDL made while stopped). A type
+widen within a family was silently rounded into the narrow target column
+from v0.79.0 (opt-in) and v0.99.45 (default). The fix checks that first
+boundary against the target's catalog instead of accepting it, and arms
+the binlog reader to emit a first-touch boundary the way pgoutput's
+RelationMessage already does — ADR-0091 §5c.
+
 ### Bug 90 closure (v0.79.1, 2026-05-24)
 
 v0.79.0 shipped §2a's "refuse loudly on computed DEFAULT" guard, but

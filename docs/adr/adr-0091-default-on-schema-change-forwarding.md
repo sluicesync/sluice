@@ -11,6 +11,10 @@ declared "Accepted" *unbolded*, and the G-17 status-parity gate read
 only bold tokens, so the DOC-3 lag it exists to catch sailed straight
 through it. The gate now reads unbolded declarations on both sides.
 
+**Amended v0.156.10 (GC-44):** §5b's seed-guard consults the target for an
+ALTER COLUMN TYPE, and the new §5c checks every intercept's first boundary
+against the target's catalog (the target-witnessed first boundary).
+
 Extends ADR-0058 (online ADD COLUMN
 forwarding) from an opt-in, ADD-COLUMN-only intercept to a
 **default-on, all-unambiguous-shapes** forwarding path on the
@@ -428,6 +432,97 @@ CDC→CDC boundaries forward normally). The benefit: no residual fidelity
 gap can ever forward a phantom destructive DDL. This is the
 value-fidelity discipline (CLAUDE.md "loud failure / no silent loss")
 applied to schema forwarding: when in doubt, do **not** destroy.
+
+**Amended (GC-44, v0.156.10): "the target keeps the column" was not safe
+for an ALTER COLUMN TYPE.** A type widen the guard skips leaves the
+target's narrow column in place, and every following value is rounded
+into it — DATETIME fsp, DECIMAL scale, FLOAT → DOUBLE — at exit 0, with
+the skip logged at INFO. An ALTER COLUMN TYPE classified against the seed
+is now decided by the target witness (§5c): the target already holding
+what the snapshot says is a phantom (skipped); the target still holding
+the seed's type is genuine (forwarded through the same zone door and
+dispatch as any ALTER). The other mutating shapes keep the skip, now at
+WARN. Pinned by `TestInterceptAddColumnForward_SeedGuardConsultsTheWitness`
+and the seed-guard cell of `TestTWFBPinMatrix_*`.
+
+### 5c. The target-witnessed first boundary (GC-44, v0.156.10)
+
+§5b and the seed only cover the intercept a cold start wires. Every other
+wiring — a warm resume, a supervisor restart, an in-process ADR-0038
+retry, a VStream reshard reopen — started with an empty cache, and a
+table's first snapshot on it was cached as the baseline and passed
+downstream as history without being applied. A change made while the
+stream was stopped, or after it restarted and before the table's first
+row, therefore never reached the target: loud for a VARCHAR widen
+(22001) or an ADD COLUMN (schema drift), **silent** for a widen within a
+family. Affected: every single-stream forward since v0.99.45 (opt-in
+since v0.79.0) and the Shape A intercept since v0.73.1.
+
+The first boundary has no observed pre-state, but the stream's target
+does. So on `!hadPre` both intercepts render the snapshot as target
+storage (`--type-override`, the Shape A discriminator,
+`translate.RetargetForShapeCompare`) and compare it, column names and
+types only, against the target's read-back of the table
+(`pipeline/schema_forward_witness.go`):
+
+| Verdict | Single-stream | Shape A (v1) |
+|---|---|---|
+| match | accept as baseline | accept |
+| target cannot witness (table absent, no storage-shape rendering) | WARN, accept | WARN, accept |
+| target-only columns only (a DROP made while stopped) | WARN, accept | WARN, accept |
+| snapshot-only columns only | forward ADD COLUMN + backfill | refuse |
+| exactly one shared column differs within an allowlisted family (temporal precision, decimal p/s, char/varchar length, float width, int width) | forward ALTER COLUMN TYPE (zone door uses the target's type as the before) | refuse |
+| anything else (possible rename, >1 change, across families) | refuse `RESUME-SCHEMA-DIVERGENCE` | refuse |
+
+The check is stateless — nothing is persisted, a restart re-derives the
+same verdict — and a refusal lands before the snapshot goes downstream,
+so no ADR-0049 history row records a shape the target does not hold.
+The independent expected value is the target's catalog, read through
+the target engine's own SchemaReader.
+
+**The binlog lane's first touch (D3).** Postgres (RelationMessage) and
+VStream (FIELD) already emit a boundary at each table's first row of
+every stream. The binlog reader emitted one only when a DDL was pending,
+so a DDL whose position was persisted past before its forward (an
+out-of-scope commit after it, then a restart) was never re-checked. An
+armed binlog reader now emits a first-touch boundary per in-scope table,
+anchored at the stream's start position
+(`engines/mysql/cdc_first_touch_boundary.go`), armed by
+`wireSchemaDeltaArming` at every reader-open site wherever an intercept
+consumes it.
+
+**Availability.** Because Postgres and VStream take a first boundary on
+every resume, a single phantom family would refuse a healthy stream on
+every restart. The comparison lens (`witnessCompareType`) erases exactly
+the measured projection-vs-catalog differences — AutoIncrement,
+charset/collation, `Decimal{0,0}`, geometry subtype/SRID, enum type name
+and wire-unknown labels, domain wrappers, array element modifiers — and
+the anti-phantom family matrix (`TestTWFBFamilyMatrix_*`, the PostGIS
+arms in the postgis job, plus the VStream arm of `TestVStream_TWFB_*`)
+pins a MATCH for every family in mysql→postgres, postgres→postgres,
+postgres→mysql, mysql→mysql, mariadb→postgres and mariadb→mysql. It found
+three projection-vs-catalog differences the code did not account for:
+
+- a bare PG `numeric` lands on MySQL as `DECIMAL(65,30)`, which the
+  compare lane did not predict — an allowlisted family, so a phantom
+  FORWARD on every resume (`translate.MySQLUnconstrainedDecimalPrecision`,
+  bound by `TestMaterializedDecimalMatchesTheEmitter`);
+- MariaDB's native `UUID` / `INET4` / `INET6` land on a MySQL-family
+  target as `CHAR(36)` / `VARCHAR(45)`, which the compare lane predicted
+  only for a Postgres source — a phantom refusal (mysqlTargetEmitShape,
+  bound by `TestMaterializedNetworkTypesMatchTheEmitter`);
+- MariaDB `JSON` is a LONGTEXT alias the schema reader recovers as JSON
+  and the binlog boundary reads as LONGTEXT — a phantom refusal on every
+  resume of a MariaDB stream with a JSON column, caught by the existing
+  `TestStreamer_MariaDBToPostgres` (the lens equates JSON with long TEXT;
+  the residual is a source JSON ⇄ LONGTEXT change made while stopped).
+
+**Residuals, stated.** Geometry is compared at geometry-vs-geography
+only. A Postgres source cannot stream `geography` at all (refused at the
+reader). Shape A refuses any non-trivial first-boundary difference
+rather than forwarding it (the lease coordinates a boundary every shard
+observes; a first boundary is observed by one shard). A table the target
+does not hold is accepted with a WARN.
 
 **Engine limitation that follows:** because pgoutput carries no
 secondary-index / generated-column / CHECK metadata, those shapes
