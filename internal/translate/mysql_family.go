@@ -29,3 +29,13 @@ func IsMySQLFamily(engine string) bool {
 		strings.EqualFold(engine, "mariadb") ||
 		strings.EqualFold(engine, "mydumper")
 }
+
+// ProjectsJSONAsLongText reports whether the named SOURCE engine's CDC
+// schema snapshots describe a JSON column as a long TEXT. MariaDB stores
+// JSON as LONGTEXT with a JSON_VALID check: the cold start's schema read
+// reports JSON (so the target holds JSON), while the change stream's
+// snapshot of the same column is a long TEXT. On every other engine a
+// long-TEXT-vs-JSON difference is a real one.
+func ProjectsJSONAsLongText(engine string) bool {
+	return strings.EqualFold(engine, "mariadb")
+}

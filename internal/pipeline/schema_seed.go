@@ -189,8 +189,9 @@ func (s *Streamer) loadWarmResumeSchemaSeed(ctx context.Context, applier ir.Chan
 	if err != nil {
 		return nil, err
 	}
-	// The same read serves the GC-44 first-boundary witness (D4).
+	// The same reads serve the GC-44 first-boundary witness (D4, F13).
 	s.firstBoundaryCatalog = witness
+	s.firstBoundaryHistory = history
 	return mergeWarmResumeSeed(ctx, streamID, "", witness, history, s.Mappings)
 }
 

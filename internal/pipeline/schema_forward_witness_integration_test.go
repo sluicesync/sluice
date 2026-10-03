@@ -9,8 +9,10 @@
 // pre-state it can trust.
 //
 // Change kinds (one table each, so each verdict is unambiguous): a temporal
-// precision widen, a decimal scale widen, FLOAT → DOUBLE, a VARCHAR widen,
-// ADD COLUMN (with the backfill of the rows the target already held), DROP
+// precision widen, a decimal widen on both axes ((10,2) → (12,4); a scale
+// widen at fixed precision narrows the integer digits and refuses — the
+// unit truth table pins it), FLOAT → DOUBLE, a VARCHAR widen, ADD COLUMN
+// (with the backfill of the rows the target already held), DROP
 // COLUMN (WARN, the target keeps it), a zone swap, RENAME (refuse), a
 // two-column change (refuse), and an unchanged control.
 //
@@ -97,9 +99,9 @@ func mysqlToPGDialect() twfbDialect {
 			{
 				table:  "t_dec",
 				create: "CREATE TABLE t_dec (id BIGINT NOT NULL PRIMARY KEY, v DECIMAL(10,2) NOT NULL) ENGINE=InnoDB; INSERT INTO t_dec VALUES (1, 1.25);",
-				ddl:    "ALTER TABLE t_dec MODIFY v DECIMAL(10,4) NOT NULL",
+				ddl:    "ALTER TABLE t_dec MODIFY v DECIMAL(12,4) NOT NULL",
 				probe:  "INSERT INTO t_dec VALUES (2, 1.2345)",
-				column: "v", wantType: "numeric(10,4)",
+				column: "v", wantType: "numeric(12,4)",
 				readBack: "SELECT v::text FROM t_dec WHERE id = 2", want: "1.2345",
 			},
 			{
@@ -192,9 +194,9 @@ func pgToPGDialect() twfbDialect {
 			{
 				table:  "t_dec",
 				create: "CREATE TABLE t_dec (id bigint PRIMARY KEY, v numeric(10,2) NOT NULL); INSERT INTO t_dec VALUES (1, 1.25);",
-				ddl:    "ALTER TABLE t_dec ALTER COLUMN v TYPE numeric(10,4)",
+				ddl:    "ALTER TABLE t_dec ALTER COLUMN v TYPE numeric(12,4)",
 				probe:  "INSERT INTO t_dec VALUES (2, 1.2345)",
-				column: "v", wantType: "numeric(10,4)",
+				column: "v", wantType: "numeric(12,4)",
 				readBack: "SELECT v::text FROM t_dec WHERE id = 2", want: "1.2345",
 			},
 			{

@@ -28,22 +28,28 @@ package pipeline
 // The first boundary has no pre-state, but the stream's own target does —
 // it holds exactly what every earlier boundary and the cold start left
 // there. So on `!hadPre` the intercept renders the snapshot as the target
-// would store it (mappings, the Shape A discriminator, then
+// would store it (the Shape A discriminator, then
 // [translate.RetargetForShapeCompare]) and compares it against the target's
 // read-back of the table, column names and types only, through
-// [witnessCompareType]'s lens on both sides:
+// [witnessCompareType]'s lens on both sides; a difference is re-checked
+// against a fresh catalog read before it is acted on:
 //
 //   - equal → the baseline is accepted, as before.
 //   - the snapshot carries columns the target lacks, and nothing else →
 //     forward ADD COLUMN, with the added-column backfill, against a
 //     synthesized pre-state (the snapshot minus those columns).
 //   - exactly one shared column differs, within one type family on the
-//     allowlist ([witnessForwardableTypeChange]) → forward ALTER COLUMN TYPE
-//     against a synthesized pre-state carrying the TARGET's type, so the
-//     session-zone door sees the zone family the target actually holds.
+//     allowlist, and the TARGET is narrower ([witnessWidthOrder]) → forward
+//     ALTER COLUMN TYPE against a synthesized pre-state carrying the
+//     TARGET's type, so the session-zone door sees the zone family the
+//     target actually holds.
+//   - the same, but the target is WIDER → a WARN, and the target keeps its
+//     type: a first boundary cannot tell an old shape from a new one, and
+//     narrowing a target that already holds wider values is silent loss.
 //   - the target carries columns the snapshot lacks, and nothing else → a
 //     WARN (a DROP COLUMN made while stopped is benign: the target keeps
 //     the column, as the drained model would).
+//   - a column an operator --type-override names is not compared.
 //   - anything else — added and dropped together (a possible rename), more
 //     than one type change, a change across families — refuses BEFORE the
 //     snapshot goes downstream, with the grep-stable marker
@@ -103,23 +109,38 @@ var resumeDivergenceMarker = ir.ErrResumeSchemaDivergence.Error()
 type targetCatalogLoader func(ctx context.Context) (map[string]*ir.Table, error)
 
 // targetCatalogWitness is the target's catalog, read lazily and memoized
-// for one intercept instance. A table absent from the memo re-reads the
-// catalog once (a table the target created after the read — a live add),
-// and a table this intercept has itself changed is forgotten so its next
-// lookup reads the change back. Used only on the intercept's goroutine.
+// for one intercept instance. The only read the target engine offers is the
+// whole catalog, so the memo is kept per TABLE: a table absent from it
+// (one the target created after the read — a live add) re-reads once, a
+// table this intercept has itself changed is marked stale and re-read on
+// its next lookup only, and a table whose memo disagrees with a snapshot is
+// re-checked against a fresh read once ([targetCatalogWitness.recheck]).
+// Every other table keeps its memo. Used only on the intercept's goroutine.
 type targetCatalogWitness struct {
-	load      targetCatalogLoader
-	tables    map[string]*ir.Table
-	loaded    bool
+	load   targetCatalogLoader
+	tables map[string]*ir.Table
+	loaded bool
+
+	// refreshed / rechecked bound the full re-reads a table can cause to one
+	// each per intercept instance; stale marks a table this intercept
+	// altered.
 	refreshed map[string]bool
+	rechecked map[string]bool
+	stale     map[string]bool
 }
 
 // newTargetCatalogWitness returns a witness over load. initial, when
 // non-nil, is a catalog read already made on this attempt — the SLM-1b
 // warm-resume seed read ([Streamer.loadWarmResumeSchemaSeed]) — and saves
-// the first read.
+// the first read. It may be older than a peer's DDL (Shape A); a mismatch
+// is always re-checked against a fresh read before it is acted on.
 func newTargetCatalogWitness(load targetCatalogLoader, initial map[string]*ir.Table) *targetCatalogWitness {
-	w := &targetCatalogWitness{load: load, refreshed: map[string]bool{}}
+	w := &targetCatalogWitness{
+		load:      load,
+		refreshed: map[string]bool{},
+		rechecked: map[string]bool{},
+		stale:     map[string]bool{},
+	}
 	if initial != nil {
 		w.tables, w.loaded = initial, true
 	}
@@ -130,7 +151,7 @@ func newTargetCatalogWitness(load targetCatalogLoader, initial map[string]*ir.Ta
 // exact spelling misses and exactly one table folds onto it — a MySQL
 // target folding identifier case).
 func (w *targetCatalogWitness) lookup(ctx context.Context, name string) (*ir.Table, bool, error) {
-	if !w.loaded {
+	if !w.loaded || w.stale[name] {
 		if err := w.read(ctx); err != nil {
 			return nil, false, err
 		}
@@ -149,11 +170,24 @@ func (w *targetCatalogWitness) lookup(ctx context.Context, name string) (*ir.Tab
 	return t, ok, nil
 }
 
-// forget drops the memo, so the next lookup reads the catalog again — the
-// intercept has just changed the target.
-func (w *targetCatalogWitness) forget() {
-	w.loaded = false
-	w.tables = nil
+// recheck re-reads the catalog for a table whose memo disagreed with a
+// snapshot, once per table per instance, and returns the fresh read-back.
+func (w *targetCatalogWitness) recheck(ctx context.Context, name string) (*ir.Table, bool, error) {
+	if !w.rechecked[name] {
+		w.rechecked[name] = true
+		if err := w.read(ctx); err != nil {
+			return nil, false, err
+		}
+	}
+	t, ok := w.find(name)
+	return t, ok, nil
+}
+
+// forget marks name stale — the intercept has just changed it on the
+// target — so its next lookup reads the change back. Other tables keep
+// their memo.
+func (w *targetCatalogWitness) forget(name string) {
+	w.stale[name] = true
 }
 
 func (w *targetCatalogWitness) read(ctx context.Context) error {
@@ -162,6 +196,7 @@ func (w *targetCatalogWitness) read(ctx context.Context) error {
 		return err
 	}
 	w.tables, w.loaded = tables, true
+	clear(w.stale)
 	return nil
 }
 
@@ -186,11 +221,17 @@ func (w *targetCatalogWitness) find(name string) (*ir.Table, bool) {
 type firstBoundaryWitness struct {
 	catalog *targetCatalogWitness
 
+	// history is this stream's own retained schema version per table at the
+	// persisted position (nil when the warm resume loaded none). Read only
+	// by Shape A ([shapeAPeerAddedColumns]).
+	history []*ir.Table
+
 	sourceEngine string
 	targetEngine string
 
-	// mappings are the operator's --type-override entries; a mapped column
-	// is held to its override's type, exactly as the cold start created it.
+	// mappings are the operator's --type-override entries. An overridden
+	// column's TYPE is the operator's decision, not a rendering of the
+	// source's, so the witness does not compare it ([witnessOptions.pinned]).
 	mappings []config.Mapping
 
 	// shardColumn is the Shape A discriminator (--inject-shard-column);
@@ -215,9 +256,14 @@ const (
 	// and differs in nothing else.
 	witnessForwardAdd
 	// witnessForwardAlter — exactly one shared column differs, within an
-	// allowlisted type family (or across the zone-sibling pair, which the
-	// forward path's own door refuses with its specific message).
+	// allowlisted type family, and the TARGET is the narrower side (or the
+	// pair is the zone-sibling swap, which the forward path's own door
+	// refuses with its specific message).
 	witnessForwardAlter
+	// witnessTargetWider — exactly one shared column differs, within an
+	// allowlisted family, and the TARGET is the wider side. Never forwarded:
+	// see [witnessWidthOrder].
+	witnessTargetWider
 	// witnessRefuse — anything else.
 	witnessRefuse
 )
@@ -275,20 +321,32 @@ func (w *firstBoundaryWitness) verdict(ctx context.Context, post *ir.Table) (wit
 	if err != nil {
 		return witnessVerdict{}, err
 	}
-	return classifyWitness(expected, target), nil
+	opts := w.options(post)
+	v := classifyWitness(expected, target, opts)
+	if v.kind == witnessMatch {
+		return v, nil
+	}
+	// The memo may predate a change the target has since taken — a Shape A
+	// peer's coordinated DDL, or anything an operator ran — so a difference
+	// is decided against a fresh read, never against the memo.
+	target, held, err = w.catalog.recheck(ctx, post.Name)
+	if err != nil {
+		return witnessVerdict{}, err
+	}
+	if !held {
+		return witnessVerdict{kind: witnessUnwitnessed, reason: "the target does not hold the table"}, nil
+	}
+	return classifyWitness(expected, target, opts), nil
 }
 
-// expected renders post as the target would store it — the operator's
-// type overrides, the Shape A discriminator, then the compare-lane retarget —
-// the same passes, in the same order, the cold start ran before creating
-// the table ([Streamer.coldStartPrepareSchema]).
+// expected renders post as the target would store it — the Shape A
+// discriminator, then the compare-lane retarget. Operator overrides are not
+// applied: an overridden column is not compared at all
+// ([witnessOptions.pinned]).
 func (w *firstBoundaryWitness) expected(post *ir.Table) (*ir.Table, error) {
 	schema := &ir.Schema{Tables: []*ir.Table{post}}
-	schema, err := translate.ApplyMappings(schema, mappingsFor(post, w.mappings))
-	if err != nil {
-		return nil, fmt.Errorf("apply --type-override to %q: %w", post.Name, err)
-	}
 	if w.shardColumn != "" {
+		var err error
 		schema, err = translate.InjectShardColumn(schema, w.shardColumn, ir.Varchar{Length: 64})
 		if err != nil {
 			return nil, fmt.Errorf("inject the shard column into %q: %w", post.Name, err)
@@ -301,28 +359,54 @@ func (w *firstBoundaryWitness) expected(post *ir.Table) (*ir.Table, error) {
 	return schema.Tables[0], nil
 }
 
-// mappingsFor keeps the overrides that name post and a column it still
-// carries. [translate.ApplyMappings] refuses an override naming an absent
-// column, which is right for a whole schema at cold start and wrong here: a
-// column dropped on the source since then is exactly a case this check
-// classifies, not an operator typo.
-func mappingsFor(post *ir.Table, mappings []config.Mapping) []config.Mapping {
-	if len(mappings) == 0 {
-		return nil
-	}
-	cols := make(map[string]bool, len(post.Columns))
-	for _, c := range post.Columns {
-		if c != nil {
-			cols[c.Name] = true
+// witnessOptions are the per-stream facts [classifyWitness] needs beyond
+// the two tables.
+type witnessOptions struct {
+	// pinned are the columns an operator --type-override names. Their TYPE
+	// is not compared: the override decided what the target holds, the
+	// source's type says nothing about it, and the target emitter renders
+	// an override in ways no source rendering predicts (a MySQL target reads
+	// a `json` override back as binary JSON, a Postgres target a `mediumtext`
+	// one as `text`). So the witness never alters an overridden column and
+	// never refuses over one. The cost, stated: an override CHANGED between
+	// runs, and a source type change on an overridden column, are not seen
+	// at a first boundary — exactly as before GC-44, and the CDC→CDC forward
+	// path does not apply overrides either. Presence (added / target-only)
+	// is still compared.
+	pinned map[string]bool
+
+	// jsonAsLongText: the source's change stream reads a JSON column as long
+	// TEXT (MariaDB, whose JSON is a LONGTEXT alias — see
+	// [translate.ProjectsJSONAsLongText]), so a long-TEXT snapshot column
+	// against a JSON target column is equal. Scoped to that source and that
+	// direction so a real JSON ⇄ TEXT change on any other source is still
+	// seen.
+	jsonAsLongText bool
+}
+
+// historyFor returns this stream's retained version of the table named
+// name, or nil.
+func (w *firstBoundaryWitness) historyFor(name string) *ir.Table {
+	for _, t := range w.history {
+		if t != nil && t.Name == name {
+			return t
 		}
 	}
-	var out []config.Mapping
-	for _, m := range mappings {
-		if m.Table == post.Name && cols[m.Column] {
-			out = append(out, m)
+	return nil
+}
+
+// options builds the witnessOptions for post.
+func (w *firstBoundaryWitness) options(post *ir.Table) witnessOptions {
+	opts := witnessOptions{jsonAsLongText: translate.ProjectsJSONAsLongText(w.sourceEngine)}
+	for _, m := range w.mappings {
+		if m.Table == post.Name {
+			if opts.pinned == nil {
+				opts.pinned = map[string]bool{}
+			}
+			opts.pinned[m.Column] = true
 		}
 	}
-	return out
+	return opts
 }
 
 // classifyWitness is the pure comparison: expected (the snapshot rendered
@@ -331,10 +415,10 @@ func mappingsFor(post *ir.Table, mappings []config.Mapping) []config.Mapping {
 // column with a generation expression and no expected counterpart is not
 // a divergence (the Postgres change stream never carries generated
 // columns, and the target derives them itself).
-func classifyWitness(expected, target *ir.Table) witnessVerdict {
+func classifyWitness(expected, target *ir.Table, opts witnessOptions) witnessVerdict {
 	exp := witnessCompareTable(expected, nil)
 	act := witnessCompareTable(target, exp)
-	reconcilePairs(exp, act)
+	reconcilePairs(exp, act, opts)
 	mismatches := irdiff.TableColumnShapeWithOptions(exp, act, irdiff.ShapeCompareOptions{ColumnTypesOnly: true})
 	if len(mismatches) == 0 {
 		return witnessVerdict{kind: witnessMatch}
@@ -366,12 +450,22 @@ func classifyWitness(expected, target *ir.Table) witnessVerdict {
 		v.kind = witnessTargetOnly
 	case len(typeDiffs) == 1 && len(v.added) == 0 && len(v.targetOnly) == 0:
 		name := typeDiffs[0]
-		if witnessForwardableTypeChange(actCols[name].Type, expCols[name].Type) ||
-			sessionZoneSiblingSwap(actCols[name].Type, expCols[name].Type) {
+		v.altered = name
+		v.targetType = rawTarget[name].Type
+		if sessionZoneSiblingSwap(actCols[name].Type, expCols[name].Type) {
 			v.kind = witnessForwardAlter
-			v.altered = name
-			v.targetType = rawTarget[name].Type
-		} else {
+			break
+		}
+		switch witnessWidthOrder(actCols[name].Type, expCols[name].Type) {
+		case targetNarrower:
+			v.kind = witnessForwardAlter
+		case targetWider:
+			v.kind = witnessTargetWider
+		case sameWidth:
+			// Two spellings of one storage (a bare temporal against its
+			// engine default): nothing to do.
+			return witnessVerdict{kind: witnessMatch}
+		default:
 			v.kind = witnessRefuse
 		}
 	default:
@@ -380,42 +474,156 @@ func classifyWitness(expected, target *ir.Table) witnessVerdict {
 	return v
 }
 
-// witnessForwardableTypeChange is the allowlist: the type changes the first
-// boundary forwards when only the target can say what the column was. Each
-// stays within one family whose values the target's own ALTER converts the
-// way the source's did — temporal precision (zone kind unchanged), decimal
-// precision/scale, character length, float width, integer width (sign
-// unchanged). Everything else refuses: with no observed pre-state, a change
-// across families is as likely a rename, an override, or a target someone
-// altered by hand as a source DDL, and guessing wrong is silent.
-func witnessForwardableTypeChange(from, to ir.Type) bool {
-	switch t := to.(type) {
+// widthOrder is how the target's column compares with the snapshot's
+// rendering of it, within one allowlisted family.
+type widthOrder int
+
+const (
+	// notComparable — across families, a sign change, or a zone-kind
+	// change: refuse.
+	notComparable widthOrder = iota
+	// targetNarrower — the source widened the column: forward the ALTER.
+	targetNarrower
+	// targetWider — the target already holds MORE than the snapshot says.
+	targetWider
+	// mixedWidth — wider on one axis and narrower on another (a decimal
+	// whose precision grew and scale shrank): refuse.
+	mixedWidth
+	// sameWidth — the two differ only in spelling.
+	sameWidth
+)
+
+// witnessWidthOrder is the allowlist, with its direction. The families are
+// those whose values the target's own ALTER converts the way the source's
+// did — temporal precision (zone kind unchanged), decimal precision/scale,
+// character length, float width, integer width (sign unchanged); anything
+// else is notComparable and refuses: with no observed pre-state, a change
+// across families is as likely a rename or a hand-altered target as a
+// source DDL, and guessing wrong is silent.
+//
+// DIRECTION IS LOAD-BEARING (GC-44 review). Only a target NARROWER than the
+// snapshot is forwarded. A target WIDER than the snapshot is never
+// narrowed, because the first boundary cannot tell an old shape from a new
+// one: a target an operator widened on purpose would be narrowed, changing
+// every later value that needs the wider type (TestTWFB_OperatorWidenedTarget_*
+// measures it), and a Postgres replay after a crash in the middle of a
+// transaction `UPDATE; ALTER c numeric(12,4); INSERT …` starts with the
+// PRE-ALTER relation while the target already holds the widened column and
+// rows written under it (TestTWFB_PostgresCrashMidTransaction_KeepsTheWiderTarget
+// pins that it converges; there the narrowing was healed by the next
+// relation and the rows' re-delivery, on every apply configuration measured,
+// but a narrowing that cannot hold those rows — a varchar or int — refuses
+// with 22001/22003 instead). A genuine source NARROWING is
+// therefore not forwarded at a first boundary (WARNed instead); the CDC→CDC
+// path, which sees both sides, still forwards one seen live.
+func witnessWidthOrder(target, snapshot ir.Type) widthOrder {
+	switch s := snapshot.(type) {
 	case ir.DateTime:
-		_, ok := from.(ir.DateTime)
-		return ok
+		t, ok := target.(ir.DateTime)
+		if !ok {
+			return notComparable
+		}
+		return orderInts(effectivePrecision(t.Precision, t.PrecisionUnspecified), effectivePrecision(s.Precision, s.PrecisionUnspecified))
 	case ir.Time:
-		f, ok := from.(ir.Time)
-		return ok && f.WithTimeZone == t.WithTimeZone
+		t, ok := target.(ir.Time)
+		if !ok || t.WithTimeZone != s.WithTimeZone {
+			return notComparable
+		}
+		return orderInts(effectivePrecision(t.Precision, t.PrecisionUnspecified), effectivePrecision(s.Precision, s.PrecisionUnspecified))
 	case ir.Timestamp:
-		f, ok := from.(ir.Timestamp)
-		return ok && f.WithTimeZone == t.WithTimeZone
+		t, ok := target.(ir.Timestamp)
+		if !ok || t.WithTimeZone != s.WithTimeZone {
+			return notComparable
+		}
+		return orderInts(effectivePrecision(t.Precision, t.PrecisionUnspecified), effectivePrecision(s.Precision, s.PrecisionUnspecified))
 	case ir.Decimal:
-		_, ok := from.(ir.Decimal)
-		return ok
+		t, ok := target.(ir.Decimal)
+		if !ok {
+			return notComparable
+		}
+		return orderDecimals(t, s)
 	case ir.Varchar:
-		_, ok := from.(ir.Varchar)
-		return ok
+		t, ok := target.(ir.Varchar)
+		if !ok {
+			return notComparable
+		}
+		return orderInts(t.Length, s.Length)
 	case ir.Char:
-		_, ok := from.(ir.Char)
-		return ok
+		t, ok := target.(ir.Char)
+		if !ok {
+			return notComparable
+		}
+		return orderInts(t.Length, s.Length)
 	case ir.Float:
-		_, ok := from.(ir.Float)
-		return ok
+		t, ok := target.(ir.Float)
+		if !ok {
+			return notComparable
+		}
+		return orderInts(floatWidth(t.Precision), floatWidth(s.Precision))
 	case ir.Integer:
-		f, ok := from.(ir.Integer)
-		return ok && f.Unsigned == t.Unsigned
+		t, ok := target.(ir.Integer)
+		if !ok || t.Unsigned != s.Unsigned {
+			return notComparable
+		}
+		return orderInts(int(t.Width), int(s.Width))
 	}
-	return false
+	return notComparable
+}
+
+// orderInts orders a target measure against a snapshot measure.
+func orderInts(target, snapshot int) widthOrder {
+	switch {
+	case target < snapshot:
+		return targetNarrower
+	case target > snapshot:
+		return targetWider
+	}
+	return sameWidth
+}
+
+// effectivePrecision is a temporal's stored precision: an unspecified one
+// is the engine default, 6, on every engine that leaves it unspecified
+// (Postgres; a MySQL target's bare precision is materialized by the
+// compare lane before it gets here).
+func effectivePrecision(p int, unspecified bool) int {
+	if unspecified {
+		return 6
+	}
+	return p
+}
+
+// floatWidth ranks the float widths.
+func floatWidth(p ir.FloatPrecision) int {
+	if p == ir.FloatDouble {
+		return 2
+	}
+	return 1
+}
+
+// orderDecimals orders two decimals on BOTH axes a value needs — the
+// integer digits (precision − scale) and the scale. An unconstrained
+// decimal is unbounded on both. Narrower only when the target is no wider
+// on either axis; mixed when the axes disagree.
+func orderDecimals(target, snapshot ir.Decimal) widthOrder {
+	const unbounded = 1 << 30
+	axes := func(d ir.Decimal) (intDigits, scale int) {
+		if d.Unconstrained {
+			return unbounded, unbounded
+		}
+		return d.Precision - d.Scale, d.Scale
+	}
+	ti, ts := axes(target)
+	si, ss := axes(snapshot)
+	io, so := orderInts(ti, si), orderInts(ts, ss)
+	switch {
+	case io == so:
+		return io
+	case io == sameWidth:
+		return so
+	case so == sameWidth:
+		return io
+	}
+	return mixedWidth
 }
 
 // witnessCompareTable copies t's columns through [witnessCompareType] for
@@ -463,8 +671,8 @@ func witnessCompareTable(t, expected *ir.Table) *ir.Table {
 //   - Array: the element is resolved at typmod -1 on the wire, so its
 //     modifier is erased on both sides (an array typmod-only ALTER is
 //     refused at the Postgres reader before it can reach this).
-//   - JSON vs long TEXT (MariaDB's JSON alias): pairwise, in
-//     [reconcilePairs].
+//   - JSON vs long TEXT on a MariaDB source, and overridden columns:
+//     pairwise, in [reconcilePairs].
 func witnessCompareType(t ir.Type) ir.Type {
 	switch v := t.(type) {
 	case ir.Integer:
@@ -501,31 +709,34 @@ func witnessCompareType(t ir.Type) ir.Type {
 	return t
 }
 
-// reconcilePairs applies the two lens rules that need BOTH sides of a
-// column at once:
+// reconcilePairs applies the lens rules that need BOTH sides of a column at
+// once:
 //
+//   - an overridden column ([witnessOptions.pinned]) is not compared.
 //   - an enum whose labels one side does not know (the pgoutput projection:
 //     a bare OID) equals the other side's enum; labels are compared only
 //     when both sides carry them.
-//   - JSON on one side and a long TEXT on the other are equal. MariaDB's
-//     JSON is a LONGTEXT alias with an auto json_valid CHECK; its
-//     SchemaReader recovers the JSON identity from that CHECK, but the
-//     binlog boundary projection reads the column as LONGTEXT, so every
-//     MariaDB JSON column read as a type change against the target the
-//     cold start created (measured by TestStreamer_MariaDBToPostgres: a
-//     RESUME-SCHEMA-DIVERGENCE on every resume). What the rule stops
-//     seeing is a source JSON ⇄ LONGTEXT change made while the stream was
-//     stopped. A text target holds a JSON document as written, and a JSON
-//     target refuses a non-JSON text loudly — but a jsonb target re-renders
-//     valid JSON text (whitespace, key order). That residual is accepted
-//     and stated: it is narrower than the phantom refusal on every MariaDB
-//     JSON column it replaces, and before GC-44 the change was not seen
-//     either.
-func reconcilePairs(exp, act *ir.Table) {
+//   - on a source whose change stream reads JSON as long TEXT
+//     ([witnessOptions.jsonAsLongText] — MariaDB), a long-TEXT snapshot
+//     column equals a JSON target column. MariaDB's JSON is a LONGTEXT
+//     alias with an auto json_valid CHECK; its SchemaReader recovers the
+//     JSON identity from that CHECK, but the binlog boundary projection
+//     reads the column as LONGTEXT, so every MariaDB JSON column read as a
+//     type change against the target the cold start created (measured by
+//     TestStreamer_MariaDBToPostgres: a RESUME-SCHEMA-DIVERGENCE on every
+//     resume). The residual, stated: on a MariaDB source a JSON ⇄ LONGTEXT
+//     change made while the stream was stopped is not seen at the first
+//     boundary. Every other source still compares JSON and TEXT as
+//     different families.
+func reconcilePairs(exp, act *ir.Table, opts witnessOptions) {
 	actCols := columnsByNameIR(act)
 	for _, e := range exp.Columns {
 		a, ok := actCols[e.Name]
 		if !ok {
+			continue
+		}
+		if opts.pinned[e.Name] {
+			e.Type = a.Type
 			continue
 		}
 		ee, eIsEnum := e.Type.(ir.Enum)
@@ -534,17 +745,18 @@ func reconcilePairs(exp, act *ir.Table) {
 			e.Type, a.Type = ir.Enum{}, ir.Enum{}
 			continue
 		}
-		if jsonOrLongText(e.Type, a.Type) || jsonOrLongText(a.Type, e.Type) {
-			e.Type, a.Type = ir.Text{Size: ir.TextLong}, ir.Text{Size: ir.TextLong}
+		if opts.jsonAsLongText && isLongText(e.Type) {
+			if _, targetJSON := a.Type.(ir.JSON); targetJSON {
+				e.Type = a.Type
+			}
 		}
 	}
 }
 
-// jsonOrLongText reports whether x is JSON and y a long TEXT.
-func jsonOrLongText(x, y ir.Type) bool {
-	_, xJSON := x.(ir.JSON)
-	yText, yIsText := y.(ir.Text)
-	return xJSON && yIsText && yText.Size == ir.TextLong
+// isLongText reports whether t is a long TEXT.
+func isLongText(t ir.Type) bool {
+	text, ok := t.(ir.Text)
+	return ok && text.Size == ir.TextLong
 }
 
 // eraseWitnessArrayModifier maps an array element to its modifier-free
@@ -605,7 +817,8 @@ func resumeDivergenceRefusal(tableName string, v witnessVerdict, hint string) er
 		"%w: the first schema boundary for %q after this stream (re)started does not match the target table, "+
 			"and the difference is not one sluice can forward without knowing what the source changed (%s). "+
 			"Refusing before the boundary is recorded or any row after it is applied; nothing has been written. "+
-			"Reconcile the target with the source via the drained model; every start repeats this check. %s",
+			"Reconcile the target with the source via the drained model; the check runs again at this table's "+
+			"first schema boundary on the next start. %s",
 		ir.ErrResumeSchemaDivergence, tableName, v.render(), hint,
 	)
 }
@@ -649,6 +862,9 @@ func routeWitnessedBoundary(
 				"values from here — drop them on the target if that is intended",
 			"table", tableName, "target_only_columns", v.targetOnly)
 		return nil, nil
+	case witnessTargetWider:
+		logTargetWider(ctx, tableName, v)
+		return nil, nil
 	case witnessRefuse:
 		return nil, resumeDivergenceRefusal(tableName, v, forwardRecoveryHint(tableName))
 	}
@@ -660,8 +876,19 @@ func routeWitnessedBoundary(
 	if err := routeForwardBoundary(ctx, deps, tableName, pre, post, snap, false); err != nil {
 		return nil, err
 	}
-	deps.witness.catalog.forget()
+	deps.witness.catalog.forget(snap.IR.Name)
 	return pre, nil
+}
+
+// logTargetWider is the WARN for [witnessTargetWider], shared by both
+// intercepts.
+func logTargetWider(ctx context.Context, tableName string, v witnessVerdict) {
+	slog.WarnContext(ctx,
+		"schema-forward: the target column is WIDER than the source's at the first schema boundary after a "+
+			"(re)start; the target keeps its type (a first boundary never narrows a column — it may be a replay "+
+			"of the shape BEFORE a change the target already took, or a target widened on purpose). If the source "+
+			"really narrowed it, narrow the target yourself via the drained model",
+		"table", tableName, "difference", v.render())
 }
 
 // witnessSynthesizedPre is the pre-state a witnessed forward is classified

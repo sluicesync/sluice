@@ -32,6 +32,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"sluicesync.dev/sluice/internal/config"
 )
 
 // twfbMySQLFamilyDDL carries every arm of internal/engines/mysql
@@ -218,6 +220,67 @@ const twfbPGOnlyProbe = `
 	VALUES (2, 'a fat cat', '[1,5)', '[2026-10-02 00:00+00,2026-10-03 00:00+00)', '<a>x</a>', 12.34, '1 day 02:03:04');
 `
 
+// The --type-override cells (GC-44 review item 3). An overridden column's
+// type is the operator's, and the target emitter renders some overrides in
+// ways no source rendering predicts — a `json` override reads back as
+// binary JSON on a MySQL target, a `mediumtext` one as `text` on a Postgres
+// target, and `smallint` on a TINYINT(1) column crosses families against
+// the change stream's boolean. Each override family is here, per direction,
+// so a witness that compared an overridden column's type would refuse or
+// forward on the restart.
+const twfbMySQLOverrideDDL = `
+	CREATE TABLE fam_ovr (
+		id     INT NOT NULL PRIMARY KEY,
+		o_bool TINYINT(1),
+		o_vc   VARCHAR(50),
+		o_json LONGTEXT,
+		o_mt   TEXT
+	) ENGINE=InnoDB;
+	INSERT INTO fam_ovr (id) VALUES (1);
+`
+
+// o_bool carries NULL: the binlog CDC decode still applies the boolean
+// convention to a TINYINT(1) whatever the override says, so a 2 refuses
+// (SLUICE-E-VALUE-TINYINT1-RANGE) and a 1 reaches a Postgres smallint as a
+// bool and refuses at encode — both loud, both outside this matrix's
+// subject (the column's TYPE is), and filed as GC-44 F11
+// (docs/type-mapping.md scopes the smallint escape hatch to a bulk migrate,
+// but `sync` accepts it).
+const twfbMySQLOverrideProbe = `INSERT INTO fam_ovr VALUES (2, NULL, 'vc', '{"k": 1}', 'mt');`
+
+// twfbPGOverrideDDL has no TINYINT(1)-shaped column: the smallint override
+// is the MySQL boolean-convention escape hatch.
+const twfbPGOverrideDDL = `
+	CREATE TABLE fam_ovr (
+		id     bigint PRIMARY KEY,
+		o_vc   varchar(50),
+		o_json text,
+		o_mt   text
+	);
+	INSERT INTO fam_ovr (id) VALUES (1);
+`
+
+const twfbPGOverrideProbe = `INSERT INTO fam_ovr VALUES (2, 'vc', '{"k": 1}', 'mt');`
+
+// twfbOverrides is the override list for a source family; bool adds the
+// TINYINT(1) → smallint override a MySQL-family source carries.
+func twfbOverrides(withBool bool) []config.Mapping {
+	m := []config.Mapping{
+		{Table: "fam_ovr", Column: "o_vc", TargetType: "varchar", TargetTypeOptions: map[string]any{"length": 200}},
+		{Table: "fam_ovr", Column: "o_json", TargetType: "json"},
+		{Table: "fam_ovr", Column: "o_mt", TargetType: "mediumtext"},
+	}
+	if withBool {
+		m = append(m, config.Mapping{Table: "fam_ovr", Column: "o_bool", TargetType: "smallint"})
+	}
+	return m
+}
+
+var (
+	twfbMySQLOverrideTable = twfbFamilyTable{"fam_ovr", twfbMySQLOverrideDDL, twfbMySQLOverrideProbe}
+	twfbPGOverrideTable    = twfbFamilyTable{"fam_ovr", twfbPGOverrideDDL, twfbPGOverrideProbe}
+)
+
 // twfbFamilyTable is one table of a direction's matrix.
 type twfbFamilyTable struct {
 	name, ddl, probe string
@@ -259,7 +322,7 @@ func runTWFBFamilyMatrix(t *testing.T, cell twfbCell, tables []twfbFamilyTable) 
 		t.Errorf("PHANTOM: a healthy resume refused or forwarded:\n%s", lines)
 	}
 	for _, tb := range tables {
-		for _, marker := range []string{twfbLogForwarded, twfbLogUnwitnessed, twfbLogTargetOnly} {
+		for _, marker := range []string{twfbLogForwarded, twfbLogUnwitnessed, twfbLogTargetOnly, twfbLogTargetWider} {
 			if lines := logLinesFor(logs, marker, tb.name); len(lines) > 0 {
 				t.Errorf("PHANTOM on %s: %s", tb.name, strings.Join(lines, "\n"))
 			}
@@ -294,7 +357,8 @@ func TestTWFBFamilyMatrix_MySQLToPostgres(t *testing.T) {
 	defer tgtCleanup()
 	runTWFBFamilyMatrix(t, twfbCell{
 		src: twfbDB{"mysql", srcDSN}, tgt: twfbDB{"postgres", tgtDSN}, streamID: "twfb-fam-m2p",
-	}, []twfbFamilyTable{{"fam", twfbMySQLFamilyDDL, twfbMySQLFamilyProbe}})
+		mappings: twfbOverrides(true),
+	}, []twfbFamilyTable{{"fam", twfbMySQLFamilyDDL, twfbMySQLFamilyProbe}, twfbMySQLOverrideTable})
 }
 
 func TestTWFBFamilyMatrix_MySQLToMySQL(t *testing.T) {
@@ -302,9 +366,11 @@ func TestTWFBFamilyMatrix_MySQLToMySQL(t *testing.T) {
 	defer cleanup()
 	runTWFBFamilyMatrix(t, twfbCell{
 		src: twfbDB{"mysql", srcDSN}, tgt: twfbDB{"mysql", tgtDSN}, streamID: "twfb-fam-m2m",
+		mappings: twfbOverrides(true),
 	}, []twfbFamilyTable{
 		{"fam", twfbMySQLFamilyDDL, twfbMySQLFamilyProbe},
 		{"fam_geo", twfbMySQLGeometryDDL, twfbMySQLGeometryProbe},
+		twfbMySQLOverrideTable,
 	})
 }
 
@@ -313,9 +379,11 @@ func TestTWFBFamilyMatrix_PostgresToPostgres(t *testing.T) {
 	defer cleanup()
 	runTWFBFamilyMatrix(t, twfbCell{
 		src: twfbDB{"postgres", srcDSN}, tgt: twfbDB{"postgres", tgtDSN}, streamID: "twfb-fam-p2p",
+		mappings: twfbOverrides(false),
 	}, []twfbFamilyTable{
 		{"fam", twfbPGFamilyDDL, twfbPGFamilyProbe},
 		{"fam_pgonly", twfbPGOnlyDDL, twfbPGOnlyProbe},
+		twfbPGOverrideTable,
 	})
 }
 
@@ -331,7 +399,8 @@ func TestTWFBFamilyMatrix_PostgresToMySQL(t *testing.T) {
 	probe := strings.NewReplacer(" c_timetz,", "", " '10:11:12+02',", "").Replace(twfbPGFamilyProbe)
 	runTWFBFamilyMatrix(t, twfbCell{
 		src: twfbDB{"postgres", srcDSN}, tgt: twfbDB{"mysql", tgtDSN}, streamID: "twfb-fam-p2m",
-	}, []twfbFamilyTable{{"fam", twfbPGFamilyDDL, probe}})
+		mappings: twfbOverrides(false),
+	}, []twfbFamilyTable{{"fam", twfbPGFamilyDDL, probe}, twfbPGOverrideTable})
 }
 
 // twfbMariaDBOnlyDDL carries the MariaDB-native families: JSON (a LONGTEXT
@@ -361,9 +430,11 @@ func TestTWFBFamilyMatrix_MariaDBToPostgres(t *testing.T) {
 	defer tgtCleanup()
 	runTWFBFamilyMatrix(t, twfbCell{
 		src: twfbDB{"mariadb", srcDSN}, tgt: twfbDB{"postgres", tgtDSN}, streamID: "twfb-fam-maria2p",
+		mappings: twfbOverrides(true),
 	}, []twfbFamilyTable{
 		{"fam", twfbMySQLFamilyDDL, twfbMySQLFamilyProbe},
 		{"fam_maria", twfbMariaDBOnlyDDL, twfbMariaDBOnlyProbe},
+		twfbMySQLOverrideTable,
 	})
 }
 
@@ -381,8 +452,10 @@ func TestTWFBFamilyMatrix_MariaDBToMySQL(t *testing.T) {
 		Replace(twfbMySQLFamilyProbe)
 	runTWFBFamilyMatrix(t, twfbCell{
 		src: twfbDB{"mariadb", srcDSN}, tgt: twfbDB{"mysql", tgtDSN}, streamID: "twfb-fam-maria2m",
+		mappings: twfbOverrides(true),
 	}, []twfbFamilyTable{
 		{"fam", twfbMySQLFamilyDDL, probe},
 		{"fam_maria", twfbMariaDBOnlyDDL, twfbMariaDBOnlyProbe},
+		twfbMySQLOverrideTable,
 	})
 }

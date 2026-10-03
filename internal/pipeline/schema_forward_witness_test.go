@@ -75,8 +75,8 @@ func TestClassifyWitness_VerdictTruthTable(t *testing.T) {
 			witnessTable(wcol("ts", ir.Timestamp{WithTimeZone: true})), witnessTable(wcol("ts", dt(0))), witnessForwardAlter, nil, "ts",
 		},
 		{
-			"DECIMAL scale", witnessTable(wcol("d", ir.Decimal{Precision: 10, Scale: 4})),
-			witnessTable(wcol("d", ir.Decimal{Precision: 10, Scale: 2})), witnessForwardAlter, nil, "d",
+			"DECIMAL scale up at fixed precision is mixed: refuses", witnessTable(wcol("d", ir.Decimal{Precision: 10, Scale: 4})),
+			witnessTable(wcol("d", ir.Decimal{Precision: 10, Scale: 2})), witnessRefuse, nil, "",
 		},
 		{
 			"FLOAT to DOUBLE", witnessTable(wcol("f", ir.Float{Precision: ir.FloatDouble})),
@@ -85,6 +85,51 @@ func TestClassifyWitness_VerdictTruthTable(t *testing.T) {
 		{"VARCHAR widen", witnessTable(wcol("v", ir.Varchar{Length: 64})), witnessTable(wcol("v", ir.Varchar{Length: 16})), witnessForwardAlter, nil, "v"},
 		{"CHAR length", witnessTable(wcol("c", ir.Char{Length: 8})), witnessTable(wcol("c", ir.Char{Length: 4})), witnessForwardAlter, nil, "c"},
 		{"INT width", witnessTable(wcol("i", ir.Integer{Width: 64})), witnessTable(wcol("i", ir.Integer{Width: 32})), witnessForwardAlter, nil, "i"},
+
+		// Direction (GC-44 review): a target WIDER than the snapshot is never
+		// narrowed, one family at a time; a decimal wider on one axis and
+		// narrower on the other refuses.
+		{"DATETIME fsp narrow", witnessTable(wcol("ts", dt(0))), witnessTable(wcol("ts", dt(6))), witnessTargetWider, nil, "ts"},
+		{"TIME precision narrow", witnessTable(wcol("t", ir.Time{Precision: 0})), witnessTable(wcol("t", ir.Time{Precision: 6})), witnessTargetWider, nil, "t"},
+		{
+			"TIMESTAMPTZ precision narrow", witnessTable(wcol("ts", ir.Timestamp{Precision: 3, WithTimeZone: true})),
+			witnessTable(wcol("ts", ir.Timestamp{PrecisionUnspecified: true, WithTimeZone: true})), witnessTargetWider, nil, "ts",
+		},
+		{
+			"TIMESTAMP bare vs (6) is one storage", witnessTable(wcol("ts", ir.Timestamp{PrecisionUnspecified: true})),
+			witnessTable(wcol("ts", ir.Timestamp{Precision: 6})), witnessMatch, nil, "",
+		},
+		{
+			"DECIMAL (10,2) over a (12,4) target: the crash-replay shape", witnessTable(wcol("d", ir.Decimal{Precision: 10, Scale: 2})),
+			witnessTable(wcol("d", ir.Decimal{Precision: 12, Scale: 4})), witnessTargetWider, nil, "d",
+		},
+		{
+			"DECIMAL scale only (12,4) over (10,2)", witnessTable(wcol("d", ir.Decimal{Precision: 12, Scale: 4})),
+			witnessTable(wcol("d", ir.Decimal{Precision: 10, Scale: 2})), witnessForwardAlter, nil, "d",
+		},
+		{
+			"DECIMAL integer digits only", witnessTable(wcol("d", ir.Decimal{Precision: 12, Scale: 2})),
+			witnessTable(wcol("d", ir.Decimal{Precision: 10, Scale: 2})), witnessForwardAlter, nil, "d",
+		},
+		{
+			"DECIMAL to unconstrained", witnessTable(wcol("d", ir.Decimal{Unconstrained: true})),
+			witnessTable(wcol("d", ir.Decimal{Precision: 10, Scale: 2})), witnessForwardAlter, nil, "d",
+		},
+		{
+			"DECIMAL against an unconstrained target", witnessTable(wcol("d", ir.Decimal{Precision: 10, Scale: 2})),
+			witnessTable(wcol("d", ir.Decimal{Unconstrained: true})), witnessTargetWider, nil, "d",
+		},
+		{
+			"DECIMAL mixed (more integer digits, less scale) refuses", witnessTable(wcol("d", ir.Decimal{Precision: 12, Scale: 1})),
+			witnessTable(wcol("d", ir.Decimal{Precision: 10, Scale: 2})), witnessRefuse, nil, "",
+		},
+		{
+			"DOUBLE to FLOAT narrow", witnessTable(wcol("f", ir.Float{Precision: ir.FloatSingle})),
+			witnessTable(wcol("f", ir.Float{Precision: ir.FloatDouble})), witnessTargetWider, nil, "f",
+		},
+		{"VARCHAR narrow", witnessTable(wcol("v", ir.Varchar{Length: 16})), witnessTable(wcol("v", ir.Varchar{Length: 64})), witnessTargetWider, nil, "v"},
+		{"CHAR narrow", witnessTable(wcol("c", ir.Char{Length: 4})), witnessTable(wcol("c", ir.Char{Length: 8})), witnessTargetWider, nil, "c"},
+		{"INT narrow", witnessTable(wcol("i", ir.Integer{Width: 32})), witnessTable(wcol("i", ir.Integer{Width: 64})), witnessTargetWider, nil, "i"},
 		{
 			"INT sign change refuses", witnessTable(wcol("i", ir.Integer{Width: 32, Unsigned: true})),
 			witnessTable(wcol("i", ir.Integer{Width: 32})), witnessRefuse, nil, "",
@@ -152,15 +197,7 @@ func TestClassifyWitness_VerdictTruthTable(t *testing.T) {
 			witnessTable(wcol("e", ir.Enum{Values: []string{"a", "b"}})), witnessRefuse, nil, "",
 		},
 		{
-			"lens: MariaDB JSON (a LONGTEXT on the binlog) vs a JSON target", witnessTable(wcol("j", ir.Text{Size: ir.TextLong})),
-			witnessTable(wcol("j", ir.JSON{})), witnessMatch, nil, "",
-		},
-		{
-			"lens: JSON vs long TEXT, the other way round", witnessTable(wcol("j", ir.JSON{Binary: true})),
-			witnessTable(wcol("j", ir.Text{Size: ir.TextLong})), witnessMatch, nil, "",
-		},
-		{
-			"lens: JSON vs a SHORTER text still differs", witnessTable(wcol("j", ir.Text{Size: ir.TextMedium})),
+			"JSON vs long TEXT differs off a MariaDB source", witnessTable(wcol("j", ir.Text{Size: ir.TextLong})),
 			witnessTable(wcol("j", ir.JSON{})), witnessRefuse, nil, "",
 		},
 		{
@@ -183,7 +220,7 @@ func TestClassifyWitness_VerdictTruthTable(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			v := classifyWitness(tc.post, tc.tgt)
+			v := classifyWitness(tc.post, tc.tgt, witnessOptions{})
 			if v.kind != tc.want {
 				t.Fatalf("verdict = %d, want %d (%s)", v.kind, tc.want, v.render())
 			}
@@ -201,6 +238,83 @@ func TestClassifyWitness_VerdictTruthTable(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestClassifyWitness_Options pins the two per-stream rules: the MariaDB
+// JSON-as-LONGTEXT equality holds for that source and that direction only
+// (review item 7), and an overridden column's type is never compared, in
+// either direction or across families (review item 3) — while its presence
+// still is.
+func TestClassifyWitness_Options(t *testing.T) {
+	t.Parallel()
+	maria := witnessOptions{jsonAsLongText: true}
+	pinned := witnessOptions{pinned: map[string]bool{"c": true}}
+	for _, tc := range []struct {
+		name      string
+		post, tgt *ir.Table
+		opts      witnessOptions
+		want      witnessVerdictKind
+	}{
+		{
+			"MariaDB: a LONGTEXT snapshot equals a JSON target", witnessTable(wcol("j", ir.Text{Size: ir.TextLong})),
+			witnessTable(wcol("j", ir.JSON{})), maria, witnessMatch,
+		},
+		{
+			"MariaDB: equally a binary-JSON target", witnessTable(wcol("j", ir.Text{Size: ir.TextLong})),
+			witnessTable(wcol("j", ir.JSON{Binary: true})), maria, witnessMatch,
+		},
+		{
+			"MariaDB: a JSON snapshot against a TEXT target still differs", witnessTable(wcol("j", ir.JSON{})),
+			witnessTable(wcol("j", ir.Text{Size: ir.TextLong})), maria, witnessRefuse,
+		},
+		{
+			"MariaDB: a SHORTER text still differs", witnessTable(wcol("j", ir.Text{Size: ir.TextMedium})),
+			witnessTable(wcol("j", ir.JSON{})), maria, witnessRefuse,
+		},
+		{
+			"any other source: LONGTEXT vs JSON differs", witnessTable(wcol("j", ir.Text{Size: ir.TextLong})),
+			witnessTable(wcol("j", ir.JSON{})),
+			witnessOptions{},
+			witnessRefuse,
+		},
+		{
+			"override: across families is not compared", witnessTable(wcol("c", ir.Integer{Width: 8})),
+			witnessTable(wcol("c", ir.Integer{Width: 16})), pinned, witnessMatch,
+		},
+		{
+			"override: a narrower target is not altered", witnessTable(wcol("c", ir.Varchar{Length: 255})),
+			witnessTable(wcol("c", ir.Varchar{Length: 32})), pinned, witnessMatch,
+		},
+		{
+			"override: JSON rendered as binary JSON", witnessTable(wcol("c", ir.Text{Size: ir.TextLong})),
+			witnessTable(wcol("c", ir.JSON{Binary: true})), pinned, witnessMatch,
+		},
+		{
+			"override: an unpinned column beside it is still compared", witnessTable(wcol("c", ir.Boolean{}), wcol("v", ir.Varchar{Length: 64})),
+			witnessTable(wcol("c", ir.Integer{Width: 16}), wcol("v", ir.Varchar{Length: 16})), pinned, witnessForwardAlter,
+		},
+		{
+			"override: a pinned column the target lacks is still added", witnessTable(wcol("c", ir.Boolean{})),
+			witnessTable(), pinned, witnessForwardAdd,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if v := classifyWitness(tc.post, tc.tgt, tc.opts); v.kind != tc.want {
+				t.Fatalf("verdict = %d, want %d (%s)", v.kind, tc.want, v.render())
+			}
+		})
+	}
+	t.Run("only MariaDB projects JSON as LONGTEXT", func(t *testing.T) {
+		for _, src := range []string{"mysql", "planetscale", "vitess", "postgres", "postgres-trigger", "mysql-trigger", "sqlite"} {
+			w := &firstBoundaryWitness{sourceEngine: src}
+			if w.options(witnessTable()).jsonAsLongText {
+				t.Errorf("%s: jsonAsLongText set; only a MariaDB source reads JSON as LONGTEXT", src)
+			}
+		}
+		if !(&firstBoundaryWitness{sourceEngine: "mariadb"}).options(witnessTable()).jsonAsLongText {
+			t.Error("mariadb: jsonAsLongText not set")
+		}
+	})
 }
 
 // fakeCatalog is a target catalog the witness reads, counting reads.
@@ -274,6 +388,32 @@ func TestFirstBoundaryWitness_Verdict(t *testing.T) {
 		cat.tables["late"] = late
 		if v, _ := w.verdict(ctx, late); v.kind != witnessMatch {
 			t.Fatalf("verdict = %d; want match after the refresh", v.kind)
+		}
+	})
+	t.Run("a mismatch against a stale memo is decided on a fresh read", func(t *testing.T) {
+		// The warm-resume seed read predates a peer's DDL (Shape A): the
+		// memo says DATETIME(0), the target now holds DATETIME(6).
+		cat := &fakeCatalog{tables: map[string]*ir.Table{"w": witnessTable(wcol("ts", ir.DateTime{Precision: 6}))}}
+		w := newFakeWitness(cat, "mysql", "mysql")
+		w.catalog = newTargetCatalogWitness(cat.load, map[string]*ir.Table{"w": witnessTable(wcol("ts", ir.DateTime{Precision: 0}))})
+		v, err := w.verdict(ctx, witnessTable(wcol("ts", ir.DateTime{Precision: 6})))
+		if err != nil || v.kind != witnessMatch {
+			t.Fatalf("verdict = %d, %v (%s); want match on the fresh read", v.kind, err, v.render())
+		}
+		if cat.reads != 1 {
+			t.Fatalf("catalog read %d times; want exactly the one recheck", cat.reads)
+		}
+	})
+	t.Run("forget re-reads only the table it names, once", func(t *testing.T) {
+		cat := &fakeCatalog{tables: map[string]*ir.Table{"w": witnessTable(), "x": witnessTable()}}
+		c := newTargetCatalogWitness(cat.load, nil)
+		_, _, _ = c.lookup(ctx, "w")
+		c.forget("w")
+		_, _, _ = c.lookup(ctx, "x")
+		_, _, _ = c.lookup(ctx, "w")
+		_, _, _ = c.lookup(ctx, "w")
+		if cat.reads != 2 {
+			t.Fatalf("catalog read %d times; want 2 (initial, then one for the forgotten table)", cat.reads)
 		}
 	})
 	t.Run("a case-folded target name resolves", func(t *testing.T) {
@@ -366,6 +506,10 @@ func TestInterceptAddColumnForward_FirstBoundaryIsWitnessed(t *testing.T) {
 			false, 1,
 		},
 		{
+			"a wider target is kept: no ALTER, accepted", witnessTable(wcol("d", ir.Decimal{Precision: 10, Scale: 2})),
+			witnessTable(wcol("d", ir.Decimal{Precision: 12, Scale: 4})), nil, false, 1,
+		},
+		{
 			"a new column forwards ADD COLUMN", witnessTable(wcol("ts", ir.DateTime{}), wcol("extra", ir.Text{Size: ir.TextLong})),
 			witnessTable(wcol("ts", ir.DateTime{})),
 			[]string{"AlterAddColumn"},
@@ -450,33 +594,88 @@ func TestInterceptAddColumnForward_SeedGuardConsultsTheWitness(t *testing.T) {
 	})
 }
 
-// TestCheckShapeAFirstBoundary_RefusesAMismatch pins F4: the Shape A
-// intercept's first boundary refuses any difference it cannot accept.
-func TestCheckShapeAFirstBoundary_RefusesAMismatch(t *testing.T) {
+// TestCheckShapeAFirstBoundary_Verdicts pins the Shape A first boundary
+// (GC-44 F4, as corrected by the review): a forwardable difference yields a
+// pre-state synthesized from the target for the lease to route — never a
+// refusal — a wider target is kept, and only an unforwardable difference
+// refuses.
+func TestCheckShapeAFirstBoundary_Verdicts(t *testing.T) {
 	ctx := context.Background()
+	post := witnessTable(wcol("ts", ir.DateTime{Precision: 3}))
 	for _, tc := range []struct {
-		name   string
-		tgt    *ir.Table
-		refuse bool
+		name    string
+		tgt     *ir.Table
+		preType ir.Type // the synthesized pre's "ts"; nil = not checked
+		preCols int     // 0 = baseline (no pre)
+		refuse  bool
 	}{
-		{"match", witnessTable(wcol("ts", ir.DateTime{Precision: 6})), false},
-		{"target-only column", witnessTable(wcol("ts", ir.DateTime{Precision: 6}), wcol("z", ir.Boolean{})), false},
-		{"fsp differs", witnessTable(wcol("ts", ir.DateTime{Precision: 0})), true},
-		{"column missing on target", witnessTable(), true},
+		{"match", witnessTable(wcol("ts", ir.DateTime{Precision: 3})), nil, 0, false},
+		{"target-only column", witnessTable(wcol("ts", ir.DateTime{Precision: 3}), wcol("z", ir.Boolean{})), nil, 0, false},
+		{"wider target is kept", witnessTable(wcol("ts", ir.DateTime{Precision: 6})), nil, 0, false},
+		{"narrower target: routed with the target's type", witnessTable(wcol("ts", ir.DateTime{Precision: 0})), ir.DateTime{Precision: 0}, 2, false},
+		{"column missing on target: routed without it", witnessTable(), nil, 1, false},
+		{"rename refuses", witnessTable(wcol("tz", ir.DateTime{Precision: 3})), nil, 0, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			w := newFakeWitness(&fakeCatalog{tables: map[string]*ir.Table{"w": tc.tgt}}, "postgres", "postgres")
-			err := checkShapeAFirstBoundary(ctx, w, "w", witnessTable(wcol("ts", ir.DateTime{Precision: 6})))
+			pre, err := checkShapeAFirstBoundary(ctx, w, "w", post, post)
 			if (err != nil) != tc.refuse {
 				t.Fatalf("err = %v, want refuse=%v", err, tc.refuse)
 			}
-			if err != nil && !strings.Contains(err.Error(), resumeDivergenceMarker) {
-				t.Errorf("refusal lacks the marker: %v", err)
+			if err != nil {
+				if !strings.Contains(err.Error(), resumeDivergenceMarker) {
+					t.Errorf("refusal lacks the marker: %v", err)
+				}
+				return
+			}
+			if tc.preCols == 0 {
+				if pre != nil {
+					t.Fatalf("pre = %v; want the baseline (nil)", pre)
+				}
+				return
+			}
+			if pre == nil || len(pre.Columns) != tc.preCols {
+				t.Fatalf("pre = %v; want %d columns", pre, tc.preCols)
+			}
+			if tc.preType != nil && !reflect.DeepEqual(columnsByNameIR(pre)["ts"].Type, tc.preType) {
+				t.Errorf("pre ts = %v; want the target's %v", columnsByNameIR(pre)["ts"].Type, tc.preType)
 			}
 		})
 	}
-	if err := checkShapeAFirstBoundary(ctx, nil, "w", witnessTable()); err != nil {
-		t.Fatalf("a nil witness must accept: %v", err)
+	if pre, err := checkShapeAFirstBoundary(ctx, nil, "w", witnessTable(), witnessTable()); err != nil || pre != nil {
+		t.Fatalf("a nil witness must accept: %v, %v", pre, err)
+	}
+
+	// GC-44 F13: a match on a column this stream never carried (a peer
+	// shard forwarded it) is routed as an ADD so this shard's rows are
+	// backfilled; a column the stream's own history already carries is not.
+	withExtra := witnessTable(wcol("ts", ir.DateTime{Precision: 3}), wcol("extra", ir.Integer{Width: 32}))
+	for _, tc := range []struct {
+		name    string
+		history []*ir.Table
+		want    int // synthesized pre's column count; 0 = baseline
+	}{
+		{"no retained history: the match is the baseline", nil, 0},
+		{"history carries the column: the baseline", []*ir.Table{withExtra}, 0},
+		{"history lacks the column: routed as an ADD", []*ir.Table{post}, 2},
+	} {
+		t.Run("peer-added/"+tc.name, func(t *testing.T) {
+			w := newFakeWitness(&fakeCatalog{tables: map[string]*ir.Table{"w": withExtra}}, "postgres", "postgres")
+			w.history = tc.history
+			pre, err := checkShapeAFirstBoundary(ctx, w, "w", withExtra, withExtra)
+			if err != nil {
+				t.Fatalf("err = %v", err)
+			}
+			if tc.want == 0 {
+				if pre != nil {
+					t.Fatalf("pre = %v; want the baseline", pre)
+				}
+				return
+			}
+			if pre == nil || len(pre.Columns) != tc.want || columnsByNameIR(pre)["extra"] != nil {
+				t.Fatalf("pre = %v; want %d columns without extra", pre, tc.want)
+			}
+		})
 	}
 }
 
@@ -513,5 +712,61 @@ func TestWireSchemaDeltaArming_ArmsFirstTouchWhereAnInterceptConsumesIt(t *testi
 				t.Errorf("first-touch armed = %v, want %v", r.armed, tc.want)
 			}
 		})
+	}
+}
+
+// TestShapeAFirstBoundary_RoutesThroughTheLeaseOnce pins the review fix for
+// Shape A's first boundary: when every shard's source widened a quiet table
+// while the fleet was stopped, the first shard to restart forwards the
+// change through the lease and the next shard — whose catalog read still
+// predates it — observes the holder's apply instead of refusing or applying
+// it a second time.
+func TestShapeAFirstBoundary_RoutesThroughTheLeaseOnce(t *testing.T) {
+	t.Parallel()
+	clock := newMockClock(testClockNow())
+	store := newFakeLeaseStore(clock.Now)
+	cfg := LeaseConfig{LeaseDuration: time.Hour, RenewDeadline: 30 * time.Minute, RetryPeriod: 5 * time.Minute}
+	narrow := witnessTable(wcol("v", ir.Varchar{Length: 16}))
+	wide := witnessTable(wcol("v", ir.Varchar{Length: 64}))
+
+	runShard := func(streamID string) (*fakeShapeApplier, error) {
+		t.Helper()
+		applier := &fakeShapeApplier{}
+		router, err := NewBoundaryRouter(newTestLeaseManager(t, store, streamID, cfg, clock), applier, &fakeProber{},
+			"postgres", "postgres", sourceDefaultReaders{})
+		if err != nil {
+			t.Fatalf("NewBoundaryRouter: %v", err)
+		}
+		// Each shard's catalog read predates the other's ALTER.
+		router.firstBoundary = newFakeWitness(&fakeCatalog{tables: map[string]*ir.Table{"w": narrow}}, "postgres", "postgres")
+		in := make(chan ir.Change, 1)
+		in <- ir.SchemaSnapshot{Schema: "src", Table: "w", Position: ir.Position{Token: "p1"}, IR: wide}
+		close(in)
+		var errStore atomic.Pointer[error]
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		got := drainChanges(t, interceptSchemaSnapshotsForCoordination(ctx, in, nil, router, nil, nil, &errStore), 2*time.Second)
+		if p := errStore.Load(); p != nil {
+			return applier, *p
+		}
+		if len(got) != 1 {
+			t.Fatalf("%s: forwarded %d changes; want the snapshot", streamID, len(got))
+		}
+		return applier, nil
+	}
+
+	a, err := runShard("stream-a")
+	if err != nil {
+		t.Fatalf("stream-a refused a forwardable first boundary: %v", err)
+	}
+	if !reflect.DeepEqual(a.callNames(), []string{"AlterColumnType"}) {
+		t.Fatalf("stream-a applier calls = %v; want one AlterColumnType as the lease holder", a.callNames())
+	}
+	b, err := runShard("stream-b")
+	if err != nil {
+		t.Fatalf("stream-b refused instead of observing the holder's apply: %v", err)
+	}
+	if calls := b.callNames(); len(calls) != 0 {
+		t.Fatalf("stream-b applier calls = %v; want none (the peer observes)", calls)
 	}
 }

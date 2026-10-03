@@ -539,6 +539,7 @@ func (s *Streamer) coldStartPrepareSchema(schema *ir.Schema) (*ir.Schema, error)
 	// that fell through to this cold start) predates the tables this run
 	// is about to create; the first-boundary witness reads its own.
 	s.firstBoundaryCatalog = nil
+	s.firstBoundaryHistory = nil
 	// Apply per-column type overrides before the schema-write phase
 	// sees the schema. Warm resume skips this step — by then the
 	// target schema is already shaped from the cold-start run.

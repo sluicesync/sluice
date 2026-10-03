@@ -313,7 +313,7 @@ jobs:
     name: Pipeline vstream suite
     if: ${{ github.event_name == 'schedule' || github.event.inputs.suite == 'all' || github.event.inputs.suite == 'vstream-pipeline' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 80
+    timeout-minutes: 83
     env:
       TESTCONTAINERS_RYUK_DISABLED: "true"
       # The -run alternation, defined ONCE so the budget guard below and
@@ -333,7 +333,10 @@ jobs:
       # TestStreamer_CrashMidTxn_VStream_{ToPostgres,ToMySQL} — each boots a
       # vttestserver and runs ~20 crash cells of ~10-20s — makes 20, and the
       # budget 44m/50m → 74m/80m.
-      VSTREAM_PIPELINE_EXPECTED_TESTS: "20"
+      # Re-derived 2026-10-02 (GC-44 review): +1,
+      # TestStreamer_TWFBFamilyMatrix_VStreamToPostgres — one vttestserver
+      # boot, a cold start and one restart (~3m) — makes 21, 77m/83m.
+      VSTREAM_PIPELINE_EXPECTED_TESTS: "21"
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v6.5.0
@@ -378,7 +381,7 @@ jobs:
       - name: Run the pipeline vstream tests
         run: |
           set -o pipefail
-          go test -tags='integration vstream' -race -count=1 -timeout=74m \
+          go test -tags='integration vstream' -race -count=1 -timeout=77m \
             -run "$VSTREAM_PIPELINE_RUN" -v ./internal/pipeline/ 2>&1 | tee vstream-pipeline.out
           # Second half of the TEST-9 guard, mirroring the filtered-tag-
           # gate's per-test PASS assert: every matched test must have

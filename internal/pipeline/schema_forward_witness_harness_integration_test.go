@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"sluicesync.dev/sluice/internal/config"
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/logcapture"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
@@ -47,7 +48,15 @@ func (d twfbDB) driver() string {
 func (d twfbDB) exec(t *testing.T, script string) {
 	t.Helper()
 	dsn := d.dsn
-	if d.driver() == "mysql" {
+	statements := []string{script}
+	switch {
+	case d.engine == "planetscale":
+		// A vtgate source: the VStream parameters are the stream's, not the
+		// driver's, and vtgate takes one statement at a time (the scripts
+		// here carry no ';' inside a statement).
+		dsn, _, _ = strings.Cut(dsn, "&vstream_")
+		statements = strings.Split(script, ";")
+	case d.driver() == "mysql":
 		dsn += "&multiStatements=true"
 	}
 	db, err := sql.Open(d.driver(), dsn)
@@ -57,8 +66,13 @@ func (d twfbDB) exec(t *testing.T, script string) {
 	defer func() { _ = db.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	if _, err := db.ExecContext(ctx, script); err != nil {
-		t.Fatalf("%s: %v\n%s", d.engine, err, script)
+	for _, stmt := range statements {
+		if strings.TrimSpace(stmt) == "" {
+			continue
+		}
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			t.Fatalf("%s: %v\n%s", d.engine, err, stmt)
+		}
 	}
 }
 
@@ -165,6 +179,8 @@ type twfbCell struct {
 	streamID string
 	// exclude is the stream's --exclude-table list.
 	exclude []string
+	// mappings is the stream's --type-override list.
+	mappings []config.Mapping
 }
 
 func (c twfbCell) streamer() *Streamer {
@@ -185,6 +201,7 @@ func (c twfbCell) streamer() *Streamer {
 		SourceDSN: c.src.dsn, TargetDSN: c.tgt.dsn,
 		StreamID: c.streamID,
 		Filter:   filter,
+		Mappings: c.mappings,
 		// The CLI's --apply-retry-attempts default; the zero value would
 		// disable the ADR-0038 retry the in-process cell exercises.
 		ApplyRetryAttempts: 8,
@@ -257,6 +274,7 @@ const (
 	twfbLogForwarded   = "the first schema boundary after a (re)start differs from the target"
 	twfbLogUnwitnessed = "the target cannot witness this table's first schema boundary"
 	twfbLogTargetOnly  = "the target holds columns the source no longer has"
+	twfbLogTargetWider = "the target column is WIDER than the source's"
 )
 
 // logLinesFor returns the captured lines carrying marker whose table

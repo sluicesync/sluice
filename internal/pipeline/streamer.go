@@ -1589,6 +1589,15 @@ type Streamer struct {
 	// cleared in [Streamer.phaseWireInterceptChain].
 	firstBoundaryCatalog map[string]*ir.Table
 
+	// firstBoundaryHistory is this stream's own retained ADR-0049 version
+	// per table at the persisted position, read by the same warm-resume
+	// seed load — the shape THIS stream last carried. Shape A's
+	// first-boundary witness uses it to tell a column a peer shard added
+	// while this one was stopped (its rows still owe a backfill) from one
+	// this stream already carried (GC-44 F13). Consumed and cleared with
+	// [Streamer.firstBoundaryCatalog].
+	firstBoundaryHistory []*ir.Table
+
 	// readerSchemaSeed loads the prior shape per in-scope table handed to
 	// a CDC reader that implements [schemaSeedSetter] (SLM-1). On cold
 	// start it is the RAW source IR captured in [coldStartPrepareSchema]

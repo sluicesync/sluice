@@ -1216,15 +1216,17 @@ func (s *Streamer) phaseWireInterceptChain(applyCtx context.Context, changes <-c
 
 // firstBoundaryWitness builds the GC-44 first-boundary witness for one
 // intercept wiring, consuming the catalog read this attempt's warm-resume
-// seed already made ([Streamer.firstBoundaryCatalog]).
+// seed already made ([Streamer.firstBoundaryCatalog]) and the stream's own
+// retained history it read beside it ([Streamer.firstBoundaryHistory]).
 func (s *Streamer) firstBoundaryWitness() *firstBoundaryWitness {
-	initial := s.firstBoundaryCatalog
-	s.firstBoundaryCatalog = nil
+	initial, history := s.firstBoundaryCatalog, s.firstBoundaryHistory
+	s.firstBoundaryCatalog, s.firstBoundaryHistory = nil, nil
 	if s.Source == nil || s.Target == nil {
 		return nil
 	}
 	w := &firstBoundaryWitness{
 		catalog:      newTargetCatalogWitness(s.loadTargetZoneWitness, initial),
+		history:      history,
 		sourceEngine: s.Source.Name(),
 		targetEngine: s.Target.Name(),
 		mappings:     s.Mappings,
