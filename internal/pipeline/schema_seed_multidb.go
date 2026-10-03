@@ -230,9 +230,10 @@ func (s *Streamer) loadMultiDatabaseTargetZoneWitness(
 	// error), and the MySQL fan-out seed is inert by construction.
 	//
 	// Without this arm the outcome is not merely un-warned, it is SILENT:
-	// the history fallback is empty for those namespaces too (the PG reader
-	// writes a schema-history row only when rel.Schema != its bound schema),
-	// so mergeWarmResumeSeed has no names either and its per-table
+	// the history fallback is empty for a namespace that was never
+	// cold-started (and, through v0.156.9, for every namespace but the
+	// DSN's own: the PG reader wrote schema-history rows only for its bound
+	// schema until GC-44 F5), so mergeWarmResumeSeed has no names either and its per-table
 	// "resumes WITHOUT a prior shape" warning does not fire. Zero log lines
 	// for a namespace whose every table resumes unchecked at its first
 	// boundary. Found by the v0.143.0 pre-tag value-fidelity review.

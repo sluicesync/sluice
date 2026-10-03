@@ -690,8 +690,11 @@ func (f *firstTouchStub) ArmFirstTouchSchemaBoundaries() { f.armed = true }
 // TestWireSchemaDeltaArming_ArmsFirstTouchWhereAnInterceptConsumesIt pins
 // the D3 arming condition at the one helper every reader-open site reaches
 // (TestSchemaDeltaArming_ReachesEveryReaderOpenSite holds the sites):
-// armed under the single-stream intercept and Shape A's, not in
-// multi-database mode, not under --schema-changes=refuse.
+// armed under every streamer shape, because every wiring has a consumer:
+// the single-stream intercept, Shape A's, or — refuse mode, multi-database,
+// Shape A drained — the unforwarded-stream check (GC-44 F5; before F5 those
+// three were unarmed, and a change made while such a stream was stopped
+// took no boundary at all on the binlog lane).
 func TestWireSchemaDeltaArming_ArmsFirstTouchWhereAnInterceptConsumesIt(t *testing.T) {
 	shard := ShardColumnSpec{Name: "shard", Value: "a"}
 	for _, tc := range []struct {
@@ -700,10 +703,11 @@ func TestWireSchemaDeltaArming_ArmsFirstTouchWhereAnInterceptConsumesIt(t *testi
 		want bool
 	}{
 		{"single-stream forward (the default)", &Streamer{}, true},
-		{"--schema-changes=refuse", &Streamer{SchemaChanges: "refuse"}, false},
-		{"multi-database", &Streamer{AllDatabases: true}, false},
+		{"--schema-changes=refuse", &Streamer{SchemaChanges: "refuse"}, true},
+		{"multi-database", &Streamer{AllDatabases: true}, true},
+		{"multi-database under refuse", &Streamer{AllDatabases: true, SchemaChanges: "refuse"}, true},
 		{"Shape A coordination", &Streamer{InjectShardColumn: shard}, true},
-		{"Shape A with --no-coordinate-live-ddl", &Streamer{InjectShardColumn: shard, NoCoordinateLiveDDL: true}, false},
+		{"Shape A with --no-coordinate-live-ddl", &Streamer{InjectShardColumn: shard, NoCoordinateLiveDDL: true}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := &firstTouchStub{}

@@ -1164,8 +1164,10 @@ func (s *Streamer) phaseWireInterceptChain(applyCtx context.Context, changes <-c
 	// SchemaSnapshot only AFTER DDL — so the first ALTER silently
 	// passes through as the anchor rather than being classified and
 	// forwarded.
+	forwarding := false
 	if s.forwardSchemaEnabled() && s.boundaryRouter == nil && s.addColumnForwardWriter != nil {
 		if deltaApplier, ok := s.addColumnForwardWriter.(ir.ShapeDeltaApplier); ok {
+			forwarding = true
 			deps := schemaForwardDeps{
 				applier:          deltaApplier,
 				sourceEngineName: s.Source.Name(),
@@ -1182,6 +1184,19 @@ func (s *Streamer) phaseWireInterceptChain(applyCtx context.Context, changes <-c
 			deps.backfill = s.addedColumnBackfill(streamID, s.addColumnForwardSchemaReader)
 			filtered = interceptAddColumnForward(applyCtx, filtered, s.coldStartSeedSnapshots, deps, &s.schemaSnapshotErr)
 		}
+	}
+	// GC-44 F5: a stream neither intercept forwards for — refuse mode, a
+	// multi-database stream, Shape A under --no-coordinate-live-ddl — still
+	// owes the target its boundaries. Keyed on what was actually wired, not
+	// on the flags, so any future path that leaves both intercepts off lands
+	// here rather than on the old unchecked pass-through
+	// (schema_change_refuse.go).
+	if s.boundaryRouter == nil && !forwarding {
+		filtered = interceptSchemaChangeRefuse(applyCtx, filtered, unforwardedBoundaryDeps{
+			witnessFor: s.unforwardedBoundaryWitnesses(streamID, witness),
+			normalizer: snapshotNormalizer,
+			why:        s.unforwardedStreamReason(),
+		}, &s.schemaSnapshotErr)
 	}
 	// Clear the cold-start seed after handing it to BOTH intercepts so
 	// a streamer restart picks up a fresh seed in its next coldStart

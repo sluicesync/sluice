@@ -1,0 +1,310 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
+package pipeline
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"sluicesync.dev/sluice/internal/ir"
+)
+
+// TestJudgeUnforwardedColumns_EveryFamilyBothDirections is the truth table
+// behind the unforwarded-stream check's one type exemption (GC-44 F5): a
+// target column at least as wide as the source's within one family is the
+// drained model run ahead of the source (or a Postgres replay's pre-ALTER
+// relation) and passes; anything else refuses. Every family the forward
+// path's direction rule ([witnessWidthOrder]) admits is pinned in both
+// directions at THIS judgement — the target wider (passes) and the source
+// wider (refuses) — and the excluded shapes are pinned as refusing, so a
+// change to the shared rule that loosens refuse mode fails here, not only in
+// the forward truth table. The independent expected value is the table,
+// written from what each target type stores.
+func TestJudgeUnforwardedColumns_EveryFamilyBothDirections(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name           string
+		target, source ir.Type
+		passes         bool
+	}{
+		{"datetime fsp: target wider", ir.DateTime{Precision: 6}, ir.DateTime{Precision: 0}, true},
+		{"datetime fsp: source wider", ir.DateTime{Precision: 0}, ir.DateTime{Precision: 6}, false},
+		{"datetime: an unspecified target is (6)", ir.DateTime{PrecisionUnspecified: true}, ir.DateTime{Precision: 3}, true},
+		{"datetime: an unspecified source needs (6)", ir.DateTime{Precision: 3}, ir.DateTime{PrecisionUnspecified: true}, false},
+		{"time fsp: target wider", ir.Time{Precision: 6}, ir.Time{Precision: 0}, true},
+		{"time fsp: source wider", ir.Time{Precision: 0}, ir.Time{Precision: 6}, false},
+		{"time: the zone kind differs", ir.Time{Precision: 6, WithTimeZone: true}, ir.Time{Precision: 0}, false},
+		{"timestamp fsp: target wider", ir.Timestamp{Precision: 6}, ir.Timestamp{Precision: 0}, true},
+		{"timestamp fsp: source wider", ir.Timestamp{Precision: 0}, ir.Timestamp{Precision: 6}, false},
+		{"timestamptz fsp: target wider", ir.Timestamp{Precision: 6, WithTimeZone: true}, ir.Timestamp{Precision: 3, WithTimeZone: true}, true},
+		{"timestamptz fsp: source wider", ir.Timestamp{Precision: 3, WithTimeZone: true}, ir.Timestamp{Precision: 6, WithTimeZone: true}, false},
+		{"the session-zone sibling swap", ir.Timestamp{Precision: 6, WithTimeZone: true}, ir.DateTime{Precision: 0}, false},
+		{"decimal: target wider on both axes", ir.Decimal{Precision: 12, Scale: 4}, ir.Decimal{Precision: 10, Scale: 2}, true},
+		{"decimal scale: source wider", ir.Decimal{Precision: 10, Scale: 2}, ir.Decimal{Precision: 10, Scale: 4}, false},
+		{"decimal integer digits: source wider", ir.Decimal{Precision: 10, Scale: 2}, ir.Decimal{Precision: 12, Scale: 2}, false},
+		{"decimal: wider on one axis, narrower on the other", ir.Decimal{Precision: 10, Scale: 4}, ir.Decimal{Precision: 10, Scale: 2}, false},
+		{"decimal: an unconstrained target", ir.Decimal{Unconstrained: true}, ir.Decimal{Precision: 65, Scale: 30}, true},
+		{"decimal: an unconstrained source", ir.Decimal{Precision: 65, Scale: 30}, ir.Decimal{Unconstrained: true}, false},
+		{"varchar: target wider", ir.Varchar{Length: 64}, ir.Varchar{Length: 16}, true},
+		{"varchar: source wider", ir.Varchar{Length: 16}, ir.Varchar{Length: 64}, false},
+		{"char: target wider", ir.Char{Length: 20}, ir.Char{Length: 10}, true},
+		{"char: source wider", ir.Char{Length: 10}, ir.Char{Length: 20}, false},
+		{"float: double holds single", ir.Float{Precision: ir.FloatDouble}, ir.Float{Precision: ir.FloatSingle}, true},
+		{"float: single does not hold double", ir.Float{Precision: ir.FloatSingle}, ir.Float{Precision: ir.FloatDouble}, false},
+		{"integer: target wider", ir.Integer{Width: 64}, ir.Integer{Width: 32}, true},
+		{"integer: source wider", ir.Integer{Width: 32}, ir.Integer{Width: 64}, false},
+		{"integer: a sign change", ir.Integer{Width: 64}, ir.Integer{Width: 32, Unsigned: true}, false},
+		{"text into varchar: across families", ir.Varchar{Length: 65535}, ir.Text{Size: ir.TextLong}, false},
+		{"char into varchar: across families", ir.Varchar{Length: 20}, ir.Char{Length: 10}, false},
+		{"integer into decimal: across families", ir.Decimal{Precision: 30, Scale: 0}, ir.Integer{Width: 32}, false},
+	} {
+		j := judgeUnforwardedColumns(witnessTable(wcol("c", tc.source)), witnessTable(wcol("c", tc.target)), witnessOptions{})
+		if passes := len(j.refused) == 0; passes != tc.passes {
+			t.Errorf("%s: target %s, source %s: passes = %v (refused %v), want %v",
+				tc.name, tc.target, tc.source, passes, j.refused, tc.passes)
+		}
+	}
+}
+
+// TestJudgeUnforwardedColumns is the column-by-column judgement: what
+// refuses, what passes, and that a single refusing column refuses the
+// boundary whatever else it carries.
+func TestJudgeUnforwardedColumns(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name           string
+		snap, target   *ir.Table
+		refused, ahead int
+		targetOnly     int
+	}{
+		{"a match", witnessTable(wcol("ts", ir.DateTime{})), witnessTable(wcol("ts", ir.DateTime{})), 0, 0, 0},
+		{"fsp widened on the source", witnessTable(wcol("ts", ir.DateTime{Precision: 6})), witnessTable(wcol("ts", ir.DateTime{})), 1, 0, 0},
+		{"fsp widened on the target first", witnessTable(wcol("ts", ir.DateTime{})), witnessTable(wcol("ts", ir.DateTime{Precision: 6})), 0, 1, 0},
+		{"decimal scale widened on the source", witnessTable(wcol("v", ir.Decimal{Precision: 10, Scale: 4})), witnessTable(wcol("v", ir.Decimal{Precision: 10, Scale: 2})), 1, 0, 0},
+		{"varchar widened on the source", witnessTable(wcol("v", ir.Varchar{Length: 64})), witnessTable(wcol("v", ir.Varchar{Length: 16})), 1, 0, 0},
+		{"a column added on the source", witnessTable(wcol("x", ir.Integer{Width: 32})), witnessTable(), 1, 0, 0},
+		{"a column the target alone has", witnessTable(), witnessTable(wcol("x", ir.Integer{Width: 32})), 0, 0, 1},
+		{"a rename reads as add + target-only, and refuses", witnessTable(wcol("b", ir.Integer{Width: 32})), witnessTable(wcol("a", ir.Integer{Width: 32})), 1, 0, 1},
+		{"one column ahead, one behind", witnessTable(wcol("a", ir.DateTime{}), wcol("b", ir.DateTime{Precision: 6})), witnessTable(wcol("a", ir.DateTime{Precision: 6}), wcol("b", ir.DateTime{})), 1, 1, 0},
+		{"across families", witnessTable(wcol("v", ir.Text{Size: ir.TextLong})), witnessTable(wcol("v", ir.Integer{Width: 32})), 1, 0, 0},
+	} {
+		j := judgeUnforwardedColumns(tc.snap, tc.target, witnessOptions{})
+		if len(j.refused) != tc.refused || len(j.ahead) != tc.ahead || len(j.targetOnly) != tc.targetOnly {
+			t.Errorf("%s: refused %d, ahead %d, target-only %d; want %d, %d, %d",
+				tc.name, len(j.refused), len(j.ahead), len(j.targetOnly), tc.refused, tc.ahead, tc.targetOnly)
+		}
+		err := j.settle(context.Background(), "src.w", "--schema-changes=refuse")
+		if refused := err != nil; refused != (tc.refused > 0) {
+			t.Errorf("%s: settle refused = %v (%v), want %v", tc.name, refused, err, tc.refused > 0)
+		}
+		if err != nil && !errors.Is(err, ir.ErrSchemaChangeRefused) {
+			t.Errorf("%s: the refusal does not carry %s: %v", tc.name, schemaChangeRefusedMarker, err)
+		}
+	}
+}
+
+// runRefuseIntercept feeds snaps through the intercept and returns what came
+// out the other side and the stored error.
+func runRefuseIntercept(t *testing.T, deps unforwardedBoundaryDeps, snaps ...ir.SchemaSnapshot) ([]ir.Change, error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	in := make(chan ir.Change, len(snaps))
+	for _, s := range snaps {
+		in <- s
+	}
+	close(in)
+	var errStore atomic.Pointer[error]
+	var out []ir.Change
+	for c := range interceptSchemaChangeRefuse(ctx, in, deps, &errStore) {
+		out = append(out, c)
+	}
+	if p := errStore.Load(); p != nil {
+		return out, *p
+	}
+	return out, nil
+}
+
+func refuseSnap(tbl *ir.Table) ir.SchemaSnapshot {
+	return ir.SchemaSnapshot{Schema: tbl.Schema, Table: tbl.Name, IR: tbl}
+}
+
+// TestInterceptSchemaChangeRefuse pins the intercept itself: a refused
+// boundary never goes downstream, a stale memo is re-read before refusing,
+// the unwitnessed fallback compares CDC with CDC, and a catalog failure is
+// not the marker.
+func TestInterceptSchemaChangeRefuse(t *testing.T) {
+	t.Parallel()
+	narrow := witnessTable(wcol("ts", ir.DateTime{}))
+	wide := witnessTable(wcol("ts", ir.DateTime{Precision: 6}))
+	single := func(w *firstBoundaryWitness) func(string) *firstBoundaryWitness {
+		return func(string) *firstBoundaryWitness { return w }
+	}
+
+	t.Run("a match passes the boundary on", func(t *testing.T) {
+		cat := &fakeCatalog{tables: map[string]*ir.Table{"w": narrow}}
+		out, err := runRefuseIntercept(t, unforwardedBoundaryDeps{witnessFor: single(newFakeWitness(cat, "mysql", "mysql"))}, refuseSnap(narrow))
+		if err != nil || len(out) != 1 {
+			t.Fatalf("out %d, err %v; want the snapshot passed on", len(out), err)
+		}
+	})
+	t.Run("a widen the target cannot hold refuses before the boundary goes downstream", func(t *testing.T) {
+		cat := &fakeCatalog{tables: map[string]*ir.Table{"w": narrow}}
+		out, err := runRefuseIntercept(t, unforwardedBoundaryDeps{witnessFor: single(newFakeWitness(cat, "mysql", "mysql")), why: "--schema-changes=refuse"}, refuseSnap(wide))
+		if !errors.Is(err, ir.ErrSchemaChangeRefused) || !strings.Contains(err.Error(), schemaChangeRefusedMarker) {
+			t.Fatalf("err = %v; want the %s refusal", err, schemaChangeRefusedMarker)
+		}
+		if !strings.Contains(err.Error(), `"ts"`) || !strings.Contains(err.Error(), "--schema-changes=refuse") {
+			t.Errorf("the refusal names neither the column nor the mode: %v", err)
+		}
+		if len(out) != 0 {
+			t.Errorf("%d changes went downstream past the refusal", len(out))
+		}
+		if cat.reads != 3 {
+			t.Errorf("catalog read %d times; want 3 (the first read, the verdict's re-read, and this check's own before refusing)", cat.reads)
+		}
+	})
+	t.Run("the target altered after the verdict's one re-read passes on this check's own", func(t *testing.T) {
+		cat := &fakeCatalog{tables: map[string]*ir.Table{"w": narrow}}
+		w := newFakeWitness(cat, "mysql", "mysql")
+		// An earlier disagreement on this table spent the verdict's once-per-
+		// table re-read (it reads the catalog, still narrow).
+		if j, err := w.judgeUnforwarded(context.Background(), wide); err != nil || len(j.refused) == 0 {
+			t.Fatalf("the first judgement = %+v, %v; want a refusal", j, err)
+		}
+		cat.tables["w"] = wide // the operator's drained-model ALTER on the target
+		out, err := runRefuseIntercept(t, unforwardedBoundaryDeps{witnessFor: single(w)}, refuseSnap(wide))
+		if err != nil || len(out) != 1 {
+			t.Fatalf("out %d, err %v; want the boundary accepted after the re-read", len(out), err)
+		}
+	})
+	t.Run("unwitnessed: the first boundary passes, a later change refuses", func(t *testing.T) {
+		cat := &fakeCatalog{tables: map[string]*ir.Table{"w": narrow}}
+		deps := unforwardedBoundaryDeps{witnessFor: single(newFakeWitness(cat, "postgres", "sqlite"))}
+		out, err := runRefuseIntercept(t, deps, refuseSnap(narrow), refuseSnap(narrow))
+		if err != nil || len(out) != 2 {
+			t.Fatalf("unchanged: out %d, err %v; want both passed", len(out), err)
+		}
+		out, err = runRefuseIntercept(t, deps, refuseSnap(narrow), refuseSnap(wide))
+		if !errors.Is(err, ir.ErrSchemaChangeRefused) || len(out) != 1 {
+			t.Fatalf("changed: out %d, err %v; want the first passed and the second refused", len(out), err)
+		}
+	})
+	t.Run("no witness at all behaves as unwitnessed", func(t *testing.T) {
+		out, err := runRefuseIntercept(t, unforwardedBoundaryDeps{}, refuseSnap(narrow), refuseSnap(wide))
+		if !errors.Is(err, ir.ErrSchemaChangeRefused) || len(out) != 1 {
+			t.Fatalf("out %d, err %v; want the first passed and the second refused", len(out), err)
+		}
+	})
+	t.Run("a catalog read failure refuses without the marker", func(t *testing.T) {
+		cat := &fakeCatalog{err: errors.New("connection refused")}
+		_, err := runRefuseIntercept(t, unforwardedBoundaryDeps{witnessFor: single(newFakeWitness(cat, "mysql", "mysql"))}, refuseSnap(narrow))
+		if err == nil || errors.Is(err, ir.ErrSchemaChangeRefused) {
+			t.Fatalf("err = %v; want a catalog error that is not %s", err, schemaChangeRefusedMarker)
+		}
+	})
+}
+
+// refuseWiringEngine is the source and target engine of the wiring roster:
+// a name, and a target catalog read through OpenSchemaReader (and, for the
+// multi-database fan-out, through a per-namespace DSN). Any other call
+// panics through the nil embedded interface.
+type refuseWiringEngine struct {
+	ir.Engine
+	name    string
+	catalog *ir.Table
+}
+
+func (e refuseWiringEngine) Name() string { return e.name }
+
+func (e refuseWiringEngine) OpenSchemaReader(context.Context, string) (ir.SchemaReader, error) {
+	return refuseWiringReader{e.catalog}, nil
+}
+
+func (refuseWiringEngine) WithDatabase(dsn, database string) (string, error) {
+	return dsn + "/" + database, nil
+}
+
+func (refuseWiringEngine) EnsureDatabase(context.Context, string, string) error { return nil }
+
+type refuseWiringReader struct{ t *ir.Table }
+
+func (r refuseWiringReader) ReadSchema(context.Context) (*ir.Schema, error) {
+	return &ir.Schema{Tables: []*ir.Table{r.t}}, nil
+}
+
+// TestPhaseWireInterceptChain_EveryUnforwardedStreamShapeIsChecked is the
+// wiring roster: every Streamer shape that wires neither forwarding
+// intercept — refuse mode, a multi-database stream (forward or refuse),
+// Shape A under --no-coordinate-live-ddl — refuses a boundary the target
+// cannot hold and passes one it matches. Before GC-44 F5 each of them passed
+// both, unchecked.
+func TestPhaseWireInterceptChain_EveryUnforwardedStreamShapeIsChecked(t *testing.T) {
+	t.Parallel()
+	shard := ShardColumnSpec{Name: "shard", Value: "a"}
+	narrow := witnessTable(wcol("ts", ir.DateTime{}))
+	wide := witnessTable(wcol("ts", ir.DateTime{Precision: 6}))
+	for _, tc := range []struct {
+		name string
+		s    func() *Streamer
+	}{
+		{"--schema-changes=refuse", func() *Streamer { return &Streamer{SchemaChanges: "refuse"} }},
+		{"multi-database (forward)", func() *Streamer { return &Streamer{AllDatabases: true} }},
+		{"multi-database under refuse", func() *Streamer { return &Streamer{AllDatabases: true, SchemaChanges: "refuse"} }},
+		{"Shape A with --no-coordinate-live-ddl", func() *Streamer {
+			return &Streamer{InjectShardColumn: shard, NoCoordinateLiveDDL: true}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, c := range []struct {
+				snap       *ir.Table
+				wantRefuse bool
+			}{{narrow, false}, {wide, true}} {
+				target := narrow
+				if tc.name == "Shape A with --no-coordinate-live-ddl" {
+					// The target carries the discriminator the cold start
+					// injected.
+					cp := *narrow
+					cp.Columns = append(append([]*ir.Column{}, narrow.Columns...), &ir.Column{Name: "shard", Type: ir.Varchar{Length: 64}})
+					target = &cp
+				}
+				s := tc.s()
+				s.Source = refuseWiringEngine{name: "mysql"}
+				tgt := refuseWiringEngine{name: "mysql", catalog: target}
+				s.Target = tgt
+				if s.multiDatabaseMode() {
+					// What the multi-database open hands over after its
+					// flat-target and fold preflights.
+					s.namespaceTargetDeriver = tgt
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				in := make(chan ir.Change, 1)
+				in <- refuseSnap(c.snap)
+				close(in)
+				var got []ir.Change
+				for ch := range s.phaseWireInterceptChain(ctx, in, nil, "roster") {
+					got = append(got, ch)
+				}
+				cancel()
+				var err error
+				if p := s.schemaSnapshotErr.Load(); p != nil {
+					err = *p
+				}
+				if c.wantRefuse {
+					if !errors.Is(err, ir.ErrSchemaChangeRefused) || len(got) != 0 {
+						t.Errorf("a widen the target cannot hold: passed %d, err %v; want refused with %s", len(got), err, schemaChangeRefusedMarker)
+					}
+					continue
+				}
+				if err != nil || len(got) != 1 {
+					t.Errorf("a boundary matching the target: passed %d, err %v; want passed", len(got), err)
+				}
+			}
+		})
+	}
+}

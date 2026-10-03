@@ -108,3 +108,29 @@ func TestPGSchemaHistory_OutOfScopeSchemaSkipped(t *testing.T) {
 		t.Errorf("out-of-scope schema produced %d versions, want 0", got)
 	}
 }
+
+// TestPGSchemaHistory_MultiSchemaEverySelectedSchemaHasBoundaries pins the
+// GC-44 F5 gate: on a multi-schema stream every SELECTED schema's relations
+// produce boundaries — the pipeline's schema-change check sees nothing it
+// is not handed — while an unselected schema still does not.
+func TestPGSchemaHistory_MultiSchemaEverySelectedSchemaHasBoundaries(t *testing.T) {
+	selected := map[string]bool{"sales": true, "billing": true}
+	r := &CDCReader{schema: "public", slotName: "s", cdcSchemaInScope: func(s string) bool { return selected[s] }}
+	sig := map[uint32]ir.SchemaSignature{}
+	out := make(chan ir.Change, 8)
+	for i, schema := range []string{"sales", "billing", "unselected"} {
+		rel := pgRelV1()
+		rel.Schema = schema
+		if err := r.maybeSnapshotSchema(context.Background(), rel, uint32(10+i), pglogrepl.LSN(1), sig, out); err != nil {
+			t.Fatalf("%s relation: %v", schema, err)
+		}
+	}
+	snaps := collectPGSnapshots(out)
+	got := map[string]bool{}
+	for _, s := range snaps {
+		got[s.Schema] = true
+	}
+	if len(snaps) != 2 || !got["sales"] || !got["billing"] {
+		t.Errorf("boundaries for %v (%d), want exactly sales and billing", got, len(snaps))
+	}
+}

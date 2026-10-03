@@ -140,6 +140,19 @@ behavior:
   any source DDL surfaces as a loud refuse with the drained-model
   recovery hint. For operators who gate DDL through a separate
   change-management process.
+  **Amended (GC-44 F5, v0.156.10): that sentence was false until then.**
+  Refuse mode (and a multi-database stream, and Shape A under
+  `--no-coordinate-live-ddl`) wired no schema-snapshot intercept, so a
+  binlog boundary only wrote its history row and a Postgres reader refused
+  only a change to a relation it had cached in the same stream: a type
+  widen within its family was neither forwarded nor refused, and every
+  following value was rounded into the old column. Such a stream now
+  checks every boundary against the target
+  (`pipeline/schema_change_refuse.go`, `SCHEMA-CHANGE-REFUSED`): a change
+  the target already holds passes — which is what lets the drained model
+  recover — and so does a target column wider than the source's that holds
+  every value; anything else refuses. "Any source DDL refuses" is
+  therefore not the contract: a DDL the target already reflects passes.
 
 A two-state enum (not a three-state `add-only|forward|refuse`) is
 chosen deliberately: the ADD-only mode ADR-0058 shipped was a

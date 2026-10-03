@@ -261,6 +261,7 @@ func (s *Streamer) coldStartMultiDatabase(
 	// the home database simply routes to the bound namespace (same name —
 	// correct). ----
 	targetDeriver, targetCanDeriveDB := s.Target.(ir.DatabaseDSNDeriver)
+	s.namespaceTargetDeriver = targetDeriver
 	if targetCanDeriveDB {
 		for _, database := range selected {
 			// Route to the (possibly renamed) TARGET namespace (ADR-0142);
@@ -604,6 +605,7 @@ func (s *Streamer) warmResumeMultiDatabase(
 	// (schema_seed_multidb.go); a nil deriver is the WARN-and-degrade arm
 	// there, not a silent one.
 	targetDeriver, _ := s.Target.(ir.DatabaseDSNDeriver)
+	s.namespaceTargetDeriver = targetDeriver
 
 	// UNLOGGED-table census at the warm-resume open too (G2): `ALTER
 	// TABLE … SET UNLOGGED` succeeds mid-sync under the spanning FOR ALL

@@ -701,14 +701,20 @@ type firstTouchBoundaryArmer interface {
 }
 
 // firstTouchBoundariesConsumed reports whether a schema-snapshot intercept
-// downstream will check a first-touch boundary against the target: the
-// single-stream forward intercept, or Shape A's coordination intercept.
-// Neither runs in multi-database mode (where a boundary only writes a
-// history row), so arming there would cost a history write per table per
-// resume for nothing.
+// downstream will check a first-touch boundary against the target. Since
+// GC-44 F5 every streamer wiring has one: the single-stream forward
+// intercept, Shape A's coordination intercept, or — on a stream neither of
+// them serves (refuse mode, multi-database, Shape A under
+// --no-coordinate-live-ddl) — the unforwarded-stream check
+// ([interceptSchemaChangeRefuse]), which [Streamer.phaseWireInterceptChain]
+// wires exactly when the other two are not. Before F5 multi-database and
+// refuse mode were left unarmed "because a boundary only writes a history
+// row" — which was the defect: a change made while such a stream was
+// stopped took no boundary at all on the binlog lane.
+//
+// It stays a predicate, not an inlined true, for the reason
+// [Streamer.schemaDeltaAppliesToTarget] does: non-streamer readers (backup
+// capture, tooling, tests) stay unarmed by never reaching the arming call.
 func (s *Streamer) firstTouchBoundariesConsumed() bool {
-	if s.multiDatabaseMode() {
-		return false
-	}
-	return s.singleStreamSchemaForwardActive() || (s.InjectShardColumn.Engaged() && !s.NoCoordinateLiveDDL)
+	return true
 }

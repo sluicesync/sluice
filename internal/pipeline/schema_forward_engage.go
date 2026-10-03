@@ -138,18 +138,18 @@ func (s *Streamer) engageAddColumnForward(ctx context.Context) error {
 		// namespace. Skip the intercept rather than open a mis-bound
 		// writer; multi-database forwarding is a follow-up.
 		//
-		// This said "the stream keeps the refuse-on-DDL behavior for its
-		// databases", and the log line said source DDL "refuses loudly".
-		// Measured false (GC-44 F5, 2026-10-02): with no intercept a
-		// binlog boundary only writes its history row, so a MySQL
-		// `MODIFY ts DATETIME(6)` is neither applied nor refused and every
-		// following value is rounded into the old column at exit 0. The
-		// log now says so; the refusal itself is the open F5 fix.
+		// The stream's boundaries are checked against the target instead
+		// (GC-44 F5, schema_change_refuse.go): one the target cannot hold
+		// refuses with SCHEMA-CHANGE-REFUSED. Until F5 this comment said the
+		// stream "keeps the refuse-on-DDL behavior", which was measured
+		// false: with no intercept a binlog boundary only wrote its history
+		// row, and a MySQL `MODIFY ts DATETIME(6)` was rounded into the old
+		// column at exit 0.
 		slog.WarnContext(ctx,
 			"schema-change forwarding skipped: multi-database streams do not "+
-				"forward source DDL (ADR-0091, single-database only), and a column type "+
-				"change is NOT refused either — apply every schema change on the target "+
-				"yourself, before the source change reaches the stream (the drained model)")
+				"forward source DDL (ADR-0091, single-database only); a source schema "+
+				"change the target cannot hold stops the stream with SCHEMA-CHANGE-REFUSED — "+
+				"apply each change on the target yourself (the drained model)")
 		return nil
 	}
 	if s.Target == nil {

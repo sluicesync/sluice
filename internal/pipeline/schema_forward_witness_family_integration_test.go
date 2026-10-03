@@ -321,13 +321,19 @@ func runTWFBFamilyMatrix(t *testing.T, cell twfbCell, tables []twfbFamilyTable) 
 	if lines := divergenceLines(out); lines != "" {
 		t.Errorf("PHANTOM: a healthy resume refused or forwarded:\n%s", lines)
 	}
+	// A stream that forwards nothing judges its boundaries through the
+	// unforwarded-stream check (GC-44 F5), which logs its own lines.
+	match, phantoms := twfbLogMatch, []string{twfbLogForwarded, twfbLogUnwitnessed, twfbLogTargetOnly, twfbLogTargetWider}
+	if cell.unforwarded() {
+		match, phantoms = refuseLogMatch, []string{refuseLogUnwitnessed, refuseLogTargetOnly, refuseLogAhead}
+	}
 	for _, tb := range tables {
-		for _, marker := range []string{twfbLogForwarded, twfbLogUnwitnessed, twfbLogTargetOnly, twfbLogTargetWider} {
+		for _, marker := range phantoms {
 			if lines := logLinesFor(logs, marker, tb.name); len(lines) > 0 {
 				t.Errorf("PHANTOM on %s: %s", tb.name, strings.Join(lines, "\n"))
 			}
 		}
-		matched := logLinesFor(logs, twfbLogMatch, tb.name)
+		matched := logLinesFor(logs, match, tb.name)
 		if len(matched) == 0 {
 			t.Errorf("VACUOUS: no first-boundary match was logged for %s — the witness never checked it", tb.name)
 		}
@@ -341,7 +347,10 @@ func runTWFBFamilyMatrix(t *testing.T, cell twfbCell, tables []twfbFamilyTable) 
 func divergenceLines(out string) string {
 	var b strings.Builder
 	for _, line := range strings.Split(out, "\n") {
-		if strings.Contains(line, resumeDivergenceMarker) || strings.Contains(line, "target DDL applied") ||
+		// The unforwarded-stream check's refusal is its ERROR line; the
+		// multi-database engage WARN names the marker without refusing.
+		if strings.Contains(line, resumeDivergenceMarker) || strings.Contains(line, `msg="schema change refused"`) ||
+			strings.Contains(line, "target DDL applied") ||
 			strings.Contains(line, "target ALTER applied") || strings.Contains(line, twfbLogForwarded) {
 			b.WriteString(line)
 			b.WriteByte('\n')
@@ -350,22 +359,22 @@ func divergenceLines(out string) string {
 	return b.String()
 }
 
-func TestTWFBFamilyMatrix_MySQLToPostgres(t *testing.T) {
+func twfbFamilyMatrixMySQLToPostgres(t *testing.T, schemaChanges string) {
 	srcDSN, _, srcCleanup := startMySQLBinlog(t)
 	defer srcCleanup()
 	_, tgtDSN, tgtCleanup := startPostgres(t)
 	defer tgtCleanup()
 	runTWFBFamilyMatrix(t, twfbCell{
-		src: twfbDB{"mysql", srcDSN}, tgt: twfbDB{"postgres", tgtDSN}, streamID: "twfb-fam-m2p",
+		src: twfbDB{"mysql", srcDSN}, tgt: twfbDB{"postgres", tgtDSN}, streamID: "twfb-fam-m2p" + schemaChanges, schemaChanges: schemaChanges,
 		mappings: twfbOverrides(true),
 	}, []twfbFamilyTable{{"fam", twfbMySQLFamilyDDL, twfbMySQLFamilyProbe}, twfbMySQLOverrideTable})
 }
 
-func TestTWFBFamilyMatrix_MySQLToMySQL(t *testing.T) {
+func twfbFamilyMatrixMySQLToMySQL(t *testing.T, schemaChanges string) {
 	srcDSN, tgtDSN, cleanup := startMySQLBinlog(t)
 	defer cleanup()
 	runTWFBFamilyMatrix(t, twfbCell{
-		src: twfbDB{"mysql", srcDSN}, tgt: twfbDB{"mysql", tgtDSN}, streamID: "twfb-fam-m2m",
+		src: twfbDB{"mysql", srcDSN}, tgt: twfbDB{"mysql", tgtDSN}, streamID: "twfb-fam-m2m" + schemaChanges, schemaChanges: schemaChanges,
 		mappings: twfbOverrides(true),
 	}, []twfbFamilyTable{
 		{"fam", twfbMySQLFamilyDDL, twfbMySQLFamilyProbe},
@@ -374,11 +383,11 @@ func TestTWFBFamilyMatrix_MySQLToMySQL(t *testing.T) {
 	})
 }
 
-func TestTWFBFamilyMatrix_PostgresToPostgres(t *testing.T) {
+func twfbFamilyMatrixPostgresToPostgres(t *testing.T, schemaChanges string) {
 	srcDSN, tgtDSN, cleanup := startPostgresLogical(t)
 	defer cleanup()
 	runTWFBFamilyMatrix(t, twfbCell{
-		src: twfbDB{"postgres", srcDSN}, tgt: twfbDB{"postgres", tgtDSN}, streamID: "twfb-fam-p2p",
+		src: twfbDB{"postgres", srcDSN}, tgt: twfbDB{"postgres", tgtDSN}, streamID: "twfb-fam-p2p" + schemaChanges, schemaChanges: schemaChanges,
 		mappings: twfbOverrides(false),
 	}, []twfbFamilyTable{
 		{"fam", twfbPGFamilyDDL, twfbPGFamilyProbe},
@@ -387,7 +396,7 @@ func TestTWFBFamilyMatrix_PostgresToPostgres(t *testing.T) {
 	})
 }
 
-func TestTWFBFamilyMatrix_PostgresToMySQL(t *testing.T) {
+func twfbFamilyMatrixPostgresToMySQL(t *testing.T, schemaChanges string) {
 	srcDSN, _, srcCleanup := startPostgresLogical(t)
 	defer srcCleanup()
 	_, tgtDSN, tgtCleanup := startMySQL(t)
@@ -398,7 +407,7 @@ func TestTWFBFamilyMatrix_PostgresToMySQL(t *testing.T) {
 	// refusal outside this matrix's subject, recorded in the GC-44 report.
 	probe := strings.NewReplacer(" c_timetz,", "", " '10:11:12+02',", "").Replace(twfbPGFamilyProbe)
 	runTWFBFamilyMatrix(t, twfbCell{
-		src: twfbDB{"postgres", srcDSN}, tgt: twfbDB{"mysql", tgtDSN}, streamID: "twfb-fam-p2m",
+		src: twfbDB{"postgres", srcDSN}, tgt: twfbDB{"mysql", tgtDSN}, streamID: "twfb-fam-p2m" + schemaChanges, schemaChanges: schemaChanges,
 		mappings: twfbOverrides(false),
 	}, []twfbFamilyTable{{"fam", twfbPGFamilyDDL, probe}, twfbPGOverrideTable})
 }
@@ -423,13 +432,13 @@ const twfbMariaDBOnlyProbe = `
 	INSERT INTO fam_maria VALUES (2, '{"k": 1}', '9b2ec2a6-4a8e-4b6c-9a3e-0f0e0d0c0b0a', '10.0.0.1', '2001:db8::1');
 `
 
-func TestTWFBFamilyMatrix_MariaDBToPostgres(t *testing.T) {
+func twfbFamilyMatrixMariaDBToPostgres(t *testing.T, schemaChanges string) {
 	srcDSN, srcCleanup := startMariaDBBinlog(t)
 	defer srcCleanup()
 	_, tgtDSN, tgtCleanup := startPostgres(t)
 	defer tgtCleanup()
 	runTWFBFamilyMatrix(t, twfbCell{
-		src: twfbDB{"mariadb", srcDSN}, tgt: twfbDB{"postgres", tgtDSN}, streamID: "twfb-fam-maria2p",
+		src: twfbDB{"mariadb", srcDSN}, tgt: twfbDB{"postgres", tgtDSN}, streamID: "twfb-fam-maria2p" + schemaChanges, schemaChanges: schemaChanges,
 		mappings: twfbOverrides(true),
 	}, []twfbFamilyTable{
 		{"fam", twfbMySQLFamilyDDL, twfbMySQLFamilyProbe},
@@ -438,7 +447,7 @@ func TestTWFBFamilyMatrix_MariaDBToPostgres(t *testing.T) {
 	})
 }
 
-func TestTWFBFamilyMatrix_MariaDBToMySQL(t *testing.T) {
+func twfbFamilyMatrixMariaDBToMySQL(t *testing.T, schemaChanges string) {
 	srcDSN, srcCleanup := startMariaDBBinlog(t)
 	defer srcCleanup()
 	_, tgtDSN, tgtCleanup := startMySQL(t)
@@ -451,11 +460,66 @@ func TestTWFBFamilyMatrix_MariaDBToMySQL(t *testing.T) {
 	probe := strings.NewReplacer("4000000000,", "4000,", "9000000000000000000,", "9000,", "16000000,", "1600,", " 200,", " 20,", "60000,", "600,").
 		Replace(twfbMySQLFamilyProbe)
 	runTWFBFamilyMatrix(t, twfbCell{
-		src: twfbDB{"mariadb", srcDSN}, tgt: twfbDB{"mysql", tgtDSN}, streamID: "twfb-fam-maria2m",
+		src: twfbDB{"mariadb", srcDSN}, tgt: twfbDB{"mysql", tgtDSN}, streamID: "twfb-fam-maria2m" + schemaChanges, schemaChanges: schemaChanges,
 		mappings: twfbOverrides(true),
 	}, []twfbFamilyTable{
 		{"fam", twfbMySQLFamilyDDL, probe},
 		{"fam_maria", twfbMariaDBOnlyDDL, twfbMariaDBOnlyProbe},
 		twfbMySQLOverrideTable,
 	})
+}
+
+// The forward (default) arm of each direction: the TWFB availability gate.
+
+func TestTWFBFamilyMatrix_MySQLToPostgres(t *testing.T) {
+	twfbFamilyMatrixMySQLToPostgres(t, "")
+}
+
+func TestTWFBFamilyMatrix_MySQLToMySQL(t *testing.T) {
+	twfbFamilyMatrixMySQLToMySQL(t, "")
+}
+
+func TestTWFBFamilyMatrix_PostgresToPostgres(t *testing.T) {
+	twfbFamilyMatrixPostgresToPostgres(t, "")
+}
+
+func TestTWFBFamilyMatrix_PostgresToMySQL(t *testing.T) {
+	twfbFamilyMatrixPostgresToMySQL(t, "")
+}
+
+func TestTWFBFamilyMatrix_MariaDBToPostgres(t *testing.T) {
+	twfbFamilyMatrixMariaDBToPostgres(t, "")
+}
+
+func TestTWFBFamilyMatrix_MariaDBToMySQL(t *testing.T) {
+	twfbFamilyMatrixMariaDBToMySQL(t, "")
+}
+
+// The --schema-changes=refuse arm (GC-44 F5): the same tables through the
+// unforwarded-stream check (schema_change_refuse.go), which takes the
+// binlog lane's first-touch boundary too, so a phantom there would refuse a
+// healthy refuse-mode stream on every restart.
+
+func TestStreamer_RefuseFamilyMatrix_MySQLToPostgres(t *testing.T) {
+	twfbFamilyMatrixMySQLToPostgres(t, "refuse")
+}
+
+func TestStreamer_RefuseFamilyMatrix_MySQLToMySQL(t *testing.T) {
+	twfbFamilyMatrixMySQLToMySQL(t, "refuse")
+}
+
+func TestStreamer_RefuseFamilyMatrix_PostgresToPostgres(t *testing.T) {
+	twfbFamilyMatrixPostgresToPostgres(t, "refuse")
+}
+
+func TestStreamer_RefuseFamilyMatrix_PostgresToMySQL(t *testing.T) {
+	twfbFamilyMatrixPostgresToMySQL(t, "refuse")
+}
+
+func TestStreamer_RefuseFamilyMatrix_MariaDBToPostgres(t *testing.T) {
+	twfbFamilyMatrixMariaDBToPostgres(t, "refuse")
+}
+
+func TestStreamer_RefuseFamilyMatrix_MariaDBToMySQL(t *testing.T) {
+	twfbFamilyMatrixMariaDBToMySQL(t, "refuse")
 }

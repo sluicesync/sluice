@@ -2188,10 +2188,20 @@ func (r *CDCReader) send(ctx context.Context, out chan<- ir.Change, c ir.Change)
 // WALStart ≤ every subsequent row LSN and the PG LSN-≤ orderer
 // resolves correctly).
 //
-// Out-of-scope schemas are skipped, mirroring the emit-side
-// rel.Schema != r.schema gate: the applier hosts schema-history rows
-// only for the bound schema's tables; a version for a relation whose
-// rows are never applied would be dead weight.
+// Out-of-scope schemas are skipped through the same [CDCReader.schemaInScope]
+// the row emitters consult: a version for a relation whose rows are never
+// applied would be dead weight.
+//
+// GC-44 F5: this said `rel.Schema != r.schema`, which on a multi-schema
+// stream skipped every selected schema but the DSN's own — their rows were
+// applied, but no boundary ever reached the pipeline for them. A type change
+// there (`timestamp(0)` → `timestamp(6)`) was therefore never compared with
+// the target, and every following value was rounded into the old column at
+// exit 0: measured on postgres:16 with a change made while the stream was
+// stopped and one made while it ran (the reader's own race gate refuses only
+// a relation it has already cached in the same stream). With no
+// cdcSchemaInScope predicate (single schema) schemaInScope is exactly
+// `schema == r.schema`, so that path is unchanged.
 //
 // A loud floor is preserved: this path only ADDS a durable version
 // write ahead of the relation's rows; the existing "insert/update/
@@ -2205,7 +2215,7 @@ func (r *CDCReader) maybeSnapshotSchema(
 	snapshotSig map[uint32]ir.SchemaSignature,
 	out chan<- ir.Change,
 ) error {
-	if rel.Schema != r.schema {
+	if !r.schemaInScope(rel.Schema) {
 		return nil // out-of-scope schema; no schema-history row to host
 	}
 	tbl := projectRelation(rel)

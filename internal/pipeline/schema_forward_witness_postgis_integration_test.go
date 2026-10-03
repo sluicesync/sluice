@@ -94,3 +94,35 @@ func TestTWFBFamilyMatrix_PostGIS_PostgresToMySQL(t *testing.T) {
 		src: twfbDB{"postgres", srcDSN}, tgt: twfbDB{"mysql", tgtDSN}, streamID: "twfb-geo-p2m",
 	}, []twfbFamilyTable{{"fam_geo", twfbPostGISGeometryPGDDL, twfbPostGISGeometryPGProbe}})
 }
+
+// The --schema-changes=refuse arm (GC-44 F5): geometry through the
+// unforwarded-stream check, which takes every first boundary too.
+
+func TestTWFBFamilyMatrix_PostGIS_RefuseMySQLToPostgres(t *testing.T) {
+	srcDSN, _, srcCleanup := startMySQLBinlog(t)
+	defer srcCleanup()
+	_, tgtDSN, tgtCleanup := startPostgresWithPostGIS(t)
+	defer tgtCleanup()
+	runTWFBFamilyMatrix(t, twfbCell{
+		src: twfbDB{"mysql", srcDSN}, tgt: twfbDB{"postgres", tgtDSN}, streamID: "refuse-geo-m2p", schemaChanges: "refuse",
+	}, []twfbFamilyTable{{"fam_geo", twfbPostGISGeometryMySQLDDL, twfbPostGISGeometryMySQLProbe}})
+}
+
+func TestTWFBFamilyMatrix_PostGIS_RefusePostgresToPostgres(t *testing.T) {
+	srcDSN, tgtDSN, cleanup := startPostgresLogicalImage(t, postgisPrebakedImage, 8)
+	defer cleanup()
+	twfbDB{"postgres", tgtDSN}.exec(t, "CREATE EXTENSION IF NOT EXISTS postgis")
+	runTWFBFamilyMatrix(t, twfbCell{
+		src: twfbDB{"postgres", srcDSN}, tgt: twfbDB{"postgres", tgtDSN}, streamID: "refuse-geo-p2p", schemaChanges: "refuse",
+	}, []twfbFamilyTable{{"fam_geo", twfbPostGISGeometryPGDDL, twfbPostGISGeometryPGProbe}})
+}
+
+func TestTWFBFamilyMatrix_PostGIS_RefusePostgresToMySQL(t *testing.T) {
+	srcDSN, _, srcCleanup := startPostgresLogicalImage(t, postgisPrebakedImage, 8)
+	defer srcCleanup()
+	_, tgtDSN, tgtCleanup := startMySQL(t)
+	defer tgtCleanup()
+	runTWFBFamilyMatrix(t, twfbCell{
+		src: twfbDB{"postgres", srcDSN}, tgt: twfbDB{"mysql", tgtDSN}, streamID: "refuse-geo-p2m", schemaChanges: "refuse",
+	}, []twfbFamilyTable{{"fam_geo", twfbPostGISGeometryPGDDL, twfbPostGISGeometryPGProbe}})
+}

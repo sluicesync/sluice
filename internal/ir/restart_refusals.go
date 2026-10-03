@@ -83,3 +83,14 @@ var ErrChangeLogWatermarkStalled = errors.New("CHANGE-LOG-WATERMARK-STALLED")
 // catalog, so a restart reads both back unchanged and refuses again until the
 // operator reconciles the target (the drained model).
 var ErrResumeSchemaDivergence = errors.New("RESUME-SCHEMA-DIVERGENCE")
+
+// ErrSchemaChangeRefused classifies the refusal of a schema boundary on a
+// stream that does not forward source DDL — `--schema-changes=refuse`, a
+// multi-database stream, `--inject-shard-column` with
+// `--no-coordinate-live-ddl` (GC-44 F5, pipeline/schema_change_refuse.go):
+// the source table now holds something the target column cannot faithfully
+// take, so applying the rows after it would change their values. Like
+// [ErrResumeSchemaDivergence] the check persists nothing and compares the
+// source's current shape with the target's catalog, so a restart refuses
+// again until the operator applies the change on the target.
+var ErrSchemaChangeRefused = errors.New("SCHEMA-CHANGE-REFUSED")

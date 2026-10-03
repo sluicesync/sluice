@@ -80,6 +80,13 @@ import (
 //     so a restart reads both back unchanged and refuses again until the
 //     operator reconciles the target. Its catalog-read failure is NOT the
 //     marker and stays restartable.
+//   - SCHEMA-CHANGE-REFUSED (every source on a stream that forwards no DDL —
+//     refuse mode, multi-database, Shape A drained; codeless; GC-44 F5):
+//     listed, for the same reason as RESUME-SCHEMA-DIVERGENCE: the check
+//     compares the source's current shape with the target's catalog and
+//     persists nothing, so a restart refuses again until the operator
+//     applies the change on the target. Its catalog-read failure is NOT the
+//     marker and stays restartable.
 //   - DEFERRED-KEY-CHECK-FAILED-AT-COMMIT (Postgres target, codeless): NOT
 //     listed. It is the COMMIT of a target transaction that a deferrable
 //     constraint's re-check refused, and one of its causes is a source
@@ -110,6 +117,7 @@ var refusalsARestartRepeats = []error{
 	ir.ErrChangeLogWatermarkStalled,
 	ir.ErrHeartbeatTableNotSluices,
 	ir.ErrResumeSchemaDivergence,
+	ir.ErrSchemaChangeRefused,
 }
 
 // refusalARestartRepeats returns the listed sentinel err carries, or nil.

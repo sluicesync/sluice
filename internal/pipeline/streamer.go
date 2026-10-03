@@ -1598,6 +1598,15 @@ type Streamer struct {
 	// [Streamer.firstBoundaryCatalog].
 	firstBoundaryHistory []*ir.Table
 
+	// namespaceTargetDeriver is the per-namespace target DSN deriver this
+	// attempt's multi-database open resolved — AFTER its flat-target refusal
+	// and namespace-fold preflight, which is why it is handed over rather
+	// than asserted again (TestMultiNamespaceFanOutRefusesAFlatTarget). The
+	// unforwarded-stream check reads each namespace's target catalog
+	// through it ([Streamer.unforwardedBoundaryWitnesses]). nil on a
+	// single-database stream, or a target that cannot derive one.
+	namespaceTargetDeriver ir.DatabaseDSNDeriver
+
 	// readerSchemaSeed loads the prior shape per in-scope table handed to
 	// a CDC reader that implements [schemaSeedSetter] (SLM-1). On cold
 	// start it is the RAW source IR captured in [coldStartPrepareSchema]

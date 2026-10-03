@@ -181,6 +181,20 @@ type twfbCell struct {
 	exclude []string
 	// mappings is the stream's --type-override list.
 	mappings []config.Mapping
+	// schemaChanges is the stream's --schema-changes ("" is the default,
+	// forward).
+	schemaChanges string
+	// databases, when set, makes it a multi-database stream over these
+	// source databases / schemas (--include-database); src.dsn is then a
+	// server-level DSN.
+	databases []string
+}
+
+// unforwarded reports whether the cell's stream forwards no source DDL, so
+// its boundaries go through the unforwarded-stream check
+// (schema_change_refuse.go) rather than the forward intercept.
+func (c twfbCell) unforwarded() bool {
+	return c.schemaChanges == "refuse" || len(c.databases) > 0
 }
 
 func (c twfbCell) streamer() *Streamer {
@@ -196,16 +210,21 @@ func (c twfbCell) streamer() *Streamer {
 	if err != nil {
 		panic(err)
 	}
-	return &Streamer{
+	s := &Streamer{
 		Source: srcEng, Target: tgtEng,
 		SourceDSN: c.src.dsn, TargetDSN: c.tgt.dsn,
-		StreamID: c.streamID,
-		Filter:   filter,
-		Mappings: c.mappings,
+		StreamID:      c.streamID,
+		Filter:        filter,
+		Mappings:      c.mappings,
+		SchemaChanges: c.schemaChanges,
 		// The CLI's --apply-retry-attempts default; the zero value would
 		// disable the ADR-0038 retry the in-process cell exercises.
 		ApplyRetryAttempts: 8,
 	}
+	if len(c.databases) > 0 {
+		s.DatabaseFilter = DatabaseFilter{Include: c.databases}
+	}
+	return s
 }
 
 // persistedPosition reads the stream's persisted resume position off the
@@ -275,6 +294,12 @@ const (
 	twfbLogUnwitnessed = "the target cannot witness this table's first schema boundary"
 	twfbLogTargetOnly  = "the target holds columns the source no longer has"
 	twfbLogTargetWider = "the target column is WIDER than the source's"
+
+	// The unforwarded-stream check's lines (schema_change_refuse.go).
+	refuseLogMatch       = "schema change check: boundary matches the target"
+	refuseLogUnwitnessed = "the target cannot witness this table's schema boundary"
+	refuseLogTargetOnly  = "the target holds columns the source does not have"
+	refuseLogAhead       = "the target already holds a wider column than the source sends"
 )
 
 // logLinesFor returns the captured lines carrying marker whose table
