@@ -469,6 +469,7 @@ func runOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 		if err := cfg.ApplyOne(ctx, streamID, first, schemaEventAtBoundary(src.open)); err != nil {
 			return 0, ir.Position{}, false, err
 		}
+		src.appliedAlone(first)
 		return 1, first.Pos(), false, nil
 	}
 
@@ -498,6 +499,7 @@ func runOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 		logBatchRollback(ctx, cfg.EngineName, streamID, 1, err)
 		return 0, ir.Position{}, false, cfg.Classify(err)
 	}
+	src.dispatched(firstSkipped, first)
 	n = 1
 	lastPos = first.Pos()
 	batchBytes := ir.ApproximateChangeBytes(first)
@@ -601,6 +603,7 @@ func runOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 				if err := cfg.ApplyOne(ctx, streamID, c, schemaEventAtBoundary(src.open)); err != nil {
 					return 0, ir.Position{}, false, err
 				}
+				src.appliedAlone(c)
 				return 1, c.Pos(), false, nil
 			}
 			// PII Phase 1.5: redact each subsequent batch member
@@ -617,6 +620,7 @@ func runOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 				logBatchRollback(ctx, cfg.EngineName, streamID, n+1, err)
 				return 0, ir.Position{}, false, cfg.Classify(err)
 			}
+			src.dispatched(skipped, c)
 			n++
 			lastPos = c.Pos()
 			// PG-2: a row-DML change skipped for an absent target wrote zero
@@ -841,7 +845,7 @@ func commitBatch(ctx context.Context, cfg *BatchConfig, tx BatchTx, streamID, to
 		)
 		return cfg.Classify(fmt.Errorf("%s: applier: commit: %w", cfg.EngineName, err))
 	}
-	src.batchCommitted(rowDML)
+	src.batchCommitted()
 	if skipPosition {
 		// Data durable, position (and thus rows_applied) deferred to the
 		// boundary. Carry this batch's DML forward AFTER the commit
@@ -933,7 +937,7 @@ type sourceTxState struct {
 	// no transaction markers at all (audit 2026-08-01 S3).
 	open bool
 
-	// splitCommitted is true once a batch has committed a row change of the
+	// splitCommitted is true once a batch has committed a statement of the
 	// source transaction while it was still open — a row cap, byte cap, idle
 	// timer, keyless table or schema event flushed mid-transaction — so part
 	// of the open source transaction is durable on the target. Only a TxBegin
@@ -941,6 +945,11 @@ type sourceTxState struct {
 	// TxCommit triggers still belongs to the transaction that was split (Bug
 	// 294).
 	splitCommitted bool
+
+	// batchWrites is true once the batch being built holds a statement of
+	// the source transaction ([sourceTxState.dispatched]); the batch's
+	// commit consumes it.
+	batchWrites bool
 }
 
 // begin opens a source transaction; nothing of it is committed yet.
@@ -949,26 +958,40 @@ func (s *sourceTxState) begin() {
 	s.splitCommitted = false
 }
 
-// batchCommitted records a batch that committed rowDML applied row changes
-// ([appliedRowDML]). One that commits with the transaction closed ended at
-// its boundary, and a later batch starts the next transaction clean. One that
-// commits with it still open committed part of it, but only if it carried a
-// row of it: the count is the batch's applied row DML, not its size (Bug
-// 295). A Postgres reader emits a table's SchemaSnapshot lazily at the
-// table's first row, inside that row's transaction, and the loop flushes the
-// snapshot alone as a one-change batch; counting it made a refusal of the
-// transaction's very first statements claim a split the target did not have.
-// A row skipped for an absent target wrote nothing either. A Truncate inside
-// the transaction is not counted, as the per-change path's pendingRows does
-// not count it: the refusal then keeps its own "may", which stays true.
-func (s *sourceTxState) batchCommitted(rowDML int) {
+// dispatched records a change the batch being built applied; skipped
+// reports that its target table is absent, so it wrote nothing (PG-2).
+func (s *sourceTxState) dispatched(skipped bool, c ir.Change) {
+	s.batchWrites = s.batchWrites || (!skipped && ir.WritesSourceStatement(c))
+}
+
+// batchCommitted records that the batch being built committed. One that
+// commits with the transaction closed ended at its boundary, and a later
+// batch starts the next transaction clean. One that commits with it still
+// open committed part of it — but only if it carried a statement of it
+// ([ir.WritesSourceStatement]: a row change or a Truncate), not merely a
+// change (Bug 295). A Postgres reader emits a table's SchemaSnapshot lazily
+// at the table's first row, inside that row's transaction, and the loop
+// flushes the snapshot alone as a one-change batch; counting it made a
+// refusal of the transaction's very first statements claim a split the
+// target did not have. A row skipped for an absent target wrote nothing
+// either.
+func (s *sourceTxState) batchCommitted() {
+	wrote := s.batchWrites
+	s.batchWrites = false
 	if !s.open {
 		s.splitCommitted = false
 		return
 	}
-	if rowDML > 0 {
+	if wrote {
 		s.splitCommitted = true
 	}
+}
+
+// appliedAlone records a change the loop applied in its own target
+// transaction, outside any batch (a schema event under TransactionalDDL=false).
+func (s *sourceTxState) appliedAlone(c ir.Change) {
+	s.dispatched(false, c)
+	s.batchCommitted()
 }
 
 // noteSplit tells a refusal that an earlier batch committed part of its

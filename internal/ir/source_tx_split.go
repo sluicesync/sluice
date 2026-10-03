@@ -48,6 +48,22 @@ func NoteSourceTxSplit(err error) error {
 	return &sourceTxSplitError{err: err, note: n.SourceTxSplitNote()}
 }
 
+// WritesSourceStatement reports whether applying c, when the target did not
+// skip it, writes a statement of its source transaction to the target: a row
+// change or a Truncate. It is what an apply loop counts toward
+// [NoteSourceTxSplit]'s "an earlier target transaction committed part of
+// it". A SchemaSnapshot writes none: a reader emits it lazily at a table's
+// first row, inside that row's transaction, but it is the table's shape, not
+// anything the transaction did (Bug 295). A committed Truncate counts: it
+// leaves the target in a state the source never had.
+func WritesSourceStatement(c Change) bool {
+	if IsRowDMLChange(c) {
+		return true
+	}
+	_, isTruncate := c.(Truncate)
+	return isTruncate
+}
+
 // sourceTxSplitError is err with its refusal's split note appended.
 type sourceTxSplitError struct {
 	err  error

@@ -1159,6 +1159,9 @@ func (a *ChangeApplier) Apply(ctx context.Context, streamID string, changes <-ch
 	defer a.marks.LogRunSummary(ctx, "mysql")
 	inSourceTx := false
 	pendingRows := int64(0)
+	// splitCommitted: a statement of the open source transaction is durable
+	// ([ir.WritesSourceStatement]; Bug 294, Bug 295).
+	splitCommitted := false
 	for {
 		select {
 		case c, ok := <-changes:
@@ -1173,6 +1176,7 @@ func (a *ChangeApplier) Apply(ctx context.Context, streamID string, changes <-ch
 			case ir.TxBegin:
 				inSourceTx = true
 				pendingRows = 0
+				splitCommitted = false
 				continue
 			case ir.TxCommit:
 				// The commit position write deletes the transaction's apply
@@ -1190,9 +1194,10 @@ func (a *ChangeApplier) Apply(ctx context.Context, streamID string, changes <-ch
 				skipped, err := a.applyOneImpl(ctx, streamID, c, false /* writePosition — deferred to TxCommit */)
 				if err != nil {
 					// Every change here commits in its own target transaction, so
-					// pendingRows > 0 means an earlier row of this source
-					// transaction is already durable: a refusal says so (Bug 294).
-					if pendingRows > 0 {
+					// once an earlier row or Truncate of this source transaction
+					// applied, it is durable: a refusal says so (Bug 294). A
+					// SchemaSnapshot or a skipped change wrote none of it (Bug 295).
+					if splitCommitted {
 						return ir.NoteSourceTxSplit(err)
 					}
 					return err
@@ -1202,6 +1207,7 @@ func (a *ChangeApplier) Apply(ctx context.Context, streamID string, changes <-ch
 				// delta (the skip already lands durably in the skip ledger).
 				if !skipped {
 					pendingRows += ir.RowsAppliedDelta(c)
+					splitCommitted = splitCommitted || ir.WritesSourceStatement(c)
 				}
 			} else {
 				if err := a.applyOne(ctx, streamID, c); err != nil {

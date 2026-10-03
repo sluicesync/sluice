@@ -75,12 +75,23 @@ func TestRunBatchLoop_KeyScopedRefusalNamesTheSplit(t *testing.T) {
 			batchSize: 1, skip: "p1", refuseAt: "p2", wantSplit: false,
 		},
 		{
-			// Deliberately conservative: the per-change path's pendingRows does
-			// not count a Truncate either, and "may" stays true.
-			name:             "a Truncate committed inside the transaction keeps the refusal's may",
+			// A committed TRUNCATE leaves the target in a state the source
+			// never had, as the lane and per-change paths also say.
+			name:             "a Truncate committed inside the transaction is a split",
 			changes:          []ir.Change{txBegin("tb"), truncateAt("x1"), insertAt("p1")},
 			batchSize:        100,
-			transactionalDDL: true, refuseAt: "p1", wantSplit: false,
+			transactionalDDL: true, refuseAt: "p1", wantSplit: true,
+		},
+		{
+			name:      "a Truncate applied alone without transactional DDL is a split",
+			changes:   []ir.Change{txBegin("tb"), truncateAt("x1"), insertAt("p1")},
+			batchSize: 100, refuseAt: "p1", wantSplit: true,
+		},
+		{
+			name:             "a Truncate skipped for an absent target is not",
+			changes:          []ir.Change{txBegin("tb"), truncateAt("x1"), insertAt("p1")},
+			batchSize:        100,
+			transactionalDDL: true, skip: "x1", refuseAt: "p1", wantSplit: false,
 		},
 		{
 			name:      "row cap split, refused at dispatch",

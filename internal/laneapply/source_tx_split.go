@@ -42,20 +42,13 @@ type laneSourceTx struct {
 
 // writesSourceStatement reports whether applying the barrier change c wrote a
 // statement of its source transaction to the target, for partCommitted (Bug
-// 295). A SchemaSnapshot carries none: a reader emits it lazily at a table's
-// first row, inside that row's transaction, but it is the table's shape, not
-// anything the transaction did. Neither does a row change skipped for an
-// absent target, which wrote zero rows (PG-2). A Truncate does.
-// The skip verdict is the route-time one [LaneApplier.SkipsRowChange] gives,
-// which fails toward "applied" on a probe error; so does this.
+// 295): a row change or a Truncate ([ir.WritesSourceStatement]), not a
+// SchemaSnapshot, and not a row change skipped for an absent target, which
+// wrote zero rows (PG-2). The skip verdict is the route-time one
+// [LaneApplier.SkipsRowChange] gives, which fails toward "applied" on a
+// probe error; so does this.
 func (o *Orchestrator) writesSourceStatement(ctx context.Context, c ir.Change) bool {
-	switch c.(type) {
-	case ir.SchemaSnapshot:
-		return false
-	case ir.Insert, ir.Update, ir.Delete:
-		return !o.la.SkipsRowChange(ctx, c)
-	}
-	return true
+	return ir.WritesSourceStatement(c) && !o.la.SkipsRowChange(ctx, c)
 }
 
 // noteTxSplit tells a refusal from a lane batch that its source transaction

@@ -422,6 +422,41 @@ func TestGC42_SchemaSnapshotInsideTheTransaction(t *testing.T) {
 	}
 }
 
+// TestGC42_TruncateInsideTheTransaction pins the other side of Bug 295: a
+// TRUNCATE committed inside the source transaction before the refused
+// statement IS a split — the target holds a state the source never had — on
+// every path, the per-change one included. The refused DELETE is the
+// transaction's only row statement (it addresses a key the corrupted seed
+// holds twice, so every path refuses it at once), so the Truncate is the
+// only thing that can make the split true. The independent evidence is the
+// truncated side table, empty on the target after the refusal.
+func TestGC42_TruncateInsideTheTransaction(t *testing.T) {
+	const ddl = `CREATE TABLE %[1]s (id int, u text NOT NULL UNIQUE, v text, CONSTRAINT %[1]s_pk PRIMARY KEY (id) DEFERRABLE INITIALLY DEFERRED)`
+	const seed = `BEGIN; SET LOCAL session_replication_role = replica; INSERT INTO %[1]s VALUES (7,'a','x'),(7,'b','x'); COMMIT;`
+	const sideDDL = `CREATE TABLE %[1]s (id int PRIMARY KEY)`
+	const sideSeed = `INSERT INTO %[1]s VALUES (1)`
+	for _, env := range gc42Envs(t) {
+		for _, p := range gc42Paths(1000) {
+			t.Run(env.name+"/"+p.name, func(t *testing.T) {
+				table := gc42Name(t, "trunc", env.name, p.name)
+				side := table + "_side"
+				gc42Table(t, env, table, ddl, seed)
+				gc42Table(t, env, side, sideDDL, sideSeed)
+				err := gc42Apply(t, env, p, table, gc42Tx(
+					table,
+					ir.Truncate{Position: cpos(fmt.Sprintf("gc42-%s-trunc", table)), Schema: "public", Table: side},
+					ir.Delete{Schema: "public", Table: table, Before: ir.Row{"id": int64(7)}},
+				))
+				gc42Assert(t, err, gc42MultiMatch, "")
+				if got := gc42State(t, env.adminDSN, side); got != "" {
+					t.Fatalf("side table = %q; the Truncate did not commit, so this cell cannot grade the split", got)
+				}
+				gc42AssertSplitAccount(t, err, true)
+			})
+		}
+	}
+}
+
 // gc42Shift builds UPDATE id = id + 1 over n rows in the order the source
 // heap visits them; ascending makes every step transiently share a key. A
 // byIndex narrows the before-image the way a REPLICA IDENTITY USING

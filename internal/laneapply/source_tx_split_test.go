@@ -129,6 +129,10 @@ func TestOrchestrator_KeyScopedRefusalNamesTheSplit(t *testing.T) {
 		{"a schema snapshot barrier drained a routed row that wrote", []ir.Change{begin, ins(5), snap, del(2)}, true},
 		{"barrier refusal after a drained row skipped for an absent target", []ir.Change{begin, insGone, upd(2, 3)}, false},
 		{"lane refusal after a key-change barrier skipped for an absent target", []ir.Change{begin, updGone, del(2)}, false},
+		// A committed TRUNCATE leaves the target in a state the source never
+		// had: a split, as the batch and per-change paths also say.
+		{"lane refusal after a Truncate barrier", []ir.Change{begin, ir.Truncate{Schema: "s", Table: "t"}, del(2)}, true},
+		{"barrier refusal after a Truncate barrier", []ir.Change{begin, ir.Truncate{Schema: "s", Table: "t"}, upd(2, 3)}, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -170,6 +174,9 @@ func withPos(c ir.Change, n int) ir.Change {
 		v.Position = p
 		return v
 	case ir.SchemaSnapshot:
+		v.Position = p
+		return v
+	case ir.Truncate:
 		v.Position = p
 		return v
 	}
