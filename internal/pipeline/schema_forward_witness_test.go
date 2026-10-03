@@ -130,6 +130,32 @@ func TestClassifyWitness_VerdictTruthTable(t *testing.T) {
 		{"VARCHAR narrow", witnessTable(wcol("v", ir.Varchar{Length: 16})), witnessTable(wcol("v", ir.Varchar{Length: 64})), witnessTargetWider, nil, "v"},
 		{"CHAR narrow", witnessTable(wcol("c", ir.Char{Length: 4})), witnessTable(wcol("c", ir.Char{Length: 8})), witnessTargetWider, nil, "c"},
 		{"INT narrow", witnessTable(wcol("i", ir.Integer{Width: 32})), witnessTable(wcol("i", ir.Integer{Width: 64})), witnessTargetWider, nil, "i"},
+		// Across families (the second review): one-sided "target holds every
+		// value" relations — kept with a WARN, never forwarded; the reverse
+		// direction still refuses.
+		{"VARCHAR(n) under a TEXT target", witnessTable(wcol("v", ir.Varchar{Length: 16})), witnessTable(wcol("v", ir.Text{Size: ir.TextLong})), witnessTargetWider, nil, "v"},
+		{
+			"VARCHAR(n) under a TEXT too small for n×4 bytes refuses", witnessTable(wcol("v", ir.Varchar{Length: 100})),
+			witnessTable(wcol("v", ir.Text{Size: ir.TextTiny})), witnessRefuse, nil, "",
+		},
+		{"TEXT over a VARCHAR target refuses (no cross-family forward)", witnessTable(wcol("v", ir.Text{Size: ir.TextLong})), witnessTable(wcol("v", ir.Varchar{Length: 16})), witnessRefuse, nil, ""},
+		{"CHAR(n) under VARCHAR(m≥n)", witnessTable(wcol("c", ir.Char{Length: 8})), witnessTable(wcol("c", ir.Varchar{Length: 8})), witnessTargetWider, nil, "c"},
+		{"CHAR(n) under VARCHAR(m<n) refuses", witnessTable(wcol("c", ir.Char{Length: 8})), witnessTable(wcol("c", ir.Varchar{Length: 4})), witnessRefuse, nil, ""},
+		{"CHAR(n) under TEXT", witnessTable(wcol("c", ir.Char{Length: 8})), witnessTable(wcol("c", ir.Text{Size: ir.TextRegular})), witnessTargetWider, nil, "c"},
+		{"INT under NUMERIC(10,0)", witnessTable(wcol("i", ir.Integer{Width: 32})), witnessTable(wcol("i", ir.Decimal{Precision: 10})), witnessTargetWider, nil, "i"},
+		{"INT under NUMERIC(9,0) refuses", witnessTable(wcol("i", ir.Integer{Width: 32})), witnessTable(wcol("i", ir.Decimal{Precision: 9})), witnessRefuse, nil, ""},
+		{"BIGINT under NUMERIC(21,2)", witnessTable(wcol("i", ir.Integer{Width: 64})), witnessTable(wcol("i", ir.Decimal{Precision: 21, Scale: 2})), witnessTargetWider, nil, "i"},
+		{"BIGINT UNSIGNED under NUMERIC(19,0) refuses", witnessTable(wcol("i", ir.Integer{Width: 64, Unsigned: true})), witnessTable(wcol("i", ir.Decimal{Precision: 19})), witnessRefuse, nil, ""},
+		{"BIGINT UNSIGNED under NUMERIC(20,0)", witnessTable(wcol("i", ir.Integer{Width: 64, Unsigned: true})), witnessTable(wcol("i", ir.Decimal{Precision: 20})), witnessTargetWider, nil, "i"},
+		{"MEDIUMINT UNSIGNED under NUMERIC(7,0) refuses", witnessTable(wcol("i", ir.Integer{Width: 24, Unsigned: true})), witnessTable(wcol("i", ir.Decimal{Precision: 7})), witnessRefuse, nil, ""},
+		{"INT under unconstrained NUMERIC", witnessTable(wcol("i", ir.Integer{Width: 32})), witnessTable(wcol("i", ir.Decimal{Unconstrained: true})), witnessTargetWider, nil, "i"},
+		{"NUMERIC over an INT target refuses", witnessTable(wcol("i", ir.Decimal{Precision: 10})), witnessTable(wcol("i", ir.Integer{Width: 64})), witnessRefuse, nil, ""},
+		{"INT UNSIGNED under BIGINT", witnessTable(wcol("i", ir.Integer{Width: 32, Unsigned: true})), witnessTable(wcol("i", ir.Integer{Width: 64})), witnessTargetWider, nil, "i"},
+		{"INT UNSIGNED under INT refuses", witnessTable(wcol("i", ir.Integer{Width: 32, Unsigned: true})), witnessTable(wcol("i", ir.Integer{Width: 32})), witnessRefuse, nil, ""},
+		{"ENUM labels under a superset", witnessTable(wcol("e", ir.Enum{Values: []string{"a", "b"}})), witnessTable(wcol("e", ir.Enum{Values: []string{"b", "a", "c"}})), witnessTargetWider, nil, "e"},
+		{"ENUM labels over a subset refuses", witnessTable(wcol("e", ir.Enum{Values: []string{"a", "b", "c"}})), witnessTable(wcol("e", ir.Enum{Values: []string{"a", "b"}})), witnessRefuse, nil, ""},
+		{"SET labels under a superset", witnessTable(wcol("s", ir.Set{Values: []string{"a"}})), witnessTable(wcol("s", ir.Set{Values: []string{"a", "b"}})), witnessTargetWider, nil, "s"},
+		{"JSON under JSONB refuses (jsonb normalizes)", witnessTable(wcol("j", ir.JSON{})), witnessTable(wcol("j", ir.JSON{Binary: true})), witnessRefuse, nil, ""},
 		{
 			"INT sign change refuses", witnessTable(wcol("i", ir.Integer{Width: 32, Unsigned: true})),
 			witnessTable(wcol("i", ir.Integer{Width: 32})), witnessRefuse, nil, "",
@@ -595,7 +621,7 @@ func TestInterceptAddColumnForward_SeedGuardConsultsTheWitness(t *testing.T) {
 }
 
 // TestCheckShapeAFirstBoundary_Verdicts pins the Shape A first boundary
-// (GC-44 F4, as corrected by the review): a forwardable difference yields a
+// (GC-44 F4, as corrected by the reviews): a forwardable difference yields a
 // pre-state synthesized from the target for the lease to route — never a
 // refusal — a wider target is kept, and only an unforwardable difference
 // refuses.
@@ -606,7 +632,7 @@ func TestCheckShapeAFirstBoundary_Verdicts(t *testing.T) {
 		name    string
 		tgt     *ir.Table
 		preType ir.Type // the synthesized pre's "ts"; nil = not checked
-		preCols int     // 0 = baseline (no pre)
+		preCols int     // 0 = not routed
 		refuse  bool
 	}{
 		{"match", witnessTable(wcol("ts", ir.DateTime{Precision: 3})), nil, 0, false},
@@ -618,7 +644,7 @@ func TestCheckShapeAFirstBoundary_Verdicts(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			w := newFakeWitness(&fakeCatalog{tables: map[string]*ir.Table{"w": tc.tgt}}, "postgres", "postgres")
-			pre, err := checkShapeAFirstBoundary(ctx, w, "w", post, post)
+			b, err := checkShapeAFirstBoundary(ctx, w, "w", post, post)
 			if (err != nil) != tc.refuse {
 				t.Fatalf("err = %v, want refuse=%v", err, tc.refuse)
 			}
@@ -628,55 +654,94 @@ func TestCheckShapeAFirstBoundary_Verdicts(t *testing.T) {
 				}
 				return
 			}
+			if len(b.peerAdded) != 0 {
+				t.Fatalf("peerAdded = %v with no retained history; want none", columnNames(b.peerAdded))
+			}
 			if tc.preCols == 0 {
-				if pre != nil {
-					t.Fatalf("pre = %v; want the baseline (nil)", pre)
+				if !b.baseline() {
+					t.Fatalf("decision = %+v; want the baseline", b)
 				}
 				return
 			}
-			if pre == nil || len(pre.Columns) != tc.preCols {
-				t.Fatalf("pre = %v; want %d columns", pre, tc.preCols)
+			if b.pre == nil || len(b.pre.Columns) != tc.preCols {
+				t.Fatalf("pre = %v; want %d columns", b.pre, tc.preCols)
 			}
-			if tc.preType != nil && !reflect.DeepEqual(columnsByNameIR(pre)["ts"].Type, tc.preType) {
-				t.Errorf("pre ts = %v; want the target's %v", columnsByNameIR(pre)["ts"].Type, tc.preType)
+			if tc.preType != nil && !reflect.DeepEqual(columnsByNameIR(b.pre)["ts"].Type, tc.preType) {
+				t.Errorf("pre ts = %v; want the target's %v", columnsByNameIR(b.pre)["ts"].Type, tc.preType)
 			}
 		})
 	}
-	if pre, err := checkShapeAFirstBoundary(ctx, nil, "w", witnessTable(), witnessTable()); err != nil || pre != nil {
-		t.Fatalf("a nil witness must accept: %v, %v", pre, err)
+	if b, err := checkShapeAFirstBoundary(ctx, nil, "w", witnessTable(), witnessTable()); err != nil || !b.baseline() {
+		t.Fatalf("a nil witness must accept: %+v, %v", b, err)
 	}
+}
 
-	// GC-44 F13: a match on a column this stream never carried (a peer
-	// shard forwarded it) is routed as an ADD so this shard's rows are
-	// backfilled; a column the stream's own history already carries is not.
-	withExtra := witnessTable(wcol("ts", ir.DateTime{Precision: 3}), wcol("extra", ir.Integer{Width: 32}))
+// TestCheckShapeAFirstBoundary_PeerAddedOnEveryArm pins GC-44 F13 across
+// every verdict arm that does not refuse (the second review: the first fix
+// reached the match arm only). The stream's retained history lacks "tier";
+// the target holds it because a peer forwarded it. Whatever else the
+// verdict says, "tier" is owed this shard's backfill — and a routed arm's
+// own ADD is owed beside it.
+func TestCheckShapeAFirstBoundary_PeerAddedOnEveryArm(t *testing.T) {
+	ctx := context.Background()
+	ts := func(p int) *ir.Column { return wcol("ts", ir.DateTime{Precision: p}) }
+	tier := wcol("tier", ir.Integer{Width: 32})
+	history := []*ir.Table{witnessTable(ts(3))}
 	for _, tc := range []struct {
-		name    string
-		history []*ir.Table
-		want    int // synthesized pre's column count; 0 = baseline
+		name      string
+		post, tgt *ir.Table
+		routed    bool
+		owed      []string
 	}{
-		{"no retained history: the match is the baseline", nil, 0},
-		{"history carries the column: the baseline", []*ir.Table{withExtra}, 0},
-		{"history lacks the column: routed as an ADD", []*ir.Table{post}, 2},
+		{"match", witnessTable(ts(3), tier), witnessTable(ts(3), tier), false, []string{"tier"}},
+		{"target wider", witnessTable(ts(3), tier), witnessTable(ts(6), tier), false, []string{"tier"}},
+		{"target only", witnessTable(ts(3), tier), witnessTable(ts(3), tier, wcol("z", ir.Boolean{})), false, []string{"tier"}},
+		{
+			"forward add", witnessTable(ts(3), tier, wcol("n", ir.Boolean{})), witnessTable(ts(3), tier), true,
+			[]string{"tier", "n"},
+		},
+		{"forward alter", witnessTable(ts(6), tier), witnessTable(ts(0), tier), true, []string{"tier"}},
 	} {
-		t.Run("peer-added/"+tc.name, func(t *testing.T) {
-			w := newFakeWitness(&fakeCatalog{tables: map[string]*ir.Table{"w": withExtra}}, "postgres", "postgres")
-			w.history = tc.history
-			pre, err := checkShapeAFirstBoundary(ctx, w, "w", withExtra, withExtra)
+		t.Run(tc.name, func(t *testing.T) {
+			w := newFakeWitness(&fakeCatalog{tables: map[string]*ir.Table{"w": tc.tgt}}, "postgres", "postgres")
+			w.history = history
+			b, err := checkShapeAFirstBoundary(ctx, w, "w", tc.post, tc.post)
 			if err != nil {
 				t.Fatalf("err = %v", err)
 			}
-			if tc.want == 0 {
-				if pre != nil {
-					t.Fatalf("pre = %v; want the baseline", pre)
-				}
-				return
+			if b.routed() != tc.routed {
+				t.Errorf("routed = %v, want %v", b.routed(), tc.routed)
 			}
-			if pre == nil || len(pre.Columns) != tc.want || columnsByNameIR(pre)["extra"] != nil {
-				t.Fatalf("pre = %v; want %d columns without extra", pre, tc.want)
+			if got := columnNames(b.peerAdded); !reflect.DeepEqual(got, []string{"tier"}) {
+				t.Errorf("peerAdded = %v, want [tier]", got)
+			}
+			if got := columnNames(b.owed(tc.post)); !reflect.DeepEqual(got, tc.owed) {
+				t.Errorf("owed = %v, want %v", got, tc.owed)
+			}
+			if b.routed() {
+				// The routed shape stays one ClassifyShape accepts: the
+				// peer's column is in pre and post alike.
+				if _, err := ClassifyShape(b.pre, tc.post); err != nil {
+					t.Errorf("the routed (pre, post) does not classify: %v", err)
+				}
 			}
 		})
 	}
+	t.Run("history carries the column: nothing owed", func(t *testing.T) {
+		post := witnessTable(ts(3), tier)
+		w := newFakeWitness(&fakeCatalog{tables: map[string]*ir.Table{"w": post}}, "postgres", "postgres")
+		w.history = []*ir.Table{post}
+		if b, err := checkShapeAFirstBoundary(ctx, w, "w", post, post); err != nil || !b.baseline() {
+			t.Fatalf("decision = %+v, %v; want the baseline", b, err)
+		}
+	})
+	t.Run("no retained history: the stated residual", func(t *testing.T) {
+		post := witnessTable(ts(3), tier)
+		w := newFakeWitness(&fakeCatalog{tables: map[string]*ir.Table{"w": post}}, "postgres", "postgres")
+		if b, err := checkShapeAFirstBoundary(ctx, w, "w", post, post); err != nil || !b.baseline() {
+			t.Fatalf("decision = %+v, %v; want the baseline", b, err)
+		}
+	})
 }
 
 // firstTouchStub records whether it was armed for first-touch boundaries.
@@ -772,5 +837,56 @@ func TestShapeAFirstBoundary_RoutesThroughTheLeaseOnce(t *testing.T) {
 	}
 	if calls := b.callNames(); len(calls) != 0 {
 		t.Fatalf("stream-b applier calls = %v; want none (the peer observes)", calls)
+	}
+}
+
+// TestShapeAFirstBoundary_WriteAheadNamesThePeerAddedColumns pins the
+// ordering GC-44 F13's fix relies on. The write-ahead record is idempotent
+// per table, so whichever write comes first is the one on the target; on a
+// forward-add arm the router's own pre-ALTER write names only the column it
+// adds. The intercept must therefore write the FULL owed set — its own ADD
+// and the peer's column — before the ALTER, or a process killed during the
+// backfill restarts without a record of the peer column's debt.
+func TestShapeAFirstBoundary_WriteAheadNamesThePeerAddedColumns(t *testing.T) {
+	clock := newMockClock(testClockNow())
+	mgr := newTestLeaseManager(t, newFakeLeaseStore(clock.Now), "stream-b",
+		LeaseConfig{LeaseDuration: time.Hour, RenewDeadline: 30 * time.Minute, RetryPeriod: 5 * time.Minute}, clock)
+	store := &fakeRefusalStore{}
+	s, _ := writeAheadStreamer(store)
+	applier := &alterObservingApplier{fakeShapeApplier: &fakeShapeApplier{}, store: store}
+	router, err := NewBoundaryRouter(mgr, applier, &fakeProber{}, "postgres", "postgres", sourceDefaultReaders{})
+	if err != nil {
+		t.Fatalf("NewBoundaryRouter: %v", err)
+	}
+	bf := &schemaForwardBackfill{
+		reader: staticBackfillReader(&pagedBackfillReader{}), batchSize: 10,
+		ledger: &s.addedColumnBackfills, streamID: "s",
+	}
+	router.beforeAddColumn = bf.writeAhead
+
+	tier := &ir.Column{Name: "tier", Type: ir.Integer{Width: 32}, Nullable: true}
+	added := &ir.Column{Name: "n", Type: ir.Integer{Width: 32}, Nullable: true}
+	post := addColForwardTable("dj", tier, added)
+	w := newFakeWitness(&fakeCatalog{tables: map[string]*ir.Table{"dj": addColForwardTable("dj", tier)}}, "postgres", "postgres")
+	w.history = []*ir.Table{addColForwardTable("dj")}
+	router.firstBoundary = w
+
+	in := make(chan ir.Change, 1)
+	in <- ir.SchemaSnapshot{Schema: "public", Table: "dj", Position: ir.Position{Token: "p1"}, IR: post}
+	close(in)
+	var errStore atomic.Pointer[error]
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	drainChanges(t, interceptSchemaSnapshotsForCoordination(ctx, in, nil, router, nil, bf, &errStore), 2*time.Second)
+	if e := errStore.Load(); e != nil {
+		t.Fatalf("intercept refused: %v", *e)
+	}
+	if applier.addColCalls != 1 {
+		t.Fatalf("AlterAddColumn calls = %d; want the forward-add arm's one", applier.addColCalls)
+	}
+	for _, col := range []string{"n", "tier"} {
+		if !strings.Contains(applier.recordAtAlter, col) {
+			t.Errorf("the write-ahead record on the target when the ALTER ran does not name %q: %q", col, applier.recordAtAlter)
+		}
 	}
 }

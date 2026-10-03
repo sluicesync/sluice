@@ -112,16 +112,56 @@ func TestPhase2e_PG_FirstBoundaryWidenWhileStopped_RoutesThroughTheLeaseOnce(t *
 }
 
 // TestPhase2e_PG_FirstBoundaryPeerAddedColumn_BackfillsEveryShard pins
-// GC-44 F13. Both sources ADD a column while the fleet is stopped, then
-// change its DEFAULT, so each source's pre-existing rows hold the ORIGINAL
-// default while the DEFAULT the holder carries is the new one. Shard A
-// restarts first and forwards the ADD through the lease, backfilling its
-// own rows. Shard B's first boundary then finds the target already
-// matching. Before the fix it took that as its baseline and planned no
-// backfill, so B's pre-existing rows kept the holder's fill — the new
-// default, which B's source does not hold — at exit 0. The independent
-// expected value is each seed row's own source.
+// GC-44 F13 on EVERY verdict arm that does not refuse. Both sources ADD a
+// column while the fleet is stopped, then change its DEFAULT, so each
+// source's pre-existing rows hold the ORIGINAL default while the DEFAULT
+// the holder carries is the new one. Shard A restarts first and forwards
+// the ADD through the lease, backfilling its own rows. Shard B's first
+// boundary then finds the column already on the target — and, per arm, one
+// more difference that decides its verdict. Before the fix only the match
+// arm planned B a backfill, so on the other four B's pre-existing rows kept
+// the holder's fill — the new default, which B's source does not hold — at
+// exit 0. The independent expected value is each seed row's own source.
 func TestPhase2e_PG_FirstBoundaryPeerAddedColumn_BackfillsEveryShard(t *testing.T) {
+	const dropLease = `DELETE FROM "public"."sluice_shard_consolidation_lease" WHERE target_table_full_name = 'public.users';`
+	for _, arm := range []struct {
+		name string
+		// bSource runs on shard B's source while the fleet is stopped.
+		bSource string
+		// bTarget runs on the target after A's forward, before B restarts.
+		// The routed arms drop A's APPLIED lease row first, as the GC sweep
+		// would: a peer's live boundary on the same table otherwise refuses
+		// on the checksum before anything is applied (loud, not this cell).
+		bTarget string
+		// check reads the arm's own outcome off the target.
+		column, wantType string
+	}{
+		{name: "match", column: "email", wantType: "character varying(255)"},
+		{
+			name: "target-wider", bTarget: `ALTER TABLE users ALTER COLUMN email TYPE varchar(512);`,
+			column: "email", wantType: "character varying(512)",
+		},
+		{
+			name: "target-only", bTarget: `ALTER TABLE users ADD COLUMN extra_t integer;`,
+			column: "extra_t", wantType: "integer",
+		},
+		{
+			name: "forward-add", bSource: `ALTER TABLE users ADD COLUMN n integer DEFAULT 3;`, bTarget: dropLease,
+			column: "n", wantType: "integer",
+		},
+		{
+			name: "forward-alter", bSource: `ALTER TABLE users ALTER COLUMN email TYPE varchar(512);`, bTarget: dropLease,
+			column: "email", wantType: "character varying(512)",
+		},
+	} {
+		t.Run(arm.name, func(t *testing.T) {
+			runPeerAddedColumnArm(t, arm.bSource, arm.bTarget, arm.column, arm.wantType)
+		})
+	}
+}
+
+func runPeerAddedColumnArm(t *testing.T, bSource, bTarget, column, wantType string) {
+	t.Helper()
 	h := startPhase2eHarness(t)
 	defer h.cleanup()
 	for i := 0; i < 2; i++ {
@@ -161,6 +201,9 @@ func TestPhase2e_PG_FirstBoundaryPeerAddedColumn_BackfillsEveryShard(t *testing.
 		phase2eApplyDDL(t, h.sourceDSNs[i], `ALTER TABLE users ADD COLUMN tier integer DEFAULT 5;
 			ALTER TABLE users ALTER COLUMN tier SET DEFAULT 7;`)
 	}
+	if bSource != "" {
+		phase2eApplyDDL(t, h.sourceDSNs[1], bSource)
+	}
 
 	// Shard A alone: it forwards the ADD and backfills its own rows.
 	_, cancelA, runErrA = startPhase2eStreamer(t, 0, h.sourceDSNs[0], h.targetDSN)
@@ -177,8 +220,11 @@ func TestPhase2e_PG_FirstBoundaryPeerAddedColumn_BackfillsEveryShard(t *testing.
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
+	if bTarget != "" {
+		phase2eApplyDDL(t, h.targetDSN, bTarget)
+	}
 
-	// Shard B: its first boundary matches the target A already changed.
+	// Shard B: tier is already on the target; its verdict is the arm's.
 	_, cancelB, runErrB = startPhase2eStreamer(t, 1, h.sourceDSNs[1], h.targetDSN)
 	defer func() {
 		cancelB()
@@ -186,6 +232,11 @@ func TestPhase2e_PG_FirstBoundaryPeerAddedColumn_BackfillsEveryShard(t *testing.
 	}()
 	phase2eApplyDDL(t, h.sourceDSNs[1], `INSERT INTO users (email) VALUES ('shard_b_post@example.com');`)
 	if !waitForPhase2eTargetCount(h.targetDSN, 6, 120*time.Second) {
+		select {
+		case err := <-runErrB:
+			t.Fatalf("shard_b exited: %v\n%s", err, twfbNoticeLines(logs.String()))
+		default:
+		}
 		t.Fatalf("shard_b's post-ADD row never landed\n%s", twfbNoticeLines(logs.String()))
 	}
 	deadline = time.Now().Add(60 * time.Second)
@@ -197,6 +248,9 @@ func TestPhase2e_PG_FirstBoundaryPeerAddedColumn_BackfillsEveryShard(t *testing.
 		t.Errorf("a shard refused:\n%s", divergenceLines(logs.String()))
 	}
 	if !strings.Contains(logs.String(), "the target already holds columns this stream never carried") {
-		t.Error("VACUOUS: shard_b's first boundary was not routed as a peer-added column")
+		t.Error("VACUOUS: shard_b's first boundary did not find the peer-added column")
+	}
+	if got := tgt.columnType(t, "users", column); got != wantType {
+		t.Errorf("target users.%s is %q, want %q (the arm's own outcome)", column, got, wantType)
 	}
 }

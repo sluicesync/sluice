@@ -162,6 +162,8 @@ func interceptSchemaSnapshotsForCoordination(
 				post := normalizeSnapshotForComparison(normalizer, snap.IR)
 				cache[key] = post
 				version[key]++
+				route := true
+				var firstOwed []*ir.Column
 				if !hadPre {
 					// First snapshot for this table since this intercept
 					// was wired. GC-44: it is the baseline only if the
@@ -170,8 +172,9 @@ func interceptSchemaSnapshotsForCoordination(
 					// against a pre-state synthesized from the target, so a
 					// fleet whose sources all changed while stopped forwards
 					// it ONCE (the holder applies, peers observe or find
-					// the target already matching).
-					witnessedPre, err := checkShapeAFirstBoundary(ctx, router.firstBoundary, key, post, snap.IR)
+					// the target already matching). Columns a peer added are
+					// owed this shard's backfill on every arm (F13).
+					first, err := checkShapeAFirstBoundary(ctx, router.firstBoundary, key, post, snap.IR)
 					if err != nil {
 						slog.ErrorContext(
 							ctx, "shard consolidation intercept: first boundary refused",
@@ -184,7 +187,7 @@ func interceptSchemaSnapshotsForCoordination(
 						errStore.Store(&wrapped)
 						return
 					}
-					if witnessedPre == nil {
+					if first.baseline() {
 						slog.DebugContext(
 							ctx, "shard consolidation intercept: seeded table cache",
 							"table", key,
@@ -196,50 +199,74 @@ func interceptSchemaSnapshotsForCoordination(
 						}
 						continue
 					}
-					pre = witnessedPre
-				}
-				// Subsequent snapshot — drive RouteBoundary against
-				// (pre, post), both in comparison form. DDL text is the
-				// deterministic IR-marshalled rendering of the RAW
-				// post-IR schema (no raw source DDL is available
-				// through the SchemaSnapshot path — DP-E's "shapes are
-				// sluice's own structural categories" applies; raw
-				// keeps peer checksums byte-compatible with the
-				// pre-normalization lease rows).
-				ddlText := deriveDDLText(snap.IR)
-				// Pass the SchemaSnapshot's source-side Position as the
-				// lease row's anchor — the v0.76.0 lease GC sweep (task
-				// #21) compares it against every stream's persisted
-				// position via the engine's PositionOrderer.
-				if err := router.RouteBoundary(ctx, key, pre, post, ddlText, version[key], snap.Position); err != nil {
-					slog.ErrorContext(
-						ctx, "shard consolidation intercept: route boundary failed",
-						"table", key,
-						"error", err,
-					)
-					// Rewind the cache: the post-state didn't land,
-					// so the next boundary still classifies from the
-					// pre-state — or, for a witnessed first boundary,
-					// is witnessed again.
-					if hadPre {
-						cache[key] = pre
-						version[key]--
-					} else {
+					route = first.routed()
+					if route {
+						pre = first.pre
+					}
+					// The write-ahead record is idempotent per table, so the
+					// FULL owed set is written before any ALTER: the
+					// router's own pre-ALTER write names only the columns
+					// it adds, and would otherwise be the record that wins.
+					firstOwed = first.owed(post)
+					if err := backfill.writeAhead(ctx, key, columnNames(firstOwed)); err != nil {
 						delete(cache, key)
 						delete(version, key)
+						wrapped := fmt.Errorf("pipeline: shard consolidation: %w. %s", err, RecoveryHint(key))
+						errStore.Store(&wrapped)
+						return
 					}
-					wrapped := fmt.Errorf("pipeline: shard consolidation: %w", err)
-					errStore.Store(&wrapped)
-					return
 				}
-				if !hadPre {
-					router.firstBoundary.catalog.forget(snap.IR.Name)
+				if route {
+					// Drive RouteBoundary against (pre, post), both in
+					// comparison form. DDL text is the deterministic
+					// IR-marshalled rendering of the RAW post-IR schema (no
+					// raw source DDL is available through the
+					// SchemaSnapshot path — DP-E's "shapes are sluice's own
+					// structural categories" applies; raw keeps peer
+					// checksums byte-compatible with the pre-normalization
+					// lease rows).
+					ddlText := deriveDDLText(snap.IR)
+					// Pass the SchemaSnapshot's source-side Position as the
+					// lease row's anchor — the v0.76.0 lease GC sweep (task
+					// #21) compares it against every stream's persisted
+					// position via the engine's PositionOrderer.
+					if err := router.RouteBoundary(ctx, key, pre, post, ddlText, version[key], snap.Position); err != nil {
+						slog.ErrorContext(
+							ctx, "shard consolidation intercept: route boundary failed",
+							"table", key,
+							"error", err,
+						)
+						// Rewind the cache: the post-state didn't land,
+						// so the next boundary still classifies from the
+						// pre-state — or, for a witnessed first boundary,
+						// is witnessed again.
+						if hadPre {
+							cache[key] = pre
+							version[key]--
+						} else {
+							delete(cache, key)
+							delete(version, key)
+						}
+						wrapped := fmt.Errorf("pipeline: shard consolidation: %w", err)
+						errStore.Store(&wrapped)
+						return
+					}
+					if !hadPre {
+						router.firstBoundary.catalog.forget(snap.IR.Name)
+					}
 				}
 				// The ALTER has landed (applied here or observed from the
 				// lease holder): an ADD COLUMN owes THIS shard's
 				// pre-existing rows a backfill from THIS stream's source,
-				// on the ledger from here.
-				owed, err := planBoundaryBackfill(ctx, backfill, key, pre, post, snap, RecoveryHint)
+				// on the ledger from here. A first boundary's owed set is
+				// its own ADD plus the columns a peer added.
+				var owed *boundaryBackfill
+				var err error
+				if hadPre {
+					owed, err = planBoundaryBackfill(ctx, backfill, key, pre, post, snap, RecoveryHint)
+				} else if len(firstOwed) > 0 {
+					owed, err = planAddedColumnBackfill(ctx, backfill, key, firstOwed, snap, RecoveryHint)
+				}
 				if err != nil {
 					wrapped := fmt.Errorf("pipeline: shard consolidation: %w", err)
 					errStore.Store(&wrapped)
@@ -277,94 +304,153 @@ func interceptSchemaSnapshotsForCoordination(
 	return out
 }
 
+// shapeAFirstBoundary is what [checkShapeAFirstBoundary] decided for a
+// table's first snapshot: whether to route it, and what this shard's rows
+// are owed.
+type shapeAFirstBoundary struct {
+	// pre, when non-nil, is the pre-state synthesized from the target that
+	// the boundary is routed through the lease against (columns the target
+	// lacks, or one narrower column). nil: the snapshot is the baseline and
+	// nothing is applied.
+	pre *ir.Table
+
+	// peerAdded are columns the target already holds that this stream never
+	// carried — a PEER shard forwarded them while this one was stopped
+	// (GC-44 F13). The holder backfilled only ITS rows; this shard's
+	// pre-existing rows still hold the holder's fill, so they are owed a
+	// backfill from THIS stream's source, whatever else the verdict says.
+	peerAdded []*ir.Column
+}
+
+// routed reports whether the boundary goes through the lease.
+func (b shapeAFirstBoundary) routed() bool { return b.pre != nil }
+
+// baseline reports whether the snapshot is accepted as is: nothing routed,
+// nothing owed.
+func (b shapeAFirstBoundary) baseline() bool { return b.pre == nil && len(b.peerAdded) == 0 }
+
+// owed is every column of post this shard's pre-existing rows are owed a
+// backfill for: those the routed boundary adds (post's columns its pre
+// lacks), then those a peer added, each once, in post's order.
+func (b shapeAFirstBoundary) owed(post *ir.Table) []*ir.Column {
+	owe := make(map[string]bool, len(b.peerAdded))
+	for _, c := range b.peerAdded {
+		owe[c.Name] = true
+	}
+	if b.pre != nil {
+		inPre := columnsByNameIR(b.pre)
+		for _, c := range post.Columns {
+			if c != nil && inPre[c.Name] == nil {
+				owe[c.Name] = true
+			}
+		}
+	}
+	var out []*ir.Column
+	for _, c := range post.Columns {
+		if c != nil && owe[c.Name] {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
 // checkShapeAFirstBoundary is the Shape A face of the target-witnessed
 // first boundary (GC-44; schema_forward_witness.go). post is the
-// comparison-form snapshot table and raw the snapshot's own IR. It returns:
+// comparison-form snapshot table and raw the snapshot's own IR.
 //
-//   - nil, nil when the snapshot is the baseline: the consolidated target
-//     agrees with it, cannot speak for the table, only carries extra
-//     columns, or holds a WIDER column (each but the first WARNed);
-//   - a pre-state synthesized from the target when the difference is one
-//     the witness forwards (columns the target lacks, or one narrower
-//     column): the caller routes (pre, post) through the lease like any
-//     boundary, so the holder applies it once and its peers observe it;
-//   - the [resumeDivergenceMarker] refusal otherwise.
+// The verdict decides the route: a match, an unwitnessable table,
+// target-only columns and a WIDER target column are the baseline (each but
+// the first WARNed); columns the target lacks or one narrower column are
+// routed through the lease against a pre-state synthesized from the target,
+// so the holder applies it once and its peers observe it; anything else is
+// the [resumeDivergenceMarker] refusal.
+//
+// Independently of the route, on EVERY arm that does not refuse, the
+// columns a peer added are owed this shard's backfill ([shapeAPeerAdded]).
+// They are planned beside the route, not routed: the column is already on
+// the target, so there is nothing to apply, and routing it would make an
+// ADD of its own that [ClassifyShape] refuses alongside an ALTER. The
+// holder's DEFAULT is not compared with this shard's either — the backfill
+// fills this shard's rows from its own source, so the DEFAULT never reaches
+// them.
 //
 // The verdict is decided against a fresh catalog read whenever the memo —
 // the warm-resume read, older than any peer DDL since — disagrees, so a
 // peer's coordinated change is seen rather than refused. nil witness (a
 // unit harness) accepts.
-func checkShapeAFirstBoundary(ctx context.Context, w *firstBoundaryWitness, tableName string, post, raw *ir.Table) (*ir.Table, error) {
+func checkShapeAFirstBoundary(ctx context.Context, w *firstBoundaryWitness, tableName string, post, raw *ir.Table) (shapeAFirstBoundary, error) {
+	var b shapeAFirstBoundary
 	if w == nil {
-		return nil, nil
+		return b, nil
 	}
 	v, err := w.verdict(ctx, raw)
 	if err != nil {
-		return nil, fmt.Errorf("read the consolidated target's catalog to check the first schema boundary for %q "+
+		return b, fmt.Errorf("read the consolidated target's catalog to check the first schema boundary for %q "+
 			"(the boundary is not accepted unchecked): %w", tableName, err)
 	}
 	switch v.kind {
 	case witnessMatch:
-		// The target may match only because a PEER shard's first boundary
-		// already forwarded an ADD COLUMN this shard's source made too. The
-		// lease applied it once, but each shard's pre-existing rows are
-		// owed a backfill from their OWN source (GC-36; GC-44 F13), and the
-		// peer planned only its own. So a column this stream never carried
-		// is routed like a live ADD — observed through the lease (which
-		// also checks the carried DEFAULT against the holder's) and
-		// backfilled for this shard.
-		if added := shapeAPeerAddedColumns(w, post); len(added) > 0 {
-			slog.InfoContext(ctx,
-				"shard consolidation: the target already holds columns this stream never carried (a peer shard "+
-					"forwarded them); routing them through the lease so this shard's rows are backfilled (GC-44)",
-				"table", tableName, "added_columns", added)
-			return witnessSynthesizedPre(post, witnessVerdict{kind: witnessForwardAdd, added: added}), nil
-		}
-		return nil, nil
 	case witnessUnwitnessed:
 		slog.WarnContext(ctx,
 			"shard consolidation: the target cannot witness this table's first schema boundary; accepting it as the "+
 				"baseline — a change made to this shard's source while the stream was stopped is NOT checked",
 			"table", tableName, "reason", v.reason)
-		return nil, nil
+		return b, nil
 	case witnessTargetOnly:
 		slog.WarnContext(ctx,
 			"shard consolidation: the consolidated target holds columns this shard's source no longer has; the "+
 				"target keeps them",
 			"table", tableName, "target_only_columns", v.targetOnly)
-		return nil, nil
 	case witnessTargetWider:
 		logTargetWider(ctx, tableName, v)
-		return nil, nil
 	case witnessForwardAdd, witnessForwardAlter:
 		slog.InfoContext(ctx,
 			"shard consolidation: the first schema boundary after a (re)start differs from the consolidated target; "+
 				"forwarding the difference (target-witnessed, GC-44) through the lease",
 			"table", tableName, "difference", v.render())
-		return witnessSynthesizedPre(post, v), nil
+		b.pre = witnessSynthesizedPre(post, v)
+	default:
+		return b, resumeDivergenceRefusal(tableName, v, RecoveryHint(tableName))
 	}
-	return nil, resumeDivergenceRefusal(tableName, v, RecoveryHint(tableName))
+	target, held, err := w.catalog.lookup(ctx, raw.Name)
+	if err != nil {
+		return b, fmt.Errorf("read the consolidated target's catalog for %q's peer-added columns: %w", tableName, err)
+	}
+	if held {
+		b.peerAdded = shapeAPeerAdded(w.historyFor(raw.Name), post, target)
+	}
+	if len(b.peerAdded) > 0 {
+		slog.InfoContext(ctx,
+			"shard consolidation: the target already holds columns this stream never carried (a peer shard "+
+				"forwarded them); backfilling this shard's rows from its own source (GC-44)",
+			"table", tableName, "added_columns", columnNames(b.peerAdded))
+	}
+	return b, nil
 }
 
-// shapeAPeerAddedColumns returns post's columns, in post's order, that this
-// stream's own retained schema version of the table lacks — columns the
-// target holds (the verdict matched) but this stream never carried, so a
-// peer added them. nil when the stream retained no version of the table:
-// with nothing to compare, the match is taken as before (stated residual,
-// GC-44 F13).
-func shapeAPeerAddedColumns(w *firstBoundaryWitness, post *ir.Table) []string {
-	prior := w.historyFor(post.Name)
+// shapeAPeerAdded returns post's columns, in post's order, that the target
+// holds and prior — this stream's own retained schema version of the table
+// — lacks: a peer added them. The verdict's own columns to add are absent
+// from the target, so they never appear here; an ALTERed column a peer also
+// added does, and is backfilled after its ALTER.
+//
+// nil when the stream retained no version of the table. With nothing to
+// compare there is no telling a peer's column from one this stream always
+// had; the residual is stated in ADR-0091 §5c (GC-44 F13).
+func shapeAPeerAdded(prior, post, target *ir.Table) []*ir.Column {
 	if prior == nil {
 		return nil
 	}
-	carried := columnsByNameIR(prior)
-	var added []string
+	carried, held := columnsByNameIR(prior), columnsByNameIR(target)
+	var added []*ir.Column
 	for _, c := range post.Columns {
 		if c == nil {
 			continue
 		}
-		if _, ok := carried[c.Name]; !ok {
-			added = append(added, c.Name)
+		_, wasCarried := carried[c.Name]
+		_, onTarget := held[c.Name]
+		if !wasCarried && onTarget {
+			added = append(added, c)
 		}
 	}
 	return added

@@ -261,15 +261,35 @@ func planBoundaryBackfill(
 	if shape.Kind != ShapeKindAddColumn {
 		return nil, nil
 	}
-	b := &boundaryBackfill{bf: bf, tableName: tableName, snap: snap, added: shape.AddedColumns}
+	return planAddedColumnBackfill(ctx, bf, tableName, shape.AddedColumns, snap, hint)
+}
+
+// planAddedColumnBackfill is the backfill of added — columns the target
+// already holds — for this stream's pre-existing rows: the tail of
+// [planBoundaryBackfill], and the plan for a Shape A first boundary whose
+// owed columns are not one classified ADD (GC-44 F13).
+//
+// The write-ahead record is idempotent PER TABLE until the plan opens it,
+// so a caller owing more columns than a pre-ALTER write named must write
+// the full set ahead first ([interceptSchemaSnapshotsForCoordination]
+// does).
+func planAddedColumnBackfill(
+	ctx context.Context,
+	bf *schemaForwardBackfill,
+	tableName string,
+	added []*ir.Column,
+	snap ir.SchemaSnapshot,
+	hint func(tableName string) string,
+) (*boundaryBackfill, error) {
+	b := &boundaryBackfill{bf: bf, tableName: tableName, snap: snap, added: added}
 	if bf != nil {
 		// Written before the ALTER on the paths that apply it; this is the
 		// write for a Shape A stream that only observed a peer's ALTER, and
 		// a no-op when the pre-ALTER write already covers the table.
-		if err := bf.writeAhead(ctx, tableName, columnNames(shape.AddedColumns)); err != nil {
+		if err := bf.writeAhead(ctx, tableName, columnNames(added)); err != nil {
 			return nil, fmt.Errorf("%w. %s", err, hint(tableName))
 		}
-		b.owed = bf.ledger.open(tableName, columnNames(shape.AddedColumns))
+		b.owed = bf.ledger.open(tableName, columnNames(added))
 	}
 	return b, nil
 }

@@ -78,8 +78,9 @@ var ErrChangeLogWatermarkStalled = errors.New("CHANGE-LOG-WATERMARK-STALLED")
 // pipeline/schema_forward_witness.go): a table's first schema boundary after
 // the stream (re)started disagrees with the target table in a way sluice
 // cannot forward without knowing what the source changed — a possible
-// rename, more than one changed column, a type change across families. The
-// check is a pure function of the source's current shape and the target's
+// rename, more than one changed column, a type change across families that
+// the target's type does not already hold. The check is a pure function of
+// the source's current shape and the target's
 // catalog, so a restart reads both back unchanged and refuses again until the
 // operator reconciles the target (the drained model).
 var ErrResumeSchemaDivergence = errors.New("RESUME-SCHEMA-DIVERGENCE")

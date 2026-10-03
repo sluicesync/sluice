@@ -487,7 +487,7 @@ compared by presence only (below).
 | target-only columns only (a DROP made while stopped) | WARN, accept | WARN, accept |
 | snapshot-only columns only | forward ADD COLUMN + backfill | route through the lease (ADD COLUMN + this shard's backfill) |
 | exactly one shared column differs within an allowlisted family and the TARGET is narrower (temporal precision with the zone kind held, decimal on both axes, char/varchar length, float width, int width with the sign held) | forward ALTER COLUMN TYPE (zone door uses the target's type as the before) | route through the lease |
-| the same, but the TARGET is wider | WARN, keep the target's type | WARN, keep |
+| the same, but the TARGET is wider — or, across families, the target's type holds every value of the source's (`TEXT` ⊇ `VARCHAR`/`CHAR`, `VARCHAR(m ≥ n)` ⊇ `CHAR(n)`, a wide enough `NUMERIC` ⊇ an integer, a wider signed ⊇ an unsigned integer, `ENUM`/`SET` label supersets; never `jsonb` ⊇ `json`) | WARN, keep the target's type | WARN, keep |
 | anything else (possible rename, >1 change, across families, a decimal wider on one axis and narrower on the other) | refuse `RESUME-SCHEMA-DIVERGENCE` | refuse |
 
 **Direction is load-bearing (review, before the first tag).** The first
@@ -512,6 +512,21 @@ still forwards one seen live). Pinned by
 `TestTWFB_PostgresCrashMidTransaction_KeepsTheWiderTarget` and
 `TestTWFB_OperatorWidenedTarget_*`.
 
+**Across families (second review).** The direction rule first knew only
+same-family widths, so a target WIDER in another family was
+`notComparable` and refused. That made the replay of a forwarded
+`varchar(n)` → `text` (a crash in the middle of the transaction, or an
+ADR-0038 retry) a `RESUME-SCHEMA-DIVERGENCE` on every start — a permanent
+wedge on a stream that converged before GC-44. `witnessWidthOrder` now
+adds one-sided "the target's type holds every value of the source's"
+relations (`targetHoldsEverySnapshotValue`, each with its value-fidelity
+argument in the code): they can only answer *target wider* — kept with a
+WARN — and never forward, so a source change across families made while
+stopped still refuses. `json` → `jsonb` is deliberately absent: jsonb
+rewrites the document. Pinned by the truth table and
+`TestTWFB_PostgresCrashMidTransaction_VarcharToTextConverges`; the
+refuse-mode check (`judgeUnforwardedColumns`) shares the relation.
+
 **`--type-override` (review).** Rendering the override into the expected
 shape phantomed even for an unchanged override — a `json` override reads
 back as binary JSON on a MySQL target, `mediumtext` as `text` on Postgres,
@@ -534,6 +549,44 @@ warm-resume read. A forwardable verdict is now routed through
 boundary: the holder applies once, peers observe it or find the target
 already matching. Pinned by
 `TestPhase2e_PG_FirstBoundaryWidenWhileStopped_RoutesThroughTheLeaseOnce`.
+
+**Peer-added columns (GC-44 F13, both reviews).** When every shard's
+source added a column while the fleet was stopped, the first shard's
+first boundary forwards it and backfills ITS rows; every later shard
+finds the column already on the target, and its own pre-existing rows
+still hold the holder's fill (the holder's carried DEFAULT, or NULL)
+where its source may hold something else (measured: a DEFAULT changed
+after the ADD — 7 on the target, 5 on the source, at exit 0). So on EVERY
+arm that does not refuse — match, target-wider, target-only, forward-add,
+forward-alter — the columns the target holds that this stream's own
+retained ADR-0049 version of the table lacks are owed this shard's
+backfill. They are planned beside the arm's own route, not routed: the
+column is already there, routing it would make an ADD that
+`ClassifyShape` refuses alongside an ALTER, and the holder's DEFAULT
+never reaches this shard's backfilled rows, so it needs no checksum. The
+full owed set is written ahead before any ALTER, because the write-ahead
+record is idempotent per table and the router's own pre-ALTER write names
+only the columns it adds. Pinned per arm by
+`TestPhase2e_PG_FirstBoundaryPeerAddedColumn_BackfillsEveryShard`,
+`TestCheckShapeAFirstBoundary_PeerAddedOnEveryArm` and
+`TestShapeAFirstBoundary_WriteAheadNamesThePeerAddedColumns`.
+
+*Residual, stated.* A stream with no retained version of the table cannot
+tell a peer's column from one it always had, and takes the arm's verdict
+alone: that is a table it never streamed a change for between its cold
+start (whose seed writes no history) and the stop, or one whose latest
+version lies past the warm-resume read's 10,000-row bound (newest first;
+GC-44 F12's growth makes a long-lived stream reach it sooner). Its rows
+keep the holder's fill for a peer-added column when that differs from its
+source's. Closing it by backfilling EVERY target-held column of such a
+table — an idempotent re-fill from current source values, which does
+converge — was evaluated and not done: it re-reads each such table in
+full from every shard once per restart that finds it unversioned, and
+the lease table cannot narrow it (its GC compares a holder-source anchor
+with each stream's own-source position, so an APPLIED row's presence
+proves nothing about this shard). Writing the cold-start seed as a
+history version, anchored at the handoff, would close it at the root;
+that changes what ADR-0049 history holds and is filed with F12.
 
 The check is stateless — nothing is persisted, a restart re-derives the
 same verdict — and a refusal lands before the snapshot goes downstream,
@@ -588,13 +641,8 @@ extended-suites vstream-pipeline leg).
 only. A Postgres source cannot stream `geography` at all (refused at the
 reader). A table the target does not hold is accepted with a WARN. The
 binlog first-touch boundary's history row is anchored at the stream start
-with the live-catalog shape (GC-44 F12). A Shape A peer whose first
-boundary finds an ADD COLUMN a sibling already forwarded routes the
-columns its own retained history version lacks through the lease, so its
-rows are backfilled from its own source (F13,
-`TestPhase2e_PG_FirstBoundaryPeerAddedColumn_BackfillsEveryShard`); a peer
-with no retained version of the table — one it never streamed a change
-for since its cold start — still takes the match as its baseline.
+with the live-catalog shape (GC-44 F12). The no-retained-version Shape A
+residual is stated under **Peer-added columns** above.
 
 **Engine limitation that follows:** because pgoutput carries no
 secondary-index / generated-column / CHECK metadata, those shapes

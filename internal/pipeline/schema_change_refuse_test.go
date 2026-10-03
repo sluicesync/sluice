@@ -58,10 +58,17 @@ func TestJudgeUnforwardedColumns_EveryFamilyBothDirections(t *testing.T) {
 		{"float: single does not hold double", ir.Float{Precision: ir.FloatSingle}, ir.Float{Precision: ir.FloatDouble}, false},
 		{"integer: target wider", ir.Integer{Width: 64}, ir.Integer{Width: 32}, true},
 		{"integer: source wider", ir.Integer{Width: 32}, ir.Integer{Width: 64}, false},
-		{"integer: a sign change", ir.Integer{Width: 64}, ir.Integer{Width: 32, Unsigned: true}, false},
+		// Across families: witnessWidthOrder's one-sided "target holds every
+		// value" relations (GC-44 second review) pass; the rest refuse.
+		{"integer: unsigned under a wider signed target", ir.Integer{Width: 64}, ir.Integer{Width: 32, Unsigned: true}, true},
+		{"integer: a sign change at the same width", ir.Integer{Width: 32}, ir.Integer{Width: 32, Unsigned: true}, false},
 		{"text into varchar: across families", ir.Varchar{Length: 65535}, ir.Text{Size: ir.TextLong}, false},
-		{"char into varchar: across families", ir.Varchar{Length: 20}, ir.Char{Length: 10}, false},
-		{"integer into decimal: across families", ir.Decimal{Precision: 30, Scale: 0}, ir.Integer{Width: 32}, false},
+		{"varchar into text", ir.Text{Size: ir.TextLong}, ir.Varchar{Length: 64}, true},
+		{"char into varchar(m ≥ n)", ir.Varchar{Length: 20}, ir.Char{Length: 10}, true},
+		{"char into varchar(m < n)", ir.Varchar{Length: 5}, ir.Char{Length: 10}, false},
+		{"integer into a decimal that holds it", ir.Decimal{Precision: 30, Scale: 0}, ir.Integer{Width: 32}, true},
+		{"integer into a decimal too narrow for it", ir.Decimal{Precision: 9, Scale: 0}, ir.Integer{Width: 32}, false},
+		{"json into jsonb (jsonb normalizes)", ir.JSON{Binary: true}, ir.JSON{}, false},
 	} {
 		j := judgeUnforwardedColumns(witnessTable(wcol("c", tc.source)), witnessTable(wcol("c", tc.target)), witnessOptions{})
 		if passes := len(j.refused) == 0; passes != tc.passes {

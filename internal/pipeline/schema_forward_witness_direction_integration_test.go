@@ -27,6 +27,7 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"testing"
@@ -45,30 +46,77 @@ import (
 // reproduce here; the mutant is caught by this cell's WIDER-warning
 // assertion and, on values, by TestTWFB_OperatorWidenedTarget_*.
 func TestTWFB_PostgresCrashMidTransaction_KeepsTheWiderTarget(t *testing.T) {
+	runTWFBCrashMidTransaction(t, twfbCrashCell{
+		table:  "t_crash",
+		from:   "numeric(10,2)",
+		to:     "numeric(12,4)",
+		seed:   "1.25",
+		update: "2.50",
+		insert: "1.2345",
+		// format_type of the widened column, the row-1 read-back, and the
+		// predicate every inserted row must satisfy.
+		wantType: "numeric(12,4)", wantRow1: "2.5000", exact: "v = 1.2345",
+	})
+}
+
+// TestTWFB_PostgresCrashMidTransaction_VarcharToTextConverges is the same
+// replay across families (the second review): a forwarded
+// varchar(16) → text, then a crash in the middle of the transaction. The
+// replay's PRE-ALTER relation (varchar(16)) meets a target already holding
+// text. Before the cross-family relations in witnessWidthOrder that was a
+// RESUME-SCHEMA-DIVERGENCE on every start — a permanent wedge on a stream
+// that had converged before GC-44; now the target is wider (text holds
+// every varchar(16) value), WARNed and kept, and the replay converges.
+func TestTWFB_PostgresCrashMidTransaction_VarcharToTextConverges(t *testing.T) {
+	runTWFBCrashMidTransaction(t, twfbCrashCell{
+		table:    "t_crash_vt",
+		from:     "varchar(16)",
+		to:       "text",
+		seed:     "'short'",
+		update:   "'updated'",
+		insert:   "repeat('x', 40)",
+		wantType: "text", wantRow1: "updated", exact: "v = repeat('x', 40)",
+	})
+}
+
+// twfbCrashCell is one column type change made inside a large source
+// transaction: UPDATE row 1, ALTER from → to, INSERT many rows needing to.
+type twfbCrashCell struct {
+	table, from, to           string
+	seed, update, insert      string // SQL value expressions
+	wantType, wantRow1, exact string
+}
+
+// runTWFBCrashMidTransaction drives c: the transaction, the target's
+// backends killed once it is part-applied, the in-process retry, and the
+// verdict read off the target.
+func runTWFBCrashMidTransaction(t *testing.T, c twfbCrashCell) {
+	t.Helper()
 	srcDSN, tgtDSN, cleanup := startPostgresLogical(t)
 	defer cleanup()
 	cell := twfbCell{src: twfbDB{"postgres", srcDSN}, tgt: twfbDB{"postgres", tgtDSN}, streamID: "twfb-crash-pg"}
 	const rows = 50000
-	cell.src.exec(t, `CREATE TABLE t_crash (id bigint PRIMARY KEY, v numeric(10,2) NOT NULL);
-		INSERT INTO t_crash VALUES (1, 1.25);`)
-	cell.coldStartAndStop(t, "t_crash", 1)
+	cell.src.exec(t, fmt.Sprintf(`CREATE TABLE %s (id bigint PRIMARY KEY, v %s NOT NULL);
+		INSERT INTO %s VALUES (1, %s);`, c.table, c.from, c.table, c.seed))
+	cell.coldStartAndStop(t, c.table, 1)
 
 	logs := twfbCaptureLogs(t)
 	s := cell.streamer()
 	s.ApplyConcurrency = 1
 	run := startTWFBRun(s)
 	cell.waitStreaming(t, run)
-	cell.src.exec(t, `BEGIN;
-		UPDATE t_crash SET v = 2.50 WHERE id = 1;
-		ALTER TABLE t_crash ALTER COLUMN v TYPE numeric(12,4);
-		INSERT INTO t_crash SELECT g, 1.2345 FROM generate_series(10, `+strconv.Itoa(rows+9)+`) g;
-		COMMIT;`)
+	cell.src.exec(t, fmt.Sprintf(`BEGIN;
+		UPDATE %[1]s SET v = %[2]s WHERE id = 1;
+		ALTER TABLE %[1]s ALTER COLUMN v TYPE %[3]s;
+		INSERT INTO %[1]s SELECT g, %[4]s FROM generate_series(10, %[5]d) g;
+		COMMIT;`, c.table, c.update, c.to, c.insert, rows+9))
 
 	// Kill the target's backends once some, not all, of the transaction's
 	// rows are committed there: the forwarded ALTER has landed and batches
 	// written under it are durable.
+	count := "SELECT count(*) FROM " + c.table
 	partial := func() bool {
-		n, err := strconv.Atoi(cell.tgt.scalar(t, "SELECT count(*) FROM t_crash WHERE id >= 10"))
+		n, err := strconv.Atoi(cell.tgt.scalar(t, count+" WHERE id >= 10"))
 		return err == nil && n > 0 && n < rows
 	}
 	deadline := time.Now().Add(120 * time.Second)
@@ -77,14 +125,14 @@ func TestTWFB_PostgresCrashMidTransaction_KeepsTheWiderTarget(t *testing.T) {
 	}
 	if !partial() {
 		t.Fatalf("VACUOUS: never observed the transaction part-applied (count %s, stream %v)",
-			cell.tgt.scalar(t, "SELECT count(*) FROM t_crash WHERE id >= 10"), run.err)
+			cell.tgt.scalar(t, count+" WHERE id >= 10"), run.err)
 	}
 	cell.tgt.exec(t, `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
 		WHERE datname = current_database() AND pid <> pg_backend_pid()`)
 
 	deadline = time.Now().Add(600 * time.Second)
 	for time.Now().Before(deadline) && !run.exited() {
-		if cell.tgt.scalar(t, "SELECT count(*) FROM t_crash") == strconv.Itoa(rows+1) {
+		if cell.tgt.scalar(t, count) == strconv.Itoa(rows+1) {
 			break
 		}
 		time.Sleep(250 * time.Millisecond)
@@ -96,22 +144,22 @@ func TestTWFB_PostgresCrashMidTransaction_KeepsTheWiderTarget(t *testing.T) {
 	if !strings.Contains(logs.String(), "applier: transient error; retrying") {
 		t.Fatal("VACUOUS: no retry was logged — the kill did not land mid-apply")
 	}
-	if len(logLinesFor(logs, twfbLogTargetWider, "t_crash")) == 0 {
+	if len(logLinesFor(logs, twfbLogTargetWider, c.table)) == 0 {
 		t.Errorf("VACUOUS: the retry's first boundary was not the pre-ALTER relation against the widened target "+
 			"(no WIDER warning)\n%s", divergenceLines(logs.String()))
 	}
-	if got := cell.tgt.columnType(t, "t_crash", "v"); got != "numeric(12,4)" {
-		t.Errorf("target t_crash.v is %q, want numeric(12,4)", got)
+	if got := cell.tgt.columnType(t, c.table, "v"); got != c.wantType {
+		t.Errorf("target %s.v is %q, want %s", c.table, got, c.wantType)
 	}
-	if got := cell.tgt.scalar(t, "SELECT count(*) FROM t_crash"); got != strconv.Itoa(rows+1) {
+	if got := cell.tgt.scalar(t, count); got != strconv.Itoa(rows+1) {
 		t.Errorf("target holds %s rows, want %d\n%s", got, rows+1, twfbNoticeLines(logs.String()))
 	}
-	if got := cell.tgt.scalar(t, "SELECT count(*) FROM t_crash WHERE id >= 10 AND v <> 1.2345"); got != "0" {
-		t.Errorf("SILENT LOSS: %s of the transaction's rows differ from the source's 1.2345 (e.g. %s)", got,
-			cell.tgt.scalar(t, "SELECT v::text FROM t_crash WHERE id >= 10 AND v <> 1.2345 LIMIT 1"))
+	if got := cell.tgt.scalar(t, count+" WHERE id >= 10 AND NOT ("+c.exact+")"); got != "0" {
+		t.Errorf("SILENT LOSS: %s of the transaction's rows differ from what the source wrote (e.g. %s)", got,
+			cell.tgt.scalar(t, "SELECT v::text FROM "+c.table+" WHERE id >= 10 AND NOT ("+c.exact+") LIMIT 1"))
 	}
-	if got := cell.tgt.scalar(t, "SELECT v::text FROM t_crash WHERE id = 1"); got != "2.5000" {
-		t.Errorf("target row 1 = %q, want 2.5000", got)
+	if got := cell.tgt.scalar(t, "SELECT v::text FROM "+c.table+" WHERE id = 1"); got != c.wantRow1 {
+		t.Errorf("target row 1 = %q, want %s", got, c.wantRow1)
 	}
 }
 

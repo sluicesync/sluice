@@ -51,7 +51,8 @@ package pipeline
 //     the column, as the drained model would).
 //   - a column an operator --type-override names is not compared.
 //   - anything else — added and dropped together (a possible rename), more
-//     than one type change, a change across families — refuses BEFORE the
+//     than one type change, a change across families the target does not
+//     already hold ([targetHoldsEverySnapshotValue]) — refuses BEFORE the
 //     snapshot goes downstream, with the grep-stable marker
 //     [resumeDivergenceMarker] naming each column and both types.
 //
@@ -479,7 +480,8 @@ func classifyWitness(expected, target *ir.Table, opts witnessOptions) witnessVer
 type widthOrder int
 
 const (
-	// notComparable — across families, a sign change, or a zone-kind
+	// notComparable — across families with no "holds every value" relation
+	// ([targetHoldsEverySnapshotValue]), a sign change, or a zone-kind
 	// change: refuse.
 	notComparable widthOrder = iota
 	// targetNarrower — the source widened the column: forward the ALTER.
@@ -516,7 +518,142 @@ const (
 // with 22001/22003 instead). A genuine source NARROWING is
 // therefore not forwarded at a first boundary (WARNed instead); the CDC→CDC
 // path, which sees both sides, still forwards one seen live.
+//
+// ACROSS families the order is one-sided: [targetHoldsEverySnapshotValue]
+// can only answer targetWider. A source change across families made while
+// the stream was stopped is still not forwarded (refused, as before), but a
+// target that already holds the wider family — the replay of a forwarded
+// varchar → text, say — is kept instead of refusing every start.
 func witnessWidthOrder(target, snapshot ir.Type) widthOrder {
+	if o := sameFamilyWidthOrder(target, snapshot); o != notComparable {
+		return o
+	}
+	if targetHoldsEverySnapshotValue(target, snapshot) {
+		return targetWider
+	}
+	return notComparable
+}
+
+// targetHoldsEverySnapshotValue is the cross-family "target is wider"
+// relation: every value a column of the snapshot's type can carry through
+// the change stream is stored by the target's type unchanged, so keeping
+// the target loses nothing. Each arm states its value-fidelity argument;
+// anything not listed is not wider.
+//
+//   - varchar(n) / char(n) ⊂ text whose byte capacity covers n characters
+//     at 4 bytes each (utf8mb4's worst case; a Postgres text is unbounded).
+//     Storage keeps trailing spaces in both, so nothing is trimmed.
+//   - char(n) ⊂ varchar(m ≥ n). A char value is at most n characters as the
+//     stream delivers it — padded to n on Postgres (pgoutput sends the
+//     bpchar text), stripped on MySQL — and varchar(m) stores either
+//     unchanged. What differs is COMPARISON (bpchar ignores trailing spaces,
+//     varchar does not), not the stored value.
+//   - an integer ⊂ a decimal whose integer digits (precision − scale) hold
+//     the type's widest value (int8: 3, int16: 5, int24: 7 signed / 8
+//     unsigned, int32: 10, int64: 19 signed / 20 unsigned), or an
+//     unconstrained decimal. A decimal stores an integer exactly.
+//   - an unsigned integer ⊂ a signed integer strictly wider (uint32 ⊂ int64
+//     holds 0 … 2³²−1).
+//   - enum / set labels ⊂ a strict superset of them. The stream carries the
+//     LABEL, not the ordinal, so the target's own label order is irrelevant.
+//
+// json ⊂ jsonb is deliberately NOT here: jsonb normalizes (duplicate keys
+// collapse to the last, whitespace and key order are rewritten), so it does
+// not hold every json value unchanged. Neither is int32 ⊂ double (exact,
+// but the float family's own rendering is not this relation's to vouch
+// for) — both stay notComparable and refuse.
+func targetHoldsEverySnapshotValue(target, snapshot ir.Type) bool {
+	switch s := snapshot.(type) {
+	case ir.Varchar:
+		if t, ok := target.(ir.Text); ok {
+			return textCovers(t.Size, s.Length)
+		}
+	case ir.Char:
+		switch t := target.(type) {
+		case ir.Varchar:
+			return t.Length >= s.Length
+		case ir.Text:
+			return textCovers(t.Size, s.Length)
+		}
+	case ir.Integer:
+		switch t := target.(type) {
+		case ir.Decimal:
+			return t.Unconstrained || t.Precision-t.Scale >= integerDigits(s)
+		case ir.Integer:
+			return s.Unsigned && !t.Unsigned && t.Width > s.Width
+		}
+	case ir.Enum:
+		if t, ok := target.(ir.Enum); ok {
+			return strictLabelSuperset(t.Values, s.Values)
+		}
+	case ir.Set:
+		if t, ok := target.(ir.Set); ok {
+			return strictLabelSuperset(t.Values, s.Values)
+		}
+	}
+	return false
+}
+
+// textCovers reports whether a TEXT of size holds n characters at 4 bytes
+// each.
+func textCovers(size ir.TextSize, n int) bool {
+	var capacity int64
+	switch size {
+	case ir.TextTiny:
+		capacity = 255
+	case ir.TextRegular:
+		capacity = 65_535
+	case ir.TextMedium:
+		capacity = 16_777_215
+	case ir.TextLong:
+		capacity = 4_294_967_295
+	}
+	return n > 0 && int64(n)*4 <= capacity
+}
+
+// integerDigits is the number of decimal digits the integer type's widest
+// value needs.
+func integerDigits(i ir.Integer) int {
+	switch i.Width {
+	case 8:
+		return 3
+	case 16:
+		return 5
+	case 24:
+		if i.Unsigned {
+			return 8
+		}
+		return 7
+	case 32:
+		return 10
+	}
+	if i.Unsigned {
+		return 20
+	}
+	return 19
+}
+
+// strictLabelSuperset reports whether target carries every label of
+// snapshot and at least one more. Both sides must know their labels (the
+// lens equates an enum whose labels one side does not know).
+func strictLabelSuperset(target, snapshot []string) bool {
+	if len(snapshot) == 0 || len(target) <= len(snapshot) {
+		return false
+	}
+	have := make(map[string]bool, len(target))
+	for _, v := range target {
+		have[v] = true
+	}
+	for _, v := range snapshot {
+		if !have[v] {
+			return false
+		}
+	}
+	return true
+}
+
+// sameFamilyWidthOrder is [witnessWidthOrder] within one family.
+func sameFamilyWidthOrder(target, snapshot ir.Type) widthOrder {
 	switch s := snapshot.(type) {
 	case ir.DateTime:
 		t, ok := target.(ir.DateTime)
