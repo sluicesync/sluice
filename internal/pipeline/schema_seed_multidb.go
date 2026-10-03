@@ -144,6 +144,9 @@ func (s *Streamer) loadMultiDatabaseWarmResumeSchemaSeed(
 			slog.Int("rows", unattributed),
 		)
 	}
+	// The same versions serve the unforwarded-stream check's prior shape
+	// per namespace (GC-44 F5 review).
+	s.namespaceHistory = historyByNamespace
 
 	var out []*ir.Table
 	for _, namespace := range selected {

@@ -1477,17 +1477,10 @@ func (s *Streamer) coldStartBeginCDC(ctx context.Context, stream *ir.SnapshotStr
 	// Bug 246: hand the reader the effective table scope so reader-side
 	// policy checks (the MySQL XA refusal) honour the sync's filter.
 	s.wireCDCScopePredicate(stream.Changes)
-	// ADR-0091 F7a (cold-start mirror of warmResume): relax the reader's
-	// mid-stream schema-change gate when single-stream forwarding is active
-	// so the unambiguous shapes reach the forward intercept rather than
-	// being refused / swallowed at the source-read level. Same type-assert/
-	// silent-ignore shape as the poll-interval setter above. PG implements
-	// it for DROP COLUMN / ALTER COLUMN TYPE (GAP #1); MySQL implements it
-	// for ALTER COLUMN NULLABILITY (GAP #2 — the nullability-only change
-	// that does not move the decode signature).
-	if setter, ok := stream.Changes.(schemaForwardModeSetter); ok {
-		setter.SetSchemaForward(s.singleStreamSchemaForwardActive())
-	}
+	// ADR-0091 F7a's reader-gate relaxation ([schemaForwardModeSetter]) is
+	// set inside wireSchemaDeltaArming below, which every reader-open site
+	// reaches ([Streamer.readerSchemaGateRelaxed]).
+	//
 	// SL-2 (audit 2026-08-31): arm the reader's session-GUC cast refusal
 	// whenever ANY path re-applies an observed delta to the target — the
 	// intercept above OR Shape A's boundary router. Wider than the setter

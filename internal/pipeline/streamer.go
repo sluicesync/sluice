@@ -1607,6 +1607,14 @@ type Streamer struct {
 	// single-database stream, or a target that cannot derive one.
 	namespaceTargetDeriver ir.DatabaseDSNDeriver
 
+	// namespaceHistory is the multi-database warm resume's retained ADR-0049
+	// versions keyed by source namespace — the per-namespace counterpart of
+	// [Streamer.firstBoundaryHistory], read by the same seed load. The
+	// unforwarded-stream check uses it as a table's last accepted shape where
+	// the target cannot say ([Streamer.unforwardedBoundaryWitnesses]).
+	// Consumed and cleared when the intercept chain is wired.
+	namespaceHistory map[string][]*ir.Table
+
 	// readerSchemaSeed loads the prior shape per in-scope table handed to
 	// a CDC reader that implements [schemaSeedSetter] (SLM-1). On cold
 	// start it is the RAW source IR captured in [coldStartPrepareSchema]

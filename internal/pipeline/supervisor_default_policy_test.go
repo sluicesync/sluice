@@ -235,7 +235,7 @@ func TestSupervisor_RefusalsARestartRepeatsAreNotRestarted(t *testing.T) {
 			witnessVerdict{kind: witnessRefuse, diffs: []witnessColumnDiff{{"a", "(absent)", "Int32"}}}, "recovery: drained model"),
 		// Built by the real judgement the unforwarded-stream check settles.
 		"SCHEMA-CHANGE-REFUSED": unforwardedJudgement{refused: []witnessColumnDiff{{"ts", "DateTime(6)", "DateTime(0)"}}}.
-			settle(context.Background(), "public.t", "--schema-changes=refuse"),
+			settle(context.Background(), "public.t", unforwardedBoundaryDeps{why: "--schema-changes=refuse"}),
 		// Coded (SLUICE-E-CDC-KEY-MATCHED-MULTIPLE-ROWS): built by the real
 		// shared constructor every applier calls, so the alias between the
 		// appliershared and ir sentinels is part of what is pinned.

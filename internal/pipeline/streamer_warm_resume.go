@@ -59,17 +59,10 @@ func (s *Streamer) warmResume(ctx context.Context, persisted ir.Position) (chang
 	}
 	// Bug 246: reader-side scope predicate, warm-resume mirror.
 	s.wireCDCScopePredicate(cdc)
-	// ADR-0091 F7a: when single-stream forwarding is active, tell the
-	// reader to relax its mid-stream schema-change gate so the unambiguous
-	// shapes reach the forward intercept as SchemaSnapshots instead of
-	// being refused / swallowed at the source-read level. PG (GAP #1: DROP
-	// COLUMN / ALTER COLUMN TYPE) and MySQL (GAP #2: ALTER COLUMN
-	// NULLABILITY — the nullability-only change that does not move the
-	// decode signature) both implement the setter; readers that don't
-	// (vstream) silently ignore.
-	if setter, ok := cdc.(schemaForwardModeSetter); ok {
-		setter.SetSchemaForward(s.singleStreamSchemaForwardActive())
-	}
+	// ADR-0091 F7a's reader-gate relaxation ([schemaForwardModeSetter]) is
+	// set inside wireSchemaDeltaArming below, which every reader-open site
+	// reaches ([Streamer.readerSchemaGateRelaxed]).
+	//
 	// SL-2 (audit 2026-08-31), warm-resume mirror: arm the reader's
 	// session-GUC cast refusal whenever ANY path re-applies an observed
 	// delta to the target (the intercept OR Shape A's boundary router).

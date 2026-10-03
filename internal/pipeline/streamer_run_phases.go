@@ -1193,9 +1193,10 @@ func (s *Streamer) phaseWireInterceptChain(applyCtx context.Context, changes <-c
 	// (schema_change_refuse.go).
 	if s.boundaryRouter == nil && !forwarding {
 		filtered = interceptSchemaChangeRefuse(applyCtx, filtered, unforwardedBoundaryDeps{
-			witnessFor: s.unforwardedBoundaryWitnesses(streamID, witness),
-			normalizer: snapshotNormalizer,
-			why:        s.unforwardedStreamReason(),
+			witnessFor:    s.unforwardedBoundaryWitnesses(witness),
+			normalizer:    snapshotNormalizer,
+			why:           s.unforwardedStreamReason(),
+			forwardRemedy: s.unforwardedForwardRemedy(),
 		}, &s.schemaSnapshotErr)
 	}
 	// Clear the cold-start seed after handing it to BOTH intercepts so

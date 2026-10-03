@@ -684,6 +684,9 @@ func (s *Streamer) wireSchemaDeltaArming(r ir.CDCReader) {
 	if armer, ok := r.(firstTouchBoundaryArmer); ok && s.firstTouchBoundariesConsumed() {
 		armer.ArmFirstTouchSchemaBoundaries()
 	}
+	if relaxer, ok := r.(schemaForwardModeSetter); ok {
+		relaxer.SetSchemaForward(s.readerSchemaGateRelaxed())
+	}
 	setter, ok := r.(schemaDeltaTargetApplySetter)
 	if !ok {
 		return
@@ -717,4 +720,31 @@ type firstTouchBoundaryArmer interface {
 // capture, tooling, tests) stay unarmed by never reaching the arming call.
 func (s *Streamer) firstTouchBoundariesConsumed() bool {
 	return true
+}
+
+// readerSchemaGateRelaxed reports whether a reader that gates mid-stream
+// schema changes itself ([schemaForwardModeSetter]: the Postgres
+// checkSchemaRace, the binlog nullability boundary) should hand the
+// unambiguous shapes on as boundaries instead of refusing them, because an
+// intercept downstream judges every boundary against the target: the
+// single-stream forward intercept, or the unforwarded-stream check (GC-44
+// F5). Only Shape A's coordinated router keeps the reader's own gate, as it
+// always has.
+//
+// It used to be [Streamer.singleStreamSchemaForwardActive], so refuse mode
+// and multi-database streams kept the Postgres gate — and that gate could
+// not be recovered from (GC-44 F5 review): a transaction that wrote rows,
+// altered a column and wrote again replays its pre-ALTER relation and then
+// the post-ALTER one on every restart, so the gate refused the drained
+// model's own restart forever, whatever the operator did to the target.
+// The unforwarded-stream check refuses the same change while the target
+// cannot hold it and lets the restart through once it can. RENAME TABLE,
+// DROP+CREATE and a projection-invisible typmod change stay refused at the
+// reader in every mode.
+//
+// Wired from [Streamer.wireSchemaDeltaArming], which every reader-open site
+// reaches (TestSchemaDeltaArming_ReachesEveryReaderOpenSite) — the
+// multi-database sites called no setter before.
+func (s *Streamer) readerSchemaGateRelaxed() bool {
+	return !s.InjectShardColumn.Engaged() || s.NoCoordinateLiveDDL
 }

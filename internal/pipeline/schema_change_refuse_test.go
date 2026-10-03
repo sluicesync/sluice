@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"sluicesync.dev/sluice/internal/config"
 	"sluicesync.dev/sluice/internal/ir"
 )
 
@@ -70,7 +71,7 @@ func TestJudgeUnforwardedColumns_EveryFamilyBothDirections(t *testing.T) {
 		{"integer into a decimal too narrow for it", ir.Decimal{Precision: 9, Scale: 0}, ir.Integer{Width: 32}, false},
 		{"json into jsonb (jsonb normalizes)", ir.JSON{Binary: true}, ir.JSON{}, false},
 	} {
-		j := judgeUnforwardedColumns(witnessTable(wcol("c", tc.source)), witnessTable(wcol("c", tc.target)), witnessOptions{})
+		j := judgeUnforwardedColumns(witnessTable(wcol("c", tc.source)), witnessTable(wcol("c", tc.target)), witnessOptions{}, nil)
 		if passes := len(j.refused) == 0; passes != tc.passes {
 			t.Errorf("%s: target %s, source %s: passes = %v (refused %v), want %v",
 				tc.name, tc.target, tc.source, passes, j.refused, tc.passes)
@@ -100,12 +101,12 @@ func TestJudgeUnforwardedColumns(t *testing.T) {
 		{"one column ahead, one behind", witnessTable(wcol("a", ir.DateTime{}), wcol("b", ir.DateTime{Precision: 6})), witnessTable(wcol("a", ir.DateTime{Precision: 6}), wcol("b", ir.DateTime{})), 1, 1, 0},
 		{"across families", witnessTable(wcol("v", ir.Text{Size: ir.TextLong})), witnessTable(wcol("v", ir.Integer{Width: 32})), 1, 0, 0},
 	} {
-		j := judgeUnforwardedColumns(tc.snap, tc.target, witnessOptions{})
+		j := judgeUnforwardedColumns(tc.snap, tc.target, witnessOptions{}, nil)
 		if len(j.refused) != tc.refused || len(j.ahead) != tc.ahead || len(j.targetOnly) != tc.targetOnly {
 			t.Errorf("%s: refused %d, ahead %d, target-only %d; want %d, %d, %d",
 				tc.name, len(j.refused), len(j.ahead), len(j.targetOnly), tc.refused, tc.ahead, tc.targetOnly)
 		}
-		err := j.settle(context.Background(), "src.w", "--schema-changes=refuse")
+		err := j.settle(context.Background(), "src.w", unforwardedBoundaryDeps{why: "--schema-changes=refuse"})
 		if refused := err != nil; refused != (tc.refused > 0) {
 			t.Errorf("%s: settle refused = %v (%v), want %v", tc.name, refused, err, tc.refused > 0)
 		}
@@ -181,7 +182,7 @@ func TestInterceptSchemaChangeRefuse(t *testing.T) {
 		w := newFakeWitness(cat, "mysql", "mysql")
 		// An earlier disagreement on this table spent the verdict's once-per-
 		// table re-read (it reads the catalog, still narrow).
-		if j, err := w.judgeUnforwarded(context.Background(), wide); err != nil || len(j.refused) == 0 {
+		if j, err := w.judgeUnforwarded(context.Background(), wide, nil); err != nil || len(j.refused) == 0 {
 			t.Fatalf("the first judgement = %+v, %v; want a refusal", j, err)
 		}
 		cat.tables["w"] = wide // the operator's drained-model ALTER on the target
@@ -225,11 +226,16 @@ type refuseWiringEngine struct {
 	ir.Engine
 	name    string
 	catalog *ir.Table
+	// readErr, when set, fails every catalog read.
+	readErr error
 }
 
 func (e refuseWiringEngine) Name() string { return e.name }
 
 func (e refuseWiringEngine) OpenSchemaReader(context.Context, string) (ir.SchemaReader, error) {
+	if e.readErr != nil {
+		return nil, e.readErr
+	}
 	return refuseWiringReader{e.catalog}, nil
 }
 
@@ -313,5 +319,172 @@ func TestPhaseWireInterceptChain_EveryUnforwardedStreamShapeIsChecked(t *testing
 				}
 			}
 		})
+	}
+}
+
+// TestOverriddenColumnRefused_TruthTable pins the GC-44 F5 review's override
+// class at the judgement: an overridden column, which the witness lens does
+// not compare by type, is still judged on width. The independent expected
+// value is the table, written from what each target type stores.
+func TestOverriddenColumnRefused_TruthTable(t *testing.T) {
+	t.Parallel()
+	dec := func(p, s int) ir.Type { return ir.Decimal{Precision: p, Scale: s} }
+	for _, tc := range []struct {
+		name                  string
+		target, source, prior ir.Type
+		refused               bool
+	}{
+		{"the review's shape: a live widen past the override", dec(12, 2), dec(14, 4), dec(10, 2), true},
+		{"a widen past the override with no prior", dec(12, 2), dec(14, 4), nil, true},
+		{"the override is wider than the source", dec(12, 2), dec(10, 2), dec(10, 2), false},
+		{"the override is wider than the widened source", dec(16, 6), dec(14, 4), dec(10, 2), false},
+		{"a deliberate narrowing override, unchanged since", dec(10, 2), dec(14, 4), dec(14, 4), false},
+		{"a deliberate narrowing override, with no prior", dec(10, 2), dec(14, 4), nil, true},
+		{"a varchar override narrower than a widened source", ir.Varchar{Length: 32}, ir.Varchar{Length: 64}, ir.Varchar{Length: 16}, true},
+		{"a temporal override narrower than a widened source", ir.DateTime{Precision: 0}, ir.DateTime{Precision: 6}, ir.DateTime{Precision: 0}, true},
+		{"an integer override narrower than a widened source", ir.Integer{Width: 32}, ir.Integer{Width: 64}, ir.Integer{Width: 32}, true},
+		{"an override across families is the operator's decision", ir.JSON{}, ir.Text{Size: ir.TextLong}, nil, false},
+		{"a smallint override on a boolean", ir.Integer{Width: 16}, ir.Boolean{}, nil, false},
+	} {
+		if got := overriddenColumnRefused(tc.target, tc.source, tc.prior); got != tc.refused {
+			t.Errorf("%s: overriddenColumnRefused(%v, %v, %v) = %v, want %v", tc.name, tc.target, tc.source, tc.prior, got, tc.refused)
+		}
+	}
+}
+
+// TestJudgeUnforwarded_OverriddenColumnThroughTheWitness drives the override
+// class through the witness the intercept uses: an override on the column
+// (so the lens equates its types), a live source widen past it — refused,
+// naming the override — and the same override with an unchanged source,
+// which passes.
+func TestJudgeUnforwarded_OverriddenColumnThroughTheWitness(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	before := witnessTable(wcol("amount", ir.Decimal{Precision: 10, Scale: 2}))
+	after := witnessTable(wcol("amount", ir.Decimal{Precision: 14, Scale: 4}))
+	target := witnessTable(wcol("amount", ir.Decimal{Precision: 12, Scale: 2}))
+	newW := func() *firstBoundaryWitness {
+		w := newFakeWitness(&fakeCatalog{tables: map[string]*ir.Table{"w": target}}, "mysql", "mysql")
+		w.mappings = []config.Mapping{{Table: "w", Column: "amount", TargetType: "numeric", TargetTypeOptions: map[string]any{"precision": 12, "scale": 2}}}
+		return w
+	}
+	j, err := newW().judgeUnforwarded(ctx, after, before)
+	if err != nil || len(j.refused) != 1 || !strings.Contains(j.refused[0].target, "--type-override") {
+		t.Fatalf("live widen past the override: %+v, %v; want one refusal naming the override", j, err)
+	}
+	if err := j.settle(ctx, "src.w", unforwardedBoundaryDeps{why: "--schema-changes=refuse"}); !errors.Is(err, ir.ErrSchemaChangeRefused) {
+		t.Errorf("settle = %v; want %s", err, schemaChangeRefusedMarker)
+	}
+	if j, err := newW().judgeUnforwarded(ctx, before, before); err != nil || len(j.refused) != 0 {
+		t.Errorf("unchanged source under a wider override: %+v, %v; want accepted", j, err)
+	}
+}
+
+// TestUnforwardedRecoveryHint pins the hint's two qualifications: the
+// forward remedy is offered only where that flag forwards, and an ADD COLUMN
+// remedy says the rows the target holds are not backfilled.
+func TestUnforwardedRecoveryHint(t *testing.T) {
+	t.Parallel()
+	if h := unforwardedRecoveryHint("t", false, false); strings.Contains(h, "--schema-changes=forward") || strings.Contains(h, "backfill") {
+		t.Errorf("multi-database / Shape A hint offers forward or a backfill note: %s", h)
+	}
+	if h := unforwardedRecoveryHint("t", true, false); !strings.Contains(h, "--schema-changes=forward") {
+		t.Errorf("refuse-mode hint lacks the forward remedy: %s", h)
+	}
+	if h := unforwardedRecoveryHint("t", false, true); !strings.Contains(h, "not backfilled") {
+		t.Errorf("ADD COLUMN hint lacks the no-backfill note: %s", h)
+	}
+	for _, tc := range []struct {
+		name string
+		s    *Streamer
+		want bool
+	}{
+		{"refuse mode", &Streamer{SchemaChanges: "refuse"}, true},
+		{"multi-database", &Streamer{AllDatabases: true, SchemaChanges: "refuse"}, false},
+		{"Shape A drained", &Streamer{SchemaChanges: "refuse", InjectShardColumn: ShardColumnSpec{Name: "s", Value: "a"}, NoCoordinateLiveDDL: true}, false},
+	} {
+		if got := tc.s.unforwardedForwardRemedy(); got != tc.want {
+			t.Errorf("%s: forward remedy offered = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestInterceptSchemaChangeRefuse_UnwitnessedRepeatsFromHistory pins that a
+// refusal on a table the target cannot witness repeats on the next start:
+// the boundary it refused was never recorded, so the stream's retained
+// history still holds the shape before it, and the fresh intercept compares
+// against that rather than accepting its first boundary.
+func TestInterceptSchemaChangeRefuse_UnwitnessedRepeatsFromHistory(t *testing.T) {
+	t.Parallel()
+	narrow := witnessTable(wcol("ts", ir.DateTime{}))
+	wide := witnessTable(wcol("ts", ir.DateTime{Precision: 6}))
+	w := newFakeWitness(&fakeCatalog{tables: map[string]*ir.Table{}}, "postgres", "sqlite")
+	w.history = []*ir.Table{narrow}
+	deps := unforwardedBoundaryDeps{witnessFor: func(string) *firstBoundaryWitness { return w }}
+	if _, err := runRefuseIntercept(t, deps, refuseSnap(wide)); !errors.Is(err, ir.ErrSchemaChangeRefused) {
+		t.Errorf("first boundary after a restart with history: err %v; want %s", err, schemaChangeRefusedMarker)
+	}
+	if out, err := runRefuseIntercept(t, deps, refuseSnap(narrow)); err != nil || len(out) != 1 {
+		t.Errorf("unchanged against history: out %d, err %v; want accepted", len(out), err)
+	}
+}
+
+// schemaGateStub records the reader-gate mode it was given.
+type schemaGateStub struct {
+	ir.CDCReader
+	relaxed, set bool
+}
+
+func (s *schemaGateStub) SetSchemaForward(enabled bool) { s.relaxed, s.set = enabled, true }
+
+// TestWireSchemaDeltaArming_RelaxesTheReaderGateWhereAnInterceptJudges pins
+// the reader-gate relaxation at the one helper every reader-open site
+// reaches: relaxed wherever an intercept judges boundaries against the
+// target — forward, refuse mode, multi-database, Shape A drained — and kept
+// only under Shape A's coordinated router. Before the F5 review refuse mode
+// and multi-database kept the Postgres gate, whose refusal a mid-transaction
+// ALTER replays on every restart.
+func TestWireSchemaDeltaArming_RelaxesTheReaderGateWhereAnInterceptJudges(t *testing.T) {
+	t.Parallel()
+	shard := ShardColumnSpec{Name: "shard", Value: "a"}
+	for _, tc := range []struct {
+		name string
+		s    *Streamer
+		want bool
+	}{
+		{"forward", &Streamer{}, true},
+		{"--schema-changes=refuse", &Streamer{SchemaChanges: "refuse"}, true},
+		{"multi-database", &Streamer{AllDatabases: true}, true},
+		{"Shape A drained", &Streamer{InjectShardColumn: shard, NoCoordinateLiveDDL: true}, true},
+		{"Shape A coordinated", &Streamer{InjectShardColumn: shard}, false},
+	} {
+		r := &schemaGateStub{}
+		tc.s.wireSchemaDeltaArming(r)
+		if !r.set || r.relaxed != tc.want {
+			t.Errorf("%s: gate set %v relaxed %v; want relaxed %v", tc.name, r.set, r.relaxed, tc.want)
+		}
+	}
+}
+
+// TestPhaseWireInterceptChain_MultiDatabaseCatalogReadErrorIsLoud pins that a
+// multi-database namespace whose target catalog cannot be read stops the
+// stream (not the marker — restartable) instead of degrading to "not held"
+// and accepting the boundary with a WARN.
+func TestPhaseWireInterceptChain_MultiDatabaseCatalogReadErrorIsLoud(t *testing.T) {
+	t.Parallel()
+	tgt := refuseWiringEngine{name: "mysql", readErr: errors.New("access denied")}
+	s := &Streamer{AllDatabases: true, Source: refuseWiringEngine{name: "mysql"}, Target: tgt, namespaceTargetDeriver: tgt}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	in := make(chan ir.Change, 1)
+	in <- refuseSnap(witnessTable(wcol("ts", ir.DateTime{Precision: 6})))
+	close(in)
+	var got []ir.Change
+	for ch := range s.phaseWireInterceptChain(ctx, in, nil, "roster") {
+		got = append(got, ch)
+	}
+	p := s.schemaSnapshotErr.Load()
+	if p == nil || len(got) != 0 || errors.Is(*p, ir.ErrSchemaChangeRefused) || !strings.Contains((*p).Error(), "access denied") {
+		t.Fatalf("passed %d, err %v; want a loud, restartable catalog-read error", len(got), p)
 	}
 }

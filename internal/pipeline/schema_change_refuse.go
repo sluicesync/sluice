@@ -42,7 +42,9 @@ package pipeline
 //     a transaction that wrote rows, altered the table and wrote again
 //     re-delivers its pre-ALTER relation first, against a target that
 //     already took the change;
-//   - a column only the target has is a WARN, as on the forward path.
+//   - a column only the target has is a WARN, as on the forward path;
+//   - a --type-override column, whose type the lens does not compare, is
+//     judged on width alone ([overriddenColumnRefused]).
 //
 // A refusal carries [ir.ErrSchemaChangeRefused] (SCHEMA-CHANGE-REFUSED) and
 // stops the stream BEFORE the boundary goes downstream, so no history row
@@ -69,12 +71,15 @@ package pipeline
 //
 // # Where the target cannot speak
 //
-// An engine pair with no storage-shape rendering, a table the target does
-// not hold, or a multi-database namespace whose catalog cannot be read: the
-// boundary is classified against the last boundary this intercept saw for
-// the table (CDC against CDC, the same projection on both sides) and any
-// structural change refuses; a table's first boundary is accepted with a
-// WARN, exactly as the forward path's unwitnessed arm does.
+// An engine pair with no storage-shape rendering, or a table the target does
+// not hold: the boundary is classified against the table's last accepted
+// shape ([priorFor] — this intercept's own, else the stream's retained
+// ADR-0049 history, which never records a refused boundary, so a refusal
+// here repeats on the next start) and any structural change refuses. A
+// table with neither is accepted with a WARN, as the forward path's
+// unwitnessed arm does: the one residual where a restart forgets. A
+// multi-database namespace whose catalog cannot be read is NOT this case —
+// the read error stops the stream ([Streamer.readNamespaceTargetCatalog]).
 //
 // # The independent expected value
 //
@@ -86,6 +91,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"reflect"
 	"sync/atomic"
 
 	"sluicesync.dev/sluice/internal/ir"
@@ -112,6 +118,14 @@ type unforwardedBoundaryDeps struct {
 
 	// why names the reason this stream forwards nothing, for the refusal.
 	why string
+
+	// forwardRemedy is true when `--schema-changes=forward` would make this
+	// stream apply such changes itself — a single-database stream under
+	// refuse mode. It is false for a multi-database stream (forwarding is
+	// single-database only) and for Shape A under --no-coordinate-live-ddl
+	// (the forward intercept never engages under --inject-shard-column), so
+	// the hint does not offer them a flag that changes nothing.
+	forwardRemedy bool
 }
 
 // interceptSchemaChangeRefuse wraps the change channel of a stream that
@@ -128,9 +142,9 @@ func interceptSchemaChangeRefuse(
 	out := make(chan ir.Change)
 	go func() {
 		defer close(out)
-		// cache holds each table's last ACCEPTED boundary, for the
-		// unwitnessed fallback only.
-		cache := map[string]*ir.Table{}
+		// accepted holds each table's last ACCEPTED boundary — the prior
+		// shape for the unwitnessed fallback and for an overridden column.
+		accepted := map[string]acceptedBoundary{}
 		for {
 			select {
 			case c, ok := <-in:
@@ -146,13 +160,13 @@ func interceptSchemaChangeRefuse(
 				}
 				key := snap.QualifiedName()
 				post := normalizeSnapshotForComparison(deps.normalizer, snap.IR)
-				if err := judgeUnforwardedBoundary(ctx, deps, key, cache[key], post, snap); err != nil {
+				if err := judgeUnforwardedBoundary(ctx, deps, key, accepted[key], post, snap); err != nil {
 					slog.ErrorContext(ctx, "schema change refused", "table", key, "error", err)
 					wrapped := fmt.Errorf("pipeline: schema change on a stream that does not forward DDL: %w", err)
 					errStore.Store(&wrapped)
 					return
 				}
-				cache[key] = post
+				accepted[key] = acceptedBoundary{compared: post, raw: snap.IR}
 				if !forwardChange(ctx, out, c) {
 					return
 				}
@@ -164,31 +178,57 @@ func interceptSchemaChangeRefuse(
 	return out
 }
 
+// acceptedBoundary is a table's last boundary this intercept passed on, in
+// both forms: compared (through the source engine's comparison lens, for
+// [ClassifyShape]) and raw (the snapshot's own IR, for rendering as target
+// storage the way the current boundary is).
+type acceptedBoundary struct {
+	compared *ir.Table
+	raw      *ir.Table
+}
+
+// priorFor returns the table's last accepted shape: this intercept's own,
+// else the stream's retained ADR-0049 version at the persisted position —
+// a boundary a refusal stopped was never recorded, so after a restart the
+// history still holds the shape before it. The zero value when there is
+// neither.
+func priorFor(deps unforwardedBoundaryDeps, w *firstBoundaryWitness, last acceptedBoundary, table string) acceptedBoundary {
+	if last.raw != nil || w == nil {
+		return last
+	}
+	if hist := w.historyFor(table); hist != nil {
+		return acceptedBoundary{compared: normalizeSnapshotForComparison(deps.normalizer, hist), raw: hist}
+	}
+	return last
+}
+
 // judgeUnforwardedBoundary decides one boundary: nil to pass it on, or the
-// refusal. pre is the table's last accepted boundary on this intercept (nil
-// for its first), post the comparison-form snapshot table and snap the raw
-// snapshot.
+// refusal. last is the table's last accepted boundary on this intercept
+// (zero for its first), post the comparison-form snapshot table and snap
+// the raw snapshot.
 func judgeUnforwardedBoundary(
 	ctx context.Context,
 	deps unforwardedBoundaryDeps,
 	tableName string,
-	pre, post *ir.Table,
+	last acceptedBoundary,
+	post *ir.Table,
 	snap ir.SchemaSnapshot,
 ) error {
 	var w *firstBoundaryWitness
 	if deps.witnessFor != nil {
 		w = deps.witnessFor(snap.Schema)
 	}
+	prior := priorFor(deps, w, last, snap.Table)
 	reason := "the stream has no target witness"
 	if w != nil {
-		j, err := w.judgeUnforwarded(ctx, snap.IR)
+		j, err := w.judgeUnforwarded(ctx, snap.IR, prior.raw)
 		if err == nil && len(j.refused) > 0 && snap.IR != nil {
 			// The verdict re-reads a disagreeing table once per intercept;
 			// on a long-lived stream the operator may have ALTERed the target
 			// again since (the drained model, applied while this stream ran),
 			// so read it again before refusing.
 			w.catalog.forget(snap.IR.Name)
-			j, err = w.judgeUnforwarded(ctx, snap.IR)
+			j, err = w.judgeUnforwarded(ctx, snap.IR, prior.raw)
 		}
 		if err != nil {
 			// Not the marker: nothing has been compared, and a fresh run may
@@ -197,22 +237,23 @@ func judgeUnforwardedBoundary(
 				"(the boundary is not accepted unchecked): %w", tableName, err)
 		}
 		if j.reason == "" {
-			return j.settle(ctx, tableName, deps.why)
+			return j.settle(ctx, tableName, deps)
 		}
 		reason = j.reason
 	}
-	// The target cannot speak for this table: fall back to the last
-	// boundary this intercept accepted, which shares the change stream's
-	// projection.
-	if pre == nil {
+	// The target cannot speak for this table: fall back to its last accepted
+	// shape, which shares the change stream's projection — this intercept's
+	// own, or the retained history version, so a refusal here repeats on the
+	// next start as long as the stream has one.
+	if prior.compared == nil {
 		slog.WarnContext(ctx,
-			"schema change check: the target cannot witness this table's schema boundary and the stream has "+
-				"seen no earlier one; accepting it — a change made to the source while the stream was stopped "+
-				"is NOT checked for this table",
+			"schema change check: the target cannot witness this table's schema boundary and the stream holds "+
+				"no earlier shape for it; accepting it — a change made to the source while the stream was "+
+				"stopped is NOT checked for this table",
 			"table", tableName, "reason", reason)
 		return nil
 	}
-	shape, err := ClassifyShape(pre, post)
+	shape, err := ClassifyShape(prior.compared, post)
 	if err == nil && shape.Kind == ShapeKindNone {
 		return nil
 	}
@@ -225,7 +266,7 @@ func judgeUnforwardedBoundary(
 			"forward schema changes (%s). Refusing before the boundary is recorded or any row after it is "+
 			"applied.%s %s",
 		ir.ErrSchemaChangeRefused, tableName, what, reason, deps.why,
-		renderDriftForRefusal(pre, post), unforwardedRecoveryHint(tableName),
+		renderDriftForRefusal(prior.compared, post), unforwardedRecoveryHint(tableName, deps.forwardRemedy, false),
 	)
 }
 
@@ -238,6 +279,9 @@ type unforwardedJudgement struct {
 	// refused are the columns whose values the target would not hold: a
 	// source column the target lacks, or a type the target's does not hold.
 	refused []witnessColumnDiff
+	// added says one of the refused columns is a source column the target
+	// lacks — the remedy is an ADD COLUMN, which the hint qualifies.
+	added bool
 	// ahead are type differences the target's type holds — the drained
 	// model applied on the target before the source.
 	ahead []witnessColumnDiff
@@ -248,22 +292,20 @@ type unforwardedJudgement struct {
 // judgeUnforwarded compares post (RAW) with the target's read-back of the
 // same table. It reaches the target through [firstBoundaryWitness.verdict] —
 // the same rendering, the same unwitnessable cases, the same re-read of a
-// table whose memo disagrees — and, when that is not a match, judges the
-// pair column by column: the forward verdict answers "what can be
-// forwarded", and a stream that forwards nothing asks a different question
-// of each column, "can the target hold what the source sends".
-func (w *firstBoundaryWitness) judgeUnforwarded(ctx context.Context, post *ir.Table) (unforwardedJudgement, error) {
+// table whose memo disagrees — and then judges the pair column by column
+// whatever the verdict says: the forward verdict answers "what can be
+// forwarded", and it does not compare an overridden column's type at all,
+// while a stream that forwards nothing asks every column "can the target
+// hold what the source sends". prior is the table's last accepted RAW shape
+// (nil when there is none), consulted for an overridden column only.
+func (w *firstBoundaryWitness) judgeUnforwarded(ctx context.Context, post, prior *ir.Table) (unforwardedJudgement, error) {
 	v, err := w.verdict(ctx, post)
 	if err != nil {
 		return unforwardedJudgement{}, err
 	}
-	switch v.kind {
-	case witnessUnwitnessed:
+	if v.kind == witnessUnwitnessed {
 		return unforwardedJudgement{reason: v.reason}, nil
-	case witnessMatch:
-		return unforwardedJudgement{}, nil
 	}
-	// The memo is current: the verdict re-read the table on its mismatch.
 	target, held, err := w.catalog.lookup(ctx, post.Name)
 	if err != nil {
 		return unforwardedJudgement{}, err
@@ -275,7 +317,13 @@ func (w *firstBoundaryWitness) judgeUnforwarded(ctx context.Context, post *ir.Ta
 	if err != nil {
 		return unforwardedJudgement{}, err
 	}
-	return judgeUnforwardedColumns(expected, target, w.options(post)), nil
+	var priorExpected *ir.Table
+	if prior != nil {
+		if priorExpected, err = w.expected(prior); err != nil {
+			return unforwardedJudgement{}, err
+		}
+	}
+	return judgeUnforwardedColumns(expected, target, w.options(post), priorExpected), nil
 }
 
 // judgeUnforwardedColumns is the pure judgement: expected (the snapshot
@@ -285,15 +333,28 @@ func (w *firstBoundaryWitness) judgeUnforwarded(ctx context.Context, post *ir.Ta
 //
 //   - a source column the target lacks refuses;
 //   - a type difference passes only when [witnessWidthOrder] puts the
-//     target at or above the source's width in one family (the same
-//     direction rule the forward path uses to never narrow); a narrower
-//     target, a change across families, a sign or zone-kind change, a
-//     decimal wider on one axis and narrower on the other, and the
-//     session-zone sibling swap all refuse;
-//   - a column only the target has is noted.
-func judgeUnforwardedColumns(expected, target *ir.Table, opts witnessOptions) unforwardedJudgement {
+//     target at or above the source's width (the same direction rule the
+//     forward path uses to never narrow); a narrower target, a change
+//     across families, a sign or zone-kind change, a decimal wider on one
+//     axis and narrower on the other, and the session-zone sibling swap all
+//     refuse;
+//   - a column only the target has is noted;
+//   - an OVERRIDDEN column ([overriddenColumnRefused]) is judged on width
+//     alone, because the lens does not compare its type at all.
+//
+// priorExpected is the table's last accepted shape rendered the same way
+// (nil when there is none).
+func judgeUnforwardedColumns(expected, target *ir.Table, opts witnessOptions, priorExpected *ir.Table) unforwardedJudgement {
 	exp := witnessCompareTable(expected, nil)
 	act := witnessCompareTable(target, exp)
+	// The lens equates an overridden column's types; keep the source's own
+	// compared type first, so its width can still be judged below.
+	pinnedSource := map[string]ir.Type{}
+	for _, c := range exp.Columns {
+		if opts.pinned[c.Name] {
+			pinnedSource[c.Name] = c.Type
+		}
+	}
 	reconcilePairs(exp, act, opts)
 	mismatches := irdiff.TableColumnShapeWithOptions(exp, act, irdiff.ShapeCompareOptions{ColumnTypesOnly: true})
 	expCols, actCols := columnsByNameIR(exp), columnsByNameIR(act)
@@ -305,6 +366,7 @@ func judgeUnforwardedColumns(expected, target *ir.Table, opts witnessOptions) un
 		switch {
 		case inExp && !inAct:
 			j.refused = append(j.refused, d)
+			j.added = true
 		case !inExp && inAct:
 			j.targetOnly = append(j.targetOnly, m.Column)
 		case sessionZoneSiblingSwap(a.Type, e.Type):
@@ -320,19 +382,66 @@ func judgeUnforwardedColumns(expected, target *ir.Table, opts witnessOptions) un
 			}
 		}
 	}
+	var priorCols map[string]*ir.Column
+	if priorExpected != nil {
+		priorCols = columnsByNameIR(witnessCompareTable(priorExpected, nil))
+	}
+	for name, source := range pinnedSource {
+		a, held := actCols[name]
+		if !held {
+			continue // judged above as a column the target lacks
+		}
+		var prior ir.Type
+		if pc, ok := priorCols[name]; ok {
+			prior = pc.Type
+		}
+		if overriddenColumnRefused(a.Type, source, prior) {
+			j.refused = append(j.refused, witnessColumnDiff{
+				column: name, source: source.String(), target: a.Type.String() + " (--type-override)",
+			})
+		}
+	}
 	return j
 }
 
+// overriddenColumnRefused judges a column an operator --type-override names.
+// The witness lens does not compare such a column's type — the override,
+// not the source, decided what the target holds, and the target emitter
+// renders an override in ways no source rendering predicts — so on its own
+// the check saw an overridden column by presence only, on EVERY boundary,
+// and a live `DECIMAL(10,2)` → `DECIMAL(14,4)` under an override of
+// `numeric(12,2)` was rounded to two places at exit 0 (GC-44 F5 review).
+//
+// So an overridden column is judged on width, where its two types fall in
+// one comparable family ([witnessWidthOrder]): a target at least as wide
+// as the source's type passes, and so does a pair across families (a
+// `json` override on a text column: the override's own decision, nothing
+// to compare). A target NARROWER than the source refuses — unless the
+// source's type is what it was at the table's last accepted boundary
+// (prior): then the narrowing is the override the operator chose and the
+// copy already applied, not a change the source has made since. With no
+// prior (a table's first boundary with no retained history) a narrower
+// override refuses: the check cannot tell a deliberate narrowing from a
+// widening made while the stream was stopped, and only one of those loses
+// data silently.
+func overriddenColumnRefused(target, source, prior ir.Type) bool {
+	switch witnessWidthOrder(target, source) {
+	case targetNarrower, mixedWidth:
+		return prior == nil || !reflect.DeepEqual(prior, source)
+	}
+	return false
+}
+
 // settle logs an accepted judgement or returns its refusal.
-func (j unforwardedJudgement) settle(ctx context.Context, tableName, why string) error {
+func (j unforwardedJudgement) settle(ctx context.Context, tableName string, deps unforwardedBoundaryDeps) error {
 	if len(j.refused) > 0 {
 		return fmt.Errorf(
 			"%w: the source table %q no longer matches the target, and this stream does not forward schema "+
 				"changes (%s); the target cannot hold what the source now sends (%s), so applying the rows "+
 				"after this boundary would change or drop their values. Refusing before the boundary is "+
 				"recorded or any row after it is applied; nothing has been written. %s",
-			ir.ErrSchemaChangeRefused, tableName, why, renderWitnessDiffs(j.refused),
-			unforwardedRecoveryHint(tableName),
+			ir.ErrSchemaChangeRefused, tableName, deps.why, renderWitnessDiffs(j.refused),
+			unforwardedRecoveryHint(tableName, deps.forwardRemedy, j.added),
 		)
 	}
 	if len(j.ahead) > 0 {
@@ -360,17 +469,28 @@ func renderWitnessDiffs(diffs []witnessColumnDiff) string {
 	return witnessVerdict{diffs: diffs}.render()
 }
 
-// unforwardedRecoveryHint is the remedy for a refusal of this check: there
+// unforwardedRecoveryHint is the remedy for a refusal of this check. There
 // is nothing to acknowledge, because the check re-reads the target on every
-// start.
-func unforwardedRecoveryHint(tableName string) string {
-	return fmt.Sprintf(
+// start. forwardRemedy offers --schema-changes=forward, only where that flag
+// would forward (see [unforwardedBoundaryDeps.forwardRemedy]); added says a
+// refused column is one the target lacks, whose ADD COLUMN on the target is
+// not followed by any backfill from this stream.
+func unforwardedRecoveryHint(tableName string, forwardRemedy, added bool) string {
+	hint := fmt.Sprintf(
 		"recovery: apply the same change to %q on the target (run 'sluice sync stop --wait' first if the "+
 			"stream is not already stopped), then re-run 'sluice sync start' with the SAME --stream-id; "+
-			"every start compares the target again, so nothing needs acknowledging. A single-database "+
-			"stream can instead run with --schema-changes=forward, which applies such changes itself.",
+			"every start compares the target again, so nothing needs acknowledging.",
 		tableName,
 	)
+	if added {
+		hint += " An ADD COLUMN you run on the target is not backfilled by this stream: the rows the target " +
+			"already holds keep whatever that ALTER gives them (its DEFAULT, or NULL), and only rows changed " +
+			"after the restart carry the source's values — copy the column's existing values yourself if they matter."
+	}
+	if forwardRemedy {
+		hint += " Or run this stream with --schema-changes=forward, which applies such changes itself."
+	}
+	return hint
 }
 
 // unforwardedStreamReason names why this stream forwards no source DDL,
@@ -387,17 +507,25 @@ func (s *Streamer) unforwardedStreamReason() string {
 	return "schema-change forwarding is not engaged for this stream"
 }
 
+// unforwardedForwardRemedy reports whether --schema-changes=forward would
+// make this stream forward the change it refused: a single-database stream
+// without --inject-shard-column, which here means one under refuse mode.
+func (s *Streamer) unforwardedForwardRemedy() bool {
+	return !s.multiDatabaseMode() && !s.InjectShardColumn.Engaged() && !s.forwardSchemaEnabled()
+}
+
 // unforwardedBoundaryWitnesses returns the witness lookup for
 // [interceptSchemaChangeRefuse]: single is the stream's own witness (built
-// by the caller, which consumes the warm-resume catalog read), served for
-// every namespace; a multi-database stream gets one witness per source
-// namespace, each reading that namespace's target catalog through the
-// per-namespace DSN the multi-database open resolved after its preflights
-// ([Streamer.namespaceTargetDeriver], [Streamer.loadMultiDatabaseTargetZoneWitness],
-// which degrades to an empty catalog — the unwitnessed fallback — with a
-// WARN when the namespace cannot be read). Called from the intercept's
-// goroutine only.
-func (s *Streamer) unforwardedBoundaryWitnesses(streamID string, single *firstBoundaryWitness) func(string) *firstBoundaryWitness {
+// by the caller, which consumes the warm-resume catalog and history reads),
+// served for every namespace; a multi-database stream gets one witness per
+// source namespace, carrying that namespace's retained history
+// ([Streamer.namespaceHistory]) and reading its target catalog through
+// [Streamer.readNamespaceTargetCatalog]. The lookup runs on the intercept's
+// goroutine only; everything it needs from the Streamer is captured here,
+// on the wiring goroutine.
+func (s *Streamer) unforwardedBoundaryWitnesses(single *firstBoundaryWitness) func(string) *firstBoundaryWitness {
+	history := s.namespaceHistory
+	s.namespaceHistory = nil
 	if !s.multiDatabaseMode() || single == nil {
 		return func(string) *firstBoundaryWitness { return single }
 	}
@@ -409,8 +537,9 @@ func (s *Streamer) unforwardedBoundaryWitnesses(streamID string, single *firstBo
 		}
 		w := &firstBoundaryWitness{
 			catalog: newTargetCatalogWitness(func(ctx context.Context) (map[string]*ir.Table, error) {
-				return s.loadMultiDatabaseTargetZoneWitness(ctx, streamID, namespace, deriver)
+				return s.readNamespaceTargetCatalog(ctx, namespace, deriver)
 			}, nil),
+			history:      history[namespace],
 			sourceEngine: single.sourceEngine,
 			targetEngine: single.targetEngine,
 			mappings:     single.mappings,
@@ -418,4 +547,30 @@ func (s *Streamer) unforwardedBoundaryWitnesses(streamID string, single *firstBo
 		byNamespace[namespace] = w
 		return w
 	}
+}
+
+// readNamespaceTargetCatalog reads one source namespace's target catalog
+// for the unforwarded-stream check, and FAILS on a read it cannot make.
+//
+// It is deliberately not [Streamer.loadMultiDatabaseTargetZoneWitness],
+// which turns any read error into an empty catalog with a WARN: right for
+// the warm-resume seed it was written for, wrong here, where an empty
+// catalog makes every table "not held" and a change made while the stream
+// was stopped would be accepted with a WARN (GC-44 F5 review). The
+// single-database witness errors loudly on the same failure; this matches
+// it. The error is not the marker, so the stream stops restartable and the
+// next start reads again. A namespace the target simply does not hold reads
+// back empty (a Postgres schema reader filters on a name nothing matches),
+// which is the honest "not held".
+func (s *Streamer) readNamespaceTargetCatalog(ctx context.Context, namespace string, deriver ir.DatabaseDSNDeriver) (map[string]*ir.Table, error) {
+	target := s.NamespaceMap.Apply(namespace)
+	if deriver == nil {
+		return nil, fmt.Errorf("pipeline: the target engine cannot derive a DSN for namespace %q, "+
+			"so its catalog cannot be read to check schema boundaries", target)
+	}
+	dsn, err := deriver.WithDatabase(s.TargetDSN, target)
+	if err != nil {
+		return nil, fmt.Errorf("pipeline: derive target DSN for namespace %q: %w", target, err)
+	}
+	return s.loadTargetZoneWitnessFromDSN(ctx, dsn)
 }
