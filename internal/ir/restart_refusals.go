@@ -95,3 +95,13 @@ var ErrResumeSchemaDivergence = errors.New("RESUME-SCHEMA-DIVERGENCE")
 // source's current shape with the target's catalog, so a restart refuses
 // again until the operator applies the change on the target.
 var ErrSchemaChangeRefused = errors.New("SCHEMA-CHANGE-REFUSED")
+
+// PreAlterReplayWedgeMarker is the grep-stable word naming the pre-ALTER
+// replay wedge (GC-44 F24): a Postgres source transaction that wrote a
+// table and then dropped, renamed or retyped one of its columns, on a
+// stream whose reader refuses that change mid-session. Every restart
+// re-delivers the transaction from its start and refuses it again, so the
+// drained model does not recover it. The Postgres reader names it on the
+// refusal itself; the pipeline's unforwarded-stream check names it where
+// the drained model leaves a replay refusing as a column the target lacks.
+const PreAlterReplayWedgeMarker = "PRE-ALTER-REPLAY-WEDGE"

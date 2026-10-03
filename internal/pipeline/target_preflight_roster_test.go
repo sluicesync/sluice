@@ -151,7 +151,7 @@ var targetPreflightStoppedColdStartResumeVsColdStartExempt = map[string]coldStar
 	"preflightCrossShardCollision": {exemptArchitectural, "refuses a multi-shard source merging into one target; " +
 		"the lane admits only a source implementing ir.SnapshotAnchorVerifier (Postgres), which implements no " +
 		"ir.ShardDiscoverer, so the preflight's own no-shards branch would return nil."},
-	"preflightShardConsolidation": {exemptArchitectural, "judges whether a populated target may receive a COPY " +
+	"preflightShardConsolidationFor": {exemptArchitectural, "judges whether a populated target may receive a COPY " +
 		"from another shard; the resume copies nothing, and whether the rows on the target are the recorded copy's " +
 		"is decided by the copy-shape gate (its `shard` aspect included) and the row floor."},
 	"preflightColdStart": {exemptArchitectural, "refuses a COPY into a populated target; the resume REQUIRES a " +

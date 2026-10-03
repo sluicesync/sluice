@@ -85,12 +85,15 @@ package pipeline
 // second case, so it stays a refusal — but the usual remedy ("apply the
 // same change on the target": narrow it, drop the column) DESTROYS values
 // in the first. So the refusal names both, tells the operator to compare
-// the source's CURRENT definition with the target's, and gives the replay
-// a safe exit that every stream shape has: a one-shot
-// `--accept-unforwarded-schema-change=<fingerprint>`, the existing
-// acknowledgement, whose fingerprint here names this table and these
-// columns ([ambiguousBoundary]). Nothing is persisted for it: the next
-// start re-derives the same refusal, and the same fingerprint.
+// the source's CURRENT definition with the target's (consistent with a
+// replay, not proof of one) and to rule out source DDL made while the
+// stream was stopped, and gives the replay a safe exit that every stream
+// shape has: a one-shot `--accept-unforwarded-schema-change=<fingerprint>`,
+// the existing acknowledgement, whose fingerprint here names this table,
+// these columns and the position the attempt resumed from
+// ([ambiguousBoundary], schema_change_ambiguous_ack.go). Nothing is
+// persisted for it: a restart from the same position re-derives the same
+// refusal, and the same fingerprint.
 //
 // The binlog lane emits a boundary only at a DDL unless it is armed for
 // first touch ([Streamer.firstTouchBoundariesConsumed]); it now is on these
@@ -192,6 +195,18 @@ type unforwardedBoundaryDeps struct {
 	// whose fingerprint it names is accepted as the replay the operator
 	// confirmed ([ambiguousBoundary]); any other refusal ignores it.
 	acknowledged string
+
+	// resumedFrom is the persisted position this attempt resumed from
+	// (zero on a cold start). An AMBIGUOUS refusal's fingerprint hashes
+	// it, so an acknowledgement accepts only a boundary re-delivered from
+	// that position — a replay — never the same change shape arriving after
+	// the stream has persisted past it (schema_change_ambiguous_ack.go).
+	resumedFrom ir.Position
+
+	// ambiguousAccepted, when set, is called once a boundary is accepted on
+	// the acknowledgement, so the Streamer can consume it once a later
+	// position persists ([Streamer.bindAmbiguousAcknowledgement]).
+	ambiguousAccepted func()
 }
 
 // priorOrigin says where a table's prior shape came from, which decides
@@ -453,10 +468,20 @@ func judgeUnforwardedBoundary(
 	drift := renderDriftForRefusal(prior.compared, post)
 	remedy := unforwardedRecoveryHint(tableName, deps.forwardRemedy, false)
 	if ambiguous {
-		// Every refusal on this arm rests on the prior alone.
-		a := newAmbiguousBoundary(tableName, what+drift, deps.acknowledged, true)
+		// Every refusal on this arm rests on the prior alone, so it is
+		// always acknowledgeable — including a shape that classifies as ADD
+		// COLUMN, which a replay explains too (the pre-change shape of a
+		// DROP COLUMN the target already took). The cost, evaluated in the
+		// GC-44 F5 fifth review and accepted: an ADD COLUMN genuinely made
+		// on the source while the stream was stopped is acknowledgeable
+		// here as well, since without the target nothing tells the two
+		// apart. The note's DDL-while-stopped question is the operator's
+		// only discriminator. (Whether the applier then fails loudly on a
+		// row carrying a column the target lacks is an UNVERIFIED PREMISE
+		// across target engines, so it is not relied on.)
+		a := newAmbiguousBoundary(tableName, what+drift, deps, true)
 		if a.acknowledged() {
-			a.logAccepted(ctx, what)
+			a.accept(ctx, what)
 			return prior, nil
 		}
 		remedy = a.note() + unforwardedRecoveryHint(tableName, false, false)
@@ -767,6 +792,17 @@ func judgeUnforwardedColumns(expected, target *ir.Table, opts witnessOptions, pr
 			j.refused = append(j.refused, witnessColumnDiff{
 				column: c.Name, source: source.String(), target: a.Type.String() + " (--type-override)",
 			})
+			// Deliberately NOT counted in onPrior, so it is never an
+			// acknowledgeable AMBIGUOUS refusal (GC-44 F5 fifth review).
+			// The refusal does rest partly on the prior (a narrower
+			// override passes while the source type equals it), so a
+			// replay showing the pre-ALTER type can refuse here. But its
+			// remedy — widen the target column until it holds the
+			// source's type — destroys nothing in either reading, unlike
+			// narrowing a column or dropping one, so the replay needs no
+			// exit that skips it; and the AMBIGUOUS note's test (compare
+			// the source's definition with the target's) cannot apply to
+			// a column whose target type is the operator's by design.
 		case narrowed:
 			j.refused = append(j.refused, witnessColumnDiff{
 				column: c.Name, source: fmt.Sprintf("%s (narrowed from %s)", source, from),
@@ -827,9 +863,9 @@ func (j unforwardedJudgement) settle(ctx context.Context, tableName string, deps
 		if j.ambiguous {
 			// The acknowledgement can vouch only for what a replay explains:
 			// every refused column must rest on the prior alone.
-			a := newAmbiguousBoundary(tableName, diffs, deps.acknowledged, j.onPrior == len(j.refused))
+			a := newAmbiguousBoundary(tableName, diffs, deps, j.onPrior == len(j.refused))
 			if a.acknowledged() {
-				a.logAccepted(ctx, diffs)
+				a.accept(ctx, diffs)
 				return nil
 			}
 			// Not --schema-changes=forward: its first boundary cannot prove a
@@ -911,17 +947,26 @@ const ambiguousBoundaryMarker = "AMBIGUOUS-SCHEMA-BOUNDARY"
 // source's order does not place after it — a replay, or a source change.
 //
 // Its exit for the replay case is the existing one-shot acknowledgement,
-// `--accept-unforwarded-schema-change`, given this refusal's fingerprint:
-// the operator compares the source's CURRENT definition with the target's,
-// and only when they agree acknowledges. Reused rather than a new flag
-// because it already means "I reconciled what sluice cannot verify; accept
-// exactly THIS refusal", and its fingerprint binding is what stops a value
-// left in a service definition from accepting a different one. Unlike the
+// `--accept-unforwarded-schema-change`, given this refusal's fingerprint.
+// Reused rather than a new flag because it already means "I reconciled
+// what sluice cannot verify; accept exactly THIS refusal". Unlike the
 // UNFORWARDED-SCHEMA-CHANGE record, nothing is persisted: the fingerprint
-// hashes the table and the refused columns, so every start re-derives the
-// same one, and it holds for the process it is given to (the retry loop
-// re-delivers the same replay, which must stay accepted). A value naming
-// another boundary is ignored and the refusal says so.
+// hashes the table, the refused columns and the position the attempt
+// resumed from, so a restart from the same position re-derives the same
+// one, while a later identical change — which arrives only after the
+// stream has persisted past the replay — gets a different one
+// (schema_change_ambiguous_ack.go has the binding and its in-process
+// consumption). A value naming another boundary is ignored and the
+// refusal says so.
+//
+// The evidence the operator is asked for is not proof either: a source
+// definition matching the target's is CONSISTENT with a replay, and also
+// with a column narrowed and widened back, or dropped and added again
+// (GC-44 F22), while the stream was stopped — histories whose values the
+// source rewrote and no catalog comparison can see. So the note also asks
+// whether anyone ran DDL on the source table while the stream was
+// stopped, and names re-copying as the safe answer when that cannot be
+// ruled out.
 //
 // An acknowledgement cannot accept a boundary that also carries a
 // difference no replay explains ([unforwardedJudgement.onPrior] short of
@@ -933,14 +978,19 @@ type ambiguousBoundary struct {
 	fingerprint string
 	passed      string
 	ackable     bool
+	// accepted is [unforwardedBoundaryDeps.ambiguousAccepted].
+	accepted func()
 }
 
-func newAmbiguousBoundary(table, detail, passed string, ackable bool) ambiguousBoundary {
+func newAmbiguousBoundary(table, detail string, deps unforwardedBoundaryDeps, ackable bool) ambiguousBoundary {
+	at := deps.resumedFrom
+	occurrence := []string{ambiguousBoundaryMarker, table, detail, at.Engine, at.Token}
 	return ambiguousBoundary{
 		table:       table,
-		fingerprint: unforwardedRefusalFingerprint(ambiguousBoundaryMarker + "\x00" + table + "\x00" + detail),
-		passed:      passed,
+		fingerprint: unforwardedRefusalFingerprint(strings.Join(occurrence, "\x00")),
+		passed:      deps.acknowledged,
 		ackable:     ackable,
+		accepted:    deps.ambiguousAccepted,
 	}
 }
 
@@ -950,43 +1000,50 @@ func (a ambiguousBoundary) acknowledged() bool {
 	return a.ackable && a.passed != "" && a.passed == a.fingerprint
 }
 
-// logAccepted WARNs the acknowledged acceptance, naming what was kept.
-func (a ambiguousBoundary) logAccepted(ctx context.Context, difference string) {
+// accept WARNs the acknowledged acceptance, naming what was kept, and
+// reports it to the Streamer's binding.
+func (a ambiguousBoundary) accept(ctx context.Context, difference string) {
 	slog.WarnContext(ctx,
 		"schema change check: accepted an "+ambiguousBoundaryMarker+" on the operator's acknowledgement ("+
-			unforwardedRefusalAckFlag+"): the source's current definition was confirmed to match the target, so "+
-			"this boundary is a replay of the table's shape before a change the target already holds; the target "+
-			"is kept unchanged",
+			unforwardedRefusalAckFlag+"): the operator confirmed this boundary is a replay of the table's shape "+
+			"before a change the target already holds; the target is kept unchanged",
 		"table", a.table, "fingerprint", a.fingerprint, "difference", difference)
+	if a.accepted != nil {
+		a.accepted()
+	}
 }
 
 // note is the refusal's ambiguity paragraph. It ends where the usual
 // remedy — which applies to the source-change case only — begins.
 func (a ambiguousBoundary) note() string {
-	replay := fmt.Sprintf("If they are the same, it is (1): change NOTHING on the target and start once with %s=%s, "+
-		"which accepts this boundary (this table, these columns) for that run.", unforwardedRefusalAckFlag, a.fingerprint)
+	replay := fmt.Sprintf("If both hold, it is (1): change NOTHING on the target and start once with %s=%s, "+
+		"which accepts this boundary (this table, these columns, resumed from this position) for that run.",
+		unforwardedRefusalAckFlag, a.fingerprint)
 	if !a.ackable {
-		replay = "If they are the same, it is (1) — but this boundary also carries a difference a replay does not " +
+		replay = "If both hold, it is (1) — but this boundary also carries a difference a replay does not " +
 			"explain away, so it cannot be acknowledged; see the pre-ALTER replay wedge in docs/operator/cdc-streaming.md " +
 			"for the recovery."
 	}
 	mismatch := ""
 	if a.passed != "" && a.passed != a.fingerprint {
-		mismatch = fmt.Sprintf(" The acknowledgement passed (%s=%s) does not name this boundary, so it was not applied.",
-			unforwardedRefusalAckFlag, a.passed)
+		mismatch = fmt.Sprintf(" The acknowledgement passed (%s=%s) does not name this boundary (this table, these "+
+			"columns, resumed from this position), so it was not applied.", unforwardedRefusalAckFlag, a.passed)
 	}
 	return fmt.Sprintf("%s: the only evidence that the source changed %q is the shape this stream recorded for it "+
 		"earlier, and the source's positions cannot place this boundary after that shape (a Postgres source anchors "+
 		"every schema boundary at LSN 0/0, GC-44 F23). So it is EITHER (1) a REPLAY — a transaction re-delivered "+
 		"from its start after a restart or a retried error, showing the table as it was BEFORE a change the target "+
 		"already holds; the target is right, and narrowing it or dropping its column would destroy values the source "+
-		"still has — OR (2) a change made on the source that this stream has not applied. Tell them apart by "+
-		"comparing the source's CURRENT definition of %q (psql \\d, or SHOW CREATE TABLE) with the target's. %s "+
-		"(On a Postgres source, if the replayed transaction changes the table again after this point, its reader "+
-		"then refuses that change mid-stream: the pre-ALTER replay wedge, whose recovery is in "+
-		"docs/operator/cdc-streaming.md.)%s If the source's column is narrower "+
-		"than the target's, or gone, it is (2): ",
-		ambiguousBoundaryMarker, a.table, a.table, replay, mismatch)
+		"still has — OR (2) a change made on the source that this stream has not applied. Compare the source's "+
+		"CURRENT definition of %q (psql \\d, or SHOW CREATE TABLE) with the target's: if the source's column is "+
+		"narrower than the target's, or gone, it is (2). A match is consistent with a replay but does not prove one: "+
+		"a column narrowed and widened back, or dropped and added again, on the source while the stream was stopped "+
+		"also matches, with the source's values rounded or replaced. So also confirm nobody ran DDL on %q on the "+
+		"source while the stream was stopped. %s If you cannot rule that out, re-copy the table (or the column's "+
+		"values) from the source, which is safe either way. (On a Postgres source, if the replayed transaction "+
+		"changes the table again after this point, its reader then refuses that change mid-stream: the pre-ALTER "+
+		"replay wedge, whose recovery is in docs/operator/cdc-streaming.md.)%s If it is (2): ",
+		ambiguousBoundaryMarker, a.table, a.table, a.table, replay, mismatch)
 }
 
 // renderWitnessDiffs lists column disagreements for a log line or refusal.
@@ -1010,7 +1067,11 @@ func unforwardedRecoveryHint(tableName string, forwardRemedy, added bool) string
 	if added {
 		hint += " An ADD COLUMN you run on the target is not backfilled by this stream: the rows the target " +
 			"already holds keep whatever that ALTER gives them (its DEFAULT, or NULL), and only rows changed " +
-			"after the restart carry the source's values — copy the column's existing values yourself if they matter."
+			"after the restart carry the source's values — copy the column's existing values yourself if they matter." +
+			" But if the target lacks it because you dropped or renamed it there after the source's own DROP COLUMN " +
+			"or RENAME COLUMN was refused mid-transaction (" + ir.PreAlterReplayWedgeMarker + "), this boundary is that " +
+			"transaction's replay and adding the column back does not pass it: see \"The pre-ALTER replay wedge\" " +
+			"in docs/operator/cdc-streaming.md."
 	}
 	if forwardRemedy {
 		hint += " Or run this stream with --schema-changes=forward, which applies such changes itself."

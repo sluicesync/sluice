@@ -1055,7 +1055,7 @@ func (s *Streamer) coldStartGatePreflight(ctx context.Context, schema *ir.Schema
 			_ = stream.Abandon()
 			return nil, err
 		}
-		if err := preflightShardConsolidation(ctx, schema, rw, s.InjectShardColumn.Name, s.InjectShardColumn.Value); err != nil {
+		if err := preflightShardConsolidationFor(ctx, schema, rw, s.InjectShardColumn.Name, s.InjectShardColumn.Value, preflightModeSync); err != nil {
 			migcore.CloseIf(rw)
 			migcore.CloseIf(sw)
 			_ = stream.Abandon()

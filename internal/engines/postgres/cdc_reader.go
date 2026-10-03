@@ -1264,7 +1264,7 @@ func (r *CDCReader) dispatchWAL(
 			return fmt.Errorf("postgres: cdc: relation %s.%s: %w", m.Namespace, m.RelationName, err)
 		}
 		if err := r.gradeRelationSchemaRace(relations, m.RelationID, entry); err != nil {
-			return err
+			return withPreAlterReplayWedge(err, relations[m.RelationID], *currentTxnLSN)
 		}
 		if err := r.gradeUnforwardedClasses(ctx, m.RelationID, entry); err != nil {
 			return err
@@ -1304,7 +1304,7 @@ func (r *CDCReader) dispatchWAL(
 			return fmt.Errorf("postgres: cdc: relation %s.%s: %w", m.Namespace, m.RelationName, err)
 		}
 		if err := r.gradeRelationSchemaRace(relations, m.RelationID, entry); err != nil {
-			return err
+			return withPreAlterReplayWedge(err, relations[m.RelationID], *currentTxnLSN)
 		}
 		if err := r.gradeUnforwardedClasses(ctx, m.RelationID, entry); err != nil {
 			return err
@@ -1586,6 +1586,7 @@ func (r *CDCReader) emitInsert(
 	if !ok {
 		return fmt.Errorf("postgres: cdc: insert for unknown relation OID %d", relID)
 	}
+	rel.writtenInTxn = lsn // the pre-ALTER replay wedge's evidence ([withPreAlterReplayWedge])
 	if !r.schemaInScope(rel.Schema) {
 		return nil // out-of-scope schema; drop
 	}
@@ -1620,6 +1621,7 @@ func (r *CDCReader) emitUpdate(
 	if !ok {
 		return fmt.Errorf("postgres: cdc: update for unknown relation OID %d", relID)
 	}
+	rel.writtenInTxn = lsn
 	if !r.schemaInScope(rel.Schema) {
 		return nil // out-of-scope schema; drop
 	}
@@ -1773,6 +1775,7 @@ func (r *CDCReader) emitDelete(
 	if !ok {
 		return fmt.Errorf("postgres: cdc: delete for unknown relation OID %d", relID)
 	}
+	rel.writtenInTxn = lsn
 	if !r.schemaInScope(rel.Schema) {
 		return nil // out-of-scope schema; drop
 	}
@@ -1926,6 +1929,7 @@ func (r *CDCReader) emitTruncate(
 		if !ok {
 			return fmt.Errorf("postgres: cdc: truncate for unknown relation OID %d", id)
 		}
+		rel.writtenInTxn = lsn
 		if !r.schemaInScope(rel.Schema) {
 			continue // out-of-scope schema; drop
 		}

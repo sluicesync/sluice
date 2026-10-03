@@ -188,13 +188,16 @@ type twfbCell struct {
 	// source databases / schemas (--include-database); src.dsn is then a
 	// server-level DSN.
 	databases []string
+	// shard, when engaged, makes it a Shape A stream (--inject-shard-column)
+	// under --no-coordinate-live-ddl, the drained model.
+	shard ShardColumnSpec
 }
 
 // unforwarded reports whether the cell's stream forwards no source DDL, so
 // its boundaries go through the unforwarded-stream check
 // (schema_change_refuse.go) rather than the forward intercept.
 func (c twfbCell) unforwarded() bool {
-	return c.schemaChanges == "refuse" || len(c.databases) > 0
+	return c.schemaChanges == "refuse" || len(c.databases) > 0 || c.shard.Engaged()
 }
 
 func (c twfbCell) streamer() *Streamer {
@@ -223,6 +226,10 @@ func (c twfbCell) streamer() *Streamer {
 	}
 	if len(c.databases) > 0 {
 		s.DatabaseFilter = DatabaseFilter{Include: c.databases}
+	}
+	if c.shard.Engaged() {
+		s.InjectShardColumn = c.shard
+		s.NoCoordinateLiveDDL = true
 	}
 	return s
 }

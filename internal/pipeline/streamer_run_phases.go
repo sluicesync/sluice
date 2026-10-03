@@ -1193,7 +1193,7 @@ func (s *Streamer) phaseWireInterceptChain(applyCtx context.Context, changes <-c
 	// (schema_change_refuse.go).
 	if s.boundaryRouter == nil && !forwarding {
 		orderer, _ := s.Source.(ir.PositionOrderer)
-		filtered = interceptSchemaChangeRefuse(applyCtx, filtered, unforwardedBoundaryDeps{
+		filtered = interceptSchemaChangeRefuse(applyCtx, filtered, s.ambiguousAckDeps(unforwardedBoundaryDeps{
 			witnessFor:    s.unforwardedBoundaryWitnesses(witness),
 			normalizer:    snapshotNormalizer,
 			why:           s.unforwardedStreamReason(),
@@ -1205,12 +1205,11 @@ func (s *Streamer) phaseWireInterceptChain(applyCtx context.Context, changes <-c
 			// would read as a change on every one of them.
 			coldStart: s.unforwardedColdStartPrior,
 			orderer:   orderer,
-			// GC-44 fourth review: the replay exit of an AMBIGUOUS refusal.
-			// Read on every wiring (the retry loop re-delivers the same
-			// replay); the startup door has already consumed and cleared a
-			// value that named a recorded UNFORWARDED-SCHEMA-CHANGE.
-			acknowledged: s.AcceptUnforwardedSchemaChange,
-		}, &s.schemaSnapshotErr)
+			// The replay exit of an AMBIGUOUS refusal (acknowledged,
+			// resumedFrom, ambiguousAccepted) is filled by ambiguousAckDeps:
+			// bound to the position this attempt resumed from, consumed
+			// once a later one persists (schema_change_ambiguous_ack.go).
+		}), &s.schemaSnapshotErr)
 	}
 	// Clear the cold-start seed after handing it to BOTH intercepts so
 	// a streamer restart picks up a fresh seed in its next coldStart

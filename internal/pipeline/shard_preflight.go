@@ -128,6 +128,42 @@ func preflightShardConsolidation(
 	shardName string,
 	shardValue any,
 ) error {
+	return preflightShardConsolidationFor(ctx, schema, rw, shardName, shardValue, preflightModeMigrate)
+}
+
+// shardReattemptRecovery is the shard-value-present refusal's recovery for
+// a re-attempt of THIS shard, worded for the command that hit it. `migrate`
+// resumes with --resume. `sync` has no such flag: a stream that already
+// holds the shard resumes with a plain start and never reaches this
+// check, so a sync cold start that does is a deliberate re-copy
+// (--restart-from-scratch, or after its slot was lost) and must first
+// remove this shard's rows. Both say what --reset-target-data does under
+// Shape A: it drops the whole target table, every sibling shard's rows
+// with it (GC-44 F5 fifth review: the sync hint offered --resume, a
+// migrate flag, and --reset-target-data with no word about the siblings).
+func shardReattemptRecovery(mode preflightMode, table, shardName string, shardValue any) string {
+	wipe := "(c) --reset-target-data + --yes drops the whole table, EVERY shard's rows with it — use it only " +
+		"when this shard is the only one the target holds"
+	if mode == preflightModeSync {
+		return fmt.Sprintf("(b) a sync stream that already holds this shard resumes with a plain `sluice sync start` "+
+			"and the same --stream-id, which runs no cold start and no copy; a cold start that reaches this "+
+			"check is a re-copy, so first delete THIS shard's rows from every in-scope table "+
+			"(DELETE FROM %s WHERE %s = '%v'; the sibling shards' rows stay) and start it again; %s",
+			table, shardName, shardValue, wipe)
+	}
+	return "(b) if this is a re-attempt of THIS shard, use --resume to pick up where the previous run left off; " + wipe
+}
+
+// preflightShardConsolidationFor is [preflightShardConsolidation] with the
+// recovery worded for mode.
+func preflightShardConsolidationFor(
+	ctx context.Context,
+	schema *ir.Schema,
+	rw ir.RowWriter,
+	shardName string,
+	shardValue any,
+	mode preflightMode,
+) error {
 	if shardName == "" {
 		return nil
 	}
@@ -173,7 +209,7 @@ func preflightShardConsolidation(
 			return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf(
 				"%w: target table %q has rows with NULL %q — a previous non-shard-aware load contaminated the table; "+
 					"reconcile by either backfilling the discriminator (UPDATE %s SET %s = <shard_value> WHERE %s IS NULL) "+
-					"or by passing --reset-target-data + --yes to wipe the table and start clean. "+
+					"or by passing --reset-target-data + --yes to wipe the table (every shard's rows) and start clean. "+
 					"Shape A (ADR-0048) refuses to extend a populated-target whose existing rows lack the discriminator",
 				errShardConsolidationRefused, table.Name, shardName, table.Name, shardName, shardName,
 			))
@@ -191,9 +227,9 @@ func preflightShardConsolidation(
 				"%w: target table %q already has rows with %s = %v — this shard is already loaded "+
 					"or the operator reused a shard value (cross-shard collision risk). "+
 					"Recovery: (a) pick a fresh VALUE for --inject-shard-column NAME=VALUE if a sibling shard "+
-					"already used it; (b) if this is a re-attempt of THIS shard, use --resume to pick up "+
-					"where the previous run left off; (c) --reset-target-data + --yes to wipe and restart",
+					"already used it; %s",
 				errShardConsolidationRefused, table.Name, shardName, shardValue,
+				shardReattemptRecovery(mode, table.Name, shardName, shardValue),
 			))
 		}
 		// Check (3): composite PK leads with the discriminator.

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"reflect"
 
+	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"sluicesync.dev/sluice/internal/ir"
@@ -64,6 +65,12 @@ type relationCacheEntry struct {
 	//   - NOTHING: no old tuple is ever emitted; the upstream emit paths
 	//     reject before this is consulted.
 	IdentityKeyCols []string
+
+	// writtenInTxn is the commit LSN (BeginMessage.FinalLSN) of the last
+	// transaction that carried a row change for this relation in this
+	// reader session; zero when none has. Set by the emit paths, read by
+	// [withPreAlterReplayWedge].
+	writtenInTxn pglogrepl.LSN
 }
 
 // relationColumn carries the resolved IR view of one column. The raw
@@ -671,14 +678,49 @@ func intervalTypmod(typmod int32) (rangeBits, precision int32) {
 // wording stays consistent across RENAME / DROP COLUMN / ALTER TYPE /
 // DROP+CREATE call sites and is straightforward for operators to grep
 // for. The "drained model" workflow is the same one ADR-0058's existing
-// non-ADD-COLUMN refusal directs operators to.
+// non-ADD-COLUMN refusal directs operators to. It no longer ends with the
+// deprecated `--forward-schema-add-column` opt-in (GC-44 F5 fifth review):
+// a pure ADD COLUMN never reaches this refusal, and forwarding has been the
+// default since v0.99.45. The drained model does NOT recover a transaction
+// that wrote the table before its DDL; that refusal carries
+// [preAlterReplayWedgeMarker] and its own recovery
+// ([withPreAlterReplayWedge]).
 const schemaRaceRecoveryHint = "sluice does not support this DDL shape mid-stream. Drained-model recovery: " +
 	"(1) `sluice sync stop --wait` on every shard, " +
 	"(2) apply the schema change via your migration tool on source AND target, " +
 	"(3) `sluice sync start` with the SAME --stream-id to continue from the last applied LSN " +
 	"(there is no resume flag: a restart looks up the persisted position and skips the " +
-	"snapshot + bulk-copy phase). " +
-	"For ADD COLUMN only, opt-in to live forwarding via --forward-schema-add-column (ADR-0058)."
+	"snapshot + bulk-copy phase)."
+
+// preAlterReplayWedgeMarker is the grep-stable word a schema-race refusal
+// carries when the refused change came inside a transaction that had
+// already written the table (GC-44 F24).
+const preAlterReplayWedgeMarker = ir.PreAlterReplayWedgeMarker
+
+// withPreAlterReplayWedge names the pre-ALTER replay wedge on a schema-race
+// refusal err, where prior (the relation cached before the refused one)
+// carried a row change in the transaction being decoded (commit LSN txn).
+// Such a transaction wrote the table, then changed it: every restart
+// re-delivers it from its start, caches the pre-change relation first and
+// refuses the post-change one here again, whatever the target holds — so
+// the drained-model hint the refusal ends with does not pass it, and the
+// operator needs the recovery that does. Anything else (no prior, a prior
+// last written by an earlier transaction, no transaction open) returns err
+// unchanged: a change in its own transaction recovers with the drained
+// model (TestStreamer_PGToPG_DrainedModelRecovery).
+func withPreAlterReplayWedge(err error, prior *relationCacheEntry, txn pglogrepl.LSN) error {
+	if err == nil || prior == nil || txn == 0 || prior.writtenInTxn != txn {
+		return err
+	}
+	return fmt.Errorf("%w %s: this transaction wrote %s.%s before this change, so every restart re-delivers "+
+		"it from its start and refuses here again whatever the target holds — the drained model above does not "+
+		"pass it (GC-44 F24). Recovery, by stream and change (docs/operator/cdc-streaming.md, \"The pre-ALTER "+
+		"replay wedge\"): a column type widening on a single-database stream passes with one start under "+
+		"--schema-changes=forward; otherwise drop the stream's replication slot (`sluice slot drop <slot> --yes`) "+
+		"and start once with --restart-from-scratch — under --inject-shard-column, first delete this shard's "+
+		"rows from the target tables, because that re-copy refuses while they are there",
+		err, preAlterReplayWedgeMarker, prior.Schema, prior.Name)
+}
 
 // projectRelation builds an [ir.Table] from a relationCacheEntry —
 // the ADR-0049 Chunk B3 boundary projector. The entry is ALREADY

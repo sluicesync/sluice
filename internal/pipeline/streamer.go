@@ -1529,6 +1529,10 @@ type Streamer struct {
 	// dispatchErr classification path.
 	schemaSnapshotErr atomic.Pointer[error]
 
+	// ambiguousAck binds an AMBIGUOUS-SCHEMA-BOUNDARY acknowledgement to
+	// the occurrence it was given for ([Streamer.bindAmbiguousAcknowledgement]).
+	ambiguousAck ambiguousAckBinding
+
 	// whereFilter is the compiled ADR-0173 Phase 2 client-side row filter,
 	// built by [preflightRowFilters] from [RowFilters] at sync-start and
 	// consumed by the CDC-leg [interceptWhereFilter]. Nil when no --where is
@@ -2125,6 +2129,10 @@ func (s *Streamer) runOnce(ctx context.Context) (err error) {
 	if err := s.phaseRefuseRecordedUnforwardedChange(ctx, applier, streamID); err != nil {
 		return err
 	}
+	// An AMBIGUOUS-SCHEMA-BOUNDARY acknowledgement is bound to the
+	// position this attempt resumes from, and expires once a later one
+	// has persisted (GC-44 F5 fifth review).
+	s.bindAmbiguousAcknowledgement(ctx, persisted, found)
 
 	// Slot-ack-after-apply (Bug 15, ADR-0020, GC-41) needs nothing here:
 	// the stream sites below capture a slot-keeping reader and the

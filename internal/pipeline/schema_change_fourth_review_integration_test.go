@@ -274,6 +274,27 @@ func TestStreamer_RefuseCrashReplayAddColumn_PostgresToPostgres(t *testing.T) {
 		t.Fatalf("the restart after the acknowledged run did not resume (stream: %v)", run.stop(t))
 	}
 	_ = run.stop(t)
+
+	// GC-44 F5 fifth review, Finding 1: the acknowledgement left in the unit
+	// file. While the stream is stopped the source really drops the column —
+	// the same table, the same refused column, the same detail as the replay
+	// the fingerprint was printed for. The stream has persisted past that
+	// replay, so the fingerprint (bound to the position it resumed from) no
+	// longer names this boundary: it refuses, and the target keeps column a.
+	// Before the binding this start accepted the DROP silently.
+	cell.src.exec(t, "ALTER TABLE t_ca DROP COLUMN a; INSERT INTO t_ca VALUES (6, 6)")
+	stale := cell.streamer()
+	stale.AcceptUnforwardedSchemaChange = m[1]
+	run = startTWFBRun(stale)
+	err = waitRefused(t, run, 90*time.Second)
+	_ = run.stop(t)
+	if err == nil || !strings.Contains(err.Error(), ambiguousBoundaryMarker) || !strings.Contains(err.Error(), "does not name this boundary") {
+		t.Fatalf("[stale acknowledgement] a genuine DROP COLUMN after the stream moved past the replay was not refused "+
+			"(err %v; target row 6 present: %v)", err, cell.tgt.hasRow(t, table, 6))
+	}
+	if cell.tgt.hasRow(t, table, 6) {
+		t.Error("[stale acknowledgement] row 6, written after the genuine DROP, landed")
+	}
 }
 
 // TestStreamer_RefuseCrashReplayWiden_PostgresToPostgres is the reviewer's

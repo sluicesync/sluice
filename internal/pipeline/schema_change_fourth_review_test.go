@@ -279,7 +279,7 @@ func TestInterceptSchemaChangeRefuse_AmbiguousBoundary(t *testing.T) {
 			refused: []witnessColumnDiff{{"w", "(dropped on the source)", "Text"}, {"v", "Text", "(absent)"}},
 			onPrior: 1, ambiguous: true,
 		}
-		fp := newAmbiguousBoundary("src.w", renderWitnessDiffs(j.refused), "", false).fingerprint
+		fp := newAmbiguousBoundary("src.w", renderWitnessDiffs(j.refused), unforwardedBoundaryDeps{}, false).fingerprint
 		err = j.settle(context.Background(), "src.w", unforwardedBoundaryDeps{acknowledged: fp})
 		if !errors.Is(err, ir.ErrSchemaChangeRefused) {
 			t.Fatalf("a non-acknowledgeable boundary was accepted on its own fingerprint (err %v)", err)
