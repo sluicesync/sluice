@@ -487,7 +487,7 @@ compared by presence only (below).
 | target-only columns only (a DROP made while stopped) | WARN, accept | WARN, accept |
 | snapshot-only columns only | forward ADD COLUMN + backfill | route through the lease (ADD COLUMN + this shard's backfill) |
 | exactly one shared column differs within an allowlisted family and the TARGET is narrower (temporal precision with the zone kind held, decimal on both axes, char/varchar length, float width, int width with the sign held) | forward ALTER COLUMN TYPE (zone door uses the target's type as the before) | route through the lease |
-| the same, but the TARGET is wider — or, across families, the target's type holds every value of the source's (`TEXT` ⊇ `VARCHAR`/`CHAR`, `VARCHAR(m ≥ n)` ⊇ `CHAR(n)`, a wide enough `NUMERIC` ⊇ an integer, a wider signed ⊇ an unsigned integer, `ENUM`/`SET` label supersets; never `jsonb` ⊇ `json`) | WARN, keep the target's type | WARN, keep |
+| the same, but the TARGET is wider — or, across families, the target's type holds every value of the source's (`TEXT` ⊇ `VARCHAR`, a wide enough `NUMERIC` with a non-negative scale ⊇ an integer, a wider signed ⊇ an unsigned integer, `ENUM` label supersets, `SET` label supersets in the same order; never `CHAR` across families — pgoutput sends `bpchar` padded while the target's existing rows were cast unpadded — and never `jsonb` ⊇ `json`; the same `VARCHAR` ⊆ `TEXT` holds for array elements, `CHAR[]` does not (v0.156.10 reviews, GC-44 F25)) | WARN, keep the target's type | WARN, keep |
 | anything else (possible rename, >1 change, across families, a decimal wider on one axis and narrower on the other) | refuse `RESUME-SCHEMA-DIVERGENCE` | refuse |
 
 **Direction is load-bearing (review, before the first tag).** The first

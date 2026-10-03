@@ -2184,13 +2184,16 @@ func (r *CDCReader) send(ctx context.Context, out chan<- ir.Change, c ir.Change)
 // would bloat the history with no-op versions and break DP-2's
 // retention ∝ DDL-count assumption).
 //
-// The anchor is the RelationMessage's OWN WAL position (xld.WALStart,
-// passed as relLSN) — captured at detection, BEFORE the first
-// post-DDL row's LSN (locked decision #4c: a replayed event between
-// the Relation and the first post-DDL row must resolve to the
-// post-DDL schema; the Relation always precedes its rows in WAL so
-// WALStart ≤ every subsequent row LSN and the PG LSN-≤ orderer
-// resolves correctly).
+// The anchor is the XLogData WALStart the RelationMessage arrived in
+// (xld.WALStart, passed as relLSN). Locked decision #4c intended it as
+// the Relation's own position, preceding its rows, so a replayed event
+// between the Relation and the first post-DDL row resolves to the
+// post-DDL schema. MEASURED otherwise (GC-44 F23, postgres:16, 2026-10-03):
+// the walsender sends a Relation message at WALStart 0/0, so every
+// version is anchored at 0/0, the history keeps one shape per table and
+// cannot order a replay against a change. The pipeline's schema checks
+// treat a PG anchor as unorderable for exactly this reason
+// (AMBIGUOUS-SCHEMA-BOUNDARY); a real anchor is the F23 fix.
 //
 // Out-of-scope schemas are skipped through the same [CDCReader.schemaInScope]
 // the row emitters consult: a version for a relation whose rows are never
