@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
@@ -279,6 +280,17 @@ func (w *idempotentRecordingRowWriter) WriteRows(_ context.Context, table *ir.Ta
 		w.engine.recordRow(table.Name, r)
 	}
 	return nil
+}
+
+// IsTableEmpty and ProbeReplayKey satisfy the F-E1 restore re-run door,
+// which refuses a writer without them: this fake target starts empty and
+// carries the recorded key.
+func (w *idempotentRecordingRowWriter) IsTableEmpty(context.Context, *ir.Table) (bool, error) {
+	return true, nil
+}
+
+func (w *idempotentRecordingRowWriter) ProbeReplayKey(_ context.Context, table *ir.Table) (exists, keyed bool, err error) {
+	return true, irbackup.TableReplayIdempotent(table), nil
 }
 
 func (w *idempotentRecordingRowWriter) WriteRowsIdempotent(_ context.Context, table *ir.Table, rows <-chan ir.Row) error {

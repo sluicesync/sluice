@@ -192,7 +192,11 @@ func runReadoutLivePanel(
 	// The drain-and-stop side effect the panel returns on q/ctrl+c: cancel
 	// the run context. For these loops a cancel IS the graceful drain (each
 	// commits its in-flight unit before returning), so there is no separate
-	// RequestStop to issue — unlike `sync start`'s streamer.
+	// RequestStop to issue — unlike `sync start`'s streamer. The
+	// `sync from-backup` broker is the exception (audit F-E1): it does
+	// NOT commit its in-flight incremental or cold-start restore, and
+	// instead returns a BROKER-*-PARTIAL error that does not unwrap to
+	// context.Canceled, so the panel reports it as a failure.
 	var stopCmd tea.Cmd = func() tea.Msg {
 		cancel()
 		return progress.NewStopResultMsg(nil)

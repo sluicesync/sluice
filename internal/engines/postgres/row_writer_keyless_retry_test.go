@@ -157,6 +157,19 @@ func TestPGReplayKeyPredicatesAgree(t *testing.T) {
 		{"not-null unique, no PK", uniqueOn("t_uniq", false, "")},
 		{"nullable unique, no PK", uniqueOn("t_null_uniq", true, "")},
 		{"expression unique only", uniqueOn("t_expr", false, "(id * 2)")},
+		// The F-E1 review's partial-unique case. Before the fix the
+		// predicates DISAGREED here (TableReplayIdempotent accepted it,
+		// this package's picker did not), so copyChunkWithRetry's B-9 gate
+		// would replay an ambiguous COPY chunk into a partial-unique-only
+		// table, duplicating every row outside the predicate.
+		{"partial unique only", &ir.Table{
+			Name:    "t_partial",
+			Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 8}}},
+			Indexes: []*ir.Index{{
+				Name: "uq_live", Unique: true, Predicate: "id > 0",
+				Columns: []ir.IndexColumn{{Column: "id"}},
+			}},
+		}},
 		{"empty PK index", &ir.Table{
 			Name:       "t_empty_pk",
 			Columns:    []*ir.Column{{Name: "id", Type: ir.Integer{Width: 8}}},

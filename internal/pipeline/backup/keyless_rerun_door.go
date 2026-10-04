@@ -18,28 +18,51 @@ import (
 // refusal).
 //
 // A restore writes rows it does not check for: the full's bulk load is a
-// plain COPY / LOAD DATA, and an incremental's INSERTs upsert only where the
-// target table has a key. Re-running a restore that failed partway onto the
-// same target therefore re-writes everything the earlier attempt wrote. On a
-// keyed table that is loud (the load collides on the key and fails). On a
-// keyless table it is silent: every row lands twice, at exit 0 (measured on
-// Postgres at 2,001 rows for 1,001 in a chain restore).
+// plain COPY / LOAD DATA / multi-row INSERT, and an incremental's INSERTs
+// upsert only where the target table has a key. Re-running a restore that
+// failed partway onto the same target therefore re-writes everything the
+// earlier attempt wrote. On a KEYED table that is loud on every engine,
+// though by two mechanisms:
+//
+//   - Postgres COPY, SQLite's INSERT and MySQL's batched-INSERT fallback
+//     collide on the key and FAIL.
+//   - MySQL's LOAD DATA LOCAL turns the duplicate-key error into a warning
+//     and SKIPS the row, and the writer's post-load check then refuses the
+//     skip as LOAD-DATA-ROWS-SKIPPED (load_data_writer.go,
+//     reportLoadDataWarnings). Measured on MySQL 8 with local_infile=ON: a
+//     restore onto a target holding a different row under the same key
+//     exited non-zero naming warning 1062. The one place it tolerates a 1062
+//     is a segment REPLAY after a transient, where it cannot tell a stale
+//     target row from one the prior attempt landed (filed: audit backlog
+//     F-E1-MYSQL-REPLAY-DUP-ATTRIBUTION).
+//
+// On a keyless table — or one keyed only on a column the backup's rows do
+// not carry, such as a serial or defaulted surrogate — every row lands
+// twice, at exit 0 (measured on Postgres at 2,001 rows for 1,001 in a chain
+// restore).
 //
 // The door is deliberately narrower than "refuse a non-empty target", which
 // is the obvious rule and the wrong one. Restoring into a target that already
 // holds OTHER data — tables out of the restore's scope, or empty tables an
-// operator pre-created — is an ordinary use, and a keyed in-scope table with
-// rows already fails loudly without help. The silent class is exactly "an
-// in-scope keyless table that already holds rows", so that is all it refuses.
-// `restore` has no --reset-target-data, so there is no override flag: the
-// remedy is to empty or exclude the named tables.
+// operator pre-created — is an ordinary use. The duplicating class is exactly
+// "an in-scope table without a collidable key that already holds rows", so
+// that is all it refuses. `restore` has no --reset-target-data, so there is
+// no override flag: the remedy is to empty or exclude tables.
 //
 // The independent expected value is the TARGET's own row count — the earlier
 // attempt's rows are on the target, not in any manifest.
 
 // restoreKeylessHint is the remedy riding SLUICE-E-RESTORE-KEYLESS-TABLE-NOT-EMPTY.
-const restoreKeylessHint = "empty the named target tables (TRUNCATE) or drop them and re-run the restore, or re-run " +
-	"with --exclude-table for each; if those rows were loaded deliberately, decide first whether the restore should add to them"
+//
+// After a restore that failed partway, the remedy is EVERY in-scope table
+// the failed attempt populated, not just the named ones: a keyed table the
+// attempt loaded fails the re-run's bulk load on its key, on every engine
+// (see the file comment), so emptying only the keyless tables trades this
+// refusal for that failure.
+const restoreKeylessHint = "if an earlier restore of this backup failed partway, empty (TRUNCATE) or drop EVERY table it " +
+	"loaded — not only the named ones, since a keyed table it loaded fails the re-run on its key — and re-run the " +
+	"restore; to leave the named tables as they are, re-run with --exclude-table for each; if those rows were loaded " +
+	"deliberately, decide first whether the restore should add to them"
 
 // refuseKeylessPopulatedTargets refuses when any of tables is keyless (on its
 // recorded definition or on the target) AND the target already holds rows in

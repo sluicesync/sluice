@@ -229,6 +229,31 @@ func TestReplayKeyPredicatesAgree(t *testing.T) {
 	// Anti-vacuity floor: a matrix that only ever produced one answer
 	// would pass this test while proving nothing about agreement.
 	sawTrue, sawFalse := false, false
+	t.Run("partial unique only (the one deliberate divergence)", func(t *testing.T) {
+		// irbackup.TableReplayIdempotent excludes a PARTIAL unique index
+		// (audit F-E1 review: a replayed row outside the predicate collides
+		// with nothing). This engine's picker does not test Predicate, so
+		// the two disagree here, in the conservative direction only. The
+		// divergence is unreachable on a MySQL target, and this binds that
+		// premise rather than asserting it: the DDL emitter refuses a
+		// partial UNIQUE before any table — and so any write core — exists.
+		partial := &ir.Table{
+			Name:    "t_partial",
+			Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 8}, Nullable: false}},
+			Indexes: []*ir.Index{{
+				Name: "uq_live", Unique: true, Predicate: "id > 0",
+				Columns: []ir.IndexColumn{{Column: "id"}},
+			}},
+		}
+		if irbackup.TableReplayIdempotent(partial) {
+			t.Error("irbackup.TableReplayIdempotent accepts a partial-unique-only table as replay-safe")
+		}
+		if checkIndexPredicate(partial.Indexes[0], "t_partial") == nil {
+			t.Fatal("the MySQL emitter no longer refuses a partial UNIQUE index, so the picker's acceptance of one " +
+				"is now reachable; teach pickNonNullUniqueIndex to skip it (as the Postgres picker does) and " +
+				"move this case into the agreement matrix")
+		}
+	})
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			replay := irbackup.TableReplayIdempotent(tc.table)

@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // restoreRecorderEngine is a fake [ir.Engine] for restore tests: a
@@ -178,6 +179,22 @@ func (w *restoreRecordingRowWriter) WriteRows(_ context.Context, table *ir.Table
 
 	w.engine.recordPhase("WriteRows:" + table.Name)
 	return nil
+}
+
+// IsTableEmpty implements [ir.TableEmptyChecker] for the F-E1 restore re-run
+// door (which refuses a writer without it): a table is empty until rows
+// were recorded for it.
+func (w *restoreRecordingRowWriter) IsTableEmpty(_ context.Context, table *ir.Table) (bool, error) {
+	w.engine.mu.Lock()
+	defer w.engine.mu.Unlock()
+	return len(w.engine.rows[table.Name]) == 0, nil
+}
+
+// ProbeReplayKey implements [ir.ReplayKeyProber]: the recorder's "target"
+// is created from the recorded schema, so it carries exactly the recorded
+// key, and every recorded column is supplied.
+func (w *restoreRecordingRowWriter) ProbeReplayKey(_ context.Context, table *ir.Table) (exists, keyed bool, err error) {
+	return true, irbackup.TableReplayIdempotent(table), nil
 }
 
 // SetReparentObserver implements [ir.ReparentObserverSetter] — the engine

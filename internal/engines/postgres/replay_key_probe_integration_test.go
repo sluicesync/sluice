@@ -37,6 +37,12 @@ const (
 // applier would have failed on it anyway. Rows are chosen to reach the
 // silent outcome wherever one exists (a NULL in a nullable key part, a value
 // outside a partial index's predicate).
+//
+// The probe is handed the RECORDED table — the row's own columns plus "v" —
+// because whether a key is SUPPLIED by the replayed rows is half of the
+// judgment (audit F-E1 review, HIGH 1): a target re-keyed on a surrogate the
+// rows never carry has a key and an ON CONFLICT clause, and still
+// duplicates. The surrogate rows and the two-keys rows below are that class.
 func TestRowWriter_ProbeReplayKey_ShapeMatrix(t *testing.T) {
 	dsn, cleanup := startPostgresForApplier(t)
 	defer cleanup()
@@ -44,24 +50,44 @@ func TestRowWriter_ProbeReplayKey_ShapeMatrix(t *testing.T) {
 	defer cancel()
 
 	cases := []struct {
-		table, ddl  string
-		row         ir.Row
-		wantExists  bool
-		wantKeyed   bool
-		wantRefusal bool // the applier's own deferrable-key refusal
-		outcome     replayOutcome
+		table, ddl   string
+		row          ir.Row
+		wantExists   bool
+		wantKeyed    bool
+		wantRefusal  bool // the applier's own deferrable-key refusal
+		outcome      replayOutcome
+		conservative bool // keyed=false although the re-apply converges
 	}{
-		{table: "absent"},
-		{"no_key", "CREATE TABLE no_key (id int NOT NULL, v text)", ir.Row{"id": int64(1)}, true, false, false, replayDuplicates},
-		{"pk", "CREATE TABLE pk (id int PRIMARY KEY, v text)", ir.Row{"id": int64(1)}, true, true, false, replayConverges},
-		{"nn_unique", "CREATE TABLE nn_unique (id int NOT NULL UNIQUE, v text)", ir.Row{"id": int64(1)}, true, true, false, replayConverges},
-		{"nn_unique_composite", "CREATE TABLE nn_unique_composite (a int NOT NULL, b int NOT NULL, v text, UNIQUE (a, b))", ir.Row{"a": int64(1), "b": int64(1)}, true, true, false, replayConverges},
-		{"nullable_unique", "CREATE TABLE nullable_unique (id int UNIQUE, v text)", ir.Row{"id": nil}, true, false, false, replayDuplicates},
-		{"composite_one_nullable", "CREATE TABLE composite_one_nullable (a int NOT NULL, b int, v text, UNIQUE (a, b))", ir.Row{"a": int64(1), "b": nil}, true, false, false, replayDuplicates},
-		{"partial_unique", "CREATE TABLE partial_unique (id int NOT NULL, v text); CREATE UNIQUE INDEX partial_unique_ix ON partial_unique (id) WHERE id > 0", ir.Row{"id": int64(-1)}, true, false, false, replayDuplicates},
-		{"expression_unique", "CREATE TABLE expression_unique (id int NOT NULL, v text); CREATE UNIQUE INDEX expression_unique_ix ON expression_unique ((id * 2))", ir.Row{"id": int64(1)}, true, false, false, replayLoud},
-		{table: "deferrable_pk_only", ddl: "CREATE TABLE deferrable_pk_only (id int PRIMARY KEY DEFERRABLE, v text)", wantExists: true, wantRefusal: true},
-		{"deferrable_pk_plus_nn_unique", "CREATE TABLE deferrable_pk_plus_nn_unique (id int PRIMARY KEY DEFERRABLE, u int NOT NULL UNIQUE, v text)", ir.Row{"id": int64(1), "u": int64(1)}, true, true, false, replayConverges},
+		{table: "absent", row: ir.Row{"id": int64(1)}},
+		{"no_key", "CREATE TABLE no_key (id int NOT NULL, v text)", ir.Row{"id": int64(1)}, true, false, false, replayDuplicates, false},
+		{"pk", "CREATE TABLE pk (id int PRIMARY KEY, v text)", ir.Row{"id": int64(1)}, true, true, false, replayConverges, false},
+		{"nn_unique", "CREATE TABLE nn_unique (id int NOT NULL UNIQUE, v text)", ir.Row{"id": int64(1)}, true, true, false, replayConverges, false},
+		{"nn_unique_composite", "CREATE TABLE nn_unique_composite (a int NOT NULL, b int NOT NULL, v text, UNIQUE (a, b))", ir.Row{"a": int64(1), "b": int64(1)}, true, true, false, replayConverges, false},
+		{"nullable_unique", "CREATE TABLE nullable_unique (id int UNIQUE, v text)", ir.Row{"id": nil}, true, false, false, replayDuplicates, false},
+		{"composite_one_nullable", "CREATE TABLE composite_one_nullable (a int NOT NULL, b int, v text, UNIQUE (a, b))", ir.Row{"a": int64(1), "b": nil}, true, false, false, replayDuplicates, false},
+		{"partial_unique", "CREATE TABLE partial_unique (id int NOT NULL, v text); CREATE UNIQUE INDEX partial_unique_ix ON partial_unique (id) WHERE id > 0", ir.Row{"id": int64(-1)}, true, false, false, replayDuplicates, false},
+		{"expression_unique", "CREATE TABLE expression_unique (id int NOT NULL, v text); CREATE UNIQUE INDEX expression_unique_ix ON expression_unique ((id * 2))", ir.Row{"id": int64(1)}, true, false, false, replayLoud, false},
+		{table: "deferrable_pk_only", ddl: "CREATE TABLE deferrable_pk_only (id int PRIMARY KEY DEFERRABLE, v text)", row: ir.Row{"id": int64(1)}, wantExists: true, wantRefusal: true},
+		{"deferrable_pk_plus_nn_unique", "CREATE TABLE deferrable_pk_plus_nn_unique (id int PRIMARY KEY DEFERRABLE, u int NOT NULL UNIQUE, v text)", ir.Row{"id": int64(1), "u": int64(1)}, true, true, false, replayConverges, false},
+		// HIGH 1: keyed on a surrogate the replayed rows never carry. The
+		// applier renders ON CONFLICT (sid); every re-applied row draws a
+		// fresh sid and collides with nothing.
+		{"surrogate_bigserial_pk", "CREATE TABLE surrogate_bigserial_pk (sid bigserial PRIMARY KEY, id int NOT NULL, v text)", ir.Row{"id": int64(1)}, true, false, false, replayDuplicates, false},
+		{"surrogate_identity_pk", "CREATE TABLE surrogate_identity_pk (sid bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, id int NOT NULL, v text)", ir.Row{"id": int64(1)}, true, false, false, replayDuplicates, false},
+		{"surrogate_uuid_default_pk", "CREATE TABLE surrogate_uuid_default_pk (sid uuid DEFAULT gen_random_uuid() PRIMARY KEY, id int NOT NULL, v text)", ir.Row{"id": int64(1)}, true, false, false, replayDuplicates, false},
+		{"surrogate_nn_unique_only", "CREATE TABLE surrogate_nn_unique_only (sid bigserial NOT NULL UNIQUE, id int NOT NULL, v text)", ir.Row{"id": int64(1)}, true, false, false, replayDuplicates, false},
+		// Two keys, one supplied. The arbiter loadConflictKey picks is the
+		// one judged: the PK when there is one, and among UNIQUE indexes the
+		// one with fewest columns. When it is the UNSUPPLIED one, the
+		// supplied index still collides — as a 23505 the broker can never
+		// get past — so the probe refuses it up front (loud either way).
+		{"two_keys_pk_unsupplied", "CREATE TABLE two_keys_pk_unsupplied (sid bigserial PRIMARY KEY, id int NOT NULL UNIQUE, v text)", ir.Row{"id": int64(1)}, true, false, false, replayLoud, false},
+		{"two_keys_pk_supplied", "CREATE TABLE two_keys_pk_supplied (id int PRIMARY KEY, u uuid NOT NULL DEFAULT gen_random_uuid() UNIQUE, v text)", ir.Row{"id": int64(1)}, true, true, false, replayConverges, false},
+		{"two_uniques_arbiter_unsupplied", "CREATE TABLE two_uniques_arbiter_unsupplied (s bigserial NOT NULL, a int NOT NULL, b int NOT NULL, v text, CONSTRAINT z_ab UNIQUE (a, b), CONSTRAINT a_s UNIQUE (s))", ir.Row{"a": int64(1), "b": int64(1)}, true, false, false, replayLoud, false},
+		{"two_uniques_arbiter_supplied", "CREATE TABLE two_uniques_arbiter_supplied (s bigserial NOT NULL, a int NOT NULL, v text, CONSTRAINT z_s UNIQUE (s), CONSTRAINT a_a UNIQUE (a))", ir.Row{"a": int64(1)}, true, true, false, replayConverges, false},
+		// A generated arbiter derived only from supplied columns converges,
+		// but the probe cannot see what its expression reads: conservative.
+		{"generated_pk", "CREATE TABLE generated_pk (id int NOT NULL, k int GENERATED ALWAYS AS (id * 2) STORED PRIMARY KEY, v text)", ir.Row{"id": int64(1)}, true, false, false, replayConverges, true},
 	}
 	for _, c := range cases {
 		if c.ddl != "" {
@@ -86,7 +112,7 @@ func TestRowWriter_ProbeReplayKey_ShapeMatrix(t *testing.T) {
 	sawKeyed, sawSilent := false, false
 	for _, c := range cases {
 		t.Run(c.table, func(t *testing.T) {
-			exists, keyed, err := prober.ProbeReplayKey(ctx, &ir.Table{Name: c.table})
+			exists, keyed, err := prober.ProbeReplayKey(ctx, replayRecordedTable(c.table, c.row))
 			if c.wantRefusal {
 				if ce, ok := sluicecode.FromError(err); !ok || ce.Code != sluicecode.CodeTargetDeferrableKey {
 					t.Fatalf("ProbeReplayKey = (%v, %v, %v); want the applier's %s refusal",
@@ -121,8 +147,11 @@ func TestRowWriter_ProbeReplayKey_ShapeMatrix(t *testing.T) {
 			if got != c.outcome {
 				t.Fatalf("re-applying one INSERT %s; the case declares %s — the ground truth moved", got, c.outcome)
 			}
-			if keyed != (got == replayConverges) {
+			if !c.conservative && keyed != (got == replayConverges) {
 				t.Errorf("probe says keyed=%v but a re-apply %s", keyed, got)
+			}
+			if got == replayDuplicates && keyed {
+				t.Error("a silently duplicating table was judged keyed")
 			}
 			sawKeyed = sawKeyed || keyed
 			sawSilent = sawSilent || got == replayDuplicates
@@ -131,4 +160,15 @@ func TestRowWriter_ProbeReplayKey_ShapeMatrix(t *testing.T) {
 	if !sawKeyed || !sawSilent {
 		t.Fatalf("anti-vacuity: the matrix must reach a keyed table and a silently duplicating one (keyed=%v, silent=%v)", sawKeyed, sawSilent)
 	}
+}
+
+// replayRecordedTable is the recorded (backup) definition a case's replayed
+// rows come from: exactly the row's columns plus "v", each nullable when the
+// case's value is NULL. The probe's supplied-column set is derived from it.
+func replayRecordedTable(name string, row ir.Row) *ir.Table {
+	t := &ir.Table{Name: name, Columns: []*ir.Column{{Name: "v", Type: ir.Text{}, Nullable: true}}}
+	for col, val := range row {
+		t.Columns = append(t.Columns, &ir.Column{Name: col, Type: ir.Integer{Width: 64}, Nullable: val == nil})
+	}
+	return t
 }

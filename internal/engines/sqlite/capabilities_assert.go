@@ -86,4 +86,15 @@ var (
 	_ ir.MaxBufferBytesSetter = (*RowWriter)(nil)
 	_ ir.TableDropper         = (*RowWriter)(nil)
 	_ ir.TableTruncator       = (*RowWriter)(nil)
+
+	// RowWriter: the F-E1 replay-duplication doors. The restore re-run door
+	// REFUSES a writer lacking either surface rather than skipping it, so
+	// losing one turns every restore onto a SQLite target into a refusal.
+	// Before they existed here that door was silently open on SQLite: a
+	// keyless table restored twice held 200 rows for 100 (audit F-E1
+	// review). Implementing TableEmptyChecker also arms the cold-start,
+	// resume and add-table pre-flights for a SQLite target, which skip a
+	// writer without it.
+	_ ir.TableEmptyChecker = (*RowWriter)(nil)
+	_ ir.ReplayKeyProber   = (*RowWriter)(nil)
 )

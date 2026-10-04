@@ -46,6 +46,7 @@ var txFuncClass = map[string]string{
 	"ChangeApplier.sendBatchUnderDeadline":      "neutral",
 	"ChangeApplier.conflictKeyFor":              "neutral",
 	"loadConflictKey":                           "neutral",
+	"loadGeneratedColumns":                      "neutral",
 	"loadPrimaryKey":                            "neutral",
 	"pgxBatchTx.queue":                          "neutral", // the one enqueue every statement takes, in call order
 	"pgxBatchTx.Rollback":                       "neutral",

@@ -103,6 +103,51 @@ func TestTableReplayIdempotent(t *testing.T) {
 			false,
 		},
 		{
+			// A PARTIAL unique index constrains only the rows its predicate
+			// selects; a replayed row outside it collides with nothing
+			// (measured on Postgres: TestRowWriter_ProbeReplayKey_ShapeMatrix
+			// "partial_unique" duplicates).
+			"partial unique index ineligible",
+			&ir.Table{
+				Name:    "t",
+				Columns: []*ir.Column{{Name: "id"}},
+				Indexes: []*ir.Index{{Name: "uq", Unique: true, Predicate: "id > 0", Columns: []ir.IndexColumn{{Column: "id"}}}},
+			},
+			false,
+		},
+		{
+			// A whitespace-only predicate is no predicate.
+			"blank predicate is a full index",
+			&ir.Table{
+				Name:    "t",
+				Columns: []*ir.Column{{Name: "id"}},
+				Indexes: []*ir.Index{{Name: "uq", Unique: true, Predicate: "  ", Columns: []ir.IndexColumn{{Column: "id"}}}},
+			},
+			true,
+		},
+		{
+			// DEFERRABLE stays eligible on the recorded side: every target
+			// lands a recorded deferrable UNIQUE as an immediate one, and a
+			// PG target that keeps a deferrable PK refuses loudly at the
+			// applier (see the function doc).
+			"deferrable unique stays eligible",
+			&ir.Table{
+				Name:    "t",
+				Columns: []*ir.Column{{Name: "id"}},
+				Indexes: []*ir.Index{{Name: "uq", Unique: true, ConstraintBacked: true, ConstraintDeferrable: true, Columns: []ir.IndexColumn{{Column: "id"}}}},
+			},
+			true,
+		},
+		{
+			"deferrable primary key stays eligible",
+			&ir.Table{
+				Name:       "t",
+				Columns:    []*ir.Column{{Name: "id"}},
+				PrimaryKey: &ir.Index{ConstraintDeferrable: true, Columns: []ir.IndexColumn{{Column: "id"}}},
+			},
+			true,
+		},
+		{
 			// Mixed: an ineligible nullable UNIQUE plus an eligible one —
 			// any eligible index qualifies.
 			"one eligible among ineligible indexes",
@@ -124,5 +169,24 @@ func TestTableReplayIdempotent(t *testing.T) {
 				t.Errorf("TableReplayIdempotent = %v; want %v", got, c.want)
 			}
 		})
+	}
+}
+
+// TestReplaySuppliedColumns pins the supplied side of the F-E1 target
+// judgment: a generated column is never bound by a writer, so it is never
+// supplied; everything else is, in declaration order.
+func TestReplaySuppliedColumns(t *testing.T) {
+	if got := ReplaySuppliedColumns(nil); got != nil {
+		t.Errorf("nil table: got %v", got)
+	}
+	table := &ir.Table{Columns: []*ir.Column{
+		{Name: "id"},
+		{Name: "k", GeneratedExpr: "id * 2"},
+		nil,
+		{Name: "v"},
+	}}
+	got := ReplaySuppliedColumns(table)
+	if len(got) != 2 || got[0] != "id" || got[1] != "v" {
+		t.Errorf("got %v; want [id v]", got)
 	}
 }

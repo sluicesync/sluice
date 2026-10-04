@@ -394,8 +394,11 @@ func TestFE1_Broker_MySQLTarget_KeylessDoor(t *testing.T) {
 		CREATE TABLE nu  (u INT NULL UNIQUE, note TEXT) ENGINE=InnoDB;
 		CREATE TABLE nnu (u INT NOT NULL UNIQUE, note TEXT) ENGINE=InnoDB;
 		CREATE TABLE pkd (id INT NOT NULL PRIMARY KEY, note TEXT) ENGINE=InnoDB;
+		CREATE TABLE sur (id INT NOT NULL PRIMARY KEY, note TEXT) ENGINE=InnoDB;
+		CREATE TABLE two (id INT NOT NULL PRIMARY KEY, note TEXT) ENGINE=InnoDB;
 		INSERT INTO kl VALUES (1, 'a'); INSERT INTO nu VALUES (NULL, 'a');
 		INSERT INTO nnu VALUES (1, 'a'); INSERT INTO pkd VALUES (1, 'a');
+		INSERT INTO sur VALUES (1, 'a'); INSERT INTO two VALUES (1, 'a');
 	`)
 	mysqlEng, _ := engines.Get("mysql")
 	store, err := blobcodec.NewLocalStore(t.TempDir())
@@ -417,7 +420,52 @@ func TestFE1_Broker_MySQLTarget_KeylessDoor(t *testing.T) {
 	if err := (&backup.Restore{Target: mysqlEng, TargetDSN: dst, Store: store}).Run(ctx); err != nil {
 		t.Fatalf("seed restore: %v", err)
 	}
-	applyDDLMySQL(t, dst, `ALTER TABLE pkd DROP PRIMARY KEY;`)
+	applyDDLMySQL(t, dst, `
+		ALTER TABLE pkd DROP PRIMARY KEY;
+		ALTER TABLE sur DROP PRIMARY KEY, ADD COLUMN sid BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY;
+		ALTER TABLE two DROP PRIMARY KEY, ADD COLUMN sid BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, ADD UNIQUE KEY two_id (id);
+	`)
+
+	// The F-E1 review's HIGH 1 on MySQL: "sur" is keyed in the backup and
+	// keyed on the target — on an AUTO_INCREMENT surrogate the backup's rows
+	// never carry, so ODKU collides with nothing. "two" carries the same
+	// surrogate PLUS a NOT NULL UNIQUE (id) the rows do supply; ODKU collides
+	// on any unique key, so it converges and must not be refused.
+	t.Run("restore re-run", func(t *testing.T) {
+		err := (&backup.Restore{Target: mysqlEng, TargetDSN: dst, Store: store}).Run(ctx)
+		assertFE1Refusal(t, err, sluicecode.CodeRestoreKeylessTableNotEmpty, []string{"kl", "nu", "pkd", "sur"}, []string{"nnu", "two"})
+	})
+
+	// The door's documented premise for the tables it does NOT refuse: a
+	// keyed table re-loaded onto rows it already holds fails LOUDLY on both
+	// MySQL bulk paths. The batched INSERT fails on 1062; LOAD DATA LOCAL
+	// downgrades the 1062 to a warning and skips the row, and the writer's
+	// post-load check must then refuse it as LOAD-DATA-ROWS-SKIPPED. The
+	// target row is changed first, so a silent skip would also be visible
+	// as the stale value surviving with a nil error.
+	t.Run("keyed re-load is loud on both MySQL bulk paths", func(t *testing.T) {
+		applyDDLMySQL(t, dst, `UPDATE nnu SET note = 'stale-target' WHERE u = 1;`)
+		defer applyDDLMySQL(t, dst, `SET GLOBAL local_infile = 0;`)
+		for _, infile := range []string{"0", "1"} {
+			applyDDLMySQL(t, dst, `SET GLOBAL local_infile = `+infile+`;`)
+			err := (&backup.Restore{
+				Target: mysqlEng, TargetDSN: dst, Store: store,
+				Filter: migcore.TableFilter{Include: []string{"nnu"}},
+			}).Run(ctx)
+			if err == nil {
+				t.Fatalf("local_infile=%s: re-loading a keyed table onto a different row under the same key exited nil", infile)
+			}
+			if ce, ok := sluicecode.FromError(err); ok && ce.Code == sluicecode.CodeRestoreKeylessTableNotEmpty {
+				t.Fatalf("local_infile=%s: the keyless door refused a keyed table: %v", infile, err)
+			}
+			if infile == "1" && !strings.Contains(err.Error(), "LOAD-DATA-ROWS-SKIPPED") {
+				t.Errorf("local_infile=1: want the LOAD DATA path's LOAD-DATA-ROWS-SKIPPED refusal, got: %v", err)
+			}
+			if infile == "0" && !strings.Contains(err.Error(), "1062") {
+				t.Errorf("local_infile=0: want the batched path's 1062, got: %v", err)
+			}
+		}
+	})
 
 	b := &SyncFromBackup{
 		Target: mysqlEng, TargetDSN: dst, Store: store, ChainURL: "test://fe1-mysql",
@@ -426,12 +474,67 @@ func TestFE1_Broker_MySQLTarget_KeylessDoor(t *testing.T) {
 	runCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 	err = b.Run(runCtx)
-	assertFE1Refusal(t, err, sluicecode.CodeBrokerKeylessTable, []string{"kl", "nu", "pkd"}, []string{"nnu"})
+	assertFE1Refusal(t, err, sluicecode.CodeBrokerKeylessTable, []string{"kl", "nu", "pkd", "sur"}, []string{"nnu", "two"})
 	msg := err.Error()
+	if i := strings.Index(msg, `"sur"`); i < 0 || !strings.HasPrefix(msg[i+len(`"sur" (`):], string(migcore.ReplayKeylessTarget)) {
+		t.Errorf("sur is keyed in the backup and on the target, but only on a surrogate the rows do not carry; "+
+			"the refusal must say the TARGET judgment failed: %v", err)
+	}
 	if i := strings.Index(msg, `"pkd"`); i < 0 || !strings.Contains(msg[i:], string(migcore.ReplayKeylessTarget)) {
 		t.Errorf("pkd is keyed in the backup and keyless only on the target; the refusal must say the TARGET judgment failed: %v", err)
 	}
 	if i := strings.Index(msg, `"nu"`); i < 0 || !strings.HasPrefix(msg[i+len(`"nu" (`):], string(migcore.ReplayKeylessRecorded)) {
 		t.Errorf("nu's only key is a nullable UNIQUE; the refusal must say the RECORDED judgment failed: %v", err)
 	}
+}
+
+// TestFE1_Broker_SurrogateKeyedTarget_RefusedBeforeAnything is the F-E1
+// review's HIGH 1 on Postgres, ported from its reproduction. "k" is keyed
+// (PRIMARY KEY id) in the backup; the target dropped that key and was
+// re-keyed on a bigserial surrogate. Both judgments used to say "keyed" —
+// the target HAS a primary key and the applier names it in its ON CONFLICT —
+// but no replayed row carries sid, so every re-applied INSERT drew a fresh
+// one: measured 2,000 target rows for 1,001 after an interrupted broker run
+// and a re-run, and a duplicated seed row on a restore re-run, both at exit
+// nil. "kk" is the control: keyed the same way on both sides, never named.
+//
+// The independent expected value is the target's own row count and the
+// position table, read straight from Postgres.
+func TestFE1_Broker_SurrogateKeyedTarget_RefusedBeforeAnything(t *testing.T) {
+	c := fe1Setup(t, `
+		CREATE TABLE k (id INT PRIMARY KEY, note TEXT);
+		CREATE TABLE kk (id INT PRIMARY KEY, note TEXT);
+		INSERT INTO k VALUES (-1, 'seed');
+		INSERT INTO kk VALUES (-1, 'seed');
+	`, `INSERT INTO k VALUES (i, 'r'||i); INSERT INTO kk VALUES (i, 'r'||i);`, func(c *fe1Chain) {
+		applyDDL(t, c.dst, `ALTER TABLE k DROP CONSTRAINT k_pkey; ALTER TABLE k ADD COLUMN sid bigserial PRIMARY KEY;`)
+	})
+
+	for _, mode := range fe1Modes {
+		t.Run("broker/"+mode.name, func(t *testing.T) {
+			streamID := "fe1-sur-" + mode.name
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+			err := c.broker(streamID, mode.conc, c.fullID).Run(ctx)
+			assertFE1Refusal(t, err, sluicecode.CodeBrokerKeylessTable, []string{"k"}, []string{"kk"})
+			if !strings.Contains(err.Error(), string(migcore.ReplayKeylessTarget)) {
+				t.Errorf("the refusal must say the TARGET judgment failed: %v", err)
+			}
+			if k, kk := fe1Count(t, c.dst, "k"), fe1Count(t, c.dst, "kk"); k != "1" || kk != "1" {
+				t.Errorf("target holds k=%s kk=%s after the refusal; want 1/1 — something was applied", k, kk)
+			}
+			if n := fe1Q(t, c.dst, fmt.Sprintf(`SELECT count(*)::text FROM sluice_cdc_state WHERE stream_id = '%s'`, streamID)); n != "0" {
+				t.Errorf("the refused broker wrote %s position row(s)", n)
+			}
+		})
+	}
+
+	t.Run("restore re-run", func(t *testing.T) {
+		pgEng, _ := engines.Get("postgres")
+		err := (&backup.Restore{Target: pgEng, TargetDSN: c.dst, Store: c.store}).Run(context.Background())
+		assertFE1Refusal(t, err, sluicecode.CodeRestoreKeylessTableNotEmpty, []string{"k"}, []string{"kk"})
+		if k := fe1Count(t, c.dst, "k"); k != "1" {
+			t.Errorf("k holds %s rows after the refused re-run; want the 1 seed row", k)
+		}
+	})
 }

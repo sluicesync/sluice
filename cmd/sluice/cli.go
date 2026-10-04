@@ -1153,8 +1153,10 @@ func (s *SyncFromBackupCmd) Run(g *Globals) error {
 	// SIGINT/SIGTERM does on the non-TTY path. That does NOT finish the
 	// in-flight incremental (audit F-E1): a cancel between ticks exits 0,
 	// one that lands mid-incremental returns the BROKER-INCREMENTAL-PARTIAL
-	// error, which the panel passes through as a failure rather than
-	// "stopped." because it does not unwrap to context.Canceled. The clean
+	// error, and one that lands during a --reset-target-data cold start
+	// after its drop began returns BROKER-COLD-START-PARTIAL; the panel
+	// passes both through as failures rather than "stopped." because
+	// neither unwraps to context.Canceled. The clean
 	// stop is `sync from-backup stop`, observed between ticks. Every other
 	// invocation keeps today's byte-identical log stream.
 	if wantPrettyProgress(g, false, false, false) {

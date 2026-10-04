@@ -26,11 +26,17 @@ import (
 // (tableIsKeyless counts any UNIQUE index) and still duplicates, which is
 // why the door's probe is the strict one.
 //
-// One shape is refused CONSERVATIVELY and says so: a functional UNIQUE key
-// part. ON DUPLICATE KEY UPDATE collides on it, so the re-apply converges,
-// but the engine's upsert-key picker (and the recorded-schema predicate,
-// irbackup.TableReplayIdempotent) never treat an expression as a key, and the
-// door follows the picker rather than widening it for one rare shape.
+// Two shapes are refused CONSERVATIVELY and say so: a functional UNIQUE key
+// part, and a STORED generated primary key. ON DUPLICATE KEY UPDATE collides
+// on both, so the re-apply converges, but whether the expression reads only
+// columns the replayed rows supply is not visible to the probe.
+//
+// The probe is handed the RECORDED table — the row's own columns plus "v" —
+// because whether a key is SUPPLIED by the replayed rows is half of the
+// judgment (audit F-E1 review, HIGH 1). The surrogate rows are that class;
+// the two-keys rows pin that ODKU collides on ANY unique key, so "some fully
+// supplied NOT NULL unique key" is this engine's predicate, not "the key the
+// upsert picker would choose".
 func TestRowWriter_ProbeReplayKey_ShapeMatrix(t *testing.T) {
 	dsn, cleanup := startMySQLForApplier(t)
 	defer cleanup()
@@ -50,7 +56,7 @@ func TestRowWriter_ProbeReplayKey_ShapeMatrix(t *testing.T) {
 		outcome      string
 		conservative bool // keyed=false although the re-apply converges
 	}{
-		{table: "absent"},
+		{table: "absent", row: ir.Row{"id": int64(1)}},
 		{"no_key", "CREATE TABLE no_key (id INT NOT NULL, v TEXT)", ir.Row{"id": int64(1)}, true, false, duplicates, false},
 		{"pk", "CREATE TABLE pk (id INT PRIMARY KEY, v TEXT)", ir.Row{"id": int64(1)}, true, true, converges, false},
 		{"nn_unique", "CREATE TABLE nn_unique (id INT NOT NULL UNIQUE, v TEXT)", ir.Row{"id": int64(1)}, true, true, converges, false},
@@ -58,6 +64,20 @@ func TestRowWriter_ProbeReplayKey_ShapeMatrix(t *testing.T) {
 		{"nullable_unique", "CREATE TABLE nullable_unique (id INT NULL UNIQUE, v TEXT)", ir.Row{"id": nil}, true, false, duplicates, false},
 		{"composite_one_nullable", "CREATE TABLE composite_one_nullable (a INT NOT NULL, b INT NULL, v TEXT, UNIQUE KEY (a, b))", ir.Row{"a": int64(1), "b": nil}, true, false, duplicates, false},
 		{"functional_unique", "CREATE TABLE functional_unique (id INT NOT NULL, v TEXT, UNIQUE KEY fu ((id * 2)))", ir.Row{"id": int64(1)}, true, false, converges, true},
+		// HIGH 1: keyed only on a surrogate the replayed rows never carry.
+		// ODKU has nothing to collide on; every re-applied row draws a fresh
+		// key value.
+		{"surrogate_auto_increment_pk", "CREATE TABLE surrogate_auto_increment_pk (sid BIGINT AUTO_INCREMENT PRIMARY KEY, id INT NOT NULL, v TEXT)", ir.Row{"id": int64(1)}, true, false, duplicates, false},
+		{"surrogate_default_expr_pk", "CREATE TABLE surrogate_default_expr_pk (sid BINARY(16) NOT NULL DEFAULT (UUID_TO_BIN(UUID())) PRIMARY KEY, id INT NOT NULL, v TEXT)", ir.Row{"id": int64(1)}, true, false, duplicates, false},
+		// Two keys, one supplied: ODKU collides on ANY unique key, so the
+		// supplied one is enough whichever is the PRIMARY KEY.
+		{"two_keys_pk_unsupplied", "CREATE TABLE two_keys_pk_unsupplied (sid BIGINT AUTO_INCREMENT PRIMARY KEY, id INT NOT NULL UNIQUE, v TEXT)", ir.Row{"id": int64(1)}, true, true, converges, false},
+		{"two_keys_pk_supplied", "CREATE TABLE two_keys_pk_supplied (id INT PRIMARY KEY, u BINARY(16) NOT NULL DEFAULT (UUID_TO_BIN(UUID())) UNIQUE, v TEXT)", ir.Row{"id": int64(1)}, true, true, converges, false},
+		// MySQL resolves column names case-insensitively; so does the probe.
+		{"case_folded_pk", "CREATE TABLE case_folded_pk (ID INT PRIMARY KEY, v TEXT)", ir.Row{"id": int64(1)}, true, true, converges, false},
+		// A generated key derived only from supplied columns converges, but
+		// the probe cannot see what its expression reads: conservative.
+		{"generated_pk", "CREATE TABLE generated_pk (id INT NOT NULL, k INT AS (id * 2) STORED PRIMARY KEY, v TEXT)", ir.Row{"id": int64(1)}, true, false, converges, true},
 	}
 	for _, c := range cases {
 		if c.ddl != "" {
@@ -100,7 +120,7 @@ func TestRowWriter_ProbeReplayKey_ShapeMatrix(t *testing.T) {
 	sawKeyed, sawSilent := false, false
 	for _, c := range cases {
 		t.Run(c.table, func(t *testing.T) {
-			exists, keyed, err := prober.ProbeReplayKey(ctx, &ir.Table{Name: c.table})
+			exists, keyed, err := prober.ProbeReplayKey(ctx, replayRecordedTable(c.table, c.row))
 			if err != nil {
 				t.Fatalf("ProbeReplayKey: %v", err)
 			}
@@ -140,4 +160,15 @@ func TestRowWriter_ProbeReplayKey_ShapeMatrix(t *testing.T) {
 	if !sawKeyed || !sawSilent {
 		t.Fatalf("anti-vacuity: the matrix must reach a keyed table and a silently duplicating one (keyed=%v, silent=%v)", sawKeyed, sawSilent)
 	}
+}
+
+// replayRecordedTable is the recorded (backup) definition a case's replayed
+// rows come from: exactly the row's columns plus "v", each nullable when the
+// case's value is NULL. The probe's supplied-column set is derived from it.
+func replayRecordedTable(name string, row ir.Row) *ir.Table {
+	t := &ir.Table{Name: name, Columns: []*ir.Column{{Name: "v", Type: ir.Text{}, Nullable: true}}}
+	for col, val := range row {
+		t.Columns = append(t.Columns, &ir.Column{Name: col, Type: ir.Integer{Width: 64}, Nullable: val == nil})
+	}
+	return t
 }

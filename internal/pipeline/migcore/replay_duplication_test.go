@@ -41,6 +41,16 @@ type plainWriter struct{}
 
 func (plainWriter) WriteRows(context.Context, *ir.Table, <-chan ir.Row) error { return nil }
 
+// probeOnlyWriter implements the key probe but not the emptiness probe —
+// the shape that would isolate the OnlyNonEmpty refusal from the other.
+type probeOnlyWriter struct{}
+
+func (probeOnlyWriter) WriteRows(context.Context, *ir.Table, <-chan ir.Row) error { return nil }
+
+func (probeOnlyWriter) ProbeReplayKey(context.Context, *ir.Table) (exists, keyed bool, err error) {
+	return true, true, nil
+}
+
 func replayTable(name string, pk bool, uniqueNullable *bool) *ir.Table {
 	t := &ir.Table{Name: name, Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}}
 	if pk {
@@ -104,13 +114,23 @@ func TestFindReplayKeylessTables(t *testing.T) {
 		})
 	})
 
-	t.Run("a writer without the probe is judged on the recorded schema", func(t *testing.T) {
+	t.Run("a writer without the probe is refused, not judged on the recorded schema alone", func(t *testing.T) {
 		got, err := FindReplayKeylessTables(ctx, plainWriter{}, tables, ReplayJudgeOptions{ProbeTarget: true})
-		if err != nil {
-			t.Fatal(err)
+		if err == nil || !strings.Contains(err.Error(), "ir.ReplayKeyProber") {
+			t.Fatalf("got %v, %v; want the fail-closed refusal naming ir.ReplayKeyProber", got, err)
 		}
-		if len(got) != 3 {
-			t.Fatalf("got %v, want the three recorded-keyless tables", got)
+	})
+
+	t.Run("a nil writer with the probe asked for is refused", func(t *testing.T) {
+		if _, err := FindReplayKeylessTables(ctx, nil, tables, ReplayJudgeOptions{ProbeTarget: true}); err == nil {
+			t.Fatal("a nil writer satisfied ProbeTarget; the target judgment was silently skipped")
+		}
+	})
+
+	t.Run("no options needs no writer", func(t *testing.T) {
+		got, err := FindReplayKeylessTables(ctx, nil, tables, ReplayJudgeOptions{})
+		if err != nil || len(got) != 3 {
+			t.Fatalf("got %v, %v; want the three recorded-keyless tables", got, err)
 		}
 	})
 
@@ -127,10 +147,13 @@ func TestFindReplayKeylessTables(t *testing.T) {
 		})
 	})
 
-	t.Run("OnlyNonEmpty on a writer that cannot report emptiness refuses nothing", func(t *testing.T) {
-		got, err := FindReplayKeylessTables(ctx, plainWriter{}, tables, ReplayJudgeOptions{ProbeTarget: true, OnlyNonEmpty: true})
-		if err != nil || len(got) != 0 {
-			t.Fatalf("got %v, %v; want nothing (the stated residual)", got, err)
+	// The F-E1 review's HIGH 2: this used to return nothing — every table
+	// treated as EMPTY — which left the restore door open on any engine
+	// whose writer could not report emptiness (SQLite: 200 rows for 100).
+	t.Run("OnlyNonEmpty on a writer that cannot report emptiness is refused", func(t *testing.T) {
+		got, err := FindReplayKeylessTables(ctx, probeOnlyWriter{}, tables, ReplayJudgeOptions{ProbeTarget: true, OnlyNonEmpty: true})
+		if err == nil || !strings.Contains(err.Error(), "ir.TableEmptyChecker") {
+			t.Fatalf("got %v, %v; want the fail-closed refusal naming ir.TableEmptyChecker", got, err)
 		}
 	})
 
@@ -156,6 +179,48 @@ func assertReplayKeyless(t *testing.T, got []ReplayKeylessTable, want map[string
 		}
 		if r != g.Reason {
 			t.Errorf("%q reported for %q, want %q", g.Name, g.Reason, r)
+		}
+	}
+}
+
+// TestReplayKeyFingerprint_MovesWithEveryJudgedPart pins the broker's
+// clearance cache key (audit F-E1 review): every part of a recorded table
+// the judge reads must move the fingerprint, or a later AlterTable delta
+// that drops or replaces a cleared table's key is never re-judged. Each
+// mutation below is one the recorded predicate or the target probe reads.
+func TestReplayKeyFingerprint_MovesWithEveryJudgedPart(t *testing.T) {
+	base := func() *ir.Table {
+		return &ir.Table{
+			Name: "t",
+			Columns: []*ir.Column{
+				{Name: "id", Type: ir.Integer{Width: 64}},
+				{Name: "u", Type: ir.Integer{Width: 64}},
+			},
+			PrimaryKey: &ir.Index{Unique: true, Columns: []ir.IndexColumn{{Column: "id"}}},
+			Indexes:    []*ir.Index{{Name: "uq_u", Unique: true, Columns: []ir.IndexColumn{{Column: "u"}}}},
+		}
+	}
+	ref := ReplayKeyFingerprint(base())
+	if ref != ReplayKeyFingerprint(base()) {
+		t.Fatal("the fingerprint is not deterministic")
+	}
+	mutations := map[string]func(*ir.Table){
+		"primary key dropped":       func(t *ir.Table) { t.PrimaryKey = nil },
+		"primary key columns moved": func(t *ir.Table) { t.PrimaryKey.Columns = []ir.IndexColumn{{Column: "u"}} },
+		"column made nullable":      func(t *ir.Table) { t.Columns[1].Nullable = true },
+		"column made generated":     func(t *ir.Table) { t.Columns[0].GeneratedExpr = "u + 1" },
+		"column renamed":            func(t *ir.Table) { t.Columns[1].Name = "v" },
+		"column added":              func(t *ir.Table) { t.Columns = append(t.Columns, &ir.Column{Name: "w"}) },
+		"unique index dropped":      func(t *ir.Table) { t.Indexes = nil },
+		"unique made non-unique":    func(t *ir.Table) { t.Indexes[0].Unique = false },
+		"unique made partial":       func(t *ir.Table) { t.Indexes[0].Predicate = "u > 0" },
+		"unique made expression":    func(t *ir.Table) { t.Indexes[0].Columns[0].Expression = "(u * 2)" },
+	}
+	for name, mutate := range mutations {
+		tbl := base()
+		mutate(tbl)
+		if ReplayKeyFingerprint(tbl) == ref {
+			t.Errorf("%s: the fingerprint did not move, so a cleared table would not be re-judged", name)
 		}
 	}
 }

@@ -51,12 +51,55 @@ func (e *brokerIncrementalPartialError) Error() string {
 	return fmt.Sprintf(
 		"broker: %s: the run was interrupted partway through incremental %s. Part of it may already be committed on "+
 			"the target, and the broker's position was NOT advanced past it (it stays at %s), so the next run re-applies "+
-			"the WHOLE incremental. Every table the broker replays has a key (keyless tables are refused before anything "+
+			"the WHOLE incremental. Every table the broker replays was judged, on the chain's recorded schema and on the "+
+			"target, to have a key the replayed rows carry and collide on (a table without one is refused before anything "+
 			"is applied), so the re-applied changes upsert and converge: re-run the same command to finish it. "+
 			"To stop a broker without interrupting an incremental, use `sluice sync from-backup stop`, which takes effect "+
 			"between ticks. Cause: %v",
 		BrokerIncrementalPartialMarker, e.backupID, e.resumeFrom, e.cause,
 	)
+}
+
+// BrokerColdStartPartialMarker is the grep-stable token on the error a
+// `--reset-target-data` cold start returns when its context is cancelled
+// after it began dropping the target's tables and before it recorded a
+// position: the target holds a partial restore and no broker position.
+const BrokerColdStartPartialMarker = "BROKER-COLD-START-PARTIAL"
+
+// brokerColdStartPartialError reports a cancel that interrupted the
+// --reset-target-data drop-and-restore. Like
+// [brokerIncrementalPartialError] it has NO Unwrap: a context.Canceled cause
+// would read as a clean stop to every layer above (the live panel prints
+// "stopped." and exits 0 on it), and a half-dropped, half-restored target
+// with no position is not one.
+type brokerColdStartPartialError struct {
+	streamID string
+	cause    error
+}
+
+func (e *brokerColdStartPartialError) Error() string {
+	return fmt.Sprintf(
+		"broker: %s: the --reset-target-data cold start for stream %q was interrupted after it began dropping the "+
+			"target's tables and before it recorded a position, so the target holds a PARTIAL restore of the chain and "+
+			"no broker position. Re-run the same command with --reset-target-data: it drops the chain's tables again and "+
+			"restores the chain from its full. Do not start the broker with --at-chain-id against this target. Cause: %v",
+		BrokerColdStartPartialMarker, e.streamID, e.cause,
+	)
+}
+
+// coldStartPartialOr returns err unchanged unless ctx is done, in which case
+// the failure is the interrupted cold start [brokerColdStartPartialError]
+// describes. Called only for failures AFTER the drop began.
+func (b *SyncFromBackup) coldStartPartialOr(ctx context.Context, err error) error {
+	if ctx.Err() == nil {
+		return err
+	}
+	slog.ErrorContext(
+		ctx, "broker: --reset-target-data cold start interrupted; exiting non-zero",
+		slog.String("marker", BrokerColdStartPartialMarker),
+		slog.String("stream_id", b.StreamID),
+	)
+	return &brokerColdStartPartialError{streamID: b.StreamID, cause: err}
 }
 
 // tickErrorExit turns a failed tick into Run's return value.
@@ -94,18 +137,29 @@ func (b *SyncFromBackup) tickErrorExit(ctx context.Context, applyErr error, last
 
 // brokerKeylessHint is the remedy riding SLUICE-E-BROKER-KEYLESS-TABLE.
 const brokerKeylessHint = "give each named table a PRIMARY KEY or a NOT NULL UNIQUE index on the SOURCE and take a new full " +
-	"backup (or, for a table keyless only on the target, give the target table the source's key), or replicate the " +
-	"table with `sluice sync start` instead of through a backup chain"
+	"backup (or, for a table keyless only on the target, give the target table the source's key — one made of columns " +
+	"the backup carries, not a serial, identity or defaulted surrogate), or replicate the table with `sluice sync start` " +
+	"instead of through a backup chain"
 
 // refuseKeylessTables is the F-E1 door. It judges every table the chain
-// records that this run has not already cleared, and refuses — naming every
-// offender at once — if a re-applied change could duplicate rows in one.
+// records that this run has not already cleared IN ITS CURRENT RECORDED
+// DEFINITION, and refuses — naming every offender at once — if a re-applied
+// change could duplicate rows in one.
 //
 // probeTarget adds the target-catalog judgment ([ir.ReplayKeyProber]) to the
 // recorded-schema one. Tables are marked cleared only after a judgment that
 // included the target, so a --reset-target-data cold start (recorded schema
 // only, because the target is about to be rebuilt) is re-judged against the
-// rebuilt target on the first tick that has work.
+// rebuilt target on the first tick that has work. A clearance is keyed by
+// [migcore.ReplayKeyFingerprint], so a later incremental whose AlterTable
+// delta drops or replaces a cleared table's key is judged again, BEFORE that
+// incremental is applied, at the top of the tick that brings it.
+//
+// Residual, stated rather than implied: a key removed from the TARGET out of
+// band, by someone else's DDL while the broker runs, is not seen until the
+// next run (whose start door probes every table). The broker's own schema
+// changes reach the target only through recorded deltas, which the
+// fingerprint covers.
 //
 // Scope: every table any link of the chain records, in its Schema or in an
 // AddTable/AlterTable delta. The broker has no table filter (`sync
@@ -126,7 +180,7 @@ func (b *SyncFromBackup) refuseKeylessTables(ctx context.Context, probeTarget bo
 	}
 	var pending []*ir.Table
 	for _, t := range backup.ChainRecordedTables(chain, migcore.TableFilter{}) {
-		if !b.keylessCleared[t.Name] {
+		if fp, ok := b.keylessCleared[t.Name]; !ok || fp != migcore.ReplayKeyFingerprint(t) {
 			pending = append(pending, t)
 		}
 	}
@@ -151,10 +205,10 @@ func (b *SyncFromBackup) refuseKeylessTables(ctx context.Context, probeTarget bo
 	}
 	if probeTarget {
 		if b.keylessCleared == nil {
-			b.keylessCleared = make(map[string]bool, len(pending))
+			b.keylessCleared = make(map[string]string, len(pending))
 		}
 		for _, t := range pending {
-			b.keylessCleared[t.Name] = true
+			b.keylessCleared[t.Name] = migcore.ReplayKeyFingerprint(t)
 		}
 	}
 	return nil

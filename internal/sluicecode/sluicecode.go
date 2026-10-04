@@ -631,8 +631,10 @@ const (
 	// CodeBrokerKeylessTable fires when `sync from-backup` would replay a
 	// backup chain into a table on which re-applying a change that already
 	// landed appends a second copy of the row: no PRIMARY KEY and no NOT NULL
-	// UNIQUE index, judged on the chain's recorded schema AND on the target
-	// table the applier writes (audit F-E1). The broker re-applies a WHOLE
+	// UNIQUE index on the chain's recorded schema, or no key on the target
+	// table the applier writes that is made of columns the replayed rows
+	// carry (a defaulted surrogate collides with nothing) (audit F-E1). The
+	// broker re-applies a WHOLE
 	// incremental after any interruption — its changes carry no apply
 	// identity — so such a table gains a duplicate of every row the
 	// interrupted run had already committed, at exit 0. Refused before
@@ -642,11 +644,12 @@ const (
 	// CodeRestoreKeylessTableNotEmpty fires when `restore` (a single full or
 	// a chain) would load rows into a target table that ALREADY holds rows
 	// and has no key a re-applied row could collide on (audit F-E1). The
-	// shape is a re-run after a failed restore: the full's COPY and the
+	// shape is a re-run after a failed restore: the full's bulk load and the
 	// incrementals' plain INSERTs append everything the earlier attempt
-	// already wrote, silently. A keyed table in the same state fails loudly
-	// on its key and is not this refusal's concern; an EMPTY keyless table
-	// (a fresh target) is restored normally.
+	// already wrote, silently. A keyed table in the same state is not this
+	// refusal's concern: the load fails loudly on its key (on MySQL's LOAD
+	// DATA LOCAL path, as LOAD-DATA-ROWS-SKIPPED naming the 1062 warning).
+	// An EMPTY keyless table (a fresh target) is restored normally.
 	CodeRestoreKeylessTableNotEmpty Code = "SLUICE-E-RESTORE-KEYLESS-TABLE-NOT-EMPTY"
 
 	// CodeCDCKeyMatchedMultipleRows fires when a CDC UPDATE or DELETE that
@@ -989,9 +992,9 @@ var registry = map[Code]Info{
 
 	CodeTargetDeferrableKey: {ClassRefusal, "refused before applying anything: a target table's primary key (or only usable unique key) is DEFERRABLE, and Postgres rejects a deferrable constraint as an `ON CONFLICT` arbiter — so sluice's idempotent apply/copy upsert cannot key on it; recreate the target constraint as immediate (NOT DEFERRABLE), pre-create the target table with an immediate key, or take the table out of scope"},
 
-	CodeBrokerKeylessTable: {ClassRefusal, "sync from-backup refused before applying anything: a table the chain replays into has no PRIMARY KEY and no NOT NULL UNIQUE index (in the chain's recorded schema or on the target), and the broker re-applies a whole incremental after any interruption — so the table would silently gain a duplicate of every row an interrupted run had committed; give the table a key on the SOURCE and take a new full backup, or replicate it with `sluice sync start`"},
+	CodeBrokerKeylessTable: {ClassRefusal, "sync from-backup refused before applying anything: a table the chain replays into has no PRIMARY KEY and no NOT NULL UNIQUE index in the chain's recorded schema, or none on the target made of columns the replayed rows carry, and the broker re-applies a whole incremental after any interruption — so the table would silently gain a duplicate of every row an interrupted run had committed; give the table a key on the SOURCE and take a new full backup, or replicate it with `sluice sync start`"},
 
-	CodeRestoreKeylessTableNotEmpty: {ClassRefusal, "restore refused before writing: a target table it would load already holds rows and has no PRIMARY KEY and no NOT NULL UNIQUE index, so the restore would append its rows next to the existing ones instead of colliding — typically a re-run after a failed restore, which would duplicate everything the earlier attempt wrote; empty or drop the named target tables and re-run, or exclude them"},
+	CodeRestoreKeylessTableNotEmpty: {ClassRefusal, "restore refused before writing: a target table it would load already holds rows and has no PRIMARY KEY or NOT NULL UNIQUE index made of columns the backup's rows carry, so the restore would append its rows next to the existing ones instead of colliding — typically a re-run after a failed restore, which would duplicate everything the earlier attempt wrote; empty or drop every table that attempt loaded and re-run, or exclude the named ones"},
 
 	CodeTargetTableShapeMismatch: {ClassRefusal, "migrate refused before any data moved: a target table with the same name already exists but its column shape (names/types/nullability) differs from what the migration would create — proceeding would fail mid-copy or land rows in the wrong columns"},
 

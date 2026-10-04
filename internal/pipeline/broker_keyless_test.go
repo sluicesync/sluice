@@ -264,6 +264,75 @@ func TestSyncFromBackup_CancelMidIncremental_ExitsWithPartialMarker(t *testing.T
 	}
 }
 
+// cancellingDropWriter is a replayKeyWriter that lets the cold start drop
+// its tables and lands the operator's q / ctrl+c at one point of it: in the
+// drop itself ("drop"), or in the chain restore that follows ("restore" —
+// its re-run door's first emptiness probe). It cancels the run and reports
+// the cancel, exactly as a real driver call interrupted there would.
+type cancellingDropWriter struct {
+	replayKeyWriter
+	cancelAt string
+	cancel   func()
+	dropped  []string
+}
+
+func (w *cancellingDropWriter) DropTable(ctx context.Context, t *ir.Table) error {
+	w.dropped = append(w.dropped, t.Name)
+	if w.cancelAt == "drop" {
+		w.cancel()
+	}
+	return ctx.Err()
+}
+
+func (w *cancellingDropWriter) IsTableEmpty(ctx context.Context, _ *ir.Table) (bool, error) {
+	if w.cancelAt == "restore" {
+		w.cancel()
+	}
+	return true, ctx.Err()
+}
+
+// TestSyncFromBackup_CancelDuringResetColdStart_ExitsWithPartialMarker pins
+// the F-E1 review's TTY finding: a cancel during the --reset-target-data
+// cold start, once the drop has begun, used to unwrap to context.Canceled,
+// which the live panel turns into "stopped." and exit 0 — over a target with
+// dropped tables, a partial restore and no position. It must instead carry
+// BROKER-COLD-START-PARTIAL and must NOT unwrap to context.Canceled.
+func TestSyncFromBackup_CancelDuringResetColdStart_ExitsWithPartialMarker(t *testing.T) {
+	for _, at := range []string{"drop", "restore"} {
+		t.Run("cancel in "+at, func(t *testing.T) {
+			store, _, _ := brokerReplayFixture(t, true)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			runCtx, runCancel := context.WithCancel(ctx)
+			defer runCancel()
+
+			app := &replayApplier{}
+			b := newReplayBroker(store, app, true)
+			w := &cancellingDropWriter{replayKeyWriter: replayKeyWriter{keyed: true}, cancelAt: at, cancel: runCancel}
+			b.Target = replayTargetEngine{applier: app, rw: w}
+			b.ResetTargetData = true
+
+			err := b.Run(runCtx)
+			if len(w.dropped) == 0 {
+				t.Fatalf("the cold start never reached its drop (Run = %v); the cancel point was not exercised", err)
+			}
+			if runCtx.Err() == nil {
+				t.Fatalf("the cancel at %q never fired (Run = %v); the arm was not exercised", at, err)
+			}
+			if err == nil || !strings.Contains(err.Error(), BrokerColdStartPartialMarker) {
+				t.Fatalf("Run = %v; want the %s error", err, BrokerColdStartPartialMarker)
+			}
+			if errors.Is(err, context.Canceled) {
+				t.Errorf("the cold-start partial error unwraps to context.Canceled, so the live panel would print "+
+					"\"stopped.\" and exit 0: %v", err)
+			}
+			if len(app.written) != 0 {
+				t.Errorf("a position was written (%d) for a cold start that never finished", len(app.written))
+			}
+		})
+	}
+}
+
 // TestSyncFromBackup_CancelAfterIncremental_ExitsClean is the other half of
 // the rule: a cancel observed once the incremental is fully applied and its
 // position advanced is the clean stop it always was.
@@ -351,6 +420,37 @@ func TestSyncFromBackup_CancelBetweenIncrementals_ExitsClean(t *testing.T) {
 // THEN does the producer append an incremental whose window created a
 // keyless table. The next tick must refuse before applying any of it.
 func TestSyncFromBackup_KeylessTableAddedLater_RefusedAtTick(t *testing.T) {
+	users := &ir.Table{
+		Name:       "users",
+		Columns:    []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
+		PrimaryKey: &ir.Index{Unique: true, Columns: []ir.IndexColumn{{Column: "id"}}},
+	}
+	events := &ir.Table{Name: "events", Columns: []*ir.Column{{Name: "v", Type: ir.Integer{Width: 64}}}}
+	// The window-START schema is the parent's recorded one; the single read
+	// here is the window-END read, which sees the new table — so the
+	// incremental records an AddTable delta for "events".
+	runTickRefusal(t, []*ir.Table{users, events}, ir.Row{"v": int64(1)}, "events")
+}
+
+// TestSyncFromBackup_ClearedTableLosesKeyLater_RefusedAtTick is the F-E1
+// review's cache finding: the door used to remember a cleared table by NAME
+// and never judge it again, so an incremental whose AlterTable delta dropped
+// "users"' primary key was applied — and re-applied after an interruption —
+// as a keyless table. The clearance is now keyed by the recorded
+// definition's fingerprint, so the tick that brings the delta re-judges it
+// before applying anything.
+func TestSyncFromBackup_ClearedTableLosesKeyLater_RefusedAtTick(t *testing.T) {
+	keylessUsers := &ir.Table{Name: "users", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}}
+	runTickRefusal(t, []*ir.Table{keylessUsers}, ir.Row{"id": int64(9)}, "users")
+}
+
+// runTickRefusal starts a broker on the keyed fixture, waits for it to apply
+// the fixture's incremental (clearing "users"), then appends an incremental
+// whose window-END schema is laterTables and whose one change inserts row
+// into wantTable, and requires the next tick to refuse naming wantTable
+// before applying any change of it.
+func runTickRefusal(t *testing.T, laterTables []*ir.Table, row ir.Row, wantTable string) {
+	t.Helper()
 	store, fullID, incrID := brokerReplayFixture(t, true)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -380,24 +480,15 @@ func TestSyncFromBackup_KeylessTableAddedLater_RefusedAtTick(t *testing.T) {
 	receivedBefore := len(app.received)
 	app.mu.Unlock()
 
-	users := &ir.Table{
-		Name:       "users",
-		Columns:    []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
-		PrimaryKey: &ir.Index{Unique: true, Columns: []ir.IndexColumn{{Column: "id"}}},
-	}
-	events := &ir.Table{Name: "events", Columns: []*ir.Column{{Name: "v", Type: ir.Integer{Width: 64}}}}
 	pos := func(lsn string) ir.Position {
 		return ir.Position{Engine: "postgres", Token: `{"slot":"s","lsn":"` + lsn + `"}`}
 	}
 	cdc := &fakeCDCEngine{
-		name: "postgres",
-		// The window-START schema is the parent's recorded one; the single
-		// read here is the window-END read, which sees the new table — so
-		// the incremental records an AddTable delta for "events".
-		schemaSequence: []*ir.Schema{{Tables: []*ir.Table{users, events}}},
+		name:           "postgres",
+		schemaSequence: []*ir.Schema{{Tables: laterTables}},
 		cdcChanges: []ir.Change{
 			ir.TxBegin{Position: pos("0/150")},
-			ir.Insert{Position: pos("0/160"), Table: "events", Row: ir.Row{"v": int64(1)}},
+			ir.Insert{Position: pos("0/160"), Table: wantTable, Row: row},
 			ir.TxCommit{Position: pos("0/170")},
 		},
 	}
@@ -412,11 +503,11 @@ func TestSyncFromBackup_KeylessTableAddedLater_RefusedAtTick(t *testing.T) {
 	select {
 	case err = <-done:
 	case <-ctx.Done():
-		t.Fatal("broker did not refuse the keyless table the second incremental added")
+		t.Fatalf("broker did not refuse the keyless %q the second incremental brought", wantTable)
 	}
 	ce, ok := sluicecode.FromError(err)
-	if !ok || ce.Code != sluicecode.CodeBrokerKeylessTable || !strings.Contains(err.Error(), `"events"`) {
-		t.Fatalf("Run = %v; want %s naming \"events\"", err, sluicecode.CodeBrokerKeylessTable)
+	if !ok || ce.Code != sluicecode.CodeBrokerKeylessTable || !strings.Contains(err.Error(), `"`+wantTable+`"`) {
+		t.Fatalf("Run = %v; want %s naming %q", err, sluicecode.CodeBrokerKeylessTable, wantTable)
 	}
 	app.mu.Lock()
 	defer app.mu.Unlock()

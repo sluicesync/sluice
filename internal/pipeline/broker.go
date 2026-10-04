@@ -28,8 +28,10 @@ package pipeline
 //     Every change of an incremental carries the PARENT position
 //     (BRK-1), and the position advances only once the whole
 //     incremental has applied, so a crash mid-replay re-applies the
-//     whole incremental. That is safe only on tables the applier
-//     upserts into — the changes carry no apply identity, so it is
+//     whole incremental. That is safe only on tables where the applier
+//     upserts on a key the replayed rows carry (a key on a defaulted
+//     surrogate they never supply collides with nothing) — the
+//     changes carry no apply identity, so it is
 //     NOT the ADR-0010 idempotency it was once described as — which
 //     is why keyless tables are refused before anything is applied
 //     (audit F-E1, [SyncFromBackup.refuseKeylessTables]). Distinct
@@ -44,7 +46,10 @@ package pipeline
 //     lands while an incremental is being applied returns an error
 //     carrying [BrokerIncrementalPartialMarker] (non-zero exit),
 //     because part of that incremental may be committed and the next
-//     run re-applies all of it (audit F-E1).
+//     run re-applies all of it (audit F-E1). A cancel during a
+//     --reset-target-data cold start, once its drop has begun, returns
+//     [BrokerColdStartPartialMarker] for the same reason: the target
+//     holds a partial restore and no position.
 //   - Cross-machine stop request via `manifests/broker_state.json`'s
 //     `stop_requested_at` field: observed only between ticks (within
 //     ~PollInterval), so it never interrupts an incremental and the
@@ -263,12 +268,16 @@ type SyncFromBackup struct {
 	// Run's goroutine, like chainCEK.
 	chainCache brokerChainCache
 
-	// keylessCleared records the tables the F-E1 keyless door has already
-	// cleared against BOTH the recorded schema and the target catalog this
-	// run, so a tick re-judges only tables the chain newly carries. Confined
-	// to Run's goroutine, like chainCEK. The zero value (nil) means "nothing
-	// cleared yet", so every table is judged — the safe default.
-	keylessCleared map[string]bool
+	// keylessCleared records, per table name, the [migcore.ReplayKeyFingerprint]
+	// of the recorded definition the F-E1 keyless door last cleared against
+	// BOTH the recorded schema and the target catalog this run. A tick
+	// re-judges a table the chain newly carries AND a table whose newest
+	// recorded definition changed since it was cleared (an AlterTable delta
+	// that dropped or replaced its key) — an earlier cut cached by name
+	// alone and never re-judged the second kind. Confined to Run's
+	// goroutine, like chainCEK. The zero value (nil) means "nothing cleared
+	// yet", so every table is judged — the safe default.
+	keylessCleared map[string]string
 
 	// Now, when set, overrides the wall-clock-time source used for
 	// `broker_state.json` timestamps. Tests pin timestamps; in
@@ -385,7 +394,9 @@ func isBrokerToken(pos ir.Position) bool {
 // A ctx cancel is a clean exit only when it does not interrupt an
 // incremental. One that lands while an incremental is being applied
 // returns a [BrokerIncrementalPartialMarker] error instead (audit F-E1):
-// see replayNewIncrementals for the exact rule.
+// see replayNewIncrementals for the exact rule. One that lands during a
+// --reset-target-data cold start after its drop began returns a
+// [BrokerColdStartPartialMarker] error (see coldStartReset).
 //
 // On every successful incremental apply: the target gains the
 // incremental's data + schema deltas, the broker's position row in
@@ -828,18 +839,24 @@ func (b *SyncFromBackup) coldStartReset(ctx context.Context, applier ir.ChangeAp
 	// chain's terminal schema. ChainRestore's CREATE TABLE IF NOT
 	// EXISTS would otherwise no-op against stale-schema tables and
 	// trigger a "column does not exist" error in the subsequent COPY.
+	//
+	// From the drop on, the target is being changed and nothing records
+	// that until the position write below, so a CANCEL anywhere in this
+	// stretch (q / ctrl+c on the live panel, SIGINT, SIGTERM) is reported
+	// with BROKER-COLD-START-PARTIAL rather than as the clean stop a bare
+	// context.Canceled reads as (audit F-E1 review).
 	if tailManifest.Schema != nil && len(tailManifest.Schema.Tables) > 0 {
 		if err := b.dropExistingTargetTables(ctx, tailManifest.Schema); err != nil {
-			return "", err
+			return "", b.coldStartPartialOr(ctx, err)
 		}
 	}
 
 	if err := rest.Run(ctx); err != nil {
-		return "", fmt.Errorf("broker: chain restore failed: %w", err)
+		return "", b.coldStartPartialOr(ctx, fmt.Errorf("broker: chain restore failed: %w", err))
 	}
 	tailID := lineage.ManifestBackupID(tailManifest)
 	if err := b.writePositionDirect(ctx, applier, tailID); err != nil {
-		return "", fmt.Errorf("broker: record post-restore position: %w", err)
+		return "", b.coldStartPartialOr(ctx, fmt.Errorf("broker: record post-restore position: %w", err))
 	}
 	slog.InfoContext(
 		ctx, "broker: cold start complete; transitioning to live polling",
@@ -1047,10 +1064,13 @@ func (b *SyncFromBackup) replayNewIncrementals(
 	// That re-apply is NOT idempotent in general, whatever ADR-0010 suggests:
 	// these changes carry no apply identity (ADR-0190 marks cannot skip
 	// them), so every change the interrupted run committed is applied a
-	// second time. A keyed table absorbs that (the INSERT upserts); a keyless
-	// one gains a duplicate row per committed INSERT (audit F-E1, measured at
-	// 2001 vs 1001 rows). That is why [SyncFromBackup.refuseKeylessTables]
-	// refuses keyless tables before anything is applied. Exactly-once (an
+	// second time. A table keyed on columns the replayed rows carry absorbs
+	// that (the INSERT upserts); a keyless one — or one the target keys only
+	// on a defaulted surrogate the rows never supply — gains a duplicate row
+	// per committed INSERT (audit F-E1, measured at 2001 vs 1001 keyless and
+	// 2000 vs 1001 on a bigserial-rekeyed target). That is why
+	// [SyncFromBackup.refuseKeylessTables] refuses such tables before
+	// anything is applied. Exactly-once (an
 	// apply identity per broker change) is the open follow-up that would
 	// lift the refusal.
 	resumeFromID := lastAppliedID
