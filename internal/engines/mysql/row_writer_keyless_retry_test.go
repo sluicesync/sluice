@@ -167,10 +167,11 @@ func TestColdCopyReparentRetry_NullableUniqueCountsAsKeyless(t *testing.T) {
 // TestReplayKeyPredicatesAgree is the premise check behind letting ONE
 // gate serve both write cores.
 //
-// The plain core is now gated on irbackup.TableReplayIdempotent while the
-// idempotent core refuses keyless tables upfront via
-// effectiveUpsertKeyColumns. The claim that routing the idempotent core
-// through the same gate is a no-op rests on those two predicates
+// The retry gate's RECORDED half is irbackup.TableReplayIdempotent (inside
+// irbackup.JudgeReplayKey) while the idempotent core refuses keyless tables
+// upfront via effectiveUpsertKeyColumns. The claim that the recorded half
+// is a no-op on the idempotent core (its TARGET half is not — see
+// row_writer_surrogate_retry_test.go) rests on those two predicates
 // classifying every table the same way — a fact about two functions in
 // two packages, which is exactly the kind of thing that quietly stops
 // being true. If they ever diverge, this fails instead of a production
