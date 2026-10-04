@@ -959,7 +959,9 @@ func (r *Restore) reconcileReparentTouched(ctx context.Context, rw ir.RowWriter,
 // primary-key/UPSERT needed, and indexes/constraints are later phases so the
 // TRUNCATE is clean and cheap. DataOnly (chain rotation segment): skip the
 // truncate (it would wipe a prior segment) and re-apply idempotently — the
-// idempotent writer restoreTable selects converges. The serial redo reuses
+// idempotent writer restoreTable selects converges ONLY when the target's key
+// is one the rows supply; a pre-created target keyed on a surrogate does not
+// (open: audit backlog F-E1-ROTATED-SEGMENT-OVERLAP). The serial redo reuses
 // the supplied primary writer (which carries the reparent observer), so a
 // reparent during the redo re-marks the table for another round.
 func (r *Restore) reapplyTableForReconcile(ctx context.Context, rw ir.RowWriter, table *ir.Table, entry *irbackup.TableManifest) error {

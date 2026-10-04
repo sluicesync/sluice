@@ -34,11 +34,17 @@ import (
 //     defaulted surrogate the rows never carry, is caught here and nowhere
 //     else.
 //
-// Each side is the other's independent expected value. The recorded schema
-// cannot see a target that dropped or replaced a key; the target cannot see
-// that the source holds legitimate duplicate rows a target-only key would
-// collapse. A table absent on the target is judged on the recorded schema
-// alone: it will be created from that schema, key included.
+// Each side covers a blind spot of the other. The recorded schema cannot see
+// a target that dropped or replaced a key; the target cannot see that a
+// KEYLESS source may hold legitimate duplicate rows, which the recorded half
+// refuses outright. Neither sees a target key COARSER than a keyed source's
+// identity — a MySQL prefix UNIQUE, or a case-insensitive collation over a
+// case-sensitive source column: the recorded table is keyed, the target key
+// is supplied and does collide, and distinct source rows merge on the FIRST
+// apply, not only on a replay (measured on MySQL; audit backlog
+// F-E1-COARSER-TARGET-KEY, LOW, open). A table absent on the target is
+// judged on the recorded schema alone: it will be created from that schema,
+// key included.
 //
 // The judge FAILS CLOSED. A writer that cannot answer a judgment the
 // caller asked for is an error, never a skip: before this, a SQLite target

@@ -20,9 +20,14 @@ import (
 // The broker stamps every change of an incremental with the PARENT position
 // (BRK-1) and gives those changes no apply identity, so ADR-0190's apply marks
 // cannot skip them. A run interrupted partway through an incremental therefore
-// re-applies the WHOLE incremental on the next run. That is harmless on a table
-// the applier upserts into and silently duplicating on a table it plain-INSERTs
-// into. Until broker changes carry an apply identity (the exactly-once
+// re-applies the WHOLE incremental on the next run. On a table the applier
+// upserts into, that converges for inserts and same-key updates/deletes; it
+// silently duplicates on a table it plain-INSERTs into. A key-CHANGING
+// incremental does not converge even on an upserted table — its re-run fails
+// on the key every time, or, when a key value moved onto another row, applies
+// a change to the wrong row silently (audit backlog F-E1-KEY-REUSE-REPLAY;
+// [brokerIncrementalPartialError] says so). Until broker changes carry an
+// apply identity (the exactly-once
 // follow-up, which lifts the refusal), the broker:
 //
 //   - refuses keyless tables before it applies anything
