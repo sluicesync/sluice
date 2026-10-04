@@ -14,7 +14,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 )
 
-// TestRowWriter_ProbeReplayKey_Vitess pins the F-E1 replay-door surfaces on a
+// TestVStream_ProbeReplayKey_Vitess pins the F-E1 replay-door surfaces on a
 // vtgate-fronted target, unsharded and sharded. Both probes read
 // information_schema through vtgate scoped to the session's DATABASE(), and
 // the premise that vtgate answers that for the keyspace —
@@ -24,7 +24,7 @@ import (
 // "absent" for every table would make both doors inert on PlanetScale and
 // Vitess: "absent" is judged on the recorded schema alone, and "empty" is
 // never refused.
-func TestRowWriter_ProbeReplayKey_Vitess(t *testing.T) {
+func TestVStream_ProbeReplayKey_Vitess(t *testing.T) {
 	for _, shards := range []int{1, 2} {
 		t.Run(map[int]string{1: "unsharded", 2: "sharded"}[shards], func(t *testing.T) {
 			dsn, _, _, cleanup := startVTTestServerWithShards(t, shards)
