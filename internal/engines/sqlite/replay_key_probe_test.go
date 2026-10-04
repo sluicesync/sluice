@@ -136,6 +136,22 @@ func TestRowWriter_ProbeReplayKey_ShapeMatrix(t *testing.T) {
 			ir.Row{"id": int64(1)},
 			true, false, duplicates, false,
 		},
+		// The same class with the surrogate declared NOT NULL, so the
+		// nullability arm cannot refuse it and only the SUPPLY check does
+		// (a mutation run found the two rows above refused by nullability
+		// alone, leaving the supply check ungraded).
+		{
+			"surrogate_not_null_autoincrement", `CREATE TABLE surrogate_not_null_autoincrement (sid INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, id INTEGER NOT NULL, v TEXT)`,
+			[]*ir.Column{col("id", i64, false), v},
+			ir.Row{"id": int64(1)},
+			true, false, duplicates, false,
+		},
+		{
+			"surrogate_not_null_default_expr", `CREATE TABLE surrogate_not_null_default_expr (sid TEXT NOT NULL PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))), id INTEGER NOT NULL, v TEXT)`,
+			[]*ir.Column{col("id", i64, false), v},
+			ir.Row{"id": int64(1)},
+			true, false, duplicates, false,
+		},
 		// Two keys, one supplied: a plain INSERT collides on every unique
 		// key, so the supplied one is enough.
 		{

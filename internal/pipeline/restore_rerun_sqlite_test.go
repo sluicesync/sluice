@@ -97,7 +97,9 @@ func TestRestoreRerun_SQLiteTarget(t *testing.T) {
 		{"rowid alias declared without NOT NULL", `CREATE TABLE logs (id INTEGER PRIMARY KEY, v TEXT)`, "", true, "target table"},
 		{
 			"target keyed on a surrogate", `CREATE TABLE logs (id INTEGER PRIMARY KEY, v TEXT)`,
-			`CREATE TABLE logs (sid INTEGER PRIMARY KEY AUTOINCREMENT, id INTEGER NOT NULL, v TEXT)`,
+			// NOT NULL so only the SUPPLY check can refuse it (an INTEGER
+			// PRIMARY KEY otherwise reads as nullable and is refused anyway).
+			`CREATE TABLE logs (sid INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, id INTEGER NOT NULL, v TEXT)`,
 			true, "target table",
 		},
 	}
