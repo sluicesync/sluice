@@ -39,8 +39,8 @@
 // announce itself as a duplicate-key collision. Acquiring a connection
 // WRITES NOTHING, so there is no prior attempt to be ambiguous about and
 // no row that could be doubled — a re-acquire is idempotent by
-// construction. That is why this helper has no [irbackup.TableReplayIdempotent]
-// gate and MUST NOT grow one: refusing a keyless table's acquire would
+// construction. That is why this helper has no replay-key gate
+// ([irbackup.JudgeReplayKey]) and MUST NOT grow one: refusing a keyless table's acquire would
 // be a pure regression (the flush that follows still gets the carve-out).
 
 package mysql

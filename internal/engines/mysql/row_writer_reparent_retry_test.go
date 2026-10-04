@@ -60,6 +60,16 @@ type flushScript struct {
 	targetEngine   string
 	engineProbeErr error
 
+	// target scripts the catalog the F-E1 re-send gate's ProbeReplayKey
+	// reads (information_schema TABLES / COLUMNS / STATISTICS). nil answers
+	// the shape every pre-existing test writes into: a table holding
+	// `id` NOT NULL and `v` NULL, keyed PRIMARY KEY (id) — a key the rows
+	// supply. replayProbes counts the existence queries, i.e. how many
+	// times the gate actually probed.
+	target          *scriptTarget
+	replayProbes    atomic.Int64
+	replayProbeErrs []error
+
 	execCalls atomic.Int64 // total INSERT ExecContext calls
 	opens     atomic.Int64 // total driver.Open calls (distinct conns)
 }
@@ -112,6 +122,9 @@ func (c scriptConn) QueryContext(_ context.Context, query string, _ []driver.Nam
 	if strings.Contains(query, "@@local_infile") {
 		return &singleValueRows{col: "@@local_infile", val: "1"}, nil
 	}
+	if rows, ok, err := c.script.replayProbeRows(query); ok {
+		return rows, err
+	}
 	if strings.Contains(query, "information_schema.TABLES") {
 		if c.script.engineProbeErr != nil {
 			return nil, c.script.engineProbeErr
@@ -123,6 +136,92 @@ func (c scriptConn) QueryContext(_ context.Context, query string, _ []driver.Nam
 		return &singleValueRows{col: "ENGINE", val: eng}, nil
 	}
 	return &emptyWarningsRows{}, nil
+}
+
+// scriptTarget is the target table [RowWriter.ProbeReplayKey] reads from a
+// scripted driver.
+type scriptTarget struct {
+	missing bool
+	// cols: name → {nullable, generated}.
+	cols map[string][2]bool
+	// keys: unique index name (PRIMARY for the primary key) → key parts.
+	keys map[string][]string
+}
+
+// defaultScriptTarget is `id` NOT NULL PRIMARY KEY, `v` NULL.
+var defaultScriptTarget = &scriptTarget{
+	cols: map[string][2]bool{"id": {false, false}, "v": {true, false}},
+	keys: map[string][]string{"PRIMARY": {"id"}},
+}
+
+// surrogateScriptTarget is the F-E1 shape: the rows' `id`/`v` plus an
+// AUTO_INCREMENT `sid` the rows never carry, which is the only key.
+var surrogateScriptTarget = &scriptTarget{
+	cols: map[string][2]bool{"sid": {false, false}, "id": {false, false}, "v": {true, false}},
+	keys: map[string][]string{"PRIMARY": {"sid"}},
+}
+
+// replayProbeRows answers ProbeReplayKey's three catalog queries. The
+// (i+1)-th existence query fails with replayProbeErrs[i] when that is set.
+func (s *flushScript) replayProbeRows(query string) (driver.Rows, bool, error) {
+	tgt := s.target
+	if tgt == nil {
+		tgt = defaultScriptTarget
+	}
+	switch {
+	case strings.Contains(query, "COUNT(*) FROM information_schema.TABLES"):
+		n := s.replayProbes.Add(1)
+		if idx := int(n - 1); idx < len(s.replayProbeErrs) && s.replayProbeErrs[idx] != nil {
+			return nil, true, s.replayProbeErrs[idx]
+		}
+		count := "1"
+		if tgt.missing {
+			count = "0"
+		}
+		return &singleValueRows{col: "COUNT(*)", val: count}, true, nil
+	case strings.Contains(query, "information_schema.COLUMNS"):
+		var out [][]string
+		for name, shape := range tgt.cols {
+			nullable, gen := "NO", ""
+			if shape[0] {
+				nullable = "YES"
+			}
+			if shape[1] {
+				gen = "expr"
+			}
+			out = append(out, []string{name, nullable, gen})
+		}
+		return &tableRows{cols: []string{"COLUMN_NAME", "IS_NULLABLE", "GENERATION_EXPRESSION"}, rows: out}, true, nil
+	case strings.Contains(query, "information_schema.STATISTICS"):
+		var out [][]string
+		for idx, parts := range tgt.keys {
+			for _, p := range parts {
+				out = append(out, []string{idx, p})
+			}
+		}
+		return &tableRows{cols: []string{"INDEX_NAME", "COLUMN_NAME"}, rows: out}, true, nil
+	}
+	return nil, false, nil
+}
+
+// tableRows is a fixed multi-column text result.
+type tableRows struct {
+	cols []string
+	rows [][]string
+	next int
+}
+
+func (r *tableRows) Columns() []string { return r.cols }
+func (r *tableRows) Close() error      { return nil }
+func (r *tableRows) Next(dest []driver.Value) error {
+	if r.next >= len(r.rows) {
+		return io.EOF
+	}
+	for i, v := range r.rows[r.next] {
+		dest[i] = []byte(v)
+	}
+	r.next++
+	return nil
 }
 
 // singleValueRows is a one-column, one-row result for the scalar session

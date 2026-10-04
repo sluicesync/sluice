@@ -218,9 +218,16 @@ func (w *RowWriter) quiesceAndReportTransient(err error, what string) error {
 // a rolled-back attempt wrote nothing, so replaying the buffered chunk is
 // clean (no dup, no partial). The committed-but-unacked branch is the one the
 // file header now spells out, and it is why this helper takes the *ir.Table
-// rather than its name: a table with no PRIMARY KEY and no all-NOT-NULL
-// UNIQUE index cannot notice a doubled chunk, so the replay is refused for it
-// (audit B-9). The first error is routed through
+// rather than its name: a table with no key the rows carry and collide on —
+// no PRIMARY KEY and no all-NOT-NULL UNIQUE index in the recorded schema, or
+// on the target only a bigserial / identity / defaulted surrogate the rows
+// never supply — cannot notice a doubled chunk, so the replay is refused for
+// it (audit B-9, F-E1; judged by [irbackup.ReplayKeyCache.Judge] over this
+// writer's own [RowWriter.ProbeReplayKey], probed at the first retry
+// decision for the table and memoised). As on MySQL, the cold copy adds
+// UNIQUE indexes after the data, so a PK-less source keyed by a NOT NULL
+// UNIQUE index has no target key while its chunks copy and a transient there
+// refuses. The first error is routed through
 // classifyApplierError; the loop retries ONLY a transient that satisfies
 // ir.RetriableError (53100 disk-full / 57P0x reparent / 08* connection / bad
 // conn) — exactly the storage-grow / serving-transition set. Any non-
@@ -233,7 +240,6 @@ func (w *RowWriter) copyChunkWithRetry(
 	attempt func(ctx context.Context) error,
 ) error {
 	tableName := pgTableNameOf(table)
-	replaySafe := irbackup.TableReplayIdempotent(table)
 	// ADR-0110: quiesce with the run's other cold-copy lanes if a coordinated
 	// grow-window pause is in effect before the first try.
 	if err := w.awaitGrowGate(ctx); err != nil {
@@ -262,15 +268,23 @@ func (w *RowWriter) copyChunkWithRetry(
 		// gate so every sibling cold-copy lane quiesces together for the grow
 		// window instead of independently hammering the struggling target.
 		w.tripGrowGate("postgres cold-copy chunk transient: "+err.Error(), err)
-		// Audit B-9 (PG sibling): the replay below re-COPIES a byte-identical
-		// chunk. Safe when the prior attempt rolled back, and safe-because-
-		// loud on a keyed table when it did not (23505). On a keyless table
-		// neither the target nor this code can tell the two apart, so the
-		// chunk would silently double. Refuse before replaying. The Trip
-		// above still runs — the transient was real and the sibling lanes
-		// should still quiesce.
-		if !replaySafe {
-			return errKeylessAmbiguousReplay(tableName, rows, err)
+		// Audit B-9 + F-E1 (PG sibling): the replay below re-COPIES a
+		// byte-identical chunk. Safe when the prior attempt rolled back, and
+		// safe-because-loud (23505) or converging (the idempotent core's
+		// upsert) when it did not — but only if a re-sent row COLLIDES, on a
+		// key of the TARGET made of columns the rows carry. A table keyless
+		// in the recorded schema has none; neither does a target keyed only
+		// on a bigserial / identity / defaulted surrogate the rows never
+		// supply, which draws a fresh value for every re-sent row. There
+		// neither the target nor this code can tell the two outcomes apart,
+		// so the chunk would silently double. Refuse before replaying. The
+		// judgment is the replay doors' own (irbackup.JudgeReplayKey via this
+		// writer's ProbeReplayKey), memoised per table. The Trip above still
+		// runs — the transient was real and the sibling lanes should still
+		// quiesce.
+		verdict, judgeErr := w.replayKeys.Judge(ctx, w.replayKeyProber(), table)
+		if judgeErr == nil && verdict != irbackup.ReplayKeyCollides {
+			return errKeylessAmbiguousReplay(tableName, rows, verdict, err)
 		}
 		// Terminal on the WALL-CLOCK deadline (the real bound) or the runaway
 		// attempt backstop. A genuinely-wedged target surfaces loudly after
@@ -314,6 +328,16 @@ func (w *RowWriter) copyChunkWithRetry(
 		if aerr := w.awaitGrowGate(ctx); aerr != nil {
 			return aerr
 		}
+		// The re-send gate above could not answer — its catalog probe hit
+		// the same struggling target. Never replay unjudged: ride the window
+		// and ask again. The probe's error becomes the one the next
+		// iteration classifies, so a non-transient probe failure ends the
+		// copy loudly instead of looping.
+		if judgeErr != nil {
+			err = fmt.Errorf("postgres: cold-copy into %q: judge whether replaying the chunk (%d rows) "+
+				"can duplicate it: %w", tableName, rows, judgeErr)
+			continue
+		}
 		// attempt() re-acquires a FRESH conn from the pool (the pinned conn is
 		// dead after a reparent / a 53100 may have poisoned the COPY) and
 		// replays the buffered chunk. NEVER reuse a dead conn.
@@ -334,29 +358,35 @@ func pgTableNameOf(table *ir.Table) string {
 }
 
 // errKeylessAmbiguousReplay is the PG twin of the MySQL core's refusal
-// (audit B-9). Same predicate ([irbackup.TableReplayIdempotent]), same
-// code, same reasoning: a transient that arrived after the server
-// committed the chunk but before the client saw the acknowledgement is
-// indistinguishable from one that rolled it back, and a table with no
-// PRIMARY KEY and no NOT NULL UNIQUE index has nothing that would make
-// the second COPY of those rows fail. The MySQL helper's doc carries
-// the full refuse-vs-reconcile argument; it applies here unchanged.
+// (audit B-9, widened by F-E1). Same predicate ([irbackup.JudgeReplayKey]
+// through [irbackup.ReplayKeyCache]), same code, same reasoning: a
+// transient that arrived after the server committed the chunk but before
+// the client saw the acknowledgement is indistinguishable from one that
+// rolled it back, and a table with no key the rows carry and collide on —
+// none in the recorded schema, or on the target only a surrogate the rows
+// never supply — has nothing that would make the second COPY of those rows
+// fail. The MySQL helper's doc carries the full refuse-vs-reconcile
+// argument; it applies here unchanged.
 //
-// The PG-specific note: on a KEYED table this path would have surfaced a
-// 23505 rather than duplicating, so the refusal changes behaviour only
-// for the keyless case — which is exactly the case that was silent.
-func errKeylessAmbiguousReplay(tableName string, rows int, cause error) error {
+// The PG-specific notes. On a table whose target key the rows supply, this
+// path surfaces a 23505 (COPY) or converges (the idempotent core's upsert)
+// rather than duplicating, so the refusal changes behaviour only where the
+// replay was silent. The key judged is the one the change applier would
+// arbitrate on (the PRIMARY KEY before any UNIQUE index), so a target with
+// an unsupplied surrogate PRIMARY KEY beside a supplied NOT NULL UNIQUE
+// index is refused although a re-COPY there would fail loudly on that
+// index: conservative, and the doors' own stated residual.
+func errKeylessAmbiguousReplay(tableName string, rows int, verdict irbackup.ReplayKeyVerdict, cause error) error {
 	return sluicecode.Wrap(
 		sluicecode.CodeCopyRetryAmbiguousKeyless,
-		"add a PRIMARY KEY or a NOT NULL UNIQUE index to the table, then re-run",
+		verdict.RemedyHint(),
 		fmt.Errorf(
-			"postgres: cold-copy into %q: the target hit a transient error mid-chunk (%d rows) and this table has "+
-				"no PRIMARY KEY and no NOT NULL UNIQUE index, so replaying the chunk could silently duplicate every "+
-				"row in it: an attempt that committed but lost its acknowledgement is indistinguishable from one "+
-				"that rolled back, and with no unique key there is no constraint violation to tell them apart. "+
-				"Refusing rather than risking duplicate rows. Add a PRIMARY KEY or a NOT NULL UNIQUE index to the "+
-				"source table and re-run, or re-run this table's copy from an empty target: %w",
-			tableName, rows, cause,
+			"postgres: cold-copy into %q: the target hit a transient error mid-chunk (%d rows) and this table %s, "+
+				"so replaying the chunk could silently duplicate every row in it: an attempt that committed but lost "+
+				"its acknowledgement is indistinguishable from one that rolled back, and with no key the rows collide "+
+				"on there is no constraint violation to tell them apart. Refusing rather than risking duplicate rows. "+
+				"Remedy: %s; or re-run this table's copy from an empty target: %w",
+			tableName, rows, verdict.Describe(), verdict.RemedyHint(), cause,
 		),
 	)
 }

@@ -20,6 +20,7 @@ import (
 	mysqldriver "github.com/go-sql-driver/mysql"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
@@ -170,6 +171,14 @@ type RowWriter struct {
 	// its batches hit the transient.
 	reparentObserver func(table string)
 	reparentSeen     sync.Map
+
+	// replayKeys memoises this writer's own [RowWriter.ProbeReplayKey]
+	// answer per table for [RowWriter.flushWithReparentRetry]'s re-send
+	// gate (audit B-9 + F-E1): a retry is licensed only when a re-sent row
+	// collides on a target key the rows supply. Probed lazily, at the
+	// first retry decision for a table, so a copy that never meets a
+	// transient never probes. Zero value ready.
+	replayKeys irbackup.ReplayKeyCache
 }
 
 // SetGrowGate implements [ir.GrowGateSetter] (ADR-0110). The pipeline

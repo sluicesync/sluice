@@ -170,6 +170,34 @@ The grow gate is still tripped and the reparent still recorded before the
 refusal: the transient was real, so the sibling lanes should still
 quiesce and the restore reconciler should still hear about the table.
 
+> **Widened 2026-10-04 (audit F-E1, second review).** "Keyless" is not a
+> property of the recorded table alone. A target created before the copy
+> and keyed only on a column the rows do not supply — an `AUTO_INCREMENT`,
+> `bigserial`, identity or defaulted surrogate — has a key, and the
+> recorded table has one too, but a re-sent row draws a fresh surrogate
+> value and collides with nothing: branch (2) doubles the batch exactly
+> as on a keyless table (measured on both engines with a real
+> committed-then-ack-lost injection). Both retry gates
+> (`flushWithReparentRetry`, `copyChunkWithRetry`) now judge with the
+> replay doors' own predicate, `irbackup.JudgeReplayKey` — the recorded
+> table first, then the writer's `ProbeReplayKey` against the target,
+> asking whether the key the write path collides on is made of columns
+> the rows carry — memoised per table per writer
+> (`irbackup.ReplayKeyCache`) and probed only at the first retry decision,
+> so a copy that meets no transient never probes. A probe that cannot
+> answer never licenses a re-send: a transient probe failure is ridden
+> like any other, a terminal one ends the copy loudly. Two consequences,
+> stated: the cold copy adds UNIQUE indexes after the data, so a PK-less
+> source table keyed only by a NOT NULL UNIQUE index has no target key
+> while it copies and now refuses on a transient (a re-send there would
+> land twice and fail the later index build); and on Postgres the key
+> judged is the applier's `ON CONFLICT` arbiter, so a surrogate PRIMARY
+> KEY beside a supplied UNIQUE index is refused although a re-COPY there
+> would fail loudly on that index. Pins:
+> `TestColdCopyRetry_SurrogateKeyedTarget_AckLostRefuses` (both engines,
+> real servers), `TestColdCopyReparentRetry_UnsuppliedTargetKeyRefusesOnEveryCore`,
+> `TestPGCopyChunkRetry_UnsuppliedTargetKeyRefuses`.
+
 **Refuse, not reconcile — and why.** The audit's alternative was a
 post-table `COUNT(*)` reconciliation, which detects instead of prevents
 and would keep a keyless table riding a reparent. It was rejected because

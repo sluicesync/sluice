@@ -79,7 +79,7 @@ func diskFull53100() error {
 func TestPGCopyChunkRetry_AwaitsBeforeEachAttempt(t *testing.T) {
 	withFastPGCopyBackoff(t)
 	gate := &recordingGrowGate{}
-	w := &RowWriter{growGate: gate}
+	w := &RowWriter{growGate: gate, replayKeyProbeForTest: keyedReplayProbe()}
 
 	var calls int
 	err := w.copyChunkWithRetry(context.Background(), pgKeyedPinTable("t"), 3, func(context.Context) error {
@@ -106,7 +106,7 @@ func TestPGCopyChunkRetry_AwaitsBeforeEachAttempt(t *testing.T) {
 func TestPGCopyChunkRetry_TripsOnClassifiedTransient(t *testing.T) {
 	withFastPGCopyBackoff(t)
 	gate := &recordingGrowGate{}
-	w := &RowWriter{growGate: gate}
+	w := &RowWriter{growGate: gate, replayKeyProbeForTest: keyedReplayProbe()}
 
 	var calls int
 	err := w.copyChunkWithRetry(context.Background(), pgKeyedPinTable("t"), 1, func(context.Context) error {
@@ -130,7 +130,7 @@ func TestPGCopyChunkRetry_TripsOnClassifiedTransient(t *testing.T) {
 func TestPGCopyChunkRetry_NoTripNoRetryOnTerminal(t *testing.T) {
 	withFastPGCopyBackoff(t)
 	gate := &recordingGrowGate{}
-	w := &RowWriter{growGate: gate}
+	w := &RowWriter{growGate: gate, replayKeyProbeForTest: keyedReplayProbe()}
 
 	terminal := &pgconn.PgError{Code: "23505", Message: "duplicate key value violates unique constraint"}
 	var calls int
@@ -162,7 +162,7 @@ func TestPGCopyChunkRetry_LoudOnExhaustion(t *testing.T) {
 	withFastPGCopyBackoff(t)
 	pgCopyReparentMaxWallVar = 20 * time.Millisecond // exhaust quickly
 	gate := &recordingGrowGate{}
-	w := &RowWriter{growGate: gate}
+	w := &RowWriter{growGate: gate, replayKeyProbeForTest: keyedReplayProbe()}
 
 	err := w.copyChunkWithRetry(context.Background(), pgKeyedPinTable("big_table"), 42, func(context.Context) error {
 		return diskFull53100() // never clears
@@ -188,7 +188,7 @@ func TestPGCopyChunkRetry_LoudOnExhaustion(t *testing.T) {
 func TestPGCopyChunkRetry_AwaitCtxCancelHalts(t *testing.T) {
 	withFastPGCopyBackoff(t)
 	gate := &recordingGrowGate{}
-	w := &RowWriter{growGate: gate}
+	w := &RowWriter{growGate: gate, replayKeyProbeForTest: keyedReplayProbe()}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // Await returns ctx.Err() immediately
@@ -212,7 +212,7 @@ func TestPGCopyChunkRetry_AwaitCtxCancelHalts(t *testing.T) {
 // pins the retry helper itself degrades cleanly.)
 func TestPGCopyChunkRetry_NilGateInert(t *testing.T) {
 	withFastPGCopyBackoff(t)
-	w := &RowWriter{} // nil growGate
+	w := &RowWriter{replayKeyProbeForTest: keyedReplayProbe()} // nil growGate
 
 	var calls int
 	err := w.copyChunkWithRetry(context.Background(), pgKeyedPinTable("t"), 1, func(context.Context) error {
@@ -251,7 +251,7 @@ func TestWriteViaCopyChunked_TerminalErrorSurfacesLoudly(t *testing.T) {
 	withSmallChunkUnit(t, 2) // 5 rows / 2 ⇒ several chunks; the first faults terminally
 
 	gate := &recordingGrowGate{}
-	w := &RowWriter{growGate: gate} // nil db: the hook short-circuits before Conn()
+	w := &RowWriter{growGate: gate, replayKeyProbeForTest: keyedReplayProbe()} // nil db: the hook short-circuits before Conn()
 
 	// A terminal SQLSTATE: 42501 insufficient_privilege. classifyApplierError
 	// returns it unchanged (not in the retriable set), so the retry loop must

@@ -20,6 +20,7 @@ import (
 	"github.com/jackc/pgx/v5/stdlib"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
@@ -158,6 +159,35 @@ type RowWriter struct {
 	// the replay converges with no dup/drop against a real PG. nil in every
 	// production path (set only from a _test.go in this package).
 	copyChunkFaultHook func(attempt int) error
+
+	// copyChunkAckLossHook is copyChunkFaultHook's other half, TEST-ONLY:
+	// consulted AFTER a chunk's CopyFrom has COMMITTED, a non-nil return
+	// stands in for the connection dropping before the client saw the
+	// acknowledgement — the committed-but-unacked branch the retry gate's
+	// keyed/keyless decision exists for. nil in every production path.
+	copyChunkAckLossHook func(attempt int) error
+
+	// replayKeys memoises this writer's own [RowWriter.ProbeReplayKey]
+	// answer per table for [RowWriter.copyChunkWithRetry]'s re-send gate
+	// (audit B-9 + F-E1). Probed lazily at the first retry decision for a
+	// table; reset by [RowWriter.SetSchema], which moves the probe's scope.
+	// Zero value ready.
+	replayKeys irbackup.ReplayKeyCache
+
+	// replayKeyProbeForTest, TEST-ONLY, substitutes the prober the re-send
+	// gate asks (see [RowWriter.replayKeyProber]) for a unit test whose
+	// writer has no database. nil in every production path.
+	replayKeyProbeForTest ir.ReplayKeyProber
+}
+
+// replayKeyProber is the prober copyChunkWithRetry's re-send gate asks: the
+// writer itself — the same ProbeReplayKey the replay doors call — unless a
+// unit test substituted a scripted one.
+func (w *RowWriter) replayKeyProber() ir.ReplayKeyProber {
+	if w.replayKeyProbeForTest != nil {
+		return w.replayKeyProbeForTest
+	}
+	return w
 }
 
 // SetCopyDurableProgress implements [ir.CopyDurableProgressReporter]
@@ -190,6 +220,7 @@ func (w *RowWriter) SetSchema(name string) {
 		return
 	}
 	w.schema = name
+	w.replayKeys.Reset()
 }
 
 // Close releases the underlying connection pool.
@@ -647,6 +678,11 @@ func (w *RowWriter) writeViaCopyChunked(ctx context.Context, table *ir.Table, ro
 			if copyErr != nil {
 				return fmt.Errorf("postgres: copy chunk into %q (%d of %d rows copied before error): %w",
 					table.Name, copied, len(chunk), copyErr)
+			}
+			// TEST-ONLY (nil in production): the chunk has committed; a
+			// fault here is the acknowledgement lost after the commit.
+			if w.copyChunkAckLossHook != nil {
+				return w.copyChunkAckLossHook(attemptNo)
 			}
 			return nil
 		})

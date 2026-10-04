@@ -130,19 +130,22 @@ func FindReplayKeylessTables(
 				continue
 			}
 		}
-		if !irbackup.TableReplayIdempotent(t) {
-			out = append(out, ReplayKeylessTable{Name: t.Name, Reason: ReplayKeylessRecorded})
-			continue
-		}
-		if prober == nil {
-			continue
-		}
-		exists, keyed, err := prober.ProbeReplayKey(ctx, t)
+		// One predicate for the doors and the engines' in-run retry gates
+		// (irbackup.JudgeReplayKey). A nil prober (ProbeTarget off) judges
+		// the recorded schema alone. A table absent on the target passes:
+		// it will be created from the recorded schema, key included.
+		verdict, err := irbackup.JudgeReplayKey(ctx, prober, t)
 		if err != nil {
 			return nil, fmt.Errorf("probe target table %q for a replay key: %w", t.Name, err)
 		}
-		if exists && !keyed {
+		switch verdict {
+		case irbackup.ReplayKeylessRecorded:
+			out = append(out, ReplayKeylessTable{Name: t.Name, Reason: ReplayKeylessRecorded})
+		case irbackup.ReplayKeylessTarget:
 			out = append(out, ReplayKeylessTable{Name: t.Name, Reason: ReplayKeylessTarget})
+		case irbackup.ReplayKeyCollides, irbackup.ReplayTargetAbsent:
+		default:
+			return nil, fmt.Errorf("judge table %q for a replay key: unknown verdict %d", t.Name, verdict)
 		}
 	}
 	return out, nil

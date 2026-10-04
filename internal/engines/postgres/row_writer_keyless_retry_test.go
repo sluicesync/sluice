@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
@@ -44,6 +45,30 @@ func pgKeyedPinTable(name string) *ir.Table {
 	}
 }
 
+// scriptedReplayProbe stands in for [RowWriter.ProbeReplayKey] on a
+// database-less unit-test writer, answering a fixed target shape and
+// counting how often the re-send gate asked.
+type scriptedReplayProbe struct {
+	exists, keyed bool
+	// errs[i], when non-nil, is the (i+1)-th call's error.
+	errs  []error
+	calls atomic.Int64
+}
+
+func (p *scriptedReplayProbe) ProbeReplayKey(context.Context, *ir.Table) (exists, keyed bool, err error) {
+	n := p.calls.Add(1)
+	if idx := int(n - 1); idx < len(p.errs) && p.errs[idx] != nil {
+		return false, false, p.errs[idx]
+	}
+	return p.exists, p.keyed, nil
+}
+
+// keyedReplayProbe answers "the target has a key the rows supply" — the
+// shape every pre-F-E1 retry test writes into.
+func keyedReplayProbe() *scriptedReplayProbe {
+	return &scriptedReplayProbe{exists: true, keyed: true}
+}
+
 // pgKeylessPinTable has no PRIMARY KEY and no unique index at all.
 func pgKeylessPinTable(name string) *ir.Table {
 	return &ir.Table{
@@ -60,7 +85,7 @@ func pgKeylessPinTable(name string) *ir.Table {
 func TestPGCopyChunkRetry_KeylessRefusesRatherThanReplay(t *testing.T) {
 	withFastPGCopyBackoff(t)
 	gate := &recordingGrowGate{}
-	w := &RowWriter{growGate: gate}
+	w := &RowWriter{growGate: gate, replayKeyProbeForTest: keyedReplayProbe()}
 
 	attempts := 0
 	err := w.copyChunkWithRetry(context.Background(), pgKeylessPinTable("events_raw"), 7, func(context.Context) error {
@@ -91,7 +116,7 @@ func TestPGCopyChunkRetry_KeylessRefusesRatherThanReplay(t *testing.T) {
 // other side: a keyed table keeps riding the storage-grow window.
 func TestPGCopyChunkRetry_KeyedStillReplays(t *testing.T) {
 	withFastPGCopyBackoff(t)
-	w := &RowWriter{growGate: &recordingGrowGate{}}
+	w := &RowWriter{growGate: &recordingGrowGate{}, replayKeyProbeForTest: keyedReplayProbe()}
 
 	attempts := 0
 	err := w.copyChunkWithRetry(context.Background(), pgKeyedPinTable("orders"), 3, func(context.Context) error {
@@ -114,7 +139,7 @@ func TestPGCopyChunkRetry_KeyedStillReplays(t *testing.T) {
 // never hits a transient copies exactly as before.
 func TestPGCopyChunkRetry_KeylessCleanChunkIsUnaffected(t *testing.T) {
 	withFastPGCopyBackoff(t)
-	w := &RowWriter{growGate: &recordingGrowGate{}}
+	w := &RowWriter{growGate: &recordingGrowGate{}, replayKeyProbeForTest: keyedReplayProbe()}
 
 	attempts := 0
 	if err := w.copyChunkWithRetry(context.Background(), pgKeylessPinTable("events_raw"), 3, func(context.Context) error {
@@ -221,17 +246,21 @@ func TestPGReplayKeyPredicatesAgree(t *testing.T) {
 // TestPGKeylessAmbiguousReplayRefusalShape pins the operator-facing surface.
 func TestPGKeylessAmbiguousReplayRefusalShape(t *testing.T) {
 	cause := errors.New(`could not extend file "base/1/2": No space left on device`)
-	err := errKeylessAmbiguousReplay("events_raw", 50000, cause)
-	if !errors.Is(err, cause) {
-		t.Error("the refusal must wrap the underlying transient so it stays diagnosable")
-	}
-	ce, ok := sluicecode.FromError(err)
-	if !ok || ce.Code != sluicecode.CodeCopyRetryAmbiguousKeyless {
-		t.Errorf("code = %v (coded=%v); want %s", ce, ok, sluicecode.CodeCopyRetryAmbiguousKeyless)
-	}
-	for _, want := range []string{"events_raw", "50000", "PRIMARY KEY"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("message must contain %q; got: %v", want, err)
+	for _, v := range []irbackup.ReplayKeyVerdict{
+		irbackup.ReplayKeylessRecorded, irbackup.ReplayKeylessTarget, irbackup.ReplayTargetAbsent,
+	} {
+		err := errKeylessAmbiguousReplay("events_raw", 50000, v, cause)
+		if !errors.Is(err, cause) {
+			t.Error("the refusal must wrap the underlying transient so it stays diagnosable")
+		}
+		ce, ok := sluicecode.FromError(err)
+		if !ok || ce.Code != sluicecode.CodeCopyRetryAmbiguousKeyless {
+			t.Errorf("code = %v (coded=%v); want %s", ce, ok, sluicecode.CodeCopyRetryAmbiguousKeyless)
+		}
+		for _, want := range []string{"events_raw", "50000", "PRIMARY KEY", v.Describe(), v.RemedyHint()} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("verdict %d: message must contain %q; got: %v", v, want, err)
+			}
 		}
 	}
 }

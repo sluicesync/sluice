@@ -281,16 +281,22 @@ func TestReplayKeyPredicatesAgree(t *testing.T) {
 // the code, the wrapped cause, and that the message names the table.
 func TestKeylessAmbiguousReplayRefusalShape(t *testing.T) {
 	cause := errors.New("vttablet: code = Unavailable desc = tablet not serving")
-	err := errKeylessAmbiguousReplay("orders_audit", 500, cause)
-	if !errors.Is(err, cause) {
-		t.Error("the refusal must wrap the underlying transient so it stays diagnosable")
-	}
-	ce, ok := sluicecode.FromError(err)
-	if !ok || ce.Code != sluicecode.CodeCopyRetryAmbiguousKeyless {
-		t.Errorf("code = %v (coded=%v); want %s", ce, ok, sluicecode.CodeCopyRetryAmbiguousKeyless)
-	}
-	if !containsAll(err.Error(), "orders_audit", "500") {
-		t.Errorf("message must name the table and the batch size; got: %v", err)
+	for _, v := range []irbackup.ReplayKeyVerdict{
+		irbackup.ReplayKeylessRecorded, irbackup.ReplayKeylessTarget, irbackup.ReplayTargetAbsent,
+	} {
+		err := errKeylessAmbiguousReplay("orders_audit", 500, v, cause)
+		if !errors.Is(err, cause) {
+			t.Error("the refusal must wrap the underlying transient so it stays diagnosable")
+		}
+		ce, ok := sluicecode.FromError(err)
+		if !ok || ce.Code != sluicecode.CodeCopyRetryAmbiguousKeyless {
+			t.Errorf("code = %v (coded=%v); want %s", ce, ok, sluicecode.CodeCopyRetryAmbiguousKeyless)
+		}
+		// Which judgment failed is the operator's next step, so the
+		// verdict's own clause and remedy must both be in the message.
+		if !containsAll(err.Error(), "orders_audit", "500", v.Describe(), v.RemedyHint()) {
+			t.Errorf("verdict %d: message must name the table, the batch size, the verdict and its remedy; got: %v", v, err)
+		}
 	}
 }
 

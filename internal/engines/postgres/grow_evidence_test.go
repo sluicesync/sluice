@@ -227,7 +227,7 @@ func TestPGGrowEvidence_TripSitePassesTheDerivedVerdict(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			gate := &recordingGrowGate{}
-			w := &RowWriter{growGate: gate}
+			w := &RowWriter{growGate: gate, replayKeyProbeForTest: keyedReplayProbe()}
 			calls := 0
 			err := w.copyChunkWithRetry(t.Context(), pgKeyedPinTable("t"), 10, func(context.Context) error {
 				calls++

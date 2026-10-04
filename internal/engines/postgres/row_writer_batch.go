@@ -162,15 +162,22 @@ func (w *RowWriter) writeViaBatchIdempotent(ctx context.Context, table *ir.Table
 		// INSERT core next door gets Await + Trip but NOT replay, for the
 		// mirror-image reason — see writeViaBatch.
 		//
-		// The helper's audit-B-9 keyless gate is unreachable here by
-		// construction — effectiveUpsertKeyColumns already refused a keyless
-		// table upfront (errKeylessIdempotent), and TestPGReplayKeyPredicatesAgree
-		// pins that THIS package's effectiveUpsertKeyColumns and
-		// irbackup.TableReplayIdempotent classify every table shape the same
-		// way. (The mysql package has its own copy of that pin for its own
-		// predicate — one test cannot cover both, since each engine keeps a
-		// private effectiveUpsertKeyColumns.) Riding the same gate anyway is
-		// deliberate: one gate for every caller beats two that can drift apart.
+		// The helper's re-send gate has two halves. Its RECORDED half is
+		// unreachable here by construction — effectiveUpsertKeyColumns
+		// already refused a keyless table upfront (errKeylessIdempotent), and
+		// TestPGReplayKeyPredicatesAgree pins that THIS package's
+		// effectiveUpsertKeyColumns and irbackup.TableReplayIdempotent
+		// classify every table shape the same way. (The mysql package has its
+		// own copy of that pin for its own predicate — one test cannot cover
+		// both, since each engine keeps a private effectiveUpsertKeyColumns.)
+		// Its TARGET half (audit F-E1) is reachable but adds no protection
+		// this path lacks: the ON CONFLICT names the RECORDED key, so a
+		// target without a unique index on it fails 42P10 on the first
+		// attempt, before any retry. It can be stricter than needed — a
+		// target with a surrogate PRIMARY KEY beside a UNIQUE index on the
+		// recorded key converges here, but the gate judges the change
+		// applier's arbiter (the PRIMARY KEY) and refuses the replay. One
+		// gate for every caller beats two that can drift apart.
 		batched := len(batch)
 		var affected int64
 		if err := w.copyChunkWithRetry(ctx, table, batched, func(attemptCtx context.Context) error {

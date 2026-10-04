@@ -56,9 +56,13 @@ import (
 // a plain INSERT. None of those is silent duplication, so excluding them
 // here would only refuse working configurations (the Bug 211 reasoning).
 //
-// Used by the backup orchestrator's anchored-resume guard (task #42,
-// ADR-0085), the engines' replay-retry gates (audit B-9), and the
-// recorded-schema half of the F-E1 replay-duplication doors.
+// It is the recorded half of [JudgeReplayKey], which is what every path
+// that re-writes rows onto a TARGET must call — the F-E1 replay doors and
+// the engines' in-run retry gates (audit B-9). Called alone it answers
+// only for the recorded table, which is right for exactly one caller: the
+// backup orchestrator's anchored-resume guard (task #42, ADR-0085), which
+// runs where no target exists. A new caller that gates a re-write onto a
+// target with this function alone repeats the F-E1 retry-gate defect.
 func TableReplayIdempotent(table *ir.Table) bool {
 	if table == nil {
 		return false

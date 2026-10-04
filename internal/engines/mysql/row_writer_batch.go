@@ -352,15 +352,20 @@ func (w *RowWriter) writeBatchedIdempotentConn(ctx context.Context, conn *sql.Co
 		// replay natively, so no 1062-on-retry tolerance is needed here
 		// (contrast the plain path's wart).
 		//
-		// The helper's audit-B-9 keyless gate is unreachable on this path by
-		// construction — [effectiveUpsertKeyColumns] already refused a
-		// keyless table upfront (errKeylessIdempotent), and
+		// The helper's re-send gate has two halves, and only one is
+		// unreachable here. Its RECORDED half is — [effectiveUpsertKeyColumns]
+		// already refused a keyless table upfront (errKeylessIdempotent), and
 		// TestReplayKeyPredicatesAgree pins that THIS package's
 		// effectiveUpsertKeyColumns and irbackup.TableReplayIdempotent
 		// classify every table shape identically. (Postgres keeps its own
 		// predicate and its own copy of that pin — one test cannot cover
-		// both.) Passing through it anyway is deliberate: ONE gate for every
-		// caller beats two that can drift.
+		// both.) Its TARGET half (audit F-E1) is very much reachable: ON
+		// DUPLICATE KEY UPDATE names no key, it collides on the TARGET's
+		// unique keys, and a target keyed only on an AUTO_INCREMENT surrogate
+		// the rows never supply gives it nothing to collide on — the "upsert
+		// absorbs the replay" argument above holds only when the gate says
+		// it does. Pinned by
+		// TestColdCopyReparentRetry_UnsuppliedTargetKeyRefusesOnEveryCore.
 		if err := w.flushWithReparentRetry(ctx, table, len(batch.rows), func(c *sql.Conn, _ bool) error {
 			if _, err := c.ExecContext(ctx, query, args...); err != nil {
 				return fmt.Errorf("mysql: idempotent insert into %q (%d rows): %w", table.Name, len(batch.rows), err)

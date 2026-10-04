@@ -134,18 +134,32 @@ func coldCopyReparentBackoff(attempt int) time.Duration {
 //     WARNING rather than an error, so its replay tolerance lives in the
 //     post-load warning probe (see [RowWriter.reportLoadDataWarnings]).
 //
-// The KEYLESS CARVE-OUT (audit B-9). Everything above is an argument
-// about a COLLISION, and a collision needs something to collide with. A
-// table with no PRIMARY KEY and no all-NOT-NULL UNIQUE index has nothing
-// — so on such a table the committed-but-unacked branch produces no 1062
-// at all and the retry silently DOUBLE-INSERTS the batch. That is why
-// this helper, not either caller, owns the decision: it takes the
-// *ir.Table and refuses the retry for a table
-// [irbackup.TableReplayIdempotent] reports false for, rather than
-// re-sending a batch whose outcome it cannot distinguish. See
-// [errKeylessAmbiguousReplay] for the reasoning and the remedy, and
-// ADR-0108's "keyless carve-out" section. Putting the gate HERE means a
-// future third caller inherits it instead of re-deriving it.
+// The KEYLESS CARVE-OUT (audit B-9, widened by F-E1). Everything above is
+// an argument about a COLLISION, and a collision needs something to
+// collide with: a key of the TARGET table whose every column the re-sent
+// rows carry. A table with no PRIMARY KEY and no all-NOT-NULL UNIQUE index
+// has nothing; neither does a target keyed only on an AUTO_INCREMENT or
+// defaulted surrogate, because the rows never supply it and every re-sent
+// row draws a fresh value. On either, the committed-but-unacked branch
+// produces no 1062 at all and the retry silently DOUBLE-INSERTS the batch.
+// That is why this helper, not any caller, owns the decision: it takes the
+// *ir.Table and refuses the retry unless [irbackup.ReplayKeyCache.Judge] —
+// the replay doors' predicate, [irbackup.JudgeReplayKey], over this
+// writer's own [RowWriter.ProbeReplayKey] — answers
+// [irbackup.ReplayKeyCollides], rather than re-sending a batch whose
+// outcome it cannot distinguish. See [errKeylessAmbiguousReplay] for the
+// reasoning and the remedy, and ADR-0108's "keyless carve-out" section.
+// Putting the gate HERE means a future fourth caller inherits it instead
+// of re-deriving it.
+//
+// The judgment is the TARGET's catalog as it stands during the copy, and
+// that has a consequence worth stating: the cold copy creates a table with
+// its PRIMARY KEY only, and adds UNIQUE indexes after the data
+// (CreateIndexes), so a PK-less source table keyed by a NOT NULL UNIQUE
+// index has no target key yet when its batches are copied, and a transient
+// there now refuses. That is the truth about that moment — a re-sent batch
+// would land twice and the later CREATE UNIQUE INDEX would fail on it —
+// so it is refused now rather than hours later.
 //
 // The first error is routed through classifyApplierError; the loop
 // retries ONLY when it satisfies ir.RetriableError (the same transient
@@ -165,9 +179,6 @@ func (w *RowWriter) flushWithReparentRetry(
 	firstConn *sql.Conn,
 ) error {
 	tableName := tableNameOf(table)
-	// Derived ONCE per flush: the predicate is pure and the schema cannot
-	// change under a cold copy.
-	replaySafe := irbackup.TableReplayIdempotent(table)
 	// ADR-0110: quiesce with the run's other cold-copy lanes if a
 	// coordinated grow-window pause is in effect. Await is a cheap open
 	// read when no pause is active (the common case) and returns ctx.Err()
@@ -212,18 +223,25 @@ func (w *RowWriter) flushWithReparentRetry(
 		// the first transient was seen (the silent under-copy fix). No-op
 		// when no observer is wired (every non-restore path).
 		w.notifyReparent(tableName)
-		// Audit B-9: the retry below re-sends a byte-identical batch. On a
-		// keyed table that is safe because the two outcomes are
-		// DISTINGUISHABLE after the fact (rolled back ⇒ clean apply;
-		// committed-but-unacked ⇒ 1062, which writeBatchedConn tolerates as
-		// proof the rows landed). On a keyless table they are NOT — both
-		// outcomes look like a clean apply, and one of them has quietly
-		// doubled the batch. Refuse before re-sending. Trip + notifyReparent
+		// Audit B-9 + F-E1: the retry below re-sends a byte-identical batch.
+		// That is safe only when the two outcomes are DISTINGUISHABLE after
+		// the fact (rolled back ⇒ clean apply; committed-but-unacked ⇒ 1062,
+		// which writeBatchedConn tolerates as proof the rows landed, or an
+		// ODKU / LOAD DATA skip on the same key). They are distinguishable
+		// only when a re-sent row COLLIDES — on a key of the TARGET table
+		// made of columns the rows carry. A table keyless in the recorded
+		// schema has no such key; neither does a target keyed only on an
+		// AUTO_INCREMENT or defaulted surrogate the rows never supply, which
+		// draws a fresh value for every re-sent row. Either way one outcome
+		// has quietly doubled the batch, so refuse before re-sending. The
+		// judgment is the replay doors' own (irbackup.JudgeReplayKey via this
+		// writer's ProbeReplayKey), memoised per table. Trip + notifyReparent
 		// above still run: the target really did hit a transient, so the
 		// sibling lanes should still quiesce and the restore reconciler
 		// should still hear about this table.
-		if !replaySafe {
-			return errKeylessAmbiguousReplay(tableName, rows, err)
+		verdict, judgeErr := w.replayKeys.Judge(ctx, w, table)
+		if judgeErr == nil && verdict != irbackup.ReplayKeyCollides {
+			return errKeylessAmbiguousReplay(tableName, rows, verdict, err)
 		}
 		// Terminal on the WALL-CLOCK deadline (the real bound) or the
 		// runaway attempt backstop. A genuinely-wedged target surfaces
@@ -269,6 +287,16 @@ func (w *RowWriter) flushWithReparentRetry(
 		// instant return.
 		if aerr := w.awaitGrowGate(ctx); aerr != nil {
 			return aerr
+		}
+		// The re-send gate above could not answer — its catalog probe hit
+		// the same struggling target. Never re-send unjudged: ride the
+		// window and ask again. The probe's error becomes the one the next
+		// iteration classifies, so a non-transient probe failure ends the
+		// copy loudly instead of looping.
+		if judgeErr != nil {
+			err = fmt.Errorf("mysql: cold-copy into %q: judge whether re-sending the batch (%d rows) "+
+				"can duplicate it: %w", tableName, rows, judgeErr)
+			continue
 		}
 		// Re-acquire a FRESH connection — the pinned conn is dead after a
 		// reparent; the pool reconnects to the new primary here. NEVER
@@ -363,19 +391,18 @@ func tableNameOf(table *ir.Table) string {
 // where it would usually have succeeded (the rolled-back branch is the
 // common one). That cost is real and is the reason the remedy names the
 // durable fix — a key — first.
-func errKeylessAmbiguousReplay(tableName string, rows int, cause error) error {
+func errKeylessAmbiguousReplay(tableName string, rows int, verdict irbackup.ReplayKeyVerdict, cause error) error {
 	return sluicecode.Wrap(
 		sluicecode.CodeCopyRetryAmbiguousKeyless,
-		"add a PRIMARY KEY or a NOT NULL UNIQUE index to the table, then re-run",
+		verdict.RemedyHint(),
 		fmt.Errorf(
-			"mysql: cold-copy into %q: the target hit a transient error mid-batch (%d rows) and this table has "+
-				"no PRIMARY KEY and no NOT NULL UNIQUE index, so re-sending the batch could silently duplicate every "+
-				"row in it: a prior attempt that committed but lost its acknowledgement is indistinguishable from one "+
-				"that rolled back, and with no unique key there is no duplicate-key collision to tell them apart "+
-				"(ADR-0108 keyless carve-out). Refusing rather than risking duplicate rows. Add a PRIMARY KEY or a "+
-				"NOT NULL UNIQUE index to the source table and re-run, or re-run this table's copy from an empty "+
+			"mysql: cold-copy into %q: the target hit a transient error mid-batch (%d rows) and this table %s, "+
+				"so re-sending the batch could silently duplicate every row in it: a prior attempt that committed but "+
+				"lost its acknowledgement is indistinguishable from one that rolled back, and with no key the rows "+
+				"collide on there is no duplicate-key collision to tell them apart (ADR-0108 keyless carve-out). "+
+				"Refusing rather than risking duplicate rows. Remedy: %s; or re-run this table's copy from an empty "+
 				"target: %w",
-			tableName, rows, cause,
+			tableName, rows, verdict.Describe(), verdict.RemedyHint(), cause,
 		),
 	)
 }
