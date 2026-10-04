@@ -291,6 +291,60 @@ func TestSyncFromBackup_CancelAfterIncremental_ExitsClean(t *testing.T) {
 	}
 }
 
+// TestSyncFromBackup_CancelBetweenIncrementals_ExitsClean pins the clean
+// half of the rule INSIDE a tick, which the after-tick test above cannot
+// reach (its cancel is observed by the between-ticks stop poll): a tick with
+// two incrementals is cancelled right after the first one's position
+// committed, so the cancel is observed at the between-incrementals check of
+// replayNewIncrementals. Nothing of the second incremental was applied, so
+// this is the clean stop it always was — nil, not the partial error.
+func TestSyncFromBackup_CancelBetweenIncrementals_ExitsClean(t *testing.T) {
+	store, fullID, incrID := brokerReplayFixture(t, true)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	users := &ir.Table{
+		Name:       "users",
+		Columns:    []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
+		PrimaryKey: &ir.Index{Unique: true, Columns: []ir.IndexColumn{{Column: "id"}}},
+	}
+	pos := func(lsn string) ir.Position {
+		return ir.Position{Engine: "postgres", Token: `{"slot":"s","lsn":"` + lsn + `"}`}
+	}
+	if err := (&IncrementalBackup{
+		Source: &fakeCDCEngine{
+			name:           "postgres",
+			schemaSequence: []*ir.Schema{{Tables: []*ir.Table{users}}},
+			cdcChanges: []ir.Change{
+				ir.TxBegin{Position: pos("0/150")},
+				ir.Insert{Position: pos("0/160"), Table: "users", Row: ir.Row{"id": int64(5)}},
+				ir.TxCommit{Position: pos("0/170")},
+			},
+		},
+		SourceDSN: "src", Store: store, ParentRef: incrID, Window: time.Minute, ChunkChanges: 1,
+	}).Run(ctx); err != nil {
+		t.Fatalf("second IncrementalBackup.Run: %v", err)
+	}
+
+	runCtx, runCancel := context.WithCancel(ctx)
+	defer runCancel()
+	app := &replayApplier{}
+	p := encodeBrokerPosition("test://fe1", fullID)
+	app.resume = &p
+	firstPos := encodeBrokerPosition("test://fe1", incrID)
+	app.onWrite = func(w ir.Position) {
+		if w == firstPos {
+			runCancel() // SIGINT lands between the tick's two incrementals
+		}
+	}
+	if err := newReplayBroker(store, app, true).Run(runCtx); err != nil {
+		t.Fatalf("Run = %v; want nil for a cancel between incrementals", err)
+	}
+	if len(app.received) != 4 {
+		t.Errorf("applier received %d changes; want only the first incremental's 4 (the cancel must stop the tick before the second)", len(app.received))
+	}
+}
+
 // TestSyncFromBackup_KeylessTableAddedLater_RefusedAtTick pins the TICK-time
 // half of the door, which the start-time door cannot stand in for: the
 // broker starts cleanly on a keyed chain, applies its incremental, and only
