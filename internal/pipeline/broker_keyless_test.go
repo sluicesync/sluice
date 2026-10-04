@@ -264,6 +264,35 @@ func TestSyncFromBackup_CancelMidIncremental_ExitsWithPartialMarker(t *testing.T
 	}
 }
 
+// TestBrokerIncrementalPartialError_RecoveryTextIsScoped pins the recovery
+// the BROKER-INCREMENTAL-PARTIAL message promises. It used to say every
+// re-applied change "upserts and converges", unconditionally; an incremental
+// that changed a row's key value does not — measured on both engines:
+// [INSERT id=1, UPDATE id 1→2] re-applied fails 23505 / 1062 on every
+// re-run, and a key value moved onto another row re-applies to the wrong row
+// at exit 0. The behaviour this text describes is pinned against real
+// servers by TestFE1_Broker_KeyChangingIncremental_RerunRefusesLoudly and
+// TestApplier_KeyChangingReplay_{RefusesLoudly,KeyReuseIsSilent} (both
+// engines); if those change, this text must change with them.
+func TestBrokerIncrementalPartialError_RecoveryTextIsScoped(t *testing.T) {
+	msg := (&brokerIncrementalPartialError{backupID: "b1", resumeFrom: "b0", cause: context.Canceled}).Error()
+	for _, want := range []string{
+		BrokerIncrementalPartialMarker,
+		"updates and deletes that keep each row's key, converge",
+		"CHANGED a row's key value",
+		"1062", "23505",
+		"apply a change to the wrong row without any error",
+		"--reset-target-data",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("BROKER-INCREMENTAL-PARTIAL message lacks %q:\n%s", want, msg)
+		}
+	}
+	if strings.Contains(msg, "re-applied changes upsert and converge") {
+		t.Errorf("the message still promises unconditional convergence:\n%s", msg)
+	}
+}
+
 // cancellingDropWriter is a replayKeyWriter that lets the cold start drop
 // its tables and lands the operator's q / ctrl+c at one point of it: in the
 // drop itself ("drop"), or in the chain restore that follows ("restore" —

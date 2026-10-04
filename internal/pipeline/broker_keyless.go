@@ -53,7 +53,11 @@ func (e *brokerIncrementalPartialError) Error() string {
 			"the target, and the broker's position was NOT advanced past it (it stays at %s), so the next run re-applies "+
 			"the WHOLE incremental. Every table the broker replays was judged, on the chain's recorded schema and on the "+
 			"target, to have a key the replayed rows carry and collide on (a table without one is refused before anything "+
-			"is applied), so the re-applied changes upsert and converge: re-run the same command to finish it. "+
+			"is applied), so re-applied inserts, and updates and deletes that keep each row's key, converge: re-run the same "+
+			"command to finish it. An incremental that CHANGED a row's key value is different: its re-run can fail on a "+
+			"duplicate key (MySQL 1062 / Postgres 23505) on every attempt, and when a key value was moved off one row and onto "+
+			"another inside the incremental, the re-run can apply a change to the wrong row without any error. If the "+
+			"source changes key values, recover with `--reset-target-data` instead of re-running. "+
 			"To stop a broker without interrupting an incremental, use `sluice sync from-backup stop`, which takes effect "+
 			"between ticks. Cause: %v",
 		BrokerIncrementalPartialMarker, e.backupID, e.resumeFrom, e.cause,

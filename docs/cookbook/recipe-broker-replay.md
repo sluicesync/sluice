@@ -237,6 +237,17 @@ key. The remedy is a key on the **source** and a new full backup (or,
 for a target-only miss, the source's key on the target table), or
 `sluice sync start` for those tables.
 
+Even on a keyed table, re-applying a whole incremental converges only
+for inserts, and for updates and deletes that keep each row's key. An
+incremental that **changed a row's key value** does not: the re-run
+re-inserts a row the interrupted run had already moved, and the move
+then collides with the moved copy, so it fails on a duplicate key
+(MySQL 1062 / Postgres 23505) on every re-run. And when a key value
+was moved off one row and onto another inside the incremental, the
+re-run can apply a change to the wrong row with no error at all. If
+your source changes key values, recover an interrupted incremental
+with `--reset-target-data`, not by re-running.
+
 **Stopping the broker.** `sluice sync from-backup stop` (or the
 `stop_requested_at` field it writes) is observed only between ticks,
 so it never interrupts an incremental and the broker exits 0. A
@@ -245,7 +256,8 @@ immediately: if it lands between incrementals the exit is still 0,
 but if it lands while an incremental is being applied the broker
 exits non-zero with an error carrying `BROKER-INCREMENTAL-PARTIAL`,
 naming the incremental. Re-run the same command; it re-applies that
-incremental and converges. A cancel during a `--reset-target-data`
+incremental, which converges unless the incremental changed key
+values (see above; then use `--reset-target-data`). A cancel during a `--reset-target-data`
 cold start, once it has begun dropping the target's tables, exits
 non-zero with `BROKER-COLD-START-PARTIAL`: the target holds a partial
 restore and no position, so re-run with `--reset-target-data` (never
