@@ -779,6 +779,15 @@ There is no new goroutine and no new shared state. The fold's bookkeeping is coo
 
 #### E.13 Open questions for the operator
 
+**Answered (operator, 2026-10-04).**
+- E-Q1: default-on, no flag and no hidden switch, landed only after §E.9 and §E.10 pass.
+- E-Q2: Postgres `Truncate` is IN, with the P7 pin.
+- E-Q4: the vtgate tear pin (P10) runs on vttestserver before shipping. The Neki premise is recorded against the Neki Tier-3 pass and does not gate this.
+- E-Q3 and E-Q6 take the recommendations: no own-boundary truncate fold; rename the test.
+- E-Q5: F-E1 was reproduced on real Postgres on 2026-10-04 and is wider than filed: a ctx cancel exits 0, the window is the whole incremental, and chain-restore re-runs duplicate too. It is filed as its own HIGH item, fixed ahead of this amendment. See `docs/dev/audit-backlog.md`.
+
+The questions as put:
+
 - **E-Q1. Default-on with no flag?** Recommendation: **yes, no operator flag and no hidden switch**, landed only after §E.9 and §E.10 pass. The fold changes no delivery guarantee (§E.5), every state it can leave is one today's code can leave, and a flag would add a `Streamer` field that must be zero-value-safe and parity-gated across sync, the broker and chain replay, for no correctness gain. The per-kind opt-in already lives in the engine (`FoldsBarrierCheckpoint`, zero = today). If a kill-switch is wanted anyway, it must be opt-OUT (`SuppressBarrierFold`), per the v0.99.51 trap.
 - **E-Q2. Postgres `Truncate`: IN, or OUT for symmetry with MySQL?** Recommendation: **IN**. It is transactional, P7 pins that premise, and it is one less special case in the Postgres adapter. The stakes are low (truncates are rare).
 - **E-Q3. Fold a `Truncate`'s OWN boundary too** (Postgres, marker stream: three commits to one, by writing the truncate's own position in its transaction)? It needs a frontier read bounded at `seq` rather than at the frontier. Recommendation: **not now**. It is rare and adds a frontier API for no measurable gain.
