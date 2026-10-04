@@ -701,6 +701,11 @@ func (r *Restore) Run(ctx context.Context) error {
 	}
 	defer migcore.CloseIf(rw)
 
+	// 4.5. The re-run door (audit F-E1); see [Restore.refuseKeylessRerun].
+	if err := r.refuseKeylessRerun(ctx, rw, schema); err != nil {
+		return err
+	}
+
 	// 5. Phase 1: tables. Skipped in DataOnly mode (a later
 	//    rotation-segment full — schema already established by
 	//    segment 0; CreateTables IF NOT EXISTS would be a no-op
@@ -720,18 +725,7 @@ func (r *Restore) Run(ctx context.Context) error {
 	//    idempotent upsert so re-applying a later segment's snapshot
 	//    over the prior segment's restored state converges (no
 	//    PK-collision); the writer selection is per-worker.
-	tablesByName := indexManifestTables(manifest.Tables)
-	tasks := make([]restoreTableTask, 0, len(schema.Tables))
-	for _, table := range schema.Tables {
-		key := manifestTableKey(table.Schema, table.Name)
-		entry, ok := tablesByName[key]
-		if !ok {
-			slog.InfoContext(ctx, "restore: table not in manifest; skipping bulk-copy",
-				slog.String("table", table.Name))
-			continue
-		}
-		tasks = append(tasks, restoreTableTask{table: table, entry: entry})
-	}
+	tasks := restoreTableTasks(ctx, schema, manifest)
 	tableParallelism, chunkParallelism, err := r.resolveRestoreParallelism(ctx, len(tasks))
 	if err != nil {
 		return err
@@ -805,6 +799,40 @@ func (r *Restore) Run(ctx context.Context) error {
 	sink.PhaseCompleted(restorePhaseConstraints)
 	sink.Summary(restoreSummaryResult(len(schema.Tables), manifest))
 	return nil
+}
+
+// restoreTableTasks pairs each table the (filtered, retargeted) schema
+// restores with its manifest entry; a schema table the manifest carries no
+// chunks for is logged and skipped. Carved out of [Restore.Run], which is at
+// its length ceiling.
+func restoreTableTasks(ctx context.Context, schema *ir.Schema, manifest *irbackup.Manifest) []restoreTableTask {
+	tablesByName := indexManifestTables(manifest.Tables)
+	tasks := make([]restoreTableTask, 0, len(schema.Tables))
+	for _, table := range schema.Tables {
+		key := manifestTableKey(table.Schema, table.Name)
+		entry, ok := tablesByName[key]
+		if !ok {
+			slog.InfoContext(ctx, "restore: table not in manifest; skipping bulk-copy",
+				slog.String("table", table.Name))
+			continue
+		}
+		tasks = append(tasks, restoreTableTask{table: table, entry: entry})
+	}
+	return tasks
+}
+
+// refuseKeylessRerun is the single-manifest half of the re-run door (audit
+// F-E1): an in-scope keyless table that already holds rows would have this
+// full's rows appended to it. Skipped on ChainRestore's per-segment re-entry
+// (SkipChainDispatch): the chain ran the door over every table it records
+// before its first segment, and its later segments find the earlier
+// segments' rows by design — they apply through the idempotent writer, which
+// refuses a keyless table on its own.
+func (r *Restore) refuseKeylessRerun(ctx context.Context, rw ir.RowWriter, schema *ir.Schema) error {
+	if r.SkipChainDispatch {
+		return nil
+	}
+	return refuseKeylessPopulatedTargets(ctx, rw, schema.Tables, "restore")
 }
 
 // restoreSummaryResult builds the ADR-0155 TTY summary panel for a

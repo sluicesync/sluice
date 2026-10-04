@@ -1020,7 +1020,7 @@ type SyncFromBackupCmd struct {
 
 	PollInterval time.Duration `help:"Wall-clock cadence each broker tick runs at. The broker observes new incrementals + applies them within ~poll-interval of their commit on the source side." default:"30s" placeholder:"DUR"`
 
-	ApplyBatchSize int   `help:"Batch up to N CDC changes per target transaction during incremental replay. Idempotent applier semantics (ADR-0010) keep replay-on-crash safe." default:"100" placeholder:"N"`
+	ApplyBatchSize int   `help:"Batch up to N CDC changes per target transaction during incremental replay. An interrupted incremental is re-applied whole on the next run, which converges only on keyed tables, so tables with no PRIMARY KEY or NOT NULL UNIQUE index are refused (SLUICE-E-BROKER-KEYLESS-TABLE)." default:"100" placeholder:"N"`
 	MaxBufferBytes int64 `help:"Soft cap on per-batch buffered memory in the CDC applier. Default 67108864 (64 MiB). See ADR-0028." default:"67108864" placeholder:"N"`
 
 	ApplyConcurrency int `help:"Key-hash concurrent-apply LANE count W for incremental REPLAY (ADR-0104/0105, the same machinery 'sync start --apply-concurrency' uses). Each incremental's merged change stream is fanned across W in-order PK-hash lanes committing concurrently, each with its own AIMD controller. Without this a large incremental replayed into a high-latency / cross-region target applies through a single serial pipelined stream and is RTT-bound (the broker-replay analog of the 'sync start' cross-region wedge). Exactly-once is preserved: every change in an incremental carries the same broker chain position, so the lanes persist the identical resume position the serial path does. ADR-0106 FAST BY DEFAULT: 0 (default, unset) = auto:4 (a fixed conservative ceiling — the broker does not run a connection-budget probe; per-lane AIMD backs off if the target is tight); 1 = explicit SERIAL opt-out (byte-identical to the pre-fix behaviour); W>1 honored verbatim." default:"0" placeholder:"W"`
@@ -1149,9 +1149,14 @@ func (s *SyncFromBackupCmd) Run(g *Globals) error {
 	// ADR-0156 phase 2: the TTY-aware live panel for the broker's
 	// poll-and-replay loop. Same [wantPrettyProgress] gate as the one-shot
 	// commands (this command has no --format json envelope / dry-run /
-	// multi-namespace shape). q/ctrl+c cancels the run context, which is the
-	// broker's graceful drain (it finishes the in-flight incremental's batch);
-	// every other invocation keeps today's byte-identical log stream.
+	// multi-namespace shape). q/ctrl+c cancels the run context, exactly as
+	// SIGINT/SIGTERM does on the non-TTY path. That does NOT finish the
+	// in-flight incremental (audit F-E1): a cancel between ticks exits 0,
+	// one that lands mid-incremental returns the BROKER-INCREMENTAL-PARTIAL
+	// error, which the panel passes through as a failure rather than
+	// "stopped." because it does not unwrap to context.Canceled. The clean
+	// stop is `sync from-backup stop`, observed between ticks. Every other
+	// invocation keeps today's byte-identical log stream.
 	if wantPrettyProgress(g, false, false, false) {
 		header := progress.LiveHeader{
 			Mode:     "broker",

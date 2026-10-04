@@ -76,6 +76,11 @@ func TestOpenRowWriterSitesApplyTargetSchema(t *testing.T) {
 			"apply. It opens a row writer only to reach ir.TableDropper. If the broker ever grows the " +
 			"flag, this drop loop addresses the WRONG namespace and must apply it — the premise is " +
 			"pinned by TestBrokerHasNoTargetSchemaToApply",
+		"pipeline:(*SyncFromBackup).refuseKeylessTables": "the broker lane has no --target-schema (same premise, " +
+			"pinned by TestBrokerHasNoTargetSchemaToApply). It opens a row writer only to reach the read-only " +
+			"ir.ReplayKeyProber for the F-E1 keyless door, and the broker's applier writes the DSN's default " +
+			"schema, which is the namespace this writer probes. If the broker grows the flag, this probe reads " +
+			"the WRONG namespace and must apply it",
 	}
 
 	dirs := []string{".", "backup"}

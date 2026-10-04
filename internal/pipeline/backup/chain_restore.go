@@ -48,8 +48,15 @@ import (
 
 // ChainRestoreStreamID is the stream identifier used by chain
 // restore when calling [ir.ChangeApplier.ApplyBatch]. The id is
-// stable across runs so a re-run-on-failure doesn't lose its
-// idempotency floor.
+// stable across runs so a re-run writes the same control rows.
+//
+// It is NOT an idempotency floor, which an earlier version of this
+// comment claimed: nothing reads the position it records back, a re-run
+// replays the full and every incremental from the start, and the only
+// thing that makes that converge is the applier's upsert key. A keyless
+// table would gain a second copy of every row (audit F-E1, measured at
+// 2001 vs 1001), so a re-run onto a keyless table that already holds rows
+// is refused by [ChainRestore.refuseKeylessRerun] instead.
 const ChainRestoreStreamID = "sluice_chain_restore"
 
 // ChainRestore runs a Phase 3 chain-aware restore from Store into
@@ -332,6 +339,17 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 	// on the target. Extracted so the BROKER can run the same list before
 	// its own destructive drop; see [ChainRestore.PreflightBeforeTarget].
 	if err := r.preflightBeforeTarget(ctx, root, links, incrementalCount); err != nil {
+		return err
+	}
+
+	// 2.9. The re-run door (audit F-E1): refuse when an in-scope keyless
+	//      table already holds rows. Deliberately NOT a member of the
+	//      shared preflightBeforeTarget list: that list is also run by the
+	//      broker's --reset-target-data cold start BEFORE it drops the
+	//      target's tables, where every table still holds rows by design —
+	//      this door asks about target STATE, so it belongs after the
+	//      caller's own destructive step, here.
+	if err := r.refuseKeylessRerun(ctx, links); err != nil {
 		return err
 	}
 

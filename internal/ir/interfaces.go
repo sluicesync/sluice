@@ -1388,6 +1388,31 @@ type TableEmptyChecker interface {
 	IsTableEmpty(ctx context.Context, table *Table) (bool, error)
 }
 
+// ReplayKeyProber is the optional surface a [RowWriter] implements to
+// answer, from the TARGET's live catalog, whether a table gives the
+// engine's change applier a key to upsert an INSERT on. That is the
+// question of whether re-applying an INSERT that already landed
+// converges (the ADR-0010 upsert) or appends a second copy of the row
+// (the plain-INSERT fallback for a table with no PRIMARY KEY and no
+// all-NOT-NULL UNIQUE index).
+//
+// It is the target half of the replay-duplication doors (audit F-E1:
+// the `sync from-backup` keyless refusal and the restore re-run door).
+// The recorded schema is judged by the engine-neutral
+// irbackup.TableReplayIdempotent; this judges the table the applier
+// will actually write, which can differ from the recorded one — a
+// target pre-created, or altered, without the source's key.
+//
+// exists reports whether the table is present on the target; when it
+// is false, keyed carries no information and is false. An error is
+// returned as-is: a probe that cannot answer must not read as "keyed".
+// The Postgres implementation can return the coded
+// SLUICE-E-TARGET-DEFERRABLE-KEY refusal, the same one its applier
+// raises on first sight of such a table.
+type ReplayKeyProber interface {
+	ProbeReplayKey(ctx context.Context, table *Table) (exists, keyed bool, err error)
+}
+
 // TableReadPreflighter is the optional surface a [SchemaReader] can
 // implement when some tables it returned are KNOWN-DOOMED to refuse at
 // read time (a flat-file reader whose dump carries a table in an

@@ -25,19 +25,30 @@ package pipeline
 //   - The position written alongside the data is the broker's
 //     synthetic position-shape: `Engine="backup-broker"`,
 //     `Token={"chain_url":"...","last_applied_backup_id":"<id>"}`.
-//     ADR-0007's transactional position-and-data atomicity makes a
-//     broker crash mid-replay safe to re-apply (ADR-0010 idempotent
-//     applier). Distinct from `sync start`'s positions (CDC LSN /
-//     GTID); the broker's positions reference chain state.
+//     Every change of an incremental carries the PARENT position
+//     (BRK-1), and the position advances only once the whole
+//     incremental has applied, so a crash mid-replay re-applies the
+//     whole incremental. That is safe only on tables the applier
+//     upserts into — the changes carry no apply identity, so it is
+//     NOT the ADR-0010 idempotency it was once described as — which
+//     is why keyless tables are refused before anything is applied
+//     (audit F-E1, [SyncFromBackup.refuseKeylessTables]). Distinct
+//     from `sync start`'s positions (CDC LSN / GTID); the broker's
+//     positions reference chain state.
 //
-// Cooperative stop:
+// Stopping:
 //
-//   - ctx cancellation: finishes the current in-flight incremental's
-//     batch (the applier's existing channel-closed branch commits
-//     the partial batch cleanly) and exits.
+//   - ctx cancellation (SIGINT/SIGTERM, q/ctrl+c on the live panel):
+//     does NOT wait for the in-flight incremental. A cancel observed
+//     between incrementals or between ticks exits 0; a cancel that
+//     lands while an incremental is being applied returns an error
+//     carrying [BrokerIncrementalPartialMarker] (non-zero exit),
+//     because part of that incremental may be committed and the next
+//     run re-applies all of it (audit F-E1).
 //   - Cross-machine stop request via `manifests/broker_state.json`'s
-//     `stop_requested_at` field: same drain path. Polled between
-//     ticks so the operator's stop is observed within ~PollInterval.
+//     `stop_requested_at` field: observed only between ticks (within
+//     ~PollInterval), so it never interrupts an incremental and the
+//     exit is always clean — the safe way to stop a broker.
 //   - Same-process stop via [RequestSyncFromBackupStop]: closes the
 //     in-process channel (registered via [registerBrokerStopChan])
 //     for instantaneous observation, no file I/O.
@@ -163,11 +174,12 @@ type SyncFromBackup struct {
 	// cross-region wedge (live Track-C finding, 2026-06-24). When > 1 (or
 	// auto), the broker plumbs it onto the applier via
 	// [migcore.ApplyApplyConcurrency] so ApplyBatch fans the merged change stream
-	// across W in-order PK-hash lanes. Exactly-once is preserved exactly as
-	// on the streamer path: every change in an incremental carries the same
-	// broker position token, so the lanes persist the identical position the
-	// serial path does, and the broker's idempotent re-replay-from-parent
-	// recovery is unchanged. Follows the ADR-0106 contract: `0 = auto:N`
+	// across W in-order PK-hash lanes. Every change in an incremental
+	// carries the same broker position token, so the lanes persist the
+	// identical position the serial path does and the re-replay-from-parent
+	// recovery is the same in both modes — which also means neither mode is
+	// exactly-once for an interrupted incremental: the whole incremental is
+	// re-applied, so keyless tables are refused (audit F-E1). Follows the ADR-0106 contract: `0 = auto:N`
 	// (the fast default — see [migcore.ResolveReplayApplyConcurrency]), `1 = serial
 	// opt-out`, `N > 1 = honored`. The zero value gets the fast default (no
 	// zero-value-safe-default trap, the v0.99.51 lesson).
@@ -250,6 +262,13 @@ type SyncFromBackup struct {
 	// [brokerChainCache] for the identity-key invariants. Confined to
 	// Run's goroutine, like chainCEK.
 	chainCache brokerChainCache
+
+	// keylessCleared records the tables the F-E1 keyless door has already
+	// cleared against BOTH the recorded schema and the target catalog this
+	// run, so a tick re-judges only tables the chain newly carries. Confined
+	// to Run's goroutine, like chainCEK. The zero value (nil) means "nothing
+	// cleared yet", so every table is judged — the safe default.
+	keylessCleared map[string]bool
 
 	// Now, when set, overrides the wall-clock-time source used for
 	// `broker_state.json` timestamps. Tests pin timestamps; in
@@ -363,6 +382,11 @@ func isBrokerToken(pos ir.Position) bool {
 // or a stop request is observed via `broker_state.json`. Returns nil
 // on a clean exit; a wrapped error on any unrecoverable failure.
 //
+// A ctx cancel is a clean exit only when it does not interrupt an
+// incremental. One that lands while an incremental is being applied
+// returns a [BrokerIncrementalPartialMarker] error instead (audit F-E1):
+// see replayNewIncrementals for the exact rule.
+//
 // On every successful incremental apply: the target gains the
 // incremental's data + schema deltas, the broker's position row in
 // `sluice_cdc_state` advances to that incremental's BackupID, and
@@ -428,6 +452,13 @@ func (b *SyncFromBackup) Run(ctx context.Context) error {
 				b.StreamID, dErr)
 		}
 		lastAppliedID = tok.LastAppliedBackupID
+		// Audit F-E1: refuse at start rather than at the first tick with
+		// work, so an operator restarting an interrupted broker learns it
+		// before anything is re-applied. The tick-time door covers tables a
+		// later incremental adds.
+		if err := b.refuseKeylessTables(ctx, true); err != nil {
+			return err
+		}
 		slog.InfoContext(
 			ctx, "broker: warm resume",
 			slog.String("stream_id", b.StreamID),
@@ -440,6 +471,15 @@ func (b *SyncFromBackup) Run(ctx context.Context) error {
 			b.StreamID, persisted.Engine,
 		)
 	default:
+		// Audit F-E1: the keyless door runs BEFORE any cold-start leg —
+		// before --reset-target-data drops and restores, before
+		// --at-chain-id records a position. On --reset-target-data the
+		// current target tables are about to be dropped and recreated from
+		// the recorded schema, so only the recorded schema is judged; the
+		// first tick that has work re-judges against the recreated target.
+		if err := b.refuseKeylessTables(ctx, !b.ResetTargetData); err != nil {
+			return err
+		}
 		// Cold-start branch.
 		startID, err := b.coldStart(ctx, applier)
 		if err != nil {
@@ -544,15 +584,7 @@ func (b *SyncFromBackup) Run(ctx context.Context) error {
 		elapsed := now().Sub(started)
 
 		if applyErr != nil {
-			if errors.Is(applyErr, context.Canceled) || errors.Is(applyErr, context.DeadlineExceeded) {
-				slog.InfoContext(
-					ctx, "broker: context cancelled; exiting",
-					slog.String("stream_id", b.StreamID),
-					slog.String("last_applied_backup_id", lastAppliedID),
-				)
-				return nil
-			}
-			return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("broker: tick: %w", applyErr))
+			return b.tickErrorExit(ctx, applyErr, lastAppliedID)
 		}
 
 		// Advance in-memory cursor only on successful applies. The
@@ -988,6 +1020,14 @@ func (b *SyncFromBackup) replayNewIncrementals(
 		return "", 0, 0, 0, err
 	}
 
+	// Audit F-E1: the keyless door, before this tick applies anything. Only
+	// tables not already cleared this run are probed, so a steady-state tick
+	// costs nothing; a table a new incremental's AddTable delta brings in is
+	// judged here, before the incremental that creates it is applied.
+	if err := b.refuseKeylessTables(ctx, true); err != nil {
+		return "", 0, 0, 0, err
+	}
+
 	batchSize := b.ApplyBatchSize
 	if batchSize <= 0 {
 		batchSize = backup.DefaultChainRestoreBatchSize
@@ -1000,9 +1040,19 @@ func (b *SyncFromBackup) replayNewIncrementals(
 	// every chunk streams cleanly). So a mid-incremental chunk failure
 	// (tamper, dropped blob, transient fetch error) leaves the persisted
 	// position at the parent, and a restart re-applies the whole incremental
-	// (idempotent, ADR-0010) instead of skipping it and silently losing its
-	// un-applied tail. Seed with lastAppliedID, or the chain root (the full)
-	// on a cold warm-resume so the token is never empty.
+	// instead of skipping it and silently losing its un-applied tail. Seed
+	// with lastAppliedID, or the chain root (the full) on a cold warm-resume
+	// so the token is never empty.
+	//
+	// That re-apply is NOT idempotent in general, whatever ADR-0010 suggests:
+	// these changes carry no apply identity (ADR-0190 marks cannot skip
+	// them), so every change the interrupted run committed is applied a
+	// second time. A keyed table absorbs that (the INSERT upserts); a keyless
+	// one gains a duplicate row per committed INSERT (audit F-E1, measured at
+	// 2001 vs 1001 rows). That is why [SyncFromBackup.refuseKeylessTables]
+	// refuses keyless tables before anything is applied. Exactly-once (an
+	// apply identity per broker change) is the open follow-up that would
+	// lift the refusal.
 	resumeFromID := lastAppliedID
 	if resumeFromID == "" {
 		resumeFromID = lineage.ManifestBackupID(chain[0].Manifest)
@@ -1025,6 +1075,23 @@ func (b *SyncFromBackup) replayNewIncrementals(
 		}
 		bytesApplied, applyErr := b.applyIncremental(ctx, applier, link, batchSize, resumeFromID)
 		if applyErr != nil {
+			// The rule that separates an interrupted incremental from a
+			// clean stop (F-E1 (a)): applyIncremental was ENTERED for this
+			// incremental and failed while the run's context is done. From
+			// the moment it is entered it may commit schema deltas and
+			// change batches under the parent position, and only its last
+			// step advances the position — so any cancel observed here can
+			// have left part of it applied. A cancel observed anywhere else
+			// (the between-incremental check above, the chain walk, the
+			// integrity gates, the tick wait, the stop poll) has applied
+			// nothing of an unadvanced incremental and stays a clean exit.
+			if ctx.Err() != nil {
+				return newApplied, totalBytes, incrCount, chunkCount, &brokerIncrementalPartialError{
+					backupID:   lineage.ManifestBackupID(link.Manifest),
+					resumeFrom: resumeFromID,
+					cause:      applyErr,
+				}
+			}
 			return newApplied, totalBytes, incrCount, chunkCount, fmt.Errorf("incremental %s: %w",
 				lineage.ManifestBackupID(link.Manifest), applyErr)
 		}

@@ -114,6 +114,7 @@ var (
 	_ ir.MaxBufferBytesSetter        = (*RowWriter)(nil)
 	_ ir.TableDropper                = (*RowWriter)(nil)
 	_ ir.TableEmptyChecker           = (*RowWriter)(nil)
+	_ ir.ReplayKeyProber             = (*RowWriter)(nil)
 	_ ir.TableTruncator              = (*RowWriter)(nil)
 
 	// ChangeApplier optional surfaces.

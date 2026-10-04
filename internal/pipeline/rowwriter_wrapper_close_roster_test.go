@@ -26,6 +26,8 @@ import (
 var closeExemptRowWriterWrappers = map[string]string{
 	"emptinessWriter": "embeds a nil ir.RowWriter to answer one probe; never holds an opened writer, so there is no pool to release",
 	"bareRowWriter":   "embeds a nil ir.RowWriter as a do-nothing stand-in; never holds an opened writer",
+	"replayTargetEngine": "a fake ENGINE, not a writer wrapper: its ir.RowWriter field is the in-memory " +
+		"replayKeyWriter it hands out from OpenRowWriter, which owns no pool and is closed by its caller",
 }
 
 // TestRowWriterTestWrapperRoster_EveryWrapperClosesItsInner requires every

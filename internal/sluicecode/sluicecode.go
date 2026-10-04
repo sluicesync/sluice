@@ -628,6 +628,27 @@ const (
 	// table with no retry and no recovery (Bug 211).
 	CodeTargetDeferrableKey Code = "SLUICE-E-TARGET-DEFERRABLE-KEY"
 
+	// CodeBrokerKeylessTable fires when `sync from-backup` would replay a
+	// backup chain into a table on which re-applying a change that already
+	// landed appends a second copy of the row: no PRIMARY KEY and no NOT NULL
+	// UNIQUE index, judged on the chain's recorded schema AND on the target
+	// table the applier writes (audit F-E1). The broker re-applies a WHOLE
+	// incremental after any interruption — its changes carry no apply
+	// identity — so such a table gains a duplicate of every row the
+	// interrupted run had already committed, at exit 0. Refused before
+	// anything is applied, including before a --reset-target-data restore.
+	CodeBrokerKeylessTable Code = "SLUICE-E-BROKER-KEYLESS-TABLE"
+
+	// CodeRestoreKeylessTableNotEmpty fires when `restore` (a single full or
+	// a chain) would load rows into a target table that ALREADY holds rows
+	// and has no key a re-applied row could collide on (audit F-E1). The
+	// shape is a re-run after a failed restore: the full's COPY and the
+	// incrementals' plain INSERTs append everything the earlier attempt
+	// already wrote, silently. A keyed table in the same state fails loudly
+	// on its key and is not this refusal's concern; an EMPTY keyless table
+	// (a fresh target) is restored normally.
+	CodeRestoreKeylessTableNotEmpty Code = "SLUICE-E-RESTORE-KEYLESS-TABLE-NOT-EMPTY"
+
 	// CodeCDCKeyMatchedMultipleRows fires when a CDC UPDATE or DELETE that
 	// names its row by key matched MORE than one row on the target (GC-42,
 	// marker KEY-SCOPED-WRITE-MATCHED-MULTIPLE-ROWS); there is no exemption — a
@@ -967,6 +988,10 @@ var registry = map[Code]Info{
 	CodeCDCKeyMatchedMultipleRows: {ClassRefusal, "a CDC UPDATE or DELETE that names its row by key matched more than one row on the target — on Postgres, typically a DEFERRABLE key a source transaction moved key values through — so applying it would touch rows the source never named; the target transaction holding it is rolled back (earlier parts of a source transaction split across target transactions may already be committed) and the stream stops rather than silently losing or overwriting a row (marker KEY-SCOPED-WRITE-MATCHED-MULTIPLE-ROWS)"},
 
 	CodeTargetDeferrableKey: {ClassRefusal, "refused before applying anything: a target table's primary key (or only usable unique key) is DEFERRABLE, and Postgres rejects a deferrable constraint as an `ON CONFLICT` arbiter — so sluice's idempotent apply/copy upsert cannot key on it; recreate the target constraint as immediate (NOT DEFERRABLE), pre-create the target table with an immediate key, or take the table out of scope"},
+
+	CodeBrokerKeylessTable: {ClassRefusal, "sync from-backup refused before applying anything: a table the chain replays into has no PRIMARY KEY and no NOT NULL UNIQUE index (in the chain's recorded schema or on the target), and the broker re-applies a whole incremental after any interruption — so the table would silently gain a duplicate of every row an interrupted run had committed; give the table a key on the SOURCE and take a new full backup, or replicate it with `sluice sync start`"},
+
+	CodeRestoreKeylessTableNotEmpty: {ClassRefusal, "restore refused before writing: a target table it would load already holds rows and has no PRIMARY KEY and no NOT NULL UNIQUE index, so the restore would append its rows next to the existing ones instead of colliding — typically a re-run after a failed restore, which would duplicate everything the earlier attempt wrote; empty or drop the named target tables and re-run, or exclude them"},
 
 	CodeTargetTableShapeMismatch: {ClassRefusal, "migrate refused before any data moved: a target table with the same name already exists but its column shape (names/types/nullability) differs from what the migration would create — proceeding would fail mid-copy or land rows in the wrong columns"},
 

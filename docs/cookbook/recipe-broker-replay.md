@@ -184,9 +184,10 @@ unconditionally, so segment-N+1's rotation snapshot is auto-skipped.
 ADR-0067's born-contiguous rotation guarantees that the new
 segment's first incremental covers the `(P_N, S]` overlap from the
 prior segment's end position, so no changes are lost across the
-rotation seam. ADR-0010's idempotent applier handles any brief
-re-application of changes that landed between the broker's last
-advance and the rotation moment.
+rotation seam. Any brief re-application of changes that landed
+between the broker's last advance and the rotation moment converges
+because every table the broker replays has a key the applier upserts
+on (keyless tables are refused at start; see "Crash recovery" below).
 
 Pre-v0.97.2 sluice deferred multi-segment broker following — the
 broker refused loudly at the first rotation transition with the
@@ -215,8 +216,37 @@ sluice sync from-backup run \
 
 The broker reads `last_applied_backup_id` from `sluice_cdc_state` on
 startup, finds it in the chain, and resumes from the next manifest
-forward. No re-application, no skipping. The idempotent applier
-(ADR-0010) handles any overlap gracefully.
+forward. Nothing is skipped — but an incremental the crash
+interrupted is **re-applied in full**, because the position only
+advances once a whole incremental has applied and the broker's
+changes carry no apply identity that would let it skip the part that
+already landed. That converges only on tables the applier can upsert
+into: a table with no PRIMARY KEY and no NOT NULL UNIQUE index would
+gain a duplicate of every row the interrupted run had committed. So
+the broker refuses such tables before it applies anything, with
+`SLUICE-E-BROKER-KEYLESS-TABLE` (exit 3), naming each table and
+whether the chain's recorded schema or the target table lacks the
+key. The remedy is a key on the **source** and a new full backup, or
+`sluice sync start` for those tables.
+
+**Stopping the broker.** `sluice sync from-backup stop` (or the
+`stop_requested_at` field it writes) is observed only between ticks,
+so it never interrupts an incremental and the broker exits 0. A
+SIGINT/SIGTERM — or `q`/ctrl+c on the live panel — cancels the run
+immediately: if it lands between incrementals the exit is still 0,
+but if it lands while an incremental is being applied the broker
+exits non-zero with an error carrying `BROKER-INCREMENTAL-PARTIAL`,
+naming the incremental. Re-run the same command; it re-applies that
+incremental and converges.
+
+**If a broker on v0.156.10 or earlier was ever interrupted** and the
+chain carries keyless tables, compare those tables with the source:
+releases v0.99.222 through v0.156.10 re-applied an interrupted
+incremental into them and duplicated its committed rows at exit 0
+(v0.20.0 through v0.99.221 skipped the rest of the interrupted
+incremental instead). The current release refuses to start on such a
+chain, so the comparison is the only way to learn whether the target
+already diverged.
 
 ### Producer crash
 
@@ -266,6 +296,12 @@ bug; file it.
 - **Cold-start without `--at-chain-id`.** The refusal names the
   recovery path; pass the flag once on first launch and don't
   pass it again on restart.
+- **Keyless tables.** The broker refuses a chain carrying a table
+  with no PRIMARY KEY and no NOT NULL UNIQUE index
+  (`SLUICE-E-BROKER-KEYLESS-TABLE`), because it cannot re-apply an
+  interrupted incremental into one without duplicating rows. There
+  is no table filter on the broker: add the key on the source and
+  take a new full, or replicate those tables with `sync start`.
 - **Two consumers with the same `--stream-id`.** They'll race on
   position writes and you'll see one make progress and the other
   appear stuck. Use distinct stream-ids for distinct targets.
