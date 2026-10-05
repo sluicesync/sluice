@@ -24,7 +24,7 @@ import (
 // side effect of giving the SQLite row writer ir.TableEmptyChecker: the
 // migrate cold-start pre-flight, which skips a writer without it, now runs
 // for a SQLite target. A migrate into a SQLite file whose table already
-// holds rows refuses (SLUICE-E-COLD-START-TARGET-NOT-EMPTY) instead of
+// holds rows refuses (SLUICE-E-COLDSTART-TARGET-NOT-EMPTY) instead of
 // appending, as on Postgres and MySQL; --force-cold-start still overrides.
 func TestMigrate_SQLiteTargetHoldingRows_RefusedByColdStartPreflight(t *testing.T) {
 	ctx := context.Background()

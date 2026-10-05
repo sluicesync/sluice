@@ -217,10 +217,19 @@ shape.
   line, so an internal `panelEventNotifier` is added to the notify fan-out on the
   pretty path (making the panel a delivery target of its own — breaches surface
   even with no external `--notify-*` sink). q/ctrl+c drains-and-stops by
-  CANCELLING the run context, which is the graceful stop for all three loops
-  (the broker finishes its in-flight incremental batch, the stream commits its
-  in-flight rollover, the watch finishes its current tick) — unlike `sync
-  start`, none of these has a separate `RequestStop` to issue. The shared
+  CANCELLING the run context, which is the graceful stop for two of the three
+  loops (the stream commits its in-flight rollover, the watch finishes its
+  current tick) — unlike `sync start`, none of these has a separate
+  `RequestStop` to issue. **Correction (audit F-E1, 2026-10-04): the broker is
+  the exception.** A cancel does NOT finish its in-flight incremental or its
+  `--reset-target-data` cold-start restore. A cancel between ticks exits 0; one
+  that lands mid-incremental returns the `BROKER-INCREMENTAL-PARTIAL` error, and
+  one that lands during a cold start after its drop began returns
+  `BROKER-COLD-START-PARTIAL`. Neither unwraps to `context.Canceled`, so the
+  panel reports them as failures, not "stopped." (`cmd/sluice/cli.go`, the
+  broker's panel wiring; `runReadoutLivePanel` in `cmd/sluice/live_panel.go`).
+  The clean broker stop is `sluice sync from-backup stop`, observed between
+  ticks. The shared
   `runReadoutLivePanel` CLI helper wires this (renderer isolation, panel-panic
   fallback to structured logging, and the final "sluice <mode> stopped." line).
   `metrics-watch --once` never panels (no long-lived loop).

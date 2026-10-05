@@ -178,7 +178,8 @@ Common findings:
   target** → the resume applies to a PostgreSQL source with a
   parallel copy that finished every in-scope table (v0.149.0+).
   Outside that, drop the kept slot (`sluice slot drop <resolved
-  name> --yes`) and re-run with `--reset-target-data`.
+  name> --source-driver postgres --source <source DSN> --yes`) and
+  re-run with `--reset-target-data`.
 
 - **Apply lag growing not shrinking** → target write throughput
   is below the source's change rate. See

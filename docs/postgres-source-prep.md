@@ -271,8 +271,8 @@ When sluice sees a slot in `unreserved` or `lost` state at startup, it refuses t
 ```
 postgres: replication slot "sluice_slot" has wal_status="lost" — required WAL has been
 permanently removed; the slot must be dropped and recreated. To recover:
-`sluice slot drop sluice_slot --source-driver=postgres --source ...` then restart with
-empty position (forces a fresh snapshot). To prevent recurrence, raise
+`sluice slot drop sluice_slot --source-driver=postgres --source <source DSN> --yes` then
+restart with empty position (forces a fresh snapshot). To prevent recurrence, raise
 max_slot_wal_keep_size on the source — PlanetScale recommends > 4GB
 ```
 
@@ -300,7 +300,7 @@ Reach for `slot drop` when there is no stream to decommission: an abandoned slot
 Drop a slot (`--yes` is required — it refuses loudly rather than prompting):
 
 ```bash
-sluice slot drop sluice_slot --source-driver postgres --source 'postgres://...'
+sluice slot drop sluice_slot --source-driver postgres --source 'postgres://...' --yes
 ```
 
 If the slot is currently in use by a CDC consumer, drop refuses unless `--force` is set. Equivalently in psql:

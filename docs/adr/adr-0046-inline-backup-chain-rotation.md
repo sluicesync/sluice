@@ -378,6 +378,26 @@ linearization point.
   Pinned by `TestBuildBrokerChain_MultiSegmentFollows` and
   `TestBuildBrokerChain_DeferralRemoved`.
 
+  **Correction (audit F-E1, 2026-10-04): the "ADR-0010's idempotent
+  applier handles the brief re-application" sentence above is wrong
+  on both halves.** The broker applies nothing twice at the rotation
+  seam: it skips every full manifest (`internal/pipeline/broker.go`,
+  the `BackupKindFull` skip in the apply loop), so segment N+1's first
+  incremental starts where segment N's position ended and there is no
+  seam overlap to re-apply. The broker's only double-apply is crash
+  re-application: an incremental interrupted partway is re-applied
+  whole under the unadvanced parent position, and that re-apply is not
+  idempotent in general, because broker changes carry no apply
+  identity. A table keyed on columns the replayed rows carry converges;
+  a keyless one (or one the target keys only on a surrogate the rows do
+  not supply) would duplicate, so the broker refuses such tables before
+  applying anything (`SLUICE-E-BROKER-KEYLESS-TABLE`), and an
+  interrupted incremental exits non-zero with `BROKER-INCREMENTAL-PARTIAL`
+  (`internal/pipeline/broker_keyless.go`). Chain *restore* is different:
+  it applies segment N+1's full over segment N's rows and replays the
+  `(P_N, S]` overlap, which is tracked separately as
+  F-E1-ROTATED-SEGMENT-OVERLAP in `docs/dev/audit-backlog.md`.
+
 ## Gotchas
 
 - **`S ≥ P_N` is a hard-fail assertion, not advisory** — loud
