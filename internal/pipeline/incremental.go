@@ -1049,6 +1049,12 @@ func (b *IncrementalBackup) openCDCReader(ctx context.Context) (ir.CDCReader, er
 // regress below start.) Those replayed events belong to the parent
 // segment; they are not this window's content.
 //
+// (Dated, 2026-10-05: since v0.138.0 a Postgres EndPosition is the commit's
+// END LSN, not its start, so a parent this binary wrote is no longer
+// replayed — the guard now fires only on a resume from a parent written
+// before v0.138.0. That replay is applied twice by restore, which is why such
+// chains are refused by [backup.SeveredTransactionDoor] as shape B.)
+//
 // That parenthetical was a transcript of one manual run for fourteen
 // months, which is the shape the 2026-08-07 invariant sweep exists to
 // convert. It is now a test: postgres'
@@ -1121,12 +1127,18 @@ func windowAdvancedPast(src ir.Engine, start, pos ir.Position) bool {
 // mean "close once this window has captured maxChanges events AND has
 // something of its own to close on".
 //
-// The replayed events are deliberately KEPT rather than filtered. They
-// are duplicates of parent content in the ordinary case (chain restore
-// replays them idempotently), but when the parent's own window ended
-// mid-transaction — the channel-close and ctx-cancel exits can do that —
-// the replay is the only thing that carries the severed tail, so
-// dropping it would convert a benign duplicate into silent loss.
+// A replayed boundary transaction is KEPT rather than filtered, and the
+// earlier wording here — "duplicates of parent content … chain restore
+// replays them idempotently" — was FALSE: restore and the broker apply a
+// replayed transaction a second time, which is idempotent only for
+// primary-key inserts and same-key updates; a keyless row doubles and a
+// key-reusing transaction misapplies (F-E1-SEVERED-TAIL-REPLAY, measured).
+// What makes keeping it safe now is that it no longer occurs on a chain
+// this binary writes: no window ends inside a transaction (the channel-close
+// exit below refuses rather than commit one; ctx-cancel commits nothing),
+// and no supported source re-delivers a COMPLETED boundary transaction
+// since v0.138.0. Chains written before either fix are refused at restore
+// and by the broker ([backup.SeveredTransactionDoor]).
 //
 // cdc is passed in so an early channel-close (the CDC reader's pump
 // terminating with an error) surfaces the underlying error via
@@ -1265,6 +1277,21 @@ func (b *IncrementalBackup) captureWindow(
 					if e := errReader.Err(); e != nil {
 						return endPos, totalChanges, advanced, backupCaptureReaderErr(e)
 					}
+				}
+				if inTransaction {
+					// F-E1-SEVERED-TAIL-REPLAY: the stream ended between a
+					// TxBegin and its TxCommit. Committing this window would
+					// end the chain inside that transaction, and the next
+					// incremental would re-deliver it whole (or, on MySQL
+					// file/pos, resume past part of it). Write nothing and
+					// fail loudly: a one-shot run exists to produce a
+					// manifest, so exiting 0 without one would read as a
+					// backup taken. The next run re-reads from the parent.
+					return endPos, totalChanges, advanced, fmt.Errorf(
+						"%s: the source change stream closed inside a source transaction (TxBegin recorded, no TxCommit) after %d change events; "+
+							"committing this window would end the chain mid-transaction, so no manifest was written and nothing was acknowledged — re-run `backup incremental`, which re-reads the window from the parent's end position",
+						abandonedWindowMarker, totalChanges,
+					)
 				}
 				if err := flush(); err != nil {
 					return endPos, totalChanges, advanced, err

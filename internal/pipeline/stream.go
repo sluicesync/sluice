@@ -31,13 +31,22 @@ package pipeline
 //
 // Stop semantics:
 //
-//   - ctx cancellation (SIGINT / SIGTERM via kongContext): finish the
-//     current in-flight rollover (commit manifest + chunks + state),
-//     then exit cleanly. Bounded by [stopDrainTimeout].
-//   - Cross-machine stop request via `manifests/stream_state.json`'s
-//     `stop_requested_at` field: same drain path. Polled between
-//     rollovers so the operator's stop is observed within the
-//     rollover-tick interval (≤ rollover-window).
+//   - ctx cancellation (SIGINT / SIGTERM via kongContext): commit the
+//     current in-flight rollover (manifest + chunks + state) when it
+//     stands at a source-transaction boundary, then exit cleanly; a
+//     rollover cancelled INSIDE a source transaction is abandoned
+//     instead (nothing committed, nothing acknowledged — the next run
+//     re-reads it). Store writes bounded by [stopDrainTimeout].
+//   - Stop request (`sluice backup stream stop`: the in-process signal
+//     or `manifests/stream_state.json`'s `stop_requested_at`, polled
+//     every [streamStopPollInterval]): close the rollover at the next
+//     transaction boundary — at once when none is open, otherwise after
+//     consuming to the open transaction's commit, bounded by
+//     [BackupStream.StopTransactionDrainTimeout] /
+//     [BackupStream.StopTransactionDrainMaxChanges]; a drain that runs
+//     out abandons the rollover. A chain never ends inside a source
+//     transaction (F-E1-SEVERED-TAIL-REPLAY; see
+//     [BackupStream.captureWindow]).
 //
 // Concurrent-writer protection:
 //
@@ -89,6 +98,43 @@ const DefaultRolloverMaxChanges = 100_000
 // 64 MiB mirrors the existing `--max-buffer-bytes` shape from Phase 2's
 // backup writer.
 const DefaultRolloverMaxBytes int64 = 64 << 20
+
+// DefaultStopTransactionDrainTimeout is the wall-clock half of the budget
+// a stop that lands inside a source transaction spends consuming to that
+// transaction's commit ([BackupStream.StopTransactionDrainTimeout]).
+//
+// Why waiting is cheap enough to be the default: every framed source sluice
+// backs up delivers a transaction only once it has COMMITTED at the source
+// (Postgres logical decoding without streaming='on', the MySQL/MariaDB
+// binlog, VStream), so the rest of an open transaction is already durable
+// and arrives at delivery speed — the stop is waiting on throughput, never
+// on a human holding a transaction open. 60 s covers a few million changes
+// at measured delivery rates and stays inside a typical supervisor's stop
+// grace period. A budget that runs out ABANDONS the window (nothing
+// committed, nothing acknowledged), which costs a re-read, never data.
+//
+// The "already committed at the source" claim is pinned for Postgres (the
+// reader never passes streaming='on' — postgres/
+// cdc_reader_streaming_protocol_integration_test.go asserts an oversized
+// transaction arrives as ONE TxBegin…TxCommit — so pgoutput sends a
+// transaction only at its commit; that same pin is what keeps a streamed
+// chunk's StreamStop, which the reader frames as a TxCommit, from ever
+// posing as a boundary inside a source transaction) and is an UNVERIFIED
+// PREMISE for the MySQL/MariaDB binlog and VStream (both write a transaction
+// to the log at commit). It is a LIVENESS argument only: were it false, a
+// stop could wait out the budget and abandon, never commit a severed window.
+const DefaultStopTransactionDrainTimeout = 60 * time.Second
+
+// DefaultStopTransactionDrainMaxChanges is the change-count half of the same
+// budget ([BackupStream.StopTransactionDrainMaxChanges]): a stop gives the
+// open transaction at most this many further change events to commit.
+const DefaultStopTransactionDrainMaxChanges = 1_000_000
+
+// abandonedWindowMarker is the grep-stable marker on the log line (and the
+// one-shot `backup incremental` error) that reports a backup window given up
+// because committing it would have ended the chain inside a source
+// transaction. See [BackupStream.captureWindow].
+const abandonedWindowMarker = "BACKUP-WINDOW-ABANDONED-OPEN-TRANSACTION"
 
 // DefaultStreamStateFilename is the path within the store the stream-
 // state liveness file is written to. Lives under [lineage.IncrementalManifestPrefix]
@@ -184,6 +230,22 @@ type BackupStream struct {
 	// back to [DefaultIncrementalChunkChanges]. The writer rolls over
 	// to a new chunk file whenever the current one hits this count.
 	ChunkChanges int
+
+	// StopTransactionDrainTimeout bounds how long a stop request (the
+	// in-process stop signal, the `stream_state.json` stop file, or a
+	// stop observed mid-window) that lands INSIDE a source transaction
+	// keeps consuming changes to that transaction's commit before giving
+	// the window up. Zero falls back to
+	// [DefaultStopTransactionDrainTimeout]. See
+	// [BackupStream.captureWindow] for why a window may never end inside
+	// a source transaction (F-E1-SEVERED-TAIL-REPLAY).
+	StopTransactionDrainTimeout time.Duration
+
+	// StopTransactionDrainMaxChanges is the change-count half of the same
+	// budget: how many further change events the stop drain may consume
+	// waiting for the open transaction's commit. Zero falls back to
+	// [DefaultStopTransactionDrainMaxChanges].
+	StopTransactionDrainMaxChanges int
 
 	// IncludeEmptyRollovers, when true, commits a manifest for a
 	// rollover that captured zero changes. Default false (skip empty
@@ -339,6 +401,20 @@ type BackupStream struct {
 	// it the floor degrades to "no skip" and restore's idempotent replay
 	// still absorbs the (now slightly larger) overlap.
 	skipThrough *ir.Position
+
+	// stopPollInterval overrides [streamStopPollInterval] for the in-window
+	// stop-file poll. Test seam (zero = the 1 s default): the severed-tail
+	// integration matrix needs a stop file observed INSIDE a few-thousand-row
+	// transaction, which a 1 s poll can only guarantee against a transaction
+	// hundreds of thousands of rows long.
+	stopPollInterval time.Duration
+
+	// onWindowChange, when set, is called on the capture goroutine after
+	// every change the window processes, with the change and whether a source
+	// transaction is open. Test seam (nil in production): it lets the severed-tail matrix
+	// fire its stop, stop file or cancel at a chosen row INSIDE a transaction
+	// instead of racing the stream from outside.
+	onWindowChange func(c ir.Change, inTransaction bool, out *captureOutcome)
 }
 
 // Run executes the long-running stream. Blocks until ctx is cancelled
@@ -455,6 +531,10 @@ func (b *BackupStream) Run(ctx context.Context) (err error) {
 			// manifest write so a store call against the just-
 			// cancelled parent doesn't short-circuit the commit.
 			if errors.Is(rErr, context.Canceled) || errors.Is(rErr, context.DeadlineExceeded) {
+				if roll.Abandoned != "" {
+					b.abandonRollover(ctx, roll, elapsed)
+					return nil
+				}
 				b.drainCommitInFlightRollover(ctx, roll, elapsed)
 				return nil
 			}
@@ -534,6 +614,16 @@ func (b *BackupStream) Run(ctx context.Context) (err error) {
 		// rollovers (GitHub #22 mirrors sync-stream's progress-reset
 		// semantics).
 		retryConsecutive = 0
+
+		// A window given up because it would have ended inside a source
+		// transaction (F-E1-SEVERED-TAIL-REPLAY). Every way to reach this is
+		// an exit — a stop whose drain ran out, or a source that closed — so
+		// the stream exits too; nothing was committed or acknowledged, and
+		// the next run re-reads the window from the parent's end.
+		if roll.Abandoned != "" {
+			b.abandonRollover(ctx, roll, elapsed)
+			return nil
+		}
 
 		if roll.Manifest == nil {
 			if b.handleEmptyRollover(ctx, roll, init.state, statePath, now, elapsed, &rolloverSeq) {
@@ -1035,10 +1125,59 @@ func (b *BackupStream) handleEmptyRollover(ctx context.Context, roll rolloverOut
 	return false
 }
 
+// abandonReason is the single rule deciding whether a captured window may be
+// committed: never one whose last recorded change is inside a source
+// transaction, and never one whose capture said to give it up (a stop drain
+// that ran out, a ctx-cancel drain whose last chunk could not be stored).
+// Empty means commit.
+func abandonReason(c captureOutcome) string {
+	switch {
+	case c.AbandonReason != "":
+		return c.AbandonReason
+	case c.OpenTransaction && c.SourceClosed:
+		return "the source change stream closed inside a source transaction (TxBegin recorded, no TxCommit)"
+	case c.OpenTransaction:
+		return "the window ended inside a source transaction (TxBegin recorded, no TxCommit)"
+	}
+	return ""
+}
+
+// abandonRollover reports a window given up rather than committed (see
+// [abandonReason]). Nothing is written: no manifest, no lineage append, no
+// chain-ack release, no registry seat move — so the source keeps every change
+// after the parent's end and the next run re-reads the whole window. That is
+// the trade: a re-read (possibly of a large transaction) in exchange for
+// never ending the chain mid-transaction, where the next window would
+// re-deliver the transaction whole and restore would apply its head twice
+// (or, on MySQL file/pos, lose the rest of a ROWS event).
+//
+// The window's already-stored change chunks are left in place, unreferenced:
+// they live under this window's own CreatedAt namespace, so no committed
+// manifest names them, but a millisecond collision with a sibling window's
+// namespace is not impossible, and deleting by namespace could then remove
+// a committed sibling's chunk. Orphans are inert; a deletion that guessed
+// wrong is not. WARN, with a grep-stable marker, because the operator asked
+// for a backup and this window is not in it.
+func (b *BackupStream) abandonRollover(ctx context.Context, roll rolloverOutcome, elapsed time.Duration) {
+	slog.WarnContext(
+		ctx, abandonedWindowMarker+": backup window NOT committed — committing it would end the chain inside a source transaction, which a later window re-delivers whole (restore would apply it twice) or, on MySQL file/pos, resumes past part of. "+
+			"No manifest written and nothing acknowledged: the next run re-reads this window from the parent's end position. Nothing is lost",
+		slog.String("reason", roll.Abandoned),
+		slog.Int64("changes", roll.TotalChanges),
+		slog.Int("unreferenced_chunks", roll.AbandonedChunks),
+		slog.Bool("stop_requested", roll.StopRequested),
+		slog.Duration("elapsed", elapsed),
+	)
+}
+
 // drainCommitInFlightRollover finalises a rollover interrupted by ctx
-// cancel (the design doc's SIGTERM contract): chunks were already
-// flushed inside captureWindow, so committing the manifest here keeps
-// every change observed before the cancel in the chain. Uses a fresh
+// cancel (the design doc's SIGTERM contract). It is reached only for a
+// window that closed at a transaction boundary with its last chunk stored —
+// a window cancelled INSIDE a transaction, or whose drain-flush failed, is
+// abandoned instead ([abandonReason]; before the severed-tail fix this
+// committed the chunks flushed so far with an EndPosition past them).
+// Committing the manifest here keeps every change observed before the
+// cancel in the chain. Uses a fresh
 // stopDrainTimeout-bounded ctx for the store writes so a call against
 // the just-cancelled parent doesn't short-circuit the commit. A
 // rollover with no change chunks has nothing to commit.
@@ -1351,6 +1490,14 @@ type rolloverOutcome struct {
 	TotalBytes    int64
 	SourceClosed  bool
 	StopRequested bool
+
+	// Abandoned, when non-empty, says why the window was given up rather
+	// than committed (the reason the abandon log line prints); Manifest is
+	// then nil. AbandonedChunks counts the change chunks the window had
+	// already stored, which no manifest references. See
+	// [BackupStream.abandonRollover].
+	Abandoned       string
+	AbandonedChunks int
 }
 
 // runRollover executes one bounded rollover window. Returns the
@@ -1434,6 +1581,16 @@ func (b *BackupStream) runRollover(
 	// BACKUP-VALUE-NOT-UTF8 refusal, say) with its own. Only a cancelled
 	// window goes on, to the drain-commit.
 	if captureErr != nil && !errors.Is(captureErr, context.Canceled) && !errors.Is(captureErr, context.DeadlineExceeded) {
+		return out, captureErr
+	}
+
+	// F-E1-SEVERED-TAIL-REPLAY: a window that ends inside a source
+	// transaction is never committed, whichever exit produced it — see
+	// [BackupStream.captureWindow]. Checked here, on the outcome every exit
+	// stamps, rather than in each exit, so a future exit cannot forget it.
+	if reason := abandonReason(captured); reason != "" {
+		out.Abandoned = reason
+		out.AbandonedChunks = len(manifest.ChangeChunks)
 		return out, captureErr
 	}
 
@@ -1626,6 +1783,18 @@ type captureOutcome struct {
 	Advanced      bool
 	SourceClosed  bool
 	StopRequested bool
+
+	// OpenTransaction reports that the window's last recorded change is
+	// inside a source transaction (a TxBegin with no TxCommit after it). It
+	// is set on EVERY return from [BackupStream.captureWindow], and a window
+	// carrying it is never committed — [BackupStream.runRollover] abandons
+	// it whichever exit produced it (F-E1-SEVERED-TAIL-REPLAY).
+	OpenTransaction bool
+
+	// AbandonReason, when non-empty, is why the window must not be
+	// committed even though it may not be open: the stop drain's budget ran
+	// out, or the ctx-cancel drain could not store the window's last chunk.
+	AbandonReason string
 }
 
 // captureWindow drains changes from changesCh into chunks staged on
@@ -1636,14 +1805,49 @@ type captureOutcome struct {
 // stop poll (decoupled from rollover cadence), and tracks totalBytes
 // across chunks for the rollover-hook env contract.
 //
-// Window-end straddle behaviour: an open transaction (TxBegin observed
-// without TxCommit) extends the window by up to one transaction so the
-// chain doesn't end mid-tx — same as Phase 3.1.
+// # A window never ends inside a source transaction
+//
+// This is the rule F-E1-SEVERED-TAIL-REPLAY is about, and every exit below
+// obeys it. A window committed with a source transaction T open (a TxBegin
+// recorded, its TxCommit not) is not a "partial chunk" — it is a chain that
+// carries T twice or loses part of it, at exit 0, with no crash anywhere:
+//
+//   - On a re-delivering source (every row of T carries a position a resume
+//     re-reads T from its start: the commit LSN on Postgres, the set or
+//     VGTID from before T on MySQL/MariaDB GTID and VStream), the next window re-delivers ALL of T, and
+//     chain restore and the broker apply T's head twice. Measured:
+//     a keyless table restored at 6 rows against the source's 3, and a
+//     key-reusing T (`UPDATE 1→2, DELETE 2, UPDATE 3→1`) losing a row.
+//   - On MySQL file/pos every row of a multi-row ROWS event shares that
+//     event's END LogPos, so the resume starts AFTER the event and the
+//     rest of it is gone (40,000 rows restored as 39,996), or — cut
+//     mid-statement — the resume wedges on `rows event for unknown
+//     table_id`. Ending only at a TxCommit removes both by construction: a
+//     window can no longer end between the rows of one ROWS event, because
+//     no ROWS event lies outside a transaction.
+//
+// So: the deadline and the count/byte caps close only at a transaction
+// boundary (they always did). A STOP that lands inside a transaction keeps
+// consuming to its TxCommit, bounded by [BackupStream.StopTransactionDrainTimeout]
+// and [BackupStream.StopTransactionDrainMaxChanges]; if the budget runs out,
+// or the source closes or the context is cancelled before the commit, the
+// window is ABANDONED — no manifest, no acknowledgement, and the next run
+// re-reads from the parent's end. [captureOutcome.OpenTransaction] is
+// stamped on every return, and [BackupStream.runRollover] refuses to commit
+// a window carrying it, so the rule does not depend on each exit
+// remembering it.
+//
+// Sources with no transaction framing — the trigger-CDC engines (pgtrigger,
+// sqlite-trigger, d1-trigger) — never emit TxBegin, so inTransaction never
+// sets and every change is a boundary. That is sound for them because each
+// change carries its own unique change-log id and the reader resumes at
+// `id > EndPosition`: a cut between two changes of one source transaction
+// neither re-delivers nor skips anything.
 //
 // Advancement condition on the two count/byte caps (roadmap item 98,
 // item 92's twin in this orchestrator): neither cap may close a rollover
 // that has not yet captured an event strictly after its StartPosition.
-// A resumed pump opens by RE-DELIVERING the transaction the parent ends
+// A resumed pump can open by RE-DELIVERING the transaction the parent ends
 // on (see [windowAdvancedPast]), so a tight cap was satisfiable by that
 // replay alone — the rollover closed at its own start position, having
 // captured nothing new, and still committed a chain-linked manifest
@@ -1652,45 +1856,44 @@ type captureOutcome struct {
 // still close (that is the stream's whole cadence), so the worst the
 // condition can cost is a rollover that runs to RolloverWindow.
 //
-// The replayed events are deliberately KEPT rather than filtered. They
-// are duplicates of parent content in the ordinary case (chain restore
-// replays them idempotently), but this orchestrator has TWO documented
-// exits that can end a window mid-transaction — the eager stop-signal
-// exit below, and the ctx-cancel drain, which skips its flush while
-// inTransaction — so the parent's tail can be severed and the replay is
-// then the only thing carrying it. Dropping it would convert a benign
-// duplicate into silent loss. (This is a different question from the
-// ADR-0067 `skipThrough` floor, which DOES drop: that one runs at an
-// in-process ROTATION boundary where the pump never restarted and the
-// dropped events are provably already committed in the prior segment.)
+// A replayed boundary transaction is KEPT rather than filtered. It is NOT
+// harmless: chain restore and the broker apply it a second time, which is
+// idempotent only for primary-key inserts and same-key updates — a keyless
+// row is duplicated, and a key-reusing transaction misapplies (the
+// F-E1-KEY-REUSE-REPLAY shape). Since v0.138.0 no supported source replays a
+// COMPLETED boundary transaction (the Postgres TxCommit carries the
+// post-commit LSN; MySQL GTID's carries the post-commit set), and since the
+// severed-tail fix no window ends inside one, so the replay this paragraph
+// used to defend no longer occurs on a chain this binary writes. Chains
+// written before either fix are refused at restore and by the broker
+// ([backup.SeveredTransactionDoor]) rather than silently doubled. (This is
+// a different question from the ADR-0067 `skipThrough` floor, which DOES
+// drop: that one runs at an in-process ROTATION boundary where the pump
+// never restarted and the dropped events are provably already committed in
+// the prior segment.)
 //
 // Two stop-signal paths (Bug 37 fix; v0.19.1):
 //
 //  1. **In-process channel** (`stopCh`). Closed by [notifyStreamStop]
 //     when [RequestStreamStop] runs in the same Go process. Detected
-//     via the new select case immediately; bypasses file I/O entirely
-//     so it can't be starved or clobbered. The integration tests
-//     (`pipeline.RequestStreamStop` in the same process as the running
-//     stream) take this path; CLI single-binary subcommand setups also
-//     register against the same registry.
+//     via the select case immediately; bypasses file I/O entirely so
+//     it can't be starved or clobbered.
 //
 //  2. **File poll** ([streamStopPollInterval], 1 s by default). Reads
 //     `stream_state.json`'s `stop_requested_at` field. The cross-
 //     machine rendezvous: an operator on machine B running
 //     `sluice backup stream stop --target=<url>` against a stream on
-//     machine A only has the file path. The poll cadence is decoupled
-//     from rollover-window so observation is bounded by ~1 s
-//     regardless of the (typically minutes-long) rollover-window
-//     setting.
+//     machine A only has the file path.
 //
-// On first observation via either path, the in-flight rollover flushes
-// (commits chunks staged so far — may be a partial mid-transaction
-// chunk) and returns IMMEDIATELY with [captureOutcome.StopRequested]=
-// true so the outer loop can finalise the manifest and exit cleanly.
-// Eager exit (rather than wait-for-next-tx-boundary) is load-bearing:
-// on a quiet source the next tx boundary may never arrive within the
-// operator's drain budget. The chain may end mid-tx in the stop case;
-// this is the correct trade — operator issued stop, exit promptly.
+// On first observation via either path the stop is latched
+// ([captureOutcome.StopRequested]). Outside a transaction the window
+// flushes and returns at once; inside one it drains to the commit as
+// described above. Before the severed-tail fix this exit was "eager" —
+// it flushed mid-transaction and committed, on the stated reasoning that
+// a quiet source might never deliver the next boundary. That reasoning
+// does not survive contact with the sources: an open transaction this
+// stream has started receiving has already committed at the source, so
+// its commit is in flight, not awaited.
 //
 // Returns the captured outcome and any fatal error.
 func (b *BackupStream) captureWindow(
@@ -1706,11 +1909,12 @@ func (b *BackupStream) captureWindow(
 	clockNow func() time.Time,
 	stopCh <-chan struct{},
 	chainCEK []byte,
-) (captureOutcome, error) {
-	var (
-		inTransaction bool
-		out           captureOutcome
-	)
+) (out captureOutcome, err error) {
+	var inTransaction bool
+	// Stamped on every return, whichever arm produced it: runRollover
+	// refuses to commit a window that ends inside a source transaction, so
+	// this one line is what makes that rule independent of each exit.
+	defer func() { out.OpenTransaction = inTransaction }()
 
 	// The chunk-writer state (the open writer, its buffer, the running
 	// chunk index, the wrapped per-chunk CEK) lives on cb so flushTo /
@@ -1731,52 +1935,66 @@ func (b *BackupStream) captureWindow(
 	// Stop-poll ticker: decoupled from rollover-window cadence so an
 	// operator's `sluice backup stream stop` is observed promptly
 	// regardless of how long the current window has left to run.
-	// Reads `stream_state.json` directly; on first observation, sets
-	// out.StopRequested so the outer loop knows to exit cleanly after
-	// this rollover commits.
-	stopPoll := time.NewTicker(streamStopPollInterval)
+	pollEvery := streamStopPollInterval
+	if b.stopPollInterval > 0 {
+		pollEvery = b.stopPollInterval
+	}
+	stopPoll := time.NewTicker(pollEvery)
 	defer stopPoll.Stop()
+
+	// The stop drain: armed when a stop lands inside a transaction.
+	drain := stopTransactionDrain{b: b}
+	defer drain.stop()
+
+	// observeStop latches a stop request from either path. Outside a
+	// transaction the window closes now (done=true); inside one the drain
+	// arms and the change arm below closes the window at the TxCommit (via
+	// processChange's `out.StopRequested && !inTransaction` close).
+	observeStop := func(via string) (done bool, err error) {
+		out.StopRequested = true
+		if !inTransaction {
+			return true, flush()
+		}
+		drain.arm(ctx, via, out.TotalChanges)
+		return false, nil
+	}
 
 	deadlinePassed := false
 	for {
 		select {
 		case <-ctx.Done():
-			// Graceful drain: commit whatever's been captured to the
-			// in-flight chunk so the rollover's manifest (written by
-			// the caller) covers every change observed before cancel.
-			// Mirrors the design doc's SIGTERM "commit current
-			// in-flight rollover" contract. Uses a fresh
-			// stopDrainTimeout-bounded ctx for the chunk write so a
-			// store call against the just-cancelled parent ctx doesn't
-			// short-circuit the flush.
+			// Graceful drain (the SIGTERM contract): a window that ends at
+			// a transaction boundary is flushed so the caller can commit
+			// it. One that ends INSIDE a transaction is abandoned — the
+			// pump is being torn down by the same cancel, so the commit
+			// cannot be waited for, and committing the head of the
+			// transaction is exactly the severed tail this function exists
+			// to prevent. The flush uses a fresh stopDrainTimeout-bounded
+			// ctx so a store call against the just-cancelled parent ctx
+			// doesn't short-circuit it; a flush that FAILS abandons too,
+			// because committing the earlier chunks would record an
+			// EndPosition the stored chunks never reach.
 			if !inTransaction && cb.writer != nil {
 				flushCtx, flushCancel := context.WithTimeout(context.WithoutCancel(ctx), stopDrainTimeout)
 				if fErr := cb.flushTo(flushCtx, &out); fErr != nil {
-					slog.WarnContext(
-						ctx, "stream: drain-flush failed; in-flight chunk dropped",
-						slog.String("err", fErr.Error()),
-					)
+					out.AbandonReason = "the context was cancelled and the window's last chunk could not be stored: " + fErr.Error()
 				}
 				flushCancel()
 			}
 			return out, ctx.Err()
 		case <-stopCh:
 			// In-process stop signal (Bug 37 fix; v0.19.1). Closed by
-			// [notifyStreamStop] when [RequestStreamStop] runs in the
-			// same Go process. No file I/O, no select-loop starvation,
-			// no clobber-race window — same-process operators get
-			// instantaneous observation. Cross-process operators take
-			// the file-poll path below; this case is just a no-op for
-			// them (their stopCh is never closed by a remote process).
+			// [notifyStreamStop]; nil it so a closed channel is observed
+			// once, not on every iteration of the drain.
+			stopCh = nil
 			slog.DebugContext(
-				ctx, "stream: in-process stop signal observed; eager exit",
+				ctx, "stream: in-process stop signal observed",
 				slog.Int64("changes_so_far", out.TotalChanges),
+				slog.Bool("in_transaction", inTransaction),
 			)
-			out.StopRequested = true
-			if err := flush(); err != nil {
+			if done, err := observeStop("in-process stop signal"); err != nil || done {
 				return out, err
 			}
-			return out, nil
 		case <-timer.C:
 			deadlinePassed = true
 			if !inTransaction {
@@ -1786,15 +2004,7 @@ func (b *BackupStream) captureWindow(
 				return out, nil
 			}
 		case <-stopPoll.C:
-			// Cross-machine stop poll. Operator-issued
-			// `sluice backup stream stop` expects prompt exit, not
-			// "wait for the source to send another tx" — on a quiet
-			// source a tx-boundary may never arrive within the
-			// operator's drain budget. Eager-exit on first observation:
-			// flush whatever's buffered (could be a partial
-			// mid-transaction chunk) and return so the outer loop can
-			// commit the in-flight manifest and exit. Surfaces as
-			// [captureOutcome.StopRequested]=true.
+			// Cross-machine stop poll.
 			if out.StopRequested {
 				continue
 			}
@@ -1809,10 +2019,13 @@ func (b *BackupStream) captureWindow(
 			if req == nil {
 				continue
 			}
-			out.StopRequested = true
-			if err := flush(); err != nil {
+			if done, err := observeStop("stream_state.json stop request"); err != nil || done {
 				return out, err
 			}
+		case <-drain.expired():
+			// The stop drain's wall-clock budget ran out before the open
+			// transaction committed. Abandon: committing would sever it.
+			out.AbandonReason = drain.reason("its time budget ran out")
 			return out, nil
 		case change, ok := <-changesCh:
 			if !ok {
@@ -1821,6 +2034,14 @@ func (b *BackupStream) captureWindow(
 					if e := errReader.Err(); e != nil {
 						return out, backupCaptureReaderErr(e)
 					}
+				}
+				if inTransaction {
+					// The pump closed between a TxBegin and its TxCommit
+					// (the cancel race, or a source that ended). Flushing
+					// and committing here is the severed tail; give the
+					// window up and let the next run re-read from the
+					// parent's end. OpenTransaction carries the verdict.
+					return out, nil
 				}
 				if err := flush(); err != nil {
 					return out, err
@@ -1831,10 +2052,76 @@ func (b *BackupStream) captureWindow(
 			if err != nil {
 				return out, err
 			}
+			if b.onWindowChange != nil {
+				b.onWindowChange(change, inTransaction, &out)
+			}
 			if terminate {
 				return out, nil
 			}
+			if drain.exhausted(out.TotalChanges) {
+				out.AbandonReason = drain.reason("its change budget ran out")
+				return out, nil
+			}
 		}
+	}
+}
+
+// stopTransactionDrain is the bounded wait a stop that lands inside a source
+// transaction spends consuming to its commit (see
+// [BackupStream.captureWindow]). Zero value is unarmed: expired() is a nil
+// channel and exhausted() is false, so the select loop pays nothing for it
+// until a stop arrives mid-transaction.
+type stopTransactionDrain struct {
+	b *BackupStream
+
+	timer      *time.Timer
+	via        string
+	armedAt    int64 // out.TotalChanges when the drain armed
+	maxChanges int
+	timeout    time.Duration
+}
+
+// arm starts the budget. Logged at INFO: the operator asked to stop and the
+// stream is still running, so say why and for how long at most.
+func (d *stopTransactionDrain) arm(ctx context.Context, via string, totalChanges int64) {
+	d.via = via
+	d.armedAt = totalChanges
+	d.timeout = d.b.StopTransactionDrainTimeout
+	if d.timeout <= 0 {
+		d.timeout = DefaultStopTransactionDrainTimeout
+	}
+	d.maxChanges = d.b.StopTransactionDrainMaxChanges
+	if d.maxChanges <= 0 {
+		d.maxChanges = DefaultStopTransactionDrainMaxChanges
+	}
+	d.timer = time.NewTimer(d.timeout)
+	slog.InfoContext(
+		ctx, "stream: stop requested inside a source transaction; consuming to its commit before closing the window, so the chain does not end mid-transaction",
+		slog.String("via", via),
+		slog.Duration("budget", d.timeout),
+		slog.Int("budget_changes", d.maxChanges),
+	)
+}
+
+func (d *stopTransactionDrain) expired() <-chan time.Time {
+	if d.timer == nil {
+		return nil
+	}
+	return d.timer.C
+}
+
+func (d *stopTransactionDrain) exhausted(totalChanges int64) bool {
+	return d.timer != nil && totalChanges-d.armedAt >= int64(d.maxChanges)
+}
+
+func (d *stopTransactionDrain) reason(what string) string {
+	return fmt.Sprintf("a stop (%s) landed inside a source transaction and the drain to its commit was cut short: %s (budget %s / %d changes)",
+		d.via, what, d.timeout, d.maxChanges)
+}
+
+func (d *stopTransactionDrain) stop() {
+	if d.timer != nil {
+		d.timer.Stop()
 	}
 }
 
@@ -1864,6 +2151,16 @@ type changeChunkBuffer struct {
 	buf           *bytes.Buffer
 	chunkIdx      int
 	curWrappedCEK []byte
+
+	// pendingEndPos is the position of the last position-bearing change
+	// WRITTEN into the open chunk. It becomes the window's EndPos only when
+	// that chunk is stored (flushTo), so the committed EndPosition can never
+	// name a change no stored chunk carries — before, processChange moved
+	// EndPos per change, and a ctx-cancel drain whose last flush was skipped
+	// (inside a transaction) or failed committed an EndPosition past every
+	// chunk it recorded.
+	pendingEndPos ir.Position
+	pendingEndSet bool
 
 	// drain moves each chunk's collected [ir.SchemaSnapshot] events onto
 	// the manifest (ADR-0049 Chunk D). One per window, so it dedupes across
@@ -1916,6 +2213,10 @@ func (cb *changeChunkBuffer) flushTo(putCtx context.Context, out *captureOutcome
 	}
 	cb.manifest.ChangeChunks = append(cb.manifest.ChangeChunks, ci)
 	out.TotalBytes += nb
+	if cb.pendingEndSet {
+		out.EndPos = cb.pendingEndPos
+		cb.pendingEndSet = false
+	}
 	cb.writer = nil
 	cb.buf = nil
 	cb.curWrappedCEK = nil
@@ -1996,10 +2297,11 @@ func (cb *changeChunkBuffer) processChange(ctx context.Context, change ir.Change
 	}
 	out.TotalChanges++
 	// Only a change the chunk stream RECORDS may move EndPos — the rollover
-	// lane's half of [recordedInChangeChunkStream].
+	// lane's half of [recordedInChangeChunkStream] — and only once the chunk
+	// carrying it is stored (see [changeChunkBuffer.pendingEndPos]).
 	pos := change.Pos()
 	if (pos.Engine != "" || pos.Token != "") && recordedInChangeChunkStream(change) {
-		out.EndPos = pos
+		cb.pendingEndPos, cb.pendingEndSet = pos, true
 		if !out.Advanced {
 			out.Advanced = windowAdvancedPast(cb.b.Source, cb.manifest.StartPosition, pos)
 		}

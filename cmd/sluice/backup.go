@@ -1125,10 +1125,14 @@ type BackupStreamCmdGroup struct {
 //
 // Operator stop paths:
 //
-//   - SIGTERM / SIGINT (Ctrl-C): drain in-flight rollover, exit cleanly.
+//   - SIGTERM / SIGINT (Ctrl-C): commit the in-flight rollover when it
+//     stands at a source-transaction boundary, abandon it (nothing
+//     committed, re-read next run) when it does not; exit cleanly.
 //   - `sluice backup stream stop --target=<url>`: cross-machine stop
-//     via `stream_state.json`. Polled between rollovers; the stream
-//     exits within ≤ rollover-window of the request.
+//     via `stream_state.json`, polled every second. Inside a source
+//     transaction the stream first consumes to its commit (bounded;
+//     see pipeline.DefaultStopTransactionDrainTimeout) — a chain never
+//     ends mid-transaction (F-E1-SEVERED-TAIL-REPLAY).
 type BackupStreamCmd struct {
 	SourceDriver string `help:"Source engine name (e.g. mysql, postgres). Must declare CDC support. See 'sluice engines'." required:"" placeholder:"NAME" group:"source"`
 	Source       string `help:"Source database DSN." required:"" env:"SLUICE_SOURCE" placeholder:"DSN" group:"source"`
