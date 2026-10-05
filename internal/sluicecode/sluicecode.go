@@ -314,7 +314,15 @@ const (
 	CodeBackupInterrupted          Code = "SLUICE-E-BACKUP-INTERRUPTED"
 	CodeBackupManifestInvalid      Code = "SLUICE-E-BACKUP-MANIFEST-INVALID"
 	CodeBackupChainConflict        Code = "SLUICE-E-BACKUP-CHAIN-CONFLICT"
-	CodeBackupEncryptionMismatch   Code = "SLUICE-E-BACKUP-ENCRYPTION-MISMATCH"
+
+	// CodeBackupChainSeveredTransaction is F-E1-SEVERED-TAIL-REPLAY's
+	// read-side door: a chain carrying one source transaction across two
+	// consecutive incrementals (a severed window tail, or a pre-v0.138.0
+	// Postgres re-delivered boundary transaction). See
+	// backup.SeveredTransactionDoor.
+	CodeBackupChainSeveredTransaction Code = "SLUICE-E-BACKUP-CHAIN-SEVERED-TRANSACTION"
+
+	CodeBackupEncryptionMismatch Code = "SLUICE-E-BACKUP-ENCRYPTION-MISMATCH"
 
 	// CodeBackupRecordedSchemaMalformed is the Bug 243 refusal: the
 	// chain's RECORDED schema carries an expression whose string literal
@@ -963,6 +971,7 @@ var registry = map[Code]Info{
 	CodeBackupInterrupted:              {ClassRefusal, "a backup manifest records partial_state=in_progress — the run that wrote it was interrupted (or is still going), so it lists only the tables finished at that moment; refused by restore, backup verify, and export-as-parquet before any data is read, because reading it creates every table and loads only some while exiting 0"},
 	CodeBackupManifestInvalid:          {ClassRefusal, "a backup manifest (or the chain of manifests) fails an internal-consistency check — recorded BackupID or schema hash not matching the recomputed content, or a segment mixing encrypted and plaintext chunks (corruption, a mis-stitched lineage, or a lazy tamper)"},
 	CodeBackupChainConflict:            {ClassRefusal, "another writer advanced this backup chain mid-operation (a duplicate cron backup incremental, a backup racing a compact/prune, or an operator double-start) — either the conditional catalog write refused rather than interleave, or this run's parent is no longer the chain's tip and committing it would fork the lineage; no catalog change was written"},
+	CodeBackupChainSeveredTransaction:  {ClassRefusal, "a backup chain carries one source transaction across two consecutive incrementals — a non-final incremental that ends inside an open transaction (a stop or cancel landed mid-transaction on a release before the severed-tail fix), or a Postgres incremental that opens by re-delivering the previous one's last transaction (chains written before v0.138.0) — so replaying it would apply part of the transaction twice (a keyless row doubled, a key-reusing transaction losing rows) or, on MySQL file/pos, skip part of it; refused by chain restore and sync from-backup before anything is applied, and by backup verify; take a new full backup"},
 	CodeBackupEncryptionMismatch:       {ClassRefusal, "the supplied encryption configuration does not match the chain's recorded encryption metadata — an encrypted chain opened (or extended by a writer) without --encrypt + key material, or an envelope whose KEK mode (passphrase / KMS) differs from the chain's recorded kek_mode"},
 	CodeBackupRecordedSchemaMalformed:  {ClassRefusal, "the chain's recorded schema carries an expression whose string literal never closes (a pre-v0.120.0 MySQL-family reader mangled apostrophe-carrying expressions at schema read), so the recorded DDL cannot be emitted as valid SQL — raised by backup verify and pre-DDL by restore/chain restore; Bug 243"},
 	CodeSchemaTargetKeyspaceSharded:    {ClassRefusal, "the write target is a SHARDED Vitess/PlanetScale keyspace and sluice is about to CREATE a table that does not yet exist there, which would carry no vindex — measured: CREATE TABLE succeeds on every shard, the first row write fails Error 1173, and the surfaced error is a nondeterministic schema-tracker race — refused at the create phase, naming the new table(s); pre-create+vindex them platform-side (then it passes), or use an unsharded keyspace"},

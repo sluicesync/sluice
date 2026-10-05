@@ -279,6 +279,11 @@ type SyncFromBackup struct {
 	// yet", so every table is judged — the safe default.
 	keylessCleared map[string]string
 
+	// severedDoor is the F-E1-SEVERED-TAIL-REPLAY door ([backup.SeveredTransactionDoor]),
+	// built on first use and kept for the run so each link's decoded edges
+	// are paid for once, not once per tick. Confined to Run's goroutine.
+	severedDoor *backup.SeveredTransactionDoor
+
 	// Now, when set, overrides the wall-clock-time source used for
 	// `broker_state.json` timestamps. Tests pin timestamps; in
 	// production callers leave it nil and the default uses time.Now.
@@ -1037,6 +1042,16 @@ func (b *SyncFromBackup) replayNewIncrementals(
 		return "", 0, 0, 0, err
 	}
 
+	// F-E1-SEVERED-TAIL-REPLAY: refuse a chain that carries one source
+	// transaction across two consecutive incrementals before applying the
+	// second. Over the WHOLE chain, every tick with new work: an incremental
+	// that was the live tail when an earlier tick applied it is judged again
+	// now that a link follows it, which is the moment its open tail becomes a
+	// duplicate. Cached per link, so a steady tick decodes only the new ones.
+	if err := b.refuseSeveredTransactions(ctx, chain); err != nil {
+		return "", 0, 0, 0, err
+	}
+
 	// Audit F-E1: the keyless door, before this tick applies anything. Only
 	// tables not already cleared this run are probed, so a steady-state tick
 	// costs nothing; a table a new incremental's AddTable delta brings in is
@@ -1169,6 +1184,19 @@ func (b *SyncFromBackup) verifyChainIntegrity(ctx context.Context, chain []linea
 	}
 	if err := backup.VerifyChainSignatures(ctx, b.Store, chain, b.Envelope, b.VerifyKey, b.RequireSignature); err != nil {
 		return fmt.Errorf("broker: verify chain signatures: %w", err)
+	}
+	return nil
+}
+
+// refuseSeveredTransactions is the broker's half of the F-E1-SEVERED-TAIL-REPLAY
+// door — the same [backup.SeveredTransactionDoor] chain restore runs in its
+// pre-target list, opening chunks through the broker's own key resolver.
+func (b *SyncFromBackup) refuseSeveredTransactions(ctx context.Context, chain []lineage.SegmentRecord) error {
+	if b.severedDoor == nil {
+		b.severedDoor = backup.NewSeveredTransactionDoor(b.Store, lineage.SameEngineComparator(ctx, b.Store, b.Target), func(_ *irbackup.Manifest, c *irbackup.ChunkInfo) ([]byte, error) { return b.chunkCEK(c) })
+	}
+	if err := b.severedDoor.Check(ctx, chain); err != nil {
+		return fmt.Errorf("broker: %w", err)
 	}
 	return nil
 }

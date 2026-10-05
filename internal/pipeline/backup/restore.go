@@ -2078,6 +2078,11 @@ func verifyBackupScan(ctx context.Context, store irbackup.Store, opts VerifyOpti
 	// counter, not the chunk tally (see [verifyFailureSummary]).
 	tally.sigFailed = verifyBackupSignatures(ctx, store, records, opts)
 
+	// F-E1-SEVERED-TAIL-REPLAY: verify predicts restore ([verifySeveredTransactions]).
+	if err := verifySeveredTransactions(ctx, store, chain, needsWalk, chainEncrypted(identity), opts.Envelope != nil, prober); err != nil {
+		return verifyScanTally{}, err
+	}
+
 	// SEC-MIRROR follow-up: an encrypted chain must not carry a plaintext
 	// chunk. The chunk scan below is SHA + authenticated-open, and both
 	// no-op on a chunk with nil Encryption, so a plaintext-spliced chunk

@@ -1853,5 +1853,26 @@ func (r *ChainRestore) preflightBeforeTarget(
 	if err := verifyChainSignatures(ctx, r.Store, links, verifyMaterial{env: r.Envelope, verifyPub: r.VerifyKey}, r.RequireSignature); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("chain restore: %w", err))
 	}
+
+	// 2.9. F-E1-SEVERED-TAIL-REPLAY: refuse a chain that carries one source
+	//      transaction across two consecutive incrementals (an old binary's
+	//      severed window tail, or a pre-v0.138.0 Postgres re-delivered
+	//      boundary transaction) — replaying it applies part of the
+	//      transaction twice. Last, because it DECODES change chunks: it
+	//      needs the chain key the encryption preflight resolved, and the
+	//      cheaper manifest-level doors should refuse a tampered chain first.
+	return r.refuseSeveredTransactions(ctx, links)
+}
+
+// refuseSeveredTransactions runs the [SeveredTransactionDoor] over the chain
+// and, when it passes, WARNs if the chain's final incremental ends inside an
+// open transaction (not refusable — nothing follows it — but restoring it
+// lands a state the source never had).
+func (r *ChainRestore) refuseSeveredTransactions(ctx context.Context, links []lineage.SegmentRecord) error {
+	door := NewSeveredTransactionDoor(r.Store, lineage.SameEngineComparator(ctx, r.Store, r.Target), func(_ *irbackup.Manifest, c *irbackup.ChunkInfo) ([]byte, error) { return r.changeChunkCEK(c) })
+	if err := door.Check(ctx, links); err != nil {
+		return fmt.Errorf("chain restore: %w", err)
+	}
+	door.WarnOpenFinalTail(ctx, links)
 	return nil
 }

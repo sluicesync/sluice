@@ -54,6 +54,11 @@ var codecReaderRoster = map[string]codecCallSite{
 		threadedFromTheRecord,
 		"the restore's segment codec, resolved once from lineage.json when the segment was opened.",
 	},
+	"backup/severed_transaction_door.go:link.Segment.CodecOrDefault()": {
+		threadedFromTheRecord,
+		"the F-E1-SEVERED-TAIL-REPLAY door opens a link's change chunks with that link's segment record's " +
+			"codec, exactly as chain restore and the broker replay will.",
+	},
 	"backup/verify_read_depth.go:t.codec": {
 		threadedFromTheRecord,
 		"the verify task carries the segment's recorded codec alongside its CEK and AAD; both reader " +

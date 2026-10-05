@@ -76,6 +76,7 @@ func TestChainRestorePreTargetDoorRoster(t *testing.T) {
 		"checkMixedModeChain",
 		"restoreManifestIntegrityPreflights",
 		"verifyChainSignatures",
+		"refuseSeveredTransactions",
 	}
 	for _, w := range want {
 		if !strings.Contains(body, w+"(") {
@@ -136,4 +137,26 @@ func mustParseFuncBodyIn(t *testing.T, path, fn string) string {
 			"deleting it", fn, path)
 	}
 	return out
+}
+
+// TestBrokerReplayRunsTheSeveredDoorBeforeApplying holds the broker's half of
+// the F-E1-SEVERED-TAIL-REPLAY door: every tick with new work runs it over the
+// whole chain, and BEFORE the loop that applies incrementals — a door after
+// the apply would refuse only once the duplicate had landed. The behavioural
+// half is backup.SeveredTransactionDoor's own tests plus
+// stream_severed_tail_integration_test.go's broker legs.
+func TestBrokerReplayRunsTheSeveredDoorBeforeApplying(t *testing.T) {
+	src := mustParseFuncBody(t, "broker.go", "replayNewIncrementals")
+	doorAt := strings.Index(src, "b.refuseSeveredTransactions(ctx, chain)")
+	applyAt := strings.Index(src, "b.applyIncremental(ctx")
+	if applyAt < 0 {
+		t.Fatal("anchor 'b.applyIncremental(ctx' not found in replayNewIncrementals — re-anchor this gate")
+	}
+	if doorAt < 0 {
+		t.Fatal("replayNewIncrementals no longer runs the severed-transaction door: the broker would apply a " +
+			"source transaction twice when a chain carries it across two incrementals")
+	}
+	if doorAt > applyAt {
+		t.Error("replayNewIncrementals runs the severed-transaction door AFTER applying incrementals")
+	}
 }
