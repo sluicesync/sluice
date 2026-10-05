@@ -155,6 +155,38 @@ func framedRows(start uint64, _ int) (out []ir.Change, end uint64) {
 	return append(out, ir.TxCommit{Position: pos(t2)}), t2
 }
 
+// TestSmartCompaction_DoesNotHealAShortInput is the other direction: the
+// boundary pair re-asserts the position the original stream RECORDED, so an
+// incremental that was already short of its EndPosition (an old cancel
+// drain's drop) must still be refused after compaction. A rewrite that
+// stamped the manifest's EndPosition instead would launder the loss.
+func TestSmartCompaction_DoesNotHealAShortInput(t *testing.T) {
+	ctx := context.Background()
+	store := newMemStore()
+	now := time.Date(2026, 5, 26, 0, 0, 0, 0, time.UTC)
+	seedSmartCompactLineageWithSchemaAndEnc(t, store, now, usersSchema(), nil, func(start uint64, j int) ([]ir.Change, uint64) {
+		out, end := markerlessRows(start, j)
+		return out, end + 5 // EndPosition past the last recorded change
+	})
+	pre, err := lineage.BuildLineageChain(ctx, store, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireIncomplete(t, NewSeveredTransactionDoor(store, nil, nil).Check(ctx, pre))
+	if _, err := CompactChain(ctx, store, CompactOpts{
+		MergeWindow: 2 * time.Hour, SmartCompaction: true, PKStrategy: PKStrategyPK,
+		Now:          func() time.Time { return now.Add(10 * time.Hour) },
+		newSegmentID: func() string { return "merged-smart" },
+	}); err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+	post, err := lineage.BuildLineageChain(ctx, store, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireIncomplete(t, NewSeveredTransactionDoor(store, nil, nil).Check(ctx, post))
+}
+
 // TestSmartCompaction_RewrittenIncrementalReachesItsEndPosition runs a real
 // `backup compact --smart-compaction` over a two-segment lineage and hands
 // its output to every reader of the tail-reach rule. The independent expected
