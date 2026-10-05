@@ -52,6 +52,46 @@ func init() {
 // deployments).
 const defaultStrictSQLMode = "STRICT_TRANS_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO"
 
+// noAutoValueOnZero is the one sql_mode flag sluice's WRITE FIDELITY depends
+// on, as distinct from the strictness flags above that --mysql-sql-mode
+// governs. Without it MySQL treats an explicit 0 written into an
+// AUTO_INCREMENT column as "generate the next value", so a source row whose
+// AUTO_INCREMENT (or PG serial/identity, or SQLite rowid) key is 0 lands on a
+// MySQL target under a different key, silently, at exit 0: measured on 8.4,
+// `migrate` turned {0,'zero'},{100,'hundred'} into {1,'zero'},{100,'hundred'}
+// (and a later forwarded `ALTER … MODIFY … AUTO_INCREMENT` renumbers an
+// existing 0 the same way). mysqldump sets this flag for the same reason.
+//
+// It is therefore not the operator's to turn off: [withRequiredSQLModes] adds
+// it to whatever mode sluice injects (the strict default, the kong-default
+// literal, any explicit --mysql-sql-mode list), and [ensureNoAutoValueOnZero]
+// adds it on the live session when sluice injected nothing — the
+// empty --mysql-sql-mode escape hatch, or an operator's DSN `sql_mode=` in any
+// key spelling. Reading is unaffected (the flag governs INSERT only), so the
+// source-side connections that share [openDB] carry it harmlessly.
+const noAutoValueOnZero = "NO_AUTO_VALUE_ON_ZERO"
+
+// sqlModeHas reports whether a raw sql_mode string (possibly single-quoted,
+// mixed-case, comma-separated, as the server or a DSN spells it) carries the
+// named flag as a whole comma-separated element.
+func sqlModeHas(mode, flag string) bool {
+	for _, part := range strings.Split(strings.Trim(mode, "'\" "), ",") {
+		if strings.EqualFold(strings.TrimSpace(part), flag) {
+			return true
+		}
+	}
+	return false
+}
+
+// withRequiredSQLModes returns mode with [noAutoValueOnZero] appended when it
+// is absent. mode is a non-empty, unquoted list sluice is about to inject.
+func withRequiredSQLModes(mode string) string {
+	if sqlModeHas(mode, noAutoValueOnZero) {
+		return mode
+	}
+	return mode + "," + noAutoValueOnZero
+}
+
 // resolveSessionSQLMode collapses an engine's --mysql-sql-mode override to the
 // concrete mode sluice injects into every MySQL connection's
 // `SET SESSION sql_mode = '...'` post-handshake. nil (an override-free engine,
@@ -941,7 +981,7 @@ func openDB(ctx context.Context, cfg *mysql.Config, sqlMode *string) (*sql.DB, e
 	if err != nil {
 		return nil, fmt.Errorf("mysql: build connector: %w", err)
 	}
-	db := sql.OpenDB(utcSessionConnector{connector})
+	db := sql.OpenDB(sessionInvariantsConnector{connector})
 
 	if err := db.PingContext(ctx); err != nil {
 		_ = db.Close()
@@ -986,7 +1026,10 @@ func markDatabaseNotFound(err error) error {
 //
 // If neither is set (an override-free engine), [defaultStrictSQLMode] applies
 // (the loud-failure-tenet default). The literal-quotes pattern matches the
-// time_zone override in [finishParseDSN].
+// time_zone override in [finishParseDSN]. Whatever mode sluice injects carries
+// [noAutoValueOnZero] ([withRequiredSQLModes]); the two tiers where it injects
+// nothing (a DSN override, the "" escape hatch) get that flag from the
+// post-connect [ensureNoAutoValueOnZero] instead.
 //
 // SEC-1 re-review follow-up: when a DSN `sql_mode` param IS present it wins on
 // the wire, but the DDL emitters escape string-literal backslashes against the
@@ -1006,6 +1049,6 @@ func injectSessionSQLMode(cfg *mysql.Config, sqlMode *string) {
 		cfg.Params = map[string]string{}
 	}
 	if _, ok := cfg.Params["sql_mode"]; !ok {
-		cfg.Params["sql_mode"] = "'" + mode + "'"
+		cfg.Params["sql_mode"] = "'" + withRequiredSQLModes(mode) + "'"
 	}
 }

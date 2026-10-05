@@ -43,7 +43,7 @@ func TestSessionTimeZone_NonUTCShiftsTimestamp_AndTheDSNDoorRefusesIt(t *testing
 		t.Fatalf("parseDSN: %v", err)
 	}
 	cfg.Params["time_zone"] = "'+09:00'"
-	// The post-connect check (utcSessionConnector) refuses this session —
+	// The post-connect check (sessionInvariantsConnector) refuses this session —
 	// the independent door, reached here because the parser was bypassed.
 	if _, err := openDB(ctx, cfg, nil); err == nil || !strings.Contains(err.Error(), "DSN-TIME-ZONE-NOT-UTC") {
 		t.Errorf("openDB with a +09:00 session that slipped the DSN parser = %v; want the post-connect DSN-TIME-ZONE-NOT-UTC refusal", err)
@@ -102,7 +102,7 @@ func TestSessionTimeZone_NonUTCShiftsTimestamp_AndTheDSNDoorRefusesIt(t *testing
 	if err != nil {
 		t.Fatalf("connector: %v", err)
 	}
-	pool := sql.OpenDB(utcSessionConnector{connector})
+	pool := sql.OpenDB(sessionInvariantsConnector{connector})
 	pool.SetMaxIdleConns(0) // every Conn below is a fresh physical connection
 	refused := 0
 	for i := 0; i < 30; i++ {
