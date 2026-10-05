@@ -1044,11 +1044,15 @@ func (b *SyncFromBackup) replayNewIncrementals(
 
 	// F-E1-SEVERED-TAIL-REPLAY: refuse a chain that carries one source
 	// transaction across two consecutive incrementals before applying the
-	// second. Over the WHOLE chain, every tick with new work: an incremental
+	// second. Over the whole chain, every tick with new work — an incremental
 	// that was the live tail when an earlier tick applied it is judged again
 	// now that a link follows it, which is the moment its open tail becomes a
-	// duplicate. Cached per link, so a steady tick decodes only the new ones.
-	if err := b.refuseSeveredTransactions(ctx, chain); err != nil {
+	// duplicate — but a finding that lands on a link this broker ALREADY
+	// applied (chain[:startIdx]) only WARNs: refusing it cannot undo it, and
+	// would halt a broker forever on history an older binary applied (a PG
+	// chain spanning a pre-v0.138.0 resume keeps its shape-B pair). Cached per
+	// link, so a steady tick decodes only the new ones.
+	if err := b.refuseSeveredTransactions(ctx, chain, startIdx); err != nil {
 		return "", 0, 0, 0, err
 	}
 
@@ -1191,11 +1195,13 @@ func (b *SyncFromBackup) verifyChainIntegrity(ctx context.Context, chain []linea
 // refuseSeveredTransactions is the broker's half of the F-E1-SEVERED-TAIL-REPLAY
 // door — the same [backup.SeveredTransactionDoor] chain restore runs in its
 // pre-target list, opening chunks through the broker's own key resolver.
-func (b *SyncFromBackup) refuseSeveredTransactions(ctx context.Context, chain []lineage.SegmentRecord) error {
+// applied is how many leading links of chain this broker has already applied
+// ([backup.SeveredTransactionDoor.CheckFrom]).
+func (b *SyncFromBackup) refuseSeveredTransactions(ctx context.Context, chain []lineage.SegmentRecord, applied int) error {
 	if b.severedDoor == nil {
 		b.severedDoor = backup.NewSeveredTransactionDoor(b.Store, lineage.SameEngineComparator(ctx, b.Store, b.Target), func(_ *irbackup.Manifest, c *irbackup.ChunkInfo) ([]byte, error) { return b.chunkCEK(c) })
 	}
-	if err := b.severedDoor.Check(ctx, chain); err != nil {
+	if err := b.severedDoor.CheckFrom(ctx, chain, applied); err != nil {
 		return fmt.Errorf("broker: %w", err)
 	}
 	return nil

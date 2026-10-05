@@ -147,7 +147,7 @@ func mustParseFuncBodyIn(t *testing.T, path, fn string) string {
 // stream_severed_tail_integration_test.go's broker legs.
 func TestBrokerReplayRunsTheSeveredDoorBeforeApplying(t *testing.T) {
 	src := mustParseFuncBody(t, "broker.go", "replayNewIncrementals")
-	doorAt := strings.Index(src, "b.refuseSeveredTransactions(ctx, chain)")
+	doorAt := strings.Index(src, "b.refuseSeveredTransactions(ctx, chain")
 	applyAt := strings.Index(src, "b.applyIncremental(ctx")
 	if applyAt < 0 {
 		t.Fatal("anchor 'b.applyIncremental(ctx' not found in replayNewIncrementals — re-anchor this gate")
@@ -158,5 +158,13 @@ func TestBrokerReplayRunsTheSeveredDoorBeforeApplying(t *testing.T) {
 	}
 	if doorAt > applyAt {
 		t.Error("replayNewIncrementals runs the severed-transaction door AFTER applying incrementals")
+	}
+	// The applied-prefix rule: the door is told how many links this broker
+	// already applied (startIdx), so it refuses only findings on links it has
+	// not — judging the whole chain halts an upgraded broker forever on a
+	// pre-v0.138.0 PG chain's permanent shape-B pair.
+	if !strings.Contains(src, "b.refuseSeveredTransactions(ctx, chain, startIdx)") {
+		t.Error("replayNewIncrementals no longer passes startIdx (the applied prefix) to the severed-transaction door: " +
+			"findings on links it already applied would refuse every tick, halting an upgraded broker on its own history")
 	}
 }

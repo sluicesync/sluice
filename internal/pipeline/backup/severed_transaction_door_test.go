@@ -18,6 +18,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -279,36 +280,66 @@ func TestSeveredTransactionDoor_HealthyChainsPass(t *testing.T) {
 	}
 }
 
+// countingStore counts chunk GETs, so the cache claim is measured rather
+// than inferred from a failure.
+type countingStore struct {
+	*blobcodec.LocalStore
+	gets int
+}
+
+func (s *countingStore) Get(ctx context.Context, path string) (io.ReadCloser, error) {
+	s.gets++
+	return s.LocalStore.Get(ctx, path)
+}
+
 // TestSeveredTransactionDoor_CachesPerLink pins the broker's cost claim: a
 // second Check over the same chain plus one new link decodes only the new
-// link (the store would refuse a re-read of a deleted chunk).
+// link. A link whose chunks cannot be decoded refuses when it is not yet
+// applied, and is WARNed and left unjudged when the broker already applied
+// it; either way it is NOT cached, so the next pass tries it again.
 func TestSeveredTransactionDoor_CachesPerLink(t *testing.T) {
-	store := sevStore(t)
-	a := sevWriteIncremental(t, store, "a", 100, sevTx(100, "x"))
-	b := sevWriteIncremental(t, store, "b", 100, sevTx(200, "y"))
+	base := sevStore(t)
+	store := &countingStore{LocalStore: base}
+	a := sevWriteIncremental(t, base, "a", 100, sevTx(100, "x"))
+	b := sevWriteIncremental(t, base, "b", 100, sevTx(200, "y"))
 	door := &SeveredTransactionDoor{Store: store, Comparator: sevLSNComparator{}}
 	if err := door.Check(context.Background(), []lineage.SegmentRecord{sevFull(), a, b}); err != nil {
 		t.Fatal(err)
 	}
-	for _, l := range []lineage.SegmentRecord{a, b} {
-		for _, c := range l.Manifest.ChangeChunks {
-			if err := store.Delete(context.Background(), c.File); err != nil {
-				t.Fatal(err)
-			}
-		}
+	first := store.gets
+	if first == 0 {
+		t.Fatal("anti-vacuity: the door decoded nothing")
 	}
-	c := sevWriteIncremental(t, store, "c", 100, sevTx(300, "z"))
+	c := sevWriteIncremental(t, base, "c", 100, sevTx(300, "z"))
 	if err := door.Check(context.Background(), []lineage.SegmentRecord{sevFull(), a, b, c}); err != nil {
-		t.Fatalf("a cached link was re-read (its chunks are gone): %v", err)
+		t.Fatal(err)
 	}
-	// And a decode failure is loud, not a silent pass.
-	d := sevWriteIncremental(t, store, "d", 100, sevTx(400, "w"))
+	if got := store.gets - first; got != 1 {
+		t.Fatalf("second pass read %d chunks; want 1 (only the new link's)", got)
+	}
+
+	d := sevWriteIncremental(t, base, "d", 100, sevTx(400, "w"))
 	for _, ch := range d.Manifest.ChangeChunks {
-		_ = store.Delete(context.Background(), ch.File)
+		_ = base.Delete(context.Background(), ch.File)
 	}
-	err := (&SeveredTransactionDoor{Store: store}).Check(context.Background(), []lineage.SegmentRecord{sevFull(), d, c})
+	chain := []lineage.SegmentRecord{sevFull(), a, b, c, d}
+	// Not yet applied (restore; a broker's new link): refused, loudly, with
+	// the fetch's own error, before anything is applied.
+	err := door.Check(context.Background(), chain)
 	if err == nil || !strings.Contains(err.Error(), "severed-transaction door") {
-		t.Fatalf("an unreadable chunk passed the door: %v", err)
+		t.Fatalf("an undecodable, unapplied link must refuse; got %v", err)
+	}
+	// Already applied (a broker past it): WARNed and left unjudged — that
+	// chunk is never read again, and refusing would halt the broker forever.
+	if err := door.CheckFrom(context.Background(), chain, len(chain)); err != nil {
+		t.Fatalf("an undecodable, already-applied link halted the broker: %v", err)
+	}
+	before := store.gets
+	if err := door.CheckFrom(context.Background(), chain, len(chain)); err != nil {
+		t.Fatal(err)
+	}
+	if store.gets == before {
+		t.Fatal("an undecodable link was cached; the next pass must try it again")
 	}
 }
 

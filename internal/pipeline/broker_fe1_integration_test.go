@@ -115,22 +115,31 @@ func fe1Setup(t *testing.T, seedDDL, loopBody string, beforeStream func(c *fe1Ch
 			c.incr = &chain[i]
 		}
 	}
-	if c.incr == nil || len(c.incr.Manifest.ChangeChunks) < 2 {
-		t.Fatalf("the stream produced no multi-chunk incremental; the partial-apply cells need one")
+	if c.incr == nil || len(c.incr.Manifest.ChangeChunks) < 3 {
+		t.Fatalf("the stream produced no incremental of 3+ chunks; the partial-apply cells need one (see corruptMiddleChunk)")
 	}
 	c.tailID = lineage.ManifestBackupID(chain[len(chain)-1].Manifest)
 	return c
 }
 
-// corruptLastChunk flips a byte in the data incremental's last change chunk
-// (a transient fetch failure, from the broker's point of view) and returns
-// the function that puts the original back.
-func (c *fe1Chain) corruptLastChunk(t *testing.T) (restore func()) {
+// corruptMiddleChunk flips a byte in a MIDDLE change chunk of the data
+// incremental (a transient fetch failure, from the applier's point of view)
+// and returns the function that puts the original back. A middle one, not
+// the last: the severed-transaction door (F-E1-SEVERED-TAIL-REPLAY) decodes
+// each incremental's FIRST and LAST chunks before anything is applied and
+// refuses a link whose chunk it cannot read, so a corrupt last chunk now
+// fails the run before the partial apply these cells exist to pin. A middle
+// chunk is read only by the apply, after the chunks before it committed.
+func (c *fe1Chain) corruptMiddleChunk(t *testing.T) (restore func()) {
 	t.Helper()
 	ctx := context.Background()
 	seg := c.incr.Segment.Store(c.store)
-	last := c.incr.Manifest.ChangeChunks[len(c.incr.Manifest.ChangeChunks)-1]
-	rc, err := seg.Get(ctx, last.File)
+	chunks := c.incr.Manifest.ChangeChunks
+	if len(chunks) < 3 {
+		t.Fatalf("the data incremental has %d chunks; a middle-chunk failure needs at least 3", len(chunks))
+	}
+	mid := chunks[len(chunks)/2]
+	rc, err := seg.Get(ctx, mid.File)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,11 +147,11 @@ func (c *fe1Chain) corruptLastChunk(t *testing.T) (restore func()) {
 	_ = rc.Close()
 	bad := append([]byte(nil), orig...)
 	bad[len(bad)/2] ^= 0xFF
-	if err := seg.Put(ctx, last.File, bytes.NewReader(bad)); err != nil {
+	if err := seg.Put(ctx, mid.File, bytes.NewReader(bad)); err != nil {
 		t.Fatal(err)
 	}
 	return func() {
-		if err := seg.Put(ctx, last.File, bytes.NewReader(orig)); err != nil {
+		if err := seg.Put(ctx, mid.File, bytes.NewReader(orig)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -190,7 +199,7 @@ func TestFE1_Broker_KeylessChain_RefusedBeforeAnything(t *testing.T) {
 		for _, mode := range fe1Modes {
 			t.Run(interrupt+"/"+mode.name, func(t *testing.T) {
 				if interrupt == "error" {
-					defer c.corruptLastChunk(t)()
+					defer c.corruptMiddleChunk(t)()
 				}
 				streamID := "fe1-kl-" + interrupt + "-" + mode.name
 				ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -217,7 +226,7 @@ func TestFE1_Broker_KeylessChain_RefusedBeforeAnything(t *testing.T) {
 	// every keyless row (2001 vs 1001) at exit nil.
 	t.Run("chain restore re-run", func(t *testing.T) {
 		applyDDL(t, c.dst, `DROP TABLE kl; DROP TABLE k;`)
-		putBack := c.corruptLastChunk(t)
+		putBack := c.corruptMiddleChunk(t)
 		pgEng, _ := engines.Get("postgres")
 		cr := func(filter migcore.TableFilter) error {
 			return (&backup.ChainRestore{Target: pgEng, TargetDSN: c.dst, Store: c.store, ApplyConcurrency: 1, Filter: filter}).Run(context.Background())
@@ -272,7 +281,7 @@ func TestFE1_Broker_KeyedChain_ConvergesAndCancelIsLoud(t *testing.T) {
 
 				var err1 error
 				if interrupt == "error" {
-					putBack := c.corruptLastChunk(t)
+					putBack := c.corruptMiddleChunk(t)
 					err1 = c.broker(streamID, mode.conc, c.fullID).Run(context.Background())
 					putBack()
 					if err1 == nil {
@@ -565,7 +574,7 @@ func TestFE1_Broker_KeyChangingIncremental_RerunRefusesLoudly(t *testing.T) {
 		t.Run(mode.name, func(t *testing.T) {
 			applyDDL(t, c.dst, `TRUNCATE k; INSERT INTO k VALUES (-1, 'seed');`)
 			streamID := "fe1-kc-" + mode.name
-			putBack := c.corruptLastChunk(t)
+			putBack := c.corruptMiddleChunk(t)
 			err1 := c.broker(streamID, mode.conc, c.fullID).Run(context.Background())
 			putBack()
 			if err1 == nil {

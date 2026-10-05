@@ -26,8 +26,9 @@ package pipeline
 // statements of sevStmtRows rows, each binlogged as ONE multi-row ROWS
 // event, and on file/pos (where every row of an event shares the event's
 // end position) the matrix asserts that at least one cut landed between
-// two rows of one event. Every shape is graded against the SOURCE, the independent expected value: per-table multisets read back
-// from the restored target and the broker target, never counts the chain
+// two rows of one event. Every shape is graded against the SOURCE, the
+// independent expected value: per-table multisets read back from the
+// restored target and the broker target, never counts the chain
 // records about itself.
 //
 // The cut is DETERMINISTIC: the stream's onWindowChange seam fires the
@@ -484,8 +485,10 @@ func (c *sevChain) run() {
 		c.sever(s)
 	}
 	c.finish()
-	// The writer-side rule, read back from the chunks: no incremental this
-	// binary wrote ends inside a transaction, so the door passes.
+	// The writer-side rules, read back from the chunks: no incremental this
+	// binary wrote ends inside a transaction (shapes A, B), and every one
+	// ends its EndPosition on the last change it recorded (shape C) — the
+	// per-engine measurement is logged as END-RULE lines.
 	chain, err := (&SyncFromBackup{Store: c.store, ChainURL: "x", StreamID: "x"}).brokerChain(context.Background())
 	if err != nil {
 		c.e.t.Fatal(err)
@@ -495,6 +498,7 @@ func (c *sevChain) run() {
 	if err := backup.NewSeveredTransactionDoor(c.store, cmp, nil).Check(context.Background(), chain); err != nil {
 		c.e.t.Fatalf("this binary wrote a chain the severed-transaction door refuses: %v", err)
 	}
+	c.logEndRule(chain)
 	c.chainRestore()
 	c.broker()
 }
@@ -621,4 +625,51 @@ func TestSeveredTail_MySQLFilePos(t *testing.T) {
 	src, dst, cleanup := startMySQLBinlog(t)
 	t.Cleanup(cleanup)
 	(&sevEnv{t: t, engine: "mysql", driver: "mysql", src: src, dst: dst}).matrix(false)
+}
+
+// logEndRule records, per incremental of a chain the CURRENT producer wrote,
+// which kind of change its EndPosition sits on — the measured half of the
+// shape-C rule ("EndPosition is the last position-bearing change the chunks
+// record"). It also asserts the equality itself, independently of the door.
+func (c *sevChain) logEndRule(chain []lineage.SegmentRecord) {
+	t := c.e.t
+	t.Helper()
+	kinds := map[string]int{}
+	for i := range chain {
+		link := &chain[i]
+		if link.Manifest.Kind != irbackup.BackupKindIncremental || len(link.Manifest.ChangeChunks) == 0 {
+			continue
+		}
+		var last ir.Change
+		for _, ci := range link.Manifest.ChangeChunks {
+			src, err := link.Segment.Store(c.store).Get(context.Background(), ci.File)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rd, err := blobcodec.NewChangeChunkReader(src, ci.SHA256, nil, link.Segment.CodecOrDefault(), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for {
+				ch, err := rd.ReadChange()
+				if err != nil {
+					break
+				}
+				if p := ch.Pos(); p.Engine != "" || p.Token != "" {
+					last = ch
+				}
+			}
+			_ = rd.Close()
+		}
+		end := link.Manifest.EndPosition
+		if last == nil && (end == link.Manifest.StartPosition || end == (ir.Position{})) {
+			kinds["(nothing positioned; EndPosition = StartPosition)"]++
+			continue
+		}
+		if last == nil || last.Pos() != end {
+			t.Fatalf("END-RULE violated on %s: EndPosition %+v, last recorded %T %+v", lineage.ManifestBackupID(link.Manifest), end, last, last)
+		}
+		kinds[fmt.Sprintf("%T", last)]++
+	}
+	t.Logf("END-RULE %s (gtid=%v): EndPosition == last recorded change on every incremental; last kinds %v", c.e.engine, c.e.gtid, kinds)
 }

@@ -846,6 +846,11 @@ func TestChainRestore_SchemaHistoryDecodeFailureIsLoud(t *testing.T) {
 	_ = lineage.UpdateLineageForManifestBestEffort(context.Background(), store, full, lineage.ManifestFileName, blobcodec.CodecGzip)
 
 	incr := makeManifest(t, irbackup.BackupKindIncremental, full, "0/200")
+	// A chunk-less (DDL-only) window ends where it started: a writer cannot
+	// record an advanced EndPosition with no change at it, and the
+	// severed-transaction door refuses that shape before this test's
+	// schema-history refusal could fire (F-E1-SEVERED-TAIL-REPLAY shape C).
+	incr.EndPosition = incr.StartPosition
 	// Corrupt SchemaHistory entry: TableJSON is "null" → UnmarshalTable
 	// returns (nil, nil); orchestrator must refuse loudly.
 	incr.SchemaHistory = []*irbackup.SchemaHistoryEntry{

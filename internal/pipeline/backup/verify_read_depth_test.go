@@ -375,10 +375,13 @@ func seedReadDepthChain(t *testing.T, encrypted bool, dataShape, changeShape rea
 		CreatedAt:     base.Add(10 * time.Minute),
 		Kind:          irbackup.BackupKindIncremental,
 		StartPosition: pos(10),
-		EndPosition:   pos(12),
-		PartialState:  irbackup.BackupStateComplete,
-		Schema:        schema,
-		ChangeChunks:  []*irbackup.ChunkInfo{changeChunk},
+		// The last change the chunk records (changeChunkBytes ends at pos(11)):
+		// a writer stamps exactly that, and verify and restore both refuse an
+		// EndPosition past it (F-E1-SEVERED-TAIL-REPLAY shape C).
+		EndPosition:  pos(11),
+		PartialState: irbackup.BackupStateComplete,
+		Schema:       schema,
+		ChangeChunks: []*irbackup.ChunkInfo{changeChunk},
 	}
 	if encrypted {
 		changeChunk.Encryption = &irbackup.ChunkEncryption{
@@ -407,7 +410,7 @@ func seedReadDepthChain(t *testing.T, encrypted bool, dataShape, changeShape rea
 			FullManifestPath: lineage.ManifestFileName,
 			Incrementals:     []string{incrPath},
 			StartPosition:    pos(10),
-			EndPosition:      pos(12),
+			EndPosition:      pos(11),
 			Codec:            blobcodec.CodecGzip,
 		}},
 	}
