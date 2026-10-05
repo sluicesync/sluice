@@ -70,6 +70,16 @@ The restart policies below key off the exit status, so here is the contract. slu
 
 Codes 0 and 1 have meant this since the first release; 2 and 3 were carved out of the generic 1 later, so a script checking `!= 0` is unaffected while a script checking `== 1` specifically may need updating. Details and the error-code registry: [error-codes](error-codes.md).
 
+### Stopping `backup stream run`
+
+A backup chain never ends inside a source transaction, because a chain that did would restore that transaction twice (or, on MySQL file/pos, lose part of it). That shapes how a `backup stream run` stops:
+
+- **`sluice backup stream stop`** (and the in-process stop) closes the current rollover at once when no source transaction is open. When one is open, the stream keeps reading until that transaction's commit, which has already happened at the source and is only being delivered, and then commits the rollover and exits 0. The wait is bounded by 60 seconds and 1,000,000 changes. If either runs out, the rollover is **abandoned** and the stream still exits 0: no manifest is written and the replication slot is not acknowledged, so the next run reads that window again from the previous rollover's end. The WARN line carries the marker `BACKUP-WINDOW-ABANDONED-OPEN-TRANSACTION`. Give the stop at least that long before your supervisor escalates to SIGKILL.
+- **SIGTERM / SIGINT** commits the in-flight rollover only when it stands at a transaction boundary. Inside a transaction it is abandoned in the same way, because the cancel also tears down the change stream, so the commit cannot be waited for. The stream exits 0 either way.
+- An abandoned rollover loses nothing. It costs a re-read of the window, possibly including a large transaction, when the stream next starts.
+
+Chains written before this behaviour existed can contain the severed shape. `restore` and `sync from-backup` refuse them with `SLUICE-E-BACKUP-CHAIN-SEVERED-TRANSACTION`, and `backup verify` reports them (see the [error-code table](error-codes.md)).
+
 ## systemd
 
 `/etc/systemd/system/sluice-sync.service`:
