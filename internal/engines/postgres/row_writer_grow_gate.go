@@ -224,10 +224,16 @@ func (w *RowWriter) quiesceAndReportTransient(err error, what string) error {
 // never supply — cannot notice a doubled chunk, so the replay is refused for
 // it (audit B-9, F-E1; judged by [irbackup.ReplayKeyCache.Judge] over this
 // writer's own [RowWriter.ProbeReplayKey], probed at the first retry
-// decision for the table and memoised). As on MySQL, the cold copy adds
-// UNIQUE indexes after the data, so a PK-less source keyed by a NOT NULL
-// UNIQUE index has no target key while its chunks copy and a transient there
-// refuses. The first error is routed through
+// decision for the table and memoised). A PK-less source keyed by a NOT NULL
+// UNIQUE index IS keyed while its chunks copy on a table sluice creates: the
+// emitter promotes that unique inline as a UNIQUE CONSTRAINT at CREATE TABLE
+// (Bug 125's cross-engine symmetry), so the arbiter the probe judges exists —
+// measured by TestColdCopyCreate_PKLessNotNullUnique_IsKeyedWhileItCopies (an
+// earlier version of this comment said the copy "adds UNIQUE indexes after the
+// data" so this shape refused every transient; that was false of the promoted
+// key). What still refuses is a target pre-created without the key, a
+// surrogate-keyed target, and a unique over a generated column, whose
+// re-sent chunk really could land twice. The first error is routed through
 // classifyApplierError; the loop retries ONLY a transient that satisfies
 // ir.RetriableError (53100 disk-full / 57P0x reparent / 08* connection / bad
 // conn) — exactly the storage-grow / serving-transition set. Any non-

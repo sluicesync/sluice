@@ -152,14 +152,24 @@ func coldCopyReparentBackoff(attempt int) time.Duration {
 // Putting the gate HERE means a future fourth caller inherits it instead
 // of re-deriving it.
 //
-// The judgment is the TARGET's catalog as it stands during the copy, and
-// that has a consequence worth stating: the cold copy creates a table with
-// its PRIMARY KEY only, and adds UNIQUE indexes after the data
-// (CreateIndexes), so a PK-less source table keyed by a NOT NULL UNIQUE
-// index has no target key yet when its batches are copied, and a transient
-// there now refuses. That is the truth about that moment — a re-sent batch
-// would land twice and the later CREATE UNIQUE INDEX would fail on it —
-// so it is refused now rather than hours later.
+// The judgment is the TARGET's catalog as it stands during the copy. For a
+// table sluice creates, a PK-less source table keyed by a NOT NULL UNIQUE
+// index IS keyed at that moment: the schema writer promotes the chosen
+// NOT NULL UNIQUE inline at CREATE TABLE (Bug 125, inlineUniqueKeyForCopy),
+// so it exists while the batches copy and a re-sent batch collides — measured
+// by TestColdCopyCreate_PKLessNotNullUnique_IsKeyedWhileItCopies. (An earlier
+// version of this comment said the copy "creates a table with its PRIMARY KEY
+// only, and adds UNIQUE indexes after the data", so this shape refused every
+// transient; that described the secondary indexes, not the promoted key, and
+// was false.) The shapes that do refuse here are the ones whose target key
+// really is missing or unsupplied while the rows land: a target pre-created
+// without the key (the operator's own DDL, --schema-already-applied), a key
+// on an AUTO_INCREMENT or defaulted surrogate, and a unique over a generated
+// column (promoted, but a generated key part never counts as supplied).
+// Letting those re-send on the promise that a later index phase would fail
+// loudly on a duplicate is not sound: the index phase is skipped under
+// --schema-already-applied, and it skips an index whose NAME already exists
+// whatever its definition (detect-then-skip, a WARN on definition drift).
 //
 // The first error is routed through classifyApplierError; the loop
 // retries ONLY when it satisfies ir.RetriableError (the same transient
