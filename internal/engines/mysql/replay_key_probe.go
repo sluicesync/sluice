@@ -123,11 +123,22 @@ func (w *RowWriter) replayRoutesBySuppliedVindex(ctx context.Context, table stri
 	if w.vtgateCfg == nil || w.schema == "" {
 		return true, nil
 	}
-	shardMap, err := discoverAllShardsForKeyspace(ctx, w.vtgateCfg, w.schema)
-	if err != nil {
-		return false, fmt.Errorf("mysql: probe replay key for %q: enumerate the shards of keyspace %q: %w", table, w.schema, err)
+	w.replayShardsMu.Lock()
+	shards := w.replayShards
+	w.replayShardsMu.Unlock()
+	if shards == 0 {
+		shardMap, err := discoverAllShardsForKeyspace(ctx, w.vtgateCfg, w.schema)
+		if err != nil {
+			return false, fmt.Errorf("mysql: probe replay key for %q: enumerate the shards of keyspace %q: %w", table, w.schema, err)
+		}
+		shards = len(shardMap[w.schema])
+		if shards > 0 {
+			w.replayShardsMu.Lock()
+			w.replayShards = shards
+			w.replayShardsMu.Unlock()
+		}
 	}
-	if len(shardMap[w.schema]) <= 1 {
+	if shards <= 1 {
 		return true, nil
 	}
 	primary, err := readPrimaryVindexColumns(ctx, w.db, w.schema, table)

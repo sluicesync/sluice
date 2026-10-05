@@ -179,6 +179,13 @@ type RowWriter struct {
 	// first retry decision for a table, so a copy that never meets a
 	// transient never probes. Zero value ready.
 	replayKeys irbackup.ReplayKeyCache
+
+	// replayShards memoises the target keyspace's shard count for
+	// [RowWriter.replayRoutesBySuppliedVindex]: discovery opens its own
+	// connection, and the replay doors probe every table. Only a successful
+	// discovery is kept (0 = not yet read); an error is retried next call.
+	replayShardsMu sync.Mutex
+	replayShards   int
 }
 
 // SetGrowGate implements [ir.GrowGateSetter] (ADR-0110). The pipeline
