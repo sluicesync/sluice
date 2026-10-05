@@ -1146,8 +1146,7 @@ func (r *ChainRestore) applyIncremental(
 		// EndPosition on its own (only a written position-bearing change does),
 		// so leaving SchemaDelta behind must not exempt an emptied data+DDL
 		// window. The posBearing gate already excludes the legit DROP-only case.
-		if end := link.Manifest.EndPosition; (end.Engine != "" || end.Token != "") &&
-			end != link.Manifest.StartPosition {
+		if end := link.Manifest.EndPosition; EndPositionUnreached(link.Manifest, ir.Position{}) {
 			return sluicecode.Wrap(sluicecode.CodeBackupIncomplete,
 				"restore from an untampered copy, or sign the chain so an emptied change-list is caught at verify time",
 				fmt.Errorf("incremental %s: manifest records EndPosition %+v (StartPosition %+v) with no change chunks and no schema content — the change-chunk list was emptied; refusing to report success with dropped events",
@@ -1495,8 +1494,6 @@ func (r *ChainRestore) streamIncrementalChanges(
 	// the documented, recoverable whole-backup rollback; signing closes that
 	// residue.
 	end := link.Manifest.EndPosition
-	posBearing := end.Engine != "" || end.Token != ""
-	claimsAdvance := end != link.Manifest.StartPosition
 	// "Reached" = the last applied change-chunk position equals EndPosition.
 	// A schema-history snapshot anchored at EndPosition is NOT trusted as proof
 	// of completeness (audit-2026-07-12). A legitimate window never presents a
@@ -1522,8 +1519,9 @@ func (r *ChainRestore) streamIncrementalChanges(
 	// (Bug 184, where a snapshot could share a data row's position) at once,
 	// signing-independently. --require-signature remains the belt-and-suspenders
 	// for the whole unsigned manifest-edit class.
-	reachedEnd := lastApplied == end
-	if posBearing && claimsAdvance && !reachedEnd {
+	// The rule itself is [EndPositionUnreached], shared with the broker and the
+	// severed-transaction door so the three cannot disagree.
+	if EndPositionUnreached(link.Manifest, lastApplied) {
 		return sluicecode.Wrap(sluicecode.CodeBackupIncomplete,
 			"restore from an untampered copy, or sign the chain so a truncated/emptied change-list is caught at verify time",
 			fmt.Errorf("incremental %s: replay reached position %+v but the manifest records EndPosition %+v (StartPosition %+v) with no change chunk or schema snapshot at EndPosition — the change-chunk list is truncated or emptied (fewer events than recorded); refusing to report success with a short tail",

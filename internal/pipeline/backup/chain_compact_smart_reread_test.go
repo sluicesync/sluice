@@ -119,8 +119,12 @@ func TestSmartCompaction_RefusesWhenTheStoreDoesNotHoldWhatItWrote(t *testing.T)
 			t.Fatalf("no collapse happened (%d → %d) — the fixture is not exercising a rewrite",
 				res.eventsBefore, res.eventsAfter)
 		}
-		if im.ChangeChunks[0].RowCount != res.eventsAfter {
-			t.Errorf("re-stamped RowCount = %d; want %d", im.ChangeChunks[0].RowCount, res.eventsAfter)
+		// RowCount counts every recorded change; this marker-less fixture's
+		// collapsed tail ends below its last input position, so the rewrite
+		// appends the empty closing TxBegin/TxCommit pair
+		// (closeAtLastInputPosition) — two changes that are not row events.
+		if want := res.eventsAfter + 2; im.ChangeChunks[0].RowCount != want {
+			t.Errorf("re-stamped RowCount = %d; want %d", im.ChangeChunks[0].RowCount, want)
 		}
 	})
 

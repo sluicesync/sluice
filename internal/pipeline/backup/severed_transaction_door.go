@@ -145,6 +145,11 @@ type incrementalEdges struct {
 	lastPos ir.Position
 	hasPos  bool
 
+	// markerless: the scanned chunks carry no transaction marker — a
+	// trigger-CDC stream. Used only to name a likely cause in shape (C)'s
+	// message; it gates no verdict.
+	markerless bool
+
 	// carriesFill marks an incremental with an ADD COLUMN fill appended
 	// after its window ([irbackup.AddColumnFill], v0.156.1+). Its trailing
 	// fill rows carry the window's EndPosition, so lastData is not the
@@ -183,7 +188,17 @@ func (d *SeveredTransactionDoor) CheckFrom(ctx context.Context, links []lineage.
 		}
 		cur, err := d.edgesOf(ctx, &links[i])
 		if err != nil {
-			if cerr := d.unjudgeable(ctx, i < from, &links[i], err); cerr != nil {
+			// Link i unreadable. Its OWN finding (C) lands on i; its tail is
+			// also the evidence for the A/B findings that land on i+1. So the
+			// WARN-and-skip a broker gets for an applied link is allowed only
+			// when every link a finding from here could land on is applied —
+			// otherwise an unreadable applied link would hide a severed or
+			// re-delivered transaction in the next, UNAPPLIED one.
+			landing := i
+			if i < len(links)-1 && isIncrementalLink(&links[i+1]) {
+				landing = i + 1
+			}
+			if cerr := d.unjudgeable(ctx, landing < from, &links[i], err); cerr != nil {
 				return cerr
 			}
 			continue
@@ -403,7 +418,7 @@ func (d *SeveredTransactionDoor) scanEdges(ctx context.Context, link *lineage.Se
 		// at the very start of an incremental, and costs a missed verdict,
 		// never a false refusal.)
 		if !markerKnown && !first.hasMarker {
-			markerKnown = true
+			markerKnown, e.markerless = true, true
 		}
 	}
 
@@ -457,6 +472,32 @@ func (d *SeveredTransactionDoor) summarizeChunk(ctx context.Context, link *linea
 // handling). Errors are coded the way chain restore's replay codes them,
 // because this is the first place the chunk is opened.
 func (d *SeveredTransactionDoor) decodeChunk(ctx context.Context, link *lineage.SegmentRecord, idx int, visit func(ir.Change)) error {
+	if err := d.decodeChunkRaw(ctx, link, idx, visit); err != nil {
+		return &chunkDecodeError{err: err}
+	}
+	return nil
+}
+
+// chunkDecodeError marks a failure to READ a link's chunks — the door could
+// not look — as distinct from any verdict it gives. Typed rather than told
+// apart by its code, because the door's verdicts and the fetch's failures
+// share codes (shape C is -BACKUP-INCOMPLETE; a truncated chunk read is
+// -BACKUP-CHUNK-CORRUPT); an allow-list of verdict codes is what let `backup
+// verify` swallow shape C. It wraps, so the fetch's own code still reaches the
+// operator through [sluicecode.FromError].
+type chunkDecodeError struct{ err error }
+
+func (e *chunkDecodeError) Error() string { return e.err.Error() }
+func (e *chunkDecodeError) Unwrap() error { return e.err }
+
+// isChunkDecodeError reports whether err is the door failing to read, not
+// the door refusing.
+func isChunkDecodeError(err error) bool {
+	var d *chunkDecodeError
+	return errors.As(err, &d)
+}
+
+func (d *SeveredTransactionDoor) decodeChunkRaw(ctx context.Context, link *lineage.SegmentRecord, idx int, visit func(ir.Change)) error {
 	chunk := link.Manifest.ChangeChunks[idx]
 	src, err := blobcodec.FetchChunkVerified(ctx, link.Segment.Store(d.Store), chunk.File, chunk.SHA256)
 	if err != nil {
@@ -493,15 +534,10 @@ func (d *SeveredTransactionDoor) decodeChunk(ctx context.Context, link *lineage.
 }
 
 // endPastRecordedError is shape (C): the manifest's EndPosition is not the
-// position of the last change its chunks record. Nil when it is, and in the
-// two shapes where no recorded change is expected at EndPosition — an empty
-// EndPosition (a one-shot window that recorded nothing; restore resolves it
-// against StartPosition), and EndPosition == StartPosition (an empty
-// rollover written anyway, or a window that never advanced). These are
-// exactly the exemptions chain restore's own tail backstop
-// (`streamIncrementalChanges`, `reachedEnd`) makes, and the comparison is
-// the one it makes — so the door refuses nothing restore would accept; it
-// refuses it BEFORE anything is applied, and names the cause.
+// position of the last change its chunks record. The predicate is
+// [EndPositionUnreached] — the same function chain restore's tail backstop
+// and the broker's backstop call — so the door refuses nothing either of them
+// would accept; it refuses BEFORE anything is applied, and names the causes.
 //
 // The rule, per writer and engine: a window's EndPosition is the position of
 // the last change it RECORDED, whatever kind — since v0.117.0 an
@@ -511,19 +547,33 @@ func (d *SeveredTransactionDoor) decodeChunk(ctx context.Context, link *lineage.
 // or a keepalive boundary's walsender position — both carried by the
 // recorded TxCommit; MySQL GTID: the post-commit set; file/pos: the XID's
 // end LogPos), a trigger-CDC window on its last row's change-log id, and an
-// ADD COLUMN fill appends transactions stamped AT EndPosition. Each is the
-// last recorded position by construction.
+// ADD COLUMN fill appends transactions stamped AT EndPosition. Smart
+// compaction keeps it: a collapsed event carries its chain's FIRST position,
+// so the rewriter holds a framed window's closing TxCommit back and, on a
+// marker-less window, appends an empty TxBegin/TxCommit pair at the
+// window's last input position (applySmartCompactionToIncrementalSized).
+// Every producer's half is graded by TestSeveredTransactionDoor_ShapeC_AgreementTable's
+// producer-written rows and the integration chains in
+// stream_severed_tail_integration_test.go.
 //
-// What it catches that (A) and (B) cannot: an OLD binary's (v0.19.0–v0.156.11)
-// ctx-cancel drain skipped its final flush inside a transaction and still
-// committed the chunks stored before it, with EndPosition already advanced
-// to the last change READ. Every complete transaction in the dropped chunk
-// is in no incremental, and the next one resumes after them: lost. The
-// stored chunks end on a TxCommit (so not A) and the next link starts after
-// the loss (so not B). Restore's tail backstop also refuses it, but only
-// after applying this link and every link before it, and under a message
-// that blames tampering. Also refused: an adversary who truncated the
-// change-chunk list — the same evidence.
+// The causes, all of which leave the same evidence:
+//   - an OLD binary's (v0.19.0–v0.156.11) `backup stream` cancel drain
+//     (SIGTERM/SIGINT) that skipped its final flush inside a transaction, or
+//     whose final flush FAILED on any engine (trigger-CDC included — it has no
+//     transactions, but the failed flush dropped its chunk the same way), and
+//     still committed the chunks stored before it with EndPosition already
+//     advanced to the last change READ. Every change in the dropped chunk is
+//     in no incremental and the next one resumes after them: lost;
+//   - a pre-v0.117.0 window whose last event was a schema snapshot, which
+//     recorded that snapshot's position as EndPosition — not loss, but this
+//     release's restore refuses it too (its tail check stopped trusting a
+//     schema anchor at EndPosition, audit 2026-07-12 item 60);
+//   - a smart compaction, before this release, of a MARKER-LESS (trigger-CDC)
+//     chain, whose collapsed tail carried an earlier position — not loss;
+//     restore refused these already, so the door names the cause rather than
+//     exempting it (the evidence cannot tell a collapsed tail from a dropped
+//     one); and
+//   - a truncated change-chunk list.
 //
 // Its reach, measured: on Postgres and MySQL/MariaDB GTID every row of one
 // transaction carries the same position, so a drop confined to ONE
@@ -532,34 +582,27 @@ func (d *SeveredTransactionDoor) decodeChunk(ctx context.Context, link *lineage.
 // transaction and (A) refuses it (the producer-reverted integration run
 // showed exactly that split: (A) on PG and GTID, (C) on file/pos, where
 // every event has its own position). (C) is what catches the drop of a
-// whole committed transaction, the reviewer's case.
-//
-// One old shape it refuses that is not loss: before v0.117.0 a window whose
-// last event was a schema snapshot recorded that snapshot's position as
-// EndPosition. This release's restore refuses those too — its tail check
-// stopped trusting a schema anchor at EndPosition (audit 2026-07-12, item
-// 60) — so the door refuses nothing this release's restore would accept
-// (TestSeveredTransactionDoor_ShapeC_AgreesWithRestoreTailBackstop); such a
-// chain may have restored on a release between v0.99.222 and item 60.
+// whole committed transaction.
 func endPastRecordedError(link *lineage.SegmentRecord, e incrementalEdges) error {
+	if !EndPositionUnreached(link.Manifest, e.lastPos) {
+		return nil
+	}
 	end := link.Manifest.EndPosition
-	if (end.Engine == "" && end.Token == "") || end == link.Manifest.StartPosition {
-		return nil
-	}
-	if e.hasPos && e.lastPos == end {
-		return nil
-	}
 	last := "no position-bearing change at all"
 	if e.hasPos {
 		last = fmt.Sprintf("%+v", e.lastPos)
 	}
+	likely := ""
+	if e.markerless && link.Segment != nil && link.Segment.CapReason == CompactedCapReason {
+		likely = " This link sits in a COMPACTED segment and its chunks carry no transaction markers, so the likeliest cause is a smart compaction (before this release) of a trigger-CDC chain — its collapsed tail kept an earlier position; nothing was lost, but the chain cannot be restored as written."
+	}
 	// Coded SLUICE-E-BACKUP-INCOMPLETE, not -CHAIN-SEVERED-TRANSACTION: it is the
-	// same evidence restore's tail backstop already refuses under that code
-	// (a truncated change-chunk list), now refused before anything is applied.
+	// same evidence restore's tail backstop already refuses under that code,
+	// now refused before anything is applied.
 	return sluicecode.Wrap(sluicecode.CodeBackupIncomplete,
-		"if this chain came from `backup stream` on v0.19.0–v0.156.11, take a new full backup (`sluice backup full`) — the changes between this incremental's last stored change and its EndPosition are in no incremental; otherwise restore from an untampered copy",
-		fmt.Errorf("incremental %s (%s) records EndPosition %+v but its change chunks end at %s — the changes in between are in no chunk, and the next incremental resumes AFTER them, so they are lost (F-E1-SEVERED-TAIL-REPLAY shape C). The cause is a `backup stream` cancel (SIGTERM/SIGINT) on a sluice v0.19.0–v0.156.11 that dropped its last chunk inside a transaction, or a truncated change-chunk list",
-			lineage.ManifestBackupID(link.Manifest), link.Path, end, last))
+		"take a new full backup (`sluice backup full`) and restore or replay from that chain; if this chain was not written by an old `backup stream` cancel, a pre-v0.117.0 schema-only window or a pre-fix smart compaction, restore from an untampered copy",
+		fmt.Errorf("incremental %s (%s) records EndPosition %+v but its change chunks end at %s, so replaying it cannot reach the position the next incremental resumes from (F-E1-SEVERED-TAIL-REPLAY shape C). Causes that leave this evidence: a `backup stream` cancel (SIGTERM/SIGINT) on sluice v0.19.0–v0.156.11 whose final flush was skipped inside a transaction or FAILED, on any engine — the changes between the last stored change and EndPosition are then in no incremental, LOST; a window written before v0.117.0 whose last event was a schema snapshot (no loss); a smart compaction, before this release, of a trigger-CDC chain (no loss); or a truncated change-chunk list.%s",
+			lineage.ManifestBackupID(link.Manifest), link.Path, end, last, likely))
 }
 
 func severedTailError(link *lineage.SegmentRecord, e incrementalEdges) error {
@@ -607,7 +650,10 @@ func verifySeveredTransactions(ctx context.Context, store irbackup.Store, chain 
 	if err == nil {
 		return nil
 	}
-	if ce, ok := sluicecode.FromError(err); ok && ce.Code == sluicecode.CodeBackupChainSeveredTransaction {
+	if !isChunkDecodeError(err) {
+		// Every VERDICT the door gives reaches verify, whatever its code — shape
+		// C is coded -BACKUP-INCOMPLETE, and an allow-list of the severed code
+		// once let verify report a shape-C chain healthy.
 		return fmt.Errorf("verify: %w", err)
 	}
 	// The door could not DECODE a chunk. That is not its verdict to give:

@@ -159,12 +159,5 @@ func TestBrokerReplayRunsTheSeveredDoorBeforeApplying(t *testing.T) {
 	if doorAt > applyAt {
 		t.Error("replayNewIncrementals runs the severed-transaction door AFTER applying incrementals")
 	}
-	// The applied-prefix rule: the door is told how many links this broker
-	// already applied (startIdx), so it refuses only findings on links it has
-	// not — judging the whole chain halts an upgraded broker forever on a
-	// pre-v0.138.0 PG chain's permanent shape-B pair.
-	if !strings.Contains(src, "b.refuseSeveredTransactions(ctx, chain, startIdx)") {
-		t.Error("replayNewIncrementals no longer passes startIdx (the applied prefix) to the severed-transaction door: " +
-			"findings on links it already applied would refuse every tick, halting an upgraded broker on its own history")
-	}
+	appliedPrefixFeedsBothConsumers(t)
 }

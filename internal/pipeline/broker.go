@@ -1008,26 +1008,9 @@ func (b *SyncFromBackup) replayNewIncrementals(
 		return "", 0, 0, 0, nil
 	}
 
-	// Find lastAppliedID's position in the chain. Everything after
-	// it is the unapplied tail.
-	startIdx := 0
-	if lastAppliedID != "" {
-		found := false
-		for i, link := range chain {
-			if lineage.ManifestBackupID(link.Manifest) == lastAppliedID {
-				startIdx = i + 1
-				found = true
-				break
-			}
-		}
-		if !found {
-			return "", 0, 0, 0, fmt.Errorf(
-				"broker: last_applied_backup_id %q not found in chain; "+
-					"the chain may have been re-rooted on the source side. Operator action: "+
-					"clear the broker's `sluice_cdc_state` row and re-run with --reset-target-data or --at-chain-id",
-				lastAppliedID,
-			)
-		}
+	startIdx, err := brokerAppliedPrefix(chain, lastAppliedID)
+	if err != nil {
+		return "", 0, 0, 0, err
 	}
 	if startIdx >= len(chain) {
 		// No new incrementals.
@@ -1192,6 +1175,32 @@ func (b *SyncFromBackup) verifyChainIntegrity(ctx context.Context, chain []linea
 	return nil
 }
 
+// brokerAppliedPrefix is how many leading links of chain this broker has
+// already applied: the index just past lastAppliedID, 0 when nothing has
+// been applied. It is BOTH where the apply loop starts and the applied prefix
+// the severed-transaction door is told about ([backup.SeveredTransactionDoor.CheckFrom]),
+// so a value that drifts from the truth either re-applies history or lets the
+// door WARN-and-pass a finding on a link not yet applied. Held by
+// TestBrokerAppliedPrefix_IsTheIndexAfterLastApplied (the value, on a chain
+// BuildLineageChain resolved) and TestBrokerReplayRunsTheSeveredDoorBeforeApplying
+// (that both consumers read this one value).
+func brokerAppliedPrefix(chain []lineage.SegmentRecord, lastAppliedID string) (int, error) {
+	if lastAppliedID == "" {
+		return 0, nil
+	}
+	for i, link := range chain {
+		if lineage.ManifestBackupID(link.Manifest) == lastAppliedID {
+			return i + 1, nil
+		}
+	}
+	return 0, fmt.Errorf(
+		"broker: last_applied_backup_id %q not found in chain; "+
+			"the chain may have been re-rooted on the source side. Operator action: "+
+			"clear the broker's `sluice_cdc_state` row and re-run with --reset-target-data or --at-chain-id",
+		lastAppliedID,
+	)
+}
+
 // refuseSeveredTransactions is the broker's half of the F-E1-SEVERED-TAIL-REPLAY
 // door — the same [backup.SeveredTransactionDoor] chain restore runs in its
 // pre-target list, opening chunks through the broker's own key resolver.
@@ -1260,8 +1269,7 @@ func (b *SyncFromBackup) applyIncremental(
 		// signing-independently; --require-signature remains the
 		// belt-and-suspenders. Parity with chain_restore.
 		end := link.Manifest.EndPosition
-		if (end.Engine != "" || end.Token != "") &&
-			end != link.Manifest.StartPosition {
+		if backup.EndPositionUnreached(link.Manifest, ir.Position{}) {
 			return 0, sluicecode.Wrap(sluicecode.CodeBackupIncomplete,
 				"restore from an untampered copy, or sign the chain so a truncated/emptied change-list is caught at verify time",
 				fmt.Errorf("incremental %s: manifest records EndPosition %+v (StartPosition %+v) but carries no change chunks — the change-chunk list was emptied; refusing to advance the broker past dropped events",
@@ -1457,8 +1465,12 @@ func (b *SyncFromBackup) streamIncrementalWithPosition(
 	// the same refusal, never a silent skip. Skipped for a schema-only window
 	// (non-position-bearing EndPosition) and reached only for chunk-bearing
 	// incrementals (the caller short-circuits the zero-chunk case).
-	if end := link.Manifest.EndPosition; len(link.Manifest.ChangeChunks) > 0 &&
-		(end.Engine != "" || end.Token != "") && lastApplied != end {
+	// The rule is [backup.EndPositionUnreached], shared with chain restore and
+	// the severed-transaction door. It used to lack restore's
+	// EndPosition == StartPosition exemption, so a DDL-only stream rollover (one
+	// chunk carrying only a schema snapshot, EndPosition stamped at its start)
+	// was refused here while restore accepted it.
+	if end := link.Manifest.EndPosition; backup.EndPositionUnreached(link.Manifest, lastApplied) {
 		return sluicecode.Wrap(sluicecode.CodeBackupIncomplete,
 			"restore from an untampered copy, or sign the chain so a truncated change-list is caught at verify time",
 			fmt.Errorf("incremental %s: replayed change-chunk tail ends at position %+v but the manifest records EndPosition %+v — the change-chunk list is truncated (fewer events than recorded); refusing to advance the broker past a short tail",

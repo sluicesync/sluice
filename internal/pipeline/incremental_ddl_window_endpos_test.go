@@ -19,6 +19,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
@@ -255,5 +256,32 @@ func TestRolloverWindow_SchemaSnapshotDoesNotMoveEndPosition(t *testing.T) {
 	if incr.EndPosition != parent.EndPosition {
 		t.Errorf("EndPosition = %+v; want the parent's %+v (a snapshot-only rollover advances nothing but must not blank the cursor)",
 			incr.EndPosition, parent.EndPosition)
+	}
+
+	// The shape-(C) agreement row this writer produces: every reader of the
+	// tail-reach rule must accept the link as written. The broker's in-apply
+	// backstop refused it until it took restore's EndPosition == StartPosition
+	// exemption (backup.EndPositionUnreached) — when the rollover leaves a
+	// chunk behind, which this run reports.
+	chain, err := lineage.BuildLineageChain(context.Background(), store, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	link := chain[len(chain)-1]
+	t.Logf("DDL-only rollover wrote %d change chunk(s)", len(link.Manifest.ChangeChunks))
+	if err := backup.NewSeveredTransactionDoor(store, nil, nil).Check(context.Background(), chain); err != nil {
+		t.Errorf("the severed-transaction door refused a DDL-only rollover the real writer produced: %v", err)
+	}
+	if len(link.Manifest.ChangeChunks) > 0 {
+		out := make(chan ir.Change, 16)
+		go func() {
+			for range out { //nolint:revive // drain
+			}
+		}()
+		err := (&SyncFromBackup{Store: store}).streamIncrementalWithPosition(context.Background(), &link, ir.Position{Engine: "postgres", Token: "x"}, out)
+		close(out)
+		if err != nil {
+			t.Errorf("the broker's tail backstop refused a DDL-only rollover the real writer produced: %v", err)
+		}
 	}
 }

@@ -8,20 +8,45 @@ package backup
 // shape (A) and the broker's applied-prefix handling (CheckFrom).
 //
 // The fixtures are hand-built in the shape OLD writers produced (the
-// reviewer's reproduction of the v0.19.1–v0.156.11 cancel-drain drop on the
+// reviewer's reproduction of the v0.19.0–v0.156.11 cancel-drain drop on the
 // pre-fix tree: stored chunks ending at a TxCommit, a whole committed
 // transaction in the dropped in-flight chunk, EndPosition advanced to the
 // next transaction's rows).
 
 import (
+	"bytes"
 	"context"
 	"strings"
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
+
+// sevWriteHeaderOnlyIncremental writes an incremental of ONE change chunk with
+// no records — a DDL-only rollover's shape (its schema snapshot rides the
+// manifest, not the chunk).
+func sevWriteHeaderOnlyIncremental(t *testing.T, store irbackup.Store, name string) lineage.SegmentRecord {
+	t.Helper()
+	var buf bytes.Buffer
+	cw, err := blobcodec.NewChangeChunkWriter(&buf, nil, blobcodec.CodecGzip, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	path := "chunks/_changes/" + name + "/changes-0.jsonl.gz"
+	if err := store.Put(context.Background(), path, bytes.NewReader(buf.Bytes())); err != nil {
+		t.Fatal(err)
+	}
+	l := sevWriteIncremental(t, store, name, 1, nil)
+	l.Manifest.ChangeChunks = []*irbackup.ChunkInfo{{File: path, RowCount: cw.ChangeCount(), SHA256: cw.Hash()}}
+	return l
+}
 
 func sevWithEnd(l lineage.SegmentRecord, start, end ir.Position) lineage.SegmentRecord {
 	l.Manifest.StartPosition, l.Manifest.EndPosition = start, end
@@ -54,6 +79,14 @@ type shapeCCase struct {
 	start, end ir.Position
 	fill       bool
 	refuse     bool
+
+	// headerOnly writes ONE change chunk with no records (changes must be
+	// empty) — what a DDL-only `backup stream` rollover leaves behind.
+	headerOnly bool
+	// compacted marks the link's segment as written by `backup compact`.
+	compacted bool
+	// wantText is a substring the door's refusal must carry.
+	wantText string
 }
 
 func shapeCCases() []shapeCCase {
@@ -66,31 +99,65 @@ func shapeCCases() []shapeCCase {
 		{name: "empty EndPosition (one-shot window that recorded nothing)", changes: []ir.Change{ir.TxBegin{}, ir.TxCommit{}}, start: sevLSN(1)},
 		{name: "EndPosition = StartPosition (empty rollover written anyway / replay-only)", changes: sevTx(10, "a"), start: sevLSN(5), end: sevLSN(5)},
 		{name: "trailing position-less TxCommit: the last POSITIONED change counts", changes: cat(sevTx(10, "a")[:2], []ir.Change{ir.TxCommit{}}), start: sevLSN(1), end: sevLSN(10)},
+		{name: "DDL-only rollover: one header-only chunk, EndPosition = StartPosition", headerOnly: true, start: sevLSN(5), end: sevLSN(5)},
+		{name: "no change chunks at all, EndPosition = StartPosition", start: sevLSN(5), end: sevLSN(5)},
 		// Refused.
 		{name: "old cancel-drain drop: EndPosition past every stored change", changes: sevTx(10, "a"), start: sevLSN(1), end: sevLSN(30), refuse: true},
 		{name: "pre-v0.117.0 schema snapshot moved EndPosition (no chunk record there)", changes: sevTx(10, "a"), start: sevLSN(1), end: sevLSN(15), refuse: true},
 		{name: "fill-bearing link whose EndPosition is past the fill", changes: cat(sevTx(10, "a"), sevFillTx(11)), start: sevLSN(1), end: sevLSN(40), fill: true, refuse: true},
 		{name: "advanced EndPosition with no positioned change at all", changes: []ir.Change{ir.TxBegin{}, ir.TxCommit{}}, start: sevLSN(1), end: sevLSN(9), refuse: true},
+		{name: "header-only chunk with an advanced EndPosition", headerOnly: true, start: sevLSN(5), end: sevLSN(9), refuse: true},
+		{name: "no change chunks at all, EndPosition advanced (emptied list)", start: sevLSN(5), end: sevLSN(9), refuse: true},
+		// What a pre-fix smart compaction left of a marker-less window that
+		// touched one row twice (INSERT@7, UPDATE@8 collapsed to an INSERT
+		// carrying the chain's FIRST position): not loss, but no reader can
+		// tell it from a dropped tail — refused, naming the likely cause.
+		{name: "pre-fix smart-compacted marker-less tail", changes: []ir.Change{ir.Insert{Position: sevLSN(7), Table: "t", Row: ir.Row{"id": 1, "v": 2}}}, start: sevLSN(1), end: sevLSN(8), compacted: true, refuse: true, wantText: "smart compaction (before this release) of a trigger-CDC chain"},
 	}
 }
 
-// TestSeveredTransactionDoor_ShapeC_AgreesWithRestoreTailBackstop is the
-// no-false-positive argument made executable. Shape C compares EndPosition
-// with exactly what chain restore's own tail backstop compares it with
-// (`reachedEnd`, with the same exemptions), so the door must refuse a link
-// IF AND ONLY IF applying that link would refuse — it only moves the
-// refusal before anything is applied and names the cause. Each case runs
-// through both: the door, and ChainRestore.applyIncremental against a
-// recording applier.
-func TestSeveredTransactionDoor_ShapeC_AgreesWithRestoreTailBackstop(t *testing.T) {
+// TestSeveredTransactionDoor_ShapeC_AgreementTable is the no-false-positive
+// argument made executable. Every reader of the tail-reach rule
+// ([EndPositionUnreached]) must refuse a link IF AND ONLY IF the others do:
+//
+//   - the door (shape C), which refuses before anything is applied;
+//   - chain restore's in-apply tail backstop (ChainRestore.applyIncremental
+//     against a recording applier, zero-chunk guard included);
+//   - `backup verify`'s run of the door (verifySeveredTransactions), which
+//     must PREDICT restore — it once passed every shape-C link, because it
+//     propagated only the severed-transaction code and shape C is coded
+//     -BACKUP-INCOMPLETE;
+//   - the broker's in-apply backstop, graded over the same rows in package
+//     pipeline (TestShapeCAgreement_BrokerTailBackstop) because this package
+//     cannot import it.
+//
+// The expected verdict per row is the WRITER's rule, not any reader's output:
+// the healthy rows are shapes a current producer writes (each tied to a
+// producer-driven pin: TestRolloverWindow_SchemaSnapshotDoesNotMoveEndPosition
+// for the DDL-only rollover, TestSmartCompaction_RewrittenIncrementalReachesItsEndPosition
+// for compacted output, the stream_severed_tail integration chains for the
+// engines' own windows), and the refused rows are the old writers' shapes.
+func TestSeveredTransactionDoor_ShapeC_AgreementTable(t *testing.T) {
 	for _, tc := range shapeCCases() {
 		t.Run(tc.name, func(t *testing.T) {
 			store := sevStore(t)
-			link := sevWithEnd(sevWriteIncremental(t, store, "x", 2, tc.changes), tc.start, tc.end)
+			var link lineage.SegmentRecord
+			if tc.headerOnly {
+				link = sevWriteHeaderOnlyIncremental(t, store, "x")
+			} else {
+				link = sevWriteIncremental(t, store, "x", 2, tc.changes)
+			}
+			link = sevWithEnd(link, tc.start, tc.end)
 			if tc.fill {
 				link = sevWithFill(link)
 			}
-			doorErr := NewSeveredTransactionDoor(store, sevLSNComparator{}, nil).Check(context.Background(), []lineage.SegmentRecord{sevFull(), link})
+			if tc.compacted {
+				link.Segment.CapReason = CompactedCapReason
+			}
+			chain := []lineage.SegmentRecord{sevFull(), link}
+			doorErr := NewSeveredTransactionDoor(store, sevLSNComparator{}, nil).Check(context.Background(), chain)
+			verifyErr := verifySeveredTransactions(context.Background(), store, chain, true, false, false, &chunkAuthProber{})
+			verifyRefused := verifyErr != nil && codeOf(verifyErr) == sluicecode.CodeBackupIncomplete
 
 			eng := &chainRestoreRecorderEngine{restoreRecorderEngine: newRestoreRecorderEngine("postgres")}
 			applier, err := eng.OpenChangeApplier(context.Background(), "tgt")
@@ -103,11 +170,17 @@ func TestSeveredTransactionDoor_ShapeC_AgreesWithRestoreTailBackstop(t *testing.
 
 			if tc.refuse {
 				requireIncomplete(t, doorErr)
+				if tc.wantText != "" && !strings.Contains(doorErr.Error(), tc.wantText) {
+					t.Errorf("door refusal does not name the likely cause %q: %v", tc.wantText, doorErr)
+				}
 			} else if doorErr != nil {
 				t.Fatalf("door refused a healthy link: %v", doorErr)
 			}
 			if restoreRefused != tc.refuse {
 				t.Fatalf("door and restore's tail backstop DISAGREE: door refuse=%v, restore refuse=%v (%v)", tc.refuse, restoreRefused, restoreErr)
+			}
+			if verifyRefused != tc.refuse {
+				t.Fatalf("`backup verify` does not predict restore: want refuse=%v, verify refused=%v (%v)", tc.refuse, verifyRefused, verifyErr)
 			}
 		})
 	}

@@ -499,6 +499,15 @@ func (c *sevChain) run() {
 		c.e.t.Fatalf("this binary wrote a chain the severed-transaction door refuses: %v", err)
 	}
 	c.logEndRule(chain)
+	// `backup verify` on the chain the real producer wrote, at both depths:
+	// it must agree with the door above and with restore below (the
+	// healthy-row half of backup.TestSeveredTransactionDoor_ShapeC_AgreementTable,
+	// on real engines).
+	for _, depth := range []backup.VerifyDepth{backup.VerifyDepthHash, backup.VerifyDepthRead} {
+		if _, err := backup.VerifyBackupCodedReport(context.Background(), c.store, backup.VerifyOptions{Depth: depth}); err != nil {
+			c.e.t.Fatalf("`backup verify --depth %s` refused a chain this binary wrote: %v", depth, err)
+		}
+	}
 	c.chainRestore()
 	c.broker()
 }

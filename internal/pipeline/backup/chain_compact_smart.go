@@ -547,6 +547,13 @@ type smartCompactor struct {
 	// trailing TxCommit back rather than emitting it eagerly.
 	heldCommit ir.Change
 
+	// lastIn / lastOut are the positions of the last position-bearing event
+	// into [smartCompactor.process] and out through [smartCompactor.deliver].
+	// [smartCompactor.closeAtLastInputPosition] uses them to end the rewritten
+	// stream where the original ended.
+	lastIn  ir.Position
+	lastOut ir.Position
+
 	// eventsBefore / eventsAfter count INSERT/UPDATE/DELETE/TRUNCATE
 	// only (the events subject to collapse), matching the
 	// [smartCompactResult] semantics. eventsAfter is tallied as events
@@ -729,9 +736,42 @@ func (s *smartCompactor) releaseHeldCommit() error {
 	return s.deliver(e)
 }
 
+// closeAtLastInputPosition ends the rewritten stream at the position the
+// original ended at, when the rewrite alone would not.
+//
+// A collapsed event carries its chain's FIRST position, so on a stream with no
+// transaction markers (the trigger-CDC sources) there is no closing commit to
+// hold back, and the collapsed tail ends BELOW the incremental's EndPosition —
+// which restore's tail backstop, the broker's and the severed-transaction
+// door's shape (C) all read, through [EndPositionUnreached], as a truncated
+// change-list. Every smart-compacted trigger-CDC chain with a row touched
+// twice in its last incremental was unrestorable. The fix appends an EMPTY
+// TxBegin/TxCommit pair stamped at the last INPUT position: it carries no row,
+// so the applied state is unchanged, and it re-asserts exactly the position the
+// original stream recorded — never the manifest's EndPosition, so an input
+// that was already short stays short and is still refused.
+//
+// On a framed stream the held commit already ends the output at the last input
+// position and nothing is appended; the pair is emitted only on a gap.
+func (s *smartCompactor) closeAtLastInputPosition() error {
+	if !positioned(s.lastIn) || s.lastOut == s.lastIn {
+		return nil
+	}
+	if err := s.deliver(ir.TxBegin{Position: s.lastIn}); err != nil {
+		return err
+	}
+	return s.deliver(ir.TxCommit{Position: s.lastIn})
+}
+
+// positioned reports whether p is a real position (the zero Position is "none").
+func positioned(p ir.Position) bool { return p.Engine != "" || p.Token != "" }
+
 // deliver is the single door to the sink; every emitted event passes through it
 // so the eventsAfter tally cannot drift from what was actually written.
 func (s *smartCompactor) deliver(e ir.Change) error {
+	if p := e.Pos(); positioned(p) {
+		s.lastOut = p
+	}
 	if isPerRowEvent(e) {
 		s.eventsAfter++
 	}
@@ -924,6 +964,9 @@ func writeLengthPrefixed(b *strings.Builder, s string) {
 // process feeds one event into the compactor. Returns an error only
 // on the refuse-loudly path (corrupt PK).
 func (s *smartCompactor) process(e ir.Change) error {
+	if p := e.Pos(); positioned(p) {
+		s.lastIn = p
+	}
 	if s.pkStrategy == PKStrategyNone {
 		// Pass-through mode: collapse disabled, every event verbatim.
 		if isPerRowEvent(e) {
@@ -1649,6 +1692,13 @@ func applySmartCompactionToIncrementalSized(
 	// so the tail of the incremental is distributed exactly like the rest.
 	res, err := compactor.finalize()
 	if err != nil {
+		return nil, err
+	}
+	// The rewritten incremental must end where the original did: see
+	// [smartCompactor.closeAtLastInputPosition]. Done here, not in finalize,
+	// because it is a property of a stored INCREMENTAL (restore's tail check
+	// compares it with the manifest), not of the collapse policy.
+	if err := compactor.closeAtLastInputPosition(); err != nil {
 		return nil, err
 	}
 	res.bytesBefore = bytesBefore
