@@ -167,6 +167,35 @@ var errNoVSchemaEntry = errors.New("mysql: table has no vschema entry")
 // [RowWriter.ShardKeyUpsertMismatch]). Measured on vttestserver (mysql80): an
 // unknown table is Error 1146 VT05005, mapped to errNoVSchemaEntry.
 func readVindexColumns(ctx context.Context, db *sql.DB, keyspace, table string) ([]string, error) {
+	vindexes, err := readColumnVindexes(ctx, db, keyspace, table)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, v := range vindexes {
+		out = append(out, v...)
+	}
+	return out, nil
+}
+
+// readPrimaryVindexColumns returns the columns of keyspace.table's PRIMARY
+// vindex — the one vtgate routes an INSERT by — as the first row of
+// `SHOW VSCHEMA VINDEXES ON`. That vtgate lists the primary first is a fact
+// about Vitess, measured on vttestserver (a secondary vindex added
+// afterwards does not displace it) by
+// TestVStream_ProbeReplayKey_UnsuppliedPrimaryVindex. A table with no
+// column vindex returns nil.
+func readPrimaryVindexColumns(ctx context.Context, db *sql.DB, keyspace, table string) ([]string, error) {
+	vindexes, err := readColumnVindexes(ctx, db, keyspace, table)
+	if err != nil || len(vindexes) == 0 {
+		return nil, err
+	}
+	return vindexes[0], nil
+}
+
+// readColumnVindexes returns each column vindex of keyspace.table as its
+// columns, in the order `SHOW VSCHEMA VINDEXES ON` lists them.
+func readColumnVindexes(ctx context.Context, db *sql.DB, keyspace, table string) ([][]string, error) {
 	// A SHOW statement takes no bind parameters; both names are quoted
 	// identifiers, so nothing an operator named can escape them.
 	rows, err := db.QueryContext(ctx, "SHOW VSCHEMA VINDEXES ON "+quoteIdent(keyspace)+"."+quoteIdent(table))
@@ -191,7 +220,7 @@ func readVindexColumns(ctx context.Context, db *sql.DB, keyspace, table string) 
 	if colsAt < 0 {
 		return nil, fmt.Errorf("mysql: SHOW VSCHEMA VINDEXES returned no Columns field (got %v)", names)
 	}
-	var out []string
+	var out [][]string
 	for rows.Next() {
 		vals := make([]sql.NullString, len(names))
 		ptrs := make([]any, len(names))
@@ -201,10 +230,14 @@ func readVindexColumns(ctx context.Context, db *sql.DB, keyspace, table string) 
 		if err := rows.Scan(ptrs...); err != nil {
 			return nil, err
 		}
+		var cols []string
 		for _, c := range strings.Split(vals[colsAt].String, ",") {
 			if c = strings.TrimSpace(c); c != "" {
-				out = append(out, c)
+				cols = append(cols, c)
 			}
+		}
+		if len(cols) > 0 {
+			out = append(out, cols)
 		}
 	}
 	return out, rows.Err()

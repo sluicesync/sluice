@@ -42,6 +42,12 @@ import (
 //   - SUPPLIED: a non-generated column of the recorded table, matched
 //     case-insensitively, which is how MySQL resolves a column name.
 //
+// On a vtgate keyspace with more than one shard, no key qualifies unless
+// every column of the table's PRIMARY VINDEX is supplied too: keys are
+// enforced per shard, and a re-sent row whose routing column the rows do not
+// carry lands on whatever shard its fresh value hashes to
+// ([RowWriter.replayRoutesBySuppliedVindex]).
+//
 // Why not the applier's batching probe ([ChangeApplier.tableIsKeyless]),
 // which counts any UNIQUE: that is ADR-0089 batch sizing and is
 // deliberately loose about nullability and supply.
@@ -76,12 +82,77 @@ func (w *RowWriter) ProbeReplayKey(ctx context.Context, table *ir.Table) (exists
 	for _, c := range supplied {
 		carried[strings.ToLower(c)] = true
 	}
+	routed, err := w.replayRoutesBySuppliedVindex(ctx, name, carried)
+	if err != nil {
+		return true, false, err
+	}
+	if !routed {
+		return true, false, nil
+	}
 	for _, key := range keys {
 		if replayKeyCollides(key, cols, carried) {
 			return true, true, nil
 		}
 	}
 	return true, false, nil
+}
+
+// replayRoutesBySuppliedVindex reports whether a replayed row of table is
+// routed to the SAME shard as the row it re-sends, which every key collision
+// on a sharded keyspace depends on: a vtgate-fronted keyspace with more than
+// one shard enforces a PRIMARY KEY or UNIQUE index per shard, so two rows
+// collide only when the primary vindex — the one vtgate routes an INSERT by —
+// sends them to one shard. That holds exactly when every primary-vindex
+// column is SUPPLIED by the rows (carried, lower-cased). A primary vindex on
+// a column the rows do not carry — a vtgate-sequence-backed or defaulted
+// surrogate — gives every re-sent row a fresh value and so a fresh shard,
+// and a supplied UNIQUE elsewhere collides with nothing on the other one:
+// measured on vttestserver (2 shards, sid from a sequence, UNIQUE(email)
+// supplied), 7 of 16 re-sends landed a duplicate email at no error
+// (TestVStream_ProbeReplayKey_UnsuppliedPrimaryVindex).
+//
+// Not a vtgate target, or one shard: every key is enforced keyspace-wide
+// (vtgate ignores vindexes on an unsharded keyspace), so true. Fail closed
+// otherwise: a shard enumeration or vschema read that errors returns the
+// error, and the doors and retry gates treat a probe that cannot answer as
+// never licensing a re-write. A table the sharded keyspace's vschema does
+// not know (errNoVSchemaEntry) is not refused here: vtgate cannot route a
+// row to it at all, so every write to it fails — loudly — before anything
+// can land twice.
+func (w *RowWriter) replayRoutesBySuppliedVindex(ctx context.Context, table string, carried map[string]bool) (bool, error) {
+	if w.vtgateCfg == nil || w.schema == "" {
+		return true, nil
+	}
+	shardMap, err := discoverAllShardsForKeyspace(ctx, w.vtgateCfg, w.schema)
+	if err != nil {
+		return false, fmt.Errorf("mysql: probe replay key for %q: enumerate the shards of keyspace %q: %w", table, w.schema, err)
+	}
+	if len(shardMap[w.schema]) <= 1 {
+		return true, nil
+	}
+	primary, err := readPrimaryVindexColumns(ctx, w.db, w.schema, table)
+	if errors.Is(err, errNoVSchemaEntry) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("mysql: probe replay key for %q: read its primary vindex on the sharded keyspace %q: %w",
+			table, w.schema, err)
+	}
+	return primaryVindexSupplied(primary, carried), nil
+}
+
+// primaryVindexSupplied is the DECISION of [RowWriter.replayRoutesBySuppliedVindex],
+// split from the reads so it is graded without a cluster: every primary
+// vindex column (matched case-insensitively, as MySQL resolves a column
+// name) is carried. A sharded table with NO primary vindex is not routable
+// by vtgate, so nothing can land twice through it; it reports true.
+func primaryVindexSupplied(primary []string, carried map[string]bool) bool {
+	for _, c := range primary {
+		if !carried[strings.ToLower(c)] {
+			return false
+		}
+	}
+	return true
 }
 
 // keyColumnShape is what [RowWriter.ProbeReplayKey] needs to know about a
