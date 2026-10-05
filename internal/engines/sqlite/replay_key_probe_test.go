@@ -173,6 +173,16 @@ func TestRowWriter_ProbeReplayKey_ShapeMatrix(t *testing.T) {
 			ir.Row{"id": int64(1)},
 			true, true, loud, false,
 		},
+		// A composite key PARTLY supplied: (id, sid) with sid a defaulted
+		// surrogate (SQLite has no auto-increment for a non-rowid column).
+		// The rows carry id only; every re-written row draws a fresh sid
+		// and the key collides with nothing.
+		{
+			"composite_pk_part_default", `CREATE TABLE composite_pk_part_default (id INTEGER NOT NULL, sid TEXT NOT NULL DEFAULT (lower(hex(randomblob(16)))), v TEXT, PRIMARY KEY (id, sid))`,
+			[]*ir.Column{col("id", i64, false), v},
+			ir.Row{"id": int64(1)},
+			true, false, duplicates, false,
+		},
 		// A view an INSTEAD OF trigger makes writable, over a keyless log:
 		// it accepts the writer's INSERT and holds rows, so it EXISTS for
 		// the door's purposes. It read as absent (sqlite_master type

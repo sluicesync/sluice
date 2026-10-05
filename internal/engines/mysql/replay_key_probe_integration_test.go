@@ -78,6 +78,17 @@ func TestRowWriter_ProbeReplayKey_ShapeMatrix(t *testing.T) {
 		// A generated key derived only from supplied columns converges, but
 		// the probe cannot see what its expression reads: conservative.
 		{"generated_pk", "CREATE TABLE generated_pk (id INT NOT NULL, k INT AS (id * 2) STORED PRIMARY KEY, v TEXT)", ir.Row{"id": int64(1)}, true, false, converges, true},
+		// A composite key PARTLY supplied: (id, sid) with sid AUTO_INCREMENT
+		// (MySQL needs sid to lead some index, hence KEY (sid)). The rows
+		// carry id only, so every re-applied row draws a fresh sid and the
+		// key collides with nothing.
+		{"composite_pk_part_auto", "CREATE TABLE composite_pk_part_auto (id INT NOT NULL, sid BIGINT NOT NULL AUTO_INCREMENT, v TEXT, PRIMARY KEY (id, sid), KEY (sid))", ir.Row{"id": int64(1)}, true, false, duplicates, false},
+		// A PREFIX unique key part (STATISTICS.SUB_PART set, COLUMN_NAME the
+		// column): a re-sent row has the same full value, so the same prefix,
+		// and ODKU collides. Keyed. (That a prefix is COARSER than the
+		// source's key — distinct rows sharing a prefix merge on the FIRST
+		// apply — is the separate F-E1-COARSER-TARGET-KEY item.)
+		{"prefix_unique", "CREATE TABLE prefix_unique (email VARCHAR(64) NOT NULL, v TEXT, UNIQUE KEY (email(8)))", ir.Row{"email": "someone@example.com"}, true, true, converges, false},
 	}
 	for _, c := range cases {
 		if c.ddl != "" {

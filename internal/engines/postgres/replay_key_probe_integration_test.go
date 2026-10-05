@@ -88,6 +88,17 @@ func TestRowWriter_ProbeReplayKey_ShapeMatrix(t *testing.T) {
 		// A generated arbiter derived only from supplied columns converges,
 		// but the probe cannot see what its expression reads: conservative.
 		{"generated_pk", "CREATE TABLE generated_pk (id int NOT NULL, k int GENERATED ALWAYS AS (id * 2) STORED PRIMARY KEY, v text)", ir.Row{"id": int64(1)}, true, false, false, replayConverges, true},
+		// A composite key PARTLY supplied: the arbiter is (id, sid) and the
+		// rows carry id only, so every re-applied row draws a fresh sid and
+		// ON CONFLICT (id, sid) matches nothing. Supplying part of a key is
+		// supplying none of it.
+		{"composite_pk_part_serial", "CREATE TABLE composite_pk_part_serial (id int NOT NULL, sid bigserial, v text, PRIMARY KEY (id, sid))", ir.Row{"id": int64(1)}, true, false, false, replayDuplicates, false},
+		// Mixed-case key columns: the applier quotes the row's keys verbatim,
+		// so the match is EXACT. "Id" supplied as "Id" converges. (Supplied
+		// as "id" it names a column that does not exist: the FIRST write
+		// fails loudly, 42703, so no re-send question arises — the probe's
+		// keyed=false for that spelling is pinned after the loop.)
+		{"mixed_case_key", `CREATE TABLE mixed_case_key ("Id" int PRIMARY KEY, v text)`, ir.Row{"Id": int64(1)}, true, true, false, replayConverges, false},
 	}
 	for _, c := range cases {
 		if c.ddl != "" {
@@ -159,6 +170,14 @@ func TestRowWriter_ProbeReplayKey_ShapeMatrix(t *testing.T) {
 	}
 	if !sawKeyed || !sawSilent {
 		t.Fatalf("anti-vacuity: the matrix must reach a keyed table and a silently duplicating one (keyed=%v, silent=%v)", sawKeyed, sawSilent)
+	}
+
+	// The case-sensitive half of the mixed-case key: rows that carry "id"
+	// do not supply the target's "Id" (Postgres does not fold a quoted
+	// identifier), so the key is not supplied.
+	if exists, keyed, err := prober.ProbeReplayKey(ctx, replayRecordedTable("mixed_case_key", ir.Row{"id": int64(1)})); err != nil || !exists || keyed {
+		t.Errorf(`mixed_case_key probed with a recorded "id": (%v, %v, %v); want (true, false, nil) — "id" is not "Id" on Postgres`,
+			exists, keyed, err)
 	}
 }
 
