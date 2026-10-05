@@ -187,10 +187,13 @@ quiesce and the restore reconciler should still hear about the table.
 > so a copy that meets no transient never probes. A probe that cannot
 > answer never licenses a re-send: a transient probe failure is ridden
 > like any other, a terminal one ends the copy loudly. Two consequences,
-> stated: the cold copy adds UNIQUE indexes after the data, so a PK-less
-> source table keyed only by a NOT NULL UNIQUE index has no target key
-> while it copies and now refuses on a transient (a re-send there would
-> land twice and fail the later index build); and on Postgres the key
+> stated: a PK-less source table keyed only by a NOT NULL UNIQUE index
+> is NOT affected on a target sluice creates — both schema writers create
+> that UNIQUE inline at CREATE TABLE (the Bug 125 inline promotion), so
+> the key exists while the rows copy (measured on MySQL 8.0/8.4 and PG,
+> 2026-10-04; an earlier draft of this note said the opposite). Such a
+> table refuses on a transient only where the target lacks the key, e.g.
+> one an operator pre-created without it; and on Postgres the key
 > judged is the applier's `ON CONFLICT` arbiter, so a surrogate PRIMARY
 > KEY beside a supplied UNIQUE index is refused although a re-COPY there
 > would fail loudly on that index. Pins:

@@ -21,6 +21,7 @@ import (
 	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 )
@@ -133,6 +134,13 @@ func TestSyncFromBackup_MySQL_HappyPath(t *testing.T) {
 		t.Fatalf("broker did not catch up: target emails = %v; want >= 6", got)
 	}
 
+	// The rows land before the incremental's position does: the
+	// position write is the incremental's last step. A cancel between
+	// the two is a partial incremental (F-E1, BROKER-INCREMENTAL-PARTIAL,
+	// a non-nil Run), so wait for the position to move past the full
+	// before asserting a clean stop.
+	waitForBrokerPastFull(t, mysqlEng, brokerTargetDSN, broker.StreamID, full.BackupID)
+
 	cancel()
 	select {
 	case err := <-brokerErr:
@@ -142,4 +150,34 @@ func TestSyncFromBackup_MySQL_HappyPath(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("broker did not exit within 10s of cancel")
 	}
+}
+
+// waitForBrokerPastFull polls the target's persisted broker position
+// until it names a backup other than the full the broker started at,
+// i.e. until an incremental's position write — its last step — has
+// committed. It reads the position through the engine applier, the same
+// read the broker's own warm resume uses.
+func waitForBrokerPastFull(t *testing.T, eng ir.Engine, dsn, streamID, fullID string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	applier, err := eng.OpenChangeApplier(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open applier to read the broker position: %v", err)
+	}
+	defer migcore.CloseIf(applier)
+	var last string
+	for ctx.Err() == nil {
+		pos, ok, err := applier.ReadPosition(ctx, streamID)
+		if err == nil && ok {
+			if tok, derr := decodeBrokerPosition(pos); derr == nil {
+				last = tok.LastAppliedBackupID
+				if last != "" && last != fullID {
+					return
+				}
+			}
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	t.Fatalf("broker position never moved past the full %s (last read %q)", fullID, last)
 }
