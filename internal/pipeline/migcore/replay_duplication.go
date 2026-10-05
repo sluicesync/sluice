@@ -65,6 +65,17 @@ const (
 	// not carry (a defaulted surrogate), whatever the recorded schema says.
 	ReplayKeylessTarget ReplayKeylessReason = "the target table has no PRIMARY KEY or NOT NULL UNIQUE index made of columns the backup's rows carry " +
 		"(a key on a column the rows do not supply, such as a serial, identity or defaulted surrogate, never collides)"
+	// ReplayKeylessTargetUnjudged means the emptiness check found rows under
+	// the table's name on the target, but the key probe found no table by
+	// that name — the name resolves to a relation the probe does not count as
+	// a table (on Postgres it matches relkind r/p only, so a foreign table, a
+	// view with an INSTEAD OF trigger, or a materialized view reads as
+	// absent). "Absent" there would mean "will be created from the recorded
+	// schema, key included", which is false of a name already holding rows,
+	// so the two answers contradict each other and the door refuses rather
+	// than pick one.
+	ReplayKeylessTargetUnjudged ReplayKeylessReason = "the target already holds rows under this name, but the key probe found no table " +
+		"by it (a view, foreign table or other non-table relation), so whether a re-written row collides cannot be judged"
 )
 
 // ReplayKeylessTable is one table a re-apply would duplicate rows in.
@@ -127,6 +138,7 @@ func FindReplayKeylessTables(
 		if t == nil {
 			continue
 		}
+		holdsRows := false
 		if checker != nil {
 			empty, err := checker.IsTableEmpty(ctx, t)
 			if err != nil {
@@ -135,11 +147,14 @@ func FindReplayKeylessTables(
 			if empty {
 				continue
 			}
+			holdsRows = true
 		}
 		// One predicate for the doors and the engines' in-run retry gates
 		// (irbackup.JudgeReplayKey). A nil prober (ProbeTarget off) judges
 		// the recorded schema alone. A table absent on the target passes:
-		// it will be created from the recorded schema, key included.
+		// it will be created from the recorded schema, key included — but
+		// not when the emptiness check just read rows under that name, which
+		// "absent" cannot be (ReplayKeylessTargetUnjudged).
 		verdict, err := irbackup.JudgeReplayKey(ctx, prober, t)
 		if err != nil {
 			return nil, fmt.Errorf("probe target table %q for a replay key: %w", t.Name, err)
@@ -149,7 +164,11 @@ func FindReplayKeylessTables(
 			out = append(out, ReplayKeylessTable{Name: t.Name, Reason: ReplayKeylessRecorded})
 		case irbackup.ReplayKeylessTarget:
 			out = append(out, ReplayKeylessTable{Name: t.Name, Reason: ReplayKeylessTarget})
-		case irbackup.ReplayKeyCollides, irbackup.ReplayTargetAbsent:
+		case irbackup.ReplayTargetAbsent:
+			if holdsRows {
+				out = append(out, ReplayKeylessTable{Name: t.Name, Reason: ReplayKeylessTargetUnjudged})
+			}
+		case irbackup.ReplayKeyCollides:
 		default:
 			return nil, fmt.Errorf("judge table %q for a replay key: unknown verdict %d", t.Name, verdict)
 		}

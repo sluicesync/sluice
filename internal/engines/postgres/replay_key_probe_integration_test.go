@@ -172,3 +172,64 @@ func replayRecordedTable(name string, row ir.Row) *ir.Table {
 	}
 	return t
 }
+
+// TestRowWriter_ProbeReplayKey_InsteadOfView is audit item C's Postgres half,
+// measured through the RESTORE writer (COPY), which is the path that door
+// guards. A view an INSTEAD OF INSERT trigger makes writable, over a keyless
+// log, accepts COPY and holds rows; the probe matched relkind r/p only, so it
+// read "absent", and the restore door clears an absent table on the promise
+// that it will be created from the recorded schema with its key. The
+// independent expected value is the log's own row count after the same row
+// is written twice.
+//
+// (The change applier does not reach this shape: it resolves column types
+// for tables only and skips a change into anything else as an unknown table,
+// recorded in its skip ledger.)
+func TestRowWriter_ProbeReplayKey_InsteadOfView(t *testing.T) {
+	dsn, cleanup := startPostgresForApplier(t)
+	defer cleanup()
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	applyPGApplier(t, dsn, `CREATE TABLE view_log (id int NOT NULL, v text);
+		CREATE VIEW view_instead_of AS SELECT id, v FROM view_log;
+		CREATE FUNCTION view_instead_of_ins() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN INSERT INTO view_log (id, v) VALUES (NEW.id, NEW.v); RETURN NEW; END $$;
+		CREATE TRIGGER view_instead_of_ins INSTEAD OF INSERT ON view_instead_of
+		FOR EACH ROW EXECUTE FUNCTION view_instead_of_ins();`)
+
+	rwAny, err := (Engine{}).OpenRowWriter(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenRowWriter: %v", err)
+	}
+	defer func() {
+		if c, ok := rwAny.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+	recorded := replayRecordedTable("view_instead_of", ir.Row{"id": int64(1)})
+	write := func() error {
+		ch := make(chan ir.Row, 1)
+		ch <- ir.Row{"id": int64(1), "v": "x"}
+		close(ch)
+		return rwAny.WriteRows(ctx, recorded, ch)
+	}
+	if err := write(); err != nil {
+		t.Fatalf("first write through the restore writer: %v", err)
+	}
+	if err := write(); err != nil {
+		t.Fatalf("second write: %v", err)
+	}
+	if n := pgScalarInt(t, dsn, "SELECT count(*) FROM view_log"); n != 2 {
+		t.Fatalf("the same row written twice left %d rows in the log; the shape no longer duplicates, so this pin grades nothing", n)
+	}
+
+	empty, err := rwAny.(ir.TableEmptyChecker).IsTableEmpty(ctx, recorded)
+	if err != nil || empty {
+		t.Fatalf("IsTableEmpty = (%v, %v); want (false, nil) — the door reads rows under the name", empty, err)
+	}
+	exists, keyed, err := rwAny.(ir.ReplayKeyProber).ProbeReplayKey(ctx, recorded)
+	if err != nil || !exists || keyed {
+		t.Fatalf("ProbeReplayKey = (%v, %v, %v); want (true, false, nil): a relation holding rows under the name "+
+			"is not absent, and a view has no key a re-written row collides on", exists, keyed, err)
+	}
+}

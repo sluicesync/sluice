@@ -24,13 +24,18 @@ import (
 // lands a second time. The restore re-run door needs to tell those apart
 // before writing, and refuses a writer that cannot answer.
 
-// tableExists reports whether a table of that name exists in the main
-// schema. SQLite resolves identifiers case-insensitively, so the match is
-// too.
+// tableExists reports whether a table — or a view, which an INSTEAD OF
+// trigger can make accept the writer's INSERT — of that name exists in the
+// main schema. A view counts so that rows under the name are seen by
+// [RowWriter.IsTableEmpty] and judged by [RowWriter.ProbeReplayKey] (a view
+// has no index, so it reads keyless and is refused) instead of reading as
+// absent, which a replay door clears on the promise that the table will be
+// created with its key. SQLite resolves identifiers case-insensitively, so
+// the match is too.
 func (w *RowWriter) tableExists(ctx context.Context, name string) (bool, error) {
 	var n int
 	err := w.db.QueryRowContext(ctx,
-		`SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ? COLLATE NOCASE`, name).Scan(&n)
+		`SELECT count(*) FROM sqlite_master WHERE type IN ('table', 'view') AND name = ? COLLATE NOCASE`, name).Scan(&n)
 	if err != nil {
 		return false, fmt.Errorf("sqlite: probe existence of %q: %w", name, err)
 	}

@@ -147,6 +147,31 @@ func TestFindReplayKeylessTables(t *testing.T) {
 		})
 	})
 
+	// The emptiness check and the key probe answer about the same name and
+	// can contradict each other: Postgres's probe counts relkind r/p only, so
+	// a foreign table or an INSTEAD-OF view holding rows reads as "absent",
+	// which the judge used to clear as "will be created with its key". Rows
+	// under the name prove it is not absent; the door refuses. An absent
+	// table with NO rows (pk_target_absent, empty here) still passes.
+	t.Run("OnlyNonEmpty refuses rows under a name the key probe calls absent", func(t *testing.T) {
+		w.rows = map[string]bool{"pk_target_absent": true}
+		defer func() { w.rows = nil }()
+		got, err := FindReplayKeylessTables(ctx, w, tables, ReplayJudgeOptions{ProbeTarget: true, OnlyNonEmpty: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertReplayKeyless(t, got, map[string]ReplayKeylessReason{
+			"pk_target_absent": ReplayKeylessTargetUnjudged,
+		})
+		got, err = FindReplayKeylessTables(ctx, w, tables, ReplayJudgeOptions{ProbeTarget: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 4 {
+			t.Errorf("without OnlyNonEmpty an absent table must still pass (it will be created): got %v", got)
+		}
+	})
+
 	// The F-E1 review's HIGH 2: this used to return nothing — every table
 	// treated as EMPTY — which left the restore door open on any engine
 	// whose writer could not report emptiness (SQLite: 200 rows for 100).

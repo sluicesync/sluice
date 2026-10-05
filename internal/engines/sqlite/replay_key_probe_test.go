@@ -173,6 +173,20 @@ func TestRowWriter_ProbeReplayKey_ShapeMatrix(t *testing.T) {
 			ir.Row{"id": int64(1)},
 			true, true, loud, false,
 		},
+		// A view an INSTEAD OF trigger makes writable, over a keyless log:
+		// it accepts the writer's INSERT and holds rows, so it EXISTS for
+		// the door's purposes. It read as absent (sqlite_master type
+		// 'table' only), which a replay door clears as "will be created
+		// with its key" (audit item C's SQLite sibling).
+		{
+			"view_instead_of", `CREATE TABLE view_log (id INTEGER NOT NULL, v TEXT);
+				CREATE VIEW view_instead_of AS SELECT id, v FROM view_log;
+				CREATE TRIGGER view_instead_of_ins INSTEAD OF INSERT ON view_instead_of
+				BEGIN INSERT INTO view_log (id, v) VALUES (NEW.id, NEW.v); END;`,
+			[]*ir.Column{col("id", i64, false), v},
+			ir.Row{"id": int64(1)},
+			true, false, duplicates, false,
+		},
 	}
 
 	db, err := sql.Open("sqlite", dsn)

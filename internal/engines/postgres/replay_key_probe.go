@@ -49,6 +49,19 @@ import (
 //
 // The writer's schema is the applier's schema (both come from the DSN's
 // resolved schema, and [ir.SchemaSetter] moves both for --target-schema).
+//
+// "Exists" counts every relation a row can be written into or read from
+// under the name — a table, a partitioned table, a view, a foreign table or
+// a materialized view (relkind r/p/v/f/m) — not only tables. "Absent"
+// licenses a door to judge the RECORDED schema alone, on the promise that
+// the table will be created from it with its key; a view (with an INSTEAD OF
+// trigger, or simply updatable) or a foreign table under the name breaks
+// that promise while it accepts rows, and the emptiness check reads rows
+// through it. Counted as existing, such a relation has no ON CONFLICT
+// arbiter of its own and so reads as keyless: refused, which is the
+// conservative answer for a relation whose collision behaviour this probe
+// cannot see. (Before, r/p only: a foreign table or INSTEAD OF view holding
+// rows read as absent and was cleared.)
 func (w *RowWriter) ProbeReplayKey(ctx context.Context, table *ir.Table) (exists, keyed bool, err error) {
 	if table == nil {
 		return false, false, errors.New("postgres: ProbeReplayKey: table is nil")
@@ -69,7 +82,7 @@ func (w *RowWriter) ProbeReplayKey(ctx context.Context, table *ir.Table) (exists
 			SELECT 1
 			FROM   pg_catalog.pg_class c
 			JOIN   pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-			WHERE  n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('r', 'p')
+			WHERE  n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('r', 'p', 'v', 'f', 'm')
 		)`
 	if err := tx.QueryRowContext(ctx, existsQ, w.schema, table.Name).Scan(&exists); err != nil {
 		return false, false, fmt.Errorf("postgres: probe replay key for %q: existence: %w", table.Name, err)
