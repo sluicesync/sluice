@@ -270,8 +270,25 @@ func TestStreamer_RefuseCrashReplayAddColumn_PostgresToPostgres(t *testing.T) {
 	// The stream resumes past the transaction without the acknowledgement.
 	run = startTWFBRun(cell.streamer())
 	cell.src.exec(t, "INSERT INTO t_ca VALUES (5, 5, 5)")
+	afterRow5 := cell.src.scalar(t, "SELECT pg_current_wal_lsn()::text")
 	if !cell.tgt.waitRow(t, table, 5, run, 90*time.Second) {
 		t.Fatalf("the restart after the acknowledged run did not resume (stream: %v)", run.stop(t))
+	}
+	// Stop only once the persisted position has passed row 5. Otherwise the
+	// next start replays row 5's transaction, caches t_ca's old shape, and
+	// the reader's own mid-stream gate refuses the DROP before the
+	// acknowledgement binding this step grades is consulted (a CI flake,
+	// 2026-10-05: refused, row 6 absent, but by the other door).
+	persistedPast := "false"
+	for deadline := time.Now().Add(60 * time.Second); persistedPast != "true" && time.Now().Before(deadline); {
+		persistedPast = cell.tgt.scalar(t, "SELECT COALESCE((source_position::json->>'lsn')::pg_lsn >= $1::pg_lsn, false)::text "+
+			"FROM sluice_cdc_state WHERE stream_id = $2", afterRow5, cell.streamID)
+		if persistedPast != "true" {
+			time.Sleep(250 * time.Millisecond)
+		}
+	}
+	if persistedPast != "true" {
+		t.Fatalf("the persisted position never passed row 5's WAL position %s (last %q; stream: %v)", afterRow5, persistedPast, run.stop(t))
 	}
 	_ = run.stop(t)
 
