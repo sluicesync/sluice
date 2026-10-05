@@ -1,6 +1,6 @@
 # ADR-0191: Exactly-once broker replay — a recorded source identity, a mid-incremental frontier, and ADR-0190's marks
 
-- **Status:** Proposed 2026-10-05 — DESIGN ONLY, no code. Written against `98ad6ec6` (v0.156.11 + the NEKI-012 backlog correction). The F-E1 follow-up that ADR-0190's operator decision 4 ("the broker: NOT in this ADR — a separate ADR later") and amendment E's E-Q5 sequenced ahead of amendment E. Open questions in §12; nothing here is decided until the operator answers them.
+- **Status:** Accepted 2026-10-05 (operator, §12): design only, no code yet; sequenced after F-E1-SEVERED-TAIL-REPLAY and ADR-0190 Amendment E. Written against `98ad6ec6` (v0.156.11 + the NEKI-012 backlog correction). The F-E1 follow-up that ADR-0190's operator decision 4 ("the broker: NOT in this ADR — a separate ADR later") and amendment E's E-Q5 sequenced ahead of amendment E. Open questions in §12; nothing here is decided until the operator answers them.
 - **Date:** 2026-10-05
 - **Related:** [ADR-0190](adr-0190-exactly-once-apply-marks.md) (the apply-mark machinery this ADR reuses unchanged, and the invariants (i)–(iii) of its amendment C); [ADR-0007](adr-0007-position-persistence.md) (position in the data transaction); [ADR-0010](adr-0010-idempotent-applier.md) (the idempotency the broker's BRK-1 comment leaned on); [ADR-0027](adr-0027-source-transaction-boundary-cdc-batching.md); [ADR-0046](adr-0046-inline-backup-chain-rotation.md) / [ADR-0067](adr-0067-contiguous-rotation-handoff.md) (segments and rotation); [ADR-0064](adr-0064-backup-smart-compaction.md) (smart compaction); [ADR-0087](adr-0087-compact-group-split-and-rotation-boundary-resume.md); [ADR-0113](adr-0113-restore-reparent-reconciliation.md) (reconcile); audit backlog **F-E1** and its sub-items F-E1-KEY-REUSE-REPLAY and F-E1-ROTATED-SEGMENT-OVERLAP.
 
@@ -271,6 +271,14 @@ New concurrency: none in the applier; the producer goroutine gains the ordinal c
 - **LOW, doc drift:** `ir.ApplyID`'s doc says "a backup chunk replay" leaves the identity zero (`change.go:179`–`181`); BRK-1's comments in `broker.go` describe the parent token as the only token. Both change with this design and are rewritten by it.
 
 ## 12. Open questions for the operator
+
+**Answered (operator, 2026-10-05).**
+- Q1: option (c) is approved.
+- Q4: narrow the keyless door per incremental, as tabled.
+- Sequencing (Q8, Q10): fix F-E1-SEVERED-TAIL-REPLAY first. It was reproduced on 2026-10-05 and is wider than filed: MySQL file/pos chains LOSE rows, so a producer-side fix is needed, which this ADR cannot supply. Then land ADR-0190 Amendment E. Then this ADR.
+- Q2, Q3, Q5, Q6, Q7 and Q9 take the recommendations.
+
+The questions as put:
 
 - **Q1. Option (c) with the recorded source identity?** Recommendation: **yes**. (a) is unsound (§1.5); (b) leaves the in-flight transaction at-least-once and cannot lift the keyless refusal; chunk-derived identities cannot dedupe §1.4's overlap.
 - **Q2. Format: an additive `aid` field plus a manifest `ApplyIdentity` flag, no `FormatVersion` bump?** Recommendation: **additive, no bump.** A bump would make older binaries refuse new chains for a field they can safely ignore; the flag, not the version, is what the broker judges.
