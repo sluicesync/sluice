@@ -176,9 +176,36 @@ func TestPublicationScope_PushdownFilterDrift(t *testing.T) {
 	}
 	defer func() { _ = srcDB.Close() }()
 	dropSlotWithRetry(t, srcDB, "sluice_drift_flt", 30*time.Second)
-	runUntilCanceled(t, newStreamer(map[string]string{"orders": "id < 200"}, true), 3)
-	if got := pgQueryOne[string](t, targetDSN,
-		`SELECT COALESCE(row_filter_hash, '') FROM sluice_cdc_state WHERE stream_id = $1`, "drift-flt"); got == recordedHash || got == "" {
+	// Wait on the hash itself, not on a row count: the target still holds
+	// the earlier runs' rows when the restart begins, so a row-count wait
+	// can be satisfied before the re-copy has cleared, re-copied or
+	// re-recorded anything (a CI flake, 2026-10-05).
+	restartCtx, restartCancel := context.WithCancel(context.Background())
+	restartErr := make(chan error, 1)
+	go func() { restartErr <- newStreamer(map[string]string{"orders": "id < 200"}, true).Run(restartCtx) }()
+	readHash := func() string {
+		return pgQueryOne[string](t, targetDSN,
+			`SELECT COALESCE(row_filter_hash, '') FROM sluice_cdc_state WHERE stream_id = $1`, "drift-flt")
+	}
+	got := readHash()
+	for deadline := time.Now().Add(90 * time.Second); (got == recordedHash || got == "") && time.Now().Before(deadline); got = readHash() {
+		select {
+		case err := <-restartErr:
+			restartCancel()
+			t.Fatalf("restart-from-scratch exited before re-recording the filter hash: %v", err)
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
+	restartCancel()
+	select {
+	case err := <-restartErr:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("restart-from-scratch exited with error: %v", err)
+		}
+	case <-time.After(60 * time.Second):
+		t.Fatal("restart-from-scratch did not exit after cancel")
+	}
+	if got == recordedHash || got == "" {
 		t.Errorf("restart-from-scratch did not re-record the new filter's hash (got %q, old %q)", got, recordedHash)
 	}
 }
