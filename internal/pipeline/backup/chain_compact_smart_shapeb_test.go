@@ -99,10 +99,17 @@ func TestSmartCompaction_RefusesToHideShapeB(t *testing.T) {
 	requireShapeB("before compaction (control)")
 	files := len(store.data)
 
+	// The order arrives the way the CLI supplies it: through the resolver,
+	// from the source engine the catalog records.
 	_, err := CompactChain(ctx, store, CompactOpts{
 		MergeWindow: 2 * time.Hour, SmartCompaction: true, PKStrategy: PKStrategyPK,
-		Now:        func() time.Time { return now.Add(10 * time.Hour) },
-		Comparator: smartLSNComparator{},
+		Now: func() time.Time { return now.Add(10 * time.Hour) },
+		PositionOrder: func(engine string) (ir.PositionMonotonicChecker, bool) {
+			if engine != "postgres" {
+				return nil, false
+			}
+			return smartLSNComparator{}, true
+		},
 	})
 	if codeOf(err) != sluicecode.CodeBackupChainSeveredTransaction || !strings.Contains(err.Error(), "nothing was copied") {
 		t.Fatalf("smart compaction did not refuse, before copying, a chain carrying shape (B): %v", err)
