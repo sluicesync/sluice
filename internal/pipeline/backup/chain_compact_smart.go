@@ -548,6 +548,17 @@ type smartCompactor struct {
 	// trailing TxCommit back rather than emitting it eagerly.
 	heldCommit ir.Change
 
+	// heldBegin is the same lookahead for a TxBegin: a transaction's begin
+	// is emitted only when something that is not collapsed follows it, so
+	// collapsed rows flushed at a barrier or at finalize land BEFORE a
+	// trailing begin instead of after it. Without it a window that ends on a
+	// BARE TxBegin (an older binary's stop just after a BEGIN; the door
+	// passes it — no row of that transaction) was rewritten into a TxBegin
+	// with rows after it, which IS the severed shape, and compaction refused
+	// a healthy chain. Released after heldCommit, so begin-after-commit order
+	// is kept.
+	heldBegin ir.Change
+
 	// lastIn / lastOut are the positions of the last position-bearing event
 	// into [smartCompactor.process] and out through [smartCompactor.deliver].
 	// [smartCompactor.closeAtLastInputPosition] uses them to end the rewritten
@@ -690,16 +701,31 @@ func newSmartCompactor(pkStrategy PKStrategy, schema *ir.Schema) *smartCompactor
 // event that carries its own real position (TxBegin / TxCommit /
 // SchemaSnapshot / TRUNCATE / a row event for a table that cannot collapse).
 //
-// It releases any held closing commit first, so an ordinary event that follows
-// a TxCommit still follows it in the output.
+// It releases the held markers first (commit, then begin), so an ordinary
+// event that follows them still follows them in the output. A TxCommit or a
+// TxBegin is itself held back: see [smartCompactor.pushCollapsed] and
+// [smartCompactor.heldBegin]. A TxBegin arriving while a commit is held keeps
+// the commit held too, so collapsed rows flushed next still land inside the
+// committed transaction rather than between it and the next begin.
 func (s *smartCompactor) push(e ir.Change) error {
-	if err := s.releaseHeldCommit(); err != nil {
-		return err
-	}
-	if _, closing := e.(ir.TxCommit); closing {
-		// Hold it back: see [smartCompactor.pushCollapsed].
+	switch e.(type) {
+	case ir.TxCommit:
+		if err := s.releaseHeld(); err != nil {
+			return err
+		}
 		s.heldCommit = e
 		return nil
+	case ir.TxBegin:
+		if s.heldBegin != nil {
+			if err := s.releaseHeld(); err != nil {
+				return err
+			}
+		}
+		s.heldBegin = e
+		return nil
+	}
+	if err := s.releaseHeld(); err != nil {
+		return err
 	}
 	return s.deliver(e)
 }
@@ -735,14 +761,19 @@ func (s *smartCompactor) pushCollapsed(events []ir.Change) error {
 	return nil
 }
 
-// releaseHeldCommit emits the held closing commit, if there is one.
-func (s *smartCompactor) releaseHeldCommit() error {
-	if s.heldCommit == nil {
-		return nil
+// releaseHeld emits the held closing commit and then the held begin, if any.
+func (s *smartCompactor) releaseHeld() error {
+	for _, slot := range []*ir.Change{&s.heldCommit, &s.heldBegin} {
+		if *slot == nil {
+			continue
+		}
+		e := *slot
+		*slot = nil
+		if err := s.deliver(e); err != nil {
+			return err
+		}
 	}
-	e := s.heldCommit
-	s.heldCommit = nil
-	return s.deliver(e)
+	return nil
 }
 
 // closeAtLastInputPosition ends the rewritten stream at the position the
@@ -760,18 +791,28 @@ func (s *smartCompactor) releaseHeldCommit() error {
 // original stream recorded — never the manifest's EndPosition, so an input
 // that was already short stays short and is still refused.
 //
-// MARKER-LESS INPUTS ONLY. On a framed stream the held commit already ends a
-// committed tail at the last input position. A framed stream that ends INSIDE
-// an open transaction (an old binary's severed window) has no commit to hold,
-// so its collapsed tail can also end below the last input position — and a
-// pair appended there would CLOSE that transaction, erasing the open tail the
+// ANY INPUT THAT DOES NOT END INSIDE AN OPEN TRANSACTION. The gap is not a
+// marker-less property: a framed MySQL/MariaDB window can end on an event
+// outside any transaction (the binlog reader emits a DDL TRUNCATE unframed,
+// and `captureWindow` ends a window whenever no transaction is open), and the
+// other tables' collapsed rows then flush after it at their first positions
+// with no closing commit to hold back. Round 4 scoped the pair to marker-less
+// inputs and that chain compacted into one restore refused
+// (TestSmartCompaction_TrailingUnframedEventStillRestores).
+//
+// The one input that must NOT get the pair is one that ends inside an open
+// transaction: a pair there would CLOSE it, erasing the open tail the
 // severed-transaction door's shape (A) refuses on, while lastIn ==
-// EndPosition kept shape (C) quiet too. Measured before this guard: the
-// keyless head of a re-delivered transaction applied twice through door,
-// verify and restore at exit 0. So a framed input never gets the pair; its
-// verdict is held by [smartCompactor.keepsTheSeveredVerdict] instead.
+// EndPosition kept shape (C) quiet too — measured in b953b09d as the keyless
+// head of a re-delivered transaction applied twice at exit 0. Such an input is
+// refused before it is rewritten ([smartCompactor.keepsTheSeveredVerdict] and
+// the pre-copy judge in [CompactChain]); this guard is the second layer
+// (TestSmart_ClosingPairNeverClosesAnOpenTransaction). A BARE trailing
+// TxBegin is open too: it gets no pair, and needs none, because the held
+// begin ([smartCompactor.heldBegin]) is emitted last at the last input
+// position.
 func (s *smartCompactor) closeAtLastInputPosition() error {
-	if s.inTail.sawMarker || !positioned(s.lastIn) || s.lastOut == s.lastIn {
+	if s.inTail.open || !positioned(s.lastIn) || s.lastOut == s.lastIn {
 		return nil
 	}
 	if err := s.deliver(ir.TxBegin{Position: s.lastIn}); err != nil {
@@ -808,7 +849,9 @@ func (s *smartCompactor) keepsTheSeveredVerdict() error {
 			fmt.Errorf("smart compaction refused: an incremental ends inside an open source transaction (TxBegin at %+v; F-E1-SEVERED-TAIL-REPLAY shape A, written by a `backup stream` stop or cancel on an older sluice), and collapsing it would change what restore and `sync from-backup` judge on — the chain is left unchanged", at))
 	}
 	if outOpen, _ := s.outTail.endsOpen(); outOpen {
-		return errors.New("smart compaction refused: the rewritten incremental ends inside an open transaction although its input did not — an ordering defect in the compactor; the chain is left unchanged")
+		return sluicecode.Wrap(sluicecode.CodeBackupChainUnreadable,
+			"this is a defect in sluice's smart compaction, not in the chain: compact with --smart-compaction-off, and report it",
+			errors.New("backup compact: pre-swap check: smart compaction refused: the rewritten incremental ends inside an open transaction although its input did not, so restore would refuse a chain that restores today; nothing was swapped or deleted"))
 	}
 	return nil
 }
@@ -1456,9 +1499,10 @@ func (s *smartCompactor) finalize() (*smartCompactResult, error) {
 	if err := s.flushAll(); err != nil {
 		return nil, err
 	}
-	// The last thing out of the compactor is the closing commit the
-	// one-slot lookahead has been holding — see [smartCompactor.pushCollapsed].
-	if err := s.releaseHeldCommit(); err != nil {
+	// The last things out of the compactor are the markers the lookahead has
+	// been holding — see [smartCompactor.pushCollapsed] and
+	// [smartCompactor.heldBegin].
+	if err := s.releaseHeld(); err != nil {
 		return nil, err
 	}
 

@@ -374,7 +374,7 @@ func (d *SeveredTransactionDoor) WarnOpenFinalTail(ctx context.Context, links []
 	}
 	slog.WarnContext(
 		ctx, "CHAIN-TAIL-OPEN-TRANSACTION: the chain's last incremental ends inside an open source transaction (written by a sluice before the severed-tail fix); "+
-			"this restore applies only that transaction's head, a state the source never had. A CDC resume from this chain's end position re-delivers the whole transaction",
+			"this restore applies only that transaction's head, a state the source never had (when a segment full follows that incremental, its snapshot is upserted over it, which overwrites keyed head rows the snapshot also holds, while head rows the snapshot lacks stay). A CDC resume from this chain's end position re-delivers the whole transaction",
 		slog.String("backup_id", lineage.ManifestBackupID(link.Manifest)),
 		slog.Any("open_transaction_at", e.openAt),
 	)
@@ -797,7 +797,7 @@ func (d *SeveredTransactionDoor) scanWholeIncremental(ctx context.Context, link 
 // One rule, two callers: the door's whole-incremental scan judges a STORED
 // incremental with it, and smart compaction judges its own INPUT and OUTPUT
 // with it, refusing a rewrite that would turn a severed incremental into one
-// the door passes (TestSmartCompaction_KeepsASeveredFramedTailVisible).
+// the door passes (TestSmartCompaction_RefusesASeveredFramedIncremental).
 type openTxTracker struct {
 	open      bool
 	openRow   bool // the open transaction has recorded a row

@@ -206,20 +206,27 @@ func TestSmartCompaction_RefusesASeveredFramedIncremental(t *testing.T) {
 	}
 }
 
-// TestSmart_ClosingPairOnlyForAMarkerlessInput isolates the closing-pair guard
-// from the refusal above (which would otherwise mask it): a FRAMED input that
-// ends inside an open transaction must get no closing pair — the pair is what
-// closed the transaction in b953b09d — while a marker-less input with the same
-// collapse does.
-func TestSmart_ClosingPairOnlyForAMarkerlessInput(t *testing.T) {
+// TestSmart_ClosingPairNeverClosesAnOpenTransaction isolates the closing-pair
+// guard from the refusals (which would otherwise mask it). The pair is owed by
+// every input that does NOT end inside an open transaction and whose collapsed
+// output ends below its last position — marker-less, and framed with a trailing
+// unframed event (MySQL's DDL TRUNCATE) — and must never be given to one that
+// does: a framed severed window (the pair would close it: b953b09d) or a bare
+// trailing TxBegin (whose held begin already ends the output at the last
+// position).
+func TestSmart_ClosingPairNeverClosesAnOpenTransaction(t *testing.T) {
 	framed, _ := severedPGRows(100, 1)
 	markerless, _ := markerlessRows(100, 1)
+	truncate, _ := trailingTruncateRows(100, 1)
+	bare, _ := bareBeginRows(100, 1)
 	for _, tc := range []struct {
 		name     string
 		events   []ir.Change
 		wantPair bool
 	}{
 		{"framed, ends inside an open transaction", framed, false},
+		{"framed, ends on a bare TxBegin", bare, false},
+		{"framed, ends on an unframed TRUNCATE", truncate, true},
 		{"marker-less, collapsed tail below the last input position", markerless, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -236,8 +243,14 @@ func TestSmart_ClosingPairOnlyForAMarkerlessInput(t *testing.T) {
 			if err := c.closeAtLastInputPosition(); err != nil {
 				t.Fatal(err)
 			}
-			if got := len(c.sink.(*sliceSink).out) - before; (got == 2) != tc.wantPair {
+			out := c.sink.(*sliceSink).out
+			if got := len(out) - before; (got == 2) != tc.wantPair {
 				t.Fatalf("closing pair appended %d events; want pair=%v", got, tc.wantPair)
+			}
+			if !tc.wantPair && tc.name == "framed, ends on a bare TxBegin" {
+				if _, ok := out[len(out)-1].(ir.TxBegin); !ok || lastPosOf(out) != lastPosOf(tc.events) {
+					t.Fatalf("a bare trailing TxBegin must be emitted LAST, at the last input position (the held begin): tail %T at %+v", out[len(out)-1], lastPosOf(out))
+				}
 			}
 		})
 	}

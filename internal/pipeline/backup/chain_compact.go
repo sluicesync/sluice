@@ -571,6 +571,26 @@ func CompactChain(ctx context.Context, store irbackup.Store, opts CompactOpts) (
 		)
 	}
 
+	// Judge smart compaction's inputs BEFORE anything is copied: a refusal
+	// that fires after executeMergeGroup left a full `seg-merged-*` copy of
+	// the group behind on every refused run ([refuseSeveredSmartInputs]).
+	if opts.SmartCompaction {
+		if err := refuseSeveredSmartInputs(ctx, store, cat, planned); err != nil {
+			return nil, err
+		}
+	}
+	// Any later refusal — the smart pass, the verdict-regression gate, the
+	// readability gate — removes the merged copies this run created, so a
+	// refused run leaves the store as it found it. Only dirs this run created
+	// and the catalog does not reference are removed.
+	var createdMerged []string
+	committed := false
+	defer func() {
+		if !committed {
+			removeUncommittedMergedDirs(ctx, store, cat, createdMerged)
+		}
+	}()
+
 	smartPK := resolvePKStrategy(opts.PKStrategy)
 	tablesWithoutPK := make(map[string]struct{})
 	tablesUnmatched := make(map[string]struct{})
@@ -579,6 +599,7 @@ func CompactChain(ctx context.Context, store irbackup.Store, opts CompactOpts) (
 		if pg.plan.MergedSegmentID == "" {
 			continue
 		}
+		createdMerged = append(createdMerged, pg.plan.MergedSegmentDir)
 		if err := executeMergeGroup(ctx, store, eligible, pg); err != nil {
 			return nil, fmt.Errorf("backup compact: merge group %s: %w", pg.plan.MergedSegmentID, err)
 		}
@@ -609,46 +630,7 @@ func CompactChain(ctx context.Context, store irbackup.Store, opts CompactOpts) (
 		if err != nil {
 			return nil, fmt.Errorf("backup compact: smart-compact merge group %s: %w", pg.plan.MergedSegmentID, err)
 		}
-		// Update the per-group plan entry + the top-level result.
-		// res.Plan was already appended to during planning; locate
-		// the entry by MergedSegmentID and update it.
-		for pi := range res.Plan {
-			if res.Plan[pi].MergedSegmentID != pg.plan.MergedSegmentID {
-				continue
-			}
-			res.Plan[pi].EventsBefore = groupRes.eventsBefore
-			res.Plan[pi].EventsAfter = groupRes.eventsAfter
-			res.Plan[pi].EventsCollapsed = groupRes.eventsBefore - groupRes.eventsAfter
-			res.Plan[pi].RowsCollapsed = groupRes.rowsCollapsed
-			res.Plan[pi].TablesWithoutPK = groupRes.tablesWithoutPKList()
-			res.Plan[pi].TablesUnmatched = groupRes.tablesUnmatchedList()
-			res.Plan[pi].ChainsEvicted = groupRes.chainsEvicted
-			res.Plan[pi].PeakChunkBufferBytes = groupRes.peakChunkBufferBytes
-			break
-		}
-		res.EventsBefore += groupRes.eventsBefore
-		res.EventsAfter += groupRes.eventsAfter
-		res.RowsCollapsed += groupRes.rowsCollapsed
-		res.ChainsEvicted += groupRes.chainsEvicted
-		// A peak is a MAXIMUM at every level: two groups compacted one
-		// after the other never hold their buffers at the same time. This
-		// mirrors [smartCompactResult.merge], which does the same for the
-		// incrementals within a group.
-		if groupRes.peakChunkBufferBytes > res.PeakChunkBufferBytes {
-			res.PeakChunkBufferBytes = groupRes.peakChunkBufferBytes
-		}
-		// Re-derive BytesAfter for this group: the chunks have been
-		// rewritten with possibly-fewer events, so the merged
-		// segment's actual byte total is groupRes.bytesAfter (chunk
-		// data only; manifest bytes are negligible and the naive
-		// BytesEstimate was chunk-byte sums).
-		res.BytesAfter += groupRes.bytesAfter - pg.plan.BytesEstimate
-		for k := range groupRes.tablesWithoutPK {
-			tablesWithoutPK[k] = struct{}{}
-		}
-		for k := range groupRes.tablesUnmatched {
-			tablesUnmatched[k] = struct{}{}
-		}
+		res.absorbSmartGroup(pg, groupRes, tablesWithoutPK, tablesUnmatched)
 	}
 	res.EventsCollapsed = res.EventsBefore - res.EventsAfter
 	if len(tablesWithoutPK) > 0 {
@@ -669,6 +651,7 @@ func CompactChain(ctx context.Context, store irbackup.Store, opts CompactOpts) (
 	if err := commitCompactedChain(ctx, store, cat, planned, opts, now()); err != nil {
 		return nil, err
 	}
+	committed = true
 
 	// ADR-0154: re-sign the merged survivor set at its new positions +
 	// the lineage. Runs BEFORE the orphan-delete sweep so the signed
@@ -743,6 +726,11 @@ func commitCompactedChain(
 	prospective.RestorableFromSegment = 0
 	if err := verifyChainReadable(ctx, store, &prospective, opts.Envelope, "backup compact", "pre-swap"); err != nil {
 		return errPreSweepReadability("backup compact", err)
+	}
+	if opts.SmartCompaction {
+		if err := refuseVerdictRegression(ctx, store, cat, &prospective); err != nil {
+			return err
+		}
 	}
 
 	cat.Segments = postSegments
