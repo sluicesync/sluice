@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/crypto"
+	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
@@ -159,6 +160,17 @@ type CompactOpts struct {
 	// with a WARN; an encrypted chain has always been compactable
 	// without key material and stays so.
 	Envelope crypto.EnvelopeEncryption
+
+	// Comparator orders the chain's SOURCE-engine positions, for the
+	// severed-transaction door's shape (B) in smart compaction's two gates
+	// ([refuseFindingsInRewrittenLinks], [refuseVerdictChange]). Collapse
+	// lowers an incremental's last-row position, which can HIDE a re-delivered
+	// boundary transaction from (B), so without a comparator those gates cannot
+	// see the class smart compaction can erase. The pipeline may not name
+	// engines (archgate): the CLI resolves it from the registry by the chain's
+	// recorded source engine (cmd/sluice's `sourceEngineComparator`, pinned by TestSourceEngineComparator_PostgresChainOrdersPositions). nil leaves
+	// (B) unjudged, exactly as a restore with no comparator does.
+	Comparator ir.PositionMonotonicChecker
 }
 
 // CompactResult summarises a [CompactChain] run.
@@ -573,21 +585,23 @@ func CompactChain(ctx context.Context, store irbackup.Store, opts CompactOpts) (
 
 	// Judge smart compaction's inputs BEFORE anything is copied: a refusal
 	// that fires after executeMergeGroup left a full `seg-merged-*` copy of
-	// the group behind on every refused run ([refuseSeveredSmartInputs]).
+	// the group behind on every refused run ([refuseFindingsInRewrittenLinks]).
 	if opts.SmartCompaction {
-		if err := refuseSeveredSmartInputs(ctx, store, cat, planned); err != nil {
+		if err := refuseFindingsInRewrittenLinks(ctx, store, cat, planned, opts.Comparator); err != nil {
 			return nil, err
 		}
 	}
 	// Any later refusal — the smart pass, the verdict-regression gate, the
 	// readability gate — removes the merged copies this run created, so a
 	// refused run leaves the store as it found it. Only dirs this run created
-	// and the catalog does not reference are removed.
+	// and neither the pre-run catalog nor the STORED catalog references are
+	// removed ([removeUncommittedMergedDirs]).
+	preRunDirs := segmentDirs(cat)
 	var createdMerged []string
 	committed := false
 	defer func() {
 		if !committed {
-			removeUncommittedMergedDirs(ctx, store, cat, createdMerged)
+			removeUncommittedMergedDirs(ctx, store, preRunDirs, createdMerged)
 		}
 	}()
 
@@ -728,7 +742,7 @@ func commitCompactedChain(
 		return errPreSweepReadability("backup compact", err)
 	}
 	if opts.SmartCompaction {
-		if err := refuseVerdictRegression(ctx, store, cat, &prospective); err != nil {
+		if err := refuseVerdictChange(ctx, store, cat, &prospective, planned, opts.Comparator); err != nil {
 			return err
 		}
 	}

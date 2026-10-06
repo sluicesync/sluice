@@ -209,49 +209,98 @@ func TestSmart_KeepsTheSeveredVerdict_SecondLayer(t *testing.T) {
 	}
 }
 
-// TestCompactChain_VerdictRegressionGate is the belt over the whole class: the
-// gate refuses a post-compaction catalog whose chain the door would refuse
-// when the current one passes, and accepts one that passes. The prospective
-// chain here is the current chain with its last incremental's manifest
-// re-pointed at a copy whose EndPosition is past its chunks (what both review
-// rounds' defects produced).
-func TestCompactChain_VerdictRegressionGate(t *testing.T) {
+// shortCopyOfLastIncremental writes a copy of segment seg's last incremental
+// whose EndPosition is past its chunks (shape C, with a new BackupID) and
+// returns a catalog that points at it instead.
+func shortCopyOfLastIncremental(t *testing.T, store irbackup.Store, cat *lineage.Catalog, seg int, path string) *lineage.Catalog {
+	t.Helper()
+	ctx := context.Background()
+	s := lineage.NewPrefixedStore(store, cat.Segments[seg].Dir)
+	incrs := cat.Segments[seg].Incrementals
+	m, err := lineage.ReadManifestAt(ctx, s, incrs[len(incrs)-1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.EndPosition = pos(999 + uint64(seg))
+	m.BackupID = irbackup.ComputeBackupID(m)
+	if err := lineage.WriteManifestAt(ctx, s, path, m); err != nil {
+		t.Fatal(err)
+	}
+	out := *cat
+	out.Segments = append([]lineage.Segment(nil), cat.Segments...)
+	out.Segments[seg].Incrementals = append(append([]string(nil), incrs[:len(incrs)-1]...), path)
+	out.Segments[seg].EndPosition = m.EndPosition
+	return &out
+}
+
+// incrementalIDs is the set of incremental BackupIDs cat's chain walks.
+func incrementalIDs(t *testing.T, store irbackup.Store, cats ...*lineage.Catalog) map[string]bool {
+	t.Helper()
+	ids := map[string]bool{}
+	for _, c := range cats {
+		links, err := lineage.BuildLineageChainFromCatalog(context.Background(), store, c, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range links {
+			if isIncrementalLink(&links[i]) {
+				ids[lineage.ManifestBackupID(links[i].Manifest)] = true
+			}
+		}
+	}
+	return ids
+}
+
+// TestCompactChain_VerdictChangeGate grades the pre-swap belt in all three
+// directions, link by link: a finding GAINED on a rewritten incremental
+// (pass→refuse: e9cbfc42's shape) and a finding LOST (refuse→pass:
+// b953b09d's shape) both refuse; the same finding before and after
+// (refuse→refuse) is not the belt's to refuse; and a refused link the run
+// does not rewrite neither disables the belt nor trips it.
+func TestCompactChain_VerdictChangeGate(t *testing.T) {
 	ctx := context.Background()
 	store := newMemStore()
 	now := time.Date(2026, 5, 26, 0, 0, 0, 0, time.UTC)
 	seedSmartCompactLineageWithSchemaAndEnc(t, store, now, usersSchema(), nil, framedRows)
-	current, _, err := lineage.LoadLineageCatalog(ctx, store)
+	healthy, _, err := lineage.LoadLineageCatalog(ctx, store)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := refuseVerdictRegression(ctx, store, current, current); err != nil {
-		t.Fatalf("an unchanged chain must pass: %v", err)
+	last := len(healthy.Segments) - 1
+	short := shortCopyOfLastIncremental(t, store, healthy, last, "manifests/incr-short.json")
+	ids := incrementalIDs(t, store, healthy, short)
+
+	if err := verdictChange(ctx, store, healthy, healthy, ids, nil); err != nil {
+		t.Fatalf("pass→pass must be allowed: %v", err)
+	}
+	if err := verdictChange(ctx, store, healthy, short, ids, nil); codeOf(err) != sluicecode.CodeBackupChainUnreadable || !strings.Contains(err.Error(), "gained: [C(") {
+		t.Fatalf("pass→refuse (a finding GAINED) must refuse: %v", err)
+	}
+	if err := verdictChange(ctx, store, short, healthy, ids, nil); codeOf(err) != sluicecode.CodeBackupChainUnreadable || !strings.Contains(err.Error(), "lost: [C(") {
+		t.Fatalf("refuse→pass (a finding LOST) must refuse: %v", err)
+	}
+	if err := verdictChange(ctx, store, short, short, ids, nil); err != nil {
+		t.Fatalf("refuse→refuse with the same finding is not a change: %v", err)
 	}
 
-	last := len(current.Segments) - 1
-	seg := lineage.NewPrefixedStore(store, current.Segments[last].Dir)
-	incrs := current.Segments[last].Incrementals
-	m, err := lineage.ReadManifestAt(ctx, seg, incrs[len(incrs)-1])
-	if err != nil {
-		t.Fatal(err)
+	// Per link: segment 0's last incremental is refused (shape C) on BOTH
+	// sides and is NOT rewritten; the rewritten segment gains a finding. The
+	// unrelated refusal must neither disable the belt nor be counted by it.
+	unrelated := shortCopyOfLastIncremental(t, store, healthy, 0, "manifests/incr-short-unrelated.json")
+	both := shortCopyOfLastIncremental(t, store, unrelated, last, "manifests/incr-short.json")
+	// The rewritten set: the last segment's incrementals (both versions).
+	rewritten := incrementalIDs(t, store, healthy, short)
+	for _, l := range healthy.Segments[0].Incrementals {
+		m, err := lineage.ReadManifestAt(ctx, lineage.NewPrefixedStore(store, healthy.Segments[0].Dir), l)
+		if err != nil {
+			t.Fatal(err)
+		}
+		delete(rewritten, m.BackupID)
 	}
-	m.EndPosition = pos(999)
-	m.BackupID = irbackup.ComputeBackupID(m)
-	const shortPath = "manifests/incr-short.json"
-	if err := lineage.WriteManifestAt(ctx, seg, shortPath, m); err != nil {
-		t.Fatal(err)
+	if err := verdictChange(ctx, store, unrelated, both, rewritten, nil); codeOf(err) != sluicecode.CodeBackupChainUnreadable {
+		t.Fatalf("a refused link elsewhere disabled the belt: %v", err)
 	}
-	prospective := *current
-	prospective.Segments = append([]lineage.Segment(nil), current.Segments...)
-	prospective.Segments[last].Incrementals = append(append([]string(nil), incrs[:len(incrs)-1]...), shortPath)
-	prospective.Segments[last].EndPosition = pos(999)
-
-	err = refuseVerdictRegression(ctx, store, current, &prospective)
-	if codeOf(err) != sluicecode.CodeBackupChainUnreadable || !strings.Contains(err.Error(), "would be refused by restore") {
-		t.Fatalf("the gate passed a compaction that turns a restorable chain into a refused one: %v", err)
-	}
-	// Other direction: an already-refused chain is not this gate's to refuse.
-	if err := refuseVerdictRegression(ctx, store, &prospective, &prospective); err != nil {
-		t.Fatalf("a chain refused before compaction is not a regression: %v", err)
+	if err := verdictChange(ctx, store, unrelated, unrelated, rewritten, nil); err != nil {
+		t.Fatalf("a refused link the run does not rewrite tripped the belt: %v", err)
 	}
 }

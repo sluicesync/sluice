@@ -1802,6 +1802,7 @@ func (c *BackupCompactCmd) Run(_ *Globals) error {
 		PKStrategy:      backup.PKStrategy(c.CompactionPKStrategy),
 		Signer:          signer,
 		Envelope:        envelope,
+		Comparator:      sourceEngineComparator(ctx, store),
 	})
 	if err != nil {
 		return err

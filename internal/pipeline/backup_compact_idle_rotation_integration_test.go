@@ -489,6 +489,7 @@ func TestADR0087_Bug139_ResumeHeals_WholeChainCompacts_PG(t *testing.T) {
 		MergeWindow:     time.Hour,
 		SmartCompaction: true,
 		PKStrategy:      backup.PKStrategyPK,
+		Comparator:      pgSourceComparator(store),
 	})
 	if err != nil {
 		t.Fatalf("CompactChain after resume heal: %v", err)

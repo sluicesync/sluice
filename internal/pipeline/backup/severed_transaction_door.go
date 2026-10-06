@@ -83,7 +83,14 @@ import (
 //     chain is left as it was and still refused
 //     (TestSmartCompaction_RefusesASeveredFramedIncremental). b953b09d broke
 //     this by closing such a transaction with an empty boundary pair. Collapse
-//     can still move the last-row position (B) compares against.
+//     LOWERS an incremental's last-row position (a collapsed event carries its
+//     chain's first position), which hides (B) — silently, a re-delivered
+//     transaction then applied twice — so smart compaction also refuses a
+//     chain carrying (B) on a link it would rewrite, and compares this door's
+//     findings link by link before and after the rewrite; both need the source
+//     engine's comparator (CompactOpts.Comparator), and without one (B) stays
+//     unjudged there exactly as here
+//     (TestSmartCompaction_RefusesToHideShapeB, TestSmartCompaction_BeltSeesShapeBLost).
 //
 // PREMISES, named per the premise rule (each is what would have to be false
 // for a verdict to be wrong):
@@ -212,6 +219,59 @@ func (d *SeveredTransactionDoor) Check(ctx context.Context, links []lineage.Segm
 // on": shapes A and B the SECOND incremental of the pair (applying it is the
 // duplicate), shape C the link itself (it is the one missing changes).
 func (d *SeveredTransactionDoor) CheckFrom(ctx context.Context, links []lineage.SegmentRecord, from int) error {
+	return d.walk(ctx, links, func(f doorFinding) error {
+		if f.shape == shapeUndecodable {
+			return d.unjudgeable(ctx, f.landing < from, &links[f.link], f.err)
+		}
+		return d.judge(ctx, f.landing < from, f.err)
+	})
+}
+
+// doorShape names what a [doorFinding] is.
+type doorShape string
+
+const (
+	shapeSevered     doorShape = "A"
+	shapeRedelivered doorShape = "B"
+	shapeEndPast     doorShape = "C"
+	shapeUndecodable doorShape = "undecodable"
+)
+
+// doorFinding is one thing the door found, before any caller's policy is
+// applied: link is the incremental it is ABOUT (the first of an A/B pair),
+// pair the second incremental of an A/B pair (-1 otherwise), landing the link
+// whose application the harm lands on.
+type doorFinding struct {
+	shape   doorShape
+	link    int
+	pair    int
+	landing int
+	err     error
+}
+
+// findings returns every finding the door makes on links, undecodable links
+// included, in chain order, with no applied-prefix policy. It is the form
+// `backup compact` uses to compare a chain's verdict before and after a
+// rewrite, LINK BY LINK.
+func (d *SeveredTransactionDoor) findings(ctx context.Context, links []lineage.SegmentRecord) []doorFinding {
+	var out []doorFinding
+	seen := map[string]bool{}
+	_ = d.walk(ctx, links, func(f doorFinding) error {
+		key := fmt.Sprintf("%s/%d/%d", f.shape, f.link, f.pair)
+		if !seen[key] {
+			seen[key] = true
+			out = append(out, f)
+		}
+		return nil
+	})
+	return out
+}
+
+// walk is the door: it visits every incremental, pairs it with the next
+// INCREMENTAL ([nextIncremental]), and hands each finding to emit, stopping at
+// the first error emit returns. The policy — refuse, WARN, skip, collect — is
+// the caller's.
+func (d *SeveredTransactionDoor) walk(ctx context.Context, links []lineage.SegmentRecord, emit func(doorFinding) error) error {
 	for i := range links {
 		if !isIncrementalLink(&links[i]) {
 			continue
@@ -230,20 +290,22 @@ func (d *SeveredTransactionDoor) CheckFrom(ctx context.Context, links []lineage.
 			if j >= 0 {
 				landing = j
 			}
-			if cerr := d.unjudgeable(ctx, landing < from, &links[i], err); cerr != nil {
-				return cerr
+			if eerr := emit(doorFinding{shape: shapeUndecodable, link: i, pair: -1, landing: landing, err: err}); eerr != nil {
+				return eerr
 			}
 			continue
 		}
-		if err := d.judge(ctx, i < from, endPastRecordedError(&links[i], cur)); err != nil {
-			return err
+		if c := endPastRecordedError(&links[i], cur); c != nil {
+			if eerr := emit(doorFinding{shape: shapeEndPast, link: i, pair: -1, landing: i, err: c}); eerr != nil {
+				return eerr
+			}
 		}
 		if j < 0 {
 			continue // the chain's last incremental: nothing follows to re-deliver it
 		}
 		if cur.endsOpen {
-			if err := d.judge(ctx, j < from, severedTailError(&links[i], cur)); err != nil {
-				return err
+			if eerr := emit(doorFinding{shape: shapeSevered, link: i, pair: j, landing: j, err: severedTailError(&links[i], cur)}); eerr != nil {
+				return eerr
 			}
 			continue
 		}
@@ -252,8 +314,8 @@ func (d *SeveredTransactionDoor) CheckFrom(ctx context.Context, links []lineage.
 		}
 		next, err := d.edgesOf(ctx, &links[j])
 		if err != nil {
-			if cerr := d.unjudgeable(ctx, j < from, &links[j], err); cerr != nil {
-				return cerr
+			if eerr := emit(doorFinding{shape: shapeUndecodable, link: j, pair: -1, landing: j, err: err}); eerr != nil {
+				return eerr
 			}
 			continue
 		}
@@ -272,8 +334,8 @@ func (d *SeveredTransactionDoor) CheckFrom(ctx context.Context, links []lineage.
 			continue
 		}
 		if atOrBefore {
-			if err := d.judge(ctx, j < from, redeliveredBoundaryError(&links[i], &links[j], cur, next)); err != nil {
-				return err
+			if eerr := emit(doorFinding{shape: shapeRedelivered, link: i, pair: j, landing: j, err: redeliveredBoundaryError(&links[i], &links[j], cur, next)}); eerr != nil {
+				return eerr
 			}
 		}
 	}
@@ -673,10 +735,22 @@ func endPastRecordedError(link *lineage.SegmentRecord, e incrementalEdges) error
 }
 
 func severedTailError(link *lineage.SegmentRecord, e incrementalEdges) error {
+	// A chain that an OLDER sluice smart-compacted can present this shape
+	// without a severed head: a window that ended on a BARE TxBegin (which this
+	// door passes) came out as that TxBegin followed by collapsed rows from
+	// earlier, committed transactions. Nothing in the chunks tells those rows
+	// from a genuine severed head — a collapsed row can carry the open
+	// transaction's own changes folded into an earlier position — so the door
+	// cannot exempt it without opening a silent pass for the real thing. It
+	// names the possibility instead; the remedy is the same.
+	compacted := ""
+	if link.Segment != nil && link.Segment.CapReason == CompactedCapReason {
+		compacted = ". This incremental sits in a COMPACTED segment: if the chain was smart-compacted by an older sluice and this window ended on a bare transaction begin, the rows after the begin may be collapsed rows from earlier transactions rather than a severed head — the two cannot be told apart from the chain, so the remedy is the same"
+	}
 	return sluicecode.Wrap(sluicecode.CodeBackupChainSeveredTransaction,
 		"take a new full backup (`sluice backup full`) and restore or replay from that chain; this one carries a source transaction in two incrementals and cannot be replayed exactly",
-		fmt.Errorf("incremental %s (%s) ends inside an open source transaction (TxBegin at %+v, no TxCommit) and is not the chain's last link — the next incremental re-delivers that transaction (or, on MySQL file/pos, resumes part-way through it), so replaying both would apply its head twice: a keyless row restored twice, a key-reusing transaction losing rows. Written by a `backup stream` stop or cancel that landed mid-transaction on a sluice before the severed-tail fix (F-E1-SEVERED-TAIL-REPLAY)",
-			lineage.ManifestBackupID(link.Manifest), link.Path, e.openAt))
+		fmt.Errorf("incremental %s (%s) ends inside an open source transaction (TxBegin at %+v, no TxCommit) and is not the chain's last link — the next incremental re-delivers that transaction (or, on MySQL file/pos, resumes part-way through it), so replaying both would apply its head twice: a keyless row restored twice, a key-reusing transaction losing rows. Written by a `backup stream` stop or cancel that landed mid-transaction on a sluice before the severed-tail fix (F-E1-SEVERED-TAIL-REPLAY)%s",
+			lineage.ManifestBackupID(link.Manifest), link.Path, e.openAt, compacted))
 }
 
 func redeliveredBoundaryError(prev, next *lineage.SegmentRecord, p, n incrementalEdges) error {

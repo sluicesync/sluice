@@ -34,7 +34,18 @@ import (
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
+	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
+
+// pgSourceComparator is the Postgres position order the CLI hands
+// `backup compact` for a Postgres-sourced chain (cmd/sluice
+// sourceEngineComparator), so these real chains run smart compaction's
+// shape-(B) gates the way an operator's run does.
+func pgSourceComparator(store irbackup.Store) ir.PositionMonotonicChecker {
+	eng, _ := engines.Get("postgres")
+	return lineage.SameEngineComparator(context.Background(), store, eng)
+}
 
 // TestADR0064_SmartCompaction_CollapsesUpdateChain_PG verifies that
 // a real PG-sourced CDC chain compacts under --smart-compaction
@@ -127,6 +138,7 @@ func TestADR0064_SmartCompaction_CollapsesUpdateChain_PG(t *testing.T) {
 		MergeWindow:     time.Hour,
 		SmartCompaction: true,
 		PKStrategy:      backup.PKStrategyPK,
+		Comparator:      pgSourceComparator(store),
 	})
 	compactWall := time.Since(startCompact)
 
