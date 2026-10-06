@@ -1295,8 +1295,10 @@ func (o *Orchestrator) barrier(ctx context.Context, seq uint64, c ir.Change) err
 // succeeded. There is no claim-before-commit, unlike a mark fence's fold:
 // the coordinator is blocked in this call with the lanes drained and nothing
 // at or above the barrier routed, so no other position writer exists while
-// it runs. On an error nothing is claimed and the run ends, as a barrier
-// error always has; the next run reads the durable position.
+// it runs. On an error the fold persisted nothing, and the run ends, as a
+// barrier error always has — but first see [Orchestrator.barrierFoldFailed]:
+// the checkpoint the fold carried is written on its own, so a failed
+// barrier replays from its transaction's start, as it did before the fold.
 //
 // A kind the engine does not fold (a MySQL-family Truncate) keeps the two
 // commits verbatim: the checkpoint, then the change with a nil checkpoint.
@@ -1314,6 +1316,9 @@ func (o *Orchestrator) applyBarrier(ctx context.Context, c ir.Change) error {
 		return err
 	}
 	if err := o.la.ApplyBarrierChange(ctx, c, at); err != nil {
+		if at != nil {
+			o.barrierFoldFailed(ctx, err)
+		}
 		if o.srcTx.partCommitted {
 			return ir.NoteSourceTxSplit(err)
 		}
@@ -1323,6 +1328,43 @@ func (o *Orchestrator) applyBarrier(ctx context.Context, c ir.Change) error {
 		o.checkpointWritten(ck)
 	}
 	return nil
+}
+
+// barrierFoldFailed persists, in a transaction of its own, the checkpoint a
+// failed barrier fold carried — the write the two-commit order made BEFORE
+// the barrier — so the failed barrier replays from its own transaction's
+// start, not from the previous persisted checkpoint. Without it, a fold that
+// fails would widen every barrier failure's replay to everything since that
+// checkpoint, and a barrier has no in-place retry: a TRANSIENT failure (a
+// Vitess tx-killer, a reparent, an exec timeout) ends the run and the
+// ADR-0038 re-entry replays that whole prefix. Where the prefix's own marks
+// are absent or untrusted (APPLY-MARKS-UNAVAILABLE, VStream COPY rows, a
+// sharded keyspace) its keyless barrier rows re-apply silently, and its
+// unmarked secondary-unique lane changes can stop on amendment C's loud
+// collision. With this write the replay distance is exactly the old one, at
+// no steady-state cost: it runs only after a failure.
+//
+// It is legal for the same reason the fold was: the lanes are drained to the
+// barrier's predecessor, so the anchor vouches only for durable data. It is
+// the ordinary writeCheckpoint — the same nextCheckpoint value, the same
+// bookkeeping on success — and its own failure is logged, not returned: the
+// barrier's error is the run's error.
+//
+// A CANCELLED run (an operator stop, the run's own abort) skips it, by
+// design. A cancelled context cannot write anyway, and detaching from it
+// would turn a stop into one more target write after the stop was asked
+// for. The replay a stop leaves is the same as a kill at the same instant,
+// which §E.5's first row already accepts — and which the two-commit order
+// shared whenever the stop landed before its pre-apply checkpoint committed.
+func (o *Orchestrator) barrierFoldFailed(ctx context.Context, foldErr error) {
+	if ctx.Err() != nil {
+		return
+	}
+	if err := o.writeCheckpoint(ctx); err != nil {
+		slog.WarnContext(ctx, "laneapply: a lane barrier failed and the checkpoint its transaction carried could not be written "+
+			"on its own either; the run will replay from the previous persisted checkpoint (ADR-0190 amendment E)",
+			slog.String("barrier_error", foldErr.Error()), slog.String("checkpoint_error", err.Error()))
+	}
 }
 
 // laneApplyLoop runs one lane (ADR-0104 graduation): it reads a batch of

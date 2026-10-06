@@ -461,9 +461,10 @@ func (t *Tracker) CloseTxs(txIDs []string) {
 // after the persisted position. The serial and per-change paths write the
 // position at every transaction's commit, in the same target transaction as
 // the commit's mark deletion, so their marks never outlive the one
-// transaction in flight; the lane barrier writes marks only after its
-// pre-barrier checkpoint has persisted the position up to the barrier's own
-// transaction; and a lane writes a transaction's marks only once the
+// transaction in flight; the lane barrier writes marks only with (or, for a
+// kind it does not fold, after) its pre-barrier checkpoint persisting the
+// position at the barrier's own transaction's start (ADR-0190 amendment E);
+// and a lane writes a transaction's marks only once the
 // coordinator's mark fence has done the same for it ([LaneFence], ADR-0190
 // amendment A) — and the next transaction's fence moves the position past it,
 // deleting them. So at the first close, every loaded mark is either that
@@ -473,14 +474,36 @@ func (t *Tracker) CloseTxs(txIDs []string) {
 // external position write). Stale marks are harmless to the skip rule (a
 // TxID never recurs) but would otherwise live forever. Callers hold t.mu and
 // have checked the tracker is enabled, so its maps exist (see Disable).
+//
+// The sweep never closes a transaction this run has already decided a change
+// for and not yet closed (t.open). "Every loaded mark is that transaction's or
+// stale" is only true when the first close passes the run's first re-delivered
+// transaction. On the lane path it need not: when another transaction is
+// delivered first (the APPLY-MARK-UNTRUSTED path, expected on a sharded
+// VStream source), a loaded mark can name a transaction T that is being
+// re-delivered right now, and the run's first close can be a fold — a lane
+// barrier's (ADR-0190 amendment E) or a mark fence's (amendment D) — inside
+// T's own target transaction. Closing T there would make that transaction's
+// gc plan drop T's NEW pending marks and delete its old ones in the same
+// commit that applies T's changes: a crash before a later checkpoint passes T
+// then re-applies T unmarked (a silent keyless duplicate). An open
+// transaction is not stale — it was re-delivered — and a later position write
+// that passes it closes it explicitly (CloseTxs from a checkpoint, or
+// CloseOpen at its commit); its loaded marks stay dirty, so that write
+// deletes them. The serial paths are unaffected: CloseOpen empties t.open
+// into t.closed before it sweeps, so their first close still passes every
+// loaded mark at once. Pinned by TestTracker_SweepSparesAnOpenTransaction and
+// TestLaneBarrier_UntrustedReloadFoldKeepsOwnMark (both engines).
 func (t *Tracker) sweepLocked() {
 	if t.swept {
 		return
 	}
 	t.swept = true
 	for _, m := range t.loaded {
+		if t.open[m.TxID] {
+			continue
+		}
 		t.closed[m.TxID] = true
-		delete(t.open, m.TxID)
 	}
 }
 

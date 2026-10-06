@@ -267,27 +267,45 @@ func TestOrchestrator_DeclinedBarrierKeepsTwoCommits(t *testing.T) {
 
 // failingBarrierSeam is fenceSeam whose ApplyBarrierChange fails whenever it
 // is handed a checkpoint to fold: the barrier's transaction rolled back.
+// cancel, when set, is called first — the run was stopped while the barrier
+// ran.
 type failingBarrierSeam struct {
 	fenceSeam
+	cancel context.CancelFunc
 }
 
 var errBarrierRolledBack = errors.New("barrier transaction rolled back")
 
 func (s *failingBarrierSeam) ApplyBarrierChange(ctx context.Context, c ir.Change, at *BarrierCheckpoint) error {
 	if at != nil {
+		if s.cancel != nil {
+			s.cancel()
+		}
 		return errBarrierRolledBack
 	}
 	return s.fenceSeam.ApplyBarrierChange(ctx, c, at)
 }
 
-// TestOrchestrator_BarrierFoldFailureClaimsNothing pins that the coordinator
-// advances its persisted-checkpoint bookkeeping only after the barrier's
-// transaction committed: a failed fold leaves lastWrittenSeq, lastWrittenCum
-// and the unclosed transactions exactly as they were, and the run fails with
-// the barrier's error — so nothing the engine rolled back is ever treated as
-// written (no later checkpoint skips the boundary, under-counts rows_applied
-// or forgets to delete tx1's marks). The reverse direction is the same stream
-// succeeding, which advances all three.
+// TestOrchestrator_BarrierFoldFailureClaimsNothing pins what the coordinator
+// does when a barrier's fold fails (ADR-0190 amendment E; review F1).
+//
+// The fold itself never counts as written: the coordinator claims nothing
+// before the barrier's transaction commits, so a failed fold can never make a
+// later checkpoint skip its boundary, under-count rows_applied, or forget to
+// delete tx1's marks.
+//
+// The run is not cancelled (a transient failure: a tx-killer, a reparent, an
+// exec timeout). The checkpoint the fold carried is then written on its own,
+// through WriteCheckpoint, before the run fails with the barrier's error. The
+// failed barrier therefore replays from its transaction's start, as it did
+// before the fold, not from the previous persisted checkpoint. Its
+// bookkeeping is that ordinary write's.
+//
+// The run is cancelled (a stop). Nothing is written, and the bookkeeping is
+// untouched: the replay is a kill's at the same instant.
+//
+// The reverse direction is the same stream succeeding: the fold advances
+// all three.
 func TestOrchestrator_BarrierFoldFailureClaimsNothing(t *testing.T) {
 	tok := barrierFoldTok
 	stream := []ir.Change{
@@ -297,27 +315,49 @@ func TestOrchestrator_BarrierFoldFailureClaimsNothing(t *testing.T) {
 		ir.TxBegin{Position: tok("c1")},
 		ir.Insert{Position: tok("r2"), Schema: "ks", Table: "k", Row: ir.Row{"v": "x"}, ApplyID: ir.ApplyID{TxID: "tx2", Seq: 1}},
 	}
-	run := func(seam LaneApplier) (*Orchestrator, error) {
+	run := func(ctx context.Context, seam LaneApplier) (*Orchestrator, error) {
 		o := NewOrchestrator(Config{Lanes: 2, MaxBatchSize: 8}, seam)
 		ch := make(chan ir.Change, len(stream))
 		for _, c := range stream {
 			ch <- c
 		}
 		close(ch)
-		err := o.Run(context.Background(), ch)
+		err := o.Run(ctx, ch)
 		return o, err
 	}
 
-	o, err := run(&failingBarrierSeam{})
+	// A transient failure: the fold's checkpoint is written on its own.
+	transient := &failingBarrierSeam{}
+	o, err := run(context.Background(), transient)
 	if !errors.Is(err, errBarrierRolledBack) {
-		t.Fatalf("Run = %v; want the barrier's error", err)
+		t.Fatalf("transient: Run = %v; want the barrier's error", err)
+	}
+	if ck := transient.eventsWith("ckpt:"); !slices.Equal(ck, []string{"ckpt:c1"}) {
+		t.Errorf("transient: checkpoints %v; want [ckpt:c1] — the failed barrier's transaction start, written on its own so the "+
+			"replay starts there and not at the previous persisted checkpoint", ck)
+	}
+	if o.lastWrittenSeq == 0 || o.lastWrittenCum != 1 || len(o.closedTx) != 0 {
+		t.Errorf("transient: lastWrittenSeq=%d lastWrittenCum=%d closedTx=%v; want the c1 boundary, 1 and none — the bookkeeping of "+
+			"the checkpoint written after the failure", o.lastWrittenSeq, o.lastWrittenCum, o.closedTx)
+	}
+
+	// A cancelled run: nothing is written, nothing is claimed.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stopped := &failingBarrierSeam{cancel: cancel}
+	o, err = run(ctx, stopped)
+	if !errors.Is(err, errBarrierRolledBack) && !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled: Run = %v; want the barrier's error or the cancellation", err)
+	}
+	if ck := stopped.eventsWith("ckpt:"); len(ck) != 0 {
+		t.Errorf("cancelled: checkpoints %v; a stopped run writes nothing after the stop", ck)
 	}
 	if o.lastWrittenSeq != 0 || o.lastWrittenCum != 0 || len(o.closedTx) != 1 {
-		t.Errorf("after a failed fold: lastWrittenSeq=%d lastWrittenCum=%d closedTx=%v; want 0, 0 and tx1 still unclosed — "+
+		t.Errorf("cancelled: lastWrittenSeq=%d lastWrittenCum=%d closedTx=%v; want 0, 0 and tx1 still unclosed — "+
 			"the coordinator claimed a checkpoint the barrier's rollback discarded", o.lastWrittenSeq, o.lastWrittenCum, o.closedTx)
 	}
 
-	o, err = run(&fenceSeam{})
+	o, err = run(context.Background(), &fenceSeam{})
 	if err != nil {
 		t.Fatalf("Run (success): %v", err)
 	}

@@ -33,6 +33,27 @@ var laneTxBody = map[string]string{
 	"laneApplierAdapter.ApplyBarrierChange": "ChangeApplier.applyOneImpl",
 }
 
+// checkLaneTxBodies: see the Postgres twin. Each laneTxBody binding must name
+// a function that exists, that its lane method reaches, and that opens the
+// transaction itself (BeginTx).
+func checkLaneTxBodies(t *testing.T, funcs map[string]*applyorder.Func) {
+	t.Helper()
+	for key, body := range laneTxBody {
+		f := funcs[body]
+		if f == nil {
+			t.Fatalf("laneTxBody names %s as %s's transaction, and no such function exists — stale", body, key)
+		}
+		bare := body[strings.LastIndex(body, ".")+1:]
+		if !applyorder.Reaching(funcs, []string{bare})[key] {
+			t.Errorf("laneTxBody binds %s to %s, which %s no longer reaches — stale", key, body, key)
+		}
+		if !f.Calls["BeginTx"] {
+			t.Errorf("laneTxBody binds %s to %s, which opens no transaction (no BeginTx) — the roster would grade the "+
+				"wrong function", key, body)
+		}
+	}
+}
+
 // laneBody returns the [applyorder.Func] that owns key's transaction.
 func laneBody(funcs map[string]*applyorder.Func, key string) *applyorder.Func {
 	if body, ok := laneTxBody[key]; ok {
@@ -88,11 +109,7 @@ func TestLanePositionWriterRoster(t *testing.T) {
 		t.Fatalf("found %v lane position writers; want at least one checkpoint, one fold writer and the barrier fold — "+
 			"the walk is not finding them", kinds)
 	}
-	for key, body := range laneTxBody {
-		if funcs[body] == nil {
-			t.Fatalf("laneTxBody names %s as %s's transaction, and no such function exists — stale", body, key)
-		}
-	}
+	checkLaneTxBodies(t, funcs)
 	var hooks []string
 	for callee := range laneBody(funcs, "laneApplierAdapter.WriteCheckpoint").Calls {
 		if postCommitHook.MatchString(callee) {

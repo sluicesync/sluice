@@ -280,3 +280,64 @@ func TestLaneBarrier_SkippedBarrierStillPersistsItsCheckpoint(t *testing.T) {
 		}
 	}
 }
+
+// TestLaneBarrier_UntrustedReloadFoldKeepsOwnMark pins the restart sweep
+// against a barrier fold that is the run's first close (review of ADR-0190
+// amendment E, F2; the reviewer's repro). Run 1 applied barrier B with its
+// mark, then crashed before a checkpoint passed B's transaction. Run 2
+// reloads the marks, and another transaction is delivered first, so B's
+// loaded mark is untrusted (APPLY-MARK-UNTRUSTED: expected on a sharded
+// VStream source) and B re-applies. B's fold closes that other transaction:
+// the run's first close. B's NEW mark must be durable after the fold commits,
+// exactly as it was with the two-commit order (the control arm), or a crash
+// before a later checkpoint passes B re-applies it unmarked — a silent third
+// copy. The second copy is pre-existing (the untrusted re-apply) and is
+// asserted as the baseline both arms share.
+func TestLaneBarrier_UntrustedReloadFoldKeepsOwnMark(t *testing.T) {
+	dsn, cleanup := startPostgresForApplier(t)
+	defer cleanup()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	barrier := ir.Insert{Schema: "public", Table: "bf_keyless", Row: ir.Row{"v": "x"}, ApplyID: ir.ApplyID{TxID: "bf-tx", Seq: 1}}
+	other := ir.Insert{Schema: "public", Table: "bf_keyless", Row: ir.Row{"v": "o"}, ApplyID: ir.ApplyID{TxID: "other-tx", Seq: 1}}
+	for _, fold := range []bool{false, true} {
+		f := newBarrierFoldFixture(ctx, t, dsn, "")
+		if _, err := f.db.ExecContext(ctx, `DELETE FROM sluice_cdc_apply_marks`); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.a.startApplyMarks(ctx, testStreamID); err != nil { // run 1
+			t.Fatal(err)
+		}
+		if err := f.la.ApplyBarrierChange(ctx, barrier, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.a.startApplyMarks(ctx, testStreamID); err != nil { // run 2: reload
+			t.Fatal(err)
+		}
+		if err := f.la.ApplyBarrierChange(ctx, other, nil); err != nil { // delivered first
+			t.Fatal(err)
+		}
+		at := laneapply.BarrierCheckpoint{Pos: f.pos(1), RowsApplied: 1, ClosedTxs: []string{"other-tx"}}
+		if fold {
+			if err := f.la.ApplyBarrierChange(ctx, barrier, &at); err != nil {
+				t.Fatal(err)
+			}
+		} else {
+			if err := f.la.WriteCheckpoint(ctx, at.Pos, at.RowsApplied, at.ClosedTxs); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.la.ApplyBarrierChange(ctx, barrier, nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+		pos, _, marks := f.state(ctx, t)
+		copies := f.probe(ctx, t, `SELECT COUNT(*)::text FROM bf_keyless WHERE v = 'x'`)
+		if copies != "2" {
+			t.Fatalf("fold=%v: %s copies of the barrier's row; the untrusted re-apply baseline is 2 — the scenario was not built", fold, copies)
+		}
+		if pos != f.pos(1).Token || marks["other-tx"] != 0 || marks["bf-tx"] != 1 {
+			t.Errorf("fold=%v: position %s (want %s), marks %v; want bf-tx:1 (the re-applied barrier's own mark) and other-tx gone "+
+				"— without B's mark a crash before a checkpoint passes it re-applies B a third time, silently", fold, pos, f.pos(1).Token, marks)
+		}
+	}
+}

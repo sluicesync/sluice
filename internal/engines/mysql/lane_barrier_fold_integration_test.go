@@ -304,3 +304,56 @@ func TestLaneBarrier_SkippedBarrierStillPersistsItsCheckpoint(t *testing.T) {
 		}
 	}
 }
+
+// TestLaneBarrier_UntrustedReloadFoldKeepsOwnMark is the Postgres pin's
+// MySQL twin (review of ADR-0190 amendment E, F2): a barrier re-applied
+// after its loaded mark proved untrusted, folding the run's first close,
+// keeps its own new mark — as the two-commit order (the control arm) does.
+func TestLaneBarrier_UntrustedReloadFoldKeepsOwnMark(t *testing.T) {
+	dsn, cleanup := startMySQLForApplier(t)
+	defer cleanup()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	barrier := ir.Insert{Schema: "target_db", Table: "bf_keyless", Row: ir.Row{"v": "x"}, ApplyID: ir.ApplyID{TxID: "bf-tx", Seq: 1}}
+	other := ir.Insert{Schema: "target_db", Table: "bf_keyless", Row: ir.Row{"v": "o"}, ApplyID: ir.ApplyID{TxID: "other-tx", Seq: 1}}
+	for _, fold := range []bool{false, true} {
+		f := newBarrierFoldFixture(ctx, t, dsn, "")
+		if _, err := f.db.ExecContext(ctx, `DELETE FROM sluice_cdc_apply_marks`); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.a.startApplyMarks(ctx, testStreamID); err != nil { // run 1
+			t.Fatal(err)
+		}
+		if err := f.la.ApplyBarrierChange(ctx, barrier, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.a.startApplyMarks(ctx, testStreamID); err != nil { // run 2: reload
+			t.Fatal(err)
+		}
+		if err := f.la.ApplyBarrierChange(ctx, other, nil); err != nil { // delivered first
+			t.Fatal(err)
+		}
+		at := laneapply.BarrierCheckpoint{Pos: f.pos(1), RowsApplied: 1, ClosedTxs: []string{"other-tx"}}
+		if fold {
+			if err := f.la.ApplyBarrierChange(ctx, barrier, &at); err != nil {
+				t.Fatal(err)
+			}
+		} else {
+			if err := f.la.WriteCheckpoint(ctx, at.Pos, at.RowsApplied, at.ClosedTxs); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.la.ApplyBarrierChange(ctx, barrier, nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+		pos, _, marks := f.state(ctx, t)
+		copies := f.probe(ctx, t, `SELECT CAST(COUNT(*) AS CHAR) FROM bf_keyless WHERE v = 'x'`)
+		if copies != "2" {
+			t.Fatalf("fold=%v: %s copies of the barrier's row; the untrusted re-apply baseline is 2 — the scenario was not built", fold, copies)
+		}
+		if pos != f.pos(1).Token || marks["other-tx"] != 0 || marks["bf-tx"] != 1 {
+			t.Errorf("fold=%v: position %s (want %s), marks %v; want bf-tx:1 (the re-applied barrier's own mark) and other-tx gone "+
+				"— without B's mark a crash before a checkpoint passes it re-applies B a third time, silently", fold, pos, f.pos(1).Token, marks)
+		}
+	}
+}
