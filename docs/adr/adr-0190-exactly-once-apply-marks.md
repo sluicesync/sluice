@@ -1,6 +1,6 @@
 # ADR-0190: Exactly-once apply marks — a restart skips the changes of an interrupted source transaction that already reached the target
 
-- **Status:** Accepted 2026-09-28 (operator answered the open questions — see "Operator decisions" below); proposed 2026-09-26 as DESIGN ONLY. Operator decision on GC-38 (l) (option (a) chosen over (b) net-effect replay and (c) transaction-aligned apply; see §"Alternatives considered"). Phases 1–5 implemented and SHIPPED in v0.156.5 together with amendments A–C (phases 4–5 diverge from §1 where the implementation-status notes say so) — see "Implementation status" below. Two AMENDMENTS, operator-approved 2026-09-28, supersede §3 where they differ: (A) a lane writes a transaction's marks only after a checkpoint-before-mark fence, and (B) the restart sweep rests on an invariant rather than on timing — see "Amendments", which also records the pre-land review's Finding 1 (that invariant was false on the serial batched path; fixed, and now checked at runtime). AMENDMENT C (operator, 2026-09-29): the LANES' marks — and amendment A's fence — are opt-in (`sync start --exactly-once-lanes`) after a benchmark measured the fence ~99.9% slower on secondary-unique-heavy work; the serial paths and the lane barrier keep their marks by default, and a drain no longer waits out the lanes' idle grace. AMENDMENT D (proposed 2026-09-30; ACCEPTED and IMPLEMENTED 2026-10-01; ships in v0.156.8): the fence's checkpoint rides the marked lane batch's own transaction. It is sound only with the drain kept and an "anchored" rule on the other lanes, and fix #3 (the per-key fence) is found incompatible with amendment A. `--exactly-once-lanes` stays opt-in. See "Amendment D", whose §D.9 records the re-validation against v0.156.7, the divergences, and the measurement. AMENDMENT E (proposed 2026-10-04; design ACCEPTED by the operator the same day, §E.13, no code yet, sequenced behind the F-E1 broker fix; D-S1 / perf-parity GAP #48): the lane barrier's pre-apply checkpoint rides the barrier's own transaction for every barrier kind that runs as one target transaction (all but a MySQL-family `Truncate`), default-on with no flag; no delivery guarantee changes. Operator answers recorded in §E.13.
+- **Status:** Accepted 2026-09-28 (operator answered the open questions — see "Operator decisions" below); proposed 2026-09-26 as DESIGN ONLY. Operator decision on GC-38 (l) (option (a) chosen over (b) net-effect replay and (c) transaction-aligned apply; see §"Alternatives considered"). Phases 1–5 implemented and SHIPPED in v0.156.5 together with amendments A–C (phases 4–5 diverge from §1 where the implementation-status notes say so) — see "Implementation status" below. Two AMENDMENTS, operator-approved 2026-09-28, supersede §3 where they differ: (A) a lane writes a transaction's marks only after a checkpoint-before-mark fence, and (B) the restart sweep rests on an invariant rather than on timing — see "Amendments", which also records the pre-land review's Finding 1 (that invariant was false on the serial batched path; fixed, and now checked at runtime). AMENDMENT C (operator, 2026-09-29): the LANES' marks — and amendment A's fence — are opt-in (`sync start --exactly-once-lanes`) after a benchmark measured the fence ~99.9% slower on secondary-unique-heavy work; the serial paths and the lane barrier keep their marks by default, and a drain no longer waits out the lanes' idle grace. AMENDMENT D (proposed 2026-09-30; ACCEPTED and IMPLEMENTED 2026-10-01; ships in v0.156.8): the fence's checkpoint rides the marked lane batch's own transaction. It is sound only with the drain kept and an "anchored" rule on the other lanes, and fix #3 (the per-key fence) is found incompatible with amendment A. `--exactly-once-lanes` stays opt-in. See "Amendment D", whose §D.9 records the re-validation against v0.156.7, the divergences, and the measurement. AMENDMENT E (proposed 2026-10-04; design ACCEPTED by the operator the same day, §E.13; IMPLEMENTED 2026-10-06 after the F-E1 broker fix, §E.14; D-S1 / perf-parity GAP #48): the lane barrier's pre-apply checkpoint rides the barrier's own transaction for every barrier kind that runs as one target transaction (all but a MySQL-family `Truncate`), default-on with no flag; no delivery guarantee changes. Operator answers recorded in §E.13.
 - **Date:** 2026-09-26
 - **Related:** [ADR-0007](adr-0007-position-persistence.md) (position written in the batch's own transaction); [ADR-0010](adr-0010-idempotent-applier.md) (idempotent UPSERT apply, the assumption this ADR finds is not enough); [ADR-0027](adr-0027-source-transaction-boundary-cdc-batching.md) (source-transaction cohesion on the serial batched path); [ADR-0089](adr-0089-default-adaptive-apply-batch-size.md) (its keyless guard: keyless tables are at-least-once); [ADR-0104](adr-0104-mysql-pipelined-cdc-apply.md) / [ADR-0105](adr-0105-postgres-concurrent-cdc-apply.md) (the lane path and its position relaxation); audit backlog GC-38 (l) (the measurement); `internal/pipeline/streamer_crash_midtxn_integration_test.go` (the gate: every apply path converges after a kill mid-transaction — the lanes' secondary-unique changes only with `--exactly-once-lanes`, amendment C).
 
@@ -537,9 +537,9 @@ D-F1 was largely overtaken by GC-41 (c): under a vtgate MULTI sidecar a torn com
 | G3 | `ExactlyOnceLanes: true` composite literal planted in `broker.go` | `TestReplayPathsNeverFold`: "writes the --exactly-once-lanes switch (ExactlyOnceLanes:)" | new reach |
 | G4 | an `ApplyID` mention planted in `blobcodec/backup_change_chunk.go` | `TestReplayPathsNeverFold`: "on a replay path, mentions ApplyID" | new reach |
 
-### Amendment E (proposed and design-accepted 2026-10-04, not yet implemented): the barrier's pre-apply checkpoint rides the barrier's own transaction (D-S1, perf-parity GAP #48)
+### Amendment E (proposed and design-accepted 2026-10-04; implemented 2026-10-06): the barrier's pre-apply checkpoint rides the barrier's own transaction (D-S1, perf-parity GAP #48)
 
-**Status: design ACCEPTED (operator answered the open questions on 2026-10-04, §E.13); no code written yet. Sequenced behind the F-E1 broker fix (E-Q5), and lands default-on only after §E.9 and §E.10 pass (E-Q1).** Proposed 2026-10-04 as design only. Written against `14106b4f` (v0.156.10 + Bug 296). It changes the lane BARRIER's position mechanics only. Amendment A's invariant, amendment B's sweep and its runtime check, amendment C's opt-in and amendment D's fold all stand unchanged. Operator decision D-Q3 asked for D-S1 as a separate follow-up; this is it.
+**Status: design ACCEPTED (operator answered the open questions on 2026-10-04, §E.13); IMPLEMENTED 2026-10-06 on `ec5effd2`, after the F-E1 broker fix (E-Q5), default-on with no flag (E-Q1). §E.9 D acceptance met and §E.10 pins built and mutation-run — see §E.14. CI `-race` Integration must be green before it is tagged.** Proposed 2026-10-04 as design only. Written against `14106b4f` (v0.156.10 + Bug 296). It changes the lane BARRIER's position mechanics only. Amendment A's invariant, amendment B's sweep and its runtime check, amendment C's opt-in and amendment D's fold all stand unchanged. Operator decision D-Q3 asked for D-S1 as a separate follow-up; this is it.
 
 **Verdict.** Fold the barrier's pre-apply checkpoint (the position `writeCheckpoint` persists after the barrier's drain) into the barrier's own target transaction, written LAST, for every barrier kind whose `ApplyBarrierChange` runs as one real target transaction: keyless, absent-target and malformed row changes, primary-key-changing updates, and `SchemaSnapshot` on both engines, plus `Truncate` on Postgres. Keep today's two commits for a MySQL-family `Truncate`, which implicitly commits. It is amendment D's argument with the hard parts removed. The barrier runs synchronously on the coordinator after a full drain, so it is the only position writer while it runs: there is no claim-before-commit, no anchored rule and no second connection. It changes no delivery guarantee. The barrier is exactly-once today wherever it writes marks, and at-least-once wherever it does not, and both stay true (§E.5). What changes is that one synchronous commit per barrier-bearing source transaction disappears.
 
@@ -794,6 +794,125 @@ The questions as put:
 - **E-Q4. Live checks.** The vtgate MULTI tear (P10) runs on vttestserver: free, CI-able, no live PlanetScale needed. The Neki cross-shard-group atomicity premise (`postgres/apply_marks.go:20`) stays **UNVERIFIED**, and only a billable Neki branch can test it. Recommendation: do not gate this amendment on it, because the fold's position is tear-safe in both orders (§E.6) and its marks add no exposure beyond today's. Record it against the standing Neki Tier-3 pass instead.
 - **E-Q5. F-E1 (broker keyless duplicates).** File it as its own item now (refuse-or-mark), independent of this amendment. Recommendation: refuse keyless tables on the broker first (small, loud), with marks for the broker as decision 4's separate ADR.
 - **E-Q6. The `TestReplayPathsNeverFold` rename** (§E.10): rename, or a doc line? Recommendation: rename.
+
+#### E.14 Implementation (2026-10-06)
+
+Built on `ec5effd2` (after the F-E1 broker fix, as E-Q5 sequenced it). Every §E.4 point was re-checked against that code first; the design held as written, and the places the code made it take a particular shape are listed under divergences.
+
+**What was built.** `laneapply`: `BarrierCheckpoint`, `FoldsBarrierCheckpoint` and the `at` parameter on `LaneApplier`, `BarrierFoldNotTransactionalMarker` (`BARRIER-FOLD-NOT-TRANSACTIONAL`) with `BarrierFoldNotTransactional`, and `Orchestrator.applyBarrier`: after `barrier`'s drain it either computes `at` with `nextCheckpoint` (the same function `writeCheckpoint` uses; `nil` for §E.4's cases (a) and (b)) and calls `checkpointWritten` only after the call returned nil, or, for a declined kind, runs the two-commit sequence verbatim. The interface docs were rewritten (F-E2). Engines: `applyOneImpl`'s `writePosition bool` became a three-way `positionWrite` (`noPosition`, `ownPosition`, `foldedCheckpoint(at)`), so the per-change path's own-token write cannot be reached with a folded checkpoint by construction (§E.4's three defects). The checkpoint's body is `writeCheckpointTx` — `CloseTxs(at.ClosedTxs)`, `Plan(pending, gc=true)`, the marks, the skip-ledger flush, then the position LAST — shared by `WriteCheckpoint` (through `commitCheckpoint`), the barrier fold (inside the barrier's own transaction, after its data) and the skip path (`commitCheckpoint` again). MySQL answers `FoldsBarrierCheckpoint = !Truncate` and refuses a `Truncate` handed a checkpoint before writing anything; Postgres answers `true`.
+
+**Divergences and shapes the code chose, flagged:**
+
+- **`WriteCheckpoint`'s skip-ledger flush moved inside its transaction**, after the marks and before the position (the §E.4 order, and where `applyOneImpl`'s own-position branch already flushed). It is still its own autocommit on the primary pool, still durable before the position commits (H-4). On MySQL it now also runs under the checkpoint's exec-timeout context.
+- **The own-position branch was factored out** as `writeOwnPositionTx`, so `applyOneImpl` reads as data → marks/position → COMMIT. The GC-41 rosters were reclassified to match: `writeCheckpointTx` and `writeOwnPositionTx` are `control` writers and helpers in `TestWriteCoreRoster_*`; `applyBarrier` and `commitCheckpoint` are helpers; `applyBarrierNoPosition` is gone. `TestPositionWritersFlushTheSkipLedger` now grades the two new bodies instead of `applyOneImpl` and `WriteCheckpoint`.
+- **`TestLanePositionWriterRoster` had to rebind the CHECKPOINT too, not only the barrier.** §E.8 asked that the barrier's checks bind to the function that opens and commits its transaction; `WriteCheckpoint` became a one-line adapter in the same change, so its checks would have graded nothing as well. Both now go through `laneTxBody` (`WriteCheckpoint` → `commitCheckpoint`, `ApplyBarrierChange` → `applyOneImpl`), with a stale-entry check. The barrier is the new class `barrier-fold`, with a floor.
+- **A test seam**, `barrierFoldCommitHookForTest` on each `ChangeApplier` (nil in production), fails the barrier's transaction after its position is written: P7's failure arm.
+- **P9's `ClosedTxs` half is unreachable, so it is not built.** A barrier the marks skip is always the run's trusted FIRST transaction (amendment B), so the only boundary a run can have recorded before it is a GC-41 (j) keepalive, which closes nothing. P9 therefore folds a checkpoint with no `ClosedTxs` (and a non-zero `RowsApplied`, to grade the contract rather than the keepalive). The `ClosedTxs` deletes on the commit path are P7's. The same fact is why the restart sweep cannot delete a skipped barrier's own loaded mark: `CloseTxs` returns before the sweep on an empty list. That is pinned only by these two tests passing, not by a test of its own.
+- **P7's absent-table row grades the skip ledger as NOT in the transaction.** The flush is its own autocommit, so the failed arm has already counted the skip once and the replay counts it again: the over-count §E.8 accepts, written into the row so it cannot read as atomicity.
+- **P12 is made deterministic with a held lane row.** The first cut lost a `select` race: once T−1's barrier returned, the coordinator's idle tick and T's first change were both ready, and when the tick won it persisted T's start itself, leaving T's barrier nothing to fold (and a mutant restoring the old order writes the same position). It was seen on the postgres-trigger pairs. T−1 now also updates a `po` row the cell holds with a target lock and releases after T is queued, so T's drain and fold run inside one `handle` call. On the marker-less trigger sources T−1's barrier is its own transaction, so an idle tick can still persist it first. There the cell accepts exactly that outcome (position = T−1's own ordinal, logged as ungraded) and refuses anything past it. The fold is graded on the six marker pairs.
+- **The P5 model's barrier rows carry a position past their transaction's start** (`c<n>`), standing in for the mid-transaction own position no write may persist. That is how M-E2 shows up there.
+- **`TestReplayPathsNeverFold` → `TestReplayPathsNeverFoldAMarkFence`**, with its scope stated in the doc (E-Q6).
+
+**Pins (§E.10).**
+- **Unit (`internal/laneapply`):**
+  - P1 `TestOrchestrator_BarrierIssuesNoSynchronousCheckpoint`;
+  - P2 `TestOrchestrator_BarrierFoldAnchorsAtTransactionStart`: marker, keepalive, marker-less, first-transaction, anchor-written, lane-fold-claimed, and `SchemaSnapshot`, plus the Bug 158 `recordingSeam`;
+  - P3 `TestOrchestrator_DeclinedBarrierKeepsTwoCommits`;
+  - P4 `TestOrchestrator_BarrierFoldFailureClaimsNothing`;
+  - P5 `modelSeam` barriers in `TestOrchestrator_PositionWritesTotallyOrdered`, flag on and off, with a barrier-fold floor;
+  - P6 the `countingSeam` fold arm of `TestOrchestrator_RowsApplied_ExactUnderLaneApply`, whose stream gained a mid-transaction keyless barrier;
+  - `TestOrchestrator_BarrierAndFoldInOneTransaction`'s barrier-first arm, updated as §E.10 says.
+- **Engines (real servers):**
+  - P7 `TestLaneBarrier_FoldIsOneTransaction`: every IN kind on both engines; the Postgres `Truncate` row binds the transactional-TRUNCATE premise to `FoldsBarrierCheckpoint`;
+  - P8 `TestLaneBarrier_MySQLTruncateDeclines`;
+  - P9 `TestLaneBarrier_SkippedBarrierStillPersistsItsCheckpoint`, both engines;
+  - P10 `TestVStream_ControlKeyspaceTornCommit_BarrierFoldStaysBehindData` (vttestserver, `vstream` tag);
+  - P14 `TestWriteCoreStatementOrder`'s new `lane barrier folds` run on both engines (every folded kind, position LAST, a per-run position-carrying-transaction floor), `TestLanePositionWriterRoster` and `TestWriteCoreRoster_*`.
+- **Pipeline:**
+  - P11 `TestBroker_BarrierFoldKeepsTheParentToken`;
+  - P12 and P13: the `barrier_fold_blocked` / `barrier_fold_landed` cells in `runCrashMidTxnSuite`, registered on every pair.
+
+**Real-server runs (2026-10-06, Docker).**
+- **Both engine packages:** `TestLaneBarrier_*` and `TestWriteCoreStatementOrder`.
+- **vttestserver:** both `TestVStream_ControlKeyspaceTornCommit_*`.
+- **Pipeline:** `TestBroker_BarrierFoldKeepsTheParentToken`, and the two new crash cells on all eight non-VStream pairs — MySQL GTID → {Postgres, MySQL}, MariaDB → Postgres, MySQL file/pos → Postgres, Postgres → {Postgres, MySQL}, postgres-trigger → {Postgres, MySQL}. All green.
+- **Every pre-existing cell §E.10 names was re-run:** the whole `TestStreamer_CrashMidTxn_*` suite on the eight non-VStream pairs and `TestStreamer_CrashMidTxn_VStream_{ToPostgres,ToMySQL}`; the full Postgres, MySQL (and `vstream`-tagged), `laneapply` and `applymarks` integration packages; and the pipeline's broker, chain-restore and lane tests. All green, after one rerun of `TestSnapshotStream_NoGapNoOverlap` (a source-side test whose container connection timed out, then passed).
+
+**Measured (fencebench, 2026-10-06).**
+- **Set-up:** `benchmarks/fencebench/`, the §E.9 recipe, three reps, medians of source transactions/s.
+- **Arms:** `base` is `ec5effd2`, the commit this change sits on (not `14106b4f`: it isolates this change from v0.156.11's F-E1 work). `bfold` is this change. Both are built from source with the same toolchain.
+- **Verification:** every one of the 108 cells ended `VERIFY OK`.
+- **Gate:** D at 0 ms gates; D at 5 ms is reported.
+
+| Pair | Workload | base serial | base lanes | **bfold lanes** | bfold ÷ base lanes | bfold ÷ base serial | bfold serial |
+|---|---|---|---|---|---|---|---|
+| MySQL → PG | D | 232.6 | 103.4 | **134.5** (132.6–135.4) | **1.30** | **0.58** | 232.4 |
+| PG → PG | D | 238.1 | 105.2 | **135.3** (134.5–136.3) | **1.29** | **0.57** | 238.1 |
+| MySQL → MySQL | D | 77.5 | 35.4 | **48.9** (48.2–49.2) | **1.38** | **0.63** | 77.2 |
+| MySQL → PG, 5 ms | D | 27.1 | 12.4 | **14.8** (14.7–14.9) | 1.19 | 0.55 | 27.1 |
+
+**Against §E.9's acceptance:**
+- **D: met on all three 0 ms pairs** (≥ 1.25× base lanes and ≥ 0.55× base serial). The model's 1.35–1.45× / 0.55–0.65× held for MySQL → MySQL; the two Postgres-target pairs came in just under the model's lower end on the first ratio. At 5 ms the drain's lane commits dominate, as §E.9 expected.
+- **The serial arms** are within 2% of base on every pair and workload.
+- **A and C on MySQL → PG:**
+
+  | Arm | A base | A bfold | C base | C bfold |
+  |---|---|---|---|---|
+  | eol | 201.3 | 203.7 | 590.4 | 572.2 (one rep 322.8) |
+  | lanes (flag off) | 7,299.3 | 6,960.6 | 15,544.0 | 15,706.8 |
+
+  All within ±10%.
+- **B lanes, as the three-rep round read it** (base → bfold):
+
+  | Pair | base | bfold | Change |
+  |---|---|---|---|
+  | MySQL → PG | 23,809.5 | 23,809.5 | — |
+  | PG → PG | 24,000 | 20,547.9 | −14% |
+  | MySQL → MySQL | 27,777.8 | 22,388.1 | −19% |
+
+  The last two read as misses, and **neither held up**. These cells time 30,000 transactions over a ~1.1–1.9 s window, and `fb wait` polls every 200 ms, so each result is N over a whole number of poll steps: a ~10–20% grain. The PG → PG values sit on exactly two levels, ~24,000 and ~20,500, one step apart.
+
+  B has no barrier, so the only code it reaches that changed is `WriteCheckpoint`'s refactor. Read against the old body, that sends the same statements in the same order: the skip-ledger flush returns before any I/O on an empty ledger (`SkipLedgerAccumulator.Flush`).
+
+  So it was measured at a resolution that can see ±10%, with arms alternating:
+  - **MySQL → MySQL, six reps at N = 30,000:** base 22,389, bfold 22,479 (the first round's base median was two reps at 27,777.8);
+  - **PG → PG, four reps at N = 150,000** (≈ 6.5 s windows, ~3% per step): base 23,604, bfold 23,989 (+1.6%).
+
+  Within ±10%, so the control holds. That is amendment D's "~10% grainy" caveat about these cells, now measured. A B row the gate means to grade should use a larger N.
+
+**Mutation runs.** The CLAUDE.md protocol was followed for each: a checkpoint commit before the first, each mutant `grep`ped in place, the red read to confirm the gate under test fired, and a revert on a tree whose only change was the mutant.
+
+| # | Mutant | Caught by (its own assertion) | Reverse / control |
+|---|---|---|---|
+| M-E1 | the pre-apply `writeCheckpoint` kept AND the fold | P1: "the coordinator wrote 60 checkpoints … the barriers must write none of their own" | P1's declined arm counts ≥ N−1 pre-apply checkpoints on the unmutated tree |
+| M-E2 | fold `c.Pos()` | P2 ("at=r2" for "at=c1"; the Bug 158 `recordingSeam` folds and persists `0/0`); P5 ("barrier mark … became durable with the position at transaction 4's commit"); P1 | — |
+| M-E2 (engine) | MySQL's fold writes `c.Pos()` | P7: "the committed barrier fold left position '' (want …)" on every kind | — |
+| M-E2 (broker) | the same, on the broker | P11 stays GREEN — the barrier's own token is the parent there too; the control §E.10 named | — |
+| M-E2b | fold `nil` always | P2's anchored rows (marker, keepalive, marker-less) | — |
+| M-E3 | the decline ignored | P3: the `decline=true` arm sees a fold | P3's `false` arm |
+| M-E4 | `checkpointWritten` before the call | P4: "after a failed fold: lastWrittenSeq=3 lastWrittenCum=1 closedTx=map[]" | P4's success arm |
+| M-E5 | the barrier's drain removed | P5: "the barrier mark of tx0003 … became durable with the position at transaction 0's commit" | the model's barrier-fold floor |
+| M-E6 | fold `RowsAppliedDelta(c)` | P6: "fold=true … rows_applied = 3; want 8" | P6's `fold=false` arm stays green under the mutant |
+| M-E7 (engine) | the position in a separate, earlier commit (Postgres, MySQL) | P7's failure arm on every kind: "left something durable: position … rows_applied 5" | P7's commit arm |
+| M-E7 (coordinator) | the pre-amendment order restored | P12 on MySQL GTID → PG: "the persisted position moved … T's start was persisted ahead of the barrier" | P13 stays green under it |
+| M-E7 (vtgate) | MySQL's separate commit, on the MULTI tear | P10: "the torn barrier commit persisted its folded position … the control shard committed before the data shard" | the batch-hook tear test |
+| M-E8 | `CloseOpen()` for `CloseTxs` (Postgres) | P7: the marked kinds lose the barrier's own mark ("marks map[] (want bf-tx:1 …)"); P13: "no apply mark at the kill: T's barrier wrote none" | P7's unmarked kinds stay green |
+| M-E9 | MySQL answers `true` for `Truncate` | P8: "FoldsBarrierCheckpoint(Truncate) = true on MySQL" | P7's `SchemaSnapshot` row (MySQL `true`) |
+| M-E9b | (added) the `BARRIER-FOLD-NOT-TRANSACTIONAL` refusal removed | P8: "a Truncate handed a checkpoint returned <nil>" | — |
+| M-E10 | the skip path's early return kept (both engines) | P9: "the skipped barrier left position … (want …), rows_applied 0 (want 2)" | P9's `at=nil` arm |
+| M-E11 | the broker streams the incremental's own id | P11: "the persisted position … names the interrupted incremental" | — |
+| M-E12 | the fold writes marks and closed deletes but no position | P13: "did not move off T−1's start", `kl` diverged from the source (`7\|prev` twice against once — the silent duplicate §E.10 predicted), and `APPLY-MARK-UNTRUSTED` | — |
+| P14-a | the position before the marks (Postgres checkpoint body) | `TestWriteCoreStatementOrder`: "lane barrier folds: a fold transaction did not write the position last" | the rosters' floors |
+| P14-b | Postgres's barrier transaction loses `forceSynchronousCommitOn` | `TestLanePositionWriterRoster`: "ApplyBarrierChange (barrier-fold) pins synchronous_commit neither directly nor through beginPipelinedTxOn" | — |
+
+Two of these differ from §E.10's predictions:
+- **M-E8 on P13:** the restart CONVERGED. A replayed primary-key change on a key the target already moved matches no row, so the loss of the barrier's own mark is graded by the cell's mark assertion, not by convergence. The silent half — a keyless barrier losing its own mark — is P7's.
+- **M-E7 on P10:** caught by the position assertion, as §E.10 says. The setup wait (a data transaction open while the position write waits) also distinguishes the one-transaction shape.
+
+**Not done here.**
+- **Neki:** recorded against the Neki Tier-3 pass (E-Q4).
+- **The late-landing COMMIT residual:** UNVERIFIED, as in §D.2.
+- **`-race`:** a concurrency chunk by CLAUDE.md's rule (§E.11). CI's `-race` Integration job must be green before any tag.
 
 ## Implementation status (2026-09-28, phases 1–5; shipped in v0.156.5)
 
