@@ -171,10 +171,12 @@ func runSyncStartLivePanel(ctx context.Context, s *SyncStartCmd, source, target 
 // metrics-watch) under the ADR-0156 GENERIC readout panel (phases 2/3). It is
 // the sibling of [runSyncStartLivePanel]: the command's loop runs in its own
 // goroutine (renderer isolation — a panel panic never aborts it), q/ctrl+c
-// drains-and-stops by CANCELLING the run context (which is the graceful stop
-// path for all three of these loops — the broker finishes its in-flight
-// incremental batch, the backup stream drains its in-flight rollover, and the
-// watch finishes its current tick), and WARN/ERROR records are forwarded into
+// stops by CANCELLING the run context (the backup stream commits its
+// in-flight rollover only when it stands at a source-transaction boundary
+// and otherwise ABANDONS the window — nothing committed, re-read next run,
+// WARN BACKUP-WINDOW-ABANDONED-OPEN-TRANSACTION; the watch finishes its
+// current tick; the broker does NOT finish an in-flight incremental — see
+// below), and WARN/ERROR records are forwarded into
 // the panel's bounded events ring via the same continuous slog gate as phase
 // 1.
 //
@@ -190,9 +192,14 @@ func runReadoutLivePanel(
 	defer cancel()
 
 	// The drain-and-stop side effect the panel returns on q/ctrl+c: cancel
-	// the run context. For these loops a cancel IS the graceful drain (each
-	// commits its in-flight unit before returning), so there is no separate
-	// RequestStop to issue — unlike `sync start`'s streamer. The
+	// the run context. For these loops a cancel is the graceful stop, so there
+	// is no separate RequestStop to issue — unlike `sync start`'s streamer.
+	// The backup stream commits its in-flight rollover only at a
+	// source-transaction boundary; a cancel inside a transaction abandons the
+	// window (exit 0, nothing committed, WARN
+	// BACKUP-WINDOW-ABANDONED-OPEN-TRANSACTION) — it does not wait for the
+	// commit the way `backup stream stop` does, because the cancel also tears
+	// down the change stream. The
 	// `sync from-backup` broker is the exception (audit F-E1): it does
 	// NOT commit its in-flight incremental or cold-start restore, and
 	// instead returns a BROKER-*-PARTIAL error that does not unwrap to

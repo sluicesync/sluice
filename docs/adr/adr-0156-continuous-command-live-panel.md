@@ -218,8 +218,14 @@ shape.
   pretty path (making the panel a delivery target of its own — breaches surface
   even with no external `--notify-*` sink). q/ctrl+c drains-and-stops by
   CANCELLING the run context, which is the graceful stop for two of the three
-  loops (the stream commits its in-flight rollover, the watch finishes its
-  current tick) — unlike `sync start`, none of these has a separate
+  loops (the watch finishes its current tick; the stream commits its
+  in-flight rollover only when it stands at a source-transaction boundary —
+  **correction (F-E1-SEVERED-TAIL-REPLAY, v0.156.12):** a cancel inside a
+  source transaction ABANDONS the window instead, exit 0, nothing committed
+  or acknowledged, the next run re-reading it, WARN
+  `BACKUP-WINDOW-ABANDONED-OPEN-TRANSACTION`; it does not wait for the
+  commit the way the bounded `backup stream stop` drain does, because the
+  cancel tears down the change stream too) — unlike `sync start`, none of these has a separate
   `RequestStop` to issue. **Correction (audit F-E1, 2026-10-04): the broker is
   the exception.** A cancel does NOT finish its in-flight incremental or its
   `--reset-target-data` cold-start restore. A cancel between ticks exits 0; one

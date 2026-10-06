@@ -1113,7 +1113,7 @@ func (b *BackupIncrementalCmd) Run(g *Globals) error {
 // sibling `stop` subcommand.
 type BackupStreamCmdGroup struct {
 	Run  BackupStreamCmd     `cmd:"" help:"Run the long-running stream (rolling incrementals at configured cadence)."`
-	Stop BackupStreamStopCmd `cmd:"" help:"Request a running stream to commit the in-flight rollover and exit cleanly."`
+	Stop BackupStreamStopCmd `cmd:"" help:"Request a running stream to commit the in-flight rollover and exit 0. Inside a source transaction the stream first reads to its commit, bounded at 60s / 1,000,000 changes; if that runs out it ABANDONS the window (nothing committed, re-read next run; WARN BACKUP-WINDOW-ABANDONED-OPEN-TRANSACTION)."`
 }
 
 // BackupStreamCmd runs `sluice backup stream run`. Drives a continuous-
@@ -1278,9 +1278,11 @@ func (b *BackupStreamCmd) Run(g *Globals) error {
 	// ADR-0156 phase 2: the TTY-aware live panel for the rolling-incremental
 	// cadence loop. Same [wantPrettyProgress] gate as the one-shot commands
 	// (this command has no --format json envelope / dry-run / multi-namespace
-	// shape). q/ctrl+c cancels the run context, which is the stream's graceful
-	// drain (it commits the in-flight rollover before exiting); every other
-	// invocation keeps today's byte-identical log stream.
+	// shape). q/ctrl+c cancels the run context — the SIGTERM path, not the
+	// bounded `backup stream stop` drain: it commits the in-flight rollover
+	// only at a source-transaction boundary and otherwise abandons the window
+	// (exit 0, nothing committed, re-read next run); every other invocation
+	// keeps today's byte-identical log stream.
 	if pretty {
 		header := progress.LiveHeader{
 			Mode:   "backup stream",
