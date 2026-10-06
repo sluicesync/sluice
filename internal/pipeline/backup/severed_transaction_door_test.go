@@ -253,13 +253,17 @@ func TestSeveredTransactionDoor_HealthyChainsPass(t *testing.T) {
 				ir.Insert{Position: sevLSN(4), Table: "t", Row: ir.Row{"v": 4}},
 			}),
 		},
-		// A segment's full between two incrementals breaks the pair: the
-		// rotation overlap (P_N, S] is snapshot-versus-change, not this door's.
+		// A segment's full between two incrementals does NOT break the pair
+		// (the next segment's first incremental resumes from this one's
+		// EndPosition); a current binary's resume starts strictly after it, so
+		// the pair passes. The rotation overlap (P_N, S] is
+		// snapshot-versus-change and not this door's. The refused half is
+		// TestSeveredTransactionDoor_PairsAcrossASegmentFull.
 		"rotation full between incrementals": {
 			sevFull(),
 			sevWriteIncremental(t, store, "d1", 100, sevTx(200, "a")),
 			sevFull(),
-			sevWriteIncremental(t, store, "d2", 100, sevTx(200, "a")),
+			sevWriteIncremental(t, store, "d2", 100, sevTx(300, "b")),
 		},
 		// An incremental with no rows at all (only a boundary pair) between
 		// two healthy ones.

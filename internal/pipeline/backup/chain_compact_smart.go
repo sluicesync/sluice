@@ -75,6 +75,7 @@ import (
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // PKStrategy controls how smart-compact identifies "the same row"
@@ -554,6 +555,14 @@ type smartCompactor struct {
 	lastIn  ir.Position
 	lastOut ir.Position
 
+	// inTail / outTail run the severed-transaction door's own rule
+	// ([openTxTracker]) over the input and the emitted stream, so the rewrite
+	// can prove it neither hid nor invented an open transaction
+	// ([smartCompactor.keepsTheSeveredVerdict]); inTail.sawMarker is also what
+	// tells a marker-less input from a framed one.
+	inTail  openTxTracker
+	outTail openTxTracker
+
 	// eventsBefore / eventsAfter count INSERT/UPDATE/DELETE/TRUNCATE
 	// only (the events subject to collapse), matching the
 	// [smartCompactResult] semantics. eventsAfter is tallied as events
@@ -751,16 +760,57 @@ func (s *smartCompactor) releaseHeldCommit() error {
 // original stream recorded — never the manifest's EndPosition, so an input
 // that was already short stays short and is still refused.
 //
-// On a framed stream the held commit already ends the output at the last input
-// position and nothing is appended; the pair is emitted only on a gap.
+// MARKER-LESS INPUTS ONLY. On a framed stream the held commit already ends a
+// committed tail at the last input position. A framed stream that ends INSIDE
+// an open transaction (an old binary's severed window) has no commit to hold,
+// so its collapsed tail can also end below the last input position — and a
+// pair appended there would CLOSE that transaction, erasing the open tail the
+// severed-transaction door's shape (A) refuses on, while lastIn ==
+// EndPosition kept shape (C) quiet too. Measured before this guard: the
+// keyless head of a re-delivered transaction applied twice through door,
+// verify and restore at exit 0. So a framed input never gets the pair; its
+// verdict is held by [smartCompactor.keepsTheSeveredVerdict] instead.
 func (s *smartCompactor) closeAtLastInputPosition() error {
-	if !positioned(s.lastIn) || s.lastOut == s.lastIn {
+	if s.inTail.sawMarker || !positioned(s.lastIn) || s.lastOut == s.lastIn {
 		return nil
 	}
 	if err := s.deliver(ir.TxBegin{Position: s.lastIn}); err != nil {
 		return err
 	}
 	return s.deliver(ir.TxCommit{Position: s.lastIn})
+}
+
+// keepsTheSeveredVerdict refuses a rewrite whose input is an incremental the
+// severed-transaction door judges SEVERED (an old binary's window that ends
+// inside an open source transaction), and a rewrite whose output would be
+// severed when its input was not. Judged with the door's own rule
+// ([openTxTracker]) over the input and the emitted stream.
+//
+// Why a severed input is refused rather than rewritten carefully: every
+// rewrite of it changes what the door reads. The collapsed rows carry their
+// chains' FIRST positions and land after the open TxBegin, so the output ends
+// below EndPosition and the door reports shape (C) — a lost-changes refusal —
+// for what is a severed transaction; a head whose rows all collapse away (an
+// INSERT in an earlier committed transaction cancelled by a DELETE in the open
+// one) leaves a bare TxBegin the door passes, and restore then applies the
+// re-delivered transaction on top of a state the collapse invented; and a
+// closing pair (b953b09d) closed the transaction outright, which applied a
+// keyless head twice at exit 0. Leaving the incremental as it is keeps the
+// door's verdict exactly — refused as shape (A), or, as a chain's final link,
+// the CHAIN-TAIL-OPEN-TRANSACTION WARN — and such a chain needs a new full
+// backup anyway. The compaction refuses as a whole and the chain is unchanged
+// (TestSmartCompaction_RefusesASeveredFramedIncremental).
+func (s *smartCompactor) keepsTheSeveredVerdict() error {
+	inOpen, at := s.inTail.endsOpen()
+	if inOpen {
+		return sluicecode.Wrap(sluicecode.CodeBackupChainSeveredTransaction,
+			"take a new full backup (`sluice backup full`) and compact that chain; this one carries a source transaction across two incrementals, and no rewrite of it can be replayed exactly",
+			fmt.Errorf("smart compaction refused: an incremental ends inside an open source transaction (TxBegin at %+v; F-E1-SEVERED-TAIL-REPLAY shape A, written by a `backup stream` stop or cancel on an older sluice), and collapsing it would change what restore and `sync from-backup` judge on — the chain is left unchanged", at))
+	}
+	if outOpen, _ := s.outTail.endsOpen(); outOpen {
+		return errors.New("smart compaction refused: the rewritten incremental ends inside an open transaction although its input did not — an ordering defect in the compactor; the chain is left unchanged")
+	}
+	return nil
 }
 
 // positioned reports whether p is a real position (the zero Position is "none").
@@ -772,6 +822,7 @@ func (s *smartCompactor) deliver(e ir.Change) error {
 	if p := e.Pos(); positioned(p) {
 		s.lastOut = p
 	}
+	s.outTail.observe(e)
 	if isPerRowEvent(e) {
 		s.eventsAfter++
 	}
@@ -967,6 +1018,7 @@ func (s *smartCompactor) process(e ir.Change) error {
 	if p := e.Pos(); positioned(p) {
 		s.lastIn = p
 	}
+	s.inTail.observe(e)
 	if s.pkStrategy == PKStrategyNone {
 		// Pass-through mode: collapse disabled, every event verbatim.
 		if isPerRowEvent(e) {
@@ -1699,6 +1751,9 @@ func applySmartCompactionToIncrementalSized(
 	// because it is a property of a stored INCREMENTAL (restore's tail check
 	// compares it with the manifest), not of the collapse policy.
 	if err := compactor.closeAtLastInputPosition(); err != nil {
+		return nil, err
+	}
+	if err := compactor.keepsTheSeveredVerdict(); err != nil {
 		return nil, err
 	}
 	res.bytesBefore = bytesBefore

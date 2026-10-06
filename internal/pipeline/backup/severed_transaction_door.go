@@ -69,15 +69,21 @@ import (
 //   - a chain whose FINAL incremental ends open is not refused (nothing
 //     follows it to re-deliver anything; the live tail of a running stream
 //     has this shape only on an old binary). Chain restore WARNs instead.
+//     "Final" and "follows" are by INCREMENTAL: a segment full in between
+//     does not break a pair ([nextIncremental]).
 //   - (B) is judged only where the source engine orders positions
 //     ([ir.PositionMonotonicChecker] — Postgres today). By the code, no other
 //     source re-delivers a COMPLETED transaction: the MySQL/MariaDB and
 //     VStream TxCommit carries the post-commit position (item 132), file/pos
 //     resumes after the XID, and the trigger-CDC sources resume at
 //     `id > position`.
-//   - a smart-compacted chain keeps (A) visible (TxBegin/TxCommit pass
-//     through the compactor verbatim) but collapse can move the last-row
-//     position (B) compares against.
+//   - a smart-compacted chain keeps (A) visible because smart compaction
+//     REFUSES to rewrite an incremental this door's rule judges severed
+//     (`keepsTheSeveredVerdict`, over the door's own [openTxTracker]); the
+//     chain is left as it was and still refused
+//     (TestSmartCompaction_RefusesASeveredFramedIncremental). b953b09d broke
+//     this by closing such a transaction with an empty boundary pair. Collapse
+//     can still move the last-row position (B) compares against.
 //
 // PREMISES, named per the premise rule (each is what would have to be false
 // for a verdict to be wrong):
@@ -114,9 +120,26 @@ type SeveredTransactionDoor struct {
 	// engine — a residual, stated here and in the audit backlog.
 	Comparator ir.PositionMonotonicChecker
 
+	// SkipUndecodable makes a link whose chunks the door cannot decode a
+	// SKIP instead of a stop: the link is recorded in [Undecodable] and every
+	// other link is still judged. `backup verify` sets it, because its own
+	// chunk checks own a corrupt or unreadable chunk and its job is to report
+	// every finding — stopping at the first undecodable link left every later
+	// one unjudged, a shape-(C) loss included, at exit 0. Zero value (false)
+	// is the restore/broker behaviour: an undecodable link that is not yet
+	// applied refuses before anything is applied.
+	SkipUndecodable bool
+
+	// Undecodable collects the decode failures a SkipUndecodable run
+	// skipped, in chain order.
+	Undecodable []error
+
 	// edges caches each incremental's decoded verdicts by manifest path +
 	// backup id, so the broker pays for a link once across all its ticks.
 	edges map[string]incrementalEdges
+
+	// skipped dedupes [SeveredTransactionDoor.Undecodable] by link.
+	skipped map[string]bool
 
 	// warned remembers which already-applied findings CheckFrom has WARNed,
 	// so a broker logs each once per run rather than once per tick.
@@ -163,10 +186,17 @@ type incrementalEdges struct {
 // Check refuses the chain when any incremental link carries part of a source
 // transaction that the next incremental carries again (shapes A and B), or
 // records an EndPosition its chunks never reach (shape C). links is the flat
-// chain in lineage order (fulls included; only consecutive INCREMENTAL pairs
-// are compared, and a segment's full between two incrementals breaks the
-// pair). Every finding refuses: this is the form for a caller about to apply
-// the whole chain (chain restore) or vouch for it (`backup verify`).
+// chain in lineage order, fulls included. Every finding refuses: this is the
+// form for a caller about to apply the whole chain (chain restore) or vouch for
+// it (`backup verify`).
+//
+// "The next incremental" is the next INCREMENTAL link, across any segment
+// fulls between them ([nextIncremental]). Both consumers apply it next: the
+// broker skips a segment full outright, and chain restore applies the full's
+// snapshot first and then that incremental — which, after a rotation, resumes
+// from the previous segment's EndPosition (`rotationBoundaryResumeStart`), so
+// it re-delivers exactly what a same-segment successor would. One pairing,
+// for both, and for the landing rule below.
 func (d *SeveredTransactionDoor) Check(ctx context.Context, links []lineage.SegmentRecord) error {
 	return d.CheckFrom(ctx, links, 0)
 }
@@ -179,24 +209,26 @@ func (d *SeveredTransactionDoor) Check(ctx context.Context, links []lineage.Segm
 // shape-B pair for good). Those are WARNed once each, naming the links so
 // the operator can check that range against the source; only findings that
 // would land on a link not yet applied refuse. Which link a finding "lands
-// on": shapes A and B the SECOND link of the pair (applying it is the
+// on": shapes A and B the SECOND incremental of the pair (applying it is the
 // duplicate), shape C the link itself (it is the one missing changes).
 func (d *SeveredTransactionDoor) CheckFrom(ctx context.Context, links []lineage.SegmentRecord, from int) error {
 	for i := range links {
 		if !isIncrementalLink(&links[i]) {
 			continue
 		}
+		j := nextIncremental(links, i) // the pair's second link; -1 when i is the last incremental
 		cur, err := d.edgesOf(ctx, &links[i])
 		if err != nil {
 			// Link i unreadable. Its OWN finding (C) lands on i; its tail is
-			// also the evidence for the A/B findings that land on i+1. So the
+			// also the evidence for the A/B findings that land on j. So the
 			// WARN-and-skip a broker gets for an applied link is allowed only
 			// when every link a finding from here could land on is applied —
 			// otherwise an unreadable applied link would hide a severed or
-			// re-delivered transaction in the next, UNAPPLIED one.
+			// re-delivered transaction in the next, UNAPPLIED incremental,
+			// including one across a segment full.
 			landing := i
-			if i < len(links)-1 && isIncrementalLink(&links[i+1]) {
-				landing = i + 1
+			if j >= 0 {
+				landing = j
 			}
 			if cerr := d.unjudgeable(ctx, landing < from, &links[i], err); cerr != nil {
 				return cerr
@@ -206,21 +238,21 @@ func (d *SeveredTransactionDoor) CheckFrom(ctx context.Context, links []lineage.
 		if err := d.judge(ctx, i < from, endPastRecordedError(&links[i], cur)); err != nil {
 			return err
 		}
-		if i == len(links)-1 {
-			continue
+		if j < 0 {
+			continue // the chain's last incremental: nothing follows to re-deliver it
 		}
 		if cur.endsOpen {
-			if err := d.judge(ctx, i+1 < from, severedTailError(&links[i], cur)); err != nil {
+			if err := d.judge(ctx, j < from, severedTailError(&links[i], cur)); err != nil {
 				return err
 			}
 			continue
 		}
-		if d.Comparator == nil || !isIncrementalLink(&links[i+1]) || !cur.hasData || cur.carriesFill {
+		if d.Comparator == nil || !cur.hasData || cur.carriesFill {
 			continue
 		}
-		next, err := d.edgesOf(ctx, &links[i+1])
+		next, err := d.edgesOf(ctx, &links[j])
 		if err != nil {
-			if cerr := d.unjudgeable(ctx, i+1 < from, &links[i+1], err); cerr != nil {
+			if cerr := d.unjudgeable(ctx, j < from, &links[j], err); cerr != nil {
 				return cerr
 			}
 			continue
@@ -234,18 +266,28 @@ func (d *SeveredTransactionDoor) CheckFrom(ctx context.Context, links []lineage.
 			// across a version boundary): no verdict, which is no refusal.
 			slog.DebugContext(
 				ctx, "severed-transaction door: cannot order a link boundary; shape (B) not judged there",
-				slog.String("backup_id", lineage.ManifestBackupID(links[i+1].Manifest)),
+				slog.String("backup_id", lineage.ManifestBackupID(links[j].Manifest)),
 				slog.String("err", cerr.Error()),
 			)
 			continue
 		}
 		if atOrBefore {
-			if err := d.judge(ctx, i+1 < from, redeliveredBoundaryError(&links[i], &links[i+1], cur, next)); err != nil {
+			if err := d.judge(ctx, j < from, redeliveredBoundaryError(&links[i], &links[j], cur, next)); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+// nextIncremental is the index of the first INCREMENTAL link after i, or -1.
+func nextIncremental(links []lineage.SegmentRecord, i int) int {
+	for j := i + 1; j < len(links); j++ {
+		if isIncrementalLink(&links[j]) {
+			return j
+		}
+	}
+	return -1
 }
 
 // judge turns a finding into a refusal, or — when the link it lands on is
@@ -282,9 +324,24 @@ func (d *SeveredTransactionDoor) judge(ctx context.Context, applied bool, findin
 // For a link the broker ALREADY applied it WARNs and leaves the link
 // unjudged: that chunk is never read again, and refusing would halt the
 // broker forever over history it already holds. Nothing is cached, so the
-// next tick tries again.
+// next tick tries again. Under [SeveredTransactionDoor.SkipUndecodable]
+// (`backup verify`) every undecodable link is recorded once and skipped.
 func (d *SeveredTransactionDoor) unjudgeable(ctx context.Context, applied bool, link *lineage.SegmentRecord, err error) error {
-	if ctx.Err() != nil || !applied {
+	if ctx.Err() != nil {
+		return err
+	}
+	if d.SkipUndecodable {
+		key := link.Path + "\x00" + lineage.ManifestBackupID(link.Manifest)
+		if !d.skipped[key] {
+			if d.skipped == nil {
+				d.skipped = map[string]bool{}
+			}
+			d.skipped[key] = true
+			d.Undecodable = append(d.Undecodable, err)
+		}
+		return nil
+	}
+	if !applied {
 		return err
 	}
 	slog.WarnContext(
@@ -301,10 +358,16 @@ func (d *SeveredTransactionDoor) unjudgeable(ctx context.Context, applied bool, 
 // transaction's head, a state the source never had. Uses the cache Check
 // filled; a link Check did not reach is decoded here.
 func (d *SeveredTransactionDoor) WarnOpenFinalTail(ctx context.Context, links []lineage.SegmentRecord) {
-	if len(links) == 0 || !isIncrementalLink(&links[len(links)-1]) {
+	last := -1
+	for i := range links {
+		if isIncrementalLink(&links[i]) {
+			last = i
+		}
+	}
+	if last < 0 {
 		return
 	}
-	link := &links[len(links)-1]
+	link := &links[last]
 	e, err := d.edgesOf(ctx, link)
 	if err != nil || !e.endsOpen {
 		return
@@ -548,13 +611,17 @@ func (d *SeveredTransactionDoor) decodeChunkRaw(ctx context.Context, link *linea
 // recorded TxCommit; MySQL GTID: the post-commit set; file/pos: the XID's
 // end LogPos), a trigger-CDC window on its last row's change-log id, and an
 // ADD COLUMN fill appends transactions stamped AT EndPosition. Smart
-// compaction keeps it: a collapsed event carries its chain's FIRST position,
-// so the rewriter holds a framed window's closing TxCommit back and, on a
-// marker-less window, appends an empty TxBegin/TxCommit pair at the
-// window's last input position (applySmartCompactionToIncrementalSized).
-// Every producer's half is graded by TestSeveredTransactionDoor_ShapeC_AgreementTable's
-// producer-written rows and the integration chains in
-// stream_severed_tail_integration_test.go.
+// compaction keeps it on the inputs it rewrites: a collapsed event carries its
+// chain's FIRST position, so the rewriter holds a COMMITTED framed window's
+// closing TxCommit back and, on a MARKER-LESS window only, appends an empty
+// TxBegin/TxCommit pair at the window's last input position
+// (applySmartCompactionToIncrementalSized). A framed window that ends inside
+// an open transaction is not rewritten at all — compaction refuses it, because
+// a pair there would close the transaction and hide shape (A)
+// (TestSmartCompaction_RefusesASeveredFramedIncremental,
+// TestSmart_ClosingPairOnlyForAMarkerlessInput). Every producer's half is
+// graded by TestSeveredTransactionDoor_ShapeC_AgreementTable's producer-written
+// rows and the integration chains in stream_severed_tail_integration_test.go.
 //
 // The causes, all of which leave the same evidence:
 //   - an OLD binary's (v0.19.0–v0.156.11) `backup stream` cancel drain
@@ -646,26 +713,28 @@ func verifySeveredTransactions(ctx context.Context, store irbackup.Store, chain 
 		cek, _, err := prober.changeChunk(owner, c, 0) // the door binds its own AAD; only the key is wanted
 		return cek, err
 	})
+	// A link the door cannot DECODE is not its verdict to give: the chunk scan
+	// below reports a corrupt or spliced chunk with its own code, and an
+	// intact-but-unreadable one is `--depth read`'s
+	// SLUICE-E-BACKUP-CHUNK-UNREADABLE by contract — the hash depth must keep
+	// blessing it (TestVerifyDepthRead_HashDepthBlessesWhatTheReadDepthRefuses).
+	// So that link is skipped, said out loud, and every OTHER link is still
+	// judged — stopping at it left every later link unjudged, a shape-(C) loss
+	// included (TestVerifySeveredTransactions_JudgesPastAnUndecodableLink).
+	door.SkipUndecodable = true
 	err := door.Check(ctx, chain)
-	if err == nil {
-		return nil
+	for _, skipped := range door.Undecodable {
+		slog.WarnContext(
+			ctx, "verify: the severed-transaction check (SLUICE-E-BACKUP-CHAIN-SEVERED-TRANSACTION) could not decode a change chunk and did NOT judge that incremental (nor a severed or re-delivered transaction it would pair with the next one); the chunk checks report that chunk",
+			slog.String("err", skipped.Error()),
+		)
 	}
-	if !isChunkDecodeError(err) {
+	if err != nil {
 		// Every VERDICT the door gives reaches verify, whatever its code — shape
 		// C is coded -BACKUP-INCOMPLETE, and an allow-list of the severed code
 		// once let verify report a shape-C chain healthy.
 		return fmt.Errorf("verify: %w", err)
 	}
-	// The door could not DECODE a chunk. That is not its verdict to give:
-	// the chunk scan below reports a corrupt or spliced chunk with its own
-	// code, and an intact-but-unreadable one is `--depth read`'s
-	// SLUICE-E-BACKUP-CHUNK-UNREADABLE by contract — the hash depth must keep
-	// blessing it (TestVerifyDepthRead_HashDepthBlessesWhatTheReadDepthRefuses).
-	// So say the check did not run, loudly, and let those own the failure.
-	slog.WarnContext(
-		ctx, "verify: the severed-transaction check (SLUICE-E-BACKUP-CHAIN-SEVERED-TRANSACTION) could not decode a change chunk and did NOT run; the chunk checks report that chunk",
-		slog.String("err", err.Error()),
-	)
 	return nil
 }
 
@@ -691,28 +760,16 @@ func manifestCarriesFill(m *irbackup.Manifest) bool {
 // (it needs a schema change in the window), so the full decode is affordable.
 func (d *SeveredTransactionDoor) scanWholeIncremental(ctx context.Context, link *lineage.SegmentRecord) (incrementalEdges, error) {
 	e := incrementalEdges{carriesFill: true}
-	var (
-		open    bool
-		openRow bool // the open transaction has recorded a row
-		beganAt ir.Position
-		severed bool
-	)
+	var tail openTxTracker
 	for i := range link.Manifest.ChangeChunks {
 		err := d.decodeChunk(ctx, link, i, func(c ir.Change) {
+			tail.observe(c)
 			p := c.Pos()
 			if p.Engine != "" || p.Token != "" {
 				e.lastPos, e.hasPos = p, true
 			}
-			switch v := c.(type) {
-			case ir.TxBegin:
-				if open && openRow && !severed {
-					severed, e.openAt = true, beganAt
-				}
-				open, openRow, beganAt = true, false, v.Position
-			case ir.TxCommit:
-				open = false
+			switch c.(type) {
 			case ir.Insert, ir.Update, ir.Delete, ir.Truncate:
-				openRow = true
 				if p.Engine == "" && p.Token == "" {
 					return
 				}
@@ -726,11 +783,54 @@ func (d *SeveredTransactionDoor) scanWholeIncremental(ctx context.Context, link 
 			return e, err
 		}
 	}
-	switch {
-	case severed:
-		e.endsOpen = true
-	case open && openRow:
-		e.endsOpen, e.openAt = true, beganAt
-	}
+	e.endsOpen, e.openAt = tail.endsOpen()
 	return e, nil
+}
+
+// openTxTracker is the severed-transaction rule over a stream of changes, in
+// order: a stream is severed when it ends inside a transaction that has
+// recorded a row, or when a TxBegin arrives while such a transaction is still
+// open (an ADD COLUMN fill opening its own transaction after a window that
+// never committed). A transaction with no row in it severs nothing — the
+// bare-TxBegin exemption.
+//
+// One rule, two callers: the door's whole-incremental scan judges a STORED
+// incremental with it, and smart compaction judges its own INPUT and OUTPUT
+// with it, refusing a rewrite that would turn a severed incremental into one
+// the door passes (TestSmartCompaction_KeepsASeveredFramedTailVisible).
+type openTxTracker struct {
+	open      bool
+	openRow   bool // the open transaction has recorded a row
+	beganAt   ir.Position
+	severed   bool
+	severedAt ir.Position
+	sawMarker bool // any TxBegin or TxCommit at all: a framed stream
+}
+
+func (t *openTxTracker) observe(c ir.Change) {
+	switch v := c.(type) {
+	case ir.TxBegin:
+		t.sawMarker = true
+		if t.open && t.openRow && !t.severed {
+			t.severed, t.severedAt = true, t.beganAt
+		}
+		t.open, t.openRow, t.beganAt = true, false, v.Position
+	case ir.TxCommit:
+		t.sawMarker = true
+		t.open = false
+	case ir.Insert, ir.Update, ir.Delete, ir.Truncate:
+		t.openRow = true
+	}
+}
+
+// endsOpen reports whether the stream observed so far is severed, and the
+// position of the transaction it is severed in.
+func (t *openTxTracker) endsOpen() (bool, ir.Position) {
+	switch {
+	case t.severed:
+		return true, t.severedAt
+	case t.open && t.openRow:
+		return true, t.beganAt
+	}
+	return false, ir.Position{}
 }
