@@ -53,17 +53,21 @@ type skipFlushEntry struct {
 // moves (the moved-door caller-roster rule).
 var skipLedgerFlushRoster = map[string]skipFlushEntry{
 	// --- MySQL ---
-	"mysql.ChangeApplier.applyOneImpl": {
+	"mysql.ChangeApplier.writeOwnPositionTx": {
 		flushesTheLedger,
-		"serial per-change path; flush precedes the in-tx position write, failure rolls the tx back.",
+		"serial per-change path (applyOneImpl's ownPosition); flush precedes the in-tx position write, " +
+			"failure rolls the tx back.",
+	},
+	"mysql.ChangeApplier.writeCheckpointTx": {
+		flushesTheLedger,
+		"the lane checkpoint's body, shared by the ADR-0104 frontier checkpoint (WriteCheckpoint → " +
+			"commitCheckpoint) and the lane barrier's folded checkpoint (ADR-0190 amendment E: applyOneImpl's " +
+			"foldedCheckpoint, and a skipped barrier's commitCheckpoint); flush precedes the position, a failure " +
+			"rolls the tx back.",
 	},
 	"mysql.ChangeApplier.persistSourceTxCommit": {
 		flushesTheLedger,
 		"CDCPOS-2 TxCommit boundary write; flush precedes BeginTx.",
-	},
-	"mysql.laneApplierAdapter.WriteCheckpoint": {
-		flushesTheLedger,
-		"ADR-0104 frontier checkpoint — the concurrent path's only position-write boundary; flush precedes it.",
 	},
 	"mysql.ChangeApplier.WritePosition": {
 		flushExempt,
@@ -91,9 +95,15 @@ var skipLedgerFlushRoster = map[string]skipFlushEntry{
 	},
 
 	// --- Postgres ---
-	"postgres.ChangeApplier.applyOneImpl": {
+	"postgres.ChangeApplier.writeOwnPositionTx": {
 		flushesTheLedger,
-		"serial per-change path; flush precedes the in-tx position write, failure rolls the tx back.",
+		"serial per-change path (applyOneImpl's ownPosition); flush precedes the in-tx position write, " +
+			"failure rolls the tx back.",
+	},
+	"postgres.ChangeApplier.writeCheckpointTx": {
+		flushesTheLedger,
+		"the lane checkpoint's body — the ADR-0104 frontier checkpoint and the lane barrier's folded " +
+			"checkpoint (ADR-0190 amendment E), as the MySQL twin; flush precedes the position.",
 	},
 	"postgres.ChangeApplier.persistSourceTxCommit": {
 		flushesTheLedger,
@@ -103,10 +113,6 @@ var skipLedgerFlushRoster = map[string]skipFlushEntry{
 		flushesTheLedger,
 		"the batch-loop WritePosition closure (both the pipelined queue arm and the serial *sql.Tx arm) " +
 			"flushes at the same boundary it writes the position.",
-	},
-	"postgres.laneApplierAdapter.WriteCheckpoint": {
-		flushesTheLedger,
-		"ADR-0104 frontier checkpoint; flush precedes it.",
 	},
 	"postgres.laneApplierAdapter.queueFold": {
 		flushesTheLedger,

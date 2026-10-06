@@ -21,6 +21,7 @@ import (
 	"sluicesync.dev/sluice/internal/appliershared"
 	"sluicesync.dev/sluice/internal/applymarks"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/laneapply"
 	"sluicesync.dev/sluice/internal/redact"
 )
 
@@ -494,6 +495,13 @@ type ChangeApplier struct {
 	// state stream of rows + boundaries has exactly #primed-tables
 	// resolve hits, NOT O(rows) or O(boundaries).
 	resolveCallsForTest atomic.Int64
+
+	// barrierFoldCommitHookForTest, when non-nil, runs in a lane barrier's
+	// transaction that folds a checkpoint (ADR-0190 amendment E) after the
+	// position is written and before the COMMIT; an error rolls the whole
+	// transaction back. TestLaneBarrier_FoldIsOneTransaction sets it to prove
+	// the data, marks and position roll back together. nil in production.
+	barrierFoldCommitHookForTest func() error
 
 	// skipWarn tracks which unknown target tables have already had their
 	// once-per-applier-lifetime skip WARN (audit C-11). The durable
@@ -1427,7 +1435,7 @@ func (a *ChangeApplier) Apply(ctx context.Context, streamID string, changes <-ch
 			}
 			applyStart := time.Now()
 			if inSourceTx {
-				skipped, err := a.applyOneImpl(ctx, streamID, c, false /* writePosition — deferred to TxCommit */)
+				skipped, err := a.applyOneImpl(ctx, streamID, c, noPosition /* deferred to TxCommit */)
 				if err != nil {
 					// Every change here commits in its own target transaction, so
 					// once an earlier row or Truncate of this source transaction
@@ -1525,8 +1533,8 @@ func applierErrorOrShutdown(ctx context.Context, err error) error {
 // table (Bug 15, ADR-0020, GC-41).
 func (a *ChangeApplier) applyOne(ctx context.Context, streamID string, c ir.Change) error {
 	// The skip signal is consumed inside applyOneImpl's own position write
-	// here (writePosition=true), so this wrapper discards it.
-	_, err := a.applyOneImpl(ctx, streamID, c, true /* writePosition */)
+	// here (ownPosition), so this wrapper discards it.
+	_, err := a.applyOneImpl(ctx, streamID, c, ownPosition)
 	return err
 }
 
@@ -1536,37 +1544,127 @@ func (a *ChangeApplier) applyOne(ctx context.Context, streamID string, c ir.Chan
 // appliershared schemaEventAtBoundary). Unreachable on this engine while
 // TransactionalDDL is true; filled so the seam stays total.
 func (a *ChangeApplier) applySchemaEvent(ctx context.Context, streamID string, c ir.Change, writePosition bool) error {
-	_, err := a.applyOneImpl(ctx, streamID, c, writePosition)
+	pw := noPosition
+	if writePosition {
+		pw = ownPosition
+	}
+	_, err := a.applyOneImpl(ctx, streamID, c, pw)
 	return err
 }
 
-// applyBarrierNoPosition applies one barrier-path change (Truncate /
-// SchemaSnapshot) on the coordinator backend WITHOUT writing the stream
-// position. It is the concurrent (ADR-0104/ADR-0105) barrier apply: on that
-// path the resume position is owned EXCLUSIVELY by the frontier-checkpoint
-// coordinator (the position relaxation — the merged position is persisted in
-// a separate WriteCheckpoint tx, only up to a fully-durable source-tx
-// boundary). Letting the barrier write its own change's position would
-// regress the persisted position to a metadata-anchored value — the
+// positionWrite is the position [ChangeApplier.applyOneImpl] writes in the
+// change's own target transaction. There are three, kept apart by
+// construction so no call site can mix them:
+//
+//   - noPosition (the zero value): none — a change inside a source
+//     transaction on the per-change path (its TxCommit writes it), and a lane
+//     barrier with no checkpoint to fold.
+//   - ownPosition: the change's OWN token with its RowsAppliedDelta, closing
+//     every open ADR-0190 transaction — the serial per-change path, outside a
+//     source transaction, where the change is its own boundary.
+//   - foldedCheckpoint(at): a lane barrier's pre-apply checkpoint (ADR-0190
+//     amendment E) — at.Pos with at.RowsApplied, closing exactly at.ClosedTxs.
+//     It must be none of ownPosition's three: the change's own token is
+//     mid-transaction on a marker stream and metadata-anchored for a
+//     SchemaSnapshot (0/0 at a pgoutput first touch — Bug 158); its own row
+//     is counted by a LATER boundary; and CloseOpen would close the barrier's
+//     own transaction — Decide noted it open — so the gc plan would drop the
+//     barrier's own mark, and a crash after the commit would re-apply it
+//     unmarked.
+type positionWrite struct {
+	own        bool
+	checkpoint *laneapply.BarrierCheckpoint
+}
+
+var (
+	noPosition  = positionWrite{}
+	ownPosition = positionWrite{own: true}
+)
+
+// foldedCheckpoint is the positionWrite of a lane barrier folding at; a nil
+// at is noPosition.
+func foldedCheckpoint(at *laneapply.BarrierCheckpoint) positionWrite {
+	return positionWrite{checkpoint: at}
+}
+
+// applyBarrier applies one lane barrier-path change (a keyless, absent-table,
+// malformed or primary-key-changing row; a SchemaSnapshot; a Truncate — all
+// transactional on Postgres) for the concurrent (ADR-0104/ADR-0105)
+// orchestrator. It never writes the change's own position: on that path the
+// resume position is owned by the frontier-checkpoint coordinator, and the
+// barrier's own would regress it to a metadata-anchored value (the
 // first-touch SchemaSnapshot carries WAL position 0/0, which pinned the
-// stream at 0/0 and broke warm-resume (Bug 158, the position half). The data
-// + ADR-0049 schema-history row + cache-after-commit still apply atomically;
-// only the position write is omitted (the frontier checkpoint persists the
-// real resume LSN of the surrounding row events).
-func (a *ChangeApplier) applyBarrierNoPosition(ctx context.Context, streamID string, c ir.Change) error {
-	// Position-free barrier apply: the concurrent orchestrator counts
-	// rows_applied at ROUTE time (gated by SkipsRowChange, PG-2), so the skip
-	// signal is not needed here.
-	_, err := a.applyOneImpl(ctx, streamID, c, false /* writePosition */)
+// stream at 0/0 and broke warm-resume — Bug 158, the position half). When
+// the coordinator hands it a checkpoint (ADR-0190 amendment E) it writes
+// that one in the barrier's transaction, last. The data + ADR-0049
+// schema-history row + marks + cache-after-commit apply atomically.
+func (a *ChangeApplier) applyBarrier(ctx context.Context, streamID string, c ir.Change, at *laneapply.BarrierCheckpoint) error {
+	// The concurrent orchestrator counts rows_applied at ROUTE time (gated by
+	// SkipsRowChange, PG-2), so the skip signal is not needed here.
+	_, err := a.applyOneImpl(ctx, streamID, c, foldedCheckpoint(at))
 	return err
+}
+
+// writeCheckpointTx puts a lane checkpoint's statements on tx after whatever
+// data tx already carries — none for the coordinator's own checkpoint, a
+// barrier's change for a fold (ADR-0190 amendment E) — in this order: the
+// apply marks, closing at.ClosedTxs (pending's upserts, then the closed
+// transactions' deletes); the coalesced skip ledger's flush (H-4: its own
+// autocommit on the primary pool, durable before the position that covers
+// the skips it records); then at.Pos with at.RowsApplied, LAST, so the
+// stream's control row is locked only across COMMIT (data before control,
+// GC-41 (c)). It returns the marks plan for [applymarks.Tracker.Committed]
+// once the caller's COMMIT lands. The caller has pinned synchronous_commit
+// on tx (F7) and rolls it back on an error.
+func (a *ChangeApplier) writeCheckpointTx(ctx context.Context, tx *sql.Tx, streamID string, at laneapply.BarrierCheckpoint, pending *applymarks.Pending) (applymarks.Plan, error) {
+	a.marks.CloseTxs(at.ClosedTxs)
+	marks := a.marks.Plan(pending, true)
+	if err := a.execApplyMarksTx(ctx, tx, marks); err != nil {
+		return applymarks.Plan{}, classifyApplierError(err)
+	}
+	if err := a.flushSkippedTables(ctx); err != nil {
+		return applymarks.Plan{}, err
+	}
+	posCtx, posCancel := a.execTimeoutCtx(ctx)
+	defer posCancel()
+	if err := writePositionTx(posCtx, tx, a.controlSchema, streamID, at.Pos.Token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, at.RowsApplied); err != nil {
+		return applymarks.Plan{}, classifyApplierError(fmt.Errorf("postgres: applier: checkpoint position write: %w", err))
+	}
+	return marks, nil
+}
+
+// commitCheckpoint persists a lane checkpoint in a transaction of its own,
+// with the F7 synchronous_commit pin: the coordinator's
+// [laneApplierAdapter.WriteCheckpoint], and a barrier the apply marks prove
+// already applied, which still owes the checkpoint it was handed (ADR-0190
+// amendment E).
+func (a *ChangeApplier) commitCheckpoint(ctx context.Context, streamID string, at laneapply.BarrierCheckpoint) error {
+	tx, err := a.db.BeginTx(ctx, nil)
+	if err != nil {
+		return classifyApplierError(fmt.Errorf("postgres: applier: checkpoint begin: %w", err))
+	}
+	if err := a.forceSynchronousCommitOn(ctx, tx); err != nil {
+		_ = tx.Rollback()
+		return classifyApplierError(err)
+	}
+	marks, err := a.writeCheckpointTx(ctx, tx, streamID, at, nil)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if err := a.commitWithTimeout(tx); err != nil {
+		return classifyApplierError(fmt.Errorf("postgres: applier: checkpoint commit: %w", err))
+	}
+	a.marks.Committed(marks)
+	return nil
 }
 
 // applyOneImpl is the shared per-change apply: redact → stamp → dispatch →
-// (optional) position write → commit → cache-after-commit. writePosition
-// gates the ADR-0007 position write: true for the serial per-change path
-// (position + data atomic); false for the concurrent barrier path (position
-// owned by the frontier checkpoint — see applyBarrierNoPosition).
-func (a *ChangeApplier) applyOneImpl(ctx context.Context, streamID string, c ir.Change, writePosition bool) (skipped bool, err error) {
+// (optional) position write → commit → cache-after-commit. pw chooses the
+// position written with the data ([positionWrite]): the change's own for the
+// serial per-change path (position + data atomic), a folded checkpoint for a
+// lane barrier (ADR-0190 amendment E), or none.
+func (a *ChangeApplier) applyOneImpl(ctx context.Context, streamID string, c ir.Change, pw positionWrite) (skipped bool, err error) {
 	// PII Phase 1.5: redact CDC row data before dispatch.
 	if err := a.redactChange(ctx, c); err != nil {
 		return false, classifyApplierError(fmt.Errorf("postgres: applier: redact: %w", err))
@@ -1585,6 +1683,14 @@ func (a *ChangeApplier) applyOneImpl(ctx context.Context, streamID string, c ir.
 		return false, err
 	}
 	if decision.Skip {
+		if pw.checkpoint != nil {
+			// ADR-0190 amendment E: the barrier writes nothing, but the
+			// checkpoint it was handed is still owed — the coordinator records
+			// it written once this returns, so skipping it would lose its
+			// rows_applied increment and leave its closed transactions' marks
+			// to the restart sweep.
+			return true, a.commitCheckpoint(ctx, streamID, *pw.checkpoint)
+		}
 		return true, nil
 	}
 	tx, err := a.db.BeginTx(ctx, nil)
@@ -1614,51 +1720,25 @@ func (a *ChangeApplier) applyOneImpl(ctx context.Context, streamID string, c ir.
 	}
 	// The change's apply marks ride this transaction — written only when the
 	// change actually applied (a C-11 skip wrote no row, so it vouches for
-	// nothing). With the position (writePosition) the plan also deletes the
-	// marks of every transaction that position passes.
+	// nothing). With a position the plan also deletes the marks of every
+	// transaction that position passes.
 	var pending applymarks.Pending
 	if !skipped {
 		pending.Add(decision.Marks)
 	}
-	if writePosition {
-		// The position is written only OUTSIDE a source transaction here (a
-		// change inside one defers it to its TxCommit), so it passes every
-		// change applied so far — each change of a marker-less stream is its
-		// own ADR-0190 transaction, and closes with it (appliershared
-		// commitBatch's rule, on the per-change path).
-		a.marks.CloseOpen()
-	}
-	marks := a.marks.Plan(&pending, writePosition)
-	if err := a.execApplyMarksTx(ctx, tx, marks); err != nil {
-		_ = tx.Rollback()
-		return false, classifyApplierError(err)
-	}
-	token := c.Pos().Token
-	if writePosition {
-		// H-4: flush the coalesced skip ledger before this change's position
-		// becomes durable (a skipped change dispatches to recordSkippedTable,
-		// which only accumulated). On failure roll the tx back so the change
-		// re-delivers and re-skips; on success the position may advance past it.
-		if err := a.flushSkippedTables(ctx); err != nil {
+	var marks applymarks.Plan
+	if pw.checkpoint != nil {
+		marks, err = a.writeCheckpointTx(ctx, tx, streamID, *pw.checkpoint, &pending)
+		if err == nil && a.barrierFoldCommitHookForTest != nil {
+			err = a.barrierFoldCommitHookForTest()
+		}
+		if err != nil {
 			_ = tx.Rollback()
 			return false, err
 		}
-		posCtx, posCancel := a.execTimeoutCtx(ctx)
-		// Serial per-change apply: this change is durable in the same tx as
-		// its position, so it contributes 1 to rows_applied when it is a
-		// row-level DML change and 0 for a Truncate / SchemaSnapshot — or for a
-		// change SKIPPED because its target table is absent (PG-2: a skip wrote
-		// no row, so it must not advance the counter).
-		delta := ir.RowsAppliedDelta(c)
-		if skipped {
-			delta = 0
-		}
-		err = writePositionTx(posCtx, tx, a.controlSchema, streamID, token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, delta)
-		posCancel()
-		if err != nil {
-			_ = tx.Rollback()
-			return false, classifyApplierError(err)
-		}
+	} else if marks, err = a.writeOwnPositionTx(ctx, tx, streamID, c, pw.own, skipped, &pending); err != nil {
+		_ = tx.Rollback()
+		return false, err
 	}
 	if err := a.commitWithTimeout(tx); err != nil {
 		// Same shutdown-race mapping as persistSourceTxCommit (the sibling
@@ -1676,6 +1756,51 @@ func (a *ChangeApplier) applyOneImpl(ctx context.Context, streamID string, c ir.
 		a.cacheActiveSchemaAfterCommit(snap)
 	}
 	return skipped, nil
+}
+
+// writeOwnPositionTx puts applyOneImpl's marks on tx and, when writePosition,
+// the change's OWN position after them (the serial per-change path, outside a
+// source transaction). It returns the marks plan for Committed. On an error
+// the caller rolls tx back.
+func (a *ChangeApplier) writeOwnPositionTx(ctx context.Context, tx *sql.Tx, streamID string, c ir.Change, writePosition, skipped bool, pending *applymarks.Pending) (applymarks.Plan, error) {
+	if writePosition {
+		// The position is written only OUTSIDE a source transaction here (a
+		// change inside one defers it to its TxCommit), so it passes every
+		// change applied so far — each change of a marker-less stream is its
+		// own ADR-0190 transaction, and closes with it (appliershared
+		// commitBatch's rule, on the per-change path).
+		a.marks.CloseOpen()
+	}
+	marks := a.marks.Plan(pending, writePosition)
+	if err := a.execApplyMarksTx(ctx, tx, marks); err != nil {
+		return applymarks.Plan{}, classifyApplierError(err)
+	}
+	if !writePosition {
+		return marks, nil
+	}
+	// H-4: flush the coalesced skip ledger before this change's position
+	// becomes durable (a skipped change dispatches to recordSkippedTable,
+	// which only accumulated). On failure the caller rolls the tx back so the
+	// change re-delivers and re-skips; on success the position may advance
+	// past it.
+	if err := a.flushSkippedTables(ctx); err != nil {
+		return applymarks.Plan{}, err
+	}
+	posCtx, posCancel := a.execTimeoutCtx(ctx)
+	defer posCancel()
+	// Serial per-change apply: this change is durable in the same tx as
+	// its position, so it contributes 1 to rows_applied when it is a
+	// row-level DML change and 0 for a Truncate / SchemaSnapshot — or for a
+	// change SKIPPED because its target table is absent (PG-2: a skip wrote
+	// no row, so it must not advance the counter).
+	delta := ir.RowsAppliedDelta(c)
+	if skipped {
+		delta = 0
+	}
+	if err := writePositionTx(posCtx, tx, a.controlSchema, streamID, c.Pos().Token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, delta); err != nil {
+		return applymarks.Plan{}, classifyApplierError(err)
+	}
+	return marks, nil
 }
 
 // errUnknownTable is the sentinel the colTypesFor lookup returns

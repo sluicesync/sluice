@@ -487,58 +487,48 @@ func (la *laneApplierAdapter) ClassifyError(err error) error {
 // WriteCheckpoint persists the merged frontier position in its own
 // transaction on the coordinator's primary pool (the ADR-0104 position
 // relaxation). The orchestrator owns the frontier read + the seq-monotone
-// guard; this does only the durable write, wrapping each error in
-// classifyApplierError exactly as the GA writeCheckpoint did.
+// guard; this does only the durable write (commitCheckpoint, whose body a
+// barrier's fold shares — ADR-0190 amendment E): this position passes
+// closedTxs, so their apply marks are deleted in the same transaction, and
+// the coalesced skip ledger the W lanes accumulated is flushed before the
+// position (H-4; a flush failure aborts the checkpoint, loudly, and the
+// lanes' work re-streams from the last frontier).
 func (la *laneApplierAdapter) WriteCheckpoint(ctx context.Context, pos ir.Position, rowsApplied int64, closedTxs []string) error {
-	a := la.a
-	// H-4: the frontier checkpoint is the concurrent path's position-write
-	// boundary, so flush the coalesced skip ledger the W lanes accumulated
-	// here, BEFORE the merged position becomes durable. A flush failure aborts
-	// the checkpoint (loud); the lanes' work re-streams from the last frontier.
-	if err := a.flushSkippedTables(ctx); err != nil {
-		return err
-	}
-	posCtx, cancel := a.execTimeoutCtx(ctx)
-	defer cancel()
-	tx, err := a.db.BeginTx(posCtx, nil)
-	if err != nil {
-		return classifyApplierError(fmt.Errorf("mysql: applier: checkpoint begin: %w", err))
-	}
-	// ADR-0190: this position passes closedTxs, so their apply marks go in
-	// the same transaction as the position.
-	a.marks.CloseTxs(closedTxs)
-	marks := a.marks.Plan(nil, true)
-	if err := a.execApplyMarksTx(posCtx, tx, marks); err != nil {
-		_ = tx.Rollback()
-		return classifyApplierError(err)
-	}
-	if err := writePositionTx(posCtx, tx, a.controlKeyspace, la.streamID, pos.Token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, rowsApplied, a.upsert); err != nil {
-		_ = tx.Rollback()
-		return classifyApplierError(fmt.Errorf("mysql: applier: checkpoint position write: %w", err))
-	}
-	if err := a.commitWithTimeout(tx); err != nil {
-		return classifyApplierError(fmt.Errorf("mysql: applier: checkpoint commit: %w", err))
-	}
-	a.marks.Committed(marks)
-	return nil
+	return la.a.commitCheckpoint(ctx, la.streamID, laneapply.BarrierCheckpoint{Pos: pos, RowsApplied: rowsApplied, ClosedTxs: closedTxs})
+}
+
+// FoldsBarrierCheckpoint implements [laneapply.LaneApplier] (ADR-0190
+// amendment E): every barrier kind runs as one real transaction on MySQL
+// except a Truncate — the server commits implicitly before and after DDL, so
+// the statements after a TRUNCATE would each autocommit, and a crash between
+// the closed-mark DELETE and the position UPSERT would leave T−1's marks
+// deleted with the position still at T−1's start (a silent keyless
+// duplicate on the replay). That premise is pinned against a real server by
+// TestApplyOne_TruncateSurvivesTheRollback and, bound to this answer, by
+// TestLaneBarrier_MySQLTruncateDeclines.
+func (la *laneApplierAdapter) FoldsBarrierCheckpoint(c ir.Change) bool {
+	_, truncate := c.(ir.Truncate)
+	return !truncate
 }
 
 // ApplyBarrierChange applies one barrier-path change on the coordinator
-// backend via applyBarrierNoPosition — which applies the data + ADR-0049
-// schema-history row + (for a SchemaSnapshot) the GUARDED cache-after-commit
-// invalidation (cacheActiveSchemaAfterCommit → invalidateTargetCachesForBoundary,
-// fired ONLY on a real signature-changing boundary, never on the first-touch
-// baseline — the SAME guarded path the serial applier uses), but does NOT
-// write the position. On the concurrent path the resume position is owned
-// exclusively by the frontier checkpoint (the ADR-0104 relaxation), so the
-// barrier must not write its own (metadata-anchored) token. The orchestrator
-// does NOT invalidate separately either (Bug 158: an unconditional
-// orchestrator-side invalidation bypassed the first-touch guard; on PG that
-// silently dropped all post-baseline changes — MySQL's text bind tolerated it
-// but the over-invalidation was still wrong, needlessly schema-dirtying every
-// table on first touch).
-func (la *laneApplierAdapter) ApplyBarrierChange(ctx context.Context, c ir.Change) error {
-	return la.a.applyBarrierNoPosition(ctx, la.streamID, c)
+// backend via applyBarrier — the data + ADR-0049 schema-history row + apply
+// marks, and, when at is non-nil, the folded pre-apply checkpoint after them
+// (ADR-0190 amendment E), in one transaction; a Truncate handed a checkpoint
+// refuses with BARRIER-FOLD-NOT-TRANSACTIONAL. It never writes the change's
+// own token: on the concurrent path the resume position is owned by the
+// frontier checkpoint (the ADR-0104 relaxation; Bug 158). For a
+// SchemaSnapshot it runs the GUARDED cache-after-commit invalidation
+// (cacheActiveSchemaAfterCommit → invalidateTargetCachesForBoundary, fired
+// ONLY on a real signature-changing boundary, never on the first-touch
+// baseline — the SAME guarded path the serial applier uses). The
+// orchestrator does NOT invalidate separately either (Bug 158: an
+// unconditional orchestrator-side invalidation bypassed the first-touch
+// guard; on PG that silently dropped all post-baseline changes — MySQL's
+// text bind tolerated it but the over-invalidation was still wrong,
+// needlessly schema-dirtying every table on first touch).
+func (la *laneApplierAdapter) ApplyBarrierChange(ctx context.Context, c ir.Change, at *laneapply.BarrierCheckpoint) error {
+	return la.a.applyBarrier(ctx, la.streamID, c, at)
 }
 
 // SkipsRowChange reports whether a row-level DML change would be dropped at

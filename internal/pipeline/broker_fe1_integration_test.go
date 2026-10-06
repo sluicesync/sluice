@@ -81,6 +81,15 @@ type fe1Chain struct {
 // store holds only the full.
 func fe1Setup(t *testing.T, seedDDL, loopBody string, beforeStream func(c *fe1Chain)) *fe1Chain {
 	t.Helper()
+	return fe1SetupWith(t, seedDDL, func(t *testing.T, src string) {
+		applyDDL(t, src, fmt.Sprintf(`DO $$ BEGIN FOR i IN 1..%d LOOP %s END LOOP; END $$;`, fe1Rows, loopBody))
+	}, beforeStream)
+}
+
+// fe1SetupWith is fe1Setup with the captured source traffic given as a
+// function (fe1Setup's is one source transaction of fe1Rows loop bodies).
+func fe1SetupWith(t *testing.T, seedDDL string, traffic func(t *testing.T, src string), beforeStream func(c *fe1Chain)) *fe1Chain {
+	t.Helper()
 	src, dst, store, fullID, td := brokerTestStreamSetup(t, seedDDL)
 	t.Cleanup(td)
 	c := &fe1Chain{src: src, dst: dst, store: store, fullID: fullID}
@@ -99,7 +108,7 @@ func fe1Setup(t *testing.T, seedDDL, loopBody string, beforeStream func(c *fe1Ch
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- stream.Run(ctx) }()
-	applyDDL(t, src, fmt.Sprintf(`DO $$ BEGIN FOR i IN 1..%d LOOP %s END LOOP; END $$;`, fe1Rows, loopBody))
+	traffic(t, src)
 	waitForIncrementals(t, store, 1, 60*time.Second)
 	time.Sleep(6 * time.Second) // let a trailing rollover settle
 	cancel()

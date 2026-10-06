@@ -97,7 +97,9 @@ func (s *scopedSeam) ClassifyError(err error) error { return err }
 
 func (s *scopedSeam) WriteCheckpoint(context.Context, ir.Position, int64, []string) error { return nil }
 
-func (s *scopedSeam) ApplyBarrierChange(context.Context, ir.Change) error {
+func (s *scopedSeam) FoldsBarrierCheckpoint(ir.Change) bool { return false }
+
+func (s *scopedSeam) ApplyBarrierChange(context.Context, ir.Change, *BarrierCheckpoint) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.barriers == 0 {

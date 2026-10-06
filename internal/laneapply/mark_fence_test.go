@@ -27,6 +27,8 @@ type fenceSeam struct {
 	events      []string
 	markTxAsked int
 	rowsTotal   int64
+
+	declineBarrierFolds bool
 }
 
 func (s *fenceSeam) ApplyLaneBatch(_ context.Context, _ int, batch []ir.Change, fold *FoldTicket) (int, error) {
@@ -72,12 +74,23 @@ func (s *fenceSeam) ApplyMarksFenced(txID string, anchored bool) {
 	s.events = append(s.events, fmt.Sprintf("fence:%s anchored=%v committed=%s", txID, anchored, strings.Join(committed, ",")))
 }
 
-func (s *fenceSeam) ApplyBarrierChange(context.Context, ir.Change) error {
+// FoldsBarrierCheckpoint: fenceSeam folds every barrier's checkpoint (ADR-0190
+// amendment E) unless declineBarrierFolds; a folded one is logged on the
+// barrier's own event ("barrier: … at=<pos> rows=<n> closed=<txs>") and its
+// increment summed with the other writers'.
+func (s *fenceSeam) FoldsBarrierCheckpoint(ir.Change) bool { return !s.declineBarrierFolds }
+
+func (s *fenceSeam) ApplyBarrierChange(_ context.Context, _ ir.Change, at *BarrierCheckpoint) error {
 	s.mu2.Lock()
 	defer s.mu2.Unlock()
 	committed := slices.Clone(s.applied)
 	slices.Sort(committed)
-	s.events = append(s.events, "barrier: committed="+strings.Join(committed, ","))
+	e := "barrier: committed=" + strings.Join(committed, ",")
+	if at != nil {
+		e += fmt.Sprintf(" at=%s rows=%d closed=%s", at.Pos.Token, at.RowsApplied, strings.Join(at.ClosedTxs, ","))
+		s.rowsTotal += at.RowsApplied
+	}
+	s.events = append(s.events, e)
 	return nil
 }
 
@@ -290,8 +303,9 @@ func barrierFoldStream(order string) []ir.Change {
 // mixed orders (§D.3). Fold first: the barrier's drain waits for the fold
 // (it sees the fold's change committed), and its pre-apply checkpoint writes
 // nothing — the fold claimed the transaction's start. Barrier first: the
-// barrier's pre-apply checkpoint persists the transaction's start
-// synchronously, so the fence that follows is anchored and issues NO ticket.
+// barrier folds the transaction's start into its own transaction (ADR-0190
+// amendment E §E.8) and the bookkeeping advances before anything else is
+// routed, so the fence that follows is anchored and issues NO ticket.
 func TestOrchestrator_BarrierAndFoldInOneTransaction(t *testing.T) {
 	for _, lanes := range []int{1, 3} {
 		seam := &fenceSeam{}
@@ -316,9 +330,13 @@ func TestOrchestrator_BarrierAndFoldInOneTransaction(t *testing.T) {
 		if f := seam.eventsWith("fence:"); !slices.Equal(f, []string{"fence:tx2 anchored=true committed=a"}) {
 			t.Errorf("lanes=%d, barrier first: fences %v; want tx2 fenced anchored\nevents: %v", lanes, f, seam.events)
 		}
-		if ck := seam.eventsWith("ckpt:"); len(ck) == 0 || ck[0] != "ckpt:c1" {
-			t.Errorf("lanes=%d, barrier first: checkpoints %v; the barrier's pre-apply checkpoint must write the start (c1)\nevents: %v",
-				lanes, ck, seam.events)
+		if b := seam.eventsWith("barrier:"); !slices.Equal(b, []string{"barrier: committed=a at=c1 rows=1 closed=tx1"}) {
+			t.Errorf("lanes=%d, barrier first: barrier %v; the barrier must fold the transaction's start (c1) into its own "+
+				"call (ADR-0190 amendment E)\nevents: %v", lanes, b, seam.events)
+		}
+		if ck := seam.eventsWith("ckpt:"); !slices.Equal(ck, []string{"ckpt:c2"}) {
+			t.Errorf("lanes=%d, barrier first: checkpoints %v; the barrier folded the start, so the coordinator writes only "+
+				"the end of the run (c2)\nevents: %v", lanes, ck, seam.events)
 		}
 	}
 }

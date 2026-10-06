@@ -25,6 +25,9 @@ type countingSeam struct {
 	// orchestrator must not count it toward rows_applied (PG-2). Empty (the
 	// zero value) means nothing is skipped, keeping the other tests unchanged.
 	missingTable string
+	// foldBarriers makes the seam fold each barrier's checkpoint (ADR-0190
+	// amendment E). false, the zero value, keeps the other tests unchanged.
+	foldBarriers bool
 }
 
 func (s *countingSeam) RouteForChange(_ context.Context, c ir.Change) (Route, bool, error) {
@@ -60,7 +63,20 @@ func (s *countingSeam) WriteCheckpoint(_ context.Context, _ ir.Position, rowsApp
 	return nil
 }
 
-func (s *countingSeam) ApplyBarrierChange(context.Context, ir.Change) error { return nil }
+// FoldsBarrierCheckpoint answers foldBarriers: false (the zero value) keeps
+// the two-commit barrier; true folds the barrier's checkpoint into its call
+// (ADR-0190 amendment E), whose increment is then recorded with the
+// checkpoints' — the sum across both writers is what the gates count.
+func (s *countingSeam) FoldsBarrierCheckpoint(ir.Change) bool { return s.foldBarriers }
+
+func (s *countingSeam) ApplyBarrierChange(_ context.Context, _ ir.Change, at *BarrierCheckpoint) error {
+	if at != nil {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.rowsDeltas = append(s.rowsDeltas, at.RowsApplied)
+	}
+	return nil
+}
 
 func (s *countingSeam) SkipsRowChange(_ context.Context, c ir.Change) bool {
 	if s.missingTable == "" || !ir.IsRowDMLChange(c) {
@@ -101,7 +117,10 @@ func (s *countingSeam) anyNegative() bool {
 // row-level DML changes applied — no double-count, no under-count — with
 // TRUNCATE / Tx markers excluded and a keyless (barriered) DML change still
 // counted. The count is realized only at frontier boundaries, so it can never
-// count a change the lanes didn't commit.
+// count a change the lanes didn't commit. It runs twice: with the barriers'
+// pre-apply checkpoints written by the coordinator, and folded into the
+// barriers' own calls (ADR-0190 amendment E) — the sum across every writer
+// must be the same exact count either way.
 func TestOrchestrator_RowsApplied_ExactUnderLaneApply(t *testing.T) {
 	tok := func(n string) ir.Position { return ir.Position{Engine: "mysql", Token: n} }
 	ins := func(p, id string) ir.Change {
@@ -119,16 +138,17 @@ func TestOrchestrator_RowsApplied_ExactUnderLaneApply(t *testing.T) {
 
 	// The stream: three transactions (marker stream) with mixed DML across
 	// distinct keys (spread over the lanes), a TRUNCATE barrier between them
-	// (not counted), and one keyless insert (barriered, still counted). Total
-	// row-level DML = 3 + 2 + 2 = 7.
+	// (not counted), and two keyless inserts (barriered, still counted; the one
+	// in Tx2 folds the checkpoint at Tx1's commit, carrying Tx1's 3). Total
+	// row-level DML = 3 + 3 + 2 = 8.
 	changes := []ir.Change{
 		// Tx1: 3 DML across distinct keys.
 		ir.TxBegin{Position: tok("t1")},
 		ins("t1", "1"), ins("t1", "2"), upd("t1", "3"),
 		ir.TxCommit{Position: tok("t1c")},
-		// Tx2: 2 DML.
+		// Tx2: 3 DML, one keyless (a barrier inside the transaction).
 		ir.TxBegin{Position: tok("t2")},
-		del("t2", "4"), ins("t2", "5"),
+		del("t2", "4"), keylessIns("t2"), ins("t2", "5"),
 		ir.TxCommit{Position: tok("t2c")},
 		// A TRUNCATE barrier (NOT row-level DML — excluded).
 		ir.Truncate{Position: tok("trunc"), Schema: "ks", Table: "t"},
@@ -137,27 +157,29 @@ func TestOrchestrator_RowsApplied_ExactUnderLaneApply(t *testing.T) {
 		keylessIns("t3"), ins("t3", "6"),
 		ir.TxCommit{Position: tok("t3c")},
 	}
-	const wantDML = 7
+	const wantDML = 8
 
 	// Run across several lane counts (serial through W>DML) — the aggregated
 	// total must be identical regardless of how the keys shard across lanes.
-	for _, lanes := range []int{1, 2, 4, 8} {
-		seam := &countingSeam{}
-		orch := NewOrchestrator(Config{Lanes: lanes, MaxBatchSize: 4}, seam)
-		ch := make(chan ir.Change, len(changes))
-		for _, c := range changes {
-			ch <- c
-		}
-		close(ch)
-		if err := orch.Run(context.Background(), ch); err != nil {
-			t.Fatalf("lanes=%d: Run: %v", lanes, err)
-		}
-		if seam.anyNegative() {
-			t.Fatalf("lanes=%d: a checkpoint carried a NEGATIVE rows delta: %v", lanes, seam.rowsDeltas)
-		}
-		if got := seam.total(); got != wantDML {
-			t.Fatalf("lanes=%d: cumulative rows_applied = %d; want %d (exact — no double/under-count)\ndeltas: %v",
-				lanes, got, wantDML, seam.rowsDeltas)
+	for _, fold := range []bool{false, true} {
+		for _, lanes := range []int{1, 2, 4, 8} {
+			seam := &countingSeam{foldBarriers: fold}
+			orch := NewOrchestrator(Config{Lanes: lanes, MaxBatchSize: 4}, seam)
+			ch := make(chan ir.Change, len(changes))
+			for _, c := range changes {
+				ch <- c
+			}
+			close(ch)
+			if err := orch.Run(context.Background(), ch); err != nil {
+				t.Fatalf("fold=%v lanes=%d: Run: %v", fold, lanes, err)
+			}
+			if seam.anyNegative() {
+				t.Fatalf("fold=%v lanes=%d: a checkpoint carried a NEGATIVE rows delta: %v", fold, lanes, seam.rowsDeltas)
+			}
+			if got := seam.total(); got != wantDML {
+				t.Fatalf("fold=%v lanes=%d: cumulative rows_applied = %d; want %d (exact — no double/under-count)\ndeltas: %v",
+					fold, lanes, got, wantDML, seam.rowsDeltas)
+			}
 		}
 	}
 }

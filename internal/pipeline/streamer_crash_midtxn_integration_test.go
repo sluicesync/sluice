@@ -715,6 +715,9 @@ func runCrashMidTxnSuite(t *testing.T, src crashSource, tgt resendTarget, pins c
 	// ADR-0190 amendment D: the fold's window, its anchored rule, the mixed
 	// barrier orders and a lane-count change after a fold.
 	crashFoldCells(t, src, tgt)
+	// ADR-0190 amendment E: the lane barrier's pre-apply checkpoint folded
+	// into its own transaction — blocked before its commit, and landed.
+	crashBarrierFoldCells(t, src, tgt)
 	// A schema event inside the interrupted transaction (the 2026-09-28
 	// CRITICAL): the serial batched path is the one that regressed; lanes and
 	// per-change are the controls.

@@ -109,6 +109,9 @@ func TestWriteCoreStatementOrder(t *testing.T) {
 		// end with it — the ADR-0190 amendment D fold writes the position
 		// LAST, so the stream's control row is locked only across COMMIT.
 		foldLast bool
+		// wantPositions: with foldLast, the committed transactions that must
+		// carry the position — one per fold the run makes.
+		wantPositions int
 	}
 	runs := []run{{
 		// Apply: a change outside a source transaction (data + marks +
@@ -172,15 +175,60 @@ func TestWriteCoreStatementOrder(t *testing.T) {
 			if err := lane.WriteCheckpoint(ctx, pos(), 2, []string{"l-1"}); err != nil {
 				return err
 			}
-			return lane.ApplyBarrierChange(ctx, logRow("l-2", 1))
+			return lane.ApplyBarrierChange(ctx, logRow("l-2", 1), nil)
+		},
+	}, {
+		// The lane barrier folding its pre-apply checkpoint (ADR-0190
+		// amendment E) on every kind MySQL folds — a keyless insert, a
+		// primary-key change, an absent-table skip, a SchemaSnapshot: data
+		// (if any), then marks and the closed transactions' deletes, then the
+		// position LAST. (Truncate is declined on MySQL and refused with a
+		// checkpoint: TestLaneBarrier_MySQLTruncateDeclines.)
+		cores:         []string{"lane-barrier"},
+		wantMixed:     2,
+		foldLast:      true,
+		wantPositions: 4,
+		do: func() error {
+			if err := a.startApplyMarks(ctx, testStreamID); err != nil {
+				return err
+			}
+			at := func(closed string) *laneapply.BarrierCheckpoint {
+				return &laneapply.BarrierCheckpoint{Pos: pos(), RowsApplied: 1, ClosedTxs: []string{closed}}
+			}
+			id++
+			before := ir.Row{"id": id, "code": fmt.Sprintf("c%d", id)}
+			if _, err := plain.ExecContext(ctx, "INSERT INTO wco_items (id, code) VALUES (?, ?)", before["id"], before["code"]); err != nil {
+				return err
+			}
+			id++
+			after := ir.Row{"id": id, "code": before["code"]}
+			for _, b := range []struct {
+				c     ir.Change
+				prior string
+			}{
+				{logRow("e-1", 1), "e-0"},
+				{ir.Update{Schema: "target_db", Table: "wco_items", Before: before, After: after, Position: pos(), ApplyID: ir.ApplyID{TxID: "e-2", Seq: 1}}, "e-1"},
+				{ir.Insert{Schema: "target_db", Table: "wco_absent", Row: ir.Row{"v": "x"}, Position: pos(), ApplyID: ir.ApplyID{TxID: "e-3", Seq: 1}}, "e-2"},
+				{ir.SchemaSnapshot{Position: pos(), Schema: "target_db", Table: "wco_items", IR: &ir.Table{
+					Name:       "wco_items",
+					Columns:    []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}, {Name: "code", Type: ir.Varchar{Length: 32}}},
+					PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}},
+				}}, "e-3"},
+			} {
+				if err := lane.ApplyBarrierChange(ctx, b.c, at(b.prior)); err != nil {
+					return fmt.Errorf("%T: %w", b.c, err)
+				}
+			}
+			return nil
 		},
 	}, {
 		// A fold batch (ADR-0190 amendment D): the fenced transaction's rows,
 		// its marks with the closed transaction's deleted, then the anchor
 		// position — one mixed transaction, data first, position last.
-		cores:     []string{"lane-batch"},
-		wantMixed: 1,
-		foldLast:  true,
+		cores:         []string{"lane-batch"},
+		wantMixed:     1,
+		foldLast:      true,
+		wantPositions: 1,
 		do: func() error {
 			if err := a.startApplyMarks(ctx, testStreamID); err != nil {
 				return err
@@ -201,7 +249,7 @@ func TestWriteCoreStatementOrder(t *testing.T) {
 		if err := r.do(); err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
-		mixed, control := 0, 0
+		mixed, control, positions := 0, 0, 0
 		for _, tx := range rec.Take() {
 			if !tx.Committed {
 				continue
@@ -215,7 +263,8 @@ func TestWriteCoreStatementOrder(t *testing.T) {
 			if tx.Has(applyorder.Control) {
 				control++
 			}
-			if r.foldLast && tx.Mixed() {
+			if r.foldLast && tx.Has(applyorder.Control) {
+				positions++
 				if last := tx.Stmts[len(tx.Stmts)-1]; !strings.Contains(last, "sluice_cdc_state") {
 					t.Errorf("%s: a fold transaction did not write the position last (it ended with %q)\n  statements: %q", name, last, tx.Stmts)
 				}
@@ -223,6 +272,9 @@ func TestWriteCoreStatementOrder(t *testing.T) {
 		}
 		if mixed < r.wantMixed {
 			t.Errorf("%s: %d mixed data+control transactions; the run is built to produce %d — it is not exercising the order under test", name, mixed, r.wantMixed)
+		}
+		if r.foldLast && positions < r.wantPositions {
+			t.Errorf("%s: %d committed transactions carried the position; the run makes %d folds — a fold wrote no position", name, positions, r.wantPositions)
 		}
 		if control == 0 {
 			t.Errorf("%s: no transaction wrote a control table — the run is not reaching its core", name)

@@ -54,7 +54,9 @@ func (s *splitSeam) ApplyLaneBatch(_ context.Context, _ int, batch []ir.Change, 
 	return len(batch), nil
 }
 
-func (s *splitSeam) ApplyBarrierChange(_ context.Context, c ir.Change) error {
+func (s *splitSeam) FoldsBarrierCheckpoint(ir.Change) bool { return false }
+
+func (s *splitSeam) ApplyBarrierChange(_ context.Context, c ir.Change, _ *BarrierCheckpoint) error {
 	if s.refuses(c) {
 		return splitNoterErr{}
 	}

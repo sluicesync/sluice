@@ -75,7 +75,11 @@ func (s *testSeam) ClassifyError(err error) error { return classifyTest(err) }
 
 func (s *testSeam) WriteCheckpoint(context.Context, ir.Position, int64, []string) error { return nil }
 
-func (s *testSeam) ApplyBarrierChange(context.Context, ir.Change) error { return nil }
+func (s *testSeam) FoldsBarrierCheckpoint(ir.Change) bool { return false }
+
+func (s *testSeam) ApplyBarrierChange(context.Context, ir.Change, *BarrierCheckpoint) error {
+	return nil
+}
 
 func (s *testSeam) SkipsRowChange(context.Context, ir.Change) bool { return false }
 
@@ -459,10 +463,13 @@ func (s *routingSeam) ClassifyError(err error) error { return classifyTest(err) 
 func (s *routingSeam) WriteCheckpoint(context.Context, ir.Position, int64, []string) error {
 	return nil
 }
-func (s *routingSeam) ApplyBarrierChange(context.Context, ir.Change) error { return nil }
-func (s *routingSeam) SkipsRowChange(context.Context, ir.Change) bool      { return false }
-func (s *routingSeam) ApplyMarkTx(context.Context, ir.Change) string       { return "" }
-func (s *routingSeam) ApplyMarksFenced(string, bool)                       {}
+func (s *routingSeam) FoldsBarrierCheckpoint(ir.Change) bool { return false }
+func (s *routingSeam) ApplyBarrierChange(context.Context, ir.Change, *BarrierCheckpoint) error {
+	return nil
+}
+func (s *routingSeam) SkipsRowChange(context.Context, ir.Change) bool { return false }
+func (s *routingSeam) ApplyMarkTx(context.Context, ir.Change) string  { return "" }
+func (s *routingSeam) ApplyMarksFenced(string, bool)                  {}
 
 // TestLaneApply_Run_TargetFailureNotMaskedAsCtxCancel is THE regression pin:
 // a lane whose target write fails (a non-retriable connection error here)

@@ -27,9 +27,10 @@ package postgres
 //   - per-change (Apply / applyOneImpl) and the serial batch loop write marks
 //     with their rows and delete a transaction's marks with the position
 //     write that passes its commit;
-//   - the lane barrier (applyBarrierNoPosition) writes marks — its
-//     pre-barrier checkpoint has already persisted the position up to the
-//     barrier's own transaction;
+//   - the lane barrier (applyBarrier) writes marks — in the transaction that
+//     also writes its pre-barrier checkpoint, the position at the barrier's
+//     own transaction's start (ADR-0190 amendment E; a MySQL Truncate
+//     barrier, which marks nothing, still writes it separately first);
 //   - lane batches write the marks of the transaction the coordinator's mark
 //     fence cleared (amendment A: it drained the lanes and persisted the
 //     position at that transaction's start first), and the frontier checkpoint

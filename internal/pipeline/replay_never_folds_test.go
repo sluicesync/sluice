@@ -16,7 +16,7 @@ import (
 
 // switchSites are the only places the --exactly-once-lanes switch may be
 // written, per form, keyed by file (relative to the module root). Every other
-// write fails TestReplayPathsNeverFold.
+// write fails TestReplayPathsNeverFoldAMarkFence.
 var switchSites = map[string][]string{
 	// sync start and the fleet spec build a Streamer from the operator's flag.
 	"ExactlyOnceLanes:": {
@@ -40,11 +40,18 @@ func replayFile(path string) bool {
 		path == "internal/pipeline/blobcodec/backup_change_chunk.go"
 }
 
-// TestReplayPathsNeverFold holds ADR-0190 amendment D's scope exemption
-// (§D.7): the `sync from-backup` broker and chain replay reach the lane
-// orchestrator through migcore.ApplyApplyConcurrency, and neither can ever
-// issue a fold ticket — for TWO independent reasons, each checked here
-// because two reasons are only worth having if each holds:
+// TestReplayPathsNeverFoldAMarkFence holds ADR-0190 amendment D's scope
+// exemption (§D.7): the `sync from-backup` broker and chain replay reach the
+// lane orchestrator through migcore.ApplyApplyConcurrency, and neither can
+// ever issue a MARK FENCE's fold ticket — for TWO independent reasons, each
+// checked here because two reasons are only worth having if each holds.
+//
+// Scope, stated because the name once read broader: this gates amendment D's
+// fold only. The replay paths DO fold at their lane BARRIERS (amendment E):
+// a barrier's pre-apply checkpoint rides the barrier's own transaction
+// wherever the lane orchestrator runs, with no flag — on the broker it is the
+// same parent token today's separate checkpoint wrote (BRK-1), which
+// TestBroker_BarrierFoldKeepsTheParentToken pins. The reasons:
 //
 //  1. only `sync start` (and the fleet spec) turns --exactly-once-lanes on.
 //     Every write of the switch across internal/ and cmd/ is held to
@@ -63,7 +70,7 @@ func replayFile(path string) bool {
 // would need adding to replayFile. The anti-vacuity floor: the walk must
 // find both replay paths' calls to ApplyApplyConcurrency and every listed
 // switch site.
-func TestReplayPathsNeverFold(t *testing.T) {
+func TestReplayPathsNeverFoldAMarkFence(t *testing.T) {
 	fset := token.NewFileSet()
 	found := map[string][]string{}
 	var concurrency, identity, strays []string

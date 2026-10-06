@@ -15,7 +15,10 @@ import (
 // CONTROL rule orders (GC-41 (c); see writePositionTx). Completeness is
 // enforced below: every function taking a transaction is classified in
 // txFuncClass, and each "control" one must be listed here.
-var controlTxWriters = []string{"execApplyMarksTx", "writePositionTx", "writeSchemaVersion", "writePositionUpsertSQL", "applyMarkStatements", "schemaVersionUpsertSQL"}
+var controlTxWriters = []string{
+	"execApplyMarksTx", "writePositionTx", "writeSchemaVersion", "writePositionUpsertSQL", "applyMarkStatements", "schemaVersionUpsertSQL",
+	"writeCheckpointTx", "writeOwnPositionTx",
+}
 
 // txFuncClass classifies every function in the package that takes a
 // transaction (*sql.Tx or the schema-history execers): "control" writes a
@@ -25,6 +28,8 @@ var controlTxWriters = []string{"execApplyMarksTx", "writePositionTx", "writeSch
 // below rather than classified here.
 var txFuncClass = map[string]string{
 	"ChangeApplier.execApplyMarksTx":         "control",
+	"ChangeApplier.writeCheckpointTx":        "control", // ADR-0190 amendment E: marks, skip-ledger flush, position — after any data
+	"ChangeApplier.writeOwnPositionTx":       "control", // applyOneImpl's marks, then (serial per-change) the change's own position
 	"writePositionTx":                        "control",
 	"writeSchemaVersion":                     "control",
 	"compactSchemaHistoryBelow":              "neutral", // runs on a.db in its own statement, never inside an apply transaction
@@ -56,7 +61,10 @@ var writeCoreClass = map[string]string{
 	"mysqlBatchTx.dispatchDelete":           applyorder.Helper,
 	"ChangeApplier.applyOne":                applyorder.Helper,
 	"ChangeApplier.applySchemaEvent":        applyorder.Helper,
-	"ChangeApplier.applyBarrierNoPosition":  applyorder.Helper,
+	"ChangeApplier.applyBarrier":            applyorder.Helper, // the lane barrier, folding or not (ADR-0190 amendment E)
+	"ChangeApplier.writeCheckpointTx":       applyorder.Helper,
+	"ChangeApplier.writeOwnPositionTx":      applyorder.Helper,
+	"ChangeApplier.commitCheckpoint":        applyorder.Helper,    // WriteCheckpoint's transaction, and a skipped barrier's
 	"CDCReader.deliver":                     applyorder.Unrelated, // the binlog reader's own dispatch
 	"CDCReader.dispatchTransactionPayload":  applyorder.Unrelated,
 	"vstreamCDCReader.pump":                 applyorder.Unrelated,

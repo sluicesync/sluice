@@ -18,6 +18,7 @@ import (
 	tcexec "github.com/testcontainers/testcontainers-go/exec"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/laneapply"
 )
 
 // TestVStream_ControlKeyspaceTornCommit_PositionStaysBehindData is GC-41
@@ -173,6 +174,156 @@ func TestVStream_ControlKeyspaceTornCommit_PositionStaysBehindData(t *testing.T)
 	}
 	if got, _, _ := a2.ReadPosition(ctx, testStreamID); got.Token != tokA {
 		t.Fatalf("after re-delivery the position = %q; want %q", got.Token, tokA)
+	}
+}
+
+// TestVStream_ControlKeyspaceTornCommit_BarrierFoldStaysBehindData is the
+// lane-barrier twin of the test above (ADR-0190 amendment E, §E.6 / P10).
+// Under the fold a barrier that writes NO control row of its own — a keyless
+// change with no ADR-0190 identity, so no apply mark — still becomes a
+// cross-keyspace transaction, because it now carries the folded checkpoint:
+// its row on the data shard, then the closed transaction's mark deletion
+// and the position on the control shard. The two-order argument says a tear
+// is harmless either way; this measures the order that matters on a real
+// vtgate MULTI commit.
+//
+// T−1's apply mark is planted and loaded, and the folded checkpoint closes
+// T−1, so the barrier's transaction deletes it. The stream's position row is
+// held FOR UPDATE, so the barrier's transaction blocks at its position
+// write with both shards touched; the data shard's backend connection is
+// killed and the lock released. At COMMIT the data shard fails first, so
+// nothing of the control shard commits: the position stays at T−1's start,
+// T−1's mark survives, and the barrier's row is not on the target. The
+// re-delivered barrier then applies once.
+func TestVStream_ControlKeyspaceTornCommit_BarrierFoldStaysBehindData(t *testing.T) {
+	vt := bootVTTestServer(t, "data,ctl", "1,1")
+	defer vt.terminate()
+	dsn := vt.dsn("data")
+	applyVTTestSQL(t, dsn, `CREATE TABLE tear_keyless (v VARCHAR(32) NOT NULL) ENGINE=InnoDB`)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	var mode string
+	if err := db.QueryRowContext(ctx, `SELECT @@transaction_mode`).Scan(&mode); err != nil || mode != "MULTI" {
+		t.Fatalf("premise: vtgate @@transaction_mode = %q (err %v); this test measures MULTI's commit order", mode, err)
+	}
+	eng, err := Engine{Flavor: FlavorVitess}.WithControlKeyspace("ctl")
+	if err != nil {
+		t.Fatalf("WithControlKeyspace: %v", err)
+	}
+	open := func() *ChangeApplier {
+		t.Helper()
+		a, err := eng.OpenChangeApplier(ctx, dsn)
+		if err != nil {
+			t.Fatalf("OpenChangeApplier: %v", err)
+		}
+		return a.(*ChangeApplier)
+	}
+	a := open()
+	defer func() { _ = a.Close() }()
+	if err := a.EnsureControlTable(ctx); err != nil {
+		t.Fatalf("EnsureControlTable: %v", err)
+	}
+	const (
+		tokPrev = `{"gtid":"3E11FA47-71CA-11E1-9E33-C80AA9429562:1-20"}` // T−1's start: the position persisted before
+		tokT    = `{"gtid":"3E11FA47-71CA-11E1-9E33-C80AA9429562:1-21"}` // T's start: the checkpoint the barrier folds
+	)
+	if err := a.WritePosition(ctx, testStreamID, ir.Position{Engine: engineNameMySQL, Token: tokPrev}); err != nil {
+		t.Fatalf("WritePosition: %v", err)
+	}
+	marksRef := controlTableRef("ctl", "sluice_cdc_apply_marks")
+	if _, err := db.ExecContext(ctx, "INSERT INTO "+marksRef+` (stream_id, table_name, key_digest, tx_id, seq, change_digest, scope_digest)
+		VALUES (?, 'data.tear_items', 'k-prev', 'tx-prev', 1, 'd', '')`, testStreamID); err != nil {
+		t.Fatalf("plant T−1's mark: %v", err)
+	}
+	if err := a.startApplyMarks(ctx, testStreamID); err != nil {
+		t.Fatalf("startApplyMarks: %v", err)
+	}
+	prevMarks := func() int {
+		t.Helper()
+		var n int
+		if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+marksRef+" WHERE tx_id = 'tx-prev'").Scan(&n); err != nil {
+			t.Fatalf("count marks: %v", err)
+		}
+		return n
+	}
+	keylessRows := func() int {
+		t.Helper()
+		var n int
+		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM tear_keyless`).Scan(&n); err != nil {
+			t.Fatalf("count: %v", err)
+		}
+		return n
+	}
+
+	lockTx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin lock tx: %v", err)
+	}
+	var held string
+	if err := lockTx.QueryRowContext(ctx, "SELECT stream_id FROM "+controlTableRef("ctl", controlTableName)+" WHERE stream_id = ? FOR UPDATE", testStreamID).Scan(&held); err != nil {
+		_ = lockTx.Rollback()
+		t.Fatalf("lock the position row: %v", err)
+	}
+	la := &laneApplierAdapter{a: a, streamID: testStreamID}
+	barrier := ir.Insert{Schema: "data", Table: "tear_keyless", Row: ir.Row{"v": "b"}, Position: ir.Position{Engine: engineNameMySQL, Token: tokT}}
+	at := &laneapply.BarrierCheckpoint{Pos: ir.Position{Engine: engineNameMySQL, Token: tokT}, RowsApplied: 1, ClosedTxs: []string{"tx-prev"}}
+	applyErr := make(chan error, 1)
+	go func() { applyErr <- la.ApplyBarrierChange(ctx, barrier, at) }()
+
+	// The barrier's ONE transaction blocked at its position write with its
+	// row open on the data shard — a separate checkpoint commit could not
+	// build this state (it would wait with no data transaction open).
+	thread := waitForTornCommitSetup(ctx, t, vt, applyErr)
+	mysqldExec(ctx, t, vt, "KILL "+strconv.FormatInt(thread, 10))
+	if err := lockTx.Rollback(); err != nil {
+		t.Fatalf("release the position row: %v", err)
+	}
+	if err := <-applyErr; err == nil {
+		t.Fatal("the barrier committed although its data-shard connection was killed before COMMIT — the tear was not induced, so this run proves nothing")
+	}
+
+	got, ok, err := a.ReadPosition(ctx, testStreamID)
+	if err != nil || !ok {
+		t.Fatalf("ReadPosition after the torn commit: ok=%v err=%v", ok, err)
+	}
+	if got.Token == tokT {
+		t.Fatalf("the torn barrier commit persisted its folded position %s while its row is on the target %d times — the "+
+			"control shard committed before the data shard", tokT, keylessRows())
+	}
+	if got.Token != tokPrev {
+		t.Fatalf("position after the torn commit = %q; want T−1's start %q", got.Token, tokPrev)
+	}
+	if n := prevMarks(); n != 1 {
+		t.Fatalf("T−1's apply mark is on the target %d times after the torn commit; want 1 — its deletion committed without "+
+			"the position and data it travels with", n)
+	}
+	if n := keylessRows(); n != 0 {
+		t.Fatalf("the barrier's row is on the target %d times; the data shard's commit was meant to fail", n)
+	}
+
+	// Redelivery from T−1's start: the barrier applies once, with its fold.
+	a2 := open()
+	defer func() { _ = a2.Close() }()
+	if err := a2.startApplyMarks(ctx, testStreamID); err != nil {
+		t.Fatalf("startApplyMarks: %v", err)
+	}
+	if err := (&laneApplierAdapter{a: a2, streamID: testStreamID}).ApplyBarrierChange(ctx, barrier, at); err != nil {
+		t.Fatalf("re-delivered barrier: %v", err)
+	}
+	if n := keylessRows(); n != 1 {
+		t.Fatalf("after re-delivery the target holds %d copies of the barrier's row; want 1", n)
+	}
+	if got, _, _ := a2.ReadPosition(ctx, testStreamID); got.Token != tokT {
+		t.Fatalf("after re-delivery the position = %q; want %q", got.Token, tokT)
+	}
+	if n := prevMarks(); n != 0 {
+		t.Fatalf("after re-delivery T−1's mark is still on the target (%d); the fold closes it", n)
 	}
 }
 

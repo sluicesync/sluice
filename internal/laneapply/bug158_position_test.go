@@ -19,10 +19,18 @@ import (
 // longer calls one (the Bug-158 over-invalidation) is enforced structurally by
 // the interface — recordingSeam compiling against [LaneApplier] is itself the
 // guard.
+//
+// It folds every barrier's checkpoint (ADR-0190 amendment E), as both engines
+// do for a SchemaSnapshot and a row barrier, and records a folded position in
+// checkpoints too — that list is every position the seam persisted, by either
+// writer — and in folded, so a test can tell the two apart. declineFolds
+// answers false instead (the two-commit sequence).
 type recordingSeam struct {
-	mu          sync.Mutex
-	checkpoints []string    // tokens passed to WriteCheckpoint, in order
-	barriers    []ir.Change // changes passed to ApplyBarrierChange, in order
+	mu           sync.Mutex
+	checkpoints  []string    // every persisted token, WriteCheckpoint's and the barrier folds', in order
+	folded       []string    // the tokens barriers folded, in order
+	barriers     []ir.Change // changes passed to ApplyBarrierChange, in order
+	declineFolds bool
 }
 
 func (s *recordingSeam) RouteForChange(_ context.Context, c ir.Change) (Route, bool, error) {
@@ -48,10 +56,16 @@ func (s *recordingSeam) WriteCheckpoint(_ context.Context, pos ir.Position, _ in
 	return nil
 }
 
-func (s *recordingSeam) ApplyBarrierChange(_ context.Context, c ir.Change) error {
+func (s *recordingSeam) FoldsBarrierCheckpoint(ir.Change) bool { return !s.declineFolds }
+
+func (s *recordingSeam) ApplyBarrierChange(_ context.Context, c ir.Change, at *BarrierCheckpoint) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.barriers = append(s.barriers, c)
+	if at != nil {
+		s.checkpoints = append(s.checkpoints, at.Pos.Token)
+		s.folded = append(s.folded, at.Pos.Token)
+	}
 	return nil
 }
 

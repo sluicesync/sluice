@@ -55,7 +55,8 @@ import (
 //   - serial batch: BatchConfig.CheckpointOnlyAtTxBoundary (change_applier_batch.go);
 //   - per-change: positions deferred to the TxCommit (persistSourceTxCommit);
 //   - concurrent lanes: the frontier checkpoint at a durable boundary, and
-//     the barrier (applyBarrierNoPosition) writes none.
+//     the barrier (applyBarrier) writes none of its own — only that
+//     checkpoint, folded into its transaction (ADR-0190 amendment E).
 //
 // In-progress chunks are not requested at all (START_REPLICATION passes no
 // `streaming` option). So the comparison is between two transaction-boundary

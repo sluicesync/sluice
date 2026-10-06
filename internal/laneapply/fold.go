@@ -46,6 +46,44 @@ type FoldTicket struct {
 	ClosedTxs []string
 }
 
+// BarrierCheckpoint is ADR-0190 amendment E's fold: the pre-apply checkpoint
+// a lane barrier would have persisted in its own synchronous transaction,
+// handed instead to [LaneApplier.ApplyBarrierChange], which writes it in the
+// barrier's own target transaction — after the data and the marks, last.
+//
+// Its fields are exactly what [LaneApplier.WriteCheckpoint] would have been
+// handed for the same boundary. Pos is the barrier's source transaction's
+// START (the highest recorded boundary below the barrier, durable on every
+// lane after the barrier's drain), never the barrier's own position: that is
+// mid-transaction on a marker stream, and metadata-anchored (0/0) for a
+// SchemaSnapshot (Bug 158). RowsApplied is the route-time DML count up to Pos
+// — the barrier's own row is counted by a LATER boundary, never by this one.
+// ClosedTxs are the transactions Pos passes, whose apply marks the barrier's
+// transaction deletes; the barrier's own transaction is never among them.
+type BarrierCheckpoint struct {
+	Pos         ir.Position
+	RowsApplied int64
+	ClosedTxs   []string
+}
+
+// BarrierFoldNotTransactionalMarker is the grep-stable token of the refusal
+// an engine raises when [LaneApplier.ApplyBarrierChange] is handed a
+// [BarrierCheckpoint] for a change kind its FoldsBarrierCheckpoint declines
+// (a MySQL-family Truncate: the server commits implicitly around the DDL, so
+// a position written after it would autocommit on its own, apart from the
+// marks it must travel with). The coordinator consults FoldsBarrierCheckpoint
+// before it builds one, so this is a coordinator-defect tripwire: the run
+// fails loudly rather than writing a position outside a transaction.
+const BarrierFoldNotTransactionalMarker = "BARRIER-FOLD-NOT-TRANSACTIONAL"
+
+// BarrierFoldNotTransactional is the [BarrierFoldNotTransactionalMarker]
+// refusal for c, raised by an engine before it writes anything.
+func BarrierFoldNotTransactional(engine string, c ir.Change) error {
+	return fmt.Errorf("laneapply: %s: %s was handed a barrier checkpoint to fold for a %T, which it applies outside "+
+		"one transaction — the coordinator must write that checkpoint itself (ADR-0190 amendment E)",
+		BarrierFoldNotTransactionalMarker, engine, c)
+}
+
 // FoldTicketDuplicateMarker is the grep-stable token of the refusal a lane
 // raises when one batch carries two fold tickets. The coordinator issues
 // ticket T+1 only after a drain that required ticket T's batch to commit, so

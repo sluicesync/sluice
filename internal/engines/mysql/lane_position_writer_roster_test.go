@@ -20,11 +20,25 @@ var lanePositionWriters = []string{"writePositionTx", "writePositionUpsertSQL"}
 // position writer — see the Postgres twin (TestLanePositionWriterRoster there)
 // for the classes.
 var lanePositionClass = map[string]string{
-	"laneApplierAdapter.WriteCheckpoint": "checkpoint",
-	"laneApplierAdapter.writeFold":       "fold",
-	"laneApplierAdapter.ApplyLaneBatch":  "fold-core",
-	"laneApplierAdapter.ApplyBarrierChange": "position-free: applyBarrierNoPosition runs applyOneImpl with " +
-		"writePosition=false (Bug 158), reached here only by bare-name matching",
+	"laneApplierAdapter.WriteCheckpoint":    "checkpoint",
+	"laneApplierAdapter.writeFold":          "fold",
+	"laneApplierAdapter.ApplyLaneBatch":     "fold-core",
+	"laneApplierAdapter.ApplyBarrierChange": "barrier-fold",
+}
+
+// laneTxBody: see the Postgres twin. The checks grade the function that owns
+// each core's transaction, never a one-line adapter.
+var laneTxBody = map[string]string{
+	"laneApplierAdapter.WriteCheckpoint":    "ChangeApplier.commitCheckpoint",
+	"laneApplierAdapter.ApplyBarrierChange": "ChangeApplier.applyOneImpl",
+}
+
+// laneBody returns the [applyorder.Func] that owns key's transaction.
+func laneBody(funcs map[string]*applyorder.Func, key string) *applyorder.Func {
+	if body, ok := laneTxBody[key]; ok {
+		return funcs[body]
+	}
+	return funcs[key]
 }
 
 // postCommitHook: see the Postgres twin.
@@ -32,17 +46,20 @@ var postCommitHook = regexp.MustCompile(`^(report|release|notify|ack)|Report|Rel
 
 // laneCommitCall is the COMMIT each position-writing lane core makes.
 var laneCommitCall = map[string]string{
-	"laneApplierAdapter.WriteCheckpoint": "commitWithTimeout",
-	"laneApplierAdapter.ApplyLaneBatch":  "commitWithTimeout",
+	"laneApplierAdapter.WriteCheckpoint":    "commitWithTimeout",
+	"laneApplierAdapter.ApplyLaneBatch":     "commitWithTimeout",
+	"laneApplierAdapter.ApplyBarrierChange": "commitWithTimeout",
 }
 
 // TestLanePositionWriterRoster is the Postgres gate's MySQL twin: every
-// laneApplierAdapter method that can reach a position writer is classified,
-// a checkpoint and a fold writer both exist, the fold's write core leaves the
-// checkpoint's post-commit trail (Committed, and any hook), and it anchors
-// its fold only after its COMMIT. Reach as the twin states; no
-// synchronous_commit check here — MySQL's commit durability is server
-// configuration, the same for both writers.
+// laneApplierAdapter method that can reach a position writer is classified;
+// a checkpoint, a fold writer and the barrier fold (ADR-0190 amendment E) all
+// exist; every position-writing core — graded on the function that owns its
+// transaction (laneTxBody) — leaves the checkpoint's post-commit trail
+// (Committed, and any hook); and a fold core anchors its fold only after its
+// COMMIT. Reach as the twin states; no synchronous_commit check here —
+// MySQL's commit durability is server configuration, the same for every
+// writer.
 func TestLanePositionWriterRoster(t *testing.T) {
 	funcs, err := applyorder.ParseFuncs(".")
 	if err != nil {
@@ -57,7 +74,7 @@ func TestLanePositionWriterRoster(t *testing.T) {
 		class, ok := lanePositionClass[key]
 		if !ok {
 			t.Errorf("%s can reach a position writer and is not classified in lanePositionClass (checkpoint, fold, fold-core, "+
-				"or position-free with a reason)", key)
+				"barrier-fold, or position-free with a reason)", key)
 			continue
 		}
 		kinds[strings.SplitN(class, ":", 2)[0]]++
@@ -67,20 +84,27 @@ func TestLanePositionWriterRoster(t *testing.T) {
 			t.Errorf("lanePositionClass names %s, which no longer reaches a position writer — stale", key)
 		}
 	}
-	if kinds["checkpoint"] < 1 || kinds["fold"] < 1 || kinds["checkpoint"]+kinds["fold"] < 2 {
-		t.Fatalf("found %v lane position writers; want at least one checkpoint and one fold writer — the walk is not finding them", kinds)
+	if kinds["checkpoint"] < 1 || kinds["fold"] < 1 || kinds["barrier-fold"] < 1 {
+		t.Fatalf("found %v lane position writers; want at least one checkpoint, one fold writer and the barrier fold — "+
+			"the walk is not finding them", kinds)
+	}
+	for key, body := range laneTxBody {
+		if funcs[body] == nil {
+			t.Fatalf("laneTxBody names %s as %s's transaction, and no such function exists — stale", body, key)
+		}
 	}
 	var hooks []string
-	for callee := range funcs["laneApplierAdapter.WriteCheckpoint"].Calls {
+	for callee := range laneBody(funcs, "laneApplierAdapter.WriteCheckpoint").Calls {
 		if postCommitHook.MatchString(callee) {
 			hooks = append(hooks, callee)
 		}
 	}
 	for key, class := range lanePositionClass {
-		if class != "fold-core" && class != "checkpoint" {
+		if class != "fold-core" && class != "checkpoint" && class != "barrier-fold" {
 			continue
 		}
-		calls := funcs[key].Calls
+		body := laneBody(funcs, key)
+		calls := body.Calls
 		if !calls["Committed"] {
 			t.Errorf("%s (%s) never calls Committed: the marks it makes durable would not be retired", key, class)
 		}
@@ -95,7 +119,7 @@ func TestLanePositionWriterRoster(t *testing.T) {
 			t.Errorf("%s (%s) does not call its COMMIT %q (laneCommitCall)", key, class, commit)
 			continue
 		}
-		if class == "fold-core" && !funcs[key].Before(commit, "Anchor") {
+		if class == "fold-core" && !body.Before(commit, "Anchor") {
 			t.Errorf("%s anchors its fold before (or without) its COMMIT %s", key, commit)
 		}
 	}

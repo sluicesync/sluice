@@ -192,21 +192,52 @@ type LaneApplier interface {
 	// position. Empty on a stream whose reader stamps no identity.
 	WriteCheckpoint(ctx context.Context, pos ir.Position, rowsApplied int64, closedTxs []string) error
 
+	// FoldsBarrierCheckpoint reports whether [LaneApplier.ApplyBarrierChange]
+	// runs c as ONE target transaction that can also carry the barrier's
+	// pre-apply checkpoint (ADR-0190 amendment E). It is pure: no side effect,
+	// no I/O. false — the zero answer, and the right one for any change kind
+	// an engine has not examined — keeps the two commits that predate the
+	// amendment: the coordinator writes the checkpoint itself, then hands the
+	// change over with a nil checkpoint. MySQL answers false for an
+	// [ir.Truncate] (the server commits implicitly around DDL, so nothing
+	// after the TRUNCATE shares its transaction); Postgres answers true for
+	// every kind (its TRUNCATE is transactional).
+	FoldsBarrierCheckpoint(c ir.Change) bool
+
 	// ApplyBarrierChange applies one barrier-path change on the coordinator
-	// backend (writing its position + data atomically per ADR-0007), and —
-	// for a SchemaSnapshot — performs ALL engine-side metadata-cache
+	// backend, after the coordinator drained every lane to the barrier's
+	// predecessor. It writes the change's data, its apply marks and — for a
+	// SchemaSnapshot — the ADR-0049 history row in one target transaction. It
+	// NEVER writes the change's OWN position (Bug 158: a SchemaSnapshot's is
+	// metadata-anchored, 0/0 at a pgoutput first touch; a row barrier's is
+	// mid-transaction on a marker stream).
+	//
+	// at, when non-nil, is the barrier's folded pre-apply checkpoint
+	// (amendment E): the position the coordinator would otherwise have
+	// persisted in its own [LaneApplier.WriteCheckpoint] transaction just
+	// before this call — the barrier's source transaction's START. The engine
+	// writes it in the barrier's transaction, in this order: the data, then
+	// the marks (closing at.ClosedTxs: the barrier's own mark upserts and the
+	// closed transactions' deletes), then the coalesced skip ledger's flush,
+	// then at.Pos with at.RowsApplied — LAST — then COMMIT. The contract: a
+	// non-nil at is persisted whether or not c applies (a barrier the marks
+	// prove already applied still writes it), or the call returns an error
+	// and none of it is durable. The coordinator passes a non-nil at only when
+	// FoldsBarrierCheckpoint(c) is true; an engine handed one for a kind it
+	// does not fold refuses with [BarrierFoldNotTransactionalMarker]. nil
+	// writes no position.
+	//
+	// For a SchemaSnapshot it also performs ALL engine-side metadata-cache
 	// invalidation needed after the apply commits, using the SAME guarded
 	// apply-then-invalidate the serial path uses: invalidate ONLY on a real
 	// signature-changing boundary, NEVER on a first-touch baseline /
-	// identical re-send. Both engine implementations already do this inside
-	// applyOne's after-commit hook (cacheActiveSchemaAfterCommit). The
-	// orchestrator does NOT independently invalidate — a separate
-	// unconditional invalidation bypassed the first-touch guard and forced
-	// the PG lane DML onto the text-encode path, silently dropping
-	// non-text-round-trippable values (Bug 158); deferring entirely to this
-	// method keeps the concurrent path's invalidation byte-identical to
-	// serial.
-	ApplyBarrierChange(ctx context.Context, c ir.Change) error
+	// identical re-send (cacheActiveSchemaAfterCommit). The orchestrator does
+	// NOT independently invalidate — a separate unconditional invalidation
+	// bypassed the first-touch guard and forced the PG lane DML onto the
+	// text-encode path, silently dropping non-text-round-trippable values
+	// (Bug 158); deferring entirely to this method keeps the concurrent
+	// path's invalidation byte-identical to serial.
+	ApplyBarrierChange(ctx context.Context, c ir.Change, at *BarrierCheckpoint) error
 
 	// SkipsRowChange reports whether a row-level DML change (Insert/Update/
 	// Delete) would be DROPPED at apply time because its target table is
@@ -1194,12 +1225,13 @@ func (o *Orchestrator) drainLanes(ctx context.Context, target uint64, only ...in
 // barrier applies a globally-ordered event (Truncate / SchemaSnapshot /
 // keyless or PK-changing row change) after draining EVERY lane to the
 // barrier's predecessor, so it lands in correct order relative to the row
-// changes around it. It first persists a checkpoint (advancing the resume
-// position to the now-fully-durable predecessor), then applies the change on
-// the coordinator backend POSITION-FREE (ApplyBarrierChange writes the data +
-// any schema-history row but NOT the position — the frontier checkpoint owns
-// the resume position on this path), then marks the barrier's seq durable and
-// persists the checkpoint again.
+// changes around it. The drain makes a checkpoint legal (position ≤ durable
+// data); [Orchestrator.applyBarrier] then persists it and applies the change —
+// in ONE target transaction when the engine folds this kind (ADR-0190
+// amendment E), else in two, the checkpoint first. The change's own position
+// is never written (ApplyBarrierChange writes the data + any schema-history
+// row; the frontier checkpoint owns the resume position on this path). Then
+// the barrier's seq is marked durable and the checkpoint persisted again.
 //
 // Metadata-cache invalidation on a SchemaSnapshot is owned ENTIRELY by
 // ApplyBarrierChange (whose engine implementation runs the SAME guarded
@@ -1220,13 +1252,7 @@ func (o *Orchestrator) barrier(ctx context.Context, seq uint64, c ir.Change) err
 	}
 	// The drain committed every earlier row of the open source transaction.
 	o.srcTx.partCommitted = o.srcTx.partCommitted || o.srcTx.rowsSeen
-	if err := o.writeCheckpoint(ctx); err != nil {
-		return err
-	}
-	if err := o.la.ApplyBarrierChange(ctx, c); err != nil {
-		if o.srcTx.partCommitted {
-			return ir.NoteSourceTxSplit(err)
-		}
+	if err := o.applyBarrier(ctx, c); err != nil {
 		return err
 	}
 	// And the barrier itself is now durable, inside it — if it wrote a
@@ -1252,6 +1278,51 @@ func (o *Orchestrator) barrier(ctx context.Context, seq uint64, c ir.Change) err
 	o.frontier.MarkCommitted(seq)
 	o.sinceCheckpoint = 0
 	return o.writeCheckpoint(ctx)
+}
+
+// applyBarrier persists the barrier's pre-apply checkpoint and applies c, with
+// every lane drained to c's predecessor. When the engine folds c's kind
+// (ADR-0190 amendment E) the checkpoint rides c's own target transaction:
+// one commit instead of two. It is computed exactly as
+// [Orchestrator.writeCheckpoint] computes its write, so it is the same value —
+// the highest recorded boundary below the barrier, which is the barrier's
+// source transaction's START, never the barrier's own position — and nil
+// when there is nothing new to persist (no boundary recorded this run, so
+// the run's start position already is that start; or an earlier barrier, a
+// lane fold or an idle/count checkpoint already wrote it).
+//
+// The bookkeeping (checkpointWritten) advances only after the call
+// succeeded. There is no claim-before-commit, unlike a mark fence's fold:
+// the coordinator is blocked in this call with the lanes drained and nothing
+// at or above the barrier routed, so no other position writer exists while
+// it runs. On an error nothing is claimed and the run ends, as a barrier
+// error always has; the next run reads the durable position.
+//
+// A kind the engine does not fold (a MySQL-family Truncate) keeps the two
+// commits verbatim: the checkpoint, then the change with a nil checkpoint.
+func (o *Orchestrator) applyBarrier(ctx context.Context, c ir.Change) error {
+	var (
+		at *BarrierCheckpoint
+		ck checkpoint
+		ok bool
+	)
+	if o.la.FoldsBarrierCheckpoint(c) {
+		if ck, ok = o.nextCheckpoint(); ok {
+			at = &BarrierCheckpoint{Pos: ck.pos, RowsApplied: ck.rowsApplied, ClosedTxs: ck.closedTxs}
+		}
+	} else if err := o.writeCheckpoint(ctx); err != nil {
+		return err
+	}
+	if err := o.la.ApplyBarrierChange(ctx, c, at); err != nil {
+		if o.srcTx.partCommitted {
+			return ir.NoteSourceTxSplit(err)
+		}
+		return err
+	}
+	if at != nil {
+		o.checkpointWritten(ck)
+	}
+	return nil
 }
 
 // laneApplyLoop runs one lane (ADR-0104 graduation): it reads a batch of
@@ -1594,9 +1665,10 @@ type checkpoint struct {
 }
 
 // nextCheckpoint computes the position write the frontier allows now, or
-// ok=false when there is nothing new to persist. Shared by writeCheckpoint
-// and a mark fence's fold ([Orchestrator.claimAnchor]), so the two writers
-// compute the same thing for the same boundary.
+// ok=false when there is nothing new to persist. Shared by writeCheckpoint, a
+// mark fence's fold ([Orchestrator.claimAnchor]) and a barrier's fold
+// ([Orchestrator.applyBarrier]), so the three writers compute the same thing
+// for the same boundary.
 func (o *Orchestrator) nextCheckpoint() (checkpoint, bool) {
 	pos, seq, ok := o.frontier.CheckpointPosition()
 	// Seq-monotone guard: never write a boundary at or below the last one
@@ -1623,7 +1695,8 @@ func (o *Orchestrator) nextCheckpoint() (checkpoint, bool) {
 }
 
 // checkpointWritten advances the persisted-checkpoint bookkeeping past ck —
-// after its write committed, or, for a fold, when the fence claims it.
+// after its write committed (a checkpoint's, or a barrier's that folded it),
+// or, for a mark fence's fold, when the fence claims it.
 func (o *Orchestrator) checkpointWritten(ck checkpoint) {
 	o.lastWrittenSeq = ck.seq
 	if ck.hasCum {

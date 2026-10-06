@@ -44,16 +44,17 @@ type modelSeam struct {
 	// delay returns how long a lane batch takes before it "commits".
 	delay func(lane int, fold *laneapply.FoldTicket) time.Duration
 
-	mu         sync.Mutex
-	persisted  int // tx number the persisted position names (0 = run start)
-	committed  map[string]bool
-	rowsOfTx   map[int][]string
-	violations []string
-	admitted   map[string]bool // change id → its marks were written
-	dropped    map[string]bool // change id → its marks were refused
-	folds      int
-	started    map[string]time.Time // change id → when its batch began
-	foldDone   map[string]time.Time // tx → when its fold committed
+	mu           sync.Mutex
+	persisted    int // tx number the persisted position names (0 = run start)
+	committed    map[string]bool
+	rowsOfTx     map[int][]string
+	violations   []string
+	admitted     map[string]bool // change id → its marks were written
+	dropped      map[string]bool // change id → its marks were refused
+	folds        int
+	barrierFolds int                  // barriers whose call carried a folded checkpoint (amendment E)
+	started      map[string]time.Time // change id → when its batch began
+	foldDone     map[string]time.Time // tx → when its fold committed
 }
 
 func newModelSeam() *modelSeam {
@@ -81,6 +82,9 @@ func modelTxNum(token string) int {
 
 func (s *modelSeam) RouteForChange(_ context.Context, c ir.Change) (laneapply.Route, bool, error) {
 	ins := c.(ir.Insert)
+	if ins.Table == "k" {
+		return laneapply.Route{}, false, nil // keyless: the barrier path
+	}
 	if ins.Table == "p" {
 		return laneapply.Route{Qualified: "ks.p", PKVals: []any{ins.Row["id"]}, Scope: laneapply.RouteScopeKey}, true, nil
 	}
@@ -174,12 +178,41 @@ func (s *modelSeam) WriteCheckpoint(_ context.Context, pos ir.Position, _ int64,
 	return nil
 }
 
-func (s *modelSeam) ClassifyError(err error) error                       { return err }
-func (s *modelSeam) ApplyBarrierChange(context.Context, ir.Change) error { return nil }
-func (s *modelSeam) SkipsRowChange(context.Context, ir.Change) bool      { return false }
+func (s *modelSeam) ClassifyError(err error) error                  { return err }
+func (s *modelSeam) SkipsRowChange(context.Context, ir.Change) bool { return false }
+
+// FoldsBarrierCheckpoint: the model folds every barrier's checkpoint (ADR-0190
+// amendment E), as both engines do for a row barrier.
+func (s *modelSeam) FoldsBarrierCheckpoint(ir.Change) bool { return true }
+
+// ApplyBarrierChange applies a barrier — a row of keyless table "k", which
+// writes its transaction's apply mark by default, as a real barrier does
+// (amendment C) — and persists the folded checkpoint at, all at one commit
+// instant: the row, then the position, then the mark's check, exactly as the
+// lane batches' fold commit is modelled above.
+func (s *modelSeam) ApplyBarrierChange(_ context.Context, c ir.Change, at *laneapply.BarrierCheckpoint) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ins := c.(ir.Insert)
+	id := fmt.Sprint(ins.Row["v"])
+	s.committed[id] = true
+	if at != nil {
+		s.barrierFolds++
+		s.persistLocked("barrier fold", at.Pos.Token)
+	}
+	tx := ins.ApplyID.TxID
+	if want := modelTxNum(tx) - 1; s.persisted != want {
+		s.violations = append(s.violations, fmt.Sprintf("the barrier mark of %s (row %s) became durable with the position at "+
+			"transaction %d's commit, not at the transaction's start (%d): marks for two transactions at once", tx, id, s.persisted, want))
+	}
+	return nil
+}
 
 // modelTx builds transaction n (committing at token c<n>) with one row per
-// table, ids "<table>-<n>-<i>".
+// table, ids "<table>-<n>-<i>". A row of the keyless table "k" is a barrier
+// (no key: Row{"v": id}) and carries a position PAST its transaction's start
+// (c<n>) — the model's stand-in for a row barrier's own, mid-transaction
+// position, which no position write may ever persist.
 func modelTx(s *modelSeam, n int, tables ...string) []ir.Change {
 	tok := func(k int) ir.Position { return ir.Position{Engine: "test", Token: fmt.Sprintf("c%04d", k)} }
 	tx := fmt.Sprintf("tx%04d", n)
@@ -187,8 +220,12 @@ func modelTx(s *modelSeam, n int, tables ...string) []ir.Change {
 	for i, table := range tables {
 		id := fmt.Sprintf("%s-%d-%d", table, n, i)
 		s.rowsOfTx[n] = append(s.rowsOfTx[n], id)
+		row, pos := ir.Row{"id": id}, tok(n-1)
+		if table == "k" {
+			row, pos = ir.Row{"v": id}, tok(n)
+		}
 		out = append(out, ir.Insert{
-			Position: tok(n - 1), Schema: "ks", Table: table, Row: ir.Row{"id": id},
+			Position: pos, Schema: "ks", Table: table, Row: row,
 			ApplyID: ir.ApplyID{TxID: tx, Seq: uint64(i + 1)},
 		})
 	}
@@ -197,7 +234,12 @@ func modelTx(s *modelSeam, n int, tables ...string) []ir.Change {
 
 func runModel(t *testing.T, s *modelSeam, lanes int, stream []ir.Change) {
 	t.Helper()
-	o := laneapply.NewOrchestrator(laneapply.Config{Lanes: lanes, MaxBatchSize: 4, ExactlyOnceLanes: true}, s)
+	runModelWith(t, s, laneapply.Config{Lanes: lanes, MaxBatchSize: 4, ExactlyOnceLanes: true}, stream)
+}
+
+func runModelWith(t *testing.T, s *modelSeam, cfg laneapply.Config, stream []ir.Change) {
+	t.Helper()
+	o := laneapply.NewOrchestrator(cfg, s)
 	ch := make(chan ir.Change, len(stream))
 	for _, c := range stream {
 		ch <- c
@@ -276,43 +318,50 @@ func TestOrchestrator_AnchoredRule(t *testing.T) {
 }
 
 // TestOrchestrator_PositionWritesTotallyOrdered drives random marked and
-// unmarked transactions across lanes with random per-lane delays, and holds
-// the two position writers — the coordinator's checkpoint and the lanes'
-// folds — to one order: every persisted position, of either writer, is
-// non-decreasing, never ahead of the data, and every transaction's marks
+// unmarked transactions, and keyless barriers, across lanes with random
+// per-lane delays, and holds the three position writers — the coordinator's
+// checkpoint, the lanes' folds (amendment D, only with --exactly-once-lanes)
+// and the barriers' folds (amendment E, with the flag on AND off) — to one
+// order: every persisted position, of any writer, is non-decreasing, never
+// ahead of the data, and every transaction's marks, a lane's or a barrier's,
 // become durable only with the position at that transaction's start.
 func TestOrchestrator_PositionWritesTotallyOrdered(t *testing.T) {
-	for _, lanes := range []int{2, 4} {
-		for seed := int64(1); seed <= 6; seed++ {
-			t.Run(fmt.Sprintf("lanes=%d/seed=%d", lanes, seed), func(t *testing.T) {
-				r := rand.New(rand.NewSource(seed))
-				s := newModelSeam()
-				tbl := distinctLaneTables(t, lanes, 2)
-				s.routeBlind["mb"] = true
-				var delayMu sync.Mutex
-				s.delay = func(int, *laneapply.FoldTicket) time.Duration {
-					delayMu.Lock()
-					defer delayMu.Unlock()
-					return time.Duration(r.Intn(3)) * time.Millisecond
-				}
-				pool := []string{"p", "p", tbl[0], tbl[1], "mb"}
-				var stream []ir.Change
-				for n := 1; n <= 40; n++ {
-					k := 1 + r.Intn(4)
-					tables := make([]string, k)
-					for i := range tables {
-						tables[i] = pool[r.Intn(len(pool))]
+	for _, exactlyOnce := range []bool{true, false} {
+		for _, lanes := range []int{2, 4} {
+			for seed := int64(1); seed <= 6; seed++ {
+				t.Run(fmt.Sprintf("exactly-once-lanes=%v/lanes=%d/seed=%d", exactlyOnce, lanes, seed), func(t *testing.T) {
+					r := rand.New(rand.NewSource(seed))
+					s := newModelSeam()
+					tbl := distinctLaneTables(t, lanes, 2)
+					s.routeBlind["mb"] = true
+					var delayMu sync.Mutex
+					s.delay = func(int, *laneapply.FoldTicket) time.Duration {
+						delayMu.Lock()
+						defer delayMu.Unlock()
+						return time.Duration(r.Intn(3)) * time.Millisecond
 					}
-					stream = append(stream, modelTx(s, n, tables...)...)
-				}
-				runModel(t, s, lanes, stream)
-				for _, v := range s.violations {
-					t.Error(v)
-				}
-				if s.folds == 0 {
-					t.Fatal("no fold ran: the stream did not exercise the second position writer")
-				}
-			})
+					pool := []string{"p", "p", tbl[0], tbl[1], "mb", "k"}
+					var stream []ir.Change
+					for n := 1; n <= 40; n++ {
+						k := 1 + r.Intn(4)
+						tables := make([]string, k)
+						for i := range tables {
+							tables[i] = pool[r.Intn(len(pool))]
+						}
+						stream = append(stream, modelTx(s, n, tables...)...)
+					}
+					runModelWith(t, s, laneapply.Config{Lanes: lanes, MaxBatchSize: 4, ExactlyOnceLanes: exactlyOnce}, stream)
+					for _, v := range s.violations {
+						t.Error(v)
+					}
+					if exactlyOnce && s.folds == 0 {
+						t.Fatal("no lane fold ran: the stream did not exercise amendment D's position writer")
+					}
+					if s.barrierFolds == 0 {
+						t.Fatal("no barrier folded its checkpoint: the stream did not exercise amendment E's position writer")
+					}
+				})
+			}
 		}
 	}
 }

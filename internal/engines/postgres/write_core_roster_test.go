@@ -19,7 +19,7 @@ import (
 var controlTxWriters = []string{
 	"execApplyMarksTx", "queueApplyMarks", "writePositionTx", "writePositionPipelined",
 	"writeSchemaVersion", "buildWriteSchemaVersionSQL", "buildWritePositionSQL", "applyMarkStatements",
-	"queueFold", "execFold",
+	"queueFold", "execFold", "writeCheckpointTx", "writeOwnPositionTx",
 }
 
 // txFuncClass classifies every function in the package that takes a
@@ -30,6 +30,8 @@ var txFuncClass = map[string]string{
 	"ChangeApplier.execApplyMarksTx":            "control",
 	"ChangeApplier.queueApplyMarks":             "control",
 	"ChangeApplier.writePositionPipelined":      "control",
+	"ChangeApplier.writeCheckpointTx":           "control", // ADR-0190 amendment E: marks, skip-ledger flush, position — after any data
+	"ChangeApplier.writeOwnPositionTx":          "control", // applyOneImpl's marks, then (serial per-change) the change's own position
 	"laneApplierAdapter.queueFold":              "control", // ADR-0190 amendment D: marks, then the fold's position
 	"laneApplierAdapter.execFold":               "control", // the same on the serial fall-back's *sql.Tx
 	"writePositionTx":                           "control",
@@ -70,7 +72,10 @@ var writeCoreClass = map[string]string{
 	"ChangeApplier.applyOneImpl":              applyorder.Helper,
 	"ChangeApplier.applyOne":                  applyorder.Helper,
 	"ChangeApplier.applySchemaEvent":          applyorder.Helper, // the batch loop's ApplyOne, unreachable while TransactionalDDL is true
-	"ChangeApplier.applyBarrierNoPosition":    applyorder.Helper,
+	"ChangeApplier.applyBarrier":              applyorder.Helper, // the lane barrier, folding or not (ADR-0190 amendment E)
+	"ChangeApplier.writeCheckpointTx":         applyorder.Helper,
+	"ChangeApplier.writeOwnPositionTx":        applyorder.Helper,
+	"ChangeApplier.commitCheckpoint":          applyorder.Helper, // WriteCheckpoint's transaction, and a skipped barrier's
 	"laneApplierAdapter.ApplyBarrierChange":   "lane-barrier",
 	"ChangeApplier.Apply":                     "serial",
 	"ChangeApplier.persistSourceTxCommit":     "serial-tx-commit-position",

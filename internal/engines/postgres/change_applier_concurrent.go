@@ -681,47 +681,30 @@ func (la *laneApplierAdapter) ClassifyError(err error) error {
 // applied (the position is durable per ADR-0007's hardening), and each error
 // is classified exactly as the serial position write would be.
 func (la *laneApplierAdapter) WriteCheckpoint(ctx context.Context, pos ir.Position, rowsApplied int64, closedTxs []string) error {
-	a := la.a
-	// H-4: the frontier checkpoint is the concurrent path's position-write
-	// boundary, so flush the coalesced skip ledger the W lanes accumulated
-	// here, BEFORE the merged position becomes durable. A flush failure aborts
-	// the checkpoint (loud); the lanes' work re-streams from the last frontier.
-	if err := a.flushSkippedTables(ctx); err != nil {
-		return err
-	}
-	tx, err := a.db.BeginTx(ctx, nil)
-	if err != nil {
-		return classifyApplierError(fmt.Errorf("postgres: applier: checkpoint begin: %w", err))
-	}
-	if err := a.forceSynchronousCommitOn(ctx, tx); err != nil {
-		_ = tx.Rollback()
-		return classifyApplierError(err)
-	}
-	// ADR-0190: this position passes closedTxs, so their apply marks go in
-	// the same transaction as the position.
-	a.marks.CloseTxs(closedTxs)
-	marks := a.marks.Plan(nil, true)
-	if err := a.execApplyMarksTx(ctx, tx, marks); err != nil {
-		_ = tx.Rollback()
-		return classifyApplierError(err)
-	}
-	posCtx, posCancel := a.execTimeoutCtx(ctx)
-	werr := writePositionTx(posCtx, tx, a.controlSchema, la.streamID, pos.Token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, rowsApplied)
-	posCancel()
-	if werr != nil {
-		_ = tx.Rollback()
-		return classifyApplierError(fmt.Errorf("postgres: applier: checkpoint position write: %w", werr))
-	}
-	if err := a.commitWithTimeout(tx); err != nil {
-		return classifyApplierError(fmt.Errorf("postgres: applier: checkpoint commit: %w", err))
-	}
-	a.marks.Committed(marks)
-	return nil
+	// commitCheckpoint, whose body a barrier's fold shares (ADR-0190
+	// amendment E): this position passes closedTxs, so their apply marks are
+	// deleted in the same transaction, and the coalesced skip ledger the W
+	// lanes accumulated is flushed before the position (H-4; a flush failure
+	// aborts the checkpoint, loudly, and the lanes' work re-streams from the
+	// last frontier).
+	return la.a.commitCheckpoint(ctx, la.streamID, laneapply.BarrierCheckpoint{Pos: pos, RowsApplied: rowsApplied, ClosedTxs: closedTxs})
 }
 
+// FoldsBarrierCheckpoint implements [laneapply.LaneApplier] (ADR-0190
+// amendment E): every barrier kind runs as one real transaction on Postgres,
+// a Truncate included — PG's TRUNCATE is transactional and rolls back with
+// the transaction, which TestLaneBarrier_FoldIsOneTransaction's Truncate row
+// pins against a real server in the same test as this answer.
+func (la *laneApplierAdapter) FoldsBarrierCheckpoint(ir.Change) bool { return true }
+
 // ApplyBarrierChange applies one barrier-path change on the coordinator
-// backend via applyOne, which writes the barrier's position + data
-// atomically per ADR-0007 AND — for a SchemaSnapshot — owns the ADR-0049
+// backend via applyBarrier — the data + ADR-0049 schema-history row + apply
+// marks, and, when at is non-nil, the folded pre-apply checkpoint after them
+// (ADR-0190 amendment E), in one transaction under the F7 synchronous_commit
+// pin. It never writes the change's own token: the frontier checkpoint owns
+// the resume position on the concurrent path (writing the barrier's own
+// metadata-anchored token — 0/0 for a first-touch SchemaSnapshot — would
+// regress it; Bug 158). For a SchemaSnapshot it owns the ADR-0049
 // active-schema cache-after-commit update + the GUARDED metadata-cache
 // invalidation (cacheActiveSchemaAfterCommit → invalidateTargetCachesForBoundary,
 // fired ONLY on a real signature-changing boundary, never on the first-touch
@@ -732,11 +715,8 @@ func (la *laneApplierAdapter) WriteCheckpoint(ctx context.Context, pos ir.Positi
 // SchemaSnapshot schema-dirty, and forced every subsequent lane DML onto the
 // QueryExecModeExec text-encode path (json/jsonb → SQLSTATE 22P02 → silent
 // total loss on the PG concurrent path).
-func (la *laneApplierAdapter) ApplyBarrierChange(ctx context.Context, c ir.Change) error {
-	// Position-free: the frontier checkpoint owns the resume position on the
-	// concurrent path (writing the barrier's own metadata-anchored token —
-	// 0/0 for a first-touch SchemaSnapshot — would regress it; Bug 158).
-	return la.a.applyBarrierNoPosition(ctx, la.streamID, c)
+func (la *laneApplierAdapter) ApplyBarrierChange(ctx context.Context, c ir.Change, at *laneapply.BarrierCheckpoint) error {
+	return la.a.applyBarrier(ctx, la.streamID, c, at)
 }
 
 // SkipsRowChange reports whether a row-level DML change would be dropped at
