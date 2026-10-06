@@ -138,6 +138,10 @@ func TestSmartCompaction_RefusedRunLeavesNoMergedCopy(t *testing.T) {
 		if codeOf(err) != sluicecode.CodeBackupChainSeveredTransaction {
 			t.Fatalf("run %d: want the severed-transaction refusal, got %v", i, err)
 		}
+		// Refused by the PRE-COPY judge, not by the in-stream layer after a copy.
+		if !strings.Contains(err.Error(), "nothing was copied") {
+			t.Fatalf("run %d: the severed input was refused after the merge group was copied: %v", i, err)
+		}
 	}
 	for f := range store.data {
 		if strings.HasPrefix(f, mergedSegmentDirPrefix) {
@@ -146,6 +150,26 @@ func TestSmartCompaction_RefusedRunLeavesNoMergedCopy(t *testing.T) {
 	}
 	if after := len(store.data); after != before {
 		t.Fatalf("refused runs changed the store: %d files before, %d after", before, after)
+	}
+
+	// A refusal AFTER the copy (smart compaction refuses an encrypted chain
+	// once the group is merged) removes the copy too.
+	enc := newMemStore()
+	seedSmartCompactLineageEncrypted(t, enc, now)
+	beforeEnc := len(enc.data)
+	if _, err := CompactChain(context.Background(), enc, CompactOpts{
+		MergeWindow: 2 * time.Hour, SmartCompaction: true,
+		Now: func() time.Time { return now.Add(10 * time.Hour) },
+	}); err == nil || !strings.Contains(err.Error(), "not yet supported on encrypted chains") {
+		t.Fatalf("want the post-copy encrypted-chain refusal, got %v", err)
+	}
+	for f := range enc.data {
+		if strings.HasPrefix(f, mergedSegmentDirPrefix) {
+			t.Errorf("a refusal after the copy left %s behind", f)
+		}
+	}
+	if afterEnc := len(enc.data); afterEnc != beforeEnc {
+		t.Fatalf("a refusal after the copy changed the store: %d files before, %d after", beforeEnc, afterEnc)
 	}
 }
 
