@@ -83,14 +83,21 @@ import (
 //     chain is left as it was and still refused
 //     (TestSmartCompaction_RefusesASeveredFramedIncremental). b953b09d broke
 //     this by closing such a transaction with an empty boundary pair. Collapse
-//     LOWERS an incremental's last-row position (a collapsed event carries its
-//     chain's first position), which hides (B) — silently, a re-delivered
-//     transaction then applied twice — so smart compaction also refuses a
-//     chain carrying (B) on a link it would rewrite, and compares this door's
-//     findings link by link before and after the rewrite; both need the source
-//     engine's comparator (CompactOpts.Comparator), and without one (B) stays
-//     unjudged there exactly as here
-//     (TestSmartCompaction_RefusesToHideShapeB, TestSmartCompaction_BeltSeesShapeBLost).
+//     also hides (B), silently, two ways: it LOWERS the first incremental's
+//     last-row position (a collapsed event carries its chain's first
+//     position), after which the re-delivered transaction is applied twice;
+//     and it RAISES the second incremental's first-row position when the
+//     re-delivered leading row collapses away (an INSERT followed by a later
+//     DELETE of the same key), after which that DELETE is LOST and the row the
+//     source deleted stays — where the uncompacted chain re-applied the INSERT
+//     idempotently and was correct. So smart compaction refuses a chain
+//     carrying (B) on any pair that involves a link it would rewrite,
+//     including a pair that crosses a merge-group boundary, and compares this
+//     door's findings link by link before and after the rewrite; both need the
+//     source engine's position order (CompactOpts.PositionOrder), and without
+//     one (B) stays unjudged there exactly as here, said at INFO
+//     (TestSmartCompaction_RefusesToHideShapeB, TestSmartCompaction_BeltSeesShapeBLost,
+//     TestSmartCompaction_CrossGroupPairShapeB).
 //
 // PREMISES, named per the premise rule (each is what would have to be false
 // for a verdict to be wrong):

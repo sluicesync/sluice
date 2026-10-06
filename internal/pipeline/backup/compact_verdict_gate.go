@@ -19,9 +19,10 @@ import (
 // Smart compaction rewrites change chunks, and the severed-transaction door
 // judges a chain BY its change chunks, so a rewrite can change the door's
 // verdict in either direction: hide a finding (b953b09d closed an open
-// transaction and erased shape (A); collapse lowers an incremental's last-row
-// position and erases shape (B) — smart compaction has done that since
-// v0.85.0) or invent one (e9cbfc42 left a healthy TRUNCATE-tailed chain ending
+// transaction and erased shape (A); collapse erases shape (B) two ways —
+// lowering the first incremental's last-row position, and collapsing the
+// second's leading re-delivered row away, which raises its first-row
+// position — and has since v0.85.0) or invent one (e9cbfc42 left a healthy TRUNCATE-tailed chain ending
 // below EndPosition). Two gates, both smart-compaction only (naive compaction
 // moves chunk bytes verbatim, so the door reads the same evidence):
 //
@@ -38,12 +39,58 @@ import (
 //     swap. The independent expected value is the input's own findings.
 //
 // REACH, stated so it is not read as broader: shape (B) is judged only with
-// a comparator, which comes from the chain's SOURCE engine through
-// [CompactOpts.Comparator] (the CLI resolves it from the registry; Postgres is
-// the one engine that orders positions today). Without one — a caller that
-// passes none, a MySQL chain — neither gate can see (B), exactly as restore
-// cannot. Encrypted chains are refused by smart compaction itself, so both
-// gates read plaintext chunks with no key.
+// the chain's SOURCE engine's position order, which CompactChain resolves
+// from the catalog through [CompactOpts.PositionOrder] (the CLI injects the
+// registry; Postgres is the one engine that orders positions today). A
+// chain whose engine has no order, a chain that records no engine, and a
+// caller that injects no resolver all leave (B) unjudged — exactly as restore
+// on that engine — and each says so at INFO and in
+// [CompactResult.ShapeBJudged]; an engine the resolver does not know refuses.
+// The pair arm of [involves] matters: a (B) pair can cross a merge-group
+// boundary, one link rewritten and one not
+// (TestSmartCompaction_CrossGroupPairShapeB). Encrypted chains are refused by
+// smart compaction itself, so both gates read plaintext chunks with no key.
+
+// prepareSmartGates resolves the source engine's position order once, from
+// the catalog CompactChain already loaded, records whether shape (B) can be
+// judged, and runs the pre-copy judge. opts.Comparator is set for the
+// pre-swap belt that runs later.
+func prepareSmartGates(ctx context.Context, store irbackup.Store, cat *lineage.Catalog, planned []plannedGroup, opts *CompactOpts, res *CompactResult) error {
+	cmp, judged, err := resolveSmartPositionOrder(ctx, cat.SourceEngine, opts)
+	if err != nil {
+		return err
+	}
+	opts.Comparator, res.ShapeBJudged = cmp, judged
+	return refuseFindingsInRewrittenLinks(ctx, store, cat, planned, cmp)
+}
+
+// resolveSmartPositionOrder decides how smart compaction judges shape (B).
+// No silent degrade: every way of NOT judging it is said at INFO and recorded
+// in [CompactResult.ShapeBJudged], and the one way that would leave a
+// judgeable chain unjudged without anyone deciding so — an engine this build
+// does not know — refuses.
+func resolveSmartPositionOrder(ctx context.Context, engine string, opts *CompactOpts) (cmp ir.PositionMonotonicChecker, judged bool, err error) {
+	switch {
+	case opts.Comparator != nil:
+		return opts.Comparator, true, nil
+	case opts.PositionOrder == nil:
+		slog.InfoContext(ctx, "backup compact: smart compaction was given no position-order resolver, so shape (B) of the severed-transaction check is NOT judged on the incrementals it rewrites")
+		return nil, false, nil
+	case engine == "":
+		slog.InfoContext(ctx, "backup compact: the chain records no source engine, so shape (B) of the severed-transaction check is NOT judged on the incrementals smart compaction rewrites")
+		return nil, false, nil
+	}
+	cmp, known := opts.PositionOrder(engine)
+	if !known {
+		return nil, false, fmt.Errorf("backup compact: SMART-COMPACTION-SOURCE-ENGINE-UNKNOWN: the chain's source engine %q is not known to this sluice, so smart compaction cannot tell whether a re-delivered transaction (shape B) would be hidden by its rewrite; compact with --smart-compaction-off (naive compaction moves the evidence verbatim), or with a sluice that knows the engine", engine)
+	}
+	if cmp == nil {
+		slog.InfoContext(ctx, "backup compact: the chain's source engine has no position order, so shape (B) of the severed-transaction check is NOT judged — the same as restore on this engine",
+			slog.String("source_engine", engine))
+		return nil, false, nil
+	}
+	return cmp, true, nil
+}
 
 // rewrittenIncrementals returns the BackupIDs of the incrementals in the
 // segments the planned merge groups will rewrite (encrypted groups excluded:
@@ -95,7 +142,7 @@ func refuseFindingsInRewrittenLinks(ctx context.Context, store irbackup.Store, c
 		switch f.shape {
 		case shapeSevered, shapeRedelivered:
 			return sluicecode.Wrap(sluicecode.CodeBackupChainSeveredTransaction,
-				"take a new full backup (`sluice backup full`) and compact that chain; this one carries a source transaction across two incrementals, and no rewrite of it can be replayed exactly",
+				"to compact this chain anyway, use `--smart-compaction-off`: naive compaction moves the change chunks verbatim, so the evidence restore refuses on is kept; to get a chain that can be replayed, take a new full backup (`sluice backup full`) — this one carries a source transaction across two incrementals, and no rewrite of it replays exactly",
 				fmt.Errorf("smart compaction refused before copying anything: %w — collapsing these incrementals would move or hide that evidence, so restore and `sync from-backup` would replay the transaction twice instead of refusing; nothing was copied, swapped or deleted", f.err))
 		case shapeUndecodable:
 			return fmt.Errorf("backup compact: judge an incremental before compacting it: %w", f.err)

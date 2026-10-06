@@ -35,16 +35,19 @@ import (
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 	"sluicesync.dev/sluice/internal/ir"
-	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
-// pgSourceComparator is the Postgres position order the CLI hands
-// `backup compact` for a Postgres-sourced chain (cmd/sluice
-// sourceEngineComparator), so these real chains run smart compaction's
-// shape-(B) gates the way an operator's run does.
-func pgSourceComparator(store irbackup.Store) ir.PositionMonotonicChecker {
-	eng, _ := engines.Get("postgres")
-	return lineage.SameEngineComparator(context.Background(), store, eng)
+// registryPositionOrderForTest is the registry-backed resolver the CLI
+// injects into `backup compact` (cmd/sluice registryPositionOrder), so these
+// real Postgres chains run smart compaction's shape-(B) gates the way an
+// operator's run does; each smart call asserts res.ShapeBJudged.
+func registryPositionOrderForTest(engine string) (ir.PositionMonotonicChecker, bool) {
+	eng, ok := engines.Get(engine)
+	if !ok {
+		return nil, false
+	}
+	cmp, _ := eng.(ir.PositionMonotonicChecker)
+	return cmp, true
 }
 
 // TestADR0064_SmartCompaction_CollapsesUpdateChain_PG verifies that
@@ -138,7 +141,7 @@ func TestADR0064_SmartCompaction_CollapsesUpdateChain_PG(t *testing.T) {
 		MergeWindow:     time.Hour,
 		SmartCompaction: true,
 		PKStrategy:      backup.PKStrategyPK,
-		Comparator:      pgSourceComparator(store),
+		PositionOrder:   registryPositionOrderForTest,
 	})
 	compactWall := time.Since(startCompact)
 
@@ -147,6 +150,9 @@ func TestADR0064_SmartCompaction_CollapsesUpdateChain_PG(t *testing.T) {
 			t.Fatalf("ADR-0067 regression: smart compact refused a live-rotation chain on a position gap — rotated chains must be born-contiguous and compactable: %v", err)
 		}
 		t.Fatalf("CompactChain smart: %v", err)
+	}
+	if !res.ShapeBJudged {
+		t.Fatal("smart compaction of a Postgres chain did not judge shape (B): the position order did not reach it")
 	}
 
 	if res.EventsBefore == 0 {

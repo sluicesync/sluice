@@ -323,12 +323,16 @@ func TestADR0087_Bug139_IdleStopCompact_SplitsAndRestores_PG(t *testing.T) {
 				MergeWindow:     time.Hour,
 				SmartCompaction: smart,
 				PKStrategy:      backup.PKStrategyPK,
+				PositionOrder:   registryPositionOrderForTest,
 			})
 			if err != nil {
 				if strings.Contains(err.Error(), "position gap") {
 					t.Fatalf("Bug-139 regression: compact REFUSED the idle-stop chain on a position gap instead of splitting at it: %v", err)
 				}
 				t.Fatalf("CompactChain (smart=%v): %v", smart, err)
+			}
+			if smart && !res.ShapeBJudged {
+				t.Fatal("smart compaction of a Postgres chain did not judge shape (B): the position order did not reach it")
 			}
 			// At least one merge happened (the pre-boundary contiguous run),
 			// AND the trailing stamp-less segment was split off (segment count
@@ -489,10 +493,13 @@ func TestADR0087_Bug139_ResumeHeals_WholeChainCompacts_PG(t *testing.T) {
 		MergeWindow:     time.Hour,
 		SmartCompaction: true,
 		PKStrategy:      backup.PKStrategyPK,
-		Comparator:      pgSourceComparator(store),
+		PositionOrder:   registryPositionOrderForTest,
 	})
 	if err != nil {
 		t.Fatalf("CompactChain after resume heal: %v", err)
+	}
+	if !res.ShapeBJudged {
+		t.Fatal("smart compaction of a Postgres chain did not judge shape (B): the position order did not reach it")
 	}
 	post, _, _ := lineage.LoadLineageCatalog(context.Background(), store)
 	if len(post.Segments) != 1 {

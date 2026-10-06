@@ -161,20 +161,38 @@ type CompactOpts struct {
 	// without key material and stays so.
 	Envelope crypto.EnvelopeEncryption
 
-	// Comparator orders the chain's SOURCE-engine positions, for the
+	// PositionOrder resolves a source engine's position order, for the
 	// severed-transaction door's shape (B) in smart compaction's two gates
-	// ([refuseFindingsInRewrittenLinks], [refuseVerdictChange]). Collapse
-	// lowers an incremental's last-row position, which can HIDE a re-delivered
-	// boundary transaction from (B), so without a comparator those gates cannot
-	// see the class smart compaction can erase. The pipeline may not name
-	// engines (archgate): the CLI resolves it from the registry by the chain's
-	// recorded source engine (cmd/sluice's `sourceEngineComparator`, pinned by TestSourceEngineComparator_PostgresChainOrdersPositions). nil leaves
-	// (B) unjudged, exactly as a restore with no comparator does.
+	// ([refuseFindingsInRewrittenLinks], [refuseVerdictChange]). Collapse can
+	// HIDE a re-delivered boundary transaction from (B) — by lowering the first
+	// incremental's last-row position, or by collapsing the second's leading
+	// re-delivered row away — so without an order those gates cannot see the
+	// class smart compaction can erase. CompactChain resolves it itself from
+	// the catalog it already loaded ([resolveSmartPositionOrder]); the
+	// pipeline may not name engines (archgate), so the CLI injects the
+	// registry-backed resolver (cmd/sluice's `registryPositionOrder`, wiring
+	// held by TestBackupCompactPassesThePositionOrder).
+	PositionOrder PositionOrderResolver
+
+	// Comparator, when non-nil, is used as the order directly and
+	// PositionOrder is not consulted — for callers (tests) that already hold
+	// one.
 	Comparator ir.PositionMonotonicChecker
 }
 
+// PositionOrderResolver returns the position order of the named source
+// engine. known is false when the engine is not known to this build; a known
+// engine with no position order returns (nil, true).
+type PositionOrderResolver func(engine string) (cmp ir.PositionMonotonicChecker, known bool)
+
 // CompactResult summarises a [CompactChain] run.
 type CompactResult struct {
+	// ShapeBJudged reports whether a smart compaction judged the
+	// severed-transaction door's shape (B) — false when the chain's source
+	// engine has no position order, records no engine, or no resolver was
+	// supplied ([resolveSmartPositionOrder] says which, at INFO).
+	ShapeBJudged bool
+
 	// GroupsConsidered is the count of in-window groups identified
 	// across the lineage's retained segments (size-1 groups are
 	// counted but skipped — they are no-ops). Always >= GroupsMerged.
@@ -587,7 +605,7 @@ func CompactChain(ctx context.Context, store irbackup.Store, opts CompactOpts) (
 	// that fires after executeMergeGroup left a full `seg-merged-*` copy of
 	// the group behind on every refused run ([refuseFindingsInRewrittenLinks]).
 	if opts.SmartCompaction {
-		if err := refuseFindingsInRewrittenLinks(ctx, store, cat, planned, opts.Comparator); err != nil {
+		if err := prepareSmartGates(ctx, store, cat, planned, &opts, res); err != nil {
 			return nil, err
 		}
 	}
@@ -688,6 +706,7 @@ func CompactChain(ctx context.Context, store irbackup.Store, opts CompactOpts) (
 		logArgs = append(
 			logArgs,
 			slog.Bool("smart_compaction", true),
+			slog.Bool("shape_b_judged", res.ShapeBJudged),
 			slog.Int64("events_before", res.EventsBefore),
 			slog.Int64("events_after", res.EventsAfter),
 			slog.Int64("events_collapsed", res.EventsCollapsed),

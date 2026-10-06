@@ -4,56 +4,43 @@
 package main
 
 import (
-	"context"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"os"
 	"strings"
 	"testing"
-
-	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
-	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
 
-// TestSourceEngineComparator_PostgresChainOrdersPositions pins what `backup
-// compact` hands smart compaction for shape (B): the registry's position order
-// for the chain's recorded SOURCE engine — Postgres today — and nothing for an
-// engine that does not order positions or a chain that records no engine.
-// Without it, smart compaction's gates cannot see the re-delivered boundary
-// transaction collapse hides.
-func TestSourceEngineComparator_PostgresChainOrdersPositions(t *testing.T) {
+// TestRegistryPositionOrder pins what `backup compact` hands smart compaction
+// for shape (B): Postgres orders positions; a registered engine without an
+// order is KNOWN with no order (smart compaction proceeds and says so); an
+// engine this build does not register is UNKNOWN (smart compaction refuses).
+func TestRegistryPositionOrder(t *testing.T) {
 	for _, tc := range []struct {
-		engine string
-		want   bool
+		engine    string
+		wantOrder bool
+		wantKnown bool
 	}{
-		{"postgres", true},
-		{"mysql", false},
-		{"", false},
-		{"not-an-engine", false},
+		{"postgres", true, true},
+		{"mysql", false, true},
+		{"not-an-engine", false, false},
 	} {
 		t.Run(tc.engine, func(t *testing.T) {
-			ctx := context.Background()
-			store, err := blobcodec.NewLocalStore(t.TempDir())
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := lineage.WriteLineageCatalog(ctx, store, &lineage.Catalog{FormatVersion: 1, SourceEngine: tc.engine, Segments: []lineage.Segment{{SegmentID: "s0", FullManifestPath: lineage.ManifestFileName}}}); err != nil {
-				t.Fatal(err)
-			}
-			if got := sourceEngineComparator(ctx, store) != nil; got != tc.want {
-				t.Fatalf("source engine %q: comparator present = %v; want %v", tc.engine, got, tc.want)
+			cmp, known := registryPositionOrder(tc.engine)
+			if (cmp != nil) != tc.wantOrder || known != tc.wantKnown {
+				t.Fatalf("registryPositionOrder(%q) = (order %v, known %v); want (order %v, known %v)", tc.engine, cmp != nil, known, tc.wantOrder, tc.wantKnown)
 			}
 		})
 	}
 }
 
-// TestBackupCompactPassesTheSourceComparator is the wiring half: every
-// backup.CompactOpts literal in the CLI sets Comparator from
-// sourceEngineComparator. Without it the helper above is dead code and smart
-// compaction's (B) gates are blind, which is exactly how the class shipped.
-// Floor: at least one CompactOpts literal must be found.
-func TestBackupCompactPassesTheSourceComparator(t *testing.T) {
+// TestBackupCompactPassesThePositionOrder is the wiring half: every
+// backup.CompactOpts literal in the CLI sets PositionOrder to
+// registryPositionOrder. Without it the resolver above is dead code and
+// smart compaction's (B) gates are off (said at INFO, but off). Floor: at
+// least one CompactOpts literal must be found.
+func TestBackupCompactPassesThePositionOrder(t *testing.T) {
 	fset := token.NewFileSet()
 	entries, err := os.ReadDir(".")
 	if err != nil {
@@ -84,17 +71,16 @@ func TestBackupCompactPassesTheSourceComparator(t *testing.T) {
 				if !ok {
 					continue
 				}
-				if k, ok := kv.Key.(*ast.Ident); !ok || k.Name != "Comparator" {
+				k, ok := kv.Key.(*ast.Ident)
+				if !ok || k.Name != "PositionOrder" {
 					continue
 				}
-				if call, ok := kv.Value.(*ast.CallExpr); ok {
-					if fn, ok := call.Fun.(*ast.Ident); ok && fn.Name == "sourceEngineComparator" {
-						wired = true
-					}
+				if v, ok := kv.Value.(*ast.Ident); ok && v.Name == "registryPositionOrder" {
+					wired = true
 				}
 			}
 			if !wired {
-				t.Errorf("%s: a backup.CompactOpts literal does not set Comparator: sourceEngineComparator(...)", fset.Position(lit.Pos()))
+				t.Errorf("%s: a backup.CompactOpts literal does not set PositionOrder: registryPositionOrder", fset.Position(lit.Pos()))
 			}
 			return true
 		})

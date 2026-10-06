@@ -845,7 +845,7 @@ func (s *smartCompactor) keepsTheSeveredVerdict() error {
 	inOpen, at := s.inTail.endsOpen()
 	if inOpen {
 		return sluicecode.Wrap(sluicecode.CodeBackupChainSeveredTransaction,
-			"take a new full backup (`sluice backup full`) and compact that chain; this one carries a source transaction across two incrementals, and no rewrite of it can be replayed exactly",
+			"to compact this chain anyway, use `--smart-compaction-off`: naive compaction moves the change chunks verbatim, so the evidence restore refuses on is kept; to get a chain that can be replayed, take a new full backup (`sluice backup full`) — this one carries a source transaction across two incrementals, and no rewrite of it replays exactly",
 			fmt.Errorf("smart compaction refused: an incremental ends inside an open source transaction (TxBegin at %+v; F-E1-SEVERED-TAIL-REPLAY shape A, written by a `backup stream` stop or cancel on an older sluice), and collapsing it would change what restore and `sync from-backup` judge on — the chain is left unchanged", at))
 	}
 	if outOpen, _ := s.outTail.endsOpen(); outOpen {
