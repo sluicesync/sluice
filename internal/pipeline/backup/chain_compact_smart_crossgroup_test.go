@@ -181,6 +181,66 @@ func TestSmartCompaction_CrossGroupPairShapeB(t *testing.T) {
 	}
 }
 
+// redeliveredInsideSegmentZero: segment 0's second incremental re-delivers
+// the transaction its first ended on (a (B) pair entirely inside segment 0);
+// every other incremental is a healthy, increasing transaction.
+func redeliveredInsideSegmentZero(seg, j int, cur uint64) (out []ir.Change, end uint64) {
+	if seg == 0 && j == 2 {
+		return []ir.Change{
+			ir.TxBegin{Position: pos(cur)},
+			ir.Insert{Position: pos(cur), Schema: "public", Table: "audit_log", Row: ir.Row{"ts": "x", "msg": "dup"}},
+			ir.TxCommit{Position: pos(cur)},
+			ir.TxBegin{Position: pos(cur + 1)},
+			ir.Insert{Position: pos(cur + 1), Schema: "public", Table: "users", Row: ir.Row{"id": int64(20), "name": "n"}},
+			ir.TxCommit{Position: pos(cur + 1)},
+		}, cur + 1
+	}
+	t := cur + 1
+	out = []ir.Change{
+		ir.TxBegin{Position: pos(t)},
+		ir.Insert{Position: pos(t), Schema: "public", Table: "users", Row: ir.Row{"id": int64(1000 + seg*10 + j), "name": "q"}},
+	}
+	if seg == 0 && j == 1 {
+		out = append(out, ir.Insert{Position: pos(t), Schema: "public", Table: "audit_log", Row: ir.Row{"ts": "x", "msg": "dup"}})
+	}
+	return append(out, ir.TxCommit{Position: pos(t)}), t
+}
+
+// TestSmartCompaction_UnrelatedFindingDoesNotBlockAMergedGroup is the other
+// direction of the cross-group pin: a (B) pair that lies entirely in a
+// segment the run does NOT rewrite is not smart compaction's to refuse — the
+// rewrite cannot move that evidence — so the merged group compacts, and the
+// untouched pair is still refused by restore afterwards.
+func TestSmartCompaction_UnrelatedFindingDoesNotBlockAMergedGroup(t *testing.T) {
+	ctx := context.Background()
+	store := newMemStore()
+	base := time.Date(2026, 5, 26, 0, 0, 0, 0, time.UTC)
+	seedSegmentsAt(t, store, base, []time.Duration{0, 10 * time.Hour, 11 * time.Hour}, redeliveredInsideSegmentZero)
+	refusedAsB := func(when string) {
+		t.Helper()
+		chain, err := lineage.BuildLineageChain(ctx, store, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := NewSeveredTransactionDoor(store, smartLSNComparator{}, nil).Check(ctx, chain); codeOf(err) != sluicecode.CodeBackupChainSeveredTransaction {
+			t.Fatalf("%s: the door does not refuse segment 0's (B) pair: %v", when, err)
+		}
+	}
+	refusedAsB("before compaction (control)")
+	res, err := CompactChain(ctx, store, CompactOpts{
+		MergeWindow: 2 * time.Hour, SmartCompaction: true, PKStrategy: PKStrategyPK,
+		Now:        func() time.Time { return base.Add(20 * time.Hour) },
+		Comparator: smartLSNComparator{},
+	})
+	if err != nil {
+		t.Fatalf("a finding in a segment the run does not rewrite blocked the merged group: %v", err)
+	}
+	if res.GroupsMerged != 1 {
+		t.Fatalf("anti-vacuity: GroupsMerged = %d; want 1", res.GroupsMerged)
+	}
+	refusedAsB("after compaction")
+}
+
 // TestSmartCompaction_ResolvesThePositionOrder: CompactChain resolves the
 // order from the catalog's source engine through the injected resolver, says
 // at INFO and in the result whenever (B) is not judged, and refuses an engine

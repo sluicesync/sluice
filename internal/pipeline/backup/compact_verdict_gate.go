@@ -22,8 +22,8 @@ import (
 // transaction and erased shape (A); collapse erases shape (B) two ways —
 // lowering the first incremental's last-row position, and collapsing the
 // second's leading re-delivered row away, which raises its first-row
-// position — and has since v0.85.0) or invent one (e9cbfc42 left a healthy TRUNCATE-tailed chain ending
-// below EndPosition). Two gates, both smart-compaction only (naive compaction
+// position — and has since v0.85.0) or invent one (e9cbfc42 left a healthy
+// TRUNCATE-tailed chain ending below EndPosition). Two gates, both smart-compaction only (naive compaction
 // moves chunk bytes verbatim, so the door reads the same evidence):
 //
 //   - refuseFindingsInRewrittenLinks, BEFORE any merge group is copied:
