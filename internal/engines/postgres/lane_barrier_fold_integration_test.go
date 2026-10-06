@@ -341,3 +341,58 @@ func TestLaneBarrier_UntrustedReloadFoldKeepsOwnMark(t *testing.T) {
 		}
 	}
 }
+
+// TestLaneBarrier_FoldCommitStepErrorIsOutcomeUnknown pins the engine half of
+// review 2's fix: a barrier fold whose COMMIT step fails reaches the
+// coordinator marked laneapply.CommitOutcomeUnknown, so the coordinator's F1
+// fallback does not write the same checkpoint again on top of a COMMIT that
+// may have landed (TestOrchestrator_BarrierFoldFailureClaimsNothing is the
+// coordinator's half). The real shape, the reviewer's repro: a deferred
+// constraint trigger makes COMMIT outlive the applier's per-exec watchdog
+// (Bug 56), which gives up while the COMMIT goes on to land — the test reads
+// the fold's position and its ONE rows_applied increment back. The reverse
+// arm: a failure BEFORE the COMMIT (the test hook) is not outcome-unknown,
+// so the fallback still runs for it.
+func TestLaneBarrier_FoldCommitStepErrorIsOutcomeUnknown(t *testing.T) {
+	dsn, cleanup := startPostgresForApplier(t)
+	defer cleanup()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	barrier := ir.Insert{Schema: "public", Table: "bf_keyless", Row: ir.Row{"v": "x"}, ApplyID: ir.ApplyID{TxID: "bf-tx", Seq: 1}}
+
+	f := newBarrierFoldFixture(ctx, t, dsn, "")
+	at := laneapply.BarrierCheckpoint{Pos: f.pos(1), RowsApplied: 5, ClosedTxs: []string{"closed-tx"}}
+	f.a.barrierFoldCommitHookForTest = func() error { return errBarrierFoldHook }
+	err := f.la.ApplyBarrierChange(ctx, barrier, &at)
+	if !errors.Is(err, errBarrierFoldHook) || laneapply.IsCommitOutcomeUnknown(err) {
+		t.Fatalf("a failure before the COMMIT returned %v (outcome unknown %v); want the hook's error, NOT outcome-unknown — "+
+			"nothing landed, so the coordinator's fallback must still write the checkpoint", err, laneapply.IsCommitOutcomeUnknown(err))
+	}
+
+	f = newBarrierFoldFixture(ctx, t, dsn, `
+		CREATE OR REPLACE FUNCTION bf_slow_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(1); RETURN NULL; END $$;
+		CREATE CONSTRAINT TRIGGER bf_slow AFTER INSERT ON bf_keyless DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION bf_slow_commit();
+		ALTER TABLE bf_keyless ENABLE ALWAYS TRIGGER bf_slow;`)
+	f.a.execTimeout = 700 * time.Millisecond
+	err = f.la.ApplyBarrierChange(ctx, barrier, &at)
+	if err == nil {
+		t.Fatal("the slow COMMIT did not outlive the 700 ms watchdog; the committed-but-unacknowledged shape was not built")
+	}
+	if !laneapply.IsCommitOutcomeUnknown(err) {
+		t.Fatalf("a COMMIT-step failure returned %v, not marked outcome-unknown: the coordinator would write the checkpoint "+
+			"again and count its rows twice", err)
+	}
+	// The outcome the applier could not know: the COMMIT landed, once.
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		pos, rows, _ := f.state(ctx, t)
+		if pos == f.pos(1).Token && rows == 5 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the fold's COMMIT never became visible (position %s, rows_applied %d): the test did not build the "+
+				"committed-but-unacknowledged shape it is about", pos, rows)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}

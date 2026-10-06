@@ -276,6 +276,22 @@ type failingBarrierSeam struct {
 
 var errBarrierRolledBack = errors.New("barrier transaction rolled back")
 
+// landedThenUnknownSeam is fenceSeam whose fold COMMIT lands — the folded
+// checkpoint and its rows_applied increment are recorded — but whose call
+// then reports a COMMIT-step error (the Bug-56 watchdog gave up), wrapped as
+// the engines wrap it.
+type landedThenUnknownSeam struct{ fenceSeam }
+
+func (s *landedThenUnknownSeam) ApplyBarrierChange(ctx context.Context, c ir.Change, at *BarrierCheckpoint) error {
+	if err := s.fenceSeam.ApplyBarrierChange(ctx, c, at); err != nil {
+		return err
+	}
+	if at != nil {
+		return CommitOutcomeUnknown(errors.New("commit watchdog fired"))
+	}
+	return nil
+}
+
 func (s *failingBarrierSeam) ApplyBarrierChange(ctx context.Context, c ir.Change, at *BarrierCheckpoint) error {
 	if at != nil {
 		if s.cancel != nil {
@@ -303,6 +319,10 @@ func (s *failingBarrierSeam) ApplyBarrierChange(ctx context.Context, c ir.Change
 //
 // The run is cancelled (a stop). Nothing is written, and the bookkeeping is
 // untouched: the replay is a kill's at the same instant.
+//
+// The fold's COMMIT step failed (CommitOutcomeUnknown; review 2). The COMMIT
+// may have landed, so the checkpoint is NOT written again: here it did land,
+// and a second write would have counted its rows twice.
 //
 // The reverse direction is the same stream succeeding: the fold advances
 // all three.
@@ -355,6 +375,22 @@ func TestOrchestrator_BarrierFoldFailureClaimsNothing(t *testing.T) {
 	if o.lastWrittenSeq != 0 || o.lastWrittenCum != 0 || len(o.closedTx) != 1 {
 		t.Errorf("cancelled: lastWrittenSeq=%d lastWrittenCum=%d closedTx=%v; want 0, 0 and tx1 still unclosed — "+
 			"the coordinator claimed a checkpoint the barrier's rollback discarded", o.lastWrittenSeq, o.lastWrittenCum, o.closedTx)
+	}
+
+	// A COMMIT-step failure whose COMMIT landed: the seam persists the fold
+	// (rows counted once), then reports the error the engines wrap with
+	// CommitOutcomeUnknown. Writing the checkpoint again would count its rows
+	// twice, so no fallback.
+	landed := &landedThenUnknownSeam{}
+	_, err = run(context.Background(), landed)
+	if !IsCommitOutcomeUnknown(err) {
+		t.Fatalf("commit outcome unknown: Run = %v; want the CommitOutcomeUnknown error", err)
+	}
+	if ck := landed.eventsWith("ckpt:"); len(ck) != 0 {
+		t.Errorf("commit outcome unknown: checkpoints %v; the fold may have landed, so writing it again adds its rows twice", ck)
+	}
+	if landed.rowsTotal != 1 {
+		t.Errorf("commit outcome unknown: rows_applied increments sum to %d; the source applied 1 DML row", landed.rowsTotal)
 	}
 
 	o, err = run(context.Background(), &fenceSeam{})

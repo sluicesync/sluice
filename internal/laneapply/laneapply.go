@@ -222,7 +222,10 @@ type LaneApplier interface {
 	// then at.Pos with at.RowsApplied — LAST — then COMMIT. The contract: a
 	// non-nil at is persisted whether or not c applies (a barrier the marks
 	// prove already applied still writes it), or the call returns an error
-	// and none of it is durable. The coordinator passes a non-nil at only when
+	// and none of it is durable — except an error from the COMMIT step, whose
+	// outcome is unknown and which the engine must wrap with
+	// [CommitOutcomeUnknown], so the coordinator does not write the same
+	// checkpoint again. The coordinator passes a non-nil at only when
 	// FoldsBarrierCheckpoint(c) is true; an engine handed one for a kind it
 	// does not fold refuses with [BarrierFoldNotTransactionalMarker]. nil
 	// writes no position.
@@ -1356,8 +1359,19 @@ func (o *Orchestrator) applyBarrier(ctx context.Context, c ir.Change) error {
 // for. The replay a stop leaves is the same as a kill at the same instant,
 // which §E.5's first row already accepts — and which the two-commit order
 // shared whenever the stop landed before its pre-apply checkpoint committed.
+//
+// A fold whose COMMIT step failed ([CommitOutcomeUnknown], amendment D's
+// classification, which the engines apply to a barrier fold's COMMIT too) is
+// skipped as well: that COMMIT may have landed after the watchdog gave up,
+// and writing the same checkpoint again would add its rows_applied twice.
+// Its replay is then the fold's own position or P_prev, whichever is durable.
+//
+// It is ONE best-effort attempt on the same pool that just failed, so the
+// failures it exists for — a reparent, a dead connection — often fail it too;
+// then it WARNs and the replay stays at P_prev. It narrows the window, it
+// does not close it.
 func (o *Orchestrator) barrierFoldFailed(ctx context.Context, foldErr error) {
-	if ctx.Err() != nil {
+	if ctx.Err() != nil || IsCommitOutcomeUnknown(foldErr) {
 		return
 	}
 	if err := o.writeCheckpoint(ctx); err != nil {

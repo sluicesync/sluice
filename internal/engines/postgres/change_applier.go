@@ -1653,7 +1653,10 @@ func (a *ChangeApplier) commitCheckpoint(ctx context.Context, streamID string, a
 		return err
 	}
 	if err := a.commitWithTimeout(tx); err != nil {
-		return classifyApplierError(fmt.Errorf("postgres: applier: checkpoint commit: %w", err))
+		// The outcome of a position write's COMMIT that failed is unknown
+		// (see applyOneImpl's fold branch): a skipped barrier's fold must not
+		// be written again on top of one that may have landed.
+		return laneapply.CommitOutcomeUnknown(classifyApplierError(fmt.Errorf("postgres: applier: checkpoint commit: %w", err)))
 	}
 	a.marks.Committed(marks)
 	return nil
@@ -1745,7 +1748,15 @@ func (a *ChangeApplier) applyOneImpl(ctx context.Context, streamID string, c ir.
 		// this window was enumerated from): a stop cancelling ctx rolls the
 		// tx back under us and Commit reports ErrTxDone; nothing persisted,
 		// resume re-delivers.
-		return false, applierErrorOrShutdown(ctx, fmt.Errorf("postgres: applier: commit: %w", err))
+		cerr := applierErrorOrShutdown(ctx, fmt.Errorf("postgres: applier: commit: %w", err))
+		if pw.checkpoint != nil {
+			// A barrier fold's COMMIT failed: it may still have landed (the
+			// Bug-56 watchdog gave up while the COMMIT waited), so the
+			// coordinator must not write its checkpoint again — that would
+			// add its rows_applied twice. Amendment D's classification.
+			cerr = laneapply.CommitOutcomeUnknown(cerr)
+		}
+		return false, cerr
 	}
 	a.marks.Committed(marks)
 	// ADR-0049 Chunk C cache-after-commit invariant: a SchemaSnapshot
