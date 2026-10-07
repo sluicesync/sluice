@@ -352,6 +352,12 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 	if err := r.refuseKeylessRerun(ctx, links); err != nil {
 		return err
 	}
+	// 2.95. Bug 297's target half: a later segment full's table that the
+	//      target already holds keyed only on a column the rows do not
+	//      supply. Target STATE, so here for the same reason as 2.9.
+	if err := r.refuseRotatedKeylessTarget(ctx, links); err != nil {
+		return err
+	}
 
 	applier, err := r.Target.OpenChangeApplier(ctx, r.TargetDSN)
 	if err != nil {
@@ -387,7 +393,6 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 	//    because seg[i].end <= seg[i+1].start, so a later segment's
 	//    full carries strictly-newer-or-equal state); an incremental
 	//    link replays its change chunks.
-	firstFullApplied := false
 	for i := range links {
 		link := &links[i]
 		switch lineage.CanonicalKind(link.Manifest.Kind) {
@@ -396,8 +401,11 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 			// LATER segment full is a fresh snapshot of the same
 			// (DDL-evolved) schema and must NOT re-run the
 			// non-idempotent index/constraint phases — it refreshes
-			// rows via an idempotent upsert (ADR-0046 §3).
-			dataOnly := firstFullApplied
+			// rows via an idempotent upsert (ADR-0046 §3). That
+			// converges only on a table whose re-written rows collide on
+			// a key; the Bug 297 doors above refused the chain otherwise,
+			// judging the fulls the SAME predicate selects here.
+			dataOnly := isDataOnlyFull(links, i)
 			slog.InfoContext(
 				ctx, "chain restore: applying segment full",
 				slog.String("segment_dir", link.Segment.Dir),
@@ -410,7 +418,6 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 				return migcore.WrapWithHint(migcore.PhaseBulkCopy, fmt.Errorf("chain restore: apply segment full %s: %w",
 					lineage.ManifestBackupID(link.Manifest), err))
 			}
-			firstFullApplied = true
 		case irbackup.BackupKindIncremental:
 			slog.InfoContext(
 				ctx, "chain restore: applying incremental",
@@ -1859,6 +1866,17 @@ func (r *ChainRestore) preflightBeforeTarget(
 	// is now reachable from outside Run.
 	if err := verifyChainSignatures(ctx, r.Store, links, verifyMaterial{env: r.Envelope, verifyPub: r.VerifyKey}, r.RequireSignature); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("chain restore: %w", err))
+	}
+
+	// 2.85. Bug 297: a ROTATED chain whose later segment full would re-write a
+	//      table keyless on its recorded schema. Restore applies that full
+	//      over the earlier segments' rows, which the idempotent writer
+	//      cannot do for such a table — it refused mid-restore, after the
+	//      first segment had landed. A manifest-only judgment, so it sits in
+	//      the shared list the broker runs before its drop; the TARGET half
+	//      asks about target state and runs in Run.
+	if err := refuseRotatedKeylessRecorded(ctx, links, r.Filter, "chain restore"); err != nil {
+		return err
 	}
 
 	// 2.9. F-E1-SEVERED-TAIL-REPLAY: refuse a chain that carries one source

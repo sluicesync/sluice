@@ -316,9 +316,12 @@ func TestRestore_DataOnlyParallel_DispatchesIdempotentPerWorker(t *testing.T) {
 	rows := map[string][]ir.Row{}
 	names := []string{"d00", "d01", "d02"}
 	for i, name := range names {
+		// Keyed: a DataOnly re-write of a keyless table is refused before
+		// the writer (Bug 297), and this pin is about dispatch, not that.
 		schema.Tables = append(schema.Tables, &ir.Table{
-			Name:    name,
-			Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
+			Name:       name,
+			Columns:    []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
+			PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}},
 		})
 		rows[name] = []ir.Row{{"id": int64(i)}, {"id": int64(i + 100)}}
 	}

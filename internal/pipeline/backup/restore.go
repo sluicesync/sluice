@@ -1167,11 +1167,19 @@ func (r *Restore) restoreChunkGroup(
 	// (errKeylessIdempotent, Bug 125). So a keyless table in a ROTATED chain
 	// fails the restore rather than duplicating into it — deliberate, and
 	// the same call ADR-0108's keyless carve-out makes for copy retries.
+	// Bug 297: that refusal used to be the ONLY one, firing here after the
+	// earlier segments had landed, worded for the VStream cold-start copy.
+	// [ChainRestore] now refuses such a chain before writing anything
+	// (rotated_keyless_door.go); the check below is the belt for a bypassed
+	// door, and keeps the engines' cold-start wording off the restore path.
 	writeFn := rw.WriteRows
 	if r.DataOnly {
 		iw, ok := rw.(ir.IdempotentRowWriter)
 		if !ok {
 			return 0, errRestoreDataOnlyNotIdempotent(table, rw)
+		}
+		if !irbackup.TableReplayIdempotent(table) {
+			return 0, errDataOnlyKeyless(table)
 		}
 		writeFn = iw.WriteRowsIdempotent
 	}
@@ -2078,8 +2086,8 @@ func verifyBackupScan(ctx context.Context, store irbackup.Store, opts VerifyOpti
 	// counter, not the chunk tally (see [verifyFailureSummary]).
 	tally.sigFailed = verifyBackupSignatures(ctx, store, records, opts)
 
-	// F-E1-SEVERED-TAIL-REPLAY: verify predicts restore ([verifySeveredTransactions]).
-	if err := verifySeveredTransactions(ctx, store, chain, needsWalk, chainEncrypted(identity), opts.Envelope != nil, prober); err != nil {
+	// The chain-shape refusals restore makes, predicted ([verifyChainShapeRefusals]).
+	if err := verifyChainShapeRefusals(ctx, store, chain, needsWalk, chainEncrypted(identity), opts.Envelope != nil, prober); err != nil {
 		return verifyScanTally{}, err
 	}
 

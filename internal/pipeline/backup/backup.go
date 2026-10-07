@@ -147,6 +147,14 @@ type Backup struct {
 	// returns.
 	Filter migcore.TableFilter
 
+	// RotationSegment marks a ROTATION-born segment full (`backup stream
+	// --retain-rotate-at*`, ADR-0046): chain restore will apply it DataOnly
+	// over the earlier segments' rows, so a table no re-written row could
+	// collide on is refused before the snapshot opens (Bug 297,
+	// SLUICE-E-BACKUP-ROTATED-KEYLESS-TABLE). The zero value is an ordinary
+	// `backup full`, which is applied first and needs no key.
+	RotationSegment bool
+
 	// ChunkRows is the per-chunk row count. Zero falls back to
 	// [DefaultBackupChunkRows]. The writer rolls over to a new chunk
 	// file whenever the current one hits this row count.
@@ -406,39 +414,20 @@ func (b *Backup) Run(ctx context.Context) error {
 		return err
 	}
 
-	// 1. Read source schema.
-	sr, err := b.Source.OpenSchemaReader(ctx, b.SourceDSN)
+	// 1 + 2. Read the source schema and apply the table filter.
+	sr, schema, err := b.readScopedSchema(ctx)
 	if err != nil {
-		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("backup: open source schema reader: %w", err))
+		return err
 	}
 	defer migcore.CloseIf(sr)
-
-	// ADR-0047 tier (b): a PG-source backup may carry uncatalogued
-	// extension types verbatim. The restore-target engine is unknown
-	// at backup time, so this only enables CAPTURE — the PG-restore-
-	// only constraint is enforced later by the recorded lineage marker
-	// (lineage.VerbatimExtensionColumnsIn → lineage.Segment) + the loud
-	// restore-time engine gate. A non-PG source never enables it.
-	migcore.ApplyVerbatimExtensionPassthrough(sr, migcore.VerbatimBackupSourcePG(b.Source))
-
-	// catalog Bug 76: scope per-column type validation to the filtered
-	// table set (b.Filter already has engine defaults merged above).
-	migcore.ApplyTableScope(sr, b.Filter)
-
-	schema, err := sr.ReadSchema(ctx)
-	if err != nil {
-		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("backup: read source schema: %w", err))
-	}
 	if len(schema.Tables) == 0 {
 		slog.InfoContext(ctx, "backup: source schema has no tables; manifest with empty table list will be written")
 	}
 
-	// 2. Apply table filter.
-	if err := migcore.ApplyTableFilter(ctx, schema, b.Filter); err != nil {
-		// migcore.ApplyTableFilter errors when the filter excludes everything.
-		// For backups that's still a valid intent in some workflows
-		// (e.g. "snapshot-time-only"), but matching the migrate shape
-		// — surface the error so the operator notices.
+	// 2.05. Bug 297: a rotation-born segment full refuses a table no later
+	// restore could re-apply it over (see rotation_keyless.go). Before the
+	// snapshot opens, so a refused rotation costs a schema read.
+	if err := b.refuseRotationKeyless(ctx, schema); err != nil {
 		return err
 	}
 

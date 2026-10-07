@@ -172,7 +172,10 @@ type rotateInputs struct {
 	// and compactable. The (P_N, S] events the new full's snapshot ALSO
 	// captured re-apply idempotently on restore -- the snapshot->CDC
 	// handoff dedup sluice already proves for the initial full->stream
-	// transition, replicated per segment boundary.
+	// transition, replicated per segment boundary. "Idempotently" holds
+	// only for a table a re-written row collides on a key in; a keyless
+	// one is refused at stream start and at each rotation (Bug 297,
+	// [backup.PreflightRotationKeyless], [backup.Backup.RotationSegment]).
 	changesCh <-chan ir.Change
 	now       func() time.Time
 	clockNow  func() time.Time
@@ -307,6 +310,14 @@ func (b *BackupStream) performRotation(ctx context.Context, in rotateInputs) (ro
 		Encryption:    b.Encryption,
 		Codec:         segCodec,
 		Now:           in.now,
+		// Bug 297: chain restore applies this full over the earlier
+		// segments' rows, so it refuses a keyless table before its
+		// snapshot opens — the abort below keeps the stream on the open
+		// segment, which stays restorable.
+		RotationSegment: true,
+	}
+	if b.legacyKeylessRotation {
+		full.RotationSegment = false // test seam: an older binary's chain (see the field)
 	}
 	if err := full.Run(ctx); err != nil {
 		b.discardProvisional(ctx, provisionalDir)

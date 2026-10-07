@@ -415,6 +415,14 @@ type BackupStream struct {
 	// fire its stop, stop file or cancel at a chosen row INSIDE a transaction
 	// instead of racing the stream from outside.
 	onWindowChange func(c ir.Change, inTransaction bool, out *captureOutcome)
+
+	// legacyKeylessRotation turns OFF both Bug 297 write-side doors (the
+	// start preflight and the rotation full's RotationSegment). Test seam
+	// (false in production; nothing outside tests sets it): the read-side
+	// pins need the rotated chain over a keyless table that every release
+	// through v0.156.12 wrote, and the doors this release adds make that
+	// chain impossible to build any other way.
+	legacyKeylessRotation bool
 }
 
 // Run executes the long-running stream. Blocks until ctx is cancelled
@@ -669,8 +677,10 @@ func (b *BackupStream) Run(ctx context.Context) (err error) {
 				if errors.Is(rotErr, errRotationAbortStayOpen) {
 					slog.ErrorContext(
 						ctx, "stream: rotation aborted; staying on the open segment (no gap introduced)",
-						slog.String("rotation_reason", reason),
-						slog.String("err", rotErr.Error()),
+						append([]any{
+							slog.String("rotation_reason", reason),
+							slog.String("err", rotErr.Error()),
+						}, sluicecode.Attrs(rotErr)...)...,
 					)
 				} else {
 					return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("stream: rotation (%s): %w", reason, rotErr))
@@ -899,6 +909,14 @@ func (b *BackupStream) newRolloverLoop(ctx context.Context) (*rolloverInit, erro
 	// enumeration).
 	if err := backup.RefuseRedactedChainExtension(parent, parentPath, "backup stream"); err != nil {
 		return nil, err
+	}
+	// Bug 297: with rotation enabled, refuse to build a chain no restore can
+	// apply whole — a later segment full re-written over a keyless table.
+	// Judged over the scope a rotation full reads, before the pump opens.
+	if (b.RetainRotateAt > 0 || b.RetainRotateAtChainLength > 0) && !b.legacyKeylessRotation {
+		if err := backup.PreflightRotationKeyless(ctx, b.Source, b.SourceDSN); err != nil {
+			return nil, err
+		}
 	}
 	// Never empty past this point: a positionless FULL is refused inside
 	// (POSITIONLESS-FULL-ROOT, on every source since v0.154.0 — the

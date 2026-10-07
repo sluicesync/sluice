@@ -515,16 +515,22 @@ func pickNonNullUniqueIndex(table *ir.Table) *ir.Index {
 // (Bug 125). Such a table has no key for ON CONFLICT to infer against,
 // so VStream COPY catchup re-emissions would create duplicate rows. Per
 // the loud-failure tenet we refuse rather than silently duplicate.
+//
+// The writer does not know its caller, so the message names both that
+// reach it rather than the one it was first written for: Bug 297 was a
+// chain restore failing here with a remedy ("exclude it from the sync")
+// for a command the operator had not run. Chain restore now refuses that
+// shape up front (SLUICE-E-BACKUP-ROTATED-KEYLESS-TABLE).
 func errKeylessIdempotent(table *ir.Table) error {
 	name := "<nil>"
 	if table != nil {
 		name = table.Name
 	}
 	return fmt.Errorf(
-		"postgres: table %q has no PRIMARY KEY and no non-null UNIQUE index; "+
-			"the cold-start VStream COPY needs a unique key to absorb Vitess's "+
-			"catchup-phase re-emissions idempotently (Bug 125). Add a PRIMARY KEY "+
-			"or a NOT NULL UNIQUE index on the source table, or exclude it from the sync",
+		"postgres: table %q has no PRIMARY KEY and no non-null UNIQUE index, and this write re-writes rows "+
+			"that may already be on the target — a cold-start VStream COPY's catch-up re-emissions (Bug 125), "+
+			"or a rotated backup chain's later segment full during restore (Bug 297) — which needs a unique key "+
+			"to absorb idempotently. Add a PRIMARY KEY or a NOT NULL UNIQUE index on the source table, or exclude the table",
 		name,
 	)
 }

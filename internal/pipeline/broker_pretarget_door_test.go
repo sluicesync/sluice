@@ -76,6 +76,7 @@ func TestChainRestorePreTargetDoorRoster(t *testing.T) {
 		"checkMixedModeChain",
 		"restoreManifestIntegrityPreflights",
 		"verifyChainSignatures",
+		"refuseRotatedKeylessRecorded", // Bug 297, the manifest-only half
 		"refuseSeveredTransactions",
 	}
 	for _, w := range want {

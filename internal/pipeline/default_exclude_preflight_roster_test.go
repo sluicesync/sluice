@@ -51,6 +51,9 @@ var defaultExcludeCallSites = map[string]string{
 		"a vanilla-mysql DSN aimed at a PlanetScale host reaches the excluder and gets the `_vt_*` " +
 		"exclusion it needs. Whether backup SHOULD refuse that pairing up front is an open question " +
 		"(audit-backlog G-10), not something this roster decides",
+	"backup/rotation_keyless.go:PreflightRotationKeyless": "NOT PREFLIGHTED — the `backup stream run` start " +
+		"door (Bug 297) mirrors the scope a rotation-born segment full reads, which is (*Backup).Run's, so it " +
+		"consults the excluder exactly as that entry does and with the same verdict",
 	"diff.go:(*Differ).Run": "NOT PREFLIGHTED — `sluice schema diff` reads information_schema over the " +
 		"plain MySQL protocol, which a PlanetScale endpoint serves fine; the exclusion is what keeps " +
 		"`_vt_*` out of the diff",

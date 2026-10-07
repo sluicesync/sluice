@@ -678,6 +678,20 @@ const (
 	// An EMPTY keyless table (a fresh target) is restored normally.
 	CodeRestoreKeylessTableNotEmpty Code = "SLUICE-E-RESTORE-KEYLESS-TABLE-NOT-EMPTY"
 
+	// CodeBackupRotatedKeylessTable fires when a backup chain that ROTATED
+	// (`backup stream --retain-rotate-at` / `--retain-rotate-at-chain-length`,
+	// ADR-0046/ADR-0067) would re-write a table with no key a re-written row
+	// collides on (Bug 297). Chain restore applies every segment full after
+	// the first DataOnly, over the rows the earlier segments already
+	// restored, through the idempotent writer — which refuses a table keyless
+	// on the recorded schema partway through the restore, and lands a second
+	// copy of every row in a target table keyed only on a column the rows do
+	// not supply. Refused by restore before anything is written, reported by
+	// `backup verify`, refused at `backup stream` start when rotation is
+	// enabled, and refused at each rotation (the stream stays on its open
+	// segment) for a table that appeared or lost its key since.
+	CodeBackupRotatedKeylessTable Code = "SLUICE-E-BACKUP-ROTATED-KEYLESS-TABLE"
+
 	// CodeCDCKeyMatchedMultipleRows fires when a CDC UPDATE or DELETE that
 	// names its row by key matched MORE than one row on the target (GC-42,
 	// marker KEY-SCOPED-WRITE-MATCHED-MULTIPLE-ROWS); there is no exemption — a
@@ -1026,6 +1040,8 @@ var registry = map[Code]Info{
 	CodeBrokerIncrementalRewritten: {ClassRefusal, "sync from-backup refused to resume inside an incremental it had applied part of, because that incremental was rewritten since (its change-chunk list changed — smart compaction — or another incremental now follows the last one fully applied): resuming by event ordinal into a different stream could drop changes silently; nothing of it was applied; recover with --reset-target-data"},
 
 	CodeRestoreKeylessTableNotEmpty: {ClassRefusal, "restore refused before writing: a target table it would load already holds rows and has no PRIMARY KEY or NOT NULL UNIQUE index made of columns the backup's rows carry, so the restore would append its rows next to the existing ones instead of colliding — typically a re-run after a failed restore, which would duplicate everything the earlier attempt wrote; empty or drop every table that attempt loaded and re-run, or exclude the named ones"},
+
+	CodeBackupRotatedKeylessTable: {ClassRefusal, "a rotated backup chain (`backup stream run --retain-rotate-at*`) would re-write a table with no key a re-written row collides on: chain restore applies every segment full after the first over the rows the earlier segments restored, which such a table cannot absorb, so restore refuses before writing anything, `backup verify` reports it, and `backup stream` refuses to start (or to rotate); restore the other tables with `--exclude-table` and give the named tables a key on the source, or stream without rotation"},
 
 	CodeTargetTableShapeMismatch: {ClassRefusal, "migrate refused before any data moved: a target table with the same name already exists but its column shape (names/types/nullability) differs from what the migration would create — proceeding would fail mid-copy or land rows in the wrong columns"},
 
