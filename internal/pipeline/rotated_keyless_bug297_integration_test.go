@@ -296,6 +296,9 @@ func runBug297(t *testing.T, side r297Side) {
 		t.Fatalf("restore --exclude-table=kl: %v", err)
 	}
 	want := r297Ints(t, side, src, "SELECT id FROM kd ORDER BY id")
+	if len(want) != 32 { // 2 seeds + 30 streamed: anti-vacuity for the equality below
+		t.Fatalf("source kd holds %d rows; the fixture writes 32", len(want))
+	}
 	got := r297Ints(t, side, tgt, "SELECT id FROM kd ORDER BY id")
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("kd after the rotated restore = %v (%d rows); source = %v (%d rows)", got, len(got), want, len(want))
@@ -414,6 +417,9 @@ func TestBug297_RotationRefusedForAKeylessTableAddedMidStream_PG(t *testing.T) {
 		col := map[string]string{"kd": "id", "kl": "a"}[tbl]
 		q := fmt.Sprintf("SELECT %s FROM %s ORDER BY %s", col, tbl, col)
 		want, got := r297Ints(t, side, src, q), r297Ints(t, side, tgt, q)
+		if n := map[string]int{"kd": 51, "kl": 30}[tbl]; len(want) != n {
+			t.Fatalf("source %s holds %d rows; the fixture writes %d", tbl, len(want), n)
+		}
 		if !reflect.DeepEqual(got, want) {
 			t.Errorf("%s after restore = %v (%d rows); source = %v (%d rows)", tbl, got, len(got), want, len(want))
 		}
