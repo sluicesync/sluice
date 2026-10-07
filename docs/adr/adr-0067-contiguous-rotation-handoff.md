@@ -153,6 +153,19 @@ Concretely:
    StartPosition` (the field documents the expected overlap), and stays
    exact otherwise.
 
+   **Amendment 2026-10-07 (Bug 297): "idempotent" here holds only for a
+   table on which a re-written row collides on a key.** The same is true
+   of the segment full itself, which chain restore applies DataOnly over
+   the earlier segments' rows. A table with no PRIMARY KEY and no NOT
+   NULL UNIQUE index was refused by the idempotent writer partway through
+   the restore, and a target pre-created keyed only on a surrogate the
+   rows do not carry duplicated silently on MySQL (measured: 355 rows for
+   32). Both are now refused before anything is written
+   (`SLUICE-E-BACKUP-ROTATED-KEYLESS-TABLE`), and `backup stream` refuses
+   to build such a chain (at start, and per rotation). Restoring such a
+   table from a rotated chain is the open item BUG297-REAL-FIX in
+   `docs/dev/audit-backlog.md`.
+
 4. **Compaction is unchanged.** A born-contiguous chain merges by pure
    concat exactly as today; discarding the later full is now safe because
    `(P_N, S]` lives in the merged incrementals. Smart compaction

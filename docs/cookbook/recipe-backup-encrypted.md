@@ -130,6 +130,22 @@ control segment cadence:
 - `--rollover-window 5m` — group changes within a 5-minute window
   into a single incremental.
 
+**Rotation needs every table to have a key.** Each rotation writes a new
+segment full, and a chain restore applies every segment full after the
+first over the rows the earlier segments already restored. A table with
+no `PRIMARY KEY` and no `NOT NULL UNIQUE` index cannot be re-written that
+way, so with either rotation flag set `backup stream run` refuses to
+start while the source holds such a table
+(`SLUICE-E-BACKUP-ROTATED-KEYLESS-TABLE`, exit 3, nothing written). A
+rotation full has no `--exclude-table` of its own, so the remedy is a
+key on the source table or a stream without rotation. A keyless table
+that appears (or loses its key) after the stream started stops rotation
+instead: each rotation is refused with the same code in the log and the
+stream keeps writing its open segment, which stays restorable; rotation
+resumes once the table has a key. Chains written by v0.156.12 and
+earlier can carry such a table — `backup verify` and `restore` name it,
+and Step 4 covers restoring the rest.
+
 `sluice backup prune --keep-incrementals N` retires older WHOLE
 segments while preserving the chain root's restorability. Retention is
 segment-granular: `N` is rounded UP to the nearest segment boundary, so
@@ -268,6 +284,22 @@ The restore re-applies the chain from the root manifest forward.
 Restore is **all-or-nothing** — if any chunk fails to unwrap, the
 restore exits non-zero before any rows land on the target. There's no
 silent partial restore.
+
+A **rotated** chain (one written with `--retain-rotate-at*`) that
+carries a table with no key a re-written row collides on is refused
+before anything is written, with `SLUICE-E-BACKUP-ROTATED-KEYLESS-TABLE`
+naming each table and the segment fulls that carry its rows. The same
+refusal covers a target table you pre-created keyed only on a column the
+backup's rows do not carry (an `AUTO_INCREMENT`, serial, identity or
+defaulted surrogate): restoring a rotated chain into it would land every
+re-written row a second time. Only a release that wrote the chain
+without the start-time check (v0.156.12 and earlier) can produce the
+first shape. The rows are in the chain, but this release cannot restore
+those tables from it: restore everything else with
+`--exclude-table=<table>` for each named table, and copy those tables
+from the source another way. Through v0.156.12 this restore failed at
+the second segment full after writing part of the target, with a
+message about a VStream cold start (Bug 297).
 
 For cross-engine restore (e.g. PG-source backup → MySQL target),
 sluice refuses loudly when the source schema uses PG-specific shapes

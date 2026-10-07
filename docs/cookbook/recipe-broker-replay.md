@@ -94,6 +94,13 @@ the producer commits an incremental (chunks accumulated during the
 window get bundled into one manifest); `--retain-rotate-at-chain-length`
 controls when the chain rotates into a new segment (useful for
 keeping individual segments compact for `backup prune` operations).
+With rotation enabled the producer refuses to start while a source
+table has no `PRIMARY KEY` and no `NOT NULL UNIQUE` index
+(`SLUICE-E-BACKUP-ROTATED-KEYLESS-TABLE`): a chain restore applies each
+later segment full over the earlier segments' rows, which such a table
+cannot absorb. The broker refuses keyless tables on its own account
+(`SLUICE-E-BROKER-KEYLESS-TABLE`), so a broker topology needs keys
+either way.
 
 ### Step 3: consumer bulk-copies the full
 

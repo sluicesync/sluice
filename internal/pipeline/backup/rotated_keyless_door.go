@@ -31,7 +31,11 @@ import (
 //     VStream cold-start copy;
 //   - keyless on the TARGET only (a pre-created table keyed on a surrogate the
 //     rows do not supply): the re-written rows land a second time, silently
-//     on MySQL, whose ON DUPLICATE KEY UPDATE collides on any unique key.
+//     on MySQL, whose ON DUPLICATE KEY UPDATE collides on any unique key
+//     (measured before this door: a 14-segment chain into an AUTO_INCREMENT
+//     -keyed table, 355 rows for the source's 32 at exit 0). On Postgres the
+//     DataOnly upsert names the recorded key in ON CONFLICT and fails
+//     partway with 42P10 instead — loud, but after writing.
 //
 // The judgment is the F-E1 one, [irbackup.JudgeReplayKey] through
 // [migcore.FindReplayKeylessTables]; nothing here re-derives "keyed".
