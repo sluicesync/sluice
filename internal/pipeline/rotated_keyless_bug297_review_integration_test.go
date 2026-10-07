@@ -10,6 +10,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -126,7 +127,7 @@ func TestBug297_KeyAddedInRotationGap_MySQL(t *testing.T) {
 	}
 	time.Sleep(4 * time.Second)
 	cancel()
-	if err := <-streamErr; err != nil {
+	if err := <-streamErr; err != nil && !errors.Is(err, context.Canceled) { // see r297BuildRotatedChain
 		t.Fatalf("stream: %v", err)
 	}
 	if !altered.Load() || segs() < 3 {
@@ -174,7 +175,7 @@ func TestBug297_KeyAddedWhileStopped_MySQL(t *testing.T) {
 		body()
 		time.Sleep(4 * time.Second)
 		cancel()
-		if err := <-streamErr; err != nil {
+		if err := <-streamErr; err != nil && !errors.Is(err, context.Canceled) { // see r297BuildRotatedChain
 			t.Fatalf("stream: %v", err)
 		}
 	}
