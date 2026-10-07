@@ -57,6 +57,7 @@ import (
 	"sluicesync.dev/sluice/internal/appliershared"
 	"sluicesync.dev/sluice/internal/applymarks"
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/laneapply"
 )
 
@@ -328,3 +329,63 @@ func (a *ChangeApplier) ClearApplyMarks(ctx context.Context, streamID string) er
 }
 
 var _ ir.ApplyMarksClearer = (*ChangeApplier)(nil)
+
+// MarksCoverReason implements [ir.ApplyMarksCoverageProber] (ADR-0191 §3.5)
+// for a MySQL-family target: "" when this applier's marks would key every
+// change of table and commit with its rows, otherwise why not.
+//
+// A `--control-keyspace` sidecar is refused as a whole: under vtgate's
+// transaction_mode=MULTI the marks and the rows commit on different shards,
+// and the write cores order the rows first so that a tear leaves rows WITHOUT
+// their marks (GC-41 (c)) — the tolerable direction for a loud collision, and
+// exactly the duplicate a keyless replay must not risk. A SHARDED keyspace
+// needs that sidecar for its control tables, so this also covers it.
+func (a *ChangeApplier) MarksCoverReason(ctx context.Context, table *ir.Table) (string, error) {
+	if a.controlKeyspace != "" {
+		return fmt.Sprintf("the target keeps its control tables in the `--control-keyspace` sidecar %q, where vtgate's MULTI "+
+			"commit can land rows without their apply marks (GC-41 (c))", a.controlKeyspace), nil
+	}
+	if unusable := applyMarksUsable(ctx, a.db, a.controlKeyspace); unusable != nil {
+		if transient := applyMarksProbeTransient(unusable); transient != nil {
+			return "", transient
+		}
+		return applymarks.UnavailableMarker + ": " + unusable.Error(), nil
+	}
+	if table == nil {
+		return "", nil
+	}
+	pk, err := a.targetKeyForCoverage(ctx, table)
+	if err != nil {
+		return "", err
+	}
+	return irbackup.MarkKeyUnsupplied(pk, table), nil
+}
+
+// targetKeyForCoverage is the primary key the applier's mark subject would
+// use for table, read without touching the applier's PK cache (a table the
+// target does not hold yet must not cache "keyless"), and the recorded key for
+// a table the target does not hold (it is created with that key).
+func (a *ChangeApplier) targetKeyForCoverage(ctx context.Context, table *ir.Table) ([]string, error) {
+	schema := a.routedSchema(table.Schema)
+	const existsQ = `SELECT COUNT(*) FROM information_schema.TABLES
+		WHERE TABLE_SCHEMA = COALESCE(NULLIF(?, ''), DATABASE()) AND TABLE_NAME = ?`
+	var n int
+	if err := a.db.QueryRowContext(ctx, existsQ, schema, table.Name).Scan(&n); err != nil {
+		return nil, fmt.Errorf("mysql: apply-marks coverage: probe %s: %w", table.Name, err)
+	}
+	if n == 0 {
+		return irbackup.RecordedKeyColumns(table), nil
+	}
+	tx, err := a.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("mysql: apply-marks coverage: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	pk, err := loadPrimaryKey(ctx, tx, schema, table.Name)
+	if err != nil {
+		return nil, fmt.Errorf("mysql: apply-marks coverage: %w", err)
+	}
+	return pk, nil
+}
+
+var _ ir.ApplyMarksCoverageProber = (*ChangeApplier)(nil)

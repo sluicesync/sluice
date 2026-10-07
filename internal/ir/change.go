@@ -258,6 +258,33 @@ type ApplyMarksClearer interface {
 	ClearApplyMarks(ctx context.Context, streamID string) error
 }
 
+// ApplyMarksCoverageProber is the optional [ChangeApplier] surface a replay
+// path asks before it replays a table whose re-applied rows nothing but
+// ADR-0190's apply marks can keep from duplicating — a keyless table, or one
+// keyed only on a column the rows do not carry (ADR-0191 §3.5). The marks
+// make such a replay exactly-once only when all three hold, and only the
+// target can say whether they do:
+//
+//   - the mark table is usable by this role (else the run applies without
+//     marks behind APPLY-MARKS-UNAVAILABLE);
+//   - a mark and its rows commit atomically (not a vtgate MULTI target with a
+//     `--control-keyspace` sidecar, where a tear leaves rows without marks by
+//     design; not a PlanetScale Neki target, whose cross-shard-group
+//     atomicity is an UNVERIFIED PREMISE);
+//   - the table's mark key on the target is computable from the replayed
+//     rows: the table has no key there (marks are table-wide), or every key
+//     column is one the recorded table carries. A key on a column the rows
+//     do not supply yields no mark key, and the change applies unmarked.
+//
+// table == nil asks only the first two (the target as a whole). A table the
+// target does not hold is judged by its recorded key, which is the one it is
+// created with. MarksCoverReason returns "" when the marks cover the table,
+// otherwise the reason they do not, for a refusal to name; a non-nil error is
+// a probe that could not answer, which a caller must treat as "not covered".
+type ApplyMarksCoverageProber interface {
+	MarksCoverReason(ctx context.Context, table *Table) (reason string, err error)
+}
+
 // Insert is a row-insertion change event.
 type Insert struct {
 	Position Position

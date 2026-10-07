@@ -49,6 +49,7 @@ import (
 	"sluicesync.dev/sluice/internal/appliershared"
 	"sluicesync.dev/sluice/internal/applymarks"
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/laneapply"
 )
 
@@ -364,3 +365,69 @@ func (a *ChangeApplier) ClearApplyMarks(ctx context.Context, streamID string) er
 }
 
 var _ ir.ApplyMarksClearer = (*ChangeApplier)(nil)
+
+// MarksCoverReason implements [ir.ApplyMarksCoverageProber] (ADR-0191 §3.5)
+// for a Postgres target: "" when this applier's marks would key every change
+// of table and commit with its rows, otherwise why not.
+//
+// Neki is refused as a whole, deliberately broader than ADR-0191 Q5's "sharded
+// Neki": the engine knows a target is Neki (isNeki) but not cheaply whether
+// its data and its control tables share one shard group, and the atomicity
+// across groups is this file's UNVERIFIED PREMISE (see the header). Loud, and
+// lifted by the same Neki Tier-3 pass Q5 names.
+func (a *ChangeApplier) MarksCoverReason(ctx context.Context, table *ir.Table) (string, error) {
+	if a.isNeki {
+		return "the target is PlanetScale Neki, where a mark committing atomically with its rows across shard groups " +
+			"is an unverified premise (ADR-0190, postgres/apply_marks.go)", nil
+	}
+	if unusable := applyMarksUsable(ctx, a.db, a.controlSchema); unusable != nil {
+		if transient := applyMarksProbeTransient(unusable); transient != nil {
+			return "", transient
+		}
+		return applymarks.UnavailableMarker + ": " + unusable.Error(), nil
+	}
+	if table == nil {
+		return "", nil
+	}
+	pk, err := a.targetKeyForCoverage(ctx, table)
+	if err != nil {
+		return "", err
+	}
+	return irbackup.MarkKeyUnsupplied(pk, table), nil
+}
+
+// targetKeyForCoverage is the primary key the applier's mark subject would
+// use for table — read without touching the applier's PK cache (a table the
+// target does not hold yet must not cache "keyless"), and the recorded key
+// for a table the target does not hold (it is created with that key).
+func (a *ChangeApplier) targetKeyForCoverage(ctx context.Context, table *ir.Table) ([]string, error) {
+	schema := a.routedSchema(table.Schema)
+	var present bool
+	if err := a.db.QueryRowContext(ctx, `SELECT pg_catalog.to_regclass($1) IS NOT NULL`,
+		schemaTableKeyQuoted(schema, table.Name)).Scan(&present); err != nil {
+		return nil, fmt.Errorf("postgres: apply-marks coverage: probe %s: %w", table.Name, err)
+	}
+	if !present {
+		return irbackup.RecordedKeyColumns(table), nil
+	}
+	tx, err := a.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: apply-marks coverage: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	pk, err := loadPrimaryKey(ctx, tx, schema, table.Name)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: apply-marks coverage: %w", err)
+	}
+	return pk.Cols, nil
+}
+
+// schemaTableKeyQuoted renders schema.table as a quoted regclass literal.
+func schemaTableKeyQuoted(schema, table string) string {
+	if schema == "" {
+		return quoteIdent(table)
+	}
+	return quoteIdent(schema) + "." + quoteIdent(table)
+}
+
+var _ ir.ApplyMarksCoverageProber = (*ChangeApplier)(nil)

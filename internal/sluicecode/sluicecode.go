@@ -641,12 +641,19 @@ const (
 	// landed appends a second copy of the row: no PRIMARY KEY and no NOT NULL
 	// UNIQUE index on the chain's recorded schema, or no key on the target
 	// table the applier writes that is made of columns the replayed rows
-	// carry (a defaulted surrogate collides with nothing) (audit F-E1). The
-	// broker re-applies a WHOLE
-	// incremental after any interruption — its changes carry no apply
-	// identity — so such a table gains a duplicate of every row the
-	// interrupted run had already committed, at exit 0. Refused before
-	// anything is applied, including before a --reset-target-data restore.
+	// carry (a defaulted surrogate collides with nothing) (audit F-E1), AND
+	// the incremental about to be replayed cannot be made exactly-once for it
+	// (ADR-0191 §3.5): it records no change identities (written before
+	// ADR-0191, or smart-compacted), a change to the table carries none, or
+	// the target's apply marks cannot cover the table (unusable, a
+	// `--control-keyspace` sidecar, a Neki target, a target keyed only on a
+	// column the rows do not carry, an engine without marks). Such a replay
+	// re-applies what an interrupted run already committed, so the table
+	// would gain a duplicate of every such row, at exit 0. Judged per
+	// incremental, for the tables it touches, before anything of it is
+	// applied; at start for the incremental a broker is inside or about to
+	// start; and, on a --reset-target-data cold start, before the drop for a
+	// target whose marks can never cover a keyless table.
 	CodeBrokerKeylessTable Code = "SLUICE-E-BROKER-KEYLESS-TABLE"
 
 	// CodeBrokerIncrementalRewritten fires when `sync from-backup` resumes
@@ -1015,7 +1022,7 @@ var registry = map[Code]Info{
 
 	CodeTargetDeferrableKey: {ClassRefusal, "refused before applying anything: a target table's primary key (or only usable unique key) is DEFERRABLE, and Postgres rejects a deferrable constraint as an `ON CONFLICT` arbiter — so sluice's idempotent apply/copy upsert cannot key on it; recreate the target constraint as immediate (NOT DEFERRABLE), pre-create the target table with an immediate key, or take the table out of scope"},
 
-	CodeBrokerKeylessTable:         {ClassRefusal, "sync from-backup refused before applying anything: a table the chain replays into has no PRIMARY KEY and no NOT NULL UNIQUE index in the chain's recorded schema, or none on the target made of columns the replayed rows carry, and the broker re-applies a whole incremental after any interruption — so the table would silently gain a duplicate of every row an interrupted run had committed; give the table a key on the SOURCE and take a new full backup, or replicate it with `sluice sync start`"},
+	CodeBrokerKeylessTable:         {ClassRefusal, "sync from-backup refused before applying anything of an incremental: a table it touches has no PRIMARY KEY and no NOT NULL UNIQUE index in the chain's recorded schema, or none on the target made of columns the replayed rows carry, AND the replay cannot be made exactly-once for it (the incremental records no change identities, or the target's apply marks cannot cover the table) — so an interrupted run's re-run would silently duplicate the rows it had committed; replay a chain this sluice wrote into a target whose marks are usable, give the table a key on the SOURCE and take a new full backup, or replicate it with `sluice sync start`"},
 	CodeBrokerIncrementalRewritten: {ClassRefusal, "sync from-backup refused to resume inside an incremental it had applied part of, because that incremental was rewritten since (its change-chunk list changed — smart compaction — or another incremental now follows the last one fully applied): resuming by event ordinal into a different stream could drop changes silently; nothing of it was applied; recover with --reset-target-data"},
 
 	CodeRestoreKeylessTableNotEmpty: {ClassRefusal, "restore refused before writing: a target table it would load already holds rows and has no PRIMARY KEY or NOT NULL UNIQUE index made of columns the backup's rows carry, so the restore would append its rows next to the existing ones instead of colliding — typically a re-run after a failed restore, which would duplicate everything the earlier attempt wrote; empty or drop every table that attempt loaded and re-run, or exclude the named ones"},

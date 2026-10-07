@@ -4,6 +4,7 @@
 package backup
 
 import (
+	"strconv"
 	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
@@ -92,6 +93,40 @@ func TableReplayIdempotent(table *ir.Table) bool {
 		}
 	}
 	return false
+}
+
+// RecordedKeyColumns is a recorded table's PRIMARY KEY columns (nil when it
+// declares none, or a key entry is an expression).
+func RecordedKeyColumns(t *ir.Table) []string {
+	if t == nil || t.PrimaryKey == nil {
+		return nil
+	}
+	out := make([]string, 0, len(t.PrimaryKey.Columns))
+	for _, c := range t.PrimaryKey.Columns {
+		out = append(out, c.Column)
+	}
+	return out
+}
+
+// MarkKeyUnsupplied is the key half of an engine's ADR-0191 coverage answer
+// ([ir.ApplyMarksCoverageProber]): "" when an ADR-0190 apply mark over the
+// target key pk is computable from the rows table records — pk empty (the
+// table is keyless on the target, so its mark is table-wide) or every pk
+// column one the rows carry ([ReplaySuppliedColumns]) — and the reason
+// otherwise. A pk column the rows do not carry (an expression entry counts as
+// not carried) yields no mark key, and the change then applies unmarked
+// (applymarks.changeKeys), which nothing can make exactly-once.
+func MarkKeyUnsupplied(pk []string, table *ir.Table) string {
+	carried := map[string]bool{}
+	for _, c := range ReplaySuppliedColumns(table) {
+		carried[c] = true
+	}
+	for _, c := range pk {
+		if c == "" || !carried[c] {
+			return "its target primary key includes " + strconv.Quote(c) + ", which the replayed rows do not carry, so no apply mark can name a row"
+		}
+	}
+	return ""
 }
 
 // ReplaySuppliedColumns returns the names of the columns a replayed row of

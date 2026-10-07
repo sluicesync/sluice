@@ -37,6 +37,11 @@ type fakeCDCEngine struct {
 	// segments stamp [irbackup.FormatVersionCDCPositionBinding]. Off by
 	// default so every existing test keeps its schema-derived version.
 	cdcPositionCommitsAfterRows bool
+
+	// stampsIdentity makes the reader declare [ir.ApplyIdentityProvider], so
+	// the incremental it captures is flagged ApplyIdentity (ADR-0191). The
+	// identities themselves are whatever cdcChanges carry. Off by default.
+	stampsIdentity bool
 }
 
 func (e *fakeCDCEngine) Name() string { return e.name }
@@ -72,8 +77,16 @@ func (*fakeCDCEngine) OpenRowWriter(_ context.Context, _ string) (ir.RowWriter, 
 }
 
 func (e *fakeCDCEngine) OpenCDCReader(_ context.Context, _ string) (ir.CDCReader, error) {
+	if e.stampsIdentity {
+		return &identityFakeCDCReader{fakeCDCReader{engine: e}}, nil
+	}
 	return &fakeCDCReader{engine: e}, nil
 }
+
+// identityFakeCDCReader is fakeCDCReader declaring ir.ApplyIdentityProvider.
+type identityFakeCDCReader struct{ fakeCDCReader }
+
+func (*identityFakeCDCReader) StampsApplyIdentity() bool { return true }
 
 func (*fakeCDCEngine) OpenChangeApplier(context.Context, string) (ir.ChangeApplier, error) {
 	return nil, errors.New("not used")

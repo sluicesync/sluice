@@ -1,0 +1,84 @@
+//go:build integration
+
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
+package postgres
+
+import (
+	"context"
+	"strings"
+	"testing"
+	"time"
+
+	"sluicesync.dev/sluice/internal/applymarks"
+	"sluicesync.dev/sluice/internal/ir"
+)
+
+// TestChangeApplier_MarksCoverReason is the Postgres half of ADR-0191 §3.5's
+// target rows, graded against a real server: the broker lifts a keyless
+// table's refusal only when this says the marks cover it. Each shape names
+// what the applier's own mark subject would do — a target table with NO key
+// (table-wide marks: covered), one keyed only on a column the replayed rows do
+// not carry (no mark key: refused), one the target does not hold yet (judged
+// by the recorded key it is created with), and a mark table this role cannot
+// use (APPLY-MARKS-UNAVAILABLE: refused).
+func TestChangeApplier_MarksCoverReason(t *testing.T) {
+	dsn, cleanup := startPostgresForApplier(t)
+	defer cleanup()
+	applyPGApplier(t, dsn, `
+		CREATE TABLE kl (v INT NOT NULL, note TEXT);
+		CREATE TABLE sur (sid BIGSERIAL PRIMARY KEY, v INT NOT NULL);
+		CREATE TABLE keyed (id INT PRIMARY KEY, v INT);`)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	applier, err := Engine{}.OpenChangeApplier(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenChangeApplier: %v", err)
+	}
+	defer func() { _ = applier.(interface{ Close() error }).Close() }()
+	if err := applier.EnsureControlTable(ctx); err != nil {
+		t.Fatal(err)
+	}
+	prober := applier.(ir.ApplyMarksCoverageProber)
+	col := func(n string) *ir.Column { return &ir.Column{Name: n, Type: ir.Integer{Width: 32}} }
+	recordedKeyless := func(name string, cols ...string) *ir.Table {
+		t := &ir.Table{Schema: "public", Name: name}
+		for _, c := range cols {
+			t.Columns = append(t.Columns, col(c))
+		}
+		return t
+	}
+	for _, tc := range []struct {
+		name  string
+		table *ir.Table
+		want  string // "" covered, else a substring of the reason
+	}{
+		{"keyless on the target: table-wide marks", recordedKeyless("kl", "v", "note"), ""},
+		{"keyed on an unsupplied surrogate", recordedKeyless("sur", "v"), `"sid"`},
+		{"keyed on a supplied column", recordedKeyless("keyed", "id", "v"), ""},
+		{"absent: judged by its recorded key (none)", recordedKeyless("absent", "v"), ""},
+		{"target level only", nil, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			why, err := prober.MarksCoverReason(ctx, tc.table)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (tc.want == "") != (why == "") || !strings.Contains(why, tc.want) {
+				t.Errorf("MarksCoverReason = %q; want %q", why, tc.want)
+			}
+		})
+	}
+
+	t.Run("mark table unusable", func(t *testing.T) {
+		applyPGApplier(t, dsn, `DROP TABLE public.sluice_cdc_apply_marks;`)
+		why, err := prober.MarksCoverReason(ctx, recordedKeyless("kl", "v", "note"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(why, applymarks.UnavailableMarker) {
+			t.Errorf("MarksCoverReason with no mark table = %q; want %s", why, applymarks.UnavailableMarker)
+		}
+	})
+}

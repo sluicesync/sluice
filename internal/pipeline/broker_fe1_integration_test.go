@@ -10,8 +10,10 @@
 // 2026-10-04 ported into pins against the interim door:
 //
 //   - the {error, ctx cancel} × {serial, lanes} matrix on a KEYLESS chain:
-//     the broker now refuses (SLUICE-E-BROKER-KEYLESS-TABLE) before it
-//     applies anything, whatever the interruption and apply mode;
+//     with change identities (ADR-0191) the interrupted run and its re-run
+//     converge to the source; stripped of them, the broker refuses
+//     (SLUICE-E-BROKER-KEYLESS-TABLE) before it applies anything, whatever
+//     the interruption and apply mode;
 //   - the same matrix on a KEYED chain: the interrupted run is re-applied and
 //     converges, a mid-incremental cancel returns BROKER-INCREMENTAL-PARTIAL
 //     (non-zero), and a cancel while idle is still a clean exit;
@@ -181,11 +183,37 @@ var fe1Modes = []struct {
 	conc int
 }{{"serial", 1}, {"lanes", 0}}
 
-// TestFE1_Broker_KeylessChain_RefusedBeforeAnything is the keyless half of
+// failMiddleChunk arms the broker's replay failpoint to kill a run just
+// before the data incremental's middle chunk is read (the crash suite's kill,
+// §13 R12), and returns the disarm. A store-side corruption cannot interrupt
+// a keyless chain's replay any more: the keyless door reads every chunk of an
+// incremental that touches a keyless table before anything is applied.
+func (c *fe1Chain) failMiddleChunk(t *testing.T) (disarm func()) {
+	t.Helper()
+	id := lineage.ManifestBackupID(c.incr.Manifest)
+	mid := len(c.incr.Manifest.ChangeChunks) / 2
+	brokerReplayChunkFailpoint = func(backupID string, chunkIdx int) error {
+		if backupID == id && chunkIdx == mid {
+			return errBrokerCrashKill
+		}
+		return nil
+	}
+	return func() { brokerReplayChunkFailpoint = nil }
+}
+
+// TestFE1_Broker_KeylessChain_ExactlyOnceOrRefused is the keyless half of
 // the matrix, plus the restore re-run door on the same chain. Before the
 // door, every broker cell ended with the keyless table at ~2001 rows (error)
 // or ~1006 (cancel, exit 0) for 1001 on the source.
-func TestFE1_Broker_KeylessChain_RefusedBeforeAnything(t *testing.T) {
+//
+// Since ADR-0191 the door is per incremental: an incremental that records
+// change identities into a target whose apply marks cover the keyless table
+// is replayed exactly-once, so the interrupted run and its re-run converge to
+// the SOURCE (the identity arm); the same incremental stripped of its
+// identities — what an older sluice or smart compaction leaves — is refused
+// before anything is applied, exactly as the interim door refused every
+// keyless chain (the no-identity arm).
+func TestFE1_Broker_KeylessChain_ExactlyOnceOrRefused(t *testing.T) {
 	c := fe1Setup(t, `
 		CREATE TABLE kl (v INT NOT NULL, note TEXT);
 		ALTER TABLE kl REPLICA IDENTITY FULL;
@@ -204,11 +232,60 @@ func TestFE1_Broker_KeylessChain_RefusedBeforeAnything(t *testing.T) {
 			}
 		})
 
+	if !c.incr.Manifest.ApplyIdentity {
+		t.Fatal("the captured incremental records no change identities; the identity arm would be vacuous")
+	}
+	reseed := func(t *testing.T) {
+		applyDDL(t, c.dst, `TRUNCATE kl, k; INSERT INTO kl VALUES (-1, 'seed'); INSERT INTO k VALUES (-1, 'seed');`)
+	}
+	// The multiset of the keyless table, as a row count and a value sum, and
+	// the keyed table's row and distinct-key counts: the SOURCE's are the
+	// independent expected value.
+	state := func(dsn string) string {
+		return fe1Q(t, dsn, `SELECT (SELECT count(*)::text || '/' || coalesce(sum(v), 0)::text FROM kl) || ' ' ||
+			(SELECT count(*)::text || '/' || count(DISTINCT id)::text FROM k)`)
+	}
+	want := state(c.src)
 	for _, interrupt := range []string{"error", "cancel"} {
 		for _, mode := range fe1Modes {
-			t.Run(interrupt+"/"+mode.name, func(t *testing.T) {
+			t.Run("identities/"+interrupt+"/"+mode.name, func(t *testing.T) {
+				reseed(t)
+				streamID := "fe1-kli-" + interrupt + "-" + mode.name
+				var err1 error
 				if interrupt == "error" {
-					defer c.corruptMiddleChunk(t)()
+					disarm := c.failMiddleChunk(t)
+					err1 = c.broker(streamID, mode.conc, c.fullID).Run(context.Background())
+					disarm()
+					if !errors.Is(err1, errBrokerCrashKill) {
+						t.Fatalf("run 1 did not die at the kill: %v", err1)
+					}
+				} else {
+					err1 = fe1CancelMidIncremental(t, c, c.broker(streamID, mode.conc, c.fullID))
+					if err1 == nil || !strings.Contains(err1.Error(), BrokerIncrementalPartialMarker) {
+						t.Fatalf("a cancel mid-incremental returned %v; want %s", err1, BrokerIncrementalPartialMarker)
+					}
+				}
+				if kl := fe1Count(t, c.dst, "kl"); kl == "1" {
+					t.Fatalf("run 1 committed no keyless row (err %v); the re-run cell would be vacuous", err1)
+				}
+				t.Logf("run 1: kl=%s k=%s, err=%v", fe1Count(t, c.dst, "kl"), fe1Count(t, c.dst, "k"), err1)
+				if err := fe1RunToTailThenCancel(t, c, c.broker(streamID, mode.conc, "")); err != nil {
+					t.Errorf("run 2: a cancel while idle returned %v; want nil (exit 0)", err)
+				}
+				if got := state(c.dst); got != want {
+					t.Errorf("the re-run did not converge to the source: target kl rows/sum k rows/distinct %s, source %s", got, want)
+				}
+			})
+		}
+	}
+
+	stripChainIdentities(t, c)
+	for _, interrupt := range []string{"error", "cancel"} {
+		for _, mode := range fe1Modes {
+			t.Run("no identities/"+interrupt+"/"+mode.name, func(t *testing.T) {
+				reseed(t)
+				if interrupt == "error" {
+					defer c.failMiddleChunk(t)()
 				}
 				streamID := "fe1-kl-" + interrupt + "-" + mode.name
 				ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -220,6 +297,9 @@ func TestFE1_Broker_KeylessChain_RefusedBeforeAnything(t *testing.T) {
 				}
 				err := c.broker(streamID, mode.conc, c.fullID).Run(ctx)
 				assertFE1Refusal(t, err, sluicecode.CodeBrokerKeylessTable, []string{"kl"}, []string{"k"})
+				if !strings.Contains(err.Error(), "records no change identities") {
+					t.Errorf("the refusal must say the incremental records no identities: %v", err)
+				}
 				if kl, k := fe1Count(t, c.dst, "kl"), fe1Count(t, c.dst, "k"); kl != "1" || k != "1" {
 					t.Errorf("target holds kl=%s k=%s after the refusal; want 1/1 — something was applied", kl, k)
 				}
@@ -403,7 +483,9 @@ func assertFE1Refusal(t *testing.T, err error, code sluicecode.Code, named, unna
 // KEY UPDATE, which does not collide on a NULL). Four shapes, one run: a
 // source-keyless table and a nullable-UNIQUE-only table are refused on the
 // recorded schema; a PK table whose TARGET copy lost its key is refused on
-// the target; a NOT NULL UNIQUE table is accepted.
+// the target; a NOT NULL UNIQUE table is accepted. That is the no-identity
+// arm; with identities (ADR-0191) the MySQL target's apply marks cover all
+// but the surrogate-keyed table, the only one refused.
 func TestFE1_Broker_MySQLTarget_KeylessDoor(t *testing.T) {
 	src, dst, cleanup := startMySQLBinlog(t)
 	defer cleanup()
@@ -485,13 +567,68 @@ func TestFE1_Broker_MySQLTarget_KeylessDoor(t *testing.T) {
 		}
 	})
 
-	b := &SyncFromBackup{
-		Target: mysqlEng, TargetDSN: dst, Store: store, ChainURL: "test://fe1-mysql",
-		StreamID: "fe1-mysql", PollInterval: 2 * time.Second, AtChainID: full.BackupID, SluiceVersion: "test",
+	// The broker's door is per incremental (ADR-0191 §3.5), so it needs an
+	// incremental that touches every table.
+	applyDDLMySQL(t, src, `
+		INSERT INTO kl VALUES (2, 'b'); INSERT INTO nu VALUES (2, 'b'); INSERT INTO nnu VALUES (2, 'b');
+		INSERT INTO pkd VALUES (2, 'b'); INSERT INTO sur VALUES (2, 'b'); INSERT INTO two VALUES (2, 'b');
+	`)
+	// The window, not a change count, closes the incremental: the target is a
+	// database on the same server, so the binlog also carries this test's
+	// writes to it, as empty transactions in the source's filter.
+	incrCtx, incrCancel := context.WithTimeout(ctx, 90*time.Second)
+	defer incrCancel()
+	if err := (&IncrementalBackup{
+		Source: mysqlEng, SourceDSN: src, Store: store, ParentRef: full.BackupID,
+		Window: 10 * time.Second, MaxChanges: 1 << 20, ChunkChanges: 50, SluiceVersion: "test",
+	}).Run(incrCtx); err != nil {
+		t.Fatalf("IncrementalBackup.Run: %v", err)
 	}
-	runCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-	defer cancel()
-	err = b.Run(runCtx)
+	chain, err := (&SyncFromBackup{Store: store, ChainURL: "x", StreamID: "x"}).brokerChain(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	incr := &chain[len(chain)-1]
+	if lineage.CanonicalKind(incr.Manifest.Kind) != irbackup.BackupKindIncremental || !incr.Manifest.ApplyIdentity {
+		t.Fatalf("the chain's tail is not an identity-bearing incremental: kind %q, apply_identity %v", incr.Manifest.Kind, incr.Manifest.ApplyIdentity)
+	}
+	touched := map[string]bool{}
+	for _, ev := range decodeIncrementalEvents(t, store, incr) {
+		if name, ok := rowChangeTable(ev); ok {
+			touched[name] = true
+		}
+	}
+	for _, name := range []string{"kl", "nu", "nnu", "pkd", "sur", "two"} {
+		if !touched[name] {
+			t.Fatalf("the incremental does not touch %s (touched %v); the per-incremental door would not judge it", name, touched)
+		}
+	}
+	runBroker := func(streamID string) error {
+		runCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+		defer cancel()
+		return (&SyncFromBackup{
+			Target: mysqlEng, TargetDSN: dst, Store: store, ChainURL: "test://" + streamID,
+			StreamID: streamID, PollInterval: 2 * time.Second, AtChainID: full.BackupID, SluiceVersion: "test",
+			brokerStatePath: "manifests/broker_state_" + streamID + ".json",
+		}).Run(runCtx)
+	}
+
+	// With identities, every table the target's apply marks cover is lifted —
+	// kl, nu and pkd are keyless on the target, so their marks are table-wide —
+	// and only sur, keyed on a surrogate no replayed row carries, has no mark
+	// key and is refused.
+	t.Run("identities", func(t *testing.T) {
+		err := runBroker("fe1-mysql-ids")
+		assertFE1Refusal(t, err, sluicecode.CodeBrokerKeylessTable, []string{"sur"}, []string{"kl", "nu", "pkd", "nnu", "two"})
+		if !strings.Contains(err.Error(), `apply marks cannot make its replay exactly-once`) || !strings.Contains(err.Error(), `"sid"`) {
+			t.Errorf("sur's refusal must say the marks cannot key it on the unsupplied sid: %v", err)
+		}
+	})
+
+	// Without them, the four tables are refused on the judgments the interim
+	// door made.
+	stripChainIdentities(t, &fe1Chain{store: store, incr: incr})
+	err = runBroker("fe1-mysql")
 	assertFE1Refusal(t, err, sluicecode.CodeBrokerKeylessTable, []string{"kl", "nu", "pkd", "sur"}, []string{"nnu", "two"})
 	msg := err.Error()
 	if i := strings.Index(msg, `"sur"`); i < 0 || !strings.HasPrefix(msg[i+len(`"sur" (`):], string(migcore.ReplayKeylessTarget)) {

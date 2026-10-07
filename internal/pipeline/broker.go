@@ -269,16 +269,25 @@ type SyncFromBackup struct {
 	// Run's goroutine, like chainCEK.
 	chainCache brokerChainCache
 
-	// keylessCleared records, per table name, the [migcore.ReplayKeyFingerprint]
-	// of the recorded definition the F-E1 keyless door last cleared against
-	// BOTH the recorded schema and the target catalog this run. A tick
-	// re-judges a table the chain newly carries AND a table whose newest
-	// recorded definition changed since it was cleared (an AlterTable delta
-	// that dropped or replaced its key) — an earlier cut cached by name
-	// alone and never re-judged the second kind. Confined to Run's
-	// goroutine, like chainCEK. The zero value (nil) means "nothing cleared
-	// yet", so every table is judged — the safe default.
-	keylessCleared map[string]string
+	// replayJudged records, per table name, the F-E1 replay-key judgment
+	// made against BOTH the recorded schema and the target catalog this run,
+	// keyed by the [migcore.ReplayKeyFingerprint] of the recorded definition
+	// it judged: a table the chain newly carries, or whose newest recorded
+	// definition changed since (an AlterTable delta that dropped or replaced
+	// its key), is judged again. Confined to Run's goroutine, like chainCEK.
+	// The zero value (nil) means "nothing judged yet" — the safe default.
+	replayJudged map[string]replayJudgement
+
+	// touched caches, per incremental, the tables its changes touch and
+	// those touched by a change without an identity — the keyless door's
+	// per-incremental scan (ADR-0191 §3.5). Confined to Run's goroutine.
+	touched map[string]incrementalTouch
+
+	// liftedKeyless is the set of tables the keyless door lifted for the
+	// incremental being applied — the per-change backstop's input. Written
+	// by Run's goroutine before the producer goroutine for that incremental
+	// starts, and only read by it.
+	liftedKeyless map[string]bool
 
 	// severedDoor is the F-E1-SEVERED-TAIL-REPLAY door ([backup.SeveredTransactionDoor]),
 	// built on first use and kept for the run so each link's decoded edges
@@ -491,11 +500,12 @@ func (b *SyncFromBackup) Run(ctx context.Context) error {
 				b.StreamID, dErr)
 		}
 		lastAppliedID = tok.LastAppliedBackupID
-		// Audit F-E1: refuse at start rather than at the first tick with
-		// work, so an operator restarting an interrupted broker learns it
-		// before anything is re-applied. The tick-time door covers tables a
-		// later incremental adds.
-		if err := b.refuseKeylessTables(ctx, true); err != nil {
+		// Audit F-E1, per incremental since ADR-0191 §3.5: the door runs at
+		// start for the incremental this broker is inside or about to start,
+		// so an operator restarting an interrupted broker learns of a refusal
+		// before anything is re-applied. Each later incremental is judged by
+		// the tick, before it is applied.
+		if err := b.refuseKeylessAtStart(ctx, applier, lastAppliedID); err != nil {
 			return err
 		}
 		slog.InfoContext(
@@ -510,13 +520,7 @@ func (b *SyncFromBackup) Run(ctx context.Context) error {
 			b.StreamID, persisted.Engine,
 		)
 	default:
-		// Audit F-E1: the keyless door runs BEFORE any cold-start leg —
-		// before --reset-target-data drops and restores, before
-		// --at-chain-id records a position. On --reset-target-data the
-		// current target tables are about to be dropped and recreated from
-		// the recorded schema, so only the recorded schema is judged; the
-		// first tick that has work re-judges against the recreated target.
-		if err := b.refuseKeylessTables(ctx, !b.ResetTargetData); err != nil {
+		if err := b.refuseKeylessAtColdStart(ctx, applier); err != nil {
 			return err
 		}
 		// Cold-start branch.
@@ -1078,14 +1082,6 @@ func (b *SyncFromBackup) replayNewIncrementals(
 		return "", 0, 0, 0, err
 	}
 
-	// Audit F-E1: the keyless door, before this tick applies anything. Only
-	// tables not already cleared this run are probed, so a steady-state tick
-	// costs nothing; a table a new incremental's AddTable delta brings in is
-	// judged here, before the incremental that creates it is applied.
-	if err := b.refuseKeylessTables(ctx, true); err != nil {
-		return "", 0, 0, 0, err
-	}
-
 	batchSize := b.ApplyBatchSize
 	if batchSize <= 0 {
 		batchSize = backup.DefaultChainRestoreBatchSize
@@ -1130,6 +1126,17 @@ func (b *SyncFromBackup) replayNewIncrementals(
 		// but is harmless to guard.
 		if link.Manifest.Kind == irbackup.BackupKindFull || link.Manifest.Kind == "" {
 			continue
+		}
+		// Audit F-E1, per incremental (ADR-0191 §3.5): the keyless door,
+		// before anything of THIS incremental is applied. A table only judged
+		// keyless needs the incremental's own evidence — identities, and
+		// target marks that cover it — so the judgment is per incremental; a
+		// table a new incremental's AddTable delta brings in is judged here,
+		// before the incremental that creates it. A chain whose every table
+		// collides on a key pays nothing (no table is a candidate, nothing is
+		// decoded).
+		if err := b.refuseKeylessIncremental(ctx, applier, link); err != nil {
+			return newApplied, totalBytes, incrCount, chunkCount, err
 		}
 		bytesApplied, applyErr := b.applyIncremental(ctx, applier, link, batchSize, resumeFromID)
 		if applyErr != nil {
@@ -1512,6 +1519,11 @@ func (b *SyncFromBackup) streamIncrementalWithPosition(
 	// goroutine.
 	var lastApplied ir.Position
 	for chunkIdx, chunk := range link.Manifest.ChangeChunks {
+		if brokerReplayChunkFailpoint != nil {
+			if err := brokerReplayChunkFailpoint(lineage.ManifestBackupID(link.Manifest), chunkIdx); err != nil {
+				return fmt.Errorf("chunk %d (%s): %w", chunkIdx, chunk.File, err)
+			}
+		}
 		if err := b.streamOneChunkWithPosition(ctx, segStore, codec, link.Manifest, chunkIdx, chunk, frontier, out, &lastApplied); err != nil {
 			return fmt.Errorf("chunk %d (%s): %w", chunkIdx, chunk.File, err)
 		}
@@ -1547,6 +1559,17 @@ func (b *SyncFromBackup) streamIncrementalWithPosition(
 	}
 	return nil
 }
+
+// brokerReplayChunkFailpoint is a test-only failpoint (the
+// [rotationCrashPoint] pattern): the ADR-0191 crash suite sets it to fail the
+// replay just before chunk chunkIdx of incremental backupID is read, which —
+// with one change per chunk and --apply-batch-size 1 — leaves exactly the
+// committed prefix a SIGKILL after the previous statement leaves. It sits on
+// the replay path only: the keyless door reads every chunk of an incremental
+// before anything is applied, so a store-side chunk fault refuses there and
+// can never kill a replay mid-incremental (§13 R12). Production never sets it
+// (nil = no-op).
+var brokerReplayChunkFailpoint func(backupID string, chunkIdx int) error
 
 // streamOneChunkWithPosition reads one chunk's events and pushes them
 // onto out with each change's Position field rewritten to its frontier token.
@@ -1609,6 +1632,12 @@ func (b *SyncFromBackup) streamOneChunkWithPosition(
 		pos, emit := frontier.stamp(change)
 		if !emit {
 			continue
+		}
+		// ADR-0191 §3.5: a change to a table the keyless door lifted must
+		// carry an identity, refused before it is emitted.
+		if err := b.refuseUnidentifiedLiftedChange(frontier.backupID, change); err != nil {
+			_ = cr.Close()
+			return err
 		}
 		rewritten, rwErr := rewritePosition(change, pos)
 		if rwErr != nil {

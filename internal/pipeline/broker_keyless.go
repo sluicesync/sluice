@@ -9,31 +9,33 @@ import (
 	"fmt"
 	"log/slog"
 
-	"sluicesync.dev/sluice/internal/ir"
-	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
-	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
-// The broker's interim answer to audit F-E1.
+// The broker's answer to audit F-E1, as ADR-0191 narrows it.
 //
-// The broker stamps every change of an incremental with the PARENT position
-// (BRK-1) and gives those changes no apply identity, so ADR-0190's apply marks
-// cannot skip them. A run interrupted partway through an incremental therefore
-// re-applies the WHOLE incremental on the next run. On a table the applier
-// upserts into, that converges for inserts and same-key updates/deletes; it
-// silently duplicates on a table it plain-INSERTs into. A key-CHANGING
-// incremental does not converge even on an upserted table — its re-run fails
-// on the key every time, or, when a key value moved onto another row, applies
-// a change to the wrong row silently (audit backlog F-E1-KEY-REUSE-REPLAY;
-// [brokerIncrementalPartialError] says so). Until broker changes carry an
-// apply identity (the exactly-once
-// follow-up, which lifts the refusal), the broker:
+// A run interrupted partway through an incremental re-applies, on the next
+// run, the one source transaction that was in flight (ADR-0191 §3.2 — the
+// position stands inside the incremental). On a table the applier upserts
+// into, re-applying it converges for inserts and same-key updates/deletes; on
+// a table it plain-INSERTs into — keyless, or keyed only on a column the rows
+// do not carry — it would silently duplicate every committed row of that
+// transaction, and a key-CHANGING transaction can misapply (audit backlog
+// F-E1-KEY-REUSE-REPLAY). ADR-0190's apply marks close both, but only where
+// three things hold, which is why the keyless door is judged PER INCREMENTAL
+// ([SyncFromBackup.refuseKeylessIncremental], §3.5):
 //
-//   - refuses keyless tables before it applies anything
-//     ([SyncFromBackup.refuseKeylessTables], SLUICE-E-BROKER-KEYLESS-TABLE);
-//   - exits non-zero, with [BrokerIncrementalPartialMarker], when a cancel
-//     interrupts an incremental, instead of exit 0.
+//   - the incremental records the reader's change identities
+//     ([irbackup.Manifest.ApplyIdentity]), and every change to the table in it
+//     carries one;
+//   - the target's mark table is usable and a mark commits with its rows
+//     ([ir.ApplyMarksCoverageProber]);
+//   - the table's mark key on the target is one the replayed rows supply.
+//
+// A table that fails any of them, and that the incremental touches, is refused
+// (SLUICE-E-BROKER-KEYLESS-TABLE) before anything of the incremental is
+// applied. A cancel that interrupts an incremental exits non-zero with
+// [BrokerIncrementalPartialMarker] instead of exit 0.
 
 // BrokerIncrementalPartialMarker is the grep-stable token on the error a
 // broker run returns when its context is cancelled (SIGINT/SIGTERM, a
@@ -157,95 +159,4 @@ func (b *SyncFromBackup) tickErrorExit(ctx context.Context, applyErr error, last
 		return nil
 	}
 	return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("broker: tick: %w", applyErr))
-}
-
-// brokerKeylessHint is the remedy riding SLUICE-E-BROKER-KEYLESS-TABLE.
-const brokerKeylessHint = "give each named table a PRIMARY KEY or a NOT NULL UNIQUE index on the SOURCE and take a new full " +
-	"backup (or, for a table keyless only on the target, give the target table the source's key — one made of columns " +
-	"the backup carries, not a serial, identity or defaulted surrogate), or replicate the table with `sluice sync start` " +
-	"instead of through a backup chain"
-
-// refuseKeylessTables is the F-E1 door. It judges every table the chain
-// records that this run has not already cleared IN ITS CURRENT RECORDED
-// DEFINITION, and refuses — naming every offender at once — if a re-applied
-// change could duplicate rows in one.
-//
-// probeTarget adds the target-catalog judgment ([ir.ReplayKeyProber]) to the
-// recorded-schema one. Tables are marked cleared only after a judgment that
-// included the target, so a --reset-target-data cold start (recorded schema
-// only, because the target is about to be rebuilt) is re-judged against the
-// rebuilt target on the first tick that has work. A clearance is keyed by
-// [migcore.ReplayKeyFingerprint], so a later incremental whose AlterTable
-// delta drops or replaces a cleared table's key is judged again, BEFORE that
-// incremental is applied, at the top of the tick that brings it.
-//
-// Residual, stated rather than implied: a key removed from the TARGET out of
-// band, by someone else's DDL while the broker runs, is not seen until the
-// next run (whose start door probes every table). The broker's own schema
-// changes reach the target only through recorded deltas, which the
-// fingerprint covers.
-//
-// Scope: every table any link of the chain records, in its Schema or in an
-// AddTable/AlterTable delta. The broker has no table filter (`sync
-// from-backup run` takes no --include-table / --exclude-table), so there is
-// nothing narrower to honour; the backup's own table selection already shaped
-// what the chain records.
-//
-// Residual, stated rather than implied: the door judges the tables the chain
-// RECORDS. A change chunk carrying rows for a table no link records (a table
-// created mid-chain that a scoped window-end schema read did not pick up) is
-// not judged here. The applier skips a table the target lacks, so those rows
-// can only land — and duplicate — if someone created that table on the target
-// by hand. The exactly-once follow-up closes it with the rest of the class.
-func (b *SyncFromBackup) refuseKeylessTables(ctx context.Context, probeTarget bool) error {
-	chain, err := b.brokerChain(ctx)
-	if err != nil {
-		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("broker: build chain: %w", err))
-	}
-	var pending []*ir.Table
-	for _, t := range backup.ChainRecordedTables(chain, migcore.TableFilter{}) {
-		if fp, ok := b.keylessCleared[t.Name]; !ok || fp != migcore.ReplayKeyFingerprint(t) {
-			pending = append(pending, t)
-		}
-	}
-	if len(pending) == 0 {
-		return nil
-	}
-	var rw ir.RowWriter
-	if probeTarget {
-		rw, err = b.Target.OpenRowWriter(ctx, b.TargetDSN)
-		if err != nil {
-			return migcore.WrapWithHint(migcore.PhaseConnect,
-				fmt.Errorf("broker: keyless-table check: open target row writer: %w", err))
-		}
-		defer migcore.CloseIf(rw)
-	}
-	keyless, err := migcore.FindReplayKeylessTables(ctx, rw, pending, migcore.ReplayJudgeOptions{ProbeTarget: probeTarget})
-	if err != nil {
-		return fmt.Errorf("broker: keyless-table check: %w", err)
-	}
-	if len(keyless) > 0 {
-		return errBrokerKeylessTables(keyless)
-	}
-	if probeTarget {
-		if b.keylessCleared == nil {
-			b.keylessCleared = make(map[string]string, len(pending))
-		}
-		for _, t := range pending {
-			b.keylessCleared[t.Name] = migcore.ReplayKeyFingerprint(t)
-		}
-	}
-	return nil
-}
-
-// errBrokerKeylessTables renders the coded refusal.
-func errBrokerKeylessTables(tables []migcore.ReplayKeylessTable) error {
-	return sluicecode.Wrap(sluicecode.CodeBrokerKeylessTable, brokerKeylessHint, fmt.Errorf(
-		"broker: refusing to replay this chain: %d table(s) have no key a re-applied change can collide on: %s. "+
-			"The broker re-applies a WHOLE incremental after any interruption (an error, a crash, SIGINT/SIGTERM), "+
-			"because its changes carry no apply identity; a keyed table converges, but a keyless one falls back to a "+
-			"plain INSERT and silently gains a duplicate of every row the interrupted run had committed (audit F-E1). "+
-			"Nothing has been applied",
-		len(tables), migcore.RenderReplayKeylessTables(tables),
-	))
 }
