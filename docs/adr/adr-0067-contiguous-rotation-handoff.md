@@ -162,9 +162,14 @@ Concretely:
    rows do not carry duplicated silently on MySQL (measured: 355 rows for
    32). Both are now refused before anything is written
    (`SLUICE-E-BACKUP-ROTATED-KEYLESS-TABLE`), and `backup stream` refuses
-   to build such a chain (at start, and per rotation). Restoring such a
-   table from a rotated chain is the open item BUG297-REAL-FIX in
-   `docs/dev/audit-backlog.md`.
+   to build such a chain (at the start of a new chain, and per rotation).
+   The key judged is the one the TARGET'S table holds — a later full is
+   never created or re-keyed on the target; it lands in the table segment
+   0 or an AddTable delta created, as altered by the recorded deltas — so
+   a later full recording a key the chain never replayed is refused too
+   (the review of the first cut measured 170 rows for 10 there).
+   Restoring such a table from a rotated chain is the open item
+   BUG297-REAL-FIX in `docs/dev/audit-backlog.md`.
 
 4. **Compaction is unchanged.** A born-contiguous chain merges by pure
    concat exactly as today; discarding the later full is now safe because
