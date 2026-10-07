@@ -68,6 +68,11 @@ var codecReaderRoster = map[string]codecCallSite{
 		threadedFromTheRecord,
 		"the broker resolves the owning manifest's segment codec before replaying its change chunks.",
 	},
+	"pipeline/broker_keyless_door.go:link.Segment.CodecOrDefault()": {
+		threadedFromTheRecord,
+		"the ADR-0191 keyless door decodes an incremental's change chunks with that link's segment record's " +
+			"codec, exactly as the broker replay that follows will.",
+	},
 }
 
 // TestChunkReaderCodecsAreThreadedFromTheRecord is the caller roster the

@@ -183,22 +183,21 @@ var fe1Modes = []struct {
 	conc int
 }{{"serial", 1}, {"lanes", 0}}
 
-// failMiddleChunk arms the broker's replay failpoint to kill a run just
-// before the data incremental's middle chunk is read (the crash suite's kill,
-// §13 R12), and returns the disarm. A store-side corruption cannot interrupt
-// a keyless chain's replay any more: the keyless door reads every chunk of an
+// failMiddleChunk arms b's replay failpoint to kill the run just before the
+// data incremental's middle chunk is read (the crash suite's kill, ADR-0191
+// §14), and returns b. A store-side corruption cannot interrupt a keyless
+// chain's replay any more: the keyless door reads every chunk of an
 // incremental that touches a keyless table before anything is applied.
-func (c *fe1Chain) failMiddleChunk(t *testing.T) (disarm func()) {
-	t.Helper()
+func (c *fe1Chain) failMiddleChunk(b *SyncFromBackup) *SyncFromBackup {
 	id := lineage.ManifestBackupID(c.incr.Manifest)
 	mid := len(c.incr.Manifest.ChangeChunks) / 2
-	brokerReplayChunkFailpoint = func(backupID string, chunkIdx int) error {
+	b.replayChunkFailpoint = func(backupID string, chunkIdx int) error {
 		if backupID == id && chunkIdx == mid {
 			return errBrokerCrashKill
 		}
 		return nil
 	}
-	return func() { brokerReplayChunkFailpoint = nil }
+	return b
 }
 
 // TestFE1_Broker_KeylessChain_ExactlyOnceOrRefused is the keyless half of
@@ -253,9 +252,7 @@ func TestFE1_Broker_KeylessChain_ExactlyOnceOrRefused(t *testing.T) {
 				streamID := "fe1-kli-" + interrupt + "-" + mode.name
 				var err1 error
 				if interrupt == "error" {
-					disarm := c.failMiddleChunk(t)
-					err1 = c.broker(streamID, mode.conc, c.fullID).Run(context.Background())
-					disarm()
+					err1 = c.failMiddleChunk(c.broker(streamID, mode.conc, c.fullID)).Run(context.Background())
 					if !errors.Is(err1, errBrokerCrashKill) {
 						t.Fatalf("run 1 did not die at the kill: %v", err1)
 					}
@@ -284,9 +281,6 @@ func TestFE1_Broker_KeylessChain_ExactlyOnceOrRefused(t *testing.T) {
 		for _, mode := range fe1Modes {
 			t.Run("no identities/"+interrupt+"/"+mode.name, func(t *testing.T) {
 				reseed(t)
-				if interrupt == "error" {
-					defer c.failMiddleChunk(t)()
-				}
 				streamID := "fe1-kl-" + interrupt + "-" + mode.name
 				ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 				defer cancel()
@@ -295,7 +289,11 @@ func TestFE1_Broker_KeylessChain_ExactlyOnceOrRefused(t *testing.T) {
 					// and exited 0. The refusal must come first.
 					time.AfterFunc(3*time.Second, cancel)
 				}
-				err := c.broker(streamID, mode.conc, c.fullID).Run(ctx)
+				b := c.broker(streamID, mode.conc, c.fullID)
+				if interrupt == "error" {
+					c.failMiddleChunk(b)
+				}
+				err := b.Run(ctx)
 				assertFE1Refusal(t, err, sluicecode.CodeBrokerKeylessTable, []string{"kl"}, []string{"k"})
 				if !strings.Contains(err.Error(), "records no change identities") {
 					t.Errorf("the refusal must say the incremental records no identities: %v", err)

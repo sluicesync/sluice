@@ -13,7 +13,7 @@ package pipeline
 // transaction and split into one transaction per statement.
 //
 // THE KILL (§13 R12). The incremental is captured one change per chunk, and a
-// cell arms brokerReplayChunkFailpoint at chunk j: the broker streams events
+// cell arms its broker's replayChunkFailpoint at chunk j: the broker streams events
 // 0..j-1, the applier commits what it received when its channel closes —
 // mid-transaction, without a position, exactly as a crash leaves a run that
 // committed each row on its own (--apply-batch-size 1) — and the run dies
@@ -35,6 +35,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -277,7 +278,19 @@ func (bc *brokerCrashChain) tableState(t *testing.T, dsn, table string) string {
 // target creates an empty database and restores the full into it.
 func (bc *brokerCrashChain) target(t *testing.T, name string) string {
 	t.Helper()
-	dsn := bc.e.database(name)
+	// e.database, with the CELL's t (cells run in parallel).
+	var dsn string
+	var err error
+	if bc.e.driver == "pgx" {
+		applyDDL(t, bc.e.dst, "CREATE DATABASE "+name)
+		dsn, err = buildPGDSN(bc.e.dst, name)
+	} else {
+		applyDDLMySQL(t, bc.e.src, "CREATE DATABASE "+name)
+		dsn, err = buildMySQLDSN(bc.e.src, name)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
 	eng, _ := engines.Get(bc.e.engine)
 	if err := (&backup.Restore{Target: eng, TargetDSN: dsn, Store: bc.store, SkipChainDispatch: true}).Run(context.Background()); err != nil {
 		t.Fatalf("restore the full into %s: %v", name, err)
@@ -298,18 +311,17 @@ func (bc *brokerCrashChain) broker(dsn, streamID string, conc int, atChain strin
 // errBrokerCrashKill is the simulated kill.
 var errBrokerCrashKill = errors.New("simulated kill")
 
-// killBefore arms the replay failpoint to kill the broker just before chunk
-// j of the suite's incremental is read (§13 R12), and returns the disarm.
-func (bc *brokerCrashChain) killBefore(t *testing.T, j int) func() {
-	t.Helper()
+// killBefore arms b's replay failpoint to kill it just before chunk j of the
+// suite's incremental is read (ADR-0191 §14), and returns b.
+func (bc *brokerCrashChain) killBefore(b *SyncFromBackup, j int) *SyncFromBackup {
 	id := lineage.ManifestBackupID(bc.incr.Manifest)
-	brokerReplayChunkFailpoint = func(backupID string, chunkIdx int) error {
+	b.replayChunkFailpoint = func(backupID string, chunkIdx int) error {
 		if backupID == id && chunkIdx == j {
 			return errBrokerCrashKill
 		}
 		return nil
 	}
-	return func() { brokerReplayChunkFailpoint = nil }
+	return b
 }
 
 // positionQ and marksQ read the broker's control rows.
@@ -367,71 +379,80 @@ func runBrokerCrashSuite(t *testing.T, e *sevEnv) {
 		want[tbl] = bc.tableState(t, e.src, tbl)
 	}
 	n := len(bc.events)
-	keylessCommitted := 0
-	for _, mode := range []struct {
-		name string
-		conc int
-	}{{"serial", 1}, {"lanes", 0}} {
-		for j := 2; j <= n-4; j++ {
-			// Only kills that land after a statement: the event before j is a row change.
-			if _, isRow := rowChangeTable(bc.events[j-1]); !isRow {
-				continue
+	var keylessCommitted atomic.Int64
+	// The cells are independent (a database and a stream id each, the kill
+	// armed on their own broker), so they run in parallel; the group returns
+	// once every cell has, before the anti-vacuity floor reads the count.
+	t.Run("cells", func(t *testing.T) {
+		for _, mode := range []struct {
+			name string
+			conc int
+		}{{"serial", 1}, {"lanes", 0}} {
+			for j := 2; j <= n-4; j++ {
+				// Only kills that land after a statement: the event before j is a row change.
+				if _, isRow := rowChangeTable(bc.events[j-1]); !isRow {
+					continue
+				}
+				t.Run(fmt.Sprintf("%s/kill_after_event_%d", mode.name, j-1), func(t *testing.T) {
+					t.Parallel()
+					bc.crashCell(t, mode.name, mode.conc, j, want, &keylessCommitted)
+				})
 			}
-			t.Run(fmt.Sprintf("%s/kill_after_event_%d", mode.name, j-1), func(t *testing.T) {
-				name := fmt.Sprintf("bk_%s_%d", mode.name, j)
-				dsn := bc.target(t, name)
-				stream := "bk-" + mode.name + fmt.Sprint(j)
-				disarm := bc.killBefore(t, j)
-				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-				err := bc.broker(dsn, stream, mode.conc, bc.fullID).Run(ctx)
-				cancel()
-				disarm()
-				if !errors.Is(err, errBrokerCrashKill) {
-					t.Fatalf("the broker did not die at the kill before chunk %d: %v", j, err)
-				}
+		}
+	})
+	// Anti-vacuity (§9 P6): kills landed after keyless rows had committed.
+	if keylessCommitted.Load() == 0 {
+		t.Fatal("no kill landed with a keyless row committed: the keyless half of the suite graded nothing")
+	}
+}
 
-				// At the kill.
-				pos, marks := bc.persisted(t, dsn, stream)
-				tok, derr := decodeBrokerPosition(ir.Position{Token: pos})
-				if derr != nil || tok.LastAppliedBackupID != bc.fullID {
-					t.Fatalf("at the kill the position is %q (%v); want the full %s as last applied", pos, derr, bc.fullID)
-				}
-				wantThrough := lastBoundaryBelow(bc.events, j)
-				got := int64(-1)
-				if tok.InProgress != nil {
-					got = tok.InProgress.Through
-				}
-				if (mode.conc == 1 && got != wantThrough) || got > wantThrough {
-					t.Errorf("at the kill the frontier is %d; want %d (the last source-transaction boundary below the kill)", got, wantThrough)
-				}
-				if got >= 0 {
-					if _, isCommit := bc.events[got].(ir.TxCommit); !isCommit && txOfOrdinal(bc.events, int(got)) != "" {
-						t.Errorf("the persisted frontier names event %d, inside a transaction", got)
-					}
-				}
-				inFlight := txOfOrdinal(bc.events, j-1)
-				for _, m := range marks {
-					if m != inFlight {
-						t.Errorf("at the kill an apply mark names %s; marks may name only the in-flight transaction %q", m, inFlight)
-					}
-				}
-				if kl := sevQuery(t, e.driver, dsn, "SELECT COUNT(*) FROM kl"); kl != "0" && kl != "1" {
-					keylessCommitted++
-				}
+// crashCell is one kill point: kill before chunk j, grade the persisted state,
+// re-run to the tail, compare every table with the source.
+func (bc *brokerCrashChain) crashCell(t *testing.T, modeName string, conc, j int, want map[string]string, keylessCommitted *atomic.Int64) {
+	dsn := bc.target(t, fmt.Sprintf("bk_%s_%d", modeName, j))
+	stream := "bk-" + modeName + fmt.Sprint(j)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	err := bc.killBefore(bc.broker(dsn, stream, conc, bc.fullID), j).Run(ctx)
+	cancel()
+	if !errors.Is(err, errBrokerCrashKill) {
+		t.Fatalf("the broker did not die at the kill before chunk %d: %v", j, err)
+	}
 
-				// The re-run.
-				bc.runToTail(t, dsn, stream, mode.conc)
-				for _, tbl := range brokerCrashTables {
-					if got := bc.tableState(t, dsn, tbl); got != want[tbl] {
-						t.Errorf("after the re-run %s DIVERGES from the source: target {%s}, source {%s}", tbl, got, want[tbl])
-					}
-				}
-			})
+	// At the kill.
+	pos, marks := bc.persisted(t, dsn, stream)
+	tok, derr := decodeBrokerPosition(ir.Position{Token: pos})
+	if derr != nil || tok.LastAppliedBackupID != bc.fullID {
+		t.Fatalf("at the kill the position is %q (%v); want the full %s as last applied", pos, derr, bc.fullID)
+	}
+	wantThrough := lastBoundaryBelow(bc.events, j)
+	got := int64(-1)
+	if tok.InProgress != nil {
+		got = tok.InProgress.Through
+	}
+	if (conc == 1 && got != wantThrough) || got > wantThrough {
+		t.Errorf("at the kill the frontier is %d; want %d (the last source-transaction boundary below the kill)", got, wantThrough)
+	}
+	if got >= 0 {
+		if _, isCommit := bc.events[got].(ir.TxCommit); !isCommit && txOfOrdinal(bc.events, int(got)) != "" {
+			t.Errorf("the persisted frontier names event %d, inside a transaction", got)
 		}
 	}
-	// Anti-vacuity (§9 P6): kills landed after keyless rows had committed.
-	if keylessCommitted == 0 {
-		t.Fatal("no kill landed with a keyless row committed: the keyless half of the suite graded nothing")
+	inFlight := txOfOrdinal(bc.events, j-1)
+	for _, m := range marks {
+		if m != inFlight {
+			t.Errorf("at the kill an apply mark names %s; marks may name only the in-flight transaction %q", m, inFlight)
+		}
+	}
+	if kl := sevQuery(t, bc.e.driver, dsn, "SELECT COUNT(*) FROM kl"); kl != "0" && kl != "1" {
+		keylessCommitted.Add(1)
+	}
+
+	// The re-run.
+	bc.runToTail(t, dsn, stream, conc)
+	for _, tbl := range brokerCrashTables {
+		if got := bc.tableState(t, dsn, tbl); got != want[tbl] {
+			t.Errorf("after the re-run %s DIVERGES from the source: target {%s}, source {%s}", tbl, got, want[tbl])
+		}
 	}
 }
 

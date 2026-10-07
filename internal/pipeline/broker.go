@@ -305,6 +305,18 @@ type SyncFromBackup struct {
 	// [DefaultBrokerStateFilename].
 	brokerStatePath string
 
+	// replayChunkFailpoint is a test-only failpoint (the [rotationCrashPoint]
+	// pattern, per broker so crash cells can run in parallel): the ADR-0191
+	// crash suite sets it to fail the replay just before chunk chunkIdx of
+	// incremental backupID is read, which — with one change per chunk and
+	// --apply-batch-size 1 — leaves exactly the committed prefix a SIGKILL
+	// after the previous statement leaves. It sits on the replay path only: the
+	// keyless door reads every chunk of an incremental before anything is
+	// applied, so a store-side chunk fault refuses there and can never kill a
+	// replay mid-incremental (ADR-0191 §14, correcting §13 R12). Production
+	// never sets it (nil = no-op).
+	replayChunkFailpoint func(backupID string, chunkIdx int) error
+
 	// pidHostFn returns the (pid, host) pair recorded on the liveness
 	// file. Defaults to (os.Getpid, os.Hostname); tests inject a stub.
 	pidHostFn func() (int, string)
@@ -1519,8 +1531,8 @@ func (b *SyncFromBackup) streamIncrementalWithPosition(
 	// goroutine.
 	var lastApplied ir.Position
 	for chunkIdx, chunk := range link.Manifest.ChangeChunks {
-		if brokerReplayChunkFailpoint != nil {
-			if err := brokerReplayChunkFailpoint(lineage.ManifestBackupID(link.Manifest), chunkIdx); err != nil {
+		if b.replayChunkFailpoint != nil {
+			if err := b.replayChunkFailpoint(lineage.ManifestBackupID(link.Manifest), chunkIdx); err != nil {
 				return fmt.Errorf("chunk %d (%s): %w", chunkIdx, chunk.File, err)
 			}
 		}
@@ -1559,17 +1571,6 @@ func (b *SyncFromBackup) streamIncrementalWithPosition(
 	}
 	return nil
 }
-
-// brokerReplayChunkFailpoint is a test-only failpoint (the
-// [rotationCrashPoint] pattern): the ADR-0191 crash suite sets it to fail the
-// replay just before chunk chunkIdx of incremental backupID is read, which —
-// with one change per chunk and --apply-batch-size 1 — leaves exactly the
-// committed prefix a SIGKILL after the previous statement leaves. It sits on
-// the replay path only: the keyless door reads every chunk of an incremental
-// before anything is applied, so a store-side chunk fault refuses there and
-// can never kill a replay mid-incremental (§13 R12). Production never sets it
-// (nil = no-op).
-var brokerReplayChunkFailpoint func(backupID string, chunkIdx int) error
 
 // streamOneChunkWithPosition reads one chunk's events and pushes them
 // onto out with each change's Position field rewritten to its frontier token.
