@@ -43,7 +43,8 @@ func must(err error) {
 	}
 }
 
-// tables for workload: A=u (unique email), B=p (no unique), C=u+p.
+// tables for workload: A=u (unique email), B=p (no unique), C=u+p, D=k,
+// K=kl (no key at all: the ADR-0191 brokerbench keyless arm).
 func tablesFor(w string) []string {
 	switch w {
 	case "A":
@@ -52,6 +53,8 @@ func tablesFor(w string) []string {
 		return []string{"p"}
 	case "D":
 		return []string{"k"}
+	case "K":
+		return []string{"kl"}
 	default:
 		return []string{"u", "p"}
 	}
@@ -65,9 +68,24 @@ func setup(kind string, db *sql.DB, w string) {
 		if t == "u" {
 			uniq = " UNIQUE"
 		}
-		ddl := fmt.Sprintf("CREATE TABLE %s (id BIGINT PRIMARY KEY, email VARCHAR(100) NOT NULL%s, name VARCHAR(100) NOT NULL, n BIGINT NOT NULL)", t, uniq)
+		pk := " PRIMARY KEY"
+		if t == "kl" {
+			pk = " NOT NULL"
+		}
+		ddl := fmt.Sprintf("CREATE TABLE %s (id BIGINT%s, email VARCHAR(100) NOT NULL%s, name VARCHAR(100) NOT NULL, n BIGINT NOT NULL)", t, pk, uniq)
 		_, err := db.Exec(ddl)
 		must(err)
+		if t == "kl" {
+			// A NON-unique index keeps the table keyless for replay (no key a
+			// re-written row collides on) while sparing InnoDB a full-scan
+			// DELETE whose gap locks deadlock the 8 generator workers.
+			_, err = db.Exec("CREATE INDEX kl_id ON kl (id)")
+			must(err)
+			if kind != "mysql" {
+				_, err = db.Exec("ALTER TABLE kl REPLICA IDENTITY FULL")
+				must(err)
+			}
+		}
 		// seed
 		for base := 1; base <= seedRows; base += 1000 {
 			var sb strings.Builder
@@ -117,12 +135,30 @@ func gen(kind string, db *sql.DB, w string, n, workers int) {
 					}
 				case "D":
 					tbl = "k"
+				case "K":
+					tbl = "kl"
 				}
 				rows := 1 + r.Intn(3)
 				tx, err := db.Begin()
 				must(err)
 				for j := 0; j < rows; j++ {
 					ord := int64(k)*1_000_000_000 + int64(i)*10 + int64(j) + 1
+					if w == "K" {
+						// Keyless: 90% inserts, 10% deletes of a seeded row this
+						// worker owns (each deleted once, so the target's
+						// multiset is exact).
+						if r.Intn(10) == 0 && len(owned) > 0 {
+							id := owned[len(owned)-1]
+							owned = owned[:len(owned)-1]
+							_, err = tx.Exec(fmt.Sprintf("DELETE FROM %s WHERE id=%s", tbl, ph(kind, 1)), id)
+						} else {
+							nextID++
+							_, err = tx.Exec(fmt.Sprintf("INSERT INTO %s (id,email,name,n) VALUES (%s,%s,%s,%s)", tbl, ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4)),
+								nextID, fmt.Sprintf("w%d-%d@x", k, nextID), fmt.Sprintf("ins%d", ord), ord)
+						}
+						must(err)
+						continue
+					}
 					if w == "D" && r.Intn(2) == 1 {
 						// PK-changing update: a lane barrier
 						ix := r.Intn(len(owned))
@@ -169,7 +205,7 @@ func fullHash(db *sql.DB, tables []string, qual string) string {
 	h := sha256.New()
 	rowsN := 0
 	for _, t := range tables {
-		rows, err := db.Query(fmt.Sprintf("SELECT id,email,name,n FROM %s%s ORDER BY id", qual, t))
+		rows, err := db.Query(fmt.Sprintf("SELECT id,email,name,n FROM %s%s ORDER BY id, email, name, n", qual, t))
 		must(err)
 		for rows.Next() {
 			var id, n int64

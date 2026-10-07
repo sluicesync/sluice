@@ -4,6 +4,20 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Fixed
+
+**`sync from-backup` replays a chain this release writes exactly-once, so an interrupted broker run no longer misapplies a source transaction that moved a key value onto another row (HIGH, silent; F-E1-KEY-REUSE-REPLAY; ADR-0191).** An interrupted broker used to re-apply its whole incremental. Re-applying `[UPDATE 1→2, DELETE 2, UPDATE 3→1]` onto the state it had already produced emptied the table at exit 0, and `[INSERT 1, UPDATE 1→2]` failed on a duplicate key on every re-run. The broker's position can now stand inside an incremental: it advances, in the same target transaction as the work, to the last source transaction whose effects are durable, so a re-run re-reads the incremental, skips what landed and re-delivers only the transaction that was in flight. `backup stream` and `backup incremental` now record each change's apply identity (the source's transaction id and the change's ordinal) in the change chunk, and the broker hands it to the apply marks `sync start` already uses (ADR-0190), which skip that transaction's changes that already landed. Pinned on real Postgres, MySQL GTID and MySQL file/pos with a broker killed after every statement of an incremental carrying a keyless table, a secondary-unique table and both key-reuse shapes, serial and lanes: every cell converges to the source (`TestBroker_CrashMidIncremental_Postgres`, `_MySQLGTID`, `_MySQLFilePos`). A chain written by an older sluice, or an incremental `backup compact --smart-compaction` rewrote, records no identities; there the re-run is confined to the one interrupted source transaction, and the advice in `BROKER-INCREMENTAL-PARTIAL` for a source that changes key values stands.
+
+**`SLUICE-E-BROKER-KEYLESS-TABLE` is judged per incremental and lifted where the replay is exactly-once.** v0.156.11 and v0.156.12 refused every keyless table in a chain. The broker now refuses an incremental, before applying anything of it, only when a table it touches has no key the replayed rows carry AND the replay cannot be made exactly-once: the incremental records no identities, a change to the table carries none (`BROKER-KEYLESS-NO-IDENTITY`), or the target's apply marks cannot cover the table (unusable, a `--control-keyspace` sidecar, a PlanetScale Neki target, an engine without apply marks such as SQLite, or a target keyed only on a column the rows do not carry). The message says which. A `--reset-target-data` cold start runs the target half of the check before it drops anything.
+
+**Resuming inside an incremental that was rewritten since refuses (`SLUICE-E-BROKER-INCREMENTAL-REWRITTEN`, exit 3).** The position records a digest of the incremental's chunk list; if smart compaction rewrote it in between, skipping by the recorded ordinal could drop a change, so the broker refuses and the recovery is `--reset-target-data`. Naive compaction moves the same chunk bytes and resumes normally.
+
+**Cold starts and chain restore clear the stream's apply marks before applying anything.** A mark left by an earlier run under the same stream id could otherwise skip a change the fresh target never received.
+
+### Compatibility
+
+The change chunk gains an optional `aid` field and the manifest an optional `apply_identity` flag; `FormatVersion` is unchanged. Change chunks grow by about 12–25% compressed (measured on Postgres and MySQL sources, ADR-0191 §14). v0.156.12 verifies and restores a chain this release writes (measured: `backup verify` OK, restore equal to the source), and this release reads older chains unchanged. The flag is not covered by a manifest signature (ADR-0191 §13 R3); a forged flag is caught change by change in either direction. The broker's position token is now `backup-broker-v2`: this release reads v0.156.12's token, and v0.156.12 refuses this release's (it reports the stream as owned by a non-broker writer) rather than misreading it, so a broker cannot be downgraded in place.
+
 ## [0.156.12] - 2026-10-06
 
 ### Fixed

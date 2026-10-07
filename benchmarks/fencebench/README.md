@@ -32,3 +32,9 @@ bash benchmarks/fencebench/down.sh
 ## Acceptance for ADR-0190 amendment D
 
 On workload A, `fold-eol` must run at **≥ 0.8×** `base-serial` on each pair measured; `fold-lanes` (the flag off) must be within noise of `base-lanes`; every cell `VERIFY OK`. The measured numbers live in the ADR (amendment D, "Implementation"), not here.
+
+## brokerbench — the cost of ADR-0191 broker replay
+
+`bcell.sh PAIR WORKLOAD ARM N REPS` (and `bdriver.sh PAIR [N] [REPS] [WORKLOADS]` for every workload × arm) measures `sync from-backup` replay instead of `sync start`. Per (pair, workload, arm) it resets the source, seeds it, takes `backup full --chain-slot`, restores that full into the target (copied as a template per replay), generates N transactions, captures them with one `backup incremental` (`CAPWIN`, default 25s), records the change chunks' stored bytes, and then times REPS replays per apply mode (`serial`, `lanes`) of `sync from-backup run --at-chain-id <full>` with `fb wait`, each followed by `fb verify`. A binary that refuses the chain records `REFUSED <code>` (the v0.156.12 base refuses workload K, a keyless table, with `SLUICE-E-BROKER-KEYLESS-TABLE`). Results go to `$FB_OUT/broker-results.txt`.
+
+Workload **K** is table `kl` with no key (a non-unique index on `id` only, so InnoDB's DELETE does not deadlock the generator): 90% inserts, 10% deletes of seeded rows. `ARMS` defaults to `base head`. Pass Windows-style paths (`C:/...`) for `FB`, `FB_OUT` and `FB_BIN_*` on Windows: the scripts set `MSYS_NO_PATHCONV=1`, so a `/c/...` path reaches the binaries unconverted. The measured numbers live in ADR-0191 §14.

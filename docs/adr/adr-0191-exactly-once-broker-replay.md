@@ -1,6 +1,6 @@
 # ADR-0191: Exactly-once broker replay — a recorded source identity, a mid-incremental frontier, and ADR-0190's marks
 
-- **Status:** Accepted 2026-10-05 (operator, §12): design only, no code yet; sequenced after F-E1-SEVERED-TAIL-REPLAY and ADR-0190 Amendment E. Written against `98ad6ec6` (v0.156.11 plus a backlog correction). The F-E1 follow-up that ADR-0190's operator decision 4 ("the broker: NOT in this ADR — a separate ADR later") and amendment E's E-Q5 sequenced ahead of amendment E. The operator answers are in §12.
+- **Status:** Implemented 2026-10-06 (unreleased) against v0.156.12, as re-validated in §13; §14 records what was built, what was not, and every divergence. Accepted 2026-10-05 (operator, §12); sequenced after F-E1-SEVERED-TAIL-REPLAY and ADR-0190 Amendment E. Written against `98ad6ec6` (v0.156.11 plus a backlog correction). The F-E1 follow-up that ADR-0190's operator decision 4 ("the broker: NOT in this ADR — a separate ADR later") and amendment E's E-Q5 sequenced ahead of amendment E. The operator answers are in §12.
 - **Date:** 2026-10-05
 - **Related:** [ADR-0190](adr-0190-exactly-once-apply-marks.md) (the apply-mark machinery this ADR reuses unchanged, and the invariants (i)–(iii) of its amendment C); [ADR-0007](adr-0007-position-persistence.md) (position in the data transaction); [ADR-0010](adr-0010-idempotent-applier.md) (the idempotency the broker's BRK-1 comment leaned on); [ADR-0027](adr-0027-source-transaction-boundary-cdc-batching.md); [ADR-0046](adr-0046-inline-backup-chain-rotation.md) / [ADR-0067](adr-0067-contiguous-rotation-handoff.md) (segments and rotation); [ADR-0064](adr-0064-backup-smart-compaction.md) (smart compaction); [ADR-0087](adr-0087-compact-group-split-and-rotation-boundary-resume.md); [ADR-0113](adr-0113-restore-reparent-reconciliation.md) (reconcile); audit backlog **F-E1** and its sub-items F-E1-KEY-REUSE-REPLAY and F-E1-ROTATED-SEGMENT-OVERLAP.
 
@@ -320,6 +320,58 @@ Written against `62e80d78` (v0.156.12), which carries everything §12 sequenced 
 **R12 — "Killed at every statement" is driven by chunk-boundary failures.** P6/P7 kill by failing the fetch of change chunk j of an incremental written with one change per chunk: every change before j is applied and committed (the applier commits its data on the channel's close, mid-transaction, without a position), which is exactly the committed-prefix state a SIGKILL leaves when each row commits on its own (`--apply-batch-size 1`). The first and last chunks are read by the severed-transaction door before anything is applied, so the measured shapes are padded by a transaction on each side.
 
 **R13 — Line numbers drifted** (e.g. `rewritePosition` is at `broker.go:1564`, `writePositionDirect` at `:963`); none of the cited behaviour did, except as R1–R12 say.
+
+## 14. Implementation notes (2026-10-06)
+
+Built on `62e80d78` in five commits: §13 (`c7cc5730`), phase 1 codec (`043c61ce`), phase 2 frontier (`83e6994c`), phase 3 cold-start mark clear (`d515e2d9`), phase 4 per-incremental door (`78a25391`), then `a0f8c530` (the crash kill as a per-broker failpoint so the cells run in parallel) and this documentation and benchmark commit. Phase 5 (chain restore's shared overlap helper) was not built: §13 R2.
+
+**What was built, by section.**
+
+- **§3.1 identity.** `changeWire.aid {"t","s"}` on row changes only; absent decodes to the zero identity; an `aid` with an empty `TxID`, on a non-row kind, or (on encode) a non-UTF-8 `TxID` refuses. `Manifest.ApplyIdentity` is set by `backup stream` (`readerStampsApplyIdentity`) and `backup incremental`; smart compaction strips every `aid` (`ir.WithoutApplyID`) and clears the flag. The flag is `canonExempt` (R3). Chain restore clears its mark stream before applying anything (R9).
+- **§3.2 frontier.** `backup-broker-v2` token with `in_progress {backup_id, chunks, through}`; rows carry their transaction's start, `TxCommit` and out-of-transaction changes their own ordinal over the RAW stream; resume reads the persisted token from the target before every incremental (R10) and refuses `SLUICE-E-BROKER-INCREMENTAL-REWRITTEN` on a changed chunk digest, a different next incremental, or a stream shorter than the frontier. T_1's start is the parent token (R11).
+- **§3.4 (2)** cold starts (`--reset-target-data` after the pre-drop doors, `--at-chain-id` before the position write) clear the stream's marks. (3) and (4) not built (R1).
+- **§3.5 door.** Per incremental, for the tables it touches, before anything of it is applied; at start for the incremental a broker is inside or about to start; a target-only judgment before a `--reset-target-data` drop; a per-change backstop before emit. Coverage is the new optional `ir.ApplyMarksCoverageProber` (Postgres, MySQL). **Divergences:** any Neki target refuses (R7); SQLite/D1 appliers implement no marks and keep the refusal; an idle chain is not refused until an incremental that touches the table arrives (the door being per incremental, as tabled — the v0.156.11 door refused at start regardless).
+
+**Correction to R12, found while running P6.** The phase-4 door decodes EVERY chunk of an incremental that touches a candidate table before anything is applied, so a store-side chunk fault can no longer interrupt such a replay mid-incremental: it refuses at the door, which is the right behaviour and the wrong kill. P6/P7 and the FE1 keyless matrix therefore kill through a test-only per-broker failpoint on the replay path, `SyncFromBackup.replayChunkFailpoint` (the `rotationCrashPoint` pattern; per broker so the 38 cells per engine run in parallel), just before chunk j is read. The committed-prefix state is the one R12 describes. The first P6 run went red in every cell because its harness restored the WHOLE chain into each target (`Restore` dispatches to chain restore); fixed with `SkipChainDispatch`, found by reading the log, not by patching the product.
+
+**Pins as built, against §9.**
+
+| # | As built | Divergence |
+|---|---|---|
+| P1 | `TestChangeChunk_ApplyIDRoundTrip` (every reader's `TxID` shape, `Seq` > 2⁵³), `_PreADR0191ChunkDecodesWithoutIdentity`, `_OlderReaderIgnoresTheIdentity` (frozen v0.156.11 `changeWire`), `_ApplyIDRefusals` | — |
+| P2 | `backup_capture_identity_integration_test.go`: PG, MySQL GTID, MySQL file/pos (stream lane), pgtrigger, sqlite-trigger (incremental lane), chunk `aid` = the reader's re-delivered identity | MariaDB, VStream, the MySQL trigger source and D1 not pinned |
+| P3–P5, P13 | `broker_frontier_test.go` (`TestBroker_FrontierTokenAtEveryBoundary`, `_ResumeSkipsThroughTheFrontier`, `_RewrittenIncrementalRefuses`, `TestBrokerToken_DowngradeIsLoud`) | — |
+| P6/P7 | `TestBroker_CrashMidIncremental_{Postgres,MySQLGTID,MySQLFilePos}`: 44-event incremental (keyless, secondary-unique, both key-reuse shapes as one transaction and split per statement, padding), killed after every statement, serial and lanes — 38 cells per engine, every one converges to the SOURCE; at the kill the frontier is the last boundary below the kill (serial) or at/below it (lanes) and marks name only the in-flight transaction; anti-vacuity on committed keyless rows | Same-engine only (PG→PG, MySQL→MySQL); no cross-engine target, no MariaDB/VStream/trigger source. Kill by failpoint, not a target row lock. P7 is folded into this suite instead of a separate `TestBroker_KeyReuseIncremental_Converges`; its no-identity twin is `TestFE1_Broker_KeyChangingIncremental_RerunRefusesLoudly`'s second arm. P6's mutant "rows stamped with their own ordinal" is NOT observable in persisted state on marker streams (no position is persisted mid-transaction) — only P3 catches it |
+| P8, P9 | not built | R1, R2 |
+| P10 | `TestBroker_ColdStartsClearTheStreamsMarks` (both entries, order) + `TestBroker_ColdStartClearsAStaleMarkThatWouldSkip` (real PG, with a control arm proving the planted mark skips) | — |
+| P11 | `TestCompaction_ApplyIdentityFlag` | first fixture was vacuous for "keeps `aid`" (collapsed events are rebuilt without identity); strengthened with pass-through rows |
+| P12 | `TestBrokerKeylessDoor_PerIncrementalMatrix` (9 rows), `_ResetJudgesTheTargetBeforeTheDrop`, `TestChangeApplier_MarksCoverReason` (real PG and MySQL), `TestFE1_Broker_KeylessChain_ExactlyOnceOrRefused`, `TestFE1_Broker_MySQLTarget_KeylessDoor` (identity arm refuses only the surrogate-keyed table) | — |
+| P14 | `TestReplayIdentityIsPassThrough` | R4 |
+
+Every pin was mutation-run in both directions where §9 names a reverse, each from a checkpoint commit, mutant grepped, the red read to confirm the intended assertion fired. Notable: P6's "write the parent token" mutant failed 13 cells on the frontier assertion, duplicated keyless rows in 10 and hit 23505 in 26; a broker that drops identities before the applier emptied `kc` (the silent KEY-REUSE shape) and duplicated keyless rows; a producer that writes no `aid` under a set flag was refused at every cell by `BROKER-KEYLESS-NO-IDENTITY` (the loud guard for that gap).
+
+**Codec checklist, cross-version, real binaries on Postgres 16.** v0.156.12 reading a chain this code wrote (identity incremental with a key change and keyless rows): `backup verify` OK, restore equal to the source. This code reading a v0.156.12 chain: verify OK, restore equal to the source; a broker on it refuses a v0.156.12 incremental that touches a keyless table, naming "records no change identities", with nothing applied. Downgrade: v0.156.12's broker over a `backup-broker-v2` token refuses ("owned by a non-broker writer") rather than misreading it. Byte-exact round trip of every engine's `TxID` shape: P1.
+
+**Not observed, stated.** The sharded-VStream `APPLY-MARK-UNTRUSTED` case of ADR-0190 does not arise on the broker path: it replays a recorded order, and a change recorded without an identity is refused per change.
+
+**Unverified premises carried forward.** §13 R2 (MariaDB, VStream and the trigger sources never re-deliver a completed transaction); Q5 (Neki cross-shard-group atomicity — refused, so not relied on); P2 for MariaDB, VStream, the MySQL trigger source and D1.
+
+**`-race`.** Phase 2–4 touch the broker's producer and the lane path's checkpoints; the `-race` integration job must be green before any tag.
+
+**Performance (§8) — measured, and the chunk-growth acceptance is MISSED.** The `brokerbench` arm is `benchmarks/fencebench/bcell.sh` / `bdriver.sh`, with workload K added to `fb`. Base is the v0.156.12 release binary (`62e80d78`, this branch's parent; §8 named `98ad6ec6`, which predates v0.156.12's own broker changes), head is `78a25391`. One chain per (pair, workload, arm), N = 10,000 source transactions of 1–3 rows, three replays per apply mode, `sync from-backup run --at-chain-id` into a target holding the full, timed by `fb wait`; every head cell and every base cell that ran ended `VERIFY OK`. Medians, transactions/s:
+
+| pair / workload | serial base → head | lanes base → head | change chunks, compressed bytes base → head |
+|---|---|---|---|
+| pg2pg A | 232.3 → 230.0 (−1.0%) | 4,464 → 4,902 (≤ 3 s cells: within the 200 ms poll) | 460,928 → 541,376 (**+17.5%**) |
+| pg2pg B | 233.3 → 230.0 (−1.4%) | ~16k → ~16k (≈ 1 s cells: unmeasurable) | 457,210 → 536,876 (**+17.4%**) |
+| pg2pg D | 239.5 → 238.3 (−0.5%) | 153.1 → 137.0 (**−10.5%**) | 511,608 → 587,844 (**+14.9%**) |
+| pg2pg K | refused → 57.0 (bimodal 57/77) | refused → 75.2 | 328,785 → 411,601 (**+25.2%**) |
+| my2pg A | 162.4 → 229.0 (base noisy: 161/162/208) | 4,098 → 4,464 (≤ 3 s cells) | 421,062 → 477,239 (**+13.3%**) |
+| my2pg B | 233.4 → 231.2 (−0.9%) | ~16k → ~16k (unmeasurable) | 425,544 → 479,883 (**+12.8%**) |
+| my2pg D | 242.9 → 240.6 (−0.9%) | 153.6 → 137.0 (**−10.8%**) | 481,811 → 538,872 (**+11.8%**) |
+| my2pg K | refused → 84.5 | refused → 109.5 | 300,395 → 349,770 (**+16.4%**) |
+
+Against §8's acceptance: B serial within ±5% (met on both pairs; B lanes too fast at N = 10,000 to grade); A and D serial within ±10% (met); `VERIFY OK` everywhere including K (met). **Compressed chunk growth ≤ 10% on every workload: MISSED on all eight cells (+11.8% to +25.2%).** §8 says a miss revisits the encoding before landing (for example a per-transaction `aid` on `TxBegin` with per-row `Seq` only, at the cost of a stateful decoder) and goes through the three-phase protocol, not tuning; that is a design change to a persisted format and is returned to the operator rather than improvised here. Also reported, not covered by an acceptance line: D on the lanes falls about 10.5–10.8% on both pairs, consistent with the barrier's extra mark statement (amendment E) now that broker changes carry identities. Not measured: uncompressed chunk bytes (no zstd decoder on the bench host), the resume cell (kill at 50% of a 100k-change incremental), `my2my`. Every serial cell sits near 230 tx/s whatever the workload, on base and head alike — a ceiling of this harness's broker path, not of this change. pg2pg K ran before `fb` gave `kl` a non-unique index on `id` (added when MySQL's full-scan DELETE deadlocked the generator); my2pg K ran with it.
 
 ## Alternatives considered
 
