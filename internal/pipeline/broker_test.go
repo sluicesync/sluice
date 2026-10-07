@@ -19,8 +19,8 @@ import (
 // JSON token decodeBrokerPosition can round-trip.
 func TestEncodeDecodeBrokerPosition(t *testing.T) {
 	pos := encodeBrokerPosition("file:///tmp/chain", "abc123def4567890")
-	if pos.Engine != BackupBrokerPositionEngine {
-		t.Errorf("engine = %q; want %q", pos.Engine, BackupBrokerPositionEngine)
+	if pos.Engine != BackupBrokerPositionEngineV2 {
+		t.Errorf("engine = %q; want %q", pos.Engine, BackupBrokerPositionEngineV2)
 	}
 	if pos.Token == "" {
 		t.Fatal("token is empty")
@@ -28,15 +28,15 @@ func TestEncodeDecodeBrokerPosition(t *testing.T) {
 	// Bug 39 fix: the token JSON carries an `_engine` field so the
 	// broker sentinel survives the engine appliers' round-trip
 	// discard of [ir.Position.Engine].
-	if !strings.Contains(pos.Token, `"_engine":"backup-broker"`) {
+	if !strings.Contains(pos.Token, `"_engine":"backup-broker-v2"`) {
 		t.Errorf("token does not embed _engine sentinel: %s", pos.Token)
 	}
 	tok, err := decodeBrokerPosition(pos)
 	if err != nil {
 		t.Fatalf("decodeBrokerPosition: %v", err)
 	}
-	if tok.Engine != BackupBrokerPositionEngine {
-		t.Errorf("decoded Engine = %q; want %q", tok.Engine, BackupBrokerPositionEngine)
+	if tok.Engine != BackupBrokerPositionEngineV2 {
+		t.Errorf("decoded Engine = %q; want %q", tok.Engine, BackupBrokerPositionEngineV2)
 	}
 	if tok.ChainURL != "file:///tmp/chain" {
 		t.Errorf("ChainURL = %q; want %q", tok.ChainURL, "file:///tmp/chain")

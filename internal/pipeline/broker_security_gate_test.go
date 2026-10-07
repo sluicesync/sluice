@@ -320,7 +320,7 @@ func TestSyncFromBackup_ChangeChunkTailTruncation_Refused(t *testing.T) {
 
 			b := &SyncFromBackup{Store: store, ChainURL: "file:///chain"}
 			out := make(chan ir.Change, 16) // large enough that the 2 sends never block
-			err := b.streamIncrementalWithPosition(ctx, link, encodeBrokerPosition("file:///chain", "parent"), out)
+			err := b.streamIncrementalWithPosition(ctx, link, newBrokerFrontier("file:///chain", "parent", link.Manifest, -1), out)
 			close(out)
 			if tc.wantErr {
 				assertCoded(t, err, sluicecode.CodeBackupIncomplete)

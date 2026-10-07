@@ -274,10 +274,17 @@ func TestSyncFromBackup_CancelMidIncremental_ExitsWithPartialMarker(t *testing.T
 // servers by TestFE1_Broker_KeyChangingIncremental_RerunRefusesLoudly and
 // TestApplier_KeyChangingReplay_{RefusesLoudly,KeyReuseIsSilent} (both
 // engines); if those change, this text must change with them.
+//
+// Since ADR-0191 the text has two arms. An incremental WITHOUT identities
+// keeps the key-change caveat, narrowed to the one in-flight transaction the
+// frontier re-delivers; one WITH identities says the re-run is exactly-once
+// where marks are usable, pinned by TestBroker_KeyReuseIncremental_Converges.
 func TestBrokerIncrementalPartialError_RecoveryTextIsScoped(t *testing.T) {
 	msg := (&brokerIncrementalPartialError{backupID: "b1", resumeFrom: "b0", cause: context.Canceled}).Error()
 	for _, want := range []string{
 		BrokerIncrementalPartialMarker,
+		"re-applies only the source transaction that was in flight",
+		"records no change identities",
 		"updates and deletes that keep each row's key, converge",
 		"CHANGED a row's key value",
 		"1062", "23505",
@@ -285,11 +292,22 @@ func TestBrokerIncrementalPartialError_RecoveryTextIsScoped(t *testing.T) {
 		"--reset-target-data",
 	} {
 		if !strings.Contains(msg, want) {
-			t.Errorf("BROKER-INCREMENTAL-PARTIAL message lacks %q:\n%s", want, msg)
+			t.Errorf("BROKER-INCREMENTAL-PARTIAL message (no identities) lacks %q:\n%s", want, msg)
 		}
 	}
-	if strings.Contains(msg, "re-applied changes upsert and converge") {
-		t.Errorf("the message still promises unconditional convergence:\n%s", msg)
+	for _, stale := range []string{"re-applied changes upsert and converge", "re-applies the WHOLE incremental"} {
+		if strings.Contains(msg, stale) {
+			t.Errorf("the message still says %q:\n%s", stale, msg)
+		}
+	}
+	withID := (&brokerIncrementalPartialError{backupID: "b1", resumeFrom: "b0", cause: context.Canceled, identity: true}).Error()
+	for _, want := range []string{"records the source's own change identities", "APPLY-MARKS-UNAVAILABLE", "key changes included"} {
+		if !strings.Contains(withID, want) {
+			t.Errorf("BROKER-INCREMENTAL-PARTIAL message (identities) lacks %q:\n%s", want, withID)
+		}
+	}
+	if strings.Contains(withID, "--reset-target-data") {
+		t.Errorf("the identity arm still sends an operator to --reset-target-data for a re-run that is exactly-once:\n%s", withID)
 	}
 }
 

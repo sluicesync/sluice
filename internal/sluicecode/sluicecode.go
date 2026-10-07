@@ -649,6 +649,17 @@ const (
 	// anything is applied, including before a --reset-target-data restore.
 	CodeBrokerKeylessTable Code = "SLUICE-E-BROKER-KEYLESS-TABLE"
 
+	// CodeBrokerIncrementalRewritten fires when `sync from-backup` resumes
+	// INSIDE an incremental it had applied part of (ADR-0191 §3.2) and that
+	// incremental is no longer the stream its persisted position counted
+	// over: its change-chunk list digests differently (smart compaction
+	// rewrote it), a different incremental now follows the last fully
+	// applied one, or the stream has fewer events than the position says
+	// were applied. Resuming would skip by event ordinal into a different
+	// stream and could drop changes silently, so the broker refuses before
+	// applying anything of it.
+	CodeBrokerIncrementalRewritten Code = "SLUICE-E-BROKER-INCREMENTAL-REWRITTEN"
+
 	// CodeRestoreKeylessTableNotEmpty fires when `restore` (a single full or
 	// a chain) would load rows into a target table that ALREADY holds rows
 	// and has no key a re-applied row could collide on (audit F-E1). The
@@ -1004,7 +1015,8 @@ var registry = map[Code]Info{
 
 	CodeTargetDeferrableKey: {ClassRefusal, "refused before applying anything: a target table's primary key (or only usable unique key) is DEFERRABLE, and Postgres rejects a deferrable constraint as an `ON CONFLICT` arbiter — so sluice's idempotent apply/copy upsert cannot key on it; recreate the target constraint as immediate (NOT DEFERRABLE), pre-create the target table with an immediate key, or take the table out of scope"},
 
-	CodeBrokerKeylessTable: {ClassRefusal, "sync from-backup refused before applying anything: a table the chain replays into has no PRIMARY KEY and no NOT NULL UNIQUE index in the chain's recorded schema, or none on the target made of columns the replayed rows carry, and the broker re-applies a whole incremental after any interruption — so the table would silently gain a duplicate of every row an interrupted run had committed; give the table a key on the SOURCE and take a new full backup, or replicate it with `sluice sync start`"},
+	CodeBrokerKeylessTable:         {ClassRefusal, "sync from-backup refused before applying anything: a table the chain replays into has no PRIMARY KEY and no NOT NULL UNIQUE index in the chain's recorded schema, or none on the target made of columns the replayed rows carry, and the broker re-applies a whole incremental after any interruption — so the table would silently gain a duplicate of every row an interrupted run had committed; give the table a key on the SOURCE and take a new full backup, or replicate it with `sluice sync start`"},
+	CodeBrokerIncrementalRewritten: {ClassRefusal, "sync from-backup refused to resume inside an incremental it had applied part of, because that incremental was rewritten since (its change-chunk list changed — smart compaction — or another incremental now follows the last one fully applied): resuming by event ordinal into a different stream could drop changes silently; nothing of it was applied; recover with --reset-target-data"},
 
 	CodeRestoreKeylessTableNotEmpty: {ClassRefusal, "restore refused before writing: a target table it would load already holds rows and has no PRIMARY KEY or NOT NULL UNIQUE index made of columns the backup's rows carry, so the restore would append its rows next to the existing ones instead of colliding — typically a re-run after a failed restore, which would duplicate everything the earlier attempt wrote; empty or drop every table that attempt loaded and re-run, or exclude the named ones"},
 

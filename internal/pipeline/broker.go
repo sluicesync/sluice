@@ -23,20 +23,19 @@ package pipeline
 //     in chain order — schema deltas first, then change chunks
 //     through the engine's batched applier.
 //   - The position written alongside the data is the broker's
-//     synthetic position-shape: `Engine="backup-broker"`,
-//     `Token={"chain_url":"...","last_applied_backup_id":"<id>"}`.
-//     Every change of an incremental carries the PARENT position
-//     (BRK-1), and the position advances only once the whole
-//     incremental has applied, so a crash mid-replay re-applies the
-//     whole incremental. That is safe only on tables where the applier
-//     upserts on a key the replayed rows carry (a key on a defaulted
-//     surrogate they never supply collides with nothing) — the
-//     changes carry no apply identity, so it is
-//     NOT the ADR-0010 idempotency it was once described as — which
-//     is why keyless tables are refused before anything is applied
-//     (audit F-E1, [SyncFromBackup.refuseKeylessTables]). Distinct
-//     from `sync start`'s positions (CDC LSN / GTID); the broker's
-//     positions reference chain state.
+//     synthetic position-shape: `Engine="backup-broker-v2"`,
+//     `Token={"chain_url":"...","last_applied_backup_id":"<id>",
+//     "in_progress":{"backup_id":"<X>","chunks":"<digest>","through":<e>}}`.
+//     Since ADR-0191 the position stands INSIDE an incremental: each
+//     change carries the frontier of its own source transaction's start
+//     ([brokerFrontier]), the applier persists it only at a transaction
+//     boundary, and a restart re-reads the incremental, drops the events
+//     already durable and re-applies only the transaction that was in
+//     flight — which ADR-0190's apply marks, keyed by the reader's
+//     identity the chunks now record, make exactly-once where they are
+//     usable. The advance to "incremental X fully applied" happens only
+//     after X streamed whole. Distinct from `sync start`'s positions (CDC
+//     LSN / GTID); the broker's positions reference chain state.
 //
 // Stopping:
 //
@@ -179,12 +178,14 @@ type SyncFromBackup struct {
 	// cross-region wedge (live Track-C finding, 2026-06-24). When > 1 (or
 	// auto), the broker plumbs it onto the applier via
 	// [migcore.ApplyApplyConcurrency] so ApplyBatch fans the merged change stream
-	// across W in-order PK-hash lanes. Every change in an incremental
-	// carries the same broker position token, so the lanes persist the
-	// identical position the serial path does and the re-replay-from-parent
-	// recovery is the same in both modes — which also means neither mode is
-	// exactly-once for an interrupted incremental: the whole incremental is
-	// re-applied, so keyless tables are refused (audit F-E1). Follows the ADR-0106 contract: `0 = auto:N`
+	// across W in-order PK-hash lanes. Every change carries the frontier
+	// token of its own source transaction's start (ADR-0191 §3.2), and the
+	// lanes persist only the highest recorded boundary at or below their
+	// contiguous frontier, so both modes resume an interrupted incremental
+	// from its last durable transaction boundary; the lane barrier's marks
+	// (amendment C keeps them on by default) and the serial path's cover
+	// the in-flight transaction, while the lanes' secondary-unique batches
+	// write none (no --exactly-once-lanes here, ADR-0191 Q7). Follows the ADR-0106 contract: `0 = auto:N`
 	// (the fast default — see [migcore.ResolveReplayApplyConcurrency]), `1 = serial
 	// opt-out`, `N > 1 = honored`. The zero value gets the fast default (no
 	// zero-value-safe-default trap, the v0.99.51 lesson).
@@ -321,26 +322,40 @@ type brokerPositionToken struct {
 	Engine              string `json:"_engine,omitempty"`
 	ChainURL            string `json:"chain_url,omitempty"`
 	LastAppliedBackupID string `json:"last_applied_backup_id"`
+
+	// InProgress, when set, is the frontier inside the incremental after
+	// LastAppliedBackupID (ADR-0191 §3.2): absent between incrementals.
+	InProgress *brokerInProgress `json:"in_progress,omitempty"`
 }
 
-// encodeBrokerPosition produces the [ir.Position] the broker writes
-// alongside data writes during incremental replay. The Engine field
-// is [BackupBrokerPositionEngine] so a future broker run can detect
-// "this row was written by a broker, not a live CDC stream" without
-// parsing the token. The same sentinel is also embedded in the JSON
-// token (`_engine` field) so it survives the engine appliers'
-// hard-coded engine-name discard on read (Bug 39 round-trip fix).
+// encodeBrokerPosition produces the [ir.Position] the broker writes when
+// an incremental is FULLY applied (and at a cold start): backupID is the
+// last fully applied incremental, with no frontier inside the next one.
+// The sentinel is [BackupBrokerPositionEngineV2] — always, since ADR-0191,
+// so a downgraded binary refuses the row loudly instead of reading it — in
+// the Engine field so a future broker run can detect "this row was written
+// by a broker, not a live CDC stream" without parsing the token, and
+// embedded in the JSON token (`_engine` field) so it survives the engine
+// appliers' hard-coded engine-name discard on read (Bug 39 round-trip fix).
 func encodeBrokerPosition(chainURL, backupID string) ir.Position {
 	tok := brokerPositionToken{
-		Engine:              BackupBrokerPositionEngine,
+		Engine:              BackupBrokerPositionEngineV2,
 		ChainURL:            chainURL,
 		LastAppliedBackupID: backupID,
 	}
 	body, _ := json.Marshal(tok)
 	return ir.Position{
-		Engine: BackupBrokerPositionEngine,
+		Engine: BackupBrokerPositionEngineV2,
 		Token:  string(body),
 	}
+}
+
+// isBrokerSentinel reports whether s is a broker token sentinel this binary
+// reads: the v2 one it writes, or the classic one every broker before
+// ADR-0191 wrote (a target upgraded mid-chain carries it until its first v2
+// write; ADR-0191 §6).
+func isBrokerSentinel(s string) bool {
+	return s == BackupBrokerPositionEngineV2 || s == BackupBrokerPositionEngine
 }
 
 // decodeBrokerPosition parses a position token written by
@@ -364,11 +379,19 @@ func decodeBrokerPosition(pos ir.Position) (*brokerPositionToken, error) {
 	if err := json.Unmarshal([]byte(pos.Token), &tok); err != nil {
 		return nil, fmt.Errorf("broker: decode position token: %w", err)
 	}
-	if tok.Engine != BackupBrokerPositionEngine {
+	if !isBrokerSentinel(tok.Engine) {
 		return nil, fmt.Errorf(
-			"broker: token's _engine field is %q, not %q",
-			tok.Engine, BackupBrokerPositionEngine,
+			"broker: token's _engine field is %q, not %q (or the classic %q)",
+			tok.Engine, BackupBrokerPositionEngineV2, BackupBrokerPositionEngine,
 		)
+	}
+	if tok.InProgress != nil {
+		if tok.Engine != BackupBrokerPositionEngineV2 {
+			return nil, fmt.Errorf("broker: a classic %q token carries an in_progress frontier, which no writer produces", tok.Engine)
+		}
+		if err := tok.InProgress.validate(); err != nil {
+			return nil, err
+		}
 	}
 	return &tok, nil
 }
@@ -389,7 +412,7 @@ func isBrokerToken(pos ir.Position) bool {
 	if err := json.Unmarshal([]byte(pos.Token), &tok); err != nil {
 		return false
 	}
-	return tok.Engine == BackupBrokerPositionEngine
+	return isBrokerSentinel(tok.Engine)
 }
 
 // Run executes the long-running broker. Blocks until ctx is cancelled
@@ -1052,29 +1075,26 @@ func (b *SyncFromBackup) replayNewIncrementals(
 		batchSize = backup.DefaultChainRestoreBatchSize
 	}
 
-	// BRK-1: the position the broker would RESUME from if the incremental
-	// currently being applied fails partway — the last FULLY-applied backup
-	// id. Each incremental streams its changes at THIS token; it advances to
-	// its own backupID only via the post-stream writePositionDirect (after
-	// every chunk streams cleanly). So a mid-incremental chunk failure
-	// (tamper, dropped blob, transient fetch error) leaves the persisted
-	// position at the parent, and a restart re-applies the whole incremental
-	// instead of skipping it and silently losing its un-applied tail. Seed
-	// with lastAppliedID, or the chain root (the full) on a cold warm-resume
-	// so the token is never empty.
+	// BRK-1, restated by ADR-0191 §3.2: resumeFromID is the last FULLY
+	// applied incremental — the parent of the one being applied. Each
+	// incremental streams its changes at frontier tokens INSIDE itself
+	// (last_applied stays this parent, in_progress names how far in), and it
+	// advances to its own backupID only via the post-stream
+	// writePositionDirect. So a mid-incremental failure (tamper, dropped
+	// blob, transient fetch error, crash) leaves the persisted position at
+	// the last durable source-transaction boundary of the in-flight
+	// incremental, and a restart resumes there — never past its un-applied
+	// tail, never before its committed transactions. Seed with
+	// lastAppliedID, or the chain root (the full) on a cold warm-resume so
+	// the token is never empty.
 	//
-	// That re-apply is NOT idempotent in general, whatever ADR-0010 suggests:
-	// these changes carry no apply identity (ADR-0190 marks cannot skip
-	// them), so every change the interrupted run committed is applied a
-	// second time. A table keyed on columns the replayed rows carry absorbs
-	// that (the INSERT upserts); a keyless one — or one the target keys only
-	// on a defaulted surrogate the rows never supply — gains a duplicate row
-	// per committed INSERT (audit F-E1, measured at 2001 vs 1001 keyless and
-	// 2000 vs 1001 on a bigserial-rekeyed target). That is why
-	// [SyncFromBackup.refuseKeylessTables] refuses such tables before
-	// anything is applied. Exactly-once (an
-	// apply identity per broker change) is the open follow-up that would
-	// lift the refusal.
+	// What the restart re-applies is the one transaction that was in flight.
+	// ADR-0190's apply marks — keyed by the reader identity the chunks now
+	// record, written by the serial paths and the lane barrier — skip its
+	// committed non-idempotent changes; an incremental without identities
+	// (written before ADR-0191, or smart-compacted) replays that transaction
+	// unmarked, which is why the keyless door judges each incremental
+	// before applying it.
 	resumeFromID := lastAppliedID
 	if resumeFromID == "" {
 		resumeFromID = lineage.ManifestBackupID(chain[0].Manifest)
@@ -1101,10 +1121,10 @@ func (b *SyncFromBackup) replayNewIncrementals(
 			// clean stop (F-E1 (a)): applyIncremental was ENTERED for this
 			// incremental and failed while the run's context is done. From
 			// the moment it is entered it may commit schema deltas and
-			// change batches under the parent position, and only its last
-			// step advances the position — so any cancel observed here can
-			// have left part of it applied. A cancel observed anywhere else
-			// (the between-incremental check above, the chain walk, the
+			// change batches at frontier positions INSIDE it, and only its
+			// last step marks it fully applied — so any cancel observed here
+			// can have left part of it applied. A cancel observed anywhere
+			// else (the between-incremental check above, the chain walk, the
 			// integrity gates, the tick wait, the stop poll) has applied
 			// nothing of an unadvanced incremental and stays a clean exit.
 			if ctx.Err() != nil {
@@ -1112,6 +1132,7 @@ func (b *SyncFromBackup) replayNewIncrementals(
 					backupID:   lineage.ManifestBackupID(link.Manifest),
 					resumeFrom: resumeFromID,
 					cause:      applyErr,
+					identity:   link.Manifest.ApplyIdentity,
 				}
 			}
 			return newApplied, totalBytes, incrCount, chunkCount, fmt.Errorf("incremental %s: %w",
@@ -1231,9 +1252,31 @@ func (b *SyncFromBackup) applyIncremental(
 	batchSize int,
 	parentResumeID string,
 ) (int64, error) {
+	// 0. Where inside THIS incremental the target already stands (ADR-0191
+	//    §3.2): read back from the target before anything of it is applied,
+	//    and refused when the incremental was rewritten since.
+	persisted, found, err := applier.ReadPosition(ctx, b.StreamID)
+	if err != nil {
+		return 0, fmt.Errorf("read position before incremental %s: %w", lineage.ManifestBackupID(link.Manifest), err)
+	}
+	skipThrough, err := resumeSkip(persisted, found, link.Manifest, parentResumeID)
+	if err != nil {
+		return 0, err
+	}
+	if skipThrough >= 0 {
+		slog.InfoContext(
+			ctx, "broker: resuming inside an incremental from its last durable source-transaction boundary",
+			slog.String("stream_id", b.StreamID),
+			slog.String("backup_id", lineage.ManifestBackupID(link.Manifest)),
+			slog.Int64("applied_through_event", skipThrough),
+		)
+	}
+
 	// GC-37 (j): see [ChainRestore.applyIncremental] — the same WARN.
 	migcore.WarnLegacyCharsetIncrement(ctx, "sync from-backup", link.Manifest)
-	// 1. Schema deltas first.
+	// 1. Schema deltas first. Re-applied on a resume inside the incremental
+	//    (ADR-0191 §4 C7): their idempotency is the claim this step always
+	//    made for a re-applied incremental.
 	if len(link.Manifest.SchemaDelta) > 0 {
 		if err := b.applySchemaDeltas(ctx, link); err != nil {
 			return 0, fmt.Errorf("apply schema deltas: %w", err)
@@ -1292,14 +1335,18 @@ func (b *SyncFromBackup) applyIncremental(
 	// persists a position only after consuming the changes ahead of it.
 	changesCh := make(chan ir.Change, migcore.RowChanBuffer)
 	errCh := make(chan error, 1)
-	// BRK-1: stream at the PARENT resume token, not this incremental's own
-	// backupID. A partial batch committed before a later-chunk failure then
-	// persists the parent position (safe re-apply on restart); the advance to
-	// backupID happens only in the post-stream writePositionDirect below.
-	pos := encodeBrokerPosition(b.ChainURL, parentResumeID)
+	// BRK-1, as ADR-0191 §3.2 restates it: every change carries the frontier
+	// token of its own source transaction's START inside this incremental —
+	// never this incremental's id as last-applied, and never a position past
+	// its own transaction. Whatever the applier persists before a failure
+	// (it persists only at a transaction boundary) therefore names exactly
+	// the committed transactions, and a restart resumes after them; the
+	// advance to backupID as "fully applied" happens only in the post-stream
+	// writePositionDirect below.
+	frontier := newBrokerFrontier(b.ChainURL, parentResumeID, link.Manifest, skipThrough)
 	go func() {
 		defer close(changesCh)
-		errCh <- b.streamIncrementalWithPosition(streamCtx, link, pos, changesCh)
+		errCh <- b.streamIncrementalWithPosition(streamCtx, link, frontier, changesCh)
 	}()
 
 	if batched, ok := applier.(ir.BatchedChangeApplier); ok {
@@ -1321,10 +1368,11 @@ func (b *SyncFromBackup) applyIncremental(
 
 	// 4. Advance the broker position to THIS incremental's backupID — only
 	//    now, after every chunk has streamed cleanly (BRK-1). The streamed
-	//    changes carried the parent resume token, so the applier's in-batch
-	//    writes never advanced past the parent; this is the single point that
-	//    commits "incremental fully applied". (It also covers appliers that
-	//    emit no position write for a boundary-only batch.)
+	//    changes carried frontier tokens INSIDE this incremental, so the
+	//    applier's in-batch writes never named it fully applied; this is the
+	//    single point that commits "incremental fully applied". (It also
+	//    covers appliers that emit no position write for a boundary-only
+	//    batch, and a resume whose every event was already durable.)
 	if err := b.writePositionDirect(ctx, applier, backupID); err != nil {
 		return 0, fmt.Errorf("finalise position: %w", err)
 	}
@@ -1424,9 +1472,9 @@ func (b *SyncFromBackup) applySchemaDeltas(ctx context.Context, link *lineage.Se
 }
 
 // streamIncrementalWithPosition reads each chunk and pushes the
-// events onto out, rewriting every change's [ir.Position] to pos so
-// the applier records the broker's chain-state token rather than the
-// source's CDC token.
+// events onto out, rewriting every change's [ir.Position] to the frontier
+// token [brokerFrontier] stamps (ADR-0191 §3.2) so the applier records the
+// broker's chain-state token rather than the source's CDC token.
 //
 // DELIBERATELY sequential (no read-ahead): unlike ChainRestore's
 // streamIncrementalChanges, this loop's dominant cadence is the
@@ -1437,7 +1485,7 @@ func (b *SyncFromBackup) applySchemaDeltas(ctx context.Context, link *lineage.Se
 func (b *SyncFromBackup) streamIncrementalWithPosition(
 	ctx context.Context,
 	link *lineage.SegmentRecord,
-	pos ir.Position,
+	frontier *brokerFrontier,
 	out chan<- ir.Change,
 ) error {
 	segStore := link.Segment.Store(b.Store)
@@ -1448,9 +1496,14 @@ func (b *SyncFromBackup) streamIncrementalWithPosition(
 	// goroutine.
 	var lastApplied ir.Position
 	for chunkIdx, chunk := range link.Manifest.ChangeChunks {
-		if err := b.streamOneChunkWithPosition(ctx, segStore, codec, link.Manifest, chunkIdx, chunk, pos, out, &lastApplied); err != nil {
+		if err := b.streamOneChunkWithPosition(ctx, segStore, codec, link.Manifest, chunkIdx, chunk, frontier, out, &lastApplied); err != nil {
 			return fmt.Errorf("chunk %d (%s): %w", chunkIdx, chunk.File, err)
 		}
+	}
+	// ADR-0191 §3.2: a stream with fewer events than the persisted frontier
+	// says were applied is not the stream the frontier counted over.
+	if frontier.skipThrough >= frontier.events() {
+		return errBrokerResumeBeyondStream(lineage.ManifestBackupID(link.Manifest), frontier.skipThrough, frontier.events())
 	}
 	// F1 (SLUICE-E-BACKUP-INCOMPLETE): change-chunk tail-truncation backstop,
 	// mirroring ChainRestore.streamIncrementalChanges. manifest.EndPosition is
@@ -1460,9 +1513,9 @@ func (b *SyncFromBackup) streamIncrementalWithPosition(
 	// SHORT of EndPosition. Refuse loudly rather than advance the broker past a
 	// short tail (which — with EndPosition intact — would poison a later CDC
 	// resume). On this error applyIncremental returns before its
-	// writePositionDirect(backupID), so the broker position stays at the
-	// PARENT (BRK-1) and a restart re-applies the whole incremental — hitting
-	// the same refusal, never a silent skip. Skipped for a schema-only window
+	// writePositionDirect(backupID), so the broker position stays at the last
+	// durable boundary inside the incremental (BRK-1) and a restart re-reads it
+	// — hitting the same refusal, never a silent skip. Skipped for a schema-only window
 	// (non-position-bearing EndPosition) and reached only for chunk-bearing
 	// incrementals (the caller short-circuits the zero-chunk case).
 	// The rule is [backup.EndPositionUnreached], shared with chain restore and
@@ -1480,7 +1533,7 @@ func (b *SyncFromBackup) streamIncrementalWithPosition(
 }
 
 // streamOneChunkWithPosition reads one chunk's events and pushes them
-// onto out with each change's Position field rewritten to pos.
+// onto out with each change's Position field rewritten to its frontier token.
 // segStore/codec come from the chunk's segment (recorded, not
 // sniffed); owner is the manifest recording the chunk, whose
 // FormatVersion + identity derive the chunk's GCM position binding
@@ -1492,7 +1545,7 @@ func (b *SyncFromBackup) streamOneChunkWithPosition(
 	owner *irbackup.Manifest,
 	chunkIdx int,
 	chunk *irbackup.ChunkInfo,
-	pos ir.Position,
+	frontier *brokerFrontier,
 	out chan<- ir.Change,
 	lastApplied *ir.Position,
 ) error {
@@ -1531,6 +1584,15 @@ func (b *SyncFromBackup) streamOneChunkWithPosition(
 		// position BEFORE the rewrite (mirrors the window writer's `lastPos`).
 		if p := change.Pos(); p.Engine != "" || p.Token != "" {
 			*lastApplied = p
+		}
+		// ADR-0191 §3.2: the event's ordinal over the RAW stream (counted
+		// before the resume drops anything), the frontier token of its
+		// transaction's start, and whether it is past the persisted frontier.
+		// A dropped event was still fetched against its SHA, decrypted and
+		// decoded above, and still fed the F1 bookkeeping.
+		pos, emit := frontier.stamp(change)
+		if !emit {
+			continue
 		}
 		rewritten, rwErr := rewritePosition(change, pos)
 		if rwErr != nil {

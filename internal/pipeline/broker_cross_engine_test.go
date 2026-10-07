@@ -9,7 +9,7 @@ package pipeline
 // engine, the chain's terminal EndPosition (engine-specific:
 // `{slot,lsn}` JSON for Postgres, GTID set for MySQL) cannot be
 // translated into a target-engine-shaped CDC position. The broker
-// still writes its own `_engine="backup-broker"` envelope to
+// still writes its own `_engine="backup-broker-v2"` envelope to
 // `sluice_cdc_state` (so warm resume works), but the chain-source-
 // engine-flavored EndPosition is intentionally omitted — operators
 // continuing CDC from a cross-engine restored target run a fresh
@@ -81,9 +81,9 @@ func TestEncodeBrokerPosition_CrossEngine_OmitsChainEndPosition(t *testing.T) {
 	pos := encodeBrokerPosition("file:///tmp/chain", "incr-0001-abc")
 
 	// Engine field carries the broker sentinel, not "postgres".
-	if pos.Engine != BackupBrokerPositionEngine {
+	if pos.Engine != BackupBrokerPositionEngineV2 {
 		t.Errorf("Engine = %q; want %q (cross-engine broker writes only its envelope)",
-			pos.Engine, BackupBrokerPositionEngine)
+			pos.Engine, BackupBrokerPositionEngineV2)
 	}
 	// Token does NOT contain a PG-shaped {slot,lsn} structure or any
 	// engine-specific raw data — only the broker's chain reference.
@@ -91,7 +91,7 @@ func TestEncodeBrokerPosition_CrossEngine_OmitsChainEndPosition(t *testing.T) {
 		t.Errorf("token contains PG-engine-specific fields; want only broker envelope: %s", pos.Token)
 	}
 	// Token MUST embed _engine sentinel for round-trip survivability.
-	if !strings.Contains(pos.Token, `"_engine":"backup-broker"`) {
+	if !strings.Contains(pos.Token, `"_engine":"backup-broker-v2"`) {
 		t.Errorf("token does not embed _engine sentinel: %s", pos.Token)
 	}
 }
@@ -146,8 +146,8 @@ func TestSyncFromBackup_WritePositionDirect_CrossEngine(t *testing.T) {
 		t.Fatalf("written = %d; want 1", len(rec.written))
 	}
 	got := rec.written[0]
-	if got.Engine != BackupBrokerPositionEngine {
-		t.Errorf("Engine = %q; want %q", got.Engine, BackupBrokerPositionEngine)
+	if got.Engine != BackupBrokerPositionEngineV2 {
+		t.Errorf("Engine = %q; want %q", got.Engine, BackupBrokerPositionEngineV2)
 	}
 	// No engine-specific raw token leaked.
 	if strings.Contains(got.Token, `"slot":`) || strings.Contains(got.Token, `"lsn":`) {

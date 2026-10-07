@@ -278,7 +278,7 @@ func TestRolloverWindow_SchemaSnapshotDoesNotMoveEndPosition(t *testing.T) {
 			for range out { //nolint:revive // drain
 			}
 		}()
-		err := (&SyncFromBackup{Store: store}).streamIncrementalWithPosition(context.Background(), &link, ir.Position{Engine: "postgres", Token: "x"}, out)
+		err := (&SyncFromBackup{Store: store}).streamIncrementalWithPosition(context.Background(), &link, newBrokerFrontier("x", "parent", link.Manifest, -1), out)
 		close(out)
 		if err != nil {
 			t.Errorf("the broker's tail backstop refused a DDL-only rollover the real writer produced: %v", err)

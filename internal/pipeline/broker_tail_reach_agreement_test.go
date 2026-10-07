@@ -115,7 +115,7 @@ func TestShapeCAgreement_BrokerTailBackstop(t *testing.T) {
 				}
 			}()
 			b := &SyncFromBackup{Store: store}
-			brokerErr := b.streamIncrementalWithPosition(ctx, &link, tailLSN(1000), out)
+			brokerErr := b.streamIncrementalWithPosition(ctx, &link, newBrokerFrontier("x", "parent", link.Manifest, -1), out)
 			close(out)
 			brokerRefused := brokerErr != nil && codeOfErr(brokerErr) == sluicecode.CodeBackupIncomplete
 			if brokerErr != nil && !brokerRefused {

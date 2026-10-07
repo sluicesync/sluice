@@ -50,23 +50,38 @@ type brokerIncrementalPartialError struct {
 	backupID   string
 	resumeFrom string
 	cause      error
+
+	// identity reports that the interrupted incremental records the
+	// reader's change identities (irbackup.Manifest.ApplyIdentity), so the
+	// re-applied transaction is covered by ADR-0190's apply marks.
+	identity bool
 }
 
 func (e *brokerIncrementalPartialError) Error() string {
-	return fmt.Sprintf(
-		"broker: %s: the run was interrupted partway through incremental %s. Part of it may already be committed on "+
-			"the target, and the broker's position was NOT advanced past it (it stays at %s), so the next run re-applies "+
-			"the WHOLE incremental. Every table the broker replays was judged, on the chain's recorded schema and on the "+
-			"target, to have a key the replayed rows carry and collide on (a table without one is refused before anything "+
-			"is applied), so re-applied inserts, and updates and deletes that keep each row's key, converge: re-run the same "+
-			"command to finish it. An incremental that CHANGED a row's key value is different: its re-run can fail on a "+
-			"duplicate key (MySQL 1062 / Postgres 23505) on every attempt, and when a key value was moved off one row and onto "+
-			"another inside the incremental, the re-run can apply a change to the wrong row without any error. If the "+
-			"source changes key values, recover with `--reset-target-data` instead of re-running. "+
-			"To stop a broker without interrupting an incremental, use `sluice sync from-backup stop`, which takes effect "+
-			"between ticks. Cause: %v",
-		BrokerIncrementalPartialMarker, e.backupID, e.resumeFrom, e.cause,
+	head := fmt.Sprintf(
+		"broker: %s: the run was interrupted partway through incremental %s. The broker's position stands INSIDE it, at "+
+			"the last source transaction whose effects are durable on the target (the last incremental fully applied is "+
+			"%s), so the next run re-reads it, skips what is already applied and re-applies only the source transaction "+
+			"that was in flight (ADR-0191). ",
+		BrokerIncrementalPartialMarker, e.backupID, e.resumeFrom,
 	)
+	var body string
+	if e.identity {
+		body = "This incremental records the source's own change identities, so wherever the target holds apply marks " +
+			"(a run without them logs APPLY-MARKS-UNAVAILABLE) the changes of that transaction already applied are " +
+			"skipped and the rest applied once, key changes included: re-run the same command to finish it. "
+	} else {
+		body = "This incremental records no change identities (it was written before ADR-0191, or rewritten by smart " +
+			"compaction), so that one transaction is re-applied without apply marks. Every table the broker replays was " +
+			"judged to have a key the replayed rows carry and collide on (a table without one is refused before anything " +
+			"is applied), so re-applied inserts, and updates and deletes that keep each row's key, converge: re-run the " +
+			"same command to finish it. A transaction that CHANGED a row's key value is different: its re-run can fail on " +
+			"a duplicate key (MySQL 1062 / Postgres 23505) on every attempt, and when a key value was moved off one row " +
+			"and onto another inside that transaction, the re-run can apply a change to the wrong row without any error. " +
+			"If the source changes key values, recover with `--reset-target-data` instead of re-running. "
+	}
+	return head + body + "To stop a broker without interrupting an incremental, use `sluice sync from-backup stop`, which " +
+		"takes effect between ticks. Cause: " + fmt.Sprint(e.cause)
 }
 
 // BrokerColdStartPartialMarker is the grep-stable token on the error a

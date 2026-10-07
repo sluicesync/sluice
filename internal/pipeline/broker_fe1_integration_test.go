@@ -560,27 +560,62 @@ func TestFE1_Broker_SurrogateKeyedTarget_RefusedBeforeAnything(t *testing.T) {
 // TestFE1_Broker_KeyChangingIncremental_RerunRefusesLoudly binds the
 // BROKER-INCREMENTAL-PARTIAL recovery text (F-E1 second review) to the
 // broker end to end. Every source row is inserted and then moved to a new
-// key inside one incremental. A run interrupted after part of it committed
-// leaves moved rows on the target; the re-run re-applies the WHOLE
-// incremental, re-inserts a row the first run already moved, and its move
-// then collides with the moved copy. That must be a loud failure on every
-// re-run — never a silent convergence claim. A failed re-run is not
-// guaranteed to leave the target untouched: in the lane apply mode the
-// re-inserted row commits in one lane before its move collides in another
-// (measured: 1,002 rows for the source's 1,001 after the first re-run, the
-// same 1,002 after the second). So the pin is loud-every-time and stable
-// across re-runs, and the documented recovery is --reset-target-data.
+// key inside one incremental — ONE source transaction. A run interrupted
+// after part of it committed leaves moved rows on the target.
 //
-// The independent expected value is the target's own row count and key
-// checksum, read from Postgres before and after each re-run.
+// Since ADR-0191 the outcome depends on the chain, and both arms are pinned.
+// On a chain that records the reader's identities (what this binary writes)
+// the re-run resumes at that transaction's start and ADR-0190's marks skip
+// its committed changes — the moves included — so it CONVERGES to the source
+// (the identity arm; TestBroker_KeyReuseIncremental_Converges carries the
+// measured key-reuse shapes). On a chain WITHOUT identities (written before
+// ADR-0191, rewritten by smart compaction; simulated here by re-encoding the
+// chunks without them) the re-run re-applies the transaction unmarked,
+// re-inserts a row the first run already moved, and its move then collides
+// with the moved copy — loud on every re-run, never a silent convergence
+// claim. A failed re-run is not guaranteed to leave the target untouched: in
+// the lane apply mode the re-inserted row commits in one lane before its move
+// collides in another (measured: 1,002 rows for the source's 1,001). So that
+// arm's pin is loud-every-time and stable across re-runs, and the documented
+// recovery is --reset-target-data.
+//
+// The independent expected value is the SOURCE's own row count and key
+// checksum for the identity arm, and the target's before and after each
+// re-run for the no-identity arm.
 func TestFE1_Broker_KeyChangingIncremental_RerunRefusesLoudly(t *testing.T) {
 	c := fe1Setup(t, `
 		CREATE TABLE k (id INT PRIMARY KEY, note TEXT);
 		INSERT INTO k VALUES (-1, 'seed');
 	`, `INSERT INTO k VALUES (i, 'r'||i); UPDATE k SET id = id + 100000 WHERE id = i;`, nil)
+	state := func(dsn string) string {
+		return fe1Q(t, dsn, `SELECT count(*)::text || '/' || coalesce(sum(id), 0)::text FROM k`)
+	}
 
 	for _, mode := range fe1Modes {
-		t.Run(mode.name, func(t *testing.T) {
+		t.Run("identities/"+mode.name, func(t *testing.T) {
+			applyDDL(t, c.dst, `TRUNCATE k; INSERT INTO k VALUES (-1, 'seed');`)
+			streamID := "fe1-kci-" + mode.name
+			putBack := c.corruptMiddleChunk(t)
+			err1 := c.broker(streamID, mode.conc, c.fullID).Run(context.Background())
+			putBack()
+			if err1 == nil {
+				t.Fatal("run 1 over a corrupted chunk returned nil; the interrupted-incremental setup did not happen")
+			}
+			if moved := fe1Q(t, c.dst, `SELECT count(*)::text FROM k WHERE id >= 100000`); moved == "0" {
+				t.Fatalf("run 1 committed no key change (err %v); the re-run cell would be vacuous", err1)
+			}
+			if err := fe1RunToTailThenCancel(t, c, c.broker(streamID, mode.conc, "")); err != nil {
+				t.Fatalf("the re-run of a key-changing incremental that records identities failed: %v", err)
+			}
+			if got, want := state(c.dst), state(c.src); got != want {
+				t.Errorf("the re-run did not converge to the source: target rows/key-sum %s, source %s", got, want)
+			}
+		})
+	}
+
+	stripChainIdentities(t, c)
+	for _, mode := range fe1Modes {
+		t.Run("no identities/"+mode.name, func(t *testing.T) {
 			applyDDL(t, c.dst, `TRUNCATE k; INSERT INTO k VALUES (-1, 'seed');`)
 			streamID := "fe1-kc-" + mode.name
 			putBack := c.corruptMiddleChunk(t)
@@ -593,10 +628,10 @@ func TestFE1_Broker_KeyChangingIncremental_RerunRefusesLoudly(t *testing.T) {
 			if moved == "0" {
 				t.Fatalf("run 1 committed no key change (err %v); the re-run cell would be vacuous", err1)
 			}
-			state := func() string {
+			targetState := func() string {
 				return fe1Q(t, c.dst, `SELECT count(*)::text || '/' || coalesce(sum(id), 0)::text FROM k`)
 			}
-			afterRun1 := state()
+			afterRun1 := targetState()
 			afterRerun := make([]string, 3)
 
 			for rerun := 1; rerun <= 2; rerun++ {
@@ -609,7 +644,7 @@ func TestFE1_Broker_KeyChangingIncremental_RerunRefusesLoudly(t *testing.T) {
 				if !strings.Contains(err.Error(), "23505") {
 					t.Errorf("re-run %d failed, but not on the key the moved rows collide on: %v", rerun, err)
 				}
-				afterRerun[rerun] = state()
+				afterRerun[rerun] = targetState()
 			}
 			t.Logf("target rows/key-sum: after the interrupted run %s, after re-run 1 %s, after re-run 2 %s",
 				afterRun1, afterRerun[1], afterRerun[2])
@@ -619,10 +654,60 @@ func TestFE1_Broker_KeyChangingIncremental_RerunRefusesLoudly(t *testing.T) {
 			if afterRerun[2] != afterRerun[1] {
 				t.Errorf("the second failed re-run changed the target again (%s → %s): re-runs are not stable", afterRerun[1], afterRerun[2])
 			}
-			if n := fe1Q(t, c.dst, fmt.Sprintf(`SELECT count(*)::text FROM sluice_cdc_state WHERE stream_id = '%s' AND source_position LIKE '%%%s%%'`,
-				streamID, lineage.ManifestBackupID(c.incr.Manifest))); n != "0" {
-				t.Errorf("a failed re-run advanced the position past the key-changing incremental")
+			pos := fe1Q(t, c.dst, fmt.Sprintf(`SELECT coalesce(string_agg(source_position, ','), '') FROM sluice_cdc_state WHERE stream_id = '%s'`, streamID))
+			if tok, err := decodeBrokerPosition(ir.Position{Token: pos}); err != nil || tok.LastAppliedBackupID == lineage.ManifestBackupID(c.incr.Manifest) {
+				t.Errorf("a failed re-run advanced the position past the key-changing incremental: %q (%v)", pos, err)
 			}
 		})
+	}
+}
+
+// stripChainIdentities rewrites the data incremental as an older sluice (or
+// smart compaction) leaves it: the same changes, with no `aid` on any of them
+// and no ApplyIdentity on the manifest. The chunks keep their paths; their
+// SHAs move, and the manifest is rewritten in place with the new ones.
+func stripChainIdentities(t *testing.T, c *fe1Chain) {
+	t.Helper()
+	ctx := context.Background()
+	seg := c.incr.Segment.Store(c.store)
+	m := c.incr.Manifest
+	for idx, chunk := range m.ChangeChunks {
+		src, err := blobcodec.FetchChunkVerified(ctx, seg, chunk.File, chunk.SHA256)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cr, err := blobcodec.NewChangeChunkReader(src, chunk.SHA256, nil, c.incr.Segment.CodecOrDefault(), irbackup.ChangeChunkAADFor(m, chunk, idx))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var buf bytes.Buffer
+		cw, err := blobcodec.NewChangeChunkWriter(&buf, nil, c.incr.Segment.CodecOrDefault(), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for {
+			ch, err := cr.ReadChange()
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := cw.WriteChange(ir.WithoutApplyID(ch)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		_ = cr.Close()
+		if err := cw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := seg.Put(ctx, chunk.File, bytes.NewReader(buf.Bytes())); err != nil {
+			t.Fatal(err)
+		}
+		chunk.SHA256 = cw.Hash()
+	}
+	m.ApplyIdentity = false
+	if err := lineage.WriteManifestAt(ctx, seg, c.incr.Path, m); err != nil {
+		t.Fatal(err)
 	}
 }
