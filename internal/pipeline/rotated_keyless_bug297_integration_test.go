@@ -313,10 +313,14 @@ func runBug297(t *testing.T, side r297Side) {
 		t.Fatal(err)
 	}
 	full := side.seed(t, fresh, eng, src)
+	// Bounded: a stream that is NOT refused runs until cancelled, and this
+	// must fail rather than hang when the door is missing.
+	startCtx, cancelStart := context.WithTimeout(ctx, 20*time.Second)
+	defer cancelStart()
 	serr := (&BackupStream{
 		Source: eng, SourceDSN: src, Store: fresh, ParentRef: full.BackupID,
 		RolloverWindow: time.Second, RetainRotateAtChainLength: 1, SluiceVersion: "test",
-	}).Run(ctx)
+	}).Run(startCtx)
 	r297AssertCode(t, "backup stream start", serr, `"kl"`, "Nothing has been written")
 	recs, _ := lineage.ListAllManifestsViaWalk(ctx, fresh)
 	if len(recs) != 1 {
