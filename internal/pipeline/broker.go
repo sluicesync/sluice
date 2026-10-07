@@ -863,6 +863,16 @@ func (b *SyncFromBackup) coldStartReset(ctx context.Context, applier ir.ChangeAp
 		return "", fmt.Errorf("broker: --reset-target-data: %w", err)
 	}
 
+	// ADR-0191 §3.4 (2): the target is about to be rebuilt from the chain,
+	// so no apply mark this stream holds can vouch for anything any more —
+	// and the broker's changes carry the reader's identities, so a stale
+	// mark naming a transaction a later incremental delivered first would be
+	// trusted. Cleared before anything is dropped or applied (the chain
+	// restore below clears its own stream's marks the same way).
+	if err := migcore.ClearReplayApplyMarks(ctx, applier, b.StreamID); err != nil {
+		return "", migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("broker: --reset-target-data: %w", err))
+	}
+
 	// Bug 40a fix: drop pre-existing target tables that match the
 	// chain's terminal schema. ChainRestore's CREATE TABLE IF NOT
 	// EXISTS would otherwise no-op against stale-schema tables and
@@ -954,6 +964,12 @@ func (b *SyncFromBackup) coldStartAtChainID(ctx context.Context, applier ir.Chan
 			"broker: --at-chain-id=%q not found in chain (available: %s)",
 			b.AtChainID, strings.Join(ids, ", "),
 		)
+	}
+	// ADR-0191 §3.4 (2): the operator asserts the target's state; no apply
+	// mark this stream holds was written against it, so none may vouch for a
+	// change the next incremental delivers.
+	if err := migcore.ClearReplayApplyMarks(ctx, applier, b.StreamID); err != nil {
+		return "", migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("broker: --at-chain-id: %w", err))
 	}
 	if err := b.writePositionDirect(ctx, applier, b.AtChainID); err != nil {
 		return "", fmt.Errorf("broker: record at-chain-id position: %w", err)
