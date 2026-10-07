@@ -135,16 +135,26 @@ segment full, and a chain restore applies every segment full after the
 first over the rows the earlier segments already restored. A table with
 no `PRIMARY KEY` and no `NOT NULL UNIQUE` index cannot be re-written that
 way, so with either rotation flag set `backup stream run` refuses to
-start while the source holds such a table
+start a new chain while the source holds such a table
 (`SLUICE-E-BACKUP-ROTATED-KEYLESS-TABLE`, exit 3, nothing written). A
 rotation full has no `--exclude-table` of its own, so the remedy is a
-key on the source table or a stream without rotation. A keyless table
-that appears (or loses its key) after the stream started stops rotation
-instead: each rotation is refused with the same code in the log and the
-stream keeps writing its open segment, which stays restorable; rotation
-resumes once the table has a key. Chains written by v0.156.12 and
-earlier can carry such a table — `backup verify` and `restore` name it,
-and Step 4 covers restoring the rest.
+key on the source table, added before the chain's first full, or a
+stream without rotation. A stream continuing an existing chain is not
+stopped: it logs a `ROTATION-KEYLESS-TABLE` WARN and runs with rotation
+suspended. A keyless table that appears (or loses its key) after the
+stream started stops rotation the same way: each rotation is refused
+with the code in the log, retried at every rollover, and the stream
+keeps writing its open segment, which grows until the table has a key.
+
+**Which key you add mid-chain matters.** A `NOT NULL UNIQUE` index is a
+schema change the chain replays, so rotation resumes and the chain
+restores. `ALTER TABLE … ADD PRIMARY KEY` is one replay cannot apply:
+from that change on the chain is unrestorable, and `restore` and
+`backup verify` refuse it up front with
+`SLUICE-E-BACKUP-SCHEMA-DELTA-UNSUPPORTED`. After an `ADD PRIMARY KEY`,
+take a new full into a new location. Chains written by v0.156.12 and
+earlier can carry a keyless table in a later full — `backup verify` and
+`restore` name it, and Step 4 covers restoring the rest.
 
 `sluice backup prune --keep-incrementals N` retires older WHOLE
 segments while preserving the chain root's restorability. Retention is

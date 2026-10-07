@@ -914,7 +914,7 @@ func (b *BackupStream) newRolloverLoop(ctx context.Context) (*rolloverInit, erro
 	// apply whole — a later segment full re-written over a keyless table.
 	// Judged over the scope a rotation full reads, before the pump opens.
 	if (b.RetainRotateAt > 0 || b.RetainRotateAtChainLength > 0) && !b.legacyKeylessRotation {
-		if err := backup.PreflightRotationKeyless(ctx, b.Source, b.SourceDSN); err != nil {
+		if err := b.preflightRotationKeyless(ctx, parent); err != nil {
 			return nil, err
 		}
 	}

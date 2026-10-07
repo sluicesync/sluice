@@ -76,6 +76,7 @@ func TestChainRestorePreTargetDoorRoster(t *testing.T) {
 		"checkMixedModeChain",
 		"restoreManifestIntegrityPreflights",
 		"verifyChainSignatures",
+		"refuseUnreplayableDeltas",     // Bug 297 review: refused alter deltas, up front
 		"refuseRotatedKeylessRecorded", // Bug 297, the manifest-only half
 		"refuseSeveredTransactions",
 	}

@@ -29,6 +29,7 @@ func TestTableReplayIdempotentCallerRoster(t *testing.T) {
 		"internal/ir/backup/replay_judge.go:JudgeReplayKey":                        "the combined predicate (recorded half)",
 		"internal/ir/backup/replay_judge.go:Judge":                                 "ReplayKeyCache.Judge, the combined predicate memoised (recorded half)",
 		"internal/pipeline/backup/backup.go:refuseKeylessRestreamOnAnchoredResume": "backup time: no target exists to judge; the overlap it guards reaches a target only through restore/broker, whose doors judge it (gap filed: F-E1-ROTATED-SEGMENT-OVERLAP)",
+		"internal/pipeline/backup/rotated_keyless_door.go:projectedKeySupplied":    "the TARGET half of JudgeReplayKey for the chain projection: it is chainTargetProjection.ProbeReplayKey's body, judging the table the chain's own replay leaves on the target (a projected target, not the recorded one) plus the supplied-column check",
 		"internal/pipeline/backup/restore.go:restoreChunkGroup":                    "a REFUSAL-only belt (Bug 297) mirroring the idempotent writer's own recorded-keyless refusal on the DataOnly path; it never licenses a write, and the target half is judged up front by ChainRestore.refuseRotatedKeylessTarget through JudgeReplayKey",
 	}
 	root := filepath.Join("..", "..", "..")

@@ -66,6 +66,7 @@ import (
 	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 const (
@@ -196,6 +197,54 @@ type rotateResult struct {
 	// compactable. The overlap re-applies idempotently on restore.
 	priorEnd  ir.Position
 	changesCh <-chan ir.Change
+}
+
+// preflightRotationKeyless is the Bug 297 start door, scoped by whether the
+// chain already exists.
+//
+// A NEW chain (its parent is the seed full and it has never rotated) is
+// refused outright: nothing is running yet, and refusing costs nothing.
+//
+// An EXISTING chain — a stream restarted after an upgrade, or after any stop
+// — is not: refusing would stop a running backup at its next restart and, on
+// Postgres, leave its replication slot pinning WAL until someone noticed.
+// That is worse than what refusing protects against, because the
+// per-rotation door already does the protecting: every rotation over a
+// keyless table is refused before its full is written and the stream stays
+// on its open segment, so it adds no later full the read side would refuse.
+// Nothing silent is opened: whatever the chain already holds is judged by
+// restore and `backup verify` up front. So the existing chain gets a loud,
+// grep-stable WARN (ROTATION-KEYLESS-TABLE, with the code) naming the tables
+// and saying rotation is suspended — and, when the chain ALREADY carries a
+// later full restore will refuse, it says that too.
+func (b *BackupStream) preflightRotationKeyless(ctx context.Context, parent *irbackup.Manifest) error {
+	err := backup.PreflightRotationKeyless(ctx, b.Source, b.SourceDSN)
+	if err == nil || !b.chainHasHistory(ctx, parent) {
+		return err
+	}
+	if _, coded := sluicecode.FromError(err); !coded {
+		return err // a schema-read failure, not the keyless verdict
+	}
+	attrs := append([]any{slog.String("err", err.Error())}, sluicecode.Attrs(err)...)
+	if existing := backup.CheckRotatedKeylessChain(ctx, b.Store); existing != nil {
+		attrs = append(attrs, slog.String("existing_chain", existing.Error()))
+	}
+	slog.WarnContext(ctx, "stream: ROTATION-KEYLESS-TABLE: rotation is enabled but a table it would back up has no key; "+
+		"continuing this EXISTING chain with every rotation suspended (each is refused and the stream stays on its open "+
+		"segment) until the table has a key — add a NOT NULL UNIQUE index (an ADD PRIMARY KEY mid-chain makes the chain "+
+		"unrestorable from that point), or take a new full into a new location", attrs...)
+	return nil
+}
+
+// chainHasHistory reports whether the stream is extending an existing chain
+// rather than starting one: its parent is an incremental, or the lineage has
+// already rotated.
+func (b *BackupStream) chainHasHistory(ctx context.Context, parent *irbackup.Manifest) bool {
+	if parent != nil && lineage.CanonicalKind(parent.Kind) == irbackup.BackupKindIncremental {
+		return true
+	}
+	cat, ok, err := lineage.LoadLineageCatalog(ctx, b.Store)
+	return err == nil && ok && len(cat.Segments) > 1
 }
 
 // shouldRotate returns a non-empty rotation reason when a threshold

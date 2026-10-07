@@ -381,38 +381,45 @@ func TestVerifyBackupScanRunsTheSeveredDoor(t *testing.T) {
 // (rotated_keyless_door.go).
 func verifyScanReaches(t *testing.T, target string) bool {
 	t.Helper()
-	calls := func(file, fn string) map[string]bool {
-		src, err := os.ReadFile(file)
-		if err != nil {
-			t.Fatal(err)
-		}
-		f, err := parser.ParseFile(token.NewFileSet(), file, src, 0)
-		if err != nil {
-			t.Fatal(err)
-		}
-		out := map[string]bool{}
-		ast.Inspect(f, func(n ast.Node) bool {
-			fd, ok := n.(*ast.FuncDecl)
-			if !ok || fd.Name.Name != fn {
-				return true
-			}
-			ast.Inspect(fd.Body, func(m ast.Node) bool {
-				if call, ok := m.(*ast.CallExpr); ok {
-					if id, ok := call.Fun.(*ast.Ident); ok {
-						out[id.Name] = true
-					}
-				}
-				return true
-			})
-			return false
-		})
-		return out
-	}
-	direct := calls("restore.go", "verifyBackupScan")
+	direct := funcCallsIn(t, "restore.go", "verifyBackupScan")
 	if direct[target] {
 		return true
 	}
-	return direct["verifyChainShapeRefusals"] && calls("rotated_keyless_door.go", "verifyChainShapeRefusals")[target]
+	return direct["verifyChainShapeRefusals"] && funcCallsIn(t, "rotated_keyless_door.go", "verifyChainShapeRefusals")[target]
+}
+
+// funcCallsIn returns the names of the plain-identifier and method calls in
+// the body of function or method fn declared in file (this package).
+func funcCallsIn(t *testing.T, file, fn string) map[string]bool {
+	t.Helper()
+	src, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := parser.ParseFile(token.NewFileSet(), file, src, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]bool{}
+	ast.Inspect(f, func(n ast.Node) bool {
+		fd, ok := n.(*ast.FuncDecl)
+		if !ok || fd.Name.Name != fn {
+			return true
+		}
+		ast.Inspect(fd.Body, func(m ast.Node) bool {
+			if call, ok := m.(*ast.CallExpr); ok {
+				switch f := call.Fun.(type) {
+				case *ast.Ident:
+					out[f.Name] = true
+				case *ast.SelectorExpr:
+					out[f.Sel.Name] = true
+				}
+			}
+			return true
+		})
+		return false
+	})
+	return out
 }
 
 // sevWithFill marks a link as carrying an ADD COLUMN fill (v0.156.1+): the

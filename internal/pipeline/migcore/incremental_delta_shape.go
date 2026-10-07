@@ -812,6 +812,11 @@ func ApplyAlterDelta(ctx context.Context, sw ir.SchemaWriter, d *irbackup.Schema
 	if res.Equal() {
 		return nil
 	}
+	// Refuse BEFORE emitting any aspect's DDL: a delta whose third aspect is
+	// refused must not leave its first two applied.
+	if err := PreflightAlterDelta(d, ac); err != nil {
+		return err
+	}
 	// Retarget the after-shape so cross-engine column types (UUID →
 	// CHAR(36) etc.) are rewritten before any emit. Same call both
 	// replay sites already made for the ADD COLUMN path.
@@ -847,6 +852,31 @@ func ApplyAlterDelta(ctx context.Context, sw ir.SchemaWriter, d *irbackup.Schema
 			if err := applyAlterAspect(ctx, aspect, res, retargeted, d, deltaApplier, shapeApplier, ac); err != nil {
 				return err
 			}
+		}
+	}
+	return nil
+}
+
+// PreflightAlterDelta returns the coded refusal [ApplyAlterDelta] would
+// return for d, or nil, without touching any target: the same
+// classification and the same disposition table. Replay sites call it over
+// every delta of a chain BEFORE writing anything, so a chain carrying a
+// delta with no faithful replay (an ADD PRIMARY KEY, a dropped column, an
+// added CHECK, …) is refused up front instead of after the earlier links
+// have landed (Bug 297 review, 2026-10-07: restore wrote 11 of 51 rows
+// before refusing a primary-key delta).
+func PreflightAlterDelta(d *irbackup.SchemaDeltaEntry, ac AlterDeltaContext) error {
+	if d == nil {
+		return nil
+	}
+	for _, aspect := range ClassifyAlterDelta(d.Before, d.After).Aspects {
+		verdict, reason, known := DispositionOf(aspect)
+		if !known {
+			return alterDeltaRefusal(ac, d.Table, aspect,
+				"this sluice build has no disposition for the aspect (development gap)")
+		}
+		if verdict == AlterRefuse {
+			return alterDeltaRefusal(ac, d.Table, aspect, reason)
 		}
 	}
 	return nil

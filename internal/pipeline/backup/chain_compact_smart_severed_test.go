@@ -109,8 +109,17 @@ func markFillOnFirstIncrementals(t *testing.T, store irbackup.Store) {
 			if err != nil {
 				continue
 			}
+			// Before/After carry the ADD COLUMN the fill belongs to, as a real
+			// capture lane records it: restore's up-front delta preflight
+			// (refuseUnreplayableDeltas) refuses a shapeless alter delta, as
+			// the replay itself would.
+			before := &ir.Table{Schema: "public", Name: "users", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}}
+			after := &ir.Table{Schema: "public", Name: "users", Columns: []*ir.Column{
+				{Name: "id", Type: ir.Integer{Width: 64}}, {Name: "extra", Type: ir.Integer{Width: 64}, Nullable: true},
+			}}
 			m.SchemaDelta = []*irbackup.SchemaDeltaEntry{{
 				Kind: irbackup.SchemaDeltaAlterTable, Schema: "public", Table: "users",
+				Before: before, After: after,
 				AddColumnFill: &irbackup.AddColumnFill{Columns: []string{"extra"}, Rows: 1},
 			}}
 			if err := lineage.WriteManifestAt(ctx, seg, p, m); err != nil {

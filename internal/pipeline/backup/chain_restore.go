@@ -690,6 +690,12 @@ func (r *ChainRestore) applyFull(ctx context.Context, full *lineage.SegmentRecor
 	if err := blobcodec.ValidateRecordedCodec(full.Segment.Codec); err != nil {
 		return err
 	}
+	if dataOnly {
+		// Bug 297, judgment 3: the live target, right before the re-write.
+		if err := r.refuseDataOnlyFullOnTarget(ctx, full); err != nil {
+			return err
+		}
+	}
 	rest := &Restore{
 		Target:             r.Target,
 		TargetDSN:          r.TargetDSN,
@@ -1875,6 +1881,11 @@ func (r *ChainRestore) preflightBeforeTarget(
 	//      first segment had landed. A manifest-only judgment, so it sits in
 	//      the shared list the broker runs before its drop; the TARGET half
 	//      asks about target state and runs in Run.
+	//      2.84 first: the projection 2.85 judges assumes every recorded
+	//      delta replays, which is what 2.84 proves (or refuses).
+	if err := refuseUnreplayableDeltas(links, r.Filter, "chain restore"); err != nil {
+		return err
+	}
 	if err := refuseRotatedKeylessRecorded(ctx, links, r.Filter, "chain restore"); err != nil {
 		return err
 	}
