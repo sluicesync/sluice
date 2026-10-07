@@ -364,6 +364,15 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 	if err := applier.EnsureControlTable(ctx); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf("chain restore: ensure control table: %w", err))
 	}
+	// ADR-0191 §3.4 (2), §13 R9: the incrementals' changes carry the
+	// reader's identities, so the applier writes and trusts apply marks under
+	// ChainRestoreStreamID. A restore starts over from the full every time,
+	// so a mark a failed earlier attempt left behind must never vouch for a
+	// change this run replays — the full may have put back exactly the row
+	// that marked change moved away.
+	if err := migcore.ClearReplayApplyMarks(ctx, applier, ChainRestoreStreamID); err != nil {
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("chain restore: %w", err))
+	}
 
 	batchSize := r.ApplyBatchSize
 	if batchSize <= 0 {

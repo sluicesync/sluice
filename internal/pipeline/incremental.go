@@ -399,6 +399,8 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 	}
 
 	manifest := b.newInProgressManifest(now, beforeSchema, beforeHash, startPos, parent)
+	// ADR-0191: the chunks record the reader's identities (`aid`).
+	manifest.ApplyIdentity = readerStampsApplyIdentity(cdc)
 
 	// Phase 6.1: align this incremental's encryption with the chain
 	// root. The parent full's [irbackup.ChainEncryption] dictates the chain's

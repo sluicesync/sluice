@@ -1075,6 +1075,30 @@ type Manifest struct {
 	// TestSchemaHistoryAnchorHasNoRestoreSideConsumer in internal/pipeline.
 	CDCPositionCommitsAfterRows bool `json:"cdc_position_commits_after_rows,omitempty"`
 
+	// ApplyIdentity records that this incremental's change chunks carry the
+	// reader's ADR-0190 identity (`aid`) on every row change the reader
+	// could name (ADR-0191 §3.1): set by the capture lanes iff the CDC reader
+	// declares [ir.ApplyIdentityProvider], carried by naive compaction,
+	// CLEARED by smart compaction on every incremental it rewrites (whose
+	// collapsed events it strips). False — the zero value, and what every
+	// manifest written before ADR-0191 decodes to — means "no identity":
+	// `sync from-backup` then keeps refusing a keyless table the incremental
+	// touches.
+	//
+	// It is what lets the broker tell "this incremental has no identity"
+	// from "this change happened to carry none" (a VStream COPY row or an
+	// interleaved shard group), so a keyless refusal can be decided before
+	// anything of the incremental is applied. ADDITIVE, no FormatVersion
+	// bump (ADR-0191 Q2): older binaries ignore it.
+	//
+	// NOT in the signed canonical bytes, deliberately (ADR-0191 §13 R3): a
+	// new canon version would make every older binary refuse every signed
+	// new chain. It needs no binding of its own because it only gates a
+	// LIFT, and the lift is backed change by change by the `aid` inside
+	// SHA-verified (and signed) chunks: forged true over chunks without
+	// identities, a keyless change refuses; forged false, the refusal stays.
+	ApplyIdentity bool `json:"apply_identity,omitempty"`
+
 	// Redaction, when non-nil, records that the rows in this manifest's
 	// chunks were written through an operator-configured PII redaction
 	// policy (`backup full --redact`). Nil — the zero default — means

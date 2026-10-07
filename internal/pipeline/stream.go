@@ -1548,6 +1548,8 @@ func (b *BackupStream) runRollover(
 		// their rows (VStream), so restore knows a schema anchor at
 		// EndPosition cannot prove the window's data was applied.
 		CDCPositionCommitsAfterRows: b.Source.Capabilities().CDCPositionCommitsAfterRows,
+		// ADR-0191: the chunks record the reader's identities (`aid`).
+		ApplyIdentity: readerStampsApplyIdentity(cdc),
 	}
 	if manifest.ParentBackupID == "" {
 		manifest.ParentBackupID = irbackup.ComputeBackupID(parent)
@@ -2365,6 +2367,18 @@ func (cb *changeChunkBuffer) processChange(ctx context.Context, change ir.Change
 		return true, nil
 	}
 	return false, nil
+}
+
+// readerStampsApplyIdentity reports whether the capture's CDC reader declares
+// [ir.ApplyIdentityProvider] — the condition for stamping
+// [irbackup.Manifest.ApplyIdentity] on the incremental it writes (ADR-0191
+// §3.1). The chunks record whatever identity each change carries either way;
+// the flag is what tells a replay that a ZERO identity on one of them is a
+// gap in the reader's naming (a VStream COPY row) rather than a chain written
+// before identities were recorded.
+func readerStampsApplyIdentity(cdc ir.CDCReader) bool {
+	p, ok := cdc.(ir.ApplyIdentityProvider)
+	return ok && p.StampsApplyIdentity()
 }
 
 // openCDCReaderWithSlot is the [BackupStream]/[IncrementalBackup]-

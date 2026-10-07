@@ -123,6 +123,13 @@ var canonExempt = map[string]string{
 		"here rather than added to the canon because canon v5 is an ON-DISK CONTRACT: a new token in it would " +
 		"invalidate every v5 signature already in the field, to bind a field whose transitive binding is already exact.",
 
+	"Manifest.ApplyIdentity": "gates only a LIFT of `sync from-backup`'s keyless refusal (ADR-0191 §3.5), and the lift " +
+		"is backed change by change by the `aid` each row change carries inside this manifest's change chunks, whose " +
+		"list, SHA and order are folded here. Forged true over chunks that carry no identity, the broker reaches a " +
+		"keyless change with a zero identity and refuses (BROKER-KEYLESS-NO-IDENTITY); forged false, the refusal stays. " +
+		"Loud both ways. Left out of the canon because a new canon version would make every older binary refuse every " +
+		"signed new chain (ErrUnsupportedCanonVersion), which is the format break ADR-0191 Q2 ruled out (§13 R3).",
+
 	"SchemaDeltaEntry.AddColumnFill": "an advisory, not a replay input. The fill's VALUES ride this manifest's own change " +
 		"chunks, whose list, SHA and order are folded here, so they are exactly as authentic as every other change. The " +
 		"record only tells the restore-side ADD-COLUMN-FILL-NOT-REPRODUCIBLE WARN (migcore.warnUnreproducibleAddColumnFill) " +
@@ -247,6 +254,7 @@ func TestCanonicalManifestBytes_ExemptFieldsStayInvisible(t *testing.T) {
 		"Manifest.PartialState":                func(m *Manifest) { m.PartialState = BackupStateInProgress },
 		"Manifest.ProgressSidecar":             func(m *Manifest) { m.ProgressSidecar = &ProgressSidecarRef{File: "p.jsonl", AttemptID: "a"} },
 		"Manifest.CDCPositionCommitsAfterRows": func(m *Manifest) { m.CDCPositionCommitsAfterRows = true },
+		"Manifest.ApplyIdentity":               func(m *Manifest) { m.ApplyIdentity = true },
 		"Manifest.Redaction":                   func(m *Manifest) { m.Redaction = &RedactionInfo{RuleCount: 1, Fingerprint: "0123456789abcdef"} },
 		"SchemaDeltaEntry.AddColumnFill": func(m *Manifest) {
 			m.SchemaDelta[0].AddColumnFill = &AddColumnFill{Columns: []string{"c"}, Rows: 3}

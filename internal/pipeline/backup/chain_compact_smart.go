@@ -1709,6 +1709,12 @@ func applySmartCompactionToIncrementalSized(
 	if chunkBudget == 0 {
 		chunkBudget = DefaultBackupChunkBytes
 	}
+	// ADR-0191 Q9: every event this rewrite emits loses its identity
+	// (chunkStreamSink.emit), so the manifest stops claiming any. A replay of
+	// the rewritten incremental therefore keeps refusing a keyless table it
+	// touches, and a broker that had applied part of the original refuses the
+	// rewrite outright (BROKER-INCREMENTAL-REWRITTEN, the chunk digest).
+	im.ApplyIdentity = false
 
 	// Step 1: decode every chunk in order, feeding the compactor — which now
 	// streams its output straight back into the chunk slots as it goes,
@@ -1972,7 +1978,12 @@ func (k *chunkStreamSink) emit(c ir.Change) error {
 	}
 	file := k.im.ChangeChunks[k.slot].File
 	before := k.w.BytesWritten()
-	if err := k.w.WriteChange(c); err != nil {
+	// ADR-0191 Q9: a rewritten incremental carries no apply identities. A
+	// collapsed event folds several source changes into one, so whichever
+	// identity it kept would name a change it no longer is; the conservative
+	// rule strips them all, and applySmartCompactionToIncrementalSized clears
+	// the manifest's ApplyIdentity with them.
+	if err := k.w.WriteChange(ir.WithoutApplyID(c)); err != nil {
 		if errors.Is(err, blobcodec.ErrChunkLineTooLong) {
 			// Collapsing merges after-images as a UNION of their columns (see
 			// [mergeAfterImage]), so a collapsed event can serialize larger

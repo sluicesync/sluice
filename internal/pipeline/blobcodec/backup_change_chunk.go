@@ -18,8 +18,12 @@ package blobcodec
 //   line 1: {"_t":"insert","schema":"public","table":"users",
 //            "row":{...},"position":{"engine":"postgres","token":"..."}}
 //   line 2: {"_t":"update","schema":"public","table":"users",
-//            "before":{...},"after":{...},"position":{...}}
+//            "before":{...},"after":{...},"position":{...},
+//            "aid":{"t":"<source transaction id>","s":<ordinal>}}
 //   line N: {"_t":"tx_commit","position":{...}}
+//
+// `aid` (ADR-0191) is the reader's ADR-0190 identity of a row change,
+// present only when the reader stamped one.
 //
 // Row maps reuse the encodeValue / decodeValue helpers from the
 // existing chunk codec so wide values (bytes, time, int64, etc.)
@@ -35,6 +39,7 @@ import (
 	"hash"
 	"io"
 	"strings"
+	"unicode/utf8"
 
 	"sluicesync.dev/sluice/internal/crypto"
 	"sluicesync.dev/sluice/internal/ir"
@@ -576,6 +581,52 @@ type changeWire struct {
 	Before   map[string]json.RawMessage `json:"before,omitempty"`
 	After    map[string]json.RawMessage `json:"after,omitempty"`
 	Position ir.Position                `json:"position"`
+
+	// AID is the reader's [ir.ApplyID] (ADR-0191 §3.1), recorded on an
+	// insert, update or delete whose reader stamped one and absent
+	// otherwise. ADDITIVE: an older binary decodes a record with plain
+	// json.Unmarshal into a struct without this field, which ignores it, so
+	// a chain carrying it still replays there (with no identity).
+	AID *changeAID `json:"aid,omitempty"`
+}
+
+// changeAID is the on-wire identity. Seq is a uint64 STRUCT field, so
+// encoding/json parses its digits straight into the integer — never through
+// a float64 (the Bug 172 trap) — and an ordinal above 2^53 round-trips exact.
+// TxID must be valid UTF-8 (encodeChange refuses otherwise): encoding/json
+// would write any other byte as U+FFFD, and a re-read identity that differs
+// from the reader's is exactly the drift the apply marks must never see.
+type changeAID struct {
+	TxID string `json:"t"`
+	Seq  uint64 `json:"s"`
+}
+
+// ErrApplyIDNotUTF8 refuses an identity encoding/json cannot carry byte-exact.
+var ErrApplyIDNotUTF8 = errors.New("change chunk: apply identity is not valid UTF-8")
+
+// encodeAID returns the wire identity of a row change, nil for none.
+func encodeAID(id ir.ApplyID) (*changeAID, error) {
+	if id.IsZero() {
+		return nil, nil
+	}
+	if !utf8.ValidString(id.TxID) {
+		return nil, fmt.Errorf("%w: transaction id %q", ErrApplyIDNotUTF8, id.TxID)
+	}
+	return &changeAID{TxID: id.TxID, Seq: id.Seq}, nil
+}
+
+// decodeAID is encodeAID's inverse. A record carrying an `aid` with an empty
+// transaction id is refused rather than read as "no identity": no writer
+// produces it, so it is corruption or a writer bug, and silently dropping it
+// would replay a change the chain says it can identify as if it could not.
+func decodeAID(w *changeWire) (ir.ApplyID, error) {
+	if w.AID == nil {
+		return ir.ApplyID{}, nil
+	}
+	if w.AID.TxID == "" {
+		return ir.ApplyID{}, fmt.Errorf("decode change: %s record carries an apply identity with an empty transaction id", w.Kind)
+	}
+	return ir.ApplyID{TxID: w.AID.TxID, Seq: w.AID.Seq}, nil
 }
 
 const (
@@ -600,12 +651,17 @@ func encodeChange(c ir.Change) (*changeWire, error) {
 		if err != nil {
 			return nil, changeTableErr(x.Schema, x.Table, err)
 		}
+		aid, err := encodeAID(x.ApplyID)
+		if err != nil {
+			return nil, changeTableErr(x.Schema, x.Table, err)
+		}
 		return &changeWire{
 			Kind:     changeKindInsert,
 			Schema:   x.Schema,
 			Table:    x.Table,
 			Row:      row,
 			Position: x.Position,
+			AID:      aid,
 		}, nil
 	case ir.Update:
 		before, err := encodeRowValues(x.Before, "before-image")
@@ -616,6 +672,10 @@ func encodeChange(c ir.Change) (*changeWire, error) {
 		if err != nil {
 			return nil, changeTableErr(x.Schema, x.Table, err)
 		}
+		aid, err := encodeAID(x.ApplyID)
+		if err != nil {
+			return nil, changeTableErr(x.Schema, x.Table, err)
+		}
 		return &changeWire{
 			Kind:     changeKindUpdate,
 			Schema:   x.Schema,
@@ -623,9 +683,14 @@ func encodeChange(c ir.Change) (*changeWire, error) {
 			Before:   before,
 			After:    after,
 			Position: x.Position,
+			AID:      aid,
 		}, nil
 	case ir.Delete:
 		before, err := encodeRowValues(x.Before, "before-image")
+		if err != nil {
+			return nil, changeTableErr(x.Schema, x.Table, err)
+		}
+		aid, err := encodeAID(x.ApplyID)
 		if err != nil {
 			return nil, changeTableErr(x.Schema, x.Table, err)
 		}
@@ -635,6 +700,7 @@ func encodeChange(c ir.Change) (*changeWire, error) {
 			Table:    x.Table,
 			Before:   before,
 			Position: x.Position,
+			AID:      aid,
 		}, nil
 	case ir.Truncate:
 		return &changeWire{
@@ -660,6 +726,19 @@ func decodeChange(w *changeWire, numbersExact bool) (ir.Change, error) {
 	if w == nil {
 		return nil, errors.New("decode change: nil wire")
 	}
+	// Only a row change carries an identity (ir.ApplyIDOf); one on any other
+	// kind is no writer's output, so it is refused rather than dropped.
+	switch w.Kind {
+	case changeKindInsert, changeKindUpdate, changeKindDelete:
+	default:
+		if w.AID != nil {
+			return nil, fmt.Errorf("decode change: a %q record carries an apply identity; only insert, update and delete records do", w.Kind)
+		}
+	}
+	id, err := decodeAID(w)
+	if err != nil {
+		return nil, err
+	}
 	switch w.Kind {
 	case changeKindInsert:
 		row, err := decodeRowValues(w.Row, numbersExact)
@@ -671,6 +750,7 @@ func decodeChange(w *changeWire, numbersExact bool) (ir.Change, error) {
 			Schema:   w.Schema,
 			Table:    w.Table,
 			Row:      row,
+			ApplyID:  id,
 		}, nil
 	case changeKindUpdate:
 		before, err := decodeRowValues(w.Before, numbersExact)
@@ -687,6 +767,7 @@ func decodeChange(w *changeWire, numbersExact bool) (ir.Change, error) {
 			Table:    w.Table,
 			Before:   before,
 			After:    after,
+			ApplyID:  id,
 		}, nil
 	case changeKindDelete:
 		before, err := decodeRowValues(w.Before, numbersExact)
@@ -698,6 +779,7 @@ func decodeChange(w *changeWire, numbersExact bool) (ir.Change, error) {
 			Schema:   w.Schema,
 			Table:    w.Table,
 			Before:   before,
+			ApplyID:  id,
 		}, nil
 	case changeKindTruncate:
 		return ir.Truncate{

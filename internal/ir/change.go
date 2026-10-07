@@ -176,9 +176,19 @@ func UnqualifiedTableName(qualifiedName string) string {
 // received.
 //
 // The zero value means "no identity": a reader that does not declare
-// [ApplyIdentityProvider] (VStream, every trigger-CDC engine, a backup
-// chunk replay) leaves it zero, and an applier NEVER skips a change with
-// a zero identity — today's at-least-once replay, exactly.
+// [ApplyIdentityProvider] leaves it zero, as do the changes a declaring
+// reader cannot name (VStream COPY rows and interleaved shard groups), and
+// an applier NEVER skips a change with a zero identity — today's
+// at-least-once replay, exactly.
+//
+// A backup carries the identity THROUGH, it never assigns one (ADR-0191):
+// the change-chunk codec records the reader's identity at capture and
+// restores it byte-exact on every read, so `sync from-backup` and chain
+// restore present a replayed change with the same (TxID, Seq) the reader
+// stamped. An incremental written before ADR-0191, or rewritten by smart
+// compaction ([WithoutApplyID]), replays with zero identities. Held by
+// TestReplayIdentityIsPassThrough: on the replay paths, the codec's decode
+// is the only place an ApplyID is ever assigned.
 type ApplyID struct {
 	TxID string
 	Seq  uint64
@@ -200,6 +210,26 @@ func ApplyIDOf(c Change) ApplyID {
 		return v.ApplyID
 	}
 	return ApplyID{}
+}
+
+// WithoutApplyID returns c with its [ApplyID] cleared — the one way a
+// replay-side rewrite (smart compaction, ADR-0191 Q9) drops the identity of a
+// change it re-encodes, so a collapsed change can never carry an identity
+// naming a transaction it no longer reproduces. A change kind that carries no
+// identity is returned unchanged.
+func WithoutApplyID(c Change) Change {
+	switch v := c.(type) {
+	case Insert:
+		v.ApplyID = ApplyID{}
+		return v
+	case Update:
+		v.ApplyID = ApplyID{}
+		return v
+	case Delete:
+		v.ApplyID = ApplyID{}
+		return v
+	}
+	return c
 }
 
 // ApplyIdentityProvider is the optional [CDCReader] capability declaring

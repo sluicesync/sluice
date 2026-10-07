@@ -43,37 +43,40 @@ func replayFile(path string) bool {
 // TestReplayPathsNeverFoldAMarkFence holds ADR-0190 amendment D's scope
 // exemption (§D.7): the `sync from-backup` broker and chain replay reach the
 // lane orchestrator through migcore.ApplyApplyConcurrency, and neither can
-// ever issue a MARK FENCE's fold ticket — for TWO independent reasons, each
-// checked here because two reasons are only worth having if each holds.
+// ever issue a MARK FENCE's fold ticket.
 //
 // Scope, stated because the name once read broader: this gates amendment D's
 // fold only. The replay paths DO fold at their lane BARRIERS (amendment E):
 // a barrier's pre-apply checkpoint rides the barrier's own transaction
 // wherever the lane orchestrator runs, with no flag — on the broker it is the
-// same parent token today's separate checkpoint wrote (BRK-1), which
-// TestBroker_BarrierFoldKeepsTheParentToken pins. The reasons:
+// frontier token of the barrier's own transaction start (ADR-0191 §3.2),
+// which TestBroker_BarrierFoldKeepsTheParentToken pins.
 //
-//  1. only `sync start` (and the fleet spec) turns --exactly-once-lanes on.
-//     Every write of the switch across internal/ and cmd/ is held to
-//     switchSites, in all three forms it can take: a composite-literal
-//     `ExactlyOnceLanes:` field (a Streamer, a laneapply.Config), a call of
-//     migcore.ApplyExactlyOnceLanes, and a call of the applier's
-//     SetExactlyOnceLanes; and an assignment to an applier's
-//     `exactlyOnceLanes` field must sit inside SetExactlyOnceLanes. So the
-//     orchestrator's fence returns at its first line on a replay path.
-//  2. replayed changes carry no ADR-0190 identity: no replay-path file
-//     (replayFile) mentions ApplyID, so ApplyMarkTx answers "" regardless.
+// The reason: only `sync start` (and the fleet spec) turns
+// --exactly-once-lanes on. Every write of the switch across internal/ and
+// cmd/ is held to switchSites, in all three forms it can take: a
+// composite-literal `ExactlyOnceLanes:` field (a Streamer, a
+// laneapply.Config), a call of migcore.ApplyExactlyOnceLanes, and a call of
+// the applier's SetExactlyOnceLanes; and an assignment to an applier's
+// `exactlyOnceLanes` field must sit inside SetExactlyOnceLanes. So the
+// orchestrator's fence returns at its first line on a replay path.
+//
+// There used to be a second, independent reason — "replayed changes carry no
+// ADR-0190 identity: no replay-path file mentions ApplyID". ADR-0191 makes it
+// false on purpose: the change-chunk codec now restores the reader's identity,
+// so a replayed change DOES carry one, and the fence's own guard (the switch
+// above) is what keeps the fold away. What replaced that reason is a
+// different property, held by TestReplayIdentityIsPassThrough: on a replay
+// path an identity is only ever CARRIED, never assigned (ADR-0191 §9 P14).
 //
 // Reach, stated: a write of the switch through reflection, or a new field
-// spelled otherwise, is outside this AST walk; reason 2 checks identifiers
-// in the named files only, so a replay path that moved into a new file
-// would need adding to replayFile. The anti-vacuity floor: the walk must
-// find both replay paths' calls to ApplyApplyConcurrency and every listed
-// switch site.
+// spelled otherwise, is outside this AST walk. The anti-vacuity floor: the
+// walk must find both replay paths' calls to ApplyApplyConcurrency and every
+// listed switch site.
 func TestReplayPathsNeverFoldAMarkFence(t *testing.T) {
 	fset := token.NewFileSet()
 	found := map[string][]string{}
-	var concurrency, identity, strays []string
+	var concurrency, strays []string
 	for _, root := range []string{"../../internal", "../../cmd"} {
 		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
@@ -115,10 +118,6 @@ func TestReplayPathsNeverFoldAMarkFence(t *testing.T) {
 								strays = append(strays, rel)
 							}
 						}
-					case *ast.Ident: // a field key, a selector's field, a type: any mention
-						if n.Name == "ApplyID" && replayFile(rel) {
-							identity = append(identity, rel)
-						}
 					}
 					return true
 				})
@@ -144,9 +143,6 @@ func TestReplayPathsNeverFoldAMarkFence(t *testing.T) {
 	}
 	for _, p := range strays {
 		t.Errorf("%s assigns an applier's exactlyOnceLanes outside SetExactlyOnceLanes", p)
-	}
-	for _, p := range identity {
-		t.Errorf("%s, on a replay path, mentions ApplyID: replayed changes must carry no ADR-0190 identity", p)
 	}
 	if !slices.Contains(concurrency, "internal/pipeline/broker.go") || !slices.Contains(concurrency, "internal/pipeline/backup/chain_restore.go") {
 		t.Fatalf("the walk found the lane wiring in %v; want broker.go and backup/chain_restore.go among them — it is not "+
