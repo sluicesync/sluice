@@ -98,7 +98,7 @@ func (b *SyncFromBackup) judgeReplayKeys(ctx context.Context, probeTarget bool) 
 		rw, err = b.Target.OpenRowWriter(ctx, b.TargetDSN)
 		if err != nil {
 			return nil, migcore.WrapWithHint(migcore.PhaseConnect,
-				fmt.Errorf("broker: keyless-table check: open target row writer: %w", err))
+				fmt.Errorf("broker: keyless-table check: open target row writer: %w", migcore.ProbeErrOrCancel(ctx, err)))
 		}
 		defer migcore.CloseIf(rw)
 	}
@@ -203,7 +203,7 @@ func (b *SyncFromBackup) exactlyOnceBlocker(ctx context.Context, applier ir.Chan
 	}
 	why, err := prober.MarksCoverReason(ctx, j.table)
 	if err != nil {
-		return "", err
+		return "", migcore.ProbeErrOrCancel(ctx, err)
 	}
 	if why != "" {
 		return needs + "; and apply marks cannot make its replay exactly-once: " + why, nil
@@ -410,7 +410,7 @@ func (b *SyncFromBackup) refuseKeylessResetTarget(ctx context.Context, applier i
 	if prober, ok := applier.(ir.ApplyMarksCoverageProber); !ok {
 		why = fmt.Sprintf("the target's change applier (%T) cannot report whether apply marks cover it", applier)
 	} else if why, err = prober.MarksCoverReason(ctx, nil); err != nil {
-		return fmt.Errorf("broker: --reset-target-data: keyless-table check: %w", err)
+		return fmt.Errorf("broker: --reset-target-data: keyless-table check: %w", migcore.ProbeErrOrCancel(ctx, err))
 	}
 	if why == "" {
 		return nil

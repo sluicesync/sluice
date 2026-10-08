@@ -409,7 +409,7 @@ func laterFulls(links []lineage.SegmentRecord) []*lineage.SegmentRecord {
 func (r *ChainRestore) openProbeWriter(ctx context.Context) (ir.RowWriter, error) {
 	rw, err := r.Target.OpenRowWriter(ctx, r.TargetDSN)
 	if err != nil {
-		return nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("chain restore: open target row writer: %w", err))
+		return nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("chain restore: open target row writer: %w", migcore.ProbeErrOrCancel(ctx, err)))
 	}
 	migcore.ApplyTargetSchema(rw, r.TargetSchema)
 	return rw, nil
