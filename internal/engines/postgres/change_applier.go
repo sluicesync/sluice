@@ -540,6 +540,10 @@ type ChangeApplier struct {
 	// applyMarksEnsureErr is why EnsureControlTable could not create the
 	// mark table, reported by the APPLY-MARKS-UNAVAILABLE WARN at apply start.
 	applyMarksEnsureErr error
+
+	// requireMarks, set by [ChangeApplier.RequireApplyMarks], turns an
+	// unusable mark table at apply start into a refusal (ADR-0191 review).
+	requireMarks bool
 }
 
 // activeSchemaVersion is one entry in the ADR-0049 Chunk C applier

@@ -214,10 +214,17 @@ func (a *ChangeApplier) startApplyMarks(ctx context.Context, streamID string) er
 	if transient := applyMarksProbeTransient(unusable); transient != nil {
 		return transient
 	}
+	if err := applymarks.Unavailable(ctx, "mysql", streamID, a.requireMarks, errors.Join(a.applyMarksEnsureErr, unusable)); err != nil {
+		return err
+	}
 	a.marks.Disable()
-	applymarks.WarnUnavailable(ctx, "mysql", streamID, errors.Join(a.applyMarksEnsureErr, unusable))
 	return nil
 }
+
+// RequireApplyMarks implements [ir.ApplyMarksRequirer]: with on, an apply
+// that finds the mark table unusable refuses instead of applying without
+// marks (ADR-0191 review).
+func (a *ChangeApplier) RequireApplyMarks(on bool) { a.requireMarks = on }
 
 // applyMarksProbeTransient returns unusable classified when it is a transient
 // failure of the availability probe (a lost connection, a timeout, a
@@ -338,8 +345,10 @@ var _ ir.ApplyMarksClearer = (*ChangeApplier)(nil)
 // transaction_mode=MULTI the marks and the rows commit on different shards,
 // and the write cores order the rows first so that a tear leaves rows WITHOUT
 // their marks (GC-41 (c)) — the tolerable direction for a loud collision, and
-// exactly the duplicate a keyless replay must not risk. A SHARDED keyspace
-// needs that sidecar for its control tables, so this also covers it.
+// exactly the duplicate a keyless replay must not risk. Today's only caller,
+// `sync from-backup`, has no --control-keyspace flag, so this arm is not
+// reachable from it (ADR-0191 review); it is kept so the answer stays true
+// for an applier that does carry a sidecar, rather than silently "covered".
 func (a *ChangeApplier) MarksCoverReason(ctx context.Context, table *ir.Table) (string, error) {
 	if a.controlKeyspace != "" {
 		return fmt.Sprintf("the target keeps its control tables in the `--control-keyspace` sidecar %q, where vtgate's MULTI "+
@@ -388,4 +397,7 @@ func (a *ChangeApplier) targetKeyForCoverage(ctx context.Context, table *ir.Tabl
 	return pk, nil
 }
 
-var _ ir.ApplyMarksCoverageProber = (*ChangeApplier)(nil)
+var (
+	_ ir.ApplyMarksCoverageProber = (*ChangeApplier)(nil)
+	_ ir.ApplyMarksRequirer       = (*ChangeApplier)(nil)
+)

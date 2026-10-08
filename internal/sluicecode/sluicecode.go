@@ -645,9 +645,10 @@ const (
 	// the incremental about to be replayed cannot be made exactly-once for it
 	// (ADR-0191 §3.5): it records no change identities (written before
 	// ADR-0191, or smart-compacted), a change to the table carries none, or
-	// the target's apply marks cannot cover the table (unusable, a
-	// `--control-keyspace` sidecar, a Neki target, a target keyed only on a
-	// column the rows do not carry, an engine without marks). Such a replay
+	// the target's apply marks cannot cover the table (unusable — judged
+	// before the incremental and again as its apply starts — a Neki target, a
+	// target keyed only on a column the rows do not carry, an engine without
+	// marks). Such a replay
 	// re-applies what an interrupted run already committed, so the table
 	// would gain a duplicate of every such row, at exit 0. Judged per
 	// incremental, for the tables it touches, before anything of it is

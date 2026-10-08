@@ -155,6 +155,11 @@ type brokerFrontier struct {
 	cached    ir.Position
 	cachedFor int64
 	hasCached bool
+
+	// unidentified counts the emitted row changes of an incremental that
+	// records identities which nevertheless carry none (keyed tables only:
+	// a lifted keyless table refuses such a change before it is emitted).
+	unidentified int64
 }
 
 // newBrokerFrontier starts a frontier over incremental m (whose parent is

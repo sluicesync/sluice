@@ -83,6 +83,7 @@ import (
 	"strings"
 	"time"
 
+	"sluicesync.dev/sluice/internal/applymarks"
 	"sluicesync.dev/sluice/internal/crypto"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
@@ -317,6 +318,11 @@ type SyncFromBackup struct {
 	// never sets it (nil = no-op).
 	replayChunkFailpoint func(backupID string, chunkIdx int) error
 
+	// resetOverPosition is set when --reset-target-data runs over an existing
+	// broker position, which the cold-start reset must clear before it drops
+	// anything (see Run).
+	resetOverPosition bool
+
 	// pidHostFn returns the (pid, host) pair recorded on the liveness
 	// file. Defaults to (os.Getpid, os.Hostname); tests inject a stub.
 	pidHostFn func() (int, string)
@@ -347,6 +353,40 @@ type brokerPositionToken struct {
 	// InProgress, when set, is the frontier inside the incremental after
 	// LastAppliedBackupID (ADR-0191 §3.2): absent between incrementals.
 	InProgress *brokerInProgress `json:"in_progress,omitempty"`
+}
+
+// BrokerAtChainIDConflictMarker is the grep-stable token on the refusal of an
+// --at-chain-id that disagrees with the broker position the target already
+// holds.
+const BrokerAtChainIDConflictMarker = "BROKER-AT-CHAIN-ID-CONFLICT"
+
+// refuseAtChainIDOverPosition judges --at-chain-id against an existing
+// broker position. The flag asserts what a target WITHOUT a position holds;
+// with one, the position (written in the same transaction as the work) is the
+// record. An assertion that agrees with it (the same last fully applied
+// incremental, nothing in progress) changes nothing and is accepted. One that
+// disagrees used to be ignored silently, which on a target the operator had
+// re-restored to an earlier link resumed from the stale row and skipped the
+// incrementals between — so it refuses (ADR-0191 review).
+func (b *SyncFromBackup) refuseAtChainIDOverPosition(tok *brokerPositionToken) error {
+	if b.AtChainID == "" {
+		return nil
+	}
+	if tok.LastAppliedBackupID == b.AtChainID && tok.InProgress == nil {
+		return nil
+	}
+	held := "last fully applied incremental " + tok.LastAppliedBackupID
+	if tok.InProgress != nil {
+		held += fmt.Sprintf(", inside incremental %s through event %d", tok.InProgress.BackupID, tok.InProgress.Through)
+	}
+	return fmt.Errorf(
+		"broker: %s: --at-chain-id=%s, but the target already holds a broker position for stream %q (%s). "+
+			"--at-chain-id asserts what a target with NO position holds. To resume from the recorded position, drop "+
+			"--at-chain-id; to rebuild the target from the chain, pass --reset-target-data instead; if you restored the "+
+			"target to %s yourself, delete this stream's row from sluice_cdc_state (and its rows from "+
+			"sluice_cdc_apply_marks) and run again with --at-chain-id",
+		BrokerAtChainIDConflictMarker, b.AtChainID, b.StreamID, held, b.AtChainID,
+	)
 }
 
 // encodeBrokerPosition produces the [ir.Position] the broker writes when
@@ -486,61 +526,19 @@ func (b *SyncFromBackup) Run(ctx context.Context) error {
 		return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf("broker: ensure control table: %w", err))
 	}
 
-	// 2. Check existing position. Three branches downstream:
-	//   - row exists + parses as broker token → warm resume.
+	// 2. Check existing position ([SyncFromBackup.resolveStart]):
+	//   - row exists + broker token + --reset-target-data → cold-start
+	//     reset over it (the row is cleared before the drop).
+	//   - row exists + broker token → warm resume (an --at-chain-id that
+	//     disagrees with it refuses).
 	//   - row absent → cold start (refusal unless override flag).
 	//   - row exists but isn't a broker token → conflict; refuse
 	//     loudly (`stream_id` is being driven by a `sync start`,
 	//     not a chain broker — overwriting would corrupt the live
 	//     stream's resume state).
-	persisted, found, err := applier.ReadPosition(ctx, b.StreamID)
+	lastAppliedID, err := b.resolveStart(ctx, applier)
 	if err != nil {
-		return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("broker: read position: %w", err))
-	}
-
-	// Bug 39 fix (v0.20.1): identify broker-owned rows via the
-	// embedded `_engine` JSON field, NOT [ir.Position.Engine]. The
-	// engine appliers' ReadPosition discards the broker's sentinel
-	// and returns its own engine name; the JSON envelope round-trips
-	// the sentinel intact. See [isBrokerToken] for the discriminator.
-	var lastAppliedID string
-	switch {
-	case found && isBrokerToken(persisted):
-		tok, dErr := decodeBrokerPosition(persisted)
-		if dErr != nil {
-			return fmt.Errorf("broker: corrupt persisted position for stream %q: %w; clear the row manually or pass --reset-target-data",
-				b.StreamID, dErr)
-		}
-		lastAppliedID = tok.LastAppliedBackupID
-		// Audit F-E1, per incremental since ADR-0191 §3.5: the door runs at
-		// start for the incremental this broker is inside or about to start,
-		// so an operator restarting an interrupted broker learns of a refusal
-		// before anything is re-applied. Each later incremental is judged by
-		// the tick, before it is applied.
-		if err := b.refuseKeylessAtStart(ctx, applier, lastAppliedID); err != nil {
-			return err
-		}
-		slog.InfoContext(
-			ctx, "broker: warm resume",
-			slog.String("stream_id", b.StreamID),
-			slog.String("last_applied_backup_id", lastAppliedID),
-		)
-	case found:
-		return fmt.Errorf(
-			"broker: stream %q is owned by a non-broker writer (position engine %q); "+
-				"choose a different --stream-id or clear the conflicting row first",
-			b.StreamID, persisted.Engine,
-		)
-	default:
-		if err := b.refuseKeylessAtColdStart(ctx, applier); err != nil {
-			return err
-		}
-		// Cold-start branch.
-		startID, err := b.coldStart(ctx, applier)
-		if err != nil {
-			return err
-		}
-		lastAppliedID = startID
+		return err
 	}
 
 	// 3. Initial state file write. The first heartbeat happens
@@ -756,6 +754,80 @@ func (b *SyncFromBackup) validate() error {
 	return nil
 }
 
+// resolveStart reads the stream's persisted position and picks the entry —
+// warm resume, a cold start (including --reset-target-data over an existing
+// broker position), or a refusal — returning the last fully applied backup
+// id the run starts after.
+//
+// Bug 39 fix (v0.20.1): broker-owned rows are identified via the embedded
+// `_engine` JSON field, NOT [ir.Position.Engine]: the engine appliers'
+// ReadPosition discards the broker's sentinel and returns its own engine
+// name, while the JSON envelope round-trips it intact ([isBrokerToken]).
+func (b *SyncFromBackup) resolveStart(ctx context.Context, applier ir.ChangeApplier) (string, error) {
+	persisted, found, err := applier.ReadPosition(ctx, b.StreamID)
+	if err != nil {
+		return "", migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("broker: read position: %w", err))
+	}
+	switch {
+	case found && isBrokerToken(persisted) && b.ResetTargetData:
+		// --reset-target-data is honoured over an existing broker position:
+		// it is the recovery SLUICE-E-BROKER-INCREMENTAL-REWRITTEN, a corrupt
+		// position and BROKER-INCREMENTAL-PARTIAL (for a key-changing source
+		// without identities) all prescribe, and before this case the warm
+		// branch below swallowed it and resumed instead (ADR-0191 review). The
+		// position is not decoded: a corrupt one is exactly what may need the
+		// reset. The cold-start reset clears the row and its marks before it
+		// drops anything (coldStartReset), so a crash mid-reset leaves no
+		// position to warm-resume onto a half-restored target.
+		slog.InfoContext(ctx, "broker: --reset-target-data over an existing broker position; the position is discarded",
+			slog.String("stream_id", b.StreamID))
+		b.resetOverPosition = true
+		return b.coldStartEntry(ctx, applier)
+	case found && isBrokerToken(persisted):
+		tok, dErr := decodeBrokerPosition(persisted)
+		if dErr != nil {
+			return "", fmt.Errorf("broker: corrupt persisted position for stream %q: %w; clear the row manually or pass --reset-target-data",
+				b.StreamID, dErr)
+		}
+		if err := b.refuseAtChainIDOverPosition(tok); err != nil {
+			return "", err
+		}
+		// Audit F-E1, per incremental since ADR-0191 §3.5: the door runs at
+		// start for the incremental this broker is inside or about to start,
+		// so an operator restarting an interrupted broker learns of a refusal
+		// before anything is re-applied. Each later incremental is judged by
+		// the tick, before it is applied.
+		if err := b.refuseKeylessAtStart(ctx, applier, tok.LastAppliedBackupID); err != nil {
+			return "", err
+		}
+		slog.InfoContext(
+			ctx, "broker: warm resume",
+			slog.String("stream_id", b.StreamID),
+			slog.String("last_applied_backup_id", tok.LastAppliedBackupID),
+		)
+		return tok.LastAppliedBackupID, nil
+	case found:
+		// A row owned by a non-broker writer (a `sync start` stream) is
+		// refused with or without --reset-target-data: overwriting it would
+		// corrupt the live stream's resume state.
+		return "", fmt.Errorf(
+			"broker: stream %q is owned by a non-broker writer (position engine %q); "+
+				"choose a different --stream-id or clear the conflicting row first",
+			b.StreamID, persisted.Engine,
+		)
+	}
+	return b.coldStartEntry(ctx, applier)
+}
+
+// coldStartEntry runs the keyless door every cold-start leg owes before it
+// touches the target, then the cold start itself.
+func (b *SyncFromBackup) coldStartEntry(ctx context.Context, applier ir.ChangeApplier) (string, error) {
+	if err := b.refuseKeylessAtColdStart(ctx, applier); err != nil {
+		return "", err
+	}
+	return b.coldStart(ctx, applier)
+}
+
 // coldStart handles the no-existing-state branch. Three sub-shapes:
 //
 //   - --reset-target-data: drop tables + run ChainRestore + record
@@ -887,6 +959,22 @@ func (b *SyncFromBackup) coldStartReset(ctx context.Context, applier ir.ChangeAp
 	// restore below clears its own stream's marks the same way).
 	if err := migcore.ClearReplayApplyMarks(ctx, applier, b.StreamID); err != nil {
 		return "", migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("broker: --reset-target-data: %w", err))
+	}
+	// Over an existing position (see Run), the row goes too, before the
+	// drop: left in place, a crash between the drop and the position write
+	// below would leave the OLD position over a half-restored target, and the
+	// next plain run would warm-resume onto it. Cleared, that run finds no
+	// position and refuses (the cold-start refusal), and a cancel reports
+	// BROKER-COLD-START-PARTIAL as for a reset without a prior position.
+	if b.resetOverPosition {
+		cleaner, ok := applier.(ir.StreamCleaner)
+		if !ok {
+			return "", fmt.Errorf("broker: --reset-target-data: the target engine's change applier (%T) cannot clear "+
+				"stream %q's sluice_cdc_state row; delete that row yourself and run again", applier, b.StreamID)
+		}
+		if err := cleaner.ClearStream(ctx, b.StreamID); err != nil {
+			return "", fmt.Errorf("broker: --reset-target-data: clear the existing position: %w", err)
+		}
 	}
 
 	// Bug 40a fix: drop pre-existing target tables that match the
@@ -1150,7 +1238,13 @@ func (b *SyncFromBackup) replayNewIncrementals(
 		if err := b.refuseKeylessIncremental(ctx, applier, link); err != nil {
 			return newApplied, totalBytes, incrCount, chunkCount, err
 		}
+		if err := b.requireMarksForLifted(applier, link); err != nil {
+			return newApplied, totalBytes, incrCount, chunkCount, err
+		}
 		bytesApplied, applyErr := b.applyIncremental(ctx, applier, link, batchSize, resumeFromID)
+		if applyErr != nil && errors.Is(applyErr, applymarks.ErrMarksRequired) {
+			return newApplied, totalBytes, incrCount, chunkCount, b.errMarksLostAtApply(link, applyErr)
+		}
 		if applyErr != nil {
 			// The rule that separates an interrupted incremental from a
 			// clean stop (F-E1 (a)): applyIncremental was ENTERED for this
@@ -1540,6 +1634,18 @@ func (b *SyncFromBackup) streamIncrementalWithPosition(
 			return fmt.Errorf("chunk %d (%s): %w", chunkIdx, chunk.File, err)
 		}
 	}
+	if frontier.unidentified > 0 {
+		slog.WarnContext(ctx, "broker: "+BrokerUnidentifiedChangesMarker+": changes to keyed tables in this incremental "+
+			"carry no apply identity, though the incremental records identities (a VStream COPY row or interleaved shard "+
+			"group, a MySQL transaction without a GTID or server identity, or a row the capture synthesized such as an "+
+			"ADD COLUMN fill). If a run is "+
+			"interrupted inside their source transaction, the re-run re-applies them without apply marks: inserts and "+
+			"same-key updates and deletes converge on the key, but a transaction that moved a key value onto another "+
+			"row is not exactly-once for them",
+			slog.String("stream_id", b.StreamID),
+			slog.String("backup_id", frontier.backupID),
+			slog.Int64("changes", frontier.unidentified))
+	}
 	// ADR-0191 §3.2: a stream with fewer events than the persisted frontier
 	// says were applied is not the stream the frontier counted over.
 	if frontier.skipThrough >= frontier.events() {
@@ -1639,6 +1745,9 @@ func (b *SyncFromBackup) streamOneChunkWithPosition(
 		if err := b.refuseUnidentifiedLiftedChange(frontier.backupID, change); err != nil {
 			_ = cr.Close()
 			return err
+		}
+		if _, isRow := rowChangeTable(change); isRow && owner.ApplyIdentity && ir.ApplyIDOf(change).IsZero() {
+			frontier.unidentified++
 		}
 		rewritten, rwErr := rewritePosition(change, pos)
 		if rwErr != nil {

@@ -63,15 +63,19 @@ func (e *brokerIncrementalPartialError) Error() string {
 	head := fmt.Sprintf(
 		"broker: %s: the run was interrupted partway through incremental %s. The broker's position stands INSIDE it, at "+
 			"the last source transaction whose effects are durable on the target (the last incremental fully applied is "+
-			"%s), so the next run re-reads it, skips what is already applied and re-applies only the source transaction "+
-			"that was in flight (ADR-0191). ",
+			"%s), so the next run re-reads it, skips what is already applied and re-applies from the first source "+
+			"transaction not durably applied — the one in flight, or on the lane apply mode the run of transactions whose "+
+			"lanes had not all committed (ADR-0191). ",
 		BrokerIncrementalPartialMarker, e.backupID, e.resumeFrom,
 	)
 	var body string
 	if e.identity {
 		body = "This incremental records the source's own change identities, so wherever the target holds apply marks " +
-			"(a run without them logs APPLY-MARKS-UNAVAILABLE) the changes of that transaction already applied are " +
-			"skipped and the rest applied once, key changes included: re-run the same command to finish it. "
+			"(a run without them logs APPLY-MARKS-UNAVAILABLE) every re-applied change that carries an identity and " +
+			"already landed is skipped and the rest applied once, key changes included: re-run the same command to " +
+			"finish it. A change recorded without an identity (logged as " + BrokerUnidentifiedChangesMarker + "; on a " +
+			"table without a key it is refused instead) is re-applied without marks and converges by its key, unless " +
+			"its transaction moved a key value onto another row. "
 	} else {
 		body = "This incremental records no change identities (it was written before ADR-0191, or rewritten by smart " +
 			"compaction), so that one transaction is re-applied without apply marks. Every table the broker replays was " +

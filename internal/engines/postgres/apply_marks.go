@@ -232,10 +232,17 @@ func (a *ChangeApplier) startApplyMarks(ctx context.Context, streamID string) er
 	if transient := applyMarksProbeTransient(unusable); transient != nil {
 		return transient
 	}
+	if err := applymarks.Unavailable(ctx, "postgres", streamID, a.requireMarks, errors.Join(a.applyMarksEnsureErr, unusable)); err != nil {
+		return err
+	}
 	a.marks.Disable()
-	applymarks.WarnUnavailable(ctx, "postgres", streamID, errors.Join(a.applyMarksEnsureErr, unusable))
 	return nil
 }
+
+// RequireApplyMarks implements [ir.ApplyMarksRequirer]: with on, an apply
+// that finds the mark table unusable refuses instead of applying without
+// marks (ADR-0191 review).
+func (a *ChangeApplier) RequireApplyMarks(on bool) { a.requireMarks = on }
 
 // applyMarksProbeTransient returns unusable classified when it is a transient
 // failure of the availability probe (a lost connection, a timeout, an admin
@@ -430,4 +437,7 @@ func schemaTableKeyQuoted(schema, table string) string {
 	return quoteIdent(schema) + "." + quoteIdent(table)
 }
 
-var _ ir.ApplyMarksCoverageProber = (*ChangeApplier)(nil)
+var (
+	_ ir.ApplyMarksCoverageProber = (*ChangeApplier)(nil)
+	_ ir.ApplyMarksRequirer       = (*ChangeApplier)(nil)
+)

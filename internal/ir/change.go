@@ -285,6 +285,21 @@ type ApplyMarksCoverageProber interface {
 	MarksCoverReason(ctx context.Context, table *Table) (reason string, err error)
 }
 
+// ApplyMarksRequirer is the optional [ChangeApplier] surface that closes the
+// gap between a replay path's coverage question and the apply that relies on
+// the answer (ADR-0191 review): [ApplyMarksCoverageProber] is asked before an
+// incremental is applied, but the applier decides whether the mark table is
+// usable when its apply starts, and on a definite "unusable" it disables the
+// marks behind an APPLY-MARKS-UNAVAILABLE WARN and applies anyway. With
+// RequireApplyMarks(true), that decision refuses instead — before any change
+// of the apply is written — with an error wrapping
+// applymarks.ErrMarksRequired. false restores the WARN. Every applier that
+// declares [ApplyMarksCoverageProber] must declare this too: a caller that
+// lifted a refusal on the prober's word fails closed without it.
+type ApplyMarksRequirer interface {
+	RequireApplyMarks(on bool)
+}
+
 // Insert is a row-insertion change event.
 type Insert struct {
 	Position Position

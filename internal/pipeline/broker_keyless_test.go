@@ -283,7 +283,7 @@ func TestBrokerIncrementalPartialError_RecoveryTextIsScoped(t *testing.T) {
 	msg := (&brokerIncrementalPartialError{backupID: "b1", resumeFrom: "b0", cause: context.Canceled}).Error()
 	for _, want := range []string{
 		BrokerIncrementalPartialMarker,
-		"re-applies only the source transaction that was in flight",
+		"re-applies from the first source transaction not durably applied",
 		"records no change identities",
 		"updates and deletes that keep each row's key, converge",
 		"CHANGED a row's key value",

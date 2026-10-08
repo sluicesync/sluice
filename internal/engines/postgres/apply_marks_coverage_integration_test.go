@@ -7,6 +7,8 @@ package postgres
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -81,4 +83,54 @@ func TestChangeApplier_MarksCoverReason(t *testing.T) {
 			t.Errorf("MarksCoverReason with no mark table = %q; want %s", why, applymarks.UnavailableMarker)
 		}
 	})
+}
+
+// TestChangeApplier_RequireApplyMarks is the engine half of the ADR-0191
+// review's apply-time re-check (ir.ApplyMarksRequirer): a mark table that
+// became unusable between a replay path's coverage question and the apply
+// refuses the apply — before any row is written — while required, on both
+// apply entries (the per-change Apply that a batch size of 1 takes, and the
+// batch/lane path), and stays the APPLY-MARKS-UNAVAILABLE WARN (rows applied)
+// when not. The independent expected value is the target's own row count.
+func TestChangeApplier_RequireApplyMarks(t *testing.T) {
+	dsn, cleanup := startPostgresForApplier(t)
+	defer cleanup()
+	applyPGApplier(t, dsn, `CREATE TABLE kl (v INT NOT NULL);`)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	applier, err := Engine{}.OpenChangeApplier(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenChangeApplier: %v", err)
+	}
+	defer func() { _ = applier.(interface{ Close() error }).Close() }()
+	if err := applier.EnsureControlTable(ctx); err != nil {
+		t.Fatal(err)
+	}
+	applyPGApplier(t, dsn, `DROP TABLE public.sluice_cdc_apply_marks;`) // after the coverage answer
+	req := applier.(ir.ApplyMarksRequirer)
+	apply := func(batch int, v int64) error {
+		pos := ir.Position{Engine: "postgres", Token: fmt.Sprintf(`{"lsn":"0/%X"}`, 0x3000000+v*0x100)}
+		ch := make(chan ir.Change, 3)
+		ch <- ir.TxBegin{Position: pos}
+		ch <- ir.Insert{Position: pos, Schema: "public", Table: "kl", Row: ir.Row{"v": v}, ApplyID: ir.ApplyID{TxID: fmt.Sprintf("req-%d", v), Seq: 1}}
+		ch <- ir.TxCommit{Position: pos}
+		close(ch)
+		return applier.(ir.BatchedChangeApplier).ApplyBatch(ctx, "req", ch, batch)
+	}
+	for _, batch := range []int{1, 100} {
+		req.RequireApplyMarks(true)
+		if err := apply(batch, int64(batch)); !errors.Is(err, applymarks.ErrMarksRequired) {
+			t.Errorf("batch %d, marks required: ApplyBatch = %v; want ErrMarksRequired", batch, err)
+		}
+		if n := pgCount(t, dsn, `SELECT count(*) FROM kl`); n != 0 {
+			t.Fatalf("batch %d, marks required: the refused apply wrote %d row(s)", batch, n)
+		}
+	}
+	req.RequireApplyMarks(false)
+	if err := apply(100, 7); err != nil {
+		t.Fatalf("marks not required: ApplyBatch = %v; want the WARN and the row applied", err)
+	}
+	if n := pgCount(t, dsn, `SELECT count(*) FROM kl`); n != 1 {
+		t.Errorf("marks not required: kl holds %d row(s); want 1", n)
+	}
 }

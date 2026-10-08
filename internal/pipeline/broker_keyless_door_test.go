@@ -5,10 +5,12 @@ package pipeline
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
+	"sluicesync.dev/sluice/internal/applymarks"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/backup"
@@ -91,10 +93,38 @@ func doorFixture(t *testing.T, changes []ir.Change, stamps bool) (store irbackup
 type coveringApplier struct {
 	replayApplier
 	reason string
+
+	// required is the last RequireApplyMarks value; marksLostAtApply makes
+	// the apply find the mark table unusable as it starts, as a real
+	// applier's startApplyMarks would after the door's judgment.
+	required         bool
+	marksLostAtApply bool
 }
 
 func (a *coveringApplier) MarksCoverReason(context.Context, *ir.Table) (string, error) {
 	return a.reason, nil
+}
+
+func (a *coveringApplier) RequireApplyMarks(on bool) { a.required = on }
+
+func (a *coveringApplier) ApplyBatch(ctx context.Context, s string, ch <-chan ir.Change, n int) error {
+	if a.marksLostAtApply {
+		if a.required {
+			return fmt.Errorf("fake: %w: dropped after the door", applymarks.ErrMarksRequired)
+		}
+		// the WARN path: apply anyway, without marks
+	}
+	return a.replayApplier.ApplyBatch(ctx, s, ch, n)
+}
+
+// proberOnlyApplier answers the coverage question ("covered") but cannot be
+// held to its marks: no ir.ApplyMarksRequirer.
+type proberOnlyApplier struct {
+	*replayApplier
+}
+
+func (a *proberOnlyApplier) MarksCoverReason(context.Context, *ir.Table) (string, error) {
+	return "", nil
 }
 
 // TestBrokerKeylessDoor_PerIncrementalMatrix is ADR-0191 §9 P12: every row of
@@ -117,7 +147,8 @@ func TestBrokerKeylessDoor_PerIncrementalMatrix(t *testing.T) {
 		touchKL, touchK, stamps, idK bool
 		zeroOne                      bool
 		reason                       string // the target's coverage answer
-		noProber                     bool
+		noProber, proberOnly         bool
+		marksLostAtApply             bool
 		wantRefused                  bool
 		wantInMsg                    string
 	}{
@@ -125,11 +156,14 @@ func TestBrokerKeylessDoor_PerIncrementalMatrix(t *testing.T) {
 		{name: "incremental without identities", touchKL: true, stamps: false, wantRefused: true, wantInMsg: "records no change identities"},
 		{name: "a change without an identity", touchKL: true, stamps: true, idK: true, zeroOne: true, wantRefused: true, wantInMsg: BrokerKeylessNoIdentityMarker},
 		{name: "marks unavailable", touchKL: true, stamps: true, idK: true, reason: "APPLY-MARKS-UNAVAILABLE: no table", wantRefused: true, wantInMsg: "APPLY-MARKS-UNAVAILABLE"},
-		{name: "vtgate control-keyspace sidecar", touchKL: true, stamps: true, idK: true, reason: "the target keeps its control tables in the `--control-keyspace` sidecar", wantRefused: true, wantInMsg: "--control-keyspace"},
+		{name: "control-keyspace sidecar (an engine reason: sync from-backup has no such flag)", touchKL: true, stamps: true, idK: true, reason: "the target keeps its control tables in the `--control-keyspace` sidecar", wantRefused: true, wantInMsg: "--control-keyspace"},
 		{name: "Neki", touchKL: true, stamps: true, idK: true, reason: "the target is PlanetScale Neki", wantRefused: true, wantInMsg: "Neki"},
 		{name: "target key on an unsupplied surrogate", touchKL: true, stamps: true, idK: true, reason: `its target primary key includes "sid", which the replayed rows do not carry`, wantRefused: true, wantInMsg: `"sid"`},
 		{name: "applier without the coverage surface", touchKL: true, stamps: true, idK: true, noProber: true, wantRefused: true, wantInMsg: "cannot report whether apply marks cover it"},
+		{name: "marks unusable by the time the apply starts", touchKL: true, stamps: true, idK: true, marksLostAtApply: true, wantRefused: true, wantInMsg: "unusable when its apply started"},
+		{name: "applier that cannot be held to its marks", touchKL: true, stamps: true, idK: true, proberOnly: true, wantRefused: true, wantInMsg: "cannot be held to its apply marks"},
 		{name: "keyless table untouched by the incremental", touchK: true, stamps: false},
+		{name: "nothing lifted: unusable marks at apply stay a WARN", touchK: true, stamps: true, marksLostAtApply: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -138,13 +172,16 @@ func TestBrokerKeylessDoor_PerIncrementalMatrix(t *testing.T) {
 			defer cancel()
 			runCtx, runCancel := context.WithCancel(ctx)
 			defer runCancel()
-			app := &coveringApplier{reason: tc.reason}
+			app := &coveringApplier{reason: tc.reason, marksLostAtApply: tc.marksLostAtApply}
 			p := encodeBrokerPosition("test://fe1", fullID)
 			app.resume = &p
 			app.onWrite = func(ir.Position) { runCancel() } // the incremental fully applied: stop
 			var applier ir.ChangeApplier = app
-			if tc.noProber {
+			switch {
+			case tc.noProber:
 				applier = &app.replayApplier
+			case tc.proberOnly:
+				applier = &proberOnlyApplier{replayApplier: &app.replayApplier}
 			}
 			b := newReplayBroker(store, &app.replayApplier, true)
 			b.Target = replayTargetEngine{applier: applier, rw: replayKeyWriter{keyed: true}}

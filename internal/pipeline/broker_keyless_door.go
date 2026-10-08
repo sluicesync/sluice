@@ -23,9 +23,20 @@ import (
 
 // BrokerKeylessNoIdentityMarker is the grep-stable token on the keyless
 // refusal for a change that carries no identity inside an incremental that
-// records them (a VStream COPY row or an interleaved shard group): the
-// manifest's flag cannot see that per-change gap, so it is judged per change.
+// records them (a VStream COPY row, an interleaved shard group, a MySQL
+// transaction without a GTID or server identity, a capture-synthesized row
+// such as an ADD COLUMN fill): the manifest's flag cannot see that per-change
+// gap, so it is judged per change.
 const BrokerKeylessNoIdentityMarker = "BROKER-KEYLESS-NO-IDENTITY"
+
+// BrokerUnidentifiedChangesMarker is the grep-stable token of the WARN the
+// broker logs once per incremental when changes to KEYED tables inside an
+// incremental that records identities carry none: their re-run is not
+// exactly-once (it converges by key, except for a key moved onto another row
+// inside one interrupted transaction), so the incremental's exactly-once claim
+// is qualified for them rather than refused — a VStream chain's COPY rows are
+// keyed and routine (ADR-0191 review).
+const BrokerUnidentifiedChangesMarker = "BROKER-UNIDENTIFIED-CHANGES"
 
 // brokerKeylessHint is the remedy riding SLUICE-E-BROKER-KEYLESS-TABLE.
 const brokerKeylessHint = "give each named table a PRIMARY KEY or a NOT NULL UNIQUE index on the SOURCE and take a new full " +
@@ -178,7 +189,8 @@ func (b *SyncFromBackup) exactlyOnceBlocker(ctx context.Context, applier ir.Chan
 	}
 	if touch.zeroID[j.table.Name] {
 		return needs + "; and " + BrokerKeylessNoIdentityMarker + ": a change to it in this incremental carries no identity " +
-			"(a VStream COPY row or an interleaved shard group), so apply marks cannot name it", nil
+			"(a VStream COPY row, an interleaved shard group, a MySQL transaction without a GTID or server identity, or a " +
+			"row the capture synthesized such as an ADD COLUMN fill), so apply marks cannot name it", nil
 	}
 	prober, ok := applier.(ir.ApplyMarksCoverageProber)
 	if !ok {
@@ -370,6 +382,54 @@ func (b *SyncFromBackup) refuseKeylessResetTarget(ctx context.Context, applier i
 
 // errBrokerKeylessTables renders the coded refusal for scope (an incremental,
 // or the chain).
+// requireMarksForLifted closes the window between the door and the apply
+// (ADR-0191 review): the door asked the target whether its marks cover each
+// lifted table before the incremental, but the applier decides whether the
+// mark table is usable only as its apply starts, and on "unusable" it used to
+// disable the marks behind a WARN and apply anyway — the lifted keyless table
+// then replayed unmarked. While this incremental lifted a table, the applier
+// is told to refuse instead ([ir.ApplyMarksRequirer]); otherwise the WARN
+// stands. An applier that answers the coverage question without honouring
+// the requirement fails closed.
+func (b *SyncFromBackup) requireMarksForLifted(applier ir.ChangeApplier, link *lineage.SegmentRecord) error {
+	need := len(b.liftedKeyless) > 0
+	req, ok := applier.(ir.ApplyMarksRequirer)
+	if !ok {
+		if !need {
+			return nil
+		}
+		return errBrokerKeylessTables("incremental "+lineage.ManifestBackupID(link.Manifest), b.liftedTables(
+			fmt.Sprintf("the target's change applier (%T) cannot be held to its apply marks for the apply", applier),
+		))
+	}
+	req.RequireApplyMarks(need)
+	return nil
+}
+
+// errMarksLostAtApply renders an apply the applier refused because the mark
+// table became unusable between the door and the apply.
+func (b *SyncFromBackup) errMarksLostAtApply(link *lineage.SegmentRecord, cause error) error {
+	return errBrokerKeylessTables("incremental "+lineage.ManifestBackupID(link.Manifest), b.liftedTables(
+		"the target's apply marks covered it when the incremental was judged, but were unusable when its apply "+
+			"started: "+cause.Error(),
+	))
+}
+
+// liftedTables renders the tables this incremental lifted, sorted, each with
+// reason.
+func (b *SyncFromBackup) liftedTables(reason string) []migcore.ReplayKeylessTable {
+	names := make([]string, 0, len(b.liftedKeyless))
+	for name := range b.liftedKeyless {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	out := make([]migcore.ReplayKeylessTable, 0, len(names))
+	for _, name := range names {
+		out = append(out, migcore.ReplayKeylessTable{Name: name, Reason: migcore.ReplayKeylessReason(reason)})
+	}
+	return out
+}
+
 func errBrokerKeylessTables(scope string, tables []migcore.ReplayKeylessTable) error {
 	return sluicecode.Wrap(sluicecode.CodeBrokerKeylessTable, brokerKeylessHint, fmt.Errorf(
 		"broker: refusing to replay %s: %d table(s) could gain duplicate rows if the replay is interrupted: %s. "+

@@ -228,12 +228,22 @@ finds it in the chain, and resumes where it stopped. That position
 can stand **inside** an incremental: it advances, in the same target
 transaction as the work, to the last source transaction whose effects
 are durable. So an incremental the crash interrupted is re-read, what
-already landed is skipped, and only the source transaction that was
-in flight is re-applied. A chain written by this sluice records each
-change's apply identity (the source's transaction id and the change's
-ordinal), and the target's apply marks then skip that transaction's
-changes that already landed: the re-run is exactly-once, for tables
-without a key and for key changes alike.
+already landed is skipped, and the re-apply starts at the first source
+transaction not durably applied (the one in flight, or with lanes the
+few whose lanes had not all committed). A chain written by this sluice
+records each change's apply identity (the source's transaction id and
+the change's ordinal), and the target's apply marks then skip the
+re-delivered changes that already landed: the re-run is exactly-once,
+for tables without a key and for key changes alike. The exception is a
+change the source could not name (a VStream COPY row, a MySQL
+transaction without a GTID or server identity, an ADD COLUMN fill row):
+on a keyed table it converges by its key, and the broker logs
+`BROKER-UNIDENTIFIED-CHANGES`; on a keyless table it is refused.
+
+`--reset-target-data` works whether or not the target already holds
+the broker's position (it clears the position first). `--at-chain-id`
+is for a target with no position: over an existing one that it does
+not match, it refuses with `BROKER-AT-CHAIN-ID-CONFLICT`.
 
 A chain written by an older sluice, or an incremental smart
 compaction rewrote, records no identities. There the in-flight
@@ -344,7 +354,9 @@ bug; file it.
 
 - **Cold-start without `--at-chain-id`.** The refusal names the
   recovery path; pass the flag once on first launch and don't
-  pass it again on restart.
+  pass it again on restart (once the target holds a position, an
+  `--at-chain-id` that does not match it refuses with
+  `BROKER-AT-CHAIN-ID-CONFLICT`).
 - **Keyless tables on an older chain.** The broker refuses an
   incremental that records no apply identities when it touches a
   table with no PRIMARY KEY and no NOT NULL UNIQUE index, and any

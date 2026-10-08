@@ -801,6 +801,24 @@ func writeString(h hash.Hash, s string) {
 	_, _ = io.WriteString(h, strconv.Itoa(len(s))+":"+s)
 }
 
+// ErrMarksRequired is what an applier returns, instead of WARNing and
+// applying without marks, when its caller required them
+// ([ir.ApplyMarksRequirer]) and the mark table turns out unusable as the
+// apply starts. Nothing of that apply has been written.
+var ErrMarksRequired = errors.New(UnavailableMarker + ": the apply marks this replay relies on are unusable, so nothing was applied")
+
+// Unavailable is the one decision every engine makes when its mark table is
+// unusable this run: with required false, WARN ([WarnUnavailable]) and return
+// nil so the caller disables the marks and applies; with required true,
+// return [ErrMarksRequired] wrapping cause.
+func Unavailable(ctx context.Context, engine, streamID string, required bool, cause error) error {
+	if required {
+		return fmt.Errorf("%s: applier: %w: %w", engine, ErrMarksRequired, cause)
+	}
+	WarnUnavailable(ctx, engine, streamID, cause)
+	return nil
+}
+
 // WarnUnavailable is the one WARN every engine logs when the mark table
 // cannot be used this run (operator decision 2: WARN and apply without marks —
 // never a new refusal). cause names why.
