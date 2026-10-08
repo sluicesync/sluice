@@ -226,6 +226,21 @@ func (p *chainTargetProjection) ProbeReplayKey(_ context.Context, table *ir.Tabl
 	return true, projectedKeySupplied(pt, irbackup.ReplaySuppliedColumns(table)), nil
 }
 
+// projectedKeySupplied is [irbackup.JudgeReplayKey]'s target half, answered
+// from the projected target table rather than a live catalog. It applies the
+// engine-neutral rules the live probes apply: a key needs a PRIMARY KEY or a
+// NOT NULL, non-partial, column-only UNIQUE (TableReplayIdempotent), whose
+// every column the later full supplies and the target does not generate.
+//
+// Residual, stated (v0.157.0 review item 3): the TARGET-dependent rules are
+// not projected, because the projection serves `backup verify` too, which has
+// no target. A DEFERRABLE key (a Postgres target refuses it as an ON CONFLICT
+// arbiter; a MySQL target emits it immediate), a vtgate keyspace whose
+// primary vindex the rows do not supply, and an index a cross-engine
+// translation drops are judged only by the live probe chain restore runs at
+// each later full (ChainRestore.applyFull) — loud, but after earlier links
+// were written, and `backup verify` passes such a chain. Pinned as
+// characterization by TestProjectedKeySupplied_ShapeMatrix.
 func projectedKeySupplied(pt *ir.Table, supplied []string) bool {
 	if !irbackup.TableReplayIdempotent(pt) {
 		return false
@@ -233,6 +248,17 @@ func projectedKeySupplied(pt *ir.Table, supplied []string) bool {
 	have := make(map[string]bool, len(supplied))
 	for _, c := range supplied {
 		have[c] = true
+	}
+	// A key column the projected TARGET table generates is never supplied,
+	// whatever the later full records: the live probes say the same
+	// (postgres loadGeneratedColumns, the MySQL GENERATED check), and
+	// without this the projection called such a key collidable and the
+	// refusal arrived only at applyFull's live probe, after part-writing
+	// (v0.157.0 review item 3).
+	for _, c := range pt.Columns {
+		if c != nil && c.IsGenerated() {
+			delete(have, c.Name)
+		}
 	}
 	allSupplied := func(idx *ir.Index) bool {
 		for _, c := range idx.Columns {
