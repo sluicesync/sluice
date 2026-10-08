@@ -290,9 +290,12 @@ SIGINT/SIGTERM — or `q`/ctrl+c on the live panel — cancels the run
 immediately: if it lands between incrementals the exit is still 0,
 but if it lands while an incremental is being applied the broker
 exits non-zero with an error carrying `BROKER-INCREMENTAL-PARTIAL`,
-naming the incremental. Re-run the same command; it re-applies that
-incremental, which converges unless the incremental changed key
-values (see above; then use `--reset-target-data`). A cancel during a `--reset-target-data`
+naming the incremental. Re-run the same command; it resumes inside
+that incremental and re-applies only from the first source
+transaction not durably applied. Where the incremental records apply
+identities that re-run is exactly-once; where it records none, it
+converges unless that transaction changed key values (see above; then
+use `--reset-target-data`). A cancel during a `--reset-target-data`
 cold start, once it has begun dropping the target's tables, exits
 non-zero with `BROKER-COLD-START-PARTIAL`: the target holds a partial
 restore and no position, so re-run with `--reset-target-data` (never
@@ -303,8 +306,11 @@ chain carries keyless tables, compare those tables with the source:
 releases v0.99.222 through v0.156.10 re-applied an interrupted
 incremental into them and duplicated its committed rows at exit 0
 (v0.20.0 through v0.99.221 skipped the rest of the interrupted
-incremental instead). The current release refuses to start on such a
-chain, so the comparison is the only way to learn whether the target
+incremental instead). The current release refuses each incremental
+of such a chain that touches a keyless table and records no apply
+identities (v0.156.11 and v0.156.12 refused every keyless table in the
+chain), but it cannot see a divergence an older release already left
+behind, so the comparison is the only way to learn whether the target
 already diverged.
 
 ### Producer crash

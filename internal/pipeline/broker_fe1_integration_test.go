@@ -349,7 +349,7 @@ func TestFE1_Broker_KeylessChain_ExactlyOnceOrRefused(t *testing.T) {
 }
 
 // TestFE1_Broker_KeyedChain_ConvergesAndCancelIsLoud is the keyed half: the
-// interrupted incremental is re-applied whole and converges, in both apply
+// interrupted incremental is resumed and converges, in both apply
 // modes; a cancel mid-incremental is BROKER-INCREMENTAL-PARTIAL; a cancel
 // while idle is a clean exit.
 func TestFE1_Broker_KeyedChain_ConvergesAndCancelIsLoud(t *testing.T) {

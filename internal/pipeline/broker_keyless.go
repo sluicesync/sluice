@@ -136,8 +136,9 @@ func (b *SyncFromBackup) coldStartPartialOr(ctx context.Context, err error) erro
 //
 // Audit F-E1 (a): a cancel that lands while an incremental is being applied
 // is NOT a clean stop. Part of the incremental may be committed and the
-// position was not advanced past it, so exit 0 would tell a supervisor the
-// run ended cleanly when the next run will re-apply the whole incremental.
+// position stands inside it (ADR-0191), so exit 0 would tell a supervisor the
+// run ended cleanly when the next run will re-apply the in-flight source
+// transaction — exactly-once only where the incremental records identities.
 // The partial arm is checked BEFORE the clean-cancel arm, and the partial
 // error does not unwrap to context.Canceled, so no caller up the stack can
 // launder it back into a clean exit. Any other cancel — the tick had applied
