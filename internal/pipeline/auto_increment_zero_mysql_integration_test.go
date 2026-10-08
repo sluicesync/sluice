@@ -375,6 +375,21 @@ func TestSyncFromBackup_MySQL_AutoIncrementZero(t *testing.T) {
 	brokerErr := make(chan error, 1)
 	go func() { brokerErr <- broker.Run(bctx) }()
 	waitForAIZeroMatch(t, sourceDSN, brokerTargetDSN, "bz", 60*time.Second)
+	// The rows can match before the broker records the incremental as fully
+	// applied (its position write follows the data), and a cancel in that
+	// window is, correctly, BROKER-INCREMENTAL-PARTIAL. Wait for the
+	// position to name the chain's tail, so the cancel lands between ticks.
+	chain, err := (&SyncFromBackup{Store: store, ChainURL: "x", StreamID: "x"}).brokerChain(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tail := lineage.ManifestBackupID(chain[len(chain)-1].Manifest)
+	for deadline := time.Now().Add(60 * time.Second); !strings.Contains(positionOrEmpty("mysql", brokerTargetDSN, "aiz-broker"), `"last_applied_backup_id":"`+tail+`"`); {
+		if time.Now().After(deadline) {
+			t.Fatal("the broker never recorded the chain's tail as applied")
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
 	bcancel()
 	select {
 	case err := <-brokerErr:
