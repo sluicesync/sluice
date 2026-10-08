@@ -236,7 +236,7 @@ func r297BuildRotatedChain(t *testing.T, side r297Side, eng ir.Engine, src strin
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	time.Sleep(4 * time.Second) // let the tail rollover commit
+	r297AwaitChainCovers(t, side, store, src, streamErr, map[string]string{"kd": "id", "kl": "a"})
 	cancel()
 	select {
 	case err := <-streamErr:
@@ -307,7 +307,9 @@ func runBug297(t *testing.T, side r297Side) {
 	}
 	got := r297Ints(t, side, tgt, "SELECT id FROM kd ORDER BY id")
 	if !reflect.DeepEqual(got, want) {
-		t.Errorf("kd after the rotated restore = %v (%d rows); source = %v (%d rows)", got, len(got), want, len(want))
+		// The fixture waited for the chain to record the whole source, so a
+		// mismatch here is restore disagreeing with its own chain.
+		t.Errorf("kd after the rotated restore = %v (%d rows); source, which the chain records = %v (%d rows)", got, len(got), want, len(want))
 	}
 	if r297TableExists(t, side, tgt, "kl") {
 		t.Error("kl was restored although excluded")
@@ -407,7 +409,7 @@ func TestBug297_RotationRefusedForAKeylessTableAddedMidStream_PG(t *testing.T) {
 	for !strings.Contains(logBuf.String(), string(sluicecode.CodeBackupRotatedKeylessTable)) && time.Now().Before(deadline) {
 		time.Sleep(300 * time.Millisecond)
 	}
-	time.Sleep(4 * time.Second)
+	r297AwaitChainCovers(t, side, store, src, streamErr, map[string]string{"kd": "id", "kl": "a"})
 	cancel()
 	if err := <-streamErr; err != nil {
 		t.Fatalf("stream.Run = %v; want clean exit (a refused rotation stays on the open segment)", err)
