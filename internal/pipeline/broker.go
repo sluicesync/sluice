@@ -323,6 +323,10 @@ type SyncFromBackup struct {
 	// anything (see Run).
 	resetOverPosition bool
 
+	// classicSuspect is the incremental a resumed classic-token broker may
+	// have been inside ([SyncFromBackup.noteClassicResume]); "" otherwise.
+	classicSuspect string
+
 	// pidHostFn returns the (pid, host) pair recorded on the liveness
 	// file. Defaults to (os.Getpid, os.Hostname); tests inject a stub.
 	pidHostFn func() (int, string)
@@ -791,6 +795,11 @@ func (b *SyncFromBackup) resolveStart(ctx context.Context, applier ir.ChangeAppl
 		}
 		if err := b.refuseAtChainIDOverPosition(tok); err != nil {
 			return "", err
+		}
+		if tok.Engine == BackupBrokerPositionEngine {
+			if err := b.noteClassicResume(ctx, tok.LastAppliedBackupID); err != nil {
+				return "", err
+			}
 		}
 		// Audit F-E1, per incremental since ADR-0191 §3.5: the door runs at
 		// start for the incremental this broker is inside or about to start,

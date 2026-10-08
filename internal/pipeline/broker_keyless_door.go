@@ -183,6 +183,11 @@ func (b *SyncFromBackup) exactlyOnceBlocker(ctx context.Context, applier ir.Chan
 	if j.keyless.Reason == migcore.ReplayKeylessTargetUnjudged {
 		return needs, nil
 	}
+	if b.classicSuspect != "" && b.classicSuspect == lineage.ManifestBackupID(link.Manifest) {
+		return needs + "; and " + BrokerClassicResumeMarker + ": this broker resumes from a position written by sluice " +
+			"v0.156.12 or older, which kept no apply marks, so if that run was interrupted inside this incremental, the " +
+			"rows it committed cannot be told apart from the ones still to apply", nil
+	}
 	if !link.Manifest.ApplyIdentity {
 		return needs + "; and this incremental records no change identities (it was written before ADR-0191, or rewritten by " +
 			"smart compaction), so an interrupted replay of it cannot be made exactly-once", nil
@@ -331,6 +336,42 @@ func (b *SyncFromBackup) refuseKeylessAtColdStart(ctx context.Context, applier i
 		return b.refuseKeylessResetTarget(ctx, applier)
 	case b.AtChainID != "":
 		return b.refuseKeylessAtStart(ctx, applier, b.AtChainID)
+	}
+	return nil
+}
+
+// BrokerClassicResumeMarker is the grep-stable token on the keyless refusal
+// for the one incremental a resumed classic-token broker may have been
+// inside (see [SyncFromBackup.noteClassicResume]).
+const BrokerClassicResumeMarker = "BROKER-CLASSIC-RESUME"
+
+// noteClassicResume handles a warm resume over a CLASSIC `backup-broker`
+// token — one written by v0.156.12 or older (ADR-0191 review, v0.157.0). That
+// token proves the previous run kept no frontier and wrote no apply marks, so
+// if it was interrupted inside the incremental after lastAppliedID, that
+// incremental's committed prefix is on the target with nothing to skip it: a
+// keyless table it touches would gain a duplicate of every row of the prefix
+// on this run, identities or not. (Releases v0.156.11 and v0.156.12 refused
+// keyless tables before applying anything, so in practice the exposure is a
+// v0.156.10-or-older broker — but the token does not say which release wrote
+// it, so the rule keys on the token.) The keyless lift is withheld for exactly
+// that incremental — the next one after lastAppliedID that the chain already
+// holds; one appended after this resume cannot have been started by the old
+// binary — which restores v0.156.12's refusal for it and for nothing else.
+func (b *SyncFromBackup) noteClassicResume(ctx context.Context, lastAppliedID string) error {
+	chain, err := b.brokerChain(ctx)
+	if err != nil {
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("broker: build chain: %w", err))
+	}
+	idx, err := brokerAppliedPrefix(chain, lastAppliedID)
+	if err != nil {
+		return nil //nolint:nilerr // the warm resume's own tick names the missing id
+	}
+	for i := idx; i < len(chain); i++ {
+		if lineage.CanonicalKind(chain[i].Manifest.Kind) == irbackup.BackupKindIncremental {
+			b.classicSuspect = lineage.ManifestBackupID(chain[i].Manifest)
+			return nil
+		}
 	}
 	return nil
 }
