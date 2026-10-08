@@ -43,7 +43,10 @@ func TestBroker_ResetOverAnExistingPosition(t *testing.T) {
 	tokens := map[string]ir.Position{
 		"clean token":       encodeBrokerPosition("test://fe1", fullID),
 		"in-progress token": encodeBrokerFrontier("test://fe1", fullID, &brokerInProgress{BackupID: "x", Chunks: strings.Repeat("0", 64), Through: 3}),
-		"corrupt token":     {Engine: BackupBrokerPositionEngineV2, Token: `{"_engine":"` + BackupBrokerPositionEngineV2 + `","last_applied_backup_id":""}`},
+		"corrupt token":     {Engine: BackupBrokerPositionEngineV2, Token: `{"_engine":"` + BackupBrokerPositionEngineV2 + `","last_applied_backup_id":"x","in_progress":{"backup_id":"","chunks":"","through":0}}`},
+	}
+	if _, err := decodeBrokerPosition(tokens["corrupt token"]); err == nil {
+		t.Fatal("the corrupt-token fixture decodes: the cell would grade a clean token twice")
 	}
 	for name, tok := range tokens {
 		t.Run(name, func(t *testing.T) {
