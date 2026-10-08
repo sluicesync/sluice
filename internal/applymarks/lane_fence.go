@@ -78,6 +78,7 @@ type fenceState struct {
 // persisted position already sits at the transaction's start. The coordinator
 // calls it after the fence's drain.
 func (f *LaneFence) Open(txID string, anchored bool) {
+	txID = MarkTxKey(txID)
 	f.state.Store(&fenceState{tx: txID, anchored: anchored})
 }
 
@@ -87,6 +88,7 @@ func (f *LaneFence) Open(txID string, anchored bool) {
 // fence drains it — but the check keeps a late call from anchoring the wrong
 // one).
 func (f *LaneFence) Anchor(txID string) {
+	txID = MarkTxKey(txID)
 	for {
 		cur := f.state.Load()
 		if cur == nil || cur.tx != txID || cur.anchored {
@@ -103,6 +105,9 @@ func (f *LaneFence) Anchor(txID string) {
 // fenced transaction, and that transaction is anchored or this batch is its
 // fold. An empty ms is trivially admitted.
 func (f *LaneFence) Admits(ms []Mark, foldTx string) bool {
+	if foldTx != "" {
+		foldTx = MarkTxKey(foldTx)
+	}
 	p := f.state.Load()
 	for _, m := range ms {
 		if p == nil || m.TxID != p.tx || (!p.anchored && foldTx != p.tx) {

@@ -51,6 +51,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	gomysql "github.com/go-sql-driver/mysql"
 
@@ -304,10 +305,49 @@ func (a *ChangeApplier) applyMarkFenceTx(ctx context.Context, c ir.Change) strin
 	return id.TxID
 }
 
+// markFieldsFit is the defensive half of the v0.157.0 review's HIGH: every
+// identifier column of the MySQL mark table is VARCHAR(255), and a value
+// longer than that fails the apply with 1406 under the strict sql_mode sluice
+// sets — or, under a relaxed one, is TRUNCATED, so the reloaded mark stops
+// matching the change it vouches for and that change re-applies (a keyless
+// duplicate). [applymarks.MarkTxKey] makes tx_id fit by construction; this
+// refuses, before any statement, a plan whose stream id, table, tx_id or
+// scope would still not fit, so no sql_mode can turn it into a silent
+// truncation. Counted in characters, as the column is.
+func markFieldsFit(streamID string, pl applymarks.Plan) error {
+	check := func(column, v string) error {
+		if n := utf8.RuneCountInString(v); n > applymarks.MarkTxIDMaxLen {
+			return fmt.Errorf("mysql: applier: an apply mark's %s is %d characters, longer than the mark table's VARCHAR(%d); "+
+				"refusing to write it (a truncated mark would stop matching its change): %.80q…",
+				column, n, applymarks.MarkTxIDMaxLen, v)
+		}
+		return nil
+	}
+	if err := check("stream_id", streamID); err != nil {
+		return err
+	}
+	for _, m := range pl.Upserts {
+		for _, f := range [][2]string{{"table_name", m.Table}, {"tx_id", m.TxID}, {"scope_digest", m.ScopeDigest}} {
+			if err := check(f[0], f[1]); err != nil {
+				return err
+			}
+		}
+	}
+	for _, tx := range pl.Deletes {
+		if err := check("tx_id", tx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // execApplyMarksTx runs a plan on the apply transaction.
 func (a *ChangeApplier) execApplyMarksTx(ctx context.Context, tx *sql.Tx, pl applymarks.Plan) error {
 	if pl.Empty() {
 		return nil
+	}
+	if err := markFieldsFit(a.marks.StreamID(), pl); err != nil {
+		return err
 	}
 	stmts, args := applyMarkStatements(a.controlKeyspace, a.marks.StreamID(), a.upsert, pl)
 	for i, s := range stmts {

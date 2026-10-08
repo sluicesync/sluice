@@ -63,6 +63,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/laneapply"
@@ -113,6 +114,69 @@ type Mark struct {
 	// written; a replay under a different scope may number its changes
 	// differently, so it refuses rather than trusting the mark.
 	ScopeDigest string
+}
+
+// MarkTxIDMaxLen is the longest transaction key a mark stores: the MySQL
+// mark table's `tx_id VARCHAR(255)` (the Postgres one is TEXT). Every key
+// [MarkTxKey] produces fits it, by construction.
+const MarkTxIDMaxLen = 255
+
+// markTxDigestPrefixLen is how much of an over-long TxID [MarkTxKey] keeps
+// readable before the digest: 128 + len(":sha256:") + 64 = 200 bytes.
+const markTxDigestPrefixLen = 128
+
+// MarkTxKey is the transaction key a mark is stored and compared under: the
+// TxID itself when it fits [MarkTxIDMaxLen] bytes, otherwise its first 128
+// bytes, ":sha256:" and the SHA-256 hex of the WHOLE TxID (200 bytes).
+//
+// # Why (v0.157.0 pre-release review, HIGH)
+//
+// A reader's TxID is not bounded: a VStream transaction is named by its
+// shard's executed GTID set, about 46 bytes per server UUID, and a
+// long-lived shard gains a UUID with every reparent — five are already past
+// 255. Stored raw into the MySQL mark table, that failed the apply with 1406
+// under the strict sql_mode sluice sets, and under a relaxed one MySQL
+// truncated it, so the reloaded mark named "another transaction", the
+// change re-applied, and a keyless table the broker had lifted gained a
+// duplicate at exit 0.
+//
+// # One place, both directions
+//
+// Every TxID enters this package through the Tracker's and the LaneFence's
+// methods, and each keys it here on the way in — the identity a change
+// carries (Decide, Skips, WouldMark), the transactions a checkpoint closes
+// (CloseTxs), the fence's transaction and fold ticket, and every mark loaded
+// back from the target (Load). So a mark is written, compared, closed and
+// deleted under the same key, and nothing outside this package ever sees a
+// raw TxID next to a stored one. The key is deterministic (stable across
+// runs and binaries) and idempotent (a key is its own key), and needs no
+// schema change. A TxID of 255 bytes or fewer is unchanged, so marks written
+// before this rule still match.
+//
+// The producers, by code reading (internal/engines): Postgres
+// "pg:<system id>:<timeline>:<commit LSN>" and the MySQL/MariaDB binlog
+// reader's ONE GTID per transaction ("<uuid>:<n>", "<uuid>:<tag>:<n>",
+// MariaDB "<domain>-<server>-<seq>") or "filepos:<server_uuid>:<file>:<pos>"
+// are all well under 255 bytes, as are the trigger engines'
+// "<engine>:<id>:<stamp>". Only VStream's
+// "vstream:<keyspace>/<shard>:<the shard's executed GTID SET>" grows without
+// bound. Nothing here depends on that census: every TxID is keyed.
+func MarkTxKey(txID string) string {
+	if len(txID) <= MarkTxIDMaxLen {
+		return txID
+	}
+	sum := sha256.Sum256([]byte(txID))
+	cut := markTxDigestPrefixLen
+	for cut > 0 && !utf8.RuneStart(txID[cut]) {
+		cut-- // never split a multi-byte character: the column is utf8mb4
+	}
+	return txID[:cut] + ":sha256:" + hex.EncodeToString(sum[:])
+}
+
+// keyedID is id with its TxID replaced by its [MarkTxKey].
+func keyedID(id ir.ApplyID) ir.ApplyID {
+	id.TxID = MarkTxKey(id.TxID)
+	return id
 }
 
 // slot is a mark's identity within one stream: the table's primary key
@@ -178,6 +242,12 @@ type Tracker struct {
 	closed       map[string]bool
 	swept        bool
 
+	// storedAs maps a transaction key to the raw tx_id a loaded mark was
+	// stored under, when the two differ: a Postgres mark written before
+	// [MarkTxKey] holds an over-long TxID raw. A delete of the key then names
+	// both, so that row is retired with its transaction instead of lingering.
+	storedAs map[string]string
+
 	// firstTx is the first identity-carrying transaction this apply run
 	// delivered — the only one a loaded mark may vouch for (see consult).
 	// First writer wins; Load resets it.
@@ -201,8 +271,16 @@ func (t *Tracker) Load(streamID, scope string, marks []Mark) {
 	t.dirty = map[string]bool{}
 	t.open = map[string]bool{}
 	t.closed = map[string]bool{}
+	t.storedAs = map[string]string{}
 	t.swept = false
 	for _, m := range marks {
+		// A Postgres mark (tx_id TEXT) written before MarkTxKey can hold
+		// a raw over-long TxID; keying it here makes it match the key its
+		// re-delivered change is compared under. Already keyed: unchanged.
+		if key := MarkTxKey(m.TxID); key != m.TxID {
+			t.storedAs[key] = m.TxID
+			m.TxID = key
+		}
 		t.loaded[m.slot()] = m
 		t.loadedTables[m.Table] = true
 		t.dirty[m.TxID] = true
@@ -272,7 +350,7 @@ func (t *Tracker) Decide(c ir.Change, s Subject) (Decision, error) {
 	if !involved {
 		return Decision{}, nil
 	}
-	id := ir.ApplyIDOf(c)
+	id := keyedID(ir.ApplyIDOf(c))
 	t.noteOpen(id.TxID)
 	if d.Skip {
 		t.skipped.Add(1)
@@ -310,7 +388,7 @@ func (t *Tracker) verdict(c ir.Change, s Subject) (d Decision, involved bool, er
 	if !t.enabled.Load() {
 		return Decision{}, false, nil
 	}
-	id := ir.ApplyIDOf(c)
+	id := keyedID(ir.ApplyIDOf(c))
 	if id.IsZero() {
 		return Decision{}, false, nil
 	}
@@ -447,6 +525,7 @@ func (t *Tracker) CloseTxs(txIDs []string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	for _, tx := range txIDs {
+		tx = MarkTxKey(tx)
 		t.closed[tx] = true
 		delete(t.open, tx)
 	}
@@ -618,6 +697,9 @@ func (t *Tracker) Plan(p *Pending, gc bool) Plan {
 			pl.closing = append(pl.closing, tx)
 			if t.dirty[tx] {
 				pl.Deletes = append(pl.Deletes, tx)
+				if raw, ok := t.storedAs[tx]; ok {
+					pl.Deletes = append(pl.Deletes, raw)
+				}
 			}
 		}
 		sort.Strings(pl.Deletes)
@@ -641,6 +723,7 @@ func (t *Tracker) Committed(pl Plan) {
 	for _, tx := range pl.closing {
 		delete(t.dirty, tx)
 		delete(t.closed, tx)
+		delete(t.storedAs, tx)
 	}
 }
 
