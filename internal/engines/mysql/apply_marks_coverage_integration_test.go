@@ -132,7 +132,8 @@ func TestChangeApplier_RequireApplyMarks(t *testing.T) {
 			t.Errorf("batch %d, marks required: ApplyBatch = %v; want ErrMarksRequired", batch, err)
 		}
 		if n := count(); n != 0 {
-			t.Fatalf("batch %d, marks required: the refused apply wrote %d row(s)", batch, n)
+			t.Errorf("batch %d, marks required: the refused apply wrote %d row(s)", batch, n)
+			applyMySQLApplier(t, dsn, `DELETE FROM kl;`)
 		}
 	}
 	req.RequireApplyMarks(false)
