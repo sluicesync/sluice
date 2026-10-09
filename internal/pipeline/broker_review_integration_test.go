@@ -25,6 +25,7 @@ package pipeline
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"math/rand"
 	"strings"
@@ -438,8 +439,12 @@ UPDATE su SET u = 'u%[2]d' WHERE id = 1; UPDATE su SET u = 'w%[2]d' WHERE id = 2
 					cancel()
 					runs++
 					if err != nil {
-						msg := err.Error()
-						if !strings.Contains(msg, BrokerIncrementalPartialMarker) && !strings.Contains(msg, "context deadline exceeded") && !strings.Contains(msg, "context canceled") {
+						// A stop is graded by errors.Is, the contract every caller
+						// uses — not by the message: a DNS lookup that hits the
+						// run's deadline unwraps to context.DeadlineExceeded
+						// (net.DNSError) while its text says only "i/o timeout".
+						stopped := errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+						if !stopped && !strings.Contains(err.Error(), BrokerIncrementalPartialMarker) {
 							t.Errorf("[%s] run %d: unexpected error: %v", name, runs, err)
 							return
 						}
@@ -449,7 +454,16 @@ UPDATE su SET u = 'u%[2]d' WHERE id = 1; UPDATE su SET u = 'w%[2]d' WHERE id = 2
 				partialsTotal.Store(name, partials)
 				if !atTail(dsn, name) {
 					// The storm's runs are short; finish uninterrupted, batched.
-					fb := bc.broker(dsn, name, mode.conc, "")
+					// With the same --at-chain-id rule as the storm: under load
+					// every short run can be cancelled before its cold start
+					// records a position (the keyless door decodes the whole
+					// incremental first), and a finish without the assertion
+					// then refuses as a cold start with no override.
+					finishAt := ""
+					if positionOrEmpty(e.driver, dsn, name) == "" {
+						finishAt = c.fullID
+					}
+					fb := bc.broker(dsn, name, mode.conc, finishAt)
 					fb.ApplyBatchSize = 200
 					fb.PollInterval = 100 * time.Millisecond
 					if err := bc.runToTailWithin(dsn, fb, 10*time.Minute); err != nil {
