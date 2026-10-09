@@ -21,7 +21,7 @@ import (
 )
 
 // TestFindReplayKeylessTables_RealPostgresCancelIsTheCancel is the
-// environmental premise behind [migcore.ProbeErrOrCancel], against a real
+// environmental premise behind [migcore.ErrOrCancel], against a real
 // server: a context that ends while the keyless door is probing a Postgres
 // target comes back from the driver in shapes that are NOT the context error
 // (pgx's write-path `i/o timeout`, database/sql's `driver: bad connection` on
@@ -33,7 +33,7 @@ import (
 // the helper re-attributed is logged, NOT floored, because how often the
 // race lands is the scheduler's choice — a forensic loop of bare
 // ProbeReplayKey calls saw 24 in 6,000, this loop usually sees none, and its
-// one catch so far was the dial-timeout shape [migcore.ProbeErrOrCancel]'s
+// one catch so far was the dial-timeout shape [migcore.ErrOrCancel]'s
 // deadline check exists for. A floor would be a flake; its job is to fail on
 // any NEW shape. The deterministic pins are
 // TestFindReplayKeylessTables_ProbeFailureUnderCancelIsTheCancel (migcore) and

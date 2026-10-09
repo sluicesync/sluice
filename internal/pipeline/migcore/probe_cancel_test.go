@@ -19,7 +19,7 @@ import (
 
 // cancellingProber stops the run while its probe is in flight and then
 // fails the way the driver does in that window — the shapes measured against
-// a real Postgres (see [ProbeErrOrCancel]).
+// a real Postgres (see [ErrOrCancel]).
 type cancellingProber struct {
 	stop  func()
 	err   error
@@ -104,13 +104,13 @@ func (deadlinePassedTimerPending) Deadline() (time.Time, bool) {
 	return time.Now().Add(-time.Millisecond), true
 }
 
-// TestProbeErrOrCancel_DeadlinePassedBeforeItsTimerFired pins [ctxEnded]: a
+// TestErrOrCancel_DeadlinePassedBeforeItsTimerFired pins [ctxEnded]: a
 // dial timeout that beats the context's own timer is still the deadline.
-func TestProbeErrOrCancel_DeadlinePassedBeforeItsTimerFired(t *testing.T) {
+func TestErrOrCancel_DeadlinePassedBeforeItsTimerFired(t *testing.T) {
 	ctx := deadlinePassedTimerPending{context.Background()}
 	dial := errors.New("failed to connect: dial error: timeout: dial tcp 127.0.0.1:5432: i/o timeout")
-	if err := ProbeErrOrCancel(ctx, dial); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("ProbeErrOrCancel = %v; want DeadlineExceeded: the deadline had passed", err)
+	if err := ErrOrCancel(ctx, dial); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ErrOrCancel = %v; want DeadlineExceeded: the deadline had passed", err)
 	}
 }
 

@@ -59,6 +59,11 @@ type brokerIncrementalPartialError struct {
 	identity bool
 }
 
+// CancelVerdict marks this error as the run's own report of the cancel, so
+// [SyncFromBackup.Run]'s exit attribution ([migcore.ErrOrCancel]) never
+// turns it back into the bare cancellation.
+func (e *brokerIncrementalPartialError) CancelVerdict() {}
+
 func (e *brokerIncrementalPartialError) Error() string {
 	head := fmt.Sprintf(
 		"broker: %s: the run was interrupted partway through incremental %s. The broker's position stands INSIDE it, at "+
@@ -106,6 +111,9 @@ type brokerColdStartPartialError struct {
 	streamID string
 	cause    error
 }
+
+// CancelVerdict: see [brokerIncrementalPartialError.CancelVerdict].
+func (e *brokerColdStartPartialError) CancelVerdict() {}
 
 func (e *brokerColdStartPartialError) Error() string {
 	return fmt.Sprintf(

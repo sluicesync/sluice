@@ -5,10 +5,8 @@ package migcore
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
-	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
@@ -144,7 +142,7 @@ func FindReplayKeylessTables(
 		if checker != nil {
 			empty, err := checker.IsTableEmpty(ctx, t)
 			if err != nil {
-				return nil, fmt.Errorf("probe target table %q for rows: %w", t.Name, ProbeErrOrCancel(ctx, err))
+				return nil, fmt.Errorf("probe target table %q for rows: %w", t.Name, ErrOrCancel(ctx, err))
 			}
 			if empty {
 				continue
@@ -159,7 +157,7 @@ func FindReplayKeylessTables(
 		// "absent" cannot be (ReplayKeylessTargetUnjudged).
 		verdict, err := irbackup.JudgeReplayKey(ctx, prober, t)
 		if err != nil {
-			return nil, fmt.Errorf("probe target table %q for a replay key: %w", t.Name, ProbeErrOrCancel(ctx, err))
+			return nil, fmt.Errorf("probe target table %q for a replay key: %w", t.Name, ErrOrCancel(ctx, err))
 		}
 		switch verdict {
 		case irbackup.ReplayKeylessRecorded:
@@ -176,59 +174,6 @@ func FindReplayKeylessTables(
 		}
 	}
 	return out, nil
-}
-
-// ProbeErrOrCancel reports a door's target-probe failure AS the run's
-// cancellation when ctx is already done, and returns err unchanged otherwise.
-//
-// Why it exists: a context that ends while a probe is mid-call does not
-// reliably come back as a context error. pgx (v5.10) cancels an in-flight
-// call by moving the socket's deadline into the past, and its WRITE path
-// returns that as a bare `write failed: ... i/o timeout` — its read path
-// normalizes the same timeout to the context error, its write path does not;
-// a connection it closed on that cancel then comes back from database/sql as
-// `driver: bad connection` to the next statement of the same transaction; and
-// a dial that times out on the deadline pgx derived from ctx's can return
-// before ctx's own timer has fired (see [ctxEnded]). None of these unwraps to
-// context.Canceled or DeadlineExceeded, so a broker stopped while its keyless
-// door was probing the target reported a failure — a non-zero exit with a
-// network-looking cause — instead of the clean stop it documents for a cancel
-// between incrementals, which is where the door runs. Found by CI's
-// TestBroker_CancelStorm_Postgres on v0.157.0; ground-truthed with a loop of
-// 6,000 deadline-bounded Postgres ProbeReplayKey calls (1 write-path timeout,
-// 23 bad connections). The broker's applies were never exposed: an
-// interrupted apply is classified by ctx.Err(), not by the error's shape.
-//
-// The door has applied nothing when it probes, so attributing the failure to
-// the cancel is the safe direction — the same rule the engines' appliers
-// follow (applierErrorOrShutdown). The probe's own error is kept in the
-// message for diagnosis but is not wrapped: a cancelled run must not surface
-// a probe's coded refusal it never finished judging.
-func ProbeErrOrCancel(ctx context.Context, err error) error {
-	if err == nil {
-		return nil
-	}
-	ctxErr := ctxEnded(ctx)
-	if ctxErr == nil || errors.Is(err, ctxErr) {
-		return err
-	}
-	//nolint:errorlint // the probe error is deliberately NOT wrapped: see the doc above
-	return fmt.Errorf("%w (the run was cancelled while the probe was in flight; it reported: %v)", ctxErr, err)
-}
-
-// ctxEnded is ctx.Err(), plus DeadlineExceeded once ctx's deadline has
-// passed even if its timer has not fired yet. The driver derives its own
-// socket and dial deadlines from ctx's, so a dial can time out first and
-// return while ctx.Err() still reads nil — seen as `failed to connect: dial
-// error: timeout` by TestFindReplayKeylessTables_RealPostgresCancelIsTheCancel.
-func ctxEnded(ctx context.Context) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if d, ok := ctx.Deadline(); ok && !time.Now().Before(d) {
-		return context.DeadlineExceeded
-	}
-	return nil
 }
 
 // errReplayDoorSurface is the fail-closed refusal for a target writer that

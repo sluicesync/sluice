@@ -495,7 +495,21 @@ func isBrokerToken(pos ir.Position) bool {
 // incremental's data + schema deltas, the broker's position row in
 // `sluice_cdc_state` advances to that incremental's BackupID, and
 // `broker_state.json` is updated with the apply timestamp.
+//
+// Every failure leaves through ONE attribution: a failure while ctx has
+// ended is reported as the cancellation ([migcore.ErrOrCancel]) unless it is
+// a coded refusal or one of the two partial errors above. The target driver
+// does not report a mid-call cancel as a context error (pgx's write path,
+// database/sql's bad connection), and every statement the broker sends —
+// control table, position read and write, the keyless door's probes, the
+// chain walk — is exposed to that; v0.157.0's CI found it at two of them in
+// turn, so the rule lives here rather than at each call site.
 func (b *SyncFromBackup) Run(ctx context.Context) error {
+	return migcore.ErrOrCancel(ctx, b.run(ctx))
+}
+
+// run is [SyncFromBackup.Run] before its exit attribution.
+func (b *SyncFromBackup) run(ctx context.Context) error {
 	if err := b.validate(); err != nil {
 		return err
 	}
