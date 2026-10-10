@@ -403,13 +403,14 @@ func TestEmptyTxRuns_LiveSyncCatchUp(t *testing.T) {
 	}
 
 	ctx1, cancel1 := context.WithCancel(context.Background())
-	done1 := make(chan error, 1)
-	go func() { done1 <- streamer().Run(ctx1) }()
-	if !waitForRowCountMySQL(t, dst, "kd", 1, 60*time.Second) {
-		t.Fatal("the cold start never copied the seed row")
-	}
+	run1 := startStream(ctx1, streamer())
+	// Stop only after the anchor is persisted, for the reason liveHeadRun.run
+	// gives: a stop inside the copy makes the second run a refused cold start.
+	run1.await(t, "the cold start copying the seed row and persisting a position", 60*time.Second, 200*time.Millisecond,
+		func() bool { return pollRowCountMySQL(dst, "kd") >= 1 && e.persisted(dst, stream) != "" },
+		func() string { return "" })
 	cancel1()
-	<-done1
+	run1.join()
 
 	writes := e.countPositionWrites(dst)
 	e.foreign(3 * foreignTxs)
@@ -417,18 +418,17 @@ func TestEmptyTxRuns_LiveSyncCatchUp(t *testing.T) {
 
 	ctx2, cancel2 := context.WithCancel(context.Background())
 	defer cancel2()
-	done2 := make(chan error, 1)
-	go func() { done2 <- streamer().Run(ctx2) }()
-	if !waitForRowCountMySQL(t, dst, "kd", 3, 2*time.Minute) {
-		t.Fatal("the warm resume never applied the real transaction")
-	}
+	run2 := startStream(ctx2, streamer())
+	run2.await(t, "the warm resume applying the real transaction", 2*time.Minute, 200*time.Millisecond,
+		func() bool { return pollRowCountMySQL(dst, "kd") >= 3 },
+		func() string { return "" })
 	n := writes()
 	// Ground truth for the echo described above, logged rather than graded:
 	// how many position writes an idle same-server stream makes per second.
 	time.Sleep(2 * time.Second)
 	t.Logf("idle echo: %d position writes in 2 s after the catch-up", writes()-n)
 	cancel2()
-	<-done2
+	run2.join()
 	t.Logf("live catch-up: %d position writes for %d foreign transactions", n, 3*foreignTxs)
 	if n == 0 {
 		t.Fatal("the counter saw no position write: it graded nothing")
@@ -483,22 +483,18 @@ func (r *liveHeadRun) streamer() *Streamer {
 // foreign transactions was held, and must still have been released.
 func (r *liveHeadRun) run(t *testing.T, k int) {
 	ctx1, cancel1 := context.WithCancel(context.Background())
-	done1 := make(chan error, 1)
-	go func() { done1 <- r.streamer().Run(ctx1) }()
+	run1 := startStream(ctx1, r.streamer())
 	want := r.e.kdState(r.e.src)
-	deadline := time.Now().Add(90 * time.Second)
 	// Stop only once the stream has handed off to CDC and persisted a
 	// position: a stop inside the copy (the rows can be visible before the
-	// copy phase ends) leaves STOPPED-SLOT-KEPT and a re-run cold start,
-	// which is not the path under test.
-	for r.e.kdStateOrEmpty(r.target) != want || r.e.persisted(r.target, r.stream) == "" {
-		if time.Now().After(deadline) {
-			t.Fatalf("%s: the cold start never copied kd and persisted a position", r.mode.name)
-		}
-		time.Sleep(250 * time.Millisecond)
-	}
+	// copy phase ends) leaves STOPPED-SLOT-KEPT and a re-run cold start
+	// that refuses on the populated target, which is not the path under
+	// test.
+	run1.await(t, r.mode.name+": the cold start copying kd and persisting a position", 90*time.Second, 250*time.Millisecond,
+		func() bool { return r.e.kdStateOrEmpty(r.target) == want && r.e.persisted(r.target, r.stream) != "" },
+		func() string { return "" })
 	cancel1()
-	<-done1
+	run1.join()
 
 	writes := r.e.countPositionWrites(r.target)
 	before := writes()
@@ -510,35 +506,64 @@ func (r *liveHeadRun) run(t *testing.T, k int) {
 
 	ctx2, cancel2 := context.WithCancel(context.Background())
 	defer cancel2()
-	done2 := make(chan error, 1)
-	go func() { done2 <- r.streamer().Run(ctx2) }()
-	deadline = time.Now().Add(2 * time.Minute)
-	for r.e.kdStateOrEmpty(r.target) != want {
-		if time.Now().After(deadline) {
-			t.Fatalf("%s: the warm resume never applied the real transaction; target sessions: %s; source sessions: %s", r.mode.name, r.e.sessions(r.target), r.e.sessions(r.e.src))
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
+	run2 := startStream(ctx2, r.streamer())
+	run2.await(t, r.mode.name+": the warm resume applying the real transaction", 2*time.Minute, 100*time.Millisecond,
+		func() bool { return r.e.kdStateOrEmpty(r.target) == want },
+		func() string {
+			return fmt.Sprintf("target sessions: %s; source sessions: %s", r.e.sessions(r.target), r.e.sessions(r.e.src))
+		})
 	caughtUp := writes() - before
-	deadline = time.Now().Add(60 * time.Second)
 	var pos string
-	for {
-		pos = r.e.persisted(r.target, r.stream)
-		if pos != "" && r.headOK(pos) {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("%s: the persisted position never reached the source head after a foreign-only tail: %s", r.mode.name, pos)
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
+	run2.await(t, r.mode.name+": the persisted position reaching the source head after a foreign-only tail", 60*time.Second, 200*time.Millisecond,
+		func() bool {
+			pos = r.e.persisted(r.target, r.stream)
+			return pos != "" && r.headOK(pos)
+		},
+		func() string { return "persisted " + pos })
 	cancel2()
-	<-done2
+	run2.join()
 	t.Logf("%s: %d position writes up to the real transaction for %d foreign transactions; position reached the source head", r.mode.name, caughtUp, 3*foreignTxs)
 	if caughtUp > foreignTxs {
 		t.Errorf("%s: %d position writes for %d foreign transactions; want at most %d (one per foreign transaction is Bug 300)", r.mode.name, caughtUp, 3*foreignTxs, foreignTxs)
 	}
 }
+
+// runningStream is a Streamer.Run in flight. Its await is the only way this
+// suite polls the target while a stream runs, because a poll that does not
+// also watch the stream reads an early return as a stall: a re-run cold
+// start that REFUSED in under two seconds, loudly, was recorded as a
+// two-minute hang "right after snapshot captured" with idle sessions on
+// both servers (COLDSTART-RERUN-STALL, 2026-10-10 — the refusal was sitting
+// unread in the done channel the whole time).
+type runningStream struct{ done chan error }
+
+func startStream(ctx context.Context, s *Streamer) *runningStream {
+	r := &runningStream{done: make(chan error, 1)}
+	go func() { r.done <- s.Run(ctx) }()
+	return r
+}
+
+// await polls cond until it holds. It fails at once, with the stream's own
+// error, if the stream returns first — nothing under test returns before it
+// is stopped — and with diag() if timeout passes with the stream running.
+func (r *runningStream) await(t *testing.T, what string, timeout, every time.Duration, cond func() bool, diag func() string) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for !cond() {
+		select {
+		case err := <-r.done:
+			t.Fatalf("waiting for %s: the stream RETURNED instead: %v", what, err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("waiting for %s: still not there after %s with the stream running; %s", what, timeout, diag())
+		}
+		time.Sleep(every)
+	}
+}
+
+// join waits for a stopped stream to return.
+func (r *runningStream) join() { <-r.done }
 
 // kdStateOrEmpty is kdState, reading "" while the table does not exist yet.
 func (e *emptyTxEnv) kdStateOrEmpty(dsn string) string {
