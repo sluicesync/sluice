@@ -37,6 +37,7 @@ package pipeline
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -48,6 +49,7 @@ import (
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 const (
@@ -182,6 +184,7 @@ func (e *emptyTxEnv) countPositionWrites(dsn string) func() int {
 		}
 	}
 	applyDDLMySQL(t, dsn, `
+		CREATE DATABASE IF NOT EXISTS etx_audit;
 		CREATE TABLE IF NOT EXISTS etx_audit.pos_writes (n BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY);
 		CREATE TRIGGER etx_ins AFTER INSERT ON sluice_cdc_state FOR EACH ROW INSERT INTO etx_audit.pos_writes () VALUES ();
 		CREATE TRIGGER etx_upd AFTER UPDATE ON sluice_cdc_state FOR EACH ROW
@@ -436,4 +439,223 @@ func TestEmptyTxRuns_LiveSyncCatchUp(t *testing.T) {
 	if got, want := e.kdState(dst), e.kdState(src); got != want {
 		t.Errorf("the sync DIVERGES from the source: target {%s}, source {%s}", got, want)
 	}
+}
+
+// liveApplyMode is one apply path the live stage feeds.
+type liveApplyMode struct {
+	name        string
+	concurrency int
+	batchSize   int
+}
+
+var liveApplyModes = []liveApplyMode{
+	{"serial-batched", 1, 100},
+	{"per-change", 1, 1},
+	{"lanes", 2, 100},
+}
+
+// liveHeadRun is one live leg of the source-head pin: a stream into its own
+// target database, stopped, the source given foreign-only traffic around one
+// real transaction, then resumed.
+type liveHeadRun struct {
+	e        *emptyTxEnv
+	target   string // the target database's DSN
+	stream   string
+	mode     liveApplyMode
+	filter   migcore.TableFilter
+	headOK   func(persisted string) bool // persisted position reaches the source head
+	readHead func()                      // snapshot the head, after the traffic
+}
+
+func (r *liveHeadRun) streamer() *Streamer {
+	eng, _ := engines.Get(r.e.engine)
+	return &Streamer{
+		Source: eng, Target: eng, SourceDSN: r.e.src, TargetDSN: r.target, StreamID: r.stream,
+		ApplyConcurrency: r.mode.concurrency, ApplyBatchSize: r.mode.batchSize, Filter: r.filter,
+	}
+}
+
+// run is the leg. Graded: the position-write count during the catch-up is
+// bounded (Bug 300), the target equals the source, and — the independent
+// expected value — once the stream is quiet, the position it PERSISTED
+// reaches the source's own head read straight from the source server
+// (`@@GLOBAL.gtid_executed` / `pg_current_wal_lsn()`): the trailing run of
+// foreign transactions was held, and must still have been released.
+func (r *liveHeadRun) run(t *testing.T, k int) {
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	done1 := make(chan error, 1)
+	go func() { done1 <- r.streamer().Run(ctx1) }()
+	want := r.e.kdState(r.e.src)
+	deadline := time.Now().Add(90 * time.Second)
+	// Stop only once the stream has handed off to CDC and persisted a
+	// position: a stop inside the copy (the rows can be visible before the
+	// copy phase ends) leaves STOPPED-SLOT-KEPT and a re-run cold start,
+	// which is not the path under test.
+	for r.e.kdStateOrEmpty(r.target) != want || r.e.persisted(r.target, r.stream) == "" {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s: the cold start never copied kd and persisted a position", r.mode.name)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	cancel1()
+	<-done1
+
+	writes := r.e.countPositionWrites(r.target)
+	before := writes()
+	r.e.foreign(foreignTxs)
+	r.e.real(k)
+	r.e.foreign(2 * foreignTxs) // the stream ends on a foreign-only run
+	r.readHead()
+	want = r.e.kdState(r.e.src)
+
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	done2 := make(chan error, 1)
+	go func() { done2 <- r.streamer().Run(ctx2) }()
+	deadline = time.Now().Add(2 * time.Minute)
+	for r.e.kdStateOrEmpty(r.target) != want {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s: the warm resume never applied the real transaction; target sessions: %s; source sessions: %s", r.mode.name, r.e.sessions(r.target), r.e.sessions(r.e.src))
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	caughtUp := writes() - before
+	deadline = time.Now().Add(60 * time.Second)
+	var pos string
+	for {
+		pos = r.e.persisted(r.target, r.stream)
+		if pos != "" && r.headOK(pos) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s: the persisted position never reached the source head after a foreign-only tail: %s", r.mode.name, pos)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	cancel2()
+	<-done2
+	t.Logf("%s: %d position writes up to the real transaction for %d foreign transactions; position reached the source head", r.mode.name, caughtUp, 3*foreignTxs)
+	if caughtUp > foreignTxs {
+		t.Errorf("%s: %d position writes for %d foreign transactions; want at most %d (one per foreign transaction is Bug 300)", r.mode.name, caughtUp, 3*foreignTxs, foreignTxs)
+	}
+}
+
+// kdStateOrEmpty is kdState, reading "" while the table does not exist yet.
+func (e *emptyTxEnv) kdStateOrEmpty(dsn string) string {
+	db, err := sql.Open(e.driver, dsn)
+	if err != nil {
+		return ""
+	}
+	defer func() { _ = db.Close() }()
+	q := "SELECT COALESCE(GROUP_CONCAT(CONCAT(id,':',note) ORDER BY id),'') FROM kd"
+	if e.driver == "pgx" {
+		q = "SELECT COALESCE(string_agg(id||':'||note, ',' ORDER BY id),'') FROM kd"
+	}
+	var s sql.NullString
+	if err := db.QueryRowContext(context.Background(), q).Scan(&s); err != nil {
+		return ""
+	}
+	return s.String
+}
+
+// sessions renders the target server's live sessions, for a failure message.
+func (e *emptyTxEnv) sessions(dsn string) string {
+	q := "SELECT COALESCE(GROUP_CONCAT(CONCAT(id,' ',command,' ',time,'s ',COALESCE(state,''),' ',COALESCE(LEFT(info,80),'')) SEPARATOR ' | '),'') FROM information_schema.processlist WHERE command <> 'Daemon'"
+	if e.driver == "pgx" {
+		q = "SELECT COALESCE(string_agg(pid||' '||state||' '||COALESCE(wait_event,'')||' '||left(query,80), ' | '),'') FROM pg_stat_activity WHERE backend_type = 'client backend'"
+	}
+	db, err := sql.Open(e.driver, dsn)
+	if err != nil {
+		return err.Error()
+	}
+	defer func() { _ = db.Close() }()
+	var s string
+	if err := db.QueryRowContext(context.Background(), q).Scan(&s); err != nil {
+		return err.Error()
+	}
+	return s
+}
+
+// persisted reads a stream's persisted source position, "" when absent.
+func (e *emptyTxEnv) persisted(dsn, stream string) string {
+	db, err := sql.Open(e.driver, dsn)
+	if err != nil {
+		return ""
+	}
+	defer func() { _ = db.Close() }()
+	q := "SELECT source_position FROM sluice_cdc_state WHERE stream_id = ?"
+	if e.driver == "pgx" {
+		q = "SELECT source_position FROM sluice_cdc_state WHERE stream_id = $1"
+	}
+	var s string
+	if err := db.QueryRowContext(context.Background(), q, stream).Scan(&s); err != nil {
+		return ""
+	}
+	return s
+}
+
+// TestEmptyTxRuns_LiveSyncReachesSourceHead_MySQLGTID runs the live leg on
+// every apply path the stage feeds — serial batched, per-change, the lanes —
+// with the target on a SEPARATE server, so nothing but the test writes the
+// source and its head stands still once the traffic stops.
+func TestEmptyTxRuns_LiveSyncReachesSourceHead_MySQLGTID(t *testing.T) {
+	src, _, cleanupSrc := startMySQLGTID(t)
+	t.Cleanup(cleanupSrc)
+	_, tgtServer, cleanupTgt := startMySQLGTID(t)
+	t.Cleanup(cleanupTgt)
+	e := &emptyTxEnv{sevEnv: &sevEnv{t: t, engine: "mysql", driver: "mysql", gtid: true, src: src}, foreignPairs: true}
+	e.exec(`CREATE TABLE kd (id INT NOT NULL PRIMARY KEY, note VARCHAR(16)) ENGINE=InnoDB;
+		CREATE DATABASE etx_noise; CREATE TABLE etx_noise.n (id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY) ENGINE=InnoDB;
+		INSERT INTO kd VALUES (0,'seed');`)
+	for i, mode := range liveApplyModes {
+		t.Run(mode.name, func(t *testing.T) {
+			e.t = t
+			db := fmt.Sprintf("etx_live_%d", i)
+			applyDDLMySQL(t, tgtServer, "CREATE DATABASE "+db)
+			target, err := buildMySQLDSN(tgtServer, db)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var head string
+			r := &liveHeadRun{e: e, target: target, stream: "etx-head-" + mode.name, mode: mode}
+			r.readHead = func() { head = sevQuery(t, "mysql", src, "SELECT @@GLOBAL.gtid_executed") }
+			r.headOK = func(pos string) bool {
+				set := decodePersistedMySQLToken(t, pos).GTIDSet
+				// Equal sets: each a subset of the other, judged by the server.
+				return sevQuery(t, "mysql", src, fmt.Sprintf("SELECT GTID_SUBSET('%s','%s') AND GTID_SUBSET('%s','%s')", head, set, set, head)) == "1"
+			}
+			r.run(t, 10+i)
+		})
+	}
+}
+
+// TestEmptyTxRuns_LiveSyncReachesSourceHead_Postgres14 is the Postgres
+// version that decodes a transaction touching no published table as an
+// empty pair. The target database shares the server, which logical decoding
+// does not see (it is per database), but its writes do advance the server's
+// WAL, so the pin is persisted >= the head read right after the traffic.
+func TestEmptyTxRuns_LiveSyncReachesSourceHead_Postgres14(t *testing.T) {
+	src, dst, cleanup := startPostgresLogicalImage(t, "postgres:14", 8)
+	t.Cleanup(cleanup)
+	e := &emptyTxEnv{sevEnv: &sevEnv{t: t, engine: "postgres", driver: "pgx", src: src, dst: dst}, foreignPairs: true}
+	applyDDL(t, src, `
+		CREATE TABLE kd (id INT PRIMARY KEY, note TEXT);
+		CREATE TABLE etx_noise (id BIGSERIAL PRIMARY KEY);
+		INSERT INTO kd VALUES (0,'seed');`)
+	var head string
+	r := &liveHeadRun{
+		e: e, target: dst, stream: "etx-head-pg14", mode: liveApplyModes[0],
+		filter: migcore.TableFilter{Include: []string{"kd"}},
+	}
+	r.readHead = func() { head = sevQuery(t, "pgx", src, "SELECT pg_current_wal_lsn()::text") }
+	r.headOK = func(pos string) bool {
+		var tok struct {
+			LSN string `json:"lsn"`
+		}
+		if err := json.Unmarshal([]byte(pos), &tok); err != nil || tok.LSN == "" {
+			t.Fatalf("persisted position %q carries no lsn: %v", pos, err)
+		}
+		return sevQuery(t, "pgx", src, fmt.Sprintf("SELECT ('%s'::pg_lsn >= '%s'::pg_lsn)::text", tok.LSN, head)) == "true"
+	}
+	r.run(t, 20)
 }

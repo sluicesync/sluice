@@ -12,23 +12,55 @@ import (
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
-// liveEmptyTxMaxRun bounds how many empty source transactions one boundary
-// write stands for on a live stream ([migcore.EmptyTxRuns.MaxRun]). A stream
-// whose source is busy only elsewhere, and never quiet, would otherwise hold
-// its position back for as long as that lasts — the GC-43 (r) shape, where a
-// position older than the source's binlog retention cannot resume. At 1,000 a
-// stream pays one position write per thousand foreign transactions, which is
-// noise beside the 12 ms per transaction it paid before.
-const liveEmptyTxMaxRun = 1000
+// liveEmptyTxPolicy is when the live stage releases a held empty
+// transaction: whichever of its three bounds is reached first.
+type liveEmptyTxPolicy struct {
+	// maxRun bounds how many empty transactions one boundary write stands
+	// for ([migcore.EmptyTxRuns.MaxRun]).
+	maxRun int
+	// linger is the idle grace: release once no change has arrived for this
+	// long. The fast path, and the only one an idle stream takes.
+	linger time.Duration
+	// maxHold bounds how long a run may be held at all, measured from when
+	// its FIRST transaction was held and never reset by a later one.
+	maxHold time.Duration
+	// now is the clock maxHold and linger are measured on; time.Now outside
+	// tests.
+	now func() time.Time
 
-// liveEmptyTxLinger is how long the live stage waits for the next change
-// before it releases a held empty transaction. It is the serial applier's
-// own idle-flush grace ([appliershared.DefaultIdleFlushPeriod]): a boundary
-// that carries no data reaches the target at most that much later than it
-// would have, which is the latency the applier already accepts for the rows
-// it batches. Any run whose transactions arrive closer together than this
-// collapses.
-const liveEmptyTxLinger = appliershared.DefaultIdleFlushPeriod
+	// pushed, TEST-ONLY (nil in production), runs after each received
+	// change has been pushed and timed, so a test driving a fake clock can
+	// advance it knowing which events the stage has already stamped.
+	pushed func()
+}
+
+// defaultLiveEmptyTxPolicy is the live stream's policy.
+//
+//   - linger is the serial applier's own idle-flush grace
+//     ([appliershared.DefaultIdleFlushPeriod], 100 ms): a boundary that
+//     carries no data reaches the target at most that much later on an idle
+//     stream, the latency the applier already accepts for the rows it batches.
+//   - maxHold is 1 s, the lane path's idle checkpoint period
+//     (laneapply checkpointIdlePeriod): the DEFAULT apply path has always let
+//     its persisted position lag the stream by up to that much, so holding a
+//     run that long makes the serial paths no staler than the default, and
+//     costs at most one position write a second under any foreign load. It is
+//     what bounds a source whose foreign transactions keep arriving just
+//     inside the linger — every one resets the linger, so on its own a steady
+//     ~10 tx/s held the position back for the whole run (the pre-land review's
+//     F1: ~100 s at the 1,000 cap), long enough to trip `sync health
+//     --max-stale-seconds`, hold a PG 14 slot's WAL, or outlive a short binlog
+//     retention.
+//   - maxRun (1,000) still bounds a run by count, the cheaper bound at high
+//     rates.
+func defaultLiveEmptyTxPolicy() liveEmptyTxPolicy {
+	return liveEmptyTxPolicy{
+		maxRun:  1000,
+		linger:  appliershared.DefaultIdleFlushPeriod,
+		maxHold: time.Second,
+		now:     time.Now,
+	}
+}
 
 // coalesceEmptyTxRuns is the live stream's empty-transaction stage (Bug 300):
 // it collapses each run of empty source transactions to the run's last
@@ -36,33 +68,42 @@ const liveEmptyTxLinger = appliershared.DefaultIdleFlushPeriod
 // [migcore.EmptyTxRuns] for what is dropped and why that loses nothing.
 //
 // A capture or a replay knows its whole stream. A live stream does not know
-// what comes next, so a held empty transaction is released once no change
-// has arrived for linger — the stage never delays a change that carries
-// data, only a boundary, and only by that much. A run therefore collapses
-// exactly when the source is producing out-of-scope transactions faster than
-// one per linger, which is the regime in which one position write apiece is
-// what held the applier behind. (Releasing only when the input is
-// momentarily EMPTY was the first cut, and measured no better than no stage
-// at all: every hop of the intercept chain is an unbuffered channel, so the
-// stage outran its own input between a transaction's begin and its commit.)
-// A withheld begin is not released on a linger: it persists nothing, and its
-// transaction's next event decides it. maxRun bounds a run that never
-// pauses. A close of in flushes first, so a clean stop persists the final
-// boundary it always did; a cancel drops what is held, which is what a crash
-// at that point would have dropped.
-func coalesceEmptyTxRuns(ctx context.Context, in <-chan ir.Change, maxRun int, linger time.Duration) <-chan ir.Change {
+// what comes next, so a held empty transaction is released by the policy —
+// after a linger with no change, after maxHold since its run began, or at
+// maxRun — and the stage never delays a change that carries data, only a
+// boundary, and only by that much. A run therefore collapses exactly when the
+// source is producing out-of-scope transactions faster than one per linger,
+// which is the regime in which one position write apiece is what held the
+// applier behind. (Releasing only when the input is momentarily EMPTY was the
+// first cut, and measured no better than no stage at all: every hop of the
+// intercept chain is an unbuffered channel, so the stage outran its own input
+// between a transaction's begin and its commit.) A withheld begin is never
+// released by the clock: it persists nothing, and its transaction's next
+// event decides it. A close of in flushes first, so a clean stop persists the
+// final boundary it always did; a cancel drops what is held, which is what a
+// crash at that point would have dropped.
+func coalesceEmptyTxRuns(ctx context.Context, in <-chan ir.Change, p liveEmptyTxPolicy) <-chan ir.Change {
 	out := make(chan ir.Change)
 	go func() {
 		defer close(out)
-		runs := migcore.EmptyTxRuns{MaxRun: maxRun}
+		runs := migcore.EmptyTxRuns{MaxRun: p.maxRun}
 		send := migcore.ChannelEmit(ctx, out)
-		timer := time.NewTimer(linger)
+		timer := time.NewTimer(p.linger)
 		defer timer.Stop()
+		var runStart, lastEvent time.Time
 		for {
-			var lingered <-chan time.Time
+			var due <-chan time.Time
 			if runs.HoldsRun() {
-				timer.Reset(linger)
-				lingered = timer.C
+				now := p.now()
+				wait := min(p.linger-now.Sub(lastEvent), p.maxHold-now.Sub(runStart))
+				if wait <= 0 {
+					if runs.ReleaseRun(send) != nil {
+						return
+					}
+					continue
+				}
+				timer.Reset(wait)
+				due = timer.C
 			}
 			select {
 			case c, ok := <-in:
@@ -70,13 +111,19 @@ func coalesceEmptyTxRuns(ctx context.Context, in <-chan ir.Change, maxRun int, l
 					_ = runs.Flush(send)
 					return
 				}
+				held, released := runs.HoldsRun(), runs.Releases()
 				if runs.Push(c, send) != nil {
 					return
 				}
-			case <-lingered:
-				if runs.ReleaseRun(send) != nil {
-					return
+				lastEvent = p.now()
+				if runs.HoldsRun() && (!held || runs.Releases() != released) {
+					runStart = lastEvent // this push began a new run
 				}
+				if p.pushed != nil {
+					p.pushed()
+				}
+			case <-due:
+				// Re-judged against the clock at the top of the loop.
 			case <-ctx.Done():
 				return
 			}

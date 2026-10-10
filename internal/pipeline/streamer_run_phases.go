@@ -1237,10 +1237,16 @@ func (s *Streamer) phaseWireInterceptChain(applyCtx context.Context, changes <-c
 	// from each change's source commit timestamp. Wired only when the
 	// operator opted into the metrics endpoint or a sync-lag alert (nil
 	// tracker ⇒ no extra goroutine, default path byte-identical). It sits
-	// after every stage that drops or holds a change, so it observes exactly
-	// the changes that reach the applier across the batched, per-change, and
-	// concurrent-lane paths (the empty-transaction stage below it drops only
-	// row-less boundaries).
+	// after every stage that drops or holds a CHANGE THAT CARRIES DATA, so
+	// it observes exactly the row changes that reach the applier across the
+	// batched, per-change, and concurrent-lane paths. It deliberately sits
+	// BEFORE the empty-transaction stage below, which drops and holds only
+	// row-less boundaries, so it sees every source commit time as it passes.
+	// Either placement reads the same lag to within that stage's maxHold
+	// (1 s): after it, the tracker would see only each run's last transaction,
+	// up to 1 s later; here, it sees a held boundary up to 1 s before the
+	// applier persists it, so for out-of-scope traffic the reading can be that
+	// much optimistic. Rows are never held, so their lag is exact either way.
 	if s.syncLag != nil {
 		filtered = observeSyncLagChanges(applyCtx, filtered, s.syncLag)
 	}
@@ -1248,9 +1254,9 @@ func (s *Streamer) phaseWireInterceptChain(applyCtx context.Context, changes <-c
 	// out-of-scope transaction on the source server (and every transaction
 	// the table or --where filter above emptied) arrives as one, and each cost
 	// the serial apply paths a position write of its own. After the sync-lag
-	// observer, which therefore still sees every source commit; the stage
-	// drops only boundaries, never a change.
-	return coalesceEmptyTxRuns(applyCtx, filtered, liveEmptyTxMaxRun, liveEmptyTxLinger)
+	// observer (see above for why); the stage drops only boundaries, never a
+	// change, and holds one at most 1 s (defaultLiveEmptyTxPolicy).
+	return coalesceEmptyTxRuns(applyCtx, filtered, defaultLiveEmptyTxPolicy())
 }
 
 // firstBoundaryWitness builds the GC-44 first-boundary witness for one

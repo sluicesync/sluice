@@ -54,6 +54,13 @@ other eighteen.
 
 ---
 
+## 2026-10-10 — Bug 300 follow-up: a same-server stream echoes its own position writes; a cold-start re-run stall
+
+Indexed 2026-10-10 when filed. Observed while pinning the Bug 300 fix (no audit pass).
+
+- SAME-SERVER-POSITION-ECHO filed
+- COLDSTART-RERUN-STALL filed
+
 ## 2026-10-09 — CI: the `TestStreamer_` integration shard sits at its time budget
 
 Indexed 2026-10-09 when filed. A single finding from the v0.157.0 release gate (no audit pass).

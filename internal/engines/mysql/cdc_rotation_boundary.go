@@ -20,7 +20,7 @@ import (
 // transaction, including the ones whose rows are all out of scope: their
 // BEGIN and XID still reach the applier as a row-less pair, and it persists
 // the commit (since Bug 300 a run of such pairs persists once, at its last —
-// the pipeline's live stage bounds a run at 1,000, so a source busy only
+// the pipeline's live stage holds a run at most 1 s, so a source busy only
 // elsewhere still moves the position). But three kinds of binlog traffic
 // persist nothing — a ROTATE, a heartbeat, and a standalone GTID group (DDL,
 // CREATE USER / GRANT, OPTIMIZE: implicit commits that carry no XID). So a

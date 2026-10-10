@@ -71,6 +71,7 @@ type EmptyTxRuns struct {
 	hasBegin bool // begin is withheld: a transaction opened, nothing in it yet
 	open     bool // a transaction that carries a change is open (and emitted)
 	elided   int64
+	released int64 // held pairs emitted so far: a change means a new run
 }
 
 // Push feeds c and hands emit every change that must go out now, in order. An
@@ -100,6 +101,21 @@ func (r *EmptyTxRuns) Push(c ir.Change, emit func(ir.Change) error) error {
 		}
 		// The commit of a transaction that carried a change, or a stray
 		// commit: the run (if any) ends before it.
+		//
+		// PREMISE: a commit closes the WHOLE transaction. A nested begin is
+		// passed through verbatim above, but its inner commit would clear
+		// open here while an outer transaction was still open, and an empty
+		// pair after it would then be collapsible from inside that outer
+		// transaction. No reader emits that shape: the MySQL/MariaDB binlog
+		// reader emits one TxCommit per XID/COMMIT group, and the one shape
+		// that nests a begin (a ROLLBACK group leaves its TxBegin with no
+		// commit) is closed by the NEXT group's commit, which ends both — as
+		// the appliers read it too; the VStream reader suppresses an
+		// interleaved BEGIN and emits only the COMMIT that leaves nothing open
+		// (vstreamTxState); pgoutput frames one transaction (or one streamed
+		// chunk) at a time; the keepalive and rotation boundaries are emitted
+		// only while no transaction is open; the trigger sources emit no
+		// markers. Code-read, not pinned against every reader.
 		if err := r.releaseHeld(emit); err != nil {
 			return err
 		}
@@ -144,6 +160,10 @@ func (r *EmptyTxRuns) Pending() bool { return r.hasHeld || r.hasBegin }
 // HoldsRun reports whether an empty transaction is held — a boundary that
 // would persist a position if released.
 func (r *EmptyTxRuns) HoldsRun() bool { return r.hasHeld }
+
+// Releases counts the held pairs emitted so far. A caller timing a run reads
+// it around a Push: if it moved, the pair now held (if any) starts a new run.
+func (r *EmptyTxRuns) Releases() int64 { return r.released }
 
 // ReleaseRun emits the held empty transaction, ending the current run, and
 // keeps a withheld begin withheld: a begin persists nothing, so only the held
@@ -207,6 +227,7 @@ func (r *EmptyTxRuns) releaseHeld(emit func(ir.Change) error) error {
 	}
 	pair := r.held
 	r.hasHeld, r.held, r.run = false, [2]ir.Change{}, 0
+	r.released++
 	if err := emit(pair[0]); err != nil {
 		return err
 	}

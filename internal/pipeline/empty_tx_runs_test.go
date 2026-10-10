@@ -15,6 +15,8 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -301,17 +303,41 @@ func TestChainRestore_CollapsesLegacyEmptyTxRuns(t *testing.T) {
 	}
 }
 
+// fakeClock is a settable clock for the live stage's policy.
+type fakeClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *fakeClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *fakeClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(d)
+}
+
+// stagePolicy is a live policy for tests; never disables a bound.
+func stagePolicy(maxRun int, linger, maxHold time.Duration, now func() time.Time) liveEmptyTxPolicy {
+	return liveEmptyTxPolicy{maxRun: maxRun, linger: linger, maxHold: maxHold, now: now}
+}
+
+const never = time.Hour // a bound a fixture must not reach
+
 // TestLiveEmptyTxStage pins the live stream's stage. Under backlog it
 // collapses each run, bounded by MaxRun; a held empty transaction with
 // nothing behind it is released once the linger passes — so an idle stream
 // persists every boundary as before, late by at most the linger — while a
 // withheld begin, which persists nothing, waits for its transaction's next
-// event.
+// event. The hold cap and the cancel are pinned below.
 func TestLiveEmptyTxStage(t *testing.T) {
-	const never = time.Hour // a backlog fixture must not depend on the clock
 	collect := func(in chan ir.Change, maxRun int) []ir.Change {
 		var got []ir.Change
-		for c := range coalesceEmptyTxRuns(context.Background(), in, maxRun, never) {
+		for c := range coalesceEmptyTxRuns(context.Background(), in, stagePolicy(maxRun, never, never, time.Now)) {
 			got = append(got, c)
 		}
 		return got
@@ -335,7 +361,7 @@ func TestLiveEmptyTxStage(t *testing.T) {
 			in <- c
 		}
 		close(in)
-		if s := scriptIndices(t, collect(in, liveEmptyTxMaxRun)); s != emptyTxWindowKept {
+		if s := scriptIndices(t, collect(in, defaultLiveEmptyTxPolicy().maxRun)); s != emptyTxWindowKept {
 			t.Errorf("emitted [%s]; want [%s]", s, emptyTxWindowKept)
 		}
 	})
@@ -358,7 +384,7 @@ func TestLiveEmptyTxStage(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		in := make(chan ir.Change)
-		out := coalesceEmptyTxRuns(ctx, in, liveEmptyTxMaxRun, 20*time.Millisecond)
+		out := coalesceEmptyTxRuns(ctx, in, stagePolicy(1000, 20*time.Millisecond, never, time.Now))
 		events := emptyTxScript("BC B")
 		for _, c := range events {
 			in <- c // no close and no further event: the source goes idle
@@ -378,4 +404,96 @@ func TestLiveEmptyTxStage(t *testing.T) {
 		receive(t, out, events[2], 10*time.Second)
 		receive(t, out, row, 10*time.Second)
 	})
+}
+
+// TestLiveEmptyTxStage_HoldCapBoundsARunTheLingerKeepsResetting is the
+// pre-land review's F1. Foreign transactions that keep arriving inside the
+// linger reset it every time, so without a cap the position was persisted
+// only at maxRun — ~100 s at ~10 tx/s. The cap is measured from the run's
+// FIRST held transaction and never reset. Deterministic: the clock is fake
+// and the linger is out of reach, so only the cap can release anything.
+func TestLiveEmptyTxStage_HoldCapBoundsARunTheLingerKeepsResetting(t *testing.T) {
+	clock := &fakeClock{now: time.Date(2026, 10, 10, 0, 0, 0, 0, time.UTC)}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	in := make(chan ir.Change, 16) // buffered: a release blocks the stage on out while the test is still sending
+	var pushed atomic.Int64
+	policy := stagePolicy(1000, never, time.Second, clock.Now)
+	policy.pushed = func() { pushed.Add(1) }
+	out := coalesceEmptyTxRuns(ctx, in, policy)
+	pairs := emptyTxScript(strings.Repeat("BC", 4))
+	sent := int64(0)
+	// sendPair sends pair i and waits until the stage has stamped both
+	// events, so the clock is advanced only BETWEEN pairs.
+	sendPair := func(i int) {
+		t.Helper()
+		in <- pairs[2*i]
+		in <- pairs[2*i+1]
+		sent += 2
+		deadline := time.Now().Add(10 * time.Second)
+		for pushed.Load() < sent {
+			if time.Now().After(deadline) {
+				t.Fatalf("the stage stamped %d of %d events", pushed.Load(), sent)
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	quiet := func(why string) {
+		t.Helper()
+		select {
+		case c := <-out:
+			t.Fatalf("%s, yet %#v was released", why, c)
+		case <-time.After(150 * time.Millisecond):
+		}
+	}
+
+	sendPair(0) // the run begins
+	clock.Advance(600 * time.Millisecond)
+	sendPair(1) // inside the cap: pair 0 is dropped, pair 1 held
+	quiet("the run is 600 ms old with a 1 s cap")
+
+	clock.Advance(500 * time.Millisecond)
+	// 1.1 s after the run began: at pair 2's begin the cap releases the HELD
+	// pair 1, and the stage blocks on out until it is read — so pair 2 is
+	// sent without waiting, and stamped after the read.
+	in <- pairs[4]
+	in <- pairs[5]
+	sent += 2
+	for _, want := range pairs[2:4] {
+		select {
+		case c := <-out:
+			if !reflect.DeepEqual(c, want) {
+				t.Fatalf("the cap released %#v; want the run's held transaction %#v", c, want)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("a run held past its cap was never released: a source busy just inside the linger would hold the position back until maxRun")
+		}
+	}
+
+	// The release ended the run: the next one is timed from its own start.
+	sendPair(3)
+	clock.Advance(600 * time.Millisecond)
+	quiet("a new run began 600 ms ago")
+}
+
+// TestLiveEmptyTxStage_CancelDropsWhatIsHeld pins the stage's cancel: the
+// output closes (the goroutine has returned — the close is its last act), and
+// the held empty transaction is NOT emitted, exactly as a crash at that point
+// would not have persisted it.
+func TestLiveEmptyTxStage_CancelDropsWhatIsHeld(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	in := make(chan ir.Change)
+	out := coalesceEmptyTxRuns(ctx, in, stagePolicy(1000, never, never, time.Now))
+	for _, c := range emptyTxScript("BC B") {
+		in <- c
+	}
+	cancel()
+	select {
+	case c, ok := <-out:
+		if ok {
+			t.Fatalf("a cancelled stage emitted %#v", c)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the stage's output never closed after the cancel: its goroutine leaked")
+	}
 }
