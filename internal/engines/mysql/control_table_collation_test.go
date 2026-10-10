@@ -60,6 +60,7 @@ func controlDDLs(t *testing.T) map[string]string {
 		cdcQueryTimeoutRaiseTableName:    cdcQueryTimeoutRaiseTableDDL(""),
 		skippedTablesTableName:           skippedTablesTableDDL(""),
 		applyMarksTableName:              applyMarksTableDDL(""),
+		columnOrderTableName:             columnOrderTableDDL(""),
 		migrateStateTableName:            migrateStateHeaderDDL(),
 		migrateProgressTableName:         migrateProgressDDL(),
 		keysetTableName:                  keysetTableDDL(),

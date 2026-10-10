@@ -25,6 +25,7 @@ func bootstrapControlTables(schema string) []controlTable {
 		shardConsolidationLeaseTable(schema),
 		skippedTablesTable(schema),
 		controlTable{name: applyMarksTableName, schema: schema, create: applyMarksTableDDL(schema)},
+		columnOrderTable(schema),
 	)
 }
 

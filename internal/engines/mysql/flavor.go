@@ -126,6 +126,8 @@ var flavorCapabilities = map[Flavor]ir.Capabilities{
 		CDC:         ir.CDCBinlog,
 		SchemaScope: ir.SchemaScopeFlat,
 		DDLDialect:  ir.DDLDialectMySQL,
+		// MODIFY … AFTER/FIRST moves a column in place.
+		ReorderColumns: true,
 	},
 
 	// ---------------------------------------------------------------
@@ -188,6 +190,9 @@ var flavorCapabilities = map[Flavor]ir.Capabilities{
 		// flavor inherits it via the capabilities alias — same vtgate,
 		// same killer.
 		TransactionKiller: true,
+
+		// MODIFY … AFTER/FIRST moves a column (an online DDL on vtgate).
+		ReorderColumns: true,
 	},
 
 	// ---------------------------------------------------------------
@@ -257,5 +262,7 @@ var flavorCapabilities = map[Flavor]ir.Capabilities{
 		CDC:         ir.CDCBinlog, // Phase 3: MariaDB domain GTIDs (ADR-0170)
 		SchemaScope: ir.SchemaScopeFlat,
 		DDLDialect:  ir.DDLDialectMySQL,
+		// MODIFY … AFTER/FIRST moves a column in place.
+		ReorderColumns: true,
 	},
 }

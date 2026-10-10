@@ -246,6 +246,14 @@ type firstBoundaryWitness struct {
 	sourceEngine string
 	targetEngine string
 
+	// orders are the stream's column-order records (RENAME-SWAP-FORWARD;
+	// column_order_boundary.go), shared with the Streamer; nil in unit
+	// harnesses, which then record nothing and prove nothing.
+	orders *columnOrderRecords
+	// targetReorders is the target engine's [ir.Capabilities.ReorderColumns],
+	// which picks the remedy a column-order refusal can name.
+	targetReorders bool
+
 	// mappings are the operator's --type-override entries. An overridden
 	// column's TYPE is the operator's decision, not a rendering of the
 	// source's, so the witness does not compare it ([witnessOptions.pinned]).
@@ -314,6 +322,10 @@ type witnessVerdict struct {
 	// source held before it narrowed the altered column (nil unless that
 	// proof decided the verdict — [witnessOptions.priorExpected]).
 	narrowedFrom ir.Type
+	// remedy, when set, replaces the refusal's generic reconcile advice — a
+	// column-order refusal's remedy depends on what the target can do
+	// ([columnOrderRemedy]).
+	remedy string
 }
 
 // narrowedDiffs annotates column's entry in diffs with the type the source
@@ -362,8 +374,18 @@ func (w *firstBoundaryWitness) verdict(ctx context.Context, post *ir.Table, pos 
 			return witnessVerdict{}, err
 		}
 	}
+	// RENAME-SWAP-FORWARD: classifyWitness pairs columns by name, so a
+	// rename swap made while the stream was stopped matches the target
+	// column for column. What it changes is the declared order — judged
+	// against the table's column-order record and the retained shape, and
+	// proven only by the target's order having moved
+	// (column_order_boundary.go).
+	order, err := w.judgeOrder(ctx, w.historyOrderPrior(post.Name, pos), post)
+	if err != nil {
+		return witnessVerdict{}, err
+	}
 	v := classifyWitness(expected, target, opts)
-	if v.kind == witnessMatch {
+	if v.kind == witnessMatch && !order.refuses() {
 		return v, nil
 	}
 	// The memo may predate a change the target has since taken — a Shape A
@@ -376,7 +398,11 @@ func (w *firstBoundaryWitness) verdict(ctx context.Context, post *ir.Table, pos 
 	if !held {
 		return witnessVerdict{kind: witnessUnwitnessed, reason: "the target does not hold the table"}, nil
 	}
-	return classifyWitness(expected, target, opts), nil
+	v = classifyWitness(expected, target, opts)
+	if order.refuses() {
+		return withColumnOrder(v, order, w.targetReorders), nil
+	}
+	return v, nil
 }
 
 // expected renders post as the target would store it — the Shape A
@@ -1240,6 +1266,14 @@ func (v witnessVerdict) render() string {
 // resumeDivergenceRefusal is the loud outcome: the first boundary disagrees
 // with the target in a way no observed pre-state can explain.
 func resumeDivergenceRefusal(tableName string, v witnessVerdict, hint string) error {
+	if v.remedy != "" {
+		return fmt.Errorf(
+			"%w: the first schema boundary for %q after this stream (re)started does not match the target table "+
+				"(%s). Refusing before the boundary is recorded or any row after it is applied; nothing has been "+
+				"written. %s",
+			ir.ErrResumeSchemaDivergence, tableName, v.render(), v.remedy,
+		)
+	}
 	return fmt.Errorf(
 		"%w: the first schema boundary for %q after this stream (re)started does not match the target table, "+
 			"and the difference is not one sluice can forward without knowing what the source changed (%s). "+
@@ -1351,7 +1385,18 @@ func witnessSynthesizedPre(post *ir.Table, v witnessVerdict) *ir.Table {
 // seed-vs-projection fidelity difference) and a genuine widen are
 // indistinguishable from the pair alone, and skipping the genuine one
 // rounds every following value; the target tells them apart.
+//
+// The same holds for more than one column changing, at least one of them
+// in type ([multiColumnAlterError]): until RENAME-SWAP-FORWARD the
+// classifier read that as no change, so a phantom of it passed silently,
+// and refusing it outright would now refuse a healthy stream's first
+// boundary. The witness accepts it where the target agrees with the
+// snapshot and refuses a genuine one ("more than one type change").
 func seedBoundaryNeedsWitness(pre, post *ir.Table) bool {
 	shape, err := ClassifyShape(pre, post)
-	return err == nil && shape.Kind == ShapeKindAlterColumnType
+	if err == nil {
+		return shape.Kind == ShapeKindAlterColumnType
+	}
+	var multi *multiColumnAlterError
+	return errors.As(err, &multi) && multi.changesAType()
 }

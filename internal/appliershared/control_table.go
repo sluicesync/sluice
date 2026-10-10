@@ -61,6 +61,13 @@ const ShardConsolidationLeaseTableName = "sluice_shard_consolidation_lease"
 // for; see internal/applymarks.
 const ApplyMarksTableName = "sluice_cdc_apply_marks"
 
+// ColumnOrderTableName is the RENAME-SWAP-FORWARD per-target control table
+// holding each table's [ir.ColumnOrderRecord]: the source's and the target's
+// declared column order as of the stream's cold start or its last accepted
+// boundary that changed either. A column-order change is accepted only when
+// the target's order moved from the recorded one to the source's new one.
+const ColumnOrderTableName = "sluice_cdc_column_order"
+
 // ControlTableConfig is the dialect seam for the shared control-table
 // CRUD (ADR-0081 tier c). Each engine keeps one package-level value
 // (the fields are engine constants, not per-stream state) and passes

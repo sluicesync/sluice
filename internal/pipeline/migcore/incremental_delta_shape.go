@@ -695,9 +695,17 @@ var alterDispositions = map[AlterAspect]alterDisposition{
 		Verdict: AlterRefuse,
 		Reason:  "the window's change chunks can carry pre-DDL events that still name the dropped column; sluice does not auto-DROP on replay (same posture as a dropped table)",
 	},
+	// RENAME-SWAP-FORWARD: this was AlterNoDDL ("column order is not
+	// load-bearing — sluice addresses columns by name"). That holds for a
+	// REORDER, whose values move with the names. A RENAME swap or rotation
+	// (`RENAME COLUMN b TO c, RENAME COLUMN c TO b`) produces the very same
+	// before/after pair with the values staying put, so passing it with no
+	// DDL left every row the restored full held under the wrong names. The
+	// recorded shapes cannot say which it was (no stable column id survives
+	// into a manifest), so it refuses.
 	AlterAspectColumnOrder: {
-		Verdict: AlterNoDDL,
-		Reason:  "column ORDER is not load-bearing: every reader, applier and shape classifier in sluice addresses columns by NAME (the ADR-0091 forwarding classifier calls a reorder ShapeKindNone for the same reason), and neither PG nor MySQL can reorder in place anyway",
+		Verdict: AlterRefuse,
+		Reason:  "the source now declares the columns in a different order, which is a reorder (MODIFY … AFTER/FIRST: the values moved with the names) or a RENAME COLUMN swap or rotation (the names moved and the values stayed); the recorded shapes cannot tell them apart and only the swap leaves the restored rows under the wrong column names (COLUMN-ORDER-CHANGED)",
 	},
 	AlterAspectColumnType: {
 		Verdict: AlterApply,

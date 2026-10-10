@@ -24,14 +24,18 @@ package pipeline
 //     INDEX, ADD / DROP / MODIFY CHECK — via applyShapeForward, after
 //     retargeting the post IR to the target dialect + scrubbing its
 //     Schema (ADR-0091 §5).
-//   - column reorder (ShapeKindNone) — no DDL; sluice decodes by name.
+//   - a column-order change the target already holds (the operator
+//     applied it there) — no DDL (column_order_boundary.go).
 //
 // Refuse-loudly catalog:
 //   - RENAME COLUMN — indistinguishable from drop+add of a same-type
 //     column from the stream alone; forwarding the wrong guess risks
 //     silent data loss (ADR-0091 §3; F7b adds PG attnum-proven rename).
 //   - Multi-shape combo (ShapeKindUnrecognized) — can't be ordered
-//     unambiguously.
+//     unambiguously; likewise more than one altered column.
+//   - A column-order change the target does not hold: a RENAME swap or
+//     rotation and a reorder are the same shape (RENAME-SWAP-FORWARD,
+//     COLUMN-ORDER-CHANGED; column_order_boundary.go).
 //   - ADD COLUMN with a volatile/computed DEFAULT (ADR-0058 §2a).
 //
 // The intercept activates when:
@@ -46,8 +50,10 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync/atomic"
 
 	"sluicesync.dev/sluice/internal/ir"
@@ -213,9 +219,13 @@ type schemaForwardBackfill struct {
 // MySQL's binlog only surfaces SchemaSnapshot on DDL detection
 // (already POST-DDL), so the intercept's cache stays empty until the
 // first DDL fires and the ALTER silently passes through as the anchor.
-// Seed snapshots are NOT forwarded downstream — the applier already
-// wrote the schema-history row at cold-start via the schema-apply
-// phase.
+// Seed snapshots are NOT forwarded downstream. (This said the applier
+// had already written their schema-history rows at cold start; it has
+// not — a table's first history version is written at its first
+// change-stream boundary, measured by RENAME-SWAP-FORWARD as an empty
+// history on the restart after a cold start. Nothing here depends on the
+// seed being recorded, and column_order_boundary.go's restart check does
+// not assume it.)
 //
 // The seed exists only on the intercept a cold start wires. Every other
 // wiring — a warm resume, a restart, an in-process retry — starts with an
@@ -314,6 +324,19 @@ func interceptAddColumnForward(
 				// boundary, and it came from CDC — so the next comparison
 				// is CDC→CDC (full guard lifts).
 				delete(seedSourced, key)
+				// accept passes an accepted boundary downstream carrying the
+				// table's new column-order record when its column list moved
+				// (RENAME-SWAP-FORWARD), so the applier writes the record on
+				// the boundary's own transaction.
+				accept := func() bool {
+					attached, err := deps.witness.attachColumnOrder(ctx, snap)
+					if err != nil {
+						wrapped := fmt.Errorf("pipeline: forward schema add-column: %w", err)
+						errStore.Store(&wrapped)
+						return false
+					}
+					return forwardChange(ctx, out, attached)
+				}
 				var routeErr error
 				switch {
 				case !hadPre && deps.witness == nil:
@@ -325,6 +348,28 @@ func interceptAddColumnForward(
 						return
 					}
 					continue
+				case hadPre && columnOrderChangeSeen(deps.witness, pre, post, snap):
+					// RENAME-SWAP-FORWARD: a swap and a reorder are the same
+					// shape; only the target's column order having MOVED from
+					// its recorded order can say the change was applied there
+					// (column_order_boundary.go). Against the seed too: a
+					// seed's fidelity differs from the change stream's in what
+					// a column carries and which columns it lists, never in
+					// the order of the ones both list — a premise every
+					// forward-mode integration stream tests, since each
+					// classifies its first boundary against the seed and
+					// would refuse on a phantom flip.
+					var confirmedPre *ir.Table
+					confirmedPre, routeErr = routeColumnOrderBoundary(ctx, deps, key, pre, post, snap)
+					if routeErr == nil && confirmedPre == nil {
+						if !accept() {
+							return
+						}
+						continue
+					}
+					if routeErr == nil {
+						pre = confirmedPre
+					}
 				case !hadPre || (preIsSeed && deps.witness != nil && seedBoundaryNeedsWitness(pre, post)):
 					// GC-44: no pre-state this intercept can trust — the
 					// table's first snapshot since the intercept was wired,
@@ -334,7 +379,7 @@ func interceptAddColumnForward(
 					witnessedPre, routeErr = routeWitnessedBoundary(ctx, deps, key, post, snap)
 					if routeErr == nil && witnessedPre == nil {
 						// Nothing forwarded: accept the baseline.
-						if !forwardChange(ctx, out, c) {
+						if !accept() {
 							return
 						}
 						continue
@@ -376,7 +421,7 @@ func interceptAddColumnForward(
 				// Forward the snapshot to the applier so the
 				// ADR-0049 schema-history row still records the
 				// version on the same tx as the position write.
-				if !forwardChange(ctx, out, c) {
+				if !accept() {
 					return
 				}
 				// Then run the backfill — after the snapshot, so the
@@ -432,6 +477,19 @@ func routeForwardBoundary(
 	preIsSeed bool,
 ) error {
 	shape, err := ClassifyShape(pre, post)
+	var multi *multiColumnAlterError
+	if err != nil && preIsSeed && errors.As(err, &multi) && !multi.changesAType() {
+		// Nullability changes on several columns against the cold-start
+		// seed: the seed guard below skips ONE such change as a possible
+		// phantom, so several get the same treatment (a type change among
+		// them went to the target witness instead — seedBoundaryNeedsWitness).
+		slog.WarnContext(ctx,
+			"schema-forward: skipping nullability changes on several columns at the first post-cold-start "+
+				"boundary (classified against the cold-start seed — not forwarding to avoid a phantom; ADR-0091 §3). "+
+				"If the source really made these changes, apply them on the target via the drained model",
+			"table", tableName, "change", err.Error())
+		return nil
+	}
 	if err != nil {
 		// ADR-0060 (F11) — surface the structured per-table drift
 		// alongside the classify error so the operator sees WHAT
@@ -487,10 +545,11 @@ func routeForwardBoundary(
 	}
 	switch shape.Kind {
 	case ShapeKindNone:
-		// No structural delta (incl. a pure column reorder — sluice
-		// decodes rows by name, so the target's physical column order
-		// is irrelevant; ADR-0091 §4). Forward the snapshot so the
-		// ADR-0049 schema-history row records; no DDL.
+		// No structural delta. Forward the snapshot so the ADR-0049
+		// schema-history row records; no DDL. (A column reorder used to
+		// land here too — ADR-0091 §4 — and so did a rename swap, which
+		// is the same shape; ClassifyShape now refuses both,
+		// RENAME-SWAP-FORWARD.)
 		return nil
 	case ShapeKindAddColumn:
 		// ADD COLUMN keeps its dedicated path: computed-DEFAULT
@@ -634,6 +693,21 @@ func refuseRenameAmbiguous(tableName string, shape Shape, pre, post *ir.Table) e
 	if shape.RenamedColumnAfter != nil {
 		newName = shape.RenamedColumnAfter.Name
 	}
+	if renameSetAmbiguous(shape, pre, post) {
+		// RENAME-SWAP-FORWARD review F3: `RENAME b TO x, RENAME c TO b`
+		// looks like one rename, c→x, and naming that pair as the remedy
+		// sent the operator to rename the wrong column — the target then
+		// held b's values under x and c's under b, silently.
+		return fmt.Errorf(
+			"%s: the source renamed more than one column of %q in one change (a column kept its name but moved "+
+				"to another position, so the one rename sluice can see, %q→%q, is not what the source did — it is "+
+				"likely a chain such as `RENAME b TO x, RENAME c TO b`). The rename set cannot be recovered from the "+
+				"table's shape, and renaming the pair above on the target would leave values under the wrong "+
+				"names.%s %s",
+			ir.ErrColumnOrderChanged, tableName, oldName, newName, renderDriftForRefusal(pre, post),
+			columnOrderRecopyRemedy,
+		)
+	}
 	return fmt.Errorf(
 		"RENAME COLUMN %q→%q on %q cannot be auto-forwarded: a rename is "+
 			"indistinguishable from a drop+add of a same-type column from the "+
@@ -643,6 +717,49 @@ func refuseRenameAmbiguous(tableName string, shape Shape, pre, post *ir.Table) e
 		oldName, newName, tableName, renderDriftForRefusal(pre, post),
 		forwardRecoveryHint(tableName),
 	)
+}
+
+// renameSetAmbiguous reports whether a one-rename shape hides a longer rename
+// chain: with the renamed column counted as one column on both sides, some
+// column sits at another position — `RENAME b TO x, RENAME c TO b` leaves
+// (id, b, c) → (id, x, b), where the visible pair c→x moved from the third
+// place to the second. Only the columns both sides list are positioned, so
+// a column one side's projection omits (a Postgres generated column) cannot
+// fake a move. The Postgres form of the same evidence, a stable id that
+// moved, is refused by [ClassifyShape] before a rename is classified.
+func renameSetAmbiguous(shape Shape, pre, post *ir.Table) bool {
+	if pre == nil || post == nil || shape.RenamedColumnBefore == nil || shape.RenamedColumnAfter == nil {
+		return false
+	}
+	oldName, newName := shape.RenamedColumnBefore.Name, shape.RenamedColumnAfter.Name
+	preNames, postNames := ir.ColumnNames(pre), ir.ColumnNames(post)
+	identity := func(n string) string {
+		if n == newName {
+			return oldName
+		}
+		return n
+	}
+	inPost := map[string]bool{}
+	for _, n := range postNames {
+		inPost[identity(n)] = true
+	}
+	var before []string
+	for _, n := range preNames {
+		if inPost[n] {
+			before = append(before, n)
+		}
+	}
+	inPre := map[string]bool{}
+	for _, n := range preNames {
+		inPre[n] = true
+	}
+	var after []string
+	for _, n := range postNames {
+		if inPre[identity(n)] {
+			after = append(after, identity(n))
+		}
+	}
+	return !slices.Equal(before, after)
 }
 
 // refuseShapeMultiCombo is the refusal for a multi-shape combo boundary

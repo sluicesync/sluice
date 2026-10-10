@@ -87,6 +87,15 @@ import (
 //     persists nothing, so a restart refuses again until the operator
 //     applies the change on the target. Its catalog-read failure is NOT the
 //     marker and stays restartable.
+//   - COLUMN-ORDER-CHANGED (every source with a schema-snapshot intercept,
+//     codeless; RENAME-SWAP-FORWARD): listed. The live refusal compares the
+//     source's new column order with the target's catalog; a restart's
+//     first boundary compares the same source shape with the retained
+//     schema history, which never records the refused boundary, and the
+//     target, both unchanged — and refuses again (as RESUME-SCHEMA-DIVERGENCE
+//     on the forward path) until the operator applies the change on the
+//     target. Its catalog-read failure is NOT the marker and stays
+//     restartable.
 //   - DEFERRED-KEY-CHECK-FAILED-AT-COMMIT (Postgres target, codeless): NOT
 //     listed. It is the COMMIT of a target transaction that a deferrable
 //     constraint's re-check refused, and one of its causes is a source
@@ -118,6 +127,7 @@ var refusalsARestartRepeats = []error{
 	ir.ErrHeartbeatTableNotSluices,
 	ir.ErrResumeSchemaDivergence,
 	ir.ErrSchemaChangeRefused,
+	ir.ErrColumnOrderChanged,
 }
 
 // refusalARestartRepeats returns the listed sentinel err carries, or nil.

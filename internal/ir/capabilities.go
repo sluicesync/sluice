@@ -129,6 +129,12 @@ type Capabilities struct {
 	// rows (Postgres: RelationMessage WALStart < row LSNs; MySQL binlog: the
 	// DDL query-event position < the row events it precedes).
 	CDCPositionCommitsAfterRows bool
+	// ReorderColumns reports that the engine can move a column within its
+	// table in place (MySQL `MODIFY … AFTER`/`FIRST`). Read by the
+	// RENAME-SWAP-FORWARD column-order refusal to name a remedy the target
+	// can actually run: where it is false (Postgres, SQLite), a source
+	// reorder can only be followed by re-copying the table.
+	ReorderColumns bool
 	// SchemaScope is the table-namespacing model.
 	SchemaScope SchemaScope
 	// NOTE: seven TYPE-FIDELITY fields were removed here on 2026-08-10

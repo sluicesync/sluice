@@ -1,0 +1,823 @@
+//go:build integration
+
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
+// RENAME-SWAP-FORWARD — the pin (column_order_boundary.go).
+//
+// A rename swap (`RENAME COLUMN b TO c, RENAME COLUMN c TO b`) on a source
+// `sync start` follows was applied to the target as nothing: every row the
+// target held kept its pre-swap values under its pre-swap names, at exit 0.
+// The class is every boundary a by-name comparison cannot see, so the
+// matrix is every shape of it × every way a stream meets the boundary, on
+// every source family that emits schema boundaries:
+//
+//	shapes:  a same-type swap, a three-way rotation, a swap across types,
+//	         a swap with a retype, a MySQL-family reorder (the stated cost),
+//	         and the sibling the same classifier read as no change — two
+//	         columns widened in one ALTER;
+//	entries: live with the cache primed by an earlier row (CDC→CDC), live
+//	         against the cold-start seed, a warm resume across the change,
+//	         a restart after the refusal, the operator's reconcile, and
+//	         --schema-changes=refuse;
+//	servers: MySQL 8.0, MySQL 8.4, MariaDB 11.4, Postgres 16.
+//
+// The grade is the target against the source — declared column names in
+// order, and every row's values by name — never the stream's own logs. A
+// refusal must leave the target exactly as it was and the post-change row
+// unapplied; the reconcile must converge the target onto the source.
+
+package pipeline
+
+import (
+	"context"
+	"crypto/md5"
+	"database/sql"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"sort"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/testcontainers/testcontainers-go"
+	mysqltc "github.com/testcontainers/testcontainers-go/modules/mysql"
+
+	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
+)
+
+// rsfServer is one database server; every cell gets its own source and
+// target database on it.
+type rsfServer struct {
+	label   string
+	engine  string
+	dialect string // "mysql" or "postgres"
+	newDB   func(t *testing.T, name string) twfbDB
+}
+
+func rsfMySQLFamily(t *testing.T, label, engine, rootDSN string, buildDSN func(orig, db string) (string, error)) rsfServer {
+	t.Helper()
+	root := twfbDB{engine: engine, dsn: rootDSN}
+	return rsfServer{
+		label: label, engine: engine, dialect: "mysql",
+		newDB: func(t *testing.T, name string) twfbDB {
+			t.Helper()
+			root.exec(t, "CREATE DATABASE "+name)
+			dsn, err := buildDSN(rootDSN, name)
+			if err != nil {
+				t.Fatalf("dsn for %s: %v", name, err)
+			}
+			return twfbDB{engine: engine, dsn: dsn}
+		},
+	}
+}
+
+// rsfBootMySQL boots a MySQL image with the binlog the stream needs.
+func rsfBootMySQL(t *testing.T, image string) (dsn string, cleanup func()) {
+	t.Helper()
+	container := runMySQLImageWithRetry(
+		t, image,
+		mysqltc.WithDatabase("source_db"),
+		mysqltc.WithUsername("root"),
+		mysqltc.WithPassword("rootpw"),
+		testcontainers.CustomizeRequest(testcontainers.GenericContainerRequest{
+			ContainerRequest: testcontainers.ContainerRequest{Cmd: []string{
+				"mysqld", "--server-id=1", "--log-bin=mysql-bin", "--binlog-format=ROW", "--binlog-row-image=FULL",
+			}},
+		}),
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	conn, err := container.ConnectionString(ctx, "parseTime=true")
+	if err != nil {
+		t.Fatalf("connection string: %v", err)
+	}
+	return conn, func() { _ = container.Terminate(context.Background()) }
+}
+
+// rsfShape is one source change: the table before it (ids 1..3), the change
+// itself (applied verbatim to the target by the reconcile), and a row
+// written after it, by name.
+type rsfShape struct {
+	name   string
+	create string
+	change string
+	insert string
+	// markers are the texts a refusal of this shape may carry (any one).
+	markers []string
+	// liveOnly limits the shape to the CDC→CDC live entry: its evidence
+	// (a Postgres stable column id) exists only within one reader session.
+	liveOnly bool
+}
+
+var (
+	rsfOrderMarkers = []string{"COLUMN-ORDER-CHANGED"}
+	rsfMultiMarkers = []string{"columns changed type or nullability in one schema boundary", "RESUME-SCHEMA-DIVERGENCE"}
+)
+
+func rsfShapes(dialect string) []rsfShape {
+	if dialect == "postgres" {
+		return []rsfShape{
+			{
+				name:    "swap",
+				create:  "CREATE TABLE kd (id INT PRIMARY KEY, b INT, c INT); INSERT INTO kd VALUES (1,10,20),(2,11,21),(3,12,22);",
+				change:  "BEGIN; ALTER TABLE kd RENAME COLUMN b TO tmp; ALTER TABLE kd RENAME COLUMN c TO b; ALTER TABLE kd RENAME COLUMN tmp TO c; COMMIT;",
+				insert:  "INSERT INTO kd (id,b,c) VALUES (100,1000,2000)",
+				markers: rsfOrderMarkers,
+			},
+			{
+				name:    "rotation",
+				create:  "CREATE TABLE kd (id INT PRIMARY KEY, b INT, c INT, d INT); INSERT INTO kd VALUES (1,10,20,30),(2,11,21,31),(3,12,22,32);",
+				change:  "BEGIN; ALTER TABLE kd RENAME COLUMN b TO tmp; ALTER TABLE kd RENAME COLUMN d TO b; ALTER TABLE kd RENAME COLUMN c TO d; ALTER TABLE kd RENAME COLUMN tmp TO c; COMMIT;",
+				insert:  "INSERT INTO kd (id,b,c,d) VALUES (100,1000,2000,3000)",
+				markers: rsfOrderMarkers,
+			},
+			{
+				name:    "swap-across-types",
+				create:  "CREATE TABLE kd (id INT PRIMARY KEY, b INT, c TEXT); INSERT INTO kd VALUES (1,10,'x1'),(2,11,'x2'),(3,12,'x3');",
+				change:  "BEGIN; ALTER TABLE kd RENAME COLUMN b TO tmp; ALTER TABLE kd RENAME COLUMN c TO b; ALTER TABLE kd RENAME COLUMN tmp TO c; COMMIT;",
+				insert:  "INSERT INTO kd (id,b,c) VALUES (100,'nb',300)",
+				markers: rsfOrderMarkers,
+			},
+			{
+				name:    "swap-and-retype",
+				create:  "CREATE TABLE kd (id INT PRIMARY KEY, b INT, c INT); INSERT INTO kd VALUES (1,10,20),(2,11,21),(3,12,22);",
+				change:  "BEGIN; ALTER TABLE kd RENAME COLUMN b TO tmp; ALTER TABLE kd RENAME COLUMN c TO b; ALTER TABLE kd RENAME COLUMN tmp TO c; ALTER TABLE kd ALTER COLUMN c TYPE BIGINT; COMMIT;",
+				insert:  "INSERT INTO kd (id,b,c) VALUES (100,1000,5000000000)",
+				markers: rsfOrderMarkers,
+			},
+			{
+				name:    "two-columns-widened",
+				create:  "CREATE TABLE kd (id INT PRIMARY KEY, b NUMERIC(10,2), c NUMERIC(10,2)); INSERT INTO kd VALUES (1,1.25,2.25),(2,1.5,2.5),(3,1.75,2.75);",
+				change:  "ALTER TABLE kd ALTER COLUMN b TYPE NUMERIC(12,4), ALTER COLUMN c TYPE NUMERIC(12,4);",
+				insert:  "INSERT INTO kd (id,b,c) VALUES (100,1.2345,2.3456)",
+				markers: rsfMultiMarkers,
+			},
+			{
+				// Review F2: the name b survives with c's column behind it —
+				// a DROP of c to a name-only classifier. Visible only through
+				// the stable column id, so live CDC→CDC only (a warm resume
+				// or a seed-sourced first boundary has none: RENAME-SWAP-INVISIBLE).
+				name:     "drop-then-rename-onto",
+				create:   "CREATE TABLE kd (id INT PRIMARY KEY, b INT, c INT); INSERT INTO kd VALUES (1,10,20),(2,11,21),(3,12,22);",
+				change:   "BEGIN; ALTER TABLE kd DROP COLUMN b; ALTER TABLE kd RENAME COLUMN c TO b; COMMIT;",
+				insert:   "INSERT INTO kd (id,b) VALUES (100,1000)",
+				markers:  []string{"now name a different column"},
+				liveOnly: true,
+			},
+		}
+	}
+	return []rsfShape{
+		{
+			name:    "swap",
+			create:  "CREATE TABLE kd (id INT PRIMARY KEY, b INT, c INT); INSERT INTO kd VALUES (1,10,20),(2,11,21),(3,12,22);",
+			change:  "ALTER TABLE kd RENAME COLUMN b TO c, RENAME COLUMN c TO b",
+			insert:  "INSERT INTO kd (id,b,c) VALUES (100,1000,2000)",
+			markers: rsfOrderMarkers,
+		},
+		{
+			name:    "rotation",
+			create:  "CREATE TABLE kd (id INT PRIMARY KEY, b INT, c INT, d INT); INSERT INTO kd VALUES (1,10,20,30),(2,11,21,31),(3,12,22,32);",
+			change:  "ALTER TABLE kd RENAME COLUMN b TO c, RENAME COLUMN c TO d, RENAME COLUMN d TO b",
+			insert:  "INSERT INTO kd (id,b,c,d) VALUES (100,1000,2000,3000)",
+			markers: rsfOrderMarkers,
+		},
+		{
+			name:    "swap-across-types",
+			create:  "CREATE TABLE kd (id INT PRIMARY KEY, b INT, c VARCHAR(20)); INSERT INTO kd VALUES (1,10,'x1'),(2,11,'x2'),(3,12,'x3');",
+			change:  "ALTER TABLE kd RENAME COLUMN b TO c, RENAME COLUMN c TO b",
+			insert:  "INSERT INTO kd (id,b,c) VALUES (100,'nb',300)",
+			markers: rsfOrderMarkers,
+		},
+		{
+			name:    "swap-and-retype",
+			create:  "CREATE TABLE kd (id INT PRIMARY KEY, b INT, c INT); INSERT INTO kd VALUES (1,10,20),(2,11,21),(3,12,22);",
+			change:  "ALTER TABLE kd CHANGE COLUMN b c BIGINT, CHANGE COLUMN c b INT",
+			insert:  "INSERT INTO kd (id,b,c) VALUES (100,1000,5000000000)",
+			markers: rsfOrderMarkers,
+		},
+		{
+			name:    "two-columns-widened",
+			create:  "CREATE TABLE kd (id INT PRIMARY KEY, b DECIMAL(10,2), c DECIMAL(10,2)); INSERT INTO kd VALUES (1,1.25,2.25),(2,1.5,2.5),(3,1.75,2.75);",
+			change:  "ALTER TABLE kd MODIFY COLUMN b DECIMAL(12,4), MODIFY COLUMN c DECIMAL(12,4)",
+			insert:  "INSERT INTO kd (id,b,c) VALUES (100,1.2345,2.3456)",
+			markers: rsfMultiMarkers,
+		},
+		{
+			// The stated cost: a plain reorder is the same shape as a swap.
+			name:    "reorder",
+			create:  "CREATE TABLE kd (id INT PRIMARY KEY, b INT, c INT); INSERT INTO kd VALUES (1,10,20),(2,11,21),(3,12,22);",
+			change:  "ALTER TABLE kd MODIFY COLUMN c INT AFTER id",
+			insert:  "INSERT INTO kd (id,b,c) VALUES (100,1000,2000)",
+			markers: rsfOrderMarkers,
+		},
+	}
+}
+
+// rsfTable is a table's declared columns and its rows' values by name,
+// ordered by id — what the grade compares.
+type rsfTable struct {
+	columns []string
+	rows    string
+}
+
+func (r rsfTable) digest() string {
+	sum := md5.Sum([]byte(r.rows))
+	return hex.EncodeToString(sum[:])
+}
+
+// rsfColumns returns the one-column result of q as strings.
+func rsfColumns(t *testing.T, conn *sql.DB, q string) []string {
+	t.Helper()
+	rows, err := conn.Query(q)
+	if err != nil {
+		t.Fatalf("read columns: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []string
+	for rows.Next() {
+		var c string
+		if err := rows.Scan(&c); err != nil {
+			t.Fatalf("scan column: %v", err)
+		}
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read columns: %v", err)
+	}
+	return out
+}
+
+func rsfRead(t *testing.T, db twfbDB) rsfTable {
+	t.Helper()
+	conn, err := sql.Open(db.driver(), db.dsn)
+	if err != nil {
+		t.Fatalf("open %s: %v", db.engine, err)
+	}
+	defer func() { _ = conn.Close() }()
+	q := `SELECT COLUMN_NAME FROM information_schema.columns WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'kd' ORDER BY ORDINAL_POSITION`
+	if db.engine == "postgres" {
+		q = `SELECT attname FROM pg_attribute WHERE attrelid = 'public.kd'::regclass AND attnum > 0 AND NOT attisdropped ORDER BY attnum`
+	}
+	var out rsfTable
+	out.columns = rsfColumns(t, conn, q)
+	// Values by NAME, in a fixed name order, so two tables declaring the
+	// same columns in different orders still compare value for value.
+	byName := append([]string(nil), out.columns...)
+	sort.Strings(byName)
+	data, err := conn.Query("SELECT " + strings.Join(byName, ", ") + " FROM kd ORDER BY id")
+	if err != nil {
+		t.Fatalf("read rows: %v", err)
+	}
+	defer func() { _ = data.Close() }()
+	var sb strings.Builder
+	for data.Next() {
+		vals := make([]sql.NullString, len(byName))
+		ptrs := make([]any, len(byName))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		if err := data.Scan(ptrs...); err != nil {
+			t.Fatalf("scan row: %v", err)
+		}
+		for i, v := range vals {
+			fmt.Fprintf(&sb, "%s=%s;", byName[i], v.String)
+		}
+		sb.WriteString("\n")
+	}
+	if err := data.Err(); err != nil {
+		t.Fatalf("read rows: %v", err)
+	}
+	out.rows = sb.String()
+	return out
+}
+
+// rsfAwaitRefusal waits for the run to stop on its own and checks the
+// refusal names the shape.
+func rsfAwaitRefusal(t *testing.T, run *twfbRun, markers []string, what string) error {
+	t.Helper()
+	deadline := time.Now().Add(90 * time.Second)
+	for !run.exited() {
+		if time.Now().After(deadline) {
+			_ = run.stop(t)
+			t.Fatalf("%s: the stream did not refuse — it is still running past the change", what)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if run.err == nil || errors.Is(run.err, context.Canceled) {
+		t.Fatalf("%s: the stream exited without refusing (err=%v)", what, run.err)
+	}
+	for _, m := range markers {
+		if strings.Contains(run.err.Error(), m) {
+			return run.err
+		}
+	}
+	t.Fatalf("%s: the stream stopped, but not on this refusal (want one of %q): %v", what, markers, run.err)
+	return nil
+}
+
+// rsfAssertUntouched grades a refusal: the target holds exactly what it
+// held before the change, and the row written after it is not there.
+func rsfAssertUntouched(t *testing.T, tgt twfbDB, before rsfTable, what string) {
+	t.Helper()
+	got := rsfRead(t, tgt)
+	if strings.Join(got.columns, ",") != strings.Join(before.columns, ",") || got.digest() != before.digest() {
+		t.Errorf("%s: the refusal changed the target\nbefore: %v\n%s\nafter:  %v\n%s", what, before.columns, before.rows, got.columns, got.rows)
+	}
+	if tgt.hasRow(t, "kd", 100) {
+		t.Errorf("%s: the row written after the change was applied — the refusal came after a post-change row", what)
+	}
+}
+
+// rsfAssertConverged grades the reconcile: the target declares the
+// source's columns in the source's order and holds every row's values by
+// name, md5 for md5.
+func rsfAssertConverged(t *testing.T, src, tgt twfbDB, what string) {
+	t.Helper()
+	s, g := rsfRead(t, src), rsfRead(t, tgt)
+	if strings.Join(s.columns, ",") != strings.Join(g.columns, ",") {
+		t.Errorf("%s: target columns %v, source %v", what, g.columns, s.columns)
+	}
+	if s.digest() != g.digest() {
+		t.Errorf("%s: target rows differ from the source\nsource:\n%s\ntarget:\n%s", what, s.rows, g.rows)
+	}
+}
+
+// rsfEntry is one way a stream meets the change.
+type rsfEntry string
+
+const (
+	rsfLiveCDC  rsfEntry = "live-cdc"  // running; an earlier row primed the cache
+	rsfLiveSeed rsfEntry = "live-seed" // running; the change is the table's first boundary
+	rsfWarm     rsfEntry = "warm"      // stopped across the change
+	rsfRefuse   rsfEntry = "refuse"    // --schema-changes=refuse, live
+)
+
+func rsfRunCell(t *testing.T, srv rsfServer, shape rsfShape, entry rsfEntry, idx int) {
+	t.Helper()
+	tag := fmt.Sprintf("c%d", idx)
+	src, tgt := srv.newDB(t, "s_"+tag), srv.newDB(t, "t_"+tag)
+	cell := twfbCell{src: src, tgt: tgt, streamID: "rsf-" + tag, slotName: "rsf_" + tag}
+	if entry == rsfRefuse {
+		cell.schemaChanges = "refuse"
+	}
+	src.exec(t, shape.create)
+	what := fmt.Sprintf("%s/%s/%s", srv.label, shape.name, entry)
+
+	var run *twfbRun
+	if entry == rsfWarm {
+		cell.coldStartAndStop(t, "kd", 3)
+	} else {
+		run = startTWFBRun(cell.streamer())
+		if !tgt.waitRow(t, "kd", 3, run, 180*time.Second) {
+			t.Fatalf("%s: the cold start never delivered the seed rows (stream: %v)", what, run.stop(t))
+		}
+		cell.waitStreaming(t, run)
+		if entry != rsfLiveSeed {
+			src.exec(t, "INSERT INTO kd (id) VALUES (50)")
+			if !tgt.waitRow(t, "kd", 50, run, 60*time.Second) {
+				t.Fatalf("%s: the priming row never landed (stream: %v)", what, run.stop(t))
+			}
+		}
+	}
+	before := rsfRead(t, tgt)
+	src.exec(t, shape.change)
+	src.exec(t, shape.insert)
+
+	if entry == rsfWarm {
+		run = startTWFBRun(cell.streamer())
+	}
+	err := rsfAwaitRefusal(t, run, shape.markers, what)
+	t.Logf("%s refused: %v", what, err)
+	rsfAssertUntouched(t, tgt, before, what)
+
+	// A restart that changed nothing refuses again: the refused boundary is
+	// never recorded, so the stream cannot forget it. Not for a liveOnly
+	// shape: its evidence does not survive the restart, which accepts it —
+	// the RENAME-SWAP-INVISIBLE residual (e), stated rather than pinned.
+	if !shape.liveOnly {
+		again := startTWFBRun(cell.streamer())
+		_ = rsfAwaitRefusal(t, again, shape.markers, what+" (restart, target not reconciled)")
+		rsfAssertUntouched(t, tgt, before, what+" (restart)")
+	}
+
+	// The operator applies the source's change on the target; the stream
+	// then converges onto the source.
+	tgt.exec(t, shape.change)
+	final := startTWFBRun(cell.streamer())
+	if !tgt.waitRow(t, "kd", 100, final, 90*time.Second) {
+		t.Fatalf("%s: after the reconcile the post-change row never landed (stream: %v)", what, final.stop(t))
+	}
+	rsfAssertConverged(t, src, tgt, what+" (after the reconcile)")
+	if err := final.stop(t); err != nil && !errors.Is(err, context.Canceled) {
+		t.Errorf("%s: the reconciled stream stopped with %v", what, err)
+	}
+	rsfAssertRecord(t, src, tgt, cell.streamID, what)
+}
+
+// rsfAssertRecord checks the stream's column-order record for kd on the
+// target: the accepted change must have recorded the source's and the
+// target's orders as they now stand — the record the NEXT order change is
+// judged against.
+func rsfAssertRecord(t *testing.T, src, tgt twfbDB, streamID, what string) {
+	t.Helper()
+	conn, err := sql.Open(tgt.driver(), tgt.dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	q := "SELECT source_columns, target_columns FROM sluice_cdc_column_order WHERE stream_id = ? AND table_name = 'kd'"
+	if tgt.engine == "postgres" {
+		q = strings.Replace(q, "?", "$1", 1)
+	}
+	rows, err := conn.Query(q, streamID)
+	if err != nil {
+		t.Fatalf("%s: read the column-order record: %v", what, err)
+	}
+	defer func() { _ = rows.Close() }()
+	want := [2]string{rsfEncodedOrder(t, rsfRead(t, src).columns), rsfEncodedOrder(t, rsfRead(t, tgt).columns)}
+	var seen []string
+	for rows.Next() {
+		var s, g string
+		if err := rows.Scan(&s, &g); err != nil {
+			t.Fatal(err)
+		}
+		if [2]string{s, g} == want {
+			return
+		}
+		seen = append(seen, s+" / "+g)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	t.Errorf("%s: no column-order record for kd reads %s / %s; the target holds %v", what, want[0], want[1], seen)
+}
+
+func rsfEncodedOrder(t *testing.T, cols []string) string {
+	t.Helper()
+	s, err := ir.EncodeColumnNames(cols)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+// rsfDivergence is how a cell's target comes to declare kd's columns in
+// another order than the source before the swap — the review's F1 class,
+// where the target already holding the swap's new order is NOT proof the
+// operator applied it.
+type rsfDivergence string
+
+const (
+	// rsfAddAfter: the source runs `ADD COLUMN x INT AFTER id` while the
+	// stream forwards it; the target appends x at the END. MySQL family.
+	rsfAddAfter rsfDivergence = "forwarded-add-after"
+	// rsfAdopted: the target table was created ahead of the cold start in
+	// another column order and adopted (ADR-0166).
+	rsfAdopted rsfDivergence = "adopted-target"
+)
+
+// rsfRunDivergedCell drives a swap whose new order the target already
+// holds: it must refuse as unprovable (the re-copy remedy), live or across a
+// restart, leave the target untouched, refuse again on a plain restart, and
+// converge after the remedy it names — `--reset-target-data`.
+func rsfRunDivergedCell(t *testing.T, srv rsfServer, how rsfDivergence, warm bool, idx int) {
+	t.Helper()
+	tag := fmt.Sprintf("d%d", idx)
+	src, tgt := srv.newDB(t, "s_"+tag), srv.newDB(t, "t_"+tag)
+	cell := twfbCell{src: src, tgt: tgt, streamID: "rsf-" + tag, slotName: "rsf_" + tag}
+	what := fmt.Sprintf("%s/diverged/%s/warm=%t", srv.label, how, warm)
+	var swap, insert string
+	switch how {
+	case rsfAddAfter:
+		src.exec(t, "CREATE TABLE kd (id INT PRIMARY KEY, b INT); INSERT INTO kd VALUES (1,10),(2,11),(3,12);")
+		swap = "ALTER TABLE kd RENAME COLUMN x TO b, RENAME COLUMN b TO x"
+		insert = "INSERT INTO kd (id,b,x) VALUES (100,1000,2000)"
+	case rsfAdopted:
+		src.exec(t, "CREATE TABLE kd (id INT PRIMARY KEY, b INT, c INT); INSERT INTO kd VALUES (1,10,20),(2,11,21),(3,12,22);")
+		tgt.exec(t, "CREATE TABLE kd (id INT PRIMARY KEY, c INT, b INT);")
+		swap = rsfShapes(srv.dialect)[0].change
+		insert = "INSERT INTO kd (id,b,c) VALUES (100,1000,2000)"
+	}
+	run := startTWFBRun(cell.streamer())
+	if !tgt.waitRow(t, "kd", 3, run, 180*time.Second) {
+		t.Fatalf("%s: the cold start never delivered the seed rows (stream: %v)", what, run.stop(t))
+	}
+	cell.waitStreaming(t, run)
+	if how == rsfAddAfter {
+		src.exec(t, "ALTER TABLE kd ADD COLUMN x INT AFTER id")
+		src.exec(t, "INSERT INTO kd (id,x,b) VALUES (60,6,7)")
+		if !tgt.waitRow(t, "kd", 60, run, 60*time.Second) {
+			t.Fatalf("%s: the forwarded ADD COLUMN's row never landed (stream: %v)", what, run.stop(t))
+		}
+		if got := rsfRead(t, tgt).columns; strings.Join(got, ",") != "id,b,x" {
+			t.Fatalf("%s: the target declares %v; the case needs the forwarded column at the end", what, got)
+		}
+	} else {
+		src.exec(t, "INSERT INTO kd (id) VALUES (50)")
+		if !tgt.waitRow(t, "kd", 50, run, 60*time.Second) {
+			t.Fatalf("%s: the priming row never landed (stream: %v)", what, run.stop(t))
+		}
+	}
+	if warm {
+		if err := run.stop(t); err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("%s: the clean stop returned %v", what, err)
+		}
+	}
+	before := rsfRead(t, tgt)
+	src.exec(t, swap)
+	src.exec(t, insert)
+	if warm {
+		run = startTWFBRun(cell.streamer())
+	}
+	markers := []string{"--reset-target-data"}
+	err := rsfAwaitRefusal(t, run, markers, what)
+	if !strings.Contains(err.Error(), "COLUMN-ORDER-CHANGED") {
+		t.Errorf("%s: the refusal does not carry COLUMN-ORDER-CHANGED: %v", what, err)
+	}
+	t.Logf("%s refused: %v", what, err)
+	rsfAssertUntouched(t, tgt, before, what)
+	again := startTWFBRun(cell.streamer())
+	_ = rsfAwaitRefusal(t, again, markers, what+" (restart)")
+	rsfAssertUntouched(t, tgt, before, what+" (restart)")
+
+	// The remedy the refusal names: re-copy the stream — on a Postgres
+	// source after dropping its slot, as the remedy says (here in SQL, what
+	// `sluice slot drop` runs).
+	if srv.dialect == "postgres" {
+		src.exec(t, "SELECT pg_drop_replication_slot('sluice_rsf_"+tag+"')")
+	}
+	s := cell.streamer()
+	s.ResetTargetData = true
+	final := startTWFBRun(s)
+	if !tgt.waitRow(t, "kd", 100, final, 180*time.Second) {
+		t.Fatalf("%s: after --reset-target-data the post-change row never landed (stream: %v)", what, final.stop(t))
+	}
+	rsfAssertConverged(t, src, tgt, what+" (after --reset-target-data)")
+	if err := final.stop(t); err != nil && !errors.Is(err, context.Canceled) {
+		t.Errorf("%s: the re-copied stream stopped with %v", what, err)
+	}
+}
+
+// rsfRunPreUpgradeCell is a stream whose target has no column-order
+// records — what a stream started before this release presents to it,
+// reproduced exactly by dropping the record table between a cold start and
+// the resume (the resume's EnsureControlTable creates it empty again).
+// swapWhileStopped: the swap happens before the stream can record
+// anything, and must refuse as unprovable (the re-copy remedy). Otherwise
+// the stream bootstraps a record at the table's first boundary, and a
+// later live swap is then judged like any other: refused until the
+// operator applies it, then converged, with the record graded.
+func rsfRunPreUpgradeCell(t *testing.T, srv rsfServer, swapWhileStopped bool, idx int) {
+	t.Helper()
+	tag := fmt.Sprintf("u%d", idx)
+	src, tgt := srv.newDB(t, "s_"+tag), srv.newDB(t, "t_"+tag)
+	cell := twfbCell{src: src, tgt: tgt, streamID: "rsf-" + tag, slotName: "rsf_" + tag}
+	shape := rsfShapes(srv.dialect)[0]
+	what := fmt.Sprintf("%s/pre-upgrade/swap-while-stopped=%t", srv.label, swapWhileStopped)
+	src.exec(t, shape.create)
+	cell.coldStartAndStop(t, "kd", 3)
+	tgt.exec(t, "DROP TABLE sluice_cdc_column_order")
+
+	if swapWhileStopped {
+		before := rsfRead(t, tgt)
+		src.exec(t, shape.change)
+		src.exec(t, shape.insert)
+		run := startTWFBRun(cell.streamer())
+		err := rsfAwaitRefusal(t, run, []string{"--reset-target-data"}, what)
+		t.Logf("%s refused: %v", what, err)
+		rsfAssertUntouched(t, tgt, before, what)
+		return
+	}
+	run := startTWFBRun(cell.streamer())
+	src.exec(t, "INSERT INTO kd (id) VALUES (50)")
+	if !tgt.waitRow(t, "kd", 50, run, 90*time.Second) {
+		t.Fatalf("%s: the first row after the upgrade never landed (stream: %v)", what, run.stop(t))
+	}
+	rsfAssertRecord(t, src, tgt, cell.streamID, what+" (bootstrapped at the first boundary)")
+	before := rsfRead(t, tgt)
+	src.exec(t, shape.change)
+	src.exec(t, shape.insert)
+	_ = rsfAwaitRefusal(t, run, []string{"RENAME COLUMN statements"}, what)
+	rsfAssertUntouched(t, tgt, before, what)
+	tgt.exec(t, shape.change)
+	final := startTWFBRun(cell.streamer())
+	if !tgt.waitRow(t, "kd", 100, final, 90*time.Second) {
+		t.Fatalf("%s: after the reconcile the post-change row never landed (stream: %v)", what, final.stop(t))
+	}
+	rsfAssertConverged(t, src, tgt, what+" (after the reconcile)")
+	if err := final.stop(t); err != nil && !errors.Is(err, context.Canceled) {
+		t.Errorf("%s: the reconciled stream stopped with %v", what, err)
+	}
+	rsfAssertRecord(t, src, tgt, cell.streamID, what)
+}
+
+// rsfRunServer runs every shape's cells on one server.
+func rsfRunServer(t *testing.T, srv rsfServer) {
+	for i, stopped := range []bool{false, true} {
+		t.Run(fmt.Sprintf("pre-upgrade/swap-while-stopped=%t", stopped), func(t *testing.T) {
+			rsfRunPreUpgradeCell(t, srv, stopped, i+1)
+		})
+	}
+	divergences := []rsfDivergence{rsfAdopted}
+	if srv.dialect == "mysql" {
+		divergences = append(divergences, rsfAddAfter)
+	}
+	d := 0
+	for _, how := range divergences {
+		for _, warm := range []bool{false, true} {
+			d++
+			n := d
+			t.Run(fmt.Sprintf("diverged/%s/warm=%t", how, warm), func(t *testing.T) {
+				rsfRunDivergedCell(t, srv, how, warm, n)
+			})
+		}
+	}
+	idx := 0
+	for _, shape := range rsfShapes(srv.dialect) {
+		entries := []rsfEntry{rsfLiveCDC, rsfWarm}
+		if shape.liveOnly {
+			entries = []rsfEntry{rsfLiveCDC}
+		}
+		if shape.name == "swap" {
+			entries = append(entries, rsfLiveSeed, rsfRefuse)
+		}
+		if shape.name == "two-columns-widened" {
+			entries = append(entries, rsfRefuse)
+		}
+		for _, entry := range entries {
+			idx++
+			n := idx
+			t.Run(shape.name+"/"+string(entry), func(t *testing.T) {
+				if entry == rsfRefuse {
+					if shape.name == "two-columns-widened" {
+						// Refuse mode judges column by column against the
+						// target and already refused a widen (GC-44 F5).
+						shape.markers = []string{"SCHEMA-CHANGE-REFUSED"}
+					}
+					if srv.dialect == "postgres" {
+						// On a stream that forwards nothing the Postgres
+						// reader's own gate refuses a same-OID rename or
+						// retype it sees mid-session, before the pipeline's
+						// check; a restart's first relation reaches the
+						// pipeline's.
+						shape.markers = append(append([]string(nil), shape.markers...), "incompatible schema change mid-stream")
+					}
+				}
+				rsfRunCell(t, srv, shape, entry, n)
+			})
+		}
+	}
+}
+
+func TestRenameSwapForward_MySQL80(t *testing.T) {
+	t.Parallel()
+	dsn, _, cleanup := startMySQLBinlog(t)
+	defer cleanup()
+	rsfRunServer(t, rsfMySQLFamily(t, "mysql-8.0", "mysql", dsn, buildMySQLDSN))
+}
+
+func TestRenameSwapForward_MySQL84(t *testing.T) {
+	t.Parallel()
+	dsn, cleanup := rsfBootMySQL(t, "mysql:8.4")
+	defer cleanup()
+	rsfRunServer(t, rsfMySQLFamily(t, "mysql-8.4", "mysql", dsn, buildMySQLDSN))
+}
+
+func TestRenameSwapForward_MariaDB(t *testing.T) {
+	t.Parallel()
+	dsn, cleanup := startMariaDBBinlog(t)
+	defer cleanup()
+	rsfRunServer(t, rsfMySQLFamily(t, "mariadb-11.4", "mariadb", dsn, buildMySQLDSN))
+}
+
+func TestRenameSwapForward_Postgres16(t *testing.T) {
+	t.Parallel()
+	srcDSN, _, cleanup := startPostgresLogicalImage(t, pgPrebakedImage, 40)
+	defer cleanup()
+	root := twfbDB{engine: "postgres", dsn: srcDSN}
+	rsfRunServer(t, rsfServer{
+		label: "postgres-16", engine: "postgres", dialect: "postgres",
+		newDB: func(t *testing.T, name string) twfbDB {
+			t.Helper()
+			root.exec(t, "CREATE DATABASE "+name)
+			dsn, err := buildPGDSN(srcDSN, name)
+			if err != nil {
+				t.Fatalf("dsn for %s: %v", name, err)
+			}
+			return twfbDB{engine: "postgres", dsn: dsn}
+		},
+	})
+}
+
+// TestRenameSwapForward_ChainRestore is the backup entry point: a full,
+// then the swap and a row inside an incremental's window, then a restore.
+// The window's schema delta shows only the declared order changing — the
+// column-order aspect, which chain replay (and the broker, through the
+// same disposition) passed with no DDL until RENAME-SWAP-FORWARD. It must
+// now refuse, and before the post-swap row reaches the target.
+func TestRenameSwapForward_ChainRestore(t *testing.T) {
+	for _, lane := range []acdLane{acdMySQLLane(false), acdPGLane(false)} {
+		t.Run(lane.engine, func(t *testing.T) {
+			shape := rsfShapes(lane.engine)[0] // the same-type swap
+			lane.seed = shape.create
+			if lane.engine == "postgres" {
+				lane.seed += " ALTER TABLE kd REPLICA IDENTITY FULL; CREATE PUBLICATION sluice_pub FOR ALL TABLES;"
+			}
+			src, tgt, cleanup := lane.start(t)
+			defer cleanup()
+			lane.exec(t, src, lane.seed)
+			eng, ok := engines.Get(lane.engine)
+			if !ok {
+				t.Fatalf("%s engine not registered", lane.engine)
+			}
+			store, err := blobcodec.NewLocalStore(t.TempDir())
+			if err != nil {
+				t.Fatalf("NewLocalStore: %v", err)
+			}
+			pos, teardown := lane.startPos(t, src)
+			defer teardown()
+			ctx := context.Background()
+			if err := (&backup.Backup{Source: eng, SourceDSN: src, Store: store, SluiceVersion: "test"}).Run(ctx); err != nil {
+				t.Fatalf("Backup.Run: %v", err)
+			}
+			full, err := lineage.ReadManifest(ctx, store)
+			if err != nil {
+				t.Fatalf("ReadManifest: %v", err)
+			}
+			full.Kind = irbackup.BackupKindFull
+			full.EndPosition = pos
+			full.BackupID = irbackup.ComputeBackupID(full)
+			if err := lineage.WriteManifestAt(ctx, store, lineage.ManifestFileName, full); err != nil {
+				t.Fatalf("rewrite full: %v", err)
+			}
+
+			lane.exec(t, src, shape.change)
+			lane.exec(t, src, shape.insert)
+			incrCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+			err = (&IncrementalBackup{
+				Source: eng, SourceDSN: src, Store: store, ParentRef: full.BackupID,
+				Window: 8 * time.Second, ChunkChanges: 3, SluiceVersion: "test",
+			}).Run(incrCtx)
+			cancel()
+			if err != nil {
+				t.Fatalf("IncrementalBackup.Run: %v", err)
+			}
+
+			restoreErr := (&backup.Restore{Target: eng, TargetDSN: tgt, Store: store}).Run(ctx)
+			if restoreErr == nil || !strings.Contains(restoreErr.Error(), "COLUMN-ORDER-CHANGED") {
+				t.Fatalf("restore across the swap = %v; want the column-order refusal", restoreErr)
+			}
+			t.Logf("restore refused: %v", restoreErr)
+			if (twfbDB{engine: lane.engine, dsn: tgt}).hasRow(t, "kd", 100) {
+				t.Errorf("the post-swap row reached the target before the refusal")
+			}
+		})
+	}
+}
+
+// TestRenameSwapForward_MySQLToPostgres_ReorderRemedy pins review F4 on a
+// real cross-engine pair: a MySQL source REORDERS a column, and the
+// Postgres target cannot — so the refusal must not tell the operator to run
+// the same `MODIFY … AFTER` there, and the remedy it does name, the re-copy,
+// must converge the target.
+func TestRenameSwapForward_MySQLToPostgres_ReorderRemedy(t *testing.T) {
+	srcDSN, _, srcCleanup := startMySQLBinlog(t)
+	defer srcCleanup()
+	_, tgtDSN, tgtCleanup := startPostgres(t)
+	defer tgtCleanup()
+	src, tgt := twfbDB{engine: "mysql", dsn: srcDSN}, twfbDB{engine: "postgres", dsn: tgtDSN}
+	cell := twfbCell{src: src, tgt: tgt, streamID: "rsf-x-reorder"}
+	src.exec(t, "CREATE TABLE kd (id INT PRIMARY KEY, b INT, c INT); INSERT INTO kd VALUES (1,10,20),(2,11,21),(3,12,22);")
+	run := startTWFBRun(cell.streamer())
+	if !tgt.waitRow(t, "kd", 3, run, 180*time.Second) {
+		t.Fatalf("the cold start never delivered the seed rows (stream: %v)", run.stop(t))
+	}
+	cell.waitStreaming(t, run)
+	before := rsfRead(t, tgt)
+	src.exec(t, "ALTER TABLE kd MODIFY COLUMN c INT AFTER id")
+	src.exec(t, "INSERT INTO kd (id,b,c) VALUES (100,1000,2000)")
+	err := rsfAwaitRefusal(t, run, []string{"COLUMN-ORDER-CHANGED"}, "mysql→postgres reorder")
+	msg := err.Error()
+	if strings.Contains(msg, "the same MODIFY") || !strings.Contains(msg, "cannot follow") || !strings.Contains(msg, "--reset-target-data") {
+		t.Errorf("the refusal's remedy is not runnable on a Postgres target: %v", err)
+	}
+	rsfAssertUntouched(t, tgt, before, "mysql→postgres reorder")
+
+	s := cell.streamer()
+	s.ResetTargetData = true
+	final := startTWFBRun(s)
+	if !tgt.waitRow(t, "kd", 100, final, 180*time.Second) {
+		t.Fatalf("after --reset-target-data the post-change row never landed (stream: %v)", final.stop(t))
+	}
+	rsfAssertConverged(t, src, tgt, "mysql→postgres reorder (after --reset-target-data)")
+	if err := final.stop(t); err != nil && !errors.Is(err, context.Canceled) {
+		t.Errorf("the re-copied stream stopped with %v", err)
+	}
+}

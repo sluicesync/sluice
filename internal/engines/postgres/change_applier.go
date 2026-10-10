@@ -541,6 +541,10 @@ type ChangeApplier struct {
 	// mark table, reported by the APPLY-MARKS-UNAVAILABLE WARN at apply start.
 	applyMarksEnsureErr error
 
+	// columnOrderEnsureErr is why EnsureControlTable could not create the
+	// RENAME-SWAP-FORWARD column-order record table (column_order.go).
+	columnOrderEnsureErr error
+
 	// requireMarks, set by [ChangeApplier.RequireApplyMarks], turns an
 	// unusable mark table at apply start into a refusal (ADR-0191 review).
 	requireMarks bool
@@ -1012,9 +1016,21 @@ func (a *ChangeApplier) EnsureControlTable(ctx context.Context) error {
 	a.applyMarksEnsureErr = retryOnCatalogRace(ctx, func() error {
 		return ensureApplyMarksTable(ctx, a.db, a.controlSchema)
 	})
+	// RENAME-SWAP-FORWARD: best-effort for the same reason; without it a
+	// column-order change refuses as unprovable (column_order.go).
+	a.columnOrderEnsureErr = retryOnCatalogRace(ctx, func() error {
+		return ensureColumnOrderTable(ctx, a.db, a.controlSchema)
+	})
 	if a.applyMarksEnsureErr == nil {
-		return ensureNekiControlTablePlacement(ctx, a.db, a.isNeki, a.serverKey, a.controlSchema, []string{
+		if err := ensureNekiControlTablePlacement(ctx, a.db, a.isNeki, a.serverKey, a.controlSchema, []string{
 			applyMarksTableName,
+		}); err != nil {
+			return err
+		}
+	}
+	if a.columnOrderEnsureErr == nil {
+		return ensureNekiControlTablePlacement(ctx, a.db, a.isNeki, a.serverKey, a.controlSchema, []string{
+			columnOrderTableName,
 		})
 	}
 	return nil
@@ -2043,6 +2059,17 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		}
 		if err := writeSchemaVersion(ctx, tx, a.controlSchema, streamID, v.Schema, v.Table, v.Position, v.IR); err != nil {
 			return false, fmt.Errorf("postgres: applier: write schema version for %s.%s: %w", v.Schema, v.Table, err)
+		}
+		// RENAME-SWAP-FORWARD: the column-order record rides the same
+		// transaction, so it never runs ahead of the boundary.
+		stmt, args, err := a.boundaryColumnOrderSQL(streamID, v)
+		if err != nil {
+			return false, err
+		}
+		if stmt != "" {
+			if _, err := tx.ExecContext(ctx, stmt, args...); err != nil {
+				return false, fmt.Errorf("postgres: applier: write column order for %s.%s: %w", v.Schema, v.Table, err)
+			}
 		}
 		return false, nil
 	}

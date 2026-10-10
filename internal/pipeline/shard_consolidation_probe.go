@@ -31,6 +31,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -206,7 +207,10 @@ type Shape struct {
 // ADR-0049 SchemaSignature.Equal's contract — same column names and
 // types in order); ShapeKindUnrecognized when the delta doesn't fit
 // the v1 catalog (the caller refuses loudly with drained-model
-// recovery hint).
+// recovery hint) — including, since RENAME-SWAP-FORWARD, a change in the
+// order the shared columns are declared in ([columnOrderChangedError]), a
+// column dropped and added back under its own name (stable column ids),
+// and more than one altered column ([multiColumnAlterError]).
 //
 // nil pre or post is treated as "absent": a fresh-table boundary (pre
 // nil) is not a recognized DDL shape (the consolidated target's table
@@ -221,9 +225,45 @@ func ClassifyShape(pre, post *ir.Table) (Shape, error) {
 		return Shape{Kind: ShapeKindUnrecognized}, errors.New("pipeline: classify shape: pre or post table is nil")
 	}
 
+	// RENAME-SWAP-FORWARD: every comparison below pairs columns by NAME,
+	// which is exactly what a rename permutation (`RENAME COLUMN b TO c,
+	// RENAME COLUMN c TO b`) and a reorder (`MODIFY c … AFTER id`) leave
+	// intact. Both move a name to another column's position, and the shape
+	// alone cannot say whether the values moved with it, so the boundary is
+	// refused before any by-name verdict can call it "no change"
+	// (column_order_boundary.go).
+	if flips := columnOrderFlips(pre, post); len(flips) > 0 {
+		return Shape{Kind: ShapeKindUnrecognized}, &columnOrderChangedError{flips: flips}
+	}
+	if changed := columnsWhoseIdentityChanged(pre, post); len(changed) > 0 {
+		return Shape{Kind: ShapeKindUnrecognized}, fmt.Errorf(
+			"pipeline: classify shape: column(s) %s now name a different column than before (the source's stable "+
+				"column id changed: a DROP and ADD of the same name, or a DROP COLUMN followed by a RENAME onto the "+
+				"dropped name); the target still holds the old column's values under that name",
+			strings.Join(changed, ", "),
+		)
+	}
+
 	added, dropped := diffColumns(pre, post)
 	createdIdx, droppedIdx := diffIndexes(pre, post)
-	alteredCol, alteredBefore, alteredKind, hasAlter := diffAlteredColumn(pre, post)
+	altered := alteredColumns(pre, post)
+	if len(altered) > 1 {
+		// More than one column changed type or nullability in one boundary.
+		// Forwarding applies one column's change, so this is refused rather
+		// than read as "no change" — which is what it read as until
+		// RENAME-SWAP-FORWARD, so a two-column widen left the target narrow
+		// and the target rounded every later value (a Postgres target, at exit
+		// 0; measured).
+		return Shape{Kind: ShapeKindUnrecognized}, &multiColumnAlterError{columns: altered}
+	}
+	var (
+		alteredCol, alteredBefore *ir.Column
+		alteredKind               ShapeKind
+		hasAlter                  = len(altered) == 1
+	)
+	if hasAlter {
+		alteredCol, alteredBefore, alteredKind = altered[0].after, altered[0].before, altered[0].kind
+	}
 	addedChecks, droppedChecks, modBefore, modAfter, hasModCheck := diffChecks(pre, post)
 
 	// RENAME COLUMN detection (task #22): exactly one added + exactly
@@ -552,44 +592,74 @@ func checksByName(t *ir.Table) map[string]*ir.CheckConstraint {
 // pre-state column, the shape (alter-type vs alter-nullability), and
 // hasAlter=true when exactly one column qualifies.
 //
-// Multiple columns with type/nullability changes are NOT recognized
-// (returns hasAlter=false; ClassifyShape's class-count will still
-// fire on the column add/drop classes if any, or treat as combo).
-// The v1 catalog deliberately scopes to single-column-altered deltas
-// — operators issuing multi-column ALTERs use the drained model.
+// Multiple columns with type/nullability changes return hasAlter=false.
+// [ClassifyShape] does not rely on that: it counts [alteredColumns] itself
+// and refuses more than one ([multiColumnAlterError]). The v1 catalog
+// deliberately scopes to single-column-altered deltas — operators issuing
+// multi-column ALTERs use the drained model.
 func diffAlteredColumn(pre, post *ir.Table) (alteredCol, alteredBefore *ir.Column, kind ShapeKind, hasAlter bool) {
+	altered := alteredColumns(pre, post)
+	if len(altered) != 1 {
+		return nil, nil, ShapeKindNone, false
+	}
+	return altered[0].after, altered[0].before, altered[0].kind, true
+}
+
+// alteredColumn is one same-named column whose type or nullability differs
+// across a boundary; kind is the shape it would be on its own (a type
+// change wins when both differ).
+type alteredColumn struct {
+	before, after *ir.Column
+	kind          ShapeKind
+}
+
+// alteredColumns returns every same-named column whose Type or Nullable
+// differs between pre and post, in post's order.
+func alteredColumns(pre, post *ir.Table) []alteredColumn {
 	preNames := map[string]*ir.Column{}
 	for _, c := range pre.Columns {
 		preNames[c.Name] = c
 	}
-	var found *ir.Column
-	var foundBefore *ir.Column
-	var foundKind ShapeKind
-	count := 0
+	var out []alteredColumn
 	for _, postCol := range post.Columns {
 		preCol, ok := preNames[postCol.Name]
 		if !ok {
 			continue
 		}
-		typeDiffers := !reflect.DeepEqual(preCol.Type, postCol.Type)
-		nullDiffers := preCol.Nullable != postCol.Nullable
 		switch {
-		case typeDiffers:
-			count++
-			found = postCol
-			foundBefore = preCol
-			foundKind = ShapeKindAlterColumnType
-		case nullDiffers:
-			count++
-			found = postCol
-			foundBefore = preCol
-			foundKind = ShapeKindAlterColumnNullability
+		case !reflect.DeepEqual(preCol.Type, postCol.Type):
+			out = append(out, alteredColumn{before: preCol, after: postCol, kind: ShapeKindAlterColumnType})
+		case preCol.Nullable != postCol.Nullable:
+			out = append(out, alteredColumn{before: preCol, after: postCol, kind: ShapeKindAlterColumnNullability})
 		}
 	}
-	if count == 1 {
-		return found, foundBefore, foundKind, true
+	return out
+}
+
+// multiColumnAlterError is [ClassifyShape]'s refusal of a boundary on
+// which more than one column changed type or nullability.
+type multiColumnAlterError struct {
+	columns []alteredColumn
+}
+
+func (e *multiColumnAlterError) Error() string {
+	parts := make([]string, 0, len(e.columns))
+	for _, c := range e.columns {
+		parts = append(parts, fmt.Sprintf("%q (%s)", c.after.Name, c.kind))
 	}
-	return nil, nil, ShapeKindNone, false
+	return fmt.Sprintf("pipeline: classify shape: %d columns changed type or nullability in one schema boundary "+
+		"(%s); sluice forwards one column's change per boundary", len(e.columns), strings.Join(parts, ", "))
+}
+
+// changesAType reports whether any of the columns changed type, as
+// opposed to nullability alone.
+func (e *multiColumnAlterError) changesAType() bool {
+	for _, c := range e.columns {
+		if c.kind == ShapeKindAlterColumnType {
+			return true
+		}
+	}
+	return false
 }
 
 // ProbeOutcome aliases [ir.ProbeOutcome] — defined in `ir` to avoid

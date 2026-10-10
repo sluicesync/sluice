@@ -495,6 +495,15 @@ type SchemaSnapshot struct {
 	// (ADR-0049 locked decision #2; the ADR rejects re-introspection
 	// in Alternatives). Non-nil for a well-formed event.
 	IR *Table
+
+	// TargetColumns, when non-nil, is the TARGET table's declared column
+	// order once this boundary is accepted — set by the pipeline's schema
+	// intercept when it or IR's own order differs from the table's
+	// [ColumnOrderRecord], and persisted (with IR's order as the source
+	// side) by a [ColumnOrderStore] applier on the boundary's own
+	// transaction (RENAME-SWAP-FORWARD; column_order_record.go). Never set
+	// by a reader, and not part of the schema-history row or a backup.
+	TargetColumns []string
 }
 
 func (SchemaSnapshot) isChange()       {}

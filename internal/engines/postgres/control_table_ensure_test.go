@@ -312,6 +312,7 @@ func TestControlTableDDLLiterals_OnlyInDetectFirstBuilders(t *testing.T) {
 		"control_table.go:skippedTablesTable":                 "controlTable builder",
 		"control_table.go:shardConsolidationLeaseTable":       "controlTable builder",
 		"schema_history.go:schemaHistoryTable":                "controlTable builder",
+		"column_order.go:columnOrderTable":                    "controlTable builder",
 		"migration_state.go:migrateStateTables":               "controlTable builder",
 		"keyset_store.go:keysetTable":                         "controlTable builder",
 		"target_metrics_history.go:targetMetricsHistoryTable": "controlTable builder",

@@ -1278,6 +1278,9 @@ func (s *Streamer) firstBoundaryWitness() *firstBoundaryWitness {
 		sourceEngine: s.Source.Name(),
 		targetEngine: s.Target.Name(),
 		mappings:     s.Mappings,
+		// RENAME-SWAP-FORWARD (column_order_boundary.go).
+		orders:         s.columnOrders,
+		targetReorders: s.Target.Capabilities().ReorderColumns,
 	}
 	if s.InjectShardColumn.Engaged() {
 		w.shardColumn = s.InjectShardColumn.Name

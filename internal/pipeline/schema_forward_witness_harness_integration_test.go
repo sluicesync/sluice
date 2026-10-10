@@ -191,6 +191,9 @@ type twfbCell struct {
 	// shard, when engaged, makes it a Shape A stream (--inject-shard-column)
 	// under --no-coordinate-live-ddl, the drained model.
 	shard ShardColumnSpec
+	// slotName is the stream's --slot-name ("" is the engine default), for
+	// cells sharing one Postgres server.
+	slotName string
 }
 
 // unforwarded reports whether the cell's stream forwards no source DDL, so
@@ -220,6 +223,7 @@ func (c twfbCell) streamer() *Streamer {
 		Filter:        filter,
 		Mappings:      c.mappings,
 		SchemaChanges: c.schemaChanges,
+		SlotName:      c.slotName,
 		// The CLI's --apply-retry-attempts default; the zero value would
 		// disable the ADR-0038 retry the in-process cell exercises.
 		ApplyRetryAttempts: 8,

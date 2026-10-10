@@ -269,7 +269,19 @@ func interceptSchemaChangeRefuse(
 					compared: post, raw: snap.IR, position: snap.Position, origin: priorIntercept,
 					recorded: withRecorded(prior.recorded, snap.IR),
 				}
-				if !forwardChange(ctx, out, c) {
+				// RENAME-SWAP-FORWARD: the table's column-order record rides
+				// the accepted boundary when its column list moved.
+				var w *firstBoundaryWitness
+				if deps.witnessFor != nil {
+					w = deps.witnessFor(snap.Schema)
+				}
+				attached, err := w.attachColumnOrder(ctx, snap)
+				if err != nil {
+					wrapped := fmt.Errorf("pipeline: schema change on a stream that does not forward DDL: %w", err)
+					errStore.Store(&wrapped)
+					return
+				}
+				if !forwardChange(ctx, out, attached) {
 					return
 				}
 			case <-ctx.Done():
@@ -413,6 +425,19 @@ func judgeUnforwardedBoundary(
 	ambiguous := changed && !prior.orders(deps.orderer, snap.Position)
 	reason := "the stream has no target witness"
 	if w != nil {
+		// RENAME-SWAP-FORWARD: the column judgement below pairs by name, so
+		// a rename swap passes it column for column. The cold-start read may
+		// judge ORDER, unlike the narrowing and dropped-column rules: its
+		// fidelity differs in what columns carry, not in the order of the
+		// columns both shapes list. With no prior that may judge, the
+		// target's own order stands in (column_order_boundary.go).
+		var orderPrior *ir.Table
+		if judges || prior.origin == priorColdStart {
+			orderPrior = prior.raw
+		}
+		if err := refuseUnheldColumnOrder(ctx, w, tableName, orderPrior, snap.IR, deps); err != nil {
+			return prior, err
+		}
 		evidence := unforwardedPrior{raw: prior.raw, judges: changed, ambiguous: ambiguous}
 		if judges {
 			evidence.returned = replacedColumns(prior.raw, snap.IR)
@@ -1131,6 +1156,10 @@ func (s *Streamer) unforwardedBoundaryWitnesses(single *firstBoundaryWitness) fu
 			sourceEngine: single.sourceEngine,
 			targetEngine: single.targetEngine,
 			mappings:     single.mappings,
+			// Records are keyed by (namespace, table), so one set serves
+			// every namespace's witness.
+			orders:         single.orders,
+			targetReorders: single.targetReorders,
 		}
 		byNamespace[namespace] = w
 		return w

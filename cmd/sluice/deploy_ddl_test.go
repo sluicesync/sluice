@@ -154,13 +154,14 @@ func TestControlTablesDDLCmd_PrintsBootstrapSet(t *testing.T) {
 		"-- sluice_cdc_query_timeout_raise\n",
 		"-- sluice_cdc_skipped_tables\n",
 		"-- sluice_cdc_apply_marks\n",
+		"-- sluice_cdc_column_order\n",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output missing %q:\n%s", want, out)
 		}
 	}
-	if got := strings.Count(out, "CREATE TABLE IF NOT EXISTS"); got != 8 {
-		t.Errorf("CREATE statements = %d; want 8", got)
+	if got := strings.Count(out, "CREATE TABLE IF NOT EXISTS"); got != 9 {
+		t.Errorf("CREATE statements = %d; want 9", got)
 	}
 	// Pasteable: every non-empty line is SQL or a -- comment.
 	for _, line := range strings.Split(out, "\n") {
@@ -216,6 +217,7 @@ func TestControlTablesDDLCmd_PostgresPrintsTheFullShape(t *testing.T) {
 		`ALTER TABLE "public"."sluice_cdc_state" ADD COLUMN IF NOT EXISTS rows_applied BIGINT NOT NULL DEFAULT 0;`,
 		`ALTER TABLE "public"."sluice_cdc_state" ADD COLUMN IF NOT EXISTS unforwarded_refusal TEXT NULL;`,
 		`CREATE TABLE IF NOT EXISTS "public"."sluice_cdc_apply_marks"`,
+		`CREATE TABLE IF NOT EXISTS "public"."sluice_cdc_column_order"`,
 		"-- sluice_migrate_state\n",
 		"-- sluice_migrate_table_progress\n",
 		"-- sluice_cdc_schema_history\n",
@@ -229,7 +231,7 @@ func TestControlTablesDDLCmd_PostgresPrintsTheFullShape(t *testing.T) {
 	if strings.Contains(out, "deploy-ddl") {
 		t.Errorf("the Postgres set carries the PlanetScale deploy-ddl recipe:\n%s", out)
 	}
-	if got := strings.Count(out, "CREATE TABLE IF NOT EXISTS"); got != 7 {
-		t.Errorf("CREATE statements = %d; want 7", got)
+	if got := strings.Count(out, "CREATE TABLE IF NOT EXISTS"); got != 8 {
+		t.Errorf("CREATE statements = %d; want 8", got)
 	}
 }

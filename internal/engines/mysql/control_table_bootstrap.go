@@ -91,5 +91,6 @@ func (e Engine) ControlTableDDL() []ir.ControlTableStatement {
 		{Table: cdcQueryTimeoutRaiseTableName, DDL: cdcQueryTimeoutRaiseTableDDL("")},
 		{Table: skippedTablesTableName, DDL: skippedTablesTableDDL("")},
 		{Table: applyMarksTableName, DDL: applyMarksTableDDL("")},
+		{Table: columnOrderTableName, DDL: columnOrderTableDDL("")},
 	}
 }

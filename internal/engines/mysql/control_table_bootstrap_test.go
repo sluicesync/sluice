@@ -345,6 +345,7 @@ func TestEngineControlTableDDL_SingleSourcedWithEnsurePaths(t *testing.T) {
 		cdcQueryTimeoutRaiseTableName,
 		skippedTablesTableName,
 		applyMarksTableName,
+		columnOrderTableName,
 	}
 	if len(stmts) != len(wantTables) {
 		t.Fatalf("ControlTableDDL returned %d statements; want %d", len(stmts), len(wantTables))
@@ -381,6 +382,9 @@ func TestEngineControlTableDDL_SingleSourcedWithEnsurePaths(t *testing.T) {
 	}
 	if err := ensureApplyMarksTable(ctx, db, ""); err != nil {
 		t.Fatalf("ensureApplyMarksTable: %v", err)
+	}
+	if err := ensureColumnOrderTable(ctx, db, ""); err != nil {
+		t.Fatalf("ensureColumnOrderTable: %v", err)
 	}
 	if err := newMigrationStateStore(db, upsertRowAlias).EnsureControlTable(ctx); err != nil {
 		t.Fatalf("migrate-state EnsureControlTable: %v", err)

@@ -186,7 +186,7 @@ information_schema re-read, which bounds the matrix:
 | ALTER COLUMN TYPE (same-engine) | ✅ forward | ✅ forward (GAP #1) |
 | ALTER COLUMN TYPE (cross-engine) | ✅ forward (GAP #3) | ✅ forward (GAP #1/#3) |
 | ALTER NULLABILITY | ✅ forward (GAP #2)¹ | ❌ refuse² |
-| REORDER | ✅ no-op (name-based decode) | ✅ no-op |
+| REORDER / RENAME swap or rotation | ❌ refuse until the target holds the new order (§4, amended 2026-10-10) | ❌ same (a PG "reorder" is only ever a swap) |
 | CREATE / DROP INDEX | ⛔ not forwarded — no boundary³ | ❌ refuse² |
 | ADD / DROP / MODIFY CHECK | ⛔ not forwarded — no boundary³ | ❌ refuse² |
 | RENAME COLUMN | ❌ refuse (§3) | ✅ forward via attnum (F7b, §3) |
@@ -356,6 +356,37 @@ column order is irrelevant to correctness. No DDL is emitted; the
 SchemaSnapshot forwards so the ADR-0049 schema-history row records.
 (Positional decode would be a silent-corruption hazard; name-based
 decode is what makes reorder a safe no-op.)
+
+**Amended 2026-10-10 (RENAME-SWAP-FORWARD) — superseded: a column-order
+change now REFUSES with `COLUMN-ORDER-CHANGED`.** The argument above is
+true of a reorder and false of the shape it shares: a rename swap or
+rotation (`RENAME COLUMN b TO c, RENAME COLUMN c TO b`) also leaves the
+column set and every name's type identical and changes only the declared
+order — but there the values stayed put and the names moved, so the
+target's existing rows needed the same RENAMEs, and "no DDL" left every
+one of them under the wrong names at exit 0 (measured, MySQL 8.0 and
+Postgres 16). Name-based decode made the rows AFTER the swap correct and
+said nothing about the rows before it. Nothing in a boundary separates
+the two shapes (§3's argument: MySQL has no stable column id, and a
+Postgres attnum is never seen against the seed or at a first boundary),
+so a boundary whose shared columns' order flipped now refuses unless the
+target's own order MOVED from its recorded order to the new one — the
+operator applied the change there — after which it is checked against
+the target like a first boundary
+(`internal/pipeline/column_order_boundary.go`). "Recorded" is the
+`sluice_cdc_column_order` control table (`ir.ColumnOrderRecord`), written
+at the cold start and on the transaction of every accepted boundary that
+changes the source's column list: a target that merely already declares
+the new order proves nothing (a forwarded `ADD COLUMN … AFTER` lands at
+the end of the target table, and a later swap can match it — found in
+review before release). A table with no record, or whose recorded target
+order already disagreed, refuses with `--reset-target-data` as the
+remedy. The cost is that a genuine MySQL/MariaDB reorder now needs the
+same reorder applied on the target (on a target without
+`Capabilities.ReorderColumns`, a re-copy). Carrying the DDL text on the boundary would let sluice
+forward the swap's RENAMEs instead (option recorded in the audit
+backlog). The same review found that more than one altered column in one
+boundary was also read as `ShapeKindNone`; it now refuses too.
 
 ### 5. Cross-engine retarget + Schema scrub for every shape
 
@@ -957,7 +988,9 @@ intercept when Shape A is engaged, exactly as ADR-0058 did.
   NULLABILITY / CREATE INDEX / DROP INDEX / ADD/DROP/MODIFY CHECK)
   reaches its `ShapeDeltaApplier` method on a fake applier; RENAME and
   multi-shape combo refuse loudly with the data-loss / ambiguity
-  message; ShapeKindNone (reorder) no-ops; volatile DEFAULT still
+  message; ShapeKindNone no-ops (a reorder no longer reaches it — §4,
+  amended: `column_order_boundary_test.go`,
+  `rename_swap_forward_integration_test.go`); volatile DEFAULT still
   refuses.
 - `internal/pipeline/migrate_schema_forward_*_integration_test.go` —
   per-shape end-to-end across all four directions (MySQL→MySQL,

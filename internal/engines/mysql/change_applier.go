@@ -527,6 +527,10 @@ type ChangeApplier struct {
 	// mark table, reported by the APPLY-MARKS-UNAVAILABLE WARN at apply start.
 	applyMarksEnsureErr error
 
+	// columnOrderEnsureErr is why EnsureControlTable could not create the
+	// RENAME-SWAP-FORWARD column-order record table (column_order.go).
+	columnOrderEnsureErr error
+
 	// requireMarks, set by [ChangeApplier.RequireApplyMarks], turns an
 	// unusable mark table at apply start into a refusal (ADR-0191 review).
 	requireMarks bool
@@ -942,6 +946,9 @@ func (a *ChangeApplier) EnsureControlTable(ctx context.Context) error {
 	// marks (the APPLY-MARKS-UNAVAILABLE WARN at apply start names why)
 	// rather than refusing to start.
 	a.applyMarksEnsureErr = ensureApplyMarksTable(ctx, a.db, a.controlKeyspace)
+	// RENAME-SWAP-FORWARD: best-effort for the same reason; without it a
+	// column-order change refuses as unprovable (column_order.go).
+	a.columnOrderEnsureErr = ensureColumnOrderTable(ctx, a.db, a.controlKeyspace)
 	return nil
 }
 
@@ -1815,6 +1822,11 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		}
 		if err := writeSchemaVersion(ctx, tx, a.controlKeyspace, streamID, v.Schema, v.Table, v.Position, v.IR, a.upsert); err != nil {
 			return false, fmt.Errorf("mysql: applier: write schema version for %s.%s: %w", v.Schema, v.Table, err)
+		}
+		// RENAME-SWAP-FORWARD: the column-order record rides the same
+		// transaction, so it never runs ahead of the boundary.
+		if err := a.writeBoundaryColumnOrder(ctx, tx, streamID, v); err != nil {
+			return false, err
 		}
 		return false, nil
 	}

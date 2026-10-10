@@ -96,6 +96,19 @@ var ErrResumeSchemaDivergence = errors.New("RESUME-SCHEMA-DIVERGENCE")
 // again until the operator applies the change on the target.
 var ErrSchemaChangeRefused = errors.New("SCHEMA-CHANGE-REFUSED")
 
+// ErrColumnOrderChanged classifies the refusal of a schema boundary across
+// which the source declares two of a table's columns in the opposite order
+// (RENAME-SWAP-FORWARD, pipeline/column_order_boundary.go). A rename
+// permutation (`RENAME COLUMN b TO c, RENAME COLUMN c TO b`) and a column
+// reorder (`MODIFY c … AFTER id`) both produce that shape, and only the
+// first leaves the target's rows under the wrong names, so sluice cannot
+// apply it unread. The comparison is against the target's own column order,
+// which a restart reads back unchanged (and a restarted stream compares the
+// source with its retained schema history, which never records the refused
+// boundary), so it refuses again until the operator applies the change on
+// the target.
+var ErrColumnOrderChanged = errors.New("COLUMN-ORDER-CHANGED")
+
 // PreAlterReplayWedgeMarker is the grep-stable word naming the pre-ALTER
 // replay wedge (GC-44 F24): a Postgres source transaction that wrote a
 // table and then dropped, renamed or retyped one of its columns, on a

@@ -398,6 +398,14 @@ func (a *ChangeApplier) dispatchPipelined(ctx context.Context, b *pgxBatchTx, st
 			return false, fmt.Errorf("postgres: applier: write schema version for %s.%s: %w", v.Schema, v.Table, err)
 		}
 		b.queue(stmt, args, queuedStmt{schema: v.Schema, table: v.Table, kind: "schema-snapshot"})
+		// RENAME-SWAP-FORWARD: the column-order record on the same tx.
+		orderStmt, orderArgs, err := a.boundaryColumnOrderSQL(streamID, v)
+		if err != nil {
+			return false, err
+		}
+		if orderStmt != "" {
+			b.queue(orderStmt, orderArgs, queuedStmt{schema: v.Schema, table: v.Table, kind: "column-order"})
+		}
 		return false, nil
 	}
 	return false, fmt.Errorf("postgres: applier: unknown change type %T", c)

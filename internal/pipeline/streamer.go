@@ -1610,6 +1610,12 @@ type Streamer struct {
 	// ([firstBoundaryWitness.historyPriorAt]). Consumed with them.
 	firstBoundaryRetained retainedHistory
 
+	// columnOrders is the stream's RENAME-SWAP-FORWARD column-order records
+	// ([Streamer.phaseLoadColumnOrders]; column_order_boundary.go): read on
+	// a warm resume, written at a cold start, and updated by the schema
+	// intercept as boundaries are accepted. Every witness of a run shares it.
+	columnOrders *columnOrderRecords
+
 	// unforwardedColdStartPrior is the RAW source shape of every table the
 	// cold start read, captured before --type-override and Shape A rewrite
 	// it, as comparison-form snapshots: the unforwarded-stream check's prior
@@ -2312,6 +2318,11 @@ func (s *Streamer) applyWithReshardFollow(
 	liveFilter *liveAddedFilter,
 	stopObserved *atomic.Bool,
 ) error {
+	// RENAME-SWAP-FORWARD: the column-order records every intercept wiring of
+	// this run shares — after a cold start, recorded before any boundary.
+	if err := s.phaseLoadColumnOrders(applyCtx, applier, streamID); err != nil {
+		return migcore.WrapWithHint(migcore.PhaseCDC, err)
+	}
 	reshardReopens := 0
 	for {
 		// Wrap the change channel: live-add-aware table filter → ADR-0054

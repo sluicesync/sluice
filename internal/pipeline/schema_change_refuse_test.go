@@ -255,6 +255,9 @@ type refuseWiringEngine struct {
 
 func (e refuseWiringEngine) Name() string { return e.name }
 
+// Capabilities declares nothing: the witness reads ReorderColumns from it.
+func (refuseWiringEngine) Capabilities() ir.Capabilities { return ir.Capabilities{} }
+
 func (e refuseWiringEngine) OpenSchemaReader(context.Context, string) (ir.SchemaReader, error) {
 	if e.readErr != nil {
 		return nil, e.readErr

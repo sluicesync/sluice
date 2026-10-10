@@ -17,7 +17,8 @@ import (
 // txFuncClass, and each "control" one must be listed here.
 var controlTxWriters = []string{
 	"execApplyMarksTx", "writePositionTx", "writeSchemaVersion", "writePositionUpsertSQL", "applyMarkStatements", "schemaVersionUpsertSQL",
-	"writeCheckpointTx", "writeOwnPositionTx",
+	"writeCheckpointTx", "writeOwnPositionTx", "writeColumnOrder", "columnOrderUpsertSQL",
+	"writeBoundaryColumnOrder",
 }
 
 // txFuncClass classifies every function in the package that takes a
@@ -32,6 +33,8 @@ var txFuncClass = map[string]string{
 	"ChangeApplier.writeOwnPositionTx":       "control", // applyOneImpl's marks, then (serial per-change) the change's own position
 	"writePositionTx":                        "control",
 	"writeSchemaVersion":                     "control",
+	"writeColumnOrder":                       "control", // RENAME-SWAP-FORWARD: the boundary's column-order record, beside the history row
+	"ChangeApplier.writeBoundaryColumnOrder": "control",
 	"compactSchemaHistoryBelow":              "neutral", // runs on a.db in its own statement, never inside an apply transaction
 	"ChangeApplier.txExec":                   "data",
 	"ChangeApplier.dispatch":                 "data", // and its SchemaSnapshot arm calls writeSchemaVersion (walked below)
@@ -46,35 +49,38 @@ var txFuncClass = map[string]string{
 // reaches: applyorder.Helper (not a core; its own callers are walked) or the
 // write core it is, as TestWriteCoreStatementOrder drives it.
 var writeCoreClass = map[string]string{
-	"ChangeApplier.dispatch":                applyorder.Helper,
-	"ChangeApplier.execApplyMarksTx":        applyorder.Helper, // the executors, reached from the SQL builders
-	"writePositionTx":                       applyorder.Helper,
-	"writeSchemaVersion":                    applyorder.Helper,
-	"ChangeApplier.applyOneImpl":            applyorder.Helper,
-	"mysqlBatchTx.writeApplyMarks":          applyorder.Helper,
-	"mysqlBatchTx.writePosition":            applyorder.Helper,
-	"laneApplierAdapter.writeFold":          applyorder.Helper, // ADR-0190 amendment D: ApplyLaneBatch's fold batches
-	"mysqlBatchTx.applySerial":              applyorder.Helper,
-	"mysqlBatchTx.dispatch":                 applyorder.Helper,
-	"mysqlBatchTx.dispatchInsert":           applyorder.Helper,
-	"mysqlBatchTx.dispatchUpdate":           applyorder.Helper,
-	"mysqlBatchTx.dispatchDelete":           applyorder.Helper,
-	"ChangeApplier.applyOne":                applyorder.Helper,
-	"ChangeApplier.applySchemaEvent":        applyorder.Helper,
-	"ChangeApplier.applyBarrier":            applyorder.Helper, // the lane barrier, folding or not (ADR-0190 amendment E)
-	"ChangeApplier.writeCheckpointTx":       applyorder.Helper,
-	"ChangeApplier.writeOwnPositionTx":      applyorder.Helper,
-	"ChangeApplier.commitCheckpoint":        applyorder.Helper,    // WriteCheckpoint's transaction, and a skipped barrier's
-	"CDCReader.deliver":                     applyorder.Unrelated, // the binlog reader's own dispatch
-	"CDCReader.dispatchTransactionPayload":  applyorder.Unrelated,
-	"vstreamCDCReader.pump":                 applyorder.Unrelated,
-	"ChangeApplier.Apply":                   "serial",
-	"ChangeApplier.persistSourceTxCommit":   "serial-tx-commit-position",
-	"laneApplierAdapter.ApplyBarrierChange": "lane-barrier",
-	"ChangeApplier.WritePosition":           "bare-write-position",
-	"ChangeApplier.batchConfig":             "batch",
-	"laneApplierAdapter.ApplyLaneBatch":     "lane-batch",
-	"laneApplierAdapter.WriteCheckpoint":    "lane-checkpoint",
+	"ChangeApplier.dispatch":                 applyorder.Helper,
+	"ChangeApplier.execApplyMarksTx":         applyorder.Helper, // the executors, reached from the SQL builders
+	"writePositionTx":                        applyorder.Helper,
+	"writeSchemaVersion":                     applyorder.Helper,
+	"writeColumnOrder":                       applyorder.Helper,
+	"ChangeApplier.writeBoundaryColumnOrder": applyorder.Helper,
+	"ChangeApplier.WriteColumnOrders":        applyorder.Unrelated, // the cold start's records, on the pool, before any apply transaction
+	"ChangeApplier.applyOneImpl":             applyorder.Helper,
+	"mysqlBatchTx.writeApplyMarks":           applyorder.Helper,
+	"mysqlBatchTx.writePosition":             applyorder.Helper,
+	"laneApplierAdapter.writeFold":           applyorder.Helper, // ADR-0190 amendment D: ApplyLaneBatch's fold batches
+	"mysqlBatchTx.applySerial":               applyorder.Helper,
+	"mysqlBatchTx.dispatch":                  applyorder.Helper,
+	"mysqlBatchTx.dispatchInsert":            applyorder.Helper,
+	"mysqlBatchTx.dispatchUpdate":            applyorder.Helper,
+	"mysqlBatchTx.dispatchDelete":            applyorder.Helper,
+	"ChangeApplier.applyOne":                 applyorder.Helper,
+	"ChangeApplier.applySchemaEvent":         applyorder.Helper,
+	"ChangeApplier.applyBarrier":             applyorder.Helper, // the lane barrier, folding or not (ADR-0190 amendment E)
+	"ChangeApplier.writeCheckpointTx":        applyorder.Helper,
+	"ChangeApplier.writeOwnPositionTx":       applyorder.Helper,
+	"ChangeApplier.commitCheckpoint":         applyorder.Helper,    // WriteCheckpoint's transaction, and a skipped barrier's
+	"CDCReader.deliver":                      applyorder.Unrelated, // the binlog reader's own dispatch
+	"CDCReader.dispatchTransactionPayload":   applyorder.Unrelated,
+	"vstreamCDCReader.pump":                  applyorder.Unrelated,
+	"ChangeApplier.Apply":                    "serial",
+	"ChangeApplier.persistSourceTxCommit":    "serial-tx-commit-position",
+	"laneApplierAdapter.ApplyBarrierChange":  "lane-barrier",
+	"ChangeApplier.WritePosition":            "bare-write-position",
+	"ChangeApplier.batchConfig":              "batch",
+	"laneApplierAdapter.ApplyLaneBatch":      "lane-batch",
+	"laneApplierAdapter.WriteCheckpoint":     "lane-checkpoint",
 }
 
 // TestWriteCoreRoster_EveryControlWriterCallerIsClassified is the half of the
