@@ -19,9 +19,12 @@ import (
 // TxCommit (or a Truncate). On a busy source that is every InnoDB
 // transaction, including the ones whose rows are all out of scope: their
 // BEGIN and XID still reach the applier as a row-less pair, and it persists
-// the commit. But three kinds of binlog traffic persist nothing — a ROTATE,
-// a heartbeat, and a standalone GTID group (DDL, CREATE USER / GRANT,
-// OPTIMIZE: implicit commits that carry no XID). So a stream that sees only
+// the commit (since Bug 300 a run of such pairs persists once, at its last —
+// the pipeline's live stage bounds a run at 1,000, so a source busy only
+// elsewhere still moves the position). But three kinds of binlog traffic
+// persist nothing — a ROTATE, a heartbeat, and a standalone GTID group (DDL,
+// CREATE USER / GRANT, OPTIMIZE: implicit commits that carry no XID). So a
+// stream that sees only
 // those never moves its persisted position, however many binlog files go
 // by. Measured on mysql:8.0 with binlog_expire_logs_seconds=60 and on
 // mariadb:11.4 (2026-10-01): an idle stream sat at mysql-bin.000003 while

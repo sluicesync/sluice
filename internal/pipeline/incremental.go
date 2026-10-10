@@ -109,7 +109,10 @@ type IncrementalBackup struct {
 	Window time.Duration
 
 	// MaxChanges bounds the total number of [ir.Change] EVENTS the
-	// orchestrator captures — transaction framing included. A
+	// orchestrator records — transaction framing included, and an empty
+	// source transaction the window collapsed away (Bug 300,
+	// [migcore.EmptyTxRuns]) excluded: traffic outside the backup's scope
+	// neither fills the window nor closes it. A
 	// single-row source transaction is three events (TxBegin, the row,
 	// TxCommit), so MaxChanges=100 is nearer 33 such transactions than
 	// 100 rows. Zero disables the cap (Window-only).
@@ -196,6 +199,13 @@ type IncrementalBackup struct {
 	// the byte-identical non-TTY stream. The CLI sets a [progress.TTYSink]
 	// only for an interactive terminal.
 	Progress progress.Sink
+
+	// recordEveryEmptyTx is a TEST-ONLY seam that writes the pre-Bug-300
+	// chain shape: every empty source transaction recorded, none collapsed
+	// ([migcore.EmptyTxRuns]). The replay side must still handle chains
+	// written that way, and this is how a test gets one from a real source.
+	// The zero value is the production behaviour.
+	recordEveryEmptyTx bool
 }
 
 // Run executes the incremental backup. Returns nil on success.
@@ -1246,6 +1256,76 @@ func (b *IncrementalBackup) captureWindow(
 		return nil
 	}
 
+	// record writes one change the window keeps into the open chunk (opening
+	// one if needed), counts it, moves endPos, and rolls the chunk on either
+	// ceiling.
+	record := func(change ir.Change) error {
+		if writer == nil {
+			if err := openWriter(); err != nil {
+				return err
+			}
+		}
+		if err := writer.WriteChange(change); err != nil {
+			return err
+		}
+		totalChanges++
+		// Position-bearing changes update endPos — but only the ones the
+		// chunk stream actually RECORDS. See
+		// [recordedInChangeChunkStream].
+		pos := change.Pos()
+		if (pos.Engine != "" || pos.Token != "") && recordedInChangeChunkStream(change) {
+			endPos = pos
+			if !advanced {
+				advanced = windowAdvancedPast(b.Source, startPos, pos)
+			}
+		}
+		// Roll the chunk on whichever ceiling it reaches FIRST — the
+		// event count or the accumulated bytes.
+		//
+		// The byte ceiling is audit 2026-08-05 C-3: item 116 P3 added one
+		// to the data-chunk lane and stopped there, so THIS lane still
+		// rolled on event count alone while the chunk accumulated in an
+		// in-memory buffer. With the per-row limit at 64 MiB, the shipped
+		// default of DefaultIncrementalChunkChanges events could buffer
+		// arbitrarily much before rolling — and a wide TEXT/JSON/BLOB
+		// column arriving over CDC is exactly the shape that reaches it.
+		// 116 P3's commit and roadmap entry both enumerated the buffering
+		// paths as covered; that enumeration was false for this one.
+		//
+		// Same constant as the data lane, and uncompressed for the same
+		// reason: chunk boundaries feed the content-addressed same-path
+		// upload skip, so where a chunk ends must not depend on how well
+		// it compressed.
+		if writer.ChangeCount() >= int64(chunkSize) ||
+			writer.BytesWritten() >= backup.DefaultBackupChunkBytes {
+			return flush()
+		}
+		return nil
+	}
+
+	// Bug 300: every received change goes through the window's empty-
+	// transaction runs, which drop an empty source transaction (a transaction
+	// whose changes all fell outside the backup's scope — on a MySQL source,
+	// every transaction of every other database on the server) when another
+	// empty one follows it. The window records the last of each run, so its
+	// EndPosition still advances past the foreign traffic and is still the
+	// last position its chunks record. totalChanges, the chunk RowCount and
+	// MaxChanges all count what is RECORDED. closeWindow releases a trailing
+	// run's last pair before the final chunk is sealed.
+	var runs migcore.EmptyTxRuns
+	keep := func(change ir.Change) error {
+		if b.recordEveryEmptyTx {
+			return record(change)
+		}
+		return runs.Push(change, record)
+	}
+	closeWindow := func() error {
+		if err := runs.Flush(record); err != nil {
+			return err
+		}
+		return flush()
+	}
+
 	// timer fires when the wall-clock deadline expires. We check it
 	// between drains so the window is never extended past
 	// deadline+one-transaction. Compute the timeout via the injected
@@ -1264,7 +1344,7 @@ func (b *IncrementalBackup) captureWindow(
 			// not in a transaction, close now; otherwise wait for the
 			// next TxCommit.
 			if !inTransaction {
-				if err := flush(); err != nil {
+				if err := closeWindow(); err != nil {
 					return endPos, totalChanges, advanced, err
 				}
 				return endPos, totalChanges, advanced, nil
@@ -1295,7 +1375,7 @@ func (b *IncrementalBackup) captureWindow(
 						abandonedWindowMarker, totalChanges,
 					)
 				}
-				if err := flush(); err != nil {
+				if err := closeWindow(); err != nil {
 					return endPos, totalChanges, advanced, err
 				}
 				return endPos, totalChanges, advanced, nil
@@ -1308,47 +1388,8 @@ func (b *IncrementalBackup) captureWindow(
 			case ir.TxCommit:
 				inTransaction = false
 			}
-			if writer == nil {
-				if err := openWriter(); err != nil {
-					return endPos, totalChanges, advanced, err
-				}
-			}
-			if err := writer.WriteChange(change); err != nil {
+			if err := keep(change); err != nil {
 				return endPos, totalChanges, advanced, err
-			}
-			totalChanges++
-			// Position-bearing changes update endPos — but only the ones the
-			// chunk stream actually RECORDS. See
-			// [recordedInChangeChunkStream].
-			pos := change.Pos()
-			if (pos.Engine != "" || pos.Token != "") && recordedInChangeChunkStream(change) {
-				endPos = pos
-				if !advanced {
-					advanced = windowAdvancedPast(b.Source, startPos, pos)
-				}
-			}
-			// Roll the chunk on whichever ceiling it reaches FIRST — the
-			// event count or the accumulated bytes.
-			//
-			// The byte ceiling is audit 2026-08-05 C-3: item 116 P3 added one
-			// to the data-chunk lane and stopped there, so THIS lane still
-			// rolled on event count alone while the chunk accumulated in an
-			// in-memory buffer. With the per-row limit at 64 MiB, the shipped
-			// default of DefaultIncrementalChunkChanges events could buffer
-			// arbitrarily much before rolling — and a wide TEXT/JSON/BLOB
-			// column arriving over CDC is exactly the shape that reaches it.
-			// 116 P3's commit and roadmap entry both enumerated the buffering
-			// paths as covered; that enumeration was false for this one.
-			//
-			// Same constant as the data lane, and uncompressed for the same
-			// reason: chunk boundaries feed the content-addressed same-path
-			// upload skip, so where a chunk ends must not depend on how well
-			// it compressed.
-			if writer.ChangeCount() >= int64(chunkSize) ||
-				writer.BytesWritten() >= backup.DefaultBackupChunkBytes {
-				if err := flush(); err != nil {
-					return endPos, totalChanges, advanced, err
-				}
 			}
 			// MaxChanges (approximate): close on a tx boundary at-or-after
 			// the cap, once the window has something of its own to close
@@ -1357,7 +1398,7 @@ func (b *IncrementalBackup) captureWindow(
 			// bound by itself and close the window at its own start
 			// position. See [windowAdvancedPast].
 			if maxChanges > 0 && totalChanges >= int64(maxChanges) && !inTransaction && advanced {
-				if err := flush(); err != nil {
+				if err := closeWindow(); err != nil {
 					return endPos, totalChanges, advanced, err
 				}
 				return endPos, totalChanges, advanced, nil
@@ -1365,7 +1406,7 @@ func (b *IncrementalBackup) captureWindow(
 			// Deadline-already-passed and we just observed a TxCommit:
 			// close now.
 			if deadlinePassed && !inTransaction {
-				if err := flush(); err != nil {
+				if err := closeWindow(); err != nil {
 					return endPos, totalChanges, advanced, err
 				}
 				return endPos, totalChanges, advanced, nil

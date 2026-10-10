@@ -203,9 +203,11 @@ type BackupStream struct {
 	RolloverWindow time.Duration
 
 	// RolloverMaxChanges bounds the total number of [ir.Change] EVENTS
-	// a single rollover captures — transaction framing included, so a
-	// single-row source transaction is three events. Zero falls back to
-	// [DefaultRolloverMaxChanges].
+	// a single rollover records — transaction framing included, so a
+	// single-row source transaction is three events, and a run of empty
+	// source transactions the rollover collapsed (Bug 300,
+	// [migcore.EmptyTxRuns]) counts only the one it kept. Zero falls back
+	// to [DefaultRolloverMaxChanges].
 	//
 	// The cap is approximate in two directions. A TxBegin/Commit pair
 	// straddling the boundary is allowed to complete so the chain
@@ -1947,7 +1949,7 @@ func (b *BackupStream) captureWindow(
 		runNamespace: changeChunkRunNamespace(manifest),
 		chainCEK:     chainCEK,
 	}
-	flush := func() error { return cb.flushTo(ctx, &out) }
+	flush := func() error { return cb.closeWindow(ctx, &out) }
 
 	timer := time.NewTimer(deadline.Sub(clockNow()))
 	defer timer.Stop()
@@ -1994,9 +1996,9 @@ func (b *BackupStream) captureWindow(
 			// doesn't short-circuit it; a flush that FAILS abandons too,
 			// because committing the earlier chunks would record an
 			// EndPosition the stored chunks never reach.
-			if !inTransaction && cb.writer != nil {
+			if !inTransaction && cb.unsealed() {
 				flushCtx, flushCancel := context.WithTimeout(context.WithoutCancel(ctx), stopDrainTimeout)
-				if fErr := cb.flushTo(flushCtx, &out); fErr != nil {
+				if fErr := cb.closeWindow(flushCtx, &out); fErr != nil {
 					out.AbandonReason = "the context was cancelled and the window's last chunk could not be stored: " + fErr.Error()
 				}
 				flushCancel()
@@ -2187,6 +2189,15 @@ type changeChunkBuffer struct {
 	// the window's chunks. See [schemaHistoryDrain] for why this lane did
 	// not have it.
 	drain schemaHistoryDrain
+
+	// runs collapses the window's runs of empty source transactions (Bug
+	// 300, [migcore.EmptyTxRuns]); processChange feeds it, closeWindow
+	// flushes it.
+	runs migcore.EmptyTxRuns
+
+	// chunkSize is the change-count ceiling record rolls a chunk on, as
+	// processChange was last handed it.
+	chunkSize int
 }
 
 // flushTo closes the open chunk writer, stores its buffer under the
@@ -2307,13 +2318,64 @@ func (cb *changeChunkBuffer) processChange(ctx context.Context, change ir.Change
 	case ir.TxCommit:
 		*inTransaction = false
 	}
+	// Bug 300: through the window's empty-transaction runs, the twin of
+	// [IncrementalBackup.captureWindow]'s — an empty source transaction
+	// followed by another empty one is not recorded; closeWindow releases
+	// the last of a trailing run.
+	cb.chunkSize = chunkSize // record's roll ceiling, for this change and any it releases
+	if err := cb.runs.Push(change, func(c ir.Change) error { return cb.record(ctx, c, out) }); err != nil {
+		return true, err
+	}
+	// Approximate max-changes cap: close at next tx boundary, once the
+	// rollover has something of its own to close on. `out.Advanced` is
+	// roadmap item 98 (item 92's twin in this orchestrator) — without it
+	// the boundary transaction a resumed pump replays could satisfy the
+	// cap by itself and close the rollover at its own start position.
+	if maxChanges > 0 && out.TotalChanges >= int64(maxChanges) && !*inTransaction && out.Advanced {
+		if err := cb.closeWindow(ctx, out); err != nil {
+			return true, err
+		}
+		return true, nil
+	}
+	// Approximate max-bytes cap: close at next tx boundary once the
+	// running total + the in-flight chunk's buffered bytes crosses the
+	// ceiling. Checked at chunk-flush boundaries so transient over-shoot
+	// is bounded by one chunk's compressed size. Carries the same
+	// advancement condition, for the same reason: the replayed
+	// transaction's bytes belong to the parent, so on its own they must
+	// not close this rollover.
+	if maxBytes > 0 && !*inTransaction && out.Advanced {
+		inflightBytes := int64(0)
+		if cb.buf != nil {
+			inflightBytes = int64(cb.buf.Len())
+		}
+		if out.TotalBytes+inflightBytes >= maxBytes {
+			if err := cb.closeWindow(ctx, out); err != nil {
+				return true, err
+			}
+			return true, nil
+		}
+	}
+	if (deadlinePassed || out.StopRequested) && !*inTransaction {
+		if err := cb.closeWindow(ctx, out); err != nil {
+			return true, err
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+// record writes one change the window keeps into the open chunk (opening one
+// if needed), counts it, stages its position as the window's pending end, and
+// rolls the chunk on either ceiling.
+func (cb *changeChunkBuffer) record(ctx context.Context, change ir.Change, out *captureOutcome) error {
 	if cb.writer == nil {
 		if err := cb.open(); err != nil {
-			return true, err
+			return err
 		}
 	}
 	if err := cb.writer.WriteChange(change); err != nil {
-		return true, err
+		return err
 	}
 	out.TotalChanges++
 	// Only a change the chunk stream RECORDS may move EndPos — the rollover
@@ -2342,49 +2404,28 @@ func (cb *changeChunkBuffer) processChange(ctx context.Context, change ir.Change
 	// one chunk's uncompressed accumulation, for the same reason the data lane
 	// does — chunk boundaries feed the content-addressed same-path upload skip,
 	// so where a chunk ends must not depend on how well it compressed.
-	if cb.writer.ChangeCount() >= int64(chunkSize) ||
+	if cb.writer.ChangeCount() >= int64(cb.chunkSize) ||
 		cb.writer.BytesWritten() >= backup.DefaultBackupChunkBytes {
-		if err := cb.flushTo(ctx, out); err != nil {
-			return true, err
-		}
+		return cb.flushTo(ctx, out)
 	}
-	// Approximate max-changes cap: close at next tx boundary, once the
-	// rollover has something of its own to close on. `out.Advanced` is
-	// roadmap item 98 (item 92's twin in this orchestrator) — without it
-	// the boundary transaction a resumed pump replays could satisfy the
-	// cap by itself and close the rollover at its own start position.
-	if maxChanges > 0 && out.TotalChanges >= int64(maxChanges) && !*inTransaction && out.Advanced {
-		if err := cb.flushTo(ctx, out); err != nil {
-			return true, err
-		}
-		return true, nil
+	return nil
+}
+
+// closeWindow releases what the window's empty-transaction runs withhold —
+// the last empty transaction of a trailing run — and seals the open chunk.
+// Every exit that commits the window closes through here; a mid-window chunk
+// roll does not, since the runs are still deciding.
+func (cb *changeChunkBuffer) closeWindow(ctx context.Context, out *captureOutcome) error {
+	if err := cb.runs.Flush(func(c ir.Change) error { return cb.record(ctx, c, out) }); err != nil {
+		return err
 	}
-	// Approximate max-bytes cap: close at next tx boundary once the
-	// running total + the in-flight chunk's buffered bytes crosses the
-	// ceiling. Checked at chunk-flush boundaries so transient over-shoot
-	// is bounded by one chunk's compressed size. Carries the same
-	// advancement condition, for the same reason: the replayed
-	// transaction's bytes belong to the parent, so on its own they must
-	// not close this rollover.
-	if maxBytes > 0 && !*inTransaction && out.Advanced {
-		inflightBytes := int64(0)
-		if cb.buf != nil {
-			inflightBytes = int64(cb.buf.Len())
-		}
-		if out.TotalBytes+inflightBytes >= maxBytes {
-			if err := cb.flushTo(ctx, out); err != nil {
-				return true, err
-			}
-			return true, nil
-		}
-	}
-	if (deadlinePassed || out.StopRequested) && !*inTransaction {
-		if err := cb.flushTo(ctx, out); err != nil {
-			return true, err
-		}
-		return true, nil
-	}
-	return false, nil
+	return cb.flushTo(ctx, out)
+}
+
+// unsealed reports whether closeWindow has anything to write: an open chunk,
+// or a change the empty-transaction runs still withhold.
+func (cb *changeChunkBuffer) unsealed() bool {
+	return cb.writer != nil || cb.runs.Pending()
 }
 
 // readerStampsApplyIdentity reports whether the capture's CDC reader declares

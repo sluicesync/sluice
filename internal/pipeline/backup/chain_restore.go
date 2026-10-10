@@ -1464,13 +1464,22 @@ func (r *ChainRestore) streamIncrementalChanges(
 	// Bug 244 skipped-by-filter tally beside it.
 	var lastApplied ir.Position
 	skipped := make(map[string]int64)
+	// Bug 300: collapse each run of empty source transactions to its last —
+	// a chain written before the fix recorded one for every out-of-scope
+	// transaction of its window, and the table filter below empties more —
+	// so the serial apply paths stop paying a position write apiece. The
+	// F1 bookkeeping reads every decoded event before the runs see it, and
+	// the run's last transaction is released before the tail check, so the
+	// stream the applier sees still ends where the chunks do.
+	var runs migcore.EmptyTxRuns
+	emit := migcore.ChannelEmit(ctx, out)
 	for f := range fetchCh {
 		if f.err != nil {
 			// A SHA-256 mismatch (tampered/corrupt stored bytes) surfaces here
 			// before decryption → coded SLUICE-E-BACKUP-CHUNK-CORRUPT.
 			return lineage.CodeChunkHashError(fmt.Errorf("chunk %d (%s): open chunk: %w", f.idx, f.chunk.File, f.err))
 		}
-		if err := r.streamOneChangeChunk(ctx, link, codec, f.idx, f.chunk, f.src, out, &lastApplied, skipped); err != nil {
+		if err := r.streamOneChangeChunk(link, codec, f.idx, f.chunk, f.src, &runs, emit, &lastApplied, skipped); err != nil {
 			return fmt.Errorf("chunk %d (%s): %w", f.idx, f.chunk.File, err)
 		}
 		slog.DebugContext(
@@ -1479,6 +1488,9 @@ func (r *ChainRestore) streamIncrementalChanges(
 			slog.Int("chunk", f.idx),
 			slog.Int64("changes", f.chunk.RowCount),
 		)
+	}
+	if err := runs.Flush(emit); err != nil {
+		return err
 	}
 	if len(skipped) > 0 {
 		var total int64
@@ -1606,16 +1618,17 @@ func (r *ChainRestore) streamSchemaHistorySnapshots(
 // streamOneChangeChunk decodes chunk's events from src — the
 // already-fetched, SHA-verified chunk body handed over by
 // [ChainRestore.streamIncrementalChanges]'s read-ahead fetcher — and
-// pushes them into out. codec is the chunk's segment's RECORDED codec
+// pushes them through runs to emit (whose send honours the stream's
+// context). codec is the chunk's segment's RECORDED codec
 // (never sniffed from the bytes — ADR-0046 §5).
 func (r *ChainRestore) streamOneChangeChunk(
-	ctx context.Context,
 	link *lineage.SegmentRecord,
 	codec blobcodec.Codec,
 	chunkIdx int,
 	chunk *irbackup.ChunkInfo,
 	src io.ReadCloser,
-	out chan<- ir.Change,
+	runs *migcore.EmptyTxRuns,
+	emit func(ir.Change) error,
 	lastApplied *ir.Position,
 	skipped map[string]int64,
 ) error {
@@ -1673,11 +1686,9 @@ func (r *ChainRestore) streamOneChangeChunk(
 			skipped[tbl]++
 			continue
 		}
-		select {
-		case <-ctx.Done():
+		if err := runs.Push(change, emit); err != nil {
 			_ = cr.Close()
-			return ctx.Err()
-		case out <- change:
+			return err
 		}
 	}
 	// A change-chunk SHA-256 mismatch surfaces at Close → coded

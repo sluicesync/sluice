@@ -988,8 +988,10 @@ func openBackupStore(
 //   - The window closes on either --window (wall-clock) or
 //     --max-changes (event count); first to fire wins. The window is
 //     extended to the next TxCommit so the chain doesn't end
-//     mid-transaction. --max-changes counts change EVENTS, transaction
-//     framing included (a one-row transaction is three), and cannot
+//     mid-transaction. --max-changes counts the change EVENTS the window
+//     records, transaction framing included (a one-row transaction is
+//     three; a run of transactions with nothing in scope records only its
+//     last, Bug 300), and cannot
 //     close a window that has not yet passed the parent's end position:
 //     a resumed CDC stream opens by replaying the transaction the parent
 //     ends on, and a tight bound was otherwise satisfiable by that
@@ -1020,7 +1022,7 @@ type BackupIncrementalCmd struct {
 	SlotName string `help:"Replication-slot name suffix on engines with a slot concept (Postgres). Reuses the same slot the original full was taken under so WAL retention covers the chain." placeholder:"NAME"`
 
 	Window     time.Duration `help:"Wall-clock duration the incremental streams CDC events for before closing the window. The window is extended to the next TxCommit so the chain doesn't end mid-transaction." default:"5m" placeholder:"DUR"`
-	MaxChanges int           `help:"Stop streaming after this many CDC EVENTS — transaction framing included, so a one-row transaction counts three (approximate; the window closes at the next TxCommit, and never before it has passed the parent's end position). Zero means time-bound only." default:"0" placeholder:"N"`
+	MaxChanges int           `help:"Stop streaming after this many CDC EVENTS — transaction framing included, so a one-row transaction counts three, and a run of transactions that changed nothing in the backup's scope counts two however long it is (approximate; the window closes at the next TxCommit, and never before it has passed the parent's end position). Zero means time-bound only." default:"0" placeholder:"N"`
 
 	ChunkSize int `help:"Maximum changes per chunk file. Smaller chunks restore faster (per-chunk SHA-256 fail-fast) but inflate the manifest." default:"100000" placeholder:"N"`
 
@@ -1149,7 +1151,7 @@ type BackupStreamCmd struct {
 	SlotName string `help:"Replication-slot name suffix on engines with a slot concept (Postgres). Reuses the slot the original full was taken under so WAL retention covers the chain." placeholder:"NAME"`
 
 	RolloverWindow     time.Duration `help:"Wall-clock cadence each rollover commits at. Window extends to next TxCommit so the chain doesn't end mid-tx." default:"5m" placeholder:"DUR"`
-	RolloverMaxChanges int           `help:"Commit a rollover after this many CDC EVENTS queue up — transaction framing included, so a one-row transaction counts three (approximate; the rollover closes at the next TxCommit, and never before the window has advanced past its own start position, because a resumed pump opens by replaying the transaction its parent ended on)." default:"100000" placeholder:"N"`
+	RolloverMaxChanges int           `help:"Commit a rollover after this many CDC EVENTS queue up — transaction framing included, so a one-row transaction counts three, and a run of transactions that changed nothing in the backup's scope counts two however long it is (approximate; the rollover closes at the next TxCommit, and never before the window has advanced past its own start position, because a resumed pump opens by replaying the transaction its parent ended on)." default:"100000" placeholder:"N"`
 	RolloverMaxBytes   int64         `help:"Commit a rollover when buffered chunk bytes cross this ceiling — transaction framing events are written to the chunk too, so they count toward it. The bound is checked at chunk-flush boundaries, so the buffer may transiently exceed it by up to one chunk, and like --rollover-max-changes it cannot close the rollover before the window has advanced past its own start position (a resumed pump replays the transaction its parent ended on). Default 67108864 (64 MiB)." default:"67108864" placeholder:"BYTES"`
 
 	ChunkSize int `help:"Maximum changes per chunk file. Smaller chunks restore faster (per-chunk SHA-256 fail-fast) but inflate the manifest." default:"100000" placeholder:"N"`

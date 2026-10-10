@@ -1724,15 +1724,28 @@ func (b *SyncFromBackup) streamIncrementalWithPosition(
 	// the F1 tail-truncation backstop below. Confined to this producer
 	// goroutine.
 	var lastApplied ir.Position
+	// Bug 300: a chain written before the Bug 300 fix records an empty source
+	// transaction for every out-of-scope transaction of its window, and the
+	// serial apply paths committed each as its own position write. The runs
+	// sit AFTER the frontier stamps every event, so the ordinals still count
+	// the raw stream (ADR-0191 §3.2) and every event that reaches the applier
+	// carries exactly the token it carried before; only the non-final empty
+	// transactions of a run are withheld. The run's last one is released
+	// before the tail checks below, as every event was before.
+	var runs migcore.EmptyTxRuns
+	emit := migcore.ChannelEmit(ctx, out)
 	for chunkIdx, chunk := range link.Manifest.ChangeChunks {
 		if b.replayChunkFailpoint != nil {
 			if err := b.replayChunkFailpoint(lineage.ManifestBackupID(link.Manifest), chunkIdx); err != nil {
 				return fmt.Errorf("chunk %d (%s): %w", chunkIdx, chunk.File, err)
 			}
 		}
-		if err := b.streamOneChunkWithPosition(ctx, segStore, codec, link.Manifest, chunkIdx, chunk, frontier, out, &lastApplied); err != nil {
+		if err := b.streamOneChunkWithPosition(ctx, segStore, codec, link.Manifest, chunkIdx, chunk, frontier, &runs, emit, &lastApplied); err != nil {
 			return fmt.Errorf("chunk %d (%s): %w", chunkIdx, chunk.File, err)
 		}
+	}
+	if err := runs.Flush(emit); err != nil {
+		return err
 	}
 	if frontier.unidentified > 0 {
 		slog.WarnContext(ctx, "broker: "+BrokerUnidentifiedChangesMarker+": changes to keyed tables in this incremental "+
@@ -1779,7 +1792,8 @@ func (b *SyncFromBackup) streamIncrementalWithPosition(
 }
 
 // streamOneChunkWithPosition reads one chunk's events and pushes them
-// onto out with each change's Position field rewritten to its frontier token.
+// through runs to send with each change's Position field rewritten to its
+// frontier token.
 // segStore/codec come from the chunk's segment (recorded, not
 // sniffed); owner is the manifest recording the chunk, whose
 // FormatVersion + identity derive the chunk's GCM position binding
@@ -1792,7 +1806,8 @@ func (b *SyncFromBackup) streamOneChunkWithPosition(
 	chunkIdx int,
 	chunk *irbackup.ChunkInfo,
 	frontier *brokerFrontier,
-	out chan<- ir.Change,
+	runs *migcore.EmptyTxRuns,
+	send func(ir.Change) error,
 	lastApplied *ir.Position,
 ) error {
 	src, err := blobcodec.FetchChunkVerified(ctx, segStore, chunk.File, chunk.SHA256)
@@ -1854,11 +1869,9 @@ func (b *SyncFromBackup) streamOneChunkWithPosition(
 			_ = cr.Close()
 			return rwErr
 		}
-		select {
-		case <-ctx.Done():
+		if err := runs.Push(rewritten, send); err != nil {
 			_ = cr.Close()
-			return ctx.Err()
-		case out <- rewritten:
+			return err
 		}
 	}
 	// A change-chunk SHA-256 mismatch surfaces at Close → coded

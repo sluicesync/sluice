@@ -1237,12 +1237,20 @@ func (s *Streamer) phaseWireInterceptChain(applyCtx context.Context, changes <-c
 	// from each change's source commit timestamp. Wired only when the
 	// operator opted into the metrics endpoint or a sync-lag alert (nil
 	// tracker ⇒ no extra goroutine, default path byte-identical). It sits
-	// LAST so it observes exactly what reaches the applier across the
-	// batched, per-change, and concurrent-lane paths.
+	// after every stage that drops or holds a change, so it observes exactly
+	// the changes that reach the applier across the batched, per-change, and
+	// concurrent-lane paths (the empty-transaction stage below it drops only
+	// row-less boundaries).
 	if s.syncLag != nil {
 		filtered = observeSyncLagChanges(applyCtx, filtered, s.syncLag)
 	}
-	return filtered
+	// Bug 300: collapse runs of empty source transactions — every
+	// out-of-scope transaction on the source server (and every transaction
+	// the table or --where filter above emptied) arrives as one, and each cost
+	// the serial apply paths a position write of its own. After the sync-lag
+	// observer, which therefore still sees every source commit; the stage
+	// drops only boundaries, never a change.
+	return coalesceEmptyTxRuns(applyCtx, filtered, liveEmptyTxMaxRun, liveEmptyTxLinger)
 }
 
 // firstBoundaryWitness builds the GC-44 first-boundary witness for one
