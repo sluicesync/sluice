@@ -14,7 +14,7 @@
 # `Integration (vstream)` legs ran bare `go test` with no assertion, so a dead
 # docker daemon would skip every geometry/vstream pin and green a REQUIRED
 # check behind branch protection — worse than a scheduled vacuous-green. The
-# 5-shard matrix leg is NOT flagged here because its `-run` lives in
+# sharded matrix leg is NOT flagged here because its `-run` lives in
 # `matrix.shard.goflags` (no literal `-run` on the go-test line); its
 # non-vacuity is `check-integration-skips.sh`, a different mechanism.
 #

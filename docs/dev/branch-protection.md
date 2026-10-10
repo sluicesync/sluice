@@ -19,7 +19,7 @@ Navigate to **Settings → Branches → Add rule** (or **Branch protection rules
 - **Require branches to be up to date before merging:** on
 - Required status checks (these are the GitHub Actions job names from `.github/workflows/ci.yml`):
   - `Test (ubuntu-latest)`
-  - `Integration`
+  - `Integration` — the rollup of the integration matrix (six shards since 2026-10-10: `pipeline-migrate`, `pipeline-rest-streamer`, `pipeline-streamer-crash`, `pipeline-rest-other`, `engines-mysql`, `engines-postgres-and-rest`). Only the rollup is required, so adding or splitting a shard needs no change here; do NOT add the per-shard `Integration (<shard>)` names, which change whenever the matrix is rebalanced
   - `Integration (PostGIS)` — added v0.29.0; gates the cross-engine geometry round-trip suite
   - `Integration (vstream)` — added after Bug 125 (CRITICAL silent-loss) shipped without VStream coverage; see the warning in `ci.yml` before touching this job
   - `Lint`

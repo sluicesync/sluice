@@ -99,9 +99,10 @@ nekiverify;^TestNekiverify;internal/engines/postgres;nekiverify.yml nekiverify
 #                     vet-tags still type-checks it on every run.
 # `integration` itself is structurally exempt (hardcoded below, not
 # listed here): its packages are guarded by check-shard-coverage.sh and
-# the ci.yml pipeline shards' -run/-skip regexes are a complete
-# partition (the -skip shard catches every name the other two don't),
-# so no bare-integration test can escape by name.
+# the ci.yml shards' -run/-skip regexes partition the test names of
+# every package they list — check-shard-coverage.sh's name-partition
+# section evaluates that per name (exactly one shard each) rather than
+# assuming it — so no bare-integration test can escape by name.
 EXEMPT_TAGS='jsonbench compressbench d1verify'
 
 set -eu

@@ -261,12 +261,26 @@ jobs:
     # layout briefly queues on the 4-runner fleet but the wall-time
     # win still nets positive (~30%).
     #
-    # `pipeline-migrate` + `pipeline-rest-streamer` + `pipeline-rest-other`
-    # exactly partition the pipeline package: their -run/-skip regexes
-    # are mutually exclusive AND cover every test (a function either
-    # starts with TestMigrate_, starts with TestStreamer_, or neither).
-    # Zero overlap; zero gap. Go 1.20+ required for `-skip`; go.mod
-    # pins >= 1.26.
+    # 2026-10-10 rebalance (CI-STREAMER-SHARD-SPLIT): `pipeline-rest-
+    # streamer` had grown to ~79 min of job wall time under -race (its
+    # go test binary ran 4480 s on run 38043057784) and exhausted the 75m
+    # inner budget once. The eight `TestStreamer_CrashMidTxn_*` cells were
+    # 2033 s of that (211-330 s each), so they moved to their own
+    # `pipeline-streamer-crash` shard. Measured on that run: crash ~34 min
+    # of tests (~38 min job), the remaining streamer ~41 min (~45 min
+    # job). `pipeline-rest-other` (~49 min of tests, ~54 min job) is now
+    # the long pole.
+    #
+    # `pipeline-migrate` + `pipeline-rest-streamer` + `pipeline-streamer-
+    # crash` + `pipeline-rest-other` exactly partition the pipeline
+    # package: their -run/-skip regexes are mutually exclusive AND cover
+    # every test (a function starts with TestMigrate_, starts with
+    # TestStreamer_CrashMidTxn_, starts with any other TestStreamer_, or
+    # none of those). Zero overlap; zero gap — and that is checked, not
+    # promised: scripts/check-shard-coverage.sh evaluates every shard's
+    # -run/-skip against every test name in every package the shards
+    # list, and fails on a name that would run in zero shards or in two.
+    # Go 1.20+ required for `-skip`; go.mod pins >= 1.26.
     #
     # `engines-postgres-and-rest` also bundles the pgtrigger engine
     # and the small non-pipeline / non-mysql-engine packages (ir,
@@ -283,7 +297,7 @@ jobs:
     # preserves the existing required-status-check name so branch
     # protection on `main` does NOT need to be updated; `needs:
     # integration` automatically depends on every matrix entry, so
-    # adding a 5th shard required zero rollup change.
+    # adding a 5th (and 6th) shard required zero rollup change.
     #
     # The 45m/35m budget rationale above still applies PER SHARD;
     # each shard runs less work than the old monolith so headroom is
@@ -293,19 +307,28 @@ jobs:
       fail-fast: false
       matrix:
         shard:
-          # internal/pipeline/backup appears in ALL THREE pipeline shards, not
-          # only the -skip one. The three regexes partition the test-name space
-          # (-run TestMigrate_ | -run TestStreamer_ | -skip both), and that
-          # partition is complete only FOR A PACKAGE LISTED IN ALL THREE.
+          # internal/pipeline/backup appears in ALL FOUR pipeline shards, not
+          # only the -skip one. The four filters partition the test-name space
+          # (TestMigrate_ | TestStreamer_ minus the crash prefix |
+          # TestStreamer_CrashMidTxn_ | -skip TestMigrate_ and TestStreamer_),
+          # and that partition is complete only FOR A PACKAGE LISTED IN ALL FOUR.
           # Listing backup under -skip alone meant a TestMigrate_- or
           # TestStreamer_-named integration test there would have run in NO
           # job, with both self-guards green (audit 2026-07-26 TEST-1).
           - name: pipeline-migrate
             packages: "./internal/pipeline/ ./internal/pipeline/backup/"
             goflags: "-run ^TestMigrate_"
+          # The TestStreamer_ name space is split in two (CI-STREAMER-SHARD-
+          # SPLIT): the crash-mid-transaction matrix runs alone, and the
+          # general streamer shard -skips exactly that prefix. The -skip shard
+          # further down needs no change: `^(TestMigrate_|TestStreamer_)`
+          # already excludes the crash prefix, which starts with TestStreamer_.
           - name: pipeline-rest-streamer
             packages: "./internal/pipeline/ ./internal/pipeline/backup/"
-            goflags: "-run ^TestStreamer_"
+            goflags: "-run ^TestStreamer_ -skip ^TestStreamer_CrashMidTxn_"
+          - name: pipeline-streamer-crash
+            packages: "./internal/pipeline/ ./internal/pipeline/backup/"
+            goflags: "-run ^TestStreamer_CrashMidTxn_"
           # The `-skip` regex uses parentheses for alternation — those
           # are shell-special characters when the goflags string gets
           # interpolated into the `go test` command line below.
@@ -315,9 +338,9 @@ jobs:
           # parse step with `syntax error near unexpected token '('`.
           # internal/pipeline/backup carries the backup/restore/chain
           # orchestration carved out of the flat pipeline root (audit
-          # 3.7b-2). Its tests are unit-only today; it is listed across ALL
-          # THREE pipeline shards (see the note above) so a future
-          # integration-tagged test there runs whatever its name.
+          # 3.7b-2). It is listed across ALL FOUR pipeline shards (see the
+          # note above) so an integration-tagged test there runs whatever
+          # its name.
           - name: pipeline-rest-other
             packages: "./internal/pipeline/ ./internal/pipeline/backup/"
             goflags: "-skip '^(TestMigrate_|TestStreamer_)'"

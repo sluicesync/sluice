@@ -155,7 +155,7 @@ ci_packages=$(awk '
 	}
 ' "$ci_workflow" | sed -e 's|^\./||' -e 's|/$||' | sort -u)
 
-# Vacuous-success guard: the matrix has 5 shards over >= 10 distinct
+# Vacuous-success guard: the matrix has 6 shards over >= 10 distinct
 # packages; an extraction that finds almost nothing means the awk scope
 # broke (job renamed, indentation changed), not that the list shrank.
 if [ "$(printf '%s\n' "$ci_packages" | grep -c .)" -lt 5 ]; then
@@ -277,7 +277,13 @@ done
 # Filtered-shard completeness (audit 2026-07-26 TEST-1).
 #
 # The pipeline shards partition the test-name space by regex:
-#   -run ^TestMigrate_ | -run ^TestStreamer_ | -skip ^(TestMigrate_|TestStreamer_)
+#   -run ^TestMigrate_
+#   -run ^TestStreamer_ -skip ^TestStreamer_CrashMidTxn_
+#   -run ^TestStreamer_CrashMidTxn_
+#   -skip ^(TestMigrate_|TestStreamer_)
+#
+# (Whether those filters really are a partition of the NAMES is the next
+# section's job; this one is about the PACKAGE lists.)
 #
 # That partition is complete only for a package listed in ALL of them. A
 # package listed under the -skip shard ALONE has a hole exactly the size of the
@@ -328,7 +334,210 @@ if [ -n "$skip_pkgs" ] && [ -n "$run_pkglists" ]; then
 		$skip_pkgs
 	OUTER
 fi
+
+# ---------------------------------------------------------------------------
+# Test-NAME partition (CI-STREAMER-SHARD-SPLIT, 2026-10-10).
+#
+# Every check above is about which PACKAGES a shard hands to `go test`. None
+# of them asked whether the shards' -run/-skip filters actually partition the
+# test NAMES inside those packages — ci.yml said "zero overlap; zero gap" and
+# check-run-filter-coverage.sh repeated it as the reason bare-integration
+# tests need no name guard, but nothing evaluated it. The partition was
+# trivially true with one -skip shard holding the complement; splitting the
+# streamer shard made it a hand-maintained property (a -run narrowed without
+# the matching -skip leaves a gap; a -skip dropped runs a test twice), and a
+# gap is exactly the silent class: `go test -run` with no match prints
+# "no tests to run", exits 0, and emits nothing for the skip guard to see.
+#
+# So evaluate it. For every test function name (Test*, Fuzz*, Example* —
+# `-run` selects all three; TestMain is not selected by it) in every package
+# directory that at least one shard lists, count the shards that list the
+# package AND whose -run matches AND whose -skip does not. The count must be
+# exactly 1. Also: a shard whose filters select NO name at all is dead (a
+# typo'd regex) and fails too.
+#
+# Scope, stated: name-level only, and over ALL *_test.go files regardless of
+# build tag (an integration shard compiles only the untagged + integration
+# files, but the partition property does not depend on which subset compiles).
+# Regexes are evaluated with awk's ERE, which agrees with Go's RE2 only on a
+# small syntax; a filter using anything outside [A-Za-z0-9_^$|()] — or a `/`,
+# which Go splits into per-level subtest patterns — is refused rather than
+# evaluated approximately. The independent expected value here is the source
+# tree's own function list, not anything the workflow says about itself.
+
+# partition_eval TABLE NAMES — TABLE is one shard per line, TAB-separated
+# (name, space-separated package entries in COVERED_PACKAGES form, -run, -skip);
+# NAMES is one `dir name` per line. Prints GAP/DOUBLE/EMPTY lines and a final
+# `CHECKED n` (names in dirs some shard lists). Recursion semantics match
+# covers() above.
+partition_eval() {
+	awk -F'\t' '
+		function covers(entry, dir,   base) {
+			if (entry ~ /\/\.\.\.$/) {
+				base = substr(entry, 1, length(entry) - 4)
+				return dir == base || index(dir, base "/") == 1
+			}
+			return dir == entry
+		}
+		NR == FNR { ns++; sname[ns] = $1; spk[ns] = $2; srun[ns] = $3; sskip[ns] = $4; next }
+		{
+			split($0, f, " ")
+			dir = f[1]; name = f[2]
+			listed = 0; hits = 0; who = ""
+			for (i = 1; i <= ns; i++) {
+				n = split(spk[i], pk, " ")
+				c = 0
+				for (j = 1; j <= n; j++) if (covers(pk[j], dir)) c = 1
+				if (!c) continue
+				listed = 1
+				if (srun[i] != "" && name !~ srun[i]) continue
+				if (sskip[i] != "" && name ~ sskip[i]) continue
+				hits++; who = who " " sname[i]; sel[i]++
+			}
+			if (!listed) next
+			checked++
+			if (hits == 0) print "GAP " dir " " name
+			else if (hits > 1) print "DOUBLE " dir " " name " ->" who
+		}
+		END {
+			for (i = 1; i <= ns; i++)
+				if ((srun[i] != "" || sskip[i] != "") && sel[i] + 0 == 0) print "EMPTY " sname[i]
+			print "CHECKED " checked + 0
+		}
+	' "$1" "$2"
+}
+
+# partition_self_test — the evaluator itself, on synthetic input, in both
+# directions: the real four-way shape must be clean, and each way of breaking
+# it (a dropped -skip, a narrowed -run, a dead regex) must be reported. Pure
+# awk, milliseconds.
+partition_self_test() {
+	_pt_dir=$(mktemp -d)
+	printf '%s\n' 'p A_1' 'p B_1' 'p B_X_1' 'p C_1' 'q A_1' >"$_pt_dir/names"
+	_pt_fail=0
+	# expect TABLE-ROWS... -- WANT (a grep -E over the output, or CLEAN)
+	_pt_case() {
+		_want=$1
+		shift
+		printf '%s\n' "$@" >"$_pt_dir/table"
+		_out=$(partition_eval "$_pt_dir/table" "$_pt_dir/names")
+		if [ "$_want" = CLEAN ]; then
+			if printf '%s\n' "$_out" | grep -qE '^(GAP|DOUBLE|EMPTY) '; then
+				echo "::error::check-shard-coverage PARTITION SELF-TEST: a clean partition was reported as broken: $_out"
+				_pt_fail=1
+			fi
+		elif ! printf '%s\n' "$_out" | grep -qE "$_want"; then
+			echo "::error::check-shard-coverage PARTITION SELF-TEST: expected /$_want/, got: $_out"
+			_pt_fail=1
+		fi
+	}
+	_t=$(printf '\t')
+	_pt_case CLEAN "a${_t}p${_t}^A_${_t}" "b${_t}p${_t}^B_${_t}^B_X_" "x${_t}p${_t}^B_X_${_t}" "o${_t}p${_t}${_t}^(A_|B_)"
+	_pt_case '^DOUBLE p B_X_1 ' "a${_t}p${_t}^A_${_t}" "b${_t}p${_t}^B_${_t}" "x${_t}p${_t}^B_X_${_t}" "o${_t}p${_t}${_t}^(A_|B_)"
+	_pt_case '^GAP p B_X_1$' "a${_t}p${_t}^A_${_t}" "b${_t}p${_t}^B_${_t}^B_X_" "x${_t}p${_t}^B_X_Y${_t}" "o${_t}p${_t}${_t}^(A_|B_)"
+	_pt_case '^EMPTY x$' "a${_t}p${_t}^A_${_t}" "b${_t}p${_t}^B_${_t}" "x${_t}p${_t}^Nope_${_t}" "o${_t}p${_t}${_t}^(A_|B_)"
+	# TEST-1's shape: q is listed only by the -skip shard, so its A_ test
+	# runs nowhere.
+	_pt_case '^GAP q A_1$' "a${_t}p${_t}^A_${_t}" "o${_t}p q${_t}${_t}^A_"
+	_pt_case '^CHECKED 4$' "a${_t}p${_t}${_t}"
+	rm -rf "$_pt_dir"
+	return "$_pt_fail"
+}
+
+if ! partition_self_test; then
+	exit 1
+fi
+
+# The shard table, from the REAL matrix: `- name:` / `packages:` / `goflags:`
+# entries between the integration job's `matrix:` and its `steps:`. goflags is
+# tokenised into -run / -skip; any other token (a `-run=X` spelling, -count,
+# a new flag) is reported as UNMODELLED rather than ignored.
+part_dir=$(mktemp -d)
+trap 'rm -rf "$part_dir"' EXIT
+awk -v sq="'" '
+	function emit() {
+		if (name != "") printf "%s\t%s\t%s\t%s\t%s\n", name, pkgs, run, skip, bad
+		name = ""; pkgs = ""; run = ""; skip = ""; bad = ""
+	}
+	function unq(s) { gsub(/^"|"$/, "", s); return s }
+	/^  integration:/ { injob = 1; next }
+	injob && /^  [A-Za-z0-9_-]+:/ { injob = 0 }
+	!injob { next }
+	/^    strategy:/ { inmatrix = 1; next }
+	inmatrix && /^    steps:/ { emit(); inmatrix = 0; next }
+	!inmatrix { next }
+	/^ *- name: / { emit(); name = $0; sub(/^ *- name: */, "", name); next }
+	/^ *packages: "/ {
+		v = $0; sub(/^ *packages: /, "", v); v = unq(v)
+		n = split(v, t, /[ \t]+/)
+		for (i = 1; i <= n; i++) {
+			if (t[i] == "") continue
+			sub(/^\.\//, "", t[i]); sub(/\/$/, "", t[i])
+			pkgs = pkgs (pkgs == "" ? "" : " ") t[i]
+		}
+		next
+	}
+	/^ *goflags: "/ {
+		v = $0; sub(/^ *goflags: /, "", v); v = unq(v); gsub(sq, "", v)
+		n = split(v, t, /[ \t]+/)
+		for (i = 1; i <= n; i++) {
+			if (t[i] == "") continue
+			if (t[i] == "-run") run = t[++i]
+			else if (t[i] == "-skip") skip = t[++i]
+			else bad = bad " " t[i]
+		}
+		next
+	}
+' "$ci_workflow" >"$part_dir/table"
+
+shard_count=$(grep -c . "$part_dir/table" || true)
+filtered_count=$(awk -F'\t' '$3 != "" || $4 != ""' "$part_dir/table" | grep -c . || true)
+if [ "$shard_count" -lt 5 ] || [ "$filtered_count" -lt 2 ]; then
+	echo "::error::check-shard-coverage NAME PARTITION: parsed $shard_count shards ($filtered_count with -run/-skip filters) from $ci_workflow — fewer than the >= 5 / >= 2 the matrix has, so the matrix parse broke (indentation, a renamed key?). Fix the extraction; refusing to pass vacuously."
+	status=1
+fi
+while IFS="$(printf '\t')" read -r sname _spk srun sskip sbad; do
+	if [ -n "$sbad" ]; then
+		echo "::error::shard $sname: goflags token(s)$sbad are not modelled by the name-partition check in scripts/check-shard-coverage.sh — only '-run X' and '-skip X' are. Teach the check the new flag before relying on it."
+		status=1
+	fi
+	for re in "$srun" "$sskip"; do
+		case "$re" in
+		*[!A-Za-z0-9_^\$\|\(\)]*)
+			echo "::error::shard $sname: filter '$re' uses regex syntax outside [A-Za-z0-9_^\$|()] — awk ERE and Go RE2 are only known to agree on that subset (and '/' is Go's subtest separator), so the name-partition check refuses to evaluate it approximately."
+			status=1
+			;;
+		esac
+	done
+done <"$part_dir/table"
+
+# Test function names per package directory. `git ls-files | xargs grep`
+# rather than `git grep`: see the MSYS note in scripts/vet-tags.sh.
+git ls-files -- '*_test.go' | xargs grep -HoE '^func (Test|Fuzz|Example)[A-Za-z0-9_]*\(' |
+	sed -nE 's|^(.*)/[^/]*:func ([A-Za-z0-9_]+)\($|\1 \2|p' |
+	grep -v ' TestMain$' | sort -u >"$part_dir/names"
+
+part_out=$(partition_eval "$part_dir/table" "$part_dir/names")
+printf '%s\n' "$part_out" | while IFS= read -r line; do
+	case "$line" in
+	GAP\ *) echo "::error::test ${line#GAP } is selected by NO integration shard that lists its package — the -run/-skip filters in $ci_workflow leave a gap, and 'go test -run' with no match exits 0 silently. Widen a -run or narrow a -skip so exactly one shard runs it." ;;
+	DOUBLE\ *) echo "::error::test ${line#DOUBLE } — selected by more than one integration shard; the filters overlap (a -skip missing from a split shard?)." ;;
+	EMPTY\ *) echo "::error::integration shard ${line#EMPTY } has -run/-skip filters that select NO test in any package it lists — a dead shard that greens vacuously. Fix the regex or drop the shard." ;;
+	esac
+done
+if printf '%s\n' "$part_out" | grep -qE '^(GAP|DOUBLE|EMPTY) '; then
+	status=1
+fi
+# Anti-vacuity floor: internal/pipeline alone has thousands of test
+# functions, so a few hundred means name discovery broke (a sed that stopped
+# matching), not that the tree shrank.
+part_checked=$(printf '%s\n' "$part_out" | sed -n 's/^CHECKED //p')
+if [ "${part_checked:-0}" -lt 2000 ]; then
+	echo "::error::check-shard-coverage NAME PARTITION: evaluated only ${part_checked:-0} test names in shard-listed packages (floor 2000) — name discovery broke; refusing to pass vacuously."
+	status=1
+fi
+
 if [ "$status" -eq 0 ]; then
-	echo "check-shard-coverage: every integration-tagged package is covered by a CI shard (recursion semantics mirroring ci.yml), and no shard entry is stale."
+	echo "check-shard-coverage: every integration-tagged package is covered by a CI shard (recursion semantics mirroring ci.yml), no shard entry is stale, and the shards' -run/-skip filters select each of $part_checked test names exactly once."
 fi
 exit $status
