@@ -92,8 +92,11 @@ func committedChangeRecords(t *testing.T, store irbackup.Store) int64 {
 	return n
 }
 
-// assertLaneCharsetRefusal requires the lane check's refusal: the replay
-// code, the fresh-full hint, and its own marker (not the reader's guard).
+// assertLaneCharsetRefusal requires a refusal before the window commits: the
+// replay code and the fresh-full hint, from the lane's window check or —
+// since Bug 301, and earlier — the reader's look-ahead, which refuses an
+// in-place charset change whose events record no charset before decoding
+// any row of the table. The lane check stays behind it as the backstop.
 func assertLaneCharsetRefusal(t *testing.T, what string, err error) {
 	t.Helper()
 	ce, ok := sluicecode.FromError(err)
@@ -103,8 +106,10 @@ func assertLaneCharsetRefusal(t *testing.T, what string, err error) {
 	if ce.Hint != backupReplayMismatchHint {
 		t.Errorf("%s: hint = %q; want %q", what, ce.Hint, backupReplayMismatchHint)
 	}
-	if !strings.Contains(err.Error(), "Refusing before the window commits") || !strings.Contains(err.Error(), "(utf8mb4 → latin1)") {
-		t.Errorf("%s: refused, but not by the lane's window check: %v", what, err)
+	lane := strings.Contains(err.Error(), "Refusing before the window commits") && strings.Contains(err.Error(), "(utf8mb4 → latin1)")
+	reader := strings.Contains(err.Error(), "does not record the character set")
+	if !lane && !reader {
+		t.Errorf("%s: refused, but neither by the lane's window check nor by the reader's look-ahead: %v", what, err)
 	}
 }
 

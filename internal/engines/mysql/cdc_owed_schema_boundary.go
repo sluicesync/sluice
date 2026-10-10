@@ -112,20 +112,37 @@ func (r *CDCReader) oweSchemaBoundaries() {
 	}
 }
 
-// owedSchemaBoundaryTables rebuilds every owed table. ok is false — and
-// nothing should be emitted — when any rebuild fails.
-func (r *CDCReader) owedSchemaBoundaryTables(ctx context.Context) (tables map[string]*tableSchema, ok bool) {
+// owedSchemaBoundaryTables rebuilds every owed table, the reader standing at
+// at. ok is false — and nothing should be emitted — when any rebuild fails,
+// or when a rebuilt shape cannot be proven to hold at at (Bug 301: the
+// catalog already includes a later DDL, so its shape is not this boundary's).
+// err is a proof that could not be carried out at all.
+func (r *CDCReader) owedSchemaBoundaryTables(ctx context.Context, at binlogCoord) (tables map[string]*tableSchema, ok bool, err error) {
 	if len(r.owedSchemaBoundary) == 0 {
-		return nil, true
+		return nil, true, nil
 	}
 	tables = make(map[string]*tableSchema, len(r.owedSchemaBoundary))
 	for qn := range r.owedSchemaBoundary {
-		tbl, err := r.tableFor(ctx, qn)
+		tbl, err := r.tableFor(ctx, qn, at)
 		if err != nil {
 			slog.DebugContext(ctx, "mysql: cdc: could not rebuild a table owing its post-DDL schema boundary; "+
 				"not persisting a position at this rotation",
 				slog.String("table", qn), slog.String("err", err.Error()))
-			return nil, false
+			return nil, false, nil
+		}
+		// Bug 301: the rebuild is the catalog as of now, which a stream behind
+		// the head has not reached. Settle it only once proven to hold here.
+		// A catalog that is ahead is the skip; a proof that could not be
+		// carried out (the look-ahead's own read failing) is an error, never a
+		// silent skip — this runs on every rotation, whatever the metadata.
+		_, ahead, err := r.catalogShapeAhead(ctx, tbl)
+		if err != nil {
+			return nil, false, err
+		}
+		if ahead {
+			slog.DebugContext(ctx, "mysql: cdc: a table owing its post-DDL schema boundary has a later schema change "+
+				"in the catalog; not persisting a position at this rotation", slog.String("table", qn))
+			return nil, false, nil
 		}
 		if len(tbl.Columns) == 0 {
 			// Gone: nothing the lazy path would ever emit.
@@ -135,7 +152,7 @@ func (r *CDCReader) owedSchemaBoundaryTables(ctx context.Context) (tables map[st
 		}
 		tables[qn] = tbl
 	}
-	return tables, true
+	return tables, true, nil
 }
 
 // settleSchemaBoundaries emits each rebuilt owed table's boundary exactly as

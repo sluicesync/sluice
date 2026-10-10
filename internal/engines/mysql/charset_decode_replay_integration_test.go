@@ -225,12 +225,16 @@ func TestCDCReplay_AcrossCharsetDDL_DecodesWritten_MariaDBMinimal(t *testing.T) 
 
 // TestCDCReplay_AcrossCharsetDDL_GuardRefuses_MariaDBNoLog: under MariaDB's
 // default binlog_row_metadata=NO_LOG the TABLE_MAP carries no charset, so
-// the replayed rows are decoded by the current catalog; the charset-DDL
-// guard must refuse when the replay reaches a DDL into a non-UTF-8 charset.
-// A replay into utf8mb4 is NOT refused (third review, item 1a): its old
-// bytes are carried by passthrough exactly as v0.156.2 carried them — here
-// latin1 0xE9, invalid UTF-8, which every target and the backup codec
-// refuse loudly. Drains up to 10 changes: the stream ends at the refusal.
+// a replay across an in-place charset change cannot decode its earlier rows
+// faithfully. Since Bug 301 the reader reads the schema changes ahead of it
+// before decoding any row, and an in-place redefinition of a character
+// column whose event records no charset refuses there — for EVERY target
+// charset, the UTF-8 one included. (Before it, a replay into utf8mb4 was
+// carried as v0.156.2 carried it, the stored latin1 byte as-is, refused
+// only downstream; and the charset-DDL guard refused the others only on
+// reaching the ALTER, after the replayed rows.) Nothing is emitted, so the
+// CHARSET-HISTORY-UNRECORDED WARN — which names a table whose rows were
+// decoded without a recorded charset — has nothing to name.
 func TestCDCReplay_AcrossCharsetDDL_GuardRefuses_MariaDBNoLog(t *testing.T) {
 	dsn, cleanup := newMariaDBDedicatedForCDC(t, mariadb114Image)
 	defer cleanup()
@@ -238,51 +242,54 @@ func TestCDCReplay_AcrossCharsetDDL_GuardRefuses_MariaDBNoLog(t *testing.T) {
 		var buf logcapture.Buffer
 		prev := slog.Default()
 		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
-		// Drain past the ALTER in every case — a refusal ends the stream
-		// early; a non-refusing one runs to the drain timeout — so the UTF-8
-		// case's "not refused" is read after the stream has reached the DDL.
 		got, err := replayAcrossCharsetDDL(t, dsn, FlavorMariaDB, c, fmt.Sprintf("r%d", i), 10)
 		slog.SetDefault(prev)
-		if c.to == "utf8mb4" {
-			if err != nil {
-				t.Errorf("%s: err = %v; a replay into a UTF-8 charset is carried as v0.156.2 carried it, not refused", c.name, err)
-			} else if len(got) != 1 {
-				t.Errorf("%s: got %d changes; want the replayed insert", c.name, len(got))
-			} else if ins, _ := got[0].(ir.Insert); ins.Row["v"] != "\xe9" {
-				t.Errorf("%s: replayed v = %q; want the stored byte 0xE9 carried as-is (the v0.156.2 behaviour)", c.name, ins.Row["v"])
-			}
-		} else {
-			t.Logf("%s: emitted before the refusal: %#v", c.name, got)
-			assertCharsetDDLGuardRefusal(t, c.name, err)
+		assertUnrecordedCharsetLookaheadRefusal(t, c.name, got, err)
+		if strings.Contains(buf.String(), charsetHistoryUnrecordedMarker) {
+			t.Errorf("%s: %s logged, but no row was decoded. log:\n%s", c.name, charsetHistoryUnrecordedMarker, buf.String())
 		}
-		// The table's current charset is what the rows were decoded by; the
-		// WARN names a table only when that is non-UTF-8.
-		if warned := strings.Contains(buf.String(), charsetHistoryUnrecordedMarker); warned != (c.to != "utf8mb4") {
-			t.Errorf("%s: %s logged = %v; want %v (current charset %s). log:\n%s",
-				c.name, charsetHistoryUnrecordedMarker, warned, c.to != "utf8mb4", c.to, buf.String())
-		}
+	}
+}
+
+// assertUnrecordedCharsetLookaheadRefusal requires the Bug 301 refusal of an
+// in-place charset change on a source that records no charset: the replay
+// code, nothing emitted, and the message saying why.
+func assertUnrecordedCharsetLookaheadRefusal(t *testing.T, what string, got []ir.Change, err error) {
+	t.Helper()
+	var ce *sluicecode.CodedError
+	if !errors.As(err, &ce) || ce.Code != sluicecode.CodeCDCSchemaReplayMismatch {
+		t.Fatalf("%s: stream error = %v; want %s", what, err, sluicecode.CodeCDCSchemaReplayMismatch)
+	}
+	if len(got) != 0 {
+		t.Errorf("%s: emitted %#v before refusing; want nothing", what, got)
+	}
+	if !strings.Contains(err.Error(), "does not record the character set") {
+		t.Errorf("%s: the refusal does not name the unrecorded charset: %v", what, err)
 	}
 }
 
 // TestCDCReplay_MariaDBAlterSyntax_GuardRefuses_MariaDBNoLog: a replay into
 // latin1 whose ALTER is spelled in MariaDB-only syntax, a quoted charset or a
-// MariaDB-only collation name must refuse exactly like the plain spelling —
-// before the third review each of these was silently unclassified — and one
-// the parser cannot classify at all refuses through the fail-safe.
+// MariaDB-only collation name. Since Bug 301 each refuses before any row is
+// decoded: a spelling the parser reads (the normaliser's work, which this
+// still pins) is an in-place redefinition whose event records no charset,
+// and one it cannot read is bounded to its table and reshapes it.
 func TestCDCReplay_MariaDBAlterSyntax_GuardRefuses_MariaDBNoLog(t *testing.T) {
 	dsn, cleanup := newMariaDBDedicatedForCDC(t, mariadb114Image)
 	defer cleanup()
 	for i, c := range mariaDBAlterSyntaxReplayCases {
 		c.from, c.to, c.valueHex, c.want = "utf8mb4", "latin1", "C3A9", "é"
-		_, err := replayAcrossCharsetDDL(t, dsn, FlavorMariaDB, c, fmt.Sprintf("s%d", i), 10)
-		assertCharsetDDLGuardRefusal(t, c.name, err)
-		// Which guard refused matters: every spelling but the last must be
-		// CLASSIFIED (the fail-safe would refuse them too, and would hide a
-		// normaliser or namer that stopped working).
-		failSafe := i == len(mariaDBAlterSyntaxReplayCases)-1
-		if err != nil && strings.Contains(err.Error(), "could not parse it or could not name its collation") != failSafe {
-			t.Errorf("%s: refused by the wrong door (want fail-safe = %v): %v", c.name, failSafe, err)
+		got, err := replayAcrossCharsetDDL(t, dsn, FlavorMariaDB, c, fmt.Sprintf("s%d", i), 10)
+		if i == len(mariaDBAlterSyntaxReplayCases)-1 {
+			// The unclassifiable spelling: reshaping, not in place.
+			var ce *sluicecode.CodedError
+			if !errors.As(err, &ce) || ce.Code != sluicecode.CodeCDCSchemaReplayMismatch || len(got) != 0 ||
+				!strings.Contains(err.Error(), "already includes a schema change logged later") {
+				t.Errorf("%s: want the look-ahead's reshaping refusal and nothing emitted; got %#v, %v", c.name, got, err)
+			}
+			continue
 		}
+		assertUnrecordedCharsetLookaheadRefusal(t, c.name, got, err)
 	}
 }
 

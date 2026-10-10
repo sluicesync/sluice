@@ -79,7 +79,7 @@ func newStagingReader(t *testing.T, flavor Flavor, startSet string) *CDCReader {
 			PrimaryKey: []string{"id"},
 		}
 	}
-	return &CDCReader{
+	r := &CDCReader{
 		schema:      "app",
 		flavor:      flavor,
 		posMode:     positionModeGTID,
@@ -94,6 +94,12 @@ func newStagingReader(t *testing.T, flavor Flavor, startSet string) *CDCReader {
 		snapshotSig:    map[string]ir.SchemaSignature{},
 		forwardNullSig: map[string]string{},
 	}
+	// The seam's catalog is read "at the reader's own position", so the
+	// Bug 301 look-ahead has nothing between the two to scan.
+	r.catalogPosition = func(context.Context) (binlogCoord, error) {
+		return binlogCoord{file: r.currentFile, pos: r.lastLogPos}, nil
+	}
+	return r
 }
 
 func hdr(t replication.EventType) *replication.EventHeader {

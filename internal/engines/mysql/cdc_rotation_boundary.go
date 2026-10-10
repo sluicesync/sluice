@@ -135,7 +135,10 @@ func (r *CDCReader) emitRotationBoundary(ctx context.Context, e *replication.Rot
 	// A DDL's boundary is emitted lazily, at the table's next row, and a
 	// restart forgets that it is owed — so settle every owed one before
 	// persisting past the DDL, or skip (cdc_owed_schema_boundary.go).
-	owed, ok := r.owedSchemaBoundaryTables(ctx)
+	owed, ok, err := r.owedSchemaBoundaryTables(ctx, binlogCoord{file: string(e.NextLogName), pos: uint32(e.Position)})
+	if err != nil {
+		return err
+	}
 	if !ok {
 		return nil
 	}

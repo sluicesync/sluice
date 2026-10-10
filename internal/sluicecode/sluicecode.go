@@ -850,13 +850,14 @@ const (
 	CodeCopyRetryAmbiguousKeyless Code = "SLUICE-E-COPY-RETRY-AMBIGUOUS-KEYLESS"
 
 	// CodeCDCSchemaReplayMismatch is the MySQL binlog reader's refusal
-	// when a buffered row event's TABLE_MAP type vector disagrees with the
-	// table's CURRENT information_schema shape. Live at the binlog head
-	// that cannot happen (MySQL serialises DDL against DML on one table),
-	// but a warm resume REPLAYS history recorded before a DDL that ran
-	// while sluice was down — and a DDL that keeps the column COUNT the
-	// same decodes old values against the new types, right count and wrong
-	// meaning (audit CDC-4).
+	// when a row event would be decoded against a table shape other than
+	// the one it was recorded under. The reader takes a shape from the
+	// CURRENT information_schema whenever its cache is cold, and a stream
+	// behind the binlog head — every backup window, every resume, a live
+	// sync that lags — reads events recorded before a schema change the
+	// catalog already shows (audit CDC-4; Bug 301, which found the
+	// "cannot happen at the head" premise this comment used to state
+	// false for a lagging live stream).
 	CodeCDCSchemaReplayMismatch Code = "SLUICE-E-CDC-SCHEMA-REPLAY-MISMATCH"
 
 	// M2 capture-completeness sweep G5 (2026-08-26): the binlog CDC source
@@ -900,6 +901,13 @@ const (
 	// duplicated fan-out otherwise). Without the opt-in the same relay
 	// shape stays the SILENT-CAPTURE-GAP WARN, never this refusal.
 	CodeCDCTriggerEchoLoop Code = "SLUICE-E-CDC-TRIGGER-ECHO-LOOP"
+
+	// CodeCDCBinlogLookaheadShort is the MySQL-family binlog reader's
+	// refusal when the Bug 301 look-ahead cannot read the binlog up to the
+	// position the source reported with a catalog read: until it has, it
+	// cannot prove the catalog shape holds at the stream's position, and it
+	// never marks binlog it did not read as classified.
+	CodeCDCBinlogLookaheadShort Code = "SLUICE-E-CDC-BINLOG-LOOKAHEAD-SHORT"
 )
 
 // Class partitions codes by how the process should exit when the
@@ -945,7 +953,7 @@ var registry = map[Code]Info{
 	CodeSchemaPermissionDenied:   {ClassRuntime, "target role lacks CREATE on the schema"},
 	CodeIndexStatementTimeLimit:  {ClassRuntime, "index build hit PlanetScale's statement-time limit (errno 3024)"},
 	CodeIndexDirectDDLDisabled:   {ClassRuntime, "PlanetScale safe-migrations blocks direct DDL (errno 1105)"},
-	CodeCDCReplicationPermission: {ClassRuntime, "connecting role lacks the REPLICATION attribute"},
+	CodeCDCReplicationPermission: {ClassRuntime, "connecting role lacks the REPLICATION attribute (Postgres), or the binlog privileges the MySQL-family CDC reader needs"},
 	CodeCDCPoolerEndpoint:        {ClassRuntime, "the source appears to be a connection pooler (Supavisor/pgbouncer) that stripped the replication startup parameter; CDC needs the direct endpoint"},
 	CodeCDCStandbySource:         {ClassRefusal, "the CDC source is a read-only standby / read replica (pg_is_in_recovery() = true); point --source at the primary endpoint — a replica remains fine for bulk migrate"},
 	CodeCDCLineageMismatch:       {ClassRefusal, "the resume position's GTID lineage does not match the source: an errant GTID (shares UUIDs with the shard and names one it never executed), a genuinely different keyspace/instance (shares none), a MySQL source rolled back behind a position it issued itself (the target is ahead of it), or a MariaDB source with an empty binlog state (a same-server reset or a rebuilt node, which MariaDB cannot tell apart) — the message says which; every arm but the errant GTID is a terminal refusal that never routes into the automatic re-snapshot, which would drop the target and re-copy from the source"},
@@ -1080,13 +1088,14 @@ var registry = map[Code]Info{
 	CodeWherePushdownDrift:           {ClassRefusal, "warm resume refused: the current --where flags don't match the row-filter subset this stream PUSHED into its Postgres publication at cold start — the publication filter is durable source-side state a warm resume never re-ensures, so resuming would leave the SERVER silently filtering on the stale predicate (under-delivery the client cannot observe); re-run with the --where the stream was established with, or --restart-from-scratch to re-snapshot under the new predicate (on a PG source the restart first refuses on the stream's existing replication slot — drop it as that refusal instructs, then re-run), or --reset-target-data for a destructive reset"},
 
 	CodeCopyRetryAmbiguousKeyless: {ClassRefusal, "a cold copy hit a transient target error mid-batch on a table with no key the rows carry and collide on (no PRIMARY KEY and no NOT NULL UNIQUE index on the source, or on the target only a surrogate the rows do not supply), and refused to re-send those rows: an attempt that committed but lost its acknowledgement is indistinguishable from one that rolled back, and with no unique key there is nothing that would make the second write fail — so the retry that rides a PlanetScale reparent or a storage-grow window on every other table would silently duplicate this one"},
-	CodeCDCSchemaReplayMismatch:   {ClassRefusal, "a MySQL binlog row event's TABLE_MAP column-type vector disagrees with the table's current information_schema shape — the event was recorded under a DIFFERENT schema than the one it is about to be decoded against, which for a same-column-count DDL (a type change) would remap every replayed value silently; refused rather than decoded"},
+	CodeCDCSchemaReplayMismatch:   {ClassRefusal, "a MySQL binlog row event was recorded under a DIFFERENT table shape than the one it is about to be decoded against — a schema change landed while the stream was behind the binlog head — and decoding it would put values under the wrong columns or types silently; refused rather than decoded"},
 
 	CodeCDCReplicaNoLogUpdates: {ClassRefusal, "binlog CDC refused at start: the source is itself a replica with log_replica_updates=OFF and a replication channel whose IO or SQL thread is not stopped (running, connecting, or unreadable), so writes replicated from its primary never enter THIS server's binlog — the CDC tail would be silently empty for all replicated traffic while local writes keep it looking alive; a server whose every channel has both threads stopped (a promoted primary) is accepted with a REPLICA-CHANNELS-STOPPED INFO instead; point the sync at the primary, stop replication (STOP REPLICA) or clear the channel (RESET REPLICA ALL) on a promoted primary, or restart mysqld with log_replica_updates=ON (the variable is read-only at runtime)"},
 	CodeCDCBinlogDBFiltered:    {ClassRefusal, "binlog CDC refused at start: the source's --binlog-ignore-db / --binlog-do-db startup filters exclude a synced database from the binlog, so its writes are applied but never logged — the CDC tail would be silently empty for that database; remove the filter flags and restart mysqld (they are not settable at runtime), or take the database out of the sync's scope"},
 	CodeCDCStatementDML:        {ClassRefusal, "binlog CDC stopped mid-stream: a row-DML statement (INSERT/UPDATE/DELETE/REPLACE, a WITH-prefixed CTE-DML, or a statement-format LOAD DATA) arrived as statement text (a QUERY or EXECUTE_LOAD_QUERY event), which under ROW logging is proof a writing session overrode binlog_format to STATEMENT/MIXED — sluice deliberately never executes replayed SQL text, so these writes cannot be applied; fix the offending session, ensure @@GLOBAL.binlog_format=ROW with no session overrides, then start the sync fresh (the statement-logged writes are only recoverable by re-snapshot)"},
 
-	CodeCDCTriggerEchoLoop: {ClassRefusal, "replicated-write capture (trigger setup --capture-replicated-writes) refused, at setup and at every CDC open: the pgtrigger source carries sluice's own apply bookkeeping (sluice_cdc_state), so another sluice sync applies into this database and the ENABLE ALWAYS capture triggers would re-capture its applied rows as new changes — an echo loop; capture from the origin database instead, or decommission the upstream sync (and drop its control table), or install without the flag (origin-only capture + the replica-role WARN)"},
+	CodeCDCBinlogLookaheadShort: {ClassRuntime, "the MySQL-family binlog reader could not read the source's binlog up to the position the source reported with a catalog read, so it cannot prove the table's shape at the stream's position; retry, and check the source's binlog flushing if it recurs"},
+	CodeCDCTriggerEchoLoop:      {ClassRefusal, "replicated-write capture (trigger setup --capture-replicated-writes) refused, at setup and at every CDC open: the pgtrigger source carries sluice's own apply bookkeeping (sluice_cdc_state), so another sluice sync applies into this database and the ENABLE ALWAYS capture triggers would re-capture its applied rows as new changes — an echo loop; capture from the origin database instead, or decommission the upstream sync (and drop its control table), or install without the flag (origin-only capture + the replica-role WARN)"},
 }
 
 // Describe returns the registry metadata for c, and whether c is a

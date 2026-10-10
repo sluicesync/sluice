@@ -161,6 +161,8 @@ func TestRotationBoundary_MariaDBCarriesLineage(t *testing.T) {
 	r := newStagingReader(t, FlavorMariaDB, "0-1-5")
 	dispatchAll(t, r, mariadbGTIDEvent(0, 6, true), queryEvent("CREATE USER u"))
 	r.lineageFile, r.lineagePos, r.lineageSet = "mysqld-bin.000006", 4, "0-1-6"
+	// What the rotate arm sets before it calls the emitter.
+	r.currentFile, r.lastLogPos = "mysqld-bin.000006", 4
 
 	rot := realRotate("mysqld-bin.000006", 4)
 	out := make(chan ir.Change, 4)

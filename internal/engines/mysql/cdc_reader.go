@@ -271,6 +271,28 @@ type CDCReader struct {
 	// the project tenets call out.
 	schemaCache map[string]*tableSchema
 
+	// ddlAhead is the Bug 301 look-ahead: the DDL events classified between
+	// the reader's position and the last catalog read, which is how a
+	// catalog shape is proven to hold at the reader's position on a source
+	// that does not record column names (cdc_ddl_lookahead.go). Pump
+	// goroutine only.
+	ddlAhead ddlLookahead
+
+	// catalogPosition is a test seam for the server binlog coordinate read
+	// after each catalog load; nil means SHOW BINARY LOG STATUS.
+	catalogPosition func(ctx context.Context) (binlogCoord, error)
+
+	// lastLogPos is the end offset, in currentFile, of the last event that
+	// carried one — see [CDCReader.readerCoord]. Pump goroutine only.
+	lastLogPos uint32
+
+	// knownShapes are the catalog shapes this stream has read per qualified
+	// table, newest first — the dictionaries a FULL-metadata row event's
+	// recorded columns are typed from (cdc_recorded_shape.go). recordedViews
+	// memoises the shape built per TABLE_MAP table_id. Pump goroutine only.
+	knownShapes   map[string][]*tableSchema
+	recordedViews map[uint64]recordedView
+
 	// unforwarded holds the StreamChanges-time fingerprint of the
 	// schema objects the boundary projection does not carry (unique keys,
 	// foreign keys, CHECKs, column defaults and attributes), keyed by
@@ -568,6 +590,22 @@ type tableSchema struct {
 	// otherwise, and nil altogether when no column has one. Populated only
 	// by [loadTableSchema].
 	LostLabels [][]bool
+
+	// loadedAt is the reader's binlog position when this shape was read
+	// from the catalog, and catalogAt the server's binlog position just
+	// after that read (Bug 301; cdc_ddl_lookahead.go). proven records that
+	// no DDL between the two reshapes the table, so the catalog shape IS
+	// the shape at loadedAt. Zero coordinates (hand-built shapes, test
+	// seams) need no proof.
+	loadedAt, catalogAt binlogCoord
+	proven              bool
+	retypedAhead        retypedAhead
+
+	// synthesized marks a shape built from a FULL-metadata TABLE_MAP with
+	// at least one column typed from the TABLE_MAP alone
+	// (cdc_recorded_shape.go). It decodes rows but is never a schema
+	// boundary.
+	synthesized bool
 }
 
 // SetCDCDatabaseScope implements [ir.CDCDatabaseScoper]. It switches
@@ -1207,9 +1245,11 @@ func isRowRelevantEvent(ev *replication.BinlogEvent) bool {
 // unrecoverable conditions; transient or unknown event types are
 // quietly ignored.
 func (r *CDCReader) dispatch(ctx context.Context, ev *replication.BinlogEvent, out chan<- ir.Change) error {
+	r.noteEventOffset(ev.Header)
 	switch e := ev.Event.(type) {
 	case *replication.RotateEvent:
 		r.currentFile = string(e.NextLogName)
+		r.lastLogPos = uint32(e.Position)
 		if isArtificialRotate(ev.Header) {
 			// The dump connection's opening rotate names the file it starts
 			// in; it is not a rotation (cdc_rotation_boundary.go). Neither
@@ -1450,8 +1490,17 @@ func (r *CDCReader) dispatch(ctx context.Context, ev *replication.BinlogEvent, o
 		// Generic DDL: conservative blanket cache invalidation.
 		// We'd rather over-invalidate than risk the row decoder
 		// using a stale column list.
+		//
+		// Bug 301: the event's schema is the session's DEFAULT database,
+		// not the database of the table the statement alters. Keyed on it
+		// alone, `USE other; ALTER TABLE app.t …` left app.t's cached shape
+		// in place and every later row decoded against the pre-DDL column
+		// list — a reorder or a rename swap landing values under the wrong
+		// names at the binlog head. So the statement's own table references
+		// count too (ddl_reach.go; a statement it cannot read reaches every
+		// table).
 		stmtSchema := string(e.Schema)
-		if stmtSchema == "" || r.databaseInScope(stmtSchema) {
+		if stmtSchema == "" || r.databaseInScope(stmtSchema) || classifyDDLReach(q, stmtSchema).reachesDatabase(r.databaseInScope) {
 			// GC-37 (j): a charset DDL whose new charset the cached shape already
 			// carries means this stream is replaying history the cache
 			// misdecoded — refuse BEFORE the cache that proves it is cleared.
@@ -1469,6 +1518,7 @@ func (r *CDCReader) dispatch(ctx context.Context, ev *replication.BinlogEvent, o
 			// (cdc_owed_schema_boundary.go).
 			r.oweSchemaBoundaries()
 			clear(r.schemaCache)
+			clear(r.recordedViews)
 			r.schemaCacheClears.Add(1) // ADR-0170 no-per-tx-churn pin
 
 			// ADR-0049 Chunk B1, locked decision #4c: capture THIS
@@ -1713,9 +1763,19 @@ func (r *CDCReader) dispatchRows(
 	}
 
 	_, cached := r.schemaCache[qn]
-	tbl, err := r.tableFor(ctx, qn)
+	catalogTbl, err := r.tableFor(ctx, qn, r.readerCoord(hdr))
 	if err != nil {
 		return fmt.Errorf("mysql: cdc: load schema for %s: %w", qn, err)
+	}
+	// Bug 301: the catalog shape is the table as of the catalog read, which
+	// a reader behind the binlog head has not reached yet. Decode by the
+	// shape this event was RECORDED under — its own column names when the
+	// source runs binlog_row_metadata=FULL, otherwise the catalog shape once
+	// proven to hold at this position — or refuse, before any row of the
+	// table is decoded. See cdc_ddl_lookahead.go and cdc_recorded_shape.go.
+	tbl, err := r.shapeAtEvent(ctx, qn, catalogTbl, ev)
+	if err != nil {
+		return err
 	}
 	// GC-2: a rebuild — the table's first row after a start or after an
 	// in-scope DDL cleared the cache — is where a schema change becomes
@@ -1730,14 +1790,12 @@ func (r *CDCReader) dispatchRows(
 		}
 	}
 
-	// Audit CDC-4: tableFor's contract ("the information_schema lookup at
-	// this point sees the correct shape") holds at the binlog HEAD, where
-	// the server serialises DDL against DML. It does NOT hold while a warm
-	// resume replays buffered history recorded before a DDL that ran during
-	// the downtime. The TABLE_MAP event states the shape these values were
-	// written under; compare it against the shape we are about to decode
-	// with, BEFORE any row is decoded or emitted, and refuse loudly on a
-	// family mismatch. See cdc_table_map_guard.go.
+	// Audit CDC-4: the TABLE_MAP event states the type vector these values
+	// were written under; compare it against the shape we are about to
+	// decode with, BEFORE any row is decoded or emitted, and refuse loudly on
+	// a family mismatch. Since Bug 301 the shape has already been proven or
+	// built for this position, so this is the backstop, not the proof. See
+	// cdc_table_map_guard.go.
 	if err := verifyTableMapMatchesSchema(ev, tbl); err != nil {
 		return err
 	}
@@ -1752,7 +1810,7 @@ func (r *CDCReader) dispatchRows(
 		return err
 	}
 	if cs == nil {
-		r.noteDecodedWithoutWrittenCharset(tbl)
+		r.noteDecodedWithoutWrittenCharset(catalogTbl)
 	}
 
 	// ADR-0049 Chunk B1: after a DDL invalidated the schema cache,
@@ -1763,8 +1821,12 @@ func (r *CDCReader) dispatchRows(
 	// (DP-1 ii). This preserves the loud floor: the snapshot is a
 	// durable version write that lands ahead of the row, it never
 	// swallows or reorders the existing decode-error path below.
-	if err := r.maybeSnapshotSchemaB1(ctx, qn, tbl, out); err != nil {
-		return err
+	// A shape with a column typed from the TABLE_MAP alone is not a
+	// boundary (cdc_recorded_shape.go): the boundary stays owed.
+	if !tbl.synthesized {
+		if err := r.maybeSnapshotSchemaB1(ctx, qn, tbl, out); err != nil {
+			return err
+		}
 	}
 
 	pos, err := r.positionFor(hdr)
@@ -1993,11 +2055,17 @@ func (r *CDCReader) dispatchRows(
 }
 
 // tableFor returns the cached table schema for qn, loading it from
-// information_schema on a cache miss. The IR contract for row events
-// promises that the column list is the post-DDL view: MySQL serialises
-// DDL relative to DML on the same table in the binlog, so the
-// information_schema lookup at this point sees the correct shape.
-func (r *CDCReader) tableFor(ctx context.Context, qn string) (*tableSchema, error) {
+// information_schema on a cache miss while the reader stands at at.
+//
+// A loaded shape is the table as of the catalog read, NOT as of at: the
+// catalog reflects every DDL the server has committed, including any the
+// reader has not reached. That held only at the binlog head, and this
+// comment used to say the lookup "sees the correct shape" unconditionally
+// (Bug 301). So the load also records the server's binlog coordinate just
+// after the read, and the shape is not decoded with until
+// [CDCReader.shapeAtEvent] has either proven it holds at the reader's
+// position or replaced it with the shape the event itself records.
+func (r *CDCReader) tableFor(ctx context.Context, qn string, at binlogCoord) (*tableSchema, error) {
 	if cached, ok := r.schemaCache[qn]; ok {
 		return cached, nil
 	}
@@ -2017,7 +2085,13 @@ func (r *CDCReader) tableFor(ctx context.Context, qn string) (*tableSchema, erro
 	if err != nil {
 		return nil, err
 	}
+	catalogAt, err := r.catalogCoord(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("read the binlog position of the schema read: %w", err)
+	}
+	tbl.loadedAt, tbl.catalogAt = at, catalogAt
 	r.schemaCache[qn] = tbl
+	r.retainKnownShape(qn, tbl)
 	return tbl, nil
 }
 

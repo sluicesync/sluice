@@ -99,8 +99,11 @@ func TestVerifyTableMapMatchesSchema_FamilyMatrix(t *testing.T) {
 				if !ok || ce.Code != sluicecode.CodeCDCSchemaReplayMismatch {
 					t.Errorf("refusal code = %v (coded=%v); want %s", ce, ok, sluicecode.CodeCDCSchemaReplayMismatch)
 				}
-				if !containsAll(err.Error(), "app.widgets", "Re-snapshot the table") {
-					t.Errorf("refusal must name the table and the remedy; got: %v", err)
+				if !containsAll(err.Error(), "app.widgets", "Refusing") {
+					t.Errorf("refusal must name the table; got: %v", err)
+				}
+				if ok && !containsAll(ce.Hint, "re-snapshot the table", "binlog_row_metadata=FULL") {
+					t.Errorf("refusal hint must name the remedies; got: %q", ce.Hint)
 				}
 			})
 		}

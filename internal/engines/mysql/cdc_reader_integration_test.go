@@ -263,6 +263,11 @@ func TestCDCReader_ColumnReorderMidStream(t *testing.T) {
 
 	// Row 1, pre-reorder (wire order id, name, color, qty).
 	applyMySQL(t, dsn, `INSERT INTO widgets (name, color, qty) VALUES ('pre', 'red', 7);`)
+	// Decode it BEFORE the ALTER runs. A reader that first loads the table
+	// after the ALTER has committed is behind the head with a catalog that is
+	// ahead of it, which under the default binlog_row_metadata=MINIMAL is a
+	// refusal by design (Bug 301) — not the cache-invalidation path this pins.
+	got := drainChanges(t, ctx, changes, 1, 30*time.Second)
 
 	// Reorder mid-stream: move qty ahead of color. New wire order becomes
 	// id, name, qty, color — a DDL QueryEvent that MUST invalidate the reader's
@@ -273,7 +278,7 @@ func TestCDCReader_ColumnReorderMidStream(t *testing.T) {
 
 	// drainChanges skips the ALTER's SchemaSnapshot + tx boundaries, so the two
 	// row changes are the pre- and post-reorder INSERTs.
-	got := drainChanges(t, ctx, changes, 2, 30*time.Second)
+	got = append(got, drainChanges(t, ctx, changes, 1, 30*time.Second)...)
 	if len(got) != 2 {
 		if cdcRdr, ok := rdr.(*CDCReader); ok {
 			if streamErr := cdcRdr.Err(); streamErr != nil {

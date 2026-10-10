@@ -25,8 +25,16 @@ import (
 // commitRollover, and the one-shot lane returns before writing its
 // manifest). No restore of such a chain gives the values back; only a new
 // full does.
+//
+// The same code also carries the Bug 301 refusal — a window that would
+// decode rows recorded before a schema change against the definition after
+// it — which refuses BEFORE any row of the table is decoded, so the hint
+// names the charset harm conditionally and adds the setting that lets
+// future windows decode across such a change.
 const backupReplayMismatchHint = "take a fresh full backup of this source (sluice backup full), and start the chain from it; " +
-	"windows this chain committed before the refusal may hold rows decoded by the wrong charset, and no restore of them recovers the values"
+	"setting binlog_row_metadata=FULL on the source first lets later windows decode rows recorded before a schema change. " +
+	"If the refusal names a CHARACTER SET change, windows this chain committed before the refusal may hold rows decoded by the " +
+	"wrong charset, and no restore of them recovers the values"
 
 // backupCaptureReaderErr is how both backup capture lanes surface the CDC
 // reader's terminal error: wrapped as before, and a replay-mismatch refusal

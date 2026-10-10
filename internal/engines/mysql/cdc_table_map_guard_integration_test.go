@@ -96,7 +96,7 @@ func TestCDCReplay_SameColumnCountTypeChangeRefusesLoudly(t *testing.T) {
 	if !errors.As(streamErr, &ce) || ce.Code != sluicecode.CodeCDCSchemaReplayMismatch {
 		t.Fatalf("stream error = %v; want %s", streamErr, sluicecode.CodeCDCSchemaReplayMismatch)
 	}
-	for _, want := range []string{"ledger", "amount", "Re-snapshot the table"} {
+	for _, want := range []string{"ledger", "amount", "schema change", "Refusing"} {
 		if !strings.Contains(streamErr.Error(), want) {
 			t.Errorf("refusal must contain %q so the operator knows what and what to do; got: %v", want, streamErr)
 		}

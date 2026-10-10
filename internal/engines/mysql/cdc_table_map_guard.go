@@ -5,15 +5,18 @@
 //
 // The binlog reader decodes a row event's raw values against the column
 // types it read from `information_schema`. The comment on [CDCReader.tableFor]
-// justifies that with a real server property: MySQL serialises DDL against
-// DML on the same table in the binlog, so by the time a row event is read
-// the catalog already reflects any DDL that preceded it.
+// once justified that with a server property — MySQL serialises DDL against
+// DML on the same table, so the catalog reflects any DDL that preceded the
+// event — which holds only for a reader AT the binlog head.
 //
-// That property is about the binlog HEAD. It says nothing about REPLAY.
-// A warm resume starts at a stored position and works forward through
-// history that may be hours old, while `information_schema` answers as of
-// NOW. If a DDL ran during the downtime, every buffered event recorded
-// before it is decoded against the post-DDL shape.
+// A reader behind the head works forward through history while
+// `information_schema` answers as of NOW: a warm resume after downtime, but
+// equally every backup window and a live sync that lags (Bug 301 measured
+// the last with no downtime at all). Every event recorded before a DDL the
+// catalog already shows is then decoded against the post-DDL shape. Since
+// Bug 301 the shape is proven or rebuilt for the event's position before
+// this guard runs (cdc_ddl_lookahead.go, cdc_recorded_shape.go); this guard
+// is the backstop.
 //
 // A DDL that changes the column COUNT is caught today — [decodeBinlogRow]
 // refuses on arity. The dangerous one is the DDL that does not: a type
@@ -43,11 +46,15 @@
 //
 // Stated as a limitation rather than left implied: a same-family change
 // this guard cannot see is a same-family change it does not claim to
-// catch. The two known ones are a pure column RENAME (identical types —
-// visible only under `binlog_row_metadata=FULL`, which is not the default,
-// via TableMapEvent.ColumnName) and an ENUM/SET whose LABEL LIST was
-// reordered or renamed (the type code is unchanged; the labels live in
-// TableMapEvent.EnumStrValue, also FULL-only). Neither is closed here.
+// catch — a column RENAME or reorder with identical types (Bug 301
+// measured the reorder and the rename swap landing values under the wrong
+// names), or an ENUM/SET whose LABEL LIST was reordered. Neither is closed
+// HERE. They are closed before this guard runs: under
+// `binlog_row_metadata=FULL` the event's own column names and labels decide
+// the shape (cdc_recorded_shape.go); without them the catalog shape must be
+// proven to hold at the event's position, a reshaping DDL in between refuses,
+// and an in-place redefinition of an ENUM/SET refuses for want of its labels
+// (cdc_ddl_lookahead.go).
 //
 // Unknown on either side means unchecked, never refused — a type sluice
 // cannot classify is not evidence of drift. TestBinlogTypeFamilyRoster is
@@ -284,13 +291,16 @@ func verifyTableMapMatchesSchema(ev *replication.RowsEvent, tbl *tableSchema) er
 func errCDCSchemaReplayMismatch(tbl *tableSchema, detail string) error {
 	return sluicecode.Wrap(
 		sluicecode.CodeCDCSchemaReplayMismatch,
-		"re-snapshot the table (sync --restart-from-scratch); the buffered binlog history predates a schema change",
+		"re-snapshot the table (sync --restart-from-scratch, or a fresh backup full for a backup chain); the binlog "+
+			"history being read predates a schema change. With binlog_row_metadata=FULL on the source, later history "+
+			"decodes across such a change",
 		fmt.Errorf(
 			"mysql: cdc: %s.%s: this binlog event was recorded under a DIFFERENT table shape than the one "+
-				"information_schema reports now — %s. A schema change ran between the position this stream is "+
-				"replaying from and now (typically a DDL applied while the sync was down), so decoding these "+
-				"buffered events against the current shape would reinterpret every value in them without any "+
-				"error. Refusing. Re-snapshot the table — no resume position can replay this history faithfully",
+				"it would be decoded with — %s. A schema change landed between the position this stream is "+
+				"reading and the shape sluice holds for the table, which happens whenever the stream is behind "+
+				"the binlog head when the change lands: a backup window, a resumed sync, or a live sync that is "+
+				"lagging. Decoding these events against that shape would reinterpret every value in them without "+
+				"any error. Refusing",
 			tbl.Schema, tbl.Name, detail,
 		),
 	)

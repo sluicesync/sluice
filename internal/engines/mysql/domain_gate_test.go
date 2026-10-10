@@ -69,6 +69,10 @@ var mysqlDomainDispatchExemptions = map[string]string{
 	"schema_reader.go:jsonValidCheckTarget:col.Type": "SOURCE-SIDE: this IS the MySQL catalog read that " +
 		"produces the IR; nothing upstream of it can have wrapped a type.",
 	"schema_reader.go:applyMariaDBGeometrySRID:col.Type": "SOURCE-SIDE: same MySQL catalog read.",
+	"cdc_recorded_shape.go:recordedColumnAccepts:typ": "SOURCE-SIDE: the shape compared against a binlog " +
+		"TABLE_MAP was read by loadTableSchema from this MySQL server's catalog (Bug 301), which has no DOMAIN.",
+	"cdc_recorded_shape.go:recordedLabelsAgree:d.Columns[j].Type": "SOURCE-SIDE: the same catalog-read shape " +
+		"as recordedColumnAccepts.",
 	"row_writer.go:prepareValue:t": "DOMAIN-PEELED-FIRST (surfaced by T-5's local-variable following): " +
 		"prepareValue reads the declared type into `t := col.Type`, and its FIRST arm — `t.(ir.Domain)` at " +
 		"row_writer.go:858 — IS the transparency handler: it unwraps to the base type, synthesizes a " +
