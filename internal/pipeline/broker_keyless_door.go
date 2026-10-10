@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"slices"
-	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
@@ -154,24 +153,26 @@ func (b *SyncFromBackup) refuseKeylessIncremental(ctx context.Context, applier i
 		return err
 	}
 	var offenders []migcore.ReplayKeylessTable
+	var blockers []keylessBlocker
 	lifted := map[string]bool{}
 	for _, name := range names {
 		if !touch.tables[name] {
 			continue
 		}
-		why, err := b.exactlyOnceBlocker(ctx, applier, link, judged[name], touch)
+		bl, err := b.exactlyOnceBlocker(ctx, applier, link, judged[name], touch)
 		if err != nil {
 			return fmt.Errorf("broker: keyless-table check for %q in incremental %s: %w", name, lineage.ManifestBackupID(link.Manifest), err)
 		}
-		if why != "" {
-			offenders = append(offenders, migcore.ReplayKeylessTable{Name: name, Reason: migcore.ReplayKeylessReason(why)})
+		if bl.why != "" {
+			offenders = append(offenders, migcore.ReplayKeylessTable{Name: name, Reason: migcore.ReplayKeylessReason(bl.why)})
+			blockers = append(blockers, bl)
 			continue
 		}
 		lifted[name] = true
 	}
 	if len(offenders) > 0 {
 		scope := "incremental " + lineage.ManifestBackupID(link.Manifest)
-		if hint, ok := b.classicResumeHint(offenders); ok {
+		if hint, ok := b.classicResumeHint(blockers); ok {
 			return errBrokerKeylessTablesHint(scope, hint, offenders)
 		}
 		return errBrokerKeylessTables(scope, offenders)
@@ -180,38 +181,70 @@ func (b *SyncFromBackup) refuseKeylessIncremental(ctx context.Context, applier i
 	return nil
 }
 
-// exactlyOnceBlocker is "" when an interrupted replay of the incremental is
-// exactly-once for the judged table, and otherwise the reason it is not,
-// prefixed by the reason the table needs it.
-func (b *SyncFromBackup) exactlyOnceBlocker(ctx context.Context, applier ir.ChangeApplier, link *lineage.SegmentRecord, j replayJudgement, touch incrementalTouch) (string, error) {
+// keylessBlocker is why an interrupted replay of an incremental is not
+// exactly-once for one keyless table: why is "" when it is (the table is
+// lifted), and otherwise the rendered reason. classic says BROKER-CLASSIC-RESUME
+// is among the reasons, and beyondClassic that another reason blocks the table
+// too — one a position cannot answer, so deleting a classic row and asserting
+// --at-chain-id would not lift it ([SyncFromBackup.classicResumeHint]).
+type keylessBlocker struct {
+	why           string
+	classic       bool
+	beyondClassic bool
+}
+
+// exactlyOnceBlocker judges the table's replay of the incremental, the reason
+// it is not exactly-once prefixed by the reason the table needs it. The checks
+// a position cannot answer run whether or not this is a classic-resume
+// incremental, so that refusal's remedy knows whether they would have lifted
+// the table (Bug 298 review F2).
+func (b *SyncFromBackup) exactlyOnceBlocker(ctx context.Context, applier ir.ChangeApplier, link *lineage.SegmentRecord, j replayJudgement, touch incrementalTouch) (keylessBlocker, error) {
 	needs := string(j.keyless.Reason)
 	if j.keyless.Reason == migcore.ReplayKeylessTargetUnjudged {
-		return needs, nil
+		return keylessBlocker{why: needs, beyondClassic: true}, nil
+	}
+	base, err := b.liftBlocker(ctx, applier, link, j, touch)
+	if err != nil {
+		return keylessBlocker{}, err
 	}
 	if b.classicSuspect != "" && b.classicSuspect == lineage.ManifestBackupID(link.Manifest) {
-		return needs + "; and " + BrokerClassicResumeMarker + ": this broker resumes from a position written by sluice " +
-			"v0.156.12 or older, which kept no apply marks, so if that run was interrupted inside this incremental, the " +
-			"rows it committed cannot be told apart from the ones still to apply", nil
+		return keylessBlocker{
+			why: needs + "; and " + BrokerClassicResumeMarker + ": this broker resumes from a position written by sluice " +
+				"v0.156.12 or older, which kept no apply marks, so if a run was interrupted inside this incremental, the " +
+				"rows it committed cannot be told apart from the ones still to apply" + base,
+			classic:       true,
+			beyondClassic: base != "",
+		}, nil
 	}
+	if base == "" {
+		return keylessBlocker{}, nil
+	}
+	return keylessBlocker{why: needs + base, beyondClassic: true}, nil
+}
+
+// liftBlocker is "" when the incremental's identities and the target's apply
+// marks make an interrupted replay exactly-once for the table, and otherwise
+// "; and <the reason they do not>".
+func (b *SyncFromBackup) liftBlocker(ctx context.Context, applier ir.ChangeApplier, link *lineage.SegmentRecord, j replayJudgement, touch incrementalTouch) (string, error) {
 	if !link.Manifest.ApplyIdentity {
-		return needs + "; and this incremental records no change identities (it was written before ADR-0191, or rewritten by " +
+		return "; and this incremental records no change identities (it was written before ADR-0191, or rewritten by " +
 			"smart compaction), so an interrupted replay of it cannot be made exactly-once", nil
 	}
 	if touch.zeroID[j.table.Name] {
-		return needs + "; and " + BrokerKeylessNoIdentityMarker + ": a change to it in this incremental carries no identity " +
+		return "; and " + BrokerKeylessNoIdentityMarker + ": a change to it in this incremental carries no identity " +
 			"(a VStream COPY row, an interleaved shard group, a MySQL transaction without a GTID or server identity, or a " +
 			"row the capture synthesized such as an ADD COLUMN fill), so apply marks cannot name it", nil
 	}
 	prober, ok := applier.(ir.ApplyMarksCoverageProber)
 	if !ok {
-		return needs + fmt.Sprintf("; and the target's change applier (%T) cannot report whether apply marks cover it", applier), nil
+		return fmt.Sprintf("; and the target's change applier (%T) cannot report whether apply marks cover it", applier), nil
 	}
 	why, err := prober.MarksCoverReason(ctx, j.table)
 	if err != nil {
 		return "", migcore.ErrOrCancel(ctx, err)
 	}
 	if why != "" {
-		return needs + "; and apply marks cannot make its replay exactly-once: " + why, nil
+		return "; and apply marks cannot make its replay exactly-once: " + why, nil
 	}
 	return "", nil
 }
@@ -491,19 +524,32 @@ func (b *SyncFromBackup) liftedTables(reason string) []migcore.ReplayKeylessTabl
 // one this sluice wrote, with identities and usable marks, and still refuse —
 // what blocks the replay is that a classic token cannot say whether the old
 // run left part of this incremental on the target, which no change to the
-// source, the chain or the marks can answer. Two recoveries can, and they are
-// the only two: rebuild the target, or the operator's assertion that the
-// target holds the chain exactly through the token's link. (Giving the target
-// table a key is not one: a table keyless on the source may legitimately hold
-// duplicate rows, which a target key would merge.) A plain re-run refuses
-// again ([SyncFromBackup.noteClassicResume]). The tables a mixed refusal
-// names for another reason keep the general remedy.
-func (b *SyncFromBackup) classicResumeHint(offenders []migcore.ReplayKeylessTable) (string, bool) {
-	classic, other := 0, 0
-	for _, o := range offenders {
-		if strings.Contains(string(o.Reason), BrokerClassicResumeMarker) {
+// source, the chain or the marks can answer. At most two recoveries can:
+// rebuild the target, or the operator's assertion that the target holds the
+// chain exactly through the token's link. (Giving the target table a key is
+// not one: a table keyless on the source may legitimately hold duplicate rows,
+// which a target key would merge.) A plain re-run refuses again
+// ([SyncFromBackup.noteClassicResume]).
+//
+// The assertion is offered only when it would work — when every classic table
+// is blocked by the classic token ALONE; one that also lacks identities or
+// marks would refuse again after it (Bug 298 review F2). And its condition is
+// about every run since the position was written, not the latest one: a
+// v0.156.11 or v0.156.12 broker that refused the incremental proves nothing
+// about an earlier v0.156.10-or-older run that was interrupted inside it and
+// left the same token (Bug 298 review F1) — citing that refusal as evidence
+// would license the silent duplicate the refusal exists to stop. Tables named
+// for another reason keep the general remedy.
+func (b *SyncFromBackup) classicResumeHint(blockers []keylessBlocker) (string, bool) {
+	classic, atChainBlocked, other := 0, 0, 0
+	for _, bl := range blockers {
+		switch {
+		case bl.classic && bl.beyondClassic:
 			classic++
-		} else {
+			atChainBlocked++
+		case bl.classic:
+			classic++
+		default:
 			other++
 		}
 	}
@@ -513,13 +559,17 @@ func (b *SyncFromBackup) classicResumeHint(offenders []migcore.ReplayKeylessTabl
 	hint := fmt.Sprintf("for %s: re-running the same command refuses again, because this stream's position stays "+
 		"the one sluice v0.156.12 or older wrote until an incremental is applied. Run it with --reset-target-data, which "+
 		"drops the target's tables, restores the chain and records a position this sluice wrote (the target must allow "+
-		"apply marks). Or, only if you know the run that wrote the position did NOT stop partway through incremental %s "+
-		"(for example, a v0.156.11 or v0.156.12 broker refused it with SLUICE-E-BROKER-KEYLESS-TABLE before applying "+
-		"any of it), delete stream %q's row from sluice_cdc_state and run again with --at-chain-id=%s; if that is "+
-		"wrong, the rows the old run committed are duplicated in the keyless tables",
-		BrokerClassicResumeMarker, b.classicSuspect, b.StreamID, b.classicAfter)
-	if other > 0 {
-		hint += ". For a table named for another reason: " + brokerKeylessHint
+		"apply marks)", BrokerClassicResumeMarker)
+	if atChainBlocked == 0 {
+		hint += fmt.Sprintf(". Or, only if you know that NO broker run started applying incremental %s after that "+
+			"position was written (when %s was fully applied), delete stream %q's row from sluice_cdc_state and run "+
+			"again with --at-chain-id=%s. A later run that refused %s, such as a v0.156.11 or v0.156.12 broker, is no "+
+			"evidence: an earlier run may have been interrupted inside it and left the same position. If the assertion "+
+			"is wrong, the rows that run committed are duplicated in the keyless tables, silently",
+			b.classicSuspect, b.classicAfter, b.StreamID, b.classicAfter, b.classicSuspect)
+	}
+	if other > 0 || atChainBlocked > 0 {
+		hint += ". For the other reasons named: " + brokerKeylessHint
 	}
 	return hint, true
 }

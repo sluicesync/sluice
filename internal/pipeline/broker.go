@@ -490,8 +490,11 @@ func isBrokerToken(pos ir.Position) bool {
 // binding occurrence winning, a non-string or null value skipped) — but
 // member by member, stopping at the first syntax error, so a token that is
 // corrupt AFTER its marker still names its owner. Every broker writes
-// `_engine` first (it is the struct's first field), so a broker token
-// truncated or damaged anywhere past the marker is recognised; one damaged
+// `_engine` first (it is the struct's first field; pinned for both encoders
+// and the frozen pre-ADR-0191 struct by
+// TestBrokerToken_MarkerIsFirstAndSurvivesTruncation, and the binding rules by
+// FuzzTokenEngineMarker), so a broker token truncated or damaged anywhere
+// past the marker is recognised; one damaged
 // before or inside the marker is not, and is refused as a non-broker row —
 // the conservative direction, since a broker-owned verdict lets
 // --reset-target-data discard the row. ok is false when no member bound.

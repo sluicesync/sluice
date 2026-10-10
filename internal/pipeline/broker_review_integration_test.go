@@ -94,29 +94,60 @@ func TestBroker_ResetOverAPosition_Postgres(t *testing.T) {
 			t.Errorf("after --reset-target-data %s DIVERGES from the source: target {%s}, source {%s}", tbl, got, want[tbl])
 		}
 	}
+	bc.gradeCorruptBrokerRows(t, dsn, "rv", want)
+}
 
-	// Bug 299 on the real control table: a broker-owned row that does not
-	// decode (the cycle's own repro, a wrong-typed field; and a truncated
-	// token) is the broker's — a plain run refuses BROKER-POSITION-CORRUPT,
-	// not "owned by a non-broker writer", and --reset-target-data is honoured
-	// over it and converges.
-	for name, bad := range map[string]string{
-		"wrong-typed field": `{"_engine":"backup-broker-v2","chain_url":12,"last_applied_backup_id":["x"]}`,
-		"truncated token":   `{"_engine":"backup-broker","chain_url":"x","last_applied_backup_id":"`,
-	} {
-		applyDDL(t, dsn, "UPDATE sluice_cdc_state SET source_position = '"+bad+"' WHERE stream_id = 'rv'")
-		ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
-		err = bc.broker(dsn, "rv", 1, "").Run(ctx)
-		cancel()
-		if err == nil || !strings.Contains(err.Error(), BrokerPositionCorruptMarker) || strings.Contains(err.Error(), "non-broker writer") {
-			t.Fatalf("%s: plain run = %v; want %s", name, err, BrokerPositionCorruptMarker)
-		}
-		b = bc.broker(dsn, "rv", 1, "")
-		b.ResetTargetData = true
-		bc.runToTailWith(t, dsn, b)
-		for _, tbl := range brokerCrashTables {
-			if got := bc.tableState(t, dsn, tbl); got != want[tbl] {
-				t.Errorf("%s: after --reset-target-data %s DIVERGES from the source: target {%s}, source {%s}", name, tbl, got, want[tbl])
+// TestBroker_CorruptBrokerRow_MySQLGTID is the MySQL-target cell of Bug 299:
+// a broker at the chain's tail on a real MySQL target, then
+// gradeCorruptBrokerRows over its real `sluice_cdc_state` (a LONGTEXT column,
+// so invalid JSON is storable there as on Postgres).
+func TestBroker_CorruptBrokerRow_MySQLGTID(t *testing.T) {
+	src, dst, cleanup := startMySQLGTID(t)
+	t.Cleanup(cleanup)
+	e := &sevEnv{t: t, engine: "mysql", driver: "mysql", gtid: true, src: src, dst: dst}
+	bc := newBrokerCrashChain(t, e)
+	want := map[string]string{}
+	for _, tbl := range brokerCrashTables {
+		want[tbl] = bc.tableState(t, e.src, tbl)
+	}
+	dsn := bc.target(t, "rv_corrupt")
+	b := bc.broker(dsn, "rvm", 1, "")
+	b.ResetTargetData = true
+	bc.runToTailWith(t, dsn, b)
+	bc.gradeCorruptBrokerRows(t, dsn, "rvm", want)
+}
+
+// gradeCorruptBrokerRows is Bug 299 on a real control table: for every way a
+// broker-owned row can fail to decode × both token generations, planted over
+// the stream's row, a plain run refuses BROKER-POSITION-CORRUPT — not "owned by
+// a non-broker writer" — and --reset-target-data is honoured over it and
+// converges to the SOURCE (want, the independent expected value).
+func (bc *brokerCrashChain) gradeCorruptBrokerRows(t *testing.T, dsn, stream string, want map[string]string) {
+	t.Helper()
+	plant := applyDDL
+	if bc.e.driver == "mysql" {
+		plant = applyDDLMySQL
+	}
+	for _, sentinel := range []string{BackupBrokerPositionEngine, BackupBrokerPositionEngineV2} {
+		for name, bad := range corruptBrokerTokens(sentinel) {
+			cell := sentinel + "/" + name
+			plant(t, dsn, "UPDATE sluice_cdc_state SET source_position = '"+bad+"' WHERE stream_id = '"+stream+"'")
+			if got := positionOrEmpty(bc.e.driver, dsn, stream); got != bad {
+				t.Fatalf("%s: the planted row reads back as %q; want %q", cell, got, bad)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			err := bc.broker(dsn, stream, 1, "").Run(ctx)
+			cancel()
+			if err == nil || !strings.Contains(err.Error(), BrokerPositionCorruptMarker) || strings.Contains(err.Error(), "non-broker writer") {
+				t.Fatalf("%s: plain run = %v; want %s", cell, err, BrokerPositionCorruptMarker)
+			}
+			b := bc.broker(dsn, stream, 1, "")
+			b.ResetTargetData = true
+			bc.runToTailWith(t, dsn, b)
+			for _, tbl := range brokerCrashTables {
+				if got := bc.tableState(t, dsn, tbl); got != want[tbl] {
+					t.Errorf("%s: after --reset-target-data %s DIVERGES from the source: target {%s}, source {%s}", cell, tbl, got, want[tbl])
+				}
 			}
 		}
 	}

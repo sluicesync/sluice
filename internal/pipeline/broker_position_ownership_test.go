@@ -5,6 +5,7 @@ package pipeline
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -147,4 +148,106 @@ func runOverPosition(t *testing.T, store irbackup.Store, token string, reset boo
 	b.ResetTargetData = reset
 	err := b.Run(ctx)
 	return dropped, app, err
+}
+
+// TestBrokerToken_MarkerIsFirstAndSurvivesTruncation is the check behind
+// tokenEngineMarker's premise that every broker writes `_engine` FIRST (Bug
+// 299 review F3): both of today's encoders and the frozen pre-ADR-0191 token
+// struct (what a v0.156.12-or-older broker wrote) open with the marker, and
+// every strict prefix of a REAL encoded token that still holds the whole
+// marker is broker-owned yet refused by decodeBrokerPosition — so a token cut
+// anywhere past the marker reaches the corrupt-position arms, never the
+// foreign one.
+func TestBrokerToken_MarkerIsFirstAndSurvivesTruncation(t *testing.T) {
+	in := &brokerInProgress{BackupID: `inc"\ ü-1`, Chunks: strings.Repeat("ab", 32), Through: 1<<53 + 1}
+	classicBody, err := json.Marshal(brokerPositionTokenV015611{Engine: backupBrokerPositionEngineV015611, ChainURL: "x", LastAppliedBackupID: "P"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, tc := range map[string]struct{ tok, sentinel string }{
+		"encodeBrokerPosition": {encodeBrokerPosition(`s3://b/"chain"`, "P ").Token, BackupBrokerPositionEngineV2},
+		"encodeBrokerFrontier": {encodeBrokerFrontier(`s3://b/"chain"`, "P ", in).Token, BackupBrokerPositionEngineV2},
+		"frozen v0.156.11":     {string(classicBody), BackupBrokerPositionEngine},
+	} {
+		if !strings.HasPrefix(tc.tok, `{"_engine":`) {
+			t.Errorf("%s: the marker is not the token's first member: %s", name, tc.tok)
+			continue
+		}
+		head := `{"_engine":"` + tc.sentinel + `"`
+		if !strings.HasPrefix(tc.tok, head) {
+			t.Errorf("%s: the token does not open with %s: %s", name, head, tc.tok)
+			continue
+		}
+		if len(tc.tok)-len(head) < 20 {
+			t.Fatalf("%s: only %d bytes after the marker; the truncation sweep would grade almost nothing", name, len(tc.tok)-len(head))
+		}
+		for n := len(head); n < len(tc.tok); n++ {
+			p := ir.Position{Engine: "postgres", Token: tc.tok[:n]}
+			if !isBrokerToken(p) {
+				t.Errorf("%s cut at %d is not broker-owned: %s", name, n, p.Token)
+			}
+			if _, err := decodeBrokerPosition(p); err == nil {
+				t.Errorf("%s cut at %d decodes: %s", name, n, p.Token)
+			}
+		}
+	}
+}
+
+// FuzzTokenEngineMarker is the differential gate on tokenEngineMarker's
+// binding rules (Bug 299 review): on every syntactically valid JSON input, the
+// marker it reads must be the value encoding/json binds to
+// brokerPositionToken.Engine — duplicate keys, case-folded keys, nested
+// objects, null and non-string values included. Invalid input is out of its
+// scope (encoding/json binds nothing there; tokenEngineMarker's
+// member-by-member read of it is pinned by the truncation and corrupt-row
+// gates above).
+func FuzzTokenEngineMarker(f *testing.F) {
+	for _, seed := range []string{
+		`{"_engine":"backup-broker-v2"}`,
+		`{"_engine":"backup-broker","_engine":"backup-broker-v2"}`,
+		`{"_engine":"backup-broker-v2","_engine":"backup-broker"}`,
+		`{"_Engine":"backup-broker-v2"}`,
+		`{"_ENGINE":"backup-broker"}`,
+		`{"_engine":"a","_ENGINE":"b"}`,
+		`{"_ENGINE":"b","_engine":"a"}`,
+		`{"x":{"_engine":"backup-broker-v2"}}`,
+		`{"x":[{"_engine":"backup-broker-v2"}],"_engine":"backup-broker"}`,
+		`{"_engine":null}`,
+		`{"_engine":"backup-broker-v2","_engine":null}`,
+		`{"_engine":7}`,
+		`{"_engine":"backup-broker-v2","_engine":7}`,
+		`{"_engine":true}`,
+		`{"_engine":["backup-broker-v2"]}`,
+		`{"_engine":{"v":"backup-broker-v2"}}`,
+		`{"_engine":""}`,
+		`{"_engine":"backup-broker-v2\u0000"}`,
+		`{"` + "\\" + `u005fengine":"backup-broker-v2"}`, // the key spelled with a JSON escape
+		`{"_engin":"backup-broker-v2"}`,
+		`{"_engines":"backup-broker-v2"}`,
+		`{"engine":"backup-broker-v2"}`,
+		`{" _engine":"backup-broker-v2"}`,
+		`{"_enginE":"backup-broker-v2","last_applied_backup_id":"P"}`,
+		string(rune(0xFEFF)) + `{"_engine":"backup-broker-v2"}`, // a BOM: not valid JSON, so out of the differential's scope
+		` {"_engine":"backup-broker-v2"} `,
+		`["backup-broker-v2"]`,
+		`"backup-broker-v2"`,
+		`null`,
+		`{}`,
+		`{"slot":"sluice_slot","lsn":"0/16B0000"}`,
+	} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, token string) {
+		if !json.Valid([]byte(token)) {
+			return
+		}
+		var ref struct {
+			Engine string `json:"_engine"`
+		}
+		_ = json.Unmarshal([]byte(token), &ref) // a type error still binds what it can, as the decoder does
+		got, _ := tokenEngineMarker(token)
+		if got != ref.Engine {
+			t.Fatalf("tokenEngineMarker(%q) = %q; encoding/json binds %q", token, got, ref.Engine)
+		}
+	})
 }
