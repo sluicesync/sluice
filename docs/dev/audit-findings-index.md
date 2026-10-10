@@ -54,6 +54,12 @@ other eighteen.
 
 ---
 
+## 2026-10-09 — CI: the `TestStreamer_` integration shard sits at its time budget
+
+Indexed 2026-10-09 when filed. A single finding from the v0.157.0 release gate (no audit pass).
+
+- CI-STREAMER-SHARD-SPLIT filed
+
 ## 2026-09-22 — Gap census: object classes × stated capabilities × peer tools
 
 Indexed 2026-09-22 by the census pass itself. The IDs are the backlog's
