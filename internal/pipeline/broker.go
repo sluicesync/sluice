@@ -325,7 +325,10 @@ type SyncFromBackup struct {
 
 	// classicSuspect is the incremental a resumed classic-token broker may
 	// have been inside ([SyncFromBackup.noteClassicResume]); "" otherwise.
+	// classicAfter is the classic token's last fully applied backup id, which
+	// the refusal's remedy names.
 	classicSuspect string
+	classicAfter   string
 
 	// pidHostFn returns the (pid, host) pair recorded on the liveness
 	// file. Defaults to (os.Getpid, os.Hostname); tests inject a stub.
@@ -425,10 +428,11 @@ func isBrokerSentinel(s string) bool {
 
 // decodeBrokerPosition parses a position token written by
 // [encodeBrokerPosition]. Returns (nil, error) when the token isn't
-// JSON-shaped or doesn't carry the broker sentinel — a non-broker
-// position written into the same row by some other code path.
-// Callers handle that as "no broker state for this stream-id" and
-// fall through to the cold-start branch.
+// JSON-shaped, doesn't carry the broker sentinel, or carries a field no
+// writer produces. It decodes; it does not judge ownership — that is
+// [isBrokerToken]'s, settled first, so an error here on a broker-owned row
+// is a corrupt position and refuses ([BrokerPositionCorruptMarker] at start,
+// the incremental's apply in resumeSkip), never a cold start.
 //
 // Bug 39 fix (v0.20.1): the discriminator is the embedded `_engine`
 // field, NOT [ir.Position.Engine]. The latter is set by the engine
@@ -463,21 +467,88 @@ func decodeBrokerPosition(pos ir.Position) (*brokerPositionToken, error) {
 
 // isBrokerToken reports whether a persisted position token (read from
 // `sluice_cdc_state.source_position` via [ir.ChangeApplier.ReadPosition])
-// was written by a broker. It probes the token's embedded `_engine`
-// field rather than [ir.Position.Engine], which the engine appliers
-// stomp on with their own engine name. Returns false on JSON-decode
-// failure (non-broker writers — live CDC — write opaque tokens that
-// are typically NOT JSON envelopes; PG slots use a JSON envelope but
-// without the `_engine` field).
+// is OWNED by a broker: whether its embedded `_engine` marker is a broker
+// sentinel. It probes that field rather than [ir.Position.Engine], which the
+// engine appliers stomp on with their own engine name. Non-broker writers —
+// live CDC — write opaque tokens that are typically NOT JSON envelopes (PG
+// slots use one, without the `_engine` field), so they never qualify.
+//
+// Ownership is judged on the marker ALONE (Bug 299, v0.157.1): whether the
+// rest of the token decodes is [decodeBrokerPosition]'s question, asked only
+// after ownership is settled. Through v0.157.0 this decoded the whole token,
+// so a broker row with a wrong-typed field or truncated JSON was called a
+// non-broker writer's — and --reset-target-data, the recovery for a corrupt
+// position, was refused over it.
 func isBrokerToken(pos ir.Position) bool {
-	if pos.Token == "" {
-		return false
+	marker, ok := tokenEngineMarker(pos.Token)
+	return ok && isBrokerSentinel(marker)
+}
+
+// tokenEngineMarker reads ONLY the `_engine` member of a position token's
+// top-level JSON object, the way encoding/json would bind it to
+// [brokerPositionToken.Engine] (a case-insensitive key match, the last
+// binding occurrence winning, a non-string or null value skipped) — but
+// member by member, stopping at the first syntax error, so a token that is
+// corrupt AFTER its marker still names its owner. Every broker writes
+// `_engine` first (it is the struct's first field), so a broker token
+// truncated or damaged anywhere past the marker is recognised; one damaged
+// before or inside the marker is not, and is refused as a non-broker row —
+// the conservative direction, since a broker-owned verdict lets
+// --reset-target-data discard the row. ok is false when no member bound.
+func tokenEngineMarker(token string) (marker string, ok bool) {
+	dec := json.NewDecoder(strings.NewReader(token))
+	if t, err := dec.Token(); err != nil || t != json.Delim('{') {
+		return "", false
 	}
-	var tok brokerPositionToken
-	if err := json.Unmarshal([]byte(pos.Token), &tok); err != nil {
-		return false
+	for dec.More() {
+		t, err := dec.Token()
+		if err != nil {
+			break
+		}
+		key, isKey := t.(string)
+		if !isKey {
+			break
+		}
+		var raw json.RawMessage
+		if err := dec.Decode(&raw); err != nil {
+			break
+		}
+		if !strings.EqualFold(key, "_engine") {
+			continue
+		}
+		var s string
+		if json.Unmarshal(raw, &s) != nil || string(raw) == "null" {
+			continue
+		}
+		marker, ok = s, true
 	}
-	return isBrokerSentinel(tok.Engine)
+	return marker, ok
+}
+
+// BrokerPositionCorruptMarker is the grep-stable token on the refusal of a
+// warm resume over a position row the broker owns (its `_engine` marker is a
+// broker sentinel) but cannot decode or would not have written.
+const BrokerPositionCorruptMarker = "BROKER-POSITION-CORRUPT"
+
+// errBrokerPositionCorrupt renders that refusal. A real broker never writes
+// such a row; it takes outside damage (a hand edit, a bad restore of the
+// control table). Nothing is applied: the position is the only record of how
+// far the target got, so the broker does not guess.
+func errBrokerPositionCorrupt(streamID string, cause error) error {
+	return fmt.Errorf("broker: %s: the persisted position for stream %q carries the broker's own marker but is corrupt: %w. "+
+		"Nothing was applied. Pass --reset-target-data to rebuild the target from the chain (it discards this row), "+
+		"or, if you know which link the target holds, delete this stream's row from sluice_cdc_state and run again "+
+		"with --at-chain-id=<that backup id>",
+		BrokerPositionCorruptMarker, streamID, cause)
+}
+
+// describeForeignToken says what a non-broker row's token carries, for the
+// refusal that names its owner.
+func describeForeignToken(token string) string {
+	if marker, ok := tokenEngineMarker(token); ok {
+		return fmt.Sprintf("its position token's _engine marker is %q, not a broker's", marker)
+	}
+	return "its position token carries no broker _engine marker"
 }
 
 // Run executes the long-running broker. Blocks until ctx is cancelled
@@ -794,7 +865,9 @@ func (b *SyncFromBackup) resolveStart(ctx context.Context, applier ir.ChangeAppl
 		// without identities) all prescribe, and before this case the warm
 		// branch below swallowed it and resumed instead (ADR-0191 review). The
 		// position is not decoded: a corrupt one is exactly what may need the
-		// reset. The cold-start reset clears the row and its marks before it
+		// reset — and isBrokerToken judges ownership on the token's `_engine`
+		// marker alone, so a broker row that does not decode reaches this case
+		// too (Bug 299). The cold-start reset clears the row and its marks before it
 		// drops anything (coldStartReset), so a crash mid-reset leaves no
 		// position to warm-resume onto a half-restored target.
 		slog.InfoContext(ctx, "broker: --reset-target-data over an existing broker position; the position is discarded",
@@ -804,8 +877,7 @@ func (b *SyncFromBackup) resolveStart(ctx context.Context, applier ir.ChangeAppl
 	case found && isBrokerToken(persisted):
 		tok, dErr := decodeBrokerPosition(persisted)
 		if dErr != nil {
-			return "", fmt.Errorf("broker: corrupt persisted position for stream %q: %w; clear the row manually or pass --reset-target-data",
-				b.StreamID, dErr)
+			return "", errBrokerPositionCorrupt(b.StreamID, dErr)
 		}
 		if err := b.refuseAtChainIDOverPosition(tok); err != nil {
 			return "", err
@@ -832,11 +904,13 @@ func (b *SyncFromBackup) resolveStart(ctx context.Context, applier ir.ChangeAppl
 	case found:
 		// A row owned by a non-broker writer (a `sync start` stream) is
 		// refused with or without --reset-target-data: overwriting it would
-		// corrupt the live stream's resume state.
+		// corrupt the live stream's resume state. The message names what the
+		// TOKEN carries, not persisted.Engine: that is the target applier's
+		// own engine name (Bug 39), never the writer's (Bug 299).
 		return "", fmt.Errorf(
-			"broker: stream %q is owned by a non-broker writer (position engine %q); "+
+			"broker: stream %q is owned by a non-broker writer (%s); "+
 				"choose a different --stream-id or clear the conflicting row first",
-			b.StreamID, persisted.Engine,
+			b.StreamID, describeForeignToken(persisted.Token),
 		)
 	}
 	return b.coldStartEntry(ctx, applier)

@@ -46,7 +46,8 @@ import (
 // resume refuses BROKER-INCREMENTAL-REWRITTEN, and --reset-target-data — that
 // refusal's remedy — rebuilds the target and converges to the SOURCE (the
 // independent expected value). Before the fix the reset warm-resumed and
-// refused again.
+// refused again. It then plants broker-owned rows that do not decode (Bug
+// 299) and grades the same two directions over each.
 func TestBroker_ResetOverAPosition_Postgres(t *testing.T) {
 	src, dst, cleanup := startPostgresLogical(t)
 	t.Cleanup(cleanup)
@@ -91,6 +92,32 @@ func TestBroker_ResetOverAPosition_Postgres(t *testing.T) {
 	for _, tbl := range brokerCrashTables {
 		if got := bc.tableState(t, dsn, tbl); got != want[tbl] {
 			t.Errorf("after --reset-target-data %s DIVERGES from the source: target {%s}, source {%s}", tbl, got, want[tbl])
+		}
+	}
+
+	// Bug 299 on the real control table: a broker-owned row that does not
+	// decode (the cycle's own repro, a wrong-typed field; and a truncated
+	// token) is the broker's — a plain run refuses BROKER-POSITION-CORRUPT,
+	// not "owned by a non-broker writer", and --reset-target-data is honoured
+	// over it and converges.
+	for name, bad := range map[string]string{
+		"wrong-typed field": `{"_engine":"backup-broker-v2","chain_url":12,"last_applied_backup_id":["x"]}`,
+		"truncated token":   `{"_engine":"backup-broker","chain_url":"x","last_applied_backup_id":"`,
+	} {
+		applyDDL(t, dsn, "UPDATE sluice_cdc_state SET source_position = '"+bad+"' WHERE stream_id = 'rv'")
+		ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
+		err = bc.broker(dsn, "rv", 1, "").Run(ctx)
+		cancel()
+		if err == nil || !strings.Contains(err.Error(), BrokerPositionCorruptMarker) || strings.Contains(err.Error(), "non-broker writer") {
+			t.Fatalf("%s: plain run = %v; want %s", name, err, BrokerPositionCorruptMarker)
+		}
+		b = bc.broker(dsn, "rv", 1, "")
+		b.ResetTargetData = true
+		bc.runToTailWith(t, dsn, b)
+		for _, tbl := range brokerCrashTables {
+			if got := bc.tableState(t, dsn, tbl); got != want[tbl] {
+				t.Errorf("%s: after --reset-target-data %s DIVERGES from the source: target {%s}, source {%s}", name, tbl, got, want[tbl])
+			}
 		}
 	}
 }

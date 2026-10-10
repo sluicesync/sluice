@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
@@ -169,7 +170,11 @@ func (b *SyncFromBackup) refuseKeylessIncremental(ctx context.Context, applier i
 		lifted[name] = true
 	}
 	if len(offenders) > 0 {
-		return errBrokerKeylessTables("incremental "+lineage.ManifestBackupID(link.Manifest), offenders)
+		scope := "incremental " + lineage.ManifestBackupID(link.Manifest)
+		if hint, ok := b.classicResumeHint(offenders); ok {
+			return errBrokerKeylessTablesHint(scope, hint, offenders)
+		}
+		return errBrokerKeylessTables(scope, offenders)
 	}
 	b.liftedKeyless = lifted
 	return nil
@@ -358,6 +363,16 @@ const BrokerClassicResumeMarker = "BROKER-CLASSIC-RESUME"
 // that incremental — the next one after lastAppliedID that the chain already
 // holds; one appended after this resume cannot have been started by the old
 // binary — which restores v0.156.12's refusal for it and for nothing else.
+//
+// A classic token is ALWAYS at a boundary (no writer put a frontier in one,
+// and decodeBrokerPosition refuses one that carries it), so "parked at a
+// boundary" is no evidence: the old run advanced the token only when an
+// incremental completed, and an interrupted one left the token exactly where
+// a clean stop would. Nothing else on the target tells the two apart — the
+// old run wrote no marks. The refusal therefore holds on every plain re-run:
+// only applying the suspect incremental would rewrite the token (as v2), and
+// the suspect is refused before anything of it is applied. Its remedy is its
+// own ([SyncFromBackup.classicResumeHint]).
 func (b *SyncFromBackup) noteClassicResume(ctx context.Context, lastAppliedID string) error {
 	chain, err := b.brokerChain(ctx)
 	if err != nil {
@@ -370,6 +385,7 @@ func (b *SyncFromBackup) noteClassicResume(ctx context.Context, lastAppliedID st
 	for i := idx; i < len(chain); i++ {
 		if lineage.CanonicalKind(chain[i].Manifest.Kind) == irbackup.BackupKindIncremental {
 			b.classicSuspect = lineage.ManifestBackupID(chain[i].Manifest)
+			b.classicAfter = lastAppliedID
 			return nil
 		}
 	}
@@ -421,8 +437,6 @@ func (b *SyncFromBackup) refuseKeylessResetTarget(ctx context.Context, applier i
 	return errBrokerKeylessTables("this chain", keyless)
 }
 
-// errBrokerKeylessTables renders the coded refusal for scope (an incremental,
-// or the chain).
 // requireMarksForLifted closes the window between the door and the apply
 // (ADR-0191 review): the door asked the target whether its marks cover each
 // lifted table before the incremental, but the applier decides whether the
@@ -471,8 +485,55 @@ func (b *SyncFromBackup) liftedTables(reason string) []migcore.ReplayKeylessTabl
 	return out
 }
 
+// classicResumeHint is the remedy for a refusal that names
+// BROKER-CLASSIC-RESUME (Bug 298, v0.157.1); ok is false when no table is
+// named for it. [brokerKeylessHint] misdirects there: the chain may already be
+// one this sluice wrote, with identities and usable marks, and still refuse —
+// what blocks the replay is that a classic token cannot say whether the old
+// run left part of this incremental on the target, which no change to the
+// source, the chain or the marks can answer. Two recoveries can, and they are
+// the only two: rebuild the target, or the operator's assertion that the
+// target holds the chain exactly through the token's link. (Giving the target
+// table a key is not one: a table keyless on the source may legitimately hold
+// duplicate rows, which a target key would merge.) A plain re-run refuses
+// again ([SyncFromBackup.noteClassicResume]). The tables a mixed refusal
+// names for another reason keep the general remedy.
+func (b *SyncFromBackup) classicResumeHint(offenders []migcore.ReplayKeylessTable) (string, bool) {
+	classic, other := 0, 0
+	for _, o := range offenders {
+		if strings.Contains(string(o.Reason), BrokerClassicResumeMarker) {
+			classic++
+		} else {
+			other++
+		}
+	}
+	if classic == 0 {
+		return "", false
+	}
+	hint := fmt.Sprintf("for %s: re-running the same command refuses again, because this stream's position stays "+
+		"the one sluice v0.156.12 or older wrote until an incremental is applied. Run it with --reset-target-data, which "+
+		"drops the target's tables, restores the chain and records a position this sluice wrote (the target must allow "+
+		"apply marks). Or, only if you know the run that wrote the position did NOT stop partway through incremental %s "+
+		"(for example, a v0.156.11 or v0.156.12 broker refused it with SLUICE-E-BROKER-KEYLESS-TABLE before applying "+
+		"any of it), delete stream %q's row from sluice_cdc_state and run again with --at-chain-id=%s; if that is "+
+		"wrong, the rows the old run committed are duplicated in the keyless tables",
+		BrokerClassicResumeMarker, b.classicSuspect, b.StreamID, b.classicAfter)
+	if other > 0 {
+		hint += ". For a table named for another reason: " + brokerKeylessHint
+	}
+	return hint, true
+}
+
+// errBrokerKeylessTables renders the coded refusal for scope (an incremental,
+// or the chain), with the general remedy.
 func errBrokerKeylessTables(scope string, tables []migcore.ReplayKeylessTable) error {
-	return sluicecode.Wrap(sluicecode.CodeBrokerKeylessTable, brokerKeylessHint, fmt.Errorf(
+	return errBrokerKeylessTablesHint(scope, brokerKeylessHint, tables)
+}
+
+// errBrokerKeylessTablesHint is [errBrokerKeylessTables] with its remedy
+// chosen by the caller.
+func errBrokerKeylessTablesHint(scope, hint string, tables []migcore.ReplayKeylessTable) error {
+	return sluicecode.Wrap(sluicecode.CodeBrokerKeylessTable, hint, fmt.Errorf(
 		"broker: refusing to replay %s: %d table(s) could gain duplicate rows if the replay is interrupted: %s. "+
 			"After an interruption (an error, a crash, SIGINT/SIGTERM) the broker re-applies the source transaction "+
 			"that was in flight; a table the applier upserts into on a key the rows carry converges, but on these "+
