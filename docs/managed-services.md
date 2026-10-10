@@ -201,7 +201,7 @@ A note that matters for anyone reading PlanetScale's docs: the shard-key restric
 
 ### Neki cannot be a continuous-sync source
 
-`sluice migrate` **out of** Neki works, including from a sharded database. `sluice sync` out of it does not, and this is a platform limitation rather than missing work on our side: a Neki replication connection can **export** a snapshot but there is no way to **import** one — both `pg_export_snapshot()` and `SET TRANSACTION SNAPSHOT` are unimplemented. Without an importable snapshot there is no consistent handoff from the bulk copy to the change stream, which is the mechanism every sluice sync depends on.
+`sluice migrate` **out of** Neki works, including from a sharded database. `sluice sync` out of it does not, and this is a platform limitation rather than missing work on our side. The router refuses a replication connection outright — `FATAL: replication connections must target a specific shard` (SQLSTATE 0A000), measured on an unsharded Neki database too — so `sync` stops at the snapshot open. Behind that, a per-shard replication connection can **export** a snapshot but there is no way to **import** one (both `pg_export_snapshot()` and `SET TRANSACTION SNAPSHOT` are unimplemented), and shards do not share a snapshot. Without an importable snapshot there is no consistent handoff from the bulk copy to the change stream, which is the mechanism every sluice sync depends on. See [planetscale-postgres-to-neki](operator/planetscale-postgres-to-neki.md).
 
 Use `sluice migrate` for a one-shot move out, and plan a cutover window rather than a continuous tail.
 
