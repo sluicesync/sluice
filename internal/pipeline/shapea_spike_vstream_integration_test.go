@@ -44,6 +44,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
 	"sort"
 	"strconv"
 	"strings"
@@ -52,6 +53,7 @@ import (
 
 	mobycontainer "github.com/moby/moby/api/types/container"
 	"github.com/testcontainers/testcontainers-go"
+	tcexec "github.com/testcontainers/testcontainers-go/exec"
 	mysqltc "github.com/testcontainers/testcontainers-go/modules/mysql"
 	pgtc "github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
@@ -60,6 +62,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/translate"
+	"sluicesync.dev/sluice/internal/vttestserver"
 
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
@@ -109,11 +112,10 @@ func startVTTestServerKeyspaces(t *testing.T, keyspaces []string, numShards int)
 		shards[i] = strconv.Itoa(numShards)
 	}
 
-	const (
-		basePort      = 33574
-		mysqlPortBase = "33577/tcp"
-		grpcPortBase  = "33575/tcp"
-	)
+	// The shared layout, below the kernel's ephemeral range (the image's
+	// own default base, 33574, is inside it — VSTREAM-TEST-EPHEMERAL-PORT).
+	mysqlPortBase := vttestserver.ContainerPort(vttestserver.MySQLPort)
+	grpcPortBase := vttestserver.ContainerPort(vttestserver.GRPCPort)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
 	defer cancel()
@@ -137,7 +139,7 @@ func startVTTestServerKeyspaces(t *testing.T, keyspaces []string, numShards int)
 		Image:        "vitess/vttestserver:mysql80",
 		ExposedPorts: []string{mysqlPortBase, grpcPortBase},
 		Env: map[string]string{
-			"PORT":            fmt.Sprintf("%d", basePort),
+			"PORT":            strconv.Itoa(vttestserver.BasePort),
 			"KEYSPACES":       strings.Join(keyspaces, ","),
 			"NUM_SHARDS":      strings.Join(shards, ","),
 			"MYSQL_BIND_HOST": "0.0.0.0",
@@ -176,6 +178,10 @@ func startVTTestServerKeyspaces(t *testing.T, keyspaces []string, numShards int)
 		terminate()
 		t.Fatalf("mapped grpc port: %v", err)
 	}
+	if err := checkVTTestServerEphemeralRange(ctx, container); err != nil {
+		terminate()
+		t.Fatal(err)
+	}
 
 	mysqlDSN = fmt.Sprintf(
 		"root@tcp(%s:%d)/%s?parseTime=true&interpolateParams=true",
@@ -207,6 +213,26 @@ func startVTTestServerKeyspaces(t *testing.T, keyspaces []string, numShards int)
 	}
 
 	return mysqlDSN, grpcEndpoint, restartSource, terminate
+}
+
+// checkVTTestServerEphemeralRange reads the booted container's own ephemeral
+// port range and refuses if it overlaps the shared vttestserver layout — the
+// premise the layout's choice of base rests on (see internal/vttestserver).
+// The engines/mysql harness carries the same check; the two packages share
+// no test code.
+func checkVTTestServerEphemeralRange(ctx context.Context, container testcontainers.Container) error {
+	code, out, err := container.Exec(ctx, []string{"cat", "/proc/sys/net/ipv4/ip_local_port_range"}, tcexec.Multiplexed())
+	if err != nil {
+		return fmt.Errorf("read the vttestserver container's ip_local_port_range: %w", err)
+	}
+	b, err := io.ReadAll(out)
+	if err != nil {
+		return fmt.Errorf("read the vttestserver container's ip_local_port_range: %w", err)
+	}
+	if code != 0 {
+		return fmt.Errorf("read the vttestserver container's ip_local_port_range: exit %d: %s", code, b)
+	}
+	return vttestserver.CheckOutsideEphemeral(string(b))
 }
 
 func applySQL(t *testing.T, dsn, sqlText string) {
