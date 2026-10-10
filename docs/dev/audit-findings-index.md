@@ -65,8 +65,8 @@ Indexed 2026-10-10 when filed. Observed while pinning the Bug 300 fix (no audit 
 
 Indexed 2026-10-09 when filed. A single finding from the v0.157.0 release gate (no audit pass).
 
-- CI-STREAMER-SHARD-SPLIT filed
-- VSTREAM-TEST-EPHEMERAL-PORT filed
+- CI-STREAMER-SHARD-SPLIT filed; FIXED 2026-10-10 (crash matrix in its own shard + a test-name partition check in `check-shard-coverage.sh`)
+- VSTREAM-TEST-EPHEMERAL-PORT filed; FIXED 2026-10-10 (shared `internal/vttestserver` layout below 32768 + a tree-walk gate + a runtime premise check)
 
 ## 2026-09-22 — Gap census: object classes × stated capabilities × peer tools
 
