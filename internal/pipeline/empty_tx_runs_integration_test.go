@@ -177,7 +177,13 @@ func (e *emptyTxEnv) countPositionWrites(dsn string) func() int {
 				RETURN NULL;
 			END $$;
 			CREATE TRIGGER etx_count AFTER INSERT OR UPDATE ON sluice_cdc_state
-				FOR EACH ROW EXECUTE FUNCTION etx.count_write();`)
+				FOR EACH ROW EXECUTE FUNCTION etx.count_write();
+			-- ALWAYS, or the counter is blind: the applier writes its position
+			-- inside its apply transaction, which runs with
+			-- session_replication_role = replica (the Bug 164 FK bypass), and
+			-- an ordinary trigger does not fire under that role. Without this
+			-- the PG leg counted 0 writes against 900 delivered empty pairs.
+			ALTER TABLE sluice_cdc_state ENABLE ALWAYS TRIGGER etx_count;`)
 		return func() int {
 			n, _ := strconv.Atoi(sevQuery(t, "pgx", dsn, "SELECT COUNT(*) FROM etx.pos_writes"))
 			return n
@@ -465,6 +471,11 @@ type liveHeadRun struct {
 	filter   migcore.TableFilter
 	headOK   func(persisted string) bool // persisted position reaches the source head
 	readHead func()                      // snapshot the head, after the traffic
+	// upstreamPairs, when set, counts the empty transactions the source will
+	// deliver to the stopped stream, read from the source itself rather than
+	// through sluice's reader: the floor that proves there was a backlog of
+	// pairs for the stage to act on.
+	upstreamPairs func() int
 }
 
 func (r *liveHeadRun) streamer() *Streamer {
@@ -503,6 +514,13 @@ func (r *liveHeadRun) run(t *testing.T, k int) {
 	r.e.foreign(2 * foreignTxs) // the stream ends on a foreign-only run
 	r.readHead()
 	want = r.e.kdState(r.e.src)
+	if r.upstreamPairs != nil {
+		pairs := r.upstreamPairs()
+		t.Logf("%s: the source holds %d empty transactions for the stream", r.mode.name, pairs)
+		if pairs < 3*foreignTxs {
+			t.Fatalf("%s: the source holds only %d empty transactions for the stream, want at least %d: the leg would grade a backlog that does not exist", r.mode.name, pairs, 3*foreignTxs)
+		}
+	}
 
 	ctx2, cancel2 := context.WithCancel(context.Background())
 	defer cancel2()
@@ -523,6 +541,13 @@ func (r *liveHeadRun) run(t *testing.T, k int) {
 	cancel2()
 	run2.join()
 	t.Logf("%s: %d position writes up to the real transaction for %d foreign transactions; position reached the source head", r.mode.name, caughtUp, 3*foreignTxs)
+	// The real transaction cannot land without a position write, so zero
+	// means the counter saw nothing, not that the stage collapsed everything
+	// (the PG leg read 0 for exactly that reason before its trigger was made
+	// ALWAYS).
+	if caughtUp == 0 {
+		t.Fatalf("%s: the counter saw no position write up to the real transaction: it graded nothing", r.mode.name)
+	}
 	if caughtUp > foreignTxs {
 		t.Errorf("%s: %d position writes for %d foreign transactions; want at most %d (one per foreign transaction is Bug 300)", r.mode.name, caughtUp, 3*foreignTxs, foreignTxs)
 	}
@@ -673,6 +698,7 @@ func TestEmptyTxRuns_LiveSyncReachesSourceHead_Postgres14(t *testing.T) {
 		filter: migcore.TableFilter{Include: []string{"kd"}},
 	}
 	r.readHead = func() { head = sevQuery(t, "pgx", src, "SELECT pg_current_wal_lsn()::text") }
+	r.upstreamPairs = func() int { return peekEmptyPairs(t, src) }
 	r.headOK = func(pos string) bool {
 		var tok struct {
 			LSN string `json:"lsn"`
@@ -683,4 +709,42 @@ func TestEmptyTxRuns_LiveSyncReachesSourceHead_Postgres14(t *testing.T) {
 		return sevQuery(t, "pgx", src, fmt.Sprintf("SELECT ('%s'::pg_lsn >= '%s'::pg_lsn)::text", tok.LSN, head)) == "true"
 	}
 	r.run(t, 20)
+}
+
+// peekEmptyPairs counts the empty transactions (a pgoutput Begin immediately
+// followed by its Commit) that the source's one slot holds for its one
+// publication, without consuming them. It reads the slot through the server's
+// own pgoutput, not sluice's reader, so it is independent of the stream
+// under test. The stream must be stopped: an active slot cannot be peeked.
+func peekEmptyPairs(t *testing.T, dsn string) int {
+	t.Helper()
+	slot := sevQuery(t, "pgx", dsn, "SELECT slot_name FROM pg_replication_slots WHERE database = current_database()")
+	pub := sevQuery(t, "pgx", dsn, "SELECT pubname FROM pg_publication")
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	rows, err := db.QueryContext(context.Background(),
+		"SELECT get_byte(data, 0) FROM pg_logical_slot_peek_binary_changes($1, NULL, NULL, 'proto_version', '1', 'publication_names', $2)",
+		slot, pub)
+	if err != nil {
+		t.Fatalf("peek slot %s: %v", slot, err)
+	}
+	defer func() { _ = rows.Close() }()
+	pairs, prev := 0, 0
+	for rows.Next() {
+		var kind int
+		if err := rows.Scan(&kind); err != nil {
+			t.Fatal(err)
+		}
+		if prev == 'B' && kind == 'C' {
+			pairs++
+		}
+		prev = kind
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return pairs
 }
