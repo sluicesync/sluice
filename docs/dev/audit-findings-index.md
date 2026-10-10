@@ -59,6 +59,7 @@ other eighteen.
 Indexed 2026-10-09 when filed. A single finding from the v0.157.0 release gate (no audit pass).
 
 - CI-STREAMER-SHARD-SPLIT filed
+- VSTREAM-TEST-EPHEMERAL-PORT filed
 
 ## 2026-09-22 — Gap census: object classes × stated capabilities × peer tools
 
