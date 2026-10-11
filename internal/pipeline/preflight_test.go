@@ -108,6 +108,33 @@ func TestPreflightColdStart_SyncModeHint(t *testing.T) {
 	}
 }
 
+// TestRecoveryHintFor_SyncNamesBothColdStartRoutes pins that the sync-mode
+// hint is true on both routes into the populated-target refusal: a stream
+// with no cdc-state row, and the ADR-0022 slot-missing fall-through, where
+// the row exists but names a position the source cannot resume from (a
+// Postgres slot loss reaches the refusal deliberately, ADR-0075 Phase 2b).
+// The hint used to open with "no cdc-state row exists for this stream",
+// which is false on the second route and sent operators looking for a row
+// that was there.
+func TestRecoveryHintFor_SyncNamesBothColdStartRoutes(t *testing.T) {
+	hint := recoveryHintFor(preflightModeSync)
+	if strings.Contains(hint, "no cdc-state row exists") {
+		t.Errorf("sync-mode hint asserts the cdc-state row is absent, which is false after a slot loss "+
+			"(the row exists, its position is stale); got %q", hint)
+	}
+	for _, want := range []string{
+		"no cdc-state row",          // the never-persisted route
+		"can no longer resume from", // the stale-row route
+		"replication slot",          // what an operator should look at on a PG source
+		"--reset-target-data --yes", // the remedy both routes share
+		"wipe the target tables and any stale cdc-state row",
+	} {
+		if !strings.Contains(hint, want) {
+			t.Errorf("sync-mode hint is missing %q; got %q", want, hint)
+		}
+	}
+}
+
 // TestPreflightColdStart_RefusalCarriesCode pins the structured side
 // of the refusal (both preflight modes): the error carries the stable
 // SLUICE-E-COLDSTART-TARGET-NOT-EMPTY code, a mode-appropriate concise

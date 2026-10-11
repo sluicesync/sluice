@@ -431,7 +431,7 @@ With a `--control-keyspace` sidecar, qualify the table with that keyspace. Once 
 A continuous sync stores its CDC control tables on the target
 (`sluice_cdc_state`, `sluice_cdc_schema_history`,
 `sluice_shard_consolidation_lease`, `sluice_cdc_skipped_tables`,
-`sluice_cdc_query_timeout_raise`, `sluice_cdc_apply_marks`). A SHARDED Vitess/PlanetScale
+`sluice_cdc_query_timeout_raise`, `sluice_cdc_apply_marks`, `sluice_cdc_column_order`). A SHARDED Vitess/PlanetScale
 target keyspace requires a primary vindex on every table, which
 the control tables don't have — so a sync against a sharded
 target otherwise dies with `VT09001: table sluice_cdc_state does
@@ -898,6 +898,8 @@ The managed-MySQL sections below (DigitalOcean, AWS RDS, Google Cloud SQL, Azure
 | Defaults CDC-safe? | No | No | **Yes** (for gaps < 24 h) | **No — retention yes, but the row image silently loses UPDATEs** | **No — and unfixable** |
 
 sluice's `sync`/backup preflight advises per platform: unconditional WARNs on the DO and Vultr host patterns (the truth is API-only on DO and nonexistent on Vultr), a detect-then-read probe on RDS hosts (silent when correctly configured), and an in-band `@@version` fingerprint for Cloud SQL (silent at its safe defaults). Azure needs no retention advisory at all — its defaults hold binlogs — but carries the row-image trap instead (see its section). Details in each section.
+
+**Two more source settings since v0.158.0, neither measured on these platforms.** A binlog reader behind the head now decodes each row by the shape it was recorded under. Under MySQL's default `binlog_row_metadata=MINIMAL`, most schema changes of a streamed table between the reader and the head refuse rather than decode; `FULL` lets sluice decode across them by column name ([cdc-streaming](operator/cdc-streaming.md#mysql-family-binlog-sources-decoding-rows-behind-the-head-deferred-schema-change-sluice-e-cdc-binlog-lookahead-short)). Whether each platform lets you set `binlog_row_metadata`, and what it defaults to there, is not recorded here. To prove a shape without column names, the reader runs `SHOW BINLOG EVENTS`, which MySQL allows to an account with `REPLICATION SLAVE`, the grant CDC already needs. **UNVERIFIED PREMISE:** that each of these platforms permits `SHOW BINLOG EVENTS` to an account that can stream has not been measured. If one does not, the reader stops rather than decode unproven (with `SLUICE-E-CDC-REPLICATION-PERMISSION` when the server answers with access-denied error 1227).
 
 ## DigitalOcean Managed MySQL
 

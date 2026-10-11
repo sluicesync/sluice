@@ -151,8 +151,21 @@ func recoveryHintFor(mode preflightMode) string {
 		// Both recover via --reset-target-data. The slot-drop step
 		// applies to PG sources only (Vitess / MySQL don't expose
 		// it as a separate concept).
-		return "no cdc-state row exists for this stream, so warm-resume isn't possible either. " +
-			"Likely state after a previous sync cold-start exited before persisting a CDC position — either " +
+		//
+		// The hint is static, and the preflight is reached from two
+		// places: a stream with NO cdc-state row, and the ADR-0022
+		// slot-missing fall-through, where the row EXISTS but names a
+		// position the source can no longer serve. On a Postgres
+		// logical-slot source that fall-through deliberately does not
+		// force a re-copy onto the populated target (ADR-0075 Phase 2b,
+		// autoResnapshotReason), so this refusal is what the operator
+		// sees after losing the slot. The hint must therefore not claim
+		// the row is absent — it did, and sent operators looking for a
+		// row that was there (TestRecoveryHintFor_SyncNamesBothColdStartRoutes).
+		return "warm-resume isn't possible either: this stream has no cdc-state row, or its cdc-state row names a " +
+			"position the source can no longer resume from (for example a replication slot that was dropped or " +
+			"invalidated), which sends sync to a cold start. A missing row is the likely state after a previous sync " +
+			"cold-start exited before persisting a CDC position — either " +
 			"mid-bulk-copy or post-bulk-copy-pre-first-CDC-apply (GitHub #15, fixed in v0.40.1 for new runs). " +
 			"To recover: (a) re-run with `--reset-target-data --yes` to wipe the target tables and any stale " +
 			"cdc-state row [preferred] (on PG sources, if the interrupted run left its replication slot behind " +

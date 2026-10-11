@@ -97,6 +97,18 @@ Default N=100. Three drift shapes detected via merge-walk:
 - PK on target only → target has an extra row.
 - PK on both, hashes differ → row content drift.
 
+What it cannot detect: each side hashes its columns in its own
+declared order, so a target whose columns were swapped by name
+(a `RENAME COLUMN` swap that a sluice release before v0.158.0
+forwarded as no change) hashes the same as the source and reads
+clean. A sample also rarely reaches defects confined to the rows
+written before a schema change, such as the MySQL/MariaDB binlog
+mis-decode fixed in v0.158.0 (Bug 301). Sample mode is same-engine
+only, so a MariaDB → Postgres target holding the negative UNSIGNED
+values fixed in v0.158.0 (MARIADB-NOLOG-UNSIGNED) gets a count check
+at most. No verify depth clears a target exposed to any of these;
+see [production-readiness](production-readiness.md#known-limitations).
+
 Server-side hashing means we ship one query per table per side;
 no row data crosses the wire. Cheap. Statistical confidence
 follows the binomial: with N=100 samples per table, ~99% chance
