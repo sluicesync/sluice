@@ -169,8 +169,7 @@ func (r *SchemaReader) SampleRowHashes(ctx context.Context, table *ir.Table, col
 			return nil, fmt.Errorf("mysql: SampleRowHashes scan %s: %w", table.Name, err)
 		}
 		if !hash.Valid {
-			return nil, fmt.Errorf("mysql: SampleRowHashes %s: row %s: the row's hash input rendered NULL (a column's rendering came back NULL for a non-NULL value); refusing rather than hashing fewer columns",
-				table.Name, pk)
+			return nil, nullHashInputRefusal(table.Name, pk)
 		}
 		samples = append(samples, ir.SampledRowHash{PrimaryKey: pk, Hash: hash.String})
 	}
@@ -179,6 +178,21 @@ func (r *SchemaReader) SampleRowHashes(ctx context.Context, table *ir.Table, col
 	}
 	ir.SortSampledRowHashes(samples)
 	return samples, nil
+}
+
+// nullHashInputRefusal is the error for a sampled row whose hash input
+// came back NULL. With every value digested on its own, the one way a
+// real row gets there is [mysqlJSONTooLargeArm]: a JSON value larger than
+// max_allowed_packet, which MySQL 8 renders empty. So the message names
+// that cause and its remedy — re-run verify for this table against a
+// server whose max_allowed_packet exceeds the value — rather than leaving
+// the operator a refusal with no way forward. The packet limit is read
+// at connect time, so a raised GLOBAL value reaches verify's fresh
+// connections; on a managed server it is a platform setting.
+func nullHashInputRefusal(table, pk string) error {
+	return fmt.Errorf("mysql: SampleRowHashes %s: row %s: the row's hash input rendered NULL (a column's rendering came back NULL, or a JSON value's came back empty, for a non-NULL value — on MySQL 8 that is a JSON value larger than the server's max_allowed_packet); refusing rather than hashing fewer columns. "+
+		"Verify this table with a larger max_allowed_packet on this server (above its largest value, e.g. SET GLOBAL max_allowed_packet = 1073741824, which applies to new connections), then re-run: sluice verify --include-table %s",
+		table, pk, table)
 }
 
 // olapCount returns SELECT COUNT(*) FROM table executed under vtgate's

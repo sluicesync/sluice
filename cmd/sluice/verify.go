@@ -163,7 +163,13 @@ func verifyExitError(result *pipeline.VerifyResult) error {
 	s := result.Summary
 	switch {
 	case result.HasMismatch():
-		summary := fmt.Sprintf("%d table(s) with row-count mismatch", s.TablesMismatch)
+		// Name the mismatch kinds from the per-table verdicts: a sample-
+		// or column-mismatch with equal counts is not a row-count
+		// mismatch, and this line is the one a CI log shows (Bug 303).
+		summary := fmt.Sprintf("%d table(s) mismatched", s.TablesMismatch)
+		if kinds := result.MismatchKinds(); kinds != "" {
+			summary += " (" + kinds + ")"
+		}
 		if result.HasUnverified() {
 			summary += fmt.Sprintf("; %d table(s) could not be verified", s.TablesUnverified)
 		}

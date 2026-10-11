@@ -254,6 +254,30 @@ func (r *VerifyResult) HasMismatch() bool {
 	return r.Summary.TablesMismatch > 0
 }
 
+// mismatchKinds is the order [VerifyResult.MismatchKinds] names the
+// mismatch statuses in — the order [VerifyTableResult.verdict] tests them.
+var mismatchKinds = []string{"count-mismatch", "column-mismatch", "sample-mismatch"}
+
+// MismatchKinds names how the mismatched tables drifted: one "N kind"
+// per kind present, e.g. "1 column-mismatch, 1 sample-mismatch", or ""
+// when nothing mismatched. The kinds are each table's verdict — the same
+// word its [VerifyTableResult.Status] carries — so the CLI's closing line
+// names the drift the per-table rows report (Bug 303: it used to call
+// every kind a row-count mismatch).
+func (r *VerifyResult) MismatchKinds() string {
+	counts := make(map[string]int, len(mismatchKinds))
+	for i := range r.Tables {
+		counts[r.Tables[i].verdict()]++
+	}
+	var parts []string
+	for _, k := range mismatchKinds {
+		if counts[k] > 0 {
+			parts = append(parts, fmt.Sprintf("%d %s", counts[k], k))
+		}
+	}
+	return strings.Join(parts, ", ")
+}
+
 // HasUnverified reports whether any table could not be verified at
 // all (Bug 190). The CLI maps this to a non-zero exit — an incomplete
 // verification must never pass an rc-gated check. Deliberately

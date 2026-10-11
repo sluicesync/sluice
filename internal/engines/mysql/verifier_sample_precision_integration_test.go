@@ -141,10 +141,30 @@ func TestSampleRowHashes_ValueLargerThanMaxAllowedPacket(t *testing.T) {
 		for name, err := range map[string]error{"ja": errJA, "jb": errJB} {
 			if err == nil || !strings.Contains(err.Error(), "row 1:") {
 				t.Errorf("%s: %s: a JSON document larger than max_allowed_packet did not refuse naming the row: %v", algo, name, err)
+			} else if !strings.Contains(err.Error(), "Verify this table with a larger max_allowed_packet") ||
+				!strings.Contains(err.Error(), "--include-table "+name) {
+				t.Errorf("%s: %s: the refusal does not name its remedy (a larger max_allowed_packet for this table): %v", algo, name, err)
 			}
 		}
 		if errJA == nil && errJB == nil && len(ja) == 1 && len(jb) == 1 && ja[0].Hash == jb[0].Hash {
 			t.Errorf("%s: two different JSON documents larger than max_allowed_packet hash EQUAL — false clean", algo)
 		}
+	}
+
+	// The remedy the refusal names must work: with the packet limit raised
+	// above the documents, a fresh verifier hashes both JSON tables, and
+	// differently.
+	if _, err := admin.Exec("SET GLOBAL max_allowed_packet = ?", original); err != nil {
+		t.Fatalf("raise max_allowed_packet: %v", err)
+	}
+	raised, rtables := openSampleVerifier(t, ctx, dsn)
+	jplan := ir.SampleColumns{Key: []string{"id"}, Hashed: []string{"id", "j"}}
+	ja, errJA := raised.SampleRowHashes(ctx, rtables["ja"], jplan, 10, 1, ir.HashMD5)
+	jb, errJB := raised.SampleRowHashes(ctx, rtables["jb"], jplan, 10, 1, ir.HashMD5)
+	if errJA != nil || errJB != nil {
+		t.Fatalf("with max_allowed_packet raised to %d the JSON tables still refuse: %v / %v", original, errJA, errJB)
+	}
+	if len(ja) != 1 || len(jb) != 1 || ja[0].Hash == jb[0].Hash {
+		t.Errorf("with max_allowed_packet raised, two different JSON documents = %+v / %+v; want one row each, hashing differently", ja, jb)
 	}
 }

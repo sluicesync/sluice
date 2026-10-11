@@ -103,7 +103,17 @@ LIMIT <N>;
 In `--format json` every table carries a `status` — `ok`,
 `count-mismatch`, `column-mismatch`, `sample-mismatch` or `unverified` —
 which is the field to branch on: a column mismatch sets none of
-`count_mismatch`, `sample_mismatch` or `reason`.
+`count_mismatch`, `sample_mismatch` or `reason`. A failing run's
+closing line names the same kinds, e.g. `drift detected: 2 table(s)
+mismatched (1 column-mismatch, 1 sample-mismatch)` (through v0.158.1
+it called every kind a "row-count mismatch").
+
+On MySQL 8 a JSON document larger than the server's
+`max_allowed_packet` renders as an empty string, so its token is the
+NULL that refuses the table (`unverified`, naming the row) rather than
+a hash every such document would share. The message names the remedy:
+verify that table again (`--include-table`) against a server whose
+`max_allowed_packet` exceeds the value.
 
 Default N=100. Four drift shapes detected:
 

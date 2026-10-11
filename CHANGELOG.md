@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Fixed
+
+**A failing `sluice verify` now names the kinds of drift it found instead of calling every one a row-count mismatch (LOW, a message; Bug 303).** Since v0.12.0 the closing line read `drift detected: N table(s) with row-count mismatch` whatever failed the run, so a `SAMPLE-MISMATCH` or `COLUMN-MISMATCH` whose counts matched ended with a line naming the one kind of drift that did not happen. It now counts each mismatched table's verdict — the same word as its JSON `status` — e.g. `drift detected: 2 table(s) mismatched (1 column-mismatch, 1 sample-mismatch)`. The per-table rows and the exit codes (1 on drift, 2 when a table could not be verified) are unchanged; a CI step that greps for the old wording needs the new one.
+
+**MySQL 8 sample verify's refusal for a JSON value past `max_allowed_packet` now names the remedy (LOW, a message).** v0.158.1 made such a value refuse its table (MySQL renders it as an empty string, which every oversized document would share) with a message that named the row but not a way forward. It now says the likely cause and to verify that table again with a larger `max_allowed_packet` on that server (`SET GLOBAL max_allowed_packet = …`, which reaches new connections, then `sluice verify --include-table <table>`).
+
 ## [0.158.1] - 2026-10-11
 
 ### Fixed
