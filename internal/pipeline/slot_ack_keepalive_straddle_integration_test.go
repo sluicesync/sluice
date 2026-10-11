@@ -259,13 +259,19 @@ func TestStreamer_PostgresKeepaliveBoundaryStraddle_OpenTxnSurvivesResume(t *tes
 					time.Sleep(time.Second)
 				}
 				restart := straddleRestartLSN(t, srcDB, slot)
-				t.Logf("window open after %s: T first record >= %s, T written to %s; persisted %s, confirmed %s, restart_lsn %s",
-					time.Since(openAt).Round(time.Second), tFirst, tWritten, persisted, conf, restart)
 				// The premise the window rests on, observed: the server holds
-				// the slot's restart point at or below T's first record.
-				if restart > tFirst {
-					t.Fatalf("restart_lsn %s is past T's first record (>= %s) while T is open — the server no longer "+
-						"holds T's beginning for a resume", restart, tFirst)
+				// the slot's restart point at or below T's first record. That
+				// record is read from the WAL itself, not bounded: tFirst is
+				// only a LOWER bound, and a RUNNING_XACTS record written between
+				// it and T's first write is a legitimate restart point above it
+				// (measured: the 2026-10-11 lanes_crash_spill red, reproduced by
+				// forcing pg_log_standby_snapshot() into that gap).
+				first := straddleFirstRecordLSN(t, srcDB, tFirst, tWritten, tXid)
+				t.Logf("window open after %s: T first record %s (read from >= %s), T written to %s; persisted %s, confirmed %s, restart_lsn %s",
+					time.Since(openAt).Round(time.Second), first, tFirst, tWritten, persisted, conf, restart)
+				if restart > first {
+					t.Fatalf("restart_lsn %s is past T's first record %s while T is open — the server no longer "+
+						"holds T's beginning for a resume", restart, first)
 				}
 				// The spill shape, observed on T itself: its spill files in the
 				// slot's directory while it is open and the boundary is past it.
@@ -519,6 +525,39 @@ func straddleRestartLSN(t *testing.T, dsn, slot string) pglogrepl.LSN {
 	lsn, err := pglogrepl.ParseLSN(s)
 	if err != nil {
 		t.Fatalf("parse restart_lsn %q: %v", s, err)
+	}
+	return lsn
+}
+
+// straddleFirstRecordLSN reads, from the WAL (pg_walinspect), the start of
+// the first record carrying xid in [from, to) — the record logical decoding
+// first sees for the transaction, which is what the slot's restart_lsn must
+// not pass while it is open. It fails rather than return a bound when no
+// such record is found: a premise check against a guess is no check.
+func straddleFirstRecordLSN(t *testing.T, dsn string, from, to pglogrepl.LSN, xid int64) pglogrepl.LSN {
+	t.Helper()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := db.Exec("CREATE EXTENSION IF NOT EXISTS pg_walinspect"); err != nil {
+		t.Fatalf("create pg_walinspect: %v", err)
+	}
+	var s sql.NullString
+	if err := db.QueryRow(
+		"SELECT min(start_lsn)::text FROM pg_get_wal_records_info($1::pg_lsn, $2::pg_lsn) WHERE xid = $3::text::xid",
+		from.String(), to.String(), xid,
+	).Scan(&s); err != nil {
+		t.Fatalf("read T's first record: %v", err)
+	}
+	if !s.Valid {
+		t.Fatalf("anti-vacuity: no WAL record for xid %d in [%s, %s) — T's first record is unknown, so the premise "+
+			"cannot be graded", xid, from, to)
+	}
+	lsn, err := pglogrepl.ParseLSN(s.String)
+	if err != nil {
+		t.Fatalf("parse T's first record %q: %v", s.String, err)
 	}
 	return lsn
 }
