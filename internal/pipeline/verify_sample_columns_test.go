@@ -177,6 +177,12 @@ func TestVerifier_Run_SampleMode_MissingColumnIsAMismatch(t *testing.T) {
 	if len(seen) != 0 {
 		t.Errorf("rows were sampled for a table missing columns: %+v", seen)
 	}
+	// Neither count_mismatch, sample_mismatch nor reason says so; the
+	// status field must, or a JSON consumer reads the table as clean.
+	if tr.Status != "column-mismatch" || tr.CountMismatch || tr.SampleMismatch != 0 || tr.Reason != "" {
+		t.Errorf("status = %q (count=%v sample=%d reason=%q); want column-mismatch carried by status alone",
+			tr.Status, tr.CountMismatch, tr.SampleMismatch, tr.Reason)
+	}
 	out := buf.String()
 	for _, want := range []string{"COLUMN-MISMATCH", "column(s) missing on target: c", "column(s) on target only (informational; not hashed): d"} {
 		if !strings.Contains(out, want) {
@@ -224,5 +230,21 @@ func TestVerifier_Run_SampleMode_ExtraColumnIsInformational(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "on target only (informational; not hashed): shard") {
 		t.Errorf("text output lacks the extra-column note:\n%s", buf.String())
+	}
+}
+
+// TestVerifyTableResult_StatusCoversEveryVerdict pins the JSON status
+// field: one word per verdict, so no failure class reads as "ok".
+func TestVerifyTableResult_StatusCoversEveryVerdict(t *testing.T) {
+	for want, tr := range map[string]VerifyTableResult{
+		"ok":              {},
+		"unverified":      {Reason: "table not present on target", CountMismatch: true},
+		"count-mismatch":  {CountMismatch: true, SampleMismatch: 3},
+		"column-mismatch": {ColumnsMissingOnTarget: []string{"c"}},
+		"sample-mismatch": {SampleMismatch: 1},
+	} {
+		if got := tr.verdict(); got != want {
+			t.Errorf("verdict(%+v) = %q; want %q", tr, got, want)
+		}
 	}
 }

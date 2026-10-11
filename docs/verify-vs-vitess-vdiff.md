@@ -87,13 +87,23 @@ tables.
 -- both sides, and the source's primary key identifies the rows.
 SELECT
   <pk_expr> AS pk,
-  MD5(CONCAT_WS('|', <token(a)>, <token(b)>, ...)) AS hash
+  MD5(<token(a)> || '|' || <token(b)> || ...) AS hash
 FROM <table>
 ORDER BY MD5(<pk_expr> || '<seed>')
 LIMIT <N>;
--- token(col): 'N' for NULL, else 'V' || length || ':' || col::text
--- (MySQL: binary-family columns are digested from their bytes)
+-- token(col): 'N' for NULL, else
+--   Postgres: 'V' || length || ':' || col::text, under pinned
+--             DateStyle/IntervalStyle/TimeZone/bytea_output/
+--             extra_float_digits
+--   MySQL:    'V' || MD5(exact text) — FLOAT via (col * 1E0) — or
+--             'X' || MD5(bytes) for the binary families
+-- A token that still came back NULL nulls the row and refuses the table.
 ```
+
+In `--format json` every table carries a `status` — `ok`,
+`count-mismatch`, `column-mismatch`, `sample-mismatch` or `unverified` —
+which is the field to branch on: a column mismatch sets none of
+`count_mismatch`, `sample_mismatch` or `reason`.
 
 Default N=100. Four drift shapes detected:
 
@@ -114,11 +124,17 @@ a mismatch on every row. A swap now mismatches every sampled row it
 touches. A RENAME swap leaves every row written before it (and not
 rewritten since) swapped, so when those rows are a fraction f of the
 table a sample of N misses all of them with probability (1−f)^N —
-about 3×10⁻⁵ at f = 10% and the default N = 100. The same fix made each value's
-rendering unambiguous: NULL and an empty string, a value containing
-the `|` separator, and MySQL binary data (a utf8mb4 cast turns any
-`GEOMETRY`, `BIT` or binary value that is not valid UTF-8 into NULL,
-so any two of them hashed alike) all hash distinctly now.
+about 3×10⁻⁵ at f = 10% and the default N = 100. The same fix closed
+the rendering's own blind spots, each pinned per type family on real
+servers: NULL against an empty string; a value containing the `|`
+separator; MySQL binary data (a utf8mb4 cast turns any `GEOMETRY`,
+`BIT` or binary value that is not valid UTF-8 into NULL — MariaDB into
+`?`); a MySQL/MariaDB `FLOAT`, which `CAST` prints at 6 significant
+digits; and Postgres endpoints whose session defaults differ
+(`DateStyle` `SQL, MDY` against `SQL, DMY` read a day/month-swapped
+date as clean). MySQL tokens are fixed-width digests because MySQL's
+`CONCAT` silently returns NULL past `max_allowed_packet`: a large value
+hashes, and two different ones differ.
 
 What it still cannot detect: a sample samples, so a defect confined
 to a few rows — such as the MySQL/MariaDB binlog mis-decode fixed in

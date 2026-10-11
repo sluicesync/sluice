@@ -40,6 +40,8 @@ var pgSampleFamilies = []pgSampleFamily{
 	{"bi", "bigint", "9223372036854775807", "9223372036854775806"},
 	{"num", "numeric(10,2)", "1.50", "1.51"},
 	{"f4", "real", "1.5", "1.25"},
+	{"f4p", "real", "1234567", "1234568"}, // the MySQL FLOAT precision class, as a guard
+
 	{"f8", "double precision", "0.1", "0.2"},
 	{"bo", "boolean", "true", "false"},
 	{"ch", "char(5)", "'ab'", "'ac'"},

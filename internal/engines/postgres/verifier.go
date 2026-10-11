@@ -8,7 +8,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
@@ -72,7 +71,7 @@ func (r *SchemaReader) ExactRowCount(ctx context.Context, table *ir.Table) (int6
 // so the operator knows which tables verify only by count.
 //
 // Hash strategy: MD5 (default) or SHA-256 (operator opt-in via
-// --strict-hash, v0.14.2+) of CONCAT_WS('|', <token>, ...) over the
+// --strict-hash, v0.14.2+) of <token> || '|' || <token> ... over the
 // columns cols names, read by name in the order cols fixes — never in
 // the table's declared order (VERIFY-SAMPLE-COLUMN-ORDER,
 // [ir.SampleColumns]). Each token is [pgSampleToken]'s injective
@@ -112,9 +111,11 @@ func (r *SchemaReader) SampleRowHashes(ctx context.Context, table *ir.Table, col
 		keys[i] = quoteIdent(c) + "::text"
 	}
 	pkExpr := strings.Join(keys, ` || '|' || `)
-	// No NULL reaches CONCAT_WS (whose NULL-skipping is what made NULL
-	// and '' collide before): every token renders NULL as 'N'.
-	concatExpr := "pg_catalog.CONCAT_WS('|', " + strings.Join(tokens, ", ") + ")"
+	// `||`, not CONCAT_WS: CONCAT_WS SKIPS a NULL argument, so a token that
+	// went NULL would silently drop out of the hash. No token is meant to —
+	// NULL renders 'N' — so `||` makes one that did null the whole hash,
+	// which the scan below refuses naming the row.
+	concatExpr := "(" + strings.Join(tokens, ` || '|' || `) + ")"
 	var hashExpr string
 	switch algo {
 	case ir.HashSHA256:
@@ -129,8 +130,13 @@ func (r *SchemaReader) SampleRowHashes(ctx context.Context, table *ir.Table, col
 		// higher-assurance mode), and a value carrying '\x' mid-string —
 		// any bytea column, rendered '\xff00' — failed the whole table
 		// with "invalid input syntax for type bytea". convert_to takes
-		// the characters as they are.
-		hashExpr = "pg_catalog.ENCODE(pg_catalog.SHA256(pg_catalog.CONVERT_TO(" + concatExpr + ", 'UTF8')), 'hex')"
+		// the characters as they are — converted to the database's OWN
+		// encoding, which is the identity: a fixed 'UTF8' refuses a
+		// SQL_ASCII database holding bytes that are not valid UTF-8
+		// ("invalid byte sequence"), where MD5, which hashes the text's
+		// bytes as stored, does not.
+		hashExpr = "pg_catalog.ENCODE(pg_catalog.SHA256(pg_catalog.CONVERT_TO(" + concatExpr +
+			", pg_catalog.current_setting('server_encoding'))), 'hex')"
 	default:
 		hashExpr = "pg_catalog.MD5(" + concatExpr + ")"
 	}
@@ -153,7 +159,8 @@ func (r *SchemaReader) SampleRowHashes(ctx context.Context, table *ir.Table, col
 	// a false mismatch — and, worse, a source at efd=0 renders a true
 	// value identically to a target holding its rounded corruption — a
 	// false clean. Pin the query's session to 3 (shortest-exact on every
-	// version) so both sides hash canonical renderings.
+	// version) so both sides hash canonical renderings — along with every
+	// other setting that changes a value's text ([sampleSessionPins]).
 	//
 	// The pin rides an explicit transaction as a SET LOCAL (the F1
 	// review finding): a statement-level SET is required (poolers strip
@@ -168,8 +175,10 @@ func (r *SchemaReader) SampleRowHashes(ctx context.Context, table *ir.Table, col
 		return nil, fmt.Errorf("postgres: SampleRowHashes %s.%s: begin: %w", r.schema, table.Name, err)
 	}
 	defer func() { _ = tx.Rollback() }() // no-op after Commit
-	if _, err := tx.ExecContext(ctx, "SET LOCAL extra_float_digits = 3"); err != nil {
-		return nil, fmt.Errorf("postgres: SampleRowHashes %s.%s: pin extra_float_digits: %w", r.schema, table.Name, err)
+	for _, pin := range sampleSessionPins {
+		if _, err := tx.ExecContext(ctx, pin); err != nil {
+			return nil, fmt.Errorf("postgres: SampleRowHashes %s.%s: %s: %w", r.schema, table.Name, pin, err)
+		}
 	}
 	rows, err := tx.QueryContext(ctx, q)
 	if err != nil {
@@ -179,17 +188,47 @@ func (r *SchemaReader) SampleRowHashes(ctx context.Context, table *ir.Table, col
 
 	var samples []ir.SampledRowHash
 	for rows.Next() {
-		var pk, hash string
+		var pk string
+		var hash sql.NullString
 		if err := rows.Scan(&pk, &hash); err != nil {
 			return nil, fmt.Errorf("postgres: SampleRowHashes scan %s.%s: %w", r.schema, table.Name, err)
 		}
-		samples = append(samples, ir.SampledRowHash{PrimaryKey: pk, Hash: hash})
+		if !hash.Valid {
+			return nil, fmt.Errorf("postgres: SampleRowHashes %s.%s: row %s: a column rendered NULL for a non-NULL value; refusing rather than hashing fewer columns",
+				r.schema, table.Name, pk)
+		}
+		samples = append(samples, ir.SampledRowHash{PrimaryKey: pk, Hash: hash.String})
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("postgres: SampleRowHashes rows %s.%s: %w", r.schema, table.Name, err)
 	}
-	sort.Slice(samples, func(i, j int) bool { return samples[i].PrimaryKey < samples[j].PrimaryKey })
+	ir.SortSampledRowHashes(samples)
 	return samples, nil
+}
+
+// sampleSessionPins fix every session setting that changes how a value
+// renders as text, so the two endpoints of a comparison render the same
+// stored value identically. Each one inherited unpinned is a false
+// MISMATCH between endpoints whose defaults differ — and, for the first
+// two, a false CLEAN:
+//
+//   - extra_float_digits (Bug 194): at 0 a true float and its rounded
+//     corruption render identically.
+//   - DateStyle: `SQL, MDY` on one side and `SQL, DMY` on the other render
+//     2024-01-02 and 2024-02-01 both as 01/02/2024 — a day/month swap
+//     reads clean.
+//   - IntervalStyle, TimeZone (timestamptz renders in the session zone),
+//     bytea_output (hex vs escape): false mismatches only. bytea_output
+//     is also pinned per connection ([afterConnectSessionPins]); the
+//     SET LOCAL is what holds under transaction-mode pooling.
+//
+// SET LOCAL inside the hash transaction, for the pooler reason above.
+var sampleSessionPins = []string{
+	"SET LOCAL extra_float_digits = 3",
+	"SET LOCAL DateStyle = 'ISO, YMD'",
+	"SET LOCAL IntervalStyle = 'postgres'",
+	"SET LOCAL TimeZone = 'UTC'",
+	"SET LOCAL bytea_output = 'hex'",
 }
 
 // sampleColumnNames checks every name against t's columns and returns

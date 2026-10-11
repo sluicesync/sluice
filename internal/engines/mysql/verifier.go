@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"sort"
 	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
@@ -143,9 +142,11 @@ func (r *SchemaReader) SampleRowHashes(ctx context.Context, table *ir.Table, col
 	if len(keys) > 1 {
 		pkSelect = "CONCAT_WS('|', " + strings.Join(keys, ", ") + ")"
 	}
-	// No NULL reaches CONCAT_WS (whose NULL-skipping is what made NULL
-	// and '' collide before): every token renders NULL as 'N'.
-	concatExpr := "CONCAT_WS('|', " + strings.Join(tokens, ", ") + ")"
+	// CONCAT, not CONCAT_WS: CONCAT_WS SKIPS a NULL argument, so a token
+	// that went NULL would silently drop out of the hash. No token is
+	// meant to — NULL renders 'N' — so CONCAT makes one that did null the
+	// whole hash, which the scan below refuses naming the row.
+	concatExpr := "CONCAT(" + strings.Join(tokens, ", '|', ") + ")"
 	hashExpr := mysqlDigest(concatExpr, algo)
 	q := fmt.Sprintf(
 		"SELECT %s AS pk, %s AS hash FROM %s%s ORDER BY MD5(CONCAT(%s, '%d')) LIMIT %d",
@@ -162,16 +163,21 @@ func (r *SchemaReader) SampleRowHashes(ctx context.Context, table *ir.Table, col
 
 	var samples []ir.SampledRowHash
 	for rows.Next() {
-		var pk, hash string
+		var pk string
+		var hash sql.NullString
 		if err := rows.Scan(&pk, &hash); err != nil {
 			return nil, fmt.Errorf("mysql: SampleRowHashes scan %s: %w", table.Name, err)
 		}
-		samples = append(samples, ir.SampledRowHash{PrimaryKey: pk, Hash: hash})
+		if !hash.Valid {
+			return nil, fmt.Errorf("mysql: SampleRowHashes %s: row %s: the row's hash input rendered NULL (a column's rendering came back NULL for a non-NULL value); refusing rather than hashing fewer columns",
+				table.Name, pk)
+		}
+		samples = append(samples, ir.SampledRowHash{PrimaryKey: pk, Hash: hash.String})
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("mysql: SampleRowHashes rows %s: %w", table.Name, err)
 	}
-	sort.Slice(samples, func(i, j int) bool { return samples[i].PrimaryKey < samples[j].PrimaryKey })
+	ir.SortSampledRowHashes(samples)
 	return samples, nil
 }
 
@@ -321,49 +327,77 @@ func sampleColumnsOf(t *ir.Table, names []string) ([]*ir.Column, error) {
 }
 
 // mysqlSampleToken renders one column's value for the sample-mode row
-// hash. The rendering is INJECTIVE, which the old one — each column
-// cast to CHAR with NULL replaced by the empty string, joined by '|' —
-// was not, in three ways each of which hashed a corrupted target clean:
+// hash: 'N' for NULL, else a one-letter tag and a fixed-width digest of
+// the value. The old rendering — each column cast to CHAR with NULL
+// replaced by the empty string, joined by '|' — read a corrupted target
+// as clean in four ways, each now closed:
 //
 //   - NULL and the empty string rendered alike. Now NULL is 'N' and
-//     every value is 'V' or 'X'-prefixed.
+//     every value is 'V'- or 'X'-tagged.
 //   - A value could borrow its neighbour's separator ('a|' + 'b' against
-//     'a' + '|b'). Now every text value carries its character length.
+//     'a' + '|b'). A fixed-width digest per column cannot.
 //   - Binary data was not rendered at all. Under the utf8mb4 connection
-//     charset sluice always uses, CAST(<bytes> AS CHAR) is NULL — with
-//     only a warning — for any byte sequence that is not valid UTF-8:
-//     measured on 8.0 for GEOMETRY POINT(1 2) (a WKB double is rarely
-//     valid UTF-8), BIT(8) b'11111111' and VARBINARY 0x61FF62. Each
-//     then rendered as the empty string, so any two such values hashed
-//     equal. The binary family ([mysqlSampleBinary]) is now digested
-//     from its raw bytes, and any OTHER column whose cast still comes
-//     back NULL takes the same byte digest rather than collapsing — the
-//     per-row CASE makes that fallback version- and charset-independent.
+//     charset sluice always uses, MySQL's CAST(<bytes> AS CHAR) is NULL —
+//     with only a warning — for any byte sequence that is not valid
+//     UTF-8: measured on 8.0 for GEOMETRY POINT(1 2) (a WKB double is
+//     rarely valid UTF-8), BIT(8) b'11111111' and VARBINARY 0x61FF62. Each
+//     rendered as the empty string, so any two such values hashed equal.
+//     The binary family ([mysqlSampleBinary]) is now digested from its raw
+//     bytes ('X'). That type dispatch is what the guarantee rests on:
+//     MariaDB's CAST does not return NULL there but substitutes '?' (11.4:
+//     0x61FF62 → 'a?b'), so for a binary value mis-typed as text the
+//     per-row CAST-is-NULL fallback below is a MySQL-only backstop, not a
+//     guarantee. Bytes declared as text (CHARACTER SET binary) map to the
+//     binary family and are pinned on both servers.
+//   - FLOAT was rendered at 6 significant digits (see [mysqlSampleText]).
 //
-// The per-column digest keeps a large BLOB's contribution fixed-width,
-// so the row's CONCAT stays well under max_allowed_packet.
+// Each value is digested on its own, and that is load-bearing, not
+// tidiness: MySQL's CONCAT returns NULL — warning 1301, nothing louder —
+// when its result would exceed max_allowed_packet, so a length-prefixed
+// text token for a large value went NULL, CONCAT_WS skipped it, and two
+// different LONGTEXT values hashed equal. A digest is 32 or 64 hex
+// characters whatever the value's size.
 func mysqlSampleToken(c *ir.Column, algo ir.HashAlgorithm) string {
 	q := quoteIdent(c.Name)
 	bytesDigest := "CONCAT('X', " + mysqlDigest(q, algo) + ")"
 	if mysqlSampleBinary(c.Type) {
 		return fmt.Sprintf("IF(%s IS NULL, 'N', %s)", q, bytesDigest)
 	}
-	text := fmt.Sprintf("CAST(%s AS CHAR)", q)
-	return fmt.Sprintf("CASE WHEN %s IS NULL THEN 'N' WHEN %s IS NULL THEN %s ELSE CONCAT('V', CHAR_LENGTH(%s), ':', %s) END",
-		q, text, bytesDigest, text, text)
+	text := mysqlSampleText(c)
+	return fmt.Sprintf("CASE WHEN %s IS NULL THEN 'N' WHEN %s IS NULL THEN %s ELSE CONCAT('V', %s) END",
+		q, text, bytesDigest, mysqlDigest(text, algo))
+}
+
+// mysqlSampleText is the exact text rendering of a non-binary column.
+//
+// Single-precision FLOAT is read through `(col * 1E0)`: MySQL and MariaDB
+// do NOT round-trip FLOAT in CAST(… AS CHAR) — they print 6 significant
+// digits, so 1234567 and 1234568 both render 1234570 and 0.1234567 and
+// 0.1234568 both render 0.123457, and a sample hash over that rendering
+// reads a corrupted FLOAT as clean. The promotion to DOUBLE is exact and
+// DOUBLE prints shortest-round-trip. `* 1E0`, not `+ 0E0`: addition loses
+// the sign of a negative zero. Same expression, for the same reason, as
+// the row reader's [selectColumnExpr].
+func mysqlSampleText(c *ir.Column) string {
+	q := quoteIdent(c.Name)
+	if f, ok := ir.UnwrapDomain(c.Type).(ir.Float); ok && f.Precision == ir.FloatSingle {
+		return "CAST((" + q + " * 1E0) AS CHAR)"
+	}
+	return "CAST(" + q + " AS CHAR)"
 }
 
 // mysqlSampleKeyText renders one key column for the sampled row's key
 // string — readable text where the value has one (it is what the
 // mismatch report prints), the bytes in hex where it does not (a
 // BINARY(16) UUID key cast to utf8mb4 is NULL for most values, which
-// would collapse distinct keys into one).
+// would collapse distinct keys into one). A FLOAT key goes through the
+// same exact rendering as a FLOAT value; at 6 digits two keys collapse.
 func mysqlSampleKeyText(c *ir.Column) string {
 	q := quoteIdent(c.Name)
 	if mysqlSampleBinary(c.Type) {
 		return "HEX(" + q + ")"
 	}
-	return fmt.Sprintf("COALESCE(CAST(%s AS CHAR), HEX(%s))", q, q)
+	return fmt.Sprintf("COALESCE(%s, HEX(%s))", mysqlSampleText(c), q)
 }
 
 // mysqlSampleBinary reports the column families whose values are bytes

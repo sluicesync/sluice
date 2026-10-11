@@ -3,7 +3,10 @@
 
 package ir
 
-import "context"
+import (
+	"context"
+	"sort"
+)
 
 // Verifier is the optional engine-side surface for data-integrity
 // verification. The `sluice verify` command (proto-ADR
@@ -80,9 +83,9 @@ type SampleVerifier interface {
 	// digest. Both source and target sides MUST be called with the
 	// same algo or the comparison is meaningless.
 	//
-	// Result ordering: sorted by primary key (lexicographically on
-	// the PrimaryKey string). Both sides return the same order so
-	// the orchestrator can do an O(n) comparison.
+	// Result ordering: [SortSampledRowHashes] — by the PrimaryKey
+	// string, then by hash. Both sides return the same order so the
+	// orchestrator can do an O(n) comparison.
 	//
 	// Returns an empty slice for an empty table (not an error).
 	// Returns an error when cols names no key column (sample mode
@@ -106,10 +109,12 @@ type SampleVerifier interface {
 // same values under the same names, declared in a different order)
 // from reporting a false mismatch.
 //
-// Each column is also rendered INJECTIVELY (NULL distinct from the
-// empty string, a length prefix so no value can borrow a neighbour's
-// separator, bytes rather than a failed text cast for binary data) —
-// see each engine's SampleRowHashes for the rendering it uses.
+// Each column is also rendered so that distinct values stay distinct:
+// NULL apart from the empty string, no value able to borrow a
+// neighbour's separator, binary data from its bytes rather than a failed
+// text cast, numbers at full precision, and no value dropping out of the
+// hash for being large — see each engine's SampleRowHashes for the
+// rendering it uses and the pins that hold it.
 type SampleColumns struct {
 	// Key names the row-identity columns, in key order: the SOURCE
 	// table's primary key. The target is sampled by the same names, so
@@ -171,4 +176,21 @@ func (a HashAlgorithm) String() string {
 type SampledRowHash struct {
 	PrimaryKey string
 	Hash       string
+}
+
+// SortSampledRowHashes puts samples in the order [SampleVerifier]
+// promises: by key, and by hash among equal keys. Two DISTINCT keys can
+// render the same key string (a composite key whose values contain the
+// '|' join), and ordering only by key would leave such rows in whatever
+// order each server returned them, pairing them arbitrarily across the
+// two sides. Breaking the tie on the hash makes the pairing
+// deterministic, so equal data on both sides always pairs up equal. The
+// collision itself can only ever cost a false mismatch, never a clean.
+func SortSampledRowHashes(samples []SampledRowHash) {
+	sort.Slice(samples, func(i, j int) bool {
+		if samples[i].PrimaryKey != samples[j].PrimaryKey {
+			return samples[i].PrimaryKey < samples[j].PrimaryKey
+		}
+		return samples[i].Hash < samples[j].Hash
+	})
 }

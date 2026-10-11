@@ -154,10 +154,19 @@ type VerifyResult struct {
 
 // VerifyTableResult is the per-table outcome.
 type VerifyTableResult struct {
-	Name           string `json:"name"`
-	SourceRowCount int64  `json:"source_row_count"`
-	TargetRowCount int64  `json:"target_row_count"`
-	CountMismatch  bool   `json:"count_mismatch"`
+	Name string `json:"name"`
+	// Status is the table's verdict, one word a JSON consumer can branch
+	// on without re-deriving it from the fields below: "ok",
+	// "count-mismatch", "column-mismatch", "sample-mismatch" or
+	// "unverified". It exists because the verdicts do not all live in one
+	// field — a column-mismatch table has count_mismatch false, no
+	// sample_mismatch and no reason, and reading only those would take it
+	// for clean. See [VerifyTableResult.verdict].
+	Status string `json:"status"`
+
+	SourceRowCount int64 `json:"source_row_count"`
+	TargetRowCount int64 `json:"target_row_count"`
+	CountMismatch  bool  `json:"count_mismatch"`
 	// SampleSize is the number of rows actually sampled (may be
 	// less than the requested SampleRowsPerTable on small tables).
 	// Zero when Depth != sample.
@@ -219,6 +228,24 @@ type VerifySummary struct {
 	// existing `sluice schema diff` is the right tool when they are
 	// drift; verify keeps its lane focused on row-data concerns.
 	TablesExtraOnTarget int `json:"tables_extra_on_target,omitempty"`
+}
+
+// verdict is the table's [VerifyTableResult.Status]: unverified first
+// (nothing else was established), then the mismatch kinds in the order
+// the text report names them.
+func (t *VerifyTableResult) verdict() string {
+	switch {
+	case t.Reason != "":
+		return "unverified"
+	case t.CountMismatch:
+		return "count-mismatch"
+	case len(t.ColumnsMissingOnTarget) > 0:
+		return "column-mismatch"
+	case t.SampleMismatch > 0:
+		return "sample-mismatch"
+	default:
+		return "ok"
+	}
 }
 
 // HasMismatch reports whether any table failed verification. Used by
@@ -416,6 +443,9 @@ func (v *Verifier) Run(ctx context.Context) (*VerifyResult, error) {
 		default:
 			result.Summary.TablesClean++
 		}
+	}
+	for i := range result.Tables {
+		result.Tables[i].Status = result.Tables[i].verdict()
 	}
 	result.Summary.TablesChecked = len(result.Tables)
 	sink.PhaseCompleted(verifyPhaseCompare)

@@ -23,6 +23,23 @@
 // GEOMETRY, BIT(8) 0xFF, and invalid-UTF-8 VARBINARY/BINARY/BLOB values
 // all rendered '' and any two of them hashed equal. `fb` drives the CAST
 // fallback directly by declaring a VARBINARY column to the hash as TEXT.
+//
+// The FLOAT rows pin the precision class: MySQL and MariaDB render a
+// single-precision FLOAT through CAST(… AS CHAR) at 6 significant digits
+// (1234567 and 1234568 both print as 1234570), so the token reads it
+// through `(col * 1E0)` — a lossless promotion to DOUBLE, which prints
+// shortest-round-trip — exactly as the row reader does. `fz` is the
+// negative zero `* 1E0` keeps and `+ 0E0` would lose; `dp` holds DOUBLE to
+// its last bit.
+//
+// The same matrix runs on MariaDB 11.4, minus two rows that are about the
+// server rather than sluice: MariaDB stores a FLOAT -0 as 0 (so `fz` has
+// nothing to corrupt), and its CAST of invalid UTF-8 substitutes '?'
+// rather than returning NULL, so the CAST-is-NULL fallback `fb` drives is
+// a MySQL-only backstop — on MariaDB the guarantee rests on the type
+// mapping digesting every binary family, which the `vcb`/`tbin` rows (a
+// CHARACTER SET binary VARCHAR and TEXT, i.e. bytes declared as text)
+// hold to account.
 
 package mysql
 
@@ -33,39 +50,48 @@ import (
 	"testing"
 	"time"
 
+	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
 )
 
 // sampleFamily is one column of the matrix: its DDL type, the value every
 // row holds, and the value the corrupted twin holds on that family's row.
+// mysqlOnly marks a row that is about a MySQL server behaviour (above).
 type sampleFamily struct {
 	col, ddl, base, corrupt string
+	mysqlOnly               bool
 }
 
 var mysqlSampleFamilies = []sampleFamily{
-	{"i", "INT", "7", "8"},
-	{"u", "BIGINT UNSIGNED", "18446744073709551615", "18446744073709551614"},
-	{"dcm", "DECIMAL(10,2)", "1.50", "1.51"},
-	{"f", "FLOAT", "1.5", "1.25"},
-	{"d", "DOUBLE", "0.1", "0.2"},
-	{"bo", "TINYINT(1)", "1", "0"},
-	{"ch", "CHAR(5)", "'ab'", "'ac'"},
-	{"vc", "VARCHAR(20)", "'hello'", "'hellp'"},
-	{"tx", "TEXT", "'text'", "'texu'"},
-	{"en", "ENUM('x','y')", "'x'", "'y'"},
-	{"st", "SET('p','q')", "'p'", "'p,q'"},
-	{"js", "JSON", `'{"a":1}'`, `'{"a":2}'`},
-	{"dt", "DATE", "'2024-01-02'", "'2024-01-03'"},
-	{"dtm", "DATETIME(6)", "'2024-01-02 03:04:05.123456'", "'2024-01-02 03:04:05.123457'"},
-	{"ts", "TIMESTAMP(6) NULL", "'2024-01-02 03:04:05.123456'", "'2024-01-02 03:04:05.123457'"},
-	{"tm", "TIME(6)", "'12:34:56.5'", "'12:34:56.6'"},
-	{"yr", "YEAR", "2024", "2025"},
-	{"bn", "BINARY(4)", "0xFFFFFFFF", "0xFEFFFFFF"},
-	{"vb", "VARBINARY(8)", "0x61FF62", "0x61FE62"},
-	{"bl", "BLOB", "0xFF00", "0xFE00"},
-	{"bt", "BIT(8)", "b'11111111'", "b'11111110'"},
-	{"g", "GEOMETRY", "ST_GeomFromText('POINT(1 2)')", "ST_GeomFromText('POINT(1 3)')"},
-	{"fb", "VARBINARY(8)", "0x80", "0x81"},
+	{col: "i", ddl: "INT", base: "7", corrupt: "8"},
+	{col: "u", ddl: "BIGINT UNSIGNED", base: "18446744073709551615", corrupt: "18446744073709551614"},
+	{col: "dcm", ddl: "DECIMAL(10,2)", base: "1.50", corrupt: "1.51"},
+	{col: "f", ddl: "FLOAT", base: "1.5", corrupt: "1.25"},
+	{col: "fp1", ddl: "FLOAT", base: "1234567", corrupt: "1234568"},
+	{col: "fp2", ddl: "FLOAT", base: "0.1234567", corrupt: "0.1234568"},
+	{col: "fz", ddl: "FLOAT", base: "-0e0", corrupt: "0", mysqlOnly: true},
+	{col: "d", ddl: "DOUBLE", base: "0.1", corrupt: "0.2"},
+	{col: "dp", ddl: "DOUBLE", base: "1", corrupt: "1.0000000000000002"},
+	{col: "bo", ddl: "TINYINT(1)", base: "1", corrupt: "0"},
+	{col: "ch", ddl: "CHAR(5)", base: "'ab'", corrupt: "'ac'"},
+	{col: "vc", ddl: "VARCHAR(20)", base: "'hello'", corrupt: "'hellp'"},
+	{col: "tx", ddl: "TEXT", base: "'text'", corrupt: "'texu'"},
+	{col: "en", ddl: "ENUM('x','y')", base: "'x'", corrupt: "'y'"},
+	{col: "st", ddl: "SET('p','q')", base: "'p'", corrupt: "'p,q'"},
+	{col: "js", ddl: "JSON", base: `'{"a":1}'`, corrupt: `'{"a":2}'`},
+	{col: "dt", ddl: "DATE", base: "'2024-01-02'", corrupt: "'2024-01-03'"},
+	{col: "dtm", ddl: "DATETIME(6)", base: "'2024-01-02 03:04:05.123456'", corrupt: "'2024-01-02 03:04:05.123457'"},
+	{col: "ts", ddl: "TIMESTAMP(6) NULL", base: "'2024-01-02 03:04:05.123456'", corrupt: "'2024-01-02 03:04:05.123457'"},
+	{col: "tm", ddl: "TIME(6)", base: "'12:34:56.5'", corrupt: "'12:34:56.6'"},
+	{col: "yr", ddl: "YEAR", base: "2024", corrupt: "2025"},
+	{col: "bn", ddl: "BINARY(4)", base: "0xFFFFFFFF", corrupt: "0xFEFFFFFF"},
+	{col: "vb", ddl: "VARBINARY(8)", base: "0x61FF62", corrupt: "0x61FE62"},
+	{col: "vcb", ddl: "VARCHAR(8) CHARACTER SET binary", base: "0x61FF62", corrupt: "0x61FE62"},
+	{col: "bl", ddl: "BLOB", base: "0xFF00", corrupt: "0xFE00"},
+	{col: "tbin", ddl: "TEXT CHARACTER SET binary", base: "0xFF00", corrupt: "0xFE00"},
+	{col: "bt", ddl: "BIT(8)", base: "b'11111111'", corrupt: "b'11111110'"},
+	{col: "g", ddl: "GEOMETRY", base: "ST_GeomFromText('POINT(1 2)')", corrupt: "ST_GeomFromText('POINT(1 3)')"},
+	{col: "fb", ddl: "VARBINARY(8)", base: "0x80", corrupt: "0x81", mysqlOnly: true},
 }
 
 // Rows past the family rows: the two encodings the old CONCAT_WS
@@ -78,10 +104,31 @@ const (
 func TestSampleRowHashes_FamilyMatrix(t *testing.T) {
 	dsn, cleanup := newSharedDB(t, "vsfam")
 	defer cleanup()
+	runSampleFamilyMatrix(t, dsn, Engine{Flavor: FlavorVanilla}, mysqlSampleFamilies)
+}
 
+// TestSampleRowHashes_FamilyMatrix_MariaDB runs the same matrix on
+// MariaDB 11.4, the LTS whose CAST of invalid UTF-8 substitutes '?'.
+func TestSampleRowHashes_FamilyMatrix_MariaDB(t *testing.T) {
+	dsn := newMariaDB(t, mariadb114Image, "vsfam")
+	eng, ok := engines.Get("mariadb")
+	if !ok {
+		t.Fatal(`engine "mariadb" not registered`)
+	}
+	var families []sampleFamily
+	for _, f := range mysqlSampleFamilies {
+		if !f.mysqlOnly {
+			families = append(families, f)
+		}
+	}
+	runSampleFamilyMatrix(t, dsn, eng, families)
+}
+
+func runSampleFamilyMatrix(t *testing.T, dsn string, eng ir.Engine, families []sampleFamily) {
+	t.Helper()
 	cols := []string{"id"}
 	defs := []string{"id BIGINT PRIMARY KEY"}
-	for _, f := range mysqlSampleFamilies {
+	for _, f := range families {
 		cols = append(cols, f.col)
 		defs = append(defs, f.col+" "+f.ddl)
 	}
@@ -90,7 +137,7 @@ func TestSampleRowHashes_FamilyMatrix(t *testing.T) {
 
 	insert := func(table string, id int, override map[string]string) string {
 		vals := []string{fmt.Sprint(id)}
-		for _, f := range mysqlSampleFamilies {
+		for _, f := range families {
 			v := f.base
 			if o, ok := override[f.col]; ok {
 				v = o
@@ -110,7 +157,7 @@ func TestSampleRowHashes_FamilyMatrix(t *testing.T) {
 	for _, table := range []string{"vs_src", "vs_same", "vs_bad"} {
 		fmt.Fprintf(&script, "CREATE TABLE %s (%s);\n", table, strings.Join(defs, ", "))
 	}
-	for i, f := range mysqlSampleFamilies {
+	for i, f := range families {
 		id := i + 1
 		script.WriteString(insert("vs_src", id, nil))
 		script.WriteString(insert("vs_same", id, nil))
@@ -133,7 +180,7 @@ func TestSampleRowHashes_FamilyMatrix(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	rdr, err := Engine{Flavor: FlavorVanilla}.OpenSchemaReader(ctx, dsn)
+	rdr, err := eng.OpenSchemaReader(ctx, dsn)
 	if err != nil {
 		t.Fatalf("OpenSchemaReader: %v", err)
 	}
@@ -175,7 +222,7 @@ func TestSampleRowHashes_FamilyMatrix(t *testing.T) {
 				return out
 			}
 			srcH, sameH, badH := hash("vs_src"), hash("vs_same"), hash("vs_bad")
-			want := len(mysqlSampleFamilies) + 2
+			want := len(families) + 2
 			if len(srcH) != want || len(sameH) != want || len(badH) != want {
 				t.Fatalf("sampled %d/%d/%d rows; want %d each", len(srcH), len(sameH), len(badH), want)
 			}
@@ -193,7 +240,7 @@ func TestSampleRowHashes_FamilyMatrix(t *testing.T) {
 				}
 				var id int
 				_, _ = fmt.Sscan(pk, &id)
-				return mysqlSampleFamilies[id-1].ddl + " (" + mysqlSampleFamilies[id-1].col + ")"
+				return families[id-1].ddl + " (" + families[id-1].col + ")"
 			}
 			for pk, h := range srcH {
 				if badH[pk] == h {
