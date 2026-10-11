@@ -990,15 +990,36 @@ func TestStreamer_AddColumnForward_PreexistingRowDefaults_MariaDBToMariaDB(t *te
 		// No known-wrong cells: the high-byte binary defaults (GC-36 item 5) and
 		// the TEXT/JSON literal defaults (GC-36 item 4) are both fixed.
 		knownWrong: map[string]fdKnownWrong{},
+		// i_ubigmax is graded, not a halt. Through v0.157.2 it halted here as a
+		// "KNOWN LOUD DEFECT": the post-ALTER row carrying the source's
+		// unsigned max was decoded as -1 (MariaDB's default NO_LOG binlog
+		// records no signedness — MARIADB-NOLOG-UNSIGNED) and the target
+		// refused it out of range. That halt was the decode bug, not a
+		// refusal this lane pins; the MySQL → MySQL lane, whose MINIMAL
+		// binlog records signedness, always graded the same cell OK.
 		halts: []fdHalt{
-			// KNOWN LOUD DEFECT: the forwarded column lands, then the first
-			// row carrying the source's unsigned max fails to apply.
-			fdLoud(t, all, "i_ubigmax", "out of range value for column 'i_ubigmax'",
-				"MariaDB BIGINT UNSIGNED: the post-ALTER row is out of range on the target").afterAlter(),
 			fdDesignedRefusal(fdMySQLNow),
 		},
 		freshPair: fdFreshPairs(fdMySQL, fdMySQL, src, tgtServer),
 	})
+	// The matrix grades only the rows that predate each ALTER. i_ubigmax's
+	// own post-ALTER row reached the target through the binlog, so grade
+	// every row of the column, that one included, against the source.
+	fdAssertColumnMatches(t, fdMySQL, "i_ubigmax", src, tgt)
+}
+
+// fdAssertColumnMatches compares one column of w, every row, target
+// against source, both read back as text by the server that holds them.
+func fdAssertColumnMatches(t *testing.T, d fdDialect, col, srcDSN, tgtDSN string) {
+	t.Helper()
+	q := "SELECT CAST(id AS CHAR), CAST(" + fdQuote(d, col) + " AS CHAR) FROM w ORDER BY id"
+	src, tgt := mysqlRowsAsText(t, srcDSN, q), mysqlRowsAsText(t, tgtDSN, q)
+	if strings.Join(src, ";") != strings.Join(tgt, ";") {
+		t.Errorf("column %s: target rows differ from the source.\nsource %v\ntarget %v", col, src, tgt)
+	}
+	if len(src) <= fdSeedRows {
+		t.Errorf("column %s: %d rows; want the seed rows plus at least one written after its ALTER", col, len(src))
+	}
 }
 
 // fdPGShapes is the Postgres source matrix.
