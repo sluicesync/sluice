@@ -364,8 +364,25 @@ func mysqlSampleToken(c *ir.Column, algo ir.HashAlgorithm) string {
 		return fmt.Sprintf("IF(%s IS NULL, 'N', %s)", q, bytesDigest)
 	}
 	text := mysqlSampleText(c)
-	return fmt.Sprintf("CASE WHEN %s IS NULL THEN 'N' WHEN %s IS NULL THEN %s ELSE CONCAT('V', %s) END",
-		q, text, bytesDigest, mysqlDigest(text, algo))
+	return fmt.Sprintf("CASE WHEN %s IS NULL THEN 'N' WHEN %s IS NULL THEN %s%s ELSE CONCAT('V', %s) END",
+		q, text, bytesDigest, mysqlJSONTooLargeArm(c, text), mysqlDigest(text, algo))
+}
+
+// mysqlJSONTooLargeArm is the one place MySQL's oversized-value failure
+// is NOT a NULL. Past max_allowed_packet, MySQL 8 renders a JSON value
+// through CAST(… AS CHAR) as the EMPTY STRING (warning 1301) — measured
+// on 8.0 with two different 20,000-character documents under a 16 KiB
+// packet: both cast to length 0 and digested to d41d8cd9…, so they hashed
+// equal and neither the CAST-is-NULL fallback nor the row refusal fired.
+// No valid JSON document is empty, so an empty rendering of a non-NULL
+// JSON value is turned into a NULL token, which nulls the row's hash and
+// refuses the table naming the row. MariaDB's JSON is a LONGTEXT alias
+// whose oversized values already go NULL; the arm is harmless there.
+func mysqlJSONTooLargeArm(c *ir.Column, text string) string {
+	if _, ok := ir.UnwrapDomain(c.Type).(ir.JSON); !ok {
+		return ""
+	}
+	return " WHEN CHAR_LENGTH(" + text + ") = 0 THEN NULL"
 }
 
 // mysqlSampleText is the exact text rendering of a non-binary column.

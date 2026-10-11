@@ -32,6 +32,7 @@ package mysql
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"testing"
 	"time"
 
@@ -85,7 +86,11 @@ func TestSampleRowHashes_ValueLargerThanMaxAllowedPacket(t *testing.T) {
 	applyMySQL(t, dsn, `CREATE TABLE la (id BIGINT PRIMARY KEY, t LONGTEXT);
 		CREATE TABLE lb (id BIGINT PRIMARY KEY, t LONGTEXT);
 		INSERT INTO la VALUES (1, REPEAT('a', 10000));
-		INSERT INTO lb VALUES (1, CONCAT(REPEAT('a', 9999), 'b'));`)
+		INSERT INTO lb VALUES (1, CONCAT(REPEAT('a', 9999), 'b'));
+		CREATE TABLE ja (id BIGINT PRIMARY KEY, j JSON);
+		CREATE TABLE jb (id BIGINT PRIMARY KEY, j JSON);
+		INSERT INTO ja VALUES (1, JSON_ARRAY(REPEAT('a', 10000)));
+		INSERT INTO jb VALUES (1, JSON_ARRAY(CONCAT(REPEAT('a', 9999), 'b')));`)
 
 	// Lower the server's packet limit below the values, for connections
 	// opened from here on (the reader below opens fresh ones), and put it
@@ -124,6 +129,22 @@ func TestSampleRowHashes_ValueLargerThanMaxAllowedPacket(t *testing.T) {
 		}
 		if a[0].Hash == b[0].Hash {
 			t.Errorf("%s: two different LONGTEXT values larger than max_allowed_packet hash EQUAL — false clean", algo)
+		}
+
+		// A large JSON document is the one value MySQL 8 does not render
+		// as NULL past the packet: CAST(j AS CHAR) comes back as the EMPTY
+		// string (warning 1301), so its digest is the same for every
+		// document. It must refuse, naming the row — never match.
+		jplan := ir.SampleColumns{Key: []string{"id"}, Hashed: []string{"id", "j"}}
+		ja, errJA := sv.SampleRowHashes(ctx, tables["ja"], jplan, 10, 1, algo)
+		jb, errJB := sv.SampleRowHashes(ctx, tables["jb"], jplan, 10, 1, algo)
+		for name, err := range map[string]error{"ja": errJA, "jb": errJB} {
+			if err == nil || !strings.Contains(err.Error(), "row 1:") {
+				t.Errorf("%s: %s: a JSON document larger than max_allowed_packet did not refuse naming the row: %v", algo, name, err)
+			}
+		}
+		if errJA == nil && errJB == nil && len(ja) == 1 && len(jb) == 1 && ja[0].Hash == jb[0].Hash {
+			t.Errorf("%s: two different JSON documents larger than max_allowed_packet hash EQUAL — false clean", algo)
 		}
 	}
 }
