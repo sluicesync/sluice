@@ -54,6 +54,12 @@ other eighteen.
 
 ---
 
+## 2026-10-11 — grow-gate episode-ladder test failed on Windows at the v0.158.0 tag
+
+Indexed when filed. A single finding from the v0.158.0 tag gate (no audit pass).
+
+- GROW-GATE-LADDER-RESET-WINDOWS filed
+
 ## 2026-10-10 — Bug 300 follow-up: a same-server stream echoes its own position writes; a cold-start re-run stall
 
 Indexed 2026-10-10 when filed. Observed while pinning the Bug 300 fix (no audit pass).
