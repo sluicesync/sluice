@@ -1264,19 +1264,20 @@ func (v witnessVerdict) render() string {
 }
 
 // refusedBeforeBoundary is what every boundary refusal says about the
-// target's state. It used to end "nothing has been written", which was
-// false: rows the source wrote before the change are applied before the
-// boundary is judged, and under binlog_row_metadata=FULL a row written
-// after the change could reach the target ahead of it, typed by the
-// target's old column — measured, a DATETIME(6) value rounded and then
-// "nothing has been written" (BUG301-DEFERRED-RETYPE). The binlog reader
-// now refuses such a row itself before decoding it
-// (engines/mysql/cdc_deferred_order.go), which is what makes the first
-// half of this sentence true; the second states what was written.
-// TestBoundaryRefusals_ClaimNothingWritten holds every literal in this
-// package to it.
-const refusedBeforeBoundary = "Refusing before the boundary is recorded or any row after it is applied; rows the " +
-	"source wrote before the change have been applied under the shape they were written in."
+// target's state, and it says only what holds by construction: the
+// refusal fires at the boundary, before the boundary's history version is
+// written and before any change after it reaches the applier; rows the
+// stream read before it may already be on the target. It used to end
+// "nothing has been written", which was false — measured under
+// binlog_row_metadata=FULL, where a row written after a type change landed
+// ahead of the folded boundary, rounded (BUG301-DEFERRED-RETYPE). The
+// binlog reader now refuses such a row before decoding it wherever the
+// binlog records the difference (engines/mysql/cdc_deferred_order.go), but
+// not for a change only to a character column's declared length or
+// collation, which it does not record — so this sentence claims nothing
+// about the shape those earlier rows were applied under.
+const refusedBeforeBoundary = "Refusing before the boundary is recorded or any change after it is applied; rows " +
+	"the stream read before it may already have been applied."
 
 // resumeDivergenceRefusal is the loud outcome: the first boundary disagrees
 // with the target in a way no observed pre-state can explain.

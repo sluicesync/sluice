@@ -37,9 +37,10 @@ import (
 // recordedColumnAccepts, which asks only whether a definition decodes the
 // row image (it ignores DATETIME precision and DECIMAL scale, which the
 // decoder takes from the image) and so cannot see the second harm. A
-// column the shape typed from the TABLE_MAP alone is not compared: its IR
-// type is approximate. It is the column dropped or retyped later, which
-// the source no longer holds in that form.
+// column the shape typed from the TABLE_MAP alone — the column dropped or
+// retyped later — has an approximate IR type, so it is held only on what
+// the TABLE_MAP records exactly ([tableMapRecorded]); comparing less let a
+// column retyped twice hide its first retype (review H1).
 //
 // The basis is the shape of the table's previous decoded event, never the
 // decode cache — behind the head the cache holds the catalog as of the
@@ -50,9 +51,9 @@ import (
 // the warm-resume position, a backup chain's parent manifest. Once a
 // baseline is given, a table missing from it has no basis, and its first
 // deferred shape refuses with the re-copy remedy rather than pass
-// unchecked. A reader given no baseline (the multi-database and
-// foreign-lineage open sites) compares from its first decoded event on;
-// a deferred shape that is a table's first event there is unchecked.
+// unchecked. Every pipeline open site that streams hands one over (the
+// single-stream and multi-database sync paths, both backup lanes); a
+// reader given none compares from its first decoded event on.
 //
 // What else a deferred shape can fold away, measured on MySQL 8.4 (FULL,
 // warm resume), and caught downstream: a rename (then a DROP of it or of
@@ -113,12 +114,49 @@ func (b decodedShape) hold(qn string, cur *ir.Table, approximate map[string]bool
 	}
 	for _, col := range cur.Columns {
 		was, known := b.types[col.Name]
-		if !known || approximate[col.Name] || ir.SameColumnType(was, col.Type) {
+		if !known {
+			continue
+		}
+		if approximate[col.Name] {
+			if ir.SameColumnType(tableMapRecorded(was), tableMapRecorded(col.Type)) {
+				continue
+			}
+		} else if ir.SameColumnType(was, col.Type) {
 			continue
 		}
 		return deferredTypeRefusal(qn, col.Name, was, col.Type)
 	}
 	return nil
+}
+
+// tableMapRecorded is t reduced to what a FULL-metadata TABLE_MAP records
+// exactly, so a column typed from the TABLE_MAP alone (whose IR type is
+// otherwise approximate) can still be held to a known type: the family,
+// temporal precision, decimal precision and scale, integer width and
+// signedness, float single/double, BIT width, ENUM/SET labels, string
+// size class and character set all survive; what the TABLE_MAP does not
+// carry is cleared on both sides — a character column's length (recorded
+// in BYTES, so VARCHAR(40) utf8mb4 reads as 160), its collation (recorded
+// only as an ID the shape names by character set; an ENUM's collation
+// likewise), and an integer's AUTO_INCREMENT. Without this, a column retyped twice hid its first
+// retype: `DATETIME` → `DATETIME(6)`, a row, → `VARCHAR(40)` left the
+// row's shape typed from the TABLE_MAP, and the row landed rounded in the
+// target's DATETIME (measured, review H1). Every family is pinned to hold
+// to its own catalog type by TestCDCRecordedColumnTypes_EveryFamily.
+func tableMapRecorded(t ir.Type) ir.Type {
+	switch v := t.(type) {
+	case ir.Varchar:
+		return ir.Varchar{Charset: v.Charset}
+	case ir.Char:
+		return ir.Char{Charset: v.Charset}
+	case ir.Text:
+		return ir.Text{Size: v.Size, Charset: v.Charset}
+	case ir.Integer:
+		return ir.Integer{Width: v.Width, Unsigned: v.Unsigned}
+	case ir.Enum:
+		return ir.Enum{Values: v.Values}
+	}
+	return t
 }
 
 // firstOrderFlip returns a pair of names both lists hold whose relative

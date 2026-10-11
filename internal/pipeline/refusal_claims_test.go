@@ -20,9 +20,16 @@ import (
 // binlog_row_metadata=FULL, where a row typed by a later change landed
 // rounded and the refusal then claimed nothing had been written
 // (BUG301-DEFERRED-RETYPE). Those refusals now share
-// refusedBeforeBoundary, which states what was written. Comments are not
-// scanned, only literals an operator could read; the floor keeps a
-// broken walk from passing vacuously.
+// refusedBeforeBoundary. Comments are not scanned, only literals an
+// operator could read; the floor keeps a broken walk from passing
+// vacuously.
+//
+// SCOPE, stated so the name is not read as broader: this directory only
+// (not engines/, not the CLI), and this one phrase. It pins the WORDING —
+// that the old false claim does not come back here — not the truth of the
+// sentence that replaced it, which rests on the reader-side deferred-shape
+// refusal and its own pins (TestHoldDecodedOrder_DeferredShapeMatrix,
+// rsfRunDeferredRetypeCell).
 func TestBoundaryRefusals_ClaimNothingWritten(t *testing.T) {
 	entries, err := os.ReadDir(".")
 	if err != nil {

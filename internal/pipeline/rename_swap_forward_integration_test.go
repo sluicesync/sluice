@@ -763,6 +763,41 @@ var rsfDeferredRetype = []struct {
 	},
 }
 
+// rsfDoubleRetype is a column retyped twice (review H1): the second change
+// leaves row 99's recorded b with no read definition, so b is typed from
+// the TABLE_MAP alone — the case a check that skipped such columns let
+// through, landing row 99 rounded in the target's original type. Held on
+// what the TABLE_MAP records (tableMapRecorded): DATETIME(6) differs from
+// DATETIME on precision, DECIMAL(12,4) from DECIMAL(10,2) on scale. Warm
+// entries only: live, each retype is its own boundary, judged by the
+// forward path.
+var rsfDoubleRetype = []struct{ name, create, retype, then string }{
+	{
+		"datetime6-then-varchar",
+		"CREATE TABLE kd (id INT PRIMARY KEY, b DATETIME, c INT); INSERT INTO kd VALUES (1,'2020-01-01 00:00:01',20),(2,'2020-01-01 00:00:02',21),(3,'2020-01-01 00:00:03',22);",
+		"ALTER TABLE kd MODIFY COLUMN b DATETIME(6); INSERT INTO kd (id,b,c) VALUES (99,'2020-01-01 00:00:00.723456',991)",
+		"ALTER TABLE kd MODIFY COLUMN b VARCHAR(40); INSERT INTO kd (id,b,c) VALUES (100,'x',1000)",
+	},
+	{
+		"datetime6-then-text",
+		"CREATE TABLE kd (id INT PRIMARY KEY, b DATETIME, c INT); INSERT INTO kd VALUES (1,'2020-01-01 00:00:01',20),(2,'2020-01-01 00:00:02',21),(3,'2020-01-01 00:00:03',22);",
+		"ALTER TABLE kd MODIFY COLUMN b DATETIME(6); INSERT INTO kd (id,b,c) VALUES (99,'2020-01-01 00:00:00.723456',991)",
+		"ALTER TABLE kd MODIFY COLUMN b TEXT; INSERT INTO kd (id,b,c) VALUES (100,'x',1000)",
+	},
+	{
+		"datetime6-then-timestamp6",
+		"CREATE TABLE kd (id INT PRIMARY KEY, b DATETIME, c INT); INSERT INTO kd VALUES (1,'2020-01-01 00:00:01',20),(2,'2020-01-01 00:00:02',21),(3,'2020-01-01 00:00:03',22);",
+		"ALTER TABLE kd MODIFY COLUMN b DATETIME(6); INSERT INTO kd (id,b,c) VALUES (99,'2020-01-01 00:00:00.723456',991)",
+		"ALTER TABLE kd MODIFY COLUMN b TIMESTAMP(6) NULL; INSERT INTO kd (id,b,c) VALUES (100,'2020-01-01 00:00:00.5',1000)",
+	},
+	{
+		"decimal-scale-then-double",
+		"CREATE TABLE kd (id INT PRIMARY KEY, b DECIMAL(10,2), c INT); INSERT INTO kd VALUES (1,1.25,20),(2,1.5,21),(3,1.75,22);",
+		"ALTER TABLE kd MODIFY COLUMN b DECIMAL(12,4); INSERT INTO kd (id,b,c) VALUES (99,1.2345,991)",
+		"ALTER TABLE kd MODIFY COLUMN b DOUBLE; INSERT INTO kd (id,b,c) VALUES (100,2.5,1000)",
+	},
+}
+
 // rsfWarmPrimed is a warm resume of a stream that applied a row of the table
 // before it stopped, so the table has a retained schema-history version
 // (its first-touch boundary) — the typed basis a deferred shape is held to.
@@ -784,10 +819,18 @@ const rsfWarmPrimed rsfEntry = "warm-primed"
 func rsfRunDeferredRetypeCell(t *testing.T, srv rsfServer, create, retype, then string, folded bool, entry rsfEntry, idx int) {
 	t.Helper()
 	tag := fmt.Sprintf("r%d", idx)
-	src, tgt := srv.newDB(t, "s_"+tag), srv.newDB(t, "t_"+tag)
+	rsfRunDeferredRetypeCellOn(t, srv.newDB(t, "s_"+tag), srv.newDB(t, "t_"+tag), srv.label, srv.full, tag,
+		create, retype, then, folded, entry)
+}
+
+// rsfRunDeferredRetypeCellOn is rsfRunDeferredRetypeCell for a given source
+// and target, which may be different engines.
+func rsfRunDeferredRetypeCellOn(t *testing.T, src, tgt twfbDB, label string, full bool, tag, create, retype, then string, folded bool, entry rsfEntry) {
+	t.Helper()
+	srv := rsfServer{label: label, full: full}
 	cell := twfbCell{src: src, tgt: tgt, streamID: "rsf-" + tag, slotName: "rsf_" + tag}
 	src.exec(t, create)
-	what := fmt.Sprintf("%s/deferred-retype %q/%s", srv.label, retype, entry)
+	what := fmt.Sprintf("%s/deferred-retype %q %q/%s", srv.label, retype, then, entry)
 	run := startTWFBRun(cell.streamer())
 	if !tgt.waitRow(t, "kd", 3, run, 180*time.Second) {
 		t.Fatalf("%s: the cold start never delivered the seed rows (stream: %v)", what, run.stop(t))
@@ -909,6 +952,15 @@ func rsfRunServer(t *testing.T, srv rsfServer) {
 				n, s := k, s
 				t.Run(s.name+"/"+string(entry), func(t *testing.T) {
 					rsfRunDeferredRetypeCell(t, srv, s.create, s.retype, s.then, s.folded, entry, n)
+				})
+			}
+		}
+		for _, s := range rsfDoubleRetype {
+			for _, entry := range []rsfEntry{rsfWarm, rsfWarmPrimed} {
+				k++
+				n, s := k, s
+				t.Run(s.name+"/"+string(entry), func(t *testing.T) {
+					rsfRunDeferredRetypeCell(t, srv, s.create, s.retype, s.then, true, entry, n)
 				})
 			}
 		}
@@ -1135,6 +1187,23 @@ func TestRenameSwapForward_ChainRestore(t *testing.T) {
 // Postgres target cannot — so the refusal must not tell the operator to run
 // the same `MODIFY … AFTER` there, and the remedy it does name, the re-copy,
 // must converge the target.
+// TestRenameSwapForward_MySQLToPostgres_DeferredRetype is the double-retype
+// cell on a Postgres target (review H1): a DECIMAL(10,2) column retyped to
+// DECIMAL(12,4), written, then to DOUBLE. On a MySQL target the applier's
+// DECIMAL-SCALE-EXCEEDED would catch row 99's lost digits after the fact;
+// a Postgres NUMERIC(10,2) rounds them without an error, so the reader's
+// refusal is the only door. FULL metadata, warm-primed.
+func TestRenameSwapForward_MySQLToPostgres_DeferredRetype(t *testing.T) {
+	srcDSN, cleanup := rsfBootMySQL(t, "mysql:8.4")
+	defer cleanup()
+	rsfFullMetadata(t, srcDSN)
+	_, tgtDSN, tgtCleanup := startPostgres(t)
+	defer tgtCleanup()
+	s := rsfDoubleRetype[len(rsfDoubleRetype)-1] // decimal-scale-then-double
+	rsfRunDeferredRetypeCellOn(t, twfbDB{engine: "mysql", dsn: srcDSN}, twfbDB{engine: "postgres", dsn: tgtDSN},
+		"mysql-8.4/full→postgres", true, "rxpg", s.create, s.retype, s.then, true, rsfWarmPrimed)
+}
+
 func TestRenameSwapForward_MySQLToPostgres_ReorderRemedy(t *testing.T) {
 	srcDSN, _, srcCleanup := startMySQLBinlog(t)
 	defer srcCleanup()

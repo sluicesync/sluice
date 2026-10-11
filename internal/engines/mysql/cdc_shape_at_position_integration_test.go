@@ -718,13 +718,18 @@ func runFamilySynthesis(t *testing.T, eng Engine, dsn string, cols []familyColum
 	applyMySQL(t, dsn, "SET time_zone = '+00:00'; INSERT INTO fam (id, "+strings.Join(names, ", ")+") VALUES (1, "+strings.Join(values, ", ")+");"+
 		" INSERT INTO fam (id) VALUES (2);")
 
-	control := familyInserts(ctx, t, eng, dsn, from)
+	// Both decodes are held to the shape a cold start's SchemaReader reads
+	// (BUG301-DEFERRED-RETYPE): the replayed one is typed from the binlog
+	// alone, and a deferred-shape check that compared more than the
+	// TABLE_MAP records would refuse it here, for some family.
+	baseline := familyCatalog(ctx, t, eng, dsn)
+	control := familyInserts(ctx, t, eng, dsn, from, baseline)
 	drop := make([]string, len(names))
 	for i, n := range names {
 		drop[i] = "DROP COLUMN " + n
 	}
 	applyMySQL(t, dsn, "ALTER TABLE fam ADD COLUMN z INT, "+strings.Join(drop, ", ")+";")
-	replayed := familyInserts(ctx, t, eng, dsn, from)
+	replayed := familyInserts(ctx, t, eng, dsn, from, baseline)
 	for i, c := range cols {
 		n := names[i]
 		for _, run := range []struct {
@@ -756,8 +761,30 @@ func runFamilySynthesis(t *testing.T, eng Engine, dsn string, cols []familyColum
 	}
 }
 
-// familyInserts streams fam's two inserts from `from`.
-func familyInserts(ctx context.Context, t *testing.T, eng Engine, dsn string, from ir.Position) []ir.Row {
+// familyCatalog reads every table of dsn through the engine's
+// SchemaReader — the lens a cold start's copy (and a backup's manifest)
+// records the source in.
+func familyCatalog(ctx context.Context, t *testing.T, eng Engine, dsn string) []*ir.Table {
+	t.Helper()
+	sr, err := eng.OpenSchemaReader(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenSchemaReader: %v", err)
+	}
+	defer func() {
+		if c, ok := sr.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+	schema, err := sr.ReadSchema(ctx)
+	if err != nil {
+		t.Fatalf("ReadSchema: %v", err)
+	}
+	return schema.Tables
+}
+
+// familyInserts streams fam's two inserts from `from`, holding deferred
+// shapes to baseline when one is given.
+func familyInserts(ctx context.Context, t *testing.T, eng Engine, dsn string, from ir.Position, baseline []*ir.Table) []ir.Row {
 	t.Helper()
 	rdr, err := eng.OpenCDCReader(ctx, dsn)
 	if err != nil {
@@ -765,6 +792,9 @@ func familyInserts(ctx context.Context, t *testing.T, eng Engine, dsn string, fr
 	}
 	cdc := rdr.(*CDCReader)
 	defer func() { _ = cdc.Close() }()
+	if baseline != nil {
+		cdc.SetDecodedShapeBaseline(baseline)
+	}
 	changes, err := cdc.StreamChanges(ctx, from)
 	if err != nil {
 		t.Fatalf("StreamChanges: %v", err)

@@ -253,8 +253,13 @@ func newColumnOrderRecords(available bool, records []ir.ColumnOrderRecord) *colu
 }
 
 // lookup returns the table's record: the exact (schema, table) one, else
-// the one record with that table name (a MySQL cold start names the table
-// without its database, the change stream with it).
+// the one record with that table name and NO schema (a single-stream MySQL
+// cold start names the table without its database, the change stream with
+// it). A record that names another namespace is never another table's:
+// a multi-database or multi-schema stream keeps one record set for all its
+// namespaces, and a same-named table elsewhere answering for this one would
+// both skip this table's own record and stand in for the target-as-prior
+// fallback — measured accepting an unapplied swap (review M1).
 func (r *columnOrderRecords) lookup(schema, table string) (*ir.ColumnOrderRecord, bool) {
 	if r == nil {
 		return nil, false
@@ -264,18 +269,10 @@ func (r *columnOrderRecords) lookup(schema, table string) (*ir.ColumnOrderRecord
 	if rec, ok := r.byKey[[2]string{schema, table}]; ok {
 		return &rec, true
 	}
-	var hit *ir.ColumnOrderRecord
-	for k, rec := range r.byKey {
-		if k[1] != table {
-			continue
-		}
-		if hit != nil {
-			return nil, false
-		}
-		rec := rec
-		hit = &rec
+	if rec, ok := r.byKey[[2]string{"", table}]; ok {
+		return &rec, true
 	}
-	return hit, hit != nil
+	return nil, false
 }
 
 func (r *columnOrderRecords) set(rec ir.ColumnOrderRecord) {

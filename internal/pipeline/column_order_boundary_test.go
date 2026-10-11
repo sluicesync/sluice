@@ -344,6 +344,40 @@ func TestFirstBoundaryWitness_ColumnOrder(t *testing.T) {
 	}
 }
 
+// TestColumnOrderRecords_LookupNeverCrossesNamespaces pins review M1: a
+// multi-namespace stream keeps one record set, and a same-named table in
+// another namespace must never answer for this one — it would stand in for
+// the target-as-prior fallback and accept an unapplied swap (the probe's
+// db2.kd judged by db1.kd's post-swap record). Only a record with no
+// schema (a single-stream MySQL cold start's) answers by name.
+func TestColumnOrderRecords_LookupNeverCrossesNamespaces(t *testing.T) {
+	t.Parallel()
+	db1 := ir.ColumnOrderRecord{Schema: "db1", Table: "kd", SourceColumns: []string{"id", "c", "b"}, TargetColumns: []string{"id", "c", "b"}}
+	bare := ir.ColumnOrderRecord{Table: "kd", SourceColumns: []string{"id", "b", "c"}, TargetColumns: []string{"id", "b", "c"}}
+
+	r := newColumnOrderRecords(true, []ir.ColumnOrderRecord{db1})
+	if rec, ok := r.lookup("db2", "kd"); ok {
+		t.Fatalf("db2.kd resolved to %+v; a record of another namespace answered", rec)
+	}
+	// The judgement that the wrong record silenced: with no record, the
+	// target is its own prior and the unapplied swap refuses.
+	rec, _ := r.lookup("db2", "kd")
+	if v := judgeColumnOrder(rec, []string{"id", "b", "c"}, []string{"id", "b", "c"}, []string{"id", "c", "b"}); !v.refuses() {
+		t.Fatalf("db2.kd's unapplied swap is accepted: %+v", v)
+	}
+	if got, ok := r.lookup("db1", "kd"); !ok || got.Schema != "db1" {
+		t.Fatalf("db1.kd's own record not found: %+v %t", got, ok)
+	}
+
+	r = newColumnOrderRecords(true, []ir.ColumnOrderRecord{bare, db1})
+	if got, ok := r.lookup("db1", "kd"); !ok || got.Schema != "db1" {
+		t.Fatalf("the exact record must win over the bare one: %+v %t", got, ok)
+	}
+	if got, ok := r.lookup("app", "kd"); !ok || got.Schema != "" {
+		t.Fatalf("a schema-less record must answer by name: %+v %t", got, ok)
+	}
+}
+
 // TestUnforwardedCheck_ColumnOrder pins the --schema-changes=refuse face:
 // the swap refuses as SCHEMA-CHANGE-REFUSED carrying COLUMN-ORDER-CHANGED,
 // and passes once the target's order has moved from the record's.

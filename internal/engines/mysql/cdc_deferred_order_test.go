@@ -61,7 +61,8 @@ func baseline(cols ...col) []*ir.Table {
 // shapes that will never be a boundary (BUG301-FULL-DEFERRED-SWAP,
 // BUG301-DEFERRED-RETYPE): such a shape may add or lose columns, but may
 // not reorder or retype one it shares with the basis; a column it typed
-// from the TABLE_MAP is never compared; a shape that IS a boundary passes
+// from the TABLE_MAP is compared only on what the TABLE_MAP records (every
+// such property has a case, review H1); a shape that IS a boundary passes
 // and becomes the basis; once a baseline is given, a table missing from it
 // refuses its first deferred shape.
 func TestHoldDecodedOrder_DeferredShapeMatrix(t *testing.T) {
@@ -84,7 +85,7 @@ func TestHoldDecodedOrder_DeferredShapeMatrix(t *testing.T) {
 		{"decimal scale", baseline(c("id", tInt), c("b", tDec2), c("c", tInt)), []step{{deferredShape(false, c("id", tInt), c("b", tDec4), tm("c", tInt)), typed}}},
 		{"varchar shrink", baseline(c("id", tInt), c("b", tVC20), c("c", tInt)), []step{{deferredShape(false, c("id", tInt), c("b", tVC5), tm("c", tInt)), typed}}},
 		{"integer widen", baseline(c("id", tInt), c("b", tInt), c("c", tInt)), []step{{deferredShape(false, c("id", tInt), c("b", tBig), tm("c", tInt)), typed}}},
-		{"approximate type never compared", baseline(c("id", tInt), c("b", tVC20), c("c", tInt)), []step{{deferredShape(false, c("id", tInt), tm("b", tVC160), c("c", tInt)), nil}}},
+		{"approximate: a character length is not compared", baseline(c("id", tInt), c("b", tVC20), c("c", tInt)), []step{{deferredShape(false, c("id", tInt), tm("b", tVC160), c("c", tInt)), nil}}},
 		{"retype that is a boundary passes", baseline(c("id", tInt), c("b", tDT0)), []step{{deferredShape(false, c("id", tInt), c("b", tDT6)), nil}}},
 		{"swap that is a boundary passes", baseline(c("id", tInt), c("b", tInt), c("c", tInt)), []step{{deferredShape(false, c("id", tInt), c("c", tInt), c("b", tInt)), nil}}},
 		{"no baseline handed over, nothing to compare", nil, []step{{deferredShape(true, c("id", tInt), c("c", tInt), tm("b", tInt)), nil}}},
@@ -104,11 +105,34 @@ func TestHoldDecodedOrder_DeferredShapeMatrix(t *testing.T) {
 			},
 		},
 		{
-			"an approximate column carries its known type forward", baseline(c("id", tInt), c("b", tDT0), c("c", tInt)),
+			"an approximate column carries its known type forward", baseline(c("id", tInt), c("b", tVC20), c("c", tInt)),
 			[]step{
-				{deferredShape(false, c("id", tInt), tm("b", tDT6), c("c", tInt)), nil},
-				{deferredShape(false, c("id", tInt), c("b", tDT6), tm("c", tInt)), typed},
+				{deferredShape(false, c("id", tInt), tm("b", tVC160), c("c", tInt)), nil},
+				{deferredShape(false, c("id", tInt), c("b", tVC5), tm("c", tInt)), typed},
 			},
+		},
+		// Review H1: an approximate column is still held on what the
+		// TABLE_MAP records — a column retyped twice must not hide its first
+		// retype behind the second.
+		{"approximate: temporal precision", baseline(c("id", tInt), c("b", tDT0)), []step{{deferredShape(false, c("id", tInt), tm("b", tDT6)), typed}}},
+		{"approximate: decimal scale", baseline(c("id", tInt), c("b", tDec2)), []step{{deferredShape(false, c("id", tInt), tm("b", tDec4)), typed}}},
+		{"approximate: integer width", baseline(c("id", tInt), c("b", tInt)), []step{{deferredShape(false, c("id", tInt), tm("b", tBig)), typed}}},
+		{"approximate: signedness", baseline(c("id", tInt), c("b", tInt)), []step{{deferredShape(false, c("id", tInt), tm("b", ir.Integer{Width: 32, Unsigned: true})), typed}}},
+		{"approximate: family", baseline(c("id", tInt), c("b", tDT6)), []step{{deferredShape(false, c("id", tInt), tm("b", tVC160)), typed}}},
+		{"approximate: float precision", baseline(c("id", tInt), c("b", ir.Float{Precision: ir.FloatSingle})), []step{{deferredShape(false, c("id", tInt), tm("b", ir.Float{Precision: ir.FloatDouble})), typed}}},
+		{"approximate: enum labels", baseline(c("id", tInt), c("b", ir.Enum{Values: []string{"a", "b"}})), []step{{deferredShape(false, c("id", tInt), tm("b", ir.Enum{Values: []string{"b", "a"}})), typed}}},
+		{"approximate: character set", baseline(c("id", tInt), c("b", ir.Varchar{Length: 20, Charset: "latin1"})), []step{{deferredShape(false, c("id", tInt), tm("b", ir.Varchar{Length: 80, Charset: "utf8mb4"})), typed}}},
+		{"approximate: text size class", baseline(c("id", tInt), c("b", ir.Text{Size: ir.TextMedium})), []step{{deferredShape(false, c("id", tInt), tm("b", ir.Text{Size: ir.TextLong})), typed}}},
+		{
+			"approximate: what the TABLE_MAP does not record is not compared",
+			baseline(c("id", tInt),
+				c("v", ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: "utf8mb4_0900_ai_ci"}),
+				c("e", ir.Enum{Values: []string{"a"}, Collation: "utf8mb4_0900_ai_ci"}),
+				c("n", ir.Integer{Width: 64, AutoIncrement: true})),
+			[]step{{deferredShape(false, c("id", tInt),
+				tm("v", ir.Varchar{Length: 80, Charset: "utf8mb4"}),
+				tm("e", ir.Enum{Values: []string{"a"}}),
+				tm("n", ir.Integer{Width: 64})), nil}},
 		},
 	}
 	for _, tc := range cases {
