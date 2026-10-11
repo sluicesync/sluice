@@ -388,6 +388,14 @@ type CDCReader struct {
 	// the pump goroutine, except SetSchemaSeed (before StreamChanges).
 	priorSig map[string]ir.SchemaSignature
 
+	// decodedOrder is each table's column order at the last event this
+	// reader decoded, or the seed's before the first — what a shape that
+	// can never be a boundary is held to (cdc_deferred_order.go). Unlike
+	// priorSig it is never refreshed from the decode cache, which behind
+	// the binlog head holds a shape from the future. Pump goroutine,
+	// except the seed setters (before StreamChanges).
+	decodedOrder map[string][]string
+
 	// schemaForward enables ADR-0091 F7a single-stream schema-change
 	// forwarding. When true, maybeSnapshotSchemaB1 ALSO emits a
 	// SchemaSnapshot on a per-column NULLABILITY-only change (GAP #2),
@@ -1838,7 +1846,12 @@ func (r *CDCReader) dispatchRows(
 	// durable version write that lands ahead of the row, it never
 	// swallows or reorders the existing decode-error path below.
 	// A shape with a column typed from the TABLE_MAP alone is not a
-	// boundary (cdc_recorded_shape.go): the boundary stays owed.
+	// boundary (cdc_recorded_shape.go): the boundary stays owed — so a
+	// column-order change it carries must refuse here, because no later
+	// boundary can show it (BUG301-FULL-DEFERRED-SWAP).
+	if err := r.holdDecodedOrder(qn, tbl); err != nil {
+		return err
+	}
 	if !tbl.synthesized {
 		if err := r.maybeSnapshotSchemaB1(ctx, qn, tbl, out); err != nil {
 			return err

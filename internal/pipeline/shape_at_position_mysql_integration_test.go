@@ -80,6 +80,11 @@ const (
 	// are the same boundary, and only a swap would leave the target's
 	// earlier rows under the wrong names.
 	shapeRefusesResumeOrder
+	// shapeRefusesCaptureOrder: the reader refuses COLUMN-ORDER-CHANGED
+	// before decoding a row whose shape is never a boundary and reorders
+	// the table (BUG301-FULL-DEFERRED-SWAP); a capture commits nothing, a
+	// resume leaves the target as the stop left it.
+	shapeRefusesCaptureOrder
 )
 
 // e2eShape is one source history, run after the chain's full (or the
@@ -102,6 +107,7 @@ func e2eShapes() []e2eShape {
 	// downstream, by chain replay and by the warm resume's boundary check
 	// alike (RENAME-SWAP-FORWARD).
 	order := map[string]shapeOutcome{"incremental": shapeRefusesRestore, "stream": shapeRefusesRestore, "resume": shapeRefusesResumeOrder}
+	deferred := map[string]shapeOutcome{"incremental": shapeRefusesCaptureOrder, "stream": shapeRefusesCaptureOrder, "resume": shapeRefusesCaptureOrder}
 	return []e2eShape{
 		{name: "reorder", history: e2ePre + " ALTER TABLE kd MODIFY c VARCHAR(40) AFTER id; INSERT INTO kd(id,b,c) VALUES (3,'103','203');", full: order},
 		{name: "add", history: e2ePre + " ALTER TABLE kd ADD COLUMN d INT; INSERT INTO kd VALUES (3,'103','203',3);", full: exact},
@@ -122,6 +128,24 @@ func e2eShapes() []e2eShape {
 			history: e2ePre + " ALTER TABLE kd ADD COLUMN d INT; INSERT INTO kd VALUES (4,'104','204',4);" +
 				" ALTER TABLE kd MODIFY c VARCHAR(40) FIRST; INSERT INTO kd(id,b,c,d) VALUES (3,'103','203',3);",
 			full: order,
+		},
+		{
+			// BUG301-FULL-DEFERRED-SWAP: the swapped row decodes under a shape
+			// typed partly from the TABLE_MAP (b is dropped later), which is
+			// never a boundary, so the reader holds the order itself.
+			name: "swap-then-drop",
+			history: e2ePre + " ALTER TABLE kd RENAME COLUMN b TO c, RENAME COLUMN c TO b; INSERT INTO kd(id,b,c) VALUES (3,'103','203');" +
+				" ALTER TABLE kd DROP COLUMN b; INSERT INTO kd(id,c) VALUES (4,'204');",
+			full: deferred,
+		},
+		{
+			// The same with no earlier row in the window: the basis is the
+			// baseline the stream started from (the parent manifest, the
+			// stream's column-order records).
+			name: "swap-then-drop-first-touch",
+			history: "ALTER TABLE kd RENAME COLUMN b TO c, RENAME COLUMN c TO b; INSERT INTO kd(id,b,c) VALUES (3,'103','203');" +
+				" ALTER TABLE kd DROP COLUMN b; INSERT INTO kd(id,c) VALUES (4,'204');",
+			full: deferred,
 		},
 	}
 }
@@ -194,6 +218,15 @@ func runBackupShape(t *testing.T, eng ir.Engine, src, tgt, path, history string,
 	}
 	if want == shapeRefusesCapture {
 		wantCode(t, captureErr, sluicecode.CodeCDCSchemaReplayMismatch, "capture")
+		if n := committedChangeRecords(t, store); n != 0 {
+			t.Errorf("the refused capture committed %d change records; want 0", n)
+		}
+		return
+	}
+	if want == shapeRefusesCaptureOrder {
+		if !errors.Is(captureErr, ir.ErrColumnOrderChanged) {
+			t.Fatalf("capture: err = %v; want %v", captureErr, ir.ErrColumnOrderChanged)
+		}
 		if n := committedChangeRecords(t, store); n != 0 {
 			t.Errorf("the refused capture committed %d change records; want 0", n)
 		}
@@ -312,6 +345,20 @@ func runResumeShape(t *testing.T, eng ir.Engine, src, tgt, streamID, history str
 					t.Fatalf("warm resume: err = %v; want %v", err, ir.ErrColumnOrderChanged)
 				}
 				assertNoWrongRow(t, src, tgt)
+			case shapeRefusesCaptureOrder:
+				if !errors.Is(err, ir.ErrColumnOrderChanged) {
+					t.Fatalf("warm resume: err = %v; want %v", err, ir.ErrColumnOrderChanged)
+				}
+				// The source now holds the pre-swap b values under c, so it is
+				// no longer the expected value; the history's own literals
+				// are (b = '1xx', c = '2xx' before the swap). Rows before the
+				// swap may have landed, decoded by their own shape: every c
+				// on the target is still a '2xx', and no row written after
+				// the swap (ids 3, 4) is there.
+				var wrong int
+				if err := mysqlOpen(t, tgt).QueryRow("SELECT COUNT(*) FROM kd WHERE c NOT LIKE '2%' OR id IN (3,4)").Scan(&wrong); err != nil || wrong != 0 {
+					t.Errorf("the target holds %d row(s) decoded across the swap (%v)", wrong, err)
+				}
 			default:
 				t.Fatalf("warm resume stopped: %v", err)
 			}
@@ -323,7 +370,7 @@ func runResumeShape(t *testing.T, eng ir.Engine, src, tgt, streamID, history str
 		}
 	}
 	stop(cancel, done)
-	if want == shapeRefusesCapture || want == shapeRefusesResume || want == shapeRefusesResumeOrder {
+	if want == shapeRefusesCapture || want == shapeRefusesResume || want == shapeRefusesResumeOrder || want == shapeRefusesCaptureOrder {
 		t.Fatalf("warm resume did not refuse; target %s, source %s", tableSignature(t, tgt, "kd", nil), srcSig)
 	}
 	assertShapeOutcome(t, src, tgt, want)

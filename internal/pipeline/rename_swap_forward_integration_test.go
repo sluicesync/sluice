@@ -53,6 +53,7 @@ import (
 	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // rsfServer is one database server; every cell gets its own source and
@@ -630,8 +631,95 @@ func rsfRunPreUpgradeCell(t *testing.T, srv rsfServer, swapWhileStopped bool, id
 	rsfAssertRecord(t, src, tgt, cell.streamID, what)
 }
 
+// rsfSwapThenLater is a MySQL-family swap that a row was written under and
+// that a later change then hid from the table's final shape: after the
+// swap `c` holds what `b` held, and the later change drops or retypes the
+// other swapped column before the stream reads the catalog. A stream that
+// meets it behind the head (warm) sees a recorded shape for the swapped
+// row that the catalog no longer describes; under binlog_row_metadata=FULL
+// that shape decodes by its own names (Bug 301) and is never a schema
+// boundary itself, so the swap reaches the doors only folded into the
+// later boundary — where its names no longer show it.
+var rsfSwapThenLater = []struct{ name, later string }{
+	{"swap-then-drop", "ALTER TABLE kd DROP COLUMN b"},
+	{"swap-then-retype", "ALTER TABLE kd MODIFY COLUMN b BIGINT"},
+}
+
+// rsfRunSwapThenLaterCell grades rsfSwapThenLater: refused before any
+// row written after the swap reaches the target, the target untouched.
+// No reconcile: the operator's remedy here is the re-copy, which the
+// diverged cells already pin.
+func rsfRunSwapThenLaterCell(t *testing.T, srv rsfServer, later string, entry rsfEntry, idx int) {
+	t.Helper()
+	tag := fmt.Sprintf("l%d", idx)
+	src, tgt := srv.newDB(t, "s_"+tag), srv.newDB(t, "t_"+tag)
+	cell := twfbCell{src: src, tgt: tgt, streamID: "rsf-" + tag, slotName: "rsf_" + tag}
+	src.exec(t, rsfShapes(srv.dialect)[0].create)
+	what := fmt.Sprintf("%s/swap-then %q/%s", srv.label, later, entry)
+	var run *twfbRun
+	if entry == rsfWarm {
+		cell.coldStartAndStop(t, "kd", 3)
+	} else {
+		run = startTWFBRun(cell.streamer())
+		if !tgt.waitRow(t, "kd", 3, run, 180*time.Second) {
+			t.Fatalf("%s: the cold start never delivered the seed rows (stream: %v)", what, run.stop(t))
+		}
+		cell.waitStreaming(t, run)
+		src.exec(t, "INSERT INTO kd (id) VALUES (50)")
+		if !tgt.waitRow(t, "kd", 50, run, 60*time.Second) {
+			t.Fatalf("%s: the priming row never landed (stream: %v)", what, run.stop(t))
+		}
+	}
+	before := rsfRead(t, tgt)
+	src.exec(t, rsfShapes(srv.dialect)[0].change)
+	src.exec(t, "INSERT INTO kd (id,b,c) VALUES (99,990,991)")
+	src.exec(t, later)
+	src.exec(t, "INSERT INTO kd (id,c) VALUES (100,2000)")
+	if entry == rsfWarm {
+		run = startTWFBRun(cell.streamer())
+	}
+	deadline := time.Now().Add(60 * time.Second)
+	for !run.exited() && time.Now().Before(deadline) {
+		time.Sleep(200 * time.Millisecond)
+	}
+	if !run.exited() {
+		// Graded, not just timed out: what a stream that walked past the
+		// swap left on the target, against the source.
+		_ = run.stop(t)
+		s, g := rsfRead(t, src), rsfRead(t, tgt)
+		t.Fatalf("%s: the stream never refused — it ran past the swap\nsource %v:\n%s\ntarget %v:\n%s", what, s.columns, s.rows, g.columns, g.rows)
+	}
+	err := run.err
+	// Behind the head without column names the reader's own look-ahead
+	// refuses first (Bug 301, SLUICE-E-CDC-SCHEMA-REPLAY-MISMATCH); with
+	// them, the boundary doors refuse the order change. Either leaves the
+	// target untouched.
+	ce, coded := sluicecode.FromError(err)
+	if !errors.Is(err, ir.ErrColumnOrderChanged) && !strings.Contains(fmt.Sprint(err), "COLUMN-ORDER-CHANGED") &&
+		(!coded || ce.Code != sluicecode.CodeCDCSchemaReplayMismatch) {
+		t.Fatalf("%s: the stream stopped, but not on a refusal of the swap: %v", what, err)
+	}
+	t.Logf("%s refused: %v", what, err)
+	rsfAssertUntouched(t, tgt, before, what)
+	if tgt.hasRow(t, "kd", 99) {
+		t.Errorf("%s: the row written under the swapped names was applied", what)
+	}
+}
+
 // rsfRunServer runs every shape's cells on one server.
 func rsfRunServer(t *testing.T, srv rsfServer) {
+	if srv.dialect == "mysql" {
+		l := 0
+		for _, s := range rsfSwapThenLater {
+			for _, entry := range []rsfEntry{rsfLiveCDC, rsfWarm} {
+				l++
+				n, later := l, s.later
+				t.Run(s.name+"/"+string(entry), func(t *testing.T) {
+					rsfRunSwapThenLaterCell(t, srv, later, entry, n)
+				})
+			}
+		}
+	}
 	for i, stopped := range []bool{false, true} {
 		t.Run(fmt.Sprintf("pre-upgrade/swap-while-stopped=%t", stopped), func(t *testing.T) {
 			rsfRunPreUpgradeCell(t, srv, stopped, i+1)

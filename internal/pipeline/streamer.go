@@ -1655,6 +1655,13 @@ type Streamer struct {
 	// is wired, so each attempt derives its own.
 	readerSchemaSeed schemaSeedLoader
 
+	// readerOrderBaseline is the source column order per table at the
+	// position the next reader streams from (decoded_order_baseline.go):
+	// set beside readerSchemaSeed by the cold start, and by the warm-resume
+	// seed loader while it runs; handed over and cleared by
+	// [Streamer.wireReaderSchemaSeed].
+	readerOrderBaseline []ir.ColumnOrderRecord
+
 	// unforwardedBaselineFrom is the last CDC reader this Run opened, kept so
 	// the next attempt's reader starts from its unforwarded-schema-change
 	// baseline rather than a fresh catalog read (GC-32). Cleared at Run entry
