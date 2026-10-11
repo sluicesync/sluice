@@ -6,6 +6,7 @@ package mysql
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -223,5 +224,25 @@ func TestDDLLookahead_ShortReadNeverMarksUnread(t *testing.T) {
 	}
 	if got := l.reaching(binlogCoord{"bin.000001", 4}, binlogCoord{"bin.000001", 500}, "app", "kd"); len(got) != 1 {
 		t.Errorf("found %d DDLs in the range the first scan could not read; want 1", len(got))
+	}
+}
+
+// TestCDCReader_RowMetadataFullStatement_PerFlavor pins the statement the
+// backup lanes' re-hint takes from the reader (Bug 302): MySQL persists the
+// setting with SET PERSIST; MariaDB has no SET PERSIST, so its statement is
+// SET GLOBAL plus the option-file line without which a restart reverts to
+// NO_LOG.
+func TestCDCReader_RowMetadataFullStatement_PerFlavor(t *testing.T) {
+	if got := (&CDCReader{flavor: FlavorVanilla}).RowMetadataFullStatement(); got != "SET PERSIST binlog_row_metadata = 'FULL'" {
+		t.Errorf("MySQL: %q", got)
+	}
+	got := (&CDCReader{flavor: FlavorMariaDB}).RowMetadataFullStatement()
+	for _, want := range []string{"SET GLOBAL binlog_row_metadata = 'FULL'", "binlog_row_metadata = FULL under [mariadbd]", "option file"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("MariaDB: %q; want it to carry %q", got, want)
+		}
+	}
+	if strings.Contains(got, "SET PERSIST binlog") {
+		t.Errorf("MariaDB: %q offers SET PERSIST, a syntax error there", got)
 	}
 }

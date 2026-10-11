@@ -4,6 +4,10 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Fixed
+
+**A backup refused for a schema change behind the stream now names the runnable `binlog_row_metadata=FULL` statement for its source, as `sync start` does (LOW, message; loud, no data loss; Bug 302).** When `backup incremental` or `backup stream` hits `SLUICE-E-CDC-SCHEMA-REPLAY-MISMATCH` (the Bug 301 refusal, a FULL-metadata column sluice cannot type, or the charset-replay refusals), the lane replaces the reader's sync-flavoured remedy with a fresh `backup full`, and in doing so dropped the reader's flavor-specific statement in favour of a bare "setting binlog_row_metadata=FULL". A MariaDB operator was therefore never told that MariaDB has no `SET PERSIST`, nor that `SET GLOBAL` alone reverts to `NO_LOG` on the next server restart without `binlog_row_metadata = FULL` under `[mariadbd]` in the option file, so the chain refused again at the next schema change after a restart. The backup remedy now carries the reader's own statement — `SET PERSIST binlog_row_metadata = 'FULL'` on MySQL; `SET GLOBAL binlog_row_metadata = 'FULL'` plus the option-file line on MariaDB — on both the reader's refusal and the lanes' own `CHARSET-HISTORY-UNRECORDED` window check. A VStream source (PlanetScale, Vitess) keeps the unspelled setting. **Affected releases:** v0.158.0, the release that made the reader's hint flavor-aware. Pinned by `TestBackupCaptureReaderErr_KeepsTheReadersFlavorStatement`, `TestCDCReader_RowMetadataFullStatement_PerFlavor`, and end to end through both lanes on MySQL 8.4 (`TestShapeAtPosition_MySQLPaths`) and MariaDB `NO_LOG` (the `CharsetDDLReplay` backup tests).
+
 ## [0.158.0] - 2026-10-11
 
 ### Fixed

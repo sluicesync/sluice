@@ -663,6 +663,16 @@ func rowMetadataFullStatement(flavor Flavor) string {
 	return rowMetadataFullMySQL
 }
 
+// RowMetadataFullStatement is [rowMetadataFullStatement] for this reader's
+// flavor, for a caller that re-hints one of its refusals — the backup
+// capture lanes (pipeline.backupReplayMismatchHintFor, Bug 302), which
+// replace the sync remedy with a fresh full and would otherwise drop the
+// flavor's statement. The VStream reader does not implement it: its source
+// sets no binlog_row_metadata an operator can reach.
+func (r *CDCReader) RowMetadataFullStatement() string {
+	return rowMetadataFullStatement(r.flavor)
+}
+
 // The two spellings of rowMetadataFullStatement. Every refusal that names
 // the setting knows its reader's flavor; the operator docs, which do not,
 // state both (docs/operator/error-codes.md).

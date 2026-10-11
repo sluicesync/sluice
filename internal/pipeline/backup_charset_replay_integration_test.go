@@ -103,9 +103,7 @@ func assertLaneCharsetRefusal(t *testing.T, what string, err error) {
 	if !ok || ce.Code != sluicecode.CodeCDCSchemaReplayMismatch {
 		t.Fatalf("%s: err = %v; want %s", what, err, sluicecode.CodeCDCSchemaReplayMismatch)
 	}
-	if ce.Hint != backupReplayMismatchHint {
-		t.Errorf("%s: hint = %q; want %q", what, ce.Hint, backupReplayMismatchHint)
-	}
+	assertMariaDBBackupHint(t, what, ce.Hint)
 	lane := strings.Contains(err.Error(), "Refusing before the window commits") && strings.Contains(err.Error(), "(utf8mb4 → latin1)")
 	reader := strings.Contains(err.Error(), "does not record the character set")
 	if !lane && !reader {
@@ -169,8 +167,18 @@ func TestIncrementalBackup_CharsetDDLReplay_RefusalNamesFreshFull_MariaDBNoLog(t
 	if !ok || ce.Code != sluicecode.CodeCDCSchemaReplayMismatch {
 		t.Fatalf("backup incremental: err = %v; want %s", err, sluicecode.CodeCDCSchemaReplayMismatch)
 	}
-	if ce.Hint != backupReplayMismatchHint {
-		t.Errorf("the one-shot lane's refusal hint = %q; want %q", ce.Hint, backupReplayMismatchHint)
+	assertMariaDBBackupHint(t, "backup incremental", ce.Hint)
+}
+
+// assertMariaDBBackupHint requires the backup lanes' remedy with the MariaDB
+// reader's own statement for binlog_row_metadata=FULL (Bug 302): the
+// option-file line is what keeps the setting across a restart.
+func assertMariaDBBackupHint(t *testing.T, what, hint string) {
+	t.Helper()
+	if !strings.HasPrefix(hint, "take a fresh full backup") ||
+		!strings.Contains(hint, "SET GLOBAL binlog_row_metadata = 'FULL'") ||
+		!strings.Contains(hint, "binlog_row_metadata = FULL under [mariadbd] in its option file") {
+		t.Errorf("%s: hint = %q; want the fresh-full remedy with MariaDB's SET GLOBAL and option-file statement", what, hint)
 	}
 }
 

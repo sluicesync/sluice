@@ -12,7 +12,8 @@ import (
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
-// backupReplayMismatchHint is the remedy a backup-chain capture lane gives a
+// backupReplayMismatchHintHead and backupReplayMismatchHintTail frame the
+// remedy ([backupReplayMismatchHintFor]) a backup-chain capture lane gives a
 // SLUICE-E-CDC-SCHEMA-REPLAY-MISMATCH refusal (GC-37 (j) third review).
 //
 // The MySQL reader's own hint is `sync --restart-from-scratch`, which does
@@ -31,19 +32,51 @@ import (
 // it — which refuses BEFORE any row of the table is decoded, so the hint
 // names the charset harm conditionally and adds the setting that lets
 // future windows decode across such a change.
-const backupReplayMismatchHint = "take a fresh full backup of this source (sluice backup full), and start the chain from it; " +
-	"setting binlog_row_metadata=FULL on the source first lets later windows decode rows recorded before a schema change. " +
-	"If the refusal names a CHARACTER SET change, windows this chain committed before the refusal may hold rows decoded by the " +
-	"wrong charset, and no restore of them recovers the values"
+//
+// The setting is spelled for the reader's flavor when the reader can say
+// (Bug 302). The reader's own hint names the runnable statement, and this
+// re-hint used to replace it with a bare "binlog_row_metadata=FULL", so a
+// MariaDB operator lost the option-file line that keeps the setting across
+// a restart (MariaDB has no SET PERSIST, and SET GLOBAL alone reverts).
+const (
+	backupReplayMismatchHintHead = "take a fresh full backup of this source (sluice backup full), and start the chain from it; " +
+		"setting binlog_row_metadata=FULL on the source first"
+	backupReplayMismatchHintTail = " lets later windows decode rows recorded before a schema change. " +
+		"If the refusal names a CHARACTER SET change, windows this chain committed before the refusal may hold rows decoded by the " +
+		"wrong charset, and no restore of them recovers the values"
+)
+
+// rowMetadataStatementReporter is implemented by a CDC reader that knows
+// the runnable statement setting binlog_row_metadata=FULL on its source:
+// the MySQL-family binlog reader, whose flavor decides between MySQL's
+// SET PERSIST and MariaDB's SET GLOBAL plus option-file line. The pipeline
+// never imports an engine package, so it asks the reader.
+type rowMetadataStatementReporter interface {
+	RowMetadataFullStatement() string
+}
+
+// backupReplayMismatchHintFor is the backup-lane remedy for a
+// SLUICE-E-CDC-SCHEMA-REPLAY-MISMATCH refusal raised while capturing from
+// cdc, carrying the reader's statement for the setting when it reports one.
+// A reader that reports none (VStream) gets the setting unspelled.
+func backupReplayMismatchHintFor(cdc any) string {
+	stmt := ""
+	if r, ok := cdc.(rowMetadataStatementReporter); ok {
+		if s := r.RowMetadataFullStatement(); s != "" {
+			stmt = " (" + s + ")"
+		}
+	}
+	return backupReplayMismatchHintHead + stmt + backupReplayMismatchHintTail
+}
 
 // backupCaptureReaderErr is how both backup capture lanes surface the CDC
 // reader's terminal error: wrapped as before, and a replay-mismatch refusal
-// re-hinted with [backupReplayMismatchHint] so the operator is not sent to a
-// sync flag.
-func backupCaptureReaderErr(e error) error {
+// re-hinted with [backupReplayMismatchHintFor] so the operator is not sent
+// to a sync flag and keeps the reader's flavor-specific statement.
+func backupCaptureReaderErr(cdc any, e error) error {
 	err := fmt.Errorf("cdc reader: %w", e)
 	if ce, ok := sluicecode.FromError(e); ok && ce.Code == sluicecode.CodeCDCSchemaReplayMismatch {
-		return sluicecode.Wrap(ce.Code, backupReplayMismatchHint, err)
+		return sluicecode.Wrap(ce.Code, backupReplayMismatchHintFor(cdc), err)
 	}
 	return err
 }
@@ -111,7 +144,7 @@ func refuseUnrecordedCharsetReplay(cdc any, before, after *ir.Schema) error {
 		return nil
 	}
 	sort.Strings(found)
-	return sluicecode.Wrap(sluicecode.CodeCDCSchemaReplayMismatch, backupReplayMismatchHint,
+	return sluicecode.Wrap(sluicecode.CodeCDCSchemaReplayMismatch, backupReplayMismatchHintFor(cdc),
 		fmt.Errorf("CHARSET-HISTORY-UNRECORDED: the source changed the charset of %s during this window, and this window "+
 			"decoded those tables' rows by the NEW charset without the change stream reaching the ALTER — so they are rows "+
 			"written in the old charset, decoded wrong. This source records no per-event charset (MariaDB "+

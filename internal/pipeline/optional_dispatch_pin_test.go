@@ -129,6 +129,11 @@ var (
 	// charset would commit them again. The VStream reader is pinned
 	// in-package (mysql.charsetShapeReporter) because its type is unexported.
 	_ charsetShapeReporter = (*mysql.CDCReader)(nil)
+	// Bug 302: the backup lanes' replay-mismatch re-hint asks the binlog
+	// reader for its flavor's binlog_row_metadata=FULL statement. A rename
+	// would not lose data; it would silently drop MariaDB's option-file
+	// line from the remedy again, so a restart reverts the setting.
+	_ rowMetadataStatementReporter = (*mysql.CDCReader)(nil)
 	// GC-41: the ONLY input that lets a Postgres slot's ack advance. The
 	// reader never acks past what is released, so an assertion that quietly
 	// stopped matching would not lose data — it would freeze

@@ -218,6 +218,11 @@ func runBackupShape(t *testing.T, eng ir.Engine, src, tgt, path, history string,
 	}
 	if want == shapeRefusesCapture {
 		wantCode(t, captureErr, sluicecode.CodeCDCSchemaReplayMismatch, "capture")
+		// Bug 302: the backup re-hint keeps the reader's MySQL statement.
+		if ce, _ := sluicecode.FromError(captureErr); !strings.HasPrefix(ce.Hint, "take a fresh full backup") ||
+			!strings.Contains(ce.Hint, "SET PERSIST binlog_row_metadata = 'FULL'") {
+			t.Errorf("capture: hint = %q; want the fresh-full remedy with MySQL's SET PERSIST statement", ce.Hint)
+		}
 		if n := committedChangeRecords(t, store); n != 0 {
 			t.Errorf("the refused capture committed %d change records; want 0", n)
 		}
