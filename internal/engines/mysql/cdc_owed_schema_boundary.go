@@ -164,6 +164,14 @@ func (r *CDCReader) settleSchemaBoundaries(ctx context.Context, tables map[strin
 	}
 	sort.Strings(names)
 	for _, qn := range names {
+		// The settle uses the table's new shape as its next row would, so it
+		// is judged as that row would be (cdc_column_identity.go) — scope-gated
+		// like the row path, which drops an excluded table's rows first.
+		if r.scopeAllowed == nil || r.tableInScope(qn) {
+			if err := r.judgeColumnIdentity(qn); err != nil {
+				return err
+			}
+		}
 		if err := r.maybeSnapshotSchemaB1(ctx, qn, tables[qn], out); err != nil {
 			return err
 		}

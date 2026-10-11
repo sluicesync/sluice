@@ -120,6 +120,16 @@ var ErrColumnOrderChanged = errors.New("COLUMN-ORDER-CHANGED")
 // again; the remedy is a re-copy.
 var ErrDeferredSchemaChange = errors.New("DEFERRED-SCHEMA-CHANGE")
 
+// ErrColumnIdentityChanged classifies a MySQL binlog reader's refusal of a
+// table whose ALTERs, read from the binlog's own statement text, left a
+// column name of its last decoded shape holding another column — a DROP
+// and re-ADD of the name, a RENAME of another column onto it, a rename swap
+// whose declared order was then restored (RENAME-SWAP-INVISIBLE,
+// engines/mysql/cdc_column_identity.go). No comparison of shapes can see
+// it, so the target cannot prove it was mirrored. The binlog is the same on
+// a restart, so it refuses again; the remedy is a re-copy.
+var ErrColumnIdentityChanged = errors.New("COLUMN-IDENTITY-CHANGED")
+
 // PreAlterReplayWedgeMarker is the grep-stable word naming the pre-ALTER
 // replay wedge (GC-44 F24): a Postgres source transaction that wrote a
 // table and then dropped, renamed or retyped one of its columns, on a

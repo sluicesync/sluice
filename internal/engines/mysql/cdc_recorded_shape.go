@@ -86,6 +86,12 @@ func recordedColumnNames(tm *replication.TableMapEvent) []string {
 // reader's position. It refuses rather than return a shape it cannot stand
 // behind.
 func (r *CDCReader) shapeAtEvent(ctx context.Context, qn string, tbl *tableSchema, ev *replication.RowsEvent) (*tableSchema, error) {
+	// RENAME-SWAP-INVISIBLE: no shape stands for an event whose table the
+	// ALTERs since its last decoded shape left with a name holding another
+	// column, whatever the metadata (cdc_column_identity.go).
+	if err := r.judgeColumnIdentity(qn); err != nil {
+		return nil, err
+	}
 	if names := recordedColumnNames(ev.Table); names != nil {
 		shape, err := r.recordedShape(ctx, qn, tbl, ev.Table, names)
 		if err != nil {

@@ -301,6 +301,11 @@ type CDCReader struct {
 	knownShapes   map[string][]*tableSchema
 	recordedViews map[uint64]recordedView
 
+	// columnIdentity is each table's column-identity changes since its last
+	// decoded shape, read from the DDL text (RENAME-SWAP-INVISIBLE,
+	// cdc_column_identity.go). Pump goroutine only.
+	columnIdentity columnIdentityTables
+
 	// unforwarded holds the StreamChanges-time fingerprint of the
 	// schema objects the boundary projection does not carry (unique keys,
 	// foreign keys, CHECKs, column defaults and attributes), keyed by
@@ -1538,6 +1543,9 @@ func (r *CDCReader) dispatch(ctx context.Context, ev *replication.BinlogEvent, o
 				return err
 			}
 			r.charsetShapes.crossedAlter(string(e.Query))
+			// RENAME-SWAP-INVISIBLE: what the statement did to column
+			// identities, judged before the table's next shape is used.
+			r.noteColumnIdentityDDL(ctx, string(e.Query), stmtSchema)
 			// SLM-1: the cache about to be cleared is the last shape each
 			// decoded table was known by — keep that as the refusal's prev
 			// before it is gone, so the rebuild after this DDL has something

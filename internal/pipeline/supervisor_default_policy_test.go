@@ -246,6 +246,9 @@ func TestSupervisor_RefusalsARestartRepeatsAreNotRestarted(t *testing.T) {
 		// wraps it (engines/mysql/cdc_deferred_order.go), under the
 		// pipeline's source-reader frame.
 		"DEFERRED-SCHEMA-CHANGE": fmt.Errorf("pipeline: source cdc reader: mysql: cdc: app.t: %w: column \"b\" is DateTime(6)", ir.ErrDeferredSchemaChange),
+		// Wrapped the way the MySQL binlog reader's column-identity ledger
+		// wraps it (engines/mysql/cdc_column_identity.go).
+		"COLUMN-IDENTITY-CHANGED": fmt.Errorf("pipeline: source cdc reader: mysql: cdc: app.t: %w: \"c\" is a new column", ir.ErrColumnIdentityChanged),
 		// Coded (SLUICE-E-CDC-KEY-MATCHED-MULTIPLE-ROWS): built by the real
 		// shared constructor every applier calls, so the alias between the
 		// appliershared and ir sentinels is part of what is pinned.

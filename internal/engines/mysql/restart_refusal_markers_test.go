@@ -21,6 +21,7 @@ func TestRestartRefusalSentinelsAreTheMarkers(t *testing.T) {
 		{ir.ErrShardedTargetVindexUpdate, shardedTargetVindexUpdateMarker},
 		{ir.ErrCharsetNotDecodable, charsetNotDecodableMarker},
 		{ir.ErrDSNTimeZoneNotUTC, "DSN-TIME-ZONE-NOT-UTC"},
+		{ir.ErrColumnIdentityChanged, "COLUMN-IDENTITY-CHANGED"},
 	} {
 		if tc.sentinel.Error() != tc.marker {
 			t.Errorf("sentinel text %q != marker %q", tc.sentinel.Error(), tc.marker)
