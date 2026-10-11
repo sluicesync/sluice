@@ -546,7 +546,7 @@ func straddleFirstRecordLSN(t *testing.T, dsn string, from, to pglogrepl.LSN, xi
 	}
 	var s sql.NullString
 	if err := db.QueryRow(
-		"SELECT min(start_lsn)::text FROM pg_get_wal_records_info($1::pg_lsn, $2::pg_lsn) WHERE xid = $3::text::xid",
+		"SELECT min(start_lsn)::text FROM pg_get_wal_records_info($1::pg_lsn, $2::pg_lsn) WHERE xid = $3",
 		from.String(), to.String(), xid,
 	).Scan(&s); err != nil {
 		t.Fatalf("read T's first record: %v", err)
