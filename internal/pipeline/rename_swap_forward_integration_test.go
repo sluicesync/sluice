@@ -20,7 +20,10 @@
 //	         against the cold-start seed, a warm resume across the change,
 //	         a restart after the refusal, the operator's reconcile, and
 //	         --schema-changes=refuse;
-//	servers: MySQL 8.0, MySQL 8.4, MariaDB 11.4, Postgres 16.
+//	servers: MySQL 8.0, MySQL 8.4, MariaDB 11.4 — each under its default
+//	         binlog_row_metadata and again under FULL, where the reader
+//	         decodes by the event's own column names (Bug 301) — and
+//	         Postgres 16.
 //
 // The grade is the target against the source — declared column names in
 // order, and every row's values by name — never the stream's own logs. A
@@ -583,7 +586,16 @@ func rsfRunPreUpgradeCell(t *testing.T, srv rsfServer, swapWhileStopped bool, id
 	what := fmt.Sprintf("%s/pre-upgrade/swap-while-stopped=%t", srv.label, swapWhileStopped)
 	src.exec(t, shape.create)
 	cell.coldStartAndStop(t, "kd", 3)
-	tgt.exec(t, "DROP TABLE sluice_cdc_column_order")
+	if srv.engine == "mariadb" {
+		// The same records-free state, without the resume re-creating the
+		// table: on MariaDB the applier's CREATE is logged with its session
+		// prefix, which the look-ahead cannot bound to one table, and source
+		// and target share this server's binlog — so the source stream would
+		// refuse its own target's DDL (BUG301-MARIADB-SELF-DDL, filed).
+		tgt.exec(t, "DELETE FROM sluice_cdc_column_order")
+	} else {
+		tgt.exec(t, "DROP TABLE sluice_cdc_column_order")
+	}
 
 	if swapWhileStopped {
 		before := rsfRead(t, tgt)
@@ -695,6 +707,51 @@ func TestRenameSwapForward_MariaDB(t *testing.T) {
 	dsn, cleanup := startMariaDBBinlog(t)
 	defer cleanup()
 	rsfRunServer(t, rsfMySQLFamily(t, "mariadb-11.4", "mariadb", dsn, buildMySQLDSN))
+}
+
+// rsfFullMetadata switches a MySQL-family server to binlog_row_metadata=FULL
+// before any cell runs, and checks the server took it. Under FULL the
+// binlog reader decodes each row by the names its own TABLE_MAP recorded
+// (Bug 301), not by a catalog read — a different path to the same schema
+// boundary, so the whole matrix runs again on it.
+func rsfFullMetadata(t *testing.T, rootDSN string) {
+	t.Helper()
+	conn, err := sql.Open("mysql", rootDSN)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := conn.Exec("SET GLOBAL binlog_row_metadata = FULL"); err != nil {
+		t.Fatalf("set binlog_row_metadata: %v", err)
+	}
+	var got string
+	if err := conn.QueryRow("SELECT @@global.binlog_row_metadata").Scan(&got); err != nil || got != "FULL" {
+		t.Fatalf("binlog_row_metadata = %q (%v), want FULL", got, err)
+	}
+}
+
+func TestRenameSwapForward_MySQL80_FullMetadata(t *testing.T) {
+	t.Parallel()
+	dsn, _, cleanup := startMySQLBinlog(t)
+	defer cleanup()
+	rsfFullMetadata(t, dsn)
+	rsfRunServer(t, rsfMySQLFamily(t, "mysql-8.0/full", "mysql", dsn, buildMySQLDSN))
+}
+
+func TestRenameSwapForward_MySQL84_FullMetadata(t *testing.T) {
+	t.Parallel()
+	dsn, cleanup := rsfBootMySQL(t, "mysql:8.4")
+	defer cleanup()
+	rsfFullMetadata(t, dsn)
+	rsfRunServer(t, rsfMySQLFamily(t, "mysql-8.4/full", "mysql", dsn, buildMySQLDSN))
+}
+
+func TestRenameSwapForward_MariaDB_FullMetadata(t *testing.T) {
+	t.Parallel()
+	dsn, cleanup := startMariaDBBinlog(t)
+	defer cleanup()
+	rsfFullMetadata(t, dsn)
+	rsfRunServer(t, rsfMySQLFamily(t, "mariadb-11.4/full", "mariadb", dsn, buildMySQLDSN))
 }
 
 func TestRenameSwapForward_Postgres16(t *testing.T) {

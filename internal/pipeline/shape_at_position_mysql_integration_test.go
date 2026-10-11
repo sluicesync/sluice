@@ -22,8 +22,12 @@
 //
 // Outcomes that are not EXACT are each a pre-existing, documented loud
 // posture of a layer downstream of the reader, named in the table:
-//   - chain restore and the broker refuse a dropped column
-//     (SLUICE-E-BACKUP-SCHEMA-DELTA-UNSUPPORTED);
+//   - chain restore and the broker refuse a dropped column and a
+//     column-order change (SLUICE-E-BACKUP-SCHEMA-DELTA-UNSUPPORTED; the
+//     latter is RENAME-SWAP-FORWARD: a reorder and a rename swap are the
+//     same delta);
+//   - a warm resume refuses a column-order change (COLUMN-ORDER-CHANGED,
+//     the same reason);
 //   - a warm resume's first schema boundary is judged against the target
 //     (GC-44): a dropped column is kept on the target with a WARN, and a
 //     cross-family retype refuses RESUME-SCHEMA-DIVERGENCE.
@@ -66,10 +70,16 @@ const (
 	// code and writes nothing.
 	shapeRefusesCapture
 	// shapeRefusesRestore: the capture succeeds, restore refuses the
-	// dropped column's delta.
+	// window's schema delta (a dropped column, or a column-order change).
 	shapeRefusesRestore
 	// shapeRefusesResume: the warm resume refuses its first boundary.
 	shapeRefusesResume
+	// shapeRefusesResumeOrder: the warm resume refuses its first boundary
+	// as a column-order change (RENAME-SWAP-FORWARD): the rows decode
+	// faithfully by their recorded names, but a reorder and a rename swap
+	// are the same boundary, and only a swap would leave the target's
+	// earlier rows under the wrong names.
+	shapeRefusesResumeOrder
 )
 
 // e2eShape is one source history, run after the chain's full (or the
@@ -88,8 +98,12 @@ const e2ePre = "INSERT INTO kd VALUES (2,'102','202'),(5,'105','205'); UPDATE kd
 
 func e2eShapes() []e2eShape {
 	exact := map[string]shapeOutcome{"incremental": shapeExact, "stream": shapeExact, "resume": shapeExact}
+	// A column-order change decodes exactly under FULL and is then refused
+	// downstream, by chain replay and by the warm resume's boundary check
+	// alike (RENAME-SWAP-FORWARD).
+	order := map[string]shapeOutcome{"incremental": shapeRefusesRestore, "stream": shapeRefusesRestore, "resume": shapeRefusesResumeOrder}
 	return []e2eShape{
-		{name: "reorder", history: e2ePre + " ALTER TABLE kd MODIFY c VARCHAR(40) AFTER id; INSERT INTO kd(id,b,c) VALUES (3,'103','203');", full: exact},
+		{name: "reorder", history: e2ePre + " ALTER TABLE kd MODIFY c VARCHAR(40) AFTER id; INSERT INTO kd(id,b,c) VALUES (3,'103','203');", full: order},
 		{name: "add", history: e2ePre + " ALTER TABLE kd ADD COLUMN d INT; INSERT INTO kd VALUES (3,'103','203',3);", full: exact},
 		{
 			name: "drop", history: e2ePre + " ALTER TABLE kd DROP COLUMN c; INSERT INTO kd VALUES (3,'103');",
@@ -107,7 +121,7 @@ func e2eShapes() []e2eShape {
 			name: "two-close-together",
 			history: e2ePre + " ALTER TABLE kd ADD COLUMN d INT; INSERT INTO kd VALUES (4,'104','204',4);" +
 				" ALTER TABLE kd MODIFY c VARCHAR(40) FIRST; INSERT INTO kd(id,b,c,d) VALUES (3,'103','203',3);",
-			full: exact,
+			full: order,
 		},
 	}
 }
@@ -293,6 +307,11 @@ func runResumeShape(t *testing.T, eng ir.Engine, src, tgt, streamID, history str
 				// decoded by the shape they were written under: each must equal
 				// the source's row with the same id.
 				assertNoWrongRow(t, src, tgt)
+			case shapeRefusesResumeOrder:
+				if !errors.Is(err, ir.ErrColumnOrderChanged) {
+					t.Fatalf("warm resume: err = %v; want %v", err, ir.ErrColumnOrderChanged)
+				}
+				assertNoWrongRow(t, src, tgt)
 			default:
 				t.Fatalf("warm resume stopped: %v", err)
 			}
@@ -304,7 +323,7 @@ func runResumeShape(t *testing.T, eng ir.Engine, src, tgt, streamID, history str
 		}
 	}
 	stop(cancel, done)
-	if want == shapeRefusesCapture || want == shapeRefusesResume {
+	if want == shapeRefusesCapture || want == shapeRefusesResume || want == shapeRefusesResumeOrder {
 		t.Fatalf("warm resume did not refuse; target %s, source %s", tableSignature(t, tgt, "kd", nil), srcSig)
 	}
 	assertShapeOutcome(t, src, tgt, want)
