@@ -188,6 +188,7 @@ func (r *CDCReader) buildRecordedShape(ctx context.Context, qn string, tbl *tabl
 			if err != nil {
 				return nil, errRecordedColumnUntypable(tbl, name, err)
 			}
+			typ = withRecordedCollation(typ, tm, i, r.collationIDNames(ctx))
 			col, dt, native = &ir.Column{Name: name, Type: typ, Nullable: true}, meta.DataType, mariadbNativeNone
 			shape.synthesized = true
 			shape.tableMapTyped = append(shape.tableMapTyped, name)
@@ -368,6 +369,38 @@ func recordedLabelsAgree(d *tableSchema, j int, tm *replication.TableMapEvent, i
 // binaryCollationID is MySQL's `binary` collation: a BINARY/VARBINARY/BLOB
 // column records it, a character column never does.
 const binaryCollationID = 63
+
+// withRecordedCollation stamps the collation recorded for column i onto a
+// character type typed from the TABLE_MAP alone. The TABLE_MAP records a
+// character column's collation ID, not only its character set, and the
+// collation decides which values are one key: without it a deferred shape
+// could not see `_ci` → `_bin` on a key column folded behind a later retype
+// of that column, and rows distinct under the new collation merged on a
+// target whose key still compared under the old one (DEFERRED-KEY-COLLATION,
+// measured on MySQL 8.4 FULL). An ID the source's collation table does not
+// name is left unstamped, and the hold then cannot compare it.
+func withRecordedCollation(typ ir.Type, tm *replication.TableMapEvent, i int, nameOf func(uint64) string) ir.Type {
+	id, ok := tm.CollationMap()[i]
+	if !ok || id == binaryCollationID {
+		return typ
+	}
+	name := strings.ToLower(nameOf(id))
+	if name == "" {
+		return typ
+	}
+	switch v := typ.(type) {
+	case ir.Varchar:
+		v.Collation = name
+		return v
+	case ir.Char:
+		v.Collation = name
+		return v
+	case ir.Text:
+		v.Collation = name
+		return v
+	}
+	return typ
+}
 
 // bitWidthFromMeta decodes a BIT column's TABLE_MAP metadata: the low byte
 // is the bits beyond whole bytes, the high byte the whole bytes.

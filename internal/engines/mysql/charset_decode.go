@@ -377,6 +377,47 @@ func (r *CDCReader) collationCharsets(ctx context.Context) func(uint64) string {
 	}
 }
 
+// collationIDNames is the reader's naming function for a TABLE_MAP
+// collation ID's collation NAME: the source server's own table only, since
+// MySQL and MariaDB assign different collations to the same high IDs and a
+// static table would misname one of them — a misnamed collation would make
+// the deferred-shape hold refuse a change nobody made. A failed load names
+// nothing (the hold then cannot compare) and is retried like
+// [CDCReader.collationCharsets].
+func (r *CDCReader) collationIDNames(ctx context.Context) func(uint64) string {
+	if r.serverCollationIDNames == nil && time.Since(r.serverCollationIDNamesTried) >= serverCollationsRetry {
+		r.serverCollationIDNamesTried = time.Now()
+		lctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		r.serverCollationIDNames = loadServerCollationIDNames(lctx, r.db)
+		cancel()
+	}
+	server := r.serverCollationIDNames
+	return func(id uint64) string { return server[id] }
+}
+
+// loadServerCollationIDNames reads the source server's collation-ID → name
+// table: MariaDB's COLLATION_CHARACTER_SET_APPLICABILITY.FULL_COLLATION_NAME
+// (its per-charset uca1400 names, which is how information_schema.COLUMNS
+// spells them), else information_schema.COLLATIONS (MySQL). nil when both
+// fail. That the names match the catalog's spelling is bound by
+// TestCDCRecordedColumnTypes_EveryFamily (+_MariaDB): a misnamed collation
+// makes the hold refuse every character family there (mutation-run with
+// MariaDB's bare COLLATION_NAME, `uca1400_ai_ci`).
+func loadServerCollationIDNames(ctx context.Context, db *sql.DB) map[uint64]string {
+	if db == nil {
+		return nil
+	}
+	for _, q := range []string{
+		`SELECT ID, FULL_COLLATION_NAME FROM information_schema.COLLATION_CHARACTER_SET_APPLICABILITY WHERE ID IS NOT NULL`,
+		`SELECT ID, COLLATION_NAME FROM information_schema.COLLATIONS WHERE ID IS NOT NULL`,
+	} {
+		if m := queryCollationIDs(ctx, db, q); len(m) > 0 {
+			return m
+		}
+	}
+	return nil
+}
+
 // serverCollationsRetry bounds how often a failed collation-table load is
 // retried, so a persistent failure costs one query per interval, not one
 // per rows event.

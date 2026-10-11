@@ -33,6 +33,10 @@ var (
 	tVC20 = ir.Varchar{Length: 20, Charset: "utf8mb4"}
 	tVC5  = ir.Varchar{Length: 5, Charset: "utf8mb4"}
 	tVC80 = ir.Varchar{Length: 80, Charset: "utf8mb4"} // VARCHAR(20) utf8mb4 as the TABLE_MAP records it, in bytes
+	// tVCci / tVC80bin: a key column before and (recorded) after
+	// `MODIFY … COLLATE utf8mb4_bin` (DEFERRED-KEY-COLLATION).
+	tVCci    = ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: "utf8mb4_0900_ai_ci"}
+	tVC80bin = ir.Varchar{Length: 80, Charset: "utf8mb4", Collation: "utf8mb4_bin"}
 )
 
 // deferredShape builds a shape; synthesized when any column is approximate
@@ -132,6 +136,22 @@ func TestHoldDecodedOrder_DeferredShapeMatrix(t *testing.T) {
 		{"approximate: char widened", baseline(c("id", tInt), c("b", ir.Char{Length: 8, Charset: "utf8mb4"})), []step{{deferredShape(false, c("id", tInt), tm("b", ir.Char{Length: 36, Charset: "utf8mb4"})), typed}}},
 		{"approximate: char at its byte bound", baseline(c("id", tInt), c("b", ir.Char{Length: 8, Charset: "utf8mb4"})), []step{{deferredShape(false, c("id", tInt), tm("b", ir.Char{Length: 32, Charset: "utf8mb4"})), nil}}},
 		{"approximate: a character set sluice cannot size", baseline(c("id", tInt), c("b", ir.Varchar{Length: 20, Charset: "x-unknown"})), []step{{deferredShape(false, c("id", tInt), tm("b", ir.Varchar{Length: 1, Charset: "x-unknown"})), typed}}},
+		// DEFERRED-KEY-COLLATION: the TABLE_MAP records a character column's
+		// collation ID, which the reader names from the source's collation
+		// table; a recorded collation that differs from the basis refuses.
+		{"approximate: varchar collation changed", baseline(c("id", tInt), c("k", tVCci)), []step{{deferredShape(false, c("id", tInt), tm("k", tVC80bin)), typed}}},
+		{"approximate: char collation changed", baseline(c("id", tInt), c("k", ir.Char{Length: 8, Charset: "utf8mb4", Collation: "utf8mb4_general_ci"})), []step{{deferredShape(false, c("id", tInt), tm("k", ir.Char{Length: 32, Charset: "utf8mb4", Collation: "utf8mb4_bin"})), typed}}},
+		{"approximate: text collation changed", baseline(c("id", tInt), c("k", ir.Text{Size: ir.TextRegular, Charset: "utf8mb4", Collation: "utf8mb4_general_ci"})), []step{{deferredShape(false, c("id", tInt), tm("k", ir.Text{Size: ir.TextRegular, Charset: "utf8mb4", Collation: "utf8mb4_bin"})), typed}}},
+		{"approximate: PAD SPACE to NO PAD", baseline(c("id", tInt), c("k", ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: "utf8mb4_bin"})), []step{{deferredShape(false, c("id", tInt), tm("k", ir.Varchar{Length: 80, Charset: "utf8mb4", Collation: "utf8mb4_0900_bin"})), typed}}},
+		{"approximate: the same collation holds", baseline(c("id", tInt), c("k", tVCci)), []step{{deferredShape(false, c("id", tInt), tm("k", ir.Varchar{Length: 80, Charset: "utf8mb4", Collation: "UTF8MB4_0900_AI_CI"})), nil}}},
+		{
+			"approximate: a collation carried forward is held",
+			baseline(c("id", tInt), c("k", tVCci), c("c", tInt)),
+			[]step{
+				{deferredShape(false, c("id", tInt), tm("k", ir.Varchar{Length: 80, Charset: "utf8mb4", Collation: "utf8mb4_0900_ai_ci"}), c("c", tInt)), nil},
+				{deferredShape(false, c("id", tInt), tm("k", tVC80bin), c("c", tInt)), typed},
+			},
+		},
 		{
 			"approximate: what the TABLE_MAP does not record is not compared",
 			baseline(c("id", tInt),

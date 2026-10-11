@@ -1274,9 +1274,12 @@ func (v witnessVerdict) render() string {
 // binlog reader now refuses such a row before decoding it wherever the
 // binlog records the difference (engines/mysql/cdc_deferred_order.go,
 // including a character column widened past what the earlier shape could
-// hold), but not for a change only to a collation, which it does not
-// record — so this sentence claims nothing about the shape those earlier
-// rows were applied under.
+// hold, and a character column's collation where the source names the
+// recorded collation ID — DEFERRED-KEY-COLLATION), but a Postgres source
+// records no collation at all, and a boundary judged against the target
+// erases collation ([witnessCompareType], KEY-COLLATION-FIRST-BOUNDARY in
+// docs/dev/audit-backlog.md) — so this sentence claims nothing about the
+// shape those earlier rows were applied under.
 const refusedBeforeBoundary = "Refusing before the boundary is recorded or any change after it is applied; rows " +
 	"the stream read before it may already have been applied."
 

@@ -86,6 +86,14 @@ type CDCReader struct {
 	serverCollations      map[uint64]string
 	serverCollationsTried time.Time
 
+	// serverCollationIDNames is the source server's collation-ID → name
+	// table. It names the collation of a character column typed from the
+	// TABLE_MAP alone, which the deferred-shape hold compares
+	// ([CDCReader.collationIDNames], DEFERRED-KEY-COLLATION). Loaded like
+	// serverCollations.
+	serverCollationIDNames      map[uint64]string
+	serverCollationIDNamesTried time.Time
+
 	// serverCollationNames / serverCollationDefaults are the source's
 	// collation name → charset table and per-charset defaults, which the
 	// charset-DDL guard names a DDL's collation by ([guardCollationNamer]).

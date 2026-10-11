@@ -807,6 +807,18 @@ var rsfDoubleRetype = []struct{ name, create, retype, then string }{
 		"ALTER TABLE kd MODIFY COLUMN b VARCHAR(100); INSERT INTO kd (id,b,c) VALUES (99,CONCAT('x',REPEAT(' ',30)),991)",
 		"ALTER TABLE kd MODIFY COLUMN b VARBINARY(200); INSERT INTO kd (id,b,c) VALUES (100,'y',1000)",
 	},
+	{
+		// DEFERRED-KEY-COLLATION: a UNIQUE key column's collation changed
+		// `_ci` → `_bin`, then the column retyped. Row 99's 'A' is distinct
+		// from row 1's 'a' only under the new collation; applied ahead of
+		// the folded boundary it met the target's `_ci` key and merged into
+		// row 1 (measured, MySQL 8.0/8.4 FULL, before the reader named the
+		// TABLE_MAP's collation ID). Held on that collation.
+		"key-collation-then-varbinary",
+		"CREATE TABLE kd (id INT PRIMARY KEY, b VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci, c INT, UNIQUE KEY ub (b)); INSERT INTO kd VALUES (1,'a',20),(2,'bb',21),(3,'ccc',22);",
+		"ALTER TABLE kd MODIFY COLUMN b VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin; INSERT INTO kd (id,b,c) VALUES (99,'A',991)",
+		"ALTER TABLE kd MODIFY COLUMN b VARBINARY(80); INSERT INTO kd (id,b,c) VALUES (100,'y',1000)",
+	},
 }
 
 // rsfWarmPrimed is a warm resume of a stream that applied a row of the table

@@ -5,6 +5,7 @@ package mysql
 
 import (
 	"fmt"
+	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -126,6 +127,9 @@ func (b decodedShape) hold(qn string, cur *ir.Table, approximate map[string]bool
 			if err := holdRecordedLength(qn, col.Name, was, col.Type); err != nil {
 				return err
 			}
+			if !recordedCollationAgrees(was, col.Type) {
+				return deferredCollationRefusal(qn, col.Name, characterCollation(was), characterCollation(col.Type))
+			}
 			continue
 		} else if ir.SameColumnType(was, col.Type) {
 			continue
@@ -141,11 +145,12 @@ func (b decodedShape) hold(qn string, cur *ir.Table, approximate map[string]bool
 // temporal precision, decimal precision and scale, integer width and
 // signedness, float single/double, BIT width, ENUM/SET labels, string
 // size class and character set all survive. Cleared on both sides: what
-// the TABLE_MAP does not carry — a collation (recorded only as an ID the
-// shape names by character set; an ENUM's likewise) and an integer's
-// AUTO_INCREMENT — and a character column's length, which it DOES record
-// but in bytes (VARCHAR(40) utf8mb4 reads as 160), so it is held
-// separately, through the character set, by [holdRecordedLength].
+// the TABLE_MAP does not carry — an ENUM's collation and an integer's
+// AUTO_INCREMENT — and two properties it DOES record but that compare
+// separately: a character column's collation, recorded as an ID and held
+// by its name where the source names it ([recordedCollationAgrees]), and
+// its length, recorded in bytes (VARCHAR(40) utf8mb4 reads as 160) and
+// held through the character set ([holdRecordedLength]).
 // Without this, a column retyped twice hid its first
 // retype: `DATETIME` → `DATETIME(6)`, a row, → `VARCHAR(40)` left the
 // row's shape typed from the TABLE_MAP, and the row landed rounded in the
@@ -165,6 +170,37 @@ func tableMapRecorded(t ir.Type) ir.Type {
 		return ir.Enum{Values: v.Values}
 	}
 	return t
+}
+
+// recordedCollationAgrees is the collation half of holding an approximate
+// character column: the collation the TABLE_MAP recorded for it
+// ([withRecordedCollation]) against the basis's. A collation change is not
+// storage-neutral — `_ci` → `_bin` (or PAD SPACE → NO PAD) on a key column
+// changes which values are one key — so rows written under it must not
+// reach a target whose column still compares under the old one before any
+// boundary changes it: measured on MySQL 8.4 FULL, `MODIFY k … COLLATE
+// utf8mb4_bin`, a row 'A' beside the existing 'a', then `MODIFY k
+// VARBINARY(80)` — the warm resume merged 'A' into the row of 'a' on the
+// target's `_ci` key and only then refused at the folded boundary
+// (DEFERRED-KEY-COLLATION). Compared only where both sides name one: a
+// collation ID the source's table did not name is unstamped.
+func recordedCollationAgrees(was, now ir.Type) bool {
+	w, n := characterCollation(was), characterCollation(now)
+	return w == "" || n == "" || strings.EqualFold(w, n)
+}
+
+// characterCollation is a character type's declared collation, "" for any
+// other type.
+func characterCollation(t ir.Type) string {
+	switch v := t.(type) {
+	case ir.Varchar:
+		return v.Collation
+	case ir.Char:
+		return v.Collation
+	case ir.Text:
+		return v.Collation
+	}
+	return ""
 }
 
 // holdRecordedLength is the length half of holding an approximate
@@ -269,6 +305,15 @@ func deferredTypeRefusal(qn, col string, was, now ir.Type) error {
 		"stream knew. Its rows would be applied before the target's column changes type, and a target type that "+
 		"cannot hold them exactly may round or truncate them without an error; %s",
 		qn, ir.ErrDeferredSchemaChange, col, now, was, deferredWhy)
+}
+
+// deferredCollationRefusal refuses a character column whose collation
+// changed under a deferred shape.
+func deferredCollationRefusal(qn, col, was, now string) error {
+	return fmt.Errorf("mysql: cdc: %s: %w: column %q has collation %s at this binlog event and had %s at the last "+
+		"shape this stream knew. Its rows would be applied before the target's column changes collation, and on a "+
+		"key a target still comparing under %s can merge rows the source keeps apart; %s",
+		qn, ir.ErrDeferredSchemaChange, col, now, was, was, deferredWhy)
 }
 
 // deferredNoBasisRefusal refuses a deferred shape of a table the stream
