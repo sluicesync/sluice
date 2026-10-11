@@ -147,12 +147,16 @@ func runWedgePin(t *testing.T, cell twfbCell, ns string, sh wedgeShape, recover 
 	cell.tgt.exec(t, fmt.Sprintf(sh.drained, tbl))
 	assertWedge(startTWFBRun(cell.streamer()), "drained-model restart (the wedge)", false)
 
+	stale := cell.persistedPosition(t)
 	run = recover(t, cell, tbl)
 	for _, id := range []int{2, 3} {
 		if !cell.tgt.waitRow(t, tbl, id, run, 180*time.Second) {
 			t.Fatalf("[%s] the recovery never landed row %d (stream: %v)", sh.name, id, run.stop(t))
 		}
 	}
+	// Rows 2 and 3 land by the re-copy, before the recovery has persisted
+	// its anchor; stop it only once it is streaming.
+	cell.waitStreamingPast(t, run, stale)
 	if err := run.stop(t); err != nil && !errors.Is(err, context.Canceled) {
 		t.Errorf("[%s] the recovery run returned %v", sh.name, err)
 	}

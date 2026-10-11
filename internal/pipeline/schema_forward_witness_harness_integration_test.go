@@ -256,9 +256,25 @@ func (c twfbCell) persistedPosition(t *testing.T) string {
 // resume position is persisted — so a stop leaves a warm-resumable stream.
 func (c twfbCell) waitStreaming(t *testing.T, run *twfbRun) {
 	t.Helper()
+	c.waitStreamingPast(t, run, "")
+}
+
+// waitStreamingPast is [twfbCell.waitStreaming] for a run that starts with
+// a cdc-state row already on the target — a --restart-from-scratch
+// recovery keeps the stream's old row (only --reset-target-data clears
+// it), so "a position exists" is true before the run has done anything.
+// It waits for a position other than stale, the one persisted before the
+// run started: the recovery's own cold-start anchor. A recovery whose
+// copy has landed but whose anchor has not is still a cold start; stopping
+// it there abandons the new slot (the pre-anchor rule, Bug 177) and leaves
+// the old row pointing at the slot the recovery dropped, so the next
+// start warm-resumes a dead position and refuses (measured: the
+// 2026-10-11 pipeline-rest-streamer red on the wedge-recovery pins).
+func (c twfbCell) waitStreamingPast(t *testing.T, run *twfbRun, stale string) {
+	t.Helper()
 	deadline := time.Now().Add(120 * time.Second)
 	for time.Now().Before(deadline) {
-		if c.persistedPosition(t) != "" {
+		if p := c.persistedPosition(t); p != "" && p != stale {
 			// Let the CDC open settle past its own startup reads.
 			time.Sleep(2 * time.Second)
 			return

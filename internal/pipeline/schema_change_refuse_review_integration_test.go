@@ -211,12 +211,16 @@ func runMidTransactionAlterPin(t *testing.T, cell twfbCell, ns string, c midTran
 	assertWedgeRefused(t, cell, startTWFBRun(cell.streamer()), tbl, c.name+"/drained-model restart (the wedge)")
 
 	// The documented recovery for this stream shape.
+	stale := cell.persistedPosition(t)
 	run = recover(t, cell)
 	for _, id := range []int{2, 3} {
 		if !cell.tgt.waitRow(t, tbl, id, run, 120*time.Second) {
 			t.Fatalf("[%s] the recovery never landed row %d (stream: %v)", c.name, id, run.stop(t))
 		}
 	}
+	// A re-copy recovery lands rows 2 and 3 before its anchor is
+	// persisted; stop it only once it is streaming.
+	cell.waitStreamingPast(t, run, stale)
 	if err := run.stop(t); err != nil && !errors.Is(err, context.Canceled) {
 		t.Errorf("[%s] the recovery run returned %v", c.name, err)
 	}
