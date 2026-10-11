@@ -170,6 +170,19 @@ type VerifyTableResult struct {
 	// for forensic drill-in. Capped at the first 25 entries to
 	// keep reports readable; the full count is in SampleMismatch.
 	SampleMismatchPKs []string `json:"sample_mismatch_pks,omitempty"`
+	// ColumnsMissingOnTarget names the source columns the target table
+	// does not carry (sample depth only — it is the depth that reads
+	// columns). Non-empty is a MISMATCH: the source holds values the
+	// target has nowhere to keep, which no row count shows. Rows are not
+	// sampled for such a table; the missing names are the finding.
+	ColumnsMissingOnTarget []string `json:"columns_missing_on_target,omitempty"`
+	// ColumnsExtraOnTarget names target columns the source table does
+	// not carry (sample depth only). Informational, like
+	// [VerifyResult.ExtraOnTarget]: a target-only column holds nothing
+	// the source can be missing (a shard-injection column, an
+	// operator-added one), so it is reported, left out of the hash, and
+	// does not fail the table.
+	ColumnsExtraOnTarget []string `json:"columns_extra_on_target,omitempty"`
 	// Reason is non-empty when this table couldn't be verified
 	// (e.g. table not on target side, a count/sample error, engine
 	// doesn't support sampling). A Reason-carrying table renders as
@@ -388,31 +401,17 @@ func (v *Verifier) Run(ctx context.Context) (*VerifyResult, error) {
 		// and count toward TablesUnverified: the operator asked for
 		// sample depth and this table didn't get it (Bug 190).
 		if depth == VerifyDepthSample {
-			srcSV, srcOK := srcVerifier.(ir.SampleVerifier)
-			tgtSV, tgtOK := tgtVerifier.(ir.SampleVerifier)
-			switch {
-			case !srcOK || !tgtOK:
-				tr.Reason = "sample mode not supported on this engine (no ir.SampleVerifier implementation)"
+			if reason := v.sampleTable(ctx, srcVerifier, tgtVerifier, srcTable, tgtTable, sampleRows, sampleSeed, &tr); reason != "" {
+				tr.Reason = reason
 				result.Tables = append(result.Tables, tr)
 				result.Summary.TablesUnverified++
 				continue
-			default:
-				algo := ir.HashMD5
-				if v.StrictHash {
-					algo = ir.HashSHA256
-				}
-				if err := compareSampleHashes(ctx, srcSV, tgtSV, srcTable, tgtTable, sampleRows, sampleSeed, algo, &tr); err != nil {
-					tr.Reason = fmt.Sprintf("sample-hash error: %v", err)
-					result.Tables = append(result.Tables, tr)
-					result.Summary.TablesUnverified++
-					continue
-				}
 			}
 		}
 
 		result.Tables = append(result.Tables, tr)
 		switch {
-		case tr.CountMismatch || tr.SampleMismatch > 0:
+		case tr.CountMismatch || tr.SampleMismatch > 0 || len(tr.ColumnsMissingOnTarget) > 0:
 			result.Summary.TablesMismatch++
 		default:
 			result.Summary.TablesClean++
@@ -482,6 +481,9 @@ func (v *Verifier) renderText(r *VerifyResult) error {
 		case t.CountMismatch:
 			fmt.Fprintf(&sb, "%-40s MISMATCH source=%d target=%d (delta=%+d)\n",
 				t.Name, t.SourceRowCount, t.TargetRowCount, t.TargetRowCount-t.SourceRowCount)
+		case len(t.ColumnsMissingOnTarget) > 0:
+			fmt.Fprintf(&sb, "%-40s COLUMN-MISMATCH counts=%d/%d (rows not sampled: the target lacks source columns)\n",
+				t.Name, t.SourceRowCount, t.TargetRowCount)
 		case t.SampleMismatch > 0:
 			fmt.Fprintf(&sb, "%-40s SAMPLE-MISMATCH counts=%d/%d sampled=%d mismatch=%d\n",
 				t.Name, t.SourceRowCount, t.TargetRowCount, t.SampleSize, t.SampleMismatch)
@@ -496,6 +498,12 @@ func (v *Verifier) renderText(r *VerifyResult) error {
 			fmt.Fprintf(&sb, "%-40s OK rows=%d sampled=%d clean\n", t.Name, t.SourceRowCount, t.SampleSize)
 		default:
 			fmt.Fprintf(&sb, "%-40s OK rows=%d\n", t.Name, t.SourceRowCount)
+		}
+		if len(t.ColumnsMissingOnTarget) > 0 {
+			fmt.Fprintf(&sb, "   column(s) missing on target: %s\n", strings.Join(t.ColumnsMissingOnTarget, ", "))
+		}
+		if len(t.ColumnsExtraOnTarget) > 0 {
+			fmt.Fprintf(&sb, "   column(s) on target only (informational; not hashed): %s\n", strings.Join(t.ColumnsExtraOnTarget, ", "))
 		}
 	}
 	if len(r.ExtraOnTarget) > 0 {
@@ -516,6 +524,96 @@ func (v *Verifier) renderText(r *VerifyResult) error {
 	return err
 }
 
+// sampleTable runs sample depth for one table into tr. It returns a
+// non-empty reason when the table could not be sampled at all (the
+// caller marks it unverified); a source column missing on the target is
+// recorded on tr as a mismatch and returns "" without sampling — the
+// missing names are the finding.
+func (v *Verifier) sampleTable(ctx context.Context, srcVerifier, tgtVerifier ir.Verifier, srcTable, tgtTable *ir.Table, n int, seed int64, tr *VerifyTableResult) string {
+	srcSV, srcOK := srcVerifier.(ir.SampleVerifier)
+	tgtSV, tgtOK := tgtVerifier.(ir.SampleVerifier)
+	if !srcOK || !tgtOK {
+		return "sample mode not supported on this engine (no ir.SampleVerifier implementation)"
+	}
+	plan, err := planSampleColumns(srcTable, tgtTable)
+	if err != nil {
+		return fmt.Sprintf("sample-hash error: %v", err)
+	}
+	tr.ColumnsMissingOnTarget = plan.missing
+	tr.ColumnsExtraOnTarget = plan.extra
+	if len(plan.missing) > 0 {
+		return ""
+	}
+	algo := ir.HashMD5
+	if v.StrictHash {
+		algo = ir.HashSHA256
+	}
+	if err := compareSampleHashes(ctx, srcSV, tgtSV, srcTable, tgtTable, plan.cols, n, seed, algo, tr); err != nil {
+		return fmt.Sprintf("sample-hash error: %v", err)
+	}
+	return ""
+}
+
+// sampleColumnPlan is what [planSampleColumns] decides for one table:
+// the column plan both sides hash, and the columns only one side has.
+type sampleColumnPlan struct {
+	cols    ir.SampleColumns
+	missing []string // source columns the target lacks, sorted
+	extra   []string // target columns the source lacks, sorted
+}
+
+// planSampleColumns fixes, ONCE, which columns sample-mode hashes and in
+// what order — the fix for VERIFY-SAMPLE-COLUMN-ORDER. Each side used to
+// hash its own columns in its own declared order, so the comparison
+// matched columns by POSITION: a target whose `b` and `c` held each
+// other's values, declared in swapped order (exactly what a RENAME swap
+// leaves), hashed identically to its source and reported clean —
+// measured on MySQL and Postgres. Matching by NAME, in one order both
+// sides share, makes a value under the wrong name change the hash, and
+// lets a genuine reorder (same values, same names, different declared
+// order) verify clean instead of falsely mismatching.
+//
+// The order is the source column names sorted bytewise: independent of
+// either side's declaration, so neither side's DDL can steer it. Names
+// match exactly; a case-only difference reads as one missing and one
+// extra column, which is loud rather than silent.
+//
+// The key is the SOURCE primary key, read by name on both sides: the
+// rows are identified as the source identifies them, whatever key the
+// target declares. A source with no primary key cannot be sampled
+// deterministically and is refused (the table lands SKIPPED, unverified).
+func planSampleColumns(src, tgt *ir.Table) (sampleColumnPlan, error) {
+	if src.PrimaryKey == nil || len(src.PrimaryKey.Columns) == 0 {
+		return sampleColumnPlan{}, errors.New("table has no primary key (sample-mode requires a PK for deterministic sampling)")
+	}
+	onTarget := make(map[string]struct{}, len(tgt.Columns))
+	for _, c := range tgt.Columns {
+		onTarget[c.Name] = struct{}{}
+	}
+	onSource := make(map[string]struct{}, len(src.Columns))
+	var p sampleColumnPlan
+	for _, c := range src.Columns {
+		onSource[c.Name] = struct{}{}
+		if _, ok := onTarget[c.Name]; ok {
+			p.cols.Hashed = append(p.cols.Hashed, c.Name)
+		} else {
+			p.missing = append(p.missing, c.Name)
+		}
+	}
+	for _, c := range tgt.Columns {
+		if _, ok := onSource[c.Name]; !ok {
+			p.extra = append(p.extra, c.Name)
+		}
+	}
+	sort.Strings(p.cols.Hashed)
+	sort.Strings(p.missing)
+	sort.Strings(p.extra)
+	for _, k := range src.PrimaryKey.Columns {
+		p.cols.Key = append(p.cols.Key, k.Column)
+	}
+	return p, nil
+}
+
 // compareSampleHashes runs SampleRowHashes on both sides with the
 // same n + seed (so both engines select the same row subset), then
 // walks the two sorted lists side-by-side to detect mismatches:
@@ -530,12 +628,12 @@ func (v *Verifier) renderText(r *VerifyResult) error {
 //
 // Const for the per-table mismatch-PK cap; full count remains in
 // SampleMismatch even when the slice is truncated.
-func compareSampleHashes(ctx context.Context, src, tgt ir.SampleVerifier, srcTable, tgtTable *ir.Table, n int, seed int64, algo ir.HashAlgorithm, tr *VerifyTableResult) error {
-	srcSamples, err := src.SampleRowHashes(ctx, srcTable, n, seed, algo)
+func compareSampleHashes(ctx context.Context, src, tgt ir.SampleVerifier, srcTable, tgtTable *ir.Table, cols ir.SampleColumns, n int, seed int64, algo ir.HashAlgorithm, tr *VerifyTableResult) error {
+	srcSamples, err := src.SampleRowHashes(ctx, srcTable, cols, n, seed, algo)
 	if err != nil {
 		return fmt.Errorf("source-side: %w", err)
 	}
-	tgtSamples, err := tgt.SampleRowHashes(ctx, tgtTable, n, seed, algo)
+	tgtSamples, err := tgt.SampleRowHashes(ctx, tgtTable, cols, n, seed, algo)
 	if err != nil {
 		return fmt.Errorf("target-side: %w", err)
 	}

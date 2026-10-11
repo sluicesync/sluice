@@ -252,9 +252,11 @@ cannot be independent evidence about itself. A comparison against a live
 source (`sluice verify`) or an actual restore narrows that gap without closing
 it: `sluice verify` compares only row counts across engines and a hash sample
 of rows same-engine, and a restore replays whatever values the chain holds.
-Neither detects a chain captured with values under the wrong column names (a
-MySQL/MariaDB binlog chain written before v0.158.0 across a column reorder,
-swap or `ENUM` label reorder, Bug 301). A MariaDB `NO_LOG` chain whose large
+Neither reliably detects a chain captured with values under the wrong column
+names (a MySQL/MariaDB binlog chain written before v0.158.0 across a column
+reorder, swap or `ENUM` label reorder, Bug 301): those are the rows written in
+a window before the change, and a same-engine sample — which compares columns
+by name after v0.158.0 — flags one only if it happens to sample it. A MariaDB `NO_LOG` chain whose large
 `UNSIGNED` values were recorded as negatives (v0.99.271–v0.157.2) fails loudly
 only when restored into MariaDB (out of range); restored into Postgres, it
 lands the negatives. Treat

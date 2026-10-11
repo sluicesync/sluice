@@ -250,7 +250,7 @@ func TestRawCopyAndSampleHashes_PinnedThroughTxnModePooler(t *testing.T) {
 	if !ok {
 		t.Fatalf("SchemaReader %T does not implement ir.SampleVerifier", srdr)
 	}
-	pooled, err := sv.SampleRowHashes(ctx, table, 10, 7, ir.HashMD5)
+	pooled, err := sv.SampleRowHashes(ctx, table, selfSampleColumns(table), 10, 7, ir.HashMD5)
 	if err != nil {
 		t.Fatalf("SampleRowHashes via txn-mode pooler: %v", err)
 	}
@@ -265,7 +265,7 @@ func TestRawCopyAndSampleHashes_PinnedThroughTxnModePooler(t *testing.T) {
 		}
 	}()
 	refSV := refRdr.(ir.SampleVerifier)
-	ref, err := refSV.SampleRowHashes(ctx, table, 10, 7, ir.HashMD5)
+	ref, err := refSV.SampleRowHashes(ctx, table, selfSampleColumns(table), 10, 7, ir.HashMD5)
 	if err != nil {
 		t.Fatalf("SampleRowHashes ref: %v", err)
 	}

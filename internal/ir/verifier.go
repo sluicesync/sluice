@@ -57,8 +57,9 @@ type Verifier interface {
 // clear "sample mode not supported on this engine" operational error.
 //
 // **Same-engine constraint** (v0.14.0 MVP): sample mode compares
-// server-side row hashes computed via MD5(CONCAT_WS('|', col::text,
-// ...)). The text rendering of values is engine-specific (MySQL
+// server-side row hashes computed over each column's text rendering,
+// read by name in the order [SampleColumns] fixes. The text rendering
+// of values is engine-specific (MySQL
 // TINYINT(1) → 0/1 vs PG BOOLEAN → t/f, etc.), so cross-engine
 // sample comparison would produce silent false-positive mismatches.
 // The orchestrator enforces source.Name() == target.Name() before
@@ -66,8 +67,11 @@ type Verifier interface {
 // future phase that adds client-side canonicalization.
 type SampleVerifier interface {
 	// SampleRowHashes returns up to n sampled rows from the table,
-	// each represented as its primary-key string + the hash of its
-	// concatenated column values. The seed parameter makes sampling
+	// each represented as its key string + the hash of the columns
+	// cols names, read BY NAME in exactly the order cols gives — never
+	// in the table's own declared order (see [SampleColumns]). A name
+	// cols carries that the table does not have is an error, never a
+	// silently shorter hash. The seed parameter makes sampling
 	// deterministic across calls — passing the same seed to source
 	// and target picks the same row subset on both sides, so the
 	// returned hashes can be compared 1:1.
@@ -81,10 +85,40 @@ type SampleVerifier interface {
 	// the orchestrator can do an O(n) comparison.
 	//
 	// Returns an empty slice for an empty table (not an error).
-	// Returns an error when the table has no usable PK (sample mode
+	// Returns an error when cols names no key column (sample mode
 	// requires deterministic sampling), when n <= 0, or on any
 	// operational failure.
-	SampleRowHashes(ctx context.Context, table *Table, n int, seed int64, algo HashAlgorithm) ([]SampledRowHash, error)
+	SampleRowHashes(ctx context.Context, table *Table, cols SampleColumns, n int, seed int64, algo HashAlgorithm) ([]SampledRowHash, error)
+}
+
+// SampleColumns is the column plan one sample-mode comparison hashes on
+// BOTH sides. The orchestrator derives it once, from the source and
+// target tables together, and hands the same value to each engine —
+// which is what makes the two sides' hashes comparable at all.
+//
+// It exists because of VERIFY-SAMPLE-COLUMN-ORDER: each side used to
+// hash its own columns in its own declared order, so a target whose
+// columns held each other's values — a RENAME swap, source `kd(id, c,
+// b)` against target `kd(id, b, c)` holding the same POSITIONAL values
+// — hashed identically to its source and reported clean. Reading the
+// columns by name, in one order both sides share, makes a value under
+// the wrong name change the hash; it also stops a genuine reorder (the
+// same values under the same names, declared in a different order)
+// from reporting a false mismatch.
+//
+// Each column is also rendered INJECTIVELY (NULL distinct from the
+// empty string, a length prefix so no value can borrow a neighbour's
+// separator, bytes rather than a failed text cast for binary data) —
+// see each engine's SampleRowHashes for the rendering it uses.
+type SampleColumns struct {
+	// Key names the row-identity columns, in key order: the SOURCE
+	// table's primary key. The target is sampled by the same names, so
+	// both sides select the same rows and render the same key strings
+	// whatever key the target itself declares.
+	Key []string
+	// Hashed names the row-content columns, in the one canonical order
+	// both sides hash them in.
+	Hashed []string
 }
 
 // HashAlgorithm selects the hash function used by sample-mode verify
@@ -132,8 +166,8 @@ func (a HashAlgorithm) String() string {
 
 // SampledRowHash is one row's contribution to a sample-mode verify
 // comparison. PrimaryKey is the canonical string rendering of the
-// row's PK (composite PKs joined with '|'); Hash is the hex MD5 of
-// the row's concatenated column values.
+// row's [SampleColumns.Key] values (composite keys joined with '|');
+// Hash is the hex digest of its [SampleColumns.Hashed] values.
 type SampledRowHash struct {
 	PrimaryKey string
 	Hash       string

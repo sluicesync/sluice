@@ -64,7 +64,7 @@ func sampleFloatHashes(t *testing.T, ctx context.Context, dsn string) []ir.Sampl
 	if !ok {
 		t.Fatalf("SchemaReader %T does not implement ir.SampleVerifier", rdr)
 	}
-	hashes, err := sv.SampleRowHashes(ctx, table, 10, 42, ir.HashMD5)
+	hashes, err := sv.SampleRowHashes(ctx, table, selfSampleColumns(table), 10, 42, ir.HashMD5)
 	if err != nil {
 		t.Fatalf("SampleRowHashes: %v", err)
 	}
@@ -135,4 +135,20 @@ func TestSampleRowHashes_FloatCanonicalUnderEFDDefaults(t *testing.T) {
 				hashesA[i].PrimaryKey, hashesA[i].Hash)
 		}
 	}
+}
+
+// selfSampleColumns is the sample plan a table makes with ITSELF: its
+// primary key, and every column in declaration order. The orchestrator's
+// planner (pipeline.planSampleColumns) is what production uses; these
+// engine-level pins compare one table against itself or a byte-identical
+// twin, where any fixed column order is a fair plan.
+func selfSampleColumns(t *ir.Table) ir.SampleColumns {
+	var c ir.SampleColumns
+	for _, k := range t.PrimaryKey.Columns {
+		c.Key = append(c.Key, k.Column)
+	}
+	for _, col := range t.Columns {
+		c.Hashed = append(c.Hashed, col.Name)
+	}
+	return c
 }

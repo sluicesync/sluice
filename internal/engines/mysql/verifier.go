@@ -100,15 +100,16 @@ func whereAnd(lead, predicate string) string {
 // Postgres sibling — see that doc for the strategy + cross-engine
 // constraint discussion.
 //
-// MySQL-specific tweaks: identifier quoting via backticks; column
-// rendering via CAST(col AS CHAR) which renders integers as decimal,
-// floats as their default text repr, datetime/timestamp as canonical
-// MySQL form; CONCAT_WS skips NULLs same as PG.
+// Columns are read by name in the order cols fixes, never in the
+// table's declared order (VERIFY-SAMPLE-COLUMN-ORDER, [ir.SampleColumns]),
+// and each one is rendered by [mysqlSampleToken] — an injective
+// encoding, so NULL, the empty string, a value containing the
+// separator, and binary data each hash distinctly.
 //
 // Hash algorithm: MD5 (default) or SHA-256 via SHA2(..., 256) when
 // algo == HashSHA256. Both produce hex-string output of consistent
 // width (32 chars MD5; 64 chars SHA-256).
-func (r *SchemaReader) SampleRowHashes(ctx context.Context, table *ir.Table, n int, seed int64, algo ir.HashAlgorithm) ([]ir.SampledRowHash, error) {
+func (r *SchemaReader) SampleRowHashes(ctx context.Context, table *ir.Table, cols ir.SampleColumns, n int, seed int64, algo ir.HashAlgorithm) ([]ir.SampledRowHash, error) {
 	if table == nil {
 		return nil, errors.New("mysql: SampleRowHashes: table is nil")
 	}
@@ -118,27 +119,34 @@ func (r *SchemaReader) SampleRowHashes(ctx context.Context, table *ir.Table, n i
 	if n <= 0 {
 		return nil, fmt.Errorf("mysql: SampleRowHashes: n must be > 0, got %d", n)
 	}
-	pkCols, err := singleOrCompositePKColumns(table)
+	keyCols, err := sampleColumnsOf(table, cols.Key)
+	if err != nil {
+		return nil, fmt.Errorf("mysql: SampleRowHashes %s: key: %w", table.Name, err)
+	}
+	hashedCols, err := sampleColumnsOf(table, cols.Hashed)
 	if err != nil {
 		return nil, fmt.Errorf("mysql: SampleRowHashes %s: %w", table.Name, err)
 	}
-	cols := make([]string, len(table.Columns))
-	for i, c := range table.Columns {
-		cols[i] = fmt.Sprintf("IFNULL(CAST(%s AS CHAR), '')", quoteIdent(c.Name))
+	if len(keyCols) == 0 || len(hashedCols) == 0 {
+		return nil, fmt.Errorf("mysql: SampleRowHashes %s: the plan names %d key and %d hashed columns; sample-mode needs at least one of each (a PK for deterministic sampling, and something to hash)",
+			table.Name, len(keyCols), len(hashedCols))
 	}
-	pkExpr := strings.Join(quotedPKList(pkCols), ` , '|' , `)
-	pkSelect := fmt.Sprintf("CONCAT_WS('|', %s)", pkExpr)
-	if len(pkCols) == 1 {
-		pkSelect = fmt.Sprintf("CAST(%s AS CHAR)", quoteIdent(pkCols[0]))
+	tokens := make([]string, len(hashedCols))
+	for i, c := range hashedCols {
+		tokens[i] = mysqlSampleToken(c, algo)
 	}
-	concatExpr := "CONCAT_WS('|', " + strings.Join(cols, ", ") + ")"
-	var hashExpr string
-	switch algo {
-	case ir.HashSHA256:
-		hashExpr = "SHA2(" + concatExpr + ", 256)"
-	default:
-		hashExpr = "MD5(" + concatExpr + ")"
+	keys := make([]string, len(keyCols))
+	for i, c := range keyCols {
+		keys[i] = mysqlSampleKeyText(c)
 	}
+	pkSelect := keys[0]
+	if len(keys) > 1 {
+		pkSelect = "CONCAT_WS('|', " + strings.Join(keys, ", ") + ")"
+	}
+	// No NULL reaches CONCAT_WS (whose NULL-skipping is what made NULL
+	// and '' collide before): every token renders NULL as 'N'.
+	concatExpr := "CONCAT_WS('|', " + strings.Join(tokens, ", ") + ")"
+	hashExpr := mysqlDigest(concatExpr, algo)
 	q := fmt.Sprintf(
 		"SELECT %s AS pk, %s AS hash FROM %s%s ORDER BY MD5(CONCAT(%s, '%d')) LIMIT %d",
 		pkSelect, hashExpr,
@@ -291,26 +299,87 @@ func singleIntegerPKColumn(t *ir.Table) (string, bool) {
 	return "", false
 }
 
-// singleOrCompositePKColumns is the sample-mode equivalent of
-// singleIntegerPKColumn — returns the PK columns regardless of type
-// (sample-mode only needs to construct a deterministic ordering, not
-// arithmetic). Returns an error when there's no PK at all.
-func singleOrCompositePKColumns(t *ir.Table) ([]string, error) {
-	if t.PrimaryKey == nil || len(t.PrimaryKey.Columns) == 0 {
-		return nil, errors.New("table has no primary key (sample-mode requires a PK for deterministic sampling)")
+// sampleColumnsOf resolves names against t's columns, in the order
+// names gives. A name t does not carry is an error: the orchestrator
+// planned the comparison from both tables, so a miss here means the
+// plan and the table disagree, and hashing fewer columns than planned
+// would silently narrow what verify compares.
+func sampleColumnsOf(t *ir.Table, names []string) ([]*ir.Column, error) {
+	byName := make(map[string]*ir.Column, len(t.Columns))
+	for _, c := range t.Columns {
+		byName[c.Name] = c
 	}
-	cols := make([]string, len(t.PrimaryKey.Columns))
-	for i, c := range t.PrimaryKey.Columns {
-		cols[i] = c.Column
+	out := make([]*ir.Column, len(names))
+	for i, n := range names {
+		c, ok := byName[n]
+		if !ok {
+			return nil, fmt.Errorf("column %q is not on the table", n)
+		}
+		out[i] = c
 	}
-	return cols, nil
+	return out, nil
 }
 
-// quotedPKList wraps each name in MySQL backtick-identifier quotes.
-func quotedPKList(names []string) []string {
-	out := make([]string, len(names))
-	for i, n := range names {
-		out[i] = quoteIdent(n)
+// mysqlSampleToken renders one column's value for the sample-mode row
+// hash. The rendering is INJECTIVE, which the old one — each column
+// cast to CHAR with NULL replaced by the empty string, joined by '|' —
+// was not, in three ways each of which hashed a corrupted target clean:
+//
+//   - NULL and the empty string rendered alike. Now NULL is 'N' and
+//     every value is 'V' or 'X'-prefixed.
+//   - A value could borrow its neighbour's separator ('a|' + 'b' against
+//     'a' + '|b'). Now every text value carries its character length.
+//   - Binary data was not rendered at all. Under the utf8mb4 connection
+//     charset sluice always uses, CAST(<bytes> AS CHAR) is NULL — with
+//     only a warning — for any byte sequence that is not valid UTF-8:
+//     measured on 8.0 for GEOMETRY POINT(1 2) (a WKB double is rarely
+//     valid UTF-8), BIT(8) b'11111111' and VARBINARY 0x61FF62. Each
+//     then rendered as the empty string, so any two such values hashed
+//     equal. The binary family ([mysqlSampleBinary]) is now digested
+//     from its raw bytes, and any OTHER column whose cast still comes
+//     back NULL takes the same byte digest rather than collapsing — the
+//     per-row CASE makes that fallback version- and charset-independent.
+//
+// The per-column digest keeps a large BLOB's contribution fixed-width,
+// so the row's CONCAT stays well under max_allowed_packet.
+func mysqlSampleToken(c *ir.Column, algo ir.HashAlgorithm) string {
+	q := quoteIdent(c.Name)
+	bytesDigest := "CONCAT('X', " + mysqlDigest(q, algo) + ")"
+	if mysqlSampleBinary(c.Type) {
+		return fmt.Sprintf("IF(%s IS NULL, 'N', %s)", q, bytesDigest)
 	}
-	return out
+	text := fmt.Sprintf("CAST(%s AS CHAR)", q)
+	return fmt.Sprintf("CASE WHEN %s IS NULL THEN 'N' WHEN %s IS NULL THEN %s ELSE CONCAT('V', CHAR_LENGTH(%s), ':', %s) END",
+		q, text, bytesDigest, text, text)
+}
+
+// mysqlSampleKeyText renders one key column for the sampled row's key
+// string — readable text where the value has one (it is what the
+// mismatch report prints), the bytes in hex where it does not (a
+// BINARY(16) UUID key cast to utf8mb4 is NULL for most values, which
+// would collapse distinct keys into one).
+func mysqlSampleKeyText(c *ir.Column) string {
+	q := quoteIdent(c.Name)
+	if mysqlSampleBinary(c.Type) {
+		return "HEX(" + q + ")"
+	}
+	return fmt.Sprintf("COALESCE(CAST(%s AS CHAR), HEX(%s))", q, q)
+}
+
+// mysqlSampleBinary reports the column families whose values are bytes
+// rather than text, and so must never be rendered through a utf8mb4 cast.
+func mysqlSampleBinary(t ir.Type) bool {
+	switch ir.UnwrapDomain(t).(type) {
+	case ir.Binary, ir.Varbinary, ir.Blob, ir.Bit, ir.Geometry:
+		return true
+	}
+	return false
+}
+
+// mysqlDigest wraps expr in the hex digest algo selects.
+func mysqlDigest(expr string, algo ir.HashAlgorithm) string {
+	if algo == ir.HashSHA256 {
+		return "SHA2(" + expr + ", 256)"
+	}
+	return "MD5(" + expr + ")"
 }

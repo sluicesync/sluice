@@ -31,6 +31,9 @@ type verifyStubEngine struct {
 	// Sample-mode per-table data; nil for count-mode tests.
 	sampleHashes map[string][]ir.SampledRowHash
 	sampleErr    map[string]error
+	// colsSeen, when non-nil, records every column plan the
+	// orchestrator hands this engine's SampleRowHashes.
+	colsSeen *[]ir.SampleColumns
 }
 
 func (e *verifyStubEngine) Name() string                  { return e.name }
@@ -50,6 +53,7 @@ func (e *verifyStubEngine) OpenSchemaReader(_ context.Context, _ string) (ir.Sch
 		fail:         e.readSchemaFail,
 		sampleHashes: e.sampleHashes,
 		sampleErr:    e.sampleErr,
+		colsSeen:     e.colsSeen,
 	}, nil
 }
 
@@ -92,6 +96,7 @@ type verifyStubReader struct {
 	// to SampleRowHashes per table. Tests use this to assert
 	// --strict-hash propagation. nil means "don't record."
 	algoSeen map[string]ir.HashAlgorithm
+	colsSeen *[]ir.SampleColumns
 }
 
 func (r *verifyStubReader) ReadSchema(_ context.Context) (*ir.Schema, error) {
@@ -114,9 +119,12 @@ func (r *verifyStubReader) ExactRowCount(_ context.Context, table *ir.Table) (in
 //
 // The algo parameter is recorded so tests can assert the orchestrator
 // passes through the configured hash algorithm.
-func (r *verifyStubReader) SampleRowHashes(_ context.Context, table *ir.Table, _ int, _ int64, algo ir.HashAlgorithm) ([]ir.SampledRowHash, error) {
+func (r *verifyStubReader) SampleRowHashes(_ context.Context, table *ir.Table, cols ir.SampleColumns, _ int, _ int64, algo ir.HashAlgorithm) ([]ir.SampledRowHash, error) {
 	if err, ok := r.sampleErr[table.Name]; ok {
 		return nil, err
+	}
+	if r.colsSeen != nil {
+		*r.colsSeen = append(*r.colsSeen, cols)
 	}
 	if r.algoSeen != nil {
 		r.algoSeen[table.Name] = algo
@@ -173,6 +181,7 @@ func verifySchema(tableNames ...string) *ir.Schema {
 			Columns: []*ir.Column{
 				{Name: "id", Type: ir.Integer{Width: 64}, Nullable: false},
 			},
+			PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}},
 		}
 	}
 	return &ir.Schema{Tables: tables}

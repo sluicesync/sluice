@@ -83,31 +83,52 @@ tables.
 ```sql
 -- For each table, pick N rows deterministically (via MD5(pk||seed)),
 -- compute MD5 of the row's column-values, compare hash sets.
+-- The columns are the SOURCE table's names sorted, read BY NAME on
+-- both sides, and the source's primary key identifies the rows.
 SELECT
   <pk_expr> AS pk,
-  MD5(CONCAT_WS('|', col1::text, col2::text, ...)) AS hash
+  MD5(CONCAT_WS('|', <token(a)>, <token(b)>, ...)) AS hash
 FROM <table>
 ORDER BY MD5(<pk_expr> || '<seed>')
 LIMIT <N>;
+-- token(col): 'N' for NULL, else 'V' || length || ':' || col::text
+-- (MySQL: binary-family columns are digested from their bytes)
 ```
 
-Default N=100. Three drift shapes detected via merge-walk:
+Default N=100. Four drift shapes detected:
 
 - PK on source only → target is missing the row.
 - PK on target only → target has an extra row.
-- PK on both, hashes differ → row content drift.
+- PK on both, hashes differ → row content drift, including a value
+  that sits under the wrong column name.
+- A source column the target lacks → `COLUMN-MISMATCH` (a target-only
+  column is named, left out of the hash, and does not fail the table).
 
-What it cannot detect: each side hashes its columns in its own
-declared order, so a target whose columns were swapped by name
-(a `RENAME COLUMN` swap that a sluice release before v0.158.0
-forwarded as no change) hashes the same as the source and reads
-clean. A sample also rarely reaches defects confined to the rows
-written before a schema change, such as the MySQL/MariaDB binlog
-mis-decode fixed in v0.158.0 (Bug 301). Sample mode is same-engine
-only, so a MariaDB → Postgres target holding the negative UNSIGNED
-values fixed in v0.158.0 (MARIADB-NOLOG-UNSIGNED) gets a count check
-at most. No verify depth clears a target exposed to any of these;
-see [production-readiness](production-readiness.md#known-limitations).
+Columns are compared by name, not position. Before the fix for
+VERIFY-SAMPLE-COLUMN-ORDER each side hashed its columns in its own
+declared order, so a target whose columns were swapped by name (a
+`RENAME COLUMN` swap that a sluice release before v0.158.0 forwarded
+as no change) hashed the same as the source and read clean, and a
+target that merely declared the same columns in another order read as
+a mismatch on every row. A swap now mismatches every sampled row it
+touches. A RENAME swap leaves every row written before it (and not
+rewritten since) swapped, so when those rows are a fraction f of the
+table a sample of N misses all of them with probability (1−f)^N —
+about 3×10⁻⁵ at f = 10% and the default N = 100. The same fix made each value's
+rendering unambiguous: NULL and an empty string, a value containing
+the `|` separator, and MySQL binary data (a utf8mb4 cast turns any
+`GEOMETRY`, `BIT` or binary value that is not valid UTF-8 into NULL,
+so any two of them hashed alike) all hash distinctly now.
+
+What it still cannot detect: a sample samples, so a defect confined
+to a few rows — such as the MySQL/MariaDB binlog mis-decode fixed in
+v0.158.0 (Bug 301), which affected only rows written in a window
+before a schema change — is caught only when the sample happens to
+include one of them, and a clean sample does not clear it. Sample
+mode is same-engine only, so a MariaDB → Postgres target holding the
+negative UNSIGNED values fixed in v0.158.0 (MARIADB-NOLOG-UNSIGNED)
+gets a count check at most. See
+[production-readiness](production-readiness.md#known-limitations).
 
 Server-side hashing means we ship one query per table per side;
 no row data crosses the wire. Cheap. Statistical confidence

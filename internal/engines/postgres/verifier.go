@@ -65,21 +65,23 @@ func (r *SchemaReader) ExactRowCount(ctx context.Context, table *ir.Table) (int6
 // The strict-hash path applies to the row-content hash, not the
 // sample-selection ordering.
 //
-// **Single-PK constraint** (v0.14.0 MVP): the sampling SQL needs the
-// PK to construct the seed-derived ordering. Tables without a PK or
-// with a composite PK fall back to "sample-mode-not-supported-for-
-// this-table"; the orchestrator surfaces a clear per-table SKIPPED
-// reason so the operator knows which tables verify only by count.
+// **Key constraint**: the sampling SQL needs a key to construct the
+// seed-derived ordering — cols.Key, the SOURCE table's primary key
+// (single or composite). A keyless source table is refused by the
+// orchestrator before this is called, and lands SKIPPED with a reason
+// so the operator knows which tables verify only by count.
 //
 // Hash strategy: MD5 (default) or SHA-256 (operator opt-in via
-// --strict-hash, v0.14.2+) of CONCAT_WS('|', col1::text, ...). PG's
-// CONCAT_WS skips NULLs, matching MySQL's behavior, so NULL handling
-// is consistent same-engine.
+// --strict-hash, v0.14.2+) of CONCAT_WS('|', <token>, ...) over the
+// columns cols names, read by name in the order cols fixes — never in
+// the table's declared order (VERIFY-SAMPLE-COLUMN-ORDER,
+// [ir.SampleColumns]). Each token is [pgSampleToken]'s injective
+// rendering of one column.
 //
 // SHA-256 path: PG 11+ ships sha256() in core (no pgcrypto needed),
 // returning bytea. ENCODE(..., 'hex') gives a 64-char hex string
 // matching the MD5() shape.
-func (r *SchemaReader) SampleRowHashes(ctx context.Context, table *ir.Table, n int, seed int64, algo ir.HashAlgorithm) ([]ir.SampledRowHash, error) {
+func (r *SchemaReader) SampleRowHashes(ctx context.Context, table *ir.Table, cols ir.SampleColumns, n int, seed int64, algo ir.HashAlgorithm) ([]ir.SampledRowHash, error) {
 	if table == nil {
 		return nil, errors.New("postgres: SampleRowHashes: table is nil")
 	}
@@ -89,25 +91,46 @@ func (r *SchemaReader) SampleRowHashes(ctx context.Context, table *ir.Table, n i
 	if n <= 0 {
 		return nil, fmt.Errorf("postgres: SampleRowHashes: n must be > 0, got %d", n)
 	}
-	pkCols, err := singleOrCompositePKColumns(table)
+	keyCols, err := sampleColumnNames(table, cols.Key)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: SampleRowHashes %s: key: %w", table.Name, err)
+	}
+	hashedCols, err := sampleColumnNames(table, cols.Hashed)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: SampleRowHashes %s: %w", table.Name, err)
 	}
-	cols := make([]string, len(table.Columns))
-	for i, c := range table.Columns {
-		cols[i] = fmt.Sprintf("COALESCE(%s::text, '')", quoteIdent(c.Name))
+	if len(keyCols) == 0 || len(hashedCols) == 0 {
+		return nil, fmt.Errorf("postgres: SampleRowHashes %s: the plan names %d key and %d hashed columns; sample-mode needs at least one of each (a PK for deterministic sampling, and something to hash)",
+			table.Name, len(keyCols), len(hashedCols))
 	}
-	pkExpr := strings.Join(quotedPKList(pkCols), ` || '|' || `)
-	if len(pkCols) == 1 {
-		pkExpr = fmt.Sprintf(`%s::text`, quoteIdent(pkCols[0]))
+	tokens := make([]string, len(hashedCols))
+	for i, c := range hashedCols {
+		tokens[i] = pgSampleToken(c)
 	}
-	concatExpr := "pg_catalog.CONCAT_WS('|', " + strings.Join(cols, ", ") + ")"
+	keys := make([]string, len(keyCols))
+	for i, c := range keyCols {
+		keys[i] = quoteIdent(c) + "::text"
+	}
+	pkExpr := strings.Join(keys, ` || '|' || `)
+	// No NULL reaches CONCAT_WS (whose NULL-skipping is what made NULL
+	// and '' collide before): every token renders NULL as 'N'.
+	concatExpr := "pg_catalog.CONCAT_WS('|', " + strings.Join(tokens, ", ") + ")"
 	var hashExpr string
 	switch algo {
 	case ir.HashSHA256:
 		// PG 11+: sha256() is built-in, returns bytea; encode to hex
 		// to match the MD5 shape.
-		hashExpr = "pg_catalog.ENCODE(pg_catalog.SHA256(" + concatExpr + "::bytea), 'hex')"
+		//
+		// The text reaches sha256() through convert_to, NOT a `::bytea`
+		// cast. The cast PARSES its input as a bytea literal, so a
+		// backslash in any rendered value was an escape: '\101' and 'A'
+		// became the same byte and hashed equal (a corrupted target
+		// reported clean under --strict-hash, the operator's
+		// higher-assurance mode), and a value carrying '\x' mid-string —
+		// any bytea column, rendered '\xff00' — failed the whole table
+		// with "invalid input syntax for type bytea". convert_to takes
+		// the characters as they are.
+		hashExpr = "pg_catalog.ENCODE(pg_catalog.SHA256(pg_catalog.CONVERT_TO(" + concatExpr + ", 'UTF8')), 'hex')"
 	default:
 		hashExpr = "pg_catalog.MD5(" + concatExpr + ")"
 	}
@@ -169,24 +192,37 @@ func (r *SchemaReader) SampleRowHashes(ctx context.Context, table *ir.Table, n i
 	return samples, nil
 }
 
-// singleOrCompositePKColumns returns the PK column names for the
-// table, or an error when sample-mode can't fire (no PK).
-func singleOrCompositePKColumns(t *ir.Table) ([]string, error) {
-	if t.PrimaryKey == nil || len(t.PrimaryKey.Columns) == 0 {
-		return nil, errors.New("table has no primary key (sample-mode requires a PK for deterministic sampling)")
+// sampleColumnNames checks every name against t's columns and returns
+// names unchanged. A name t does not carry is an error: the
+// orchestrator planned the comparison from both tables, so a miss here
+// means the plan and the table disagree, and hashing fewer columns than
+// planned would silently narrow what verify compares.
+func sampleColumnNames(t *ir.Table, names []string) ([]string, error) {
+	present := make(map[string]struct{}, len(t.Columns))
+	for _, c := range t.Columns {
+		present[c.Name] = struct{}{}
 	}
-	cols := make([]string, len(t.PrimaryKey.Columns))
-	for i, c := range t.PrimaryKey.Columns {
-		cols[i] = c.Column
+	for _, n := range names {
+		if _, ok := present[n]; !ok {
+			return nil, fmt.Errorf("column %q is not on the table", n)
+		}
 	}
-	return cols, nil
+	return names, nil
 }
 
-// quotedPKList returns each name wrapped in PG identifier quotes.
-func quotedPKList(names []string) []string {
-	out := make([]string, len(names))
-	for i, n := range names {
-		out[i] = quoteIdent(n)
-	}
-	return out
+// pgSampleToken renders one column's value for the sample-mode row
+// hash. The rendering is INJECTIVE, which the old one — each column's
+// ::text with NULL replaced by the empty string, joined by '|' — was
+// not: NULL and the empty string rendered alike (a target holding an
+// empty string where the source held NULL hashed clean), and a value
+// could borrow its neighbour's separator ('a|' +
+// 'b' against 'a' + '|b'). Now NULL is 'N', and every value is 'V',
+// its character length, ':' and its text. Every Postgres type has a
+// text output function, so unlike MySQL's utf8mb4 cast there is no
+// value ::text cannot render; bytea renders as hex or escape text,
+// both injective (the session's bytea_output only decides which).
+func pgSampleToken(name string) string {
+	text := quoteIdent(name) + "::text"
+	return fmt.Sprintf("CASE WHEN %s IS NULL THEN 'N' ELSE 'V' || pg_catalog.length(%s)::text || ':' || %s END",
+		quoteIdent(name), text, text)
 }
