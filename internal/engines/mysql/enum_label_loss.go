@@ -126,11 +126,14 @@ type binlogLabelGuard struct {
 	// tableMap holds, per ENUM/SET column, the labels the row event's
 	// TABLE_MAP carried (binlog_row_metadata=FULL); nil entries otherwise.
 	tableMap [][]string
+	// flavor picks the spelling of the FULL-metadata remedy
+	// ([rowMetadataFullStatement]); the zero value is MySQL's.
+	flavor Flavor
 }
 
 // binlogLabelGuardFor builds the guard for one rows event. tm may be nil.
-func binlogLabelGuardFor(tbl *tableSchema, tm *replication.TableMapEvent) binlogLabelGuard {
-	g := binlogLabelGuard{lost: tbl.LostLabels}
+func binlogLabelGuardFor(tbl *tableSchema, tm *replication.TableMapEvent, flavor Flavor) binlogLabelGuard {
+	g := binlogLabelGuard{lost: tbl.LostLabels, flavor: flavor}
 	if len(g.lost) == 0 || tm == nil {
 		return g
 	}
@@ -205,10 +208,10 @@ func (g binlogLabelGuard) recoverLostLabels(table string, colIdx int, col *ir.Co
 			continue
 		}
 		if len(tm) != len(catalog) {
-			return nil, enumLabelNotRecoverable(table, col.Name, catalog[i], "the row event's TABLE_MAP carries no labels for this column (binlog_row_metadata is not FULL)", enumLabelRemedyBinlog)
+			return nil, enumLabelNotRecoverable(table, col.Name, catalog[i], "the row event's TABLE_MAP carries no labels for this column (binlog_row_metadata is not FULL)", enumLabelRemedyBinlog(g.flavor))
 		}
 		if !labelAgreesWithCatalog(tm[i], catalog[i]) {
-			return nil, enumLabelNotRecoverable(table, col.Name, catalog[i], fmt.Sprintf("the row event's TABLE_MAP label %q does not match the catalog's %q", tm[i], catalog[i]), enumLabelRemedyBinlog)
+			return nil, enumLabelNotRecoverable(table, col.Name, catalog[i], fmt.Sprintf("the row event's TABLE_MAP label %q does not match the catalog's %q", tm[i], catalog[i]), enumLabelRemedyBinlog(g.flavor))
 		}
 		if !replaced {
 			labels = append([]string(nil), catalog...)
@@ -337,13 +340,14 @@ func anyLostLabel(lost [][]bool) bool {
 
 // enumLabelRemedyBinlog and enumLabelRemedyVStream are the refusal's hint
 // on the two paths: only the binlog has a TABLE_MAP to recover from.
-const (
-	enumLabelRemedyBinlog = "either set binlog_row_metadata=FULL on the source (SET PERSIST binlog_row_metadata = 'FULL'; the next row " +
+func enumLabelRemedyBinlog(flavor Flavor) string {
+	return "either set binlog_row_metadata=FULL on the source (" + rowMetadataFullStatement(flavor) + "; the next row " +
 		"event carries the true labels, and a genuine '?' label then streams too), or rename the label on the source to characters " +
 		"inside the Basic Multilingual Plane, or exclude the table"
-	enumLabelRemedyVStream = "rename the label on the source to characters inside the Basic Multilingual Plane, or exclude the table " +
-		"(a VStream source offers no faithful label to recover from)"
-)
+}
+
+const enumLabelRemedyVStream = "rename the label on the source to characters inside the Basic Multilingual Plane, or exclude the table " +
+	"(a VStream source offers no faithful label to recover from)"
 
 func enumLabelNotRecoverable(table, column, label, why, remedy string) error {
 	return sluicecode.Wrap(

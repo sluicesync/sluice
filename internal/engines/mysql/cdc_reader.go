@@ -565,6 +565,13 @@ type tableSchema struct {
 	// replay guard (charset_ddl_guard.go) applies only to such a table.
 	decodedWithoutWrittenCharset bool
 
+	// signednessFromShape is set once a rows event of this table was decoded
+	// with an UNSIGNED column's signedness taken from this shape because the
+	// event recorded none (cdc_unrecorded_signedness.go). It dedupes the
+	// DEBUG line, and the signedness matrix reads it to tell which servers
+	// record signedness at all.
+	signednessFromShape bool
+
 	// NativeKinds is parallel to Columns: NativeKinds[i] is the MariaDB
 	// native fixed-width kind of Columns[i] (uuid/inet4/inet6) or
 	// mariadbNativeNone. It is captured from information_schema.data_type
@@ -1801,7 +1808,7 @@ func (r *CDCReader) dispatchRows(
 	}
 	// GC-37 (i): the labels the catalog may have lost, and the TABLE_MAP's
 	// own labels for them when the source runs binlog_row_metadata=FULL.
-	lbl := binlogLabelGuardFor(tbl, ev.Table)
+	lbl := binlogLabelGuardFor(tbl, ev.Table, r.flavor)
 	// GC-37 (j): the charset each character column was WRITTEN in, from the
 	// TABLE_MAP — refused as a CDC-4 replay mismatch when the catalog no
 	// longer declares it. See [binlogColumnCharsets].
@@ -1812,6 +1819,15 @@ func (r *CDCReader) dispatchRows(
 	if cs == nil {
 		r.noteDecodedWithoutWrittenCharset(catalogTbl)
 	}
+	// MARIADB-NOLOG-UNSIGNED: the UNSIGNED integer columns whose event does
+	// not record their signedness, decoded by the proven shape's — or a
+	// refusal when the shape is not proven. See
+	// cdc_unrecorded_signedness.go.
+	us, err := binlogUnrecordedUnsigned(tbl, ev.Table)
+	if err != nil {
+		return err
+	}
+	noteUnrecordedSignedness(tbl, us)
 
 	// ADR-0049 Chunk B1: after a DDL invalidated the schema cache,
 	// the first row event per table forces tableFor to rebuild the
@@ -1871,7 +1887,7 @@ func (r *CDCReader) dispatchRows(
 			if err := refusePartialRowImage(tbl, skippedColumnsFor(ev, i), "insert", "write"); err != nil {
 				return err
 			}
-			row, err := decodeBinlogRow(raw, tbl.Columns, tbl.NativeKinds, r.flavor, tbl.Name, r.zeroDate, lbl, cs)
+			row, err := decodeBinlogRow(raw, tbl.Columns, tbl.NativeKinds, r.flavor, tbl.Name, r.zeroDate, lbl, cs, us)
 			if err != nil {
 				return fmt.Errorf("mysql: cdc: decode insert: %w", err)
 			}
@@ -1916,11 +1932,11 @@ func (r *CDCReader) dispatchRows(
 			if err := refusePartialRowImage(tbl, skippedColumnsFor(ev, i+1), "update", "after"); err != nil {
 				return err
 			}
-			before, err := decodeBinlogRow(ev.Rows[i], tbl.Columns, tbl.NativeKinds, r.flavor, tbl.Name, r.zeroDate, lbl, cs)
+			before, err := decodeBinlogRow(ev.Rows[i], tbl.Columns, tbl.NativeKinds, r.flavor, tbl.Name, r.zeroDate, lbl, cs, us)
 			if err != nil {
 				return fmt.Errorf("mysql: cdc: decode update before: %w", err)
 			}
-			after, err := decodeBinlogRow(ev.Rows[i+1], tbl.Columns, tbl.NativeKinds, r.flavor, tbl.Name, r.zeroDate, lbl, cs)
+			after, err := decodeBinlogRow(ev.Rows[i+1], tbl.Columns, tbl.NativeKinds, r.flavor, tbl.Name, r.zeroDate, lbl, cs, us)
 			if err != nil {
 				return fmt.Errorf("mysql: cdc: decode update after: %w", err)
 			}
@@ -1992,7 +2008,7 @@ func (r *CDCReader) dispatchRows(
 					return err
 				}
 			}
-			before, err := decodeBinlogRow(raw, tbl.Columns, tbl.NativeKinds, r.flavor, tbl.Name, r.zeroDate, lbl, cs)
+			before, err := decodeBinlogRow(raw, tbl.Columns, tbl.NativeKinds, r.flavor, tbl.Name, r.zeroDate, lbl, cs, us)
 			if err != nil {
 				return fmt.Errorf("mysql: cdc: decode delete: %w", err)
 			}
@@ -4099,7 +4115,11 @@ func stripBackticks(s string) string {
 // excludes the column from the target SQL — the target's GENERATED
 // clause then recomputes the value rather than freezing the source-
 // side result.
-func decodeBinlogRow(raw []any, cols []*ir.Column, natives []mariadbNativeKind, flavor Flavor, tableName string, zeroDate zeroDateMode, labels binlogLabelGuard, charsets []*columnCharset) (ir.Row, error) {
+//
+// unsigned is [binlogUnrecordedUnsigned]'s answer for the event: the UNSIGNED
+// integer columns go-mysql decoded as signed because the TABLE_MAP recorded
+// no signedness (MARIADB-NOLOG-UNSIGNED). nil means none.
+func decodeBinlogRow(raw []any, cols []*ir.Column, natives []mariadbNativeKind, flavor Flavor, tableName string, zeroDate zeroDateMode, labels binlogLabelGuard, charsets []*columnCharset, unsigned unrecordedUnsigned) (ir.Row, error) {
 	if len(raw) != len(cols) {
 		return nil, fmt.Errorf("row has %d values; schema has %d columns", len(raw), len(cols))
 	}
@@ -4131,6 +4151,13 @@ func decodeBinlogRow(raw []any, cols []*ir.Column, natives []mariadbNativeKind, 
 		// catalog. Before-images go through the same call, so a key compared
 		// in a later WHERE is converted too.
 		cellRaw := raw[i]
+		if unsigned != nil && unsigned[i] != 0 {
+			u, err := reinterpretUnsigned(cellRaw, unsigned[i])
+			if err != nil {
+				return nil, fmt.Errorf("column %q: %w", col.Name, err)
+			}
+			cellRaw = u
+		}
 		cc := stringColumnCharset(col.Type)
 		if charsets != nil {
 			cc = charsets[i]

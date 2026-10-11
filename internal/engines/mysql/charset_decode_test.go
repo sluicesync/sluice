@@ -45,7 +45,7 @@ func TestDecodeBinlogRow_ConvertsNonUTF8CharsetColumns(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			cols := []*ir.Column{{Name: "c", Type: tc.typ}}
-			row, err := decodeBinlogRow([]any{tc.raw}, cols, nil, FlavorVanilla, "t", zeroDateInherit, binlogLabelGuard{}, nil)
+			row, err := decodeBinlogRow([]any{tc.raw}, cols, nil, FlavorVanilla, "t", zeroDateInherit, binlogLabelGuard{}, nil, nil)
 			if err != nil {
 				t.Fatalf("decodeBinlogRow: %v", err)
 			}
@@ -80,7 +80,7 @@ func TestBinlogColumnCharsets_WrittenCharsetWins(t *testing.T) {
 	if err != nil || cs[1] == nil || cs[1].name != "latin1" {
 		t.Fatalf("matching TABLE_MAP: cs=%v err=%v; want latin1", cs, err)
 	}
-	row, err := decodeBinlogRow([]any{int32(1), []byte{0xE9}}, tbl.Columns, nil, FlavorVanilla, "t", zeroDateInherit, binlogLabelGuard{}, cs)
+	row, err := decodeBinlogRow([]any{int32(1), []byte{0xE9}}, tbl.Columns, nil, FlavorVanilla, "t", zeroDateInherit, binlogLabelGuard{}, cs, nil)
 	if err != nil || row["v"] != "é" {
 		t.Fatalf("decode by the written latin1 = %q, %v; want é", row["v"], err)
 	}
@@ -91,7 +91,7 @@ func TestBinlogColumnCharsets_WrittenCharsetWins(t *testing.T) {
 	if err != nil {
 		t.Fatalf("replayed utf8mb4 under a latin1 catalog: err = %v; want the written charset used", err)
 	}
-	row, err = decodeBinlogRow([]any{int32(1), "\xC3\xA9"}, tbl.Columns, nil, FlavorVanilla, "t", zeroDateInherit, binlogLabelGuard{}, cs)
+	row, err = decodeBinlogRow([]any{int32(1), "\xC3\xA9"}, tbl.Columns, nil, FlavorVanilla, "t", zeroDateInherit, binlogLabelGuard{}, cs, nil)
 	if err != nil || row["v"] != "é" {
 		t.Fatalf("utf8mb4 C3A9 under a latin1 catalog decoded as %q, %v; want é (the written charset)", row["v"], err)
 	}
@@ -139,14 +139,14 @@ func TestDecodeBinlogRow_RefusesWhatItCannotDecode(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cols := []*ir.Column{{Name: "c", Type: tc.typ}}
-			_, err := decodeBinlogRow([]any{tc.raw}, cols, nil, FlavorVanilla, "t", zeroDateInherit, binlogLabelGuard{}, nil)
+			_, err := decodeBinlogRow([]any{tc.raw}, cols, nil, FlavorVanilla, "t", zeroDateInherit, binlogLabelGuard{}, nil, nil)
 			if !errors.Is(err, errCharsetNotDecodable) || !strings.Contains(err.Error(), `table "t" column "c"`) {
 				t.Fatalf("err = %v; want %s naming the table and column", err, charsetNotDecodableMarker)
 			}
 		})
 	}
 	row, err := decodeBinlogRow([]any{nil}, []*ir.Column{{Name: "c", Type: ir.Varchar{Length: 1, Charset: "latin1"}}},
-		nil, FlavorVanilla, "t", zeroDateInherit, binlogLabelGuard{}, nil)
+		nil, FlavorVanilla, "t", zeroDateInherit, binlogLabelGuard{}, nil, nil)
 	if err != nil || row["c"] != nil {
 		t.Fatalf("NULL latin1 = %#v, %v; want nil", row["c"], err)
 	}

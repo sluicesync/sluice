@@ -193,7 +193,7 @@ A label that genuinely **is** `'?b'` on a `utf8mb4`/`utf16`/`utf32` column looks
 
 Recovery:
 
-- On a binlog source, `SET PERSIST binlog_row_metadata = 'FULL'` and restart the stream. Note that the target's ENUM still carries the `'?b'` label, so a recovered `'😀b'` then fails loudly at the target's INSERT unless the column was widened (next bullet) or the labels renamed.
+- On a binlog source, set `binlog_row_metadata=FULL` and restart the stream: on MySQL, `SET PERSIST binlog_row_metadata = 'FULL'`; on MariaDB, which has no `SET PERSIST`, `SET GLOBAL binlog_row_metadata = 'FULL'` plus `binlog_row_metadata = FULL` under `[mariadbd]` in the option file so a restart keeps it. Note that the target's ENUM still carries the `'?b'` label, so a recovered `'😀b'` then fails loudly at the target's INSERT unless the column was widened (next bullet) or the labels renamed.
 - Rename the source labels to BMP characters (ASCII, or 3-byte UTF-8) via `ALTER TABLE … MODIFY` before migrating.
 - For `migrate`, `--type-override=TABLE.COL=text` emits the column as TEXT on the target so the copy's true label text lands faithfully; ENUM enforcement is lost. For `sync`, the same override also needs `binlog_row_metadata=FULL` on the source for the CDC half.
 - Exclude the table.

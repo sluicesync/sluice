@@ -73,6 +73,9 @@ var mysqlDomainDispatchExemptions = map[string]string{
 		"TABLE_MAP was read by loadTableSchema from this MySQL server's catalog (Bug 301), which has no DOMAIN.",
 	"cdc_recorded_shape.go:recordedLabelsAgree:d.Columns[j].Type": "SOURCE-SIDE: the same catalog-read shape " +
 		"as recordedColumnAccepts.",
+	"cdc_unrecorded_signedness.go:binlogUnrecordedUnsigned:col.Type": "SOURCE-SIDE: the shape whose integer " +
+		"signedness stands in for a TABLE_MAP that records none is the same catalog-read (or TABLE_MAP-typed) " +
+		"MySQL shape as decodeBinlogRow's, which has no DOMAIN.",
 	"row_writer.go:prepareValue:t": "DOMAIN-PEELED-FIRST (surfaced by T-5's local-variable following): " +
 		"prepareValue reads the declared type into `t := col.Type`, and its FIRST arm — `t.(ir.Domain)` at " +
 		"row_writer.go:858 — IS the transparency handler: it unwraps to the base type, synthesizes a " +

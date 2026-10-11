@@ -492,7 +492,7 @@ func (r *CDCReader) proveCatalogShape(ctx context.Context, tbl *tableSchema) err
 		return err
 	}
 	if ahead {
-		return errCDCCatalogAheadOfPosition(tbl, d)
+		return errCDCCatalogAheadOfPosition(tbl, d, r.flavor)
 	}
 	return nil
 }
@@ -571,7 +571,7 @@ func (r *CDCReader) recheckRetypedColumns(tbl *tableSchema, tm *replication.Tabl
 		return nil
 	}
 	if tm == nil || len(tm.ColumnType) != len(tbl.Columns) {
-		return errCDCCatalogAheadOfPosition(tbl, *tbl.retypedAhead.first)
+		return errCDCCatalogAheadOfPosition(tbl, *tbl.retypedAhead.first, r.flavor)
 	}
 	for j, col := range tbl.Columns {
 		if !tbl.retypedAhead.covers(col.Name) {
@@ -614,6 +614,10 @@ func retypedColumnUnverified(tbl *tableSchema, j int, tm *replication.TableMapEv
 			return "the event does not record the character set it was written in"
 		}
 	case famInt, famDecimal, famFloat:
+		// This refusal is what lets the decoder take an unrecorded
+		// signedness from the shape for every OTHER column
+		// (cdc_unrecorded_signedness.go): a column redefined ahead of the
+		// reader never reaches it without the event's own record.
 		if _, ok := tm.UnsignedMap()[j]; !ok {
 			return "the event does not record whether it was signed"
 		}
@@ -625,14 +629,14 @@ func retypedColumnUnverified(tbl *tableSchema, j int, tm *replication.TableMapEv
 // row events carry no column names. It reuses the replay-mismatch code: the
 // cause and the remedy are the same family, and this is the refusal the old
 // guard would have issued for the cases it could see.
-func errCDCCatalogAheadOfPosition(tbl *tableSchema, d aheadDDL) error {
+func errCDCCatalogAheadOfPosition(tbl *tableSchema, d aheadDDL, flavor Flavor) error {
 	stmt := strings.Join(strings.Fields(d.stmt), " ")
 	if len(stmt) > 200 {
 		stmt = stmt[:200] + "…"
 	}
 	return sluicecode.Wrap(
 		sluicecode.CodeCDCSchemaReplayMismatch,
-		"set binlog_row_metadata=FULL on the source (SET PERSIST binlog_row_metadata = 'FULL') so row events record "+
+		"set binlog_row_metadata=FULL on the source ("+rowMetadataFullStatement(flavor)+") so row events record "+
 			"the column names they were written under, then re-snapshot: `sync start --restart-from-scratch` for a sync, "+
 			"a fresh `backup full` for a backup chain. Events already written without names cannot be decoded faithfully",
 		fmt.Errorf(
@@ -646,6 +650,27 @@ func errCDCCatalogAheadOfPosition(tbl *tableSchema, d aheadDDL) error {
 		),
 	)
 }
+
+// rowMetadataFullStatement is how an operator sets binlog_row_metadata=FULL
+// durably on a source of flavor. MySQL 8 persists it with SET PERSIST;
+// MariaDB has no SET PERSIST (the statement is a syntax error there), so
+// it takes SET GLOBAL for the running server plus the option-file line
+// that keeps it across a restart.
+func rowMetadataFullStatement(flavor Flavor) string {
+	if flavor == FlavorMariaDB {
+		return rowMetadataFullMariaDB
+	}
+	return rowMetadataFullMySQL
+}
+
+// The two spellings of rowMetadataFullStatement. Every refusal that names
+// the setting knows its reader's flavor; the operator docs, which do not,
+// state both (docs/operator/error-codes.md).
+const (
+	rowMetadataFullMySQL   = "SET PERSIST binlog_row_metadata = 'FULL'"
+	rowMetadataFullMariaDB = "MariaDB has no SET PERSIST: SET GLOBAL binlog_row_metadata = 'FULL' for the running " +
+		"server, plus binlog_row_metadata = FULL under [mariadbd] in its option file so a restart keeps it"
+)
 
 // dataTypeAt is tbl's catalog data_type for column j, or "unknown".
 func dataTypeAt(tbl *tableSchema, j int) string {

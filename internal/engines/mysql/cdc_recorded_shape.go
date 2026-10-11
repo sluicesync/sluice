@@ -42,6 +42,7 @@ package mysql
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -409,7 +410,13 @@ func fixedStringLength(code byte, meta uint16) (length int, isFixed bool) {
 // becomes a schema boundary (see the file comment).
 func recordedColumnMeta(tm *replication.TableMapEvent, i int, flavor Flavor, charsetOf func(uint64) string) (columnMeta, ir.Type, error) {
 	code, meta := tm.ColumnType[i], tm.ColumnMeta[i]
-	unsigned := tm.UnsignedMap()[i]
+	unsigned, signKnown := tm.UnsignedMap()[i]
+	if isBinlogIntegerCode(code) && !signKnown {
+		// No server sluice has met writes names (FULL) without signedness,
+		// but an integer typed here must not default to signed on that
+		// assumption (MARIADB-NOLOG-UNSIGNED).
+		return columnMeta{}, nil, errors.New("it is an integer, and the event does not record whether it was signed")
+	}
 	sign := ""
 	if unsigned {
 		sign = " unsigned"
