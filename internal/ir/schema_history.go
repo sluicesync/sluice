@@ -116,11 +116,21 @@ func (s SchemaSignature) Equal(other SchemaSignature) bool {
 		if s.names[i] != other.names[i] {
 			return false
 		}
-		if !reflect.DeepEqual(s.types[i], other.types[i]) {
+		if !SameColumnType(s.types[i], other.types[i]) {
 			return false
 		}
 	}
 	return true
+}
+
+// SameColumnType is the per-column half of [SchemaSignature.Equal]: two IR
+// types are the same decode contract when they are structurally equal,
+// type parameters included. Exported so a reader holding one column's
+// type against a recorded shape (the MySQL binlog reader's deferred-shape
+// check) uses exactly the equivalence that decides whether a change is a
+// schema boundary, rather than a second one of its own.
+func SameColumnType(a, b Type) bool {
+	return reflect.DeepEqual(a, b)
 }
 
 // ColumnTypes returns the signature's per-column IR types keyed by

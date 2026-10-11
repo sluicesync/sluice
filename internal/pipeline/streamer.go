@@ -1655,12 +1655,13 @@ type Streamer struct {
 	// is wired, so each attempt derives its own.
 	readerSchemaSeed schemaSeedLoader
 
-	// readerOrderBaseline is the source column order per table at the
+	// readerShapeBaseline is the typed source shape per table at the
 	// position the next reader streams from (decoded_order_baseline.go):
-	// set beside readerSchemaSeed by the cold start, and by the warm-resume
-	// seed loader while it runs; handed over and cleared by
-	// [Streamer.wireReaderSchemaSeed].
-	readerOrderBaseline []ir.ColumnOrderRecord
+	// set beside readerSchemaSeed by the cold start (the schema it copied
+	// from), and by the warm-resume seed loader while it runs (the retained
+	// history at the resume position); handed over and cleared by
+	// [Streamer.wireReaderSchemaSeed]. nil: none known for this open.
+	readerShapeBaseline []*ir.Table
 
 	// unforwardedBaselineFrom is the last CDC reader this Run opened, kept so
 	// the next attempt's reader starts from its unforwarded-schema-change
@@ -2328,7 +2329,7 @@ func (s *Streamer) applyWithReshardFollow(
 	// RENAME-SWAP-FORWARD: the column-order records every intercept wiring of
 	// this run shares — after a cold start, recorded before any boundary.
 	if err := s.phaseLoadColumnOrders(applyCtx, applier, streamID); err != nil {
-		return migcore.WrapWithHint(migcore.PhaseCDC, err)
+		return controlReadFailure(migcore.WrapWithHint(migcore.PhaseCDC, err))
 	}
 	reshardReopens := 0
 	for {

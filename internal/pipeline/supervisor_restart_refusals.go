@@ -128,6 +128,7 @@ var refusalsARestartRepeats = []error{
 	ir.ErrResumeSchemaDivergence,
 	ir.ErrSchemaChangeRefused,
 	ir.ErrColumnOrderChanged,
+	ir.ErrDeferredSchemaChange,
 }
 
 // refusalARestartRepeats returns the listed sentinel err carries, or nil.

@@ -403,8 +403,7 @@ func columnOrderRemedy(v columnOrderVerdict, targetReorders bool) string {
 
 // columnOrderRefusal is the forward path's refusal for tableName.
 func columnOrderRefusal(tableName string, v columnOrderVerdict, targetReorders bool) error {
-	return fmt.Errorf("%w on %q. Refusing before the boundary is recorded or any row after it is applied; "+
-		"nothing has been written. %s",
+	return fmt.Errorf("%w on %q. "+refusedBeforeBoundary+" %s",
 		&columnOrderChangedError{flips: v.flips}, tableName, columnOrderRemedy(v, targetReorders))
 }
 
@@ -513,8 +512,8 @@ func refuseUnheldColumnOrder(
 	if !v.refuses() {
 		return nil
 	}
-	return fmt.Errorf("%w: %w on %q, and this stream does not forward schema changes (%s). Refusing before the "+
-		"boundary is recorded or any row after it is applied; nothing has been written. %s",
+	return fmt.Errorf("%w: %w on %q, and this stream does not forward schema changes (%s). "+
+		refusedBeforeBoundary+" %s",
 		ir.ErrSchemaChangeRefused, &columnOrderChangedError{flips: v.flips}, tableName, deps.why,
 		columnOrderRemedy(v, w.targetReorders))
 }

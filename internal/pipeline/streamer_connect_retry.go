@@ -70,6 +70,23 @@ func connectHint(err error) error {
 	return &connectPhaseError{err: migcore.WrapWithHint(migcore.PhaseConnect, err)}
 }
 
+// controlReadFailure marks a failure of a setup-phase control-table read
+// (the schema-history cache prime, the column-order records) the same way
+// [connectHint] marks a connection open, keeping the hint err already
+// carries: such a read touches nothing but the target's sluice tables, so
+// a transient there is retried by [runWithRetry] like any other setup
+// failure rather than ending the stream. A non-transient shape stays
+// terminal. Found when a Postgres16 `TestRenameSwapForward_*` cell exited
+// at the column-order read on `driver: bad connection` — a shape the
+// shared transient corpus does not classify either (CONTROL-READ-BADCONN,
+// filed), so that exact exit is not yet retried. nil in → nil out.
+func controlReadFailure(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &connectPhaseError{err: err}
+}
+
 // isRetriableConnectFailure reports whether err is a connect-phase-marked
 // failure with a positively-transient shape — the only combination
 // [runWithRetry] retries without an [ir.RetriableError] wrapper. The marker

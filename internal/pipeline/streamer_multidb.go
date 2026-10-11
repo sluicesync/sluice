@@ -484,6 +484,9 @@ func (s *Streamer) coldStartMultiDatabase(
 	// GC-44 F5 third review: the same raw, namespace-stamped shapes are the
 	// unforwarded-stream check's prior for each table's first boundary.
 	s.unforwardedColdStartPrior = synthesizeColdStartSeedSnapshots(&ir.Schema{Tables: readerSeed}, s.Source)
+	// BUG301-DEFERRED-RETYPE: and the typed shape a deferred binlog shape is
+	// held to at each table's first event (decoded_order_baseline.go).
+	s.readerShapeBaseline = append([]*ir.Table{}, readerSeed...)
 	if err := s.wireReaderSchemaSeedFrom(ctx, stream.Changes, staticSchemaSeed(readerSeed)); err != nil {
 		closeStream()
 		return nil, stop, migcore.WrapWithHint(migcore.PhaseCDC, err)

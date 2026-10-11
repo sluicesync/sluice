@@ -933,7 +933,7 @@ func (s *Streamer) phasePrimeSchemaHistoryCache(ctx context.Context, applier ir.
 			primePos = persisted
 		}
 		if err := primer.PrimeSchemaHistoryCache(ctx, streamID, primePos); err != nil {
-			return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("pipeline: prime schema-history cache: %w", err))
+			return controlReadFailure(migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("pipeline: prime schema-history cache: %w", err)))
 		}
 	}
 	return nil

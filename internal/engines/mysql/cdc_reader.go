@@ -388,13 +388,16 @@ type CDCReader struct {
 	// the pump goroutine, except SetSchemaSeed (before StreamChanges).
 	priorSig map[string]ir.SchemaSignature
 
-	// decodedOrder is each table's column order at the last event this
-	// reader decoded, or the seed's before the first — what a shape that
-	// can never be a boundary is held to (cdc_deferred_order.go). Unlike
-	// priorSig it is never refreshed from the decode cache, which behind
-	// the binlog head holds a shape from the future. Pump goroutine,
-	// except the seed setters (before StreamChanges).
-	decodedOrder map[string][]string
+	// decodedShapes is each table's shape (order + read-definition types)
+	// at the last event this reader decoded, or the baseline's before the
+	// first — what a shape that can never be a boundary is held to
+	// (cdc_deferred_order.go). Unlike priorSig it is never refreshed from
+	// the decode cache, which behind the binlog head holds a shape from the
+	// future. decodedShapeBaselineSet makes a table missing from it refuse
+	// its first deferred shape. Pump goroutine, except
+	// SetDecodedShapeBaseline (before StreamChanges).
+	decodedShapes           map[string]decodedShape
+	decodedShapeBaselineSet bool
 
 	// schemaForward enables ADR-0091 F7a single-stream schema-change
 	// forwarding. When true, maybeSnapshotSchemaB1 ALSO emits a
@@ -621,6 +624,10 @@ type tableSchema struct {
 	// (cdc_recorded_shape.go). It decodes rows but is never a schema
 	// boundary.
 	synthesized bool
+	// tableMapTyped names the columns of a synthesized shape typed from the
+	// TABLE_MAP alone: their IR types are approximate, so the deferred-shape
+	// check (cdc_deferred_order.go) never compares them.
+	tableMapTyped []string
 }
 
 // SetCDCDatabaseScope implements [ir.CDCDatabaseScoper]. It switches

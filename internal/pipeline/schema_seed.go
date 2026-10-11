@@ -194,7 +194,7 @@ func (s *Streamer) loadWarmResumeSchemaSeed(ctx context.Context, applier ir.Chan
 	s.firstBoundaryHistory = history
 	s.firstBoundaryRetained = anchors
 	s.unforwardedColdStartPrior = nil // a warm resume's prior is the history
-	s.readerOrderBaseline = warmResumeOrderBaseline(ctx, applier, streamID, history)
+	s.readerShapeBaseline = warmResumeShapeBaseline(history)
 	return mergeWarmResumeSeed(ctx, streamID, "", witness, history, s.Mappings)
 }
 
@@ -689,11 +689,11 @@ func (s *Streamer) wireReaderSchemaSeed(ctx context.Context, r ir.CDCReader) err
 	// GC-32: the unforwarded-schema-change baseline rides this helper because
 	// every reader-open site calls it; see unforwarded_baseline_carry.go.
 	s.wireUnforwardedBaseline(r)
-	// BUG301-FULL-DEFERRED-SWAP: so does the column-order baseline, handed
+	// BUG301-FULL-DEFERRED-SWAP: so does the typed shape baseline, handed
 	// over after the loader below runs (the warm-resume loader sets it).
 	defer func() {
-		wireDecodedOrderBaseline(r, s.readerOrderBaseline)
-		s.readerOrderBaseline = nil
+		wireDecodedShapeBaseline(r, s.readerShapeBaseline)
+		s.readerShapeBaseline = nil
 	}()
 	load := s.readerSchemaSeed
 	s.readerSchemaSeed = nil

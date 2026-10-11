@@ -356,9 +356,9 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 	// The resume position is the chain's: a refusal about it names the
 	// chain and a new full as the remedy (GC-41 (k)).
 	setResumeOrigin(cdc, ir.CDCResumeOriginBackupChain)
-	// BUG301-FULL-DEFERRED-SWAP: the parent's schema is the column order
-	// the window starts from.
-	wireDecodedOrderBaseline(cdc, schemaOrderBaseline(schemaTables(beforeSchema)))
+	// BUG301-FULL-DEFERRED-SWAP: the parent's schema is the typed shape
+	// the window starts from (decoded_order_baseline.go).
+	wireDecodedShapeBaseline(cdc, schemaTables(beforeSchema))
 
 	changesCh, err := cdc.StreamChanges(ctx, startPos)
 	if err != nil {

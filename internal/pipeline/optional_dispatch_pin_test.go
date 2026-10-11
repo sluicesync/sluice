@@ -122,7 +122,7 @@ var (
 	// table's first never-a-boundary shape to. Renamed silently, every
 	// stream whose first event of a table is a deferred swap would decode
 	// it with nothing to compare against — the silent case it closes.
-	_ decodedOrderBaselineSetter = (*mysql.CDCReader)(nil)
+	_ decodedShapeBaselineSetter = (*mysql.CDCReader)(nil)
 	// GC-37 (j) fourth review: the backup lanes' charset-replay window check
 	// (refuseUnrecordedCharsetReplay) guards a REFUSAL — if this assertion
 	// quietly stopped matching, a window that decoded rows by the wrong

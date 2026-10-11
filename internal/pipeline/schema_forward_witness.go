@@ -1263,21 +1263,35 @@ func (v witnessVerdict) render() string {
 	return strings.Join(parts, "; ")
 }
 
+// refusedBeforeBoundary is what every boundary refusal says about the
+// target's state. It used to end "nothing has been written", which was
+// false: rows the source wrote before the change are applied before the
+// boundary is judged, and under binlog_row_metadata=FULL a row written
+// after the change could reach the target ahead of it, typed by the
+// target's old column — measured, a DATETIME(6) value rounded and then
+// "nothing has been written" (BUG301-DEFERRED-RETYPE). The binlog reader
+// now refuses such a row itself before decoding it
+// (engines/mysql/cdc_deferred_order.go), which is what makes the first
+// half of this sentence true; the second states what was written.
+// TestBoundaryRefusals_ClaimNothingWritten holds every literal in this
+// package to it.
+const refusedBeforeBoundary = "Refusing before the boundary is recorded or any row after it is applied; rows the " +
+	"source wrote before the change have been applied under the shape they were written in."
+
 // resumeDivergenceRefusal is the loud outcome: the first boundary disagrees
 // with the target in a way no observed pre-state can explain.
 func resumeDivergenceRefusal(tableName string, v witnessVerdict, hint string) error {
 	if v.remedy != "" {
 		return fmt.Errorf(
 			"%w: the first schema boundary for %q after this stream (re)started does not match the target table "+
-				"(%s). Refusing before the boundary is recorded or any row after it is applied; nothing has been "+
-				"written. %s",
+				"(%s). "+refusedBeforeBoundary+" %s",
 			ir.ErrResumeSchemaDivergence, tableName, v.render(), v.remedy,
 		)
 	}
 	return fmt.Errorf(
 		"%w: the first schema boundary for %q after this stream (re)started does not match the target table, "+
 			"and the difference is not one sluice can forward without knowing what the source changed (%s). "+
-			"Refusing before the boundary is recorded or any row after it is applied; nothing has been written. "+
+			refusedBeforeBoundary+" "+
 			"Reconcile the target with the source via the drained model; the check runs again at this table's "+
 			"first schema boundary on the next start. %s",
 		ir.ErrResumeSchemaDivergence, tableName, v.render(), hint,

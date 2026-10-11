@@ -190,6 +190,7 @@ func (r *CDCReader) buildRecordedShape(ctx context.Context, qn string, tbl *tabl
 			}
 			col, dt, native = &ir.Column{Name: name, Type: typ, Nullable: true}, meta.DataType, mariadbNativeNone
 			shape.synthesized = true
+			shape.tableMapTyped = append(shape.tableMapTyped, name)
 		}
 		shape.Columns[i], shape.DataTypes[i], shape.NativeKinds[i], shape.LostLabels[i] = col, dt, native, lost
 	}

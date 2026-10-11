@@ -47,6 +47,34 @@ func TestConnectRetry_TransientOpenFailureRetries(t *testing.T) {
 	}
 }
 
+// TestControlReadFailure_TransientRetriesOthersStayTerminal pins the
+// setup-phase control-table reads (the schema-history cache prime, the
+// column-order records): a transient there is retried like a connection
+// open, and anything else — a records codec refusal — ends the stream.
+func TestControlReadFailure_TransientRetriesOthersStayTerminal(t *testing.T) {
+	transient := controlReadFailure(fmt.Errorf("pipeline: column-order records: %w", syscall.ECONNRESET))
+	terminal := controlReadFailure(errors.New("pipeline: column-order records: a stored column list does not re-encode to itself"))
+	if !isRetriableConnectFailure(transient) {
+		t.Errorf("a transient control-table read is not retried: %v", transient)
+	}
+	if isRetriableConnectFailure(terminal) {
+		t.Errorf("a non-transient control-table read failure is retried: %v", terminal)
+	}
+
+	s := fastRetryStreamer(t, true, 8)
+	var calls int
+	s.runOnceFn = func(context.Context) error {
+		calls++
+		if calls == 1 {
+			return transient
+		}
+		return nil
+	}
+	if err := s.Run(context.Background()); err != nil || calls != 2 {
+		t.Fatalf("Run = %v after %d attempt(s); want the transient absorbed by one retry", err, calls)
+	}
+}
+
 func TestConnectRetry_BudgetExhaustionStaysLoud(t *testing.T) {
 	// The loud-failure floor: a target that can NEVER be reached exhausts
 	// the consecutive budget and fails, never loops forever.

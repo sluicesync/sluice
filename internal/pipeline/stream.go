@@ -607,7 +607,7 @@ func (b *BackupStream) Run(ctx context.Context) (err error) {
 				// slot door is the only guard here: it must name the
 				// chain, not a sync target (GC-41 (k)).
 				setResumeOrigin(cdc, ir.CDCResumeOriginBackupChain)
-				wireDecodedOrderBaseline(cdc, schemaOrderBaseline(schemaTables(currentParent.Schema)))
+				wireDecodedShapeBaseline(cdc, schemaTables(currentParent.Schema))
 				changesCh, err = cdc.StreamChanges(ctx, resumeFrom)
 				if err != nil {
 					if errors.Is(err, ir.ErrPositionInvalid) {
@@ -1008,9 +1008,9 @@ func (b *BackupStream) newRolloverLoop(ctx context.Context) (*rolloverInit, erro
 	// The resume position is the chain's: a refusal about it names the
 	// chain and a new full as the remedy (GC-41 (k)).
 	setResumeOrigin(cdc, ir.CDCResumeOriginBackupChain)
-	// BUG301-FULL-DEFERRED-SWAP: the parent's schema is the column order
+	// BUG301-FULL-DEFERRED-SWAP: the parent's schema is the typed shape
 	// the stream starts from (decoded_order_baseline.go).
-	wireDecodedOrderBaseline(cdc, schemaOrderBaseline(schemaTables(parent.Schema)))
+	wireDecodedShapeBaseline(cdc, schemaTables(parent.Schema))
 
 	changesCh, err := cdc.StreamChanges(ctx, startPos)
 	if err != nil {

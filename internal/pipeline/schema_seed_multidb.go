@@ -149,6 +149,15 @@ func (s *Streamer) loadMultiDatabaseWarmResumeSchemaSeed(
 	s.namespaceHistory = historyByNamespace
 	s.firstBoundaryRetained = anchors
 	s.unforwardedColdStartPrior = nil // a warm resume's prior is the history
+	// BUG301-DEFERRED-RETYPE: the namespace-stamped history is also the
+	// typed shape a deferred binlog shape is held to (an unattributed row
+	// cannot be keyed for this server-wide reader, so its table has none
+	// and refuses its first deferred shape).
+	var attributed []*ir.Table
+	for _, namespace := range selected {
+		attributed = append(attributed, historyByNamespace[namespace]...)
+	}
+	s.readerShapeBaseline = warmResumeShapeBaseline(attributed)
 
 	var out []*ir.Table
 	for _, namespace := range selected {

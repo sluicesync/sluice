@@ -535,8 +535,8 @@ func (s *Streamer) coldStartPrepareSchema(schema *ir.Schema) (*ir.Schema, error)
 	// its own SOURCE projection, and a target type in its prev would read
 	// as a phantom swap on every overridden column.
 	s.readerSchemaSeed = staticSchemaSeed(rawReaderSchemaSeed(schema))
-	// The same raw read is the column order the CDC phase starts from.
-	s.readerOrderBaseline = schemaOrderBaseline(rawReaderSchemaSeed(schema))
+	// The same raw read is the typed shape the CDC phase starts from.
+	s.readerShapeBaseline = append([]*ir.Table{}, rawReaderSchemaSeed(schema)...)
 	// A catalog read an earlier attempt of this Run made (a warm resume
 	// that fell through to this cold start) predates the tables this run
 	// is about to create; the first-boundary witness reads its own.

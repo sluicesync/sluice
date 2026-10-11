@@ -63,6 +63,14 @@ type rsfServer struct {
 	engine  string
 	dialect string // "mysql" or "postgres"
 	newDB   func(t *testing.T, name string) twfbDB
+	// full: a MySQL-family server running binlog_row_metadata=FULL.
+	full bool
+}
+
+// rsfFull marks srv as running binlog_row_metadata=FULL.
+func rsfFull(srv rsfServer) rsfServer {
+	srv.full = true
+	return srv
 }
 
 func rsfMySQLFamily(t *testing.T, label, engine, rootDSN string, buildDSN func(orig, db string) (string, error)) rsfServer {
@@ -692,10 +700,16 @@ func rsfRunSwapThenLaterCell(t *testing.T, srv rsfServer, later string, entry rs
 	err := run.err
 	// Behind the head without column names the reader's own look-ahead
 	// refuses first (Bug 301, SLUICE-E-CDC-SCHEMA-REPLAY-MISMATCH); with
-	// them, the boundary doors refuse the order change. Either leaves the
-	// target untouched.
+	// them, the boundary doors refuse the order change — or, on a warm
+	// resume of a table with no retained typed shape (this cell stops
+	// straight after the copy), the reader refuses the deferred shape for
+	// having nothing to be held to (DEFERRED-SCHEMA-CHANGE). Every one
+	// leaves the target untouched. The order check against a typed basis is
+	// pinned by TestShapeAtPosition_MySQLPaths's swap-then-drop cells,
+	// whose streams applied a row before stopping.
 	ce, coded := sluicecode.FromError(err)
 	if !errors.Is(err, ir.ErrColumnOrderChanged) && !strings.Contains(fmt.Sprint(err), "COLUMN-ORDER-CHANGED") &&
+		!errors.Is(err, ir.ErrDeferredSchemaChange) &&
 		(!coded || ce.Code != sluicecode.CodeCDCSchemaReplayMismatch) {
 		t.Fatalf("%s: the stream stopped, but not on a refusal of the swap: %v", what, err)
 	}
@@ -706,9 +720,198 @@ func rsfRunSwapThenLaterCell(t *testing.T, srv rsfServer, later string, entry rs
 	}
 }
 
+// rsfDeferredRetype is a MySQL-family type change a row was written under
+// (BUG301-DEFERRED-RETYPE): `retype` changes b and writes row 99 under the
+// new type, `then` drops c and writes row 100. Folded (a `then` that
+// drops c): behind the head under FULL, row 99's recorded shape holds a
+// column no read definition types, so it is never a boundary, and the row
+// would reach the target under the target's OLD type before anything
+// changed it — measured on DATETIME(6): the fractional seconds rounded
+// away at exit 0. The unfolded widen is the control: its shape IS a
+// boundary, so it forwards and converges.
+var rsfDeferredRetype = []struct {
+	name, create, retype, then string
+	folded                     bool
+}{
+	{
+		"datetime-precision-then-drop",
+		"CREATE TABLE kd (id INT PRIMARY KEY, b DATETIME, c INT); INSERT INTO kd VALUES (1,'2020-01-01 00:00:01',20),(2,'2020-01-01 00:00:02',21),(3,'2020-01-01 00:00:03',22);",
+		"ALTER TABLE kd MODIFY COLUMN b DATETIME(6); INSERT INTO kd (id,b,c) VALUES (99,'2020-01-01 00:00:00.723456',991)",
+		"ALTER TABLE kd DROP COLUMN c; INSERT INTO kd (id,b) VALUES (100,'2020-01-01 00:00:00.5')",
+		true,
+	},
+	{
+		"decimal-scale-then-drop",
+		"CREATE TABLE kd (id INT PRIMARY KEY, b DECIMAL(10,2), c INT); INSERT INTO kd VALUES (1,1.25,20),(2,1.5,21),(3,1.75,22);",
+		"ALTER TABLE kd MODIFY COLUMN b DECIMAL(12,4); INSERT INTO kd (id,b,c) VALUES (99,1.2345,991)",
+		"ALTER TABLE kd DROP COLUMN c; INSERT INTO kd (id,b) VALUES (100,2.3456)",
+		true,
+	},
+	{
+		"varchar-shrink-then-drop",
+		"CREATE TABLE kd (id INT PRIMARY KEY, b VARCHAR(20), c INT); INSERT INTO kd VALUES (1,'a',20),(2,'bb',21),(3,'ccc',22);",
+		"ALTER TABLE kd MODIFY COLUMN b VARCHAR(5); INSERT INTO kd (id,b,c) VALUES (99,'abc',991)",
+		"ALTER TABLE kd DROP COLUMN c; INSERT INTO kd (id,b) VALUES (100,'x')",
+		true,
+	},
+	{
+		"varchar-widen-in-place",
+		"CREATE TABLE kd (id INT PRIMARY KEY, b VARCHAR(20), c INT); INSERT INTO kd VALUES (1,'a',20),(2,'bb',21),(3,'ccc',22);",
+		"ALTER TABLE kd MODIFY COLUMN b VARCHAR(40); INSERT INTO kd (id,b,c) VALUES (99,'abcdefghijklmnopqrstuvwxyz0123',991)",
+		"INSERT INTO kd (id,b,c) VALUES (100,'x',1000)",
+		false,
+	},
+}
+
+// rsfWarmPrimed is a warm resume of a stream that applied a row of the table
+// before it stopped, so the table has a retained schema-history version
+// (its first-touch boundary) — the typed basis a deferred shape is held to.
+// Plain rsfWarm stops straight after the copy: no version, so a deferred
+// shape refuses for having no basis at all.
+const rsfWarmPrimed rsfEntry = "warm-primed"
+
+// rsfRunDeferredRetypeCell grades rsfDeferredRetype against the source.
+//
+//   - live: the stream is at the head for each step (row 99 lands before
+//     the DROP runs), so every change is its own boundary: it converges.
+//   - warm on FULL, folded: refuses DEFERRED-SCHEMA-CHANGE before row 99
+//     reaches the target — on the TYPE when primed (a typed basis exists),
+//     for having no basis otherwise.
+//   - warm on FULL, unfolded: converges.
+//   - warm without FULL: Bug 301's look-ahead decides (its own matrix pins
+//     which change it refuses); here it must refuse with the target
+//     untouched or converge exactly.
+func rsfRunDeferredRetypeCell(t *testing.T, srv rsfServer, create, retype, then string, folded bool, entry rsfEntry, idx int) {
+	t.Helper()
+	tag := fmt.Sprintf("r%d", idx)
+	src, tgt := srv.newDB(t, "s_"+tag), srv.newDB(t, "t_"+tag)
+	cell := twfbCell{src: src, tgt: tgt, streamID: "rsf-" + tag, slotName: "rsf_" + tag}
+	src.exec(t, create)
+	what := fmt.Sprintf("%s/deferred-retype %q/%s", srv.label, retype, entry)
+	run := startTWFBRun(cell.streamer())
+	if !tgt.waitRow(t, "kd", 3, run, 180*time.Second) {
+		t.Fatalf("%s: the cold start never delivered the seed rows (stream: %v)", what, run.stop(t))
+	}
+	cell.waitStreaming(t, run)
+	if entry == rsfWarmPrimed {
+		src.exec(t, "INSERT INTO kd (id) VALUES (50)")
+		if !tgt.waitRow(t, "kd", 50, run, 60*time.Second) {
+			t.Fatalf("%s: the priming row never landed (stream: %v)", what, run.stop(t))
+		}
+	}
+	if entry != rsfLiveCDC {
+		if err := run.stop(t); err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("%s: the clean stop returned %v", what, err)
+		}
+	}
+	before := rsfRead(t, tgt)
+	src.exec(t, retype)
+	if entry == rsfLiveCDC && !tgt.waitRow(t, "kd", 99, run, 60*time.Second) {
+		t.Fatalf("%s: the stream did not apply the retype at the head (stream: %v)", what, run.stop(t))
+	}
+	src.exec(t, then)
+	if entry != rsfLiveCDC {
+		run = startTWFBRun(cell.streamer())
+	}
+	warm := entry != rsfLiveCDC
+	mustRefuse := warm && srv.full && folded
+	mustConverge := !warm || (srv.full && !folded)
+	converged := tgt.waitRow(t, "kd", 100, run, 60*time.Second)
+	switch {
+	case run.exited() && run.err != nil && !errors.Is(run.err, context.Canceled):
+		if mustConverge {
+			t.Fatalf("%s: the stream refused a change it should forward: %v", what, run.err)
+		}
+		if mustRefuse {
+			if !errors.Is(run.err, ir.ErrDeferredSchemaChange) {
+				t.Fatalf("%s: refused, but not DEFERRED-SCHEMA-CHANGE: %v", what, run.err)
+			}
+			if entry == rsfWarmPrimed && !strings.Contains(run.err.Error(), `column "b" is`) {
+				t.Fatalf("%s: refused, but not on b's type (the primed basis is typed): %v", what, run.err)
+			}
+		}
+		t.Logf("%s refused: %v", what, run.err)
+		rsfAssertUntouched(t, tgt, before, what)
+		if tgt.hasRow(t, "kd", 99) {
+			t.Errorf("%s: the row written under the new type was applied", what)
+		}
+	case converged:
+		if mustRefuse {
+			_ = run.stop(t)
+			s, g := rsfRead(t, src), rsfRead(t, tgt)
+			t.Fatalf("%s: the stream ran past the folded change\nsource %v:\n%s\ntarget %v:\n%s", what, s.columns, s.rows, g.columns, g.rows)
+		}
+		rsfAssertConvergedOnSourceColumns(t, src, tgt, what)
+		if err := run.stop(t); err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("%s: the stream stopped with %v", what, err)
+		}
+	default:
+		_ = run.stop(t)
+		t.Fatalf("%s: the stream neither refused nor delivered the last row", what)
+	}
+}
+
+// rsfAssertConvergedOnSourceColumns: every source column, every row, by
+// name, equals the target's — a column the source dropped and the target
+// kept (the GC-44 WARN) is not compared.
+func rsfAssertConvergedOnSourceColumns(t *testing.T, src, tgt twfbDB, what string) {
+	t.Helper()
+	s := rsfRead(t, src)
+	g := rsfReadColumns(t, tgt, s.columns)
+	if s.rows != g {
+		t.Errorf("%s: target differs from the source on the source's columns\nsource:\n%s\ntarget:\n%s", what, s.rows, g)
+	}
+}
+
+// rsfReadColumns renders db's kd rows over cols exactly as rsfRead does.
+func rsfReadColumns(t *testing.T, db twfbDB, cols []string) string {
+	t.Helper()
+	conn, err := sql.Open(db.driver(), db.dsn)
+	if err != nil {
+		t.Fatalf("open %s: %v", db.engine, err)
+	}
+	defer func() { _ = conn.Close() }()
+	byName := append([]string(nil), cols...)
+	sort.Strings(byName)
+	data, err := conn.Query("SELECT " + strings.Join(byName, ", ") + " FROM kd ORDER BY id")
+	if err != nil {
+		t.Fatalf("read rows: %v", err)
+	}
+	defer func() { _ = data.Close() }()
+	var sb strings.Builder
+	for data.Next() {
+		vals := make([]sql.NullString, len(byName))
+		ptrs := make([]any, len(byName))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		if err := data.Scan(ptrs...); err != nil {
+			t.Fatalf("scan row: %v", err)
+		}
+		for i, v := range vals {
+			fmt.Fprintf(&sb, "%s=%s;", byName[i], v.String)
+		}
+		sb.WriteString("\n")
+	}
+	if err := data.Err(); err != nil {
+		t.Fatalf("read rows: %v", err)
+	}
+	return sb.String()
+}
+
 // rsfRunServer runs every shape's cells on one server.
 func rsfRunServer(t *testing.T, srv rsfServer) {
 	if srv.dialect == "mysql" {
+		k := 0
+		for _, s := range rsfDeferredRetype {
+			for _, entry := range []rsfEntry{rsfLiveCDC, rsfWarm, rsfWarmPrimed} {
+				k++
+				n, s := k, s
+				t.Run(s.name+"/"+string(entry), func(t *testing.T) {
+					rsfRunDeferredRetypeCell(t, srv, s.create, s.retype, s.then, s.folded, entry, n)
+				})
+			}
+		}
 		l := 0
 		for _, s := range rsfSwapThenLater {
 			for _, entry := range []rsfEntry{rsfLiveCDC, rsfWarm} {
@@ -823,7 +1026,7 @@ func TestRenameSwapForward_MySQL80_FullMetadata(t *testing.T) {
 	dsn, _, cleanup := startMySQLBinlog(t)
 	defer cleanup()
 	rsfFullMetadata(t, dsn)
-	rsfRunServer(t, rsfMySQLFamily(t, "mysql-8.0/full", "mysql", dsn, buildMySQLDSN))
+	rsfRunServer(t, rsfFull(rsfMySQLFamily(t, "mysql-8.0/full", "mysql", dsn, buildMySQLDSN)))
 }
 
 func TestRenameSwapForward_MySQL84_FullMetadata(t *testing.T) {
@@ -831,7 +1034,7 @@ func TestRenameSwapForward_MySQL84_FullMetadata(t *testing.T) {
 	dsn, cleanup := rsfBootMySQL(t, "mysql:8.4")
 	defer cleanup()
 	rsfFullMetadata(t, dsn)
-	rsfRunServer(t, rsfMySQLFamily(t, "mysql-8.4/full", "mysql", dsn, buildMySQLDSN))
+	rsfRunServer(t, rsfFull(rsfMySQLFamily(t, "mysql-8.4/full", "mysql", dsn, buildMySQLDSN)))
 }
 
 func TestRenameSwapForward_MariaDB_FullMetadata(t *testing.T) {
@@ -839,7 +1042,7 @@ func TestRenameSwapForward_MariaDB_FullMetadata(t *testing.T) {
 	dsn, cleanup := startMariaDBBinlog(t)
 	defer cleanup()
 	rsfFullMetadata(t, dsn)
-	rsfRunServer(t, rsfMySQLFamily(t, "mariadb-11.4/full", "mariadb", dsn, buildMySQLDSN))
+	rsfRunServer(t, rsfFull(rsfMySQLFamily(t, "mariadb-11.4/full", "mariadb", dsn, buildMySQLDSN)))
 }
 
 func TestRenameSwapForward_Postgres16(t *testing.T) {

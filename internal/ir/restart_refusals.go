@@ -109,6 +109,17 @@ var ErrSchemaChangeRefused = errors.New("SCHEMA-CHANGE-REFUSED")
 // the target.
 var ErrColumnOrderChanged = errors.New("COLUMN-ORDER-CHANGED")
 
+// ErrDeferredSchemaChange classifies a MySQL binlog reader's refusal of a
+// row event whose recorded shape will never be a schema boundary (a column
+// of it was dropped or retyped later in the binlog, under
+// binlog_row_metadata=FULL) and that changes a column's type against the
+// last shape the stream knew — or that has no typed shape to be held to at
+// all (BUG301-DEFERRED-RETYPE, engines/mysql/cdc_deferred_order.go). Its
+// rows would reach the target before any boundary changed the target's
+// type. The binlog and the basis are the same on a restart, so it refuses
+// again; the remedy is a re-copy.
+var ErrDeferredSchemaChange = errors.New("DEFERRED-SCHEMA-CHANGE")
+
 // PreAlterReplayWedgeMarker is the grep-stable word naming the pre-ALTER
 // replay wedge (GC-44 F24): a Postgres source transaction that wrote a
 // table and then dropped, renamed or retyped one of its columns, on a

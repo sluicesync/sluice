@@ -902,8 +902,7 @@ func (j unforwardedJudgement) settle(ctx context.Context, tableName string, deps
 		return fmt.Errorf(
 			"%w: the source table %q no longer matches the target, and this stream does not forward schema "+
 				"changes (%s); the target cannot hold what the source now sends (%s)%s, so applying the rows "+
-				"after this boundary would change or drop their values. Refusing before the boundary is "+
-				"recorded or any row after it is applied; nothing has been written. %s",
+				"after this boundary would change or drop their values. "+refusedBeforeBoundary+" %s",
 			ir.ErrSchemaChangeRefused, tableName, deps.why, diffs, j.shapeNote(), remedy,
 		)
 	}
