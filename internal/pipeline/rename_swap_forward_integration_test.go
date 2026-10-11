@@ -796,6 +796,17 @@ var rsfDoubleRetype = []struct{ name, create, retype, then string }{
 		"ALTER TABLE kd MODIFY COLUMN b DECIMAL(12,4); INSERT INTO kd (id,b,c) VALUES (99,1.2345,991)",
 		"ALTER TABLE kd MODIFY COLUMN b DOUBLE; INSERT INTO kd (id,b,c) VALUES (100,2.5,1000)",
 	},
+	{
+		// The TABLE_MAP records b's length in bytes: VARCHAR(100) utf8mb4
+		// is 400 bytes against a basis of 20 characters (80 bytes), a widen.
+		// Row 99 ends in 30 spaces, which a VARCHAR(20) target cuts with no
+		// error (MySQL: a Note; Postgres: silently) — measured, review of
+		// 3e9de74a.
+		"varchar-widen-then-varbinary",
+		"CREATE TABLE kd (id INT PRIMARY KEY, b VARCHAR(20), c INT); INSERT INTO kd VALUES (1,'a',20),(2,'bb',21),(3,'ccc',22);",
+		"ALTER TABLE kd MODIFY COLUMN b VARCHAR(100); INSERT INTO kd (id,b,c) VALUES (99,CONCAT('x',REPEAT(' ',30)),991)",
+		"ALTER TABLE kd MODIFY COLUMN b VARBINARY(200); INSERT INTO kd (id,b,c) VALUES (100,'y',1000)",
+	},
 }
 
 // rsfWarmPrimed is a warm resume of a stream that applied a row of the table
@@ -869,7 +880,7 @@ func rsfRunDeferredRetypeCellOn(t *testing.T, src, tgt twfbDB, label string, ful
 			if !errors.Is(run.err, ir.ErrDeferredSchemaChange) {
 				t.Fatalf("%s: refused, but not DEFERRED-SCHEMA-CHANGE: %v", what, run.err)
 			}
-			if entry == rsfWarmPrimed && !strings.Contains(run.err.Error(), `column "b" is`) {
+			if entry == rsfWarmPrimed && !strings.Contains(run.err.Error(), `column "b"`) {
 				t.Fatalf("%s: refused, but not on b's type (the primed basis is typed): %v", what, run.err)
 			}
 		}
@@ -1187,6 +1198,47 @@ func TestRenameSwapForward_ChainRestore(t *testing.T) {
 // Postgres target cannot — so the refusal must not tell the operator to run
 // the same `MODIFY … AFTER` there, and the remedy it does name, the re-copy,
 // must converge the target.
+// TestRenameSwapForward_MySQL84_DeferredShrinkHolds is the other direction
+// of the length check (review of 3e9de74a): a VARCHAR shrink folded behind
+// a later retype keeps the target wider than any value written, so the
+// reader must NOT refuse the row — it lands with its exact value, and the
+// later cross-family boundary is what refuses. FULL, warm-primed.
+func TestRenameSwapForward_MySQL84_DeferredShrinkHolds(t *testing.T) {
+	dsn, cleanup := rsfBootMySQL(t, "mysql:8.4")
+	defer cleanup()
+	rsfFullMetadata(t, dsn)
+	srv := rsfFull(rsfMySQLFamily(t, "mysql-8.4/full", "mysql", dsn, buildMySQLDSN))
+	src, tgt := srv.newDB(t, "s_shrink"), srv.newDB(t, "t_shrink")
+	cell := twfbCell{src: src, tgt: tgt, streamID: "rsf-shrink"}
+	src.exec(t, "CREATE TABLE kd (id INT PRIMARY KEY, b VARCHAR(20), c INT); INSERT INTO kd VALUES (1,'a',20),(2,'bb',21),(3,'ccc',22);")
+	run := startTWFBRun(cell.streamer())
+	if !tgt.waitRow(t, "kd", 3, run, 180*time.Second) {
+		t.Fatalf("cold start: %v", run.stop(t))
+	}
+	cell.waitStreaming(t, run)
+	src.exec(t, "INSERT INTO kd (id) VALUES (50)")
+	if !tgt.waitRow(t, "kd", 50, run, 60*time.Second) {
+		t.Fatalf("prime: %v", run.stop(t))
+	}
+	if err := run.stop(t); err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("stop: %v", err)
+	}
+	src.exec(t, "ALTER TABLE kd MODIFY COLUMN b VARCHAR(10); INSERT INTO kd (id,b,c) VALUES (99,'abcdefghij',991)")
+	src.exec(t, "ALTER TABLE kd MODIFY COLUMN b VARBINARY(200); INSERT INTO kd (id,b,c) VALUES (100,'y',1000)")
+	run = startTWFBRun(cell.streamer())
+	_ = tgt.waitRow(t, "kd", 100, run, 45*time.Second)
+	if !run.exited() {
+		_ = run.stop(t)
+	}
+	if errors.Is(run.err, ir.ErrDeferredSchemaChange) {
+		t.Fatalf("the reader refused a folded shrink, which no value can overflow: %v", run.err)
+	}
+	if got := tgt.scalar(t, "SELECT b FROM kd WHERE id = 99"); got != "abcdefghij" {
+		t.Fatalf("row 99 on the target = %q, want it applied with its exact value (stream: %v)", got, run.err)
+	}
+	t.Logf("row 99 landed exact; the stream ended with %v", run.err)
+}
+
 // TestRenameSwapForward_MySQLToPostgres_DeferredRetype is the double-retype
 // cell on a Postgres target (review H1): a DECIMAL(10,2) column retyped to
 // DECIMAL(12,4), written, then to DOUBLE. On a MySQL target the applier's
@@ -1199,9 +1251,32 @@ func TestRenameSwapForward_MySQLToPostgres_DeferredRetype(t *testing.T) {
 	rsfFullMetadata(t, srcDSN)
 	_, tgtDSN, tgtCleanup := startPostgres(t)
 	defer tgtCleanup()
-	s := rsfDoubleRetype[len(rsfDoubleRetype)-1] // decimal-scale-then-double
-	rsfRunDeferredRetypeCellOn(t, twfbDB{engine: "mysql", dsn: srcDSN}, twfbDB{engine: "postgres", dsn: tgtDSN},
-		"mysql-8.4/full→postgres", true, "rxpg", s.create, s.retype, s.then, true, rsfWarmPrimed)
+	src := twfbDB{engine: "mysql", dsn: srcDSN}
+	n := 0
+	for _, s := range rsfDoubleRetype {
+		if s.name != "decimal-scale-then-double" && s.name != "varchar-widen-then-varbinary" {
+			continue
+		}
+		n++
+		tag := fmt.Sprintf("rxpg%d", n)
+		t.Run(s.name, func(t *testing.T) {
+			// Each cell its own Postgres database: the stream's tables and
+			// control tables must not meet the previous cell's.
+			twfbDB{engine: "postgres", dsn: tgtDSN}.exec(t, "CREATE DATABASE "+tag)
+			tgt, err := buildPGDSN(tgtDSN, tag)
+			if err != nil {
+				t.Fatal(err)
+			}
+			s2 := src
+			mysqlDB := mustCreateMySQLDatabase(t, srcDSN, tag)
+			s2.dsn = mysqlDB
+			rsfRunDeferredRetypeCellOn(t, s2, twfbDB{engine: "postgres", dsn: tgt},
+				"mysql-8.4/full→postgres", true, tag, s.create, s.retype, s.then, true, rsfWarmPrimed)
+		})
+	}
+	if n != 2 {
+		t.Fatalf("ran %d Postgres-target cells, want 2", n)
+	}
 }
 
 func TestRenameSwapForward_MySQLToPostgres_ReorderRemedy(t *testing.T) {

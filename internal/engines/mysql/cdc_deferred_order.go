@@ -39,8 +39,10 @@ import (
 // decoder takes from the image) and so cannot see the second harm. A
 // column the shape typed from the TABLE_MAP alone — the column dropped or
 // retyped later — has an approximate IR type, so it is held only on what
-// the TABLE_MAP records exactly ([tableMapRecorded]); comparing less let a
-// column retyped twice hide its first retype (review H1).
+// the TABLE_MAP records exactly ([tableMapRecorded], and a character
+// column's byte length through its character set, [holdRecordedLength]);
+// comparing less let a column retyped twice hide its first retype (review
+// H1) or its first widen (review of 3e9de74a).
 //
 // The basis is the shape of the table's previous decoded event, never the
 // decode cache — behind the head the cache holds the catalog as of the
@@ -118,9 +120,13 @@ func (b decodedShape) hold(qn string, cur *ir.Table, approximate map[string]bool
 			continue
 		}
 		if approximate[col.Name] {
-			if ir.SameColumnType(tableMapRecorded(was), tableMapRecorded(col.Type)) {
-				continue
+			if !ir.SameColumnType(tableMapRecorded(was), tableMapRecorded(col.Type)) {
+				return deferredTypeRefusal(qn, col.Name, was, col.Type)
 			}
+			if err := holdRecordedLength(qn, col.Name, was, col.Type); err != nil {
+				return err
+			}
+			continue
 		} else if ir.SameColumnType(was, col.Type) {
 			continue
 		}
@@ -134,11 +140,13 @@ func (b decodedShape) hold(qn string, cur *ir.Table, approximate map[string]bool
 // otherwise approximate) can still be held to a known type: the family,
 // temporal precision, decimal precision and scale, integer width and
 // signedness, float single/double, BIT width, ENUM/SET labels, string
-// size class and character set all survive; what the TABLE_MAP does not
-// carry is cleared on both sides — a character column's length (recorded
-// in BYTES, so VARCHAR(40) utf8mb4 reads as 160), its collation (recorded
-// only as an ID the shape names by character set; an ENUM's collation
-// likewise), and an integer's AUTO_INCREMENT. Without this, a column retyped twice hid its first
+// size class and character set all survive. Cleared on both sides: what
+// the TABLE_MAP does not carry — a collation (recorded only as an ID the
+// shape names by character set; an ENUM's likewise) and an integer's
+// AUTO_INCREMENT — and a character column's length, which it DOES record
+// but in bytes (VARCHAR(40) utf8mb4 reads as 160), so it is held
+// separately, through the character set, by [holdRecordedLength].
+// Without this, a column retyped twice hid its first
 // retype: `DATETIME` → `DATETIME(6)`, a row, → `VARCHAR(40)` left the
 // row's shape typed from the TABLE_MAP, and the row landed rounded in the
 // target's DATETIME (measured, review H1). Every family is pinned to hold
@@ -157,6 +165,61 @@ func tableMapRecorded(t ir.Type) ir.Type {
 		return ir.Enum{Values: v.Values}
 	}
 	return t
+}
+
+// holdRecordedLength is the length half of holding an approximate
+// character column. The TABLE_MAP records a VARCHAR/CHAR's maximum length
+// in BYTES (beside its character set), the basis in characters, so the two
+// compare only through the character set's maximum bytes per character.
+// Only a WIDEN refuses: a column that may now hold more than the basis
+// could means rows written under it can exceed the target's column, and
+// MySQL (with a Note) and Postgres (silently) cut excess trailing spaces
+// rather than refuse — measured: `VARCHAR(20)` → `VARCHAR(100)`, a 31-byte
+// value ending in spaces, → `VARBINARY(200)`, and the row landed with 20
+// bytes on both targets before the folded boundary refused (review of
+// 3e9de74a). A shrink keeps the target wider than any value written and
+// is safe, which is also why CHAR(8) recorded as 32 utf8mb4 bytes holds.
+// A character set sluice cannot size refuses: nothing proves the bound.
+func holdRecordedLength(qn, col string, was, now ir.Type) error {
+	var basisChars, recordedBytes int
+	var charset string
+	switch n := now.(type) {
+	case ir.Varchar:
+		basisChars, recordedBytes, charset = was.(ir.Varchar).Length, n.Length, n.Charset
+	case ir.Char:
+		basisChars, recordedBytes, charset = was.(ir.Char).Length, n.Length, n.Charset
+	default:
+		return nil
+	}
+	perChar, known := charsetMaxBytes[canonicalCharsetName(charset)]
+	if known && recordedBytes <= basisChars*perChar {
+		return nil
+	}
+	return fmt.Errorf("mysql: cdc: %s: %w: column %q holds up to %d bytes of %s at this binlog event, and the last shape "+
+		"this stream knew held %d characters (%s). A value longer than the target column would be cut — MySQL and "+
+		"Postgres drop excess trailing spaces with no error — before any boundary widens the target; %s",
+		qn, ir.ErrDeferredSchemaChange, col, recordedBytes, charset, basisChars, charsetBound(charset, basisChars, perChar, known), deferredWhy)
+}
+
+// charsetBound renders what the basis length allows, in bytes.
+func charsetBound(charset string, chars, perChar int, known bool) string {
+	if !known {
+		return "a character set whose bytes per character sluice does not know"
+	}
+	return fmt.Sprintf("at most %d bytes of %s", chars*perChar, charset)
+}
+
+// charsetMaxBytes is each MySQL/MariaDB character set's maximum bytes per
+// character (information_schema.CHARACTER_SETS.MAXLEN), by the canonical
+// name canonicalCharsetName yields. Static because it is a property of the
+// character set, not of a server.
+var charsetMaxBytes = map[string]int{
+	"armscii8": 1, "ascii": 1, "big5": 2, "binary": 1, "cp1250": 1, "cp1251": 1, "cp1256": 1, "cp1257": 1,
+	"cp850": 1, "cp852": 1, "cp866": 1, "cp932": 2, "dec8": 1, "eucjpms": 3, "euckr": 2, "gb18030": 4,
+	"gb2312": 2, "gbk": 2, "geostd8": 1, "greek": 1, "hebrew": 1, "hp8": 1, "keybcs2": 1, "koi8r": 1,
+	"koi8u": 1, "latin1": 1, "latin2": 1, "latin5": 1, "latin7": 1, "macce": 1, "macroman": 1, "sjis": 2,
+	"swe7": 1, "tis620": 1, "ucs2": 2, "ujis": 3, "utf16": 4, "utf16le": 4, "utf32": 4, "utf8mb3": 3,
+	"utf8mb4": 4,
 }
 
 // firstOrderFlip returns a pair of names both lists hold whose relative

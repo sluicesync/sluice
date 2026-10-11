@@ -656,6 +656,7 @@ func TestCDCRecordedColumnTypes_EveryFamily(t *testing.T) {
 	setRowMetadata(t, base, "FULL")
 	eng := Engine{Flavor: FlavorVanilla}
 	runFamilySynthesis(t, eng, shapeCaseDB(t, base, "b301_fam"), mysqlFamilyColumns())
+	assertCharsetMaxBytesMatchesServer(t, base)
 
 	// The families the binlog cannot type refuse.
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -692,6 +693,44 @@ func TestCDCRecordedColumnTypes_EveryFamily_MariaDB(t *testing.T) {
 	logServerVersion(t, base)
 	setRowMetadata(t, base, "FULL")
 	runFamilySynthesis(t, Engine{Flavor: FlavorMariaDB}, shapeCaseDB(t, base, "b301_fam"), commonFamilyColumns())
+	assertCharsetMaxBytesMatchesServer(t, base)
+}
+
+// assertCharsetMaxBytesMatchesServer binds the deferred-shape length check's
+// premise (cdc_deferred_order.go, charsetMaxBytes) to the server: every
+// character set it reports must be in the table with its own MAXLEN. A
+// missing one would make that check refuse every deferred row of such a
+// column; a wrong one would let a widen through or refuse a shrink.
+func assertCharsetMaxBytesMatchesServer(t *testing.T, dsn string) {
+	t.Helper()
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	rows, err := db.Query("SELECT CHARACTER_SET_NAME, MAXLEN FROM information_schema.CHARACTER_SETS")
+	if err != nil {
+		t.Fatalf("read CHARACTER_SETS: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	n := 0
+	for rows.Next() {
+		var name string
+		var maxlen int
+		if err := rows.Scan(&name, &maxlen); err != nil {
+			t.Fatal(err)
+		}
+		n++
+		if got, ok := charsetMaxBytes[canonicalCharsetName(name)]; !ok || got != maxlen {
+			t.Errorf("character set %s: server MAXLEN %d, charsetMaxBytes %d (present %t)", name, maxlen, got, ok)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if n < 30 {
+		t.Fatalf("the server reported %d character sets; the check is not reading them", n)
+	}
 }
 
 // runFamilySynthesis writes a value row and an all-NULL row, decodes them

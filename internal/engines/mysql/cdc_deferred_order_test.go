@@ -24,15 +24,15 @@ func c(name string, typ ir.Type) col { return col{name: name, typ: typ} }
 func tm(name string, typ ir.Type) col { return col{name: name, typ: typ, approximate: true} }
 
 var (
-	tInt   = ir.Integer{Width: 32}
-	tBig   = ir.Integer{Width: 64}
-	tDT0   = ir.DateTime{Precision: 0}
-	tDT6   = ir.DateTime{Precision: 6}
-	tDec2  = ir.Decimal{Precision: 10, Scale: 2}
-	tDec4  = ir.Decimal{Precision: 12, Scale: 4}
-	tVC20  = ir.Varchar{Length: 20}
-	tVC5   = ir.Varchar{Length: 5}
-	tVC160 = ir.Varchar{Length: 160}
+	tInt  = ir.Integer{Width: 32}
+	tBig  = ir.Integer{Width: 64}
+	tDT0  = ir.DateTime{Precision: 0}
+	tDT6  = ir.DateTime{Precision: 6}
+	tDec2 = ir.Decimal{Precision: 10, Scale: 2}
+	tDec4 = ir.Decimal{Precision: 12, Scale: 4}
+	tVC20 = ir.Varchar{Length: 20, Charset: "utf8mb4"}
+	tVC5  = ir.Varchar{Length: 5, Charset: "utf8mb4"}
+	tVC80 = ir.Varchar{Length: 80, Charset: "utf8mb4"} // VARCHAR(20) utf8mb4 as the TABLE_MAP records it, in bytes
 )
 
 // deferredShape builds a shape; synthesized when any column is approximate
@@ -85,7 +85,7 @@ func TestHoldDecodedOrder_DeferredShapeMatrix(t *testing.T) {
 		{"decimal scale", baseline(c("id", tInt), c("b", tDec2), c("c", tInt)), []step{{deferredShape(false, c("id", tInt), c("b", tDec4), tm("c", tInt)), typed}}},
 		{"varchar shrink", baseline(c("id", tInt), c("b", tVC20), c("c", tInt)), []step{{deferredShape(false, c("id", tInt), c("b", tVC5), tm("c", tInt)), typed}}},
 		{"integer widen", baseline(c("id", tInt), c("b", tInt), c("c", tInt)), []step{{deferredShape(false, c("id", tInt), c("b", tBig), tm("c", tInt)), typed}}},
-		{"approximate: a character length is not compared", baseline(c("id", tInt), c("b", tVC20), c("c", tInt)), []step{{deferredShape(false, c("id", tInt), tm("b", tVC160), c("c", tInt)), nil}}},
+		{"approximate: a byte length within the basis holds", baseline(c("id", tInt), c("b", tVC20), c("c", tInt)), []step{{deferredShape(false, c("id", tInt), tm("b", tVC80), c("c", tInt)), nil}}},
 		{"retype that is a boundary passes", baseline(c("id", tInt), c("b", tDT0)), []step{{deferredShape(false, c("id", tInt), c("b", tDT6)), nil}}},
 		{"swap that is a boundary passes", baseline(c("id", tInt), c("b", tInt), c("c", tInt)), []step{{deferredShape(false, c("id", tInt), c("c", tInt), c("b", tInt)), nil}}},
 		{"no baseline handed over, nothing to compare", nil, []step{{deferredShape(true, c("id", tInt), c("c", tInt), tm("b", tInt)), nil}}},
@@ -107,7 +107,7 @@ func TestHoldDecodedOrder_DeferredShapeMatrix(t *testing.T) {
 		{
 			"an approximate column carries its known type forward", baseline(c("id", tInt), c("b", tVC20), c("c", tInt)),
 			[]step{
-				{deferredShape(false, c("id", tInt), tm("b", tVC160), c("c", tInt)), nil},
+				{deferredShape(false, c("id", tInt), tm("b", tVC80), c("c", tInt)), nil},
 				{deferredShape(false, c("id", tInt), c("b", tVC5), tm("c", tInt)), typed},
 			},
 		},
@@ -118,11 +118,20 @@ func TestHoldDecodedOrder_DeferredShapeMatrix(t *testing.T) {
 		{"approximate: decimal scale", baseline(c("id", tInt), c("b", tDec2)), []step{{deferredShape(false, c("id", tInt), tm("b", tDec4)), typed}}},
 		{"approximate: integer width", baseline(c("id", tInt), c("b", tInt)), []step{{deferredShape(false, c("id", tInt), tm("b", tBig)), typed}}},
 		{"approximate: signedness", baseline(c("id", tInt), c("b", tInt)), []step{{deferredShape(false, c("id", tInt), tm("b", ir.Integer{Width: 32, Unsigned: true})), typed}}},
-		{"approximate: family", baseline(c("id", tInt), c("b", tDT6)), []step{{deferredShape(false, c("id", tInt), tm("b", tVC160)), typed}}},
+		{"approximate: family", baseline(c("id", tInt), c("b", tDT6)), []step{{deferredShape(false, c("id", tInt), tm("b", tVC80)), typed}}},
 		{"approximate: float precision", baseline(c("id", tInt), c("b", ir.Float{Precision: ir.FloatSingle})), []step{{deferredShape(false, c("id", tInt), tm("b", ir.Float{Precision: ir.FloatDouble})), typed}}},
 		{"approximate: enum labels", baseline(c("id", tInt), c("b", ir.Enum{Values: []string{"a", "b"}})), []step{{deferredShape(false, c("id", tInt), tm("b", ir.Enum{Values: []string{"b", "a"}})), typed}}},
 		{"approximate: character set", baseline(c("id", tInt), c("b", ir.Varchar{Length: 20, Charset: "latin1"})), []step{{deferredShape(false, c("id", tInt), tm("b", ir.Varchar{Length: 80, Charset: "utf8mb4"})), typed}}},
 		{"approximate: text size class", baseline(c("id", tInt), c("b", ir.Text{Size: ir.TextMedium})), []step{{deferredShape(false, c("id", tInt), tm("b", ir.Text{Size: ir.TextLong})), typed}}},
+		// Review of 3e9de74a: the TABLE_MAP records a character column's
+		// length in bytes; a widen past what the basis could hold refuses,
+		// a shrink holds (the target stays wider than any value written).
+		{"approximate: varchar widened past the basis", baseline(c("id", tInt), c("b", tVC20)), []step{{deferredShape(false, c("id", tInt), tm("b", ir.Varchar{Length: 400, Charset: "utf8mb4"})), typed}}},
+		{"approximate: varchar one byte past the basis", baseline(c("id", tInt), c("b", ir.Varchar{Length: 20, Charset: "latin1"})), []step{{deferredShape(false, c("id", tInt), tm("b", ir.Varchar{Length: 21, Charset: "latin1"})), typed}}},
+		{"approximate: varchar shrunk", baseline(c("id", tInt), c("b", tVC20)), []step{{deferredShape(false, c("id", tInt), tm("b", ir.Varchar{Length: 20, Charset: "utf8mb4"})), nil}}},
+		{"approximate: char widened", baseline(c("id", tInt), c("b", ir.Char{Length: 8, Charset: "utf8mb4"})), []step{{deferredShape(false, c("id", tInt), tm("b", ir.Char{Length: 36, Charset: "utf8mb4"})), typed}}},
+		{"approximate: char at its byte bound", baseline(c("id", tInt), c("b", ir.Char{Length: 8, Charset: "utf8mb4"})), []step{{deferredShape(false, c("id", tInt), tm("b", ir.Char{Length: 32, Charset: "utf8mb4"})), nil}}},
+		{"approximate: a character set sluice cannot size", baseline(c("id", tInt), c("b", ir.Varchar{Length: 20, Charset: "x-unknown"})), []step{{deferredShape(false, c("id", tInt), tm("b", ir.Varchar{Length: 1, Charset: "x-unknown"})), typed}}},
 		{
 			"approximate: what the TABLE_MAP does not record is not compared",
 			baseline(c("id", tInt),
