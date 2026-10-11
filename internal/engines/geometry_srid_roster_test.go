@@ -129,6 +129,13 @@ var geometrySRIDRoster = map[string]geometrySRIDVerdict{
 		sridNotCarried,
 		"schema policy: names the large-object family (TEXT/BLOB/JSON/GEOMETRY) a type is emitted as, which decides the form its DEFAULT takes.",
 	},
+	"mysql.mysqlSampleBinary": {
+		sridNotCarried,
+		"verify sample-hash rendering: names the type families (GEOMETRY among them) whose values " +
+			"are hashed server-side as a digest of their raw bytes rather than through a utf8mb4 " +
+			"cast. No value reaches Go; the digest covers the stored bytes, SRID prefix included, " +
+			"so a row SRID that differs between source and target already changes the hash.",
+	},
 	"postgres.emitColumnType": {
 		sridNotCarried,
 		"DDL emit: renders geometry(<Subtype>,<SRID>) from the IR column type. Per-COLUMN " +
