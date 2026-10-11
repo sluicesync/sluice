@@ -112,6 +112,11 @@ func TestClassifyShape_ColumnIdentityClass(t *testing.T) {
 		{"add column, stable ids on both sides", withIDs(kdTable(kdInt("b")), 1, 2), withIDs(kdTable(kdInt("b"), kdInt("x")), 1, 2, 3), "", ShapeKindAddColumn},
 		{"proven single rename, stable ids on both sides", withIDs(kdTable(kdInt("b")), 1, 2), withIDs(kdTable(kdInt("z")), 1, 2), "", ShapeKindRenameColumn},
 		{"add column", kdTable(kdInt("b")), kdTable(kdInt("b"), kdInt("x")), "", ShapeKindAddColumn},
+		// A drop renumbers every later column's ordinal; the survivors keep
+		// their relative order, which is all the order check compares.
+		{"drop a middle column", kdTable(kdInt("b"), kdInt("c"), kdInt("d")), kdTable(kdInt("b"), kdInt("d")), "", ShapeKindDropColumn},
+		{"drop a middle column, stable ids", withIDs(kdTable(kdInt("b"), kdInt("c"), kdInt("d")), 1, 2, 3, 4), withIDs(kdTable(kdInt("b"), kdInt("d")), 1, 2, 4), "", ShapeKindDropColumn},
+		{"drop a middle column, add one at the end", kdTable(kdInt("b"), kdInt("c"), kdInt("d")), kdTable(kdInt("b"), kdInt("d"), kdInt("x")), "", ShapeKindRenameColumn},
 		{"add column placed first", kdTable(kdInt("b"), kdInt("c")), kdTable(kdInt("x"), kdInt("b"), kdInt("c")), "", ShapeKindAddColumn},
 		{"single rename", kdTable(kdInt("b"), kdInt("c")), kdTable(kdInt("b"), kdInt("z")), "", ShapeKindRenameColumn},
 		{"single widen", kdTable(dec("b", 2), kdInt("c")), kdTable(dec("b", 4), kdInt("c")), "", ShapeKindAlterColumnType},
@@ -463,5 +468,64 @@ func TestRefuseRenameAmbiguous_ARenameChainIsNotOfferedAsOnePair(t *testing.T) {
 	shape, _ = ClassifyShape(pre, single)
 	if msg := refuseRenameAmbiguous("public.kd", shape, pre, single).Error(); !strings.Contains(msg, "Rename on the target manually") {
 		t.Errorf("a genuine single rename lost its remedy: %s", msg)
+	}
+}
+
+// TestRefuseRenameAmbiguous_DropAddIsNotAChain pins the CI failure on
+// fa15f092: a DROP of a middle column plus an ADD of the same type (which
+// lands at the END) moves no survivor relative to another, but the F3
+// check positioned the inferred pair (gone→fresh) and read the appended
+// column as a moved one — "renamed more than one column", a re-copy
+// remedy. Postgres proves it outright (the attnums differ: a drop+add);
+// MySQL has no ids, and the shape is a drop+add or a rename chain that
+// ends at the end, so it gets the ambiguous-rename refusal with a remedy
+// that names both readings — not the rename-chain one.
+func TestRefuseRenameAmbiguous_DropAddIsNotAChain(t *testing.T) {
+	t.Parallel()
+	id := func(c *ir.Column, n int) *ir.Column {
+		return kdWith(c, func(c *ir.Column) { c.StableID = n })
+	}
+	cases := []struct {
+		name      string
+		pre, post *ir.Table
+		want      []string // substrings the refusal must carry
+		not       []string // and must not
+	}{
+		{
+			"postgres: different attnums",
+			kdTable(id(kdInt("name"), 2), id(kdInt("gone"), 3), id(kdInt("p"), 4)),
+			kdTable(id(kdInt("name"), 2), id(kdInt("p"), 4), id(kdInt("fresh"), 5)),
+			[]string{"RENAME COLUMN", "cannot be auto-forwarded", "different stable ids", "DROP COLUMN"},
+			[]string{"renamed more than one column", "Rename on the target manually"},
+		},
+		{
+			"mysql: drop a middle column, add one at the end",
+			kdTable(kdInt("name"), kdInt("gone"), kdInt("p")),
+			kdTable(kdInt("name"), kdInt("p"), kdInt("fresh")),
+			[]string{"RENAME COLUMN", "cannot be auto-forwarded", "DROP COLUMN", "--reset-target-data"},
+			[]string{"renamed more than one column", "Rename on the target manually"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			shape, err := ClassifyShape(tc.pre, tc.post)
+			if err != nil || shape.Kind != ShapeKindRenameColumn {
+				t.Fatalf("ClassifyShape = %v, %v; want the one-rename shape a drop+add looks like", shape.Kind, err)
+			}
+			msg := refuseRenameAmbiguous("public.kd", shape, tc.pre, tc.post).Error()
+			for _, s := range tc.want {
+				if !strings.Contains(msg, s) {
+					t.Errorf("the refusal lacks %q: %s", s, msg)
+				}
+			}
+			for _, s := range tc.not {
+				if strings.Contains(msg, s) {
+					t.Errorf("the refusal carries %q: %s", s, msg)
+				}
+			}
+			if errors.Is(refuseRenameAmbiguous("public.kd", shape, tc.pre, tc.post), ir.ErrColumnOrderChanged) {
+				t.Errorf("a drop+add is not a column-order change")
+			}
+		})
 	}
 }

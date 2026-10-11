@@ -681,10 +681,9 @@ func renamedName(c *ir.Column) string {
 // RENAME COLUMN boundary (ADR-0091 §3). A rename and a drop+add of a
 // same-type column are indistinguishable from the IR delta; forwarding
 // the wrong guess silently drops the renamed column's data on the
-// target (or leaves stale data under the new name). Refuse loudly on
-// both engines until F7b adds PG attnum-proven rename detection. Names
-// the table, the inferred old→new pair, the per-change drift
-// (ADR-0060 / F11), and the drained-recovery hint.
+// target (or leaves stale data under the new name). Names the table, the
+// inferred old→new pair, the per-change drift (ADR-0060 / F11), and a
+// remedy that fits what the shape can and cannot tell ([readRename]).
 func refuseRenameAmbiguous(tableName string, shape Shape, pre, post *ir.Table) error {
 	oldName, newName := "?", "?"
 	if shape.RenamedColumnBefore != nil {
@@ -693,7 +692,9 @@ func refuseRenameAmbiguous(tableName string, shape Shape, pre, post *ir.Table) e
 	if shape.RenamedColumnAfter != nil {
 		newName = shape.RenamedColumnAfter.Name
 	}
-	if renameSetAmbiguous(shape, pre, post) {
+	drift := renderDriftForRefusal(pre, post)
+	switch readRename(shape, pre, post) {
+	case renameChain:
 		// RENAME-SWAP-FORWARD review F3: `RENAME b TO x, RENAME c TO b`
 		// looks like one rename, c→x, and naming that pair as the remedy
 		// sent the operator to rename the wrong column — the target then
@@ -704,8 +705,26 @@ func refuseRenameAmbiguous(tableName string, shape Shape, pre, post *ir.Table) e
 				"likely a chain such as `RENAME b TO x, RENAME c TO b`). The rename set cannot be recovered from the "+
 				"table's shape, and renaming the pair above on the target would leave values under the wrong "+
 				"names.%s %s",
-			ir.ErrColumnOrderChanged, tableName, oldName, newName, renderDriftForRefusal(pre, post),
-			columnOrderRecopyRemedy,
+			ir.ErrColumnOrderChanged, tableName, oldName, newName, drift, columnOrderRecopyRemedy,
+		)
+	case renameProvenDropAdd:
+		return fmt.Errorf(
+			"RENAME COLUMN %q→%q on %q cannot be auto-forwarded: the two columns have different stable ids, so the "+
+				"source did not rename %q — it dropped %q and added %q (DROP COLUMN + ADD COLUMN), which sluice does "+
+				"not forward as one change (ADR-0091 §3). Apply the same DROP COLUMN %q and ADD COLUMN %q on the "+
+				"target via the drained model.%s %s",
+			oldName, newName, tableName, oldName, oldName, newName, oldName, newName, drift,
+			forwardRecoveryHint(tableName),
+		)
+	case renameAppended:
+		return fmt.Errorf(
+			"RENAME COLUMN %q→%q on %q cannot be auto-forwarded: %q now sits at the end of the table, where an "+
+				"added column lands, and %q did not — a rename keeps its column's place, so this is either a DROP "+
+				"COLUMN %q plus an ADD COLUMN %q, or a chain of renames that ends at the last column, and the table's "+
+				"shape cannot tell which. Apply on the target exactly what the source did (the drop and the add, or "+
+				"the same renames) via the drained model. If it cannot be known: %s%s %s",
+			oldName, newName, tableName, newName, oldName, oldName, newName,
+			columnOrderRecopyRemedy, drift, forwardRecoveryHint(tableName),
 		)
 	}
 	return fmt.Errorf(
@@ -714,24 +733,69 @@ func refuseRenameAmbiguous(tableName string, shape Shape, pre, post *ir.Table) e
 			"replication stream alone, and forwarding the wrong guess risks "+
 			"silently dropping the column's data on the target (ADR-0091 §3). "+
 			"Rename on the target manually via the drained model.%s %s",
-		oldName, newName, tableName, renderDriftForRefusal(pre, post),
+		oldName, newName, tableName, drift,
 		forwardRecoveryHint(tableName),
 	)
 }
 
-// renameSetAmbiguous reports whether a one-rename shape hides a longer rename
-// chain: with the renamed column counted as one column on both sides, some
-// column sits at another position — `RENAME b TO x, RENAME c TO b` leaves
-// (id, b, c) → (id, x, b), where the visible pair c→x moved from the third
-// place to the second. Only the columns both sides list are positioned, so
-// a column one side's projection omits (a Postgres generated column) cannot
-// fake a move. The Postgres form of the same evidence, a stable id that
-// moved, is refused by [ClassifyShape] before a rename is classified.
-func renameSetAmbiguous(shape Shape, pre, post *ir.Table) bool {
+// renameReading is what a one-drop-plus-one-add shape can be, judged from
+// the positions and stable ids the two shapes carry.
+type renameReading int
+
+const (
+	// renameInPlace: the added column holds the dropped one's place — a
+	// rename, or a drop+add placed there; the shape cannot tell.
+	renameInPlace renameReading = iota
+	// renameProvenDropAdd: both columns carry stable ids (Postgres
+	// attnums) and they differ — a drop+add, not a rename.
+	renameProvenDropAdd
+	// renameAppended: the added column is the table's last and the dropped
+	// one was not, and no other column moved: a drop+add (an ADD lands at
+	// the end) or a rename chain ending there — never one rename.
+	renameAppended
+	// renameChain: a column that kept its name moved past the pair — the
+	// evidence of a rename chain (review F3).
+	renameChain
+)
+
+// readRename reads a one-rename shape. Positions are compared as RELATIVE
+// order, never ordinals: a drop renumbers every later column, and that is
+// no evidence of anything. With stable ids on both columns of the pair,
+// the ids decide outright — a rename keeps its id (and is proven, never
+// refused here), a drop+add does not — and a chain that reused a name is
+// refused before this by [ClassifyShape]'s identity check
+// (columnsWhoseIdentityChanged), so position evidence is never consulted.
+// Without ids the pair's place is the evidence: kept → in place; moved to
+// the end with every other column in order → appended; else a chain.
+func readRename(shape Shape, pre, post *ir.Table) renameReading {
 	if pre == nil || post == nil || shape.RenamedColumnBefore == nil || shape.RenamedColumnAfter == nil {
-		return false
+		return renameInPlace
 	}
-	oldName, newName := shape.RenamedColumnBefore.Name, shape.RenamedColumnAfter.Name
+	before, after := shape.RenamedColumnBefore, shape.RenamedColumnAfter
+	if before.StableID != 0 && after.StableID != 0 {
+		if before.StableID != after.StableID {
+			return renameProvenDropAdd
+		}
+		return renameInPlace
+	}
+	if !renamePairMoved(before.Name, after.Name, pre, post) {
+		return renameInPlace
+	}
+	preNames, postNames := ir.ColumnNames(pre), ir.ColumnNames(post)
+	if len(postNames) > 0 && postNames[len(postNames)-1] == after.Name &&
+		(len(preNames) == 0 || preNames[len(preNames)-1] != before.Name) {
+		return renameAppended
+	}
+	return renameChain
+}
+
+// renamePairMoved reports whether, with the pair counted as one column on
+// both sides, the columns both sides list stand in a different relative
+// order — `RENAME b TO x, RENAME c TO b` leaves (id, b, c) → (id, x, b),
+// where the visible pair c→x moved past b. Only the columns both sides
+// list are compared, so a column one side's projection omits (a Postgres
+// generated column) cannot fake a move.
+func renamePairMoved(oldName, newName string, pre, post *ir.Table) bool {
 	preNames, postNames := ir.ColumnNames(pre), ir.ColumnNames(post)
 	identity := func(n string) string {
 		if n == newName {
