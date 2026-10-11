@@ -105,8 +105,16 @@ func tripBurst(g *GrowGate, n int, ev ir.GrowEvidence) {
 }
 
 // tripBurstStagger keeps a whole burst far shorter than any window these
-// tests use, so a burst can never straddle a close→reopen boundary and
-// misalign the window sequence being measured. It must stay well ABOVE the
+// tests use, so that on an UNLOADED runner a burst does not straddle a
+// close→reopen boundary and misalign the window sequence being measured.
+// That is a property of the scheduler, not of this constant, and it does NOT
+// hold on a loaded one: GROW-GATE-LADDER-RESET-WINDOWS measured the sleeps
+// stretched past 20ms windows in 31 of 32 contended runs, and the straddling
+// trip then legitimately arms an extra window. So a wall-clock caller must
+// either tolerate an extra window in its failing direction, detect it loudly
+// ([TestGrowGate_HoldIsInvariantToTheNumberOfLanesReportingOneEvent]'s
+// owner count), or not use a burst at all (the episode-ladder test runs on
+// [fakeGrowClock] with one Trip per window). It must stay well ABOVE the
 // gate owner's loop latency (microseconds): a burst fired with no spacing at
 // all is absorbed by a single-slot coalescing buffer, which would let the
 // pre-fix per-trip ladder pass these gates. Verified in both directions by
@@ -490,6 +498,38 @@ func TestGrowGate_SustainedTroubleStillEscalatesToAMeaningfulQuiesce(t *testing.
 // The reset half matters on its own: without it the first bad minute of a
 // multi-hour run would leave the gate permanently at its 30s cap, so a single
 // early blip would cost every later blip a full cap-length stall.
+//
+// # GROW-GATE-LADDER-RESET-WINDOWS: why this runs on a fake clock
+//
+// The wall-clock version failed the v0.158.0 tag's Windows leg with "trouble
+// returning after a healthy stretch quiesced for 168.046ms, want ~20ms", which
+// is rung 4 of the 20ms ladder and so read as a missed reset. It was not. It
+// was reproduced locally under CPU contention (31 of 32 runs) with every
+// window's rung recorded, and in every failure the window after the healthy
+// stretch was rung 1 — the gate reset exactly as designed. What the test had
+// read was a STALE hold: a burst trip whose 150µs stagger was stretched past a
+// 20ms window's end by the scheduler arrived after the reopen and, being a
+// prompt re-trip, legitimately armed a further window one rung up. Its hold
+// sat queued in the buffered channel, and the post-reset next() returned it
+// instead of the post-reset window's. Measured, e.g.: windows held
+// 166/40/80/160/20ms at rungs 1/2/3/4/1, and the test reported 160ms.
+//
+// The product half was ruled out by the code as well as by the record:
+// finishWindow stamps lastReopen BEFORE it closes reopenCh, under the same
+// lock, so Await cannot return before the idle clock has started, and the
+// clock runs from the window's END, not its start.
+//
+// So the test now drives one Trip per window on [fakeGrowClock] — a burst
+// cannot straddle a window that ends only when the gate's own wait is
+// satisfied — and it derives the healthy stretch from the gate's own
+// episode-end timestamp (lastReopen) rather than from when this goroutine
+// happened to resume. Fan-out coalescing within a window is not this test's
+// property; [TestGrowGate_HoldIsInvariantToTheNumberOfLanesReportingOneEvent]
+// pins it. That also lets the assertions be EXACT: rung k holds base<<(k-1)
+// to the nanosecond, and the idle boundary is crossed on both sides by one
+// nanosecond. The just-short side is what binds "idle is measured from the
+// window's END": a gate that measured it from the window's start would see
+// idle-1ns plus the whole previous hold, reset early, and fail here.
 func TestGrowGate_EpisodeLadderClimbsPerWindowAndResetsAfterAHealthyStretch(t *testing.T) {
 	captureSlog(t)
 	const (
@@ -499,48 +539,73 @@ func TestGrowGate_EpisodeLadderClimbsPerWindowAndResetsAfterAHealthyStretch(t *t
 	withScaledGrowGate(t, base, 10*time.Second, base, idle, time.Hour, 1.0)
 
 	g := NewGrowGate(context.Background(), nil)
+	clk := newFakeGrowClock()
+	g.nowFn, g.afterFn = clk.Now, clk.After
 	holds := make(chan time.Duration, 8)
 	g.onWindowClosed = func(d time.Duration) { holds <- d }
 
-	next := func() time.Duration {
+	// window drives one trip → reopen cycle and returns the hold it took.
+	window := func() time.Duration {
+		g.Trip("lane transient", ir.GrowEvidenceTargetFace)
+		if err := g.Await(context.Background()); err != nil {
+			t.Fatalf("Await: %v", err)
+		}
 		select {
 		case d := <-holds:
 			return d
-		case <-time.After(5 * time.Second):
+		case <-time.After(10 * time.Second):
 			t.Fatal("no window observed")
 			return 0
 		}
 	}
-
-	// Three consecutive windows, each re-tripped promptly: rungs 1, 2, 3.
-	climbed := make([]time.Duration, 0, 3)
-	for range 3 {
-		tripBurst(g, 3, ir.GrowEvidenceTargetFace)
-		if err := g.Await(context.Background()); err != nil {
-			t.Fatalf("Await: %v", err)
+	// healthyFor advances the clock so that exactly d has elapsed since the
+	// gate's OWN episode-end stamp — the instant its idle clock starts.
+	healthyFor := func(d time.Duration) {
+		g.mu.Lock()
+		end := g.lastReopen
+		g.mu.Unlock()
+		if end.IsZero() {
+			t.Fatal("no window has reopened yet; there is no episode end to measure a healthy stretch from")
 		}
-		climbed = append(climbed, next())
-	}
-	for i := 1; i < len(climbed); i++ {
-		if climbed[i] <= climbed[i-1] {
-			t.Errorf("window %d held %v, not longer than window %d's %v — the ladder is not climbing across windows",
-				i+1, climbed[i], i, climbed[i-1])
-		}
+		clk.Advance(end.Add(d).Sub(clk.Now()))
 	}
 
-	// Now a healthy stretch longer than the episode idle, then trouble returns.
-	time.Sleep(idle + 100*time.Millisecond)
-	tripBurst(g, 3, ir.GrowEvidenceTargetFace)
-	if err := g.Await(context.Background()); err != nil {
-		t.Fatalf("Await: %v", err)
+	// CLIMB: three consecutive windows, each re-tripped with no healthy time
+	// between them: rungs 1, 2, 3, exactly.
+	for i, want := range []time.Duration{base, 2 * base, 4 * base} {
+		if got := window(); got != want {
+			t.Fatalf("window %d held %v, want %v (rung %d) — the ladder is not climbing one rung per window",
+				i+1, got, want, i+1)
+		}
 	}
-	afterReset := next()
-	if afterReset > 3*base {
-		t.Errorf(
-			"trouble returning after a healthy stretch quiesced for %v, want ~%v — the episode ladder did not "+
-				"reset, so one early bad patch permanently taxes every later one",
-			afterReset, base,
+
+	// JUST SHORT of the idle: still the same episode, so the ladder climbs to
+	// rung 4. This is also the anti-vacuity half for the reset below — a gate
+	// that reset on every trip would fail here rather than pass there.
+	healthyFor(idle - time.Nanosecond)
+	if got, want := window(), 8*base; got != want {
+		t.Fatalf(
+			"a trip %v after the previous window ENDED held %v, want %v (rung 4) — the episode reset early. "+
+				"If the idle clock ran from the window's START, the %v hold would count toward the healthy "+
+				"stretch and a gate that never saw %v of health would forget its trouble",
+			idle-time.Nanosecond, got, want, 4*base, idle,
 		)
+	}
+
+	// EXACTLY the idle: a new episode, back at the base probe interval.
+	healthyFor(idle)
+	if got := window(); got != base {
+		t.Errorf(
+			"trouble returning after a healthy stretch of exactly %v quiesced for %v, want %v — the episode "+
+				"ladder did not reset, so one early bad patch permanently taxes every later one",
+			idle, got, base,
+		)
+	}
+
+	// One hold per window, and none left over: the property whose absence made
+	// the wall-clock version read a stale hold.
+	if n := len(holds); n != 0 {
+		t.Errorf("%d window(s) closed that this test did not drive; the hold sequence is misaligned", n)
 	}
 }
 
