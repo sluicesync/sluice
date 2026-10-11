@@ -100,6 +100,13 @@ func TestStreamer_MultiSchema_RenameMap_PostgresToPostgres(t *testing.T) {
 	if !waitForPGScalar(t, pgTarget, `SELECT COUNT(*) FROM x.widgets`, 3, 30*time.Second) {
 		t.Fatalf("CDC never settled renamed schema x (want 3)")
 	}
+	// y's count starts at 3 and ends at 3 (+1 insert, -1 delete), so the
+	// count alone passes before either change lands — poll for the DELETE
+	// itself (seen once racing under a parallel local run).
+	if !waitForPGScalar(t, pgTarget, `SELECT COUNT(*) FROM y.widgets WHERE id = 4`, 1, 30*time.Second) ||
+		!waitForPGScalar(t, pgTarget, `SELECT COUNT(*) FROM y.widgets WHERE id = 2`, 0, 30*time.Second) {
+		t.Fatalf("CDC never settled renamed schema y (want id 4 present and id 2 deleted)")
+	}
 	if !waitForPGScalar(t, pgTarget, `SELECT COUNT(*) FROM y.widgets`, 3, 30*time.Second) {
 		t.Fatalf("CDC never settled renamed schema y (want 3)")
 	}
