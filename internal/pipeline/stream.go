@@ -1685,14 +1685,14 @@ func (b *BackupStream) runRollover(
 			return out, fmt.Errorf("rollover: %w", err)
 		}
 		out.TotalBytes += fillBytes
-	} else {
-		// The drain commits the parent's schema with no delta, so the delta
-		// writers' Bug 304 stamp never runs — yet the window's rows may follow
-		// a key-collation change the stream recorded in its SchemaHistory, and
-		// a pre-v0.159.1 binary would replay them onto the old key and merge
-		// (review 2026-10-12 finding 4, measured). Stamp from that history.
-		stampKeyCollationHistoryOnDrain(manifest, beforeSchema)
 	}
+	// Every commit, drain or not: the delta writers' Bug 304 stamp sees only
+	// the window's END shape, and the drain writes no delta at all — yet the
+	// window's rows may follow a key-collation change the stream recorded in
+	// its SchemaHistory (one reverted by the window's end, too), and a
+	// pre-v0.159.1 binary would replay them onto the old key and merge
+	// (review 2026-10-12 finding 4, measured; #2 finding 2).
+	stampKeyCollationHistory(manifest, beforeSchema)
 
 	// Stamp the CDC-position fold version FIRST (item 57) so ComputeBackupID
 	// folds CDCPositionCommitsAfterRows into the id for a VStream segment.

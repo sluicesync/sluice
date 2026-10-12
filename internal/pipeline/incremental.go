@@ -496,6 +496,11 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 	if err := b.attachWindowEndSchema(ctx, cdc, manifest, beforeSchema); err != nil {
 		return err
 	}
+	// 5a. The Bug 304 stamp from the window's own history: the delta above
+	//     sees only the END shape, so a key collation changed and changed
+	//     back inside the window (and any change a VStream source records no
+	//     collation for) stamps here (review 2026-10-12 #2, finding 2).
+	stampKeyCollationHistory(manifest, beforeSchema)
 	// 5b. The ADD COLUMN fill — the source's values for the rows an added
 	//     column filled, which no change event carries. After the window
 	//     and the delta, so it orders behind every event it could race.

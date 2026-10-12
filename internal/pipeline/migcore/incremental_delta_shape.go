@@ -324,20 +324,21 @@ func DeltaChangesKeyCollation(delta []*irbackup.SchemaDeltaEntry) bool {
 	return false
 }
 
-// TableChangesKeyCollation reports whether after declares a different
-// collation (or character set) than before for a same-named column that is
-// a key in either shape — [AlterAspectColumnCollation]'s rule, applied to a
-// pair whose AFTER shape did not come from the schema reader: a change
-// stream's [ir.SchemaSnapshot] recorded in a segment's SchemaHistory. So it
-// compares only the columns, never the table's identity or any other aspect
-// (the two readers spell those differently), and a column the stream
-// recorded with no collation is not evidence of a change (VStream carries
-// none). Used where a segment commits WITHOUT a schema delta — the
-// `backup stream` ctx-cancel drain-commit — to stamp it as the delta
-// writers would have (review 2026-10-12 finding 4).
-func TableChangesKeyCollation(before, after *ir.Table) bool {
+// KeyCollationChange compares a same-named column that is a key in either
+// shape — [AlterAspectColumnCollation]'s rule — between before (the schema
+// reader's shape a segment's parent recorded) and after (a change stream's
+// [ir.SchemaSnapshot] from the segment's SchemaHistory). Only columns are
+// compared, never the table's identity or any other aspect: the two readers
+// spell those differently. changed: after declares a different collation
+// or character set. unknown: before records a collation for a character key
+// column and after records none (VStream carries no collation), so the
+// stream cannot show whether it changed. A column neither side records a
+// collation for (a source with no collation concept) is neither. Used to
+// stamp every CDC segment from its history (review 2026-10-12 findings 4
+// and #2-2).
+func KeyCollationChange(before, after *ir.Table) (changed, unknown bool) {
 	if before == nil || after == nil {
-		return false
+		return false, false
 	}
 	beforeByName := make(map[string]*ir.Column, len(before.Columns))
 	for _, c := range before.Columns {
@@ -350,17 +351,19 @@ func TableChangesKeyCollation(before, after *ir.Table) bool {
 			continue
 		}
 		b := beforeByName[a.Name]
-		if b == nil {
+		if b == nil || (!isKeyColumn(before, a.Name) && !isKeyColumn(after, a.Name)) {
 			continue
 		}
-		if !collationRecorded(a.Type) {
-			continue
-		}
-		if !sameCollation(b.Type, a.Type) && (isKeyColumn(before, a.Name) || isKeyColumn(after, a.Name)) {
-			return true
+		switch {
+		case collationRecorded(a.Type):
+			if !sameCollation(b.Type, a.Type) {
+				changed = true
+			}
+		case collationRecorded(b.Type):
+			unknown = true
 		}
 	}
-	return false
+	return changed, unknown
 }
 
 // collationRecorded reports whether a change stream's column type says

@@ -135,8 +135,9 @@ func TestStampKeyCollationDeltaOnAttach_ShapeMatrix(t *testing.T) {
 // exactly that path — it skips the refresh, writes no delta, and its window
 // can still hold a key-collation DDL — and this gate stayed green while it
 // committed such a window unstamped (measured). That path is pinned
-// separately: stampKeyCollationHistoryOnDrain, by
-// TestStampKeyCollationHistoryOnDrain (unit) and
+// separately: stampKeyCollationHistory, by
+// TestStampKeyCollationHistory (unit), TestCDCSegmentCommitsStampFromHistory (the
+// roster below) and
 // TestBackupStream_DrainCommit_StampsAKeyCollationWindow (integration).
 func TestSchemaDeltaWritersStampKeyCollation(t *testing.T) {
 	fset := token.NewFileSet()
@@ -200,15 +201,18 @@ func TestSchemaDeltaWritersStampKeyCollation(t *testing.T) {
 	}
 }
 
-// TestStampKeyCollationHistoryOnDrain pins the drain-commit's stamp (review
-// 2026-10-12 finding 4) over the window's SchemaHistory as the change stream
-// records it: a key column whose collation the stream saw change stamps the
-// segment; a non-key column's change, a column the stream recorded with no
-// collation (a VStream shape), an unchanged key and a FULL manifest do not.
-// A Postgres database-default key (no name, stamped deterministic) counts as
-// a recorded collation. The independent expected value is the rule stated
-// here, graded per cell.
-func TestStampKeyCollationHistoryOnDrain(t *testing.T) {
+// TestStampKeyCollationHistory pins the history-based stamp every CDC commit
+// runs (review 2026-10-12 finding 4, and #2 finding 2) over the window's
+// SchemaHistory as the change stream records it: a key column whose
+// collation the stream saw change stamps the segment, including a change
+// the window reverted by its end (A → B → A: two history entries, no delta);
+// a character key column the stream recorded with NO collation (VStream)
+// stamps conservatively when the parent's shape records one; a non-key
+// column's change, an unchanged key, a column neither side records a
+// collation for, and a FULL manifest do not. A Postgres database-default key
+// (no name, stamped deterministic) counts as a recorded collation. The
+// independent expected value is the rule stated here, graded per cell.
+func TestStampKeyCollationHistory(t *testing.T) {
 	my := func(coll string) ir.Type { return ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: coll} }
 	table := func(k, note ir.Type) *ir.Table {
 		return &ir.Table{
@@ -220,34 +224,122 @@ func TestStampKeyCollationHistoryOnDrain(t *testing.T) {
 	}
 	before := &ir.Schema{Tables: []*ir.Table{table(my("utf8mb4_0900_ai_ci"), my("utf8mb4_0900_ai_ci"))}}
 	pgBefore := &ir.Schema{Tables: []*ir.Table{table(ir.Text{Collation: "ci", Determinism: ir.CollationNonDeterministic}, ir.Text{})}}
+	bare := &ir.Schema{Tables: []*ir.Table{table(ir.Varchar{Length: 20}, ir.Varchar{Length: 20})}}
 	cases := []struct {
 		name    string
 		kind    string
 		before  *ir.Schema
-		history *ir.Table
+		history []*ir.Table
 		stamped bool
 	}{
-		{"unique key ci -> bin", irbackup.BackupKindIncremental, before, table(my("utf8mb4_bin"), my("utf8mb4_0900_ai_ci")), true},
-		{"postgres key ci -> database default", irbackup.BackupKindIncremental, pgBefore, table(ir.Text{Determinism: ir.CollationDeterministic}, ir.Text{}), true},
-		{"control: non-key column", irbackup.BackupKindIncremental, before, table(my("utf8mb4_0900_ai_ci"), my("utf8mb4_bin")), false},
-		{"control: no collation recorded (VStream)", irbackup.BackupKindIncremental, before, table(ir.Varchar{Length: 20}, my("utf8mb4_0900_ai_ci")), false},
-		{"control: unchanged", irbackup.BackupKindIncremental, before, table(my("utf8mb4_0900_ai_ci"), my("utf8mb4_0900_ai_ci")), false},
-		{"control: full manifest", irbackup.BackupKindFull, before, table(my("utf8mb4_bin"), my("utf8mb4_0900_ai_ci")), false},
+		{"unique key ci -> bin", irbackup.BackupKindIncremental, before, []*ir.Table{table(my("utf8mb4_bin"), my("utf8mb4_0900_ai_ci"))}, true},
+		{"unique key ci -> bin -> ci (reverted inside the window)", irbackup.BackupKindIncremental, before, []*ir.Table{
+			table(my("utf8mb4_bin"), my("utf8mb4_0900_ai_ci")), table(my("utf8mb4_0900_ai_ci"), my("utf8mb4_0900_ai_ci")),
+		}, true},
+		{"postgres key ci -> database default", irbackup.BackupKindIncremental, pgBefore, []*ir.Table{table(ir.Text{Determinism: ir.CollationDeterministic}, ir.Text{})}, true},
+		{"no collation recorded for a character key (VStream): conservative", irbackup.BackupKindIncremental, before, []*ir.Table{table(ir.Varchar{Length: 20}, my("utf8mb4_0900_ai_ci"))}, true},
+		{"control: non-key column", irbackup.BackupKindIncremental, before, []*ir.Table{table(my("utf8mb4_0900_ai_ci"), my("utf8mb4_bin"))}, false},
+		{"control: neither side records a collation", irbackup.BackupKindIncremental, bare, []*ir.Table{table(ir.Varchar{Length: 20}, ir.Varchar{Length: 20})}, false},
+		{"control: unchanged", irbackup.BackupKindIncremental, before, []*ir.Table{table(my("utf8mb4_0900_ai_ci"), my("utf8mb4_0900_ai_ci"))}, false},
+		{"control: full manifest", irbackup.BackupKindFull, before, []*ir.Table{table(my("utf8mb4_bin"), my("utf8mb4_0900_ai_ci"))}, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			js, err := ir.MarshalTable(c.history)
-			if err != nil {
-				t.Fatal(err)
-			}
 			const start = irbackup.FormatVersionInjectiveChunkAAD
-			m := &irbackup.Manifest{Kind: c.kind, FormatVersion: start, SchemaHistory: []*irbackup.SchemaHistoryEntry{
-				{Schema: "s", Table: "kd", TableJSON: js},
-			}}
-			stampKeyCollationHistoryOnDrain(m, c.before)
+			m := &irbackup.Manifest{Kind: c.kind, FormatVersion: start}
+			for _, h := range c.history {
+				js, err := ir.MarshalTable(h)
+				if err != nil {
+					t.Fatal(err)
+				}
+				m.SchemaHistory = append(m.SchemaHistory, &irbackup.SchemaHistoryEntry{Schema: "s", Table: "kd", TableJSON: js})
+			}
+			// The delta the window's END shape would produce: none for the
+			// reverted cell, so only the history can stamp it.
+			stampKeyCollationHistory(m, c.before)
 			if got := m.FormatVersion >= irbackup.FormatVersionKeyCollationDelta; got != c.stamped {
 				t.Errorf("FormatVersion = %d; stamped = %v, want %v", m.FormatVersion, got, c.stamped)
 			}
 		})
+	}
+}
+
+// TestCDCSegmentCommitsStampFromHistory is the roster for the history-based
+// Bug 304 stamp (review 2026-10-12 #2, finding 2): every non-test function
+// under internal/pipeline that SEALS a manifest — assigns `….BackupID =
+// irbackup.ComputeBackupID(…)` — must call stampKeyCollationHistory, unless
+// it is named below with a reason. It reaches what the delta-writer roster
+// above cannot: a commit that writes no delta (the drain) and a window whose
+// key change the END diff cannot see (A → B → A). The universe is derived
+// from the AST; the floor (two CDC commit sites today: the `backup stream`
+// rollover and `backup incremental`) keeps a blind walk from passing. It
+// does NOT reach a commit that seals through some other spelling (a helper
+// returning the id, as lineage's chain builders do for tests) — those are
+// not production commit paths today.
+func TestCDCSegmentCommitsStampFromHistory(t *testing.T) {
+	exempt := map[string]string{
+		"backup/backup.go:Run": "a FULL backup: no CDC window, no SchemaHistory, and StampKeyCollationDelta is a no-op for a full",
+	}
+	fset := token.NewFileSet()
+	commits := 0
+	err := filepath.WalkDir(".", func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		f, err := parser.ParseFile(fset, path, nil, 0)
+		if err != nil {
+			return err
+		}
+		for _, decl := range f.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Body == nil {
+				continue
+			}
+			seals, stamps := false, false
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				switch v := n.(type) {
+				case *ast.AssignStmt:
+					for i, lhs := range v.Lhs {
+						sel, ok := lhs.(*ast.SelectorExpr)
+						if !ok || sel.Sel.Name != "BackupID" || i >= len(v.Rhs) {
+							continue
+						}
+						if call, ok := v.Rhs[i].(*ast.CallExpr); ok {
+							if fs, ok := call.Fun.(*ast.SelectorExpr); ok && fs.Sel.Name == "ComputeBackupID" {
+								seals = true
+							}
+						}
+					}
+				case *ast.CallExpr:
+					if id, ok := v.Fun.(*ast.Ident); ok && id.Name == "stampKeyCollationHistory" {
+						stamps = true
+					}
+				}
+				return true
+			})
+			if !seals {
+				continue
+			}
+			key := filepath.ToSlash(path) + ":" + fn.Name.Name
+			if _, ok := exempt[key]; ok {
+				continue
+			}
+			commits++
+			if !stamps {
+				t.Errorf("%s: %s seals a manifest without stampKeyCollationHistory — a window whose rows follow a key "+
+					"collation change its end diff cannot see restores merged on a pre-v0.159.1 binary (Bug 304; "+
+					"exempt it here with a reason if it seals no CDC segment)", fset.Position(fn.Pos()), fn.Name.Name)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if commits < 2 {
+		t.Fatalf("found %d CDC commit site(s); want at least 2 (runRollover, IncrementalBackup.Run) — the walk is blind", commits)
 	}
 }

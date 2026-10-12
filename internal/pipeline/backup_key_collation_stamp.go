@@ -29,31 +29,40 @@ func stampKeyCollationDeltaOnAttach(m *irbackup.Manifest) {
 	irbackup.StampKeyCollationDelta(m, migcore.DeltaChangesKeyCollation(m.SchemaDelta))
 }
 
-// stampKeyCollationHistoryOnDrain is the stamp for the one segment that
-// commits WITHOUT a schema delta although its window may hold DDL: the
-// `backup stream` ctx-cancel drain-commit ([BackupStream.runRollover]), which
-// skips the schema refresh because the source read cannot run on the
-// cancelled context. Measured 2026-10-12 (review finding 4, MySQL 8.0): a
-// window that changed a UNIQUE key's collation (`utf8mb4_0900_ai_ci` →
-// `utf8mb4_bin`) and then inserted 'A' beside 'a' drain-committed at
-// FormatVersion 1 with no SchemaDelta — so a v0.158.x binary, which has no
-// key-collation guard, would replay 'A' onto the old `_ci` key and merge it
-// at exit 0: the Bug 304 harm through a door the delta writers' stamp does
-// not reach (TestSchemaDeltaWritersStampKeyCollation rosters writers of a
-// delta; this path writes none).
+// stampKeyCollationHistory stamps a CDC segment from its window's own
+// SchemaHistory: every [ir.SchemaSnapshot] the change stream recorded is
+// compared with before (the schema the segment's parent recorded) for a key
+// column whose collation the stream saw change. Called on EVERY CDC commit —
+// the `backup stream` rollover and its ctx-cancel drain-commit, and
+// `backup incremental` — because the delta writers' stamp
+// ([stampKeyCollationDeltaOnAttach]) sees only the window's END shape:
 //
-// The evidence is the window's own SchemaHistory: each [ir.SchemaSnapshot]
-// the change stream recorded, compared with before (the parent's schema,
-// which the drain commits unchanged) for a key column whose collation the
-// stream saw change ([migcore.TableChangesKeyCollation]). An entry that
-// does not decode stamps too — the conservative direction: an older binary
-// that cannot be shown the change must not read the segment.
+//   - the drain-commit writes no delta at all (it skips the schema refresh,
+//     which cannot run on the cancelled context). Measured 2026-10-12 (review
+//     finding 4, MySQL 8.0): a window that changed a UNIQUE key `0900_ai_ci`
+//     → `_bin` and then inserted 'A' beside 'a' committed at FormatVersion 1;
+//   - a window that changes a key's collation AND BACK (A → B → A) diffs
+//     empty at its end, so no delta writer stamps it, yet the rows written
+//     under B replay onto the A key on an older binary and merge (review
+//     2026-10-12 #2, finding 2a).
 //
-// What it does not change: this binary still restores such a segment by
+// A pre-v0.159.1 binary reading such a segment has no guard (before
+// v0.159.0) or no delta to apply, and merges at exit 0 — the Bug 304 harm.
+//
+// [migcore.KeyCollationChange] decides per table. A change stream that
+// records NO collation for a character key column (VStream) cannot show the
+// change either way; the segment is stamped then too, conservatively —
+// review 2026-10-12 #2, finding 2b: otherwise a VStream segment never could
+// be. So a VStream segment whose window touched a table with a character
+// key is readable only by v0.159.1+. An entry that does not decode stamps
+// as well (an older binary that cannot be shown the change must not read
+// the segment).
+//
+// What it does not change: this binary still restores a drain segment by
 // replaying the window onto the old key, and its applier guard, armed from
 // the same SchemaHistory, refuses the merge loudly (KEY-COLLATION-MERGE,
 // measured) — filed as KEY-COLLATION-DRAIN-NO-DELTA.
-func stampKeyCollationHistoryOnDrain(m *irbackup.Manifest, before *ir.Schema) {
+func stampKeyCollationHistory(m *irbackup.Manifest, before *ir.Schema) {
 	if m == nil || before == nil {
 		return
 	}
@@ -70,7 +79,7 @@ func stampKeyCollationHistoryOnDrain(m *irbackup.Manifest, before *ir.Schema) {
 			if b == nil || b.Name != h.Table || (b.Schema != "" && h.Schema != "" && b.Schema != h.Schema) {
 				continue
 			}
-			if migcore.TableChangesKeyCollation(b, after) {
+			if changed, unknown := migcore.KeyCollationChange(b, after); changed || unknown {
 				irbackup.StampKeyCollationDelta(m, true)
 				return
 			}

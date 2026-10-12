@@ -123,6 +123,76 @@ func TestBackupStream_DrainCommit_StampsAKeyCollationWindow(t *testing.T) {
 	}
 }
 
+// TestBackupStream_KeyCollationChangedAndRevertedInsideTheWindowIsStamped
+// pins review 2026-10-12 #2 finding 2a on a real MySQL binlog: a window that
+// changes a UNIQUE key `0900_ai_ci` → `_bin`, writes 'A' beside 'a', moves it
+// out of the way and changes the key back diffs EMPTY at its end — no schema
+// delta, so no delta writer stamps it — yet its rows were written under
+// `_bin`, and a binary older than the stamp replays 'A' onto the `_ci` key.
+// Observed live (the stream running before the DDL), so the reader records
+// both shapes in SchemaHistory and the history stamp sees the change. The
+// segment must be stamped FormatVersionKeyCollationDelta and carry no delta
+// (the premise, checked).
+//
+// What this does NOT cover, measured 2026-10-12 and filed: the same history
+// replayed by a run that starts AFTER the DDL records only the current shape
+// (one SchemaHistory entry, unstamped), and THIS binary's own chain restore
+// of either chain lands target row 1 as 'A' where the source holds 'a', at
+// exit 0 (KEY-COLLATION-REVERTED-WINDOW-RESTORE).
+func TestBackupStream_KeyCollationChangedAndRevertedInsideTheWindowIsStamped(t *testing.T) {
+	_, myRoot, myCleanup := startMySQL(t)
+	defer myCleanup()
+	myEng, _ := engines.Get("mysql")
+	twfbDB{engine: "mysql", dsn: myRoot}.exec(t, "CREATE DATABASE abas")
+	srcDSN, err := buildMySQLDSN(myRoot, "abas")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := twfbDB{engine: "mysql", dsn: srcDSN}
+	src.exec(t, "CREATE TABLE kd (id INT NOT NULL PRIMARY KEY, k VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL UNIQUE, d INT); "+
+		"INSERT INTO kd VALUES (1,'a',1),(2,'b',2)")
+	ctx := context.Background()
+	store, err := blobcodec.NewLocalStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := (&backup.Backup{Source: myEng, SourceDSN: srcDSN, Store: store, SluiceVersion: "test"}).Run(ctx); err != nil {
+		t.Fatalf("full: %v", err)
+	}
+	full, err := lineage.ReadManifest(ctx, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() {
+		done <- (&BackupStream{
+			Source: myEng, SourceDSN: srcDSN, Store: store, ParentRef: full.BackupID,
+			RolloverWindow: 10 * time.Minute, RolloverMaxChanges: 1 << 30, RolloverMaxBytes: 1 << 40,
+			ChunkChanges: 100, SluiceVersion: "test",
+		}).Run(runCtx)
+	}()
+	// Let the stream start reading before the DDL, so it observes both ALTERs.
+	time.Sleep(3 * time.Second)
+	src.exec(t, "ALTER TABLE kd MODIFY k VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL")
+	src.exec(t, "INSERT INTO kd VALUES (99,'A',99)")
+	src.exec(t, "UPDATE kd SET k = 'A2' WHERE id = 99")
+	src.exec(t, "ALTER TABLE kd MODIFY k VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL")
+	src.exec(t, "INSERT INTO kd VALUES (100,'zz',100)")
+	seg := drainSegmentWhenCaptured(t, store, cancel, done, 3)
+	if len(seg.SchemaDelta) != 0 {
+		t.Fatalf("the segment carries a SchemaDelta (%d entries) — this cell no longer exercises a change only the history shows",
+			len(seg.SchemaDelta))
+	}
+	if len(seg.SchemaHistory) < 2 {
+		t.Fatalf("the segment recorded %d SchemaHistory entries; want both ALTERs — the cell exercises nothing", len(seg.SchemaHistory))
+	}
+	if seg.FormatVersion < irbackup.FormatVersionKeyCollationDelta {
+		t.Fatalf("FormatVersion = %d; want >= %d — the window's rows followed a key collation change it reverted, and an "+
+			"older binary would replay 'A' onto the 0900_ai_ci key", seg.FormatVersion, irbackup.FormatVersionKeyCollationDelta)
+	}
+}
+
 // drainSegmentWhenCaptured gives the stream time to capture the source's
 // writes, cancels it (the drain-commit), and returns the single incremental
 // segment it committed, which must hold at least want change records.
