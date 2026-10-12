@@ -285,23 +285,38 @@ func canonMariaDBTimestampExpr(expr string) string {
 }
 
 // mariadbTargetCollations maps the language-agnostic MySQL-8
-// utf8mb4_0900_* collations to the closest MariaDB equivalent that
-// exists on BOTH supported LTS lines (10.11 and 11.4): the UCA-14.0.0
-// set, plus the codepoint-binary nopad form for 0900_bin. MariaDB 11.4
-// aliases the 0900 names itself, but 10.11 rejects them (Error 1273) —
-// mapping unconditionally keeps the emitted DDL valid on the whole
-// supported floor. The swap is surfaced (never silent): the CREATE
-// path WARNs per table, the ALTER paths per column. Semantics note:
-// UCA 9.0.0 vs 14.0.0 weights differ for edge-case characters, and the
-// uca1400 forms are PAD SPACE where 0900 is NO PAD — the closest
-// faithful equivalent, not a byte-identical one. Language-specific
+// utf8mb4_0900_* collations to the MariaDB collation that compares as
+// they do and exists on BOTH supported LTS lines (10.11 and 11.4): the
+// UCA-14.0.0 NO PAD set, plus the codepoint-binary nopad form for
+// 0900_bin. MariaDB 11.4 aliases the 0900 names itself (and its aliases
+// are NO PAD too, measured on 11.4.13), but 10.11 rejects them (Error
+// 1273) — mapping unconditionally keeps the emitted DDL valid on the
+// whole supported floor. The swap is surfaced (never silent): the CREATE
+// path WARNs per table, the ALTER paths per column. Residual: UCA 9.0.0
+// vs 14.0.0 weights differ for edge-case characters. Language-specific
 // 0900 collations (utf8mb4_de_pb_0900_ai_ci, …) are deliberately NOT
 // mapped: they pass through verbatim and fail loudly on a pre-11.4
 // target rather than guess a language table.
+//
+// Through v0.159.0 this map created the PAD SPACE uca1400 forms
+// (`utf8mb4_uca1400_ai_ci`), which equate 'a' and 'a ' where every 0900
+// collation keeps them apart (Bug 305). For a key column that is two
+// source rows the target holds as one: the key-collation guard refuses
+// the second (KEY-COLLATION-MERGE), and the refusal's re-copy remedy
+// rebuilt the very column it refused — a duplicate-key failure on the
+// copy, every time. Creating the NO PAD form makes the target key compare
+// as the source's, so there is nothing for the guard to arm and a re-copy
+// converges. Every character column, not only keys: the emitter types a
+// column without knowing its indexes, a column that becomes a key later
+// (a forwarded ADD UNIQUE) would otherwise carry PAD SPACE into the same
+// trap, and NO PAD is what the source's comparisons mean for any column.
+// A target an older sluice created keeps its PAD SPACE columns until it is
+// re-created; the guard still covers it (see [mariadbKeyGuardCollations]).
+// [TestEmitterRemapCreatesWhatTheGuardComparesUnder] binds the two maps.
 var mariadbTargetCollations = map[string]string{
-	"utf8mb4_0900_ai_ci": "utf8mb4_uca1400_ai_ci",
-	"utf8mb4_0900_as_ci": "utf8mb4_uca1400_as_ci",
-	"utf8mb4_0900_as_cs": "utf8mb4_uca1400_as_cs",
+	"utf8mb4_0900_ai_ci": "utf8mb4_uca1400_nopad_ai_ci",
+	"utf8mb4_0900_as_ci": "utf8mb4_uca1400_nopad_as_ci",
+	"utf8mb4_0900_as_cs": "utf8mb4_uca1400_nopad_as_cs",
 	"utf8mb4_0900_bin":   "utf8mb4_nopad_bin", // codepoint binary, NO PAD on both sides
 }
 
@@ -309,25 +324,33 @@ var mariadbTargetCollations = map[string]string{
 // MariaDB source's uca1400 collations (utf8mb4_uca1400_ai_ci is the
 // 11.4 server default, so every string column of a default-collation
 // 11.4 schema carries it) arriving at a MySQL-family target, which has
-// no uca1400 set. Same surfacing and same closest-equivalent caveats
-// as [mariadbTargetCollations]; language-specific uca1400 variants
-// pass through verbatim and fail loudly.
+// no uca1400 set. The NO PAD uca1400 forms fold onto their exact 0900
+// counterparts — they are what [mariadbTargetCollations] creates, so a
+// table sluice copied MySQL → MariaDB copies back. The PAD SPACE forms
+// have no PAD SPACE UCA equivalent on MySQL and fold onto the NO PAD
+// 0900 ones (the closest equivalent, not a byte-identical one). Same
+// surfacing as [mariadbTargetCollations]; language-specific uca1400
+// variants pass through verbatim and fail loudly.
 var mysqlTargetCollations = map[string]string{
-	"utf8mb4_uca1400_ai_ci": "utf8mb4_0900_ai_ci",
-	"utf8mb4_uca1400_as_ci": "utf8mb4_0900_as_ci",
-	"utf8mb4_uca1400_as_cs": "utf8mb4_0900_as_cs",
-	"utf8mb4_nopad_bin":     "utf8mb4_0900_bin", // codepoint binary, NO PAD on both sides
+	"utf8mb4_uca1400_nopad_ai_ci": "utf8mb4_0900_ai_ci",
+	"utf8mb4_uca1400_nopad_as_ci": "utf8mb4_0900_as_ci",
+	"utf8mb4_uca1400_nopad_as_cs": "utf8mb4_0900_as_cs",
+	"utf8mb4_nopad_bin":           "utf8mb4_0900_bin", // codepoint binary, NO PAD on both sides
+	"utf8mb4_uca1400_ai_ci":       "utf8mb4_0900_ai_ci",
+	"utf8mb4_uca1400_as_ci":       "utf8mb4_0900_as_ci",
+	"utf8mb4_uca1400_as_cs":       "utf8mb4_0900_as_cs",
 }
 
 // mariadbKeyGuardCollations / mysqlKeyGuardCollations name, for the
 // key-collation guard (key_collation_guard.go), the collation on THIS target
-// server that compares as a cross-flavor SOURCE collation does. They are
-// deliberately not the emitter's remap: that one picks the closest collation
-// to CREATE the column with, and for the 0900 → uca1400 direction it moves
-// NO PAD to PAD SPACE, which equates 'a' and 'a ' where the source does not.
-// Judged by the emitter's map, a MySQL 8 `utf8mb4_0900_ai_ci` key landing on
-// a MariaDB `utf8mb4_uca1400_ai_ci` column looked unchanged and went
-// unguarded; measured on MariaDB 11.4.13, `INSERT (2,'a ') … ON DUPLICATE KEY
+// server that compares as a cross-flavor SOURCE collation does. Since Bug 305
+// the emitter's remap creates exactly these (pinned), but they stay separate
+// maps because they answer different questions about different tables: this
+// one judges whatever column the target HOLDS, including one an older sluice
+// created with the PAD SPACE uca1400 forms, which equate 'a' and 'a ' where
+// the source does not. Judged by that old remap, a MySQL 8
+// `utf8mb4_0900_ai_ci` key landing on a MariaDB `utf8mb4_uca1400_ai_ci`
+// column looked unchanged and went unguarded; measured on MariaDB 11.4.13, `INSERT (2,'a ') … ON DUPLICATE KEY
 // UPDATE` then silently overwrote row 1 (KEY-COLLATION review F-A). The
 // guard therefore compares under the NO PAD uca1400 forms, which exist from
 // MariaDB 10.10 on (measured on 10.11.19 and 11.4.13); below that the

@@ -535,7 +535,7 @@ func runVerify(t *testing.T, srcEngine, srcDSN, dstEngine, dstDSN string) {
 // TestMariaDB_MigrateCorpus_BothDirections_BothLTS is the full-corpus
 // migrate + verify pin over {mariadb→mysql8, mysql8→mariadb} × {11.4,
 // 10.11}. The mysql8→mariadb-10.11 leg additionally exercises the
-// utf8mb4_0900_* → utf8mb4_uca1400_* collation remap live (10.11
+// utf8mb4_0900_* → utf8mb4_uca1400_nopad_* collation remap live (10.11
 // rejects the 0900 names outright, so a green CREATE is the pin) —
 // every string column of the default-collation MySQL 8 source carries
 // utf8mb4_0900_ai_ci.
@@ -562,10 +562,10 @@ func TestMariaDB_MigrateCorpus_BothDirections_BothLTS(t *testing.T) {
 				runVerify(t, "mysql", srcDSN, "mariadb", dstDSN)
 
 				// The collation-remap pin: the MySQL 8 source's string
-				// columns carry utf8mb4_0900_ai_ci; the MariaDB target
-				// must hold a uca1400 (10.11) or 0900/uca1400 (11.4)
-				// collation — and on 10.11 the remap is the ONLY way the
-				// CREATE succeeded at all.
+				// columns carry utf8mb4_0900_ai_ci (NO PAD); the MariaDB
+				// target must hold its NO PAD uca1400 form (Bug 305) — and
+				// on 10.11 the remap is the ONLY way the CREATE succeeded
+				// at all.
 				db, err := sql.Open("mysql", dstDSN)
 				if err != nil {
 					t.Fatalf("open target: %v", err)
@@ -576,8 +576,8 @@ func TestMariaDB_MigrateCorpus_BothDirections_BothLTS(t *testing.T) {
 				if err := db.QueryRow(q).Scan(&coll); err != nil {
 					t.Fatalf("read target collation: %v", err)
 				}
-				if coll != "utf8mb4_uca1400_ai_ci" {
-					t.Errorf("target vc collation = %q; want utf8mb4_uca1400_ai_ci (remapped from utf8mb4_0900_ai_ci)", coll)
+				if coll != "utf8mb4_uca1400_nopad_ai_ci" {
+					t.Errorf("target vc collation = %q; want utf8mb4_uca1400_nopad_ai_ci (remapped from utf8mb4_0900_ai_ci)", coll)
 				}
 			})
 		})

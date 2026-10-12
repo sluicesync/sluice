@@ -504,7 +504,18 @@ func isKeyCollationMergeRaise(err error) bool {
 // and new values apart (`_bin`, a case-only UPDATE) looks exactly like a
 // second row: the refusal repeats on every start, and after a collation
 // change the re-delivered INSERT no longer conflicts and lands a second
-// time. A re-copy converges in both cases, so it leads.
+// time. A re-copy converges in both cases, so it leads — when sluice
+// creates the key under a collation that compares as the source's.
+//
+// It names that collation per armed column: the guard's comparison
+// collation, which for a MySQL 8 source on MariaDB is the NO PAD uca1400
+// form, not the source's own name (Bug 305: "the source's collation" sent
+// operators to `utf8mb4_0900_ai_ci`, which MariaDB 10.11 lacks and whose
+// remapped PAD SPACE form is the one that refused). For a column armed to
+// compare bytes (a Postgres source collation, which a MySQL target cannot
+// declare), sluice creates the key under the target's default collation —
+// the one that equates the values — so a re-copy does not converge there
+// and is not offered.
 func keyCollationMergeRemedy(plan *keyCollationPlan, schema, table string) string {
 	identityArmed := len(plan.pk) == 0
 	for _, c := range plan.pk {
@@ -512,16 +523,49 @@ func keyCollationMergeRemedy(plan *keyCollationPlan, schema, table string) strin
 			identityArmed = true
 		}
 	}
-	if identityArmed {
-		return fmt.Sprintf("The key that identifies a row of %s.%s is itself compared differently on the two "+
-			"sides (or the table has no primary key), so sluice cannot tell a re-delivered change of that key "+
-			"from a second source row, and this refusal repeats on every start. Re-copy the table, which "+
-			"converges either way: restart the sync with --restart-from-scratch, or take the table out of scope, "+
-			"re-run, and bring it back with a fresh cold start. Giving the target key the source's collation "+
-			"converges only if this is a second source row, not a re-delivered change of one",
-			quoteIdent(schema), quoteIdent(table))
+	// need lists, in key order, what each armed column must be declared with;
+	// recopyAligns is false when one of them is a collation sluice cannot
+	// create from the source's declaration.
+	var need []string
+	recopyAligns := true
+	named := map[string]bool{}
+	for _, key := range append([][]string{plan.pk}, plan.keys...) {
+		for _, c := range key {
+			ac, ok := plan.armed[c]
+			if !ok || named[c] {
+				continue
+			}
+			named[c] = true
+			if ac.bytes {
+				recopyAligns = false
+				need = append(need, quoteIdent(c)+" a binary collation (for example COLLATE utf8mb4_bin)")
+				continue
+			}
+			need = append(need, quoteIdent(c)+" CHARACTER SET "+ac.charset+" COLLATE "+ac.collation)
+		}
 	}
-	return fmt.Sprintf("Give the target's key column(s) the source's collation (for example `ALTER TABLE %s.%s "+
-		"MODIFY <column> … CHARACTER SET … COLLATE …` as the source declares it) and restart, or re-copy the table",
-		quoteIdent(schema), quoteIdent(table))
+	collations := strings.Join(need, ", ")
+	if collations == "" {
+		collations = "the source's collation" // a plan names its armed keys; kept for a hand-built one
+	}
+	alter := fmt.Sprintf("`ALTER TABLE %s.%s MODIFY <column> …` with %s", quoteIdent(schema), quoteIdent(table), collations)
+	if identityArmed {
+		lead := fmt.Sprintf("The key that identifies a row of %s.%s is itself compared differently on the two "+
+			"sides (or the table has no primary key), so sluice cannot tell a re-delivered change of that key "+
+			"from a second source row, and this refusal repeats on every start. ", quoteIdent(schema), quoteIdent(table))
+		if recopyAligns {
+			return lead + "Re-copy the table, which converges either way: restart the sync with " +
+				"--restart-from-scratch, which recreates it with " + collations + ". Giving the target key that " +
+				"collation yourself (" + alter + ") converges only if this is a second source row, not a " +
+				"re-delivered change of one"
+		}
+		return lead + "A re-copy does not converge here: sluice recreates the key under the target's default " +
+			"collation, which equates the values. Give the target key " + collations + " (" + alter + ") and " +
+			"restart; that converges only if this is a second source row, not a re-delivered change of one"
+	}
+	if recopyAligns {
+		return "Give the target's key column(s) " + collations + " (" + alter + ") and restart, or re-copy the " +
+			"table with --restart-from-scratch, which recreates it with that collation"
+	}
+	return "Give the target's key column(s) " + collations + " (" + alter + ") and restart"
 }

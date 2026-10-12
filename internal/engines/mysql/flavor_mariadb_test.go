@@ -351,23 +351,34 @@ func TestParseMariaDBVersion(t *testing.T) {
 }
 
 // TestMariaDBCollationRemaps pins the cross-family maps in both
-// directions and that they are exact mirrors of each other.
+// directions: the MySQL → MariaDB map creates the NO PAD uca1400 forms
+// (Bug 305) and every one of them maps back exactly, and every MariaDB
+// collation the reverse map folds lands on a 0900 collation that maps
+// forward to a NO PAD form — so a round trip ends on NO PAD whichever
+// uca1400 form it started from.
 func TestMariaDBCollationRemaps(t *testing.T) {
-	if got := FlavorMariaDB.crossFlavorCollationRemap()["utf8mb4_0900_ai_ci"]; got != "utf8mb4_uca1400_ai_ci" {
-		t.Errorf("mariadb remap of utf8mb4_0900_ai_ci = %q", got)
+	if got := FlavorMariaDB.crossFlavorCollationRemap()["utf8mb4_0900_ai_ci"]; got != "utf8mb4_uca1400_nopad_ai_ci" {
+		t.Errorf("mariadb remap of utf8mb4_0900_ai_ci = %q; want the NO PAD utf8mb4_uca1400_nopad_ai_ci", got)
 	}
-	if got := FlavorVanilla.crossFlavorCollationRemap()["utf8mb4_uca1400_ai_ci"]; got != "utf8mb4_0900_ai_ci" {
-		t.Errorf("vanilla remap of utf8mb4_uca1400_ai_ci = %q", got)
-	}
-	// Mirror-completeness: every entry in one map reverses in the other.
-	for from, to := range mariadbTargetCollations {
-		if back, ok := mysqlTargetCollations[to]; !ok || back != from {
-			t.Errorf("mariadbTargetCollations[%q] = %q does not mirror in mysqlTargetCollations (got %q, %v)", from, to, back, ok)
+	for _, from := range []string{"utf8mb4_uca1400_ai_ci", "utf8mb4_uca1400_nopad_ai_ci"} {
+		if got := FlavorVanilla.crossFlavorCollationRemap()[from]; got != "utf8mb4_0900_ai_ci" {
+			t.Errorf("vanilla remap of %s = %q; want utf8mb4_0900_ai_ci", from, got)
 		}
 	}
+	// The forward map round-trips exactly.
+	for from, to := range mariadbTargetCollations {
+		if back, ok := mysqlTargetCollations[to]; !ok || back != from {
+			t.Errorf("mariadbTargetCollations[%q] = %q does not map back in mysqlTargetCollations (got %q, %v)", from, to, back, ok)
+		}
+		if !strings.Contains(to, "nopad") {
+			t.Errorf("mariadbTargetCollations[%q] = %q is not a NO PAD form; every 0900 collation is NO PAD", from, to)
+		}
+	}
+	// Every reverse fold lands where the forward map goes to NO PAD.
 	for from, to := range mysqlTargetCollations {
-		if back, ok := mariadbTargetCollations[to]; !ok || back != from {
-			t.Errorf("mysqlTargetCollations[%q] = %q does not mirror in mariadbTargetCollations (got %q, %v)", from, to, back, ok)
+		fwd, ok := mariadbTargetCollations[to]
+		if !ok || !strings.Contains(fwd, "nopad") {
+			t.Errorf("mysqlTargetCollations[%q] = %q, which mariadbTargetCollations maps to %q (%v); want a NO PAD form", from, to, fwd, ok)
 		}
 	}
 	// A language-specific 0900 collation is deliberately NOT mapped —
@@ -384,6 +395,38 @@ func TestMariaDBCollationRemaps(t *testing.T) {
 	}
 }
 
+// TestEmitterRemapCreatesWhatTheGuardComparesUnder binds the two
+// cross-flavor maps for Bug 305: for every source collation either flavor's
+// emitter remaps, the column it CREATES is the collation the key-collation
+// guard COMPARES that source collation under. That is what makes a column
+// sluice created unarmed by construction, and so what makes the
+// KEY-COLLATION-MERGE refusal's re-copy remedy converge. Through v0.159.0
+// the MariaDB emitter created the PAD SPACE uca1400 forms, the guard
+// compared under NO PAD, and every re-copy rebuilt the key it refused. The
+// expected side is the guard's own plan ([planKeyCollationGuard], via
+// armedFor) over a target column typed by the emitter, not either map read
+// directly.
+func TestEmitterRemapCreatesWhatTheGuardComparesUnder(t *testing.T) {
+	checked := 0
+	for _, flavor := range []Flavor{FlavorMariaDB, FlavorVanilla} {
+		for from, created := range flavor.crossFlavorCollationRemap() {
+			src := ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: from}
+			tgt := ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: newMySQLEmitterForFlavor(nil, flavor).emittableCollation("utf8mb4", from)}
+			if tgt.Collation != created {
+				t.Fatalf("%v emitter created %q for %q; the remap says %q", flavor, tgt.Collation, from, created)
+			}
+			if ac, armed := armedFor(src, tgt, flavor.keyGuardCollations()); armed {
+				t.Errorf("%v: a %s source key lands on a column sluice creates as %s, which the guard arms (compares as %s) — "+
+					"the KEY-COLLATION-MERGE re-copy remedy cannot converge (Bug 305)", flavor, from, created, ac.collation)
+			}
+			checked++
+		}
+	}
+	if checked < 8 {
+		t.Fatalf("checked %d remapped collations; want at least 8 (4 per direction) — the maps are not being walked", checked)
+	}
+}
+
 // TestEmittableCollation_Remap pins the emitter composition: PG
 // collations still drop, remapped collations swap, everything else
 // passes through — and the nil-remap emitter (stdEmitter / unit
@@ -392,8 +435,8 @@ func TestEmittableCollation_Remap(t *testing.T) {
 	mariadbEmitter := newMySQLEmitterForFlavor(nil, FlavorMariaDB)
 	vanillaEmitter := newMySQLEmitterForFlavor(nil, FlavorVanilla)
 
-	if got := mariadbEmitter.emittableCollation("utf8mb4", "utf8mb4_0900_ai_ci"); got != "utf8mb4_uca1400_ai_ci" {
-		t.Errorf("mariadb emitter: 0900_ai_ci → %q; want utf8mb4_uca1400_ai_ci", got)
+	if got := mariadbEmitter.emittableCollation("utf8mb4", "utf8mb4_0900_ai_ci"); got != "utf8mb4_uca1400_nopad_ai_ci" {
+		t.Errorf("mariadb emitter: 0900_ai_ci → %q; want utf8mb4_uca1400_nopad_ai_ci", got)
 	}
 	if got := vanillaEmitter.emittableCollation("utf8mb4", "utf8mb4_uca1400_ai_ci"); got != "utf8mb4_0900_ai_ci" {
 		t.Errorf("vanilla emitter: uca1400_ai_ci → %q; want utf8mb4_0900_ai_ci", got)
