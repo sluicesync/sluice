@@ -32,9 +32,10 @@ package mysql
 //
 // # Cost
 //
-// Two catalog reads per table per writer (the target's columns and primary
-// key), cached; a third (its unique keys) and a collation probe only when a
-// column is armed. Nothing per row: the guard is the update list's first
+// One catalog read per table per writer (the target's column collations),
+// cached; only when a column is armed, one more for the keys (primary and
+// unique together), SELECT DATABASE() when the writer has no schema, and the
+// collation-expressibility probe. Nothing per row: the guard is the update list's first
 // assignment, evaluated by the server only on a conflict, and rendered once
 // per table — a non-conflicting insert runs exactly as before.
 
