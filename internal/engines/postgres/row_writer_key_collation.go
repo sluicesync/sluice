@@ -30,6 +30,7 @@ package postgres
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -77,9 +78,29 @@ func copyKeyCollationMergeRefusal(err error, plan *pgKeyCollationPlan, schema, t
 	}
 	return &ir.KeyCollationMergeError{
 		Schema: schema, Table: table, Cause: err,
-		Remedy: fmt.Sprintf("These are two rows of the source the copy is reading, and the target table cannot hold "+
-			"both. Give the target's key column(s) a deterministic collation, or the source's (for example `ALTER "+
-			"TABLE %s.%s ALTER COLUMN <column> TYPE … COLLATE …`), and run the copy again, or exclude the table",
-			quoteIdent(schema), quoteIdent(table)),
+		Remedy: copyKeyCollationMergeRemedy(plan, schema, table),
 	}
+}
+
+// copyKeyCollationMergeRemedy names, per armed key column, the collation the
+// guard compared it under — "C" for a deterministic source (any
+// deterministic collation tells the values apart), the source's own
+// nondeterministic collation otherwise — which a Postgres target can always
+// declare (a MySQL-family source key on a nondeterministic target refuses
+// KEY-COLLATION-GUARD-UNSUPPORTED before any row instead). The MySQL twin
+// names the collation the same way (review 2026-10-12, finding 2: "the
+// source's collation" is not something the operator can always declare).
+func copyKeyCollationMergeRemedy(plan *pgKeyCollationPlan, schema, table string) string {
+	cols := make([]string, 0, len(plan.compare))
+	for c := range plan.compare {
+		cols = append(cols, c)
+	}
+	sortStrings(cols)
+	need := make([]string, len(cols))
+	for i, c := range cols {
+		need[i] = quoteIdent(c) + " COLLATE " + quoteIdent(plan.compare[c])
+	}
+	return fmt.Sprintf("These are two rows of the source the copy is reading, and the target table cannot hold "+
+		"both. Give the target's key column(s) %s (`ALTER TABLE %s.%s ALTER COLUMN <column> TYPE <type> COLLATE …`) "+
+		"and run the copy again, or exclude the table", strings.Join(need, ", "), quoteIdent(schema), quoteIdent(table))
 }

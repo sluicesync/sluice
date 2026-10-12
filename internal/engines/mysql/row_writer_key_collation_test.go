@@ -137,7 +137,7 @@ func TestCopyKeyCollationMergeRefusal_NeedsTheGuardAndTheMarker(t *testing.T) {
 	if !errors.As(err, &kce) || !errors.Is(err, ir.ErrKeyCollationMerge) {
 		t.Fatalf("the guard's raise was not attributed: %v", err)
 	}
-	if !strings.Contains(err.Error(), "run the copy again") {
+	if !strings.Contains(err.Error(), "two rows of the source the copy is reading") {
 		t.Errorf("the remedy is not the copy's: %v", err)
 	}
 	if errors.Is(copyKeyCollationMergeRefusal(raise, copyKeyCollationGuard{}, "kd"), ir.ErrKeyCollationMerge) {
@@ -146,5 +146,83 @@ func TestCopyKeyCollationMergeRefusal_NeedsTheGuardAndTheMarker(t *testing.T) {
 	other := &mysql.MySQLError{Number: 1690, Message: "BIGINT value is out of range"}
 	if errors.Is(copyKeyCollationMergeRefusal(other, armed, "kd"), ir.ErrKeyCollationMerge) {
 		t.Error("an ordinary overflow was attributed")
+	}
+}
+
+// TestCopyKeyCollationMergeRemedy_NamesTheCollationTheKeyNeeds pins review
+// 2026-10-12 finding 2 over plans the copy guard actually builds: the copy's
+// remedy names, per armed key column, the collation the target key needs —
+// a binary collation for a byte-armed Postgres key (whose own collation
+// MySQL cannot declare), the NO PAD uca1400 form for a MySQL 8 key on
+// MariaDB (whose 0900 name MariaDB 10.11 lacks), the source's own for a
+// same-flavor one — and never "as the source declares it". A byte-armed key
+// is told to resume, not to recreate the table (sluice recreates it under
+// the target default, which equates the values).
+func TestCopyKeyCollationMergeRemedy_NamesTheCollationTheKeyNeeds(t *testing.T) {
+	varchar := func(cs, coll string) ir.Type { return ir.Varchar{Length: 20, Charset: cs, Collation: coll} }
+	target := func(k ir.Type) map[string]*ir.Column {
+		return map[string]*ir.Column{"id": {Name: "id", Type: ir.Integer{Width: 32}}, "k": {Name: "k", Type: k}}
+	}
+	source := func(k ir.Type) *ir.Table {
+		return &ir.Table{Name: "kd", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 32}}, {Name: "k", Type: k}}}
+	}
+	mysqlCI := target(varchar("utf8mb4", "utf8mb4_0900_ai_ci"))
+	cases := []struct {
+		name      string
+		plan      *keyCollationPlan
+		want      []string
+		forbidden []string
+	}{
+		{
+			"postgres deterministic key (bytes)",
+			planCopyKeyCollationGuard(source(ir.Varchar{Length: 20, Collation: "C", Determinism: ir.CollationDeterministic}), mysqlCI, []string{"k"}, nil, mysqlKeyGuardCollations),
+			[]string{"`k` a binary collation (for example COLLATE utf8mb4_bin)", "resume the copy", "rather than recreating the table"},
+			[]string{"as the source declares", "the source's collation", "COLLATE C"},
+		},
+		{
+			"postgres nondeterministic key (bytes)",
+			planCopyKeyCollationGuard(source(ir.Varchar{Length: 20, Collation: "l2", Determinism: ir.CollationNonDeterministic}), mysqlCI, []string{"k"}, nil, mysqlKeyGuardCollations),
+			[]string{"`k` a binary collation", "resume the copy"},
+			[]string{"as the source declares", "the source's collation", "COLLATE l2"},
+		},
+		{
+			"postgres default key (bytes)",
+			planCopyKeyCollationGuard(source(ir.Varchar{Length: 20, Determinism: ir.CollationDeterministic}), mysqlCI, []string{"id"}, [][]string{{"k"}}, mysqlKeyGuardCollations),
+			[]string{"`k` a binary collation", "resume the copy"},
+			[]string{"as the source declares", "the source's collation"},
+		},
+		{
+			"mysql 8 to mariadb (NO PAD uca1400)",
+			planCopyKeyCollationGuard(source(varchar("utf8mb4", "utf8mb4_0900_ai_ci")), target(varchar("utf8mb4", "utf8mb4_uca1400_ai_ci")), []string{"k"}, nil, mariadbKeyGuardCollations),
+			[]string{"`k` CHARACTER SET utf8mb4 COLLATE utf8mb4_uca1400_nopad_ai_ci", "run the copy again"},
+			[]string{"utf8mb4_0900_ai_ci", "as the source declares", "resume the copy"},
+		},
+		{
+			"mysql _bin to mysql _ci (plain)",
+			planCopyKeyCollationGuard(source(varchar("utf8mb4", "utf8mb4_bin")), target(varchar("utf8mb4", "utf8mb4_general_ci")), []string{"k"}, nil, mysqlKeyGuardCollations),
+			[]string{"`k` CHARACTER SET utf8mb4 COLLATE utf8mb4_bin", "run the copy again"},
+			[]string{"as the source declares", "resume the copy"},
+		},
+	}
+	for _, tc := range cases {
+		if tc.plan == nil {
+			t.Fatalf("%s: the copy guard armed nothing — the cell exercises no refusal", tc.name)
+		}
+		got := copyKeyCollationMergeRemedy(tc.plan, "s", "kd")
+		for _, w := range tc.want {
+			if !strings.Contains(got, w) {
+				t.Errorf("%s: remedy lacks %q:\n%s", tc.name, w, got)
+			}
+		}
+		for _, f := range tc.forbidden {
+			if strings.Contains(got, f) {
+				t.Errorf("%s: remedy says %q:\n%s", tc.name, f, got)
+			}
+		}
+		// The applier's remedy names the same collations for the same plan.
+		need, _ := keyCollationNeeds(tc.plan)
+		if !strings.Contains(keyCollationMergeRemedy(tc.plan, "s", "kd"), need) {
+			t.Errorf("%s: the applier's remedy names other collations than %q", tc.name, need)
+		}
 	}
 }

@@ -88,3 +88,31 @@ func TestCopyKeyCollationMergeRefusal_NeedsTheGuardAndTheMarker(t *testing.T) {
 		t.Error("an ordinary invalid cast was attributed")
 	}
 }
+
+// TestCopyKeyCollationMergeRemedy_NamesTheCollation pins review 2026-10-12
+// finding 2's Postgres half over plans the guard builds: the copy's remedy
+// names, per armed key column, the collation it was compared under — "C"
+// for a deterministic source, the source's own nondeterministic collation
+// otherwise — not a generic "the source's".
+func TestCopyKeyCollationMergeRemedy_NamesTheCollation(t *testing.T) {
+	tbl := func(k ir.Type) *ir.Table {
+		return &ir.Table{Name: "kd", Columns: []*ir.Column{{Name: "k", Type: k}}}
+	}
+	for _, tc := range []struct {
+		name string
+		src  ir.Type
+		want string
+	}{
+		{"deterministic source", ir.Text{Size: ir.TextLong, Collation: "en_US", Determinism: ir.CollationDeterministic}, `"k" COLLATE "C"`},
+		{"another nondeterministic source", ir.Text{Size: ir.TextLong, Collation: "ci_ai", Determinism: ir.CollationNonDeterministic}, `"k" COLLATE "ci_ai"`},
+	} {
+		plan, _ := planPGKeyCollationGuard(tbl(tc.src), []string{"k"}, map[string]targetKeyCollation{"k": {name: "ci"}})
+		if plan == nil {
+			t.Fatalf("%s: not armed", tc.name)
+		}
+		got := copyKeyCollationMergeRemedy(plan, "public", "kd")
+		if !strings.Contains(got, tc.want) || strings.Contains(got, "the source's") {
+			t.Errorf("%s: remedy does not name %s:\n%s", tc.name, tc.want, got)
+		}
+	}
+}

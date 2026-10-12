@@ -140,11 +140,12 @@ func (w *RowWriter) resolveCopyKeyCollationGuard(ctx context.Context, q queryRow
 	}
 	assign, hang, ok := plan.renderFor(quoteIdent(table.Name), names, w.upsert)
 	if !ok {
+		need, _ := keyCollationNeeds(plan)
 		return copyKeyCollationGuard{}, &terminalMySQLError{err: fmt.Errorf("%w: %s: mysql: copy into %s: a key column "+
 			"whose collation the source declares differently from the target is not among the copied columns "+
 			"(a generated column), so sluice cannot check that an upsert does not merge two source rows. Refusing "+
-			"before any row of the table is written; give the target key the source's collation, or exclude the table",
-			ir.ErrKeyCollationMerge, keyCollationGuardUnsupportedMarker, qn)}
+			"before any row of the table is written; give the target's key column(s) %s, or exclude the table",
+			ir.ErrKeyCollationMerge, keyCollationGuardUnsupportedMarker, qn, need)}
 	}
 	return copyKeyCollationGuard{plan: plan, schema: schema, assign: assign, hang: hang}, nil
 }
@@ -254,9 +255,27 @@ func copyKeyCollationMergeRefusal(err error, guard copyKeyCollationGuard, table 
 	}
 	return &ir.KeyCollationMergeError{
 		Schema: guard.schema, Table: table, Cause: err,
-		Remedy: fmt.Sprintf("These are two rows of the source the copy is reading, and the target table cannot hold "+
-			"both. Give the target's key column(s) the source's collation (for example `ALTER TABLE %s.%s MODIFY "+
-			"<column> … CHARACTER SET … COLLATE …` as the source declares it) and run the copy again, or exclude the "+
-			"table", quoteIdent(guard.schema), quoteIdent(table)),
+		Remedy: copyKeyCollationMergeRemedy(guard.plan, guard.schema, table),
 	}
+}
+
+// copyKeyCollationMergeRemedy names, per armed key column, the collation the
+// target key needs ([keyCollationNeeds] — the applier's remedy computes the
+// same list). It never says "the source's collation": a Postgres source's
+// cannot be declared on MySQL, and a MySQL 8 source's 0900 name does not
+// exist on MariaDB 10.11 (review 2026-10-12, finding 2). For a byte-armed
+// key it says to resume the copy, not recreate the table: sluice creates
+// that key under the target's default collation, which equates the values,
+// so `--restart-from-scratch` would meet the same pair again.
+func copyKeyCollationMergeRemedy(plan *keyCollationPlan, schema, table string) string {
+	collations, recopyAligns := keyCollationNeeds(plan)
+	alter := fmt.Sprintf("`ALTER TABLE %s.%s MODIFY <column> …` with %s", quoteIdent(schema), quoteIdent(table), collations)
+	lead := "These are two rows of the source the copy is reading, and the target table cannot hold both. " +
+		"Give the target's key column(s) " + collations + " (" + alter + ")"
+	if recopyAligns {
+		return lead + " and run the copy again, or exclude the table"
+	}
+	return lead + " and resume the copy (for `migrate`, `--resume`) rather than recreating the table: " +
+		"sluice creates that key under the target's default collation, which equates the " +
+		"values, so a re-copy from scratch meets the same pair. Or exclude the table"
 }

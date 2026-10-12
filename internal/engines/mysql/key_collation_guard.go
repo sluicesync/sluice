@@ -557,31 +557,7 @@ func keyCollationMergeRemedy(plan *keyCollationPlan, schema, table string) strin
 			identityArmed = true
 		}
 	}
-	// need lists, in key order, what each armed column must be declared with;
-	// recopyAligns is false when one of them is a collation sluice cannot
-	// create from the source's declaration.
-	var need []string
-	recopyAligns := true
-	named := map[string]bool{}
-	for _, key := range append([][]string{plan.pk}, plan.keys...) {
-		for _, c := range key {
-			ac, ok := plan.armed[c]
-			if !ok || named[c] {
-				continue
-			}
-			named[c] = true
-			if ac.bytes {
-				recopyAligns = false
-				need = append(need, quoteIdent(c)+" a binary collation (for example COLLATE utf8mb4_bin)")
-				continue
-			}
-			need = append(need, quoteIdent(c)+" CHARACTER SET "+ac.charset+" COLLATE "+ac.collation)
-		}
-	}
-	collations := strings.Join(need, ", ")
-	if collations == "" {
-		collations = "the source's collation" // a plan names its armed keys; kept for a hand-built one
-	}
+	collations, recopyAligns := keyCollationNeeds(plan)
 	if identityArmed {
 		// No ALTER spelled out here: the collation change converges only for a
 		// second source row, so the text names the collation without handing
@@ -605,4 +581,42 @@ func keyCollationMergeRemedy(plan *keyCollationPlan, schema, table string) strin
 			"table with --restart-from-scratch, which recreates it with that collation"
 	}
 	return "Give the target's key column(s) " + collations + " (" + alter + ") and restart"
+}
+
+// keyCollationNeeds is what each armed key column of plan must be declared
+// with on this target for the guard's comparison to be the key's own, in
+// key order: the guard's comparison collation (for a MySQL 8 source on
+// MariaDB the NO PAD uca1400 form, not the source's 0900 name — Bug 305),
+// or for a column armed to compare bytes (a Postgres source collation,
+// which a MySQL target cannot declare) a binary collation. recopyAligns is
+// false when any column is byte-armed: sluice creates such a key under the
+// target's default collation, which equates the values, so a re-copy that
+// recreates the table does not converge there. Shared by the applier's
+// remedy ([keyCollationMergeRemedy]) and the copy's
+// ([copyKeyCollationMergeRefusal]) so the two never name different
+// collations for one key.
+func keyCollationNeeds(plan *keyCollationPlan) (collations string, recopyAligns bool) {
+	var need []string
+	recopyAligns = true
+	named := map[string]bool{}
+	for _, key := range append([][]string{plan.pk}, plan.keys...) {
+		for _, c := range key {
+			ac, ok := plan.armed[c]
+			if !ok || named[c] {
+				continue
+			}
+			named[c] = true
+			if ac.bytes {
+				recopyAligns = false
+				need = append(need, quoteIdent(c)+" a binary collation (for example COLLATE utf8mb4_bin)")
+				continue
+			}
+			need = append(need, quoteIdent(c)+" CHARACTER SET "+ac.charset+" COLLATE "+ac.collation)
+		}
+	}
+	collations = strings.Join(need, ", ")
+	if collations == "" {
+		collations = "the source's collation" // a plan names its armed keys; kept for a hand-built one
+	}
+	return collations, recopyAligns
 }
