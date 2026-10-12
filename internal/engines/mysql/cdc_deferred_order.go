@@ -86,7 +86,7 @@ func (r *CDCReader) holdDecodedOrder(qn string, tbl *tableSchema) error {
 			return deferredNoBasisRefusal(qn)
 		}
 		if hasBasis {
-			if err := basis.hold(qn, cur, approximate); err != nil {
+			if err := basis.hold(qn, cur, approximate, tbl.unnamedCollations, r.serverCollationIDNames != nil); err != nil {
 				return err
 			}
 		}
@@ -109,8 +109,10 @@ func (r *CDCReader) holdDecodedOrder(qn string, tbl *tableSchema) error {
 }
 
 // hold refuses a shape (cur) that reorders or retypes any column it
-// shares with the basis b.
-func (b decodedShape) hold(qn string, cur *ir.Table, approximate map[string]bool) error {
+// shares with the basis b. unnamed are cur's TABLE_MAP-typed character
+// columns whose recorded collation ID was not named, and namesLoaded says
+// whether the source's collation table was read at all.
+func (b decodedShape) hold(qn string, cur *ir.Table, approximate map[string]bool, unnamed map[string]uint64, namesLoaded bool) error {
 	names := ir.ColumnNames(cur)
 	if a, c, flipped := firstOrderFlip(b.names, names); flipped {
 		return deferredOrderRefusal(qn, a, c)
@@ -126,6 +128,9 @@ func (b decodedShape) hold(qn string, cur *ir.Table, approximate map[string]bool
 			}
 			if err := holdRecordedLength(qn, col.Name, was, col.Type); err != nil {
 				return err
+			}
+			if id, ok := unnamed[col.Name]; ok && characterCollation(was) != "" {
+				return deferredUnnamedCollationRefusal(qn, col.Name, id, characterCollation(was), namesLoaded)
 			}
 			if !recordedCollationAgrees(was, col.Type) {
 				return deferredCollationRefusal(qn, col.Name, characterCollation(was), characterCollation(col.Type))
@@ -314,6 +319,22 @@ func deferredCollationRefusal(qn, col, was, now string) error {
 		"shape this stream knew. Its rows would be applied before the target's column changes collation, and on a "+
 		"key a target still comparing under %s can merge rows the source keeps apart; %s",
 		qn, ir.ErrDeferredSchemaChange, col, now, was, was, deferredWhy)
+}
+
+// deferredUnnamedCollationRefusal refuses a character column whose recorded
+// collation ID could not be named, where the basis declares a collation:
+// whether it changed cannot be told, and passing it would be the
+// fail-open review F4 found (the charset half of the same lookup already
+// refuses an unnamed ID).
+func deferredUnnamedCollationRefusal(qn, col string, id uint64, was string, namesLoaded bool) error {
+	why := "the source's collation table does not name it"
+	if !namesLoaded {
+		why = "the source's collation table (information_schema.COLLATIONS) could not be read, so it could not be " +
+			"named; starting the stream again retries the read"
+	}
+	return fmt.Errorf("mysql: cdc: %s: %w: column %q was written under collation ID %d, and %s. The last shape this "+
+		"stream knew declared %s, and whether this event's collation differs cannot be told; %s",
+		qn, ir.ErrDeferredSchemaChange, col, id, why, was, deferredWhy)
 }
 
 // deferredNoBasisRefusal refuses a deferred shape of a table the stream

@@ -194,7 +194,14 @@ func (r *CDCReader) buildRecordedShape(ctx context.Context, qn string, tbl *tabl
 			if err != nil {
 				return nil, errRecordedColumnUntypable(tbl, name, err)
 			}
-			typ = withRecordedCollation(typ, tm, i, r.collationIDNames(ctx))
+			var unnamed uint64
+			typ, unnamed = withRecordedCollation(typ, tm, i, r.collationIDNames(ctx))
+			if unnamed != 0 {
+				if shape.unnamedCollations == nil {
+					shape.unnamedCollations = map[string]uint64{}
+				}
+				shape.unnamedCollations[name] = unnamed
+			}
 			col, dt, native = &ir.Column{Name: name, Type: typ, Nullable: true}, meta.DataType, mariadbNativeNone
 			shape.synthesized = true
 			shape.tableMapTyped = append(shape.tableMapTyped, name)
@@ -384,28 +391,35 @@ const binaryCollationID = 63
 // of that column, and rows distinct under the new collation merged on a
 // target whose key still compared under the old one (DEFERRED-KEY-COLLATION,
 // measured on MySQL 8.4 FULL). An ID the source's collation table does not
-// name is left unstamped, and the hold then cannot compare it.
-func withRecordedCollation(typ ir.Type, tm *replication.TableMapEvent, i int, nameOf func(uint64) string) ir.Type {
+// name — or a table that could not be read — leaves the type unstamped and
+// returns the ID as unnamed, so the hold refuses where the basis declares
+// a collation rather than pass a change it cannot see (review F4).
+func withRecordedCollation(typ ir.Type, tm *replication.TableMapEvent, i int, nameOf func(uint64) string) (stamped ir.Type, unnamedID uint64) {
 	id, ok := tm.CollationMap()[i]
 	if !ok || id == binaryCollationID {
-		return typ
+		return typ, 0
+	}
+	switch typ.(type) {
+	case ir.Varchar, ir.Char, ir.Text:
+	default:
+		return typ, 0
 	}
 	name := strings.ToLower(nameOf(id))
 	if name == "" {
-		return typ
+		return typ, id
 	}
 	switch v := typ.(type) {
 	case ir.Varchar:
 		v.Collation = name
-		return v
+		return v, 0
 	case ir.Char:
 		v.Collation = name
-		return v
+		return v, 0
 	case ir.Text:
 		v.Collation = name
-		return v
+		return v, 0
 	}
-	return typ
+	return typ, 0
 }
 
 // bitWidthFromMeta decodes a BIT column's TABLE_MAP metadata: the low byte

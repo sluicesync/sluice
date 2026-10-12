@@ -17,11 +17,20 @@ type col struct {
 	name        string
 	typ         ir.Type
 	approximate bool
+	// unnamedID, when set, is a recorded collation ID the source's table did
+	// not name (review F4).
+	unnamedID uint64
 }
 
 func c(name string, typ ir.Type) col { return col{name: name, typ: typ} }
 
 func tm(name string, typ ir.Type) col { return col{name: name, typ: typ, approximate: true} }
+
+// tmUnnamed is tm for a character column whose recorded collation ID could
+// not be named, so the type carries no collation.
+func tmUnnamed(name string, typ ir.Type, id uint64) col {
+	return col{name: name, typ: typ, approximate: true, unnamedID: id}
+}
 
 var (
 	tInt  = ir.Integer{Width: 32}
@@ -48,6 +57,12 @@ func deferredShape(force bool, cols ...col) *tableSchema {
 		if k.approximate {
 			tbl.synthesized = true
 			tbl.tableMapTyped = append(tbl.tableMapTyped, k.name)
+		}
+		if k.unnamedID != 0 {
+			if tbl.unnamedCollations == nil {
+				tbl.unnamedCollations = map[string]uint64{}
+			}
+			tbl.unnamedCollations[k.name] = k.unnamedID
 		}
 	}
 	return tbl
@@ -144,6 +159,11 @@ func TestHoldDecodedOrder_DeferredShapeMatrix(t *testing.T) {
 		{"approximate: text collation changed", baseline(c("id", tInt), c("k", ir.Text{Size: ir.TextRegular, Charset: "utf8mb4", Collation: "utf8mb4_general_ci"})), []step{{deferredShape(false, c("id", tInt), tm("k", ir.Text{Size: ir.TextRegular, Charset: "utf8mb4", Collation: "utf8mb4_bin"})), typed}}},
 		{"approximate: PAD SPACE to NO PAD", baseline(c("id", tInt), c("k", ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: "utf8mb4_bin"})), []step{{deferredShape(false, c("id", tInt), tm("k", ir.Varchar{Length: 80, Charset: "utf8mb4", Collation: "utf8mb4_0900_bin"})), typed}}},
 		{"approximate: the same collation holds", baseline(c("id", tInt), c("k", tVCci)), []step{{deferredShape(false, c("id", tInt), tm("k", ir.Varchar{Length: 80, Charset: "utf8mb4", Collation: "UTF8MB4_0900_AI_CI"})), nil}}},
+		// Review F4: a recorded collation ID the source's table did not name
+		// (or a table that could not be read) is not a pass where the basis
+		// declares a collation; it is where the basis declares none.
+		{"approximate: an unnamed collation ID against a declared basis", baseline(c("id", tInt), c("k", tVCci)), []step{{deferredShape(false, c("id", tInt), tmUnnamed("k", tVC80, 9999)), typed}}},
+		{"approximate: an unnamed collation ID against an undeclared basis", baseline(c("id", tInt), c("k", tVC20)), []step{{deferredShape(false, c("id", tInt), tmUnnamed("k", tVC80, 9999)), nil}}},
 		{
 			"approximate: a collation carried forward is held",
 			baseline(c("id", tInt), c("k", tVCci), c("c", tInt)),

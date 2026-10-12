@@ -819,6 +819,33 @@ var rsfDoubleRetype = []struct{ name, create, retype, then string }{
 		"ALTER TABLE kd MODIFY COLUMN b VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin; INSERT INTO kd (id,b,c) VALUES (99,'A',991)",
 		"ALTER TABLE kd MODIFY COLUMN b VARBINARY(80); INSERT INTO kd (id,b,c) VALUES (100,'y',1000)",
 	},
+	// The same across the character families' TABLE_MAP wire types (Bug 74:
+	// pin the class): CHAR is MYSQL_TYPE_STRING, TEXT a BLOB-coded column
+	// with a collation; VARCHAR is above.
+	{
+		"key-collation-char-then-varbinary",
+		"CREATE TABLE kd (id INT PRIMARY KEY, b CHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci, c INT, UNIQUE KEY ub (b)); INSERT INTO kd VALUES (1,'a',20),(2,'bb',21),(3,'ccc',22);",
+		"ALTER TABLE kd MODIFY COLUMN b CHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin; INSERT INTO kd (id,b,c) VALUES (99,'A',991)",
+		"ALTER TABLE kd MODIFY COLUMN b VARBINARY(80); INSERT INTO kd (id,b,c) VALUES (100,'y',1000)",
+	},
+	{
+		"key-collation-text-then-blob",
+		"CREATE TABLE kd (id INT PRIMARY KEY, b TEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci, c INT, UNIQUE KEY ub (b(20))); INSERT INTO kd VALUES (1,'a',20),(2,'bb',21),(3,'ccc',22);",
+		"ALTER TABLE kd MODIFY COLUMN b TEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin; INSERT INTO kd (id,b,c) VALUES (99,'A',991)",
+		"ALTER TABLE kd MODIFY COLUMN b MEDIUMBLOB; INSERT INTO kd (id,b,c) VALUES (100,'y',1000)",
+	},
+}
+
+// rsfDoubleRetypeMySQLOnly is rsfDoubleRetype for collations MariaDB does
+// not have: PAD SPACE → NO PAD (`utf8mb4_bin` → `utf8mb4_0900_bin`), where
+// row 99's 'a ' is one key with row 1's 'a' only under the old collation.
+var rsfDoubleRetypeMySQLOnly = []struct{ name, create, retype, then string }{
+	{
+		"key-nopad-then-varbinary",
+		"CREATE TABLE kd (id INT PRIMARY KEY, b VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin, c INT, UNIQUE KEY ub (b)); INSERT INTO kd VALUES (1,'a',20),(2,'bb',21),(3,'ccc',22);",
+		"ALTER TABLE kd MODIFY COLUMN b VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin; INSERT INTO kd (id,b,c) VALUES (99,'a ',991)",
+		"ALTER TABLE kd MODIFY COLUMN b VARBINARY(80); INSERT INTO kd (id,b,c) VALUES (100,'y',1000)",
+	},
 }
 
 // rsfWarmPrimed is a warm resume of a stream that applied a row of the table
@@ -978,7 +1005,11 @@ func rsfRunServer(t *testing.T, srv rsfServer) {
 				})
 			}
 		}
-		for _, s := range rsfDoubleRetype {
+		doubles := rsfDoubleRetype
+		if srv.engine == "mysql" {
+			doubles = append(append([]struct{ name, create, retype, then string }(nil), rsfDoubleRetype...), rsfDoubleRetypeMySQLOnly...)
+		}
+		for _, s := range doubles {
 			for _, entry := range []rsfEntry{rsfWarm, rsfWarmPrimed} {
 				k++
 				n, s := k, s

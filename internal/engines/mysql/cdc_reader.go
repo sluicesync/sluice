@@ -641,6 +641,11 @@ type tableSchema struct {
 	// TABLE_MAP alone: their IR types are approximate, so the deferred-shape
 	// check (cdc_deferred_order.go) never compares them.
 	tableMapTyped []string
+	// unnamedCollations are the TABLE_MAP-typed character columns whose
+	// recorded collation ID the source's collation table did not name, by
+	// column (the ID). Their collation is unknown, so the deferred-shape
+	// hold refuses rather than pass them where the basis declares one (F4).
+	unnamedCollations map[string]uint64
 }
 
 // SetCDCDatabaseScope implements [ir.CDCDatabaseScoper]. It switches
