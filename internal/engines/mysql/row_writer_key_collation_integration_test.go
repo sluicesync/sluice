@@ -206,6 +206,18 @@ func krwRunServer(t *testing.T, srv kcgServer, core krwCore) {
 				err := write(t, dsn, tbl, ir.Row{"id": int64(1), "k": "A", "d": int64(2)})
 				wantMerge(t, err, dsn, "kc", "id", "1:61")
 			})
+			// Review 2026-10-12 #2 finding 1: a PREFIX unique key. The server
+			// matches 'Apple-1' against 'apple-2' on the five-character prefix
+			// alone; a guard comparing whole values called them different and
+			// let the upsert overwrite row 1 at exit 0.
+			t.Run("unique prefix key beside a primary key", func(t *testing.T) {
+				dsn := cell()
+				applyDDL(t, dsn, "CREATE TABLE kx (id INT NOT NULL PRIMARY KEY, k VARCHAR(20) "+tgtCI+" NOT NULL, d INT, UNIQUE KEY uk (k(5)))")
+				applyDDL(t, dsn, "INSERT INTO kx VALUES (1,'apple-2',1)")
+				tbl := &ir.Table{Name: "kx", Columns: threeCols(src.key), PrimaryKey: pkOn("id")}
+				err := write(t, dsn, tbl, ir.Row{"id": int64(2), "k": "Apple-1", "d": int64(2)})
+				wantMerge(t, err, dsn, "kx", "id", "1:6170706C652D32")
+			})
 			t.Run("unique key beside a primary key", func(t *testing.T) {
 				dsn := cell()
 				applyDDL(t, dsn, "CREATE TABLE ku (id INT NOT NULL PRIMARY KEY, k VARCHAR(20) "+tgtCI+" NOT NULL, d INT, UNIQUE KEY uk (k))")

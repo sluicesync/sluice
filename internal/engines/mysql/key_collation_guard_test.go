@@ -146,7 +146,7 @@ func TestPlanKeyCollationGuard(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			p := planKeyCollationGuard(tc.source, tc.target, tc.pk, tc.uniques, tc.remap)
+			p := planKeyCollationGuard(tc.source, tc.target, targetUniqueKeys{pk: tc.pk, uniques: tc.uniques}, tc.remap)
 			if (p != nil) != tc.wantArmed {
 				t.Fatalf("armed = %v; want %v (%+v)", p != nil, tc.wantArmed, p)
 			}
@@ -172,7 +172,7 @@ func TestPlanKeyCollationGuard(t *testing.T) {
 // column's plain assignment, and the raise carries the marker.
 func TestKeyCollationGuard_RendersFirstAndOnce(t *testing.T) {
 	p := planKeyCollationGuard(kcgSource(ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: "utf8mb4_bin"}),
-		kcgCols(ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: "utf8mb4_general_ci"}), []string{"id"}, [][]string{{"k"}}, nil)
+		kcgCols(ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: "utf8mb4_general_ci"}), targetUniqueKeys{pk: []string{"id"}, uniques: [][]string{{"k"}}}, nil)
 	for _, upsert := range []upsertSpelling{upsertRowAlias, upsertValuesFunc} {
 		assign, hang, ok := p.render("s", "kd", []string{"d", "id", "k"}, upsert)
 		if !ok || hang != "d" {
@@ -303,5 +303,38 @@ func TestKeyCollationGuardUnsupported_NamesTheSourcesOwnCollation(t *testing.T) 
 	if msg := keyCollationGuardUnsupported("`t`.`kd`", "k", same, cause).Error(); strings.Contains(msg, "compared on this target") ||
 		!strings.Contains(msg, "COLLATE utf8mb4_ja_0900_as_cs, which") {
 		t.Errorf("same-flavor refusal mis-rendered:\n%s", msg)
+	}
+}
+
+// TestKeyCollationGuard_PrefixKeyPartsCompareThePrefix pins review
+// 2026-10-12 #2 finding 1 at the render: a prefix key part (SUB_PART n) is
+// compared as LEFT(x, n) on BOTH sides of both comparisons — the target's,
+// because that is what the server matched on, and the source's, applied
+// before the CONVERT/CAST — while a whole-column part and the primary key's
+// same-row check stay whole.
+func TestKeyCollationGuard_PrefixKeyPartsCompareThePrefix(t *testing.T) {
+	for _, src := range []ir.Type{
+		ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: "utf8mb4_bin"},
+		ir.Varchar{Length: 20, Determinism: ir.CollationDeterministic},
+	} {
+		p := planKeyCollationGuard(kcgSource(src), kcgCols(ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: "utf8mb4_general_ci"}),
+			targetUniqueKeys{pk: []string{"id"}, uniques: [][]string{{"k"}}, uniqueSubs: [][]int{{5}}}, nil)
+		if p == nil {
+			t.Fatalf("%v: not armed", src)
+		}
+		assign, _, ok := p.render("s", "kd", []string{"id", "k", "d"}, upsertRowAlias)
+		if !ok {
+			t.Fatal("render refused")
+		}
+		tgt := "LEFT(`s`.`kd`.`k`, 5) <=> LEFT(" + upsertRowAlias.newRowRef("`k`") + ", 5)"
+		if !strings.Contains(assign, tgt) {
+			t.Errorf("%v: the target comparison is not on the prefix:\n%s", src, assign)
+		}
+		if strings.Count(assign, "LEFT(") != 4 {
+			t.Errorf("%v: want the prefix on both sides of both comparisons (4 LEFTs):\n%s", src, assign)
+		}
+		if !strings.Contains(assign, "(`s`.`kd`.`id` <=> "+upsertRowAlias.newRowRef("`id`")+")") {
+			t.Errorf("%v: the primary key's same-row check is not on the whole value:\n%s", src, assign)
+		}
 	}
 }

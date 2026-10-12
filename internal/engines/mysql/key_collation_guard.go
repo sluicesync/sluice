@@ -82,6 +82,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/go-sql-driver/mysql"
@@ -126,8 +127,13 @@ type armedCollation struct {
 
 // keyCollationPlan is the guard for one table, rendered per statement.
 type keyCollationPlan struct {
-	pk    []string
-	keys  [][]string // every unique key (the primary key included) with an armed column
+	pk   []string
+	keys [][]string // every unique key (the primary key included) with an armed column
+	// subs parallels keys: each key part's index prefix length (SUB_PART,
+	// in characters for a character column), 0 for the whole column. The
+	// server matches an upsert through a prefix key on the prefix alone, so
+	// the guard compares exactly that (review 2026-10-12 #2, finding 1).
+	subs  [][]int
 	armed map[string]armedCollation
 	// marker is the armed column whose incoming value the raise names.
 	marker string
@@ -137,8 +143,9 @@ type keyCollationPlan struct {
 // source's current shape of the table (nil: unknown, nothing armed);
 // colTypes the target's columns; pk and uniques the target's keys. nil when
 // nothing is armed.
-func planKeyCollationGuard(source *ir.Table, colTypes map[string]*ir.Column, pk []string, uniques [][]string, compareAs map[string]string) *keyCollationPlan {
+func planKeyCollationGuard(source *ir.Table, colTypes map[string]*ir.Column, keys targetUniqueKeys, compareAs map[string]string) *keyCollationPlan {
 	armed := armedColumns(source, colTypes, compareAs)
+	pk := keys.pk
 	inPK := make(map[string]bool, len(pk))
 	for _, c := range pk {
 		inPK[c] = true
@@ -148,7 +155,7 @@ func planKeyCollationGuard(source *ir.Table, colTypes map[string]*ir.Column, pk 
 			delete(armed, col) // the identity key itself: not covered, see uniqueOnly
 		}
 	}
-	return planFromArmed(armed, pk, uniques)
+	return planFromArmed(armed, keys)
 }
 
 // planCopyKeyCollationGuard is [planKeyCollationGuard] for the idempotent
@@ -158,21 +165,28 @@ func planKeyCollationGuard(source *ir.Table, colTypes map[string]*ir.Column, pk 
 // identity key would wedge it; a copy re-sends only rows of a snapshot,
 // never a change of a key, so the case cannot arise, and without the guard
 // two source keys 'A' and 'a' on a `_ci` target key are one row at exit 0.
-func planCopyKeyCollationGuard(source *ir.Table, colTypes map[string]*ir.Column, pk []string, uniques [][]string, compareAs map[string]string) *keyCollationPlan {
-	return planFromArmed(armedColumns(source, colTypes, compareAs), pk, uniques)
+func planCopyKeyCollationGuard(source *ir.Table, colTypes map[string]*ir.Column, keys targetUniqueKeys, compareAs map[string]string) *keyCollationPlan {
+	return planFromArmed(armedColumns(source, colTypes, compareAs), keys)
 }
 
 // planFromArmed is the guard over the armed columns: every unique key (the
 // primary key first) holding one, and the marker. nil when no key does.
-func planFromArmed(armed map[string]armedCollation, pk []string, uniques [][]string) *keyCollationPlan {
+func planFromArmed(armed map[string]armedCollation, keys targetUniqueKeys) *keyCollationPlan {
 	if len(armed) == 0 {
 		return nil
 	}
-	p := &keyCollationPlan{pk: pk, armed: armed}
-	for _, key := range append([][]string{pk}, uniques...) {
+	p := &keyCollationPlan{pk: keys.pk, armed: armed}
+	all := append([][]string{keys.pk}, keys.uniques...)
+	allSubs := append([][]int{keys.pkSub}, keys.uniqueSubs...)
+	for i, key := range all {
+		var subs []int
+		if i < len(allSubs) {
+			subs = allSubs[i]
+		}
 		for _, col := range key {
 			if _, ok := armed[col]; ok {
 				p.keys = append(p.keys, key)
+				p.subs = append(p.subs, subs)
 				if p.marker == "" {
 					p.marker = col
 				}
@@ -346,34 +360,59 @@ func (p *keyCollationPlan) renderFor(tableRef string, cols []string, upsert upse
 	tbl := tableRef + "."
 	existing := func(c string) string { return tbl + quoteIdent(c) }
 	incoming := func(c string) string { return upsert.newRowRef(quoteIdent(c)) }
-	tgtEq := func(c string) string { return existing(c) + " <=> " + incoming(c) }
-	srcEq := func(c string) string {
+	// part is a key part's compared value: the whole column, or — for a
+	// prefix key part (SUB_PART n) — LEFT(x, n), because the server matches
+	// an upsert through a prefix key on the prefix alone. Comparing whole
+	// values there let 'Apple-1' overwrite 'apple-2' on a `k(5)` UNIQUE key
+	// (review 2026-10-12 #2, finding 1). LEFT counts characters for a
+	// character string and bytes for a binary one, which is how MySQL and
+	// MariaDB define SUB_PART; it is applied before any CONVERT or CAST, in
+	// the column's own character set, so the source comparison sees the same
+	// characters the index holds.
+	part := func(x string, n int) string {
+		if n <= 0 {
+			return x
+		}
+		return "LEFT(" + x + ", " + strconv.Itoa(n) + ")"
+	}
+	tgtEq := func(c string, n int) string { return part(existing(c), n) + " <=> " + part(incoming(c), n) }
+	srcEq := func(c string, n int) string {
 		ac, armed := p.armed[c]
 		switch {
 		case !armed:
-			return tgtEq(c)
+			return tgtEq(c, n)
 		case ac.bytes:
-			return "CAST(" + existing(c) + " AS BINARY) <=> CAST(" + incoming(c) + " AS BINARY)"
+			return "CAST(" + part(existing(c), n) + " AS BINARY) <=> CAST(" + part(incoming(c), n) + " AS BINARY)"
 		}
 		conv := func(x string) string {
-			return "CONVERT(" + x + " USING " + ac.charset + ") COLLATE " + ac.collation
+			return "CONVERT(" + part(x, n) + " USING " + ac.charset + ") COLLATE " + ac.collation
 		}
 		return conv(existing(c)) + " <=> " + conv(incoming(c))
 	}
-	all := func(cols []string, eq func(string) string) string {
+	all := func(cols []string, subs []int, eq func(string, int) string) string {
 		parts := make([]string, len(cols))
 		for i, c := range cols {
-			parts[i] = eq(c)
+			n := 0
+			if i < len(subs) {
+				n = subs[i]
+			}
+			parts[i] = eq(c, n)
 		}
 		return "(" + strings.Join(parts, " AND ") + ")"
 	}
 	merges := make([]string, len(p.keys))
 	for i, key := range p.keys {
-		merges[i] = "(" + all(key, tgtEq) + " AND NOT " + all(key, srcEq) + ")"
+		var subs []int
+		if i < len(p.subs) {
+			subs = p.subs[i]
+		}
+		merges[i] = "(" + all(key, subs, tgtEq) + " AND NOT " + all(key, subs, srcEq) + ")"
 	}
 	okExpr := "NOT (" + strings.Join(merges, " OR ") + ")"
 	if len(p.pk) > 0 {
-		okExpr = "(" + all(p.pk, srcEq) + " OR " + okExpr + ")"
+		// The same source row: its whole primary key equal under the source's
+		// collation (stricter than a prefix match, so never a false "same").
+		okExpr = "(" + all(p.pk, nil, srcEq) + " OR " + okExpr + ")"
 	}
 	hang = cols[0]
 	pkSet := make(map[string]bool, len(p.pk))
@@ -422,11 +461,14 @@ func (a *ChangeApplier) keyCollationPlanFor(ctx context.Context, q queryRower, s
 		// A column differs: read the unique keys beyond the primary key (the
 		// only extra read, once per table and source shape), and the target
 		// must know every collation the guard names.
-		uniques, err := nonPKUniqueKeyColumns(ctx, q, schema, table)
+		keys, err := uniqueKeyColumns(ctx, q, schema, table)
 		if err != nil {
 			return nil, fmt.Errorf("mysql: applier: read the unique keys of %s for the key-collation guard: %w", qn, err)
 		}
-		plan = planKeyCollationGuard(source, colTypes, pk, uniques, compareAs)
+		// The applier upserts by its own key; the catalog supplies each part's
+		// prefix length where that key is the catalog's primary key.
+		keys.pk, keys.pkSub = pk, subPartsFor(pk, keys.pk, keys.pkSub)
+		plan = planKeyCollationGuard(source, colTypes, keys, compareAs)
 		if plan != nil {
 			if err := checkKeyCollationsExpressible(ctx, q, qn, plan); err != nil {
 				return nil, err
@@ -449,34 +491,19 @@ type queryRower interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
-// nonPKUniqueKeyColumns reads the target's unique keys other than the
-// primary key, each as its columns in index order.
-func nonPKUniqueKeyColumns(ctx context.Context, q queryRower, schema, table string) ([][]string, error) {
-	rows, err := q.QueryContext(ctx, `SELECT index_name, column_name FROM information_schema.statistics
-		WHERE table_schema = ? AND table_name = ? AND non_unique = 0 AND index_name <> 'PRIMARY'
-		ORDER BY index_name, seq_in_index`, schema, table)
-	if err != nil {
-		return nil, err
+// subPartsFor returns, for each column of key, its prefix length in the
+// catalog's primary key catPK/catSub when key is that same key (same
+// columns, same order), else all zeros (whole columns).
+func subPartsFor(key, catPK []string, catSub []int) []int {
+	if len(key) != len(catPK) || len(catSub) != len(catPK) {
+		return nil
 	}
-	defer func() { _ = rows.Close() }()
-	var out [][]string
-	last := ""
-	for rows.Next() {
-		var idx string
-		var col sql.NullString
-		if err := rows.Scan(&idx, &col); err != nil {
-			return nil, err
+	for i := range key {
+		if key[i] != catPK[i] {
+			return nil
 		}
-		if !col.Valid {
-			continue // a functional key part: not a column the guard can compare
-		}
-		if idx != last || len(out) == 0 {
-			out = append(out, nil)
-			last = idx
-		}
-		out[len(out)-1] = append(out[len(out)-1], col.String)
 	}
-	return out, rows.Err()
+	return catSub
 }
 
 // checkKeyCollationsExpressible refuses loudly when the target server does

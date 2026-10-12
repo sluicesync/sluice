@@ -400,6 +400,17 @@ func kcgRunServer(t *testing.T, srv kcgServer, batched bool) {
 			ir.Insert{Position: kcgPos(1), Schema: db, Table: "kd", Row: ir.Row{"id": int64(2), "k": "é", "d": int64(2)}})
 		wantMerge(t, err, dsn, "kd", "id", before)
 	})
+	// Review 2026-10-12 #2 finding 1: a PREFIX unique key, matched by the
+	// server on 'Apple' against 'apple' while the whole values differ.
+	t.Run("unique prefix key beside a primary key", func(t *testing.T) {
+		db, dsn := cell("pfx")
+		applyDDL(t, dsn, "CREATE TABLE kx (id INT NOT NULL PRIMARY KEY, k VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL, d INT, UNIQUE KEY uk (k(5)))")
+		applyDDL(t, dsn, "INSERT INTO kx VALUES (1,'apple-2',1)")
+		before := kcgRows(t, dsn, "kx", "id")
+		err := kcgApply(t, srv.eng, dsn, batched, kcgSnapshot(db, "kx", pkTable(db)),
+			ir.Insert{Position: kcgPos(1), Schema: db, Table: "kx", Row: ir.Row{"id": int64(2), "k": "Apple-1", "d": int64(2)}})
+		wantMerge(t, err, dsn, "kx", "id", before)
+	})
 	t.Run("composite primary key with one armed column", func(t *testing.T) {
 		db, dsn := cell("cpk")
 		applyDDL(t, dsn, "CREATE TABLE kd (id INT NOT NULL, k VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL, d INT, PRIMARY KEY (k, id))")

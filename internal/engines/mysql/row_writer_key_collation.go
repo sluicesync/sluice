@@ -128,7 +128,7 @@ func (w *RowWriter) resolveCopyKeyCollationGuard(ctx context.Context, q queryRow
 	if err != nil {
 		return copyKeyCollationGuard{}, fmt.Errorf("mysql: copy into %s: read the unique keys for the key-collation guard: %w", qn, err)
 	}
-	plan := planCopyKeyCollationGuard(table, colTypes, keys.pk, keys.uniques, compareAs)
+	plan := planCopyKeyCollationGuard(table, colTypes, keys, compareAs)
 	if plan == nil {
 		return copyKeyCollationGuard{}, nil
 	}
@@ -252,19 +252,25 @@ func targetColumnCollations(ctx context.Context, q queryRower, schema, table str
 }
 
 // targetUniqueKeys is a target table's primary key and its other unique
-// keys, each as its columns in index order.
+// keys, each as its columns in index order, with each part's index prefix
+// length (pkSub / uniqueSubs, parallel to the columns; 0 for the whole
+// column).
 type targetUniqueKeys struct {
-	pk      []string
-	uniques [][]string
+	pk         []string
+	pkSub      []int
+	uniques    [][]string
+	uniqueSubs [][]int
 }
 
-// uniqueKeyColumns reads the target's primary key and other unique keys in
-// one catalog query; a functional key part is skipped, as
-// [nonPKUniqueKeyColumns] skips it.
+// uniqueKeyColumns reads the target's primary key and other unique keys,
+// with each key part's SUB_PART (an index prefix: characters for a character
+// column, bytes for a binary one), in one catalog query. A functional key
+// part (no column) is skipped: the guard cannot compare it, a stated
+// residual (KEY-COLLATION-FUNCTIONAL-KEY-PART).
 func uniqueKeyColumns(ctx context.Context, q queryRower, schema, table string) (targetUniqueKeys, error) {
 	var out targetUniqueKeys
-	rows, err := q.QueryContext(ctx, `SELECT index_name, column_name FROM information_schema.statistics
-		WHERE table_schema = ? AND table_name = ? AND non_unique = 0
+	rows, err := q.QueryContext(ctx, `SELECT index_name, column_name, sub_part FROM information_schema.statistics
+		WHERE table_schema = COALESCE(NULLIF(?, ''), DATABASE()) AND table_name = ? AND non_unique = 0
 		ORDER BY index_name = 'PRIMARY' DESC, index_name, seq_in_index`, schema, table)
 	if err != nil {
 		return out, err
@@ -274,20 +280,29 @@ func uniqueKeyColumns(ctx context.Context, q queryRower, schema, table string) (
 	for rows.Next() {
 		var idx string
 		var col sql.NullString
-		if err := rows.Scan(&idx, &col); err != nil {
+		var sub sql.NullInt64
+		if err := rows.Scan(&idx, &col, &sub); err != nil {
 			return out, err
+		}
+		n := 0
+		if sub.Valid {
+			n = int(sub.Int64)
 		}
 		switch {
 		case !col.Valid:
 			continue
 		case idx == "PRIMARY":
 			out.pk = append(out.pk, col.String)
+			out.pkSub = append(out.pkSub, n)
 		default:
 			if idx != last || len(out.uniques) == 0 {
 				out.uniques = append(out.uniques, nil)
+				out.uniqueSubs = append(out.uniqueSubs, nil)
 				last = idx
 			}
-			out.uniques[len(out.uniques)-1] = append(out.uniques[len(out.uniques)-1], col.String)
+			i := len(out.uniques) - 1
+			out.uniques[i] = append(out.uniques[i], col.String)
+			out.uniqueSubs[i] = append(out.uniqueSubs[i], n)
 		}
 	}
 	return out, rows.Err()

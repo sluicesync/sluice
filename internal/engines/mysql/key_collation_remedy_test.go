@@ -41,19 +41,19 @@ func TestKeyCollationMergeRemedy_NamesTheCollationThatConverges(t *testing.T) {
 	}{
 		{
 			"mysql 8 to mariadb, the primary key",
-			planKeyCollationGuard(source(varchar("utf8mb4", "utf8mb4_0900_ai_ci")), padSpace, []string{"k"}, [][]string{{"k"}}, mariadbKeyGuardCollations),
+			planKeyCollationGuard(source(varchar("utf8mb4", "utf8mb4_0900_ai_ci")), padSpace, targetUniqueKeys{pk: []string{"k"}, uniques: [][]string{{"k"}}}, mariadbKeyGuardCollations),
 			[]string{"COLLATE utf8mb4_uca1400_nopad_ai_ci", "--restart-from-scratch", "converges either way"},
 			[]string{"utf8mb4_0900_ai_ci", "does not converge"},
 		},
 		{
 			"mysql 8 to mariadb, a unique key beside the primary key",
-			planKeyCollationGuard(source(varchar("utf8mb4", "utf8mb4_0900_ai_ci")), padSpace, []string{"id"}, [][]string{{"id"}, {"k"}}, mariadbKeyGuardCollations),
+			planKeyCollationGuard(source(varchar("utf8mb4", "utf8mb4_0900_ai_ci")), padSpace, targetUniqueKeys{pk: []string{"id"}, uniques: [][]string{{"id"}, {"k"}}}, mariadbKeyGuardCollations),
 			[]string{"COLLATE utf8mb4_uca1400_nopad_ai_ci", "--restart-from-scratch"},
 			[]string{"utf8mb4_0900_ai_ci"},
 		},
 		{
 			"a postgres byte-compared key on a mysql _ci primary key",
-			planKeyCollationGuard(source(pgC), mysqlCI, []string{"k"}, [][]string{{"k"}}, mysqlKeyGuardCollations),
+			planKeyCollationGuard(source(pgC), mysqlCI, targetUniqueKeys{pk: []string{"k"}, uniques: [][]string{{"k"}}}, mysqlKeyGuardCollations),
 			[]string{"does not converge", "COLLATE utf8mb4_bin"},
 			[]string{"--restart-from-scratch", "converges either way"},
 		},

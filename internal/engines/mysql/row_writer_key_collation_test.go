@@ -48,10 +48,10 @@ func TestPlanCopyKeyCollationGuard_ArmsThePostgresDefaultInsideThePrimaryKey(t *
 		t.Run(tc.name, func(t *testing.T) {
 			src, tgt := kcgSource(tc.source), kcgCols(ci)
 			compareAs := FlavorVanilla.keyGuardCollations()
-			if got := planKeyCollationGuard(src, tgt, tc.pk, tc.uniques, compareAs) != nil; got != tc.applier {
+			if got := planKeyCollationGuard(src, tgt, targetUniqueKeys{pk: tc.pk, uniques: tc.uniques}, compareAs) != nil; got != tc.applier {
 				t.Errorf("applier armed = %v; want %v", got, tc.applier)
 			}
-			if got := planCopyKeyCollationGuard(src, tgt, tc.pk, tc.uniques, compareAs) != nil; got != tc.copier {
+			if got := planCopyKeyCollationGuard(src, tgt, targetUniqueKeys{pk: tc.pk, uniques: tc.uniques}, compareAs) != nil; got != tc.copier {
 				t.Errorf("copy armed = %v; want %v", got, tc.copier)
 			}
 		})
@@ -89,7 +89,7 @@ func TestBuildBatchUpsert_KeyCollationGuard(t *testing.T) {
 			target[c.Name] = &ir.Column{Name: c.Name, Type: typ}
 			names = append(names, c.Name)
 		}
-		plan := planCopyKeyCollationGuard(tbl, target, []string{"k"}, nil, nil)
+		plan := planCopyKeyCollationGuard(tbl, target, targetUniqueKeys{pk: []string{"k"}, uniques: nil}, nil)
 		if plan == nil {
 			t.Fatal("not armed")
 		}
@@ -178,31 +178,31 @@ func TestCopyKeyCollationMergeRemedy_NamesTheCollationTheKeyNeeds(t *testing.T) 
 	}{
 		{
 			"postgres deterministic key (bytes)",
-			planCopyKeyCollationGuard(source(ir.Varchar{Length: 20, Collation: "C", Determinism: ir.CollationDeterministic}), mysqlCI, []string{"k"}, nil, mysqlKeyGuardCollations),
+			planCopyKeyCollationGuard(source(ir.Varchar{Length: 20, Collation: "C", Determinism: ir.CollationDeterministic}), mysqlCI, targetUniqueKeys{pk: []string{"k"}, uniques: nil}, mysqlKeyGuardCollations),
 			[]string{"`k` a binary collation (for example COLLATE utf8mb4_bin)", "resume the copy", "rather than recreating the table"},
 			[]string{"as the source declares", "the source's collation", "COLLATE C"},
 		},
 		{
 			"postgres nondeterministic key (bytes)",
-			planCopyKeyCollationGuard(source(ir.Varchar{Length: 20, Collation: "l2", Determinism: ir.CollationNonDeterministic}), mysqlCI, []string{"k"}, nil, mysqlKeyGuardCollations),
+			planCopyKeyCollationGuard(source(ir.Varchar{Length: 20, Collation: "l2", Determinism: ir.CollationNonDeterministic}), mysqlCI, targetUniqueKeys{pk: []string{"k"}, uniques: nil}, mysqlKeyGuardCollations),
 			[]string{"`k` a binary collation", "resume the copy"},
 			[]string{"as the source declares", "the source's collation", "COLLATE l2"},
 		},
 		{
 			"postgres default key (bytes)",
-			planCopyKeyCollationGuard(source(ir.Varchar{Length: 20, Determinism: ir.CollationDeterministic}), mysqlCI, []string{"id"}, [][]string{{"k"}}, mysqlKeyGuardCollations),
+			planCopyKeyCollationGuard(source(ir.Varchar{Length: 20, Determinism: ir.CollationDeterministic}), mysqlCI, targetUniqueKeys{pk: []string{"id"}, uniques: [][]string{{"k"}}}, mysqlKeyGuardCollations),
 			[]string{"`k` a binary collation", "resume the copy"},
 			[]string{"as the source declares", "the source's collation"},
 		},
 		{
 			"mysql 8 to mariadb (NO PAD uca1400)",
-			planCopyKeyCollationGuard(source(varchar("utf8mb4", "utf8mb4_0900_ai_ci")), target(varchar("utf8mb4", "utf8mb4_uca1400_ai_ci")), []string{"k"}, nil, mariadbKeyGuardCollations),
+			planCopyKeyCollationGuard(source(varchar("utf8mb4", "utf8mb4_0900_ai_ci")), target(varchar("utf8mb4", "utf8mb4_uca1400_ai_ci")), targetUniqueKeys{pk: []string{"k"}, uniques: nil}, mariadbKeyGuardCollations),
 			[]string{"`k` CHARACTER SET utf8mb4 COLLATE utf8mb4_uca1400_nopad_ai_ci", "run the copy again"},
 			[]string{"utf8mb4_0900_ai_ci", "as the source declares", "resume the copy"},
 		},
 		{
 			"mysql _bin to mysql _ci (plain)",
-			planCopyKeyCollationGuard(source(varchar("utf8mb4", "utf8mb4_bin")), target(varchar("utf8mb4", "utf8mb4_general_ci")), []string{"k"}, nil, mysqlKeyGuardCollations),
+			planCopyKeyCollationGuard(source(varchar("utf8mb4", "utf8mb4_bin")), target(varchar("utf8mb4", "utf8mb4_general_ci")), targetUniqueKeys{pk: []string{"k"}, uniques: nil}, mysqlKeyGuardCollations),
 			[]string{"`k` CHARACTER SET utf8mb4 COLLATE utf8mb4_bin", "run the copy again"},
 			[]string{"as the source declares", "resume the copy"},
 		},
