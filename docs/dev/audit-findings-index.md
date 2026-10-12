@@ -54,6 +54,13 @@ other eighteen.
 
 ---
 
+## 2026-10-12 — Bugs 304 and 305 (the v0.159.0 regression cycle): fixed, with what they leave open
+
+Indexed when filed. Two findings observed while fixing Bugs 304 and 305 (no audit pass); the bugs themselves are numbered in the BUG-CATALOG and recorded as fixed in the backlog section.
+
+- KEY-COLLATION-REMAP-COMMENT filed
+- MARIADB-SHAPE-GATE-COLLATION filed
+
 ## 2026-10-11 — grow-gate episode-ladder test failed on Windows at the v0.158.0 tag
 
 Indexed when filed. A single finding from the v0.158.0 tag gate (no audit pass).
