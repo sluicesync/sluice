@@ -1963,6 +1963,7 @@ func (b *IncrementalBackup) attachWindowEndSchema(ctx context.Context, cdc ir.CD
 		return fmt.Errorf("incremental: %w", err)
 	}
 	manifest.SchemaDelta = migcore.DiffSchemas(beforeSchema, afterSchema)
+	stampKeyCollationDeltaOnAttach(manifest)
 	if len(manifest.SchemaDelta) > 0 {
 		// The end-state schema is more useful for restore-side
 		// targeting than the start-state. Swap it in so the manifest's

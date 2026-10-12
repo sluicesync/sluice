@@ -421,9 +421,13 @@ func xvTopFormatFlags() []string {
 //
 // Version 12 is the second: it is stamped on a postgres-trigger CDC
 // SEGMENT whose chunks carried an exact-text number — never on a full.
+//
+// Version 13 is the third: it is stamped on a CDC SEGMENT whose schema delta
+// changes a key column's collation — never on a full either.
 var xvShapeStampedTiers = map[int]string{
-	irbackup.FormatVersionPositionlessFull: "TestBackup_CrossVersionPositionlessFull (internal/pipeline/backup)",
-	irbackup.FormatVersionExactNumbers:     "TestBackup_CrossVersionExactNumbers (internal/pipeline)",
+	irbackup.FormatVersionPositionlessFull:  "TestBackup_CrossVersionPositionlessFull (internal/pipeline/backup)",
+	irbackup.FormatVersionExactNumbers:      "TestBackup_CrossVersionExactNumbers (internal/pipeline)",
+	irbackup.FormatVersionKeyCollationDelta: "TestBackup_CrossVersionKeyCollationDelta (internal/pipeline)",
 }
 
 // xvBackupFullTopFormat writes a full stamped at the current top format

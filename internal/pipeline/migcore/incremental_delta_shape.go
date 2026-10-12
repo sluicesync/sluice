@@ -306,6 +306,24 @@ func sameCollation(a, b ir.Type) bool {
 	return strings.EqualFold(ac, bc) && strings.EqualFold(al, bl)
 }
 
+// DeltaChangesKeyCollation reports whether any alter_table entry of delta
+// carries [AlterAspectColumnCollation] — a primary-key or UNIQUE-key
+// column whose collation changed. The backup writers stamp such a segment
+// [irbackup.FormatVersionKeyCollationDelta] (Bug 304): the aspect exists
+// only in this classifier, not in the entry, so a reader built before it
+// reads the entry as no change at all.
+func DeltaChangesKeyCollation(delta []*irbackup.SchemaDeltaEntry) bool {
+	for _, d := range delta {
+		if d == nil || d.Kind != irbackup.SchemaDeltaAlterTable {
+			continue
+		}
+		if ClassifyAlterDelta(d.Before, d.After).Has(AlterAspectColumnCollation) {
+			return true
+		}
+	}
+	return false
+}
+
 // AllAlterAspects returns every aspect the diff can report, DERIVED
 // from the two comparator registries (never hand-listed) so a new
 // comparator immediately shows up in the disposition gate.

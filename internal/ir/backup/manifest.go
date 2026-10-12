@@ -264,7 +264,10 @@ import (
 // v0.156.4 introduces FormatVersion=12 for a postgres-trigger CDC segment
 // whose change chunks carry an EXACT-TEXT number — see
 // [FormatVersionExactNumbers].
-const BackupFormatVersion = 12
+//
+// v0.159.1 introduces FormatVersion=13 for a CDC segment whose schema delta
+// changes a KEY column's collation — see [FormatVersionKeyCollationDelta].
+const BackupFormatVersion = 13
 
 // FormatVersionLegacy / FormatVersionSecurityMetadata name the
 // historically-recorded values so callers don't sprinkle bare ints
@@ -469,7 +472,51 @@ const (
 	// raising a segment to 12 mid-capture never changes an already-sealed
 	// chunk's AAD encoding.
 	FormatVersionExactNumbers = 12
+
+	// FormatVersionKeyCollationDelta marks a CDC segment (incremental /
+	// streaming) whose [Manifest.SchemaDelta] changes the collation of a
+	// primary-key or UNIQUE-key column (Bug 304). The entry itself is an
+	// ordinary alter_table whose before/after shapes differ in that
+	// column's collation; the column-collation ASPECT is derived from it at
+	// read time, and only a v0.159.0+ reader's diff compares collation. An
+	// older reader classifies the entry as "no change", restores the table
+	// under its pre-window collation, and replays the window onto it: two
+	// rows the source keeps apart (`'a'` and `'A'` after a `_ci` → `_bin`
+	// change) become one, at exit 0, and its `backup verify` passes.
+	// Measured with v0.158.1 against v0.159.0 chains from MySQL 8.4 and
+	// Postgres 16. The Bug-116 class with the dropped thing being a KEY'S
+	// IDENTITY: the bump makes every pre-v0.159.1 reader refuse the
+	// manifest at its own ceiling.
+	//
+	// Proportional: stamped by [StampKeyCollationDelta] only on an
+	// incremental whose writer recorded such a delta (the caller classifies
+	// it: this package names no aspect). Every full and every other segment
+	// — including one whose only change is a NON-key column's collation,
+	// which every reader treats as no delta — keeps its feature-minimum
+	// version. A segment v0.159.0 wrote with such a delta is NOT restamped
+	// (it carries its feature-minimum version, and nothing rewrites a sealed
+	// manifest's version — see [StampExactNumbers]'s compaction note), so a
+	// v0.159.0 chain stays readable, and mis-restorable, by older binaries.
+	//
+	// Above the exact-numbers tier so a 13-stamped manifest keeps every
+	// lower `>=` fold; none of them changes between 9 and 13, so raising a
+	// segment to 13 after its row chunks sealed changes no sealed chunk's
+	// AAD encoding (an encrypted segment is at 9 or above before its first
+	// chunk, and a plaintext chunk has no AAD).
+	FormatVersionKeyCollationDelta = 13
 )
+
+// StampKeyCollationDelta raises m.FormatVersion to
+// [FormatVersionKeyCollationDelta] when carried is true and m is a CDC
+// segment (incremental). carried is the writer's report that the segment's
+// schema delta changes a key column's collation. Idempotent; a no-op for a
+// full and when carried is false. MUST run before [ComputeBackupID], for
+// the reason [StampExactNumbers] gives.
+func StampKeyCollationDelta(m *Manifest, carried bool) {
+	if m != nil && carried && canonicalKind(m.Kind) == BackupKindIncremental {
+		m.FormatVersion = max(m.FormatVersion, FormatVersionKeyCollationDelta)
+	}
+}
 
 // StampExactNumbers raises m.FormatVersion to [FormatVersionExactNumbers]
 // when carried is true and m is a CDC segment (incremental). carried is the
@@ -623,6 +670,7 @@ var minimumReaderVersion = map[int]string{
 	FormatVersionRedaction:             "v0.144.0",
 	FormatVersionPositionlessFull:      "v0.154.0",
 	FormatVersionExactNumbers:          "v0.156.4",
+	FormatVersionKeyCollationDelta:     "v0.159.1",
 }
 
 // MinimumReaderVersion names the earliest sluice release that can read a

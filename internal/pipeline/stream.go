@@ -1776,6 +1776,7 @@ func (b *BackupStream) refreshSchemaAndAttachDelta(
 		return nil
 	}
 	manifest.SchemaDelta = delta
+	stampKeyCollationDeltaOnAttach(manifest)
 	manifest.Schema = afterSchema
 	afterHash, err := irbackup.ComputeSchemaHash(afterSchema)
 	if err != nil {

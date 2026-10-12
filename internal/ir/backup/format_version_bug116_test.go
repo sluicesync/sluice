@@ -139,17 +139,23 @@ func TestChooseFormatVersion_Bug116(t *testing.T) {
 }
 
 // TestBackupFormatVersion_Bumped pins the version ladder: the build
-// ceiling is the positionless-full version, the redaction-marker,
-// injective-chunk-AAD, standalone-sequences, ADR-0086 in-progress
+// ceiling is the key-collation-delta version, the exact-numbers,
+// positionless-full, redaction-marker, injective-chunk-AAD, standalone-sequences, ADR-0086 in-progress
 // sidecar and Bug 116 security-metadata versions keep their historical
 // slots, and the legacy value is frozen. If a future change reorders
 // these without updating the chooseFormatVersion / sidecar /
 // chunk-binding contracts, this test catches the regression at build
 // time.
 func TestBackupFormatVersion_Bumped(t *testing.T) {
-	if BackupFormatVersion != FormatVersionExactNumbers {
-		t.Errorf("BackupFormatVersion = %d; want FormatVersionExactNumbers=%d (current ceiling)",
-			BackupFormatVersion, FormatVersionExactNumbers)
+	if BackupFormatVersion != FormatVersionKeyCollationDelta {
+		t.Errorf("BackupFormatVersion = %d; want FormatVersionKeyCollationDelta=%d (current ceiling)",
+			BackupFormatVersion, FormatVersionKeyCollationDelta)
+	}
+	// Above the exact-numbers tier, for the reason that tier sits above the
+	// positionless one: a 13-stamped segment keeps every lower `>=` fold.
+	if FormatVersionKeyCollationDelta <= FormatVersionExactNumbers {
+		t.Errorf("FormatVersionKeyCollationDelta (%d) must be strictly greater than FormatVersionExactNumbers (%d)",
+			FormatVersionKeyCollationDelta, FormatVersionExactNumbers)
 	}
 	// Above the positionless tier: a 12-stamped segment keeps every lower
 	// `>=` fold, and the AAD encoding does not change between 11 and 12

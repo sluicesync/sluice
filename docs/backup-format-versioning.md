@@ -179,11 +179,32 @@ Every backup chain root manifest carries a `FormatVersion` field:
   binary — needs no rewrite: a v0.156.4+ binary keys exact decoding on the
   manifest's source engine, not on this version, so it restores those
   chains exactly too.
+- **`FormatVersion=13`** — a **key-collation** change segment
+  (`v0.159.1+`, Bug 304): an incremental / `backup stream` segment whose
+  window changed the collation (or character set) of a primary-key or
+  UNIQUE-key column — `ALTER TABLE … MODIFY k … COLLATE utf8mb4_bin` on
+  MySQL, `ALTER COLUMN k TYPE text COLLATE "C"` on Postgres. The segment's
+  `schema_delta` records it as an ordinary `alter_table` entry whose
+  before and after shapes differ only in that collation; only a v0.159.0+
+  reader compares collation when it classifies the entry. An older binary
+  reads the entry as no change, restores the table under its pre-window
+  collation and replays the window onto it, so two rows the source keeps
+  apart (`'a'` and `'A'` after a `_ci` → `_bin` change) become one — at
+  exit 0, with its own `backup verify` passing (measured with v0.158.1
+  against v0.159.0 chains from MySQL 8.4 and Postgres 16). The bump makes
+  it refuse at its own ceiling instead. Proportional: a full, a segment
+  with no schema change, and a segment whose only collation change is on a
+  column outside every primary and unique key (which no reader treats as a
+  delta) keep their previous version. **v0.159.0 wrote such segments
+  without the stamp**, and nothing re-stamps a sealed segment, so a chain
+  v0.159.0 captured across a key-collation change still restores — wrongly
+  — on v0.158.x and older: restore those chains with v0.159.0 or later.
 
 If your backups don't use RLS, EXCLUDE constraints, or standalone
 sequences, you don't encrypt, sign or redact, and your source records a
-CDC position (or has no CDC at all), and no `postgres-trigger` change
-segment of yours carries a non-integer number, you'll never see a version
+CDC position (or has no CDC at all), no `postgres-trigger` change
+segment of yours carries a non-integer number, and no backup window of
+yours changes a key column's collation, you'll never see a version
 above 1 on a finalized manifest and cross-version restore behaves
 exactly as it did pre-v0.94.1. If your backups *do* use any of them,
 you get the guarantee that older sluice can't silently land a restored

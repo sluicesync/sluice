@@ -270,7 +270,7 @@ git worktree add --detach "$peer_worktree" "$peer_tag" >/dev/null
 # THE FOURTH AXIS: ONE BELOW-TIER BINARY PER SHAPE-STAMPED TIER.
 #
 # A tier suite (the positionless-full suite for 11, the exact-numbers
-# suite for 12) asserts that a release BELOW its tier refuses what the
+# suite for 12, the key-collation-delta suite for 13) asserts that a release BELOW its tier refuses what the
 # tier stamps. Through FormatVersion 11 that release was simply OLD — and
 # the next bump broke it: OLD advances to the newest release below the
 # NEW top tier, which is AT the older tier and reads it (the 12 bump,
@@ -281,37 +281,63 @@ git worktree add --detach "$peer_worktree" "$peer_tag" >/dev/null
 # when the top tier does. When it coincides with OLD it reuses OLD's
 # build rather than compiling the same tag twice.
 #
+# AN ENTRY MAY ALSO NAME A SYMBOL THE BINARY MUST LACK (NAME:CONST:SYMBOL@FILE).
+# The key-collation tier (13, Bug 304) needs it: the release that silently
+# merges a v0.159.0+ chain's key-collation delta is one whose schema diff
+# cannot see a collation change at all, and v0.159.0 — the newest tag below
+# 13 — CAN (it introduced the aspect; it only failed to stamp it). Below-tier
+# alone would pick v0.159.0, whose refusal is right but whose own restores
+# are exact, so the suite's premise cell (the old binary merges at exit 0)
+# would have nothing to measure. The symbol is the aspect's constant, read
+# from each tag's tree, so the choice is derived, not a hardcoded tag.
+#
 # read_tier NAME — the value of a FormatVersion constant in manifest.go.
 read_tier() {
 	sed -n "s/^[[:space:]]*$1 *= *\([0-9][0-9]*\).*/\1/p" "$manifest_file" | head -1
 }
 
-# below_tag TIER — "TAG VERSION" of the newest tag stamping below TIER.
+# below_tag TIER [SYMBOL FILE] — "TAG VERSION" of the newest tag stamping
+# below TIER and, when SYMBOL is given, whose FILE does not contain it (a
+# tag where FILE does not exist lacks it too).
 below_tag() {
 	for t in $(git tag --list 'v*' --sort=-v:refname); do
 		v=$(git show "$t:$manifest_file" 2>/dev/null | read_format_version || true)
 		[ -n "$v" ] || continue
-		if [ "$v" -lt "$1" ]; then
-			echo "$t $v"
-			return 0
+		[ "$v" -lt "$1" ] || continue
+		if [ -n "${2:-}" ] && git show "$t:$3" 2>/dev/null | grep -q "$2"; then
+			continue
 		fi
+		echo "$t $v"
+		return 0
 	done
 	return 1
 }
 
-tier_suites="POSITIONLESS:FormatVersionPositionlessFull EXACT_NUMBERS:FormatVersionExactNumbers"
+tier_suites="POSITIONLESS:FormatVersionPositionlessFull EXACT_NUMBERS:FormatVersionExactNumbers KEY_COLLATION:FormatVersionKeyCollationDelta:AlterAspectColumnCollation@internal/pipeline/migcore/incremental_delta_shape.go"
 tier_lines=
 for entry in $tier_suites; do
 	name=${entry%%:*}
-	const=${entry#*:}
+	rest=${entry#*:}
+	const=${rest%%:*}
+	lacks_symbol=
+	lacks_file=
+	if [ "$rest" != "$const" ]; then
+		lacks=${rest#*:}
+		lacks_symbol=${lacks%%@*}
+		lacks_file=${lacks#*@}
+	fi
 	tier=$(read_tier "$const")
 	if [ -z "$tier" ]; then
 		echo "::error::crossversion-build: could not read $const from $manifest_file — the tier suite $name has no tier to derive a binary below."
 		exit 1
 	fi
-	pair=$(below_tag "$tier" || true)
+	if [ -n "$lacks_symbol" ] && ! grep -q "$lacks_symbol" "$lacks_file"; then
+		echo "::error::crossversion-build: the $name tier suite selects a binary lacking $lacks_symbol, but this tree's $lacks_file does not carry it either — the symbol was renamed; update tier_suites."
+		exit 1
+	fi
+	pair=$(below_tag "$tier" "$lacks_symbol" "$lacks_file" || true)
 	if [ -z "$pair" ]; then
-		echo "::error::crossversion-build: no tag stamps below $const=$tier — the $name tier suite would assert a refusal no binary can make."
+		echo "::error::crossversion-build: no tag stamps below $const=$tier${lacks_symbol:+ without $lacks_symbol} — the $name tier suite would assert a refusal no binary can make."
 		exit 1
 	fi
 	tier_lines="$tier_lines $name:$tier:${pair% *}:${pair#* }"
