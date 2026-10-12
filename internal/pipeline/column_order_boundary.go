@@ -468,7 +468,7 @@ func routeColumnOrderBoundary(
 			"recorded order to the source's (the change was applied there); checking the rest of the boundary "+
 			"against the target",
 		"table", tableName, "columns", renderColumnOrderFlips(v.flips))
-	return routeWitnessedBoundary(ctx, deps, tableName, post, snap)
+	return routeWitnessedBoundary(ctx, deps, tableName, post, snap, nil)
 }
 
 // columnOrderChangeSeen reports whether the boundary flips a column pair

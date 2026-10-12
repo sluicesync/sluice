@@ -335,7 +335,7 @@ func TestFirstBoundaryWitness_ColumnOrder(t *testing.T) {
 			if tc.history != nil {
 				w.history = []*ir.Table{tc.history}
 			}
-			v, err := w.verdict(ctx, tc.post, ir.Position{})
+			v, err := w.verdict(ctx, tc.post, ir.Position{}, nil)
 			if err != nil {
 				t.Fatal(err)
 			}

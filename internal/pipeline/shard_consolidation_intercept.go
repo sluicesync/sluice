@@ -396,7 +396,7 @@ func checkShapeAFirstBoundary(ctx context.Context, w *firstBoundaryWitness, tabl
 	if w == nil {
 		return b, nil
 	}
-	v, err := w.verdict(ctx, raw, pos)
+	v, err := w.verdict(ctx, raw, pos, nil)
 	if err != nil {
 		return b, fmt.Errorf("read the consolidated target's catalog to check the first schema boundary for %q "+
 			"(the boundary is not accepted unchecked): %w", tableName, err)

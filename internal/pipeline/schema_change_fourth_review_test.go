@@ -131,10 +131,10 @@ func TestFirstBoundaryWitness_NarrowBackProvenAfterTheHistory(t *testing.T) {
 	w.history = []*ir.Table{wide}
 	w.retained = retainedHistory{wide: {anchor: testPos(10), recorded: []*ir.Table{narrow, wide}}}
 	ctx := context.Background()
-	if v, err := w.verdict(ctx, narrow, testPos(20)); err != nil || v.kind != witnessForwardAlter {
+	if v, err := w.verdict(ctx, narrow, testPos(20), nil); err != nil || v.kind != witnessForwardAlter {
 		t.Errorf("proven after: verdict %d (%v); want the narrowing forwarded", v.kind, err)
 	}
-	if v, err := w.verdict(ctx, narrow, testPos(10)); err != nil || v.kind != witnessTargetWider {
+	if v, err := w.verdict(ctx, narrow, testPos(10), nil); err != nil || v.kind != witnessTargetWider {
 		t.Errorf("at the anchor: verdict %d (%v); want the WARN-keep", v.kind, err)
 	}
 }

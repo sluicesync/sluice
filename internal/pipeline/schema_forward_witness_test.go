@@ -386,14 +386,14 @@ func TestFirstBoundaryWitness_Verdict(t *testing.T) {
 	ctx := context.Background()
 	t.Run("the target does not hold the table", func(t *testing.T) {
 		cat := &fakeCatalog{tables: map[string]*ir.Table{}}
-		v, err := newFakeWitness(cat, "postgres", "postgres").verdict(ctx, witnessTable(), ir.Position{})
+		v, err := newFakeWitness(cat, "postgres", "postgres").verdict(ctx, witnessTable(), ir.Position{}, nil)
 		if err != nil || v.kind != witnessUnwitnessed {
 			t.Fatalf("verdict = %d, %v; want unwitnessed", v.kind, err)
 		}
 	})
 	t.Run("no storage-shape rendering for the pair", func(t *testing.T) {
 		cat := &fakeCatalog{tables: map[string]*ir.Table{"w": witnessTable()}}
-		v, err := newFakeWitness(cat, "postgres", "sqlite").verdict(ctx, witnessTable(), ir.Position{})
+		v, err := newFakeWitness(cat, "postgres", "sqlite").verdict(ctx, witnessTable(), ir.Position{}, nil)
 		if err != nil || v.kind != witnessUnwitnessed || cat.reads != 0 {
 			t.Fatalf("verdict = %d, %v, reads %d; want unwitnessed with no catalog read", v.kind, err, cat.reads)
 		}
@@ -402,7 +402,7 @@ func TestFirstBoundaryWitness_Verdict(t *testing.T) {
 		cat := &fakeCatalog{tables: map[string]*ir.Table{"w": witnessTable()}}
 		w := newFakeWitness(cat, "mysql", "mysql")
 		for range 3 {
-			if v, err := w.verdict(ctx, witnessTable(), ir.Position{}); err != nil || v.kind != witnessMatch {
+			if v, err := w.verdict(ctx, witnessTable(), ir.Position{}, nil); err != nil || v.kind != witnessMatch {
 				t.Fatalf("verdict = %d, %v; want match", v.kind, err)
 			}
 		}
@@ -412,7 +412,7 @@ func TestFirstBoundaryWitness_Verdict(t *testing.T) {
 		other := witnessTable()
 		other.Name = "late"
 		for range 2 {
-			if v, _ := w.verdict(ctx, other, ir.Position{}); v.kind != witnessUnwitnessed {
+			if v, _ := w.verdict(ctx, other, ir.Position{}, nil); v.kind != witnessUnwitnessed {
 				t.Fatalf("verdict for an absent table = %d; want unwitnessed", v.kind)
 			}
 		}
@@ -423,11 +423,11 @@ func TestFirstBoundaryWitness_Verdict(t *testing.T) {
 	t.Run("a table created after the first read is found by the refresh", func(t *testing.T) {
 		cat := &fakeCatalog{tables: map[string]*ir.Table{"w": witnessTable()}}
 		w := newFakeWitness(cat, "mysql", "mysql")
-		_, _ = w.verdict(ctx, witnessTable(), ir.Position{})
+		_, _ = w.verdict(ctx, witnessTable(), ir.Position{}, nil)
 		late := witnessTable()
 		late.Name = "late"
 		cat.tables["late"] = late
-		if v, _ := w.verdict(ctx, late, ir.Position{}); v.kind != witnessMatch {
+		if v, _ := w.verdict(ctx, late, ir.Position{}, nil); v.kind != witnessMatch {
 			t.Fatalf("verdict = %d; want match after the refresh", v.kind)
 		}
 	})
@@ -437,7 +437,7 @@ func TestFirstBoundaryWitness_Verdict(t *testing.T) {
 		cat := &fakeCatalog{tables: map[string]*ir.Table{"w": witnessTable(wcol("ts", ir.DateTime{Precision: 6}))}}
 		w := newFakeWitness(cat, "mysql", "mysql")
 		w.catalog = newTargetCatalogWitness(cat.load, map[string]*ir.Table{"w": witnessTable(wcol("ts", ir.DateTime{Precision: 0}))})
-		v, err := w.verdict(ctx, witnessTable(wcol("ts", ir.DateTime{Precision: 6})), ir.Position{})
+		v, err := w.verdict(ctx, witnessTable(wcol("ts", ir.DateTime{Precision: 6})), ir.Position{}, nil)
 		if err != nil || v.kind != witnessMatch {
 			t.Fatalf("verdict = %d, %v (%s); want match on the fresh read", v.kind, err, v.render())
 		}
@@ -463,13 +463,13 @@ func TestFirstBoundaryWitness_Verdict(t *testing.T) {
 		cat := &fakeCatalog{tables: map[string]*ir.Table{"orders": tgt}}
 		post := witnessTable()
 		post.Name = "Orders"
-		if v, _ := newFakeWitness(cat, "mysql", "mysql").verdict(ctx, post, ir.Position{}); v.kind != witnessMatch {
+		if v, _ := newFakeWitness(cat, "mysql", "mysql").verdict(ctx, post, ir.Position{}, nil); v.kind != witnessMatch {
 			t.Fatalf("verdict = %d; want match", v.kind)
 		}
 	})
 	t.Run("a catalog read error is returned, not degraded", func(t *testing.T) {
 		cat := &fakeCatalog{err: errors.New("target down")}
-		if _, err := newFakeWitness(cat, "mysql", "mysql").verdict(ctx, witnessTable(), ir.Position{}); err == nil {
+		if _, err := newFakeWitness(cat, "mysql", "mysql").verdict(ctx, witnessTable(), ir.Position{}, nil); err == nil {
 			t.Fatal("verdict swallowed a catalog read error")
 		}
 	})
@@ -481,7 +481,7 @@ func TestFirstBoundaryWitness_Verdict(t *testing.T) {
 			{Table: "w", Column: "dropped_since", TargetType: "text"},
 			{Table: "other", Column: "x", TargetType: "text"},
 		}
-		v, err := w.verdict(ctx, witnessTable(wcol("ts", ir.DateTime{Precision: 6})), ir.Position{})
+		v, err := w.verdict(ctx, witnessTable(wcol("ts", ir.DateTime{Precision: 6})), ir.Position{}, nil)
 		if err != nil || v.kind != witnessMatch {
 			t.Fatalf("verdict = %d, %v (%s); want match", v.kind, err, v.render())
 		}
@@ -491,7 +491,7 @@ func TestFirstBoundaryWitness_Verdict(t *testing.T) {
 		cat := &fakeCatalog{tables: map[string]*ir.Table{"w": tgt}}
 		w := newFakeWitness(cat, "mysql", "mysql")
 		w.shardColumn = "_sluice_shard"
-		if v, err := w.verdict(ctx, witnessTable(), ir.Position{}); err != nil || v.kind != witnessMatch {
+		if v, err := w.verdict(ctx, witnessTable(), ir.Position{}, nil); err != nil || v.kind != witnessMatch {
 			t.Fatalf("verdict = %d, %v (%s); want match", v.kind, err, v.render())
 		}
 	})

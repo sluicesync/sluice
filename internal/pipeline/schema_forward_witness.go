@@ -348,7 +348,10 @@ var errWitnessNoTable = errors.New("rendering the snapshot as target storage pro
 // paths retarget from) against the target's read-back of the same table.
 // pos is the boundary's position, which decides whether the stream's
 // retained history may judge a narrowing ([firstBoundaryWitness.historyPriorAt]).
-func (w *firstBoundaryWitness) verdict(ctx context.Context, post *ir.Table, pos ir.Position) (witnessVerdict, error) {
+// seed, when the boundary is classified against the cold-start seed, is
+// that seed: the source's own prior for the key-collation door
+// ([judgeKeyCollation]); nil otherwise, when the retained history serves.
+func (w *firstBoundaryWitness) verdict(ctx context.Context, post *ir.Table, pos ir.Position, seed *ir.Table) (witnessVerdict, error) {
 	if post == nil {
 		return witnessVerdict{kind: witnessUnwitnessed, reason: "the snapshot carries no table"}, nil
 	}
@@ -384,8 +387,12 @@ func (w *firstBoundaryWitness) verdict(ctx context.Context, post *ir.Table, pos 
 	if err != nil {
 		return witnessVerdict{}, err
 	}
+	keyPrior := seed
+	if keyPrior == nil {
+		keyPrior = w.historyPriorAt(post.Name, pos)
+	}
 	v := classifyWitness(expected, target, opts)
-	if v.kind == witnessMatch && !order.refuses() {
+	if v.kind == witnessMatch && !order.refuses() && len(w.keyCollationChanges(post, keyPrior, target)) == 0 {
 		return v, nil
 	}
 	// The memo may predate a change the target has since taken — a Shape A
@@ -400,9 +407,14 @@ func (w *firstBoundaryWitness) verdict(ctx context.Context, post *ir.Table, pos 
 	}
 	v = classifyWitness(expected, target, opts)
 	if order.refuses() {
-		return withColumnOrder(v, order, w.targetReorders), nil
+		v = withColumnOrder(v, order, w.targetReorders)
 	}
-	return v, nil
+	return withKeyCollation(v, w.keyCollationChanges(post, keyPrior, target)), nil
+}
+
+// keyCollationChanges is [judgeKeyCollation] for this stream's engine pair.
+func (w *firstBoundaryWitness) keyCollationChanges(post, prior, target *ir.Table) []keyCollationChange {
+	return judgeKeyCollation(post, prior, target, w.sourceEngine == w.targetEngine, w.targetEngine)
 }
 
 // expected renders post as the target would store it — the Shape A
@@ -1101,11 +1113,11 @@ func witnessCompareTable(t, expected *ir.Table) *ir.Table {
 //
 //   - Integer.AutoIncrement: catalog-only; no change stream carries it.
 //   - character charset/collation: pgoutput and VStream carry neither, and
-//     across engines it is translation, not drift. UNVERIFIED PREMISE —
-//     this arm is the exception: a collation change is not storage-neutral
-//     everywhere (a `_ci` → `_bin` change on a MySQL key column changes
-//     which values collide), and a stopped-time collation change is
-//     therefore not seen at a boundary. Filed as GC-44 F17.
+//     across engines it is translation, not drift. Not storage-neutral on a
+//     KEY column (a `_ci` → `_bin` change changes which values collide), so
+//     a key column's collation is judged apart from this lens, against the
+//     source's own prior (key_collation_boundary.go, GC-44 F17 /
+//     KEY-COLLATION-FIRST-BOUNDARY). A non-key column's is not judged.
 //   - a constraint-free Decimal{0,0} is the legacy unconstrained spelling.
 //   - Geometry: the subtype and Z/M flags are erased (the change streams
 //     do not carry them reliably); geometry-vs-geography is kept, and so is
@@ -1276,8 +1288,7 @@ func (v witnessVerdict) render() string {
 // including a character column widened past what the earlier shape could
 // hold, and a character column's collation where the source names the
 // recorded collation ID — DEFERRED-KEY-COLLATION), but a Postgres source
-// records no collation at all, and a boundary judged against the target
-// erases collation ([witnessCompareType], KEY-COLLATION-FIRST-BOUNDARY in
+// records no collation at all (KEY-COLLATION-FIRST-BOUNDARY in
 // docs/dev/audit-backlog.md) — so this sentence claims nothing about the
 // shape those earlier rows were applied under.
 const refusedBeforeBoundary = "Refusing before the boundary is recorded or any change after it is applied; rows " +
@@ -1310,15 +1321,17 @@ func resumeDivergenceRefusal(tableName string, v witnessVerdict, hint string) er
 // pre-state the boundary was forwarded against (nil when nothing was
 // forwarded: a match, a target-only difference, an unwitnessable table),
 // so the caller can plan the added-column backfill exactly as it does for
-// a CDC→CDC boundary.
+// a CDC→CDC boundary. seed is the cold-start seed when the boundary was
+// classified against it (the key-collation door's prior), nil otherwise.
 func routeWitnessedBoundary(
 	ctx context.Context,
 	deps schemaForwardDeps,
 	tableName string,
 	post *ir.Table,
 	snap ir.SchemaSnapshot,
+	seed *ir.Table,
 ) (*ir.Table, error) {
-	v, err := deps.witness.verdict(ctx, snap.IR, snap.Position)
+	v, err := deps.witness.verdict(ctx, snap.IR, snap.Position, seed)
 	if err != nil {
 		// Not the divergence marker: nothing has been compared, and a fresh
 		// run may read the catalog fine.

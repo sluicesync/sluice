@@ -375,8 +375,11 @@ func interceptAddColumnForward(
 					// table's first snapshot since the intercept was wired,
 					// or an ALTER COLUMN TYPE against the cold-start seed.
 					// The target is the witness (schema_forward_witness.go).
-					var witnessedPre *ir.Table
-					witnessedPre, routeErr = routeWitnessedBoundary(ctx, deps, key, post, snap)
+					var witnessedPre, seed *ir.Table
+					if preIsSeed {
+						seed = pre
+					}
+					witnessedPre, routeErr = routeWitnessedBoundary(ctx, deps, key, post, snap, seed)
 					if routeErr == nil && witnessedPre == nil {
 						// Nothing forwarded: accept the baseline.
 						if !accept() {

@@ -649,6 +649,9 @@ type unforwardedJudgement struct {
 	ahead []witnessColumnDiff
 	// targetOnly are the target's columns the source lacks.
 	targetOnly []string
+	// keyCollation are the refused key columns whose character set or
+	// collation changed ([judgeKeyCollation]).
+	keyCollation []keyCollationChange
 }
 
 // judgeUnforwarded compares post (RAW) with the target's read-back of the
@@ -663,7 +666,7 @@ type unforwardedJudgement struct {
 func (w *firstBoundaryWitness) judgeUnforwarded(ctx context.Context, post *ir.Table, prior unforwardedPrior) (unforwardedJudgement, error) {
 	// No position: the verdict here only says whether the target can
 	// witness the table; the narrowing evidence is prior's.
-	v, err := w.verdict(ctx, post, ir.Position{})
+	v, err := w.verdict(ctx, post, ir.Position{}, nil)
 	if err != nil {
 		return unforwardedJudgement{}, err
 	}
@@ -687,7 +690,20 @@ func (w *firstBoundaryWitness) judgeUnforwarded(ctx context.Context, post *ir.Ta
 			return unforwardedJudgement{}, err
 		}
 	}
-	return judgeUnforwardedColumns(expected, target, w.options(post), judged), nil
+	j := judgeUnforwardedColumns(expected, target, w.options(post), judged)
+	// KEY-COLLATION-FIRST-BOUNDARY: the column judgement above sees through
+	// the witness lens, which erases a collation; a key column's is judged
+	// here, against the source's own prior where it judges this boundary
+	// (key_collation_boundary.go).
+	var keyPrior *ir.Table
+	if prior.judges {
+		keyPrior = prior.raw
+	}
+	for _, c := range w.keyCollationChanges(post, keyPrior, target) {
+		j.refused = append(j.refused, c.diff())
+		j.keyCollation = append(j.keyCollation, c)
+	}
+	return j, nil
 }
 
 // judgedPrior is [unforwardedPrior] with the prior shape rendered as target
@@ -949,6 +965,9 @@ func (j unforwardedJudgement) shapeNote() string {
 // same change on the target" is not the whole story.
 func (j unforwardedJudgement) remedyNotes() string {
 	var notes string
+	if len(j.keyCollation) > 0 {
+		notes += " " + keyCollationRemedy(j.keyCollation)
+	}
 	if j.narrowed {
 		notes += " A column the source NARROWED: its own ALTER converted the values it stores (rounded, " +
 			"truncated or relabelled them), and the rows the target already holds were never converted — " +

@@ -194,6 +194,10 @@ func cloneTable(t *ir.Table) *ir.Table {
 // alterFixture is one aspect's minimal (before, after) pair plus the
 // assertion for what the apply path must have done.
 type alterFixture struct {
+	// base, when set, adjusts baseTable for BOTH shapes first — for an
+	// aspect the base table carries no column for (a collation needs a
+	// character column).
+	base func(t *ir.Table)
 	// mutate turns a copy of baseTable into the after-shape.
 	mutate func(after *ir.Table)
 	// wantCall asserts the recorded DDL for an AlterApply aspect.
@@ -247,6 +251,27 @@ var alterFixtures = map[AlterAspect]alterFixture{
 			t.Helper()
 			if len(w.nullability) != 1 || !w.nullability[0].Nullable {
 				t.Errorf("AlterColumnNullability calls = %+v; want [amount nullable]", w.nullability)
+			}
+		},
+	},
+	AlterAspectColumnCollation: {
+		// KEY-COLLATION-FIRST-BOUNDARY (5): a key column's collation changed
+		// `_ci` → `_bin` with the type unchanged. Before the aspect existed
+		// the diff saw no change (Type.String renders neither), so no delta
+		// was recorded and the restored key kept `_ci`.
+		base: func(t *ir.Table) {
+			t.Columns[1].Type = ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: "utf8mb4_0900_ai_ci"}
+		},
+		mutate: func(a *ir.Table) {
+			a.Columns[1].Type = ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: "utf8mb4_bin"}
+		},
+		wantCall: func(t *testing.T, w *recordingSchemaWriter) {
+			t.Helper()
+			if len(w.typed) != 1 || w.typed[0].Name != "amount" {
+				t.Fatalf("AlterColumnType calls = %+v; want [amount]", w.typed)
+			}
+			if vc, ok := w.typed[0].Type.(ir.Varchar); !ok || vc.Collation != "utf8mb4_bin" {
+				t.Errorf("altered column = %#v; want it to carry utf8mb4_bin", w.typed[0].Type)
 			}
 		},
 	},
@@ -340,6 +365,9 @@ var alterFixtures = map[AlterAspect]alterFixture{
 // fixturePair renders one aspect's before/after tables.
 func fixturePair(f alterFixture) (before, after *ir.Table) {
 	before = baseTable()
+	if f.base != nil {
+		f.base(before)
+	}
 	after = cloneTable(before)
 	f.mutate(after)
 	return before, after

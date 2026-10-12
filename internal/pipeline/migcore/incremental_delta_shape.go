@@ -72,6 +72,15 @@ const (
 	// differs.
 	AlterAspectColumnNullable AlterAspect = "column-nullable"
 
+	// AlterAspectColumnCollation — a same-named character column whose
+	// character set or collation differs. Not storage-neutral: on a key
+	// column it changes which values are one key (`_ci` → `_bin`, PAD
+	// SPACE → NO PAD). [ir.Type.String] does not render either, so before
+	// this aspect a collation-only change produced no delta at all and the
+	// restored target kept the old collation, merging the window's rows
+	// the source keeps apart (KEY-COLLATION-FIRST-BOUNDARY, measured).
+	AlterAspectColumnCollation AlterAspect = "column-collation"
+
 	// AlterAspectColumnGenerated — a same-named column that gained or
 	// lost its GENERATED-ness.
 	AlterAspectColumnGenerated AlterAspect = "column-generated"
@@ -197,6 +206,10 @@ var alterColumnAspectComparators = []struct {
 		Same:   func(a, b *ir.Column) bool { return a.Nullable == b.Nullable },
 	},
 	{
+		Aspect: AlterAspectColumnCollation,
+		Same:   func(a, b *ir.Column) bool { return sameCollation(a.Type, b.Type) },
+	},
+	{
 		Aspect: AlterAspectColumnGenerated,
 		Same:   func(a, b *ir.Column) bool { return a.IsGenerated() == b.IsGenerated() },
 	},
@@ -271,6 +284,17 @@ var alterAspectComparators = []struct {
 		Aspect: AlterAspectForeignKeyRedefined,
 		Same:   func(a, b *ir.Table) bool { return len(redefinedForeignKeys(a, b)) == 0 },
 	},
+}
+
+// sameCollation reports whether two column types declare the same
+// character set and collation ([translate.ColumnCollation]; names compared
+// case-insensitively). Both shapes of a delta come from the same engine's
+// schema reader — the parent manifest and the window's catalog read — so a
+// difference here is a change the source made, not a rendering artifact.
+func sameCollation(a, b ir.Type) bool {
+	ac, al := translate.ColumnCollation(a)
+	bc, bl := translate.ColumnCollation(b)
+	return strings.EqualFold(ac, bc) && strings.EqualFold(al, bl)
 }
 
 // AllAlterAspects returns every aspect the diff can report, DERIVED
@@ -715,6 +739,18 @@ var alterDispositions = map[AlterAspect]alterDisposition{
 		Verdict: AlterApply,
 		Reason:  "ALTER TABLE ... SET/DROP NOT NULL via the engine's shape-delta surface",
 	},
+	// Applied BEFORE the window replays, like a type change: a key whose
+	// collation became more discriminating (`_ci` → `_bin`, PAD SPACE → NO
+	// PAD) must be on the target before rows distinct only under it arrive,
+	// or they merge. The opposite direction (`_bin` → `_ci`) is the stated
+	// residual: the source could only make that change after removing every
+	// pair the new collation equates, and if one such pair was written AND
+	// removed inside the same window, replaying it into the already-altered
+	// key merges the pair before the delete. No measured case reaches it.
+	AlterAspectColumnCollation: {
+		Verdict: AlterApply,
+		Reason:  "ALTER TABLE ... MODIFY/ALTER COLUMN with the new character set and collation via the engine's shape-delta surface",
+	},
 	AlterAspectColumnGenerated: {
 		Verdict: AlterRefuse,
 		Reason:  "no engine surface converts a column to or from GENERATED, and the two shapes disagree about who computes the value — replaying into the wrong one is not recoverable after the fact",
@@ -921,7 +957,7 @@ func applyAlterAspect(
 		slog.InfoContext(ctx, ac.Origin+": schema delta — applied ADD COLUMN",
 			append(ac.logAttrs(d.Table), "added_columns", len(added))...)
 		warnUnreproducibleAddColumnFill(ctx, ac, d)
-	case AlterAspectColumnType, AlterAspectColumnNullable:
+	case AlterAspectColumnType, AlterAspectColumnNullable, AlterAspectColumnCollation:
 		if shapeApplier == nil {
 			return alterDeltaRefusal(ac, d.Table, aspect,
 				"the target engine's schema writer does not implement ir.ShapeDeltaApplier, so the change cannot be applied — and skipping it would leave the target's column shape disagreeing with the values the window replays")
@@ -935,7 +971,9 @@ func applyAlterAspect(
 				want = ch.After
 			}
 			var err error
-			if aspect == AlterAspectColumnType {
+			if aspect == AlterAspectColumnType || aspect == AlterAspectColumnCollation {
+				// A collation change is applied as a column retype carrying
+				// the after-shape's character set and collation.
 				err = shapeApplier.AlterColumnType(ctx, retargeted, want)
 			} else {
 				err = shapeApplier.AlterColumnNullability(ctx, retargeted, want)
