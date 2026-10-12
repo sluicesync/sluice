@@ -130,7 +130,14 @@ func TestPlanKeyCollationGuard(t *testing.T) {
 		{"source _bin, target _ci, no key on k", kcgSource(bin), kcgCols(ci), []string{"id"}, nil, false, false, nil, nil, ""},
 		{"source collation unknown (VStream)", kcgSource(ir.Varchar{Length: 20}), kcgCols(ci), []string{"k"}, nil, false, false, nil, nil, ""},
 		{"Postgres deterministic source", kcgSource(ir.Text{Size: ir.TextLong, Collation: "C", Determinism: ir.CollationDeterministic}), kcgCols(ci), []string{"k"}, nil, true, true, []int{1}, nil, ""},
-		{"Postgres nondeterministic source", kcgSource(ir.Text{Size: ir.TextLong, Collation: "ci", Determinism: ir.CollationNonDeterministic}), kcgCols(ci), []string{"k"}, nil, false, false, nil, nil, ""},
+		// Review 2026-10-12 finding 1: a nondeterministic Postgres key (ICU
+		// ks-level2 / level3) is created under the target's default, which
+		// equates what the source keeps apart. Armed exactly as the database
+		// default is: bytes, and only as a UNIQUE key beside a primary key.
+		{"Postgres nondeterministic source, primary key: not armed (no new wedge)", kcgSource(ir.Text{Size: ir.TextLong, Collation: "ci", Determinism: ir.CollationNonDeterministic}), kcgCols(ci), []string{"k"}, nil, false, false, nil, nil, ""},
+		{"Postgres nondeterministic source, unique beside a primary key: armed as bytes", kcgSource(ir.Text{Size: ir.TextLong, Collation: "ci", Determinism: ir.CollationNonDeterministic}), kcgCols(ci), []string{"id"}, [][]string{{"k"}}, true, true, []int{1}, nil, ""},
+		{"Postgres nondeterministic source, unique with no primary key: not armed", kcgSource(ir.Text{Size: ir.TextLong, Collation: "ci", Determinism: ir.CollationNonDeterministic}), kcgCols(ci), nil, [][]string{{"k"}}, false, false, nil, nil, ""},
+		{"Postgres named collation of unknown determinism: not armed", kcgSource(ir.Text{Size: ir.TextLong, Collation: "ci"}), kcgCols(ci), []string{"id"}, [][]string{{"k"}}, false, false, nil, nil, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

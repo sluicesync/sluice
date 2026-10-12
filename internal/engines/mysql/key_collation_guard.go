@@ -111,8 +111,9 @@ type armedCollation struct {
 	// comparison name to the source.
 	charset, collation, declared string
 	// uniqueOnly: the source column is on a Postgres database's DEFAULT
-	// collation (no name, stamped deterministic), which the MySQL target
-	// created under its own default — usually case-insensitive. Armed only
+	// collation (no name, stamped deterministic) or on a NONDETERMINISTIC
+	// Postgres collation (see [armedFor]), which the MySQL target created
+	// under its own default — usually case-insensitive. Armed only
 	// in a UNIQUE key beside a primary key the column is not part of
 	// (operator's choice (b), KEY-COLLATION-PG-DEFAULT-TO-MYSQL): there the
 	// primary key recognises a re-delivered change of the same row, so the
@@ -244,8 +245,41 @@ func armedFor(src, tgt ir.Type, compareAs map[string]string) (armedCollation, bo
 		}
 		return armedCollation{charset: strings.ToLower(scs), collation: srcColl, declared: declared}, true
 	case "postgres":
-		if collationDeterminismOf(src) == ir.CollationDeterministic {
+		switch collationDeterminismOf(src) {
+		case ir.CollationDeterministic:
 			return armedCollation{bytes: true}, true
+		case ir.CollationNonDeterministic:
+			// A Postgres NONDETERMINISTIC collation (an ICU `ks-level2`
+			// case-insensitive key, a level3 one): the MySQL emitter cannot
+			// declare it and creates the key under the target's default, which
+			// equates values the source keeps apart (`'e'`/`'é'` at level 2,
+			// `'a'`/`'A'` at level 3, both one key under `utf8mb4_0900_ai_ci`).
+			// Left unarmed, those merged through every guarded upsert at exit 0
+			// (review 2026-10-12, finding 1). Armed as the database default is
+			// (bytes, uniqueOnly) — the operator's KEY-COLLATION-PG-DEFAULT-TO-
+			// MYSQL policy, mirrored exactly.
+			//
+			// Why a BYTE comparison is right for a collation that is not byte
+			// equality. A nondeterministic collation equates MORE byte strings
+			// than byte equality does, never fewer: two values it keeps apart
+			// are byte-different, and two byte-different values it equates
+			// cannot both be in a source unique key at once. So on a SNAPSHOT
+			// (the copy path, where uniqueOnly is ignored and the primary key
+			// is armed too) every pair of rows is byte-distinct and
+			// source-distinct, a re-sent row is byte-identical to itself, and a
+			// target conflict between byte-different keys is exactly a merge.
+			// On the APPLY path the byte comparison is STRICTER than the
+			// source's: a re-delivered change of a key the source equates
+			// (`'A'` → `'a'` on a case-insensitive key) is byte-different, so in
+			// the primary key — the identity — it would refuse what converges
+			// today; uniqueOnly leaves the identity unarmed for that reason,
+			// and the primary-key-equal arm of the guard recognises the
+			// re-delivered change of a UNIQUE key beside it. What remains
+			// stricter is loud, never silent: a conflict between two DIFFERENT
+			// source rows whose keys the source equates, which a source unique
+			// key admits only transiently (a DEFERRABLE constraint mid-
+			// transaction), refuses rather than passing.
+			return armedCollation{bytes: true, uniqueOnly: true}, true
 		}
 	}
 	return armedCollation{}, false

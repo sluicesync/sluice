@@ -22,6 +22,7 @@ import (
 func TestPlanCopyKeyCollationGuard_ArmsThePostgresDefaultInsideThePrimaryKey(t *testing.T) {
 	ci := ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: "utf8mb4_general_ci"}
 	pgDefault := ir.Varchar{Length: 20, Determinism: ir.CollationDeterministic}
+	pgNondet := ir.Varchar{Length: 20, Collation: "ci_level2", Determinism: ir.CollationNonDeterministic}
 	bin := ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: "utf8mb4_bin"}
 	cases := []struct {
 		name            string
@@ -33,6 +34,9 @@ func TestPlanCopyKeyCollationGuard_ArmsThePostgresDefaultInsideThePrimaryKey(t *
 		{"postgres default, primary key", pgDefault, []string{"k"}, nil, false, true},
 		{"postgres default, unique with no primary key", pgDefault, nil, [][]string{{"k"}}, false, true},
 		{"postgres default, unique beside a primary key", pgDefault, []string{"id"}, [][]string{{"k"}}, true, true},
+		{"postgres nondeterministic, primary key", pgNondet, []string{"k"}, nil, false, true},
+		{"postgres nondeterministic, unique with no primary key", pgNondet, nil, [][]string{{"k"}}, false, true},
+		{"postgres nondeterministic, unique beside a primary key", pgNondet, []string{"id"}, [][]string{{"k"}}, true, true},
 		{"_bin, primary key", bin, []string{"k"}, nil, true, true},
 		{"_bin, no key on the column", bin, []string{"id"}, nil, false, false},
 		{"agreeing collations", ci, []string{"k"}, nil, false, false},

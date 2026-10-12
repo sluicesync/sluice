@@ -16,8 +16,9 @@ package pipeline
 //
 // Pairs: Postgres → MySQL onto the target table sluice itself creates for a
 // default-collation text key (`utf8mb4_0900_ai_ci`, measured on a fresh
-// migrate 2026-10-12 — no hand-set collation needed to arm it), MySQL
-// `_bin` → MySQL `_ci`, and Postgres "C" → a nondeterministic ICU key.
+// migrate 2026-10-12 — no hand-set collation needed to arm it), Postgres
+// NONDETERMINISTIC ICU keys (level 2 and level 3) → that same MySQL target,
+// MySQL `_bin` → MySQL `_ci`, and Postgres "C" → a nondeterministic ICU key.
 //
 // The independent expected value is the source's own rows: the target is
 // read back as (key bytes, value) and every row on it must be one the
@@ -114,11 +115,36 @@ func TestKeyCollationRowWriter_CopyPaths(t *testing.T) {
 	applyPGDDL(t, pgTgt, "CREATE COLLATION ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false);"+
 		"CREATE TABLE kpp (k text COLLATE ci PRIMARY KEY, v int); CREATE TABLE okpp (k text COLLATE ci PRIMARY KEY, v int);")
 
+	// Review 2026-10-12 finding 1: a NONDETERMINISTIC Postgres key. The MySQL
+	// emitter cannot declare an ICU collation and creates the key under the
+	// target default, `utf8mb4_0900_ai_ci`, which equates what the source
+	// keeps apart: 'e'/'é' at level 2 (accent-sensitive, case-insensitive),
+	// 'a'/'A' at level 3. Before the fix the guard left these keys unarmed and
+	// the second source row merged into the first at exit 0. The copy arms
+	// them in the primary key and in a UNIQUE key beside one.
+	applyPGDDL(t, pgSrc, "CREATE COLLATION l2 (provider = icu, locale = 'und-u-ks-level2', deterministic = false);"+
+		"CREATE COLLATION l3 (provider = icu, locale = 'und-u-ks-level3', deterministic = false);"+
+		"CREATE TABLE kn2 (k varchar(20) COLLATE l2 PRIMARY KEY, v int); INSERT INTO kn2 VALUES ('e', 1), ('é', 2), ('b', 3);"+
+		"CREATE TABLE okn2 (k varchar(20) COLLATE l2 PRIMARY KEY, v int); INSERT INTO okn2 VALUES ('e', 1), ('b', 2), ('c', 3);"+
+		"CREATE TABLE kn3 (k varchar(20) COLLATE l3 PRIMARY KEY, v int); INSERT INTO kn3 VALUES "+seedRows+";"+
+		"CREATE TABLE okn3 (k varchar(20) COLLATE l3 PRIMARY KEY, v int); INSERT INTO okn3 VALUES "+okRows+";"+
+		"CREATE TABLE kn2u (id int PRIMARY KEY, k varchar(20) COLLATE l2 NOT NULL UNIQUE, v int); INSERT INTO kn2u VALUES (1, 'e', 1), (2, 'é', 2), (3, 'b', 3);"+
+		"CREATE TABLE okn2u (id int PRIMARY KEY, k varchar(20) COLLATE l2 NOT NULL UNIQUE, v int); INSERT INTO okn2u VALUES (1, 'e', 1), (2, 'b', 2), (3, 'c', 3);")
+	applyMySQLDDL(t, mysqlTgt, "CREATE TABLE kn2 (k varchar(20) NOT NULL PRIMARY KEY, v int) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"+
+		"CREATE TABLE okn2 (k varchar(20) NOT NULL PRIMARY KEY, v int) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"+
+		"CREATE TABLE kn3 (k varchar(20) NOT NULL PRIMARY KEY, v int) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"+
+		"CREATE TABLE okn3 (k varchar(20) NOT NULL PRIMARY KEY, v int) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"+
+		"CREATE TABLE kn2u (id int NOT NULL PRIMARY KEY, k varchar(20) NOT NULL UNIQUE, v int) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"+
+		"CREATE TABLE okn2u (id int NOT NULL PRIMARY KEY, k varchar(20) NOT NULL UNIQUE, v int) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;")
+
 	pairs := []struct {
 		krwPair
 		merge, ok string
 	}{
 		{krwPair{"postgres default → mysql (sluice-created target)", pgEng, mysqlEng, pgSrc, mysqlTgt, "mysql", "HEX(k)"}, "kpm", "okpm"},
+		{krwPair{"postgres ICU level2 primary key → mysql 0900_ai_ci", pgEng, mysqlEng, pgSrc, mysqlTgt, "mysql", "HEX(k)"}, "kn2", "okn2"},
+		{krwPair{"postgres ICU level3 primary key → mysql 0900_ai_ci", pgEng, mysqlEng, pgSrc, mysqlTgt, "mysql", "HEX(k)"}, "kn3", "okn3"},
+		{krwPair{"postgres ICU level2 unique beside a primary key → mysql 0900_ai_ci", pgEng, mysqlEng, pgSrc, mysqlTgt, "mysql", "HEX(k)"}, "kn2u", "okn2u"},
 		{krwPair{"mysql _bin → mysql _ci", mysqlEng, mysqlEng, mysqlSrc, mysqlTgt, "mysql", "HEX(k)"}, "kmm", "okmm"},
 		{krwPair{"postgres C → postgres nondeterministic", pgEng, pgEng, pgSrc, pgTgt, "pgx", "upper(encode(convert_to(k, 'UTF8'), 'hex'))"}, "kpp", "okpp"},
 	}
