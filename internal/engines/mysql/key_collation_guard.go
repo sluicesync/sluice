@@ -123,6 +123,12 @@ type armedCollation struct {
 	// case-only change converges today and the guard would wedge it, so
 	// that case stays unarmed — documented as not covered.
 	uniqueOnly bool
+	// nondet: the source collation is (or, for an unstamped named Postgres
+	// collation, may be) NONDETERMINISTIC, so the byte comparison is
+	// stricter than the source's: a copy-time refusal on such a key can be a
+	// stale target row the source equates with the new one, not two source
+	// rows. Read by the copy's remedy ([copyKeyCollationMergeRemedy]).
+	nondet bool
 }
 
 // keyCollationPlan is the guard for one table, rendered per statement.
@@ -160,11 +166,17 @@ func planKeyCollationGuard(source *ir.Table, colTypes map[string]*ir.Column, key
 
 // planCopyKeyCollationGuard is [planKeyCollationGuard] for the idempotent
 // copy writer (KEY-COLLATION-ROWWRITER). It differs in one rule: a Postgres
-// default-collation column is armed in the primary key too. The applier
-// leaves that one unarmed because a re-delivered case-only change of the
-// identity key would wedge it; a copy re-sends only rows of a snapshot,
-// never a change of a key, so the case cannot arise, and without the guard
-// two source keys 'A' and 'a' on a `_ci` target key are one row at exit 0.
+// default-collation or nondeterministic column is armed in the primary key
+// too. The applier leaves those unarmed because a re-delivered case-only
+// change of the identity key would wedge it. A copy delivers rows, not
+// changes, but it is NOT confined to one snapshot (review 2026-10-12 #2,
+// finding 4): a resumed migrate over a live source, add-table or a restore
+// over rows already there can re-send a row whose key the source has since
+// changed, and on a nondeterministic key that stale pair is byte-different
+// though the source equates it. The guard refuses it, loudly — the cost of
+// arming here, and the copy's remedy says that a re-copy from scratch
+// converges then ([copyKeyCollationMergeRemedy]). Unarmed, two source keys
+// 'A' and 'a' on a `_ci` target key are one row at exit 0, silently.
 func planCopyKeyCollationGuard(source *ir.Table, colTypes map[string]*ir.Column, keys targetUniqueKeys, compareAs map[string]string) *keyCollationPlan {
 	return planFromArmed(armedColumns(source, colTypes, compareAs), keys)
 }
@@ -265,21 +277,29 @@ func armedFor(src, tgt ir.Type, compareAs map[string]string) (armedCollation, bo
 		switch collationDeterminismOf(src) {
 		case ir.CollationDeterministic:
 			return armedCollation{bytes: true}, true
-		case ir.CollationNonDeterministic, ir.CollationDeterminismUnknown:
-			// UNKNOWN determinism on a NAMED Postgres collation is a schema
-			// no reader stamped: one decoded from a backup manifest written
-			// before v0.159.0, whose type envelope had no
-			// collation_determinism key (review 2026-10-12, finding 5). Left
-			// unarmed, every Postgres key of such a chain went unguarded on a
-			// cross-engine restore (the DataOnly copy and the replay applier).
-			// Either determinism is possible, and the arm below is right for
-			// both: byte equality is exact for a deterministic collation (the
-			// only cost is that the applier leaves the primary key unarmed, as
-			// it does for the database default), and the argument below holds
-			// for a nondeterministic one. A database-DEFAULT key of such a
-			// chain has no name either, so it cannot be told from a source that
-			// records no collation (VStream) and stays unarmed — named in F17.
+		case ir.CollationDeterminismUnknown:
+			// UNKNOWN determinism on a NAMED Postgres-dialect collation: a
+			// schema no reader stamped. Two producers today: a backup manifest
+			// written before v0.159.0, whose type envelope had no
+			// collation_determinism key (review 2026-10-12, finding 5), and the
+			// mydumper reader, which carries a `COLLATE`-only column (SHOW
+			// CREATE TABLE omits a CHARACTER SET equal to the table's) with no
+			// charset, so CollationDialect reads its MySQL collation as a
+			// Postgres one (MYDUMPER-COLLATION-NO-CHARSET). Left unarmed, such a
+			// key went unguarded on a cross-engine restore and a resumed
+			// mydumper import alike.
 			//
+			// Armed as bytes in EVERY key, the primary key included, at apply
+			// too (review 2026-10-12 #2, finding 3; loud over silent). A named
+			// DETERMINISTIC primary key ("C") of an old chain left unarmed at
+			// apply let 'a' inserted in an incremental merge onto the full's
+			// 'A' at exit 0. The cost, stated: if the collation was in fact
+			// nondeterministic (case-insensitive), a re-applied case-only change
+			// of that primary key is byte-different and refuses
+			// KEY-COLLATION-MERGE loudly where it would have converged. nondet
+			// is set because it may have been, for the remedy's sake.
+			return armedCollation{bytes: true, nondet: true}, true
+		case ir.CollationNonDeterministic:
 			// A Postgres NONDETERMINISTIC collation (an ICU `ks-level2`
 			// case-insensitive key, a level3 one): the MySQL emitter cannot
 			// declare it and creates the key under the target's default, which
@@ -294,11 +314,15 @@ func armedFor(src, tgt ir.Type, compareAs map[string]string) (armedCollation, bo
 			// equality. A nondeterministic collation equates MORE byte strings
 			// than byte equality does, never fewer: two values it keeps apart
 			// are byte-different, and two byte-different values it equates
-			// cannot both be in a source unique key at once. So on a SNAPSHOT
-			// (the copy path, where uniqueOnly is ignored and the primary key
-			// is armed too) every pair of rows is byte-distinct and
-			// source-distinct, a re-sent row is byte-identical to itself, and a
-			// target conflict between byte-different keys is exactly a merge.
+			// cannot both be in a source unique key at once. So WITHIN ONE
+			// SNAPSHOT every pair of rows is byte-distinct and source-distinct, a
+			// re-sent row is byte-identical to itself, and a target conflict
+			// between byte-different keys is exactly a merge. ACROSS source
+			// states — a copy resumed over a source that kept changing — a
+			// byte-different conflict can also be a stale target row whose key
+			// the source now spells differently but still equates (`'a'` copied,
+			// then changed to `'A'`): the copy refuses that too, loudly, and its
+			// remedy says which case is which ([copyKeyCollationMergeRemedy]).
 			// On the APPLY path the byte comparison is STRICTER than the
 			// source's: a re-delivered change of a key the source equates
 			// (`'A'` → `'a'` on a case-insensitive key) is byte-different, so in
@@ -310,7 +334,7 @@ func armedFor(src, tgt ir.Type, compareAs map[string]string) (armedCollation, bo
 			// source rows whose keys the source equates, which a source unique
 			// key admits only transiently (a DEFERRABLE constraint mid-
 			// transaction), refuses rather than passing.
-			return armedCollation{bytes: true, uniqueOnly: true}, true
+			return armedCollation{bytes: true, uniqueOnly: true, nondet: true}, true
 		}
 	}
 	return armedCollation{}, false

@@ -391,6 +391,22 @@ func kcgRunServer(t *testing.T, srv kcgServer, batched bool) {
 	// Review 2026-10-12 finding 6: an accent-only merge and a composite
 	// primary key with one armed column, pinned at the applier on a server
 	// (they were unit-level only).
+	// Review 2026-10-12 #2 finding 3: a NAMED Postgres primary key whose
+	// determinism nothing recorded (a pre-v0.159.0 manifest decodes "C" so)
+	// is armed in the primary key at apply too: 'A' from the full, then 'a'
+	// from an incremental onto the `_ci` target key must refuse, not merge.
+	t.Run("postgres named key of unknown determinism: a primary-key merge refuses", func(t *testing.T) {
+		db, dsn := cell("pgunk")
+		applyDDL(t, dsn, "CREATE TABLE ku (id INT NOT NULL, k VARCHAR(20) CHARACTER SET utf8mb4 COLLATE "+srv.tgtCI+" NOT NULL, d INT, PRIMARY KEY (k))")
+		applyDDL(t, dsn, "INSERT INTO ku VALUES (1,'A',1)")
+		before := kcgRows(t, dsn, "ku", "id")
+		err := kcgApply(t, srv.eng, dsn, batched, kcgSnapshot(db, "ku", []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 32}},
+			{Name: "k", Type: ir.Varchar{Length: 20, Collation: "C"}},
+			{Name: "d", Type: ir.Integer{Width: 32}, Nullable: true},
+		}), ir.Insert{Position: kcgPos(1), Schema: db, Table: "ku", Row: ir.Row{"id": int64(2), "k": "a", "d": int64(2)}})
+		wantMerge(t, err, dsn, "ku", "id", before)
+	})
 	t.Run("accent-only pk merge", func(t *testing.T) {
 		db, dsn := cell("acc")
 		applyDDL(t, dsn, "CREATE TABLE kd (id INT NOT NULL, k VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL, d INT, PRIMARY KEY (k))")

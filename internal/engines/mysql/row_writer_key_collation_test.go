@@ -38,7 +38,7 @@ func TestPlanCopyKeyCollationGuard_ArmsThePostgresDefaultInsideThePrimaryKey(t *
 		{"postgres nondeterministic, primary key", pgNondet, []string{"k"}, nil, false, true},
 		{"postgres nondeterministic, unique with no primary key", pgNondet, nil, [][]string{{"k"}}, false, true},
 		{"postgres nondeterministic, unique beside a primary key", pgNondet, []string{"id"}, [][]string{{"k"}}, true, true},
-		{"postgres named, determinism unknown (a pre-v0.159.0 manifest), primary key", pgUnknown, []string{"k"}, nil, false, true},
+		{"postgres named, determinism unknown (a pre-v0.159.0 manifest), primary key", pgUnknown, []string{"k"}, nil, true, true},
 		{"postgres named, determinism unknown, unique beside a primary key", pgUnknown, []string{"id"}, [][]string{{"k"}}, true, true},
 		{"_bin, primary key", bin, []string{"k"}, nil, true, true},
 		{"_bin, no key on the column", bin, []string{"id"}, nil, false, false},
@@ -140,7 +140,7 @@ func TestCopyKeyCollationMergeRefusal_NeedsTheGuardAndTheMarker(t *testing.T) {
 	if !errors.As(err, &kce) || !errors.Is(err, ir.ErrKeyCollationMerge) {
 		t.Fatalf("the guard's raise was not attributed: %v", err)
 	}
-	if !strings.Contains(err.Error(), "two rows of the source the copy is reading") {
+	if !strings.Contains(err.Error(), "different rows of the source") {
 		t.Errorf("the remedy is not the copy's: %v", err)
 	}
 	if errors.Is(copyKeyCollationMergeRefusal(raise, copyKeyCollationGuard{}, "kd"), ir.ErrKeyCollationMerge) {
@@ -180,13 +180,15 @@ func TestCopyKeyCollationMergeRemedy_NamesTheCollationTheKeyNeeds(t *testing.T) 
 			"postgres deterministic key (bytes)",
 			planCopyKeyCollationGuard(source(ir.Varchar{Length: 20, Collation: "C", Determinism: ir.CollationDeterministic}), mysqlCI, targetUniqueKeys{pk: []string{"k"}, uniques: nil}, mysqlKeyGuardCollations),
 			[]string{"`k` a binary collation (for example COLLATE utf8mb4_bin)", "resume the copy", "rather than recreating the table"},
-			[]string{"as the source declares", "the source's collation", "COLLATE C"},
+			[]string{"as the source declares", "the source's collation", "COLLATE C", "re-copy the table from scratch"},
 		},
 		{
 			"postgres nondeterministic key (bytes)",
 			planCopyKeyCollationGuard(source(ir.Varchar{Length: 20, Collation: "l2", Determinism: ir.CollationNonDeterministic}), mysqlCI, targetUniqueKeys{pk: []string{"k"}, uniques: nil}, mysqlKeyGuardCollations),
-			[]string{"`k` a binary collation", "resume the copy"},
-			[]string{"as the source declares", "the source's collation", "COLLATE l2"},
+			// Review #2 finding 4: the pair may be one the source equates (a stale
+			// row), where a re-copy from scratch converges and a resume repeats.
+			[]string{"`k` a binary collation", "re-copy the table from scratch", "resuming repeats this refusal", "If the source keeps them apart"},
+			[]string{"as the source declares", "the source's collation", "COLLATE l2", "different rows of the source"},
 		},
 		{
 			"postgres default key (bytes)",

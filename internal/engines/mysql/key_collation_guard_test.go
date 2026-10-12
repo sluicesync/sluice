@@ -141,7 +141,7 @@ func TestPlanKeyCollationGuard(t *testing.T) {
 		// determinism no reader stamped (a manifest written before v0.159.0)
 		// arms as the nondeterministic case does — right for either kind.
 		{"Postgres named collation of unknown determinism, unique beside a primary key: armed as bytes", kcgSource(ir.Text{Size: ir.TextLong, Collation: "ci"}), kcgCols(ci), []string{"id"}, [][]string{{"k"}}, true, true, []int{1}, nil, ""},
-		{"Postgres named collation of unknown determinism, primary key: not armed at apply", kcgSource(ir.Text{Size: ir.TextLong, Collation: "C"}), kcgCols(ci), []string{"k"}, nil, false, false, nil, nil, ""},
+		{"Postgres named collation of unknown determinism, primary key: armed at apply too (review #2 finding 3)", kcgSource(ir.Text{Size: ir.TextLong, Collation: "C"}), kcgCols(ci), []string{"k"}, nil, true, true, []int{1}, nil, ""},
 		{"Postgres default collation of unknown determinism: not armed (indistinguishable from VStream)", kcgSource(ir.Text{Size: ir.TextLong}), kcgCols(ci), []string{"id"}, [][]string{{"k"}}, false, false, nil, nil, ""},
 	}
 	for _, tc := range cases {

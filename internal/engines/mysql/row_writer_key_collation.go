@@ -326,19 +326,58 @@ func copyKeyCollationMergeRefusal(err error, guard copyKeyCollationGuard, table 
 // target key needs ([keyCollationNeeds] — the applier's remedy computes the
 // same list). It never says "the source's collation": a Postgres source's
 // cannot be declared on MySQL, and a MySQL 8 source's 0900 name does not
-// exist on MariaDB 10.11 (review 2026-10-12, finding 2). For a byte-armed
-// key it says to resume the copy, not recreate the table: sluice creates
-// that key under the target's default collation, which equates the values,
-// so `--restart-from-scratch` would meet the same pair again.
+// exist on MariaDB 10.11 (review 2026-10-12, finding 2).
+//
+// What converges depends on what the two values are to the SOURCE:
+//
+//   - a key the source compares exactly (a MySQL-family collation, or a
+//     deterministic Postgres one compared as bytes): the two are different
+//     source rows — both in the snapshot, or one the source has since
+//     replaced — and the target key must tell them apart. For a byte-armed
+//     key it says to resume the copy, not recreate the table: sluice creates
+//     that key under the target's default collation, which equates the
+//     values, so a re-copy from scratch meets the same pair again;
+//   - a NONDETERMINISTIC key (review 2026-10-12 #2, finding 4): the byte
+//     comparison is stricter than the source's, so the pair may be one the
+//     source equates — a row whose key the source changed between this
+//     copy's attempts (a resumed copy of a live source, add-table or a
+//     restore over rows already there), where the target holds a stale row;
+//     a re-copy from scratch converges there and a resume repeats the
+//     refusal. Or it is a pair the source keeps apart ('e'/'é' at level 2),
+//     where the target key has to tell them apart as above. The text names
+//     both, since only the operator can compare under the source's collation.
 func copyKeyCollationMergeRemedy(plan *keyCollationPlan, schema, table string) string {
 	collations, recopyAligns := keyCollationNeeds(plan)
 	alter := fmt.Sprintf("`ALTER TABLE %s.%s MODIFY <column> …` with %s", quoteIdent(schema), quoteIdent(table), collations)
-	lead := "These are two rows of the source the copy is reading, and the target table cannot hold both. " +
-		"Give the target's key column(s) " + collations + " (" + alter + ")"
+	give := "give the target's key column(s) " + collations + " (" + alter + ")"
+	if keyCollationPlanNondet(plan) {
+		return "The two key values are equal under the target's collation and differ byte for byte, and the source compares this " +
+			"key under a nondeterministic collation, so compare them under it. If the source equates them, the target holds a " +
+			"stale row whose key the source changed between this copy's attempts: re-copy the table from scratch " +
+			"(a fresh `migrate`, or `--restart-from-scratch` for a sync), which converges — resuming repeats this " +
+			"refusal. If the source keeps them apart, they are two source rows the target key cannot hold under its " +
+			"default collation: " + give + " and resume the copy rather than recreating the table, since sluice " +
+			"recreates that key under the default. Or exclude the table"
+	}
+	lead := "These are two different rows of the source (both in what the copy read, or one the source has since " +
+		"replaced), and the target table cannot hold both. G" + give[1:]
 	if recopyAligns {
 		return lead + " and run the copy again, or exclude the table"
 	}
 	return lead + " and resume the copy (for `migrate`, `--resume`) rather than recreating the table: " +
 		"sluice creates that key under the target's default collation, which equates the " +
 		"values, so a re-copy from scratch meets the same pair. Or exclude the table"
+}
+
+// keyCollationPlanNondet reports whether any armed KEY column compares a
+// nondeterministic (or possibly nondeterministic) source collation as bytes.
+func keyCollationPlanNondet(plan *keyCollationPlan) bool {
+	for _, key := range plan.keys {
+		for _, c := range key {
+			if ac, ok := plan.armed[c]; ok && ac.nondet {
+				return true
+			}
+		}
+	}
+	return false
 }
