@@ -293,3 +293,29 @@ func TestReportLoadDataWarnings_ReplayShortfallBeyondDuplicatesRefuses(t *testin
 		}
 	})
 }
+
+// TestReplayMaySkipRows pins when the LOAD DATA replay consults the
+// key-collation replay gate (review 2026-10-12 finding 3b): only when the
+// replay's own numbers leave room for a duplicate-key skip. A replay that
+// inserted every row with no duplicate warning — its warnings a relaxed-mode
+// clamp — skipped nothing and must not refuse KEY-COLLATION-REPLAY-AMBIGUOUS.
+func TestReplayMaySkipRows(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name        string
+		segRows     int
+		inserted    int64
+		visibleDups int
+		want        bool
+	}{
+		{"every row inserted, no duplicate warning (a clamp only)", 3, 3, 0, false},
+		{"rows short of the segment", 3, 2, 0, true},
+		{"a duplicate warning though the count says all landed", 3, 3, 1, true},
+		{"nothing inserted: a full lost-ack replay", 3, 0, 3, true},
+		{"rows-inserted unknown", 3, -1, 0, true},
+	} {
+		if got := replayMaySkipRows(tc.segRows, tc.inserted, tc.visibleDups); got != tc.want {
+			t.Errorf("%s: replayMaySkipRows(%d, %d, %d) = %v; want %v", tc.name, tc.segRows, tc.inserted, tc.visibleDups, got, tc.want)
+		}
+	}
+}

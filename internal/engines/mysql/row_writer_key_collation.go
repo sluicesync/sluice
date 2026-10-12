@@ -47,10 +47,12 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 )
 
-// keyCollationReplayAmbiguousMarker names the plain cores' refusal to treat
-// a retried batch's duplicate key as its own already-landed rows on a table
-// whose target key equates keys the source keeps apart
-// ([RowWriter.refuseAmbiguousReplay]).
+// keyCollationReplayAmbiguousMarker names the LOAD DATA core's refusal to
+// treat a replayed segment's duplicate-key skips as its own already-landed
+// rows on a table whose target key equates keys the source keeps apart
+// ([RowWriter.refuseAmbiguousReplay]). The batched core no longer raises it
+// for a retry: it re-sends the batch as the guarded upsert instead
+// ([RowWriter.replayArmedBatchAsGuardedUpsert]).
 const keyCollationReplayAmbiguousMarker = "KEY-COLLATION-REPLAY-AMBIGUOUS"
 
 // copyKeyCollationGuard is one table's guard, rendered once: the update
@@ -150,19 +152,64 @@ func (w *RowWriter) resolveCopyKeyCollationGuard(ctx context.Context, q queryRow
 	return copyKeyCollationGuard{plan: plan, schema: schema, assign: assign, hang: hang}, nil
 }
 
-// refuseAmbiguousReplay is the plain cores' half of the guard. Their retry
-// arms treat a duplicate key on a re-sent batch as the batch's own rows,
-// landed by an attempt whose ack was lost: the batched core tolerates the
-// retry's 1062 (ADR-0108), LOAD DATA counts the replay's duplicate-key
-// skips as re-sent rows. Both arguments hold only when the target key
-// compares as the source's does — on an armed table the duplicate may be a
-// second source row the target equates with a first, and accepting it drops
-// that row at exit 0 (measured: the whole batch, on the batched core). So on
-// an armed table the arm refuses instead. The cost is stated: a genuine
-// lost-ack replay on an armed table refuses too, loudly, where it would have
-// converged; a fresh run's first attempt then reports any real merge as a
-// duplicate key. nil on an unarmed table. Called only on the retry arm, never
-// on the hot path.
+// replayArmedBatchAsGuardedUpsert is the batched core's half of the guard.
+// Its retry arm treats a duplicate key on a re-sent batch as the batch's
+// own rows, landed by an attempt whose ack was lost (ADR-0108). That holds
+// only when the target key compares as the source's does — on an armed
+// table the duplicate may be a second source row the target equates with a
+// first, and accepting it dropped the whole batch at exit 0 (measured).
+//
+// On an armed table the batch is therefore re-sent as the idempotent
+// writer's GUARDED upsert ([buildBatchUpsert] with the copy guard), which
+// tells the two apart exactly: a row matching one already landed with the
+// same key under the source's collation is the batch's own and the upsert
+// rewrites it with identical values; a match the source's collation keeps
+// apart raises KEY-COLLATION-MERGE and rolls the statement back. So a
+// genuine lost-ack replay converges — nearly every Postgres → MySQL
+// character-keyed table is armed, and refusing every ADR-0108 reparent or
+// storage-grow retry there would have been a loud wedge on a working
+// configuration (review 2026-10-12, finding 3a) — and only a real merge
+// refuses. The upsert also re-sends any row an interrupted attempt did not
+// land, so unlike the 1062 tolerance it does not rest on the batch having
+// been atomic (the SDL-1 premise [verifyTransactionalTolerance] checks).
+//
+// armed is false on an unarmed table, where the caller keeps the ADR-0108
+// tolerance unchanged. A table with no upsert key cannot take the upsert;
+// it never reaches a retry (flushWithReparentRetry refuses a keyless
+// table), and if it did it refuses KEY-COLLATION-REPLAY-AMBIGUOUS rather
+// than guess. Called only on the retry arm, never on the hot path.
+func (w *RowWriter) replayArmedBatchAsGuardedUpsert(ctx context.Context, c *sql.Conn, table *ir.Table, rowCount int, args []any) (armed bool, err error) {
+	guard, err := w.copyKeyCollationGuardFor(ctx, c, table)
+	if err != nil {
+		return true, err
+	}
+	if guard.plan == nil {
+		return false, nil
+	}
+	keyCols, ok := effectiveUpsertKeyColumns(table)
+	if !ok {
+		return true, w.refuseAmbiguousReplay(ctx, c, table)
+	}
+	if _, err := c.ExecContext(ctx, buildBatchUpsert(table, rowCount, keyCols, w.upsert, guard), args...); err != nil {
+		return true, copyKeyCollationMergeRefusal(err, guard, table.Name)
+	}
+	return true, nil
+}
+
+// refuseAmbiguousReplay is the LOAD DATA core's half of the guard. Its
+// replay counts duplicate-key skips as re-sent rows, landed by an attempt
+// whose ack was lost; on an armed table a skip may instead be a second
+// source row the target equates with a first, and accepting it drops that
+// row at exit 0 (measured). LOAD DATA has no upsert form to re-send the
+// segment through, so a replay that SKIPPED rows on an armed table refuses
+// instead ([RowWriter.reportLoadDataWarnings] consults it only when the
+// replay's own numbers show a skip — rows inserted short of the segment, or
+// a duplicate-key warning; a replay whose warnings are all something else
+// skipped nothing and is not ambiguous). The cost is stated: a genuine
+// lost-ack replay on an armed table refuses too, loudly, where it would
+// have converged; a fresh run's first attempt then reports any real merge
+// as a duplicate key. nil on an unarmed table. Called only on the retry
+// arm, never on the hot path.
 func (w *RowWriter) refuseAmbiguousReplay(ctx context.Context, q queryRower, table *ir.Table) error {
 	guard, err := w.copyKeyCollationGuardFor(ctx, q, table)
 	if err != nil {
@@ -171,12 +218,13 @@ func (w *RowWriter) refuseAmbiguousReplay(ctx context.Context, q queryRower, tab
 	if guard.plan == nil {
 		return nil
 	}
+	need, _ := keyCollationNeeds(guard.plan)
 	return fmt.Errorf("%s: mysql: copy into %s.%s: a batch re-sent after a transient met a duplicate key. sluice "+
 		"accepts that as the batch's own rows landed by the lost attempt only where the target's key compares as "+
 		"the source's does; here the target's collation equates keys the source keeps apart, so the duplicate may "+
 		"be two source rows merging, and accepting it would drop one. Refusing rather than guessing; run the copy "+
-		"again (a first attempt reports a genuine collision as a duplicate key), or give the target key the "+
-		"source's collation", keyCollationReplayAmbiguousMarker, quoteIdent(guard.schema), quoteIdent(table.Name))
+		"again (a first attempt reports a genuine collision as a duplicate key), or give the target's key column(s) %s",
+		keyCollationReplayAmbiguousMarker, quoteIdent(guard.schema), quoteIdent(table.Name), need)
 }
 
 // targetColumnCollations reads the target table's character columns as the

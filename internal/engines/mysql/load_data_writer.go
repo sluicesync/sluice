@@ -547,10 +547,13 @@ func (w *RowWriter) decideBulkWriteWarnings(ctx context.Context, table string, s
 // TestLoadDataLocal_TruncationHidesBehindDuplicateWarnings.
 //
 // replayGate is non-nil exactly on a replay: before any of the replay's
-// warnings are tolerated it must agree that a duplicate here can only be the
-// segment's own row ([RowWriter.refuseAmbiguousReplay], KEY-COLLATION-ROWWRITER).
-// It is consulted only when the server warned, because a skipped row always
-// carries a warning — a replay with none has nothing to tolerate.
+// duplicate-key skips are tolerated it must agree that a duplicate here can
+// only be the segment's own row ([RowWriter.refuseAmbiguousReplay],
+// KEY-COLLATION-ROWWRITER). It is consulted only when the replay may have
+// skipped a row ([replayMaySkipRows]) — a replay that inserted every row of
+// the segment, with no duplicate-key warning, has no duplicate to be
+// ambiguous about, whatever else it warned (review 2026-10-12 finding 3b:
+// gating on any warning refused a clean replay over a relaxed-mode clamp).
 func (w *RowWriter) reportLoadDataWarnings(ctx context.Context, conn *sql.Conn, table string, segRows int, inserted int64, replayGate func() error) error {
 	replay := replayGate != nil
 	sw, err := readShowWarnings(ctx, conn, table)
@@ -565,7 +568,7 @@ func (w *RowWriter) reportLoadDataWarnings(ctx context.Context, conn *sql.Conn, 
 	// than failing a clean write.
 	total, terr := readTrueWarningCount(ctx, conn)
 	warned := (terr == nil && total > 0) || (terr != nil && sw.Visible > 0)
-	if replay && warned {
+	if replay && warned && replayMaySkipRows(segRows, inserted, sw.Visible-sw.NonDup) {
 		if err := replayGate(); err != nil {
 			return err
 		}
@@ -627,6 +630,17 @@ func (w *RowWriter) reportLoadDataWarnings(ctx context.Context, conn *sql.Conn, 
 		slog.Int64("duplicates_skipped", int64(segRows)-inserted),
 	)
 	return nil
+}
+
+// replayMaySkipRows reports whether a replayed segment's own numbers leave
+// room for a duplicate-key skip — the only thing the key-collation replay
+// gate can be ambiguous about. Evidence of a skip is the server's
+// rows-inserted short of the rows sent (the independent number), or any
+// visible duplicate-key warning; an unknown rows-inserted (-1) proves
+// nothing, so it counts as possible. Pure, unit-pinned by
+// TestReplayMaySkipRows.
+func replayMaySkipRows(segRows int, inserted int64, visibleDups int) bool {
+	return inserted < 0 || inserted < int64(segRows) || visibleDups > 0
 }
 
 // unexplainedShortfall is the dropped-row count the shortfall witness

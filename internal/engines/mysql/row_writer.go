@@ -691,11 +691,18 @@ func (w *RowWriter) writeBatchedConn(ctx context.Context, conn *sql.Conn, table 
 				// And the collision must be with the batch's OWN rows, which
 				// holds only where the target key compares as the source's
 				// does: on an armed table it can be a merge of two source
-				// rows (KEY-COLLATION-ROWWRITER, [RowWriter.refuseAmbiguousReplay]).
-				if isRetry && isMySQLDupKey(err) {
-					if kcErr := w.refuseAmbiguousReplay(ctx, c, table); kcErr != nil {
-						return fmt.Errorf("mysql: insert into %q (%d rows): %w", table.Name, len(batch.rows), kcErr)
-					}
+				// rows, so there the batch is re-sent as the guarded upsert,
+				// which tells the two apart, and falls through to the warning
+				// probe (KEY-COLLATION-ROWWRITER,
+				// [RowWriter.replayArmedBatchAsGuardedUpsert]).
+				if !isRetry || !isMySQLDupKey(err) {
+					return fmt.Errorf("mysql: insert into %q (%d rows): %w", table.Name, len(batch.rows), err)
+				}
+				armed, kcErr := w.replayArmedBatchAsGuardedUpsert(ctx, c, table, len(batch.rows), args)
+				if kcErr != nil {
+					return fmt.Errorf("mysql: insert into %q (%d rows): %w", table.Name, len(batch.rows), kcErr)
+				}
+				if !armed {
 					if engErr := verifyTransactionalTolerance(ctx, c, table.Name); engErr != nil {
 						return fmt.Errorf("mysql: insert into %q (%d rows): %w", table.Name, len(batch.rows), engErr)
 					}
@@ -708,7 +715,13 @@ func (w *RowWriter) writeBatchedConn(ctx context.Context, conn *sql.Conn, table 
 					)
 					return nil
 				}
-				return fmt.Errorf("mysql: insert into %q (%d rows): %w", table.Name, len(batch.rows), err)
+				slog.WarnContext(
+					ctx, "mysql: cold-copy plain INSERT retry collided with a duplicate key (Error 1062) on a table whose "+
+						"target key collation differs from the source's; re-sent the batch as the key-collation-guarded "+
+						"upsert, which matched only the batch's own already-landed rows",
+					slog.String("table", table.Name),
+					slog.Int("rows", len(batch.rows)),
+				)
 			}
 			if batchedInsertFailHookForTest != nil {
 				if injected := batchedInsertFailHookForTest(isRetry, true); injected != nil {

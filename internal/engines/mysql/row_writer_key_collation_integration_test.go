@@ -275,8 +275,17 @@ func krwRunServer(t *testing.T, srv kcgServer, core krwCore) {
 // collision is with this batch's own rows. On an armed table it can be a
 // merge: measured 2026-10-12, a transient before the first attempt then
 // 'A' and 'a' in the retried batch dropped the batch (batched) or 'a'
-// (LOAD DATA) at exit 0. Armed, the retry arm now refuses
-// KEY-COLLATION-REPLAY-AMBIGUOUS.
+// (LOAD DATA) at exit 0.
+//
+// Since review 2026-10-12 finding 3 the two cores answer differently:
+//   - batched: the retried batch is re-sent as the GUARDED upsert, so a
+//     genuine lost-ack replay on an armed table CONVERGES (own rows) and
+//     only a real merge refuses, as KEY-COLLATION-MERGE;
+//   - LOAD DATA (no upsert form): a replay that skipped rows on an armed
+//     table refuses KEY-COLLATION-REPLAY-AMBIGUOUS, the lost-ack replay
+//     included (the stated residual); a replay whose only warnings are not
+//     duplicate-key skips (a relaxed-mode clamp, every row inserted) does
+//     NOT refuse.
 //
 // The independent expected value is the target's rows against the source's.
 func TestRowWriterKeyCollationGuard_PlainCoresWithholdTheReplayTolerance(t *testing.T) {
@@ -290,85 +299,117 @@ func TestRowWriterKeyCollationGuard_PlainCoresWithholdTheReplayTolerance(t *test
 
 	// inject fails the FIRST attempt with a classified transient, before its
 	// statement ran (rolled back) or after it committed (the lost ack).
-	cores := []struct {
+	type core struct {
 		name   string
 		bulk   ir.BulkLoadMethod
 		inject func(afterExec bool) func()
-	}{
-		{"batched-insert", ir.BulkLoadBatchedInsert, func(afterExec bool) func() {
-			batchedInsertFailHookForTest = func(isRetry, executed bool) error {
-				if isRetry || executed != afterExec {
-					return nil
-				}
-				return vttabletUnavailable()
-			}
-			return func() { batchedInsertFailHookForTest = nil }
-		}},
-		{"load-data", ir.BulkLoadLoadDataInfile, func(afterExec bool) func() {
-			want := loadDataBeforeExec
-			if afterExec {
-				want = loadDataAfterExec
-			}
-			loadDataSegmentFailHookForTest = func(_ int, replay bool, phase loadDataSegmentPhase) error {
-				if replay || phase != want {
-					return nil
-				}
-				return vttabletUnavailable()
-			}
-			return func() { loadDataSegmentFailHookForTest = nil }
-		}},
 	}
-	source := []ir.Row{{"id": int64(1), "k": "A", "d": int64(1)}, {"id": int64(2), "k": "a", "d": int64(2)}, {"id": int64(3), "k": "b", "d": int64(3)}}
-	for _, core := range cores {
-		for _, armed := range []bool{true, false} {
-			core, armed := core, armed
-			name := core.name + "/armed"
-			if !armed {
-				name = core.name + "/unarmed (the tolerance still converges)"
+	batched := core{"batched-insert", ir.BulkLoadBatchedInsert, func(afterExec bool) func() {
+		batchedInsertFailHookForTest = func(isRetry, executed bool) error {
+			if isRetry || executed != afterExec {
+				return nil
 			}
-			t.Run(name, func(t *testing.T) {
-				srcColl, rows := "utf8mb4_bin", source
-				if !armed {
-					// An unarmed table cannot hold the pair at all; it is a
-					// genuine lost-ack replay of distinct keys.
-					srcColl, rows = "utf8mb4_general_ci", []ir.Row{source[0], source[2]}
+			return vttabletUnavailable()
+		}
+		return func() { batchedInsertFailHookForTest = nil }
+	}}
+	loadData := core{"load-data", ir.BulkLoadLoadDataInfile, func(afterExec bool) func() {
+		want := loadDataBeforeExec
+		if afterExec {
+			want = loadDataAfterExec
+		}
+		loadDataSegmentFailHookForTest = func(_ int, replay bool, phase loadDataSegmentPhase) error {
+			if replay || phase != want {
+				return nil
+			}
+			return vttabletUnavailable()
+		}
+		return func() { loadDataSegmentFailHookForTest = nil }
+	}}
+	pair := []ir.Row{{"id": int64(1), "k": "A", "d": int64(1)}, {"id": int64(2), "k": "a", "d": int64(2)}, {"id": int64(3), "k": "b", "d": int64(3)}}
+	distinct := []ir.Row{pair[0], pair[2]}
+	const (
+		converges  = ""
+		bin, ci    = "utf8mb4_bin", "utf8mb4_general_ci"
+		relaxedRun = "relaxed"
+	)
+	cells := []struct {
+		name      string
+		core      core
+		srcColl   string // ci: unarmed
+		rows      []ir.Row
+		afterExec bool   // the lost ack (true) or a rolled-back first attempt
+		want      string // the refusal marker, or converges
+		mode      string // relaxedRun: --mysql-sql-mode='' and a clamping value
+	}{
+		{"batched/armed merge (rolled back, 'A' and 'a' in the retry)", batched, bin, pair, false, keyCollationMergeMarker, ""},
+		{"batched/armed own rows (lost ack) converges", batched, bin, distinct, true, converges, ""},
+		{"batched/unarmed own rows (lost ack) converges", batched, ci, distinct, true, converges, ""},
+		{"load-data/armed merge (rolled back, 'A' and 'a' in the replay)", loadData, bin, pair, false, keyCollationReplayAmbiguousMarker, ""},
+		{"load-data/armed own rows (lost ack): ambiguous, refuses", loadData, bin, distinct, true, keyCollationReplayAmbiguousMarker, ""},
+		{"load-data/unarmed own rows (lost ack) converges", loadData, ci, distinct, true, converges, ""},
+		{"load-data/armed replay whose only warning is a clamp converges", loadData, bin, distinct, false, converges, relaxedRun},
+	}
+	for _, cell := range cells {
+		t.Run(cell.name, func(t *testing.T) {
+			applyDDL(t, dsn, "DROP TABLE IF EXISTS pr; CREATE TABLE pr (id INT NOT NULL, k VARCHAR(20) CHARACTER SET utf8mb4 "+
+				"COLLATE utf8mb4_general_ci NOT NULL PRIMARY KEY, d INT, c TINYINT) ENGINE=InnoDB")
+			tbl := &ir.Table{Name: "pr", Columns: []*ir.Column{
+				{Name: "id", Type: ir.Integer{Width: 32}},
+				{Name: "k", Type: kcgVarchar(cell.srcColl)},
+				{Name: "d", Type: ir.Integer{Width: 32}, Nullable: true},
+				{Name: "c", Type: ir.Integer{Width: 8}, Nullable: true},
+			}, PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "k"}}}}
+			rows := make([]ir.Row, len(cell.rows))
+			for i, r := range cell.rows {
+				rows[i] = ir.Row{"id": r["id"], "k": r["k"], "d": r["d"], "c": int64(1)}
+				if cell.mode == relaxedRun && i == 0 {
+					rows[i]["c"] = int64(300) // clamps to 127 under a relaxed sql_mode: a non-duplicate warning
 				}
-				applyDDL(t, dsn, "DROP TABLE IF EXISTS pr; CREATE TABLE pr (id INT NOT NULL, k VARCHAR(20) CHARACTER SET utf8mb4 "+
-					"COLLATE utf8mb4_general_ci NOT NULL PRIMARY KEY, d INT) ENGINE=InnoDB")
-				tbl := &ir.Table{Name: "pr", Columns: []*ir.Column{
-					{Name: "id", Type: ir.Integer{Width: 32}},
-					{Name: "k", Type: kcgVarchar(srcColl)},
-					{Name: "d", Type: ir.Integer{Width: 32}, Nullable: true},
-				}, PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "k"}}}}
-				// Armed: the first attempt rolled back, so the retry's
-				// collision can only be the merge. Unarmed: it committed and
-				// lost its ack, so the retry collides with its own rows.
-				defer core.inject(!armed)()
+			}
+			defer cell.core.inject(cell.afterExec)()
 
+			var w *RowWriter
+			if cell.mode == relaxedRun {
+				relaxed := ""
+				db, err := openDB(ctx, mustParseDSN(t, dsn), &relaxed)
+				if err != nil {
+					t.Fatalf("openDB: %v", err)
+				}
+				defer func() { _ = db.Close() }()
+				w = &RowWriter{db: db, sqlMode: &relaxed}
+			} else {
 				rw, err := Engine{}.OpenRowWriter(ctx, dsn)
 				if err != nil {
 					t.Fatalf("OpenRowWriter: %v", err)
 				}
-				w := rw.(*RowWriter)
+				w = rw.(*RowWriter)
 				defer func() { _ = w.Close() }()
-				w.bulkLoad = core.bulk
-				ch := make(chan ir.Row, len(rows))
-				for _, r := range rows {
-					ch <- r
+			}
+			w.bulkLoad = cell.core.bulk
+			ch := make(chan ir.Row, len(rows))
+			for _, r := range rows {
+				ch <- r
+			}
+			close(ch)
+			err := w.WriteRows(ctx, tbl, ch)
+			got := kcgRows(t, dsn, "pr", "id")
+			if cell.want == converges {
+				if err != nil || got != "1:41,3:62" {
+					t.Fatalf("the retry did not converge: err=%v target=%s (want 1:41,3:62)", err, got)
 				}
-				close(ch)
-				err = w.WriteRows(ctx, tbl, ch)
-				got := kcgRows(t, dsn, "pr", "id")
-				if !armed {
-					if err != nil || got != "1:41,3:62" {
-						t.Fatalf("an unarmed retry no longer converges: err=%v target=%s", err, got)
-					}
-					return
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), cell.want) {
+				t.Fatalf("err = %v; want %s (the target holds %q, the source %d rows)", err, cell.want, got, len(rows))
+			}
+			// A refusal leaves no merged row: nothing on the target holds a
+			// source row's key with another row's id.
+			for _, r := range strings.Split(got, ",") {
+				if r != "" && r != "1:41" && r != "3:62" && r != "2:61" {
+					t.Fatalf("the target holds %s, which is no source row (target %s)", r, got)
 				}
-				if err == nil || !strings.Contains(err.Error(), keyCollationReplayAmbiguousMarker) {
-					t.Fatalf("err = %v; want %s (the target holds %q, the source three rows)", err, keyCollationReplayAmbiguousMarker, got)
-				}
-			})
-		}
+			}
+		})
 	}
 }
