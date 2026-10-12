@@ -129,6 +129,12 @@ func (w *RowWriter) WriteRowsIdempotentParallel(ctx context.Context, table *ir.T
 	if !ok {
 		return errKeylessIdempotent(table)
 	}
+	// KEY-COLLATION-ROWWRITER: resolved once, before any worker writes, so
+	// a table the guard cannot be written for refuses with nothing landed.
+	guard, err := w.copyKeyCollationGuardOwnConn(ctx, table)
+	if err != nil {
+		return err
+	}
 
 	// A single worker is just the serial core — no fan-out machinery
 	// needed (and the pipeline only calls this with len==1 on the
@@ -142,7 +148,7 @@ func (w *RowWriter) WriteRowsIdempotentParallel(ctx context.Context, table *ir.T
 			return fmt.Errorf("mysql: idempotent insert into %q: pin connection: %w", table.Name, err)
 		}
 		defer func() { _ = conn.Close() }()
-		return w.writeBatchedIdempotentConn(ctx, conn, table, keyCols, workers[0], false)
+		return w.writeBatchedIdempotentConn(ctx, conn, table, keyCols, guard, workers[0], false)
 	}
 
 	// Shared child ctx: the first worker error cancels it so peers (and
@@ -169,7 +175,7 @@ func (w *RowWriter) WriteRowsIdempotentParallel(ctx context.Context, table *ir.T
 			defer func() { _ = conn.Close() }()
 			// reportDurable=false — fan-out workers must not advance the
 			// mid-COPY durable watermark (see the doc comment above).
-			if err := w.writeBatchedIdempotentConn(workerCtx, conn, table, keyCols, rows, false); err != nil {
+			if err := w.writeBatchedIdempotentConn(workerCtx, conn, table, keyCols, guard, rows, false); err != nil {
 				errOnce.Do(func() { firstEr = err })
 				cancel()
 			}
@@ -289,7 +295,6 @@ func (w *RowWriter) writeBatchedIdempotent(ctx context.Context, table *ir.Table,
 	if !ok {
 		return errKeylessIdempotent(table)
 	}
-
 	// Pin a single connection for the whole write so the per-flush Vector
 	// B warning check (reportBulkWriteWarnings) reads SHOW WARNINGS on the
 	// SAME session that ran the upsert — session-scoped, like writeBatched.
@@ -302,10 +307,16 @@ func (w *RowWriter) writeBatchedIdempotent(ctx context.Context, table *ir.Table,
 		return fmt.Errorf("mysql: idempotent insert into %q: pin connection: %w", table.Name, err)
 	}
 	defer func() { _ = conn.Close() }()
+	// KEY-COLLATION-ROWWRITER (row_writer_key_collation.go), read on the
+	// pinned connection before the first flush.
+	guard, err := w.copyKeyCollationGuardFor(ctx, conn, table)
+	if err != nil {
+		return err
+	}
 	// reportDurable=true — the serial path is a single FIFO stream, so the
 	// mid-COPY durable watermark (ADR-0072 Phase B) is order-equivalent and
 	// safe to advance per flush.
-	return w.writeBatchedIdempotentConn(ctx, conn, table, keyCols, rows, true)
+	return w.writeBatchedIdempotentConn(ctx, conn, table, keyCols, guard, rows, true)
 }
 
 // writeBatchedIdempotentConn is the per-connection idempotent batched
@@ -330,7 +341,7 @@ func (w *RowWriter) writeBatchedIdempotent(ctx context.Context, table *ir.Table,
 // per-worker (defensible: a systematic clamp still trips every worker's
 // first-N exhaustive flushes and the final flush). No shared mutable
 // batch state crosses workers.
-func (w *RowWriter) writeBatchedIdempotentConn(ctx context.Context, conn *sql.Conn, table *ir.Table, keyCols []string, rows <-chan ir.Row, reportDurable bool) error {
+func (w *RowWriter) writeBatchedIdempotentConn(ctx context.Context, conn *sql.Conn, table *ir.Table, keyCols []string, guard copyKeyCollationGuard, rows <-chan ir.Row, reportDurable bool) error {
 	w.noteTierCPUBoundTarget(ctx)
 	batch := w.newInsertBatcher(table)
 
@@ -338,7 +349,7 @@ func (w *RowWriter) writeBatchedIdempotentConn(ctx context.Context, conn *sql.Co
 		if batch.empty() {
 			return nil
 		}
-		query := buildBatchUpsert(table, len(batch.rows), keyCols, w.upsert)
+		query := buildBatchUpsert(table, len(batch.rows), keyCols, w.upsert, guard)
 		args, err := flattenArgs(batch.rows, table)
 		if err != nil {
 			return fmt.Errorf("mysql: idempotent insert into %q: %w", table.Name, err)
@@ -368,6 +379,7 @@ func (w *RowWriter) writeBatchedIdempotentConn(ctx context.Context, conn *sql.Co
 		// TestColdCopyReparentRetry_UnsuppliedTargetKeyRefusesOnEveryCore.
 		if err := w.flushWithReparentRetry(ctx, table, len(batch.rows), func(c *sql.Conn, _ bool) error {
 			if _, err := c.ExecContext(ctx, query, args...); err != nil {
+				err = copyKeyCollationMergeRefusal(err, guard, table.Name)
 				return fmt.Errorf("mysql: idempotent insert into %q (%d rows): %w", table.Name, len(batch.rows), err)
 			}
 			// Vector B: strict sql_mode errors at the upsert above; under
@@ -437,7 +449,13 @@ func (w *RowWriter) writeBatchedIdempotentConn(ctx context.Context, conn *sql.Co
 // upsert selects the ON DUPLICATE KEY UPDATE spelling (roadmap item
 // 73: the MySQL 8.0.20+ row alias everywhere except mariadb, which
 // keeps the legacy VALUES() form).
-func buildBatchUpsert(table *ir.Table, rowCount int, keyCols []string, upsert upsertSpelling) string {
+//
+// guard, when armed, is the table's key-collation guard
+// (row_writer_key_collation.go): its assignment goes FIRST in the update
+// list — MySQL evaluates the list left to right on the row as updated so
+// far — and replaces the plain assignment of the column it assigns. An
+// unarmed guard renders the statement byte-identical to before.
+func buildBatchUpsert(table *ir.Table, rowCount int, keyCols []string, upsert upsertSpelling, guard copyKeyCollationGuard) string {
 	cols := nonGeneratedColumns(table.Columns)
 	colNames := make([]string, len(cols))
 	for i, c := range cols {
@@ -474,18 +492,22 @@ func buildBatchUpsert(table *ir.Table, rowCount int, keyCols []string, upsert up
 		nonKey = append(nonKey, c.Name)
 	}
 	sb.WriteString(upsert.clauseOpen())
-	if len(nonKey) == 0 {
+	parts := make([]string, 0, len(nonKey)+1)
+	if guard.plan != nil {
+		parts = append(parts, guard.assign)
+	}
+	for _, c := range nonKey {
+		if guard.plan != nil && c == guard.hang {
+			continue
+		}
+		parts = append(parts, quoteIdent(c)+" = "+upsert.newRowRef(quoteIdent(c)))
+	}
+	if len(parts) == 0 {
 		// Every column is a conflict-key column. Re-assign the first
 		// key column to itself so the statement parses; the conflict
-		// resolves to a no-op UPDATE which is the right semantic.
-		sb.WriteString(quoteIdent(keyCols[0]))
-		sb.WriteString(" = ")
-		sb.WriteString(upsert.newRowRef(quoteIdent(keyCols[0])))
-		return sb.String()
-	}
-	parts := make([]string, len(nonKey))
-	for i, c := range nonKey {
-		parts[i] = quoteIdent(c) + " = " + upsert.newRowRef(quoteIdent(c))
+		// resolves to a no-op UPDATE which is the right semantic. (With
+		// a guard, its own assignment stands in for this one.)
+		parts = append(parts, quoteIdent(keyCols[0])+" = "+upsert.newRowRef(quoteIdent(keyCols[0])))
 	}
 	sb.WriteString(strings.Join(parts, ", "))
 	return sb.String()

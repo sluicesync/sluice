@@ -242,7 +242,16 @@ func (w *RowWriter) flushLoadDataSegment(ctx context.Context, conn *sql.Conn, ta
 		// The only reliable closure is the post-load warning probe, and it
 		// runs on the conn this attempt used — every segment, never
 		// sampled, because on this path the warning IS the error.
-		return w.reportLoadDataWarnings(ctx, c, table.Name, seg.rows, inserted, isRetry)
+		var replayGate func() error
+		if isRetry {
+			replayGate = func() error {
+				if kcErr := w.refuseAmbiguousReplay(ctx, c, table); kcErr != nil {
+					return fmt.Errorf("mysql: LOAD DATA into %q (%d rows): %w", table.Name, seg.rows, kcErr)
+				}
+				return nil
+			}
+		}
+		return w.reportLoadDataWarnings(ctx, c, table.Name, seg.rows, inserted, replayGate)
 	}, conn); err != nil {
 		return err
 	}
@@ -536,7 +545,14 @@ func (w *RowWriter) decideBulkWriteWarnings(ctx context.Context, table string, s
 // single truncation warning can sit entirely outside the visible window.
 // That exact case is pinned in
 // TestLoadDataLocal_TruncationHidesBehindDuplicateWarnings.
-func (w *RowWriter) reportLoadDataWarnings(ctx context.Context, conn *sql.Conn, table string, segRows int, inserted int64, replay bool) error {
+//
+// replayGate is non-nil exactly on a replay: before any of the replay's
+// warnings are tolerated it must agree that a duplicate here can only be the
+// segment's own row ([RowWriter.refuseAmbiguousReplay], KEY-COLLATION-ROWWRITER).
+// It is consulted only when the server warned, because a skipped row always
+// carries a warning — a replay with none has nothing to tolerate.
+func (w *RowWriter) reportLoadDataWarnings(ctx context.Context, conn *sql.Conn, table string, segRows int, inserted int64, replayGate func() error) error {
+	replay := replayGate != nil
 	sw, err := readShowWarnings(ctx, conn, table)
 	if err != nil {
 		return err
@@ -549,6 +565,11 @@ func (w *RowWriter) reportLoadDataWarnings(ctx context.Context, conn *sql.Conn, 
 	// than failing a clean write.
 	total, terr := readTrueWarningCount(ctx, conn)
 	warned := (terr == nil && total > 0) || (terr != nil && sw.Visible > 0)
+	if replay && warned {
+		if err := replayGate(); err != nil {
+			return err
+		}
+	}
 	// The independent witness (the 2026-08-01 rule: name the number the
 	// check does not derive from the artifact it grades): the driver's
 	// rows-inserted against the rows sluice sent. A shortfall is a dropped

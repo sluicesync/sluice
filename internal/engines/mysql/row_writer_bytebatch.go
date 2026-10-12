@@ -62,6 +62,17 @@ const maxBulkInsertPlaceholders = 60000
 // package's other test seams (multiRowFlushHookForTest).
 var bulkFlushHookForTest func(rows int, bytes int64)
 
+// batchedInsertFailHookForTest, when non-nil, is consulted by the plain
+// batched core ([RowWriter.writeBatchedConn]) before each attempt's INSERT
+// (executed=false) and after it succeeded (executed=true — the
+// committed-but-unacked shape); a non-nil return is treated exactly like the
+// INSERT's own error. It is the batched twin of
+// loadDataSegmentFailHookForTest: a pin injects a classified transient on a
+// first attempt to drive the retry arm (the tolerate-1062-on-retry wart)
+// against a real server. Production leaves it nil; same set-then-reset
+// discipline as bulkFlushHookForTest.
+var batchedInsertFailHookForTest func(isRetry, executed bool) error
+
 // insertBatcher accumulates the pending rows for ONE multi-row INSERT /
 // upsert statement and owns the flush decision for the batched bulk
 // paths (ADR-0150). It is a pure accumulator — the callers own the SQL

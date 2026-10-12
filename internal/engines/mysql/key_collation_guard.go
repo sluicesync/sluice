@@ -147,6 +147,23 @@ func planKeyCollationGuard(source *ir.Table, colTypes map[string]*ir.Column, pk 
 			delete(armed, col) // the identity key itself: not covered, see uniqueOnly
 		}
 	}
+	return planFromArmed(armed, pk, uniques)
+}
+
+// planCopyKeyCollationGuard is [planKeyCollationGuard] for the idempotent
+// copy writer (KEY-COLLATION-ROWWRITER). It differs in one rule: a Postgres
+// default-collation column is armed in the primary key too. The applier
+// leaves that one unarmed because a re-delivered case-only change of the
+// identity key would wedge it; a copy re-sends only rows of a snapshot,
+// never a change of a key, so the case cannot arise, and without the guard
+// two source keys 'A' and 'a' on a `_ci` target key are one row at exit 0.
+func planCopyKeyCollationGuard(source *ir.Table, colTypes map[string]*ir.Column, pk []string, uniques [][]string, compareAs map[string]string) *keyCollationPlan {
+	return planFromArmed(armedColumns(source, colTypes, compareAs), pk, uniques)
+}
+
+// planFromArmed is the guard over the armed columns: every unique key (the
+// primary key first) holding one, and the marker. nil when no key does.
+func planFromArmed(armed map[string]armedCollation, pk []string, uniques [][]string) *keyCollationPlan {
 	if len(armed) == 0 {
 		return nil
 	}
@@ -256,6 +273,14 @@ func collationDeterminismOf(t ir.Type) ir.CollationDeterminism {
 // is false when the guard cannot reference a key column's incoming value
 // (it is not in the insert's column list — a generated column).
 func (p *keyCollationPlan) render(schema, table string, cols []string, upsert upsertSpelling) (assign, hang string, ok bool) {
+	return p.renderFor(quoteIdent(schema)+"."+quoteIdent(table), cols, upsert)
+}
+
+// renderFor is [keyCollationPlan.render] for a statement whose INSERT names
+// the table as tableRef (already quoted): the existing row's columns are
+// referenced through it. The copy writer inserts into an unqualified table
+// name on its own database, so it passes just the table.
+func (p *keyCollationPlan) renderFor(tableRef string, cols []string, upsert upsertSpelling) (assign, hang string, ok bool) {
 	inCols := make(map[string]bool, len(cols))
 	for _, c := range cols {
 		inCols[c] = true
@@ -267,7 +292,7 @@ func (p *keyCollationPlan) render(schema, table string, cols []string, upsert up
 			}
 		}
 	}
-	tbl := quoteIdent(schema) + "." + quoteIdent(table) + "."
+	tbl := tableRef + "."
 	existing := func(c string) string { return tbl + quoteIdent(c) }
 	incoming := func(c string) string { return upsert.newRowRef(quoteIdent(c)) }
 	tgtEq := func(c string) string { return existing(c) + " <=> " + incoming(c) }
@@ -352,7 +377,7 @@ func (a *ChangeApplier) keyCollationPlanFor(ctx context.Context, q queryRower, s
 		}
 		plan = planKeyCollationGuard(source, colTypes, pk, uniques, compareAs)
 		if plan != nil {
-			if err := a.checkKeyCollationsExpressible(ctx, q, qn, plan); err != nil {
+			if err := checkKeyCollationsExpressible(ctx, q, qn, plan); err != nil {
 				return nil, err
 			}
 		}
@@ -407,7 +432,7 @@ func nonPKUniqueKeyColumns(ctx context.Context, q queryRower, schema, table stri
 // not know a collation the guard must compare under (a MySQL 8.0
 // `utf8mb4_0900_*` collation on a MariaDB target, say): running unguarded
 // would be the merge this guard exists for.
-func (a *ChangeApplier) checkKeyCollationsExpressible(ctx context.Context, q queryRower, qn string, plan *keyCollationPlan) error {
+func checkKeyCollationsExpressible(ctx context.Context, q queryRower, qn string, plan *keyCollationPlan) error {
 	for col, ac := range plan.armed {
 		if ac.bytes {
 			continue
@@ -436,7 +461,7 @@ func keyCollationGuardUnsupported(qn, col string, ac armedCollation, cause error
 	if declared != ac.collation {
 		compared = " (compared on this target as " + ac.collation + ")"
 	}
-	return &terminalMySQLError{err: fmt.Errorf("%w: %s: mysql: applier: %s: the source declares key column %q "+
+	return &terminalMySQLError{err: fmt.Errorf("%w: %s: mysql: %s: the source declares key column %q "+
 		"with CHARACTER SET %s COLLATE %s%s, which this target server does not support (%v), so sluice cannot "+
 		"check that an upsert does not merge two source rows the target's collation equates. Refusing before "+
 		"any row of the table is applied. Give the target column a collation that compares as the source's "+
@@ -453,17 +478,21 @@ func keyCollationGuardUnsupported(qn, col string, ac armedCollation, cause error
 // pin, TestVStream_KeyCollationGuard_ShardedTarget, asserts the refusal
 // through vtgate). Anything else is returned unchanged.
 func keyCollationMergeRefusal(err error, plan *keyCollationPlan, schema, table string) error {
-	if err == nil || plan == nil {
-		return err
-	}
-	var me *mysql.MySQLError
-	if !errors.As(err, &me) || me.Number != 1690 || !strings.Contains(me.Message, keyCollationMergeMarker) {
+	if plan == nil || !isKeyCollationMergeRaise(err) {
 		return err
 	}
 	return &ir.KeyCollationMergeError{
 		Schema: schema, Table: table, Cause: err,
 		Remedy: keyCollationMergeRemedy(plan, schema, table),
 	}
+}
+
+// isKeyCollationMergeRaise reports whether err is the guard's raise: a 1690
+// whose server text keeps the marker. The caller also requires that its
+// statement carried the guard.
+func isKeyCollationMergeRaise(err error) bool {
+	var me *mysql.MySQLError
+	return errors.As(err, &me) && me.Number == 1690 && strings.Contains(me.Message, keyCollationMergeMarker)
 }
 
 // keyCollationMergeRemedy is the refusal's remedy. When the key that

@@ -88,7 +88,7 @@ func TestBuildBatchUpsertOmitsTheShardKeyAndGuards(t *testing.T) {
 
 	t.Run("zero plan renders exactly as before", func(t *testing.T) {
 		t.Parallel()
-		got, _ := buildBatchUpsert("public", shardKeyTable(), 1, []string{"id"}, upsertShardKeyPlan{})
+		got, _ := buildBatchUpsert("public", shardKeyTable(), 1, []string{"id"}, upsertShardKeyPlan{}, nil)
 		if !strings.Contains(got, `"tenant_id" = EXCLUDED."tenant_id"`) {
 			t.Errorf("an ordinary PostgreSQL target lost a column from its SET list: %s", got)
 		}
@@ -100,7 +100,7 @@ func TestBuildBatchUpsertOmitsTheShardKeyAndGuards(t *testing.T) {
 	t.Run("shard key outside the conflict key: omitted AND guarded", func(t *testing.T) {
 		t.Parallel()
 		plan := upsertShardKeyPlan{omitFromSet: []string{"tenant_id"}, guard: true}
-		got, _ := buildBatchUpsert("public", shardKeyTable(), 2, []string{"id"}, plan)
+		got, _ := buildBatchUpsert("public", shardKeyTable(), 2, []string{"id"}, plan, nil)
 		if strings.Contains(got, `"tenant_id" = EXCLUDED."tenant_id"`) {
 			t.Errorf("the SET list still names the shard key, which the target refuses on shape: %s", got)
 		}
@@ -120,7 +120,7 @@ func TestBuildBatchUpsertOmitsTheShardKeyAndGuards(t *testing.T) {
 		// It is already excluded from the SET list because key columns are,
 		// and its value cannot differ for a given conflict key — so the plan
 		// carries nothing and the statement is unchanged.
-		got, _ := buildBatchUpsert("public", shardKeyTable(), 1, []string{"id", "tenant_id"}, upsertShardKeyPlan{})
+		got, _ := buildBatchUpsert("public", shardKeyTable(), 1, []string{"id", "tenant_id"}, upsertShardKeyPlan{}, nil)
 		if strings.Contains(got, "IS NOT DISTINCT FROM") {
 			t.Errorf("a guard was added where the conflict key already fixes the shard key: %s", got)
 		}
@@ -147,7 +147,7 @@ func TestBuildBatchUpsertDoesNotArmTheGuardForADoNothingStatement(t *testing.T) 
 	}
 	plan := upsertShardKeyPlan{omitFromSet: []string{"tenant_id"}, guard: true}
 
-	got, guarded := buildBatchUpsert("public", table, 2, []string{"id"}, plan)
+	got, guarded := buildBatchUpsert("public", table, 2, []string{"id"}, plan, nil)
 	if !strings.Contains(got, "DO NOTHING") {
 		t.Fatalf("expected DO NOTHING when every non-key column is the shard key: %s", got)
 	}

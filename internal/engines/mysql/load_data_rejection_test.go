@@ -228,6 +228,10 @@ func newWarningsFakeConn(t *testing.T, spec string) *sql.Conn {
 // before the matrix test has had a chance to name it. The legitimate
 // replay and the capped-list abstention are pinned alongside so the belt
 // cannot be satisfied by refusing every replay.
+// unarmedReplay is the replay gate of a table whose target key compares as
+// the source's does: it lets the replay's duplicates be tolerated.
+func unarmedReplay() error { return nil }
+
 func TestReportLoadDataWarnings_ReplayShortfallBeyondDuplicatesRefuses(t *testing.T) {
 	// No t.Parallel: the relaxed-mode arm swaps the global slog default.
 	ctx := context.Background()
@@ -239,7 +243,7 @@ func TestReportLoadDataWarnings_ReplayShortfallBeyondDuplicatesRefuses(t *testin
 			// Three rows re-sent; two landed before (1062 each), one the
 			// server dropped under a code this build has never heard of.
 			conn := newWarningsFakeConn(t, "codes=1062,1062,9999")
-			err := w.reportLoadDataWarnings(ctx, conn, "child", 3, 0, true)
+			err := w.reportLoadDataWarnings(ctx, conn, "child", 3, 0, unarmedReplay)
 			if err == nil {
 				t.Fatalf("%s: a replayed segment short one row beyond its duplicates was accepted — this is the "+
 					"blanket replay exemption audit 2026-09-15 A0915-MYSQL-MEDIUM-1 removed", name)
@@ -263,7 +267,7 @@ func TestReportLoadDataWarnings_ReplayShortfallBeyondDuplicatesRefuses(t *testin
 
 		w := &RowWriter{sqlMode: &strict}
 		conn := newWarningsFakeConn(t, "codes=1062,1062,1062")
-		if err := w.reportLoadDataWarnings(ctx, conn, "t", 3, 0, true); err != nil {
+		if err := w.reportLoadDataWarnings(ctx, conn, "t", 3, 0, unarmedReplay); err != nil {
 			t.Fatalf("a byte-identical replay of a fully-committed segment must be tolerated: %v", err)
 		}
 		if !strings.Contains(buf.String(), "landed exactly once") {
@@ -279,7 +283,7 @@ func TestReportLoadDataWarnings_ReplayShortfallBeyondDuplicatesRefuses(t *testin
 		codes := strings.TrimSuffix(strings.Repeat("1062,", 1024), ",")
 		w := &RowWriter{sqlMode: &strict}
 		conn := newWarningsFakeConn(t, "codes="+codes+"|count=3000")
-		err := w.reportLoadDataWarnings(ctx, conn, "t", 3000, 0, true)
+		err := w.reportLoadDataWarnings(ctx, conn, "t", 3000, 0, unarmedReplay)
 		if err == nil {
 			t.Fatal("a capped replay list under strict mode must refuse (the hidden warnings cannot be classified)")
 		}

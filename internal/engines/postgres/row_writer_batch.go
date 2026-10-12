@@ -135,6 +135,12 @@ func (w *RowWriter) writeViaBatchIdempotent(ctx context.Context, table *ir.Table
 	if err != nil {
 		return err
 	}
+	// KEY-COLLATION-ROWWRITER (row_writer_key_collation.go): nil on a target
+	// whose conflict key the source's collation agrees with.
+	keyGuard, err := w.copyKeyCollationPlanFor(ctx, table, keyCols)
+	if err != nil {
+		return err
+	}
 
 	batch := make([]ir.Row, 0, limit)
 	var batchBytes int64
@@ -142,7 +148,7 @@ func (w *RowWriter) writeViaBatchIdempotent(ctx context.Context, table *ir.Table
 		if len(batch) == 0 {
 			return nil
 		}
-		query, guarded := buildBatchUpsert(w.schema, table, len(batch), keyCols, shardPlan)
+		query, guarded := buildBatchUpsert(w.schema, table, len(batch), keyCols, shardPlan, keyGuard)
 		args, err := flattenArgs(batch, table)
 		if err != nil {
 			return fmt.Errorf("postgres: prepare args for %q: %w", table.Name, err)
@@ -197,6 +203,7 @@ func (w *RowWriter) writeViaBatchIdempotent(ctx context.Context, table *ir.Table
 			}
 			return nil
 		}); err != nil {
+			err = copyKeyCollationMergeRefusal(err, keyGuard, w.schema, table.Name)
 			return fmt.Errorf("postgres: idempotent insert into %q (%d rows): %w", table.Name, batched, err)
 		}
 		// The guard's other half. The predicate makes a shard-key-changing row
@@ -262,7 +269,14 @@ func (w *RowWriter) writeViaBatchIdempotent(ctx context.Context, table *ir.Table
 // the guard, and a DO NOTHING statement under-counts by design. Reporting from
 // the builder means the check can never be armed for a statement that does not
 // carry the predicate it is checking.
-func buildBatchUpsert(schema string, table *ir.Table, rowCount int, keyCols []string, plan upsertShardKeyPlan) (stmt string, guarded bool) {
+//
+// keyGuard, when non-nil, is the table's key-collation guard
+// (row_writer_key_collation.go): the target table is aliased so the DO
+// UPDATE's WHERE can name the existing row, its predicate joins that WHERE,
+// and a table whose every column is the key takes a guarded self-assignment
+// in place of DO NOTHING (which would drop a merging row). nil renders the
+// statement byte-identical to before.
+func buildBatchUpsert(schema string, table *ir.Table, rowCount int, keyCols []string, plan upsertShardKeyPlan, keyGuard *pgKeyCollationPlan) (stmt string, guarded bool) {
 	cols := nonGeneratedColumns(table.Columns)
 	colNames := make([]string, len(cols))
 	for i, c := range cols {
@@ -282,6 +296,9 @@ func buildBatchUpsert(schema string, table *ir.Table, rowCount int, keyCols []st
 	}
 
 	tableRef := quoteIdent(schema) + "." + quoteIdent(table.Name)
+	if keyGuard != nil && len(keyCols) > 0 {
+		tableRef += " AS " + quoteIdent(keyCollationExistingAlias)
+	}
 	var sb strings.Builder
 	fmt.Fprintf(
 		&sb, "INSERT INTO %s (%s) VALUES %s",
@@ -335,6 +352,16 @@ func buildBatchUpsert(schema string, table *ir.Table, rowCount int, keyCols []st
 	sb.WriteString(strings.Join(conflictTarget, ", "))
 	sb.WriteByte(')')
 	if len(nonKey) == 0 {
+		if keyGuard != nil {
+			// Every column is a conflict-key column, and the key is
+			// guarded: a self-assignment whose WHERE writes nothing when the
+			// keys agree under the source's collation and raises when they
+			// do not — the applier's spelling (buildInsertSQL).
+			k0 := quoteIdent(keyCols[0])
+			sb.WriteString(" DO UPDATE SET " + k0 + " = " + quoteIdent(keyCollationExistingAlias) + "." + k0)
+			sb.WriteString(keyGuard.where(true))
+			return sb.String(), false
+		}
 		// Every column is a conflict-key column — the conflicting row IS
 		// the row we wanted to write. DO NOTHING absorbs it silently.
 		sb.WriteString(" DO NOTHING")
@@ -367,15 +394,23 @@ func buildBatchUpsert(schema string, table *ir.Table, rowCount int, keyCols []st
 	// silently kept its old value. With it, that row is SKIPPED — and the
 	// statement's own affected-row count falls short of the batch, which is
 	// how the caller learns it happened. See [upsertShardKeyPlan].
+	var preds []string
 	if plan.guard && len(plan.omitFromSet) > 0 {
 		ref := quoteIdent(table.Name)
-		if schema != "" {
+		switch {
+		case keyGuard != nil:
+			ref = quoteIdent(keyCollationExistingAlias) // the alias hides the table's own name
+		case schema != "":
 			ref = quoteIdent(schema) + "." + quoteIdent(table.Name)
 		}
-		preds := make([]string, len(plan.omitFromSet))
-		for i, c := range plan.omitFromSet {
-			preds[i] = fmt.Sprintf("%s.%s IS NOT DISTINCT FROM EXCLUDED.%s", ref, quoteIdent(c), quoteIdent(c))
+		for _, c := range plan.omitFromSet {
+			preds = append(preds, fmt.Sprintf("%s.%s IS NOT DISTINCT FROM EXCLUDED.%s", ref, quoteIdent(c), quoteIdent(c)))
 		}
+	}
+	if keyGuard != nil {
+		preds = append(preds, keyGuard.predicate(false))
+	}
+	if len(preds) > 0 {
 		sb.WriteString(" WHERE ")
 		sb.WriteString(strings.Join(preds, " AND "))
 	}

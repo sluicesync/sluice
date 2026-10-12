@@ -649,7 +649,7 @@ func TestMariaDBUpsertBuilders_BothSpellings(t *testing.T) {
 			},
 			PrimaryKey: &ir.Index{Name: "PRIMARY", Columns: []ir.IndexColumn{{Column: "id"}}},
 		}
-		got := buildBatchUpsert(table, 2, []string{"id"}, upsertValuesFunc)
+		got := buildBatchUpsert(table, 2, []string{"id"}, upsertValuesFunc, copyKeyCollationGuard{})
 		want := "INSERT INTO `users` (`id`, `email`) VALUES (?, ?), (?, ?) ON DUPLICATE KEY UPDATE `email` = VALUES(`email`)"
 		if got != want {
 			t.Errorf("mariadb batch upsert:\n got: %s\nwant: %s", got, want)

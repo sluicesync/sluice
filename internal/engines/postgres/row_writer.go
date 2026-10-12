@@ -13,6 +13,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -173,6 +174,12 @@ type RowWriter struct {
 	// table; reset by [RowWriter.SetSchema], which moves the probe's scope.
 	// Zero value ready.
 	replayKeys irbackup.ReplayKeyCache
+
+	// keyCollationGuards caches each table's idempotent-copy key-collation
+	// guard (KEY-COLLATION-ROWWRITER), keyed by schema-qualified name — so
+	// [RowWriter.SetSchema] moving the writer needs no reset — and checked
+	// against the source shape it was resolved for. Zero value ready.
+	keyCollationGuards sync.Map
 
 	// replayKeyProbeForTest, TEST-ONLY, substitutes the prober the re-send
 	// gate asks (see [RowWriter.replayKeyProber]) for a unit test whose

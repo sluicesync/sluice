@@ -162,6 +162,13 @@ func sourceKeyCollation(t ir.Type) (charset, name string, det ir.CollationDeterm
 // so the guarded DO UPDATE stands in for DO NOTHING and must write nothing
 // when the keys agree.
 func (p *pgKeyCollationPlan) where(allKey bool) string {
+	return " WHERE " + p.predicate(allKey)
+}
+
+// predicate is [pgKeyCollationPlan.where] without the keyword, for a
+// statement whose WHERE carries another predicate too (the copy writer's
+// Neki shard-key guard).
+func (p *pgKeyCollationPlan) predicate(allKey bool) string {
 	cols := make([]string, 0, len(p.compare))
 	for c := range p.compare {
 		cols = append(cols, c)
@@ -178,7 +185,7 @@ func (p *pgKeyCollationPlan) where(allKey bool) string {
 		agree = "false"
 	}
 	raise := "(('" + keyCollationMergeMarker + "' || pg_catalog.left(EXCLUDED." + quoteIdent(p.marker) + "::text, 0))::int IS NULL)"
-	return " WHERE CASE WHEN " + strings.Join(eq, " AND ") + " THEN " + agree + " ELSE " + raise + " END"
+	return "CASE WHEN " + strings.Join(eq, " AND ") + " THEN " + agree + " ELSE " + raise + " END"
 }
 
 // sortStrings sorts in place (a tiny helper so the rendered SQL is stable).
@@ -217,12 +224,7 @@ func (a *ChangeApplier) keyCollationPlanFor(ctx context.Context, srcSchema, sche
 		var unexpressible []string
 		plan, unexpressible = planPGKeyCollationGuard(source, key, target)
 		if len(unexpressible) > 0 {
-			return nil, &terminalPGError{err: fmt.Errorf("%w: %s: postgres: applier: %s: the target compares key "+
-				"column(s) %s under a nondeterministic collation, and the source declares a MySQL-family collation "+
-				"Postgres has no equivalent for, so sluice cannot check that an upsert does not merge two source "+
-				"rows the target's collation equates. Refusing before the table's first upsert; give the "+
-				"target key a deterministic collation (the database default, or \"C\"), or re-copy the table. Nothing of this upsert was applied",
-				ir.ErrKeyCollationMerge, keyCollationGuardUnsupportedMarker, qn, strings.Join(unexpressible, ", "))}
+			return nil, keyCollationGuardUnexpressible(qn, unexpressible)
 		}
 		if plan != nil {
 			if err := checkPGCollationsExist(ctx, a.db, qn, plan); err != nil {
@@ -237,6 +239,18 @@ func (a *ChangeApplier) keyCollationPlanFor(ctx context.Context, srcSchema, sche
 	a.keyCollationGuardCache[qn] = pgKeyCollationGuardEntry{source: source, plan: plan}
 	a.cacheMu.Unlock()
 	return plan, nil
+}
+
+// keyCollationGuardUnexpressible is the GUARD-UNSUPPORTED refusal for the
+// unexpressible columns [planPGKeyCollationGuard] returned, shared by the
+// applier and the copy writer.
+func keyCollationGuardUnexpressible(qn string, unexpressible []string) error {
+	return &terminalPGError{err: fmt.Errorf("%w: %s: postgres: %s: the target compares key "+
+		"column(s) %s under a nondeterministic collation, and the source declares a MySQL-family collation "+
+		"Postgres has no equivalent for, so sluice cannot check that an upsert does not merge two source "+
+		"rows the target's collation equates. Refusing before the table's first upsert; give the "+
+		"target key a deterministic collation (the database default, or \"C\"), or re-copy the table. Nothing of this upsert was applied",
+		ir.ErrKeyCollationMerge, keyCollationGuardUnsupportedMarker, qn, strings.Join(unexpressible, ", "))}
 }
 
 // targetKeyCollations reads every column's collation on the target table.
@@ -275,7 +289,7 @@ func checkPGCollationsExist(ctx context.Context, db *sql.DB, qn string, plan *pg
 	for col, coll := range plan.compare {
 		var probe sql.NullString
 		if err := db.QueryRowContext(ctx, "SELECT ''::text COLLATE "+quoteIdent(coll)).Scan(&probe); err != nil {
-			return &terminalPGError{err: fmt.Errorf("%w: %s: postgres: applier: %s: the source declares key column %q "+
+			return &terminalPGError{err: fmt.Errorf("%w: %s: postgres: %s: the source declares key column %q "+
 				"with collation %q, which this target does not have (%v), so sluice cannot check that an upsert does "+
 				"not merge two source rows the target's collation equates. Refusing before any row of the table is "+
 				"applied; create the collation on the target, or give the key a collation that compares as the "+

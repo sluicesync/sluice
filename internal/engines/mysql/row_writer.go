@@ -112,6 +112,17 @@ type RowWriter struct {
 	// local_infile=OFF or the table carries a geometry column.
 	upsert upsertSpelling
 
+	// flavor is the target's flavor, which the key-collation guard on the
+	// idempotent path reads for the target's columns and its cross-flavor
+	// comparison map (row_writer_key_collation.go). The zero value is
+	// vanilla MySQL, which is what a direct construction targets.
+	flavor Flavor
+
+	// keyCollationGuards caches each table's idempotent-copy key-collation
+	// guard (KEY-COLLATION-ROWWRITER), keyed by table name and checked
+	// against the source shape it was resolved for. Zero value ready.
+	keyCollationGuards sync.Map
+
 	// safeMigrationsPossible marks a flavor whose server can refuse direct
 	// DDL outright (Vitess's "direct DDL is disabled", surfaced by
 	// PlanetScale as Safe Migrations). Vanilla MySQL and MariaDB have no
@@ -623,6 +634,11 @@ func (w *RowWriter) writeBatchedConn(ctx context.Context, conn *sql.Conn, table 
 		// the new primary) on every retry. The dead post-reparent conn is
 		// never reused.
 		if err := w.flushWithReparentRetry(ctx, table, len(batch.rows), func(c *sql.Conn, isRetry bool) error {
+			if batchedInsertFailHookForTest != nil {
+				if injected := batchedInsertFailHookForTest(isRetry, false); injected != nil {
+					return injected
+				}
+			}
 			if _, err := c.ExecContext(ctx, query, args...); err != nil {
 				// WART: tolerate-1062-on-retry (ADR-0108). A plain cold-copy
 				// batch is a SINGLE atomic multi-row INSERT. On a classified
@@ -671,7 +687,15 @@ func (w *RowWriter) writeBatchedConn(ctx context.Context, conn *sql.Conn, table 
 				// refusing MyISAM targets outright: a MyISAM copy that never
 				// hits a retry-collision is correct, and refusing it would fire
 				// on a working configuration.
+				//
+				// And the collision must be with the batch's OWN rows, which
+				// holds only where the target key compares as the source's
+				// does: on an armed table it can be a merge of two source
+				// rows (KEY-COLLATION-ROWWRITER, [RowWriter.refuseAmbiguousReplay]).
 				if isRetry && isMySQLDupKey(err) {
+					if kcErr := w.refuseAmbiguousReplay(ctx, c, table); kcErr != nil {
+						return fmt.Errorf("mysql: insert into %q (%d rows): %w", table.Name, len(batch.rows), kcErr)
+					}
 					if engErr := verifyTransactionalTolerance(ctx, c, table.Name); engErr != nil {
 						return fmt.Errorf("mysql: insert into %q (%d rows): %w", table.Name, len(batch.rows), engErr)
 					}
@@ -685,6 +709,11 @@ func (w *RowWriter) writeBatchedConn(ctx context.Context, conn *sql.Conn, table 
 					return nil
 				}
 				return fmt.Errorf("mysql: insert into %q (%d rows): %w", table.Name, len(batch.rows), err)
+			}
+			if batchedInsertFailHookForTest != nil {
+				if injected := batchedInsertFailHookForTest(isRetry, true); injected != nil {
+					return injected
+				}
 			}
 			// Strict sql_mode rejects an out-of-range value at the INSERT
 			// above (loud already); under --mysql-sql-mode='' MySQL silently
