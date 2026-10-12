@@ -162,6 +162,12 @@ func krwRunServer(t *testing.T, srv kcgServer, core krwCore) {
 		// copy re-sends only rows of a snapshot, never a re-delivered
 		// change of a key, so there is no wedge to avoid.
 		{"source postgres default", pgDefault},
+		// Review 2026-10-12 finding 1: a NONDETERMINISTIC Postgres key,
+		// armed exactly as the default is.
+		{"source postgres nondeterministic", ir.Varchar{Length: 20, Collation: "ci", Determinism: ir.CollationNonDeterministic}},
+		// Finding 5: a named Postgres collation whose determinism no reader
+		// stamped — what a manifest written before v0.159.0 decodes to.
+		{"source postgres named, determinism unknown (pre-v0.159.0 manifest)", ir.Varchar{Length: 20, Collation: "C"}},
 	} {
 		src := src
 		t.Run(src.name, func(t *testing.T) {
@@ -183,6 +189,22 @@ func krwRunServer(t *testing.T, srv kcgServer, core krwCore) {
 				tbl := &ir.Table{Name: "kd", Columns: threeCols(src.key), PrimaryKey: pkOn("k")}
 				err := write(t, dsn, tbl, ir.Row{"id": int64(2), "k": "A", "d": int64(2)})
 				wantMerge(t, err, dsn, "kd", "id", "1:61")
+			})
+			t.Run("accent-only pk merge against an earlier batch", func(t *testing.T) {
+				dsn := cell()
+				applyDDL(t, dsn, "CREATE TABLE kd (id INT NOT NULL, k VARCHAR(20) "+tgtCI+" NOT NULL, d INT, PRIMARY KEY (k))")
+				applyDDL(t, dsn, "INSERT INTO kd VALUES (1,'e',1)")
+				tbl := &ir.Table{Name: "kd", Columns: threeCols(src.key), PrimaryKey: pkOn("k")}
+				err := write(t, dsn, tbl, ir.Row{"id": int64(2), "k": "é", "d": int64(2)})
+				wantMerge(t, err, dsn, "kd", "id", "1:65")
+			})
+			t.Run("composite primary key with one armed column", func(t *testing.T) {
+				dsn := cell()
+				applyDDL(t, dsn, "CREATE TABLE kc (id INT NOT NULL, k VARCHAR(20) "+tgtCI+" NOT NULL, d INT, PRIMARY KEY (k, id))")
+				applyDDL(t, dsn, "INSERT INTO kc VALUES (1,'a',1)")
+				tbl := &ir.Table{Name: "kc", Columns: threeCols(src.key), PrimaryKey: pkOn("k", "id")}
+				err := write(t, dsn, tbl, ir.Row{"id": int64(1), "k": "A", "d": int64(2)})
+				wantMerge(t, err, dsn, "kc", "id", "1:61")
 			})
 			t.Run("unique key beside a primary key", func(t *testing.T) {
 				dsn := cell()

@@ -248,7 +248,21 @@ func armedFor(src, tgt ir.Type, compareAs map[string]string) (armedCollation, bo
 		switch collationDeterminismOf(src) {
 		case ir.CollationDeterministic:
 			return armedCollation{bytes: true}, true
-		case ir.CollationNonDeterministic:
+		case ir.CollationNonDeterministic, ir.CollationDeterminismUnknown:
+			// UNKNOWN determinism on a NAMED Postgres collation is a schema
+			// no reader stamped: one decoded from a backup manifest written
+			// before v0.159.0, whose type envelope had no
+			// collation_determinism key (review 2026-10-12, finding 5). Left
+			// unarmed, every Postgres key of such a chain went unguarded on a
+			// cross-engine restore (the DataOnly copy and the replay applier).
+			// Either determinism is possible, and the arm below is right for
+			// both: byte equality is exact for a deterministic collation (the
+			// only cost is that the applier leaves the primary key unarmed, as
+			// it does for the database default), and the argument below holds
+			// for a nondeterministic one. A database-DEFAULT key of such a
+			// chain has no name either, so it cannot be told from a source that
+			// records no collation (VStream) and stays unarmed — named in F17.
+			//
 			// A Postgres NONDETERMINISTIC collation (an ICU `ks-level2`
 			// case-insensitive key, a level3 one): the MySQL emitter cannot
 			// declare it and creates the key under the target's default, which
