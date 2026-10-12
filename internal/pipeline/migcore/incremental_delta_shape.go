@@ -324,6 +324,66 @@ func DeltaChangesKeyCollation(delta []*irbackup.SchemaDeltaEntry) bool {
 	return false
 }
 
+// TableChangesKeyCollation reports whether after declares a different
+// collation (or character set) than before for a same-named column that is
+// a key in either shape — [AlterAspectColumnCollation]'s rule, applied to a
+// pair whose AFTER shape did not come from the schema reader: a change
+// stream's [ir.SchemaSnapshot] recorded in a segment's SchemaHistory. So it
+// compares only the columns, never the table's identity or any other aspect
+// (the two readers spell those differently), and a column the stream
+// recorded with no collation is not evidence of a change (VStream carries
+// none). Used where a segment commits WITHOUT a schema delta — the
+// `backup stream` ctx-cancel drain-commit — to stamp it as the delta
+// writers would have (review 2026-10-12 finding 4).
+func TableChangesKeyCollation(before, after *ir.Table) bool {
+	if before == nil || after == nil {
+		return false
+	}
+	beforeByName := make(map[string]*ir.Column, len(before.Columns))
+	for _, c := range before.Columns {
+		if c != nil {
+			beforeByName[c.Name] = c
+		}
+	}
+	for _, a := range after.Columns {
+		if a == nil {
+			continue
+		}
+		b := beforeByName[a.Name]
+		if b == nil {
+			continue
+		}
+		if !collationRecorded(a.Type) {
+			continue
+		}
+		if !sameCollation(b.Type, a.Type) && (isKeyColumn(before, a.Name) || isKeyColumn(after, a.Name)) {
+			return true
+		}
+	}
+	return false
+}
+
+// collationRecorded reports whether a change stream's column type says
+// anything about its collation: a name, or — a Postgres database-default
+// column, which has none — a determinism the reader stamped from the
+// catalog. A character type with neither (a VStream column) records nothing.
+func collationRecorded(t ir.Type) bool {
+	if _, coll := translate.ColumnCollation(t); coll != "" {
+		return true
+	}
+	switch v := t.(type) {
+	case ir.Varchar:
+		return v.Determinism != ir.CollationDeterminismUnknown
+	case ir.Char:
+		return v.Determinism != ir.CollationDeterminismUnknown
+	case ir.Text:
+		return v.Determinism != ir.CollationDeterminismUnknown
+	case ir.Domain:
+		return collationRecorded(v.BaseType)
+	}
+	return false
+}
+
 // AllAlterAspects returns every aspect the diff can report, DERIVED
 // from the two comparator registries (never hand-listed) so a new
 // comparator immediately shows up in the disposition gate.

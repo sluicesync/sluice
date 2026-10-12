@@ -128,6 +128,16 @@ func TestStampKeyCollationDeltaOnAttach_ShapeMatrix(t *testing.T) {
 // an older binary reads as no change. The universe is derived from the AST,
 // not listed; the floor (two writers today: `backup incremental` and the
 // `backup stream` rollover) keeps a walk that matches nothing from passing.
+//
+// WHAT IT DOES NOT REACH (review 2026-10-12 finding 4): a path that commits
+// a segment WITHOUT writing a SchemaDelta is invisible to it, because the
+// roster keys on the write. The `backup stream` ctx-cancel drain-commit is
+// exactly that path — it skips the refresh, writes no delta, and its window
+// can still hold a key-collation DDL — and this gate stayed green while it
+// committed such a window unstamped (measured). That path is pinned
+// separately: stampKeyCollationHistoryOnDrain, by
+// TestStampKeyCollationHistoryOnDrain (unit) and
+// TestBackupStream_DrainCommit_StampsAKeyCollationWindow (integration).
 func TestSchemaDeltaWritersStampKeyCollation(t *testing.T) {
 	fset := token.NewFileSet()
 	writers := 0
@@ -187,5 +197,57 @@ func TestSchemaDeltaWritersStampKeyCollation(t *testing.T) {
 	}
 	if writers < 2 {
 		t.Fatalf("found %d SchemaDelta writer(s); want at least 2 (attachWindowEndSchema, refreshSchemaAndAttachDelta) — the walk is blind", writers)
+	}
+}
+
+// TestStampKeyCollationHistoryOnDrain pins the drain-commit's stamp (review
+// 2026-10-12 finding 4) over the window's SchemaHistory as the change stream
+// records it: a key column whose collation the stream saw change stamps the
+// segment; a non-key column's change, a column the stream recorded with no
+// collation (a VStream shape), an unchanged key and a FULL manifest do not.
+// A Postgres database-default key (no name, stamped deterministic) counts as
+// a recorded collation. The independent expected value is the rule stated
+// here, graded per cell.
+func TestStampKeyCollationHistoryOnDrain(t *testing.T) {
+	my := func(coll string) ir.Type { return ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: coll} }
+	table := func(k, note ir.Type) *ir.Table {
+		return &ir.Table{
+			Schema: "s", Name: "kd", Columns: []*ir.Column{
+				{Name: "id", Type: ir.Integer{Width: 32}}, {Name: "k", Type: k}, {Name: "note", Type: note},
+			}, PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}},
+			Indexes: []*ir.Index{{Name: "uk", Unique: true, Columns: []ir.IndexColumn{{Column: "k"}}}},
+		}
+	}
+	before := &ir.Schema{Tables: []*ir.Table{table(my("utf8mb4_0900_ai_ci"), my("utf8mb4_0900_ai_ci"))}}
+	pgBefore := &ir.Schema{Tables: []*ir.Table{table(ir.Text{Collation: "ci", Determinism: ir.CollationNonDeterministic}, ir.Text{})}}
+	cases := []struct {
+		name    string
+		kind    string
+		before  *ir.Schema
+		history *ir.Table
+		stamped bool
+	}{
+		{"unique key ci -> bin", irbackup.BackupKindIncremental, before, table(my("utf8mb4_bin"), my("utf8mb4_0900_ai_ci")), true},
+		{"postgres key ci -> database default", irbackup.BackupKindIncremental, pgBefore, table(ir.Text{Determinism: ir.CollationDeterministic}, ir.Text{}), true},
+		{"control: non-key column", irbackup.BackupKindIncremental, before, table(my("utf8mb4_0900_ai_ci"), my("utf8mb4_bin")), false},
+		{"control: no collation recorded (VStream)", irbackup.BackupKindIncremental, before, table(ir.Varchar{Length: 20}, my("utf8mb4_0900_ai_ci")), false},
+		{"control: unchanged", irbackup.BackupKindIncremental, before, table(my("utf8mb4_0900_ai_ci"), my("utf8mb4_0900_ai_ci")), false},
+		{"control: full manifest", irbackup.BackupKindFull, before, table(my("utf8mb4_bin"), my("utf8mb4_0900_ai_ci")), false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			js, err := ir.MarshalTable(c.history)
+			if err != nil {
+				t.Fatal(err)
+			}
+			const start = irbackup.FormatVersionInjectiveChunkAAD
+			m := &irbackup.Manifest{Kind: c.kind, FormatVersion: start, SchemaHistory: []*irbackup.SchemaHistoryEntry{
+				{Schema: "s", Table: "kd", TableJSON: js},
+			}}
+			stampKeyCollationHistoryOnDrain(m, c.before)
+			if got := m.FormatVersion >= irbackup.FormatVersionKeyCollationDelta; got != c.stamped {
+				t.Errorf("FormatVersion = %d; stamped = %v, want %v", m.FormatVersion, got, c.stamped)
+			}
+		})
 	}
 }
