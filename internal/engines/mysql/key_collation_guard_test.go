@@ -114,6 +114,13 @@ func TestPlanKeyCollationGuard(t *testing.T) {
 			[]int{1},
 			FlavorVanilla.keyGuardCollations(), "utf8mb4_0900_as_cs",
 		},
+		// KEY-COLLATION-PG-DEFAULT-TO-MYSQL, operator's choice (b): a
+		// Postgres database-default key (no name, deterministic) is armed
+		// only as a UNIQUE key beside a primary key it is not part of.
+		{"Postgres default collation, unique beside a primary key: armed", kcgSource(ir.Varchar{Length: 20, Determinism: ir.CollationDeterministic}), kcgCols(ci), []string{"id"}, [][]string{{"k"}}, true, true, []int{1}, nil, ""},
+		{"Postgres default collation, primary key: not armed (no new wedge)", kcgSource(ir.Varchar{Length: 20, Determinism: ir.CollationDeterministic}), kcgCols(ci), []string{"k"}, nil, false, false, nil, nil, ""},
+		{"Postgres default collation, unique with no primary key: not armed", kcgSource(ir.Varchar{Length: 20, Determinism: ir.CollationDeterministic}), kcgCols(ci), nil, [][]string{{"k"}}, false, false, nil, nil, ""},
+		{"Postgres default collation, unique key also holding the primary key column: not armed", kcgSource(ir.Varchar{Length: 20, Determinism: ir.CollationDeterministic}), kcgCols(ci), []string{"k"}, [][]string{{"k", "id"}}, false, false, nil, nil, ""},
 		{"Postgres deterministic source through a domain", kcgSource(ir.Domain{Name: "code", BaseType: ir.Text{Size: ir.TextLong, Collation: "C", Determinism: ir.CollationDeterministic}}), kcgCols(ci), []string{"k"}, nil, true, true, []int{1}, nil, ""},
 		{"no source shape", nil, kcgCols(ci), []string{"k"}, nil, false, false, nil, nil, ""},
 		{"source and target agree: no guard, no cost", kcgSource(ci), kcgCols(ci), []string{"k"}, nil, false, false, nil, nil, ""},

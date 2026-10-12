@@ -106,6 +106,17 @@ type armedCollation struct {
 	// charset / collation: a MySQL-family source collation, applied to both
 	// values converted to its character set.
 	charset, collation string
+	// uniqueOnly: the source column is on a Postgres database's DEFAULT
+	// collation (no name, stamped deterministic), which the MySQL target
+	// created under its own default — usually case-insensitive. Armed only
+	// in a UNIQUE key beside a primary key the column is not part of
+	// (operator's choice (b), KEY-COLLATION-PG-DEFAULT-TO-MYSQL): there the
+	// primary key recognises a re-delivered change of the same row, so the
+	// guard refuses a second source row without wedging a re-delivery. In
+	// the primary key itself (or with no primary key) a re-delivered
+	// case-only change converges today and the guard would wedge it, so
+	// that case stays unarmed — documented as not covered.
+	uniqueOnly bool
 }
 
 // keyCollationPlan is the guard for one table, rendered per statement.
@@ -123,6 +134,15 @@ type keyCollationPlan struct {
 // nothing is armed.
 func planKeyCollationGuard(source *ir.Table, colTypes map[string]*ir.Column, pk []string, uniques [][]string, compareAs map[string]string) *keyCollationPlan {
 	armed := armedColumns(source, colTypes, compareAs)
+	inPK := make(map[string]bool, len(pk))
+	for _, c := range pk {
+		inPK[c] = true
+	}
+	for col, ac := range armed {
+		if ac.uniqueOnly && (len(pk) == 0 || inPK[col]) {
+			delete(armed, col) // the identity key itself: not covered, see uniqueOnly
+		}
+	}
 	if len(armed) == 0 {
 		return nil
 	}
@@ -179,12 +199,17 @@ func armedColumns(source *ir.Table, colTypes map[string]*ir.Column, compareAs ma
 // compareAs name.
 func armedFor(src, tgt ir.Type, compareAs map[string]string) (armedCollation, bool) {
 	scs, srcColl := translate.ColumnCollation(src)
-	if srcColl == "" {
-		return armedCollation{}, false // the source's collation is not known
-	}
 	tcs, tcoll := translate.ColumnCollation(tgt)
 	if tcoll == "" {
 		return armedCollation{}, false // not a character column on the target
+	}
+	if srcColl == "" {
+		if collationDeterminismOf(src) == ir.CollationDeterministic {
+			// A Postgres database-default collation: byte equality, armed
+			// only beside a primary key (planKeyCollationGuard).
+			return armedCollation{bytes: true, uniqueOnly: true}, true
+		}
+		return armedCollation{}, false // the source's collation is not known
 	}
 	switch translate.CollationDialect(scs, srcColl) {
 	case "mysql":

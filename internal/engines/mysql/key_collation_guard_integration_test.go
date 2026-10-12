@@ -321,6 +321,63 @@ func kcgRunServer(t *testing.T, srv kcgServer, batched bool) {
 		}
 	})
 
+	// KEY-COLLATION-PG-DEFAULT-TO-MYSQL, operator's choice (b): a Postgres
+	// source key on the database DEFAULT collation (no name, deterministic,
+	// case-sensitive) lands on a `_ci` target key. Beside a primary key a
+	// UNIQUE merge refuses; the primary key itself is not armed, so a
+	// re-delivered case-only change of it still converges.
+	pgDefault := ir.Varchar{Length: 20, Determinism: ir.CollationDeterministic}
+	t.Run("postgres default collation: a unique key beside a primary key refuses a merge", func(t *testing.T) {
+		db, dsn := cell("pgu")
+		applyDDL(t, dsn, "CREATE TABLE pu (id INT NOT NULL PRIMARY KEY, k VARCHAR(20) CHARACTER SET utf8mb4 COLLATE "+srv.tgtCI+" NOT NULL, d INT, UNIQUE KEY uk (k))")
+		applyDDL(t, dsn, "INSERT INTO pu VALUES (1,'a',1)")
+		snap := kcgSnapshot(db, "pu", []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 32}},
+			{Name: "k", Type: pgDefault},
+			{Name: "d", Type: ir.Integer{Width: 32}, Nullable: true},
+		})
+		before := kcgRows(t, dsn, "pu", "id")
+		err := kcgApply(t, srv.eng, dsn, batched, snap,
+			ir.Insert{Position: kcgPos(1), Schema: db, Table: "pu", Row: ir.Row{"id": int64(99), "k": "A", "d": int64(99)}})
+		wantMerge(t, err, dsn, "pu", "id", before)
+		// The same row changing its unique column's case passes: the primary
+		// key recognises it.
+		if err := kcgApply(t, srv.eng, dsn, batched, snap, ir.Update{
+			Position: kcgPos(2), Schema: db, Table: "pu",
+			Before: ir.Row{"id": int64(1), "k": "a", "d": int64(1)},
+			After:  ir.Row{"id": int64(1), "k": "A", "d": int64(1)},
+		}); err != nil {
+			t.Fatalf("a case-only change of the unique column on the same row refused: %v", err)
+		}
+		if got, want := kcgRows(t, dsn, "pu", "id"), "1:41"; got != want {
+			t.Fatalf("target %s; want %s", got, want)
+		}
+	})
+	t.Run("postgres default collation: a re-delivered case-only primary-key change converges", func(t *testing.T) {
+		db, dsn := cell("pgp")
+		applyDDL(t, dsn, "CREATE TABLE pp (id INT NOT NULL, k VARCHAR(20) CHARACTER SET utf8mb4 COLLATE "+srv.tgtCI+" NOT NULL, d INT, PRIMARY KEY (k))")
+		snap := kcgSnapshot(db, "pp", []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 32}},
+			{Name: "k", Type: pgDefault},
+			{Name: "d", Type: ir.Integer{Width: 32}, Nullable: true},
+		})
+		insert := ir.Insert{Position: kcgPos(1), Schema: db, Table: "pp", Row: ir.Row{"id": int64(1), "k": "a", "d": int64(1)}}
+		update := ir.Update{
+			Position: kcgPos(2), Schema: db, Table: "pp",
+			Before: ir.Row{"id": int64(1), "k": "a", "d": int64(1)},
+			After:  ir.Row{"id": int64(1), "k": "A", "d": int64(1)},
+		}
+		if err := kcgApply(t, srv.eng, dsn, batched, snap, insert, update); err != nil {
+			t.Fatalf("first delivery: %v", err)
+		}
+		if err := kcgApply(t, srv.eng, dsn, batched, snap, insert, update); err != nil {
+			t.Fatalf("the re-delivery refused (a new wedge): %v", err)
+		}
+		if got, want := kcgRows(t, dsn, "pp", "id"), "1:41"; got != want {
+			t.Fatalf("after the re-delivery the target is %s; want %s", got, want)
+		}
+	})
+
 	t.Run("a case-insensitive source re-delivers a case-only key change", func(t *testing.T) {
 		db, dsn := cell("rd")
 		applyDDL(t, dsn, "CREATE TABLE kd (id INT NOT NULL, k VARCHAR(20) CHARACTER SET utf8mb4 COLLATE "+srv.tgtCI+" NOT NULL, d INT, PRIMARY KEY (k))")
