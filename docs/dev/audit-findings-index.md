@@ -54,6 +54,22 @@ other eighteen.
 
 ---
 
+## 2026-10-12 — value-fidelity review of the v0.159.1 candidate (KEY-COLLATION-ROWWRITER, Bugs 304 and 305): five fixed, what they leave open
+
+Indexed when filed. The independent pre-tag value-fidelity review's findings and what their fixes leave open; the fixed ones are struck in the backlog section.
+
+- KEY-COLLATION-ND-UNARMED filed
+- KEY-COLLATION-COPY-REMEDY-UNDECLARABLE filed
+- KEY-COLLATION-REPLAY-AMBIGUOUS-TOO-WIDE filed
+- KEY-COLLATION-DRAIN-UNSTAMPED filed
+- KEY-COLLATION-DRAIN-NO-DELTA filed
+- KEY-COLLATION-PRE0159-DEFAULT-KEY filed
+- KEY-COLLATION-GUARD-NAME-CASE filed
+- KEY-COLLATION-GUARD-CACHE-STALE filed
+- KEY-COLLATION-CELLS-UNIT-ONLY filed
+- KEY-COLLATION-E2E-ROTATED-BROKER filed
+- MYDUMPER-COLLATION-NO-CHARSET filed
+
 ## 2026-10-12 — Bugs 304 and 305 (the v0.159.0 regression cycle): fixed, with what they leave open
 
 Indexed when filed. Two findings observed while fixing Bugs 304 and 305 (no audit pass); the bugs themselves are numbered in the BUG-CATALOG and recorded as fixed in the backlog section.

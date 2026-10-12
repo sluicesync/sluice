@@ -213,10 +213,13 @@ func armedColumns(source *ir.Table, colTypes map[string]*ir.Column, compareAs ma
 // be at all. compareAs is the target flavor's key-guard comparison map
 // ([Flavor.keyGuardCollations]): the collation on this target server that
 // compares as a cross-flavor source collation does. It is NOT the emitter's
-// remap ([Flavor.crossFlavorCollationRemap]), which moves a MySQL 8
-// `utf8mb4_0900_ai_ci` (NO PAD) to MariaDB's PAD SPACE `utf8mb4_uca1400_ai_ci`;
-// judged by that map the column looked unchanged and an `'a '` row silently
-// overwrote `'a'` (review F-A). A source collation equal to the target's
+// remap ([Flavor.crossFlavorCollationRemap]), which through v0.159.0 moved a
+// MySQL 8 `utf8mb4_0900_ai_ci` (NO PAD) to MariaDB's PAD SPACE
+// `utf8mb4_uca1400_ai_ci`; judged by that map the column looked unchanged and
+// an `'a '` row silently overwrote `'a'` (review F-A). Since Bug 305 the
+// emitter creates the NO PAD form and the two maps agree on those names, but
+// a target an older sluice created still holds the PAD SPACE column, which
+// is why the guard keeps its own map. A source collation equal to the target's
 // under compareAs arms nothing; a different one is compared under the
 // compareAs name.
 func armedFor(src, tgt ir.Type, compareAs map[string]string) (armedCollation, bool) {
