@@ -332,6 +332,15 @@ var mysqlTargetCollations = map[string]string{
 // guard therefore compares under the NO PAD uca1400 forms, which exist from
 // MariaDB 10.10 on (measured on 10.11.19 and 11.4.13); below that the
 // guard's probe fails and the table refuses KEY-COLLATION-GUARD-UNSUPPORTED.
+// That is below the supported 10.11 floor, and no sluice-created table
+// reaches it: measured 2026-10-12 on 10.5 and 10.6, a cold start fails
+// earlier, at CREATE TABLE (the emitter's uca1400 forms are 10.10+ too,
+// Error 1273), and a pre-existing table of another collation is refused by
+// the pre-create gate. Only `--schema-already-applied` onto a hand-made
+// table gets there, and it refuses at the first CDC write to the table,
+// before any change to it is applied (the copied rows stay as copied)
+// (TestKeyCollationGuardUnsupported_NamesTheSourcesOwnCollation pins the
+// wording).
 // Residual, stated: the comparison is UCA 14.0.0 where the source sorts by
 // UCA 9.0.0, so two strings whose weights differ only between those versions
 // are judged by the newer table. The reverse map folds the uca1400 NO PAD

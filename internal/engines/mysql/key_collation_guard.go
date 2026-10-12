@@ -104,8 +104,12 @@ type armedCollation struct {
 	// collation), so the comparison is on the binary strings.
 	bytes bool
 	// charset / collation: a MySQL-family source collation, applied to both
-	// values converted to its character set.
-	charset, collation string
+	// values converted to its character set. collation is the name the
+	// comparison runs under on THIS server (the key-guard map's, for a
+	// cross-flavor source); declared is the source's own name for it, which
+	// the GUARD-UNSUPPORTED refusal reports so it never attributes the
+	// comparison name to the source.
+	charset, collation, declared string
 	// uniqueOnly: the source column is on a Postgres database's DEFAULT
 	// collation (no name, stamped deterministic), which the MySQL target
 	// created under its own default — usually case-insensitive. Armed only
@@ -213,14 +217,15 @@ func armedFor(src, tgt ir.Type, compareAs map[string]string) (armedCollation, bo
 	}
 	switch translate.CollationDialect(scs, srcColl) {
 	case "mysql":
-		srcColl = strings.ToLower(srcColl)
+		declared := strings.ToLower(srcColl)
+		srcColl = declared
 		if mapped, ok := compareAs[srcColl]; ok {
 			srcColl = mapped
 		}
 		if strings.EqualFold(scs, tcs) && strings.EqualFold(srcColl, tcoll) {
 			return armedCollation{}, false
 		}
-		return armedCollation{charset: strings.ToLower(scs), collation: srcColl}, true
+		return armedCollation{charset: strings.ToLower(scs), collation: srcColl, declared: declared}, true
 	case "postgres":
 		if collationDeterminismOf(src) == ir.CollationDeterministic {
 			return armedCollation{bytes: true}, true
@@ -410,15 +415,34 @@ func (a *ChangeApplier) checkKeyCollationsExpressible(ctx context.Context, q que
 		var probe sql.NullString
 		err := q.QueryRowContext(ctx, "SELECT CONVERT('' USING "+ac.charset+") COLLATE "+ac.collation).Scan(&probe)
 		if err != nil {
-			return &terminalMySQLError{err: fmt.Errorf("%w: %s: mysql: applier: %s: the source declares key column %q "+
-				"with CHARACTER SET %s COLLATE %s, which this target server does not support (%v), so sluice cannot "+
-				"check that an upsert does not merge two source rows the target's collation equates. Refusing before "+
-				"any row of the table is applied. Give the target column a collation that compares as the source's "+
-				"does, or re-copy the table",
-				ir.ErrKeyCollationMerge, keyCollationGuardUnsupportedMarker, qn, col, ac.charset, ac.collation, err)}
+			return keyCollationGuardUnsupported(qn, col, ac, err)
 		}
 	}
 	return nil
+}
+
+// keyCollationGuardUnsupported is the GUARD-UNSUPPORTED refusal for one armed
+// column. It names the source's own collation and, separately, the one the
+// comparison needs on this server: for a MySQL 8 source on a MariaDB target
+// they differ (`utf8mb4_0900_ai_ci` is compared as
+// `utf8mb4_uca1400_nopad_ai_ci`, which MariaDB has only from 10.10 on, so
+// below the supported 10.11 floor this is what the first write to an armed
+// table meets — measured on 10.5 and 10.6, nothing of the table applied).
+func keyCollationGuardUnsupported(qn, col string, ac armedCollation, cause error) error {
+	declared, compared := ac.declared, ""
+	if declared == "" {
+		declared = ac.collation
+	}
+	if declared != ac.collation {
+		compared = " (compared on this target as " + ac.collation + ")"
+	}
+	return &terminalMySQLError{err: fmt.Errorf("%w: %s: mysql: applier: %s: the source declares key column %q "+
+		"with CHARACTER SET %s COLLATE %s%s, which this target server does not support (%v), so sluice cannot "+
+		"check that an upsert does not merge two source rows the target's collation equates. Refusing before "+
+		"any row of the table is applied. Give the target column a collation that compares as the source's "+
+		"does, move the target to a server version that has %s, or re-copy the table",
+		ir.ErrKeyCollationMerge, keyCollationGuardUnsupportedMarker, qn, col, ac.charset, declared, compared,
+		cause, ac.collation)}
 }
 
 // keyCollationMergeRefusal attributes a guarded upsert's failure: a 1690

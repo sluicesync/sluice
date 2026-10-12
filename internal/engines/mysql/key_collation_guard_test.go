@@ -249,3 +249,47 @@ func TestKeyCollationMergeRefusal_NeedsTheNumberAndTheMarker(t *testing.T) {
 		t.Error("an unguarded statement's 1690 was attributed to the guard")
 	}
 }
+
+// TestKeyCollationGuardUnsupported_NamesTheSourcesOwnCollation pins the
+// GUARD-UNSUPPORTED refusal for the cross-flavor arm: a MySQL 8
+// `utf8mb4_0900_ai_ci` key on a MariaDB target is compared as
+// `utf8mb4_uca1400_nopad_ai_ci`, which MariaDB below 10.10 does not have
+// (measured on 10.5 and 10.6: the first CDC write to the table refuses).
+// The refusal must attribute 0900 to the source and the NO PAD form to the
+// comparison, not claim the source declares a collation it does not; it is
+// terminal and carries the merge sentinel the restart roster keys on.
+func TestKeyCollationGuardUnsupported_NamesTheSourcesOwnCollation(t *testing.T) {
+	src := ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: "utf8mb4_0900_ai_ci"}
+	tgt := ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: "utf8mb4_general_ci"}
+	ac, armed := armedFor(src, tgt, FlavorMariaDB.keyGuardCollations())
+	if !armed {
+		t.Fatal("a 0900_ai_ci key on a MariaDB general_ci column is not armed")
+	}
+	cause := &mysql.MySQLError{Number: 1273, Message: "Unknown collation: 'utf8mb4_uca1400_nopad_ai_ci'"}
+	err := keyCollationGuardUnsupported("`t`.`kd`", "k", ac, cause)
+	msg := err.Error()
+	for _, want := range []string{
+		keyCollationGuardUnsupportedMarker,
+		"COLLATE utf8mb4_0900_ai_ci (compared on this target as utf8mb4_uca1400_nopad_ai_ci)",
+		"a server version that has utf8mb4_uca1400_nopad_ai_ci",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("refusal lacks %q:\n%s", want, msg)
+		}
+	}
+	if !errors.Is(err, ir.ErrKeyCollationMerge) {
+		t.Error("the refusal does not carry ir.ErrKeyCollationMerge (the restart roster's key)")
+	}
+	var term ir.TerminalError
+	if !errors.As(err, &term) || !term.Terminal() {
+		t.Error("the refusal is not terminal")
+	}
+
+	// A same-flavor collation the target lacks has no separate comparison
+	// name, and the message says nothing about one.
+	same, _ := armedFor(ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: "utf8mb4_ja_0900_as_cs"}, tgt, FlavorVanilla.keyGuardCollations())
+	if msg := keyCollationGuardUnsupported("`t`.`kd`", "k", same, cause).Error(); strings.Contains(msg, "compared on this target") ||
+		!strings.Contains(msg, "COLLATE utf8mb4_ja_0900_as_cs, which") {
+		t.Errorf("same-flavor refusal mis-rendered:\n%s", msg)
+	}
+}
