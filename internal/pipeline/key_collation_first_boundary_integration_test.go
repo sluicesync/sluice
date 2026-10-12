@@ -19,9 +19,12 @@
 // refused and the target holds only rows identical to the source's, the
 // colliding row absent. Never the stream's own logs.
 //
-// Postgres sources are NOT in this matrix: pgoutput carries no collation,
-// so options (2) and (5) cannot see a Postgres change, and its cells still
-// merge (the applier backstop, option 3, is the door for them; not built).
+// Postgres sources are in this matrix too (TestKeyCollationFirstBoundary_Postgres16):
+// pgoutput carries no collation, so they measured merging on every entry
+// before the fix; the reader now reads each column's collation from the
+// catalog at every Relation, and the applier backstop (option 3,
+// KEY-COLLATION-MERGE) refuses what a boundary does not show. The grade
+// does not care which door refused.
 
 package pipeline
 

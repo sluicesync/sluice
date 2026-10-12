@@ -41,9 +41,15 @@ package pipeline
 //
 // # What it does not see, stated
 //
-//   - A source whose change stream carries no collation — pgoutput, VStream
-//     — gives the boundary none to compare, so nothing here fires for it.
-//     That is the applier backstop's job (option 3, not built).
+//   - A source whose boundary carries no collation — VStream — gives this
+//     door nothing to compare, so nothing here fires for it. pgoutput
+//     carries none either, but the Postgres reader reads each column's
+//     collation from the catalog at every Relation (cdc_relations.go), so a
+//     Postgres boundary carries the collation in force when it was read,
+//     not necessarily the one the change was made under. What the boundary
+//     cannot see is the applier backstop's job (option 3,
+//     [ir.ErrKeyCollationMerge], both appliers); a VStream source stays
+//     uncovered by both (docs/production-readiness.md, F17).
 //   - A non-key column is not judged: its collation decides no row identity.
 //   - A collation from another dialect than the target's (MySQL → Postgres)
 //     is not judged: the target's writer never carries a foreign collation,
