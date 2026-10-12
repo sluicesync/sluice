@@ -1544,8 +1544,11 @@ func (r *CDCReader) dispatch(ctx context.Context, ev *replication.BinlogEvent, o
 			}
 			r.charsetShapes.crossedAlter(string(e.Query))
 			// RENAME-SWAP-INVISIBLE: what the statement did to column
-			// identities, judged before the table's next shape is used.
-			r.noteColumnIdentityDDL(ctx, string(e.Query), stmtSchema)
+			// identities; a statement that leaves a name holding another
+			// column refuses here, before the DDL is crossed.
+			if err := r.noteColumnIdentityDDL(ctx, string(e.Query), stmtSchema); err != nil {
+				return err
+			}
 			// SLM-1: the cache about to be cleared is the last shape each
 			// decoded table was known by — keep that as the refusal's prev
 			// before it is gone, so the rebuild after this DDL has something

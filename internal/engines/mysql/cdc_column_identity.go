@@ -39,10 +39,17 @@ import (
 // reader's own position, whatever the metadata and however far behind the
 // head the reader is. So the reader keeps, per table, a ledger of what the
 // ALTERs since the table's last decoded shape did to its columns' identity
-// ([columnIdentityLedger]), and before the table's next shape is used —
-// its next row, or the rotation boundary's settle — refuses when a name
-// that existed before now holds something else
-// ([CDCReader.judgeColumnIdentity]).
+// ([columnIdentityLedger]) and refuses when a name that existed before now
+// holds something else. It refuses AT THE DDL EVENT ([CDCReader.noteColumnIdentityDDL]),
+// not at the table's next row: the target's existing rows are wrong from
+// the moment the source executes the statement, and a restart between the
+// two would otherwise start past the DDL with an empty ledger — any commit
+// of another table (or the heartbeat) persists a position there, so a
+// routine restart is enough (review F1, measured on every shape). A refused
+// DDL is never crossed, so a restart re-reads it and refuses again. The
+// table's next shape — its next row, or the rotation boundary's settle — is
+// judged once more ([CDCReader.judgeColumnIdentity]), for the pure
+// permutation below, which only becomes refusable once a column is moved.
 //
 // One shape is left to the downstream doors: a pure permutation (a rename
 // swap or rotation among names that all survive) with no column moved by
@@ -52,22 +59,35 @@ import (
 // refusing it here would take that remedy away, because a restart replays
 // the same DDL into the same ledger. Anything else that changed a name's
 // column refuses here, with the re-copy remedy: nothing on the target can
-// prove the operator mirrored it.
+// prove the operator mirrored it. The cost of refusing at the DDL: a swap
+// spelled as three renames through a temporary name (`b TO tmp; c TO b;
+// tmp TO c`) refuses at its second statement, where it is
+// indistinguishable from `DROP b; RENAME c TO b`, with the re-copy remedy
+// instead of the order doors' apply-the-renames one.
+//
+// MariaDB's `IF [NOT] EXISTS` on a column clause is outside the parser's
+// grammar; it is removed and the statement re-parsed
+// ([stripColumnIfExists]), reading each clause as having taken effect — a
+// no-op `DROP COLUMN IF EXISTS c` then `ADD COLUMN c` refuses too (loud).
+// A statement that still cannot be parsed ([CDCReader.unreadIdentityDDL])
+// refuses when it names an in-scope table and either spells DROP, CHANGE
+// or RENAME outside quotes, or follows a statement that already vacated a
+// name of that table; otherwise it is logged at WARN as
+// COLUMN-IDENTITY-UNREAD, so a routine `ADD COLUMN u UUID` keeps flowing.
 //
 // The expected value is independent of the thing checked: the server's own
 // record of the statements it executed, not a comparison of shapes.
 //
 // # What it does not see
 //
-//   - A statement the parser cannot read (MariaDB's UUID type, `ADD COLUMN
-//     IF NOT EXISTS`, ...) is not tracked: refusing every such DDL at the
-//     head would stop working MariaDB streams on routine changes. It is
-//     logged at WARN under COLUMN-IDENTITY-UNREAD, naming the statement.
-//   - The ledger is in-process, like the owed boundary it sits beside
-//     (cdc_owed_schema_boundary.go): a position persisted between two
-//     statements of one of these shapes, then a restart before the table's
-//     next row, starts a fresh ledger past the first statement (GC-44's
-//     class).
+//   - A pure permutation, a persisted position past it, a restart, then a
+//     `MODIFY … AFTER` restoring the old order: the permutation is not
+//     refusable at its own DDL (the order doors judge it), and the fresh
+//     ledger after the restart sees only a reorder. The ledger is
+//     in-process, like the owed boundary it sits beside
+//     (cdc_owed_schema_boundary.go; GC-44's class).
+//   - An unparsed statement that names no table, or names one the prefix
+//     reader cannot bound, is logged, not refused.
 //   - Table identity: `RENAME TABLE a TO tmp, b TO a, tmp TO b` and a DROP
 //     plus CREATE of the same name are the same defect one level up; the
 //     ledger follows a table across a rename but does not judge it.
@@ -212,69 +232,162 @@ func identityKey(schema, table string) string {
 }
 
 // noteColumnIdentityDDL records what a DDL statement does to column
-// identities. Called by the generic-DDL arm for every in-scope DDL.
-func (r *CDCReader) noteColumnIdentityDDL(ctx context.Context, stmt, defaultSchema string) {
+// identities, and refuses when the statement leaves an in-scope table with
+// a name holding another column (other than a pure permutation the order
+// doors judge). Called by the generic-DDL arm for every in-scope DDL; a
+// refusal stops the stream before the DDL is crossed.
+func (r *CDCReader) noteColumnIdentityDDL(ctx context.Context, stmt, defaultSchema string) error {
 	parsed, ok := parseIdentityDDL(stmt)
 	if !ok {
-		if reach := classifyDDLReach(stmt, defaultSchema); !reach.neutral {
-			slog.WarnContext(ctx, "mysql: cdc: COLUMN-IDENTITY-UNREAD: a schema change could not be parsed, so a "+
-				"column it renamed, dropped or re-added under an existing name would not be seen",
-				slog.String("statement", abbreviateStatement(stmt)))
-		}
-		return
+		return r.unreadIdentityDDL(ctx, stmt, defaultSchema)
 	}
 	if r.columnIdentity == nil {
 		r.columnIdentity = columnIdentityTables{}
 	}
-	ref := func(t sqlparser.TableName) string {
+	ref := func(t sqlparser.TableName) ddlTableRef {
 		schema := t.Qualifier.String()
 		if schema == "" {
 			schema = defaultSchema
 		}
-		return identityKey(schema, t.Name.String())
+		return ddlTableRef{schema: schema, table: t.Name.String()}
 	}
-	move := func(from, to string) {
-		l := r.columnIdentity[from]
-		delete(r.columnIdentity, from)
+	key := func(t ddlTableRef) string { return identityKey(t.schema, t.table) }
+	move := func(from, to ddlTableRef) {
+		l := r.columnIdentity[key(from)]
+		delete(r.columnIdentity, key(from))
 		if l != nil {
-			r.columnIdentity[to] = l
+			r.columnIdentity[key(to)] = l
 		} else {
-			delete(r.columnIdentity, to)
+			delete(r.columnIdentity, key(to))
 		}
 	}
+	var touched []ddlTableRef
 	switch s := parsed.(type) {
 	case *sqlparser.AlterTable:
-		key := ref(s.Table)
-		l := r.columnIdentity[key]
+		t := ref(s.Table)
+		l := r.columnIdentity[key(t)]
 		if l == nil {
 			l = &columnIdentityLedger{}
 		}
 		l.apply(columnIdentityEditOf(s), stmt)
 		if l.now != nil {
-			r.columnIdentity[key] = l
+			r.columnIdentity[key(t)] = l
 		}
+		touched = append(touched, t)
 		for _, opt := range s.AlterOptions {
 			if rn, ok := opt.(*sqlparser.RenameTableName); ok {
-				move(key, ref(rn.Table))
+				move(t, ref(rn.Table))
+				t = ref(rn.Table)
+				touched = append(touched, t)
 			}
 		}
 	case *sqlparser.RenameTable:
 		// Pairs apply in order (`a TO tmp, b TO a, tmp TO b`).
 		for _, p := range s.TablePairs {
 			move(ref(p.FromTable), ref(p.ToTable))
+			touched = append(touched, ref(p.ToTable))
 		}
 	case *sqlparser.DropTable:
-		for _, t := range s.FromTables {
-			delete(r.columnIdentity, ref(t))
+		// A temporary table shadows the base table without touching it.
+		if !s.Temp {
+			for _, t := range s.FromTables {
+				delete(r.columnIdentity, key(ref(t)))
+			}
 		}
 	case *sqlparser.CreateTable:
-		delete(r.columnIdentity, ref(s.Table))
+		// CREATE TABLE IF NOT EXISTS of an existing table is a no-op the
+		// server still binlogs (ORMs issue it on every start), and a
+		// temporary table leaves the base table alone: neither is a new
+		// table, so neither resets its ledger (review F2).
+		if !s.IfNotExists && !s.Temp {
+			delete(r.columnIdentity, key(ref(s.Table)))
+		}
 	}
+	for _, t := range touched {
+		if err := r.refuseIdentityChangeAt(t); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// parseIdentityDDL parses a DDL statement the way [classifyDDLReach] does.
-// ok is false for a statement it cannot fully read.
+// identityInScope reports whether a table a DDL names is one this stream
+// replicates: its database is in scope and, when the pipeline wired a
+// table filter, the table passes it. The names are the statement's own
+// spelling, which may differ in case from the stored one the filter was
+// given: a mismatch makes a table look out of scope here, and its next row
+// is still judged by the row path, which uses the stored name.
+func (r *CDCReader) identityInScope(t ddlTableRef) bool {
+	if !r.databaseInScope(t.schema) {
+		return false
+	}
+	return r.scopeAllowed == nil || r.scopeAllowed(t.schema, t.table)
+}
+
+// refuseIdentityChangeAt refuses when t's ledger now holds a change that is
+// not a pure permutation. The ledger is kept, not settled: the refused DDL
+// is not crossed, so a restart replays it into a fresh ledger and refuses
+// again.
+func (r *CDCReader) refuseIdentityChangeAt(t ddlTableRef) error {
+	if !r.identityInScope(t) {
+		return nil
+	}
+	l := r.columnIdentity[identityKey(t.schema, t.table)]
+	if l == nil {
+		return nil
+	}
+	names, permutation := l.changed()
+	if len(names) == 0 || permutation {
+		return nil
+	}
+	return columnIdentityRefusal(qualifiedName(t.schema, t.table), l.describe(names), l.first)
+}
+
+// unreadIdentityDDL handles a statement [parseIdentityDDL] cannot read
+// (review F3). It refuses when the statement's prefix names an in-scope
+// table and either spells DROP, CHANGE or RENAME outside quotes — it may
+// have vacated a name — or the table's ledger already holds a vacated name
+// the statement may have re-occupied. Anything else is logged and flows: a
+// routine MariaDB `ADD COLUMN u UUID` changes no column's identity.
+func (r *CDCReader) unreadIdentityDDL(ctx context.Context, stmt, defaultSchema string) error {
+	if reach, ok := classifyUnparsedDDL(stripLeadingSQLComments(stmt), defaultSchema); ok && !reach.neutral {
+		vacating := sqlWordsInclude(stmt, "DROP", "CHANGE", "RENAME")
+		for _, t := range reach.tables {
+			if !r.identityInScope(t) {
+				continue
+			}
+			l := r.columnIdentity[identityKey(t.schema, t.table)]
+			if vacating || (l != nil && len(l.vacated) > 0) {
+				return fmt.Errorf("mysql: cdc: %s: %w (COLUMN-IDENTITY-UNREAD): sluice could not parse the schema change "+
+					"%q, which may drop, rename or re-add one of the table's columns under a name the table already had. "+
+					"Refusing before it is crossed. Re-copy the stream: `sluice sync start --reset-target-data --yes` "+
+					"with the stream's other flags unchanged for a sync, or a fresh `backup full` for a backup chain",
+					qualifiedName(t.schema, t.table), ir.ErrColumnIdentityChanged, abbreviateStatement(stmt))
+			}
+		}
+	}
+	if reach := classifyDDLReach(stmt, defaultSchema); !reach.neutral {
+		slog.WarnContext(ctx, "mysql: cdc: COLUMN-IDENTITY-UNREAD: a schema change could not be parsed; it neither "+
+			"spells DROP, CHANGE or RENAME nor follows one on its table, so it is taken as changing no column's identity",
+			slog.String("statement", abbreviateStatement(stmt)))
+	}
+	return nil
+}
+
+// parseIdentityDDL parses a DDL statement the way [classifyDDLReach] does,
+// retrying once with MariaDB's column-clause `IF [NOT] EXISTS` removed
+// ([stripColumnIfExists]). ok is false for a statement it cannot fully read.
 func parseIdentityDDL(stmt string) (sqlparser.Statement, bool) {
+	if parsed, ok := parseIdentityDDLOnce(stmt); ok {
+		return parsed, true
+	}
+	if stripped, changed := stripColumnIfExists(stmt); changed {
+		return parseIdentityDDLOnce(stripped)
+	}
+	return nil, false
+}
+
+func parseIdentityDDLOnce(stmt string) (sqlparser.Statement, bool) {
 	stmt = stripLeadingSQLComments(stmt)
 	p := charsetDDLParser()
 	if stmt == "" || p == nil {
@@ -292,6 +405,153 @@ func parseIdentityDDL(stmt string) (sqlparser.Statement, bool) {
 		return nil, false
 	}
 	return parsed, true
+}
+
+// sqlWord is one token of a statement: an unquoted word (a keyword or a
+// bare identifier) with its byte span, or a marker that something else —
+// punctuation, a quoted identifier or a string literal — stood there.
+type sqlWord struct {
+	text       string
+	start, end int
+	word       bool
+}
+
+// sqlWords tokenises a whole statement. String literals and backtick
+// identifiers are opaque (never words); plain comments are skipped; the
+// content of a comment the server may EXECUTE (`/*!…*/`, `/*+…*/`) is
+// tokenised as code, and executable reports that one was seen.
+func sqlWords(stmt string) (out []sqlWord, executable bool) {
+	for i := 0; i < len(stmt); {
+		c := stmt[i]
+		switch {
+		case c == ' ' || c == '\t' || c == '\r' || c == '\n':
+			i++
+		case strings.HasPrefix(stmt[i:], "/*!") || strings.HasPrefix(stmt[i:], "/*+"):
+			executable = true
+			i += 3
+			for i < len(stmt) && stmt[i] >= '0' && stmt[i] <= '9' {
+				i++
+			}
+		case strings.HasPrefix(stmt[i:], "*/"):
+			i += 2
+		case strings.HasPrefix(stmt[i:], "/*"):
+			end := strings.Index(stmt[i+2:], "*/")
+			if end < 0 {
+				return out, executable
+			}
+			i += end + 4
+		case c == '#' || strings.HasPrefix(stmt[i:], "-- "):
+			end := strings.IndexByte(stmt[i:], '\n')
+			if end < 0 {
+				return out, executable
+			}
+			i += end + 1
+		case c == '\'' || c == '"' || c == '`':
+			j := i + 1
+			for j < len(stmt) {
+				if stmt[j] == '\\' && c != '`' {
+					j += 2
+					continue
+				}
+				if stmt[j] == c {
+					if j+1 < len(stmt) && stmt[j+1] == c {
+						j += 2
+						continue
+					}
+					break
+				}
+				j++
+			}
+			out = append(out, sqlWord{start: i, end: min(j+1, len(stmt))})
+			i = j + 1
+		case isSQLWordByte(c):
+			j := i
+			for j < len(stmt) && isSQLWordByte(stmt[j]) {
+				j++
+			}
+			out = append(out, sqlWord{text: stmt[i:j], start: i, end: j, word: true})
+			i = j
+		default:
+			out = append(out, sqlWord{start: i, end: i + 1})
+			i++
+		}
+	}
+	return out, executable
+}
+
+func isSQLWordByte(c byte) bool {
+	return c == '_' || c == '$' || c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= 0x80
+}
+
+// is reports whether w is the unquoted keyword kw.
+func (w sqlWord) is(kw string) bool { return w.word && strings.EqualFold(w.text, kw) }
+
+// sqlWordsInclude reports whether stmt spells any of kws as an unquoted word.
+func sqlWordsInclude(stmt string, kws ...string) bool {
+	words, _ := sqlWords(stmt)
+	for _, w := range words {
+		for _, kw := range kws {
+			if w.is(kw) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// stripColumnIfExists removes MariaDB's `IF [NOT] EXISTS` from the column
+// clauses of an ALTER TABLE — after `ADD [COLUMN]`, `DROP [COLUMN]`,
+// `CHANGE [COLUMN]`, `MODIFY [COLUMN]` and `RENAME COLUMN` — which the
+// parser's grammar lacks. It never edits inside a quoted identifier or a
+// string, and leaves a statement carrying an executable comment unchanged
+// (its clauses cannot be located by position). changed is false when it
+// removed nothing.
+func stripColumnIfExists(stmt string) (out string, changed bool) {
+	words, executable := sqlWords(stmt)
+	if executable || len(words) == 0 || !words[0].is("ALTER") {
+		return stmt, false
+	}
+	var cuts [][2]int
+	for i := 0; i < len(words); i++ {
+		w := words[i]
+		renaming := w.is("RENAME")
+		if !w.is("ADD") && !w.is("DROP") && !w.is("CHANGE") && !w.is("MODIFY") && !renaming {
+			continue
+		}
+		j := i + 1
+		if j < len(words) && words[j].is("COLUMN") {
+			j++
+		} else if renaming {
+			continue
+		}
+		k := j
+		if k < len(words) && words[k].is("IF") {
+			k++
+			if k < len(words) && words[k].is("NOT") {
+				k++
+			}
+			if k < len(words) && words[k].is("EXISTS") {
+				// Through the whitespace after EXISTS, up to the next token.
+				end := words[k].end
+				if k+1 < len(words) {
+					end = words[k+1].start
+				}
+				cuts = append(cuts, [2]int{words[j].start, end})
+				i = k
+			}
+		}
+	}
+	if len(cuts) == 0 {
+		return stmt, false
+	}
+	var b strings.Builder
+	prev := 0
+	for _, c := range cuts {
+		b.WriteString(stmt[prev:c[0]])
+		prev = c[1]
+	}
+	b.WriteString(stmt[prev:])
+	return b.String(), true
 }
 
 // columnIdentityEditOf extracts an ALTER TABLE's column-identity clauses.
