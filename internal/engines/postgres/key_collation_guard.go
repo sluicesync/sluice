@@ -23,11 +23,12 @@ package postgres
 // collation than the target's. The guard compares the two keys under the
 // source's collation: a named DETERMINISTIC source collation compares
 // bytes, through `COLLATE "C"`; a nondeterministic one compares under its
-// own name. A source key on the database default collation carries no
-// determinism at the boundary (the reader spells it as the SchemaReader
-// does, which the seed is held to raw) and cannot be told from a stream
-// that carries no collation at all, so it is not armed — stated residual. Equal there → the same
-// source key: a re-applied or re-delivered INSERT, absorbed as before.
+// own name. A source key on the database default collation is stamped
+// deterministic by both Postgres readers (the catalog's own answer for the
+// 'default' row on the CDC side), so it compares bytes too; an empty name
+// with no determinism means the boundary carried no collation at all (a
+// schema decoded from an older binary) and arms nothing. Equal there → the
+// same source key: a re-applied or re-delivered INSERT, absorbed as before.
 // Different → the source has two rows: refuse.
 //
 // No round trip is added: the check is the DO UPDATE's own WHERE, a CASE
@@ -83,9 +84,15 @@ type targetKeyCollation struct {
 }
 
 // planPGKeyCollationGuard decides which conflict-key columns are armed.
-func planPGKeyCollationGuard(source *ir.Table, key []string, target map[string]targetKeyCollation) *pgKeyCollationPlan {
+// unexpressible lists, as "column (charset collation)", each NONDETERMINISTIC
+// target key column whose source declares a MySQL-family collation: Postgres
+// has no collation that compares as it does, so the guard cannot be written
+// and the caller refuses (KEY-COLLATION-GUARD-UNSUPPORTED) rather than apply
+// unguarded (review LOW). A deterministic target key needs no guard whatever
+// the source says.
+func planPGKeyCollationGuard(source *ir.Table, key []string, target map[string]targetKeyCollation) (plan *pgKeyCollationPlan, unexpressible []string) {
 	if source == nil || len(key) == 0 {
-		return nil
+		return nil, nil
 	}
 	srcCols := map[string]ir.Type{}
 	for _, c := range source.Columns {
@@ -104,8 +111,12 @@ func planPGKeyCollationGuard(source *ir.Table, key []string, target map[string]t
 			continue
 		}
 		cs, name, det, known := sourceKeyCollation(st)
-		if !known || cs != "" {
-			continue // unknown, or a MySQL-family collation Postgres cannot express
+		if !known {
+			continue // the boundary carried no collation: stated residual
+		}
+		if cs != "" {
+			unexpressible = append(unexpressible, fmt.Sprintf("%s (%s %s)", col, cs, name))
+			continue
 		}
 		switch {
 		case det == ir.CollationDeterministic:
@@ -120,16 +131,19 @@ func planPGKeyCollationGuard(source *ir.Table, key []string, target map[string]t
 		}
 	}
 	if len(p.compare) == 0 {
-		return nil
+		return nil, unexpressible
 	}
-	return p
+	return p, unexpressible
 }
 
 // sourceKeyCollation reads a source column's declared collation; known is
 // false when the boundary carried none (a change stream that cannot see
-// it, a non-character column).
+// it, a non-character column). A domain over a character type has its base
+// type's collation.
 func sourceKeyCollation(t ir.Type) (charset, name string, det ir.CollationDeterminism, known bool) {
 	switch v := t.(type) {
+	case ir.Domain:
+		return sourceKeyCollation(v.BaseType)
 	case ir.Varchar:
 		charset, name, det = v.Charset, v.Collation, v.Determinism
 	case ir.Char:
@@ -200,7 +214,16 @@ func (a *ChangeApplier) keyCollationPlanFor(ctx context.Context, srcSchema, sche
 		if err != nil {
 			return nil, fmt.Errorf("postgres: applier: read the key collations of %s for the key-collation guard: %w", qn, err)
 		}
-		plan = planPGKeyCollationGuard(source, key, target)
+		var unexpressible []string
+		plan, unexpressible = planPGKeyCollationGuard(source, key, target)
+		if len(unexpressible) > 0 {
+			return nil, &terminalPGError{err: fmt.Errorf("%w: %s: postgres: applier: %s: the target compares key "+
+				"column(s) %s under a nondeterministic collation, and the source declares a MySQL-family collation "+
+				"Postgres has no equivalent for, so sluice cannot check that an upsert does not merge two source "+
+				"rows the target's collation equates. Refusing before the table's first upsert; give the "+
+				"target key a deterministic collation (the database default, or \"C\"), or re-copy the table. Nothing of this upsert was applied",
+				ir.ErrKeyCollationMerge, keyCollationGuardUnsupportedMarker, qn, strings.Join(unexpressible, ", "))}
+		}
 		if plan != nil {
 			if err := checkPGCollationsExist(ctx, a.db, qn, plan); err != nil {
 				return nil, err

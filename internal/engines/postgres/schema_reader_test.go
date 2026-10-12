@@ -115,7 +115,7 @@ func TestSchemaReader_TypeMatrix(t *testing.T) {
 	// ---- users column types ----
 	wantTypes := map[string]ir.Type{
 		"id":     ir.Integer{Width: 64, AutoIncrement: true},
-		"email":  ir.Varchar{Length: 255},
+		"email":  ir.Varchar{Length: 255, Determinism: ir.CollationDeterministic}, // the database default, stamped deterministic (KEY-COLLATION review)
 		"active": ir.Boolean{},
 		// Bug 19c: the source enum type name is now carried verbatim.
 		"role":        ir.Enum{Values: []string{"admin", "user", "guest"}, TypeName: "user_role"},

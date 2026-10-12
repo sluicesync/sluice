@@ -21,25 +21,38 @@ func TestPlanPGKeyCollationGuard(t *testing.T) {
 		source *ir.Table
 		target map[string]targetKeyCollation
 		want   string // "" = not armed
+		refuse bool   // the guard cannot be written: KEY-COLLATION-GUARD-UNSUPPORTED
 	}{
-		{"deterministic target never merges", src(ir.Text{Collation: "ci", Determinism: ir.CollationNonDeterministic}), map[string]targetKeyCollation{"k": {name: "", deterministic: true}}, ""},
-		{"source C against a nondeterministic key", src(ir.Text{Collation: "C", Determinism: ir.CollationDeterministic}), ciTarget, "C"},
-		{"source database default (no determinism at the boundary): residual, unarmed", src(ir.Text{}), ciTarget, ""},
-		{"the same nondeterministic collation", src(ir.Text{Collation: "ci", Determinism: ir.CollationNonDeterministic}), ciTarget, ""},
-		{"another nondeterministic collation", src(ir.Text{Collation: "ci_ai", Determinism: ir.CollationNonDeterministic}), ciTarget, "ci_ai"},
-		{"a MySQL-family source", src(ir.Varchar{Charset: "utf8mb4", Collation: "utf8mb4_bin"}), ciTarget, ""},
-		{"a source collation the stream did not carry", src(ir.Text{}), ciTarget, ""},
-		{"no source shape", nil, ciTarget, ""},
+		{"deterministic target never merges", src(ir.Text{Collation: "ci", Determinism: ir.CollationNonDeterministic}), map[string]targetKeyCollation{"k": {name: "", deterministic: true}}, "", false},
+		{"source C against a nondeterministic key", src(ir.Text{Collation: "C", Determinism: ir.CollationDeterministic}), ciTarget, "C", false},
+		{"source C through a domain", src(ir.Domain{Name: "code", BaseType: ir.Text{Collation: "C", Determinism: ir.CollationDeterministic}}), ciTarget, "C", false},
+		// The PG then-retype warm cells: a key moved to the database default
+		// while the stream lagged. The readers stamp the default
+		// deterministic, so it compares bytes against a nondeterministic key.
+		{"source database default, stamped deterministic", src(ir.Varchar{Length: 20, Determinism: ir.CollationDeterministic}), ciTarget, "C", false},
+		{"no collation carried at all (a schema from an older binary): unarmed", src(ir.Text{}), ciTarget, "", false},
+		{"the same nondeterministic collation", src(ir.Text{Collation: "ci", Determinism: ir.CollationNonDeterministic}), ciTarget, "", false},
+		{"another nondeterministic collation", src(ir.Text{Collation: "ci_ai", Determinism: ir.CollationNonDeterministic}), ciTarget, "ci_ai", false},
+		// Review LOW: a MySQL-family source on a nondeterministic target key
+		// was skipped silently; Postgres has no collation that compares as
+		// it does, so the guard refuses instead.
+		{"a MySQL-family source on a nondeterministic key: refused", src(ir.Varchar{Charset: "utf8mb4", Collation: "utf8mb4_bin"}), ciTarget, "", true},
+		{"a MySQL-family source on a deterministic key: nothing to guard", src(ir.Varchar{Charset: "utf8mb4", Collation: "utf8mb4_bin"}), map[string]targetKeyCollation{"k": {name: "", deterministic: true}}, "", false},
+		{"a source collation the stream did not carry", src(ir.Varchar{Length: 20}), ciTarget, "", false},
+		{"no source shape", nil, ciTarget, "", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			p := planPGKeyCollationGuard(tc.source, []string{"k"}, tc.target)
+			p, unexpressible := planPGKeyCollationGuard(tc.source, []string{"k"}, tc.target)
 			got := ""
 			if p != nil {
 				got = p.compare["k"]
 			}
 			if got != tc.want {
 				t.Fatalf("compare under %q; want %q", got, tc.want)
+			}
+			if (len(unexpressible) > 0) != tc.refuse {
+				t.Fatalf("unexpressible = %v; want refused=%v", unexpressible, tc.refuse)
 			}
 		})
 	}

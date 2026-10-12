@@ -2632,12 +2632,18 @@ func (r *CDCReader) resolveColumnCollations(ctx context.Context, entry *relation
 		if !ok {
 			continue
 		}
-		// The SchemaReader's spelling exactly (collationDeterminism): a
-		// named collation carries its determinism, the database default
-		// carries none — TestSeedAgreesWithPgoutputProjection_TypmodFamilies
-		// holds the seed and this projection to the same raw type.
+		// The SchemaReader's spelling exactly (collationDeterminism): every
+		// collation carries its determinism, the database default included
+		// (here the catalog's own answer for the 'default' row) —
+		// TestSeedAgreesWithPgoutputProjection_TypmodFamilies holds the seed
+		// and this projection to the same raw type. A default reported
+		// nondeterministic would break the premise collationDeterminism
+		// documents; it stays Unknown (unarmed) rather than name a
+		// collation that has no name.
 		det := ir.CollationDeterminismUnknown
 		switch {
+		case c.name == "" && c.deterministic:
+			det = ir.CollationDeterministic
 		case c.name == "":
 		case c.deterministic:
 			det = ir.CollationDeterministic

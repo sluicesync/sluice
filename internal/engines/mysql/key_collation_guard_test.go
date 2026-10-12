@@ -4,8 +4,12 @@
 package mysql
 
 import (
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/go-sql-driver/mysql"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -41,24 +45,76 @@ func TestPlanKeyCollationGuard(t *testing.T) {
 		remap       map[string]string
 		wantColl    string
 	}{
-		// The cold start remaps a MySQL 8 collation onto MariaDB's
-		// equivalent: no change, no guard, and no probe for a collation the
-		// target does not have.
+		// Review F-A: the cold start remaps a MySQL 8 `0900_ai_ci` (NO PAD)
+		// key onto MariaDB's PAD SPACE `uca1400_ai_ci`, which equates 'a'
+		// and 'a ' where the source does not. Judged by the emitter's remap
+		// this was "unchanged" and unguarded (measured: a silent overwrite on
+		// MariaDB 11.4). It must arm, compared under the NO PAD form.
 		{
-			"cross-flavor remap, unchanged", kcgSource(ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: "utf8mb4_0900_ai_ci"}),
-			kcgCols(ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: "utf8mb4_uca1400_ai_ci"}),
-			[]string{"k"},
-			nil, false, false, nil,
-			mariadbTargetCollations, "",
-		},
-		{
-			"cross-flavor remap, changed: compared under the target's name", kcgSource(ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: "utf8mb4_0900_bin"}),
+			"MySQL 0900_ai_ci on a MariaDB uca1400_ai_ci target: armed, NO PAD compare", kcgSource(ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: "utf8mb4_0900_ai_ci"}),
 			kcgCols(ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: "utf8mb4_uca1400_ai_ci"}),
 			[]string{"k"},
 			nil, true, false,
 			[]int{1},
-			mariadbTargetCollations, "utf8mb4_nopad_bin",
+			FlavorMariaDB.keyGuardCollations(), "utf8mb4_uca1400_nopad_ai_ci",
 		},
+		{
+			"MySQL 0900_as_cs on a MariaDB uca1400_as_cs target: armed, NO PAD compare", kcgSource(ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: "utf8mb4_0900_as_cs"}),
+			kcgCols(ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: "utf8mb4_uca1400_as_cs"}),
+			[]string{"k"},
+			nil, true, false,
+			[]int{1},
+			FlavorMariaDB.keyGuardCollations(), "utf8mb4_uca1400_nopad_as_cs",
+		},
+		{
+			"MySQL 0900_bin on a MariaDB nopad_bin target: the same comparison, unarmed", kcgSource(ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: "utf8mb4_0900_bin"}),
+			kcgCols(ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: "utf8mb4_nopad_bin"}),
+			[]string{"k"},
+			nil, false, false, nil,
+			FlavorMariaDB.keyGuardCollations(), "",
+		},
+		{
+			"MySQL 0900_ai_ci on a MariaDB NO PAD uca1400 target: the same comparison, unarmed", kcgSource(ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: "utf8mb4_0900_ai_ci"}),
+			kcgCols(ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: "utf8mb4_uca1400_nopad_ai_ci"}),
+			[]string{"k"},
+			nil, false, false, nil,
+			FlavorMariaDB.keyGuardCollations(), "",
+		},
+		{
+			"MySQL 0900_bin on a MariaDB uca1400_ai_ci target: armed, compared as nopad_bin", kcgSource(ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: "utf8mb4_0900_bin"}),
+			kcgCols(ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: "utf8mb4_uca1400_ai_ci"}),
+			[]string{"k"},
+			nil, true, false,
+			[]int{1},
+			FlavorMariaDB.keyGuardCollations(), "utf8mb4_nopad_bin",
+		},
+		// The reverse: a MariaDB uca1400 source on the MySQL 0900 column the
+		// cold start created. The 0900 target is NO PAD, so it never equates
+		// what a PAD SPACE source keeps apart: unarmed, no probe for a
+		// collation MySQL does not have.
+		{
+			"MariaDB uca1400_ai_ci on a MySQL 0900_ai_ci target: unarmed", kcgSource(ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: "utf8mb4_uca1400_ai_ci"}),
+			kcgCols(ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: "utf8mb4_0900_ai_ci"}),
+			[]string{"k"},
+			nil, false, false, nil,
+			FlavorVanilla.keyGuardCollations(), "",
+		},
+		{
+			"MariaDB uca1400_nopad_as_cs on a MySQL 0900_as_cs target: unarmed", kcgSource(ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: "utf8mb4_uca1400_nopad_as_cs"}),
+			kcgCols(ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: "utf8mb4_0900_as_cs"}),
+			[]string{"k"},
+			nil, false, false, nil,
+			FlavorVanilla.keyGuardCollations(), "",
+		},
+		{
+			"MariaDB uca1400_as_cs on a MySQL 0900_ai_ci target: armed, compared as 0900_as_cs", kcgSource(ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: "utf8mb4_uca1400_as_cs"}),
+			kcgCols(ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: "utf8mb4_0900_ai_ci"}),
+			[]string{"k"},
+			nil, true, false,
+			[]int{1},
+			FlavorVanilla.keyGuardCollations(), "utf8mb4_0900_as_cs",
+		},
+		{"Postgres deterministic source through a domain", kcgSource(ir.Domain{Name: "code", BaseType: ir.Text{Size: ir.TextLong, Collation: "C", Determinism: ir.CollationDeterministic}}), kcgCols(ci), []string{"k"}, nil, true, true, []int{1}, nil, ""},
 		{"no source shape", nil, kcgCols(ci), []string{"k"}, nil, false, false, nil, nil, ""},
 		{"source and target agree: no guard, no cost", kcgSource(ci), kcgCols(ci), []string{"k"}, nil, false, false, nil, nil, ""},
 		{"same collation in another case", kcgSource(ir.Varchar{Length: 20, Charset: "UTF8MB4", Collation: "UTF8MB4_GENERAL_CI"}), kcgCols(ci), []string{"k"}, nil, false, false, nil, nil, ""},
@@ -116,8 +172,73 @@ func TestKeyCollationGuard_RendersFirstAndOnce(t *testing.T) {
 				t.Errorf("guard %q lacks %q", assign, want)
 			}
 		}
+		// Review F-B: the raise is never a value arm (its type would be
+		// aggregated with the column's: error 4078 on MariaDB UUID / INET6 /
+		// GEOMETRY, and a CAST to CHAR silently changed FLOAT values). Both
+		// value arms are the column's own incoming value.
+		newD := upsert.newRowRef("`d`")
+		if want := ", IF((18446744073709551615 + "; !strings.Contains(assign, want) {
+			t.Errorf("the raise is not in a condition: %s", assign)
+		}
+		if !strings.HasSuffix(assign, ") = 0, "+newD+", "+newD+"))") {
+			t.Errorf("the raise's arms are not the column's own value: %s", assign)
+		}
+		if strings.Contains(strings.ToUpper(assign), " AS CHAR") {
+			t.Errorf("the guard converts a value through a string: %s", assign)
+		}
 	}
 	if _, _, ok := p.render("s", "kd", []string{"d", "id"}, upsertRowAlias); ok {
 		t.Fatal("a guard whose key column is not in the insert rendered")
+	}
+}
+
+// TestKeyCollationMergeRemedy_LeadsWithARecopyWhenTheIdentityIsArmed pins
+// the remedy's honesty (review LOW): when the key that identifies a row is
+// itself armed, or there is no primary key, a re-delivered change of that
+// key cannot be told from a second row, the refusal repeats, and only a
+// re-copy converges; otherwise aligning the collation does.
+func TestKeyCollationMergeRemedy_LeadsWithARecopyWhenTheIdentityIsArmed(t *testing.T) {
+	armedK := map[string]armedCollation{"k": {charset: "utf8mb4", collation: "utf8mb4_bin"}}
+	for _, tc := range []struct {
+		name   string
+		plan   *keyCollationPlan
+		recopy bool
+	}{
+		{"no primary key", &keyCollationPlan{armed: armedK}, true},
+		{"the primary key is the armed column", &keyCollationPlan{pk: []string{"k"}, armed: armedK}, true},
+		{"the armed column is a unique key beside the primary key", &keyCollationPlan{pk: []string{"id"}, armed: armedK}, false},
+	} {
+		got := keyCollationMergeRemedy(tc.plan, "s", "t")
+		if lead := strings.HasPrefix(got, "The key that identifies a row"); lead != tc.recopy {
+			t.Errorf("%s: remedy leads with the re-copy = %v; want %v: %s", tc.name, lead, tc.recopy, got)
+		}
+	}
+}
+
+// TestKeyCollationMergeRefusal_NeedsTheNumberAndTheMarker pins the
+// attribution (review LOW): a 1690 is the guard's raise only when the
+// server's text names the marker; an ordinary overflow in the same guarded
+// statement surfaces as itself, and the marker without the number is not
+// the guard either.
+func TestKeyCollationMergeRefusal_NeedsTheNumberAndTheMarker(t *testing.T) {
+	p := &keyCollationPlan{pk: []string{"k"}}
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"1690 with the marker", &mysql.MySQLError{Number: 1690, Message: "BIGINT UNSIGNED value is out of range in '18446744073709551615 + octet_length(concat('KEY-COLLATION-MERGE',`new`.`k`))'"}, true},
+		{"1690 without the marker", &mysql.MySQLError{Number: 1690, Message: "BIGINT value is out of range in '(`t`.`n` + 1)'"}, false},
+		{"the marker on another error", &mysql.MySQLError{Number: 1062, Message: "Duplicate entry 'KEY-COLLATION-MERGE' for key 'k'"}, false},
+		{"wrapped 1690 with the marker", fmt.Errorf("vtgate: %w", &mysql.MySQLError{Number: 1690, Message: "out of range in 'KEY-COLLATION-MERGE'"}), true},
+	}
+	for _, tc := range cases {
+		got := errors.Is(keyCollationMergeRefusal(tc.err, p, "s", "t"), ir.ErrKeyCollationMerge)
+		if got != tc.want {
+			t.Errorf("%s: attributed = %v; want %v", tc.name, got, tc.want)
+		}
+	}
+	if err := keyCollationMergeRefusal(cases[0].err, nil, "s", "t"); errors.Is(err, ir.ErrKeyCollationMerge) {
+		t.Error("an unguarded statement's 1690 was attributed to the guard")
 	}
 }

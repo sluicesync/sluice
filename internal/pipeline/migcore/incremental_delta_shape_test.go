@@ -261,6 +261,9 @@ var alterFixtures = map[AlterAspect]alterFixture{
 		// was recorded and the restored key kept `_ci`.
 		base: func(t *ir.Table) {
 			t.Columns[1].Type = ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: "utf8mb4_0900_ai_ci"}
+			// A key column: the aspect is reported only for a column whose
+			// value decides which rows are one (TestAlterCollationOnANonKeyColumnIsNotADelta).
+			t.Indexes[0].Unique = true
 		},
 		mutate: func(a *ir.Table) {
 			a.Columns[1].Type = ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: "utf8mb4_bin"}
@@ -360,6 +363,44 @@ var alterFixtures = map[AlterAspect]alterFixture{
 		// leaving the constraint looking identical by name.
 		mutate: func(a *ir.Table) { a.ForeignKeys[0].OnDelete = ir.FKActionCascade },
 	},
+}
+
+// TestAlterCollationOnANonKeyColumnIsNotADelta pins the scope of
+// AlterAspectColumnCollation (review LOW): a collation-only change on a
+// column in no PRIMARY KEY or UNIQUE index decides no row's identity, so it
+// stays the no-op it was before the aspect existed — reported, it refused
+// every chain restore to a target with no shape-delta surface (SQLite, D1).
+// The same change on the primary key, on a UNIQUE index on either side,
+// is reported.
+func TestAlterCollationOnANonKeyColumnIsNotADelta(t *testing.T) {
+	retype := func(tbl *ir.Table, coll string) {
+		tbl.Columns[1].Type = ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: coll}
+	}
+	for _, tc := range []struct {
+		name  string
+		shape func(before, after *ir.Table)
+		want  bool
+	}{
+		{"non-unique index only", func(_, _ *ir.Table) {}, false},
+		{"no index at all", func(b, a *ir.Table) { b.Indexes, a.Indexes = nil, nil }, false},
+		{"unique index", func(b, a *ir.Table) { b.Indexes[0].Unique, a.Indexes[0].Unique = true, true }, true},
+		{"unique index on the after side only", func(_, a *ir.Table) { a.Indexes[0].Unique = true }, true},
+		{"primary key", func(b, a *ir.Table) {
+			pk := &ir.Index{Name: "PRIMARY", Unique: true, Columns: []ir.IndexColumn{{Column: "amount"}}}
+			b.PrimaryKey, a.PrimaryKey = pk, pk
+		}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before := baseTable()
+			retype(before, "utf8mb4_0900_ai_ci")
+			after := cloneTable(before)
+			retype(after, "utf8mb4_bin")
+			tc.shape(before, after)
+			if got := ClassifyAlterDelta(before, after).Has(AlterAspectColumnCollation); got != tc.want {
+				t.Fatalf("collation aspect reported = %v; want %v", got, tc.want)
+			}
+		})
+	}
 }
 
 // fixturePair renders one aspect's before/after tables.

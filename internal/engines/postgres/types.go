@@ -349,17 +349,33 @@ func translateUserDefinedType(c columnMeta) (ir.Type, error) {
 	)
 }
 
-// collationDeterminism maps a column's named-collation determinism signal
+// collationDeterminism maps a column's collation determinism signal
 // (pg_collation.collisdeterministic, read into columnMeta) to the IR carrier
-// (audit 2026-07-18 F0-3). It is only meaningful for a NAMED collation: the
-// default (unnamed) collation is always deterministic and left at the safe
-// Unknown zero value, which the character-type structs carry harmlessly (the
-// client-side `--where` evaluator treats an empty collation as byte-exact
-// regardless). For a named collation the verdict is authoritative:
-// deterministic ⇒ byte-exact `=` (safe to reproduce client-side),
-// non-deterministic ⇒ collation-aware `=` (refused).
+// (audit 2026-07-18 F0-3). For a named collation the verdict is the
+// catalog's: deterministic ⇒ byte-exact `=` (safe to reproduce
+// client-side), non-deterministic ⇒ collation-aware `=` (refused).
+//
+// The database DEFAULT collation (empty name) is stamped deterministic too
+// (KEY-COLLATION review, the PG then-retype cells). It used to be left at
+// Unknown, which is also how a schema that carried NO collation reads (a
+// VStream boundary, a schema decoded from an older binary), so the
+// key-collation guard could not arm on it: a key moved to the default while
+// a stream lagged replayed its earlier rows unguarded onto a target key that
+// equates them, and they merged at exit 0 (TestKeyCollationFirstBoundary_
+// Postgres16, then-retype warm cells). The `--where` resolver is unaffected
+// (an empty collation was byte-exact already). The premise — the default
+// collation is deterministic — is the catalog's own answer on the CDC side
+// (resolveColumnCollations reads the 'default' row's collisdeterministic);
+// here the query COALESCEs it, and TestPostgresDefaultCollationIsDeterministic
+// binds the premise against a database created with a case-insensitive ICU
+// locale.
 func collationDeterminism(c columnMeta) ir.CollationDeterminism {
 	if c.Collation == "" {
+		// A columnMeta built without the catalog read (no
+		// CollationIsDeterministic) stays Unknown, as before.
+		if c.CollationIsDeterministic {
+			return ir.CollationDeterministic
+		}
 		return ir.CollationDeterminismUnknown
 	}
 	if c.CollationIsDeterministic {

@@ -148,13 +148,53 @@ func (a *ChangeApplier) ProbeAlterColumnType(ctx context.Context, table *ir.Tabl
 	if !present {
 		return ir.ProbeOutcomeInconsistent, nil
 	}
-	if reflect.DeepEqual(observed, want.Type) {
+	if probeTypesEqual(observed, want.Type) {
 		return ir.ProbeOutcomeApplied, nil
 	}
 	return ir.ProbeOutcomeInconsistent, fmt.Errorf(
 		"postgres: probe alter column type %s.%s.%s: observed IR type %v, want %v",
 		schemaName, table.Name, want.Name, observed, want.Type,
 	)
+}
+
+// probeTypesEqual is the probe's type comparison: structural equality,
+// except that a character column on the database DEFAULT collation compares
+// without its determinism. The readers stamp the default deterministic
+// (types.go collationDeterminism), but that is a property of the database,
+// not of the DDL the probe asks about, and a want taken from a schema
+// recorded by an older binary carries none — so the stamp alone must not
+// read as a type that did not land.
+func probeTypesEqual(observed, want ir.Type) bool {
+	return reflect.DeepEqual(dropDefaultDeterminism(observed), dropDefaultDeterminism(want))
+}
+
+// dropDefaultDeterminism clears Determinism on a default-collation
+// character type (a domain's base included) and returns t otherwise.
+func dropDefaultDeterminism(t ir.Type) ir.Type {
+	switch v := t.(type) {
+	case ir.Char:
+		if v.Collation == "" {
+			v.Determinism = ir.CollationDeterminismUnknown
+		}
+		return v
+	case ir.Varchar:
+		if v.Collation == "" {
+			v.Determinism = ir.CollationDeterminismUnknown
+		}
+		return v
+	case ir.Text:
+		if v.Collation == "" {
+			v.Determinism = ir.CollationDeterminismUnknown
+		}
+		return v
+	case ir.Domain:
+		v.BaseType = dropDefaultDeterminism(v.BaseType)
+		return v
+	case ir.Array:
+		v.Element = dropDefaultDeterminism(v.Element)
+		return v
+	}
+	return t
 }
 
 // readColumnIRType introspects the named column on the target via
@@ -328,7 +368,7 @@ func (a *ChangeApplier) ProbeRenameColumn(ctx context.Context, table *ir.Table, 
 				schemaName, table.Name, newName,
 			)
 		}
-		if reflect.DeepEqual(observed, want.Type) {
+		if probeTypesEqual(observed, want.Type) {
 			return ir.ProbeOutcomeApplied, nil
 		}
 		return ir.ProbeOutcomeInconsistent, fmt.Errorf(

@@ -204,6 +204,23 @@ type schemaTypeEnvelope struct {
 	// unconstrained Inet/Cidr, i.e. emits `INET`/`CIDR` — exactly what it
 	// does today. No regression, no format bump.
 	InetFamily uint8 `json:"inet_family,omitempty"`
+
+	// CollationDeterminism is [Char.Determinism] / [Varchar.Determinism] /
+	// [Text.Determinism]: whether a NAMED Postgres collation compares
+	// byte for byte. It rides the wire because a decoded schema is what
+	// chain restore's synthetic SchemaSnapshots and a history-primed
+	// applier arm the key-collation guard from: dropped, a Postgres
+	// `text COLLATE "C"` key read back as Unknown and the guard left a
+	// Postgres-to-MySQL replay unguarded (KEY-COLLATION review F-C). It is
+	// excluded from the schema FINGERPRINT — see fingerprintType in
+	// internal/ir/backup/chain.go — because the Postgres reader sets it on
+	// every explicitly-collated column, so folding it in would mint a new
+	// chain epoch (item 104).
+	//
+	// Append-only, and forward-compatible in the direction that matters: an
+	// older binary reading a newer manifest ignores this key and decodes
+	// Unknown — exactly what it does today. No format bump.
+	CollationDeterminism uint8 `json:"collation_determinism,omitempty"`
 }
 
 // domainCheckOnDisk is the wire shape of one [DomainCheck] inside a
@@ -243,16 +260,19 @@ func MarshalType(t Type) ([]byte, error) {
 		env.Length = v.Length
 		env.Charset = v.Charset
 		env.Collation = v.Collation
+		env.CollationDeterminism = uint8(v.Determinism)
 	case Varchar:
 		env.Kind = "Varchar"
 		env.Length = v.Length
 		env.Charset = v.Charset
 		env.Collation = v.Collation
+		env.CollationDeterminism = uint8(v.Determinism)
 	case Text:
 		env.Kind = "Text"
 		env.TextSize = uint8(v.Size)
 		env.Charset = v.Charset
 		env.Collation = v.Collation
+		env.CollationDeterminism = uint8(v.Determinism)
 	case Binary:
 		env.Kind = "Binary"
 		env.Length = v.Length
@@ -391,11 +411,11 @@ func UnmarshalType(b []byte) (Type, error) {
 	case "Float":
 		return Float{Precision: FloatPrecision(env.FloatPrec)}, nil
 	case "Char":
-		return Char{Length: env.Length, Charset: env.Charset, Collation: env.Collation}, nil
+		return Char{Length: env.Length, Charset: env.Charset, Collation: env.Collation, Determinism: CollationDeterminism(env.CollationDeterminism)}, nil
 	case "Varchar":
-		return Varchar{Length: env.Length, Charset: env.Charset, Collation: env.Collation}, nil
+		return Varchar{Length: env.Length, Charset: env.Charset, Collation: env.Collation, Determinism: CollationDeterminism(env.CollationDeterminism)}, nil
 	case "Text":
-		return Text{Size: TextSize(env.TextSize), Charset: env.Charset, Collation: env.Collation}, nil
+		return Text{Size: TextSize(env.TextSize), Charset: env.Charset, Collation: env.Collation, Determinism: CollationDeterminism(env.CollationDeterminism)}, nil
 	case "Binary":
 		return Binary{Length: env.Length}, nil
 	case "Varbinary":

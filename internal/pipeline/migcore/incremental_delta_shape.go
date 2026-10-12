@@ -193,6 +193,10 @@ func (r AlterResidual) Has(a AlterAspect) bool {
 var alterColumnAspectComparators = []struct {
 	Aspect AlterAspect
 	Same   func(a, b *ir.Column) bool
+	// KeyOnly limits the aspect to a column in the primary key or a UNIQUE
+	// index on either side of the delta: elsewhere the property changes no
+	// value the replay writes, and the delta stays the no-op it always was.
+	KeyOnly bool
 }{
 	{
 		Aspect: AlterAspectColumnType,
@@ -206,8 +210,13 @@ var alterColumnAspectComparators = []struct {
 		Same:   func(a, b *ir.Column) bool { return a.Nullable == b.Nullable },
 	},
 	{
-		Aspect: AlterAspectColumnCollation,
-		Same:   func(a, b *ir.Column) bool { return sameCollation(a.Type, b.Type) },
+		// Key columns only (review LOW): a non-key column's collation
+		// decides no row's identity, and an AlterApply disposition there
+		// refused every chain restore to a target with no shape-delta
+		// surface (SQLite, D1) over a change that was a no-op before.
+		Aspect:  AlterAspectColumnCollation,
+		Same:    func(a, b *ir.Column) bool { return sameCollation(a.Type, b.Type) },
+		KeyOnly: true,
 	},
 	{
 		Aspect: AlterAspectColumnGenerated,
@@ -355,6 +364,9 @@ func ClassifyAlterDelta(before, after *ir.Table) AlterResidual {
 			if c.Same(bCol, aCol) {
 				continue
 			}
+			if c.KeyOnly && !isKeyColumn(before, aCol.Name) && !isKeyColumn(after, aCol.Name) {
+				continue
+			}
 			res.ColumnChanges = append(res.ColumnChanges, AlterColumnChange{
 				Aspect: c.Aspect, Before: bCol, After: aCol,
 			})
@@ -365,6 +377,31 @@ func ClassifyAlterDelta(before, after *ir.Table) AlterResidual {
 		}
 	}
 	return res
+}
+
+// isKeyColumn reports whether name is a column of t's primary key or of one
+// of its UNIQUE indexes — a column whose value decides which rows are one.
+func isKeyColumn(t *ir.Table, name string) bool {
+	in := func(idx *ir.Index) bool {
+		if idx == nil {
+			return false
+		}
+		for _, c := range idx.Columns {
+			if c.Column == name {
+				return true
+			}
+		}
+		return false
+	}
+	if in(t.PrimaryKey) {
+		return true
+	}
+	for _, idx := range t.Indexes {
+		if idx != nil && idx.Unique && in(idx) {
+			return true
+		}
+	}
+	return false
 }
 
 // sameColumnOrder reports whether the two shapes declare the same

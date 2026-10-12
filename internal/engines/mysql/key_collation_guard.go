@@ -45,18 +45,32 @@ package mysql
 // guard is evaluated by the server inside the statement. The FIRST
 // assignment of the update list (it must come before any assignment that
 // changes a key column — MySQL evaluates them left to right on the updated
-// row; measured) becomes `col = IF(<ok>, <new>, <raise>)`, where <raise> is
+// row; measured) becomes
+// `col = IF(<ok>, <new>, IF((<raise>) = 0, <new>, <new>))`, where <raise> is
 // an unsigned overflow carrying the marker:
 // `18446744073709551615 + OCTET_LENGTH(CONCAT('KEY-COLLATION-MERGE', …))`.
 // Measured on MySQL 8.0.46, 8.4.11, MariaDB 11.4.13 and vttestserver (a
 // sharded keyspace through vtgate): error 1690 in strict and non-strict
 // sql_mode alike, the whole multi-row statement rolled back, an
 // identical-bytes re-apply untouched, and the server's text keeps the marker.
-// The other spellings measured do NOT work everywhere: `CAST(… AS JSON)`
-// does not exist on MariaDB, and an invalid REGEXP returns NULL with a
-// warning there — the row merged with its column set to NULL. Whatever the
-// server's text keeps, the exec sites attribute a 1690 from a guarded
-// statement to [ir.KeyCollationMergeError] by provenance.
+//
+// The raise is in a CONDITION, never a value arm, because a value arm's type
+// is aggregated with the column's. Measured 2026-10-12 on MySQL 8.0, 8.4 and
+// MariaDB 10.11 / 11.4 over UUID, INET6, GEOMETRY, JSON, TIMESTAMP(6),
+// DATETIME(6), DECIMAL(65,30), BIT(64), FLOAT, DOUBLE, VARBINARY, BLOB, SET,
+// ENUM, TIME(6), YEAR, BIGINT UNSIGNED and a latin1 VARCHAR (a non-conflicting
+// insert, a same-row conflict, a merge): `IF(ok, new, <raise>)` fails EVERY
+// statement on MariaDB at its type check when the column is UUID, INET6 or
+// GEOMETRY (error 4078, a wedge on the first insert); `IF(ok, new,
+// CAST(<raise> AS CHAR))` passes the type check but routes the value through
+// a string and SILENTLY changed FLOAT 1.17549435e-38 and 16777217 on all four
+// servers; the condition form is byte-exact for every cell and raises 1690
+// with the marker. Pinned by TestKeyCollationGuard_HangTypeFamilies. The
+// other spellings measured earlier do NOT work everywhere either: `CAST(… AS
+// JSON)` does not exist on MariaDB, and an invalid REGEXP returns NULL with a
+// warning there — the row merged with its column set to NULL. The exec
+// sites attribute a 1690 to [ir.KeyCollationMergeError] only when the
+// statement carried the guard AND the server's text keeps the marker.
 //
 // One metadata read per armed table (its unique keys) and one per new
 // collation (whether this server knows it), both cached; a collation the
@@ -107,8 +121,8 @@ type keyCollationPlan struct {
 // source's current shape of the table (nil: unknown, nothing armed);
 // colTypes the target's columns; pk and uniques the target's keys. nil when
 // nothing is armed.
-func planKeyCollationGuard(source *ir.Table, colTypes map[string]*ir.Column, pk []string, uniques [][]string, remap map[string]string) *keyCollationPlan {
-	armed := armedColumns(source, colTypes, remap)
+func planKeyCollationGuard(source *ir.Table, colTypes map[string]*ir.Column, pk []string, uniques [][]string, compareAs map[string]string) *keyCollationPlan {
+	armed := armedColumns(source, colTypes, compareAs)
 	if len(armed) == 0 {
 		return nil
 	}
@@ -132,7 +146,7 @@ func planKeyCollationGuard(source *ir.Table, colTypes map[string]*ir.Column, pk 
 
 // armedColumns is every column (key or not) whose source collation the
 // target does not share, keyed by name; the caller narrows to keys.
-func armedColumns(source *ir.Table, colTypes map[string]*ir.Column, remap map[string]string) map[string]armedCollation {
+func armedColumns(source *ir.Table, colTypes map[string]*ir.Column, compareAs map[string]string) map[string]armedCollation {
 	if source == nil {
 		return nil
 	}
@@ -145,7 +159,7 @@ func armedColumns(source *ir.Table, colTypes map[string]*ir.Column, remap map[st
 		if tc == nil {
 			continue
 		}
-		if ac, ok := armedFor(c.Type, tc.Type, remap); ok {
+		if ac, ok := armedFor(c.Type, tc.Type, compareAs); ok {
 			armed[c.Name] = ac
 		}
 	}
@@ -154,13 +168,16 @@ func armedColumns(source *ir.Table, colTypes map[string]*ir.Column, remap map[st
 
 // armedFor reports how a key column whose source type is src and target type
 // is tgt must be compared under the source's collation, and whether it must
-// be at all. remap is the target flavor's cross-flavor collation remap
-// ([Flavor.crossFlavorCollationRemap]): a MySQL source's `utf8mb4_0900_*`
-// collation lands on a MariaDB target as its `uca1400` equivalent (and the
-// reverse), so the source collation is judged by its remapped name — equal
-// to the target's is not a change, and a different one is compared under
-// the name the target server has.
-func armedFor(src, tgt ir.Type, remap map[string]string) (armedCollation, bool) {
+// be at all. compareAs is the target flavor's key-guard comparison map
+// ([Flavor.keyGuardCollations]): the collation on this target server that
+// compares as a cross-flavor source collation does. It is NOT the emitter's
+// remap ([Flavor.crossFlavorCollationRemap]), which moves a MySQL 8
+// `utf8mb4_0900_ai_ci` (NO PAD) to MariaDB's PAD SPACE `utf8mb4_uca1400_ai_ci`;
+// judged by that map the column looked unchanged and an `'a '` row silently
+// overwrote `'a'` (review F-A). A source collation equal to the target's
+// under compareAs arms nothing; a different one is compared under the
+// compareAs name.
+func armedFor(src, tgt ir.Type, compareAs map[string]string) (armedCollation, bool) {
 	scs, srcColl := translate.ColumnCollation(src)
 	if srcColl == "" {
 		return armedCollation{}, false // the source's collation is not known
@@ -172,7 +189,7 @@ func armedFor(src, tgt ir.Type, remap map[string]string) (armedCollation, bool) 
 	switch translate.CollationDialect(scs, srcColl) {
 	case "mysql":
 		srcColl = strings.ToLower(srcColl)
-		if mapped, ok := remap[srcColl]; ok {
+		if mapped, ok := compareAs[srcColl]; ok {
 			srcColl = mapped
 		}
 		if strings.EqualFold(scs, tcs) && strings.EqualFold(srcColl, tcoll) {
@@ -187,7 +204,9 @@ func armedFor(src, tgt ir.Type, remap map[string]string) (armedCollation, bool) 
 	return armedCollation{}, false
 }
 
-// collationDeterminismOf is a character type's declared determinism.
+// collationDeterminismOf is a character type's declared determinism; a
+// domain over a character type has its base type's (as
+// [translate.ColumnCollation] reads its collation through the domain).
 func collationDeterminismOf(t ir.Type) ir.CollationDeterminism {
 	switch v := t.(type) {
 	case ir.Varchar:
@@ -196,6 +215,8 @@ func collationDeterminismOf(t ir.Type) ir.CollationDeterminism {
 		return v.Determinism
 	case ir.Text:
 		return v.Determinism
+	case ir.Domain:
+		return collationDeterminismOf(v.BaseType)
 	}
 	return ir.CollationDeterminismUnknown
 }
@@ -262,8 +283,13 @@ func (p *keyCollationPlan) render(schema, table string, cols []string, upsert up
 			}
 		}
 	}
+	// The raise sits in the CONDITION of an inner IF whose two arms are both
+	// the hang column's incoming value, so the assignment's type is the
+	// column's own and no value is converted (see the package comment's
+	// measured table for the spellings that fail).
 	raise := "18446744073709551615 + OCTET_LENGTH(CONCAT('" + keyCollationMergeMarker + "', " + incoming(p.marker) + "))"
-	return quoteIdent(hang) + " = IF(" + okExpr + ", " + incoming(hang) + ", " + raise + ")", hang, true
+	newHang := incoming(hang)
+	return quoteIdent(hang) + " = IF(" + okExpr + ", " + newHang + ", IF((" + raise + ") = 0, " + newHang + ", " + newHang + "))", hang, true
 }
 
 // keyCollationGuardEntry caches one table's plan against the source shape it
@@ -285,8 +311,8 @@ func (a *ChangeApplier) keyCollationPlanFor(ctx context.Context, q queryRower, s
 		return e.plan, nil
 	}
 	var plan *keyCollationPlan
-	remap := a.flavor.crossFlavorCollationRemap()
-	if len(armedColumns(source, colTypes, remap)) > 0 {
+	compareAs := a.flavor.keyGuardCollations()
+	if len(armedColumns(source, colTypes, compareAs)) > 0 {
 		// A column differs: read the unique keys beyond the primary key (the
 		// only extra read, once per table and source shape), and the target
 		// must know every collation the guard names.
@@ -294,7 +320,7 @@ func (a *ChangeApplier) keyCollationPlanFor(ctx context.Context, q queryRower, s
 		if err != nil {
 			return nil, fmt.Errorf("mysql: applier: read the unique keys of %s for the key-collation guard: %w", qn, err)
 		}
-		plan = planKeyCollationGuard(source, colTypes, pk, uniques, remap)
+		plan = planKeyCollationGuard(source, colTypes, pk, uniques, compareAs)
 		if plan != nil {
 			if err := a.checkKeyCollationsExpressible(ctx, q, qn, plan); err != nil {
 				return nil, err
@@ -371,22 +397,53 @@ func (a *ChangeApplier) checkKeyCollationsExpressible(ctx context.Context, q que
 }
 
 // keyCollationMergeRefusal attributes a guarded upsert's failure: a 1690
-// from a statement carrying the guard is the guard's raise, whatever text
-// the server kept. Anything else is returned unchanged.
+// from a statement carrying the guard, whose server text names the marker,
+// is the guard's raise. Both are required: a 1690 from an ordinary value
+// overflow in the same statement must surface as itself, not as a merge.
+// The marker survives every server measured, vtgate included (the sharded
+// pin, TestVStream_KeyCollationGuard_ShardedTarget, asserts the refusal
+// through vtgate). Anything else is returned unchanged.
 func keyCollationMergeRefusal(err error, plan *keyCollationPlan, schema, table string) error {
 	if err == nil || plan == nil {
 		return err
 	}
 	var me *mysql.MySQLError
-	if !errors.As(err, &me) || me.Number != 1690 {
-		if !strings.Contains(err.Error(), keyCollationMergeMarker) {
-			return err
-		}
+	if !errors.As(err, &me) || me.Number != 1690 || !strings.Contains(me.Message, keyCollationMergeMarker) {
+		return err
 	}
 	return &ir.KeyCollationMergeError{
 		Schema: schema, Table: table, Cause: err,
-		Remedy: fmt.Sprintf("Give the target's key column(s) the source's collation (for example `ALTER TABLE %s.%s "+
-			"MODIFY <column> … CHARACTER SET … COLLATE …` as the source declares it) and restart, or re-copy the table",
-			quoteIdent(schema), quoteIdent(table)),
+		Remedy: keyCollationMergeRemedy(plan, schema, table),
 	}
+}
+
+// keyCollationMergeRemedy is the refusal's remedy. When the key that
+// identifies a row (the primary key, or for a table without one the key the
+// applier upserts by) has no armed column, the guard tells a second source
+// row from the same one, so aligning the target key's collation converges.
+// When it does — no primary key at all, or an armed column inside it — a
+// re-delivered change of that key on a source whose collation keeps the old
+// and new values apart (`_bin`, a case-only UPDATE) looks exactly like a
+// second row: the refusal repeats on every start, and after a collation
+// change the re-delivered INSERT no longer conflicts and lands a second
+// time. A re-copy converges in both cases, so it leads.
+func keyCollationMergeRemedy(plan *keyCollationPlan, schema, table string) string {
+	identityArmed := len(plan.pk) == 0
+	for _, c := range plan.pk {
+		if _, ok := plan.armed[c]; ok {
+			identityArmed = true
+		}
+	}
+	if identityArmed {
+		return fmt.Sprintf("The key that identifies a row of %s.%s is itself compared differently on the two "+
+			"sides (or the table has no primary key), so sluice cannot tell a re-delivered change of that key "+
+			"from a second source row, and this refusal repeats on every start. Re-copy the table, which "+
+			"converges either way: restart the sync with --restart-from-scratch, or take the table out of scope, "+
+			"re-run, and bring it back with a fresh cold start. Giving the target key the source's collation "+
+			"converges only if this is a second source row, not a re-delivered change of one",
+			quoteIdent(schema), quoteIdent(table))
+	}
+	return fmt.Sprintf("Give the target's key column(s) the source's collation (for example `ALTER TABLE %s.%s "+
+		"MODIFY <column> … CHARACTER SET … COLLATE …` as the source declares it) and restart, or re-copy the table",
+		quoteIdent(schema), quoteIdent(table))
 }

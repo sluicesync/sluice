@@ -47,41 +47,14 @@ var envelopeExempt = map[string]string{
 		"emission is unaffected, so a decoded schema not carrying it loses nothing a consumer " +
 		"could act on",
 
-	// ADJUDICATED 2026-08-04 (roadmap item 121). Promoted from
-	// envelopeKnownGap after the three checks the gap entry demanded, each
-	// run rather than assumed:
-	//
-	//  1. ONE consumer. `Determinism` reaches exactly one call site —
-	//     rowpredicate/predicate.go's ResolveStringEquality — via the
-	//     engines' CollationResolver implementations.
-	//  2. NO DDL consumer. Neither the Postgres, MySQL nor SQLite emitter
-	//     mentions it, so a decoded schema that reads back Unknown emits
-	//     byte-identical DDL. This is the check that would have made it a
-	//     MUST-WIRE: had the emitter rendered a non-deterministic collation
-	//     from it, dropping it on restore would change `=` semantics on the
-	//     restored column.
-	//  3. The consumer cannot receive a DECODED schema. The predicate is
-	//     compiled in buildWhereCDCFilter from the Streamer's LIVE source
-	//     schema read, on a path restricted to MySQL and Postgres sources;
-	//     no restore or manifest path compiles a predicate.
-	//
-	// So this is Enum.Collation's argument, verified for these fields
-	// rather than inherited from them. The reflect.DeepEqual concern the
-	// gap entry raised (SchemaSignature.Equal, diffRenameColumnIR) resolves
-	// the same way Enum.Collation's own doc resolves it: a decoded and a
-	// fresh-read column disagreeing can only ADD an advisory delta, never
-	// hide a decode-affecting change, and no data is mutated on either path.
-	"Char.Determinism":    determinismExemptReason,
-	"Varchar.Determinism": determinismExemptReason,
-	"Text.Determinism":    determinismExemptReason,
+	// Char/Varchar/Text.Determinism were exempt here from item 121 until
+	// KEY-COLLATION review F-C. The exemption rested on "no decoded manifest
+	// schema reaches its consumer", which stopped being true when the
+	// key-collation guard began arming from a decoded schema (chain
+	// restore's synthetic SchemaSnapshots, a history-primed applier). They
+	// now ride the wire and are excluded from the chain fingerprint instead
+	// (internal/ir/backup/chain.go, fingerprintType).
 }
-
-const determinismExemptReason = "set by the PG reader from collisdeterministic and read back as " +
-	"CollationDeterminismUnknown. Adjudicated as a DECISION (item 121): its only consumer is the " +
-	"--where string-equality resolver, no engine's DDL emitter consults it, and the predicate is " +
-	"compiled from a LIVE schema read on a path no decoded manifest schema reaches — so a decoded " +
-	"schema not carrying it loses nothing a consumer could act on. See envelopeExempt's comment " +
-	"for the three checks this rests on"
 
 // envelopeKnownGap names Type fields that do NOT survive the round trip and
 // are NOT adjudicated decisions — they are acknowledged holes, left in place

@@ -175,13 +175,14 @@ func TestKeyCollationGuard_Postgres(t *testing.T) {
 	}
 }
 
-// TestPostgresKeyCollationPremise_EquatingChangeIsRefused binds the premise
-// the Postgres reader's catalog-as-of-now collation read rests on
-// (cdc_relations.go, projectCollation): a source cannot move a key column
-// to a collation that equates two of its existing values, because the
-// unique index rebuild refuses. If this ever passed, a replayed row could be
-// compared under a LESS discriminating collation than the one it was
-// written under.
+// TestPostgresKeyCollationPremise_EquatingChangeIsRefused binds the TRUE half
+// of what the Postgres reader's catalog-as-of-now collation read was argued
+// from (cdc_relations.go, projectCollation): a source cannot move a key
+// column to a collation that equates two of its EXISTING values, because
+// the unique index rebuild refuses. The conclusion once drawn from it — that
+// "now" is always at least as discriminating as any replayed state — is
+// false; TestPostgresKeyCollationPremise_LooseningAfterADeleteIsAllowed
+// below pins the counter-example (KEY-COLLATION review F-D).
 func TestPostgresKeyCollationPremise_EquatingChangeIsRefused(t *testing.T) {
 	dsn, cleanup := newSharedPGDB(t, "kcg_premise")
 	defer cleanup()
@@ -199,5 +200,81 @@ func TestPostgresKeyCollationPremise_EquatingChangeIsRefused(t *testing.T) {
 			"reader's catalog-as-of-now collation read rests on no longer holds")
 	} else if !strings.Contains(err.Error(), "23505") && !strings.Contains(strings.ToLower(err.Error()), "duplicate") {
 		t.Fatalf("refused, but not as a unique violation: %v", err)
+	}
+}
+
+// TestPostgresKeyCollationPremise_LooseningAfterADeleteIsAllowed pins the
+// counter-example that makes the catalog-as-of-now read a stated residual
+// rather than a safe one (KEY-COLLATION review F-D): the values that would
+// collide need not exist when the collation is loosened. Tighten `ci` to
+// "C", insert 'A' beside 'a', delete 'A', loosen back to `ci` — every step
+// succeeds, so a reader replaying that window after the loosening compares
+// 'A' with 'a' under `ci`. If this ever started refusing, the residual named
+// in projectCollation's comment and the CHANGELOG would be worth re-reading.
+func TestPostgresKeyCollationPremise_LooseningAfterADeleteIsAllowed(t *testing.T) {
+	dsn, cleanup := newSharedPGDB(t, "kcg_premise_loosen")
+	defer cleanup()
+	applyPGApplier(t, dsn, `CREATE COLLATION IF NOT EXISTS ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false);
+		CREATE TABLE kl (k text COLLATE ci NOT NULL PRIMARY KEY); INSERT INTO kl VALUES ('a');`)
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	for _, stmt := range []string{
+		`ALTER TABLE kl ALTER COLUMN k TYPE text COLLATE "C"`,
+		`INSERT INTO kl VALUES ('A')`,
+		`DELETE FROM kl WHERE k = 'A'`,
+		`ALTER TABLE kl ALTER COLUMN k TYPE text COLLATE ci`,
+	} {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			t.Fatalf("%s: %v (the sequence that makes the catalog-as-of-now read unsafe no longer runs; "+
+				"re-read projectCollation's FALSE PREMISE note)", stmt, err)
+		}
+	}
+}
+
+// TestPostgresDefaultCollationIsDeterministic binds the premise the
+// readers' default-collation stamp rests on (types.go collationDeterminism,
+// cdc_reader.go resolveColumnCollations): a database's DEFAULT collation is
+// deterministic, even when the database is created with a case-insensitive
+// ICU locale (measured on Postgres 16, 2026-10-12: 'a' = 'A' is false there
+// and pg_collation's 'default' row reports collisdeterministic). If this
+// ever failed, the SchemaReader's COALESCE would stamp a nondeterministic
+// default as deterministic and the key-collation guard would compare it by
+// bytes where the source does not.
+func TestPostgresDefaultCollationIsDeterministic(t *testing.T) {
+	dsn, cleanup := newSharedPGDB(t, "kcg_default_premise")
+	defer cleanup()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	const name = "kcg_icu_ci_default"
+	_, _ = db.ExecContext(ctx, "DROP DATABASE IF EXISTS "+name)
+	if _, err := db.ExecContext(ctx, "CREATE DATABASE "+name+
+		" LOCALE_PROVIDER icu ICU_LOCALE 'und-u-ks-level2' TEMPLATE template0"); err != nil {
+		t.Fatalf("create an ICU-locale database: %v", err)
+	}
+	defer func() { _, _ = db.ExecContext(context.Background(), "DROP DATABASE IF EXISTS "+name) }()
+	host, port, user, password := ensureSharedPostgres(t)
+	icu, err := sql.Open("pgx", sharedPGDSN(host, port, user, password, name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = icu.Close() }()
+	var eq, det bool
+	if err := icu.QueryRowContext(ctx, `SELECT 'a' = 'A',
+		(SELECT collisdeterministic FROM pg_catalog.pg_collation WHERE collname = 'default')`).Scan(&eq, &det); err != nil {
+		t.Fatal(err)
+	}
+	if eq || !det {
+		t.Fatalf("on a database created with a case-insensitive ICU locale, 'a' = 'A' is %v and the default "+
+			"collation reports collisdeterministic=%v: the readers' deterministic stamp for the default no longer holds", eq, det)
 	}
 }

@@ -188,9 +188,11 @@ func columnNeedsFingerprintNormalizing(c *ir.Column) bool {
 // an exclusion that only reached the scalar would have moved the fingerprint
 // of every chain carrying the array form.
 //
-// THE SET IS FOUR FIELDS: [ir.Macaddr.Width] (roadmap item 117 / Bug 225),
-// [ir.Enum.TypeName] (item 121), and [ir.Inet.Family] / [ir.Cidr.Family]
-// (item 133). All are governed by the same reason as the exclusion block
+// THE SET IS SEVEN FIELDS: [ir.Macaddr.Width] (roadmap item 117 / Bug 225),
+// [ir.Enum.TypeName] (item 121), [ir.Inet.Family] / [ir.Cidr.Family]
+// (item 133), and [ir.Char.Determinism] / [ir.Varchar.Determinism] /
+// [ir.Text.Determinism] (KEY-COLLATION review F-C; it costs the fingerprint
+// a named-collation determinism flip, which changes no target DDL). All are governed by the same reason as the exclusion block
 // below — the Postgres reader sets each for an ORDINARY column of that type,
 // so `omitempty` (which drops only the zero value) would not hold any of them
 // back: the key would be present in the type envelope of every real Postgres
@@ -262,6 +264,30 @@ func fingerprintType(t ir.Type) (ir.Type, bool) {
 			return t, false
 		}
 		return ir.Cidr{}, true
+	case ir.Char:
+		// Char/Varchar/Text.Determinism (KEY-COLLATION review F-C) — same
+		// treatment, same reason: the Postgres reader sets it on every
+		// column with an explicit named collation, so it is non-zero on
+		// ordinary source data. It rides the wire so a decoded schema arms
+		// the key-collation guard; it is excluded here so no chain is
+		// repartitioned.
+		if v.Determinism == ir.CollationDeterminismUnknown {
+			return t, false
+		}
+		v.Determinism = ir.CollationDeterminismUnknown
+		return v, true
+	case ir.Varchar:
+		if v.Determinism == ir.CollationDeterminismUnknown {
+			return t, false
+		}
+		v.Determinism = ir.CollationDeterminismUnknown
+		return v, true
+	case ir.Text:
+		if v.Determinism == ir.CollationDeterminismUnknown {
+			return t, false
+		}
+		v.Determinism = ir.CollationDeterminismUnknown
+		return v, true
 	case ir.Array:
 		elem, changed := fingerprintType(v.Element)
 		if !changed {

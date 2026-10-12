@@ -319,6 +319,52 @@ var mysqlTargetCollations = map[string]string{
 	"utf8mb4_nopad_bin":     "utf8mb4_0900_bin", // codepoint binary, NO PAD on both sides
 }
 
+// mariadbKeyGuardCollations / mysqlKeyGuardCollations name, for the
+// key-collation guard (key_collation_guard.go), the collation on THIS target
+// server that compares as a cross-flavor SOURCE collation does. They are
+// deliberately not the emitter's remap: that one picks the closest collation
+// to CREATE the column with, and for the 0900 → uca1400 direction it moves
+// NO PAD to PAD SPACE, which equates 'a' and 'a ' where the source does not.
+// Judged by the emitter's map, a MySQL 8 `utf8mb4_0900_ai_ci` key landing on
+// a MariaDB `utf8mb4_uca1400_ai_ci` column looked unchanged and went
+// unguarded; measured on MariaDB 11.4.13, `INSERT (2,'a ') … ON DUPLICATE KEY
+// UPDATE` then silently overwrote row 1 (KEY-COLLATION review F-A). The
+// guard therefore compares under the NO PAD uca1400 forms, which exist from
+// MariaDB 10.10 on (measured on 10.11.19 and 11.4.13); below that the
+// guard's probe fails and the table refuses KEY-COLLATION-GUARD-UNSUPPORTED.
+// Residual, stated: the comparison is UCA 14.0.0 where the source sorts by
+// UCA 9.0.0, so two strings whose weights differ only between those versions
+// are judged by the newer table. The reverse map folds the uca1400 NO PAD
+// forms onto their exact 0900 counterparts; MariaDB's PAD SPACE uca1400 forms
+// have no PAD SPACE UCA equivalent on MySQL and fold onto the NO PAD 0900
+// ones, which distinguishes MORE than the source does — a failure there is a
+// refusal of a re-delivery the source considers the same key, never a merge.
+var mariadbKeyGuardCollations = map[string]string{
+	"utf8mb4_0900_ai_ci": "utf8mb4_uca1400_nopad_ai_ci",
+	"utf8mb4_0900_as_ci": "utf8mb4_uca1400_nopad_as_ci",
+	"utf8mb4_0900_as_cs": "utf8mb4_uca1400_nopad_as_cs",
+	"utf8mb4_0900_bin":   "utf8mb4_nopad_bin",
+}
+
+var mysqlKeyGuardCollations = map[string]string{
+	"utf8mb4_uca1400_nopad_ai_ci": "utf8mb4_0900_ai_ci",
+	"utf8mb4_uca1400_nopad_as_ci": "utf8mb4_0900_as_ci",
+	"utf8mb4_uca1400_nopad_as_cs": "utf8mb4_0900_as_cs",
+	"utf8mb4_nopad_bin":           "utf8mb4_0900_bin",
+	"utf8mb4_uca1400_ai_ci":       "utf8mb4_0900_ai_ci",
+	"utf8mb4_uca1400_as_ci":       "utf8mb4_0900_as_ci",
+	"utf8mb4_uca1400_as_cs":       "utf8mb4_0900_as_cs",
+}
+
+// keyGuardCollations returns the key-collation guard's comparison map for
+// this flavor's target server family (see [mariadbKeyGuardCollations]).
+func (f Flavor) keyGuardCollations() map[string]string {
+	if f == FlavorMariaDB {
+		return mariadbKeyGuardCollations
+	}
+	return mysqlKeyGuardCollations
+}
+
 // crossFlavorCollationRemap returns the collation remap the emitter
 // applies for this flavor's target server family, nil when the flavor
 // needs none.

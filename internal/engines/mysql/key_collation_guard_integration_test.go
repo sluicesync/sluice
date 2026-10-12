@@ -273,6 +273,54 @@ func kcgRunServer(t *testing.T, srv kcgServer, batched bool) {
 		wantMerge(t, err, dsn, "nk", "id", before)
 	})
 
+	// Review LOW: with no primary key the guard cannot tell a re-delivered
+	// row from a second source row. A `_bin` source's case-only UPDATE of a
+	// UNIQUE column, re-delivered, therefore refuses — loud and permanent by
+	// design — and the remedy must be the one that converges: re-copy the
+	// table. Giving the target key the source's collation does NOT converge
+	// here (measured below): the re-delivered INSERT no longer conflicts and
+	// lands a second row.
+	t.Run("no primary key: a re-delivered case-only update refuses and names a re-copy", func(t *testing.T) {
+		db, dsn := cell("np")
+		applyDDL(t, dsn, "CREATE TABLE np (id INT NOT NULL, k VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL, d INT, UNIQUE KEY uk (k))")
+		snap := kcgSnapshot(db, "np", pkTable(db))
+		insert := ir.Insert{Position: kcgPos(1), Schema: db, Table: "np", Row: ir.Row{"id": int64(1), "k": "a", "d": int64(1)}}
+		update := ir.Update{
+			Position: kcgPos(2), Schema: db, Table: "np",
+			Before: ir.Row{"id": int64(1), "k": "a", "d": int64(1)},
+			After:  ir.Row{"id": int64(1), "k": "A", "d": int64(1)},
+		}
+		if err := kcgApply(t, srv.eng, dsn, batched, snap, insert, update); err != nil {
+			t.Fatalf("first delivery: %v", err)
+		}
+		before := kcgRows(t, dsn, "np", "id")
+		if before != "1:41" {
+			t.Fatalf("after the first delivery the target is %s; want 1:41", before)
+		}
+		err := kcgApply(t, srv.eng, dsn, batched, snap, insert, update)
+		wantMerge(t, err, dsn, "np", "id", before)
+		if !strings.Contains(err.Error(), "cannot tell a re-delivered change") || !strings.Contains(err.Error(), "Re-copy the table") {
+			t.Fatalf("the refusal's remedy does not lead with the re-copy a keyless table needs: %v", err)
+		}
+		if strings.Contains(err.Error(), "MODIFY <column>") {
+			t.Fatalf("the refusal recommends the collation change unconditionally, which does not converge here: %v", err)
+		}
+		// The collation remedy, measured 2026-10-12 on MySQL 8.0 and MariaDB
+		// 11.4: the re-delivered INSERT no longer conflicts and lands a second
+		// (1,'a'); the re-delivered UPDATE then hits the UNIQUE key (1062).
+		// Loud, and not converged (serially the stray row stays) — which is
+		// why the remedy leads with the re-copy. Pinned loud: a silent pass
+		// here would mean the collation remedy started converging, and the
+		// remedy text should be revisited.
+		applyDDL(t, dsn, "ALTER TABLE np MODIFY k VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL")
+		err = kcgApply(t, srv.eng, dsn, batched, snap, insert, update)
+		t.Logf("after the collation change the re-delivery returned %v and the target is %s", err, kcgRows(t, dsn, "np", "id"))
+		if err == nil {
+			t.Fatalf("after the collation change the re-delivery passed (target %s): the collation remedy now converges "+
+				"on a keyless table, so keyCollationMergeRemedy's re-copy-first text is stale", kcgRows(t, dsn, "np", "id"))
+		}
+	})
+
 	t.Run("a case-insensitive source re-delivers a case-only key change", func(t *testing.T) {
 		db, dsn := cell("rd")
 		applyDDL(t, dsn, "CREATE TABLE kd (id INT NOT NULL, k VARCHAR(20) CHARACTER SET utf8mb4 COLLATE "+srv.tgtCI+" NOT NULL, d INT, PRIMARY KEY (k))")
