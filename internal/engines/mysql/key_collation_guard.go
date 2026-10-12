@@ -548,21 +548,24 @@ func keyCollationMergeRemedy(plan *keyCollationPlan, schema, table string) strin
 	if collations == "" {
 		collations = "the source's collation" // a plan names its armed keys; kept for a hand-built one
 	}
-	alter := fmt.Sprintf("`ALTER TABLE %s.%s MODIFY <column> …` with %s", quoteIdent(schema), quoteIdent(table), collations)
 	if identityArmed {
+		// No ALTER spelled out here: the collation change converges only for a
+		// second source row, so the text names the collation without handing
+		// over a statement to run unconditionally (pinned by the "no primary
+		// key" cell of TestKeyCollationGuard_MySQLFamily).
 		lead := fmt.Sprintf("The key that identifies a row of %s.%s is itself compared differently on the two "+
 			"sides (or the table has no primary key), so sluice cannot tell a re-delivered change of that key "+
 			"from a second source row, and this refusal repeats on every start. ", quoteIdent(schema), quoteIdent(table))
 		if recopyAligns {
 			return lead + "Re-copy the table, which converges either way: restart the sync with " +
 				"--restart-from-scratch, which recreates it with " + collations + ". Giving the target key that " +
-				"collation yourself (" + alter + ") converges only if this is a second source row, not a " +
-				"re-delivered change of one"
+				"collation yourself converges only if this is a second source row, not a re-delivered change of one"
 		}
 		return lead + "A re-copy does not converge here: sluice recreates the key under the target's default " +
-			"collation, which equates the values. Give the target key " + collations + " (" + alter + ") and " +
-			"restart; that converges only if this is a second source row, not a re-delivered change of one"
+			"collation, which equates the values. Giving the target key " + collations + " converges only if " +
+			"this is a second source row, not a re-delivered change of one"
 	}
+	alter := fmt.Sprintf("`ALTER TABLE %s.%s MODIFY <column> …` with %s", quoteIdent(schema), quoteIdent(table), collations)
 	if recopyAligns {
 		return "Give the target's key column(s) " + collations + " (" + alter + ") and restart, or re-copy the " +
 			"table with --restart-from-scratch, which recreates it with that collation"
