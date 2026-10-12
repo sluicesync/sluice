@@ -80,6 +80,13 @@ func classifyApplierError(err error) error {
 		return err
 	}
 
+	// The key-collation guard's raise (key_collation_guard.go) — attributed
+	// by its marker on every apply path, the pipelined batch included, where
+	// the error surfaces away from the statement that raised it.
+	if isKeyCollationMergeRaise(err) {
+		return &ir.KeyCollationMergeError{Cause: err}
+	}
+
 	// Driver-level "bad connection" / EOF — auto-reconnect on retry.
 	//
 	// context.DeadlineExceeded surfaces when a per-exec timeout

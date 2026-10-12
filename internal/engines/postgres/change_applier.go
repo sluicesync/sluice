@@ -314,6 +314,12 @@ type ChangeApplier struct {
 	// reading the true PK.
 	conflictKeyCache map[string][]string
 
+	// keyCollationGuardCache maps "schema.table" (routed) → the
+	// key-collation backstop plan computed for the source shape it names
+	// (key_collation_guard.go); dropped with the other metadata on a
+	// boundary.
+	keyCollationGuardCache map[string]pgKeyCollationGuardEntry
+
 	// warnedKeyless tracks tables for which the ADR-0089 keyless guard
 	// has already logged its one-time WARN (a table with no PK and no
 	// usable unique index, held at single-row apply). Lazily allocated.
@@ -1921,7 +1927,11 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		if err != nil {
 			return false, fmt.Errorf("postgres: applier: resolve shard key for %s.%s: %w", schema, v.Table, err)
 		}
-		stmt, args, err := buildInsertSQL(schema, v.Table, v.Row, key, colTypes, insShardKeys)
+		guard, err := a.keyCollationPlanFor(ctx, v.Schema, schema, v.Table, key)
+		if err != nil {
+			return false, err
+		}
+		stmt, args, err := buildInsertSQL(schema, v.Table, v.Row, key, colTypes, insShardKeys, guard)
 		if err != nil {
 			return false, fmt.Errorf("postgres: applier: build insert for %s.%s: %w", schema, v.Table, err)
 		}
@@ -1929,6 +1939,9 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		// (one catalog read per table per run).
 		a.noteUnenforcedDeferrable(ctx, schema, v.Table)
 		if _, err := a.txExec(ctx, tx, stmt, a.execDMLArgs(schema, v.Table, args)...); err != nil {
+			if guard != nil && isKeyCollationMergeRaise(err) {
+				err = &ir.KeyCollationMergeError{Schema: schema, Table: v.Table, Cause: err}
+			}
 			return false, fmt.Errorf("postgres: applier: insert into %s.%s: %w", schema, v.Table, err)
 		}
 		return false, nil
@@ -2941,7 +2954,14 @@ func loadConflictKey(ctx context.Context, tx *sql.Tx, schema, table string) ([]s
 // When the shard key IS in the conflict key nothing is refused and nothing is
 // dropped — it is already excluded from the SET list as a key column, and its
 // value cannot differ for a given conflict key.
-func buildInsertSQL(schema, table string, row ir.Row, key []string, colTypes map[string]*ir.Column, shardKeys []string) (sqlStmt string, args []any, err error) {
+//
+// guard, when non-nil, is the conflict key's key-collation backstop
+// (key_collation_guard.go): the existing row is aliased and the DO UPDATE
+// carries the guard's WHERE; a table whose columns are all key columns
+// trades its DO NOTHING — which on a nondeterministic key would drop the
+// incoming row — for a guarded DO UPDATE that writes nothing when the keys
+// agree.
+func buildInsertSQL(schema, table string, row ir.Row, key []string, colTypes map[string]*ir.Column, shardKeys []string, guard *pgKeyCollationPlan) (sqlStmt string, args []any, err error) {
 	cols := appliershared.NonGeneratedRowKeys(row, colTypes)
 	args = make([]any, 0, len(cols))
 	colSQL := make([]string, len(cols))
@@ -2960,9 +2980,15 @@ func buildInsertSQL(schema, table string, row ir.Row, key []string, colTypes map
 		placeholders[i] = applyPlaceholder(c, i+1, colTypes)
 	}
 
+	if len(key) == 0 {
+		guard = nil
+	}
 	var sb strings.Builder
 	sb.WriteString("INSERT INTO ")
 	sb.WriteString(tableRef)
+	if guard != nil {
+		sb.WriteString(" AS " + quoteIdent(keyCollationExistingAlias))
+	}
 	sb.WriteString(" (")
 	sb.WriteString(strings.Join(colSQL, ", "))
 	sb.WriteString(") VALUES (")
@@ -2993,14 +3019,25 @@ func buildInsertSQL(schema, table string, row ir.Row, key []string, colTypes map
 		sb.WriteString(strings.Join(conflictTarget, ", "))
 		sb.WriteByte(')')
 
-		if len(nonKey) > 0 {
+		switch {
+		case len(nonKey) > 0:
 			sb.WriteString(" DO UPDATE SET ")
 			parts := make([]string, len(nonKey))
 			for i, c := range nonKey {
 				parts[i] = fmt.Sprintf("%s = EXCLUDED.%s", quoteIdent(c), quoteIdent(c))
 			}
 			sb.WriteString(strings.Join(parts, ", "))
-		} else {
+			if guard != nil {
+				sb.WriteString(guard.where(false))
+			}
+		case guard != nil:
+			// All columns are key columns, and the key is guarded: a
+			// self-assignment whose WHERE writes nothing when the keys agree
+			// and raises when they do not.
+			k0 := quoteIdent(key[0])
+			sb.WriteString(" DO UPDATE SET " + k0 + " = " + quoteIdent(keyCollationExistingAlias) + "." + k0)
+			sb.WriteString(guard.where(true))
+		default:
 			// All columns are key columns — nothing to update on conflict.
 			// DO NOTHING absorbs the conflict silently.
 			sb.WriteString(" DO NOTHING")

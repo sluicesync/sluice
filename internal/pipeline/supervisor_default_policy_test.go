@@ -253,6 +253,12 @@ func TestSupervisor_RefusalsARestartRepeatsAreNotRestarted(t *testing.T) {
 		// shared constructor every applier calls, so the alias between the
 		// appliershared and ir sentinels is part of what is pinned.
 		"KEY-SCOPED-WRITE-MATCHED-MULTIPLE-ROWS": appliershared.RefuseKeyScopedMultiMatch("postgres", "delete", "public", "t", ir.Row{"id": int64(2)}, 2),
+		// The real refusal type both appliers return when the in-statement
+		// key-collation guard raises (engines/{mysql,postgres}/key_collation_guard.go),
+		// under the pipeline's applier frame.
+		"KEY-COLLATION-MERGE": fmt.Errorf("pipeline: apply: %w", &ir.KeyCollationMergeError{
+			Schema: "public", Table: "t", Remedy: "apply the collation change on the target", Cause: terminalTestErr{"guard raised"},
+		}),
 	}
 
 	if len(cases) != len(refusalsARestartRepeats) {

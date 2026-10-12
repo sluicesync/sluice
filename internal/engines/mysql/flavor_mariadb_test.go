@@ -531,21 +531,21 @@ func TestMariaDBUpsertBuilders_BothSpellings(t *testing.T) {
 	t.Run("onDuplicateKeyUpdateClause", func(t *testing.T) {
 		cols := []string{"id", "email", "active"}
 		pk := []string{"id"}
-		if got, want := onDuplicateKeyUpdateClause(cols, pk, upsertRowAlias),
+		if got, want := onDuplicateKeyUpdateClause(cols, pk, upsertRowAlias, "", ""),
 			" AS new ON DUPLICATE KEY UPDATE `email` = new.`email`, `active` = new.`active`"; got != want {
 			t.Errorf("row alias:\n got: %s\nwant: %s", got, want)
 		}
-		if got, want := onDuplicateKeyUpdateClause(cols, pk, upsertValuesFunc),
+		if got, want := onDuplicateKeyUpdateClause(cols, pk, upsertValuesFunc, "", ""),
 			" ON DUPLICATE KEY UPDATE `email` = VALUES(`email`), `active` = VALUES(`active`)"; got != want {
 			t.Errorf("VALUES():\n got: %s\nwant: %s", got, want)
 		}
 		// All-PK degenerate no-op assignment.
-		if got, want := onDuplicateKeyUpdateClause([]string{"a", "b"}, []string{"a", "b"}, upsertValuesFunc),
+		if got, want := onDuplicateKeyUpdateClause([]string{"a", "b"}, []string{"a", "b"}, upsertValuesFunc, "", ""),
 			" ON DUPLICATE KEY UPDATE `a` = VALUES(`a`)"; got != want {
 			t.Errorf("VALUES() all-PK:\n got: %s\nwant: %s", got, want)
 		}
 		// Keyless full-row SET-list.
-		if got, want := onDuplicateKeyUpdateClause([]string{"x", "y"}, nil, upsertValuesFunc),
+		if got, want := onDuplicateKeyUpdateClause([]string{"x", "y"}, nil, upsertValuesFunc, "", ""),
 			" ON DUPLICATE KEY UPDATE `x` = VALUES(`x`), `y` = VALUES(`y`)"; got != want {
 			t.Errorf("VALUES() keyless:\n got: %s\nwant: %s", got, want)
 		}
@@ -553,7 +553,7 @@ func TestMariaDBUpsertBuilders_BothSpellings(t *testing.T) {
 
 	t.Run("buildInsertSQL", func(t *testing.T) {
 		row := ir.Row{"id": 1, "v": "a"}
-		gotSQL, _, err := buildInsertSQL("src", "t", row, []string{"id"}, nil, upsertValuesFunc)
+		gotSQL, _, err := buildInsertSQL("src", "t", row, []string{"id"}, nil, upsertValuesFunc, nil)
 		if err != nil {
 			t.Fatal(err)
 		}

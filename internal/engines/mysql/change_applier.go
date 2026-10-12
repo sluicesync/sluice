@@ -332,7 +332,13 @@ type ChangeApplier struct {
 	// fail-closed fallback is WARNed at most once per table rather than
 	// per change.
 	nonPKUniqueCache map[string]bool
-	warnedRouteProbe map[string]bool
+
+	// keyCollationGuardCache maps "schema.table" (routed) → the key-collation
+	// backstop plan computed for the source shape it names
+	// (key_collation_guard.go); recomputed when the active schema version
+	// changes, dropped with the other metadata on a boundary.
+	keyCollationGuardCache map[string]keyCollationGuardEntry
+	warnedRouteProbe       map[string]bool
 
 	// colTypeCache maps "schema.table" → column-name → *ir.Column. It
 	// is the input to prepareValue for every value the applier
@@ -1677,11 +1683,16 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		if err != nil {
 			return false, fmt.Errorf("mysql: applier: column types for %s.%s: %w", schema, v.Table, err)
 		}
-		stmt, args, err := buildInsertSQL(schema, v.Table, v.Row, pk, colTypes, a.upsert)
+		guard, err := a.keyCollationPlanFor(ctx, tx, v.Schema, schema, v.Table, pk, colTypes)
+		if err != nil {
+			return false, err
+		}
+		stmt, args, err := buildInsertSQL(schema, v.Table, v.Row, pk, colTypes, a.upsert, guard)
 		if err != nil {
 			return false, fmt.Errorf("mysql: applier: build insert for %s.%s: %w", schema, v.Table, err)
 		}
 		if _, err := a.txExec(ctx, tx, stmt, args...); err != nil {
+			err = keyCollationMergeRefusal(err, guard, schema, v.Table)
 			return false, fmt.Errorf("mysql: applier: insert into %s.%s: %w", schema, v.Table, err)
 		}
 		return false, a.reportApplyClampWarnings(ctx, tx, schema, v.Table)
@@ -2371,8 +2382,8 @@ func loadPrimaryKey(ctx context.Context, tx *sql.Tx, schema, table string) ([]st
 // exists so a future error-producing value rule surfaces loudly on
 // this path without another signature change. Same on the
 // buildUpdateSQL / buildDeleteSQL / clause-builder siblings.
-func buildInsertSQL(schema, table string, row ir.Row, pk []string, colTypes map[string]*ir.Column, upsert upsertSpelling) (sqlStmt string, args []any, err error) {
-	return buildMultiRowInsertSQL(schema, table, []ir.Row{row}, pk, colTypes, upsert)
+func buildInsertSQL(schema, table string, row ir.Row, pk []string, colTypes map[string]*ir.Column, upsert upsertSpelling, guard *keyCollationPlan) (sqlStmt string, args []any, err error) {
+	return buildMultiRowInsertSQL(schema, table, []ir.Row{row}, pk, colTypes, upsert, guard)
 }
 
 // buildUpdateSQL builds an UPDATE statement. SET uses every column in

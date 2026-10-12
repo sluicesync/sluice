@@ -1138,7 +1138,7 @@ func TestMariaDB_UpsertSpelling_ExecutesLive(t *testing.T) {
 	// Single-row applier upsert, twice with the same PK — the second
 	// exec must UPDATE via ON DUPLICATE KEY UPDATE … VALUES(…).
 	for _, v := range []int{1, 2} {
-		stmt, args, err := buildInsertSQL("mdb_upsert", "t_ups", ir.Row{"id": 10, "v": v}, []string{"id"}, nil, upsertValuesFunc)
+		stmt, args, err := buildInsertSQL("mdb_upsert", "t_ups", ir.Row{"id": 10, "v": v}, []string{"id"}, nil, upsertValuesFunc, nil)
 		if err != nil {
 			t.Fatalf("buildInsertSQL: %v", err)
 		}

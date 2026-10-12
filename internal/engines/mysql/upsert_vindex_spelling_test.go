@@ -36,7 +36,7 @@ func TestUpsertSpelling_VitessFamilyNeverUsesValuesFunc(t *testing.T) {
 		if f.upsertSpelling() == upsertValuesFunc {
 			t.Errorf("flavor %s renders ON DUPLICATE KEY UPDATE col = VALUES(col): vtgate accepts that spelling for a primary-vindex column and duplicates the row across shards", f)
 		}
-		stmt, _, err := buildInsertSQL("ks", "t", ir.Row{"id": int64(1), "cust": int64(4)}, []string{"id"}, nil, f.upsertSpelling())
+		stmt, _, err := buildInsertSQL("ks", "t", ir.Row{"id": int64(1), "cust": int64(4)}, []string{"id"}, nil, f.upsertSpelling(), nil)
 		if err != nil {
 			t.Fatalf("buildInsertSQL: %v", err)
 		}

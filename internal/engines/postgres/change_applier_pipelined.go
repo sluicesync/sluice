@@ -297,7 +297,11 @@ func (a *ChangeApplier) dispatchPipelined(ctx context.Context, b *pgxBatchTx, st
 		if err != nil {
 			return false, fmt.Errorf("postgres: applier: resolve shard key for %s.%s: %w", schema, v.Table, err)
 		}
-		stmt, args, err := buildInsertSQL(schema, v.Table, v.Row, key, colTypes, insShardKeys)
+		guard, err := a.keyCollationPlanFor(ctx, v.Schema, schema, v.Table, key)
+		if err != nil {
+			return false, err
+		}
+		stmt, args, err := buildInsertSQL(schema, v.Table, v.Row, key, colTypes, insShardKeys, guard)
 		if err != nil {
 			return false, fmt.Errorf("postgres: applier: build insert for %s.%s: %w", schema, v.Table, err)
 		}

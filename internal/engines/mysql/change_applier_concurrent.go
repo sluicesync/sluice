@@ -196,6 +196,7 @@ func (a *ChangeApplier) invalidateMetadataCaches(qn string) {
 	delete(a.colTypeCache, qn)
 	delete(a.pkCache, qn)
 	delete(a.nonPKUniqueCache, qn)
+	delete(a.keyCollationGuardCache, qn)
 	// P-1: a same-stream DDL that creates/alters the table drops its
 	// negative skip verdict too, so the table is picked up at the barrier
 	// rather than waiting out skipVerdictTTL.

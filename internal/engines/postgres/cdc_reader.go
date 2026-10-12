@@ -1260,6 +1260,9 @@ func (r *CDCReader) dispatchWAL(
 		if err := r.resolveColumnStableIDs(ctx, entry); err != nil {
 			return fmt.Errorf("postgres: cdc: relation %s.%s: %w", m.Namespace, m.RelationName, err)
 		}
+		if err := r.resolveColumnCollations(ctx, entry); err != nil {
+			return fmt.Errorf("postgres: cdc: relation %s.%s: %w", m.Namespace, m.RelationName, err)
+		}
 		if err := r.resolveGeometryColumnSRIDs(ctx, entry); err != nil {
 			return fmt.Errorf("postgres: cdc: relation %s.%s: %w", m.Namespace, m.RelationName, err)
 		}
@@ -1298,6 +1301,9 @@ func (r *CDCReader) dispatchWAL(
 			return fmt.Errorf("postgres: cdc: relation %s.%s: %w", m.Namespace, m.RelationName, err)
 		}
 		if err := r.resolveColumnStableIDs(ctx, entry); err != nil {
+			return fmt.Errorf("postgres: cdc: relation %s.%s: %w", m.Namespace, m.RelationName, err)
+		}
+		if err := r.resolveColumnCollations(ctx, entry); err != nil {
 			return fmt.Errorf("postgres: cdc: relation %s.%s: %w", m.Namespace, m.RelationName, err)
 		}
 		if err := r.resolveGeometryColumnSRIDs(ctx, entry); err != nil {
@@ -2575,6 +2581,71 @@ func (r *CDCReader) resolveColumnStableIDs(ctx context.Context, entry *relationC
 		if n, ok := attnums[entry.Columns[i].Name]; ok {
 			entry.Columns[i].StableID = n
 		}
+	}
+	return nil
+}
+
+// resolveColumnCollations reads each column's collation from the live
+// catalog (pg_attribute.attcollation → pg_collation; pgoutput's Relation
+// carries none) onto entry, for [projectCollation]. A nil r.db leaves every
+// column unresolved, and the projection then carries no collation — the
+// guard it feeds stays unarmed, as before this read existed.
+func (r *CDCReader) resolveColumnCollations(ctx context.Context, entry *relationCacheEntry) error {
+	if r.db == nil {
+		return nil
+	}
+	const q = `
+		SELECT a.attname,
+		       COALESCE(CASE WHEN coll.collname = 'default' THEN '' ELSE coll.collname END, ''),
+		       COALESCE(coll.collisdeterministic, true)
+		FROM   pg_attribute a
+		JOIN   pg_class      cl ON cl.oid = a.attrelid
+		JOIN   pg_namespace  n  ON n.oid  = cl.relnamespace
+		LEFT JOIN pg_collation coll ON coll.oid = a.attcollation AND a.attcollation <> 0
+		WHERE  n.nspname  = $1
+		  AND  cl.relname = $2
+		  AND  a.attnum   > 0
+		  AND  NOT a.attisdropped`
+	rows, err := r.db.QueryContext(ctx, q, entry.Schema, entry.Name)
+	if err != nil {
+		return fmt.Errorf("resolve column collations: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	type coll struct {
+		name          string
+		deterministic bool
+	}
+	got := map[string]coll{}
+	for rows.Next() {
+		var name string
+		var c coll
+		if err := rows.Scan(&name, &c.name, &c.deterministic); err != nil {
+			return fmt.Errorf("resolve column collations: %w", err)
+		}
+		got[name] = c
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("resolve column collations: %w", err)
+	}
+	for i := range entry.Columns {
+		c, ok := got[entry.Columns[i].Name]
+		if !ok {
+			continue
+		}
+		// The SchemaReader's spelling exactly (collationDeterminism): a
+		// named collation carries its determinism, the database default
+		// carries none — TestSeedAgreesWithPgoutputProjection_TypmodFamilies
+		// holds the seed and this projection to the same raw type.
+		det := ir.CollationDeterminismUnknown
+		switch {
+		case c.name == "":
+		case c.deterministic:
+			det = ir.CollationDeterministic
+		default:
+			det = ir.CollationNonDeterministic
+		}
+		entry.Columns[i].Collation, entry.Columns[i].CollationDeterminism = c.name, det
+		entry.Columns[i].CollationResolved = true
 	}
 	return nil
 }

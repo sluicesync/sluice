@@ -104,6 +104,20 @@ type relationColumn struct {
 	// modified array projects its element modifier too.
 	StorageOID     uint32
 	StorageTypeMod int32
+
+	// Collation / CollationDeterminism are the column's collation as the
+	// catalog declares it NOW (pg_attribute.attcollation; pgoutput carries
+	// none), resolved by [CDCReader.resolveColumnCollations] on each
+	// RelationMessage and projected onto the boundary's character type by
+	// [projectRelation]. Collation is "" for the database default, with no
+	// determinism recorded — the SchemaReader's spelling, which the seed is
+	// held to raw; CollationResolved says the
+	// read happened at all (a hand-built reader leaves it false, and the
+	// projection then carries nothing). Not compared by the reader's own
+	// relation-change gates: a collation change is not a decode change.
+	Collation            string
+	CollationDeterminism ir.CollationDeterminism
+	CollationResolved    bool
 }
 
 // detectIncompatibleRelationChange compares a previously-cached relation
@@ -757,7 +771,7 @@ func projectRelation(rel *relationCacheEntry) *ir.Table {
 		// pipeline rename intercept can prove rename-vs-drop+add. It is
 		// METADATA only — SchemaSignatureOf / diffAlteredColumn ignore it,
 		// so it does not perturb the decode contract or alter-detection.
-		cols[i] = &ir.Column{Name: c.Name, Type: containSRIDSentinel(projectArrayElementModifier(c)), StableID: c.StableID}
+		cols[i] = &ir.Column{Name: c.Name, Type: projectCollation(containSRIDSentinel(projectArrayElementModifier(c)), c), StableID: c.StableID}
 	}
 	tbl := &ir.Table{Schema: rel.Schema, Name: rel.Name, Columns: cols}
 	// Bug 89: surface the key columns from the RelationMessage's
@@ -780,6 +794,39 @@ func projectRelation(rel *relationCacheEntry) *ir.Table {
 		tbl.PrimaryKey = &ir.Index{Columns: pkCols}
 	}
 	return tbl
+}
+
+// projectCollation stamps the catalog collation [CDCReader.resolveColumnCollations]
+// read for c onto a character type (KEY-COLLATION-FIRST-BOUNDARY): the
+// boundary is how the applier learns the source's current collation for
+// the key-collation guard, and pgoutput's Relation carries none. Named the
+// way the SchemaReader names it ("" for the database default), so a
+// comparison with the cold-start seed sees the same spelling.
+//
+// The catalog answers as of NOW, not as of the relation's WAL position.
+// The guard this feeds is safe with that because of a premise, checked by
+// the server itself: a source cannot move a key column to a collation that
+// equates two of its existing values (the unique index rebuild fails), so
+// "now" can only ever be MORE discriminating than any earlier key state
+// the stream replays — a replayed row compared under it is compared at
+// least as strictly as the source compared it. Pinned by
+// TestPostgresKeyCollationPremise_EquatingChangeIsRefused.
+func projectCollation(t ir.Type, c relationColumn) ir.Type {
+	if !c.CollationResolved {
+		return t
+	}
+	switch v := t.(type) {
+	case ir.Varchar:
+		v.Collation, v.Determinism = c.Collation, c.CollationDeterminism
+		return v
+	case ir.Char:
+		v.Collation, v.Determinism = c.Collation, c.CollationDeterminism
+		return v
+	case ir.Text:
+		v.Collation, v.Determinism = c.Collation, c.CollationDeterminism
+		return v
+	}
+	return t
 }
 
 // projectArrayElementModifier is c's type for the schema boundary: c.Type,

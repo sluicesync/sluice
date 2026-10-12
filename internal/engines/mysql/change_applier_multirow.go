@@ -144,6 +144,10 @@ type insertRun struct {
 	rows     []ir.Row
 	args     int
 	bytes    int64
+	// guard is the table's key-collation backstop, nil when nothing is armed
+	// (key_collation_guard.go). One per run: a run holds one table, and the
+	// plan changes only at a schema boundary, which flushes the run first.
+	guard *keyCollationPlan
 }
 
 func (r *insertRun) empty() bool { return len(r.rows) == 0 }
@@ -304,7 +308,11 @@ func (b *mysqlBatchTx) dispatchInsert(ctx context.Context, streamID string, c ir
 	if err != nil {
 		return false, fmt.Errorf("mysql: applier: column types for %s.%s: %w", schema, ins.Table, err)
 	}
-	return false, b.appendUpsert(ctx, schema, ins.Table, ins.Row, pk, colTypes, ir.ApproximateChangeBytes(c))
+	guard, err := b.a.keyCollationPlanFor(ctx, b.tx, ins.Schema, schema, ins.Table, pk, colTypes)
+	if err != nil {
+		return false, err
+	}
+	return false, b.appendUpsert(ctx, schema, ins.Table, ins.Row, pk, colTypes, guard, ir.ApproximateChangeBytes(c))
 }
 
 // dispatchUpdate buffers a keyed, non-PK-changing Update with a COMPLETE
@@ -378,7 +386,11 @@ func (b *mysqlBatchTx) dispatchUpdate(ctx context.Context, streamID string, c ir
 		b.a.logPartialAfterImage(ctx, schema, upd.Table, missing)
 		return b.applySerial(ctx, streamID, c)
 	}
-	return false, b.appendUpsert(ctx, schema, upd.Table, upd.After, pk, colTypes, ir.ApproximateChangeBytes(c))
+	guard, err := b.a.keyCollationPlanFor(ctx, b.tx, upd.Schema, schema, upd.Table, pk, colTypes)
+	if err != nil {
+		return false, err
+	}
+	return false, b.appendUpsert(ctx, schema, upd.Table, upd.After, pk, colTypes, guard, ir.ApproximateChangeBytes(c))
 }
 
 // logPartialAfterImage emits the once-per-table notice that a table's UPDATEs
@@ -448,7 +460,7 @@ func (b *mysqlBatchTx) applySerial(ctx context.Context, streamID string, c ir.Ch
 // flushes the upsert-run if the new row switches table/shape or would overflow a
 // per-statement cap, and finally appends. Inserts and update-upserts to the same
 // table + identical column shape coalesce into ONE multi-row statement.
-func (b *mysqlBatchTx) appendUpsert(ctx context.Context, schema, table string, row ir.Row, pk []string, colTypes map[string]*ir.Column, addBytes int64) error {
+func (b *mysqlBatchTx) appendUpsert(ctx context.Context, schema, table string, row ir.Row, pk []string, colTypes map[string]*ir.Column, guard *keyCollationPlan, addBytes int64) error {
 	if err := b.flushDeletes(ctx); err != nil {
 		return err
 	}
@@ -465,6 +477,7 @@ func (b *mysqlBatchTx) appendUpsert(ctx context.Context, schema, table string, r
 		b.run.cols = cols
 		b.run.pk = pk
 		b.run.colTypes = colTypes
+		b.run.guard = guard
 	}
 	b.run.rows = append(b.run.rows, row)
 	b.run.args += addArgs
@@ -539,11 +552,12 @@ func (b *mysqlBatchTx) flushUpserts(ctx context.Context) error {
 	if b.run.empty() {
 		return nil
 	}
-	stmt, args, err := buildMultiRowInsertSQL(b.run.schema, b.run.table, b.run.rows, b.run.pk, b.run.colTypes, b.a.upsert)
+	stmt, args, err := buildMultiRowInsertSQL(b.run.schema, b.run.table, b.run.rows, b.run.pk, b.run.colTypes, b.a.upsert, b.run.guard)
 	if err != nil {
 		return fmt.Errorf("mysql: applier: build multi-row insert for %s.%s: %w", b.run.schema, b.run.table, err)
 	}
 	if _, err := b.a.txExec(ctx, b.tx, stmt, args...); err != nil {
+		err = keyCollationMergeRefusal(err, b.run.guard, b.run.schema, b.run.table)
 		return fmt.Errorf("mysql: applier: multi-row insert into %s.%s: %w", b.run.schema, b.run.table, err)
 	}
 	// Vector B (task C2): under --mysql-sql-mode='' the server silently
@@ -641,11 +655,27 @@ func (b *mysqlBatchTx) Rollback() error {
 // colTypes maps column names to their full IR descriptors and is the input to
 // prepareValue; a missing entry (cold cache / unknown column) is tolerated and
 // the raw value bound, the same pre-Bug-6 shape buildInsertSQL preserves.
-func buildMultiRowInsertSQL(schema, table string, rows []ir.Row, pk []string, colTypes map[string]*ir.Column, upsert upsertSpelling) (sqlStmt string, args []any, err error) {
+//
+// guard, when non-nil, is the table's key-collation backstop
+// (key_collation_guard.go): its check becomes the update list's first
+// assignment. A guard whose key columns the insert cannot reference refuses
+// rather than run unguarded.
+func buildMultiRowInsertSQL(schema, table string, rows []ir.Row, pk []string, colTypes map[string]*ir.Column, upsert upsertSpelling, guard *keyCollationPlan) (sqlStmt string, args []any, err error) {
 	if len(rows) == 0 {
 		return "", nil, errors.New("mysql: applier: buildMultiRowInsertSQL: no rows")
 	}
 	cols := appliershared.NonGeneratedRowKeys(rows[0], colTypes)
+	var guardAssign, guardHang string
+	if guard != nil {
+		var ok bool
+		if guardAssign, guardHang, ok = guard.render(schema, table, cols, upsert); !ok {
+			return "", nil, &terminalMySQLError{err: fmt.Errorf("%w: %s: mysql: applier: %s.%s: a key column whose "+
+				"collation the source declares differently from the target is not in the insert's column list (a "+
+				"generated column), so sluice cannot check that an upsert does not merge two source rows. Refusing "+
+				"before it is applied; give the target key the source's collation, or re-copy the table",
+				ir.ErrKeyCollationMerge, keyCollationGuardUnsupportedMarker, schema, table)}
+		}
+	}
 	colSQL := make([]string, len(cols))
 	for i, c := range cols {
 		colSQL[i] = quoteIdent(c)
@@ -675,7 +705,7 @@ func buildMultiRowInsertSQL(schema, table string, rows []ir.Row, pk []string, co
 	sb.WriteString(strings.Join(colSQL, ", "))
 	sb.WriteString(") VALUES ")
 	sb.WriteString(strings.Join(groups, ", "))
-	sb.WriteString(onDuplicateKeyUpdateClause(cols, pk, upsert))
+	sb.WriteString(onDuplicateKeyUpdateClause(cols, pk, upsert, guardAssign, guardHang))
 	return sb.String(), args, nil
 }
 
@@ -717,47 +747,51 @@ func buildMultiRowInsertSQL(schema, table string, rows []ir.Row, pk []string, co
 // The fix for an over-refusal is never to switch the spelling. Pinned by
 // TestUpsertSpelling_VitessFamilyNeverUsesValuesFunc and
 // TestVStream_ShardedTarget_VindexMoveRefusesLoudly.
-func onDuplicateKeyUpdateClause(cols, pk []string, upsert upsertSpelling) string {
-	var sb strings.Builder
-	if len(pk) > 0 {
-		pkSet := make(map[string]struct{}, len(pk))
-		for _, p := range pk {
-			pkSet[p] = struct{}{}
-		}
-		nonPK := make([]string, 0, len(cols))
-		for _, c := range cols {
-			if _, isPK := pkSet[c]; !isPK {
-				nonPK = append(nonPK, c)
-			}
-		}
-		if len(nonPK) > 0 {
-			sb.WriteString(upsert.clauseOpen())
-			parts := make([]string, len(nonPK))
-			for i, c := range nonPK {
-				parts[i] = quoteIdent(c) + " = " + upsert.newRowRef(quoteIdent(c))
-			}
-			sb.WriteString(strings.Join(parts, ", "))
-			return sb.String()
-		}
-		// Every column is a PK column — the row IS its own key. On conflict
-		// there's nothing to update; emit a no-op assignment so the conflict
-		// is absorbed silently.
-		sb.WriteString(upsert.clauseOpen())
-		sb.WriteString(quoteIdent(pk[0]))
-		sb.WriteString(" = ")
-		sb.WriteString(upsert.newRowRef(quoteIdent(pk[0])))
-		return sb.String()
+//
+// guardAssign, when set, is the key-collation guard's assignment of column
+// guardHang (key_collation_guard.go). It is written FIRST — MySQL evaluates
+// the list left to right against the row as updated so far, so a guard
+// after an assignment to a key column would compare the new value with
+// itself (measured) — and replaces that column's plain assignment.
+func onDuplicateKeyUpdateClause(cols, pk []string, upsert upsertSpelling, guardAssign, guardHang string) string {
+	assigned := onDuplicateKeyUpdateColumns(cols, pk)
+	parts := make([]string, 0, len(assigned)+1)
+	if guardAssign != "" {
+		parts = append(parts, guardAssign)
 	}
-	// No PRIMARY KEY: full-row SET-list so a collision on any unique index is
-	// absorbed idempotently rather than erroring with MySQL 1062 (the ADR-0072
-	// Gap-2 interlock; see the doc above).
-	sb.WriteString(upsert.clauseOpen())
-	parts := make([]string, len(cols))
-	for i, c := range cols {
-		parts[i] = quoteIdent(c) + " = " + upsert.newRowRef(quoteIdent(c))
+	for _, c := range assigned {
+		if guardAssign != "" && c == guardHang {
+			continue
+		}
+		parts = append(parts, quoteIdent(c)+" = "+upsert.newRowRef(quoteIdent(c)))
 	}
-	sb.WriteString(strings.Join(parts, ", "))
-	return sb.String()
+	return upsert.clauseOpen() + strings.Join(parts, ", ")
+}
+
+// onDuplicateKeyUpdateColumns is the columns the update list assigns their
+// incoming value: every non-PK column; with every column a PK column, the
+// first, as a no-op assignment that absorbs the conflict; with no PRIMARY
+// KEY, every column, so a collision on any unique index is absorbed
+// idempotently rather than erroring with MySQL 1062 (the ADR-0072 Gap-2
+// interlock; see the doc above).
+func onDuplicateKeyUpdateColumns(cols, pk []string) []string {
+	if len(pk) == 0 {
+		return cols
+	}
+	pkSet := make(map[string]struct{}, len(pk))
+	for _, p := range pk {
+		pkSet[p] = struct{}{}
+	}
+	nonPK := make([]string, 0, len(cols))
+	for _, c := range cols {
+		if _, isPK := pkSet[c]; !isPK {
+			nonPK = append(nonPK, c)
+		}
+	}
+	if len(nonPK) > 0 {
+		return nonPK
+	}
+	return pk[:1]
 }
 
 // buildMultiRowDeleteSQL builds a parameterised, PK-keyed multi-row DELETE for

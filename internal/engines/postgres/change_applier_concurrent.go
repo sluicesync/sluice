@@ -201,6 +201,7 @@ func (a *ChangeApplier) invalidateMetadataCaches(qn string) {
 	delete(a.pkCache, qn)
 	delete(a.conflictKeyCache, qn)
 	delete(a.nonPKUniqueCache, qn)
+	delete(a.keyCollationGuardCache, qn)
 	// GC-42: a boundary can add or drop a DEFERRABLE constraint; re-read it
 	// (and re-WARN) on the next touch.
 	delete(a.deferrableChecked, qn)

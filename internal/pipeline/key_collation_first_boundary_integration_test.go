@@ -92,7 +92,11 @@ func kcfbRows(t *testing.T, db twfbDB) map[string]string {
 		t.Fatalf("open: %v", err)
 	}
 	defer func() { _ = conn.Close() }()
-	rows, err := conn.Query("SELECT CAST(id AS CHAR), HEX(k) FROM kd")
+	q := "SELECT CAST(id AS CHAR), HEX(k) FROM kd"
+	if db.engine == "postgres" {
+		q = "SELECT id::text, upper(encode(convert_to(k::text, 'UTF8'), 'hex')) FROM kd"
+	}
+	rows, err := conn.Query(q)
 	if err != nil {
 		t.Fatalf("read kd: %v", err)
 	}
@@ -170,7 +174,7 @@ func kcfbWaitConverged(t *testing.T, src, tgt twfbDB, run *twfbRun, timeout time
 func kcfbRunCell(t *testing.T, srv rsfServer, sc kcfbScenario, entry string, idx int) {
 	tag := fmt.Sprintf("q%d", idx)
 	src, tgt := srv.newDB(t, "s_"+tag), srv.newDB(t, "t_"+tag)
-	cell := twfbCell{src: src, tgt: tgt, streamID: "kcfb-" + tag}
+	cell := twfbCell{src: src, tgt: tgt, streamID: "kcfb-" + tag, slotName: "kcfb_" + tag}
 	if entry == kcfbRefuse {
 		cell.schemaChanges = "refuse"
 	}
@@ -234,9 +238,28 @@ func kcfbRunCell(t *testing.T, srv rsfServer, sc kcfbScenario, entry string, idx
 }
 
 func kcfbRunServer(t *testing.T, srv rsfServer) {
+	kcfbRunScenarios(t, srv, kcfbScenarios(), []string{kcfbLiveCDC, kcfbLiveSeed, kcfbWarm, kcfbPrimed, kcfbRefuse})
+}
+
+// kcfbPGScenarios are the Postgres-source shapes: a key on a
+// nondeterministic ICU collation (created on each database by the server
+// fixture) moved to "C", alone and then retyped. pgoutput carries no
+// collation; the reader now reads it from the catalog at every Relation.
+func kcfbPGScenarios() []kcfbScenario {
+	pk := "CREATE TABLE kd (id int NOT NULL, k text COLLATE ci NOT NULL PRIMARY KEY, d int); INSERT INTO kd VALUES (1,'a',1),(2,'b',2),(3,'c',3);"
+	pkv := "CREATE TABLE kd (id int NOT NULL, k varchar(20) COLLATE ci NOT NULL PRIMARY KEY, d int); INSERT INTO kd VALUES (1,'a',1),(2,'b',2),(3,'c',3);"
+	toC := `ALTER TABLE kd ALTER COLUMN k TYPE text COLLATE "C";`
+	toCv := `ALTER TABLE kd ALTER COLUMN k TYPE varchar(20) COLLATE "C";`
+	return []kcfbScenario{
+		{"pg-pk-collation", pk, toC + " INSERT INTO kd (id,k,d) VALUES (99,'A',99);", "INSERT INTO kd (id,k,d) VALUES (100,'zz',100);", toC},
+		{"pg-pk-collation-then-retype", pkv, toCv + " INSERT INTO kd (id,k,d) VALUES (99,'A',99);", "ALTER TABLE kd ALTER COLUMN k TYPE text; INSERT INTO kd (id,k,d) VALUES (100,'zz',100);", ""},
+	}
+}
+
+func kcfbRunScenarios(t *testing.T, srv rsfServer, scs []kcfbScenario, entries []string) {
 	i := 0
-	for _, sc := range kcfbScenarios() {
-		for _, entry := range []string{kcfbLiveCDC, kcfbLiveSeed, kcfbWarm, kcfbPrimed, kcfbRefuse} {
+	for _, sc := range scs {
+		for _, entry := range entries {
 			i++
 			n, sc, entry := i, sc, entry
 			t.Run(sc.name+"/"+entry, func(t *testing.T) {
@@ -245,6 +268,32 @@ func kcfbRunServer(t *testing.T, srv rsfServer) {
 			})
 		}
 	}
+}
+
+// TestKeyCollationFirstBoundary_Postgres16 is the Postgres → Postgres half:
+// measured merging on EVERY entry before the fix, the live one included.
+// Each cell must now be exact or refuse before row 99 merges.
+func TestKeyCollationFirstBoundary_Postgres16(t *testing.T) {
+	srcDSN, _, cleanup := startPostgresLogicalImage(t, pgPrebakedImage, 40)
+	defer cleanup()
+	root := twfbDB{engine: "postgres", dsn: srcDSN}
+	srv := rsfServer{
+		label: "postgres-16", engine: "postgres", dialect: "postgres",
+		newDB: func(t *testing.T, name string) twfbDB {
+			t.Helper()
+			root.exec(t, "CREATE DATABASE "+name)
+			dsn, err := buildPGDSN(srcDSN, name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			db := twfbDB{engine: "postgres", dsn: dsn}
+			db.exec(t, "CREATE COLLATION ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false)")
+			return db
+		},
+	}
+	t.Run("cells", func(t *testing.T) {
+		kcfbRunScenarios(t, srv, kcfbPGScenarios(), []string{kcfbLiveCDC, kcfbLiveSeed, kcfbWarm, kcfbPrimed, kcfbRefuse})
+	})
 }
 
 func TestKeyCollationFirstBoundary_MySQL80_Full(t *testing.T) {
