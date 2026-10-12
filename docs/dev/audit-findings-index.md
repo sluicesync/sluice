@@ -54,6 +54,20 @@ other eighteen.
 
 ---
 
+## 2026-10-12 — second value-fidelity review of the v0.159.1 candidate (b0360550..46d49733): four fixed, one HIGH found while pinning
+
+Indexed when filed. The second pre-tag review's findings, what they leave open, and the HIGH measured while pinning finding 2; the fixed ones are struck in the backlog section.
+
+- KEY-COLLATION-PREFIX-KEY filed
+- KEY-COLLATION-HISTORY-STAMP filed
+- KEY-COLLATION-REVERTED-WINDOW-RESTORE filed
+- KEY-COLLATION-PRE0159-NAMED-PK filed
+- KEY-COLLATION-ND-COPY-REMEDY filed
+- KEY-COLLATION-UNKNOWN-PRODUCERS filed
+- KEY-COLLATION-FUNCTIONAL-KEY-PART filed
+- KEY-COLLATION-PG-INDEX-COLLATION filed
+- LOAD-DATA-SKIP-NO-WARNING-COUNT filed
+
 ## 2026-10-12 — value-fidelity review of the v0.159.1 candidate (KEY-COLLATION-ROWWRITER, Bugs 304 and 305): five fixed, what they leave open
 
 Indexed when filed. The independent pre-tag value-fidelity review's findings and what their fixes leave open; the fixed ones are struck in the backlog section.
