@@ -7,7 +7,7 @@
 // skips the schema refresh (the source read cannot run on the cancelled
 // context), so a window that changed a key column's collation committed
 // with no SchemaDelta — and so with no Bug 304 stamp. MEASURED before the
-// fix (MySQL 8.4): FormatVersion 1, SchemaDelta 0, SchemaHistory 1 carrying
+// fix (MySQL 8.0): FormatVersion 1, SchemaDelta 0, SchemaHistory 1 carrying
 // the post-DDL `utf8mb4_bin` key; a pre-v0.159.1 binary reads such a
 // segment and, with no key-collation guard before v0.159.0, replays 'A'
 // onto the old `_ci` key, merging it at exit 0.

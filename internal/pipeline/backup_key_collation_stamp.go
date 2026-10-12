@@ -33,7 +33,7 @@ func stampKeyCollationDeltaOnAttach(m *irbackup.Manifest) {
 // commits WITHOUT a schema delta although its window may hold DDL: the
 // `backup stream` ctx-cancel drain-commit ([BackupStream.runRollover]), which
 // skips the schema refresh because the source read cannot run on the
-// cancelled context. Measured 2026-10-12 (review finding 4, MySQL 8.4): a
+// cancelled context. Measured 2026-10-12 (review finding 4, MySQL 8.0): a
 // window that changed a UNIQUE key's collation (`utf8mb4_0900_ai_ci` →
 // `utf8mb4_bin`) and then inserted 'A' beside 'a' drain-committed at
 // FormatVersion 1 with no SchemaDelta — so a v0.158.x binary, which has no
