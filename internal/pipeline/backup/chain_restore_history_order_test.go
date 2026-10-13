@@ -176,43 +176,70 @@ func TestRestoreKeyCollationRemedy(t *testing.T) {
 		SchemaDelta: []*irbackup.SchemaDeltaEntry{{Kind: irbackup.SchemaDeltaAlterTable, Table: "kd", Before: binT, After: ciT}},
 	}}}
 	quiet := &lineage.SegmentRecord{ManifestRecord: lineage.ManifestRecord{Manifest: &irbackup.Manifest{Schema: &ir.Schema{Tables: []*ir.Table{ciT}}}}}
-	restoreRunsNone := []string{"--restart-from-scratch", "and restart", "sync start"}
+	// A byte-armed key (a Postgres source collation a MySQL target cannot
+	// declare): sluice recreates it under the target's default (review of
+	// 7ff76a4c, L5). And the Postgres applier's refusal, which names nothing.
+	diverges := fmt.Errorf("mysql: applier: insert into db.kd: %w", &ir.KeyCollationMergeError{
+		Schema: "db", Table: "kd", Cause: errors.New("1690"), Remedy: "engine text",
+		Needs: "`k` a binary collation (for example COLLATE utf8mb4_bin)", RecopyDiverges: true,
+	})
+	unknown := fmt.Errorf("postgres: applier: %w", &ir.KeyCollationMergeError{Schema: "public", Table: "kd", Cause: errors.New("22P02")})
 
-	got := restoreKeyCollationRemedy(loosened, engine)
-	if !errors.Is(got, ir.ErrKeyCollationMerge) {
-		t.Fatalf("loosening window: err = %v; want it still %v", got, ir.ErrKeyCollationMerge)
+	// What each command cannot run: `restore` has no --restart-from-scratch
+	// and does not resume; the broker has no --exclude-table and is not
+	// `sluice restore`.
+	runsNone := map[RestoreCommand][]string{
+		RestoreCommandRestore:         {"--restart-from-scratch", "and restart", "sync start", "sync from-backup"},
+		RestoreCommandBrokerColdStart: {"--restart-from-scratch", "and restart", "sync start", "sluice restore", "--exclude-table"},
 	}
-	remedy := strings.SplitN(got.Error(), "Refusing before it is applied (the whole statement rolled back). ", 2)[1]
-	if !strings.HasPrefix(remedy, "Take a fresh full backup after the key change") {
-		t.Errorf("loosening window: the remedy does not lead with the fresh full backup:\n%s", remedy)
+	cases := []struct {
+		name string
+		cmd  RestoreCommand
+		link *lineage.SegmentRecord
+		err  error
+		lead string // the remedy's first words
+		has  []string
+	}{
+		{"restore, window", RestoreCommandRestore, loosened, engine, "Take a fresh full backup after the key change and restore it into an empty target", nil},
+		{"broker cold start, window", RestoreCommandBrokerColdStart, loosened, engine, "Take a fresh full backup after the key change, then replay the new chain from its full: `sluice sync from-backup run --reset-target-data --yes`", nil},
+		{"restore, recopy aligns", RestoreCommandRestore, quiet, engine, "sluice creates a missing table's key with `k` CHARACTER SET utf8mb4 COLLATE utf8mb4_bin", []string{"`sluice restore --exclude-table kd`", "restore again into the empty target"}},
+		{"restore, recopy diverges", RestoreCommandRestore, quiet, diverges, "This table cannot be restored onto this target as it is", []string{"`sluice restore --exclude-table kd`", "a binary collation", "Postgres target"}},
+		{"restore, engine cannot tell", RestoreCommandRestore, quiet, unknown, "sluice creates a missing table's key with a collation that compares them as the source's does", []string{"`sluice restore --exclude-table kd`"}},
+		{"broker cold start, recopy aligns", RestoreCommandBrokerColdStart, quiet, engine, "This replay drops the chain's tables and creates them itself", []string{"`k` CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"}},
+		{"broker cold start, recopy diverges", RestoreCommandBrokerColdStart, quiet, diverges, "This replay drops the chain's tables and creates them itself", []string{"a binary collation", "Postgres target"}},
 	}
-	for _, f := range restoreRunsNone {
-		if strings.Contains(got.Error(), f) {
-			t.Errorf("loosening window: the restore's refusal says %q, which `restore` cannot run:\n%v", f, got)
+	for _, c := range cases {
+		got := restoreKeyCollationRemedy(c.link, c.cmd, c.err)
+		if !errors.Is(got, ir.ErrKeyCollationMerge) {
+			t.Fatalf("%s: err = %v; want it still %v", c.name, got, ir.ErrKeyCollationMerge)
 		}
-	}
-
-	got = restoreKeyCollationRemedy(quiet, engine)
-	if !errors.Is(got, ir.ErrKeyCollationMerge) || !strings.Contains(got.Error(), "Restore the chain into an empty target whose key column(s) carry `k` CHARACTER SET utf8mb4 COLLATE utf8mb4_bin") {
-		t.Fatalf("a window that changes no key collation: err = %v; want the restore's own remedy naming what the key needs", got)
-	}
-	for _, f := range restoreRunsNone {
-		if strings.Contains(got.Error(), f) {
-			t.Errorf("no window change: the restore's refusal says %q, which `restore` cannot run:\n%v", f, got)
+		_, remedy, ok := strings.Cut(got.Error(), "(the whole statement rolled back). ")
+		if !ok || !strings.HasPrefix(remedy, c.lead) {
+			t.Errorf("%s: the remedy does not lead with %q:\n%s", c.name, c.lead, got)
+		}
+		for _, h := range c.has {
+			if !strings.Contains(remedy, h) {
+				t.Errorf("%s: the remedy lacks %q:\n%s", c.name, h, remedy)
+			}
+		}
+		for _, f := range runsNone[c.cmd] {
+			if strings.Contains(got.Error(), f) {
+				t.Errorf("%s: the refusal says %q, which this command cannot run:\n%v", c.name, f, got)
+			}
 		}
 	}
 
 	// A KEY-COLLATION-MERGE that carries no engine remedy (the guard could not
 	// be built) keeps its own text; inside such a window the fresh full follows it.
 	bare := fmt.Errorf("apply: %w: KEY-COLLATION-GUARD-UNSUPPORTED", ir.ErrKeyCollationMerge)
-	if got := restoreKeyCollationRemedy(loosened, bare); !strings.HasPrefix(got.Error(), bare.Error()) || !strings.Contains(got.Error(), "Take a fresh full backup") {
+	if got := restoreKeyCollationRemedy(loosened, RestoreCommandRestore, bare); !strings.HasPrefix(got.Error(), bare.Error()) || !strings.Contains(got.Error(), "Take a fresh full backup") {
 		t.Fatalf("bare refusal in a loosening window: err = %v", got)
 	}
-	if got := restoreKeyCollationRemedy(quiet, bare); got.Error() != bare.Error() {
+	if got := restoreKeyCollationRemedy(quiet, RestoreCommandRestore, bare); got.Error() != bare.Error() {
 		t.Fatalf("bare refusal, no window change: err = %v; want it unchanged", got)
 	}
 	other := errors.New("boom")
-	if got := restoreKeyCollationRemedy(loosened, other); got.Error() != other.Error() {
+	if got := restoreKeyCollationRemedy(loosened, RestoreCommandRestore, other); got.Error() != other.Error() {
 		t.Fatalf("another error: err = %v; want it unchanged", got)
 	}
 }
@@ -442,6 +469,34 @@ func TestHistoryReplay_VersionNamespaceIsChecked(t *testing.T) {
 	if _, err := replay(h, append(other, txIn("db", 20, 21, 22)...)); err != nil {
 		t.Fatalf("the same namespace refused: %v", err)
 	}
+
+	// Review of 7ff76a4c: the ADD COLUMN fill both capture lanes append at the
+	// window's end names no namespace (the flat manifest's). It neither binds
+	// nor contradicts: after a named row it passes and the version keeps the
+	// row's namespace.
+	fresh := func() *historyReplay {
+		t.Helper()
+		h, err := newHistoryReplay("b1", "test", tokenOrderer{}, nil, []ir.SchemaSnapshot{hsnap(5, "utf8mb4_bin")})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return h
+	}
+	got, err := replay(fresh(), append(txIn("db", 10, 11, 12), txIn("", 20, 21, 22)...))
+	if err != nil || got != "S5@db:utf8mb4_bin B10 I11@db C12 B20 I21 C22" {
+		t.Fatalf("a fill row after a named row: %q, err = %v; want it to pass with the version under db", got, err)
+	}
+	// A fill-only window: the version goes out under none, ahead of the fill.
+	got, err = replay(fresh(), txIn("", 20, 21, 22))
+	if err != nil || got != "S5:utf8mb4_bin B20 I21 C22" {
+		t.Fatalf("a fill-only window: %q, err = %v", got, err)
+	}
+	// A named row of the table AFTER the version went out under none would
+	// miss it: that refuses.
+	_, err = replay(fresh(), append(txIn("", 20, 21, 22), txIn("db", 30, 31, 32)...))
+	if !errors.Is(err, ir.ErrKeyCollationMerge) || !strings.Contains(err.Error(), keyCollationVersionNamespaceMarker) {
+		t.Fatalf("a named row after the version went out under none: err = %v; want %s", err, keyCollationVersionNamespaceMarker)
+	}
 }
 
 // TestHistoryReplay_WindowEndVersionsGoLast: the window-end versions
@@ -458,18 +513,27 @@ func TestHistoryReplay_WindowEndVersionsGoLast(t *testing.T) {
 	}
 }
 
-// TestWindowEndVersions: one per window-start version, the window's recorded
-// shape of its table at the window's end; none without an end position.
+// TestWindowEndVersions: one per window-start version whose table the
+// window recorded no version of — the window's recorded shape of the table at
+// the window's end; none without an end position, and none for a table the
+// window recorded a version of (review of 7ff76a4c, L3: a drain-commit's
+// manifest records its parent's schema, which would replace the window's
+// last recorded shape with an earlier one).
 func TestWindowEndVersions(t *testing.T) {
 	binT, ciT := keyTable("utf8mb4_bin"), keyTable("utf8mb4_0900_ai_ci")
 	m := &irbackup.Manifest{EndPosition: hpos(40), Schema: &ir.Schema{Tables: []*ir.Table{ciT}}}
 	seeds := []ir.SchemaSnapshot{{Position: hpos(1), Table: "kd", IR: binT}}
-	ends := windowEndVersions(m, seeds)
+	ends := windowEndVersions(m, seeds, nil)
 	if len(ends) != 1 || ends[0].IR != ciT || ends[0].Position != hpos(40) {
 		t.Fatalf("ends = %+v; want the recorded `_ci` shape at the window's end", ends)
 	}
+	recorded := hsnap(20, "utf8mb4_bin")
+	recorded.Schema = "db"
+	if ends := windowEndVersions(m, seeds, []ir.SchemaSnapshot{recorded}); len(ends) != 0 {
+		t.Fatalf("ends = %+v; want none for a table the window recorded a version of", ends)
+	}
 	m.EndPosition = ir.Position{}
-	if ends := windowEndVersions(m, seeds); len(ends) != 0 {
+	if ends := windowEndVersions(m, seeds, nil); len(ends) != 0 {
 		t.Fatalf("ends = %+v; want none without an end position", ends)
 	}
 }

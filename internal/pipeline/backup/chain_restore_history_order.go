@@ -92,11 +92,16 @@ const keyCollationHistoryUnorderedMarker = "KEY-COLLATION-HISTORY-UNORDERED"
 // that change has been seen, the boundary and what follows it are held —
 // until the transaction's first row (which names the namespace) or its
 // commit (an empty transaction: nothing in it for a version to govern, so it
-// passes and the versions wait for the next boundary). A flat manifest is a
-// single-namespace stream, so any table's row names it; that premise is
-// CHECKED, not assumed: a later change of a table whose version took the
-// namespace, naming another, refuses (KEY-COLLATION-VERSION-NAMESPACE)
-// rather than let the lookup miss again.
+// passes and the versions wait for the next boundary). A change that itself
+// names NO namespace binds nothing and contradicts nothing: the ADD COLUMN
+// fill both capture lanes append at the window's end names what the flat
+// manifest names, which is none (review of 7ff76a4c — a first cut refused
+// it, failing a window that loosened a key and added a column, which
+// v0.159.2 restored exactly). A flat manifest is a single-namespace stream,
+// so any named row names it; that premise is CHECKED, not assumed: a later
+// named change of a table whose version was filed under another namespace,
+// or under none, refuses (KEY-COLLATION-VERSION-NAMESPACE) rather than let
+// the lookup miss again ([historyReplay.checkNamespace]).
 
 // keyCollationVersionNamespaceMarker names the refusal raised when a change
 // names a namespace other than the one a namespace-less version took.
@@ -114,9 +119,11 @@ type historyReplay struct {
 	// namespace is the one the window's changes name, once learned
 	// (namespaceKnown); bound holds the tables whose namespace-less version
 	// took it, for the check that a later change of them names the same.
-	namespace      string
-	namespaceKnown bool
-	bound          map[string]bool
+	// unboundReleased holds the tables whose version went out naming none.
+	namespace       string
+	namespaceKnown  bool
+	bound           map[string]bool
+	unboundReleased map[string]bool
 
 	// held is non-nil while changes wait for the namespace a due version
 	// needs (held[0], when present, is the boundary it is due at);
@@ -298,6 +305,7 @@ func (h *historyReplay) isBoundary(c ir.Change) bool {
 // goes on, and the versions stay due). See "A version names its table the
 // way the window's changes do".
 func (h *historyReplay) admit(c ir.Change, push, deliver func(ir.Change) error) error {
+	push = h.noting(push)
 	if h.held == nil {
 		wait, err := h.dueNeedsNamespace(c)
 		if err != nil {
@@ -310,7 +318,15 @@ func (h *historyReplay) admit(c ir.Change, push, deliver func(ir.Change) error) 
 	}
 	h.held = append(h.held, c)
 	if namespace, _, ok := tableScoped(c); ok {
-		h.bindNamespace(namespace)
+		// A change naming no namespace (the ADD COLUMN fill both capture
+		// lanes append, which names what the flat manifest names) names the
+		// flat one the waiting versions name too: they go ahead of it as they
+		// are, and it binds nothing. Holding on to a later named row instead
+		// would hold the whole fill — one UPDATE per row of the table — in
+		// memory.
+		if namespace != "" {
+			h.bindNamespace(namespace)
+		}
 		return h.flush(push, deliver, true)
 	}
 	if _, ok := c.(ir.TxCommit); ok {
@@ -441,22 +457,58 @@ func (h *historyReplay) bindNamespace(namespace string) {
 	}
 }
 
-// checkNamespace refuses a change of a table whose namespace-less version
-// took the window's namespace, when the change names another: the version
-// would be filed where the change's lookup does not look, and the guard it
-// arms would not arm (Bug 306). A flat manifest is a single-namespace
-// stream, so this never fires on a stream sluice records; it is the check
-// on that premise.
+// noting wraps push to record the tables whose version went out naming no
+// namespace, for [historyReplay.checkNamespace].
+func (h *historyReplay) noting(push func(ir.Change) error) func(ir.Change) error {
+	return func(c ir.Change) error {
+		if s, ok := c.(ir.SchemaSnapshot); ok && s.Schema == "" {
+			if h.unboundReleased == nil {
+				h.unboundReleased = map[string]bool{}
+			}
+			h.unboundReleased[s.Table] = true
+		}
+		return push(c)
+	}
+}
+
+// checkNamespace refuses a change naming a namespace that is not the one a
+// version of its table was filed under: one that took the window's
+// namespace from an earlier change, when this change names another, or one
+// that went out naming none (a change naming none reached it first), when
+// this change names one. Either way the version would be filed where the
+// change's lookup does not look, and the guard it arms would not arm (Bug
+// 306).
+//
+// A change naming NO namespace is never refused and binds nothing: both
+// capture lanes write the ADD COLUMN fill under the namespace the flat
+// manifest records, which is none (incremental_add_column_fill.go), and
+// existing chains carry such rows (review of 7ff76a4c: refusing them failed
+// a window that only loosened a key and added a column, which v0.159.2
+// restored exactly). A fill row's lookup misses the window-start version,
+// as on v0.159.2; it updates by primary key with the same key before and
+// after, so no other source row can meet it through the key.
+//
+// UNVERIFIED PREMISE, checked here: a flat manifest is a single-namespace
+// stream, and the only changes of it naming none are appended at the
+// window's end (the fill), after every named row.
 func (h *historyReplay) checkNamespace(c ir.Change) error {
 	namespace, table, ok := tableScoped(c)
-	if !ok || !h.namespaceKnown || !h.bound[table] || namespace == h.namespace {
+	if !ok || namespace == "" {
 		return nil
 	}
-	return fmt.Errorf("%w: %s: incremental %s: a schema version of table %s recorded no namespace and took %q, the one "+
-		"the window's first change named, but a change of the table names %q, so the shape that version records would "+
-		"not govern it and rows the source keeps apart could merge. Refusing before that change is applied; take a fresh "+
-		"full backup and restore from it",
-		ir.ErrKeyCollationMerge, keyCollationVersionNamespaceMarker, h.backupID, table, h.namespace, namespace)
+	var filed string
+	switch {
+	case h.unboundReleased[table]:
+		filed = "no namespace (a change naming none came first)"
+	case h.namespaceKnown && h.bound[table] && namespace != h.namespace:
+		filed = fmt.Sprintf("%q, the one the window's first change named", h.namespace)
+	default:
+		return nil
+	}
+	return fmt.Errorf("%w: %s: incremental %s: a schema version of table %s recorded no namespace and was filed under %s, "+
+		"but a change of the table names %q, so the shape that version records would not govern it and rows the source "+
+		"keeps apart could merge. Refusing before that change is applied; take a fresh full backup and restore from it",
+		ir.ErrKeyCollationMerge, keyCollationVersionNamespaceMarker, h.backupID, table, filed, namespace)
 }
 
 // tableScoped is the namespace and table a change names, for the changes
@@ -540,22 +592,49 @@ func windowStartVersions(parent *ir.Schema, m *irbackup.Manifest, snaps []ir.Sch
 	return seeds
 }
 
-// windowEndVersions is, for every window-start version, the shape the
-// window recorded for its table, anchored at the window's end. The window's
-// own versions need not reach that shape: a window whose last event for the
-// table is the ALTER records no version after it (Bug 306), and without one
-// the window-start shape — the one the window CHANGED — would stay the
-// applier's active shape for every later window, and for a `sync start`
-// resuming at the chain's end, arming the guard from a collation the table
-// no longer has. The recorded shape is the basis the next window's reader
-// starts from, so the applier and the reader agree at the seam. A window
-// with no end position, or a table the window no longer records, gets none.
-func windowEndVersions(m *irbackup.Manifest, seeds []ir.SchemaSnapshot) []ir.SchemaSnapshot {
+// windowEndVersions is, for every window-start version whose table the
+// window recorded NO version of, the shape the window recorded for that
+// table, anchored at the window's end. Such a window — its last event for
+// the table the ALTER (Bug 306) — would otherwise leave the window-start
+// shape, the one the window CHANGED, as the applier's active shape for the
+// table. The effect is IN MEMORY ONLY, for the later windows of the same
+// chain restore (the applier is shared across links): the versions also
+// reach the target's sluice_cdc_schema_history, but under
+// ChainRestoreStreamID, which nothing primes from — a `sync start` primes
+// under its own stream id (review of 7ff76a4c, L1) — so no resume reads
+// them. Measured benefit: none so far. The stale shape it replaces could
+// only over-arm the guard (a loud false refusal, never a merge: the source
+// key is the looser one), and the case-only change of one row tried as a
+// probe restored exactly either way. Kept because it is the shape the next
+// window's reader starts from, so applier and reader agree at the seam.
+//
+// A table the window recorded a version of gets none: its last recorded
+// version already is the stream's shape, and the manifest's schema is not
+// always the end shape — a drain-commit records its PARENT's schema
+// (beforeSchema in incremental.go and stream.go; review of 7ff76a4c, L3),
+// which would have replaced a later recorded shape with an earlier one. A
+// drain window records no delta, so its only seeds come from such versions
+// and it never gets one. Nor does a window with no end position, or a table
+// the window no longer records. A window that names no namespace leaves its
+// window-end version where no named row looks, and a window with no change
+// chunk and no history returns before any version is released
+// (KEY-COLLATION-ZERO-CHUNK-WINDOW-END in docs/dev/audit-backlog.md).
+func windowEndVersions(m *irbackup.Manifest, seeds, snaps []ir.SchemaSnapshot) []ir.SchemaSnapshot {
 	if m == nil || m.Schema == nil || m.EndPosition.Token == "" {
 		return nil
 	}
 	var ends []ir.SchemaSnapshot
 	for _, s := range seeds {
+		recorded := false
+		for _, v := range snaps {
+			if sameVersionTable(v, s) {
+				recorded = true
+				break
+			}
+		}
+		if recorded {
+			continue
+		}
 		for _, t := range m.Schema.Tables {
 			if t != nil && sameTable(t, s.Schema, s.Table) {
 				ends = append(ends, ir.SchemaSnapshot{Position: m.EndPosition, Schema: s.Schema, Table: s.Table, IR: t})
@@ -678,14 +757,29 @@ func refuseKeyCollationHistory(backupID, why string, m *irbackup.Manifest, snaps
 //     converges: every restore of this chain re-applies the window's change
 //     to the target ahead of the rows written under the earlier collation
 //     (review of d6ecb939, finding 4);
-//   - otherwise, a restore into an empty target whose key column(s) can
-//     carry what the guard compared under ([ir.KeyCollationMergeError.Needs]).
+//   - otherwise, by what a re-copy would create (review of 7ff76a4c, L5):
+//     a key sluice creates under the target's default collation, which
+//     equates the values ([ir.KeyCollationMergeError.RecopyDiverges] — a
+//     byte-armed Postgres key on MySQL), cannot be restored as it is, and
+//     the remedy is to leave the table out or use a target that keeps the
+//     source's comparison; a key sluice would create as the guard compared
+//     it ([ir.KeyCollationMergeError.Needs]) was not created by this
+//     restore — a table that already existed is kept as it was (CREATE
+//     TABLE IF NOT EXISTS) — so the remedy is to drop it and restore again,
+//     or leave it out.
+//
+// Each text is worded for the command the restore runs inside
+// ([ChainRestore.Command]): `sluice restore`, or the broker's
+// --reset-target-data cold start, which has no --exclude-table and is
+// re-run as `sluice sync from-backup run --reset-target-data --yes`. Every
+// invocation named is graded against the CLI by
+// TestRuntimeMessagesNameRealCLISurface.
 //
 // A KEY-COLLATION-MERGE that is no [ir.KeyCollationMergeError] (the guard
 // could not be built for the key, KEY-COLLATION-GUARD-UNSUPPORTED) names no
 // command; inside such a window it gets the fresh-full sentence after its
 // own, as before.
-func restoreKeyCollationRemedy(link *lineage.SegmentRecord, err error) error {
+func restoreKeyCollationRemedy(link *lineage.SegmentRecord, cmd RestoreCommand, err error) error {
 	if !errors.Is(err, ir.ErrKeyCollationMerge) {
 		return err
 	}
@@ -695,20 +789,53 @@ func restoreKeyCollationRemedy(link *lineage.SegmentRecord, err error) error {
 		if !window {
 			return err
 		}
-		return fmt.Errorf("%w. %s", err, windowKeyCollationRemedy(link))
+		return fmt.Errorf("%w. %s", err, windowKeyCollationRemedy(link, cmd))
 	}
 	return ir.WithKeyCollationMergeRemedy(err, func(e *ir.KeyCollationMergeError) string {
 		if window {
-			return windowKeyCollationRemedy(link)
+			return windowKeyCollationRemedy(link, cmd)
 		}
-		needs := "the collation the source compares them under"
-		if e.Needs != "" {
-			needs = e.Needs
-		}
-		return "Restore the chain into an empty target whose key column(s) carry " + needs + ". `sluice restore` " +
-			"does not resume: running it again starts over from the full backup, onto the rows already restored, so " +
-			"altering this target's key and re-running does not converge"
+		return nonWindowKeyCollationRemedy(e, cmd)
 	})
+}
+
+// RestoreCommand names the command a chain restore runs inside, for the
+// remedies its refusals name. The zero value is `sluice restore`.
+type RestoreCommand int
+
+const (
+	// RestoreCommandRestore is `sluice restore`.
+	RestoreCommandRestore RestoreCommand = iota
+	// RestoreCommandBrokerColdStart is the chain restore `sluice sync
+	// from-backup run --reset-target-data` runs before it polls.
+	RestoreCommandBrokerColdStart
+)
+
+// nonWindowKeyCollationRemedy is the remedy outside a window that changes a
+// key's collation (see [restoreKeyCollationRemedy]).
+func nonWindowKeyCollationRemedy(e *ir.KeyCollationMergeError, cmd RestoreCommand) string {
+	needs := "a collation that compares them as the source's does"
+	if e.Needs != "" {
+		needs = e.Needs
+	}
+	if cmd == RestoreCommandBrokerColdStart {
+		return "This replay drops the chain's tables and creates them itself, so running " +
+			"`sluice sync from-backup run --reset-target-data --yes` again creates the same key and refuses here again: this target cannot hold the " +
+			"two source rows under the collation sluice gives the key on it. Replay the chain onto a target whose key " +
+			"column(s) carry " + needs + " (for a Postgres-source chain, a Postgres target keeps the source's comparison)"
+	}
+	if e.RecopyDiverges {
+		return fmt.Sprintf("This table cannot be restored onto this target as it is: sluice creates its key under the "+
+			"target's default collation, which equates the two values, so neither a re-run nor a fresh full backup "+
+			"converges. Leave it out with `sluice restore --exclude-table %s` and copy it into a table whose key "+
+			"column(s) carry %s, or restore onto a target that keeps the source's comparison (for a Postgres-source "+
+			"chain, a Postgres target)", e.Table, needs)
+	}
+	return fmt.Sprintf("sluice creates a missing table's key with %s, and keeps a table that already existed as it was "+
+		"(its CREATE TABLE is IF NOT EXISTS), so a key that refuses here most likely predates this restore. Drop the "+
+		"table, and every other table the restore wrote — "+
+		"`sluice restore` does not resume, and a re-run starts over from the full backup — then restore again into "+
+		"the empty target, or leave the table out with `sluice restore --exclude-table %s`", needs, e.Table)
 }
 
 // windowChangesKeyCollation reports whether link's window itself changes a
@@ -722,7 +849,14 @@ func windowChangesKeyCollation(link *lineage.SegmentRecord) bool {
 }
 
 // windowKeyCollationRemedy is the remedy inside such a window.
-func windowKeyCollationRemedy(link *lineage.SegmentRecord) string {
+func windowKeyCollationRemedy(link *lineage.SegmentRecord, cmd RestoreCommand) string {
+	if cmd == RestoreCommandBrokerColdStart {
+		return fmt.Sprintf("Take a fresh full backup after the key change, then replay the new chain from its full: "+
+			"`sluice sync from-backup run --reset-target-data --yes` against it, with this replay's other flags. Incremental %s changes a key column's collation inside "+
+			"its own window, so every replay of this chain re-applies that change ahead of the rows written under the "+
+			"earlier collation and refuses here again; altering the target's key does not help, because "+
+			"--reset-target-data drops the tables and starts over from the full backup", lineage.ManifestBackupID(link.Manifest))
+	}
 	return fmt.Sprintf("Take a fresh full backup after the key change and restore it into an empty target. "+
 		"Incremental %s changes a key column's collation inside its own window, so every restore of this chain "+
 		"re-applies that change ahead of the rows written under the earlier collation and refuses here again; "+

@@ -583,11 +583,12 @@ func keyCollationMergeRefusal(err error, plan *keyCollationPlan, schema, table s
 	if plan == nil || !isKeyCollationMergeRaise(err) {
 		return err
 	}
-	needs, _ := keyCollationNeeds(plan)
+	needs, recopyAligns := keyCollationNeeds(plan)
 	return &ir.KeyCollationMergeError{
 		Schema: schema, Table: table, Cause: err,
-		Remedy: keyCollationMergeRemedy(plan, schema, table),
-		Needs:  needs,
+		Remedy:         keyCollationMergeRemedy(plan, schema, table),
+		Needs:          needs,
+		RecopyDiverges: !recopyAligns,
 	}
 }
 

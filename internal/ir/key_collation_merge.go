@@ -40,6 +40,12 @@ type KeyCollationMergeError struct {
 	// ("`k` CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"); empty when the
 	// engine cannot name it.
 	Needs string
+	// RecopyDiverges reports that recreating the table does not converge:
+	// sluice creates the key under the target's default collation, which
+	// equates the values (a key armed to compare bytes — a Postgres source
+	// collation a MySQL target cannot declare). False when a re-copy creates
+	// the key as Needs names it, or when the engine cannot tell.
+	RecopyDiverges bool
 	// Cause is the server error the guard raised.
 	Cause error
 }

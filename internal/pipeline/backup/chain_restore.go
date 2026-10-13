@@ -164,6 +164,13 @@ type ChainRestore struct {
 	// column's collation.
 	SourceEngine func(name string) (ir.Engine, bool)
 
+	// Command names the command this restore runs inside, for the remedies
+	// its refusals name ([restoreKeyCollationRemedy]): the zero value is
+	// `sluice restore`; the broker's --reset-target-data cold start sets
+	// [RestoreCommandBrokerColdStart] (review of 7ff76a4c, L5 — it showed a
+	// broker operator `sluice restore` advice).
+	Command RestoreCommand
+
 	// windowStart is the schema the link before the incremental being
 	// applied recorded — the shape in force at that window's start — set by
 	// the chain walk ([windowStartVersions]). nil for a caller that applies
@@ -1238,13 +1245,13 @@ func (r *ChainRestore) applyIncremental(
 		if err := batched.ApplyBatch(ctx, ChainRestoreStreamID, changesCh, batchSize); err != nil {
 			streamCancel()
 			<-errCh
-			return fmt.Errorf("apply changes (batched): %w", restoreKeyCollationRemedy(link, err))
+			return fmt.Errorf("apply changes (batched): %w", restoreKeyCollationRemedy(link, r.Command, err))
 		}
 	} else {
 		if err := applier.Apply(ctx, ChainRestoreStreamID, changesCh); err != nil {
 			streamCancel()
 			<-errCh
-			return fmt.Errorf("apply changes: %w", restoreKeyCollationRemedy(link, err))
+			return fmt.Errorf("apply changes: %w", restoreKeyCollationRemedy(link, r.Command, err))
 		}
 	}
 	if err := <-errCh; err != nil {
@@ -1449,7 +1456,7 @@ func (r *ChainRestore) streamIncrementalChanges(
 	if err != nil {
 		return err
 	}
-	history.windowEnd = windowEndVersions(link.Manifest, seeds)
+	history.windowEnd = windowEndVersions(link.Manifest, seeds, snaps)
 	segStore := link.Segment.Store(r.Store)
 	codec := link.Segment.CodecOrDefault()
 
