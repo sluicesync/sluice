@@ -66,6 +66,16 @@ func (f *firstTouchBoundaries) start(anchor ir.Position) {
 	f.touched = map[string]struct{}{}
 }
 
+// pending reports whether qn's next row would be its first of an armed
+// stream, without marking it.
+func (f *firstTouchBoundaries) pending(qn string) bool {
+	if !f.armed || f.touched == nil {
+		return false
+	}
+	_, seen := f.touched[qn]
+	return !seen
+}
+
 // take reports whether qn's row is its first of an armed stream, and marks
 // it touched either way. An out-of-scope table is marked without a
 // boundary: nothing it emits reaches the target.

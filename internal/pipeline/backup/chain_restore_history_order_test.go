@@ -12,6 +12,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
 
 // varcharKey is a utf8mb4 VARCHAR(20) under collation.
@@ -86,6 +87,75 @@ func TestWindowStartVersions(t *testing.T) {
 	}
 	if seeds := windowStartVersions(nil, loosened, nil); len(seeds) != 0 {
 		t.Fatalf("seeds = %+v; want none with no previous link", seeds)
+	}
+}
+
+// TestKeyCollationHistory_AVersionRecordingNoCollationIsNoEvidence is the
+// review-of-d6ecb939 finding 1 probe: a VStream version records no
+// collation (empty Collation) while the schema reader recorded one for the
+// same primary key. Read the wrong way round, that was a change, and the
+// broker refused every VStream window of a character-keyed table; it must
+// neither refuse nor seed.
+func TestKeyCollationHistory_AVersionRecordingNoCollationIsNoEvidence(t *testing.T) {
+	recorded := keyTable("utf8mb4_0900_ai_ci")
+	vstream := hsnap(10, "")
+	m := &irbackup.Manifest{Schema: &ir.Schema{Tables: []*ir.Table{recorded}}, StartPosition: hpos(1)}
+	if err := refuseKeyCollationHistory("b1", "test", m, []ir.SchemaSnapshot{vstream}); err != nil {
+		t.Fatalf("a version with no collation against the recorded schema: err = %v; want nil", err)
+	}
+	if err := refuseKeyCollationHistory("b1", "test", m, []ir.SchemaSnapshot{hsnap(10, ""), hsnap(20, "")}); err != nil {
+		t.Fatalf("two versions with no collation: err = %v; want nil", err)
+	}
+	if err := refuseKeyCollationHistory("b1", "test", m, []ir.SchemaSnapshot{hsnap(10, "utf8mb4_0900_ai_ci"), hsnap(20, "")}); err != nil {
+		t.Fatalf("a recorded version followed by one with no collation: err = %v; want nil", err)
+	}
+	if seeds := windowStartVersions(m.Schema, m, []ir.SchemaSnapshot{vstream}); len(seeds) != 0 {
+		t.Fatalf("seeds = %+v; want none for a version that records no collation", seeds)
+	}
+	// The real change is still seen, with the version as the after side.
+	if err := refuseKeyCollationHistory("b1", "test", m, []ir.SchemaSnapshot{hsnap(10, "utf8mb4_bin")}); !errors.Is(err, ir.ErrKeyCollationMerge) {
+		t.Fatalf("a version that records another collation: err = %v; want %v", err, ir.ErrKeyCollationMerge)
+	}
+}
+
+// TestHistoryReplay_StrandedAgreeingVersionIsDropped (review of d6ecb939,
+// finding 6): a stranded version that agrees with a later version released
+// past it is dropped, not released after it — which would leave the
+// applier's active schema on the older shape for the rest of the window.
+func TestHistoryReplay_StrandedAgreeingVersionIsDropped(t *testing.T) {
+	snaps := []ir.SchemaSnapshot{hsnap(10, "utf8mb4_bin"), hsnap(30, "utf8mb4_bin")}
+	h, err := newHistoryReplay("b1", "test", strandingOrderer{strand: "10"}, nil, snaps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := replayOrder(t, h, append(tx(15, 16, 17), tx(35, 36, 37)...)), "B15 I16 C17 S30:utf8mb4_bin B35 I36 C37"; got != want {
+		t.Fatalf("replayed order\n got: %s\nwant: %s", got, want)
+	}
+}
+
+// TestWindowKeyCollationRemedy (review of d6ecb939, finding 4): a guard
+// refusal inside a window that changes a key's collation names the remedy
+// that converges — a fresh full backup — because restarting the restore
+// re-applies the change ahead of the same rows; any other error is left as
+// it is.
+func TestWindowKeyCollationRemedy(t *testing.T) {
+	binT, ciT := keyTable("utf8mb4_bin"), keyTable("utf8mb4_0900_ai_ci")
+	merge := fmt.Errorf("apply changes: %w", ir.ErrKeyCollationMerge)
+	loosened := &lineage.SegmentRecord{ManifestRecord: lineage.ManifestRecord{Manifest: &irbackup.Manifest{
+		Schema:      &ir.Schema{Tables: []*ir.Table{ciT}},
+		SchemaDelta: []*irbackup.SchemaDeltaEntry{{Kind: irbackup.SchemaDeltaAlterTable, Table: "kd", Before: binT, After: ciT}},
+	}}}
+	got := windowKeyCollationRemedy(loosened, merge)
+	if !errors.Is(got, ir.ErrKeyCollationMerge) || !strings.Contains(got.Error(), "take a fresh full backup") {
+		t.Fatalf("loosening window: err = %v; want the fresh-full remedy, still %v", got, ir.ErrKeyCollationMerge)
+	}
+	quiet := &lineage.SegmentRecord{ManifestRecord: lineage.ManifestRecord{Manifest: &irbackup.Manifest{Schema: &ir.Schema{Tables: []*ir.Table{ciT}}}}}
+	if got := windowKeyCollationRemedy(quiet, merge); got.Error() != merge.Error() {
+		t.Fatalf("a window that changes no key collation: err = %v; want it unchanged", got)
+	}
+	other := errors.New("boom")
+	if got := windowKeyCollationRemedy(loosened, other); got.Error() != other.Error() {
+		t.Fatalf("another error: err = %v; want it unchanged", got)
 	}
 }
 

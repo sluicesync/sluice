@@ -163,7 +163,7 @@ func kcfbGrade(t *testing.T, what string, src, tgt twfbDB, refusal error) {
 // written BEFORE the key change, under the target's own stricter collation:
 // it lands correctly ahead of a refusal at the change, so its presence is
 // not a merge (the per-row check still grades it).
-var kcfbCollidingRowMayLand = map[string]bool{"uq-collation-loosened": true, "nonkey-collation-forward": true}
+var kcfbCollidingRowMayLand = map[string]bool{"uq-collation-loosened": true, "uq-collation-loosened-mariadb": true, "nonkey-collation-forward": true}
 
 // kcfbMustNotRefuse names the scenarios no entry may refuse except
 // `--schema-changes=refuse`: nothing in them can merge a row.
@@ -352,6 +352,48 @@ func TestKeyCollationFirstBoundary_MySQL84_Minimal(t *testing.T) {
 	defer cleanup()
 	t.Run("cells", func(t *testing.T) {
 		kcfbRunServer(t, rsfMySQLFamily(t, "mysql-8.4/minimal", "mysql", dsn, buildMySQLDSN))
+	})
+}
+
+// kcfbMariaDBScenarios are the changed-back and loosened windows on
+// MariaDB's own collation names (it has no `utf8mb4_0900_*` before 11.4.5):
+// the binlog reader stamps each row with the collation its TABLE_MAP
+// recorded on MariaDB too, under MINIMAL and FULL (review of d6ecb939,
+// finding 7). MariaDB's default NO_LOG records no collation and is not
+// covered (its in-place change ahead of the reader refuses there instead).
+// Every cell once met MariaDB's ERROR 4052 intermittently: parallel cells
+// in one process registered the same replica server id
+// (BINLOG-SERVER-ID-COLLISION, fixed in generateServerID).
+func kcfbMariaDBScenarios() []kcfbScenario {
+	ci := "CREATE TABLE kd (id INT NOT NULL PRIMARY KEY, k VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL, d INT, UNIQUE KEY uk (k)); INSERT INTO kd VALUES (1,'a',1),(2,'b',2),(3,'c',3);"
+	bin := "CREATE TABLE kd (id INT NOT NULL PRIMARY KEY, k VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL, d INT, UNIQUE KEY uk (k)); INSERT INTO kd VALUES (1,'a',1),(2,'b',2),(3,'c',3);"
+	toBin := "ALTER TABLE kd MODIFY k VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL;"
+	toCI := "ALTER TABLE kd MODIFY k VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL;"
+	moveAway := " INSERT INTO kd (id,k,d) VALUES (99,'A',99); UPDATE kd SET k = 'A2' WHERE id = 99; "
+	sentinel := "INSERT INTO kd (id,k,d) VALUES (100,'zz',100);"
+	return []kcfbScenario{
+		{"uq-collation-reverted-mariadb", ci, toBin + moveAway + toCI, sentinel, ""},
+		{"uq-collation-loosened-mariadb", bin, moveAway + toCI, sentinel, ""},
+	}
+}
+
+func TestKeyCollationFirstBoundary_MariaDB114_Minimal(t *testing.T) {
+	dsn, cleanup := startMariaDBBinlog(t)
+	defer cleanup()
+	twfbDB{engine: "mariadb", dsn: dsn}.exec(t, "SET GLOBAL binlog_row_metadata = MINIMAL")
+	t.Run("cells", func(t *testing.T) {
+		kcfbRunScenarios(t, rsfMySQLFamily(t, "mariadb-11.4/minimal", "mariadb", dsn, buildMySQLDSN),
+			kcfbMariaDBScenarios(), []string{kcfbLiveCDC, kcfbWarm, kcfbPrimed})
+	})
+}
+
+func TestKeyCollationFirstBoundary_MariaDB114_Full(t *testing.T) {
+	dsn, cleanup := startMariaDBBinlog(t)
+	defer cleanup()
+	rsfFullMetadata(t, dsn)
+	t.Run("cells", func(t *testing.T) {
+		kcfbRunScenarios(t, rsfFull(rsfMySQLFamily(t, "mariadb-11.4/full", "mariadb", dsn, buildMySQLDSN)),
+			kcfbMariaDBScenarios(), []string{kcfbLiveCDC, kcfbWarm, kcfbPrimed})
 	})
 }
 

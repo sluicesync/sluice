@@ -414,6 +414,14 @@ type CDCReader struct {
 	decodedShapes           map[string]decodedShape
 	decodedShapeBaselineSet bool
 
+	// ddlGen counts the logged DDLs that can have changed each table, and
+	// basisDDLs is a table's count when its decodedShapes basis was last
+	// set: a collation that differs from the basis with no DDL of THAT table
+	// read since is one no boundary announces (cdc_recorded_collation.go).
+	// Pump goroutine, except SetDecodedShapeBaseline (before StreamChanges).
+	ddlGen    ddlGenerations
+	basisDDLs map[string]int64
+
 	// schemaForward enables ADR-0091 F7a single-stream schema-change
 	// forwarding. When true, maybeSnapshotSchemaB1 ALSO emits a
 	// SchemaSnapshot on a per-column NULLABILITY-only change (GAP #2),
@@ -1542,7 +1550,11 @@ func (r *CDCReader) dispatch(ctx context.Context, ev *replication.BinlogEvent, o
 		// count too (ddl_reach.go; a statement it cannot read reaches every
 		// table).
 		stmtSchema := string(e.Schema)
-		if stmtSchema == "" || r.databaseInScope(stmtSchema) || classifyDDLReach(q, stmtSchema).reachesDatabase(r.databaseInScope) {
+		reach := classifyDDLReach(q, stmtSchema)
+		if stmtSchema == "" || r.databaseInScope(stmtSchema) || reach.reachesDatabase(r.databaseInScope) {
+			// Which tables this logged DDL can have changed, for the
+			// unannounced-collation check (cdc_recorded_collation.go).
+			r.ddlGen.note(reach)
 			// GC-37 (j): a charset DDL whose new charset the cached shape already
 			// carries means this stream is replaying history the cache
 			// misdecoded — refuse BEFORE the cache that proves it is cleared.

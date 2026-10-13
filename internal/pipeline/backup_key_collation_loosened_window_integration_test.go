@@ -131,10 +131,72 @@ func TestChainRestore_KeyCollationLoosenedInsideTheWindow(t *testing.T) {
 						if !errors.Is(applyErr, ir.ErrKeyCollationMerge) || unordered {
 							t.Fatalf("apply = %v; want the guard's KEY-COLLATION-MERGE (from the window-start version)", applyErr)
 						}
+						// A restart re-applies the loosening ahead of the same rows,
+						// so the remedy that converges is a fresh full backup.
+						if !strings.Contains(applyErr.Error(), "take a fresh full backup") {
+							t.Fatalf("apply = %v; want the fresh-full remedy", applyErr)
+						}
 					}
 					kcfbGrade(t, name, src, tgt, applyErr)
 				})
 			}
 		}
+	}
+}
+
+// TestBackupStream_UnloggedKeyCollationChangeRefuses pins review of
+// d6ecb939 finding 2 on a real server: a key collation changed with
+// sql_log_bin=0 reaches the catalog and the TABLE_MAP but writes no QUERY
+// event, so no schema boundary would carry it; the binlog reader refuses
+// COLLATION-CHANGE-UNANNOUNCED (DEFERRED-SCHEMA-CHANGE) before decoding the
+// row written under it, instead of reporting it under a shape no boundary
+// announces.
+func TestBackupStream_UnloggedKeyCollationChangeRefuses(t *testing.T) {
+	_, myRoot, myCleanup := startMySQL(t)
+	defer myCleanup()
+	myEng, _ := engines.Get("mysql")
+	for i, other := range []string{"", "ALTER TABLE other ADD COLUMN x INT"} {
+		name := "alone"
+		if other != "" {
+			// A logged ALTER of an unrelated table first: routine on a busy
+			// source, and it must not silence the check for kd.
+			name = "after another table's logged ALTER"
+		}
+		t.Run(name, func(t *testing.T) {
+			db := fmt.Sprintf("kul_s%d", i)
+			twfbDB{engine: "mysql", dsn: myRoot}.exec(t, "CREATE DATABASE "+db)
+			srcDSN, err := buildMySQLDSN(myRoot, db)
+			if err != nil {
+				t.Fatal(err)
+			}
+			src := twfbDB{engine: "mysql", dsn: srcDSN}
+			src.exec(t, "CREATE TABLE kd (id INT NOT NULL PRIMARY KEY, k VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL UNIQUE, d INT); "+
+				"CREATE TABLE other (id INT NOT NULL PRIMARY KEY); INSERT INTO kd VALUES (1,'a',1),(2,'b',2)")
+			ctx := context.Background()
+			store, err := blobcodec.NewLocalStore(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := (&backup.Backup{Source: myEng, SourceDSN: srcDSN, Store: store, SluiceVersion: "test"}).Run(ctx); err != nil {
+				t.Fatalf("full: %v", err)
+			}
+			full, err := lineage.ReadManifest(ctx, store)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// kd's first row of the window comes first, so the hidden change
+			// is not its first touch.
+			window := []string{"INSERT INTO kd VALUES (50,'p',50)"}
+			if other != "" {
+				window = append(window, other)
+			}
+			window = append(window,
+				"SET SESSION sql_log_bin = 0; ALTER TABLE kd MODIFY k VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL; SET SESSION sql_log_bin = 1",
+				"INSERT INTO kd VALUES (99,'A',99)")
+			captureErr := krwCapture(t, "backup-stream", myEng, srcDSN, "", store, full.BackupID, src, window)
+			if !errors.Is(captureErr, ir.ErrDeferredSchemaChange) || !strings.Contains(captureErr.Error(), "COLLATION-CHANGE-UNANNOUNCED") {
+				t.Fatalf("capture = %v; want COLLATION-CHANGE-UNANNOUNCED", captureErr)
+			}
+		})
 	}
 }

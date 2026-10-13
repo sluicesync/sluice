@@ -5,6 +5,7 @@ package mysql
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	"github.com/go-mysql-org/go-mysql/replication"
@@ -51,10 +52,15 @@ import (
 // the reader refuse in [retypedColumnUnverified]), and VStream, whose events
 // carry no collation (F17's named VStream residual).
 //
-// UNVERIFIED PREMISE: a collation change on the source is a DDL, so the row
-// after it is a table's first row after a DDL, where the boundary is
-// emitted. A shape stamped differently from the last one reported without an
-// intervening DDL or first touch is not emitted as a boundary of its own.
+// The boundary placement rests on a premise, now CHECKED rather than
+// assumed: a collation change on the source is a DDL the binlog carries, so
+// the row after it is the table's first row after a DDL, where the boundary
+// is emitted. A collation change with no logged DDL (sql_log_bin=0) refuses
+// instead of decoding rows under a shape no boundary announces
+// ([CDCReader.holdUnannouncedCollation]). ENUM and SET columns are not
+// stamped: their values travel as label indexes, so a collation change does
+// not alter which values the row image carries, and their labels are
+// compared separately (recordedLabelsAgree).
 
 // recordedShapeAtEvent is [CDCReader.shapeAtEvent] with the event's recorded
 // collations stamped on ([CDCReader.stampRecordedCollations]).
@@ -63,7 +69,167 @@ func (r *CDCReader) recordedShapeAtEvent(ctx context.Context, qn string, catalog
 	if err != nil {
 		return nil, err
 	}
-	return r.stampRecordedCollations(ctx, shape, ev.Table), nil
+	if err := r.refuseUnnamedKeyCollations(ctx, qn, shape, ev.Table); err != nil {
+		return nil, err
+	}
+	shape = r.stampRecordedCollations(ctx, shape, ev.Table)
+	if err := r.holdUnannouncedCollation(qn, shape); err != nil {
+		return nil, err
+	}
+	return shape, nil
+}
+
+// holdUnannouncedCollation turns this file's premise into a check: a
+// character column's collation may change from the shape this stream last
+// decoded the table with only where a boundary will carry the change — a
+// logged DDL that can reach THIS table ([ddlGenerations]; one that cannot be
+// bounded to named tables counts for every table) was read since that
+// shape, or this is its first row of an armed stream. Anywhere else the stream would decode rows under a collation no
+// boundary announces: a DDL run with sql_log_bin=0, which reaches the
+// catalog and the TABLE_MAP but writes no QUERY event. It refuses
+// DEFERRED-SCHEMA-CHANGE before any row of it is decoded (review of
+// d6ecb939, finding 2). Scoped like the reader's other refusals: an
+// excluded table's rows reach no target. A column the basis declares no
+// collation for, or a table with no basis, is not compared.
+func (r *CDCReader) holdUnannouncedCollation(qn string, shape *tableSchema) error {
+	if r.scopeAllowed != nil && !r.tableInScope(qn) {
+		return nil
+	}
+	// Not the owed-boundary set: every logged DDL marks every table the
+	// reader knows as owing one (the cache clear is blanket), so an ALTER of
+	// another table would silence the check for this one — measured, the
+	// sql_log_bin=0 change after an unrelated ALTER passed.
+	if r.firstTouch.pending(qn) {
+		return nil
+	}
+	basis, ok := r.decodedShapes[qn]
+	if !ok {
+		return nil
+	}
+	// A logged DDL that can have changed THIS table was read since the basis
+	// was taken: the change may be its, and the post-DDL boundary carries it
+	// (a table the reader had not cached when the DDL arrived owes no
+	// boundary by name, yet gets one at its first rebuild). Scoped per table
+	// so a routine ALTER of another table does not silence the check; a DDL
+	// that cannot be attributed to named tables counts for every table.
+	if r.ddlGen.at(qn) != r.basisDDLs[qn] {
+		return nil
+	}
+	for _, c := range shape.Columns {
+		now, was := characterCollation(c.Type), characterCollation(basis.types[c.Name])
+		if now == "" || was == "" || strings.EqualFold(now, was) {
+			continue
+		}
+		return fmt.Errorf("mysql: cdc: %s: %w: %s: column %q is decoded under collation %s at this binlog event, "+
+			"and the last shape this stream decoded the table with declared %s, but no schema change of the table "+
+			"was logged in between — a DDL run with sql_log_bin=0 changes the catalog and the row images without "+
+			"writing the statement to the binlog — so no schema boundary will carry the change ahead of these rows, "+
+			"and on a key a target comparing under %s can merge rows the source keeps apart. Refusing before any row "+
+			"of it is decoded. Re-copy the stream: `sluice sync start --reset-target-data --yes` with the stream's "+
+			"other flags unchanged for a sync, or a fresh `backup full` for a backup chain",
+			qn, ir.ErrDeferredSchemaChange, unannouncedCollationMarker, c.Name, now, was, was)
+	}
+	return nil
+}
+
+// noteBasisAt records the DDL count at which qn's basis was set.
+func (r *CDCReader) noteBasisAt(qn string) {
+	if r.basisDDLs == nil {
+		r.basisDDLs = map[string]int64{}
+	}
+	r.basisDDLs[qn] = r.ddlGen.at(qn)
+}
+
+// ddlGenerations counts logged DDLs per table they can reach
+// ([classifyDDLReach]): per qualified table, per database (DROP DATABASE),
+// and for every table at once when a statement cannot be bounded to named
+// tables. A neutral statement (an index, a table option) reaches none.
+type ddlGenerations struct {
+	all    int64
+	tables map[string]int64
+	dbs    map[string]int64
+}
+
+// note counts one logged DDL.
+func (g *ddlGenerations) note(reach ddlReach) {
+	switch {
+	case reach.neutral:
+		return
+	case reach.all:
+		g.all++
+		return
+	}
+	if g.tables == nil {
+		g.tables, g.dbs = map[string]int64{}, map[string]int64{}
+	}
+	for _, t := range reach.tables {
+		g.tables[strings.ToLower(qualifiedName(t.schema, t.table))]++
+	}
+	for _, db := range reach.databases {
+		g.dbs[strings.ToLower(db)]++
+	}
+}
+
+// at is qn's generation: it changes whenever a DDL that can reach qn is
+// noted.
+func (g *ddlGenerations) at(qn string) int64 {
+	schema, _ := splitQualified(qn)
+	return g.all + g.tables[strings.ToLower(qn)] + g.dbs[strings.ToLower(schema)]
+}
+
+// unannouncedCollationMarker names [CDCReader.holdUnannouncedCollation]'s
+// refusal.
+const unannouncedCollationMarker = "COLLATION-CHANGE-UNANNOUNCED"
+
+// refuseUnnamedKeyCollations refuses, retryably, a rows event that records a
+// collation ID for a character primary-key column while the source's
+// collation-name table could not be read: without names nothing can be
+// stamped, and the reverted and loosened windows would merge again for as
+// long as the read keeps failing (review of d6ecb939, finding 3). The read
+// is retried every [serverCollationsRetry], so a restart recovers. The
+// reader knows the primary key only; a UNIQUE key's column is not covered.
+// A reader with no database handle (a test seam) never loads the table and
+// is exempt.
+func (r *CDCReader) refuseUnnamedKeyCollations(ctx context.Context, qn string, shape *tableSchema, tm *replication.TableMapEvent) error {
+	if r.db == nil || tm == nil || len(tm.ColumnType) != len(shape.Columns) {
+		return nil
+	}
+	ids := tm.CollationMap()
+	if len(ids) == 0 {
+		return nil
+	}
+	// The name table loads lazily, on the first use; a check that ran before
+	// that first load mistook "not loaded yet" for "unreadable" and refused
+	// every stream's first row (measured in the MySQL integration suite).
+	r.collationIDNames(ctx)
+	if r.serverCollationIDNames != nil {
+		return nil
+	}
+	for i, col := range shape.Columns {
+		id, recorded := ids[i]
+		if !recorded || id == binaryCollationID || characterCollation(col.Type) == "" || !inPrimaryKey(shape, col.Name) {
+			continue
+		}
+		return fmt.Errorf("mysql: cdc: %s: %s: key column %q was written under collation ID %d, and the source's "+
+			"collation table (information_schema.COLLATIONS) could not be read to name it, so the collation the row "+
+			"was written under cannot be carried to the target. Refusing; starting the stream again retries the read",
+			qn, collationNamesUnavailableMarker, col.Name, id)
+	}
+	return nil
+}
+
+// collationNamesUnavailableMarker names [CDCReader.refuseUnnamedKeyCollations]'s
+// refusal.
+const collationNamesUnavailableMarker = "COLLATION-NAMES-UNAVAILABLE"
+
+// inPrimaryKey reports whether column is in tbl's primary key.
+func inPrimaryKey(tbl *tableSchema, column string) bool {
+	for _, k := range tbl.PrimaryKey {
+		if strings.EqualFold(k, column) {
+			return true
+		}
+	}
+	return false
 }
 
 // stampRecordedCollations returns tbl with each character column's

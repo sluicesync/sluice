@@ -105,6 +105,7 @@ func (r *CDCReader) holdDecodedOrder(qn string, tbl *tableSchema) error {
 		r.decodedShapes = map[string]decodedShape{}
 	}
 	r.decodedShapes[qn] = next
+	r.noteBasisAt(qn)
 	return nil
 }
 
@@ -373,5 +374,6 @@ func (r *CDCReader) SetDecodedShapeBaseline(tables []*ir.Table) {
 			}
 		}
 		r.decodedShapes[qualifiedName(schema, t.Name)] = s
+		r.noteBasisAt(qualifiedName(schema, t.Name))
 	}
 }

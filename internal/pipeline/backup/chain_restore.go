@@ -1238,13 +1238,13 @@ func (r *ChainRestore) applyIncremental(
 		if err := batched.ApplyBatch(ctx, ChainRestoreStreamID, changesCh, batchSize); err != nil {
 			streamCancel()
 			<-errCh
-			return fmt.Errorf("apply changes (batched): %w", err)
+			return windowKeyCollationRemedy(link, fmt.Errorf("apply changes (batched): %w", err))
 		}
 	} else {
 		if err := applier.Apply(ctx, ChainRestoreStreamID, changesCh); err != nil {
 			streamCancel()
 			<-errCh
-			return fmt.Errorf("apply changes: %w", err)
+			return windowKeyCollationRemedy(link, fmt.Errorf("apply changes: %w", err))
 		}
 	}
 	if err := <-errCh; err != nil {

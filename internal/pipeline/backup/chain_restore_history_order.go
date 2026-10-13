@@ -4,6 +4,7 @@
 package backup
 
 import (
+	"errors"
 	"fmt"
 
 	"sluicesync.dev/sluice/internal/ir"
@@ -156,9 +157,13 @@ func (h *historyReplay) before(c ir.Change, push func(ir.Change) error) error {
 	if pos.Token == "" {
 		return nil
 	}
-	held := map[string]ir.SchemaSnapshot{}
-	kept := h.pending[:0]
-	for _, s := range h.pending {
+	// stranded holds, per table, the versions left pending so far in this
+	// pass — each recorded BEFORE any later version of the table this pass
+	// releases.
+	stranded := map[string][]int{}
+	drop := map[int]bool{}
+	var kept []int
+	for i, s := range h.pending {
 		at, err := h.orderer.PositionAtOrAfter(pos, s.Position)
 		if err != nil {
 			return fmt.Errorf("order schema-history version %s.%s at %s against change at %s: %w",
@@ -166,24 +171,35 @@ func (h *historyReplay) before(c ir.Change, push func(ir.Change) error) error {
 		}
 		qn := s.Schema + "." + s.Table
 		if !at {
-			if _, ok := held[qn]; !ok {
-				held[qn] = s
-			}
-			kept = append(kept, s)
+			stranded[qn] = append(stranded[qn], i)
+			kept = append(kept, i)
 			continue
 		}
-		if earlier, ok := held[qn]; ok {
+		for _, j := range stranded[qn] {
+			earlier := h.pending[j]
 			why := fmt.Sprintf("its schema version at %s was not placed before the change at %s although a later version of the table was",
 				earlier.Position.Token, pos.Token)
 			if err := refuseKeyCollationHistory(h.backupID, why, &irbackup.Manifest{Schema: h.keys}, []ir.SchemaSnapshot{earlier, s}); err != nil {
 				return err
 			}
+			// They agree, so the earlier one changes nothing the guard reads —
+			// but released later it would leave the applier's active schema
+			// on the OLDER shape for the rest of the window (review of
+			// d6ecb939, finding 6). It is dropped.
+			drop[j] = true
 		}
+		delete(stranded, qn)
 		if err := push(s); err != nil {
 			return err
 		}
 	}
-	h.pending = kept
+	next := make([]ir.SchemaSnapshot, 0, len(kept))
+	for _, j := range kept {
+		if !drop[j] {
+			next = append(next, h.pending[j])
+		}
+	}
+	h.pending = next
 	return nil
 }
 
@@ -227,7 +243,7 @@ func windowStartVersions(parent *ir.Schema, m *irbackup.Manifest, snaps []ir.Sch
 			if hit {
 				break
 			}
-			if sameTable(p, s.Schema, s.Table) && keyCollationsDisagree(p, withRecordedIndexes(s.IR, parent)) {
+			if sameTable(p, s.Schema, s.Table) && versionChangesKeyCollation(p, withRecordedIndexes(s.IR, parent), false) {
 				hit = true
 			}
 		}
@@ -252,11 +268,24 @@ func sameTable(t *ir.Table, schema, table string) bool {
 	return t.Name == table && (t.Schema == "" || schema == "" || t.Schema == schema)
 }
 
-// keyCollationsDisagree reports whether a and b declare a different
-// collation for a key column either records ([migcore.KeyCollationChange],
-// both ways).
-func keyCollationsDisagree(a, b *ir.Table) bool {
-	return migcore.KeyCollationChange(a, b) || migcore.KeyCollationChange(b, a)
+// versionChangesKeyCollation reports whether a change stream's version
+// declares a key collation different from known — a shape the schema reader
+// recorded, or an earlier version. The version is always the AFTER side of
+// [migcore.KeyCollationChange]: a version that records no collation (every
+// VStream version) is no evidence of a change, and comparing it the other way
+// round read a recorded `utf8mb4_0900_ai_ci` against its "" as one, refusing
+// every VStream window of a character-keyed table on the broker (review of
+// d6ecb939, finding 1). Between two versions both sides must record the
+// collation: the reverse check asks the same question of known, so an
+// unrecorded side on either end is not a change. (A table where one key
+// column is unrecorded on one side and another on the other side would read
+// as a change; no reader produces that mix — each records collations for
+// every column or for none.)
+func versionChangesKeyCollation(known, version *ir.Table, bothVersions bool) bool {
+	if !migcore.KeyCollationChange(known, version) {
+		return false
+	}
+	return !bothVersions || migcore.KeyCollationChange(version, known)
 }
 
 // RefuseUnreplayableKeyCollationHistory refuses an incremental that changes
@@ -297,13 +326,13 @@ func refuseKeyCollationHistory(backupID, why string, m *irbackup.Manifest, snaps
 	for _, s := range snaps {
 		qn := s.Schema + "." + s.Table
 		cur := withRecordedIndexes(s.IR, keys)
-		if p, ok := prev[qn]; ok && keyCollationsDisagree(p, cur) {
+		if p, ok := prev[qn]; ok && versionChangesKeyCollation(p, cur, true) {
 			return keyCollationHistoryRefusal(backupID, qn, why)
 		}
 		prev[qn] = cur
 		if keys != nil {
 			for _, k := range keys.Tables {
-				if k != nil && sameTable(k, s.Schema, s.Table) && keyCollationsDisagree(k, cur) {
+				if k != nil && sameTable(k, s.Schema, s.Table) && versionChangesKeyCollation(k, cur, false) {
 					return keyCollationHistoryRefusal(backupID, qn, why)
 				}
 			}
@@ -312,13 +341,35 @@ func refuseKeyCollationHistory(backupID, why string, m *irbackup.Manifest, snaps
 	return nil
 }
 
+// windowKeyCollationRemedy corrects the remedy of a KEY-COLLATION-MERGE the
+// applier raised inside a window that itself changes a key's collation (a
+// loosening delta, a changed-and-reverted key). The guard's own remedy —
+// give the target key the source's collation and restart — cannot converge
+// there: every re-run of the restore re-applies the window's delta to the
+// target before its rows, and the rows written under the window's earlier
+// collation meet the later one again (review of d6ecb939, finding 4). The
+// chain records a row the target cannot hold in that order; the remedy is a
+// fresh full backup taken after the key change, restored on its own.
+func windowKeyCollationRemedy(link *lineage.SegmentRecord, err error) error {
+	if !errors.Is(err, ir.ErrKeyCollationMerge) || link == nil || link.Manifest == nil {
+		return err
+	}
+	snaps, derr := decodeSchemaHistory(link)
+	if derr != nil || refuseKeyCollationHistory("", "", link.Manifest, snaps) == nil {
+		return err
+	}
+	return fmt.Errorf("%w. Incremental %s changes a key column's collation inside its own window, so restarting the "+
+		"restore re-applies that change ahead of the same rows and refuses again: take a fresh full backup after the "+
+		"key change and restore from it", err, lineage.ManifestBackupID(link.Manifest))
+}
+
 // keyCollationHistoryRefusal is the KEY-COLLATION-HISTORY-UNORDERED error.
 func keyCollationHistoryRefusal(backupID, what, why string) error {
 	return fmt.Errorf("%w: %s: incremental %s changes a key column's collation (%s), and %s, so which rows were "+
 		"written under which collation cannot be told; replaying them under either could merge rows the source keeps "+
-		"apart. Refusing before any change of the window is applied. A chain restore whose source engine orders its "+
-		"positions guards each row under the collation recorded at its position; otherwise take a fresh full backup "+
-		"after the key change",
+		"apart. Refusing before any change of the window is applied; restarting refuses again, and changing the "+
+		"target key's collation does not help. Take a new full backup after the key change, then replay the new "+
+		"chain: `sluice sync from-backup run --reset-target-data --yes` against it (or `sluice restore` it)",
 		ir.ErrKeyCollationMerge, keyCollationHistoryUnorderedMarker, backupID, what, why)
 }
 
