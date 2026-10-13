@@ -50,7 +50,7 @@ func TestChainRestore_KeyCollationLoosenedInsideTheWindow(t *testing.T) {
 	defer myCleanup()
 	myEng, _ := engines.Get("mysql")
 	root := twfbDB{engine: "mysql", dsn: myRoot}
-	n := 0
+	n, graded := 0, 0
 	for _, metadata := range []string{"MINIMAL", "FULL"} {
 		for _, key := range []string{"pk", "unique"} {
 			for _, lane := range []string{"backup-stream", "backup-stream-rollover", "backup-incremental", "broker", "broker-rollover"} {
@@ -93,6 +93,12 @@ func TestChainRestore_KeyCollationLoosenedInsideTheWindow(t *testing.T) {
 					}
 					captureErr := krwCapture(t, captureLane, myEng, srcDSN, "", store, full.BackupID, src, klwWindow())
 					if captureErr != nil {
+						// Only the key-collation guard may refuse a capture here;
+						// any other capture error would otherwise pass the cell
+						// having graded nothing.
+						if !errors.Is(captureErr, ir.ErrKeyCollationMerge) {
+							t.Fatalf("capture = %v; want success or the guard's KEY-COLLATION-MERGE", captureErr)
+						}
 						t.Logf("capture refused: %v", captureErr)
 						return
 					}
@@ -139,9 +145,16 @@ func TestChainRestore_KeyCollationLoosenedInsideTheWindow(t *testing.T) {
 						}
 					}
 					kcfbGrade(t, name, src, tgt, applyErr)
+					graded++
 				})
 			}
 		}
+	}
+	// Anti-vacuity floor: every cell reaches the grade today (measured on
+	// CI and locally); a capture that starts refusing must be looked at, not
+	// absorbed by the early return above.
+	if graded < n {
+		t.Errorf("%d of %d cells reached the grade; want all of them", graded, n)
 	}
 }
 
@@ -341,7 +354,7 @@ func TestChainRestore_UnloggedRevertedKeyCollationBeforeTheWindowsFirstRow(t *te
 	unlogged := func(stmt string) string {
 		return "SET SESSION sql_log_bin = 0; " + stmt + "; SET SESSION sql_log_bin = 1"
 	}
-	n := 0
+	n, graded := 0, 0
 	for _, trailing := range []bool{true, false} {
 		for _, lane := range []string{"backup-incremental", "backup-stream-rollover"} {
 			n++
@@ -384,13 +397,26 @@ func TestChainRestore_UnloggedRevertedKeyCollationBeforeTheWindowsFirstRow(t *te
 				}
 				captureErr := krwCapture(t, lane, myEng, srcDSN, "", store, full.BackupID, src, window)
 				if captureErr != nil {
+					// The only capture refusal this window may draw: the reader
+					// meeting a row whose recorded collation no logged DDL
+					// announced. Anything else would pass the cell ungraded.
+					if !errors.Is(captureErr, ir.ErrDeferredSchemaChange) || !strings.Contains(captureErr.Error(), "COLLATION-CHANGE-UNANNOUNCED") {
+						t.Fatalf("capture = %v; want success or DEFERRED-SCHEMA-CHANGE COLLATION-CHANGE-UNANNOUNCED", captureErr)
+					}
 					t.Logf("capture refused: %v", captureErr)
 					return
 				}
 				applyErr := (&backup.ChainRestore{Target: myEng, TargetDSN: tgtDSN, Store: store}).Run(ctx)
 				t.Logf("apply = %v; source %s target %s", applyErr, kcfbRender(kcfbRows(t, src)), kcfbRender(kcfbRows(t, tgt)))
 				kcfbGrade(t, name, src, tgt, applyErr)
+				graded++
 			})
 		}
+	}
+	// Anti-vacuity floor: the two "no row after the revert" cells have no
+	// row for the reader to refuse at, so they always reach the grade (the
+	// cells with a trailing row refuse at capture, measured on CI).
+	if graded < 2 {
+		t.Errorf("%d of %d cells reached the grade; want at least 2", graded, n)
 	}
 }

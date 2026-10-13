@@ -1963,6 +1963,23 @@ func (b *BackupStream) captureWindow(
 	}
 	flush := func() error { return cb.closeWindow(ctx, &out) }
 
+	// The unstored-tail backstop, the OpenTransaction defer's twin. A
+	// context-class error is what runRollover drain-commits on, and the
+	// drain commits every chunk ALREADY stored. Chunks roll on a change
+	// count or byte ceiling, not at transaction boundaries, so if changes
+	// the window read are still unstored (a flush that failed, or an exit
+	// that never flushed) the stored chunks can end inside a transaction
+	// whose TxCommit was consumed: OpenTransaction is false and the commit
+	// would sever it. Abandon instead — the next run re-reads the window
+	// from the parent's end. Stamped on every return, so it does not
+	// depend on each exit remembering to drain.
+	defer func() {
+		if isContextErr(err) && out.AbandonReason == "" && !inTransaction && cb.unsealed() {
+			out.AbandonReason = "the window ended on a context error with changes it had read still unstored: " +
+				"committing the chunks stored before them could end the chain inside a transaction (" + err.Error() + ")"
+		}
+	}()
+
 	timer := time.NewTimer(deadline.Sub(clockNow()))
 	defer timer.Stop()
 
@@ -2076,16 +2093,21 @@ func (b *BackupStream) captureWindow(
 		case change, ok := <-changesCh:
 			if !ok {
 				out.SourceClosed = true
+				var readerErr error
 				if errReader, ok := cdc.(interface{ Err() error }); ok {
-					if e := errReader.Err(); e != nil {
-						return out, backupCaptureReaderErr(cdc, e)
-					}
+					readerErr = errReader.Err()
 				}
-				if ctx.Err() != nil {
+				if ctx.Err() != nil && (readerErr == nil || isContextErr(readerErr)) {
 					// The pump closed because of the cancel: the same
 					// drain as the ctx.Done arm, never a flush under the
-					// cancelled ctx.
+					// cancelled ctx. A reader that recorded the cancel as
+					// its own error (pgtrigger, sqlite-trigger, the
+					// Postgres standby-status send) closed for the same
+					// reason; any other reader error still surfaces.
 					return drainOnCancel()
+				}
+				if readerErr != nil {
+					return out, backupCaptureReaderErr(cdc, readerErr)
 				}
 				if inTransaction {
 					// The pump closed between a TxBegin and its TxCommit
@@ -2116,6 +2138,12 @@ func (b *BackupStream) captureWindow(
 			}
 		}
 	}
+}
+
+// isContextErr reports whether err is a cancel or a deadline: the errors
+// runRollover drain-commits on rather than failing.
+func isContextErr(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // stopTransactionDrain is the bounded wait a stop that lands inside a source
