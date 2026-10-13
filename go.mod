@@ -36,7 +36,7 @@ require (
 	github.com/mattn/go-isatty v0.0.24
 	github.com/moby/moby/api v1.55.0
 	github.com/muesli/termenv v0.16.0
-	github.com/parquet-go/parquet-go v0.30.1
+	github.com/parquet-go/parquet-go v0.32.0
 	github.com/testcontainers/testcontainers-go v0.44.0
 	github.com/testcontainers/testcontainers-go/modules/mysql v0.44.0
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.44.0
