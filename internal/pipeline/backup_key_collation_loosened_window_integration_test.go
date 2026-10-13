@@ -36,6 +36,7 @@ import (
 	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 const (
@@ -103,7 +104,7 @@ func TestChainRestore_KeyCollationLoosenedInsideTheWindow(t *testing.T) {
 	defer myCleanup()
 	myEng, _ := engines.Get("mysql")
 	root := twfbDB{engine: "mysql", dsn: myRoot}
-	n := 0
+	n, graded := 0, 0
 	for _, trailing := range []bool{true, false} {
 		for _, metadata := range []string{"MINIMAL", "FULL"} {
 			for _, key := range []string{"pk", "unique"} {
@@ -115,6 +116,7 @@ func TestChainRestore_KeyCollationLoosenedInsideTheWindow(t *testing.T) {
 					}
 					create := klwKeys()[key]
 					t.Run(name, func(t *testing.T) {
+						kcCellForensics(t)
 						root.exec(t, "SET GLOBAL binlog_row_metadata = '"+metadata+"'")
 						srcDB, tgtDB := fmt.Sprintf("klw_s%d", n), fmt.Sprintf("klw_t%d", n)
 						root.exec(t, "CREATE DATABASE "+srcDB+"; CREATE DATABASE "+tgtDB)
@@ -149,6 +151,12 @@ func TestChainRestore_KeyCollationLoosenedInsideTheWindow(t *testing.T) {
 						}
 						captureErr := krwCapture(t, captureLane, myEng, srcDSN, "", store, full.BackupID, src, klwWindow(trailing))
 						if captureErr != nil {
+							// Only the key-collation guard may refuse a capture here;
+							// any other capture error would otherwise pass the cell
+							// having graded nothing.
+							if !errors.Is(captureErr, ir.ErrKeyCollationMerge) {
+								t.Fatalf("capture = %v; want success or the guard's KEY-COLLATION-MERGE", captureErr)
+							}
 							t.Logf("capture refused: %v", captureErr)
 							return
 						}
@@ -205,10 +213,19 @@ func TestChainRestore_KeyCollationLoosenedInsideTheWindow(t *testing.T) {
 							klwAssertRestoreRemedy(t, applyErr)
 						}
 						kcfbGrade(t, name, src, tgt, applyErr)
+						graded++
 					})
 				}
 			}
 		}
+	}
+	// Anti-vacuity floor: every cell reaches the grade — the 20 trailing-row
+	// cells (measured on CI and locally, #353) and the 12 no-trailing-row
+	// cells Bug 306 added (measured locally: none refuses at capture). A
+	// capture that starts refusing must be looked at, not absorbed by the
+	// early return above.
+	if n != 32 || graded < n {
+		t.Errorf("%d of %d cells reached the grade; want all 32", graded, n)
 	}
 }
 
@@ -238,6 +255,9 @@ func TestChainRestore_KeyCollationLoosenedWindowEndsOnItsRecordedShape(t *testin
 	root := twfbDB{engine: "mysql", dsn: myRoot}
 	for i, key := range []string{"pk", "unique"} {
 		t.Run(key, func(t *testing.T) {
+			// No floor here: this cell has no early return — every capture
+			// and restore error is fatal — so it grades or fails.
+			kcCellForensics(t)
 			srcDB, tgtDB := fmt.Sprintf("klwe_s%d", i), fmt.Sprintf("klwe_t%d", i)
 			root.exec(t, "CREATE DATABASE "+srcDB+"; CREATE DATABASE "+tgtDB)
 			srcDSN, err := buildMySQLDSN(myRoot, srcDB)
@@ -325,7 +345,7 @@ func TestChainRestore_KeyCollationLoosenedPlusAddColumnWindow(t *testing.T) {
 			"ALTER TABLE kd ADD COLUMN e INT NOT NULL DEFAULT 7",
 		},
 	}
-	n := 0
+	n, graded, refusedAtCapture := 0, 0, 0
 	for _, collide := range []bool{false, true} {
 		for _, metadata := range []string{"MINIMAL", "FULL"} {
 			for _, key := range []string{"pk", "unique"} {
@@ -336,6 +356,7 @@ func TestChainRestore_KeyCollationLoosenedPlusAddColumnWindow(t *testing.T) {
 						name = "A beside a/" + name
 					}
 					t.Run(name, func(t *testing.T) {
+						kcCellForensics(t)
 						root.exec(t, "SET GLOBAL binlog_row_metadata = '"+metadata+"'")
 						srcDB, tgtDB := fmt.Sprintf("klwa_s%d", n), fmt.Sprintf("klwa_t%d", n)
 						root.exec(t, "CREATE DATABASE "+srcDB+"; CREATE DATABASE "+tgtDB)
@@ -366,10 +387,15 @@ func TestChainRestore_KeyCollationLoosenedPlusAddColumnWindow(t *testing.T) {
 							// Read behind the head under MINIMAL, the row written before the
 							// ADD COLUMN cannot be decoded by name, and the reader refuses the
 							// capture before anything is recorded — measured; the restore half
-							// of this cell is unreachable.
-							if captureErr == nil || !strings.Contains(captureErr.Error(), "binlog_row_metadata is not FULL") {
-								t.Fatalf("capture = %v; want the reader's MINIMAL-behind-the-head refusal", captureErr)
+							// of this cell is unreachable. Only that refusal is accepted:
+							// its code and its own text.
+							ce, coded := sluicecode.FromError(captureErr)
+							if !coded || ce.Code != sluicecode.CodeCDCSchemaReplayMismatch ||
+								!strings.Contains(captureErr.Error(), "binlog_row_metadata is not FULL") {
+								t.Fatalf("capture = %v; want the reader's MINIMAL-behind-the-head refusal (%s)",
+									captureErr, sluicecode.CodeCDCSchemaReplayMismatch)
 							}
+							refusedAtCapture++
 							return
 						}
 						if captureErr != nil {
@@ -385,6 +411,7 @@ func TestChainRestore_KeyCollationLoosenedPlusAddColumnWindow(t *testing.T) {
 							if s != g {
 								t.Errorf("target differs from the source by id:HEX(k):e\nsource: %s\ntarget: %s", s, g)
 							}
+							graded++
 							return
 						}
 						// Refused, with nothing merged: every target row is the source's
@@ -406,10 +433,19 @@ func TestChainRestore_KeyCollationLoosenedPlusAddColumnWindow(t *testing.T) {
 								t.Errorf("the colliding row 99 landed before the refusal: %s", g)
 							}
 						}
+						graded++
 					})
 				}
 			}
 		}
+	}
+	// Anti-vacuity floor (#353's discipline): of the 16 cells, the 4 MINIMAL ×
+	// backup-incremental cells (both windows, both keys) refuse at capture by
+	// design and are asserted as that refusal; the other 12 must reach the
+	// grade (measured locally: all 12 do).
+	if n != 16 || graded < 12 || graded+refusedAtCapture < n {
+		t.Errorf("%d of %d cells reached the grade and %d refused at capture as asserted; want 12 graded and the other 4 refused",
+			graded, n, refusedAtCapture)
 	}
 }
 
@@ -609,7 +645,7 @@ func TestChainRestore_UnloggedRevertedKeyCollationBeforeTheWindowsFirstRow(t *te
 	unlogged := func(stmt string) string {
 		return "SET SESSION sql_log_bin = 0; " + stmt + "; SET SESSION sql_log_bin = 1"
 	}
-	n := 0
+	n, graded := 0, 0
 	for _, trailing := range []bool{true, false} {
 		for _, lane := range []string{"backup-incremental", "backup-stream-rollover"} {
 			n++
@@ -625,6 +661,7 @@ func TestChainRestore_UnloggedRevertedKeyCollationBeforeTheWindowsFirstRow(t *te
 				window = append(window, "INSERT INTO kd VALUES (100,'zz',100)")
 			}
 			t.Run(name, func(t *testing.T) {
+				kcCellForensics(t)
 				srcDB, tgtDB := fmt.Sprintf("kub_s%d", n), fmt.Sprintf("kub_t%d", n)
 				root.exec(t, "CREATE DATABASE "+srcDB+"; CREATE DATABASE "+tgtDB)
 				srcDSN, err := buildMySQLDSN(myRoot, srcDB)
@@ -651,13 +688,26 @@ func TestChainRestore_UnloggedRevertedKeyCollationBeforeTheWindowsFirstRow(t *te
 				}
 				captureErr := krwCapture(t, lane, myEng, srcDSN, "", store, full.BackupID, src, window)
 				if captureErr != nil {
+					// The only capture refusal this window may draw: the reader
+					// meeting a row whose recorded collation no logged DDL
+					// announced. Anything else would pass the cell ungraded.
+					if !errors.Is(captureErr, ir.ErrDeferredSchemaChange) || !strings.Contains(captureErr.Error(), "COLLATION-CHANGE-UNANNOUNCED") {
+						t.Fatalf("capture = %v; want success or DEFERRED-SCHEMA-CHANGE COLLATION-CHANGE-UNANNOUNCED", captureErr)
+					}
 					t.Logf("capture refused: %v", captureErr)
 					return
 				}
 				applyErr := (&backup.ChainRestore{Target: myEng, TargetDSN: tgtDSN, Store: store}).Run(ctx)
 				t.Logf("apply = %v; source %s target %s", applyErr, kcfbRender(kcfbRows(t, src)), kcfbRender(kcfbRows(t, tgt)))
 				kcfbGrade(t, name, src, tgt, applyErr)
+				graded++
 			})
 		}
+	}
+	// Anti-vacuity floor: the two "no row after the revert" cells have no
+	// row for the reader to refuse at, so they always reach the grade (the
+	// cells with a trailing row refuse at capture, measured on CI).
+	if graded < 2 {
+		t.Errorf("%d of %d cells reached the grade; want at least 2", graded, n)
 	}
 }
