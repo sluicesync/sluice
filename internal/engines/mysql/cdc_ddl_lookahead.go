@@ -192,9 +192,13 @@ func (l *ddlLookahead) scan(ctx context.Context, db *sql.DB, from, to binlogCoor
 	at := start
 	for {
 		rows, err := listEvents(ctx, at.file, at.pos, lookaheadPage)
-		if err != nil {
+		if err != nil && (at.file != to.file || !isActiveTailTruncation(err)) {
 			return errLookaheadPrivilege(fmt.Errorf("mysql: cdc: look-ahead SHOW BINLOG EVENTS IN %q FROM %d: %w", at.file, at.pos, err))
 		}
+		// A truncation at the active file's tail ends the page where the
+		// server stopped: the rows before it are whole, and it is read below
+		// exactly as a page that ended short.
+		truncated := err != nil
 		next := at.pos
 		for _, ev := range rows {
 			if at.file == to.file && ev.pos >= to.pos {
@@ -209,7 +213,7 @@ func (l *ddlLookahead) scan(ctx context.Context, db *sql.DB, from, to binlogCoor
 			// boundary known, and paging from it re-reads one event.
 			next = max(next, ev.end, ev.pos)
 		}
-		if len(rows) == lookaheadPage {
+		if len(rows) == lookaheadPage && !truncated {
 			if next <= at.pos {
 				return fmt.Errorf("mysql: cdc: look-ahead made no progress in %s at %d", at.file, at.pos)
 			}
@@ -391,7 +395,39 @@ func splitUseClause(info string) (db, stmt string, ok bool) {
 	return "", "", false
 }
 
-// showBinlogEvents reads one page of SHOW BINLOG EVENTS.
+// # SHOW BINLOG EVENTS reads past the position it was asked about
+//
+// A page is bounded by a row count, not by the scan's end coordinate, so on
+// the file the server is still appending to it reads on past that
+// coordinate into the live tail. A transaction being flushed there can be
+// partly on disk, and MySQL then fails the statement with error 1220,
+// "binlog truncated in the middle of event; consider out of disk": a
+// transient fault of any busy source, which used to stop the stream.
+// Measured on mysql:8.4 and 8.0 under eight concurrent writers: about one
+// read in a hundred truncated, every truncation lay at or past the SHOW
+// BINARY LOG STATUS position read just before the query, and every row
+// before it reached the client whole and contiguous. mariadb:11.4 serves
+// only whole events and never raised it.
+//
+// showBinlogEvents therefore returns the rows read before an error, and
+// [ddlLookahead.scan] reads a page that truncated at the active file's tail
+// as one that ended where the server stopped: complete when it covers the
+// scan's end coordinate, re-read like any short page when it does not. The
+// marker never moves past a byte the scan read, and a truncation the scan
+// cannot get past still ends in SLUICE-E-CDC-BINLOG-LOOKAHEAD-SHORT. A
+// truncation in a file the server has rotated away from is no live tail,
+// and stays an error.
+
+// isActiveTailTruncation reports whether err is MySQL's "binlog truncated in
+// the middle of event" (1220). 1220 alone is the generic "error when
+// executing command", so the server's LOG_READ_TRUNC text is matched too.
+func isActiveTailTruncation(err error) bool {
+	var me *sqldriver.MySQLError
+	return errors.As(err, &me) && me.Number == 1220 && strings.Contains(me.Message, "truncated in the middle of event")
+}
+
+// showBinlogEvents reads one page of SHOW BINLOG EVENTS. On an error it
+// returns the rows read before it as well.
 func showBinlogEvents(ctx context.Context, db *sql.DB, file string, from uint32, limit int) ([]binlogEventRow, error) {
 	// SHOW BINLOG EVENTS takes no placeholders; the file name is quoted as
 	// a string literal (it comes from the server's own binlog index).

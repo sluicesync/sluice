@@ -6,9 +6,12 @@ package mysql
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
+
+	sqldriver "github.com/go-sql-driver/mysql"
 
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
@@ -18,17 +21,42 @@ type fakeBinlog struct {
 	files map[string][]binlogEventRow
 	order []string
 	calls int
+	// tornAt, per file, is where an event the server is still writing
+	// starts: a read that reaches it returns the rows before it and MySQL's
+	// 1220 truncation, as a real server does (cdc_ddl_lookahead.go).
+	tornAt map[string]uint32
+	// failWith, when set, is returned for every read.
+	failWith error
 }
 
 func (f *fakeBinlog) events(_ context.Context, file string, from uint32, limit int) ([]binlogEventRow, error) {
 	f.calls++
+	if f.failWith != nil {
+		return nil, f.failWith
+	}
+	torn, hasTorn := f.tornAt[file]
 	var out []binlogEventRow
 	for _, ev := range f.files[file] {
+		if hasTorn && ev.pos >= torn {
+			break
+		}
 		if ev.pos >= from && len(out) < limit {
 			out = append(out, ev)
 		}
 	}
+	if hasTorn && from <= torn && len(out) < limit {
+		return out, tornEventError(torn)
+	}
 	return out, nil
+}
+
+// tornEventError is the error mysql:8.4 returned, measured, for a SHOW
+// BINLOG EVENTS that reached an event still being written at pos.
+func tornEventError(pos uint32) error {
+	return &sqldriver.MySQLError{Number: 1220, Message: fmt.Sprintf(
+		"Error when executing command SHOW BINLOG EVENTS: Error reading Log_event at position %d: "+
+			"Failed decoding event: binlog truncated in the middle of event; consider out of disk", pos,
+	)}
 }
 
 func (f *fakeBinlog) list(context.Context) ([]string, error) { return f.order, nil }
@@ -224,6 +252,117 @@ func TestDDLLookahead_ShortReadNeverMarksUnread(t *testing.T) {
 	}
 	if got := l.reaching(binlogCoord{"bin.000001", 4}, binlogCoord{"bin.000001", 500}, "app", "kd"); len(got) != 1 {
 		t.Errorf("found %d DDLs in the range the first scan could not read; want 1", len(got))
+	}
+}
+
+// TestDDLLookahead_TornTailPastTheEndIsEnough pins the CI failure of
+// 2026-10-13 (`look-ahead SHOW BINLOG EVENTS … Error 1220 … binlog truncated
+// in the middle of event`): SHOW BINLOG EVENTS reads past the scan's end
+// coordinate into the active file's live tail, and a transaction being
+// flushed there tore the whole read. The rows before the torn event cover
+// the scan's range, so the proof completes — and still finds the DDL inside
+// it.
+func TestDDLLookahead_TornTailPastTheEndIsEnough(t *testing.T) {
+	for _, torn := range []uint32{300, 400} { // at the end coordinate, and past it
+		t.Run(fmt.Sprint(torn), func(t *testing.T) {
+			bl := &fakeBinlog{
+				order: []string{"bin.000001"},
+				files: map[string][]binlogEventRow{"bin.000001": {
+					rowsEv(4, 100), queryEv(100, 200, "use `app`; ALTER TABLE kd DROP COLUMN c"), rowsEv(200, 300), rowsEv(300, 400),
+				}},
+				tornAt: map[string]uint32{"bin.000001": torn},
+			}
+			l := bl.lookahead()
+			from, to := binlogCoord{"bin.000001", 4}, binlogCoord{"bin.000001", 300}
+			if err := l.scan(context.Background(), nil, from, to); err != nil {
+				t.Fatalf("a read torn at or past the scan's end must complete the scan: %v", err)
+			}
+			if l.through != to {
+				t.Errorf("marker = %v; want %v", l.through, to)
+			}
+			if got := l.reaching(from, to, "app", "kd"); len(got) != 1 {
+				t.Errorf("found %d reshaping DDLs in the range a torn read covered; want 1", len(got))
+			}
+		})
+	}
+}
+
+// TestDDLLookahead_TornTailRefusals pins what a torn read must NOT be taken
+// for. Short of the end coordinate it is a short page: re-read, the marker
+// never past the last whole event, SLUICE-E-CDC-BINLOG-LOOKAHEAD-SHORT if it
+// never heals, and a DDL in the range found once it does. In a file the
+// server has rotated away from it is no live tail, and stays an error; and
+// any other error on the active file stays one too.
+func TestDDLLookahead_TornTailRefusals(t *testing.T) {
+	ctx := context.Background()
+	t.Run("short of the end", func(t *testing.T) {
+		bl := &fakeBinlog{
+			order:  []string{"bin.000001"},
+			files:  map[string][]binlogEventRow{"bin.000001": {rowsEv(4, 100), rowsEv(100, 200)}},
+			tornAt: map[string]uint32{"bin.000001": 200},
+		}
+		l := bl.lookahead()
+		l.shortReadWait = time.Millisecond
+		from, to := binlogCoord{"bin.000001", 4}, binlogCoord{"bin.000001", 500}
+		err := l.scan(ctx, nil, from, to)
+		if ce, ok := sluicecode.FromError(err); !ok || ce.Code != sluicecode.CodeCDCBinlogLookaheadShort {
+			t.Fatalf("a read torn short of the end that never heals must refuse with %s; got %v", sluicecode.CodeCDCBinlogLookaheadShort, err)
+		}
+		if l.through.after(binlogCoord{"bin.000001", 200}) {
+			t.Errorf("marker %v covers offsets the scan never read (it read to 200)", l.through)
+		}
+		// The server finishes writing: a DDL sits where the read was torn.
+		delete(bl.tornAt, "bin.000001")
+		bl.files["bin.000001"] = append(bl.files["bin.000001"], queryEv(200, 500, "use `app`; ALTER TABLE kd DROP COLUMN c"))
+		if err := l.scan(ctx, nil, from, to); err != nil {
+			t.Fatal(err)
+		}
+		if got := l.reaching(from, to, "app", "kd"); len(got) != 1 {
+			t.Errorf("found %d DDLs where the torn read stopped; want 1", len(got))
+		}
+	})
+	t.Run("rotated file", func(t *testing.T) {
+		bl := &fakeBinlog{
+			order: []string{"bin.000001", "bin.000002"},
+			files: map[string][]binlogEventRow{
+				"bin.000001": {rowsEv(4, 100), rowsEv(100, 200)},
+				"bin.000002": {rowsEv(4, 100)},
+			},
+			tornAt: map[string]uint32{"bin.000001": 100},
+		}
+		l := bl.lookahead()
+		err := l.scan(ctx, nil, binlogCoord{"bin.000001", 4}, binlogCoord{"bin.000002", 100})
+		if !isActiveTailTruncation(err) {
+			t.Fatalf("a torn read in a rotated file must surface the truncation; got %v", err)
+		}
+	})
+	t.Run("other error", func(t *testing.T) {
+		denied := &sqldriver.MySQLError{Number: 1227, Message: "Access denied; you need (at least one of) the REPLICATION SLAVE privilege(s)"}
+		bl := &fakeBinlog{order: []string{"bin.000001"}, files: map[string][]binlogEventRow{}, failWith: denied}
+		l := bl.lookahead()
+		err := l.scan(ctx, nil, binlogCoord{"bin.000001", 4}, binlogCoord{"bin.000001", 100})
+		if ce, ok := sluicecode.FromError(err); !ok || ce.Code != sluicecode.CodeCDCReplicationPermission {
+			t.Fatalf("a refused read on the active file must stay a refusal; got %v", err)
+		}
+	})
+}
+
+// TestIsActiveTailTruncation pins the classifier to the server's own text:
+// 1220 is the generic "error when executing command", and only its
+// truncation form is a torn tail.
+func TestIsActiveTailTruncation(t *testing.T) {
+	if !isActiveTailTruncation(fmt.Errorf("wrapped: %w", tornEventError(114653))) {
+		t.Error("the measured mysql:8.4 truncation (wrapped) was not recognised")
+	}
+	for _, err := range []error{
+		nil,
+		errors.New("binlog truncated in the middle of event"),
+		&sqldriver.MySQLError{Number: 1220, Message: "Error when executing command SHOW BINLOG EVENTS: Could not find target log"},
+		&sqldriver.MySQLError{Number: 1236, Message: "binlog truncated in the middle of event"},
+	} {
+		if isActiveTailTruncation(err) {
+			t.Errorf("%v classified as a torn tail", err)
+		}
 	}
 }
 
