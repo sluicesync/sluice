@@ -432,9 +432,27 @@ func TestGenerateServerIDIsNonZero(t *testing.T) {
 	// Cheap sanity: the binlog protocol rejects ID=0, so the helper
 	// must never return it.
 	for i := 0; i < 50; i++ {
-		if id := generateServerID(); id == 0 {
-			t.Fatal("generateServerID returned 0")
+		if id := generateServerID(); id < serverIDFloor {
+			t.Fatalf("generateServerID returned %d, below the hand-assigned range floor %d (0 is rejected by the protocol)", id, serverIDFloor)
 		}
+	}
+}
+
+// TestGenerateServerIDIsDistinctWithinAProcess pins
+// BINLOG-SERVER-ID-COLLISION: readers opened in one process within one tick
+// of a coarse clock (Windows) must still register distinct server ids — a
+// fleet of `sync run` legs, or parallel test cells, against one MariaDB
+// source otherwise lose a leg to ERROR 4052. Measured before the fix: the
+// clock-only hash repeated within a 1,000-call loop on Windows.
+func TestGenerateServerIDIsDistinctWithinAProcess(t *testing.T) {
+	const n = 1000
+	seen := make(map[uint32]int, n)
+	for i := 0; i < n; i++ {
+		id := generateServerID()
+		if prev, dup := seen[id]; dup {
+			t.Fatalf("generateServerID call %d repeated call %d's id %d", i, prev, id)
+		}
+		seen[id] = i
 	}
 }
 

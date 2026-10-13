@@ -346,10 +346,10 @@ func rsiRunBackupCell(t *testing.T, srv rsiServer, shape rsiShape, entry rsiEntr
 // server. MariaDB needs both: its applier's DDL is binlogged with a session
 // prefix the look-ahead cannot bound to one table (BUG301-MARIADB-SELF-DDL),
 // so a target on the source server refuses every source stream behind it.
-// sequential runs the cells one at a time: concurrent binlog streams from
-// one process on Windows have collided on MariaDB (ERROR 4052, a replica
-// with the same server_id — generateServerID hashes a clock read whose
-// resolution there is coarse).
+// sequential runs the cells one at a time. It was added because concurrent
+// binlog streams from one process on Windows collided on MariaDB (ERROR
+// 4052, a replica with the same server_id); BINLOG-SERVER-ID-COLLISION
+// fixed generateServerID, and the setting is kept because it costs little.
 type rsiServer struct {
 	rsfServer
 	tgt        *rsfServer

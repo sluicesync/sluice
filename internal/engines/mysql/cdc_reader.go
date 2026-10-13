@@ -240,9 +240,11 @@ type CDCReader struct {
 	binlogTLSMode string
 
 	// serverID is the replica identifier the syncer registers with
-	// the source. Must be unique across all replicas of the source —
-	// a collision causes silent event loss. Generated from a hash of
-	// host+pid+startNanos at construction time and surfaced in logs.
+	// the source. Must be unique across all replicas of the source:
+	// MariaDB refuses a second registration with the same id (ERROR
+	// 4052); MySQL 8 tells dump threads apart by the syncer's random
+	// @replica_uuid instead. Assigned by generateServerID at
+	// construction: a per-process base plus a per-process sequence.
 	serverID uint32
 
 	// syncer is the binlog client. nil until StreamChanges starts the
@@ -3786,27 +3788,44 @@ func formatSIDAsUUID(sid []byte) (string, error) {
 	return string(out), nil
 }
 
-// generateServerID returns a uint32 server ID derived from the host,
-// PID, and current time. The hash isn't cryptographically strong — its
-// job is to keep concurrent sluice processes from picking the same ID
-// against the same source, which is enough for the well-behaved-cluster
-// case the project targets.
-func generateServerID() uint32 {
+// serverIDFloor keeps generated ids above the small range operators assign
+// by hand (a source is usually server_id 1, its replicas a handful more),
+// so a generated id cannot land on the source's own id or a sibling
+// replica's. It also keeps the id clear of 0, which the binlog protocol
+// rejects.
+const serverIDFloor = 1 << 16
+
+// serverIDBase is the per-process starting point: a hash of the host, the
+// pid and the process's first clock read. It separates sluice processes
+// against one source; it cannot separate readers within one process, which
+// is what serverIDSeq is for.
+var serverIDBase = sync.OnceValue(func() uint32 {
 	h := fnv.New32a()
 	if hostname, err := os.Hostname(); err == nil {
 		_, _ = h.Write([]byte(hostname))
 	}
-	var buf [16]byte
+	var buf [12]byte
 	binary.LittleEndian.PutUint32(buf[0:4], uint32(os.Getpid()))
 	binary.LittleEndian.PutUint64(buf[4:12], uint64(time.Now().UnixNano()))
-	_, _ = h.Write(buf[:12])
-	id := h.Sum32()
-	// Avoid the documented "reserved" zero ID; the binlog protocol
-	// rejects it.
-	if id == 0 {
-		return 1
-	}
-	return id
+	_, _ = h.Write(buf[:])
+	return h.Sum32()
+})
+
+// serverIDSeq numbers the readers this process has opened.
+var serverIDSeq atomic.Uint32
+
+// generateServerID returns the replica server id a binlog reader registers
+// with: the process base plus a process-wide sequence number, folded into
+// [serverIDFloor, 2^32). Two calls in one process never repeat until 2^32 -
+// 2^16 readers have been opened. It used to hash one clock read per call,
+// and on Windows two readers opened within one clock tick got the same id
+// (BINLOG-SERVER-ID-COLLISION): MariaDB refuses the second with ERROR 4052.
+// There is no operator override; the binlog syncer in StreamChanges is the
+// only consumer.
+func generateServerID() uint32 {
+	const span = uint64(1<<32 - serverIDFloor)
+	n := uint64(serverIDBase()) + uint64(serverIDSeq.Add(1))
+	return uint32(serverIDFloor + n%span)
 }
 
 // hostPortFromAddr splits an "addr" of the form "host:port" into its
