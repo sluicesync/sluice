@@ -115,10 +115,16 @@ func TestStreamer_MultiSchema_PostgresToPostgres(t *testing.T) {
 		<-runErr
 		t.Fatalf("CDC never delivered sales insert")
 	}
-	if !waitForPGScalar(t, pgTarget, `SELECT COUNT(*) FROM billing.widgets`, 3, 30*time.Second) {
+	// Wait on the transaction's own effects, not the count: billing held 3
+	// rows (ids 1–3) BEFORE it, and the apply lanes are per table, so the
+	// sales half can land first while billing still shows the pre-delete 3 —
+	// a count wait passed early and raced the DELETE (CI 2026-10-13, run
+	// 38397860161; the end-of-test parity check proved the DELETE landed).
+	if !waitForPGScalar(t, pgTarget, `SELECT COUNT(*) FROM billing.widgets WHERE id = 4`, 1, 30*time.Second) ||
+		!waitForPGScalar(t, pgTarget, `SELECT COUNT(*) FROM billing.widgets WHERE id = 2`, 0, 30*time.Second) {
 		streamCancel()
 		<-runErr
-		t.Fatalf("CDC never settled billing (want 3)")
+		t.Fatalf("CDC never settled billing (want id 4 present, id 2 deleted)")
 	}
 	// Let the update/delete land deterministically.
 	if !waitForPGScalar(t, pgTarget, `SELECT COUNT(*) FROM sales.widgets WHERE name='a-one-upd'`, 1, 15*time.Second) {
@@ -258,11 +264,14 @@ func TestStreamer_MultiSchema_PostgresToMySQL(t *testing.T) {
 		<-runErr
 		t.Fatalf("CDC never delivered sales insert to MySQL")
 	}
-	// billing: 3 + 1 - 1 = 3.
-	if !waitForRowCountMySQLDB(t, mysqlServer, "billing", "accounts", 3, 30*time.Second) {
+	// billing: 3 + 1 - 1 = 3 — but it held 3 before the transaction too, and
+	// the apply lanes are per table, so wait on the effects themselves (id 4
+	// present, id 2 deleted) rather than a count the pre-state satisfies.
+	if !waitForMySQLDBScalar(t, mysqlServer, "billing", "SELECT COUNT(*) FROM accounts WHERE id = 4", 1, 30*time.Second) ||
+		!waitForMySQLDBScalar(t, mysqlServer, "billing", "SELECT COUNT(*) FROM accounts WHERE id = 2", 0, 30*time.Second) {
 		streamCancel()
 		<-runErr
-		t.Fatalf("CDC never settled billing on MySQL")
+		t.Fatalf("CDC never settled billing on MySQL (want id 4 present, id 2 deleted)")
 	}
 	// The UPDATE routed to sales only. Poll for it — the UPDATE is a
 	// distinct CDC event that may land just after the INSERT count settles.
