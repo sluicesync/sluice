@@ -102,3 +102,76 @@ func TestKeyCollationFirstBoundary_ChainRestore_PGCollateCToMySQL(t *testing.T) 
 		})
 	}
 }
+
+// TestChainRestore_PGKeyTightenedAsTheTablesLastEventToMySQL pins review of
+// 5f1f19a6 (MEDIUM): window 1 writes a row of kd (the reader records the
+// key's nondeterministic shape at it) and then tightens the key to "C" as
+// kd's LAST event in the window, so no version of the "C" shape follows.
+// Window 2 inserts 'A' beside 'a' — distinct under "C", one key under the
+// `utf8mb4_0900_ai_ci` a MySQL target creates for both. The guard must arm
+// from the "C" shape (the primary key compared byte for byte); the stale
+// nondeterministic shape arms UNIQUE keys only, leaving the primary key
+// unarmed. Graded against the Postgres source by id:HEX(k): exact, or
+// refused with nothing merged.
+//
+// What this does NOT discriminate, measured: with the window-end version
+// removed (the first cut of L3) this cell still refuses correctly, because
+// window 2 records its own version of kd — pgoutput sends a Relation ahead
+// of a table's first row in every session, and after any ALTER — and that
+// version, carrying "C", arms the guard before 'A'. The window-end rule is
+// graded by TestWindowEndVersions; this cell is the end-to-end witness that
+// the shape reaches the guard on a real pair, not a mutation-proven gate.
+func TestChainRestore_PGKeyTightenedAsTheTablesLastEventToMySQL(t *testing.T) {
+	srcRoot, _, pgCleanup := startPostgresLogical(t)
+	defer pgCleanup()
+	_, myRoot, myCleanup := startMySQL(t)
+	defer myCleanup()
+	pgEng, _ := engines.Get("postgres")
+	myEng, _ := engines.Get("mysql")
+	twfbDB{engine: "postgres", dsn: srcRoot}.exec(t, "CREATE DATABASE kctl_s")
+	srcDSN, err := buildPGDSN(srcRoot, "kctl_s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	twfbDB{engine: "mysql", dsn: myRoot}.exec(t, "CREATE DATABASE kctl_t")
+	tgtDSN, err := buildMySQLDSN(myRoot, "kctl_t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src, tgt := twfbDB{engine: "postgres", dsn: srcDSN}, twfbDB{engine: "mysql", dsn: tgtDSN}
+	src.exec(t, "CREATE COLLATION ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false)")
+	src.exec(t, "CREATE TABLE kd (id INT NOT NULL, k varchar(20) COLLATE ci NOT NULL PRIMARY KEY, d INT); "+
+		"ALTER TABLE kd REPLICA IDENTITY FULL; INSERT INTO kd VALUES (1,'a',1),(2,'b',2)")
+	ctx := context.Background()
+	store, err := blobcodec.NewLocalStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := (&backup.Backup{Source: pgEng, SourceDSN: srcDSN, Store: store, SluiceVersion: "test", ChainSlot: true}).Run(ctx); err != nil {
+		t.Fatalf("full: %v", err)
+	}
+	defer dropPGLogicalSlot(t, srcDSN, "sluice_slot")
+	incr := func(what string) {
+		t.Helper()
+		runCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+		defer cancel()
+		if err := (&IncrementalBackup{Source: pgEng, SourceDSN: srcDSN, Store: store, Window: 5 * time.Second, SluiceVersion: "test"}).Run(runCtx); err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+	}
+	src.exec(t, "INSERT INTO kd VALUES (3,'c',3)")
+	src.exec(t, `ALTER TABLE kd ALTER COLUMN k TYPE varchar(20) COLLATE "C"`)
+	incr("window 1")
+	src.exec(t, "INSERT INTO kd VALUES (99,'A',99)")
+	incr("window 2")
+	recs, err := lineage.ListAllSegmentManifests(ctx, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range recs {
+		t.Logf("link %s kind=%s deltas=%d history=%d", lineage.ManifestBackupID(r.Manifest), r.Manifest.Kind, len(r.Manifest.SchemaDelta), len(r.Manifest.SchemaHistory))
+	}
+	restoreErr := (&backup.ChainRestore{Target: myEng, TargetDSN: tgtDSN, Store: store, SourceEngine: engines.Get}).Run(ctx)
+	t.Logf("restore = %v; source %s target %s", restoreErr, kcfbRender(kcfbRows(t, src)), kcfbRender(kcfbRows(t, tgt)))
+	kcfbGrade(t, "pg-tightened-last-to-mysql", src, tgt, restoreErr)
+}

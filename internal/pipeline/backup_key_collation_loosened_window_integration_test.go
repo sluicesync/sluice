@@ -314,62 +314,100 @@ func TestChainRestore_KeyCollationLoosenedPlusAddColumnWindow(t *testing.T) {
 		t.Helper()
 		return db.scalar(t, "SELECT IFNULL(GROUP_CONCAT(CONCAT(id, ':', HEX(k), ':', IFNULL(e, 'NULL')) ORDER BY id), '') FROM kd")
 	}
+	// collide is Bug 306's own shape with the ADD COLUMN in the same window
+	// (review of 5f1f19a6, LOW 5): 'A' written beside 'a' under `_bin`, moved
+	// away, the key loosened, the column added. It must refuse with nothing
+	// merged; the quiet window must restore exactly.
+	windows := map[bool][]string{
+		false: {"INSERT INTO kd VALUES (3,'c',3)", klwToCI, "ALTER TABLE kd ADD COLUMN e INT NOT NULL DEFAULT 7"},
+		true: {
+			"INSERT INTO kd VALUES (99,'A',99)", "UPDATE kd SET k = 'A2' WHERE id = 99", klwToCI,
+			"ALTER TABLE kd ADD COLUMN e INT NOT NULL DEFAULT 7",
+		},
+	}
 	n := 0
-	for _, metadata := range []string{"MINIMAL", "FULL"} {
-		for _, key := range []string{"pk", "unique"} {
-			for _, lane := range []string{"backup-incremental", "backup-stream-rollover"} {
-				n++
-				t.Run(fmt.Sprintf("%s/%s/%s", metadata, key, lane), func(t *testing.T) {
-					root.exec(t, "SET GLOBAL binlog_row_metadata = '"+metadata+"'")
-					srcDB, tgtDB := fmt.Sprintf("klwa_s%d", n), fmt.Sprintf("klwa_t%d", n)
-					root.exec(t, "CREATE DATABASE "+srcDB+"; CREATE DATABASE "+tgtDB)
-					srcDSN, err := buildMySQLDSN(myRoot, srcDB)
-					if err != nil {
-						t.Fatal(err)
+	for _, collide := range []bool{false, true} {
+		for _, metadata := range []string{"MINIMAL", "FULL"} {
+			for _, key := range []string{"pk", "unique"} {
+				for _, lane := range []string{"backup-incremental", "backup-stream-rollover"} {
+					n++
+					name := fmt.Sprintf("%s/%s/%s", metadata, key, lane)
+					if collide {
+						name = "A beside a/" + name
 					}
-					tgtDSN, err := buildMySQLDSN(myRoot, tgtDB)
-					if err != nil {
-						t.Fatal(err)
-					}
-					src, tgt := twfbDB{engine: "mysql", dsn: srcDSN}, twfbDB{engine: "mysql", dsn: tgtDSN}
-					src.exec(t, klwKeys()[key]+"; INSERT INTO kd VALUES (1,'a',1),(2,'b',2)")
-					ctx := context.Background()
-					store, err := blobcodec.NewLocalStore(t.TempDir())
-					if err != nil {
-						t.Fatal(err)
-					}
-					if err := (&backup.Backup{Source: myEng, SourceDSN: srcDSN, Store: store, SluiceVersion: "test"}).Run(ctx); err != nil {
-						t.Fatalf("full: %v", err)
-					}
-					full, err := lineage.ReadManifest(ctx, store)
-					if err != nil {
-						t.Fatal(err)
-					}
-					window := []string{"INSERT INTO kd VALUES (3,'c',3)", klwToCI, "ALTER TABLE kd ADD COLUMN e INT NOT NULL DEFAULT 7"}
-					captureErr := krwCapture(t, lane, myEng, srcDSN, "", store, full.BackupID, src, window)
-					if metadata == "MINIMAL" && lane == "backup-incremental" {
-						// Read behind the head under MINIMAL, the row written before the
-						// ADD COLUMN cannot be decoded by name, and the reader refuses the
-						// capture before anything is recorded — measured; the restore half
-						// of this cell is unreachable.
-						if captureErr == nil || !strings.Contains(captureErr.Error(), "binlog_row_metadata is not FULL") {
-							t.Fatalf("capture = %v; want the reader's MINIMAL-behind-the-head refusal", captureErr)
+					t.Run(name, func(t *testing.T) {
+						root.exec(t, "SET GLOBAL binlog_row_metadata = '"+metadata+"'")
+						srcDB, tgtDB := fmt.Sprintf("klwa_s%d", n), fmt.Sprintf("klwa_t%d", n)
+						root.exec(t, "CREATE DATABASE "+srcDB+"; CREATE DATABASE "+tgtDB)
+						srcDSN, err := buildMySQLDSN(myRoot, srcDB)
+						if err != nil {
+							t.Fatal(err)
 						}
-						return
-					}
-					if captureErr != nil {
-						t.Fatalf("capture: %v", captureErr)
-					}
-					restoreErr := (&backup.ChainRestore{Target: myEng, TargetDSN: tgtDSN, Store: store, SourceEngine: engines.Get}).Run(ctx)
-					s, g := rows(t, src), rows(t, tgt)
-					t.Logf("restore = %v; source %s target %s", restoreErr, s, g)
-					if restoreErr != nil {
-						t.Fatalf("restore = %v; want the window exact (nothing in it collides)", restoreErr)
-					}
-					if s != g {
-						t.Errorf("target differs from the source by id:HEX(k):e\nsource: %s\ntarget: %s", s, g)
-					}
-				})
+						tgtDSN, err := buildMySQLDSN(myRoot, tgtDB)
+						if err != nil {
+							t.Fatal(err)
+						}
+						src, tgt := twfbDB{engine: "mysql", dsn: srcDSN}, twfbDB{engine: "mysql", dsn: tgtDSN}
+						src.exec(t, klwKeys()[key]+"; INSERT INTO kd VALUES (1,'a',1),(2,'b',2)")
+						ctx := context.Background()
+						store, err := blobcodec.NewLocalStore(t.TempDir())
+						if err != nil {
+							t.Fatal(err)
+						}
+						if err := (&backup.Backup{Source: myEng, SourceDSN: srcDSN, Store: store, SluiceVersion: "test"}).Run(ctx); err != nil {
+							t.Fatalf("full: %v", err)
+						}
+						full, err := lineage.ReadManifest(ctx, store)
+						if err != nil {
+							t.Fatal(err)
+						}
+						captureErr := krwCapture(t, lane, myEng, srcDSN, "", store, full.BackupID, src, windows[collide])
+						if metadata == "MINIMAL" && lane == "backup-incremental" {
+							// Read behind the head under MINIMAL, the row written before the
+							// ADD COLUMN cannot be decoded by name, and the reader refuses the
+							// capture before anything is recorded — measured; the restore half
+							// of this cell is unreachable.
+							if captureErr == nil || !strings.Contains(captureErr.Error(), "binlog_row_metadata is not FULL") {
+								t.Fatalf("capture = %v; want the reader's MINIMAL-behind-the-head refusal", captureErr)
+							}
+							return
+						}
+						if captureErr != nil {
+							t.Fatalf("capture: %v", captureErr)
+						}
+						restoreErr := (&backup.ChainRestore{Target: myEng, TargetDSN: tgtDSN, Store: store, SourceEngine: engines.Get}).Run(ctx)
+						s, g := rows(t, src), rows(t, tgt)
+						t.Logf("restore = %v; source %s target %s", restoreErr, s, g)
+						if !collide {
+							if restoreErr != nil {
+								t.Fatalf("restore = %v; want the window exact (nothing in it collides)", restoreErr)
+							}
+							if s != g {
+								t.Errorf("target differs from the source by id:HEX(k):e\nsource: %s\ntarget: %s", s, g)
+							}
+							return
+						}
+						// Refused, with nothing merged: every target row is the source's
+						// row of the same id, key bytes and e, and the colliding row 99
+						// never landed.
+						if !errors.Is(restoreErr, ir.ErrKeyCollationMerge) {
+							t.Fatalf("restore = %v; want KEY-COLLATION-MERGE", restoreErr)
+						}
+						klwAssertRestoreRemedy(t, restoreErr)
+						srcRows := map[string]bool{}
+						for _, r := range strings.Split(s, ",") {
+							srcRows[r] = true
+						}
+						for _, r := range strings.Split(g, ",") {
+							if r != "" && !srcRows[r] {
+								t.Errorf("target row %s is not the source's (a merge)\nsource: %s\ntarget: %s", r, s, g)
+							}
+							if strings.HasPrefix(r, "99:") {
+								t.Errorf("the colliding row 99 landed before the refusal: %s", g)
+							}
+						}
+					})
+				}
 			}
 		}
 	}
