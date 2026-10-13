@@ -164,6 +164,12 @@ type ChainRestore struct {
 	// column's collation.
 	SourceEngine func(name string) (ir.Engine, bool)
 
+	// windowStart is the schema the link before the incremental being
+	// applied recorded — the shape in force at that window's start — set by
+	// the chain walk ([windowStartVersions]). nil for a caller that applies
+	// one incremental on its own.
+	windowStart *ir.Schema
+
 	// chainCEK caches the chain-level CEK after the full's preflight.
 	// Reused for every change-chunk decrypt across the incremental
 	// walk so Argon2id (passphrase mode) runs once per chain restore.
@@ -436,6 +442,12 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 				slog.Int("change_chunks", len(link.Manifest.ChangeChunks)),
 				slog.Int("schema_deltas", len(link.Manifest.SchemaDelta)),
 			)
+			// The shape in force at this window's start is the one the
+			// previous link recorded (KEY-COLLATION-LOOSENED-WINDOW).
+			r.windowStart = nil
+			if i > 0 {
+				r.windowStart = links[i-1].Manifest.Schema
+			}
 			if err := r.applyIncremental(ctx, link, applier, batchSize); err != nil {
 				return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("chain restore: incremental %s: %w",
 					lineage.ManifestBackupID(link.Manifest), err))
@@ -1431,8 +1443,9 @@ func (r *ChainRestore) streamIncrementalChanges(
 	if err != nil {
 		return fmt.Errorf("apply schema history: %w", err)
 	}
+	snaps = append(windowStartVersions(r.windowStart, link.Manifest, snaps), snaps...)
 	history, err := newHistoryReplay(lineage.ManifestBackupID(link.Manifest), link.Manifest.SourceEngine,
-		r.positionOrdererFor(link.Manifest.SourceEngine), link.Manifest.Schema, snaps)
+		r.positionOrdererFor(link.Manifest.SourceEngine), link.Manifest, snaps)
 	if err != nil {
 		return err
 	}

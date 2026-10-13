@@ -860,11 +860,15 @@ var alterDispositions = map[AlterAspect]alterDisposition{
 	// Applied BEFORE the window replays, like a type change: a key whose
 	// collation became more discriminating (`_ci` → `_bin`, PAD SPACE → NO
 	// PAD) must be on the target before rows distinct only under it arrive,
-	// or they merge. The opposite direction (`_bin` → `_ci`) is the stated
-	// residual: the source could only make that change after removing every
-	// pair the new collation equates, and if one such pair was written AND
-	// removed inside the same window, replaying it into the already-altered
-	// key merges the pair before the delete. No measured case reaches it.
+	// or they merge. The opposite direction (`_bin` → `_ci`) does reach a
+	// merge: the source could only make that change after removing every
+	// pair the new collation equates, but a pair written AND moved apart
+	// inside the same window replays into the already-loosened key — measured
+	// (KEY-COLLATION-LOOSENED-WINDOW: target row 1 overwritten, or gone with
+	// the key as the primary key, exit 0). Chain restore now arms the guard
+	// for the rows before the change from the window's start shape
+	// (backup.windowStartVersions) and refuses the merge; `sync from-backup`
+	// refuses any window this aspect appears in.
 	AlterAspectColumnCollation: {
 		Verdict: AlterApply,
 		Reason:  "ALTER TABLE ... MODIFY/ALTER COLUMN with the new character set and collation via the engine's shape-delta surface",

@@ -412,11 +412,6 @@ type CDCReader struct {
 	decodedShapes           map[string]decodedShape
 	decodedShapeBaselineSet bool
 
-	// recordedCollations is, per table and character column, the collation
-	// its last decoded rows event RECORDED (cdc_recorded_collation.go).
-	// Pump goroutine only.
-	recordedCollations map[string]map[string]string
-
 	// schemaForward enables ADR-0091 F7a single-stream schema-change
 	// forwarding. When true, maybeSnapshotSchemaB1 ALSO emits a
 	// SchemaSnapshot on a per-column NULLABILITY-only change (GAP #2),
@@ -1823,8 +1818,9 @@ func (r *CDCReader) dispatchRows(
 	// shape this event was RECORDED under — its own column names when the
 	// source runs binlog_row_metadata=FULL, otherwise the catalog shape once
 	// proven to hold at this position — or refuse, before any row of the
-	// table is decoded. See cdc_ddl_lookahead.go and cdc_recorded_shape.go.
-	tbl, err := r.shapeAtEvent(ctx, qn, catalogTbl, ev)
+	// table is decoded. See cdc_ddl_lookahead.go and cdc_recorded_shape.go;
+	// its collations are the event's (cdc_recorded_collation.go).
+	tbl, err := r.recordedShapeAtEvent(ctx, qn, catalogTbl, ev)
 	if err != nil {
 		return err
 	}
@@ -1885,8 +1881,7 @@ func (r *CDCReader) dispatchRows(
 	// boundary (cdc_recorded_shape.go): the boundary stays owed — so a
 	// column-order change it carries must refuse here, because no later
 	// boundary can show it (BUG301-FULL-DEFERRED-SWAP).
-	// The recorded collations are held too (cdc_recorded_collation.go).
-	if err := r.holdDecodedShape(ctx, qn, tbl, ev.Table); err != nil {
+	if err := r.holdDecodedOrder(qn, tbl); err != nil {
 		return err
 	}
 	if !tbl.synthesized {

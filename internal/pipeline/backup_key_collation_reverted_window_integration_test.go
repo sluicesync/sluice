@@ -30,6 +30,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -58,12 +59,20 @@ func krwCapture(t *testing.T, lane string, eng ir.Engine, srcDSN, slot string, s
 			Window: 8 * time.Second, SluiceVersion: "test",
 		}).Run(runCtx)
 	}
+	// "backup-stream" ends its one window by the drain-commit, which records
+	// no schema delta (KEY-COLLATION-DRAIN-NO-DELTA); "backup-stream-rollover"
+	// commits windows by rollover, each with the schema refresh and delta a
+	// long-running stream writes.
+	rollover := 10 * time.Minute
+	if lane == "backup-stream-rollover" {
+		rollover = 4 * time.Second
+	}
 	runCtx, cancel := context.WithCancel(ctx)
 	done := make(chan error, 1)
 	go func() {
 		done <- (&BackupStream{
 			Source: eng, SourceDSN: srcDSN, Store: store, ParentRef: parent, SlotName: slot,
-			RolloverWindow: 10 * time.Minute, RolloverMaxChanges: 1 << 30, RolloverMaxBytes: 1 << 40,
+			RolloverWindow: rollover, RolloverMaxChanges: 1 << 30, RolloverMaxBytes: 1 << 40,
 			ChunkChanges: 100, SluiceVersion: "test",
 		}).Run(runCtx)
 	}()
@@ -94,21 +103,20 @@ func TestChainRestore_KeyCollationChangedAndRevertedInsideTheWindow(t *testing.T
 	windows := map[string][]string{
 		// The defect: the key's `_bin` shape lives only inside the window.
 		"reverted": {toBin, "INSERT INTO kd VALUES (99,'A',99)", "UPDATE kd SET k = 'A2' WHERE id = 99", toCI, "INSERT INTO kd VALUES (100,'zz',100)"},
-		// The control the reader's hold must NOT refuse: rows written before
-		// a forward change the catalog already shows, and rows after it.
+		// The control nothing may refuse: rows written before a forward
+		// (tightening) change the catalog already shows, and rows after it.
 		"forward": {"INSERT INTO kd VALUES (50,'p',50)", toBin, "INSERT INTO kd VALUES (99,'A',99)", "INSERT INTO kd VALUES (100,'zz',100)"},
 	}
 	n := 0
 	for _, metadata := range []string{"MINIMAL", "FULL"} {
 		for _, key := range []string{"pk", "unique"} {
 			for _, variant := range []string{"reverted", "forward"} {
-				for _, lane := range []string{"backup-stream", "backup-incremental"} {
+				for _, lane := range []string{"backup-stream", "backup-stream-rollover", "backup-incremental"} {
 					if variant == "forward" && lane == "backup-stream" {
-						// The control grades the reader's hold, which a live
-						// window never reaches; and this harness ends a stream
-						// window by its drain-commit, which records no schema
-						// delta (KEY-COLLATION-DRAIN-NO-DELTA, pinned by
-						// TestBackupStream_DrainCommit_StampsAKeyCollationWindow).
+						// A drain-commit records no schema delta
+						// (KEY-COLLATION-DRAIN-NO-DELTA, pinned by
+						// TestBackupStream_DrainCommit_StampsAKeyCollationWindow),
+						// so the control runs on the rollover lane instead.
 						continue
 					}
 					n++
@@ -140,26 +148,27 @@ func TestChainRestore_KeyCollationChangedAndRevertedInsideTheWindow(t *testing.T
 						if err != nil {
 							t.Fatal(err)
 						}
-						captureErr := krwCapture(t, lane, myEng, srcDSN, "", store, full.BackupID, src, window)
-						if variant == "reverted" && lane == "backup-incremental" {
-							// The reader replays the window behind the head: the
-							// TABLE_MAP records `_bin` for rows the catalog says are
-							// `_ci`, and nothing will ever record the `_bin` shape.
-							if !errors.Is(captureErr, ir.ErrDeferredSchemaChange) {
-								t.Fatalf("capture = %v; want %v (the reader's recorded-collation hold)", captureErr, ir.ErrDeferredSchemaChange)
-							}
-							return
+						// Behind the head (the incremental lane) the reader reports
+						// each row under the collation its event recorded, so the
+						// history carries `_bin` there too; no lane refuses capture.
+						if err := krwCapture(t, lane, myEng, srcDSN, "", store, full.BackupID, src, window); err != nil {
+							t.Fatalf("capture: %v", err)
 						}
-						if captureErr != nil {
-							t.Fatalf("capture: %v", captureErr)
+						cr := &backup.ChainRestore{Target: myEng, TargetDSN: tgtDSN, Store: store}
+						if metadata == "FULL" {
+							// The CLI's wiring (MINIMAL cells take the same-named
+							// Target's orderer instead).
+							cr.SourceEngine = engines.Get
 						}
-						restoreErr := (&backup.ChainRestore{Target: myEng, TargetDSN: tgtDSN, Store: store}).Run(ctx)
+						restoreErr := cr.Run(ctx)
 						t.Logf("restore = %v; source %s target %s", restoreErr, kcfbRender(kcfbRows(t, src)), kcfbRender(kcfbRows(t, tgt)))
 						if variant == "reverted" {
 							// The window's history holds both shapes; the `_bin` one
-							// governs 'A', and the guard must refuse it onto `_ci`.
-							if !errors.Is(restoreErr, ir.ErrKeyCollationMerge) {
-								t.Fatalf("restore = %v; want %v", restoreErr, ir.ErrKeyCollationMerge)
+							// governs 'A', and the GUARD must refuse it onto `_ci` —
+							// not KEY-COLLATION-HISTORY-UNORDERED, which satisfies the
+							// same sentinel and means the versions were never placed.
+							if !errors.Is(restoreErr, ir.ErrKeyCollationMerge) || strings.Contains(restoreErr.Error(), "KEY-COLLATION-HISTORY-UNORDERED") {
+								t.Fatalf("restore = %v; want the guard's %v", restoreErr, ir.ErrKeyCollationMerge)
 							}
 						} else if restoreErr != nil {
 							t.Fatalf("restore: %v", restoreErr)

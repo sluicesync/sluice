@@ -5,7 +5,6 @@ package mysql
 
 import (
 	"context"
-	"errors"
 	"testing"
 
 	gomysql "github.com/go-mysql-org/go-mysql/mysql"
@@ -17,14 +16,15 @@ import (
 const (
 	collIDBin = 46  // utf8mb4_bin
 	collIDCI  = 255 // utf8mb4_0900_ai_ci
+	collIDASC = 65  // ascii_bin
 )
 
-func recordedCollationReader(baseline []*ir.Table) *CDCReader {
-	r := &CDCReader{schema: "d", serverCollationIDNames: map[uint64]string{collIDBin: "utf8mb4_bin", collIDCI: "utf8mb4_0900_ai_ci"}}
-	if baseline != nil {
-		r.SetDecodedShapeBaseline(baseline)
+func recordedCollationReader() *CDCReader {
+	return &CDCReader{
+		schema:                 "d",
+		serverCollationIDNames: map[uint64]string{collIDBin: "utf8mb4_bin", collIDCI: "utf8mb4_0900_ai_ci", collIDASC: "ascii_bin"},
+		serverCollations:       map[uint64]string{collIDBin: "utf8mb4", collIDCI: "utf8mb4", collIDASC: "ascii"},
 	}
-	return r
 }
 
 func kdShape(collation string) *tableSchema {
@@ -43,86 +43,53 @@ func kdTableMap(kCollationID uint64) *replication.TableMapEvent {
 	}
 }
 
-func kdBaseline(collation string) []*ir.Table {
-	s := kdShape(collation)
-	return []*ir.Table{{Schema: "d", Name: "kd", Columns: s.Columns}}
+func kCollation(tbl *tableSchema) (charset, collation string) {
+	v := tbl.Columns[1].Type.(ir.Varchar)
+	return v.Charset, v.Collation
 }
 
-// TestHoldRecordedCollations pins KEY-COLLATION-REVERTED-WINDOW-RESTORE at
-// the reader: a row recorded under a collation that neither the shape
-// decoding it nor the stream's last known one declares refuses; a forward
-// change replayed behind the head (rows recorded under the basis, then under
-// the catalog's current collation) and a live stream pass.
-func TestHoldRecordedCollations(t *testing.T) {
+// TestStampRecordedCollations pins KEY-COLLATION-REVERTED-WINDOW-RESTORE and
+// KEY-COLLATION-LOOSENED-WINDOW at the reader: a rows event read behind the
+// head under a catalog that has since changed the key's collation is
+// decoded and reported under the collation it RECORDED, so the boundary the
+// stream emits for it carries the shape in force at that row.
+func TestStampRecordedCollations(t *testing.T) {
 	ctx := context.Background()
-	const qn = "d.kd"
-	type event struct {
-		declared string
-		recorded uint64
-		refuse   bool
-	}
+	r := recordedCollationReader()
 	cases := []struct {
-		name     string
-		baseline []*ir.Table
-		events   []event
+		name                  string
+		declared              string
+		recorded              uint64
+		wantCharset, wantColl string
+		same                  bool
 	}{
-		{"reverted window replayed: _bin rows under a _ci catalog and basis", kdBaseline("utf8mb4_0900_ai_ci"), []event{
-			{"utf8mb4_0900_ai_ci", collIDCI, false},
-			{"utf8mb4_0900_ai_ci", collIDBin, true},
-		}},
-		{"forward change replayed: rows under the basis, then under the catalog", kdBaseline("utf8mb4_0900_ai_ci"), []event{
-			{"utf8mb4_bin", collIDCI, false},
-			{"utf8mb4_bin", collIDCI, false},
-			{"utf8mb4_bin", collIDBin, false},
-		}},
-		{"forward then back: the last recorded collation is the basis", kdBaseline("utf8mb4_0900_ai_ci"), []event{
-			{"utf8mb4_bin", collIDBin, false},
-			{"utf8mb4_0900_ai_ci", collIDCI, false},
-		}},
-		{"live: recorded equals declared", kdBaseline("utf8mb4_0900_ai_ci"), []event{
-			{"utf8mb4_0900_ai_ci", collIDCI, false},
-		}},
-		{"armed, table not in the baseline", []*ir.Table{}, []event{
-			{"utf8mb4_0900_ai_ci", collIDBin, true},
-		}},
-		{"unarmed reader with no basis compares nothing", nil, []event{
-			{"utf8mb4_0900_ai_ci", collIDBin, false},
-		}},
+		{"reverted: written under _bin, catalog back on _ci", "utf8mb4_0900_ai_ci", collIDBin, "utf8mb4", "utf8mb4_bin", false},
+		{"loosened: written under _bin, catalog loosened to _ci", "utf8mb4_0900_ai_ci", collIDBin, "utf8mb4", "utf8mb4_bin", false},
+		{"tightened: written under _ci, catalog now _bin", "utf8mb4_bin", collIDCI, "utf8mb4", "utf8mb4_0900_ai_ci", false},
+		{"character set too", "utf8mb4_bin", collIDASC, "ascii", "ascii_bin", false},
+		{"at the head: recorded equals the catalog", "utf8mb4_0900_ai_ci", collIDCI, "utf8mb4", "utf8mb4_0900_ai_ci", true},
+		{"binary column", "utf8mb4_0900_ai_ci", binaryCollationID, "utf8mb4", "utf8mb4_0900_ai_ci", true},
+		{"unnamed ID", "utf8mb4_0900_ai_ci", 999, "utf8mb4", "utf8mb4_0900_ai_ci", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			r := recordedCollationReader(tc.baseline)
-			for i, ev := range tc.events {
-				err := r.holdRecordedCollations(ctx, qn, kdShape(ev.declared), kdTableMap(ev.recorded))
-				if got := errors.Is(err, ir.ErrDeferredSchemaChange); got != ev.refuse {
-					t.Fatalf("event %d (declared %s, recorded ID %d): err = %v; refuse = %v, want %v",
-						i, ev.declared, ev.recorded, err, got, ev.refuse)
-				}
-				if err != nil {
-					return
-				}
-				// What holdDecodedOrder does after the hold: the shape becomes the basis.
-				if err := r.holdDecodedOrder(qn, kdShape(ev.declared)); err != nil {
-					t.Fatalf("event %d: holdDecodedOrder: %v", i, err)
-				}
+			in := kdShape(tc.declared)
+			got := r.stampRecordedCollations(ctx, in, kdTableMap(tc.recorded))
+			if (got == in) != tc.same {
+				t.Fatalf("returned the input shape = %v; want %v", got == in, tc.same)
+			}
+			if cs, coll := kCollation(got); cs != tc.wantCharset || coll != tc.wantColl {
+				t.Fatalf("k = %s/%s; want %s/%s", cs, coll, tc.wantCharset, tc.wantColl)
+			}
+			if _, coll := kCollation(in); coll != tc.declared {
+				t.Fatalf("the input shape was modified: k = %s", coll)
 			}
 		})
 	}
-}
-
-// TestHoldRecordedCollations_SkipsWhatItCannotCompare: a binary column, an
-// ID the source does not name, and a TABLE_MAP that records no collation
-// (MariaDB NO_LOG) pass untouched.
-func TestHoldRecordedCollations_SkipsWhatItCannotCompare(t *testing.T) {
-	ctx := context.Background()
-	r := recordedCollationReader(kdBaseline("utf8mb4_0900_ai_ci"))
-	for _, tm := range []*replication.TableMapEvent{
-		kdTableMap(binaryCollationID),
-		kdTableMap(999), // unnamed
-		{ColumnCount: 2, ColumnType: []byte{gomysql.MYSQL_TYPE_LONG, gomysql.MYSQL_TYPE_VARCHAR}, ColumnMeta: []uint16{0, 80}},
-	} {
-		if err := r.holdRecordedCollations(ctx, "d.kd", kdShape("utf8mb4_0900_ai_ci"), tm); err != nil {
-			t.Fatalf("err = %v; want nil", err)
-		}
+	// No TABLE_MAP collations at all (MariaDB NO_LOG): the shape is the catalog's.
+	in := kdShape("utf8mb4_bin")
+	noLog := &replication.TableMapEvent{ColumnCount: 2, ColumnType: []byte{gomysql.MYSQL_TYPE_LONG, gomysql.MYSQL_TYPE_VARCHAR}, ColumnMeta: []uint16{0, 80}}
+	if got := r.stampRecordedCollations(ctx, in, noLog); got != in {
+		t.Fatal("a TABLE_MAP recording no collation changed the shape")
 	}
 }

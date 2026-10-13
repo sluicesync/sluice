@@ -5,7 +5,6 @@ package mysql
 
 import (
 	"context"
-	"fmt"
 	"strings"
 
 	"github.com/go-mysql-org/go-mysql/replication"
@@ -13,129 +12,123 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 )
 
-// # A collation the stream will never record (KEY-COLLATION-REVERTED-WINDOW-RESTORE)
+// # A row's collation is the one its event recorded
+// (KEY-COLLATION-REVERTED-WINDOW-RESTORE, KEY-COLLATION-LOOSENED-WINDOW)
 //
 // A reader behind the binlog head reads each table's definition from the
-// catalog, which answers as of NOW. A column whose collation was changed and
-// changed BACK between the reader's position and the head reads as if it had
-// never changed: `MODIFY k … COLLATE utf8mb4_bin`, a row 'A' beside the
-// existing 'a', the row moved out of the way, `MODIFY k … COLLATE
-// utf8mb4_0900_ai_ci`. The look-ahead (cdc_ddl_lookahead.go) proves the
-// column LIST, and the decode is byte-exact, so nothing refused; the shape the
-// rows were decoded under — and the schema history the stream recorded — said
-// `_ci` throughout. A restore armed its key-collation guard from that shape,
-// equal to the target's, and replayed 'A' onto row 1's 'a': target row 1 held
-// 'A' where the source holds 'a', at exit 0 (measured on MySQL 8.0, MINIMAL
-// and FULL, `backup incremental` started after the change; a warm-resumed
-// sync reads the binlog the same way).
+// catalog, which answers as of NOW. A key column whose collation changed
+// between the reader's position and the head reads as if every row had been
+// written under the current collation, and the shape the stream reports —
+// its schema boundaries and the schema history a backup records — says so.
+// Two measured harms (MySQL 8.0 and 8.4, MINIMAL and FULL, a `backup
+// incremental` or a warm-resumed `sync start` read after the change):
+//
+//   - changed and changed BACK (`_ci` → `_bin`, 'A' beside 'a', 'A' moved
+//     away, back to `_ci`): the `_bin` shape was never reported at all, and
+//     'A' replayed onto row 1's 'a' — target row 1 held 'A', or was gone
+//     with the key as the primary key, at exit 0;
+//   - LOOSENED (`_bin` → `_ci` after 'A' beside 'a' moved away): the table's
+//     first boundary after a resume carried the catalog's `_ci` (GC-44 F12),
+//     the target key was loosened before 'A' arrived, and 'A' merged.
 //
 // The TABLE_MAP before every rows event records each character column's
 // collation ID — under the default binlog_row_metadata=MINIMAL as well as
-// FULL. So the reader compares it, per character column, with two
-// independent statements of what the stream knows:
-//
-//   - the shape it decodes the event with (the catalog's, or the event's own
-//     names under FULL): equal means the stream's record is right;
-//   - the collation the column's previous rows were recorded under in this
-//     stream, or — for its first — the basis the pipeline handed over (the
-//     schema the copy or the parent backup recorded, or the retained history
-//     at a resume; [CDCReader.SetDecodedShapeBaseline]): equal means the rows
-//     predate a change the catalog already shows, which the delta and the
-//     boundary carry (a forward `_ci` → `_bin` replayed behind the head).
-//
-// A collation equal to NEITHER was in force only between two changes the
-// stream cannot see, so no boundary will ever describe the shape these rows
-// were written under; the reader refuses before decoding any of them
-// (DEFERRED-SCHEMA-CHANGE). It refuses for any character column, not only a
-// key: the reader does not know the table's unique keys, and a collation that
-// existed only inside a stretch of binlog sluice cannot describe is a schema
-// the stream would otherwise report wrongly.
+// FULL. So the shape a rows event is decoded and reported under carries the
+// RECORDED collation (and its character set) wherever the two differ
+// ([CDCReader.stampRecordedCollations]): the event's own statement of what
+// it was written under, at its position. The boundaries the stream already
+// emits — the first touch of a table, the first row after a DDL — then carry
+// the shape in force at that row, so a sync forwards (or, under
+// `--schema-changes=refuse`, refuses) the change before the rows written
+// under it, and a backup's schema history records it for chain restore to
+// guard those rows under. Decoding is unaffected: character values are
+// decoded by the TABLE_MAP's character set already ([binlogColumnCharsets]).
 //
 // Not covered: a collation ID the source's collation table does not name
-// (no comparison is possible; the DEFERRED-KEY-COLLATION hold refuses that
-// case for the columns it sees), a source that records no collation
-// (MariaDB's default binlog_row_metadata=NO_LOG — its in-place column changes
-// ahead of the reader already refuse in [retypedColumnUnverified]), and a
-// column with no basis (no baseline was handed over, or the table is not in
-// it).
+// (the shape keeps the catalog's; the DEFERRED-KEY-COLLATION hold refuses it
+// where it can see it), a source that records no collation (MariaDB's
+// default binlog_row_metadata=NO_LOG — its in-place column changes ahead of
+// the reader refuse in [retypedColumnUnverified]), and VStream, whose events
+// carry no collation (F17's named VStream residual).
+//
+// UNVERIFIED PREMISE: a collation change on the source is a DDL, so the row
+// after it is a table's first row after a DDL, where the boundary is
+// emitted. A shape stamped differently from the last one reported without an
+// intervening DDL or first touch is not emitted as a boundary of its own.
 
-// holdDecodedShape holds a rows event's shape before any row of it is
-// decoded: its recorded collations ([CDCReader.holdRecordedCollations])
-// against the basis, then its order and types
-// ([CDCReader.holdDecodedOrder]), which makes it the next basis — so the
-// collation hold must run first.
-func (r *CDCReader) holdDecodedShape(ctx context.Context, qn string, tbl *tableSchema, tm *replication.TableMapEvent) error {
-	if err := r.holdRecordedCollations(ctx, qn, tbl, tm); err != nil {
-		return err
+// recordedShapeAtEvent is [CDCReader.shapeAtEvent] with the event's recorded
+// collations stamped on ([CDCReader.stampRecordedCollations]).
+func (r *CDCReader) recordedShapeAtEvent(ctx context.Context, qn string, catalog *tableSchema, ev *replication.RowsEvent) (*tableSchema, error) {
+	shape, err := r.shapeAtEvent(ctx, qn, catalog, ev)
+	if err != nil {
+		return nil, err
 	}
-	return r.holdDecodedOrder(qn, tbl)
+	return r.stampRecordedCollations(ctx, shape, ev.Table), nil
 }
 
-// holdRecordedCollations refuses a rows event of qn whose TABLE_MAP records,
-// for a character column of tbl, a collation that neither tbl nor the column's
-// last recorded (or baseline) collation declares; otherwise it records each
-// column's collation for the next event.
-func (r *CDCReader) holdRecordedCollations(ctx context.Context, qn string, tbl *tableSchema, tm *replication.TableMapEvent) error {
+// stampRecordedCollations returns tbl with each character column's
+// collation, and character set, replaced by the ones its rows event
+// recorded where they differ from tbl's; tbl itself when none differ.
+func (r *CDCReader) stampRecordedCollations(ctx context.Context, tbl *tableSchema, tm *replication.TableMapEvent) *tableSchema {
 	if tm == nil || len(tm.ColumnType) != len(tbl.Columns) {
-		return nil
+		return tbl
 	}
 	ids := tm.CollationMap()
 	if len(ids) == 0 {
-		return nil
+		return tbl
 	}
-	nameOf := r.collationIDNames(ctx)
-	last := r.recordedCollations[qn]
-	basis := r.decodedShapes[qn]
+	nameOf, charsetOf := r.collationIDNames(ctx), r.collationCharsets(ctx)
+	var stamped *tableSchema
 	for i, col := range tbl.Columns {
-		declared := characterCollation(col.Type)
 		id, ok := ids[i]
-		if declared == "" || !ok || id == binaryCollationID {
+		if !ok || id == binaryCollationID || characterCollation(col.Type) == "" {
 			continue
 		}
-		recorded := strings.ToLower(nameOf(id))
-		if recorded == "" {
+		name := strings.ToLower(nameOf(id))
+		if name == "" || strings.EqualFold(name, characterCollation(col.Type)) {
 			continue
 		}
-		if !strings.EqualFold(recorded, declared) {
-			known := last[col.Name]
-			if known == "" {
-				known = characterCollation(basis.types[col.Name])
-			}
-			switch {
-			case known == "" && r.decodedShapeBaselineSet:
-				// Armed, and nothing says what the column was before: the
-				// deferred-shape hold's no-basis posture (a warm resume of a
-				// table with no retained history), loud rather than unchecked.
-				return unrecordedCollationRefusal(qn, col.Name, recorded, declared, "")
-			case known != "" && !strings.EqualFold(recorded, known):
-				return unrecordedCollationRefusal(qn, col.Name, recorded, declared, known)
-			}
+		typ, ok := withCollation(col.Type, canonicalCharsetName(charsetOf(id)), name)
+		if !ok {
+			continue
 		}
-		if last == nil {
-			if r.recordedCollations == nil {
-				r.recordedCollations = map[string]map[string]string{}
-			}
-			last = map[string]string{}
-			r.recordedCollations[qn] = last
+		if stamped == nil {
+			cp := *tbl
+			cp.Columns = append([]*ir.Column(nil), tbl.Columns...)
+			stamped = &cp
 		}
-		last[col.Name] = recorded
+		c := *col
+		c.Type = typ
+		stamped.Columns[i] = &c
 	}
-	return nil
+	if stamped == nil {
+		return tbl
+	}
+	return stamped
 }
 
-// unrecordedCollationRefusal is the DEFERRED-SCHEMA-CHANGE refusal of
-// [CDCReader.holdRecordedCollations]. known is "" when the stream holds no
-// shape of the table from before this event.
-func unrecordedCollationRefusal(qn, col, recorded, declared, known string) error {
-	before := "the last collation this stream knew it by is " + known
-	if known == "" {
-		before = "this stream holds no shape of the table from before this event to show what it was"
+// withCollation is t with its character set and collation set; ok is false
+// for a type that has none.
+func withCollation(t ir.Type, charset, collation string) (ir.Type, bool) {
+	switch v := t.(type) {
+	case ir.Varchar:
+		if charset != "" {
+			v.Charset = charset
+		}
+		v.Collation = collation
+		return v, true
+	case ir.Char:
+		if charset != "" {
+			v.Charset = charset
+		}
+		v.Collation = collation
+		return v, true
+	case ir.Text:
+		if charset != "" {
+			v.Charset = charset
+		}
+		v.Collation = collation
+		return v, true
 	}
-	return fmt.Errorf("mysql: cdc: %s: %w: column %q was written under collation %s at this binlog event, but the "+
-		"table's definition as this stream reads it declares %s, and %s. The collation was changed, and changed "+
-		"again, in a stretch of binlog whose schema the catalog no longer shows, so no schema boundary will record the shape these rows were written under, and on a key "+
-		"column a target comparing under %s can merge rows the source keeps apart. Refusing before any row of it is "+
-		"decoded. Re-copy the stream: `sluice sync start --reset-target-data --yes` with the stream's other flags "+
-		"unchanged for a sync, or a fresh `backup full` for a backup chain",
-		qn, ir.ErrDeferredSchemaChange, col, recorded, declared, before, declared)
+	return t, false
 }

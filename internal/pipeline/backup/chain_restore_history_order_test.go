@@ -11,7 +11,126 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
+
+// varcharKey is a utf8mb4 VARCHAR(20) under collation.
+func varcharKey(collation string) ir.Type {
+	return ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: collation}
+}
+
+// TestRefuseKeyCollationHistory_ComparesConsecutiveVersions is the
+// reviewer's probe (review of df690b30, finding 2): a column added in V1
+// with a `_bin` UNIQUE key and loosened in V2. Compared only with V0, which
+// lacks the column, the change was invisible; each version is now compared
+// with the one before it.
+func TestRefuseKeyCollationHistory_ComparesConsecutiveVersions(t *testing.T) {
+	v := func(at int, k2 ir.Type) ir.SchemaSnapshot {
+		tbl := &ir.Table{
+			Name: "kd", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 32}}},
+			PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}},
+		}
+		if k2 != nil {
+			tbl.Columns = append(tbl.Columns, &ir.Column{Name: "k2", Type: k2})
+			tbl.Indexes = []*ir.Index{{Name: "uk2", Unique: true, Columns: []ir.IndexColumn{{Column: "k2"}}}}
+		}
+		return ir.SchemaSnapshot{Position: hpos(at), Table: "kd", IR: tbl}
+	}
+	snaps := []ir.SchemaSnapshot{v(10, nil), v(20, varcharKey("utf8mb4_bin")), v(30, varcharKey("utf8mb4_0900_ai_ci"))}
+	if err := refuseKeyCollationHistory("b1", "test", nil, snaps); !errors.Is(err, ir.ErrKeyCollationMerge) {
+		t.Fatalf("err = %v; want %v (V1 and V2 disagree on k2)", err, ir.ErrKeyCollationMerge)
+	}
+}
+
+// TestRefuseKeyCollationHistory_DeltaAndRecordedSchema: a window whose delta
+// changes a key's collation (a loosened key), and a version that disagrees
+// with the segment's recorded schema (a drain-commit, recorded with its
+// parent's schema and no delta), both refuse for a replay that cannot place
+// its versions; a window that changes nothing does not.
+func TestRefuseKeyCollationHistory_DeltaAndRecordedSchema(t *testing.T) {
+	binT, ciT := keyTable("utf8mb4_bin"), keyTable("utf8mb4_0900_ai_ci")
+	loosened := &irbackup.Manifest{
+		Schema:      &ir.Schema{Tables: []*ir.Table{ciT}},
+		SchemaDelta: []*irbackup.SchemaDeltaEntry{{Kind: irbackup.SchemaDeltaAlterTable, Table: "kd", Before: binT, After: ciT}},
+	}
+	if err := refuseKeyCollationHistory("b1", "test", loosened, nil); !errors.Is(err, ir.ErrKeyCollationMerge) {
+		t.Fatalf("loosening delta: err = %v; want %v", err, ir.ErrKeyCollationMerge)
+	}
+	drain := &irbackup.Manifest{Schema: &ir.Schema{Tables: []*ir.Table{ciT}}}
+	if err := refuseKeyCollationHistory("b1", "test", drain, []ir.SchemaSnapshot{hsnap(10, "utf8mb4_bin")}); !errors.Is(err, ir.ErrKeyCollationMerge) {
+		t.Fatalf("version against the recorded schema: err = %v; want %v", err, ir.ErrKeyCollationMerge)
+	}
+	if err := refuseKeyCollationHistory("b1", "test", drain, []ir.SchemaSnapshot{hsnap(10, "utf8mb4_0900_ai_ci")}); err != nil {
+		t.Fatalf("no change: err = %v", err)
+	}
+}
+
+// TestWindowStartVersions: the previous link's shape is seeded, at the
+// window's start, only for a table whose key collation the window changes
+// (KEY-COLLATION-LOOSENED-WINDOW).
+func TestWindowStartVersions(t *testing.T) {
+	binT, ciT := keyTable("utf8mb4_bin"), keyTable("utf8mb4_0900_ai_ci")
+	start := ir.Position{Engine: "test", Token: "5"}
+	parent := &ir.Schema{Tables: []*ir.Table{binT}}
+	loosened := &irbackup.Manifest{
+		StartPosition: start,
+		SchemaDelta:   []*irbackup.SchemaDeltaEntry{{Kind: irbackup.SchemaDeltaAlterTable, Table: "kd", Before: binT, After: ciT}},
+	}
+	seeds := windowStartVersions(parent, loosened, []ir.SchemaSnapshot{hsnap(10, "utf8mb4_0900_ai_ci")})
+	if len(seeds) != 1 || seeds[0].IR != binT || seeds[0].Position != start {
+		t.Fatalf("seeds = %+v; want the parent's `_bin` shape at the window's start", seeds)
+	}
+	unchanged := &irbackup.Manifest{StartPosition: start}
+	if seeds := windowStartVersions(parent, unchanged, []ir.SchemaSnapshot{hsnap(10, "utf8mb4_bin")}); len(seeds) != 0 {
+		t.Fatalf("seeds = %+v; want none for a window that changes no key collation", seeds)
+	}
+	if seeds := windowStartVersions(nil, loosened, nil); len(seeds) != 0 {
+		t.Fatalf("seeds = %+v; want none with no previous link", seeds)
+	}
+}
+
+// strandingOrderer places every version except the one anchored at strand.
+type strandingOrderer struct{ strand string }
+
+func (o strandingOrderer) PositionAtOrAfter(p, anchor ir.Position) (bool, error) {
+	if anchor.Token == o.strand {
+		return false, nil
+	}
+	return tokenOrderer{}.PositionAtOrAfter(p, anchor)
+}
+
+// TestHistoryReplay_StrandedVersionRefuses (finding 6): a version the orderer
+// never places (file/pos with another ServerUUID, a VStream shard missing)
+// while a LATER version of the same table is released means the window is
+// unorderable there; when the two disagree on a key collation, it refuses
+// instead of holding the earlier one to the window's end.
+func TestHistoryReplay_StrandedVersionRefuses(t *testing.T) {
+	snaps := []ir.SchemaSnapshot{hsnap(10, "utf8mb4_bin"), hsnap(30, "utf8mb4_0900_ai_ci")}
+	h, err := newHistoryReplay("b1", "test", strandingOrderer{strand: "10"}, nil, snaps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	push := func(ir.Change) error { return nil }
+	var refused error
+	for _, c := range append(tx(15, 16, 17), tx(35, 36, 37)...) {
+		if refused = h.before(c, push); refused != nil {
+			break
+		}
+	}
+	if !errors.Is(refused, ir.ErrKeyCollationMerge) || !strings.Contains(refused.Error(), keyCollationHistoryUnorderedMarker) {
+		t.Fatalf("err = %v; want %v naming %s", refused, ir.ErrKeyCollationMerge, keyCollationHistoryUnorderedMarker)
+	}
+	same := []ir.SchemaSnapshot{hsnap(10, "utf8mb4_bin"), hsnap(30, "utf8mb4_bin")}
+	h, err = newHistoryReplay("b1", "test", strandingOrderer{strand: "10"}, nil, same)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range append(tx(15, 16, 17), tx(35, 36, 37)...) {
+		if err := h.before(c, push); err != nil {
+			t.Fatalf("versions that agree refused: %v", err)
+		}
+	}
+}
 
 // tokenOrderer orders positions whose tokens are decimal integers.
 type tokenOrderer struct{}
@@ -112,7 +231,10 @@ func TestHistoryReplay_VersionsInterleaveByPosition(t *testing.T) {
 
 // TestHistoryReplay_NeverInsideATransaction: a version anchored inside a
 // transaction's span is released at the next boundary, not between the
-// transaction's rows.
+// transaction's rows. UNVERIFIED PREMISE behind the rule: a DDL is never
+// inside a source transaction — true of MySQL (implicit commit), false of
+// Postgres, whose versions are anchored at LSN 0/0 and released ahead of the
+// window instead (GC-44 F23).
 func TestHistoryReplay_NeverInsideATransaction(t *testing.T) {
 	h, err := newHistoryReplay("b1", "test", tokenOrderer{}, nil, []ir.SchemaSnapshot{hsnap(12, "utf8mb4_bin")})
 	if err != nil {
@@ -167,7 +289,7 @@ func TestRefuseKeyCollationHistory_UniqueKeyFromTheRecordedSchema(t *testing.T) 
 		Columns: keyTable("utf8mb4_0900_ai_ci").Columns,
 		Indexes: []*ir.Index{{Name: "k", Unique: true, Columns: []ir.IndexColumn{{Column: "k"}}}},
 	}}}
-	if err := refuseKeyCollationHistory("b1", "test", recorded, snaps); !errors.Is(err, ir.ErrKeyCollationMerge) {
+	if err := refuseKeyCollationHistory("b1", "test", &irbackup.Manifest{Schema: recorded}, snaps); !errors.Is(err, ir.ErrKeyCollationMerge) {
 		t.Fatalf("err = %v; want %v (k is a UNIQUE key in the recorded schema)", err, ir.ErrKeyCollationMerge)
 	}
 	if err := refuseKeyCollationHistory("b1", "test", nil, snaps); err != nil {

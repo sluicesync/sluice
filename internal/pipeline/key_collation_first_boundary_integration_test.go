@@ -72,6 +72,18 @@ func kcfbScenarios() []kcfbScenario {
 	// 'A' moved out of the way, so the catalog never shows `_bin` again.
 	reverted := toBin + " UPDATE kd SET k = 'A2' WHERE id = 99; " +
 		"ALTER TABLE kd MODIFY k VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL;"
+	// KEY-COLLATION-LOOSENED-WINDOW: the key is `_bin` before the change and
+	// is loosened to `_ci` after 'A' moved out of the way.
+	uqBin := "CREATE TABLE kd (id INT NOT NULL PRIMARY KEY, k VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL, d INT, UNIQUE KEY uk (k)); INSERT INTO kd VALUES (1,'a',1),(2,'b',2),(3,'c',3);"
+	loosened := "INSERT INTO kd (id,k,d) VALUES (99,'A',99); UPDATE kd SET k = 'A2' WHERE id = 99; " +
+		"ALTER TABLE kd MODIFY k VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL;"
+	// A must-pass control (review of df690b30, finding 3): a NON-key
+	// column's collation changed with a row written before it, read behind
+	// the head — on the warm entry with no retained history for the table.
+	noteCI := "CREATE TABLE kd (id INT NOT NULL PRIMARY KEY, k VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL, d INT, " +
+		"note VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NULL, UNIQUE KEY uk (k)); INSERT INTO kd (id,k,d) VALUES (1,'a',1),(2,'b',2),(3,'c',3);"
+	noteForward := "INSERT INTO kd (id,k,d,note) VALUES (99,'x',99,'n'); " +
+		"ALTER TABLE kd MODIFY note VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NULL;"
 	return []kcfbScenario{
 		{"pk-collation", pk, toBin, sentinel, binDDL},
 		{"uq-collation", uq, toBin, sentinel, binDDL},
@@ -81,6 +93,8 @@ func kcfbScenarios() []kcfbScenario {
 		{"uq-collation-then-drop", uq, toBin, drop, ""},
 		{"pk-collation-then-retype", pk, toBin, retype, ""},
 		{"uq-collation-reverted", uq, reverted, sentinel, ""},
+		{"uq-collation-loosened", uqBin, loosened, sentinel, ""},
+		{"nonkey-collation-forward", noteCI, noteForward, sentinel, ""},
 	}
 }
 
@@ -142,6 +156,23 @@ func kcfbRender(m map[string]string) string {
 // collides under the old collation (99) is not there — nothing merged.
 func kcfbGrade(t *testing.T, what string, src, tgt twfbDB, refusal error) {
 	t.Helper()
+	kcfbGradeWith(t, what, src, tgt, refusal, false)
+}
+
+// kcfbCollidingRowMayLand names the scenarios whose colliding row (99) is
+// written BEFORE the key change, under the target's own stricter collation:
+// it lands correctly ahead of a refusal at the change, so its presence is
+// not a merge (the per-row check still grades it).
+var kcfbCollidingRowMayLand = map[string]bool{"uq-collation-loosened": true, "nonkey-collation-forward": true}
+
+// kcfbMustNotRefuse names the scenarios no entry may refuse except
+// `--schema-changes=refuse`: nothing in them can merge a row.
+var kcfbMustNotRefuse = map[string]bool{"nonkey-collation-forward": true}
+
+// kcfbGradeWith is [kcfbGrade]; mayLand allows the colliding row on the
+// target after a refusal when it equals the source's.
+func kcfbGradeWith(t *testing.T, what string, src, tgt twfbDB, refusal error, mayLand bool) {
+	t.Helper()
 	s, g := kcfbRows(t, src), kcfbRows(t, tgt)
 	if refusal == nil {
 		if kcfbRender(s) != kcfbRender(g) {
@@ -156,7 +187,7 @@ func kcfbGrade(t *testing.T, what string, src, tgt twfbDB, refusal error) {
 				what, id, k, s[id], kcfbRender(s), kcfbRender(g))
 		}
 	}
-	if _, ok := g["99"]; ok {
+	if _, ok := g["99"]; ok && !mayLand {
 		t.Errorf("%s: refused AFTER the colliding row was applied", what)
 	}
 	for _, id := range []string{"1", "2", "3"} {
@@ -222,10 +253,13 @@ func kcfbRunCell(t *testing.T, srv rsfServer, sc kcfbScenario, entry string, idx
 			t.Fatalf("%s: the stream exited without an error", what)
 		}
 		t.Logf("%s refused: %v", what, refusal)
+		if kcfbMustNotRefuse[sc.name] && entry != kcfbRefuse {
+			t.Errorf("%s: refused a change that can merge nothing: %v", what, refusal)
+		}
 	} else if err := run.stop(t); err != nil && !errors.Is(err, context.Canceled) {
 		t.Errorf("%s: the stream stopped with %v", what, err)
 	}
-	kcfbGrade(t, what, src, tgt, refusal)
+	kcfbGradeWith(t, what, src, tgt, refusal, kcfbCollidingRowMayLand[sc.name])
 	if refusal == nil || sc.remedy == "" {
 		return
 	}
@@ -375,10 +409,16 @@ func TestKeyCollationFirstBoundary_ChainRestore(t *testing.T) {
 				if capErr != nil {
 					// Refused at capture: nothing to restore, nothing merged.
 					t.Logf("%s: capture refused: %v", what, capErr)
+					if kcfbMustNotRefuse[sc.name] {
+						t.Errorf("%s: capture refused a change that can merge nothing: %v", what, capErr)
+					}
 					return
 				}
 				if err := (&backup.ChainRestore{Target: eng, TargetDSN: tgtDSN, Store: store}).Run(ctx); err != nil {
 					t.Logf("%s: restore refused: %v", what, err)
+					if kcfbMustNotRefuse[sc.name] {
+						t.Errorf("%s: restore refused a change that can merge nothing: %v", what, err)
+					}
 					if tgt.scalar(t, "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = 'kd'") == "1" {
 						kcfbGrade(t, what, src, tgt, err)
 					}
