@@ -457,15 +457,21 @@ func (h *historyReplay) bindNamespace(namespace string) {
 	}
 }
 
-// noting wraps push to record the tables whose version went out naming no
-// namespace, for [historyReplay.checkNamespace].
+// noting wraps push to record the tables whose LATEST version went out
+// naming no namespace, for [historyReplay.checkNamespace]. A named version
+// of the table pushed after it supersedes it — the named rows' lookup finds
+// that one — so it clears the mark (review of 5f1f19a6, LOW 1).
 func (h *historyReplay) noting(push func(ir.Change) error) func(ir.Change) error {
 	return func(c ir.Change) error {
-		if s, ok := c.(ir.SchemaSnapshot); ok && s.Schema == "" {
-			if h.unboundReleased == nil {
-				h.unboundReleased = map[string]bool{}
+		if s, ok := c.(ir.SchemaSnapshot); ok {
+			if s.Schema == "" {
+				if h.unboundReleased == nil {
+					h.unboundReleased = map[string]bool{}
+				}
+				h.unboundReleased[s.Table] = true
+			} else {
+				delete(h.unboundReleased, s.Table)
 			}
-			h.unboundReleased[s.Table] = true
 		}
 		return push(c)
 	}
@@ -592,55 +598,63 @@ func windowStartVersions(parent *ir.Schema, m *irbackup.Manifest, snaps []ir.Sch
 	return seeds
 }
 
-// windowEndVersions is, for every window-start version whose table the
-// window recorded NO version of, the shape the window recorded for that
-// table, anchored at the window's end. Such a window — its last event for
-// the table the ALTER (Bug 306) — would otherwise leave the window-start
-// shape, the one the window CHANGED, as the applier's active shape for the
-// table. The effect is IN MEMORY ONLY, for the later windows of the same
+// windowEndVersions is, for every window-start version, the shape the
+// window recorded for its table at the window's end — when the window's own
+// versions do not already end on it. A reader records a version lazily, at
+// the next row of the table whose decoded shape changed, so a table whose
+// LAST event in the window is a key-collation ALTER has no version of the
+// shape it ended on: with no version of the table at all (Bug 306), the
+// window-start shape stays the applier's active shape for the table; with
+// an earlier version (a row, then the ALTER), that earlier version does
+// (review of 5f1f19a6). Either is stale for the restore's later windows,
+// and a stale shape can under-arm as well as over-arm: a Postgres key
+// tightened from a nondeterministic collation to "C" as the table's last
+// event leaves the nondeterministic shape active on a MySQL target, which
+// arms UNIQUE keys only (the primary key unarmed), where the "C" shape arms
+// the primary key byte for byte — so a later window's 'A' would upsert onto
+// 'a'. The effect is IN MEMORY ONLY, for the later windows of the same
 // chain restore (the applier is shared across links): the versions also
 // reach the target's sluice_cdc_schema_history, but under
-// ChainRestoreStreamID, which nothing primes from — a `sync start` primes
-// under its own stream id (review of 7ff76a4c, L1) — so no resume reads
-// them. Measured benefit: none so far. The stale shape it replaces could
-// only over-arm the guard (a loud false refusal, never a merge: the source
-// key is the looser one), and the case-only change of one row tried as a
-// probe restored exactly either way. Kept because it is the shape the next
-// window's reader starts from, so applier and reader agree at the seam.
+// ChainRestoreStreamID, which nothing primes from (review of 7ff76a4c, L1).
 //
-// A table the window recorded a version of gets none: its last recorded
-// version already is the stream's shape, and the manifest's schema is not
-// always the end shape — a drain-commit records its PARENT's schema
-// (beforeSchema in incremental.go and stream.go; review of 7ff76a4c, L3),
-// which would have replaced a later recorded shape with an earlier one. A
-// drain window records no delta, so its only seeds come from such versions
-// and it never gets one. Nor does a window with no end position, or a table
-// the window no longer records. A window that names no namespace leaves its
-// window-end version where no named row looks, and a window with no change
-// chunk and no history returns before any version is released
+// The window's recorded schema is its end shape only when the window
+// carries a schema delta: a window with none records its PARENT's schema
+// (beforeSchema in incremental.go and stream.go — a drain-commit, or any
+// window whose catalog did not change), which would replace a later
+// recorded shape with an earlier one (review of 7ff76a4c, L3). So a window
+// with no delta gets none. With a delta, a table whose last recorded
+// version already compares its keys as the recorded schema does gets none
+// either (it would change nothing). Nor does a window with no end position,
+// or a table the window no longer records. A window that names no namespace
+// leaves its window-end version where no named row looks, and a window with
+// no change chunk and no history returns before any version is released
 // (KEY-COLLATION-ZERO-CHUNK-WINDOW-END in docs/dev/audit-backlog.md).
 func windowEndVersions(m *irbackup.Manifest, seeds, snaps []ir.SchemaSnapshot) []ir.SchemaSnapshot {
-	if m == nil || m.Schema == nil || m.EndPosition.Token == "" {
+	if m == nil || m.Schema == nil || m.EndPosition.Token == "" || len(m.SchemaDelta) == 0 {
 		return nil
 	}
 	var ends []ir.SchemaSnapshot
 	for _, s := range seeds {
-		recorded := false
-		for _, v := range snaps {
-			if sameVersionTable(v, s) {
-				recorded = true
-				break
-			}
-		}
-		if recorded {
-			continue
-		}
+		var end *ir.Table
 		for _, t := range m.Schema.Tables {
 			if t != nil && sameTable(t, s.Schema, s.Table) {
-				ends = append(ends, ir.SchemaSnapshot{Position: m.EndPosition, Schema: s.Schema, Table: s.Table, IR: t})
+				end = t
 				break
 			}
 		}
+		if end == nil {
+			continue
+		}
+		var last *ir.Table
+		for _, v := range snaps {
+			if sameVersionTable(v, s) {
+				last = v.IR
+			}
+		}
+		if last != nil && !migcore.KeyCollationChange(withRecordedIndexes(last, m.Schema), end) {
+			continue
+		}
+		ends = append(ends, ir.SchemaSnapshot{Position: m.EndPosition, Schema: s.Schema, Table: s.Table, IR: end})
 	}
 	return ends
 }
@@ -830,6 +844,16 @@ func nonWindowKeyCollationRemedy(e *ir.KeyCollationMergeError, cmd RestoreComman
 			"converges. Leave it out with `sluice restore --exclude-table %s` and copy it into a table whose key "+
 			"column(s) carry %s, or restore onto a target that keeps the source's comparison (for a Postgres-source "+
 			"chain, a Postgres target)", e.Table, needs)
+	}
+	if e.Needs == "" {
+		// The engine could not name what the key needs, so whether a re-run
+		// creates it so is not known (review of 5f1f19a6, LOW 3): say both.
+		return fmt.Sprintf("If this table existed before the restore (its CREATE TABLE is IF NOT EXISTS, so a "+
+			"table already there is kept as it was), drop it and every other table the restore wrote — `sluice "+
+			"restore` does not resume, and a re-run starts over from the full backup — then restore again into the "+
+			"empty target. If the restore created it, a re-run creates the same key and refuses here again: leave "+
+			"the table out with `sluice restore --exclude-table %s`, or restore onto a target whose key compares as "+
+			"the source's does", e.Table)
 	}
 	return fmt.Sprintf("sluice creates a missing table's key with %s, and keeps a table that already existed as it was "+
 		"(its CREATE TABLE is IF NOT EXISTS), so a key that refuses here most likely predates this restore. Drop the "+

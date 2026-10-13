@@ -67,6 +67,7 @@ Indexed when filed. The three cycle bugs (numbered in the BUG-CATALOG) and the f
 - KEY-COLLATION-ZERO-CHUNK-WINDOW-END filed
 - KEY-COLLATION-FILL-NAMESPACE filed
 - KEY-COLLATION-ROLLOVER-SPLIT-DELTA-DUP filed
+- KEY-COLLATION-WINDOW-END-STALE-RECORDED filed
 
 ## 2026-10-12 — second value-fidelity review of the v0.159.1 candidate (b0360550..46d49733): four fixed, one HIGH found while pinning
 

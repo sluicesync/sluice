@@ -204,7 +204,7 @@ func TestRestoreKeyCollationRemedy(t *testing.T) {
 		{"broker cold start, window", RestoreCommandBrokerColdStart, loosened, engine, "Take a fresh full backup after the key change, then replay the new chain from its full: `sluice sync from-backup run --reset-target-data --yes`", nil},
 		{"restore, recopy aligns", RestoreCommandRestore, quiet, engine, "sluice creates a missing table's key with `k` CHARACTER SET utf8mb4 COLLATE utf8mb4_bin", []string{"`sluice restore --exclude-table kd`", "restore again into the empty target"}},
 		{"restore, recopy diverges", RestoreCommandRestore, quiet, diverges, "This table cannot be restored onto this target as it is", []string{"`sluice restore --exclude-table kd`", "a binary collation", "Postgres target"}},
-		{"restore, engine cannot tell", RestoreCommandRestore, quiet, unknown, "sluice creates a missing table's key with a collation that compares them as the source's does", []string{"`sluice restore --exclude-table kd`"}},
+		{"restore, engine cannot tell", RestoreCommandRestore, quiet, unknown, "If this table existed before the restore", []string{"`sluice restore --exclude-table kd`", "If the restore created it, a re-run creates the same key and refuses here again"}},
 		{"broker cold start, recopy aligns", RestoreCommandBrokerColdStart, quiet, engine, "This replay drops the chain's tables and creates them itself", []string{"`k` CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"}},
 		{"broker cold start, recopy diverges", RestoreCommandBrokerColdStart, quiet, diverges, "This replay drops the chain's tables and creates them itself", []string{"a binary collation", "Postgres target"}},
 	}
@@ -497,6 +497,19 @@ func TestHistoryReplay_VersionNamespaceIsChecked(t *testing.T) {
 	if !errors.Is(err, ir.ErrKeyCollationMerge) || !strings.Contains(err.Error(), keyCollationVersionNamespaceMarker) {
 		t.Fatalf("a named row after the version went out under none: err = %v; want %s", err, keyCollationVersionNamespaceMarker)
 	}
+	// Review of 5f1f19a6, LOW 1: a NAMED version of the table released after
+	// the unnamed one supersedes it — the named row's lookup finds that one —
+	// so the named row passes.
+	named := hsnap(25, "utf8mb4_0900_ai_ci")
+	named.Schema = "db"
+	h, err = newHistoryReplay("b1", "test", tokenOrderer{}, nil, []ir.SchemaSnapshot{hsnap(5, "utf8mb4_bin"), named})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err = replay(h, append(txIn("", 20, 21, 22), txIn("db", 30, 31, 32)...))
+	if err != nil || got != "S5:utf8mb4_bin B20 I21 C22 S25@db:utf8mb4_0900_ai_ci B30 I31@db C32" {
+		t.Fatalf("a named version superseding the unnamed one: %q, err = %v; want the named row to pass", got, err)
+	}
 }
 
 // TestHistoryReplay_WindowEndVersionsGoLast: the window-end versions
@@ -513,24 +526,41 @@ func TestHistoryReplay_WindowEndVersionsGoLast(t *testing.T) {
 	}
 }
 
-// TestWindowEndVersions: one per window-start version whose table the
-// window recorded no version of — the window's recorded shape of the table at
-// the window's end; none without an end position, and none for a table the
-// window recorded a version of (review of 7ff76a4c, L3: a drain-commit's
-// manifest records its parent's schema, which would replace the window's
-// last recorded shape with an earlier one).
+// TestWindowEndVersions: the window's recorded shape of a seeded table at
+// the window's end, unless the window's own versions already end on it.
+//   - no recorded version: one (Bug 306);
+//   - a recorded version that compares the key differently from the end
+//     shape — a row, then the key's collation changed as the table's last
+//     event, recorded lazily so no version follows: one (review of
+//     5f1f19a6; the first cut of L3 skipped it and left the earlier shape
+//     active);
+//   - a recorded version that already compares as the end shape: none;
+//   - no schema delta (a drain-commit, which records its PARENT's schema):
+//     none, whatever was recorded (review of 7ff76a4c, L3);
+//   - no end position: none.
 func TestWindowEndVersions(t *testing.T) {
 	binT, ciT := keyTable("utf8mb4_bin"), keyTable("utf8mb4_0900_ai_ci")
-	m := &irbackup.Manifest{EndPosition: hpos(40), Schema: &ir.Schema{Tables: []*ir.Table{ciT}}}
+	delta := []*irbackup.SchemaDeltaEntry{{Kind: irbackup.SchemaDeltaAlterTable, Table: "kd", Before: binT, After: ciT}}
+	m := &irbackup.Manifest{EndPosition: hpos(40), Schema: &ir.Schema{Tables: []*ir.Table{ciT}}, SchemaDelta: delta}
 	seeds := []ir.SchemaSnapshot{{Position: hpos(1), Table: "kd", IR: binT}}
+	inDB := func(collation string) ir.SchemaSnapshot {
+		s := hsnap(20, collation)
+		s.Schema = "db"
+		return s
+	}
 	ends := windowEndVersions(m, seeds, nil)
 	if len(ends) != 1 || ends[0].IR != ciT || ends[0].Position != hpos(40) {
-		t.Fatalf("ends = %+v; want the recorded `_ci` shape at the window's end", ends)
+		t.Fatalf("no recorded version: ends = %+v; want the recorded `_ci` shape at the window's end", ends)
 	}
-	recorded := hsnap(20, "utf8mb4_bin")
-	recorded.Schema = "db"
-	if ends := windowEndVersions(m, seeds, []ir.SchemaSnapshot{recorded}); len(ends) != 0 {
-		t.Fatalf("ends = %+v; want none for a table the window recorded a version of", ends)
+	if ends := windowEndVersions(m, seeds, []ir.SchemaSnapshot{inDB("utf8mb4_bin")}); len(ends) != 1 || ends[0].IR != ciT {
+		t.Fatalf("a recorded `_bin` version before the change: ends = %+v; want the `_ci` end shape", ends)
+	}
+	if ends := windowEndVersions(m, seeds, []ir.SchemaSnapshot{inDB("utf8mb4_0900_ai_ci")}); len(ends) != 0 {
+		t.Fatalf("a recorded version already on the end shape: ends = %+v; want none", ends)
+	}
+	drain := &irbackup.Manifest{EndPosition: hpos(40), Schema: &ir.Schema{Tables: []*ir.Table{binT}}}
+	if ends := windowEndVersions(drain, seeds, []ir.SchemaSnapshot{inDB("utf8mb4_0900_ai_ci")}); len(ends) != 0 {
+		t.Fatalf("no schema delta (the parent's schema recorded): ends = %+v; want none", ends)
 	}
 	m.EndPosition = ir.Position{}
 	if ends := windowEndVersions(m, seeds, nil); len(ends) != 0 {

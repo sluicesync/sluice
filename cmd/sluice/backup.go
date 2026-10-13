@@ -1893,9 +1893,14 @@ func (c *BackupCompactCmd) Run(_ *Globals) error {
 //
 // Phase 3 (v0.17.0+): when the supplied --from contains incremental
 // manifests in addition to the full, the restore walks the chain in
-// order. Same-engine chains apply schema deltas + replay change
-// chunks; cross-engine chains with incrementals are refused (Phase
-// 5+ topic).
+// order, applying schema deltas and replaying change chunks. A
+// cross-engine chain with incrementals is replayed too (Phase 5: the
+// change rows are routed through the target engine's applier — e.g.
+// TestChainRestore_PGKeyTightenedAsTheTablesLastEventToMySQL and
+// TestKeyCollationFirstBoundary_ChainRestore_PGCollateCToMySQL restore
+// Postgres chains onto MySQL). Only a construct the target engine
+// cannot hold, in the root full or any link's deltas, refuses it
+// (preflightCrossEngineSupportable).
 type RestoreCmd struct {
 	FromDir string `help:"Directory containing the backup to restore from (local filesystem). Mutually exclusive with --from." placeholder:"DIR"`
 	From    string `help:"URL of the backup to restore (s3://, gs://, azblob://, file:///). Mutually exclusive with --from-dir." placeholder:"URL"`
