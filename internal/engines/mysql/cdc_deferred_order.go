@@ -66,10 +66,15 @@ import (
 // so the swap is its own boundary.
 
 // decodedShape is a table's basis: its column order, and the IR type of
-// each column whose type came from a read definition.
+// each column whose type came from a read definition. seeded names the
+// columns whose type is still the one [CDCReader.SetDecodedShapeBaseline]
+// handed over — a catalog read, which for a backup chain's parent manifest
+// can be taken past the parent's end position — rather than one an event of
+// this stream was decoded under.
 type decodedShape struct {
-	names []string
-	types map[string]ir.Type
+	names  []string
+	types  map[string]ir.Type
+	seeded map[string]bool
 }
 
 // holdDecodedOrder holds tbl to the table's basis when tbl will not be a
@@ -99,6 +104,12 @@ func (r *CDCReader) holdDecodedOrder(qn string, tbl *tableSchema) error {
 		case basis.types[c.Name] != nil:
 			// Carried: an approximate type says nothing new about the column.
 			next.types[c.Name] = basis.types[c.Name]
+			if basis.seeded[c.Name] {
+				if next.seeded == nil {
+					next.seeded = map[string]bool{}
+				}
+				next.seeded[c.Name] = true
+			}
 		}
 	}
 	if r.decodedShapes == nil {
@@ -367,10 +378,11 @@ func (r *CDCReader) SetDecodedShapeBaseline(tables []*ir.Table) {
 		if schema == "" {
 			schema = r.schema
 		}
-		s := decodedShape{names: ir.ColumnNames(t), types: make(map[string]ir.Type, len(t.Columns))}
+		s := decodedShape{names: ir.ColumnNames(t), types: make(map[string]ir.Type, len(t.Columns)), seeded: map[string]bool{}}
 		for _, c := range t.Columns {
 			if c != nil && c.Type != nil {
 				s.types[c.Name] = c.Type
+				s.seeded[c.Name] = true
 			}
 		}
 		r.decodedShapes[qualifiedName(schema, t.Name)] = s

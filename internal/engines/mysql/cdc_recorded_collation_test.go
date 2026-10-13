@@ -154,9 +154,18 @@ func TestStampRecordedCollations(t *testing.T) {
 // and a table with no basis do not.
 func TestHoldUnannouncedCollation(t *testing.T) {
 	const qn = "d.kd"
-	newReader := func() *CDCReader {
+	seededReader := func(collation string) *CDCReader {
 		r := recordedCollationReader()
-		r.SetDecodedShapeBaseline([]*ir.Table{{Schema: "d", Name: "kd", Columns: kdShape("utf8mb4_0900_ai_ci").Columns}})
+		r.SetDecodedShapeBaseline([]*ir.Table{{Schema: "d", Name: "kd", Columns: kdShape(collation).Columns}})
+		r.seededBoundaries.start(ir.Position{}, true)
+		return r
+	}
+	// newReader's basis is OBSERVED: the stream decoded a `_ci` row of kd.
+	newReader := func() *CDCReader {
+		r := seededReader("utf8mb4_0900_ai_ci")
+		if err := r.holdDecodedOrder(qn, kdShape("utf8mb4_0900_ai_ci")); err != nil {
+			t.Fatal(err)
+		}
 		return r
 	}
 	shape := kdShape("utf8mb4_bin")
@@ -165,6 +174,39 @@ func TestHoldUnannouncedCollation(t *testing.T) {
 	err := r.holdUnannouncedCollation(qn, shape)
 	if !errors.Is(err, ir.ErrDeferredSchemaChange) || !strings.Contains(err.Error(), unannouncedCollationMarker) {
 		t.Fatalf("unannounced change: err = %v; want %v naming %s", err, ir.ErrDeferredSchemaChange, unannouncedCollationMarker)
+	}
+	// A SEEDED basis is a catalog read, which a parent manifest takes at
+	// window close — past its end position, so it can already show a LOGGED
+	// change the stream has not reached. A row recorded before that DDL
+	// differs from it and must not refuse (third review of a0878c3c; this
+	// case was pinned as a refusal until then): it owes a boundary at the
+	// stream's start instead, so the history carries the recorded shape.
+	// The basis the row's decode leaves is observed, and checked from there.
+	r = seededReader("utf8mb4_bin")
+	if err := r.holdUnannouncedCollation(qn, kdShape("utf8mb4_0900_ai_ci")); err != nil {
+		t.Fatalf("a row recorded before a logged change the seeded basis already shows: err = %v", err)
+	}
+	if !r.seededBoundaries.take(qn) {
+		t.Fatal("a row differing from the seeded basis owes no boundary; its recorded shape would reach no history")
+	}
+	if err := r.holdDecodedOrder(qn, kdShape("utf8mb4_0900_ai_ci")); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.holdUnannouncedCollation(qn, shape); !errors.Is(err, ir.ErrDeferredSchemaChange) {
+		t.Fatalf("an unlogged change after the first observed row: err = %v; want %v", err, ir.ErrDeferredSchemaChange)
+	}
+	// No start anchor, or a shape that is never a boundary: no boundary
+	// can be owed, so it refuses as before.
+	r = seededReader("utf8mb4_bin")
+	r.seededBoundaries = seededCollationBoundaries{}
+	if err := r.holdUnannouncedCollation(qn, kdShape("utf8mb4_0900_ai_ci")); !errors.Is(err, ir.ErrDeferredSchemaChange) {
+		t.Fatalf("seeded mismatch with no anchor: err = %v; want %v", err, ir.ErrDeferredSchemaChange)
+	}
+	r = seededReader("utf8mb4_bin")
+	synth := kdShape("utf8mb4_0900_ai_ci")
+	synth.synthesized = true
+	if err := r.holdUnannouncedCollation(qn, synth); !errors.Is(err, ir.ErrDeferredSchemaChange) {
+		t.Fatalf("seeded mismatch on a deferred shape: err = %v; want %v", err, ir.ErrDeferredSchemaChange)
 	}
 	// An owed boundary alone is no evidence: every logged DDL owes one for
 	// every table the reader knows.
@@ -212,31 +254,48 @@ func TestHoldUnannouncedCollation(t *testing.T) {
 	}
 }
 
-// TestRefuseUnnamedKeyCollations (review of d6ecb939, finding 3): with the
-// source's collation-name table unreadable, a recorded collation ID on a
-// character primary-key column refuses (retryably) instead of stamping
-// nothing and letting a reverted or loosened window merge.
-func TestRefuseUnnamedKeyCollations(t *testing.T) {
+// TestRefuseUnnamedCollations (review of d6ecb939, finding 3; third review of
+// a0878c3c, finding 2): a recorded collation ID the reader cannot name — the
+// source's collation-name table unreadable, or read and lacking the ID —
+// refuses (retryably) on ANY character column, not only the primary key:
+// the reader does not know the table's UNIQUE keys, so a key-only check
+// left a UNIQUE key's reverted window to merge.
+func TestRefuseUnnamedCollations(t *testing.T) {
 	db, err := sql.Open("mysql", "u:p@tcp(127.0.0.1:1)/d")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = db.Close() }()
 	r := &CDCReader{schema: "d", db: db}
-	err = r.refuseUnnamedKeyCollations(context.Background(), "d.kd", kdShape("utf8mb4_0900_ai_ci"), kdTableMap(collIDBin))
+	err = r.refuseUnnamedCollations(context.Background(), "d.kd", kdShape("utf8mb4_0900_ai_ci"), kdTableMap(collIDBin))
 	if err == nil || !strings.Contains(err.Error(), collationNamesUnavailableMarker) {
 		t.Fatalf("err = %v; want %s", err, collationNamesUnavailableMarker)
 	}
 	if errors.Is(err, ir.ErrDeferredSchemaChange) {
 		t.Fatal("the refusal is terminal; it must be retryable (the read is retried)")
 	}
-	nonKey := kdShape("utf8mb4_0900_ai_ci")
-	nonKey.PrimaryKey = []string{"id"}
-	if err := r.refuseUnnamedKeyCollations(context.Background(), "d.kd", nonKey, kdTableMap(collIDBin)); err != nil {
-		t.Fatalf("a non-key column: err = %v", err)
+	// A column outside the primary key (a UNIQUE key's, which the reader
+	// cannot see) refuses the same way.
+	nonPK := kdShape("utf8mb4_0900_ai_ci")
+	nonPK.PrimaryKey = []string{"id"}
+	if err := r.refuseUnnamedCollations(context.Background(), "d.kd", nonPK, kdTableMap(collIDBin)); err == nil || !strings.Contains(err.Error(), collationNamesUnavailableMarker) {
+		t.Fatalf("a column outside the primary key: err = %v; want %s", err, collationNamesUnavailableMarker)
 	}
 	r.serverCollationIDNames = map[uint64]string{collIDBin: "utf8mb4_bin"}
-	if err := r.refuseUnnamedKeyCollations(context.Background(), "d.kd", kdShape("utf8mb4_0900_ai_ci"), kdTableMap(collIDBin)); err != nil {
+	if err := r.refuseUnnamedCollations(context.Background(), "d.kd", kdShape("utf8mb4_0900_ai_ci"), kdTableMap(collIDBin)); err != nil {
 		t.Fatalf("names loaded: err = %v", err)
+	}
+	// The table loaded but lacking the recorded ID: nothing would be stamped.
+	err = r.refuseUnnamedCollations(context.Background(), "d.kd", nonPK, kdTableMap(999))
+	if err == nil || !strings.Contains(err.Error(), collationNamesUnavailableMarker) || !strings.Contains(err.Error(), "does not name it") {
+		t.Fatalf("an ID the loaded table lacks: err = %v; want %s", err, collationNamesUnavailableMarker)
+	}
+	// Exempt: a binary column, and a column type with no collation.
+	if err := r.refuseUnnamedCollations(context.Background(), "d.kd", nonPK, kdTableMap(binaryCollationID)); err != nil {
+		t.Fatalf("binary: err = %v", err)
+	}
+	// A reader with no handle and no table loaded is a test seam.
+	if err := (&CDCReader{schema: "d"}).refuseUnnamedCollations(context.Background(), "d.kd", nonPK, kdTableMap(999)); err != nil {
+		t.Fatalf("test seam: err = %v", err)
 	}
 }

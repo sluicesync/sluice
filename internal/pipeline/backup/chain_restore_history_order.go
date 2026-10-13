@@ -159,7 +159,9 @@ func (h *historyReplay) before(c ir.Change, push func(ir.Change) error) error {
 	}
 	// stranded holds, per table, the versions left pending so far in this
 	// pass — each recorded BEFORE any later version of the table this pass
-	// releases.
+	// releases. UNVERIFIED PREMISE: that the manifest lists a table's
+	// versions in position order, so "earlier in pending" means "earlier in
+	// the stream" (KEY-COLLATION-STRANDED-VERSION-ORDER).
 	stranded := map[string][]int{}
 	drop := map[int]bool{}
 	var kept []int
@@ -277,10 +279,12 @@ func sameTable(t *ir.Table, schema, table string) bool {
 // every VStream window of a character-keyed table on the broker (review of
 // d6ecb939, finding 1). Between two versions both sides must record the
 // collation: the reverse check asks the same question of known, so an
-// unrecorded side on either end is not a change. (A table where one key
+// unrecorded side on either end is not a change. A table where one key
 // column is unrecorded on one side and another on the other side would read
-// as a change; no reader produces that mix — each records collations for
-// every column or for none.)
+// as a change, a loud false refusal. UNVERIFIED PREMISE: that no reader
+// produces that mix — each records collations for every column or for none.
+// Nothing asserts it per reader; the cost if it breaks is a refusal, not a
+// merge.
 func versionChangesKeyCollation(known, version *ir.Table, bothVersions bool) bool {
 	if !migcore.KeyCollationChange(known, version) {
 		return false

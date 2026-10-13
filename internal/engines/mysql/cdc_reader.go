@@ -242,9 +242,13 @@ type CDCReader struct {
 	// serverID is the replica identifier the syncer registers with
 	// the source. Must be unique across all replicas of the source:
 	// MariaDB refuses a second registration with the same id (ERROR
-	// 4052); MySQL 8 tells dump threads apart by the syncer's random
-	// @replica_uuid instead. Assigned by generateServerID at
-	// construction: a per-process base plus a per-process sequence.
+	// 4052); MySQL 8 was measured telling dump threads apart by the
+	// syncer's @replica_uuid instead (an UNVERIFIED PREMISE about MySQL
+	// and go-mysql, checked only by
+	// TestCDCReader_SameServerIDOnMySQL_BothStreamsKeepReading). Assigned
+	// by generateServerID at construction — a per-process base plus a
+	// per-process sequence — and kept off the source's own id at stream
+	// start (serverIDDistinctFromSource).
 	serverID uint32
 
 	// syncer is the binlog client. nil until StreamChanges starts the
@@ -369,6 +373,12 @@ type CDCReader struct {
 	// touch is not owed — a restart re-arms it. Pump goroutine only, except
 	// the arming setter (before StreamChanges).
 	firstTouch firstTouchBoundaries
+
+	// seededBoundaries is the boundary a table's first observed row owes
+	// when its recorded collation differs from the SEEDED baseline
+	// (cdc_recorded_collation.go): emitted anchored at the stream's start
+	// position, armed or not. Pump goroutine only.
+	seededBoundaries seededCollationBoundaries
 
 	// snapshotSig is the per-qualified-table structural fingerprint of
 	// the schema-history version last emitted as an
@@ -946,6 +956,7 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 	// reader is single-stream): plaintext and unverified-TLS modes WARN
 	// loudly, verifying TLS says nothing. Audit finding N-3.
 	r.warnBinlogTransport(ctx)
+	r.serverID = r.serverIDDistinctFromSource(ctx, r.serverID)
 
 	syncerCfg := replication.BinlogSyncerConfig{
 		ServerID: r.serverID,
@@ -1030,15 +1041,18 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 	// GC-44 D3: the first-touch boundaries of an armed stream are anchored
 	// at its start (cdc_first_touch_boundary.go). positionAt reads the
 	// GTID set / file startStreamer just installed.
+	// The seeded-collation boundary uses the same anchor, armed or not; an
+	// unarmed reader that cannot resolve it refuses that boundary instead.
+	anchor, anchorErr := r.positionAt(startPos.File, startPos.Pos)
 	if r.firstTouch.armed {
-		anchor, err := r.positionAt(startPos.File, startPos.Pos)
-		if err != nil {
+		if anchorErr != nil {
 			r.syncer.Close()
 			r.syncer = nil
-			return nil, fmt.Errorf("mysql: first-touch boundary anchor: %w", err)
+			return nil, fmt.Errorf("mysql: first-touch boundary anchor: %w", anchorErr)
 		}
 		r.firstTouch.start(anchor)
 	}
+	r.seededBoundaries.start(anchor, anchorErr == nil)
 
 	r.noEventsSuppress = make(chan struct{})
 	r.noEventsSuppressOnce = sync.Once{}
@@ -2209,12 +2223,16 @@ func (r *CDCReader) maybeSnapshotSchemaB1(ctx context.Context, qn string, tbl *t
 	// with no DDL pending (cdc_first_touch_boundary.go). Taken whatever
 	// happens below, so it fires once per table per stream.
 	firstTouch := r.firstTouch.take(qn, r.scopeAllowed == nil || r.tableInScope(qn))
-	if !r.pendingDDLActive && !firstTouch {
+	seededDue := r.seededBoundaries.take(qn)
+	if !r.pendingDDLActive && !firstTouch && !seededDue {
 		return nil
 	}
 	anchor := r.pendingDDLAnchor
 	if !r.pendingDDLActive {
 		anchor = r.firstTouch.anchor
+		if !firstTouch {
+			anchor = r.seededBoundaries.anchor
+		}
 	}
 	// Whatever this returns, the table's post-DDL boundary is settled: a
 	// version written, no delta, or a refusal that stops the stream
@@ -3800,12 +3818,34 @@ func formatSIDAsUUID(sid []byte) (string, error) {
 	return string(out), nil
 }
 
-// serverIDFloor keeps generated ids above the small range operators assign
-// by hand (a source is usually server_id 1, its replicas a handful more),
-// so a generated id cannot land on the source's own id or a sibling
-// replica's. It also keeps the id clear of 0, which the binlog protocol
-// rejects.
+// serverIDFloor keeps generated ids above the small range operators usually
+// assign by hand (a source is often server_id 1, its replicas a handful
+// more) and clear of 0, which the binlog protocol rejects. It is a
+// likelihood, not a guarantee: managed services (RDS, Aurora, Cloud SQL)
+// assign large ids, so the source's own id is checked at stream start
+// ([CDCReader.serverIDDistinctFromSource]); a sibling replica's id is not
+// visible to the reader and is not checked.
 const serverIDFloor = 1 << 16
+
+// serverIDDistinctFromSource returns id, or a fresh one when id equals the
+// source's own @@server_id — a replica registering with the source's id is
+// refused (MySQL) or confuses the dump. A failed read keeps id: the check
+// narrows a one-in-four-billion collision, and the registration itself
+// still fails loudly if it happens.
+func (r *CDCReader) serverIDDistinctFromSource(ctx context.Context, id uint32) uint32 {
+	if r.db == nil {
+		return id
+	}
+	var source uint64
+	if err := r.db.QueryRowContext(ctx, "SELECT @@server_id").Scan(&source); err != nil {
+		slog.DebugContext(ctx, "mysql: cdc: could not read the source's server_id; keeping the generated replica id", slog.Any("error", err))
+		return id
+	}
+	for uint64(id) == source {
+		id = generateServerID()
+	}
+	return id
+}
 
 // serverIDBase is the per-process starting point: a hash of the host, the
 // pid and the process's first clock read. It separates sluice processes

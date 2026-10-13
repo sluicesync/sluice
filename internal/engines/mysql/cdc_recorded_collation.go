@@ -45,9 +45,9 @@ import (
 // guard those rows under. Decoding is unaffected: character values are
 // decoded by the TABLE_MAP's character set already ([binlogColumnCharsets]).
 //
-// Not covered: a collation ID the source's collation table does not name
-// (the shape keeps the catalog's; the DEFERRED-KEY-COLLATION hold refuses it
-// where it can see it), a source that records no collation (MariaDB's
+// A collation ID the reader cannot name refuses, retryably
+// ([CDCReader.refuseUnnamedCollations], COLLATION-NAMES-UNAVAILABLE). Not
+// covered: a source that records no collation (MariaDB's
 // default binlog_row_metadata=NO_LOG — its in-place column changes ahead of
 // the reader refuse in [retypedColumnUnverified]), and VStream, whose events
 // carry no collation (F17's named VStream residual).
@@ -69,7 +69,7 @@ func (r *CDCReader) recordedShapeAtEvent(ctx context.Context, qn string, catalog
 	if err != nil {
 		return nil, err
 	}
-	if err := r.refuseUnnamedKeyCollations(ctx, qn, shape, ev.Table); err != nil {
+	if err := r.refuseUnnamedCollations(ctx, qn, shape, ev.Table); err != nil {
 		return nil, err
 	}
 	shape = r.stampRecordedCollations(ctx, shape, ev.Table)
@@ -84,13 +84,15 @@ func (r *CDCReader) recordedShapeAtEvent(ctx context.Context, qn string, catalog
 // decoded the table with only where a boundary will carry the change — a
 // logged DDL that can reach THIS table ([ddlGenerations]; one that cannot be
 // bounded to named tables counts for every table) was read since that
-// shape, or this is its first row of an armed stream. Anywhere else the stream would decode rows under a collation no
-// boundary announces: a DDL run with sql_log_bin=0, which reaches the
-// catalog and the TABLE_MAP but writes no QUERY event. It refuses
-// DEFERRED-SCHEMA-CHANGE before any row of it is decoded (review of
-// d6ecb939, finding 2). Scoped like the reader's other refusals: an
-// excluded table's rows reach no target. A column the basis declares no
-// collation for, or a table with no basis, is not compared.
+// shape, or this is its first row of an armed stream. Anywhere else the
+// stream would decode rows under a collation no boundary announces: a DDL
+// run with sql_log_bin=0, which reaches the catalog and the TABLE_MAP but
+// writes no QUERY event. It refuses DEFERRED-SCHEMA-CHANGE before any row of
+// it is decoded (review of d6ecb939, finding 2). Scoped like the reader's
+// other refusals: an excluded table's rows reach no target. A column the
+// basis declares no collation for, or a table with no basis, is not
+// compared. A basis still SEEDED from the baseline owes a boundary instead
+// of refusing (third review of a0878c3c; see the loop).
 func (r *CDCReader) holdUnannouncedCollation(qn string, shape *tableSchema) error {
 	if r.scopeAllowed != nil && !r.tableInScope(qn) {
 		return nil
@@ -118,6 +120,25 @@ func (r *CDCReader) holdUnannouncedCollation(qn string, shape *tableSchema) erro
 	for _, c := range shape.Columns {
 		now, was := characterCollation(c.Type), characterCollation(basis.types[c.Name])
 		if now == "" || was == "" || strings.EqualFold(now, was) {
+			continue
+		}
+		// A type still seeded from the baseline is a catalog read, not a
+		// shape this stream observed: a parent manifest's schema is read at
+		// window close and can already show a LOGGED change the stream has
+		// yet to reach, so refusing on it refused rows written before that
+		// DDL, on every restart (third review of a0878c3c). Neither reading
+		// can be told apart here, so the row's recorded shape becomes a
+		// boundary at the stream's start — what a first touch does — and
+		// the history carries it either way: a later logged DDL is its own
+		// boundary, and an unlogged change reverted before the table's first
+		// row leaves a version recording the collation the rows were
+		// written under, so chain restore guards them under it (measured:
+		// KEY-COLLATION-MERGE, nothing merged —
+		// TestChainRestore_UnloggedRevertedKeyCollationBeforeTheWindowsFirstRow;
+		// skipping the seeded basis instead restored them merged). Where no
+		// boundary can be emitted (a shape that is never a boundary, or no
+		// start anchor), it refuses as before.
+		if basis.seeded[c.Name] && !shape.synthesized && r.seededBoundaries.owe(qn) {
 			continue
 		}
 		return fmt.Errorf("mysql: cdc: %s: %w: %s: column %q is decoded under collation %s at this binlog event, "+
@@ -181,17 +202,18 @@ func (g *ddlGenerations) at(qn string) int64 {
 // refusal.
 const unannouncedCollationMarker = "COLLATION-CHANGE-UNANNOUNCED"
 
-// refuseUnnamedKeyCollations refuses, retryably, a rows event that records a
-// collation ID for a character primary-key column while the source's
-// collation-name table could not be read: without names nothing can be
-// stamped, and the reverted and loosened windows would merge again for as
-// long as the read keeps failing (review of d6ecb939, finding 3). The read
-// is retried every [serverCollationsRetry], so a restart recovers. The
-// reader knows the primary key only; a UNIQUE key's column is not covered.
-// A reader with no database handle (a test seam) never loads the table and
-// is exempt.
-func (r *CDCReader) refuseUnnamedKeyCollations(ctx context.Context, qn string, shape *tableSchema, tm *replication.TableMapEvent) error {
-	if r.db == nil || tm == nil || len(tm.ColumnType) != len(shape.Columns) {
+// refuseUnnamedCollations refuses, retryably, a rows event that records a
+// collation ID for a character column the reader cannot name — the source's
+// collation-name table could not be read, or was read and lacks the ID.
+// Without a name nothing is stamped, and the reverted and loosened windows
+// would merge again (review of d6ecb939, finding 3). Every character column,
+// not only the primary key: the reader does not know the table's UNIQUE
+// keys, and a refusal that a restart retries costs nothing on a column that
+// was never at risk (third review of a0878c3c, finding 2). The read is
+// retried every [serverCollationsRetry]. A reader with no database handle
+// and no loaded table (a test seam) is exempt.
+func (r *CDCReader) refuseUnnamedCollations(ctx context.Context, qn string, shape *tableSchema, tm *replication.TableMapEvent) error {
+	if tm == nil || len(tm.ColumnType) != len(shape.Columns) {
 		return nil
 	}
 	ids := tm.CollationMap()
@@ -201,36 +223,36 @@ func (r *CDCReader) refuseUnnamedKeyCollations(ctx context.Context, qn string, s
 	// The name table loads lazily, on the first use; a check that ran before
 	// that first load mistook "not loaded yet" for "unreadable" and refused
 	// every stream's first row (measured in the MySQL integration suite).
-	r.collationIDNames(ctx)
-	if r.serverCollationIDNames != nil {
+	if r.db != nil {
+		r.collationIDNames(ctx)
+	}
+	names := r.serverCollationIDNames
+	if names == nil && r.db == nil {
 		return nil
 	}
 	for i, col := range shape.Columns {
 		id, recorded := ids[i]
-		if !recorded || id == binaryCollationID || characterCollation(col.Type) == "" || !inPrimaryKey(shape, col.Name) {
+		if !recorded || id == binaryCollationID || characterCollation(col.Type) == "" {
 			continue
 		}
-		return fmt.Errorf("mysql: cdc: %s: %s: key column %q was written under collation ID %d, and the source's "+
-			"collation table (information_schema.COLLATIONS) could not be read to name it, so the collation the row "+
-			"was written under cannot be carried to the target. Refusing; starting the stream again retries the read",
-			qn, collationNamesUnavailableMarker, col.Name, id)
+		why := "could not be read to name it"
+		if names != nil {
+			if names[id] != "" {
+				continue
+			}
+			why = "was read and does not name it"
+		}
+		return fmt.Errorf("mysql: cdc: %s: %s: character column %q was written under collation ID %d, and the source's "+
+			"collation table (information_schema.COLLATIONS) %s, so the collation the row was written under cannot "+
+			"be carried to the target. Refusing; starting the stream again retries the read",
+			qn, collationNamesUnavailableMarker, col.Name, id, why)
 	}
 	return nil
 }
 
-// collationNamesUnavailableMarker names [CDCReader.refuseUnnamedKeyCollations]'s
+// collationNamesUnavailableMarker names [CDCReader.refuseUnnamedCollations]'s
 // refusal.
 const collationNamesUnavailableMarker = "COLLATION-NAMES-UNAVAILABLE"
-
-// inPrimaryKey reports whether column is in tbl's primary key.
-func inPrimaryKey(tbl *tableSchema, column string) bool {
-	for _, k := range tbl.PrimaryKey {
-		if strings.EqualFold(k, column) {
-			return true
-		}
-	}
-	return false
-}
 
 // stampRecordedCollations returns tbl with each character column's
 // collation, and character set, replaced by the ones its rows event
@@ -251,6 +273,8 @@ func (r *CDCReader) stampRecordedCollations(ctx context.Context, tbl *tableSchem
 			continue
 		}
 		name := strings.ToLower(nameOf(id))
+		// An unnamed ID never reaches here from a rows event:
+		// refuseUnnamedCollations refused it first.
 		if name == "" || strings.EqualFold(name, characterCollation(col.Type)) {
 			continue
 		}
@@ -297,4 +321,38 @@ func withCollation(t ir.Type, charset, collation string) (ir.Type, bool) {
 		return v, true
 	}
 	return t, false
+}
+
+// seededCollationBoundaries are the boundaries owed by tables whose first
+// observed row recorded a collation the seeded baseline does not declare
+// ([CDCReader.holdUnannouncedCollation]). The zero value owes none and has
+// no anchor, so it refuses instead.
+type seededCollationBoundaries struct {
+	anchor   ir.Position
+	anchored bool
+	due      map[string]struct{}
+}
+
+// start records the stream's start position, when one resolved, and clears
+// the owed set. Called once per StreamChanges.
+func (s *seededCollationBoundaries) start(anchor ir.Position, ok bool) {
+	s.anchor, s.anchored, s.due = anchor, ok, map[string]struct{}{}
+}
+
+// owe marks qn's boundary owed; false when no anchor resolved.
+func (s *seededCollationBoundaries) owe(qn string) bool {
+	if !s.anchored {
+		return false
+	}
+	s.due[qn] = struct{}{}
+	return true
+}
+
+// take reports whether qn owes the boundary, and clears it.
+func (s *seededCollationBoundaries) take(qn string) bool {
+	if _, ok := s.due[qn]; !ok {
+		return false
+	}
+	delete(s.due, qn)
+	return true
 }
