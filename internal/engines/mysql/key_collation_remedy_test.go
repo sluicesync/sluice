@@ -18,7 +18,19 @@ import (
 // sluice re-creates the key with that collation. For a key armed to compare
 // bytes (a Postgres source collation, which a MySQL target cannot declare)
 // the re-copy recreates the target's default collation, so it is not offered.
+//
+// Bug 308: the re-copy is named per command, each with the flag that
+// command accepts — `sync start --restart-from-scratch`, and for a backup
+// replay `sync from-backup run --reset-target-data --yes` (which has no
+// --restart-from-scratch). The CLI-surface gate
+// (TestRuntimeMessagesNameRealCLISurface in cmd/sluice) grades both
+// invocations against the kong definitions; `restore` replaces this
+// remedy with its own (backup.restoreKeyCollationRemedy).
 func TestKeyCollationMergeRemedy_NamesTheCollationThatConverges(t *testing.T) {
+	const (
+		syncRecopy   = "`sluice sync start --restart-from-scratch`"
+		brokerRecopy = "`sluice sync from-backup run --reset-target-data --yes`"
+	)
 	varchar := func(cs, coll string) ir.Type { return ir.Varchar{Length: 20, Charset: cs, Collation: coll} }
 	source := func(k ir.Type) *ir.Table {
 		return &ir.Table{Name: "kd", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 32}}, {Name: "k", Type: k}}}
@@ -42,14 +54,14 @@ func TestKeyCollationMergeRemedy_NamesTheCollationThatConverges(t *testing.T) {
 		{
 			"mysql 8 to mariadb, the primary key",
 			planKeyCollationGuard(source(varchar("utf8mb4", "utf8mb4_0900_ai_ci")), padSpace, targetUniqueKeys{pk: []string{"k"}, uniques: [][]string{{"k"}}}, mariadbKeyGuardCollations),
-			[]string{"COLLATE utf8mb4_uca1400_nopad_ai_ci", "--restart-from-scratch", "converges either way"},
-			[]string{"utf8mb4_0900_ai_ci", "does not converge"},
+			[]string{"COLLATE utf8mb4_uca1400_nopad_ai_ci", "converges either way", syncRecopy, brokerRecopy},
+			[]string{"utf8mb4_0900_ai_ci", "does not converge", "restart the sync with --restart-from-scratch"},
 		},
 		{
 			"mysql 8 to mariadb, a unique key beside the primary key",
 			planKeyCollationGuard(source(varchar("utf8mb4", "utf8mb4_0900_ai_ci")), padSpace, targetUniqueKeys{pk: []string{"id"}, uniques: [][]string{{"id"}, {"k"}}}, mariadbKeyGuardCollations),
-			[]string{"COLLATE utf8mb4_uca1400_nopad_ai_ci", "--restart-from-scratch"},
-			[]string{"utf8mb4_0900_ai_ci"},
+			[]string{"COLLATE utf8mb4_uca1400_nopad_ai_ci", syncRecopy, brokerRecopy},
+			[]string{"utf8mb4_0900_ai_ci", "table with --restart-from-scratch"},
 		},
 		{
 			"a postgres byte-compared key on a mysql _ci primary key",

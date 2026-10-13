@@ -12,6 +12,14 @@
 //
 // The independent expected value is the source's rows read by id:HEX(k)
 // after the window (kcfbGrade): byte-exact, or refused with nothing merged.
+//
+// Bug 306: the window runs with and without a row of kd after the loosening.
+// Without one, the window records no version of kd, and the window-start
+// version — built from a MySQL full manifest, which names no namespace — was
+// filed under `kd` while the rows looked up `<db>.kd`: the guard never armed
+// and both capture lanes restored row 1 merged at exit 0. The target's own
+// schema history is read as the second, independent witness: every version
+// of kd must name the database the rows name.
 
 package pipeline
 
@@ -62,6 +70,23 @@ func klwLanes(trailing bool) []string {
 		return []string{"backup-stream", "backup-stream-rollover", "backup-incremental", "broker", "broker-rollover"}
 	}
 	return []string{"backup-stream-rollover", "backup-incremental", "broker-rollover"}
+}
+
+// klwAssertRestoreRemedy pins Bug 308 on the restore path, end to end: the
+// refusal's remedy LEADS with the fresh full backup, and names nothing
+// `restore` cannot run — no --restart-from-scratch (a `sync start` flag), no
+// "ALTER the key and restart" (a re-run starts over from the full).
+func klwAssertRestoreRemedy(t *testing.T, err error) {
+	t.Helper()
+	_, remedy, ok := strings.Cut(err.Error(), "(the whole statement rolled back). ")
+	if !ok || !strings.HasPrefix(remedy, "Take a fresh full backup after the key change") {
+		t.Errorf("restore refusal does not lead with the fresh full backup: %v", err)
+	}
+	for _, f := range []string{"--restart-from-scratch", "and restart", "sync start"} {
+		if strings.Contains(err.Error(), f) {
+			t.Errorf("restore refusal names %q, which `restore` cannot run: %v", f, err)
+		}
+	}
 }
 
 // klwHistoryNamespaces renders the target's schema-history rows for kd as
@@ -144,7 +169,16 @@ func TestChainRestore_KeyCollationLoosenedInsideTheWindow(t *testing.T) {
 						}
 						t.Logf("apply = %v; source %s target %s", applyErr, kcfbRender(kcfbRows(t, src)), kcfbRender(kcfbRows(t, tgt)))
 						if !broker {
-							t.Logf("target schema history for kd: %s (source database %s)", klwHistoryNamespaces(t, tgt), srcDB)
+							// Bug 306: every version of kd the restore wrote names the
+							// database the window's rows name, where their lookup looks.
+							history := klwHistoryNamespaces(t, tgt)
+							t.Logf("target schema history for kd: %s (source database %s)", history, srcDB)
+							if strings.Contains(history, "[]") {
+								t.Errorf("a version of kd was written naming no namespace (%s); the rows name %s", history, srcDB)
+							}
+							if lane != "backup-stream" && !strings.Contains(history, "["+srcDB+"]") {
+								t.Errorf("no version of kd names %s (%s)", srcDB, history)
+							}
 						}
 						unordered := applyErr != nil && strings.Contains(applyErr.Error(), "KEY-COLLATION-HISTORY-UNORDERED")
 						switch {
@@ -168,15 +202,91 @@ func TestChainRestore_KeyCollationLoosenedInsideTheWindow(t *testing.T) {
 							}
 							// A restart re-applies the loosening ahead of the same rows,
 							// so the remedy that converges is a fresh full backup.
-							if !strings.Contains(applyErr.Error(), "take a fresh full backup") {
-								t.Fatalf("apply = %v; want the fresh-full remedy", applyErr)
-							}
+							klwAssertRestoreRemedy(t, applyErr)
 						}
 						kcfbGrade(t, name, src, tgt, applyErr)
 					})
 				}
 			}
 		}
+	}
+}
+
+// TestChainRestore_KeyCollationLoosenedWindowEndsOnItsRecordedShape pins the
+// window-end version (backup.windowEndVersions). Window 1 loosens kd's key
+// with nothing colliding and no row of kd after the ALTER — but a row of
+// another table after it, so the window's end position lies past the ALTER
+// and window 2's reader, seeded from window 1's recorded `_ci` shape, owes
+// kd no boundary: neither window records a version of the `_ci` shape.
+// Window 2 changes row 1's key 'a' → 'A' — on the now `_ci` source a
+// case-only change of one row, which merges nothing. Without a version of
+// the shape window 1 ended on, the window-start `_bin` version (which Bug
+// 306's fix made reachable: it used to be filed where nothing looked) would
+// stay the applier's active shape for window 2, and the last word in the
+// target's schema history for the next `sync start` to prime from. The
+// chain must restore byte-exact (graded against the source by id:HEX(k)),
+// and the target's history must hold kd's `_ci` shape under the database.
+func TestChainRestore_KeyCollationLoosenedWindowEndsOnItsRecordedShape(t *testing.T) {
+	_, myRoot, myCleanup := startMySQL(t)
+	defer myCleanup()
+	myEng, _ := engines.Get("mysql")
+	root := twfbDB{engine: "mysql", dsn: myRoot}
+	for i, key := range []string{"pk", "unique"} {
+		t.Run(key, func(t *testing.T) {
+			srcDB, tgtDB := fmt.Sprintf("klwe_s%d", i), fmt.Sprintf("klwe_t%d", i)
+			root.exec(t, "CREATE DATABASE "+srcDB+"; CREATE DATABASE "+tgtDB)
+			srcDSN, err := buildMySQLDSN(myRoot, srcDB)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tgtDSN, err := buildMySQLDSN(myRoot, tgtDB)
+			if err != nil {
+				t.Fatal(err)
+			}
+			src, tgt := twfbDB{engine: "mysql", dsn: srcDSN}, twfbDB{engine: "mysql", dsn: tgtDSN}
+			src.exec(t, klwKeys()[key]+"; INSERT INTO kd VALUES (1,'a',1),(2,'b',2); CREATE TABLE other (id INT NOT NULL PRIMARY KEY)")
+			ctx := context.Background()
+			store, err := blobcodec.NewLocalStore(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := (&backup.Backup{Source: myEng, SourceDSN: srcDSN, Store: store, SluiceVersion: "test"}).Run(ctx); err != nil {
+				t.Fatalf("full: %v", err)
+			}
+			incr := func() {
+				t.Helper()
+				runCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+				defer cancel()
+				if err := (&IncrementalBackup{Source: myEng, SourceDSN: srcDSN, Store: store, Window: 8 * time.Second, SluiceVersion: "test"}).Run(runCtx); err != nil {
+					t.Fatalf("incremental: %v", err)
+				}
+			}
+			src.exec(t, "INSERT INTO kd VALUES (50,'q',50)")
+			src.exec(t, klwToCI)
+			src.exec(t, "INSERT INTO other VALUES (1)")
+			incr()
+			if key == "pk" {
+				src.exec(t, "UPDATE kd SET k = 'A' WHERE k = 'a'")
+			} else {
+				src.exec(t, "UPDATE kd SET k = 'A' WHERE id = 1")
+			}
+			incr()
+			cr := &backup.ChainRestore{Target: myEng, TargetDSN: tgtDSN, Store: store, SourceEngine: engines.Get}
+			restoreErr := cr.Run(ctx)
+			history := tgt.scalar(t, "SELECT IFNULL(GROUP_CONCAT(CONCAT('[', schema_name, ']', "+
+				"IF(ir_schema_json LIKE '%utf8mb4_bin%', '_bin', '_ci')) SEPARATOR ','), '') "+
+				"FROM sluice_cdc_schema_history WHERE table_name = 'kd'")
+			t.Logf("restore = %v; source %s target %s; kd history %s", restoreErr,
+				kcfbRender(kcfbRows(t, src)), kcfbRender(kcfbRows(t, tgt)), history)
+			if restoreErr != nil {
+				t.Fatalf("restore = %v; want the chain exact (window 2 merges nothing)", restoreErr)
+			}
+			kcfbGrade(t, key, src, tgt, nil)
+			if !strings.Contains(history, "["+srcDB+"]_ci") {
+				t.Errorf("kd's schema history (%s) holds no `_ci` shape under %s: the window-start `_bin` "+
+					"version is the last word for a resume", history, srcDB)
+			}
+		})
 	}
 }
 

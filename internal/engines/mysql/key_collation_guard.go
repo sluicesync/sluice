@@ -583,9 +583,11 @@ func keyCollationMergeRefusal(err error, plan *keyCollationPlan, schema, table s
 	if plan == nil || !isKeyCollationMergeRaise(err) {
 		return err
 	}
+	needs, _ := keyCollationNeeds(plan)
 	return &ir.KeyCollationMergeError{
 		Schema: schema, Table: table, Cause: err,
 		Remedy: keyCollationMergeRemedy(plan, schema, table),
+		Needs:  needs,
 	}
 }
 
@@ -635,8 +637,8 @@ func keyCollationMergeRemedy(plan *keyCollationPlan, schema, table string) strin
 			"sides (or the table has no primary key), so sluice cannot tell a re-delivered change of that key "+
 			"from a second source row, and this refusal repeats on every start. ", quoteIdent(schema), quoteIdent(table))
 		if recopyAligns {
-			return lead + "Re-copy the table, which converges either way: restart the sync with " +
-				"--restart-from-scratch, which recreates it with " + collations + ". Giving the target key that " +
+			return lead + "Re-copy the table, which converges either way: " + keyCollationRecopy + " recreates it with " +
+				collations + ". Giving the target key that " +
 				"collation yourself converges only if this is a second source row, not a re-delivered change of one"
 		}
 		return lead + "A re-copy does not converge here: sluice recreates the key under the target's default " +
@@ -646,10 +648,18 @@ func keyCollationMergeRemedy(plan *keyCollationPlan, schema, table string) strin
 	alter := fmt.Sprintf("`ALTER TABLE %s.%s MODIFY <column> …` with %s", quoteIdent(schema), quoteIdent(table), collations)
 	if recopyAligns {
 		return "Give the target's key column(s) " + collations + " (" + alter + ") and restart, or re-copy the " +
-			"table with --restart-from-scratch, which recreates it with that collation"
+			"table: " + keyCollationRecopy + " recreates it with that collation"
 	}
 	return "Give the target's key column(s) " + collations + " (" + alter + ") and restart"
 }
+
+// keyCollationRecopy names the re-copy for each command that reaches the
+// applier's remedy, since the flag differs between them (Bug 308: the
+// remedy named --restart-from-scratch alone, which only `sync start`
+// accepts). `restore` replaces this remedy with its own — it neither
+// resumes nor re-copies a table (backup.restoreKeyCollationRemedy).
+const keyCollationRecopy = "`sluice sync start --restart-from-scratch` (or, replaying a backup chain, " +
+	"`sluice sync from-backup run --reset-target-data --yes`)"
 
 // keyCollationNeeds is what each armed key column of plan must be declared
 // with on this target for the guard's comparison to be the key's own, in

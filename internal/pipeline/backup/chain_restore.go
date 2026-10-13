@@ -1238,13 +1238,13 @@ func (r *ChainRestore) applyIncremental(
 		if err := batched.ApplyBatch(ctx, ChainRestoreStreamID, changesCh, batchSize); err != nil {
 			streamCancel()
 			<-errCh
-			return windowKeyCollationRemedy(link, fmt.Errorf("apply changes (batched): %w", err))
+			return fmt.Errorf("apply changes (batched): %w", restoreKeyCollationRemedy(link, err))
 		}
 	} else {
 		if err := applier.Apply(ctx, ChainRestoreStreamID, changesCh); err != nil {
 			streamCancel()
 			<-errCh
-			return windowKeyCollationRemedy(link, fmt.Errorf("apply changes: %w", err))
+			return fmt.Errorf("apply changes: %w", restoreKeyCollationRemedy(link, err))
 		}
 	}
 	if err := <-errCh; err != nil {
@@ -1443,12 +1443,13 @@ func (r *ChainRestore) streamIncrementalChanges(
 	if err != nil {
 		return fmt.Errorf("apply schema history: %w", err)
 	}
-	snaps = append(windowStartVersions(r.windowStart, link.Manifest, snaps), snaps...)
+	seeds := windowStartVersions(r.windowStart, link.Manifest, snaps)
 	history, err := newHistoryReplay(lineage.ManifestBackupID(link.Manifest), link.Manifest.SourceEngine,
-		r.positionOrdererFor(link.Manifest.SourceEngine), link.Manifest, snaps)
+		r.positionOrdererFor(link.Manifest.SourceEngine), link.Manifest, append(seeds, snaps...))
 	if err != nil {
 		return err
 	}
+	history.windowEnd = windowEndVersions(link.Manifest, seeds)
 	segStore := link.Segment.Store(r.Store)
 	codec := link.Segment.CodecOrDefault()
 
@@ -1508,6 +1509,20 @@ func (r *ChainRestore) streamIncrementalChanges(
 	// change outside a transaction, so a held empty pair recorded before it
 	// is released before it.
 	pushVersion := func(c ir.Change) error { return runs.Push(c, emit) }
+	// deliver hands a change the history replay has placed on to the
+	// applier. Bug 244: it honours the restore's table filter, the door the
+	// base full's restore already honours. Without this, an excluded table's
+	// events reached the applier, which died loudly against the table the
+	// filter deliberately never created ("table X has no columns") —
+	// breaking `--exclude-table` as a salvage on any chain carrying an
+	// incremental.
+	deliver := func(c ir.Change) error {
+		if drop, tbl := filterDropsChange(r.Filter, c); drop {
+			skipped[tbl]++
+			return nil
+		}
+		return runs.Push(c, emit)
+	}
 	if err := history.start(pushVersion); err != nil {
 		return fmt.Errorf("apply schema history: %w", err)
 	}
@@ -1517,7 +1532,7 @@ func (r *ChainRestore) streamIncrementalChanges(
 			// before decryption → coded SLUICE-E-BACKUP-CHUNK-CORRUPT.
 			return lineage.CodeChunkHashError(fmt.Errorf("chunk %d (%s): open chunk: %w", f.idx, f.chunk.File, f.err))
 		}
-		if err := r.streamOneChangeChunk(link, codec, f.idx, f.chunk, f.src, history, &runs, emit, &lastApplied, skipped); err != nil {
+		if err := r.streamOneChangeChunk(link, codec, f.idx, f.chunk, f.src, history, pushVersion, deliver, &lastApplied); err != nil {
 			return fmt.Errorf("chunk %d (%s): %w", f.idx, f.chunk.File, err)
 		}
 		slog.DebugContext(
@@ -1529,7 +1544,7 @@ func (r *ChainRestore) streamIncrementalChanges(
 	}
 	// A version anchored after the window's last change still reaches the
 	// target's schema history, so a resume at the chain's end finds it.
-	if err := history.releaseAll(pushVersion); err != nil {
+	if err := history.finish(pushVersion, deliver); err != nil {
 		return fmt.Errorf("apply schema history: %w", err)
 	}
 	if err := runs.Flush(emit); err != nil {
@@ -1647,8 +1662,9 @@ func decodeSchemaHistory(link *lineage.SegmentRecord) ([]ir.SchemaSnapshot, erro
 // streamOneChangeChunk decodes chunk's events from src — the
 // already-fetched, SHA-verified chunk body handed over by
 // [ChainRestore.streamIncrementalChanges]'s read-ahead fetcher — and
-// pushes them through runs to emit (whose send honours the stream's
-// context). codec is the chunk's segment's RECORDED codec
+// admits them to history, which places the window's schema versions among
+// them (pushVersion) and hands each change to deliver. codec is the chunk's
+// segment's RECORDED codec
 // (never sniffed from the bytes — ADR-0046 §5).
 func (r *ChainRestore) streamOneChangeChunk(
 	link *lineage.SegmentRecord,
@@ -1657,10 +1673,8 @@ func (r *ChainRestore) streamOneChangeChunk(
 	chunk *irbackup.ChunkInfo,
 	src io.ReadCloser,
 	history *historyReplay,
-	runs *migcore.EmptyTxRuns,
-	emit func(ir.Change) error,
+	pushVersion, deliver func(ir.Change) error,
 	lastApplied *ir.Position,
-	skipped map[string]int64,
 ) error {
 	cek, err := r.changeChunkCEK(chunk)
 	if err != nil {
@@ -1708,25 +1722,12 @@ func (r *ChainRestore) streamOneChangeChunk(
 		}
 		// KEY-COLLATION-REVERTED-WINDOW-RESTORE: each schema version reaches
 		// the applier ahead of the first change recorded under it — before
-		// the table filter, which keeps transaction framing and positions
-		// for every table (chain_restore_history_order.go).
-		if err := history.before(change, func(c ir.Change) error { return runs.Push(c, emit) }); err != nil {
+		// the table filter (in deliver), which keeps transaction framing and
+		// positions for every table, and under the namespace the window's
+		// changes name (Bug 306; chain_restore_history_order.go).
+		if err := history.admit(change, pushVersion, deliver); err != nil {
 			_ = cr.Close()
 			return fmt.Errorf("apply schema history: %w", err)
-		}
-		// Bug 244: honour the restore's table filter, the door the base
-		// full's restore already honours. Without this, an excluded table's
-		// events reached the applier, which died loudly against the table
-		// the filter deliberately never created ("table X has no columns") —
-		// breaking `--exclude-table` as a salvage on any chain carrying an
-		// incremental.
-		if drop, tbl := filterDropsChange(r.Filter, change); drop {
-			skipped[tbl]++
-			continue
-		}
-		if err := runs.Push(change, emit); err != nil {
-			_ = cr.Close()
-			return err
 		}
 	}
 	// A change-chunk SHA-256 mismatch surfaces at Close → coded

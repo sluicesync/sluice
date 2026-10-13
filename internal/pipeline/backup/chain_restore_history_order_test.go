@@ -88,6 +88,25 @@ func TestWindowStartVersions(t *testing.T) {
 	if seeds := windowStartVersions(nil, loosened, nil); len(seeds) != 0 {
 		t.Fatalf("seeds = %+v; want none with no previous link", seeds)
 	}
+	// The seed names what the parent recorded (none, for MySQL) — not a name
+	// borrowed from a version only some windows record (Bug 306); the
+	// replay gives it the rows' namespace.
+	inDB := hsnap(10, "utf8mb4_0900_ai_ci")
+	inDB.Schema = "db"
+	if seeds := windowStartVersions(parent, loosened, []ir.SchemaSnapshot{inDB}); len(seeds) != 1 || seeds[0].Schema != "" {
+		t.Fatalf("seeds = %+v; want one naming the parent's (empty) namespace", seeds)
+	}
+	// A delta of a same-named table in another namespace changes nothing here.
+	inA, inB := keyTable("utf8mb4_bin"), keyTable("utf8mb4_bin")
+	inA.Schema, inB.Schema = "a", "b"
+	otherDelta := &irbackup.Manifest{
+		StartPosition: start,
+		SchemaDelta:   []*irbackup.SchemaDeltaEntry{{Kind: irbackup.SchemaDeltaAlterTable, Schema: "b", Table: "kd", Before: binT, After: ciT}},
+	}
+	seeds = windowStartVersions(&ir.Schema{Tables: []*ir.Table{inA, inB}}, otherDelta, nil)
+	if len(seeds) != 1 || seeds[0].Schema != "b" {
+		t.Fatalf("seeds = %+v; want only b.kd", seeds)
+	}
 }
 
 // TestKeyCollationHistory_AVersionRecordingNoCollationIsNoEvidence is the
@@ -138,23 +157,62 @@ func TestHistoryReplay_StrandedAgreeingVersionIsDropped(t *testing.T) {
 // that converges — a fresh full backup — because restarting the restore
 // re-applies the change ahead of the same rows; any other error is left as
 // it is.
-func TestWindowKeyCollationRemedy(t *testing.T) {
+//
+// Bug 308: the restore's remedy REPLACES the applier's — whose "ALTER the
+// key and restart, or re-copy with --restart-from-scratch" cannot run for
+// `restore` — rather than following it.
+func TestRestoreKeyCollationRemedy(t *testing.T) {
 	binT, ciT := keyTable("utf8mb4_bin"), keyTable("utf8mb4_0900_ai_ci")
-	merge := fmt.Errorf("apply changes: %w", ir.ErrKeyCollationMerge)
+	// The applier's own refusal, worded for `sync start` (the MySQL engine's
+	// text, abridged), wrapped the way the engine wraps it.
+	engine := fmt.Errorf("mysql: applier: insert into db.kd: %w", &ir.KeyCollationMergeError{
+		Schema: "db", Table: "kd", Cause: errors.New("1690"),
+		Remedy: "Give the target's key column(s) `k` COLLATE utf8mb4_bin (`ALTER TABLE …`) and restart, or re-copy the " +
+			"table: `sluice sync start --restart-from-scratch` recreates it with that collation",
+		Needs: "`k` CHARACTER SET utf8mb4 COLLATE utf8mb4_bin",
+	})
 	loosened := &lineage.SegmentRecord{ManifestRecord: lineage.ManifestRecord{Manifest: &irbackup.Manifest{
 		Schema:      &ir.Schema{Tables: []*ir.Table{ciT}},
 		SchemaDelta: []*irbackup.SchemaDeltaEntry{{Kind: irbackup.SchemaDeltaAlterTable, Table: "kd", Before: binT, After: ciT}},
 	}}}
-	got := windowKeyCollationRemedy(loosened, merge)
-	if !errors.Is(got, ir.ErrKeyCollationMerge) || !strings.Contains(got.Error(), "take a fresh full backup") {
-		t.Fatalf("loosening window: err = %v; want the fresh-full remedy, still %v", got, ir.ErrKeyCollationMerge)
-	}
 	quiet := &lineage.SegmentRecord{ManifestRecord: lineage.ManifestRecord{Manifest: &irbackup.Manifest{Schema: &ir.Schema{Tables: []*ir.Table{ciT}}}}}
-	if got := windowKeyCollationRemedy(quiet, merge); got.Error() != merge.Error() {
-		t.Fatalf("a window that changes no key collation: err = %v; want it unchanged", got)
+	restoreRunsNone := []string{"--restart-from-scratch", "and restart", "sync start"}
+
+	got := restoreKeyCollationRemedy(loosened, engine)
+	if !errors.Is(got, ir.ErrKeyCollationMerge) {
+		t.Fatalf("loosening window: err = %v; want it still %v", got, ir.ErrKeyCollationMerge)
+	}
+	remedy := strings.SplitN(got.Error(), "Refusing before it is applied (the whole statement rolled back). ", 2)[1]
+	if !strings.HasPrefix(remedy, "Take a fresh full backup after the key change") {
+		t.Errorf("loosening window: the remedy does not lead with the fresh full backup:\n%s", remedy)
+	}
+	for _, f := range restoreRunsNone {
+		if strings.Contains(got.Error(), f) {
+			t.Errorf("loosening window: the restore's refusal says %q, which `restore` cannot run:\n%v", f, got)
+		}
+	}
+
+	got = restoreKeyCollationRemedy(quiet, engine)
+	if !errors.Is(got, ir.ErrKeyCollationMerge) || !strings.Contains(got.Error(), "Restore the chain into an empty target whose key column(s) carry `k` CHARACTER SET utf8mb4 COLLATE utf8mb4_bin") {
+		t.Fatalf("a window that changes no key collation: err = %v; want the restore's own remedy naming what the key needs", got)
+	}
+	for _, f := range restoreRunsNone {
+		if strings.Contains(got.Error(), f) {
+			t.Errorf("no window change: the restore's refusal says %q, which `restore` cannot run:\n%v", f, got)
+		}
+	}
+
+	// A KEY-COLLATION-MERGE that carries no engine remedy (the guard could not
+	// be built) keeps its own text; inside such a window the fresh full follows it.
+	bare := fmt.Errorf("apply: %w: KEY-COLLATION-GUARD-UNSUPPORTED", ir.ErrKeyCollationMerge)
+	if got := restoreKeyCollationRemedy(loosened, bare); !strings.HasPrefix(got.Error(), bare.Error()) || !strings.Contains(got.Error(), "Take a fresh full backup") {
+		t.Fatalf("bare refusal in a loosening window: err = %v", got)
+	}
+	if got := restoreKeyCollationRemedy(quiet, bare); got.Error() != bare.Error() {
+		t.Fatalf("bare refusal, no window change: err = %v; want it unchanged", got)
 	}
 	other := errors.New("boom")
-	if got := windowKeyCollationRemedy(loosened, other); got.Error() != other.Error() {
+	if got := restoreKeyCollationRemedy(loosened, other); got.Error() != other.Error() {
 		t.Fatalf("another error: err = %v; want it unchanged", got)
 	}
 }
@@ -235,47 +293,214 @@ func hsnap(at int, collation string) ir.SchemaSnapshot {
 }
 
 // replayOrder runs changes through h the way chain restore does and renders
-// the stream the applier would see.
+// the stream the applier would see. A version or row naming a namespace
+// renders it after "@".
 func replayOrder(t *testing.T, h *historyReplay, changes []ir.Change) string {
 	t.Helper()
+	got, err := replay(h, changes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return got
+}
+
+// replay is [replayOrder] returning the error instead.
+func replay(h *historyReplay, changes []ir.Change) (string, error) {
 	var out []string
+	at := func(namespace string) string {
+		if namespace == "" {
+			return ""
+		}
+		return "@" + namespace
+	}
 	push := func(c ir.Change) error {
 		switch v := c.(type) {
 		case ir.SchemaSnapshot:
-			out = append(out, "S"+v.Position.Token+":"+v.IR.Columns[1].Type.(ir.Varchar).Collation)
+			out = append(out, "S"+v.Position.Token+at(v.Schema)+":"+v.IR.Columns[1].Type.(ir.Varchar).Collation)
 		case ir.TxBegin:
 			out = append(out, "B"+v.Position.Token)
 		case ir.TxCommit:
 			out = append(out, "C"+v.Position.Token)
 		case ir.Insert:
-			out = append(out, "I"+v.Position.Token)
+			out = append(out, "I"+v.Position.Token+at(v.Schema))
 		default:
 			out = append(out, fmt.Sprintf("%T", c))
 		}
 		return nil
 	}
 	if err := h.start(push); err != nil {
-		t.Fatal(err)
+		return strings.Join(out, " "), err
 	}
 	for _, c := range changes {
-		if err := h.before(c, push); err != nil {
-			t.Fatal(err)
-		}
-		if err := push(c); err != nil {
-			t.Fatal(err)
+		if err := h.admit(c, push, push); err != nil {
+			return strings.Join(out, " "), err
 		}
 	}
-	if err := h.releaseAll(push); err != nil {
-		t.Fatal(err)
-	}
-	return strings.Join(out, " ")
+	err := h.finish(push, push)
+	return strings.Join(out, " "), err
 }
 
 func tx(begin, row, commit int) []ir.Change {
+	return txIn("", begin, row, commit)
+}
+
+// txIn is [tx] with its row naming namespace.
+func txIn(namespace string, begin, row, commit int) []ir.Change {
 	return []ir.Change{
 		ir.TxBegin{Position: hpos(begin)},
-		ir.Insert{Position: hpos(row), Table: "kd"},
+		ir.Insert{Position: hpos(row), Schema: namespace, Table: "kd"},
 		ir.TxCommit{Position: hpos(commit)},
+	}
+}
+
+// TestHistoryReplay_VersionTakesTheRowsNamespace pins Bug 306 at the replay
+// seam. A MySQL full manifest records its tables with no namespace, so the
+// window-start version names none, while every row the binlog recorded
+// names the database — and the applier files a version, and looks a row's
+// up, by namespace and table. The version must reach the applier naming
+// the database, ahead of the first transaction, with or without a version of
+// the window to borrow a name from.
+func TestHistoryReplay_VersionTakesTheRowsNamespace(t *testing.T) {
+	seed := hsnap(5, "utf8mb4_bin") // a window-start version: no namespace
+	cases := []struct {
+		name    string
+		snaps   []ir.SchemaSnapshot
+		orderer ir.PositionOrderer
+		changes []ir.Change
+		want    string
+	}{
+		{
+			name: "no version of the table in the window (the loosening is its last event)", snaps: []ir.SchemaSnapshot{seed},
+			orderer: tokenOrderer{}, changes: txIn("db", 10, 11, 12),
+			want: "S5@db:utf8mb4_bin B10 I11@db C12",
+		},
+		{
+			name: "an empty transaction first: it passes, the version waits for a row", snaps: []ir.SchemaSnapshot{seed},
+			orderer: tokenOrderer{},
+			changes: append([]ir.Change{ir.TxBegin{Position: hpos(8)}, ir.TxCommit{Position: hpos(9)}}, txIn("db", 10, 11, 12)...),
+			want:    "B8 C9 S5@db:utf8mb4_bin B10 I11@db C12",
+		},
+		{
+			name: "a row outside any transaction names it", snaps: []ir.SchemaSnapshot{seed},
+			orderer: tokenOrderer{}, changes: []ir.Change{ir.Insert{Position: hpos(10), Schema: "db", Table: "kd"}},
+			want: "S5@db:utf8mb4_bin I10@db",
+		},
+		{
+			name: "unordered: released up front, once the namespace is known", snaps: []ir.SchemaSnapshot{seed},
+			changes: txIn("db", 10, 11, 12),
+			want:    "S5@db:utf8mb4_bin B10 I11@db C12",
+		},
+		{
+			name: "a recorded version of the window keeps its own namespace",
+			snaps: []ir.SchemaSnapshot{seed, func() ir.SchemaSnapshot {
+				s := hsnap(20, "utf8mb4_0900_ai_ci")
+				s.Schema = "db"
+				return s
+			}()},
+			orderer: tokenOrderer{}, changes: append(txIn("db", 10, 11, 12), txIn("db", 21, 22, 23)...),
+			want: "S5@db:utf8mb4_bin B10 I11@db C12 S20@db:utf8mb4_0900_ai_ci B21 I22@db C23",
+		},
+		{
+			name: "no row at all: the version keeps no namespace (nothing for it to govern)", snaps: []ir.SchemaSnapshot{seed},
+			orderer: tokenOrderer{}, changes: []ir.Change{ir.TxBegin{Position: hpos(8)}, ir.TxCommit{Position: hpos(9)}},
+			want: "B8 C9 S5:utf8mb4_bin",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			snaps := append([]ir.SchemaSnapshot(nil), c.snaps...)
+			h, err := newHistoryReplay("b1", "test", c.orderer, nil, snaps)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := replayOrder(t, h, c.changes); got != c.want {
+				t.Fatalf("replayed order\n got: %s\nwant: %s", got, c.want)
+			}
+		})
+	}
+}
+
+// TestHistoryReplay_VersionNamespaceIsChecked: the namespace a version
+// naming none takes is the window's first change's, on the premise that a
+// flat manifest is a single-namespace stream. A later change of that table
+// naming another refuses (KEY-COLLATION-VERSION-NAMESPACE) — the version
+// would be filed where that change's lookup does not look.
+func TestHistoryReplay_VersionNamespaceIsChecked(t *testing.T) {
+	h, err := newHistoryReplay("b1", "test", tokenOrderer{}, nil, []ir.SchemaSnapshot{hsnap(5, "utf8mb4_bin")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := []ir.Change{ir.TxBegin{Position: hpos(10)}, ir.Insert{Position: hpos(11), Schema: "db", Table: "other"}, ir.TxCommit{Position: hpos(12)}}
+	_, err = replay(h, append(other, txIn("db2", 20, 21, 22)...))
+	if !errors.Is(err, ir.ErrKeyCollationMerge) || !strings.Contains(err.Error(), keyCollationVersionNamespaceMarker) {
+		t.Fatalf("err = %v; want %v naming %s", err, ir.ErrKeyCollationMerge, keyCollationVersionNamespaceMarker)
+	}
+	h, err = newHistoryReplay("b1", "test", tokenOrderer{}, nil, []ir.SchemaSnapshot{hsnap(5, "utf8mb4_bin")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := replay(h, append(other, txIn("db", 20, 21, 22)...)); err != nil {
+		t.Fatalf("the same namespace refused: %v", err)
+	}
+}
+
+// TestHistoryReplay_WindowEndVersionsGoLast: the window-end versions
+// ([windowEndVersions]) follow every change and pending version, under the
+// namespace the window's changes named.
+func TestHistoryReplay_WindowEndVersionsGoLast(t *testing.T) {
+	h, err := newHistoryReplay("b1", "test", tokenOrderer{}, nil, []ir.SchemaSnapshot{hsnap(5, "utf8mb4_bin")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.windowEnd = []ir.SchemaSnapshot{hsnap(12, "utf8mb4_0900_ai_ci")}
+	if got, want := replayOrder(t, h, txIn("db", 10, 11, 12)), "S5@db:utf8mb4_bin B10 I11@db C12 S12@db:utf8mb4_0900_ai_ci"; got != want {
+		t.Fatalf("replayed order\n got: %s\nwant: %s", got, want)
+	}
+}
+
+// TestWindowEndVersions: one per window-start version, the window's recorded
+// shape of its table at the window's end; none without an end position.
+func TestWindowEndVersions(t *testing.T) {
+	binT, ciT := keyTable("utf8mb4_bin"), keyTable("utf8mb4_0900_ai_ci")
+	m := &irbackup.Manifest{EndPosition: hpos(40), Schema: &ir.Schema{Tables: []*ir.Table{ciT}}}
+	seeds := []ir.SchemaSnapshot{{Position: hpos(1), Table: "kd", IR: binT}}
+	ends := windowEndVersions(m, seeds)
+	if len(ends) != 1 || ends[0].IR != ciT || ends[0].Position != hpos(40) {
+		t.Fatalf("ends = %+v; want the recorded `_ci` shape at the window's end", ends)
+	}
+	m.EndPosition = ir.Position{}
+	if ends := windowEndVersions(m, seeds); len(ends) != 0 {
+		t.Fatalf("ends = %+v; want none without an end position", ends)
+	}
+}
+
+// TestKeyCollationHistory_ANamespacelessVersionIsTheSameTable is the sibling
+// sweep of Bug 306 through the two comparisons keyed by a version's
+// namespace: a window-start version naming none and the window's version
+// naming the database are one table, so the unordered refusal compares
+// them, and so does the stranded-version check.
+func TestKeyCollationHistory_ANamespacelessVersionIsTheSameTable(t *testing.T) {
+	inDB := func(at int, collation string) ir.SchemaSnapshot {
+		s := hsnap(at, collation)
+		s.Schema = "db"
+		return s
+	}
+	snaps := []ir.SchemaSnapshot{hsnap(5, "utf8mb4_bin"), inDB(30, "utf8mb4_0900_ai_ci")}
+	if err := refuseKeyCollationHistory("b1", "test", nil, snaps); !errors.Is(err, ir.ErrKeyCollationMerge) {
+		t.Fatalf("unordered: err = %v; want %v (the two disagree on kd's key)", err, ir.ErrKeyCollationMerge)
+	}
+	h, err := newHistoryReplay("b1", "test", strandingOrderer{strand: "5"}, nil, append([]ir.SchemaSnapshot(nil), snaps...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var refused error
+	for _, c := range append(txIn("db", 31, 32, 33), txIn("db", 35, 36, 37)...) {
+		if refused = h.before(c, func(ir.Change) error { return nil }); refused != nil {
+			break
+		}
+	}
+	if !errors.Is(refused, ir.ErrKeyCollationMerge) || !strings.Contains(refused.Error(), keyCollationHistoryUnorderedMarker) {
+		t.Fatalf("stranded: err = %v; want %v naming %s", refused, ir.ErrKeyCollationMerge, keyCollationHistoryUnorderedMarker)
 	}
 }
 
