@@ -918,7 +918,7 @@ func nekiDSNWithParam(dsn, key, value string) (string, error) {
 	}
 	q := u.Query()
 	q.Set(key, value)
-	u.RawQuery = q.Encode()
+	u.RawQuery = EncodeURIQuery(q)
 	return u.String(), nil
 }
 

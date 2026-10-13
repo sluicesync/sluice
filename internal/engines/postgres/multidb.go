@@ -142,7 +142,7 @@ func withSchemaURI(dsn, schema string) (string, error) {
 	}
 	q := u.Query()
 	q.Set("schema", schema)
-	u.RawQuery = q.Encode()
+	u.RawQuery = EncodeURIQuery(q)
 	return u.String(), nil
 }
 

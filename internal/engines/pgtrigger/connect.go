@@ -50,7 +50,7 @@ func parseURIDSN(dsn string) (*pgConfig, error) {
 		schema = "public"
 	}
 	q.Del("schema")
-	u.RawQuery = q.Encode()
+	u.RawQuery = postgres.EncodeURIQuery(q)
 	return &pgConfig{dsn: u.String(), schema: schema}, nil
 }
 

@@ -2973,7 +2973,7 @@ func withReplicationParam(dsn string) (string, error) {
 		// here, the same way parseDSN strips it for the *sql.DB path.
 		q.Del("schema")
 		q.Set("replication", "database")
-		u.RawQuery = q.Encode()
+		u.RawQuery = EncodeURIQuery(q)
 		return u.String(), nil
 	}
 	// libpq KV form: same strip-schema dance, then append replication.

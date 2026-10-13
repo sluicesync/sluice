@@ -106,7 +106,7 @@ func withApplicationName(dsn string, role connRole, id string) string {
 			return dsn // operator-supplied; don't clobber
 		}
 		q.Set("application_name", appName)
-		u.RawQuery = q.Encode()
+		u.RawQuery = EncodeURIQuery(q)
 		return u.String()
 	}
 
