@@ -58,6 +58,7 @@ func TestChainRestore_KeyCollationLoosenedInsideTheWindow(t *testing.T) {
 				name := fmt.Sprintf("%s/%s/%s", metadata, key, lane)
 				create := klwKeys()[key]
 				t.Run(name, func(t *testing.T) {
+					kcCellForensics(t)
 					root.exec(t, "SET GLOBAL binlog_row_metadata = '"+metadata+"'")
 					srcDB, tgtDB := fmt.Sprintf("klw_s%d", n), fmt.Sprintf("klw_t%d", n)
 					root.exec(t, "CREATE DATABASE "+srcDB+"; CREATE DATABASE "+tgtDB)
@@ -356,6 +357,7 @@ func TestChainRestore_UnloggedRevertedKeyCollationBeforeTheWindowsFirstRow(t *te
 				window = append(window, "INSERT INTO kd VALUES (100,'zz',100)")
 			}
 			t.Run(name, func(t *testing.T) {
+				kcCellForensics(t)
 				srcDB, tgtDB := fmt.Sprintf("kub_s%d", n), fmt.Sprintf("kub_t%d", n)
 				root.exec(t, "CREATE DATABASE "+srcDB+"; CREATE DATABASE "+tgtDB)
 				srcDSN, err := buildMySQLDSN(myRoot, srcDB)

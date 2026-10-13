@@ -74,6 +74,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -229,6 +230,7 @@ func (l *ddlLookahead) scan(ctx context.Context, db *sql.DB, from, to binlogCoor
 				// unread binlog as classified — a later proof would skip a
 				// DDL in it. Re-read from here a few times, then refuse.
 				shortReads++
+				slog.DebugContext(ctx, "PHASE-A-KC2 look-ahead short read", "file", at.file, "next", next, "to", to.String(), "short_reads", shortReads, "torn", truncated) // PHASE-A-KC2 temporary
 				if shortReads > lookaheadShortReads {
 					return sluicecode.Wrap(sluicecode.CodeCDCBinlogLookaheadShort,
 						"retry; if it recurs, check that the source flushes its binlog (sync_binlog, "+

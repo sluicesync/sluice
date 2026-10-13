@@ -30,6 +30,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -37,6 +38,7 @@ import (
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/logcapture"
 	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
@@ -67,6 +69,7 @@ func krwCapture(t *testing.T, lane string, eng ir.Engine, srcDSN, slot string, s
 	if lane == "backup-stream-rollover" {
 		rollover = 4 * time.Second
 	}
+	started := time.Now()
 	runCtx, cancel := context.WithCancel(ctx)
 	done := make(chan error, 1)
 	go func() {
@@ -81,12 +84,108 @@ func krwCapture(t *testing.T, lane string, eng ir.Engine, srcDSN, slot string, s
 	for _, s := range window {
 		src.exec(t, s)
 	}
+	windowWritten := time.Since(started)
 	time.Sleep(6 * time.Second)
 	cancel()
 	if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
 		return err
 	}
+	krwRequireWindowCaptured(t, lane, store, krwRowStatements(window), windowWritten)
 	return nil
+}
+
+// krwRequireWindowCaptured fails the cell when the stream's committed
+// incrementals together hold fewer row changes than the window has row
+// statements (decoded from the chunks: an empty window still commits its
+// transaction framing): the stream exited cleanly without having captured the
+// window, so whatever the restore or broker does next grades nothing. The
+// cells would otherwise report it as the lane under test applying nothing — the CI
+// failure of 2026-10-13 (`apply = <nil>; source 1:61,100:7A7A,2:62,99:4132
+// target 1:61,2:62`, a broker cell that ran its whole 30 s and returned nil)
+// had that shape, and nothing to tell a missed window from a broker that
+// never applied a committed one.
+// The independent expected value is the window itself; the segment listing
+// in the message is what the next occurrence needs to be diagnosed.
+func krwRequireWindowCaptured(t *testing.T, lane string, store irbackup.Store, rowStatements int, windowWritten time.Duration) {
+	t.Helper()
+	recs, err := lineage.ListAllSegmentManifests(context.Background(), store)
+	if err != nil {
+		t.Fatalf("%s: list segments: %v", lane, err)
+	}
+	captured := 0
+	var listing strings.Builder
+	for _, rec := range recs {
+		m := rec.Manifest
+		rows := 0
+		if m.Kind == irbackup.BackupKindIncremental {
+			rows = krwRowChanges(t, store, rec)
+			captured += rows
+		}
+		fmt.Fprintf(&listing, "\n  %s %s parent=%s records=%d row-changes=%d deltas=%d end=%s",
+			m.Kind, m.BackupID, m.ParentBackupID, manifestChangeRecordCount(m), rows, len(m.SchemaDelta), m.EndPosition.Token)
+	}
+	if captured < rowStatements {
+		t.Fatalf("%s: the stream exited cleanly having committed %d row changes for a window of %d row statements "+
+			"(written %s after the stream started): it did not capture the window, so this cell grades nothing. Segments:%s",
+			lane, captured, rowStatements, windowWritten.Round(time.Millisecond), listing.String())
+	}
+}
+
+// krwRowChanges decodes rec's change chunks and counts its row changes.
+func krwRowChanges(t *testing.T, store irbackup.Store, rec lineage.SegmentRecord) int {
+	t.Helper()
+	n := 0
+	for _, ci := range rec.Manifest.ChangeChunks {
+		src, err := rec.Segment.Store(store).Get(context.Background(), ci.File)
+		if err != nil {
+			t.Fatalf("read chunk %s: %v", ci.File, err)
+		}
+		rd, err := blobcodec.NewChangeChunkReader(src, ci.SHA256, nil, rec.Segment.CodecOrDefault(), nil)
+		if err != nil {
+			t.Fatalf("open chunk %s: %v", ci.File, err)
+		}
+		for {
+			ch, err := rd.ReadChange()
+			if err != nil {
+				break
+			}
+			switch ch.(type) {
+			case ir.Insert, ir.Update, ir.Delete:
+				n++
+			}
+		}
+		_ = rd.Close()
+	}
+	return n
+}
+
+// krwRowStatements counts the window's INSERT/UPDATE/DELETE statements.
+func krwRowStatements(window []string) int {
+	n := 0
+	for _, s := range window {
+		u := strings.ToUpper(strings.TrimSpace(s))
+		if strings.HasPrefix(u, "INSERT") || strings.HasPrefix(u, "UPDATE") || strings.HasPrefix(u, "DELETE") {
+			n++
+		}
+	}
+	return n
+}
+
+// kcCellForensics captures every slog line of the calling cell at DEBUG and
+// writes it to the test log only if the cell fails, so a CI-only flake in
+// these cells arrives with the stream's and the broker's own account of it.
+// The cells are not parallel, so swapping the default logger is safe.
+func kcCellForensics(t *testing.T) {
+	t.Helper()
+	captured := &logcapture.Buffer{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(captured, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() {
+		slog.SetDefault(prev)
+		if t.Failed() {
+			t.Logf("slog of the failed cell:\n%s", captured.String())
+		}
+	})
 }
 
 func TestChainRestore_KeyCollationChangedAndRevertedInsideTheWindow(t *testing.T) {
@@ -123,6 +222,7 @@ func TestChainRestore_KeyCollationChangedAndRevertedInsideTheWindow(t *testing.T
 					name := fmt.Sprintf("%s/%s/%s/%s", metadata, key, variant, lane)
 					create, window := keys[key], windows[variant]
 					t.Run(name, func(t *testing.T) {
+						kcCellForensics(t)
 						root.exec(t, "SET GLOBAL binlog_row_metadata = '"+metadata+"'")
 						srcDB, tgtDB := fmt.Sprintf("krw_s%d", n), fmt.Sprintf("krw_t%d", n)
 						root.exec(t, "CREATE DATABASE "+srcDB+"; CREATE DATABASE "+tgtDB)
@@ -359,6 +459,7 @@ func TestChainRestore_KeyCollationChangedAndRevertedInsideTheWindow_Postgres16(t
 			name := fmt.Sprintf("%s/prior-row=%v", key, prior)
 			create := keys[key]
 			t.Run(name, func(t *testing.T) {
+				kcCellForensics(t)
 				srcDB, tgtDB, slot := fmt.Sprintf("krwp_s%d", n), fmt.Sprintf("krwp_t%d", n), fmt.Sprintf("krwp_slot%d", n)
 				root.exec(t, "CREATE DATABASE "+srcDB)
 				root.exec(t, "CREATE DATABASE "+tgtDB)
