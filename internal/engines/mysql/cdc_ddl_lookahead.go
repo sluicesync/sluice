@@ -189,6 +189,10 @@ func (l *ddlLookahead) scan(ctx context.Context, db *sql.DB, from, to binlogCoor
 	}
 	var files []string
 	shortReads := 0
+	// lastTear is the truncation the latest short read ended on, if it
+	// ended on one: a tear that never heals short of to is not a lagging
+	// flush, and the refusal must say so.
+	var lastTear error
 	at := start
 	for {
 		rows, err := listEvents(ctx, at.file, at.pos, lookaheadPage)
@@ -229,13 +233,13 @@ func (l *ddlLookahead) scan(ctx context.Context, db *sql.DB, from, to binlogCoor
 				// unread binlog as classified — a later proof would skip a
 				// DDL in it. Re-read from here a few times, then refuse.
 				shortReads++
+				if truncated {
+					lastTear = err
+				} else {
+					lastTear = nil
+				}
 				if shortReads > lookaheadShortReads {
-					return sluicecode.Wrap(sluicecode.CodeCDCBinlogLookaheadShort,
-						"retry; if it recurs, check that the source flushes its binlog (sync_binlog, "+
-							"binlog_group_commit_sync_delay) and serves SHOW BINLOG EVENTS up to the position it reports",
-						fmt.Errorf("mysql: cdc: look-ahead could read %s only to offset %d, short of the "+
-							"position the schema read was stamped with (%s); refusing to prove a shape over binlog "+
-							"it could not read", at.file, next, to))
+					return errLookaheadShort(at.file, next, to, lastTear)
 				}
 				l.through, at.pos = binlogCoord{at.file, next}, next
 				select {
@@ -264,6 +268,29 @@ func (l *ddlLookahead) scan(ctx context.Context, db *sql.DB, from, to binlogCoor
 		}
 		at = binlogCoord{file: nextFile, pos: 4}
 	}
+}
+
+// errLookaheadShort is the SLUICE-E-CDC-BINLOG-LOOKAHEAD-SHORT refusal: the
+// scan could read file only to offset next, short of to. When the last read
+// ended on a tear (tear != nil) the binlog may not merely lag — the server
+// failed to decode an event before the position it reported, through the
+// whole retry budget —
+// so the refusal carries the server's own error and does not point at the
+// flush settings.
+func errLookaheadShort(file string, next uint32, to binlogCoord, tear error) error {
+	what := fmt.Errorf("mysql: cdc: look-ahead could read %s only to offset %d, short of the "+
+		"position the schema read was stamped with (%s); refusing to prove a shape over binlog "+
+		"it could not read", file, next, to)
+	if tear != nil {
+		return sluicecode.Wrap(sluicecode.CodeCDCBinlogLookaheadShort,
+			"the source could not decode its own binlog before the position it reports; inspect "+
+				file+" at offset "+fmt.Sprint(next)+" on the source (mysqlbinlog) before retrying",
+			fmt.Errorf("%w; the last read ended on: %w", what, tear))
+	}
+	return sluicecode.Wrap(sluicecode.CodeCDCBinlogLookaheadShort,
+		"retry; if it recurs, check that the source flushes its binlog (sync_binlog, "+
+			"binlog_group_commit_sync_delay) and serves SHOW BINLOG EVENTS up to the position it reports",
+		what)
 }
 
 // reaching returns the DDLs in [from, to) that can reshape schema.table, in

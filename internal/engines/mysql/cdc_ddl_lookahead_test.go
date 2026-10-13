@@ -308,6 +308,11 @@ func TestDDLLookahead_TornTailRefusals(t *testing.T) {
 		if ce, ok := sluicecode.FromError(err); !ok || ce.Code != sluicecode.CodeCDCBinlogLookaheadShort {
 			t.Fatalf("a read torn short of the end that never heals must refuse with %s; got %v", sluicecode.CodeCDCBinlogLookaheadShort, err)
 		}
+		// A tear that never heals is not a lagging flush: the refusal carries
+		// the server's own decode error and does not blame sync_binlog.
+		if ce, _ := sluicecode.FromError(err); !isActiveTailTruncation(err) || strings.Contains(ce.Hint, "sync_binlog") {
+			t.Errorf("the refusal must carry the server's 1220 and not the flush hint; got %v", err)
+		}
 		if l.through.after(binlogCoord{"bin.000001", 200}) {
 			t.Errorf("marker %v covers offsets the scan never read (it read to 200)", l.through)
 		}
