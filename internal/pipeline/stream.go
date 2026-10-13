@@ -1993,29 +1993,41 @@ func (b *BackupStream) captureWindow(
 		return false, nil
 	}
 
+	// drainOnCancel is the graceful drain (the SIGTERM contract): a window
+	// that ends at a transaction boundary is flushed so the caller can
+	// commit it. One that ends INSIDE a transaction is abandoned — the pump
+	// is being torn down by the same cancel, so the commit cannot be waited
+	// for, and committing the head of the transaction is exactly the severed
+	// tail this function exists to prevent. The flush uses a fresh
+	// stopDrainTimeout-bounded ctx so a store call against the
+	// just-cancelled parent ctx doesn't short-circuit it; a flush that FAILS
+	// abandons too, because committing the earlier chunks would record an
+	// EndPosition the stored chunks never reach.
+	//
+	// Both arms that can observe a cancel take it. The cancel closes the
+	// window's ctx AND, through the same ctx, the reader's change channel,
+	// and a capture loop that wakes after both are ready picks either case.
+	// The closed-channel arm used to flush under the cancelled ctx itself:
+	// the store refused the put, the window's last chunk went unrecorded,
+	// and the stream exited 0 having committed nothing of a window it had
+	// read (the CI failure of 2026-10-13; nothing was acknowledged, so the
+	// next run re-read it — but the stop had silently not drained).
+	drainOnCancel := func() (captureOutcome, error) {
+		if !inTransaction && cb.unsealed() {
+			flushCtx, flushCancel := context.WithTimeout(context.WithoutCancel(ctx), stopDrainTimeout)
+			if fErr := cb.closeWindow(flushCtx, &out); fErr != nil {
+				out.AbandonReason = "the context was cancelled and the window's last chunk could not be stored: " + fErr.Error()
+			}
+			flushCancel()
+		}
+		return out, ctx.Err()
+	}
+
 	deadlinePassed := false
 	for {
 		select {
 		case <-ctx.Done():
-			// Graceful drain (the SIGTERM contract): a window that ends at
-			// a transaction boundary is flushed so the caller can commit
-			// it. One that ends INSIDE a transaction is abandoned — the
-			// pump is being torn down by the same cancel, so the commit
-			// cannot be waited for, and committing the head of the
-			// transaction is exactly the severed tail this function exists
-			// to prevent. The flush uses a fresh stopDrainTimeout-bounded
-			// ctx so a store call against the just-cancelled parent ctx
-			// doesn't short-circuit it; a flush that FAILS abandons too,
-			// because committing the earlier chunks would record an
-			// EndPosition the stored chunks never reach.
-			if !inTransaction && cb.unsealed() {
-				flushCtx, flushCancel := context.WithTimeout(context.WithoutCancel(ctx), stopDrainTimeout)
-				if fErr := cb.closeWindow(flushCtx, &out); fErr != nil {
-					out.AbandonReason = "the context was cancelled and the window's last chunk could not be stored: " + fErr.Error()
-				}
-				flushCancel()
-			}
-			return out, ctx.Err()
+			return drainOnCancel()
 		case <-stopCh:
 			// In-process stop signal (Bug 37 fix; v0.19.1). Closed by
 			// [notifyStreamStop]; nil it so a closed channel is observed
@@ -2068,6 +2080,12 @@ func (b *BackupStream) captureWindow(
 					if e := errReader.Err(); e != nil {
 						return out, backupCaptureReaderErr(cdc, e)
 					}
+				}
+				if ctx.Err() != nil {
+					// The pump closed because of the cancel: the same
+					// drain as the ctx.Done arm, never a flush under the
+					// cancelled ctx.
+					return drainOnCancel()
 				}
 				if inTransaction {
 					// The pump closed between a TxBegin and its TxCommit
