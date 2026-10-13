@@ -41,8 +41,36 @@ func klwKeys() map[string]string {
 	}
 }
 
-func klwWindow() []string {
-	return []string{"INSERT INTO kd VALUES (99,'A',99)", "UPDATE kd SET k = 'A2' WHERE id = 99", klwToCI, "INSERT INTO kd VALUES (100,'zz',100)"}
+// klwWindow is the window: 'A' written beside 'a' under `_bin`, moved out
+// of the way, and the key loosened. trailing adds a later row of kd, which
+// gives the window a recorded version of the table naming its database —
+// without it, the loosening is the window's last event for kd and the
+// window records no version of kd at all (Bug 306).
+func klwWindow(trailing bool) []string {
+	w := []string{"INSERT INTO kd VALUES (99,'A',99)", "UPDATE kd SET k = 'A2' WHERE id = 99", klwToCI}
+	if trailing {
+		w = append(w, "INSERT INTO kd VALUES (100,'zz',100)")
+	}
+	return w
+}
+
+// klwLanes is every lane for the trailing-row window; the no-trailing-row
+// window (Bug 306) runs the lanes that replay a delta (the drain-commit lane
+// records none, so it never reaches the shape).
+func klwLanes(trailing bool) []string {
+	if trailing {
+		return []string{"backup-stream", "backup-stream-rollover", "backup-incremental", "broker", "broker-rollover"}
+	}
+	return []string{"backup-stream-rollover", "backup-incremental", "broker-rollover"}
+}
+
+// klwHistoryNamespaces renders the target's schema-history rows for kd as
+// "[schema_name]" each — the namespace the seed and the window's rows must
+// agree on (Bug 306: the seed was written under "").
+func klwHistoryNamespaces(t *testing.T, tgt twfbDB) string {
+	t.Helper()
+	return tgt.scalar(t, "SELECT IFNULL(GROUP_CONCAT(CONCAT('[', schema_name, ']') ORDER BY anchor_position SEPARATOR ','), '') "+
+		"FROM sluice_cdc_schema_history WHERE table_name = 'kd'")
 }
 
 func TestChainRestore_KeyCollationLoosenedInsideTheWindow(t *testing.T) {
@@ -51,94 +79,102 @@ func TestChainRestore_KeyCollationLoosenedInsideTheWindow(t *testing.T) {
 	myEng, _ := engines.Get("mysql")
 	root := twfbDB{engine: "mysql", dsn: myRoot}
 	n := 0
-	for _, metadata := range []string{"MINIMAL", "FULL"} {
-		for _, key := range []string{"pk", "unique"} {
-			for _, lane := range []string{"backup-stream", "backup-stream-rollover", "backup-incremental", "broker", "broker-rollover"} {
-				n++
-				name := fmt.Sprintf("%s/%s/%s", metadata, key, lane)
-				create := klwKeys()[key]
-				t.Run(name, func(t *testing.T) {
-					root.exec(t, "SET GLOBAL binlog_row_metadata = '"+metadata+"'")
-					srcDB, tgtDB := fmt.Sprintf("klw_s%d", n), fmt.Sprintf("klw_t%d", n)
-					root.exec(t, "CREATE DATABASE "+srcDB+"; CREATE DATABASE "+tgtDB)
-					srcDSN, err := buildMySQLDSN(myRoot, srcDB)
-					if err != nil {
-						t.Fatal(err)
+	for _, trailing := range []bool{true, false} {
+		for _, metadata := range []string{"MINIMAL", "FULL"} {
+			for _, key := range []string{"pk", "unique"} {
+				for _, lane := range klwLanes(trailing) {
+					n++
+					name := fmt.Sprintf("%s/%s/%s", metadata, key, lane)
+					if !trailing {
+						name = "no row after the loosening/" + name
 					}
-					tgtDSN, err := buildMySQLDSN(myRoot, tgtDB)
-					if err != nil {
-						t.Fatal(err)
-					}
-					src, tgt := twfbDB{engine: "mysql", dsn: srcDSN}, twfbDB{engine: "mysql", dsn: tgtDSN}
-					src.exec(t, create+"; INSERT INTO kd VALUES (1,'a',1),(2,'b',2)")
-					ctx := context.Background()
-					store, err := blobcodec.NewLocalStore(t.TempDir())
-					if err != nil {
-						t.Fatal(err)
-					}
-					if err := (&backup.Backup{Source: myEng, SourceDSN: srcDSN, Store: store, SluiceVersion: "test"}).Run(ctx); err != nil {
-						t.Fatalf("full: %v", err)
-					}
-					full, err := lineage.ReadManifest(ctx, store)
-					if err != nil {
-						t.Fatal(err)
-					}
-					captureLane, broker := lane, strings.HasPrefix(lane, "broker")
-					if broker {
-						captureLane = strings.Replace(lane, "broker", "backup-stream", 1)
-						if err := (&backup.Restore{Target: myEng, TargetDSN: tgtDSN, Store: store}).Run(ctx); err != nil {
-							t.Fatalf("seed restore: %v", err)
+					create := klwKeys()[key]
+					t.Run(name, func(t *testing.T) {
+						root.exec(t, "SET GLOBAL binlog_row_metadata = '"+metadata+"'")
+						srcDB, tgtDB := fmt.Sprintf("klw_s%d", n), fmt.Sprintf("klw_t%d", n)
+						root.exec(t, "CREATE DATABASE "+srcDB+"; CREATE DATABASE "+tgtDB)
+						srcDSN, err := buildMySQLDSN(myRoot, srcDB)
+						if err != nil {
+							t.Fatal(err)
 						}
-					}
-					captureErr := krwCapture(t, captureLane, myEng, srcDSN, "", store, full.BackupID, src, klwWindow())
-					if captureErr != nil {
-						t.Logf("capture refused: %v", captureErr)
-						return
-					}
-					var applyErr error
-					if broker {
-						bctx, bcancel := context.WithTimeout(ctx, 30*time.Second)
-						applyErr = (&SyncFromBackup{
-							Target: myEng, TargetDSN: tgtDSN, Store: store,
-							ChainURL: "test://klwb", StreamID: "klwb",
-							PollInterval: time.Second, AtChainID: full.BackupID, SluiceVersion: "test",
-						}).Run(bctx)
-						bcancel()
-						if errors.Is(applyErr, context.DeadlineExceeded) || errors.Is(applyErr, context.Canceled) {
-							applyErr = nil
+						tgtDSN, err := buildMySQLDSN(myRoot, tgtDB)
+						if err != nil {
+							t.Fatal(err)
 						}
-					} else {
-						applyErr = (&backup.ChainRestore{Target: myEng, TargetDSN: tgtDSN, Store: store}).Run(ctx)
-					}
-					t.Logf("apply = %v; source %s target %s", applyErr, kcfbRender(kcfbRows(t, src)), kcfbRender(kcfbRows(t, tgt)))
-					unordered := applyErr != nil && strings.Contains(applyErr.Error(), "KEY-COLLATION-HISTORY-UNORDERED")
-					switch {
-					case lane == "backup-stream":
-						// The drain-commit records no delta (KEY-COLLATION-DRAIN-NO-DELTA),
-						// so the target key stays `_bin` and the window lands exactly.
-						if applyErr != nil {
-							t.Fatalf("apply = %v; want the window exact on the unchanged `_bin` key", applyErr)
+						src, tgt := twfbDB{engine: "mysql", dsn: srcDSN}, twfbDB{engine: "mysql", dsn: tgtDSN}
+						src.exec(t, create+"; INSERT INTO kd VALUES (1,'a',1),(2,'b',2)")
+						ctx := context.Background()
+						store, err := blobcodec.NewLocalStore(t.TempDir())
+						if err != nil {
+							t.Fatal(err)
 						}
-					case broker:
-						// The broker places no version between a window's changes, so
-						// it refuses a window that changes a key's collation.
-						if !unordered {
-							t.Fatalf("apply = %v; want KEY-COLLATION-HISTORY-UNORDERED", applyErr)
+						if err := (&backup.Backup{Source: myEng, SourceDSN: srcDSN, Store: store, SluiceVersion: "test"}).Run(ctx); err != nil {
+							t.Fatalf("full: %v", err)
 						}
-					default:
-						// The delta loosens the target first; the window-start version
-						// arms the guard for 'A', written under `_bin`.
-						if !errors.Is(applyErr, ir.ErrKeyCollationMerge) || unordered {
-							t.Fatalf("apply = %v; want the guard's KEY-COLLATION-MERGE (from the window-start version)", applyErr)
+						full, err := lineage.ReadManifest(ctx, store)
+						if err != nil {
+							t.Fatal(err)
 						}
-						// A restart re-applies the loosening ahead of the same rows,
-						// so the remedy that converges is a fresh full backup.
-						if !strings.Contains(applyErr.Error(), "take a fresh full backup") {
-							t.Fatalf("apply = %v; want the fresh-full remedy", applyErr)
+						captureLane, broker := lane, strings.HasPrefix(lane, "broker")
+						if broker {
+							captureLane = strings.Replace(lane, "broker", "backup-stream", 1)
+							if err := (&backup.Restore{Target: myEng, TargetDSN: tgtDSN, Store: store}).Run(ctx); err != nil {
+								t.Fatalf("seed restore: %v", err)
+							}
 						}
-					}
-					kcfbGrade(t, name, src, tgt, applyErr)
-				})
+						captureErr := krwCapture(t, captureLane, myEng, srcDSN, "", store, full.BackupID, src, klwWindow(trailing))
+						if captureErr != nil {
+							t.Logf("capture refused: %v", captureErr)
+							return
+						}
+						var applyErr error
+						if broker {
+							bctx, bcancel := context.WithTimeout(ctx, 30*time.Second)
+							applyErr = (&SyncFromBackup{
+								Target: myEng, TargetDSN: tgtDSN, Store: store,
+								ChainURL: "test://klwb", StreamID: "klwb",
+								PollInterval: time.Second, AtChainID: full.BackupID, SluiceVersion: "test",
+							}).Run(bctx)
+							bcancel()
+							if errors.Is(applyErr, context.DeadlineExceeded) || errors.Is(applyErr, context.Canceled) {
+								applyErr = nil
+							}
+						} else {
+							applyErr = (&backup.ChainRestore{Target: myEng, TargetDSN: tgtDSN, Store: store}).Run(ctx)
+						}
+						t.Logf("apply = %v; source %s target %s", applyErr, kcfbRender(kcfbRows(t, src)), kcfbRender(kcfbRows(t, tgt)))
+						if !broker {
+							t.Logf("target schema history for kd: %s (source database %s)", klwHistoryNamespaces(t, tgt), srcDB)
+						}
+						unordered := applyErr != nil && strings.Contains(applyErr.Error(), "KEY-COLLATION-HISTORY-UNORDERED")
+						switch {
+						case lane == "backup-stream":
+							// The drain-commit records no delta (KEY-COLLATION-DRAIN-NO-DELTA),
+							// so the target key stays `_bin` and the window lands exactly.
+							if applyErr != nil {
+								t.Fatalf("apply = %v; want the window exact on the unchanged `_bin` key", applyErr)
+							}
+						case broker:
+							// The broker places no version between a window's changes, so
+							// it refuses a window that changes a key's collation.
+							if !unordered {
+								t.Fatalf("apply = %v; want KEY-COLLATION-HISTORY-UNORDERED", applyErr)
+							}
+						default:
+							// The delta loosens the target first; the window-start version
+							// arms the guard for 'A', written under `_bin`.
+							if !errors.Is(applyErr, ir.ErrKeyCollationMerge) || unordered {
+								t.Fatalf("apply = %v; want the guard's KEY-COLLATION-MERGE (from the window-start version)", applyErr)
+							}
+							// A restart re-applies the loosening ahead of the same rows,
+							// so the remedy that converges is a fresh full backup.
+							if !strings.Contains(applyErr.Error(), "take a fresh full backup") {
+								t.Fatalf("apply = %v; want the fresh-full remedy", applyErr)
+							}
+						}
+						kcfbGrade(t, name, src, tgt, applyErr)
+					})
+				}
 			}
 		}
 	}
