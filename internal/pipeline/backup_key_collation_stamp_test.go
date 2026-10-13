@@ -206,9 +206,9 @@ func TestSchemaDeltaWritersStampKeyCollation(t *testing.T) {
 // SchemaHistory as the change stream records it: a key column whose
 // collation the stream saw change stamps the segment, including a change
 // the window reverted by its end (A → B → A: two history entries, no delta);
-// a character key column the stream recorded with NO collation (VStream)
-// stamps conservatively when the parent's shape records one; a non-key
-// column's change, an unchanged key, a column neither side records a
+// a non-key column's change, a character key column the stream recorded
+// with NO collation (VStream: not evidence — KEY-COLLATION-VSTREAM-UNSTAMPED,
+// review 2026-10-12 #3), an unchanged key, a column neither side records a
 // collation for, and a FULL manifest do not. A Postgres database-default key
 // (no name, stamped deterministic) counts as a recorded collation. The
 // independent expected value is the rule stated here, graded per cell.
@@ -237,7 +237,7 @@ func TestStampKeyCollationHistory(t *testing.T) {
 			table(my("utf8mb4_bin"), my("utf8mb4_0900_ai_ci")), table(my("utf8mb4_0900_ai_ci"), my("utf8mb4_0900_ai_ci")),
 		}, true},
 		{"postgres key ci -> database default", irbackup.BackupKindIncremental, pgBefore, []*ir.Table{table(ir.Text{Determinism: ir.CollationDeterministic}, ir.Text{})}, true},
-		{"no collation recorded for a character key (VStream): conservative", irbackup.BackupKindIncremental, before, []*ir.Table{table(ir.Varchar{Length: 20}, my("utf8mb4_0900_ai_ci"))}, true},
+		{"control: no collation recorded for a character key (VStream) is not evidence", irbackup.BackupKindIncremental, before, []*ir.Table{table(ir.Varchar{Length: 20}, my("utf8mb4_0900_ai_ci"))}, false},
 		{"control: non-key column", irbackup.BackupKindIncremental, before, []*ir.Table{table(my("utf8mb4_0900_ai_ci"), my("utf8mb4_bin"))}, false},
 		{"control: neither side records a collation", irbackup.BackupKindIncremental, bare, []*ir.Table{table(ir.Varchar{Length: 20}, ir.Varchar{Length: 20})}, false},
 		{"control: unchanged", irbackup.BackupKindIncremental, before, []*ir.Table{table(my("utf8mb4_0900_ai_ci"), my("utf8mb4_0900_ai_ci"))}, false},

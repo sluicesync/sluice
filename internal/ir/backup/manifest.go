@@ -489,8 +489,12 @@ const (
 	// manifest at its own ceiling.
 	//
 	// Proportional: stamped by [StampKeyCollationDelta] only on an
-	// incremental whose writer recorded such a delta (the caller classifies
-	// it: this package names no aspect). Every full and every other segment
+	// incremental whose writer recorded such a delta, or whose window's
+	// SchemaHistory records a key column's collation changing (a drain
+	// commit, or a change reverted by the window's end, which leaves no
+	// delta) — the caller classifies it: this package names no aspect. A
+	// history entry that records no collation (VStream) is not evidence and
+	// does not stamp. Every full and every other segment
 	// — including one whose only change is a NON-key column's collation,
 	// which every reader treats as no delta — keeps its feature-minimum
 	// version. A segment v0.159.0 wrote with such a delta is NOT restamped

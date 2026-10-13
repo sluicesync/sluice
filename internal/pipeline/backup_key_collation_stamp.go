@@ -49,14 +49,16 @@ func stampKeyCollationDeltaOnAttach(m *irbackup.Manifest) {
 // A pre-v0.159.1 binary reading such a segment has no guard (before
 // v0.159.0) or no delta to apply, and merges at exit 0 — the Bug 304 harm.
 //
-// [migcore.KeyCollationChange] decides per table. A change stream that
-// records NO collation for a character key column (VStream) cannot show the
-// change either way; the segment is stamped then too, conservatively —
-// review 2026-10-12 #2, finding 2b: otherwise a VStream segment never could
-// be. So a VStream segment whose window touched a table with a character
-// key is readable only by v0.159.1+. An entry that does not decode stamps
-// as well (an older binary that cannot be shown the change must not read
-// the segment).
+// [migcore.KeyCollationChange] decides per table, on evidence only: a
+// change stream that records NO collation for a character key column
+// (VStream) cannot show the change, so its segments are not stamped from
+// history — the named residual KEY-COLLATION-VSTREAM-UNSTAMPED. Stamping
+// them conservatively was tried and withdrawn (review 2026-10-12 #3): it
+// fired on virtually every VStream segment of a string-keyed table, cut
+// older binaries off those chains, and still missed the collation-only DDL,
+// which changes no VStream signature. An entry that does not decode stamps
+// (an older binary that cannot be shown the change must not read the
+// segment).
 //
 // What it does not change: this binary still restores a drain segment by
 // replaying the window onto the old key, and its applier guard, armed from
@@ -79,7 +81,7 @@ func stampKeyCollationHistory(m *irbackup.Manifest, before *ir.Schema) {
 			if b == nil || b.Name != h.Table || (b.Schema != "" && h.Schema != "" && b.Schema != h.Schema) {
 				continue
 			}
-			if changed, unknown := migcore.KeyCollationChange(b, after); changed || unknown {
+			if migcore.KeyCollationChange(b, after) {
 				irbackup.StampKeyCollationDelta(m, true)
 				return
 			}

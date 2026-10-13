@@ -329,16 +329,21 @@ func DeltaChangesKeyCollation(delta []*irbackup.SchemaDeltaEntry) bool {
 // reader's shape a segment's parent recorded) and after (a change stream's
 // [ir.SchemaSnapshot] from the segment's SchemaHistory). Only columns are
 // compared, never the table's identity or any other aspect: the two readers
-// spell those differently. changed: after declares a different collation
-// or character set. unknown: before records a collation for a character key
-// column and after records none (VStream carries no collation), so the
-// stream cannot show whether it changed. A column neither side records a
-// collation for (a source with no collation concept) is neither. Used to
-// stamp every CDC segment from its history (review 2026-10-12 findings 4
-// and #2-2).
-func KeyCollationChange(before, after *ir.Table) (changed, unknown bool) {
+// spell those differently. It reports a change only where after declares a
+// different collation or character set. A column after records no
+// collation for (VStream carries none; a source with no collation concept)
+// is not evidence of a change and is not reported: a stream that cannot
+// show the change cannot be stamped from it. Treating it as a change was
+// tried and withdrawn (review 2026-10-12 #3) — VStream records a history
+// entry on the first event per table per reader, not per DDL, so it stamped
+// virtually every VStream segment of a string-keyed table, made those chains
+// unreadable by older binaries, and still missed the collation-only DDL it
+// was for, which changes no VStream signature. That case is the named
+// residual KEY-COLLATION-VSTREAM-UNSTAMPED. Used to stamp every CDC segment
+// from its history (review 2026-10-12 findings 4 and #2-2).
+func KeyCollationChange(before, after *ir.Table) bool {
 	if before == nil || after == nil {
-		return false, false
+		return false
 	}
 	beforeByName := make(map[string]*ir.Column, len(before.Columns))
 	for _, c := range before.Columns {
@@ -354,16 +359,11 @@ func KeyCollationChange(before, after *ir.Table) (changed, unknown bool) {
 		if b == nil || (!isKeyColumn(before, a.Name) && !isKeyColumn(after, a.Name)) {
 			continue
 		}
-		switch {
-		case collationRecorded(a.Type):
-			if !sameCollation(b.Type, a.Type) {
-				changed = true
-			}
-		case collationRecorded(b.Type):
-			unknown = true
+		if collationRecorded(a.Type) && !sameCollation(b.Type, a.Type) {
+			return true
 		}
 	}
-	return changed, unknown
+	return false
 }
 
 // collationRecorded reports whether a change stream's column type says
