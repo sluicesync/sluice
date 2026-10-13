@@ -1144,6 +1144,7 @@ func (s *SyncFromBackupCmd) Run(g *Globals) error {
 		// + --planetscale-org + the service token); inert on the live-polling
 		// path, consulted only by the --reset-target-data cold-start restore.
 		IndexBuildFallback: s.planetScaleIndexFallback(),
+		SourceEngine:       engines.Get,
 	}
 
 	// ADR-0156 phase 2: the TTY-aware live panel for the broker's

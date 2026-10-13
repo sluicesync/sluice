@@ -140,6 +140,11 @@ type Restore struct {
 	// existed.
 	IndexBuildFallback ir.IndexBuildFallback
 
+	// SourceEngine is threaded to the chain walk ([ChainRestore.SourceEngine]):
+	// the engine registry's Get, so an incremental's schema versions replay
+	// in its recorded source engine's position order.
+	SourceEngine func(name string) (ir.Engine, bool)
+
 	// TargetTelemetry, when non-nil, is an advisory control-plane health
 	// provider (ADR-0107) the restore consults at parallelism-resolve time
 	// to clamp the AUTO bulk×table fan-out by the target's LIVE CPU/memory
@@ -413,6 +418,7 @@ func (r *Restore) newChainRestore() *ChainRestore {
 		TargetSchema:       r.TargetSchema,
 		IndexBuildFallback: r.IndexBuildFallback,
 		Progress:           r.Progress,
+		SourceEngine:       r.SourceEngine,
 	}
 }
 

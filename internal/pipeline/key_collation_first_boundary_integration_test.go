@@ -68,6 +68,10 @@ func kcfbScenarios() []kcfbScenario {
 	sentinel := "INSERT INTO kd (id,k,d) VALUES (100,'zz',100);"
 	drop := "ALTER TABLE kd DROP COLUMN d; INSERT INTO kd (id,k) VALUES (100,'zz');"
 	retype := "ALTER TABLE kd MODIFY k VARBINARY(80) NOT NULL; INSERT INTO kd (id,k,d) VALUES (100,'zz',100);"
+	// KEY-COLLATION-REVERTED-WINDOW-RESTORE: the key is changed back after
+	// 'A' moved out of the way, so the catalog never shows `_bin` again.
+	reverted := toBin + " UPDATE kd SET k = 'A2' WHERE id = 99; " +
+		"ALTER TABLE kd MODIFY k VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL;"
 	return []kcfbScenario{
 		{"pk-collation", pk, toBin, sentinel, binDDL},
 		{"uq-collation", uq, toBin, sentinel, binDDL},
@@ -76,6 +80,7 @@ func kcfbScenarios() []kcfbScenario {
 		{"pk-collation-then-drop", pk, toBin, drop, ""},
 		{"uq-collation-then-drop", uq, toBin, drop, ""},
 		{"pk-collation-then-retype", pk, toBin, retype, ""},
+		{"uq-collation-reverted", uq, reverted, sentinel, ""},
 	}
 }
 

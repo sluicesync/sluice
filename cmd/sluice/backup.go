@@ -16,6 +16,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/config"
 	"sluicesync.dev/sluice/internal/crypto"
+	"sluicesync.dev/sluice/internal/engines"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline"
 	"sluicesync.dev/sluice/internal/pipeline/backup"
@@ -2126,6 +2127,9 @@ func (r *RestoreCmd) run(g *Globals, env *envelopeRun) error {
 		TargetTelemetry: telemetryProviderOrNil(telemetryProvider),
 		// ADR-0148 / audit MED-A1: nil unless armed (see above).
 		IndexBuildFallback: indexFallback,
+		// KEY-COLLATION-REVERTED-WINDOW-RESTORE: an incremental's schema
+		// versions replay in its recorded source engine's position order.
+		SourceEngine: engines.Get,
 	}
 	// Validation is done; errors past this point classify as "failed"
 	// (not "refused") in the --format json envelope.

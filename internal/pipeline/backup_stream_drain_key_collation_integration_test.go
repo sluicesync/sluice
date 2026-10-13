@@ -134,11 +134,13 @@ func TestBackupStream_DrainCommit_StampsAKeyCollationWindow(t *testing.T) {
 // segment must be stamped FormatVersionKeyCollationDelta and carry no delta
 // (the premise, checked).
 //
-// What this does NOT cover, measured 2026-10-12 and filed: the same history
-// replayed by a run that starts AFTER the DDL records only the current shape
-// (one SchemaHistory entry, unstamped), and THIS binary's own chain restore
-// of either chain lands target row 1 as 'A' where the source holds 'a', at
-// exit 0 (KEY-COLLATION-REVERTED-WINDOW-RESTORE).
+// What this does NOT cover: the same history replayed by a run that starts
+// AFTER the DDL records only the current shape and is unstamped — and since
+// the KEY-COLLATION-REVERTED-WINDOW-RESTORE fix that run refuses at the binlog
+// reader instead, while THIS binary's chain restore of the live chain refuses
+// the merge (both pinned by
+// TestChainRestore_KeyCollationChangedAndRevertedInsideTheWindow; before the
+// fix each landed target row 1 as 'A' where the source holds 'a', exit 0).
 func TestBackupStream_KeyCollationChangedAndRevertedInsideTheWindowIsStamped(t *testing.T) {
 	_, myRoot, myCleanup := startMySQL(t)
 	defer myCleanup()

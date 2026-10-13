@@ -1,0 +1,391 @@
+//go:build integration
+
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
+// KEY-COLLATION-REVERTED-WINDOW-RESTORE: a backup window in which a key
+// column's collation changes `utf8mb4_0900_ai_ci` → `utf8mb4_bin`, a row the
+// new collation keeps apart from an existing one is written ('A' beside 'a'),
+// moved out of the way ('A2'), and the collation is changed back. The window
+// ends with the key's original shape, so it carries no schema delta, and the
+// restored target's key compares under `_ci` throughout. The row 'A' existed
+// on the source only while the key was `_bin`; replayed onto the `_ci` key it
+// meets row 1's 'a'.
+//
+// Measured before the fix (MySQL 8.0, MINIMAL and FULL, UNIQUE key): target
+// row 1 held 'A' (`1:41`) where the source holds 'a', restore exit 0 — for a
+// live `backup stream` window (chain restore pushed every SchemaHistory
+// version ahead of the rows, so the guard armed from the reverted shape) and
+// for a `backup incremental` started after the revert (the reader recorded
+// only the catalog's current shape).
+//
+// The independent expected value is the source's rows read by id:HEX(k)
+// after the window (kcfbGrade): a restore either lands them byte for byte or
+// refuses with no merged row on the target. Each cell also names WHICH door
+// must answer, so a refusal from an unrelated guard cannot pass it.
+
+package pipeline
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"testing"
+	"time"
+
+	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
+)
+
+// krwCapture runs one capture lane over window and returns its error:
+// "backup-stream" observes the window live (started before it),
+// "backup-incremental" replays it after the fact.
+func krwCapture(t *testing.T, lane string, eng ir.Engine, srcDSN, slot string, store irbackup.Store, parent string, src twfbDB, window []string) error {
+	t.Helper()
+	ctx := context.Background()
+	if lane == "backup-incremental" {
+		for _, s := range window {
+			src.exec(t, s)
+		}
+		runCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+		defer cancel()
+		return (&IncrementalBackup{
+			Source: eng, SourceDSN: srcDSN, Store: store, ParentRef: parent, SlotName: slot,
+			Window: 8 * time.Second, SluiceVersion: "test",
+		}).Run(runCtx)
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() {
+		done <- (&BackupStream{
+			Source: eng, SourceDSN: srcDSN, Store: store, ParentRef: parent, SlotName: slot,
+			RolloverWindow: 10 * time.Minute, RolloverMaxChanges: 1 << 30, RolloverMaxBytes: 1 << 40,
+			ChunkChanges: 100, SluiceVersion: "test",
+		}).Run(runCtx)
+	}()
+	// Let the stream start reading before the window, so it observes it live.
+	time.Sleep(3 * time.Second)
+	for _, s := range window {
+		src.exec(t, s)
+	}
+	time.Sleep(6 * time.Second)
+	cancel()
+	if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
+		return err
+	}
+	return nil
+}
+
+func TestChainRestore_KeyCollationChangedAndRevertedInsideTheWindow(t *testing.T) {
+	_, myRoot, myCleanup := startMySQL(t)
+	defer myCleanup()
+	myEng, _ := engines.Get("mysql")
+	root := twfbDB{engine: "mysql", dsn: myRoot}
+	keys := map[string]string{
+		"pk":     "CREATE TABLE kd (id INT NOT NULL, k VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL PRIMARY KEY, d INT)",
+		"unique": "CREATE TABLE kd (id INT NOT NULL PRIMARY KEY, k VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL UNIQUE, d INT)",
+	}
+	toBin := "ALTER TABLE kd MODIFY k VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL"
+	toCI := "ALTER TABLE kd MODIFY k VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL"
+	windows := map[string][]string{
+		// The defect: the key's `_bin` shape lives only inside the window.
+		"reverted": {toBin, "INSERT INTO kd VALUES (99,'A',99)", "UPDATE kd SET k = 'A2' WHERE id = 99", toCI, "INSERT INTO kd VALUES (100,'zz',100)"},
+		// The control the reader's hold must NOT refuse: rows written before
+		// a forward change the catalog already shows, and rows after it.
+		"forward": {"INSERT INTO kd VALUES (50,'p',50)", toBin, "INSERT INTO kd VALUES (99,'A',99)", "INSERT INTO kd VALUES (100,'zz',100)"},
+	}
+	n := 0
+	for _, metadata := range []string{"MINIMAL", "FULL"} {
+		for _, key := range []string{"pk", "unique"} {
+			for _, variant := range []string{"reverted", "forward"} {
+				for _, lane := range []string{"backup-stream", "backup-incremental"} {
+					if variant == "forward" && lane == "backup-stream" {
+						// The control grades the reader's hold, which a live
+						// window never reaches; and this harness ends a stream
+						// window by its drain-commit, which records no schema
+						// delta (KEY-COLLATION-DRAIN-NO-DELTA, pinned by
+						// TestBackupStream_DrainCommit_StampsAKeyCollationWindow).
+						continue
+					}
+					n++
+					name := fmt.Sprintf("%s/%s/%s/%s", metadata, key, variant, lane)
+					create, window := keys[key], windows[variant]
+					t.Run(name, func(t *testing.T) {
+						root.exec(t, "SET GLOBAL binlog_row_metadata = '"+metadata+"'")
+						srcDB, tgtDB := fmt.Sprintf("krw_s%d", n), fmt.Sprintf("krw_t%d", n)
+						root.exec(t, "CREATE DATABASE "+srcDB+"; CREATE DATABASE "+tgtDB)
+						srcDSN, err := buildMySQLDSN(myRoot, srcDB)
+						if err != nil {
+							t.Fatal(err)
+						}
+						tgtDSN, err := buildMySQLDSN(myRoot, tgtDB)
+						if err != nil {
+							t.Fatal(err)
+						}
+						src, tgt := twfbDB{engine: "mysql", dsn: srcDSN}, twfbDB{engine: "mysql", dsn: tgtDSN}
+						src.exec(t, create+"; INSERT INTO kd VALUES (1,'a',1),(2,'b',2)")
+						ctx := context.Background()
+						store, err := blobcodec.NewLocalStore(t.TempDir())
+						if err != nil {
+							t.Fatal(err)
+						}
+						if err := (&backup.Backup{Source: myEng, SourceDSN: srcDSN, Store: store, SluiceVersion: "test"}).Run(ctx); err != nil {
+							t.Fatalf("full: %v", err)
+						}
+						full, err := lineage.ReadManifest(ctx, store)
+						if err != nil {
+							t.Fatal(err)
+						}
+						captureErr := krwCapture(t, lane, myEng, srcDSN, "", store, full.BackupID, src, window)
+						if variant == "reverted" && lane == "backup-incremental" {
+							// The reader replays the window behind the head: the
+							// TABLE_MAP records `_bin` for rows the catalog says are
+							// `_ci`, and nothing will ever record the `_bin` shape.
+							if !errors.Is(captureErr, ir.ErrDeferredSchemaChange) {
+								t.Fatalf("capture = %v; want %v (the reader's recorded-collation hold)", captureErr, ir.ErrDeferredSchemaChange)
+							}
+							return
+						}
+						if captureErr != nil {
+							t.Fatalf("capture: %v", captureErr)
+						}
+						restoreErr := (&backup.ChainRestore{Target: myEng, TargetDSN: tgtDSN, Store: store}).Run(ctx)
+						t.Logf("restore = %v; source %s target %s", restoreErr, kcfbRender(kcfbRows(t, src)), kcfbRender(kcfbRows(t, tgt)))
+						if variant == "reverted" {
+							// The window's history holds both shapes; the `_bin` one
+							// governs 'A', and the guard must refuse it onto `_ci`.
+							if !errors.Is(restoreErr, ir.ErrKeyCollationMerge) {
+								t.Fatalf("restore = %v; want %v", restoreErr, ir.ErrKeyCollationMerge)
+							}
+						} else if restoreErr != nil {
+							t.Fatalf("restore: %v", restoreErr)
+						}
+						kcfbGrade(t, name, src, tgt, restoreErr)
+					})
+				}
+			}
+		}
+	}
+}
+
+// TestChainRestore_KeyCollationChangedAndRevertedInsideTheWindow_MySQLToPostgres
+// is the cross-engine direction: the reverted MySQL window, captured live,
+// restored onto Postgres, whose key the restore creates from the MySQL
+// `_ci` declaration. The grade is the same: byte-exact, or refused with
+// nothing merged.
+func TestChainRestore_KeyCollationChangedAndRevertedInsideTheWindow_MySQLToPostgres(t *testing.T) {
+	_, myRoot, myCleanup := startMySQL(t)
+	defer myCleanup()
+	_, pgTarget, pgCleanup := startPostgresLogical(t)
+	defer pgCleanup()
+	myEng, _ := engines.Get("mysql")
+	pgEng, _ := engines.Get("postgres")
+	for i, key := range []string{"pk", "unique"} {
+		t.Run(key, func(t *testing.T) {
+			srcDB, tgtDB := fmt.Sprintf("krwx_s%d", i), fmt.Sprintf("krwx_t%d", i)
+			twfbDB{engine: "mysql", dsn: myRoot}.exec(t, "CREATE DATABASE "+srcDB)
+			twfbDB{engine: "postgres", dsn: pgTarget}.exec(t, "CREATE DATABASE "+tgtDB)
+			srcDSN, err := buildMySQLDSN(myRoot, srcDB)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tgtDSN, err := buildPGDSN(pgTarget, tgtDB)
+			if err != nil {
+				t.Fatal(err)
+			}
+			src, tgt := twfbDB{engine: "mysql", dsn: srcDSN}, twfbDB{engine: "postgres", dsn: tgtDSN}
+			create := "CREATE TABLE kd (id INT NOT NULL PRIMARY KEY, k VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL UNIQUE, d INT)"
+			if key == "pk" {
+				create = "CREATE TABLE kd (id INT NOT NULL, k VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL PRIMARY KEY, d INT)"
+			}
+			src.exec(t, create+"; INSERT INTO kd VALUES (1,'a',1),(2,'b',2)")
+			ctx := context.Background()
+			store, err := blobcodec.NewLocalStore(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := (&backup.Backup{Source: myEng, SourceDSN: srcDSN, Store: store, SluiceVersion: "test"}).Run(ctx); err != nil {
+				t.Fatalf("full: %v", err)
+			}
+			full, err := lineage.ReadManifest(ctx, store)
+			if err != nil {
+				t.Fatal(err)
+			}
+			window := []string{
+				"ALTER TABLE kd MODIFY k VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL",
+				"INSERT INTO kd VALUES (99,'A',99)",
+				"UPDATE kd SET k = 'A2' WHERE id = 99",
+				"ALTER TABLE kd MODIFY k VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL",
+				"INSERT INTO kd VALUES (100,'zz',100)",
+			}
+			if err := krwCapture(t, "backup-stream", myEng, srcDSN, "", store, full.BackupID, src, window); err != nil {
+				t.Fatalf("capture: %v", err)
+			}
+			// SourceEngine as the CLI wires it: the versions replay in MySQL's
+			// position order onto a Postgres target.
+			restoreErr := (&backup.ChainRestore{Target: pgEng, TargetDSN: tgtDSN, Store: store, SourceEngine: engines.Get}).Run(ctx)
+			t.Logf("restore = %v; source %s target %s", restoreErr, kcfbRender(kcfbRows(t, src)), kcfbRender(kcfbRows(t, tgt)))
+			if restoreErr != nil {
+				t.Fatalf("restore: %v — the Postgres key is case-sensitive, so the window lands byte-exact", restoreErr)
+			}
+			kcfbGrade(t, "mysql-to-postgres/"+key, src, tgt, nil)
+		})
+	}
+}
+
+// TestSyncFromBackup_KeyCollationChangedAndRevertedInsideTheWindow is the
+// broker sibling: the reverted window captured live by `backup stream`,
+// replayed by `sync from-backup` onto a target restored from the full.
+// Measured before the fix: target row 1 held 'A' (`1:41`), broker exit 0 —
+// its change stream carries no schema version, so its applier's
+// key-collation guard was never armed. It must now refuse the window
+// (KEY-COLLATION-HISTORY-UNORDERED) before applying any of it.
+func TestSyncFromBackup_KeyCollationChangedAndRevertedInsideTheWindow(t *testing.T) {
+	_, myRoot, myCleanup := startMySQL(t)
+	defer myCleanup()
+	myEng, _ := engines.Get("mysql")
+	root := twfbDB{engine: "mysql", dsn: myRoot}
+	root.exec(t, "CREATE DATABASE krwb_s; CREATE DATABASE krwb_t")
+	srcDSN, err := buildMySQLDSN(myRoot, "krwb_s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tgtDSN, err := buildMySQLDSN(myRoot, "krwb_t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src, tgt := twfbDB{engine: "mysql", dsn: srcDSN}, twfbDB{engine: "mysql", dsn: tgtDSN}
+	src.exec(t, "CREATE TABLE kd (id INT NOT NULL PRIMARY KEY, k VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL UNIQUE, d INT); "+
+		"INSERT INTO kd VALUES (1,'a',1),(2,'b',2)")
+	ctx := context.Background()
+	store, err := blobcodec.NewLocalStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := (&backup.Backup{Source: myEng, SourceDSN: srcDSN, Store: store, SluiceVersion: "test"}).Run(ctx); err != nil {
+		t.Fatalf("full: %v", err)
+	}
+	full, err := lineage.ReadManifest(ctx, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := (&backup.Restore{Target: myEng, TargetDSN: tgtDSN, Store: store}).Run(ctx); err != nil {
+		t.Fatalf("seed restore: %v", err)
+	}
+	window := []string{
+		"ALTER TABLE kd MODIFY k VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL",
+		"INSERT INTO kd VALUES (99,'A',99)",
+		"UPDATE kd SET k = 'A2' WHERE id = 99",
+		"ALTER TABLE kd MODIFY k VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL",
+		"INSERT INTO kd VALUES (100,'zz',100)",
+	}
+	if err := krwCapture(t, "backup-stream", myEng, srcDSN, "", store, full.BackupID, src, window); err != nil {
+		t.Fatalf("capture: %v", err)
+	}
+	bctx, bcancel := context.WithTimeout(ctx, 30*time.Second)
+	defer bcancel()
+	brokerErr := (&SyncFromBackup{
+		Target: myEng, TargetDSN: tgtDSN, Store: store,
+		ChainURL: "test://krwb", StreamID: "krwb",
+		PollInterval: time.Second, AtChainID: full.BackupID, SluiceVersion: "test",
+	}).Run(bctx)
+	if errors.Is(brokerErr, context.DeadlineExceeded) || errors.Is(brokerErr, context.Canceled) {
+		brokerErr = nil
+	}
+	t.Logf("broker = %v; source %s target %s", brokerErr, kcfbRender(kcfbRows(t, src)), kcfbRender(kcfbRows(t, tgt)))
+	if !errors.Is(brokerErr, ir.ErrKeyCollationMerge) {
+		t.Fatalf("broker = %v; want %v (its replay carries no schema version, so the window must be refused)", brokerErr, ir.ErrKeyCollationMerge)
+	}
+	kcfbGrade(t, "broker", src, tgt, brokerErr)
+}
+
+// TestChainRestore_KeyCollationChangedAndRevertedInsideTheWindow_Postgres16
+// is the Postgres-source sibling: a nondeterministic ICU key ("ci") moved to
+// "C" and back, observed live by `backup stream`, restored onto Postgres.
+// Two arms: the window's first touch of the table is the key change itself,
+// or a row precedes it (so the window's first Relation is the "ci" shape).
+// Every cell must refuse with nothing merged: a primary key on k through the
+// applier's guard, a unique key through the target's own unique index (the
+// Postgres applier upserts on the primary key only). A SIBLING pin, not a
+// gate on the history ordering: mutation-run 2026-10-12, these cells refuse
+// with the versions prepended as before too (Postgres anchors every version
+// at LSN 0/0, so no order exists to restore).
+//
+// NOT pinned here, because it does not hold: the same window REPLAYED by a
+// `backup incremental` started after the revert. pgoutput's Relation carries
+// no collation and the reader reads it from the catalog as of now
+// (projectCollation's FALSE PREMISE note, KEY-COLLATION review F-D), so the
+// window records only "ci" and, with a primary key on k, the restore lands
+// 'A' over 'a' and the replayed UPDATE moves it — target row 1 gone, exit 0
+// (measured 2026-10-12, postgres:16). That residual is filed, not fixed.
+func TestChainRestore_KeyCollationChangedAndRevertedInsideTheWindow_Postgres16(t *testing.T) {
+	rootDSN, _, cleanup := startPostgresLogicalImage(t, pgPrebakedImage, 40)
+	defer cleanup()
+	pgEng, _ := engines.Get("postgres")
+	root := twfbDB{engine: "postgres", dsn: rootDSN}
+	keys := map[string]string{
+		"pk":     "CREATE TABLE kd (id int NOT NULL, k text COLLATE ci NOT NULL PRIMARY KEY, d int)",
+		"unique": "CREATE TABLE kd (id int PRIMARY KEY, k text COLLATE ci NOT NULL UNIQUE, d int)",
+	}
+	n := 0
+	for _, key := range []string{"pk", "unique"} {
+		for _, prior := range []bool{false, true} {
+			n++
+			name := fmt.Sprintf("%s/prior-row=%v", key, prior)
+			create := keys[key]
+			t.Run(name, func(t *testing.T) {
+				srcDB, tgtDB, slot := fmt.Sprintf("krwp_s%d", n), fmt.Sprintf("krwp_t%d", n), fmt.Sprintf("krwp_slot%d", n)
+				root.exec(t, "CREATE DATABASE "+srcDB)
+				root.exec(t, "CREATE DATABASE "+tgtDB)
+				srcDSN, err := buildPGDSN(rootDSN, srcDB)
+				if err != nil {
+					t.Fatal(err)
+				}
+				tgtDSN, err := buildPGDSN(rootDSN, tgtDB)
+				if err != nil {
+					t.Fatal(err)
+				}
+				src, tgt := twfbDB{engine: "postgres", dsn: srcDSN}, twfbDB{engine: "postgres", dsn: tgtDSN}
+				for _, db := range []twfbDB{src, tgt} {
+					db.exec(t, "CREATE COLLATION ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false)")
+				}
+				src.exec(t, create+"; INSERT INTO kd VALUES (1,'a',1),(2,'b',2)")
+				window := []string{
+					`ALTER TABLE kd ALTER COLUMN k TYPE text COLLATE "C"`,
+					"INSERT INTO kd VALUES (99,'A',99)",
+					"UPDATE kd SET k = 'A2' WHERE id = 99",
+					"ALTER TABLE kd ALTER COLUMN k TYPE text COLLATE ci",
+					"INSERT INTO kd VALUES (100,'zz',100)",
+				}
+				if prior {
+					window = append([]string{"INSERT INTO kd VALUES (50,'p',50)"}, window...)
+				}
+				ctx := context.Background()
+				store, err := blobcodec.NewLocalStore(t.TempDir())
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := (&backup.Backup{Source: pgEng, SourceDSN: srcDSN, Store: store, SluiceVersion: "test", SlotName: slot, ChainSlot: true}).Run(ctx); err != nil {
+					t.Fatalf("full: %v", err)
+				}
+				full, err := lineage.ReadManifest(ctx, store)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := krwCapture(t, "backup-stream", pgEng, srcDSN, slot, store, full.BackupID, src, window); err != nil {
+					t.Fatalf("capture: %v", err)
+				}
+				restoreErr := (&backup.ChainRestore{Target: pgEng, TargetDSN: tgtDSN, Store: store}).Run(ctx)
+				t.Logf("restore = %v; source %s target %s", restoreErr, kcfbRender(kcfbRows(t, src)), kcfbRender(kcfbRows(t, tgt)))
+				if restoreErr == nil {
+					t.Fatal("restore succeeded; want a refusal — 'A' was written under \"C\" and the target key is ci")
+				}
+				kcfbGrade(t, name, src, tgt, restoreErr)
+			})
+		}
+	}
+}

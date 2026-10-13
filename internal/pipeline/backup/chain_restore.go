@@ -155,6 +155,15 @@ type ChainRestore struct {
 	// leaves the direct index build byte-identical.
 	IndexBuildFallback ir.IndexBuildFallback
 
+	// SourceEngine resolves the chain's recorded source engine by name, for
+	// the position order an incremental's schema versions are replayed in
+	// (KEY-COLLATION-REVERTED-WINDOW-RESTORE, [historyReplay]); cmd/sluice
+	// passes the engine registry's Get. nil: a Target of the same name stands
+	// in, and for any other source the versions are released ahead of the
+	// window's changes, refusing a window whose versions disagree on a key
+	// column's collation.
+	SourceEngine func(name string) (ir.Engine, bool)
+
 	// chainCEK caches the chain-level CEK after the full's preflight.
 	// Reused for every change-chunk decrypt across the incremental
 	// walk so Argon2id (passphrase mode) runs once per chain restore.
@@ -1396,9 +1405,12 @@ func (r *ChainRestore) applySchemaDeltas(ctx context.Context, link *lineage.Segm
 // streamIncrementalChanges opens each change chunk in turn and
 // pushes events onto out, verifying SHA-256 along the way.
 //
-// ADR-0049 Chunk D: prepends the manifest's SchemaHistory entries as
-// [ir.SchemaSnapshot] events on the channel before the row events.
-// The applier processes them through its normal dispatch path (engine
+// ADR-0049 Chunk D: the manifest's SchemaHistory entries ride the channel
+// as [ir.SchemaSnapshot] events, each released ahead of the first change
+// recorded at or after its anchor ([historyReplay];
+// KEY-COLLATION-REVERTED-WINDOW-RESTORE — they used to be prepended, which
+// armed the key-collation guard from the window's last version for every
+// row). The applier processes them through its normal dispatch path (engine
 // SchemaSnapshot case → writeSchemaVersion in the SAME target tx as
 // the ADR-0007 position write, locked decision #4a), seeding the
 // target's sluice_cdc_schema_history table under [ChainRestoreStreamID].
@@ -1415,8 +1427,14 @@ func (r *ChainRestore) streamIncrementalChanges(
 	link *lineage.SegmentRecord,
 	out chan<- ir.Change,
 ) error {
-	if err := r.streamSchemaHistorySnapshots(ctx, link, out); err != nil {
+	snaps, err := decodeSchemaHistory(link)
+	if err != nil {
 		return fmt.Errorf("apply schema history: %w", err)
+	}
+	history, err := newHistoryReplay(lineage.ManifestBackupID(link.Manifest), link.Manifest.SourceEngine,
+		r.positionOrdererFor(link.Manifest.SourceEngine), link.Manifest.Schema, snaps)
+	if err != nil {
+		return err
 	}
 	segStore := link.Segment.Store(r.Store)
 	codec := link.Segment.CodecOrDefault()
@@ -1473,13 +1491,20 @@ func (r *ChainRestore) streamIncrementalChanges(
 	// stream the applier sees still ends where the chunks do.
 	var runs migcore.EmptyTxRuns
 	emit := migcore.ChannelEmit(ctx, out)
+	// A schema version goes through the empty-transaction runs like any
+	// change outside a transaction, so a held empty pair recorded before it
+	// is released before it.
+	pushVersion := func(c ir.Change) error { return runs.Push(c, emit) }
+	if err := history.start(pushVersion); err != nil {
+		return fmt.Errorf("apply schema history: %w", err)
+	}
 	for f := range fetchCh {
 		if f.err != nil {
 			// A SHA-256 mismatch (tampered/corrupt stored bytes) surfaces here
 			// before decryption → coded SLUICE-E-BACKUP-CHUNK-CORRUPT.
 			return lineage.CodeChunkHashError(fmt.Errorf("chunk %d (%s): open chunk: %w", f.idx, f.chunk.File, f.err))
 		}
-		if err := r.streamOneChangeChunk(link, codec, f.idx, f.chunk, f.src, &runs, emit, &lastApplied, skipped); err != nil {
+		if err := r.streamOneChangeChunk(link, codec, f.idx, f.chunk, f.src, history, &runs, emit, &lastApplied, skipped); err != nil {
 			return fmt.Errorf("chunk %d (%s): %w", f.idx, f.chunk.File, err)
 		}
 		slog.DebugContext(
@@ -1488,6 +1513,11 @@ func (r *ChainRestore) streamIncrementalChanges(
 			slog.Int("chunk", f.idx),
 			slog.Int64("changes", f.chunk.RowCount),
 		)
+	}
+	// A version anchored after the window's last change still reaches the
+	// target's schema history, so a resume at the chain's end finds it.
+	if err := history.releaseAll(pushVersion); err != nil {
+		return fmt.Errorf("apply schema history: %w", err)
 	}
 	if err := runs.Flush(emit); err != nil {
 		return err
@@ -1564,55 +1594,41 @@ func (r *ChainRestore) streamIncrementalChanges(
 	return nil
 }
 
-// streamSchemaHistorySnapshots converts each SchemaHistoryEntry on
-// link.Manifest.SchemaHistory into a synthetic [ir.SchemaSnapshot] and
-// pushes it onto out. The applier's SchemaSnapshot dispatch persists
-// the version into sluice_cdc_schema_history (locked decision #4a:
-// same target tx as the position write — engine-side handled).
+// decodeSchemaHistory converts each SchemaHistoryEntry on
+// link.Manifest.SchemaHistory into a synthetic [ir.SchemaSnapshot], in
+// recorded order. [historyReplay] releases each into the change stream at
+// the position it was recorded at; the applier's SchemaSnapshot dispatch
+// persists the version into sluice_cdc_schema_history (locked decision #4a:
+// same target tx as the position write — engine-side handled) and makes it
+// the active schema the rows after it are guarded under.
 //
 // A nil-table entry is loud (not silently skipped): a corrupt manifest
 // would otherwise silently degrade future resume across the boundary
 // (the exact silent-mis-decode class ADR-0049 exists to kill). This
 // composes with the engine applier's own nil-IR guard.
-func (r *ChainRestore) streamSchemaHistorySnapshots(
-	ctx context.Context,
-	link *lineage.SegmentRecord,
-	out chan<- ir.Change,
-) error {
-	if len(link.Manifest.SchemaHistory) == 0 {
-		return nil
-	}
+func decodeSchemaHistory(link *lineage.SegmentRecord) ([]ir.SchemaSnapshot, error) {
+	snaps := make([]ir.SchemaSnapshot, 0, len(link.Manifest.SchemaHistory))
 	for i, entry := range link.Manifest.SchemaHistory {
 		if entry == nil {
-			return fmt.Errorf("schema-history entry %d: nil", i)
+			return nil, fmt.Errorf("schema-history entry %d: nil", i)
 		}
 		tbl, err := ir.UnmarshalTable(entry.TableJSON)
 		if err != nil {
-			return fmt.Errorf("schema-history entry %d (%s.%s): decode table: %w",
+			return nil, fmt.Errorf("schema-history entry %d (%s.%s): decode table: %w",
 				i, entry.Schema, entry.Table, err)
 		}
 		if tbl == nil {
-			return fmt.Errorf("schema-history entry %d (%s.%s) at %+v decoded to a nil table — corrupt manifest",
+			return nil, fmt.Errorf("schema-history entry %d (%s.%s) at %+v decoded to a nil table — corrupt manifest",
 				i, entry.Schema, entry.Table, entry.AnchorPosition)
 		}
-		snap := ir.SchemaSnapshot{
+		snaps = append(snaps, ir.SchemaSnapshot{
 			Position: entry.AnchorPosition,
 			Schema:   entry.Schema,
 			Table:    entry.Table,
 			IR:       tbl,
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case out <- snap:
-		}
+		})
 	}
-	slog.DebugContext(
-		ctx, "chain restore: schema-history replayed",
-		slog.String("backup_id", lineage.ManifestBackupID(link.Manifest)),
-		slog.Int("entries", len(link.Manifest.SchemaHistory)),
-	)
-	return nil
+	return snaps, nil
 }
 
 // streamOneChangeChunk decodes chunk's events from src — the
@@ -1627,6 +1643,7 @@ func (r *ChainRestore) streamOneChangeChunk(
 	chunkIdx int,
 	chunk *irbackup.ChunkInfo,
 	src io.ReadCloser,
+	history *historyReplay,
 	runs *migcore.EmptyTxRuns,
 	emit func(ir.Change) error,
 	lastApplied *ir.Position,
@@ -1675,6 +1692,14 @@ func (r *ChainRestore) streamOneChangeChunk(
 		// SLUICE-E-BACKUP-INCOMPLETE).
 		if p := change.Pos(); p.Engine != "" || p.Token != "" {
 			*lastApplied = p
+		}
+		// KEY-COLLATION-REVERTED-WINDOW-RESTORE: each schema version reaches
+		// the applier ahead of the first change recorded under it — before
+		// the table filter, which keeps transaction framing and positions
+		// for every table (chain_restore_history_order.go).
+		if err := history.before(change, func(c ir.Change) error { return runs.Push(c, emit) }); err != nil {
+			_ = cr.Close()
+			return fmt.Errorf("apply schema history: %w", err)
 		}
 		// Bug 244: honour the restore's table filter, the door the base
 		// full's restore already honours. Without this, an excluded table's

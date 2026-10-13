@@ -252,6 +252,11 @@ type SyncFromBackup struct {
 	// telemetry surface, so there is no shared-org reconciliation to do here.
 	IndexBuildFallback ir.IndexBuildFallback
 
+	// SourceEngine is threaded to the --reset-target-data cold start's chain
+	// restore ([backup.ChainRestore.SourceEngine]). The live replay does not
+	// use it: it places no schema version between a window's changes.
+	SourceEngine func(name string) (ir.Engine, bool)
+
 	// chainCEK caches the unwrapped per-chain CEK across ticks so
 	// Argon2id (passphrase mode) runs once per broker process.
 	chainCEK []byte
@@ -1001,6 +1006,7 @@ func (b *SyncFromBackup) newColdStartChainRestore() *backup.ChainRestore {
 		// audit MED-A1 gap #12: the segment-0 full's deferred index build on a
 		// PlanetScale target routes a walled failure through the deploy request.
 		IndexBuildFallback: b.IndexBuildFallback,
+		SourceEngine:       b.SourceEngine,
 	}
 }
 
@@ -1503,6 +1509,14 @@ func (b *SyncFromBackup) applyIncremental(
 
 	// GC-37 (j): see [ChainRestore.applyIncremental] — the same WARN.
 	migcore.WarnLegacyCharsetIncrement(ctx, "sync from-backup", link.Manifest)
+	// KEY-COLLATION-REVERTED-WINDOW-RESTORE: this replay carries the source's
+	// events only — no schema version reaches the applier between them — so a
+	// window whose versions disagree on a key collation cannot be guarded per
+	// row. Refused before anything of it is applied, delta included.
+	if err := backup.RefuseUnreplayableKeyCollationHistory(link,
+		"sync from-backup replays no schema version between a window's changes"); err != nil {
+		return 0, err
+	}
 	// 1. Schema deltas first. Re-applied on a resume inside the incremental
 	//    (ADR-0191 §4 C7): their idempotency is the claim this step always
 	//    made for a re-applied incremental.
