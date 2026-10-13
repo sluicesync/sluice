@@ -54,6 +54,17 @@ other eighteen.
 
 ---
 
+## 2026-10-13 — Bugs 306, 307 and 308 (the v0.159.2 regression cycle): fixed, with what they leave open
+
+Indexed when filed. The three cycle bugs (numbered in the BUG-CATALOG) and the findings made while fixing them (no audit pass).
+
+- KEY-COLLATION-VERSION-NAMESPACE filed
+- KEY-COLLATION-WINDOW-START-OUTLIVES-WINDOW filed
+- KEY-COLLATION-WINDOW-END-ANCHOR filed
+- KEY-COLLATION-PRE0159-2-UNDETECTABLE filed
+- KEY-COLLATION-RESTORE-REMEDY filed
+- KEY-COLLATION-NONWINDOW-RESTORE-REMEDY filed
+
 ## 2026-10-12 — second value-fidelity review of the v0.159.1 candidate (b0360550..46d49733): four fixed, one HIGH found while pinning
 
 Indexed when filed. The second pre-tag review's findings, what they leave open, and the HIGH measured while pinning finding 2; the fixed ones are struck in the backlog section.
