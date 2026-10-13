@@ -184,9 +184,9 @@ func RefuseUnreplayableKeyCollationHistory(link *lineage.SegmentRecord, why stri
 }
 
 // refuseKeyCollationHistory refuses when two versions of one table in snaps
-// disagree on a key column's collation ([migcore.KeyCollationChange], either
-// way — a version recording no collation for a key the other names counts).
-// keys is the segment's recorded schema: a change stream's version carries
+// disagree on a key column's collation ([migcore.KeyCollationChange]: a
+// version that records no collation, as VStream's do, is no evidence either
+// way — KEY-COLLATION-VSTREAM-UNSTAMPED). keys is the segment's recorded schema: a change stream's version carries
 // the primary key at most (the MySQL binlog reader's knows no UNIQUE index),
 // so the recorded schema's unique indexes say which other columns are keys.
 func refuseKeyCollationHistory(backupID, why string, keys *ir.Schema, snaps []ir.SchemaSnapshot) error {
@@ -199,8 +199,7 @@ func refuseKeyCollationHistory(backupID, why string, keys *ir.Schema, snaps []ir
 			first[qn] = cur
 			continue
 		}
-		changed, unknown := migcore.KeyCollationChange(prev, cur)
-		if !changed && !unknown {
+		if !migcore.KeyCollationChange(prev, cur) {
 			continue
 		}
 		return fmt.Errorf("%w: %s: incremental %s records more than one key collation for %s, and %s, so which rows "+
