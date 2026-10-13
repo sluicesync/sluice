@@ -31,10 +31,34 @@ var ErrKeyCollationMerge = errors.New("KEY-COLLATION-MERGE")
 type KeyCollationMergeError struct {
 	Schema, Table string
 	// Remedy is the engine's own advice (the DDL that gives the target key
-	// the source's collation).
+	// the source's collation), written for the commands that resume a
+	// stream: `sync start` and `sync from-backup run`. A command that
+	// recovers another way replaces it ([WithKeyCollationMergeRemedy]).
 	Remedy string
+	// Needs names what the target's key column(s) must be declared with for
+	// the guard's comparison to be the key's own, as the engine names it
+	// ("`k` CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"); empty when the
+	// engine cannot name it.
+	Needs string
 	// Cause is the server error the guard raised.
 	Cause error
+}
+
+// WithKeyCollationMergeRemedy is the [KeyCollationMergeError] err carries,
+// with its remedy replaced by remedy(e) — for a command whose recovery is
+// not the engine's (Bug 308: `restore` neither resumes nor accepts
+// --restart-from-scratch, so the engine's "ALTER the key and restart, or
+// re-copy with --restart-from-scratch" cannot run there). The wrapping
+// between the engine and the caller is dropped; the error's own text names
+// the table. An err carrying none is returned as is.
+func WithKeyCollationMergeRemedy(err error, remedy func(e *KeyCollationMergeError) string) error {
+	var e *KeyCollationMergeError
+	if !errors.As(err, &e) {
+		return err
+	}
+	cp := *e
+	cp.Remedy = remedy(e)
+	return &cp
 }
 
 func (e *KeyCollationMergeError) Error() string {

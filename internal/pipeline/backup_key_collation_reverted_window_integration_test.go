@@ -170,6 +170,7 @@ func TestChainRestore_KeyCollationChangedAndRevertedInsideTheWindow(t *testing.T
 							if !errors.Is(restoreErr, ir.ErrKeyCollationMerge) || strings.Contains(restoreErr.Error(), "KEY-COLLATION-HISTORY-UNORDERED") {
 								t.Fatalf("restore = %v; want the guard's %v", restoreErr, ir.ErrKeyCollationMerge)
 							}
+							klwAssertRestoreRemedy(t, restoreErr)
 						} else if restoreErr != nil {
 							t.Fatalf("restore: %v", restoreErr)
 						}

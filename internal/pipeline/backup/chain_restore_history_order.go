@@ -71,6 +71,37 @@ import (
 // keyCollationHistoryUnorderedMarker names the refusal.
 const keyCollationHistoryUnorderedMarker = "KEY-COLLATION-HISTORY-UNORDERED"
 
+// # A version names its table the way the window's changes do (Bug 306)
+//
+// The applier keys the shape it arms the key-collation guard from by the
+// namespace and table a version names, and looks it up under the namespace
+// the row names. A MySQL full manifest records its tables with NO namespace
+// (a single-database read is flat: "the database the stream is bound to"),
+// while every change the binlog reader records names that database. A
+// window-start version built from such a manifest therefore landed under
+// `kd` while the window's rows looked up `<db>.kd`: the lookup missed, the
+// guard never armed, and 'A' merged into 'a' at exit 0 — whenever the
+// window recorded no version of the table to borrow the name from, which is
+// exactly a window whose last event for the table is the loosening ALTER
+// (measured on MySQL 8.4, both capture lanes, MINIMAL and FULL, PRIMARY and
+// UNIQUE key; the target's schema history held the seed under '').
+//
+// So a version that names no namespace takes the one the window's changes
+// name, learned from the window's first table-scoped change
+// ([historyReplay.admit]). When such a version is due at a boundary before
+// that change has been seen, the boundary and what follows it are held —
+// until the transaction's first row (which names the namespace) or its
+// commit (an empty transaction: nothing in it for a version to govern, so it
+// passes and the versions wait for the next boundary). A flat manifest is a
+// single-namespace stream, so any table's row names it; that premise is
+// CHECKED, not assumed: a later change of a table whose version took the
+// namespace, naming another, refuses (KEY-COLLATION-VERSION-NAMESPACE)
+// rather than let the lookup miss again.
+
+// keyCollationVersionNamespaceMarker names the refusal raised when a change
+// names a namespace other than the one a namespace-less version took.
+const keyCollationVersionNamespaceMarker = "KEY-COLLATION-VERSION-NAMESPACE"
+
 // historyReplay releases a window's recorded schema versions into its
 // replayed change stream. Producer goroutine only.
 type historyReplay struct {
@@ -79,6 +110,24 @@ type historyReplay struct {
 	orderer  ir.PositionOrderer // nil: unorderable, everything released up front
 	keys     *ir.Schema         // the segment's recorded schema, for its unique keys
 	inTx     bool
+
+	// namespace is the one the window's changes name, once learned
+	// (namespaceKnown); bound holds the tables whose namespace-less version
+	// took it, for the check that a later change of them names the same.
+	namespace      string
+	namespaceKnown bool
+	bound          map[string]bool
+
+	// held is non-nil while changes wait for the namespace a due version
+	// needs (held[0], when present, is the boundary it is due at);
+	// startHeld marks the versions [historyReplay.start] would release
+	// ahead of every change as part of what waits.
+	held      []ir.Change
+	startHeld bool
+
+	// windowEnd are the versions released after everything else
+	// ([historyReplay.finish]).
+	windowEnd []ir.SchemaSnapshot
 }
 
 // positionOrdererFor is the position orderer of the engine a chain was
@@ -115,8 +164,23 @@ func newHistoryReplay(backupID, sourceEngine string, orderer ir.PositionOrderer,
 
 // start releases what precedes every change: with no orderer, everything;
 // with one, a version recorded with no position (nothing to order it by,
-// so it keeps its old place ahead of the window).
+// so it keeps its old place ahead of the window). When one of them names
+// no namespace, they wait for the window's first table-scoped change
+// instead ([historyReplay.admit]).
 func (h *historyReplay) start(push func(ir.Change) error) error {
+	wait, err := h.dueNeedsNamespace(nil)
+	if err != nil {
+		return err
+	}
+	if wait {
+		h.held, h.startHeld = []ir.Change{}, true
+		return nil
+	}
+	return h.releaseStart(push)
+}
+
+// releaseStart is [historyReplay.start]'s release.
+func (h *historyReplay) releaseStart(push func(ir.Change) error) error {
 	if h.orderer == nil {
 		return h.releaseAll(push)
 	}
@@ -142,27 +206,23 @@ func (h *historyReplay) start(push func(ir.Change) error) error {
 // the window is unorderable there, and if the two disagree on a key
 // collation it refuses.
 func (h *historyReplay) before(c ir.Change, push func(ir.Change) error) error {
-	boundary := !h.inTx
-	switch c.(type) {
-	case ir.TxBegin:
-		h.inTx = true
-	case ir.TxCommit:
-		h.inTx = false
-		boundary = false
-	}
-	if !boundary || h.orderer == nil || len(h.pending) == 0 {
+	if !h.track(c) || h.orderer == nil || len(h.pending) == 0 {
 		return nil
 	}
 	pos := c.Pos()
 	if pos.Token == "" {
 		return nil
 	}
-	// stranded holds, per table, the versions left pending so far in this
-	// pass — each recorded BEFORE any later version of the table this pass
-	// releases. UNVERIFIED PREMISE: that the manifest lists a table's
-	// versions in position order, so "earlier in pending" means "earlier in
-	// the stream" (KEY-COLLATION-STRANDED-VERSION-ORDER).
-	stranded := map[string][]int{}
+	// stranded holds the versions left pending so far in this pass — each
+	// recorded BEFORE any later version of the same table this pass
+	// releases. "The same table" is [sameVersionTable]'s: a version naming
+	// no namespace is the table of that name in any (Bug 306 — keyed by the
+	// literal namespace, a window-start version naming none was never
+	// compared with the window's own versions naming the database).
+	// UNVERIFIED PREMISE: that the manifest lists a table's versions in
+	// position order, so "earlier in pending" means "earlier in the stream"
+	// (KEY-COLLATION-STRANDED-VERSION-ORDER).
+	var stranded []int
 	drop := map[int]bool{}
 	var kept []int
 	for i, s := range h.pending {
@@ -171,13 +231,17 @@ func (h *historyReplay) before(c ir.Change, push func(ir.Change) error) error {
 			return fmt.Errorf("order schema-history version %s.%s at %s against change at %s: %w",
 				s.Schema, s.Table, s.Position.Token, pos.Token, err)
 		}
-		qn := s.Schema + "." + s.Table
 		if !at {
-			stranded[qn] = append(stranded[qn], i)
+			stranded = append(stranded, i)
 			kept = append(kept, i)
 			continue
 		}
-		for _, j := range stranded[qn] {
+		still := stranded[:0:0]
+		for _, j := range stranded {
+			if !sameVersionTable(h.pending[j], s) {
+				still = append(still, j)
+				continue
+			}
 			earlier := h.pending[j]
 			why := fmt.Sprintf("its schema version at %s was not placed before the change at %s although a later version of the table was",
 				earlier.Position.Token, pos.Token)
@@ -190,7 +254,7 @@ func (h *historyReplay) before(c ir.Change, push func(ir.Change) error) error {
 			// d6ecb939, finding 6). It is dropped.
 			drop[j] = true
 		}
-		delete(stranded, qn)
+		stranded = still
 		if err := push(s); err != nil {
 			return err
 		}
@@ -203,6 +267,218 @@ func (h *historyReplay) before(c ir.Change, push func(ir.Change) error) error {
 	}
 	h.pending = next
 	return nil
+}
+
+// track records c's effect on the transaction state and reports whether c
+// is a boundary: it opens a transaction or stands outside one.
+func (h *historyReplay) track(c ir.Change) bool {
+	boundary := h.isBoundary(c)
+	switch c.(type) {
+	case ir.TxBegin:
+		h.inTx = true
+	case ir.TxCommit:
+		h.inTx = false
+	}
+	return boundary
+}
+
+// isBoundary is [historyReplay.track]'s answer, without recording c.
+func (h *historyReplay) isBoundary(c ir.Change) bool {
+	if _, ok := c.(ir.TxCommit); ok {
+		return false
+	}
+	return !h.inTx
+}
+
+// admit hands c on — deliver, after [historyReplay.before] has released what
+// is due ahead of it — unless a version naming no namespace is due and the
+// window's namespace is not known yet: then c waits, with what follows it,
+// until a table-scoped change names the namespace (the versions take it, and
+// everything held goes on in order) or the transaction commits empty (it
+// goes on, and the versions stay due). See "A version names its table the
+// way the window's changes do".
+func (h *historyReplay) admit(c ir.Change, push, deliver func(ir.Change) error) error {
+	if h.held == nil {
+		wait, err := h.dueNeedsNamespace(c)
+		if err != nil {
+			return err
+		}
+		if !wait {
+			return h.pass(c, push, deliver, true)
+		}
+		h.held = []ir.Change{}
+	}
+	h.held = append(h.held, c)
+	if namespace, _, ok := tableScoped(c); ok {
+		h.bindNamespace(namespace)
+		return h.flush(push, deliver, true)
+	}
+	if _, ok := c.(ir.TxCommit); ok {
+		return h.flush(push, deliver, false)
+	}
+	return nil
+}
+
+// finish ends the window: anything still held goes on (the window never
+// named its namespace, so its versions keep none — there is no row of it for
+// them to govern), then every pending version, then the window-end versions.
+func (h *historyReplay) finish(push, deliver func(ir.Change) error) error {
+	if h.held != nil {
+		if err := h.flush(push, deliver, true); err != nil {
+			return err
+		}
+	}
+	if err := h.releaseAll(push); err != nil {
+		return err
+	}
+	for _, s := range h.windowEnd {
+		if err := push(s); err != nil {
+			return err
+		}
+	}
+	h.windowEnd = nil
+	return nil
+}
+
+// flush hands on the held changes in order: with release, the versions due
+// ahead of them go first (the start versions, then whatever
+// [historyReplay.before] releases at the held boundary); without, only the
+// transaction state is recorded, and the versions stay due.
+func (h *historyReplay) flush(push, deliver func(ir.Change) error, release bool) error {
+	held := h.held
+	h.held = nil
+	if release && h.startHeld {
+		h.startHeld = false
+		if err := h.releaseStart(push); err != nil {
+			return err
+		}
+	}
+	for _, c := range held {
+		if err := h.pass(c, push, deliver, release); err != nil {
+			return err
+		}
+	}
+	if h.startHeld {
+		// The start versions still wait for the namespace.
+		h.held = []ir.Change{}
+	}
+	return nil
+}
+
+// pass hands c on: release decides whether the versions due ahead of it go
+// first.
+func (h *historyReplay) pass(c ir.Change, push, deliver func(ir.Change) error, release bool) error {
+	if release {
+		if err := h.before(c, push); err != nil {
+			return err
+		}
+	} else {
+		h.track(c)
+	}
+	if err := h.checkNamespace(c); err != nil {
+		return err
+	}
+	return deliver(c)
+}
+
+// dueNeedsNamespace reports whether a version naming no namespace would be
+// released ahead of c (c nil: by [historyReplay.start]) while the window's
+// namespace is still unknown.
+func (h *historyReplay) dueNeedsNamespace(c ir.Change) (bool, error) {
+	if h.namespaceKnown {
+		return false, nil
+	}
+	var pos ir.Position
+	if c != nil {
+		if !h.isBoundary(c) || h.orderer == nil {
+			return false, nil
+		}
+		if pos = c.Pos(); pos.Token == "" {
+			return false, nil
+		}
+	}
+	for _, s := range h.pending {
+		if s.Schema != "" {
+			continue
+		}
+		// A version released up front goes at start, never at a change.
+		upFront := h.orderer == nil || s.Position.Token == ""
+		if c == nil {
+			if upFront {
+				return true, nil
+			}
+			continue
+		}
+		if upFront {
+			continue
+		}
+		at, err := h.orderer.PositionAtOrAfter(pos, s.Position)
+		if err != nil {
+			return false, fmt.Errorf("order schema-history version %s at %s against change at %s: %w",
+				s.Table, s.Position.Token, pos.Token, err)
+		}
+		if at {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// bindNamespace gives every version naming no namespace the one the
+// window's changes name.
+func (h *historyReplay) bindNamespace(namespace string) {
+	h.namespace, h.namespaceKnown = namespace, true
+	if h.bound == nil {
+		h.bound = map[string]bool{}
+	}
+	for _, versions := range [][]ir.SchemaSnapshot{h.pending, h.windowEnd} {
+		for i := range versions {
+			if versions[i].Schema == "" {
+				versions[i].Schema = namespace
+				h.bound[versions[i].Table] = true
+			}
+		}
+	}
+}
+
+// checkNamespace refuses a change of a table whose namespace-less version
+// took the window's namespace, when the change names another: the version
+// would be filed where the change's lookup does not look, and the guard it
+// arms would not arm (Bug 306). A flat manifest is a single-namespace
+// stream, so this never fires on a stream sluice records; it is the check
+// on that premise.
+func (h *historyReplay) checkNamespace(c ir.Change) error {
+	namespace, table, ok := tableScoped(c)
+	if !ok || !h.namespaceKnown || !h.bound[table] || namespace == h.namespace {
+		return nil
+	}
+	return fmt.Errorf("%w: %s: incremental %s: a schema version of table %s recorded no namespace and took %q, the one "+
+		"the window's first change named, but a change of the table names %q, so the shape that version records would "+
+		"not govern it and rows the source keeps apart could merge. Refusing before that change is applied; take a fresh "+
+		"full backup and restore from it",
+		ir.ErrKeyCollationMerge, keyCollationVersionNamespaceMarker, h.backupID, table, h.namespace, namespace)
+}
+
+// tableScoped is the namespace and table a change names, for the changes
+// that name one.
+func tableScoped(c ir.Change) (namespace, table string, ok bool) {
+	switch v := c.(type) {
+	case ir.Insert:
+		return v.Schema, v.Table, true
+	case ir.Update:
+		return v.Schema, v.Table, true
+	case ir.Delete:
+		return v.Schema, v.Table, true
+	case ir.Truncate:
+		return v.Schema, v.Table, true
+	}
+	return "", "", false
+}
+
+// sameVersionTable reports whether two versions are of the same table: the
+// same name, and the same namespace when both name one.
+func sameVersionTable(a, b ir.SchemaSnapshot) bool {
+	return a.Table == b.Table && (a.Schema == "" || b.Schema == "" || a.Schema == b.Schema)
 }
 
 // releaseAll releases every pending version (the window's end).
@@ -225,22 +501,30 @@ func (h *historyReplay) releaseAll(push func(ir.Change) error) error {
 // seeds nothing. Only those tables are seeded: a version is a durable row in
 // the target's schema history, and a table whose key did not change gains
 // nothing from one.
+//
+// A seed names the namespace the parent recorded — none, for a MySQL
+// manifest — and one naming none takes the namespace the window's changes
+// name when it is released ([historyReplay.admit], Bug 306). It used to
+// borrow one only from a recorded version of the table in the window, so a
+// window recording none (its last event for the table the loosening ALTER)
+// filed the seed where the rows' lookup never looked.
 func windowStartVersions(parent *ir.Schema, m *irbackup.Manifest, snaps []ir.SchemaSnapshot) []ir.SchemaSnapshot {
 	if parent == nil || m == nil {
 		return nil
-	}
-	changed := map[string]bool{}
-	for _, d := range m.SchemaDelta {
-		if d != nil && d.Kind == irbackup.SchemaDeltaAlterTable && migcore.DeltaChangesKeyCollation([]*irbackup.SchemaDeltaEntry{d}) {
-			changed[d.Table] = true
-		}
 	}
 	var seeds []ir.SchemaSnapshot
 	for _, p := range parent.Tables {
 		if p == nil {
 			continue
 		}
-		hit := changed[p.Name]
+		hit := false
+		for _, d := range m.SchemaDelta {
+			if d != nil && d.Kind == irbackup.SchemaDeltaAlterTable && sameTable(p, d.Schema, d.Table) &&
+				migcore.DeltaChangesKeyCollation([]*irbackup.SchemaDeltaEntry{d}) {
+				hit = true
+				break
+			}
+		}
 		for _, s := range snaps {
 			if hit {
 				break
@@ -249,19 +533,37 @@ func windowStartVersions(parent *ir.Schema, m *irbackup.Manifest, snaps []ir.Sch
 				hit = true
 			}
 		}
-		if !hit {
-			continue
+		if hit {
+			seeds = append(seeds, ir.SchemaSnapshot{Position: m.StartPosition, Schema: p.Schema, Table: p.Name, IR: p})
 		}
-		schema := p.Schema
-		for _, s := range snaps {
-			if sameTable(p, s.Schema, s.Table) && s.Schema != "" {
-				schema = s.Schema
+	}
+	return seeds
+}
+
+// windowEndVersions is, for every window-start version, the shape the
+// window recorded for its table, anchored at the window's end. The window's
+// own versions need not reach that shape: a window whose last event for the
+// table is the ALTER records no version after it (Bug 306), and without one
+// the window-start shape — the one the window CHANGED — would stay the
+// applier's active shape for every later window, and for a `sync start`
+// resuming at the chain's end, arming the guard from a collation the table
+// no longer has. The recorded shape is the basis the next window's reader
+// starts from, so the applier and the reader agree at the seam. A window
+// with no end position, or a table the window no longer records, gets none.
+func windowEndVersions(m *irbackup.Manifest, seeds []ir.SchemaSnapshot) []ir.SchemaSnapshot {
+	if m == nil || m.Schema == nil || m.EndPosition.Token == "" {
+		return nil
+	}
+	var ends []ir.SchemaSnapshot
+	for _, s := range seeds {
+		for _, t := range m.Schema.Tables {
+			if t != nil && sameTable(t, s.Schema, s.Table) {
+				ends = append(ends, ir.SchemaSnapshot{Position: m.EndPosition, Schema: s.Schema, Table: s.Table, IR: t})
 				break
 			}
 		}
-		seeds = append(seeds, ir.SchemaSnapshot{Position: m.StartPosition, Schema: schema, Table: p.Name, IR: p})
 	}
-	return seeds
+	return ends
 }
 
 // sameTable reports whether t is the table named schema.table (an empty
@@ -326,14 +628,28 @@ func refuseKeyCollationHistory(backupID, why string, m *irbackup.Manifest, snaps
 			return keyCollationHistoryRefusal(backupID, "a table its schema delta changes", why)
 		}
 	}
-	prev := map[string]*ir.Table{}
+	// prev is each version seen so far with its table's recorded indexes;
+	// the one compared with s is the latest of the same table
+	// ([sameVersionTable] — a window-start version naming no namespace and
+	// the window's versions naming the database are one table, Bug 306).
+	type seen struct {
+		v   ir.SchemaSnapshot
+		cur *ir.Table
+	}
+	var prev []seen
 	for _, s := range snaps {
 		qn := s.Schema + "." + s.Table
 		cur := withRecordedIndexes(s.IR, keys)
-		if p, ok := prev[qn]; ok && versionChangesKeyCollation(p, cur, true) {
-			return keyCollationHistoryRefusal(backupID, qn, why)
+		for i := len(prev) - 1; i >= 0; i-- {
+			if !sameVersionTable(prev[i].v, s) {
+				continue
+			}
+			if versionChangesKeyCollation(prev[i].cur, cur, true) {
+				return keyCollationHistoryRefusal(backupID, qn, why)
+			}
+			break
 		}
-		prev[qn] = cur
+		prev = append(prev, seen{s, cur})
 		if keys != nil {
 			for _, k := range keys.Tables {
 				if k != nil && sameTable(k, s.Schema, s.Table) && versionChangesKeyCollation(k, cur, false) {
@@ -345,26 +661,73 @@ func refuseKeyCollationHistory(backupID, why string, m *irbackup.Manifest, snaps
 	return nil
 }
 
-// windowKeyCollationRemedy corrects the remedy of a KEY-COLLATION-MERGE the
-// applier raised inside a window that itself changes a key's collation (a
-// loosening delta, a changed-and-reverted key). The guard's own remedy —
-// give the target key the source's collation and restart — cannot converge
-// there: every re-run of the restore re-applies the window's delta to the
-// target before its rows, and the rows written under the window's earlier
-// collation meet the later one again (review of d6ecb939, finding 4). The
-// chain records a row the target cannot hold in that order; the remedy is a
-// fresh full backup taken after the key change, restored on its own.
-func windowKeyCollationRemedy(link *lineage.SegmentRecord, err error) error {
-	if !errors.Is(err, ir.ErrKeyCollationMerge) || link == nil || link.Manifest == nil {
+// restoreKeyCollationRemedy gives a KEY-COLLATION-MERGE the applier raised
+// during a chain restore the remedy `restore` can run. The applier's own —
+// give the target key the source's collation and restart, or re-copy the
+// table with --restart-from-scratch — is written for the commands that
+// resume a stream, and neither half runs here (Bug 308): `restore` has no
+// --restart-from-scratch, and it does not resume, so a re-run starts over
+// from the full backup onto the rows already restored (measured on MySQL
+// 8.4: LOAD-DATA-ROWS-SKIPPED, after the operator had ALTERed the key as
+// told). So the restore's remedy REPLACES the applier's, it is not appended
+// after it:
+//
+//   - inside a window that itself changes a key's collation (a loosening
+//     delta, a changed-and-reverted key), a fresh full backup taken after
+//     the key change, restored into an empty target. No other remedy
+//     converges: every restore of this chain re-applies the window's change
+//     to the target ahead of the rows written under the earlier collation
+//     (review of d6ecb939, finding 4);
+//   - otherwise, a restore into an empty target whose key column(s) can
+//     carry what the guard compared under ([ir.KeyCollationMergeError.Needs]).
+//
+// A KEY-COLLATION-MERGE that is no [ir.KeyCollationMergeError] (the guard
+// could not be built for the key, KEY-COLLATION-GUARD-UNSUPPORTED) names no
+// command; inside such a window it gets the fresh-full sentence after its
+// own, as before.
+func restoreKeyCollationRemedy(link *lineage.SegmentRecord, err error) error {
+	if !errors.Is(err, ir.ErrKeyCollationMerge) {
 		return err
 	}
-	snaps, derr := decodeSchemaHistory(link)
-	if derr != nil || refuseKeyCollationHistory("", "", link.Manifest, snaps) == nil {
-		return err
+	window := windowChangesKeyCollation(link)
+	var merge *ir.KeyCollationMergeError
+	if !errors.As(err, &merge) {
+		if !window {
+			return err
+		}
+		return fmt.Errorf("%w. %s", err, windowKeyCollationRemedy(link))
 	}
-	return fmt.Errorf("%w. Incremental %s changes a key column's collation inside its own window, so restarting the "+
-		"restore re-applies that change ahead of the same rows and refuses again: take a fresh full backup after the "+
-		"key change and restore from it", err, lineage.ManifestBackupID(link.Manifest))
+	return ir.WithKeyCollationMergeRemedy(err, func(e *ir.KeyCollationMergeError) string {
+		if window {
+			return windowKeyCollationRemedy(link)
+		}
+		needs := "the collation the source compares them under"
+		if e.Needs != "" {
+			needs = e.Needs
+		}
+		return "Restore the chain into an empty target whose key column(s) carry " + needs + ". `sluice restore` " +
+			"does not resume: running it again starts over from the full backup, onto the rows already restored, so " +
+			"altering this target's key and re-running does not converge"
+	})
+}
+
+// windowChangesKeyCollation reports whether link's window itself changes a
+// key column's collation ([refuseKeyCollationHistory]'s test).
+func windowChangesKeyCollation(link *lineage.SegmentRecord) bool {
+	if link == nil || link.Manifest == nil {
+		return false
+	}
+	snaps, err := decodeSchemaHistory(link)
+	return err == nil && refuseKeyCollationHistory("", "", link.Manifest, snaps) != nil
+}
+
+// windowKeyCollationRemedy is the remedy inside such a window.
+func windowKeyCollationRemedy(link *lineage.SegmentRecord) string {
+	return fmt.Sprintf("Take a fresh full backup after the key change and restore it into an empty target. "+
+		"Incremental %s changes a key column's collation inside its own window, so every restore of this chain "+
+		"re-applies that change ahead of the rows written under the earlier collation and refuses here again; "+
+		"altering the target's key does not help, because `sluice restore` does not resume and a re-run starts "+
+		"over from the full backup", lineage.ManifestBackupID(link.Manifest))
 }
 
 // keyCollationHistoryRefusal is the KEY-COLLATION-HISTORY-UNORDERED error.
