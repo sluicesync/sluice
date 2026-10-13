@@ -18,6 +18,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 )
 
 // brokerFakeIndexFallback is an inert ir.IndexBuildFallback with an identity
@@ -47,5 +48,16 @@ func TestSyncFromBackup_ColdStartChainRestoreUnarmed(t *testing.T) {
 	cr := (&SyncFromBackup{}).newColdStartChainRestore()
 	if cr.IndexBuildFallback != nil {
 		t.Errorf("unarmed cold-start ChainRestore fallback = %#v; want nil", cr.IndexBuildFallback)
+	}
+}
+
+// TestSyncFromBackup_ColdStartChainRestoreNamesTheBroker pins review of
+// 7ff76a4c, L5: the chain restore the --reset-target-data cold start runs
+// words its KEY-COLLATION-MERGE remedies for the broker (`sluice sync
+// from-backup run --reset-target-data --yes`), not for `sluice restore`,
+// whose --exclude-table the broker does not accept.
+func TestSyncFromBackup_ColdStartChainRestoreNamesTheBroker(t *testing.T) {
+	if cr := (&SyncFromBackup{}).newColdStartChainRestore(); cr.Command != backup.RestoreCommandBrokerColdStart {
+		t.Errorf("cold-start ChainRestore.Command = %v; want backup.RestoreCommandBrokerColdStart", cr.Command)
 	}
 }

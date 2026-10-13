@@ -1007,6 +1007,8 @@ func (b *SyncFromBackup) newColdStartChainRestore() *backup.ChainRestore {
 		// PlanetScale target routes a walled failure through the deploy request.
 		IndexBuildFallback: b.IndexBuildFallback,
 		SourceEngine:       b.SourceEngine,
+		// Its refusals name the broker's own re-run, not `sluice restore`'s.
+		Command: backup.RestoreCommandBrokerColdStart,
 	}
 }
 

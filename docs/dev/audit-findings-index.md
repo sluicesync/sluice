@@ -64,6 +64,9 @@ Indexed when filed. The three cycle bugs (numbered in the BUG-CATALOG) and the f
 - KEY-COLLATION-PRE0159-2-UNDETECTABLE filed
 - KEY-COLLATION-RESTORE-REMEDY filed
 - KEY-COLLATION-NONWINDOW-RESTORE-REMEDY filed
+- KEY-COLLATION-ZERO-CHUNK-WINDOW-END filed
+- KEY-COLLATION-FILL-NAMESPACE filed
+- KEY-COLLATION-ROLLOVER-SPLIT-DELTA-DUP filed
 
 ## 2026-10-12 — second value-fidelity review of the v0.159.1 candidate (b0360550..46d49733): four fixed, one HIGH found while pinning
 

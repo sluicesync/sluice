@@ -222,10 +222,15 @@ func TestChainRestore_KeyCollationLoosenedInsideTheWindow(t *testing.T) {
 // case-only change of one row, which merges nothing. Without a version of
 // the shape window 1 ended on, the window-start `_bin` version (which Bug
 // 306's fix made reachable: it used to be filed where nothing looked) would
-// stay the applier's active shape for window 2, and the last word in the
-// target's schema history for the next `sync start` to prime from. The
-// chain must restore byte-exact (graded against the source by id:HEX(k)),
-// and the target's history must hold kd's `_ci` shape under the database.
+// stay the applier's active shape for window 2. The chain must restore
+// byte-exact (graded against the source by id:HEX(k)), and the versions the
+// restore handed the applier must include kd's `_ci` shape under the
+// database. The target's sluice_cdc_schema_history is read as the witness
+// of that sequence (each version is written there in the transaction that
+// caches it), NOT as resume state: it is filed under ChainRestoreStreamID,
+// which nothing primes from (review of 7ff76a4c, L1). What this does not
+// show: that the stale `_bin` shape would have refused anything in window 2
+// — with the window-end version removed, this chain still restored exactly.
 func TestChainRestore_KeyCollationLoosenedWindowEndsOnItsRecordedShape(t *testing.T) {
 	_, myRoot, myCleanup := startMySQL(t)
 	defer myCleanup()
@@ -284,9 +289,89 @@ func TestChainRestore_KeyCollationLoosenedWindowEndsOnItsRecordedShape(t *testin
 			kcfbGrade(t, key, src, tgt, nil)
 			if !strings.Contains(history, "["+srcDB+"]_ci") {
 				t.Errorf("kd's schema history (%s) holds no `_ci` shape under %s: the window-start `_bin` "+
-					"version is the last word for a resume", history, srcDB)
+					"version stayed the applier's last version of kd", history, srcDB)
 			}
 		})
+	}
+}
+
+// TestChainRestore_KeyCollationLoosenedPlusAddColumnWindow pins the review
+// of 7ff76a4c (HIGH, loud): one window writes a row of kd, loosens its key
+// and adds a column to it, with nothing colliding. Both capture lanes append
+// the ADD COLUMN fill — one UPDATE per row, by primary key — at the window's
+// end, naming the namespace the flat MySQL manifest records: none. The
+// first cut of Bug 306's fix bound the window's namespace from the row
+// before and refused the fill's "" as a contradiction
+// (KEY-COLLATION-VERSION-NAMESPACE), where v0.159.2 restored exactly. A
+// change naming no namespace now neither binds nor contradicts it. The
+// independent expected value is the source's rows read by id:HEX(k):e.
+func TestChainRestore_KeyCollationLoosenedPlusAddColumnWindow(t *testing.T) {
+	_, myRoot, myCleanup := startMySQL(t)
+	defer myCleanup()
+	myEng, _ := engines.Get("mysql")
+	root := twfbDB{engine: "mysql", dsn: myRoot}
+	rows := func(t *testing.T, db twfbDB) string {
+		t.Helper()
+		return db.scalar(t, "SELECT IFNULL(GROUP_CONCAT(CONCAT(id, ':', HEX(k), ':', IFNULL(e, 'NULL')) ORDER BY id), '') FROM kd")
+	}
+	n := 0
+	for _, metadata := range []string{"MINIMAL", "FULL"} {
+		for _, key := range []string{"pk", "unique"} {
+			for _, lane := range []string{"backup-incremental", "backup-stream-rollover"} {
+				n++
+				t.Run(fmt.Sprintf("%s/%s/%s", metadata, key, lane), func(t *testing.T) {
+					root.exec(t, "SET GLOBAL binlog_row_metadata = '"+metadata+"'")
+					srcDB, tgtDB := fmt.Sprintf("klwa_s%d", n), fmt.Sprintf("klwa_t%d", n)
+					root.exec(t, "CREATE DATABASE "+srcDB+"; CREATE DATABASE "+tgtDB)
+					srcDSN, err := buildMySQLDSN(myRoot, srcDB)
+					if err != nil {
+						t.Fatal(err)
+					}
+					tgtDSN, err := buildMySQLDSN(myRoot, tgtDB)
+					if err != nil {
+						t.Fatal(err)
+					}
+					src, tgt := twfbDB{engine: "mysql", dsn: srcDSN}, twfbDB{engine: "mysql", dsn: tgtDSN}
+					src.exec(t, klwKeys()[key]+"; INSERT INTO kd VALUES (1,'a',1),(2,'b',2)")
+					ctx := context.Background()
+					store, err := blobcodec.NewLocalStore(t.TempDir())
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := (&backup.Backup{Source: myEng, SourceDSN: srcDSN, Store: store, SluiceVersion: "test"}).Run(ctx); err != nil {
+						t.Fatalf("full: %v", err)
+					}
+					full, err := lineage.ReadManifest(ctx, store)
+					if err != nil {
+						t.Fatal(err)
+					}
+					window := []string{"INSERT INTO kd VALUES (3,'c',3)", klwToCI, "ALTER TABLE kd ADD COLUMN e INT NOT NULL DEFAULT 7"}
+					captureErr := krwCapture(t, lane, myEng, srcDSN, "", store, full.BackupID, src, window)
+					if metadata == "MINIMAL" && lane == "backup-incremental" {
+						// Read behind the head under MINIMAL, the row written before the
+						// ADD COLUMN cannot be decoded by name, and the reader refuses the
+						// capture before anything is recorded — measured; the restore half
+						// of this cell is unreachable.
+						if captureErr == nil || !strings.Contains(captureErr.Error(), "binlog_row_metadata is not FULL") {
+							t.Fatalf("capture = %v; want the reader's MINIMAL-behind-the-head refusal", captureErr)
+						}
+						return
+					}
+					if captureErr != nil {
+						t.Fatalf("capture: %v", captureErr)
+					}
+					restoreErr := (&backup.ChainRestore{Target: myEng, TargetDSN: tgtDSN, Store: store, SourceEngine: engines.Get}).Run(ctx)
+					s, g := rows(t, src), rows(t, tgt)
+					t.Logf("restore = %v; source %s target %s", restoreErr, s, g)
+					if restoreErr != nil {
+						t.Fatalf("restore = %v; want the window exact (nothing in it collides)", restoreErr)
+					}
+					if s != g {
+						t.Errorf("target differs from the source by id:HEX(k):e\nsource: %s\ntarget: %s", s, g)
+					}
+				})
+			}
+		}
 	}
 }
 
