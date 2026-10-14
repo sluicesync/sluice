@@ -827,7 +827,7 @@ func commitBatch(ctx context.Context, cfg *BatchConfig, tx BatchTx, streamID, to
 				ctx, cfg.EngineName+": applier: batch rollback on position-write error",
 				slog.String("stream_id", streamID),
 				slog.Int("rows_attempted", rows),
-				slog.String("err", err.Error()),
+				rollbackErrAttr(err),
 			)
 			// Classified like the commit arm below (GC-41 (g)): on an
 			// engine that coalesces rows (MySQL, ADR-0139) the position
@@ -841,7 +841,7 @@ func commitBatch(ctx context.Context, cfg *BatchConfig, tx BatchTx, streamID, to
 			ctx, cfg.EngineName+": applier: batch commit error",
 			slog.String("stream_id", streamID),
 			slog.Int("rows_attempted", rows),
-			slog.String("err", err.Error()),
+			rollbackErrAttr(err),
 		)
 		return cfg.Classify(fmt.Errorf("%s: applier: commit: %w", cfg.EngineName, err))
 	}
@@ -882,7 +882,7 @@ func writeBoundaryOnly(ctx context.Context, cfg *BatchConfig, streamID, token st
 		slog.WarnContext(
 			ctx, cfg.EngineName+": applier: boundary-position rollback on write error",
 			slog.String("stream_id", streamID),
-			slog.String("err", err.Error()),
+			rollbackErrAttr(err),
 		)
 		return cfg.Classify(err)
 	}
@@ -1053,6 +1053,21 @@ func logBatchRollback(ctx context.Context, engineName, streamID string, rowsAtte
 		ctx, engineName+": applier: batch rollback on error",
 		slog.String("stream_id", streamID),
 		slog.Int("rows_attempted", rowsAttempted),
-		slog.String("err", err.Error()),
+		rollbackErrAttr(err),
 	)
+}
+
+// rollbackErrAttr is the "err" attribute of the loop's rollback / commit
+// WARN lines. A terminal refusal ([ir.IsTerminal]) is withheld: every arm
+// returns it, and the caller reports it — often with a remedy of its own
+// that the applier's cannot know (Bug 309: a chain restore replaces the
+// KEY-COLLATION-MERGE remedy with one `restore` can run, while this line,
+// logged first, repeated the applier's stream remedy, and an operator who
+// followed it hit the same refusal again). A transient keeps its text: it
+// is retried, and this line is the only record of it.
+func rollbackErrAttr(err error) slog.Attr {
+	if ir.IsTerminal(err) {
+		return slog.String("err", "a terminal refusal, reported by the caller")
+	}
+	return slog.String("err", err.Error())
 }

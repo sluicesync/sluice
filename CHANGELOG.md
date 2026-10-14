@@ -4,6 +4,10 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Fixed
+
+- **A serial-apply refusal no longer logs a remedy the running command cannot carry out ahead of the one it can (LOW, loud; Bug 309; v0.159.3 is affected, and in earlier releases the returned remedy was the stream one too, Bug 308).** With `--apply-concurrency=1`, the shared batch loop logged a WARN (`batch rollback on position-write error`, or `batch rollback on error`) carrying the applier's raw error before returning it. For a chain restore's `KEY-COLLATION-MERGE` that WARN repeated the applier's stream remedy, which names `sluice sync start --restart-from-scratch` and `sluice sync from-backup run --reset-target-data --yes`, while the error `restore` and the `sync from-backup run --reset-target-data` cold start then printed carried the correct remedy: a fresh full backup. An operator reading the first remedy in the log and re-running the broker got the same refusal again. The returned refusal was right on every path, and the default lane path never logged the WARN. The batch loop's five failure arms (both dispatch arms, the position write, the commit and the boundary-position write) now keep a transient error's text, since it is retried and the WARN is its only record, and withhold a terminal refusal's text, which the caller reports. The four other applier WARNs that log an error's text log catalog-probe failures the applier swallows and does not return, so they keep it. Pinned by `TestBatchLoopRollbackWarn_WithholdsATerminalRefusal` (each reachable arm × terminal/transient) and `TestBatchLoopRollbackWarn_EveryErrAttrIsGuarded`, which fails if a WARN in `batch_loop.go` logs a raw error and covers the boundary-position arm. Both were mutation-checked in both directions. The filing traced this to a broken error chain on the serial path; a real-MySQL probe found the chain intact at `ApplyConcurrency: 1`.
+
 ## [0.159.3] - 2026-10-13
 
 ### Fixed
