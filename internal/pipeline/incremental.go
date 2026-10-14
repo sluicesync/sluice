@@ -1620,7 +1620,7 @@ func keyCollationSameAnchorRefusal(qn, anchor string) error {
 		"rows were written under which collation, and replaying them under either could merge rows the source keeps "+
 		"apart (a Postgres change stream anchors every schema version at LSN 0/0). Refusing to record the window. "+
 		"Take a new full backup after the key change (`sluice backup full`) and continue the chain from it; "+
-		"restarting this capture from the same position refuses again",
+		"restarting this capture from the same position re-reads the catalog and is expected to refuse again",
 		ir.ErrKeyCollationMerge, keyCollationSameAnchorMarker, qn, anchor)
 }
 
@@ -1638,11 +1638,14 @@ func (d *schemaHistoryDrain) into(manifest *irbackup.Manifest, snaps []ir.Schema
 }
 
 // schemaHistoryDrainError marks an error from [schemaHistoryDrain.into]. It
-// is deterministic — the same window drains to the same refusal on every
-// read — unlike a store failure beside it in a chunk flush, which a re-read
-// may not repeat. `backup stream`'s cancel drain abandons a window whose last
-// flush fails so the next run re-reads it; for this error that re-read
-// refuses again, so the drain returns it instead of exiting 0 with the
+// is a verdict on what the window recorded, not a transport failure like a
+// store write beside it in a chunk flush. A re-read is not guaranteed to
+// repeat it — the Postgres reader reads collations from the catalog at
+// read time, so a later read can record a different (never less safe:
+// bytes are the strictest comparison) shape — but abandoning the window to
+// find out would hide the verdict behind a clean exit. `backup stream`'s
+// cancel drain abandons a window whose last flush fails so the next run
+// re-reads it; for this error it returns it instead of exiting 0 with the
 // refusal folded into an abandoned-window WARN (KEY-COLLATION-SAME-ANCHOR's
 // first cut did exactly that, measured on postgres:16).
 type schemaHistoryDrainError struct{ err error }
@@ -1669,7 +1672,7 @@ func (d *schemaHistoryDrain) record(manifest *irbackup.Manifest, snaps []ir.Sche
 			if len(weakened) == 0 {
 				continue
 			}
-			merged := withColumnTypesFrom(kept.table, s.IR, weakened)
+			merged := withKeyCollationWeakened(kept.table, s.IR, weakened)
 			payload, err := ir.MarshalTable(merged)
 			if err != nil {
 				return fmt.Errorf("drain schema snapshots: marshal schema-history table %s.%s: %w",
@@ -1700,13 +1703,20 @@ func (d *schemaHistoryDrain) record(manifest *irbackup.Manifest, snaps []ir.Sche
 	return nil
 }
 
-// withColumnTypesFrom is a copy of t whose columns named in names take their
-// type from src. Neither table is modified.
-func withColumnTypesFrom(t, src *ir.Table, names []string) *ir.Table {
-	take := make(map[string]ir.Type, len(names))
+// withKeyCollationWeakened is a copy of t whose columns named in names keep
+// their collation NAME and lose their determinism — not established, which
+// this binary's guards compare as bytes. The name is kept, not taken from
+// src, because an older binary compares names (review of 17adc8f9, MEDIUM: a
+// kept "C" overwritten by a later {ci, Unknown} matched a ci target and
+// armed nothing there, where "C" would have). A kept column with no name
+// (the database default) takes src's type, whose name is what makes it
+// "not established" rather than "nothing recorded". Neither table is
+// modified.
+func withKeyCollationWeakened(t, src *ir.Table, names []string) *ir.Table {
+	later := make(map[string]ir.Type, len(names))
 	for _, c := range src.Columns {
 		if c != nil {
-			take[c.Name] = c.Type
+			later[c.Name] = c.Type
 		}
 	}
 	cp := *t
@@ -1717,14 +1727,41 @@ func withColumnTypesFrom(t, src *ir.Table, names []string) *ir.Table {
 			continue
 		}
 		for _, n := range names {
-			if n == c.Name {
-				col := *c
-				col.Type = take[n]
-				cp.Columns[i] = &col
+			if n != c.Name {
+				continue
 			}
+			col := *c
+			if typ, ok := withoutDeterminism(c.Type); ok {
+				col.Type = typ
+			} else {
+				col.Type = later[n]
+			}
+			cp.Columns[i] = &col
 		}
 	}
 	return &cp
+}
+
+// withoutDeterminism is t, a NAMED character type, with its determinism
+// cleared; ok is false for any other type (including a character type with
+// no collation name).
+func withoutDeterminism(t ir.Type) (ir.Type, bool) {
+	switch v := t.(type) {
+	case ir.Varchar:
+		v.Determinism = ir.CollationDeterminismUnknown
+		return v, v.Collation != ""
+	case ir.Char:
+		v.Determinism = ir.CollationDeterminismUnknown
+		return v, v.Collation != ""
+	case ir.Text:
+		v.Determinism = ir.CollationDeterminismUnknown
+		return v, v.Collation != ""
+	case ir.Domain:
+		base, ok := withoutDeterminism(v.BaseType)
+		v.BaseType = base
+		return v, ok
+	}
+	return t, false
 }
 
 // changeChunkPath returns the conventional path of change chunk

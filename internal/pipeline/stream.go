@@ -2036,8 +2036,8 @@ func (b *BackupStream) captureWindow(
 			flushCancel()
 			var refused *schemaHistoryDrainError
 			if errors.As(fErr, &refused) {
-				// Deterministic: a re-read of this window refuses again, so
-				// abandoning it would only hide the refusal behind a clean exit.
+				// A verdict, not a transport failure: abandoning the window
+				// would hide it behind a clean exit ([schemaHistoryDrainError]).
 				return out, fErr
 			}
 			if fErr != nil {

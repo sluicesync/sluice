@@ -396,7 +396,18 @@ func ReconcileSameAnchorKeyCollation(kept, later *ir.Table) (weakened []string, 
 			continue
 		}
 		b := keptByName[a.Name]
-		if b == nil || (!isKeyColumn(kept, a.Name) && !isKeyColumn(later, a.Name)) {
+		if b == nil {
+			// A key column the kept version does not have (added inside the
+			// window and keyed): dropping the later version would leave the
+			// restore no shape for it at all, so a recorded collation on it
+			// is a change neither version can stand for (second review of
+			// the fix, LOW 1).
+			if isKeyColumn(later, a.Name) && collationRecorded(a.Type) {
+				conflict = true
+			}
+			continue
+		}
+		if !isKeyColumn(kept, a.Name) && !isKeyColumn(later, a.Name) {
 			continue
 		}
 		switch {

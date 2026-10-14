@@ -57,6 +57,10 @@ func TestSchemaHistoryDrain_SameAnchorKeyCollationRefuses(t *testing.T) {
 		{"unique key from the recorded schema", [][]ir.SchemaSnapshot{{drainSnap(ci("id")), drainSnap(c("id"))}}, uniqueK, true, 1},
 		{"non-key column changes collation", [][]ir.SchemaSnapshot{{drainSnap(ci("id")), drainSnap(c("id"))}}, nil, false, 1},
 		{"identical re-emit", [][]ir.SchemaSnapshot{{drainSnap(ci("k")), drainSnap(ci("k"))}}, nil, false, 1},
+		{"a later key column the kept version lacks", [][]ir.SchemaSnapshot{{drainSnap(&ir.Table{
+			Schema: "public", Name: "kd", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{}}},
+			PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}},
+		}), drainSnap(ci("k"))}}, nil, true, 1},
 		{"distinct anchors", [][]ir.SchemaSnapshot{{drainSnap(ci("k")), {Position: ir.Position{Token: "0/16B3748"}, Schema: "public", Table: "kd", IR: c("k")}}}, nil, false, 2},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -121,7 +125,14 @@ func TestSchemaHistoryDrain_NotEstablishedWeakensTheKeptVersion(t *testing.T) {
 		wantDet     ir.CollationDeterminism
 	}{
 		{"kept ci, then ci not established: weakened", nondet, unest, "ci", ir.CollationDeterminismUnknown},
-		{"kept ci, then another name not established: weakened", nondet, unestOther, "ci_ai", ir.CollationDeterminismUnknown},
+		// The kept NAME survives: an older binary compares names, and a kept
+		// "C" rewritten to a ci target's own name armed nothing there
+		// (second review of the fix, MEDIUM).
+		{"kept ci, then another name not established: weakened, name kept", nondet, unestOther, "ci", ir.CollationDeterminismUnknown},
+		{"kept C, then ci not established: weakened, name kept", strict, unest, "C", ir.CollationDeterminismUnknown},
+		// A database-default key has no name, and no name with no
+		// determinism reads "nothing recorded": it takes the later name.
+		{"kept database default, then ci not established: takes the name", drainTable("", ir.CollationDeterministic, "k"), unest, "ci", ir.CollationDeterminismUnknown},
 		{"kept not established, then C: already bytes, no refusal", unest, strict, "ci", ir.CollationDeterminismUnknown},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
