@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -119,6 +120,14 @@ type CDCReader struct {
 	// and cached cumulatively; a DDL that redefines a domain mid-stream is out of
 	// scope (same posture as the enum cache). nil until first lookup.
 	domainBases map[uint32]domainBase
+
+	// decodingXid is the xid of the source transaction whose messages are
+	// being decoded: the BeginMessage's, or a streamed chunk's
+	// StreamStartMessageV2's. 0 before the first. A RelationMessage arrives
+	// inside one, so [CDCReader.resolveColumnCollations] can ask whether a
+	// column's catalog row is newer than the rows it is about to describe
+	// (KEY-COLLATION-PG-LOOSENED-REPLAY). Pump goroutine only.
+	decodingXid uint32
 
 	// schema is the Postgres namespace the reader is bound to.
 	// Events for other schemas are dropped during dispatch.
@@ -1330,6 +1339,7 @@ func (r *CDCReader) dispatchWAL(
 		return r.maybeSnapshotSchema(ctx, entry, m.RelationID, xld.WALStart, snapshotSig, out)
 
 	case *pglogrepl.BeginMessage:
+		r.decodingXid = m.Xid
 		*currentTxnLSN = m.FinalLSN
 		*currentTxnStartLSN = xld.WALStart
 		// Source commit timestamp for the sync-lag metric (roadmap item
@@ -1391,6 +1401,7 @@ func (r *CDCReader) dispatchWAL(
 
 	case *pglogrepl.StreamStartMessageV2:
 		*inStream = true
+		r.decodingXid = m.Xid
 		r.applyIDs.End() // a streamed chunk's rows carry no ADR-0190 identity (never skippable)
 		// pgoutput v2 streaming-in-progress: large source
 		// transactions arrive in chunks separated by StreamStart /
@@ -2590,6 +2601,43 @@ func (r *CDCReader) resolveColumnStableIDs(ctx context.Context, entry *relationC
 // carries none) onto entry, for [projectCollation]. A nil r.db leaves every
 // column unresolved, and the projection then carries no collation — the
 // guard it feeds stays unarmed, as before this read existed.
+//
+// KEY-COLLATION-PG-LOOSENED-REPLAY: the catalog answers as of now, not as of
+// the rows the Relation describes ([projectCollation]'s FALSE PREMISE note).
+// It can say when that difference matters: altering a column rewrites its
+// pg_attribute row, so a row whose xmin is NEWER than the transaction being
+// decoded ([CDCReader.decodingXid]) belongs to a DDL that ran after those
+// rows were written, and the collation read now is not established for
+// them. An EQUAL xmin is the same transaction, whose DDL may have run before
+// or after the rows (tighten, write 'A' beside 'a', loosen back, all in one
+// transaction — measured merging on a LIVE Postgres → Postgres sync, every
+// entry, before equality counted), so it counts too. The lower bound is the
+// wraparound guard: freezing keeps a catalog row's raw xmin, so once it is
+// more than 2^31 xids old age() goes NEGATIVE and a bare `<=` read every old
+// column as newer than every row (measured on postgres:16 with pg_resetwal;
+// a nondeterministic key on a long-lived table would compare as bytes for
+// half of each xid cycle, and a re-delivered case-only key change would
+// refuse on every start — review of the first cut, finding 3). That
+// measurement is a manual script (freeze, pg_resetwal -x past 2^31), not a
+// CI test; the bound can only withhold a mark, never add one. When that collation is nondeterministic — the only kind that can
+// equate two keys the rows were written apart under, since the database
+// default is deterministic ([TestPostgresDefaultCollationIsDeterministic])
+// — the column keeps its name and is stamped Unknown, which both target
+// guards arm as a byte comparison: an incoming key that matches a
+// byte-different existing one refuses KEY-COLLATION-MERGE instead of
+// merging onto it (measured end to end: tighten, insert 'A' beside 'a',
+// delete it, loosen back, replayed after the loosening — target row 1 was
+// gone at exit 0). A deterministic collation read now compares bytes
+// already, the strictest comparison any earlier collation could have had.
+//
+// Residual, stated: xids order by ASSIGNMENT, not commit. A DDL whose
+// transaction was assigned its xid before the decoded one and committed
+// after it (it wrote elsewhere first, then waited on the decoded
+// transaction's lock) reads as older and is missed. Any other change to the
+// column's pg_attribute row (RENAME, SET NOT NULL, SET STATISTICS, …) after
+// the decoded rows also stamps Unknown: a byte comparison where the
+// collation's would do, loud at worst and only on a byte-different
+// conflict.
 func (r *CDCReader) resolveColumnCollations(ctx context.Context, entry *relationCacheEntry) error {
 	if r.db == nil {
 		return nil
@@ -2597,7 +2645,8 @@ func (r *CDCReader) resolveColumnCollations(ctx context.Context, entry *relation
 	const q = `
 		SELECT a.attname,
 		       COALESCE(CASE WHEN coll.collname = 'default' THEN '' ELSE coll.collname END, ''),
-		       COALESCE(coll.collisdeterministic, true)
+		       COALESCE(coll.collisdeterministic, true),
+		       COALESCE(pg_catalog.age(a.xmin) BETWEEN 0 AND pg_catalog.age($3::text::xid), false)
 		FROM   pg_attribute a
 		JOIN   pg_class      cl ON cl.oid = a.attrelid
 		JOIN   pg_namespace  n  ON n.oid  = cl.relnamespace
@@ -2606,7 +2655,11 @@ func (r *CDCReader) resolveColumnCollations(ctx context.Context, entry *relation
 		  AND  cl.relname = $2
 		  AND  a.attnum   > 0
 		  AND  NOT a.attisdropped`
-	rows, err := r.db.QueryContext(ctx, q, entry.Schema, entry.Name)
+	var decoding any // NULL before the first transaction: nothing to compare with
+	if r.decodingXid != 0 {
+		decoding = strconv.FormatUint(uint64(r.decodingXid), 10)
+	}
+	rows, err := r.db.QueryContext(ctx, q, entry.Schema, entry.Name, decoding)
 	if err != nil {
 		return fmt.Errorf("resolve column collations: %w", err)
 	}
@@ -2614,12 +2667,13 @@ func (r *CDCReader) resolveColumnCollations(ctx context.Context, entry *relation
 	type coll struct {
 		name          string
 		deterministic bool
+		newerThanRows bool
 	}
 	got := map[string]coll{}
 	for rows.Next() {
 		var name string
 		var c coll
-		if err := rows.Scan(&name, &c.name, &c.deterministic); err != nil {
+		if err := rows.Scan(&name, &c.name, &c.deterministic, &c.newerThanRows); err != nil {
 			return fmt.Errorf("resolve column collations: %w", err)
 		}
 		got[name] = c
@@ -2647,6 +2701,9 @@ func (r *CDCReader) resolveColumnCollations(ctx context.Context, entry *relation
 		case c.name == "":
 		case c.deterministic:
 			det = ir.CollationDeterministic
+		case c.newerThanRows:
+			// Not established for the rows this Relation describes (see the
+			// function comment): named, Unknown, armed as bytes.
 		default:
 			det = ir.CollationNonDeterministic
 		}

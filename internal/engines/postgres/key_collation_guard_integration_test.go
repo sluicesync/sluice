@@ -278,3 +278,89 @@ func TestPostgresDefaultCollationIsDeterministic(t *testing.T) {
 			"collation reports collisdeterministic=%v: the readers' deterministic stamp for the default no longer holds", eq, det)
 	}
 }
+
+// TestPostgresCatalogNewerThanRowsPremise binds the premise
+// KEY-COLLATION-PG-LOOSENED-REPLAY's fix rests on, through the reader's own
+// query (resolveColumnCollations): ALTER COLUMN TYPE … COLLATE rewrites the
+// column's pg_attribute row, so its xmin is newer than a transaction that
+// wrote rows before the ALTER, and not newer than one that wrote after it;
+// an ALTER in the rows' own transaction leaves the xmin EQUAL to their xid.
+// Both directions, and an untouched column as the control: if the ALTER
+// stopped rewriting the row, the first cell would read the loosened
+// collation as established for rows written under the stricter one and
+// the guard would stay unarmed — the merge at exit 0 the fix closes.
+func TestPostgresCatalogNewerThanRowsPremise(t *testing.T) {
+	dsn, cleanup := newSharedPGDB(t, "kcg_catalog_newer")
+	defer cleanup()
+	applyPGApplier(t, dsn, `CREATE COLLATION IF NOT EXISTS ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false);
+		CREATE TABLE kn (id int NOT NULL, k text COLLATE "C" NOT NULL PRIMARY KEY, v text COLLATE ci);`)
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	// The 32-bit xid pgoutput's BeginMessage carries for the inserting
+	// transaction.
+	xidOfInsert := func(row string) uint32 {
+		var xid int64
+		if err := db.QueryRowContext(ctx, "WITH w AS (INSERT INTO kn VALUES "+row+" RETURNING 1) "+
+			"SELECT pg_current_xact_id()::text::bigint % 4294967296 FROM w").Scan(&xid); err != nil {
+			t.Fatal(err)
+		}
+		return uint32(xid)
+	}
+	before := xidOfInsert("(1, 'a', 'x')")
+	if _, err := db.ExecContext(ctx, "ALTER TABLE kn ALTER COLUMN k TYPE text COLLATE ci"); err != nil {
+		t.Fatal(err)
+	}
+	after := xidOfInsert("(2, 'b', 'y')")
+
+	read := func(xid uint32) map[string]ir.CollationDeterminism {
+		r := &CDCReader{db: db, decodingXid: xid}
+		entry := &relationCacheEntry{Schema: "public", Name: "kn", Columns: []relationColumn{{Name: "id"}, {Name: "k"}, {Name: "v"}}}
+		if err := r.resolveColumnCollations(ctx, entry); err != nil {
+			t.Fatal(err)
+		}
+		got := map[string]ir.CollationDeterminism{}
+		for _, c := range entry.Columns {
+			got[c.Name] = c.CollationDeterminism
+		}
+		return got
+	}
+	if got := read(before); got["k"] != ir.CollationDeterminismUnknown || got["v"] != ir.CollationNonDeterministic {
+		t.Errorf("rows written before the ALTER: k=%v v=%v; want k Unknown (its catalog row is newer than the rows) and the untouched v NonDeterministic", got["k"], got["v"])
+	}
+	if got := read(after); got["k"] != ir.CollationNonDeterministic {
+		t.Errorf("rows written after the ALTER: k=%v; want NonDeterministic (the catalog row predates them)", got["k"])
+	}
+	if got := read(0); got["k"] != ir.CollationNonDeterministic {
+		t.Errorf("no transaction decoded yet: k=%v; want NonDeterministic (nothing to compare with)", got["k"])
+	}
+
+	// One transaction writes a row and then alters a column: the catalog
+	// row's xmin EQUALS the rows' xid, and the DDL ran after them. The
+	// reader cannot tell that from a DDL that ran first, so equal counts.
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sameTx int64
+	if err := tx.QueryRowContext(ctx, "WITH w AS (INSERT INTO kn VALUES (3, 'c', 'z') RETURNING 1) "+
+		"SELECT pg_current_xact_id()::text::bigint % 4294967296 FROM w").Scan(&sameTx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(ctx, `ALTER TABLE kn ALTER COLUMN k TYPE text COLLATE "C"`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(ctx, "ALTER TABLE kn ALTER COLUMN k TYPE text COLLATE ci"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(uint32(sameTx)); got["k"] != ir.CollationDeterminismUnknown {
+		t.Errorf("same transaction, DDL after the row: k=%v; want Unknown (an equal xmin may postdate the rows)", got["k"])
+	}
+}

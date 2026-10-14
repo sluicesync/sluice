@@ -33,6 +33,12 @@ func TestPlanPGKeyCollationGuard(t *testing.T) {
 		{"no collation carried at all (a schema from an older binary): unarmed", src(ir.Text{}), ciTarget, "", false},
 		{"the same nondeterministic collation", src(ir.Text{Collation: "ci", Determinism: ir.CollationNonDeterministic}), ciTarget, "", false},
 		{"another nondeterministic collation", src(ir.Text{Collation: "ci_ai", Determinism: ir.CollationNonDeterministic}), ciTarget, "ci_ai", false},
+		// KEY-COLLATION-PG-LOOSENED-REPLAY: the reader read the collation from
+		// a catalog row newer than the rows, so it stamps the name with no
+		// determinism. Even the target's own name proves nothing then: bytes.
+		{"the target's collation, not established for the rows", src(ir.Text{Collation: "ci"}), ciTarget, "C", false},
+		{"another named collation, not established for the rows", src(ir.Text{Collation: "ci_ai"}), ciTarget, "C", false},
+		{"not established, on a deterministic key: nothing to guard", src(ir.Text{Collation: "ci"}), map[string]targetKeyCollation{"k": {name: "", deterministic: true}}, "", false},
 		// Review LOW: a MySQL-family source on a nondeterministic target key
 		// was skipped silently; Postgres has no collation that compares as
 		// it does, so the guard refuses instead.

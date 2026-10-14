@@ -731,3 +731,39 @@ func TestHistoryReplay_Unordered(t *testing.T) {
 		t.Fatalf("err = %v; want %v naming %s", err, ir.ErrKeyCollationMerge, keyCollationHistoryUnorderedMarker)
 	}
 }
+
+// TestRefuseUnreplayableKeyCollationHistory_NotEstablishedKey pins the broker
+// half of KEY-COLLATION-PG-LOOSENED-REPLAY (review of the first cut, finding
+// 2). A `backup incremental` taken after a Postgres key was tightened, written
+// and loosened back records no delta and only versions whose key collation is
+// not established (named, no determinism). A guarded replay compares that key
+// as bytes; the broker arms nothing, so it must refuse. A version whose key is
+// established, and a not-established column outside every key, do not.
+func TestRefuseUnreplayableKeyCollationHistory_NotEstablishedKey(t *testing.T) {
+	link := func(k, v ir.Type) *lineage.SegmentRecord {
+		tbl := &ir.Table{
+			Schema: "public", Name: "kd",
+			Columns:    []*ir.Column{{Name: "k", Type: k}, {Name: "v", Type: v}},
+			PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "k"}}},
+		}
+		payload, err := ir.MarshalTable(tbl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &lineage.SegmentRecord{ManifestRecord: lineage.ManifestRecord{Manifest: &irbackup.Manifest{
+			SchemaHistory: []*irbackup.SchemaHistoryEntry{{Schema: "public", Table: "kd", AnchorPosition: ir.Position{Token: "0/0"}, TableJSON: payload}},
+		}}}
+	}
+	ci := ir.Text{Collation: "ci", Determinism: ir.CollationNonDeterministic}
+	unest := ir.Text{Collation: "ci"}
+	err := RefuseUnreplayableKeyCollationHistory(link(unest, ci), "test")
+	if !errors.Is(err, ir.ErrKeyCollationMerge) || !strings.Contains(err.Error(), keyCollationHistoryUnorderedMarker) {
+		t.Fatalf("not-established key: err = %v; want %s", err, keyCollationHistoryUnorderedMarker)
+	}
+	if err := RefuseUnreplayableKeyCollationHistory(link(ci, ci), "test"); err != nil {
+		t.Fatalf("established key: err = %v; want nil", err)
+	}
+	if err := RefuseUnreplayableKeyCollationHistory(link(ci, unest), "test"); err != nil {
+		t.Fatalf("not-established non-key column: err = %v; want nil", err)
+	}
+}

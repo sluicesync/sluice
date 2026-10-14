@@ -295,6 +295,15 @@ func kcfbPGScenarios() []kcfbScenario {
 	return []kcfbScenario{
 		{"pg-pk-collation", pk, toC + " INSERT INTO kd (id,k,d) VALUES (99,'A',99);", "INSERT INTO kd (id,k,d) VALUES (100,'zz',100);", toC},
 		{"pg-pk-collation-then-retype", pkv, toCv + " INSERT INTO kd (id,k,d) VALUES (99,'A',99);", "ALTER TABLE kd ALTER COLUMN k TYPE text; INSERT INTO kd (id,k,d) VALUES (100,'zz',100);", ""},
+		// KEY-COLLATION-PG-LOOSENED-REPLAY on the sync lane: tightened, 'A'
+		// written beside 'a' and moved away, loosened back. A warm resume
+		// replays it after the loosening, when the catalog says ci for every
+		// row; the reader must see the catalog row is newer than the rows.
+		// One implicit transaction (a multi-statement query): the catalog row's
+		// xmin EQUALS the rows' xid.
+		{"pg-pk-collation-reverted", pk, toC + " INSERT INTO kd (id,k,d) VALUES (99,'A',99); UPDATE kd SET k = 'A2' WHERE id = 99; ALTER TABLE kd ALTER COLUMN k TYPE text COLLATE ci;", "INSERT INTO kd (id,k,d) VALUES (100,'zz',100);", ""},
+		// Four transactions: the catalog row's xmin is NEWER than the rows'.
+		{"pg-pk-collation-reverted-separate", pk, "BEGIN; " + toC + " COMMIT; BEGIN; INSERT INTO kd (id,k,d) VALUES (99,'A',99); COMMIT; BEGIN; UPDATE kd SET k = 'A2' WHERE id = 99; COMMIT; BEGIN; ALTER TABLE kd ALTER COLUMN k TYPE text COLLATE ci; COMMIT;", "INSERT INTO kd (id,k,d) VALUES (100,'zz',100);", ""},
 	}
 }
 

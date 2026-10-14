@@ -415,23 +415,24 @@ func TestSyncFromBackup_KeyCollationChangedAndRevertedInsideTheWindow(t *testing
 
 // TestChainRestore_KeyCollationChangedAndRevertedInsideTheWindow_Postgres16
 // is the Postgres-source sibling: a nondeterministic ICU key ("ci") moved to
-// "C" and back, observed live by `backup stream`, restored onto Postgres.
+// "C" and back, restored onto Postgres. Two lanes: observed live by `backup
+// stream`, or REPLAYED by a `backup incremental` started after the revert.
 // Two arms: the window's first touch of the table is the key change itself,
 // or a row precedes it (so the window's first Relation is the "ci" shape).
-// Every cell must refuse with nothing merged: a primary key on k through the
-// applier's guard, a unique key through the target's own unique index (the
-// Postgres applier upserts on the primary key only). A SIBLING pin, not a
-// gate on the history ordering: mutation-run 2026-10-12, these cells refuse
-// with the versions prepended as before too (Postgres anchors every version
-// at LSN 0/0, so no order exists to restore).
+// Every cell must refuse with nothing merged — at capture
+// (KEY-COLLATION-SAME-ANCHOR: the live stream records both shapes at LSN
+// 0/0), or at restore: a primary key on k through the applier's guard, a
+// unique key through the target's own unique index (the Postgres applier
+// upserts on the primary key only).
 //
-// NOT pinned here, because it does not hold: the same window REPLAYED by a
-// `backup incremental` started after the revert. pgoutput's Relation carries
-// no collation and the reader reads it from the catalog as of now
-// (projectCollation's FALSE PREMISE note, KEY-COLLATION review F-D), so the
-// window records only "ci" and, with a primary key on k, the restore lands
-// 'A' over 'a' and the replayed UPDATE moves it — target row 1 gone, exit 0
-// (measured 2026-10-12, postgres:16). That residual is filed, not fixed.
+// The incremental lane is KEY-COLLATION-PG-LOOSENED-REPLAY: the reader reads
+// the collation from the catalog as of now, which is "ci" for every Relation
+// of the replayed window, and before the fix the restore landed 'A' over 'a'
+// and the replayed UPDATE moved it — target row 1 gone, exit 0 (measured
+// 2026-10-12 on postgres:16, and again by the mutation run of the fix). The
+// reader now sees that the column's pg_attribute row is newer than the rows
+// and stamps the collation not established, which the guard compares as
+// bytes.
 func TestChainRestore_KeyCollationChangedAndRevertedInsideTheWindow_Postgres16(t *testing.T) {
 	rootDSN, _, cleanup := startPostgresLogicalImage(t, pgPrebakedImage, 40)
 	defer cleanup()
@@ -441,74 +442,126 @@ func TestChainRestore_KeyCollationChangedAndRevertedInsideTheWindow_Postgres16(t
 		"pk":     "CREATE TABLE kd (id int NOT NULL, k text COLLATE ci NOT NULL PRIMARY KEY, d int)",
 		"unique": "CREATE TABLE kd (id int PRIMARY KEY, k text COLLATE ci NOT NULL UNIQUE, d int)",
 	}
-	n := 0
-	for _, key := range []string{"pk", "unique"} {
-		for _, prior := range []bool{false, true} {
-			if key == "pk" && prior {
-				// NOT a stable pin, and the reason is an open defect
-				// (KEY-COLLATION-PG-SAME-ANCHOR): every Postgres version is
-				// anchored at LSN 0/0, and the capture's history drain keeps
-				// one version per anchor, so the window keeps whichever shape
-				// its first Relation carried. With a row before the change that
-				// is "ci" when the reader keeps up — and the restore then lands
-				// 'A' over 'a', row 1 gone, exit 0 (measured in 1 of 3 runs on
-				// postgres:16; the other runs read "C" from a lagging catalog
-				// and refused).
-				continue
+	n, ran, sameAnchorRefusals, graded := 0, 0, 0, 0
+	defer func() {
+		t.Logf("%d of %d cells refused at capture (%s)", sameAnchorRefusals, n, keyCollationSameAnchorMarker)
+	}()
+	change := []string{
+		`ALTER TABLE kd ALTER COLUMN k TYPE text COLLATE "C"`,
+		"INSERT INTO kd VALUES (99,'A',99)",
+		"UPDATE kd SET k = 'A2' WHERE id = 99",
+		"ALTER TABLE kd ALTER COLUMN k TYPE text COLLATE ci",
+	}
+	// "broker" captures with `backup incremental` and replays the chain with
+	// `sync from-backup`, whose applier is never armed from a version: it
+	// must refuse the window itself (review of the first cut, finding 2).
+	for _, lane := range []string{"backup-stream", "backup-incremental", "broker"} {
+		for _, key := range []string{"pk", "unique"} {
+			for _, prior := range []bool{false, true} {
+				// "one-tx" runs the whole change in one transaction: its rows'
+				// Relation is read when the catalog already says ci, with the
+				// catalog row's xmin EQUAL to the rows' xid. After a prior row
+				// the window's first version is {ci, NonDeterministic}, and the
+				// drain once dropped the later not-established one as "the
+				// same collation" (review of the first cut, finding 1).
+				for _, shape := range []string{"separate", "one-tx"} {
+					// The primary-key cell with a row before the change was
+					// excluded until KEY-COLLATION-SAME-ANCHOR was fixed: every
+					// Postgres version is anchored at LSN 0/0 and the capture's
+					// history drain kept the first shape per anchor, so when the
+					// reader kept up the window kept "ci", and the restore landed
+					// 'A' over 'a' — row 1 gone at exit 0 (1 run in 3 on
+					// postgres:16).
+					n++
+					name := fmt.Sprintf("%s/%s/prior-row=%v/%s", lane, key, prior, shape)
+					create := keys[key]
+					t.Run(name, func(t *testing.T) {
+						kcCellForensics(t)
+						ran++
+						srcDB, tgtDB, slot := fmt.Sprintf("krwp_s%d", n), fmt.Sprintf("krwp_t%d", n), fmt.Sprintf("krwp_slot%d", n)
+						root.exec(t, "CREATE DATABASE "+srcDB)
+						root.exec(t, "CREATE DATABASE "+tgtDB)
+						srcDSN, err := buildPGDSN(rootDSN, srcDB)
+						if err != nil {
+							t.Fatal(err)
+						}
+						tgtDSN, err := buildPGDSN(rootDSN, tgtDB)
+						if err != nil {
+							t.Fatal(err)
+						}
+						src, tgt := twfbDB{engine: "postgres", dsn: srcDSN}, twfbDB{engine: "postgres", dsn: tgtDSN}
+						for _, db := range []twfbDB{src, tgt} {
+							db.exec(t, "CREATE COLLATION ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false)")
+						}
+						src.exec(t, create+"; INSERT INTO kd VALUES (1,'a',1),(2,'b',2)")
+						var window []string
+						if prior {
+							window = append(window, "INSERT INTO kd VALUES (50,'p',50)")
+						}
+						if shape == "one-tx" {
+							window = append(window, "BEGIN; "+strings.Join(change, "; ")+"; COMMIT")
+						} else {
+							window = append(window, change...)
+						}
+						window = append(window, "INSERT INTO kd VALUES (100,'zz',100)")
+						ctx := context.Background()
+						store, err := blobcodec.NewLocalStore(t.TempDir())
+						if err != nil {
+							t.Fatal(err)
+						}
+						if err := (&backup.Backup{Source: pgEng, SourceDSN: srcDSN, Store: store, SluiceVersion: "test", SlotName: slot, ChainSlot: true}).Run(ctx); err != nil {
+							t.Fatalf("full: %v", err)
+						}
+						full, err := lineage.ReadManifest(ctx, store)
+						if err != nil {
+							t.Fatal(err)
+						}
+						captureLane := lane
+						if lane == "broker" {
+							captureLane = "backup-incremental"
+							if err := (&backup.Restore{Target: pgEng, TargetDSN: tgtDSN, Store: store}).Run(ctx); err != nil {
+								t.Fatalf("seed restore: %v", err)
+							}
+						}
+						if err := krwCapture(t, captureLane, pgEng, srcDSN, slot, store, full.BackupID, src, window); err != nil {
+							// Only the same-anchor refusal may stop the capture; it
+							// records no window, so there is nothing to restore.
+							if !errors.Is(err, ir.ErrKeyCollationMerge) || !strings.Contains(err.Error(), keyCollationSameAnchorMarker) {
+								t.Fatalf("capture = %v; want success or %s", err, keyCollationSameAnchorMarker)
+							}
+							t.Logf("capture refused: %v", err)
+							sameAnchorRefusals++
+							return
+						}
+						var applyErr error
+						if lane == "broker" {
+							bctx, bcancel := context.WithTimeout(ctx, 30*time.Second)
+							applyErr = (&SyncFromBackup{
+								Target: pgEng, TargetDSN: tgtDSN, Store: store,
+								ChainURL: "test://krwpb", StreamID: "krwpb",
+								PollInterval: time.Second, AtChainID: full.BackupID, SluiceVersion: "test",
+							}).Run(bctx)
+							bcancel()
+							if errors.Is(applyErr, context.DeadlineExceeded) || errors.Is(applyErr, context.Canceled) {
+								applyErr = nil
+							}
+						} else {
+							applyErr = (&backup.ChainRestore{Target: pgEng, TargetDSN: tgtDSN, Store: store}).Run(ctx)
+						}
+						t.Logf("apply = %v; source %s target %s", applyErr, kcfbRender(kcfbRows(t, src)), kcfbRender(kcfbRows(t, tgt)))
+						if applyErr == nil {
+							t.Fatal("the replay succeeded; want a refusal — 'A' was written under \"C\" and the target key is ci")
+						}
+						kcfbGrade(t, name, src, tgt, applyErr)
+						graded++
+					})
+				}
 			}
-			n++
-			name := fmt.Sprintf("%s/prior-row=%v", key, prior)
-			create := keys[key]
-			t.Run(name, func(t *testing.T) {
-				kcCellForensics(t)
-				srcDB, tgtDB, slot := fmt.Sprintf("krwp_s%d", n), fmt.Sprintf("krwp_t%d", n), fmt.Sprintf("krwp_slot%d", n)
-				root.exec(t, "CREATE DATABASE "+srcDB)
-				root.exec(t, "CREATE DATABASE "+tgtDB)
-				srcDSN, err := buildPGDSN(rootDSN, srcDB)
-				if err != nil {
-					t.Fatal(err)
-				}
-				tgtDSN, err := buildPGDSN(rootDSN, tgtDB)
-				if err != nil {
-					t.Fatal(err)
-				}
-				src, tgt := twfbDB{engine: "postgres", dsn: srcDSN}, twfbDB{engine: "postgres", dsn: tgtDSN}
-				for _, db := range []twfbDB{src, tgt} {
-					db.exec(t, "CREATE COLLATION ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false)")
-				}
-				src.exec(t, create+"; INSERT INTO kd VALUES (1,'a',1),(2,'b',2)")
-				window := []string{
-					`ALTER TABLE kd ALTER COLUMN k TYPE text COLLATE "C"`,
-					"INSERT INTO kd VALUES (99,'A',99)",
-					"UPDATE kd SET k = 'A2' WHERE id = 99",
-					"ALTER TABLE kd ALTER COLUMN k TYPE text COLLATE ci",
-					"INSERT INTO kd VALUES (100,'zz',100)",
-				}
-				if prior {
-					window = append([]string{"INSERT INTO kd VALUES (50,'p',50)"}, window...)
-				}
-				ctx := context.Background()
-				store, err := blobcodec.NewLocalStore(t.TempDir())
-				if err != nil {
-					t.Fatal(err)
-				}
-				if err := (&backup.Backup{Source: pgEng, SourceDSN: srcDSN, Store: store, SluiceVersion: "test", SlotName: slot, ChainSlot: true}).Run(ctx); err != nil {
-					t.Fatalf("full: %v", err)
-				}
-				full, err := lineage.ReadManifest(ctx, store)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if err := krwCapture(t, "backup-stream", pgEng, srcDSN, slot, store, full.BackupID, src, window); err != nil {
-					t.Fatalf("capture: %v", err)
-				}
-				restoreErr := (&backup.ChainRestore{Target: pgEng, TargetDSN: tgtDSN, Store: store}).Run(ctx)
-				t.Logf("restore = %v; source %s target %s", restoreErr, kcfbRender(kcfbRows(t, src)), kcfbRender(kcfbRows(t, tgt)))
-				if restoreErr == nil {
-					t.Fatal("restore succeeded; want a refusal — 'A' was written under \"C\" and the target key is ci")
-				}
-				kcfbGrade(t, name, src, tgt, restoreErr)
-			})
 		}
+	}
+	// Anti-vacuity floor: every cell either refused at capture or reached
+	// the grade.
+	if n != 24 || ran == 0 || sameAnchorRefusals+graded != ran {
+		t.Errorf("%d cells (%d ran), %d refused at capture, %d graded; want every cell that ran accounted for", n, ran, sameAnchorRefusals, graded)
 	}
 }

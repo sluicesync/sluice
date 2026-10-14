@@ -366,6 +366,74 @@ func KeyCollationChange(before, after *ir.Table) bool {
 	return false
 }
 
+// ReconcileSameAnchorKeyCollation compares two versions of one table that a
+// capture recorded at the SAME anchor, which it can keep only one of
+// (KEY-COLLATION-SAME-ANCHOR; a Postgres change stream anchors every version
+// at LSN 0/0, so the kept one governs the whole window at restore). For each
+// key column of either version:
+//
+//   - kept's collation not established ([CollationUnestablished]): the
+//     window already compares that key as bytes, which no later collation
+//     can make stricter — nothing to do;
+//   - later's not established: kept must be weakened to it (weakened names
+//     the column), or rows written under a stricter collation than kept's
+//     replay under kept's (KEY-COLLATION-PG-LOOSENED-REPLAY inside a window
+//     whose first Relation was read before the change);
+//   - both recorded and different: conflict — a collation change neither
+//     shape can stand for.
+func ReconcileSameAnchorKeyCollation(kept, later *ir.Table) (weakened []string, conflict bool) {
+	if kept == nil || later == nil {
+		return nil, false
+	}
+	keptByName := make(map[string]*ir.Column, len(kept.Columns))
+	for _, c := range kept.Columns {
+		if c != nil {
+			keptByName[c.Name] = c
+		}
+	}
+	for _, a := range later.Columns {
+		if a == nil {
+			continue
+		}
+		b := keptByName[a.Name]
+		if b == nil || (!isKeyColumn(kept, a.Name) && !isKeyColumn(later, a.Name)) {
+			continue
+		}
+		switch {
+		case CollationUnestablished(b.Type):
+		case CollationUnestablished(a.Type):
+			weakened = append(weakened, a.Name)
+		case collationRecorded(a.Type) && collationRecorded(b.Type) && !sameCollation(b.Type, a.Type):
+			conflict = true
+		}
+	}
+	return weakened, conflict
+}
+
+// CollationUnestablished reports whether a column type names a
+// Postgres-dialect collation (no charset) with no determinism: a collation
+// the Postgres CDC reader read from a catalog row newer than the rows it
+// describes (KEY-COLLATION-PG-LOOSENED-REPLAY), which the target guards
+// compare as bytes.
+func CollationUnestablished(t ir.Type) bool {
+	if d, ok := t.(ir.Domain); ok {
+		return CollationUnestablished(d.BaseType)
+	}
+	charset, coll := translate.ColumnCollation(t)
+	if charset != "" || coll == "" {
+		return false
+	}
+	switch v := t.(type) {
+	case ir.Varchar:
+		return v.Determinism == ir.CollationDeterminismUnknown
+	case ir.Char:
+		return v.Determinism == ir.CollationDeterminismUnknown
+	case ir.Text:
+		return v.Determinism == ir.CollationDeterminismUnknown
+	}
+	return false
+}
+
 // collationRecorded reports whether a change stream's column type says
 // anything about its collation: a name, or — a Postgres database-default
 // column, which has none — a determinism the reader stamped from the

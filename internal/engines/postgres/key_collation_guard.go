@@ -27,7 +27,9 @@ package postgres
 // deterministic by both Postgres readers (the catalog's own answer for the
 // 'default' row on the CDC side), so it compares bytes too; an empty name
 // with no determinism means the boundary carried no collation at all (a
-// schema decoded from an older binary) and arms nothing. Equal there → the
+// schema decoded from an older binary) and arms nothing, while a NAMED
+// collation with no determinism (not established for the rows: see
+// planPGKeyCollationGuard) compares bytes. Equal there → the
 // same source key: a re-applied or re-delivered INSERT, absorbed as before.
 // Different → the source has two rows: refuse.
 //
@@ -120,6 +122,15 @@ func planPGKeyCollationGuard(source *ir.Table, key []string, target map[string]t
 		}
 		switch {
 		case det == ir.CollationDeterministic:
+			p.compare[col] = "C"
+		case det == ir.CollationDeterminismUnknown:
+			// Named but not established: the CDC reader read the collation
+			// from a catalog row newer than the rows it describes
+			// (KEY-COLLATION-PG-LOOSENED-REPLAY), or the schema predates the
+			// determinism stamp. Compared as bytes, as the MySQL guard does:
+			// the rows may have been written under a stricter collation than
+			// the one read, so even the target's own name is no proof that
+			// two byte-different keys are one source row.
 			p.compare[col] = "C"
 		case name != tc.name:
 			p.compare[col] = name

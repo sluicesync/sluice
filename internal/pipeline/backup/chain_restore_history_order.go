@@ -687,6 +687,17 @@ func versionChangesKeyCollation(known, version *ir.Table, bothVersions bool) boo
 	return !bothVersions || migcore.KeyCollationChange(version, known)
 }
 
+// ReconcileSameAnchorVersions is [migcore.ReconcileSameAnchorKeyCollation]
+// with keys' recorded UNIQUE indexes counted as keys (a change stream's
+// version carries the primary key at most). A capture can keep only one
+// version per anchor ([ir.SchemaVersionKey]); weakened names the kept
+// version's key columns that must take the later version's not-established
+// collation, and conflict is a key change the window's history cannot carry
+// (KEY-COLLATION-SAME-ANCHOR).
+func ReconcileSameAnchorVersions(kept, later *ir.Table, keys *ir.Schema) (weakened []string, conflict bool) {
+	return migcore.ReconcileSameAnchorKeyCollation(withRecordedIndexes(kept, keys), withRecordedIndexes(later, keys))
+}
+
 // RefuseUnreplayableKeyCollationHistory refuses an incremental that changes
 // a key column's collation, for a replay that cannot place each schema
 // version ahead of the changes written under it — why says which. `sync
@@ -695,12 +706,62 @@ func versionChangesKeyCollation(known, version *ir.Table, bothVersions bool) boo
 // guard is never armed from one (KEY-COLLATION-REVERTED-WINDOW-RESTORE and
 // KEY-COLLATION-LOOSENED-WINDOW, both measured on the broker: target row 1
 // held 'A' where the source holds 'a', exit 0).
+//
+// A version whose key collation is NOT ESTABLISHED
+// ([migcore.CollationUnestablished]: the Postgres reader read it from a
+// catalog row newer than its rows) refuses too. A guarded replay compares
+// such a key as bytes; this one arms nothing, so the rows written under a
+// stricter collation than the one read would replay unguarded
+// (KEY-COLLATION-PG-LOOSENED-REPLAY on the broker: a `backup incremental`
+// taken after a tighten, write and loosen records no delta and only
+// not-established versions — review of the first cut, finding 2).
 func RefuseUnreplayableKeyCollationHistory(link *lineage.SegmentRecord, why string) error {
 	snaps, err := decodeSchemaHistory(link)
 	if err != nil {
 		return fmt.Errorf("schema history: %w", err)
 	}
-	return refuseKeyCollationHistory(lineage.ManifestBackupID(link.Manifest), why, link.Manifest, snaps)
+	backupID := lineage.ManifestBackupID(link.Manifest)
+	if err := refuseKeyCollationHistory(backupID, why, link.Manifest, snaps); err != nil {
+		return err
+	}
+	var keys *ir.Schema
+	if link.Manifest != nil {
+		keys = link.Manifest.Schema
+	}
+	for _, s := range snaps {
+		if col := unestablishedKeyColumn(withRecordedIndexes(s.IR, keys)); col != "" {
+			return keyCollationHistoryRefusal(backupID,
+				fmt.Sprintf("%s.%s: column %q's collation is not established for the rows it describes", s.Schema, s.Table, col), why)
+		}
+	}
+	return nil
+}
+
+// unestablishedKeyColumn is the first key column of t whose collation is not
+// established ([migcore.CollationUnestablished]), or "".
+func unestablishedKeyColumn(t *ir.Table) string {
+	if t == nil {
+		return ""
+	}
+	key := map[string]bool{}
+	mark := func(idx *ir.Index) {
+		if idx == nil || (idx != t.PrimaryKey && !idx.Unique) {
+			return
+		}
+		for _, c := range idx.Columns {
+			key[c.Column] = true
+		}
+	}
+	mark(t.PrimaryKey)
+	for _, idx := range t.Indexes {
+		mark(idx)
+	}
+	for _, c := range t.Columns {
+		if c != nil && key[c.Name] && migcore.CollationUnestablished(c.Type) {
+			return c.Name
+		}
+	}
+	return ""
 }
 
 // refuseKeyCollationHistory refuses when the window m changes a key

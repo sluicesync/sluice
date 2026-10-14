@@ -1579,8 +1579,49 @@ func recordedInChangeChunkStream(c ir.Change) bool {
 // Found by the sibling sweep of the 2026-08-07 DDL-only-window entry; held by
 // TestRolloverWindow_SchemaSnapshotDoesNotMoveEndPosition, whose
 // SchemaHistory assertion is what fires.
+//
+// KEY-COLLATION-SAME-ANCHOR: "skipping" a later version at a recorded anchor
+// is only lossless when it is the same shape. A Postgres change stream
+// anchors every version at LSN 0/0 (GC-44 F23), so a window that writes a
+// row of a table and then changes its key's collation records two shapes
+// at one anchor, and keeping the first threw away the shape the later rows
+// were written under: the restore armed nothing for them and a primary-key
+// row merged away at exit 0 (measured on postgres:16, 1 run in 3 — the
+// others lagged and read the later shape first). A later version that
+// disagrees with the kept one on a key column's collation now refuses the
+// window instead ([keyCollationSameAnchorRefusal]); one whose key collation
+// is not established (the Postgres reader read it from a catalog row newer
+// than its rows) weakens the kept version to it instead, so the whole window
+// compares that key as bytes — the kept shape alone would have armed nothing
+// for the later rows (review of the first cut, finding 1: a same-transaction
+// tighten/write/loosen after a prior row, no lag needed). See
+// [backup.ReconcileSameAnchorVersions].
 type schemaHistoryDrain struct {
-	seen map[string]struct{}
+	seen map[string]drainedVersion
+}
+
+// drainedVersion is the version a drain kept for one (table, anchor) and the
+// manifest entry that records it, rewritten when a later version weakens it.
+type drainedVersion struct {
+	table *ir.Table
+	entry *irbackup.SchemaHistoryEntry
+}
+
+// keyCollationSameAnchorMarker names [keyCollationSameAnchorRefusal].
+const keyCollationSameAnchorMarker = "KEY-COLLATION-SAME-ANCHOR"
+
+// keyCollationSameAnchorRefusal is the drain's refusal of a window whose
+// change stream recorded two shapes of qn at one anchor that disagree on a
+// key column's collation.
+func keyCollationSameAnchorRefusal(qn, anchor string) error {
+	return fmt.Errorf("%w: %s: %s: this window's change stream recorded two shapes of the table at one position (%q) "+
+		"that disagree on a key column's collation, so the key's collation changed inside the window after a row of "+
+		"the table was written; a backup keeps one schema version per position, so a restore could not tell which "+
+		"rows were written under which collation, and replaying them under either could merge rows the source keeps "+
+		"apart (a Postgres change stream anchors every schema version at LSN 0/0). Refusing to record the window. "+
+		"Take a new full backup after the key change (`sluice backup full`) and continue the chain from it; "+
+		"restarting this capture from the same position refuses again",
+		ir.ErrKeyCollationMerge, keyCollationSameAnchorMarker, qn, anchor)
 }
 
 // into appends snaps to manifest.SchemaHistory, skipping ones this drain has
@@ -1588,7 +1629,29 @@ type schemaHistoryDrain struct {
 // orchestrator has no applier in the loop and therefore no source-side
 // streamID to record; restore-time replay (applySchemaHistory in
 // chain_restore.go) substitutes ChainRestoreStreamID when it is empty.
+// Every error it returns is a [schemaHistoryDrainError].
 func (d *schemaHistoryDrain) into(manifest *irbackup.Manifest, snaps []ir.SchemaSnapshot) error {
+	if err := d.record(manifest, snaps); err != nil {
+		return &schemaHistoryDrainError{err: err}
+	}
+	return nil
+}
+
+// schemaHistoryDrainError marks an error from [schemaHistoryDrain.into]. It
+// is deterministic — the same window drains to the same refusal on every
+// read — unlike a store failure beside it in a chunk flush, which a re-read
+// may not repeat. `backup stream`'s cancel drain abandons a window whose last
+// flush fails so the next run re-reads it; for this error that re-read
+// refuses again, so the drain returns it instead of exiting 0 with the
+// refusal folded into an abandoned-window WARN (KEY-COLLATION-SAME-ANCHOR's
+// first cut did exactly that, measured on postgres:16).
+type schemaHistoryDrainError struct{ err error }
+
+func (e *schemaHistoryDrainError) Error() string { return e.err.Error() }
+func (e *schemaHistoryDrainError) Unwrap() error { return e.err }
+
+// record is [schemaHistoryDrain.into]'s body.
+func (d *schemaHistoryDrain) record(manifest *irbackup.Manifest, snaps []ir.SchemaSnapshot) error {
 	for _, s := range snaps {
 		if s.IR == nil {
 			// A reader should never emit a nil-IR snapshot; if one does,
@@ -1598,27 +1661,70 @@ func (d *schemaHistoryDrain) into(manifest *irbackup.Manifest, snaps []ir.Schema
 				s.Schema, s.Table, s.Position)
 		}
 		key := ir.SchemaVersionKey("", s.Schema, s.Table, s.Position.Token)
-		if _, dup := d.seen[key]; dup {
+		if kept, dup := d.seen[key]; dup {
+			weakened, conflict := backup.ReconcileSameAnchorVersions(kept.table, s.IR, manifest.Schema)
+			if conflict {
+				return keyCollationSameAnchorRefusal(s.Schema+"."+s.Table, s.Position.Token)
+			}
+			if len(weakened) == 0 {
+				continue
+			}
+			merged := withColumnTypesFrom(kept.table, s.IR, weakened)
+			payload, err := ir.MarshalTable(merged)
+			if err != nil {
+				return fmt.Errorf("drain schema snapshots: marshal schema-history table %s.%s: %w",
+					s.Schema, s.Table, err)
+			}
+			kept.entry.TableJSON = payload
+			d.seen[key] = drainedVersion{table: merged, entry: kept.entry}
 			continue
 		}
-		if d.seen == nil {
-			d.seen = map[string]struct{}{}
-		}
-		d.seen[key] = struct{}{}
 		payload, err := ir.MarshalTable(s.IR)
 		if err != nil {
 			return fmt.Errorf("drain schema snapshots: marshal schema-history table %s.%s: %w",
 				s.Schema, s.Table, err)
 		}
-		manifest.SchemaHistory = append(manifest.SchemaHistory, &irbackup.SchemaHistoryEntry{
+		entry := &irbackup.SchemaHistoryEntry{
 			StreamID:       "",
 			Schema:         s.Schema,
 			Table:          s.Table,
 			AnchorPosition: s.Position,
 			TableJSON:      payload,
-		})
+		}
+		manifest.SchemaHistory = append(manifest.SchemaHistory, entry)
+		if d.seen == nil {
+			d.seen = map[string]drainedVersion{}
+		}
+		d.seen[key] = drainedVersion{table: s.IR, entry: entry}
 	}
 	return nil
+}
+
+// withColumnTypesFrom is a copy of t whose columns named in names take their
+// type from src. Neither table is modified.
+func withColumnTypesFrom(t, src *ir.Table, names []string) *ir.Table {
+	take := make(map[string]ir.Type, len(names))
+	for _, c := range src.Columns {
+		if c != nil {
+			take[c.Name] = c.Type
+		}
+	}
+	cp := *t
+	cp.Columns = make([]*ir.Column, len(t.Columns))
+	for i, c := range t.Columns {
+		cp.Columns[i] = c
+		if c == nil {
+			continue
+		}
+		for _, n := range names {
+			if n == c.Name {
+				col := *c
+				col.Type = take[n]
+				cp.Columns[i] = &col
+			}
+		}
+	}
+	return &cp
 }
 
 // changeChunkPath returns the conventional path of change chunk

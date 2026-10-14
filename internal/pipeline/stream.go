@@ -2032,10 +2032,17 @@ func (b *BackupStream) captureWindow(
 	drainOnCancel := func() (captureOutcome, error) {
 		if !inTransaction && cb.unsealed() {
 			flushCtx, flushCancel := context.WithTimeout(context.WithoutCancel(ctx), stopDrainTimeout)
-			if fErr := cb.closeWindow(flushCtx, &out); fErr != nil {
+			fErr := cb.closeWindow(flushCtx, &out)
+			flushCancel()
+			var refused *schemaHistoryDrainError
+			if errors.As(fErr, &refused) {
+				// Deterministic: a re-read of this window refuses again, so
+				// abandoning it would only hide the refusal behind a clean exit.
+				return out, fErr
+			}
+			if fErr != nil {
 				out.AbandonReason = "the context was cancelled and the window's last chunk could not be stored: " + fErr.Error()
 			}
-			flushCancel()
 		}
 		return out, ctx.Err()
 	}

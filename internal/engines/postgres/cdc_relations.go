@@ -817,10 +817,15 @@ func projectRelation(rel *relationCacheEntry) *ir.Table {
 // replaying that window after the loosening reads `ci` for every Relation
 // in it, so the guard compares 'A' with 'a' under `ci`, judges them the
 // same source row and lets the upsert overwrite 'a'; the replayed DELETE of
-// 'A' then deletes the merged row, and 'a' is gone at exit 0. No cheap
-// sound fix exists here (pgoutput carries no collation, and the catalog
-// keeps no history); the residual is named in the CHANGELOG's "Not
-// covered" list. What the catalog read DOES give is every case where the
+// 'A' then deletes the merged row, and 'a' is gone at exit 0
+// (KEY-COLLATION-PG-LOOSENED-REPLAY). pgoutput carries no collation and the
+// catalog keeps no history, but it does say WHEN the read is unsafe: the
+// column's pg_attribute row is newer than the rows being decoded, or from
+// their own transaction. The
+// reader then stamps a nondeterministic collation as not established
+// (named, Unknown determinism), which the target guards compare as bytes
+// ([CDCReader.resolveColumnCollations], which also states the xid-order
+// residual). What the catalog read gives otherwise is every case where the
 // collation in force now distinguishes the keys — the common one.
 func projectCollation(t ir.Type, c relationColumn) ir.Type {
 	if !c.CollationResolved {
