@@ -496,8 +496,9 @@ func runOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 	firstSkipped, err := cfg.Dispatch(ctx, tx, streamID, first)
 	if err != nil {
 		_ = tx.Rollback()
-		logBatchRollback(ctx, cfg.EngineName, streamID, 1, err)
-		return 0, ir.Position{}, false, cfg.Classify(err)
+		classified := cfg.Classify(err)
+		logBatchRollback(ctx, cfg.EngineName, "batch rollback on error", streamID, classified, slog.Int("rows_attempted", 1))
+		return 0, ir.Position{}, false, classified
 	}
 	src.dispatched(firstSkipped, first)
 	n = 1
@@ -617,8 +618,9 @@ func runOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 			skipped, err := cfg.Dispatch(ctx, tx, streamID, c)
 			if err != nil {
 				_ = tx.Rollback()
-				logBatchRollback(ctx, cfg.EngineName, streamID, n+1, err)
-				return 0, ir.Position{}, false, cfg.Classify(err)
+				classified := cfg.Classify(err)
+				logBatchRollback(ctx, cfg.EngineName, "batch rollback on error", streamID, classified, slog.Int("rows_attempted", n+1))
+				return 0, ir.Position{}, false, classified
 			}
 			src.dispatched(skipped, c)
 			n++
@@ -823,27 +825,21 @@ func commitBatch(ctx context.Context, cfg *BatchConfig, tx BatchTx, streamID, to
 	if !skipPosition {
 		if err := cfg.WritePosition(ctx, tx, streamID, token, *pending+int64(rowDML)); err != nil {
 			_ = tx.Rollback()
-			slog.WarnContext(
-				ctx, cfg.EngineName+": applier: batch rollback on position-write error",
-				slog.String("stream_id", streamID),
-				slog.Int("rows_attempted", rows),
-				slog.String("err", err.Error()),
-			)
 			// Classified like the commit arm below (GC-41 (g)): on an
 			// engine that coalesces rows (MySQL, ADR-0139) the position
 			// write is where most of the batch's DATA is first sent, so a
 			// transient here is as retriable as one at COMMIT.
-			return cfg.Classify(err)
+			classified := cfg.Classify(err)
+			logBatchRollback(ctx, cfg.EngineName, "batch rollback on position-write error", streamID, classified,
+				slog.Int("rows_attempted", rows))
+			return classified
 		}
 	}
 	if err := cfg.Commit(tx); err != nil {
-		slog.WarnContext(
-			ctx, cfg.EngineName+": applier: batch commit error",
-			slog.String("stream_id", streamID),
-			slog.Int("rows_attempted", rows),
-			slog.String("err", err.Error()),
-		)
-		return cfg.Classify(fmt.Errorf("%s: applier: commit: %w", cfg.EngineName, err))
+		classified := cfg.Classify(fmt.Errorf("%s: applier: commit: %w", cfg.EngineName, err))
+		logBatchRollback(ctx, cfg.EngineName, "batch commit error", streamID, classified,
+			slog.Int("rows_attempted", rows))
+		return classified
 	}
 	src.batchCommitted()
 	if skipPosition {
@@ -879,12 +875,9 @@ func writeBoundaryOnly(ctx context.Context, cfg *BatchConfig, streamID, token st
 	}
 	if err := cfg.WritePosition(ctx, tx, streamID, token, *pending); err != nil {
 		_ = tx.Rollback()
-		slog.WarnContext(
-			ctx, cfg.EngineName+": applier: boundary-position rollback on write error",
-			slog.String("stream_id", streamID),
-			slog.String("err", err.Error()),
-		)
-		return cfg.Classify(err)
+		classified := cfg.Classify(err)
+		logBatchRollback(ctx, cfg.EngineName, "boundary-position rollback on write error", streamID, classified)
+		return classified
 	}
 	if err := cfg.Commit(tx); err != nil {
 		return cfg.Classify(fmt.Errorf("%s: applier: boundary commit: %w", cfg.EngineName, err))
@@ -1046,13 +1039,27 @@ func logBatchCommitted(ctx context.Context, engineName, streamID string, rows in
 	)
 }
 
-// logBatchRollback is the shared "batch rollback on error" WARN line
-// for dispatch failures.
-func logBatchRollback(ctx context.Context, engineName, streamID string, rowsAttempted int, err error) {
-	slog.WarnContext(
-		ctx, engineName+": applier: batch rollback on error",
-		slog.String("stream_id", streamID),
-		slog.Int("rows_attempted", rowsAttempted),
-		slog.String("err", err.Error()),
-	)
+// logBatchRollback is the loop's one account of a failed batch: the
+// "<engine>: applier: <what>" WARN, carrying the CLASSIFIED error the loop
+// returns — for every failing arm (dispatch, position write, commit, and
+// the boundary-only position write).
+//
+// A terminal refusal ([ir.IsTerminal]) is not logged at WARN. It ends the
+// run and is returned to the command, which reports it once, in its own
+// words: chain restore replaces a KEY-COLLATION-MERGE's remedy, written for
+// `sync start`, with one `restore` or the broker's `--reset-target-data`
+// cold start can run (Bug 308). Logged here, the engine's wording reached
+// the operator first — on the serial path only, since the lane path never
+// logged it — and the v0.159.3 regression cycle followed it: a broker re-run
+// that refuses again on the same chain (Bug 309). The WARN exists for what
+// the caller retries, which leaves no other trace; a DEBUG line keeps the
+// event for forensics without the text.
+func logBatchRollback(ctx context.Context, engineName, what, streamID string, classified error, attrs ...slog.Attr) {
+	attrs = append([]slog.Attr{slog.String("stream_id", streamID)}, attrs...)
+	if ir.IsTerminal(classified) {
+		slog.LogAttrs(ctx, slog.LevelDebug, engineName+": applier: "+what+
+			" (a terminal refusal: returned to the command, which reports it)", attrs...)
+		return
+	}
+	slog.LogAttrs(ctx, slog.LevelWarn, engineName+": applier: "+what, append(attrs, slog.String("err", classified.Error()))...)
 }
