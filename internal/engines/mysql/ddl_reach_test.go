@@ -45,6 +45,7 @@ func TestClassifyDDLReach(t *testing.T) {
 		{"SET sql_log_bin=0, @@session.foreign_key_checks = 0; SET NAMES utf8mb4; ALTER TABLE kd ADD COLUMN d INT", ddlReach{tables: app("kd")}},
 		// Not provably plain: unchanged, so as unbounded as before.
 		{"SET sql_mode='ANSI'; CREATE TABLE ctl (id INT PRIMARY KEY)", ddlReach{all: true}},
+		{"set foreign_key_checks=0; CREATE TABLE ctl (id INT PRIMARY KEY); ALTER TABLE kd DROP COLUMN c", ddlReach{all: true}},
 		// A lone SET the parser reads: neutral, as before.
 		{"SET foreign_key_checks=0", ddlReach{neutral: true}},
 

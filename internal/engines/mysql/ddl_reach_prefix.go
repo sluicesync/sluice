@@ -323,5 +323,12 @@ func stripLeadingSessionAssignments(stmt string) string {
 	if !stripped || strings.TrimSpace(s) == "" {
 		return stmt
 	}
+	// More than one statement left (`set …; CREATE TABLE a …; ALTER TABLE b …`):
+	// the prefix fallback would bound it to the first, so leave it as
+	// unbounded as before. A `;` inside a literal also lands here — the
+	// conservative direction.
+	if strings.Contains(strings.TrimRight(s, "; \t\r\n"), ";") {
+		return stmt
+	}
 	return s
 }
