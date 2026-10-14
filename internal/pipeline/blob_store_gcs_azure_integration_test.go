@@ -222,8 +222,14 @@ func startAzurite(t *testing.T) (container string) {
 	req := testcontainers.ContainerRequest{
 		Image:        azuriteImage,
 		ExposedPorts: []string{azuriteBlobPt},
-		Cmd:          []string{"azurite-blob", "--blobHost", "0.0.0.0"},
-		WaitingFor:   wait.ForListeningPort(azuriteBlobPt).WithStartupTimeout(60 * time.Second),
+		// --skipApiVersionCheck: azblob 1.8.2 sends x-ms-version 2026-12-06,
+		// newer than any Azurite release (3.37.0 tops out at 2026-06-06), and
+		// Azurite refuses an unknown version with a 400. Real Azure accepts
+		// it; this contract test uses only basic blob operations, which the
+		// emulator implements regardless of the version header. Drop the flag
+		// once an Azurite release supports the client's API version.
+		Cmd:        []string{"azurite-blob", "--blobHost", "0.0.0.0", "--skipApiVersionCheck"},
+		WaitingFor: wait.ForListeningPort(azuriteBlobPt).WithStartupTimeout(60 * time.Second),
 	}
 	c, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
 		ContainerRequest: req,
