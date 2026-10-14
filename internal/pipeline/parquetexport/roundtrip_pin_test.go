@@ -23,9 +23,35 @@ import (
 	"time"
 
 	"github.com/parquet-go/parquet-go"
+	"github.com/parquet-go/parquet-go/format"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
+
+// logicalAs unwraps a leaf's logical-type annotation as the union
+// member T. parquet-go v0.32 models the thrift LogicalType union as a
+// sum type (one Value interface field) rather than one pointer field
+// per member; ok is false for an absent annotation or another member.
+func logicalAs[T format.LogicalTypeValue](lt *format.LogicalType) (T, bool) {
+	var zero T
+	if lt == nil {
+		return zero, false
+	}
+	v, ok := lt.Value.(T)
+	return v, ok
+}
+
+// isLogical reports whether lt carries the union member T.
+func isLogical[T format.LogicalTypeValue](lt *format.LogicalType) bool {
+	_, ok := logicalAs[T](lt)
+	return ok
+}
+
+// isMicros reports whether a TIME/TIMESTAMP unit is MICROS.
+func isMicros(u format.TimeUnit) bool {
+	_, ok := u.Value.(*format.MicroSeconds)
+	return ok
+}
 
 // oneColTable builds a single-column table named "t" with column "v".
 func oneColTable(typ ir.Type) *ir.Table {
@@ -237,7 +263,7 @@ func TestPin_UnsignedIntegerFamily(t *testing.T) {
 	// are unsigned; without it MaxUint64 reads as -1.
 	info := logicalTypeOf(t, data, "v")
 	lt := info.node.Type().LogicalType()
-	if lt == nil || lt.Integer == nil || lt.Integer.BitWidth != 64 || lt.Integer.IsSigned {
+	if it, ok := logicalAs[*format.IntType](lt); !ok || it.BitWidth != 64 || it.IsSigned {
 		t.Fatalf("logical type = %v; want unsigned INT(64)", lt)
 	}
 	// Negative into unsigned is an upstream bug: refuse.
@@ -316,7 +342,7 @@ func TestPin_StringLeafFamily(t *testing.T) {
 			}
 			info := logicalTypeOf(t, data, "v")
 			lt := info.node.Type().LogicalType()
-			if lt == nil || lt.UTF8 == nil {
+			if !isLogical[*format.StringType](lt) {
 				t.Fatalf("logical type = %v; want STRING", lt)
 			}
 			if tc.name == "timetz" && len(codec.Notes) == 0 {
@@ -468,7 +494,7 @@ func TestPin_JSONFamily(t *testing.T) {
 			t.Fatalf(`binary=%v JSON body null = %v; want a PRESENT "null" body, not SQL NULL`, binary, vals[2])
 		}
 		info := logicalTypeOf(t, data, "v")
-		if lt := info.node.Type().LogicalType(); lt == nil || lt.Json == nil {
+		if lt := info.node.Type().LogicalType(); !isLogical[*format.JsonType](lt) {
 			t.Fatalf("logical type = %v; want JSON", lt)
 		}
 	}
@@ -501,7 +527,7 @@ func TestPin_DateFamily(t *testing.T) {
 	if !vals[4].IsNull() {
 		t.Fatal("NULL lost")
 	}
-	if lt := logicalTypeOf(t, data, "v").node.Type().LogicalType(); lt == nil || lt.Date == nil {
+	if lt := logicalTypeOf(t, data, "v").node.Type().LogicalType(); !isLogical[*format.DateType](lt) {
 		t.Fatalf("logical type = %v; want DATE", lt)
 	}
 	// A Date value with a time-of-day violates the IR contract; a
@@ -544,11 +570,12 @@ func TestPin_TimestampFamilies(t *testing.T) {
 				t.Fatal("NULL lost")
 			}
 			lt := logicalTypeOf(t, data, "v").node.Type().LogicalType()
-			if lt == nil || lt.Timestamp == nil || lt.Timestamp.Unit.Micros == nil {
+			ts, ok := logicalAs[*format.TimestampType](lt)
+			if !ok || !isMicros(ts.Unit) {
 				t.Fatalf("logical type = %v; want TIMESTAMP(MICROS)", lt)
 			}
-			if lt.Timestamp.IsAdjustedToUTC != tc.wantAdjusted {
-				t.Fatalf("IsAdjustedToUTC = %v; want %v", lt.Timestamp.IsAdjustedToUTC, tc.wantAdjusted)
+			if ts.IsAdjustedToUTC != tc.wantAdjusted {
+				t.Fatalf("IsAdjustedToUTC = %v; want %v", ts.IsAdjustedToUTC, tc.wantAdjusted)
 			}
 			// Sub-microsecond precision would be silently truncated by
 			// TIMESTAMP(MICROS): refuse.
@@ -587,7 +614,7 @@ func TestPin_TimeOfDayFamily(t *testing.T) {
 		t.Fatal("NULL lost")
 	}
 	lt := logicalTypeOf(t, data, "v").node.Type().LogicalType()
-	if lt == nil || lt.Time == nil || lt.Time.Unit.Micros == nil || lt.Time.IsAdjustedToUTC {
+	if tt, ok := logicalAs[*format.TimeType](lt); !ok || !isMicros(tt.Unit) || tt.IsAdjustedToUTC {
 		t.Fatalf("logical type = %v; want TIME(MICROS, isAdjustedToUTC=false)", lt)
 	}
 	// The refusal matrix: SQL TIME values with no time-of-day form.
@@ -622,7 +649,7 @@ func TestPin_DecimalFamilies(t *testing.T) {
 			t.Fatal("NULL lost")
 		}
 		lt := logicalTypeOf(t, data, "v").node.Type().LogicalType()
-		if lt == nil || lt.Decimal == nil || lt.Decimal.Precision != 9 || lt.Decimal.Scale != 2 {
+		if dt, ok := logicalAs[*format.DecimalType](lt); !ok || dt.Precision != 9 || dt.Scale != 2 {
 			t.Fatalf("logical type = %v; want DECIMAL(9,2)", lt)
 		}
 	})
