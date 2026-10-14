@@ -433,8 +433,12 @@ func ReconcileSameAnchorKeyCollation(kept, later *ir.Table) (weakened []string, 
 			// window and keyed): dropping the later version would leave the
 			// restore no shape for it at all, so a recorded collation on it
 			// is a change neither version can stand for (second review of
-			// the fix, LOW 1).
-			if isKeyColumn(later, a.Name) && collationRecorded(a.Type) {
+			// the fix, LOW 1). Not when the column is a key only because
+			// both versions key on every column — REPLICA IDENTITY FULL,
+			// where pgoutput flags each column, the one just added included
+			// (measured: every ADD COLUMN of a text column on such a table
+			// refused, TestIncrementalBackup_ChainRestore_AddColumnDefaults).
+			if isKeyColumn(later, a.Name) && collationRecorded(a.Type) && !keyedOnlyByFullIdentity(kept, later, a.Name) {
 				conflict = true
 			}
 			continue
@@ -594,6 +598,46 @@ func isKeyColumn(t *ir.Table, name string) bool {
 		}
 	}
 	return false
+}
+
+// keyedOnlyByFullIdentity reports whether name is a key of later only
+// because kept and later each key on every one of their columns — the shape
+// a pgoutput Relation takes under REPLICA IDENTITY FULL — and no unique
+// index names it. Residual, stated: a real primary key over every column
+// that is extended to a column added inside the window reads the same; the
+// rows before the add carry no value for that column to merge on.
+func keyedOnlyByFullIdentity(kept, later *ir.Table, name string) bool {
+	if !keyCoversEveryColumn(kept) || !keyCoversEveryColumn(later) {
+		return false
+	}
+	for _, idx := range later.Indexes {
+		if idx == nil || !idx.Unique {
+			continue
+		}
+		for _, c := range idx.Columns {
+			if c.Column == name {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// keyCoversEveryColumn reports whether t's primary key names every column.
+func keyCoversEveryColumn(t *ir.Table) bool {
+	if t.PrimaryKey == nil {
+		return false
+	}
+	keyed := make(map[string]bool, len(t.PrimaryKey.Columns))
+	for _, c := range t.PrimaryKey.Columns {
+		keyed[c.Column] = true
+	}
+	for _, c := range t.Columns {
+		if c != nil && !keyed[c.Name] {
+			return false
+		}
+	}
+	return true
 }
 
 // sameColumnOrder reports whether the two shapes declare the same

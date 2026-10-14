@@ -313,6 +313,7 @@ func runACDLane(t *testing.T, lane acdLane) {
 
 	captureLogs := &logcapture.Buffer{}
 	prev := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(prev) })
 	slog.SetDefault(slog.New(slog.NewJSONHandler(captureLogs, &slog.HandlerOptions{Level: slog.LevelInfo})))
 	lane.exec(t, src, strings.Join(window, ";\n")+";")
 	if lane.stream {

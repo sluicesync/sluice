@@ -26,6 +26,21 @@ func drainTable(coll string, det ir.CollationDeterminism, pk string) *ir.Table {
 	}
 }
 
+// fullIdentity is kd as a Relation projects it under REPLICA IDENTITY FULL,
+// every column flagged a key: (id) alone, or (id, k text COLLATE "C") after
+// an ADD COLUMN.
+func fullIdentity(withK bool) *ir.Table {
+	t := &ir.Table{Schema: "public", Name: "kd", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{}}}}
+	if withK {
+		t.Columns = append(t.Columns, &ir.Column{Name: "k", Type: ir.Text{Collation: "C", Determinism: ir.CollationDeterministic}})
+	}
+	t.PrimaryKey = &ir.Index{}
+	for _, c := range t.Columns {
+		t.PrimaryKey.Columns = append(t.PrimaryKey.Columns, ir.IndexColumn{Column: c.Name})
+	}
+	return t
+}
+
 func drainSnap(t *ir.Table) ir.SchemaSnapshot {
 	return ir.SchemaSnapshot{Position: ir.Position{Token: "0/0"}, Schema: t.Schema, Table: t.Name, IR: t}
 }
@@ -61,6 +76,8 @@ func TestSchemaHistoryDrain_SameAnchorKeyCollationRefuses(t *testing.T) {
 			Schema: "public", Name: "kd", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{}}},
 			PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}},
 		}), drainSnap(ci("k"))}}, nil, true, 1},
+		{"replica identity full: an added column keyed by the identity only", [][]ir.SchemaSnapshot{{drainSnap(fullIdentity(false)), drainSnap(fullIdentity(true))}}, nil, false, 1},
+		{"replica identity full: an added column a unique index keys", [][]ir.SchemaSnapshot{{drainSnap(fullIdentity(false)), drainSnap(fullIdentity(true))}}, uniqueK, true, 1},
 		{"distinct anchors", [][]ir.SchemaSnapshot{{drainSnap(ci("k")), {Position: ir.Position{Token: "0/16B3748"}, Schema: "public", Table: "kd", IR: c("k")}}}, nil, false, 2},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
