@@ -350,7 +350,7 @@ func (r *CDCReader) refuseIdentityChangeAt(t ddlTableRef) error {
 // the statement may have re-occupied. Anything else is logged and flows: a
 // routine MariaDB `ADD COLUMN u UUID` changes no column's identity.
 func (r *CDCReader) unreadIdentityDDL(ctx context.Context, stmt, defaultSchema string) error {
-	if reach, ok := classifyUnparsedDDL(stripLeadingSQLComments(stmt), defaultSchema); ok && !reach.neutral {
+	if reach, ok := classifyUnparsedDDL(stripLeadingSQLComments(stripLeadingSessionAssignments(stripLeadingSQLComments(stmt))), defaultSchema); ok && !reach.neutral {
 		vacating := sqlWordsInclude(stmt, "DROP", "CHANGE", "RENAME")
 		for _, t := range reach.tables {
 			if !r.identityInScope(t) {

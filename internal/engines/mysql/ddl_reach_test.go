@@ -38,6 +38,15 @@ func TestClassifyDDLReach(t *testing.T) {
 		{"DROP TABLE kd, other.t", ddlReach{tables: []ddlTableRef{{"app", "kd"}, {"other", "t"}}}},
 		{"RENAME TABLE kd TO old_kd, new_kd TO kd", ddlReach{tables: []ddlTableRef{{"app", "kd"}, {"app", "old_kd"}, {"app", "new_kd"}, {"app", "kd"}}}},
 		{"DROP DATABASE app", ddlReach{databases: []string{"app"}}},
+		// A leading run of plain session assignments reshapes nothing: the
+		// statement after it is classified (measured on mariadb:11.4, a
+		// target's control-table CREATE reached every stream's table).
+		{"set foreign_key_checks=0; CREATE TABLE IF NOT EXISTS `ctl` (id INT PRIMARY KEY)", ddlReach{tables: app("ctl")}},
+		{"SET sql_log_bin=0, @@session.foreign_key_checks = 0; SET NAMES utf8mb4; ALTER TABLE kd ADD COLUMN d INT", ddlReach{tables: app("kd")}},
+		// Not provably plain: unchanged, so as unbounded as before.
+		{"SET sql_mode='ANSI'; CREATE TABLE ctl (id INT PRIMARY KEY)", ddlReach{all: true}},
+		// A lone SET the parser reads: neutral, as before.
+		{"SET foreign_key_checks=0", ddlReach{neutral: true}},
 
 		// In place: names and positions kept, some types may change.
 		{"ALTER TABLE kd MODIFY b VARCHAR(80)", ddlReach{tables: app("kd"), inPlace: true, retyped: []string{"b"}}},

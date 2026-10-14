@@ -283,3 +283,45 @@ func (p *prefixReader) objectDDL() (ddlReach, bool) {
 	}
 	return ddlReach{}, false
 }
+
+// stripLeadingSessionAssignments removes a leading run of plain `SET`
+// session assignments (`set foreign_key_checks=0; CREATE TABLE …`), which
+// reshape no table, so the statement after them is what gets classified.
+// Measured in CI on mariadb:11.4: a target's control-table CREATE on the
+// source's server reached the binlog as one such two-statement text, the
+// strict parser could not read it, and it reached every table — three
+// streams behind the head refused SLUICE-E-CDC-SCHEMA-REPLAY-MISMATCH at once.
+//
+// Only provably plain assignments are removed: up to the first `;`, nothing
+// but identifier characters, digits, `@`, `.`, `=`, `,`, `-` and whitespace.
+// Anything else — a quote, a paren, a comment, no `;`, or nothing after the
+// last assignment — returns stmt unchanged, which stays as bounded or
+// unbounded as it was.
+func stripLeadingSessionAssignments(stmt string) string {
+	s := stmt
+	stripped := false
+	for {
+		s = strings.TrimLeft(s, " \t\r\n")
+		if len(s) < 4 || !strings.EqualFold(s[:4], "SET ") {
+			break
+		}
+		end := strings.IndexByte(s, ';')
+		if end < 0 {
+			return stmt
+		}
+		for _, c := range s[4:end] {
+			plain := c == '_' || c == '@' || c == '.' || c == '=' || c == ',' || c == '-' ||
+				c == ' ' || c == '\t' || c == '\r' || c == '\n' ||
+				(c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+			if !plain {
+				return stmt
+			}
+		}
+		s = s[end+1:]
+		stripped = true
+	}
+	if !stripped || strings.TrimSpace(s) == "" {
+		return stmt
+	}
+	return s
+}

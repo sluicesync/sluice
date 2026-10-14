@@ -136,7 +136,7 @@ var neutralStatementLeaders = []string{
 // event's default database (the QueryEvent schema, or the `use` clause of
 // a SHOW BINLOG EVENTS Info).
 func classifyDDLReach(stmt, defaultSchema string) ddlReach {
-	stmt = stripLeadingSQLComments(stmt)
+	stmt = stripLeadingSQLComments(stripLeadingSessionAssignments(stripLeadingSQLComments(stmt)))
 	unbounded := ddlReach{all: true}
 	if stmt == "" {
 		return unbounded
