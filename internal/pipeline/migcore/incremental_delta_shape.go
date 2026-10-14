@@ -366,6 +366,38 @@ func KeyCollationChange(before, after *ir.Table) bool {
 	return false
 }
 
+// KeyCollationUnestablished reports whether after — a change stream's
+// [ir.SchemaSnapshot] from a segment's SchemaHistory — records a key column
+// whose collation is not established for its rows ([CollationUnestablished]:
+// KEY-COLLATION-PG-LOOSENED-REPLAY). A column is a key by
+// [AlterAspectColumnCollation]'s rule, the one [KeyCollationChange] applies:
+// in either shape's primary key or a UNIQUE index of before (the schema the
+// segment's parent recorded — a change stream's snapshot carries no
+// secondary indexes). before may be nil (a table the window created): the
+// snapshot's own key still counts. Unlike [KeyCollationChange] it compares
+// nothing with before: the name of a not-established collation is usually
+// the parent's own, which is exactly why no name comparison can see it.
+//
+// Over-approximation, stated: a pgoutput snapshot's "primary key" is the
+// REPLICA IDENTITY, so under REPLICA IDENTITY FULL every column is a key
+// here, and a non-key column whose collation changed after the rows counts
+// too. Its cost is a segment an older binary refuses loudly, never a merge.
+// Used to stamp [irbackup.FormatVersionKeyCollationUnestablished].
+func KeyCollationUnestablished(before, after *ir.Table) bool {
+	if after == nil {
+		return false
+	}
+	for _, a := range after.Columns {
+		if a == nil || !CollationUnestablished(a.Type) {
+			continue
+		}
+		if isKeyColumn(after, a.Name) || (before != nil && isKeyColumn(before, a.Name)) {
+			return true
+		}
+	}
+	return false
+}
+
 // ReconcileSameAnchorKeyCollation compares two versions of one table that a
 // capture recorded at the SAME anchor, which it can keep only one of
 // (KEY-COLLATION-SAME-ANCHOR; a Postgres change stream anchors every version

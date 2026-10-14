@@ -139,17 +139,23 @@ func TestChooseFormatVersion_Bug116(t *testing.T) {
 }
 
 // TestBackupFormatVersion_Bumped pins the version ladder: the build
-// ceiling is the key-collation-delta version, the exact-numbers,
-// positionless-full, redaction-marker, injective-chunk-AAD, standalone-sequences, ADR-0086 in-progress
+// ceiling is the key-collation-unestablished version, the
+// key-collation-delta, exact-numbers, positionless-full, redaction-marker, injective-chunk-AAD, standalone-sequences, ADR-0086 in-progress
 // sidecar and Bug 116 security-metadata versions keep their historical
 // slots, and the legacy value is frozen. If a future change reorders
 // these without updating the chooseFormatVersion / sidecar /
 // chunk-binding contracts, this test catches the regression at build
 // time.
 func TestBackupFormatVersion_Bumped(t *testing.T) {
-	if BackupFormatVersion != FormatVersionKeyCollationDelta {
-		t.Errorf("BackupFormatVersion = %d; want FormatVersionKeyCollationDelta=%d (current ceiling)",
-			BackupFormatVersion, FormatVersionKeyCollationDelta)
+	if BackupFormatVersion != FormatVersionKeyCollationUnestablished {
+		t.Errorf("BackupFormatVersion = %d; want FormatVersionKeyCollationUnestablished=%d (current ceiling)",
+			BackupFormatVersion, FormatVersionKeyCollationUnestablished)
+	}
+	// Above the key-collation-delta tier, for the same reason: a 14-stamped
+	// segment keeps every lower `>=` fold, and none changes between 9 and 14.
+	if FormatVersionKeyCollationUnestablished <= FormatVersionKeyCollationDelta {
+		t.Errorf("FormatVersionKeyCollationUnestablished (%d) must be strictly greater than FormatVersionKeyCollationDelta (%d)",
+			FormatVersionKeyCollationUnestablished, FormatVersionKeyCollationDelta)
 	}
 	// Above the exact-numbers tier, for the reason that tier sits above the
 	// positionless one: a 13-stamped segment keeps every lower `>=` fold.

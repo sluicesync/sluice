@@ -199,12 +199,38 @@ Every backup chain root manifest carries a `FormatVersion` field:
   without the stamp**, and nothing re-stamps a sealed segment, so a chain
   v0.159.0 captured across a key-collation change still restores — wrongly
   — on v0.158.x and older: restore those chains with v0.159.0 or later.
+- **`FormatVersion=14`** — a **not-established key collation** segment
+  (`v0.160.0+`, KEY-COLLATION-PG-LOOSENED-REPLAY): an incremental /
+  `backup stream` segment from a Postgres source whose window's schema
+  history records a primary-key or UNIQUE-key column with a
+  nondeterministic collation that is *not established* for the rows —
+  the column's `pg_attribute` row is newer than, or from, the transaction
+  that wrote them (a key tightened `ci` → `"C"`, `'A'` written beside
+  `'a'`, moved, and loosened back to `ci`, all inside the window). pgoutput
+  carries no collation, so the reader reads it from the catalog as of now
+  and records the column as named-but-not-established; a v0.160.0+ binary
+  compares such a key as bytes and refuses the merge
+  (`KEY-COLLATION-MERGE`). The name is the parent's own, so the
+  version-13 stamp does not fire, and a v0.159.x binary — whose guard
+  arms nothing for a same-named key it cannot classify — replays `'A'`
+  onto `'a'` and loses a source row at exit 0 (measured with v0.159.3
+  against Postgres 16: on its own chain, and on this release's chain with
+  the stamp disabled). The bump makes it refuse at its own
+  ceiling instead. Proportional: a full, a segment whose key collations
+  the stream established, a not-established *non-key* column, and every
+  MySQL, VStream and trigger-CDC segment keep their previous version
+  (under `REPLICA IDENTITY FULL` every column counts as a key here, so a
+  non-key nondeterministic column altered inside the window stamps too —
+  a loud refusal on an older binary, never a merge). Only a v0.160.0+
+  reader writes the shape, so no older chain needs re-stamping.
 
 If your backups don't use RLS, EXCLUDE constraints, or standalone
 sequences, you don't encrypt, sign or redact, and your source records a
 CDC position (or has no CDC at all), no `postgres-trigger` change
-segment of yours carries a non-integer number, and no backup window of
-yours changes a key column's collation, you'll never see a version
+segment of yours carries a non-integer number, no backup window of
+yours changes a key column's collation, and no Postgres backup window
+of yours alters a nondeterministic key column after writing rows to
+it, you'll never see a version
 above 1 on a finalized manifest and cross-version restore behaves
 exactly as it did pre-v0.94.1. If your backups *do* use any of them,
 you get the guarantee that older sluice can't silently land a restored

@@ -56,16 +56,33 @@ func stampKeyCollationDeltaOnAttach(m *irbackup.Manifest) {
 // them conservatively was tried and withdrawn (review 2026-10-12 #3): it
 // fired on virtually every VStream segment of a string-keyed table, cut
 // older binaries off those chains, and still missed the collation-only DDL,
-// which changes no VStream signature. An entry that does not decode stamps
-// (an older binary that cannot be shown the change must not read the
-// segment).
+// which changes no VStream signature.
+//
+// The SECOND tier it stamps, [irbackup.FormatVersionKeyCollationUnestablished]:
+// a history entry recording a key column whose collation is not established
+// for its rows ([migcore.KeyCollationUnestablished] — the Postgres reader's
+// {name, Unknown} for a column whose pg_attribute row is newer than the
+// decoded transaction, KEY-COLLATION-PG-LOOSENED-REPLAY). That entry usually
+// carries the parent's own collation NAME, so [migcore.KeyCollationChange]
+// sees no change and the 13 stamp does not fire; yet a v0.159.x binary arms
+// no guard for a same-named Unknown key and its broker does not refuse it,
+// so it would merge the window's rows at exit 0. This binary compares such
+// a key as bytes. Proportional: a non-key column so stamped, and a key whose
+// collation the stream established, move nothing.
+//
+// An entry that does not decode stamps BOTH tiers: it might be either shape,
+// and an older binary that cannot be shown the evidence must not read the
+// segment. Stamping only 13 there would leave it readable by v0.159.1–v0.159.3,
+// exactly the binaries the 14 tier exists to keep out; the cost of the higher
+// stamp is a loud refusal on those binaries for a segment this one cannot
+// classify either.
 //
 // What it does not change: this binary still restores a drain segment by
 // replaying the window onto the old key, and its applier guard, armed from
 // the same SchemaHistory, refuses the merge loudly (KEY-COLLATION-MERGE,
 // measured) — filed as KEY-COLLATION-DRAIN-NO-DELTA.
 func stampKeyCollationHistory(m *irbackup.Manifest, before *ir.Schema) {
-	if m == nil || before == nil {
+	if m == nil {
 		return
 	}
 	for _, h := range m.SchemaHistory {
@@ -75,16 +92,25 @@ func stampKeyCollationHistory(m *irbackup.Manifest, before *ir.Schema) {
 		after, err := ir.UnmarshalTable(h.TableJSON)
 		if err != nil || after == nil {
 			irbackup.StampKeyCollationDelta(m, true)
+			irbackup.StampKeyCollationUnestablished(m, true)
 			return
 		}
-		for _, b := range before.Tables {
-			if b == nil || b.Name != h.Table || (b.Schema != "" && h.Schema != "" && b.Schema != h.Schema) {
-				continue
+		// Against every parent table h may version (a side naming no schema
+		// matches any) — or none, for a table the window created, whose
+		// snapshot's own key still decides the 14 stamp.
+		parents := 0
+		if before != nil {
+			for _, b := range before.Tables {
+				if b == nil || b.Name != h.Table || (b.Schema != "" && h.Schema != "" && b.Schema != h.Schema) {
+					continue
+				}
+				parents++
+				irbackup.StampKeyCollationUnestablished(m, migcore.KeyCollationUnestablished(b, after))
+				irbackup.StampKeyCollationDelta(m, migcore.KeyCollationChange(b, after))
 			}
-			if migcore.KeyCollationChange(b, after) {
-				irbackup.StampKeyCollationDelta(m, true)
-				return
-			}
+		}
+		if parents == 0 {
+			irbackup.StampKeyCollationUnestablished(m, migcore.KeyCollationUnestablished(nil, after))
 		}
 	}
 }

@@ -424,10 +424,15 @@ func xvTopFormatFlags() []string {
 //
 // Version 13 is the third: it is stamped on a CDC SEGMENT whose schema delta
 // changes a key column's collation — never on a full either.
+//
+// Version 14 is the fourth: it is stamped on a CDC SEGMENT whose schema
+// history records a key column whose collation was not established for its
+// rows — never on a full.
 var xvShapeStampedTiers = map[int]string{
-	irbackup.FormatVersionPositionlessFull:  "TestBackup_CrossVersionPositionlessFull (internal/pipeline/backup)",
-	irbackup.FormatVersionExactNumbers:      "TestBackup_CrossVersionExactNumbers (internal/pipeline)",
-	irbackup.FormatVersionKeyCollationDelta: "TestBackup_CrossVersionKeyCollationDelta (internal/pipeline)",
+	irbackup.FormatVersionPositionlessFull:          "TestBackup_CrossVersionPositionlessFull (internal/pipeline/backup)",
+	irbackup.FormatVersionExactNumbers:              "TestBackup_CrossVersionExactNumbers (internal/pipeline)",
+	irbackup.FormatVersionKeyCollationDelta:         "TestBackup_CrossVersionKeyCollationDelta (internal/pipeline)",
+	irbackup.FormatVersionKeyCollationUnestablished: "TestBackup_CrossVersionKeyCollationUnestablished (internal/pipeline)",
 }
 
 // xvBackupFullTopFormat writes a full stamped at the current top format

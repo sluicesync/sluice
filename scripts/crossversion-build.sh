@@ -270,7 +270,8 @@ git worktree add --detach "$peer_worktree" "$peer_tag" >/dev/null
 # THE FOURTH AXIS: ONE BELOW-TIER BINARY PER SHAPE-STAMPED TIER.
 #
 # A tier suite (the positionless-full suite for 11, the exact-numbers
-# suite for 12, the key-collation-delta suite for 13) asserts that a release BELOW its tier refuses what the
+# suite for 12, the key-collation-delta suite for 13, the
+# key-collation-unestablished suite for 14) asserts that a release BELOW its tier refuses what the
 # tier stamps. Through FormatVersion 11 that release was simply OLD — and
 # the next bump broke it: OLD advances to the newest release below the
 # NEW top tier, which is AT the older tier and reads it (the 12 bump,
@@ -290,6 +291,13 @@ git worktree add --detach "$peer_worktree" "$peer_tag" >/dev/null
 # are exact, so the suite's premise cell (the old binary merges at exit 0)
 # would have nothing to measure. The symbol is the aspect's constant, read
 # from each tag's tree, so the choice is derived, not a hardcoded tag.
+#
+# The not-established-key tier (14, KEY-COLLATION-PG-LOOSENED-REPLAY) needs
+# no symbol: the reader that stamps a key "not established" and the guard
+# branch that compares it as bytes landed in the SAME release as the tier,
+# so every tag below 14 lacks both (v0.159.3, its below-tier binary today,
+# has neither `decodingXid` in the Postgres CDC reader nor the guard's
+# Unknown arm) — its own chain merges, which is the premise cell's harm.
 #
 # read_tier NAME — the value of a FormatVersion constant in manifest.go.
 read_tier() {
@@ -313,7 +321,7 @@ below_tag() {
 	return 1
 }
 
-tier_suites="POSITIONLESS:FormatVersionPositionlessFull EXACT_NUMBERS:FormatVersionExactNumbers KEY_COLLATION:FormatVersionKeyCollationDelta:AlterAspectColumnCollation@internal/pipeline/migcore/incremental_delta_shape.go"
+tier_suites="POSITIONLESS:FormatVersionPositionlessFull EXACT_NUMBERS:FormatVersionExactNumbers KEY_COLLATION:FormatVersionKeyCollationDelta:AlterAspectColumnCollation@internal/pipeline/migcore/incremental_delta_shape.go KEY_UNESTABLISHED:FormatVersionKeyCollationUnestablished"
 tier_lines=
 for entry in $tier_suites; do
 	name=${entry%%:*}

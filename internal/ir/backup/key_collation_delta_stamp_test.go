@@ -12,13 +12,15 @@ import (
 // spelling × carried × every tier it could start from: only an incremental
 // (a CDC segment, the only manifest kind that records a schema delta) whose
 // delta changed a key column's collation is raised, to exactly
-// [FormatVersionKeyCollationDelta], and nothing else moves. The expected
-// value is the rule stated here, not the function's output.
+// [FormatVersionKeyCollationDelta] — never LOWERED from a higher tier it
+// already carries ([FormatVersionKeyCollationUnestablished]) — and nothing
+// else moves. The expected value is the rule stated here, not the
+// function's output.
 func TestStampKeyCollationDelta(t *testing.T) {
 	startingVersions := []int{
 		FormatVersionLegacy, FormatVersionSecurityMetadata, FormatVersionCDCPositionBinding,
 		FormatVersionInjectiveChunkAAD, FormatVersionRedaction, FormatVersionPositionlessFull,
-		FormatVersionExactNumbers, FormatVersionKeyCollationDelta,
+		FormatVersionExactNumbers, FormatVersionKeyCollationDelta, FormatVersionKeyCollationUnestablished,
 	}
 	raised := 0
 	for _, kind := range []string{"", BackupKindFull, BackupKindIncremental} {
@@ -28,7 +30,7 @@ func TestStampKeyCollationDelta(t *testing.T) {
 				StampKeyCollationDelta(m, carried)
 				want := before
 				if carried && kind == BackupKindIncremental {
-					want = FormatVersionKeyCollationDelta
+					want = max(before, FormatVersionKeyCollationDelta)
 					raised++
 				}
 				if m.FormatVersion != want {

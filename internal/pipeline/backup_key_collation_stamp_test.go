@@ -265,7 +265,10 @@ func TestStampKeyCollationHistory(t *testing.T) {
 }
 
 // TestCDCSegmentCommitsStampFromHistory is the roster for the history-based
-// Bug 304 stamp (review 2026-10-12 #2, finding 2): every non-test function
+// Bug 304 stamp (review 2026-10-12 #2, finding 2) — and, since the same
+// function raises it, for the FormatVersion-14 not-established-key stamp
+// (KEY-COLLATION-PG-LOOSENED-REPLAY), whose evidence exists ONLY in the
+// SchemaHistory, so no delta writer could carry it: every non-test function
 // under internal/pipeline that SEALS a manifest — assigns `….BackupID =
 // irbackup.ComputeBackupID(…)` — must call stampKeyCollationHistory, unless
 // it is named below with a reason. It reaches what the delta-writer roster
@@ -330,7 +333,8 @@ func TestCDCSegmentCommitsStampFromHistory(t *testing.T) {
 			commits++
 			if !stamps {
 				t.Errorf("%s: %s seals a manifest without stampKeyCollationHistory — a window whose rows follow a key "+
-					"collation change its end diff cannot see restores merged on a pre-v0.159.1 binary (Bug 304; "+
+					"collation change its end diff cannot see restores merged on a pre-v0.159.1 binary (Bug 304), and one "+
+					"whose key collation was not established for its rows on a pre-v0.160.0 binary (FormatVersion 14; "+
 					"exempt it here with a reason if it seals no CDC segment)", fset.Position(fn.Pos()), fn.Name.Name)
 			}
 		}

@@ -267,7 +267,12 @@ import (
 //
 // v0.159.1 introduces FormatVersion=13 for a CDC segment whose schema delta
 // changes a KEY column's collation — see [FormatVersionKeyCollationDelta].
-const BackupFormatVersion = 13
+//
+// v0.160.0 introduces FormatVersion=14 for a CDC segment whose
+// SchemaHistory records a KEY column whose collation the change stream
+// could not establish for its rows — see
+// [FormatVersionKeyCollationUnestablished].
+const BackupFormatVersion = 14
 
 // FormatVersionLegacy / FormatVersionSecurityMetadata name the
 // historically-recorded values so callers don't sprinkle bare ints
@@ -508,7 +513,57 @@ const (
 	// AAD encoding (an encrypted segment is at 9 or above before its first
 	// chunk, and a plaintext chunk has no AAD).
 	FormatVersionKeyCollationDelta = 13
+
+	// FormatVersionKeyCollationUnestablished marks a CDC segment
+	// (incremental / streaming) whose [Manifest.SchemaHistory] records a
+	// primary-key or UNIQUE-key column whose collation is NOT ESTABLISHED
+	// for the rows the entry describes: named, no character set, determinism
+	// [ir.CollationDeterminismUnknown]. The Postgres change stream stamps
+	// that shape when the column's pg_attribute row is newer than, or from,
+	// the decoded transaction (KEY-COLLATION-PG-LOOSENED-REPLAY: a key
+	// tightened `ci` → "C", 'A' written beside 'a', moved, and loosened back
+	// reads `ci` for every Relation of the replayed window). A v0.160.0+
+	// applier compares such a key as bytes and its broker refuses it. A
+	// v0.159.x applier leaves it UNARMED — the name equals the target's, and
+	// only a known determinism arms a same-named key — and its broker does
+	// not refuse it, so the replayed 'A' lands on 'a' under `ci` and a source
+	// row is gone at exit 0. The name is unchanged, so neither
+	// [FormatVersionKeyCollationDelta] stamp sees a collation change; without
+	// this tier the segment stays readable by exactly the binaries that merge
+	// it (the item-104 cross-version shape). The bump makes every
+	// pre-v0.160.0 reader refuse the manifest at its own ceiling.
+	//
+	// Proportional: stamped by [StampKeyCollationUnestablished] only on an
+	// incremental whose window's history records such a key, or whose
+	// history holds an entry that does not decode (the caller classifies
+	// both: this package names no collation rule). A non-key column so
+	// stamped, a key whose collation the stream did establish (deterministic
+	// or nondeterministic), a change stream that records no collation at all
+	// (VStream, pgtrigger), and every full keep their previous version. No
+	// older segment needs restamping: only the v0.160.0 reader writes the
+	// shape.
+	//
+	// Above the key-collation-delta tier so a 14-stamped manifest keeps
+	// every lower `>=` fold; none of them changes between 9 and 14 (the folds
+	// sit at 8, 9 and 10), so raising a segment to 14 after its row chunks
+	// sealed changes no sealed chunk's AAD encoding (an encrypted segment is
+	// at 9 or above before its first chunk, and a plaintext chunk has no
+	// AAD).
+	FormatVersionKeyCollationUnestablished = 14
 )
+
+// StampKeyCollationUnestablished raises m.FormatVersion to
+// [FormatVersionKeyCollationUnestablished] when carried is true and m is a
+// CDC segment (incremental). carried is the writer's report that the
+// segment's SchemaHistory records a key column whose collation the change
+// stream could not establish for its rows. Idempotent; a no-op for a full
+// and when carried is false. MUST run before [ComputeBackupID], for the
+// reason [StampExactNumbers] gives.
+func StampKeyCollationUnestablished(m *Manifest, carried bool) {
+	if m != nil && carried && canonicalKind(m.Kind) == BackupKindIncremental {
+		m.FormatVersion = max(m.FormatVersion, FormatVersionKeyCollationUnestablished)
+	}
+}
 
 // StampKeyCollationDelta raises m.FormatVersion to
 // [FormatVersionKeyCollationDelta] when carried is true and m is a CDC
@@ -675,6 +730,10 @@ var minimumReaderVersion = map[int]string{
 	FormatVersionPositionlessFull:      "v0.154.0",
 	FormatVersionExactNumbers:          "v0.156.4",
 	FormatVersionKeyCollationDelta:     "v0.159.1",
+	// ASSUMES the tier ships in the next tag, v0.160.0 (a minor: it is a
+	// backup format break); a release cut under another name corrects it
+	// here and in docs/backup-format-versioning.md.
+	FormatVersionKeyCollationUnestablished: "v0.160.0",
 }
 
 // MinimumReaderVersion names the earliest sluice release that can read a
