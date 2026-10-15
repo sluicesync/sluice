@@ -307,11 +307,12 @@ jobs:
       fail-fast: false
       matrix:
         shard:
-          # internal/pipeline/backup appears in ALL FOUR pipeline shards, not
-          # only the -skip one. The four filters partition the test-name space
+          # internal/pipeline/backup appears in ALL FIVE pipeline shards, not
+          # only the -skip one. The five filters partition the test-name space
           # (TestMigrate_ | TestStreamer_ minus the crash prefix |
-          # TestStreamer_CrashMidTxn_ | -skip TestMigrate_ and TestStreamer_),
-          # and that partition is complete only FOR A PACKAGE LISTED IN ALL FOUR.
+          # TestStreamer_CrashMidTxn_ | TestRenameSwap and TestChain | -skip all
+          # of those), and that partition is complete only FOR A PACKAGE LISTED
+          # IN ALL FIVE.
           # Listing backup under -skip alone meant a TestMigrate_- or
           # TestStreamer_-named integration test there would have run in NO
           # job, with both self-guards green (audit 2026-07-26 TEST-1).
@@ -338,12 +339,21 @@ jobs:
           # parse step with `syntax error near unexpected token '('`.
           # internal/pipeline/backup carries the backup/restore/chain
           # orchestration carved out of the flat pipeline root (audit
-          # 3.7b-2). It is listed across ALL FOUR pipeline shards (see the
+          # 3.7b-2). It is listed across ALL FIVE pipeline shards (see the
           # note above) so an integration-tagged test there runs whatever
           # its name.
+          # 2026-10-15 rebalance (CI-REST-OTHER-SHARD-SPLIT): rest-other's
+          # go test binary ran 5074 s of its 105m budget on the v0.160.0 tag
+          # (run 38666235637). Of the ~8540 test-seconds in that log the
+          # TestRenameSwap* family was ~3890 (four 550 s parallel cells) and
+          # TestChain* ~1350, so both prefixes move to their own shard. The
+          # -skip shard below excludes them in the same regex.
+          - name: pipeline-renameswap-chain
+            packages: "./internal/pipeline/ ./internal/pipeline/backup/"
+            goflags: "-run '^(TestRenameSwap|TestChain)'"
           - name: pipeline-rest-other
             packages: "./internal/pipeline/ ./internal/pipeline/backup/"
-            goflags: "-skip '^(TestMigrate_|TestStreamer_)'"
+            goflags: "-skip '^(TestMigrate_|TestStreamer_|TestRenameSwap|TestChain)'"
           - name: engines-mysql
             packages: "./internal/engines/mysql/... ./internal/rowpredicate/"
             goflags: ""
