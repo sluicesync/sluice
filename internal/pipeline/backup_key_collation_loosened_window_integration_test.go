@@ -33,6 +33,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
@@ -687,27 +688,78 @@ func TestChainRestore_UnloggedRevertedKeyCollationBeforeTheWindowsFirstRow(t *te
 					t.Fatal(err)
 				}
 				captureErr := krwCapture(t, lane, myEng, srcDSN, "", store, full.BackupID, src, window)
-				if captureErr != nil {
-					// The only capture refusal this window may draw: the reader
-					// meeting a row whose recorded collation no logged DDL
-					// announced. Anything else would pass the cell ungraded.
+				if trailing {
+					// The row after the revert carries the reverted collation,
+					// which no logged DDL announced since kd's first row: the
+					// reader refuses it. Required, not accepted: a capture that
+					// passed here would be an unannounced change let through.
 					if !errors.Is(captureErr, ir.ErrDeferredSchemaChange) || !strings.Contains(captureErr.Error(), "COLLATION-CHANGE-UNANNOUNCED") {
-						t.Fatalf("capture = %v; want success or DEFERRED-SCHEMA-CHANGE COLLATION-CHANGE-UNANNOUNCED", captureErr)
+						t.Fatalf("capture = %v; want DEFERRED-SCHEMA-CHANGE COLLATION-CHANGE-UNANNOUNCED at the row after the revert", captureErr)
 					}
-					t.Logf("capture refused: %v", captureErr)
+					graded++
 					return
 				}
+				// No row after the revert: the seeded-basis boundary path
+				// (SEEDED-BOUNDARY-PIN-NONDISCRIMINATING). Capture must
+				// SUCCEED — the earlier refuse-at-capture behaviour fails
+				// here, not passes — and record the `_bin` shape kd's rows
+				// were written under as a version anchored at the stream's
+				// start, which the restore then guards them under.
+				if captureErr != nil {
+					t.Fatalf("capture = %v; want success: kd's first row owes a boundary at the stream's start, not a refusal", captureErr)
+				}
+				klwRequireStreamStartVersion(t, store, "kd", "k", "utf8mb4_bin")
 				applyErr := (&backup.ChainRestore{Target: myEng, TargetDSN: tgtDSN, Store: store}).Run(ctx)
 				t.Logf("apply = %v; source %s target %s", applyErr, kcfbRender(kcfbRows(t, src)), kcfbRender(kcfbRows(t, tgt)))
+				if !errors.Is(applyErr, ir.ErrKeyCollationMerge) {
+					t.Fatalf("restore = %v; want the guard's KEY-COLLATION-MERGE (from the version at the stream's start)", applyErr)
+				}
 				kcfbGrade(t, name, src, tgt, applyErr)
 				graded++
 			})
 		}
 	}
-	// Anti-vacuity floor: the two "no row after the revert" cells have no
-	// row for the reader to refuse at, so they always reach the grade (the
-	// cells with a trailing row refuse at capture, measured on CI).
-	if graded < 2 {
-		t.Errorf("%d of %d cells reached the grade; want at least 2", graded, n)
+	// Anti-vacuity floor: every cell grades its own required outcome — the
+	// trailing cells the capture refusal, the others a restore refusal of a
+	// successful capture — so none may end early.
+	if graded != n {
+		t.Errorf("%d of %d cells reached the grade; want all", graded, n)
 	}
+}
+
+// klwRequireStreamStartVersion fails t unless some incremental of the chain
+// in store records a schema version of table anchored at the stream's start
+// (the first incremental's StartPosition) whose column carries collation.
+func klwRequireStreamStartVersion(t *testing.T, store irbackup.Store, table, column, collation string) {
+	t.Helper()
+	recs, err := lineage.ListAllSegmentManifests(context.Background(), store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start, seen := "", []string{}
+	for _, rec := range recs {
+		m := rec.Manifest
+		if m == nil || m.Kind != irbackup.BackupKindIncremental {
+			continue
+		}
+		if start == "" {
+			start = m.StartPosition.Token
+		}
+		for _, e := range m.SchemaHistory {
+			if e == nil || e.Table != table {
+				continue
+			}
+			tbl, err := ir.UnmarshalTable(e.TableJSON)
+			if err != nil {
+				t.Fatalf("decode schema-history entry of %s: %v", table, err)
+			}
+			got := klwColumnCollation(&ir.Schema{Tables: []*ir.Table{tbl}}, table, column)
+			seen = append(seen, fmt.Sprintf("%s@%s", got, e.AnchorPosition.Token))
+			if start != "" && e.AnchorPosition.Token == start && got == collation {
+				return
+			}
+		}
+	}
+	t.Fatalf("no schema version of %s.%s under %s anchored at the stream's start %q; versions seen: %v",
+		table, column, collation, start, seen)
 }
