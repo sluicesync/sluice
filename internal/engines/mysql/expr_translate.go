@@ -95,6 +95,10 @@ func translateExprForMySQL(expr string) string {
 	// PG→MySQL leg). This runs first because the later operator/function
 	// rewrites and the requote pass must see MySQL-form identifiers.
 	expr = rewritePGIdentQuotes(expr)
+	// Postgres prints trim(x) as TRIM(BOTH FROM x), which MySQL cannot store
+	// ([rewritePGTrimKeywordOnly]); after the quote rewrite, so a quoted
+	// column remove-string is already backticked and left alone.
+	expr = rewritePGTrimKeywordOnly(expr)
 	// Order matters. Casts must run before the || rewriter so a cast
 	// on a string-concat operand doesn't confuse the concat-chain
 	// detector. ANY(ARRAY[...]) must run before the cast pass too —

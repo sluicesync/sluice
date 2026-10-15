@@ -145,8 +145,17 @@ func TestRequotePGReservedIdents_TrimKeywordsStayGrammar(t *testing.T) {
 		// trim(`Leading`) and concat(trim(`trailing`),'!').
 		{"trim(Leading)", `trim("Leading")`},
 		{"concat(trim(trailing),'!')", `concat(trim("Trailing"),'!')`},
-		// A column followed by an operator is an operand, not the keyword.
-		{"trim(both || 'x' from s)", `trim("both" || 'x' from s)`},
+		// A column-led remove-string with an operator: MySQL stores it
+		// parenthesized, so the inner group is not TRIM's.
+		{"trim((both - 1) from s)", `trim(("both" - 1) from s)`},
+		// The keyword before a unary-minus remove-string: MySQL stores
+		// trim(both -1 from c) as trim(both -(1) from c), MariaDB as
+		// trim(both -1 from c) (Bug 311 review, F2).
+		{"trim(both -(1) from s)", "trim(both -(1) from s)"},
+		{"trim(both -1 from s)", "trim(both -1 from s)"},
+		// MariaDB prints the keyword first, then a column-led remove-string.
+		{"trim(leading Leading - 1 from s)", `trim(leading "Leading" - 1 from s)`},
+		{"trim(both trim(s) from s)", "trim(both trim(s) from s)"},
 		// Outside TRIM they are always columns.
 		{"Leading + 1", `"Leading" + 1`},
 		{"both || s", `"both" || s`},

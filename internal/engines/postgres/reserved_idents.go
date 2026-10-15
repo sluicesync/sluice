@@ -83,8 +83,9 @@ var pgExprGrammarKeywords = map[string]struct{}{
 // the grammar-`FROM` shapes.
 //
 // `LEADING`, `TRAILING` and `BOTH` are grammar only as the FIRST token of a
-// `TRIM(…)` argument list with an operand after it ([exprident.ContextRule]
-// LeadsOperand): `TRIM(BOTH 'x' FROM s)`, `TRIM(LEADING c FROM s)`. Anywhere
+// `TRIM(…)` argument list with a remove-string and then FROM after it
+// ([exprident.ContextRule] LeadsOperand): `TRIM(BOTH 'x' FROM s)`,
+// `TRIM(LEADING c FROM s)`, `TRIM(BOTH -(1) FROM s)`. Anywhere
 // else they are column references the source quoted, and the read boundary
 // stripped that quoting. Both mistakes are silent, because each misreading is
 // valid Postgres that trims different characters:
@@ -92,7 +93,7 @@ var pgExprGrammarKeywords = map[string]struct{}{
 //   - Quoting the keyword (`TRIM("Leading" 'x' FROM s)` is a syntax error,
 //     but `TRIM("Leading" FROM s)` trims the column's characters): the
 //     value-fidelity review of v0.160.1.
-//   - Leaving a column bare (“trim(`both` from `code`)“ read as
+//   - Leaving a column bare (MySQL stores trim(`both` from `code`), read as
 //     `TRIM(BOTH FROM code)`, trimming spaces instead of the column's
 //     characters): Bug 311, which v0.160.1's first cut of this rule
 //     introduced by keeping the word bare anywhere inside TRIM.

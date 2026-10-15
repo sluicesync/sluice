@@ -208,3 +208,40 @@ func TestTranslateGeneratedExpr_PGSourceReservedWord(t *testing.T) {
 		t.Errorf("translateIndexExpr = %q; want %q", got, want)
 	}
 }
+
+// TestRequoteMySQLReservedIdents_TrimKeywords pins Bug 311's MySQL-writer
+// half for both source dialects. A MySQL source's text has lost its
+// backticks, so the word is the keyword only when it leads a remove-string
+// and FROM (the shapes MySQL 8.0.46 and MariaDB 11.4 store). A Postgres
+// source prints trim(x) as `TRIM(BOTH FROM x)`, which MySQL cannot store
+// and the positional rule would read as a column (review finding F1), so
+// the PG→MySQL translator rewrites it to TRIM/LTRIM/RTRIM first
+// ([rewritePGTrimKeywordOnly]); the second table runs that composition.
+func TestRequoteMySQLReservedIdents_TrimKeywords(t *testing.T) {
+	for _, c := range []struct{ in, want string }{
+		{"trim(both 'x' from code)", "trim(both 'x' from code)"},
+		{"trim(both from code)", "trim(`both` from code)"},
+		{"trim(both both from code)", "trim(both `both` from code)"},
+		{"trim(leading code from code)", "trim(leading code from code)"},
+		{"trim(both -(1) from code)", "trim(both -(1) from code)"},
+		{"concat(trim(trailing),'!')", "concat(trim(`trailing`),'!')"},
+		{"both + 1", "`both` + 1"},
+	} {
+		if got := requoteMySQLReservedIdents(c.in); got != c.want {
+			t.Errorf("requoteMySQLReservedIdents(%q) = %q; want %q", c.in, got, c.want)
+		}
+	}
+	for _, c := range []struct{ in, want string }{
+		{"TRIM(BOTH FROM code)", "TRIM(code)"},
+		{"(TRIM(LEADING FROM code) <> '')", "(LTRIM(code) <> '')"},
+		{"TRIM(TRAILING FROM\n code)", "RTRIM(code)"},
+		{"TRIM(TRAILING 'x' FROM code)", "TRIM(TRAILING 'x' FROM code)"},
+		{`TRIM(BOTH "both" FROM code)`, "TRIM(BOTH `both` FROM code)"},
+		{`TRIM(BOTH FROM "both")`, "TRIM(`both`)"},
+		{"'TRIM(BOTH FROM x)'", "'TRIM(BOTH FROM x)'"},
+	} {
+		if got := requoteMySQLReservedIdents(translateExprForMySQL(c.in)); got != c.want {
+			t.Errorf("PG→MySQL %q = %q; want %q", c.in, got, c.want)
+		}
+	}
+}

@@ -434,27 +434,66 @@ func (r ContextRule) isGrammar(prevTok string, fnStack []string, lead bool) bool
 }
 
 // tokenLeadsOperand reports whether the token ending at expr[end] is
-// followed, across whitespace, by the start of an operand: a string
-// literal, a quoted identifier, a number, a parenthesised group, or a word
-// other than FROM. It is false before FROM, `)`, `,` or an operator.
+// followed by an operand and then, still in the same paren group, by a bare
+// FROM: the shape `BOTH <remstr> FROM s`. It is false when FROM comes next
+// (`both FROM s`: the word IS the remove-string), and when the group has no
+// FROM at all (`trim(both)`, SQLite's `trim(both, 'x')`).
+//
+// The remove-string may start with anything, including a unary operator:
+// MySQL stores `trim(both -1 from c)` as `trim(both -(1) from c)` (Bug 311
+// review, finding F2). A column-first remove-string with a binary operator
+// is never stored bare — MySQL parenthesizes it (`trim((both - 1) from c)`)
+// and MariaDB prints the keyword first — so it cannot be mistaken for
+// `BOTH <remstr>`.
 func tokenLeadsOperand(expr string, end int, q byte) bool {
-	k := end
-	for k < len(expr) && (expr[k] == ' ' || expr[k] == '\t' || expr[k] == '\n' || expr[k] == '\r') {
-		k++
-	}
-	if k >= len(expr) {
-		return false
-	}
-	c := expr[k]
-	switch {
-	case c == '\'' || c == q || c == '(' || (c >= '0' && c <= '9'):
-		return true
-	case IsIdentStartByte(c):
-		j := k
-		for j < len(expr) && IsIdentifierByte(expr[j]) {
-			j++
+	depth := 0
+	first := true
+	for k := end; k < len(expr); {
+		c := expr[k]
+		switch {
+		case c == ' ' || c == '\t' || c == '\n' || c == '\r':
+			k++
+			continue
+		case c == '\'':
+			k = ScanStringLiteral(expr, k)
+		case c == q:
+			k++
+			for k < len(expr) {
+				if expr[k] == q {
+					if k+1 < len(expr) && expr[k+1] == q {
+						k += 2
+						continue
+					}
+					k++
+					break
+				}
+				k++
+			}
+		case c == '(':
+			depth++
+			k++
+		case c == ')':
+			if depth == 0 {
+				return false
+			}
+			depth--
+			k++
+		case IsIdentStartByte(c):
+			j := k
+			for j < len(expr) && IsIdentifierByte(expr[j]) {
+				j++
+			}
+			if depth == 0 && strings.EqualFold(expr[k:j], "FROM") {
+				return !first
+			}
+			k = j
+		default:
+			if depth == 0 && c == ',' {
+				return false
+			}
+			k++
 		}
-		return !strings.EqualFold(expr[k:j], "FROM")
+		first = false
 	}
 	return false
 }

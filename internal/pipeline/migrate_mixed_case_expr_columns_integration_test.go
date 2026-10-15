@@ -170,6 +170,22 @@ func testTrimKeywordColumns(t *testing.T, target string) {
 		INSERT INTO trim_words (id, code, ~both~, ~Leading~, ~trailing~)
 		VALUES (1, 'xbabx', 'b', 'x', '  t  '), (2, 'bbabb', 'b', 'b', 't'), (3, '  bab  ', 'b', ' ', ' tt');
 	`, "~", "`"))
+	if target == "mysql" {
+		// The keyword before a unary-minus remove-string, which MySQL stores
+		// as trim(both -(1) from code), beside an INT column named both: read
+		// as the column it becomes a subtraction, silently (review finding F2).
+		// MySQL target only: Postgres has no numeric remove-string, so there
+		// the correct reading is a loud 42883 either way.
+		applyMySQLDDL(t, mysqlSource, strings.ReplaceAll(`
+		CREATE TABLE trim_neg (
+			id     INT NOT NULL PRIMARY KEY,
+			code   VARCHAR(20),
+			~both~ INT,
+			g_neg  VARCHAR(20) AS (trim(both -1 from code)) STORED
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+		INSERT INTO trim_neg (id, code, ~both~) VALUES (1, '-1a-1', 5), (2, '-1-1x', 2);
+	`, "~", "`"))
+	}
 
 	runMigrate(t, "mysql", target, mysqlSource, tgtDSN)
 
@@ -186,42 +202,111 @@ func testTrimKeywordColumns(t *testing.T, target string) {
 	}
 	defer func() { _ = tgt.Close() }()
 
-	read := func(db *sql.DB, q string) map[int][5]string {
-		t.Helper()
+	compareGeneratedWithSource(ctx, t, src, tgt, "trim_words", 3, "g_kw", "g_col", "g_mix", "g_lead", "g_one")
+	if target == "mysql" {
+		compareGeneratedWithSource(ctx, t, src, tgt, "trim_neg", 2, "g_neg")
+	}
+}
+
+// TestMigrate_PostgresToMySQL_TrimKeywordForms is the Bug 311 review's
+// finding F1 on real servers. Postgres prints trim(x) as
+// `TRIM(BOTH FROM x)` (and ltrim-by-keyword as `TRIM(LEADING FROM x)`),
+// a form MySQL and MariaDB never store, so the positional rule a MySQL
+// source's de-quoted text needs would read the keyword as a column on a
+// MySQL target: a refusal (`Unknown column 'BOTH'`) for a table without
+// such a column, and a silent wrong trim for one with it. Postgres quotes
+// every column of these names, so its text takes the keyword reading.
+// The table carries a `both` column to make the wrong reading silent, and
+// the values are compared with what Postgres computed.
+func TestMigrate_PostgresToMySQL_TrimKeywordForms(t *testing.T) {
+	pgSource, _, pgCleanup := startPostgres(t)
+	defer pgCleanup()
+	_, mysqlTarget, mysqlCleanup := startMySQL(t)
+	defer mysqlCleanup()
+
+	applyPGDDL(t, pgSource, `
+		CREATE TABLE trim_pg (
+			id     INT PRIMARY KEY,
+			code   VARCHAR(20),
+			"both" VARCHAR(5),
+			g_trim VARCHAR(20) GENERATED ALWAYS AS (trim(code)) STORED,
+			g_lead VARCHAR(20) GENERATED ALWAYS AS (trim(leading from code)) STORED,
+			g_col  VARCHAR(20) GENERATED ALWAYS AS (trim(both "both" from code)) STORED,
+			CONSTRAINT code_not_blank CHECK (trim(leading from code) <> '')
+		);
+		CREATE INDEX trim_pg_code ON trim_pg ((trim(both from code)));
+		INSERT INTO trim_pg (id, code, "both") VALUES (1, '  aba  ', 'a'), (2, 'aba', 'a');
+	`)
+
+	runMigrate(t, "postgres", "mysql", pgSource, mysqlTarget)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	src, err := sql.Open("pgx", pgSource)
+	if err != nil {
+		t.Fatalf("open pg source: %v", err)
+	}
+	defer func() { _ = src.Close() }()
+	tgt, err := sql.Open("mysql", mysqlTarget)
+	if err != nil {
+		t.Fatalf("open mysql target: %v", err)
+	}
+	defer func() { _ = tgt.Close() }()
+
+	compareGeneratedWithSource(ctx, t, src, tgt, "trim_pg", 2, "g_trim", "g_lead", "g_col")
+	// The CHECK landed and still means trim-then-compare: an all-blank code
+	// is refused, and a padded one is accepted.
+	if _, err := tgt.ExecContext(ctx, "INSERT INTO trim_pg (id, code) VALUES (3, '   ')"); err == nil {
+		t.Errorf("an all-blank code was accepted; the CHECK did not land as trim(leading from code) <> ''")
+	}
+	if _, err := tgt.ExecContext(ctx, "INSERT INTO trim_pg (id, code) VALUES (4, ' x ')"); err != nil {
+		t.Errorf("a padded code was refused: %v", err)
+	}
+}
+
+// compareGeneratedWithSource reads id plus cols from table on both sides and
+// requires every target value to equal the value the source server
+// computed — the independent expected value for a translated expression.
+func compareGeneratedWithSource(ctx context.Context, t *testing.T, src, tgt *sql.DB, table string, wantRows int, cols ...string) {
+	t.Helper()
+	q := "SELECT id, " + strings.Join(cols, ", ") + " FROM " + table + " ORDER BY id"
+	read := func(db *sql.DB, side string) map[int][]sql.NullString {
 		rows, err := db.QueryContext(ctx, q)
 		if err != nil {
-			t.Fatalf("read generated columns: %v", err)
+			t.Fatalf("read %s on the %s: %v", table, side, err)
 		}
 		defer func() { _ = rows.Close() }()
-		out := map[int][5]string{}
+		out := map[int][]sql.NullString{}
 		for rows.Next() {
 			var id int
-			var v [5]string
-			if err := rows.Scan(&id, &v[0], &v[1], &v[2], &v[3], &v[4]); err != nil {
-				t.Fatalf("scan: %v", err)
+			v := make([]sql.NullString, len(cols))
+			dest := []any{&id}
+			for i := range v {
+				dest = append(dest, &v[i])
+			}
+			if err := rows.Scan(dest...); err != nil {
+				t.Fatalf("scan %s on the %s: %v", table, side, err)
 			}
 			out[id] = v
 		}
 		if err := rows.Err(); err != nil {
-			t.Fatalf("rows: %v", err)
+			t.Fatalf("rows %s on the %s: %v", table, side, err)
 		}
 		return out
 	}
-	want := read(src, "SELECT id, g_kw, g_col, g_mix, g_lead, g_one FROM trim_words ORDER BY id")
-	got := read(tgt, `SELECT id, g_kw, g_col, g_mix, g_lead, g_one FROM trim_words ORDER BY id`)
-	if len(want) != 3 {
-		t.Fatalf("source rows = %d; want 3", len(want))
+	want, got := read(src, "source"), read(tgt, "target")
+	if len(want) != wantRows {
+		t.Fatalf("%s: source rows = %d; want %d", table, len(want), wantRows)
 	}
-	names := [5]string{"g_kw", "g_col", "g_mix", "g_lead", "g_one"}
 	for id, w := range want {
 		g, ok := got[id]
 		if !ok {
-			t.Errorf("row %d missing on the target", id)
+			t.Errorf("%s row %d missing on the target", table, id)
 			continue
 		}
 		for i := range w {
 			if g[i] != w[i] {
-				t.Errorf("row %d %s = %q on the target; the source computed %q", id, names[i], g[i], w[i])
+				t.Errorf("%s row %d %s = %q on the target; the source computed %q", table, id, cols[i], g[i].String, w[i].String)
 			}
 		}
 	}
