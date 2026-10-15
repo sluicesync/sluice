@@ -58,9 +58,9 @@ ADR-0016 layer but lands in the per-engine emit code.
 
 | Source shape | Behavior | Notes |
 |---|---|---|
-| Column references | Verbatim, identifier-requoted per dialect | ADR-0045 |
+| Column references | Verbatim, identifier-requoted per dialect; on a Postgres target a MySQL or SQLite body's column references are resolved case-insensitively against the table and emitted under the column's real name, quoted where Postgres would fold it (v0.160.1, GitHub #356). Words the grammar takes bare (a type after `AS` or `::`, a `COLLATE` name, an `INTERVAL` unit, the field of `EXTRACT`/`TIMESTAMPDIFF`/`TIMESTAMPADD`) are left alone even when a column shares the name | ADR-0045 |
 | Arithmetic / comparison | Verbatim | Operators identical across engines |
-| `LOWER(x)` / `UPPER(x)` | Verbatim | Identifier case follows the dialect rules |
+| `LOWER(x)` / `UPPER(x)` | Verbatim | Column references inside resolve as in the first row |
 | `LENGTH(x)` | Verbatim | Both engines accept |
 | `CAST(x AS TYPE)` | Verbatim for parameterised casts | Some shapes refuse — see "Deferred rules" |
 | `COALESCE(...)` | Verbatim | Both engines accept identically |

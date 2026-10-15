@@ -564,6 +564,11 @@ func TestParseCreateTable_ColumnCollationsResolveLikeTheServer(t *testing.T) {
 			map[string]ir.Type{"k": ir.Varchar{Length: 10, Charset: "utf8mb3"}},
 		},
 		{
+			"utf8 and utf8mb3 spellings on one table line name one charset",
+			"CREATE TABLE `t` (`k` varchar(10)) DEFAULT CHARSET=utf8mb3 COLLATE=utf8_bin;",
+			map[string]ir.Type{"k": ir.Varchar{Length: 10, Charset: "utf8mb3", Collation: "utf8_bin"}},
+		},
+		{
 			"no table options leave the column as it was",
 			"CREATE TABLE `t` (`k` varchar(10));",
 			map[string]ir.Type{"k": ir.Varchar{Length: 10}},

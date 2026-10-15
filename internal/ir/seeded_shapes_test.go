@@ -41,3 +41,18 @@ func TestSeededShapes_NamespaceRule(t *testing.T) {
 		t.Error("an unseeded table answered")
 	}
 }
+
+// TestSeededShapes_NamespacelessLastWins documents a LATENT limit, not a
+// feature: two namespace-less shapes of one table name collapse to the
+// last seeded. No backup records more than one database today (ADR-0074's
+// multi-database path is migrate and sync only), so it cannot arise; if a
+// multi-database backup is ever added, its manifests must name namespaces
+// or this lookup will guard one database's table with another's shape.
+func TestSeededShapes_NamespacelessLastWins(t *testing.T) {
+	var s SeededShapes
+	first, second := &Table{Name: "kd"}, &Table{Name: "kd"}
+	s.Seed([]*Table{first, second})
+	if got := s.Lookup("db1", "kd"); got != second {
+		t.Errorf("Lookup = %v; want the last namespace-less shape seeded", got)
+	}
+}

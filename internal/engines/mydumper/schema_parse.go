@@ -1148,7 +1148,7 @@ func (b *tableBuilder) inheritTableCollation() {
 		return
 	}
 	collation := ""
-	if charsetOfCollation(b.tableCollation) == charset {
+	if sameCharset(charsetOfCollation(b.tableCollation), charset) {
 		collation = b.tableCollation
 	}
 	for _, col := range b.table.Columns {
@@ -1170,6 +1170,19 @@ func (b *tableBuilder) inheritTableCollation() {
 			}
 		}
 	}
+}
+
+// sameCharset reports whether two charset names name one charset: `utf8` is
+// MySQL's older spelling of `utf8mb3`, and a dump can mix them
+// (`CHARSET=utf8mb3 COLLATE=utf8_bin`).
+func sameCharset(a, b string) bool {
+	canon := func(s string) string {
+		if s == "utf8" {
+			return "utf8mb3"
+		}
+		return s
+	}
+	return canon(a) == canon(b)
 }
 
 // charsetOfCollation derives a collation's charset: MySQL collation names

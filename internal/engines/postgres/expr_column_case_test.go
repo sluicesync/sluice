@@ -118,3 +118,29 @@ func TestResolveColumnName(t *testing.T) {
 func noParens(s string) string {
 	return strings.NewReplacer("(", "", ")", "").Replace(s)
 }
+
+// TestRequotePGReservedIdents_TrimKeywordsStayGrammar pins the value-fidelity
+// review's v0.160.1 finding: inside TRIM(...), LEADING / TRAILING / BOTH are
+// grammar even when the table has a column of that name. Re-quoting one
+// (`TRIM("Leading" FROM s)`) is valid Postgres that trims the characters held
+// in that column, so a generated column would compute different values,
+// silently. The same words outside TRIM are column references.
+func TestRequotePGReservedIdents_TrimKeywordsStayGrammar(t *testing.T) {
+	tbl := &ir.Table{Columns: []*ir.Column{{Name: "Leading"}, {Name: "both"}, {Name: "Trailing"}, {Name: "s"}}}
+	for _, c := range []struct{ in, want string }{
+		{"trim(leading from s)", "trim(leading from s)"},
+		{"trim(both from s)", "trim(both from s)"},
+		{"trim(TRAILING 'x' from s)", "trim(TRAILING 'x' from s)"},
+		{"Leading + 1", `"Leading" + 1`},
+		{"both || s", `"both" || s`},
+	} {
+		if got := requotePGReservedIdents(c.in, tbl); got != c.want {
+			t.Errorf("requotePGReservedIdents(%q) = %q; want %q", c.in, got, c.want)
+		}
+	}
+	// The reserved-word pass alone (no table) had the same defect for a
+	// lower-case `leading` column.
+	if got := requotePGReservedIdents("trim(leading from s)", nil); got != "trim(leading from s)" {
+		t.Errorf("reserved-word pass re-quoted a TRIM keyword: %q", got)
+	}
+}

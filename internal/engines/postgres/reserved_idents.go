@@ -60,7 +60,7 @@ var pgExprGrammarKeywords = map[string]struct{}{
 // ONLY in a specific syntactic position and are an ordinary column
 // identifier everywhere else (see [exprident.ContextRule]).
 //
-// `FROM` is the sole entry. PostgreSQL's grammar permits a bare,
+// `FROM` is the first entry. PostgreSQL's grammar permits a bare,
 // unquoted `FROM` in an expression body in exactly two shapes:
 //
 //   - `IS [NOT] DISTINCT FROM` — `FROM` immediately follows `DISTINCT`.
@@ -81,7 +81,18 @@ var pgExprGrammarKeywords = map[string]struct{}{
 // any generated-column / expression-index / DEFAULT referencing a
 // `from` column); the position-aware rule fixes it without regressing
 // the grammar-`FROM` shapes.
+//
+// `LEADING`, `TRAILING` and `BOTH` are grammar inside `TRIM(…)` only
+// (`TRIM(LEADING FROM s)`, which MySQL stores in exactly that form). Outside
+// it they are column references. Inside it, re-quoting one as a column
+// (`TRIM("Leading" FROM s)`) is VALID Postgres that trims the characters held
+// in that column, so a generated column computed different values at exit 0
+// (value-fidelity review of v0.160.1; the reserved-word pass had the same
+// defect for a lower-case `leading` column).
 var pgExprContextualKeywords = map[string]exprident.ContextRule{
+	"LEADING":  {InFunction: map[string]struct{}{"TRIM": {}}},
+	"TRAILING": {InFunction: map[string]struct{}{"TRIM": {}}},
+	"BOTH":     {InFunction: map[string]struct{}{"TRIM": {}}},
 	"FROM": {
 		AfterToken: map[string]struct{}{"DISTINCT": {}},
 		InFunction: map[string]struct{}{

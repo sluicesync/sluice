@@ -702,16 +702,19 @@ func ReconcileSameAnchorVersions(kept, later *ir.Table, keys *ir.Schema) (weaken
 // a key column's collation, for a replay that cannot place each schema
 // version ahead of the changes written under it — why says which. `sync
 // from-backup` is one: its change stream carries the source's events only,
-// so its applier never sees a window's versions at all and its key-collation
-// guard is never armed from one (KEY-COLLATION-REVERTED-WINDOW-RESTORE and
-// KEY-COLLATION-LOOSENED-WINDOW, both measured on the broker: target row 1
-// held 'A' where the source holds 'a', exit 0).
+// so its applier never sees a window's versions: since v0.160.1 it arms
+// from the segment's recorded schema, ONE shape for the whole window
+// (KEY-COLLATION-BROKER-UNARMED), which is sound only when no version
+// disagrees with it, and this refusal is what makes that so
+// (KEY-COLLATION-REVERTED-WINDOW-RESTORE and KEY-COLLATION-LOOSENED-WINDOW,
+// both measured on the broker: target row 1 held 'A' where the source holds
+// 'a', exit 0).
 //
 // A version whose key collation is NOT ESTABLISHED
 // ([migcore.CollationUnestablished]: the Postgres reader read it from a
 // catalog row newer than its rows) refuses too. A guarded replay compares
-// such a key as bytes; this one arms nothing, so the rows written under a
-// stricter collation than the one read would replay unguarded
+// such a key as bytes; this one arms only the recorded schema's shape, so the
+// rows written under a stricter collation than the one read would replay unguarded
 // (KEY-COLLATION-PG-LOOSENED-REPLAY on the broker: a `backup incremental`
 // taken after a tighten, write and loosen records no delta and only
 // not-established versions — review of the first cut, finding 2).
