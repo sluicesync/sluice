@@ -1403,7 +1403,7 @@ func (r *ChainRestore) applySchemaDeltas(ctx context.Context, link *lineage.Segm
 				BackupID:     lineage.ManifestBackupID(link.Manifest),
 				Origin:       "chain restore",
 			}); err != nil {
-				return err
+				return keyCollationDeltaRefusal(link, r.Command, d, err)
 			}
 		}
 	}

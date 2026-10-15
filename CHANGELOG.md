@@ -4,6 +4,10 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Fixed
+
+- **A chain restore whose incremental changes a key column's collation, where the target refuses that change, now says so with a remedy instead of surfacing the target's raw duplicate-key error (LOW-MEDIUM, loud; KEY-COLLATION-ROLLOVER-SPLIT-DELTA-DUP).** Chain restore applies an incremental's schema changes ahead of its rows. When the source tightened a key, wrote `'A'` beside `'a'`, and only in a later incremental moved `'A'` away and loosened the key back, that later incremental's ALTER reaches the target while both values are still there, and MySQL refuses it with `Error 1062 Duplicate entry`. An hourly `backup incremental` splits a change from its revert this way by construction. Nothing was merged, but the error named no remedy. It is now `KEY-COLLATION-MERGE`, marked `KEY-COLLATION-DELTA-FAILED`, keeps the target's error, and leads to the remedy the other refusals of such a window give: take a fresh full backup after the key change and restore it into an empty target (or, under `sync from-backup run --reset-target-data`, replay the new chain). Applying such a change at the end of the incremental instead, so the restore converges, is still open.
+
 ## [0.160.1] - 2026-10-15
 
 ### Fixed
