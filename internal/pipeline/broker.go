@@ -1519,6 +1519,18 @@ func (b *SyncFromBackup) applyIncremental(
 		"sync from-backup replays no schema version between a window's changes"); err != nil {
 		return 0, err
 	}
+	// KEY-COLLATION-BROKER-UNARMED: with no schema version in the stream, the
+	// applier's guard had nothing to arm from, so EVERY incremental applied
+	// unguarded, not only a window that changes a collation (measured: a
+	// Postgres UNIQUE key beside the primary key, replayed onto MySQL's
+	// _ai_ci, took 'A' onto 'a' at exit 0 where live `sync start` refuses).
+	// The window's recorded schema is a sound shape for all of its rows: the
+	// refusal above passed, so no version of the window disagrees with it on
+	// a key collation. The window's own versions are not overlaid: a MySQL
+	// binlog version carries no UNIQUE index, and the recorded schema does.
+	if seeder, ok := applier.(ir.GuardSourceShapeSeeder); ok && link.Manifest != nil && link.Manifest.Schema != nil {
+		seeder.SeedSourceShapes(link.Manifest.Schema.Tables)
+	}
 	// 1. Schema deltas first. Re-applied on a resume inside the incremental
 	//    (ADR-0191 §4 C7): their idempotency is the claim this step always
 	//    made for a re-applied incremental.

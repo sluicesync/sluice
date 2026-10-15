@@ -466,6 +466,11 @@ type ChangeApplier struct {
 	// leave a cache entry that disagrees with persisted state.
 	activeSchema map[string]activeSchemaVersion
 
+	// seededShapes is the [ir.GuardSourceShapeSeeder] fallback the key-collation
+	// guard reads when no schema version is active for a table (a
+	// `sync from-backup` replay carries none). In-memory only.
+	seededShapes ir.SeededShapes
+
 	// resolveCallsForTest counts how many times the applier has
 	// touched the schema-history storage to resolve a schema version
 	// (i.e. the per-table loadRetainedSchemaVersions + resolve hit

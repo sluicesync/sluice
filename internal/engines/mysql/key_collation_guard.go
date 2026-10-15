@@ -472,7 +472,7 @@ type keyCollationGuardEntry struct {
 // keyCollationPlanFor returns the guard plan for a write into schema.table
 // (routed) of a change from srcSchema.table, or nil when nothing is armed.
 func (a *ChangeApplier) keyCollationPlanFor(ctx context.Context, q queryRower, srcSchema, schema, table string, pk []string, colTypes map[string]*ir.Column) (*keyCollationPlan, error) {
-	source, _ := a.ActiveSchema(srcSchema, table)
+	source := a.guardSourceShape(srcSchema, table)
 	qn := qualifiedName(schema, table)
 	a.cacheMu.RLock()
 	e, hit := a.keyCollationGuardCache[qn]
@@ -699,4 +699,19 @@ func keyCollationNeeds(plan *keyCollationPlan) (collations string, recopyAligns 
 		collations = "the source's collation" // a plan names its armed keys; kept for a hand-built one
 	}
 	return collations, recopyAligns
+}
+
+// guardSourceShape is the source shape the key-collation guard arms from:
+// the active schema version for srcSchema.table, or, when none is active, the
+// shape a replay seeded through [ChangeApplier.SeedSourceShapes].
+func (a *ChangeApplier) guardSourceShape(srcSchema, table string) *ir.Table {
+	if source, ok := a.ActiveSchema(srcSchema, table); ok && source != nil {
+		return source
+	}
+	return a.seededShapes.Lookup(srcSchema, table)
+}
+
+// SeedSourceShapes implements [ir.GuardSourceShapeSeeder].
+func (a *ChangeApplier) SeedSourceShapes(tables []*ir.Table) {
+	a.seededShapes.Seed(tables)
 }

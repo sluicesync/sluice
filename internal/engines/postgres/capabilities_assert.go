@@ -163,6 +163,7 @@ var (
 
 	// ChangeApplier optional surfaces.
 	_ ir.ApplyConcurrencySetter         = (*ChangeApplier)(nil)
+	_ ir.GuardSourceShapeSeeder         = (*ChangeApplier)(nil)
 	_ ir.ExactlyOnceLanesSetter         = (*ChangeApplier)(nil)
 	_ ir.ApplyExecTimeoutSetter         = (*ChangeApplier)(nil)
 	_ ir.BatchObserverSetter            = (*ChangeApplier)(nil)

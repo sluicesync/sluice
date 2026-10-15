@@ -64,6 +64,16 @@ Indexed when filed. The report's defect and what fixing it found (no audit pass)
 - SCHEMA-DIFF-GENERATED-EXPR-VERBATIM filed
 - SYNC-INDEX-FAILURE-NO-RESUME filed
 
+## 2026-10-15 — triage of the open key-collation entries against main (read-only, code-cited)
+
+Indexed when filed. A re-grade of existing entries; no new IDs beyond those already filed.
+
+- KEY-COLLATION-BROKER-UNARMED filed
+- KEY-COLLATION-TRIGGER-CDC-NO-HISTORY filed
+- MARIADB-SHAPE-GATE-COLLATION filed
+- KEY-COLLATION-ROLLOVER-SPLIT-DELTA-DUP filed
+- KEY-COLLATION-FUNCTIONAL-KEY-PART filed
+
 ## 2026-10-13 — Bugs 306, 307 and 308 (the v0.159.2 regression cycle): fixed, with what they leave open
 
 Indexed when filed. The three cycle bugs (numbered in the BUG-CATALOG) and the findings made while fixing them (no audit pass).

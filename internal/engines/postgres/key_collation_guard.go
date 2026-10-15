@@ -218,7 +218,7 @@ type pgKeyCollationGuardEntry struct {
 // keyCollationPlanFor returns the guard plan for an insert into schema.table
 // (routed) of a change from srcSchema.table, or nil when nothing is armed.
 func (a *ChangeApplier) keyCollationPlanFor(ctx context.Context, srcSchema, schema, table string, key []string) (*pgKeyCollationPlan, error) {
-	source, _ := a.ActiveSchema(srcSchema, table)
+	source := a.guardSourceShape(srcSchema, table)
 	qn := schemaTableKey(schema, table)
 	a.cacheMu.RLock()
 	e, hit := a.keyCollationGuardCache[qn]
@@ -315,4 +315,19 @@ func checkPGCollationsExist(ctx context.Context, db *sql.DB, qn string, plan *pg
 func isKeyCollationMergeRaise(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "22P02" && strings.Contains(pgErr.Message, keyCollationMergeMarker)
+}
+
+// guardSourceShape is the source shape the key-collation guard arms from:
+// the active schema version for srcSchema.table, or, when none is active, the
+// shape a replay seeded through [ChangeApplier.SeedSourceShapes].
+func (a *ChangeApplier) guardSourceShape(srcSchema, table string) *ir.Table {
+	if source, ok := a.ActiveSchema(srcSchema, table); ok && source != nil {
+		return source
+	}
+	return a.seededShapes.Lookup(srcSchema, table)
+}
+
+// SeedSourceShapes implements [ir.GuardSourceShapeSeeder].
+func (a *ChangeApplier) SeedSourceShapes(tables []*ir.Table) {
+	a.seededShapes.Seed(tables)
 }
