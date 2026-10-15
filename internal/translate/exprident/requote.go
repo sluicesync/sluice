@@ -106,6 +106,12 @@ func (cfg Config) WithColumns(names []string) Config {
 type ContextRule struct {
 	AfterToken map[string]struct{}
 	InFunction map[string]struct{}
+	// LeadsOperand narrows the InFunction match to the first token of the
+	// call's argument list when an operand follows it ([tokenLeadsOperand]):
+	// the shape of `TRIM(BOTH 'x' FROM s)`, where the word is grammar, and not
+	// of `TRIM(both FROM s)` or `TRIM(both)`, where it can only be a column
+	// the source quoted (Bug 311).
+	LeadsOperand bool
 }
 
 // IsIdentStartByte reports whether b can begin an unquoted SQL
@@ -171,8 +177,15 @@ func RequoteIdentifiers(expr string, cfg Config) string {
 	// ContextRule.InFunction.
 	prevTok := ""
 	var fnStack []string
+	// groupStart: nothing but whitespace since the last '(', for
+	// ContextRule.LeadsOperand.
+	groupStart := false
 	for i := 0; i < len(expr); {
 		c := expr[i]
+		atStart := groupStart
+		if c != ' ' && c != '\t' && c != '\n' && c != '\r' {
+			groupStart = false
+		}
 		switch {
 		case c == '\'':
 			// String literal — copy verbatim. A literal is a
@@ -217,9 +230,12 @@ func RequoteIdentifiers(expr string, cfg Config) string {
 				}
 			}
 			callPos := k < len(expr) && expr[k] == '('
-			if name, ok := columnRef(expr, i, tok, callPos, cfg, prevTok, fnStack); ok {
+			// lead: the token opens its paren group and an operand follows
+			// it ([ContextRule.LeadsOperand]).
+			lead := atStart && tokenLeadsOperand(expr, j, q)
+			if name, ok := columnRef(expr, i, tok, callPos, cfg, prevTok, fnStack, lead); ok {
 				writeColumnName(&sb, name, cfg)
-			} else if !callPos && shouldRequote(tok, cfg, prevTok, fnStack) {
+			} else if !callPos && shouldRequote(tok, cfg, prevTok, fnStack, lead) {
 				sb.WriteByte(q)
 				sb.WriteString(tok)
 				sb.WriteByte(q)
@@ -238,6 +254,7 @@ func RequoteIdentifiers(expr string, cfg Config) string {
 			// identifier token (the call-position test above used the
 			// same adjacency). A non-call '(' pushes "".
 			fnStack = append(fnStack, prevTok)
+			groupStart = true
 			sb.WriteByte(c)
 			prevTok = ""
 			i++
@@ -267,7 +284,7 @@ func RequoteIdentifiers(expr string, cfg Config) string {
 // is an unconditional grammar keyword, is a contextual keyword in its
 // grammar position, or sits in a position where SQL grammar wants a type,
 // collation or date-part name ([inNonColumnPosition]).
-func columnRef(expr string, start int, tok string, callPos bool, cfg Config, prevTok string, fnStack []string) (string, bool) {
+func columnRef(expr string, start int, tok string, callPos bool, cfg Config, prevTok string, fnStack []string, lead bool) (string, bool) {
 	if cfg.Columns == nil || callPos {
 		return "", false
 	}
@@ -279,7 +296,7 @@ func columnRef(expr string, start int, tok string, callPos bool, cfg Config, pre
 	if _, excluded := cfg.GrammarExclusions[u]; excluded {
 		return "", false
 	}
-	if rule, ok := cfg.GrammarContextual[u]; ok && rule.isGrammar(prevTok, fnStack) {
+	if rule, ok := cfg.GrammarContextual[u]; ok && rule.isGrammar(prevTok, fnStack, lead) {
 		return "", false
 	}
 	if inNonColumnPosition(expr, start, u, prevTok, fnStack) {
@@ -378,7 +395,7 @@ func bareSafe(name string, cfg Config) bool {
 // matching contextual rule for the current position (prevTok is the
 // last identifier-like token, upper-cased; fnStack is the enclosing
 // function-call-name stack, upper-cased).
-func shouldRequote(tok string, cfg Config, prevTok string, fnStack []string) bool {
+func shouldRequote(tok string, cfg Config, prevTok string, fnStack []string, lead bool) bool {
 	u := strings.ToUpper(tok)
 	if _, excluded := cfg.GrammarExclusions[u]; excluded {
 		return false
@@ -391,7 +408,7 @@ func shouldRequote(tok string, cfg Config, prevTok string, fnStack []string) boo
 	// EXTRACT/SUBSTRING/TRIM/OVERLAY call). Outside those positions a
 	// bare reserved word is a de-quoted column reference and is
 	// re-quoted.
-	if rule, ok := cfg.GrammarContextual[u]; ok && rule.isGrammar(prevTok, fnStack) {
+	if rule, ok := cfg.GrammarContextual[u]; ok && rule.isGrammar(prevTok, fnStack, lead) {
 		return false
 	}
 	return true
@@ -399,8 +416,10 @@ func shouldRequote(tok string, cfg Config, prevTok string, fnStack []string) boo
 
 // isGrammar reports whether a [Config.GrammarContextual] token is in a
 // grammar position: the previous significant token is in AfterToken,
-// or the innermost enclosing function-call name is in InFunction.
-func (r ContextRule) isGrammar(prevTok string, fnStack []string) bool {
+// or the innermost enclosing function-call name is in InFunction — and,
+// under LeadsOperand, the token leads that call's arguments with an operand
+// after it (lead).
+func (r ContextRule) isGrammar(prevTok string, fnStack []string, lead bool) bool {
 	if prevTok != "" {
 		if _, ok := r.AfterToken[prevTok]; ok {
 			return true
@@ -408,8 +427,34 @@ func (r ContextRule) isGrammar(prevTok string, fnStack []string) bool {
 	}
 	if n := len(fnStack); n > 0 {
 		if _, ok := r.InFunction[fnStack[n-1]]; ok {
-			return true
+			return !r.LeadsOperand || lead
 		}
+	}
+	return false
+}
+
+// tokenLeadsOperand reports whether the token ending at expr[end] is
+// followed, across whitespace, by the start of an operand: a string
+// literal, a quoted identifier, a number, a parenthesised group, or a word
+// other than FROM. It is false before FROM, `)`, `,` or an operator.
+func tokenLeadsOperand(expr string, end int, q byte) bool {
+	k := end
+	for k < len(expr) && (expr[k] == ' ' || expr[k] == '\t' || expr[k] == '\n' || expr[k] == '\r') {
+		k++
+	}
+	if k >= len(expr) {
+		return false
+	}
+	c := expr[k]
+	switch {
+	case c == '\'' || c == q || c == '(' || (c >= '0' && c <= '9'):
+		return true
+	case IsIdentStartByte(c):
+		j := k
+		for j < len(expr) && IsIdentifierByte(expr[j]) {
+			j++
+		}
+		return !strings.EqualFold(expr[k:j], "FROM")
 	}
 	return false
 }

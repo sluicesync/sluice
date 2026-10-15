@@ -52,7 +52,15 @@ var exprGrammarKeywords = map[string]struct{}{
 // `EXTRACT(field FROM src)` / `SUBSTRING(s FROM n)` / `TRIM(… FROM s)`
 // grammar, so the same AfterToken/InFunction discrimination applies;
 // it still re-quotes a de-quoted user column literally named `from`.
+//
+// `LEADING`, `TRAILING` and `BOTH` follow the Postgres rule too (Bug 311):
+// grammar only as the first token of TRIM's arguments with an operand after
+// it. Without it a MySQL source's stored `trim(both 'x' from c)` reached a
+// MySQL target as `trim(`both` 'x' from c)`, a syntax error.
 var mysqlExprContextualKeywords = map[string]exprident.ContextRule{
+	"LEADING":  {InFunction: map[string]struct{}{"TRIM": {}}, LeadsOperand: true},
+	"TRAILING": {InFunction: map[string]struct{}{"TRIM": {}}, LeadsOperand: true},
+	"BOTH":     {InFunction: map[string]struct{}{"TRIM": {}}, LeadsOperand: true},
 	"FROM": {
 		AfterToken: map[string]struct{}{"DISTINCT": {}},
 		InFunction: map[string]struct{}{

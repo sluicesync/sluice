@@ -119,18 +119,35 @@ func noParens(s string) string {
 	return strings.NewReplacer("(", "", ")", "").Replace(s)
 }
 
-// TestRequotePGReservedIdents_TrimKeywordsStayGrammar pins the value-fidelity
-// review's v0.160.1 finding: inside TRIM(...), LEADING / TRAILING / BOTH are
-// grammar even when the table has a column of that name. Re-quoting one
-// (`TRIM("Leading" FROM s)`) is valid Postgres that trims the characters held
-// in that column, so a generated column would compute different values,
-// silently. The same words outside TRIM are column references.
+// TestRequotePGReservedIdents_TrimKeywordsStayGrammar pins how LEADING /
+// TRAILING / BOTH inside TRIM(...) are told apart from a column of the same
+// name once the source's quoting is gone. Each wrong answer is valid Postgres
+// that trims different characters, so both directions are silent:
+//
+//   - the keyword quoted as a column (value-fidelity review of v0.160.1);
+//   - the column left bare as the keyword (Bug 311, introduced by that
+//     review's first fix, which kept the word bare anywhere inside TRIM).
+//
+// The inputs are the shapes MySQL 8.0.46 and MariaDB 11.4 actually store,
+// measured 2026-10-15: a keyword always has a remove-string after it, so a
+// word right before FROM, `)` or an operator is the column.
 func TestRequotePGReservedIdents_TrimKeywordsStayGrammar(t *testing.T) {
 	tbl := &ir.Table{Columns: []*ir.Column{{Name: "Leading"}, {Name: "both"}, {Name: "Trailing"}, {Name: "s"}}}
 	for _, c := range []struct{ in, want string }{
-		{"trim(leading from s)", "trim(leading from s)"},
-		{"trim(both from s)", "trim(both from s)"},
+		// Keyword: first in TRIM's arguments, an operand follows.
+		{"trim(both 'x' from s)", "trim(both 'x' from s)"},
 		{"trim(TRAILING 'x' from s)", "trim(TRAILING 'x' from s)"},
+		{"trim( leading s from s)", "trim( leading s from s)"},
+		// MySQL's stored trim(`both` from `s`): the column is the remove-string.
+		{"trim(both from s)", `trim("both" from s)`},
+		// trim(both `both` from `s`), MySQL and MariaDB: keyword, then column.
+		{"trim(both both from s)", `trim(both "both" from s)`},
+		// trim(`Leading`) and concat(trim(`trailing`),'!').
+		{"trim(Leading)", `trim("Leading")`},
+		{"concat(trim(trailing),'!')", `concat(trim("Trailing"),'!')`},
+		// A column followed by an operator is an operand, not the keyword.
+		{"trim(both || 'x' from s)", `trim("both" || 'x' from s)`},
+		// Outside TRIM they are always columns.
 		{"Leading + 1", `"Leading" + 1`},
 		{"both || s", `"both" || s`},
 	} {
@@ -138,9 +155,13 @@ func TestRequotePGReservedIdents_TrimKeywordsStayGrammar(t *testing.T) {
 			t.Errorf("requotePGReservedIdents(%q) = %q; want %q", c.in, got, c.want)
 		}
 	}
-	// The reserved-word pass alone (no table) had the same defect for a
-	// lower-case `leading` column.
-	if got := requotePGReservedIdents("trim(leading from s)", nil); got != "trim(leading from s)" {
-		t.Errorf("reserved-word pass re-quoted a TRIM keyword: %q", got)
+	// The reserved-word pass alone (no table) follows the same positions.
+	for _, c := range []struct{ in, want string }{
+		{"trim(leading 'x' from s)", "trim(leading 'x' from s)"},
+		{"trim(leading from s)", `trim("leading" from s)`},
+	} {
+		if got := requotePGReservedIdents(c.in, nil); got != c.want {
+			t.Errorf("requotePGReservedIdents(%q, nil) = %q; want %q", c.in, got, c.want)
+		}
 	}
 }

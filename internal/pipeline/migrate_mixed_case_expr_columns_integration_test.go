@@ -122,3 +122,107 @@ func TestMigrate_MySQLToPostgres_MixedCaseColumnExpressions(t *testing.T) {
 		}
 	}
 }
+
+// TestMigrate_MySQLSource_TrimKeywordColumns is Bug 311 on real servers:
+// a column literally named `both`, `leading` or `trailing` used inside
+// TRIM(...). MySQL's stored text tells the column (backticked) from the
+// keyword (bare), but the read boundary strips the backticks, so the
+// Postgres writer must tell them apart by position. Each wrong answer is
+// valid Postgres that trims different characters, so the generated values
+// are compared with the values the SOURCE server computed — the independent
+// expected value — rather than with a spelling. v0.160.1 left the column
+// bare (`TRIM(BOTH FROM code)`), so g_col trimmed spaces instead of 'b' at
+// exit 0, and g_one failed with 42601.
+//
+// The mysql leg is the sibling on the MySQL writer, which quoted the KEYWORD
+// (`trim(`both` 'x' from code)`, a syntax error) before the same rule.
+func TestMigrate_MySQLSource_TrimKeywordColumns(t *testing.T) {
+	for _, target := range []string{"postgres", "mysql"} {
+		t.Run(target, func(t *testing.T) { testTrimKeywordColumns(t, target) })
+	}
+}
+
+func testTrimKeywordColumns(t *testing.T, target string) {
+	mysqlSource, mysqlTarget, mysqlCleanup := startMySQL(t)
+	defer mysqlCleanup()
+	tgtDriver, tgtDSN := "mysql", mysqlTarget
+	if target == "postgres" {
+		_, pgTarget, pgCleanup := startPostgres(t)
+		defer pgCleanup()
+		tgtDriver, tgtDSN = "pgx", pgTarget
+	}
+
+	// MySQL identifier quotes cannot sit in a Go raw string; ~ stands for one.
+	applyMySQLDDL(t, mysqlSource, strings.ReplaceAll(`
+		CREATE TABLE trim_words (
+			id         INT NOT NULL PRIMARY KEY,
+			code       VARCHAR(20),
+			~both~     VARCHAR(5),
+			~Leading~  VARCHAR(5),
+			~trailing~ VARCHAR(10),
+			g_kw   VARCHAR(20) AS (trim(both 'x' from code)) STORED,
+			g_col  VARCHAR(20) AS (trim(~both~ from code)) STORED,
+			g_mix  VARCHAR(20) AS (trim(both ~both~ from code)) STORED,
+			g_lead VARCHAR(20) AS (trim(leading ~Leading~ from code)) STORED,
+			g_one  VARCHAR(20) AS (concat(trim(~trailing~), '!')) STORED
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+		INSERT INTO trim_words (id, code, ~both~, ~Leading~, ~trailing~)
+		VALUES (1, 'xbabx', 'b', 'x', '  t  '), (2, 'bbabb', 'b', 'b', 't'), (3, '  bab  ', 'b', ' ', ' tt');
+	`, "~", "`"))
+
+	runMigrate(t, "mysql", target, mysqlSource, tgtDSN)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	src, err := sql.Open("mysql", mysqlSource)
+	if err != nil {
+		t.Fatalf("open mysql source: %v", err)
+	}
+	defer func() { _ = src.Close() }()
+	tgt, err := sql.Open(tgtDriver, tgtDSN)
+	if err != nil {
+		t.Fatalf("open %s target: %v", target, err)
+	}
+	defer func() { _ = tgt.Close() }()
+
+	read := func(db *sql.DB, q string) map[int][5]string {
+		t.Helper()
+		rows, err := db.QueryContext(ctx, q)
+		if err != nil {
+			t.Fatalf("read generated columns: %v", err)
+		}
+		defer func() { _ = rows.Close() }()
+		out := map[int][5]string{}
+		for rows.Next() {
+			var id int
+			var v [5]string
+			if err := rows.Scan(&id, &v[0], &v[1], &v[2], &v[3], &v[4]); err != nil {
+				t.Fatalf("scan: %v", err)
+			}
+			out[id] = v
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("rows: %v", err)
+		}
+		return out
+	}
+	want := read(src, "SELECT id, g_kw, g_col, g_mix, g_lead, g_one FROM trim_words ORDER BY id")
+	got := read(tgt, `SELECT id, g_kw, g_col, g_mix, g_lead, g_one FROM trim_words ORDER BY id`)
+	if len(want) != 3 {
+		t.Fatalf("source rows = %d; want 3", len(want))
+	}
+	names := [5]string{"g_kw", "g_col", "g_mix", "g_lead", "g_one"}
+	for id, w := range want {
+		g, ok := got[id]
+		if !ok {
+			t.Errorf("row %d missing on the target", id)
+			continue
+		}
+		for i := range w {
+			if g[i] != w[i] {
+				t.Errorf("row %d %s = %q on the target; the source computed %q", id, names[i], g[i], w[i])
+			}
+		}
+	}
+}

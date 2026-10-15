@@ -82,17 +82,31 @@ var pgExprGrammarKeywords = map[string]struct{}{
 // `from` column); the position-aware rule fixes it without regressing
 // the grammar-`FROM` shapes.
 //
-// `LEADING`, `TRAILING` and `BOTH` are grammar inside `TRIM(…)` only
-// (`TRIM(LEADING FROM s)`, which MySQL stores in exactly that form). Outside
-// it they are column references. Inside it, re-quoting one as a column
-// (`TRIM("Leading" FROM s)`) is VALID Postgres that trims the characters held
-// in that column, so a generated column computed different values at exit 0
-// (value-fidelity review of v0.160.1; the reserved-word pass had the same
-// defect for a lower-case `leading` column).
+// `LEADING`, `TRAILING` and `BOTH` are grammar only as the FIRST token of a
+// `TRIM(…)` argument list with an operand after it ([exprident.ContextRule]
+// LeadsOperand): `TRIM(BOTH 'x' FROM s)`, `TRIM(LEADING c FROM s)`. Anywhere
+// else they are column references the source quoted, and the read boundary
+// stripped that quoting. Both mistakes are silent, because each misreading is
+// valid Postgres that trims different characters:
+//
+//   - Quoting the keyword (`TRIM("Leading" 'x' FROM s)` is a syntax error,
+//     but `TRIM("Leading" FROM s)` trims the column's characters): the
+//     value-fidelity review of v0.160.1.
+//   - Leaving a column bare (“trim(`both` from `code`)“ read as
+//     `TRIM(BOTH FROM code)`, trimming spaces instead of the column's
+//     characters): Bug 311, which v0.160.1's first cut of this rule
+//     introduced by keeping the word bare anywhere inside TRIM.
+//
+// Measured on MySQL 8.0.46 and MariaDB 11.4 (2026-10-15): neither stores a
+// keyword without a remove-string after it. MySQL accepts
+// `TRIM(LEADING FROM s)` in a statement but cannot store it (its own
+// re-print fails to parse, ERROR 1064 at CREATE TABLE); MariaDB stores it as
+// `ltrim(s)`. So in stored text, a word right before FROM, `)` or `,` is
+// always the column.
 var pgExprContextualKeywords = map[string]exprident.ContextRule{
-	"LEADING":  {InFunction: map[string]struct{}{"TRIM": {}}},
-	"TRAILING": {InFunction: map[string]struct{}{"TRIM": {}}},
-	"BOTH":     {InFunction: map[string]struct{}{"TRIM": {}}},
+	"LEADING":  {InFunction: map[string]struct{}{"TRIM": {}}, LeadsOperand: true},
+	"TRAILING": {InFunction: map[string]struct{}{"TRIM": {}}, LeadsOperand: true},
+	"BOTH":     {InFunction: map[string]struct{}{"TRIM": {}}, LeadsOperand: true},
 	"FROM": {
 		AfterToken: map[string]struct{}{"DISTINCT": {}},
 		InFunction: map[string]struct{}{
