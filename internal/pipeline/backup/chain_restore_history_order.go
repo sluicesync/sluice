@@ -160,13 +160,75 @@ func newHistoryReplay(backupID, sourceEngine string, orderer ir.PositionOrderer,
 	if m != nil {
 		h.keys = m.Schema
 	}
+	why := ""
 	if h.orderer == nil {
-		why := fmt.Sprintf("its schema versions cannot be ordered against its changes (no position orderer for source engine %q)", sourceEngine)
+		why = fmt.Sprintf("its schema versions cannot be ordered against its changes (no position orderer for source engine %q)", sourceEngine)
+	} else {
+		var err error
+		if why, err = versionsOutOfOrder(h.orderer, snaps); err != nil {
+			return nil, err
+		}
+	}
+	if why != "" {
 		if err := refuseKeyCollationHistory(backupID, why, m, snaps); err != nil {
 			return nil, err
 		}
 	}
 	return h, nil
+}
+
+// versionsOutOfOrder checks the premise [historyReplay.before]'s
+// stranded-version drop rests on: that a table's versions are listed in
+// position order, so "earlier in the list" is "earlier in the stream"
+// (KEY-COLLATION-STRANDED-VERSION-ORDER). It names the first table whose
+// version is listed after another of the same table ([sameVersionTable])
+// that the orderer places strictly LATER — a manifest out of order, or a
+// version anchored at the stream's start written after a later version of
+// its table (SEEDED-FLAG-SYNTHESIZED-CARRY, by code-reading unreachable).
+// Released in list order, such a pair leaves the applier's active schema on
+// the older shape, and the drop can discard a version a later one
+// contradicts. "" when every comparable pair is in order.
+//
+// A pair the orderer cannot place either way (a file/pos ServerUUID
+// mismatch, a VStream shard missing from one position) is not reported
+// here: it is unorderable rather than out of order, and `before` already
+// refuses it where the two disagree on a key collation. A version with no
+// position is released ahead of the window and takes no part. As with the
+// orderer-less case, the caller refuses only a window that changes a key
+// column's collation ([refuseKeyCollationHistory]); elsewhere the order
+// decides nothing the key-collation guard reads, and such a window restores
+// as it always did.
+func versionsOutOfOrder(orderer ir.PositionOrderer, snaps []ir.SchemaSnapshot) (string, error) {
+	for i, s := range snaps {
+		if s.Position.Token == "" {
+			continue
+		}
+		for j := i - 1; j >= 0; j-- {
+			prev := snaps[j]
+			if prev.Position.Token == "" || !sameVersionTable(prev, s) {
+				continue
+			}
+			after, err := orderer.PositionAtOrAfter(s.Position, prev.Position)
+			if err != nil {
+				return "", fmt.Errorf("order schema-history version %s.%s at %s against its previous version at %s: %w",
+					s.Schema, s.Table, s.Position.Token, prev.Position.Token, err)
+			}
+			if after {
+				break
+			}
+			before, err := orderer.PositionAtOrAfter(prev.Position, s.Position)
+			if err != nil {
+				return "", fmt.Errorf("order schema-history version %s.%s at %s against its next version at %s: %w",
+					prev.Schema, prev.Table, prev.Position.Token, s.Position.Token, err)
+			}
+			if before {
+				return fmt.Sprintf("its schema versions of %s are not in position order (the version at %s is listed "+
+					"after the one at %s, which is later in the stream)", s.Table, s.Position.Token, prev.Position.Token), nil
+			}
+			break
+		}
+	}
+	return "", nil
 }
 
 // start releases what precedes every change: with no orderer, everything;
@@ -226,9 +288,11 @@ func (h *historyReplay) before(c ir.Change, push func(ir.Change) error) error {
 	// no namespace is the table of that name in any (Bug 306 — keyed by the
 	// literal namespace, a window-start version naming none was never
 	// compared with the window's own versions naming the database).
-	// UNVERIFIED PREMISE: that the manifest lists a table's versions in
-	// position order, so "earlier in pending" means "earlier in the stream"
-	// (KEY-COLLATION-STRANDED-VERSION-ORDER).
+	// The premise that the manifest lists a table's versions in position
+	// order, so "earlier in pending" means "earlier in the stream", is
+	// checked at construction ([versionsOutOfOrder],
+	// KEY-COLLATION-STRANDED-VERSION-ORDER) for every pair the orderer can
+	// compare, on any window that changes a key collation.
 	var stranded []int
 	drop := map[int]bool{}
 	var kept []int
