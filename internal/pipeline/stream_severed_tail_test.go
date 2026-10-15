@@ -29,6 +29,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -40,11 +41,16 @@ import (
 
 // feedCDCEngine is a fakeCDCEngine whose change stream the test feeds one
 // change at a time. Both hops are unbuffered, so a send on feed returning
-// means the stream has RECEIVED the change before it — the test always knows
-// how far the window has read.
+// means only that the stream has RECEIVED the change BEFORE it: the change
+// just sent may still sit in the reader's forwarding goroutine. delivered
+// counts changes the stream has taken from the second hop, and [send] waits
+// on it, so a test that cancels right after a send cancels a window that
+// has read everything sent (the CancelAtBoundary flake: a fixed sleep stood
+// in for this and lost the race on a loaded Windows runner).
 type feedCDCEngine struct {
 	fakeCDCEngine
-	feed chan ir.Change
+	feed      chan ir.Change
+	delivered atomic.Int64
 
 	mu   sync.Mutex
 	acks []ir.Position
@@ -70,6 +76,7 @@ func (r *feedCDCReader) StreamChanges(ctx context.Context, _ ir.Position) (<-cha
 				}
 				select {
 				case out <- c:
+					r.e.delivered.Add(1)
 				case <-ctx.Done():
 					return
 				}
@@ -102,6 +109,10 @@ type severedFixture struct {
 	eng    *feedCDCEngine
 	stream *BackupStream
 	parent *irbackup.Manifest
+
+	// fed counts changes handed to feed; [send] waits until the stream has
+	// taken that many from the reader (feedCDCEngine.delivered).
+	fed int64
 }
 
 func newSeveredFixture(t *testing.T) *severedFixture {
@@ -156,9 +167,17 @@ func (f *severedFixture) send(cs ...ir.Change) {
 	for _, c := range cs {
 		select {
 		case f.eng.feed <- c:
+			f.fed++
 		case <-time.After(10 * time.Second):
 			f.t.Fatalf("the stream stopped reading at %T %+v", c, c.Pos())
 		}
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for f.eng.delivered.Load() < f.fed {
+		if time.Now().After(deadline) {
+			f.t.Fatalf("the stream took %d of %d changes sent", f.eng.delivered.Load(), f.fed)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
@@ -169,6 +188,7 @@ func (f *severedFixture) offer(cs ...ir.Change) {
 	for _, c := range cs {
 		select {
 		case f.eng.feed <- c:
+			f.fed++
 		case <-time.After(2 * time.Second):
 			return
 		}
@@ -290,9 +310,8 @@ func (f *severedFixture) stopFile() {
 // TxBegin(10) + rows 11..13. With ChunkChanges=2 a chunk of the open
 // transaction is already stored when this returns.
 func (f *severedFixture) openTx() {
-	f.send(tx(2, 2)...)                // 4 changes, positions 2..5
-	f.send(tx(10, 4)[:4]...)           // TxBegin(10), 11, 12, 13
-	time.Sleep(100 * time.Millisecond) // let the window record row 13
+	f.send(tx(2, 2)...)      // 4 changes, positions 2..5
+	f.send(tx(10, 4)[:4]...) // TxBegin(10), 11, 12, 13; send returns once the window took row 13
 }
 
 func TestBackupStream_StopInsideTransaction_InProcess_DrainsToCommit(t *testing.T) {
@@ -375,7 +394,6 @@ func TestBackupStream_CancelAtBoundary_Commits(t *testing.T) {
 	done := f.run(ctx)
 	f.send(tx(2, 2)...)
 	f.send(tx(10, 3)...) // positions 10..14, ends on TxCommit(14)
-	time.Sleep(100 * time.Millisecond)
 	cancel()
 	f.wait(done)
 	f.requireClosedAtCommit(4+5, posTok(14))
@@ -412,7 +430,6 @@ func TestBackupStream_CancelDrainFlushFails_Abandons(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := f.run(ctx)
 	f.send(tx(2, 2)...)
-	time.Sleep(100 * time.Millisecond)
 	fs.mu.Lock()
 	fs.armed = true
 	fs.mu.Unlock()
@@ -436,7 +453,6 @@ func TestBackupStream_CancelDrainFlushFailsAfterStoredChunks_Abandons(t *testing
 	done := f.run(ctx)
 	f.send(tx(2, 2)...)  // chunks [B2 I3] [I4 C5] stored
 	f.send(tx(10, 1)...) // chunk [B10 I11] stored; C12 buffered
-	time.Sleep(100 * time.Millisecond)
 	fs.mu.Lock()
 	fs.armed = true
 	fs.mu.Unlock()
