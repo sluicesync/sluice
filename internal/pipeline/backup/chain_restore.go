@@ -1155,6 +1155,10 @@ func (r *ChainRestore) applyIncremental(
 	// for a non-UTF-8 column's non-ASCII values — name them (WARN; the values
 	// are not in the chain, so refusing would recover nothing).
 	migcore.WarnLegacyCharsetIncrement(ctx, "chain restore", link.Manifest)
+	// KEY-COLLATION-PRE0159-2-UNDETECTABLE: a pre-v0.159.2 MySQL-family
+	// incremental cannot show a key collation changed and reverted inside its
+	// window (WARN; the evidence is not in the chain).
+	migcore.WarnUnverifiableKeyCollationIncrement(ctx, "chain restore", link.Manifest)
 	// 1. Schema deltas first. Phase 3.2 same-engine: AddTable goes
 	//    through CreateTablesWithoutConstraints (the table has no
 	//    rows yet on the target — they arrive via the change

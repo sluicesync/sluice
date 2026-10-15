@@ -80,18 +80,25 @@ func WarnLegacyCharsetIncrement(ctx context.Context, origin string, m *irbackup.
 // v0.156.2 or earlier. An unparseable version ("dev", "") is not assumed
 // either way and returns false.
 func capturedBeforeCharsetDecode(v string) bool {
+	return sluiceVersionBefore(v, 156, 3)
+}
+
+// sluiceVersionBefore reports whether a manifest's SluiceVersion v is a
+// v0.x.y release earlier than v0.minor.patch. An unparseable version
+// ("dev", "") is not assumed either way and returns false.
+func sluiceVersionBefore(v string, minor, patch int) bool {
 	v = strings.TrimPrefix(strings.TrimSpace(v), "v")
 	parts := strings.SplitN(v, ".", 3)
 	if len(parts) < 3 {
 		return false
 	}
-	patch := parts[2]
-	if i := strings.IndexFunc(patch, func(r rune) bool { return r < '0' || r > '9' }); i >= 0 {
-		patch = patch[:i]
+	p := parts[2]
+	if i := strings.IndexFunc(p, func(r rune) bool { return r < '0' || r > '9' }); i >= 0 {
+		p = p[:i]
 	}
 	nums := [3]int{}
-	for i, p := range []string{parts[0], parts[1], patch} {
-		n, err := strconv.Atoi(p)
+	for i, s := range []string{parts[0], parts[1], p} {
+		n, err := strconv.Atoi(s)
 		if err != nil {
 			return false
 		}
@@ -100,10 +107,10 @@ func capturedBeforeCharsetDecode(v string) bool {
 	switch {
 	case nums[0] != 0:
 		return false
-	case nums[1] != 156:
-		return nums[1] < 156
+	case nums[1] != minor:
+		return nums[1] < minor
 	default:
-		return nums[2] <= 2
+		return nums[2] < patch
 	}
 }
 

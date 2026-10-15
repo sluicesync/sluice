@@ -1509,8 +1509,10 @@ func (b *SyncFromBackup) applyIncremental(
 		)
 	}
 
-	// GC-37 (j): see [ChainRestore.applyIncremental] — the same WARN.
+	// GC-37 (j) and KEY-COLLATION-PRE0159-2-UNDETECTABLE: see
+	// [ChainRestore.applyIncremental] — the same WARNs.
 	migcore.WarnLegacyCharsetIncrement(ctx, "sync from-backup", link.Manifest)
+	migcore.WarnUnverifiableKeyCollationIncrement(ctx, "sync from-backup", link.Manifest)
 	// KEY-COLLATION-REVERTED-WINDOW-RESTORE: this replay carries the source's
 	// events only — no schema version reaches the applier between them — so a
 	// window whose versions disagree on a key collation cannot be guarded per

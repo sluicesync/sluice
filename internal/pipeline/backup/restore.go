@@ -1987,9 +1987,13 @@ func verifyBackupScan(ctx context.Context, store irbackup.Store, opts VerifyOpti
 	// clean while holding U+FFFD (or a different character) for a non-UTF-8
 	// column's non-ASCII values, so "all chunks OK" alone would say the chain
 	// is sound. A WARN, not a refusal, for the reason restore gives: the
-	// values are not in the chain to recover.
+	// values are not in the chain to recover. The same for
+	// KEY-COLLATION-PRE0159-2-UNVERIFIABLE: a pre-v0.159.2 MySQL-family
+	// incremental hashes clean and still cannot show a key collation changed
+	// and reverted inside its window.
 	for _, rec := range records {
 		migcore.WarnLegacyCharsetIncrement(ctx, "backup verify", rec.Manifest)
+		migcore.WarnUnverifiableKeyCollationIncrement(ctx, "backup verify", rec.Manifest)
 	}
 
 	// The manifest-integrity preflights restore runs, run here from the
