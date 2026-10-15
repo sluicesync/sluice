@@ -43,4 +43,7 @@ var mydumperDomainDispatchExemptions = map[string]string{
 	"schema_parse.go:checkCharsets:col.Type": "SOURCE-SIDE: this IS the mydumper `CREATE TABLE` parse " +
 		"(tableBuilder) that produces the IR; nothing upstream of it can have wrapped a type in ir.Domain, and " +
 		"MySQL has no CREATE DOMAIN regardless. The switch picks string-family columns for the charset refusal.",
+	"schema_parse.go:inheritTableCollation:col.Type": "SOURCE-SIDE: the same tableBuilder parse, run on the " +
+		"table it just built; no ir.Domain can exist yet. The switch gives string-family columns the table's " +
+		"charset and collation.",
 }

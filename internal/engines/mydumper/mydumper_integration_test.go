@@ -423,6 +423,64 @@ func TestMydumperIntegration_RealDumpEndToEnd(t *testing.T) {
 			t.Fatalf("verify reported mismatches: %+v", result.Summary)
 		}
 	})
+
+	// MYDUMPER-COLLATION-NO-CHARSET, through a real dump. MySQL 8 prints a
+	// column inheriting a utf8mb4_bin table default as `COLLATE utf8mb4_bin`
+	// with no charset; the parser used to carry that collation charset-less,
+	// the MySQL writer dropped it, and the key was created under the
+	// target's default utf8mb4_0900_ai_ci, which equates 'a' and 'A'. Runs
+	// LAST: it adds a table to the shared source, which the reader-
+	// equivalence and verify legs above read live.
+	t.Run("binary-collated-key-keeps-its-collation", func(t *testing.T) {
+		db, err := sql.Open("mysql", srcDSN)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = db.Close() }()
+		if _, err := db.Exec("CREATE TABLE binkeys (k VARCHAR(10) NOT NULL PRIMARY KEY, v INT) " +
+			"DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec("INSERT INTO binkeys VALUES ('a', 1), ('A', 2)"); err != nil {
+			t.Fatal(err)
+		}
+		dir := runRealMydumper(t, dumperC, sourceIP, "binkeys", "-T "+itSourceDB+".binkeys")
+		schemaText, err := os.ReadFile(filepath.Join(dir, itSourceDB+".binkeys-schema.sql"))
+		if err != nil {
+			t.Fatalf("read the dumped schema: %v", err)
+		}
+		// The premise this test rides: the dump spells the key collation
+		// with no charset. If a future server or mydumper prints the
+		// charset, this test no longer exercises the fix.
+		if !strings.Contains(string(schemaText), "COLLATE utf8mb4_bin NOT NULL") ||
+			strings.Contains(string(schemaText), "`k` varchar(10) CHARACTER SET") {
+			t.Fatalf("the dump does not carry the collation-only key spelling this test needs:\n%s", schemaText)
+		}
+
+		target := createMySQLDB(t, mysqlRootDSN, "dump_binkeys_my")
+		runMigrate(t, dumpEng, mysqlEng, dir, target, migcore.TableFilter{})
+
+		tdb, err := sql.Open("mysql", target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tdb.Close() }()
+		var collation string
+		if err := tdb.QueryRow("SELECT COLLATION_NAME FROM information_schema.COLUMNS " +
+			"WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'binkeys' AND COLUMN_NAME = 'k'").Scan(&collation); err != nil {
+			t.Fatal(err)
+		}
+		if collation != "utf8mb4_bin" {
+			t.Errorf("target key collation = %s; want utf8mb4_bin", collation)
+		}
+		var n int
+		if err := tdb.QueryRow("SELECT COUNT(*) FROM binkeys").Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != 2 {
+			t.Errorf("target rows = %d; want 2 ('a' and 'A' are distinct keys)", n)
+		}
+	})
 }
 
 // ---------------------------------------------------------------------------

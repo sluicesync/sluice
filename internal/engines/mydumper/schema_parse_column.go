@@ -60,6 +60,17 @@ func (b *tableBuilder) parseColumnDef() error {
 	if err != nil {
 		return err
 	}
+	// A collation names its charset, and MySQL 8's SHOW CREATE TABLE
+	// prints only `COLLATE utf8mb4_bin` for a column whose charset is the
+	// table's (measured on 8.0: every column inheriting a utf8mb4_bin table
+	// default prints that way). Carried with no charset, the collation read
+	// downstream as another engine's vocabulary and was dropped, so the key
+	// landed under the target's default collation (MYDUMPER-COLLATION-
+	// NO-CHARSET). Deriving it here also lets checkCharsets see a
+	// `COLLATE latin1_bin` column as the latin1 column it is.
+	if attrs.charset == "" && attrs.collation != "" {
+		attrs.charset = charsetOfCollation(attrs.collation)
+	}
 
 	meta := mysql.ColumnMeta{
 		DataType:   spec.base,

@@ -279,15 +279,16 @@ func armedFor(src, tgt ir.Type, compareAs map[string]string) (armedCollation, bo
 			return armedCollation{bytes: true}, true
 		case ir.CollationDeterminismUnknown:
 			// UNKNOWN determinism on a NAMED Postgres-dialect collation: a
-			// schema no reader stamped. Two producers today: a backup manifest
+			// schema no reader stamped. One producer today: a backup manifest
 			// written before v0.159.0, whose type envelope had no
-			// collation_determinism key (review 2026-10-12, finding 5), and the
-			// mydumper reader, which carries a `COLLATE`-only column (SHOW
-			// CREATE TABLE omits a CHARACTER SET equal to the table's) with no
-			// charset, so CollationDialect reads its MySQL collation as a
-			// Postgres one (MYDUMPER-COLLATION-NO-CHARSET). Left unarmed, such a
-			// key went unguarded on a cross-engine restore and a resumed
-			// mydumper import alike.
+			// collation_determinism key (review 2026-10-12, finding 5). There
+			// was a second until the mydumper reader derived a `COLLATE`-only
+			// column's charset from its collation (MYDUMPER-COLLATION-
+			// NO-CHARSET): carried with no charset, CollationDialect read its
+			// MySQL collation as a Postgres one. A backup manifest written from
+			// such an import still carries that shape. Left unarmed, such a key
+			// went unguarded on a cross-engine restore and a resumed mydumper
+			// import alike.
 			//
 			// Armed as bytes in EVERY key, the primary key included, at apply
 			// too (review 2026-10-12 #2, finding 3; loud over silent). A named

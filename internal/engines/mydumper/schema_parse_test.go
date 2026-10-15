@@ -4,6 +4,7 @@
 package mydumper
 
 import (
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -69,8 +70,8 @@ func TestParseSchemaFile_FullFamilyCreateTable(t *testing.T) {
 		"ratio":   ir.Float{Precision: ir.FloatSingle},
 		"wide":    ir.Float{Precision: ir.FloatDouble},
 		"name":    ir.Varchar{Length: 255, Charset: "utf8mb4", Collation: "utf8mb4_0900_ai_ci"},
-		"fixed":   ir.Char{Length: 4},
-		"body":    ir.Text{Size: ir.TextLong},
+		"fixed":   ir.Char{Length: 4, Charset: "utf8mb4", Collation: "utf8mb4_0900_ai_ci"},
+		"body":    ir.Text{Size: ir.TextLong, Charset: "utf8mb4", Collation: "utf8mb4_0900_ai_ci"},
 		"bin":     ir.Binary{Length: 2},
 		"vbin":    ir.Varbinary{Length: 64},
 		"payload": ir.Blob{Size: ir.BlobLong},
@@ -89,7 +90,7 @@ func TestParseSchemaFile_FullFamilyCreateTable(t *testing.T) {
 		// assertion encoded the defect, so the lexer's blanket
 		// versioned-comment skip dropped it with nothing to notice.
 		"pt": ir.Geometry{Subtype: ir.GeometryPoint, SRID: 4326},
-		"up": ir.Varchar{Length: 16},
+		"up": ir.Varchar{Length: 16, Charset: "utf8mb4", Collation: "utf8mb4_0900_ai_ci"},
 	}
 	if len(table.Columns) != len(wantTypes) {
 		t.Fatalf("columns = %d; want %d", len(table.Columns), len(wantTypes))
@@ -512,5 +513,90 @@ func TestParseCreateTable_EnumEscapeShapes(t *testing.T) {
 		if !ok || !reflect.DeepEqual(e.Values, tc.want) {
 			t.Fatalf("%s → %#v; want %v", tc.src, table.Columns[0].Type, tc.want)
 		}
+	}
+}
+
+// TestParseCreateTable_ColumnCollationsResolveLikeTheServer pins
+// MYDUMPER-COLLATION-NO-CHARSET on the two SHOW CREATE TABLE shapes
+// measured on real servers. MySQL 8.0 prints a column that inherits a
+// utf8mb4_bin table default as `COLLATE utf8mb4_bin` with no charset;
+// MariaDB 11.4 prints it bare and names the collation only on the table
+// line. Before the fix the first carried a charset-less collation, which
+// downstream read as Postgres vocabulary and dropped, and the second
+// carried nothing: either way a case-sensitive key was created under the
+// target's default collation.
+func TestParseCreateTable_ColumnCollationsResolveLikeTheServer(t *testing.T) {
+	bin := ir.Varchar{Length: 10, Charset: "utf8mb4", Collation: "utf8mb4_bin"}
+	for _, c := range []struct {
+		name, ddl string
+		want      map[string]ir.Type
+	}{
+		{
+			"mysql8: collation-only columns derive the charset",
+			"CREATE TABLE `t` (`k` varchar(10) COLLATE utf8mb4_bin NOT NULL, `g` text COLLATE utf8mb4_bin, " +
+				"`c` varchar(10) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_as_cs, PRIMARY KEY (`k`)) " +
+				"ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;",
+			map[string]ir.Type{
+				"k": bin,
+				"g": ir.Text{Size: ir.TextRegular, Charset: "utf8mb4", Collation: "utf8mb4_bin"},
+				"c": ir.Varchar{Length: 10, Charset: "utf8mb4", Collation: "utf8mb4_0900_as_cs"},
+			},
+		},
+		{
+			"mariadb: bare columns inherit the table's collation",
+			"CREATE TABLE `t` (`k` varchar(10) NOT NULL, `a` varchar(10) DEFAULT NULL, PRIMARY KEY (`k`)) " +
+				"ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;",
+			map[string]ir.Type{"k": bin, "a": bin},
+		},
+		{
+			"a table collation alone names the charset",
+			"CREATE TABLE `t` (`k` varchar(10)) COLLATE=utf8mb4_bin;",
+			map[string]ir.Type{"k": bin},
+		},
+		{
+			"a charset with no collation leaves the server's default unnamed",
+			"CREATE TABLE `t` (`k` varchar(10)) DEFAULT CHARSET=utf8mb3;",
+			map[string]ir.Type{"k": ir.Varchar{Length: 10, Charset: "utf8mb3"}},
+		},
+		{
+			"an explicit column charset is not overridden by the table's collation",
+			"CREATE TABLE `t` (`k` varchar(10) CHARACTER SET utf8mb3) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;",
+			map[string]ir.Type{"k": ir.Varchar{Length: 10, Charset: "utf8mb3"}},
+		},
+		{
+			"no table options leave the column as it was",
+			"CREATE TABLE `t` (`k` varchar(10));",
+			map[string]ir.Type{"k": ir.Varchar{Length: 10}},
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			tbl, err := parseCreateTable(c.ddl, "t-schema.sql")
+			if err != nil {
+				t.Fatalf("parseCreateTable: %v", err)
+			}
+			for _, col := range tbl.Columns {
+				want, ok := c.want[col.Name]
+				if !ok {
+					continue
+				}
+				if col.Type != want {
+					t.Errorf("column %s type = %#v; want %#v", col.Name, col.Type, want)
+				}
+			}
+		})
+	}
+}
+
+// TestParseCreateTable_CollationOnlyColumnFeedsTheCharsetGate: deriving the
+// charset from the collation also lets the ADR-0161 charset gate see a
+// `COLLATE latin1_bin` column in a utf8mb4 table as the latin1 column it is.
+// It passed as utf8mb4 before.
+func TestParseCreateTable_CollationOnlyColumnFeedsTheCharsetGate(t *testing.T) {
+	_, err := parseCreateTable(
+		"CREATE TABLE `t` (`k` varchar(10) COLLATE latin1_bin) DEFAULT CHARSET=utf8mb4;", "t-schema.sql",
+	)
+	var refusal *CharsetRefusalError
+	if !errors.As(err, &refusal) || refusal.Charset != "latin1" {
+		t.Fatalf("err = %v; want a latin1 CharsetRefusalError", err)
 	}
 }

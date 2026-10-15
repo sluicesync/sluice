@@ -561,6 +561,7 @@ func parseCreateTable(stmt, file string) (*ir.Table, error) {
 	if len(t.Columns) == 0 {
 		return nil, fmt.Errorf("mydumper: %s: CREATE TABLE %s has no columns", file, tableName)
 	}
+	b.inheritTableCollation()
 	// A charset violation returns the PARSED TABLE with the typed
 	// refusal, so schema readers can defer it to first use (Bug 188);
 	// every other error above returns a nil table as before.
@@ -1118,6 +1119,57 @@ func (b *tableBuilder) checkCharsets() error {
 		}
 	}
 	return nil
+}
+
+// inheritTableCollation gives every character column that declares neither
+// a charset nor a collation the table's, which is what the server resolved
+// for it. It runs after the table options, which follow the column list.
+//
+// MariaDB's SHOW CREATE TABLE prints nothing on a column that inherits the
+// table's collation and carries it only on the table line (measured on
+// 11.4: a `DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin` table prints its
+// columns bare). Left empty, such a column was created under the target's
+// default collation, so a case-sensitive key became a case-insensitive one
+// on a MySQL target (MYDUMPER-COLLATION-NO-CHARSET, wider than filed).
+// MySQL 8 prints an inherited non-default collation on the column itself,
+// so a bare column there has the charset's default collation, which the
+// table line also names whenever it prints one for that charset.
+//
+// A table line with a charset and no collation (a `latin1` or `utf8mb3`
+// table, or any table dumped from MySQL 5.7) leaves the collation empty:
+// it is that charset's default on the source server, and the default is
+// server-dependent for utf8mb4, so naming one here would be a guess.
+func (b *tableBuilder) inheritTableCollation() {
+	charset := b.tableCharset
+	if charset == "" {
+		charset = charsetOfCollation(b.tableCollation)
+	}
+	if charset == "" {
+		return
+	}
+	collation := ""
+	if charsetOfCollation(b.tableCollation) == charset {
+		collation = b.tableCollation
+	}
+	for _, col := range b.table.Columns {
+		switch v := col.Type.(type) {
+		case ir.Char:
+			if v.Charset == "" && v.Collation == "" {
+				v.Charset, v.Collation = charset, collation
+				col.Type = v
+			}
+		case ir.Varchar:
+			if v.Charset == "" && v.Collation == "" {
+				v.Charset, v.Collation = charset, collation
+				col.Type = v
+			}
+		case ir.Text:
+			if v.Charset == "" && v.Collation == "" {
+				v.Charset, v.Collation = charset, collation
+				col.Type = v
+			}
+		}
+	}
 }
 
 // charsetOfCollation derives a collation's charset: MySQL collation names
