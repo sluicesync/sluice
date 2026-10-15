@@ -1944,10 +1944,8 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		// (one catalog read per table per run).
 		a.noteUnenforcedDeferrable(ctx, schema, v.Table)
 		if _, err := a.txExec(ctx, tx, stmt, a.execDMLArgs(schema, v.Table, args)...); err != nil {
-			if guard != nil && isKeyCollationMergeRaise(err) {
-				err = &ir.KeyCollationMergeError{Schema: schema, Table: v.Table, Cause: err}
-			}
-			return false, fmt.Errorf("postgres: applier: insert into %s.%s: %w", schema, v.Table, err)
+			return false, fmt.Errorf("postgres: applier: insert into %s.%s: %w", schema, v.Table,
+				applyKeyCollationMergeError(err, guard, schema, v.Table))
 		}
 		return false, nil
 

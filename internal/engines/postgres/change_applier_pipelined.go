@@ -80,6 +80,11 @@ type queuedStmt struct {
 	// keyScoped is the GC-42 multi-row check every UPDATE/DELETE carries,
 	// read against the statement's command tag at flush; nil otherwise.
 	keyScoped *keyScopedWrite
+
+	// guard is an insert's key-collation plan (nil when nothing is armed),
+	// so a flushed KEY-COLLATION-MERGE raise is attributed with the table
+	// and the plan's remedy ([applyKeyCollationMergeError]).
+	guard *pgKeyCollationPlan
 }
 
 // pgxBatchTx is the ADR-0092 pipelined-apply transaction handle. It pins
@@ -308,7 +313,7 @@ func (a *ChangeApplier) dispatchPipelined(ctx context.Context, b *pgxBatchTx, st
 		// GC-42: names a DEFERRABLE constraint replica mode leaves unchecked
 		// (one catalog read per table per run).
 		a.noteUnenforcedDeferrable(ctx, schema, v.Table)
-		b.queue(stmt, args, queuedStmt{schema: schema, table: v.Table, kind: "insert"})
+		b.queue(stmt, args, queuedStmt{schema: schema, table: v.Table, kind: "insert", guard: guard})
 		return false, nil
 
 	case ir.Update:
@@ -548,7 +553,8 @@ func (a *ChangeApplier) sendBatchUnderDeadline(b *pgxBatchTx) error {
 func (a *ChangeApplier) attributeQueuedError(s queuedStmt, err error) error {
 	switch s.kind {
 	case "insert":
-		return fmt.Errorf("postgres: applier: insert into %s.%s: %w", s.schema, s.table, err)
+		return fmt.Errorf("postgres: applier: insert into %s.%s: %w", s.schema, s.table,
+			applyKeyCollationMergeError(err, s.guard, s.schema, s.table))
 	case "update":
 		return fmt.Errorf("postgres: applier: update %s.%s: %w", s.schema, s.table, err)
 	case "delete":

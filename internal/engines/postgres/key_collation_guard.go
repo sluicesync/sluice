@@ -76,6 +76,12 @@ type pgKeyCollationPlan struct {
 	compare map[string]string
 	// marker is the armed column whose incoming value the raise reads.
 	marker string
+	// targetHasSource lists the armed columns the target already declares
+	// under the source's collation name, compared as bytes only because that
+	// collation is not established for the rows
+	// (KEY-COLLATION-PG-UNESTABLISHED-REMEDY): for them, giving the target
+	// key the source's collation cannot converge.
+	targetHasSource []string
 }
 
 // targetKeyCollation is a target column's collation ("" the default) and
@@ -132,6 +138,9 @@ func planPGKeyCollationGuard(source *ir.Table, key []string, target map[string]t
 			// the one read, so even the target's own name is no proof that
 			// two byte-different keys are one source row.
 			p.compare[col] = "C"
+			if name == tc.name {
+				p.targetHasSource = append(p.targetHasSource, col)
+			}
 		case name != tc.name:
 			p.compare[col] = name
 		default:
@@ -316,6 +325,75 @@ func isKeyCollationMergeRaise(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "22P02" && strings.Contains(pgErr.Message, keyCollationMergeMarker)
 }
+
+// applyKeyCollationMergeError attributes a guarded CDC insert's failure
+// ([isKeyCollationMergeRaise]) to [ir.KeyCollationMergeError], naming the
+// table and the apply path's remedy; anything else is returned unchanged.
+// Shared by the serial dispatch and the pipelined batch, which attributes a
+// flushed error to the statement it queued — the classifier's own
+// attribution ([classifyApplierError]) sees neither the table nor the plan,
+// so through it the refusal named no table and the generic remedy
+// (KEY-COLLATION-PG-UNESTABLISHED-REMEDY, the wider half).
+func applyKeyCollationMergeError(err error, plan *pgKeyCollationPlan, schema, table string) error {
+	if plan == nil || !isKeyCollationMergeRaise(err) {
+		return err
+	}
+	return &ir.KeyCollationMergeError{
+		Schema: schema, Table: table, Cause: err,
+		Remedy: applyKeyCollationMergeRemedy(plan, schema, table),
+	}
+}
+
+// applyKeyCollationMergeRemedy is the CDC apply path's remedy. It names the
+// collation the guard compared each armed column under, as the copy's
+// remedy does ([copyKeyCollationMergeRemedy]) — never "the source's
+// collation", which the target may already have: a key armed only because
+// its collation was not established for the rows
+// ([pgKeyCollationPlan.targetHasSource]) carries the source's name on the
+// target already, and is compared as bytes because the rows may have been
+// written under a stricter collation. There, altering the key to the
+// source's collation changes nothing, so only the re-copy is offered: it
+// copies the source's rows as they stand now, under the collation they now
+// have.
+func applyKeyCollationMergeRemedy(plan *pgKeyCollationPlan, schema, table string) string {
+	if len(plan.targetHasSource) > 0 {
+		cols := append([]string(nil), plan.targetHasSource...)
+		sortStrings(cols)
+		for i, c := range cols {
+			cols[i] = quoteIdent(c)
+		}
+		return fmt.Sprintf("The target's key column(s) %s of %s.%s already carry the source's collation; sluice "+
+			"compared them byte for byte because the change stream could not establish the collation these rows "+
+			"were written under (the column was altered after them), so giving the target key the source's "+
+			"collation cannot converge. Re-copy the table, which copies the source's rows as they stand now: %s",
+			strings.Join(cols, ", "), quoteIdent(schema), quoteIdent(table), keyCollationRecopy)
+	}
+	return fmt.Sprintf("Give the target's key column(s) %s (`ALTER TABLE %s.%s ALTER COLUMN <column> TYPE <type> "+
+		"COLLATE …`) and restart, or re-copy the table: %s recreates it with the source's collation",
+		keyCollationNeeds(plan), quoteIdent(schema), quoteIdent(table), keyCollationRecopy)
+}
+
+// keyCollationNeeds names, per armed column in name order, the collation the
+// guard compared it under (`"k" COLLATE "C"`).
+func keyCollationNeeds(plan *pgKeyCollationPlan) string {
+	cols := make([]string, 0, len(plan.compare))
+	for c := range plan.compare {
+		cols = append(cols, c)
+	}
+	sortStrings(cols)
+	need := make([]string, len(cols))
+	for i, c := range cols {
+		need[i] = quoteIdent(c) + " COLLATE " + quoteIdent(plan.compare[c])
+	}
+	return strings.Join(need, ", ")
+}
+
+// keyCollationRecopy names the re-copy for each command that reaches the
+// applier's remedy, each with the flag that command accepts (Bug 308; the
+// MySQL twin carries the same text). `restore` replaces the remedy with its
+// own (backup.restoreKeyCollationRemedy).
+const keyCollationRecopy = "`sluice sync start --restart-from-scratch` (or, replaying a backup chain, " +
+	"`sluice sync from-backup run --reset-target-data --yes`)"
 
 // guardSourceShape is the source shape the key-collation guard arms from:
 // the active schema version for srcSchema.table, or, when none is active, the
