@@ -290,7 +290,7 @@ func TestEmitters_IdentifierLengthRefusal(t *testing.T) {
 			// test is the effective name's own length.
 			prefix: "t_",
 			emit: func(name string) error {
-				_, err := emitCreateIndex("public", "t", mkNamedIdx(name, false), emitOpts{})
+				_, err := emitCreateIndex("public", &ir.Table{Name: "t"}, mkNamedIdx(name, false), emitOpts{})
 				return err
 			},
 		},

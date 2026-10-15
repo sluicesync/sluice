@@ -168,7 +168,7 @@ func TestRequotePGReservedIdents(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			if got := requotePGReservedIdents(c.in); got != c.want {
+			if got := requotePGReservedIdents(c.in, nil); got != c.want {
 				t.Errorf("\n got  %q\n want %q", got, c.want)
 			}
 		})
@@ -253,7 +253,7 @@ func TestTranslateIndexExpr_PGReservedWord(t *testing.T) {
 			Expression:        "(order + 1)",
 			ExpressionDialect: "mysql",
 		}
-		got := translateIndexExpr(c, emitOpts{})
+		got := translateIndexExpr(c, nil, emitOpts{})
 		want := `("order" + 1)`
 		if got != want {
 			t.Errorf("\n got  %q\n want %q", got, want)
@@ -265,7 +265,7 @@ func TestTranslateIndexExpr_PGReservedWord(t *testing.T) {
 			Expression:        `("order" + 1)`,
 			ExpressionDialect: "postgres",
 		}
-		got := translateIndexExpr(c, emitOpts{})
+		got := translateIndexExpr(c, nil, emitOpts{})
 		want := `("order" + 1)`
 		if got != want {
 			t.Errorf("\n got  %q\n want %q", got, want)

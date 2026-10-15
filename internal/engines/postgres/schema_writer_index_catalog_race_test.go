@@ -28,6 +28,7 @@ import (
 func newCatalogRaceJob() indexBuildJob {
 	return indexBuildJob{
 		tableName: "widgets",
+		table:     &ir.Table{Name: "widgets", Columns: []*ir.Column{{Name: "name"}}},
 		idx: &ir.Index{
 			Name:    "widgets_name_idx",
 			Kind:    ir.IndexKindBTree,

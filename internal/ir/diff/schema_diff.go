@@ -508,7 +508,7 @@ type Options struct {
 	// on the name-matched path only: the emitted-match path's expected
 	// side is the TARGET writer's own prediction, already in target
 	// spelling.
-	TranslateExpectedCheckExpr func(expr, exprDialect string) (translated string, ok bool)
+	TranslateExpectedCheckExpr func(expr, exprDialect string, table *ir.Table) (translated string, ok bool)
 }
 
 // Schemas computes the structural delta between expected and
@@ -807,7 +807,7 @@ func diffChecks(td *TableDiff, expected, actual *ir.Table, opts Options) {
 		// phantom-reporting the source spelling. See
 		// [Options.TranslateExpectedCheckExpr].
 		if opts.TranslateExpectedCheckExpr != nil {
-			if translated, ok := opts.TranslateExpectedCheckExpr(expExpr, exp.ExprDialect); ok {
+			if translated, ok := opts.TranslateExpectedCheckExpr(expExpr, exp.ExprDialect, expected); ok {
 				expExpr = strings.TrimSpace(translated)
 			}
 		}

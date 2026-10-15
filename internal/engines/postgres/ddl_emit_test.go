@@ -168,7 +168,7 @@ func TestEmitCreateIndex_NameLengthRefusal(t *testing.T) {
 	}
 
 	t.Run("exactly 63 bytes accepted", func(t *testing.T) {
-		stmt, err := emitCreateIndex("public", tbl, mkIdx(name63), emitOpts{})
+		stmt, err := emitCreateIndex("public", &ir.Table{Name: tbl}, mkIdx(name63), emitOpts{})
 		if err != nil {
 			t.Fatalf("63-byte name should be accepted, got error: %v", err)
 		}
@@ -178,7 +178,7 @@ func TestEmitCreateIndex_NameLengthRefusal(t *testing.T) {
 	})
 
 	t.Run("64 bytes refused loudly with name in message", func(t *testing.T) {
-		_, err := emitCreateIndex("public", tbl, mkIdx(name64), emitOpts{})
+		_, err := emitCreateIndex("public", &ir.Table{Name: tbl}, mkIdx(name64), emitOpts{})
 		if err == nil {
 			t.Fatal("64-byte name must be refused, got nil error")
 		}
@@ -191,7 +191,7 @@ func TestEmitCreateIndex_NameLengthRefusal(t *testing.T) {
 	})
 
 	t.Run("multibyte name >63 bytes but <=63 runes refused (byte-based)", func(t *testing.T) {
-		_, err := emitCreateIndex("public", tbl, mkIdx(multibyte), emitOpts{})
+		_, err := emitCreateIndex("public", &ir.Table{Name: tbl}, mkIdx(multibyte), emitOpts{})
 		if err == nil {
 			t.Fatalf("multibyte name of %d bytes (%d runes) must be refused (byte-based check), got nil error",
 				len(multibyte), len([]rune(multibyte)))
@@ -205,10 +205,10 @@ func TestEmitCreateIndex_NameLengthRefusal(t *testing.T) {
 		base := "ix_t_" + strings.Repeat("a", 63-len("ix_t_")) // 63 bytes shared prefix
 		nameA := base + "_alpha"
 		nameB := base + "_beta"
-		if _, err := emitCreateIndex("public", tbl, mkIdx(nameA), emitOpts{}); err == nil {
+		if _, err := emitCreateIndex("public", &ir.Table{Name: tbl}, mkIdx(nameA), emitOpts{}); err == nil {
 			t.Errorf("name A (%d bytes) sharing a 63-byte prefix must be refused", len(nameA))
 		}
-		if _, err := emitCreateIndex("public", tbl, mkIdx(nameB), emitOpts{}); err == nil {
+		if _, err := emitCreateIndex("public", &ir.Table{Name: tbl}, mkIdx(nameB), emitOpts{}); err == nil {
 			t.Errorf("name B (%d bytes) sharing a 63-byte prefix must be refused", len(nameB))
 		}
 	})
@@ -501,7 +501,7 @@ func TestEmitCreateIndex_PgvectorIVFFlat(t *testing.T) {
 		Kind:    ir.IndexKindUnspecified,
 		Columns: []ir.IndexColumn{{Column: "embedding"}},
 	}
-	got, err := emitCreateIndex("public", "items", idx, emitOpts{})
+	got, err := emitCreateIndex("public", &ir.Table{Name: "items"}, idx, emitOpts{})
 	if err != nil {
 		t.Fatalf("emitCreateIndex: %v", err)
 	}
@@ -1493,7 +1493,7 @@ func TestEmitCreateIndex(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			got, err := emitCreateIndex("public", "users", c.idx, emitOpts{})
+			got, err := emitCreateIndex("public", &ir.Table{Name: "users"}, c.idx, emitOpts{})
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}

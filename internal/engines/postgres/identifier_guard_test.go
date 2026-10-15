@@ -62,12 +62,12 @@ func TestBareIdentifierPositionsRefuseInjection(t *testing.T) {
 			})
 		},
 		"index access method": func() (string, error) {
-			return emitCreateIndex("public", "t", &ir.Index{
+			return emitCreateIndex("public", &ir.Table{Name: "t"}, &ir.Index{
 				Name: "i", Method: hostile, Columns: []ir.IndexColumn{{Column: "c"}},
 			}, emitOpts{})
 		},
 		"index operator class": func() (string, error) {
-			return emitCreateIndex("public", "t", &ir.Index{
+			return emitCreateIndex("public", &ir.Table{Name: "t"}, &ir.Index{
 				Name: "i", Columns: []ir.IndexColumn{{Column: "c", OperatorClass: `text_ops; CREATE ROLE attacker SUPERUSER; --`}},
 			}, emitOpts{})
 		},
@@ -115,7 +115,7 @@ func TestBareIdentifierPositionsRefuseInjection(t *testing.T) {
 // pgvector shipped a new index type.
 func TestBareIdentifierPositionsAcceptRealValues(t *testing.T) {
 	for _, method := range []string{"btree", "hash", "gin", "gist", "spgist", "brin", "ivfflat", "hnsw", "bm25"} {
-		stmt, err := emitCreateIndex("public", "t", &ir.Index{
+		stmt, err := emitCreateIndex("public", &ir.Table{Name: "t"}, &ir.Index{
 			Name: "i", Method: method, Columns: []ir.IndexColumn{{Column: "c"}},
 		}, emitOpts{})
 		if err != nil {
@@ -130,7 +130,7 @@ func TestBareIdentifierPositionsAcceptRealValues(t *testing.T) {
 		"gin_trgm_ops", "gist_trgm_ops", "text_pattern_ops", "varchar_pattern_ops",
 		"jsonb_path_ops", "vector_l2_ops", "gist__int_ops", "_int4_ops",
 	} {
-		stmt, err := emitCreateIndex("public", "t", &ir.Index{
+		stmt, err := emitCreateIndex("public", &ir.Table{Name: "t"}, &ir.Index{
 			Name: "i", Columns: []ir.IndexColumn{{Column: "c", OperatorClass: opclass}},
 		}, emitOpts{})
 		if err != nil {

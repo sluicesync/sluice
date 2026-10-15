@@ -29,7 +29,7 @@ func TestNekiOnlineDDLRequiresQualifiedNames(t *testing.T) {
 	t.Parallel()
 
 	idx := &ir.Index{Name: "ix_created", Columns: []ir.IndexColumn{{Column: "created_at"}}}
-	stmt, err := emitCreateIndex("public", "soak_rows_pg", idx, emitOpts{})
+	stmt, err := emitCreateIndex("public", &ir.Table{Name: "soak_rows_pg"}, idx, emitOpts{})
 	if err != nil {
 		t.Fatalf("emitCreateIndex: %v", err)
 	}

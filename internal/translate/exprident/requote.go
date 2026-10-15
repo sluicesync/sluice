@@ -36,12 +36,53 @@ import "strings"
 //     historical behaviour requires the '(' to immediately follow).
 //     This single flag is the only behavioural divergence between the
 //     two engines' historical helpers and is preserved exactly.
+//
+// Two further fields resolve COLUMN references rather than reserved words
+// (see [Config.WithColumns]); both are zero in the engine-level configs:
+//
+//   - Columns: the columns of the table the expression belongs to, keyed
+//     by upper-cased name, valued by the column's real spelling. A bare
+//     token outside call position that names one of them — matched
+//     case-insensitively, the way the MySQL and SQLite sources resolve
+//     it — is emitted as that real spelling, quoted when the target
+//     would not read it back unquoted. nil disables the pass.
+//   - UnquotedFold: how the target folds an unquoted identifier
+//     (strings.ToLower for Postgres). A column whose real spelling the
+//     fold would change must be quoted to survive; one the fold leaves
+//     alone, and that is not reserved, is emitted bare.
 type Config struct {
 	QuoteByte         byte
 	Reserved          map[string]struct{}
 	GrammarExclusions map[string]struct{}
 	GrammarContextual map[string]ContextRule
 	SkipWSBeforeParen bool
+
+	Columns      map[string]string
+	UnquotedFold func(string) string
+}
+
+// WithColumns returns cfg bound to one table's column names, so
+// [RequoteIdentifiers] also resolves bare column references to their real
+// spelling (see the Columns field). An empty names list returns cfg
+// unchanged.
+//
+// Why it exists (GitHub #356): a source reader strips its engine's
+// identifier quotes for IR portability, and the MySQL and SQLite sources
+// resolve column names case-insensitively, so a stored expression can
+// spell a column `Price` or even `status` for a column named `STATUS`.
+// Postgres folds every unquoted identifier to lower case, so the bare
+// token names no column at all and the CREATE fails with SQLSTATE 42703.
+// The reserved-word pass alone never fired on those names.
+func (cfg Config) WithColumns(names []string) Config {
+	if len(names) == 0 {
+		return cfg
+	}
+	cols := make(map[string]string, len(names))
+	for _, n := range names {
+		cols[strings.ToUpper(n)] = n
+	}
+	cfg.Columns = cols
+	return cfg
 }
 
 // ContextRule describes when a [Config.GrammarContextual] token is
@@ -176,7 +217,9 @@ func RequoteIdentifiers(expr string, cfg Config) string {
 				}
 			}
 			callPos := k < len(expr) && expr[k] == '('
-			if !callPos && shouldRequote(tok, cfg, prevTok, fnStack) {
+			if name, ok := columnRef(expr, i, tok, callPos, cfg, prevTok, fnStack); ok {
+				writeColumnName(&sb, name, cfg)
+			} else if !callPos && shouldRequote(tok, cfg, prevTok, fnStack) {
 				sb.WriteByte(q)
 				sb.WriteString(tok)
 				sb.WriteByte(q)
@@ -216,6 +259,116 @@ func RequoteIdentifiers(expr string, cfg Config) string {
 		}
 	}
 	return sb.String()
+}
+
+// columnRef reports whether the bare token tok, starting at expr[start],
+// is a reference to one of cfg.Columns, and if so returns the column's
+// real spelling. A token is NOT a column reference when it heads a call,
+// is an unconditional grammar keyword, is a contextual keyword in its
+// grammar position, or sits in a position where SQL grammar wants a type,
+// collation or date-part name ([inNonColumnPosition]).
+func columnRef(expr string, start int, tok string, callPos bool, cfg Config, prevTok string, fnStack []string) (string, bool) {
+	if cfg.Columns == nil || callPos {
+		return "", false
+	}
+	u := strings.ToUpper(tok)
+	name, ok := cfg.Columns[u]
+	if !ok {
+		return "", false
+	}
+	if _, excluded := cfg.GrammarExclusions[u]; excluded {
+		return "", false
+	}
+	if rule, ok := cfg.GrammarContextual[u]; ok && rule.isGrammar(prevTok, fnStack) {
+		return "", false
+	}
+	if inNonColumnPosition(expr, start, u, prevTok, fnStack) {
+		return "", false
+	}
+	return name, true
+}
+
+// datePartWords are the date/time field names SQL grammar takes bare: the
+// unit of an INTERVAL literal (`INTERVAL 1 DAY`), the field of
+// `EXTRACT(YEAR FROM ts)`, and MySQL's TIMESTAMPDIFF/TIMESTAMPADD unit.
+// A table may well have a column named `Day` or `Year`, and quoting the
+// grammar word as that column would turn valid SQL into a syntax error.
+var datePartWords = map[string]struct{}{
+	"MICROSECOND": {}, "MILLISECOND": {}, "SECOND": {}, "MINUTE": {}, "HOUR": {},
+	"DAY": {}, "WEEK": {}, "MONTH": {}, "QUARTER": {}, "YEAR": {},
+	"DECADE": {}, "CENTURY": {}, "MILLENNIUM": {}, "EPOCH": {},
+	"DOW": {}, "DOY": {}, "ISODOW": {}, "ISOYEAR": {},
+	"TIMEZONE": {}, "TIMEZONE_HOUR": {}, "TIMEZONE_MINUTE": {},
+	"SECOND_MICROSECOND": {}, "MINUTE_MICROSECOND": {}, "MINUTE_SECOND": {},
+	"HOUR_MICROSECOND": {}, "HOUR_SECOND": {}, "HOUR_MINUTE": {},
+	"DAY_MICROSECOND": {}, "DAY_SECOND": {}, "DAY_MINUTE": {}, "DAY_HOUR": {},
+	"YEAR_MONTH": {},
+}
+
+// datePartFunctions take a bare date-part word as their FIRST argument.
+var datePartFunctions = map[string]struct{}{
+	"EXTRACT": {}, "TIMESTAMPDIFF": {}, "TIMESTAMPADD": {},
+}
+
+// inNonColumnPosition reports whether the token starting at expr[start]
+// (upper-cased as u) is in a position where the grammar wants a name that
+// is not a column: a type after `AS` (CAST) or `::`, a collation after
+// COLLATE, or a date-part word as an INTERVAL unit (after a numeric or
+// string literal) or as a date-part function's first argument.
+func inNonColumnPosition(expr string, start int, u, prevTok string, fnStack []string) bool {
+	if prevTok == "AS" || prevTok == "COLLATE" {
+		return true
+	}
+	k := start
+	for k > 0 && (expr[k-1] == ' ' || expr[k-1] == '\t') {
+		k--
+	}
+	if k >= 2 && expr[k-2:k] == "::" {
+		return true
+	}
+	if _, unit := datePartWords[u]; !unit || k == 0 {
+		return false
+	}
+	switch prev := expr[k-1]; {
+	case prev >= '0' && prev <= '9', prev == '\'':
+		return true
+	case prev == '(':
+		if n := len(fnStack); n > 0 {
+			_, ok := datePartFunctions[fnStack[n-1]]
+			return ok
+		}
+	}
+	return false
+}
+
+// writeColumnName emits a resolved column reference: bare when the target
+// reads the real spelling back unchanged and it is not reserved, quoted
+// (doubling any embedded quote byte) otherwise.
+func writeColumnName(sb *strings.Builder, name string, cfg Config) {
+	if bareSafe(name, cfg) {
+		sb.WriteString(name)
+		return
+	}
+	q := string(cfg.QuoteByte)
+	sb.WriteString(q)
+	sb.WriteString(strings.ReplaceAll(name, q, q+q))
+	sb.WriteString(q)
+}
+
+func bareSafe(name string, cfg Config) bool {
+	if name == "" || !IsIdentStartByte(name[0]) {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		if !IsIdentifierByte(name[i]) {
+			return false
+		}
+	}
+	if cfg.UnquotedFold != nil && cfg.UnquotedFold(name) != name {
+		return false
+	}
+	_, reserved := cfg.Reserved[strings.ToUpper(name)]
+	return !reserved
 }
 
 // shouldRequote reports whether tok (case-insensitive) is a reserved

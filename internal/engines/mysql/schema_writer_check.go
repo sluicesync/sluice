@@ -138,7 +138,7 @@ func mysqlCheckConstraintExists(ctx context.Context, db *sql.DB, schema, tableNa
 // Identifier requoting (the emit path's requoteMySQLReservedIdents) is
 // deliberately NOT applied here: the diff canonicalizer strips identifier
 // quoting, so the translator body alone is the correct comparison surface.
-func (w *SchemaWriter) TranslateCheckExprFromDialect(expr, sourceDialect string) (string, bool) {
+func (w *SchemaWriter) TranslateCheckExprFromDialect(expr, sourceDialect string, _ *ir.Table) (string, bool) {
 	if sourceDialect != translatableSourceDialect {
 		return "", false
 	}

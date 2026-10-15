@@ -159,11 +159,16 @@ func pgCheckConstraintExists(ctx context.Context, db sqlExecQueryer, schemaName,
 // (JSON operators, TO_CHAR, function renames) is context-free.
 // Best-effort per the interface contract: untranslatable constructs pass
 // through unchanged and the diff reports them exactly as before.
-func (w *SchemaWriter) TranslateCheckExprFromDialect(expr, sourceDialect string) (string, bool) {
+//
+// The identifier pass is the emit path's too, bound to the expected
+// table: a CHECK over a mixed-case MySQL column lands as `("Qty" >= 0)`
+// (GitHub #356), and an expected side left as `(Qty >= 0)` names a
+// different column on Postgres, which the diff rightly refuses to fold.
+func (w *SchemaWriter) TranslateCheckExprFromDialect(expr, sourceDialect string, table *ir.Table) (string, bool) {
 	if sourceDialect != translatableSourceDialect {
 		return "", false
 	}
-	return translateExprForPG(expr, ExprContext{}), true
+	return requotePGReservedIdents(translateExprForPG(expr, ExprContext{}), table), true
 }
 
 // untranslatedMySQLToPGTokens lists tokens that, when they survive

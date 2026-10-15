@@ -54,6 +54,16 @@ other eighteen.
 
 ---
 
+## 2026-10-15 — GitHub #356 (an outside user's report): fixed, with what it leaves open
+
+Indexed when filed. The report's defect and what fixing it found (no audit pass).
+
+- EXPR-COLUMN-CASE-PG filed
+- EXPR-COLUMN-CASE-GRAMMAR-WORD-COLUMN filed
+- SCHEMA-DIFF-EXPR-INDEX-PHANTOM filed
+- SCHEMA-DIFF-GENERATED-EXPR-VERBATIM filed
+- SYNC-INDEX-FAILURE-NO-RESUME filed
+
 ## 2026-10-13 — Bugs 306, 307 and 308 (the v0.159.2 regression cycle): fixed, with what they leave open
 
 Indexed when filed. The three cycle bugs (numbered in the BUG-CATALOG) and the findings made while fixing them (no audit pass).

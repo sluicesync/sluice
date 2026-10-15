@@ -3,7 +3,10 @@
 
 package exprident
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // mysqlLikeCfg / pgLikeCfg are deliberately small configs that mirror
 // the two real engine shapes (backtick vs double-quote, no-ws vs
@@ -123,5 +126,54 @@ func TestScanPrimitives(t *testing.T) {
 	}
 	if IsIdentStartByte('0') {
 		t.Error("IsIdentStartByte accepted a digit (numeric literal must not start an ident)")
+	}
+}
+
+// TestRequoteIdentifiers_ResolvesColumnReferences pins the GitHub #356
+// pass: with a table's columns bound, a bare column reference is emitted
+// as the column's real spelling, quoted when the target's unquoted fold
+// would change it, and every position where SQL grammar wants a non-column
+// name is left alone even when a column shares that name.
+func TestRequoteIdentifiers_ResolvesColumnReferences(t *testing.T) {
+	cfg := pgLikeCfg
+	cfg.GrammarExclusions = map[string]struct{}{"AND": {}, "NULL": {}, "AS": {}, "INTERVAL": {}}
+	cfg.UnquotedFold = strings.ToLower
+	cfg = cfg.WithColumns([]string{"STATUS", "Price", "Qty", "plain", "Day", "Year", "Text", "Order", "utf8mb4_bin"})
+
+	cases := []struct{ name, in, want string }{
+		{"case-mismatched ref resolves to the real spelling", "lower(status)", `lower("STATUS")`},
+		{"exact upper-case ref is quoted", "lower(STATUS)", `lower("STATUS")`},
+		{"mixed-case refs in arithmetic", "Price * Qty", `"Price" * "Qty"`},
+		{"lower-case column stays bare", "plain + 1", "plain + 1"},
+		{"lower-case column spelled upper is emitted as its real name", "PLAIN + 1", "plain + 1"},
+		{"reserved mixed-case column", "Order > 0", `"Order" > 0`},
+		{"function name sharing a column name stays a call", "year(ts) + Year", `year(ts) + "Year"`},
+		{"unrelated identifier untouched", "other + 1", "other + 1"},
+		{"string literal untouched", "x = 'STATUS'", "x = 'STATUS'"},
+		{"already-quoted ident untouched", `"status" + 1`, `"status" + 1`},
+		{"interval unit after a number is grammar", "ts + interval 1 day", `ts + interval 1 day`},
+		{"interval unit after a string literal is grammar", "ts + interval '1' DAY", `ts + interval '1' DAY`},
+		{"extract field is grammar", "extract(year from ts)", "extract(year from ts)"},
+		{"column named like a unit is still a column elsewhere", "Day + 1", `"Day" + 1`},
+		{"extract source naming a unit-named column", "extract(year from Day)", `extract(year from "Day")`},
+		{"timestampdiff unit is grammar", "timestampdiff(DAY, a, b)", "timestampdiff(DAY, a, b)"},
+		{"cast target type is grammar", "cast(x as text)", "cast(x as text)"},
+		{"pg cast target type is grammar", "x::text", "x::text"},
+		{"collation name is grammar", "x collate utf8mb4_bin", "x collate utf8mb4_bin"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := RequoteIdentifiers(c.in, cfg); got != c.want {
+				t.Errorf("RequoteIdentifiers(%q) = %q; want %q", c.in, got, c.want)
+			}
+		})
+	}
+
+	// Without columns bound the pass is exactly the reserved-word pass.
+	if got := RequoteIdentifiers("lower(status) + Price", pgLikeCfg); got != "lower(status) + Price" {
+		t.Errorf("unbound config changed a non-reserved token: %q", got)
+	}
+	if got := pgLikeCfg.WithColumns(nil); got.Columns != nil {
+		t.Errorf("WithColumns(nil) bound a column map")
 	}
 }

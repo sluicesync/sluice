@@ -384,7 +384,7 @@ func (d *Differ) Run(ctx context.Context) (*irdiff.SchemaDiff, error) {
 	// target actually holds. A writer-less degraded diff (sw == nil
 	// after an open refusal) leaves it nil — those pairs then
 	// phantom-report, the stated degraded mode.
-	var translateExpected func(expr, dialect string) (string, bool)
+	var translateExpected func(expr, dialect string, table *ir.Table) (string, bool)
 	if xlat, ok := sw.(ir.CheckExprDialectTranslator); ok {
 		translateExpected = xlat.TranslateCheckExprFromDialect
 	}

@@ -88,7 +88,7 @@ func TestSQLiteRoute_Index_PortableEmitted(t *testing.T) {
 		Predicate:        "deleted_at IS NULL",
 		PredicateDialect: "sqlite",
 	}
-	stmt, err := emitCreateIndex("public", "users", idx, emitOpts{})
+	stmt, err := emitCreateIndex("public", &ir.Table{Name: "users"}, idx, emitOpts{})
 	if err != nil {
 		t.Fatalf("emitCreateIndex: %v", err)
 	}
@@ -139,7 +139,7 @@ func TestSQLiteRoute_Index_NonPortableSkipped(t *testing.T) {
 			{Expression: "strftime('%Y', d)", ExpressionDialect: "sqlite"},
 		},
 	}
-	if stmt, err := emitCreateIndex("public", "t", exprIdx, emitOpts{}); err != nil || stmt != "" {
+	if stmt, err := emitCreateIndex("public", &ir.Table{Name: "t"}, exprIdx, emitOpts{}); err != nil || stmt != "" {
 		t.Errorf("non-portable expr index = (%q, %v); want (\"\", nil) — WARN-skip", stmt, err)
 	}
 
@@ -149,7 +149,7 @@ func TestSQLiteRoute_Index_NonPortableSkipped(t *testing.T) {
 		Predicate:        "julianday(d) > 0",
 		PredicateDialect: "sqlite",
 	}
-	if stmt, err := emitCreateIndex("public", "t", predIdx, emitOpts{}); err != nil || stmt != "" {
+	if stmt, err := emitCreateIndex("public", &ir.Table{Name: "t"}, predIdx, emitOpts{}); err != nil || stmt != "" {
 		t.Errorf("non-portable partial index = (%q, %v); want (\"\", nil) — WARN-skip", stmt, err)
 	}
 }

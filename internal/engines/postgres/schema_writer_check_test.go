@@ -143,17 +143,17 @@ func TestCheckExprsEquivalent(t *testing.T) {
 // (best-effort by contract, never a gate).
 func TestSchemaWriter_TranslateCheckExprFromDialect(t *testing.T) {
 	w := &SchemaWriter{}
-	got, ok := w.TranslateCheckExprFromDialect("json_extract(j, '$.k') IS NOT NULL", "mysql")
+	got, ok := w.TranslateCheckExprFromDialect("json_extract(j, '$.k') IS NOT NULL", "mysql", nil)
 	if !ok || !strings.Contains(got, "->") || strings.Contains(got, "json_extract") {
 		t.Fatalf("mysql-dialect JSON_EXTRACT did not translate to the arrow form: (%q, %v)", got, ok)
 	}
-	if got, ok := w.TranslateCheckExprFromDialect("log(c) >= 0", "mysql"); !ok || !strings.Contains(strings.ToUpper(got), "LN(") {
+	if got, ok := w.TranslateCheckExprFromDialect("log(c) >= 0", "mysql", nil); !ok || !strings.Contains(strings.ToUpper(got), "LN(") {
 		t.Fatalf("mysql-dialect single-arg log did not translate to LN: (%q, %v)", got, ok)
 	}
-	if _, ok := w.TranslateCheckExprFromDialect("anything", "sqlite"); ok {
+	if _, ok := w.TranslateCheckExprFromDialect("anything", "sqlite", nil); ok {
 		t.Fatal("a foreign dialect must decline (ok=false), not translate")
 	}
-	if got, ok := w.TranslateCheckExprFromDialect("str_to_date(s, '%Y') IS NOT NULL", "mysql"); !ok || !strings.Contains(got, "str_to_date") {
+	if got, ok := w.TranslateCheckExprFromDialect("str_to_date(s, '%Y') IS NOT NULL", "mysql", nil); !ok || !strings.Contains(got, "str_to_date") {
 		t.Fatalf("an untranslatable construct must pass through unchanged with ok=true: (%q, %v)", got, ok)
 	}
 }

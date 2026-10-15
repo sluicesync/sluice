@@ -54,10 +54,10 @@ func TestWriterDialectGuard_SQLiteVerbatim(t *testing.T) {
 				&ir.CheckConstraint{Expr: tc.body, ExprDialect: tc.dialect}, nil, opts,
 			)
 			pred := translateIndexPredicate(
-				&ir.Index{Predicate: tc.body, PredicateDialect: tc.dialect}, opts,
+				&ir.Index{Predicate: tc.body, PredicateDialect: tc.dialect}, nil, opts,
 			)
 			expr := translateIndexExpr(
-				ir.IndexColumn{Expression: tc.body, ExpressionDialect: tc.dialect}, opts,
+				ir.IndexColumn{Expression: tc.body, ExpressionDialect: tc.dialect}, nil, opts,
 			)
 			for label, got := range map[string]string{
 				"generated": gen, "check": chk, "predicate": pred, "indexExpr": expr,

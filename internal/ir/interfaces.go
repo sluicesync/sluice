@@ -77,8 +77,12 @@ type DDLPreviewer interface {
 // returns the input text unchanged with ok=true, and the comparison
 // simply reports the mismatch it would have reported anyway. Never an
 // error: this surface renders for comparison, it does not gate.
+//
+// table is the expected table the CHECK belongs to (nil when unknown):
+// a writer whose emit resolves column references against the table
+// (PostgreSQL, GitHub #356) needs it to render the same text.
 type CheckExprDialectTranslator interface {
-	TranslateCheckExprFromDialect(expr, sourceDialect string) (string, bool)
+	TranslateCheckExprFromDialect(expr, sourceDialect string, table *Table) (string, bool)
 }
 
 // ColumnDDLPreviewer is the optional engine surface for emitting a

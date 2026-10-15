@@ -55,7 +55,7 @@ func emitViaTableDef(t *ir.Table) error {
 }
 
 func emitViaCreateIndex(t *ir.Table) error {
-	_, err := emitCreateIndex("public", t.Name, t.Indexes[0], emitOpts{})
+	_, err := emitCreateIndex("public", t, t.Indexes[0], emitOpts{})
 	return err
 }
 

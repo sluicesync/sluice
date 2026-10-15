@@ -807,7 +807,7 @@ func TestDiffChecks_TranslateExpectedHook(t *testing.T) {
 	// A stand-in for the PG writer's rewrite, shaped like the real one:
 	// translates only the "mysql" dialect, rewriting the source spelling
 	// to the target's.
-	xlat := func(expr, dialect string) (string, bool) {
+	xlat := func(expr, dialect string, _ *ir.Table) (string, bool) {
 		if dialect != "mysql" {
 			return "", false
 		}

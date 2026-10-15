@@ -500,11 +500,12 @@ func promoteVirtualColumns(table *ir.Table) (*ir.Table, bool) {
 }
 
 // indexBuildJob is one (table, index) unit of work the concurrent
-// CreateIndexes worker pool consumes. The table name is carried
-// alongside the index because emitCreateIndex needs it and the error
-// message names it.
+// CreateIndexes worker pool consumes. The table is carried alongside the
+// index because emitCreateIndex resolves the index's column references
+// against it, and the error message names it.
 type indexBuildJob struct {
 	tableName string
+	table     *ir.Table
 	idx       *ir.Index
 }
 
@@ -647,7 +648,7 @@ func (w *SchemaWriter) indexBuildJobsForTables(tables []*ir.Table) []indexBuildJ
 			if idx.ConstraintBacked {
 				continue
 			}
-			jobs = append(jobs, indexBuildJob{tableName: table.Name, idx: idx})
+			jobs = append(jobs, indexBuildJob{tableName: table.Name, table: table, idx: idx})
 		}
 	}
 	return jobs
@@ -810,7 +811,7 @@ func (w *SchemaWriter) buildJobsOn(ctx context.Context, conn *sql.Conn, jobs []i
 
 // buildOneIndex emits and executes the CREATE INDEX for one job on conn.
 func (w *SchemaWriter) buildOneIndex(ctx context.Context, conn *sql.Conn, job indexBuildJob) error {
-	stmt, err := emitCreateIndex(w.schema, job.tableName, job.idx, w.emitOpts())
+	stmt, err := emitCreateIndex(w.schema, job.table, job.idx, w.emitOpts())
 	if err != nil {
 		return err
 	}
@@ -1673,7 +1674,7 @@ func (w *SchemaWriter) PreviewDDL(ctx context.Context, s *ir.Schema) ([]ir.DDLSt
 			if idx.ConstraintBacked {
 				continue
 			}
-			stmt, err := emitCreateIndex(w.schema, table.Name, idx, w.emitOpts())
+			stmt, err := emitCreateIndex(w.schema, table, idx, w.emitOpts())
 			if err != nil {
 				return nil, err
 			}
@@ -1962,7 +1963,7 @@ func (w *SchemaWriter) CreateShapeIndex(ctx context.Context, table *ir.Table, in
 		if idx == nil || strings.EqualFold(idx.Name, "PRIMARY") {
 			continue
 		}
-		stmt, err := emitCreateIndex(w.schema, table.Name, idx, w.emitOpts())
+		stmt, err := emitCreateIndex(w.schema, table, idx, w.emitOpts())
 		if err != nil {
 			return fmt.Errorf("create shape index: emit %q: %w", idx.Name, err)
 		}

@@ -10,7 +10,12 @@
 
 package postgres
 
-import "sluicesync.dev/sluice/internal/translate/exprident"
+import (
+	"strings"
+
+	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/translate/exprident"
+)
 
 func isIdentifierByte(b byte) bool { return exprident.IsIdentifierByte(b) }
 
@@ -36,6 +41,7 @@ var pgRequoteConfig = exprident.Config{
 	GrammarExclusions: pgExprGrammarKeywords,
 	GrammarContextual: pgExprContextualKeywords,
 	SkipWSBeforeParen: true,
+	UnquotedFold:      strings.ToLower,
 }
 
 // requotePGReservedIdents re-applies double-quote quoting to bare
@@ -57,6 +63,57 @@ var pgRequoteConfig = exprident.Config{
 // pg_get_expr output with reserved-word column refs already correctly
 // double-quoted, and the writer's same-dialect path emits that text
 // verbatim. The helper is invoked only on the cross-dialect branch.
-func requotePGReservedIdents(expr string) string {
-	return exprident.RequoteIdentifiers(expr, pgRequoteConfig)
+//
+// tbl is the table the expression belongs to. When it is non-nil, bare
+// references to its columns are also resolved to the column's real
+// spelling and quoted where Postgres would otherwise fold them (GitHub
+// #356): the MySQL and SQLite sources match column names
+// case-insensitively, so `lower(status)` over a column named `STATUS`, or
+// `Price * Qty` over `Price`/`Qty`, is valid at the source and names no
+// column on Postgres once the quotes are gone. nil keeps the
+// reserved-word pass alone, which is right only for a body that cannot
+// reference a column (a DEFAULT).
+func requotePGReservedIdents(expr string, tbl *ir.Table) string {
+	cfg := pgRequoteConfig
+	if tbl != nil {
+		names := make([]string, 0, len(tbl.Columns))
+		for _, c := range tbl.Columns {
+			if c != nil {
+				names = append(names, c.Name)
+			}
+		}
+		cfg = cfg.WithColumns(names)
+	}
+	return exprident.RequoteIdentifiers(expr, cfg)
+}
+
+// resolveColumnName returns the real spelling of the table column that
+// name refers to: name itself when the table has that exact column (or no
+// table is given), otherwise the single column that matches it
+// case-insensitively. The MySQL and SQLite sources resolve column names
+// that way, so a key part spelled differently from its column is valid
+// there; Postgres matches quoted names exactly (GitHub #356). With no
+// match, or two case-insensitive matches (only possible on a Postgres
+// source, which spells key parts exactly), name is returned unchanged.
+func resolveColumnName(table *ir.Table, name string) string {
+	if table == nil {
+		return name
+	}
+	match := ""
+	for _, c := range table.Columns {
+		switch {
+		case c == nil:
+		case c.Name == name:
+			return name
+		case strings.EqualFold(c.Name, name):
+			if match != "" {
+				return name
+			}
+			match = c.Name
+		}
+	}
+	if match == "" {
+		return name
+	}
+	return match
 }

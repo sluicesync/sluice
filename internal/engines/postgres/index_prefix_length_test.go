@@ -80,7 +80,7 @@ func TestIndexPrefixLength_UniqueKeysRefuse_PlainIndexesDoNot(t *testing.T) {
 			Unique:  true,
 			Columns: []ir.IndexColumn{prefixCol("email", 10)},
 		}
-		_, err := emitCreateIndex("public", "users", idx, emitOpts{})
+		_, err := emitCreateIndex("public", &ir.Table{Name: "users"}, idx, emitOpts{})
 		requirePrefixRefusal(t, err, "email", 10)
 	})
 
@@ -121,7 +121,7 @@ func TestIndexPrefixLength_UniqueKeysRefuse_PlainIndexesDoNot(t *testing.T) {
 			Name:    "idx_email",
 			Columns: []ir.IndexColumn{prefixCol("email", 10)},
 		}
-		stmt, err := emitCreateIndex("public", "users", idx, emitOpts{})
+		stmt, err := emitCreateIndex("public", &ir.Table{Name: "users"}, idx, emitOpts{})
 		if err != nil {
 			t.Fatalf("a non-unique prefix index must still emit (the prefix is a size choice, "+
 				"not a constraint): %v", err)
@@ -144,7 +144,7 @@ func TestIndexPrefixLength_UniqueKeysRefuse_PlainIndexesDoNot(t *testing.T) {
 			Unique:  true,
 			Columns: []ir.IndexColumn{{Column: "email"}},
 		}
-		if _, err := emitCreateIndex("public", "users", idx, emitOpts{}); err != nil {
+		if _, err := emitCreateIndex("public", &ir.Table{Name: "users"}, idx, emitOpts{}); err != nil {
 			t.Fatalf("an ordinary unique index must emit unchanged: %v", err)
 		}
 	})

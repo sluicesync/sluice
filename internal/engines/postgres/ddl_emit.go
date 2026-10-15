@@ -580,7 +580,7 @@ func translateDefaultExpr(table *ir.Table, c *ir.Column, d ir.DefaultExpression,
 			(!bareBool || boolCol)
 		if eligible {
 			if pg, ok := translate.SQLiteExprToPG(d.Expr); ok {
-				return requotePGReservedIdents(pg), true
+				return requotePGReservedIdents(pg, nil), true
 			}
 		}
 		slog.Warn(
@@ -614,8 +614,11 @@ func translateDefaultExpr(table *ir.Table, c *ir.Column, d ir.DefaultExpression,
 	// CREATE TABLE with SQLSTATE 42601. Bring it onto the uniform
 	// cross-dialect composition: requote(translate(expr)). Same-dialect
 	// (and the bit-literal special case) returned above unchanged.
+	// A DEFAULT cannot reference a column on Postgres, so no table is
+	// passed and only reserved words are re-quoted.
 	return requotePGReservedIdents(
 		translateExprForPG(d.Expr, ExprContext{EnabledPGExtensions: opts.EnabledExtensions}),
+		nil,
 	), true
 }
 
@@ -1830,7 +1833,7 @@ func emitTableDef(schema string, table *ir.Table, opts emitOpts) (string, error)
 	}
 
 	if table.PrimaryKey != nil {
-		pkCols, err := emitIndexColumnList(table.PrimaryKey.Columns, opts,
+		pkCols, err := emitIndexColumnList(table.PrimaryKey.Columns, table, opts,
 			fmt.Sprintf("postgres: primary key on %s.%s", schema, table.Name), true)
 		if err != nil {
 			return "", err
@@ -1903,7 +1906,7 @@ func emitTableDef(schema string, table *ir.Table, opts emitOpts) (string, error)
 		if err := validatePGIndexName(name, idx.Name, table.Name); err != nil {
 			return "", err
 		}
-		uniqCols, err := emitIndexColumnList(idx.Columns, opts,
+		uniqCols, err := emitIndexColumnList(idx.Columns, table, opts,
 			fmt.Sprintf("postgres: inline unique key %q on %s.%s", idx.Name, schema, table.Name), true)
 		if err != nil {
 			return "", err
@@ -2079,7 +2082,7 @@ func refuseUnrepresentablePrefix(cols []ir.IndexColumn, where string, enforcesUn
 // so a MySQL-source `json_unquote(json_extract(j,'$.k'))` index
 // rewrites to `(j->>'k')` instead of failing at CREATE INDEX.
 // Same-dialect / untagged expressions pass through verbatim.
-func emitIndexColumnList(cols []ir.IndexColumn, opts emitOpts, where string, enforcesUniqueness bool) (string, error) {
+func emitIndexColumnList(cols []ir.IndexColumn, table *ir.Table, opts emitOpts, where string, enforcesUniqueness bool) (string, error) {
 	if err := checkIndexPrefixLength(cols, where, enforcesUniqueness); err != nil {
 		return "", err
 	}
@@ -2090,9 +2093,9 @@ func emitIndexColumnList(cols []ir.IndexColumn, opts emitOpts, where string, enf
 	for i, c := range cols {
 		var entry string
 		if c.Expression != "" {
-			entry = "(" + translateIndexExpr(c, opts) + ")"
+			entry = "(" + translateIndexExpr(c, table, opts) + ")"
 		} else {
-			entry = quoteIdent(c.Column)
+			entry = quoteIdent(resolveColumnName(table, c.Column))
 		}
 		// Per-column operator class — populated by the schema reader
 		// for (a) extension-introduced access methods that need an
@@ -2151,7 +2154,7 @@ func emitIndexColumnList(cols []ir.IndexColumn, opts emitOpts, where string, enf
 // search keys), the simpler context-free pass covers the observed
 // cases. If a bool-context-aware index emit is needed later, the
 // caller can build [ExprContext] and route through this helper.
-func translateIndexExpr(c ir.IndexColumn, opts emitOpts) string {
+func translateIndexExpr(c ir.IndexColumn, table *ir.Table, opts emitOpts) string {
 	// SQLite source (ADR-0133 follow-up): translate the portable subset. A
 	// non-portable expression-index body is WARN-skipped for the WHOLE index
 	// in emitCreateIndex (an index is a performance object, not a correctness
@@ -2159,7 +2162,7 @@ func translateIndexExpr(c ir.IndexColumn, opts emitOpts) string {
 	// filtered out before this renders.
 	if c.ExpressionDialect == sqliteSourceDialect {
 		if pg, ok := translate.SQLiteExprToPG(c.Expression); ok {
-			return requotePGReservedIdents(pg)
+			return requotePGReservedIdents(pg, table)
 		}
 		return c.Expression
 	}
@@ -2170,20 +2173,30 @@ func translateIndexExpr(c ir.IndexColumn, opts emitOpts) string {
 		return c.Expression
 	}
 	// Cross-dialect index expression: re-quote PG reserved-word column
-	// refs the source reader de-quoted (catalog Bug 63). Same-dialect
+	// refs the source reader de-quoted (catalog Bug 63), and resolve
+	// column refs to the table's real spelling (GitHub #356). Same-dialect
 	// PG→PG returned above with the pg_get_expr text verbatim.
 	return requotePGReservedIdents(
 		translateExprForPG(c.Expression, ExprContext{EnabledPGExtensions: opts.EnabledExtensions}),
+		table,
 	)
 }
 
 // emitCreateIndex produces a CREATE INDEX statement (UNIQUE if
 // applicable). Postgres uses CREATE INDEX rather than ALTER TABLE
 // ADD INDEX (which doesn't exist here).
-func emitCreateIndex(schema, tableName string, idx *ir.Index, opts emitOpts) (string, error) {
+//
+// table is the index's table: its name places the index, and its columns
+// resolve the column references in key parts, expression bodies and the
+// partial-index predicate (GitHub #356).
+func emitCreateIndex(schema string, table *ir.Table, idx *ir.Index, opts emitOpts) (string, error) {
 	if idx == nil {
 		return "", errors.New("postgres: emitCreateIndex: index is nil")
 	}
+	if table == nil {
+		return "", errors.New("postgres: emitCreateIndex: table is nil")
+	}
+	tableName := table.Name
 	if strings.EqualFold(idx.Name, "PRIMARY") {
 		return "", errors.New("postgres: emitCreateIndex: PRIMARY index is inline in CREATE TABLE")
 	}
@@ -2252,7 +2265,7 @@ func emitCreateIndex(schema, tableName string, idx *ir.Index, opts emitOpts) (st
 		sb.WriteString(method)
 		sb.WriteByte(' ')
 	}
-	cols, err := emitIndexColumnList(idx.Columns, opts, where, idx.Unique)
+	cols, err := emitIndexColumnList(idx.Columns, table, opts, where, idx.Unique)
 	if err != nil {
 		return "", err
 	}
@@ -2266,7 +2279,7 @@ func emitCreateIndex(schema, tableName string, idx *ir.Index, opts emitOpts) (st
 			if i > 0 {
 				sb.WriteString(", ")
 			}
-			sb.WriteString(quoteIdent(c))
+			sb.WriteString(quoteIdent(resolveColumnName(table, c)))
 		}
 		sb.WriteByte(')')
 	}
@@ -2276,7 +2289,7 @@ func emitCreateIndex(schema, tableName string, idx *ir.Index, opts emitOpts) (st
 	// runs the ADR-0016 translator first.
 	if pred := strings.TrimSpace(idx.Predicate); pred != "" {
 		sb.WriteString(" WHERE ")
-		sb.WriteString(translateIndexPredicate(idx, opts))
+		sb.WriteString(translateIndexPredicate(idx, table, opts))
 	}
 	sb.WriteByte(';')
 	return sb.String(), nil
@@ -2289,13 +2302,13 @@ func emitCreateIndex(schema, tableName string, idx *ir.Index, opts emitOpts) (st
 // untagged text passes through verbatim (the PG pg_get_expr output);
 // a MySQL-source predicate is rewritten and PG-reserved idents the
 // source reader de-quoted are re-quoted.
-func translateIndexPredicate(idx *ir.Index, opts emitOpts) string {
+func translateIndexPredicate(idx *ir.Index, table *ir.Table, opts emitOpts) string {
 	// SQLite source (ADR-0133 follow-up): translate the portable subset. A
 	// non-portable predicate WARN-skips the whole partial index in
 	// emitCreateIndex, so ok=false here is a defensive verbatim.
 	if idx.PredicateDialect == sqliteSourceDialect {
 		if pg, ok := translate.SQLiteExprToPG(idx.Predicate); ok {
-			return requotePGReservedIdents(pg)
+			return requotePGReservedIdents(pg, table)
 		}
 		return idx.Predicate
 	}
@@ -2307,6 +2320,7 @@ func translateIndexPredicate(idx *ir.Index, opts emitOpts) string {
 	}
 	return requotePGReservedIdents(
 		translateExprForPG(idx.Predicate, ExprContext{EnabledPGExtensions: opts.EnabledExtensions}),
+		table,
 	)
 }
 
@@ -2674,7 +2688,7 @@ func translateGeneratedExpr(c *ir.Column, tbl *ir.Table, opts emitOpts) string {
 	// silently change the column's meaning.
 	if c.GeneratedExprDialect == sqliteSourceDialect {
 		if pg, ok := translate.SQLiteExprToPG(c.GeneratedExpr); ok {
-			return requotePGReservedIdents(pg)
+			return requotePGReservedIdents(pg, tbl)
 		}
 		return c.GeneratedExpr
 	}
@@ -2697,7 +2711,7 @@ func translateGeneratedExpr(c *ir.Column, tbl *ir.Table, opts emitOpts) string {
 	// fails with SQLSTATE 42601 (catalog Bug 63). Same-dialect PG→PG
 	// returns above before this point — the PG reader already emits
 	// properly-quoted refs from pg_get_expr.
-	return requotePGReservedIdents(translateExprForPG(c.GeneratedExpr, ctx))
+	return requotePGReservedIdents(translateExprForPG(c.GeneratedExpr, ctx), tbl)
 }
 
 // translateCheckExpr returns the CHECK-constraint expression to emit,
@@ -2720,7 +2734,7 @@ func translateCheckExpr(c *ir.CheckConstraint, tbl *ir.Table, opts emitOpts) str
 		// with them. Without that the body emits SQL PG rejects
 		// (`operator does not exist: boolean = integer`).
 		if pg, ok := translate.SQLiteExprToPGBoolAware(c.Expr, exprContextForTable(tbl).BoolColumns); ok {
-			return requotePGReservedIdents(pg)
+			return requotePGReservedIdents(pg, tbl)
 		}
 		return c.Expr
 	}
@@ -2735,7 +2749,7 @@ func translateCheckExpr(c *ir.CheckConstraint, tbl *ir.Table, opts emitOpts) str
 	// Cross-dialect CHECK body: re-quote PG reserved-word column refs
 	// the source reader de-quoted (catalog Bug 63). Same-dialect PG→PG
 	// returned above with the pg_get_expr text verbatim.
-	return requotePGReservedIdents(translateExprForPG(c.Expr, ctx))
+	return requotePGReservedIdents(translateExprForPG(c.Expr, ctx), tbl)
 }
 
 // exprContextForTable builds the [ExprContext] for tbl, populating
