@@ -131,7 +131,11 @@ func TestRelationFacts_DiffPremisesOnARealServer(t *testing.T) {
 		`DROP INDEX prem_tenant_uidx; CREATE UNIQUE INDEX prem_tenant_uidx ON prem (tenant2) NULLS NOT DISTINCT`,
 		`UNIQUE INDEX "prem_tenant_uidx" changed`)
 	step("drop unique index", `DROP INDEX prem_tenant_uidx`, `DROP INDEX "prem_tenant_uidx"`)
-	step("a constraint-owned unique index is not read twice",
-		`ALTER TABLE prem ADD CONSTRAINT prem_amt2_uq UNIQUE (amt2)`, `ADD CONSTRAINT "prem_amt2_uq"`)
+	// Exactly one delta: the constraint, not also its backing index.
+	prior := read()
+	exec(`ALTER TABLE prem ADD CONSTRAINT prem_amt2_uq UNIQUE (amt2)`)
+	if d := diffRelationFacts(prior, read()); len(d) != 1 || !strings.Contains(d[0], `ADD CONSTRAINT "prem_amt2_uq"`) {
+		t.Errorf("a constraint-owned unique index: deltas = %q; want exactly the ADD CONSTRAINT (its index must not be read twice)", d)
+	}
 	step("a non-unique index is not compared", `CREATE INDEX prem_amt2_idx ON prem (amt2)`, "")
 }
