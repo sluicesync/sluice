@@ -2,6 +2,10 @@ package mysql
 
 import "strings"
 
+// viewQualifierAmbiguousMarker is the grep-stable marker of the refusal a
+// view gets when its body uses its own database's name as an alias.
+const viewQualifierAmbiguousMarker = "VIEW-QUALIFIER-AMBIGUOUS"
+
 // stripOwnSchemaQualifier removes the source database's own name from the
 // identifiers of a view body, so the view resolves against the database it
 // is created in rather than the one it was read from (Bug 314).
@@ -13,19 +17,28 @@ import "strings"
 // app) or, when the target server also holds a database named app, reads
 // app's tables at exit 0 — a view on the target serving the source's data.
 //
-// Only a backquoted identifier spelling exactly the source database's name
-// and followed directly by a dot and another backquoted identifier is
-// removed. References to other databases are left qualified: they point
-// outside the migration, and rewriting them would guess. String literals
-// (single- or double-quoted, with backslash escapes and doubled quotes) are
-// copied untouched, so a literal that happens to spell `app`.`t` survives.
-func stripOwnSchemaQualifier(definition, schema string) string {
+// A backquoted identifier spelling exactly the source database's name is
+// removed, with its dot, when it is directly followed by a dot and another
+// backquoted identifier and is not itself the second part of a name. The
+// identifier after a removed qualifier is copied as is, never tested again,
+// so a table named like its database (`app`.`app`.`x`) loses one qualifier,
+// not two. References to other databases stay qualified: they point outside
+// the migration, and rewriting them would guess. String literals are copied
+// untouched.
+//
+// The body is not rewritten at all, and ambiguous reports true, when the
+// database's name is used as anything else, other than a column alias after
+// AS: a table alias (`app`.`t` `app`), a derived table's or a CTE's name. Then
+// `app`.`id` may be the alias's column, and removing "`app`." would re-bind
+// it, inside a correlated subquery, to a column of the inner table at exit 0.
+// The caller refuses such a view rather than guess.
+func stripOwnSchemaQualifier(definition, schema string) (stripped string, ambiguous bool) {
 	if schema == "" {
-		return definition
+		return definition, false
 	}
-	qualifier := "`" + strings.ReplaceAll(schema, "`", "``") + "`."
-	if !strings.Contains(definition, qualifier) {
-		return definition
+	ident := "`" + strings.ReplaceAll(schema, "`", "``") + "`"
+	if !strings.Contains(definition, ident) {
+		return definition, false
 	}
 	var b strings.Builder
 	b.Grow(len(definition))
@@ -36,11 +49,22 @@ func stripOwnSchemaQualifier(definition, schema string) string {
 			b.WriteString(definition[i:end])
 			i = end
 		case '`':
-			if strings.HasPrefix(definition[i:], qualifier) && strings.HasPrefix(definition[i+len(qualifier):], "`") {
-				i += len(qualifier)
+			end := skipBackquoted(definition, i)
+			if definition[i:end] != ident || followsDot(definition, i) {
+				b.WriteString(definition[i:end])
+				i = end
 				continue
 			}
-			end := skipBackquoted(definition, i)
+			if strings.HasPrefix(definition[end:], ".`") {
+				// The qualifier: drop it, and copy the name it qualifies.
+				next := skipBackquoted(definition, end+1)
+				b.WriteString(definition[end+1 : next])
+				i = next
+				continue
+			}
+			if !followsAS(definition, i) {
+				return definition, true
+			}
 			b.WriteString(definition[i:end])
 			i = end
 		default:
@@ -48,7 +72,34 @@ func stripOwnSchemaQualifier(definition, schema string) string {
 			i++
 		}
 	}
-	return b.String()
+	return b.String(), false
+}
+
+// followsDot reports whether the token starting at s[i] is preceded, past
+// any spaces, by a dot: the second or third part of a dotted name.
+func followsDot(s string, i int) bool {
+	j := i - 1
+	for j >= 0 && s[j] == ' ' {
+		j--
+	}
+	return j >= 0 && s[j] == '.'
+}
+
+// followsAS reports whether the token starting at s[i] is preceded by the
+// keyword AS, which in a stored MySQL view body introduces a column alias.
+func followsAS(s string, i int) bool {
+	j := i - 1
+	for j >= 0 && s[j] == ' ' {
+		j--
+	}
+	if j < 1 || !strings.EqualFold(s[j-1:j+1], "as") {
+		return false
+	}
+	return j < 2 || !isIdentByte(s[j-2])
+}
+
+func isIdentByte(c byte) bool {
+	return c == '_' || c == '$' || c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= 0x80
 }
 
 // skipBackquoted returns the index just past the backquoted identifier

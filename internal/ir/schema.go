@@ -170,6 +170,19 @@ type View struct {
 
 	// Comment is the view-level comment, if any. Mirrors Table.Comment.
 	Comment string
+
+	// Refusal, when non-empty, is why the reader could not make
+	// Definition safe to create on a target, and the views phase refuses
+	// the view with it instead of creating it (Bug 314: a MySQL body
+	// that uses its own database's name as an alias cannot have the
+	// database qualifier removed without guessing which references it
+	// qualifies). Reading still succeeds, so --exclude-view can drop the
+	// view and let the rest of the run proceed.
+	//
+	// omitempty keeps the zero value out of the marshalled schema, so the
+	// backup schema fingerprint of every view without a refusal is
+	// unchanged (see internal/ir/backup/schema_hash_golden_test.go).
+	Refusal string `json:"Refusal,omitempty"`
 }
 
 // Table describes a single relational table.

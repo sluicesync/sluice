@@ -1292,29 +1292,37 @@ func (w *SchemaWriter) CreateViews(ctx context.Context, s *ir.Schema) error {
 		if err != nil {
 			return err
 		}
-		if err := w.execViewDDL(ctx, stmt); err != nil {
+		if err := w.execViewDDL(ctx, stmt, view.Schema); err != nil {
 			return fmt.Errorf("postgres: create view %q: %w", view.Name, err)
 		}
 	}
 	return nil
 }
 
-// execViewDDL runs one CREATE VIEW with the target schema first on the
-// search path (Bug 314). The reader writes the source schema's own names
-// unqualified, and PG binds a view's references when it is created, so they
-// must resolve in the schema the view's tables were created in rather than
-// in the session default. Before this, a source on public migrated with
-// --target-schema app2 created app2.v over public.p, the target's own
-// unrelated table. public stays on the path after the target schema so an
-// extension installed there (the common place) still resolves, as it did.
-func (w *SchemaWriter) execViewDDL(ctx context.Context, stmt string) error {
+// execViewDDL runs one CREATE VIEW with the target schema on the search path
+// (Bug 314). The reader writes the source schema's own names unqualified,
+// and PG binds a view's references when it is created, so they must resolve
+// in the schema the view's tables were created in rather than in the session
+// default. Before this, a source on public migrated with --target-schema
+// app2 created app2.v over public.p, the target's own unrelated table.
+//
+// The path holds the target schema alone, except for a view read from
+// public. A body read from any other schema names every public object
+// explicitly, so an unqualified name in it can only mean one of the source
+// schema's own objects, and public on the path could only bind a name the
+// run did not create (an --exclude-table table, a routine) to an unrelated
+// target object, silently. A body read from public names its extension
+// functions unqualified, as public is where they usually live, so public
+// stays on the path after the target schema for it. sourceSchema empty is
+// a body recorded before the reader tagged it, treated as public.
+func (w *SchemaWriter) execViewDDL(ctx context.Context, stmt, sourceSchema string) error {
 	tx, err := w.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
 	path := quoteIdent(w.schema)
-	if w.schema != "public" {
+	if w.schema != "public" && (sourceSchema == "public" || sourceSchema == "") {
 		path += ", public"
 	}
 	if _, err := tx.ExecContext(ctx, "SELECT pg_catalog.set_config('search_path', $1, true)", path); err != nil {
