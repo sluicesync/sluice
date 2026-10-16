@@ -76,6 +76,31 @@ func TestFormatVersionFor_HiddenCollation(t *testing.T) {
 		t.Errorf("an unstamped manifest carrying nothing refused: %v", err)
 	}
 
+	// A history entry carrying the field below 15 is the same edited shape:
+	// the key-collation guard takes a history version's table as its source
+	// shape, so an injected value there must be refused too.
+	historyEntry := func(hidden string) *SchemaHistoryEntry {
+		b, err := ir.MarshalTable(table("a", hidden))
+		if err != nil {
+			t.Fatalf("marshal history table: %v", err)
+		}
+		return &SchemaHistoryEntry{TableJSON: b}
+	}
+	inHistory := &Manifest{
+		Kind: BackupKindIncremental, FormatVersion: FormatVersionKeyCollationUnestablished,
+		SchemaHistory: []*SchemaHistoryEntry{historyEntry("utf8mb4_bin")},
+	}
+	if err := RefuseUnstampedHiddenCollation(inHistory); err == nil {
+		t.Error("a format-14 manifest whose schema history carries a hidden collation was accepted")
+	}
+	plainHistory := &Manifest{
+		Kind: BackupKindIncremental, FormatVersion: FormatVersionKeyCollationUnestablished,
+		SchemaHistory: []*SchemaHistoryEntry{historyEntry("")},
+	}
+	if err := RefuseUnstampedHiddenCollation(plainHistory); err != nil {
+		t.Errorf("a history entry carrying nothing refused: %v", err)
+	}
+
 	// WithoutHiddenCollation clears every one and mutates nothing.
 	s := &ir.Schema{Tables: []*ir.Table{table("a", "utf8mb4_bin"), table("b", "")}}
 	cleared := WithoutHiddenCollation(s)

@@ -582,9 +582,12 @@ const (
 	// Proportional: stamped by [FormatVersionFor] on a schema that carries
 	// the field and by [StampHiddenCollation] on a segment whose delta or
 	// refreshed schema does; every manifest without a MySQL functional key
-	// read on vanilla MySQL keeps its previous version. SchemaHistory is not
-	// consulted: the change streams record no secondary indexes, and the
-	// history is folded raw into a signature rather than fingerprinted.
+	// read on vanilla MySQL keeps its previous version. SchemaHistory is
+	// scanned as well ([ManifestCarriesHiddenCollation]), though no writer
+	// puts the field there today: only the MySQL schema reader sets it, and
+	// MySQL's history projections carry columns and a bare primary key
+	// (pgtrigger's first-touch versions carry full tables, but from the
+	// Postgres reader, which never sets it).
 	//
 	// Above the key-collation tiers so a 15-stamped manifest keeps every
 	// lower `>=` fold; none changes between 9 and 15, so raising a CDC

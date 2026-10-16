@@ -64,6 +64,23 @@ func ManifestCarriesHiddenCollation(m *Manifest) bool {
 			return true
 		}
 	}
+	// SchemaHistory too. No writer puts the field there today: only the
+	// MySQL schema reader sets it, and MySQL's history projections carry
+	// columns and a bare primary key. But pgtrigger's first-touch versions
+	// now carry full tables with secondary indexes, so "history records no
+	// indexes" is no longer a premise to lean on, and the key-collation
+	// guard consumes a history version's table as its source shape. An
+	// entry carrying the field below FormatVersionHiddenCollation is the
+	// same edited shape as a schema carrying it. An entry that does not
+	// decode is left to the readers that decode it, which refuse it loudly.
+	for _, e := range m.SchemaHistory {
+		if e == nil || len(e.TableJSON) == 0 {
+			continue
+		}
+		if t, err := ir.UnmarshalTable(e.TableJSON); err == nil && tableCarriesHiddenCollation(t) {
+			return true
+		}
+	}
 	return false
 }
 
