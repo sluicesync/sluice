@@ -68,28 +68,15 @@ func WarnUnverifiableKeyCollationIncrement(ctx context.Context, origin string, m
 }
 
 // characterKeyColumns lists t's columns that are character-typed and part
-// of its primary key or a unique index, in column order. A functional key
-// part names no column and adds none.
+// of its primary key or a unique index, in column order — a functional key
+// part's column included ([isKeyColumn]).
 func characterKeyColumns(t *ir.Table) []string {
 	if t == nil {
 		return nil
 	}
-	key := map[string]bool{}
-	mark := func(idx *ir.Index) {
-		if idx == nil || (idx != t.PrimaryKey && !idx.Unique) {
-			return
-		}
-		for _, c := range idx.Columns {
-			key[c.Column] = true
-		}
-	}
-	mark(t.PrimaryKey)
-	for _, idx := range t.Indexes {
-		mark(idx)
-	}
 	var cols []string
 	for _, c := range t.Columns {
-		if c == nil || !key[c.Name] {
+		if c == nil || !isKeyColumn(t, c.Name) {
 			continue
 		}
 		switch ir.UnwrapDomain(c.Type).(type) {

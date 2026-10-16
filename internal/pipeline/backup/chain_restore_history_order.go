@@ -746,21 +746,19 @@ func unestablishedKeyColumn(t *ir.Table) string {
 	if t == nil {
 		return ""
 	}
-	key := map[string]bool{}
-	mark := func(idx *ir.Index) {
-		if idx == nil || (idx != t.PrimaryKey && !idx.Unique) {
-			return
+	key := func(name string) bool {
+		if migcore.IndexReadsColumn(t.PrimaryKey, name) {
+			return true
 		}
-		for _, c := range idx.Columns {
-			key[c.Column] = true
+		for _, idx := range t.Indexes {
+			if idx != nil && idx.Unique && migcore.IndexReadsColumn(idx, name) {
+				return true
+			}
 		}
-	}
-	mark(t.PrimaryKey)
-	for _, idx := range t.Indexes {
-		mark(idx)
+		return false
 	}
 	for _, c := range t.Columns {
-		if c != nil && key[c.Name] && migcore.CollationUnestablished(c.Type) {
+		if c != nil && key(c.Name) && migcore.CollationUnestablished(c.Type) {
 			return c.Name
 		}
 	}

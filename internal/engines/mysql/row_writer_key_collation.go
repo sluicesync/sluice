@@ -124,9 +124,12 @@ func (w *RowWriter) resolveCopyKeyCollationGuard(ctx context.Context, q queryRow
 		}
 	}
 	qn := qualifiedName(schema, table.Name)
-	keys, err := uniqueKeyColumns(ctx, q, schema, table.Name)
+	keys, err := uniqueKeyColumns(ctx, q, w.flavor, schema, table.Name)
 	if err != nil {
 		return copyKeyCollationGuard{}, fmt.Errorf("mysql: copy into %s: read the unique keys for the key-collation guard: %w", qn, err)
+	}
+	if opaque := keys.refusesOpaque(); len(opaque) > 0 {
+		return copyKeyCollationGuard{}, keyCollationFunctionalUnsupported(qn, opaque)
 	}
 	plan := planCopyKeyCollationGuard(table, colTypes, keys, compareAs)
 	if plan == nil {
@@ -254,58 +257,95 @@ func targetColumnCollations(ctx context.Context, q queryRower, schema, table str
 // targetUniqueKeys is a target table's primary key and its other unique
 // keys, each as its columns in index order, with each part's index prefix
 // length (pkSub / uniqueSubs, parallel to the columns; 0 for the whole
-// column).
+// column). A functional part the guard reads through stands in its key as
+// the column it reads, with the part itself in uniqueFns (parallel to
+// uniques; nil for a plain column); one it cannot read is left out of its
+// key and listed in opaque (key_collation_functional.go). A primary key
+// never has a functional part: MySQL refuses one.
 type targetUniqueKeys struct {
 	pk         []string
 	pkSub      []int
 	uniques    [][]string
 	uniqueSubs [][]int
+	uniqueFns  [][]*functionalKeyPart
+	opaque     []opaqueKeyPart
 }
 
 // uniqueKeyColumns reads the target's primary key and other unique keys,
 // with each key part's SUB_PART (an index prefix: characters for a character
-// column, bytes for a binary one), in one catalog query. A functional key
-// part (no column) is skipped: the guard cannot compare it, a stated
-// residual (KEY-COLLATION-FUNCTIONAL-KEY-PART).
-func uniqueKeyColumns(ctx context.Context, q queryRower, schema, table string) (targetUniqueKeys, error) {
+// column, bytes for a binary one), in one catalog query, and — only when a
+// key has a functional part — the collation each functional part compares
+// under ([functionalKeyCollations]). MariaDB has no functional key parts
+// and no EXPRESSION column (flavor_mariadb.go); its query selects NULL.
+func uniqueKeyColumns(ctx context.Context, q queryRower, flavor Flavor, schema, table string) (targetUniqueKeys, error) {
 	var out targetUniqueKeys
-	rows, err := q.QueryContext(ctx, `SELECT index_name, column_name, sub_part FROM information_schema.statistics
+	expr := "expression"
+	if flavor == FlavorMariaDB {
+		expr = "NULL"
+	}
+	rows, err := q.QueryContext(ctx, `SELECT index_name, column_name, `+expr+`, sub_part, seq_in_index FROM information_schema.statistics
 		WHERE table_schema = COALESCE(NULLIF(?, ''), DATABASE()) AND table_name = ? AND non_unique = 0
 		ORDER BY index_name = 'PRIMARY' DESC, index_name, seq_in_index`, schema, table)
 	if err != nil {
 		return out, err
 	}
 	defer func() { _ = rows.Close() }()
-	last := ""
+	last, functional := "", false
+	parts := map[string]int{} // each key's part count
+	var fns []*functionalKeyPart
 	for rows.Next() {
 		var idx string
-		var col sql.NullString
+		var col, expression sql.NullString
 		var sub sql.NullInt64
-		if err := rows.Scan(&idx, &col, &sub); err != nil {
+		var seq int
+		if err := rows.Scan(&idx, &col, &expression, &sub, &seq); err != nil {
 			return out, err
 		}
 		n := 0
 		if sub.Valid {
 			n = int(sub.Int64)
 		}
-		switch {
-		case !col.Valid:
-			continue
-		case idx == "PRIMARY":
-			out.pk = append(out.pk, col.String)
-			out.pkSub = append(out.pkSub, n)
-		default:
-			if idx != last || len(out.uniques) == 0 {
-				out.uniques = append(out.uniques, nil)
-				out.uniqueSubs = append(out.uniqueSubs, nil)
-				last = idx
+		parts[idx]++
+		name := col.String
+		var fn *functionalKeyPart
+		if !col.Valid {
+			functional = true
+			column, steps, ok := parseFunctionalKeyPart(expression.String)
+			if !ok {
+				out.opaque = append(out.opaque, opaqueKeyPart{index: idx, expr: expression.String, seq: seq - 1})
+				continue
 			}
-			i := len(out.uniques) - 1
-			out.uniques[i] = append(out.uniques[i], col.String)
-			out.uniqueSubs[i] = append(out.uniqueSubs[i], n)
+			name = column
+			fn = &functionalKeyPart{index: idx, expr: expression.String, seq: seq - 1, column: column, steps: steps}
+			fns = append(fns, fn)
 		}
+		if idx == "PRIMARY" {
+			out.pk = append(out.pk, name)
+			out.pkSub = append(out.pkSub, n)
+			continue
+		}
+		if idx != last || len(out.uniques) == 0 {
+			out.uniques = append(out.uniques, nil)
+			out.uniqueSubs = append(out.uniqueSubs, nil)
+			out.uniqueFns = append(out.uniqueFns, nil)
+			last = idx
+		}
+		i := len(out.uniques) - 1
+		out.uniques[i] = append(out.uniques[i], name)
+		out.uniqueSubs[i] = append(out.uniqueSubs[i], n)
+		out.uniqueFns[i] = append(out.uniqueFns[i], fn)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return out, err
+	}
+	for _, f := range fns {
+		f.alone = parts[f.index] == 1
+	}
+	if functional {
+		collations, known := functionalKeyCollations(ctx, q, flavor, schema, table)
+		out.resolveFunctionalCollations(collations, known)
+	}
+	return out, nil
 }
 
 // copyKeyCollationMergeRefusal attributes a guarded copy statement's failure
@@ -348,6 +388,13 @@ func copyKeyCollationMergeRefusal(err error, guard copyKeyCollationGuard, table 
 //     both, since only the operator can compare under the source's collation.
 func copyKeyCollationMergeRemedy(plan *keyCollationPlan, schema, table string) string {
 	collations, recopyAligns := keyCollationNeeds(plan)
+	if plan.armsFunctional() {
+		return "These are two different rows of the source (both in what the copy read, or one the source has since " +
+			"replaced), and the target table cannot hold both. Give the target " + collations + " and resume the " +
+			"copy (for `migrate`, `--resume`) rather than recreating the table: sluice recreates that key from the " +
+			"source's expression, under the target's default collation, so a re-copy from scratch meets the same " +
+			"pair. Or exclude the table"
+	}
 	alter := fmt.Sprintf("`ALTER TABLE %s.%s MODIFY <column> …` with %s", quoteIdent(schema), quoteIdent(table), collations)
 	give := "give the target's key column(s) " + collations + " (" + alter + ")"
 	if keyCollationPlanNondet(plan) {

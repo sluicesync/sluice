@@ -576,24 +576,14 @@ func ClassifyAlterDelta(before, after *ir.Table) AlterResidual {
 }
 
 // isKeyColumn reports whether name is a column of t's primary key or of one
-// of its UNIQUE indexes — a column whose value decides which rows are one.
+// of its UNIQUE indexes — a column whose value decides which rows are one,
+// a functional key part's column included ([IndexReadsColumn]).
 func isKeyColumn(t *ir.Table, name string) bool {
-	in := func(idx *ir.Index) bool {
-		if idx == nil {
-			return false
-		}
-		for _, c := range idx.Columns {
-			if c.Column == name {
-				return true
-			}
-		}
-		return false
-	}
-	if in(t.PrimaryKey) {
+	if IndexReadsColumn(t.PrimaryKey, name) {
 		return true
 	}
 	for _, idx := range t.Indexes {
-		if idx != nil && idx.Unique && in(idx) {
+		if idx != nil && idx.Unique && IndexReadsColumn(idx, name) {
 			return true
 		}
 	}

@@ -66,13 +66,14 @@ Indexed when filed. The report's defect and what fixing it found (no audit pass)
 
 ## 2026-10-15 — triage of the open key-collation entries against main (read-only, code-cited)
 
-Indexed when filed. A re-grade of existing entries; no new IDs beyond those already filed.
+Indexed when filed. A re-grade of existing entries, plus the residual found fixing one of them (KEY-COLLATION-FUNCTIONAL-UNARMED-TABLE).
 
 - KEY-COLLATION-BROKER-UNARMED filed
 - KEY-COLLATION-TRIGGER-CDC-NO-HISTORY filed
 - MARIADB-SHAPE-GATE-COLLATION filed
 - KEY-COLLATION-ROLLOVER-SPLIT-DELTA-DUP filed
 - KEY-COLLATION-FUNCTIONAL-KEY-PART filed
+- KEY-COLLATION-FUNCTIONAL-UNARMED-TABLE filed
 
 ## 2026-10-13 — Bugs 306, 307 and 308 (the v0.159.2 regression cycle): fixed, with what they leave open
 

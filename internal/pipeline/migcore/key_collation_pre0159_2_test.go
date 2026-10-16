@@ -90,6 +90,12 @@ func TestWarnUnverifiableKeyCollationIncrement(t *testing.T) {
 			"mysql/composite/varchar2": mk("mysql", "0.159.1", table("t", vc, func(tbl *ir.Table) {
 				tbl.PrimaryKey.Columns = append(tbl.PrimaryKey.Columns, ir.IndexColumn{Column: "k"})
 			})),
+			// KEY-COLLATION-FUNCTIONAL-KEY-PART: a functional key decides
+			// which rows are one through its column, as a plain key does.
+			// Until the fix this case was pinned QUIET.
+			"mysql/functional unique key": mk("mysql", "0.159.1", table("t", vc, func(tbl *ir.Table) {
+				tbl.Indexes = []*ir.Index{{Name: "fx", Unique: true, Columns: []ir.IndexColumn{{Expression: "lower(k)"}}}}
+			})),
 		} {
 			out := run(m)
 			if !strings.Contains(out, KeyCollationPre01592Marker) || !strings.Contains(out, "columns=k") || !strings.Contains(out, "table=t") {
@@ -113,8 +119,11 @@ func TestWarnUnverifiableKeyCollationIncrement(t *testing.T) {
 			"sqlite source":         mk("sqlite", "0.159.1", table("t", vc, pkOnK)),
 			"integer key only":      mk("mysql", "0.159.1", table("t", vc, func(*ir.Table) {})),
 			"non-unique index on k": mk("mysql", "0.159.1", table("t", vc, func(tbl *ir.Table) { tbl.Indexes = []*ir.Index{{Name: "ix", Columns: []ir.IndexColumn{{Column: "k"}}}} })),
-			"functional unique key": mk("mysql", "0.159.1", table("t", vc, func(tbl *ir.Table) {
-				tbl.Indexes = []*ir.Index{{Name: "fx", Unique: true, Columns: []ir.IndexColumn{{Expression: "lower(k)"}}}}
+			"functional non-unique index": mk("mysql", "0.159.1", table("t", vc, func(tbl *ir.Table) {
+				tbl.Indexes = []*ir.Index{{Name: "fx", Columns: []ir.IndexColumn{{Expression: "lower(k)"}}}}
+			})),
+			"functional unique key over another column": mk("mysql", "0.159.1", table("t", vc, func(tbl *ir.Table) {
+				tbl.Indexes = []*ir.Index{{Name: "fx", Unique: true, Columns: []ir.IndexColumn{{Expression: "lower(other)"}}}}
 			})),
 			"non-character key (int)": mk("mysql", "0.159.1", table("t", ir.Integer{Width: 32}, pkOnK)),
 			"a full": {
