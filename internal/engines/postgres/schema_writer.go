@@ -1292,11 +1292,38 @@ func (w *SchemaWriter) CreateViews(ctx context.Context, s *ir.Schema) error {
 		if err != nil {
 			return err
 		}
-		if err := execEmittedDDL(ctx, w.db, stmt); err != nil {
+		if err := w.execViewDDL(ctx, stmt); err != nil {
 			return fmt.Errorf("postgres: create view %q: %w", view.Name, err)
 		}
 	}
 	return nil
+}
+
+// execViewDDL runs one CREATE VIEW with the target schema first on the
+// search path (Bug 314). The reader writes the source schema's own names
+// unqualified, and PG binds a view's references when it is created, so they
+// must resolve in the schema the view's tables were created in rather than
+// in the session default. Before this, a source on public migrated with
+// --target-schema app2 created app2.v over public.p, the target's own
+// unrelated table. public stays on the path after the target schema so an
+// extension installed there (the common place) still resolves, as it did.
+func (w *SchemaWriter) execViewDDL(ctx context.Context, stmt string) error {
+	tx, err := w.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	path := quoteIdent(w.schema)
+	if w.schema != "public" {
+		path += ", public"
+	}
+	if _, err := tx.ExecContext(ctx, "SELECT pg_catalog.set_config('search_path', $1, true)", path); err != nil {
+		return fmt.Errorf("pin search_path: %w", err)
+	}
+	if err := execEmittedDDL(ctx, tx, stmt); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // emitCreateView returns the appropriate `CREATE [OR REPLACE | MATERIALIZED]
