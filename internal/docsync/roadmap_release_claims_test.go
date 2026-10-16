@@ -692,6 +692,17 @@ func requireTagVisibility(t *testing.T) *gitRepo {
 func (g *gitRepo) run(args ...string) (string, error) {
 	cmd := exec.CommandContext(g.ctx, "git", args...)
 	cmd.Dir = g.dir
+	// Not the caller's repository-location variables: a pre-commit hook run
+	// in a linked worktree exports GIT_DIR (and GIT_INDEX_FILE, GIT_PREFIX), and with
+	// GIT_DIR set and no GIT_WORK_TREE git takes cmd.Dir — this package's
+	// directory — as the top of the work tree, so `git blame ../../docs/…`
+	// failed as "outside repository" and the hook refused every commit made
+	// from a worktree (measured 2026-10-15).
+	for _, kv := range os.Environ() {
+		if name, _, _ := strings.Cut(kv, "="); name != "GIT_DIR" && name != "GIT_INDEX_FILE" && name != "GIT_WORK_TREE" && name != "GIT_PREFIX" {
+			cmd.Env = append(cmd.Env, kv)
+		}
+	}
 	out, err := cmd.Output()
 	if err != nil {
 		var ee *exec.ExitError
