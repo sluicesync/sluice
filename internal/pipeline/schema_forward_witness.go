@@ -93,7 +93,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"reflect"
 	"sort"
 	"strings"
 
@@ -486,7 +485,7 @@ func sourceNarrowed(prior, snapshot ir.Type) bool {
 // sameStorage reports whether two lens-applied types store the same
 // values: equal, or two spellings of one storage.
 func sameStorage(a, b ir.Type) bool {
-	return reflect.DeepEqual(a, b) || witnessWidthOrder(a, b) == sameWidth
+	return ir.SameColumnType(a, b) || witnessWidthOrder(a, b) == sameWidth
 }
 
 // priorColumns indexes the prior shape's lens-applied columns by name (nil

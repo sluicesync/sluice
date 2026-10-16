@@ -137,9 +137,11 @@ const retainedSchemaSeedLimit = 10_000
 // schemaSeedLoader produces the prior-shape seed for the reader about to
 // be wired. It is a closure rather than a value so the warm-resume witness
 // read of the target ([loadTargetZoneWitness]) runs ONLY for a reader
-// that accepts a seed: the trigger-CDC lanes never implement
-// [schemaSeedSetter], and reading their target's catalog on every resume
-// would be a new failure surface for a lane that consumes nothing from it.
+// that accepts a seed ([schemaSeedSetter]) or emits schema boundaries the
+// intercepts judge against that read ([schemaBoundaryEmitter], the
+// postgres-trigger reader): the sqlite-trigger and d1-trigger lanes (one
+// reader) are neither, and reading their target's catalog on every resume
+// would be a new failure surface for lanes that consume nothing from it.
 type schemaSeedLoader func(ctx context.Context) ([]*ir.Table, error)
 
 // staticSchemaSeed wraps a seed already in hand (the cold-start source
@@ -664,10 +666,12 @@ func resolveRetainedSeedTable(orderer ir.PositionOrderer, versions []ir.Retained
 }
 
 // wireReaderSchemaSeed runs the pending seed loader for a reader that
-// accepts a seed and hands the result over; the loader is cleared first
+// accepts a seed (and hands the result over) or emits schema boundaries
+// (schemaBoundaryEmitter, which needs only the load's side effects — the
+// unforwarded check's prior); the loader is cleared first
 // so every attempt derives its own (a warm resume after a cold start in
 // the same process must not inherit the cold-start seed — its prior is
-// the target witness). Readers without the surface never run the loader
+// the target witness). Readers with neither surface never run the loader
 // and silently keep their old behaviour. A loader error is the caller's
 // to surface: the reader is armed for a refusal whose prev the seed
 // supplies.
@@ -700,15 +704,16 @@ func (s *Streamer) wireReaderSchemaSeed(ctx context.Context, r ir.CDCReader) err
 	if load == nil {
 		return nil
 	}
-	setter, ok := r.(schemaSeedSetter)
-	if !ok {
+	setter, isSetter := r.(schemaSeedSetter)
+	_, emits := r.(schemaBoundaryEmitter)
+	if !isSetter && !emits {
 		return nil
 	}
 	seed, err := load(ctx)
 	if err != nil {
 		return err
 	}
-	if len(seed) > 0 {
+	if isSetter && len(seed) > 0 {
 		setter.SetSchemaSeed(seed)
 	}
 	return nil

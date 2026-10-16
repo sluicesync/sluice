@@ -138,7 +138,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"reflect"
 	"strings"
 	"sync/atomic"
 
@@ -174,6 +173,22 @@ type unforwardedBoundaryDeps struct {
 	// (the forward intercept never engages under --inject-shard-column), so
 	// the hint does not offer them a flag that changes nothing.
 	forwardRemedy bool
+
+	// triggerSource is true for a trigger-CDC source
+	// ([Streamer.sourceRefusesDDL]): its refusal carries the engine's own
+	// recovery ([deps.recoveryHint]), not the drained model's "apply it on
+	// the target and restart".
+	triggerSource bool
+
+	// shardEngaged is true under --inject-shard-column, where the trigger
+	// remedy's --restart-from-scratch needs the shard's rows deleted first.
+	shardEngaged bool
+
+	// schemaAlreadyApplied is true under --schema-already-applied, where the
+	// trigger remedy's --restart-from-scratch drops and recreates nothing
+	// (the cold start skips every DDL phase), so the operator lands the
+	// change and empties the tables first.
+	schemaAlreadyApplied bool
 
 	// coldStart is the RAW source shape of every table a cold start read
 	// before this wiring ([Streamer.unforwardedColdStartPrior]; nil after a
@@ -491,7 +506,7 @@ func judgeUnforwardedBoundary(
 		what = err.Error()
 	}
 	drift := renderDriftForRefusal(prior.compared, post)
-	remedy := unforwardedRecoveryHint(tableName, deps.forwardRemedy, false)
+	remedy := deps.recoveryHint(tableName, deps.forwardRemedy, false)
 	if ambiguous {
 		// Every refusal on this arm rests on the prior alone, so it is
 		// always acknowledgeable — including a shape that classifies as ADD
@@ -509,7 +524,7 @@ func judgeUnforwardedBoundary(
 			a.accept(ctx, what)
 			return prior, nil
 		}
-		remedy = a.note() + unforwardedRecoveryHint(tableName, false, false)
+		remedy = a.note() + deps.recoveryHint(tableName, false, false)
 	}
 	return prior, fmt.Errorf(
 		"%w: the source changed %q (%s; the target cannot be read to compare: %s) and this stream does not "+
@@ -891,7 +906,7 @@ func judgeUnforwardedColumns(expected, target *ir.Table, opts witnessOptions, pr
 func overriddenColumnRefused(target, source, prior ir.Type) bool {
 	switch witnessWidthOrder(target, source) {
 	case targetNarrower, mixedWidth:
-		return prior == nil || !reflect.DeepEqual(prior, source)
+		return prior == nil || !ir.SameColumnType(prior, source)
 	}
 	return false
 }
@@ -900,7 +915,7 @@ func overriddenColumnRefused(target, source, prior ir.Type) bool {
 func (j unforwardedJudgement) settle(ctx context.Context, tableName string, deps unforwardedBoundaryDeps) error {
 	if len(j.refused) > 0 {
 		diffs := renderWitnessDiffs(j.refused)
-		remedy := unforwardedRecoveryHint(tableName, deps.forwardRemedy, j.added) + j.remedyNotes()
+		remedy := deps.recoveryHint(tableName, deps.forwardRemedy, j.added) + j.remedyNotes()
 		if j.ambiguous {
 			// The acknowledgement can vouch only for what a replay explains:
 			// every refused column must rest on the prior alone.
@@ -913,7 +928,7 @@ func (j unforwardedJudgement) settle(ctx context.Context, tableName string, deps
 			// narrowing or a DROP on a source whose order is unknown either
 			// (GC-44 F23), so it would keep the target with a WARN in the
 			// source-change case — the silent outcome this refusal exists for.
-			remedy = a.note() + unforwardedRecoveryHint(tableName, false, j.added) + j.remedyNotes()
+			remedy = a.note() + deps.recoveryHint(tableName, false, j.added) + j.remedyNotes()
 		}
 		return fmt.Errorf(
 			"%w: the source table %q no longer matches the target, and this stream does not forward schema "+
@@ -1092,6 +1107,66 @@ func (a ambiguousBoundary) note() string {
 // renderWitnessDiffs lists column disagreements for a log line or refusal.
 func renderWitnessDiffs(diffs []witnessColumnDiff) string {
 	return witnessVerdict{diffs: diffs}.render()
+}
+
+// recoveryHint is the remedy this stream's refusal carries:
+// [unforwardedRecoveryHint], or on a trigger-CDC source the engine's own
+// procedure for source DDL — the one its reader's observed-DDL refusal
+// names. The drained model's "apply the same change on the target and
+// restart with the SAME --stream-id" does not work there: the reader then
+// reaches the change's DDL marker and refuses again, demanding a re-copy, so
+// an operator following the first refusal met a second with different advice
+// (TRIGGER-REFUSAL-REMEDY, found by the review of 288789f2).
+//
+// The remedy is `--restart-from-scratch` alone: an operator restart drops and
+// recreates the in-scope target tables from the source's current schema and
+// re-copies them, which lands the change. An earlier cut said to land it with
+// `sluice migrate` first, which cannot run — migrate refuses a populated
+// target and never ALTERs (third review, TRIGGER-DDL-REMEDY-RUNS). Measured
+// converging on a populated target, with a row deleted while stopped, by
+// TestTriggerDDLRecovery_RemedyConvergesOnAPopulatedTarget.
+//
+// Two configurations make the restart drop nothing, and get the
+// apply-then-empty form instead: --inject-shard-column (the consolidated
+// table is shared; only this shard's rows go) and --schema-already-applied
+// (the cold start skips every DDL phase, streamer_coldstart.go). That form
+// names the SOURCE table and says so, because the hint has no table or schema
+// rename map in hand. The "not enough" claim is scoped to the event-trigger
+// tier: an --allow-polled-fingerprint install records no DDL marker, so
+// nothing refuses the restart there (fourth review).
+func (d unforwardedBoundaryDeps) recoveryHint(tableName string, forwardRemedy, added bool) string {
+	if !d.triggerSource {
+		return unforwardedRecoveryHint(tableName, forwardRemedy, added)
+	}
+	if d.shardEngaged || d.schemaAlreadyApplied {
+		why := "This stream runs under --inject-shard-column, so the consolidated table is shared and a restart " +
+			"does not drop it"
+		empty := "delete this shard's rows from it"
+		if !d.shardEngaged {
+			why = "This stream runs under --schema-already-applied, so a restart neither drops nor recreates " +
+				"any target table"
+			empty = "empty it (and every other table the stream copies)"
+		}
+		return fmt.Sprintf(
+			"Trigger-CDC recovery (the engine's procedure for any source DDL): drain the stream ('sluice sync stop "+
+				"--wait'). %s: apply the same change to the target table that source table %q lands in (under "+
+				"a table or schema rename that is the mapped name, not this one), %s, then re-run 'sluice sync "+
+				"start --source-driver=... --source=... --target-driver=... --target=... --restart-from-scratch'. "+
+				"Without that, rows the source deleted while the stream was stopped stay on the target.",
+			why, tableName, empty,
+		)
+	}
+	return fmt.Sprintf(
+		"Trigger-CDC recovery (the engine's procedure for any source DDL, and what its reader demands when it "+
+			"reaches the change's own DDL marker): drain the stream ('sluice sync stop --wait'), then re-run "+
+			"'sluice sync start --source-driver=... --source=... --target-driver=... --target=... "+
+			"--restart-from-scratch' — an operator restart drops and recreates the stream's tables on the target, "+
+			"the one source table %q lands in among them, from the source's current schema and re-copies them, which "+
+			"lands the change. With the source's DDL event triggers installed (the default tier), applying the change on the "+
+			"target and restarting at the same position is not enough: the reader reaches the change's DDL marker "+
+			"and refuses again.",
+		tableName,
+	)
 }
 
 // unforwardedRecoveryHint is the remedy for a refusal of this check. There

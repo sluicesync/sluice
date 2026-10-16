@@ -262,11 +262,28 @@ func TestRefuseObservedDDL_DroppedTableRemedy(t *testing.T) {
 		t.Errorf("dropped-table refusal steers to `sluice migrate`, which cannot land a drop: %s", dropped)
 	}
 	generic := refuseObservedDDL(ddlMarker{tag: "ALTER TABLE"}).Error()
-	if !strings.Contains(generic, "sluice migrate") {
-		t.Errorf("generic DDL refusal lost its migrate remedy: %s", generic)
+	// TRIGGER-DDL-REMEDY-RUNS: `sluice migrate` refuses a populated target and
+	// never ALTERs, so the generic remedy must not route through it; the
+	// restart lands the change (measured by the pipeline's
+	// TestTriggerDDLRecovery_RemedyConvergesOnAPopulatedTarget).
+	if strings.Contains(generic, "sluice migrate") {
+		t.Errorf("generic DDL refusal still names `sluice migrate`, which cannot run on a populated target: %s", generic)
+	}
+	if !strings.Contains(generic, "--restart-from-scratch") || !strings.Contains(generic, "drops and recreates") {
+		t.Errorf("generic DDL refusal does not say the restart lands the change: %s", generic)
 	}
 	if strings.Contains(generic, "DROPPED") {
 		t.Errorf("generic DDL refusal claims a drop: %s", generic)
+	}
+	// Both end in --restart-from-scratch, which under --inject-shard-column
+	// cannot remove rows deleted while stopped; both must say so.
+	for name, msg := range map[string]string{"dropped": dropped, "generic": generic} {
+		if !strings.Contains(msg, "delete this shard's rows") {
+			t.Errorf("%s refusal omits the --inject-shard-column caveat: %s", name, msg)
+		}
+		if !strings.Contains(msg, "under --schema-already-applied the restart drops and recreates nothing") {
+			t.Errorf("%s refusal omits the --schema-already-applied caveat: %s", name, msg)
+		}
 	}
 }
 

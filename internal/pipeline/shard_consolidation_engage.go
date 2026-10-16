@@ -53,6 +53,9 @@ func (s *Streamer) engageShardCoordination(ctx context.Context, applier ir.Chang
 	if s.NoCoordinateLiveDDL {
 		return nil
 	}
+	if s.sourceRefusesDDL() && sourceEmitsSchemaBoundaries(s.Source) {
+		return refuseTriggerSourceCoordination(s.Source.Name())
+	}
 	store, ok := applier.(ir.ShardConsolidationLeaseStore)
 	if !ok {
 		return s.refuseEngineMissingCoordination("lease store")
@@ -165,6 +168,37 @@ func (s *Streamer) refuseEngineMissingCoordination(missingSurface string) error 
 			"migrate, then resume every shard by re-running 'sluice sync start' with that shard's "+
 			"own --stream-id; there is no resume flag)",
 		engineName, missingSurface,
+	)
+}
+
+// triggerSourceCoordinationMarker names the refusal of live cross-shard DDL
+// coordination for a trigger-CDC source.
+const triggerSourceCoordinationMarker = "TRIGGER-SOURCE-LIVE-DDL-COORDINATION"
+
+// refuseTriggerSourceCoordination is the door for a trigger-CDC source under
+// `--inject-shard-column` with live coordination (the default). Coordination
+// forwards each shard's schema boundaries to the consolidated target through
+// the lease; it is gated on Shape A, not on [Streamer.forwardSchemaEnabled],
+// so [Streamer.sourceRefusesDDL] alone left it open. A trigger-CDC reader
+// forwards no DDL by design (ADR-0066 §7), but the postgres-trigger reader's
+// first-touch boundary (KEY-COLLATION-TRIGGER-CDC-NO-HISTORY) reads the
+// catalog as it stands, so a change made while the stream was stopped would
+// reach the consolidated target through it. The drained model is what this
+// engine supports, and under it a trigger stream's boundaries go through the
+// unforwarded-stream check, which refuses instead (TRIGGER-SHAPE-A-FORWARD,
+// found by the review of 288789f2).
+//
+// Scoped to a trigger-CDC source whose reader emits schema boundaries
+// ([schemaBoundaryEmittingSource]): sqlite-trigger and d1-trigger emit none,
+// so coordination has nothing of theirs to forward, and refusing them was a
+// false refusal of a working configuration (the re-review).
+func refuseTriggerSourceCoordination(sourceEngine string) error {
+	return fmt.Errorf(
+		"pipeline: %s: source engine %q is a trigger-CDC source, which forwards no schema change (its reader refuses "+
+			"source DDL, ADR-0066 §7), so it cannot take part in live cross-shard DDL coordination. Recovery: pass "+
+			"--no-coordinate-live-ddl (the drained model — every shard stopped with 'sluice sync stop --wait' for a schema "+
+			"change, which this engine's own recovery requires anyway)",
+		triggerSourceCoordinationMarker, sourceEngine,
 	)
 }
 

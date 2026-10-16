@@ -820,7 +820,8 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, applier
 		// at the persisted position as the fallback. The loader is
 		// installed here — the one place with the applier, the source and
 		// the position in hand — and run inside warmResume, only for a
-		// reader that accepts a seed. The guard below used to read "only
+		// reader that accepts a seed or emits schema boundaries
+		// (schemaBoundaryEmitter). The guard below used to read "only
 		// when a forward path is live: the seed feeds a refusal that is
 		// otherwise unarmed" — a cost argument that stopped being true
 		// when audit 2026-09-06 H5 widened the predicate, since the
@@ -1199,6 +1200,10 @@ func (s *Streamer) phaseWireInterceptChain(applyCtx context.Context, changes <-c
 			normalizer:    snapshotNormalizer,
 			why:           s.unforwardedStreamReason(),
 			forwardRemedy: s.unforwardedForwardRemedy(),
+			triggerSource: s.sourceRefusesDDL(),
+			shardEngaged:  s.InjectShardColumn.Engaged(),
+
+			schemaAlreadyApplied: s.SchemaAlreadyApplied,
 			// MEDIUM-2 of the third review: the cold start's RAW source read,
 			// not coldStartSeedSnapshots — that seed is synthesized only for
 			// the forwarding paths, and after --type-override has rewritten

@@ -56,6 +56,12 @@ const kttcCreate = "CREATE TABLE kd (id int NOT NULL PRIMARY KEY, k varchar(20) 
 // the MySQL server for more databases ("" for a Postgres target).
 func kttcPair(t *testing.T, tag, target string) (src, tgt twfbDB, myRoot string, cleanup func()) {
 	t.Helper()
+	return kttcPairWith(t, tag, target, kttcCreate)
+}
+
+// kttcPairWith is [kttcPair] over the source table create (kd, captured).
+func kttcPairWith(t *testing.T, tag, target, create string) (src, tgt twfbDB, myRoot string, cleanup func()) {
+	t.Helper()
 	srcDSN, pgTarget, pgCleanup := startPostgres(t)
 	cleanup = pgCleanup
 	tgt = twfbDB{engine: "postgres", dsn: pgTarget}
@@ -72,7 +78,7 @@ func kttcPair(t *testing.T, tag, target string) (src, tgt twfbDB, myRoot string,
 		tgt = twfbDB{engine: "mysql", dsn: tgtDSN}
 	}
 	src = twfbDB{engine: "postgres", dsn: srcDSN}
-	src.exec(t, kttcCreate)
+	src.exec(t, create)
 	if _, err := pgtrigger.Setup(context.Background(), srcDSN, pgtrigger.SetupOptions{Tables: []string{"kd"}, Schema: "public"}); err != nil {
 		cleanup()
 		t.Fatalf("pgtrigger.Setup: %v", err)

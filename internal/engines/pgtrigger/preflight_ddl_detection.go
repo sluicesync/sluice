@@ -50,7 +50,14 @@ const ddlDetectionAbsentMarker = "DDL-DETECTION-ABSENT"
 // poller through it). Setup's claim surface is handled separately: the
 // CLI's mode string now reports "NONE" for this tier, so the operator
 // hears it at install time too.
-func warnDDLDetectionAbsent(ctx context.Context, db *sql.DB, schema string) {
+//
+// It reports whether the event-trigger tier was established. False — the
+// polled tier, or a probe that could not tell — makes the reader read each
+// first-touch shape per table rather than once per schema
+// ([CDCReader.cachedShape]): with DDL invisible, a key added to a table after
+// the schema's first touch would otherwise be judged from the older read
+// (FIRST-TOUCH-POLLED-TIER-STALE).
+func warnDDLDetectionAbsent(ctx context.Context, db *sql.DB, schema string) (eventTier bool) {
 	// Bounded (audit 2026-08-27 A5; rationale on [openProbeTimeout]): on
 	// expiry the error arm below fires the "could not rule it out" WARN —
 	// the degrade, not a silent skip.
@@ -63,7 +70,7 @@ func warnDDLDetectionAbsent(ctx context.Context, db *sql.DB, schema string) {
 				"if it is a --allow-polled-fingerprint install, source DDL is INVISIBLE to capture (see the polled-tier warning) and this open could not rule that out; "+
 				"the same read establishes whether the install carries the sql_drop capture arm ("+dropCaptureAbsentMarker+"), so that is unknown too",
 			slog.Any("err", err))
-		return
+		return false
 	}
 	if state.anyFnPresent() {
 		// Event-trigger tier: grade the ARMS, not just the tier. This rides
@@ -71,7 +78,7 @@ func warnDDLDetectionAbsent(ctx context.Context, db *sql.DB, schema string) {
 		// serial open-path timeout for state already in hand, and both
 		// WARNs share the same posture (warn, degrade on error).
 		warnDropCaptureAbsent(ctx, state, schema)
-		return
+		return true
 	}
 	slog.WarnContext(ctx,
 		"pgtrigger: "+ddlDetectionAbsentMarker+": this install is on the --allow-polled-fingerprint tier, which has NO DDL detection — "+
@@ -81,6 +88,7 @@ func warnDDLDetectionAbsent(ctx context.Context, db *sql.DB, schema string) {
 			"Apply source DDL with the drained model instead: `sluice sync stop --wait`, apply the DDL on source AND target, re-run `sluice trigger setup --dsn=... --tables=...`, then `sluice sync start`. "+
 			"If your role can CREATE EVENT TRIGGER, re-run `sluice trigger setup --dsn=... --tables=...` WITHOUT --allow-polled-fingerprint to install the event-trigger tier, which refuses loudly on observed DDL",
 		slog.String("schema", schema))
+	return false
 }
 
 // dropCaptureAbsentMarker is the grep-stable prefix for the D-1 upgrade

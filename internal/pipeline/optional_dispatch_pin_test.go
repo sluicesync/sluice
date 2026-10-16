@@ -51,6 +51,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/engines/mysql"
+	"sluicesync.dev/sluice/internal/engines/pgtrigger"
 	"sluicesync.dev/sluice/internal/engines/postgres"
 
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
@@ -113,6 +114,14 @@ var (
 	// process, so without the seed a stopped-stream timestamp⇄timestamptz
 	// swap primed silently on every warm resume. Same reasoning as above.
 	_ schemaSeedSetter = (*postgres.CDCReader)(nil)
+	// TRIGGER-WARM-RESUME-NO-PRIOR: the postgres-trigger reader takes no seed,
+	// but its first-touch boundaries need the warm-resume load to run. A
+	// renamed method would silently drop every warm resume back to judging
+	// with no prior, which refuses a narrowing --type-override on every start.
+	_ schemaBoundaryEmitter = (*pgtrigger.CDCReader)(nil)
+	// Its engine-level twin keys the Shape A coordination door; a rename would
+	// silently reopen TRIGGER-SHAPE-A-FORWARD.
+	_ schemaBoundaryEmittingSource = pgtrigger.Engine{}
 	// GC-32: the unforwarded-schema-change baseline carry. A method renamed
 	// on either reader would make the assertion miss, and every automatic
 	// retry would silently re-baseline again — the defect GC-32 closed.

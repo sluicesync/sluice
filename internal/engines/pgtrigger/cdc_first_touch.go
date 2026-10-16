@@ -62,12 +62,34 @@ package pgtrigger
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"sluicesync.dev/sluice/internal/engines/postgres"
 	"sluicesync.dev/sluice/internal/ir"
 )
+
+// EmitsSchemaBoundaries marks this reader for the pipeline's
+// schemaBoundaryEmitter surface: it takes no schema seed, but its stream
+// carries the first-touch boundaries above, so a warm resume must still load
+// the retained history and target catalog the unforwarded-stream check
+// judges them against. Without that load every warm resume judged with no
+// prior, and a narrowing --type-override refused on every restart
+// (TRIGGER-WARM-RESUME-NO-PRIOR). The method set is the whole contract; the
+// pipeline type-asserts it, so its spelling is pinned at compile time in
+// pipeline/optional_dispatch_pin_test.go and end to end by
+// pipeline.TestKeyCollationTriggerCDC_WarmResumeShapes.
+func (r *CDCReader) EmitsSchemaBoundaries() {}
+
+// CDCReaderEmitsSchemaBoundaries is the engine-level twin of
+// [CDCReader.EmitsSchemaBoundaries], for decisions the pipeline makes before
+// the reader is open — the Shape A coordination door, which refuses live
+// cross-shard coordination for this engine because its boundaries would be
+// forwarded to the consolidated target (TRIGGER-SHAPE-A-FORWARD). Pinned in
+// pipeline/optional_dispatch_pin_test.go.
+func (Engine) CDCReaderEmitsSchemaBoundaries() {}
 
 // tableShapeFunc reads the source's shape of schema.table for changes the
 // transaction txid (an xid8, as the change log records it) captured.
@@ -153,26 +175,57 @@ func anchorBefore(p ir.Position) (ir.Position, error) {
 	return encodePos(pgTriggerPos{LastID: pos.LastID - 1})
 }
 
-// readTableShape is the production [tableShapeFunc]: the schema reader's read
-// of the one table, with each column's collation stamped as of the capturing
+// readTableShape is the production [tableShapeFunc]: the schema reader's shape
+// of the table, with each column's collation stamped as of the capturing
 // transaction.
+//
+// The cost, measured (postgres:16, one container): a schema read costs about
+// 60 ms on a near-empty schema and about 400 ms beside 500 other tables,
+// views and sequences, because the reader's view and sequence passes walk the
+// whole schema whatever the table scope. Read per table, a stream over 100 of
+// those tables would spend about 40 s of pump time on first touches; read as
+// below, the same 100 first touches took 1.36 s in all (13.6 ms each, the
+// schema read included; measured with a throwaway probe, not a CI test).
+// So the shapes are read ONCE per
+// schema per session, scoped to the tables this install captures there
+// ([capturedTableNames]) that this stream reads (the pipeline's scope
+// predicate, when one is set), and each table's collations — the
+// per-row-transaction half — are still read at its own first touch. Setup
+// does NOT vet everything the schema reader refuses (an extension-function
+// DEFAULT, an extension type: the first cut's comment claimed it did, and the
+// re-review found one out-of-scope table failing every first touch), so a
+// failed per-schema read falls back to reading each table on its own
+// (FIRST-TOUCH-BATCH-SCOPE). A table missing from the cached read is read on
+// its own.
+//
+// The per-schema read is as of the session's first touch of the schema, not
+// of each table, and that is sound only where a later DDL that matters to the
+// shape leaves a marker. On the event-trigger tier the capture fires on ALTER
+// TABLE, CREATE TABLE, CREATE INDEX and a dropped table (setup.go): an added
+// column, key, unique index or collation halts the stream at its marker
+// before any change after it. It does NOT fire on DROP INDEX, ALTER TYPE …
+// ADD/RENAME VALUE or ALTER DOMAIN, so those leave the cached shape stale for
+// the session. A stale shape cannot disarm the key-collation guard: both
+// target guards take their keys from the TARGET's catalog and only the column
+// collations from the shape. That is not the same as saying a source DROP
+// INDEX is safe, and it is NOT: the target keeps the dropped key, so two rows
+// the source now allows under it (even byte-identical ones) meet on the
+// target, where an upsert through that key overwrites the first row at exit 0
+// — a pre-existing hole on every CDC source (DROP INDEX is invisible to all
+// of them), not caused by this boundary, and filed separately. An enum label
+// added on the source reaches the target exactly as it did before this
+// boundary existed (the boundary never carried it); a domain CHECK holds no
+// data. On the polled-fingerprint tier no DDL leaves a marker, so there the
+// shape is read per table ([CDCReader.shapePerTable],
+// FIRST-TOUCH-POLLED-TIER-STALE: the per-schema read described a table without
+// a UNIQUE key added after the schema's first touch — which, measured, did not
+// unarm the guard, for the reason above, but left the recorded shape wrong);
+// a change made after a table's own first touch is still not seen until the
+// next session, as for collations.
 func (r *CDCReader) readTableShape(ctx context.Context, schema, table string, txid int64) (*ir.Table, error) {
-	sr, err := r.openShapeReader(ctx)
+	tbl, err := r.cachedShape(ctx, schema, table)
 	if err != nil {
 		return nil, err
-	}
-	sr.SetSchema(schema)
-	sr.SetTableScope(func(name string) bool { return name == table })
-	s, err := sr.ReadSchema(ctx)
-	if err != nil {
-		return nil, err
-	}
-	var tbl *ir.Table
-	for _, t := range s.Tables {
-		if t != nil && t.Name == table {
-			tbl = t
-			break
-		}
 	}
 	if tbl == nil {
 		return nil, fmt.Errorf("the source catalog has no table %s.%s, which these captured changes name — a DDL "+
@@ -192,6 +245,110 @@ func (r *CDCReader) readTableShape(ctx context.Context, schema, table string, tx
 		}
 	}
 	return tbl, nil
+}
+
+// cachedShape returns the schema reader's shape of schema.table from the
+// session's per-schema read, reading it first if this is the schema's first
+// touch, and reading the table alone if the cached read lacks it. nil when the
+// catalog has no such table.
+func (r *CDCReader) cachedShape(ctx context.Context, schema, table string) (*ir.Table, error) {
+	tables, ok := r.shapes[schema]
+	if !ok && r.shapePerTable {
+		// The polled-fingerprint tier (FIRST-TOUCH-POLLED-TIER-STALE): DDL
+		// leaves no marker there, so a key added to this table after the
+		// schema's first touch would be judged from the older read. Pay the
+		// per-table cost instead.
+		tables, ok = map[string]*ir.Table{}, true
+	}
+	if !ok {
+		names, err := capturedTableNames(ctx, r.db, r.schema, schema)
+		if err != nil {
+			return nil, fmt.Errorf("list the captured tables of %s: %w", schema, err)
+		}
+		inScope := func(name string) bool {
+			if name == table {
+				return true
+			}
+			return names[name] && (r.scopeAllowed == nil || r.scopeAllowed(schema, name))
+		}
+		if tables, err = r.readShapes(ctx, schema, inScope); err != nil {
+			// FIRST-TOUCH-BATCH-SCOPE: setup does not vet everything the
+			// schema reader refuses (an extension-function DEFAULT, an
+			// extension type), so one captured table this stream does not
+			// read must not fail the shapes of the tables it does. Read
+			// each table on its own for the rest of the session; the
+			// touched table's own read below still fails loudly if IT is
+			// the one the reader refuses.
+			slog.InfoContext(ctx, "pgtrigger: first-touch schema boundary: the per-schema shape read failed; reading each table on its own",
+				slog.String("schema", schema), slog.Any("err", err))
+			tables = map[string]*ir.Table{}
+		}
+		if r.shapes == nil {
+			r.shapes = map[string]map[string]*ir.Table{}
+		}
+		r.shapes[schema] = tables
+	}
+	if tbl := tables[table]; tbl != nil {
+		delete(tables, table) // handed out once: each table is touched once per session
+		return tbl, nil
+	}
+	one, err := r.readShapes(ctx, schema, func(name string) bool { return name == table })
+	if err != nil {
+		return nil, err
+	}
+	return one[table], nil
+}
+
+// readShapes reads the tables of schema the scope admits, keyed by name.
+func (r *CDCReader) readShapes(ctx context.Context, schema string, scope func(string) bool) (map[string]*ir.Table, error) {
+	sr, err := r.openShapeReader(ctx)
+	if err != nil {
+		return nil, err
+	}
+	sr.SetSchema(schema)
+	sr.SetTableScope(scope)
+	s, err := sr.ReadSchema(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]*ir.Table{}
+	for _, t := range s.Tables {
+		if t != nil {
+			out[t.Name] = t
+		}
+	}
+	return out, nil
+}
+
+// capturedTableNames lists the tables of tableSchema that carry this install's
+// capture trigger (the install's functions live in installSchema), the scope
+// of [CDCReader.cachedShape]'s per-schema read.
+func capturedTableNames(ctx context.Context, db *sql.DB, installSchema, tableSchema string) (map[string]bool, error) {
+	const q = `
+SELECT c.relname
+  FROM pg_catalog.pg_trigger tg
+  JOIN pg_catalog.pg_proc p       ON p.oid = tg.tgfoid
+  JOIN pg_catalog.pg_namespace fn ON fn.oid = p.pronamespace
+  JOIN pg_catalog.pg_class c      ON c.oid = tg.tgrelid
+  JOIN pg_catalog.pg_namespace tn ON tn.oid = c.relnamespace
+ WHERE fn.nspname = $1
+   AND tn.nspname = $2
+   AND tg.tgname = $3
+   AND NOT tg.tgisinternal`
+	rows, err := db.QueryContext(ctx, q, installSchema, tableSchema, CaptureTriggerRow)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	names := map[string]bool{}
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			return nil, err
+		}
+		names[n] = true
+	}
+	return names, rows.Err()
 }
 
 // openShapeReader opens the schema reader [CDCReader.readTableShape] reads

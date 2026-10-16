@@ -128,11 +128,17 @@ type CDCReader struct {
 	// touch emits the first-touch schema boundary ahead of each table's
 	// first change of the session (cdc_first_touch.go,
 	// KEY-COLLATION-TRIGGER-CDC-NO-HISTORY), reading through shapeReader,
-	// opened on the first touch. Pump-goroutine-only; Close releases
+	// opened on the first touch, and shapes, the per-schema shape read each
+	// table is served from once (cachedShape). Pump-goroutine-only; Close releases
 	// shapeReader after joining the pump.
 	touch       firstTouch
 	shapeReader *postgres.SchemaReader
-	appID       string
+	shapes      map[string]map[string]*ir.Table
+	// shapePerTable reads each first-touch shape on its own instead of once
+	// per schema: set on the polled-fingerprint tier (or when the tier could
+	// not be read), where DDL is invisible (FIRST-TOUCH-POLLED-TIER-STALE).
+	shapePerTable bool
+	appID         string
 
 	// mu guards err. The pump writes; the caller reads via Err.
 	mu  sync.Mutex
@@ -232,7 +238,7 @@ func openCDCReader(ctx context.Context, dsn, appID string) (ir.CDCReader, error)
 	// out" arm — and each probe derives its own bounded context per the A5
 	// convention (TestOpenPathProbesDeriveBoundedContexts). Cost: one
 	// EXISTS + one single-row catalog read per stream open.
-	warnDDLDetectionAbsent(ctx, db, cfg.schema)
+	eventTier := warnDDLDetectionAbsent(ctx, db, cfg.schema)
 	// WARN (never refuse) when the installed capture functions predate the
 	// SEC-1 fix — SECURITY DEFINER with no pinned search_path, which on the
 	// superuser-owned DDL capture function is a privilege-escalation any
@@ -242,12 +248,13 @@ func openCDCReader(ctx context.Context, dsn, appID string) (ir.CDCReader, error)
 	// running syncs — the reasoning is recorded on the door itself.
 	warnInsecureCaptureFunctions(ctx, db, cfg.schema)
 	r := &CDCReader{
-		db:           db,
-		schema:       cfg.schema,
-		dsn:          cfg.dsn,
-		appID:        appID,
-		pollInterval: defaultPollInterval,
-		batchSize:    defaultBatchSize,
+		db:            db,
+		schema:        cfg.schema,
+		dsn:           cfg.dsn,
+		appID:         appID,
+		shapePerTable: !eventTier,
+		pollInterval:  defaultPollInterval,
+		batchSize:     defaultBatchSize,
 	}
 	r.touch.shape = r.readTableShape
 	return r, nil
@@ -604,28 +611,54 @@ func classifyPollError(err error) error {
 // which is why the seterr gate accepts it as-is: routing it through the
 // transient classifier would be strictly wrong (this must never retry).
 //
-// A DROPPED captured table gets its own remedy (D-1). The generic hint sends
-// the operator to `sluice migrate`, which reads the SOURCE schema and creates
-// what it finds — it cannot land a drop, and re-running it against a source
-// that no longer has the table would leave the target's copy in place while
-// reporting success. Naming the dropped relation also matters because the
+// The generic remedy is `--restart-from-scratch` alone. It used to say to land
+// the change with `sluice migrate` first, which cannot run: migrate refuses a
+// populated target (COLD-START-TARGET-NOT-EMPTY) and never ALTERs (third
+// review, TRIGGER-DDL-REMEDY-RUNS). An operator restart drops and recreates
+// the stream's in-scope target tables from the source's current schema and
+// re-copies them (freshCopyOperatorRestart), which lands the change and
+// carries no row the source deleted while the stream was stopped — measured on
+// a populated Postgres target, pipeline
+// TestTriggerDDLRecovery_RemedyConvergesOnAPopulatedTarget.
+//
+// A DROPPED captured table gets its own remedy (D-1): a restart recreates only
+// the tables the stream still reads, so the dropped table's target copy is the
+// operator's decision. Naming the dropped relation also matters because the
 // marker is the only remaining evidence: by the time this refusal is read the
 // table, and its capture triggers, are gone from the source catalogs.
+//
+// Under --inject-shard-column the consolidated table is shared and the restart
+// does not drop it, so the operator applies the change to it and deletes this
+// shard's rows first (measured in the same test). The reader does not know
+// whether the stream is sharded, so that caveat is always appended,
+// conditional in its wording.
 func refuseObservedDDL(m ddlMarker) error {
 	if m.droppedRelation != "" {
 		return fmt.Errorf(
 			"pgtrigger: source table %s was DROPPED (%s) — the trigger engine refuses to forward DDL, and a drop is not something `sluice migrate` can land: "+
 				"the target still holds that table's last-synced rows and will keep them forever. Drain the stream (`sluice sync stop --wait`), decide the target's fate for that table "+
 				"(drop it on the target to match the source, or keep it as a deliberate archive), re-run `sluice trigger setup --dsn=<source-dsn> --tables=<the tables that still exist>` on the source, "+
-				"drop the table from the sync's --tables, then re-run `sluice sync start --source-driver=... --source=... --target-driver=... --target=... --restart-from-scratch` (there is no --reset-position flag; --restart-from-scratch is what discards the persisted position and re-copies from the beginning)",
+				"drop the table from the sync's --tables, then re-run `sluice sync start --source-driver=... --source=... --target-driver=... --target=... --restart-from-scratch` (there is no --reset-position flag; --restart-from-scratch is what discards the persisted position and re-copies from the beginning)"+shardRestartCaveat,
 			m.droppedRelation, m.tag,
 		)
 	}
 	return fmt.Errorf(
-		"pgtrigger: observed source-side DDL (%s); the trigger engine refuses to forward DDL — drain the stream (`sluice sync stop --wait`), run `sluice migrate --source-driver=... --source=... --target-driver=... --target=...` on the target to land the schema change, then re-run `sluice sync start --source-driver=... --source=... --target-driver=... --target=... --restart-from-scratch` (there is no --reset-position flag; --restart-from-scratch is what discards the persisted position and re-copies from the beginning)",
+		"pgtrigger: observed source-side DDL (%s); the trigger engine refuses to forward DDL — drain the stream (`sluice sync stop --wait`), then re-run `sluice sync start --source-driver=... --source=... --target-driver=... --target=... --restart-from-scratch`: "+
+			"an operator restart drops and recreates the stream's tables on the target from the source's CURRENT schema and re-copies them, which lands the change "+
+			"(there is no --reset-position flag; --restart-from-scratch is what discards the persisted position and re-copies from the beginning)"+shardRestartCaveat,
 		m.tag,
 	)
 }
+
+// shardRestartCaveat is [refuseObservedDDL]'s caveat for the two
+// configurations whose restart drops nothing: --inject-shard-column (the
+// consolidated table is shared) and --schema-already-applied (the cold start
+// skips every DDL phase). The reader knows neither, so both are worded as
+// conditions.
+const shardRestartCaveat = "; under --inject-shard-column the consolidated target table is shared and the restart does NOT drop it: " +
+	"apply the same change to it and delete this shard's rows from it before the --restart-from-scratch, or rows the source " +
+	"deleted while the stream was stopped stay on the target; under --schema-already-applied the restart drops and recreates " +
+	"nothing: apply the change on the target and empty the stream's tables before the --restart-from-scratch"
 
 // watermarkStalledMarker is the grep-stable marker of
 // [refuseStalledWatermark]'s refusal. The refusal carries it as

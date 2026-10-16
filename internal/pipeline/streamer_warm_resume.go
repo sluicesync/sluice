@@ -72,7 +72,8 @@ func (s *Streamer) warmResume(ctx context.Context, persisted ir.Position) (chang
 	// zone witness with the retained schema-history version as fallback
 	// (SLM-1b), through the loader phaseOpenChangeStream installed before
 	// this call (this function has no applier in hand). The loader runs
-	// only for a reader that accepts a seed, and its error is loud: the
+	// only for a reader that accepts a seed or emits schema boundaries
+	// (schemaBoundaryEmitter: postgres-trigger), and its error is loud: the
 	// arming above is inert without a prior, and a resume that silently
 	// lost its prior would reopen the first-boundary window.
 	if err := s.wireReaderSchemaSeed(ctx, cdc); err != nil {

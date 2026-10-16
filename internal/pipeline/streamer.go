@@ -149,10 +149,41 @@ type schemaDeltaTargetApplySetter interface {
 // stream was cleanly stopped arrived as the resumed process's FIRST
 // RelationMessage and primed silently (measured on postgres:16, PG→PG and
 // PG→MySQL, both directions; pipeline.TestStreamer_PGSource_StoppedStreamZoneSwap).
-// Readers that don't implement it (the trigger-CDC lanes, which emit no
-// schema boundary at all) silently ignore, which is the old behaviour.
+// Readers that don't implement it silently ignore, which is the old
+// behaviour — but see [schemaBoundaryEmitter] for the one that still needs
+// the load to run.
 type schemaSeedSetter interface {
 	SetSchemaSeed(tables []*ir.Table)
+}
+
+// schemaBoundaryEmitter is the optional CDC-reader surface of a reader that
+// takes no seed but whose stream nonetheless carries schema boundaries: the
+// postgres-trigger reader's first-touch snapshot
+// (KEY-COLLATION-TRIGGER-CDC-NO-HISTORY). [Streamer.wireReaderSchemaSeed]
+// still runs the warm-resume load for it, because that load is what hands
+// the unforwarded-stream check its prior — the retained history and the
+// target catalog. Without it every warm resume judged a table with no
+// prior, and a narrowing --type-override (varchar(50) → varchar(20), bigint
+// → int) refused SCHEMA-CHANGE-REFUSED on every restart, on MySQL and
+// Postgres targets alike, with no acknowledgement exit
+// (TRIGGER-WARM-RESUME-NO-PRIOR, measured).
+type schemaBoundaryEmitter interface {
+	EmitsSchemaBoundaries()
+}
+
+// schemaBoundaryEmittingSource is the ENGINE-level twin of
+// [schemaBoundaryEmitter], for decisions made before a reader is open: the
+// source engine's CDC reader emits schema boundaries. The Shape A
+// coordination door reads it ([refuseTriggerSourceCoordination]).
+type schemaBoundaryEmittingSource interface {
+	CDCReaderEmitsSchemaBoundaries()
+}
+
+// sourceEmitsSchemaBoundaries reports whether src declares
+// [schemaBoundaryEmittingSource].
+func sourceEmitsSchemaBoundaries(src ir.Engine) bool {
+	_, ok := src.(schemaBoundaryEmittingSource)
+	return ok
 }
 
 // targetSchemaSetter is the optional applier-side surface for
@@ -1651,7 +1682,7 @@ type Streamer struct {
 	// the target's zone witness per table with the retained schema-history
 	// version as fallback ([loadWarmResumeSchemaSeed], SLM-1b). A loader
 	// rather than a value so the warm-resume target read runs only for a
-	// reader that accepts a seed. Consumed and cleared where the reader
+	// reader that accepts a seed or emits schema boundaries. Consumed and cleared where the reader
 	// is wired, so each attempt derives its own.
 	readerSchemaSeed schemaSeedLoader
 
