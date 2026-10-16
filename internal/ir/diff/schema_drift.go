@@ -441,7 +441,12 @@ func diffRenameColumnIR(added, dropped map[string]*ir.Column) (oldName, newName 
 	dCopy.SluiceInjected = false
 	aCopy.Default = normalizeDefaultForRenameDrift(aCopy.Default)
 	dCopy.Default = normalizeDefaultForRenameDrift(dCopy.Default)
-	if !reflect.DeepEqual(aCopy, dCopy) {
+	// The type through ir.SameColumnType (TYPE-WIRE-EMPTY-SLICE-SIGNATURE's
+	// sibling sweep): an expected schema decoded from a manifest spells an
+	// empty list nil where a live read spells it empty.
+	sameType := ir.SameColumnType(aCopy.Type, dCopy.Type)
+	aCopy.Type, dCopy.Type = nil, nil
+	if !sameType || !reflect.DeepEqual(aCopy, dCopy) {
 		return "", "", false
 	}
 	return dropCol.Name, addCol.Name, true

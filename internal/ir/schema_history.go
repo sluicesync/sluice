@@ -129,8 +129,66 @@ func (s SchemaSignature) Equal(other SchemaSignature) bool {
 // type against a recorded shape (the MySQL binlog reader's deferred-shape
 // check) uses exactly the equivalence that decides whether a change is a
 // schema boundary, rather than a second one of its own.
+//
+// One difference is not a difference: an empty list spelled as an empty
+// slice and the same list spelled nil ([normalizeEmptyLists]). The schema
+// reader builds a Postgres domain without a CHECK as
+// `ir.Domain{Checks: []ir.DomainCheck{}}` and schema history reads it back
+// as `Checks: nil`, so DeepEqual called the two a schema change
+// (TYPE-WIRE-EMPTY-SLICE-SIGNATURE): every warm resume of a postgres-trigger
+// stream invalidated the Postgres applier's caches for such a table, which
+// moved it to the slow path silently and, with a jsonb column beside it,
+// wedged the apply.
+//
+// Deliberately NOT "whatever the history codec writes identically" — the
+// first cut of this fix did that, and the re-review found it merged real
+// differences: the codec does not record [Enum.Collation] (a collation-only
+// MySQL ENUM change, which [Enum.Collation]'s own doc requires to surface as
+// a delta, audit 2026-07-19 E1/E3), and JSON rewrites invalid UTF-8 to
+// U+FFFD (enum labels or domain CHECKs that differ only in invalid bytes, on
+// a SQL_ASCII Postgres). So a version read back from history with
+// `Collation: ""` still differs from a live MySQL boundary carrying the real
+// collation, exactly as before this fix: the direction that costs an extra
+// schema version or a cache invalidation, never a hidden change.
 func SameColumnType(a, b Type) bool {
-	return reflect.DeepEqual(a, b)
+	if reflect.DeepEqual(a, b) {
+		return true
+	}
+	return reflect.DeepEqual(normalizeEmptyLists(a), normalizeEmptyLists(b))
+}
+
+// normalizeEmptyLists is t with every empty list field set to nil, through
+// the composite types that can hold another type. Every IR type with a slice
+// field is a case here; TestSameColumnType_EveryListFieldIsNormalized
+// (internal/typematrix) fails when a new one is not.
+func normalizeEmptyLists(t Type) Type {
+	switch v := t.(type) {
+	case Domain:
+		if len(v.Checks) == 0 {
+			v.Checks = nil
+		}
+		v.BaseType = normalizeEmptyLists(v.BaseType)
+		return v
+	case Array:
+		v.Element = normalizeEmptyLists(v.Element)
+		return v
+	case Enum:
+		if len(v.Values) == 0 {
+			v.Values = nil
+		}
+		return v
+	case Set:
+		if len(v.Values) == 0 {
+			v.Values = nil
+		}
+		return v
+	case ExtensionType:
+		if len(v.Modifiers) == 0 {
+			v.Modifiers = nil
+		}
+		return v
+	}
+	return t
 }
 
 // ColumnTypes returns the signature's per-column IR types keyed by

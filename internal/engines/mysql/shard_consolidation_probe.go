@@ -15,7 +15,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"reflect"
 	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
@@ -114,7 +113,7 @@ func (a *ChangeApplier) ProbeAlterColumnType(ctx context.Context, table *ir.Tabl
 	if !present {
 		return ir.ProbeOutcomeInconsistent, nil
 	}
-	if reflect.DeepEqual(observed, want.Type) {
+	if ir.SameColumnType(observed, want.Type) {
 		return ir.ProbeOutcomeApplied, nil
 	}
 	return ir.ProbeOutcomeInconsistent, fmt.Errorf(
@@ -250,7 +249,7 @@ func (a *ChangeApplier) ProbeRenameColumn(ctx context.Context, table *ir.Table, 
 				table.Name, newName,
 			)
 		}
-		if reflect.DeepEqual(observed, want.Type) {
+		if ir.SameColumnType(observed, want.Type) {
 			return ir.ProbeOutcomeApplied, nil
 		}
 		return ir.ProbeOutcomeInconsistent, fmt.Errorf(

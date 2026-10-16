@@ -541,6 +541,11 @@ func unforwardableTypmodColumn(prev, current *relationCacheEntry) (col string, s
 		if pair, ok := sessionTZSwapPair(pc, cc); ok {
 			return cc.Name, unforwardableSessionTZCast, pair
 		}
+		// DeepEqual on purpose, exempt from TYPE-WIRE-EMPTY-SLICE-SIGNATURE's
+		// sweep to ir.SameColumnType: both operands are this process's own
+		// pgoutput projections (the cached Relation and the new one), never a
+		// version read back from history, and the projection builds no
+		// ir.Domain and no empty list.
 		if !reflect.DeepEqual(containSRIDSentinel(pc.Type), containSRIDSentinel(cc.Type)) {
 			continue
 		}

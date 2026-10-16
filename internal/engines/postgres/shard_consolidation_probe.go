@@ -19,7 +19,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"reflect"
 	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
@@ -165,7 +164,7 @@ func (a *ChangeApplier) ProbeAlterColumnType(ctx context.Context, table *ir.Tabl
 // recorded by an older binary carries none — so the stamp alone must not
 // read as a type that did not land.
 func probeTypesEqual(observed, want ir.Type) bool {
-	return reflect.DeepEqual(dropDefaultDeterminism(observed), dropDefaultDeterminism(want))
+	return ir.SameColumnType(dropDefaultDeterminism(observed), dropDefaultDeterminism(want))
 }
 
 // dropDefaultDeterminism clears Determinism on a default-collation

@@ -439,7 +439,12 @@ func diffRenameColumn(added, dropped []*ir.Column) (before, after *ir.Column, ok
 	// default", so collapse to a single canonical form for equality.
 	aCopy.Default = normalizeDefaultForRename(aCopy.Default)
 	dCopy.Default = normalizeDefaultForRename(dCopy.Default)
-	return d, a, reflect.DeepEqual(aCopy, dCopy)
+	// The type through ir.SameColumnType (TYPE-WIRE-EMPTY-SLICE-SIGNATURE's
+	// sibling sweep): one side may be a version read back from schema history,
+	// which spells an empty list nil.
+	sameType := ir.SameColumnType(aCopy.Type, dCopy.Type)
+	aCopy.Type, dCopy.Type = nil, nil
+	return d, a, sameType && reflect.DeepEqual(aCopy, dCopy)
 }
 
 // normalizeDefaultForRename folds the two encodings of "no default" —
@@ -627,7 +632,10 @@ func alteredColumns(pre, post *ir.Table) []alteredColumn {
 			continue
 		}
 		switch {
-		case !reflect.DeepEqual(preCol.Type, postCol.Type):
+		// ir.SameColumnType, not DeepEqual: pre is often the retained history
+		// version (the unforwarded check's prior), which spells an empty list
+		// nil, and DeepEqual read that as an ALTER COLUMN TYPE.
+		case !ir.SameColumnType(preCol.Type, postCol.Type):
 			out = append(out, alteredColumn{before: preCol, after: postCol, kind: ShapeKindAlterColumnType})
 		case preCol.Nullable != postCol.Nullable:
 			out = append(out, alteredColumn{before: preCol, after: postCol, kind: ShapeKindAlterColumnNullability})
