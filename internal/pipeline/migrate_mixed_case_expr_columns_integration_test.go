@@ -12,8 +12,11 @@ import (
 	"testing"
 	"time"
 
+	"sluicesync.dev/sluice/internal/engines"
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
+	"sluicesync.dev/sluice/internal/translate"
 )
 
 // TestMigrate_MySQLToPostgres_MixedCaseColumnExpressions is GitHub #356 on
@@ -153,22 +156,36 @@ func testTrimKeywordColumns(t *testing.T, target string) {
 	}
 
 	// MySQL identifier quotes cannot sit in a Go raw string; ~ stands for one.
+	// trim_words holds the cells both targets can carry: the keyword with a
+	// one-character literal, and a column named trailing as TRIM's operand.
+	// trim_cols holds a column AS the remove-string, which only a MySQL target
+	// can carry: Postgres reads a remove-string as a character set, MySQL as
+	// a substring, and a column's value is unknown until a row arrives, so a
+	// Postgres target refuses it (Bug 312, asserted below).
 	applyMySQLDDL(t, mysqlSource, strings.ReplaceAll(`
 		CREATE TABLE trim_words (
 			id         INT NOT NULL PRIMARY KEY,
 			code       VARCHAR(20),
-			~both~     VARCHAR(5),
-			~Leading~  VARCHAR(5),
 			~trailing~ VARCHAR(10),
 			g_kw   VARCHAR(20) AS (trim(both 'x' from code)) STORED,
-			g_col  VARCHAR(20) AS (trim(~both~ from code)) STORED,
-			g_mix  VARCHAR(20) AS (trim(both ~both~ from code)) STORED,
-			g_lead VARCHAR(20) AS (trim(leading ~Leading~ from code)) STORED,
 			g_one  VARCHAR(20) AS (concat(trim(~trailing~), '!')) STORED
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
-		INSERT INTO trim_words (id, code, ~both~, ~Leading~, ~trailing~)
-		VALUES (1, 'xbabx', 'b', 'x', '  t  '), (2, 'bbabb', 'b', 'b', 't'), (3, '  bab  ', 'b', ' ', ' tt');
+		INSERT INTO trim_words (id, code, ~trailing~)
+		VALUES (1, 'xbabx', '  t  '), (2, 'bbabb', 't'), (3, '  bab  ', ' tt');
+
+		CREATE TABLE trim_cols (
+			id         INT NOT NULL PRIMARY KEY,
+			code       VARCHAR(20),
+			~both~     VARCHAR(5),
+			~Leading~  VARCHAR(5),
+			g_col  VARCHAR(20) AS (trim(~both~ from code)) STORED,
+			g_mix  VARCHAR(20) AS (trim(both ~both~ from code)) STORED,
+			g_lead VARCHAR(20) AS (trim(leading ~Leading~ from code)) STORED
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+		INSERT INTO trim_cols (id, code, ~both~, ~Leading~)
+		VALUES (1, 'xbabx', 'b', 'x'), (2, 'bbabb', 'b', 'b'), (3, '  bab  ', 'b', ' ');
 	`, "~", "`"))
 	if target == "mysql" {
 		// The keyword before a unary-minus remove-string, which MySQL stores
@@ -187,8 +204,6 @@ func testTrimKeywordColumns(t *testing.T, target string) {
 	`, "~", "`"))
 	}
 
-	runMigrate(t, "mysql", target, mysqlSource, tgtDSN)
-
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	src, err := sql.Open("mysql", mysqlSource)
@@ -202,9 +217,138 @@ func testTrimKeywordColumns(t *testing.T, target string) {
 	}
 	defer func() { _ = tgt.Close() }()
 
-	compareGeneratedWithSource(ctx, t, src, tgt, "trim_words", 3, "g_kw", "g_col", "g_mix", "g_lead", "g_one")
-	if target == "mysql" {
-		compareGeneratedWithSource(ctx, t, src, tgt, "trim_neg", 2, "g_neg")
+	if target == "postgres" {
+		runMigrateScoped(t, "mysql", target, mysqlSource, tgtDSN, "", "trim_words")
+		compareGeneratedWithSource(ctx, t, src, tgt, "trim_words", 3, "g_kw", "g_one")
+		requireTrimRefusal(ctx, t, "mysql", target, mysqlSource, tgtDSN, tgt, "trim_cols")
+		return
+	}
+	runMigrate(t, "mysql", target, mysqlSource, tgtDSN)
+	compareGeneratedWithSource(ctx, t, src, tgt, "trim_words", 3, "g_kw", "g_one")
+	compareGeneratedWithSource(ctx, t, src, tgt, "trim_cols", 3, "g_col", "g_mix", "g_lead")
+	compareGeneratedWithSource(ctx, t, src, tgt, "trim_neg", 2, "g_neg")
+}
+
+// TestMigrate_TrimRemoveStringAcrossFamilies is Bug 312 on real servers.
+// TRIM's remove-string is a repeated SUBSTRING on MySQL and a character SET on
+// Postgres (TRIM(BOTH 'xy' FROM 'yxAyx') is 'yxAyx' on MySQL and 'A' on
+// Postgres), and both parse the same text, so a generated column or CHECK
+// carried across verbatim computes different values at exit 0. Across the
+// families sluice refuses any remove-string that is not a literal of at most
+// one character; the controls prove it does not refuse within a family, where
+// the text means the same thing, and the values there are compared with what
+// the source computed.
+func TestMigrate_TrimRemoveStringAcrossFamilies(t *testing.T) {
+	mysqlSource, mysqlTarget, mysqlCleanup := startMySQL(t)
+	defer mysqlCleanup()
+	pgSource, pgTarget, pgCleanup := startPostgres(t)
+	defer pgCleanup()
+
+	applyMySQLDDL(t, mysqlSource, `
+		CREATE TABLE my_gen (
+			id INT NOT NULL PRIMARY KEY,
+			s  VARCHAR(20),
+			g  VARCHAR(20) AS (trim(both 'xy' from s)) STORED
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+		INSERT INTO my_gen (id, s) VALUES (1, 'yxAyx'), (2, 'xyAxy'), (3, 'A');
+		CREATE TABLE my_chk (
+			id INT NOT NULL PRIMARY KEY,
+			s  VARCHAR(20),
+			CONSTRAINT my_chk_s CHECK (trim(leading 'ab' from s) <> '')
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+		INSERT INTO my_chk (id, s) VALUES (1, 'ba');
+	`)
+	applyPGDDL(t, pgSource, `
+		CREATE TABLE pg_gen (
+			id INT PRIMARY KEY,
+			s  VARCHAR(20),
+			g  VARCHAR(20) GENERATED ALWAYS AS (trim(both 'xy' from s)) STORED
+		);
+		INSERT INTO pg_gen (id, s) VALUES (1, 'yxAyx'), (2, 'xyAxy'), (3, 'A');
+		CREATE TABLE pg_chk (
+			id INT PRIMARY KEY,
+			s  VARCHAR(20),
+			CONSTRAINT pg_chk_s CHECK (trim(both E' \t\r\n' from s) <> '')
+		);
+		INSERT INTO pg_chk (id, s) VALUES (1, 'a');
+		CREATE TABLE pg_col (
+			id     INT PRIMARY KEY,
+			s      VARCHAR(20),
+			"both" VARCHAR(5),
+			g      VARCHAR(20) GENERATED ALWAYS AS (trim(both "both" from s)) STORED
+		);
+		INSERT INTO pg_col (id, s, "both") VALUES (1, 'abA', 'ab');
+	`)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	open := func(driver, dsn string) *sql.DB {
+		db, err := sql.Open(driver, dsn)
+		if err != nil {
+			t.Fatalf("open %s: %v", driver, err)
+		}
+		t.Cleanup(func() { _ = db.Close() })
+		return db
+	}
+	mySrc, myTgt := open("mysql", mysqlSource), open("mysql", mysqlTarget)
+	pgSrc, pgTgt := open("pgx", pgSource), open("pgx", pgTarget)
+
+	t.Run("mysql to postgres refuses", func(t *testing.T) {
+		requireTrimRefusal(ctx, t, "mysql", "postgres", mysqlSource, pgTarget, pgTgt, "my_gen")
+		requireTrimRefusal(ctx, t, "mysql", "postgres", mysqlSource, pgTarget, pgTgt, "my_chk")
+	})
+	t.Run("postgres to mysql refuses", func(t *testing.T) {
+		requireTrimRefusal(ctx, t, "postgres", "mysql", pgSource, mysqlTarget, myTgt, "pg_gen")
+		requireTrimRefusal(ctx, t, "postgres", "mysql", pgSource, mysqlTarget, myTgt, "pg_chk")
+		requireTrimRefusal(ctx, t, "postgres", "mysql", pgSource, mysqlTarget, myTgt, "pg_col")
+	})
+	// Same family, same meaning: carried across and computed exactly as the
+	// source computed it. These run after the refusals, which created nothing.
+	t.Run("mysql to mysql carries it", func(t *testing.T) {
+		runMigrateScoped(t, "mysql", "mysql", mysqlSource, mysqlTarget, "trim-my", "my_gen")
+		compareGeneratedWithSource(ctx, t, mySrc, myTgt, "my_gen", 3, "g")
+	})
+	t.Run("postgres to postgres carries it", func(t *testing.T) {
+		runMigrateScoped(t, "postgres", "postgres", pgSource, pgTarget, "trim-pg", "pg_gen")
+		compareGeneratedWithSource(ctx, t, pgSrc, pgTgt, "pg_gen", 3, "g")
+	})
+}
+
+// requireTrimRefusal migrates only table and requires the Bug 312 refusal,
+// with the table never created on the target (so no row could have landed
+// under the wrong meaning).
+func requireTrimRefusal(ctx context.Context, t *testing.T, srcName, tgtName, srcDSN, tgtDSN string, tgt *sql.DB, table string) {
+	t.Helper()
+	src, _ := engines.Get(srcName)
+	dst, _ := engines.Get(tgtName)
+	mig := &Migrator{
+		Source:      src,
+		Target:      dst,
+		SourceDSN:   srcDSN,
+		TargetDSN:   tgtDSN,
+		MigrationID: "trim-refuse-" + table,
+		Filter:      migcore.TableFilter{Include: []string{table}},
+	}
+	runCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	err := mig.Run(runCtx)
+	if err == nil {
+		t.Fatalf("%s → %s migrated %s; its TRIM remove-string means something different on the target "+
+			"and must be refused", srcName, tgtName, table)
+	}
+	if !strings.Contains(err.Error(), translate.TrimRemoveStringMarker) {
+		t.Fatalf("%s → %s refused %s, but not with %s: %v", srcName, tgtName, table, translate.TrimRemoveStringMarker, err)
+	}
+	var n int
+	q := "SELECT count(*) FROM information_schema.tables WHERE table_name = '" + table + "'"
+	if tgtName == "mysql" {
+		q += " AND table_schema = DATABASE()"
+	}
+	if err := tgt.QueryRowContext(ctx, q).Scan(&n); err != nil {
+		t.Fatalf("look for %s on the target: %v", table, err)
+	}
+	if n != 0 {
+		t.Errorf("%s exists on the %s target after the refusal", table, tgtName)
 	}
 }
 
@@ -217,7 +361,9 @@ func testTrimKeywordColumns(t *testing.T, target string) {
 // such a column, and a silent wrong trim for one with it. Postgres quotes
 // every column of these names, so its text takes the keyword reading.
 // The table carries a `both` column to make the wrong reading silent, and
-// the values are compared with what Postgres computed.
+// the values are compared with what Postgres computed. (`both` used AS the
+// remove-string is refused on a MySQL target, Bug 312:
+// TestMigrate_TrimRemoveStringAcrossFamilies.)
 func TestMigrate_PostgresToMySQL_TrimKeywordForms(t *testing.T) {
 	pgSource, _, pgCleanup := startPostgres(t)
 	defer pgCleanup()
@@ -231,7 +377,6 @@ func TestMigrate_PostgresToMySQL_TrimKeywordForms(t *testing.T) {
 			"both" VARCHAR(5),
 			g_trim VARCHAR(20) GENERATED ALWAYS AS (trim(code)) STORED,
 			g_lead VARCHAR(20) GENERATED ALWAYS AS (trim(leading from code)) STORED,
-			g_col  VARCHAR(20) GENERATED ALWAYS AS (trim(both "both" from code)) STORED,
 			CONSTRAINT code_not_blank CHECK (trim(leading from code) <> '')
 		);
 		CREATE INDEX trim_pg_code ON trim_pg ((trim(both from code)));
@@ -253,7 +398,7 @@ func TestMigrate_PostgresToMySQL_TrimKeywordForms(t *testing.T) {
 	}
 	defer func() { _ = tgt.Close() }()
 
-	compareGeneratedWithSource(ctx, t, src, tgt, "trim_pg", 2, "g_trim", "g_lead", "g_col")
+	compareGeneratedWithSource(ctx, t, src, tgt, "trim_pg", 2, "g_trim", "g_lead")
 	// The CHECK landed and still means trim-then-compare: an all-blank code
 	// is refused, and a padded one is accepted.
 	if _, err := tgt.ExecContext(ctx, "INSERT INTO trim_pg (id, code) VALUES (3, '   ')"); err == nil {

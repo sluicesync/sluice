@@ -1055,6 +1055,14 @@ func emitColumnDef(table *ir.Table, c *ir.Column, opts emitOpts) (string, error)
 		if err := refuseNonPortableSQLiteExprPG("generated column", c.Name, c.GeneratedExpr, c.GeneratedExprDialect); err != nil {
 			return "", err
 		}
+		// A MySQL TRIM remove-string longer than one character is a
+		// substring there and a character set here (Bug 312).
+		if c.GeneratedExprDialect == translatableSourceDialect {
+			if err := translate.RefuseDivergentTrim("generated column", pgTableNameOf(table), c.Name,
+				c.GeneratedExpr, translatableSourceDialect, "Postgres"); err != nil {
+				return "", err
+			}
+		}
 		sb.WriteString(" GENERATED ALWAYS AS (")
 		body := translateGeneratedExpr(c, table, opts)
 		// Bug 25 (v0.10.1): for enum-typed generated columns we

@@ -21,6 +21,7 @@ import (
 	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/translate"
 )
 
 // AlterAddCheck implements [ir.ShapeDeltaApplier] for MySQL
@@ -203,6 +204,13 @@ func refuseUntranslatedCheckExprMySQL(chk *ir.CheckConstraint, exprText string) 
 	// dialect-guard early-return skipped.
 	if err := refuseNonPortableSQLiteExprMySQL("CHECK constraint", chk.Name, chk.Expr, chk.ExprDialect); err != nil {
 		return err
+	}
+	// Bug 312: a Postgres TRIM remove-string longer than one character.
+	if chk.ExprDialect == translatableSourceDialect {
+		if err := translate.RefuseDivergentTrim("CHECK constraint", "", chk.Name,
+			chk.Expr, translatableSourceDialect, "MySQL"); err != nil {
+			return err
+		}
 	}
 	// Scan ONLY a body from the one engine whose tokens this list describes
 	// (Postgres); self / untagged / SQLite / any unknown dialect emits verbatim

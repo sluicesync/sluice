@@ -1032,6 +1032,14 @@ func (m mysqlEmitter) emitColumnDef(tableName string, c *ir.Column) (string, err
 		if err := refuseNonPortableSQLiteExprMySQL("generated column", c.Name, c.GeneratedExpr, c.GeneratedExprDialect); err != nil {
 			return "", err
 		}
+		// A Postgres TRIM remove-string longer than one character is a
+		// character set there and a substring here (Bug 312).
+		if c.GeneratedExprDialect == translatableSourceDialect {
+			if err := translate.RefuseDivergentTrim("generated column", tableName, c.Name,
+				c.GeneratedExpr, translatableSourceDialect, "MySQL"); err != nil {
+				return "", err
+			}
+		}
 		sb.WriteString(" GENERATED ALWAYS AS (")
 		sb.WriteString(translateGeneratedExpr(c, m.backslashEscapes))
 		sb.WriteByte(')')
