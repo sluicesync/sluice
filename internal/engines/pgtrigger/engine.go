@@ -202,6 +202,16 @@ func (e Engine) PreflightIndexes(s *ir.Schema) error {
 // boundary.
 var _ ir.IndexEmitPreflighter = Engine{}
 
+// PreflightViews implements [ir.ViewEmitPreflighter] by delegating to the
+// composed [postgres.Engine], for the same reason and against the same
+// non-promotion trap as PreflightIndexes: without it, Bug 314's cross-engine
+// view refusal reaches a trigger target only at CreateViews, after the copy.
+func (e Engine) PreflightViews(s *ir.Schema) error {
+	return e.pg.PreflightViews(s)
+}
+
+var _ ir.ViewEmitPreflighter = Engine{}
+
 // PreflightColumnTypes implements [ir.ColumnTypeEmitPreflighter] by delegating
 // to the composed [postgres.Engine]. Same reason as PreflightIndexes above, and
 // the same trap: a method on the composed struct is NOT promoted through this
