@@ -66,8 +66,13 @@ func krwCapture(t *testing.T, lane string, eng ir.Engine, srcDSN, slot string, s
 	// commits windows by rollover, each with the schema refresh and delta a
 	// long-running stream writes.
 	rollover := 10 * time.Minute
-	if lane == "backup-stream-rollover" {
-		rollover = 4 * time.Second
+	rolls := lane == "backup-stream-rollover"
+	if rolls {
+		rollover = krwRolloverWindow
+	}
+	before := ""
+	if rolls {
+		before = krwSourceShape(t, src)
 	}
 	started := time.Now()
 	runCtx, cancel := context.WithCancel(ctx)
@@ -85,13 +90,89 @@ func krwCapture(t *testing.T, lane string, eng ir.Engine, srcDSN, slot string, s
 		src.exec(t, s)
 	}
 	windowWritten := time.Since(started)
-	time.Sleep(6 * time.Second)
-	cancel()
-	if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
-		return err
+	var runErr error
+	exited := false
+	if rolls {
+		exited, runErr = krwAwaitFirstRollover(store, done, krwRolloverWindow+20*time.Second)
+	} else {
+		time.Sleep(6 * time.Second)
 	}
-	krwRequireWindowCaptured(t, lane, store, krwRowStatements(window), windowWritten)
+	cancel()
+	if !exited {
+		runErr = <-done
+	}
+	if runErr != nil && !errors.Is(runErr, context.Canceled) {
+		return runErr
+	}
+	schemaChanged := rolls && krwSourceShape(t, src) != before
+	krwRequireWindowCaptured(t, lane, store, krwRowStatements(window), windowWritten, schemaChanged)
 	return nil
+}
+
+// krwRolloverWindow is the "backup-stream-rollover" lane's RolloverWindow.
+// The lane's premise is that the whole window — its rows AND its ALTERs —
+// lands in the stream's FIRST rollover, which commits with the schema
+// refresh and delta. The window is written 3 s after the stream starts, so
+// this is the budget the window's statements have before the deadline. It
+// was 4 s (a ~1 s budget) until a CI run (38920928785) on a loaded runner
+// returned a table-rebuilding MODIFY of the key after rollover 1's deadline:
+// the ALTER fell into rollover 2, which the cancel drained without a schema
+// refresh, and the broker cell — correctly — saw no collation change in the
+// window it was handed. 10 s gives the window a ~7 s budget;
+// krwRequireWindowCaptured names the premise when even that is not enough
+// (WINDOW-SPLIT), so a break reads as the test's premise and not as the
+// product's verdict.
+const krwRolloverWindow = 10 * time.Second
+
+// krwAwaitFirstRollover waits until the stream has committed its first
+// incremental (the first rollover) or exits, at most limit. It replaces a
+// fixed post-window sleep: the first rollover holds everything written
+// before its deadline whenever the cell stops the stream after it, so the
+// cell waits exactly as long as the rollover takes and no longer. exited
+// reports that done fired, with the stream's error.
+func krwAwaitFirstRollover(store irbackup.Store, done <-chan error, limit time.Duration) (exited bool, err error) {
+	deadline := time.Now().Add(limit)
+	for time.Now().Before(deadline) {
+		select {
+		case err := <-done:
+			return true, err
+		case <-time.After(250 * time.Millisecond):
+		}
+		// A listing that races the commit is an error or a short list; either
+		// is "not yet", and the cell's own check re-lists after the stop.
+		recs, lerr := lineage.ListAllSegmentManifests(context.Background(), store)
+		if lerr != nil {
+			continue
+		}
+		for _, rec := range recs {
+			if rec.Manifest.Kind == irbackup.BackupKindIncremental {
+				return false, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+// krwSourceShape renders the source database's column catalog (MySQL): a
+// change across the window means the window's ALTERs changed the schema
+// on net, so the rollover holding its rows owes a schema delta. A window
+// that changes a key and changes it back (the reverted window) owes none.
+// It is read from the source's catalog, not from anything the stream
+// wrote, so it is independent of the capture it grades.
+func krwSourceShape(t *testing.T, src twfbDB) string {
+	t.Helper()
+	if src.engine != "mysql" {
+		t.Fatalf("the backup-stream-rollover lane's window-split check reads a MySQL catalog; source engine %q", src.engine)
+	}
+	shape := src.scalar(t, "SELECT CONCAT(COUNT(*), ':', IFNULL(BIT_XOR(CRC32(CONCAT_WS(':', TABLE_NAME, ORDINAL_POSITION, COLUMN_NAME, "+
+		"COLUMN_TYPE, IFNULL(CHARACTER_SET_NAME, '-'), IFNULL(COLLATION_NAME, '-'), IS_NULLABLE, IFNULL(COLUMN_DEFAULT, '-')))), 0)) "+
+		"FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE()")
+	if strings.HasPrefix(shape, "<") {
+		// scalar renders a failed read as "<err>": two failed reads would
+		// compare equal and silently waive the delta requirement.
+		t.Fatalf("read the source's column catalog: %s", shape)
+	}
+	return shape
 }
 
 // krwRequireWindowCaptured fails the cell when the stream's committed
@@ -106,13 +187,27 @@ func krwCapture(t *testing.T, lane string, eng ir.Engine, srcDSN, slot string, s
 // never applied a committed one.
 // The independent expected value is the window itself; the segment listing
 // in the message is what the next occurrence needs to be diagnosed.
-func krwRequireWindowCaptured(t *testing.T, lane string, store irbackup.Store, rowStatements int, windowWritten time.Duration) {
+//
+// WINDOW-SPLIT names the stream lanes' other premise: the whole window lands
+// in ONE committed incremental. Its rows must not spread across two, and when
+// the window changed the source's schema on net (schemaChanged, read from the
+// source's catalog before and after it — not from the capture), the
+// incremental holding its last row change must carry a schema delta: an
+// ALTER that landed in a later rollover was refreshed into a window the cell
+// never grades, or drained by the stop with no refresh at all, and the cell
+// would report the product's correct verdict on a window without the ALTER
+// as a defect (CI run 38920928785, `apply = <nil>; want
+// KEY-COLLATION-HISTORY-UNORDERED`). The delta requirement applies only to
+// the rollover lane: the drain-commit lane records no delta by design
+// (KEY-COLLATION-DRAIN-NO-DELTA).
+func krwRequireWindowCaptured(t *testing.T, lane string, store irbackup.Store, rowStatements int, windowWritten time.Duration, schemaChanged bool) {
 	t.Helper()
 	recs, err := lineage.ListAllSegmentManifests(context.Background(), store)
 	if err != nil {
 		t.Fatalf("%s: list segments: %v", lane, err)
 	}
-	captured := 0
+	captured, holding := 0, 0
+	var last *irbackup.Manifest
 	var listing strings.Builder
 	for _, rec := range recs {
 		m := rec.Manifest
@@ -120,6 +215,10 @@ func krwRequireWindowCaptured(t *testing.T, lane string, store irbackup.Store, r
 		if m.Kind == irbackup.BackupKindIncremental {
 			rows = krwRowChanges(t, store, rec)
 			captured += rows
+			if rows > 0 {
+				holding++
+				last = m
+			}
 		}
 		fmt.Fprintf(&listing, "\n  %s %s parent=%s records=%d row-changes=%d deltas=%d end=%s",
 			m.Kind, m.BackupID, m.ParentBackupID, manifestChangeRecordCount(m), rows, len(m.SchemaDelta), m.EndPosition.Token)
@@ -128,6 +227,16 @@ func krwRequireWindowCaptured(t *testing.T, lane string, store irbackup.Store, r
 		t.Fatalf("%s: the stream exited cleanly having committed %d row changes for a window of %d row statements "+
 			"(written %s after the stream started): it did not capture the window, so this cell grades nothing. Segments:%s",
 			lane, captured, rowStatements, windowWritten.Round(time.Millisecond), listing.String())
+	}
+	if holding > 1 {
+		t.Fatalf("%s: WINDOW-SPLIT: the window's rows landed in %d rollovers (written %s after the stream started); "+
+			"the cell grades one window, so it grades nothing. Segments:%s",
+			lane, holding, windowWritten.Round(time.Millisecond), listing.String())
+	}
+	if schemaChanged && last != nil && len(last.SchemaDelta) == 0 {
+		t.Fatalf("%s: WINDOW-SPLIT: the ALTER landed in a later rollover than its rows: the source's schema changed across the window, "+
+			"but the incremental holding its last row change (%s) carries no schema delta (written %s after the stream started). Segments:%s",
+			lane, last.BackupID, windowWritten.Round(time.Millisecond), listing.String())
 	}
 }
 
