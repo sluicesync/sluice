@@ -420,7 +420,7 @@ func ukcTradeRemedy(t *testing.T, src, tgt twfbDB, cell twfbCell) {
 
 	// The printed remedy for `sync start`, as an operator would run it: on a
 	// Postgres source, first the slot drop the remedy names (here its SQL
-	// equivalent on the literal slot `sluice_<--slot-name>`).
+	// equivalent on the resolved, `sluice_`-prefixed slot name).
 	if src.engine == "postgres" {
 		if !strings.Contains(refusal.Error(), "sluice slot drop") {
 			t.Fatalf("the remedy does not name the slot drop a Postgres re-copy needs: %v", refusal)

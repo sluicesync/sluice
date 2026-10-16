@@ -37,10 +37,11 @@ var ErrUniqueKeyConflictOtherRow = errors.New("UNIQUE-KEY-CONFLICT-OTHER-ROW")
 // --reset-target-data (which needs --yes off a terminal; cmd/sluice cli.go).
 const UniqueKeyConflictRecopyRemedy = "a re-copy converges — for `sluice sync start`, restart with " +
 	"`--restart-from-scratch` and the same `--stream-id` (from a Postgres pgoutput source, first drop the stream's " +
-	"replication slot, which a fresh snapshot refuses to inherit: `sluice slot drop sluice_<--slot-name> " +
-	"--source-driver=postgres --source <DSN> --yes`, the default slot being `sluice_slot`); for `sluice sync from-backup run`, which has no " +
-	"`--restart-from-scratch`, re-run it with `--reset-target-data --yes` (it drops the target tables and " +
-	"restores the chain again)."
+	"replication slot, which a fresh snapshot refuses to inherit: `sluice slot drop <SLOT> " +
+	"--source-driver=postgres --source <DSN> --yes`, where <SLOT> is the full name `sluice slot list` prints: " +
+	"`sluice_slot` by default, else `sluice_` + --slot-name unless that already starts with `sluice_`); " +
+	"for `sluice sync from-backup run`, which has no `--restart-from-scratch`, re-run it with " +
+	"`--reset-target-data --yes` (it drops the target tables and restores the chain again; this leg is unmeasured)."
 
 // UniqueKeyConflictError is the terminal refusal the appliers raise when an
 // upsert's conflict-identity guard fired. Engine-neutral: MySQL builds it
