@@ -567,7 +567,12 @@ jobs:
   # on a Postgres segment whose schema history records a key column whose
   # collation was not established for its rows, against the newest release
   # below it (whose guard arms nothing for such a key).
-  # Both guards count 5 accordingly; a sixth suite bumps them again.
+  # SIX since the FormatVersion-15 bump (FUNCTIONAL-CAST-HIDDEN-COLLATION):
+  # TestBackup_CrossVersionHiddenCollation pins the tier stamped on any
+  # manifest whose schema carries a MySQL functional key's hidden-column
+  # collation (it boots its own MySQL container), against the newest
+  # release below it.
+  # Both guards count 6 accordingly; a seventh suite bumps them again.
   crossversion:
     name: Cross-version backup compat
     if: ${{ github.event_name == 'schedule' || github.event.inputs.suite == 'all' || github.event.inputs.suite == 'crossversion' }}
@@ -598,8 +603,8 @@ jobs:
       - name: Assert the -run filter matches the suite (vacuous-green guard)
         run: |
           matched=$(go test -tags='integration crossversion' -list '^TestBackup_CrossVersion' ./internal/pipeline/ ./internal/pipeline/backup/ | grep -c '^Test' || true)
-          if [ "$matched" -ne 5 ]; then
-            echo "::error::crossversion: -run filter matches ${matched} top-level tests, expected 5 (chain-compat + positionless-full + exact-numbers + key-collation-delta + key-collation-unestablished). A rename emptied the filter or a cross-version test joined/left the leg — update the filter, this guard, and scripts/check-run-filter-coverage.sh together."
+          if [ "$matched" -ne 6 ]; then
+            echo "::error::crossversion: -run filter matches ${matched} top-level tests, expected 6 (chain-compat + positionless-full + exact-numbers + key-collation-delta + key-collation-unestablished + hidden-collation). A rename emptied the filter or a cross-version test joined/left the leg — update the filter, this guard, and scripts/check-run-filter-coverage.sh together."
             exit 1
           fi
 
@@ -624,8 +629,8 @@ jobs:
           # runs fails the parent by name — so this outer check is
           # specifically for the case where a whole suite silently didn't.)
           passed=$(grep -c '^--- PASS: TestBackup_CrossVersion' crossversion.out || true)
-          if [ "$passed" -ne 5 ]; then
-            echo "::error::crossversion: ${passed} top-level tests PASSed, expected 5 — a suite was skipped or didn't run (vacuous green). See the run log."
+          if [ "$passed" -ne 6 ]; then
+            echo "::error::crossversion: ${passed} top-level tests PASSed, expected 6 — a suite was skipped or didn't run (vacuous green). See the run log."
             exit 1
           fi
 

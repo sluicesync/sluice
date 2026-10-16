@@ -26,7 +26,6 @@ package mysql
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -78,36 +77,8 @@ func TestFunctionalKeyHiddenCollation_ClassFix(t *testing.T) {
 			rows: [2]ir.Row{{"id": int64(1), "k": "e", "f": int64(1)}, {"id": int64(2), "k": "é", "f": int64(2)}},
 		},
 	}
-	n := 0
-	newDB := func(t *testing.T) string {
-		t.Helper()
-		n++
-		dsn, cleanup := newSharedDB(t, fmt.Sprintf("kchc_%d", n))
-		t.Cleanup(cleanup)
-		return dsn
-	}
-	write := func(t *testing.T, eng Engine, dsn string, table *ir.Table, rows ...ir.Row) error {
-		t.Helper()
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-		defer cancel()
-		rw, err := eng.OpenRowWriter(ctx, dsn)
-		if err != nil {
-			t.Fatalf("OpenRowWriter: %v", err)
-		}
-		defer func() { _ = rw.(*RowWriter).Close() }()
-		ch := make(chan ir.Row, len(rows))
-		for _, r := range rows {
-			ch <- r
-		}
-		close(ch)
-		return rw.(*RowWriter).WriteRowsIdempotent(ctx, table, ch)
-	}
-	wantMerge := func(t *testing.T, err error, dsn string) {
-		t.Helper()
-		if !errors.Is(err, ir.ErrKeyCollationMerge) || !strings.Contains(fmtErr(err), keyCollationMergeMarker) {
-			t.Fatalf("err = %v; want KEY-COLLATION-MERGE (target %s)", err, kcgRows(t, dsn, "kd", "id"))
-		}
-	}
+	newDB := kchcNewDB("kchc")
+	write, wantMerge := kchcWrite, kchcWantMerge
 	for _, s := range shapes {
 		t.Run(s.name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)

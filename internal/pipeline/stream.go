@@ -1785,6 +1785,9 @@ func (b *BackupStream) refreshSchemaAndAttachDelta(
 	manifest.SchemaDelta = delta
 	stampKeyCollationDeltaOnAttach(manifest)
 	manifest.Schema = afterSchema
+	// The window-end schema may carry a functional key's hidden-column
+	// collation the parent's did not (FormatVersionHiddenCollation).
+	irbackup.StampHiddenCollation(manifest)
 	afterHash, err := irbackup.ComputeSchemaHash(afterSchema)
 	if err != nil {
 		return fmt.Errorf("rollover: hash post-window schema: %w", err)

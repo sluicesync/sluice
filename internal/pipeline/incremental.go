@@ -2117,6 +2117,9 @@ func (b *IncrementalBackup) attachWindowEndSchema(ctx context.Context, cdc ir.CD
 		// targeting than the start-state. Swap it in so the manifest's
 		// recorded Schema reflects the post-window source shape.
 		manifest.Schema = afterSchema
+		// The window-end schema may carry a functional key's hidden-column
+		// collation the parent's did not (FormatVersionHiddenCollation).
+		irbackup.StampHiddenCollation(manifest)
 		afterHash, err := irbackup.ComputeSchemaHash(afterSchema)
 		if err != nil {
 			return fmt.Errorf("incremental: hash source schema (end): %w", err)

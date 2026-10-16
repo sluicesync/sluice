@@ -11,6 +11,21 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 )
 
+// TestMySQLCollationName pins the F5 routing test: MySQL and MariaDB
+// collation names are recognised with or without a charset beside them;
+// Postgres and ICU names are not.
+func TestMySQLCollationName(t *testing.T) {
+	for name, want := range map[string]bool{
+		"utf8mb4_0900_ai_ci": true, "UTF8MB4_BIN": true, "latin1_swedish_ci": true, "utf8_general_ci": true,
+		"utf8mb3_general_ci": true, "utf8mb4_uca1400_ai_ci": true, "binary": true,
+		"C": false, "POSIX": false, "en_US.utf8": false, "und-x-icu": false, "default": false, "ucs_basic": false,
+	} {
+		if got := mysqlCollationName(name); got != want {
+			t.Errorf("mysqlCollationName(%q) = %v; want %v", name, got, want)
+		}
+	}
+}
+
 // TestParseFunctionalKeyPart is the grammar, both ways: every form the
 // guard reads through renders to the expression it read, and every form it
 // cannot read is refused rather than half-read. The real-server matrix
@@ -143,9 +158,11 @@ func withHidden(t *ir.Table, hidden string) *ir.Table {
 //
 // MySQL-family source (FUNCTIONAL-CAST-HIDDEN-COLLATION, the class fix): the
 // source key's comparison is its READ hidden collation, compared with the
-// target index's; the column's declared collation plays no part — the fifth
-// review's S1 (MODIFY left the hidden column on the old collation) and S2
-// (a literal under an INT column) are both "read and different".
+// target index's — the fifth review's S1 (MODIFY left the hidden column on
+// the old collation) and S2 (a literal under an INT column) are both "read
+// and different" — AND the columns it reads must agree with the target's
+// (sixth review F1: the value is computed under the target column's
+// collation), so an armed or unknown-collation column arms.
 //
 // Postgres/SQLite source: the column routes (armed column, a declared
 // collation other than the index's or none, a missing column; a non-string
@@ -179,10 +196,37 @@ func TestFunctionalPartArms_EachRoute(t *testing.T) {
 		{"mysql: hidden collation not read", part(true, "utf8mb4_0900_ai_ci"), mysqlSrc("", k(ci)), nil, true},
 		{"mysql: the source has no such key (a CDC projection)", part(true, "utf8mb4_0900_ai_ci"), src(k(ci)), nil, true},
 		{
-			"mysql: an armed column does not override a read-equal key", part(true, "utf8mb4_0900_ai_ci"),
+			// Sixth review F1: the key compares as the source's, but the
+			// value is computed under the target column's collation.
+			"mysql: an armed column arms a read-equal key", part(true, "utf8mb4_0900_ai_ci"),
 			mysqlSrc("utf8mb4_0900_ai_ci", k(ci)),
 			map[string]armedCollation{"k": {charset: "utf8mb4", collation: "utf8mb4_bin"}},
-			false,
+			true,
+		},
+		{
+			"mysql: source column collation unknown (a --type-override)", part(true, "utf8mb4_0900_ai_ci"),
+			mysqlSrc("utf8mb4_0900_ai_ci", k(ir.Varchar{Length: 20})), nil, true,
+		},
+		{
+			"mysql: the source lacks the column", part(true, "utf8mb4_0900_ai_ci"),
+			mysqlSrc("utf8mb4_0900_ai_ci", &ir.Column{Name: "other", Type: ci}), nil, true,
+		},
+		{
+			"mysql: read equal over an INT column", part(true, "utf8mb4_0900_ai_ci"),
+			mysqlSrc("utf8mb4_0900_ai_ci", k(ir.Integer{Width: 32})), nil, false,
+		},
+		{
+			// Sixth review F5: a MySQL collation carried without its charset
+			// (the pre-MYDUMPER-COLLATION-NO-CHARSET shape) is still the MySQL
+			// route, where the read-different hidden collation arms. Routed by
+			// charset presence it read as Postgres, and the column — named
+			// like the index — armed nothing.
+			"mysql: a charset-less MySQL collation, read different", part(true, "utf8mb4_0900_ai_ci"),
+			mysqlSrc("utf8mb4_bin", k(ir.Varchar{Length: 20, Collation: "utf8mb4_0900_ai_ci"})), nil, true,
+		},
+		{
+			"mysql: a charset-less MariaDB collation, read different", part(true, "utf8mb4_uca1400_ai_ci"),
+			mysqlSrc("utf8mb4_bin", k(ir.Varchar{Length: 20, Collation: "utf8mb4_uca1400_ai_ci"})), nil, true,
 		},
 		// Postgres/SQLite route.
 		{"postgres: armed column only", part(true, "utf8mb4_0900_ai_ci"), src(k(pgSameName)), map[string]armedCollation{"k": {bytes: true}}, true},
@@ -268,6 +312,8 @@ func TestPlanKeyCollationGuard_FunctionalParts(t *testing.T) {
 		// The "mysql _bin" and "F2" rows above read none, so they arm.
 		{"mysql to mysql, the source's own key (hidden collation read, equal)", tgtCI, tgtCI, lower(true, "utf8mb4_0900_ai_ci"), "", "utf8mb4_0900_ai_ci"},
 		{"mysql to mysql, hidden collation read, different (S1/S2)", tgtCI, tgtCI, lower(true, "utf8mb4_0900_ai_ci"), readTgt, "utf8mb4_bin"},
+		// Sixth review F1: the key is read equal, but the column diverges.
+		{"mysql to mysql, hidden collation read, equal, column diverges", srcBin, tgtCI, lower(true, "utf8mb4_0900_ai_ci"), readTgt, "utf8mb4_0900_ai_ci"},
 		{"mysql to mysql, index collation unknown", tgtCI, tgtCI, lower(false, ""), "((TRUE) AND NOT", ""},
 		{"mysql to mysql, unreadable part, hidden collation read, equal", tgtCI, tgtCI, md5(true, "utf8mb4_0900_ai_ci"), "", "utf8mb4_0900_ai_ci"},
 	} {

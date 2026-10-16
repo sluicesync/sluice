@@ -960,11 +960,37 @@ func (r *SchemaReader) populateHiddenCollations(ctx context.Context, tables map[
 			continue
 		}
 		for _, c := range parts {
-			if coll, known := hiddenCollationOf(hidden, indexOf[c], seqOf[c]); known {
+			if coll, known := hiddenCollationOf(hidden, indexOf[c], seqOf[c]); known && r.collationFitsExpression(ctx, t.Name, c.Expression, coll) {
 				c.HiddenCollation = coll
 			}
 		}
 	}
+}
+
+// collationFitsExpression reports whether coll belongs to the character set
+// the expression evaluates to on this server today — the precondition for
+// the writer's `((expr) COLLATE coll)` (sixth review, F2). An ALTER … MODIFY
+// that changes the column's CHARACTER SET leaves the hidden column on its
+// old one: `trim(k)` keyed over a `utf8mb3_general_ci` k still compares
+// under `utf8mb3_general_ci` after k moves to utf8mb4, and
+// `(trim(k)) COLLATE utf8mb3_general_ci` over the utf8mb4 value is ERROR
+// 1253 — MySQL does reject a COLLATE of another charset, at the index
+// build, after every row was copied. Such a part keeps the collation
+// unknown: the writer emits the bare expression and the guard arms it.
+//
+// CHARSET() is decided by the expression's types, not its values, so it is
+// evaluated over a NULL-extended row of the table (a LEFT JOIN that matches
+// nothing) and the comparison is the server's own, so the utf8/utf8mb3
+// spellings never disagree. Any error, or no answer, is "does not fit".
+func (r *SchemaReader) collationFitsExpression(ctx context.Context, table, expr, coll string) bool {
+	q := "SELECT CHARSET(" + expr + ") = (SELECT character_set_name FROM information_schema.collations " +
+		"WHERE collation_name = ?) FROM (SELECT 1) AS sluice_probe LEFT JOIN " +
+		quoteIdent(r.schema) + "." + quoteIdent(table) + " ON FALSE"
+	var fits sql.NullBool
+	if err := r.db.QueryRowContext(ctx, q, coll).Scan(&fits); err != nil {
+		return false
+	}
+	return fits.Valid && fits.Bool
 }
 
 // populateForeignKeys fills in ForeignKey lists for each table.

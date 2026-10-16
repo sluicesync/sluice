@@ -954,13 +954,21 @@ type IndexColumn struct {
 	// compares it against the target's hidden column instead of inferring
 	// the source's comparison from the column. Other writers ignore it.
 	//
-	// It is a re-emission and guard hint, not part of what the schema IS
-	// for the backup fingerprint: [ComputeSchemaHash] excludes it
-	// (fingerprintIndex), so a chain written before it existed still
-	// verifies, and an older binary reading a newer manifest drops it
-	// without a hash mismatch. migcore's index equality ignores it unless
-	// both sides carry it, so the first incremental after an upgrade does
-	// not read every functional key as redefined.
+	// Set only where it fits: the reader records it only when the
+	// collation belongs to the character set the expression evaluates to
+	// today. An ALTER … MODIFY that changed the column's CHARACTER SET
+	// leaves the hidden column on the old set, and `(expr) COLLATE <it>`
+	// over the new one is ERROR 1253 at the index build; such a part is
+	// "not known" instead.
+	//
+	// It decides how the key compares, so it is part of what the schema IS:
+	// the backup fingerprint folds it when set (an empty one marshals away,
+	// leaving every older fingerprint unchanged), and a manifest carrying
+	// it is stamped backup.FormatVersionHiddenCollation so older binaries,
+	// which would drop it, refuse the manifest instead. migcore's index
+	// equality and the schema diff compare it only when both sides carry
+	// it, so the first incremental after an upgrade does not read every
+	// functional key as redefined.
 	HiddenCollation string `json:",omitempty"`
 }
 

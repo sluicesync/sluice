@@ -850,6 +850,13 @@ func (b *Backup) buildInProgressManifest(schema *ir.Schema, prior *irbackup.Mani
 	if b.Now != nil {
 		now = b.Now
 	}
+	// A run resuming an encrypted attempt written below the injective-AAD
+	// tier keeps that tier for its kept chunks (setupChainEncryption), so it
+	// cannot carry a format-15 schema: it records its functional keys'
+	// hidden-column collations as not known ([irbackup.WithoutHiddenCollation]).
+	if prior != nil && prior.ChainEncryption != nil && prior.FormatVersion < irbackup.FormatVersionInjectiveChunkAAD {
+		schema = irbackup.WithoutHiddenCollation(schema)
+	}
 	// ADR-0152: fulls record the schema fingerprint too (incrementals
 	// always have), extending chain-restore's recompute-and-compare
 	// corruption check to the chain root.

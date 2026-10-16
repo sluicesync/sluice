@@ -9,6 +9,84 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 )
 
+// TestFormatVersionFor_HiddenCollation is the FormatVersionHiddenCollation
+// tier's proportionality, cell by cell (sixth review F3/F4): only a schema
+// or delta that CARRIES a functional key's hidden-column collation moves
+// to 15; an expression key without one, a plain key, and every other tier's
+// trigger keep their version. The reverse door: a manifest below 15 that
+// carries the field refuses, one at 15 or with nothing carried does not.
+func TestFormatVersionFor_HiddenCollation(t *testing.T) {
+	table := func(name, hidden string) *ir.Table {
+		return &ir.Table{
+			Name:       name,
+			PrimaryKey: &ir.Index{Name: "PRIMARY", Unique: true, Columns: []ir.IndexColumn{{Column: "id"}}},
+			Indexes: []*ir.Index{{Name: "fk", Unique: true, Columns: []ir.IndexColumn{
+				{Expression: "lower(k)", ExpressionDialect: "mysql", HiddenCollation: hidden},
+			}}},
+		}
+	}
+	for _, tc := range []struct {
+		name   string
+		schema *ir.Schema
+		want   int
+	}{
+		{"functional key, hidden collation read", &ir.Schema{Tables: []*ir.Table{table("a", ""), table("b", "utf8mb4_bin")}}, FormatVersionHiddenCollation},
+		{"functional key, hidden collation not read", &ir.Schema{Tables: []*ir.Table{table("a", "")}}, FormatVersionLegacy},
+		{"with sequences too: the higher tier wins", &ir.Schema{Tables: []*ir.Table{table("a", "utf8mb4_bin")}, Sequences: []*ir.Sequence{{Name: "s"}}}, FormatVersionHiddenCollation},
+		{"sequences, no hidden collation", &ir.Schema{Tables: []*ir.Table{table("a", "")}, Sequences: []*ir.Sequence{{Name: "s"}}}, FormatVersionStandaloneSequences},
+		{"on the primary key", &ir.Schema{Tables: []*ir.Table{{Name: "p", PrimaryKey: &ir.Index{Name: "PRIMARY", Columns: []ir.IndexColumn{{Expression: "lower(k)", HiddenCollation: "latin1_bin"}}}}}}, FormatVersionHiddenCollation},
+	} {
+		if got := FormatVersionFor(tc.schema); got != tc.want {
+			t.Errorf("%s: FormatVersionFor = %d; want %d", tc.name, got, tc.want)
+		}
+	}
+
+	// The CDC segment's stamp: a delta side or the swapped-in schema.
+	for _, tc := range []struct {
+		name string
+		m    *Manifest
+		want int
+	}{
+		{"incremental, nothing carried", &Manifest{Kind: BackupKindIncremental, FormatVersion: 9, Schema: &ir.Schema{Tables: []*ir.Table{table("a", "")}}}, 9},
+		{"incremental, schema carries", &Manifest{Kind: BackupKindIncremental, FormatVersion: 9, Schema: &ir.Schema{Tables: []*ir.Table{table("a", "utf8mb4_bin")}}}, FormatVersionHiddenCollation},
+		{"incremental, delta after carries", &Manifest{Kind: BackupKindIncremental, FormatVersion: 1, SchemaDelta: []*SchemaDeltaEntry{{Kind: SchemaDeltaAlterTable, Table: "a", Before: table("a", ""), After: table("a", "utf8mb4_bin")}}}, FormatVersionHiddenCollation},
+		{"incremental, delta before carries", &Manifest{Kind: BackupKindIncremental, FormatVersion: 1, SchemaDelta: []*SchemaDeltaEntry{{Kind: SchemaDeltaAlterTable, Table: "a", Before: table("a", "utf8mb4_bin"), After: table("a", "")}}}, FormatVersionHiddenCollation},
+		{"full, schema carries", &Manifest{Kind: BackupKindFull, FormatVersion: 1, Schema: &ir.Schema{Tables: []*ir.Table{table("a", "utf8mb4_bin")}}}, FormatVersionHiddenCollation},
+		{"nil manifest", nil, 0},
+	} {
+		StampHiddenCollation(tc.m)
+		got := 0
+		if tc.m != nil {
+			got = tc.m.FormatVersion
+		}
+		if got != tc.want {
+			t.Errorf("%s: StampHiddenCollation → %d; want %d", tc.name, got, tc.want)
+		}
+	}
+
+	carrying := &Manifest{Kind: BackupKindFull, Schema: &ir.Schema{Tables: []*ir.Table{table("a", "utf8mb4_bin")}}}
+	for fv, wantErr := range map[int]bool{1: true, 9: true, FormatVersionKeyCollationUnestablished: true, FormatVersionHiddenCollation: false} {
+		carrying.FormatVersion = fv
+		if err := RefuseUnstampedHiddenCollation(carrying); (err != nil) != wantErr {
+			t.Errorf("format %d carrying the field: err %v; want refused %v", fv, err, wantErr)
+		}
+	}
+	plain := &Manifest{Kind: BackupKindFull, FormatVersion: 1, Schema: &ir.Schema{Tables: []*ir.Table{table("a", "")}}}
+	if err := RefuseUnstampedHiddenCollation(plain); err != nil {
+		t.Errorf("an unstamped manifest carrying nothing refused: %v", err)
+	}
+
+	// WithoutHiddenCollation clears every one and mutates nothing.
+	s := &ir.Schema{Tables: []*ir.Table{table("a", "utf8mb4_bin"), table("b", "")}}
+	cleared := WithoutHiddenCollation(s)
+	if FormatVersionFor(cleared) != FormatVersionLegacy || s.Tables[0].Indexes[0].Columns[0].HiddenCollation != "utf8mb4_bin" {
+		t.Errorf("WithoutHiddenCollation: cleared → %d, caller's %q", FormatVersionFor(cleared), s.Tables[0].Indexes[0].Columns[0].HiddenCollation)
+	}
+	if cleared.Tables[1] != s.Tables[1] {
+		t.Error("WithoutHiddenCollation copied a table that carried nothing")
+	}
+}
+
 // TestChooseFormatVersion_Bug116 pins the v0.94.1 Bug 116 closure:
 // manifests whose schema carries security-relevant fields older
 // binaries would silently drop (RLS, RLSForced, Policies, EXCLUDE
@@ -147,9 +225,15 @@ func TestChooseFormatVersion_Bug116(t *testing.T) {
 // chunk-binding contracts, this test catches the regression at build
 // time.
 func TestBackupFormatVersion_Bumped(t *testing.T) {
-	if BackupFormatVersion != FormatVersionKeyCollationUnestablished {
-		t.Errorf("BackupFormatVersion = %d; want FormatVersionKeyCollationUnestablished=%d (current ceiling)",
-			BackupFormatVersion, FormatVersionKeyCollationUnestablished)
+	if BackupFormatVersion != FormatVersionHiddenCollation {
+		t.Errorf("BackupFormatVersion = %d; want FormatVersionHiddenCollation=%d (current ceiling)",
+			BackupFormatVersion, FormatVersionHiddenCollation)
+	}
+	// Above the key-collation-unestablished tier: a 15-stamped manifest
+	// keeps every lower `>=` fold, and none changes between 9 and 15.
+	if FormatVersionHiddenCollation <= FormatVersionKeyCollationUnestablished {
+		t.Errorf("FormatVersionHiddenCollation (%d) must be strictly greater than FormatVersionKeyCollationUnestablished (%d)",
+			FormatVersionHiddenCollation, FormatVersionKeyCollationUnestablished)
 	}
 	// Above the key-collation-delta tier, for the same reason: a 14-stamped
 	// segment keeps every lower `>=` fold, and none changes between 9 and 14.

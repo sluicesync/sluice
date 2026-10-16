@@ -2348,8 +2348,15 @@ func translateIndexExpr(c ir.IndexColumn, backslashEscapes bool) string {
 // differently from the source's and merged rows the source kept apart
 // (measured on MySQL 8.4). Pinning it makes the target key compare exactly
 // as the source's. Only a same-dialect part carries one (the MySQL reader
-// is its only producer), and only a collated string does, so the COLLATE is
-// always over a string of that collation's own character set.
+// is its only producer), only a collated string does, and the reader
+// records it only when it belongs to the character set the expression
+// evaluates to on the source ([SchemaReader.collationFitsExpression]):
+// MySQL DOES reject a COLLATE of another charset (ERROR 1253), and an
+// ALTER … MODIFY that changed the column's charset leaves the hidden
+// column on the old one (sixth review, F2). A target whose column charset
+// differs from the source's — a --type-override that changes it — can
+// still meet the 1253, loudly, at the index build (the named residual
+// FUNCTIONAL-HIDDEN-COLLATION-TARGET-CHARSET).
 func functionalPartExpr(c ir.IndexColumn, backslashEscapes bool) string {
 	body := translateIndexExpr(c, backslashEscapes)
 	if c.HiddenCollation == "" || c.ExpressionDialect != dialectName {

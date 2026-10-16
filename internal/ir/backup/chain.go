@@ -360,23 +360,17 @@ func fingerprintIndex(in *ir.Index) *ir.Index {
 	}
 	out := *in
 	out.ConstraintNamed = false
-	// HiddenCollation (FUNCTIONAL-CAST-HIDDEN-COLLATION) is a re-emission
-	// and guard hint: excluded so the fingerprint stays byte-identical to
-	// what every binary before it hashed (answer 3 of the golden test), in
-	// both directions — an old chain verifies here, and a new manifest
-	// verifies on an older binary that drops the field. The cost is tamper
-	// detection of that one field.
-	for _, c := range in.Columns {
-		if c.HiddenCollation == "" {
-			continue
-		}
-		out.Columns = make([]ir.IndexColumn, len(in.Columns))
-		copy(out.Columns, in.Columns)
-		for i := range out.Columns {
-			out.Columns[i].HiddenCollation = ""
-		}
-		break
-	}
+	// [ir.IndexColumn.HiddenCollation] (FUNCTIONAL-CAST-HIDDEN-COLLATION)
+	// is NOT excluded, and needs no line here: it decides how a functional
+	// key compares, so it is part of what the schema IS, and an edit to it
+	// must move the fingerprint. Empty — every schema written before it
+	// existed, and every one without a MySQL functional key — it marshals
+	// away under `omitempty`, so those fingerprints are byte-identical to
+	// what older binaries hashed (the golden test pins that). Set, the
+	// fingerprint moves, and that is safe only because a manifest carrying
+	// the field is stamped [FormatVersionHiddenCollation], which every older
+	// binary refuses at its ceiling before it could recompute a hash that
+	// drops the field (sixth review, F3/F4).
 	return &out
 }
 

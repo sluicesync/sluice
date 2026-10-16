@@ -272,7 +272,11 @@ import (
 // SchemaHistory records a KEY column whose collation the change stream
 // could not establish for its rows — see
 // [FormatVersionKeyCollationUnestablished].
-const BackupFormatVersion = 14
+//
+// v0.161.0 introduces FormatVersion=15 for a manifest whose schema or
+// schema delta carries a MySQL functional key part's hidden-column
+// collation — see [FormatVersionHiddenCollation].
+const BackupFormatVersion = 15
 
 // FormatVersionLegacy / FormatVersionSecurityMetadata name the
 // historically-recorded values so callers don't sprinkle bare ints
@@ -550,6 +554,47 @@ const (
 	// at 9 or above before its first chunk, and a plaintext chunk has no
 	// AAD).
 	FormatVersionKeyCollationUnestablished = 14
+
+	// FormatVersionHiddenCollation marks a manifest — full or CDC segment —
+	// whose recorded schema or schema delta carries a MySQL functional key
+	// part's hidden-column collation ([ir.IndexColumn.HiddenCollation];
+	// FUNCTIONAL-CAST-HIDDEN-COLLATION). The field decides how the key
+	// compares: a charset-less CAST or a literal takes the creating
+	// session's collation and an ALTER … MODIFY leaves the hidden column on
+	// its old one, so the expression text alone rebuilds a key that merges
+	// rows the source keeps apart. This binary's writer pins it and its
+	// guard compares by it, and [ComputeSchemaHash] folds it (non-empty
+	// only, so no older fingerprint moves).
+	//
+	// The bump exists because of the fold. An older binary decodes the
+	// manifest, drops the unknown field, and recomputes a fingerprint that
+	// cannot match the recorded one — a chain restore refusing "fingerprint
+	// mismatch" on an intact chain at best, and at worst (an unsigned
+	// manifest, a path that does not recompute) a restore that rebuilds the
+	// key from the text and merges at exit 0. Stamped above every older
+	// ceiling, the manifest is refused at [lineage.ReadManifest]'s version
+	// check by any pre-v0.161.0 reader instead. And the reverse door: a
+	// manifest recorded BELOW this version that carries the field was not
+	// written by any binary — no writer produces that shape — so a reader
+	// refuses it rather than honour an injected comparison
+	// ([RefuseUnstampedHiddenCollation]).
+	//
+	// Proportional: stamped by [FormatVersionFor] on a schema that carries
+	// the field and by [StampHiddenCollation] on a segment whose delta or
+	// refreshed schema does; every manifest without a MySQL functional key
+	// read on vanilla MySQL keeps its previous version. SchemaHistory is not
+	// consulted: the change streams record no secondary indexes, and the
+	// history is folded raw into a signature rather than fingerprinted.
+	//
+	// Above the key-collation tiers so a 15-stamped manifest keeps every
+	// lower `>=` fold; none changes between 9 and 15, so raising a CDC
+	// segment to 15 after its chunks sealed changes no AAD encoding. A FULL
+	// is stamped when its manifest is built, before any chunk — except a run
+	// RESUMING an encrypted pre-v9 attempt, whose kept chunks pin its tier:
+	// that run records the schema without the field
+	// ([WithoutHiddenCollation]), leaving those keys "not known", which the
+	// writer emits bare and the guard arms.
+	FormatVersionHiddenCollation = 15
 )
 
 // StampKeyCollationUnestablished raises m.FormatVersion to
@@ -684,6 +729,11 @@ func chooseFormatVersion(s *ir.Schema) int {
 	if s == nil {
 		return FormatVersionLegacy
 	}
+	// A functional key's hidden-column collation gates the highest tier
+	// ([FormatVersionHiddenCollation]), so it wins over everything below.
+	if schemaCarriesHiddenCollation(s) {
+		return FormatVersionHiddenCollation
+	}
 	// Standalone sequences gate the highest tier, so they win over
 	// the table-level security fields below.
 	if len(s.Sequences) > 0 {
@@ -734,6 +784,10 @@ var minimumReaderVersion = map[int]string{
 	// backup format break); a release cut under another name corrects it
 	// here and in docs/backup-format-versioning.md.
 	FormatVersionKeyCollationUnestablished: "v0.160.0",
+	// ASSUMES the tier ships in the next minor, v0.161.0 (a backup format
+	// break); a release cut under another name corrects it here and in
+	// docs/backup-format-versioning.md.
+	FormatVersionHiddenCollation: "v0.161.0",
 }
 
 // MinimumReaderVersion names the earliest sluice release that can read a

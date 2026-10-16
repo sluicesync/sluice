@@ -153,6 +153,11 @@ func ReadManifestAt(ctx context.Context, store irbackup.Store, path string) (*ir
 		return nil, fmt.Errorf("manifest %q format version %d is newer than this build supports (%d); upgrade sluice",
 			path, m.FormatVersion, irbackup.BackupFormatVersion)
 	}
+	// Before the replay, whose normalization re-derives the version from
+	// the schema and would stamp an injected field into legitimacy.
+	if err := irbackup.RefuseUnstampedHiddenCollation(m); err != nil {
+		return nil, fmt.Errorf("manifest %q: %w", path, err)
+	}
 	if err := replayManifestProgress(ctx, store, m); err != nil {
 		return nil, err
 	}
@@ -216,6 +221,10 @@ func ReadManifest(ctx context.Context, store irbackup.Store) (*irbackup.Manifest
 	if m.FormatVersion > irbackup.BackupFormatVersion {
 		return nil, fmt.Errorf("backup: manifest format version %d is newer than this build supports (%d); upgrade sluice",
 			m.FormatVersion, irbackup.BackupFormatVersion)
+	}
+	// Before the replay — see [ReadManifestAt].
+	if err := irbackup.RefuseUnstampedHiddenCollation(&m); err != nil {
+		return nil, err
 	}
 	if err := replayManifestProgress(ctx, store, &m); err != nil {
 		return nil, err

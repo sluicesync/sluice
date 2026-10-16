@@ -299,6 +299,11 @@ git worktree add --detach "$peer_worktree" "$peer_tag" >/dev/null
 # has neither `decodingXid` in the Postgres CDC reader nor the guard's
 # Unknown arm) — its own chain merges, which is the premise cell's harm.
 #
+# The hidden-collation tier (15, FUNCTIONAL-CAST-HIDDEN-COLLATION) needs no
+# symbol either: the reader of a functional key's hidden-column collation,
+# the writer's pin and the fingerprint fold all landed with the tier, so
+# every tag below 15 (v0.160.4 today) rebuilds such a key from its text.
+#
 # read_tier NAME — the value of a FormatVersion constant in manifest.go.
 read_tier() {
 	sed -n "s/^[[:space:]]*$1 *= *\([0-9][0-9]*\).*/\1/p" "$manifest_file" | head -1
@@ -321,7 +326,7 @@ below_tag() {
 	return 1
 }
 
-tier_suites="POSITIONLESS:FormatVersionPositionlessFull EXACT_NUMBERS:FormatVersionExactNumbers KEY_COLLATION:FormatVersionKeyCollationDelta:AlterAspectColumnCollation@internal/pipeline/migcore/incremental_delta_shape.go KEY_UNESTABLISHED:FormatVersionKeyCollationUnestablished"
+tier_suites="POSITIONLESS:FormatVersionPositionlessFull EXACT_NUMBERS:FormatVersionExactNumbers KEY_COLLATION:FormatVersionKeyCollationDelta:AlterAspectColumnCollation@internal/pipeline/migcore/incremental_delta_shape.go KEY_UNESTABLISHED:FormatVersionKeyCollationUnestablished HIDDEN_COLLATION:FormatVersionHiddenCollation"
 tier_lines=
 for entry in $tier_suites; do
 	name=${entry%%:*}

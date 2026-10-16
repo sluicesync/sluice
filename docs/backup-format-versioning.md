@@ -223,6 +223,31 @@ Every backup chain root manifest carries a `FormatVersion` field:
   non-key nondeterministic column altered inside the window stamps too —
   a loud refusal on an older binary, never a merge). Only a v0.160.0+
   reader writes the shape, so no older chain needs re-stamping.
+- **`FormatVersion=15`** — a **functional-key hidden collation**
+  manifest (`v0.161.0+`, FUNCTIONAL-CAST-HIDDEN-COLLATION): a full or
+  segment whose recorded schema or schema delta carries the collation a
+  MySQL functional key part's hidden column compares under
+  (`HiddenCollation` on the index entry). The expression text does not
+  decide it — a `CAST` with no character set or a string literal takes
+  the creating session's collation, and an `ALTER … MODIFY` of the column
+  leaves the hidden column on its old one — so a key rebuilt from the
+  text alone merges rows the source keeps apart. This binary reads it on
+  vanilla MySQL, pins it on the target, compares by it in the
+  key-collation guard, and folds it into the schema fingerprint. An older
+  binary would drop it, fail to reproduce the fingerprint, and at worst
+  rebuild the key from the text; the bump makes it refuse at its own
+  ceiling instead. The reverse door is closed too: a manifest recorded
+  *below* 15 that carries the field is refused on read, since no binary
+  writes that shape. Proportional: a schema with no MySQL functional key,
+  one read through vtgate (which does not serve the hidden column), and
+  every Postgres, SQLite and trigger-CDC backup keep their previous
+  version, and an empty field leaves every older fingerprint unchanged. A
+  chain begun before v0.161.0 stays at its version until a window's schema
+  delta swaps in a freshly read schema; a full resuming an encrypted
+  attempt written below version 9 records the field as not known rather
+  than strand its sealed chunks. Residual: a functional key's hidden
+  collation changed and changed back inside one window leaves equal ends
+  and is not seen (FUNCTIONAL-HIDDEN-COLLATION-WINDOW-REVERT).
 
 If your backups don't use RLS, EXCLUDE constraints, or standalone
 sequences, you don't encrypt, sign or redact, and your source records a
@@ -230,7 +255,8 @@ CDC position (or has no CDC at all), no `postgres-trigger` change
 segment of yours carries a non-integer number, no backup window of
 yours changes a key column's collation, and no Postgres backup window
 of yours alters a nondeterministic key column after writing rows to
-it, you'll never see a version
+it, and no vanilla-MySQL source of yours has a collated functional key
+part, you'll never see a version
 above 1 on a finalized manifest and cross-version restore behaves
 exactly as it did pre-v0.94.1. If your backups *do* use any of them,
 you get the guarantee that older sluice can't silently land a restored

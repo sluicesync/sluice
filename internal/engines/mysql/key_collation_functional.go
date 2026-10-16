@@ -689,8 +689,11 @@ func (k *targetUniqueKeys) markFunctionalArming(source *ir.Table, armed map[stri
 // For a MySQL-family source the source's comparison is READ, not inferred
 // (FUNCTIONAL-CAST-HIDDEN-COLLATION, the class fix): the MySQL reader
 // records each functional part's hidden-column collation on the source IR
-// ([ir.IndexColumn.HiddenCollation]), and the part arms exactly when that
-// is unknown or differs from the target index's. Five review rounds each
+// ([ir.IndexColumn.HiddenCollation]), and the part arms when that is
+// unknown or differs from the target index's — or when a column it reads
+// does not compare on the target as on the source, since the VALUE is
+// computed under the target column's collation ([functionalColumnsArm];
+// sixth review F1). Five review rounds each
 // found another shape where inferring the source key's comparison from its
 // columns' declared collation was wrong and silent: a CAST takes the
 // creating session's collation (a CAST with an explicit CHARACTER SET takes
@@ -738,8 +741,35 @@ func functionalPartArms(f *functionalKeyPart, source *ir.Table, armed map[string
 		if mapped, ok := compareAs[coll]; ok {
 			coll = mapped
 		}
-		return !strings.EqualFold(coll, f.collation)
+		if !strings.EqualFold(coll, f.collation) {
+			return true
+		}
+		// Sixth review, F1: an equal hidden collation fixes how the key
+		// COMPARES its value, not how the value is COMPUTED. The expression
+		// evaluates over the target's columns under the target column's
+		// collation — `k = 'a'`, FIELD, LOCATE, NULLIF, CASE, the case tables
+		// of LOWER/UPPER — so `if(k = 'a', 'same', k)` over a source
+		// `utf8mb4_bin` k and a target `utf8mb4_0900_ai_ci` k computes 'same'
+		// for 'A' on the target alone, and the pinned `_bin` key merged
+		// (2,'A') onto (1,'a') at exit 0 (measured). So the columns are
+		// compared too: one whose collation the target does not share, or
+		// whose source collation is not known, arms.
+		return functionalColumnsArm(f, source, armed, nil)
 	}
+	return functionalColumnsArm(f, source, armed, compareAs)
+}
+
+// functionalColumnsArm reports whether a column a functional part reads puts
+// its key under the guard: a column the plan already armed (its source
+// collation is one the target column does not share), a column the source
+// does not have, or a string column whose source collation is not known. A
+// non-string column (INT, JSON) brings no collation and arms nothing (fourth
+// review, finding 3).
+//
+// With compareAs non-nil — the Postgres/SQLite route, which has no hidden
+// column to read — the column's own collation must also BE the index's,
+// since nothing else says what the source compares the value under.
+func functionalColumnsArm(f *functionalKeyPart, source *ir.Table, armed map[string]armedCollation, compareAs map[string]string) bool {
 	srcCols := make(map[string]*ir.Column, len(source.Columns))
 	for _, c := range source.Columns {
 		if c != nil {
@@ -759,14 +789,20 @@ func functionalPartArms(f *functionalKeyPart, source *ir.Table, armed map[string
 			return true
 		}
 		if !isStringType(c.Type) {
-			continue // fourth review, finding 3: an INT or JSON column brings no collation
+			continue
 		}
 		_, coll := translate.ColumnCollation(c.Type)
+		if coll == "" {
+			return true
+		}
+		if compareAs == nil {
+			continue
+		}
 		coll = strings.ToLower(coll)
 		if mapped, ok := compareAs[coll]; ok {
 			coll = mapped
 		}
-		if coll == "" || !strings.EqualFold(coll, f.collation) {
+		if !strings.EqualFold(coll, f.collation) {
 			return true
 		}
 	}
@@ -774,10 +810,19 @@ func functionalPartArms(f *functionalKeyPart, source *ir.Table, armed map[string
 }
 
 // sourceIsNonMySQL reports positive evidence that the source shape is not a
-// MySQL-family table: a string column carrying a Postgres- or SQLite-dialect
-// collation, or a stamped Postgres collation determinism. Without that
+// MySQL-family table: a string column carrying a collation no MySQL-family
+// server names, or a stamped Postgres collation determinism. Without that
 // evidence the source is treated as MySQL-family, whose functional parts
-// compare by their read hidden collation or — unknown — arm.
+// compare by their read hidden collation and their columns, or — unknown —
+// arm. That route arms wherever the column-only route does, so a wrong
+// "MySQL" answer costs only refusals.
+//
+// The test is the collation NAME, not [translate.CollationDialect]'s
+// charset-presence rule (sixth review, F5): a MySQL collation carried
+// without its charset — the shape the mydumper reader produced before
+// MYDUMPER-COLLATION-NO-CHARSET, which an old backup manifest still carries
+// — reads as Postgres there, and routed the part onto the column-only
+// comparison, which ignores the source's hidden column.
 func sourceIsNonMySQL(source *ir.Table) bool {
 	for _, c := range source.Columns {
 		if c == nil || !isStringType(c.Type) {
@@ -786,11 +831,28 @@ func sourceIsNonMySQL(source *ir.Table) bool {
 		if collationDeterminismOf(c.Type) != ir.CollationDeterminismUnknown {
 			return true
 		}
-		if cs, coll := translate.ColumnCollation(c.Type); coll != "" && translate.CollationDialect(cs, coll) != "mysql" {
+		if _, coll := translate.ColumnCollation(c.Type); coll != "" && !mysqlCollationName(coll) {
 			return true
 		}
 	}
 	return false
+}
+
+// mysqlCollationName reports whether name is a MySQL- or MariaDB-family
+// collation: one Vitess's MySQL 8 collation environment knows, or one whose
+// leading word is a MySQL character set (MariaDB's `utf8mb4_uca1400_ai_ci`,
+// which that environment does not carry). Postgres's "C", "POSIX",
+// "en_US.utf8" and ICU's "und-x-icu" are none of these.
+func mysqlCollationName(name string) bool {
+	if charsetForCollationName(name) != "" {
+		return true
+	}
+	cs, _, found := strings.Cut(strings.ToLower(name), "_")
+	if cs == "utf8" {
+		cs = "utf8mb3"
+	}
+	_, known := charsetMaxBytes[cs]
+	return found && known
 }
 
 // sourceFunctionalPart is the source's own functional part matching f — the

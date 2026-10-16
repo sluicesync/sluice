@@ -1429,16 +1429,34 @@ func indexDisplayName(key string, idx *ir.Index) string {
 // hidden collation is stripped first — `(lower(k) collate h)` with hidden h
 // and `lower(k)` with hidden h are the same key, and a migrate-created
 // target must not read as drifted from its source.
-func renderIndexColumns(idx *ir.Index, withHidden bool) string {
+//
+// peer is the index on the other side of the comparison (nil: none). The
+// hidden collation renders only for a part BOTH sides record one for — the
+// rule migcore's index equality applies (sixth review, F6): a side read
+// where the hidden column is not served (vtgate) or recorded before the
+// field existed (an older manifest) is not evidence of a different
+// comparison, and rendering it one-sided read every such key as drifted.
+// A side that records none still has the pinning wrapper stripped under
+// the peer's collation, so the writer's `(expr) COLLATE h` read back
+// through vtgate matches the source's bare `expr`.
+func renderIndexColumns(idx, peer *ir.Index, withHidden bool) string {
 	if idx == nil || len(idx.Columns) == 0 {
 		return ""
 	}
 	parts := make([]string, 0, len(idx.Columns))
-	for _, c := range idx.Columns {
+	for i, c := range idx.Columns {
+		var peerHidden string
+		if peer != nil && i < len(peer.Columns) {
+			peerHidden = peer.Columns[i].HiddenCollation
+		}
 		var seg string
 		switch {
 		case c.Expression != "":
-			seg = "(" + stripOuterCollate(c.Expression, c.HiddenCollation) + ")"
+			strip := c.HiddenCollation
+			if strip == "" {
+				strip = peerHidden
+			}
+			seg = "(" + stripOuterCollate(c.Expression, strip) + ")"
 		default:
 			seg = c.Column
 			if c.Length > 0 {
@@ -1452,7 +1470,7 @@ func renderIndexColumns(idx *ir.Index, withHidden bool) string {
 		if c.Collation != "" {
 			seg += " COLLATE " + c.Collation
 		}
-		if withHidden && c.HiddenCollation != "" {
+		if withHidden && c.HiddenCollation != "" && peerHidden != "" {
 			seg += " COLLATE " + c.HiddenCollation
 		}
 		if c.Desc {
@@ -1529,7 +1547,7 @@ func diffIndexDefinitions(td *TableDiff, expIdx, actIdx map[string]*ir.Index, wi
 		d := IndexDiff{Name: indexDisplayName(key, exp)}
 		mismatched := false
 
-		if ec, ac := renderIndexColumns(exp, withHidden), renderIndexColumns(act, withHidden); ec != ac {
+		if ec, ac := renderIndexColumns(exp, act, withHidden), renderIndexColumns(act, exp, withHidden); ec != ac {
 			d.ExpectedColumns, d.ActualColumns = ec, ac
 			mismatched = true
 		}

@@ -68,6 +68,10 @@ import (
 // the proof: the summary phrase the comparison must produce, and the
 // nested-diff slot the field's own comparator must populate.
 type containedFieldProbe struct {
+	// prepare, when set, runs on BOTH sides before mutate — for a field
+	// compared only when both sides carry it (HiddenCollation), so the
+	// probe mutates a value the expected side also holds.
+	prepare       func(s *ir.Schema)
 	mutate        func(actual *ir.Schema)
 	wantInSummary string
 
@@ -409,7 +413,12 @@ var indexColumnFieldProbes = map[string]containedFieldProbe{
 	"HiddenCollation": {
 		// FUNCTIONAL-CAST-HIDDEN-COLLATION, the same class as Collation: a
 		// MySQL functional key part's hidden-column collation decides which
-		// values count as equal, and the expression text does not.
+		// values count as equal, and the expression text does not. Compared
+		// only when both sides carry it (sixth review F6), so both start
+		// with one and the actual side's changes.
+		prepare: func(s *ir.Schema) {
+			s.Tables[0].Indexes[0].Columns[0].HiddenCollation = "utf8mb4_0900_ai_ci"
+		},
 		mutate: func(s *ir.Schema) {
 			s.Tables[0].Indexes[0].Columns[0].HiddenCollation = "utf8mb4_bin"
 		},
@@ -863,8 +872,12 @@ func assertContainedRosterCovers(t *testing.T, typ reflect.Type, probes map[stri
 		t.Run(name, func(t *testing.T) {
 			expected := rosterBaseline()
 			actual := rosterBaseline()
+			if p.prepare != nil {
+				p.prepare(expected)
+				p.prepare(actual)
+			}
 
-			if got := Schemas(expected, rosterBaseline(), Options{}); got.HasChanges() {
+			if got := Schemas(expected, actual, Options{}); got.HasChanges() {
 				t.Fatalf("baseline compares UNEQUAL to itself (%s) — the probe result would be meaningless", got.Summary())
 			}
 

@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/crypto"
+	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
@@ -91,6 +92,68 @@ func TestSetupChainEncryption_SignedTableBindingStamp(t *testing.T) {
 			t.Errorf("resumed run recovered a different chain CEK")
 		}
 	})
+}
+
+// TestBuildInProgressManifest_HiddenCollationOnAResumedPreV9Run pins the
+// one full that cannot stamp FormatVersionHiddenCollation: a run resuming
+// an encrypted attempt written below the injective-AAD tier keeps that
+// tier for its kept chunks, so it records the schema WITHOUT the
+// functional key's hidden-column collation — a 15 stamp would send restore
+// down an AAD encoding those chunks were not sealed under, and an unstamped
+// carrier is refused on read. A fresh run, and a resumed v9+ one, carry it
+// at 15.
+func TestBuildInProgressManifest_HiddenCollationOnAResumedPreV9Run(t *testing.T) {
+	schema := func() *ir.Schema {
+		return &ir.Schema{Tables: []*ir.Table{{
+			Name:       "kd",
+			Columns:    []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
+			PrimaryKey: &ir.Index{Name: "PRIMARY", Unique: true, Columns: []ir.IndexColumn{{Column: "id"}}},
+			Indexes: []*ir.Index{{Name: "fk", Unique: true, Columns: []ir.IndexColumn{
+				{Expression: "lower(k)", ExpressionDialect: "mysql", HiddenCollation: "utf8mb4_bin"},
+			}}},
+		}}}
+	}
+	for _, tc := range []struct {
+		name        string
+		priorFV     int // 0: a fresh run
+		wantFV      int
+		wantCarries bool
+	}{
+		{"fresh encrypted run", 0, irbackup.FormatVersionHiddenCollation, true},
+		{"resuming a v7 encrypted attempt", irbackup.FormatVersionChunkTableBinding, irbackup.FormatVersionChunkTableBinding, false},
+		{"resuming a v6 encrypted attempt", irbackup.FormatVersionSignedManifest, irbackup.FormatVersionEncryptedChunkBinding, false},
+		{"resuming a v9 encrypted attempt", irbackup.FormatVersionInjectiveChunkAAD, irbackup.FormatVersionHiddenCollation, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			enc := stampTestEncryption(t)
+			var prior *irbackup.Manifest
+			if tc.priorFV != 0 {
+				prior, _ = priorChainAtVersion(t, enc, tc.priorFV)
+			}
+			b := &Backup{Source: stubEngine{}, SourceDSN: "dsn", Encryption: enc}
+			s := schema()
+			m, err := b.buildInProgressManifest(s, prior, false, ir.Position{}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := b.setupChainEncryption(m, prior); err != nil {
+				t.Fatalf("setupChainEncryption: %v", err)
+			}
+			if m.FormatVersion != tc.wantFV || irbackup.ManifestCarriesHiddenCollation(m) != tc.wantCarries {
+				t.Errorf("FormatVersion %d, carries %v; want %d, %v", m.FormatVersion,
+					irbackup.ManifestCarriesHiddenCollation(m), tc.wantFV, tc.wantCarries)
+			}
+			if err := irbackup.RefuseUnstampedHiddenCollation(m); err != nil {
+				t.Errorf("this binary would refuse its own manifest: %v", err)
+			}
+			if got, _ := irbackup.ComputeSchemaHash(m.Schema); got != m.SchemaHash {
+				t.Errorf("the recorded fingerprint is not the recorded schema's")
+			}
+			if s.Tables[0].Indexes[0].Columns[0].HiddenCollation == "" {
+				t.Error("the caller's schema was mutated")
+			}
+		})
+	}
 }
 
 func stampTestEncryption(t *testing.T) *lineage.BackupEncryption {

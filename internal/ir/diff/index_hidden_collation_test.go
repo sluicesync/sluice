@@ -32,19 +32,35 @@ func TestStripOuterCollate(t *testing.T) {
 // TestRenderIndexColumns_HiddenCollation: the source key and the target key
 // the writer rebuilt with its pinning wrapper render alike; a target whose
 // hidden collation differs (a stale key) renders differently; cross-family
-// (withHidden false) the hidden collation stays out.
+// (withHidden false) the hidden collation stays out; and (sixth review F6)
+// a pair where only ONE side records the hidden collation — a vtgate read,
+// a manifest from before the field — is not drift, the pinned wrapper
+// included.
 func TestRenderIndexColumns_HiddenCollation(t *testing.T) {
 	part := func(expr, hidden string) *ir.Index {
 		return &ir.Index{Name: "fk", Unique: true, Columns: []ir.IndexColumn{{Expression: expr, HiddenCollation: hidden}}}
 	}
-	src := renderIndexColumns(part("lower(k)", "utf8mb4_bin"), true)
-	if tgt := renderIndexColumns(part("(lower(k) collate utf8mb4_bin)", "utf8mb4_bin"), true); tgt != src {
-		t.Errorf("the writer's pinned key renders %q; the source %q", tgt, src)
+	differ := func(exp, act *ir.Index, withHidden bool) bool {
+		return renderIndexColumns(exp, act, withHidden) != renderIndexColumns(act, exp, withHidden)
 	}
-	if stale := renderIndexColumns(part("lower(k)", "utf8mb4_0900_ai_ci"), true); stale == src {
-		t.Errorf("a stale key under another hidden collation renders like the source: %q", stale)
-	}
-	if got := renderIndexColumns(part("lower(k)", "utf8mb4_bin"), false); got != "((lower(k)))" {
-		t.Errorf("cross-family render %q carries the hidden collation", got)
+	src := part("lower(k)", "utf8mb4_bin")
+	for _, tc := range []struct {
+		name       string
+		exp, act   *ir.Index
+		withHidden bool
+		want       bool
+	}{
+		{"the writer's pinned key", src, part("(lower(k) collate utf8mb4_bin)", "utf8mb4_bin"), true, false},
+		{"a stale key under another hidden collation", src, part("lower(k)", "utf8mb4_0900_ai_ci"), true, true},
+		{"cross-family: the hidden collation stays out", src, part("lower(k)", "utf8mb4_0900_ai_ci"), false, false},
+		{"F6: the target read through vtgate (no hidden collation)", src, part("lower(k)", ""), true, false},
+		{"F6: the pinned key read through vtgate", src, part("(lower(k) collate utf8mb4_bin)", ""), true, false},
+		{"F6: a manifest from before the field", part("lower(k)", ""), part("(lower(k) collate utf8mb4_bin)", "utf8mb4_bin"), true, false},
+		{"F6: one-sided, but the expressions differ", src, part("upper(k)", ""), true, true},
+	} {
+		if got := differ(tc.exp, tc.act, tc.withHidden); got != tc.want {
+			t.Errorf("%s: drift %v; want %v (%q vs %q)", tc.name, got, tc.want,
+				renderIndexColumns(tc.exp, tc.act, tc.withHidden), renderIndexColumns(tc.act, tc.exp, tc.withHidden))
+		}
 	}
 }

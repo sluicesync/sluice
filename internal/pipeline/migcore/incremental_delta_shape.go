@@ -312,13 +312,63 @@ func sameCollation(a, b ir.Type) bool {
 // [irbackup.FormatVersionKeyCollationDelta] (Bug 304): the aspect exists
 // only in this classifier, not in the entry, so a reader built before it
 // reads the entry as no change at all.
+//
+// A UNIQUE functional key redefined under a different hidden-column
+// collation ([ir.IndexColumn.HiddenCollation]; sixth review F4) is the same
+// change to a key's comparison and holds too: the entry reads as an index
+// redefine, and the rows the window wrote under the old comparison meet
+// the new one exactly as a column collation change's do. Such a segment is
+// stamped [irbackup.FormatVersionHiddenCollation] in any case, since both
+// sides carry the field.
 func DeltaChangesKeyCollation(delta []*irbackup.SchemaDeltaEntry) bool {
 	for _, d := range delta {
 		if d == nil || d.Kind != irbackup.SchemaDeltaAlterTable {
 			continue
 		}
-		if ClassifyAlterDelta(d.Before, d.After).Has(AlterAspectColumnCollation) {
+		if ClassifyAlterDelta(d.Before, d.After).Has(AlterAspectColumnCollation) ||
+			uniqueKeyHiddenCollationChanged(d.Before, d.After) {
 			return true
+		}
+	}
+	return false
+}
+
+// uniqueKeyHiddenCollationChanged reports whether a primary or UNIQUE key of
+// after, under a name before also has, compares one of its functional parts
+// under a different hidden-column collation than before's. A part only one
+// side records the collation for is not a change — the comparison
+// [indicesEqual] makes, so the first segment after an upgrade does not read
+// every functional key as redefined. A change and change-back inside one
+// window leaves equal ends and is not seen (the named residual
+// FUNCTIONAL-HIDDEN-COLLATION-WINDOW-REVERT; the change streams record no
+// secondary indexes, so the history cannot show it either).
+func uniqueKeyHiddenCollationChanged(before, after *ir.Table) bool {
+	if before == nil || after == nil {
+		return false
+	}
+	keys := func(t *ir.Table) []*ir.Index {
+		out := []*ir.Index{t.PrimaryKey}
+		for _, idx := range t.Indexes {
+			if idx != nil && idx.Unique {
+				out = append(out, idx)
+			}
+		}
+		return out
+	}
+	for _, a := range keys(after) {
+		if a == nil {
+			continue
+		}
+		for _, b := range keys(before) {
+			if b == nil || !strings.EqualFold(a.Name, b.Name) || len(a.Columns) != len(b.Columns) {
+				continue
+			}
+			for i := range a.Columns {
+				ah, bh := a.Columns[i].HiddenCollation, b.Columns[i].HiddenCollation
+				if ah != "" && bh != "" && !strings.EqualFold(ah, bh) {
+					return true
+				}
+			}
 		}
 	}
 	return false
