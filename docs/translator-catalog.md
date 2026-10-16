@@ -70,7 +70,7 @@ ADR-0016 layer but lands in the per-engine emit code.
 
 | Source shape | Behavior | Notes |
 |---|---|---|
-| Functional indexes `(LOWER(email))` | Verbatim through same-engine, refuse loudly cross-engine when expression grammar diverges | ADR-0045 |
+| Functional indexes `(LOWER(email))` | Body verbatim through same-engine, except that MySQL → MySQL wraps a part as `(expr) COLLATE <source hidden collation>` when the reader recorded the collation its source key's hidden column compares under (a collated string part, read on vanilla MySQL only; not through vtgate); refuse loudly cross-engine when expression grammar diverges | ADR-0045; FUNCTIONAL-CAST-HIDDEN-COLLATION (`functionalPartExpr`): the expression text does not decide that collation (a charset-less `CAST` or a literal takes the creating session's, and an `ALTER … MODIFY` leaves the hidden column on its old one), so a key rebuilt from the text alone could merge rows the source keeps apart |
 | Operator classes (`text_pattern_ops`, `gin_trgm_ops`) | Carried verbatim same-engine; cross-engine extension-owned opclasses refuse with named recovery | ADR-0032 + Bug 47 invariant + v0.95.0 Bug 115 closure |
 | Partial-index `WHERE` clause | Verbatim through; per-dialect identifier requoting | Bug 65 closure |
 | Covering `INCLUDE` columns | Verbatim through; order preserved | |
