@@ -71,7 +71,7 @@ func (m *Migrator) phaseReadSourceSchema(ctx context.Context, scope *multiDBScop
 	// to-be-migrated tables. m.Filter already has engine-default
 	// exclusions merged just above, so this push-down matches the
 	// authoritative post-read migcore.ApplyTableFilter prune below.
-	migcore.ApplyTableScope(sr, m.Filter)
+	scopeTally := migcore.ApplyTableScopeTallied(sr, m.Filter)
 
 	// Multi-database fan-out (ADR-0074): tell the source reader it is
 	// reading one database of the selected set so it stamps
@@ -104,6 +104,11 @@ func (m *Migrator) phaseReadSourceSchema(ctx context.Context, scope *multiDBScop
 	if len(schema.Tables) == 0 && len(schema.Views) == 0 {
 		slog.InfoContext(ctx, "source schema has no tables or views; nothing to migrate")
 		return sr, nil, nil
+	}
+	// Views but no tables because the push-down filtered every table out
+	// (Postgres) is the filter refusal, not a views-only namespace.
+	if err := migcore.RefuseFilteredOutNamespace(schema, scopeTally); err != nil {
+		return sr, nil, err
 	}
 
 	// ---- 1.25. Prune schema by table filter ----

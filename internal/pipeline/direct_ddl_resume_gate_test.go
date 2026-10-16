@@ -95,6 +95,50 @@ func TestDirectDDLPreflightIsNotRunOnResume(t *testing.T) {
 	}
 }
 
+// TestDirectDDLPreflightCountsDeferredFanoutViews holds the Bug 317 review
+// finding: a fan-out namespace's views are taken for the deferred views pass
+// before the direct-DDL probe's condition is evaluated, so under ADR-0166
+// (every table pre-created, nothing left in createSchema) a namespace whose
+// only remaining DDL was its views skipped the probe and met the DDL refusal
+// later, at the deferred pass, after every namespace had copied. Same
+// source-level shape as the gate above, for the same reason: the behaviour
+// needs a live DDL-refusing target no unit test has.
+func TestDirectDDLPreflightCountsDeferredFanoutViews(t *testing.T) {
+	t.Parallel()
+
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "migrate.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse migrate.go: %v", err)
+	}
+	var conds []string
+	ast.Inspect(f, func(n ast.Node) bool {
+		ifs, ok := n.(*ast.IfStmt)
+		if !ok || ifs.Cond == nil {
+			return true
+		}
+		ast.Inspect(ifs.Body, func(m ast.Node) bool {
+			if call, ok := m.(*ast.CallExpr); ok {
+				if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "PreflightDirectDDL" {
+					conds = append(conds, exprText(fset, ifs.Cond))
+				}
+			}
+			return true
+		})
+		return true
+	})
+	if len(conds) == 0 {
+		t.Fatal("no `if` in migrate.go guards PreflightDirectDDL; move this gate with the probe")
+	}
+	for _, c := range conds {
+		if !strings.Contains(c, "multiDBDeferredViews.pending()") {
+			t.Errorf("the direct-DDL probe's condition %q does not count the fan-out's deferred views: a namespace "+
+				"whose tables were all pre-created (ADR-0166) skips the probe and is refused only at the deferred "+
+				"views pass, after every namespace copied (Bug 317 review)", c)
+		}
+	}
+}
+
 // exprText renders an expression back to source text.
 func exprText(fset *token.FileSet, e ast.Expr) string {
 	var buf bytes.Buffer

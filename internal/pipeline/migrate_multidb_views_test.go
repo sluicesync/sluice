@@ -42,14 +42,62 @@ func (*viewCatalogWriter) SyncIdentitySequences(context.Context, *ir.Schema) err
 
 func (w *viewCatalogWriter) CreateViews(_ context.Context, s *ir.Schema) error {
 	for _, v := range s.Views {
+		key := w.ns + "." + v.Name
+		// A materialized view has no CREATE OR REPLACE: a second CREATE of
+		// one fails, as on Postgres.
+		if v.Materialized && w.catalog[key] {
+			return errors.New("relation " + key + " already exists")
+		}
 		for _, dep := range strings.Fields(v.Definition) {
 			if !w.catalog[dep] {
 				return errors.New("relation " + dep + " does not exist")
 			}
 		}
-		w.catalog[w.ns+"."+v.Name] = true
+		w.catalog[key] = true
 	}
 	return nil
+}
+
+// TestCreateDeferredViews_InterleavedCrossNamespace pins per-VIEW progress:
+// A={a1→B.b1, a2}, B={b1→A.a2, b2→A.a1}. Round 1 creates a2 and b1, round
+// 2 creates a1 and then b2. Counting progress per namespace gave up here —
+// neither namespace completed in a round — and refused a graph that
+// completes.
+func TestCreateDeferredViews_InterleavedCrossNamespace(t *testing.T) {
+	eng := &viewCatalogEngine{catalog: map[string]bool{"m.t": true}}
+	err := createDeferredViews(context.Background(), eng, []namespaceViews{
+		{database: "A", targetDSN: "A", views: []*ir.View{{Name: "a1", Definition: "B.b1"}, {Name: "a2", Definition: "m.t"}}},
+		{database: "B", targetDSN: "B", views: []*ir.View{{Name: "b1", Definition: "A.a2"}, {Name: "b2", Definition: "A.a1"}}},
+	})
+	if err != nil {
+		t.Fatalf("createDeferredViews refused a cross-namespace graph a later round completes: %v", err)
+	}
+	for _, want := range []string{"A.a1", "A.a2", "B.b1", "B.b2"} {
+		if !eng.catalog[want] {
+			t.Errorf("view %s was not created", want)
+		}
+	}
+}
+
+// TestCreateDeferredViews_CreatedMaterializedViewIsNotReissued pins that a
+// view created in an earlier round is not issued again: a namespace with a
+// materialized view and a view that only a later round can create used to
+// re-run the whole namespace, and the matview's second CREATE failed.
+func TestCreateDeferredViews_CreatedMaterializedViewIsNotReissued(t *testing.T) {
+	eng := &viewCatalogEngine{catalog: map[string]bool{"m.t": true}}
+	err := createDeferredViews(context.Background(), eng, []namespaceViews{
+		{database: "A", targetDSN: "A", views: []*ir.View{
+			{Name: "mv", Definition: "m.t", Materialized: true},
+			{Name: "late", Definition: "Z.v"},
+		}},
+		{database: "Z", targetDSN: "Z", views: []*ir.View{{Name: "v", Definition: "m.t"}}},
+	})
+	if err != nil {
+		t.Fatalf("createDeferredViews re-issued an already-created materialized view: %v", err)
+	}
+	if !eng.catalog["A.late"] {
+		t.Error("A.late was not created")
+	}
 }
 
 // TestCreateDeferredViews_CrossNamespaceViewOnView pins the round loop: a

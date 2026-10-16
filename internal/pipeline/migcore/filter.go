@@ -44,6 +44,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -481,8 +482,54 @@ func applyTableFilter(ctx context.Context, schema *ir.Schema, filter TableFilter
 	if report {
 		reportUnmatched(ctx, filter, allNames)
 	}
-	if len(kept) == 0 {
-		return errors.New("pipeline: table filter excluded every source table; nothing to migrate (check --include-table / --exclude-table)")
+	// Refuse only when the filter EMPTIED a non-empty table set (Bug 317
+	// review). A namespace that arrived with no tables — a views-only
+	// database or schema — had nothing for the filter to exclude, and
+	// refusing it aborted a fan-out midway on any --include-table /
+	// --exclude-table and on every PlanetScale/Vitess source with no flags
+	// at all (the engine-default `_vt_*` exclusion makes the filter
+	// non-empty). Where an engine's push-down already dropped every table
+	// before this point (Postgres), the caller owns that verdict:
+	// [RefuseFilteredOutNamespace].
+	if len(kept) == 0 && original > 0 {
+		return errFilterExcludedEveryTable
+	}
+	return nil
+}
+
+var errFilterExcludedEveryTable = errors.New("pipeline: table filter excluded every source table; nothing to migrate (check --include-table / --exclude-table)")
+
+// ScopeTally counts the candidate tables an engine's scope push-down asked
+// about (see [ApplyTableScopeTallied]), so a caller can tell "this
+// namespace has no tables" from "the push-down scoped every table out" —
+// both arrive as an empty schema.Tables.
+type ScopeTally struct {
+	asked atomic.Int64
+}
+
+// Asked reports how many candidate tables the push-down was asked about.
+// Nil-safe: a nil tally (no push-down installed) reports zero.
+func (t *ScopeTally) Asked() int64 {
+	if t == nil {
+		return 0
+	}
+	return t.asked.Load()
+}
+
+// RefuseFilteredOutNamespace returns the filter refusal when the source
+// HAD tables but the engine's scope push-down dropped every one of them
+// and views remain. Without it a Postgres namespace whose tables were all
+// filtered out would proceed to create views over tables the run never
+// copied, while the same namespace on MySQL (no push-down) refuses in
+// [ApplyTableFilter]. A schema with no views returns early upstream and
+// never reaches this; a namespace that genuinely has no tables (Asked is
+// zero) passes.
+func RefuseFilteredOutNamespace(schema *ir.Schema, tally *ScopeTally) error {
+	if schema == nil || len(schema.Tables) > 0 || len(schema.Views) == 0 {
+		return nil
+	}
+	if tally.Asked() > 0 {
+		return errFilterExcludedEveryTable
 	}
 	return nil
 }

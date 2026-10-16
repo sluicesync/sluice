@@ -15,13 +15,11 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
-	"log/slog"
 	"strings"
 	"testing"
 	"time"
 
 	"sluicesync.dev/sluice/internal/engines"
-	"sluicesync.dev/sluice/internal/logcapture"
 	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 
@@ -189,34 +187,36 @@ func TestStreamer_ViewsOnlyNamespace_PostgresToPostgres_Fanout(t *testing.T) {
 	assertViewsMatchSource(t, ctx, src, dst, []string{"a_rpt.v", "b_mix.vm", "z_rpt.v"})
 }
 
-// TestStreamer_ViewsOnlyNamespace_PostgresSingle_WarnsViewsNotCreated pins
-// the single-namespace sync sibling's chosen behaviour: a stream with no
-// tables has no change stream to run and still returns, but the views it
-// does not create are named at WARN with their count, not left behind an
-// INFO line.
-func TestStreamer_ViewsOnlyNamespace_PostgresSingle_WarnsViewsNotCreated(t *testing.T) {
+// TestStreamer_ViewsOnlyNamespace_PostgresSingle_RefusesViewsOnly pins the
+// single-namespace sync sibling (operator decision, Bug 317 review): a
+// stream with no tables has no change stream to run and opens no target
+// writer, so it cannot create the views — and exiting 0 with them absent
+// reads as success to automation. It refuses, non-zero, with
+// SYNC-VIEWS-ONLY-NAMESPACE naming the view. --skip-views is judged first:
+// with the views filtered out, the plain "nothing to stream" return holds.
+func TestStreamer_ViewsOnlyNamespace_PostgresSingle_RefusesViewsOnly(t *testing.T) {
 	pgSource, pgTarget, cleanup := startPostgresLogical(t)
 	defer cleanup()
 	seedPGViewsOnlyFanout(t, pgSource)
 	pgEng, _ := engines.Get("postgres")
 
-	captured := &logcapture.Buffer{}
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(captured, &slog.HandlerOptions{Level: slog.LevelInfo})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
-
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
-	err := (&Streamer{
-		Source: pgEng, Target: pgEng,
-		SourceDSN: pgSource + "&schema=a_rpt", TargetDSN: pgTarget, TargetSchema: "a_rpt",
-		StreamID: "views-only-single",
-	}).Run(ctx)
-	if err != nil {
-		t.Fatalf("Streamer.Run on a views-only schema: %v", err)
+	newStreamer := func(skipViews bool) *Streamer {
+		return &Streamer{
+			Source: pgEng, Target: pgEng,
+			SourceDSN: pgSource + "&schema=a_rpt", TargetDSN: pgTarget, TargetSchema: "a_rpt",
+			StreamID: "views-only-single", SkipViews: skipViews,
+		}
 	}
-	logs := captured.String()
-	if !strings.Contains(logs, "level=WARN") || !strings.Contains(logs, "views_not_created=1") {
-		t.Fatalf("single-namespace sync of a views-only schema did not WARN with the view count; log:\n%s", logs)
+	err := newStreamer(false).Run(ctx)
+	if err == nil {
+		t.Fatal("single-namespace sync of a views-only schema exited 0 with its view absent; want SYNC-VIEWS-ONLY-NAMESPACE")
+	}
+	if !strings.Contains(err.Error(), "SYNC-VIEWS-ONLY-NAMESPACE") || !strings.Contains(err.Error(), "(v)") {
+		t.Fatalf("refusal lacks the marker or the view name: %v", err)
+	}
+	if err := newStreamer(true).Run(ctx); err != nil {
+		t.Fatalf("--skip-views must leave nothing to refuse over; got %v", err)
 	}
 }

@@ -72,12 +72,23 @@ func (s *Streamer) buildDryRunPlan(ctx context.Context, streamID string, persist
 	migcore.ApplyVerbatimExtensionPassthrough(sr, verbatimLiveSameEnginePG(s.Source, s.Target))
 	// catalog Bug 76: scope per-column type validation to the filtered
 	// table set (s.Filter already has engine defaults merged in Run).
-	migcore.ApplyTableScope(sr, s.Filter)
+	scopeTally := migcore.ApplyTableScopeTallied(sr, s.Filter)
 	schema, err := sr.ReadSchema(ctx)
 	if err != nil {
 		return nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: dry-run: read source schema: %w", err))
 	}
 	if len(schema.Tables) == 0 {
+		// Bug 317: a plan must refuse what the real run refuses — a
+		// single-namespace views-only schema (SYNC-VIEWS-ONLY-NAMESPACE).
+		if !s.multiDatabaseMode() {
+			applyViewFilter(ctx, schema, s.ViewFilter, s.SkipViews)
+			if err := migcore.RefuseFilteredOutNamespace(schema, scopeTally); err != nil {
+				return nil, err
+			}
+			if err := refuseSyncViewsOnlyNamespace(schema); err != nil {
+				return nil, err
+			}
+		}
 		plan.noSourceTables = true
 		return plan, nil
 	}

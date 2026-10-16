@@ -769,7 +769,13 @@ func loadOrInitState(ctx context.Context, rc resumeContext, resume, resetting bo
 		return state, true, nil
 
 	case found && state.Phase == ir.MigrationPhaseComplete && !resume:
-		return ir.MigrationState{}, false, fmt.Errorf("pipeline: migration_id %q is already complete; drop the target tables to redo, or use a different --migration-id", rc.migrationID)
+		// The multi-namespace fan-out marks each namespace complete before
+		// its final cross-namespace passes (deferred foreign keys, deferred
+		// views — Bug 317), so a fan-out that failed in one of those passes
+		// lands here on a plain re-run; --resume is what retries the pass.
+		return ir.MigrationState{}, false, fmt.Errorf("pipeline: migration_id %q is already complete; drop the target tables to redo, "+
+			"or use a different --migration-id (if a multi-database / multi-schema run failed in its final foreign-key "+
+			"or views pass, re-run it with --resume to retry that pass)", rc.migrationID)
 
 	case found && !resume:
 		return ir.MigrationState{}, false, fmt.Errorf("pipeline: a partial migration is already recorded for migration_id %q (phase=%s); pass --resume to continue or drop the row to start fresh", rc.migrationID, state.Phase)

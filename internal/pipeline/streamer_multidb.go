@@ -767,7 +767,7 @@ func (s *Streamer) coldStartReadOneDatabaseSchema(
 		return nil, connectHint(fmt.Errorf("pipeline: open source schema reader for %q: %w", database, err))
 	}
 	defer migcore.CloseIf(sr)
-	migcore.ApplyTableScope(sr, s.Filter)
+	scopeTally := migcore.ApplyTableScopeTallied(sr, s.Filter)
 	applyMultiDatabaseScope(sr, &multiDBScope{database: database, inScope: inScope})
 	schema, err := sr.ReadSchema(ctx)
 	if err != nil {
@@ -780,6 +780,9 @@ func (s *Streamer) coldStartReadOneDatabaseSchema(
 		slog.InfoContext(ctx, "multi-database: database has no tables or views; skipping copy",
 			slog.String("stream_id", streamID), slog.String("database", database))
 		return nil, nil
+	}
+	if err := migcore.RefuseFilteredOutNamespace(schema, scopeTally); err != nil {
+		return nil, fmt.Errorf("pipeline: filter tables for %q: %w", database, err)
 	}
 
 	// Quiet: one pass of the fan-out. A pattern naming a table in another

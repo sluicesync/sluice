@@ -987,7 +987,12 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 	// declines to answer: the create phase's own DDL still fails loudly a
 	// moment later if DDL really is needed, which is the pre-v0.151.0
 	// behaviour and no worse than it.
-	if !resuming && (len(createSchema.Tables) > 0 || len(createSchema.Views) > 0) {
+	//
+	// A fan-out namespace's views were taken for the deferred pass (Bug 317)
+	// but are still DDL this run emits, so they count here too: under
+	// ADR-0166 a namespace whose tables were all pre-created would otherwise
+	// skip the probe and fail later, at the deferred views pass.
+	if !resuming && (len(createSchema.Tables) > 0 || len(createSchema.Views) > 0 || m.multiDBDeferredViews.pending() > 0) {
 		if err := migcore.PreflightDirectDDL(ctx, rw, "migrate"); err != nil {
 			return markFailed(ctx, rc, state, ir.MigrationPhasePending, err)
 		}

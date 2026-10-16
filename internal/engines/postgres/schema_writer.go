@@ -1269,12 +1269,14 @@ func (w *SchemaWriter) RestoreIdentityGeneration(ctx context.Context, s *ir.Sche
 // migration ends with a query-ready matview. Phase 2 will extend this
 // with CDC-driven `REFRESH MATERIALIZED VIEW` on a configured cadence.
 //
-// `CREATE OR REPLACE` covers regular-view re-runs idempotently; PG
-// rejects `CREATE OR REPLACE MATERIALIZED VIEW`, so a re-run of
-// CreateViews against a target whose matview already exists raises
-// "relation X already exists". The orchestrator's retry policy treats
-// this as success (the view is in place; the second pass would have
-// produced the same body anyway).
+// `CREATE OR REPLACE` covers regular-view re-runs idempotently. PG
+// rejects `CREATE OR REPLACE MATERIALIZED VIEW`, and nothing in the
+// orchestrator treats "already exists" as success, so a re-run (a
+// --resume after a failed views phase) would fail on a matview an
+// earlier attempt created. So a matview that already exists is checked
+// instead of re-created: the same definition is skipped as already in
+// place, a different one refuses loudly, naming it
+// ([SchemaWriter.materializedViewAlreadyCreated], Bug 317 review).
 //
 // View-to-view dependency ordering is the orchestrator's responsibility:
 // CreateViews emits in declared order, so a view that references
@@ -1294,6 +1296,15 @@ func (w *SchemaWriter) CreateViews(ctx context.Context, s *ir.Schema) error {
 		stmt, err := emitCreateView(w.schema, view)
 		if err != nil {
 			return err
+		}
+		if view.Materialized {
+			exists, err := w.materializedViewAlreadyCreated(ctx, view)
+			if err != nil {
+				return fmt.Errorf("postgres: create view %q: %w", view.Name, err)
+			}
+			if exists {
+				continue
+			}
 		}
 		if err := w.execViewDDL(ctx, stmt, view.Schema); err != nil {
 			return fmt.Errorf("postgres: create view %q: %w", view.Name, err)
@@ -1319,6 +1330,46 @@ func (w *SchemaWriter) CreateViews(ctx context.Context, s *ir.Schema) error {
 // stays on the path after the target schema for it. sourceSchema empty is
 // a body recorded before the reader tagged it, treated as public.
 func (w *SchemaWriter) execViewDDL(ctx context.Context, stmt, sourceSchema string) error {
+	return w.inViewSearchPath(ctx, sourceSchema, func(tx *sql.Tx) error {
+		return execEmittedDDL(ctx, tx, stmt)
+	})
+}
+
+// materializedViewAlreadyCreated reports whether the target already holds
+// materialized view v with v's definition — an earlier attempt of this run
+// created it — so a re-run does not issue a second CREATE, which PG fails
+// with "already exists". The target's definition is read under the same
+// search_path the CREATE runs under, so its deparse qualifies names the way
+// the source body (read under the source schema's path) does. A matview of
+// that name with a DIFFERENT definition is refused loudly rather than kept:
+// keeping it would leave the target serving a body the source never had.
+func (w *SchemaWriter) materializedViewAlreadyCreated(ctx context.Context, v *ir.View) (bool, error) {
+	var def sql.NullString
+	err := w.inViewSearchPath(ctx, v.Schema, func(tx *sql.Tx) error {
+		err := tx.QueryRowContext(ctx,
+			"SELECT definition FROM pg_catalog.pg_matviews WHERE schemaname = $1 AND matviewname = $2",
+			w.schema, v.Name).Scan(&def)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		return err
+	})
+	if err != nil {
+		return false, fmt.Errorf("read existing materialized view: %w", err)
+	}
+	if !def.Valid {
+		return false, nil
+	}
+	if strings.TrimSpace(trimTrailingSemicolon(def.String)) == strings.TrimSpace(trimTrailingSemicolon(v.Definition)) {
+		return true, nil
+	}
+	return false, fmt.Errorf("materialized view %s.%s already exists on the target with a different definition; "+
+		"drop it (or exclude the view with --exclude-view) and re-run", quoteIdent(w.schema), quoteIdent(v.Name))
+}
+
+// inViewSearchPath runs fn in a transaction whose search_path is pinned the
+// way [SchemaWriter.execViewDDL] documents, and commits it.
+func (w *SchemaWriter) inViewSearchPath(ctx context.Context, sourceSchema string, fn func(*sql.Tx) error) error {
 	tx, err := w.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -1331,7 +1382,7 @@ func (w *SchemaWriter) execViewDDL(ctx context.Context, stmt, sourceSchema strin
 	if _, err := tx.ExecContext(ctx, "SELECT pg_catalog.set_config('search_path', $1, true)", path); err != nil {
 		return fmt.Errorf("pin search_path: %w", err)
 	}
-	if err := execEmittedDDL(ctx, tx, stmt); err != nil {
+	if err := fn(tx); err != nil {
 		return err
 	}
 	return tx.Commit()

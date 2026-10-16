@@ -97,9 +97,9 @@ func TestAssertSingleDDLStatement(t *testing.T) {
 //     integers, no recorded content.
 //   - syncOneIdentity: a setval query with BIND ARGUMENTS — recorded
 //     content travels as parameters, which cannot split a statement.
-//   - execViewDDL: a set_config with the target schema as a BIND
-//     ARGUMENT (Bug 314); the CREATE VIEW itself still goes through
-//     execEmittedDDL on the same transaction.
+//   - inViewSearchPath: a set_config with the target schema as a BIND
+//     ARGUMENT (Bug 314); execViewDDL runs the CREATE VIEW inside it through
+//     execEmittedDDL on the same transaction (Bug 317 review split them).
 //
 // Scope, stated per the gate rule: this roster reaches the two
 // schema-writer files only. The row/CDC apply paths execute
@@ -113,7 +113,7 @@ func TestSchemaWriterEmittedDDLGoesThroughTheSingleStatementDoor(t *testing.T) {
 		"execEmittedDDL":     true, // the door itself — the one real ExecContext
 		"tuneIndexBuildConn": true,
 		"syncOneIdentity":    true,
-		"execViewDDL":        true,
+		"inViewSearchPath":   true,
 	}
 
 	fset := token.NewFileSet()

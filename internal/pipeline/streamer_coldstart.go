@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
@@ -377,7 +378,7 @@ func (s *Streamer) coldStartReadSourceSchema(ctx context.Context, resumingCopy b
 	migcore.ApplyVerbatimExtensionPassthrough(sr, verbatimLiveSameEnginePG(s.Source, s.Target))
 	// catalog Bug 76: scope per-column type validation to the filtered
 	// table set (s.Filter already has engine defaults merged in Run).
-	migcore.ApplyTableScope(sr, s.Filter)
+	scopeTally := migcore.ApplyTableScopeTallied(sr, s.Filter)
 	// Large-object census (roadmap item 68c) — advisory WARN only; runs
 	// BEFORE ReadSchema so the named-suspect branch is reachable: an
 	// in-scope oid/lo column refuses at the schema read as an unsupported
@@ -392,16 +393,19 @@ func (s *Streamer) coldStartReadSourceSchema(ctx context.Context, resumingCopy b
 	if len(schema.Tables) == 0 {
 		migcore.CloseIf(sr)
 		// Bug 317 sibling: a single-namespace stream with no tables has no
-		// change stream to run, so this path keeps returning — but views it
-		// is not creating are said so at WARN with the count, never dropped
-		// behind an INFO line. (The multi-namespace fan-out does create a
-		// views-only namespace's views; see coldStartReadOneDatabaseSchema.)
-		if n := len(schema.Views); n > 0 {
-			slog.WarnContext(ctx, "source schema has views but no tables; sync streams table changes, so nothing is "+
-				"streamed and these views are NOT created on the target — create them with `sluice migrate` "+
-				"(which creates a views-only schema's views) once the tables they read exist",
-				slog.Int("views_not_created", n))
-			return nil, nil, nil
+		// change stream to run, and this path opens no target writers, so it
+		// cannot create the views. Exiting 0 with requested views absent
+		// reads as success to automation, so a views-only schema REFUSES —
+		// judged after --skip-views / the view filter, so an operator who
+		// opted out of the views gets the plain "nothing to stream". (The
+		// multi-namespace fan-out does create a views-only namespace's
+		// views; see coldStartReadOneDatabaseSchema.)
+		applyViewFilter(ctx, schema, s.ViewFilter, s.SkipViews)
+		if err := migcore.RefuseFilteredOutNamespace(schema, scopeTally); err != nil {
+			return nil, nil, err
+		}
+		if err := refuseSyncViewsOnlyNamespace(schema); err != nil {
+			return nil, nil, err
 		}
 		slog.InfoContext(ctx, "source schema has no tables; nothing to stream")
 		return nil, nil, nil
@@ -1647,4 +1651,30 @@ func openSnapshotStreamScoped(ctx context.Context, source ir.Engine, dsn, slotNa
 		}
 	}
 	return source.OpenSnapshotStream(ctx, dsn)
+}
+
+// syncViewsOnlyNamespaceMarker is the grep-stable handle of the
+// single-namespace `sync start` refusal of a views-only schema (Bug 317).
+const syncViewsOnlyNamespaceMarker = "SYNC-VIEWS-ONLY-NAMESPACE"
+
+// refuseSyncViewsOnlyNamespace refuses a single-namespace sync whose
+// source holds views (after the view filter) but no tables: there is no
+// change stream to run, and the cold start that would have created the
+// views never opens a target writer, so returning would exit 0 with every
+// requested view absent. Nil when no views remain.
+func refuseSyncViewsOnlyNamespace(schema *ir.Schema) error {
+	if schema == nil || len(schema.Tables) > 0 || len(schema.Views) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(schema.Views))
+	for _, v := range schema.Views {
+		if v != nil {
+			names = append(names, v.Name)
+		}
+	}
+	return fmt.Errorf("pipeline: %s: the source schema holds %d view(s) and no tables (%s); `sync start` "+
+		"streams table changes, so there is nothing to stream and the views would not be created. "+
+		"Create them with `sluice migrate` once the tables they read exist on the target (it creates a "+
+		"views-only schema's views), or pass --skip-views to accept a run that streams nothing",
+		syncViewsOnlyNamespaceMarker, len(names), strings.Join(names, ", "))
 }

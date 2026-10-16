@@ -109,6 +109,21 @@ func ApplyVerbatimExtensionPassthrough(target any, enabled bool) {
 // engine-default exclusions merged ([EffectiveTableFilter]) so the
 // push-down matches the post-read prune.
 func ApplyTableScope(reader any, filter TableFilter) {
+	applyTableScope(reader, filter, nil)
+}
+
+// ApplyTableScopeTallied is [ApplyTableScope] that also counts every
+// candidate table the push-down is asked about, for
+// [RefuseFilteredOutNamespace]. The tally stays zero when the reader has
+// no push-down or the filter is empty — in both cases nothing is dropped
+// before the post-read prune, which then sees the real table set.
+func ApplyTableScopeTallied(reader any, filter TableFilter) *ScopeTally {
+	tally := &ScopeTally{}
+	applyTableScope(reader, filter, tally)
+	return tally
+}
+
+func applyTableScope(reader any, filter TableFilter, tally *ScopeTally) {
 	scoper, ok := reader.(ir.TableScoper)
 	if !ok {
 		return
@@ -131,6 +146,9 @@ func ApplyTableScope(reader any, filter TableFilter) {
 	census := filter.census
 	scoper.SetTableScope(func(tableName string) bool {
 		census.record(tableName)
+		if tally != nil {
+			tally.asked.Add(1)
+		}
 		return filter.Allows(tableName)
 	})
 }
