@@ -676,9 +676,9 @@ func keyCollationFunctionalUnsupported(qn string, parts []*functionalKeyPart) er
 
 // markFunctionalArming decides, for every functional part of keys, whether
 // it arms its key ([functionalPartArms]).
-func (k *targetUniqueKeys) markFunctionalArming(source *ir.Table, armed map[string]armedCollation, compareAs map[string]string) {
+func (k *targetUniqueKeys) markFunctionalArming(source *ir.Table, colTypes map[string]*ir.Column, armed map[string]armedCollation, compareAs map[string]string) {
 	for _, f := range k.functionalParts() {
-		f.arms = functionalPartArms(f, source, armed, compareAs)
+		f.arms = functionalPartArms(f, source, colTypes, armed, compareAs)
 	}
 }
 
@@ -725,7 +725,7 @@ func (k *targetUniqueKeys) markFunctionalArming(source *ir.Table, armed map[stri
 // arming costs only a refusal of a stale respelling ON DUPLICATE KEY UPDATE
 // would converge (re-review finding 2) — which is why a read-and-equal part
 // does not arm.
-func functionalPartArms(f *functionalKeyPart, source *ir.Table, armed map[string]armedCollation, compareAs map[string]string) bool {
+func functionalPartArms(f *functionalKeyPart, source *ir.Table, colTypes map[string]*ir.Column, armed map[string]armedCollation, compareAs map[string]string) bool {
 	switch {
 	case !f.collated():
 		return false
@@ -754,33 +754,54 @@ func functionalPartArms(f *functionalKeyPart, source *ir.Table, armed map[string
 		// (2,'A') onto (1,'a') at exit 0 (measured). So the columns are
 		// compared too: one whose collation the target does not share, or
 		// whose source collation is not known, arms.
-		return functionalColumnsArm(f, source, armed, nil)
+		return functionalColumnsArm(f, source, colTypes, armed, nil)
 	}
-	return functionalColumnsArm(f, source, armed, compareAs)
+	return functionalColumnsArm(f, source, colTypes, armed, compareAs)
 }
 
 // functionalColumnsArm reports whether a column a functional part reads puts
 // its key under the guard: a column the plan already armed (its source
 // collation is one the target column does not share), a column the source
-// does not have, or a string column whose source collation is not known. A
-// non-string column (INT, JSON) brings no collation and arms nothing (fourth
-// review, finding 3).
+// does not have, a string column whose source collation is not known, or a
+// column that is a string on the target but not on the source (seventh
+// review, finding 2: a VARBINARY or INT carried to a VARCHAR by a
+// --type-override, under `if(k = 'a', 'same', 'other')`, compares the
+// target's values under a collation the source never applied). A column
+// that is a string on neither side (INT, JSON) brings no collation and arms
+// nothing (fourth review, finding 3). colTypes is the target's columns.
+//
+// The columns are those the expression names AND, through a generated
+// column, the stored columns it is computed from (seventh review, finding
+// 1, HIGH silent): the target recomputes `g AS (if(k = 'a', 'same', k))`
+// under k's TARGET collation, so a k the target compares differently changes
+// g's value though g itself is declared alike on both sides, and
+// `UNIQUE ((upper(g)))` merged (2,'A') onto (1,'a') at exit 0 with equal
+// hidden collations.
 //
 // With compareAs non-nil — the Postgres/SQLite route, which has no hidden
-// column to read — the column's own collation must also BE the index's,
-// since nothing else says what the source compares the value under.
-func functionalColumnsArm(f *functionalKeyPart, source *ir.Table, armed map[string]armedCollation, compareAs map[string]string) bool {
+// column to read — a column the expression names must also be declared
+// under the index's collation, since nothing else says what the source
+// compares the value under. A base column reached only through a generated
+// one is not held to that: the generated column's own declaration is what
+// the expression reads.
+func functionalColumnsArm(f *functionalKeyPart, source *ir.Table, colTypes map[string]*ir.Column, armed map[string]armedCollation, compareAs map[string]string) bool {
 	srcCols := make(map[string]*ir.Column, len(source.Columns))
 	for _, c := range source.Columns {
 		if c != nil {
 			srcCols[strings.ToLower(c.Name)] = c
 		}
 	}
+	tgtCols := make(map[string]*ir.Column, len(colTypes))
+	for name, c := range colTypes {
+		if c != nil {
+			tgtCols[strings.ToLower(name)] = c
+		}
+	}
 	armedFold := make(map[string]bool, len(armed))
 	for name := range armed {
 		armedFold[strings.ToLower(name)] = true
 	}
-	for _, name := range f.named {
+	arms := func(name string, againstIndex bool) bool {
 		if armedFold[strings.ToLower(name)] {
 			return true
 		}
@@ -789,20 +810,31 @@ func functionalColumnsArm(f *functionalKeyPart, source *ir.Table, armed map[stri
 			return true
 		}
 		if !isStringType(c.Type) {
-			continue
+			t := tgtCols[strings.ToLower(name)]
+			return t != nil && isStringType(t.Type)
 		}
 		_, coll := translate.ColumnCollation(c.Type)
 		if coll == "" {
 			return true
 		}
-		if compareAs == nil {
-			continue
+		if !againstIndex {
+			return false
 		}
 		coll = strings.ToLower(coll)
 		if mapped, ok := compareAs[coll]; ok {
 			coll = mapped
 		}
-		if !strings.EqualFold(coll, f.collation) {
+		return !strings.EqualFold(coll, f.collation)
+	}
+	named := make(map[string]bool, len(f.named))
+	for _, name := range f.named {
+		named[strings.ToLower(name)] = true
+		if arms(name, compareAs != nil) {
+			return true
+		}
+	}
+	for _, name := range f.columns {
+		if !named[strings.ToLower(name)] && arms(name, false) {
 			return true
 		}
 	}

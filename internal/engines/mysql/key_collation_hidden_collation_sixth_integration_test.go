@@ -183,6 +183,123 @@ func TestFunctionalKeyHiddenCollation_SixthReview(t *testing.T) {
 		}
 	})
 
+	// Seventh review, finding 1 (HIGH, silent): the same divergence one
+	// step removed. g is declared alike on both sides, but the target
+	// RECOMPUTES it from k under k's target collation, so the key over g
+	// merged with equal hidden collations because only g was compared.
+	t.Run("F1 through a generated column", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		defer cancel()
+		src := newDB(t)
+		applyDDL(t, src, "CREATE TABLE kd (id INT NOT NULL PRIMARY KEY, k VARCHAR(20) CHARACTER SET utf8mb4 "+
+			"COLLATE utf8mb4_bin NOT NULL, f INT, g VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci "+
+			"AS (if(k = 'a', 'same', k)), UNIQUE KEY fk ((upper(g))))")
+		rows := [2]ir.Row{{"id": int64(1), "k": "a", "f": int64(1)}, {"id": int64(2), "k": "A", "f": int64(2)}}
+		for _, r := range rows {
+			applyDDL(t, src, fmt.Sprintf("INSERT INTO kd (id, k, f) VALUES (%d, '%s', %d)", r["id"], r["k"], r["f"]))
+		}
+		want := kcgRows(t, src, "kd", "id")
+		if strings.Count(want, ",") != 1 {
+			t.Fatalf("the source key did not keep the pair apart (%s); the cell measures nothing", want)
+		}
+		table := kchcReadTable(ctx, t, src)
+		if got := table.Indexes[0].Columns[0].HiddenCollation; got != "utf8mb4_0900_ai_ci" {
+			t.Fatalf("hidden collation %q; want utf8mb4_0900_ai_ci", got)
+		}
+		for _, tc := range []struct {
+			name, alter string
+			refuses     bool
+		}{
+			{"control: aligned base column, both rows land", "", false},
+			{"base column moved to utf8mb4_0900_ai_ci: refuses", "ALTER TABLE kd MODIFY k VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL", true},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				tgt := newDB(t)
+				if err := kchcCreate(ctx, t, tgt, table); err != nil {
+					t.Fatalf("create the pinned key: %v", err)
+				}
+				if tc.alter != "" {
+					applyDDL(t, tgt, tc.alter)
+				}
+				if err := kchcWrite(t, Engine{}, tgt, table, rows[0]); err != nil {
+					t.Fatal(err)
+				}
+				before := kcgRows(t, tgt, "kd", "id")
+				err := kchcWrite(t, Engine{}, tgt, table, rows[1])
+				if !tc.refuses {
+					if err != nil {
+						t.Fatalf("the aligned target refused: %v", err)
+					}
+					if got := kcgRows(t, tgt, "kd", "id"); got != want {
+						t.Fatalf("target %s; the source holds %s", got, want)
+					}
+					return
+				}
+				kchcWantMerge(t, err, tgt)
+				if got := kcgRows(t, tgt, "kd", "id"); got != before {
+					t.Fatalf("the refusal changed the target: %s → %s", before, got)
+				}
+			})
+		}
+	})
+
+	// Seventh review, finding 2 (MEDIUM, silent): a column that is a string
+	// on the target alone. On the source k is VARBINARY, so `k = 'a'` is a
+	// byte comparison and 'A' computes 'other'; on a target where k became a
+	// `_ci` VARCHAR (a --type-override; here a MODIFY) 'A' computes 'same'.
+	// k carries no source collation, so the plan never armed it.
+	t.Run("a column that is a string on the target alone", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		defer cancel()
+		src := newDB(t)
+		applyDDL(t, src, "CREATE TABLE kd (id INT NOT NULL PRIMARY KEY, k VARBINARY(20) NOT NULL, f INT, "+
+			"UNIQUE KEY fk ((if(k = 'a', 'same', 'other'))))")
+		rows := [2]ir.Row{{"id": int64(1), "k": []byte("a"), "f": int64(1)}, {"id": int64(2), "k": []byte("A"), "f": int64(2)}}
+		for _, r := range rows {
+			applyDDL(t, src, fmt.Sprintf("INSERT INTO kd VALUES (%d, '%s', %d)", r["id"], r["k"], r["f"]))
+		}
+		want := kcgRows(t, src, "kd", "id")
+		if strings.Count(want, ",") != 1 {
+			t.Fatalf("the source key did not keep the pair apart (%s); the cell measures nothing", want)
+		}
+		table := kchcReadTable(ctx, t, src)
+		for _, tc := range []struct {
+			name, alter string
+			refuses     bool
+		}{
+			{"control: VARBINARY on both sides, both rows land", "", false},
+			{"k a utf8mb4_0900_ai_ci VARCHAR on the target: refuses", "ALTER TABLE kd MODIFY k VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL", true},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				tgt := newDB(t)
+				if err := kchcCreate(ctx, t, tgt, table); err != nil {
+					t.Fatalf("create the pinned key: %v", err)
+				}
+				if tc.alter != "" {
+					applyDDL(t, tgt, tc.alter)
+				}
+				if err := kchcWrite(t, Engine{}, tgt, table, rows[0]); err != nil {
+					t.Fatal(err)
+				}
+				before := kcgRows(t, tgt, "kd", "id")
+				err := kchcWrite(t, Engine{}, tgt, table, rows[1])
+				if !tc.refuses {
+					if err != nil {
+						t.Fatalf("the aligned target refused: %v", err)
+					}
+					if got := kcgRows(t, tgt, "kd", "id"); got != want {
+						t.Fatalf("target %s; the source holds %s", got, want)
+					}
+					return
+				}
+				kchcWantMerge(t, err, tgt)
+				if got := kcgRows(t, tgt, "kd", "id"); got != before {
+					t.Fatalf("the refusal changed the target: %s → %s", before, got)
+				}
+			})
+		}
+	})
+
 	t.Run("F2: S1 with a charset change", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 		defer cancel()

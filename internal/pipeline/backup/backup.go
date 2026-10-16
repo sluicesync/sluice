@@ -1741,12 +1741,21 @@ func priorResumableTables(prior *irbackup.Manifest) []*irbackup.TableManifest {
 // new one, and the replay window carries events under a schema the
 // manifest never saw. Both schemas here are post-filter, so a changed
 // --tables filter between attempts trips this too — equally unsound.
+//
+// A functional key's hidden-column collation ([ir.IndexColumn.HiddenCollation])
+// is compared away on both sides (seventh review, finding 3): the
+// fingerprint folds it, so an attempt interrupted on a binary that did not
+// read it (v0.160.x and older) and resumed on one that does refused "the
+// source schema changed" on an unchanged vanilla-MySQL source with a
+// collated functional key. Kept row chunks hold rows, which no index
+// collation shapes, and the resumed manifest records the field as this run
+// reads it.
 func refuseAnchoredResumeOnSchemaDrift(current, prior *ir.Schema) error {
-	curHash, err := manifestSchemaFingerprint(current)
+	curHash, err := manifestSchemaFingerprint(irbackup.WithoutHiddenCollation(current))
 	if err != nil {
 		return fmt.Errorf("backup: resume: fingerprint current schema: %w", err)
 	}
-	priorHash, err := manifestSchemaFingerprint(prior)
+	priorHash, err := manifestSchemaFingerprint(irbackup.WithoutHiddenCollation(prior))
 	if err != nil {
 		return fmt.Errorf("backup: resume: fingerprint prior schema: %w", err)
 	}

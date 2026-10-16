@@ -155,7 +155,7 @@ type keyCollationPlan struct {
 // nothing is armed.
 func planKeyCollationGuard(source *ir.Table, colTypes map[string]*ir.Column, keys targetUniqueKeys, compareAs map[string]string) *keyCollationPlan {
 	armed := applierArmedColumns(source, colTypes, keys, compareAs)
-	keys.markFunctionalArming(source, armed, compareAs)
+	keys.markFunctionalArming(source, colTypes, armed, compareAs)
 	return planFromArmed(armed, keys)
 }
 
@@ -191,7 +191,7 @@ func applierArmedColumns(source *ir.Table, colTypes map[string]*ir.Column, keys 
 // 'A' and 'a' on a `_ci` target key are one row at exit 0, silently.
 func planCopyKeyCollationGuard(source *ir.Table, colTypes map[string]*ir.Column, keys targetUniqueKeys, compareAs map[string]string) *keyCollationPlan {
 	armed := armedColumns(source, colTypes, compareAs)
-	keys.markFunctionalArming(source, armed, compareAs)
+	keys.markFunctionalArming(source, colTypes, armed, compareAs)
 	return planFromArmed(armed, keys)
 }
 

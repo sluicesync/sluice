@@ -245,7 +245,67 @@ func TestFunctionalPartArms_EachRoute(t *testing.T) {
 		{"index collation unknown", part(false, ""), mysqlSrc("utf8mb4_0900_ai_ci", k(ci)), nil, true},
 		{"not a string", part(true, ""), nil, nil, false},
 	} {
-		if got := functionalPartArms(tc.f, tc.source, tc.armed, mysqlKeyGuardCollations); got != tc.want {
+		if got := functionalPartArms(tc.f, tc.source, nil, tc.armed, mysqlKeyGuardCollations); got != tc.want {
+			t.Errorf("%s: arms %v; want %v", tc.name, got, tc.want)
+		}
+	}
+
+	// Seventh review: the columns a part reads through a generated column
+	// (finding 1), and a column that is a string on the target alone
+	// (finding 2). gpart is `upper(g)` with g AS (if(k = 'a', 'same', k)):
+	// named g, base column k.
+	bin := ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: "utf8mb4_bin"}
+	gpart := &functionalKeyPart{index: "fk", seq: 0, named: []string{"g"}, columns: []string{"k"}, known: true, collation: "utf8mb4_0900_ai_ci"}
+	g := &ir.Column{Name: "g", Type: ci}
+	tgt := func(cols ...*ir.Column) map[string]*ir.Column {
+		m := map[string]*ir.Column{}
+		for _, c := range cols {
+			m[c.Name] = c
+		}
+		return m
+	}
+	for _, tc := range []struct {
+		name   string
+		f      *functionalKeyPart
+		source *ir.Table
+		tgt    map[string]*ir.Column
+		armed  map[string]armedCollation
+		want   bool
+	}{
+		{
+			"mysql: the generated column's base column is armed", gpart,
+			mysqlSrc("utf8mb4_0900_ai_ci", k(bin), g), tgt(k(ci), g),
+			map[string]armedCollation{"k": {charset: "utf8mb4", collation: "utf8mb4_bin"}},
+			true,
+		},
+		{"mysql: generated control (base column aligned)", gpart, mysqlSrc("utf8mb4_0900_ai_ci", k(bin), g), tgt(k(bin), g), nil, false},
+		{"mysql: the base column's source collation unknown", gpart, mysqlSrc("utf8mb4_0900_ai_ci", k(ir.Varchar{Length: 20}), g), tgt(k(ci), g), nil, true},
+		{"mysql: the source lacks the base column", gpart, mysqlSrc("utf8mb4_0900_ai_ci", g), tgt(k(ci), g), nil, true},
+		{
+			// Through the Postgres route the base column is not held to the
+			// index's collation (g's declaration is what the expression reads).
+			"postgres: base column declared under another collation, unarmed", gpart,
+			src(&ir.Column{Name: "k", Type: pgSameName}, &ir.Column{Name: "g", Type: pgSameName}),
+			tgt(k(ci), g), nil, false,
+		},
+		{
+			"mysql: VARBINARY on the source, VARCHAR on the target", part(true, "utf8mb4_0900_ai_ci"),
+			mysqlSrc("utf8mb4_0900_ai_ci", k(ir.Varbinary{Length: 20})), tgt(k(ci)), nil, true,
+		},
+		{
+			"mysql: INT on the source, VARCHAR on the target", part(true, "utf8mb4_0900_ai_ci"),
+			mysqlSrc("utf8mb4_0900_ai_ci", k(ir.Integer{Width: 32})), tgt(k(ci)), nil, true,
+		},
+		{
+			"mysql: INT on both sides", part(true, "utf8mb4_0900_ai_ci"),
+			mysqlSrc("utf8mb4_0900_ai_ci", k(ir.Integer{Width: 32})), tgt(k(ir.Integer{Width: 32})), nil, false,
+		},
+		{
+			"postgres: INT on the source, VARCHAR on the target", part(true, "utf8mb4_0900_ai_ci"),
+			src(&ir.Column{Name: "k", Type: ir.Integer{Width: 32}}, &ir.Column{Name: "s", Type: pgDefault}), tgt(k(ci)), nil, true,
+		},
+	} {
+		if got := functionalPartArms(tc.f, tc.source, tc.tgt, tc.armed, mysqlKeyGuardCollations); got != tc.want {
 			t.Errorf("%s: arms %v; want %v", tc.name, got, tc.want)
 		}
 	}
