@@ -219,4 +219,10 @@ func TestStreamer_ViewsOnlyNamespace_PostgresSingle_RefusesViewsOnly(t *testing.
 	if err := newStreamer(true).Run(ctx); err != nil {
 		t.Fatalf("--skip-views must leave nothing to refuse over; got %v", err)
 	}
+	// The dry run refuses what the real run refuses.
+	dry := newStreamer(false)
+	dry.DryRun = true
+	if err := dry.Run(ctx); err == nil || !strings.Contains(err.Error(), "SYNC-VIEWS-ONLY-NAMESPACE") {
+		t.Fatalf("sync --dry-run of a views-only schema: want SYNC-VIEWS-ONLY-NAMESPACE; got %v", err)
+	}
 }
