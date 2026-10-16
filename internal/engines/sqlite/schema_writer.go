@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/translate"
 )
 
 // Compile-time proof the SQLite write side satisfies the orchestrator's
@@ -256,6 +257,11 @@ func (w *SchemaWriter) CreateViews(ctx context.Context, s *ir.Schema) error {
 	// whose schema already exists).
 	if err := validateSQLiteViewNamespace(s.Tables, s.Views); err != nil {
 		return err
+	}
+	// Bug 314: a body that crossed from MySQL, or from a non-public Postgres
+	// schema, would now parse here and compute differently.
+	if err := translate.RefuseUnportableViews(s, "sqlite"); err != nil {
+		return fmt.Errorf("sqlite: %w", err)
 	}
 	for _, view := range s.Views {
 		if view == nil || view.Name == "" {

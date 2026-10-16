@@ -18,6 +18,7 @@ import (
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
+	"sluicesync.dev/sluice/internal/translate"
 )
 
 // TestMigrate_PostgresView_ReadsTheTargetSchema is Bug 314's Postgres arm
@@ -77,7 +78,8 @@ func TestMigrate_PostgresView_ReadsTheTargetSchema(t *testing.T) {
 	}{
 		{"app to app2", pg, withPGSchema(pgSource, "app"), pgTarget, "app2", "pgx", []string{"app2.v", "app2.mv"}, nil, "1:src-a,2:src-b"},
 		{"public to app3", pg, pgSource, pgTarget, "app3", "pgx", []string{"app3.pv"}, nil, "1:pub"},
-		{"app to mysql", my, withPGSchema(pgSource, "app"), myTarget, "", "mysql", []string{"v"}, []string{"mv"}, "1:src-a,2:src-b"},
+		// public bodies never carried a qualifier: copied verbatim, unchanged.
+		{"public to mysql", my, pgSource, myTarget, "", "mysql", []string{"pv"}, nil, "1:pub"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -104,6 +106,41 @@ func TestMigrate_PostgresView_ReadsTheTargetSchema(t *testing.T) {
 			}
 		})
 	}
+
+	// A non-public Postgres body used to name its schema, so it could never
+	// be created on MySQL. Unqualified, it would create and compute in
+	// MySQL's dialect (app.v's a/b is 3 on Postgres, 3.5000 on MySQL), so it
+	// is refused by name, before the copy.
+	t.Run("app to mysql refused", func(t *testing.T) {
+		applyPGDDL(t, pgSource, `CREATE VIEW app.vdiv AS SELECT id, id * 7 / 2 AS r FROM app.t;`)
+		applyMySQLDDL(t, mySource, `CREATE DATABASE refuse_tgt;`)
+		tgt, err := buildMySQLDSN(mySource, "refuse_tgt")
+		if err != nil {
+			t.Fatalf("dsn: %v", err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		defer cancel()
+		mig := &Migrator{
+			Source: pg, Target: my, SourceDSN: withPGSchema(pgSource, "app"), TargetDSN: tgt,
+			MigrationID: "bug314-cross-engine", ViewFilter: ViewFilter{Exclude: []string{"mv"}},
+		}
+		err = mig.Run(ctx)
+		if err == nil || !strings.Contains(err.Error(), translate.ViewCrossDialectMarker) || !strings.Contains(err.Error(), "vdiv") {
+			t.Fatalf("want the %s refusal naming vdiv, got: %v", translate.ViewCrossDialectMarker, err)
+		}
+		db, oerr := sql.Open("mysql", tgt)
+		if oerr != nil {
+			t.Fatalf("open target: %v", oerr)
+		}
+		defer func() { _ = db.Close() }()
+		var n int
+		if err := db.QueryRowContext(ctx, "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'refuse_tgt'").Scan(&n); err != nil {
+			t.Fatalf("count target tables: %v", err)
+		}
+		if n != 0 {
+			t.Errorf("refuse_tgt holds %d tables: the refusal must come before the copy", n)
+		}
+	})
 
 	// A view over a table the run leaves out: on a non-public source its
 	// body names that table unqualified, meaning the source schema's own.

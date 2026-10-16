@@ -4274,10 +4274,11 @@ type IndexEmitPreflighter interface {
 // return later — or, where the view phase would NOT refuse because the loss
 // is silent there, the refusal that loss deserves. It must not refuse
 // anything the view phase would accept. It takes no context and opens no
-// connection. Engines that are sources only, or whose view emit cannot lose
-// a view (Postgres and MySQL both emit `CREATE OR REPLACE VIEW`, and both
-// raise loudly when the name is held by a base table), omit the method; the
-// orchestrator type-asserts and skips.
+// connection. Engines that are sources only omit the method; the
+// orchestrator type-asserts and skips. Postgres and MySQL need no namespace
+// check (both emit `CREATE OR REPLACE VIEW`, and both raise loudly when the
+// name is held by a base table) and implement the method only for Bug 314's
+// cross-engine view-body refusal, which their CreateViews also applies.
 //
 // # Why the class exists at all
 //
