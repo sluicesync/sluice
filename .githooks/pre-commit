@@ -226,7 +226,14 @@ test_args="-count=1"
 if [ "$(go env CGO_ENABLED 2>/dev/null)" = "1" ]; then
 	test_args="$test_args -race"
 fi
-if ! go test $test_args $gate_pkgs >/dev/null; then
+# Git exports GIT_DIR / GIT_INDEX_FILE to the hook. In a linked worktree
+# GIT_DIR names .git/worktrees/<name>, and with no GIT_WORK_TREE a test
+# that shells out to git from its package directory then treats that
+# directory as the work-tree root, so `git blame ../../docs/...` refuses
+# as "outside repository" (TestRoadmapUnreleasedClaimsAreNotContradictedByATag,
+# 2026-10-15). The tests find the repository from their own directory, as
+# they do under plain `go test`, so drop the hook's git variables for them.
+if ! env -u GIT_DIR -u GIT_INDEX_FILE -u GIT_WORK_TREE -u GIT_PREFIX go test $test_args $gate_pkgs >/dev/null; then
 	red "pre-commit: tests failed."
 	echo "Run: go test ./...  (to see the failure)"
 	exit 1
