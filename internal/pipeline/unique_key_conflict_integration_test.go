@@ -357,3 +357,69 @@ func TestStreamer_UniqueKeyConflict_TriggerCDC(t *testing.T) {
 		return kttcStreamer(t, src, tgt, cell.streamID)
 	})
 }
+
+// TestStreamer_UniqueKeyConflict_TradeRemedy provokes the guard's stated
+// false refusal (UNIQUE-KEY-GUARD-OVERLAP-REFUSAL) and measures the remedy
+// the refusal prints. MySQL → MySQL, kd with no primary key and two unique
+// keys (id, k). While the stream is stopped the source inserts (3,'c') and
+// then moves it to id 4, and the TARGET is made to hold (4,'c') already —
+// the state a re-delivery window leaves (a lock-free capture's or the
+// auto-shard stitch's overlap, a broker re-run without apply marks): the
+// target ahead of the change being replayed. The replayed INSERT (3,'c')
+// matches (4,'c') through k and disagrees on id, which is exactly a merge's
+// shape, so it refuses. The refusal names two remedies; the source still
+// declares both keys, so the one that applies is the re-copy,
+// `--restart-from-scratch` with the same stream id. That must converge:
+// the target equal to the source by id.
+func TestStreamer_UniqueKeyConflict_TradeRemedy(t *testing.T) {
+	myNew, myCleanup := ukcMySQLServer(t)
+	defer myCleanup()
+	src, tgt := myNew("ukctr_s"), myNew("ukctr_t")
+	src.exec(t, ukcCreate("mysql", true))
+	cell := twfbCell{src: src, tgt: tgt, streamID: "ukctr"}
+	cell.coldStartAndStop(t, "kd", 2)
+
+	src.exec(t, "INSERT INTO kd VALUES (3,'c','three'); UPDATE kd SET id = 4 WHERE id = 3")
+	tgt.exec(t, "INSERT INTO kd VALUES (4,'c','three')")
+
+	run := startTWFBRun(cell.streamer())
+	deadline := time.Now().Add(90 * time.Second)
+	for time.Now().Before(deadline) && !run.exited() {
+		time.Sleep(300 * time.Millisecond)
+	}
+	if !run.exited() {
+		_ = run.stop(t)
+		t.Fatalf("the replay onto a target ahead of it did not refuse (target %s)", ukcRender(ukcRows(t, tgt)))
+	}
+	refusal := run.err
+	if !errors.Is(refusal, ir.ErrUniqueKeyConflictOtherRow) || !strings.Contains(refusal.Error(), "--restart-from-scratch") {
+		t.Fatalf("refused with %v; want %s naming --restart-from-scratch", refusal, ir.ErrUniqueKeyConflictOtherRow)
+	}
+	t.Logf("refusal: %v", refusal)
+
+	// The printed remedy, as an operator would run it.
+	s := cell.streamer()
+	s.RestartFromScratch = true
+	run = startTWFBRun(s)
+	deadline = time.Now().Add(180 * time.Second)
+	for time.Now().Before(deadline) && !run.exited() {
+		if ukcRender(ukcRows(t, src)) == ukcRender(ukcRows(t, tgt)) {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if run.exited() && run.err != nil && !errors.Is(run.err, context.Canceled) {
+		t.Fatalf("the remedy run failed: %v", run.err)
+	}
+	cell.waitStreaming(t, run)
+	src.exec(t, "INSERT INTO kd VALUES (5,'e','five')")
+	if !tgt.waitRow(t, "kd", 5, run, 60*time.Second) {
+		t.Fatalf("the stream did not resume after the remedy (%v)", run.stop(t))
+	}
+	if err := run.stop(t); err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("the remedy run stopped with %v", err)
+	}
+	if s, g := ukcRender(ukcRows(t, src)), ukcRender(ukcRows(t, tgt)); s != g {
+		t.Fatalf("the remedy did not converge\nsource %s\ntarget %s", s, g)
+	}
+}

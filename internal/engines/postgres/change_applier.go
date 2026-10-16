@@ -3007,7 +3007,7 @@ func buildGuardedInsertSQL(schema, table string, row ir.Row, key []string, colTy
 		guard = nil
 		identity = nil
 	}
-	if identity != nil && len(identity.columns(cols)) == 0 {
+	if identity != nil && !identity.armedFor(cols) {
 		identity = nil // the row does not supply the primary key: nothing to compare
 	}
 	var sb strings.Builder

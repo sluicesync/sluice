@@ -47,9 +47,11 @@ package mysql
 //     row as far as anything the target declares can tell, and its other
 //     columns are overwritten — the documented newer-image upsert
 //     (ChangeApplier "Identity-key behaviour"; pinned by
-//     TestChangeApplier_NoPKWithUniqueKey_Idempotent), which the ADR-0072
-//     resumable cold-start COPY needs: vtgate re-sends rows past the last
-//     checkpoint, at the source's CURRENT image, through this applier.
+//     TestChangeApplier_NoPKWithUniqueKey_Idempotent). That test's comment
+//     attributes the need to the ADR-0072 resumable cold-start COPY; since
+//     v0.99.8 an interrupted cold start resumes through the bulk-COPY path
+//     (streamer_run_phases.go, resumeCopyFrom), i.e. the copy writer, so
+//     the applier's re-deliveries are the overlap windows listed below.
 //
 //     The consequence, stated so it cannot be read as broader: a table with
 //     no primary key and exactly ONE unique key is not guarded. There the
@@ -81,14 +83,23 @@ package mysql
 //
 // The union arm has the same cost, wider (review MEDIUM, pinned as a stated
 // trade): on a table without a primary key (or with a surrogate one the rows
-// do not supply) and two or more unique keys, the SAME source row re-sent in
-// a newer image whose OTHER unique column changed — kd(id UNIQUE, k UNIQUE),
-// target (3,'c'), the source updated id to 4, an ADR-0072 resumable VStream
-// cold start re-sends (4,'c') — is the same statement as a merge and refuses.
-// It lands only where such a row is re-delivered onto a target that already
-// holds an older image AND one of its unique columns changed in between; it
-// is not every resume of such a table. No narrowing is sound: the merge and
-// the re-send differ only in source history the applier does not hold.
+// do not supply) and two or more unique keys, the SAME source row re-applied
+// in an image whose OTHER unique column differs from the target's —
+// kd(id UNIQUE, k UNIQUE): the source inserts (3,'c') and then moves it to id
+// 4, the target already holds (4,'c'), and the INSERT (3,'c') is replayed —
+// is the same statement as a merge and refuses. It needs a re-delivery of an
+// applied change onto a target that is already AHEAD of it; by code reading
+// those paths are the lock-free MySQL capture's overlap (the CDC tail starts
+// at the pre-snapshot position, resolveLockFreeCapture), the VStream
+// auto-shard stitch window (P_start = the per-shard minimum,
+// stitchSnapshotMin), and a broker re-run without apply marks. Not measured
+// on those paths; provoked directly by
+// TestStreamer_UniqueKeyConflict_TradeRemedy, which also measures the printed
+// remedy (--restart-from-scratch, same stream id) converging. The ADR-0072
+// resume is NOT such a path: it runs through the copy writer, which absorbs a
+// conflict through a key the source declares. No narrowing is sound: the
+// merge and the re-applied row differ only in source history the applier does
+// not hold.
 // UNIQUE-KEY-GUARD-OVERLAP-REFUSAL in the audit backlog.
 //
 // # Mechanism
@@ -216,7 +227,7 @@ func uniqueKeyColumnSets(keys targetUniqueKeys) [][]string {
 // hang column when only the identity guard is armed. assign is "" when
 // neither is; ok is false when coll cannot reference a key column's
 // incoming value (the caller refuses).
-func renderUpsertGuard(tableRef string, cols, pk []string, upsert upsertSpelling, identity []string, scope [][]string, coll *keyCollationPlan) (assign, hang string, ok bool) {
+func renderUpsertGuard(tableRef string, cols, pk []string, upsert upsertSpelling, identity []string, scope [][]scopePart, coll *keyCollationPlan) (assign, hang string, ok bool) {
 	check := func(h string) string { return identityCheckValue(tableRef, upsert, identity, scope, h) }
 	switch {
 	case coll != nil:
@@ -246,7 +257,7 @@ func renderUpsertGuard(tableRef string, cols, pk []string, upsert upsertSpelling
 // row on every column of at least one of them (`=`, so a NULL never agrees —
 // a unique key never matches through a NULL), else the conflict came through
 // another key and is absorbed. nil applies the check to every conflict.
-func identityCheckValue(tableRef string, upsert upsertSpelling, identity []string, scope [][]string, hang string) string {
+func identityCheckValue(tableRef string, upsert upsertSpelling, identity []string, scope [][]scopePart, hang string) string {
 	eq := make([]string, len(identity))
 	for i, c := range identity {
 		eq[i] = tableRef + "." + quoteIdent(c) + " <=> " + upsert.newRowRef(quoteIdent(c))
@@ -259,7 +270,7 @@ func identityCheckValue(tableRef string, upsert upsertSpelling, identity []strin
 		for i, key := range scope {
 			parts := make([]string, len(key))
 			for j, c := range key {
-				parts[j] = tableRef + "." + quoteIdent(c) + " = " + upsert.newRowRef(quoteIdent(c))
+				parts[j] = c.of(tableRef+"."+quoteIdent(c.col)) + " = " + c.of(upsert.newRowRef(quoteIdent(c.col)))
 			}
 			agree[i] = "COALESCE((" + strings.Join(parts, " AND ") + "), FALSE)"
 		}
@@ -369,10 +380,18 @@ func applyUniqueKeyConflictRemedy(keyNames []string, schema, table string) strin
 	if len(keyNames) == 1 {
 		drop = "`ALTER TABLE " + quoteIdent(schema) + "." + quoteIdent(table) + " DROP INDEX " + quoteIdent(keyNames[0]) + "`"
 	}
-	return fmt.Sprintf("Check whether the source still declares that key. If it does not, drop it on the target (%s) "+
+	check := "Check whether the source still declares that key."
+	if len(keyNames) > 1 {
+		// The statement cannot say which key matched, let alone which one the
+		// source dropped: name the work instead of guessing.
+		check = "The target has more than one unique key besides the primary key, and sluice cannot tell which " +
+			"one the conflict came through or which one the source no longer declares: check EACH against the source."
+	}
+	return fmt.Sprintf("%s If the source no longer declares one, drop it on the target (%s) "+
 		"and restart with the same --stream-id: the row then lands beside the one it matched, as on the source. If "+
-		"the source still declares it, the matched target row is stale (a unique value that moved between rows "+
-		"inside a re-delivery window) and a re-copy converges: restart with --restart-from-scratch.", drop)
+		"the source still declares every one, the matched target row is stale (a newer image of a row, or a unique "+
+		"value that moved between rows, inside a re-delivery window) and a re-copy converges: restart with "+
+		"--restart-from-scratch and the same --stream-id.", check, drop)
 }
 
 // undeclaredUniqueKeys returns the target's unique keys besides its primary
@@ -390,7 +409,7 @@ func applyUniqueKeyConflictRemedy(keyNames []string, schema, table string) strin
 // stale target row the copy is meant to refresh (a VStream catchup
 // re-emission, a resumed copy over rows the source changed since), and the
 // source's own key guarantees the copied rows cannot collide on it.
-func undeclaredUniqueKeys(table *ir.Table, keys targetUniqueKeys) (rendered, names []string, cols [][]string) {
+func undeclaredUniqueKeys(table *ir.Table, keys targetUniqueKeys) (rendered, names []string, cols [][]scopePart) {
 	declaredFunctional := map[string]bool{}
 	declaredCols := map[string]bool{}
 	add := func(idx *ir.Index) {
@@ -443,12 +462,44 @@ func undeclaredUniqueKeys(table *ir.Table, keys targetUniqueKeys) (rendered, nam
 		rendered = append(rendered, all[i])
 		names = append(names, name)
 		if plain {
-			cols = append(cols, append([]string(nil), keyCols...))
+			cols = append(cols, scopeParts(keyCols, keys, i))
 		} else {
 			cols = append(cols, nil)
 		}
 	}
 	return rendered, names, cols
+}
+
+// scopePart is one key part of an undeclared key in the copy writer's
+// scope: its column and its index prefix length (SUB_PART; 0 for the whole
+// column). The server matches through a prefix key on the prefix alone, so
+// the scope compares LEFT(x, sub) — comparing whole values let (99,'abcde2')
+// be absorbed into (1,'abcde1') through an undeclared k(5) (review round 3,
+// measured on mysql:8.4), as the key-collation guard learned for its own
+// prefix parts.
+type scopePart struct {
+	col string
+	sub int
+}
+
+// of renders x as this part's compared value.
+func (p scopePart) of(x string) string {
+	if p.sub <= 0 {
+		return x
+	}
+	return "LEFT(" + x + ", " + strconv.Itoa(p.sub) + ")"
+}
+
+// scopeParts is key i's columns with their prefix lengths.
+func scopeParts(cols []string, keys targetUniqueKeys, i int) []scopePart {
+	out := make([]scopePart, len(cols))
+	for j, c := range cols {
+		out[j] = scopePart{col: c}
+		if i < len(keys.uniqueSubs) && j < len(keys.uniqueSubs[i]) {
+			out[j].sub = keys.uniqueSubs[i][j]
+		}
+	}
+	return out
 }
 
 // copyGuardScope is the copy writer's per-key scope for the identity check
@@ -458,7 +509,7 @@ func undeclaredUniqueKeys(table *ir.Table, keys targetUniqueKeys) (rendered, nam
 // declared key and is absorbed. nil — the check applies to every conflict —
 // when an undeclared key has a functional part, whose match cannot be told
 // from its columns.
-func copyGuardScope(undeclaredCols [][]string) [][]string {
+func copyGuardScope(undeclaredCols [][]scopePart) [][]scopePart {
 	for _, c := range undeclaredCols {
 		if len(c) == 0 {
 			return nil

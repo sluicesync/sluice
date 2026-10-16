@@ -58,11 +58,11 @@ package postgres
 // and a DROP made while the stream was stopped is the filed stream-open
 // comparison (UNIQUE-KEY-STOPPED-WINDOW-DOOR).
 //
-// The cost of the union arm, stated: a newer image of the SAME source row
-// whose other unique column changed (a keyless row whose `email` was
-// updated, re-sent by an ADR-0072 resume or replayed in an overlap window
-// onto a target that already holds the update) refuses where it used to
-// converge — loud (UNIQUE-KEY-GUARD-OVERLAP-REFUSAL).
+// The cost of the union arm, stated: an image of the SAME source row whose
+// other unique column differs from the target's (a keyless row whose `email`
+// was updated, replayed in a re-delivery window onto a target already ahead
+// of it) refuses where it used to converge — loud
+// (UNIQUE-KEY-GUARD-OVERLAP-REFUSAL, which lists the paths).
 //
 // The comparison is on each value's text form under COLLATE "C" — every
 // type has a text output, while some (json) have no equality operator at
@@ -153,10 +153,22 @@ func (a *ChangeApplier) conflictIdentityFor(ctx context.Context, schema, table s
 	return newPGConflictIdentity(pk, key, uniqueCols), nil
 }
 
-// uniqueIndexColumnsFor returns, cached per table, every unique index's
-// plain key columns (expression elements skipped; the primary key
-// excluded). A partial index counts: agreeing on its columns is required of
-// the same row whether or not the predicate covers it.
+// uniqueIndexColumnsFor returns, cached per table, one entry per valid
+// unique index (the primary key excluded): the columns its key reads — a
+// plain element its column, an EXPRESSION element every column the
+// expression reads (the Vars of pg_index.indexprs, as the MySQL guard takes a
+// functional part's read columns, uniqueKeyColumnSets). An index is never
+// dropped from the count: round 3 of the review measured that skipping
+// expression elements made UNIQUE(code) beside UNIQUE(lower(email)) look
+// like a one-index table, left the guard unarmed, and let INSERT
+// (99,'y@a','a',…) ON CONFLICT (code) DO UPDATE replace row 1 silently.
+//
+// An index with an expression element whose columns cannot be named — one
+// reading no column, or a whole-row reference — is returned as a nil entry:
+// nothing the guard can compare tells its matches apart, so the table's
+// guard refuses every conflict ([pgConflictIdentity.columns]) rather than
+// leave that index out. A partial index counts too; its predicate's columns
+// are not part of its key and are not read.
 func (a *ChangeApplier) uniqueIndexColumnsFor(ctx context.Context, schema, table string) ([][]string, error) {
 	qn := schemaTableKey(schema, table)
 	a.cacheMu.RLock()
@@ -165,33 +177,56 @@ func (a *ChangeApplier) uniqueIndexColumnsFor(ctx context.Context, schema, table
 	if ok {
 		return v, nil
 	}
+	// One row per index. keycols: the plain elements' columns. exprcols: the
+	// columns the expression elements read. nexpr: how many expression
+	// elements. wholerow: an expression Var with varattno 0 (the whole row).
+	// The unit separator joins names so a comma in an identifier cannot split
+	// one.
 	rows, err := a.db.QueryContext(ctx, `
-		SELECT ix.indexrelid, a.attname
+		SELECT ix.indexrelid,
+		       COALESCE((SELECT pg_catalog.string_agg(a.attname, E'\x1f' ORDER BY u.ord)
+		                 FROM pg_catalog.unnest(ix.indkey) WITH ORDINALITY AS u(attnum, ord)
+		                 JOIN pg_attribute a ON a.attrelid = ix.indrelid AND a.attnum = u.attnum
+		                 WHERE u.attnum > 0), ''),
+		       COALESCE((SELECT pg_catalog.string_agg(DISTINCT a.attname, E'\x1f')
+		                 FROM pg_catalog.regexp_matches(COALESCE(ix.indexprs::text, ''), ':varattno (-?[0-9]+)', 'g') AS m
+		                 JOIN pg_attribute a ON a.attrelid = ix.indrelid AND a.attnum = m[1]::int2
+		                 WHERE m[1]::int > 0), ''),
+		       (SELECT pg_catalog.count(*) FROM pg_catalog.unnest(ix.indkey) AS u(attnum) WHERE u.attnum = 0),
+		       EXISTS (SELECT 1 FROM pg_catalog.regexp_matches(COALESCE(ix.indexprs::text, ''), ':varattno (-?[0-9]+)', 'g') AS m
+		               WHERE m[1]::int <= 0)
 		FROM   pg_index ix
 		JOIN   pg_class      tcl ON tcl.oid = ix.indrelid
 		JOIN   pg_namespace  n   ON n.oid   = tcl.relnamespace
-		JOIN   LATERAL pg_catalog.unnest(ix.indkey) WITH ORDINALITY AS u(attnum, ord) ON TRUE
-		JOIN   pg_attribute  a   ON a.attrelid = ix.indrelid AND a.attnum = u.attnum
 		WHERE  n.nspname = $1 AND tcl.relname = $2
 		  AND  ix.indisunique AND NOT ix.indisprimary AND ix.indisvalid
-		ORDER  BY ix.indexrelid, u.ord`, schema, table)
+		ORDER  BY ix.indexrelid`, schema, table)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out [][]string
-	var last uint32
 	for rows.Next() {
-		var oid uint32
-		var col string
-		if err := rows.Scan(&oid, &col); err != nil {
+		var (
+			oid               uint32
+			keyCols, exprCols string
+			nExpr             int
+			wholeRow          bool
+		)
+		if err := rows.Scan(&oid, &keyCols, &exprCols, &nExpr, &wholeRow); err != nil {
 			return nil, err
 		}
-		if len(out) == 0 || oid != last {
-			out = append(out, nil)
-			last = oid
+		if nExpr > 0 && (exprCols == "" || wholeRow) {
+			out = append(out, nil) // an expression the guard cannot name the columns of
+			continue
 		}
-		out[len(out)-1] = append(out[len(out)-1], col)
+		var set []string
+		for _, s := range []string{keyCols, exprCols} {
+			if s != "" {
+				set = append(set, strings.Split(s, "\x1f")...)
+			}
+		}
+		out = append(out, set)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -208,8 +243,10 @@ func (a *ChangeApplier) uniqueIndexColumnsFor(ctx context.Context, schema, table
 // columns is the identity an insert of cols must find on the matched row:
 // the primary key when the insert names every column of it, else the union
 // of the unique indexes' columns when there are two or more and the insert
-// names every one, else nil (unarmed for that statement).
-func (g *pgConflictIdentity) columns(cols []string) []string {
+// names every one, else nil (unarmed for that statement). refuseAll is true
+// when the union arm applies and an index's columns cannot be named (a nil
+// entry, [ChangeApplier.uniqueIndexColumnsFor]): every conflict refuses.
+func (g *pgConflictIdentity) columns(cols []string) (ident []string, refuseAll bool) {
 	have := make(map[string]bool, len(cols))
 	for _, c := range cols {
 		have[c] = true
@@ -230,17 +267,26 @@ func (g *pgConflictIdentity) columns(cols []string) []string {
 	}
 	if len(g.pk) > 0 {
 		if out := pick(g.pk); out != nil {
-			return out
+			return out, false
 		}
 	}
 	if len(g.uniqueCols) < 2 {
-		return nil
+		return nil, false
 	}
 	var union []string
 	for _, k := range g.uniqueCols {
+		if k == nil {
+			return nil, true
+		}
 		union = append(union, k...)
 	}
-	return pick(union)
+	return pick(union), false
+}
+
+// armedFor reports whether an insert of cols carries the guard.
+func (g *pgConflictIdentity) armedFor(cols []string) bool {
+	ident, refuseAll := g.columns(cols)
+	return len(ident) > 0 || refuseAll
 }
 
 // wrap returns the DO UPDATE's predicate for an insert of cols: inner (the
@@ -251,17 +297,21 @@ func (g *pgConflictIdentity) wrap(cols []string, inner string) string {
 	if g == nil {
 		return inner
 	}
-	ident := g.columns(cols)
-	if len(ident) == 0 {
+	ident, refuseAll := g.columns(cols)
+	if len(ident) == 0 && !refuseAll {
 		return inner
 	}
-	eq := make([]string, len(ident))
-	for i, c := range ident {
-		eq[i] = "(" + quoteIdent(keyCollationExistingAlias) + "." + quoteIdent(c) + ")::text COLLATE \"C\" IS NOT DISTINCT FROM (EXCLUDED." +
-			quoteIdent(c) + ")::text COLLATE \"C\""
+	cond := "false"
+	if !refuseAll {
+		eq := make([]string, len(ident))
+		for i, c := range ident {
+			eq[i] = "(" + quoteIdent(keyCollationExistingAlias) + "." + quoteIdent(c) + ")::text COLLATE \"C\" IS NOT DISTINCT FROM (EXCLUDED." +
+				quoteIdent(c) + ")::text COLLATE \"C\""
+		}
+		cond = strings.Join(eq, " AND ")
 	}
 	raise := "(('" + uniqueKeyConflictMarker + "' || pg_catalog.left(pg_catalog.concat(EXCLUDED." + quoteIdent(cols[0]) + "), 0))::int IS NULL)"
-	return "CASE WHEN " + strings.Join(eq, " AND ") + " THEN " + inner + " ELSE " + raise + " END"
+	return "CASE WHEN " + cond + " THEN " + inner + " ELSE " + raise + " END"
 }
 
 // isUniqueKeyConflictRaise reports whether err is the guard's raise: an
@@ -283,14 +333,20 @@ func applyUniqueKeyConflictError(err error, g *pgConflictIdentity, schema, table
 		quoted[i] = quoteIdent(c)
 	}
 	keyDesc := "the unique index on (" + strings.Join(quoted, ", ") + "), this table's ON CONFLICT key"
+	check := "Check whether the source still declares that index."
+	if len(g.pk) == 0 && len(g.uniqueCols) >= 2 {
+		keyDesc += ", or another of its unique indexes the matched row disagrees on"
+		check = "The table has more than one unique index, and sluice cannot tell which one the source no longer " +
+			"declares: check EACH against the source."
+	}
 	return &ir.UniqueKeyConflictError{
 		Schema: schema, Table: table, Cause: err, Keys: keyDesc,
-		Remedy: "Check whether the source still declares that index. If it does not, drop it on the target " +
+		Remedy: check + " If the source no longer declares one, drop it on the target " +
 			"(`DROP INDEX <schema>.<index>`; find it with `\\d " + quoteIdent(schema) + "." + quoteIdent(table) + "`) and " +
-			"restart with the same --stream-id — the table then has no conflict key and the row lands beside the one it " +
-			"matched, as on the source. If the source still declares it, the matched target row is stale (a newer " +
+			"restart with the same --stream-id, so the row lands beside the one it " +
+			"matched, as on the source. If the source still declares every one, the matched target row is stale (a newer " +
 			"version of it, or a unique value that moved between rows, inside a re-delivery window) and a re-copy " +
-			"converges: restart with --restart-from-scratch.",
+			"converges: restart with --restart-from-scratch and the same --stream-id.",
 	}
 }
 

@@ -268,3 +268,45 @@ func TestUniqueKeyConflictGuard_CopyWriter(t *testing.T) {
 		}
 	}
 }
+
+// TestUniqueKeyConflictGuard_CopyWriterPrefixKey pins the per-key scope on a
+// PREFIX key (review round 3, measured on mysql:8.4): an undeclared UNIQUE
+// c(5) matches 'abcde2' against 'abcde1' on the prefix alone, so the scope
+// must compare LEFT(c, 5); comparing whole values absorbed (99,'abcde2') into
+// row 1 at exit 0.
+func TestUniqueKeyConflictGuard_CopyWriterPrefixKey(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+	src := &ir.Table{
+		Name: "kp",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 32}},
+			{Name: "c", Type: ir.Varchar{Length: 20}},
+		},
+		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}},
+	}
+	for _, srv := range kcgServers(t) {
+		t.Run(srv.name, func(t *testing.T) {
+			db := "ukc_prefix_" + strings.NewReplacer("-", "", ".", "").Replace(srv.name)
+			dsn, cleanup := srv.newDB(t, db)
+			defer cleanup()
+			applyDDL(t, dsn, "CREATE TABLE kp (id INT NOT NULL PRIMARY KEY, c VARCHAR(20), UNIQUE KEY kp_c (c(5)))")
+			applyDDL(t, dsn, "INSERT INTO kp VALUES (1,'abcde1')")
+			w, err := srv.eng.OpenRowWriter(ctx, dsn)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer closeIf(w)
+			rows := make(chan ir.Row, 1)
+			rows <- ir.Row{"id": int64(99), "c": "abcde2"}
+			close(rows)
+			err = w.(ir.IdempotentRowWriter).WriteRowsIdempotent(ctx, src, rows)
+			if !errors.Is(err, ir.ErrUniqueKeyConflictOtherRow) {
+				t.Fatalf("err = %v; want %s", err, ir.ErrUniqueKeyConflictOtherRow)
+			}
+			if got, want := ukcRows(t, dsn, "SELECT CONCAT_WS(':', id, c) FROM kp"), "1:abcde1"; got != want {
+				t.Fatalf("target %s; want %s", got, want)
+			}
+		})
+	}
+}

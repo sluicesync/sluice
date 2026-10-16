@@ -37,7 +37,7 @@ func gc2Base() *pgRelationFacts {
 			3: {name: "tenant", typ: "text", notNull: true, def: "'a'::text"},
 		},
 		uniqueIndexes: map[string]pgConstraintFact{
-			"x_uidx": {kind: "i", compare: "unique index key=2 option=0 nulls_not_distinct=false pred= exprs=", display: "CREATE UNIQUE INDEX x_uidx ON public.t USING btree (x)", attnums: []int16{2}},
+			"x_uidx": {kind: "i", compare: "unique index key=2 option=0 nulls_not_distinct=false pred= exprs=", display: "CREATE UNIQUE INDEX x_uidx ON public.t USING btree (x)", attnums: []int16{2}, identity: "x class_coll=1978 0"},
 		},
 	}
 }
@@ -395,11 +395,21 @@ func TestDiffRelationFacts_PlainUniqueIndex(t *testing.T) {
 	if d := diffRelationFacts(gc2Base(), idxRenamed); len(d) != 0 {
 		t.Errorf("an ALTER INDEX RENAME refused: %q", d)
 	}
+	// Same structure under a new name but another collation (identity differs):
+	// not a rename.
+	recollated := cloneFacts(gc2Base())
+	ru := recollated.uniqueIndexes["x_uidx"]
+	ru.identity = "x class_coll=1978 950"
+	recollated.uniqueIndexes["x_uidx_c"] = ru
+	delete(recollated.uniqueIndexes, "x_uidx")
+	if d := diffRelationFacts(gc2Base(), recollated); len(d) != 2 {
+		t.Errorf("a new-name CREATE with another collation: deltas %q; want DROP and CREATE", d)
+	}
 	// A DROP of one index and a CREATE of a DIFFERENT one under another name
 	// is not a rename: both refuse.
 	swapped := cloneFacts(gc2Base())
 	delete(swapped.uniqueIndexes, "x_uidx")
-	swapped.uniqueIndexes["tenant_uidx"] = pgConstraintFact{kind: "i", compare: "unique index key=3", display: "CREATE UNIQUE INDEX tenant_uidx ON public.t USING btree (tenant)", attnums: []int16{3}}
+	swapped.uniqueIndexes["tenant_uidx"] = pgConstraintFact{kind: "i", compare: "unique index key=3", display: "CREATE UNIQUE INDEX tenant_uidx ON public.t USING btree (tenant)", attnums: []int16{3}, identity: "tenant class_coll=3126 100"}
 	if d := diffRelationFacts(gc2Base(), swapped); len(d) != 2 {
 		t.Errorf("a DROP plus a different CREATE: deltas %q; want both", d)
 	}

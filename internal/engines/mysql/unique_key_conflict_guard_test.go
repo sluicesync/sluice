@@ -183,6 +183,18 @@ func TestUpsertGuardRefusal_Attribution(t *testing.T) {
 // is declared by a source unique index over the same columns and prefix
 // lengths (its name does not count, so a key redefined under the old name
 // arms); a functional key is declared only by name; anything else arms.
+func TestApplyUniqueKeyConflictRemedy_TwoKeysSaysCheckEach(t *testing.T) {
+	one := applyUniqueKeyConflictRemedy([]string{"kd_k"}, "s", "kd")
+	if !strings.Contains(one, "DROP INDEX `kd_k`") || strings.Contains(one, "EACH") {
+		t.Errorf("one key: %s", one)
+	}
+	two := applyUniqueKeyConflictRemedy([]string{"kd_k", "kd_zid"}, "s", "kd")
+	if !strings.Contains(two, "check EACH against the source") || !strings.Contains(two, "DROP INDEX <key>") ||
+		!strings.Contains(two, "--restart-from-scratch and the same --stream-id") {
+		t.Errorf("two keys: %s", two)
+	}
+}
+
 func TestUndeclaredUniqueKeys(t *testing.T) {
 	src := &ir.Table{
 		Name:       "kd",
@@ -209,13 +221,13 @@ func TestUndeclaredUniqueKeys(t *testing.T) {
 	if got[0] != "tgt_v (v)" {
 		t.Errorf("rendered %q", got[0])
 	}
-	if cols[2] != nil || strings.Join(cols[0], ",") != "v" {
-		t.Errorf("columns %v; want v first and nil for the functional key", cols)
+	if cols[2] != nil || len(cols[0]) != 1 || cols[0][0] != (scopePart{col: "v"}) || cols[3][0] != (scopePart{col: "p", sub: 9}) {
+		t.Errorf("columns %v; want v first, nil for the functional key, p with its prefix 9", cols)
 	}
 	if copyGuardScope(cols) != nil {
 		t.Error("a functional undeclared key must widen the scope to every conflict")
 	}
-	if s := copyGuardScope([][]string{{"v"}, {"w"}}); len(s) != 2 {
+	if s := copyGuardScope([][]scopePart{{{col: "v"}}, {{col: "w"}}}); len(s) != 2 {
 		t.Errorf("plain undeclared keys: scope %v", s)
 	}
 }

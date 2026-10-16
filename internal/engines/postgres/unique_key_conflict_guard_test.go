@@ -34,17 +34,25 @@ func TestNewPGConflictIdentity(t *testing.T) {
 	if u == nil {
 		t.Fatal("unarmed on a keyless table with two unique indexes (the review's arbiter-dropped shape)")
 	}
-	if got := u.columns([]string{"id", "email", "code", "v"}); strings.Join(got, ",") != "code,email,id" {
+	if got, _ := u.columns([]string{"id", "email", "code", "v"}); strings.Join(got, ",") != "code,email,id" {
 		t.Errorf("keyless, two indexes: identity %v; want code,email,id", got)
 	}
-	if got := u.columns([]string{"code", "v"}); got != nil {
+	if got, _ := u.columns([]string{"code", "v"}); got != nil {
 		t.Errorf("a row missing an index column: identity %v; want unarmed", got)
 	}
+	// An index whose expression reads no nameable column: every conflict refuses.
+	x := newPGConflictIdentity(nil, []string{"code"}, [][]string{{"code"}, nil})
+	if _, all := x.columns([]string{"code", "v"}); !all {
+		t.Error("an unnameable expression index did not widen to refusing every conflict")
+	}
+	if w := x.wrap([]string{"code", "v"}, "true"); !strings.HasPrefix(w, "CASE WHEN false THEN") {
+		t.Errorf("refuse-all predicate: %s", w)
+	}
 	d := newPGConflictIdentity([]string{"id"}, []string{"k"}, nil) // a deferrable PK the arbiter skipped
-	if got := d.columns([]string{"id", "k", "v"}); strings.Join(got, ",") != "id" {
+	if got, _ := d.columns([]string{"id", "k", "v"}); strings.Join(got, ",") != "id" {
 		t.Errorf("deferrable primary key: identity %v; want id", got)
 	}
-	if got := d.columns([]string{"k", "v"}); got != nil {
+	if got, _ := d.columns([]string{"k", "v"}); got != nil {
 		t.Errorf("a row without the primary key: identity %v; want unarmed", got)
 	}
 }

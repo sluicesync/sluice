@@ -130,6 +130,66 @@ func TestUniqueKeyConflictGuard_Postgres(t *testing.T) {
 				}
 			})
 
+			t.Run("no primary key, an expression unique index beside the arbiter", func(t *testing.T) {
+				// Round 3 of the review, measured: with expression elements
+				// dropped from the count, UNIQUE(lower(email)) vanished, the
+				// table looked like one index, and the guard stayed unarmed —
+				// INSERT (99,'y@a','a',…) ON CONFLICT (code) replaced row 1.
+				// The mixed index (k, lower(e)) contributed only k.
+				for _, sh := range []struct{ name, ddl, rows string }{
+					{"lower(email)", `CREATE TABLE tx (id int, email text, code text NOT NULL, v text);
+						CREATE UNIQUE INDEX tx_code ON tx (code); CREATE UNIQUE INDEX tx_lemail ON tx (lower(email));
+						INSERT INTO tx VALUES (1,'x@a','a','one');`, "1:x@a:a:one"},
+					{"mixed (id, lower(email))", `CREATE TABLE tx (id int, email text, code text NOT NULL, v text);
+						CREATE UNIQUE INDEX tx_code ON tx (code); CREATE UNIQUE INDEX tx_mixed ON tx (id, lower(email));
+						INSERT INTO tx VALUES (1,'x@a','a','one');`, "1:x@a:a:one"},
+				} {
+					t.Run(sh.name, func(t *testing.T) {
+						dsn, cleanup := newSharedPGDB(t, "ukc_expr_"+strings.NewReplacer("(", "", ")", "", " ", "", ",", "").Replace(sh.name)+"_"+door)
+						defer cleanup()
+						applyPGApplier(t, dsn, sh.ddl)
+						const txRows = "SELECT concat_ws(':', id::text, email, code, v) FROM tx"
+						tx := func(pos int, id int64, email, v string) ir.Insert {
+							return ir.Insert{Position: kcgPGPos(pos), Schema: "public", Table: "tx", Row: ir.Row{"id": id, "email": email, "code": "a", "v": v}}
+						}
+						// A different row: id differs (and email, for the mixed index's
+						// expression to be the only other disagreement, id is kept 1).
+						diff := tx(1, 99, "y@a", "ninetynine")
+						if strings.HasPrefix(sh.name, "mixed") {
+							diff = tx(1, 1, "y@a", "ninetynine") // differs only in the expression's column
+						}
+						err := kcgPGApply(t, dsn, batched, diff)
+						if !errors.Is(err, ir.ErrUniqueKeyConflictOtherRow) {
+							t.Fatalf("err = %v; want %s", err, ir.ErrUniqueKeyConflictOtherRow)
+						}
+						if got := ukcPGRows(t, dsn, txRows); got != sh.rows {
+							t.Fatalf("the refusal changed the target: %s", got)
+						}
+						if err := kcgPGApply(t, dsn, batched, tx(2, 1, "x@a", "uno")); err != nil {
+							t.Fatalf("a newer-image re-send agreeing on every key refused: %v", err)
+						}
+						if got, want := ukcPGRows(t, dsn, txRows), "1:x@a:a:uno"; got != want {
+							t.Fatalf("target %s; want %s", got, want)
+						}
+					})
+				}
+			})
+
+			t.Run("no primary key, a unique index reading no column: every conflict refuses", func(t *testing.T) {
+				dsn, cleanup := newSharedPGDB(t, "ukc_const_"+door)
+				defer cleanup()
+				applyPGApplier(t, dsn, `CREATE TABLE tc (id int, code text NOT NULL, v text);
+					CREATE UNIQUE INDEX tc_code ON tc (code); CREATE UNIQUE INDEX tc_one ON tc ((1));
+					INSERT INTO tc VALUES (1,'a','one');`)
+				err := kcgPGApply(t, dsn, batched, ir.Insert{Position: kcgPGPos(1), Schema: "public", Table: "tc", Row: ir.Row{"id": int64(1), "code": "a", "v": "one"}})
+				if !errors.Is(err, ir.ErrUniqueKeyConflictOtherRow) {
+					t.Fatalf("err = %v; want the loud refusal (the guard cannot name that index's columns)", err)
+				}
+				if got, want := ukcPGRows(t, dsn, "SELECT concat_ws(':', id::text, code, v) FROM tc"), "1:a:one"; got != want {
+					t.Fatalf("target %s; want %s", got, want)
+				}
+			})
+
 			t.Run("no primary key, one unique index: the newer-image re-send still converges", func(t *testing.T) {
 				dsn, cleanup := newSharedPGDB(t, "ukc_nopk_"+door)
 				defer cleanup()

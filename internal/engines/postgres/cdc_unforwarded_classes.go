@@ -153,6 +153,12 @@ type pgConstraintFact struct {
 	compare string
 	display string
 	attnums []int16
+	// identity is, for a plain unique index, compare plus its operator classes
+	// and collations: what an ALTER INDEX … RENAME preserves and a CREATE under
+	// a new name with another collation or opclass does not
+	// ([renamedUniqueIndexes]). compare omits them, since a retype or a
+	// collation change rebuilds them.
+	identity string
 }
 
 // pgPolicyFact is one pg_policy row: compare is what the diff equates,
@@ -283,6 +289,7 @@ func readRelationFacts(ctx context.Context, db *sql.DB, relid uint32) (map[uint3
 		       pg_catalog.array_to_string(ix.indkey::int2[], ','),
 		       pg_catalog.array_to_string(ix.indoption::int2[], ','),
 		       COALESCE(pg_catalog.to_jsonb(ix)->>'indnullsnotdistinct', ''),
+		       pg_catalog.array_to_string(ix.indclass::oid[], ',') || ' ' || pg_catalog.array_to_string(ix.indcollation::oid[], ','),
 		       COALESCE(pg_catalog.regexp_replace(ix.indpred::text, ':location -?[0-9]+', '', 'g'), ''),
 		       COALESCE(pg_catalog.regexp_replace(ix.indexprs::text, ':location -?[0-9]+', '', 'g'), '')
 		FROM   pg_index ix
@@ -297,17 +304,18 @@ func readRelationFacts(ctx context.Context, db *sql.DB, relid uint32) (map[uint3
 		var (
 			oid                                 uint32
 			name, def, indkey, indoption, nulls string
-			pred, exprs                         string
+			pred, exprs, classColl              string
 		)
-		if err := rows.Scan(&oid, &name, &def, &indkey, &indoption, &nulls, &pred, &exprs); err != nil {
+		if err := rows.Scan(&oid, &name, &def, &indkey, &indoption, &nulls, &classColl, &pred, &exprs); err != nil {
 			return err
 		}
 		if f := out[oid]; f != nil {
 			f.uniqueIndexes[name] = pgConstraintFact{
-				kind:    "i",
-				compare: fmt.Sprintf("unique index key=%s option=%s nulls_not_distinct=%s pred=%s exprs=%s", indkey, indoption, nulls, pred, exprs),
-				display: def,
-				attnums: parseAttnums(indkey),
+				kind:     "i",
+				compare:  fmt.Sprintf("unique index key=%s option=%s nulls_not_distinct=%s pred=%s exprs=%s", indkey, indoption, nulls, pred, exprs),
+				display:  def,
+				attnums:  parseAttnums(indkey),
+				identity: fmt.Sprintf("unique index key=%s option=%s nulls_not_distinct=%s pred=%s exprs=%s class_coll=%s", indkey, indoption, nulls, pred, exprs, classColl),
 			}
 		}
 		return nil
@@ -574,24 +582,24 @@ func diffRelationFacts(prior, cur *pgRelationFacts) []string {
 }
 
 // renamedUniqueIndexes pairs a unique index present only in prior with one
-// present only in cur when their structural comparison values are equal and
-// that value is unique on each side among such indexes — an ALTER INDEX …
+// present only in cur when their identities (structure, operator classes and
+// collations) are equal and that identity is unique on each side among such indexes — an ALTER INDEX …
 // RENAME. Both names are returned.
 func renamedUniqueIndexes(prior, cur map[string]pgConstraintFact) map[string]bool {
 	gone, came := map[string][]string{}, map[string][]string{}
 	for name, f := range prior {
 		if _, ok := cur[name]; !ok {
-			gone[f.compare] = append(gone[f.compare], name)
+			gone[f.identity] = append(gone[f.identity], name)
 		}
 	}
 	for name, f := range cur {
 		if _, ok := prior[name]; !ok {
-			came[f.compare] = append(came[f.compare], name)
+			came[f.identity] = append(came[f.identity], name)
 		}
 	}
 	out := map[string]bool{}
-	for compare, g := range gone {
-		if c := came[compare]; len(g) == 1 && len(c) == 1 {
+	for identity, g := range gone {
+		if c := came[identity]; len(g) == 1 && len(c) == 1 {
 			out[g[0]], out[c[0]] = true, true
 		}
 	}
