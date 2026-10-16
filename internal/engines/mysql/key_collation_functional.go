@@ -56,14 +56,26 @@ package mysql
 //     nothing.
 //
 // A part ARMS its key — puts it under the guard — when its value may be a
-// collated string, whatever the column's own collation pair says (review
-// F2: a column the source and target both declare `utf8mb4_bin` still merges
-// 'e' and 'é' under a key whose CAST compares it under `_ai_ci`). So the
-// keys are read for every table, armed column or not: one catalog read per
-// table per writer, cached. A part whose value is not a string (`(j * 2)`,
-// a binary CAST) compares by value everywhere and arms nothing; inside a key
-// armed by another part it is left out (TRUE on both sides), which can only
-// widen the key's match, never hide one.
+// collated string and the source's comparison of it can differ from the
+// index's ([functionalPartArms]): a column it reads is armed, the source
+// declares one under a collation other than the index's (review F2: a column
+// both sides declare `utf8mb4_bin` still merges 'e' and 'é' under a key
+// whose CAST compares `_ai_ci`), or the index's collation is not known.
+// Where the target compares exactly as the source does — a MySQL source's
+// own key — it does not arm (re-review finding 2: arming there refused stale
+// respellings ON DUPLICATE KEY UPDATE converges). So the keys are read for
+// every table, armed column or not: one catalog read per table per writer,
+// cached, and two more (its columns and its hidden columns) for a table with
+// a functional part. A part KNOWN not to be a string (`(j * 2)`, a binary
+// CAST) compares by value everywhere and arms nothing; inside a key armed by
+// another part it is left out (TRUE on both sides), which can only widen
+// the key's match, never hide one. Where the hidden column cannot be read
+// (vtgate) the guard cannot know that, so such a part compares as a string
+// would — TRUE on the target, its columns' bytes on the source.
+//
+// A part over a GENERATED column compares through that column's base
+// columns, with TRUE on the target side ([targetUniqueKeys.
+// resolveFunctionalColumns]): no insert carries a generated value.
 //
 // The catalog keeps the expression's identifiers as the index DDL spelled
 // them (`lower(EMAIL)` over column `Email`), so every column a part reads
@@ -81,6 +93,7 @@ import (
 	"unicode/utf8"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/translate"
 )
 
 // functionalStep is one function the guard can see through, applied to the
@@ -100,9 +113,13 @@ type functionalKeyPart struct {
 	index, expr string // the key's name and the server's EXPRESSION text
 	seq         int    // the part's position in its key, from 0
 	alone       bool   // the key's only part
-	// columns are the columns the expression reads, as the table spells
-	// them once resolved ([targetUniqueKeys.resolveFunctionalColumns]).
-	columns []string
+	// columns are the stored columns the expression reads, as the table
+	// spells them once resolved ([targetUniqueKeys.resolveFunctionalColumns]),
+	// a generated column replaced by its base columns; named are the columns
+	// the expression names, generated ones included, which arming compares.
+	columns, named []string
+	// arms: the part puts its key under the guard ([markFunctionalArming]).
+	arms bool
 	// readable: steps render the expression over columns[0].
 	readable bool
 	steps    []functionalStep
@@ -327,17 +344,42 @@ func (p *functionalParser) ident() (string, []functionalStep, bool) {
 
 // expressionColumns lists the backquoted identifiers of the server's
 // EXPRESSION text — the columns an expression the guard cannot read reads.
-// The server backquotes every column reference in that text; a backslash
-// escapes the next byte (its string literals are stored as `\'…\'`), and a
-// backquote that is not a column (inside a literal) names no column of the
-// table and refuses at resolution, loudly.
+// The server backquotes every column reference in that text. String
+// literals are skipped (re-review 2026-10-15, finding 6: a backquote inside
+// one read as a column): the catalog stores them with escaped delimiters,
+// `_utf8mb4\'a`b\'`, and a plain `'…'` (doubled quote, backslash escape) is
+// skipped the same way. A name that still resolves to no column of the
+// table refuses at resolution, loudly.
 func expressionColumns(expr string) []string {
 	var out []string
 	for i := 0; i < len(expr); i++ {
-		switch expr[i] {
-		case '\\':
-			i++
-		case '`':
+		switch {
+		case expr[i] == '\\' && i+1 < len(expr) && expr[i+1] == '\'':
+			// A literal with escaped delimiters: to the next \'.
+			for i += 2; i < len(expr); i++ {
+				if expr[i] == '\\' && i+1 < len(expr) {
+					if expr[i+1] == '\'' {
+						i++
+						break
+					}
+					i++
+				}
+			}
+		case expr[i] == '\'':
+			for i++; i < len(expr); i++ {
+				if expr[i] == '\\' {
+					i++
+					continue
+				}
+				if expr[i] == '\'' {
+					if i+1 < len(expr) && expr[i+1] == '\'' {
+						i++
+						continue
+					}
+					break
+				}
+			}
+		case expr[i] == '`':
 			var b strings.Builder
 			for i++; i < len(expr); i++ {
 				if expr[i] == '`' {
@@ -484,10 +526,19 @@ func (k *targetUniqueKeys) functionalParts() []*functionalKeyPart {
 // the table's own spelling of it, matched case-insensitively (a MySQL column
 // name is), and returns the parts naming a column the table does not have.
 // The key entry a part stands in is rewritten with it.
-func (k *targetUniqueKeys) resolveFunctionalColumns(tableColumns []string) (unresolved []*functionalKeyPart) {
-	byFold := make(map[string]string, len(tableColumns))
+//
+// A GENERATED column is never in an insert's column list, so the guard
+// cannot reference its incoming value (re-review 2026-10-15, finding 1: a
+// key over one refused the whole table, same-engine included). A part
+// reading one compares through the generated column's own base columns
+// instead — the columns its generation expression names, expanded through
+// any generated column among them — and its target side becomes TRUE, since
+// the expression over the generated value cannot be rendered. Equal base
+// bytes give an equal generated value, so the source side stays sound.
+func (k *targetUniqueKeys) resolveFunctionalColumns(tableColumns []tableColumn) (unresolved []*functionalKeyPart) {
+	byFold := make(map[string]tableColumn, len(tableColumns))
 	for _, c := range tableColumns {
-		byFold[strings.ToLower(c)] = c
+		byFold[strings.ToLower(c.name)] = c
 	}
 	for i, key := range k.uniqueFns {
 		for j, f := range key {
@@ -495,17 +546,40 @@ func (k *targetUniqueKeys) resolveFunctionalColumns(tableColumns []string) (unre
 				continue
 			}
 			ok := true
-			for n, c := range f.columns {
-				if canonical, found := byFold[strings.ToLower(c)]; found {
-					f.columns[n] = canonical
-				} else {
+			f.named = f.named[:0]
+			var base []string
+			seen := map[string]bool{}
+			var expand func(name string, depth int)
+			expand = func(name string, depth int) {
+				c, found := byFold[strings.ToLower(name)]
+				if !found || depth > 8 {
 					ok = false
+					return
 				}
+				if c.generation == "" {
+					if !seen[c.name] {
+						seen[c.name] = true
+						base = append(base, c.name)
+					}
+					return
+				}
+				f.readable = false // the generated value is not in the insert
+				for _, ref := range expressionColumns(c.generation) {
+					expand(ref, depth+1)
+				}
+			}
+			for _, c := range f.columns {
+				if tc, found := byFold[strings.ToLower(c)]; found {
+					f.named = append(f.named, tc.name)
+				}
+				expand(c, 0)
 			}
 			if !ok {
 				unresolved = append(unresolved, f)
 				continue
 			}
+			f.columns = base
+			k.uniques[i][j] = ""
 			if len(f.columns) > 0 {
 				k.uniques[i][j] = f.columns[0]
 			}
@@ -513,6 +587,10 @@ func (k *targetUniqueKeys) resolveFunctionalColumns(tableColumns []string) (unre
 	}
 	return unresolved
 }
+
+// tableColumn is one column of the target table as the catalog spells it,
+// with its generation expression ("" for a stored value).
+type tableColumn struct{ name, generation string }
 
 // keyCollationFunctionalUnsupported is the GUARD-UNSUPPORTED refusal for a
 // functional key part naming a column the table does not have — a non-ASCII
@@ -530,13 +608,81 @@ func keyCollationFunctionalUnsupported(qn string, parts []*functionalKeyPart) er
 		ir.ErrKeyCollationMerge, keyCollationGuardUnsupportedMarker, qn, strings.Join(names, ", "))}
 }
 
-// armsFunctional reports whether a collated functional part is among the
+// markFunctionalArming decides, for every functional part of keys, whether
+// it arms its key ([functionalPartArms]).
+func (k *targetUniqueKeys) markFunctionalArming(source *ir.Table, armed map[string]armedCollation, compareAs map[string]string) {
+	for _, f := range k.functionalParts() {
+		f.arms = functionalPartArms(f, source, armed, compareAs)
+	}
+}
+
+// functionalPartArms reports whether a functional part puts its key under
+// the guard: when its value may be a collated string AND the source's own
+// comparison of it can differ from the index's. That is so when
+//
+//   - the index's collation is not known (vtgate; an ambiguous shortened
+//     hidden-column name): nothing shows the two alike;
+//   - a column it names is armed — the source declares a collation the
+//     target column does not share, which every Postgres-source character
+//     column is (the cross-family case);
+//   - a column it names is declared by the source under a collation other
+//     than the one the index compares under (review F2: a column both sides
+//     declare `utf8mb4_bin` under a key whose CAST compares `_ai_ci`), or
+//     the source declares none, or lacks the column.
+//
+// Otherwise the target compares the part exactly as the source compares its
+// columns, and arming it would only refuse what converges: re-review
+// 2026-10-15 finding 2 measured a MySQL → MySQL copy, with the source's own
+// key, refusing a stale respelled row (target row 3 'A@y', the source's row
+// 4 'a@y') that ON DUPLICATE KEY UPDATE converges. A part whose value is not
+// a string never arms. With no source shape (nothing known of the source)
+// only an unknown index collation arms, as for a plain column.
+func functionalPartArms(f *functionalKeyPart, source *ir.Table, armed map[string]armedCollation, compareAs map[string]string) bool {
+	switch {
+	case !f.collated():
+		return false
+	case !f.known:
+		return true
+	case source == nil:
+		return false
+	}
+	srcCols := make(map[string]*ir.Column, len(source.Columns))
+	for _, c := range source.Columns {
+		if c != nil {
+			srcCols[strings.ToLower(c.Name)] = c
+		}
+	}
+	armedFold := make(map[string]bool, len(armed))
+	for name := range armed {
+		armedFold[strings.ToLower(name)] = true
+	}
+	for _, name := range f.named {
+		if armedFold[strings.ToLower(name)] {
+			return true
+		}
+		c := srcCols[strings.ToLower(name)]
+		if c == nil {
+			return true
+		}
+		_, coll := translate.ColumnCollation(c.Type)
+		coll = strings.ToLower(coll)
+		if mapped, ok := compareAs[coll]; ok {
+			coll = mapped
+		}
+		if coll == "" || !strings.EqualFold(coll, f.collation) {
+			return true
+		}
+	}
+	return false
+}
+
+// armsFunctional reports whether an arming functional part is among the
 // plan's keys: the remedies then name the key to recreate, not a column to
 // alter.
 func (p *keyCollationPlan) armsFunctional() bool {
 	for _, fns := range p.fns {
 		for _, f := range fns {
-			if f != nil && f.collated() {
+			if f != nil && f.arms {
 				return true
 			}
 		}
@@ -554,12 +700,14 @@ func (p *keyCollationPlan) armsFunctional() bool {
 // is spelled out; otherwise the text names the part and leaves the key's
 // other parts as they are.
 //
-// The comparison named is `utf8mb4_0900_bin` for a utf8mb4 value and a
-// binary CAST for any other: review F5 measured that `<charset>_bin` is PAD
-// SPACE, so 'e' and 'e ' still collided after an operator applied it.
+// The comparison named is `utf8mb4_0900_bin` for a value known to be
+// utf8mb4 and a binary CAST for any other or an unknown one (re-review
+// finding 4: on vtgate a utf8mb4 collation over a latin1 expression errors):
+// review F5 measured that `<charset>_bin` is PAD SPACE, so 'e' and 'e ' still
+// collided after an operator applied it.
 func functionalKeyNeed(f *functionalKeyPart) string {
 	exact := "(" + f.expr + ") COLLATE utf8mb4_0900_bin"
-	if cs, _, _ := strings.Cut(f.collation, "_"); f.known && cs != "utf8mb4" {
+	if cs, _, _ := strings.Cut(f.collation, "_"); !f.known || cs != "utf8mb4" {
 		exact = "CAST(" + f.expr + " AS BINARY)"
 	}
 	const why = "altering the column does not change a functional key, which keeps the collation it was created with"

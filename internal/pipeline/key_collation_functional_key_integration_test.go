@@ -357,6 +357,43 @@ func TestKeyCollationFunctionalKey_PgtriggerToMySQLApply(t *testing.T) {
 	kcfbGrade(t, "pgtrigger → mysql", src, tgt, refusal)
 }
 
+// TestKeyCollationFunctionalKey_MySQLToMySQLGeneratedApply is re-review
+// finding 1 end to end: a MySQL source whose functional key reads a
+// GENERATED column — which no insert carries — streams to MySQL. The guard
+// refused the table on every write (the key's column was "not among the
+// copied columns"); the source's own key, compared alike on both sides,
+// must now cold-start and apply exactly.
+func TestKeyCollationFunctionalKey_MySQLToMySQLGeneratedApply(t *testing.T) {
+	mySrc, myRoot, myCleanup := startMySQL(t)
+	defer myCleanup()
+	twfbDB{engine: "mysql", dsn: myRoot}.exec(t, "CREATE DATABASE kfgm_t")
+	tgtDSN, err := buildMySQLDSN(myRoot, "kfgm_t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src, tgt := twfbDB{engine: "mysql", dsn: mySrc}, twfbDB{engine: "mysql", dsn: tgtDSN}
+	cell := twfbCell{src: src, tgt: tgt, streamID: "kfgm"}
+	src.exec(t, "CREATE TABLE kd (id int NOT NULL PRIMARY KEY, k varchar(20) NOT NULL, b varchar(20) NOT NULL DEFAULT 'x', d int, "+
+		"g varchar(40) AS (concat(k, b)) STORED, UNIQUE KEY kd_lower_g ((lower(g)))); "+
+		"INSERT INTO kd (id,k,d) VALUES (1,'e',1),(2,'b',2),(3,'c',3)")
+	run := startTWFBRun(cell.streamer())
+	if !tgt.waitRow(t, "kd", 3, run, 180*time.Second) {
+		t.Fatalf("the cold start never delivered the seed (%v)", run.stop(t))
+	}
+	cell.waitStreaming(t, run)
+	t.Logf("target: %s", tgt.scalar(t, "SELECT GROUP_CONCAT(CONCAT(index_name, ':', COALESCE(column_name, expression)) "+
+		"SEPARATOR ', ') FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = 'kd' AND non_unique = 0"))
+	src.exec(t, "INSERT INTO kd (id,k,d) VALUES (99,'f',99)")
+	src.exec(t, "UPDATE kd SET k = 'E' WHERE id = 1")
+	src.exec(t, "INSERT INTO kd (id,k,d) VALUES (100,'zz',100)")
+	_ = tgt.waitRow(t, "kd", 100, run, 60*time.Second)
+	kcfbWaitConverged(t, src, tgt, run, 20*time.Second)
+	if refusal := kfkRefusal(t, run); refusal != nil {
+		t.Fatalf("refused the source's own key over a generated column: %v", refusal)
+	}
+	kcfbGrade(t, "mysql → mysql generated", src, tgt, nil)
+}
+
 // kfkNewPair creates a Postgres source database and a MySQL target database
 // named for tag.
 func kfkNewPair(t *testing.T, pgRoot, myRoot, tag string) (src, tgt twfbDB) {

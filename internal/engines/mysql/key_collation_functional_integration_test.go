@@ -45,7 +45,7 @@ func TestUniqueKeyColumns_FunctionalPartsOnTheRealServer(t *testing.T) {
 		"UNIQUE KEY bc ((k collate utf8mb4_bin)), UNIQUE KEY l1 ((lower(cast(k as char charset latin1)))), "+
 		"UNIQUE KEY bn ((cast(k as binary))), UNIQUE KEY mix (j, (upper(k))), "+
 		"UNIQUE KEY md ((md5(k))), UNIQUE KEY nm ((j * 2)), UNIQUE KEY tb ((trim(both 'x' from k))), "+
-		"UNIQUE KEY cc ((concat(k, j))), UNIQUE KEY mc ((lower(K))), UNIQUE KEY "+strings.Repeat("functional_key_", 4)+" ((upper(lower(k)))))")
+		"UNIQUE KEY cc ((concat(k, j))), UNIQUE KEY lb ((concat(k, 'a`b'))), UNIQUE KEY mc ((lower(K))), UNIQUE KEY "+strings.Repeat("functional_key_", 4)+" ((upper(lower(k)))))")
 	applyDDL(t, dsn, "INSERT INTO kx VALUES (1, ' Abc ', 1), (2, 'ÉtÉ', 2), (3, 'x', 3), (4, 'ß', 4)")
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
@@ -102,7 +102,7 @@ func TestUniqueKeyColumns_FunctionalPartsOnTheRealServer(t *testing.T) {
 	for idx, want := range map[string]struct {
 		columns  string
 		collated bool
-	}{"md": {"k", true}, "nm": {"j", false}, "tb": {"k", true}, "cc": {"k|j", true}} {
+	}{"md": {"k", true}, "nm": {"j", false}, "tb": {"k", true}, "cc": {"k|j", true}, "lb": {"k", true}} {
 		f := read[idx]
 		if f == nil || f.readable {
 			t.Errorf("key %s: %+v; want an unreadable part", idx, f)
@@ -389,6 +389,149 @@ func TestRowWriterKeyCollationGuard_FunctionalKeysReview(t *testing.T) {
 				if got := kcgRows(t, dsn, "kd", "id"); got != "1:65,2:C3A9,3:6520" {
 					t.Fatalf("after the remedy the target is %s; want 1:65,2:C3A9,3:6520", got)
 				}
+			})
+		})
+	}
+}
+
+// TestRowWriterKeyCollationGuard_FunctionalKeysReReview is the re-review's
+// cells (2026-10-15, second pass), graded by the target's rows as HEX:
+//
+//   - a functional part over a GENERATED column, which no insert carries:
+//     same-engine it must copy (it refused the table), cross-engine it must
+//     still refuse a merge, through the generated column's base columns;
+//   - MySQL → MySQL with the source's own key: a re-copy and a stale
+//     respelled row must not refuse where the key is compared alike on both
+//     sides (where the hidden column cannot be read the guard assumes it may
+//     differ, and the respelling refuses: the stated cost);
+//   - a merge through UNIQUE (j, (lower(k))) and UNIQUE ((j*2), (lower(k)));
+//   - the long-name discriminator: a conflict through ANOTHER unique key
+//     (uk on j) with the functional key's values apart must proceed when
+//     the long name's hidden column is matched, and refuses when it is not
+//     known — so dropping the prefix match turns the first red.
+func TestRowWriterKeyCollationGuard_FunctionalKeysReReview(t *testing.T) {
+	n := 0
+	cell := func(t *testing.T, ddl string) string {
+		t.Helper()
+		n++
+		dsn, cleanup := newSharedDB(t, fmt.Sprintf("kcfrr_%d", n))
+		t.Cleanup(cleanup)
+		applyDDL(t, dsn, ddl)
+		return dsn
+	}
+	write := func(t *testing.T, eng Engine, dsn string, table *ir.Table, rows ...ir.Row) error {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		rw, err := eng.OpenRowWriter(ctx, dsn)
+		if err != nil {
+			t.Fatalf("OpenRowWriter: %v", err)
+		}
+		defer func() { _ = rw.(*RowWriter).Close() }()
+		ch := make(chan ir.Row, len(rows))
+		for _, r := range rows {
+			ch <- r
+		}
+		close(ch)
+		return rw.(*RowWriter).WriteRowsIdempotent(ctx, table, ch)
+	}
+	wantMerge := func(t *testing.T, err error, dsn, want string) {
+		t.Helper()
+		if !errors.Is(err, ir.ErrKeyCollationMerge) || !strings.Contains(fmtErr(err), keyCollationMergeMarker) ||
+			strings.Contains(fmtErr(err), keyCollationGuardUnsupportedMarker) {
+			t.Fatalf("err = %v; want KEY-COLLATION-MERGE (target %s)", err, kcgRows(t, dsn, "kd", "id"))
+		}
+		if got := kcgRows(t, dsn, "kd", "id"); got != want {
+			t.Fatalf("after the refusal the target is %s; want %s (nothing merged)", got, want)
+		}
+	}
+	wantRows := func(t *testing.T, err error, dsn, want string) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("refused: %v", err)
+		}
+		if got := kcgRows(t, dsn, "kd", "id"); got != want {
+			t.Fatalf("target %s; want %s", got, want)
+		}
+	}
+	pgVC := ir.Varchar{Length: 20, Determinism: ir.CollationDeterministic}
+	myVC := kcgVarchar("utf8mb4_0900_ai_ci")
+	pk := &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}}
+	kj := func(key ir.Type) *ir.Table {
+		return &ir.Table{Name: "kd", PrimaryKey: pk, Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 32}}, {Name: "k", Type: key}, {Name: "j", Type: ir.Integer{Width: 32}, Nullable: true},
+		}}
+	}
+	gen := func(key ir.Type) *ir.Table {
+		return &ir.Table{Name: "kd", PrimaryKey: pk, Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 32}},
+			{Name: "k", Type: key},
+			{Name: "b", Type: key},
+			{Name: "g", Type: key, GeneratedExpr: "concat(k, b)", GeneratedStored: true, Nullable: true},
+		}}
+	}
+	row := func(id int64, k string, j int64) ir.Row { return ir.Row{"id": id, "k": k, "j": j} }
+	grow := func(id int64, k, b string) ir.Row { return ir.Row{"id": id, "k": k, "b": b} }
+	const ci = "CREATE TABLE kd (id INT NOT NULL PRIMARY KEY, k VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL, j INT, "
+	const genDDL = "CREATE TABLE kd (id INT NOT NULL PRIMARY KEY, k VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL, " +
+		"b VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL, " +
+		"g VARCHAR(40) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci AS (concat(k, b)) STORED, UNIQUE KEY fk ((lower(g))))"
+	long := strings.Repeat("functional_key_", 4)
+
+	for _, flavor := range []struct {
+		name    string
+		eng     Engine
+		unknown bool
+	}{{"hidden column read", Engine{}, false}, {"hidden column unknown (vitess flavor)", Engine{Flavor: FlavorVitess}, true}} {
+		t.Run(flavor.name, func(t *testing.T) {
+			t.Run("generated column, same engine, copies and re-copies", func(t *testing.T) {
+				dsn := cell(t, genDDL)
+				for i := 0; i < 2; i++ {
+					wantRows(t, write(t, flavor.eng, dsn, gen(myVC), grow(1, "e", "x"), grow(2, "f", "x")), dsn, "1:65,2:66")
+				}
+			})
+			t.Run("generated column, postgres source, merge refuses", func(t *testing.T) {
+				dsn := cell(t, genDDL)
+				wantRows(t, write(t, flavor.eng, dsn, gen(pgVC), grow(1, "e", "x")), dsn, "1:65")
+				wantMerge(t, write(t, flavor.eng, dsn, gen(pgVC), grow(2, "é", "x")), dsn, "1:65")
+				wantRows(t, write(t, flavor.eng, dsn, gen(pgVC), grow(3, "f", "x")), dsn, "1:65,3:66")
+			})
+			t.Run("mysql to mysql, the source's own key, re-copy and a stale respelling", func(t *testing.T) {
+				dsn := cell(t, ci+"UNIQUE KEY fk ((lower(k))))")
+				for i := 0; i < 2; i++ {
+					wantRows(t, write(t, flavor.eng, dsn, kj(myVC), row(1, "a@x", 1), row(2, "b", 2)), dsn, "1:614078,2:62")
+				}
+				// The target holds row 3 'A@y'; the source has since moved it to
+				// row 4 as 'a@y' (a delete the copy did not see): ODKU converges.
+				wantRows(t, write(t, flavor.eng, dsn, kj(myVC), row(3, "A@y", 3)), dsn, "1:614078,2:62,3:414079")
+				err := write(t, flavor.eng, dsn, kj(myVC), row(4, "a@y", 4))
+				if flavor.unknown {
+					// The stated cost: with the hidden column unread the guard
+					// cannot tell the key is the source's, and refuses.
+					wantMerge(t, err, dsn, "1:614078,2:62,3:414079")
+					return
+				}
+				wantRows(t, err, dsn, "1:614078,2:62,3:614079")
+			})
+			for _, shape := range []string{"UNIQUE KEY fk (j, (lower(k)))", "UNIQUE KEY fk ((j * 2), (lower(k)))"} {
+				t.Run(shape+" merge refuses", func(t *testing.T) {
+					dsn := cell(t, ci+shape+")")
+					wantRows(t, write(t, flavor.eng, dsn, kj(pgVC), row(1, "e", 5)), dsn, "1:65")
+					wantMerge(t, write(t, flavor.eng, dsn, kj(pgVC), row(2, "é", 5)), dsn, "1:65")
+					wantRows(t, write(t, flavor.eng, dsn, kj(pgVC), row(3, "é", 6)), dsn, "1:65,3:C3A9")
+				})
+			}
+			t.Run("long key name, a conflict through another unique key", func(t *testing.T) {
+				dsn := cell(t, ci+"UNIQUE KEY "+long+" ((lower(k))), UNIQUE KEY uk (j))")
+				wantRows(t, write(t, flavor.eng, dsn, kj(pgVC), row(1, "e", 5)), dsn, "1:65")
+				err := write(t, flavor.eng, dsn, kj(pgVC), row(2, "f", 5))
+				if flavor.unknown {
+					wantMerge(t, err, dsn, "1:65")
+					return
+				}
+				// Matched: lower('e') and lower('f') differ, so the long key does
+				// not match and the upsert proceeds through uk.
+				wantRows(t, err, dsn, "1:66")
 			})
 		})
 	}

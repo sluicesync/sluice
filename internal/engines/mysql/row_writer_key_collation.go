@@ -351,29 +351,29 @@ func uniqueKeyColumns(ctx context.Context, q queryRower, flavor Flavor, schema, 
 	for _, f := range fns {
 		f.alone = parts[f.index] == 1
 	}
-	names, err := tableColumnNames(ctx, q, schema, table)
+	columns, err := tableColumns(ctx, q, schema, table)
 	if err != nil {
 		return out, err
 	}
-	out.unresolved = out.resolveFunctionalColumns(names)
+	out.unresolved = out.resolveFunctionalColumns(columns)
 	hidden, known := functionalKeyCollations(ctx, q, flavor, schema, table)
 	out.resolveFunctionalCollations(hidden, known)
 	return out, nil
 }
 
-// tableColumnNames is every column of the target table as the catalog
-// spells it.
-func tableColumnNames(ctx context.Context, q queryRower, schema, table string) ([]string, error) {
-	rows, err := q.QueryContext(ctx, `SELECT column_name FROM information_schema.columns
+// tableColumns is every column of the target table as the catalog spells
+// it, with its generation expression ("" for a stored value).
+func tableColumns(ctx context.Context, q queryRower, schema, table string) ([]tableColumn, error) {
+	rows, err := q.QueryContext(ctx, `SELECT column_name, COALESCE(generation_expression, '') FROM information_schema.columns
 		WHERE table_schema = COALESCE(NULLIF(?, ''), DATABASE()) AND table_name = ?`, schema, table)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
-	var out []string
+	var out []tableColumn
 	for rows.Next() {
-		var c string
-		if err := rows.Scan(&c); err != nil {
+		var c tableColumn
+		if err := rows.Scan(&c.name, &c.generation); err != nil {
 			return nil, err
 		}
 		out = append(out, c)

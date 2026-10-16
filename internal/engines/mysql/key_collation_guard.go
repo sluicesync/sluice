@@ -154,7 +154,9 @@ type keyCollationPlan struct {
 // colTypes the target's columns; pk and uniques the target's keys. nil when
 // nothing is armed.
 func planKeyCollationGuard(source *ir.Table, colTypes map[string]*ir.Column, keys targetUniqueKeys, compareAs map[string]string) *keyCollationPlan {
-	return planFromArmed(applierArmedColumns(source, colTypes, keys, compareAs), keys)
+	armed := applierArmedColumns(source, colTypes, keys, compareAs)
+	keys.markFunctionalArming(source, armed, compareAs)
+	return planFromArmed(armed, keys)
 }
 
 // applierArmedColumns is the applier's armed set: every armed column but a
@@ -188,7 +190,9 @@ func applierArmedColumns(source *ir.Table, colTypes map[string]*ir.Column, keys 
 // converges then ([copyKeyCollationMergeRemedy]). Unarmed, two source keys
 // 'A' and 'a' on a `_ci` target key are one row at exit 0, silently.
 func planCopyKeyCollationGuard(source *ir.Table, colTypes map[string]*ir.Column, keys targetUniqueKeys, compareAs map[string]string) *keyCollationPlan {
-	return planFromArmed(armedColumns(source, colTypes, compareAs), keys)
+	armed := armedColumns(source, colTypes, compareAs)
+	keys.markFunctionalArming(source, armed, compareAs)
+	return planFromArmed(armed, keys)
 }
 
 // planFromArmed is the guard over the armed columns: every unique key (the
@@ -216,7 +220,7 @@ func planFromArmed(armed map[string]armedCollation, keys targetUniqueKeys) *keyC
 			if j < len(fns) {
 				fn = fns[j]
 			}
-			if _, ok := armed[col]; (fn == nil && !ok) || (fn != nil && !fn.collated()) {
+			if _, ok := armed[col]; (fn == nil && !ok) || (fn != nil && !fn.arms) {
 				continue
 			}
 			p.keys = append(p.keys, key)
@@ -555,7 +559,7 @@ func (a *ChangeApplier) keyCollationPlanFor(ctx context.Context, q queryRower, s
 	// The applier upserts by its own key; the catalog supplies each part's
 	// prefix length where that key is the catalog's primary key.
 	keys.pk, keys.pkSub = pk, subPartsFor(pk, keys.pk, keys.pkSub)
-	plan := planFromArmed(applierArmedColumns(source, colTypes, keys, compareAs), keys)
+	plan := planKeyCollationGuard(source, colTypes, keys, compareAs)
 	if plan != nil {
 		if err := checkKeyCollationsExpressible(ctx, q, qn, plan); err != nil {
 			return nil, err
@@ -753,7 +757,7 @@ func keyCollationNeeds(plan *keyCollationPlan) (collations string, recopyAligns 
 			if i < len(allFns) && j < len(allFns[i]) && allFns[i][j] != nil {
 				// A functional part needs its key recreated, not its column
 				// altered (KEY-COLLATION-FUNCTIONAL-KEY-PART).
-				if f := allFns[i][j]; f.collated() && !named["\x00"+f.index+"!"+f.expr] {
+				if f := allFns[i][j]; f.arms && !named["\x00"+f.index+"!"+f.expr] {
 					named["\x00"+f.index+"!"+f.expr] = true
 					recopyAligns = false
 					need = append(need, functionalKeyNeed(f))

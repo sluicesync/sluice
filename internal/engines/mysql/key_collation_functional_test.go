@@ -116,9 +116,11 @@ func TestFunctionalKeyPart_SourceEq(t *testing.T) {
 
 // TestPlanKeyCollationGuard_FunctionalParts is the arming matrix: a
 // functional part arms its key exactly when its value may be a collated
-// string, whatever its column's own collation pair (review F2), on the
-// applier and the copy alike — readable or not (review F4: an unreadable
-// part arms per row, never refuses the table).
+// string and the source's comparison of it can differ from the index's
+// ([functionalPartArms]: an armed column, a source collation other than the
+// index's — review F2 — or an unknown index collation), on the applier and
+// the copy alike, readable or not (review F4: an unreadable part arms per
+// row, never refuses the table).
 func TestPlanKeyCollationGuard_FunctionalParts(t *testing.T) {
 	pgDefault := ir.Varchar{Length: 20, Determinism: ir.CollationDeterministic}
 	srcBin := ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: "utf8mb4_bin"}
@@ -126,12 +128,12 @@ func TestPlanKeyCollationGuard_FunctionalParts(t *testing.T) {
 	tgtBin := ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: "utf8mb4_bin"}
 	lower := func(known bool, coll string) *functionalKeyPart {
 		return &functionalKeyPart{
-			index: "fk", expr: "lower(`k`)", alone: true, columns: []string{"k"}, readable: true,
+			index: "fk", expr: "lower(`k`)", alone: true, columns: []string{"k"}, named: []string{"k"}, readable: true,
 			steps: []functionalStep{{kind: "fn", fn: "LOWER"}}, known: known, collation: coll,
 		}
 	}
 	md5 := func(known bool, coll string) *functionalKeyPart {
-		return &functionalKeyPart{index: "fk", expr: "md5(`k`)", alone: true, columns: []string{"k"}, known: known, collation: coll}
+		return &functionalKeyPart{index: "fk", expr: "md5(`k`)", alone: true, columns: []string{"k"}, named: []string{"k"}, known: known, collation: coll}
 	}
 	keys := func(f *functionalKeyPart) targetUniqueKeys {
 		return targetUniqueKeys{pk: []string{"id"}, uniques: [][]string{{"k"}}, uniqueSubs: [][]int{{0}}, uniqueFns: [][]*functionalKeyPart{{f}}}
@@ -151,6 +153,12 @@ func TestPlanKeyCollationGuard_FunctionalParts(t *testing.T) {
 		{"F4: unreadable collated part", pgDefault, tgtCI, md5(true, "latin1_swedish_ci"), "((TRUE) AND NOT"},
 		{"F4: unreadable part, collation unknown", pgDefault, tgtCI, md5(false, ""), "((TRUE) AND NOT"},
 		{"F4: unreadable non-string part", pgDefault, tgtCI, md5(true, ""), ""},
+		// Re-review finding 2: the source compares the column under the very
+		// collation the index does (the source's own key), so nothing arms;
+		// with the index's collation unknown, it does.
+		{"mysql to mysql, the source's own key", tgtCI, tgtCI, lower(true, "utf8mb4_0900_ai_ci"), ""},
+		{"mysql to mysql, index collation unknown", tgtCI, tgtCI, lower(false, ""), "((TRUE) AND NOT"},
+		{"mysql to mysql, unreadable part under the column's collation", tgtCI, tgtCI, md5(true, "utf8mb4_0900_ai_ci"), ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			for name, p := range map[string]*keyCollationPlan{
@@ -221,13 +229,31 @@ func TestResolveFunctionalColumns(t *testing.T) {
 	a := &functionalKeyPart{index: "fa", columns: []string{"EMAIL"}, readable: true}
 	b := &functionalKeyPart{index: "fb", columns: []string{"Ab", "j"}}
 	c := &functionalKeyPart{index: "fc", columns: []string{"na?ve-mangled"}}
-	k := targetUniqueKeys{uniques: [][]string{{"EMAIL"}, {"x", "Ab"}, {"na?ve-mangled"}}, uniqueFns: [][]*functionalKeyPart{{a}, {nil, b}, {c}}}
-	bad := k.resolveFunctionalColumns([]string{"id", "Email", "ab", "J", "x"})
-	if a.columns[0] != "Email" || k.uniques[0][0] != "Email" {
-		t.Errorf("a %+v, key %v", a.columns, k.uniques[0])
+	// Re-review finding 1: a part over a GENERATED column reads its base
+	// columns (through a generated column among them), and its target side
+	// can no longer render the expression.
+	g := &functionalKeyPart{index: "fg", columns: []string{"G"}, readable: true}
+	k := targetUniqueKeys{
+		uniques:   [][]string{{"EMAIL"}, {"x", "Ab"}, {"na?ve-mangled"}, {"G"}},
+		uniqueFns: [][]*functionalKeyPart{{a}, {nil, b}, {c}, {g}},
+	}
+	bad := k.resolveFunctionalColumns([]tableColumn{
+		{name: "id"},
+		{name: "Email"},
+		{name: "ab"},
+		{name: "J"},
+		{name: "x"},
+		{name: "g", generation: "concat(`h`,`Email`)"},
+		{name: "h", generation: "upper(`x`)"},
+	})
+	if a.columns[0] != "Email" || k.uniques[0][0] != "Email" || !a.readable {
+		t.Errorf("a %+v, key %v", a, k.uniques[0])
 	}
 	if b.columns[0] != "ab" || b.columns[1] != "J" || k.uniques[1][1] != "ab" {
 		t.Errorf("b %+v, key %v", b.columns, k.uniques[1])
+	}
+	if strings.Join(g.columns, "|") != "x|Email" || strings.Join(g.named, "|") != "g" || g.readable || k.uniques[3][0] != "x" {
+		t.Errorf("generated: %+v, key %v", g, k.uniques[3])
 	}
 	if len(bad) != 1 || bad[0] != c {
 		t.Fatalf("unresolved %+v; want fc", bad)
@@ -244,14 +270,19 @@ func TestResolveFunctionalColumns(t *testing.T) {
 }
 
 // TestExpressionColumns: every backquoted identifier, in order, a doubled
-// backquote kept, a backslash-escaped literal skipped over.
+// backquote kept, and a string literal — either delimiter form, a backquote
+// inside it — skipped over (re-review finding 6).
 func TestExpressionColumns(t *testing.T) {
-	got := expressionColumns("concat(`a`,_utf8mb4\\'x\\',`b``c`, md5(`D`))")
-	if strings.Join(got, "|") != "a|b`c|D" {
-		t.Errorf("%q", got)
-	}
-	if got := expressionColumns("(1 + 2)"); len(got) != 0 {
-		t.Errorf("%q", got)
+	for expr, want := range map[string]string{
+		"concat(`a`,_utf8mb4\\'x\\',`b``c`, md5(`D`))": "a|b`c|D",
+		"concat(`k`,_utf8mb4\\'a`b\\')":                "k",
+		"concat(`k`,'a`b','it''s `x`')":                "k",
+		"concat(`k`,_utf8mb4\\'a\\\\`b\\',`j`)":        "k|j",
+		"(1 + 2)":                                      "",
+	} {
+		if got := strings.Join(expressionColumns(expr), "|"); got != want {
+			t.Errorf("%s: %q; want %q", expr, got, want)
+		}
 	}
 }
 
@@ -313,8 +344,11 @@ func TestFunctionalKeyNeed(t *testing.T) {
 	if got := functionalKeyNeed(f); !strings.Contains(got, "((CAST(lower(`k`) AS BINARY)))") {
 		t.Errorf("latin1: %s", got)
 	}
-	f.known = false
-	if got := functionalKeyNeed(f); !strings.Contains(got, "COLLATE utf8mb4_0900_bin") {
+	// Re-review finding 4: with the charset unknown (vtgate), a utf8mb4
+	// collation would error on a latin1 expression; the binary CAST runs on
+	// any.
+	f.known, f.collation = false, ""
+	if got := functionalKeyNeed(f); !strings.Contains(got, "((CAST(lower(`k`) AS BINARY)))") {
 		t.Errorf("unknown collation: %s", got)
 	}
 	if strings.Contains(functionalKeyNeed(f), "utf8mb4_bin") {
