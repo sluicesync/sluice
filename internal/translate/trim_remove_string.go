@@ -143,7 +143,7 @@ func RefuseDivergentTrim(kind, table, name, expr, sourceDialect, targetEngine st
 // target collides on rows the source keyed apart, which is loud, and refusing
 // it up front only moves that failure ahead of the copy.
 func RefuseDivergentTrimIndex(table string, idx *ir.Index, sourceDialect, targetEngine string) error {
-	if idx == nil || !(idx.Unique || idx.ConstraintBacked) {
+	if idx == nil || (!idx.Unique && !idx.ConstraintBacked) {
 		return nil
 	}
 	for _, c := range idx.Columns {
