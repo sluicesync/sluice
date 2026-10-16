@@ -395,6 +395,14 @@ func TestDiffRelationFacts_PlainUniqueIndex(t *testing.T) {
 	if d := diffRelationFacts(gc2Base(), idxRenamed); len(d) != 0 {
 		t.Errorf("an ALTER INDEX RENAME refused: %q", d)
 	}
+	// A DROP of one index and a CREATE of a DIFFERENT one under another name
+	// is not a rename: both refuse.
+	swapped := cloneFacts(gc2Base())
+	delete(swapped.uniqueIndexes, "x_uidx")
+	swapped.uniqueIndexes["tenant_uidx"] = pgConstraintFact{kind: "i", compare: "unique index key=3", display: "CREATE UNIQUE INDEX tenant_uidx ON public.t USING btree (tenant)", attnums: []int16{3}}
+	if d := diffRelationFacts(gc2Base(), swapped); len(d) != 2 {
+		t.Errorf("a DROP plus a different CREATE: deltas %q; want both", d)
+	}
 
 	dropped := cloneFacts(gc2Base())
 	delete(dropped.columns, 2)
