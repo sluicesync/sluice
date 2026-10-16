@@ -310,3 +310,36 @@ func TestUniqueKeyConflictGuard_CopyWriterPrefixKey(t *testing.T) {
 		})
 	}
 }
+
+// TestUniqueKeyConflictGuard_AcceptedSilentResidual_NullKeyColumnsMerge pins a
+// residual the guard DELIBERATELY does not close (round-4 review), so a future
+// fix flips this test on purpose. The union identity of a table without a
+// primary key compares unique-key columns NULL-safely (`<=>`), and a unique
+// key admits any number of NULLs, so two DIFFERENT source rows can agree on
+// every unique-key column: kd(id UNIQUE NULL, k UNIQUE), the source dropped
+// kd_k (unseen), rows (NULL,'a','one') then (NULL,'a','two') — the second is
+// upserted onto the first at exit 0. Apply cannot tell that from a newer
+// image of the same row (the same statement against the same row), and a
+// plain `=` would only move the miss (NULL rows would then always count as
+// different and refuse every re-delivery). It belongs with the single-key
+// keyless residual: closed only at the source (UNIQUE-KEY-STOPPED-WINDOW-DOOR).
+func TestUniqueKeyConflictGuard_AcceptedSilentResidual_NullKeyColumnsMerge(t *testing.T) {
+	for _, srv := range kcgServers(t) {
+		for _, batched := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/batched=%t", srv.name, batched), func(t *testing.T) {
+				db := fmt.Sprintf("ukc_nullres_%s_%t", strings.NewReplacer("-", "", ".", "").Replace(srv.name), batched)
+				dsn, cleanup := srv.newDB(t, db)
+				defer cleanup()
+				applyDDL(t, dsn, "CREATE TABLE kd (id INT NULL, k VARCHAR(20) NOT NULL, v VARCHAR(20), UNIQUE KEY kd_id (id), UNIQUE KEY kd_k (k))")
+				applyDDL(t, dsn, "INSERT INTO kd VALUES (NULL,'a','one')")
+				err := kcgApply(t, srv.eng, dsn, batched, ir.Insert{Position: kcgPos(1), Schema: db, Table: "kd", Row: ir.Row{"id": nil, "k": "a", "v": "two"}})
+				if err != nil {
+					t.Fatalf("the residual is now refused (%v): flip this pin deliberately and update the backlog", err)
+				}
+				if got, want := ukcRows(t, dsn, ukcKdRows), "NULL:a:two"; got != want {
+					t.Fatalf("target %s; want the accepted merge %s", got, want)
+				}
+			})
+		}
+	}
+}

@@ -16,6 +16,7 @@ package postgres
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"sort"
 	"strings"
 	"testing"
@@ -221,6 +222,33 @@ func TestUniqueKeyConflictGuard_Postgres(t *testing.T) {
 					t.Fatalf("target changed: %s -> %s", before, got)
 				}
 			})
+		})
+	}
+}
+
+// TestUniqueKeyConflictGuard_AcceptedSilentResidual_NullKeyColumnsMerge pins
+// the Postgres half of a residual the guard DELIBERATELY does not close
+// (round-4 review; the MySQL twin's comment has the reasoning), so a future
+// fix flips it on purpose: with no primary key, UNIQUE(code) the arbiter and
+// UNIQUE(id) nullable beside it, rows (NULL,'a','one') and (NULL,'a','two')
+// agree on every unique index's columns under IS NOT DISTINCT FROM, so the
+// second overwrites the first at exit 0. A partial unique index behaves the
+// same for rows outside its predicate (its predicate is not read).
+func TestUniqueKeyConflictGuard_AcceptedSilentResidual_NullKeyColumnsMerge(t *testing.T) {
+	for _, batched := range []bool{false, true} {
+		t.Run(fmt.Sprintf("batched=%t", batched), func(t *testing.T) {
+			dsn, cleanup := newSharedPGDB(t, fmt.Sprintf("ukc_nullres_%t", batched))
+			defer cleanup()
+			applyPGApplier(t, dsn, `CREATE TABLE tn (id int, code text NOT NULL, v text);
+				CREATE UNIQUE INDEX tn_code ON tn (code); CREATE UNIQUE INDEX tn_id ON tn (id);
+				INSERT INTO tn VALUES (NULL,'a','one');`)
+			err := kcgPGApply(t, dsn, batched, ir.Insert{Position: kcgPGPos(1), Schema: "public", Table: "tn", Row: ir.Row{"id": nil, "code": "a", "v": "two"}})
+			if err != nil {
+				t.Fatalf("the residual is now refused (%v): flip this pin deliberately and update the backlog", err)
+			}
+			if got, want := ukcPGRows(t, dsn, "SELECT concat_ws(':', coalesce(id::text, 'NULL'), code, v) FROM tn"), "NULL:a:two"; got != want {
+				t.Fatalf("target %s; want the accepted merge %s", got, want)
+			}
 		})
 	}
 }

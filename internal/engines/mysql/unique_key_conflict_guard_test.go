@@ -190,7 +190,9 @@ func TestApplyUniqueKeyConflictRemedy_TwoKeysSaysCheckEach(t *testing.T) {
 	}
 	two := applyUniqueKeyConflictRemedy([]string{"kd_k", "kd_zid"}, "s", "kd")
 	if !strings.Contains(two, "check EACH against the source") || !strings.Contains(two, "DROP INDEX <key>") ||
-		!strings.Contains(two, "--restart-from-scratch and the same --stream-id") {
+		!strings.Contains(two, "for `sluice sync start`, restart with `--restart-from-scratch` and the same `--stream-id`") ||
+		!strings.Contains(two, "for `sluice sync from-backup run`, which has no `--restart-from-scratch`, re-run it with `--reset-target-data --yes`") ||
+		!strings.Contains(two, "`sluice slot drop sluice_<--slot-name> --source-driver=postgres --source <DSN> --yes`") {
 		t.Errorf("two keys: %s", two)
 	}
 }

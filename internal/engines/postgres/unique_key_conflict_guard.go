@@ -42,6 +42,14 @@ package postgres
 // A table keyed on its primary key needs nothing: a conflict through the
 // arbiter IS the same row.
 //
+// Not reached, accepted and pinned
+// (TestUniqueKeyConflictGuard_AcceptedSilentResidual_NullKeyColumnsMerge): two
+// different source rows that agree on every unique index because the columns
+// they differ in are NULL there (IS NOT DISTINCT FROM calls NULL equal, and a
+// unique index admits many NULLs), or lie outside a partial index's predicate
+// (which is not read). Apply cannot tell them from a newer image of one row;
+// it is the single-index residual's shape, closed only at the source.
+//
 // The shape left open — no primary key and exactly ONE unique index — is
 // stated so it cannot be read as broader. The merge and the newer-image
 // re-send the ON CONFLICT exists for (a re-applied Insert carrying a changed
@@ -345,8 +353,8 @@ func applyUniqueKeyConflictError(err error, g *pgConflictIdentity, schema, table
 			"(`DROP INDEX <schema>.<index>`; find it with `\\d " + quoteIdent(schema) + "." + quoteIdent(table) + "`) and " +
 			"restart with the same --stream-id, so the row lands beside the one it " +
 			"matched, as on the source. If the source still declares every one, the matched target row is stale (a newer " +
-			"version of it, or a unique value that moved between rows, inside a re-delivery window) and a re-copy " +
-			"converges: restart with --restart-from-scratch and the same --stream-id.",
+			"version of it, or a unique value that moved between rows, inside a re-delivery window) and " +
+			ir.UniqueKeyConflictRecopyRemedy,
 	}
 }
 

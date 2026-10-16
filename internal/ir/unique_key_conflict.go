@@ -16,7 +16,9 @@ import (
 // conflict through any unique key it has, and then overwrites the row it
 // matched. When that row's primary key differs from the incoming row's (or,
 // on a table without one and with two or more unique keys, when it
-// disagrees on any unique key's columns), the incoming row is a second row
+// disagrees on any unique key's columns — compared NULL-safely, so rows that
+// differ only in NULL key columns, or outside a partial index's predicate,
+// are not told apart), the incoming row is a second row
 // of the source, not a re-delivery of the first: the source has no such
 // unique key any more (a `DROP INDEX` or `DROP CONSTRAINT` sluice
 // does not forward), and applying the upsert would replace one source row
@@ -27,6 +29,18 @@ import (
 // supervisor's do-not-restart roster. The remedy is to drop that key on the
 // target, or re-copy the table.
 var ErrUniqueKeyConflictOtherRow = errors.New("UNIQUE-KEY-CONFLICT-OTHER-ROW")
+
+// UniqueKeyConflictRecopyRemedy is the re-copy half of the refusal's remedy,
+// shared by both appliers. An applier cannot tell which command drives it, so
+// it names both: `sync start` re-copies with --restart-from-scratch, while
+// `sync from-backup run` has no such flag and recovers with
+// --reset-target-data (which needs --yes off a terminal; cmd/sluice cli.go).
+const UniqueKeyConflictRecopyRemedy = "a re-copy converges — for `sluice sync start`, restart with " +
+	"`--restart-from-scratch` and the same `--stream-id` (from a Postgres pgoutput source, first drop the stream's " +
+	"replication slot, which a fresh snapshot refuses to inherit: `sluice slot drop sluice_<--slot-name> " +
+	"--source-driver=postgres --source <DSN> --yes`, the default slot being `sluice_slot`); for `sluice sync from-backup run`, which has no " +
+	"`--restart-from-scratch`, re-run it with `--reset-target-data --yes` (it drops the target tables and " +
+	"restores the chain again)."
 
 // UniqueKeyConflictError is the terminal refusal the appliers raise when an
 // upsert's conflict-identity guard fired. Engine-neutral: MySQL builds it

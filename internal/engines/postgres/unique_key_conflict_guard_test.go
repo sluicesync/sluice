@@ -122,7 +122,7 @@ func TestApplyInsertGuardError_Attribution(t *testing.T) {
 	if !errors.Is(err, ir.ErrUniqueKeyConflictOtherRow) || !ir.IsTerminal(err) {
 		t.Fatalf("not attributed: %v", err)
 	}
-	for _, want := range []string{`("k")`, "--restart-from-scratch", `"public"."kd"`} {
+	for _, want := range []string{`("k")`, "--restart-from-scratch", `"public"."kd"`, "`sluice sync from-backup run`", "`--reset-target-data --yes`", "`sluice slot drop sluice_<--slot-name>"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("the refusal does not name %q: %v", want, err)
 		}

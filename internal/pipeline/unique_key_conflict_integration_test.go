@@ -360,23 +360,43 @@ func TestStreamer_UniqueKeyConflict_TriggerCDC(t *testing.T) {
 
 // TestStreamer_UniqueKeyConflict_TradeRemedy provokes the guard's stated
 // false refusal (UNIQUE-KEY-GUARD-OVERLAP-REFUSAL) and measures the remedy
-// the refusal prints. MySQL → MySQL, kd with no primary key and two unique
-// keys (id, k). While the stream is stopped the source inserts (3,'c') and
-// then moves it to id 4, and the TARGET is made to hold (4,'c') already —
-// the state a re-delivery window leaves (a lock-free capture's or the
-// auto-shard stitch's overlap, a broker re-run without apply marks): the
-// target ahead of the change being replayed. The replayed INSERT (3,'c')
-// matches (4,'c') through k and disagrees on id, which is exactly a merge's
-// shape, so it refuses. The refusal names two remedies; the source still
-// declares both keys, so the one that applies is the re-copy,
-// `--restart-from-scratch` with the same stream id. That must converge:
-// the target equal to the source by id.
+// the refusal prints, on BOTH re-copy paths `--restart-from-scratch` has
+// (cmd/sluice cli.go, RestartFromScratch): a native MySQL binlog source,
+// whose plain-INSERT copy makes the restart DROP and recreate the target
+// tables first (it converges almost by construction), and a Postgres
+// pgoutput source, whose idempotent upsert copy re-copies ONTO the existing
+// rows without dropping them. kd has no primary key and two unique keys (id,
+// k). While the stream is stopped the source inserts (3,'c') and then moves
+// it to id 4, and the TARGET is made to hold (4,'c') already — the state a
+// re-delivery window leaves: the target ahead of the change being replayed.
+// The replayed INSERT (3,'c') matches (4,'c') through k and disagrees on id,
+// exactly a merge's shape, so it refuses. The source still declares both
+// keys, so the remedy that applies is the re-copy for `sync start`,
+// `--restart-from-scratch` with the same stream id. It must converge: the
+// target equal to the source by id, and the stream live again. Not measured:
+// a VStream source, whose restart re-runs the auto-shard stitch window, so
+// under live writes the refusal may fire again; and the upsert path with a
+// stale target row the source no longer has, which a re-copy that deletes
+// nothing cannot remove (`--reset-target-data --yes` is the fallback).
 func TestStreamer_UniqueKeyConflict_TradeRemedy(t *testing.T) {
 	myNew, myCleanup := ukcMySQLServer(t)
 	defer myCleanup()
-	src, tgt := myNew("ukctr_s"), myNew("ukctr_t")
-	src.exec(t, ukcCreate("mysql", true))
-	cell := twfbCell{src: src, tgt: tgt, streamID: "ukctr"}
+	t.Run("mysql-binlog source, the drop path", func(t *testing.T) {
+		src, tgt := myNew("ukctr_s"), myNew("ukctr_t")
+		src.exec(t, ukcCreate("mysql", true))
+		ukcTradeRemedy(t, src, tgt, twfbCell{src: src, tgt: tgt, streamID: "ukctr"})
+	})
+	t.Run("postgres-pgoutput source, the upsert re-copy path", func(t *testing.T) {
+		pgNew, pgCleanup := ukcPGServer(t)
+		defer pgCleanup()
+		src, tgt := pgNew("ukctrp_s"), myNew("ukctrp_t")
+		src.exec(t, ukcCreate("postgres", true))
+		ukcTradeRemedy(t, src, tgt, twfbCell{src: src, tgt: tgt, streamID: "ukctrp", slotName: "ukctrp"})
+	})
+}
+
+func ukcTradeRemedy(t *testing.T, src, tgt twfbDB, cell twfbCell) {
+	t.Helper()
 	cell.coldStartAndStop(t, "kd", 2)
 
 	src.exec(t, "INSERT INTO kd VALUES (3,'c','three'); UPDATE kd SET id = 4 WHERE id = 3")
@@ -392,12 +412,21 @@ func TestStreamer_UniqueKeyConflict_TradeRemedy(t *testing.T) {
 		t.Fatalf("the replay onto a target ahead of it did not refuse (target %s)", ukcRender(ukcRows(t, tgt)))
 	}
 	refusal := run.err
-	if !errors.Is(refusal, ir.ErrUniqueKeyConflictOtherRow) || !strings.Contains(refusal.Error(), "--restart-from-scratch") {
-		t.Fatalf("refused with %v; want %s naming --restart-from-scratch", refusal, ir.ErrUniqueKeyConflictOtherRow)
+	if !errors.Is(refusal, ir.ErrUniqueKeyConflictOtherRow) || !strings.Contains(refusal.Error(), "--restart-from-scratch") ||
+		!strings.Contains(refusal.Error(), "--reset-target-data --yes") {
+		t.Fatalf("refused with %v; want %s naming both re-copy remedies", refusal, ir.ErrUniqueKeyConflictOtherRow)
 	}
 	t.Logf("refusal: %v", refusal)
 
-	// The printed remedy, as an operator would run it.
+	// The printed remedy for `sync start`, as an operator would run it: on a
+	// Postgres source, first the slot drop the remedy names (here its SQL
+	// equivalent on the literal slot `sluice_<--slot-name>`).
+	if src.engine == "postgres" {
+		if !strings.Contains(refusal.Error(), "sluice slot drop") {
+			t.Fatalf("the remedy does not name the slot drop a Postgres re-copy needs: %v", refusal)
+		}
+		src.exec(t, "SELECT pg_drop_replication_slot('sluice_"+cell.slotName+"')")
+	}
 	s := cell.streamer()
 	s.RestartFromScratch = true
 	run = startTWFBRun(s)

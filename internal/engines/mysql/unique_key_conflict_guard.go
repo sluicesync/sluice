@@ -67,6 +67,13 @@ package mysql
 //     the filed stream-open comparison for a DROP made while the stream was
 //     stopped (UNIQUE-KEY-STOPPED-WINDOW-DOOR).
 //
+//     The same holds, accepted and pinned
+//     (TestUniqueKeyConflictGuard_AcceptedSilentResidual_NullKeyColumnsMerge),
+//     for two different source rows that agree on every unique key because
+//     the columns they differ in are NULL there (`<=>` calls NULL equal and a
+//     unique key admits many NULLs): apply cannot tell them from a newer image
+//     either, and a plain `=` would only move the miss.
+//
 // The guard is ARMED only where a conflict can come through a key other
 // than the identity: a target table with a unique key besides its primary
 // key (and, without a primary key, at least two unique keys). Any other
@@ -95,7 +102,8 @@ package mysql
 // stitchSnapshotMin), and a broker re-run without apply marks. Not measured
 // on those paths; provoked directly by
 // TestStreamer_UniqueKeyConflict_TradeRemedy, which also measures the printed
-// remedy (--restart-from-scratch, same stream id) converging. The ADR-0072
+// remedy (--restart-from-scratch, same stream id) converging on a binlog and
+// a pgoutput source. The ADR-0072
 // resume is NOT such a path: it runs through the copy writer, which absorbs a
 // conflict through a key the source declares. No narrowing is sound: the
 // merge and the re-applied row differ only in source history the applier does
@@ -390,8 +398,7 @@ func applyUniqueKeyConflictRemedy(keyNames []string, schema, table string) strin
 	return fmt.Sprintf("%s If the source no longer declares one, drop it on the target (%s) "+
 		"and restart with the same --stream-id: the row then lands beside the one it matched, as on the source. If "+
 		"the source still declares every one, the matched target row is stale (a newer image of a row, or a unique "+
-		"value that moved between rows, inside a re-delivery window) and a re-copy converges: restart with "+
-		"--restart-from-scratch and the same --stream-id.", check, drop)
+		"value that moved between rows, inside a re-delivery window) and "+ir.UniqueKeyConflictRecopyRemedy, check, drop)
 }
 
 // undeclaredUniqueKeys returns the target's unique keys besides its primary
