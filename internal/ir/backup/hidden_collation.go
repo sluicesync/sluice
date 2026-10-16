@@ -131,6 +131,78 @@ func WithoutHiddenCollation(s *ir.Schema) *ir.Schema {
 	return &out
 }
 
+// HiddenCollationComparable returns a and b with each functional part's
+// hidden-column collation cleared where the OTHER schema's matching part
+// (same table, same index name, same position) records none — the
+// both-sides rule migcore's index equality and `schema diff` apply. A
+// schema an older binary recorded (no field) then compares equal to the
+// same schema read by this one, while two schemas that both record the
+// field and disagree still differ. Neither input is mutated.
+func HiddenCollationComparable(a, b *ir.Schema) (comparableA, comparableB *ir.Schema) {
+	return withPeerHiddenCollations(a, b), withPeerHiddenCollations(b, a)
+}
+
+// withPeerHiddenCollations is s with every hidden-column collation cleared
+// that peer's matching part does not also record.
+func withPeerHiddenCollations(s, peer *ir.Schema) *ir.Schema {
+	if !schemaCarriesHiddenCollation(s) {
+		return s
+	}
+	recorded := map[string]bool{}
+	if peer != nil {
+		for _, t := range peer.Tables {
+			if t == nil {
+				continue
+			}
+			for _, idx := range append([]*ir.Index{t.PrimaryKey}, t.Indexes...) {
+				if idx == nil {
+					continue
+				}
+				for i, c := range idx.Columns {
+					if c.HiddenCollation != "" {
+						recorded[hiddenPartKey(t, idx, i)] = true
+					}
+				}
+			}
+		}
+	}
+	out := *s
+	out.Tables = make([]*ir.Table, len(s.Tables))
+	for i, t := range s.Tables {
+		if !tableCarriesHiddenCollation(t) {
+			out.Tables[i] = t
+			continue
+		}
+		strip := func(idx *ir.Index) *ir.Index {
+			if idx == nil {
+				return nil
+			}
+			ci := *idx
+			ci.Columns = make([]ir.IndexColumn, len(idx.Columns))
+			copy(ci.Columns, idx.Columns)
+			for j := range ci.Columns {
+				if !recorded[hiddenPartKey(t, idx, j)] {
+					ci.Columns[j].HiddenCollation = ""
+				}
+			}
+			return &ci
+		}
+		ct := *t
+		ct.PrimaryKey = strip(t.PrimaryKey)
+		ct.Indexes = make([]*ir.Index, len(t.Indexes))
+		for j, idx := range t.Indexes {
+			ct.Indexes[j] = strip(idx)
+		}
+		out.Tables[i] = &ct
+	}
+	return &out
+}
+
+// hiddenPartKey names a functional part across two reads of a schema.
+func hiddenPartKey(t *ir.Table, idx *ir.Index, i int) string {
+	return fmt.Sprintf("%s\x00%s\x00%s\x00%d", t.Schema, t.Name, idx.Name, i)
+}
+
 func indexWithoutHiddenCollation(in *ir.Index) *ir.Index {
 	if in == nil {
 		return nil

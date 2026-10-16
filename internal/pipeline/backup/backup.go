@@ -1743,19 +1743,23 @@ func priorResumableTables(prior *irbackup.Manifest) []*irbackup.TableManifest {
 // --tables filter between attempts trips this too — equally unsound.
 //
 // A functional key's hidden-column collation ([ir.IndexColumn.HiddenCollation])
-// is compared away on both sides (seventh review, finding 3): the
-// fingerprint folds it, so an attempt interrupted on a binary that did not
-// read it (v0.160.x and older) and resumed on one that does refused "the
-// source schema changed" on an unchanged vanilla-MySQL source with a
-// collated functional key. Kept row chunks hold rows, which no index
-// collation shapes, and the resumed manifest records the field as this run
-// reads it.
+// is compared only where BOTH attempts recorded it
+// ([irbackup.HiddenCollationComparable]; seventh review finding 3, eighth
+// review). The fingerprint folds it, so an attempt interrupted on a binary
+// that did not read it (v0.160.x and older) and resumed on one that does
+// refused "the source schema changed" on an unchanged vanilla-MySQL source
+// with a collated functional key — one-sided, it is not evidence of a
+// change. Two recorded values that differ ARE one: the key was recreated
+// under another collation between the attempts, so the replay from the
+// adopted anchor carries rows written under the old comparison, and
+// accepting it let a restore pinned to the new one merge them.
 func refuseAnchoredResumeOnSchemaDrift(current, prior *ir.Schema) error {
-	curHash, err := manifestSchemaFingerprint(irbackup.WithoutHiddenCollation(current))
+	current, prior = irbackup.HiddenCollationComparable(current, prior)
+	curHash, err := manifestSchemaFingerprint(current)
 	if err != nil {
 		return fmt.Errorf("backup: resume: fingerprint current schema: %w", err)
 	}
-	priorHash, err := manifestSchemaFingerprint(irbackup.WithoutHiddenCollation(prior))
+	priorHash, err := manifestSchemaFingerprint(prior)
 	if err != nil {
 		return fmt.Errorf("backup: resume: fingerprint prior schema: %w", err)
 	}

@@ -36,4 +36,15 @@ func TestRefuseAnchoredResumeOnSchemaDrift_HiddenCollationAcrossTheUpgrade(t *te
 	if err := refuseAnchoredResumeOnSchemaDrift(schema("utf8mb4_bin", 64), schema("", 32)); err == nil {
 		t.Error("a real column change beside the hidden collation was accepted")
 	}
+	// Eighth review: both attempts recorded the field and they differ — the
+	// key was recreated under another collation between them. A real change.
+	if err := refuseAnchoredResumeOnSchemaDrift(schema("utf8mb4_0900_ai_ci", 32), schema("utf8mb4_bin", 32)); err == nil {
+		t.Error("a hidden collation both attempts recorded, and that changed, was accepted")
+	}
+	if err := refuseAnchoredResumeOnSchemaDrift(schema("utf8mb4_bin", 32), schema("utf8mb4_bin", 32)); err != nil {
+		t.Errorf("an equal recorded hidden collation refused: %v", err)
+	}
+	if err := refuseAnchoredResumeOnSchemaDrift(schema("", 32), schema("utf8mb4_bin", 32)); err != nil {
+		t.Errorf("a current read that lacks the field (vtgate) refused: %v", err)
+	}
 }
