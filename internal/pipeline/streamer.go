@@ -1665,6 +1665,13 @@ type Streamer struct {
 	// single-database stream, or a target that cannot derive one.
 	namespaceTargetDeriver ir.DatabaseDSNDeriver
 
+	// multiDBFilterTally sums the table-scope push-down count and the
+	// filter's kept tables across the fan-out cold start's namespaces, so a
+	// run in which every namespace was filtered empty refuses instead of
+	// starting CDC over nothing (Bug 317 follow-up). Set per cold-start
+	// attempt; nil on a single-database stream.
+	multiDBFilterTally *migcore.FanoutFilterTally
+
 	// namespaceHistory is the multi-database warm resume's retained ADR-0049
 	// versions keyed by source namespace — the per-namespace counterpart of
 	// [Streamer.firstBoundaryHistory], read by the same seed load. The

@@ -40,6 +40,15 @@ import (
 // matches CALLS of the migcore helpers by selector within one declaration.
 // A caller that installs the push-down in one function and filters in
 // another (or reaches the helpers through a function value) is outside it.
+// And it checks that RefuseFilteredOutNamespace is PRESENT in the
+// declaration, not that it is REACHED: a call placed after a zero-table
+// early return (`if len(schema.Tables) == 0 { return }`) would satisfy this
+// gate and never fire. Reachability on today's five single-namespace entry
+// points (backup full, schema diff, migrate, sync start; schema preview
+// carries no push-down and is graded alongside them) is held behaviourally
+// by TestMigrate_ViewsOnlyNamespace_PostgresTypoIncludeTableRefusesEverywhere,
+// and on the fan-outs' run-wide verdict by
+// Test{Migrate,Streamer}_FanoutTypoIncludeTableRefuses_Postgres.
 
 // scopeFilterExempt: "<dir relative to repo root>::<decl>" → reason.
 var scopeFilterExempt = map[string]string{

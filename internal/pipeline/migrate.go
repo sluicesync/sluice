@@ -460,6 +460,13 @@ type Migrator struct {
 	// run and every programmatic caller) keeps the views phase inline.
 	multiDBDeferredViews *deferredViews
 
+	// multiDBFilterTally sums the table-scope push-down's count and the
+	// filter's kept tables across every namespace of a fan-out, so the run
+	// can refuse when every namespace was filtered empty (each pass alone
+	// may only skip). Shared by pointer across the per-database clones; nil
+	// on a single-database run.
+	multiDBFilterTally *migcore.FanoutFilterTally
+
 	// AllowDegradedFKs opts the operator into the pgcopydb-PR-#27-style
 	// "tolerate dirty FK source" behaviour: when [SchemaWriter.CreateConstraints]
 	// hits SQLSTATE 23503 on a validating `ADD CONSTRAINT`, retry as

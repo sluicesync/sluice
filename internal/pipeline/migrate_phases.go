@@ -112,6 +112,9 @@ func (m *Migrator) phaseReadSourceSchema(ctx context.Context, scope *multiDBScop
 			return sr, nil, err
 		}
 	}
+	// A skipped fan-out namespace still counts toward the run-wide verdict
+	// (runMultiDatabase refuses when every namespace was filtered empty).
+	m.multiDBFilterTally.Add(scopeTally.Asked(), 0)
 	if len(schema.Tables) == 0 && len(schema.Views) == 0 {
 		slog.InfoContext(ctx, "source schema has no tables or views; nothing to migrate")
 		return sr, nil, nil
@@ -135,6 +138,7 @@ func (m *Migrator) phaseReadSourceSchema(ctx context.Context, scope *multiDBScop
 	if err := applyFilter(ctx, schema, m.Filter); err != nil {
 		return sr, nil, err
 	}
+	m.multiDBFilterTally.Add(0, len(schema.Tables))
 	// Post-filter, pre-DDL: refuse loudly if any REMAINING table is
 	// known-doomed to fail at read time (deferred flat-file refusals —
 	// an excluded doomed table no longer blocks the run, Bug 188).

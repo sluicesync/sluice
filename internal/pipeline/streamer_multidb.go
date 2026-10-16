@@ -369,18 +369,17 @@ func (s *Streamer) coldStartMultiDatabase(
 	multiRC, closeRecording := s.openColdStartRecording(ctx, streamID, ir.SnapshotAnchorRecord{})
 	defer closeRecording()
 	var pendingViews []namespaceViews
+	s.multiDBFilterTally = &migcore.FanoutFilterTally{}
 	for _, database := range selected {
 		if err := s.coldStartCopyOneDatabase(ctx, multiRC, stream, applier, streamID, database, inScope, targetDeriver, targetCanDeriveDB, fresh, budgetReport.CopyFanoutCeiling, &readerSeed, &pendingViews); err != nil {
 			abandonStream()
 			return nil, stop, err
 		}
 	}
-	// Bug 317: every namespace's tables exist now, so create the views the
-	// per-namespace passes deferred (a view reading a namespace that sorts
-	// later resolves). Before the recorded run is marked complete and before
-	// the CDC anchor is persisted: a view that cannot be created fails the
-	// cold start loudly, exactly as the inline views phase did.
-	if err := createDeferredViews(ctx, s.Target, pendingViews); err != nil {
+	// Bug 317: the run-wide filter verdict, then the deferred views — before
+	// the recorded run is marked complete and before the CDC anchor is
+	// persisted (see finishFanoutCopy).
+	if err := s.finishFanoutCopy(ctx, pendingViews); err != nil {
 		abandonStream()
 		return nil, stop, err
 	}
@@ -514,6 +513,22 @@ func (s *Streamer) coldStartMultiDatabase(
 	// GC-41: a multi-schema Postgres stream reads one slot like any other.
 	s.captureSlotAckReleaser(stream.Changes)
 	return changes, stop, nil
+}
+
+// finishFanoutCopy closes the fan-out cold start's copy loop.
+//
+// First the run-wide filter verdict (Bug 317 follow-up): each namespace
+// pass may skip a namespace its filter emptied, but every namespace
+// filtered empty while the source held tables is the filter refusal, not a
+// stream started over nothing. Then the deferred views (Bug 317): every
+// namespace's tables exist now, so a view reading a namespace that sorts
+// later resolves, and a view that cannot be created fails the cold start
+// loudly, exactly as the inline views phase did.
+func (s *Streamer) finishFanoutCopy(ctx context.Context, pendingViews []namespaceViews) error {
+	if err := s.multiDBFilterTally.Refuse(); err != nil {
+		return err
+	}
+	return createDeferredViews(ctx, s.Target, pendingViews)
 }
 
 // warmResumeMultiDatabase is the ADR-0074 Phase 1b.3 multi-database
@@ -774,6 +789,10 @@ func (s *Streamer) coldStartReadOneDatabaseSchema(
 		return nil, fmt.Errorf("pipeline: read source schema for %q: %w", database, err)
 	}
 
+	// A skipped namespace still counts toward the run-wide verdict
+	// (coldStartMultiDatabase refuses when every namespace was filtered empty).
+	s.multiDBFilterTally.Add(scopeTally.Asked(), 0)
+
 	// Bug 317: a views-only namespace is not empty — its views are created
 	// by the deferred pass after every namespace's tables exist.
 	if len(schema.Tables) == 0 && len(schema.Views) == 0 {
@@ -791,6 +810,7 @@ func (s *Streamer) coldStartReadOneDatabaseSchema(
 	if err := migcore.ApplyTableFilterQuiet(ctx, schema, s.Filter); err != nil {
 		return nil, fmt.Errorf("pipeline: filter tables for %q: %w", database, err)
 	}
+	s.multiDBFilterTally.Add(0, len(schema.Tables))
 
 	// Doomed-read refusal, per namespace and post-filter, exactly as migrate
 	// and the single-schema cold start run it. Surfaced when the roster's

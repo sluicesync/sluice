@@ -59,8 +59,8 @@ var viewCreationRoster = map[string]map[string]string{
 		"runColdStartResumePhases": "(*Streamer).resumeTargetPreflight",
 		// the deferred passes: each namespace's views were preflighted in its
 		// own per-namespace pass.
-		"(*Migrator).runMultiDatabase":       "(*Migrator).phaseTranslateAndGateSchema",
-		"(*Streamer).coldStartMultiDatabase": "(*Streamer).coldStartCopyOneDatabase",
+		"(*Migrator).runMultiDatabase": "(*Migrator).phaseTranslateAndGateSchema",
+		"(*Streamer).finishFanoutCopy": "(*Streamer).coldStartCopyOneDatabase",
 	},
 	"internal/pipeline/backup": {
 		"(*Restore).Run": "(*Restore).refuseUnrepresentableTargetShape",

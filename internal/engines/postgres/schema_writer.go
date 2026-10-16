@@ -1347,8 +1347,9 @@ func (w *SchemaWriter) execViewDDL(ctx context.Context, stmt, sourceSchema strin
 // materialized view v with v's definition — an earlier attempt of this run,
 // or an operator who pre-created the schema — so the caller REFRESHES it
 // instead of issuing a second CREATE, which PG fails with "already
-// exists". The comparison is of deparsed text: a deparse that changed only
-// cosmetically (a different server major version between attempts) reads as
+// exists". The comparison is of deparsed text, so a body that deparses
+// differently — the source and target (or two attempts) on different server
+// major versions, or a semantically equal body that deparses differently — reads as
 // a different definition and refuses loudly, never silently. The target's definition is read under the same
 // search_path the CREATE runs under, so its deparse qualifies names the way
 // the source body (read under the source schema's path) does. A matview of

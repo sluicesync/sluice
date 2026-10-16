@@ -516,6 +516,49 @@ func (t *ScopeTally) Asked() int64 {
 	return t.asked.Load()
 }
 
+// FanoutFilterTally sums, across every namespace of a multi-namespace
+// fan-out, the candidate tables the scope push-down was asked about and the
+// tables the table filter kept. A fan-out deliberately SKIPS a namespace
+// whose tables were all filtered out and that has no views (an
+// --include-table naming one namespace's table is a normal fan-out shape),
+// so no single pass may refuse it — but when every pass skipped, the run
+// would copy nothing at exit 0, and only the summed count can say so.
+// [FanoutFilterTally.Refuse] is that verdict; the per-pass skip stays.
+// Nil-safe throughout: a nil tally (single-namespace run) records nothing
+// and never refuses.
+type FanoutFilterTally struct {
+	mu    sync.Mutex
+	asked int64
+	kept  int
+}
+
+// Add folds one pass's numbers in: asked from that pass's [ScopeTally],
+// kept from the table set its filter left.
+func (f *FanoutFilterTally) Add(asked int64, kept int) {
+	if f == nil {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.asked += asked
+	f.kept += kept
+}
+
+// Refuse returns the filter refusal when the push-down was asked about at
+// least one table across the fan-out and the filter kept none anywhere.
+func (f *FanoutFilterTally) Refuse() error {
+	if f == nil {
+		return nil
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.asked > 0 && f.kept == 0 {
+		return fmt.Errorf("%w — in every selected namespace (the source holds tables; the filter matched none of them)",
+			errFilterExcludedEveryTable)
+	}
+	return nil
+}
+
 // RefuseFilteredOutNamespace returns the filter refusal when the source
 // HAD tables but the engine's scope push-down dropped every one of them —
 // the push-down twin of [ApplyTableFilter]'s own refusal, which can only

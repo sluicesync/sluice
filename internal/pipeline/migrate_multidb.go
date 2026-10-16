@@ -196,6 +196,12 @@ func (m *Migrator) runMultiDatabase(ctx context.Context) error {
 	// same routing.
 	perRuns := make([]Migrator, 0, len(selected))
 
+	// Run-wide filter verdict (Bug 317 follow-up): each pass may skip a
+	// namespace its filter emptied, but a run in which EVERY namespace was
+	// filtered empty copies nothing and must not exit 0. Set before the loop
+	// so every per-database clone shares the pointer.
+	m.multiDBFilterTally = &migcore.FanoutFilterTally{}
+
 	for i, database := range selected {
 		// target is the source namespace's renamed TARGET (ADR-0142;
 		// identity when unmapped). Only the target-namespace identifier
@@ -282,6 +288,15 @@ func (m *Migrator) runMultiDatabase(ctx context.Context) error {
 	// accumulated across every pass, so this is the first and only point
 	// where the verdict is sound.
 	migcore.ReportUnmatchedPatterns(ctx, m.Filter)
+
+	// The same independent count every pass takes — the push-down's tally
+	// and the filter's kept set — summed: tables existed, none survived the
+	// filter anywhere. Before this a Postgres `--all-schemas
+	// --include-table=typo` skipped every namespace at INFO and ended
+	// "multi-database migrate complete" at exit 0 having copied nothing.
+	if err := m.multiDBFilterTally.Refuse(); err != nil {
+		return err
+	}
 
 	// ---- Final cross-database pass: apply the deferred foreign keys now
 	// that every selected database's tables exist on the target. Skipped
