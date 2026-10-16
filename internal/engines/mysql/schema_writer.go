@@ -882,12 +882,8 @@ func (w *SchemaWriter) CreateViews(ctx context.Context, s *ir.Schema) error {
 			// loud-failure tenet).
 			return fmt.Errorf("mysql: CreateViews: view %q is materialized; MySQL has no materialized view support", view.Name)
 		}
-		// Bug 312: a Postgres view body is emitted verbatim, so a TRIM
-		// remove-string longer than one byte would read as a substring here.
-		if view.DefinitionDialect == translatableSourceDialect {
-			if err := translate.RefuseDivergentTrim("view", "", view.Name, view.Definition, translatableSourceDialect, "MySQL"); err != nil {
-				return err
-			}
+		if err := refuseDivergentTrimView(view); err != nil {
+			return err
 		}
 		stmt := emitCreateView(view)
 		if _, err := w.db.ExecContext(ctx, stmt); err != nil {
@@ -895,6 +891,17 @@ func (w *SchemaWriter) CreateViews(ctx context.Context, s *ir.Schema) error {
 		}
 	}
 	return nil
+}
+
+// refuseDivergentTrimView is Bug 312's view door, shared by CreateViews and
+// PreviewDDL so a dry run shows the refusal the real run gives. A Postgres
+// view body is emitted verbatim, so a TRIM remove-string longer than one byte
+// would read as a substring here instead of a character set.
+func refuseDivergentTrimView(view *ir.View) error {
+	if view.DefinitionDialect != translatableSourceDialect {
+		return nil
+	}
+	return translate.RefuseDivergentTrim("view", "", view.Name, view.Definition, translatableSourceDialect, "MySQL")
 }
 
 // emitCreateView returns the `CREATE OR REPLACE VIEW <name> AS
@@ -995,6 +1002,9 @@ func (w *SchemaWriter) PreviewDDL(_ context.Context, s *ir.Schema) ([]ir.DDLStat
 	for _, view := range s.Views {
 		if view == nil || view.Name == "" || view.Materialized {
 			continue
+		}
+		if err := refuseDivergentTrimView(view); err != nil {
+			return nil, err
 		}
 		out = append(out, ir.DDLStatement{
 			Table: view.Name,

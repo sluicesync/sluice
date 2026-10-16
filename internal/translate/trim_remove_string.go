@@ -184,9 +184,14 @@ func trimRemoveStringSafe(args, dialect string) bool {
 	return singleCharLiteral(strings.TrimSpace(args[start:from]))
 }
 
-// plainCastSuffix matches the casts pg_get_expr appends to a literal
-// ('x'::text, 'x'::character varying, 'x'::bpchar), and nothing else.
-var plainCastSuffix = regexp.MustCompile(`^(\s*::\s*[A-Za-z_][A-Za-z_ ]*(\(\s*\d+\s*\))?)*\s*$`)
+// plainCastSuffix matches a chain of casts to a VARIABLE-length text type
+// ('x'::text, 'x'::character varying, 'x'::varchar(1)), the casts pg_get_expr
+// appends to a text literal, and nothing else. An allowlist on purpose: a cast
+// can change the remove-string before TRIM sees it. The fixed-length types are
+// the measured case (Bug 312's second review, real servers): ' '::bpchar or
+// ' '::character(1) drops its trailing space when Postgres converts it back to
+// text, so Postgres trims nothing while MySQL trims spaces.
+var plainCastSuffix = regexp.MustCompile(`(?i)^(\s*::\s*(text|varchar|character\s+varying)(\(\s*\d+\s*\))?)*\s*$`)
 
 // singleCharLiteral reports whether s is exactly one standard single-quoted
 // string literal of at most one byte, optionally followed by plain

@@ -69,6 +69,14 @@ func TestTrimRemoveStringDiverges(t *testing.T) {
 		{"pg quoted column named both", "postgres", `TRIM(BOTH "both" FROM s)`, true},
 		{"pg column remove-string", "postgres", "TRIM(BOTH pad FROM s)", true},
 		{"pg collate suffix is not a plain cast", "postgres", `TRIM(BOTH 'x' COLLATE "C" FROM s)`, true},
+		// A fixed-length cast drops a trailing space on the way back to text,
+		// so ' '::bpchar is an EMPTY set on Postgres (measured, the second
+		// Bug 312 review). Only variable-length text casts pass.
+		{"pg bpchar cast changes the remove-string", "postgres", "TRIM(BOTH ' '::bpchar FROM s)", true},
+		{"pg character(1) cast changes the remove-string", "postgres", "TRIM(BOTH ' '::character(1) FROM s)", true},
+		{"pg char cast", "postgres", "TRIM(BOTH 'x'::char FROM s)", true},
+		{"pg varchar(1) cast", "postgres", "TRIM(BOTH 'x'::varchar(1) FROM s)", false},
+		{"pg unknown type cast", "postgres", "TRIM(BOTH 'x'::citext FROM s)", true},
 		{"pg FROM in quoted ident", "postgres", `TRIM(BOTH 'x'::text FROM "from")`, false},
 		{"pg btrim is not TRIM", "postgres", "btrim(s, 'xy'::text)", false},
 	}

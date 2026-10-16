@@ -310,6 +310,12 @@ func TestMigrate_TrimRemoveStringAcrossFamilies(t *testing.T) {
 			s  VARCHAR(20)
 		);
 		CREATE UNIQUE INDEX pg_uidx_u ON pg_uidx ((trim(both 'xy' from s)));
+		CREATE TABLE pg_bpchar (
+			id INT PRIMARY KEY,
+			s  TEXT,
+			g  TEXT GENERATED ALWAYS AS (trim(both ' '::char(1) from s)) STORED
+		);
+		INSERT INTO pg_bpchar (id, s) VALUES (1, '  a  '), (2, 'b');
 	`)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -332,7 +338,10 @@ func TestMigrate_TrimRemoveStringAcrossFamilies(t *testing.T) {
 			requireTrimRefusal(ctx, t, "mysql", "postgres", mysqlSource, pgTarget, pgTgt, table)
 		})
 	}
-	for _, table := range []string{"pg_gen", "pg_chk", "pg_col", "pg_uidx"} {
+	// pg_bpchar: ' '::char(1) is an EMPTY remove-set on Postgres (the cast
+	// back to text drops the space), so the source trims nothing; MySQL
+	// would trim spaces.
+	for _, table := range []string{"pg_gen", "pg_chk", "pg_col", "pg_uidx", "pg_bpchar"} {
 		t.Run("postgres to mysql refuses "+table, func(t *testing.T) {
 			requireTrimRefusal(ctx, t, "postgres", "mysql", pgSource, mysqlTarget, myTgt, table)
 		})
