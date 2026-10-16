@@ -112,6 +112,77 @@ func TestFunctionalKeyPart_SourceEq(t *testing.T) {
 	if got := (&functionalKeyPart{columns: []string{"a"}, known: true}).sourceEq(b); got != "TRUE" {
 		t.Errorf("not a string: %s", got)
 	}
+	// Third review finding 2: a collated part reading no column is never the
+	// same source key.
+	for name, f := range map[string]*functionalKeyPart{
+		"collated, no column": {known: true, collation: "x"},
+		"unknown, no column":  {},
+	} {
+		if got := f.sourceEq(b); got != "FALSE" {
+			t.Errorf("%s: %s; want FALSE", name, got)
+		}
+	}
+	if got := (&functionalKeyPart{known: true}).sourceEq(b); got != "TRUE" {
+		t.Errorf("not a string, no column: %s", got)
+	}
+}
+
+// TestFunctionalPartArms_EachRoute discriminates each route by which a part
+// arms its key (third review finding 5: the Postgres cells armed through two
+// routes at once, so a mutant of either survived). Every case but its route
+// is held off: the index's collation is known and the target column is not
+// armed unless the route is the armed one.
+func TestFunctionalPartArms_EachRoute(t *testing.T) {
+	ci := ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: "utf8mb4_0900_ai_ci"}
+	bin := ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: "utf8mb4_bin"}
+	part := func(known bool, coll string) *functionalKeyPart {
+		return &functionalKeyPart{named: []string{"K"}, columns: []string{"k"}, known: known, collation: coll}
+	}
+	src := func(cols ...*ir.Column) *ir.Table { return &ir.Table{Name: "kd", Columns: cols} }
+	for _, tc := range []struct {
+		name   string
+		f      *functionalKeyPart
+		source *ir.Table
+		armed  map[string]armedCollation
+		want   bool
+	}{
+		// The control: the source declares k under the index's collation and
+		// k is not armed — the source's own key, nothing arms.
+		{"control: the source's own key", part(true, "utf8mb4_0900_ai_ci"), src(&ir.Column{Name: "k", Type: ci}), nil, false},
+		{
+			"armed column only (source collation equals the index's)", part(true, "utf8mb4_0900_ai_ci"),
+			src(&ir.Column{Name: "k", Type: ci}),
+			map[string]armedCollation{"k": {charset: "utf8mb4", collation: "utf8mb4_0900_ai_ci"}},
+			true,
+		},
+		{
+			"collation comparison only (unarmed column, index under another collation)", part(true, "utf8mb4_0900_ai_ci"),
+			src(&ir.Column{Name: "k", Type: bin}), nil, true,
+		},
+		{"the source lacks the column", part(true, "utf8mb4_0900_ai_ci"), src(&ir.Column{Name: "other", Type: ci}), nil, true},
+		{"no source shape (finding 3)", part(true, "utf8mb4_0900_ai_ci"), nil, nil, true},
+		{"index collation unknown", part(false, ""), src(&ir.Column{Name: "k", Type: ci}), nil, true},
+		{"not a string", part(true, ""), nil, nil, false},
+	} {
+		if got := functionalPartArms(tc.f, tc.source, tc.armed, mysqlKeyGuardCollations); got != tc.want {
+			t.Errorf("%s: arms %v; want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestPlanKeyCollationGuard_FunctionalPartNoSourceShape is finding 3 at the
+// planner: with no source shape (a live trigger-CDC stream), a collated
+// functional part still arms its key on the applier.
+func TestPlanKeyCollationGuard_FunctionalPartNoSourceShape(t *testing.T) {
+	f := &functionalKeyPart{
+		index: "fk", expr: "lower(`k`)", alone: true, columns: []string{"k"}, named: []string{"k"}, readable: true,
+		steps: []functionalStep{{kind: "fn", fn: "LOWER"}}, known: true, collation: "utf8mb4_0900_ai_ci",
+	}
+	keys := targetUniqueKeys{pk: []string{"id"}, uniques: [][]string{{"k"}}, uniqueSubs: [][]int{{0}}, uniqueFns: [][]*functionalKeyPart{{f}}}
+	ci := ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: "utf8mb4_0900_ai_ci"}
+	if p := planKeyCollationGuard(nil, kcgCols(ci), keys, mysqlKeyGuardCollations); p == nil || !p.armsFunctional() {
+		t.Fatalf("no source shape: plan %+v; want the functional key armed", p)
+	}
 }
 
 // TestPlanKeyCollationGuard_FunctionalParts is the arming matrix: a
@@ -273,16 +344,35 @@ func TestResolveFunctionalColumns(t *testing.T) {
 // backquote kept, and a string literal — either delimiter form, a backquote
 // inside it — skipped over (re-review finding 6).
 func TestExpressionColumns(t *testing.T) {
+	// SQL spelling, as expressionColumns receives it.
 	for expr, want := range map[string]string{
-		"concat(`a`,_utf8mb4\\'x\\',`b``c`, md5(`D`))": "a|b`c|D",
-		"concat(`k`,_utf8mb4\\'a`b\\')":                "k",
-		"concat(`k`,'a`b','it''s `x`')":                "k",
-		"concat(`k`,_utf8mb4\\'a\\\\`b\\',`j`)":        "k|j",
-		"(1 + 2)":                                      "",
+		"concat(`a`,_utf8mb4'x',`b``c`, md5(`D`))": "a|b`c|D",
+		"concat(`k`,_utf8mb4'a`b')":                "k",
+		"concat(`k`,'a`b','it''s `x`')":            "k",
+		"concat(`k`,_utf8mb4'it\\'s',`j`)":         "k|j",
+		"concat(_utf8mb4'x''y',`k`)":               "k",
+		"concat(`k`,\"dq'x\",`j`)":                 "k|j",
+		"(1 + 2)":                                  "",
 	} {
 		if got := strings.Join(expressionColumns(expr), "|"); got != want {
 			t.Errorf("%s: %q; want %q", expr, got, want)
 		}
+	}
+	// Third review finding 1: the exact catalog text MySQL 8.4 stores for
+	// concat(k,'it''s',j) and for "dq'x" — the information_schema layer over
+	// the SQL spelling — decoded first, as uniqueKeyColumns does. Scanned raw,
+	// the inner \' closed the literal and j was lost.
+	for catalog, want := range map[string]string{
+		"concat(`k`,_utf8mb4\\'it\\\\\\'s\\',`j`)": "k|j",
+		"concat(`k`,_utf8mb4\\'dq\\\\\\'x\\',`j`)": "k|j",
+	} {
+		if got := strings.Join(expressionColumns(decodeISExpressionEscapes(catalog)), "|"); got != want {
+			t.Errorf("catalog %s: %q; want %q", catalog, got, want)
+		}
+	}
+	// A literal that does not scan refuses at resolution.
+	if got := expressionColumns("concat(`k`,'open"); len(got) != 2 || got[1] != unreadableLiteral {
+		t.Errorf("unterminated: %q", got)
 	}
 }
 

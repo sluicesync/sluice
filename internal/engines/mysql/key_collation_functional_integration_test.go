@@ -45,7 +45,7 @@ func TestUniqueKeyColumns_FunctionalPartsOnTheRealServer(t *testing.T) {
 		"UNIQUE KEY bc ((k collate utf8mb4_bin)), UNIQUE KEY l1 ((lower(cast(k as char charset latin1)))), "+
 		"UNIQUE KEY bn ((cast(k as binary))), UNIQUE KEY mix (j, (upper(k))), "+
 		"UNIQUE KEY md ((md5(k))), UNIQUE KEY nm ((j * 2)), UNIQUE KEY tb ((trim(both 'x' from k))), "+
-		"UNIQUE KEY cc ((concat(k, j))), UNIQUE KEY lb ((concat(k, 'a`b'))), UNIQUE KEY mc ((lower(K))), UNIQUE KEY "+strings.Repeat("functional_key_", 4)+" ((upper(lower(k)))))")
+		"UNIQUE KEY cc ((concat(k, j))), UNIQUE KEY lb ((concat(k, 'a`b'))), UNIQUE KEY qa ((concat(k, 'it''s', j))), UNIQUE KEY qb ((concat('x''y', k))),UNIQUE KEY mc ((lower(K))), UNIQUE KEY "+strings.Repeat("functional_key_", 4)+" ((upper(lower(k)))))")
 	applyDDL(t, dsn, "INSERT INTO kx VALUES (1, ' Abc ', 1), (2, 'ÉtÉ', 2), (3, 'x', 3), (4, 'ß', 4)")
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
@@ -102,7 +102,7 @@ func TestUniqueKeyColumns_FunctionalPartsOnTheRealServer(t *testing.T) {
 	for idx, want := range map[string]struct {
 		columns  string
 		collated bool
-	}{"md": {"k", true}, "nm": {"j", false}, "tb": {"k", true}, "cc": {"k|j", true}, "lb": {"k", true}} {
+	}{"md": {"k", true}, "nm": {"j", false}, "tb": {"k", true}, "cc": {"k|j", true}, "lb": {"k", true}, "qa": {"k|j", true}, "qb": {"k", true}} {
 		f := read[idx]
 		if f == nil || f.readable {
 			t.Errorf("key %s: %+v; want an unreadable part", idx, f)
@@ -247,6 +247,34 @@ func TestRowWriterKeyCollationGuard_FunctionalKeys(t *testing.T) {
 				})
 			})
 		}
+	}
+}
+
+// TestKeyCollationGuard_FunctionalKeyNoSourceShape is third-review finding 3
+// on the applier: a change stream that carries no SchemaSnapshot (the live
+// sqlite-trigger and d1-trigger readers) leaves the applier with no source
+// shape, and a functional key must still be guarded — its source side is
+// bytes, which needs nothing from the source. Both apply doors; the target
+// is read back by HEX(k).
+func TestKeyCollationGuard_FunctionalKeyNoSourceShape(t *testing.T) {
+	for _, batched := range []bool{false, true} {
+		t.Run(fmt.Sprintf("batched=%v", batched), func(t *testing.T) {
+			db := fmt.Sprintf("kcfn_nosrc_%v", batched)
+			dsn, cleanup := newSharedDB(t, db)
+			defer cleanup()
+			applyDDL(t, dsn, "CREATE TABLE kd (id INT NOT NULL PRIMARY KEY, k VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL, d INT, "+
+				"UNIQUE KEY fk ((lower(cast(k as char charset utf8mb4)))))")
+			applyDDL(t, dsn, "INSERT INTO kd VALUES (1,'e',1)")
+			// No SchemaSnapshot precedes the change.
+			err := kcgApply(t, Engine{}, dsn, batched,
+				ir.Insert{Position: kcgPos(1), Schema: db, Table: "kd", Row: ir.Row{"id": int64(2), "k": "é", "d": int64(2)}})
+			if !errors.Is(err, ir.ErrKeyCollationMerge) || !strings.Contains(fmtErr(err), keyCollationMergeMarker) {
+				t.Fatalf("err = %v; want KEY-COLLATION-MERGE (target %s)", err, kcgRows(t, dsn, "kd", "id"))
+			}
+			if got := kcgRows(t, dsn, "kd", "id"); got != "1:65" {
+				t.Fatalf("after the refusal the target is %s; want 1:65", got)
+			}
+		})
 	}
 }
 
@@ -519,6 +547,36 @@ func TestRowWriterKeyCollationGuard_FunctionalKeysReReview(t *testing.T) {
 					wantRows(t, write(t, flavor.eng, dsn, kj(pgVC), row(1, "e", 5)), dsn, "1:65")
 					wantMerge(t, write(t, flavor.eng, dsn, kj(pgVC), row(2, "é", 5)), dsn, "1:65")
 					wantRows(t, write(t, flavor.eng, dsn, kj(pgVC), row(3, "é", 6)), dsn, "1:65,3:C3A9")
+				})
+			}
+			// Third review finding 1: a quote-containing literal. The catalog
+			// stores 'it''s' as _utf8mb4\'it\\\'s\'; scanned raw, the column after
+			// it (j) was lost, and 'e'/'é' in j merged at exit 0.
+			kjText := &ir.Table{Name: "kd", PrimaryKey: pk, Columns: []*ir.Column{
+				{Name: "id", Type: ir.Integer{Width: 32}}, {Name: "k", Type: pgVC}, {Name: "j", Type: pgVC},
+			}}
+			kjGen := &ir.Table{Name: "kd", PrimaryKey: pk, Columns: []*ir.Column{
+				{Name: "id", Type: ir.Integer{Width: 32}},
+				{Name: "k", Type: pgVC},
+				{Name: "j", Type: pgVC},
+				{Name: "g", Type: pgVC, GeneratedExpr: "concat(k, 'it''s', j)", GeneratedStored: true, Nullable: true},
+			}}
+			const kjDDL = "CREATE TABLE kd (id INT NOT NULL PRIMARY KEY, k VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL, " +
+				"j VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL, "
+			for name, ddl := range map[string]string{
+				"quote literal in an unreadable key": kjDDL + "UNIQUE KEY fk ((concat(k, 'it''s', j))))",
+				"quote literal in a generated column": kjDDL + "g VARCHAR(60) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci " +
+					"AS (concat(k, 'it''s', j)) STORED, UNIQUE KEY fk ((lower(g))))",
+			} {
+				t.Run(name, func(t *testing.T) {
+					tbl := kjText
+					if strings.Contains(name, "generated") {
+						tbl = kjGen
+					}
+					dsn := cell(t, ddl)
+					wantRows(t, write(t, flavor.eng, dsn, tbl, ir.Row{"id": int64(1), "k": "a", "j": "e"}), dsn, "1:61")
+					wantMerge(t, write(t, flavor.eng, dsn, tbl, ir.Row{"id": int64(2), "k": "a", "j": "é"}), dsn, "1:61")
+					wantRows(t, write(t, flavor.eng, dsn, tbl, ir.Row{"id": int64(3), "k": "a", "j": "f"}), dsn, "1:61,3:61")
 				})
 			}
 			t.Run("long key name, a conflict through another unique key", func(t *testing.T) {

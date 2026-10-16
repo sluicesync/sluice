@@ -60,10 +60,12 @@ package mysql
 // index's ([functionalPartArms]): a column it reads is armed, the source
 // declares one under a collation other than the index's (review F2: a column
 // both sides declare `utf8mb4_bin` still merges 'e' and 'é' under a key
-// whose CAST compares `_ai_ci`), or the index's collation is not known.
-// Where the target compares exactly as the source does — a MySQL source's
-// own key — it does not arm (re-review finding 2: arming there refused stale
-// respellings ON DUPLICATE KEY UPDATE converges). So the keys are read for
+// whose CAST compares `_ai_ci`), the index's collation is not known, or
+// there is no source shape at all (a live trigger-CDC stream). A part whose
+// columns the source declares under the index's own collation does not arm
+// (re-review finding 2: arming there refused stale respellings ON DUPLICATE
+// KEY UPDATE converges) — which infers the source's index from its columns,
+// a stated premise ([functionalPartArms]). So the keys are read for
 // every table, armed column or not: one catalog read per table per writer,
 // cached, and two more (its columns and its hidden columns) for a table with
 // a functional part. A part KNOWN not to be a string (`(j * 2)`, a binary
@@ -80,9 +82,15 @@ package mysql
 // The catalog keeps the expression's identifiers as the index DDL spelled
 // them (`lower(EMAIL)` over column `Email`), so every column a part reads
 // is resolved against the table's columns case-insensitively (review F1:
-// an exact-case lookup missed and ran no guard). A name that resolves to no
-// column — a non-ASCII name the catalog mangled (Bug 288) — refuses
-// KEY-COLLATION-GUARD-UNSUPPORTED: there is nothing to compare its bytes by.
+// an exact-case lookup missed and ran no guard).
+//
+// The table-level refusals that remain, each KEY-COLLATION-GUARD-UNSUPPORTED
+// and each loud before any row: a name that resolves to no column (a
+// non-ASCII name the catalog mangled, Bug 288; an unscannable literal); a
+// generated column nested more than eight deep; and an armed key whose
+// resolved columns are still not all in the insert (renderFor). A collated
+// part that resolves to no column at all compares FALSE on the source side,
+// so a conflict through it refuses that row.
 
 import (
 	"context"
@@ -137,9 +145,17 @@ func (f *functionalKeyPart) collated() bool { return !f.known || f.collation != 
 // sourceEq is the part's source-side comparison: the bytes of every column
 // it reads (bytes renders one column's), or TRUE for a part that is not a
 // collated string, which compares by value on both sides and is left out.
+// A collated part that reads NO column compares FALSE — never the same
+// source key — so any conflict through it refuses: a constant expression, or
+// a column list a scan lost, must be loud, never a silent "same" (third
+// review 2026-10-15, finding 2: TRUE here let a part whose columns were
+// dropped pass every merge).
 func (f *functionalKeyPart) sourceEq(bytes func(column string) string) string {
-	if !f.collated() || len(f.columns) == 0 {
+	if !f.collated() {
 		return "TRUE"
+	}
+	if len(f.columns) == 0 {
+		return "FALSE"
 	}
 	parts := make([]string, len(f.columns))
 	for i, c := range f.columns {
@@ -342,44 +358,35 @@ func (p *functionalParser) ident() (string, []functionalStep, bool) {
 	return "", nil, false
 }
 
-// expressionColumns lists the backquoted identifiers of the server's
-// EXPRESSION text — the columns an expression the guard cannot read reads.
-// The server backquotes every column reference in that text. String
-// literals are skipped (re-review 2026-10-15, finding 6: a backquote inside
-// one read as a column): the catalog stores them with escaped delimiters,
-// `_utf8mb4\'a`b\'`, and a plain `'…'` (doubled quote, backslash escape) is
-// skipped the same way. A name that still resolves to no column of the
-// table refuses at resolution, loudly.
+// unreadableLiteral stands in [expressionColumns]'s result for a string
+// literal it could not scan to its end: a name no table has, so the part
+// refuses at resolution rather than being read with columns missing.
+const unreadableLiteral = "\x00unterminated literal"
+
+// expressionColumns lists the backquoted identifiers of an expression in
+// SQL spelling — the columns an expression the guard cannot read reads. The
+// server backquotes every column reference. The text must already be
+// decoded from the information_schema layer ([decodeISExpressionEscapes],
+// done where the catalog is read): that layer escapes `\` and `'` once more,
+// so `'it”s'` is stored as `_utf8mb4\'it\\\'s\'`, and a scan of the raw
+// text took the inner `\'` for the close and lost every column after the
+// literal — `concat(k, 'it”s', j)` read as k alone, and 'e'/'é' in j
+// merged at exit 0 (third review 2026-10-15, measured on MySQL 8.4). String
+// literals are skipped with the package's MySQL literal scanner
+// ([quotedLiteralClose]: backslash escapes and doubled quotes, either
+// delimiter), so a backquote inside one is not read as a column. A literal
+// that does not scan yields [unreadableLiteral], which refuses.
 func expressionColumns(expr string) []string {
 	var out []string
 	for i := 0; i < len(expr); i++ {
-		switch {
-		case expr[i] == '\\' && i+1 < len(expr) && expr[i+1] == '\'':
-			// A literal with escaped delimiters: to the next \'.
-			for i += 2; i < len(expr); i++ {
-				if expr[i] == '\\' && i+1 < len(expr) {
-					if expr[i+1] == '\'' {
-						i++
-						break
-					}
-					i++
-				}
+		switch expr[i] {
+		case '\'', '"':
+			closeIdx, _, ok := quotedLiteralClose(expr[i:], expr[i])
+			if !ok {
+				return append(out, unreadableLiteral)
 			}
-		case expr[i] == '\'':
-			for i++; i < len(expr); i++ {
-				if expr[i] == '\\' {
-					i++
-					continue
-				}
-				if expr[i] == '\'' {
-					if i+1 < len(expr) && expr[i+1] == '\'' {
-						i++
-						continue
-					}
-					break
-				}
-			}
-		case expr[i] == '`':
+			i += closeIdx
+		case '`':
 			var b strings.Builder
 			for i++; i < len(expr); i++ {
 				if expr[i] == '`' {
@@ -622,29 +629,46 @@ func (k *targetUniqueKeys) markFunctionalArming(source *ir.Table, armed map[stri
 //
 //   - the index's collation is not known (vtgate; an ambiguous shortened
 //     hidden-column name): nothing shows the two alike;
+//
 //   - a column it names is armed — the source declares a collation the
 //     target column does not share, which every Postgres-source character
 //     column is (the cross-family case);
+//
 //   - a column it names is declared by the source under a collation other
 //     than the one the index compares under (review F2: a column both sides
 //     declare `utf8mb4_bin` under a key whose CAST compares `_ai_ci`), or
 //     the source declares none, or lacks the column.
 //
-// Otherwise the target compares the part exactly as the source compares its
+//   - there is no source shape at all: nothing shows the source compares
+//     alike. Third review 2026-10-15, finding 3: disarming here left every
+//     functional key unguarded on a live sqlite-trigger or d1-trigger →
+//     MySQL stream, whose readers emit no SchemaSnapshot (only the broker
+//     seeds a shape). A plain column stays unarmed without one — its rule
+//     needs the source's collation to compare — but a functional part's
+//     source side is bytes, which needs nothing from the source.
+//
+// Otherwise the target compares the part as the source compares its
 // columns, and arming it would only refuse what converges: re-review
 // 2026-10-15 finding 2 measured a MySQL → MySQL copy, with the source's own
 // key, refusing a stale respelled row (target row 3 'A@y', the source's row
 // 4 'a@y') that ON DUPLICATE KEY UPDATE converges. A part whose value is not
-// a string never arms. With no source shape (nothing known of the source)
-// only an unknown index collation arms, as for a plain column.
+// a string never arms.
+//
+// UNVERIFIED PREMISE, stated (third review, finding 4): "the source compares
+// the part under its columns' collation" infers the SOURCE's own index from
+// the source's column collations, because the source's hidden column is not
+// read. That holds for an index over the column (`lower(k)` keeps k's
+// collation) and is measured for MySQL 8.0/8.4's CAST, which takes the
+// character set's default (`utf8mb4_0900_ai_ci`) and so arms over a
+// utf8mb4_bin column (loudly). A source whose own key compares under some
+// other collation — a hand-made COLLATE in the source's key, with the target
+// key matching the column — is not seen.
 func functionalPartArms(f *functionalKeyPart, source *ir.Table, armed map[string]armedCollation, compareAs map[string]string) bool {
 	switch {
 	case !f.collated():
 		return false
-	case !f.known:
+	case !f.known, source == nil:
 		return true
-	case source == nil:
-		return false
 	}
 	srcCols := make(map[string]*ir.Column, len(source.Columns))
 	for _, c := range source.Columns {

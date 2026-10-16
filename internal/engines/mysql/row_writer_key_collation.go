@@ -314,11 +314,16 @@ func uniqueKeyColumns(ctx context.Context, q queryRower, flavor Flavor, schema, 
 		name := col.String
 		var fn *functionalKeyPart
 		if !col.Valid {
-			fn = &functionalKeyPart{index: idx, expr: expression.String, seq: seq - 1}
-			if column, steps, ok := parseFunctionalKeyPart(expression.String); ok {
+			// The catalog's text carries information_schema's escaping layer
+			// over the SQL spelling (`\'` for every quote, `\\` for every
+			// backslash); decoded once here, every reader of it — the parser,
+			// the column scan, the remedy's statement — sees SQL.
+			sqlText := decodeISExpressionEscapes(expression.String)
+			fn = &functionalKeyPart{index: idx, expr: sqlText, seq: seq - 1}
+			if column, steps, ok := parseFunctionalKeyPart(sqlText); ok {
 				fn.columns, fn.readable, fn.steps = []string{column}, true, steps
 			} else {
-				fn.columns = expressionColumns(expression.String)
+				fn.columns = expressionColumns(sqlText)
 			}
 			name = ""
 			if len(fn.columns) > 0 {
@@ -376,6 +381,7 @@ func tableColumns(ctx context.Context, q queryRower, schema, table string) ([]ta
 		if err := rows.Scan(&c.name, &c.generation); err != nil {
 			return nil, err
 		}
+		c.generation = decodeISExpressionEscapes(c.generation) // the same layer as EXPRESSION's
 		out = append(out, c)
 	}
 	return out, rows.Err()
