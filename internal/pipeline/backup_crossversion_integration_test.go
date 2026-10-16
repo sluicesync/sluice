@@ -428,11 +428,17 @@ func xvTopFormatFlags() []string {
 // Version 14 is the fourth: it is stamped on a CDC SEGMENT whose schema
 // history records a key column whose collation was not established for its
 // rows — never on a full.
+//
+// Version 15 is the fifth: it is stamped on a manifest whose schema carries a
+// MySQL functional key part's hidden-column collation, which only the
+// vanilla-MySQL schema reader sets, so no flag reaches it on a Postgres
+// primary.
 var xvShapeStampedTiers = map[int]string{
 	irbackup.FormatVersionPositionlessFull:          "TestBackup_CrossVersionPositionlessFull (internal/pipeline/backup)",
 	irbackup.FormatVersionExactNumbers:              "TestBackup_CrossVersionExactNumbers (internal/pipeline)",
 	irbackup.FormatVersionKeyCollationDelta:         "TestBackup_CrossVersionKeyCollationDelta (internal/pipeline)",
 	irbackup.FormatVersionKeyCollationUnestablished: "TestBackup_CrossVersionKeyCollationUnestablished (internal/pipeline)",
+	irbackup.FormatVersionHiddenCollation:           "TestBackup_CrossVersionHiddenCollation (internal/pipeline)",
 }
 
 // xvBackupFullTopFormat writes a full stamped at the current top format
