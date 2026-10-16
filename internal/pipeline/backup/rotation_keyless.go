@@ -80,12 +80,19 @@ func (b *Backup) readScopedSchema(ctx context.Context) (ir.SchemaReader, *ir.Sch
 
 	// catalog Bug 76: scope per-column type validation to the filtered
 	// table set (b.Filter already has engine defaults merged by the caller).
-	migcore.ApplyTableScope(sr, b.Filter)
+	scopeTally := migcore.ApplyTableScopeTallied(sr, b.Filter)
 
 	schema, err := sr.ReadSchema(ctx)
 	if err != nil {
 		migcore.CloseIf(sr)
 		return nil, nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("backup: read source schema: %w", err))
+	}
+	// The push-down (Postgres) drops a filtered-out table before
+	// ApplyTableFilter sees it, so a typo'd --include-table would otherwise
+	// write an empty backup at exit 0 (Bug 317 second review).
+	if err := migcore.RefuseFilteredOutNamespace(schema, scopeTally); err != nil {
+		migcore.CloseIf(sr)
+		return nil, nil, err
 	}
 	// migcore.ApplyTableFilter errors when the filter excludes everything.
 	// For backups that's still a valid intent in some workflows

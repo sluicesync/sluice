@@ -1274,9 +1274,12 @@ func (w *SchemaWriter) RestoreIdentityGeneration(ctx context.Context, s *ir.Sche
 // orchestrator treats "already exists" as success, so a re-run (a
 // --resume after a failed views phase) would fail on a matview an
 // earlier attempt created. So a matview that already exists is checked
-// instead of re-created: the same definition is skipped as already in
-// place, a different one refuses loudly, naming it
-// ([SchemaWriter.materializedViewAlreadyCreated], Bug 317 review).
+// instead of re-created: the same definition is REFRESHED (an existing
+// matview was built over whatever its tables held then — empty tables
+// under a pre-created schema, a previous snapshot after a sync
+// restart-from-scratch — so skipping it would keep stale rows), a
+// different one refuses loudly, naming it
+// ([SchemaWriter.materializedViewAlreadyCreated], Bug 317 reviews).
 //
 // View-to-view dependency ordering is the orchestrator's responsibility:
 // CreateViews emits in declared order, so a view that references
@@ -1303,7 +1306,12 @@ func (w *SchemaWriter) CreateViews(ctx context.Context, s *ir.Schema) error {
 				return fmt.Errorf("postgres: create view %q: %w", view.Name, err)
 			}
 			if exists {
-				continue
+				// Refresh, never skip: the matview already there was built
+				// over whatever the tables held then — empty tables under a
+				// pre-created schema (ADR-0166), or the previous snapshot's
+				// rows after a sync restart-from-scratch truncated them —
+				// so keeping it would serve stale content at exit 0.
+				stmt = "REFRESH MATERIALIZED VIEW " + quoteIdent(w.schema) + "." + quoteIdent(view.Name) + ";"
 			}
 		}
 		if err := w.execViewDDL(ctx, stmt, view.Schema); err != nil {
@@ -1336,9 +1344,12 @@ func (w *SchemaWriter) execViewDDL(ctx context.Context, stmt, sourceSchema strin
 }
 
 // materializedViewAlreadyCreated reports whether the target already holds
-// materialized view v with v's definition — an earlier attempt of this run
-// created it — so a re-run does not issue a second CREATE, which PG fails
-// with "already exists". The target's definition is read under the same
+// materialized view v with v's definition — an earlier attempt of this run,
+// or an operator who pre-created the schema — so the caller REFRESHES it
+// instead of issuing a second CREATE, which PG fails with "already
+// exists". The comparison is of deparsed text: a deparse that changed only
+// cosmetically (a different server major version between attempts) reads as
+// a different definition and refuses loudly, never silently. The target's definition is read under the same
 // search_path the CREATE runs under, so its deparse qualifies names the way
 // the source body (read under the source schema's path) does. A matview of
 // that name with a DIFFERENT definition is refused loudly rather than kept:

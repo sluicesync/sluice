@@ -104,7 +104,7 @@ func TestMigrate_ViewsOnlyNamespace_PostgresToPostgres_FanoutUnderExcludeTable(t
 // round 1 creates the matview and fails the view, round 2 must create the
 // view without the matview's second CREATE failing (PG has no CREATE OR
 // REPLACE MATERIALIZED VIEW). Two layers keep that true — the pass never
-// re-issues a created view, and the PG writer skips a matview that already
+// re-issues a created view, and the PG writer refreshes a matview that already
 // exists with the same definition — so this cell is red only when BOTH are
 // broken; each layer has its own pin (the unit
 // TestCreateDeferredViews_CreatedMaterializedViewIsNotReissued, and

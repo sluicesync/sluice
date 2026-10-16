@@ -22,6 +22,7 @@ import (
 type viewsOnlyFilterSource struct {
 	stubEngineBase
 	tables   []string
+	noViews  bool
 	defaults []string
 }
 
@@ -30,18 +31,22 @@ func (*viewsOnlyFilterSource) Name() string { return "views-only-filter-src" }
 func (s *viewsOnlyFilterSource) DefaultExcludePatterns(string) []string { return s.defaults }
 
 func (s *viewsOnlyFilterSource) OpenSchemaReader(context.Context, string) (ir.SchemaReader, error) {
-	return &viewsOnlyFilterReader{tables: s.tables}, nil
+	return &viewsOnlyFilterReader{tables: s.tables, noViews: s.noViews}, nil
 }
 
 type viewsOnlyFilterReader struct {
-	tables []string
-	scope  func(string) bool
+	tables  []string
+	noViews bool
+	scope   func(string) bool
 }
 
 func (r *viewsOnlyFilterReader) SetTableScope(allow func(string) bool) { r.scope = allow }
 
 func (r *viewsOnlyFilterReader) ReadSchema(context.Context) (*ir.Schema, error) {
 	s := &ir.Schema{Views: []*ir.View{{Name: "v", Definition: "SELECT 1 AS id"}}}
+	if r.noViews {
+		s.Views = nil
+	}
 	for _, name := range r.tables {
 		if r.scope != nil && !r.scope(name) {
 			continue
@@ -87,6 +92,7 @@ func TestPhaseReadSourceSchema_ViewsOnlyNamespaceUnderATableFilter(t *testing.T)
 		{"views-only, --include-table", &viewsOnlyFilterSource{}, mustFilter(t, []string{"orders"}, nil), false},
 		{"views-only, vstream-flavor default _vt_* and no flags", &viewsOnlyFilterSource{defaults: vtDefaults}, migcore.TableFilter{}, false},
 		{"tables all filtered by the push-down, views remain", &viewsOnlyFilterSource{tables: []string{"t"}}, mustFilter(t, []string{"orders"}, nil), true},
+		{"tables all filtered by the push-down, no views (typo'd --include-table)", &viewsOnlyFilterSource{tables: []string{"t"}, noViews: true}, mustFilter(t, []string{"ordres"}, nil), true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

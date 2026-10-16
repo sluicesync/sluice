@@ -517,15 +517,22 @@ func (t *ScopeTally) Asked() int64 {
 }
 
 // RefuseFilteredOutNamespace returns the filter refusal when the source
-// HAD tables but the engine's scope push-down dropped every one of them
-// and views remain. Without it a Postgres namespace whose tables were all
-// filtered out would proceed to create views over tables the run never
-// copied, while the same namespace on MySQL (no push-down) refuses in
-// [ApplyTableFilter]. A schema with no views returns early upstream and
-// never reaches this; a namespace that genuinely has no tables (Asked is
-// zero) passes.
+// HAD tables but the engine's scope push-down dropped every one of them —
+// the push-down twin of [ApplyTableFilter]'s own refusal, which can only
+// see the tables that reached it. On Postgres (the push-down engine) a
+// typo'd --include-table arrives as an empty schema.Tables, which is also
+// what a genuinely table-less source looks like; the tally tells them
+// apart. A namespace that genuinely has no tables (Asked is zero) passes.
+//
+// Every caller that installs the push-down AND then applies the table
+// filter owes this call (held by TestTableScopePushDownCallersOweTheRefusal).
+// The multi-namespace fan-out calls it only for a namespace that still has
+// views: a fan-out namespace with no views whose tables were all filtered
+// out is skipped at INFO, which is how a fan-out with --include-table
+// naming one namespace's table works on Postgres (MySQL, with no push-down,
+// refuses there instead — a pre-existing asymmetry, filed).
 func RefuseFilteredOutNamespace(schema *ir.Schema, tally *ScopeTally) error {
-	if schema == nil || len(schema.Tables) > 0 || len(schema.Views) == 0 {
+	if schema == nil || len(schema.Tables) > 0 {
 		return nil
 	}
 	if tally.Asked() > 0 {

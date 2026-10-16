@@ -97,7 +97,7 @@ type pendingView struct {
 // refuses before any view is created, as [migcore.RunViewsPhase] does.
 //
 // Across runs (a --resume after this pass failed) the pass starts from
-// the full list again; the Postgres writer skips a materialized view that
+// the full list again; the Postgres writer refreshes a materialized view that
 // already exists with the same definition, and CREATE OR REPLACE VIEW
 // covers plain views on both writers.
 func createDeferredViews(ctx context.Context, target ir.Engine, namespaces []namespaceViews) error {

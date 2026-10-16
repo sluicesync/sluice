@@ -101,14 +101,20 @@ func (m *Migrator) phaseReadSourceSchema(ctx context.Context, scope *multiDBScop
 	// namespace's tables — still has its views to create: every table phase
 	// below runs over zero tables, and the views phase (with its preflight)
 	// runs as usual. Returning here for it skipped the views at exit 0.
+	//
+	// No tables because the push-down filtered every table out (Postgres) is
+	// the filter refusal, not an empty or views-only namespace: a typo'd
+	// --include-table refuses instead of exiting 0 with "nothing to migrate".
+	// In a fan-out only a namespace that still has views refuses; one with
+	// nothing left is skipped, as it always was (see RefuseFilteredOutNamespace).
+	if scope == nil || len(schema.Views) > 0 {
+		if err := migcore.RefuseFilteredOutNamespace(schema, scopeTally); err != nil {
+			return sr, nil, err
+		}
+	}
 	if len(schema.Tables) == 0 && len(schema.Views) == 0 {
 		slog.InfoContext(ctx, "source schema has no tables or views; nothing to migrate")
 		return sr, nil, nil
-	}
-	// Views but no tables because the push-down filtered every table out
-	// (Postgres) is the filter refusal, not a views-only namespace.
-	if err := migcore.RefuseFilteredOutNamespace(schema, scopeTally); err != nil {
-		return sr, nil, err
 	}
 
 	// ---- 1.25. Prune schema by table filter ----

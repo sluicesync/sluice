@@ -234,11 +234,16 @@ func (d *Differ) Run(ctx context.Context) (*irdiff.SchemaDiff, error) {
 
 	// catalog Bug 76: scope per-column type validation to the filtered
 	// table set before the schema scan.
-	migcore.ApplyTableScope(sr, d.Filter)
+	scopeTally := migcore.ApplyTableScopeTallied(sr, d.Filter)
 
 	srcSchema, err := sr.ReadSchema(ctx)
 	if err != nil {
 		return nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("diff: read source schema: %w", err))
+	}
+	// A filter the push-down applied to every table (Postgres) is the filter
+	// refusal, not an empty or views-only source.
+	if err := migcore.RefuseFilteredOutNamespace(srcSchema, scopeTally); err != nil {
+		return nil, err
 	}
 	// Bug 317 sibling: a views-only schema still has views to diff (missing
 	// / extra / drifted on the target).
