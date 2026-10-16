@@ -199,6 +199,9 @@ func (r *SchemaReader) readViews(ctx context.Context) ([]*ir.View, error) {
 		if err := rows.Scan(&name, &definition); err != nil {
 			return nil, err
 		}
+		// Bug 314: MySQL writes the database name into every table
+		// reference, so a verbatim body would read the source's database on
+		// a target server that also holds one by that name.
 		out = append(out, &ir.View{
 			// Schema is empty in single-database mode (flat scope); in
 			// multi-database mode (ADR-0074) it carries the source
@@ -206,7 +209,7 @@ func (r *SchemaReader) readViews(ctx context.Context) ([]*ir.View, error) {
 			// same-named target namespace.
 			Schema:            r.namespaceName(),
 			Name:              name,
-			Definition:        definition,
+			Definition:        r.viewDefinition(definition),
 			DefinitionDialect: dialectName,
 			Materialized:      false,
 		})
@@ -262,6 +265,20 @@ func (r *SchemaReader) readTables(ctx context.Context) (map[string]*ir.Table, er
 	}
 	appliershared.LogExcludedControlTables("mysql", excluded)
 	return out, rows.Err()
+}
+
+// viewDefinition is the body readViews stores for a view (Bug 314). In
+// single-database mode the target database may have any name, so the
+// source database's own qualifier is stripped and the view resolves
+// against the database it is created in. In multi-database mode
+// (ADR-0074) every namespace lands in a same-named target database, so the
+// qualifier already names the right one, including for a view that reads
+// a sibling database, and the body is kept verbatim.
+func (r *SchemaReader) viewDefinition(definition string) string {
+	if r.multiDB {
+		return definition
+	}
+	return stripOwnSchemaQualifier(definition, r.schema)
 }
 
 // namespaceName returns the database name to stamp onto emitted

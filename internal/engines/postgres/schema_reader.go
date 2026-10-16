@@ -264,6 +264,16 @@ func (r *SchemaReader) catalogQuery(ctx context.Context, q string, args ...any) 
 // exposure audit -- runs the catalog read through the SAME chokepoint,
 // including the SET LOCAL above, instead of opening its own.
 func catalogQueryOn(ctx context.Context, db *sql.DB, q string, args ...any) (*catalogRows, error) {
+	return catalogQueryUnderSearchPath(ctx, db, "", q, args...)
+}
+
+// catalogQueryUnderSearchPath is [catalogQueryOn] with the transaction's
+// search_path pinned to schema (when non-empty). The deparse functions
+// behind pg_views.definition qualify a relation exactly when its schema is
+// not on the reading session's search_path, so a view body read under the
+// server's default path names its own schema whenever that is not public,
+// and names nothing when it is (Bug 314).
+func catalogQueryUnderSearchPath(ctx context.Context, db *sql.DB, schema, q string, args ...any) (*catalogRows, error) {
 	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return nil, fmt.Errorf("postgres: begin catalog read: %w", err)
@@ -271,6 +281,12 @@ func catalogQueryOn(ctx context.Context, db *sql.DB, q string, args ...any) (*ca
 	if _, err := tx.ExecContext(ctx, "SET LOCAL max_parallel_workers_per_gather = 0"); err != nil {
 		_ = tx.Rollback()
 		return nil, fmt.Errorf("postgres: disable parallel plan for catalog read: %w", err)
+	}
+	if schema != "" {
+		if _, err := tx.ExecContext(ctx, "SELECT pg_catalog.set_config('search_path', $1, true)", quoteIdent(schema)); err != nil {
+			_ = tx.Rollback()
+			return nil, fmt.Errorf("postgres: pin search_path for catalog read: %w", err)
+		}
 	}
 	// The rows escape through the catalogRows wrapper; every caller
 	// iterates and checks Err via the embedded *sql.Rows, but the
@@ -602,7 +618,13 @@ func (r *SchemaReader) readViews(ctx context.Context) ([]*ir.View, error) {
 		WHERE  schemaname = $1
 		ORDER  BY name`
 
-	rows, err := r.catalogQuery(ctx, q, r.schema)
+	// Bug 314: read the bodies with the source schema as the whole search
+	// path, so the server writes the source's own relations and functions
+	// unqualified and every other schema's qualified. The writer then
+	// resolves the unqualified names in the target schema, whatever it is
+	// called. Read under the default path, a body names schema app and, on
+	// a target that also holds an app schema, reads it at exit 0.
+	rows, err := catalogQueryUnderSearchPath(ctx, r.db, r.schema, q, r.schema)
 	if err != nil {
 		return nil, err
 	}
