@@ -125,6 +125,15 @@ type CDCReader struct {
 	// per table. Pump-goroutine-only, like outOfScopeWarned.
 	excludedNoted map[string]bool
 
+	// touch emits the first-touch schema boundary ahead of each table's
+	// first change of the session (cdc_first_touch.go,
+	// KEY-COLLATION-TRIGGER-CDC-NO-HISTORY), reading through shapeReader,
+	// opened on the first touch. Pump-goroutine-only; Close releases
+	// shapeReader after joining the pump.
+	touch       firstTouch
+	shapeReader *postgres.SchemaReader
+	appID       string
+
 	// mu guards err. The pump writes; the caller reads via Err.
 	mu  sync.Mutex
 	err error
@@ -232,13 +241,16 @@ func openCDCReader(ctx context.Context, dsn, appID string) (ir.CDCReader, error)
 	// re-run does. WARN rather than refuse so the upgrade does not strand
 	// running syncs — the reasoning is recorded on the door itself.
 	warnInsecureCaptureFunctions(ctx, db, cfg.schema)
-	return &CDCReader{
+	r := &CDCReader{
 		db:           db,
 		schema:       cfg.schema,
 		dsn:          cfg.dsn,
+		appID:        appID,
 		pollInterval: defaultPollInterval,
 		batchSize:    defaultBatchSize,
-	}, nil
+	}
+	r.touch.shape = r.readTableShape
+	return r, nil
 }
 
 // SetPollInterval overrides the default 1 s poll cadence for this
@@ -272,6 +284,10 @@ func (r *CDCReader) Close() error {
 	if r.pumpDone != nil {
 		<-r.pumpDone
 		r.pumpDone = nil
+	}
+	if r.shapeReader != nil {
+		_ = r.shapeReader.Close()
+		r.shapeReader = nil
 	}
 	r.pruneMu.Lock()
 	if r.pruneDB != nil {
@@ -436,7 +452,15 @@ func (r *CDCReader) pump(ctx context.Context, startID int64, out chan<- ir.Chang
 			r.setErr(refuseStalledWatermark(b))
 			return
 		}
-		for _, ev := range b.events {
+		// The first-touch schema boundary (cdc_first_touch.go). A failed
+		// catalog read is a poll fault: retried when transient, terminal
+		// otherwise, and nothing of the batch is sent either way.
+		events, err := r.touch.precede(ctx, b.events, b.txids)
+		if err != nil {
+			r.setErr(classifyPollError(err))
+			return
+		}
+		for _, ev := range events {
 			select {
 			case <-ctx.Done():
 				return
@@ -696,6 +720,17 @@ type pollBatch struct {
 	// whether the window came back full: a window of out-of-scope rows
 	// emits nothing and is exactly as full (GC-43 (a)).
 	consumed int
+
+	// txids parallels events: the capturing transaction's xid8 for each, so
+	// the first-touch schema boundary can ask whether the catalog changed
+	// after the rows it describes ([firstTouch.precede]).
+	txids []int64
+}
+
+// add appends one decoded change and the txid that captured it.
+func (b *pollBatch) add(c ir.Change, txid int64) {
+	b.events = append(b.events, c)
+	b.txids = append(b.txids, txid)
 }
 
 // poll runs one bounded fetch and consumes the contiguous committed run
@@ -818,7 +853,7 @@ func (r *CDCReader) poll(ctx context.Context, lastSeen int64) (pollBatch, error)
 			if err != nil {
 				return pollBatch{}, fmt.Errorf("encode position: %w", err)
 			}
-			b.events = append(b.events, ir.Truncate{Position: pos, Schema: schema, Table: table, CommitTime: commitTime})
+			b.add(ir.Truncate{Position: pos, Schema: schema, Table: table, CommitTime: commitTime}, txid)
 			b.lastID = id
 			continue
 		}
@@ -854,7 +889,7 @@ func (r *CDCReader) poll(ctx context.Context, lastSeen int64) (pollBatch, error)
 
 		switch op {
 		case "I":
-			b.events = append(b.events, ir.Insert{Position: pos, Schema: schema, Table: table, Row: afterRow, CommitTime: commitTime, ApplyID: applyID})
+			b.add(ir.Insert{Position: pos, Schema: schema, Table: table, Row: afterRow, CommitTime: commitTime, ApplyID: applyID}, txid)
 		case "U":
 			// `before`/`after` completeness is a deliberate
 			// capture-payload mode choice (ADR-0068), NOT a REPLICA
@@ -869,7 +904,7 @@ func (r *CDCReader) poll(ctx context.Context, lastSeen int64) (pollBatch, error)
 			// the applier builds its WHERE from `before` and SET from
 			// `after` — both correct and idempotent for any of the
 			// modes, with no reader/applier code change.
-			b.events = append(b.events, ir.Update{Position: pos, Schema: schema, Table: table, Before: beforeRow, After: afterRow, CommitTime: commitTime, ApplyID: applyID})
+			b.add(ir.Update{Position: pos, Schema: schema, Table: table, Before: beforeRow, After: afterRow, CommitTime: commitTime, ApplyID: applyID}, txid)
 		case "D":
 			// Delete events carry only OLD; the applier's PK-only
 			// path uses Before to identify the row.
@@ -880,13 +915,14 @@ func (r *CDCReader) poll(ctx context.Context, lastSeen int64) (pollBatch, error)
 				// is correct.
 				return pollBatch{}, fmt.Errorf("delete event id=%d has NULL before_jsonb", id)
 			}
-			b.events = append(b.events, ir.Delete{Position: pos, Schema: schema, Table: table, Before: beforeRow, CommitTime: commitTime, ApplyID: applyID})
+			b.add(ir.Delete{Position: pos, Schema: schema, Table: table, Before: beforeRow, CommitTime: commitTime, ApplyID: applyID}, txid)
 		default:
 			return pollBatch{}, fmt.Errorf("unknown op %q at id=%d", op, id)
 		}
 		// The watermark rides the bigserial id alone; txid is consumed above
-		// only as the apply-identity stamp (the settled-ceiling arm consumes
-		// it inside the SQL — [pollQuery] / [settledCeilingSQL]). committed
+		// only as the apply-identity stamp and carried beside the change for
+		// the first-touch boundary's catalog-age check (the settled-ceiling
+		// arm consumes it inside the SQL — [pollQuery] / [settledCeilingSQL]). committed
 		// is the sync-lag commit timestamp (roadmap item 45).
 		b.lastID = id
 	}

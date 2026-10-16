@@ -2642,6 +2642,38 @@ func (r *CDCReader) resolveColumnCollations(ctx context.Context, entry *relation
 	if r.db == nil {
 		return nil
 	}
+	got, err := ColumnCollationsAsOf(ctx, r.db, entry.Schema, entry.Name, r.decodingXid)
+	if err != nil {
+		return err
+	}
+	for i := range entry.Columns {
+		c, ok := got[entry.Columns[i].Name]
+		if !ok {
+			continue
+		}
+		entry.Columns[i].Collation, entry.Columns[i].CollationDeterminism = c.Name, c.Determinism
+		entry.Columns[i].CollationResolved = true
+	}
+	return nil
+}
+
+// ColumnCollation is one column's collation as [ColumnCollationsAsOf] reads
+// it: the name ("" for the database default, the SchemaReader's spelling)
+// and its determinism as established for the rows being decoded.
+type ColumnCollation struct {
+	Name        string
+	Determinism ir.CollationDeterminism
+}
+
+// ColumnCollationsAsOf is the catalog read behind
+// [CDCReader.resolveColumnCollations], keyed by column name, for rows written
+// by the transaction whose 32-bit xid is decodingXid (0: none known, nothing
+// compared). It is exported for the postgres-trigger reader, whose
+// first-touch schema boundary (KEY-COLLATION-TRIGGER-CDC-NO-HISTORY) reads a
+// table's collations exactly as a pgoutput Relation's are read, with the
+// capturing transaction's xid standing in for the decoded one — so both
+// lanes stamp a collation changed after the rows Unknown the same way.
+func ColumnCollationsAsOf(ctx context.Context, db *sql.DB, schema, table string, decodingXid uint32) (map[string]ColumnCollation, error) {
 	const q = `
 		SELECT a.attname,
 		       COALESCE(CASE WHEN coll.collname = 'default' THEN '' ELSE coll.collname END, ''),
@@ -2656,35 +2688,22 @@ func (r *CDCReader) resolveColumnCollations(ctx context.Context, entry *relation
 		  AND  a.attnum   > 0
 		  AND  NOT a.attisdropped`
 	var decoding any // NULL before the first transaction: nothing to compare with
-	if r.decodingXid != 0 {
-		decoding = strconv.FormatUint(uint64(r.decodingXid), 10)
+	if decodingXid != 0 {
+		decoding = strconv.FormatUint(uint64(decodingXid), 10)
 	}
-	rows, err := r.db.QueryContext(ctx, q, entry.Schema, entry.Name, decoding)
+	rows, err := db.QueryContext(ctx, q, schema, table, decoding)
 	if err != nil {
-		return fmt.Errorf("resolve column collations: %w", err)
+		return nil, fmt.Errorf("resolve column collations: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
-	type coll struct {
-		name          string
-		deterministic bool
-		newerThanRows bool
-	}
-	got := map[string]coll{}
+	got := map[string]ColumnCollation{}
 	for rows.Next() {
-		var name string
-		var c coll
-		if err := rows.Scan(&name, &c.name, &c.deterministic, &c.newerThanRows); err != nil {
-			return fmt.Errorf("resolve column collations: %w", err)
-		}
-		got[name] = c
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("resolve column collations: %w", err)
-	}
-	for i := range entry.Columns {
-		c, ok := got[entry.Columns[i].Name]
-		if !ok {
-			continue
+		var (
+			name, collName               string
+			deterministic, newerThanRows bool
+		)
+		if err := rows.Scan(&name, &collName, &deterministic, &newerThanRows); err != nil {
+			return nil, fmt.Errorf("resolve column collations: %w", err)
 		}
 		// The SchemaReader's spelling exactly (collationDeterminism): every
 		// collation carries its determinism, the database default included
@@ -2696,21 +2715,24 @@ func (r *CDCReader) resolveColumnCollations(ctx context.Context, entry *relation
 		// collation that has no name.
 		det := ir.CollationDeterminismUnknown
 		switch {
-		case c.name == "" && c.deterministic:
+		case collName == "" && deterministic:
 			det = ir.CollationDeterministic
-		case c.name == "":
-		case c.deterministic:
+		case collName == "":
+		case deterministic:
 			det = ir.CollationDeterministic
-		case c.newerThanRows:
-			// Not established for the rows this Relation describes (see the
-			// function comment): named, Unknown, armed as bytes.
+		case newerThanRows:
+			// Not established for the rows being decoded (see
+			// [CDCReader.resolveColumnCollations]): named, Unknown, armed as
+			// bytes.
 		default:
 			det = ir.CollationNonDeterministic
 		}
-		entry.Columns[i].Collation, entry.Columns[i].CollationDeterminism = c.name, det
-		entry.Columns[i].CollationResolved = true
+		got[name] = ColumnCollation{Name: collName, Determinism: det}
 	}
-	return nil
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("resolve column collations: %w", err)
+	}
+	return got, nil
 }
 
 // primaryKeyColumnsFromCatalog returns the ordered PRIMARY KEY column

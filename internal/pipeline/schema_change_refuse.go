@@ -1130,6 +1130,8 @@ func (s *Streamer) unforwardedStreamReason() string {
 		return "a multi-database stream; forwarding is single-database only (ADR-0091)"
 	case s.InjectShardColumn.Engaged():
 		return "--inject-shard-column with --no-coordinate-live-ddl"
+	case s.sourceRefusesDDL():
+		return "a trigger-CDC source, whose reader refuses source DDL rather than forward it (ADR-0066 §7)"
 	case !s.forwardSchemaEnabled():
 		return "--schema-changes=refuse"
 	}
@@ -1138,9 +1140,11 @@ func (s *Streamer) unforwardedStreamReason() string {
 
 // unforwardedForwardRemedy reports whether --schema-changes=forward would
 // make this stream forward the change it refused: a single-database stream
-// without --inject-shard-column, which here means one under refuse mode.
+// without --inject-shard-column, which here means one under refuse mode. A
+// trigger-CDC source forwards nothing whatever the flag says, so it is not
+// offered there.
 func (s *Streamer) unforwardedForwardRemedy() bool {
-	return !s.multiDatabaseMode() && !s.InjectShardColumn.Engaged() && !s.forwardSchemaEnabled()
+	return !s.multiDatabaseMode() && !s.InjectShardColumn.Engaged() && !s.sourceRefusesDDL() && !s.forwardSchemaEnabled()
 }
 
 // unforwardedBoundaryWitnesses returns the witness lookup for

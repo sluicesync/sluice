@@ -24,13 +24,37 @@ import (
 
 // forwardSchemaEnabled reports whether ADR-0091 single-stream schema-
 // change forwarding is active for this stream. Forwarding is ON by
-// default; only an explicit --schema-changes=refuse turns it off (the
-// empty zero-value is treated as "forward" so older callers and tests
-// get the shipping default). The deprecated --forward-schema-add-column
+// default; an explicit --schema-changes=refuse turns it off (the empty
+// zero-value is treated as "forward" so older callers and tests get the
+// shipping default), and so does a trigger-CDC source
+// ([Streamer.sourceRefusesDDL]), whatever the flag says. The deprecated --forward-schema-add-column
 // does NOT change this — forwarding is already on by default — it only
 // triggers a deprecation WARN at engage time.
 func (s *Streamer) forwardSchemaEnabled() bool {
-	return !strings.EqualFold(s.SchemaChanges, "refuse")
+	return !strings.EqualFold(s.SchemaChanges, "refuse") && !s.sourceRefusesDDL()
+}
+
+// sourceRefusesDDL reports whether the source is a trigger-CDC engine
+// ([ir.CDCTriggers]), whose reader refuses every source DDL it observes
+// (ADR-0066 §7) and so never forwards one. Such a stream runs as
+// `--schema-changes=refuse` does: its boundaries go through the
+// unforwarded-stream check, never the forward intercept.
+//
+// It matters because the postgres-trigger reader now emits a first-touch
+// schema boundary per table (KEY-COLLATION-TRIGGER-CDC-NO-HISTORY), read
+// from the catalog as it stands. A change made while the stream was stopped
+// shows there before the reader reaches its DDL marker (when more captured
+// rows than one poll window precede the marker), and on the default forward
+// path the first-boundary witness applied it to the target: measured, an
+// ADD COLUMN reached the target ahead of the reader's own DDL refusal
+// (TestTriggerCDCFirstTouch_StoppedStreamDDLIsNeverForwarded, mutation run).
+// A `timestamp` ⇄ `timestamptz` swap was refused there too, by the forward
+// intercept's own session-zone door, but by a door this engine's design
+// never meant to rely on. Refusing every such boundary is what the engine
+// promises for DDL anyway, and it keeps the session-GUC-cast roster's
+// exemption for this emitter true (docsync sessionGUCCastEmitterExempt).
+func (s *Streamer) sourceRefusesDDL() bool {
+	return s.Source != nil && s.Source.Capabilities().CDC == ir.CDCTriggers
 }
 
 // singleStreamSchemaForwardActive reports whether the ADR-0091

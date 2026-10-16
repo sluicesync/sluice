@@ -70,6 +70,12 @@ var (
 	// so the composed postgres reader's WAL-LSN answers can never leak into
 	// a trigger chain again. Both are graded across the registry by
 	// docsync's TestEveryCDCEngineRecordsABackupPosition.
+	// KEY-COLLATION-TRIGGER-CDC-NO-HISTORY: the reader now records a schema
+	// version per table per session, and a warm resume orders the retained
+	// versions against the persisted position — an engine without an orderer
+	// refuses that prime on every restart.
+	_ ir.PositionOrderer = Engine{}
+
 	_ irbackup.SnapshotOpener                = Engine{}
 	_ irbackup.PositionCapturer              = (*SchemaReader)(nil)
 	_ irbackup.PositionFromManifestPreflight = (*SchemaReader)(nil)

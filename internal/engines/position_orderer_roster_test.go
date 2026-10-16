@@ -62,11 +62,15 @@ func TestPositionOrdererRosterMatchesTheMarkerlessPath(t *testing.T) {
 				"ADR-0049 schema-history resolution, not for checkpointing",
 		},
 		"pgtrigger": {
-			emitsTxMarkers: false, positionOrderer: false,
-			why: "marker-less change-log source, no orderer — reaches noteBoundary and cannot be asserted " +
-				"generically. Its poll is nonetheless SAFE by inspection: pollQuery selects `id` unaliased " +
-				"in both the CTE and the outer query, so nothing shadows the bigint, and its watermark is " +
-				"the end of the contiguous committed run rather than the max id fetched",
+			emitsTxMarkers: false, positionOrderer: true,
+			why: "marker-less change-log source that GAINED an orderer for the ADR-0049 schema-history " +
+				"resolution: its first-touch schema boundary (KEY-COLLATION-TRIGGER-CDC-NO-HISTORY) records " +
+				"versions a warm resume must order. The laneapply token-monotonicity decision was revisited " +
+				"then and stands: an assertion built on ir.PositionOrderer would now cover pgtrigger, but still " +
+				"not sqlite-trigger/d1-trigger, the engines that produced Bug 266/268, so it would read as " +
+				"covering the marker-less path while missing its defect. pgtrigger's poll is SAFE by inspection " +
+				"anyway: pollQuery selects `id` unaliased in both the CTE and the outer query, so nothing " +
+				"shadows the bigint, and its watermark is the end of the contiguous committed run",
 		},
 		"sqlite-trigger": {
 			emitsTxMarkers: false, positionOrderer: false,

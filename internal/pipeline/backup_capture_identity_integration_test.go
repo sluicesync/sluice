@@ -135,7 +135,7 @@ func TestBackupCapture_RecordsTheReaderIdentity(t *testing.T) {
 			t.Fatalf("pgtrigger.Setup: %v", err)
 		}
 		eng, _ := engines.Get(pgtrigger.EngineName)
-		runTriggerCaptureIdentityBinding(ctx, t, eng, src, pgtrigger.EngineName, pgtrigger.AppliedLastID, func(stmts []string) {
+		runTriggerCaptureIdentityBinding(ctx, t, eng, src, pgtrigger.EngineName, pgtrigger.AppliedLastID, len(p2Tables), func(stmts []string) {
 			for _, s := range stmts {
 				applyDDL(t, src, s)
 			}
@@ -156,7 +156,7 @@ func TestBackupCapture_RecordsTheReaderIdentity(t *testing.T) {
 			t.Fatalf("sqlitetrigger.Setup: %v", err)
 		}
 		eng, _ := engines.Get(sqlitetrigger.EngineName)
-		runTriggerCaptureIdentityBinding(ctx, t, eng, path, sqlitetrigger.EngineName, sqlitetrigger.AppliedLastID, func(stmts []string) {
+		runTriggerCaptureIdentityBinding(ctx, t, eng, path, sqlitetrigger.EngineName, sqlitetrigger.AppliedLastID, 0, func(stmts []string) {
 			for _, s := range stmts {
 				// Each statement its own transaction (the change log names
 				// every change as one anyway).
@@ -173,15 +173,18 @@ func TestBackupCapture_RecordsTheReaderIdentity(t *testing.T) {
 // runTriggerCaptureIdentityBinding is the trigger-source cell: a full that
 // records the change log's anchor, the traffic, one `backup incremental`
 // closing on its row count, then the engine's reader re-delivering from the
-// incremental's StartPosition.
-func runTriggerCaptureIdentityBinding(ctx context.Context, t *testing.T, eng ir.Engine, dsn, engineName string, decode func(string) (int64, error), exec func([]string)) {
+// incremental's StartPosition. boundaries is how many first-touch schema
+// boundaries the reader emits inside the window (one per table on
+// postgres-trigger, none on sqlite-trigger; see [pgTriggerWindowChanges]),
+// which MaxChanges counts beside the row changes.
+func runTriggerCaptureIdentityBinding(ctx context.Context, t *testing.T, eng ir.Engine, dsn, engineName string, decode func(string) (int64, error), boundaries int, exec func([]string)) {
 	t.Helper()
 	store := runTriggerChainFull(ctx, t, eng, dsn, engineName, decode)
 	exec(p2Traffic("pgx"))
 	const rowChanges = 11 // p2Traffic's three transactions
 	if err := (&IncrementalBackup{
 		Source: eng, SourceDSN: dsn, Store: store, Window: 45 * time.Second,
-		MaxChanges: rowChanges, ChunkChanges: 4, SluiceVersion: "test",
+		MaxChanges: rowChanges + boundaries, ChunkChanges: 4, SluiceVersion: "test",
 	}).Run(ctx); err != nil {
 		t.Fatalf("IncrementalBackup.Run: %v", err)
 	}

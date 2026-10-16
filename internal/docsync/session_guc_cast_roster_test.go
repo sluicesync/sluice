@@ -16,6 +16,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // WHICH CDC LANES REFUSE A SESSION-GUC-RESOLVED CAST, kept honest against
@@ -189,13 +190,37 @@ var sessionGUCCastLanes = []gucCastLane{
 var sessionGUCCastExempt = map[string]string{
 	"sqlite":           "no CDC reader at all (the trigger variant is a separate engine), so no schema boundary is ever emitted and nothing forwards a MODIFY",
 	"d1":               "same as sqlite — the CDC lane is the separate d1-trigger engine",
-	"postgres-trigger": "the trigger-CDC readers emit row changes only; they build no ir.SchemaSnapshot, so no observed DDL can reach a forward path (the emitter walk below is what keeps this true)",
-	"sqlite-trigger":   "same trigger-CDC reader shape as postgres-trigger — no schema-boundary emission",
-	"d1-trigger":       "same trigger-CDC reader shape as postgres-trigger — no schema-boundary emission",
+	"postgres-trigger": "its reader refuses every observed DDL (ADR-0066 §7), and its one boundary — the first-touch schema snapshot (KEY-COLLATION-TRIGGER-CDC-NO-HISTORY) — never reaches a forward path: a trigger-CDC source runs the unforwarded-stream check, which refuses a boundary that differs from the target instead of re-applying it (see sessionGUCCastEmitterExempt)",
+	"sqlite-trigger":   "trigger-CDC reader that builds no ir.SchemaSnapshot (the emitter walk below is what keeps this true), and a trigger-CDC source never forwards a boundary anyway",
+	"d1-trigger":       "same reader as sqlite-trigger — no schema-boundary emission",
 	"csv":              "flat-file SOURCE only: no CDC reader, and its temporal values carry no engine-side session zone to be re-cast against",
 	"tsv":              "same flatfile engine as csv",
 	"ndjson":           "same flatfile engine as csv",
 	"mydumper":         "dump-directory source: no CDC reader, no mid-stream DDL",
+}
+
+// gucCastEmitterExemption is a boundary emitter that needs no session-GUC-cast
+// door because nothing downstream of it can re-apply a DDL: its engine is a
+// trigger-CDC source, for which the streamer never wires the forward
+// intercept (pipeline's TestForwardSchemaEnabled_TriggerCDCSourceNeverForwards
+// pins that half). engine is the registered name whose capability the
+// roster checks, so the exemption fails the moment the premise stops holding.
+type gucCastEmitterExemption struct {
+	engine string
+	reason string
+}
+
+// sessionGUCCastEmitterExempt holds those emitters, keyed by the file's path
+// relative to internal/docsync.
+var sessionGUCCastEmitterExempt = map[string]gucCastEmitterExemption{
+	filepath.ToSlash(filepath.Join("..", "engines", "pgtrigger", "cdc_first_touch.go")): {
+		engine: "postgres-trigger",
+		reason: "the first-touch schema snapshot exists to arm the target's key-collation guard; a trigger-CDC " +
+			"source forwards no boundary (the streamer runs the unforwarded-stream check for it, which refuses " +
+			"a boundary that differs from the target with SCHEMA-CHANGE-REFUSED), so a zone swap made while the " +
+			"stream was stopped refuses before any DDL reaches the target " +
+			"(pipeline TestTriggerCDCFirstTouch_StoppedStreamDDLIsNeverForwarded)",
+	},
 }
 
 // gucCastLaneFacts is what the AST reader extracts for one lane — kept as
@@ -227,6 +252,8 @@ func gradeSessionGUCCastRoster(
 	exempt map[string]string,
 	facts map[string]gucCastLaneFacts,
 	emitterFiles []string,
+	emitterExempt map[string]gucCastEmitterExemption,
+	triggerCDC map[string]bool,
 ) []string {
 	var problems []string
 	add := func(format string, args ...any) {
@@ -279,9 +306,27 @@ func gradeSessionGUCCastRoster(
 			declaredSites[filepath.ToSlash(site.file)] = lane.id
 		}
 	}
+	emitting := map[string]bool{}
 	for _, f := range emitterFiles {
-		if _, ok := declaredSites[filepath.ToSlash(f)]; !ok {
-			add("%s builds an ir.SchemaSnapshot but is not a declared refusal site of any lane — a boundary emitter with no session-GUC-cast door forwards the class silently (this is the half that would have caught MySQL's two VStream emitters)", filepath.ToSlash(f))
+		f = filepath.ToSlash(f)
+		emitting[f] = true
+		if _, ok := declaredSites[f]; ok {
+			continue
+		}
+		if ex, ok := emitterExempt[f]; ok {
+			switch {
+			case strings.TrimSpace(ex.reason) == "":
+				add("%s is exempted as a boundary emitter with an empty reason; name the mechanism that keeps its boundaries off every forward path", f)
+			case !triggerCDC[ex.engine]:
+				add("%s is exempted because engine %q is a trigger-CDC source the streamer never forwards for, but %q does not declare ir.CDCTriggers — the exemption's premise no longer holds; give the emitter a session-GUC-cast door", f, ex.engine, ex.engine)
+			}
+			continue
+		}
+		add("%s builds an ir.SchemaSnapshot but is not a declared refusal site of any lane — a boundary emitter with no session-GUC-cast door forwards the class silently (this is the half that would have caught MySQL's two VStream emitters)", f)
+	}
+	for f := range emitterExempt {
+		if !emitting[filepath.ToSlash(f)] {
+			add("emitter exemption names %s, which builds no ir.SchemaSnapshot — drop or re-point the stale entry", filepath.ToSlash(f))
 		}
 	}
 
@@ -400,7 +445,14 @@ func TestSessionGUCCastRoster_EveryCDCLane(t *testing.T) {
 		t.Fatalf("found %d ir.SchemaSnapshot emitter file(s) under internal/engines (%v); floor 4 — the walk is vacuous, re-point it", len(emitters), emitters)
 	}
 
-	if problems := gradeSessionGUCCastRoster(names, sessionGUCCastLanes, sessionGUCCastExempt, facts, emitters); len(problems) > 0 {
+	triggerCDC := map[string]bool{}
+	for _, name := range names {
+		if eng, ok := engines.Get(name); ok && eng.Capabilities().CDC == ir.CDCTriggers {
+			triggerCDC[name] = true
+		}
+	}
+	if problems := gradeSessionGUCCastRoster(names, sessionGUCCastLanes, sessionGUCCastExempt, facts, emitters,
+		sessionGUCCastEmitterExempt, triggerCDC); len(problems) > 0 {
 		t.Errorf("session-GUC-cast roster: %d problem(s):\n  %s", len(problems), strings.Join(problems, "\n  "))
 	}
 }
@@ -443,7 +495,7 @@ func TestSessionGUCCastRoster_MetaFailsClosed(t *testing.T) {
 	t.Run("positive control: a complete lane reports nothing", func(t *testing.T) {
 		got := gradeSessionGUCCastRoster(names, []gucCastLane{goodLane},
 			map[string]string{}, map[string]gucCastLaneFacts{"fake-lane": goodFacts},
-			[]string{"reader.go"})
+			[]string{"reader.go"}, nil, nil)
 		if len(got) != 0 {
 			t.Fatalf("complete lane reported problems: %v", got)
 		}
@@ -453,7 +505,7 @@ func TestSessionGUCCastRoster_MetaFailsClosed(t *testing.T) {
 		f := goodFacts
 		f.calls = map[string]int{"reader.go": 0}
 		got := gradeSessionGUCCastRoster(names, []gucCastLane{goodLane},
-			map[string]string{}, map[string]gucCastLaneFacts{"fake-lane": f}, []string{"reader.go"})
+			map[string]string{}, map[string]gucCastLaneFacts{"fake-lane": f}, []string{"reader.go"}, nil, nil)
 		requireProblemMentioning(t, got, "never calls")
 	})
 
@@ -461,29 +513,53 @@ func TestSessionGUCCastRoster_MetaFailsClosed(t *testing.T) {
 		f := goodFacts
 		f.arms = 1
 		got := gradeSessionGUCCastRoster(names, []gucCastLane{goodLane},
-			map[string]string{}, map[string]gucCastLaneFacts{"fake-lane": f}, []string{"reader.go"})
+			map[string]string{}, map[string]gucCastLaneFacts{"fake-lane": f}, []string{"reader.go"}, nil, nil)
 		requireProblemMentioning(t, got, "arm(s); floor")
 	})
 
 	t.Run("(c) a new registered engine classified as neither", func(t *testing.T) {
 		got := gradeSessionGUCCastRoster(append(append([]string(nil), names...), "brandnew"),
 			[]gucCastLane{goodLane}, map[string]string{},
-			map[string]gucCastLaneFacts{"fake-lane": goodFacts}, []string{"reader.go"})
+			map[string]gucCastLaneFacts{"fake-lane": goodFacts}, []string{"reader.go"}, nil, nil)
 		requireProblemMentioning(t, got, `engine "brandnew" appears in no session-GUC-cast lane`)
 	})
 
 	t.Run("(d) a boundary emitter no lane declares", func(t *testing.T) {
 		got := gradeSessionGUCCastRoster(names, []gucCastLane{goodLane},
 			map[string]string{}, map[string]gucCastLaneFacts{"fake-lane": goodFacts},
-			[]string{"reader.go", "brand_new_lane.go"})
+			[]string{"reader.go", "brand_new_lane.go"}, nil, nil)
 		requireProblemMentioning(t, got, "brand_new_lane.go")
+	})
+
+	t.Run("(g) an exempted emitter: held while its engine is trigger-CDC, failed when not", func(t *testing.T) {
+		exempt := map[string]gucCastEmitterExemption{"first_touch.go": {engine: "fakeengine", reason: "never forwarded"}}
+		emitters := []string{"reader.go", "first_touch.go"}
+		got := gradeSessionGUCCastRoster(names, []gucCastLane{goodLane}, map[string]string{},
+			map[string]gucCastLaneFacts{"fake-lane": goodFacts}, emitters, exempt, map[string]bool{"fakeengine": true})
+		if len(got) != 0 {
+			t.Fatalf("a trigger-CDC engine's exempted emitter reported problems: %v", got)
+		}
+		got = gradeSessionGUCCastRoster(names, []gucCastLane{goodLane}, map[string]string{},
+			map[string]gucCastLaneFacts{"fake-lane": goodFacts}, emitters, exempt, map[string]bool{})
+		requireProblemMentioning(t, got, "premise no longer holds")
+		exempt["first_touch.go"] = gucCastEmitterExemption{engine: "fakeengine"}
+		got = gradeSessionGUCCastRoster(names, []gucCastLane{goodLane}, map[string]string{},
+			map[string]gucCastLaneFacts{"fake-lane": goodFacts}, emitters, exempt, map[string]bool{"fakeengine": true})
+		requireProblemMentioning(t, got, "empty reason")
+	})
+
+	t.Run("(h) an emitter exemption naming a file that emits nothing", func(t *testing.T) {
+		exempt := map[string]gucCastEmitterExemption{"gone.go": {engine: "fakeengine", reason: "never forwarded"}}
+		got := gradeSessionGUCCastRoster(names, []gucCastLane{goodLane}, map[string]string{},
+			map[string]gucCastLaneFacts{"fake-lane": goodFacts}, []string{"reader.go"}, exempt, map[string]bool{"fakeengine": true})
+		requireProblemMentioning(t, got, "gone.go, which builds no ir.SchemaSnapshot")
 	})
 
 	t.Run("(e) a refusal that does not name the mechanism", func(t *testing.T) {
 		f := goodFacts
 		f.messages = []string{"this ALTER cannot be forwarded; use the drained model"}
 		got := gradeSessionGUCCastRoster(names, []gucCastLane{goodLane},
-			map[string]string{}, map[string]gucCastLaneFacts{"fake-lane": f}, []string{"reader.go"})
+			map[string]string{}, map[string]gucCastLaneFacts{"fake-lane": f}, []string{"reader.go"}, nil, nil)
 		requireProblemMentioning(t, got, "no SINGLE refusal message names all of")
 	})
 
@@ -500,7 +576,7 @@ func TestSessionGUCCastRoster_MetaFailsClosed(t *testing.T) {
 			"some unrelated refusal; use the drained model",
 		}
 		got := gradeSessionGUCCastRoster(names, []gucCastLane{goodLane},
-			map[string]string{}, map[string]gucCastLaneFacts{"fake-lane": f}, []string{"reader.go"})
+			map[string]string{}, map[string]gucCastLaneFacts{"fake-lane": f}, []string{"reader.go"}, nil, nil)
 		requireProblemMentioning(t, got, "no SINGLE refusal message names all of")
 		// The failure must distinguish split-apart from simply-gone: both
 		// markers are present somewhere, and the message says so.

@@ -831,15 +831,24 @@ func projectCollation(t ir.Type, c relationColumn) ir.Type {
 	if !c.CollationResolved {
 		return t
 	}
+	return StampColumnCollation(t, ColumnCollation{Name: c.Collation, Determinism: c.CollationDeterminism})
+}
+
+// StampColumnCollation is [projectCollation]'s stamp: c onto a character
+// type (VARCHAR, CHAR, TEXT), any other type unchanged. Exported for the
+// postgres-trigger reader's first-touch boundary, which stamps what
+// [ColumnCollationsAsOf] read onto the schema reader's shape of the table
+// the same way a pgoutput Relation's projection is stamped.
+func StampColumnCollation(t ir.Type, c ColumnCollation) ir.Type {
 	switch v := t.(type) {
 	case ir.Varchar:
-		v.Collation, v.Determinism = c.Collation, c.CollationDeterminism
+		v.Collation, v.Determinism = c.Name, c.Determinism
 		return v
 	case ir.Char:
-		v.Collation, v.Determinism = c.Collation, c.CollationDeterminism
+		v.Collation, v.Determinism = c.Name, c.Determinism
 		return v
 	case ir.Text:
-		v.Collation, v.Determinism = c.Collation, c.CollationDeterminism
+		v.Collation, v.Determinism = c.Name, c.Determinism
 		return v
 	}
 	return t

@@ -4,6 +4,9 @@
 package pgtrigger
 
 import (
+	"errors"
+	"fmt"
+
 	"sluicesync.dev/sluice/internal/engines/internal/triggercdc"
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -49,4 +52,34 @@ func decodePos(p ir.Position) (pgTriggerPos, bool, error) {
 // empty, malformed, or FOREIGN token loudly. See [triggercdc.Codec.AppliedLastID].
 func AppliedLastID(token string) (int64, error) {
 	return posCodec.AppliedLastID(token)
+}
+
+// PositionAtOrAfter implements [ir.PositionOrderer]: p is at or after anchor
+// when its change-log id is. Two ids of one change log are totally ordered —
+// the id is an untouched BIGSERIAL, which openCDCReader's sequence preflight
+// holds (cdc_gapfree.go) — so the order never answers "unorderable".
+//
+// It exists for the first-touch schema boundary (cdc_first_touch.go): once a
+// stream records schema versions, a warm resume orders them against the
+// persisted position (the applier's schema-history prime, the reader seed),
+// and an engine with no orderer refuses that resolve outright; chain restore
+// places a window's versions among its changes by it. The empty "from now"
+// sentinel and a foreign or malformed token refuse loudly, as the postgres
+// orderer does.
+func (Engine) PositionAtOrAfter(p, anchor ir.Position) (bool, error) {
+	pp, ok, err := decodePos(p)
+	if err != nil {
+		return false, fmt.Errorf("pgtrigger: position-orderer: decode p: %w", err)
+	}
+	if !ok {
+		return false, errors.New("pgtrigger: position-orderer: p is the empty/from-now sentinel, not an orderable position")
+	}
+	ap, ok, err := decodePos(anchor)
+	if err != nil {
+		return false, fmt.Errorf("pgtrigger: position-orderer: decode anchor: %w", err)
+	}
+	if !ok {
+		return false, errors.New("pgtrigger: position-orderer: anchor is the empty/from-now sentinel, not an orderable position")
+	}
+	return pp.LastID >= ap.LastID, nil
 }

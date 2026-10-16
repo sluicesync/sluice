@@ -87,7 +87,7 @@ func TestBackupChain_PGTrigger_PostFullRowsReachTheRestore(t *testing.T) {
 	wantRows := pgQueryOne[int64](t, sourceDSN, "SELECT COUNT(*) FROM events")
 	wantSum := pgQueryOne[int64](t, sourceDSN, "SELECT COALESCE(SUM(n), 0) FROM events")
 
-	runTriggerChainIncrementalAndRestore(ctx, t, src, sourceDSN, store, targetDSN)
+	runTriggerChainIncrementalAndRestoreN(ctx, t, src, sourceDSN, store, "postgres", targetDSN, pgTriggerWindowChanges(triggerChainPostFullRows, 1))
 
 	gotRows := pgQueryOne[int64](t, targetDSN, "SELECT COUNT(*) FROM events")
 	gotSum := pgQueryOne[int64](t, targetDSN, "SELECT COALESCE(SUM(n), 0) FROM events")
@@ -174,6 +174,15 @@ func runTriggerChainIncrementalAndRestore(ctx context.Context, t *testing.T, src
 	t.Helper()
 	runTriggerChainIncrementalAndRestoreN(ctx, t, src, sourceDSN, store, "postgres", targetDSN, triggerChainPostFullRows)
 }
+
+// pgTriggerWindowChanges is the MaxChanges that closes a postgres-trigger
+// incremental after rows row changes over tables tables. The reader precedes
+// each table's first change of a session with a first-touch schema boundary
+// (KEY-COLLATION-TRIGGER-CDC-NO-HISTORY), and the capture loop counts that
+// SchemaSnapshot toward MaxChanges like any change event, so a cap of rows
+// alone closes the window one row early. The sqlite-trigger reader emits no
+// boundary; its callers pass the row count unchanged.
+func pgTriggerWindowChanges(rows, tables int) int { return rows + tables }
 
 // runTriggerChainIncrementalAndRestoreN is [runTriggerChainIncrementalAndRestore]
 // with the incremental closing on maxChanges post-full changes and

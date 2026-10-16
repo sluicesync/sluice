@@ -103,7 +103,7 @@ func TestBackupChain_PGTrigger_NumericValuesRestoreExactly(t *testing.T) {
 		c0.nu, c0.np, c0.f8, c0.f4, c0.na, c0.js, c0.fa,
 	))
 
-	runTriggerChainIncrementalAndRestoreN(ctx, t, src, sourceDSN, store, "postgres", targetDSN, len(pgTriggerNumericCells)+1)
+	runTriggerChainIncrementalAndRestoreN(ctx, t, src, sourceDSN, store, "postgres", targetDSN, pgTriggerWindowChanges(len(pgTriggerNumericCells)+1, 1))
 	if got := incrementalFormatVersions(ctx, t, store); len(got) != 1 || got[0] != irbackup.FormatVersionExactNumbers {
 		t.Errorf("incremental format versions = %v; want one segment stamped FormatVersionExactNumbers=%d — its chunks carry "+
 			"exact-text numbers a pre-v0.156.4 reader would round, so it must refuse the segment instead",
@@ -220,7 +220,7 @@ func TestBackupChain_PGTrigger_NumericValuesRestoreExactly_ToMySQL(t *testing.T)
 	for _, c := range pgTriggerNumericMySQLCells {
 		applyDDL(t, sourceDSN, fmt.Sprintf(`INSERT INTO numsmy (id, nu, np) VALUES (%d, '%s', '%s');`, c.id, c.nu, c.np))
 	}
-	runTriggerChainIncrementalAndRestoreN(ctx, t, src, sourceDSN, store, "mysql", mysqlTarget, len(pgTriggerNumericMySQLCells))
+	runTriggerChainIncrementalAndRestoreN(ctx, t, src, sourceDSN, store, "mysql", mysqlTarget, pgTriggerWindowChanges(len(pgTriggerNumericMySQLCells), 1))
 
 	want := numericColumnsText(t, "pgx", sourceDSN, `SELECT id, nu::text, np::text FROM numsmy ORDER BY id`)
 	got := numericColumnsText(t, "mysql", mysqlTarget, `SELECT id, CAST(nu AS CHAR), CAST(np AS CHAR) FROM numsmy ORDER BY id`)
@@ -276,7 +276,7 @@ func TestBackupChain_PGTrigger_FloatsAndArraysRestoreExactly_ToMySQL(t *testing.
 	for _, c := range cells {
 		applyDDL(t, sourceDSN, fmt.Sprintf(`INSERT INTO floatsmy (id, f8, f4, na) VALUES (%s, '%s', '%s', '%s');`, c.id, c.f8, c.f4, c.na))
 	}
-	runTriggerChainIncrementalAndRestoreN(ctx, t, src, sourceDSN, store, "mysql", mysqlTarget, len(cells))
+	runTriggerChainIncrementalAndRestoreN(ctx, t, src, sourceDSN, store, "mysql", mysqlTarget, pgTriggerWindowChanges(len(cells), 1))
 
 	want := floatRowsText(t, "pgx", sourceDSN, `SELECT id, f8::text, f4::text, array_to_json(na)::text FROM floatsmy ORDER BY id`)
 	got := floatRowsText(t, "mysql", mysqlTarget, `SELECT id, CAST(f8 AS CHAR), CAST(CAST(f4 AS DOUBLE) AS CHAR), CAST(na AS CHAR) FROM floatsmy ORDER BY id`)
@@ -328,7 +328,7 @@ func TestBackupChain_PGTrigger_OverScaleRestoreRefuses_ToMySQL(t *testing.T) {
 		return pgtrigger.AppliedLastID(tok)
 	})
 	applyDDL(t, sourceDSN, `INSERT INTO overscale (id, nu) VALUES (2, '0.1234567890123456789012345678901');`)
-	runTriggerChainIncrementalAndRestoreN(ctx, t, src, sourceDSN, store, "", "", 1)
+	runTriggerChainIncrementalAndRestoreN(ctx, t, src, sourceDSN, store, "", "", pgTriggerWindowChanges(1, 1))
 
 	eng, ok := engines.Get("mysql")
 	if !ok {
@@ -491,7 +491,7 @@ func TestSyncFromBackup_PGTriggerChain_NumericValuesExact(t *testing.T) {
 			c.id, c.nu, c.np, c.f8, c.f4, c.na, c.js, c.fa,
 		))
 	}
-	runTriggerChainIncrementalAndRestoreN(ctx, t, src, sourceDSN, store, "", "", len(pgTriggerNumericCells))
+	runTriggerChainIncrementalAndRestoreN(ctx, t, src, sourceDSN, store, "", "", pgTriggerWindowChanges(len(pgTriggerNumericCells), 1))
 	brokerCancel, brokerDone := runBrokerInGoroutine(t, targetDSN, "numbers-broker", store, brokerOpts{
 		PollInterval: time.Second,
 		AtChainID:    full.BackupID,

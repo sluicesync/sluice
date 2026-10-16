@@ -102,11 +102,19 @@ func applyPGSQL(t *testing.T, dsn, sqlText string) {
 	}
 }
 
-// drainEvents reads up to n events from out with a per-event timeout,
+// drainEvents reads up to n changes from out with a per-event timeout,
 // or returns whatever it collected when the channel closes.
+//
+// A first-touch schema boundary (cdc_first_touch.go) is not counted or
+// returned: it is the table's shape, not a change, and these tests grade
+// changes. It is checked instead, wherever it appears: it must be followed
+// immediately by a change of its own table one change-log id above its
+// anchor — the shape TestFirstTouch_PrecedesEachTablesFirstChangeOnce pins
+// in isolation, held here against the real poll.
 func drainEvents(t *testing.T, out <-chan ir.Change, n int, perEventTimeout time.Duration) []ir.Change {
 	t.Helper()
 	var got []ir.Change
+	var boundary *ir.SchemaSnapshot
 	timer := time.NewTimer(perEventTimeout)
 	defer timer.Stop()
 	for len(got) < n {
@@ -114,7 +122,21 @@ func drainEvents(t *testing.T, out <-chan ir.Change, n int, perEventTimeout time
 		select {
 		case ev, ok := <-out:
 			if !ok {
+				if boundary != nil {
+					t.Errorf("the stream closed after a first-touch boundary of %s with no change of the table after it", boundary.QualifiedName())
+				}
 				return got
+			}
+			if s, isBoundary := ev.(ir.SchemaSnapshot); isBoundary {
+				if boundary != nil {
+					t.Errorf("two first-touch boundaries in a row (%s, then %s); each must precede its table's change", boundary.QualifiedName(), s.QualifiedName())
+				}
+				boundary = &s
+				continue
+			}
+			if boundary != nil {
+				requireBoundaryPrecedes(t, *boundary, ev)
+				boundary = nil
 			}
 			got = append(got, ev)
 		case <-timer.C:
@@ -122,6 +144,25 @@ func drainEvents(t *testing.T, out <-chan ir.Change, n int, perEventTimeout time
 		}
 	}
 	return got
+}
+
+// requireBoundaryPrecedes checks that a first-touch boundary s governs the
+// change c that follows it: same table, anchored one id below it, with a
+// shape.
+func requireBoundaryPrecedes(t *testing.T, s ir.SchemaSnapshot, c ir.Change) {
+	t.Helper()
+	anchor, _, aerr := decodePos(s.Position)
+	at, _, cerr := decodePos(c.Pos())
+	switch {
+	case aerr != nil || cerr != nil:
+		t.Errorf("first-touch boundary %+v / change %+v: undecodable position (%v, %v)", s.Position, c.Pos(), aerr, cerr)
+	case s.QualifiedName() != c.QualifiedName():
+		t.Errorf("first-touch boundary of %s precedes a change of %s", s.QualifiedName(), c.QualifiedName())
+	case anchor.LastID != at.LastID-1:
+		t.Errorf("first-touch boundary of %s is anchored at id %d; the change it precedes is id %d (want the anchor one below)", s.QualifiedName(), anchor.LastID, at.LastID)
+	case s.IR == nil || len(s.IR.Columns) == 0:
+		t.Errorf("first-touch boundary of %s carries no shape", s.QualifiedName())
+	}
 }
 
 // TestCDCReader_BasicChangeStream exercises the full polling pipeline:
