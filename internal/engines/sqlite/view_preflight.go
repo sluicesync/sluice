@@ -5,8 +5,10 @@ package sqlite
 
 import (
 	"errors"
+	"fmt"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/translate"
 )
 
 // Compile-time proof the ENGINE (not a test stub) answers the pre-copy
@@ -33,5 +35,11 @@ func (Engine) PreflightViews(s *ir.Schema) error {
 	if s == nil {
 		return errors.New("sqlite: PreflightViews: schema is nil")
 	}
-	return validateSQLiteViewNamespace(s.Tables, s.Views)
+	if err := validateSQLiteViewNamespace(s.Tables, s.Views); err != nil {
+		return err
+	}
+	if err := translate.RefuseUnportableViews(s, "sqlite"); err != nil {
+		return fmt.Errorf("sqlite: %w", err)
+	}
+	return nil
 }

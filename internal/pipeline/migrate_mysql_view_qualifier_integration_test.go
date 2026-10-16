@@ -8,12 +8,15 @@ package pipeline
 import (
 	"context"
 	"database/sql"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"sluicesync.dev/sluice/internal/engines"
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
+	_ "sluicesync.dev/sluice/internal/engines/sqlite"
+	"sluicesync.dev/sluice/internal/translate"
 )
 
 // TestMigrate_MySQLToMySQL_ViewReadsTheTargetDatabase is Bug 314 on a real
@@ -127,6 +130,28 @@ func TestMigrate_MySQLToMySQL_ViewReadsTheTargetDatabase(t *testing.T) {
 		}
 		if n != 0 {
 			t.Errorf("alias_tgt holds %d views after the refusal; the views phase must refuse before creating any", n)
+		}
+		if err := tgt.QueryRowContext(ctx, "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'alias_tgt'").Scan(&n); err != nil {
+			t.Fatalf("count alias_tgt tables: %v", err)
+		}
+		if n != 0 {
+			t.Errorf("alias_tgt holds %d tables: the refusal must come before the copy, not after it", n)
+		}
+	})
+
+	// A MySQL body on SQLite used to fail ("cannot reference objects in
+	// database"). Unqualified it would create and compute in SQLite's
+	// dialect, so it is refused by name before any row is copied.
+	t.Run("sqlite target refused", func(t *testing.T) {
+		sqliteEng, _ := engines.Get("sqlite")
+		dst := filepath.Join(t.TempDir(), "bug314-views.db")
+		m := &Migrator{Source: src, Target: sqliteEng, SourceDSN: srcDSN, TargetDSN: dst, ViewFilter: skipAlias, MigrationID: "bug314-sqlite"}
+		err := m.Run(ctx)
+		if err == nil || !strings.Contains(err.Error(), translate.ViewCrossDialectMarker) || !strings.Contains(err.Error(), "v_own") {
+			t.Fatalf("want the %s refusal naming v_own, got: %v", translate.ViewCrossDialectMarker, err)
+		}
+		if got := sqliteUserTables(t, dst); len(got) != 0 {
+			t.Errorf("the SQLite target holds tables %v: the refusal must come before the copy", got)
 		}
 	})
 }

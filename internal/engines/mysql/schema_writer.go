@@ -885,6 +885,9 @@ func (w *SchemaWriter) CreateViews(ctx context.Context, s *ir.Schema) error {
 		if err := refuseDivergentTrimView(view); err != nil {
 			return err
 		}
+		if err := translate.RefuseUnportableView(view, dialectName); err != nil {
+			return fmt.Errorf("mysql: %w", err)
+		}
 		stmt := emitCreateView(view)
 		if _, err := w.db.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("mysql: create view %q: %w", view.Name, wrapDDLError(err))

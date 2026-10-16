@@ -1288,6 +1288,9 @@ func (w *SchemaWriter) CreateViews(ctx context.Context, s *ir.Schema) error {
 		if view == nil || view.Name == "" {
 			continue
 		}
+		if err := translate.RefuseUnportableView(view, dialectName); err != nil {
+			return fmt.Errorf("postgres: %w", err)
+		}
 		stmt, err := emitCreateView(w.schema, view)
 		if err != nil {
 			return err

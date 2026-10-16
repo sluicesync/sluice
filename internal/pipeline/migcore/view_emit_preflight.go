@@ -38,13 +38,15 @@ import (
 //
 // # Scope, stated rather than implied
 //
-// This reaches exactly the engines that implement [ir.ViewEmitPreflighter],
-// which today is SQLite alone — and that is a claim about the other engines,
-// not an omission: Postgres and MySQL both emit `CREATE OR REPLACE VIEW`, and
-// both raise loudly when the name is held by a base table, so there is no
-// silent no-op to preflight. The roster gate
-// TestEveryTargetRefusesACollidingViewNamespace holds that statement to the
-// registry.
+// A view carrying [ir.View.Refusal] (Bug 314) is refused here for every
+// target. Beyond that, this reaches exactly the engines that implement
+// [ir.ViewEmitPreflighter]: SQLite (the view-namespace collision, plus Bug
+// 314's cross-engine body refusal) and MySQL and Postgres (Bug 314's
+// cross-engine body refusal only). Postgres and MySQL need no namespace
+// preflight: both emit `CREATE OR REPLACE VIEW`, and both raise loudly when
+// the name is held by a base table, so there is no silent no-op to preflight.
+// The roster gate TestEveryTargetRefusesACollidingViewNamespace holds the
+// namespace statement to the registry.
 //
 // An engine without the optional surface is skipped silently.
 //
@@ -53,8 +55,19 @@ import (
 // one an operator acts on — stays byte-identical to the one its own phase
 // would produce.
 func PreflightViewEmit(ctx context.Context, target ir.Engine, schema *ir.Schema, mode string) error {
+	if schema == nil {
+		return nil
+	}
+	// A view the reader could not make portable (Bug 314) is refused on
+	// every target, preflighter or not, before the copy rather than at the
+	// views phase after it.
+	for _, v := range schema.Views {
+		if v != nil && v.Refusal != "" {
+			return fmt.Errorf("%s: %s", mode, v.Refusal)
+		}
+	}
 	pf, ok := target.(ir.ViewEmitPreflighter)
-	if !ok || schema == nil {
+	if !ok {
 		return nil
 	}
 	if err := pf.PreflightViews(schema); err != nil {
