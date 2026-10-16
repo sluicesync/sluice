@@ -295,8 +295,10 @@ func (p *Previewer) Run(ctx context.Context) error {
 	if err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("preview: read source schema: %w", err))
 	}
-	if len(srcSchema.Tables) == 0 {
-		return errors.New("preview: source schema has no tables")
+	// Bug 317 sibling: a views-only schema has something to preview — the
+	// views, through the same view-emit preflight migrate runs.
+	if len(srcSchema.Tables) == 0 && len(srcSchema.Views) == 0 {
+		return errors.New("preview: source schema has no tables or views")
 	}
 
 	// ---- 2. Filter ----

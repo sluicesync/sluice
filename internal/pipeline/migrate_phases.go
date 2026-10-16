@@ -96,8 +96,13 @@ func (m *Migrator) phaseReadSourceSchema(ctx context.Context, scope *multiDBScop
 	if err != nil {
 		return sr, nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: read source schema: %w", err))
 	}
-	if len(schema.Tables) == 0 {
-		slog.InfoContext(ctx, "source schema has no tables; nothing to migrate")
+	// Only a schema with neither tables NOR views is empty (Bug 317). A
+	// views-only namespace — a reporting schema of views over another
+	// namespace's tables — still has its views to create: every table phase
+	// below runs over zero tables, and the views phase (with its preflight)
+	// runs as usual. Returning here for it skipped the views at exit 0.
+	if len(schema.Tables) == 0 && len(schema.Views) == 0 {
+		slog.InfoContext(ctx, "source schema has no tables or views; nothing to migrate")
 		return sr, nil, nil
 	}
 

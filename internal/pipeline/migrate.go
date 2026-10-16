@@ -448,6 +448,18 @@ type Migrator struct {
 	// orchestrator-internal mechanism, not an operator knob.
 	multiDBDeferFKs bool
 
+	// multiDBDeferredViews is the views twin of multiDBDeferFKs (Bug 317).
+	// Non-nil only on a per-database clone in the multi-database fan-out:
+	// the inner single-database run hands its (already preflighted) views
+	// to it instead of creating them, and the orchestrator creates every
+	// namespace's views in a final pass once every namespace's tables
+	// exist. A view in one namespace routinely reads tables in another — a
+	// reporting schema over the application schema — and namespaces are
+	// migrated one at a time in lexicographic order, so creating it inline
+	// fails whenever its namespace sorts first. nil (every single-database
+	// run and every programmatic caller) keeps the views phase inline.
+	multiDBDeferredViews *deferredViews
+
 	// AllowDegradedFKs opts the operator into the pgcopydb-PR-#27-style
 	// "tolerate dirty FK source" behaviour: when [SchemaWriter.CreateConstraints]
 	// hits SQLSTATE 23503 on a validating `ADD CONSTRAINT`, retry as
@@ -754,14 +766,18 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 	}
 
 	if m.DryRun {
-		plan := m.buildDryRunPlan(ctx, schema)
-		if m.PlanSink != nil {
-			m.PlanSink(plan)
-			return nil
-		}
-		m.logPlan(ctx, plan)
+		m.emitDryRunPlan(ctx, schema)
 		return nil
 	}
+
+	// Multi-database fan-out (Bug 317): hand the views to the orchestrator's
+	// final cross-namespace pass instead of creating them here. Taken AFTER
+	// the dry-run plan (which reports them) and after the view-emit
+	// preflight in phaseTranslateAndGateSchema (so a refusal still fires
+	// before this namespace copies anything), and BEFORE the resume
+	// short-circuit below, so an already-complete namespace on a --resume
+	// still contributes its views to the final pass.
+	schema = m.multiDBDeferredViews.take(schema)
 
 	// ---- 1.75. Open the migration-state store (if the target engine
 	// supports it) and resolve the migration_id. ----

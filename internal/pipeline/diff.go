@@ -240,8 +240,10 @@ func (d *Differ) Run(ctx context.Context) (*irdiff.SchemaDiff, error) {
 	if err != nil {
 		return nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("diff: read source schema: %w", err))
 	}
-	if len(srcSchema.Tables) == 0 {
-		return nil, errors.New("diff: source schema has no tables")
+	// Bug 317 sibling: a views-only schema still has views to diff (missing
+	// / extra / drifted on the target).
+	if len(srcSchema.Tables) == 0 && len(srcSchema.Views) == 0 {
+		return nil, errors.New("diff: source schema has no tables or views")
 	}
 
 	if err := migcore.ApplyTableFilter(ctx, srcSchema, d.Filter); err != nil {

@@ -391,6 +391,18 @@ func (s *Streamer) coldStartReadSourceSchema(ctx context.Context, resumingCopy b
 	}
 	if len(schema.Tables) == 0 {
 		migcore.CloseIf(sr)
+		// Bug 317 sibling: a single-namespace stream with no tables has no
+		// change stream to run, so this path keeps returning — but views it
+		// is not creating are said so at WARN with the count, never dropped
+		// behind an INFO line. (The multi-namespace fan-out does create a
+		// views-only namespace's views; see coldStartReadOneDatabaseSchema.)
+		if n := len(schema.Views); n > 0 {
+			slog.WarnContext(ctx, "source schema has views but no tables; sync streams table changes, so nothing is "+
+				"streamed and these views are NOT created on the target — create them with `sluice migrate` "+
+				"(which creates a views-only schema's views) once the tables they read exist",
+				slog.Int("views_not_created", n))
+			return nil, nil, nil
+		}
 		slog.InfoContext(ctx, "source schema has no tables; nothing to stream")
 		return nil, nil, nil
 	}

@@ -68,6 +68,17 @@ type PlanTable struct {
 	RowCountEstimated bool `json:"row_count_estimated"`
 }
 
+// emitDryRunPlan builds the plan and hands it to PlanSink when one is
+// set (the JSON / programmatic consumer), else renders it to the log.
+func (m *Migrator) emitDryRunPlan(ctx context.Context, schema *ir.Schema) {
+	plan := m.buildDryRunPlan(ctx, schema)
+	if m.PlanSink != nil {
+		m.PlanSink(plan)
+		return
+	}
+	m.logPlan(ctx, plan)
+}
+
 // buildDryRunPlan assembles the migration plan from the already-read,
 // already-translated schema. Per-table row counts (v0.10.2) are
 // best-effort via [dryRunRowCounts]; unavailable counts stay -1.

@@ -258,6 +258,9 @@ func (m *Migrator) runMultiDatabase(ctx context.Context) error {
 		// cross-database FK references a table in another selected
 		// database that may not exist on the target yet.
 		perDB.multiDBDeferFKs = true
+		// Defer views likewise (Bug 317): a view routinely reads another
+		// selected namespace's tables, which may not exist on the target yet.
+		perDB.multiDBDeferredViews = &deferredViews{}
 
 		slog.InfoContext(
 			ctx, "multi-database migrate: starting database",
@@ -304,6 +307,25 @@ func (m *Migrator) runMultiDatabase(ctx context.Context) error {
 				return fmt.Errorf("pipeline: apply foreign keys for database %q: %w", database, err)
 			}
 		}
+	}
+
+	// ---- Final cross-namespace views pass (Bug 317): every selected
+	// namespace's tables exist now, so a view reading a sibling namespace
+	// resolves whatever order the namespaces were copied in. Last, as in
+	// the single-database ladder (views follow constraints). ----
+	deferred := make([]namespaceViews, 0, len(perRuns))
+	for i := range perRuns {
+		if d := perRuns[i].multiDBDeferredViews; d != nil {
+			deferred = append(deferred, namespaceViews{
+				database:     selected[i],
+				targetDSN:    perRuns[i].TargetDSN,
+				targetSchema: perRuns[i].TargetSchema,
+				views:        d.views,
+			})
+		}
+	}
+	if err := createDeferredViews(ctx, m.Target, deferred); err != nil {
+		return err
 	}
 
 	slog.InfoContext(

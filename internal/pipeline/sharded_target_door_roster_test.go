@@ -67,6 +67,7 @@ var shardedTargetDoorRoster = map[string]doorClass{
 	"schema_forward_engage.go::(*Streamer).engageAddColumnForward::OpenSchemaWriter":         classOpenOnly, // sync schema-forward: opens to forward ALTERs (ShapeDeltaApplier); never creates tables. THE H-2 regression case.
 	"shard_consolidation_engage.go::(*Streamer).engageShardCoordination::OpenSchemaWriter":   classOpenOnly, // opens for the per-shape DDL applier (ShapeDeltaApplier); no CREATE TABLE.
 	"migrate_multidb.go::(*Migrator).applyDeferredConstraints::OpenSchemaWriter":             classOpenOnly, // deferred cross-database FK pass: CreateConstraints only, tables already created per-database.
+	"migrate_multidb_views.go::(namespaceViews).create::OpenSchemaWriter":                    classOpenOnly, // Bug 317 deferred cross-namespace views pass (migrate + sync fan-out): CreateViews only, tables already created per-namespace through the door.
 	"backup/chain_restore.go::(*ChainRestore).reprimeStandaloneSequences::OpenSchemaWriter":  classOpenOnly, // opens for the sequence reprimer; no CREATE TABLE.
 	"backup/chain_restore.go::(*ChainRestore).syncIdentitySequencesAtTail::OpenSchemaWriter": classOpenOnly, // opens for SyncIdentitySequences at the chain tail; no CREATE TABLE.
 

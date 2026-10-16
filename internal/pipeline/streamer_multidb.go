@@ -368,11 +368,21 @@ func (s *Streamer) coldStartMultiDatabase(
 	// that door is a separate change.
 	multiRC, closeRecording := s.openColdStartRecording(ctx, streamID, ir.SnapshotAnchorRecord{})
 	defer closeRecording()
+	var pendingViews []namespaceViews
 	for _, database := range selected {
-		if err := s.coldStartCopyOneDatabase(ctx, multiRC, stream, applier, streamID, database, inScope, targetDeriver, targetCanDeriveDB, fresh, budgetReport.CopyFanoutCeiling, &readerSeed); err != nil {
+		if err := s.coldStartCopyOneDatabase(ctx, multiRC, stream, applier, streamID, database, inScope, targetDeriver, targetCanDeriveDB, fresh, budgetReport.CopyFanoutCeiling, &readerSeed, &pendingViews); err != nil {
 			abandonStream()
 			return nil, stop, err
 		}
+	}
+	// Bug 317: every namespace's tables exist now, so create the views the
+	// per-namespace passes deferred (a view reading a namespace that sorts
+	// later resolves). Before the recorded run is marked complete and before
+	// the CDC anchor is persisted: a view that cannot be created fails the
+	// cold start loudly, exactly as the inline views phase did.
+	if err := createDeferredViews(ctx, s.Target, pendingViews); err != nil {
+		abandonStream()
+		return nil, stop, err
 	}
 	// Every selected database is copied: the recorded run is terminal, so
 	// `sync status` stops listing it as a cold start in progress.
@@ -764,8 +774,10 @@ func (s *Streamer) coldStartReadOneDatabaseSchema(
 		return nil, fmt.Errorf("pipeline: read source schema for %q: %w", database, err)
 	}
 
-	if len(schema.Tables) == 0 {
-		slog.InfoContext(ctx, "multi-database: database has no tables; skipping copy",
+	// Bug 317: a views-only namespace is not empty — its views are created
+	// by the deferred pass after every namespace's tables exist.
+	if len(schema.Tables) == 0 && len(schema.Views) == 0 {
+		slog.InfoContext(ctx, "multi-database: database has no tables or views; skipping copy",
 			slog.String("stream_id", streamID), slog.String("database", database))
 		return nil, nil
 	}
@@ -1084,6 +1096,11 @@ func (s *Streamer) preflightOneNamespaceReplicaIdentity(ctx context.Context, src
 // across all databases); only the WRITE side is per-database. The applier
 // in this run is the server-level CDC applier; the per-database writers
 // here are bulk-copy-only and closed at the end of this call.
+//
+// The database's views are NOT created here (Bug 317): they are appended
+// to deferred with this database's target routing, and the caller creates
+// every namespace's views once every namespace's tables exist, because a
+// view routinely reads a sibling namespace that may sort later.
 func (s *Streamer) coldStartCopyOneDatabase(
 	ctx context.Context,
 	rc resumeContext,
@@ -1096,6 +1113,7 @@ func (s *Streamer) coldStartCopyOneDatabase(
 	fresh freshCopyReason,
 	fanoutCeiling int,
 	readerSeed *[]*ir.Table,
+	deferred *[]namespaceViews,
 ) error {
 	schema, err := s.coldStartReadOneDatabaseSchema(ctx, streamID, database, inScope)
 	if err != nil {
@@ -1309,8 +1327,7 @@ func (s *Streamer) coldStartCopyOneDatabase(
 	switch {
 	case s.ResetTargetData:
 		if err := resetTargetDataForStream(ctx, schema, rw, applier, streamID); err != nil {
-			migcore.CloseIf(rw)
-			migcore.CloseIf(sw)
+			closeWriters()
 			return fmt.Errorf("pipeline: reset target data for %q: %w", database, err)
 		}
 	case fresh.forcesFresh() && (!copyReaderIsIdempotent(stream.Rows) || fresh.clearsTarget()):
@@ -1324,14 +1341,12 @@ func (s *Streamer) coldStartCopyOneDatabase(
 		// but guarded for parity) keeps the absorb-the-overlap behaviour via
 		// the default branch.
 		if err := resetTargetTablesForRestart(ctx, schema, rw); err != nil {
-			migcore.CloseIf(rw)
-			migcore.CloseIf(sw)
+			closeWriters()
 			return fmt.Errorf("pipeline: restart-from-scratch reset for %q: %w", database, err)
 		}
 	default:
 		if err := preflightColdStart(ctx, schema, rw, s.ForceColdStart || fresh.forcesFresh(), preflightModeSync); err != nil {
-			migcore.CloseIf(rw)
-			migcore.CloseIf(sw)
+			closeWriters()
 			return fmt.Errorf("pipeline: cold-start preflight for %q: %w", database, err)
 		}
 		// Roadmap item 140, the multi-database sibling. This fan-out is the
@@ -1358,8 +1373,7 @@ func (s *Streamer) coldStartCopyOneDatabase(
 			Mode:                "sync cold-start",
 		}
 		if err := fkGate.readAndCheckPreExistingForeignKeys(ctx, schema); err != nil {
-			migcore.CloseIf(rw)
-			migcore.CloseIf(sw)
+			closeWriters()
 			return err
 		}
 	}
@@ -1400,13 +1414,12 @@ func (s *Streamer) coldStartCopyOneDatabase(
 		// what Table.Schema carries here.
 		ProgressNamespace: database,
 	}
-	if err := runBulkCopyWithOpts(ctx, schema, stream.Rows, sw, rw, bulkOpts); err != nil {
-		migcore.CloseIf(rw)
-		migcore.CloseIf(sw)
+	// Bug 317: hand the views to the caller's final cross-namespace pass.
+	*deferred = append(*deferred, namespaceViews{database: database, targetDSN: targetDSN, targetSchema: targetSchema, views: schema.Views})
+	defer closeWriters()
+	if err := runBulkCopyWithOpts(ctx, withoutViews(schema), stream.Rows, sw, rw, bulkOpts); err != nil {
 		return fmt.Errorf("pipeline: bulk-copy database %q: %w", database, err)
 	}
-	migcore.CloseIf(rw)
-	migcore.CloseIf(sw)
 	return nil
 }
 
