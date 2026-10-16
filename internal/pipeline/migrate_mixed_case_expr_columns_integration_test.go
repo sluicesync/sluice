@@ -391,10 +391,13 @@ func TestMigrate_TrimRemoveStringViews(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	cases := []struct {
-		name, src, dst, srcDSN, dstDSN, driver string
+		name, src, dst, srcDSN, dstDSN, driver, marker string
 	}{
-		{"postgres to mysql", "postgres", "mysql", pgSource, mysqlTarget, "mysql"},
-		{"mysql to postgres", "mysql", "postgres", mysqlSource, pgTarget, "pgx"},
+		{"postgres to mysql", "postgres", "mysql", pgSource, mysqlTarget, "mysql", translate.TrimRemoveStringMarker},
+		// A MySQL body is always backquoted, so it never could be created on
+		// Postgres; since Bug 314 the cross-engine view refusal names it before
+		// the copy, ahead of the TRIM door.
+		{"mysql to postgres", "mysql", "postgres", mysqlSource, pgTarget, "pgx", translate.ViewCrossDialectMarker},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -404,8 +407,8 @@ func TestMigrate_TrimRemoveStringViews(t *testing.T) {
 			runCtx, runCancel := context.WithTimeout(ctx, 2*time.Minute)
 			defer runCancel()
 			err := mig.Run(runCtx)
-			if err == nil || !strings.Contains(err.Error(), translate.TrimRemoveStringMarker) {
-				t.Fatalf("%s: want the %s refusal for view v_trim, got: %v", c.name, translate.TrimRemoveStringMarker, err)
+			if err == nil || !strings.Contains(err.Error(), c.marker) {
+				t.Fatalf("%s: want the %s refusal for view v_trim, got: %v", c.name, c.marker, err)
 			}
 			if !strings.Contains(err.Error(), "v_trim") {
 				t.Errorf("the refusal does not name the view: %v", err)
