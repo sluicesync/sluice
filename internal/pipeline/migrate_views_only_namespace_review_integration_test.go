@@ -99,15 +99,17 @@ func TestMigrate_ViewsOnlyNamespace_PostgresToPostgres_FanoutUnderExcludeTable(t
 	assertViewsMatchSource(t, ctx, src, dst, []string{"a_rpt.v", "b_mix.vm", "z_rpt.v"})
 }
 
-// TestMigrate_ViewsOnlyNamespace_PostgresDeferredPassShapes covers the
-// deferred pass's per-view progress on a real target:
-//   - a_mv holds a MATERIALIZED view and a view reading z_late, which sorts
-//     later — round 1 creates the matview and fails the view, round 2 must
-//     create the view without issuing the matview's CREATE again (PG has
-//     no CREATE OR REPLACE MATERIALIZED VIEW);
-//   - c_x / d_y interleave: c_x={a1→d_y.b1, a2}, d_y={b1→c_x.a2, b2→c_x.a1},
-//     which per-namespace progress refused and per-view progress completes.
-func TestMigrate_ViewsOnlyNamespace_PostgresDeferredPassShapes(t *testing.T) {
+// TestMigrate_ViewsOnlyNamespace_PostgresDeferredPassMaterializedView: a_mv
+// holds a MATERIALIZED view and a view reading z_late, which sorts later —
+// round 1 creates the matview and fails the view, round 2 must create the
+// view without the matview's second CREATE failing (PG has no CREATE OR
+// REPLACE MATERIALIZED VIEW). Two layers keep that true — the pass never
+// re-issues a created view, and the PG writer skips a matview that already
+// exists with the same definition — so this cell is red only when BOTH are
+// broken; each layer has its own pin (the unit
+// TestCreateDeferredViews_CreatedMaterializedViewIsNotReissued, and
+// ..._PostgresMaterializedViewAcrossResume).
+func TestMigrate_ViewsOnlyNamespace_PostgresDeferredPassMaterializedView(t *testing.T) {
 	pgSource, pgTarget, cleanup := startPostgres(t)
 	defer cleanup()
 	applyPGDDL(t, pgSource, `
@@ -119,6 +121,34 @@ func TestMigrate_ViewsOnlyNamespace_PostgresDeferredPassShapes(t *testing.T) {
 		CREATE SCHEMA a_mv;
 		CREATE MATERIALIZED VIEW a_mv.mv AS SELECT id FROM m_app.t WHERE k <= 20;
 		CREATE VIEW a_mv.late AS SELECT id FROM z_late.v;
+	`)
+	pgEng, _ := engines.Get("postgres")
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	mig := &Migrator{
+		Source: pgEng, Target: pgEng, SourceDSN: pgSource, TargetDSN: pgTarget,
+		DatabaseFilter: DatabaseFilter{Include: []string{"a_mv", "m_app", "z_late"}},
+	}
+	if err := mig.Run(ctx); err != nil {
+		t.Fatalf("Bug 317 review: deferred views pass with a materialized view: %v", err)
+	}
+	src, dst := openBoth(t, "pgx", pgSource, pgTarget)
+	assertViewsMatchSource(t, ctx, src, dst, []string{"a_mv.mv", "a_mv.late"})
+}
+
+// TestMigrate_ViewsOnlyNamespace_PostgresDeferredPassInterleaved: c_x and
+// d_y read each other in both directions — c_x={a1→d_y.b1, a2},
+// d_y={b1→c_x.a2, b2→c_x.a1}. Round 1 creates a2 and b1 and neither
+// namespace completes, so per-namespace progress refused; per-view progress
+// completes in round 2. Kept apart from any namespace that would make
+// per-namespace progress in round 1, which would mask the defect.
+func TestMigrate_ViewsOnlyNamespace_PostgresDeferredPassInterleaved(t *testing.T) {
+	pgSource, pgTarget, cleanup := startPostgres(t)
+	defer cleanup()
+	applyPGDDL(t, pgSource, `
+		CREATE SCHEMA m_app;
+		CREATE TABLE m_app.t (id INT PRIMARY KEY, k INT NOT NULL);
+		INSERT INTO m_app.t VALUES (1, 10), (2, 20), (3, 30);
 		CREATE SCHEMA c_x;
 		CREATE SCHEMA d_y;
 		CREATE VIEW c_x.a2 AS SELECT id FROM m_app.t;
@@ -131,13 +161,13 @@ func TestMigrate_ViewsOnlyNamespace_PostgresDeferredPassShapes(t *testing.T) {
 	defer cancel()
 	mig := &Migrator{
 		Source: pgEng, Target: pgEng, SourceDSN: pgSource, TargetDSN: pgTarget,
-		DatabaseFilter: DatabaseFilter{Include: []string{"a_mv", "c_x", "d_y", "m_app", "z_late"}},
+		DatabaseFilter: DatabaseFilter{Include: []string{"c_x", "d_y", "m_app"}},
 	}
 	if err := mig.Run(ctx); err != nil {
-		t.Fatalf("Bug 317 review: deferred views pass: %v", err)
+		t.Fatalf("Bug 317 review: deferred views pass refused an interleaved cross-namespace graph: %v", err)
 	}
 	src, dst := openBoth(t, "pgx", pgSource, pgTarget)
-	assertViewsMatchSource(t, ctx, src, dst, []string{"a_mv.mv", "a_mv.late", "c_x.a1", "c_x.a2", "d_y.b1", "d_y.b2"})
+	assertViewsMatchSource(t, ctx, src, dst, []string{"c_x.a1", "c_x.a2", "d_y.b1", "d_y.b2"})
 }
 
 // TestMigrate_ViewsOnlyNamespace_PostgresMaterializedViewAcrossResume: the
