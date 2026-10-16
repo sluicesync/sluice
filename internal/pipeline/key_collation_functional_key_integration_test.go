@@ -83,10 +83,16 @@ func TestKeyCollationFunctionalKey_PostgresToMySQLApply(t *testing.T) {
 		// MySQL keeps the functional key's hidden column on the collation it
 		// was created with, so the key still equates 'e' and 'é'. A guard that
 		// re-derived the expression's collation from the column would compare
-		// under utf8mb4_bin and let the merge through.
+		// under utf8mb4_bin and let the merge through. The key is first
+		// rebuilt without the CAST sluice emits (a MySQL source's own
+		// `((lower(k)))`), whose collation follows the column's: under the
+		// CAST the expression takes the character set's default whatever the
+		// column says, so the re-derived and the recorded collation agree and
+		// the cell would not tell them apart.
 		{
 			tag: "kfe", create: kfkPGFunctionalTable, collide: "é", wantRefusal: true,
-			tgtAlter: "ALTER TABLE kd MODIFY k varchar(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL",
+			tgtAlter: "ALTER TABLE kd DROP INDEX kd_lower_k, ADD UNIQUE KEY kd_lower_k ((lower(k))); " +
+				"ALTER TABLE kd MODIFY k varchar(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL",
 		},
 	}
 	for _, c := range cells {
