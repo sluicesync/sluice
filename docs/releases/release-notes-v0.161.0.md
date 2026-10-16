@@ -72,9 +72,10 @@
 - **Anyone restoring backups across versions:** restore any chain containing a version-15 manifest with v0.161.0 or later. Older binaries refuse those manifests loudly; chains without one restore on older binaries as before.
 - **Everyone else:** upgrade.
 
-**Corrected 2026-10-16 (found by the site docs review).** Two statements above were wrong.
-- **The `postgres-trigger` remedy cannot converge as written.** The damaged tables hold values the source keeps apart only by case, under a UNIQUE key the MySQL target compares `utf8mb4_0900_ai_ci`, so the target key cannot hold both. A `--restart-from-scratch` or a restore on v0.161.0 therefore refuses `KEY-COLLATION-MERGE` instead of restoring the missing row. Recreate the target key comparing byte for byte (`COLLATE utf8mb4_0900_bin`), as the refusal names, and then re-copy. The same applies to the functional-key remedy: recreate the key the refusal names before re-copying.
+**Corrected 2026-10-16 (found by the site docs review and this release's regression cycle, which measured the remedy).** Three statements above were wrong.
+- **The `postgres-trigger` remedy does not converge as written.** The damaged tables hold values the source keeps apart only by case, under a UNIQUE key the MySQL target compares `utf8mb4_0900_ai_ci`, so that key cannot hold both. Measured: `sync start --restart-from-scratch` recreates the table with the same key, copies both rows, then fails `Error 1062` at the index build, leaving both rows and no unique key. What converges (measured, including a later live case-only pair): create the target table yourself with the key comparing byte for byte (`COLLATE utf8mb4_0900_bin`), then run `sync start --restart-from-scratch --schema-already-applied`. A plain re-copy after recreating the key does not work, because the re-copy recreates the table.
 - **`FormatVersion` 15 is not limited to unique keys.** Any collated functional key part, unique or not, on a vanilla-MySQL source table stamps the backup 15. So v0.160.4 and older also refuse a backup whose only functional index is non-unique.
+- **The typo'd-filter holes were narrower than stated.** On v0.160.4, `backup full`, `schema diff` and a fan-out `migrate` already refused a Postgres `--include-table` that matched nothing. The exit-0 holes this release closes are single-namespace `migrate`, single-namespace `sync start` and fan-out `sync start`.
 
 ---
 
