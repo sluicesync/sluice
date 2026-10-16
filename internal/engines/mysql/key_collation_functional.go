@@ -717,7 +717,7 @@ func (k *targetUniqueKeys) markFunctionalArming(source *ir.Table, armed map[stri
 // a `utf8mb4_bin` session holding 'a' and 'A' apart while sluice's rebuild
 // compared `_0900_ai_ci` — so those parts arm instead of inferring. A source
 // key carrying a hand-made COLLATE the target key lacks is still not seen;
-// the class fix (KEY-COLLATION-FUNCTIONAL-SESSION-COLLATION: read the source's
+// the class fix (FUNCTIONAL-CAST-HIDDEN-COLLATION: read the source's
 // hidden column into the IR and emit its collation) closes both.
 func functionalPartArms(f *functionalKeyPart, source *ir.Table, armed map[string]armedCollation, compareAs map[string]string) bool {
 	switch {
@@ -790,7 +790,7 @@ func isStringType(t ir.Type) bool {
 // alike, and the second row's upsert replaced the first at exit 0. The
 // source's own hidden column is not read (the class fix — carrying the
 // source key's collation into the IR and emitting it — is filed separately
-// as KEY-COLLATION-FUNCTIONAL-SESSION-COLLATION), so such a part is treated
+// as FUNCTIONAL-CAST-HIDDEN-COLLATION), so such a part is treated
 // as not known alike and arms. For a part the guard cannot read, any CAST or
 // CONVERT in its text counts: its structure cannot show an outer COLLATE.
 func (f *functionalKeyPart) sessionDerivedCollation() bool {
