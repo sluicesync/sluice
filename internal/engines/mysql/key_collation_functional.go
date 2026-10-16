@@ -11,10 +11,10 @@ package mysql
 //
 // A Postgres `UNIQUE (lower(email))` reaches MySQL as the functional key
 // part `((lower(cast(email as char charset utf8mb4))))`. Its comparison is
-// the CAST's — the creating session's default for the character set,
-// `utf8mb4_0900_ai_ci` under sluice's (a CAST with no CHARACTER SET takes the
-// session's collation_connection instead) — which equates lower('e') and
-// lower('é'), two values Postgres keeps apart. The
+// the CAST's — with an explicit CHARACTER SET, the server's default for the
+// set, `utf8mb4_0900_ai_ci` (only a charset-less CAST follows the creating
+// session's collation_connection) — which equates lower('e') and lower('é'),
+// two values Postgres keeps apart. The
 // guard read the target's unique keys with every functional part skipped,
 // so it saw no key holding the armed column, and the second source row
 // overwrote the first through ON DUPLICATE KEY UPDATE at exit 0 (measured
@@ -59,16 +59,18 @@ package mysql
 //
 // A part ARMS its key — puts it under the guard — when its value may be a
 // collated string and the source's comparison of it can differ from the
-// index's ([functionalPartArms]): a column it reads is armed, the source
-// declares one under a collation other than the index's (review F2: a column
-// both sides declare `utf8mb4_bin` still merges 'e' and 'é' under a key
-// whose CAST compares `_ai_ci`), the index's collation is not known, or
-// there is no source shape at all (a live trigger-CDC stream). A part whose
-// columns the source declares under the index's own collation does not arm
-// (re-review finding 2: arming there refused stale respellings ON DUPLICATE
-// KEY UPDATE converges) — which infers the source's index from its columns,
-// a stated premise ([functionalPartArms]); a CAST or CONVERT, whose
-// collation the creating session decides, always arms. So the keys are read for
+// index's ([functionalPartArms]). For a MySQL-family source that is READ:
+// the reader records the source key's hidden-column collation on the IR
+// ([ir.IndexColumn.HiddenCollation]; FUNCTIONAL-CAST-HIDDEN-COLLATION) and
+// the part arms when it is unknown or differs from the target's — no
+// inference from the column's declared collation, which five review rounds
+// each found wrong in another shape (a session CAST, an ALTER … MODIFY that
+// left the hidden column behind, a string literal under an INT column). The
+// writer pins that collation on the keys it creates, so a migrated target
+// compares as its source and does not arm. For a Postgres or SQLite source
+// (no hidden column) the column routes stay: an armed column, or a declared
+// collation other than the index's or none. Always: an unknown index
+// collation, or no source shape at all (a live trigger-CDC stream), arms. So the keys are read for
 // every table, armed column or not: one catalog read per table per writer,
 // cached, and two more (its columns and its hidden columns) for a table with
 // a functional part. A part KNOWN not to be a string (`(j * 2)`, a binary
@@ -520,22 +522,29 @@ func cutLast(s, sep string) (before, after string, found bool) {
 func (k *targetUniqueKeys) resolveFunctionalCollations(hidden []hiddenKeyColumn, known bool) {
 	for _, f := range k.functionalParts() {
 		f.collation, f.known = "", false
-		if !known {
-			continue
-		}
-		matches := 0
-		for _, h := range hidden {
-			if h.part == f.seq && (h.index == f.index || (h.truncated && strings.HasPrefix(f.index, h.index))) {
-				matches++
-				f.collation = h.collation
-			}
-		}
-		if matches == 1 {
-			f.known = true
-		} else {
-			f.collation = ""
+		if known {
+			f.collation, f.known = hiddenCollationOf(hidden, f.index, f.seq)
 		}
 	}
+}
+
+// hiddenCollationOf is the collation of the one hidden column for a key's
+// functional part at position seq, matched by the full key name or — for a
+// shortened name — by prefix. known is false when none or more than one
+// matches. Shared by the guard's target side and the schema reader's
+// source side ([SchemaReader.populateHiddenCollations]).
+func hiddenCollationOf(hidden []hiddenKeyColumn, index string, seq int) (collation string, known bool) {
+	matches := 0
+	for _, h := range hidden {
+		if h.part == seq && (h.index == index || (h.truncated && strings.HasPrefix(index, h.index))) {
+			matches++
+			collation = h.collation
+		}
+	}
+	if matches != 1 {
+		return "", false
+	}
+	return collation, true
 }
 
 // functionalParts is every functional part of the keys.
@@ -675,56 +684,61 @@ func (k *targetUniqueKeys) markFunctionalArming(source *ir.Table, armed map[stri
 
 // functionalPartArms reports whether a functional part puts its key under
 // the guard: when its value may be a collated string AND the source's own
-// comparison of it can differ from the index's. That is so when
+// comparison of it can differ from the index's.
 //
-//   - the index's collation is not known (vtgate; an ambiguous shortened
-//     hidden-column name): nothing shows the two alike;
+// For a MySQL-family source the source's comparison is READ, not inferred
+// (FUNCTIONAL-CAST-HIDDEN-COLLATION, the class fix): the MySQL reader
+// records each functional part's hidden-column collation on the source IR
+// ([ir.IndexColumn.HiddenCollation]), and the part arms exactly when that
+// is unknown or differs from the target index's. Five review rounds each
+// found another shape where inferring the source key's comparison from its
+// columns' declared collation was wrong and silent: a CAST takes the
+// creating session's collation (a CAST with an explicit CHARACTER SET takes
+// the server's default for the set; only a charset-less CAST follows the
+// session's collation_connection), a literal takes the session's too
+// (`if(f,'A','a')` over an INT f), and an ALTER … MODIFY of the column
+// leaves the hidden column on its OLD collation (`trim(k)` after k moved
+// `_bin` → `_0900_ai_ci`). The column says nothing reliable; the hidden
+// column is the key. Unknown — a Vitess/PlanetScale source (vtgate does not
+// serve SHOW EXTENDED), a manifest an older binary wrote, a CDC projection
+// that carries no secondary indexes, a source key of another name — arms.
 //
-//   - a column it names is armed — the source declares a collation the
-//     target column does not share, which every Postgres-source character
-//     column is (the cross-family case);
+// For a Postgres or SQLite source there is no hidden column; the routes stay
+// those the earlier rounds measured: a column it reads is armed (the source
+// declares a collation the target column does not share), or the source
+// declares a string column under a collation other than the index's or none
+// at all (every Postgres-source character column does one or the other).
+// A non-string column (INT, JSON) brings no collation and arms nothing.
 //
-//   - a column it names is declared by the source under a collation other
-//     than the one the index compares under (review F2: a column both sides
-//     declare `utf8mb4_bin` under a key whose CAST compares `_ai_ci`), or
-//     the source declares none, or lacks the column.
+// Always, before either route: the index's collation not known (vtgate; an
+// ambiguous shortened hidden-column name) arms, and so does having no source
+// shape at all (a live sqlite-trigger or d1-trigger stream, whose readers
+// emit no SchemaSnapshot; third review, finding 3) — a functional part's
+// source side is bytes, which needs nothing from the source. A part whose
+// value is not a string never arms.
 //
-//   - there is no source shape at all: nothing shows the source compares
-//     alike. Third review 2026-10-15, finding 3: disarming here left every
-//     functional key unguarded on a live sqlite-trigger or d1-trigger →
-//     MySQL stream, whose readers emit no SchemaSnapshot (only the broker
-//     seeds a shape). A plain column stays unarmed without one — its rule
-//     needs the source's collation to compare — but a functional part's
-//     source side is bytes, which needs nothing from the source.
-//
-// Otherwise the target compares the part as the source compares its
-// columns, and arming it would only refuse what converges: re-review
-// 2026-10-15 finding 2 measured a MySQL → MySQL copy, with the source's own
-// key, refusing a stale respelled row (target row 3 'A@y', the source's row
-// 4 'a@y') that ON DUPLICATE KEY UPDATE converges. A part whose value is not
-// a string never arms.
-//
-//   - its comparison collation was decided by the session that created it —
-//     a CAST or CONVERT with no later COLLATE ([sessionDerivedCollation]).
-//
-// UNVERIFIED PREMISE, stated (third review, finding 4; narrowed by the
-// fourth): "the source compares the part under its columns' collation"
-// infers the SOURCE's own index from the source's column collations, because
-// the source's hidden column is not read. It holds for a part whose collation
-// derives from its columns (`lower(k)`, `trim(k)`, `concat(k, j)` keep the
-// columns'). It is FALSE for a CAST or CONVERT, whose collation is the
-// creating session's — the fourth review measured a source key created from
-// a `utf8mb4_bin` session holding 'a' and 'A' apart while sluice's rebuild
-// compared `_0900_ai_ci` — so those parts arm instead of inferring. A source
-// key carrying a hand-made COLLATE the target key lacks is still not seen;
-// the class fix (FUNCTIONAL-CAST-HIDDEN-COLLATION: read the source's
-// hidden column into the IR and emit its collation) closes both.
+// Arming refuses a row only when the target matched two rows whose columns
+// differ byte for byte, so where the source's key compares as the target's,
+// arming costs only a refusal of a stale respelling ON DUPLICATE KEY UPDATE
+// would converge (re-review finding 2) — which is why a read-and-equal part
+// does not arm.
 func functionalPartArms(f *functionalKeyPart, source *ir.Table, armed map[string]armedCollation, compareAs map[string]string) bool {
 	switch {
 	case !f.collated():
 		return false
-	case !f.known, source == nil, f.sessionDerivedCollation():
+	case !f.known, source == nil:
 		return true
+	}
+	if !sourceIsNonMySQL(source) {
+		src := sourceFunctionalPart(source, f)
+		if src == nil || src.HiddenCollation == "" {
+			return true
+		}
+		coll := strings.ToLower(src.HiddenCollation)
+		if mapped, ok := compareAs[coll]; ok {
+			coll = mapped
+		}
+		return !strings.EqualFold(coll, f.collation)
 	}
 	srcCols := make(map[string]*ir.Column, len(source.Columns))
 	for _, c := range source.Columns {
@@ -745,11 +759,7 @@ func functionalPartArms(f *functionalKeyPart, source *ir.Table, armed map[string
 			return true
 		}
 		if !isStringType(c.Type) {
-			// Not a string column (an INT, a JSON document): it brings no
-			// collation into the part, so it neither shows the source alike
-			// nor different (fourth review, finding 3: counting it as "the
-			// source declares none" armed `concat(k, '-', n)` over an INT n).
-			continue
+			continue // fourth review, finding 3: an INT or JSON column brings no collation
 		}
 		_, coll := translate.ColumnCollation(c.Type)
 		coll = strings.ToLower(coll)
@@ -763,86 +773,52 @@ func functionalPartArms(f *functionalKeyPart, source *ir.Table, armed map[string
 	return false
 }
 
+// sourceIsNonMySQL reports positive evidence that the source shape is not a
+// MySQL-family table: a string column carrying a Postgres- or SQLite-dialect
+// collation, or a stamped Postgres collation determinism. Without that
+// evidence the source is treated as MySQL-family, whose functional parts
+// compare by their read hidden collation or — unknown — arm.
+func sourceIsNonMySQL(source *ir.Table) bool {
+	for _, c := range source.Columns {
+		if c == nil || !isStringType(c.Type) {
+			continue
+		}
+		if collationDeterminismOf(c.Type) != ir.CollationDeterminismUnknown {
+			return true
+		}
+		if cs, coll := translate.ColumnCollation(c.Type); coll != "" && translate.CollationDialect(cs, coll) != "mysql" {
+			return true
+		}
+	}
+	return false
+}
+
+// sourceFunctionalPart is the source's own functional part matching f — the
+// source index of f's name (sluice keeps a MySQL key's name) whose entry at
+// f's position is an expression — or nil.
+func sourceFunctionalPart(source *ir.Table, f *functionalKeyPart) *ir.IndexColumn {
+	for _, idx := range append([]*ir.Index{source.PrimaryKey}, source.Indexes...) {
+		if idx == nil || !strings.EqualFold(idx.Name, f.index) || f.seq >= len(idx.Columns) {
+			continue
+		}
+		if c := &idx.Columns[f.seq]; c.Expression != "" {
+			return c
+		}
+	}
+	return nil
+}
+
 // isStringType reports whether a source column type carries a collation
 // into an expression over it: the character types, ENUM and SET, through a
-// domain.
+// domain. On the Postgres/SQLite route an ENUM or SET (no collation in the
+// IR) counts as declaring none and arms — safe, and moot for MySQL-family
+// sources, which compare by the read hidden collation instead.
 func isStringType(t ir.Type) bool {
 	switch v := t.(type) {
 	case ir.Char, ir.Varchar, ir.Text, ir.Enum, ir.Set:
 		return true
 	case ir.Domain:
 		return isStringType(v.BaseType)
-	}
-	return false
-}
-
-// sessionDerivedCollation reports whether the part's comparison collation
-// was decided by the SESSION that created the key rather than by its
-// columns: a CAST or CONVERT to a character type that no later COLLATE
-// overrides. Fourth review 2026-10-15, finding 1 (HIGH, silent, measured on
-// MySQL 8.4): a CAST with no CHARACTER SET takes the creating session's
-// collation_connection, and one with a CHARACTER SET takes that session's
-// default for the set (default_collation_for_utf8mb4) — while the catalog
-// stores the same text either way. A source key `((cast(k as char(10))))`
-// created from a `utf8mb4_bin` session held 'a' and 'A' apart; sluice
-// recreated it through its own session under `utf8mb4_0900_ai_ci`, the
-// column declared `_0900_ai_ci` on both sides, the guard inferred the two
-// alike, and the second row's upsert replaced the first at exit 0. The
-// source's own hidden column is not read (the class fix — carrying the
-// source key's collation into the IR and emitting it — is filed separately
-// as FUNCTIONAL-CAST-HIDDEN-COLLATION), so such a part is treated
-// as not known alike and arms. For a part the guard cannot read, any CAST or
-// CONVERT in its text counts: its structure cannot show an outer COLLATE.
-func (f *functionalKeyPart) sessionDerivedCollation() bool {
-	if f.readable {
-		pending := false
-		for _, s := range f.steps {
-			switch s.kind {
-			case "cast":
-				pending = s.charset != "binary"
-			case "collate":
-				pending = false
-			}
-		}
-		return pending
-	}
-	return expressionCallsAny(f.expr, "cast", "convert")
-}
-
-// expressionCallsAny reports whether expr, in SQL spelling, calls any of the
-// named functions (an identifier token followed by '('), outside string
-// literals and backquoted identifiers, case-insensitively.
-func expressionCallsAny(expr string, names ...string) bool {
-	for i := 0; i < len(expr); i++ {
-		switch c := expr[i]; {
-		case c == '\'' || c == '"':
-			closeIdx, _, ok := quotedLiteralClose(expr[i:], c)
-			if !ok {
-				return true // unscannable: do not claim it calls nothing
-			}
-			i += closeIdx
-		case c == '`':
-			for i++; i < len(expr) && expr[i] != '`'; i++ {
-			}
-		case (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_':
-			start := i
-			for i < len(expr) && ((expr[i] >= 'a' && expr[i] <= 'z') || (expr[i] >= 'A' && expr[i] <= 'Z') || (expr[i] >= '0' && expr[i] <= '9') || expr[i] == '_') {
-				i++
-			}
-			word := strings.ToLower(expr[start:i])
-			j := i
-			for j < len(expr) && expr[j] == ' ' {
-				j++
-			}
-			if j < len(expr) && expr[j] == '(' {
-				for _, n := range names {
-					if word == n {
-						return true
-					}
-				}
-			}
-			i--
-		}
 	}
 	return false
 }

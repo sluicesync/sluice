@@ -193,7 +193,25 @@ func indicesEqual(a, b *ir.Index) bool {
 	if a.Name != b.Name || a.Unique != b.Unique {
 		return false
 	}
-	return reflect.DeepEqual(a.Columns, b.Columns)
+	if len(a.Columns) != len(b.Columns) {
+		return false
+	}
+	for i := range a.Columns {
+		ac, bc := a.Columns[i], b.Columns[i]
+		// HiddenCollation (FUNCTIONAL-CAST-HIDDEN-COLLATION) is compared only
+		// when BOTH shapes carry it: a parent manifest an older binary wrote
+		// has none, and reading every functional key as redefined on the
+		// first incremental after an upgrade would stamp a schema delta the
+		// source never ran. Both carrying it and differing is a real change
+		// (the key was rebuilt under another collation).
+		if ac.HiddenCollation == "" || bc.HiddenCollation == "" {
+			ac.HiddenCollation, bc.HiddenCollation = "", ""
+		}
+		if !reflect.DeepEqual(ac, bc) {
+			return false
+		}
+	}
+	return true
 }
 
 // TypeString renders an IR Type to its canonical String form. nil

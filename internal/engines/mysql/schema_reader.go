@@ -921,7 +921,50 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 		}
 		t.Indexes = append(t.Indexes, idx)
 	}
+	r.populateHiddenCollations(ctx, tables)
 	return nil
+}
+
+// populateHiddenCollations records, on every functional key part of every
+// table, the collation its hidden generated column compares under
+// ([ir.IndexColumn.HiddenCollation]; FUNCTIONAL-CAST-HIDDEN-COLLATION): one
+// SHOW EXTENDED FULL COLUMNS per table that has a functional part, vanilla
+// MySQL only. A part whose hidden column cannot be read, is ambiguous, or is
+// not a collated string keeps it empty — "not known", which the writer emits
+// as before and the key-collation guard treats as possibly different.
+func (r *SchemaReader) populateHiddenCollations(ctx context.Context, tables map[string]*ir.Table) {
+	if r.flavor != FlavorVanilla {
+		return
+	}
+	for _, name := range sortedKeys(tables) {
+		t := tables[name]
+		var parts []*ir.IndexColumn
+		indexOf := map[*ir.IndexColumn]string{}
+		seqOf := map[*ir.IndexColumn]int{}
+		for _, idx := range append([]*ir.Index{t.PrimaryKey}, t.Indexes...) {
+			if idx == nil {
+				continue
+			}
+			for i := range idx.Columns {
+				if c := &idx.Columns[i]; c.Expression != "" {
+					parts = append(parts, c)
+					indexOf[c], seqOf[c] = idx.Name, i
+				}
+			}
+		}
+		if len(parts) == 0 {
+			continue
+		}
+		hidden, ok := functionalKeyCollations(ctx, r.db, r.flavor, r.schema, t.Name)
+		if !ok {
+			continue
+		}
+		for _, c := range parts {
+			if coll, known := hiddenCollationOf(hidden, indexOf[c], seqOf[c]); known {
+				c.HiddenCollation = coll
+			}
+		}
+	}
 }
 
 // populateForeignKeys fills in ForeignKey lists for each table.

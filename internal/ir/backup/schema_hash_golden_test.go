@@ -320,6 +320,55 @@ func TestComputeSchemaHash_ExcludesIndexConstraintNamed(t *testing.T) {
 	}
 }
 
+// TestComputeSchemaHash_ExcludesIndexHiddenCollation pins the decision for
+// [ir.IndexColumn.HiddenCollation] (FUNCTIONAL-CAST-HIDDEN-COLLATION): the
+// MySQL reader sets it on EVERY collated functional key part it can read,
+// so `omitempty` alone would move the fingerprint for every MySQL chain with
+// a functional key (the Bug 216 shape) — it is excluded instead, a re-
+// emission and guard hint. Cross-version in both directions: a schema an
+// older binary wrote (no field) and the same schema this binary reads (the
+// field set) hash identically, so an old chain verifies here and a new
+// manifest verifies on an older binary that drops the field. The caller's
+// schema must not be mutated (the writer re-emits the collation from it).
+func TestComputeSchemaHash_ExcludesIndexHiddenCollation(t *testing.T) {
+	schemaWith := func(hidden string) *ir.Schema {
+		return &ir.Schema{Tables: []*ir.Table{{
+			Name:       "kd",
+			Columns:    []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}, {Name: "k", Type: ir.Varchar{Length: 20}}},
+			PrimaryKey: &ir.Index{Name: "PRIMARY", Unique: true, Columns: []ir.IndexColumn{{Column: "id"}}},
+			Indexes: []*ir.Index{{
+				Name: "fk", Unique: true,
+				Columns: []ir.IndexColumn{{Expression: "lower(k)", ExpressionDialect: "mysql", HiddenCollation: hidden}, {Column: "id"}},
+			}},
+		}}}
+	}
+	old, err := ComputeSchemaHash(schemaWith(""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := schemaWith("utf8mb4_bin")
+	got, err := ComputeSchemaHash(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != old {
+		t.Errorf("IndexColumn.HiddenCollation moved the schema fingerprint:\n  without %s\n  with    %s\n"+
+			"every MySQL chain with a functional key would stop verifying across versions; exclude it in fingerprintIndex", old, got)
+	}
+	if s.Tables[0].Indexes[0].Columns[0].HiddenCollation != "utf8mb4_bin" {
+		t.Error("hashing the schema cleared HiddenCollation on the caller's own index")
+	}
+	// The wire carries it when set and omits it when empty.
+	b, err := json.Marshal(s.Tables[0].Indexes[0].Columns[0])
+	if err != nil || !strings.Contains(string(b), `"HiddenCollation":"utf8mb4_bin"`) {
+		t.Errorf("set HiddenCollation does not ride the wire: %s %v", b, err)
+	}
+	b, _ = json.Marshal(ir.IndexColumn{Expression: "lower(k)"})
+	if strings.Contains(string(b), "HiddenCollation") {
+		t.Errorf("an empty HiddenCollation is on the wire: %s", b)
+	}
+}
+
 // TestIndexConstraintNamed_OmitsZeroValue pins the WIRE half (roadmap item
 // 84): a false ConstraintNamed must not appear in Index's JSON at all, so
 // a manifest this binary writes for an unnamed index stays byte-identical

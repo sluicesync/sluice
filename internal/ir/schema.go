@@ -935,6 +935,33 @@ type IndexColumn struct {
 	// backup schema fingerprint byte-identical whenever it is empty.
 	Collation        string `json:",omitempty"`
 	CollationDialect string `json:",omitempty"`
+
+	// HiddenCollation is the collation a MySQL FUNCTIONAL key part actually
+	// compares under: the collation of the hidden generated column MySQL
+	// keeps for it, read off the source catalog (SHOW EXTENDED FULL
+	// COLUMNS). Set only by the MySQL reader, only on an expression entry
+	// whose value is a collated string, and only where that column could
+	// be read (vanilla MySQL; vtgate does not serve it).
+	//
+	// It exists because the expression text does NOT determine it: a CAST
+	// with no CHARACTER SET takes the creating session's
+	// collation_connection, a literal takes the session's too, and an
+	// ALTER … MODIFY of the column leaves the hidden column on its OLD
+	// collation (FUNCTIONAL-CAST-HIDDEN-COLLATION, measured on MySQL 8.4).
+	// Rebuilding the key from the text alone compares it differently. The
+	// MySQL writer emits `((expr) COLLATE <it>)` so the rebuilt key
+	// compares exactly as the source's, and the key-collation guard
+	// compares it against the target's hidden column instead of inferring
+	// the source's comparison from the column. Other writers ignore it.
+	//
+	// It is a re-emission and guard hint, not part of what the schema IS
+	// for the backup fingerprint: [ComputeSchemaHash] excludes it
+	// (fingerprintIndex), so a chain written before it existed still
+	// verifies, and an older binary reading a newer manifest drops it
+	// without a hash mismatch. migcore's index equality ignores it unless
+	// both sides carry it, so the first incremental after an upgrade does
+	// not read every functional key as redefined.
+	HiddenCollation string `json:",omitempty"`
 }
 
 // FKAction is the action to take on a referenced row's UPDATE or DELETE.

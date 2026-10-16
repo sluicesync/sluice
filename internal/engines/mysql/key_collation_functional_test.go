@@ -127,37 +127,45 @@ func TestFunctionalKeyPart_SourceEq(t *testing.T) {
 	}
 }
 
+// withHidden gives t the source key `fk` over lower(k) whose hidden column
+// the MySQL reader read as hidden ("" adds no key).
+func withHidden(t *ir.Table, hidden string) *ir.Table {
+	if hidden != "" {
+		t.Indexes = append(t.Indexes, &ir.Index{Name: "fk", Unique: true, Columns: []ir.IndexColumn{
+			{Expression: "lower(k)", ExpressionDialect: "mysql", HiddenCollation: hidden},
+		}})
+	}
+	return t
+}
+
 // TestFunctionalPartArms_EachRoute discriminates each route by which a part
-// arms its key (third review finding 5: the Postgres cells armed through two
-// routes at once, so a mutant of either survived). Every case but its route
-// is held off: the index's collation is known and the target column is not
-// armed unless the route is the armed one.
+// arms its key, one at a time (third review finding 5).
+//
+// MySQL-family source (FUNCTIONAL-CAST-HIDDEN-COLLATION, the class fix): the
+// source key's comparison is its READ hidden collation, compared with the
+// target index's; the column's declared collation plays no part — the fifth
+// review's S1 (MODIFY left the hidden column on the old collation) and S2
+// (a literal under an INT column) are both "read and different".
+//
+// Postgres/SQLite source: the column routes (armed column, a declared
+// collation other than the index's or none, a missing column; a non-string
+// column brings none).
 func TestFunctionalPartArms_EachRoute(t *testing.T) {
 	ci := ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: "utf8mb4_0900_ai_ci"}
-	bin := ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: "utf8mb4_bin"}
+	pgDefault := ir.Varchar{Length: 20, Determinism: ir.CollationDeterministic}
+	// A Postgres-dialect column named like the index's collation, so only
+	// the armed-column route can arm it.
+	pgSameName := ir.Varchar{Length: 20, Collation: "utf8mb4_0900_ai_ci", Determinism: ir.CollationDeterministic}
 	part := func(known bool, coll string) *functionalKeyPart {
-		return &functionalKeyPart{named: []string{"K"}, columns: []string{"k"}, known: known, collation: coll}
+		return &functionalKeyPart{index: "fk", seq: 0, named: []string{"K"}, columns: []string{"k"}, known: known, collation: coll}
+	}
+	mysqlSrc := func(hidden string, cols ...*ir.Column) *ir.Table {
+		return &ir.Table{Name: "kd", Columns: cols, Indexes: []*ir.Index{{
+			Name: "FK", Unique: true, Columns: []ir.IndexColumn{{Expression: "lower(k)", ExpressionDialect: "mysql", HiddenCollation: hidden}},
+		}}}
 	}
 	src := func(cols ...*ir.Column) *ir.Table { return &ir.Table{Name: "kd", Columns: cols} }
-	withSteps := func(f *functionalKeyPart, kinds ...string) *functionalKeyPart {
-		f.readable = true
-		for _, k := range kinds {
-			f.steps = append(f.steps, functionalStep{kind: k, charset: "utf8mb4"})
-		}
-		return f
-	}
-	unreadable := func(f *functionalKeyPart, expr string) *functionalKeyPart {
-		f.expr = expr
-		return f
-	}
-	twoCols := func(f *functionalKeyPart) *functionalKeyPart {
-		f.named, f.columns, f.expr = []string{"k", "n"}, []string{"k", "n"}, "concat(`k`,'-',`n`)"
-		return f
-	}
-	jsonOnly := func(f *functionalKeyPart) *functionalKeyPart {
-		f.named, f.columns, f.expr = []string{"doc"}, []string{"doc"}, "json_unquote(json_extract(`doc`,'$.x'))"
-		return f
-	}
+	k := func(t ir.Type) *ir.Column { return &ir.Column{Name: "k", Type: t} }
 	for _, tc := range []struct {
 		name   string
 		f      *functionalKeyPart
@@ -165,43 +173,33 @@ func TestFunctionalPartArms_EachRoute(t *testing.T) {
 		armed  map[string]armedCollation
 		want   bool
 	}{
-		// The control: the source declares k under the index's collation and
-		// k is not armed — the source's own key, nothing arms.
-		{"control: the source's own key", part(true, "utf8mb4_0900_ai_ci"), src(&ir.Column{Name: "k", Type: ci}), nil, false},
+		// MySQL-family route.
+		{"mysql: read and equal", part(true, "utf8mb4_0900_ai_ci"), mysqlSrc("utf8mb4_0900_ai_ci", k(ci)), nil, false},
+		{"mysql: read and different (S1, S2, a session CAST)", part(true, "utf8mb4_0900_ai_ci"), mysqlSrc("utf8mb4_bin", k(ci)), nil, true},
+		{"mysql: hidden collation not read", part(true, "utf8mb4_0900_ai_ci"), mysqlSrc("", k(ci)), nil, true},
+		{"mysql: the source has no such key (a CDC projection)", part(true, "utf8mb4_0900_ai_ci"), src(k(ci)), nil, true},
 		{
-			"armed column only (source collation equals the index's)", part(true, "utf8mb4_0900_ai_ci"),
-			src(&ir.Column{Name: "k", Type: ci}),
-			map[string]armedCollation{"k": {charset: "utf8mb4", collation: "utf8mb4_0900_ai_ci"}},
-			true,
+			"mysql: an armed column does not override a read-equal key", part(true, "utf8mb4_0900_ai_ci"),
+			mysqlSrc("utf8mb4_0900_ai_ci", k(ci)),
+			map[string]armedCollation{"k": {charset: "utf8mb4", collation: "utf8mb4_bin"}},
+			false,
+		},
+		// Postgres/SQLite route.
+		{"postgres: armed column only", part(true, "utf8mb4_0900_ai_ci"), src(k(pgSameName)), map[string]armedCollation{"k": {bytes: true}}, true},
+		{"postgres: control (named like the index, unarmed)", part(true, "utf8mb4_0900_ai_ci"), src(k(pgSameName)), nil, false},
+		{"postgres: declares none", part(true, "utf8mb4_0900_ai_ci"), src(k(pgDefault)), nil, true},
+		{
+			"postgres: the source lacks the column", part(true, "utf8mb4_0900_ai_ci"),
+			src(&ir.Column{Name: "other", Type: pgDefault}), nil, true,
 		},
 		{
-			"collation comparison only (unarmed column, index under another collation)", part(true, "utf8mb4_0900_ai_ci"),
-			src(&ir.Column{Name: "k", Type: bin}), nil, true,
+			"postgres: only an INT column", part(true, "utf8mb4_0900_ai_ci"),
+			src(&ir.Column{Name: "k", Type: ir.Integer{Width: 32}}, &ir.Column{Name: "s", Type: pgDefault}), nil, false,
 		},
-		{"the source lacks the column", part(true, "utf8mb4_0900_ai_ci"), src(&ir.Column{Name: "other", Type: ci}), nil, true},
+		// Either route.
 		{"no source shape (finding 3)", part(true, "utf8mb4_0900_ai_ci"), nil, nil, true},
-		{"index collation unknown", part(false, ""), src(&ir.Column{Name: "k", Type: ci}), nil, true},
+		{"index collation unknown", part(false, ""), mysqlSrc("utf8mb4_0900_ai_ci", k(ci)), nil, true},
 		{"not a string", part(true, ""), nil, nil, false},
-		// Fourth review finding 1: a CAST's collation is the creating
-		// session's, so the column's says nothing about the source's key.
-		{
-			"readable CAST, no later COLLATE (session-derived)", withSteps(part(true, "utf8mb4_0900_ai_ci"), "cast"),
-			src(&ir.Column{Name: "k", Type: ci}), nil, true,
-		},
-		{
-			"readable CAST under an outer COLLATE (not session-derived)", withSteps(part(true, "utf8mb4_0900_ai_ci"), "cast", "collate"),
-			src(&ir.Column{Name: "k", Type: ci}), nil, false,
-		},
-		{
-			"unreadable part calling CONVERT", unreadable(part(true, "utf8mb4_0900_ai_ci"), "md5(convert(`k` using utf8mb4))"),
-			src(&ir.Column{Name: "k", Type: ci}), nil, true,
-		},
-		// Fourth review finding 3: a non-string column brings no collation.
-		{
-			"string column aligned beside an INT column", twoCols(part(true, "utf8mb4_0900_ai_ci")),
-			src(&ir.Column{Name: "k", Type: ci}, &ir.Column{Name: "n", Type: ir.Integer{Width: 32}}), nil, false,
-		},
-		{"only a JSON column", jsonOnly(part(true, "utf8mb4_0900_ai_ci")), src(&ir.Column{Name: "doc", Type: ir.JSON{}}), nil, false},
 	} {
 		if got := functionalPartArms(tc.f, tc.source, tc.armed, mysqlKeyGuardCollations); got != tc.want {
 			t.Errorf("%s: arms %v; want %v", tc.name, got, tc.want)
@@ -254,26 +252,29 @@ func TestPlanKeyCollationGuard_FunctionalParts(t *testing.T) {
 		src, tgt ir.Type
 		part     *functionalKeyPart
 		wantTgt  string // "" = not armed
+		hidden   string // the source key's read hidden collation ("" none read)
 	}{
-		{"postgres default, collated", pgDefault, tgtCI, lower(true, "utf8mb4_0900_ai_ci"), readTgt},
-		{"postgres default, unknown collation", pgDefault, tgtCI, lower(false, ""), "((TRUE) AND NOT"},
-		{"postgres default, not a string", pgDefault, tgtCI, lower(true, ""), ""},
-		{"mysql _bin, collated", srcBin, tgtCI, lower(true, "utf8mb4_0900_ai_ci"), readTgt},
-		{"F2: column aligned (_bin both sides), key collated", srcBin, tgtBin, lower(true, "utf8mb4_0900_ai_ci"), readTgt},
-		{"F4: unreadable collated part", pgDefault, tgtCI, md5(true, "latin1_swedish_ci"), "((TRUE) AND NOT"},
-		{"F4: unreadable part, collation unknown", pgDefault, tgtCI, md5(false, ""), "((TRUE) AND NOT"},
-		{"F4: unreadable non-string part", pgDefault, tgtCI, md5(true, ""), ""},
-		// Re-review finding 2: the source compares the column under the very
-		// collation the index does (the source's own key), so nothing arms;
-		// with the index's collation unknown, it does.
-		{"mysql to mysql, the source's own key", tgtCI, tgtCI, lower(true, "utf8mb4_0900_ai_ci"), ""},
-		{"mysql to mysql, index collation unknown", tgtCI, tgtCI, lower(false, ""), "((TRUE) AND NOT"},
-		{"mysql to mysql, unreadable part under the column's collation", tgtCI, tgtCI, md5(true, "utf8mb4_0900_ai_ci"), ""},
+		{"postgres default, collated", pgDefault, tgtCI, lower(true, "utf8mb4_0900_ai_ci"), readTgt, ""},
+		{"postgres default, unknown collation", pgDefault, tgtCI, lower(false, ""), "((TRUE) AND NOT", ""},
+		{"postgres default, not a string", pgDefault, tgtCI, lower(true, ""), "", ""},
+		{"mysql _bin, collated", srcBin, tgtCI, lower(true, "utf8mb4_0900_ai_ci"), readTgt, ""},
+		{"F2: column aligned (_bin both sides), key collated", srcBin, tgtBin, lower(true, "utf8mb4_0900_ai_ci"), readTgt, ""},
+		{"F4: unreadable collated part", pgDefault, tgtCI, md5(true, "latin1_swedish_ci"), "((TRUE) AND NOT", ""},
+		{"F4: unreadable part, collation unknown", pgDefault, tgtCI, md5(false, ""), "((TRUE) AND NOT", ""},
+		{"F4: unreadable non-string part", pgDefault, tgtCI, md5(true, ""), "", ""},
+		// MySQL → MySQL: the source key's READ hidden collation decides
+		// (FUNCTIONAL-CAST-HIDDEN-COLLATION): equal to the target index's,
+		// nothing arms (re-review finding 2); different or unread, it arms.
+		// The "mysql _bin" and "F2" rows above read none, so they arm.
+		{"mysql to mysql, the source's own key (hidden collation read, equal)", tgtCI, tgtCI, lower(true, "utf8mb4_0900_ai_ci"), "", "utf8mb4_0900_ai_ci"},
+		{"mysql to mysql, hidden collation read, different (S1/S2)", tgtCI, tgtCI, lower(true, "utf8mb4_0900_ai_ci"), readTgt, "utf8mb4_bin"},
+		{"mysql to mysql, index collation unknown", tgtCI, tgtCI, lower(false, ""), "((TRUE) AND NOT", ""},
+		{"mysql to mysql, unreadable part, hidden collation read, equal", tgtCI, tgtCI, md5(true, "utf8mb4_0900_ai_ci"), "", "utf8mb4_0900_ai_ci"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			for name, p := range map[string]*keyCollationPlan{
-				"applier": planKeyCollationGuard(kcgSource(tc.src), kcgCols(tc.tgt), keys(tc.part), mysqlKeyGuardCollations),
-				"copy":    planCopyKeyCollationGuard(kcgSource(tc.src), kcgCols(tc.tgt), keys(tc.part), mysqlKeyGuardCollations),
+				"applier": planKeyCollationGuard(withHidden(kcgSource(tc.src), tc.hidden), kcgCols(tc.tgt), keys(tc.part), mysqlKeyGuardCollations),
+				"copy":    planCopyKeyCollationGuard(withHidden(kcgSource(tc.src), tc.hidden), kcgCols(tc.tgt), keys(tc.part), mysqlKeyGuardCollations),
 			} {
 				if (p != nil) != (tc.wantTgt != "") {
 					t.Fatalf("%s: armed %v; want %v", name, p != nil, tc.wantTgt != "")
@@ -432,25 +433,6 @@ func TestDecodeCatalogExpression(t *testing.T) {
 	}
 }
 
-// TestExpressionCallsAny finds a call outside literals and identifiers,
-// case-insensitively, and treats an unscannable literal as a possible call.
-func TestExpressionCallsAny(t *testing.T) {
-	for expr, want := range map[string]bool{
-		"md5(convert(`k` using utf8mb4))":     true,
-		"CAST (`k` AS CHAR(10))":              true,
-		"concat(`k`,'cast(x)')":               false,
-		"concat(`cast`,`k`)":                  false,
-		"lower(`k`)":                          false,
-		"concat(`castle`,`k`)":                false,
-		"concat(`k`,'open":                    true,
-		"json_unquote(json_extract(`d`,'x'))": false,
-	} {
-		if got := expressionCallsAny(expr, "cast", "convert"); got != want {
-			t.Errorf("%s: %v; want %v", expr, got, want)
-		}
-	}
-}
-
 // TestKeyCollationFunctionalUnsupported_RemedyPerCause: each cause names its
 // own remedy (fourth review finding 4).
 func TestKeyCollationFunctionalUnsupported_RemedyPerCause(t *testing.T) {
@@ -538,5 +520,33 @@ func TestFunctionalKeyNeed(t *testing.T) {
 	}
 	if strings.Contains(functionalKeyNeed(f), "utf8mb4_bin") {
 		t.Error("names the PAD SPACE utf8mb4_bin")
+	}
+}
+
+// TestFunctionalPartExpr_PinsTheSourceHiddenCollation: a same-dialect
+// functional part carrying the source key's hidden collation is emitted as
+// `(expr) COLLATE <it>` (FUNCTIONAL-CAST-HIDDEN-COLLATION, the class fix), so
+// the rebuilt key compares as the source's; a part without one, or from
+// another dialect, emits as before.
+func TestFunctionalPartExpr_PinsTheSourceHiddenCollation(t *testing.T) {
+	for _, tc := range []struct {
+		c    ir.IndexColumn
+		want string
+	}{
+		{ir.IndexColumn{Expression: "lower(k)", ExpressionDialect: "mysql", HiddenCollation: "utf8mb4_bin"}, "(lower(k)) COLLATE utf8mb4_bin"},
+		{
+			ir.IndexColumn{Expression: "cast(k as char(10) charset utf8mb4)", ExpressionDialect: "mysql", HiddenCollation: "utf8mb4_general_ci"},
+			"(cast(k as char(10) charset utf8mb4)) COLLATE utf8mb4_general_ci",
+		},
+		{ir.IndexColumn{Expression: "lower(k)", ExpressionDialect: "mysql"}, "lower(k)"},
+		{ir.IndexColumn{Expression: "lower(k)", ExpressionDialect: "postgres", HiddenCollation: "utf8mb4_bin"}, "lower(k)"},
+	} {
+		if got := functionalPartExpr(tc.c, false); got != tc.want {
+			t.Errorf("%+v: %q; want %q", tc.c, got, tc.want)
+		}
+	}
+	got := emitIndexColumnList([]ir.IndexColumn{{Expression: "trim(k)", ExpressionDialect: "mysql", HiddenCollation: "utf8mb4_bin"}}, false)
+	if got != "(((trim(k)) COLLATE utf8mb4_bin))" {
+		t.Errorf("index column list %q", got)
 	}
 }

@@ -37,6 +37,7 @@ import (
 	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/translate/exprident"
 )
 
 // SchemaDiff is the structural delta between two schemas. The naming
@@ -739,7 +740,7 @@ func diffTable(expected, actual *ir.Table, opts Options) TableDiff {
 		}
 		sort.Strings(td.IndexesExtra)
 	}
-	diffIndexDefinitions(&td, expIdx, actIdx)
+	diffIndexDefinitions(&td, expIdx, actIdx, !opts.IgnoreCharsetCollation)
 
 	diffChecks(&td, expected, actual, opts)
 	diffForeignKeys(&td, expected, actual, opts)
@@ -1418,7 +1419,17 @@ func indexDisplayName(key string, idx *ir.Index) string {
 // renderer that dropped it would reproduce the blindness this comparison was
 // added to remove (roadmap item 125). An expression entry renders as its
 // expression text.
-func renderIndexColumns(idx *ir.Index) string {
+//
+// With withHidden, a MySQL functional part also renders the collation its
+// hidden column compares under ([ir.IndexColumn.HiddenCollation];
+// FUNCTIONAL-CAST-HIDDEN-COLLATION): it decides which values the key counts
+// as equal, and the expression text does not (a session CAST, a literal, a
+// column MODIFY all leave the text alone). The MySQL writer pins it as an
+// outer `(expr) COLLATE <it>`, so an outer COLLATE naming the part's own
+// hidden collation is stripped first — `(lower(k) collate h)` with hidden h
+// and `lower(k)` with hidden h are the same key, and a migrate-created
+// target must not read as drifted from its source.
+func renderIndexColumns(idx *ir.Index, withHidden bool) string {
 	if idx == nil || len(idx.Columns) == 0 {
 		return ""
 	}
@@ -1427,7 +1438,7 @@ func renderIndexColumns(idx *ir.Index) string {
 		var seg string
 		switch {
 		case c.Expression != "":
-			seg = "(" + c.Expression + ")"
+			seg = "(" + stripOuterCollate(c.Expression, c.HiddenCollation) + ")"
 		default:
 			seg = c.Column
 			if c.Length > 0 {
@@ -1441,12 +1452,46 @@ func renderIndexColumns(idx *ir.Index) string {
 		if c.Collation != "" {
 			seg += " COLLATE " + c.Collation
 		}
+		if withHidden && c.HiddenCollation != "" {
+			seg += " COLLATE " + c.HiddenCollation
+		}
 		if c.Desc {
 			seg += " DESC"
 		}
 		parts = append(parts, seg)
 	}
 	return "(" + strings.Join(parts, ", ") + ")"
+}
+
+// stripOuterCollate removes, repeatedly, an outer `(… collate <coll>)`
+// wrapping expr whose collation is coll (case-insensitive), and any
+// redundant outermost parentheses left behind, so the writer's pinning
+// wrapper compares equal to the bare source expression. Parentheses are
+// matched literal-aware ([exprident.ScanParenGroup]); a different outer
+// collation, or none, leaves expr as it is.
+func stripOuterCollate(expr, coll string) string {
+	if coll == "" {
+		return expr
+	}
+	suffix := " collate " + strings.ToLower(coll)
+	enclosed := func(e string) bool {
+		if !strings.HasPrefix(e, "(") {
+			return false
+		}
+		closeIdx, ok := exprident.ScanParenGroup(e, 0)
+		return ok && closeIdx == len(e)-1
+	}
+	e := strings.TrimSpace(expr)
+	for {
+		if !enclosed(e) {
+			return e
+		}
+		inner := strings.TrimSpace(e[1 : len(e)-1])
+		if strings.HasSuffix(strings.ToLower(inner), suffix) {
+			inner = strings.TrimSpace(inner[:len(inner)-len(suffix)])
+		}
+		e = inner
+	}
 }
 
 // diffIndexDefinitions compares indexes present on BOTH sides under the same
@@ -1460,11 +1505,14 @@ func renderIndexColumns(idx *ir.Index) string {
 // a primary key from being role-matched in one pass and name-matched in the
 // other.
 //
-// opts is deliberately not consulted: IgnoreExtras scopes which SIDE's
+// IgnoreExtras is deliberately not consulted: it scopes which SIDE's
 // absences are reported, and there is no absence here — both sides have the
-// index. IgnoreCharsetCollation is about column types, which this does not
-// compare.
-func diffIndexDefinitions(td *TableDiff, expIdx, actIdx map[string]*ir.Index) {
+// index. withHidden is !IgnoreCharsetCollation: a functional key part's
+// hidden-column collation ([ir.IndexColumn.HiddenCollation]) joins the
+// comparison only for a same-storage-family pair, the same gate column
+// collations ride (cross-family it is translation noise — only the MySQL
+// reader records one).
+func diffIndexDefinitions(td *TableDiff, expIdx, actIdx map[string]*ir.Index, withHidden bool) {
 	common := make([]string, 0, len(expIdx))
 	for key := range expIdx {
 		if _, ok := actIdx[key]; ok {
@@ -1481,7 +1529,7 @@ func diffIndexDefinitions(td *TableDiff, expIdx, actIdx map[string]*ir.Index) {
 		d := IndexDiff{Name: indexDisplayName(key, exp)}
 		mismatched := false
 
-		if ec, ac := renderIndexColumns(exp), renderIndexColumns(act); ec != ac {
+		if ec, ac := renderIndexColumns(exp, withHidden), renderIndexColumns(act, withHidden); ec != ac {
 			d.ExpectedColumns, d.ActualColumns = ec, ac
 			mismatched = true
 		}

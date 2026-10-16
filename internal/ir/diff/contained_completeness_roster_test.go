@@ -406,6 +406,25 @@ var indexColumnFieldProbes = map[string]containedFieldProbe{
 			return nil
 		},
 	},
+	"HiddenCollation": {
+		// FUNCTIONAL-CAST-HIDDEN-COLLATION, the same class as Collation: a
+		// MySQL functional key part's hidden-column collation decides which
+		// values count as equal, and the expression text does not.
+		mutate: func(s *ir.Schema) {
+			s.Tables[0].Indexes[0].Columns[0].HiddenCollation = "utf8mb4_bin"
+		},
+		wantInSummary: "index mismatch",
+		wantInDiff: func(d SchemaDiff) error {
+			id, err := oneIndexDiff(d)
+			if err != nil {
+				return err
+			}
+			if !strings.Contains(id.ActualColumns, "COLLATE utf8mb4_bin") {
+				return fmt.Errorf("ActualColumns does not carry the hidden collation: %+v", id)
+			}
+			return nil
+		},
+	},
 }
 
 var indexColumnFieldExempt = map[string]string{

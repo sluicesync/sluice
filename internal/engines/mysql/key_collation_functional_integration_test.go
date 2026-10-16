@@ -526,13 +526,20 @@ func TestRowWriterKeyCollationGuard_FunctionalKeysReReview(t *testing.T) {
 			})
 			t.Run("mysql to mysql, the source's own key, re-copy and a stale respelling", func(t *testing.T) {
 				dsn := cell(t, ci+"UNIQUE KEY fk ((lower(k))))")
+				// The source shape as the MySQL reader records it: the key with
+				// its hidden collation (FUNCTIONAL-CAST-HIDDEN-COLLATION), equal
+				// to the target's.
+				own := kj(myVC)
+				own.Indexes = []*ir.Index{{Name: "fk", Unique: true, Columns: []ir.IndexColumn{
+					{Expression: "lower(k)", ExpressionDialect: "mysql", HiddenCollation: "utf8mb4_0900_ai_ci"},
+				}}}
 				for i := 0; i < 2; i++ {
-					wantRows(t, write(t, flavor.eng, dsn, kj(myVC), row(1, "a@x", 1), row(2, "b", 2)), dsn, "1:614078,2:62")
+					wantRows(t, write(t, flavor.eng, dsn, own, row(1, "a@x", 1), row(2, "b", 2)), dsn, "1:614078,2:62")
 				}
 				// The target holds row 3 'A@y'; the source has since moved it to
 				// row 4 as 'a@y' (a delete the copy did not see): ODKU converges.
-				wantRows(t, write(t, flavor.eng, dsn, kj(myVC), row(3, "A@y", 3)), dsn, "1:614078,2:62,3:414079")
-				err := write(t, flavor.eng, dsn, kj(myVC), row(4, "a@y", 4))
+				wantRows(t, write(t, flavor.eng, dsn, own, row(3, "A@y", 3)), dsn, "1:614078,2:62,3:414079")
+				err := write(t, flavor.eng, dsn, own, row(4, "a@y", 4))
 				if flavor.unknown {
 					// The stated cost: with the hidden column unread the guard
 					// cannot tell the key is the source's, and refuses.

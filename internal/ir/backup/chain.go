@@ -360,6 +360,23 @@ func fingerprintIndex(in *ir.Index) *ir.Index {
 	}
 	out := *in
 	out.ConstraintNamed = false
+	// HiddenCollation (FUNCTIONAL-CAST-HIDDEN-COLLATION) is a re-emission
+	// and guard hint: excluded so the fingerprint stays byte-identical to
+	// what every binary before it hashed (answer 3 of the golden test), in
+	// both directions — an old chain verifies here, and a new manifest
+	// verifies on an older binary that drops the field. The cost is tamper
+	// detection of that one field.
+	for _, c := range in.Columns {
+		if c.HiddenCollation == "" {
+			continue
+		}
+		out.Columns = make([]ir.IndexColumn, len(in.Columns))
+		copy(out.Columns, in.Columns)
+		for i := range out.Columns {
+			out.Columns[i].HiddenCollation = ""
+		}
+		break
+	}
 	return &out
 }
 

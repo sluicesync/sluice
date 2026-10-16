@@ -1799,7 +1799,7 @@ func emitIndexColumnListWithPrefix(cols []ir.IndexColumn, allowPrefix, backslash
 	for i, c := range cols {
 		var entry string
 		if c.Expression != "" {
-			entry = "(" + translateIndexExpr(c, backslashEscapes) + ")"
+			entry = "(" + functionalPartExpr(c, backslashEscapes) + ")"
 		} else {
 			entry = quoteIdent(c.Column)
 			if allowPrefix && c.Length > 0 {
@@ -2336,6 +2336,26 @@ func translateCheckExprText(c *ir.CheckConstraint) string {
 // target).
 func translateIndexExpr(c ir.IndexColumn, backslashEscapes bool) string {
 	return escapeExprLiteralBackslashes(translateIndexExprText(c), backslashEscapes)
+}
+
+// functionalPartExpr is a functional key part's body as the writer emits
+// it: [translateIndexExpr], wrapped as `(expr) COLLATE <it>` when the part
+// carries the collation its source key's hidden column compares under
+// ([ir.IndexColumn.HiddenCollation]; FUNCTIONAL-CAST-HIDDEN-COLLATION). The
+// expression text alone does not decide that collation — a CAST with no
+// CHARACTER SET or a literal takes the creating session's, and a column
+// MODIFY leaves it on the old one — so a key rebuilt from the text compared
+// differently from the source's and merged rows the source kept apart
+// (measured on MySQL 8.4). Pinning it makes the target key compare exactly
+// as the source's. Only a same-dialect part carries one (the MySQL reader
+// is its only producer), and only a collated string does, so the COLLATE is
+// always over a string of that collation's own character set.
+func functionalPartExpr(c ir.IndexColumn, backslashEscapes bool) string {
+	body := translateIndexExpr(c, backslashEscapes)
+	if c.HiddenCollation == "" || c.ExpressionDialect != dialectName {
+		return body
+	}
+	return "(" + body + ") COLLATE " + c.HiddenCollation
 }
 
 func translateIndexExprText(c ir.IndexColumn) string {

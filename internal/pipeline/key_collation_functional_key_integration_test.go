@@ -394,30 +394,55 @@ func TestKeyCollationFunctionalKey_MySQLToMySQLGeneratedApply(t *testing.T) {
 	kcfbGrade(t, "mysql → mysql generated", src, tgt, nil)
 }
 
-// TestKeyCollationFunctionalKey_MySQLToMySQLSessionCollatedCast is fourth
-// review finding 1 end to end (HIGH, silent, measured on MySQL 8.4 and
-// pre-existing in released versions): a CAST's collation is the CREATING
-// session's, while the catalog stores the same text either way. The source
-// key is created from a session whose collation_connection keeps the pair
-// apart; sluice recreates it through its own session, where the CAST compares
-// `utf8mb4_0900_ai_ci` and equates them. The column is `_0900_ai_ci` on both
-// sides, so a guard that inferred the source key from its column ran no
-// check, and the stream's upsert of row 2 replaced row 1 at exit 0. It must
-// now refuse KEY-COLLATION-MERGE with the target unchanged.
+// TestKeyCollationFunctionalKey_MySQLToMySQLHiddenCollation is
+// FUNCTIONAL-CAST-HIDDEN-COLLATION end to end, the class fix (fourth review
+// finding 1, fifth review S1/S2: HIGH, silent, measured on MySQL 8.4,
+// pre-existing in released versions). A MySQL functional key part compares
+// under its hidden column's collation, which the catalog's expression text
+// does not record: a charset-less CAST and a string literal take the
+// creating session's collation_connection, and an ALTER … MODIFY of the
+// column leaves the hidden column on its old collation. sluice rebuilt the
+// key from the text through its own session, compared the pair as one, and
+// the stream's upsert of row 2 replaced row 1 at exit 0.
 //
-// Cells: a `utf8mb4_bin` session ('a'/'A') and go-sql-driver's default
-// `utf8mb4_general_ci` session ('ss'/'ß', apart under general_ci and one key
-// under 0900_ai_ci). The independent expected value is the source's own rows.
-func TestKeyCollationFunctionalKey_MySQLToMySQLSessionCollatedCast(t *testing.T) {
+// The reader now records each part's hidden collation and the writer pins it
+// as `((expr) COLLATE <it>)`, so the cold start's target key compares as the
+// source's and row 2 — held beside row 1 on the source — lands exactly. The
+// stale-target half (a target an older binary built, which the guard must
+// refuse) is pinned at the engine (TestFunctionalKeyHiddenCollation_ClassFix).
+// The independent expected value is the source's own rows.
+func TestKeyCollationFunctionalKey_MySQLToMySQLHiddenCollation(t *testing.T) {
 	mySrc, myRoot, myCleanup := startMySQL(t)
 	defer myCleanup()
+	const ci = "k varchar(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL"
 	for _, c := range []struct {
-		tag, session, seed, collide string
+		tag, name, session, create, alter string
+		seed, collide                     string // row 1's and row 2's (k, f)
 	}{
-		{"kfsb", "utf8mb4_bin", "a", "A"},
-		{"kfsg", "utf8mb4_general_ci", "ss", "ß"},
+		{
+			tag: "kfsb", name: "CAST from a utf8mb4_bin session", session: "utf8mb4_bin",
+			create: "CREATE TABLE kd (id int NOT NULL PRIMARY KEY, " + ci + ", f int, d int, UNIQUE KEY ck ((cast(k as char(10)))))",
+			seed:   "'a', 1", collide: "'A', 2",
+		},
+		{
+			tag: "kfsg", name: "CAST from a utf8mb4_general_ci session", session: "utf8mb4_general_ci",
+			create: "CREATE TABLE kd (id int NOT NULL PRIMARY KEY, " + ci + ", f int, d int, UNIQUE KEY ck ((cast(k as char(10)))))",
+			seed:   "'ss', 1", collide: "'ß', 2",
+		},
+		{
+			tag: "kfs1", name: "S1: the column MODIFYed after the key",
+			create: "CREATE TABLE kd (id int NOT NULL PRIMARY KEY, k varchar(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL, f int, d int, " +
+				"UNIQUE KEY ck ((trim(k))))",
+			alter: "ALTER TABLE kd MODIFY " + ci,
+			seed:  "'e', 1", collide: "'é', 2",
+		},
+		{
+			tag: "kfs2", name: "S2: string literals under an INT column", session: "utf8mb4_bin",
+			create: "CREATE TABLE kd (id int NOT NULL PRIMARY KEY, " + ci + ", f int, d int, UNIQUE KEY ck ((if(f, 'A', 'a'))))",
+			seed:   "'x', 1", collide: "'y', 0",
+		},
 	} {
-		t.Run(c.session, func(t *testing.T) {
+		t.Run(c.name, func(t *testing.T) {
 			twfbDB{engine: "mysql", dsn: myRoot}.exec(t, "CREATE DATABASE "+c.tag+"_s")
 			twfbDB{engine: "mysql", dsn: myRoot}.exec(t, "CREATE DATABASE "+c.tag+"_t")
 			srcDSN, err := buildMySQLDSN(mySrc, c.tag+"_s")
@@ -429,42 +454,35 @@ func TestKeyCollationFunctionalKey_MySQLToMySQLSessionCollatedCast(t *testing.T)
 				t.Fatal(err)
 			}
 			src, tgt := twfbDB{engine: "mysql", dsn: srcDSN}, twfbDB{engine: "mysql", dsn: tgtDSN}
-			// The key is created from a session under c.session.
-			twfbDB{engine: "mysql", dsn: srcDSN + "&collation=" + c.session}.exec(t,
-				"CREATE TABLE kd (id int NOT NULL PRIMARY KEY, k varchar(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL, d int, "+
-					"UNIQUE KEY ck ((cast(k as char(10))))); INSERT INTO kd (id,k,d) VALUES (1,'"+c.seed+"',1)")
-			srcHidden := src.scalar(t, "SELECT collation_name FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = 'kd' AND column_name = 'k'")
-			t.Logf("source column collation %s; key expression %s", srcHidden,
-				src.scalar(t, "SELECT expression FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = 'kd' AND index_name = 'ck'"))
+			sessionDSN := srcDSN
+			if c.session != "" {
+				sessionDSN += "&collation=" + c.session
+			}
+			twfbDB{engine: "mysql", dsn: sessionDSN}.exec(t, c.create)
+			if c.alter != "" {
+				src.exec(t, c.alter)
+			}
+			src.exec(t, "INSERT INTO kd (id,k,f,d) VALUES (1,"+c.seed+",1)")
 			cell := twfbCell{src: src, tgt: tgt, streamID: c.tag}
 			run := startTWFBRun(cell.streamer())
 			if !tgt.waitRow(t, "kd", 1, run, 180*time.Second) {
 				t.Fatalf("the cold start never delivered the seed (%v)", run.stop(t))
 			}
 			cell.waitStreaming(t, run)
+			t.Logf("target key: %s", tgt.scalar(t, "SELECT expression FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = 'kd' AND index_name = 'ck'"))
 			// The source holds both: its own key keeps the pair apart.
-			src.exec(t, "INSERT INTO kd (id,k,d) VALUES (2,'"+c.collide+"',2)")
+			src.exec(t, "INSERT INTO kd (id,k,f,d) VALUES (2,"+c.collide+",2)")
 			if src.scalar(t, "SELECT COUNT(*) FROM kd") != "2" {
 				t.Fatal("the source key did not keep the pair apart; the cell measures nothing")
 			}
-			src.exec(t, "INSERT INTO kd (id,k,d) VALUES (100,'zz',100)")
-			_ = tgt.waitRow(t, "kd", 100, run, 60*time.Second)
+			// No sentinel row: the S2 key has only the two values both rows
+			// already hold. Row 2 itself is waited for.
+			_ = tgt.waitRow(t, "kd", 2, run, 60*time.Second)
 			kcfbWaitConverged(t, src, tgt, run, 20*time.Second)
-			refusal := kfkRefusal(t, run)
-			if refusal == nil {
-				t.Fatalf("nothing refused: the target's rebuilt key equates %q and %q (source %s, target %s)",
-					c.seed, c.collide, kcfbRender(kcfbRows(t, src)), kcfbRender(kcfbRows(t, tgt)))
+			if refusal := kfkRefusal(t, run); refusal != nil {
+				t.Fatalf("refused on a target sluice built to compare as the source: %v", refusal)
 			}
-			if !errors.Is(refusal, ir.ErrKeyCollationMerge) {
-				t.Errorf("refused with %v; want %v", refusal, ir.ErrKeyCollationMerge)
-			}
-			s, g := kcfbRows(t, src), kcfbRows(t, tgt)
-			if g["1"] != s["1"] {
-				t.Errorf("row 1 on the target is %q; the source holds %q (a merge)", g["1"], s["1"])
-			}
-			if _, ok := g["2"]; ok {
-				t.Errorf("row 2 landed beside a refusal: target %s", kcfbRender(g))
-			}
+			kcfbGrade(t, c.name, src, tgt, nil)
 		})
 	}
 }
