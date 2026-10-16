@@ -415,6 +415,23 @@ func TestExpressionColumns(t *testing.T) {
 	}
 }
 
+// TestDecodeCatalogExpression: MySQL's information_schema layer is undone;
+// MariaDB stores none, so its `\'` is the value's own and stays (fourth
+// review finding 2).
+func TestDecodeCatalogExpression(t *testing.T) {
+	const catalog = "concat(`k`,_utf8mb4\\'it\\\\\\'s\\',`j`)"
+	if got := decodeCatalogExpression(FlavorVanilla, catalog); got != "concat(`k`,_utf8mb4'it\\'s',`j`)" {
+		t.Errorf("mysql: %s", got)
+	}
+	const mariadb = "concat(`k`,'it\\'s',`j`)"
+	if got := decodeCatalogExpression(FlavorMariaDB, mariadb); got != mariadb {
+		t.Errorf("mariadb: %s", got)
+	}
+	if got := strings.Join(expressionColumns(decodeCatalogExpression(FlavorMariaDB, mariadb)), "|"); got != "k|j" {
+		t.Errorf("mariadb columns: %q", got)
+	}
+}
+
 // TestExpressionCallsAny finds a call outside literals and identifiers,
 // case-insensitively, and treats an unscannable literal as a possible call.
 func TestExpressionCallsAny(t *testing.T) {
