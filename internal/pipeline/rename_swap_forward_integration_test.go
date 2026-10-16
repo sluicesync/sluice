@@ -565,12 +565,19 @@ func rsfRunDivergedCell(t *testing.T, srv rsfServer, how rsfDivergence, warm boo
 	if srv.dialect == "postgres" {
 		src.exec(t, "SELECT pg_drop_replication_slot('sluice_rsf_"+tag+"')")
 	}
+	stale := cell.persistedPosition(t)
 	s := cell.streamer()
 	s.ResetTargetData = true
 	final := startTWFBRun(s)
 	if !tgt.waitRow(t, "kd", 100, final, 180*time.Second) {
 		t.Fatalf("%s: after --reset-target-data the post-change row never landed (stream: %v)", what, final.stop(t))
 	}
+	// Row 100 alone does not mean the re-copy is done: a MySQL target
+	// copies through four workers partitioned by key hash, each committing
+	// on its own connection, so one worker's rows can be visible before the
+	// others'. The hand-off position is persisted only after every worker
+	// has returned.
+	cell.waitStreamingPast(t, final, stale)
 	rsfAssertConverged(t, src, tgt, what+" (after --reset-target-data)")
 	if err := final.stop(t); err != nil && !errors.Is(err, context.Canceled) {
 		t.Errorf("%s: the re-copied stream stopped with %v", what, err)
@@ -1345,12 +1352,16 @@ func TestRenameSwapForward_MySQLToPostgres_ReorderRemedy(t *testing.T) {
 	}
 	rsfAssertUntouched(t, tgt, before, "mysql→postgres reorder")
 
+	stale := cell.persistedPosition(t)
 	s := cell.streamer()
 	s.ResetTargetData = true
 	final := startTWFBRun(s)
 	if !tgt.waitRow(t, "kd", 100, final, 180*time.Second) {
 		t.Fatalf("after --reset-target-data the post-change row never landed (stream: %v)", final.stop(t))
 	}
+	// Wait for the hand-off, as rsfRunDivergedCell does: row 100 alone does
+	// not prove the re-copy finished.
+	cell.waitStreamingPast(t, final, stale)
 	rsfAssertConverged(t, src, tgt, "mysql→postgres reorder (after --reset-target-data)")
 	if err := final.stop(t); err != nil && !errors.Is(err, context.Canceled) {
 		t.Errorf("the re-copied stream stopped with %v", err)
