@@ -219,6 +219,9 @@ Every backup chain root manifest carries a `FormatVersion` field:
   ceiling instead. Proportional: a full, a segment whose key collations
   the stream established, a not-established *non-key* column, and every
   MySQL, VStream and trigger-CDC segment keep their previous version
+  (through v0.160.4; since v0.161.0 a `postgres-trigger` segment records
+  first-touch schema versions, so this tier can stamp one whose key column
+  has a nondeterministic collation changed after capture)
   (under `REPLICA IDENTITY FULL` every column counts as a key here, so a
   non-key nondeterministic column altered inside the window stamps too —
   a loud refusal on an older binary, never a merge). Only a v0.160.0+
@@ -240,8 +243,8 @@ Every backup chain root manifest carries a `FormatVersion` field:
   *below* 15 that carries the field is refused on read, since no binary
   writes that shape. Proportional: a schema with no MySQL functional key,
   one read through vtgate (which does not serve the hidden column), and
-  every Postgres, SQLite and trigger-CDC backup keep their previous
-  version, and an empty field leaves every older fingerprint unchanged. A
+  every Postgres, SQLite and trigger-CDC backup are not stamped 15, and
+  an empty field leaves every older fingerprint unchanged. A
   chain begun before v0.161.0 stays at its version until a window's schema
   delta swaps in a freshly read schema; a full resuming an encrypted
   attempt written below version 9 records the field as not known rather
