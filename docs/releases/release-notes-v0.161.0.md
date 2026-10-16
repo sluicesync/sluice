@@ -72,6 +72,10 @@
 - **Anyone restoring backups across versions:** restore any chain containing a version-15 manifest with v0.161.0 or later. Older binaries refuse those manifests loudly; chains without one restore on older binaries as before.
 - **Everyone else:** upgrade.
 
+**Corrected 2026-10-16 (found by the site docs review).** Two statements above were wrong.
+- **The `postgres-trigger` remedy cannot converge as written.** The damaged tables hold values the source keeps apart only by case, under a UNIQUE key the MySQL target compares `utf8mb4_0900_ai_ci`, so the target key cannot hold both. A `--restart-from-scratch` or a restore on v0.161.0 therefore refuses `KEY-COLLATION-MERGE` instead of restoring the missing row. Recreate the target key comparing byte for byte (`COLLATE utf8mb4_0900_bin`), as the refusal names, and then re-copy. The same applies to the functional-key remedy: recreate the key the refusal names before re-copying.
+- **`FormatVersion` 15 is not limited to unique keys.** Any collated functional key part, unique or not, on a vanilla-MySQL source table stamps the backup 15. So v0.160.4 and older also refuse a backup whose only functional index is non-unique.
+
 ---
 
 **Install:** `brew install sluicesync/tap/sluice` · `go install sluicesync.dev/sluice/cmd/sluice@v0.161.0` · **Container:** `ghcr.io/sluicesync/sluice:0.161.0`
