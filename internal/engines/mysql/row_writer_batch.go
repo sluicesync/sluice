@@ -379,7 +379,7 @@ func (w *RowWriter) writeBatchedIdempotentConn(ctx context.Context, conn *sql.Co
 		// TestColdCopyReparentRetry_UnsuppliedTargetKeyRefusesOnEveryCore.
 		if err := w.flushWithReparentRetry(ctx, table, len(batch.rows), func(c *sql.Conn, _ bool) error {
 			if _, err := c.ExecContext(ctx, query, args...); err != nil {
-				err = copyKeyCollationMergeRefusal(err, guard, table.Name)
+				err = copyUpsertGuardRefusal(err, guard, table.Name)
 				return fmt.Errorf("mysql: idempotent insert into %q (%d rows): %w", table.Name, len(batch.rows), err)
 			}
 			// Vector B: strict sql_mode errors at the upsert above; under
@@ -450,8 +450,10 @@ func (w *RowWriter) writeBatchedIdempotentConn(ctx context.Context, conn *sql.Co
 // 73: the MySQL 8.0.20+ row alias everywhere except mariadb, which
 // keeps the legacy VALUES() form).
 //
-// guard, when armed, is the table's key-collation guard
-// (row_writer_key_collation.go): its assignment goes FIRST in the update
+// guard, when armed, is the table's upsert guards — the key-collation guard
+// (row_writer_key_collation.go) and/or the conflict-identity guard
+// (unique_key_conflict_guard.go), composed into one assignment by
+// [RowWriter.resolveCopyKeyCollationGuard]: its assignment goes FIRST in the update
 // list — MySQL evaluates the list left to right on the row as updated so
 // far — and replaces the plain assignment of the column it assigns. An
 // unarmed guard renders the statement byte-identical to before.
@@ -493,11 +495,11 @@ func buildBatchUpsert(table *ir.Table, rowCount int, keyCols []string, upsert up
 	}
 	sb.WriteString(upsert.clauseOpen())
 	parts := make([]string, 0, len(nonKey)+1)
-	if guard.plan != nil {
+	if guard.assign != "" {
 		parts = append(parts, guard.assign)
 	}
 	for _, c := range nonKey {
-		if guard.plan != nil && c == guard.hang {
+		if guard.assign != "" && c == guard.hang {
 			continue
 		}
 		parts = append(parts, quoteIdent(c)+" = "+upsert.newRowRef(quoteIdent(c)))

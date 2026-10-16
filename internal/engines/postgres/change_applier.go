@@ -1936,7 +1936,11 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		if err != nil {
 			return false, err
 		}
-		stmt, args, err := buildInsertSQL(schema, v.Table, v.Row, key, colTypes, insShardKeys, guard)
+		identity, err := a.conflictIdentityFor(ctx, schema, v.Table, key)
+		if err != nil {
+			return false, err
+		}
+		stmt, args, err := buildGuardedInsertSQL(schema, v.Table, v.Row, key, colTypes, insShardKeys, guard, identity)
 		if err != nil {
 			return false, fmt.Errorf("postgres: applier: build insert for %s.%s: %w", schema, v.Table, err)
 		}
@@ -1945,7 +1949,7 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		a.noteUnenforcedDeferrable(ctx, schema, v.Table)
 		if _, err := a.txExec(ctx, tx, stmt, a.execDMLArgs(schema, v.Table, args)...); err != nil {
 			return false, fmt.Errorf("postgres: applier: insert into %s.%s: %w", schema, v.Table,
-				applyKeyCollationMergeError(err, guard, schema, v.Table))
+				applyInsertGuardError(err, guard, identity, schema, v.Table))
 		}
 		return false, nil
 
@@ -2965,6 +2969,17 @@ func loadConflictKey(ctx context.Context, tx *sql.Tx, schema, table string) ([]s
 // incoming row — for a guarded DO UPDATE that writes nothing when the keys
 // agree.
 func buildInsertSQL(schema, table string, row ir.Row, key []string, colTypes map[string]*ir.Column, shardKeys []string, guard *pgKeyCollationPlan) (sqlStmt string, args []any, err error) {
+	return buildGuardedInsertSQL(schema, table, row, key, colTypes, shardKeys, guard, nil)
+}
+
+// buildGuardedInsertSQL is [buildInsertSQL] with the conflict-identity guard
+// (unique_key_conflict_guard.go): identity, when non-nil, makes the DO
+// UPDATE run only when the matched row carries the incoming row's identity,
+// checked for every row the key-collation guard's own predicate passed. A table whose
+// columns are all conflict-key columns keeps DO NOTHING when only the
+// identity guard is armed: under a deterministic arbiter a conflict through
+// a key covering every column IS the identical row.
+func buildGuardedInsertSQL(schema, table string, row ir.Row, key []string, colTypes map[string]*ir.Column, shardKeys []string, guard *pgKeyCollationPlan, identity *pgConflictIdentity) (sqlStmt string, args []any, err error) {
 	cols := appliershared.NonGeneratedRowKeys(row, colTypes)
 	args = make([]any, 0, len(cols))
 	colSQL := make([]string, len(cols))
@@ -2985,11 +3000,15 @@ func buildInsertSQL(schema, table string, row ir.Row, key []string, colTypes map
 
 	if len(key) == 0 {
 		guard = nil
+		identity = nil
+	}
+	if identity != nil && len(identity.columns(cols)) == 0 {
+		identity = nil // the row does not supply the primary key: nothing to compare
 	}
 	var sb strings.Builder
 	sb.WriteString("INSERT INTO ")
 	sb.WriteString(tableRef)
-	if guard != nil {
+	if guard != nil || identity != nil {
 		sb.WriteString(" AS " + quoteIdent(keyCollationExistingAlias))
 	}
 	sb.WriteString(" (")
@@ -3030,8 +3049,11 @@ func buildInsertSQL(schema, table string, row ir.Row, key []string, colTypes map
 				parts[i] = fmt.Sprintf("%s = EXCLUDED.%s", quoteIdent(c), quoteIdent(c))
 			}
 			sb.WriteString(strings.Join(parts, ", "))
-			if guard != nil {
-				sb.WriteString(guard.where(false))
+			switch {
+			case guard != nil:
+				sb.WriteString(" WHERE " + guard.predicateAgreeing(identity.wrap(cols, "true")))
+			case identity != nil:
+				sb.WriteString(" WHERE " + identity.wrap(cols, "true"))
 			}
 		case guard != nil:
 			// All columns are key columns, and the key is guarded: a
@@ -3039,7 +3061,7 @@ func buildInsertSQL(schema, table string, row ir.Row, key []string, colTypes map
 			// and raises when they do not.
 			k0 := quoteIdent(key[0])
 			sb.WriteString(" DO UPDATE SET " + k0 + " = " + quoteIdent(keyCollationExistingAlias) + "." + k0)
-			sb.WriteString(guard.where(true))
+			sb.WriteString(" WHERE " + guard.predicateAgreeing(identity.wrap(cols, "false")))
 		default:
 			// All columns are key columns — nothing to update on conflict.
 			// DO NOTHING absorbs the conflict silently.

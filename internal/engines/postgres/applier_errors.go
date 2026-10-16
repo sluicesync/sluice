@@ -87,6 +87,12 @@ func classifyApplierError(err error) error {
 		return &ir.KeyCollationMergeError{Cause: err}
 	}
 
+	// The conflict-identity guard's raise (unique_key_conflict_guard.go), the
+	// same way.
+	if isUniqueKeyConflictRaise(err) {
+		return &ir.UniqueKeyConflictError{Cause: err}
+	}
+
 	// Driver-level "bad connection" / EOF — auto-reconnect on retry.
 	//
 	// context.DeadlineExceeded surfaces when a per-exec timeout

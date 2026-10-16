@@ -397,6 +397,21 @@ func (p *keyCollationPlan) render(schema, table string, cols []string, upsert up
 // referenced through it. The copy writer inserts into an unqualified table
 // name on its own database, so it passes just the table.
 func (p *keyCollationPlan) renderFor(tableRef string, cols []string, upsert upsertSpelling) (assign, hang string, ok bool) {
+	rhs, hang, ok := p.renderValue(tableRef, cols, upsert, nil)
+	if !ok {
+		return "", "", false
+	}
+	return quoteIdent(hang) + " = " + rhs, hang, true
+}
+
+// renderValue is [keyCollationPlan.renderFor]'s right-hand side alone — the
+// guarded value of the hang column. pass, when non-nil, renders the value
+// the assignment takes when the keys are NOT a merge (nil: the hang
+// column's incoming value), so the conflict-identity guard
+// (unique_key_conflict_guard.go) runs only for a row this guard passed: a
+// key the target's collation equates is reported as the collation merge it
+// is, not as a dropped unique key.
+func (p *keyCollationPlan) renderValue(tableRef string, cols []string, upsert upsertSpelling, pass func(hang string) string) (rhs, hang string, ok bool) {
 	// Case-insensitively, as MySQL names columns: the catalog spells a key's
 	// columns as the target does, the insert as the source does.
 	inCols := make(map[string]bool, len(cols))
@@ -499,20 +514,7 @@ func (p *keyCollationPlan) renderFor(tableRef string, cols []string, upsert upse
 		// collation (stricter than a prefix match, so never a false "same").
 		okExpr = "(" + all(p.pk, nil, nil, srcPart) + " OR " + okExpr + ")"
 	}
-	hang = cols[0]
-	pkSet := make(map[string]bool, len(p.pk))
-	for _, c := range p.pk {
-		pkSet[c] = true
-	}
-	if len(p.pk) > 0 {
-		hang = p.pk[0]
-		for _, c := range cols {
-			if !pkSet[c] {
-				hang = c
-				break
-			}
-		}
-	}
+	hang = guardHangColumn(cols, p.pk)
 	// The raise sits in the CONDITION of an inner IF whose two arms are both
 	// the hang column's incoming value, so the assignment's type is the
 	// column's own and no value is converted (see the package comment's
@@ -523,26 +525,32 @@ func (p *keyCollationPlan) renderFor(tableRef string, cols []string, upsert upse
 	}
 	raise := "18446744073709551615 + OCTET_LENGTH(CONCAT('" + keyCollationMergeMarker + "', " + incoming(marker) + "))"
 	newHang := incoming(hang)
-	return quoteIdent(hang) + " = IF(" + okExpr + ", " + newHang + ", IF((" + raise + ") = 0, " + newHang + ", " + newHang + "))", hang, true
+	passValue := newHang
+	if pass != nil {
+		passValue = pass(hang)
+	}
+	return "IF(" + okExpr + ", " + passValue + ", IF((" + raise + ") = 0, " + newHang + ", " + newHang + "))", hang, true
 }
 
-// keyCollationGuardEntry caches one table's plan against the source shape it
-// was computed from.
+// keyCollationGuardEntry caches one table's upsert guards against the source
+// shape they were computed from.
 type keyCollationGuardEntry struct {
 	source *ir.Table
-	plan   *keyCollationPlan
+	guard  *applyUpsertGuard
 }
 
-// keyCollationPlanFor returns the guard plan for a write into schema.table
-// (routed) of a change from srcSchema.table, or nil when nothing is armed.
-func (a *ChangeApplier) keyCollationPlanFor(ctx context.Context, q queryRower, srcSchema, schema, table string, pk []string, colTypes map[string]*ir.Column) (*keyCollationPlan, error) {
+// upsertGuardFor returns the upsert guards for a write into schema.table
+// (routed) of a change from srcSchema.table — the key-collation guard and
+// the conflict-identity guard (unique_key_conflict_guard.go), both read off
+// the one unique-key catalog read — or nil when neither is armed.
+func (a *ChangeApplier) upsertGuardFor(ctx context.Context, q queryRower, srcSchema, schema, table string, pk []string, colTypes map[string]*ir.Column) (*applyUpsertGuard, error) {
 	source := a.guardSourceShape(srcSchema, table)
 	qn := qualifiedName(schema, table)
 	a.cacheMu.RLock()
 	e, hit := a.keyCollationGuardCache[qn]
 	a.cacheMu.RUnlock()
 	if hit && e.source == source {
-		return e.plan, nil
+		return e.guard, nil
 	}
 	compareAs := a.flavor.keyGuardCollations()
 	// The unique keys beyond the primary key (one read per table and source
@@ -569,9 +577,10 @@ func (a *ChangeApplier) keyCollationPlanFor(ctx context.Context, q queryRower, s
 	if a.keyCollationGuardCache == nil {
 		a.keyCollationGuardCache = map[string]keyCollationGuardEntry{}
 	}
-	a.keyCollationGuardCache[qn] = keyCollationGuardEntry{source: source, plan: plan}
+	guard := newApplyUpsertGuard(plan, keys)
+	a.keyCollationGuardCache[qn] = keyCollationGuardEntry{source: source, guard: guard}
 	a.cacheMu.Unlock()
-	return plan, nil
+	return guard, nil
 }
 
 // queryRower is the read surface the guard's metadata lookups need (a

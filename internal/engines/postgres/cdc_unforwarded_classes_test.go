@@ -36,6 +36,9 @@ func gc2Base() *pgRelationFacts {
 			2: {name: "x", typ: "integer"},
 			3: {name: "tenant", typ: "text", notNull: true, def: "'a'::text"},
 		},
+		uniqueIndexes: map[string]pgConstraintFact{
+			"x_uidx": {kind: "i", compare: "unique index key=2 option=0 nulls_not_distinct=false pred= exprs=", display: "CREATE UNIQUE INDEX x_uidx ON public.t USING btree (x)", attnums: []int16{2}},
+		},
 	}
 }
 
@@ -52,6 +55,10 @@ func cloneFacts(f *pgRelationFacts) *pgRelationFacts {
 	out.columns = map[int16]pgColumnFact{}
 	for k, v := range f.columns {
 		out.columns[k] = v
+	}
+	out.uniqueIndexes = map[string]pgConstraintFact{}
+	for k, v := range f.uniqueIndexes {
+		out.uniqueIndexes[k] = v
 	}
 	return &out
 }
@@ -330,5 +337,63 @@ func TestUnforwardedBaseline_PassesOnWhatItWasHandedWhenNeverStarted(t *testing.
 	got, ok := middle.UnforwardedBaseline().(pgUnforwardedBaseline)
 	if !ok || got[16400] == nil {
 		t.Fatalf("a reader that was handed a baseline and never started returned %v; want the handed baseline", middle.UnforwardedBaseline())
+	}
+}
+
+// TestDiffRelationFacts_PlainUniqueIndex pins SOURCE-DROPPED-UNIQUE-KEY-MERGE's
+// source-side half: a plain unique index (no constraint owns it) refuses on
+// DROP, CREATE and a change of its structure, exactly as a UNIQUE constraint
+// does; a rename of its column is no change (the comparison is attnum-based),
+// a retype explains a structural change, and a DROP that went with its column
+// is the target's own DROP COLUMN's cascade.
+func TestDiffRelationFacts_PlainUniqueIndex(t *testing.T) {
+	refuse := []struct {
+		name   string
+		mutate func(*pgRelationFacts)
+		want   string
+	}{
+		{"drop", func(f *pgRelationFacts) { delete(f.uniqueIndexes, "x_uidx") }, `DROP INDEX "x_uidx" (was CREATE UNIQUE INDEX x_uidx`},
+		{"create", func(f *pgRelationFacts) {
+			f.uniqueIndexes["tenant_uidx"] = pgConstraintFact{kind: "i", compare: "unique index key=3", display: "CREATE UNIQUE INDEX tenant_uidx ON public.t USING btree (tenant)", attnums: []int16{3}}
+		}, `CREATE UNIQUE INDEX "tenant_uidx"`},
+		{"made partial", func(f *pgRelationFacts) {
+			u := f.uniqueIndexes["x_uidx"]
+			u.compare += " pred={OPEXPR}"
+			f.uniqueIndexes["x_uidx"] = u
+		}, `UNIQUE INDEX "x_uidx" changed`},
+	}
+	for _, tc := range refuse {
+		cur := cloneFacts(gc2Base())
+		tc.mutate(cur)
+		deltas := diffRelationFacts(gc2Base(), cur)
+		if len(deltas) != 1 || !strings.Contains(deltas[0], tc.want) {
+			t.Errorf("%s: deltas %q; want one naming %q", tc.name, deltas, tc.want)
+		}
+	}
+
+	renamed := cloneFacts(gc2Base())
+	renamed.columns[2] = pgColumnFact{name: "x2", typ: "integer"}
+	u := renamed.uniqueIndexes["x_uidx"]
+	u.display = "CREATE UNIQUE INDEX x_uidx ON public.t USING btree (x2)"
+	renamed.uniqueIndexes["x_uidx"] = u
+	if d := diffRelationFacts(gc2Base(), renamed); len(d) != 0 {
+		t.Errorf("a column rename refused through its unique index: %q", d)
+	}
+
+	retyped := cloneFacts(gc2Base())
+	retyped.columns[2] = pgColumnFact{name: "x", typ: "bigint"}
+	u = retyped.uniqueIndexes["x_uidx"]
+	u.compare += " (rebuilt)"
+	retyped.uniqueIndexes["x_uidx"] = u
+	if d := diffRelationFacts(gc2Base(), retyped); len(d) != 0 {
+		t.Errorf("a key column's retype refused through its unique index: %q", d)
+	}
+
+	dropped := cloneFacts(gc2Base())
+	delete(dropped.columns, 2)
+	delete(dropped.uniqueIndexes, "x_uidx")
+	delete(dropped.constraints, "x_pos")
+	if d := diffRelationFacts(gc2Base(), dropped); len(d) != 0 {
+		t.Errorf("a unique index dropped with its column refused: %q", d)
 	}
 }

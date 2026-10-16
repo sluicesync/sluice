@@ -96,6 +96,12 @@ import (
 //     on the forward path) until the operator applies the change on the
 //     target. Its catalog-read failure is NOT the marker and stays
 //     restartable.
+//   - UNIQUE-KEY-CONFLICT-OTHER-ROW (MySQL and Postgres targets, codeless;
+//     SOURCE-DROPPED-UNIQUE-KEY-MERGE): listed. An upsert matched a different
+//     row through a unique key the target has; the row sits after the
+//     persisted position, the target key is unchanged by a restart, so the
+//     re-delivered row matches the same row and refuses again until the
+//     operator drops the key or re-copies.
 //   - DEFERRED-KEY-CHECK-FAILED-AT-COMMIT (Postgres target, codeless): NOT
 //     listed. It is the COMMIT of a target transaction that a deferrable
 //     constraint's re-check refused, and one of its causes is a source
@@ -131,6 +137,7 @@ var refusalsARestartRepeats = []error{
 	ir.ErrDeferredSchemaChange,
 	ir.ErrColumnIdentityChanged,
 	ir.ErrKeyCollationMerge,
+	ir.ErrUniqueKeyConflictOtherRow,
 }
 
 // refusalARestartRepeats returns the listed sentinel err carries, or nil.

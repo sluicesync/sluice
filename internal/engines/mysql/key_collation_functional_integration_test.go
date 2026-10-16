@@ -620,8 +620,15 @@ func TestRowWriterKeyCollationGuard_FunctionalKeysReReview(t *testing.T) {
 					return
 				}
 				// Matched: lower('e') and lower('f') differ, so the long key does
-				// not match and the upsert proceeds through uk.
-				wantRows(t, err, dsn, "1:66")
+				// not match and the upsert proceeds through uk — onto row 1, a
+				// different row (id 2 against id 1). That used to overwrite row
+				// 1's k ("1:66"); the conflict-identity guard
+				// (SOURCE-DROPPED-UNIQUE-KEY-MERGE) now refuses it, since this
+				// copy's source table declares neither target key.
+				if !errors.Is(err, ir.ErrUniqueKeyConflictOtherRow) {
+					t.Fatalf("err = %v; want %s", err, ir.ErrUniqueKeyConflictOtherRow)
+				}
+				wantRows(t, nil, dsn, "1:65")
 			})
 		})
 	}

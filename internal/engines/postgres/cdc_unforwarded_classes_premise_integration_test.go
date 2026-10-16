@@ -120,4 +120,18 @@ func TestRelationFacts_DiffPremisesOnARealServer(t *testing.T) {
 	step("drop of an EXCLUDE with an expression element",
 		`ALTER TABLE prem DROP CONSTRAINT prem_no_overlap`,
 		`DROP CONSTRAINT "prem_no_overlap"`)
+
+	// Plain unique indexes (SOURCE-DROPPED-UNIQUE-KEY-MERGE): the comparison
+	// is structural and attnum-based, so a rename or a retype of the key
+	// column is no change; a DROP, a CREATE and a structural change are.
+	step("create unique index", `CREATE UNIQUE INDEX prem_tenant_uidx ON prem (owner)`, `CREATE UNIQUE INDEX "prem_tenant_uidx"`)
+	step("rename under a plain unique index", `ALTER TABLE prem RENAME COLUMN owner TO tenant2`, "")
+	step("retype alone under a plain unique index", `ALTER TABLE prem ALTER COLUMN tenant2 TYPE varchar(100)`, "")
+	step("plain unique index made NULLS NOT DISTINCT",
+		`DROP INDEX prem_tenant_uidx; CREATE UNIQUE INDEX prem_tenant_uidx ON prem (tenant2) NULLS NOT DISTINCT`,
+		`UNIQUE INDEX "prem_tenant_uidx" changed`)
+	step("drop unique index", `DROP INDEX prem_tenant_uidx`, `DROP INDEX "prem_tenant_uidx"`)
+	step("a constraint-owned unique index is not read twice",
+		`ALTER TABLE prem ADD CONSTRAINT prem_amt2_uq UNIQUE (amt2)`, `ADD CONSTRAINT "prem_amt2_uq"`)
+	step("a non-unique index is not compared", `CREATE INDEX prem_amt2_idx ON prem (amt2)`, "")
 }

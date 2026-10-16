@@ -1688,7 +1688,7 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		if err != nil {
 			return false, fmt.Errorf("mysql: applier: column types for %s.%s: %w", schema, v.Table, err)
 		}
-		guard, err := a.keyCollationPlanFor(ctx, tx, v.Schema, schema, v.Table, pk, colTypes)
+		guard, err := a.upsertGuardFor(ctx, tx, v.Schema, schema, v.Table, pk, colTypes)
 		if err != nil {
 			return false, err
 		}
@@ -1697,7 +1697,7 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 			return false, fmt.Errorf("mysql: applier: build insert for %s.%s: %w", schema, v.Table, err)
 		}
 		if _, err := a.txExec(ctx, tx, stmt, args...); err != nil {
-			err = keyCollationMergeRefusal(err, guard, schema, v.Table)
+			err = upsertGuardRefusal(err, guard, schema, v.Table)
 			return false, fmt.Errorf("mysql: applier: insert into %s.%s: %w", schema, v.Table, err)
 		}
 		return false, a.reportApplyClampWarnings(ctx, tx, schema, v.Table)
@@ -2387,7 +2387,7 @@ func loadPrimaryKey(ctx context.Context, tx *sql.Tx, schema, table string) ([]st
 // exists so a future error-producing value rule surfaces loudly on
 // this path without another signature change. Same on the
 // buildUpdateSQL / buildDeleteSQL / clause-builder siblings.
-func buildInsertSQL(schema, table string, row ir.Row, pk []string, colTypes map[string]*ir.Column, upsert upsertSpelling, guard *keyCollationPlan) (sqlStmt string, args []any, err error) {
+func buildInsertSQL(schema, table string, row ir.Row, pk []string, colTypes map[string]*ir.Column, upsert upsertSpelling, guard *applyUpsertGuard) (sqlStmt string, args []any, err error) {
 	return buildMultiRowInsertSQL(schema, table, []ir.Row{row}, pk, colTypes, upsert, guard)
 }
 

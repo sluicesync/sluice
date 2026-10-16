@@ -109,11 +109,21 @@ import (
 //     DROP+ADD.
 //   - `backup incremental` opens a fresh reader every run, so a change
 //     between two incrementals is always in the next one's baseline.
-//   - Plain (non-constraint) indexes are deliberately NOT compared: index
-//     DDL is the documented not-forwarded tradeoff for this lane
+//   - Plain NON-UNIQUE indexes are deliberately NOT compared: index DDL is
+//     the documented not-forwarded tradeoff for this lane
 //     (docs/production-readiness.md), it never alters what a row may
 //     contain, and refusing on every source-side CREATE INDEX would end
-//     streams on routine tuning.
+//     streams on routine tuning. A UNIQUE index is different, and IS
+//     compared whether or not a constraint owns it
+//     (SOURCE-DROPPED-UNIQUE-KEY-MERGE): it decides which rows may coexist,
+//     and a target that kept one the source dropped turned the source's
+//     next duplicate into an upsert onto the row that held the key — a
+//     merge at exit 0 on a MySQL target, or on a Postgres target whose
+//     ON CONFLICT key it was. Both directions refuse, as for a UNIQUE
+//     constraint: a CREATE UNIQUE INDEX the target lacks leaves it weaker
+//     than the source. Residual, stated: a retype of a column read only
+//     inside a unique index's EXPRESSION changes the expression tree
+//     without touching a key attnum, and refuses (loud, a false refusal).
 
 // unforwardedChangeMarker is the grep-stable token every refusal from this
 // door carries.
@@ -128,6 +138,11 @@ type pgRelationFacts struct {
 	constraints  map[string]pgConstraintFact
 	policies     map[string]pgPolicyFact
 	columns      map[int16]pgColumnFact
+	// uniqueIndexes is every valid UNIQUE index no PRIMARY KEY, UNIQUE or
+	// EXCLUDE constraint owns (a plain `CREATE UNIQUE INDEX`), keyed by index
+	// name, kind "i" (SOURCE-DROPPED-UNIQUE-KEY-MERGE). The constraint-owned
+	// ones are in constraints already.
+	uniqueIndexes map[string]pgConstraintFact
 }
 
 // pgConstraintFact is one pg_constraint row. compare is what the diff
@@ -176,9 +191,10 @@ func readRelationFacts(ctx context.Context, db *sql.DB, relid uint32) (map[uint3
 		WHERE `+relFilter, relid, func(rows *sql.Rows) error {
 		var oid uint32
 		f := &pgRelationFacts{
-			constraints: map[string]pgConstraintFact{},
-			policies:    map[string]pgPolicyFact{},
-			columns:     map[int16]pgColumnFact{},
+			constraints:   map[string]pgConstraintFact{},
+			policies:      map[string]pgPolicyFact{},
+			columns:       map[int16]pgColumnFact{},
+			uniqueIndexes: map[string]pgConstraintFact{},
 		}
 		if err := rows.Scan(&oid, &f.schema, &f.name, &f.rlsEnabled, &f.rlsForced); err != nil {
 			return err
@@ -242,6 +258,58 @@ func readRelationFacts(ctx context.Context, db *sql.DB, relid uint32) (map[uint3
 			compare = "check " + nodeTree
 		}
 		f.constraints[name] = pgConstraintFact{kind: kind, compare: compare, display: def, attnums: parseAttnums(conkey)}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// Plain UNIQUE indexes (SOURCE-DROPPED-UNIQUE-KEY-MERGE). A source DROP
+	// INDEX on one left the target's copy of it in place, and the target then
+	// upserted a later source row duplicating the dropped key onto the row
+	// that held it. Compared on the index's structure — key attnums, per-
+	// column options, NULLS NOT DISTINCT, and the predicate and expression
+	// node trees with parse positions stripped — never on pg_get_indexdef,
+	// whose text names the table and so would change on a table rename.
+	// Operator class and collation are not compared: a retype or a column
+	// collation change (another class, or not compared at all) rebuilds them.
+	// An index a constraint owns is skipped (it is in constraints), and so is
+	// an index not yet valid (a CREATE UNIQUE INDEX CONCURRENTLY in flight,
+	// or one that failed): its validation re-sends the relation, and it is
+	// compared from then on.
+	err = eachCatalogRow(ctx, db, "unique indexes", `
+		SELECT c.oid, ic.relname,
+		       pg_catalog.pg_get_indexdef(ix.indexrelid),
+		       pg_catalog.array_to_string(ix.indkey::int2[], ','),
+		       pg_catalog.array_to_string(ix.indoption::int2[], ','),
+		       COALESCE(pg_catalog.to_jsonb(ix)->>'indnullsnotdistinct', ''),
+		       COALESCE(pg_catalog.regexp_replace(ix.indpred::text, ':location -?[0-9]+', '', 'g'), ''),
+		       COALESCE(pg_catalog.regexp_replace(ix.indexprs::text, ':location -?[0-9]+', '', 'g'), '')
+		FROM   pg_index ix
+		JOIN   pg_class ic ON ic.oid = ix.indexrelid
+		JOIN   pg_class c ON c.oid = ix.indrelid
+		JOIN   pg_namespace n ON n.oid = c.relnamespace
+		WHERE  ix.indisunique AND NOT ix.indisprimary AND ix.indisvalid
+		  AND  NOT EXISTS (SELECT 1 FROM pg_constraint con
+		                   WHERE con.conindid = ix.indexrelid AND con.conrelid = ix.indrelid
+		                     AND con.contype IN ('p', 'u', 'x'))
+		  AND `+relFilter, relid, func(rows *sql.Rows) error {
+		var (
+			oid                                 uint32
+			name, def, indkey, indoption, nulls string
+			pred, exprs                         string
+		)
+		if err := rows.Scan(&oid, &name, &def, &indkey, &indoption, &nulls, &pred, &exprs); err != nil {
+			return err
+		}
+		if f := out[oid]; f != nil {
+			f.uniqueIndexes[name] = pgConstraintFact{
+				kind:    "i",
+				compare: fmt.Sprintf("unique index key=%s option=%s nulls_not_distinct=%s pred=%s exprs=%s", indkey, indoption, nulls, pred, exprs),
+				display: def,
+				attnums: parseAttnums(indkey),
+			}
+		}
 		return nil
 	})
 	if err != nil {
@@ -444,6 +512,32 @@ func diffRelationFacts(prior, cur *pgRelationFacts) []string {
 			continue
 		}
 		deltas = append(deltas, fmt.Sprintf("DROP CONSTRAINT %q (was %s)", name, pc.display))
+	}
+
+	// Plain UNIQUE indexes: the same rules as a constraint, with a rename of a
+	// key column explaining nothing (the comparison is attnum-based) and a
+	// retype of a key column explaining a change (its rebuild can alter the
+	// expression tree). A DROP whose column is gone is the target's own DROP
+	// COLUMN's cascade.
+	for _, name := range sortedFactKeys(cur.uniqueIndexes) {
+		cc := cur.uniqueIndexes[name]
+		pc, ok := prior.uniqueIndexes[name]
+		switch {
+		case !ok:
+			deltas = append(deltas, fmt.Sprintf("CREATE UNIQUE INDEX %q (%s)", name, cc.display))
+		case pc.compare != cc.compare && !touches(cc.attnums, retypedOnly):
+			deltas = append(deltas, fmt.Sprintf("UNIQUE INDEX %q changed: %s -> %s", name, pc.display, cc.display))
+		}
+	}
+	for _, name := range sortedFactKeys(prior.uniqueIndexes) {
+		if _, ok := cur.uniqueIndexes[name]; ok {
+			continue
+		}
+		pc := prior.uniqueIndexes[name]
+		if lostColumn(pc.attnums) {
+			continue
+		}
+		deltas = append(deltas, fmt.Sprintf("DROP INDEX %q (was %s)", name, pc.display))
 	}
 
 	if prior.rlsEnabled != cur.rlsEnabled {

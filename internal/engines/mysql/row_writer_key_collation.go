@@ -58,13 +58,20 @@ import (
 // ([RowWriter.replayArmedBatchAsGuardedUpsert]).
 const keyCollationReplayAmbiguousMarker = "KEY-COLLATION-REPLAY-AMBIGUOUS"
 
-// copyKeyCollationGuard is one table's guard, rendered once: the update
-// list's guarded first assignment and the column it assigns. The zero value
-// (nil plan) is an unarmed table and renders byte-identical SQL to before.
+// copyKeyCollationGuard is one table's upsert guards, rendered once: the
+// update list's guarded first assignment and the column it assigns. plan is
+// the key-collation guard (nil when no column is armed); undeclared lists
+// the target's unique keys the copy's source table does not declare, which
+// arm the conflict-identity guard (unique_key_conflict_guard.go). The zero
+// value is an unarmed table and renders byte-identical SQL to before.
 type copyKeyCollationGuard struct {
 	plan         *keyCollationPlan
 	schema       string
 	assign, hang string
+	// undeclared renders each such key as "name (a, b)"; undeclaredNames
+	// parallels it with the bare index names, for the remedy's DROP INDEX.
+	undeclared      []string
+	undeclaredNames []string
 }
 
 // copyKeyCollationGuardEntry caches a table's guard against the source shape
@@ -127,7 +134,8 @@ func (w *RowWriter) resolveCopyKeyCollationGuard(ctx context.Context, q queryRow
 		return copyKeyCollationGuard{}, keyCollationFunctionalUnsupported(qualifiedName(w.schema, table.Name), keys.unresolved)
 	}
 	plan := planCopyKeyCollationGuard(table, colTypes, keys, compareAs)
-	if plan == nil {
+	undeclared, undeclaredNames := undeclaredUniqueKeys(table, keys)
+	if plan == nil && len(undeclared) == 0 {
 		return copyKeyCollationGuard{}, nil
 	}
 	// Armed: the database's name for the messages.
@@ -138,15 +146,27 @@ func (w *RowWriter) resolveCopyKeyCollationGuard(ctx context.Context, q queryRow
 		}
 	}
 	qn := qualifiedName(schema, table.Name)
-	if err := checkKeyCollationsExpressible(ctx, q, qn, plan); err != nil {
-		return copyKeyCollationGuard{}, err
-	}
 	cols := nonGeneratedColumns(table.Columns)
 	names := make([]string, len(cols))
 	for i, c := range cols {
 		names[i] = c.Name
 	}
-	assign, hang, ok := plan.renderFor(quoteIdent(table.Name), names, w.upsert)
+	if plan != nil {
+		if err := checkKeyCollationsExpressible(ctx, q, qn, plan); err != nil {
+			return copyKeyCollationGuard{}, err
+		}
+	}
+	// The copy's identity is the key it upserts by — the source's primary
+	// key, else the non-null unique key it chose (Bug 125) — read off the
+	// source shape this copy runs from, so unlike the CDC applier's boundary
+	// shapes it is current. Its hang column is a non-key column of that key,
+	// matching the SET list [buildBatchUpsert] renders.
+	keyCols, _ := effectiveUpsertKeyColumns(table)
+	var identity []string
+	if len(undeclared) > 0 {
+		identity = conflictIdentityColumns(keyCols, names, uniqueKeyColumnSets(keys))
+	}
+	assign, hang, ok := renderUpsertGuard(quoteIdent(table.Name), names, keyCols, w.upsert, identity, plan)
 	if !ok {
 		need, _ := keyCollationNeeds(plan)
 		return copyKeyCollationGuard{}, &terminalMySQLError{err: fmt.Errorf("%w: %s: mysql: copy into %s: a key column "+
@@ -155,7 +175,10 @@ func (w *RowWriter) resolveCopyKeyCollationGuard(ctx context.Context, q queryRow
 			"before any row of the table is written; give the target's key column(s) %s, or exclude the table",
 			ir.ErrKeyCollationMerge, keyCollationGuardUnsupportedMarker, qn, need)}
 	}
-	return copyKeyCollationGuard{plan: plan, schema: schema, assign: assign, hang: hang}, nil
+	return copyKeyCollationGuard{
+		plan: plan, schema: schema, assign: assign, hang: hang,
+		undeclared: undeclared, undeclaredNames: undeclaredNames,
+	}, nil
 }
 
 // replayArmedBatchAsGuardedUpsert is the batched core's half of the guard.
@@ -197,7 +220,7 @@ func (w *RowWriter) replayArmedBatchAsGuardedUpsert(ctx context.Context, c *sql.
 		return true, w.refuseAmbiguousReplay(ctx, c, table)
 	}
 	if _, err := c.ExecContext(ctx, buildBatchUpsert(table, rowCount, keyCols, w.upsert, guard), args...); err != nil {
-		return true, copyKeyCollationMergeRefusal(err, guard, table.Name)
+		return true, copyUpsertGuardRefusal(err, guard, table.Name)
 	}
 	return true, nil
 }
@@ -273,6 +296,10 @@ type targetUniqueKeys struct {
 	uniqueSubs [][]int
 	uniqueFns  [][]*functionalKeyPart
 	unresolved []*functionalKeyPart
+	// uniqueNames parallels uniques: each key's index name, for the
+	// UNIQUE-KEY-CONFLICT-OTHER-ROW remedy and the copy writer's
+	// declared-by-the-source test (unique_key_conflict_guard.go).
+	uniqueNames []string
 }
 
 // uniqueKeyColumns reads the target's primary key and other unique keys,
@@ -340,6 +367,7 @@ func uniqueKeyColumns(ctx context.Context, q queryRower, flavor Flavor, schema, 
 			out.uniques = append(out.uniques, nil)
 			out.uniqueSubs = append(out.uniqueSubs, nil)
 			out.uniqueFns = append(out.uniqueFns, nil)
+			out.uniqueNames = append(out.uniqueNames, idx)
 			last = idx
 		}
 		i := len(out.uniques) - 1

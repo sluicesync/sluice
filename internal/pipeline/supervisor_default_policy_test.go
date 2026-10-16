@@ -259,6 +259,11 @@ func TestSupervisor_RefusalsARestartRepeatsAreNotRestarted(t *testing.T) {
 		"KEY-COLLATION-MERGE": fmt.Errorf("pipeline: apply: %w", &ir.KeyCollationMergeError{
 			Schema: "public", Table: "t", Remedy: "apply the collation change on the target", Cause: terminalTestErr{"guard raised"},
 		}),
+		// The real refusal type both appliers return when the conflict-identity
+		// guard raises (engines/{mysql,postgres}/unique_key_conflict_guard.go).
+		"UNIQUE-KEY-CONFLICT-OTHER-ROW": fmt.Errorf("pipeline: apply: %w", &ir.UniqueKeyConflictError{
+			Schema: "public", Table: "t", Keys: "kd_k (k)", Cause: terminalTestErr{"guard raised"},
+		}),
 	}
 
 	if len(cases) != len(refusalsARestartRepeats) {

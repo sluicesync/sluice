@@ -189,6 +189,18 @@ func (p *pgKeyCollationPlan) where(allKey bool) string {
 // statement whose WHERE carries another predicate too (the copy writer's
 // Neki shard-key guard).
 func (p *pgKeyCollationPlan) predicate(allKey bool) string {
+	agree := "true"
+	if allKey {
+		agree = "false"
+	}
+	return p.predicateAgreeing(agree)
+}
+
+// predicateAgreeing is [pgKeyCollationPlan.predicate] with agree as the value
+// when the keys are equal under the source's collation — the conflict-identity
+// guard's own check (unique_key_conflict_guard.go), so it runs only for a row
+// this guard passed and a collation merge is reported as one.
+func (p *pgKeyCollationPlan) predicateAgreeing(agree string) string {
 	cols := make([]string, 0, len(p.compare))
 	for c := range p.compare {
 		cols = append(cols, c)
@@ -199,10 +211,6 @@ func (p *pgKeyCollationPlan) predicate(allKey bool) string {
 		coll := quoteIdent(p.compare[c])
 		eq[i] = quoteIdent(keyCollationExistingAlias) + "." + quoteIdent(c) + " COLLATE " + coll +
 			" IS NOT DISTINCT FROM EXCLUDED." + quoteIdent(c) + " COLLATE " + coll
-	}
-	agree := "true"
-	if allKey {
-		agree = "false"
 	}
 	raise := "(('" + keyCollationMergeMarker + "' || pg_catalog.left(EXCLUDED." + quoteIdent(p.marker) + "::text, 0))::int IS NULL)"
 	return "CASE WHEN " + strings.Join(eq, " AND ") + " THEN " + agree + " ELSE " + raise + " END"

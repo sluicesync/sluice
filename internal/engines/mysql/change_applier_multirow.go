@@ -144,10 +144,11 @@ type insertRun struct {
 	rows     []ir.Row
 	args     int
 	bytes    int64
-	// guard is the table's key-collation backstop, nil when nothing is armed
-	// (key_collation_guard.go). One per run: a run holds one table, and the
+	// guard is the table's upsert guards (the key-collation backstop,
+	// key_collation_guard.go, and the conflict-identity guard,
+	// unique_key_conflict_guard.go), nil when nothing is armed. One per run: a run holds one table, and the
 	// plan changes only at a schema boundary, which flushes the run first.
-	guard *keyCollationPlan
+	guard *applyUpsertGuard
 }
 
 func (r *insertRun) empty() bool { return len(r.rows) == 0 }
@@ -308,7 +309,7 @@ func (b *mysqlBatchTx) dispatchInsert(ctx context.Context, streamID string, c ir
 	if err != nil {
 		return false, fmt.Errorf("mysql: applier: column types for %s.%s: %w", schema, ins.Table, err)
 	}
-	guard, err := b.a.keyCollationPlanFor(ctx, b.tx, ins.Schema, schema, ins.Table, pk, colTypes)
+	guard, err := b.a.upsertGuardFor(ctx, b.tx, ins.Schema, schema, ins.Table, pk, colTypes)
 	if err != nil {
 		return false, err
 	}
@@ -386,7 +387,7 @@ func (b *mysqlBatchTx) dispatchUpdate(ctx context.Context, streamID string, c ir
 		b.a.logPartialAfterImage(ctx, schema, upd.Table, missing)
 		return b.applySerial(ctx, streamID, c)
 	}
-	guard, err := b.a.keyCollationPlanFor(ctx, b.tx, upd.Schema, schema, upd.Table, pk, colTypes)
+	guard, err := b.a.upsertGuardFor(ctx, b.tx, upd.Schema, schema, upd.Table, pk, colTypes)
 	if err != nil {
 		return false, err
 	}
@@ -460,7 +461,7 @@ func (b *mysqlBatchTx) applySerial(ctx context.Context, streamID string, c ir.Ch
 // flushes the upsert-run if the new row switches table/shape or would overflow a
 // per-statement cap, and finally appends. Inserts and update-upserts to the same
 // table + identical column shape coalesce into ONE multi-row statement.
-func (b *mysqlBatchTx) appendUpsert(ctx context.Context, schema, table string, row ir.Row, pk []string, colTypes map[string]*ir.Column, guard *keyCollationPlan, addBytes int64) error {
+func (b *mysqlBatchTx) appendUpsert(ctx context.Context, schema, table string, row ir.Row, pk []string, colTypes map[string]*ir.Column, guard *applyUpsertGuard, addBytes int64) error {
 	if err := b.flushDeletes(ctx); err != nil {
 		return err
 	}
@@ -557,7 +558,7 @@ func (b *mysqlBatchTx) flushUpserts(ctx context.Context) error {
 		return fmt.Errorf("mysql: applier: build multi-row insert for %s.%s: %w", b.run.schema, b.run.table, err)
 	}
 	if _, err := b.a.txExec(ctx, b.tx, stmt, args...); err != nil {
-		err = keyCollationMergeRefusal(err, b.run.guard, b.run.schema, b.run.table)
+		err = upsertGuardRefusal(err, b.run.guard, b.run.schema, b.run.table)
 		return fmt.Errorf("mysql: applier: multi-row insert into %s.%s: %w", b.run.schema, b.run.table, err)
 	}
 	// Vector B (task C2): under --mysql-sql-mode='' the server silently
@@ -656,11 +657,11 @@ func (b *mysqlBatchTx) Rollback() error {
 // prepareValue; a missing entry (cold cache / unknown column) is tolerated and
 // the raw value bound, the same pre-Bug-6 shape buildInsertSQL preserves.
 //
-// guard, when non-nil, is the table's key-collation backstop
-// (key_collation_guard.go): its check becomes the update list's first
-// assignment. A guard whose key columns the insert cannot reference refuses
-// rather than run unguarded.
-func buildMultiRowInsertSQL(schema, table string, rows []ir.Row, pk []string, colTypes map[string]*ir.Column, upsert upsertSpelling, guard *keyCollationPlan) (sqlStmt string, args []any, err error) {
+// guard, when non-nil, is the table's upsert guards ([applyUpsertGuard]: the
+// key-collation backstop and the conflict-identity guard): their check
+// becomes the update list's first assignment. A key-collation guard whose key
+// columns the insert cannot reference refuses rather than run unguarded.
+func buildMultiRowInsertSQL(schema, table string, rows []ir.Row, pk []string, colTypes map[string]*ir.Column, upsert upsertSpelling, guard *applyUpsertGuard) (sqlStmt string, args []any, err error) {
 	if len(rows) == 0 {
 		return "", nil, errors.New("mysql: applier: buildMultiRowInsertSQL: no rows")
 	}
@@ -668,7 +669,7 @@ func buildMultiRowInsertSQL(schema, table string, rows []ir.Row, pk []string, co
 	var guardAssign, guardHang string
 	if guard != nil {
 		var ok bool
-		if guardAssign, guardHang, ok = guard.render(schema, table, cols, upsert); !ok {
+		if guardAssign, guardHang, ok = guard.render(quoteIdent(schema)+"."+quoteIdent(table), cols, pk, upsert); !ok {
 			return "", nil, &terminalMySQLError{err: fmt.Errorf("%w: %s: mysql: applier: %s.%s: a key column whose "+
 				"collation the source declares differently from the target is not in the insert's column list (a "+
 				"generated column), so sluice cannot check that an upsert does not merge two source rows. Refusing "+
@@ -719,19 +720,29 @@ func buildMultiRowInsertSQL(schema, table string, rows []ir.Row, pk []string, co
 //	AS new ON DUPLICATE KEY UPDATE `a` = new.`a`, `b` = new.`b`      (row alias)
 //	ON DUPLICATE KEY UPDATE `a` = VALUES(`a`), `b` = VALUES(`b`)     (mariadb)
 //
-// PK columns are excluded from the SET list because updating them on conflict
-// is a no-op at best (they are equal by definition during the conflict) and
-// silently incorrect if the new and existing rows have differing PK shapes.
+// PK columns are excluded from the SET list: on a conflict through the PK
+// they are equal already, and rewriting a PK on conflict would be silently
+// incorrect if the new and existing rows have differing PK shapes. The PK is
+// NOT equal by definition during every conflict, though — this clause fires
+// on a conflict through ANY unique key, and a secondary unique key can match
+// a row with a different PK (SOURCE-DROPPED-UNIQUE-KEY-MERGE: the target kept
+// a unique key the source dropped). That conflict is refused by the
+// conflict-identity guard (unique_key_conflict_guard.go), armed on every
+// table with a unique key besides its PK, which rides guardAssign below.
 // When every column is a PK column the clause degrades to a single no-op
 // `pk = new.pk` so the conflict is absorbed silently.
 //
 // With an empty PK list it STILL emits ON DUPLICATE KEY UPDATE — with a full-
 // row SET-list — because MySQL fires that clause on a conflict against ANY
 // unique index, not just the PK. This makes a no-PK table with a UNIQUE key
-// idempotent on re-apply (the ADR-0072 Gap-2 interlock: a resumed cold-start
-// COPY's re-sent rows upsert instead of 1062-ing); a truly keyless table never
-// collides, so the clause is inert and behaviour is effectively plain INSERT.
-// See the ChangeApplier package doc for the full resume-idempotency contract.
+// idempotent on re-apply of an IDENTICAL row (the ADR-0072 Gap-2 interlock: a
+// resumed cold-start COPY's re-sent rows upsert instead of 1062-ing); a
+// conflict with a row that differs in any column is refused by the
+// conflict-identity guard, since on such a table the unique key is the only
+// identity and it may be the very key the source dropped. A truly keyless
+// table never collides, so the clause is inert and behaviour is effectively
+// plain INSERT. See the ChangeApplier package doc for the full
+// resume-idempotency contract.
 //
 // DO NOT move a vtgate flavor to the VALUES() spelling (GC-41 (e)). On a
 // sharded target vtgate refuses an ON DUPLICATE KEY UPDATE that assigns a
@@ -748,8 +759,9 @@ func buildMultiRowInsertSQL(schema, table string, rows []ir.Row, pk []string, co
 // TestUpsertSpelling_VitessFamilyNeverUsesValuesFunc and
 // TestVStream_ShardedTarget_VindexMoveRefusesLoudly.
 //
-// guardAssign, when set, is the key-collation guard's assignment of column
-// guardHang (key_collation_guard.go). It is written FIRST — MySQL evaluates
+// guardAssign, when set, is the upsert guards' assignment of column guardHang
+// ([applyUpsertGuard.render]: the conflict-identity check, then the
+// key-collation guard's). It is written FIRST — MySQL evaluates
 // the list left to right against the row as updated so far, so a guard
 // after an assignment to a key column would compare the new value with
 // itself (measured) — and replaces that column's plain assignment.
