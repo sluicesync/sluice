@@ -17,6 +17,7 @@ import (
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // TestMigrate_PostgresView_ReadsTheTargetSchema is Bug 314's Postgres arm
@@ -103,6 +104,43 @@ func TestMigrate_PostgresView_ReadsTheTargetSchema(t *testing.T) {
 			}
 		})
 	}
+
+	// A view over a table the run leaves out: on a non-public source its
+	// body names that table unqualified, meaning the source schema's own.
+	// The target's public holds an unrelated table by that name, and the
+	// view must not bind to it: the create fails loudly instead.
+	t.Run("excluded table does not bind to public", func(t *testing.T) {
+		applyPGDDL(t, pgSource, `
+			CREATE SCHEMA ex;
+			CREATE TABLE ex.keep (id INT PRIMARY KEY, v TEXT);
+			CREATE TABLE ex.x (id INT PRIMARY KEY, v TEXT);
+			INSERT INTO ex.x VALUES (1, 'src-x');
+			CREATE VIEW ex.vx AS SELECT id, v FROM ex.x;
+		`)
+		applyPGDDL(t, pgTarget, `
+			CREATE TABLE public.x (id INT PRIMARY KEY, v TEXT);
+			INSERT INTO public.x VALUES (42, 'PUBLIC-DECOY');
+		`)
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		defer cancel()
+		mig := &Migrator{
+			Source: pg, Target: pg, SourceDSN: withPGSchema(pgSource, "ex"), TargetDSN: pgTarget,
+			TargetSchema: "ex4", MigrationID: "bug314-excluded",
+			Filter: migcore.TableFilter{Exclude: []string{"x"}},
+		}
+		err := mig.Run(ctx)
+		if err == nil {
+			db, oerr := sql.Open("pgx", pgTarget)
+			if oerr != nil {
+				t.Fatalf("open target: %v", oerr)
+			}
+			defer func() { _ = db.Close() }()
+			t.Fatalf("migrate succeeded; ex4.vx returns %s, but the table it reads was excluded, so it can only be reading an unrelated target table", readViewRows(ctx, t, db, "ex4.vx"))
+		}
+		if !strings.Contains(err.Error(), "vx") {
+			t.Errorf("the failure does not name the view: %v", err)
+		}
+	})
 }
 
 // readViewRows renders a view's (id, v) rows as "id:v,..." in id order.

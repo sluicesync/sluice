@@ -35,6 +35,18 @@ func RunViewsPhase(ctx context.Context, schema *ir.Schema, sw ir.SchemaWriter) e
 	if schema == nil || len(schema.Views) == 0 {
 		return nil
 	}
+	// A reader that could not make a body safe to create says so on the
+	// view (Bug 314); refuse every such view up front, by name, before any
+	// view is created.
+	var refused []error
+	for _, v := range schema.Views {
+		if v != nil && v.Refusal != "" {
+			refused = append(refused, errors.New(v.Refusal))
+		}
+	}
+	if len(refused) > 0 {
+		return fmt.Errorf("pipeline: views phase: %w", errors.Join(refused...))
+	}
 
 	// First pass: try every view. retry collects views that failed.
 	pending := append([]*ir.View(nil), schema.Views...)
