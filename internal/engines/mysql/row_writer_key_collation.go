@@ -32,10 +32,13 @@ package mysql
 //
 // # Cost
 //
-// One catalog read per table per writer (the target's column collations),
-// cached; only when a column is armed, one more for the keys (primary and
-// unique together), SELECT DATABASE() when the writer has no schema, and the
-// collation-expressibility probe. Nothing per row: the guard is the update list's first
+// Two catalog reads per table per writer, cached: the target's column
+// collations and its keys (primary and unique together — read whether or
+// not a column is armed, since a functional key part arms by its own
+// collation); SELECT DATABASE() when the writer has no schema; two more
+// only for a table with a functional key part (its column names and hidden
+// columns); and, when a column is armed, the collation-expressibility probe.
+// Nothing per row: the guard is the update list's first
 // assignment, evaluated by the server only on a conflict, and rendered once
 // per table — a non-conflicting insert runs exactly as before.
 
@@ -113,10 +116,21 @@ func (w *RowWriter) resolveCopyKeyCollationGuard(ctx context.Context, q queryRow
 		return copyKeyCollationGuard{}, fmt.Errorf("mysql: copy into %q: read the target's column collations for the key-collation guard: %w", table.Name, err)
 	}
 	compareAs := w.flavor.keyGuardCollations()
-	if len(armedColumns(table, colTypes, compareAs)) == 0 {
+	// The keys are read whether or not a column is armed: a functional key
+	// part arms its key by its own collation (key_collation_functional.go).
+	// The catalog queries take "" as the session's database.
+	keys, err := uniqueKeyColumns(ctx, q, w.flavor, w.schema, table.Name)
+	if err != nil {
+		return copyKeyCollationGuard{}, fmt.Errorf("mysql: copy into %q: read the unique keys for the key-collation guard: %w", table.Name, err)
+	}
+	if len(keys.unresolved) > 0 {
+		return copyKeyCollationGuard{}, keyCollationFunctionalUnsupported(qualifiedName(w.schema, table.Name), keys.unresolved)
+	}
+	plan := planCopyKeyCollationGuard(table, colTypes, keys, compareAs)
+	if plan == nil {
 		return copyKeyCollationGuard{}, nil
 	}
-	// Armed: the keys, and the database's name for the messages.
+	// Armed: the database's name for the messages.
 	schema := w.schema
 	if schema == "" {
 		if err := q.QueryRowContext(ctx, "SELECT DATABASE()").Scan(&schema); err != nil {
@@ -124,17 +138,6 @@ func (w *RowWriter) resolveCopyKeyCollationGuard(ctx context.Context, q queryRow
 		}
 	}
 	qn := qualifiedName(schema, table.Name)
-	keys, err := uniqueKeyColumns(ctx, q, w.flavor, schema, table.Name)
-	if err != nil {
-		return copyKeyCollationGuard{}, fmt.Errorf("mysql: copy into %s: read the unique keys for the key-collation guard: %w", qn, err)
-	}
-	if opaque := keys.refusesOpaque(); len(opaque) > 0 {
-		return copyKeyCollationGuard{}, keyCollationFunctionalUnsupported(qn, opaque)
-	}
-	plan := planCopyKeyCollationGuard(table, colTypes, keys, compareAs)
-	if plan == nil {
-		return copyKeyCollationGuard{}, nil
-	}
 	if err := checkKeyCollationsExpressible(ctx, q, qn, plan); err != nil {
 		return copyKeyCollationGuard{}, err
 	}
@@ -257,26 +260,28 @@ func targetColumnCollations(ctx context.Context, q queryRower, schema, table str
 // targetUniqueKeys is a target table's primary key and its other unique
 // keys, each as its columns in index order, with each part's index prefix
 // length (pkSub / uniqueSubs, parallel to the columns; 0 for the whole
-// column). A functional part the guard reads through stands in its key as
-// the column it reads, with the part itself in uniqueFns (parallel to
-// uniques; nil for a plain column); one it cannot read is left out of its
-// key and listed in opaque (key_collation_functional.go). A primary key
-// never has a functional part: MySQL refuses one.
+// column). A functional part stands in its key as the first column it reads
+// ("" for one reading none), with the part itself in uniqueFns (parallel to
+// uniques; nil for a plain column; key_collation_functional.go). unresolved
+// lists the functional parts naming a column the table does not have, which
+// the callers refuse. A primary key never has a functional part: MySQL
+// refuses one.
 type targetUniqueKeys struct {
 	pk         []string
 	pkSub      []int
 	uniques    [][]string
 	uniqueSubs [][]int
 	uniqueFns  [][]*functionalKeyPart
-	opaque     []opaqueKeyPart
+	unresolved []*functionalKeyPart
 }
 
 // uniqueKeyColumns reads the target's primary key and other unique keys,
 // with each key part's SUB_PART (an index prefix: characters for a character
 // column, bytes for a binary one), in one catalog query, and — only when a
-// key has a functional part — the collation each functional part compares
-// under ([functionalKeyCollations]). MariaDB has no functional key parts
-// and no EXPRESSION column (flavor_mariadb.go); its query selects NULL.
+// key has a functional part — the table's column names (to resolve the
+// expression's spelling of them) and the collation each functional part
+// compares under ([functionalKeyCollations]). MariaDB has no functional key
+// parts and no EXPRESSION column (flavor_mariadb.go); its query selects NULL.
 func uniqueKeyColumns(ctx context.Context, q queryRower, flavor Flavor, schema, table string) (targetUniqueKeys, error) {
 	var out targetUniqueKeys
 	expr := "expression"
@@ -290,7 +295,7 @@ func uniqueKeyColumns(ctx context.Context, q queryRower, flavor Flavor, schema, 
 		return out, err
 	}
 	defer func() { _ = rows.Close() }()
-	last, functional := "", false
+	last := ""
 	parts := map[string]int{} // each key's part count
 	var fns []*functionalKeyPart
 	for rows.Next() {
@@ -309,14 +314,16 @@ func uniqueKeyColumns(ctx context.Context, q queryRower, flavor Flavor, schema, 
 		name := col.String
 		var fn *functionalKeyPart
 		if !col.Valid {
-			functional = true
-			column, steps, ok := parseFunctionalKeyPart(expression.String)
-			if !ok {
-				out.opaque = append(out.opaque, opaqueKeyPart{index: idx, expr: expression.String, seq: seq - 1})
-				continue
+			fn = &functionalKeyPart{index: idx, expr: expression.String, seq: seq - 1}
+			if column, steps, ok := parseFunctionalKeyPart(expression.String); ok {
+				fn.columns, fn.readable, fn.steps = []string{column}, true, steps
+			} else {
+				fn.columns = expressionColumns(expression.String)
 			}
-			name = column
-			fn = &functionalKeyPart{index: idx, expr: expression.String, seq: seq - 1, column: column, steps: steps}
+			name = ""
+			if len(fn.columns) > 0 {
+				name = fn.columns[0]
+			}
 			fns = append(fns, fn)
 		}
 		if idx == "PRIMARY" {
@@ -338,14 +345,40 @@ func uniqueKeyColumns(ctx context.Context, q queryRower, flavor Flavor, schema, 
 	if err := rows.Err(); err != nil {
 		return out, err
 	}
+	if len(fns) == 0 {
+		return out, nil
+	}
 	for _, f := range fns {
 		f.alone = parts[f.index] == 1
 	}
-	if functional {
-		collations, known := functionalKeyCollations(ctx, q, flavor, schema, table)
-		out.resolveFunctionalCollations(collations, known)
+	names, err := tableColumnNames(ctx, q, schema, table)
+	if err != nil {
+		return out, err
 	}
+	out.unresolved = out.resolveFunctionalColumns(names)
+	hidden, known := functionalKeyCollations(ctx, q, flavor, schema, table)
+	out.resolveFunctionalCollations(hidden, known)
 	return out, nil
+}
+
+// tableColumnNames is every column of the target table as the catalog
+// spells it.
+func tableColumnNames(ctx context.Context, q queryRower, schema, table string) ([]string, error) {
+	rows, err := q.QueryContext(ctx, `SELECT column_name FROM information_schema.columns
+		WHERE table_schema = COALESCE(NULLIF(?, ''), DATABASE()) AND table_name = ?`, schema, table)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []string
+	for rows.Next() {
+		var c string
+		if err := rows.Scan(&c); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
 }
 
 // copyKeyCollationMergeRefusal attributes a guarded copy statement's failure

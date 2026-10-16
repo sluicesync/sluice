@@ -66,7 +66,7 @@ func TestKeyCollationMergeRemedy_NamesTheCollationThatConverges(t *testing.T) {
 		{
 			"a postgres byte-compared key on a mysql _ci primary key",
 			planKeyCollationGuard(source(pgC), mysqlCI, targetUniqueKeys{pk: []string{"k"}, uniques: [][]string{{"k"}}}, mysqlKeyGuardCollations),
-			[]string{"does not converge", "COLLATE utf8mb4_bin"},
+			[]string{"does not converge", "COLLATE utf8mb4_0900_bin"},
 			[]string{"--restart-from-scratch", "converges either way"},
 		},
 	}

@@ -179,7 +179,7 @@ func TestCopyKeyCollationMergeRemedy_NamesTheCollationTheKeyNeeds(t *testing.T) 
 		{
 			"postgres deterministic key (bytes)",
 			planCopyKeyCollationGuard(source(ir.Varchar{Length: 20, Collation: "C", Determinism: ir.CollationDeterministic}), mysqlCI, targetUniqueKeys{pk: []string{"k"}, uniques: nil}, mysqlKeyGuardCollations),
-			[]string{"`k` a binary collation (for example COLLATE utf8mb4_bin)", "resume the copy", "rather than recreating the table"},
+			[]string{"`k` a binary collation that does not pad (for example COLLATE utf8mb4_0900_bin; on MariaDB utf8mb4_nopad_bin)", "resume the copy", "rather than recreating the table"},
 			[]string{"as the source declares", "the source's collation", "COLLATE C", "re-copy the table from scratch"},
 		},
 		{

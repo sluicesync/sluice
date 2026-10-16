@@ -44,7 +44,8 @@ func TestUniqueKeyColumns_FunctionalPartsOnTheRealServer(t *testing.T) {
 		"UNIQUE KEY cn ((cast(k as char(10) charset utf8mb4))), UNIQUE KEY cl ((lower(k) collate utf8mb4_bin)), "+
 		"UNIQUE KEY bc ((k collate utf8mb4_bin)), UNIQUE KEY l1 ((lower(cast(k as char charset latin1)))), "+
 		"UNIQUE KEY bn ((cast(k as binary))), UNIQUE KEY mix (j, (upper(k))), "+
-		"UNIQUE KEY md ((md5(k))), UNIQUE KEY nm ((j * 2)), UNIQUE KEY tb ((trim(both 'x' from k))))")
+		"UNIQUE KEY md ((md5(k))), UNIQUE KEY nm ((j * 2)), UNIQUE KEY tb ((trim(both 'x' from k))), "+
+		"UNIQUE KEY cc ((concat(k, j))), UNIQUE KEY mc ((lower(K))), UNIQUE KEY "+strings.Repeat("functional_key_", 4)+" ((upper(lower(k)))))")
 	applyDDL(t, dsn, "INSERT INTO kx VALUES (1, ' Abc ', 1), (2, 'ÉtÉ', 2), (3, 'x', 3), (4, 'ß', 4)")
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
@@ -66,22 +67,24 @@ func TestUniqueKeyColumns_FunctionalPartsOnTheRealServer(t *testing.T) {
 			}
 		}
 	}
-	opaque := map[string]opaqueKeyPart{}
-	for _, o := range keys.opaque {
-		opaque[o.index] = o
+	if len(keys.unresolved) != 0 {
+		t.Fatalf("unresolved parts %+v", keys.unresolved)
 	}
+	long := strings.Repeat("functional_key_", 4)
 	for idx, wantColl := range map[string]string{
 		"lo": "utf8mb4_0900_ai_ci", "up": "utf8mb4_0900_ai_ci", "lc": "utf8mb4_0900_ai_ci", "tr": "utf8mb4_0900_ai_ci",
 		"lr": "utf8mb4_0900_ai_ci", "cs": "utf8mb4_0900_ai_ci", "cn": "utf8mb4_0900_ai_ci", "cl": "utf8mb4_bin",
 		"bc": "utf8mb4_bin", "l1": "latin1_swedish_ci", "bn": "", "mix": "utf8mb4_0900_ai_ci",
+		"mc": "utf8mb4_0900_ai_ci", long: "utf8mb4_0900_ai_ci",
 	} {
 		f := read[idx]
-		if f == nil {
-			t.Errorf("key %s: not read through (opaque: %+v)", idx, opaque[idx])
+		if f == nil || !f.readable {
+			t.Errorf("key %s: not read through (%+v)", idx, f)
 			continue
 		}
-		if f.column != "k" || !f.known || f.collation != wantColl {
-			t.Errorf("key %s (%s): column %q collation %q known %v; want k, %q, known", idx, f.expr, f.column, f.collation, f.known, wantColl)
+		// mc spells the column K: resolved to the table's k (review F1).
+		if len(f.columns) != 1 || f.columns[0] != "k" || !f.known || f.collation != wantColl {
+			t.Errorf("key %s (%s): columns %q collation %q known %v; want k, %q, known", idx, f.expr, f.columns, f.collation, f.known, wantColl)
 		}
 		// The guard's rendering against the server's own expression, row by
 		// row, byte for byte.
@@ -93,35 +96,37 @@ func TestUniqueKeyColumns_FunctionalPartsOnTheRealServer(t *testing.T) {
 			t.Errorf("key %s: the rendering %s differs from the server's %s on %d row(s)", idx, f.render("k"), f.expr, differ)
 		}
 	}
-	for idx, refuses := range map[string]bool{"md": true, "nm": false, "tb": true} {
-		o, ok := opaque[idx]
-		if !ok {
-			t.Errorf("key %s: read through; want opaque", idx)
+	// The parts the guard cannot read: the columns each reads, resolved, and
+	// whether its value is a collated string (it arms per row) or not (left
+	// out).
+	for idx, want := range map[string]struct {
+		columns  string
+		collated bool
+	}{"md": {"k", true}, "nm": {"j", false}, "tb": {"k", true}, "cc": {"k|j", true}} {
+		f := read[idx]
+		if f == nil || f.readable {
+			t.Errorf("key %s: %+v; want an unreadable part", idx, f)
 			continue
 		}
-		if got := !o.known || o.collation != ""; got != refuses {
-			t.Errorf("key %s (%s): refuses %v (collation %q known %v); want %v", idx, o.expr, got, o.collation, o.known, refuses)
+		if strings.Join(f.columns, "|") != want.columns || !f.known || f.collated() != want.collated {
+			t.Errorf("key %s (%s): columns %q known %v collated %v; want %q, known, %v", idx, f.expr, f.columns, f.known, f.collated(), want.columns, want.collated)
 		}
-	}
-	if len(keys.refusesOpaque()) != 2 {
-		t.Errorf("refusing opaque parts %+v; want md and tb", keys.refusesOpaque())
 	}
 
 	// The Vitess flavors never read the hidden columns (vtgate does not parse
-	// SHOW EXTENDED): every part is unknown, so it refuses or compares TRUE.
+	// SHOW EXTENDED): every part is unknown, and so compares TRUE on the
+	// target side — it never refuses the table.
 	vk, err := uniqueKeyColumns(ctx, db, FlavorVitess, "", "kx")
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, fns := range vk.uniqueFns {
-		for _, f := range fns {
-			if f != nil && f.known {
-				t.Errorf("vitess flavor: key %s claims a known collation %q", f.index, f.collation)
-			}
+	for _, f := range vk.functionalParts() {
+		if f.known {
+			t.Errorf("vitess flavor: key %s claims a known collation %q", f.index, f.collation)
 		}
 	}
-	if len(vk.refusesOpaque()) != 3 {
-		t.Errorf("vitess flavor: refusing opaque parts %+v; want all three", vk.refusesOpaque())
+	if len(vk.unresolved) != 0 {
+		t.Errorf("vitess flavor: unresolved parts %+v", vk.unresolved)
 	}
 }
 
@@ -217,28 +222,23 @@ func TestRowWriterKeyCollationGuard_FunctionalKeys(t *testing.T) {
 						}
 					})
 				}
-				t.Run("opaque collated part refuses before any row", func(t *testing.T) {
+				// Review F4: an unreadable part compares per row (TRUE on the
+				// target, the columns' bytes on the source) and never refuses
+				// the table; a non-string one is left out.
+				t.Run("opaque collated part copies what merges nothing", func(t *testing.T) {
 					dsn := cell(t, tgt+"UNIQUE KEY fk ((md5(k))))")
-					err := write(t, flavor.eng, dsn, tbl, e, f)
-					if !errors.Is(err, ir.ErrKeyCollationMerge) || !strings.Contains(err.Error(), keyCollationGuardUnsupportedMarker) ||
-						!strings.Contains(err.Error(), "md5") {
-						t.Fatalf("err = %v; want %s naming the key's expression", err, keyCollationGuardUnsupportedMarker)
+					for i := 0; i < 2; i++ {
+						if err := write(t, flavor.eng, dsn, tbl, e, eAcute); err != nil {
+							t.Fatalf("pass %d: %v", i, err)
+						}
 					}
-					if got := kcgRows(t, dsn, "kd", "id"); got != "" {
-						t.Fatalf("the refusal wrote rows: %s", got)
+					if got := kcgRows(t, dsn, "kd", "id"); got != "1:65,2:C3A9" {
+						t.Fatalf("target %s; want 1:65,2:C3A9", got)
 					}
 				})
 				t.Run("opaque non-string part is left out", func(t *testing.T) {
 					dsn := cell(t, tgt+"UNIQUE KEY fk ((j * 2)), UNIQUE KEY uk (k))")
-					err := write(t, flavor.eng, dsn, tbl, e, f)
-					if flavor.eng.Flavor == FlavorVitess {
-						// Unknown: the part may be a string, so it refuses.
-						if !strings.Contains(fmtErr(err), keyCollationGuardUnsupportedMarker) {
-							t.Fatalf("err = %v; want %s", err, keyCollationGuardUnsupportedMarker)
-						}
-						return
-					}
-					if err != nil {
+					if err := write(t, flavor.eng, dsn, tbl, e, f); err != nil {
 						t.Fatalf("a non-string functional part refused: %v", err)
 					}
 					if got := kcgRows(t, dsn, "kd", "id"); got != "1:65,2:66" {
@@ -255,4 +255,141 @@ func fmtErr(err error) string {
 		return "<nil>"
 	}
 	return err.Error()
+}
+
+// TestRowWriterKeyCollationGuard_FunctionalKeysReview is the independent
+// review's cells (2026-10-15), each graded by the target's rows as HEX:
+//
+//   - F1: the key's expression spells the column in another case than the
+//     column (the catalog keeps the DDL's spelling);
+//   - F2: a column whose collation the source shares (unarmed) under a key
+//     whose CAST compares it under another collation;
+//   - F4: an opaque collated part (`md5(k)`) on an armed table must not
+//     refuse a copy that merges nothing, a non-string part must not refuse
+//     where its hidden column cannot be read, and an index name longer than
+//     the 52 characters a hidden column's name keeps must still be guarded;
+//   - F5: the remedy's collation must keep a trailing-space pair apart.
+func TestRowWriterKeyCollationGuard_FunctionalKeysReview(t *testing.T) {
+	n := 0
+	cell := func(t *testing.T, ddl string) string {
+		t.Helper()
+		n++
+		dsn, cleanup := newSharedDB(t, fmt.Sprintf("kcfr_%d", n))
+		t.Cleanup(cleanup)
+		applyDDL(t, dsn, ddl)
+		return dsn
+	}
+	write := func(t *testing.T, eng Engine, dsn string, table *ir.Table, rows ...ir.Row) error {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		rw, err := eng.OpenRowWriter(ctx, dsn)
+		if err != nil {
+			t.Fatalf("OpenRowWriter: %v", err)
+		}
+		defer func() { _ = rw.(*RowWriter).Close() }()
+		ch := make(chan ir.Row, len(rows))
+		for _, r := range rows {
+			ch <- r
+		}
+		close(ch)
+		return rw.(*RowWriter).WriteRowsIdempotent(ctx, table, ch)
+	}
+	table := func(key ir.Type) *ir.Table {
+		return &ir.Table{Name: "kd", Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 32}},
+			{Name: "k", Type: key},
+			{Name: "j", Type: ir.Integer{Width: 32}, Nullable: true},
+		}, PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}}}
+	}
+	pgDefault := table(ir.Varchar{Length: 20, Determinism: ir.CollationDeterministic})
+	srcBin := table(kcgVarchar("utf8mb4_bin"))
+	row := func(id int64, k string) ir.Row { return ir.Row{"id": id, "k": k, "j": id} }
+	wantMerge := func(t *testing.T, err error, dsn string) {
+		t.Helper()
+		if !errors.Is(err, ir.ErrKeyCollationMerge) || !strings.Contains(fmtErr(err), keyCollationMergeMarker) ||
+			strings.Contains(fmtErr(err), keyCollationGuardUnsupportedMarker) {
+			t.Fatalf("err = %v; want KEY-COLLATION-MERGE (target %s)", err, kcgRows(t, dsn, "kd", "id"))
+		}
+		if got := kcgRows(t, dsn, "kd", "id"); got != "1:65" {
+			t.Fatalf("after the refusal the target is %s; want 1:65 (nothing merged)", got)
+		}
+	}
+	const ci = "CREATE TABLE kd (id INT NOT NULL PRIMARY KEY, k VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL, j INT, "
+	const bin = "CREATE TABLE kd (id INT NOT NULL PRIMARY KEY, k VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL, j INT, "
+
+	for _, flavor := range []struct {
+		name string
+		eng  Engine
+	}{{"hidden column read", Engine{}}, {"hidden column unknown (vitess flavor)", Engine{Flavor: FlavorVitess}}} {
+		t.Run(flavor.name, func(t *testing.T) {
+			t.Run("F1 mixed-case expression identifier", func(t *testing.T) {
+				dsn := cell(t, ci+"UNIQUE KEY fk ((lower(cast(K as char charset utf8mb4)))))")
+				if err := write(t, flavor.eng, dsn, pgDefault, row(1, "e")); err != nil {
+					t.Fatal(err)
+				}
+				wantMerge(t, write(t, flavor.eng, dsn, pgDefault, row(2, "é")), dsn)
+			})
+			t.Run("F2 unarmed column under a CAST-collated key", func(t *testing.T) {
+				dsn := cell(t, bin+"UNIQUE KEY fk ((lower(cast(k as char charset utf8mb4)))))")
+				if err := write(t, flavor.eng, dsn, srcBin, row(1, "e")); err != nil {
+					t.Fatal(err)
+				}
+				wantMerge(t, write(t, flavor.eng, dsn, srcBin, row(2, "é")), dsn)
+			})
+			t.Run("F4 md5 key on an armed table copies what merges nothing", func(t *testing.T) {
+				dsn := cell(t, ci+"UNIQUE KEY fk ((md5(k))))")
+				for i := 0; i < 2; i++ { // the second pass re-sends both rows
+					if err := write(t, flavor.eng, dsn, pgDefault, row(1, "e"), row(2, "é")); err != nil {
+						t.Fatalf("pass %d: %v", i, err)
+					}
+				}
+				if got := kcgRows(t, dsn, "kd", "id"); got != "1:65,2:C3A9" {
+					t.Fatalf("target %s; want 1:65,2:C3A9", got)
+				}
+			})
+			t.Run("F4 non-string opaque part copies", func(t *testing.T) {
+				dsn := cell(t, ci+"UNIQUE KEY fk ((j * 2)), UNIQUE KEY uk (id, k))")
+				if err := write(t, flavor.eng, dsn, pgDefault, row(1, "e"), row(2, "f")); err != nil {
+					t.Fatal(err)
+				}
+				if got := kcgRows(t, dsn, "kd", "id"); got != "1:65,2:66" {
+					t.Fatalf("target %s; want 1:65,2:66", got)
+				}
+			})
+			t.Run("F4 index name longer than a hidden column keeps", func(t *testing.T) {
+				long := strings.Repeat("functional_key_", 4) // 60 characters
+				dsn := cell(t, ci+"UNIQUE KEY "+long+" ((lower(k))))")
+				if err := write(t, flavor.eng, dsn, pgDefault, row(1, "e")); err != nil {
+					t.Fatal(err)
+				}
+				wantMerge(t, write(t, flavor.eng, dsn, pgDefault, row(2, "é")), dsn)
+			})
+			t.Run("F5 the remedy keeps a trailing-space pair apart", func(t *testing.T) {
+				dsn := cell(t, ci+"UNIQUE KEY fk ((lower(cast(k as char charset utf8mb4)))))")
+				if err := write(t, flavor.eng, dsn, pgDefault, row(1, "e")); err != nil {
+					t.Fatal(err)
+				}
+				err := write(t, flavor.eng, dsn, pgDefault, row(2, "é"))
+				wantMerge(t, err, dsn)
+				// Apply the statement the refusal names, verbatim.
+				msg := fmtErr(err)
+				start := strings.Index(msg, "DROP INDEX `fk`, ADD UNIQUE KEY `fk` (")
+				if start < 0 {
+					t.Fatalf("the refusal names no statement to recreate the key: %s", msg)
+				}
+				end := strings.Index(msg[start:], ")`")
+				if end < 0 {
+					t.Fatalf("the refusal names no statement to recreate the key: %s", msg)
+				}
+				applyDDL(t, dsn, "ALTER TABLE kd "+msg[start:start+end+1])
+				if err := write(t, flavor.eng, dsn, pgDefault, row(2, "é"), row(3, "e ")); err != nil {
+					t.Fatalf("after the remedy: %v", err)
+				}
+				if got := kcgRows(t, dsn, "kd", "id"); got != "1:65,2:C3A9,3:6520" {
+					t.Fatalf("after the remedy the target is %s; want 1:65,2:C3A9,3:6520", got)
+				}
+			})
+		})
+	}
 }

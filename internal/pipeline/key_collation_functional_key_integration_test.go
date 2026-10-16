@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/engines/pgtrigger"
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
@@ -63,7 +64,7 @@ func TestKeyCollationFunctionalKey_PostgresToMySQLApply(t *testing.T) {
 		// one the refusal names — the key recreated under a binary collation.
 		{
 			tag: "kfa", create: kfkPGFunctionalTable, collide: "é", wantRefusal: true,
-			remedy: "ALTER TABLE kd DROP INDEX kd_lower_k, ADD UNIQUE KEY kd_lower_k ((lower(cast(`k` as char charset utf8mb4)) COLLATE utf8mb4_bin))",
+			remedy: "ALTER TABLE kd DROP INDEX kd_lower_k, ADD UNIQUE KEY kd_lower_k (((lower(cast(`k` as char charset utf8mb4))) COLLATE utf8mb4_0900_bin))",
 		},
 		// Two functional parts over different columns, the merge through both.
 		{
@@ -93,6 +94,29 @@ func TestKeyCollationFunctionalKey_PostgresToMySQLApply(t *testing.T) {
 			tag: "kfe", create: kfkPGFunctionalTable, collide: "é", wantRefusal: true,
 			tgtAlter: "ALTER TABLE kd DROP INDEX kd_lower_k, ADD UNIQUE KEY kd_lower_k ((lower(k))); " +
 				"ALTER TABLE kd MODIFY k varchar(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL",
+		},
+		// Review 2026-10-15 F1: the key's expression spells the column K; the
+		// catalog keeps that spelling and an exact-case lookup ran no guard.
+		{
+			tag: "kff", create: kfkPGFunctionalTable, collide: "é", wantRefusal: true,
+			tgtAlter: "ALTER TABLE kd DROP INDEX kd_lower_k, ADD UNIQUE KEY kd_lower_k ((lower(cast(K as char charset utf8mb4))))",
+		},
+		// Review F4: an unreadable functional key (`md5`), the common
+		// Postgres idiom for a unique large text, on a table whose columns
+		// are armed. 'e' and 'é' hash apart, nothing merges: the stream must
+		// land them exactly. The first cut refused every apply of the table.
+		{
+			tag: "kfg", collide: "é",
+			create: "CREATE TABLE kd (id int NOT NULL PRIMARY KEY, k varchar(20) NOT NULL, d int); " +
+				"CREATE UNIQUE INDEX kd_md5_k ON kd (md5(k)); ALTER TABLE kd REPLICA IDENTITY FULL;",
+		},
+		// Review F3: no primary key. The applier leaves a Postgres default-
+		// collation column unarmed without one (uniqueOnly); a functional
+		// part arms its key by its own collation, so the merge refuses.
+		{
+			tag: "kfh", collide: "é", wantRefusal: true,
+			create: "CREATE TABLE kd (id int NOT NULL, k varchar(20) NOT NULL, d int); " +
+				"CREATE UNIQUE INDEX kd_lower_k ON kd (lower(k)); ALTER TABLE kd REPLICA IDENTITY FULL;",
 		},
 	}
 	for _, c := range cells {
@@ -290,6 +314,47 @@ func TestKeyCollationFunctionalKey_MySQLToPostgresApply(t *testing.T) {
 	}
 	t.Logf("refused: %v", refusal)
 	kcfbGrade(t, "mysql → postgres", src, tgt, refusal)
+}
+
+// TestKeyCollationFunctionalKey_PgtriggerToMySQLApply is the trigger-CDC
+// lane (review 2026-10-15 test gap): a postgres-trigger source with `UNIQUE
+// (lower(k))` streams to MySQL, and 'é' arrives as row 99 beside 'e'. It
+// must refuse KEY-COLLATION-MERGE with nothing merged, as the pgoutput lane
+// does.
+func TestKeyCollationFunctionalKey_PgtriggerToMySQLApply(t *testing.T) {
+	srcDSN, _, pgCleanup := startPostgres(t)
+	defer pgCleanup()
+	_, myRoot, myCleanup := startMySQL(t)
+	defer myCleanup()
+	twfbDB{engine: "mysql", dsn: myRoot}.exec(t, "CREATE DATABASE kft_t")
+	tgtDSN, err := buildMySQLDSN(myRoot, "kft_t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src, tgt := twfbDB{engine: "postgres", dsn: srcDSN}, twfbDB{engine: "mysql", dsn: tgtDSN}
+	src.exec(t, kfkPGFunctionalTable+" INSERT INTO kd (id,k,d) VALUES (1,'e',1),(2,'b',2),(3,'c',3)")
+	if _, err := pgtrigger.Setup(context.Background(), srcDSN, pgtrigger.SetupOptions{Tables: []string{"kd"}, Schema: "public"}); err != nil {
+		t.Fatalf("pgtrigger.Setup: %v", err)
+	}
+	cell := twfbCell{src: src, tgt: tgt, streamID: "kft"}
+	run := startTWFBRun(kttcStreamer(t, src, tgt, cell.streamID))
+	if !tgt.waitRow(t, "kd", 3, run, 180*time.Second) {
+		t.Fatalf("the cold start never delivered the seed (%v)", run.stop(t))
+	}
+	cell.waitStreaming(t, run)
+	src.exec(t, "INSERT INTO kd (id,k,d) VALUES (99,'é',99)")
+	src.exec(t, "INSERT INTO kd (id,k,d) VALUES (100,'zz',100)")
+	_ = tgt.waitRow(t, "kd", 100, run, 60*time.Second)
+	kcfbWaitConverged(t, src, tgt, run, 20*time.Second)
+	refusal := kfkRefusal(t, run)
+	if refusal == nil {
+		t.Fatalf("nothing refused: the target's functional key equates 'e' with 'é' (source %s, target %s)",
+			kcfbRender(kcfbRows(t, src)), kcfbRender(kcfbRows(t, tgt)))
+	}
+	if !errors.Is(refusal, ir.ErrKeyCollationMerge) {
+		t.Errorf("refused with %v; want %v", refusal, ir.ErrKeyCollationMerge)
+	}
+	kcfbGrade(t, "pgtrigger → mysql", src, tgt, refusal)
 }
 
 // kfkNewPair creates a Postgres source database and a MySQL target database

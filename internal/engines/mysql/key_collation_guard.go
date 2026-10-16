@@ -193,13 +193,11 @@ func planCopyKeyCollationGuard(source *ir.Table, colTypes map[string]*ir.Column,
 
 // planFromArmed is the guard over the armed columns: every unique key (the
 // primary key first) holding one, and the marker. nil when no key does. A
-// functional part holds its column only when its value is a collated
-// string ([functionalKeyPart.collated]): a numeric or binary value cannot
-// be merged by a collation.
+// functional part arms its key when its value may be a collated string
+// ([functionalKeyPart.collated]), whatever its column's own collation pair
+// (review 2026-10-15 F2), and never when it is a numeric or binary value,
+// which no collation can merge.
 func planFromArmed(armed map[string]armedCollation, keys targetUniqueKeys) *keyCollationPlan {
-	if len(armed) == 0 {
-		return nil
-	}
 	p := &keyCollationPlan{pk: keys.pk, armed: armed}
 	all := append([][]string{keys.pk}, keys.uniques...)
 	allSubs := append([][]int{keys.pkSub}, keys.uniqueSubs...)
@@ -214,14 +212,18 @@ func planFromArmed(armed map[string]armedCollation, keys targetUniqueKeys) *keyC
 			fns = allFns[i]
 		}
 		for j, col := range key {
-			if _, ok := armed[col]; !ok || (j < len(fns) && fns[j] != nil && !fns[j].collated()) {
+			var fn *functionalKeyPart
+			if j < len(fns) {
+				fn = fns[j]
+			}
+			if _, ok := armed[col]; (fn == nil && !ok) || (fn != nil && !fn.collated()) {
 				continue
 			}
 			p.keys = append(p.keys, key)
 			p.subs = append(p.subs, subs)
 			p.fns = append(p.fns, fns)
 			if p.marker == "" {
-				p.marker = col
+				p.marker = col // "" for a functional part reading no column: renderFor falls back
 			}
 			break
 		}
@@ -391,14 +393,22 @@ func (p *keyCollationPlan) render(schema, table string, cols []string, upsert up
 // referenced through it. The copy writer inserts into an unqualified table
 // name on its own database, so it passes just the table.
 func (p *keyCollationPlan) renderFor(tableRef string, cols []string, upsert upsertSpelling) (assign, hang string, ok bool) {
+	// Case-insensitively, as MySQL names columns: the catalog spells a key's
+	// columns as the target does, the insert as the source does.
 	inCols := make(map[string]bool, len(cols))
 	for _, c := range cols {
-		inCols[c] = true
+		inCols[strings.ToLower(c)] = true
 	}
-	for _, key := range p.keys {
-		for _, c := range key {
-			if !inCols[c] {
-				return "", "", false
+	for i, key := range p.keys {
+		for j, c := range key {
+			read := []string{c}
+			if i < len(p.fns) && j < len(p.fns[i]) && p.fns[i][j] != nil {
+				read = p.fns[i][j].columns
+			}
+			for _, c := range read {
+				if !inCols[strings.ToLower(c)] {
+					return "", "", false
+				}
 			}
 		}
 	}
@@ -448,7 +458,7 @@ func (p *keyCollationPlan) renderFor(tableRef string, cols []string, upsert upse
 	}
 	srcPart := func(c string, n int, fn *functionalKeyPart) string {
 		if fn != nil {
-			return bytesEq(c, 0)
+			return fn.sourceEq(func(c string) string { return bytesEq(c, 0) })
 		}
 		return srcEq(c, n)
 	}
@@ -503,7 +513,11 @@ func (p *keyCollationPlan) renderFor(tableRef string, cols []string, upsert upse
 	// the hang column's incoming value, so the assignment's type is the
 	// column's own and no value is converted (see the package comment's
 	// measured table for the spellings that fail).
-	raise := "18446744073709551615 + OCTET_LENGTH(CONCAT('" + keyCollationMergeMarker + "', " + incoming(p.marker) + "))"
+	marker := p.marker
+	if marker == "" { // the only armed part is a functional one reading no column
+		marker = cols[0]
+	}
+	raise := "18446744073709551615 + OCTET_LENGTH(CONCAT('" + keyCollationMergeMarker + "', " + incoming(marker) + "))"
 	newHang := incoming(hang)
 	return quoteIdent(hang) + " = IF(" + okExpr + ", " + newHang + ", IF((" + raise + ") = 0, " + newHang + ", " + newHang + "))", hang, true
 }
@@ -526,28 +540,25 @@ func (a *ChangeApplier) keyCollationPlanFor(ctx context.Context, q queryRower, s
 	if hit && e.source == source {
 		return e.plan, nil
 	}
-	var plan *keyCollationPlan
 	compareAs := a.flavor.keyGuardCollations()
-	if len(armedColumns(source, colTypes, compareAs)) > 0 {
-		// A column differs: read the unique keys beyond the primary key (the
-		// only extra read, once per table and source shape), and the target
-		// must know every collation the guard names.
-		keys, err := uniqueKeyColumns(ctx, q, a.flavor, schema, table)
-		if err != nil {
-			return nil, fmt.Errorf("mysql: applier: read the unique keys of %s for the key-collation guard: %w", qn, err)
-		}
-		// The applier upserts by its own key; the catalog supplies each part's
-		// prefix length where that key is the catalog's primary key.
-		keys.pk, keys.pkSub = pk, subPartsFor(pk, keys.pk, keys.pkSub)
-		armed := applierArmedColumns(source, colTypes, keys, compareAs)
-		if opaque := keys.refusesOpaque(); len(opaque) > 0 && len(armed) > 0 {
-			return nil, keyCollationFunctionalUnsupported(qn, opaque)
-		}
-		plan = planFromArmed(armed, keys)
-		if plan != nil {
-			if err := checkKeyCollationsExpressible(ctx, q, qn, plan); err != nil {
-				return nil, err
-			}
+	// The unique keys beyond the primary key (one read per table and source
+	// shape), whether or not a column differs: a functional key part arms
+	// its key by its own collation (key_collation_functional.go). The
+	// target must know every collation the guard names.
+	keys, err := uniqueKeyColumns(ctx, q, a.flavor, schema, table)
+	if err != nil {
+		return nil, fmt.Errorf("mysql: applier: read the unique keys of %s for the key-collation guard: %w", qn, err)
+	}
+	if len(keys.unresolved) > 0 {
+		return nil, keyCollationFunctionalUnsupported(qn, keys.unresolved)
+	}
+	// The applier upserts by its own key; the catalog supplies each part's
+	// prefix length where that key is the catalog's primary key.
+	keys.pk, keys.pkSub = pk, subPartsFor(pk, keys.pk, keys.pkSub)
+	plan := planFromArmed(applierArmedColumns(source, colTypes, keys, compareAs), keys)
+	if plan != nil {
+		if err := checkKeyCollationsExpressible(ctx, q, qn, plan); err != nil {
+			return nil, err
 		}
 	}
 	a.cacheMu.Lock()
@@ -742,7 +753,7 @@ func keyCollationNeeds(plan *keyCollationPlan) (collations string, recopyAligns 
 			if i < len(allFns) && j < len(allFns[i]) && allFns[i][j] != nil {
 				// A functional part needs its key recreated, not its column
 				// altered (KEY-COLLATION-FUNCTIONAL-KEY-PART).
-				if f := allFns[i][j]; ok && f.collated() && !named["\x00"+f.index+"!"+f.expr] {
+				if f := allFns[i][j]; f.collated() && !named["\x00"+f.index+"!"+f.expr] {
 					named["\x00"+f.index+"!"+f.expr] = true
 					recopyAligns = false
 					need = append(need, functionalKeyNeed(f))
@@ -755,7 +766,7 @@ func keyCollationNeeds(plan *keyCollationPlan) (collations string, recopyAligns 
 			named[c] = true
 			if ac.bytes {
 				recopyAligns = false
-				need = append(need, quoteIdent(c)+" a binary collation (for example COLLATE utf8mb4_bin)")
+				need = append(need, quoteIdent(c)+" a binary collation that does not pad (for example COLLATE utf8mb4_0900_bin; on MariaDB utf8mb4_nopad_bin)")
 				continue
 			}
 			need = append(need, quoteIdent(c)+" CHARACTER SET "+ac.charset+" COLLATE "+ac.collation)
