@@ -16,6 +16,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/translate"
 )
 
 // SchemaWriter applies an IR Schema to a PostgreSQL database in three
@@ -1326,6 +1327,13 @@ func (w *SchemaWriter) CreateViews(ctx context.Context, s *ir.Schema) error {
 func emitCreateView(schema string, v *ir.View) (string, error) {
 	if err := validatePGIdentifier("view", v.Name, v.Name, schema); err != nil {
 		return "", err
+	}
+	// Bug 312: a MySQL view body is emitted verbatim, so a TRIM remove-string
+	// longer than one byte would read as a character set here.
+	if v.DefinitionDialect == translatableSourceDialect {
+		if err := translate.RefuseDivergentTrim("view", "", v.Name, v.Definition, translatableSourceDialect, "Postgres"); err != nil {
+			return "", err
+		}
 	}
 	qualified := quoteIdent(schema) + "." + quoteIdent(v.Name)
 	body := trimTrailingSemicolon(v.Definition)

@@ -1862,6 +1862,11 @@ func emitAddIndexClause(idx *ir.Index, backslashEscapes bool) (string, error) {
 	if err := checkIndexColumnCollation(idx.Columns, fmt.Sprintf("mysql: index %q", idx.Name), idx.Unique); err != nil {
 		return "", err
 	}
+	// Bug 312, at the same chokepoint: a Postgres unique expression key whose
+	// TRIM remove-string reads as a substring here.
+	if err := translate.RefuseDivergentTrimIndex("", idx, translatableSourceDialect, "MySQL"); err != nil {
+		return "", err
+	}
 
 	var sb strings.Builder
 	sb.WriteString("ADD ")

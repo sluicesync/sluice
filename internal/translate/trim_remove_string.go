@@ -7,7 +7,8 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
-	"unicode/utf8"
+
+	"sluicesync.dev/sluice/internal/ir"
 
 	"sluicesync.dev/sluice/internal/translate/exprident"
 )
@@ -23,14 +24,19 @@ import (
 // Both spell the call identically and both parse it, so an expression that
 // crosses between the two families verbatim computes a different value at
 // exit 0. The two readings agree exactly when the remove-string is zero or one
-// character: a one-character substring and a one-character set are the same
-// thing. So a remove-string is safe to carry across only when it is provably
-// that: a single string literal of at most one character. A column (its value
-// is unknown until a row arrives), an expression, or a longer literal is not.
+// unit long: a one-unit substring and a one-unit set are the same thing. The
+// unit is a character on a character operand and a BYTE on a binary one
+// (VARBINARY/BLOB on MySQL, bytea on Postgres), and nothing here knows the
+// operand's type, so the safe set is a single string literal of at most one
+// BYTE. A one-character multibyte literal is two or more bytes, and over a
+// binary operand MySQL strips the byte sequence while Postgres strips any one
+// of its bytes (found by the Bug 312 review, reproduced on real servers). A
+// column (its value is unknown until a row arrives), an expression, or a
+// longer literal is not safe either.
 //
 // The likeliest real trigger is the Postgres whitespace-set idiom,
-// `trim(both E' \t\r\n' from s)`, which on MySQL strips nothing unless the
-// value happens to end in that exact four-character run.
+// `trim(both E' \t\r\n' from s)`, which on MySQL strips only exact repeats of
+// that four-character run at either end, and usually nothing.
 
 // TrimRemoveStringDiverges returns the first TRIM call in expr whose
 // remove-string MySQL and Postgres would read differently, and true; or "" and
@@ -91,8 +97,8 @@ const TrimRemoveStringMarker = "TRIM-REMOVE-STRING-SEMANTICS"
 // RefuseDivergentTrim returns a loud refusal when expr, written in
 // sourceDialect and bound for targetEngine, carries a TRIM whose remove-string
 // the two families read differently ([TrimRemoveStringDiverges]); nil
-// otherwise. kind is "generated column" or "CHECK constraint"; table and name
-// locate it.
+// otherwise. kind is "generated column", "CHECK constraint", "view" or "unique
+// index"; table and name locate it (table may be empty).
 //
 // Callers pass only the dialect their translator accepts from the OTHER
 // family (a Postgres target passes "mysql", a MySQL target "postgres"); a
@@ -103,8 +109,11 @@ func RefuseDivergentTrim(kind, table, name, expr, sourceDialect, targetEngine st
 		return nil
 	}
 	remedy := "drop it on the source and re-create an equivalent one on the target after the run, or skip the table with `--exclude-table`"
-	if kind == "generated column" {
+	switch kind {
+	case "generated column":
 		remedy = "supply a target-valid body with `--expr-override " + table + "." + name + "=<expression>`, or skip the table with `--exclude-table`"
+	case "view":
+		remedy = "drop the view on the source before the run and re-create an equivalent one on the target after it"
 	}
 	where := ""
 	if table != "" {
@@ -115,9 +124,37 @@ func RefuseDivergentTrim(kind, table, name, expr, sourceDialect, targetEngine st
 			"MySQL strips it as a repeated substring, Postgres strips any character in it as a set "+
 			"(TRIM(BOTH 'xy' FROM 'yxAyx') is 'yxAyx' on MySQL and 'A' on Postgres). Carried across "+
 			"verbatim it would compute different values at exit 0. The two agree only for a remove-string "+
-			"that is a literal of at most one character. Remedy: %s",
+			"that is a literal of at most one byte. Remedy: %s",
 		TrimRemoveStringMarker, kind, name, where, call, targetEngine, sourceDialect, remedy,
 	)
+}
+
+// RefuseDivergentTrimIndex applies [RefuseDivergentTrim] to every
+// sourceDialect expression key part of idx when idx enforces uniqueness
+// (Unique or ConstraintBacked).
+//
+// Only a UNIQUE index is asked, because only uniqueness changes what rows the
+// target accepts: a non-unique expression index is a lookup structure, and a
+// query on the target computes the same target-side expression the index
+// stores. A unique one does not diverge harmlessly in either direction. Postgres
+// → MySQL, rows the source's unique key refuses (`'xA'` and `'yA'` under
+// `trim(both 'xy' from s)`) are both accepted on the target, so the key is
+// silently weaker after cutover, which is the CHECK harm. MySQL → Postgres the
+// target collides on rows the source keyed apart, which is loud, and refusing
+// it up front only moves that failure ahead of the copy.
+func RefuseDivergentTrimIndex(table string, idx *ir.Index, sourceDialect, targetEngine string) error {
+	if idx == nil || !(idx.Unique || idx.ConstraintBacked) {
+		return nil
+	}
+	for _, c := range idx.Columns {
+		if c.Expression == "" || c.ExpressionDialect != sourceDialect {
+			continue
+		}
+		if err := RefuseDivergentTrim("unique index", table, idx.Name, c.Expression, sourceDialect, targetEngine); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // trimRemoveStringSafe reports whether the argument list of one TRIM call
@@ -152,7 +189,7 @@ func trimRemoveStringSafe(args, dialect string) bool {
 var plainCastSuffix = regexp.MustCompile(`^(\s*::\s*[A-Za-z_][A-Za-z_ ]*(\(\s*\d+\s*\))?)*\s*$`)
 
 // singleCharLiteral reports whether s is exactly one standard single-quoted
-// string literal of at most one character, optionally followed by plain
+// string literal of at most one byte, optionally followed by plain
 // casts. An empty s (a remove-string that is not there) is safe too.
 func singleCharLiteral(s string) bool {
 	if s == "" {
@@ -168,8 +205,9 @@ func singleCharLiteral(s string) bool {
 	if !plainCastSuffix.MatchString(s[end:]) {
 		return false
 	}
+	// One BYTE, not one character: see the comment at the top of this file.
 	body := strings.ReplaceAll(s[1:end-1], "''", "'")
-	return utf8.RuneCountInString(body) <= 1
+	return len(body) <= 1
 }
 
 // topLevelFrom returns the index of the first FROM keyword in args at paren

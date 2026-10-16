@@ -6,6 +6,8 @@ package translate
 import (
 	"strings"
 	"testing"
+
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestTrimRemoveStringDiverges pins Bug 312's detector over the shapes each
@@ -31,7 +33,12 @@ func TestTrimRemoveStringDiverges(t *testing.T) {
 		{"mysql leading one char", "mysql", "trim(leading '0' from code)", false},
 		{"mysql empty literal", "mysql", "trim(both '' from s)", false},
 		{"mysql doubled quote is one char", "mysql", "trim(both '''' from s)", false},
-		{"mysql multibyte one char", "mysql", "trim(trailing 'é' from s)", false},
+		// One character, two bytes: over a VARBINARY operand MySQL strips the
+		// byte pair and Postgres's bytea trim strips either byte (the Bug 312
+		// review, reproduced on real servers). The operand type is not known
+		// here, so it is refused.
+		{"mysql multibyte one char is two bytes", "mysql", "trim(trailing 'é' from s)", true},
+		{"pg multibyte one char is two bytes", "postgres", "TRIM(BOTH 'é'::text FROM s)", true},
 		{"mysql two-char literal", "mysql", "trim(both 'xy' from s)", true},
 		{"mysql two-char, no side", "mysql", "trim('xy' from s)", true},
 		{"mysql trailing two-char", "mysql", "trim(trailing 'ab' from s)", true},
@@ -54,7 +61,11 @@ func TestTrimRemoveStringDiverges(t *testing.T) {
 		{"pg one-char cast literal", "postgres", "TRIM(BOTH 'x'::text FROM s)", false},
 		{"pg varchar cast", "postgres", "TRIM(LEADING '0'::character varying FROM code)", false},
 		{"pg two-char cast literal", "postgres", "TRIM(BOTH 'xy'::text FROM s)", true},
-		{"pg whitespace-set idiom", "postgres", `TRIM(BOTH E' \t\r\n'::text FROM s)`, true},
+		// pg_get_expr prints the idiom with the control characters raw (under
+		// standard_conforming_strings); the E'' form is hand-written text.
+		{"pg whitespace-set idiom as printed", "postgres", "TRIM(BOTH ' \t\r\n'::text FROM s)", true},
+		{"pg whitespace-set idiom, E-string", "postgres", `TRIM(BOTH E' \t\r\n'::text FROM s)`, true},
+		{"mysql no side keyword, two chars", "mysql", "trim('ab' from s)", true},
 		{"pg quoted column named both", "postgres", `TRIM(BOTH "both" FROM s)`, true},
 		{"pg column remove-string", "postgres", "TRIM(BOTH pad FROM s)", true},
 		{"pg collate suffix is not a plain cast", "postgres", `TRIM(BOTH 'x' COLLATE "C" FROM s)`, true},
@@ -99,5 +110,39 @@ func TestRefuseDivergentTrim(t *testing.T) {
 	}
 	if !strings.Contains(chk.Error(), TrimRemoveStringMarker) {
 		t.Errorf("CHECK refusal lacks the marker:\n%s", chk)
+	}
+}
+
+// TestRefuseDivergentTrimIndex pins which indexes are asked: a uniqueness-
+// enforcing one with a cross-family expression key part. A non-unique index,
+// a same-family key part and a plain column key are not.
+func TestRefuseDivergentTrimIndex(t *testing.T) {
+	key := func(expr, dialect string) []ir.IndexColumn {
+		return []ir.IndexColumn{{Expression: expr, ExpressionDialect: dialect}}
+	}
+	bad := "trim(both 'xy' from s)"
+	cases := []struct {
+		name string
+		idx  *ir.Index
+		want bool
+	}{
+		{"unique cross-family", &ir.Index{Name: "u", Unique: true, Columns: key(bad, "mysql")}, true},
+		{"constraint-backed cross-family", &ir.Index{Name: "u", ConstraintBacked: true, Columns: key(bad, "mysql")}, true},
+		{"non-unique is a lookup structure", &ir.Index{Name: "i", Columns: key(bad, "mysql")}, false},
+		{"same family", &ir.Index{Name: "u", Unique: true, Columns: key(bad, "postgres")}, false},
+		{"one-byte literal", &ir.Index{Name: "u", Unique: true, Columns: key("trim(both 'x' from s)", "mysql")}, false},
+		{"plain column", &ir.Index{Name: "u", Unique: true, Columns: []ir.IndexColumn{{Column: "s"}}}, false},
+		{"nil", nil, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := RefuseDivergentTrimIndex("t", c.idx, "mysql", "Postgres")
+			if (err != nil) != c.want {
+				t.Fatalf("refused = %v, want %v (err %v)", err != nil, c.want, err)
+			}
+			if err != nil && !strings.Contains(err.Error(), "unique index") {
+				t.Errorf("refusal does not name the site: %v", err)
+			}
+		})
 	}
 }

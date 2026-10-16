@@ -2229,6 +2229,11 @@ func emitCreateIndex(schema string, table *ir.Table, idx *ir.Index, opts emitOpt
 		)
 		return "", nil
 	}
+	// Bug 312: a MySQL unique expression key whose TRIM remove-string reads
+	// as a character set here.
+	if err := translate.RefuseDivergentTrimIndex(tableName, idx, translatableSourceDialect, "Postgres"); err != nil {
+		return "", err
+	}
 
 	var sb strings.Builder
 	sb.WriteString("CREATE ")

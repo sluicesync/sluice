@@ -17,6 +17,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/sluicecode"
+	"sluicesync.dev/sluice/internal/translate"
 )
 
 // SchemaWriter applies an IR Schema to a MySQL database in three
@@ -880,6 +881,13 @@ func (w *SchemaWriter) CreateViews(ctx context.Context, s *ir.Schema) error {
 			// emitting a regular view with the matview's SELECT (the
 			// loud-failure tenet).
 			return fmt.Errorf("mysql: CreateViews: view %q is materialized; MySQL has no materialized view support", view.Name)
+		}
+		// Bug 312: a Postgres view body is emitted verbatim, so a TRIM
+		// remove-string longer than one byte would read as a substring here.
+		if view.DefinitionDialect == translatableSourceDialect {
+			if err := translate.RefuseDivergentTrim("view", "", view.Name, view.Definition, translatableSourceDialect, "MySQL"); err != nil {
+				return err
+			}
 		}
 		stmt := emitCreateView(view)
 		if _, err := w.db.ExecContext(ctx, stmt); err != nil {

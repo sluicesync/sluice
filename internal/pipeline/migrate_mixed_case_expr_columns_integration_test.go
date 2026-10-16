@@ -257,6 +257,27 @@ func TestMigrate_TrimRemoveStringAcrossFamilies(t *testing.T) {
 			CONSTRAINT my_chk_s CHECK (trim(leading 'ab' from s) <> '')
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 		INSERT INTO my_chk (id, s) VALUES (1, 'ba');
+		CREATE TABLE my_noside (
+			id INT NOT NULL PRIMARY KEY,
+			s  VARCHAR(20),
+			g  VARCHAR(20) AS (trim('xy' from s)) STORED
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+		CREATE TABLE my_trail (
+			id INT NOT NULL PRIMARY KEY,
+			s  VARCHAR(20),
+			g  VARCHAR(20) AS (trim(trailing 'ab' from s)) STORED
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+		CREATE TABLE my_bin (
+			id INT NOT NULL PRIMARY KEY,
+			s  VARBINARY(10),
+			g  VARBINARY(10) AS (trim(both 'é' from s)) STORED
+		) ENGINE=InnoDB;
+		INSERT INTO my_bin (id, s) VALUES (1, 0xA941C3);
+		CREATE TABLE my_uidx (
+			id INT NOT NULL PRIMARY KEY,
+			s  VARCHAR(20),
+			UNIQUE KEY my_uidx_u ((trim(both 'xy' from s)))
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 	`)
 	applyPGDDL(t, pgSource, `
 		CREATE TABLE pg_gen (
@@ -278,6 +299,17 @@ func TestMigrate_TrimRemoveStringAcrossFamilies(t *testing.T) {
 			g      VARCHAR(20) GENERATED ALWAYS AS (trim(both "both" from s)) STORED
 		);
 		INSERT INTO pg_col (id, s, "both") VALUES (1, 'abA', 'ab');
+		CREATE TABLE pg_one (
+			id INT PRIMARY KEY,
+			s  VARCHAR(20),
+			g  VARCHAR(20) GENERATED ALWAYS AS (trim(both 'x' from s)) STORED
+		);
+		INSERT INTO pg_one (id, s) VALUES (1, 'xxAxx'), (2, 'xAyx'), (3, 'A');
+		CREATE TABLE pg_uidx (
+			id INT PRIMARY KEY,
+			s  VARCHAR(20)
+		);
+		CREATE UNIQUE INDEX pg_uidx_u ON pg_uidx ((trim(both 'xy' from s)));
 	`)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -293,14 +325,23 @@ func TestMigrate_TrimRemoveStringAcrossFamilies(t *testing.T) {
 	mySrc, myTgt := open("mysql", mysqlSource), open("mysql", mysqlTarget)
 	pgSrc, pgTgt := open("pgx", pgSource), open("pgx", pgTarget)
 
-	t.Run("mysql to postgres refuses", func(t *testing.T) {
-		requireTrimRefusal(ctx, t, "mysql", "postgres", mysqlSource, pgTarget, pgTgt, "my_gen")
-		requireTrimRefusal(ctx, t, "mysql", "postgres", mysqlSource, pgTarget, pgTgt, "my_chk")
-	})
-	t.Run("postgres to mysql refuses", func(t *testing.T) {
-		requireTrimRefusal(ctx, t, "postgres", "mysql", pgSource, mysqlTarget, myTgt, "pg_gen")
-		requireTrimRefusal(ctx, t, "postgres", "mysql", pgSource, mysqlTarget, myTgt, "pg_chk")
-		requireTrimRefusal(ctx, t, "postgres", "mysql", pgSource, mysqlTarget, myTgt, "pg_col")
+	// One subtest per table, so each door is graded on its own rather than
+	// stopping at the first refusal.
+	for _, table := range []string{"my_gen", "my_chk", "my_noside", "my_trail", "my_bin", "my_uidx"} {
+		t.Run("mysql to postgres refuses "+table, func(t *testing.T) {
+			requireTrimRefusal(ctx, t, "mysql", "postgres", mysqlSource, pgTarget, pgTgt, table)
+		})
+	}
+	for _, table := range []string{"pg_gen", "pg_chk", "pg_col", "pg_uidx"} {
+		t.Run("postgres to mysql refuses "+table, func(t *testing.T) {
+			requireTrimRefusal(ctx, t, "postgres", "mysql", pgSource, mysqlTarget, myTgt, table)
+		})
+	}
+	// A one-byte literal means the same on both: carried across, cast
+	// stripped, and computed exactly as Postgres computed it.
+	t.Run("postgres to mysql carries a one-byte literal", func(t *testing.T) {
+		runMigrateScoped(t, "postgres", "mysql", pgSource, mysqlTarget, "trim-pg-one", "pg_one")
+		compareGeneratedWithSource(ctx, t, pgSrc, myTgt, "pg_one", 3, "g")
 	})
 	// Same family, same meaning: carried across and computed exactly as the
 	// source computed it. These run after the refusals, which created nothing.
@@ -312,6 +353,72 @@ func TestMigrate_TrimRemoveStringAcrossFamilies(t *testing.T) {
 		runMigrateScoped(t, "postgres", "postgres", pgSource, pgTarget, "trim-pg", "pg_gen")
 		compareGeneratedWithSource(ctx, t, pgSrc, pgTgt, "pg_gen", 3, "g")
 	})
+}
+
+// TestMigrate_TrimRemoveStringViews is the view sibling of Bug 312, found by
+// the fix's review and reproduced on real servers. A view body is emitted
+// verbatim, so a Postgres view `trim(both pad from s)` landed on MySQL with no
+// cast to make it fail, and the view returned 'yxAyx' where the source's
+// returned 'A', at exit 0. A view carries no rows, so the refusal at the views
+// phase loses nothing: the table is copied, the view is refused by name, and
+// the run fails.
+func TestMigrate_TrimRemoveStringViews(t *testing.T) {
+	mysqlSource, mysqlTarget, mysqlCleanup := startMySQL(t)
+	defer mysqlCleanup()
+	pgSource, pgTarget, pgCleanup := startPostgres(t)
+	defer pgCleanup()
+
+	applyPGDDL(t, pgSource, `
+		CREATE TABLE vt (id INT PRIMARY KEY, s VARCHAR(20), pad VARCHAR(5));
+		INSERT INTO vt VALUES (1, 'yxAyx', 'xy');
+		CREATE VIEW v_trim AS SELECT id, trim(both pad from s) AS g FROM vt;
+	`)
+	applyMySQLDDL(t, mysqlSource, `
+		CREATE TABLE vt (id INT NOT NULL PRIMARY KEY, s VARCHAR(20)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+		INSERT INTO vt VALUES (1, 'yxAyx');
+		CREATE VIEW v_trim AS SELECT id, trim(both 'xy' from s) AS g FROM vt;
+	`)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	cases := []struct {
+		name, src, dst, srcDSN, dstDSN, driver string
+	}{
+		{"postgres to mysql", "postgres", "mysql", pgSource, mysqlTarget, "mysql"},
+		{"mysql to postgres", "mysql", "postgres", mysqlSource, pgTarget, "pgx"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			srcEng, _ := engines.Get(c.src)
+			dstEng, _ := engines.Get(c.dst)
+			mig := &Migrator{Source: srcEng, Target: dstEng, SourceDSN: c.srcDSN, TargetDSN: c.dstDSN}
+			runCtx, runCancel := context.WithTimeout(ctx, 2*time.Minute)
+			defer runCancel()
+			err := mig.Run(runCtx)
+			if err == nil || !strings.Contains(err.Error(), translate.TrimRemoveStringMarker) {
+				t.Fatalf("%s: want the %s refusal for view v_trim, got: %v", c.name, translate.TrimRemoveStringMarker, err)
+			}
+			if !strings.Contains(err.Error(), "v_trim") {
+				t.Errorf("the refusal does not name the view: %v", err)
+			}
+			tgt, oerr := sql.Open(c.driver, c.dstDSN)
+			if oerr != nil {
+				t.Fatalf("open target: %v", oerr)
+			}
+			defer func() { _ = tgt.Close() }()
+			q := "SELECT count(*) FROM information_schema.views WHERE table_name = 'v_trim'"
+			if c.dst == "mysql" {
+				q += " AND table_schema = DATABASE()"
+			}
+			var n int
+			if err := tgt.QueryRowContext(ctx, q).Scan(&n); err != nil {
+				t.Fatalf("look for v_trim on the target: %v", err)
+			}
+			if n != 0 {
+				t.Errorf("view v_trim exists on the %s target after the refusal", c.dst)
+			}
+		})
+	}
 }
 
 // requireTrimRefusal migrates only table and requires the Bug 312 refusal,

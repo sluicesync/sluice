@@ -8,6 +8,7 @@ import (
 	"fmt"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/translate"
 )
 
 // Compile-time proof the ENGINE (not a test stub) answers the pre-copy
@@ -72,6 +73,10 @@ func (Engine) PreflightIndexes(s *ir.Schema) error {
 			}
 			if err := refuseUnrepresentableCollation(idx.Columns, fmt.Sprintf("mysql: index %q", idx.Name),
 				idx.Unique || idx.ConstraintBacked); err != nil {
+				return err
+			}
+			// Bug 312: the same verdict [emitAddIndexClause] gives, before the copy.
+			if err := translate.RefuseDivergentTrimIndex(table.Name, idx, translatableSourceDialect, "MySQL"); err != nil {
 				return err
 			}
 		}

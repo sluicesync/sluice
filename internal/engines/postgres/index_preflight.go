@@ -8,6 +8,7 @@ import (
 	"fmt"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/translate"
 )
 
 // Compile-time proof the ENGINE (not a test stub) answers the pre-copy
@@ -86,6 +87,10 @@ func (Engine) PreflightIndexes(s *ir.Schema) error {
 			// key — the same verdict [emitIndexColumnList] and
 			// [emitAddUniqueConstraint] give, one phase earlier.
 			if err := refuseUnrepresentableCollation(idx.Columns, where, enforces); err != nil {
+				return err
+			}
+			// Bug 312: the same verdict [emitCreateIndex] gives, before the copy.
+			if err := translate.RefuseDivergentTrimIndex(table.Name, idx, translatableSourceDialect, "Postgres"); err != nil {
 				return err
 			}
 			// A ConstraintBacked name is emitted VERBATIM by
