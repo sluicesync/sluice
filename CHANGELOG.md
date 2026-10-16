@@ -4,6 +4,23 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.160.4] - 2026-10-16
+
+### Fixed
+
+- **A copied view now reads the tables of the schema or database it is created in, instead of a same-named schema or database on the target, at exit 0 (HIGH, silent; Bug 314; long-standing).** MySQL stores a view with the database name in every table reference, and Postgres reads one back with its schema name whenever that schema is not on the session's search path. sluice copied the body verbatim. MySQL → MySQL into a differently named database (including with `--map-database`), Postgres into another schema (`--target-schema`, a target `?schema=`, `--map-schema`, `sync start`), and Postgres → MySQL from a non-`public` schema therefore created a view that read a same-named database or schema on the target, or failed loudly when there was none. A `public` source migrated to another schema bound its unqualified body to the target's own `public` tables. Fixes:
+  - The MySQL reader removes the source database's own qualifier, leaving string literals and other databases' references alone (`stripOwnSchemaQualifier`).
+  - The Postgres reader reads view bodies under search_path = the source schema (`catalogQueryUnderSearchPath`).
+  - The Postgres writer creates each view under search_path = the target schema, plus `public` only for a view read from `public` (`execViewDDL`).
+  - A MySQL view that uses its own database's name as a table, derived-table or CTE alias cannot be made portable without guessing, so it is refused by name before any view is created, with `VIEW-QUALIFIER-AMBIGUOUS` (through the new `ir.View.Refusal`, which is omitted when empty, so backup schema fingerprints are unchanged).
+  - A view whose body crosses engine families and named its schema or database until now stays refused, now by name and before the copy, with `VIEW-BODY-CROSS-ENGINE` (`RefuseUnportableView`). This covers MySQL → Postgres/SQLite, and Postgres from a non-`public` schema → MySQL/SQLite. Unqualified, such a body would parse and compute differently: MySQL's `a / b` is `3.5000`, Postgres's and SQLite's `3`.
+  - `VIEW-QUALIFIER-AMBIGUOUS` is also raised before any data moves.
+  - Known loud trades:
+    - A Postgres view calling an extension installed outside `public` may now fail at the views phase.
+    - In a Postgres multi-schema → MySQL fan-out (or a restore of one), a view outside `public` used to create because its qualifier happened to name the database sluice created. It is now refused with `VIEW-BODY-CROSS-ENGINE`.
+  - Still open: a view over another schema that the same run renames, and restores of backups taken before this release.
+  - Pinned against decoys on real servers by `TestMigrate_MySQLToMySQL_ViewReadsTheTargetDatabase` and `TestMigrate_PostgresView_ReadsTheTargetSchema`.
+
 ## [0.160.3] - 2026-10-15
 
 ### Fixed

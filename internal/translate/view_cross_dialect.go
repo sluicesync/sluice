@@ -33,10 +33,10 @@ const ViewCrossDialectMarker = "VIEW-BODY-CROSS-ENGINE"
 //     under a MySQL ci collation and not elsewhere, MySQL's concat(s, NULL) is
 //     NULL where SQLite's is the string. So they stay refused, now by name.
 //
-// A Postgres body read from public, or a SQLite body, crossing engines is left
-// to the existing verbatim policy: it never carried a qualifier, so this fix
-// changes nothing for it (production-readiness "Cross-engine view bodies are
-// emitted verbatim").
+// A Postgres body read from public that crosses engines is left to the
+// existing verbatim policy (SQLite sources carry no views): it never carried
+// a qualifier, so this fix changes nothing for it (production-readiness
+// "Cross-engine view bodies are emitted verbatim").
 func RefuseUnportableView(view *ir.View, targetDialect string) error {
 	if view == nil {
 		return nil
