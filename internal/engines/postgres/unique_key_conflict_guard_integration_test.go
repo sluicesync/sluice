@@ -87,6 +87,49 @@ func TestUniqueKeyConflictGuard_Postgres(t *testing.T) {
 				}
 			})
 
+			t.Run("no primary key, two unique indexes, the arbiter is the one the source dropped", func(t *testing.T) {
+				dsn, cleanup := newSharedPGDB(t, "ukc_arb_"+door)
+				defer cleanup()
+				// The review's measured shape: UNIQUE(code) is the arbiter (the
+				// only all-NOT-NULL index), UNIQUE(email, id) survives beside it.
+				// Before the union identity, INSERT (99,'y@a','a',…) ON CONFLICT
+				// (code) DO UPDATE rewrote row 1 into row 99: INSERT 0 1, row 1
+				// gone, no error.
+				applyPGApplier(t, dsn, `CREATE TABLE ta (id int, email text, code text NOT NULL, v text);
+					CREATE UNIQUE INDEX ta_code ON ta (code); CREATE UNIQUE INDEX ta_email_id ON ta (email, id);
+					INSERT INTO ta VALUES (1,'x@a','a','one');`)
+				const taRows = "SELECT concat_ws(':', id::text, email, code, v) FROM ta"
+				ta := func(pos int, id int64, email, code, v string) ir.Insert {
+					return ir.Insert{Position: kcgPGPos(pos), Schema: "public", Table: "ta", Row: ir.Row{"id": id, "email": email, "code": code, "v": v}}
+				}
+				before := ukcPGRows(t, dsn, taRows)
+				err := kcgPGApply(t, dsn, batched, ta(1, 99, "y@a", "a", "ninetynine"))
+				if !errors.Is(err, ir.ErrUniqueKeyConflictOtherRow) {
+					t.Fatalf("err = %v; want %s", err, ir.ErrUniqueKeyConflictOtherRow)
+				}
+				if got := ukcPGRows(t, dsn, taRows); got != before {
+					t.Fatalf("the refusal changed the target: %s -> %s", before, got)
+				}
+				// The same row at a newer image, agreeing on every unique index:
+				// converges.
+				if err := kcgPGApply(t, dsn, batched, ta(2, 1, "x@a", "a", "uno")); err != nil {
+					t.Fatalf("a newer-image re-send agreeing on every key refused: %v", err)
+				}
+				if got, want := ukcPGRows(t, dsn, taRows), "1:x@a:a:uno"; got != want {
+					t.Fatalf("target %s; want %s", got, want)
+				}
+				// The stated trade (UNIQUE-KEY-GUARD-OVERLAP-REFUSAL): the same
+				// source row re-sent after ANOTHER unique column changed refuses,
+				// loud, target unchanged.
+				err = kcgPGApply(t, dsn, batched, ta(3, 1, "z@a", "a", "uno"))
+				if !errors.Is(err, ir.ErrUniqueKeyConflictOtherRow) {
+					t.Fatalf("trade: err = %v; want %s", err, ir.ErrUniqueKeyConflictOtherRow)
+				}
+				if got, want := ukcPGRows(t, dsn, taRows), "1:x@a:a:uno"; got != want {
+					t.Fatalf("trade: target %s; want %s", got, want)
+				}
+			})
+
 			t.Run("no primary key, one unique index: the newer-image re-send still converges", func(t *testing.T) {
 				dsn, cleanup := newSharedPGDB(t, "ukc_nopk_"+door)
 				defer cleanup()

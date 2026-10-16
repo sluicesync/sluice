@@ -314,6 +314,11 @@ type ChangeApplier struct {
 	// reading the true PK.
 	conflictKeyCache map[string][]string
 
+	// uniqueIndexColsCache maps "schema.table" (routed) to every unique index's
+	// plain columns (the PK excluded) — the conflict-identity guard's identity
+	// for a table without a primary key (unique_key_conflict_guard.go).
+	uniqueIndexColsCache map[string][][]string
+
 	// keyCollationGuardCache maps "schema.table" (routed) → the
 	// key-collation backstop plan computed for the source shape it names
 	// (key_collation_guard.go); dropped with the other metadata on a

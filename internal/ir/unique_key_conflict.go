@@ -15,9 +15,10 @@ import (
 // (Postgres, on a table whose conflict key is not a primary key) resolves a
 // conflict through any unique key it has, and then overwrites the row it
 // matched. When that row's primary key differs from the incoming row's (or,
-// on a table without one, when any column differs), the incoming row is a
-// second row of the source, not a re-delivery of the first: the source has
-// no such unique key any more (a `DROP INDEX` or `DROP CONSTRAINT` sluice
+// on a table without one and with two or more unique keys, when it
+// disagrees on any unique key's columns), the incoming row is a second row
+// of the source, not a re-delivery of the first: the source has no such
+// unique key any more (a `DROP INDEX` or `DROP CONSTRAINT` sluice
 // does not forward), and applying the upsert would replace one source row
 // with another at exit 0.
 //
@@ -56,7 +57,7 @@ func (e *UniqueKeyConflictError) Error() string {
 		remedy = "Drop that unique key on the target if the source no longer has it, then restart; or re-copy the table."
 	}
 	return fmt.Sprintf("%s: %s matched an existing target row through %s, and that row is a different row: "+
-		"its primary key (or, on a table without one, its values) differs from the incoming row's. The probable "+
+		"its primary key (or, on a table without one, one of its unique keys) differs from the incoming row's. The probable "+
 		"cause is a unique key the target still has and the source no longer does — a DROP INDEX or DROP "+
 		"CONSTRAINT sluice does not forward — so the source now holds both rows and the target can hold only one. "+
 		"Applying it would overwrite the existing row with the incoming one. Refusing before it is applied (the "+

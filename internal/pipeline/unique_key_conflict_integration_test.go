@@ -111,10 +111,6 @@ type ukcScenario struct {
 const (
 	ukcGuard = "UNIQUE-KEY-CONFLICT-OTHER-ROW"
 	ukcDoor  = "UNFORWARDED-SCHEMA-CHANGE"
-	// ukcPGUniqueViolation: a Postgres target without a primary key keys its
-	// ON CONFLICT on one of the two unique indexes (kd_id); a conflict
-	// through the other is a unique_violation, loud before this fix too.
-	ukcPGUniqueViolation = "SQLSTATE 23505"
 )
 
 // ukcCreate is kd on the source's dialect. The keyless shape carries a
@@ -122,13 +118,16 @@ const (
 // merge is indistinguishable from the newer-image re-send the upsert must
 // absorb, and is deliberately not guarded at apply time
 // (engines/mysql/unique_key_conflict_guard.go); with two, the surviving key
-// is the identity the guard checks.
+// is the identity the guard checks. The second key is named kd_zid so the
+// DROPPED kd_k sorts first and is a Postgres target's ON CONFLICT arbiter
+// (fewest columns, then the smallest name): the review's shape, where the
+// merge goes through the arbiter itself and no unique_violation fires.
 func ukcCreate(dialect string, keyless bool) string {
 	pk := " PRIMARY KEY"
 	idKey, idKeyMy := "", ""
 	if keyless {
 		pk = ""
-		idKey, idKeyMy = "CREATE UNIQUE INDEX kd_id ON kd (id); ", ", UNIQUE KEY kd_id (id)"
+		idKey, idKeyMy = "CREATE UNIQUE INDEX kd_zid ON kd (id); ", ", UNIQUE KEY kd_zid (id)"
 	}
 	if dialect == "postgres" {
 		return "CREATE TABLE kd (id int NOT NULL" + pk + ", k varchar(20) NOT NULL, v varchar(20)); " +
@@ -281,7 +280,7 @@ func TestStreamer_UniqueKeyConflict_PostgresSource(t *testing.T) {
 		{"mysql/keyless/stopped", "mysql", ukcScenario{keyless: true, stopped: true, markers: []string{ukcGuard}}},
 		{"mysql/pk/stopped/control", "mysql", ukcScenario{stopped: true, control: true}},
 		{"postgres/keyless/live", "postgres", ukcScenario{keyless: true, markers: []string{ukcDoor}}},
-		{"postgres/keyless/stopped", "postgres", ukcScenario{keyless: true, stopped: true, markers: []string{ukcPGUniqueViolation}}},
+		{"postgres/keyless/stopped", "postgres", ukcScenario{keyless: true, stopped: true, markers: []string{ukcGuard}}},
 		{"postgres/keyless/stopped/control", "postgres", ukcScenario{keyless: true, stopped: true, control: true}},
 	}
 	for i, c := range cells {
@@ -318,7 +317,7 @@ func TestStreamer_UniqueKeyConflict_MySQLSource(t *testing.T) {
 	}{
 		{"mysql/pk/stopped", "mysql", ukcScenario{stopped: true, markers: []string{ukcGuard}}},
 		{"mysql/pk/stopped/control", "mysql", ukcScenario{stopped: true, control: true}},
-		{"postgres/keyless/stopped", "postgres", ukcScenario{keyless: true, stopped: true, markers: []string{ukcPGUniqueViolation}}},
+		{"postgres/keyless/stopped", "postgres", ukcScenario{keyless: true, stopped: true, markers: []string{ukcGuard}}},
 	}
 	for i, c := range cells {
 		t.Run(c.name, func(t *testing.T) {

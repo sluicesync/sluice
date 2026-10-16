@@ -50,7 +50,7 @@ func TestConflictIdentityColumns(t *testing.T) {
 // key-collation guard alone renders exactly what it did before.
 func TestRenderUpsertGuard_Shapes(t *testing.T) {
 	cols := []string{"id", "k", "v"}
-	if a, _, ok := renderUpsertGuard("`s`.`kd`", cols, []string{"id"}, upsertRowAlias, nil, nil); a != "" || !ok {
+	if a, _, ok := renderUpsertGuard("`s`.`kd`", cols, []string{"id"}, upsertRowAlias, nil, nil, nil); a != "" || !ok {
 		t.Fatalf("unarmed rendered %q", a)
 	}
 	coll := planKeyCollationGuard(kcgSource(ir.Varchar{Length: 20, Charset: "utf8mb4", Collation: "utf8mb4_bin"}),
@@ -61,7 +61,7 @@ func TestRenderUpsertGuard_Shapes(t *testing.T) {
 	}
 	kcCols := []string{"d", "id", "k"}
 	for _, upsert := range []upsertSpelling{upsertRowAlias, upsertValuesFunc} {
-		assign, hang, _ := renderUpsertGuard("`s`.`kd`", cols, []string{"id"}, upsert, []string{"id"}, nil)
+		assign, hang, _ := renderUpsertGuard("`s`.`kd`", cols, []string{"id"}, upsert, []string{"id"}, nil, nil)
 		newK := upsert.newRowRef("`k`")
 		want := "`k` = IF((`s`.`kd`.`id` <=> " + upsert.newRowRef("`id`") + "), " + newK +
 			", IF((18446744073709551615 + OCTET_LENGTH(CONCAT('UNIQUE-KEY-CONFLICT-OTHER-ROW', ISNULL(" + newK + ")))) = 0, " +
@@ -70,7 +70,7 @@ func TestRenderUpsertGuard_Shapes(t *testing.T) {
 			t.Errorf("identity only:\n got %s (hang %s)\nwant %s", assign, hang, want)
 		}
 		// Keyless: every column is the identity, and the hang is the first.
-		assign, hang, _ = renderUpsertGuard("`s`.`kd`", cols, nil, upsert, cols, nil)
+		assign, hang, _ = renderUpsertGuard("`s`.`kd`", cols, nil, upsert, cols, nil, nil)
 		for _, c := range cols {
 			if !strings.Contains(assign, "`s`.`kd`.`"+c+"` <=> "+upsert.newRowRef("`"+c+"`")) {
 				t.Errorf("keyless: %s does not compare %s", assign, c)
@@ -81,13 +81,13 @@ func TestRenderUpsertGuard_Shapes(t *testing.T) {
 		}
 		// Key-collation alone: exactly the assignment it rendered before.
 		before, beforeHang, _ := coll.render("s", "kd", kcCols, upsert)
-		assign, hang, _ = renderUpsertGuard("`s`.`kd`", kcCols, []string{"id"}, upsert, nil, coll)
+		assign, hang, _ = renderUpsertGuard("`s`.`kd`", kcCols, []string{"id"}, upsert, nil, nil, coll)
 		if assign != before || hang != beforeHang {
 			t.Errorf("key-collation alone changed:\n got %s\nwant %s", assign, before)
 		}
 		// Composed: the key-collation raise is the OUTER check, and the
 		// identity check replaces its passing value.
-		assign, hang, _ = renderUpsertGuard("`s`.`kd`", kcCols, []string{"id"}, upsert, []string{"id"}, coll)
+		assign, hang, _ = renderUpsertGuard("`s`.`kd`", kcCols, []string{"id"}, upsert, []string{"id"}, nil, coll)
 		kc := strings.Index(assign, "KEY-COLLATION-MERGE")
 		uk := strings.Index(assign, "UNIQUE-KEY-CONFLICT-OTHER-ROW")
 		if hang != beforeHang || kc < 0 || uk < 0 || uk > kc || !strings.HasPrefix(assign, "`d` = IF(") {
@@ -97,7 +97,7 @@ func TestRenderUpsertGuard_Shapes(t *testing.T) {
 			t.Errorf("composed: the identity check is not the key-collation guard's passing value: %s", assign)
 		}
 	}
-	if _, _, ok := renderUpsertGuard("`s`.`kd`", []string{"d", "id"}, []string{"id"}, upsertRowAlias, []string{"id"}, coll); ok {
+	if _, _, ok := renderUpsertGuard("`s`.`kd`", []string{"d", "id"}, []string{"id"}, upsertRowAlias, []string{"id"}, nil, coll); ok {
 		t.Error("a key-collation guard whose key column is not in the insert rendered")
 	}
 }
@@ -179,9 +179,10 @@ func TestUpsertGuardRefusal_Attribution(t *testing.T) {
 	}
 }
 
-// TestUndeclaredUniqueKeys pins the copy writer's arming: a target unique key
-// the copy's source declares (by name, or by the same plain columns) is
-// declared; one it does not, or a functional one under another name, arms.
+// TestUndeclaredUniqueKeys pins the copy writer's arming: a plain target key
+// is declared by a source unique index over the same columns and prefix
+// lengths (its name does not count, so a key redefined under the old name
+// arms); a functional key is declared only by name; anything else arms.
 func TestUndeclaredUniqueKeys(t *testing.T) {
 	src := &ir.Table{
 		Name:       "kd",
@@ -190,20 +191,32 @@ func TestUndeclaredUniqueKeys(t *testing.T) {
 			{Name: "kd_k", Unique: true, Columns: []ir.IndexColumn{{Column: "k"}}},
 			{Name: "src_ab", Unique: true, Columns: []ir.IndexColumn{{Column: "a"}, {Column: "b"}}},
 			{Name: "plain_v", Columns: []ir.IndexColumn{{Column: "v"}}},
+			{Name: "kd_p", Unique: true, Columns: []ir.IndexColumn{{Column: "p", Length: 5}}},
+			{Name: "fn_ok", Unique: true, Columns: []ir.IndexColumn{{Expression: "lower(k)"}}},
 		},
 	}
 	keys := targetUniqueKeys{
 		pk:          []string{"id"},
-		uniques:     [][]string{{"k"}, {"A", "b"}, {"v"}, {"w"}, {"k"}},
-		uniqueNames: []string{"KD_K", "tgt_ab", "tgt_v", "tgt_w", "fn_k"},
-		uniqueFns:   [][]*functionalKeyPart{nil, nil, nil, nil, {{index: "fn_k"}}},
+		uniques:     [][]string{{"k"}, {"A", "b"}, {"v"}, {"w"}, {"k"}, {"k"}, {"p"}, {"p"}, {"x"}},
+		uniqueSubs:  [][]int{{0}, {0, 0}, {0}, {0}, {0}, {0}, {5}, {9}, {0}},
+		uniqueNames: []string{"KD_K", "tgt_ab", "tgt_v", "tgt_w", "fn_k", "fn_ok", "p5", "p9", "kd_k"},
+		uniqueFns:   [][]*functionalKeyPart{nil, nil, nil, nil, {{index: "fn_k"}}, {{index: "fn_ok"}}, nil, nil, nil},
 	}
-	got, names := undeclaredUniqueKeys(src, keys)
-	if want := []string{"tgt_v", "tgt_w", "fn_k"}; !slices.Equal(names, want) {
+	got, names, cols := undeclaredUniqueKeys(src, keys)
+	if want := []string{"tgt_v", "tgt_w", "fn_k", "p9", "kd_k"}; !slices.Equal(names, want) {
 		t.Fatalf("undeclared %v (%v); want %v", names, got, want)
 	}
 	if got[0] != "tgt_v (v)" {
 		t.Errorf("rendered %q", got[0])
+	}
+	if cols[2] != nil || strings.Join(cols[0], ",") != "v" {
+		t.Errorf("columns %v; want v first and nil for the functional key", cols)
+	}
+	if copyGuardScope(cols) != nil {
+		t.Error("a functional undeclared key must widen the scope to every conflict")
+	}
+	if s := copyGuardScope([][]string{{"v"}, {"w"}}); len(s) != 2 {
+		t.Errorf("plain undeclared keys: scope %v", s)
 	}
 }
 
@@ -212,7 +225,7 @@ func TestUndeclaredUniqueKeys(t *testing.T) {
 // assignment, keyed on the copy's own key, and the zero guard is unchanged.
 func TestBuildBatchUpsert_ConflictIdentityGuard(t *testing.T) {
 	table := &ir.Table{Name: "kd", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{}}, {Name: "k", Type: ir.Text{}}, {Name: "v", Type: ir.Text{}}}}
-	assign, hang, _ := renderUpsertGuard(quoteIdent("kd"), []string{"id", "k", "v"}, []string{"id"}, upsertRowAlias, []string{"id"}, nil)
+	assign, hang, _ := renderUpsertGuard(quoteIdent("kd"), []string{"id", "k", "v"}, []string{"id"}, upsertRowAlias, []string{"id"}, nil, nil)
 	g := copyKeyCollationGuard{assign: assign, hang: hang, schema: "s", undeclared: []string{"kd_k (k)"}, undeclaredNames: []string{"kd_k"}}
 	got := buildBatchUpsert(table, 1, []string{"id"}, upsertRowAlias, g)
 	_, clause, _ := strings.Cut(got, upsertRowAlias.clauseOpen())

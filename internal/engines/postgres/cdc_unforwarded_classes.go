@@ -519,10 +519,16 @@ func diffRelationFacts(prior, cur *pgRelationFacts) []string {
 	// retype of a key column explaining a change (its rebuild can alter the
 	// expression tree). A DROP whose column is gone is the target's own DROP
 	// COLUMN's cascade.
+	// An ALTER INDEX … RENAME is no change: an index that left under one name
+	// and arrived under another with the identical structure is paired off
+	// (only when the structure is unique among the moved indexes, so two
+	// swapped definitions are not mistaken for renames).
+	renamed := renamedUniqueIndexes(prior.uniqueIndexes, cur.uniqueIndexes)
 	for _, name := range sortedFactKeys(cur.uniqueIndexes) {
 		cc := cur.uniqueIndexes[name]
 		pc, ok := prior.uniqueIndexes[name]
 		switch {
+		case renamed[name]:
 		case !ok:
 			deltas = append(deltas, fmt.Sprintf("CREATE UNIQUE INDEX %q (%s)", name, cc.display))
 		case pc.compare != cc.compare && !touches(cc.attnums, retypedOnly):
@@ -531,6 +537,9 @@ func diffRelationFacts(prior, cur *pgRelationFacts) []string {
 	}
 	for _, name := range sortedFactKeys(prior.uniqueIndexes) {
 		if _, ok := cur.uniqueIndexes[name]; ok {
+			continue
+		}
+		if renamed[name] {
 			continue
 		}
 		pc := prior.uniqueIndexes[name]
@@ -562,6 +571,31 @@ func diffRelationFacts(prior, cur *pgRelationFacts) []string {
 		}
 	}
 	return deltas
+}
+
+// renamedUniqueIndexes pairs a unique index present only in prior with one
+// present only in cur when their structural comparison values are equal and
+// that value is unique on each side among such indexes — an ALTER INDEX …
+// RENAME. Both names are returned.
+func renamedUniqueIndexes(prior, cur map[string]pgConstraintFact) map[string]bool {
+	gone, came := map[string][]string{}, map[string][]string{}
+	for name, f := range prior {
+		if _, ok := cur[name]; !ok {
+			gone[f.compare] = append(gone[f.compare], name)
+		}
+	}
+	for name, f := range cur {
+		if _, ok := prior[name]; !ok {
+			came[f.compare] = append(came[f.compare], name)
+		}
+	}
+	out := map[string]bool{}
+	for compare, g := range gone {
+		if c := came[compare]; len(g) == 1 && len(c) == 1 {
+			out[g[0]], out[c[0]] = true, true
+		}
+	}
+	return out
 }
 
 func sortedFactKeys[V any](m map[string]V) []string {

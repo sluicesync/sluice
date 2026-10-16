@@ -134,7 +134,7 @@ func (w *RowWriter) resolveCopyKeyCollationGuard(ctx context.Context, q queryRow
 		return copyKeyCollationGuard{}, keyCollationFunctionalUnsupported(qualifiedName(w.schema, table.Name), keys.unresolved)
 	}
 	plan := planCopyKeyCollationGuard(table, colTypes, keys, compareAs)
-	undeclared, undeclaredNames := undeclaredUniqueKeys(table, keys)
+	undeclared, undeclaredNames, undeclaredCols := undeclaredUniqueKeys(table, keys)
 	if plan == nil && len(undeclared) == 0 {
 		return copyKeyCollationGuard{}, nil
 	}
@@ -166,7 +166,7 @@ func (w *RowWriter) resolveCopyKeyCollationGuard(ctx context.Context, q queryRow
 	if len(undeclared) > 0 {
 		identity = conflictIdentityColumns(keyCols, names, uniqueKeyColumnSets(keys))
 	}
-	assign, hang, ok := renderUpsertGuard(quoteIdent(table.Name), names, keyCols, w.upsert, identity, plan)
+	assign, hang, ok := renderUpsertGuard(quoteIdent(table.Name), names, keyCols, w.upsert, identity, copyGuardScope(undeclaredCols), plan)
 	if !ok {
 		need, _ := keyCollationNeeds(plan)
 		return copyKeyCollationGuard{}, &terminalMySQLError{err: fmt.Errorf("%w: %s: mysql: copy into %s: a key column "+
@@ -212,10 +212,17 @@ func (w *RowWriter) replayArmedBatchAsGuardedUpsert(ctx context.Context, c *sql.
 	if err != nil {
 		return true, err
 	}
-	if guard.plan == nil {
+	keyCols, ok := effectiveUpsertKeyColumns(table)
+	// The conflict-identity guard arms the replay too
+	// (SOURCE-DROPPED-UNIQUE-KEY-MERGE): with a target unique key the source
+	// does not declare, a duplicate on the re-sent batch may be a different
+	// source row colliding on that key, which the 1062 tolerance would accept
+	// as the batch's own and drop. A table with no upsert key keeps the
+	// tolerance path only when nothing but that guard is armed (it never
+	// reaches a retry: flushWithReparentRetry refuses it first).
+	if guard.plan == nil && (len(guard.undeclared) == 0 || !ok) {
 		return false, nil
 	}
-	keyCols, ok := effectiveUpsertKeyColumns(table)
 	if !ok {
 		return true, w.refuseAmbiguousReplay(ctx, c, table)
 	}

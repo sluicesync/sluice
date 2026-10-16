@@ -24,18 +24,28 @@ package postgres
 // # The rule, and what it cannot reach
 //
 // The identity is the MySQL twin's: the primary key when the row supplies
-// it, else the columns of every unique key. On Postgres the second arm adds
-// nothing — the arbiter is one key, and a matched row that disagrees on
-// any OTHER unique index is already a unique_violation — so the guard is
-// armed only on a table with a primary key that is not its conflict key (a
-// DEFERRABLE one, which [loadConflictKey] skips as an arbiter). There, a
-// matched row with a different primary key raises
-// UNIQUE-KEY-CONFLICT-OTHER-ROW and rolls the statement back.
+// it, else the columns of every unique index (the arbiter included) when
+// the table has at least two. The second arm is NOT redundant on Postgres:
+// a DO UPDATE rewrites the matched row's OTHER unique columns too, and a
+// unique_violation fires only when a THIRD row already holds the new value
+// (review finding, measured on postgres:16: `t(id, email, code, v)` keyed on
+// UNIQUE(code) beside UNIQUE(email, id), `INSERT (99,'y@a','a',…) ON
+// CONFLICT (code) DO UPDATE` onto (1,'x@a','a',…) returned INSERT 0 1 and
+// row 1 was gone). Guarded:
 //
-// The measured c5g shape — no primary key, ONE unique index as the arbiter
-// — is not guarded, stated so it cannot be read as broader. The merge and
-// the newer-image re-send the ON CONFLICT exists for (a re-applied Insert
-// carrying a changed non-key column, pinned by
+//   - a table with a primary key that is not its conflict key (a DEFERRABLE
+//     one, which [loadConflictKey] skips as an arbiter): the primary key;
+//   - a table with no primary key and two or more unique indexes: every
+//     unique index's columns, so a matched row disagreeing on any of them
+//     refuses — including when the dropped index IS the arbiter.
+//
+// A table keyed on its primary key needs nothing: a conflict through the
+// arbiter IS the same row.
+//
+// The shape left open — no primary key and exactly ONE unique index — is
+// stated so it cannot be read as broader. The merge and the newer-image
+// re-send the ON CONFLICT exists for (a re-applied Insert carrying a changed
+// non-key column, pinned by
 // TestChangeApplier_NoPKUniqueKeyInsert_IdempotentReplay) are the same
 // statement against the same target row, and nothing the applier holds
 // tells them apart: the CDC boundary shapes carry no unique indexes
@@ -47,6 +57,12 @@ package postgres
 // pgoutput door now refuses a live DROP INDEX (cdc_unforwarded_classes.go),
 // and a DROP made while the stream was stopped is the filed stream-open
 // comparison (UNIQUE-KEY-STOPPED-WINDOW-DOOR).
+//
+// The cost of the union arm, stated: a newer image of the SAME source row
+// whose other unique column changed (a keyless row whose `email` was
+// updated, re-sent by an ADR-0072 resume or replayed in an overlap window
+// onto a target that already holds the update) refuses where it used to
+// converge — loud (UNIQUE-KEY-GUARD-OVERLAP-REFUSAL).
 //
 // The comparison is on each value's text form under COLLATE "C" — every
 // type has a text output, while some (json) have no equality operator at
@@ -61,8 +77,9 @@ package postgres
 // armed too, its predicate is the OUTER check and this one is its agreeing
 // value, so a key the target's collation equates reports as that guard's
 // merge; the identity is checked for every row it passed. The cast's
-// operand is `pg_catalog.concat(EXCLUDED.<col>)`, which references the row (so the planner cannot fold it) and is never NULL (a
-// NULL would make the cast NULL instead of an error).
+// operand is `pg_catalog.concat(EXCLUDED.<col>)`, which references the row
+// (so the planner cannot fold it) and is never NULL (a NULL would make the
+// cast NULL instead of an error).
 
 import (
 	"context"
@@ -79,21 +96,22 @@ import (
 // refusal's sentinel ([ir.ErrUniqueKeyConflictOtherRow]) is the same text.
 const uniqueKeyConflictMarker = "UNIQUE-KEY-CONFLICT-OTHER-ROW"
 
-// pgConflictIdentity arms the guard for one table: it has a primary key that
-// is not its conflict key (a DEFERRABLE one, which Postgres refuses as an
-// arbiter, so [loadConflictKey] fell through to a unique index). pk is that
-// primary key, key the conflict key, for the refusal's text.
+// pgConflictIdentity arms the guard for one table whose conflict key is not
+// its primary key. pk is the primary key (empty when there is none);
+// uniqueCols is every unique index's plain columns, the primary key excluded
+// and the arbiter included; key is the conflict key, for the refusal's text.
 type pgConflictIdentity struct {
-	pk  []string
-	key []string
+	pk         []string
+	uniqueCols [][]string
+	key        []string
 }
 
 // newPGConflictIdentity returns the guard for a table whose conflict key is
-// key and whose primary key is pk, or nil when the conflict key IS the
-// primary key (any other index's conflict is a unique_violation), there is
-// no primary key (see the file comment), or no conflict key (a plain INSERT).
-func newPGConflictIdentity(pk, key []string) *pgConflictIdentity {
-	if len(key) == 0 || len(pk) == 0 {
+// key, or nil when the conflict key IS the primary key, there is no conflict
+// key (a plain INSERT), or the table has no primary key and fewer than two
+// unique indexes (see the file comment).
+func newPGConflictIdentity(pk, key []string, uniqueCols [][]string) *pgConflictIdentity {
+	if len(key) == 0 {
 		return nil
 	}
 	if len(pk) == len(key) {
@@ -108,13 +126,16 @@ func newPGConflictIdentity(pk, key []string) *pgConflictIdentity {
 			return nil
 		}
 	}
-	return &pgConflictIdentity{pk: append([]string(nil), pk...), key: append([]string(nil), key...)}
+	if len(pk) == 0 && len(uniqueCols) < 2 {
+		return nil
+	}
+	return &pgConflictIdentity{pk: append([]string(nil), pk...), uniqueCols: uniqueCols, key: append([]string(nil), key...)}
 }
 
 // conflictIdentityFor returns the conflict-identity guard for an insert into
-// schema.table (routed) keyed on key, or nil when the conflict key is the
-// table's primary key. The primary key comes from the applier's cached
-// metadata ([ChangeApplier.pkForRedact]), so the steady state costs nothing.
+// schema.table (routed) keyed on key, or nil when unarmed. The primary key
+// and the unique indexes come from cached catalog reads, so the steady state
+// costs nothing.
 func (a *ChangeApplier) conflictIdentityFor(ctx context.Context, schema, table string, key []string) (*pgConflictIdentity, error) {
 	if len(key) == 0 {
 		return nil, nil
@@ -123,23 +144,103 @@ func (a *ChangeApplier) conflictIdentityFor(ctx context.Context, schema, table s
 	if err != nil {
 		return nil, fmt.Errorf("postgres: applier: primary-key lookup for the conflict-identity guard on %s.%s: %w", schema, table, err)
 	}
-	return newPGConflictIdentity(pk, key), nil
+	var uniqueCols [][]string
+	if len(pk) == 0 {
+		if uniqueCols, err = a.uniqueIndexColumnsFor(ctx, schema, table); err != nil {
+			return nil, fmt.Errorf("postgres: applier: unique-index lookup for the conflict-identity guard on %s.%s: %w", schema, table, err)
+		}
+	}
+	return newPGConflictIdentity(pk, key, uniqueCols), nil
+}
+
+// uniqueIndexColumnsFor returns, cached per table, every unique index's
+// plain key columns (expression elements skipped; the primary key
+// excluded). A partial index counts: agreeing on its columns is required of
+// the same row whether or not the predicate covers it.
+func (a *ChangeApplier) uniqueIndexColumnsFor(ctx context.Context, schema, table string) ([][]string, error) {
+	qn := schemaTableKey(schema, table)
+	a.cacheMu.RLock()
+	v, ok := a.uniqueIndexColsCache[qn]
+	a.cacheMu.RUnlock()
+	if ok {
+		return v, nil
+	}
+	rows, err := a.db.QueryContext(ctx, `
+		SELECT ix.indexrelid, a.attname
+		FROM   pg_index ix
+		JOIN   pg_class      tcl ON tcl.oid = ix.indrelid
+		JOIN   pg_namespace  n   ON n.oid   = tcl.relnamespace
+		JOIN   LATERAL pg_catalog.unnest(ix.indkey) WITH ORDINALITY AS u(attnum, ord) ON TRUE
+		JOIN   pg_attribute  a   ON a.attrelid = ix.indrelid AND a.attnum = u.attnum
+		WHERE  n.nspname = $1 AND tcl.relname = $2
+		  AND  ix.indisunique AND NOT ix.indisprimary AND ix.indisvalid
+		ORDER  BY ix.indexrelid, u.ord`, schema, table)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out [][]string
+	var last uint32
+	for rows.Next() {
+		var oid uint32
+		var col string
+		if err := rows.Scan(&oid, &col); err != nil {
+			return nil, err
+		}
+		if len(out) == 0 || oid != last {
+			out = append(out, nil)
+			last = oid
+		}
+		out[len(out)-1] = append(out[len(out)-1], col)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	a.cacheMu.Lock()
+	if a.uniqueIndexColsCache == nil {
+		a.uniqueIndexColsCache = map[string][][]string{}
+	}
+	a.uniqueIndexColsCache[qn] = out
+	a.cacheMu.Unlock()
+	return out, nil
 }
 
 // columns is the identity an insert of cols must find on the matched row:
-// the primary key when the insert names every column of it, else nil
-// (unarmed for that statement).
+// the primary key when the insert names every column of it, else the union
+// of the unique indexes' columns when there are two or more and the insert
+// names every one, else nil (unarmed for that statement).
 func (g *pgConflictIdentity) columns(cols []string) []string {
 	have := make(map[string]bool, len(cols))
 	for _, c := range cols {
 		have[c] = true
 	}
-	for _, p := range g.pk {
-		if !have[p] {
-			return nil
+	pick := func(want []string) []string {
+		seen := map[string]bool{}
+		out := make([]string, 0, len(want))
+		for _, w := range want {
+			if !have[w] {
+				return nil
+			}
+			if !seen[w] {
+				seen[w] = true
+				out = append(out, w)
+			}
+		}
+		return out
+	}
+	if len(g.pk) > 0 {
+		if out := pick(g.pk); out != nil {
+			return out
 		}
 	}
-	return g.pk
+	if len(g.uniqueCols) < 2 {
+		return nil
+	}
+	var union []string
+	for _, k := range g.uniqueCols {
+		union = append(union, k...)
+	}
+	return pick(union)
 }
 
 // wrap returns the DO UPDATE's predicate for an insert of cols: inner (the

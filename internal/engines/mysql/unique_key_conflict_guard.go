@@ -79,6 +79,18 @@ package mysql
 // key has always refused that replay loudly (a unique_violation on the
 // non-arbiter key), so this is parity, not a new class of wedge.
 //
+// The union arm has the same cost, wider (review MEDIUM, pinned as a stated
+// trade): on a table without a primary key (or with a surrogate one the rows
+// do not supply) and two or more unique keys, the SAME source row re-sent in
+// a newer image whose OTHER unique column changed — kd(id UNIQUE, k UNIQUE),
+// target (3,'c'), the source updated id to 4, an ADR-0072 resumable VStream
+// cold start re-sends (4,'c') — is the same statement as a merge and refuses.
+// It lands only where such a row is re-delivered onto a target that already
+// holds an older image AND one of its unique columns changed in between; it
+// is not every resume of such a table. No narrowing is sound: the merge and
+// the re-send differ only in source history the applier does not hold.
+// UNIQUE-KEY-GUARD-OVERLAP-REFUSAL in the audit backlog.
+//
 // # Mechanism
 //
 // The key-collation guard's (key_collation_guard.go, whose comment has the
@@ -98,6 +110,7 @@ package mysql
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/go-sql-driver/mysql"
@@ -203,8 +216,8 @@ func uniqueKeyColumnSets(keys targetUniqueKeys) [][]string {
 // hang column when only the identity guard is armed. assign is "" when
 // neither is; ok is false when coll cannot reference a key column's
 // incoming value (the caller refuses).
-func renderUpsertGuard(tableRef string, cols, pk []string, upsert upsertSpelling, identity []string, coll *keyCollationPlan) (assign, hang string, ok bool) {
-	check := func(h string) string { return identityCheckValue(tableRef, upsert, identity, h) }
+func renderUpsertGuard(tableRef string, cols, pk []string, upsert upsertSpelling, identity []string, scope [][]string, coll *keyCollationPlan) (assign, hang string, ok bool) {
+	check := func(h string) string { return identityCheckValue(tableRef, upsert, identity, scope, h) }
 	switch {
 	case coll != nil:
 		var value string
@@ -227,14 +240,32 @@ func renderUpsertGuard(tableRef string, cols, pk []string, upsert upsertSpelling
 // equals the incoming row on every identity column, the marker's raise
 // otherwise. The raise sits in the CONDITION of an IF whose arms are both
 // the incoming value, as the key-collation guard's does.
-func identityCheckValue(tableRef string, upsert upsertSpelling, identity []string, hang string) string {
+//
+// scope, when non-empty, limits the check to conflicts that MAY have come
+// through one of those keys: the matched row must agree with the incoming
+// row on every column of at least one of them (`=`, so a NULL never agrees —
+// a unique key never matches through a NULL), else the conflict came through
+// another key and is absorbed. nil applies the check to every conflict.
+func identityCheckValue(tableRef string, upsert upsertSpelling, identity []string, scope [][]string, hang string) string {
 	eq := make([]string, len(identity))
 	for i, c := range identity {
 		eq[i] = tableRef + "." + quoteIdent(c) + " <=> " + upsert.newRowRef(quoteIdent(c))
 	}
 	newHang := upsert.newRowRef(quoteIdent(hang))
 	raise := "18446744073709551615 + OCTET_LENGTH(CONCAT('" + uniqueKeyConflictMarker + "', ISNULL(" + newHang + ")))"
-	return "IF((" + strings.Join(eq, " AND ") + "), " + newHang + ", IF((" + raise + ") = 0, " + newHang + ", " + newHang + "))"
+	ok := "(" + strings.Join(eq, " AND ") + ")"
+	if len(scope) > 0 {
+		agree := make([]string, len(scope))
+		for i, key := range scope {
+			parts := make([]string, len(key))
+			for j, c := range key {
+				parts[j] = tableRef + "." + quoteIdent(c) + " = " + upsert.newRowRef(quoteIdent(c))
+			}
+			agree[i] = "COALESCE((" + strings.Join(parts, " AND ") + "), FALSE)"
+		}
+		ok = "(" + ok + " OR NOT (" + strings.Join(agree, " OR ") + "))"
+	}
+	return "IF(" + ok + ", " + newHang + ", IF((" + raise + ") = 0, " + newHang + ", " + newHang + "))"
 }
 
 // isUniqueKeyConflictRaise reports whether err is the guard's raise: a 1690
@@ -306,7 +337,7 @@ func (g *applyUpsertGuard) render(tableRef string, cols, pk []string, upsert ups
 	if len(g.others) > 0 {
 		identity = conflictIdentityColumns(pk, cols, g.uniqueCols)
 	}
-	return renderUpsertGuard(tableRef, cols, pk, upsert, identity, g.coll)
+	return renderUpsertGuard(tableRef, cols, pk, upsert, identity, nil, g.coll)
 }
 
 // upsertGuardRefusal attributes a guarded upsert's failure to the guard
@@ -346,33 +377,37 @@ func applyUniqueKeyConflictRemedy(keyNames []string, schema, table string) strin
 
 // undeclaredUniqueKeys returns the target's unique keys besides its primary
 // key that the copy's source table does not declare — rendered as
-// [describeUniqueKeys] does, and by bare index name. A target key is
-// declared when the source has a unique index (or the primary key) of the
-// same name, or over the same plain columns (both compared
-// case-insensitively, as MySQL names them; a functional key part never
-// matches by columns). The copy writer arms the conflict-identity guard
-// only for such a key: a conflict through a key the source DOES declare is
-// a stale target row the copy is meant to refresh (a VStream catchup
+// [describeUniqueKeys] does, by bare index name, and as the plain columns a
+// conflict through it compares (nil for a key with a functional part). A
+// plain target key is declared when the source has a unique index (or the
+// primary key) over the same columns with the same prefix lengths (column
+// names compared case-insensitively, as MySQL names them); the index NAME
+// does not count, so a key redefined under its old name is undeclared. A
+// key with a functional part cannot be matched by columns and is declared
+// when the source has a unique index of the same name with an expression
+// entry. The copy writer arms the conflict-identity guard only for an
+// undeclared key: a conflict through a key the source DOES declare is a
+// stale target row the copy is meant to refresh (a VStream catchup
 // re-emission, a resumed copy over rows the source changed since), and the
 // source's own key guarantees the copied rows cannot collide on it.
-func undeclaredUniqueKeys(table *ir.Table, keys targetUniqueKeys) (rendered, names []string) {
-	declaredNames := map[string]bool{}
+func undeclaredUniqueKeys(table *ir.Table, keys targetUniqueKeys) (rendered, names []string, cols [][]string) {
+	declaredFunctional := map[string]bool{}
 	declaredCols := map[string]bool{}
 	add := func(idx *ir.Index) {
 		if idx == nil {
 			return
 		}
-		if idx.Name != "" {
-			declaredNames[strings.ToLower(idx.Name)] = true
-		}
-		cols := make([]string, 0, len(idx.Columns))
+		parts := make([]string, 0, len(idx.Columns))
 		for _, c := range idx.Columns {
 			if c.Column == "" {
-				return // an expression entry: matches by name only
+				if idx.Name != "" {
+					declaredFunctional[strings.ToLower(idx.Name)] = true
+				}
+				return
 			}
-			cols = append(cols, strings.ToLower(c.Column))
+			parts = append(parts, strings.ToLower(c.Column)+"/"+strconv.Itoa(c.Length))
 		}
-		declaredCols[strings.Join(cols, "\x00")] = true
+		declaredCols[strings.Join(parts, "\x00")] = true
 	}
 	add(table.PrimaryKey)
 	for _, idx := range table.Indexes {
@@ -381,30 +416,55 @@ func undeclaredUniqueKeys(table *ir.Table, keys targetUniqueKeys) (rendered, nam
 		}
 	}
 	all := describeUniqueKeys(keys)
-	for i, cols := range keys.uniques {
+	for i, keyCols := range keys.uniques {
 		name := ""
 		if i < len(keys.uniqueNames) {
 			name = keys.uniqueNames[i]
 		}
-		if declaredNames[strings.ToLower(name)] {
-			continue
-		}
 		plain := true
-		lower := make([]string, len(cols))
-		for j, c := range cols {
+		parts := make([]string, len(keyCols))
+		for j, c := range keyCols {
 			if c == "" || (i < len(keys.uniqueFns) && j < len(keys.uniqueFns[i]) && keys.uniqueFns[i][j] != nil) {
 				plain = false
 				break
 			}
-			lower[j] = strings.ToLower(c)
+			sub := 0
+			if i < len(keys.uniqueSubs) && j < len(keys.uniqueSubs[i]) {
+				sub = keys.uniqueSubs[i][j]
+			}
+			parts[j] = strings.ToLower(c) + "/" + strconv.Itoa(sub)
 		}
-		if plain && declaredCols[strings.Join(lower, "\x00")] {
+		switch {
+		case plain && declaredCols[strings.Join(parts, "\x00")]:
+			continue
+		case !plain && declaredFunctional[strings.ToLower(name)]:
 			continue
 		}
 		rendered = append(rendered, all[i])
 		names = append(names, name)
+		if plain {
+			cols = append(cols, append([]string(nil), keyCols...))
+		} else {
+			cols = append(cols, nil)
+		}
 	}
-	return rendered, names
+	return rendered, names, cols
+}
+
+// copyGuardScope is the copy writer's per-key scope for the identity check
+// ([identityCheckValue]): the undeclared keys' columns, so a conflict that
+// cannot have come through an undeclared key (the matched row disagrees with
+// the incoming one on every undeclared key) is the stale-row refresh through a
+// declared key and is absorbed. nil — the check applies to every conflict —
+// when an undeclared key has a functional part, whose match cannot be told
+// from its columns.
+func copyGuardScope(undeclaredCols [][]string) [][]string {
+	for _, c := range undeclaredCols {
+		if len(c) == 0 {
+			return nil
+		}
+	}
+	return undeclaredCols
 }
 
 // copyUpsertGuardRefusal attributes a guarded copy upsert's failure to the

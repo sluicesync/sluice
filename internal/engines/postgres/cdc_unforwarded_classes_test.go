@@ -389,6 +389,13 @@ func TestDiffRelationFacts_PlainUniqueIndex(t *testing.T) {
 		t.Errorf("a key column's retype refused through its unique index: %q", d)
 	}
 
+	idxRenamed := cloneFacts(gc2Base())
+	idxRenamed.uniqueIndexes["x_uidx2"] = idxRenamed.uniqueIndexes["x_uidx"]
+	delete(idxRenamed.uniqueIndexes, "x_uidx")
+	if d := diffRelationFacts(gc2Base(), idxRenamed); len(d) != 0 {
+		t.Errorf("an ALTER INDEX RENAME refused: %q", d)
+	}
+
 	dropped := cloneFacts(gc2Base())
 	delete(dropped.columns, 2)
 	delete(dropped.uniqueIndexes, "x_uidx")

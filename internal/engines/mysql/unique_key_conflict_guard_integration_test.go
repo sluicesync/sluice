@@ -170,6 +170,17 @@ func ukcRunServer(t *testing.T, srv kcgServer, batched bool) {
 		if got, want := ukcRows(t, dsn, ukcKdRows), "1:a:uno,2:b:NULL,3:c:three"; got != want {
 			t.Fatalf("target %s; want %s", got, want)
 		}
+		// The stated trade (UNIQUE-KEY-GUARD-OVERLAP-REFUSAL): the SAME source
+		// row re-sent after ANOTHER unique column changed — the source updated
+		// id 3 -> 4, and an ADR-0072 resume re-sends (4,'c') — is the same
+		// statement as a merge and refuses, loud, target unchanged.
+		err = kcgApply(t, srv.eng, dsn, batched, ins(db, 5, int64(4), "c", "three"))
+		if !errors.Is(err, ir.ErrUniqueKeyConflictOtherRow) {
+			t.Fatalf("trade: err = %v; want %s", err, ir.ErrUniqueKeyConflictOtherRow)
+		}
+		if got, want := ukcRows(t, dsn, ukcKdRows), "1:a:uno,2:b:NULL,3:c:three"; got != want {
+			t.Fatalf("trade: target %s; want %s", got, want)
+		}
 	})
 
 	t.Run("no primary key, one unique key: the newer-image re-send still converges", func(t *testing.T) {
@@ -187,14 +198,21 @@ func ukcRunServer(t *testing.T, srv kcgServer, batched bool) {
 	})
 }
 
-// TestUniqueKeyConflictGuard_CopyWriter pins the idempotent copy writer: a
-// target unique key the copy's source table declares keeps today's absorb
-// (a stale row refreshed — the VStream catchup re-emission shape); one it
-// does not declare refuses a row that would overwrite another.
+// TestUniqueKeyConflictGuard_CopyWriter pins the idempotent copy writer on
+// MySQL 8.0 and MariaDB 11.4. The target is kd(id PK, k UNIQUE kd_k, v
+// UNIQUE kd_v) holding (1,'a','one'); the copy's source table declares kd_k
+// (or not, per cell) and never kd_v. Each cell names the target state it
+// must leave, read back after the write:
+//
+//   - a conflict through a DECLARED key is a stale-row refresh and is
+//     absorbed (row 1 takes the copy's image) — per key: the undeclared kd_v
+//     beside it does not turn that refresh into a refusal;
+//   - a conflict through an UNDECLARED key with a different primary key
+//     refuses, target unchanged.
 func TestUniqueKeyConflictGuard_CopyWriter(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
-	source := func(declared bool) *ir.Table {
+	source := func(declareK bool) *ir.Table {
 		tbl := &ir.Table{
 			Name: "kd",
 			Columns: []*ir.Column{
@@ -204,39 +222,49 @@ func TestUniqueKeyConflictGuard_CopyWriter(t *testing.T) {
 			},
 			PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}},
 		}
-		if declared {
+		if declareK {
 			tbl.Indexes = []*ir.Index{{Name: "kd_k", Unique: true, Columns: []ir.IndexColumn{{Column: "k"}}}}
 		}
 		return tbl
 	}
-	for _, declared := range []bool{true, false} {
-		t.Run(fmt.Sprintf("declared=%t", declared), func(t *testing.T) {
-			dsn, cleanup := newSharedDB(t, fmt.Sprintf("ukc_copy_%t", declared))
-			defer cleanup()
-			applyDDL(t, dsn, "CREATE TABLE kd (id INT NOT NULL PRIMARY KEY, k VARCHAR(20) NOT NULL, v VARCHAR(20), UNIQUE KEY kd_k (k))")
-			applyDDL(t, dsn, "INSERT INTO kd VALUES (1,'a','one')")
-			before := ukcRows(t, dsn, ukcKdRows)
-			w, err := Engine{}.OpenRowWriter(ctx, dsn)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer closeIf(w)
-			rows := make(chan ir.Row, 1)
-			rows <- ir.Row{"id": int64(99), "k": "a", "v": "ninetynine"}
-			close(rows)
-			err = w.(ir.IdempotentRowWriter).WriteRowsIdempotent(ctx, source(declared), rows)
-			if declared {
+	cells := []struct {
+		name     string
+		declareK bool
+		row      ir.Row
+		refuse   bool
+		want     string
+	}{
+		{"through a declared key, an undeclared key beside it", true, ir.Row{"id": int64(99), "k": "a", "v": "ninetynine"}, false, "1:a:ninetynine"},
+		{"through an undeclared key", true, ir.Row{"id": int64(99), "k": "z", "v": "one"}, true, "1:a:one"},
+		{"through a key the source does not declare", false, ir.Row{"id": int64(99), "k": "a", "v": "ninetynine"}, true, "1:a:one"},
+	}
+	for _, srv := range kcgServers(t) {
+		for i, c := range cells {
+			t.Run(srv.name+"/"+c.name, func(t *testing.T) {
+				db := fmt.Sprintf("ukc_copy_%s_%d", strings.NewReplacer("-", "", ".", "").Replace(srv.name), i)
+				dsn, cleanup := srv.newDB(t, db)
+				defer cleanup()
+				applyDDL(t, dsn, "CREATE TABLE kd (id INT NOT NULL PRIMARY KEY, k VARCHAR(20) NOT NULL, v VARCHAR(20), UNIQUE KEY kd_k (k), UNIQUE KEY kd_v (v))")
+				applyDDL(t, dsn, "INSERT INTO kd VALUES (1,'a','one')")
+				w, err := srv.eng.OpenRowWriter(ctx, dsn)
 				if err != nil {
-					t.Fatalf("a conflict through a key the source declares refused: %v", err)
+					t.Fatal(err)
 				}
-				return
-			}
-			if !errors.Is(err, ir.ErrUniqueKeyConflictOtherRow) || !strings.Contains(err.Error(), "DROP INDEX `kd_k`") {
-				t.Fatalf("err = %v; want %s naming the key", err, ir.ErrUniqueKeyConflictOtherRow)
-			}
-			if got := ukcRows(t, dsn, ukcKdRows); got != before {
-				t.Fatalf("the refusal changed the target: %s -> %s", before, got)
-			}
-		})
+				defer closeIf(w)
+				rows := make(chan ir.Row, 1)
+				rows <- c.row
+				close(rows)
+				err = w.(ir.IdempotentRowWriter).WriteRowsIdempotent(ctx, source(c.declareK), rows)
+				switch {
+				case c.refuse && (!errors.Is(err, ir.ErrUniqueKeyConflictOtherRow) || !strings.Contains(err.Error(), "DROP INDEX")):
+					t.Fatalf("err = %v; want %s naming the key", err, ir.ErrUniqueKeyConflictOtherRow)
+				case !c.refuse && err != nil:
+					t.Fatalf("refused: %v", err)
+				}
+				if got := ukcRows(t, dsn, ukcKdRows); got != c.want {
+					t.Fatalf("target %s; want %s", got, c.want)
+				}
+			})
+		}
 	}
 }

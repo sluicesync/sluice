@@ -130,6 +130,8 @@ func TestRelationFacts_DiffPremisesOnARealServer(t *testing.T) {
 	step("plain unique index made NULLS NOT DISTINCT",
 		`DROP INDEX prem_tenant_uidx; CREATE UNIQUE INDEX prem_tenant_uidx ON prem (tenant2) NULLS NOT DISTINCT`,
 		`UNIQUE INDEX "prem_tenant_uidx" changed`)
+	step("rename a plain unique index", `ALTER INDEX prem_tenant_uidx RENAME TO prem_tenant_uidx2`, "")
+	step("rename it back", `ALTER INDEX prem_tenant_uidx2 RENAME TO prem_tenant_uidx`, "")
 	step("drop unique index", `DROP INDEX prem_tenant_uidx`, `DROP INDEX "prem_tenant_uidx"`)
 	// Exactly one delta: the constraint, not also its backing index.
 	prior := read()

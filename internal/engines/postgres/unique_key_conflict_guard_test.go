@@ -14,22 +14,33 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 )
 
-// TestNewPGConflictIdentity pins where the Postgres guard arms: only on a
-// table with a primary key that is not its ON CONFLICT key (a deferrable
-// one). Keyed on its primary key, any other index's conflict is a
-// unique_violation, loud already; with no primary key, its one arbiter cannot
-// tell a merge from the newer-image re-send it must absorb.
+// TestNewPGConflictIdentity pins where the Postgres guard arms: a table with a
+// primary key that is not its ON CONFLICT key (a deferrable one), keyed on
+// the primary key; a table with no primary key and two or more unique
+// indexes, keyed on all their columns. Keyed on its primary key a conflict
+// through the arbiter is the same row; with no primary key and one unique
+// index the arbiter cannot tell a merge from the newer-image re-send.
 func TestNewPGConflictIdentity(t *testing.T) {
-	if newPGConflictIdentity([]string{"id"}, []string{"id"}) != nil {
+	if newPGConflictIdentity([]string{"id"}, []string{"id"}, nil) != nil {
 		t.Error("armed on a table keyed on its primary key")
 	}
-	if newPGConflictIdentity(nil, nil) != nil {
+	if newPGConflictIdentity(nil, nil, nil) != nil {
 		t.Error("armed on a keyless table (plain INSERT)")
 	}
-	if newPGConflictIdentity(nil, []string{"k"}) != nil {
+	if newPGConflictIdentity(nil, []string{"k"}, nil) != nil {
 		t.Error("armed on a table without a primary key: its one arbiter cannot tell a merge from a newer-image re-send")
 	}
-	d := newPGConflictIdentity([]string{"id"}, []string{"k"}) // a deferrable PK the arbiter skipped
+	u := newPGConflictIdentity(nil, []string{"code"}, [][]string{{"code"}, {"email", "id"}})
+	if u == nil {
+		t.Fatal("unarmed on a keyless table with two unique indexes (the review's arbiter-dropped shape)")
+	}
+	if got := u.columns([]string{"id", "email", "code", "v"}); strings.Join(got, ",") != "code,email,id" {
+		t.Errorf("keyless, two indexes: identity %v; want code,email,id", got)
+	}
+	if got := u.columns([]string{"code", "v"}); got != nil {
+		t.Errorf("a row missing an index column: identity %v; want unarmed", got)
+	}
+	d := newPGConflictIdentity([]string{"id"}, []string{"k"}, nil) // a deferrable PK the arbiter skipped
 	if got := d.columns([]string{"id", "k", "v"}); strings.Join(got, ",") != "id" {
 		t.Errorf("deferrable primary key: identity %v; want id", got)
 	}
@@ -53,7 +64,7 @@ func TestBuildGuardedInsertSQL_ConflictIdentity(t *testing.T) {
 	if err != nil || same != plain {
 		t.Fatalf("nil identity changed the statement:\n%s\n%s", plain, same)
 	}
-	got, _, err := buildGuardedInsertSQL("public", "kd", row, []string{"k"}, nil, nil, nil, newPGConflictIdentity([]string{"id"}, []string{"k"}))
+	got, _, err := buildGuardedInsertSQL("public", "kd", row, []string{"k"}, nil, nil, nil, newPGConflictIdentity([]string{"id"}, []string{"k"}, nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +82,7 @@ func TestBuildGuardedInsertSQL_ConflictIdentity(t *testing.T) {
 	// check: a collation merge is reported as one, and the identity runs for
 	// the rows it passed.
 	coll := &pgKeyCollationPlan{compare: map[string]string{"k": "C"}, marker: "k"}
-	both, _, err := buildGuardedInsertSQL("public", "kd", row, []string{"k"}, nil, nil, coll, newPGConflictIdentity([]string{"id"}, []string{"k"}))
+	both, _, err := buildGuardedInsertSQL("public", "kd", row, []string{"k"}, nil, nil, coll, newPGConflictIdentity([]string{"id"}, []string{"k"}, nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +90,7 @@ func TestBuildGuardedInsertSQL_ConflictIdentity(t *testing.T) {
 	if kc < 0 || uk < 0 || !strings.Contains(both, `COLLATE "C" THEN CASE WHEN ("sluice_existing"`) {
 		t.Errorf("composed guards misplaced:\n%s", both)
 	}
-	allKey, _, err := buildGuardedInsertSQL("public", "kk", ir.Row{"k": "a"}, []string{"k"}, nil, nil, nil, newPGConflictIdentity([]string{"id"}, []string{"k"}))
+	allKey, _, err := buildGuardedInsertSQL("public", "kk", ir.Row{"k": "a"}, []string{"k"}, nil, nil, nil, newPGConflictIdentity([]string{"id"}, []string{"k"}, nil))
 	if err != nil || !strings.HasSuffix(allKey, "DO NOTHING") {
 		t.Errorf("all-key table: %s (%v)", allKey, err)
 	}
@@ -87,7 +98,7 @@ func TestBuildGuardedInsertSQL_ConflictIdentity(t *testing.T) {
 	// statement is unguarded.
 	noPK := ir.Row{"k": "a", "v": "x"}
 	p1, _, _ := buildInsertSQL("public", "kd", noPK, []string{"k"}, nil, nil, nil)
-	p2, _, _ := buildGuardedInsertSQL("public", "kd", noPK, []string{"k"}, nil, nil, nil, newPGConflictIdentity([]string{"id"}, []string{"k"}))
+	p2, _, _ := buildGuardedInsertSQL("public", "kd", noPK, []string{"k"}, nil, nil, nil, newPGConflictIdentity([]string{"id"}, []string{"k"}, nil))
 	if p1 != p2 {
 		t.Errorf("a row without the primary key was guarded: %s", p2)
 	}
@@ -97,7 +108,7 @@ func TestBuildGuardedInsertSQL_ConflictIdentity(t *testing.T) {
 // 22P02 carrying its marker on a statement that carried it, and the
 // classifier's fallback for a pipelined error that arrives without its plan.
 func TestApplyInsertGuardError_Attribution(t *testing.T) {
-	g := newPGConflictIdentity([]string{"id"}, []string{"k"})
+	g := newPGConflictIdentity([]string{"id"}, []string{"k"}, nil)
 	raise := &pgconn.PgError{Code: "22P02", Message: `invalid input syntax for type integer: "UNIQUE-KEY-CONFLICT-OTHER-ROW"`}
 	err := applyInsertGuardError(fmt.Errorf("batch: %w", raise), nil, g, "public", "kd")
 	if !errors.Is(err, ir.ErrUniqueKeyConflictOtherRow) || !ir.IsTerminal(err) {
