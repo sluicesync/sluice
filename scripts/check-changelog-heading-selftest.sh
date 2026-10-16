@@ -188,6 +188,22 @@ git -C "$repo" commit -q --no-verify -m "changelog: promote 9.9.3"
 printf '# Changelog\n\n## [Unreleased]\n\n### Fixed\n\n**In-progress work.**\n\n## [9.9.3] - 2026-09-09\n\nReleased.\n' >"$repo/CHANGELOG.md"
 git -C "$repo" add -A
 run_tree between-releases 0 && expect between-releases "the index carries '## [9.9.3]'"
+git -C "$repo" commit -q --no-verify -m "work in progress under Unreleased"
+
+# ---- case 6b: a release cut from a release branch, mirrored to main ----
+# v9.9.4 was tagged on a release branch; main adds its archive and heading
+# afterwards while main's Unreleased still holds later work. The tag already
+# existing is what makes this a mirror rather than the release commit (which
+# always precedes its tag: case 3 is that direction and stays refused).
+git -C "$repo" tag v9.9.4
+printf '# sluice v9.9.4\n' >"$repo/docs/releases/release-notes-v9.9.4.md"
+printf '# Changelog\n\n## [Unreleased]\n\n### Fixed\n\n**In-progress work.**\n\n## [9.9.4] - 2026-09-10\n\nReleased from a branch.\n\n## [9.9.3] - 2026-09-09\n\nReleased.\n' >"$repo/CHANGELOG.md"
+git -C "$repo" add -A
+run_tree branch-release-mirror 0 && expect branch-release-mirror "v9.9.4 is already tagged"
+# The mirror still owes the heading.
+printf '# Changelog\n\n## [Unreleased]\n\n### Fixed\n\n**In-progress work.**\n\n## [9.9.3] - 2026-09-09\n\nReleased.\n' >"$repo/CHANGELOG.md"
+git -C "$repo" add -A
+run_tree branch-release-mirror-unpromoted 1 && expect branch-release-mirror-unpromoted "has no '## [9.9.4]' heading"
 
 # ---- case 7: the archive floor ----
 # Remove the seeded archive from the index so the listing is implausibly

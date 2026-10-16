@@ -99,6 +99,16 @@ case "${1:-}" in
 	if git diff --cached --name-only --diff-filter=A 2>/dev/null |
 		grep -qx "docs/releases/release-notes-v$newest.md"; then
 		require_empty=yes
+		# A release cut from a release branch (CLAUDE.md: "commit the notes
+		# archive to main too") adds the archive to main AFTER its tag
+		# exists, while main's Unreleased carries work that release did not
+		# ship. That commit mirrors a release; it is not the release
+		# commit, which always precedes its tag. The heading is still
+		# required below, so the mirror cannot forget the section.
+		if git rev-parse -q --verify "refs/tags/v$newest" >/dev/null 2>&1; then
+			require_empty=no
+			echo "check-changelog-heading: v$newest is already tagged; this commit mirrors that release's archive, so main's Unreleased may hold later work." >&2
+		fi
 	fi
 	grade_body "the index (newest archived notes: v$newest)" "$newest" "$BODY" "$require_empty" || exit 1
 	if [ "$require_empty" = yes ]; then
