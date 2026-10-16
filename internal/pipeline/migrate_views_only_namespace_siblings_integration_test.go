@@ -150,8 +150,12 @@ func TestStreamer_ViewsOnlyNamespace_PostgresToPostgres_Fanout(t *testing.T) {
 			DatabaseFilter: DatabaseFilter{Include: []string{"a_rpt", "b_mix", "m_app", "z_rpt"}},
 		}).Run(streamCtx)
 	}()
+	returned := false
 	defer func() {
 		streamCancel()
+		if returned {
+			return
+		}
 		select {
 		case <-runErr:
 		case <-time.After(20 * time.Second):
@@ -164,6 +168,7 @@ func TestStreamer_ViewsOnlyNamespace_PostgresToPostgres_Fanout(t *testing.T) {
 	if !waitForPGScalar(t, pgTarget, `SELECT COUNT(*) FROM z_rpt.v`, 3, 90*time.Second) {
 		select {
 		case err := <-runErr:
+			returned = true
 			t.Fatalf("Bug 317: stream ended before z_rpt.v appeared on the target: %v", err)
 		default:
 		}
