@@ -394,6 +394,81 @@ func TestKeyCollationFunctionalKey_MySQLToMySQLGeneratedApply(t *testing.T) {
 	kcfbGrade(t, "mysql → mysql generated", src, tgt, nil)
 }
 
+// TestKeyCollationFunctionalKey_MySQLToMySQLSessionCollatedCast is fourth
+// review finding 1 end to end (HIGH, silent, measured on MySQL 8.4 and
+// pre-existing in released versions): a CAST's collation is the CREATING
+// session's, while the catalog stores the same text either way. The source
+// key is created from a session whose collation_connection keeps the pair
+// apart; sluice recreates it through its own session, where the CAST compares
+// `utf8mb4_0900_ai_ci` and equates them. The column is `_0900_ai_ci` on both
+// sides, so a guard that inferred the source key from its column ran no
+// check, and the stream's upsert of row 2 replaced row 1 at exit 0. It must
+// now refuse KEY-COLLATION-MERGE with the target unchanged.
+//
+// Cells: a `utf8mb4_bin` session ('a'/'A') and go-sql-driver's default
+// `utf8mb4_general_ci` session ('ss'/'ß', apart under general_ci and one key
+// under 0900_ai_ci). The independent expected value is the source's own rows.
+func TestKeyCollationFunctionalKey_MySQLToMySQLSessionCollatedCast(t *testing.T) {
+	mySrc, myRoot, myCleanup := startMySQL(t)
+	defer myCleanup()
+	for _, c := range []struct {
+		tag, session, seed, collide string
+	}{
+		{"kfsb", "utf8mb4_bin", "a", "A"},
+		{"kfsg", "utf8mb4_general_ci", "ss", "ß"},
+	} {
+		t.Run(c.session, func(t *testing.T) {
+			twfbDB{engine: "mysql", dsn: myRoot}.exec(t, "CREATE DATABASE "+c.tag+"_s")
+			twfbDB{engine: "mysql", dsn: myRoot}.exec(t, "CREATE DATABASE "+c.tag+"_t")
+			srcDSN, err := buildMySQLDSN(mySrc, c.tag+"_s")
+			if err != nil {
+				t.Fatal(err)
+			}
+			tgtDSN, err := buildMySQLDSN(myRoot, c.tag+"_t")
+			if err != nil {
+				t.Fatal(err)
+			}
+			src, tgt := twfbDB{engine: "mysql", dsn: srcDSN}, twfbDB{engine: "mysql", dsn: tgtDSN}
+			// The key is created from a session under c.session.
+			twfbDB{engine: "mysql", dsn: srcDSN + "&collation=" + c.session}.exec(t,
+				"CREATE TABLE kd (id int NOT NULL PRIMARY KEY, k varchar(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL, d int, "+
+					"UNIQUE KEY ck ((cast(k as char(10))))); INSERT INTO kd (id,k,d) VALUES (1,'"+c.seed+"',1)")
+			srcHidden := src.scalar(t, "SELECT collation_name FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = 'kd' AND column_name = 'k'")
+			t.Logf("source column collation %s; key expression %s", srcHidden,
+				src.scalar(t, "SELECT expression FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = 'kd' AND index_name = 'ck'"))
+			cell := twfbCell{src: src, tgt: tgt, streamID: c.tag}
+			run := startTWFBRun(cell.streamer())
+			if !tgt.waitRow(t, "kd", 1, run, 180*time.Second) {
+				t.Fatalf("the cold start never delivered the seed (%v)", run.stop(t))
+			}
+			cell.waitStreaming(t, run)
+			// The source holds both: its own key keeps the pair apart.
+			src.exec(t, "INSERT INTO kd (id,k,d) VALUES (2,'"+c.collide+"',2)")
+			if src.scalar(t, "SELECT COUNT(*) FROM kd") != "2" {
+				t.Fatal("the source key did not keep the pair apart; the cell measures nothing")
+			}
+			src.exec(t, "INSERT INTO kd (id,k,d) VALUES (100,'zz',100)")
+			_ = tgt.waitRow(t, "kd", 100, run, 60*time.Second)
+			kcfbWaitConverged(t, src, tgt, run, 20*time.Second)
+			refusal := kfkRefusal(t, run)
+			if refusal == nil {
+				t.Fatalf("nothing refused: the target's rebuilt key equates %q and %q (source %s, target %s)",
+					c.seed, c.collide, kcfbRender(kcfbRows(t, src)), kcfbRender(kcfbRows(t, tgt)))
+			}
+			if !errors.Is(refusal, ir.ErrKeyCollationMerge) {
+				t.Errorf("refused with %v; want %v", refusal, ir.ErrKeyCollationMerge)
+			}
+			s, g := kcfbRows(t, src), kcfbRows(t, tgt)
+			if g["1"] != s["1"] {
+				t.Errorf("row 1 on the target is %q; the source holds %q (a merge)", g["1"], s["1"])
+			}
+			if _, ok := g["2"]; ok {
+				t.Errorf("row 2 landed beside a refusal: target %s", kcfbRender(g))
+			}
+		})
+	}
+}
+
 // kfkNewPair creates a Postgres source database and a MySQL target database
 // named for tag.
 func kfkNewPair(t *testing.T, pgRoot, myRoot, tag string) (src, tgt twfbDB) {

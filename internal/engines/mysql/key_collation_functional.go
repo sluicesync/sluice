@@ -11,8 +11,10 @@ package mysql
 //
 // A Postgres `UNIQUE (lower(email))` reaches MySQL as the functional key
 // part `((lower(cast(email as char charset utf8mb4))))`. Its comparison is
-// the CAST's — the character set's default, `utf8mb4_0900_ai_ci` — which
-// equates lower('e') and lower('é'), two values Postgres keeps apart. The
+// the CAST's — the creating session's default for the character set,
+// `utf8mb4_0900_ai_ci` under sluice's (a CAST with no CHARACTER SET takes the
+// session's collation_connection instead) — which equates lower('e') and
+// lower('é'), two values Postgres keeps apart. The
 // guard read the target's unique keys with every functional part skipped,
 // so it saw no key holding the armed column, and the second source row
 // overwrote the first through ON DUPLICATE KEY UPDATE at exit 0 (measured
@@ -65,7 +67,8 @@ package mysql
 // columns the source declares under the index's own collation does not arm
 // (re-review finding 2: arming there refused stale respellings ON DUPLICATE
 // KEY UPDATE converges) — which infers the source's index from its columns,
-// a stated premise ([functionalPartArms]). So the keys are read for
+// a stated premise ([functionalPartArms]); a CAST or CONVERT, whose
+// collation the creating session decides, always arms. So the keys are read for
 // every table, armed column or not: one catalog read per table per writer,
 // cached, and two more (its columns and its hidden columns) for a table with
 // a functional part. A part KNOWN not to be a string (`(j * 2)`, a binary
@@ -128,6 +131,9 @@ type functionalKeyPart struct {
 	columns, named []string
 	// arms: the part puts its key under the guard ([markFunctionalArming]).
 	arms bool
+	// unresolved is why its columns could not be resolved ("" when they
+	// were): one of unresolvedColumn, unresolvedLiteral, unresolvedNesting.
+	unresolved string
 	// readable: steps render the expression over columns[0].
 	readable bool
 	steps    []functionalStep
@@ -358,6 +364,22 @@ func (p *functionalParser) ident() (string, []functionalStep, bool) {
 	return "", nil, false
 }
 
+// decodeCatalogExpression undoes information_schema's escaping layer over an
+// expression's SQL spelling for the flavor that wrote it, as
+// [normalizeExprForFlavor] does for the schema reader: MySQL (and vtgate,
+// which serves MySQL's catalog) escapes `\` and `'` once more; MariaDB
+// stores the SHOW CREATE spelling with no extra layer, where `\'` inside a
+// literal is the value's own apostrophe and decoding it would corrupt the
+// scan (fourth review, finding 4 — unreachable today, MariaDB having no
+// functional key parts, but a generated column's text is read on any flavor
+// that reaches here).
+func decodeCatalogExpression(flavor Flavor, s string) string {
+	if flavor == FlavorMariaDB {
+		return s
+	}
+	return decodeISExpressionEscapes(s)
+}
+
 // unreadableLiteral stands in [expressionColumns]'s result for a string
 // literal it could not scan to its end: a name no table has, so the part
 // refuses at resolution rather than being read with columns missing.
@@ -553,14 +575,21 @@ func (k *targetUniqueKeys) resolveFunctionalColumns(tableColumns []tableColumn) 
 				continue
 			}
 			ok := true
-			f.named = f.named[:0]
+			f.named, f.unresolved = f.named[:0], ""
 			var base []string
 			seen := map[string]bool{}
 			var expand func(name string, depth int)
 			expand = func(name string, depth int) {
 				c, found := byFold[strings.ToLower(name)]
-				if !found || depth > 8 {
-					ok = false
+				switch {
+				case name == unreadableLiteral:
+					ok, f.unresolved = false, unresolvedLiteral
+					return
+				case !found:
+					ok, f.unresolved = false, unresolvedColumn
+					return
+				case depth > 8:
+					ok, f.unresolved = false, unresolvedNesting
 					return
 				}
 				if c.generation == "" {
@@ -599,20 +628,41 @@ func (k *targetUniqueKeys) resolveFunctionalColumns(tableColumns []tableColumn) 
 // with its generation expression ("" for a stored value).
 type tableColumn struct{ name, generation string }
 
-// keyCollationFunctionalUnsupported is the GUARD-UNSUPPORTED refusal for a
-// functional key part naming a column the table does not have — a non-ASCII
-// name the catalog's EXPRESSION text mangled (Bug 288): there is no column
-// to compare its bytes by (KEY-COLLATION-FUNCTIONAL-KEY-PART).
+// The causes a functional part's columns could not be resolved
+// ([targetUniqueKeys.resolveFunctionalColumns]), each with its own remedy
+// (fourth review, finding 4: one "name the columns in ASCII" remedy was
+// wrong for the other two).
+const (
+	// unresolvedColumn: the expression names a column the table does not
+	// have — a non-ASCII name the catalog's text mangled (Bug 288).
+	unresolvedColumn = "names a column sluice cannot find in the table (the catalog's text of the expression does " +
+		"not name it as the table does); recreate the key over columns named in ASCII"
+	// unresolvedLiteral: a string literal in the expression did not scan.
+	unresolvedLiteral = "holds a string literal sluice cannot read to its end, so the columns after it are not " +
+		"known; recreate the key with the literal written plainly, or move the expression into a stored generated " +
+		"column and key that column"
+	// unresolvedNesting: generated columns nested past the expansion limit.
+	unresolvedNesting = "reads a generated column built on generated columns more than eight deep; key a " +
+		"shallower expression"
+)
+
+// keyCollationFunctionalUnsupported is the GUARD-UNSUPPORTED refusal for
+// functional key parts whose columns could not be resolved, each named with
+// its cause and remedy: there is no set of columns to compare their bytes by
+// (KEY-COLLATION-FUNCTIONAL-KEY-PART).
 func keyCollationFunctionalUnsupported(qn string, parts []*functionalKeyPart) error {
 	names := make([]string, len(parts))
 	for i, f := range parts {
-		names[i] = fmt.Sprintf("%s (%s)", quoteIdent(f.index), f.expr)
+		why := f.unresolved
+		if why == "" {
+			why = unresolvedColumn
+		}
+		names[i] = fmt.Sprintf("%s (%s) %s", quoteIdent(f.index), f.expr, why)
 	}
-	return &terminalMySQLError{err: fmt.Errorf("%w: %s: mysql: %s: the unique key(s) %s read a column sluice cannot "+
-		"find in the table (the catalog's text of the expression does not name it as the table does), so sluice "+
-		"cannot check that an upsert does not merge two source rows that key equates. Refusing before any row of "+
-		"the table is written. Recreate the key over columns named in ASCII, or exclude the table",
-		ir.ErrKeyCollationMerge, keyCollationGuardUnsupportedMarker, qn, strings.Join(names, ", "))}
+	return &terminalMySQLError{err: fmt.Errorf("%w: %s: mysql: %s: sluice cannot tell which columns a unique key "+
+		"compares, so it cannot check that an upsert does not merge two source rows that key equates. Refusing "+
+		"before any row of the table is written. The key %s. Or exclude the table",
+		ir.ErrKeyCollationMerge, keyCollationGuardUnsupportedMarker, qn, strings.Join(names, "; the key "))}
 }
 
 // markFunctionalArming decides, for every functional part of keys, whether
@@ -654,20 +704,26 @@ func (k *targetUniqueKeys) markFunctionalArming(source *ir.Table, armed map[stri
 // 4 'a@y') that ON DUPLICATE KEY UPDATE converges. A part whose value is not
 // a string never arms.
 //
-// UNVERIFIED PREMISE, stated (third review, finding 4): "the source compares
-// the part under its columns' collation" infers the SOURCE's own index from
-// the source's column collations, because the source's hidden column is not
-// read. That holds for an index over the column (`lower(k)` keeps k's
-// collation) and is measured for MySQL 8.0/8.4's CAST, which takes the
-// character set's default (`utf8mb4_0900_ai_ci`) and so arms over a
-// utf8mb4_bin column (loudly). A source whose own key compares under some
-// other collation — a hand-made COLLATE in the source's key, with the target
-// key matching the column — is not seen.
+//   - its comparison collation was decided by the session that created it —
+//     a CAST or CONVERT with no later COLLATE ([sessionDerivedCollation]).
+//
+// UNVERIFIED PREMISE, stated (third review, finding 4; narrowed by the
+// fourth): "the source compares the part under its columns' collation"
+// infers the SOURCE's own index from the source's column collations, because
+// the source's hidden column is not read. It holds for a part whose collation
+// derives from its columns (`lower(k)`, `trim(k)`, `concat(k, j)` keep the
+// columns'). It is FALSE for a CAST or CONVERT, whose collation is the
+// creating session's — the fourth review measured a source key created from
+// a `utf8mb4_bin` session holding 'a' and 'A' apart while sluice's rebuild
+// compared `_0900_ai_ci` — so those parts arm instead of inferring. A source
+// key carrying a hand-made COLLATE the target key lacks is still not seen;
+// the class fix (KEY-COLLATION-FUNCTIONAL-SESSION-COLLATION: read the source's
+// hidden column into the IR and emit its collation) closes both.
 func functionalPartArms(f *functionalKeyPart, source *ir.Table, armed map[string]armedCollation, compareAs map[string]string) bool {
 	switch {
 	case !f.collated():
 		return false
-	case !f.known, source == nil:
+	case !f.known, source == nil, f.sessionDerivedCollation():
 		return true
 	}
 	srcCols := make(map[string]*ir.Column, len(source.Columns))
@@ -688,6 +744,13 @@ func functionalPartArms(f *functionalKeyPart, source *ir.Table, armed map[string
 		if c == nil {
 			return true
 		}
+		if !isStringType(c.Type) {
+			// Not a string column (an INT, a JSON document): it brings no
+			// collation into the part, so it neither shows the source alike
+			// nor different (fourth review, finding 3: counting it as "the
+			// source declares none" armed `concat(k, '-', n)` over an INT n).
+			continue
+		}
 		_, coll := translate.ColumnCollation(c.Type)
 		coll = strings.ToLower(coll)
 		if mapped, ok := compareAs[coll]; ok {
@@ -695,6 +758,90 @@ func functionalPartArms(f *functionalKeyPart, source *ir.Table, armed map[string
 		}
 		if coll == "" || !strings.EqualFold(coll, f.collation) {
 			return true
+		}
+	}
+	return false
+}
+
+// isStringType reports whether a source column type carries a collation
+// into an expression over it: the character types, ENUM and SET, through a
+// domain.
+func isStringType(t ir.Type) bool {
+	switch v := t.(type) {
+	case ir.Char, ir.Varchar, ir.Text, ir.Enum, ir.Set:
+		return true
+	case ir.Domain:
+		return isStringType(v.BaseType)
+	}
+	return false
+}
+
+// sessionDerivedCollation reports whether the part's comparison collation
+// was decided by the SESSION that created the key rather than by its
+// columns: a CAST or CONVERT to a character type that no later COLLATE
+// overrides. Fourth review 2026-10-15, finding 1 (HIGH, silent, measured on
+// MySQL 8.4): a CAST with no CHARACTER SET takes the creating session's
+// collation_connection, and one with a CHARACTER SET takes that session's
+// default for the set (default_collation_for_utf8mb4) — while the catalog
+// stores the same text either way. A source key `((cast(k as char(10))))`
+// created from a `utf8mb4_bin` session held 'a' and 'A' apart; sluice
+// recreated it through its own session under `utf8mb4_0900_ai_ci`, the
+// column declared `_0900_ai_ci` on both sides, the guard inferred the two
+// alike, and the second row's upsert replaced the first at exit 0. The
+// source's own hidden column is not read (the class fix — carrying the
+// source key's collation into the IR and emitting it — is filed separately
+// as KEY-COLLATION-FUNCTIONAL-SESSION-COLLATION), so such a part is treated
+// as not known alike and arms. For a part the guard cannot read, any CAST or
+// CONVERT in its text counts: its structure cannot show an outer COLLATE.
+func (f *functionalKeyPart) sessionDerivedCollation() bool {
+	if f.readable {
+		pending := false
+		for _, s := range f.steps {
+			switch s.kind {
+			case "cast":
+				pending = s.charset != "binary"
+			case "collate":
+				pending = false
+			}
+		}
+		return pending
+	}
+	return expressionCallsAny(f.expr, "cast", "convert")
+}
+
+// expressionCallsAny reports whether expr, in SQL spelling, calls any of the
+// named functions (an identifier token followed by '('), outside string
+// literals and backquoted identifiers, case-insensitively.
+func expressionCallsAny(expr string, names ...string) bool {
+	for i := 0; i < len(expr); i++ {
+		switch c := expr[i]; {
+		case c == '\'' || c == '"':
+			closeIdx, _, ok := quotedLiteralClose(expr[i:], c)
+			if !ok {
+				return true // unscannable: do not claim it calls nothing
+			}
+			i += closeIdx
+		case c == '`':
+			for i++; i < len(expr) && expr[i] != '`'; i++ {
+			}
+		case (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_':
+			start := i
+			for i < len(expr) && ((expr[i] >= 'a' && expr[i] <= 'z') || (expr[i] >= 'A' && expr[i] <= 'Z') || (expr[i] >= '0' && expr[i] <= '9') || expr[i] == '_') {
+				i++
+			}
+			word := strings.ToLower(expr[start:i])
+			j := i
+			for j < len(expr) && expr[j] == ' ' {
+				j++
+			}
+			if j < len(expr) && expr[j] == '(' {
+				for _, n := range names {
+					if word == n {
+						return true
+					}
+				}
+			}
+			i--
 		}
 	}
 	return false

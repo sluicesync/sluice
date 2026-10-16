@@ -318,7 +318,7 @@ func uniqueKeyColumns(ctx context.Context, q queryRower, flavor Flavor, schema, 
 			// over the SQL spelling (`\'` for every quote, `\\` for every
 			// backslash); decoded once here, every reader of it — the parser,
 			// the column scan, the remedy's statement — sees SQL.
-			sqlText := decodeISExpressionEscapes(expression.String)
+			sqlText := decodeCatalogExpression(flavor, expression.String)
 			fn = &functionalKeyPart{index: idx, expr: sqlText, seq: seq - 1}
 			if column, steps, ok := parseFunctionalKeyPart(sqlText); ok {
 				fn.columns, fn.readable, fn.steps = []string{column}, true, steps
@@ -356,7 +356,7 @@ func uniqueKeyColumns(ctx context.Context, q queryRower, flavor Flavor, schema, 
 	for _, f := range fns {
 		f.alone = parts[f.index] == 1
 	}
-	columns, err := tableColumns(ctx, q, schema, table)
+	columns, err := tableColumns(ctx, q, flavor, schema, table)
 	if err != nil {
 		return out, err
 	}
@@ -368,7 +368,7 @@ func uniqueKeyColumns(ctx context.Context, q queryRower, flavor Flavor, schema, 
 
 // tableColumns is every column of the target table as the catalog spells
 // it, with its generation expression ("" for a stored value).
-func tableColumns(ctx context.Context, q queryRower, schema, table string) ([]tableColumn, error) {
+func tableColumns(ctx context.Context, q queryRower, flavor Flavor, schema, table string) ([]tableColumn, error) {
 	rows, err := q.QueryContext(ctx, `SELECT column_name, COALESCE(generation_expression, '') FROM information_schema.columns
 		WHERE table_schema = COALESCE(NULLIF(?, ''), DATABASE()) AND table_name = ?`, schema, table)
 	if err != nil {
@@ -381,7 +381,7 @@ func tableColumns(ctx context.Context, q queryRower, schema, table string) ([]ta
 		if err := rows.Scan(&c.name, &c.generation); err != nil {
 			return nil, err
 		}
-		c.generation = decodeISExpressionEscapes(c.generation) // the same layer as EXPRESSION's
+		c.generation = decodeCatalogExpression(flavor, c.generation)
 		out = append(out, c)
 	}
 	return out, rows.Err()

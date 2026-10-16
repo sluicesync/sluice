@@ -139,6 +139,25 @@ func TestFunctionalPartArms_EachRoute(t *testing.T) {
 		return &functionalKeyPart{named: []string{"K"}, columns: []string{"k"}, known: known, collation: coll}
 	}
 	src := func(cols ...*ir.Column) *ir.Table { return &ir.Table{Name: "kd", Columns: cols} }
+	withSteps := func(f *functionalKeyPart, kinds ...string) *functionalKeyPart {
+		f.readable = true
+		for _, k := range kinds {
+			f.steps = append(f.steps, functionalStep{kind: k, charset: "utf8mb4"})
+		}
+		return f
+	}
+	unreadable := func(f *functionalKeyPart, expr string) *functionalKeyPart {
+		f.expr = expr
+		return f
+	}
+	twoCols := func(f *functionalKeyPart) *functionalKeyPart {
+		f.named, f.columns, f.expr = []string{"k", "n"}, []string{"k", "n"}, "concat(`k`,'-',`n`)"
+		return f
+	}
+	jsonOnly := func(f *functionalKeyPart) *functionalKeyPart {
+		f.named, f.columns, f.expr = []string{"doc"}, []string{"doc"}, "json_unquote(json_extract(`doc`,'$.x'))"
+		return f
+	}
 	for _, tc := range []struct {
 		name   string
 		f      *functionalKeyPart
@@ -163,6 +182,26 @@ func TestFunctionalPartArms_EachRoute(t *testing.T) {
 		{"no source shape (finding 3)", part(true, "utf8mb4_0900_ai_ci"), nil, nil, true},
 		{"index collation unknown", part(false, ""), src(&ir.Column{Name: "k", Type: ci}), nil, true},
 		{"not a string", part(true, ""), nil, nil, false},
+		// Fourth review finding 1: a CAST's collation is the creating
+		// session's, so the column's says nothing about the source's key.
+		{
+			"readable CAST, no later COLLATE (session-derived)", withSteps(part(true, "utf8mb4_0900_ai_ci"), "cast"),
+			src(&ir.Column{Name: "k", Type: ci}), nil, true,
+		},
+		{
+			"readable CAST under an outer COLLATE (not session-derived)", withSteps(part(true, "utf8mb4_0900_ai_ci"), "cast", "collate"),
+			src(&ir.Column{Name: "k", Type: ci}), nil, false,
+		},
+		{
+			"unreadable part calling CONVERT", unreadable(part(true, "utf8mb4_0900_ai_ci"), "md5(convert(`k` using utf8mb4))"),
+			src(&ir.Column{Name: "k", Type: ci}), nil, true,
+		},
+		// Fourth review finding 3: a non-string column brings no collation.
+		{
+			"string column aligned beside an INT column", twoCols(part(true, "utf8mb4_0900_ai_ci")),
+			src(&ir.Column{Name: "k", Type: ci}, &ir.Column{Name: "n", Type: ir.Integer{Width: 32}}), nil, false,
+		},
+		{"only a JSON column", jsonOnly(part(true, "utf8mb4_0900_ai_ci")), src(&ir.Column{Name: "doc", Type: ir.JSON{}}), nil, false},
 	} {
 		if got := functionalPartArms(tc.f, tc.source, tc.armed, mysqlKeyGuardCollations); got != tc.want {
 			t.Errorf("%s: arms %v; want %v", tc.name, got, tc.want)
@@ -373,6 +412,45 @@ func TestExpressionColumns(t *testing.T) {
 	// A literal that does not scan refuses at resolution.
 	if got := expressionColumns("concat(`k`,'open"); len(got) != 2 || got[1] != unreadableLiteral {
 		t.Errorf("unterminated: %q", got)
+	}
+}
+
+// TestExpressionCallsAny finds a call outside literals and identifiers,
+// case-insensitively, and treats an unscannable literal as a possible call.
+func TestExpressionCallsAny(t *testing.T) {
+	for expr, want := range map[string]bool{
+		"md5(convert(`k` using utf8mb4))":     true,
+		"CAST (`k` AS CHAR(10))":              true,
+		"concat(`k`,'cast(x)')":               false,
+		"concat(`cast`,`k`)":                  false,
+		"lower(`k`)":                          false,
+		"concat(`castle`,`k`)":                false,
+		"concat(`k`,'open":                    true,
+		"json_unquote(json_extract(`d`,'x'))": false,
+	} {
+		if got := expressionCallsAny(expr, "cast", "convert"); got != want {
+			t.Errorf("%s: %v; want %v", expr, got, want)
+		}
+	}
+}
+
+// TestKeyCollationFunctionalUnsupported_RemedyPerCause: each cause names its
+// own remedy (fourth review finding 4).
+func TestKeyCollationFunctionalUnsupported_RemedyPerCause(t *testing.T) {
+	for cause, want := range map[string]string{
+		unresolvedColumn:  "columns named in ASCII",
+		unresolvedLiteral: "literal written plainly",
+		unresolvedNesting: "shallower expression",
+	} {
+		err := keyCollationFunctionalUnsupported("s.kd", []*functionalKeyPart{{index: "fk", expr: "x", unresolved: cause}})
+		if !strings.Contains(err.Error(), want) || !strings.Contains(err.Error(), keyCollationGuardUnsupportedMarker) {
+			t.Errorf("%q: %v", want, err)
+		}
+		for other, otherWant := range map[string]string{unresolvedColumn: "ASCII", unresolvedLiteral: "literal", unresolvedNesting: "eight deep"} {
+			if other != cause && strings.Contains(err.Error(), otherWant) {
+				t.Errorf("%q names another cause's remedy (%q): %v", want, otherWant, err)
+			}
+		}
 	}
 }
 

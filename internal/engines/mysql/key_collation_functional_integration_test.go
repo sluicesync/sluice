@@ -579,6 +579,31 @@ func TestRowWriterKeyCollationGuard_FunctionalKeysReReview(t *testing.T) {
 					wantRows(t, write(t, flavor.eng, dsn, tbl, ir.Row{"id": int64(3), "k": "a", "j": "f"}), dsn, "1:61,3:61")
 				})
 			}
+			// Fourth review finding 1: a CAST's collation is the creating
+			// session's, so a MySQL source's key over a column declared alike
+			// can compare differently from the target's rebuild. The guard
+			// cannot see the source's hidden column and must arm.
+			t.Run("CAST key over a column declared alike on both sides", func(t *testing.T) {
+				dsn := cell(t, ci+"UNIQUE KEY fk ((cast(k as char(10) charset utf8mb4))))")
+				wantRows(t, write(t, flavor.eng, dsn, kj(myVC), row(1, "a", 1)), dsn, "1:61")
+				wantMerge(t, write(t, flavor.eng, dsn, kj(myVC), row(2, "A", 2)), dsn, "1:61")
+				wantRows(t, write(t, flavor.eng, dsn, kj(myVC), row(3, "b", 3)), dsn, "1:61,3:62")
+			})
+			// Fourth review finding 5: a collated part that reads no column
+			// (a constant generated column) is never the same source key.
+			t.Run("column-less collated part", func(t *testing.T) {
+				constGen := &ir.Table{Name: "kd", PrimaryKey: pk, Columns: []*ir.Column{
+					{Name: "id", Type: ir.Integer{Width: 32}},
+					{Name: "k", Type: pgVC},
+					{Name: "g", Type: pgVC, GeneratedExpr: "'x'", GeneratedStored: true, Nullable: true},
+				}}
+				dsn := cell(t, "CREATE TABLE kd (id INT NOT NULL PRIMARY KEY, k VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL, "+
+					"g VARCHAR(10) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci AS ('x') STORED, UNIQUE KEY fk ((lower(g))))")
+				wantRows(t, write(t, flavor.eng, dsn, constGen, ir.Row{"id": int64(1), "k": "a"}), dsn, "1:61")
+				wantMerge(t, write(t, flavor.eng, dsn, constGen, ir.Row{"id": int64(2), "k": "b"}), dsn, "1:61")
+				// The same row re-sent is the same source row: it passes.
+				wantRows(t, write(t, flavor.eng, dsn, constGen, ir.Row{"id": int64(1), "k": "a"}), dsn, "1:61")
+			})
 			t.Run("long key name, a conflict through another unique key", func(t *testing.T) {
 				dsn := cell(t, ci+"UNIQUE KEY "+long+" ((lower(k))), UNIQUE KEY uk (j))")
 				wantRows(t, write(t, flavor.eng, dsn, kj(pgVC), row(1, "e", 5)), dsn, "1:65")
