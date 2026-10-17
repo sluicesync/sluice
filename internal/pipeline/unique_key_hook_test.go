@@ -21,6 +21,7 @@ import (
 // the DDL the forward intercept had already applied (round-3 review).
 func TestUniqueKeyBoundaryHook_SchemaIntercepts(t *testing.T) {
 	snap := addColForwardSnap(addColForwardTable("users"))
+	added := addColForwardSnap(addColForwardTable("users", &ir.Column{Name: "nickname", Type: ir.Varchar{Length: 100}, Nullable: true}))
 	for _, verdict := range []bool{true, false} {
 		var judged []string
 		hook := func(_ context.Context, s ir.SchemaSnapshot) bool {
@@ -32,15 +33,47 @@ func TestUniqueKeyBoundaryHook_SchemaIntercepts(t *testing.T) {
 			want = 1
 		}
 
+		// Forward: the anchor (the seed branch) and then an ADD COLUMN (the
+		// routed branch's accept()), each judged before it is forwarded.
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		in := make(chan ir.Change, 1)
+		in := make(chan ir.Change, 2)
 		in <- snap
+		in <- added
 		close(in)
-		out := interceptAddColumnForward(ctx, in, nil, schemaForwardDeps{applier: &fakeShapeApplier{}, uniqueKeys: hook}, &atomic.Pointer[error]{})
-		if got := drainChannel(t, out, 5*time.Second); len(got) != want || strings.Join(judged, ",") != "users" {
+		out := interceptAddColumnForward(ctx, in, nil, schemaForwardDeps{
+			applier: &fakeShapeApplier{}, sourceEngineName: "postgres", targetEngineName: "postgres", uniqueKeys: hook,
+		}, &atomic.Pointer[error]{})
+		wantJudged := "users,users"
+		if !verdict {
+			wantJudged = "users" // the anchor's refusal stops it
+		}
+		if got := drainChannel(t, out, 5*time.Second); len(got) != 2*want || strings.Join(judged, ",") != wantJudged {
 			t.Errorf("forward, verdict %v: forwarded %d, judged %v", verdict, len(got), judged)
 		}
 		cancel()
+		if !verdict {
+			// The routed branch alone: an anchor the hook passes, then the
+			// ADD COLUMN it stops.
+			judged = nil
+			n := 0
+			routed := func(_ context.Context, s ir.SchemaSnapshot) bool {
+				judged = append(judged, s.Table)
+				n++
+				return n == 1
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			in := make(chan ir.Change, 2)
+			in <- snap
+			in <- added
+			close(in)
+			out := interceptAddColumnForward(ctx, in, nil, schemaForwardDeps{
+				applier: &fakeShapeApplier{}, sourceEngineName: "postgres", targetEngineName: "postgres", uniqueKeys: routed,
+			}, &atomic.Pointer[error]{})
+			if got := drainChannel(t, out, 5*time.Second); len(got) != 1 || strings.Join(judged, ",") != "users,users" {
+				t.Errorf("forward accept(): forwarded %d, judged %v; want the ADD COLUMN judged and withheld", len(got), judged)
+			}
+			cancel()
+		}
 
 		judged = nil
 		got, err := runRefuseIntercept(t, unforwardedBoundaryDeps{why: "--schema-changes=refuse", uniqueKeys: hook}, snap)
