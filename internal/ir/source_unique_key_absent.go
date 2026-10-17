@@ -111,12 +111,16 @@ const sourceUniqueKeyDropClause = "drop each named key on the target (`DROP INDE
 // operator --restart-from-scratch clears them too (streamer_coldstart.go,
 // freshCopyOperatorRestart.clearsTarget — even for VStream, whose snapshot
 // reader is the one ir.IdempotentCopyReader and whose AUTOMATIC re-snapshot
-// alone upserts onto the existing rows; Bug 320). Both measured converging
+// alone upserts onto the existing rows; Bug 320) — except under
+// --inject-shard-column, whose restart skips the clear (the consolidated
+// table is shared; unmeasured here). Both measured converging
 // from this refusal (TestStreamer_UniqueKeyDoor_PostgresSource's clean
 // re-copy cells, TestStreamer_UniqueKeyDoor_TriggerCDC).
 const sourceUniqueKeyRecopyClause = "re-copy from a clean target: `sluice sync start --restart-from-scratch` " +
 	"or `--reset-target-data --yes`, with the same `--stream-id` (" + PgoutputSlotDropClause + "); both drop and " +
-	"re-create the stream's target tables from the source, these keys and any merged row with them (destructive)."
+	"re-create the stream's target tables from the source, these keys and any merged row with them (destructive). " +
+	"Under `--inject-shard-column` a `--restart-from-scratch` re-copies onto the shared consolidated table instead, " +
+	"keeping the keys: drop them there first."
 
 func (e *SourceUniqueKeyAbsentError) remedy() string {
 	switch e.When {
