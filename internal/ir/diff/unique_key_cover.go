@@ -27,10 +27,11 @@ package diff
 // when some source key S (its primary key or a unique index) has, for
 // every part, a part of T it implies:
 //
-//   - a plain column implies the same column (names compared without case:
-//     every writer keeps the source's column names, and a case-only
-//     difference between two columns of one table is not a shape any
-//     engine pair here produces);
+//   - a plain column implies the same column (names compared without case,
+//     since every writer keeps the source's column names and some fold
+//     them — EXCEPT when either table holds two columns whose names differ
+//     only in case, a Postgres `"Email"` beside `email`: there names are
+//     compared exactly, or one would vouch for the other);
 //   - a prefix part `c(n)` implies `c(m)` for m ≥ n and the whole column
 //     `c` (unique on the first n characters is stricter than unique on
 //     more); a whole-column source part implies only a whole-column target
@@ -39,9 +40,12 @@ package diff
 //     both sides were read in one dialect (whitespace, identifier quoting
 //     and the writer's own `(expr) COLLATE <hidden>` pin removed — the
 //     normalization [renderIndexColumns] applies for `schema diff`);
-//   - a part with an index collation (SQLite NOCASE / RTRIM) implies the
-//     same column with that collation or none (a case-insensitive unique
-//     forbids more, so it implies the binary one), never a different one.
+//   - a part with an index collation (SQLite NOCASE / RTRIM, or a Postgres
+//     `(k COLLATE "x")` the caller folds in from the catalog's indcollation)
+//     implies the same column with that collation or none (a coarser
+//     equality forbids more, so it implies the default one), never a
+//     different one; a target part with an index collation its source part
+//     lacks is NOT implied (it may equate values the source keeps apart).
 //
 // And for the key as a whole: a PARTIAL source key (a predicate) enforces
 // uniqueness only inside its predicate, so it covers a target key only
@@ -55,9 +59,15 @@ package diff
 // as text (a MySQL `lower(`k`)` and a Postgres `lower((k)::text)` are one
 // key). There, and only there, the key's NAME is the identity: T is
 // covered by a same-named source key whose plain parts imply T's position
-// by position and whose expression parts sit at the same positions. Every
-// schema writer keeps a secondary index's name, so a key sluice created
-// matches. Stated so it cannot be read as broader: this fallback cannot
+// by position and whose expression parts sit at the same positions. The
+// source table's names must already be the TARGET engine's spelling of
+// them: a Postgres writer table-prefixes a secondary index name
+// (translate.PGEffectiveIndexName: `users_uniq_lower_email` for
+// `uniq_lower_email`, with convention-prefix, already-prefixed,
+// constraint-owned and >63-byte exceptions), while MySQL-family and SQLite
+// writers keep it, and the caller maps the source through
+// translate.WithTargetIndexNames first. Stated so it cannot be read as
+// broader: this fallback cannot
 // see a cross-dialect expression or predicate REDEFINED under its old name
 // (a miss), and refuses one RENAMED on either side (a loud false refusal,
 // which the acceptance flag answers).
@@ -73,9 +83,18 @@ package diff
 // subset rule still covers a key that only ADDS such a column to a key the
 // source enforces, which is the `--inject-shard-column` composite key).
 //
-// Not compared, each owned elsewhere: column collations (the key-collation
-// guard), a functional part's hidden collation (the functional-key guard),
-// DESC and NULLS ordering (they do not change which rows may coexist).
+// Not compared: DESC and NULLS ordering (they do not change which rows may
+// coexist); a functional part's hidden collation (the functional-key guard
+// owns it); and COLUMN collations, which the key-collation guard owns at
+// apply time on every lane EXCEPT a VStream source, where that guard is
+// unarmed (key_collation_boundary.go, F17) — so a VStream source column
+// moved from a `_ci` to a `_bin` collation while the stream was stopped is
+// seen by neither (stated residual). They are not compared here because a
+// column collation is TRANSLATED between engines and even between servers
+// of one family (a MySQL 8 → MariaDB target takes `utf8mb4_uca1400_*`
+// names, Bug 305), so an exact comparison refuses working configurations,
+// and no ordering of collations by strictness is available to compare
+// instead.
 
 import (
 	"strings"
@@ -92,6 +111,7 @@ func UncoveredTargetUniqueKeys(source, target *ir.Table) []*ir.Index {
 	if source == nil || target == nil {
 		return nil
 	}
+	r := coverRule{exact: hasCaseCollidingColumns(source) || hasCaseCollidingColumns(target)}
 	sourceKeys := uniqueKeysOf(source)
 	sourceCols := make(map[string]bool, len(source.Columns))
 	for _, c := range source.Columns {
@@ -106,7 +126,7 @@ func UncoveredTargetUniqueKeys(source, target *ir.Table) []*ir.Index {
 		}
 		covered := false
 		for _, s := range sourceKeys {
-			if sourceKeyCovers(s, t) {
+			if r.sourceKeyCovers(s, t) {
 				covered = true
 				break
 			}
@@ -116,6 +136,39 @@ func UncoveredTargetUniqueKeys(source, target *ir.Table) []*ir.Index {
 		}
 	}
 	return out
+}
+
+// coverRule carries how names compare for one table pair.
+type coverRule struct {
+	// exact compares column names and expression identifiers with their
+	// case, set when either table holds columns whose names differ only in
+	// case (L7 of the round-1 review): folding would let `"Email"` vouch
+	// for `email`.
+	exact bool
+}
+
+func (r coverRule) sameName(a, b string) bool {
+	if r.exact {
+		return a == b
+	}
+	return strings.EqualFold(a, b)
+}
+
+// hasCaseCollidingColumns reports two columns of t whose names are equal
+// without case.
+func hasCaseCollidingColumns(t *ir.Table) bool {
+	seen := make(map[string]bool, len(t.Columns))
+	for _, c := range t.Columns {
+		if c == nil {
+			continue
+		}
+		k := strings.ToLower(c.Name)
+		if seen[k] {
+			return true
+		}
+		seen[k] = true
+	}
+	return false
 }
 
 // uniqueKeysOf lists a table's primary key and unique indexes, skipping an
@@ -157,22 +210,22 @@ func keyHasTargetGeneratedColumn(key *ir.Index, table *ir.Table, sourceCols map[
 }
 
 // sourceKeyCovers reports whether source key s implies target key t.
-func sourceKeyCovers(s, t *ir.Index) bool {
+func (r coverRule) sourceKeyCovers(s, t *ir.Index) bool {
 	if t.ConstraintNullsNotDistinct && !s.ConstraintNullsNotDistinct {
 		return false
 	}
-	if structurallyCovers(s, t) {
+	if r.structurallyCovers(s, t) {
 		return true
 	}
-	return nameCovers(s, t)
+	return r.nameCovers(s, t)
 }
 
 // structurallyCovers is the subset rule, comparing every part (and a
 // partial source key's predicate) within one dialect.
-func structurallyCovers(s, t *ir.Index) bool {
+func (r coverRule) structurallyCovers(s, t *ir.Index) bool {
 	if sp := strings.TrimSpace(s.Predicate); sp != "" {
 		tp := strings.TrimSpace(t.Predicate)
-		if tp == "" || s.PredicateDialect != t.PredicateDialect || normalizeKeyText(sp, "") != normalizeKeyText(tp, "") {
+		if tp == "" || s.PredicateDialect != t.PredicateDialect || r.normalizeKeyText(sp, "") != r.normalizeKeyText(tp, "") {
 			return false
 		}
 	}
@@ -180,7 +233,7 @@ func structurallyCovers(s, t *ir.Index) bool {
 	for _, sp := range s.Columns {
 		found := false
 		for i, tp := range t.Columns {
-			if !used[i] && partImplies(sp, tp) {
+			if !used[i] && r.partImplies(sp, tp) {
 				used[i] = true
 				found = true
 				break
@@ -196,7 +249,7 @@ func structurallyCovers(s, t *ir.Index) bool {
 // partImplies reports whether a source key part implies a target key part
 // (the per-part rules in the file comment). Expression parts compare only
 // within one dialect.
-func partImplies(s, t ir.IndexColumn) bool {
+func (r coverRule) partImplies(s, t ir.IndexColumn) bool {
 	if s.Collation != "" || t.Collation != "" {
 		if t.Collation != "" && !strings.EqualFold(s.Collation, t.Collation) {
 			return false
@@ -215,9 +268,9 @@ func partImplies(s, t ir.IndexColumn) bool {
 		if th == "" {
 			th = sh
 		}
-		return normalizeKeyText(s.Expression, sh) == normalizeKeyText(t.Expression, th)
+		return r.normalizeKeyText(s.Expression, sh) == r.normalizeKeyText(t.Expression, th)
 	}
-	if !strings.EqualFold(s.Column, t.Column) {
+	if !r.sameName(s.Column, t.Column) {
 		return false
 	}
 	switch {
@@ -235,7 +288,7 @@ func partImplies(s, t ir.IndexColumn) bool {
 // whose expression parts — read in another dialect — sit at the same
 // positions. It applies only when something in the pair could not be
 // compared as text; a same-dialect pair is the structural rule's alone.
-func nameCovers(s, t *ir.Index) bool {
+func (r coverRule) nameCovers(s, t *ir.Index) bool {
 	if s.Name == "" || !strings.EqualFold(s.Name, t.Name) || len(s.Columns) != len(t.Columns) {
 		return false
 	}
@@ -246,7 +299,7 @@ func nameCovers(s, t *ir.Index) bool {
 		}
 		if s.PredicateDialect != t.PredicateDialect {
 			crossDialect = true
-		} else if normalizeKeyText(s.Predicate, "") != normalizeKeyText(t.Predicate, "") {
+		} else if r.normalizeKeyText(s.Predicate, "") != r.normalizeKeyText(t.Predicate, "") {
 			return false
 		}
 	}
@@ -262,7 +315,7 @@ func nameCovers(s, t *ir.Index) bool {
 			crossDialect = true
 			continue
 		}
-		if !partImplies(sp, tp) {
+		if !r.partImplies(sp, tp) {
 			return false
 		}
 	}
@@ -273,26 +326,36 @@ func nameCovers(s, t *ir.Index) bool {
 // of one dialect agree on: the writer's outer `(expr) COLLATE <hidden>` pin
 // removed, then, outside single-quoted literals, lower case without
 // whitespace, identifier quotes or redundant outer parentheses. A literal
-// is kept byte for byte: `k = 'A'` and `k = 'a'` are different keys.
-func normalizeKeyText(expr, hiddenCollation string) string {
+// is kept byte for byte: `k = 'A'` and `k = 'a'` are different keys. Under
+// the exact rule (a table with case-colliding column names) identifiers keep
+// their case and their double quotes too.
+func (r coverRule) normalizeKeyText(expr, hiddenCollation string) string {
 	e := stripOuterCollate(expr, hiddenCollation)
 	var b strings.Builder
 	inLiteral := false
-	for _, r := range e {
-		if r == '\'' {
+	for _, ch := range e {
+		if ch == '\'' {
 			inLiteral = !inLiteral
-			b.WriteRune(r)
+			b.WriteRune(ch)
 			continue
 		}
 		if inLiteral {
-			b.WriteRune(r)
+			b.WriteRune(ch)
 			continue
 		}
-		switch r {
-		case ' ', '\t', '\n', '\r', '`', '"':
+		switch ch {
+		case ' ', '\t', '\n', '\r', '`':
+			continue
+		case '"':
+			if !r.exact {
+				continue
+			}
+		}
+		if r.exact {
+			b.WriteRune(ch)
 			continue
 		}
-		b.WriteString(strings.ToLower(string(r)))
+		b.WriteString(strings.ToLower(string(ch)))
 	}
 	out := b.String()
 	for strings.HasPrefix(out, "(") && strings.HasSuffix(out, ")") && balancedOuter(out) {

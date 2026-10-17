@@ -654,14 +654,15 @@ func TestStreamer_UniqueKeyDoor_WorkingConfigurations(t *testing.T) {
 			t.Fatalf("the warm restart exited: %v", run.err)
 		}
 		_ = run.stop(t)
-		// ...and a stopped-window DROP there refuses, naming namespace.table.
+		// ...and a stopped-window DROP there refuses, naming the TARGET namespace
+		// (ukdwf_b1, the renamed one): the table the operator must change.
 		src.exec(t, "ALTER TABLE kd DROP INDEX kd_k")
 		run = startTWFBRun(newStreamer())
 		deadline := time.Now().Add(120 * time.Second)
 		for time.Now().Before(deadline) && !run.exited() {
 			time.Sleep(300 * time.Millisecond)
 		}
-		if !run.exited() || !errors.Is(run.err, ir.ErrSourceUniqueKeyAbsent) || !strings.Contains(run.err.Error(), "ukdwf_a1.kd.kd_k") {
+		if !run.exited() || !errors.Is(run.err, ir.ErrSourceUniqueKeyAbsent) || !strings.Contains(run.err.Error(), "ukdwf_b1.kd.kd_k") {
 			_ = run.stop(t)
 			t.Fatalf("the fan-out did not refuse the namespace's dropped key: %v", run.err)
 		}

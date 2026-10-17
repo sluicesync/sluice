@@ -1109,13 +1109,6 @@ func (s *Streamer) startTelemetrySidecars(ctx context.Context, applier ir.Change
 // restart picks up a fresh seed in its next coldStart run.
 func (s *Streamer) phaseWireInterceptChain(applyCtx context.Context, changes <-chan ir.Change, liveFilter *liveAddedFilter, streamID string) <-chan ir.Change {
 	filtered := filterChangesWithLiveAdd(applyCtx, changes, s.Filter, liveFilter)
-	// UNIQUE-KEY-STOPPED-WINDOW-DOOR: on a source whose change stream
-	// carries no DDL, re-check the target's unique keys against the
-	// source's every period, at a transaction boundary, before the next
-	// change is forwarded. A verbatim pass-through when the stream-open
-	// door armed nothing (unique_key_door.go).
-	filtered = interceptUniqueKeyRecheck(applyCtx, filtered, s.uniqueKeyRecheckPeriod(), s.uniqueKeyRecheck(),
-		&s.uniqueKeyRecheckErr, time.Now)
 	// ADR-0173 Phase 2: continuous *filtered* sync — the client-side
 	// row-move dispatch. When a `--where` predicate is set (s.whereFilter
 	// compiled by preflightRowFilters), evaluate it per row-bearing change
@@ -1230,6 +1223,13 @@ func (s *Streamer) phaseWireInterceptChain(applyCtx context.Context, changes <-c
 	s.coldStartSeedSnapshots = nil
 	s.unforwardedColdStartPrior = nil
 	s.firstBoundaryRetained = nil
+	// UNIQUE-KEY-STOPPED-WINDOW-DOOR, mid-stream: after the schema-forward
+	// intercepts, so a forwarded ALTER is on the target when its boundary
+	// passes (a forwarded DROP COLUMN can narrow a MySQL-family key), and
+	// the periodic re-check on a source whose change stream carries no DDL.
+	// A verbatim pass-through when the stream-open door armed nothing
+	// (unique_key_recheck.go).
+	filtered = interceptUniqueKeyChecks(applyCtx, filtered, s.uniqueKeyChecksFor(), &s.uniqueKeyRecheckErr, time.Now)
 	// Roadmap item 46 (ADR-0121): the delayed-replica gate. When
 	// --apply-delay is set, hold each change until its source commit
 	// timestamp + delay has elapsed before forwarding it to the applier (the
