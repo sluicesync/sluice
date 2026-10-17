@@ -183,7 +183,9 @@ func TestStreamer_UniqueKeyDoor_Review5SQLiteSourceFoldingTarget(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "app.db")
 			for _, stmt := range []string{
 				"PRAGMA journal_mode=WAL",
-				"CREATE TABLE kd (id INTEGER PRIMARY KEY, k TEXT NOT NULL UNIQUE, v TEXT)",
+				// k is the PRIMARY KEY, so on the Postgres target it is the upsert's
+				// ON CONFLICT key and 'A' would merge onto 'a' silently.
+				"CREATE TABLE kd (id INTEGER NOT NULL, k TEXT NOT NULL PRIMARY KEY, v TEXT)",
 				"INSERT INTO kd VALUES (1,'a','one'),(2,'b','two')",
 			} {
 				sqliteExec(t, path, stmt)
