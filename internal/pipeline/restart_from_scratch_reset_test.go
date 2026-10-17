@@ -17,8 +17,10 @@ package pipeline
 // The fix: when restarting-from-scratch (or auto-resnapshotting) with a
 // NON-idempotent reader, drop the in-scope target tables first
 // (resetTargetTablesForRestart, reusing --reset-target-data's FK-safe
-// drop machinery) so the plain-INSERT copy starts clean. The idempotent
-// path is unchanged (still absorbs). These pins lock both halves of the
+// drop machinery) so the plain-INSERT copy starts clean. An idempotent
+// reader still absorbs on the AUTOMATIC re-snapshot only; the operator's
+// --restart-from-scratch clears it too (audit 2026-08-01 S5,
+// TestColdStartGate_RestartFromScratch_Idempotent_DropsTarget). These pins lock both halves of the
 // dispatch decision and the helper's error/refusal shapes.
 
 import (

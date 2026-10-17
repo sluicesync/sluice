@@ -426,16 +426,17 @@ type Streamer struct {
 
 	// RestartFromScratch, when true, forces a fresh cold-start that
 	// re-copies from row 0 — IGNORING any persisted resume position
-	// (incl. a mid-COPY TablePKs cursor) — WITHOUT dropping the target
-	// (the idempotent COPY writer absorbs the re-copied overlap). It is
+	// (incl. a mid-COPY TablePKs cursor). It drops and recreates the
+	// in-scope target tables first on every reader (freshCopyOperatorRestart
+	// clears the target, audit 2026-08-01 S5), except under
+	// --inject-shard-column, whose consolidated tables are shared. It is
 	// the explicit "force-fresh-COPY" knob: --force-cold-start only
 	// skips the pre-flight (it still warm-resumes when a position
-	// exists), and --reset-target-data is the heavier destructive path
-	// (it DROPs the dest tables). This sits between them. Like
+	// exists), and --reset-target-data is the heavier path (it also
+	// deletes the cdc-state row). This sits between them. Like
 	// ResetTargetData it forces the cold-start branch and skips the
-	// populated-target pre-flight (you are deliberately re-copying onto
-	// existing rows). Cleared after the first iteration so a retry does
-	// not perpetually re-cold-start.
+	// populated-target pre-flight. Cleared after the first iteration so a
+	// retry does not perpetually re-cold-start.
 	RestartFromScratch bool
 
 	// SuppressAutoResnapshotOnInvalidPosition is the OPT-OUT for the

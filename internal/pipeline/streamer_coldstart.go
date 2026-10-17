@@ -1035,7 +1035,8 @@ func (s *Streamer) coldStartGatePreflight(ctx context.Context, schema *ir.Schema
 		//     prior copy dup-key-collide (MySQL Error 1062).
 		//
 		//  2. The operator's explicit --restart-from-scratch on an IDEMPOTENT
-		//     reader (VStream, PG) — added for audit 2026-08-01 S5. The old
+		//     reader (VStream only; the Postgres snapshot is not one and is
+		//     already covered by 1) — added for audit 2026-08-01 S5. The old
 		//     code sent this to the default branch on the reasoning that "the
 		//     UPSERT writer absorbs the overlap". It absorbs rows that still
 		//     exist at the source; it cannot remove rows the source DELETED
@@ -1089,7 +1090,7 @@ func (s *Streamer) coldStartGatePreflight(ctx context.Context, schema *ir.Schema
 		// classic cold-start preflight is suppressed in that case.
 		if !s.InjectShardColumn.Engaged() {
 			// A fresh reason reaches this default branch only for the
-			// AUTOMATIC auto-resnapshot on an IDEMPOTENT reader (VStream/PG).
+			// AUTOMATIC auto-resnapshot on an IDEMPOTENT reader (VStream).
 			// Everything else that forces a fresh copy is drained by the
 			// clear-the-target case above. (A genuine fresh cold-start has
 			// freshCopyNone and is still refused on a populated target —

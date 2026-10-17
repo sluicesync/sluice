@@ -297,11 +297,10 @@ func (s *Streamer) runWithRetry(ctx context.Context, attempts int) error {
 		// and either dead-end on the populated-target refusal or dup-key
 		// (1062) on the partial prior copy (native MySQL, plain INSERT). Set
 		// RestartFromScratch so the re-run forces a clean re-establishment:
-		// coldStartGatePreflight then makes it land cleanly PER SOURCE — a
-		// non-idempotent reader (native MySQL binlog) drops + recreates the
-		// in-scope target tables first, an idempotent reader (VStream/PG)
-		// re-copies with UPSERT and absorbs the overlap (the v0.99.73
-		// forceFresh path). It is bounded + backed-off by the SAME ADR-0038
+		// coldStartGatePreflight then drops + recreates the in-scope target
+		// tables first on EVERY reader (freshCopyOperatorRestart clears the
+		// target; audit 2026-08-01 S5), so the re-copy starts clean. Under
+		// --inject-shard-column the shared tables are not dropped. It is bounded + backed-off by the SAME ADR-0038
 		// budget below (never an infinite loop) and loud (the retry WARN +
 		// the budget-exhaustion terminal both fire). The cdc-state row is
 		// untouched (only --reset-target-data clears it).
