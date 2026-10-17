@@ -358,8 +358,8 @@ func TestInterceptUniqueKeyChecks(t *testing.T) {
 		cfg := uniqueKeyChecks{
 			maxFailures: 3, boundary: refusingBoundary(&tables), colsKey: keyByTable,
 			seedCols: map[string]string{
-				uniqueKeyColsKey("", "Users"): columnList(ukrSnap("Users", "id", "k", "b").IR),
 				uniqueKeyColsKey("", "users"): columnList(ukrSnap("users", "id", "k").IR),
+				uniqueKeyColsKey("", "Users"): columnList(ukrSnap("Users", "id", "k", "b").IR),
 			},
 		}
 		got, err := h.run(t, ctx, cfg, []ir.Change{ukrSnap("users", "id", "k")}, make([]time.Duration, 1))
