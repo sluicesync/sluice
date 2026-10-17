@@ -310,25 +310,29 @@ func TestStreamer_UniqueKeyDoor_PostgresSource(t *testing.T) {
 	}
 	// The other remedy a pgoutput refusal prints — the clean re-copy, for a
 	// stream an older sluice ran across the DROP — run exactly as printed.
-	t.Run("mysql/pk/stopped-drop/the clean re-copy remedy", func(t *testing.T) {
-		src, tgt := pgNew("ukdpz_s"), myNew("ukdpz_t")
-		src.exec(t, ukdShapePK.pgCreate)
-		cell := twfbCell{src: src, tgt: tgt, streamID: "ukdpz", slotName: "ukdpz"}
-		cell.coldStartAndStop(t, "kd", 2)
-		before := ukdRows(t, tgt)
-		src.exec(t, ukdShapePK.pgDrop)
-		src.exec(t, ukdShapePK.duplicate)
-		run := startTWFBRun(cell.streamer())
-		ukdAwaitExitOrConverge(t, run, src, tgt, 120*time.Second)
-		refusal := ukdRequireRefusal(t, run, tgt, before, "kd.kd_k", ir.UniqueKeyDoorAtOpen)
-		if !strings.Contains(refusal.Error(), "--reset-target-data --yes") {
-			t.Fatalf("the refusal does not print the clean re-copy: %v", refusal)
-		}
-		ukdRunPrintedSlotDrop(t, refusal, src, cell.slotName)
-		r := cell.streamer()
-		r.ResetTargetData = true
-		ukdConvergeAndResume(t, r, src, tgt, "INSERT INTO kd VALUES (8,'r','eight')")
-	})
+	for i, remedy := range []string{"--reset-target-data", "--restart-from-scratch"} {
+		t.Run("mysql/pk/stopped-drop/the clean re-copy remedy "+remedy, func(t *testing.T) {
+			tag := "ukdpz" + string(rune('a'+i))
+			src, tgt := pgNew(tag+"_s"), myNew(tag+"_t")
+			src.exec(t, ukdShapePK.pgCreate)
+			cell := twfbCell{src: src, tgt: tgt, streamID: tag, slotName: tag}
+			cell.coldStartAndStop(t, "kd", 2)
+			before := ukdRows(t, tgt)
+			src.exec(t, ukdShapePK.pgDrop)
+			src.exec(t, ukdShapePK.duplicate)
+			run := startTWFBRun(cell.streamer())
+			ukdAwaitExitOrConverge(t, run, src, tgt, 120*time.Second)
+			refusal := ukdRequireRefusal(t, run, tgt, before, "kd.kd_k", ir.UniqueKeyDoorAtOpen)
+			if !strings.Contains(refusal.Error(), remedy) {
+				t.Fatalf("the refusal does not print the clean re-copy %s: %v", remedy, refusal)
+			}
+			ukdRunPrintedSlotDrop(t, refusal, src, cell.slotName)
+			r := cell.streamer()
+			r.ResetTargetData = remedy == "--reset-target-data"
+			r.RestartFromScratch = remedy == "--restart-from-scratch"
+			ukdConvergeAndResume(t, r, src, tgt, "INSERT INTO kd VALUES (8,'r','eight')")
+		})
+	}
 }
 
 // ukdRunPrintedSlotDrop runs the slot drop a refusal prints for a Postgres
