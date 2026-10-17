@@ -66,6 +66,10 @@ import (
 // [interceptAddColumnForward] needs. Plumbed by the Streamer's apply
 // loop; the test harness constructs a minimal one with fakes.
 type schemaForwardDeps struct {
+	// uniqueKeys judges each snapshot after its DDL and before it is
+	// forwarded ([uniqueKeyBoundaryGate]); nil judges nothing.
+	uniqueKeys uniqueKeyBoundaryHook
+
 	// applier issues the per-shape ALTER/CREATE/DROP DDL on the target
 	// (ADR-0091). Both PG and MySQL SchemaWriters implement the full
 	// [ir.ShapeDeltaApplier] surface; the Streamer opens one alongside
@@ -335,6 +339,9 @@ func interceptAddColumnForward(
 						errStore.Store(&wrapped)
 						return false
 					}
+					if deps.uniqueKeys != nil && !deps.uniqueKeys(ctx, snap) {
+						return false
+					}
 					return forwardChange(ctx, out, attached)
 				}
 				var routeErr error
@@ -344,6 +351,9 @@ func interceptAddColumnForward(
 						ctx, "forward-add-column intercept: seeded table cache",
 						"table", key,
 					)
+					if deps.uniqueKeys != nil && !deps.uniqueKeys(ctx, snap) {
+						return
+					}
 					if !forwardChange(ctx, out, c) {
 						return
 					}

@@ -44,7 +44,7 @@ func dispatchOne(t *testing.T, r *CDCReader, payload []byte) (ir.Change, error) 
 	t.Helper()
 	var (
 		relations            = map[uint32]*relationCacheEntry{}
-		snapshotSig          = map[uint32]ir.SchemaSignature{}
+		snapshotSig          = map[uint32]relationSnapshotSig{}
 		currentTxnLSN        pglogrepl.LSN
 		currentTxnStartLSN   pglogrepl.LSN
 		currentTxnCommitTime time.Time

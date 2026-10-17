@@ -109,7 +109,7 @@ func TestStreamAbortMessageV2_RefusesLoudly(t *testing.T) {
 	// flag so the parse succeeds and the dispatch arm is reached.
 	var (
 		relations            = map[uint32]*relationCacheEntry{}
-		snapshotSig          = map[uint32]ir.SchemaSignature{}
+		snapshotSig          = map[uint32]relationSnapshotSig{}
 		currentTxnLSN        = pglogrepl.LSN(0)
 		currentTxnStartLSN   = pglogrepl.LSN(0)
 		currentTxnCommitTime = time.Time{}
@@ -191,7 +191,7 @@ func TestStreamAbortMessageV2_ErrorPropagatesAsUnclassified(t *testing.T) {
 	}
 	var (
 		relations            = map[uint32]*relationCacheEntry{}
-		snapshotSig          = map[uint32]ir.SchemaSignature{}
+		snapshotSig          = map[uint32]relationSnapshotSig{}
 		currentTxnLSN        = pglogrepl.LSN(0)
 		currentTxnStartLSN   = pglogrepl.LSN(0)
 		currentTxnCommitTime = time.Time{}

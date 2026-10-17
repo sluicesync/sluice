@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -38,7 +39,7 @@ type uniqueKeyChecks struct {
 	// stream-open door read it, keyed by colsKey; a snapshot is checked when
 	// its column list differs from the last one known for its table,
 	// starting from that seed.
-	boundary    func(ctx context.Context, schema, table string) (*ir.SourceUniqueKeyAbsentError, error)
+	boundary    func(ctx context.Context, snap ir.SchemaSnapshot) (*ir.SourceUniqueKeyAbsentError, error)
 	seedCols    map[string]string
 	colsKey     func(schema, table string) string
 	maxFailures int
@@ -46,9 +47,12 @@ type uniqueKeyChecks struct {
 
 func (c uniqueKeyChecks) armed() bool { return c.periodic != nil || c.boundary != nil }
 
-// interceptUniqueKeyChecks runs the door mid-stream, on the change channel
-// AFTER the schema-forward intercepts (so a forwarded ALTER is already on
-// the target when its SchemaSnapshot passes):
+// interceptUniqueKeyChecks runs the door's PERIODIC re-check mid-stream as a
+// channel stage, wired UPSTREAM of the schema intercepts (a held transaction
+// below them would be applied after a DDL they had already run). Its
+// BOUNDARY half is a [uniqueKeyBoundaryGate] the schema intercepts call;
+// production wires this stage without one, and a unit test wires one here to
+// drive the gate through the same harness:
 //
 //   - PERIODIC (a source whose change stream carries no DDL): once a period
 //     has passed, the next transaction is HELD from its TxBegin until it
@@ -94,6 +98,13 @@ func (c uniqueKeyChecks) armed() bool { return c.periodic != nil || c.boundary !
 // that window is applied, and the re-check's refusal then names a re-copy.
 // The trigger engines refuse a keyless table at setup, so on them that arm
 // cannot occur; VStream can carry one.
+//
+// Upstream of the schema intercepts, a periodic re-check due just after a
+// snapshot can read the target while the forward intercept is still
+// applying that snapshot's DDL. The only key-relevant DDL it forwards is a
+// DROP COLUMN, whose cascade drops or narrows a target key, so the miss
+// direction is a refusal a restart clears (a loud false refusal, not a
+// silent pass), and it needs a due re-check to coincide with such a DROP.
 func interceptUniqueKeyChecks(
 	ctx context.Context,
 	in <-chan ir.Change,
@@ -105,11 +116,7 @@ func interceptUniqueKeyChecks(
 		return in
 	}
 	out := make(chan ir.Change, migcore.RowChanBuffer)
-	prevCols := make(map[string]string, len(cfg.seedCols))
-	for k, v := range cfg.seedCols {
-		prevCols[k] = v
-	}
-	r := &uniqueKeyRunner{cfg: cfg, errStore: errStore, now: now, out: out, last: now(), prevCols: prevCols}
+	r := &uniqueKeyRunner{cfg: cfg, errStore: errStore, now: now, out: out, last: now(), gate: newUniqueKeyBoundaryGate(cfg, errStore)}
 	go func() {
 		defer close(out)
 		for {
@@ -141,7 +148,7 @@ type uniqueKeyRunner struct {
 	held     []ir.Change
 	holding  bool
 	inTx     bool
-	prevCols map[string]string
+	gate     *uniqueKeyBoundaryGate
 }
 
 // step handles one change; false ends the intercept.
@@ -218,59 +225,143 @@ func (r *uniqueKeyRunner) flush(ctx context.Context) bool {
 	return true
 }
 
-// emit forwards c, running the boundary check first for a SchemaSnapshot
-// whose column list moved.
+// emit forwards c, through the runner's boundary gate for a SchemaSnapshot
+// (production wires the stage with none: the schema intercepts hold the
+// gate; a unit test wires one here to drive it).
 func (r *uniqueKeyRunner) emit(ctx context.Context, c ir.Change) bool {
-	if snap, ok := c.(ir.SchemaSnapshot); ok && r.cfg.boundary != nil && snap.IR != nil {
-		key := snap.QualifiedName()
-		if r.cfg.colsKey != nil {
-			key = r.cfg.colsKey(snap.Schema, snap.Table)
-		}
-		cols := columnList(snap.IR)
-		prev, seen := r.prevCols[key]
-		if seen && prev != cols {
-			refusal, err := r.cfg.boundary(ctx, snap.Schema, snap.Table)
-			if !r.settleBoundary(ctx, snap.QualifiedName(), refusal, err) {
-				return false
-			}
-		}
-		r.prevCols[key] = cols
+	if snap, ok := c.(ir.SchemaSnapshot); ok && !r.gate.judge(ctx, snap) {
+		return false
 	}
 	return forwardChange(ctx, r.out, c)
 }
 
-// settleBoundary acts on a boundary check's result. A read failure stops
-// the stream (restartable) instead of WARNing: the boundary is judged once,
-// and forwarding past it unjudged would leave the table unwatched for the
-// rest of the run on a source with no periodic re-check (round-2 review
-// MEDIUM-1). It is not counted toward the periodic failure budget.
-func (r *uniqueKeyRunner) settleBoundary(ctx context.Context, table string, refusal *ir.SourceUniqueKeyAbsentError, err error) bool {
-	switch {
-	case ctx.Err() != nil:
-		return false
-	case err != nil:
-		stop := fmt.Errorf("%s: the unique-key check after a schema change of %s could not read a catalog, so the "+
-			"change cannot be judged and the stream stops before anything after it is applied; the next start "+
-			"compares the catalogs again: %w", SourceUniqueKeyRecheckFailedMarker, table, err)
-		r.errStore.Store(&stop)
-		return false
-	case refusal != nil:
-		var e error = refusal
-		r.errStore.Store(&e)
-		return false
+// uniqueKeyBoundaryGate is the BOUNDARY check ([uniqueKeyChecks.boundary]),
+// judged synchronously by whichever schema intercept handles a snapshot —
+// forward ([interceptAddColumnForward]), refuse
+// ([interceptSchemaChangeRefuse]) or Shape A
+// ([interceptSchemaSnapshotsForCoordination]) — after that intercept has
+// applied its DDL and before it forwards the snapshot. It is NOT a channel
+// stage of its own: the forward intercepts apply a boundary's DDL as soon as
+// they read the snapshot, and rely on every earlier change having reached
+// the applier already; a stage between them and the applier holds earlier
+// changes past that DDL, and a row carrying a column the forward just
+// dropped then failed at the applier (measured: the schema-forward DROP,
+// RENAME and ALTER TYPE pins all broke while this check was a downstream
+// stage). Owned by the one intercept goroutine that calls it. A nil gate
+// judges nothing.
+type uniqueKeyBoundaryGate struct {
+	check    func(ctx context.Context, snap ir.SchemaSnapshot) (*ir.SourceUniqueKeyAbsentError, error)
+	colsKey  func(schema, table string) string
+	prevCols map[string]string
+	errStore *atomic.Pointer[error]
+}
+
+// newUniqueKeyBoundaryGate builds the gate for cfg (nil when cfg arms no
+// boundary check), its baseline the open door's column lists.
+func newUniqueKeyBoundaryGate(cfg uniqueKeyChecks, errStore *atomic.Pointer[error]) *uniqueKeyBoundaryGate {
+	if cfg.boundary == nil {
+		return nil
 	}
+	prevCols := make(map[string]string, len(cfg.seedCols))
+	for k, v := range cfg.seedCols {
+		prevCols[k] = v
+	}
+	return &uniqueKeyBoundaryGate{check: cfg.boundary, colsKey: cfg.colsKey, prevCols: prevCols, errStore: errStore}
+}
+
+// hook is the gate as the schema intercepts take it (nil for a nil gate).
+func (g *uniqueKeyBoundaryGate) hook() uniqueKeyBoundaryHook {
+	if g == nil {
+		return nil
+	}
+	return g.judge
+}
+
+// uniqueKeyBoundaryHook judges one snapshot; false means a refusal or a
+// fail-closed stop was stored and the caller must stop forwarding.
+type uniqueKeyBoundaryHook func(ctx context.Context, snap ir.SchemaSnapshot) bool
+
+// judge runs the check for a snapshot whose columns moved ([columnsMoved])
+// or whose reader reports a unique key lost with a column
+// ([ir.SchemaSnapshot.UniqueKeysMoved]: a dropped generated column is not in
+// a Postgres change stream's column list, so only the reader's catalog read
+// sees it). A read failure stops the stream (restartable) instead of
+// WARNing: the boundary is judged once, and passing it unjudged would leave
+// the table unwatched for the rest of the run on a source with no periodic
+// re-check (round-2 review MEDIUM-1). It is not counted toward the periodic
+// failure budget.
+func (g *uniqueKeyBoundaryGate) judge(ctx context.Context, snap ir.SchemaSnapshot) bool {
+	if g == nil || snap.IR == nil {
+		return true
+	}
+	key := snap.QualifiedName()
+	if g.colsKey != nil {
+		key = g.colsKey(snap.Schema, snap.Table)
+	}
+	cols := columnList(snap.IR)
+	prev, seen := g.prevCols[key]
+	if snap.UniqueKeysMoved || (seen && columnsMoved(prev, cols)) {
+		refusal, err := g.check(ctx, snap)
+		switch {
+		case ctx.Err() != nil:
+			return false
+		case err != nil:
+			stop := fmt.Errorf("%s: the unique-key check after a schema change of %s could not read a catalog, so the "+
+				"change cannot be judged and the stream stops before anything after it is applied; the next start "+
+				"compares the catalogs again: %w", SourceUniqueKeyRecheckFailedMarker, snap.QualifiedName(), err)
+			g.errStore.Store(&stop)
+			return false
+		case refusal != nil:
+			var e error = refusal
+			g.errStore.Store(&e)
+			return false
+		}
+	}
+	g.prevCols[key] = cols
 	return true
 }
 
+// columnList renders a table's columns for [columnsMoved]: each name with
+// its stable id (a Postgres attnum, [ir.Column.StableID]) when it has one,
+// sorted.
 func columnList(t *ir.Table) string {
 	names := make([]string, 0, len(t.Columns))
 	for _, c := range t.Columns {
 		if c != nil {
-			names = append(names, c.Name)
+			names = append(names, c.Name+"\x01"+strconv.Itoa(c.StableID))
 		}
 	}
 	sort.Strings(names)
 	return strings.Join(names, "\x00")
+}
+
+// columnsMoved compares two [columnList]s: different names moved, and so
+// did a name whose stable id differs where BOTH sides carry one (a column
+// dropped and re-added under the same name — round-3 review). A side with
+// no id (the open door's schema read, a MySQL source) compares by name.
+func columnsMoved(prev, cur string) bool {
+	ids := func(list string) map[string]string {
+		out := map[string]string{}
+		if list == "" {
+			return out
+		}
+		for _, e := range strings.Split(list, "\x00") {
+			name, id, _ := strings.Cut(e, "\x01")
+			out[name] = id
+		}
+		return out
+	}
+	p, c := ids(prev), ids(cur)
+	if len(p) != len(c) {
+		return true
+	}
+	for name, cid := range c {
+		pid, ok := p[name]
+		if !ok || (pid != "0" && cid != "0" && pid != cid) {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *uniqueKeyRunner) runPeriodic(ctx context.Context) bool {
@@ -326,10 +417,11 @@ func (s *Streamer) uniqueKeyChecksFor() uniqueKeyChecks {
 		}
 		return uniqueKeyColsKey(schema, table)
 	}
-	cfg.boundary = func(ctx context.Context, schema, table string) (*ir.SourceUniqueKeyAbsentError, error) {
-		i := door.scopeFor(schema)
+	cfg.boundary = func(ctx context.Context, snap ir.SchemaSnapshot) (*ir.SourceUniqueKeyAbsentError, error) {
+		i := door.scopeFor(snap.Schema)
 		absent, _, err := s.compareUniqueKeys(ctx, door.scopes, uniqueKeyCompare{
-			only: map[int][]string{i: {table}}, collations: s.uniqueKeyCollationsArmed(false),
+			only: map[int][]string{i: {snap.Table}}, collations: s.uniqueKeyCollationsArmed(false),
+			positionCols: snapshotColumnNames(snap.IR),
 		})
 		if err != nil || len(absent) == 0 {
 			return nil, err

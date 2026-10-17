@@ -152,6 +152,10 @@ var schemaChangeRefusedMarker = ir.ErrSchemaChangeRefused.Error()
 
 // unforwardedBoundaryDeps is what [interceptSchemaChangeRefuse] needs.
 type unforwardedBoundaryDeps struct {
+	// uniqueKeys judges each accepted snapshot before it is forwarded
+	// ([uniqueKeyBoundaryGate]); nil judges nothing.
+	uniqueKeys uniqueKeyBoundaryHook
+
 	// witnessFor returns the target witness for a boundary's source
 	// namespace (ir.SchemaSnapshot.Schema): one for the single-database
 	// stream whatever the namespace, one per namespace on a multi-database
@@ -294,6 +298,9 @@ func interceptSchemaChangeRefuse(
 				if err != nil {
 					wrapped := fmt.Errorf("pipeline: schema change on a stream that does not forward DDL: %w", err)
 					errStore.Store(&wrapped)
+					return
+				}
+				if deps.uniqueKeys != nil && !deps.uniqueKeys(ctx, snap) {
 					return
 				}
 				if !forwardChange(ctx, out, attached) {
@@ -563,9 +570,12 @@ type unforwardedPrior struct {
 // ADD refuses as a column the target lacks.
 //
 // In-process evidence only: a history version carries no stable ids (they
-// are not persisted), so the same replacement across a restart is not seen,
-// and the Postgres reader emits no boundary at all for a replacement that
-// leaves every name and type in place (GC-44 F22).
+// are not persisted), so the same replacement across a restart is not seen.
+// Within a session the Postgres reader now emits a boundary for a
+// replacement that leaves every name and type in place, since its dedupe
+// compares attnums too (round-3 review of UNIQUE-KEY-STOPPED-WINDOW-DOOR);
+// through v0.161.1 it emitted none (GC-44 F22), and a replacement made
+// while the stream was stopped is still not seen.
 func replacedColumns(prior, post *ir.Table) map[string]bool {
 	if post == nil || prior == nil {
 		return nil

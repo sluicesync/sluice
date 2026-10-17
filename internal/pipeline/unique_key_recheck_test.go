@@ -204,8 +204,9 @@ func TestInterceptUniqueKeyChecks(t *testing.T) {
 			t.Fatalf("a cancellation surfaced %v", err)
 		}
 	})
-	refusingBoundary := func(tables *[]string) func(context.Context, string, string) (*ir.SourceUniqueKeyAbsentError, error) {
-		return func(_ context.Context, _, table string) (*ir.SourceUniqueKeyAbsentError, error) {
+	refusingBoundary := func(tables *[]string) func(context.Context, ir.SchemaSnapshot) (*ir.SourceUniqueKeyAbsentError, error) {
+		return func(_ context.Context, snap ir.SchemaSnapshot) (*ir.SourceUniqueKeyAbsentError, error) {
+			table := snap.Table
 			*tables = append(*tables, table)
 			return &ir.SourceUniqueKeyAbsentError{When: ir.UniqueKeyDoorAtSchemaChange}, nil
 		}
@@ -242,7 +243,7 @@ func TestInterceptUniqueKeyChecks(t *testing.T) {
 		cfg := uniqueKeyChecks{
 			maxFailures: 3, colsKey: keyByTable,
 			seedCols: map[string]string{uniqueKeyColsKey("", "kd"): columnList(ukrSnap("kd", "id", "k", "b").IR)},
-			boundary: func(context.Context, string, string) (*ir.SourceUniqueKeyAbsentError, error) {
+			boundary: func(context.Context, ir.SchemaSnapshot) (*ir.SourceUniqueKeyAbsentError, error) {
 				return nil, errors.New("catalog down")
 			},
 		}
@@ -276,7 +277,8 @@ func TestInterceptUniqueKeyChecks(t *testing.T) {
 	t.Run("the boundary check runs on a moved column list, not on an unseeded first snapshot", func(t *testing.T) {
 		var h ukrHarness
 		var tables []string
-		cfg := uniqueKeyChecks{maxFailures: 3, boundary: func(_ context.Context, _, table string) (*ir.SourceUniqueKeyAbsentError, error) {
+		cfg := uniqueKeyChecks{maxFailures: 3, boundary: func(_ context.Context, snap ir.SchemaSnapshot) (*ir.SourceUniqueKeyAbsentError, error) {
+			table := snap.Table
 			tables = append(tables, table)
 			return &ir.SourceUniqueKeyAbsentError{When: ir.UniqueKeyDoorAtSchemaChange}, nil
 		}}
@@ -289,6 +291,80 @@ func TestInterceptUniqueKeyChecks(t *testing.T) {
 		// first snapshot, the row, the reordered (same set) snapshot.
 		if len(got) != 3 {
 			t.Fatalf("forwarded=%d; want 3, the snapshot that moved the columns withheld", len(got))
+		}
+	})
+	// Round-3 review: shapes whose column NAMES do not move.
+	withIDs := func(table string, cols map[string]int) ir.SchemaSnapshot {
+		s := ukrSnap(table)
+		for _, n := range []string{"id", "k", "b"} {
+			if id, ok := cols[n]; ok {
+				s.IR.Columns = append(s.IR.Columns, &ir.Column{Name: n, StableID: id})
+			}
+		}
+		return s
+	}
+	t.Run("a column dropped and re-added under its name (a new attnum) is checked", func(t *testing.T) {
+		var h ukrHarness
+		var tables []string
+		cfg := uniqueKeyChecks{maxFailures: 3, boundary: refusingBoundary(&tables)}
+		got, err := h.run(t, ctx, cfg, []ir.Change{
+			withIDs("kd", map[string]int{"id": 1, "k": 2, "b": 3}), watchedRow,
+			withIDs("kd", map[string]int{"id": 1, "k": 2, "b": 4}), watchedRow,
+		}, make([]time.Duration, 4))
+		if strings.Join(tables, ",") != "kd" || !errors.Is(err, ir.ErrSourceUniqueKeyAbsent) || len(got) != 2 {
+			t.Fatalf("checked %v, forwarded %d, err=%v; want the re-added column's snapshot checked and withheld", tables, len(got), err)
+		}
+	})
+	t.Run("an id-less seed against a snapshot with attnums compares by name", func(t *testing.T) {
+		var h ukrHarness
+		var tables []string
+		cfg := uniqueKeyChecks{
+			maxFailures: 3, boundary: refusingBoundary(&tables), colsKey: keyByTable,
+			seedCols: map[string]string{uniqueKeyColsKey("", "kd"): columnList(ukrSnap("kd", "id", "k", "b").IR)},
+		}
+		got, err := h.run(t, ctx, cfg, []ir.Change{withIDs("kd", map[string]int{"id": 1, "k": 2, "b": 3}), watchedRow}, make([]time.Duration, 2))
+		if len(tables) != 0 || err != nil || len(got) != 2 {
+			t.Fatalf("checked %v, forwarded %d, err=%v; the open read carries no attnums, so this is no change", tables, len(got), err)
+		}
+	})
+	t.Run("a reader-reported unique key lost with a column is checked though nothing moved", func(t *testing.T) {
+		var h ukrHarness
+		var tables []string
+		cfg := uniqueKeyChecks{
+			maxFailures: 3, boundary: refusingBoundary(&tables), colsKey: keyByTable,
+			seedCols: map[string]string{uniqueKeyColsKey("", "kd"): columnList(ukrSnap("kd", "id", "k").IR)},
+		}
+		// A dropped GENERATED column: never in the change stream's list.
+		lost := ukrSnap("kd", "id", "k")
+		lost.UniqueKeysMoved = true
+		got, err := h.run(t, ctx, cfg, []ir.Change{ukrSnap("kd", "id", "k"), watchedRow, lost, watchedRow}, make([]time.Duration, 4))
+		if strings.Join(tables, ",") != "kd" || !errors.Is(err, ir.ErrSourceUniqueKeyAbsent) || len(got) != 2 {
+			t.Fatalf("checked %v, forwarded %d, err=%v; want the flagged snapshot checked and withheld", tables, len(got), err)
+		}
+	})
+	t.Run("the flag is honoured on a table the open door never read", func(t *testing.T) {
+		var h ukrHarness
+		var tables []string
+		cfg := uniqueKeyChecks{maxFailures: 3, boundary: refusingBoundary(&tables), colsKey: keyByTable}
+		lost := ukrSnap("kd", "id", "k")
+		lost.UniqueKeysMoved = true
+		if _, err := h.run(t, ctx, cfg, []ir.Change{lost}, make([]time.Duration, 1)); strings.Join(tables, ",") != "kd" || err == nil {
+			t.Fatalf("checked %v, err=%v", tables, err)
+		}
+	})
+	t.Run("two tables whose names differ only in case keep separate baselines", func(t *testing.T) {
+		var h ukrHarness
+		var tables []string
+		cfg := uniqueKeyChecks{
+			maxFailures: 3, boundary: refusingBoundary(&tables), colsKey: keyByTable,
+			seedCols: map[string]string{
+				uniqueKeyColsKey("", "Users"): columnList(ukrSnap("Users", "id", "k", "b").IR),
+				uniqueKeyColsKey("", "users"): columnList(ukrSnap("users", "id", "k").IR),
+			},
+		}
+		got, err := h.run(t, ctx, cfg, []ir.Change{ukrSnap("users", "id", "k")}, make([]time.Duration, 1))
+		if len(tables) != 0 || err != nil || len(got) != 1 {
+			t.Fatalf("checked %v, err=%v; users matches its own baseline, not Users'", tables, err)
 		}
 	})
 	t.Run("nothing armed is a pass-through", func(t *testing.T) {

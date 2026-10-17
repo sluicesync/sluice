@@ -6,6 +6,7 @@ package postgres
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -420,5 +421,54 @@ func TestDiffRelationFacts_PlainUniqueIndex(t *testing.T) {
 	delete(dropped.constraints, "x_pos")
 	if d := diffRelationFacts(gc2Base(), dropped); len(d) != 0 {
 		t.Errorf("a unique index dropped with its column refused: %q", d)
+	}
+}
+
+// TestUniqueKeysLostWithColumn pins the round-3 handoff: every unique key
+// kind (a plain unique index, a UNIQUE constraint, a PRIMARY KEY) lost with
+// a dropped column is named — and still exempt from this door's refusal —
+// while a key that merely changed, a renamed index, an expression element
+// (attnum 0) and a non-unique constraint kind are not handed on.
+func TestUniqueKeysLostWithColumn(t *testing.T) {
+	cols := func(attnums ...int16) map[int16]pgColumnFact {
+		out := map[int16]pgColumnFact{}
+		for _, a := range attnums {
+			out[a] = pgColumnFact{name: fmt.Sprint("c", a), typ: "int4"}
+		}
+		return out
+	}
+	key := func(kind string, attnums ...int16) pgConstraintFact {
+		return pgConstraintFact{kind: kind, compare: fmt.Sprint(kind, attnums), display: "x", identity: fmt.Sprint(kind, attnums), attnums: attnums}
+	}
+	prior := &pgRelationFacts{
+		columns: cols(1, 2, 3, 4),
+		constraints: map[string]pgConstraintFact{
+			"kd_pkey": key("p", 3), "kd_u": key("u", 2, 4), "kd_chk": key("c", 4), "kd_x": key("x", 4),
+		},
+		uniqueIndexes: map[string]pgConstraintFact{
+			"kd_g": key("i", 4), "kd_expr": key("i", 0), "kd_keep": key("i", 1), "kd_old": key("i", 2),
+		},
+	}
+	cur := &pgRelationFacts{
+		columns:     cols(1, 2, 3), // attnum 4 dropped (b, or a generated g)
+		constraints: map[string]pgConstraintFact{"kd_pkey": key("p", 3)},
+		uniqueIndexes: map[string]pgConstraintFact{
+			"kd_keep": key("i", 1), "kd_new": key("i", 2), // kd_old renamed to kd_new
+		},
+	}
+	if got := strings.Join(uniqueKeysLostWithColumn(prior, cur), ","); got != "kd_u,kd_g" {
+		t.Fatalf("handed on %q, want kd_u,kd_g", got)
+	}
+	if deltas := diffRelationFacts(prior, cur); len(deltas) != 1 || !strings.Contains(deltas[0], "kd_expr") {
+		t.Fatalf("door deltas %v: want only kd_expr (an expression index is not lost with a column)", deltas)
+	}
+	// A primary key lost with its column is handed on too.
+	cur.columns = cols(1, 2)
+	cur.constraints = map[string]pgConstraintFact{}
+	if got := strings.Join(uniqueKeysLostWithColumn(prior, cur), ","); got != "kd_pkey,kd_u,kd_g" {
+		t.Fatalf("handed on %q, want kd_pkey,kd_u,kd_g", got)
+	}
+	if uniqueKeysLostWithColumn(nil, cur) != nil {
+		t.Fatal("no prior: nothing to hand on")
 	}
 }

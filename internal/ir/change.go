@@ -504,6 +504,17 @@ type SchemaSnapshot struct {
 	// transaction (RENAME-SWAP-FORWARD; column_order_record.go). Never set
 	// by a reader, and not part of the schema-history row or a backup.
 	TargetColumns []string
+
+	// UniqueKeysMoved, set by a reader, reports that the source table lost a
+	// unique key together with a column it covered, at this boundary — a
+	// change the IR itself may not show (a dropped GENERATED column is not in
+	// a Postgres change stream's column list at all). The pipeline's
+	// unique-key door compares the table's source and target keys at such a
+	// boundary whether or not its column list moved (round-3 review of
+	// UNIQUE-KEY-STOPPED-WINDOW-DOOR). A reader may emit a snapshot whose IR
+	// is unchanged only to carry it. Not part of the schema-history row or a
+	// backup.
+	UniqueKeysMoved bool
 }
 
 func (SchemaSnapshot) isChange()       {}
