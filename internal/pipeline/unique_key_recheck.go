@@ -600,13 +600,17 @@ func (s *Streamer) uniqueKeyChecksFor() uniqueKeyChecks {
 	multi := len(door.scopes) > 1 || (len(door.scopes) == 1 && door.scopes[0].namespace != "")
 	cfg.seedCols, cfg.seedTypes = door.openCols, door.openTypes
 	accepted := parseAcceptedUniqueKeys(s.AcceptTargetOnlyUniqueKeys)
+	// The open door's namespace rule (round-7 review MEDIUM-2): an
+	// acceptance names the scope's source namespace or its target one, the
+	// namespace the refusal prints (--target-schema); this compared the
+	// source's alone, so a pasted `tgt.kd.uk=…` never armed type-only
+	// judging. A namespace no scope names is judged (fail closed).
 	cfg.acceptedTable = func(schema, table string) bool {
-		for _, e := range accepted {
-			if strings.EqualFold(e.table, table) && (e.namespace == "" || strings.EqualFold(e.namespace, schema)) {
-				return true
-			}
+		i, ok := door.scopeFor(schema)
+		if !ok {
+			return true
 		}
-		return false
+		return accepted.hasTable(table, door.scopes[i].namespace, door.scopes[i].targetNamespace)
 	}
 	cfg.colsKey = func(schema, table string) string {
 		if !multi {

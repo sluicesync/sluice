@@ -68,58 +68,78 @@ func TestUniqueKeyDoor_AcceptanceFingerprint(t *testing.T) {
 	}
 }
 
-// TestKeyFingerprint pins the fingerprint as a codec (round-6 review): it
-// is stable across a process restart (a fixed value), across the
-// re-renders a reader is known to make — the Postgres writer's table prefix
-// on the key name, identifier case, whitespace and quoting, a predicate
-// with or without its WHERE — and on both target engines' types; and every
-// component of the shape changes it.
-func TestKeyFingerprint(t *testing.T) {
-	col := func(name string, typ ir.Type) *ir.Column { return &ir.Column{Name: name, Type: typ} }
-	table := func(cols ...*ir.Column) *ir.Table { return &ir.Table{Name: "kd", Columns: cols} }
-	myBin := table(col("k", ir.Varchar{Length: 20, Collation: "utf8mb4_bin"}), col("x", ir.Integer{Width: 32}))
-	key := func(name string, parts ...ir.IndexColumn) *ir.Index {
-		return &ir.Index{Name: name, Unique: true, Columns: parts}
+// TestDefinitionFingerprint pins the fingerprint as a codec over the
+// engine's definition (round-7 review MEDIUM-1): a fixed value, so a
+// restart or a new release computes the same one (a change here invalidates
+// every operator's flag), and NO normalisation — the round-6 shape folded
+// case and whitespace inside a predicate's literals, so `status='Active'`
+// and `'active '` were one key. Identical definitions hash the same, and a
+// change of one byte anywhere, a literal's case or inner space included,
+// changes it. That each engine's definition carries every dimension (an
+// array element's collation, an expression's, a literal, an operator class)
+// is pinned on the real servers: TestUniqueKeyDefinition_* in the postgres
+// and mysql packages.
+func TestDefinitionFingerprint(t *testing.T) {
+	def := "index\x1fCREATE UNIQUE INDEX uk ON public.kd USING btree (k)\x1ftrue"
+	// sha256 of def, computed independently (printf … | sha256sum).
+	if got := definitionFingerprint(def); got != "dad423a5e223" || len(got) != acceptedFingerprintLen {
+		t.Fatalf("definitionFingerprint = %q, want the golden dad423a5e223", got)
 	}
-	k := ir.IndexColumn{Column: "k"}
-	base := keyFingerprint(key("uk", k), myBin)
-	if base != keyFingerprint(key("uk", k), myBin) || len(base) != acceptedFingerprintLen {
-		t.Fatalf("not deterministic: %q", base)
+	if definitionFingerprint(def) != definitionFingerprint(strings.Clone(def)) {
+		t.Fatal("identical definitions hashed differently")
 	}
-	// A fixed value, so a restart (or a new release) computes the same one: a
-	// change here invalidates every operator's flag. It is sha256 over
-	// "(k Varchar(20) collate utf8mb4_bin)", independently computed.
-	if base != "5a5934ed052c" {
-		t.Errorf("the fingerprint of UNIQUE (k varchar(20) utf8mb4_bin) is %q, want the golden 5a5934ed052c", base)
-	}
-	if base != keyFingerprint(key("kd_uk", ir.IndexColumn{Column: "K"}), table(col("K", ir.Varchar{Length: 20, Collation: "UTF8MB4_BIN"}), col("x", ir.Integer{Width: 32}))) {
-		t.Error("the name prefix or identifier case changed the fingerprint")
-	}
-	pred := func(p string) *ir.Index { i := key("uk", k); i.Predicate = p; return i }
-	if keyFingerprint(pred("x > 0"), myBin) != keyFingerprint(pred(` WHERE "x" >  0`), myBin) {
-		t.Error("a predicate's WHERE, quoting or spacing changed the fingerprint")
-	}
-	pgText := table(col("k", ir.Text{Size: ir.TextLong, Determinism: ir.CollationDeterministic}))
-	if keyFingerprint(key("uk", k), pgText) == "" || keyFingerprint(key("uk", k), pgText) == base {
-		t.Error("a Postgres text key hashed like a MySQL varchar(20) one")
-	}
-	nnd := key("uk", k)
-	nnd.ConstraintNullsNotDistinct = true
-	for name, fp := range map[string]string{
-		"another column":       keyFingerprint(key("uk", ir.IndexColumn{Column: "x"}), myBin),
-		"one more part":        keyFingerprint(key("uk", k, ir.IndexColumn{Column: "x"}), myBin),
-		"a prefix length":      keyFingerprint(key("uk", ir.IndexColumn{Column: "k", Length: 5}), myBin),
-		"an index collation":   keyFingerprint(key("uk", ir.IndexColumn{Column: "k", Collation: "utf8mb4_0900_ai_ci"}), myBin),
-		"the column collation": keyFingerprint(key("uk", k), table(col("k", ir.Varchar{Length: 20, Collation: "utf8mb4_0900_ai_ci"}))),
-		"the column size":      keyFingerprint(key("uk", k), table(col("k", ir.Varchar{Length: 30, Collation: "utf8mb4_bin"}))),
-		"the column type":      keyFingerprint(key("uk", k), table(col("k", ir.Char{Length: 20, Collation: "utf8mb4_bin"}))),
-		"nulls not distinct":   keyFingerprint(nnd, myBin),
-		"a predicate":          keyFingerprint(pred("x > 0"), myBin),
-		"an expression part":   keyFingerprint(key("uk", ir.IndexColumn{Expression: "lower(k)"}), myBin),
+	pred := "index\x1fCREATE UNIQUE INDEX uk ON public.kd USING btree (k) WHERE (status = 'Active'::text)\x1ftrue"
+	for name, other := range map[string]string{
+		"a literal's case":         strings.Replace(pred, "'Active'", "'active'", 1),
+		"a literal's inner space":  strings.Replace(pred, "'Active'", "'Active '", 1),
+		"identifier case":          strings.Replace(pred, "uk ON", "UK ON", 1),
+		"an operator class":        strings.Replace(pred, "(k)", "(k text_pattern_ops)", 1),
+		"an expression collation":  strings.Replace(pred, "(k)", `((lower(k)) COLLATE "C")`, 1),
+		"a dependent column's row": pred + "\ncolumn\x1f2\x1fk\x1ftext[]\x1f\x1fpublic.nd\x1ffalse\x1ffalse\x1f\x1f",
 	} {
-		if fp == base {
+		if definitionFingerprint(other) == definitionFingerprint(pred) {
 			t.Errorf("%s did not change the fingerprint", name)
 		}
+	}
+	// The refusal shows the first line, separators readable, truncated.
+	if got := definitionDisplay(def + "\ncolumn\x1f1"); got != "index | CREATE UNIQUE INDEX uk ON public.kd USING btree (k) | true" {
+		t.Errorf("definitionDisplay = %q", got)
+	}
+	if got := definitionDisplay(strings.Repeat("x", definitionDisplayMax+5)); len([]rune(got)) != definitionDisplayMax+1 {
+		t.Errorf("a long definition was not truncated: %d runes", len([]rune(got)))
+	}
+}
+
+// TestUniqueKeyDoor_DefinitionReadFailsClosed pins the fail-closed branch
+// (round-7 review MEDIUM-1): an accepted key whose definition cannot be read
+// is never passed on a fallback. A read error fails the check, at open and
+// at a boundary; a target engine with no definition surface refuses the key
+// as one that cannot be accepted.
+func TestUniqueKeyDoor_DefinitionReadFailsClosed(t *testing.T) {
+	pk := ukDoorKey("PRIMARY", "id")
+	keyed := ukDoorTable("kd", pk, ukDoorKey("uk", "k"))
+	s, _, target := ukDoorStreamer(t, ir.CDCLogicalReplication, []*ir.Table{ukDoorTable("kd", pk)}, []*ir.Table{keyed})
+	s.AcceptTargetOnlyUniqueKeys = []string{"kd.uk=" + keyFingerprint(keyed.Indexes[0], keyed)}
+	ctx := context.Background()
+	if err := s.phaseRefuseTargetOnlyUniqueKeys(ctx, nil, "s1", true); err != nil {
+		t.Fatalf("open with the key accepted: %v", err)
+	}
+	boundary := s.uniqueKeyChecksFor().boundary
+
+	target.defErr = errors.New("catalog read failed")
+	if err := s.phaseRefuseTargetOnlyUniqueKeys(ctx, nil, "s1", true); err == nil || !strings.Contains(err.Error(), "catalog read failed") {
+		t.Fatalf("open with the definition unreadable: %v, want the read error", err)
+	}
+	if refusal, err := boundary(ctx, ir.SchemaSnapshot{Table: "kd", IR: ukDoorTable("kd", pk)}); err == nil || refusal != nil {
+		t.Fatalf("boundary with the definition unreadable: refusal %v, err %v, want the read error", refusal, err)
+	}
+
+	target.defErr, target.noDefinitions = nil, true
+	err := s.phaseRefuseTargetOnlyUniqueKeys(ctx, nil, "s1", true)
+	var refusal *ir.SourceUniqueKeyAbsentError
+	if !errors.As(err, &refusal) || refusal.Keys[0].DefinitionUnreadable == "" || refusal.Keys[0].Fingerprint != "" ||
+		!strings.Contains(err.Error(), "cannot be accepted") {
+		t.Fatalf("a target with no definition surface: %v, want the key refused as unacceptable", err)
 	}
 }
 
@@ -182,10 +202,12 @@ func TestAddTableUniqueKeyDoor_CollationAsRead(t *testing.T) {
 		}
 	}
 	overridden, asRead, target := table("ci"), table("bin"), map[string]*ir.Table{"kd": table("ci")}
-	if err := refuseAddTableTargetOnlyUniqueKeysAsRead(overridden, nil, target, eng, eng, nil); err != nil {
+	if err := refuseAddTableTargetOnlyUniqueKeys(overridden, target, eng, eng, nil); err != nil {
 		t.Fatalf("the overridden table alone (the old behaviour) refused: %v", err)
 	}
-	err := refuseAddTableTargetOnlyUniqueKeysAsRead(overridden, asRead, target, eng, eng, nil)
+	err := refuseAddTableTargetOnlyUniqueKeysAsRead(context.Background(), addTableKeyDoor{
+		source: overridden, asRead: asRead, target: target, sourceEngine: eng, targetEngine: eng, define: ukDoorDefiner(target),
+	})
 	if err == nil || !strings.Contains(err.Error(), "the target's k compares case-") {
 		t.Fatalf("the source as read is case-sensitive, the target key folds: err %v", err)
 	}
@@ -408,5 +430,50 @@ func TestUniqueKeyBoundaryGate_FoldedSeedIsReadOnly(t *testing.T) {
 	// "USERS" folds onto two seeded tables: no baseline, not judged.
 	if !g.hook()(ctx, r5Snap("USERS", types, "id", "k", "n")) || len(*judged) != 1 {
 		t.Fatalf("an ambiguous folded spelling found a baseline: %v", *judged)
+	}
+}
+
+// TestUniqueKeyDoor_TargetQualifiedAcceptance pins round-7 MEDIUM-2 and its
+// add-table LOW: the refusal of a `--target-schema tgt` stream prints
+// `tgt.kd.uk=…`, and every check honours that value as pasted — the open
+// door, the boundary gate's type-only arming (which compared the source
+// namespace alone, so a forwarded `ALTER COLUMN k TYPE char(n)` under the
+// accepted key went unjudged), and add-table (which matched the empty
+// namespace only, refusing the value sync start had printed). A namespace
+// that is neither the source's nor the target's matches nothing.
+func TestUniqueKeyDoor_TargetQualifiedAcceptance(t *testing.T) {
+	pk := ukDoorKey("PRIMARY", "id")
+	keyed := ukDoorTable("kd", pk, ukDoorKey("uk", "k"))
+	src := ukDoorTable("kd", pk)
+	s, _, _ := ukDoorStreamer(t, ir.CDCLogicalReplication, []*ir.Table{src}, []*ir.Table{keyed})
+	s.TargetSchema = "tgt"
+	ctx := context.Background()
+	err := s.phaseRefuseTargetOnlyUniqueKeys(ctx, nil, "s1", true)
+	var refusal *ir.SourceUniqueKeyAbsentError
+	if !errors.As(err, &refusal) {
+		t.Fatalf("an unaccepted key: %v", err)
+	}
+	value := "tgt.kd.uk=" + keyFingerprint(keyed.Indexes[0], keyed)
+	if !strings.Contains(err.Error(), "--accept-target-only-unique-key "+value) {
+		t.Fatalf("the refusal does not print %s: %v", value, err)
+	}
+	s.AcceptTargetOnlyUniqueKeys = []string{value}
+	if err := s.phaseRefuseTargetOnlyUniqueKeys(ctx, nil, "s1", true); err != nil {
+		t.Fatalf("the pasted target-qualified value refused at open: %v", err)
+	}
+	if !s.uniqueKeyChecksFor().acceptedTable("", "kd") {
+		t.Error("the boundary gate does not see the target-qualified acceptance: type-only boundaries go unjudged")
+	}
+	target := map[string]*ir.Table{"kd": keyed}
+	if err := refuseAddTableTargetOnlyUniqueKeys(src, target, nil, nil, []string{value}, "", "tgt"); err != nil {
+		t.Errorf("add-table refused the value sync start printed: %v", err)
+	}
+	other := "other.kd.uk=" + keyFingerprint(keyed.Indexes[0], keyed)
+	if err := refuseAddTableTargetOnlyUniqueKeys(src, target, nil, nil, []string{other}, "", "tgt"); err == nil {
+		t.Error("add-table accepted a value naming another namespace")
+	}
+	s.AcceptTargetOnlyUniqueKeys = []string{other}
+	if s.uniqueKeyChecksFor().acceptedTable("", "kd") {
+		t.Error("the boundary gate honoured a value naming another namespace")
 	}
 }

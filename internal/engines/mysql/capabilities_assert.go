@@ -72,7 +72,11 @@ var (
 	_ ir.RowFilterSetter      = (*SchemaReader)(nil)
 	_ ir.SampleVerifier       = (*SchemaReader)(nil)
 	_ ir.SequenceStateReader  = (*SchemaReader)(nil)
-	_ ir.Verifier             = (*SchemaReader)(nil)
+	// UniqueKeyDefinitionReader feeds the unique-key door's acceptance
+	// fingerprint (round-7 review MEDIUM-1); without it an accepted key on a
+	// MySQL-family target refuses at every check.
+	_ ir.UniqueKeyDefinitionReader = (*SchemaReader)(nil)
+	_ ir.Verifier                  = (*SchemaReader)(nil)
 
 	// SchemaWriter optional surfaces.
 	// CheckExprDialectTranslator exposes the PG->MySQL CHECK-expr rewrite the

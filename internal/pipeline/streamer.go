@@ -484,7 +484,9 @@ type Streamer struct {
 
 	// AcceptTargetOnlyUniqueKeys names target unique keys the operator
 	// accepts although no source key implies them
-	// (`--accept-target-only-unique-key <table>.<key>`, repeatable): keys the
+	// (`--accept-target-only-unique-key <table>.<key>=<fingerprint>`, repeatable,
+	// the fingerprint that of the key's definition as the target reports it,
+	// printed by the refusal): keys the
 	// target was built with on purpose. Every other target unique key the
 	// source does not enforce refuses SOURCE-UNIQUE-KEY-ABSENT at stream
 	// open and at the mid-stream re-check (unique_key_door.go). Standing,

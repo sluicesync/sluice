@@ -80,7 +80,11 @@ func ukdAcceptValue(t *testing.T, db twfbDB, table, key string) []string {
 		keys := append([]*ir.Index{tbl.PrimaryKey}, tbl.Indexes...)
 		for _, idx := range keys {
 			if idx != nil && strings.EqualFold(idx.Name, key) {
-				return []string{table + "." + idx.Name + "=" + keyFingerprint(idx, tbl)}
+				def, err := sr.(ir.UniqueKeyDefinitionReader).UniqueKeyDefinition(ctx, tbl.Name, idx.Name)
+				if err != nil {
+					t.Fatalf("read the definition of %s.%s: %v", tbl.Name, idx.Name, err)
+				}
+				return []string{table + "." + idx.Name + "=" + definitionFingerprint(def)}
 			}
 		}
 	}

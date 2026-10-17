@@ -73,3 +73,24 @@ type CollationLooseningResolver interface {
 type UniqueKeyFactReader interface {
 	UniqueKeyFacts(ctx context.Context) (map[string]map[string]UniqueKeyFact, error)
 }
+
+// UniqueKeyDefinitionReader is the optional SchemaReader surface that
+// serves the server's own definition of one unique key of a table in the
+// reader's scope, together with the definition of every column the key
+// depends on (its parts, the columns an expression or a predicate reads),
+// as one opaque string. The stream's unique-key door hashes it into the
+// fingerprint an --accept-target-only-unique-key acceptance carries
+// (round-7 review MEDIUM-1): a fingerprint over a list of the dimensions
+// sluice knows matter missed one every review round (an array element's
+// collation, an expression's, a literal's case, an operator class), so it
+// is taken over everything the engine itself says instead, and any change
+// to the key or to a column it depends on changes it.
+//
+// The text is the engine's authoritative rendering with no normalisation
+// beyond a fixed order and separator: no case folding, no whitespace or
+// literal rewriting. It is compared only with another reading of the same
+// key, never parsed. A key the reader cannot find, or cannot fully
+// describe, is an error, never a partial definition.
+type UniqueKeyDefinitionReader interface {
+	UniqueKeyDefinition(ctx context.Context, table, key string) (string, error)
+}

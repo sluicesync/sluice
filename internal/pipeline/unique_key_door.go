@@ -90,7 +90,9 @@ package pipeline
 //
 // A key the operator built into the target beyond the source's is exactly
 // the merge risk, so it refuses too, and is accepted by name with
-// `--accept-target-only-unique-key <table>.<key>` (standing, repeatable).
+// `--accept-target-only-unique-key <table>.<key>=<fingerprint>` (standing,
+// repeatable; the fingerprint is of the key's definition, see
+// [definitionFingerprint]).
 // Keys sluice itself adds are covered without it: a key copied from the
 // source is implied by it; a promoted PK-substitute unique index is a source
 // index; the `--inject-shard-column` composite only adds a column to a key
@@ -116,6 +118,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -431,6 +434,7 @@ func (s *Streamer) compareUniqueKeys(ctx context.Context, scopes []uniqueKeyDoor
 		if err != nil {
 			return nil, nil, err
 		}
+		var uncovered []uncoveredKey
 		for _, st := range src {
 			if cols != nil {
 				cols[uniqueKeyColsKey(sc.namespace, st.Name)] = columnList(st)
@@ -451,27 +455,27 @@ func (s *Streamer) compareUniqueKeys(ctx context.Context, scopes []uniqueKeyDoor
 				if sc.targetNamespace != "" {
 					table = sc.targetNamespace + "." + table
 				}
-				entry, accepted := accept.match(tt.Name, key.Name, sc.namespace, sc.targetNamespace)
-				if !accepted {
-					absent = append(absent, absentUniqueKey(table, tt, key, weakened))
-					continue
-				}
-				if accept[entry].namespace == "" && len(scopes) > 1 {
-					if ambiguous[entry] == nil {
-						ambiguous[entry] = map[string]bool{}
+				u := uncoveredKey{display: table, table: tt, key: key, weakened: weakened}
+				if entry, ok := accept.match(tt.Name, key.Name, sc.namespace, sc.targetNamespace); ok {
+					if accept[entry].namespace == "" && len(scopes) > 1 {
+						if ambiguous[entry] == nil {
+							ambiguous[entry] = map[string]bool{}
+						}
+						ambiguous[entry][sc.targetNamespace] = true
 					}
-					ambiguous[entry][sc.targetNamespace] = true
+					u.accepted = &accept[entry]
 				}
-				// Honoured only while the key still has the shape the flag
-				// carries (round-6 review MEDIUM-A/B).
-				if accept[entry].fingerprint == keyFingerprint(key, tt) {
-					continue
-				}
-				k := absentUniqueKey(table, tt, key, weakened)
-				k.AcceptedFingerprint = accept[entry].fingerprint
-				absent = append(absent, k)
+				uncovered = append(uncovered, u)
 			}
 		}
+		// Honoured only while the key's definition, as the target reports it
+		// now, hashes to the fingerprint the flag carries (round-7 review
+		// MEDIUM-1).
+		found, err := judgeUncoveredKeys(ctx, s.Target, sc.targetDSN, sc.targetSchema, uncovered)
+		if err != nil {
+			return nil, nil, err
+		}
+		absent = append(absent, found...)
 	}
 	for entry, namespaces := range ambiguous {
 		if len(namespaces) > 1 {
@@ -691,11 +695,9 @@ func stampArrayElementDeterminism(t *ir.Table, tf map[string]ir.UniqueKeyFact) {
 	}
 }
 
-// cloneTableKeys copies t deeply enough for [foldUniqueKeyFacts] to change
-// its keys without touching t: add-table folds facts into the table it is
-// about to CREATE, whose keys must stay as read.
 // cloneTableColumns copies t with its own Column values, so a later in-place
-// rewrite of the original's columns (an override) does not reach the copy.
+// rewrite of the original's columns (an override, a facts fold's array
+// element stamp) does not reach the copy.
 func cloneTableColumns(t *ir.Table) *ir.Table {
 	if t == nil {
 		return nil
@@ -711,6 +713,9 @@ func cloneTableColumns(t *ir.Table) *ir.Table {
 	return &cp
 }
 
+// cloneTableKeys copies t deeply enough for [foldUniqueKeyFacts] to change
+// its keys without touching t: add-table folds facts into the table it is
+// about to CREATE, whose keys must stay as read.
 func cloneTableKeys(t *ir.Table) *ir.Table {
 	cp := *t
 	cloneIndex := func(idx *ir.Index) *ir.Index {
@@ -974,12 +979,10 @@ func hasSecondaryUniqueKey(t *ir.Table) bool {
 // key lands on a Postgres target as a constraint, SQLSTATE 2BP01).
 func absentUniqueKey(table string, t *ir.Table, key *ir.Index, weakened func(sourceColumn, targetColumn string) bool) ir.AbsentUniqueKey {
 	k := ir.AbsentUniqueKey{
-		Table:       table,
-		Key:         key.Name,
-		Columns:     renderKeyParts(key),
-		Constraint:  key.ConstraintBacked || (key == t.PrimaryKey && key.ConstraintNamed),
-		Shape:       keyShape(key, t),
-		Fingerprint: keyFingerprint(key, t),
+		Table:      table,
+		Key:        key.Name,
+		Columns:    renderKeyParts(key),
+		Constraint: key.ConstraintBacked || (key == t.PrimaryKey && key.ConstraintNamed),
 	}
 	if weakened != nil {
 		for _, c := range key.Columns {
@@ -1027,8 +1030,9 @@ func lowerSet(names []string) map[string]bool {
 // `<table>.<key>=<fingerprint>`, or `<namespace>.<table>.<key>=<fingerprint>`
 // on a multi-database stream. Names compare without case.
 //
-// The fingerprint ([keyFingerprint]) binds the acceptance to the key's
-// shape (round-6 review MEDIUM-A): it is in the flag value, so it survives a
+// The fingerprint ([definitionFingerprint]) binds the acceptance to the key's
+// definition as the target reports it (round-6 MEDIUM-A, round-7 MEDIUM-1):
+// it is in the flag value, so it survives a
 // restart unchanged. An acceptance bound only to a name re-bound itself on
 // every start to whatever shape the target held then: a forwarded DROP
 // COLUMN that narrowed the key, followed by a stop before the boundary was
@@ -1078,104 +1082,198 @@ func parseAcceptedUniqueKeys(entries []string) acceptedUniqueKeys {
 // `[<namespace>.]<table>.<key>=<fingerprint>`, including one with no
 // fingerprint or a malformed one: a typo would otherwise accept nothing and
 // look like a refusal that ignores the flag, and a value with no
-// fingerprint would accept whatever shape the key has.
+// fingerprint would accept whatever definition the key has.
 func validateAcceptedUniqueKeys(entries []string) error {
 	for _, e := range entries {
 		if _, ok := splitAcceptedUniqueKey(e); !ok {
 			return fmt.Errorf("pipeline: --accept-target-only-unique-key %q: want <table>.<key>=<fingerprint> (or "+
 				"<namespace>.<table>.<key>=<fingerprint> on a multi-database stream), the fingerprint being the %d hex "+
 				"digits the SOURCE-UNIQUE-KEY-ABSENT refusal prints for the key; it binds the acceptance to the key's "+
-				"shape", e, acceptedFingerprintLen)
+				"definition", e, acceptedFingerprintLen)
 		}
 	}
 	return nil
 }
 
-// keyShape renders a target unique key's shape for its fingerprint, and
-// for the refusal (round-6 review MEDIUM-B): each part's column, folded,
-// with its prefix length, its FULL type (size included) and its effective
-// collation — the index's own where it has one, else the column's, which
-// is where a MySQL key, and a Postgres key inheriting its column's
-// collation, hold it — or the expression, normalized; then NULLS NOT
-// DISTINCT and the predicate. The key's NAME is not in it, so the Postgres
-// writer's table prefix and a rename change nothing; identifier case and
-// whitespace are folded.
-func keyShape(key *ir.Index, table *ir.Table) string {
-	parts := make([]string, len(key.Columns))
-	for i, p := range key.Columns {
-		if p.Expression != "" {
-			parts[i] = "expr " + normalizeShapeText(p.Expression)
-			continue
-		}
-		s := strings.ToLower(p.Column)
-		if p.Length > 0 {
-			s += fmt.Sprintf("(%d)", p.Length)
-		}
-		coll := strings.ToLower(strings.TrimSpace(p.Collation))
-		if col := columnNamed(table, p.Column); col != nil {
-			s += " " + ir.UnwrapDomain(col.Type).String()
-			if coll == "" {
-				c, _ := characterCollation(col.Type)
-				coll = strings.ToLower(strings.TrimSpace(c))
+// keyDefiner returns the target engine's own definition of one unique key
+// of a target table and of every column it depends on
+// ([ir.UniqueKeyDefinitionReader]), which the acceptance fingerprint hashes.
+type keyDefiner func(ctx context.Context, table, key string) (string, error)
+
+// errKeyDefinitionUnsupported is a target engine with no
+// [ir.UniqueKeyDefinitionReader]: its keys cannot be fingerprinted, so none
+// can be accepted, and the refusal says so.
+var errKeyDefinitionUnsupported = errors.New("the target engine cannot report a unique key's definition")
+
+// openKeyDefiner returns a [keyDefiner] over the target, opening its schema
+// reader on first use (most checks fingerprint nothing), and the func that
+// closes it.
+func openKeyDefiner(target ir.Engine, dsn, targetSchema string) (define keyDefiner, closeReader func()) {
+	var tr ir.SchemaReader
+	var openErr error
+	opened := false
+	define = func(ctx context.Context, table, key string) (string, error) {
+		if !opened {
+			opened = true
+			tr, openErr = target.OpenSchemaReader(ctx, dsn)
+			if openErr == nil && targetSchema != "" {
+				migcore.ApplyTargetSchema(tr, targetSchema)
 			}
 		}
-		if coll != "" {
-			s += " collate " + coll
+		if openErr != nil {
+			return "", fmt.Errorf("open target schema reader: %w", openErr)
 		}
-		parts[i] = s
-	}
-	out := "(" + strings.Join(parts, ", ") + ")"
-	if key.ConstraintNullsNotDistinct {
-		out += " nulls not distinct"
-	}
-	if pred := strings.TrimSpace(key.Predicate); pred != "" {
-		if len(pred) > 5 && strings.EqualFold(pred[:6], "where ") {
-			pred = pred[6:]
+		dr, ok := tr.(ir.UniqueKeyDefinitionReader)
+		if !ok {
+			return "", errKeyDefinitionUnsupported
 		}
-		out += " where " + normalizeShapeText(pred)
+		return dr.UniqueKeyDefinition(ctx, table, key)
 	}
-	return out
+	return define, func() {
+		if tr != nil {
+			migcore.CloseIf(tr)
+		}
+	}
 }
 
-// normalizeShapeText folds an expression or predicate's case and drops its
-// whitespace and identifier quotes, so a re-render of one definition (a
-// catalog's spacing, quoting or case) is one shape.
-func normalizeShapeText(s string) string {
-	var b strings.Builder
-	for _, r := range strings.ToLower(s) {
-		switch r {
-		case ' ', '\t', '\n', '\r', '"', '`':
-			continue
-		}
-		b.WriteRune(r)
-	}
-	return b.String()
+// uncoveredKey is one target key no source key implies, with the acceptance
+// naming it, if any.
+type uncoveredKey struct {
+	// display is the table as the refusal names it (namespace-qualified).
+	display  string
+	table    *ir.Table
+	key      *ir.Index
+	weakened func(sourceColumn, targetColumn string) bool
+	accepted *acceptedUniqueKey
 }
 
-// keyFingerprint is the short, stable hash of [keyShape] an acceptance
-// carries.
-func keyFingerprint(key *ir.Index, table *ir.Table) string {
-	sum := sha256.Sum256([]byte(keyShape(key, table)))
+// judgeUncoveredKeys runs [judgeUncoveredKey] over one target's uncovered
+// keys, reading their definitions through one schema reader opened on the
+// target only when there is a key to define. Every door entry — stream open,
+// schema boundary, periodic re-check, add-table — judges through it.
+func judgeUncoveredKeys(ctx context.Context, target ir.Engine, dsn, targetSchema string, keys []uncoveredKey) ([]ir.AbsentUniqueKey, error) {
+	if len(keys) == 0 {
+		return nil, nil
+	}
+	define, closeDefiner := openKeyDefiner(target, dsn, targetSchema)
+	defer closeDefiner()
+	return judgeUncoveredKeysWith(ctx, define, keys)
+}
+
+// judgeUncoveredKeysWith is [judgeUncoveredKeys] over a given definer.
+func judgeUncoveredKeysWith(ctx context.Context, define keyDefiner, keys []uncoveredKey) ([]ir.AbsentUniqueKey, error) {
+	var absent []ir.AbsentUniqueKey
+	for _, u := range keys {
+		k, err := judgeUncoveredKey(ctx, define, u.display, u.table, u.key, u.weakened, u.accepted)
+		if err != nil {
+			return nil, err
+		}
+		if k != nil {
+			absent = append(absent, *k)
+		}
+	}
+	return absent, nil
+}
+
+// judgeUncoveredKey decides one target key no source key implies: nil when
+// an acceptance carries the fingerprint of the key's definition as the
+// target reports it now, else the key to refuse, carrying that fingerprint
+// (the value the refusal prints) and the acceptance's stale one, if any.
+// A target engine that cannot report a definition refuses the key with no
+// fingerprint (nothing could be accepted); any other read failure fails the
+// check — never a fallback to a shape sluice renders itself (round-7 review
+// MEDIUM-1: that list of dimensions missed one every round).
+func judgeUncoveredKey(ctx context.Context, define keyDefiner, display string, t *ir.Table, key *ir.Index,
+	weakened func(sourceColumn, targetColumn string) bool, accepted *acceptedUniqueKey,
+) (*ir.AbsentUniqueKey, error) {
+	k := absentUniqueKey(display, t, key, weakened)
+	if key.Name != "" {
+		def, err := define(ctx, t.Name, key.Name)
+		switch {
+		case errors.Is(err, errKeyDefinitionUnsupported):
+			k.DefinitionUnreadable = err.Error()
+		case err != nil:
+			return nil, fmt.Errorf("read the definition of target unique key %s.%s: %w", display, key.Name, err)
+		default:
+			k.Definition, k.Fingerprint = definitionDisplay(def), definitionFingerprint(def)
+		}
+	}
+	if accepted != nil {
+		if k.Fingerprint != "" && accepted.fingerprint == k.Fingerprint {
+			return nil, nil
+		}
+		k.AcceptedFingerprint = accepted.fingerprint
+	}
+	return &k, nil
+}
+
+// definitionFingerprint is the short, stable hash of a key's definition an
+// acceptance carries: the first [acceptedFingerprintLen] hex digits of its
+// sha256. The definition is hashed as the engine rendered it, so the
+// fingerprint changes with anything the engine reports about the key or a
+// column it depends on — a size-only widening, a collation, an operator
+// class, a literal's case, and a server upgrade that respells a type or
+// collation (MySQL 8.0.30's utf8 → utf8mb3) alike. Each such change refuses
+// until re-accepted: loud, which is the trade for a fingerprint that cannot
+// omit a dimension.
+func definitionFingerprint(def string) string {
+	sum := sha256.Sum256([]byte(def))
 	return hex.EncodeToString(sum[:])[:acceptedFingerprintLen]
 }
 
+// definitionDisplayMax caps the definition the refusal prints.
+const definitionDisplayMax = 240
+
+// definitionDisplay renders a key's definition for the refusal: its first
+// line (the key itself, e.g. `CREATE UNIQUE INDEX …` or the `UNIQUE KEY`
+// line), its field separators shown as " | ", truncated past
+// [definitionDisplayMax] characters. The fingerprint is over the whole
+// definition, the columns included.
+func definitionDisplay(def string) string {
+	first, _, _ := strings.Cut(def, "\n")
+	first = strings.ReplaceAll(first, "\x1f", " | ")
+	if r := []rune(first); len(r) > definitionDisplayMax {
+		first = string(r[:definitionDisplayMax]) + "…"
+	}
+	return first
+}
+
 // match returns the entry accepting table.key in any of namespaces (a
-// 3-part entry must name one of them; a 2-part entry matches any).
+// 3-part entry must name one of them; a 2-part entry matches any). Every
+// check passes the same namespaces: the scope's source namespace and its
+// target namespace, the one the refusal prints (round-7 review MEDIUM-2:
+// the boundary gate compared the source's alone, so a value pasted from a
+// `--target-schema` refusal was never judged at a schema change).
 func (a acceptedUniqueKeys) match(table, key string, namespaces ...string) (int, bool) {
 	for i, e := range a {
-		if !strings.EqualFold(e.table, table) || !strings.EqualFold(e.key, key) {
-			continue
-		}
-		if e.namespace == "" {
+		if strings.EqualFold(e.table, table) && strings.EqualFold(e.key, key) && e.inNamespace(namespaces) {
 			return i, true
-		}
-		for _, ns := range namespaces {
-			if strings.EqualFold(e.namespace, ns) {
-				return i, true
-			}
 		}
 	}
 	return 0, false
+}
+
+// hasTable reports an entry accepting any key of table in any of
+// namespaces, under [acceptedUniqueKeys.match]'s namespace rule.
+func (a acceptedUniqueKeys) hasTable(table string, namespaces ...string) bool {
+	for _, e := range a {
+		if strings.EqualFold(e.table, table) && e.inNamespace(namespaces) {
+			return true
+		}
+	}
+	return false
+}
+
+func (e acceptedUniqueKey) inNamespace(namespaces []string) bool {
+	if e.namespace == "" {
+		return true
+	}
+	for _, ns := range namespaces {
+		if ns != "" && strings.EqualFold(e.namespace, ns) {
+			return true
+		}
+	}
+	return false
 }
 
 func sortedNamespaces(m map[string]bool) []string {

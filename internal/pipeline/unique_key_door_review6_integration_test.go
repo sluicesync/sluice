@@ -168,8 +168,9 @@ func TestStreamer_UniqueKeyDoor_Review6AcceptedKeyCollationLoosened(t *testing.T
 		run := startTWFBRun(newStreamer())
 		ukdAwaitExitOrConverge(t, run, src, tgt, 120*time.Second)
 		refusal := ukdR3RequireNoMergeRefusal(t, run, src, tgt, ir.UniqueKeyDoorAtOpen)
-		if refusal.Keys[0].AcceptedFingerprint == "" || !strings.Contains(refusal.Keys[0].Shape, "collate ci") {
-			t.Fatalf("the refusal does not name the stale fingerprint and the inherited collation: %v", run.err)
+		if refusal.Keys[0].AcceptedFingerprint != strings.SplitN(accept[0], "=", 2)[1] ||
+			refusal.Keys[0].Fingerprint == refusal.Keys[0].AcceptedFingerprint {
+			t.Fatalf("the refusal does not name the stale fingerprint beside a new one: %v", run.err)
 		}
 		if g := ukdRows(t, tgt); strings.Contains(g, "4|") {
 			t.Fatalf("'A' was applied under the loosened key: %s", g)

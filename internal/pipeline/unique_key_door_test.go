@@ -6,6 +6,7 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -19,6 +20,10 @@ type ukDoorEngine struct {
 	*resumeDispatchEngine
 	schemas map[string]*ir.Schema
 	scoped  []string
+	// noDefinitions serves a reader with no [ir.UniqueKeyDefinitionReader];
+	// defErr makes its definition read fail.
+	noDefinitions bool
+	defErr        error
 }
 
 func (e *ukDoorEngine) OpenSchemaReader(_ context.Context, dsn string) (ir.SchemaReader, error) {
@@ -26,13 +31,76 @@ func (e *ukDoorEngine) OpenSchemaReader(_ context.Context, dsn string) (ir.Schem
 	if !ok {
 		return nil, errors.New("ukDoorEngine: no schema for " + dsn)
 	}
-	return &ukDoorReader{engine: e, schema: s}, nil
+	r := &ukDoorReader{engine: e, schema: s}
+	if e.noDefinitions {
+		return r, nil
+	}
+	return &ukDoorDefReader{r}, nil
 }
 
 type ukDoorReader struct {
 	engine *ukDoorEngine
 	schema *ir.Schema
 	scope  func(string) bool
+}
+
+// ukDoorDefReader adds the definition surface: the key and the columns it
+// reads, rendered with %#v — a stand-in for an engine's own text that
+// changes with every field of either.
+type ukDoorDefReader struct{ *ukDoorReader }
+
+func (r *ukDoorDefReader) UniqueKeyDefinition(_ context.Context, table, key string) (string, error) {
+	if r.engine.defErr != nil {
+		return "", r.engine.defErr
+	}
+	for _, t := range r.schema.Tables {
+		if !strings.EqualFold(t.Name, table) {
+			continue
+		}
+		for _, idx := range append([]*ir.Index{t.PrimaryKey}, t.Indexes...) {
+			if idx != nil && idx.Name == key {
+				return ukDoorDefinition(idx, t), nil
+			}
+		}
+	}
+	return "", errors.New("ukDoorDefReader: no key " + table + "." + key)
+}
+
+func ukDoorDefinition(key *ir.Index, t *ir.Table) string {
+	def := fmt.Sprintf("%#v", *key)
+	for _, c := range t.Columns {
+		for _, p := range key.Columns {
+			if p.Expression != "" || strings.EqualFold(p.Column, c.Name) {
+				def += fmt.Sprintf("\n%#v", *c)
+				break
+			}
+		}
+	}
+	return def
+}
+
+// ukDoorDefiner defines the keys of tables as [ukDoorDefReader] does.
+func ukDoorDefiner(tables map[string]*ir.Table) keyDefiner {
+	s := &ir.Schema{}
+	for _, t := range tables {
+		s.Tables = append(s.Tables, t)
+	}
+	r := &ukDoorDefReader{&ukDoorReader{engine: &ukDoorEngine{}, schema: s}}
+	return r.UniqueKeyDefinition
+}
+
+// refuseAddTableTargetOnlyUniqueKeys runs the add-table door on source as
+// read, its target keys defined by [ukDoorDefiner].
+func refuseAddTableTargetOnlyUniqueKeys(source *ir.Table, target map[string]*ir.Table, se, te ir.Engine, accept []string, namespaces ...string) error {
+	return refuseAddTableTargetOnlyUniqueKeysAsRead(context.Background(), addTableKeyDoor{
+		source: source, target: target, sourceEngine: se, targetEngine: te, accept: accept,
+		define: ukDoorDefiner(target), namespaces: namespaces,
+	})
+}
+
+// keyFingerprint is the fingerprint the test target reports for key on t.
+func keyFingerprint(key *ir.Index, t *ir.Table) string {
+	return definitionFingerprint(ukDoorDefinition(key, t))
 }
 
 func (r *ukDoorReader) SetTableScope(allow func(string) bool) { r.scope = allow }

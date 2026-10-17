@@ -255,7 +255,7 @@ type AddTable struct {
 
 	// AcceptTargetOnlyUniqueKeys is [Streamer.AcceptTargetOnlyUniqueKeys]
 	// for the table being added: unique keys a pre-created target table
-	// carries beyond the source's, accepted by name (`<table>.<key>`).
+	// carries beyond the source's, accepted with its fingerprint (`<table>.<key>=<fingerprint>`).
 	AcceptTargetOnlyUniqueKeys []string
 
 	// sourceKeyFacts is the source reader's [ir.UniqueKeyFact]s, read in
@@ -759,17 +759,36 @@ func (a *AddTable) preflightTargetForStream(ctx context.Context, scoped *ir.Sche
 // no [ir.UniqueKeyFact]s, so a pre-created Postgres target's NULLS NOT
 // DISTINCT, index-level COLLATE and partitioned keys were invisible to it,
 // and a failed read was a WARN and a skip (round-3 review MEDIUM). Both
-// sides now have their facts folded in — the source's into a copy of the
-// table this command will create, so its keys stay as read — and a read
-// that fails refuses the command: the next run reads again.
+// sides now have their facts folded in — the source's into copies of the
+// table this command will create and of the table as read (whose array key
+// columns' element collation only the facts classify: round-7 review
+// MEDIUM-3 judged collation direction on an unfolded copy, so a target
+// `text[] COLLATE <nondeterministic>` key passed), so its keys stay as read —
+// and a read that fails refuses the command: the next run reads again.
 func (a *AddTable) refuseTargetOnlyUniqueKeys(ctx context.Context, source *ir.Table, targetSchema string) error {
 	src := &ir.Schema{Tables: []*ir.Table{cloneTableKeys(cloneTableColumns(source))}}
 	foldUniqueKeyFacts(a.sourceKeyFacts, src)
+	asRead := a.sourceAsRead
+	if asRead == nil {
+		asRead = source
+	}
+	read := &ir.Schema{Tables: []*ir.Table{cloneTableKeys(cloneTableColumns(asRead))}}
+	foldUniqueKeyFacts(a.sourceKeyFacts, read)
 	target, err := a.readTargetKeys(ctx, source.Name, targetSchema)
 	if err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: add-table: unique-key door: %w", err))
 	}
-	return refuseAddTableTargetOnlyUniqueKeysAsRead(src.Tables[0], a.sourceAsRead, target, a.Source, a.Target, a.AcceptTargetOnlyUniqueKeys)
+	define, closeDefiner := openKeyDefiner(a.Target, a.TargetDSN, targetSchema)
+	defer closeDefiner()
+	err = refuseAddTableTargetOnlyUniqueKeysAsRead(ctx, addTableKeyDoor{
+		source: src.Tables[0], asRead: read.Tables[0], target: target, sourceEngine: a.Source, targetEngine: a.Target,
+		accept: a.AcceptTargetOnlyUniqueKeys, define: define, namespaces: []string{source.Schema, targetSchema},
+	})
+	var refusal *ir.SourceUniqueKeyAbsentError
+	if err != nil && !errors.As(err, &refusal) {
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: add-table: unique-key door: %w", err))
+	}
+	return err
 }
 
 // readTargetKeys reads the target's counterpart of table, with its
@@ -806,52 +825,60 @@ func (a *AddTable) readTargetKeys(ctx context.Context, table, targetSchema strin
 	return out, nil
 }
 
-// refuseAddTableTargetOnlyUniqueKeys is the add-table entry of the
+// addTableKeyDoor is one add-table run of the unique-key door's inputs.
+type addTableKeyDoor struct {
+	// source is the scoped table after the operator's overrides, which
+	// change column types and generated expressions, never keys; asRead is
+	// the table before --type-override, on which collation direction is
+	// judged (nil: source).
+	source, asRead *ir.Table
+	target         map[string]*ir.Table
+	sourceEngine   ir.Engine
+	targetEngine   ir.Engine
+	accept         []string
+	// define reads a target key's definition for the acceptance fingerprint.
+	define keyDefiner
+	// namespaces are those an acceptance may name: the source's and the
+	// target's (--target-schema), the one sync start's refusal prints.
+	namespaces []string
+}
+
+// refuseAddTableTargetOnlyUniqueKeysAsRead is the add-table entry of the
 // unique-key door (unique_key_door.go, UNIQUE-KEY-STOPPED-WINDOW-DOOR): a
 // PRE-CREATED target table joins the stream with whatever unique keys it
 // has, and one the source does not enforce is a merge waiting for its first
-// duplicate, so each must be implied by a source key or accepted by name. A
-// table sluice creates copies the source's keys, which imply themselves.
-// It reads the shape gate's catalog, so it degrades with that read (its
-// WARN). source is the scoped table after the operator's overrides, which
-// change column types and generated expressions, never keys.
-func refuseAddTableTargetOnlyUniqueKeys(source *ir.Table, targetTables map[string]*ir.Table, sourceEngine, targetEngine ir.Engine, accept []string) error {
-	return refuseAddTableTargetOnlyUniqueKeysAsRead(source, nil, targetTables, sourceEngine, targetEngine, accept)
-}
-
-// refuseAddTableTargetOnlyUniqueKeysAsRead is [refuseAddTableTargetOnlyUniqueKeys]
-// with the collation direction judged on asRead, the source table before
-// --type-override (nil: source itself).
-func refuseAddTableTargetOnlyUniqueKeysAsRead(source, asRead *ir.Table, targetTables map[string]*ir.Table, sourceEngine, targetEngine ir.Engine, accept []string) error {
+// duplicate, so each must be implied by a source key or accepted with the
+// fingerprint of its definition. A table sluice creates copies the source's
+// keys, which imply themselves. It judges through [judgeUncoveredKeysWith],
+// the stream door's own judge, with the same namespace rule.
+func refuseAddTableTargetOnlyUniqueKeysAsRead(ctx context.Context, d addTableKeyDoor) error {
+	asRead := d.asRead
 	if asRead == nil {
-		asRead = source
+		asRead = d.source
 	}
-	tables := make([]*ir.Table, 0, len(targetTables))
-	for _, t := range targetTables {
+	tables := make([]*ir.Table, 0, len(d.target))
+	for _, t := range d.target {
 		if t != nil {
 			tables = append(tables, t)
 		}
 	}
-	target := matchTargetTable(tables, source.Name)
+	target := matchTargetTable(tables, d.source.Name)
 	if target == nil {
 		return nil
 	}
-	accepted := parseAcceptedUniqueKeys(accept)
-	var absent []ir.AbsentUniqueKey
-	weakened := keyColumnWeakening(sourceEngine, targetEngine, asRead, target)
-	for _, key := range uncoveredTargetKeys(source, target, engineNameOrEmpty(targetEngine), weakened) {
-		entry, ok := accepted.match(target.Name, key.Name, "")
-		if ok && accepted[entry].fingerprint == keyFingerprint(key, target) {
-			continue
+	accepted := parseAcceptedUniqueKeys(d.accept)
+	weakened := keyColumnWeakening(d.sourceEngine, d.targetEngine, asRead, target)
+	var uncovered []uncoveredKey
+	for _, key := range uncoveredTargetKeys(d.source, target, engineNameOrEmpty(d.targetEngine), weakened) {
+		u := uncoveredKey{display: target.Name, table: target, key: key, weakened: weakened}
+		if entry, ok := accepted.match(target.Name, key.Name, d.namespaces...); ok {
+			u.accepted = &accepted[entry]
 		}
-		k := absentUniqueKey(target.Name, target, key, weakened)
-		if ok {
-			k.AcceptedFingerprint = accepted[entry].fingerprint
-		}
-		absent = append(absent, k)
+		uncovered = append(uncovered, u)
 	}
-	if len(absent) == 0 {
-		return nil
+	absent, err := judgeUncoveredKeysWith(ctx, d.define, uncovered)
+	if err != nil || len(absent) == 0 {
+		return err
 	}
 	return &ir.SourceUniqueKeyAbsentError{Keys: absent, When: ir.UniqueKeyDoorAddTable}
 }

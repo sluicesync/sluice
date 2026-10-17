@@ -78,16 +78,22 @@ type AbsentUniqueKey struct {
 	// stricter equality. The refusal names them, and an ALTER of each to a
 	// collation as strict as the source's is one more way to clear it.
 	LooserColumns []string
-	// Shape and Fingerprint are the key's shape as it is now (its parts'
-	// columns, full types and effective collations, NULLS NOT DISTINCT, its
-	// predicate) and the short hash of it that an
+	// Definition and Fingerprint are the key's definition as the target
+	// engine reports it now (its first line, truncated, for the message) and
+	// the short hash of the whole definition — the key and every column it
+	// depends on ([UniqueKeyDefinitionReader]) — that an
 	// --accept-target-only-unique-key acceptance must carry. The refusal
 	// prints the exact flag value to pass.
-	Shape       string
+	Definition  string
 	Fingerprint string
+	// DefinitionUnreadable says why the key has no fingerprint (a target
+	// engine that cannot report a key's definition): such a key cannot be
+	// accepted.
+	DefinitionUnreadable string
 	// AcceptedFingerprint is the fingerprint an acceptance of this key
-	// carries when the key's shape no longer hashes to it (a forwarded DROP
-	// COLUMN narrowed it, a collation change loosened it).
+	// carries when the key's definition no longer hashes to it (a forwarded
+	// DROP COLUMN narrowed it, a collation change loosened it, a column it
+	// depends on changed at all).
 	AcceptedFingerprint string
 }
 
@@ -121,13 +127,16 @@ func (e *SourceUniqueKeyAbsentError) Error() string {
 			keys[i] += " [a constraint: ALTER TABLE " + k.Table + " DROP CONSTRAINT " + name + "]"
 		}
 		if k.AcceptedFingerprint != "" {
-			keys[i] += " [accepted with fingerprint " + k.AcceptedFingerprint + ", which is not this key's shape now: " +
-				"it has changed since it was accepted, and a narrower or looser key merges rows the accepted one kept " +
-				"apart]"
+			keys[i] += " [accepted with fingerprint " + k.AcceptedFingerprint + ", which is not this key's definition " +
+				"now: the key or a column it depends on has changed since it was accepted, and a narrower or looser key " +
+				"merges rows the accepted one kept apart]"
 		}
 		if k.Fingerprint != "" && name != "(unnamed)" {
-			keys[i] += " [shape " + k.Shape + "; to accept it as it is now: --accept-target-only-unique-key " +
+			keys[i] += " [definition " + k.Definition + "; to accept it as it is now: --accept-target-only-unique-key " +
 				k.Table + "." + name + "=" + k.Fingerprint + "]"
+		}
+		if k.DefinitionUnreadable != "" {
+			keys[i] += " [cannot be accepted: " + k.DefinitionUnreadable + "]"
 		}
 		if len(k.LooserColumns) > 0 {
 			keys[i] += " [the target's " + strings.Join(k.LooserColumns, ", ") + " compares case-, accent- or " +
@@ -148,7 +157,7 @@ func (e *SourceUniqueKeyAbsentError) Error() string {
 // sourceUniqueKeyAcceptClause is the acknowledgement half of every remedy.
 const sourceUniqueKeyAcceptClause = "If a key is one the target should enforce beyond the source (one the target " +
 	"was built with on purpose), accept it with the `--accept-target-only-unique-key <table>.<key>=<fingerprint>` value printed beside the key " +
-	"(repeatable), on every start — the fingerprint binds the acceptance to the key's shape, so a key that later changes shape refuses again; the apply-time guard (UNIQUE-KEY-CONFLICT-OTHER-ROW) still refuses a merge through it wherever " +
+	"(repeatable), on every start — the fingerprint is of the key's definition as the target reports it, the columns it depends on included, so any later change to the key or to one of those columns (a size-only widening and a server upgrade that respells a type included) refuses again until re-accepted; the apply-time guard (UNIQUE-KEY-CONFLICT-OTHER-ROW) still refuses a merge through it wherever " +
 	"it can tell the rows apart."
 
 // sourceUniqueKeyDropClause is the drop-the-key remedy.
