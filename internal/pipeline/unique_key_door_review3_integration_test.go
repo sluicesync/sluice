@@ -209,7 +209,9 @@ func TestStreamer_UniqueKeyDoor_Review3AddTableFacts(t *testing.T) {
 //     stream has not reached yet;
 //   - "key dropped, duplicate, then column dropped" (the round-4 reviewer's
 //     probe): the source drops the key ON ITS OWN and writes a duplicate of
-//     row 1, then drops the column. On a table with no primary key the
+//     row 1, then drops the column. On a table with no primary key and a
+//     NOT NULL key column (so a Postgres target takes it as its ON CONFLICT
+//     key, rather than inserting plainly and raising 23505) the
 //     target's key is the upsert's conflict key on both engines.
 //
 // The two are indistinguishable to the reader and the gate. The round-3
@@ -237,7 +239,7 @@ func TestStreamer_UniqueKeyDoor_Review3CatalogAheadOfPosition(t *testing.T) {
 		},
 		{
 			"key dropped, duplicate, then column dropped", "b",
-			"CREATE TABLE kd (id int NOT NULL, k varchar(20) NOT NULL, v varchar(20), doomed varchar(20)); " +
+			"CREATE TABLE kd (id int NOT NULL, k varchar(20) NOT NULL, v varchar(20), doomed varchar(20) NOT NULL); " +
 				"CREATE UNIQUE INDEX kd_doomed ON kd (doomed); " +
 				"ALTER TABLE kd REPLICA IDENTITY FULL; INSERT INTO kd VALUES (1,'a','one','x'),(2,'b','two','y')",
 			"DROP INDEX kd_doomed; INSERT INTO kd (id,k,v,doomed) VALUES (3,'c','three','x')",
