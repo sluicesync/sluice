@@ -65,10 +65,10 @@ func ukdR7StoppedChange(t *testing.T, cell twfbCell, key string, change func(), 
 		return s
 	}
 	ukdColdStartStop(t, cell, newStreamer) // accepted: runs
+	// No premise check through ukdAcceptValue here: it reads the definition
+	// through the reader under test, so a blind reader would trip it instead
+	// of the door (the round-7 mutation run found exactly that).
 	change()
-	if now := ukdAcceptValue(t, tgt, "kd", key); len(now) != 1 || now[0] == accept[0] {
-		t.Fatalf("the premise moved: the change did not alter the key's definition (%v vs %v)", now, accept)
-	}
 	src.exec(t, dup)
 	run := startTWFBRun(newStreamer())
 	ukdAwaitExitOrConverge(t, run, src, tgt, 120*time.Second)
