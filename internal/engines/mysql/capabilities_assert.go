@@ -33,6 +33,7 @@ var (
 	_ ir.TemporalLiteralResolver               = mysqlCollationResolver{}
 	_ ir.NetworkLiteralResolver                = mysqlCollationResolver{}
 	_ ir.CollationResolverProvider             = Engine{}
+	_ ir.CollationLooseningResolver            = Engine{} // the unique-key door's collation direction (MEDIUM-2)
 	_ irbackup.SnapshotOpener                  = Engine{}
 	_ ir.CDCSchemaSnapshotNormalizer           = Engine{}
 	_ ir.DatabaseDSNDeriver                    = Engine{}

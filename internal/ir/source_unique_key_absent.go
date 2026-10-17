@@ -44,10 +44,14 @@ const (
 	// UniqueKeyDoorAddTable is `sluice schema add-table`, before the table
 	// is copied or handed to the stream.
 	UniqueKeyDoorAddTable
-	// UniqueKeyDoorAtSchemaChange is the check after a schema change the
-	// stream forwarded to the target (a forwarded DROP COLUMN can leave a
-	// MySQL target holding a narrower key than the source); nothing after
-	// the boundary has been applied.
+	// UniqueKeyDoorAtSchemaChange is the check at a source schema boundary
+	// whose column list differs from the table's previous one — the open
+	// door's read for the table's first boundary of the run (round-2 review
+	// HIGH-1) — run after the schema-forward intercepts, whether or not they
+	// forwarded the change (a forwarded DROP COLUMN can leave a MySQL target
+	// a narrower key; one at the first boundary after a cold start is not
+	// forwarded, ADR-0091 §3, leaving the target's column and its key).
+	// Nothing after the boundary has been applied.
 	UniqueKeyDoorAtSchemaChange
 )
 
@@ -64,6 +68,12 @@ type AbsentUniqueKey struct {
 	// or PRIMARY KEY constraint), which `DROP INDEX` cannot drop: the
 	// refusal marks it so the remedy names `ALTER TABLE … DROP CONSTRAINT`.
 	Constraint bool
+	// LooserColumns names the key's columns whose target collation equates
+	// values the source column's keeps apart (case, accents or trailing
+	// spaces): the source may enforce a key on the same columns, under a
+	// stricter equality. The refusal names them, and an ALTER of each to a
+	// collation as strict as the source's is one more way to clear it.
+	LooserColumns []string
 }
 
 // SourceUniqueKeyAbsentError is the refusal. Engine-neutral: the pipeline
@@ -95,12 +105,18 @@ func (e *SourceUniqueKeyAbsentError) Error() string {
 		if k.Constraint {
 			keys[i] += " [a constraint: ALTER TABLE " + k.Table + " DROP CONSTRAINT " + name + "]"
 		}
+		if len(k.LooserColumns) > 0 {
+			keys[i] += " [the target's " + strings.Join(k.LooserColumns, ", ") + " compares case-, accent- or " +
+				"trailing-space-insensitively where the source's does not: ALTERing the target column(s) to a collation " +
+				"as strict as the source's also clears it]"
+		}
 	}
 	return fmt.Sprintf("%s: the target has %d unique key(s) the source does not enforce: %s. Every insert reaches "+
 		"the target as an upsert, which resolves a conflict through a unique key (on a MySQL-family target any the "+
 		"table has; on Postgres its ON CONFLICT key), so the source's next row duplicating one of these keys can "+
 		"overwrite a different row at exit 0. The usual cause is a source DROP INDEX (or DROP CONSTRAINT) no stream "+
-		"saw — made while none was running, or on a source whose change stream carries no DDL — or a target created "+
+		"saw — made while none was running, or on a source whose change stream carries no DDL — a key column whose "+
+		"target collation compares more loosely than the source's, or a target created "+
 		"with a key the source never had. %s",
 		ErrSourceUniqueKeyAbsent, len(e.Keys), strings.Join(keys, ", "), e.remedy())
 }
@@ -156,10 +172,11 @@ func (e *SourceUniqueKeyAbsentError) remedy() string {
 		return "Refusing before the table is copied or handed to the stream. Drop each named key on the target table " +
 			"and run add-table again, or accept it by name with `--accept-target-only-unique-key <table>.<key>`."
 	case UniqueKeyDoorAtSchemaChange:
-		return "Found after a schema change the stream forwarded to the target (a forwarded DROP COLUMN narrows a " +
-			"MySQL-family key that included the column, while a Postgres source drops such an index outright); " +
-			"stopped before anything after the change was applied: " + sourceUniqueKeyDropClause + ". " +
-			sourceUniqueKeyAcceptClause
+		return "Found at a source schema change that moved the table's columns (a Postgres source drops an index " +
+			"outright with a column it covers, while a forwarded DROP COLUMN narrows a MySQL-family key that " +
+			"included it, and a DROP COLUMN at the first boundary after a cold start is not forwarded at all, " +
+			"leaving the target's column and its key); stopped before anything after the change was applied: " +
+			sourceUniqueKeyDropClause + ". " + sourceUniqueKeyAcceptClause
 	case UniqueKeyDoorMidStream:
 		interval := e.RecheckInterval
 		if interval == "" {
@@ -173,10 +190,12 @@ func (e *SourceUniqueKeyAbsentError) remedy() string {
 	}
 	if e.SourceSeesDDLLive {
 		return "Refusing at stream open, before any change of this run is applied. This source's change stream " +
-			"refuses a unique-key DROP it reads, so a dropped key was dropped while no stream was reading (or the target " +
-			"was created with the key) and nothing written after it has been applied: " + sourceUniqueKeyDropClause +
-			". If a sluice v0.161.0 or earlier was streaming from a Postgres source when its plain unique index was " +
-			"dropped (those releases did not see that DROP), rows may already have merged; " + e.recopy() + " " +
+			"refuses a unique-key DROP it reads, and this release checks the target's keys after every schema change " +
+			"it forwards, so when this release was streaming across the change, a dropped key was dropped while no " +
+			"stream was reading (or the target was created with the key) and nothing written after it has been " +
+			"applied: " + sourceUniqueKeyDropClause + ". If an earlier sluice was streaming across it, rows may already " +
+			"have merged — v0.161.0 and earlier did not see a Postgres plain unique index's DROP, and no release through " +
+			"v0.161.1 checked the target's keys at a DROP COLUMN of a key column; then " + e.recopy() + " " +
 			sourceUniqueKeyAcceptClause
 	}
 	return "Refusing at stream open, before any change of this run is applied. This source's change stream carries " +

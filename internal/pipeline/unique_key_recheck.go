@@ -33,9 +33,14 @@ type uniqueKeyChecks struct {
 	period   time.Duration
 	periodic func(context.Context) (*ir.SourceUniqueKeyAbsentError, error)
 	watches  func(schema, table string) bool
-	// boundary checks one table after a schema change the stream forwarded
-	// (nil: none).
+	// boundary checks one table at a schema boundary, forwarded or not
+	// (nil: none). seedCols holds each table's column list as the
+	// stream-open door read it, keyed by colsKey; a snapshot is checked when
+	// its column list differs from the last one known for its table,
+	// starting from that seed.
 	boundary    func(ctx context.Context, schema, table string) (*ir.SourceUniqueKeyAbsentError, error)
+	seedCols    map[string]string
+	colsKey     func(schema, table string) string
 	maxFailures int
 }
 
@@ -55,14 +60,26 @@ func (c uniqueKeyChecks) armed() bool { return c.periodic != nil || c.boundary !
 //     stored and the channel closed before the transaction's first change is
 //     forwarded, so the stream stops between source transactions.
 //   - BOUNDARY (every source): a SchemaSnapshot whose column list differs
-//     from the last one seen for its table runs the door for that table
-//     before the snapshot is forwarded. The first snapshot of a table in a
-//     run is not checked — the stream-open door already compared it.
+//     from the last one known for its table runs the door for that table
+//     before the snapshot is forwarded. "Known" starts from the stream-open
+//     door's own read of the table, so the table's FIRST snapshot of the
+//     run is checked too when it differs from that read — pgoutput emits a
+//     snapshot at each table's first Relation of a session, so a DROP COLUMN
+//     made before the table's first change in the run arrives exactly there
+//     (round-2 review HIGH-1: skipping first snapshots let such a DROP
+//     COLUMN — the first boundary after a cold start, which schema-forward
+//     does not forward, so the target kept the column and its key — merge
+//     a keyless duplicate onto another row at exit 0). A
+//     table the open door did not read (a live-added one) is checked from
+//     its second snapshot on.
 //
-// A catalog-read failure WARNs ([SourceUniqueKeyRecheckFailedMarker]) and
-// the next due check tries again; maxFailures consecutive failures stop the
-// stream with that marker (restartable — the next start's open door reads
-// again). A cancelled context stops quietly.
+// A periodic catalog-read failure WARNs ([SourceUniqueKeyRecheckFailedMarker])
+// and the next due check tries again; maxFailures consecutive failures stop
+// the stream with that marker (restartable — the next start's open door reads
+// again). A BOUNDARY read failure stops the stream at once (same marker,
+// restartable, outside that budget): the boundary is checked once, and a
+// pgoutput or binlog stream has no periodic re-check to catch it later. A
+// cancelled context stops quietly.
 //
 // # The window it leaves, stated
 //
@@ -88,7 +105,11 @@ func interceptUniqueKeyChecks(
 		return in
 	}
 	out := make(chan ir.Change, migcore.RowChanBuffer)
-	r := &uniqueKeyRunner{cfg: cfg, errStore: errStore, now: now, out: out, last: now(), prevCols: map[string]string{}}
+	prevCols := make(map[string]string, len(cfg.seedCols))
+	for k, v := range cfg.seedCols {
+		prevCols[k] = v
+	}
+	r := &uniqueKeyRunner{cfg: cfg, errStore: errStore, now: now, out: out, last: now(), prevCols: prevCols}
 	go func() {
 		defer close(out)
 		for {
@@ -127,6 +148,11 @@ type uniqueKeyRunner struct {
 func (r *uniqueKeyRunner) step(ctx context.Context, c ir.Change) bool {
 	if r.holding {
 		r.held = append(r.held, c)
+		if isTxCommit(c) {
+			// Whichever arm below releases the hold, the transaction is over
+			// (the cap can land on its commit; round-2 review L-b).
+			r.inTx = false
+		}
 		switch {
 		case r.touchesWatched(c) || len(r.held) >= uniqueKeyHoldCap:
 			if !r.runPeriodic(ctx) {
@@ -134,7 +160,6 @@ func (r *uniqueKeyRunner) step(ctx context.Context, c ir.Change) bool {
 			}
 			return r.flush(ctx)
 		case isTxCommit(c):
-			r.inTx = false
 			return r.flush(ctx)
 		}
 		return true
@@ -198,17 +223,43 @@ func (r *uniqueKeyRunner) flush(ctx context.Context) bool {
 func (r *uniqueKeyRunner) emit(ctx context.Context, c ir.Change) bool {
 	if snap, ok := c.(ir.SchemaSnapshot); ok && r.cfg.boundary != nil && snap.IR != nil {
 		key := snap.QualifiedName()
+		if r.cfg.colsKey != nil {
+			key = r.cfg.colsKey(snap.Schema, snap.Table)
+		}
 		cols := columnList(snap.IR)
 		prev, seen := r.prevCols[key]
-		r.prevCols[key] = cols
 		if seen && prev != cols {
 			refusal, err := r.cfg.boundary(ctx, snap.Schema, snap.Table)
-			if !r.settle(ctx, refusal, err) {
+			if !r.settleBoundary(ctx, snap.QualifiedName(), refusal, err) {
 				return false
 			}
 		}
+		r.prevCols[key] = cols
 	}
 	return forwardChange(ctx, r.out, c)
+}
+
+// settleBoundary acts on a boundary check's result. A read failure stops
+// the stream (restartable) instead of WARNing: the boundary is judged once,
+// and forwarding past it unjudged would leave the table unwatched for the
+// rest of the run on a source with no periodic re-check (round-2 review
+// MEDIUM-1). It is not counted toward the periodic failure budget.
+func (r *uniqueKeyRunner) settleBoundary(ctx context.Context, table string, refusal *ir.SourceUniqueKeyAbsentError, err error) bool {
+	switch {
+	case ctx.Err() != nil:
+		return false
+	case err != nil:
+		stop := fmt.Errorf("%s: the unique-key check after a schema change of %s could not read a catalog, so the "+
+			"change cannot be judged and the stream stops before anything after it is applied; the next start "+
+			"compares the catalogs again: %w", SourceUniqueKeyRecheckFailedMarker, table, err)
+		r.errStore.Store(&stop)
+		return false
+	case refusal != nil:
+		var e error = refusal
+		r.errStore.Store(&e)
+		return false
+	}
+	return true
 }
 
 func columnList(t *ir.Table) string {
@@ -267,9 +318,19 @@ func (s *Streamer) uniqueKeyChecksFor() uniqueKeyChecks {
 		return uniqueKeyChecks{}
 	}
 	cfg := uniqueKeyChecks{period: s.uniqueKeyRecheckPeriod(), maxFailures: uniqueKeyRecheckMaxFailures}
+	multi := len(door.scopes) > 1 || (len(door.scopes) == 1 && door.scopes[0].namespace != "")
+	cfg.seedCols = door.openCols
+	cfg.colsKey = func(schema, table string) string {
+		if !multi {
+			schema = ""
+		}
+		return uniqueKeyColsKey(schema, table)
+	}
 	cfg.boundary = func(ctx context.Context, schema, table string) (*ir.SourceUniqueKeyAbsentError, error) {
 		i := door.scopeFor(schema)
-		absent, _, err := s.compareUniqueKeys(ctx, door.scopes, nil, map[int][]string{i: {table}})
+		absent, _, err := s.compareUniqueKeys(ctx, door.scopes, uniqueKeyCompare{
+			only: map[int][]string{i: {table}}, collations: s.uniqueKeyCollationsArmed(false),
+		})
 		if err != nil || len(absent) == 0 {
 			return nil, err
 		}
@@ -284,7 +345,6 @@ func (s *Streamer) uniqueKeyChecksFor() uniqueKeyChecks {
 			watched[door.scopes[i].namespace+"\x00"+strings.ToLower(t)] = true
 		}
 	}
-	multi := len(door.scopes) > 1 || (len(door.scopes) == 1 && door.scopes[0].namespace != "")
 	cfg.watches = func(schema, table string) bool {
 		if !multi {
 			schema = ""
@@ -292,7 +352,7 @@ func (s *Streamer) uniqueKeyChecksFor() uniqueKeyChecks {
 		return watched[schema+"\x00"+strings.ToLower(table)]
 	}
 	cfg.periodic = func(ctx context.Context) (*ir.SourceUniqueKeyAbsentError, error) {
-		absent, _, err := s.compareUniqueKeys(ctx, door.scopes, nil, door.watched)
+		absent, _, err := s.compareUniqueKeys(ctx, door.scopes, uniqueKeyCompare{only: door.watched, collations: s.uniqueKeyCollationsArmed(false)})
 		if err != nil || len(absent) == 0 {
 			return nil, err
 		}

@@ -202,6 +202,16 @@ func (e Engine) PreflightIndexes(s *ir.Schema) error {
 // boundary.
 var _ ir.IndexEmitPreflighter = Engine{}
 
+// CollationLoosening implements [ir.CollationLooseningResolver] by
+// delegating to the composed [postgres.Engine]: the field is not embedded,
+// so without this a trigger source or target would silently drop out of the
+// unique-key door's collation-direction check (MEDIUM-2).
+func (e Engine) CollationLoosening(t ir.Type) (ir.CollationLoosening, bool) {
+	return e.pg.CollationLoosening(t)
+}
+
+var _ ir.CollationLooseningResolver = Engine{}
+
 // PreflightViews implements [ir.ViewEmitPreflighter] by delegating to the
 // composed [postgres.Engine], for the same reason and against the same
 // non-promotion trap as PreflightIndexes: without it, Bug 314's cross-engine

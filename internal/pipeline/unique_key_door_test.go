@@ -87,7 +87,7 @@ func TestUniqueKeyDoor_AtOpen(t *testing.T) {
 		s, _, _ := ukDoorStreamer(t, ir.CDCBinlog,
 			[]*ir.Table{ukDoorTable("kd", pk)},
 			[]*ir.Table{ukDoorTable("kd", pk, ukDoorKey("kd_k", "k"))})
-		err := s.phaseRefuseTargetOnlyUniqueKeys(context.Background(), nil, "s1")
+		err := s.phaseRefuseTargetOnlyUniqueKeys(context.Background(), nil, "s1", true)
 		var refusal *ir.SourceUniqueKeyAbsentError
 		if !errors.As(err, &refusal) || !errors.Is(err, ir.ErrSourceUniqueKeyAbsent) {
 			t.Fatalf("got %v, want SOURCE-UNIQUE-KEY-ABSENT", err)
@@ -103,7 +103,7 @@ func TestUniqueKeyDoor_AtOpen(t *testing.T) {
 		s, _, _ := ukDoorStreamer(t, ir.CDCTriggers,
 			[]*ir.Table{ukDoorTable("kd", nil)},
 			[]*ir.Table{ukDoorTable("kd", nil, ukDoorKey("kd_k", "k"))})
-		err := s.phaseRefuseTargetOnlyUniqueKeys(context.Background(), nil, "s1")
+		err := s.phaseRefuseTargetOnlyUniqueKeys(context.Background(), nil, "s1", true)
 		if !errors.Is(err, ir.ErrSourceUniqueKeyAbsent) || !strings.Contains(err.Error(), "may already have merged") ||
 			!strings.Contains(err.Error(), "--reset-target-data --yes") {
 			t.Fatalf("got %v, want the re-copy remedy first", err)
@@ -113,7 +113,7 @@ func TestUniqueKeyDoor_AtOpen(t *testing.T) {
 		s, _, _ := ukDoorStreamer(t, ir.CDCBinlog,
 			[]*ir.Table{ukDoorTable("kd", pk, ukDoorKey("kd_k", "k"))},
 			[]*ir.Table{ukDoorTable("kd", pk, ukDoorKey("kd_k", "k"))})
-		if err := s.phaseRefuseTargetOnlyUniqueKeys(context.Background(), nil, "s1"); err != nil {
+		if err := s.phaseRefuseTargetOnlyUniqueKeys(context.Background(), nil, "s1", true); err != nil {
 			t.Fatal(err)
 		}
 		if s.uniqueKeyDoor == nil || s.uniqueKeyDoor.periodic {
@@ -125,11 +125,11 @@ func TestUniqueKeyDoor_AtOpen(t *testing.T) {
 			[]*ir.Table{ukDoorTable("kd", pk)},
 			[]*ir.Table{ukDoorTable("KD", pk, ukDoorKey("kd_k", "k"))})
 		s.AcceptTargetOnlyUniqueKeys = []string{"kd.KD_K"}
-		if err := s.phaseRefuseTargetOnlyUniqueKeys(context.Background(), nil, "s1"); err != nil {
+		if err := s.phaseRefuseTargetOnlyUniqueKeys(context.Background(), nil, "s1", true); err != nil {
 			t.Fatal(err)
 		}
 		s.AcceptTargetOnlyUniqueKeys = []string{"kd.other"}
-		if err := s.phaseRefuseTargetOnlyUniqueKeys(context.Background(), nil, "s1"); !errors.Is(err, ir.ErrSourceUniqueKeyAbsent) {
+		if err := s.phaseRefuseTargetOnlyUniqueKeys(context.Background(), nil, "s1", true); !errors.Is(err, ir.ErrSourceUniqueKeyAbsent) {
 			t.Fatalf("accepting another key let kd_k through: %v", err)
 		}
 	})
@@ -142,7 +142,7 @@ func TestUniqueKeyDoor_AtOpen(t *testing.T) {
 			t.Fatal(err)
 		}
 		s.Filter = f
-		if err := s.phaseRefuseTargetOnlyUniqueKeys(context.Background(), nil, "s1"); err != nil {
+		if err := s.phaseRefuseTargetOnlyUniqueKeys(context.Background(), nil, "s1", true); err != nil {
 			t.Fatal(err)
 		}
 		for _, n := range tgt.scoped {
@@ -154,7 +154,7 @@ func TestUniqueKeyDoor_AtOpen(t *testing.T) {
 	t.Run("a table the target does not hold is not judged", func(t *testing.T) {
 		s, _, _ := ukDoorStreamer(t, ir.CDCBinlog,
 			[]*ir.Table{ukDoorTable("kd", pk)}, nil)
-		if err := s.phaseRefuseTargetOnlyUniqueKeys(context.Background(), nil, "s1"); err != nil {
+		if err := s.phaseRefuseTargetOnlyUniqueKeys(context.Background(), nil, "s1", true); err != nil {
 			t.Fatal(err)
 		}
 	})
@@ -162,7 +162,7 @@ func TestUniqueKeyDoor_AtOpen(t *testing.T) {
 		s, _, _ := ukDoorStreamer(t, ir.CDCBinlog, nil, nil)
 		s.TargetDSN = "missing"
 		s.Source.(*ukDoorEngine).schemas["src-dsn"] = &ir.Schema{Tables: []*ir.Table{ukDoorTable("kd", pk)}}
-		err := s.phaseRefuseTargetOnlyUniqueKeys(context.Background(), nil, "s1")
+		err := s.phaseRefuseTargetOnlyUniqueKeys(context.Background(), nil, "s1", true)
 		if err == nil || errors.Is(err, ir.ErrSourceUniqueKeyAbsent) {
 			t.Fatalf("got %v, want a restartable read failure", err)
 		}
@@ -171,7 +171,7 @@ func TestUniqueKeyDoor_AtOpen(t *testing.T) {
 		s, _, _ := ukDoorStreamer(t, ir.CDCVStream,
 			[]*ir.Table{ukDoorTable("kd", pk, ukDoorKey("kd_k", "k")), ukDoorTable("plain", pk)},
 			[]*ir.Table{ukDoorTable("kd", pk, ukDoorKey("kd_k", "k")), ukDoorTable("plain", pk)})
-		if err := s.phaseRefuseTargetOnlyUniqueKeys(context.Background(), nil, "s1"); err != nil {
+		if err := s.phaseRefuseTargetOnlyUniqueKeys(context.Background(), nil, "s1", true); err != nil {
 			t.Fatal(err)
 		}
 		if s.uniqueKeyDoor == nil || strings.Join(s.uniqueKeyDoor.watched[0], ",") != "kd" {
@@ -230,6 +230,17 @@ func TestSourceUniqueKeyAbsentError_Remedies(t *testing.T) {
 			"add-table", &ir.SourceUniqueKeyAbsentError{Keys: keys, When: ir.UniqueKeyDoorAddTable},
 			[]string{"before the table is copied", "run add-table again"},
 		},
+		{
+			"at a schema change", &ir.SourceUniqueKeyAbsentError{Keys: keys, When: ir.UniqueKeyDoorAtSchemaChange},
+			[]string{"not forwarded at all", "stopped before anything after the change was applied", "DROP INDEX"},
+		},
+		{
+			"a looser key column", &ir.SourceUniqueKeyAbsentError{
+				Keys:              []ir.AbsentUniqueKey{{Table: "kd", Key: "kd_k", Columns: "(k)", LooserColumns: []string{"k"}}},
+				SourceSeesDDLLive: true,
+			},
+			[]string{"[the target's k compares case-, accent- or trailing-space-insensitively", "ALTERing the target column(s)"},
+		},
 	}
 	for _, c := range cells {
 		t.Run(c.name, func(t *testing.T) {
@@ -251,15 +262,15 @@ func TestRefuseAddTableTargetOnlyUniqueKeys(t *testing.T) {
 	pk := ukDoorKey("PRIMARY", "id")
 	src := ukDoorTable("kd", pk)
 	precreated := map[string]*ir.Table{"kd": ukDoorTable("kd", pk, ukDoorKey("kd_k", "k"))}
-	err := refuseAddTableTargetOnlyUniqueKeys(src, precreated, "mysql", nil)
+	err := refuseAddTableTargetOnlyUniqueKeys(src, precreated, nil, nil, nil)
 	var refusal *ir.SourceUniqueKeyAbsentError
 	if !errors.As(err, &refusal) || refusal.When != ir.UniqueKeyDoorAddTable {
 		t.Fatalf("got %v, want the add-table refusal", err)
 	}
-	if err := refuseAddTableTargetOnlyUniqueKeys(src, precreated, "mysql", []string{"kd.kd_k"}); err != nil {
+	if err := refuseAddTableTargetOnlyUniqueKeys(src, precreated, nil, nil, []string{"kd.kd_k"}); err != nil {
 		t.Fatalf("an accepted key refused: %v", err)
 	}
-	if err := refuseAddTableTargetOnlyUniqueKeys(src, map[string]*ir.Table{}, "mysql", nil); err != nil {
+	if err := refuseAddTableTargetOnlyUniqueKeys(src, map[string]*ir.Table{}, nil, nil, nil); err != nil {
 		t.Fatalf("a table sluice will create refused: %v", err)
 	}
 }
@@ -289,12 +300,115 @@ func TestUncoveredTargetKeys_TargetIndexNames(t *testing.T) {
 		{"postgres target, unprefixed name on the target (renamed by hand)", "postgres", expr("uniq_lower_email", "lower(`email`)", "mysql"), expr("uniq_lower_email", "lower((email)::text)", "postgres"), true},
 		{"postgres target, another key entirely", "postgres", expr("uniq_lower_email", "lower(`email`)", "mysql"), expr("users_uniq_upper", "upper((email)::text)", "postgres"), true},
 	}
+	t.Run("two source keys mapping to one target name cover nothing by name (round-2 L-c)", func(t *testing.T) {
+		src := ukDoorTable("users", pk,
+			expr("users_e", "lower(`email`)", "mysql"), expr("e", "upper(`email`)", "mysql"))
+		tgt := ukDoorTable("users", pk, expr("users_e", "lower((email)::text)", "postgres"))
+		if got := uncoveredTargetKeys(src, tgt, "postgres", nil); len(got) != 1 {
+			t.Errorf("uncovered = %v; an ambiguous name must not vouch for the target key", got)
+		}
+	})
 	for _, c := range cells {
 		t.Run(c.name, func(t *testing.T) {
-			got := uncoveredTargetKeys(ukDoorTable("users", pk, c.src), ukDoorTable("users", pk, c.tgt), c.engine)
+			got := uncoveredTargetKeys(ukDoorTable("users", pk, c.src), ukDoorTable("users", pk, c.tgt), c.engine, nil)
 			if (len(got) > 0) != c.wantRefused {
 				t.Errorf("uncovered = %v, want refused=%v", got, c.wantRefused)
 			}
 		})
+	}
+}
+
+// ukLooseEngine is an engine with a name and a collation-loosening table
+// keyed by collation name, for the door's collation-direction eligibility.
+type ukLooseEngine struct {
+	stubEngine
+	name  string
+	loose map[string]ir.CollationLoosening
+}
+
+func (e ukLooseEngine) Name() string { return e.name }
+
+func (e ukLooseEngine) CollationLoosening(t ir.Type) (ir.CollationLoosening, bool) {
+	v, ok := t.(ir.Varchar)
+	if !ok {
+		return 0, false
+	}
+	l, ok := e.loose[v.Collation]
+	return l, ok
+}
+
+// TestKeyColumnWeakening_Eligibility pins which engine pairs arm the door's
+// collation direction (round-2 review MEDIUM-2) and what it reports: armed
+// for a same-family pair and a Postgres-family target, withheld for a
+// non-MySQL source into a MySQL-family target (a Postgres byte-exact key
+// lands on the target's case-insensitive default) and for an engine
+// without a resolver; a column either side cannot classify is never
+// weakened.
+func TestKeyColumnWeakening_Eligibility(t *testing.T) {
+	loose := map[string]ir.CollationLoosening{"bin": 0, "ci": ir.LooseCase | ir.LooseAccent}
+	eng := func(name string) ir.Engine { return ukLooseEngine{name: name, loose: loose} }
+	table := func(coll string) *ir.Table {
+		return &ir.Table{Name: "kd", Columns: []*ir.Column{{Name: "k", Type: ir.Varchar{Length: 9, Collation: coll}}}}
+	}
+	cases := []struct {
+		name           string
+		source, target ir.Engine
+		srcColl        string
+		tgtColl        string
+		want           bool
+	}{
+		{"mysql bin -> mysql ci", eng("mysql"), eng("mysql"), "bin", "ci", true},
+		{"mysql ci -> mysql bin", eng("mysql"), eng("mysql"), "ci", "bin", false},
+		{"mysql bin -> mariadb ci", eng("mysql"), eng("mariadb"), "bin", "ci", true},
+		{"postgres bin -> postgres ci", eng("postgres"), eng("postgres"), "bin", "ci", true},
+		{"mysql bin -> postgres ci", eng("mysql"), eng("postgres"), "bin", "ci", true},
+		{"mysql bin -> postgres-trigger ci", eng("mysql"), eng("postgres-trigger"), "bin", "ci", true},
+		{"postgres bin -> mysql ci: withheld", eng("postgres"), eng("mysql"), "bin", "ci", false},
+		{"unclassified target column", eng("mysql"), eng("mysql"), "bin", "unknown", false},
+		{"no resolver", stubEngine{}, eng("mysql"), "bin", "ci", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			w := keyColumnWeakening(c.source, c.target, table(c.srcColl), table(c.tgtColl))
+			got := w != nil && w("k", "k")
+			if got != c.want {
+				t.Fatalf("weakened = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// ukCDCEngine is an engine with a CDC method, for which checks judge
+// collation direction.
+type ukCDCEngine struct {
+	stubEngine
+	cdc ir.CDCMethod
+}
+
+func (e ukCDCEngine) Capabilities() ir.Capabilities { return ir.Capabilities{CDC: e.cdc} }
+
+// TestUniqueKeyCollationsArmed pins when the door judges collation
+// direction: on a DDL-carrying source (binlog, pgoutput) only at a cold
+// start's open, since a warm open would refuse a collation change the
+// key-collation door forwards; on a source whose stream carries no DDL
+// (VStream, triggers) at every check.
+func TestUniqueKeyCollationsArmed(t *testing.T) {
+	cases := []struct {
+		cdc      ir.CDCMethod
+		coldOpen bool
+		want     bool
+	}{
+		{ir.CDCBinlog, true, true},
+		{ir.CDCBinlog, false, false},
+		{ir.CDCLogicalReplication, true, true},
+		{ir.CDCLogicalReplication, false, false},
+		{ir.CDCVStream, false, true},
+		{ir.CDCTriggers, false, true},
+	}
+	for _, c := range cases {
+		s := &Streamer{Source: ukCDCEngine{cdc: c.cdc}}
+		if got := s.uniqueKeyCollationsArmed(c.coldOpen); got != c.want {
+			t.Errorf("%v coldOpen=%v: armed=%v, want %v", c.cdc, c.coldOpen, got, c.want)
+		}
 	}
 }
