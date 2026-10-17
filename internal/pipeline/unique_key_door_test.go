@@ -274,6 +274,14 @@ func TestRefuseAddTableTargetOnlyUniqueKeys(t *testing.T) {
 	if err := refuseAddTableTargetOnlyUniqueKeys(src, precreated, nil, nil, []string{accept}); err != nil {
 		t.Fatalf("an accepted key refused: %v", err)
 	}
+	// The same name accepted at another shape (round-6 MEDIUM-A): the
+	// fingerprint binds the acceptance, so the key as it is now refuses and
+	// the refusal names the stale fingerprint.
+	stale := "kd.kd_k=" + keyFingerprint(ukDoorKey("kd_k", "id"), precreated["kd"])
+	err = refuseAddTableTargetOnlyUniqueKeys(src, precreated, nil, nil, []string{stale})
+	if !errors.As(err, &refusal) || refusal.Keys[0].AcceptedFingerprint != strings.TrimPrefix(stale, "kd.kd_k=") {
+		t.Fatalf("a key accepted at another shape: got %v, want the add-table refusal naming the stale fingerprint", err)
+	}
 	if err := refuseAddTableTargetOnlyUniqueKeys(src, map[string]*ir.Table{}, nil, nil, nil); err != nil {
 		t.Fatalf("a table sluice will create refused: %v", err)
 	}
