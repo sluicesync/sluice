@@ -30,16 +30,25 @@ import (
 // target, or re-copy the table.
 var ErrUniqueKeyConflictOtherRow = errors.New("UNIQUE-KEY-CONFLICT-OTHER-ROW")
 
+// PgoutputSlotDropClause is the step every `sync start` re-copy from a
+// Postgres pgoutput source needs first, `--restart-from-scratch` and
+// `--reset-target-data` alike: the stream's replication slot survives both,
+// and a fresh snapshot refuses to inherit it (measured on each:
+// TestStreamer_UniqueKeyConflict_TradeRemedy,
+// TestStreamer_UniqueKeyDoor_PostgresSource's clean re-copy cell).
+// `sluice slot drop` never auto-prefixes, so it names the full slot.
+const PgoutputSlotDropClause = "from a Postgres pgoutput source, first drop the stream's " +
+	"replication slot, which a fresh snapshot refuses to inherit: `sluice slot drop <SLOT> " +
+	"--source-driver=postgres --source <DSN> --yes`, where <SLOT> is the full name `sluice slot list` prints: " +
+	"`sluice_slot` by default, else `sluice_` + --slot-name unless that already starts with `sluice_`"
+
 // UniqueKeyConflictRecopyRemedy is the re-copy half of the refusal's remedy,
 // shared by both appliers. An applier cannot tell which command drives it, so
 // it names both: `sync start` re-copies with --restart-from-scratch, while
 // `sync from-backup run` has no such flag and recovers with
 // --reset-target-data (which needs --yes off a terminal; cmd/sluice cli.go).
 const UniqueKeyConflictRecopyRemedy = "a re-copy converges — for `sluice sync start`, restart with " +
-	"`--restart-from-scratch` and the same `--stream-id` (from a Postgres pgoutput source, first drop the stream's " +
-	"replication slot, which a fresh snapshot refuses to inherit: `sluice slot drop <SLOT> " +
-	"--source-driver=postgres --source <DSN> --yes`, where <SLOT> is the full name `sluice slot list` prints: " +
-	"`sluice_slot` by default, else `sluice_` + --slot-name unless that already starts with `sluice_`); " +
+	"`--restart-from-scratch` and the same `--stream-id` (" + PgoutputSlotDropClause + "); " +
 	"for `sluice sync from-backup run`, which has no `--restart-from-scratch`, re-run it with " +
 	"`--reset-target-data --yes` (it drops the target tables and restores the chain again; this leg is unmeasured)."
 

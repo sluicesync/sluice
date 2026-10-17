@@ -53,6 +53,10 @@ type AbsentUniqueKey struct {
 	Key string
 	// Columns renders the key's parts: "(k)", "(lower(email))".
 	Columns string
+	// Constraint reports a key a table constraint owns (a Postgres UNIQUE
+	// or PRIMARY KEY constraint), which `DROP INDEX` cannot drop: the
+	// refusal marks it so the remedy names `ALTER TABLE … DROP CONSTRAINT`.
+	Constraint bool
 }
 
 // SourceUniqueKeyAbsentError is the refusal. Engine-neutral: the pipeline
@@ -77,6 +81,9 @@ func (e *SourceUniqueKeyAbsentError) Error() string {
 			name = "(unnamed)"
 		}
 		keys[i] = k.Table + "." + name + " " + k.Columns
+		if k.Constraint {
+			keys[i] += " [a constraint: ALTER TABLE " + k.Table + " DROP CONSTRAINT " + name + "]"
+		}
 	}
 	return fmt.Sprintf("%s: the target has %d unique key(s) the source does not enforce: %s. Every insert reaches "+
 		"the target as an upsert that resolves a conflict through any unique key the target has, so the source's next "+
@@ -103,9 +110,10 @@ const sourceUniqueKeyDropClause = "drop each named key on the target (`DROP INDE
 // primary key the merged row carries the other row's identity); dropping
 // and re-creating the tables from the source does both.
 const sourceUniqueKeyRecopyClause = "re-copy from a clean target with `sluice sync start --reset-target-data --yes` " +
-	"and the same `--stream-id`: it drops the stream's target tables, these keys with them, and copies them again " +
-	"from the source (destructive). A re-copy onto the existing tables (`--restart-from-scratch`) keeps the keys, so " +
-	"this check would refuse it again, and cannot remove a row a merge left behind."
+	"and the same `--stream-id` (" + PgoutputSlotDropClause + "): it drops the stream's target tables, these keys " +
+	"with them, and copies them again from the source (destructive). A re-copy onto the existing tables " +
+	"(`--restart-from-scratch`) keeps the keys, so this check would refuse it again, and cannot remove a row a " +
+	"merge left behind."
 
 func (e *SourceUniqueKeyAbsentError) remedy() string {
 	switch e.When {

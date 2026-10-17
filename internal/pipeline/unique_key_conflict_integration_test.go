@@ -20,9 +20,11 @@
 // the stream is stopped), and the pgoutput door (UNFORWARDED-SCHEMA-CHANGE,
 // which now reads plain unique indexes) for a live pgoutput stream. A
 // keyless table here also carries a unique key on id (see ukcCreate): the
-// single-unique-key keyless shape is the stated residual that only the
-// source-side doors reach (UNIQUE-KEY-STOPPED-WINDOW-DOOR in the audit
-// backlog), so it has no cell that could pass for the wrong reason.
+// single-unique-key keyless shape is the residual the guard cannot see, so
+// it has no cell here that could pass for the wrong reason; the stream-open
+// unique-key door closes it (unique_key_door_integration_test.go). These
+// cells accept kd_k by name so that door stands aside and the guard is
+// what they pin (see ukcRun).
 //
 // The independent expected value is the SOURCE's rows read by id (id, k, v)
 // against the target's, never the stream's own logs: every row the target
@@ -148,6 +150,18 @@ func ukcDropIndex(dialect string) string {
 // ukcRun runs one cell: newStreamer builds the stream (fresh each start).
 func ukcRun(t *testing.T, sc ukcScenario, src, tgt twfbDB, cell twfbCell, newStreamer func() *Streamer) {
 	t.Helper()
+	// These cells pin the APPLY guard. Since UNIQUE-KEY-STOPPED-WINDOW-DOOR
+	// the stream-open door refuses a target key the source dropped before
+	// the guard can see a row (unique_key_door_integration_test.go pins
+	// that), and the trigger lane's mid-stream re-check may too; accepting
+	// kd_k by name is exactly the configuration where the guard is the last
+	// line, so every cell here runs with it.
+	build := newStreamer
+	newStreamer = func() *Streamer {
+		s := build()
+		s.AcceptTargetOnlyUniqueKeys = []string{"kd.kd_k"}
+		return s
+	}
 	srcDialect := "mysql"
 	if src.engine == "postgres" {
 		srcDialect = "postgres"

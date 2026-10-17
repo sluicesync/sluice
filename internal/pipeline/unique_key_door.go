@@ -313,7 +313,7 @@ func (s *Streamer) compareUniqueKeys(
 				if sc.namespace != "" {
 					table = sc.namespace + "." + table
 				}
-				absent = append(absent, ir.AbsentUniqueKey{Table: table, Key: key.Name, Columns: renderKeyParts(key)})
+				absent = append(absent, absentUniqueKey(table, tt, key))
 			}
 		}
 	}
@@ -430,6 +430,20 @@ func hasSecondaryUniqueKey(t *ir.Table) bool {
 		}
 	}
 	return false
+}
+
+// absentUniqueKey renders one refused key. table is the name the refusal
+// shows (namespace-qualified on a multi-database stream). A key a table
+// constraint owns — a Postgres UNIQUE constraint, a named primary key — is
+// marked, since `DROP INDEX` refuses it (measured: a keyless table's unique
+// key lands on a Postgres target as a constraint, SQLSTATE 2BP01).
+func absentUniqueKey(table string, t *ir.Table, key *ir.Index) ir.AbsentUniqueKey {
+	return ir.AbsentUniqueKey{
+		Table:      table,
+		Key:        key.Name,
+		Columns:    renderKeyParts(key),
+		Constraint: key.ConstraintBacked || (key == t.PrimaryKey && key.ConstraintNamed),
+	}
 }
 
 // renderKeyParts renders a key's parts for the refusal: "(k)", "(c(10))",
