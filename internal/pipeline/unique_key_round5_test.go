@@ -116,6 +116,23 @@ func TestAddTableUniqueKeyDoor_CollationAsRead(t *testing.T) {
 	}
 }
 
+// TestUniqueKeyDoorScopeFor pins round-5 LOW-5: a namespace no scope of a
+// multi-database stream names is not scope 0 (whose filter would judge
+// nothing for the boundary) but no scope, which the boundary check refuses.
+func TestUniqueKeyDoorScopeFor(t *testing.T) {
+	single := &uniqueKeyDoorState{scopes: []uniqueKeyDoorScope{{}}}
+	if i, ok := single.scopeFor("anything"); i != 0 || !ok {
+		t.Errorf("single-namespace: %d, %v", i, ok)
+	}
+	multi := &uniqueKeyDoorState{scopes: []uniqueKeyDoorScope{{namespace: "a"}, {namespace: "b"}}}
+	if i, ok := multi.scopeFor("B"); i != 1 || !ok {
+		t.Errorf("named namespace: %d, %v", i, ok)
+	}
+	if _, ok := multi.scopeFor("c"); ok {
+		t.Error("an unnamed namespace found a scope")
+	}
+}
+
 // r5Gate builds a boundary gate over table kd whose check records what it
 // judged.
 func r5Gate(seedCols map[string]string, seedTypes map[string]map[string]ir.Type) (gate *uniqueKeyBoundaryGate, judgedTables *[]string) {
