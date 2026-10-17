@@ -5,6 +5,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -80,6 +81,24 @@ func TestUniqueKeyBoundaryHook_SchemaIntercepts(t *testing.T) {
 		if err != nil || len(got) != want || strings.Join(judged, ",") != "users" {
 			t.Errorf("refuse, verdict %v: forwarded %d, judged %v, err %v", verdict, len(got), judged, err)
 		}
+	}
+}
+
+// ukReadFailEngine is an engine whose schema reader cannot be opened.
+type ukReadFailEngine struct{ stubEngine }
+
+func (ukReadFailEngine) OpenSchemaReader(context.Context, string) (ir.SchemaReader, error) {
+	return nil, errors.New("catalog down")
+}
+
+// TestAddTableUniqueKeyDoor_ReadFailureRefuses pins the round-3 add-table
+// fix's fail-closed half: a target catalog that cannot be read refuses the
+// command, where the shape gate's read only WARNed and skipped the door.
+func TestAddTableUniqueKeyDoor_ReadFailureRefuses(t *testing.T) {
+	a := &AddTable{Source: ukReadFailEngine{}, Target: ukReadFailEngine{}}
+	err := a.refuseTargetOnlyUniqueKeys(context.Background(), &ir.Table{Name: "kd"}, "")
+	if err == nil || !strings.Contains(err.Error(), "catalog down") {
+		t.Fatalf("err = %v; want the read failure to refuse", err)
 	}
 }
 
