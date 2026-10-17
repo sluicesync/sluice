@@ -137,6 +137,26 @@ func PGEffectiveIndexName(tableName string, idx *ir.Index) string {
 // its structural ROLE instead of by name.
 type indexNameRule func(tableName string, idx *ir.Index) string
 
+// WithTargetIndexNames returns tbl with its secondary indexes renamed to the
+// names a targetEngine schema writer holds them under (the same rule the
+// compare-lane retarget applies), or tbl itself when the target keeps
+// source names verbatim. The primary key is untouched (matched by role).
+// Used where a source table's index NAMES are compared with a target
+// catalog's — the stream's unique-key door matches a cross-dialect
+// expression or partial key by name (UNIQUE-KEY-STOPPED-WINDOW-DOOR).
+func WithTargetIndexNames(tbl *ir.Table, targetEngine string) *ir.Table {
+	if tbl == nil {
+		return nil
+	}
+	renamed := retargetIndexNames(tbl, indexNameRuleFor(targetEngine))
+	if renamed == nil {
+		return tbl
+	}
+	out := *tbl
+	out.Indexes = renamed
+	return &out
+}
+
 // indexNameRuleFor returns the rule for a target engine, or nil when the
 // target holds source index names verbatim.
 //

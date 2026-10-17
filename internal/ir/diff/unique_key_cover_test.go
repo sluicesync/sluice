@@ -101,7 +101,11 @@ func TestUncoveredTargetUniqueKeys_Matrix(t *testing.T) {
 		{"cross-dialect predicate, same name", ukcTable(pkID, &ir.Index{Name: "p", Unique: true, Columns: []ir.IndexColumn{ukcCol("k")}, Predicate: "a IS NULL", PredicateDialect: "sqlite"}), ukcTable(pkID, &ir.Index{Name: "p", Unique: true, Columns: []ir.IndexColumn{ukcCol("k")}, Predicate: "(a IS NULL)", PredicateDialect: "postgres"}), ""},
 		{"cross-dialect predicate, another name", ukcTable(pkID, &ir.Index{Name: "p", Unique: true, Columns: []ir.IndexColumn{ukcCol("k")}, Predicate: "a IS NULL", PredicateDialect: "sqlite"}), ukcTable(pkID, &ir.Index{Name: "q", Unique: true, Columns: []ir.IndexColumn{ukcCol("k")}, Predicate: "(a IS NULL)", PredicateDialect: "postgres"}), "q"},
 
-		// ---- NULLS NOT DISTINCT
+		// ---- NULLS NOT DISTINCT. The schema reader sets the flag for a
+		// constraint-owned index only (it drives a WARN there); the stream's
+		// door folds it in for EVERY unique index from the Postgres
+		// catalog (ir.UniqueKeyFactReader, pipeline applyUniqueKeyFacts), so
+		// these cells are the values the door's comparison actually sees.
 		{"target NULLS NOT DISTINCT, source not", ukcTable(pkID, ukcKey("k", ukcCol("k"))), ukcTable(pkID, &ir.Index{Name: "k", Unique: true, Columns: []ir.IndexColumn{ukcCol("k")}, ConstraintNullsNotDistinct: true}), "k"},
 		{"both NULLS NOT DISTINCT", ukcTable(pkID, &ir.Index{Name: "k", Unique: true, Columns: []ir.IndexColumn{ukcCol("k")}, ConstraintNullsNotDistinct: true}), ukcTable(pkID, &ir.Index{Name: "k", Unique: true, Columns: []ir.IndexColumn{ukcCol("k")}, ConstraintNullsNotDistinct: true}), ""},
 
@@ -109,6 +113,10 @@ func TestUncoveredTargetUniqueKeys_Matrix(t *testing.T) {
 		{"source NOCASE implies a binary target key", ukcTable(pkID, ukcKey("k", ir.IndexColumn{Column: "k", Collation: "NOCASE"})), ukcTable(pkID, ukcKey("k", ukcCol("k"))), ""},
 		{"a binary source key does not imply a NOCASE target key", ukcTable(pkID, ukcKey("k", ukcCol("k"))), ukcTable(pkID, ukcKey("k", ir.IndexColumn{Column: "k", Collation: "NOCASE"})), "k"},
 		{"NOCASE does not imply RTRIM", ukcTable(pkID, ukcKey("k", ir.IndexColumn{Column: "k", Collation: "NOCASE"})), ukcTable(pkID, ukcKey("k", ir.IndexColumn{Column: "k", Collation: "RTRIM"})), "k"},
+
+		// ---- Postgres index-level collations (indcollation, folded in by the door)
+		{"a target index collation the source part lacks", ukcTable(pkID, ukcKey("k", ukcCol("k"))), ukcTable(pkID, ukcKey("k", ir.IndexColumn{Column: "k", Collation: "ci_icu", CollationDialect: "postgres"})), "k"},
+		{"the same index collation on both sides", ukcTable(pkID, ukcKey("k", ir.IndexColumn{Column: "k", Collation: "ci_icu", CollationDialect: "postgres"})), ukcTable(pkID, ukcKey("k", ir.IndexColumn{Column: "k", Collation: "ci_icu", CollationDialect: "postgres"})), ""},
 
 		// ---- the two shapes the apply guard cannot see (residuals (a) and (b))
 		{"(a) keyless, the only unique key dropped", ukcTable(nil), ukcTable(nil, ukcKey("kd_k", ukcCol("k"))), "kd_k"},
@@ -126,6 +134,35 @@ func TestUncoveredTargetUniqueKeys_Matrix(t *testing.T) {
 
 // TestUncoveredTargetUniqueKeys_TargetOnlyColumns pins the exemption for a
 // key on a column the target generates on every insert, and its limits.
+// TestUncoveredTargetUniqueKeys_CaseCollidingColumns pins the exact-name
+// rule: on a table holding `"Email"` and `email`, a key on one never vouches
+// for a key on the other (columns or expression identifiers), while the
+// ordinary fold still holds on a table without such a pair.
+func TestUncoveredTargetUniqueKeys_CaseCollidingColumns(t *testing.T) {
+	withEmails := func(keys ...*ir.Index) *ir.Table {
+		tbl := ukcTable(ukcKey("PRIMARY", ukcCol("id")), keys...)
+		tbl.Columns = append(tbl.Columns, &ir.Column{Name: "Email", Type: ir.Text{}}, &ir.Column{Name: "email", Type: ir.Text{}})
+		return tbl
+	}
+	cells := []struct {
+		name           string
+		source, target *ir.Table
+		want           string
+	}{
+		{"a key on Email does not cover a key on email", withEmails(ukcKey("ue", ukcCol("Email"))), withEmails(ukcKey("ue", ukcCol("email"))), "ue"},
+		{"the same column covers", withEmails(ukcKey("ue", ukcCol("email"))), withEmails(ukcKey("ue", ukcCol("email"))), ""},
+		{"an expression over Email does not cover one over email", withEmails(ukcKey("le", ukcExpr(`lower("Email")`, "postgres"))), withEmails(ukcKey("le", ukcExpr("lower(email)", "postgres"))), "le"},
+		{"without a colliding pair the fold holds", ukcTable(nil, ukcKey("k", ukcCol("K"))), ukcTable(nil, ukcKey("k", ukcCol("k"))), ""},
+	}
+	for _, c := range cells {
+		t.Run(c.name, func(t *testing.T) {
+			if got := ukcNames(UncoveredTargetUniqueKeys(c.source, c.target)); got != c.want {
+				t.Errorf("uncovered = %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
 func TestUncoveredTargetUniqueKeys_TargetOnlyColumns(t *testing.T) {
 	src := ukcTable(nil, ukcKey("kd_k", ukcCol("k")))
 	withCol := func(c *ir.Column, keys ...*ir.Index) *ir.Table {

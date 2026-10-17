@@ -7,10 +7,12 @@ package pipeline
 //
 // # The harm
 //
-// Every sluice target applies a source INSERT as an upsert, and an upsert
-// resolves a conflict through ANY unique key the target has. A target unique
-// key the source does not enforce turns the source's next duplicate of it
-// into an overwrite of a different row, at exit 0
+// Every sluice target applies a source INSERT as an upsert, and the upsert
+// resolves a conflict through a unique key: on a MySQL-family target any
+// unique key the table has (ON DUPLICATE KEY UPDATE), on Postgres the
+// table's ON CONFLICT key (a conflict through another key raises 23505). A
+// target unique key the source does not enforce can turn the source's next
+// duplicate of it into an overwrite of a different row, at exit 0
 // (SOURCE-DROPPED-UNIQUE-KEY-MERGE). The source-side doors see a DROP INDEX
 // only live — pgoutput at the next RelationMessage, the binlog at the DDL
 // event — and both baseline at StreamChanges, so a DROP made while the
@@ -40,13 +42,27 @@ package pipeline
 //     because it compares the two catalogs and consults no persisted state:
 //     "no cdc-state row" is not "no drift" here.
 //   - MID-STREAM, only on a source whose change stream carries no DDL
-//     (CDCTriggers, CDCVStream): a re-check every [uniqueKeyRecheckInterval],
-//     run at a transaction boundary before the next change is forwarded,
+//     (CDCTriggers, CDCVStream): a re-check every [uniqueKeyRecheckInterval]
 //     over the tables that have a target unique key besides the primary key
-//     (where the merge happens). See [interceptUniqueKeyRecheck] for the
-//     window it leaves. pgoutput and the binlog are not re-checked: their
-//     own doors refuse a live unique-key DROP before the next row of the
-//     table (postgres and mysql cdc_unforwarded_classes.go).
+//     (where the merge happens), run before the first change of a
+//     transaction that touches one of them is forwarded, and skipped while
+//     none does. See [interceptUniqueKeyRecheck] for the window it leaves.
+//     pgoutput and the binlog are not re-checked: their own doors refuse a
+//     live unique-key DROP before the next row of the table (postgres and
+//     mysql cdc_unforwarded_classes.go).
+//   - After a SCHEMA CHANGE the stream forwarded to the target, on every
+//     source, for that table: a forwarded DROP COLUMN narrows a MySQL-family
+//     target key that included the column (UNIQUE(a,b) → UNIQUE(a)) while a
+//     Postgres source drops such an index outright, which no source-side
+//     door sees because the source's own change is the column.
+//
+// Tables live-added while the stream runs (ADR-0034) join the re-check only
+// at the next start; `schema add-table` judged a pre-created one before
+// handing it over, and a table it creates copies the source's keys. The door
+// runs after a cold start's bulk copy (it needs the tables to exist), so an
+// extra key on a PRE-CREATED target refuses only once the copy is done; the
+// copy itself cannot merge through such a key (a plain-INSERT or COPY
+// duplicate is loud, the idempotent copy writer refuses an undeclared key).
 //
 // **Independent expected value:** the source catalog's unique keys, read
 // fresh by the source engine's own SchemaReader, against the target
@@ -72,9 +88,12 @@ package pipeline
 // as of stream OPEN, but the changes a run applies start at the persisted
 // position, which can predate it — a DROP INDEX, a duplicate insert, a
 // delete of it and a re-CREATE of the key, all while stopped, leave a key
-// the source declares at open and a replayed duplicate the guard alone can
-// refuse. Mid-stream, a trigger or VStream source's set is fresh only to
-// within the re-check window. The guard stays as it is.
+// the source declares at open and a replayed duplicate — which the guard
+// refuses where it is armed and which is SILENT on the two shapes it
+// cannot see (no primary key and one unique key; rows differing only in a
+// NULL or partial-predicate column). Mid-stream, a trigger or VStream
+// source's set is fresh only to within the re-check window. The guard stays
+// as it is.
 
 import (
 	"context"
@@ -82,12 +101,12 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
 	irdiff "sluicesync.dev/sluice/internal/ir/diff"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
+	"sluicesync.dev/sluice/internal/translate"
 )
 
 // uniqueKeyRecheckInterval is the mid-stream re-check's period on a source
@@ -98,28 +117,42 @@ import (
 const uniqueKeyRecheckInterval = 15 * time.Second
 
 // SourceUniqueKeyRecheckFailedMarker is the grep-stable token on the WARN a
-// mid-stream re-check logs when it cannot read a catalog. The stream keeps
-// running — a transient read failure must not end it — and the next
-// re-check tries again; a WARN repeating on every interval means the door is
-// not watching.
+// mid-stream re-check logs when it cannot read a catalog, and on the error
+// that stops the stream after [uniqueKeyRecheckMaxFailures] consecutive
+// failures: on a source whose change stream carries no DDL the re-check is
+// the only mid-stream protection, so it fails closed rather than WARN
+// forever while not watching.
 const SourceUniqueKeyRecheckFailedMarker = "SOURCE-UNIQUE-KEY-RECHECK-FAILED"
+
+// uniqueKeyRecheckMaxFailures is how many consecutive re-check catalog-read
+// failures stop the stream — about a minute at the default period. A
+// transient blip WARNs and the next re-check tries again.
+const uniqueKeyRecheckMaxFailures = 4
 
 // uniqueKeyDoorScope is one source namespace and its target counterpart.
 type uniqueKeyDoorScope struct {
 	// namespace is the source namespace on a multi-database stream, ""
-	// on a single-database one; it qualifies table names in the refusal.
-	namespace    string
-	sourceDSN    string
-	targetDSN    string
-	targetSchema string
+	// on a single-database one.
+	namespace string
+	// targetNamespace qualifies table names in the refusal: the renamed
+	// target namespace on a multi-database stream, --target-schema on a
+	// single one, "" when the target's DSN names it.
+	targetNamespace string
+	sourceDSN       string
+	targetDSN       string
+	targetSchema    string
 }
 
-// uniqueKeyDoorState is what the stream-open door hands the re-check.
+// uniqueKeyDoorState is what the stream-open door hands the mid-stream
+// checks.
 type uniqueKeyDoorState struct {
 	scopes []uniqueKeyDoorScope
 	// watched lists, per scope index, the source table names whose target
 	// has a unique key besides its primary key.
 	watched map[int][]string
+	// periodic arms the periodic re-check: a source whose change stream
+	// carries no DDL.
+	periodic bool
 }
 
 // sourceSeesUniqueKeyDDLLive reports a source whose change stream refuses a
@@ -143,20 +176,20 @@ func (s *Streamer) phaseRefuseTargetOnlyUniqueKeys(ctx context.Context, applier 
 	if err != nil {
 		return err
 	}
-	liveAdded := s.uniqueKeyDoorLiveAdded(ctx, applier, streamID)
+	liveAdded, err := s.uniqueKeyDoorLiveAdded(ctx, applier, streamID)
+	if err != nil {
+		return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("pipeline: unique-key door: %w", err))
+	}
 	absent, watched, err := s.compareUniqueKeys(ctx, scopes, liveAdded, nil)
 	if err != nil {
 		return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("pipeline: unique-key door: %w", err))
 	}
 	if len(absent) > 0 {
-		return &ir.SourceUniqueKeyAbsentError{
-			Keys:              absent,
-			When:              ir.UniqueKeyDoorAtOpen,
-			SourceSeesDDLLive: sourceSeesUniqueKeyDDLLive(s.Source),
-		}
+		return s.uniqueKeyRefusal(absent, ir.UniqueKeyDoorAtOpen)
 	}
-	if !sourceSeesUniqueKeyDDLLive(s.Source) && len(watched) > 0 {
-		s.uniqueKeyDoor = &uniqueKeyDoorState{scopes: scopes, watched: watched}
+	periodic := !sourceSeesUniqueKeyDDLLive(s.Source) && len(watched) > 0
+	s.uniqueKeyDoor = &uniqueKeyDoorState{scopes: scopes, watched: watched, periodic: periodic}
+	if periodic {
 		slog.InfoContext(ctx, "unique-key door: this source's change stream carries no DDL; re-checking the target's "+
 			"unique keys against the source's periodically",
 			slog.String("stream_id", streamID),
@@ -164,6 +197,17 @@ func (s *Streamer) phaseRefuseTargetOnlyUniqueKeys(ctx context.Context, applier 
 			slog.Int("tables", countWatched(watched)))
 	}
 	return nil
+}
+
+// uniqueKeyRefusal builds the refusal for this stream.
+func (s *Streamer) uniqueKeyRefusal(absent []ir.AbsentUniqueKey, when ir.UniqueKeyDoorWhen) *ir.SourceUniqueKeyAbsentError {
+	return &ir.SourceUniqueKeyAbsentError{
+		Keys:              absent,
+		When:              when,
+		SourceSeesDDLLive: sourceSeesUniqueKeyDDLLive(s.Source),
+		ShardConsolidated: s.InjectShardColumn.Engaged(),
+		RecheckInterval:   s.uniqueKeyRecheckPeriod().String(),
+	}
 }
 
 func countWatched(watched map[int][]string) int {
@@ -187,7 +231,9 @@ func (s *Streamer) uniqueKeyRecheckPeriod() time.Duration {
 // namespace.
 func (s *Streamer) uniqueKeyDoorScopes(ctx context.Context) ([]uniqueKeyDoorScope, error) {
 	if !s.multiDatabaseMode() {
-		return []uniqueKeyDoorScope{{sourceDSN: s.SourceDSN, targetDSN: s.TargetDSN, targetSchema: s.TargetSchema}}, nil
+		return []uniqueKeyDoorScope{{
+			targetNamespace: s.TargetSchema, sourceDSN: s.SourceDSN, targetDSN: s.TargetDSN, targetSchema: s.TargetSchema,
+		}}, nil
 	}
 	selected, _, err := s.resolveStreamDatabases(ctx)
 	if err != nil {
@@ -218,30 +264,31 @@ func (s *Streamer) uniqueKeyDoorScopes(ctx context.Context) ([]uniqueKeyDoorScop
 				return nil, fmt.Errorf("pipeline: unique-key door: derive target DSN for %q: %w", db, err)
 			}
 		}
-		scopes = append(scopes, uniqueKeyDoorScope{namespace: db, sourceDSN: srcDSN, targetDSN: tgtDSN})
+		scopes = append(scopes, uniqueKeyDoorScope{
+			namespace: db, targetNamespace: s.NamespaceMap.Apply(db), sourceDSN: srcDSN, targetDSN: tgtDSN,
+		})
 	}
 	return scopes, nil
 }
 
 // uniqueKeyDoorLiveAdded is the stream's live-added tables (ADR-0034): in
 // scope although the operator's filter may not name them. A read failure
-// leaves them out — the add-table door judged each when it was added.
-func (s *Streamer) uniqueKeyDoorLiveAdded(ctx context.Context, applier ir.ChangeApplier, streamID string) map[string]bool {
+// fails the open (restartable, not the marker): judging only the filter's
+// tables would leave the live-added ones unjudged, silently.
+func (s *Streamer) uniqueKeyDoorLiveAdded(ctx context.Context, applier ir.ChangeApplier, streamID string) (map[string]bool, error) {
 	reader, ok := applier.(liveAddedTablesReader)
 	if !ok {
-		return nil
+		return nil, nil
 	}
 	tables, err := reader.ReadLiveAddedTables(ctx, streamID)
 	if err != nil {
-		slog.DebugContext(ctx, "unique-key door: live-added tables unreadable; judging the filter's tables",
-			slog.String("stream_id", streamID), slog.String("err", err.Error()))
-		return nil
+		return nil, fmt.Errorf("read live-added tables: %w", err)
 	}
 	out := make(map[string]bool, len(tables))
 	for _, t := range tables {
 		out[t] = true
 	}
-	return out
+	return out, nil
 }
 
 // compareUniqueKeys reads both catalogs for every scope and returns the
@@ -283,14 +330,14 @@ func (s *Streamer) compareUniqueKeys(
 			names[strings.ToLower(t.Name)] = true
 		}
 		tgt, err := s.readUniqueKeyDoorTarget(ctx, sc, names)
-		if err != nil && sc.namespace != "" {
+		if err != nil && sc.namespace != "" && ir.IsDatabaseNotFound(err) {
 			// A multi-database stream re-resolves its selection from the live
 			// source on every start, so a namespace created since the cold
-			// start has no target counterpart yet (MySQL errors on the missing
-			// database): it holds no keys to judge, and turning it into a
-			// refusal would break a configuration that runs. The same degrade
-			// as loadMultiDatabaseTargetZoneWitness.
-			slog.WarnContext(ctx, "unique-key door: the target namespace could not be read; its tables are not judged",
+			// start has no target counterpart yet (MySQL errno 1049; a missing
+			// Postgres schema reads back empty instead): it holds no keys to
+			// judge, and refusing would break a configuration that runs. Only
+			// that class: any other read failure fails the open.
+			slog.WarnContext(ctx, "unique-key door: the target namespace does not exist yet; its tables are not judged",
 				slog.String("namespace", sc.namespace), slog.String("err", err.Error()))
 			continue
 		}
@@ -305,13 +352,13 @@ func (s *Streamer) compareUniqueKeys(
 			if hasSecondaryUniqueKey(tt) {
 				watched[i] = append(watched[i], st.Name)
 			}
-			for _, key := range irdiff.UncoveredTargetUniqueKeys(st, tt) {
-				if accept.allows(sc.namespace, tt.Name, key.Name) {
+			for _, key := range uncoveredTargetKeys(st, tt, s.Target.Name()) {
+				if accept.allows(sc.namespace, tt.Name, key.Name) || accept.allows(sc.targetNamespace, tt.Name, key.Name) {
 					continue
 				}
 				table := tt.Name
-				if sc.namespace != "" {
-					table = sc.namespace + "." + table
+				if sc.targetNamespace != "" {
+					table = sc.targetNamespace + "." + table
 				}
 				absent = append(absent, absentUniqueKey(table, tt, key))
 			}
@@ -349,6 +396,9 @@ func (s *Streamer) readUniqueKeyDoorSource(ctx context.Context, sc uniqueKeyDoor
 	}
 	if schema == nil {
 		return nil, nil
+	}
+	if err := applyUniqueKeyFacts(ctx, sr, schema); err != nil {
+		return nil, connectHint(fmt.Errorf("read source unique-key facts: %w", err))
 	}
 	var out []*ir.Table
 	for _, t := range schema.Tables {
@@ -392,6 +442,9 @@ func (s *Streamer) readUniqueKeyDoorTarget(ctx context.Context, sc uniqueKeyDoor
 	if schema == nil {
 		return nil, nil
 	}
+	if err := applyUniqueKeyFacts(ctx, tr, schema); err != nil {
+		return nil, connectHint(fmt.Errorf("read target unique-key facts: %w", err))
+	}
 	var out []*ir.Table
 	for _, t := range schema.Tables {
 		if t != nil && inScope(t.Name) {
@@ -399,6 +452,69 @@ func (s *Streamer) readUniqueKeyDoorTarget(ctx context.Context, sc uniqueKeyDoor
 		}
 	}
 	return out, nil
+}
+
+// applyUniqueKeyFacts folds a reader's [ir.UniqueKeyFact]s into the tables
+// it just read, in place (the schema is this door's own read, consumed
+// nowhere else): a unique index the server does not enforce is dropped from
+// the table (it can neither cover a target key nor merge a row), NULLS NOT
+// DISTINCT is set for every unique index, and a per-part INDEX collation is
+// carried as the part's Collation (dialect "postgres"), which the cover rule
+// compares. A reader without the surface (every engine but Postgres) leaves
+// the tables as read.
+func applyUniqueKeyFacts(ctx context.Context, reader any, schema *ir.Schema) error {
+	fr, ok := reader.(ir.UniqueKeyFactReader)
+	if !ok {
+		return nil
+	}
+	facts, err := fr.UniqueKeyFacts(ctx)
+	if err != nil {
+		return err
+	}
+	for _, t := range schema.Tables {
+		if t == nil || facts[t.Name] == nil {
+			continue
+		}
+		tf := facts[t.Name]
+		kept := t.Indexes[:0]
+		for _, idx := range t.Indexes {
+			if idx == nil || !idx.Unique {
+				kept = append(kept, idx)
+				continue
+			}
+			f, has := tf[idx.Name]
+			if !has {
+				kept = append(kept, idx)
+				continue
+			}
+			if !f.Enforcing {
+				continue
+			}
+			idx.ConstraintNullsNotDistinct = idx.ConstraintNullsNotDistinct || f.NullsNotDistinct
+			for i := range idx.Columns {
+				if i < len(f.PartCollations) && f.PartCollations[i] != "" {
+					idx.Columns[i].Collation = f.PartCollations[i]
+					idx.Columns[i].CollationDialect = "postgres"
+				}
+			}
+			kept = append(kept, idx)
+		}
+		t.Indexes = kept
+		if pk := t.PrimaryKey; pk != nil {
+			if f, has := tf[pk.Name]; has && !f.Enforcing {
+				t.PrimaryKey = nil
+			}
+		}
+	}
+	return nil
+}
+
+// uncoveredTargetKeys is the cover rule with the source's secondary index
+// names mapped to the names the target engine holds them under (a Postgres
+// target table-prefixes them, translate.PGEffectiveIndexName), since a
+// cross-dialect expression or partial key is matched by name.
+func uncoveredTargetKeys(source, target *ir.Table, targetEngine string) []*ir.Index {
+	return irdiff.UncoveredTargetUniqueKeys(translate.WithTargetIndexNames(source, targetEngine), target)
 }
 
 // matchTargetTable finds the target table for a source table: the exact
@@ -458,6 +574,9 @@ func renderKeyParts(key *ir.Index) string {
 			parts[i] = fmt.Sprintf("%s(%d)", c.Column, c.Length)
 		default:
 			parts[i] = c.Column
+		}
+		if c.Collation != "" {
+			parts[i] += " COLLATE " + c.Collation
 		}
 	}
 	out := "(" + strings.Join(parts, ", ") + ")"
@@ -526,106 +645,4 @@ func (a acceptedUniqueKeys) allows(namespace, table, key string) bool {
 		}
 	}
 	return false
-}
-
-// interceptUniqueKeyRecheck re-runs the door every period on the watched
-// tables, at a transaction boundary — a TxBegin, or a row change outside a
-// transaction — before that change is forwarded, so a refusal stops the
-// stream between source transactions. A refusal is stored in errStore and
-// the channel closed; a catalog read failure WARNs
-// ([SourceUniqueKeyRecheckFailedMarker]) and the stream continues.
-//
-// # The window it leaves, stated
-//
-// The re-check runs AFTER the change it precedes was read from the source,
-// so a source DROP committed before that change is visible to it: the
-// transaction that would merge, and everything after it, is refused. What
-// it does not cover is the transactions forwarded between the DROP and the
-// next re-check — up to one period of them. For the shapes the apply guard
-// sees (a table with a primary key, or with two or more unique keys and
-// rows that differ in a non-NULL key column) those still refuse at their
-// first colliding row; for the two it cannot see (no primary key and one
-// unique key; rows differing only in NULL or partial-predicate columns) a
-// merge in that window is applied, and the re-check's refusal then names a
-// re-copy as the remedy. Holding every change until a re-check started after
-// it would close the window at the cost of up to a period of added latency on
-// every change of the stream; not built.
-func interceptUniqueKeyRecheck(
-	ctx context.Context,
-	in <-chan ir.Change,
-	period time.Duration,
-	check func(context.Context) (*ir.SourceUniqueKeyAbsentError, error),
-	errStore *atomic.Pointer[error],
-	now func() time.Time,
-) <-chan ir.Change {
-	if check == nil {
-		return in
-	}
-	out := make(chan ir.Change, migcore.RowChanBuffer)
-	// The stream-open door just ran: the first period starts now.
-	last := now()
-	go func() {
-		defer close(out)
-		inTx := false
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case c, ok := <-in:
-				if !ok {
-					return
-				}
-				boundary := false
-				switch c.(type) {
-				case ir.TxBegin:
-					boundary, inTx = true, true
-				case ir.TxCommit:
-					inTx = false
-				default:
-					boundary = !inTx
-				}
-				if boundary && now().Sub(last) >= period {
-					last = now()
-					refusal, err := check(ctx)
-					switch {
-					case err != nil:
-						slog.WarnContext(ctx, SourceUniqueKeyRecheckFailedMarker+": the periodic re-check of the "+
-							"target's unique keys against the source's could not read a catalog; the stream continues "+
-							"and the next re-check tries again",
-							slog.String("err", err.Error()))
-					case refusal != nil:
-						var e error = refusal
-						errStore.Store(&e)
-						return
-					}
-				}
-				if !forwardChange(ctx, out, c) {
-					return
-				}
-			}
-		}
-	}()
-	return out
-}
-
-// uniqueKeyRecheck builds the re-check intercept's check, or nil when the
-// stream needs none (a source that sees unique-key DDL live, or nothing to
-// watch).
-func (s *Streamer) uniqueKeyRecheck() func(context.Context) (*ir.SourceUniqueKeyAbsentError, error) {
-	door := s.uniqueKeyDoor
-	if door == nil || len(door.watched) == 0 {
-		return nil
-	}
-	period := s.uniqueKeyRecheckPeriod()
-	return func(ctx context.Context) (*ir.SourceUniqueKeyAbsentError, error) {
-		absent, _, err := s.compareUniqueKeys(ctx, door.scopes, nil, door.watched)
-		if err != nil || len(absent) == 0 {
-			return nil, err
-		}
-		return &ir.SourceUniqueKeyAbsentError{
-			Keys:            absent,
-			When:            ir.UniqueKeyDoorMidStream,
-			RecheckInterval: period.String(),
-		}, nil
-	}
 }

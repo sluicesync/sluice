@@ -90,6 +90,7 @@ var (
 	_ ir.SlotHealthReporter         = (*SchemaReader)(nil)
 	_ ir.SlotSpillReporter          = (*SchemaReader)(nil)
 	_ ir.TableScoper                = (*SchemaReader)(nil)
+	_ ir.UniqueKeyFactReader        = (*SchemaReader)(nil)
 	_ ir.VerbatimExtensionAware     = (*SchemaReader)(nil)
 	_ ir.Verifier                   = (*SchemaReader)(nil)
 	// The pipeline's preflight probers are pipeline-side interfaces

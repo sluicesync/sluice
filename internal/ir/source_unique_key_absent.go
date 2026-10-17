@@ -12,15 +12,17 @@ import (
 // ErrSourceUniqueKeyAbsent classifies the refusal of a stream whose target
 // holds a unique key the source does not enforce
 // (UNIQUE-KEY-STOPPED-WINDOW-DOOR). Every insert reaches a sluice target as
-// an upsert, and an upsert resolves a conflict through ANY unique key the
-// target has, so the source's next row that duplicates such a key would
-// overwrite a different row at exit 0 (SOURCE-DROPPED-UNIQUE-KEY-MERGE).
-// The apply-time conflict-identity guard (UNIQUE-KEY-CONFLICT-OTHER-ROW)
-// cannot see every such merge — not on a table with no primary key and one
-// unique key, nor between rows that differ only in a NULL or partial-index
-// column — so the stream compares the two catalogs instead: at every
-// stream open, and periodically on a source whose change stream carries no
-// DDL.
+// an upsert, and the upsert resolves a conflict through a unique key — on a
+// MySQL-family target through any unique key the table has, on Postgres
+// through the table's ON CONFLICT key (another key raises an error there) —
+// so the source's next row duplicating such a key can overwrite a different
+// row at exit 0 (SOURCE-DROPPED-UNIQUE-KEY-MERGE). The apply-time
+// conflict-identity guard (UNIQUE-KEY-CONFLICT-OTHER-ROW) cannot see every
+// such merge — not on a table with no primary key and one unique key, nor
+// between rows that differ only in a NULL or partial-index column — so the
+// stream compares the two catalogs instead: at every stream open, after a
+// schema change it forwards, and periodically on a source whose change
+// stream carries no DDL.
 //
 // The comparison is a pure function of the two catalogs, so a restart reads
 // both back unchanged and refuses again until the operator drops the key
@@ -42,12 +44,17 @@ const (
 	// UniqueKeyDoorAddTable is `sluice schema add-table`, before the table
 	// is copied or handed to the stream.
 	UniqueKeyDoorAddTable
+	// UniqueKeyDoorAtSchemaChange is the check after a schema change the
+	// stream forwarded to the target (a forwarded DROP COLUMN can leave a
+	// MySQL target holding a narrower key than the source); nothing after
+	// the boundary has been applied.
+	UniqueKeyDoorAtSchemaChange
 )
 
 // AbsentUniqueKey is one target unique key no source key implies.
 type AbsentUniqueKey struct {
-	// Table is the target table, qualified with its namespace when the
-	// stream spans several.
+	// Table is the target table, qualified with its target namespace when
+	// the stream names one (a multi-database stream, --target-schema).
 	Table string
 	// Key is the key's name on the target ("" for an unnamed one).
 	Key string
@@ -66,9 +73,13 @@ type SourceUniqueKeyAbsentError struct {
 	When UniqueKeyDoorWhen
 	// SourceSeesDDLLive reports a source whose change stream refuses a
 	// unique-key DROP it reads (pgoutput, the MySQL binlog), so a DROP found
-	// at stream open was made while the stream was stopped and nothing
+	// at stream open was made while no stream was reading, and nothing
 	// after it has been applied.
 	SourceSeesDDLLive bool
+	// ShardConsolidated reports an `--inject-shard-column` stream, whose
+	// target table every shard shares: dropping and re-creating it would
+	// take every shard's rows with it.
+	ShardConsolidated bool
 	// RecheckInterval is the mid-stream re-check's period, for the message.
 	RecheckInterval string
 }
@@ -86,10 +97,11 @@ func (e *SourceUniqueKeyAbsentError) Error() string {
 		}
 	}
 	return fmt.Sprintf("%s: the target has %d unique key(s) the source does not enforce: %s. Every insert reaches "+
-		"the target as an upsert that resolves a conflict through any unique key the target has, so the source's next "+
-		"row duplicating one of these keys would overwrite a different row at exit 0. The usual cause is a source "+
-		"DROP INDEX (or DROP CONSTRAINT) the stream did not see — made while it was stopped, or on a source whose "+
-		"change stream carries no DDL — or a target created with a key the source never had. %s",
+		"the target as an upsert, which resolves a conflict through a unique key (on a MySQL-family target any the "+
+		"table has; on Postgres its ON CONFLICT key), so the source's next row duplicating one of these keys can "+
+		"overwrite a different row at exit 0. The usual cause is a source DROP INDEX (or DROP CONSTRAINT) no stream "+
+		"saw — made while none was running, or on a source whose change stream carries no DDL — or a target created "+
+		"with a key the source never had. %s",
 		ErrSourceUniqueKeyAbsent, len(e.Keys), strings.Join(keys, ", "), e.remedy())
 }
 
@@ -111,43 +123,66 @@ const sourceUniqueKeyDropClause = "drop each named key on the target (`DROP INDE
 // operator --restart-from-scratch clears them too (streamer_coldstart.go,
 // freshCopyOperatorRestart.clearsTarget — even for VStream, whose snapshot
 // reader is the one ir.IdempotentCopyReader and whose AUTOMATIC re-snapshot
-// alone upserts onto the existing rows; Bug 320) — except under
-// --inject-shard-column, whose restart skips the clear (the consolidated
-// table is shared; unmeasured here). Both measured converging
+// alone upserts onto the existing rows; Bug 320). Both measured converging
 // from this refusal (TestStreamer_UniqueKeyDoor_PostgresSource's clean
-// re-copy cells, TestStreamer_UniqueKeyDoor_TriggerCDC).
+// re-copy cells, TestStreamer_UniqueKeyDoor_TriggerCDC). Not under
+// --inject-shard-column: see sourceUniqueKeyShardRecopyClause.
 const sourceUniqueKeyRecopyClause = "re-copy from a clean target: `sluice sync start --restart-from-scratch` " +
 	"or `--reset-target-data --yes`, with the same `--stream-id` (" + PgoutputSlotDropClause + "); both drop and " +
-	"re-create the stream's target tables from the source, these keys and any merged row with them (destructive). " +
-	"Under `--inject-shard-column` a `--restart-from-scratch` re-copies onto the shared consolidated table instead, " +
-	"keeping the keys: drop them there first."
+	"re-create the stream's target tables from the source, these keys and any merged row with them (destructive)."
+
+// sourceUniqueKeyShardRecopyClause replaces the re-copy clause on an
+// `--inject-shard-column` stream. Its target table is shared by every shard:
+// --reset-target-data drops it and every shard's rows with it
+// (shard_preflight.go), and its --restart-from-scratch skips the clear
+// (streamer_coldstart.go gates the clear on !InjectShardColumn.Engaged()),
+// re-copying this shard onto the shared table, keys kept. Unmeasured.
+const sourceUniqueKeyShardRecopyClause = "this is an `--inject-shard-column` stream, whose target table every " +
+	"shard shares: do NOT use `--reset-target-data`, which drops that table and every shard's rows with it. Drop " +
+	"each named key on the target first, then re-copy this shard with `sluice sync start --restart-from-scratch` " +
+	"and the same `--stream-id` (" + PgoutputSlotDropClause + "), which re-copies onto the shared table without " +
+	"clearing it: it refreshes this shard's rows by key but cannot remove a row a merge left behind."
+
+func (e *SourceUniqueKeyAbsentError) recopy() string {
+	if e.ShardConsolidated {
+		return sourceUniqueKeyShardRecopyClause
+	}
+	return sourceUniqueKeyRecopyClause
+}
 
 func (e *SourceUniqueKeyAbsentError) remedy() string {
 	switch e.When {
 	case UniqueKeyDoorAddTable:
 		return "Refusing before the table is copied or handed to the stream. Drop each named key on the target table " +
 			"and run add-table again, or accept it by name with `--accept-target-only-unique-key <table>.<key>`."
+	case UniqueKeyDoorAtSchemaChange:
+		return "Found after a schema change the stream forwarded to the target (a forwarded DROP COLUMN narrows a " +
+			"MySQL-family key that included the column, while a Postgres source drops such an index outright); " +
+			"stopped before anything after the change was applied: " + sourceUniqueKeyDropClause + ". " +
+			sourceUniqueKeyAcceptClause
 	case UniqueKeyDoorMidStream:
 		interval := e.RecheckInterval
 		if interval == "" {
 			interval = "one re-check interval"
 		}
+		rc := e.recopy()
 		return "Found by the periodic re-check, which a source whose change stream carries no DDL needs: changes " +
 			"applied since the source's DROP — up to " + interval + " of them — may already have merged, and dropping " +
 			"the key alone would keep those rows. Stopped before the next change is applied. " +
-			strings.ToUpper(sourceUniqueKeyRecopyClause[:1]) + sourceUniqueKeyRecopyClause[1:] + " " + sourceUniqueKeyAcceptClause
+			strings.ToUpper(rc[:1]) + rc[1:] + " " + sourceUniqueKeyAcceptClause
 	}
 	if e.SourceSeesDDLLive {
 		return "Refusing at stream open, before any change of this run is applied. This source's change stream " +
-			"refuses a unique-key DROP it reads, so the source dropped the key while the stream was stopped and nothing " +
-			"written after the DROP has been applied: " + sourceUniqueKeyDropClause + ". If a sluice v0.161.0 or " +
-			"earlier was streaming from a Postgres source when its plain unique index was dropped (those releases did " +
-			"not see that DROP), rows may already have merged; " + sourceUniqueKeyRecopyClause + " " + sourceUniqueKeyAcceptClause
+			"refuses a unique-key DROP it reads, so a dropped key was dropped while no stream was reading (or the target " +
+			"was created with the key) and nothing written after it has been applied: " + sourceUniqueKeyDropClause +
+			". If a sluice v0.161.0 or earlier was streaming from a Postgres source when its plain unique index was " +
+			"dropped (those releases did not see that DROP), rows may already have merged; " + e.recopy() + " " +
+			sourceUniqueKeyAcceptClause
 	}
 	return "Refusing at stream open, before any change of this run is applied. This source's change stream carries " +
 		"no DDL, so if the source dropped the key while a stream was RUNNING, changes written after the DROP may already " +
-		"have merged on the target, and dropping the key alone would keep them; " + sourceUniqueKeyRecopyClause +
-		" If the stream was stopped across the DROP (or the key was never the source's), nothing after it was " +
+		"have merged on the target, and dropping the key alone would keep them; " + e.recopy() +
+		" If no stream was running across the DROP (or the key was never the source's), nothing after it was " +
 		"applied: " + sourceUniqueKeyDropClause + ". " + sourceUniqueKeyAcceptClause
 }
 

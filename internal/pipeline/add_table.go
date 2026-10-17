@@ -55,7 +55,6 @@ import (
 
 	"sluicesync.dev/sluice/internal/config"
 	"sluicesync.dev/sluice/internal/ir"
-	irdiff "sluicesync.dev/sluice/internal/ir/diff"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/redact"
 	"sluicesync.dev/sluice/internal/translate"
@@ -728,7 +727,7 @@ func (a *AddTable) preflightTargetForStream(ctx context.Context, scoped *ir.Sche
 		if err := preflightBinaryTargetColumnsOnCDC(scoped, actual, "add-table"); err != nil {
 			return err
 		}
-		if err := refuseAddTableTargetOnlyUniqueKeys(scoped.Tables[0], actual, a.AcceptTargetOnlyUniqueKeys); err != nil {
+		if err := refuseAddTableTargetOnlyUniqueKeys(scoped.Tables[0], actual, engineNameOrEmpty(a.Target), a.AcceptTargetOnlyUniqueKeys); err != nil {
 			return err
 		}
 	}
@@ -748,7 +747,7 @@ func (a *AddTable) preflightTargetForStream(ctx context.Context, scoped *ir.Sche
 // It reads the shape gate's catalog, so it degrades with that read (its
 // WARN). source is the scoped table after the operator's overrides, which
 // change column types and generated expressions, never keys.
-func refuseAddTableTargetOnlyUniqueKeys(source *ir.Table, targetTables map[string]*ir.Table, accept []string) error {
+func refuseAddTableTargetOnlyUniqueKeys(source *ir.Table, targetTables map[string]*ir.Table, targetEngine string, accept []string) error {
 	tables := make([]*ir.Table, 0, len(targetTables))
 	for _, t := range targetTables {
 		if t != nil {
@@ -761,7 +760,7 @@ func refuseAddTableTargetOnlyUniqueKeys(source *ir.Table, targetTables map[strin
 	}
 	accepted := parseAcceptedUniqueKeys(accept)
 	var absent []ir.AbsentUniqueKey
-	for _, key := range irdiff.UncoveredTargetUniqueKeys(source, target) {
+	for _, key := range uncoveredTargetKeys(source, target, targetEngine) {
 		if !accepted.allows("", target.Name, key.Name) {
 			absent = append(absent, absentUniqueKey(target.Name, target, key))
 		}

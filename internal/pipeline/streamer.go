@@ -2459,14 +2459,22 @@ func (s *Streamer) applyWithReshardFollow(
 // resumes.
 const maxReshardReopensPerRun = 256
 
-// interceptErrorPending reports whether an ADR-0054/ADR-0058 SchemaSnapshot
-// intercept has stored a (non-nil) error this attempt. Used by the
-// reshard auto-follow guard so a reopen never masks a schema-forwarding /
-// coordination failure — that must reach [phaseSettleDispatch] and be
-// classified/surfaced.
+// interceptErrorPending reports whether any change intercept has stored a
+// (non-nil) error this attempt: the ADR-0054/ADR-0058 SchemaSnapshot
+// intercepts, the --where row-move intercept, and the unique-key checks
+// (UNIQUE-KEY-STOPPED-WINDOW-DOOR). Each closes the channel cleanly on a
+// refusal, which reads exactly like the reshard close the auto-follow guard
+// reopens on — so a reopen must never run past one: it has to reach
+// [phaseSettleDispatch] and be surfaced. Every error sink
+// [phaseSettleDispatch] reads is listed here; the whereFilterErr sink was
+// missing until the unique-key one joined it.
 func (s *Streamer) interceptErrorPending() bool {
-	p := s.schemaSnapshotErr.Load()
-	return p != nil && *p != nil
+	for _, sink := range []*atomic.Pointer[error]{&s.schemaSnapshotErr, &s.whereFilterErr, &s.uniqueKeyRecheckErr} {
+		if p := sink.Load(); p != nil && *p != nil {
+			return true
+		}
+	}
+	return false
 }
 
 // surfaceSourceError returns the source CDC reader's stored Err()

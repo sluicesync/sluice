@@ -7,9 +7,7 @@ import (
 	"context"
 	"errors"
 	"strings"
-	"sync/atomic"
 	"testing"
-	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
@@ -94,7 +92,7 @@ func TestUniqueKeyDoor_AtOpen(t *testing.T) {
 		if !errors.As(err, &refusal) || !errors.Is(err, ir.ErrSourceUniqueKeyAbsent) {
 			t.Fatalf("got %v, want SOURCE-UNIQUE-KEY-ABSENT", err)
 		}
-		if !strings.Contains(err.Error(), "kd.kd_k (k)") || !strings.Contains(err.Error(), "nothing written after the DROP has been applied") {
+		if !strings.Contains(err.Error(), "kd.kd_k (k)") || !strings.Contains(err.Error(), "nothing written after it has been applied") {
 			t.Errorf("the refusal does not name the key or the live-source remedy: %v", err)
 		}
 		if !strings.Contains(err.Error(), "--accept-target-only-unique-key") {
@@ -118,7 +116,7 @@ func TestUniqueKeyDoor_AtOpen(t *testing.T) {
 		if err := s.phaseRefuseTargetOnlyUniqueKeys(context.Background(), nil, "s1"); err != nil {
 			t.Fatal(err)
 		}
-		if s.uniqueKeyDoor != nil {
+		if s.uniqueKeyDoor == nil || s.uniqueKeyDoor.periodic {
 			t.Error("a source that sees unique-key DDL live armed the mid-stream re-check")
 		}
 	})
@@ -181,7 +179,7 @@ func TestUniqueKeyDoor_AtOpen(t *testing.T) {
 		}
 		// The source drops kd_k mid-stream: the re-check refuses, mid-stream.
 		s.Source.(*ukDoorEngine).schemas["src-dsn"].Tables[0] = ukDoorTable("kd", pk)
-		refusal, err := s.uniqueKeyRecheck()(context.Background())
+		refusal, err := s.uniqueKeyChecksFor().periodic(context.Background())
 		if err != nil || refusal == nil || refusal.When != ir.UniqueKeyDoorMidStream {
 			t.Fatalf("re-check = %v, %v; want a mid-stream refusal", refusal, err)
 		}
@@ -208,91 +206,6 @@ func TestValidateAcceptedUniqueKeys(t *testing.T) {
 	}
 }
 
-// TestInterceptUniqueKeyRecheck pins the re-check's placement: only at a
-// transaction boundary, only once a period has passed, a refusal stopping
-// the stream before the change it precedes, a read failure not stopping it.
-func TestInterceptUniqueKeyRecheck(t *testing.T) {
-	// The intercept's goroutine reads the clock while the test advances it.
-	var clockNanos atomic.Int64
-	now := func() time.Time { return time.Unix(0, clockNanos.Load()) }
-	run := func(t *testing.T, changes []ir.Change, check func(context.Context) (*ir.SourceUniqueKeyAbsentError, error), advance []time.Duration) ([]ir.Change, error) {
-		t.Helper()
-		in := make(chan ir.Change)
-		var store atomic.Pointer[error]
-		out := interceptUniqueKeyRecheck(context.Background(), in, 10*time.Second, check, &store, now)
-		var got []ir.Change
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			for c := range out {
-				got = append(got, c)
-			}
-		}()
-		for i, c := range changes {
-			clockNanos.Add(int64(advance[i]))
-			select {
-			case in <- c:
-			case <-done:
-			}
-		}
-		close(in)
-		<-done
-		var err error
-		if p := store.Load(); p != nil {
-			err = *p
-		}
-		return got, err
-	}
-	begin, ins, commit := ir.TxBegin{}, ir.Insert{Table: "kd"}, ir.TxCommit{}
-
-	t.Run("a refusal at the next boundary stops the stream before that transaction", func(t *testing.T) {
-		checks := 0
-		got, err := run(t, []ir.Change{begin, ins, commit, begin, ins, commit},
-			func(context.Context) (*ir.SourceUniqueKeyAbsentError, error) {
-				checks++
-				return &ir.SourceUniqueKeyAbsentError{When: ir.UniqueKeyDoorMidStream}, nil
-			},
-			// The period elapses INSIDE the first transaction: no check there.
-			[]time.Duration{0, 11 * time.Second, 0, 0, 0, 0})
-		if checks != 1 || len(got) != 3 || !errors.Is(err, ir.ErrSourceUniqueKeyAbsent) {
-			t.Fatalf("checks=%d forwarded=%d err=%v; want one check at the second TxBegin, three forwarded, the refusal", checks, len(got), err)
-		}
-	})
-	t.Run("no check before a period has passed", func(t *testing.T) {
-		checks := 0
-		got, err := run(t, []ir.Change{begin, ins, commit},
-			func(context.Context) (*ir.SourceUniqueKeyAbsentError, error) { checks++; return nil, nil },
-			[]time.Duration{time.Second, 0, 0})
-		if checks != 0 || len(got) != 3 || err != nil {
-			t.Fatalf("checks=%d forwarded=%d err=%v", checks, len(got), err)
-		}
-	})
-	t.Run("a row change outside a transaction is a boundary", func(t *testing.T) {
-		checks := 0
-		_, _ = run(t, []ir.Change{ins},
-			func(context.Context) (*ir.SourceUniqueKeyAbsentError, error) { checks++; return nil, nil },
-			[]time.Duration{11 * time.Second})
-		if checks != 1 {
-			t.Fatalf("checks=%d, want 1", checks)
-		}
-	})
-	t.Run("a read failure does not stop the stream", func(t *testing.T) {
-		got, err := run(t, []ir.Change{begin, ins, commit},
-			func(context.Context) (*ir.SourceUniqueKeyAbsentError, error) { return nil, errors.New("catalog down") },
-			[]time.Duration{11 * time.Second, 0, 0})
-		if len(got) != 3 || err != nil {
-			t.Fatalf("forwarded=%d err=%v", len(got), err)
-		}
-	})
-	t.Run("nil check is a pass-through", func(t *testing.T) {
-		in := make(chan ir.Change)
-		var store atomic.Pointer[error]
-		if out := interceptUniqueKeyRecheck(context.Background(), in, time.Second, nil, &store, now); out != (<-chan ir.Change)(in) { //nolint:gocritic // typeUnparen: the conversion is what makes the comparison typecheck
-			t.Fatal("a stream with nothing to re-check grew a stage")
-		}
-	})
-}
-
 // TestSourceUniqueKeyAbsentError_Remedies pins each check's remedy text.
 func TestSourceUniqueKeyAbsentError_Remedies(t *testing.T) {
 	keys := []ir.AbsentUniqueKey{{Table: "kd", Key: "kd_k", Columns: "(k)"}}
@@ -303,7 +216,7 @@ func TestSourceUniqueKeyAbsentError_Remedies(t *testing.T) {
 	}{
 		{
 			"open, live source", &ir.SourceUniqueKeyAbsentError{Keys: keys, SourceSeesDDLLive: true},
-			[]string{"SOURCE-UNIQUE-KEY-ABSENT", "kd.kd_k (k)", "nothing written after the DROP has been applied", "DROP INDEX", "--stream-id", "--accept-target-only-unique-key"},
+			[]string{"SOURCE-UNIQUE-KEY-ABSENT", "kd.kd_k (k)", "nothing written after it has been applied", "DROP INDEX", "--stream-id", "--accept-target-only-unique-key"},
 		},
 		{
 			"open, no live DDL", &ir.SourceUniqueKeyAbsentError{Keys: keys},
@@ -338,15 +251,50 @@ func TestRefuseAddTableTargetOnlyUniqueKeys(t *testing.T) {
 	pk := ukDoorKey("PRIMARY", "id")
 	src := ukDoorTable("kd", pk)
 	precreated := map[string]*ir.Table{"kd": ukDoorTable("kd", pk, ukDoorKey("kd_k", "k"))}
-	err := refuseAddTableTargetOnlyUniqueKeys(src, precreated, nil)
+	err := refuseAddTableTargetOnlyUniqueKeys(src, precreated, "mysql", nil)
 	var refusal *ir.SourceUniqueKeyAbsentError
 	if !errors.As(err, &refusal) || refusal.When != ir.UniqueKeyDoorAddTable {
 		t.Fatalf("got %v, want the add-table refusal", err)
 	}
-	if err := refuseAddTableTargetOnlyUniqueKeys(src, precreated, []string{"kd.kd_k"}); err != nil {
+	if err := refuseAddTableTargetOnlyUniqueKeys(src, precreated, "mysql", []string{"kd.kd_k"}); err != nil {
 		t.Fatalf("an accepted key refused: %v", err)
 	}
-	if err := refuseAddTableTargetOnlyUniqueKeys(src, map[string]*ir.Table{}, nil); err != nil {
+	if err := refuseAddTableTargetOnlyUniqueKeys(src, map[string]*ir.Table{}, "mysql", nil); err != nil {
 		t.Fatalf("a table sluice will create refused: %v", err)
+	}
+}
+
+// TestUncoveredTargetKeys_TargetIndexNames pins H1 of the round-1 review: a
+// cross-dialect expression or partial key is matched by name, and a
+// Postgres target table-prefixes a secondary index name, so the source's
+// names are mapped to the target engine's spelling first. MySQL `users
+// UNIQUE KEY uniq_lower_email ((lower(email)))` lands on Postgres as
+// `users_uniq_lower_email`; a MySQL or SQLite target keeps the name.
+func TestUncoveredTargetKeys_TargetIndexNames(t *testing.T) {
+	expr := func(name, text, dialect string) *ir.Index {
+		return &ir.Index{Name: name, Unique: true, Columns: []ir.IndexColumn{{Expression: text, ExpressionDialect: dialect}}}
+	}
+	partial := func(name, pred, dialect string) *ir.Index {
+		return &ir.Index{Name: name, Unique: true, Columns: []ir.IndexColumn{{Column: "k"}}, Predicate: pred, PredicateDialect: dialect}
+	}
+	pk := ukDoorKey("PRIMARY", "id")
+	cells := []struct {
+		name, engine string
+		src, tgt     *ir.Index
+		wantRefused  bool
+	}{
+		{"mysql to postgres, expression", "postgres", expr("uniq_lower_email", "lower(`email`)", "mysql"), expr("users_uniq_lower_email", "lower((email)::text)", "postgres"), false},
+		{"sqlite to postgres, partial", "postgres", partial("uq_live", "deleted IS NULL", "sqlite"), partial("users_uq_live", "(deleted IS NULL)", "postgres"), false},
+		{"postgres to mysql keeps the name", "mysql", expr("uniq_lower_email", "lower((email)::text)", "postgres"), expr("uniq_lower_email", "lower(`email`)", "mysql"), false},
+		{"postgres target, unprefixed name on the target (renamed by hand)", "postgres", expr("uniq_lower_email", "lower(`email`)", "mysql"), expr("uniq_lower_email", "lower((email)::text)", "postgres"), true},
+		{"postgres target, another key entirely", "postgres", expr("uniq_lower_email", "lower(`email`)", "mysql"), expr("users_uniq_upper", "upper((email)::text)", "postgres"), true},
+	}
+	for _, c := range cells {
+		t.Run(c.name, func(t *testing.T) {
+			got := uncoveredTargetKeys(ukDoorTable("users", pk, c.src), ukDoorTable("users", pk, c.tgt), c.engine)
+			if (len(got) > 0) != c.wantRefused {
+				t.Errorf("uncovered = %v, want refused=%v", got, c.wantRefused)
+			}
+		})
 	}
 }
