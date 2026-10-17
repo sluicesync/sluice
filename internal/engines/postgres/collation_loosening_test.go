@@ -34,6 +34,11 @@ func TestCollationLoosening_Determinism(t *testing.T) {
 		{"bpchar nondeterministic", ir.Char{Length: 9, Collation: "ci", Determinism: non}, c | a | p, true},
 		{"determinism unknown", ir.Varchar{Length: 9}, 0, false},
 		{"bpchar determinism unknown", ir.Char{Length: 9}, 0, false},
+		{"citext extension type", ir.ExtensionType{Extension: "citext", Name: "citext"}, c, true},
+		{"citext verbatim, schema-qualified", ir.VerbatimType{Definition: "public.citext"}, c, true},
+		{"another verbatim type", ir.VerbatimType{Definition: "ltree"}, 0, false},
+		{"text array, deterministic", ir.Array{Element: ir.Text{Size: ir.TextLong, Determinism: det}}, 0, true},
+		{"citext array", ir.Array{Element: ir.ExtensionType{Extension: "citext", Name: "citext"}}, c, true},
 		{"not a character type", ir.Integer{Width: 32}, 0, false},
 	}
 	for _, tc := range cases {

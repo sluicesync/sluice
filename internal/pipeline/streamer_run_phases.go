@@ -1118,6 +1118,18 @@ func (s *Streamer) phaseWireInterceptChain(applyCtx context.Context, changes <-c
 	// so an out-of-scope change never reaches the schema-forward / delay /
 	// sync-lag stages or the applier.
 	filtered = interceptWhereFilter(applyCtx, filtered, s.whereFilter, &s.whereFilterErr)
+	// UNIQUE-KEY-STOPPED-WINDOW-DOOR, mid-stream. The periodic re-check (a
+	// source whose change stream carries no DDL) is a stage HERE, upstream
+	// of the schema intercepts: it holds whole transactions, and below them
+	// a held change would be applied after a DDL they had already run. The
+	// boundary check is not a stage at all — the schema intercept that
+	// handles a snapshot judges it after its DDL and before forwarding it
+	// (uniqueKeyBoundaryGate, which says why). A verbatim pass-through when
+	// the stream-open door armed nothing (unique_key_recheck.go).
+	uniqueKeys := s.uniqueKeyChecksFor()
+	uniqueKeyGate := newUniqueKeyBoundaryGate(uniqueKeys, &s.uniqueKeyRecheckErr)
+	uniqueKeys.boundary = nil
+	filtered = interceptUniqueKeyChecks(applyCtx, filtered, uniqueKeys, &s.uniqueKeyRecheckErr, time.Now)
 	// ADR-0054 Phase 2d: when live coordination is engaged, intercept
 	// SchemaSnapshot events to route through the lease + per-shape
 	// applier + probe before forwarding to the downstream applier.
@@ -1141,6 +1153,7 @@ func (s *Streamer) phaseWireInterceptChain(applyCtx context.Context, changes <-c
 	var shapeABackfill *schemaForwardBackfill
 	if s.boundaryRouter != nil {
 		s.boundaryRouter.firstBoundary = witness
+		s.boundaryRouter.uniqueKeys = uniqueKeyGate.hook()
 		shapeABackfill = s.addedColumnBackfill(streamID, s.shapeSourceSchemaReader)
 		// The lease holder's ALTER is preceded by the backfill's durable
 		// write-ahead record (schema_forward_backfill_ledger.go).
@@ -1176,6 +1189,7 @@ func (s *Streamer) phaseWireInterceptChain(applyCtx context.Context, changes <-c
 				targetEngineName: s.Target.Name(),
 				normalizer:       snapshotNormalizer,
 				witness:          witness,
+				uniqueKeys:       uniqueKeyGate.hook(),
 			}
 			if s.addColumnForwardSchemaReader != nil {
 				deps.defaultProber = newSourceDefaultProber(s.addColumnForwardSchemaReader)
@@ -1197,6 +1211,7 @@ func (s *Streamer) phaseWireInterceptChain(applyCtx context.Context, changes <-c
 		orderer, _ := s.Source.(ir.PositionOrderer)
 		filtered = interceptSchemaChangeRefuse(applyCtx, filtered, s.ambiguousAckDeps(unforwardedBoundaryDeps{
 			witnessFor:    s.unforwardedBoundaryWitnesses(witness),
+			uniqueKeys:    uniqueKeyGate.hook(),
 			normalizer:    snapshotNormalizer,
 			why:           s.unforwardedStreamReason(),
 			forwardRemedy: s.unforwardedForwardRemedy(),
@@ -1223,13 +1238,6 @@ func (s *Streamer) phaseWireInterceptChain(applyCtx context.Context, changes <-c
 	s.coldStartSeedSnapshots = nil
 	s.unforwardedColdStartPrior = nil
 	s.firstBoundaryRetained = nil
-	// UNIQUE-KEY-STOPPED-WINDOW-DOOR, mid-stream: after the schema-forward
-	// intercepts, so a forwarded ALTER is on the target when its boundary
-	// passes (a forwarded DROP COLUMN can narrow a MySQL-family key), and
-	// the periodic re-check on a source whose change stream carries no DDL.
-	// A verbatim pass-through when the stream-open door armed nothing
-	// (unique_key_recheck.go).
-	filtered = interceptUniqueKeyChecks(applyCtx, filtered, s.uniqueKeyChecksFor(), &s.uniqueKeyRecheckErr, time.Now)
 	// Roadmap item 46 (ADR-0121): the delayed-replica gate. When
 	// --apply-delay is set, hold each change until its source commit
 	// timestamp + delay has elapsed before forwarding it to the applier (the

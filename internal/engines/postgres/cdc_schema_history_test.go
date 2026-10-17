@@ -40,14 +40,14 @@ func pgRelV1() *relationCacheEntry {
 // NOT write a new schema-history version.
 func TestPGSchemaHistory_TrueDelta_NoOpReEmit(t *testing.T) {
 	r := &CDCReader{schema: "public", slotName: "s"}
-	sig := map[uint32]ir.SchemaSignature{}
+	sig := map[uint32]relationSnapshotSig{}
 	out := make(chan ir.Change, 16)
 
-	if err := r.maybeSnapshotSchema(context.Background(), pgRelV1(), 100, pglogrepl.LSN(0x10), sig, out); err != nil {
+	if err := r.maybeSnapshotSchema(context.Background(), pgRelV1(), 100, pglogrepl.LSN(0x10), false, sig, out); err != nil {
 		t.Fatalf("first relation: %v", err)
 	}
 	// Identical relation re-emit at a later LSN (reconnect).
-	if err := r.maybeSnapshotSchema(context.Background(), pgRelV1(), 100, pglogrepl.LSN(0x99), sig, out); err != nil {
+	if err := r.maybeSnapshotSchema(context.Background(), pgRelV1(), 100, pglogrepl.LSN(0x99), false, sig, out); err != nil {
 		t.Fatalf("re-emit relation: %v", err)
 	}
 	snaps := collectPGSnapshots(out)
@@ -62,15 +62,15 @@ func TestPGSchemaHistory_TrueDelta_NoOpReEmit(t *testing.T) {
 // later row's LSN (locked decision #4c).
 func TestPGSchemaHistory_TrueDelta_RealAlter(t *testing.T) {
 	r := &CDCReader{schema: "public", slotName: "s"}
-	sig := map[uint32]ir.SchemaSignature{}
+	sig := map[uint32]relationSnapshotSig{}
 	out := make(chan ir.Change, 16)
 
-	_ = r.maybeSnapshotSchema(context.Background(), pgRelV1(), 100, pglogrepl.LSN(0x10), sig, out)
+	_ = r.maybeSnapshotSchema(context.Background(), pgRelV1(), 100, pglogrepl.LSN(0x10), false, sig, out)
 
 	v2 := pgRelV1()
 	v2.Columns = append(v2.Columns, relationColumn{Name: "country", OID: 1043, Type: ir.Varchar{Length: 2}})
 	const ddlLSN = pglogrepl.LSN(0x4242)
-	if err := r.maybeSnapshotSchema(context.Background(), v2, 100, ddlLSN, sig, out); err != nil {
+	if err := r.maybeSnapshotSchema(context.Background(), v2, 100, ddlLSN, false, sig, out); err != nil {
 		t.Fatalf("post-ALTER relation: %v", err)
 	}
 
@@ -97,11 +97,11 @@ func TestPGSchemaHistory_TrueDelta_RealAlter(t *testing.T) {
 // rel.Schema != r.schema gate).
 func TestPGSchemaHistory_OutOfScopeSchemaSkipped(t *testing.T) {
 	r := &CDCReader{schema: "public", slotName: "s"}
-	sig := map[uint32]ir.SchemaSignature{}
+	sig := map[uint32]relationSnapshotSig{}
 	out := make(chan ir.Change, 4)
 	rel := pgRelV1()
 	rel.Schema = "other_schema"
-	if err := r.maybeSnapshotSchema(context.Background(), rel, 7, pglogrepl.LSN(1), sig, out); err != nil {
+	if err := r.maybeSnapshotSchema(context.Background(), rel, 7, pglogrepl.LSN(1), false, sig, out); err != nil {
 		t.Fatalf("out-of-scope relation: %v", err)
 	}
 	if got := len(collectPGSnapshots(out)); got != 0 {
@@ -116,12 +116,12 @@ func TestPGSchemaHistory_OutOfScopeSchemaSkipped(t *testing.T) {
 func TestPGSchemaHistory_MultiSchemaEverySelectedSchemaHasBoundaries(t *testing.T) {
 	selected := map[string]bool{"sales": true, "billing": true}
 	r := &CDCReader{schema: "public", slotName: "s", cdcSchemaInScope: func(s string) bool { return selected[s] }}
-	sig := map[uint32]ir.SchemaSignature{}
+	sig := map[uint32]relationSnapshotSig{}
 	out := make(chan ir.Change, 8)
 	for i, schema := range []string{"sales", "billing", "unselected"} {
 		rel := pgRelV1()
 		rel.Schema = schema
-		if err := r.maybeSnapshotSchema(context.Background(), rel, uint32(10+i), pglogrepl.LSN(1), sig, out); err != nil {
+		if err := r.maybeSnapshotSchema(context.Background(), rel, uint32(10+i), pglogrepl.LSN(1), false, sig, out); err != nil {
 			t.Fatalf("%s relation: %v", schema, err)
 		}
 	}
@@ -132,5 +132,42 @@ func TestPGSchemaHistory_MultiSchemaEverySelectedSchemaHasBoundaries(t *testing.
 	}
 	if len(snaps) != 2 || !got["sales"] || !got["billing"] {
 		t.Errorf("boundaries for %v (%d), want exactly sales and billing", got, len(snaps))
+	}
+}
+
+// TestPGSchemaHistory_StableIDAndUniqueKeysMoved pins the round-3 dedupe:
+// a column dropped and re-added under its name and type (same decode
+// signature, a new attnum) is a version, a re-emit with the same attnums is
+// not, and a Relation whose grade reported a unique key lost with a column
+// is emitted with UniqueKeysMoved even when nothing else changed.
+func TestPGSchemaHistory_StableIDAndUniqueKeysMoved(t *testing.T) {
+	r := &CDCReader{schema: "public", slotName: "s"}
+	sig := map[uint32]relationSnapshotSig{}
+	out := make(chan ir.Change, 16)
+	rel := func(emailAttnum int) *relationCacheEntry {
+		e := pgRelV1()
+		e.Columns[0].StableID, e.Columns[1].StableID = 1, emailAttnum
+		return e
+	}
+	steps := []struct {
+		rel   *relationCacheEntry
+		moved bool
+	}{
+		{rel(2), false}, // first: a version
+		{rel(2), false}, // re-emit: none
+		{rel(3), false}, // email dropped and re-added: a version
+		{rel(3), true},  // a key lost with a generated column: a flagged version
+	}
+	for i, step := range steps {
+		if err := r.maybeSnapshotSchema(context.Background(), step.rel, 100, pglogrepl.LSN(0x10+i), step.moved, sig, out); err != nil {
+			t.Fatal(err)
+		}
+	}
+	snaps := collectPGSnapshots(out)
+	if len(snaps) != 3 {
+		t.Fatalf("want 3 versions, got %d", len(snaps))
+	}
+	if snaps[1].UniqueKeysMoved || !snaps[2].UniqueKeysMoved {
+		t.Fatalf("UniqueKeysMoved = %v, %v; want only the flagged one", snaps[1].UniqueKeysMoved, snaps[2].UniqueKeysMoved)
 	}
 }

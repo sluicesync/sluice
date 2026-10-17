@@ -1058,7 +1058,7 @@ func (r *CDCReader) pump(ctx context.Context, conn *pgconn.PgConn, startLSN pglo
 	// *without* any DDL; a new schema-history version is written ONLY
 	// when the projected (column-name, ordered-type) signature differs
 	// from the one already snapshotted for that OID.
-	snapshotSig := map[uint32]ir.SchemaSignature{}
+	snapshotSig := map[uint32]relationSnapshotSig{}
 	streamedLSN := startLSN
 	currentTxnLSN := startLSN
 	// currentTxnStartLSN is the WAL position of the BEGIN record for
@@ -1239,7 +1239,7 @@ func (r *CDCReader) dispatchWAL(
 	ctx context.Context,
 	xld pglogrepl.XLogData,
 	relations map[uint32]*relationCacheEntry,
-	snapshotSig map[uint32]ir.SchemaSignature,
+	snapshotSig map[uint32]relationSnapshotSig,
 	currentTxnLSN *pglogrepl.LSN,
 	currentTxnStartLSN *pglogrepl.LSN,
 	currentTxnCommitTime *time.Time,
@@ -1278,7 +1278,8 @@ func (r *CDCReader) dispatchWAL(
 		if err := r.gradeRelationSchemaRace(relations, m.RelationID, entry); err != nil {
 			return withPreAlterReplayWedge(err, relations[m.RelationID], *currentTxnLSN, r.slotName)
 		}
-		if err := r.gradeUnforwardedClasses(ctx, m.RelationID, entry); err != nil {
+		keysMoved, err := r.gradeUnforwardedClasses(ctx, m.RelationID, entry)
+		if err != nil {
 			return err
 		}
 		// Replace the cache entry with the new shape so subsequent DML on
@@ -1296,7 +1297,7 @@ func (r *CDCReader) dispatchWAL(
 			slog.String("wal_start", xld.WALStart.String()),
 			slog.String("server_wal_end", xld.ServerWALEnd.String()),
 		)
-		return r.maybeSnapshotSchema(ctx, entry, m.RelationID, xld.WALStart, snapshotSig, out)
+		return r.maybeSnapshotSchema(ctx, entry, m.RelationID, xld.WALStart, keysMoved, snapshotSig, out)
 
 	case *pglogrepl.RelationMessage:
 		if err := r.ensureRelationTypeOIDs(ctx, m.Columns); err != nil {
@@ -1321,7 +1322,8 @@ func (r *CDCReader) dispatchWAL(
 		if err := r.gradeRelationSchemaRace(relations, m.RelationID, entry); err != nil {
 			return withPreAlterReplayWedge(err, relations[m.RelationID], *currentTxnLSN, r.slotName)
 		}
-		if err := r.gradeUnforwardedClasses(ctx, m.RelationID, entry); err != nil {
+		keysMoved, err := r.gradeUnforwardedClasses(ctx, m.RelationID, entry)
+		if err != nil {
 			return err
 		}
 		// Replace the cache entry with the new shape so subsequent DML on
@@ -1336,7 +1338,7 @@ func (r *CDCReader) dispatchWAL(
 			slog.String("wal_start", xld.WALStart.String()),
 			slog.String("server_wal_end", xld.ServerWALEnd.String()),
 		)
-		return r.maybeSnapshotSchema(ctx, entry, m.RelationID, xld.WALStart, snapshotSig, out)
+		return r.maybeSnapshotSchema(ctx, entry, m.RelationID, xld.WALStart, keysMoved, snapshotSig, out)
 
 	case *pglogrepl.BeginMessage:
 		r.decodingXid = m.Xid
@@ -2236,15 +2238,16 @@ func (r *CDCReader) maybeSnapshotSchema(
 	rel *relationCacheEntry,
 	relID uint32,
 	relLSN pglogrepl.LSN,
-	snapshotSig map[uint32]ir.SchemaSignature,
+	uniqueKeysMoved bool,
+	snapshotSig map[uint32]relationSnapshotSig,
 	out chan<- ir.Change,
 ) error {
 	if !r.schemaInScope(rel.Schema) {
 		return nil // out-of-scope schema; no schema-history row to host
 	}
 	tbl := projectRelation(rel)
-	sig := ir.SchemaSignatureOf(tbl)
-	if prev, ok := snapshotSig[relID]; ok && prev.Equal(sig) {
+	sig := relationSnapshotSig{decode: ir.SchemaSignatureOf(tbl), ids: stableIDList(tbl)}
+	if prev, ok := snapshotSig[relID]; ok && prev.equal(sig) && !uniqueKeysMoved {
 		// No-op Relation re-emit (reconnect / first-touch with no
 		// DDL): not a true delta — do NOT write a new version.
 		return nil
@@ -2254,15 +2257,47 @@ func (r *CDCReader) maybeSnapshotSchema(
 		return err
 	}
 	if err := r.send(ctx, out, ir.SchemaSnapshot{
-		Position: pos,
-		Schema:   rel.Schema,
-		Table:    rel.Name,
-		IR:       tbl,
+		Position:        pos,
+		Schema:          rel.Schema,
+		Table:           rel.Name,
+		IR:              tbl,
+		UniqueKeysMoved: uniqueKeysMoved,
 	}); err != nil {
 		return err
 	}
 	snapshotSig[relID] = sig
 	return nil
+}
+
+// relationSnapshotSig is what [CDCReader.maybeSnapshotSchema] dedupes a
+// RelationMessage on: the ADR-0049 decode signature (names and ordered IR
+// types) AND each column's attnum. The attnums are the round-3 review's
+// addition (GC-44 F22's own fix shape): a column dropped and re-added under
+// the same name and type keeps the decode signature and changes only its
+// attnum, and without a boundary for it the pipeline's unique-key compare
+// never ran while the target kept a key on the dropped column. A re-sent
+// Relation with no DDL (reconnect, first touch) keeps both, so it is still
+// no version. The attnums are reader-local: the history codec does not
+// persist stable ids.
+type relationSnapshotSig struct {
+	decode ir.SchemaSignature
+	ids    string
+}
+
+func (s relationSnapshotSig) equal(o relationSnapshotSig) bool {
+	return s.ids == o.ids && s.decode.Equal(o.decode)
+}
+
+// stableIDList renders a projected table's attnums in column order.
+func stableIDList(t *ir.Table) string {
+	var b strings.Builder
+	for _, c := range t.Columns {
+		if c != nil {
+			b.WriteString(strconv.Itoa(c.StableID))
+		}
+		b.WriteByte(',')
+	}
+	return b.String()
 }
 
 // ensureRelationTypeOIDs resolves the dynamic-OID metadata a RelationMessage's

@@ -20,8 +20,10 @@ import (
 // conflict-identity guard (UNIQUE-KEY-CONFLICT-OTHER-ROW) cannot see every
 // such merge — not on a table with no primary key and one unique key, nor
 // between rows that differ only in a NULL or partial-index column — so the
-// stream compares the two catalogs instead: at every stream open, after a
-// schema change it forwards, and periodically on a source whose change
+// stream compares the two catalogs instead: at every stream open, at a
+// source schema boundary that moves the table's columns or loses a unique key
+// with a column (forwarded to the target or not), and periodically on a
+// source whose change
 // stream carries no DDL.
 //
 // The comparison is a pure function of the two catalogs, so a restart reads
@@ -45,6 +47,8 @@ const (
 	// is copied or handed to the stream.
 	UniqueKeyDoorAddTable
 	// UniqueKeyDoorAtSchemaChange is the check at a source schema boundary
+	// that loses a unique key with a column (the reader reports it,
+	// [SchemaSnapshot.UniqueKeysMoved]) or
 	// whose column list differs from the table's previous one — the open
 	// door's read for the table's first boundary of the run (round-2 review
 	// HIGH-1) — run after the schema-forward intercepts, whether or not they
@@ -190,13 +194,15 @@ func (e *SourceUniqueKeyAbsentError) remedy() string {
 	}
 	if e.SourceSeesDDLLive {
 		return "Refusing at stream open, before any change of this run is applied. This source's change stream " +
-			"refuses a unique-key DROP it reads, and this release checks the target's keys after every schema change " +
-			"it forwards, so when this release was streaming across the change, a dropped key was dropped while no " +
-			"stream was reading (or the target was created with the key) and nothing written after it has been " +
-			"applied: " + sourceUniqueKeyDropClause + ". If an earlier sluice was streaming across it, rows may already " +
-			"have merged — v0.161.0 and earlier did not see a Postgres plain unique index's DROP, and no release through " +
-			"v0.161.1 checked the target's keys at a DROP COLUMN of a key column; then " + e.recopy() + " " +
-			sourceUniqueKeyAcceptClause
+			"refuses a unique-key DROP it reads, and this release also checks the target's keys at every schema " +
+			"change that moves a table's columns or loses a unique key with a column, forwarded or not. So if THIS " +
+			"release was the one streaming whenever the key could have been dropped, it was dropped while no stream " +
+			"was reading (or the target was created with the key) and nothing written after it has been applied: " +
+			sourceUniqueKeyDropClause + ". That does not hold for a window an earlier sluice streamed across, where " +
+			"rows may already have merged: v0.161.0 and earlier did not see a Postgres plain unique index's DROP, and " +
+			"no release through v0.161.1 checked the target's keys at a DROP COLUMN of a key column (including a " +
+			"dropped generated key column, and a key column dropped and re-added under its name); then " + e.recopy() +
+			" " + sourceUniqueKeyAcceptClause
 	}
 	return "Refusing at stream open, before any change of this run is applied. This source's change stream carries " +
 		"no DDL, so if the source dropped the key while a stream was RUNNING, changes written after the DROP may already " +

@@ -49,6 +49,10 @@ import (
 // snapshot (the source CDC reader emits snapshots one at a time per
 // table).
 type BoundaryRouter struct {
+	// uniqueKeys judges each snapshot after its ALTER and before the Shape-A
+	// intercept forwards it ([uniqueKeyBoundaryGate]); nil judges nothing.
+	uniqueKeys uniqueKeyBoundaryHook
+
 	mgr     *LeaseManager
 	applier ir.ShapeDeltaApplier
 	prober  ShardConsolidationProber

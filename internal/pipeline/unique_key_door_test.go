@@ -364,7 +364,14 @@ func TestKeyColumnWeakening_Eligibility(t *testing.T) {
 		{"mysql bin -> postgres ci", eng("mysql"), eng("postgres"), "bin", "ci", true},
 		{"mysql bin -> postgres-trigger ci", eng("mysql"), eng("postgres-trigger"), "bin", "ci", true},
 		{"postgres bin -> mysql ci: withheld", eng("postgres"), eng("mysql"), "bin", "ci", false},
-		{"unclassified target column", eng("mysql"), eng("mysql"), "bin", "unknown", false},
+		// An unclassified collation (round-3 review LOW): looser unless the
+		// names match or the target is known to fold nothing; not judged
+		// across families, whose names are not comparable.
+		{"unclassified target column, another name", eng("mysql"), eng("mysql"), "bin", "unknown", true},
+		{"unclassified source column, another name", eng("mysql"), eng("mysql"), "unknown", "ci", true},
+		{"unclassified on both sides, the same name", eng("mysql"), eng("mysql"), "unknown", "unknown", false},
+		{"unclassified source, target folds nothing", eng("mysql"), eng("mysql"), "unknown", "bin", false},
+		{"unclassified across families", eng("mysql"), eng("postgres"), "bin", "unknown", false},
 		{"no resolver", stubEngine{}, eng("mysql"), "bin", "ci", false},
 	}
 	for _, c := range cases {

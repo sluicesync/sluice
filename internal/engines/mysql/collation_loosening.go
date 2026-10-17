@@ -24,8 +24,10 @@ import (
 //     and `'a '` are one stored value even under a NO PAD collation (a MySQL
 //     8 CHAR key against a Postgres bpchar target is not a weakening).
 //
-// ok is false for a non-character type or one with no recorded collation:
-// the stream's unique-key door then has nothing to compare. Every faithful
+// ok is false for a non-character type, one with no recorded collation, or
+// a name whose axes are not all named ([collationAxesNamed]):
+// the stream's unique-key door then compares the collation NAMES, and a
+// differing name counts as looser. Every faithful
 // cross-flavor translation keeps the axes (MySQL 8 → MariaDB maps 0900_ai_ci
 // to uca1400_nopad_ai_ci and 0900_bin to nopad_bin, flavor_mariadb.go).
 func (Engine) CollationLoosening(t ir.Type) (ir.CollationLoosening, bool) {
@@ -51,6 +53,9 @@ func (Engine) CollationLoosening(t ir.Type) (ir.CollationLoosening, bool) {
 	if collationByteExactMySQL(lc) {
 		return l, true
 	}
+	if !collationAxesNamed(lc) {
+		return 0, false
+	}
 	switch {
 	case strings.Contains(lc, "_ai"):
 		l |= ir.LooseAccent
@@ -61,4 +66,24 @@ func (Engine) CollationLoosening(t ir.Type) (ir.CollationLoosening, bool) {
 		l |= ir.LooseCase
 	}
 	return l, true
+}
+
+// collationAxesNamed reports a collation name whose tokens state its case
+// and accent behaviour (`_ci` or `_cs`), with no token naming an axis this
+// classification does not model: kana sensitivity (`_ks` — a `_ja_…_as_cs`
+// collation folds hiragana and katakana, its `_ks` twin does not) or a
+// MariaDB weight-level suffix (`utf8mb4_thai_520_w2`). Anything else is
+// UNKNOWN (ok=false), which the stream's unique-key door treats as looser
+// than any source collation of another name: the conservative direction is
+// the loud one (round-3 review LOW).
+func collationAxesNamed(lc string) bool {
+	if strings.Contains(lc, "_ks") {
+		return false
+	}
+	for _, part := range strings.Split(lc, "_") {
+		if len(part) == 2 && part[0] == 'w' && part[1] >= '0' && part[1] <= '9' {
+			return false
+		}
+	}
+	return strings.Contains(lc, "_ci") || strings.Contains(lc, "_cs")
 }

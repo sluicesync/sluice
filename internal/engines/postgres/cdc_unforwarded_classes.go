@@ -55,7 +55,10 @@ import (
 //     CONSTRAINT added alongside it is NOT exempt — that is the sharp
 //     shape above.
 //   - a constraint that disappears because a column it keys on is gone:
-//     the target's own DROP COLUMN removes it too.
+//     the target's own DROP COLUMN removes it too WHEN the DROP is
+//     forwarded. For a PRIMARY KEY, UNIQUE constraint or unique index that
+//     premise is not trusted: the drop is handed to the pipeline's
+//     source↔target unique-key compare instead ([uniqueKeysLostWithColumn]).
 //   - a PRIMARY KEY, UNIQUE or EXCLUDE whose definition text changed
 //     because a column it keys on was renamed or re-typed: the rename/type
 //     change itself is classified (and forwarded or refused) by the
@@ -525,8 +528,10 @@ func diffRelationFacts(prior, cur *pgRelationFacts) []string {
 	// Plain UNIQUE indexes: the same rules as a constraint, with a rename of a
 	// key column explaining nothing (the comparison is attnum-based) and a
 	// retype of a key column explaining a change (its rebuild can alter the
-	// expression tree). A DROP whose column is gone is the target's own DROP
-	// COLUMN's cascade.
+	// expression tree). A DROP whose column is gone is handed to the
+	// pipeline's unique-key compare ([uniqueKeysLostWithColumn]) rather than
+	// refused here: when the DROP COLUMN was forwarded, the target's own DROP
+	// COLUMN cascades to the key and the compare passes.
 	// An ALTER INDEX … RENAME is no change: an index that left under one name
 	// and arrived under another with the identical structure is paired off
 	// (only when the structure is unique among the moved indexes, so two
@@ -579,6 +584,48 @@ func diffRelationFacts(prior, cur *pgRelationFacts) []string {
 		}
 	}
 	return deltas
+}
+
+// uniqueKeysLostWithColumn names the unique keys — plain unique indexes and
+// PRIMARY KEY / UNIQUE constraints — that [diffRelationFacts] exempts as
+// lost with a dropped column. That exemption rests on the target's own DROP
+// COLUMN removing the key too, which holds only when the DROP is forwarded,
+// and three shapes forward none (round-3 review): a dropped GENERATED column
+// (pgoutput's RelationMessage omits generated columns, so the projection
+// never changes); a column dropped and re-added under the same name and type
+// (the projection is unchanged but for the attnum); and any DROP COLUMN at
+// the first boundary after a cold start (ADR-0091 §3). A merge through the
+// key the target kept followed at exit 0. So these drops are not exempt
+// from judgement, only from THIS door: the reader hands them to the
+// pipeline's source↔target unique-key compare
+// ([ir.SchemaSnapshot.UniqueKeysMoved]), which passes a key the target did
+// drop and refuses one it kept.
+func uniqueKeysLostWithColumn(prior, cur *pgRelationFacts) []string {
+	if prior == nil || cur == nil {
+		return nil
+	}
+	lost := func(attnums []int16) bool {
+		for _, a := range attnums {
+			if _, ok := cur.columns[a]; a != 0 && !ok {
+				return true
+			}
+		}
+		return false
+	}
+	var out []string
+	for _, name := range sortedFactKeys(prior.constraints) {
+		pc := prior.constraints[name]
+		if _, ok := cur.constraints[name]; !ok && (pc.kind == "p" || pc.kind == "u") && lost(pc.attnums) {
+			out = append(out, name)
+		}
+	}
+	renamed := renamedUniqueIndexes(prior.uniqueIndexes, cur.uniqueIndexes)
+	for _, name := range sortedFactKeys(prior.uniqueIndexes) {
+		if _, ok := cur.uniqueIndexes[name]; !ok && !renamed[name] && lost(prior.uniqueIndexes[name].attnums) {
+			out = append(out, name)
+		}
+	}
+	return out
 }
 
 // renamedUniqueIndexes pairs a unique index present only in prior with one
@@ -730,31 +777,35 @@ func (r *CDCReader) captureUnforwardedBaseline(ctx context.Context) error {
 // relation with no baseline (created after StreamChanges) is baselined
 // here; a relation that passes is re-baselined so an exempt change (a
 // forwarded DROP COLUMN's cascade) is not re-diffed at the next boundary.
-func (r *CDCReader) gradeUnforwardedClasses(ctx context.Context, relationID uint32, entry *relationCacheEntry) error {
+//
+// uniqueKeysMoved reports a unique key the relation lost with a dropped
+// column ([uniqueKeysLostWithColumn]): the caller hands it on to the
+// pipeline's unique-key compare.
+func (r *CDCReader) gradeUnforwardedClasses(ctx context.Context, relationID uint32, entry *relationCacheEntry) (uniqueKeysMoved bool, err error) {
 	r.unforwarded.mu.Lock()
 	armed := r.unforwarded.facts != nil
 	prior := r.unforwarded.facts[relationID]
 	r.unforwarded.mu.Unlock()
 	if !armed || r.db == nil || !r.relationInScope(entry.Schema, entry.Name) {
-		return nil
+		return false, nil
 	}
 	facts, err := readRelationFacts(ctx, r.db, relationID)
 	if err != nil {
-		return fmt.Errorf("postgres: cdc: relation %s.%s: read the schema objects logical replication does not carry: %w", entry.Schema, entry.Name, err)
+		return false, fmt.Errorf("postgres: cdc: relation %s.%s: read the schema objects logical replication does not carry: %w", entry.Schema, entry.Name, err)
 	}
 	cur := facts[relationID]
 	if cur == nil {
-		return nil // dropped since the message was written; the DML path owns that
+		return false, nil // dropped since the message was written; the DML path owns that
 	}
 	if prior != nil {
 		if deltas := diffRelationFacts(prior, cur); len(deltas) > 0 {
-			return &terminalPGError{err: unforwardedChangeError(entry.Schema, entry.Name, deltas)}
+			return false, &terminalPGError{err: unforwardedChangeError(entry.Schema, entry.Name, deltas)}
 		}
 	}
 	r.unforwarded.mu.Lock()
 	r.unforwarded.facts[relationID] = cur
 	r.unforwarded.mu.Unlock()
-	return nil
+	return len(uniqueKeysLostWithColumn(prior, cur)) > 0, nil
 }
 
 func unforwardedChangeError(schema, table string, deltas []string) error {

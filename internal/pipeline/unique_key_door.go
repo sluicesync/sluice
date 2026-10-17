@@ -62,8 +62,13 @@ package pipeline
 //     compared with the column list this door read at open (pgoutput sends
 //     a snapshot at each table's first Relation of a session, so a DROP
 //     COLUMN made before the table's first change arrives as that first
-//     boundary; round-2 review HIGH-1). A catalog read that fails there
-//     stops the stream (restartable) rather than pass the boundary unjudged.
+//     boundary; round-2 review HIGH-1). Column lists compare with their
+//     Postgres attnums, so a column dropped and re-added under its name is a
+//     move, and a boundary whose reader reports a unique key lost with a
+//     column ([ir.SchemaSnapshot.UniqueKeysMoved]) is checked even when no
+//     list moved: a dropped GENERATED column is not in a pgoutput column list
+//     at all (round-3 review). A catalog read that fails there stops the
+//     stream (restartable) rather than pass the boundary unjudged.
 //
 // Tables live-added while the stream runs (ADR-0034) join the re-check only
 // at the next start; `schema add-table` judged a pre-created one before
@@ -172,9 +177,14 @@ type uniqueKeyDoorState struct {
 }
 
 // uniqueKeyColsKey keys a table's column list by source namespace ("" on a
-// single-namespace stream) and folded table name.
+// single-namespace stream; folded) and table name, NOT folded: the open
+// door's read and the change stream name a table from one server, so its
+// case agrees, and folding would let `Users` and `users` (a Postgres source
+// may hold both) share one baseline (round-3 review LOW). A name the two
+// reads spell differently only loses its seed, so its first snapshot is not
+// compared: the behaviour before the seed existed.
 func uniqueKeyColsKey(namespace, table string) string {
-	return strings.ToLower(namespace) + "\x00" + strings.ToLower(table)
+	return strings.ToLower(namespace) + "\x00" + table
 }
 
 // sourceSeesUniqueKeyDDLLive reports a source whose change stream refuses a
@@ -352,6 +362,44 @@ type uniqueKeyCompare struct {
 	// collations arms the collation direction ([keyColumnWeakening]); see
 	// [Streamer.uniqueKeyCollationsArmed].
 	collations bool
+	// positionCols, at a boundary check, is the boundary snapshot's column
+	// names (folded): the source table's columns AT THE STREAM'S POSITION.
+	// The source catalog is read now, and may already be past that position
+	// (round-3 review, measured: a DROP COLUMN run right after the boundary
+	// being judged). A target key on a column the snapshot still has but the
+	// catalog no longer does is therefore a DROP COLUMN the stream has not
+	// reached, not a key the source dropped: it is deferred, and judged at
+	// that DROP's own boundary, which the gate is guaranteed to see because
+	// the column leaves the change stream's column list there.
+	positionCols map[string]bool
+}
+
+// snapshotColumnNames folds a boundary snapshot's column names.
+func snapshotColumnNames(t *ir.Table) map[string]bool {
+	out := map[string]bool{}
+	if t == nil {
+		return out
+	}
+	for _, c := range t.Columns {
+		if c != nil {
+			out[strings.ToLower(c.Name)] = true
+		}
+	}
+	return out
+}
+
+// pendingDrop reports a key with a plain part on a column the stream's
+// position still has and the source catalog does not ([uniqueKeyCompare.positionCols]).
+func pendingDrop(key *ir.Index, source *ir.Table, positionCols map[string]bool) bool {
+	if len(positionCols) == 0 {
+		return false
+	}
+	for _, p := range key.Columns {
+		if p.Expression == "" && positionCols[strings.ToLower(p.Column)] && columnNamed(source, p.Column) == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // compareUniqueKeys reads both catalogs for every scope and returns the
@@ -421,7 +469,7 @@ func (s *Streamer) compareUniqueKeys(ctx context.Context, scopes []uniqueKeyDoor
 			}
 			weakened := weakening(st, tt)
 			for _, key := range uncoveredTargetKeys(st, tt, s.Target.Name(), weakened) {
-				if accept.allows(sc.namespace, tt.Name, key.Name) || accept.allows(sc.targetNamespace, tt.Name, key.Name) {
+				if pendingDrop(key, st, req.positionCols) || accept.allows(sc.namespace, tt.Name, key.Name) || accept.allows(sc.targetNamespace, tt.Name, key.Name) {
 					continue
 				}
 				table := tt.Name
@@ -531,14 +579,26 @@ func (s *Streamer) readUniqueKeyDoorTarget(ctx context.Context, sc uniqueKeyDoor
 // compares. A reader without the surface (every engine but Postgres) leaves
 // the tables as read.
 func applyUniqueKeyFacts(ctx context.Context, reader any, schema *ir.Schema) error {
-	fr, ok := reader.(ir.UniqueKeyFactReader)
-	if !ok {
-		return nil
-	}
-	facts, err := fr.UniqueKeyFacts(ctx)
+	facts, err := readUniqueKeyFacts(ctx, reader)
 	if err != nil {
 		return err
 	}
+	foldUniqueKeyFacts(facts, schema)
+	return nil
+}
+
+// readUniqueKeyFacts is the fetch half of [applyUniqueKeyFacts]: nil for a
+// reader without the surface.
+func readUniqueKeyFacts(ctx context.Context, reader any) (map[string]map[string]ir.UniqueKeyFact, error) {
+	fr, ok := reader.(ir.UniqueKeyFactReader)
+	if !ok {
+		return nil, nil
+	}
+	return fr.UniqueKeyFacts(ctx)
+}
+
+// foldUniqueKeyFacts is the fold half of [applyUniqueKeyFacts], in place.
+func foldUniqueKeyFacts(facts map[string]map[string]ir.UniqueKeyFact, schema *ir.Schema) {
 	for _, t := range schema.Tables {
 		if t == nil || facts[t.Name] == nil {
 			continue
@@ -577,7 +637,27 @@ func applyUniqueKeyFacts(ctx context.Context, reader any, schema *ir.Schema) err
 		}
 		addUnlistedUniqueKeys(t, tf)
 	}
-	return nil
+}
+
+// cloneTableKeys copies t deeply enough for [foldUniqueKeyFacts] to change
+// its keys without touching t: add-table folds facts into the table it is
+// about to CREATE, whose keys must stay as read.
+func cloneTableKeys(t *ir.Table) *ir.Table {
+	cp := *t
+	cloneIndex := func(idx *ir.Index) *ir.Index {
+		if idx == nil {
+			return nil
+		}
+		c := *idx
+		c.Columns = append([]ir.IndexColumn(nil), idx.Columns...)
+		return &c
+	}
+	cp.PrimaryKey = cloneIndex(t.PrimaryKey)
+	cp.Indexes = make([]*ir.Index, len(t.Indexes))
+	for i, idx := range t.Indexes {
+		cp.Indexes[i] = cloneIndex(idx)
+	}
+	return &cp
 }
 
 // addUnlistedUniqueKeys adds to t every enforcing unique index the facts
@@ -691,6 +771,7 @@ func keyColumnWeakening(source, target ir.Engine, st, tt *ir.Table) func(sourceC
 	if !translate.SameStorageShapeFamily(source.Name(), target.Name()) && !translate.SameStorageShapeFamily(target.Name(), "postgres") {
 		return nil
 	}
+	sameFamily := translate.SameStorageShapeFamily(source.Name(), target.Name())
 	return func(sourceColumn, targetColumn string) bool {
 		sc, tc := columnNamed(st, sourceColumn), columnNamed(tt, targetColumn)
 		if sc == nil || tc == nil {
@@ -698,8 +779,44 @@ func keyColumnWeakening(source, target ir.Engine, st, tt *ir.Table) func(sourceC
 		}
 		sl, sok := sr.CollationLoosening(sc.Type)
 		tl, tok := tr.CollationLoosening(tc.Type)
-		return sok && tok && tl&^sl != 0
+		if sok && tok {
+			return tl&^sl != 0
+		}
+		return unknownCollationWeakened(sc.Type, tc.Type, tl, tok, sameFamily)
 	}
+}
+
+// unknownCollationWeakened decides a key column pair one side's resolver
+// could not classify (round-3 review LOW): the conservative answer is the
+// loud one, so a character column pair of one engine family counts as
+// weakened unless both name the same collation or the target's is known to
+// fold nothing. Across families the names are not comparable and the pair
+// is not judged. A non-character column is never weakened.
+func unknownCollationWeakened(source, target ir.Type, tl ir.CollationLoosening, tok, sameFamily bool) bool {
+	sn, sChar := characterCollation(source)
+	tn, tChar := characterCollation(target)
+	switch {
+	case !sChar || !tChar:
+		return false
+	case tok && tl == 0:
+		return false
+	case !sameFamily:
+		return false
+	}
+	return !strings.EqualFold(sn, tn)
+}
+
+// characterCollation returns a character type's collation name.
+func characterCollation(t ir.Type) (string, bool) {
+	switch v := ir.UnwrapDomain(t).(type) {
+	case ir.Char:
+		return v.Collation, true
+	case ir.Varchar:
+		return v.Collation, true
+	case ir.Text:
+		return v.Collation, true
+	}
+	return "", false
 }
 
 // columnNamed finds a column by its exact name, else the one column equal

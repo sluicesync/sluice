@@ -53,7 +53,7 @@ func (h *keepaliveHarness) wal(payload []byte) {
 	if err := h.r.dispatchWAL(
 		context.Background(),
 		pglogrepl.XLogData{WALStart: 0x50, ServerWALEnd: 0x200, ServerTime: time.Now(), WALData: payload},
-		map[uint32]*relationCacheEntry{}, map[uint32]ir.SchemaSignature{},
+		map[uint32]*relationCacheEntry{}, map[uint32]relationSnapshotSig{},
 		&h.currentTxnLSN, &h.currentTxnStartLSN, &h.currentTxnCommitTime, &h.streamedLSN, &h.inStream, h.kb,
 		map[uint32]pglogrepl.LSN{}, h.out,
 	); err != nil {

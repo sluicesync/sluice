@@ -257,6 +257,11 @@ type AddTable struct {
 	// for the table being added: unique keys a pre-created target table
 	// carries beyond the source's, accepted by name (`<table>.<key>`).
 	AcceptTargetOnlyUniqueKeys []string
+
+	// sourceKeyFacts is the source reader's [ir.UniqueKeyFact]s, read in
+	// Run while the source reader is open and folded into a COPY of the
+	// added table by the unique-key door ([AddTable.refuseTargetOnlyUniqueKeys]).
+	sourceKeyFacts map[string]map[string]ir.UniqueKeyFact
 }
 
 // Run executes the add-table flow. Returns nil on success or a
@@ -343,6 +348,10 @@ func (a *AddTable) Run(ctx context.Context) error {
 	if err := a.preflightAddTableShape(ctx, sr, scoped); err != nil {
 		migcore.CloseIf(sr)
 		return err
+	}
+	if a.sourceKeyFacts, err = readUniqueKeyFacts(ctx, sr); err != nil {
+		migcore.CloseIf(sr)
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: add-table: read source unique-key facts: %w", err))
 	}
 	migcore.CloseIf(sr)
 
@@ -727,15 +736,67 @@ func (a *AddTable) preflightTargetForStream(ctx context.Context, scoped *ir.Sche
 		if err := preflightBinaryTargetColumnsOnCDC(scoped, actual, "add-table"); err != nil {
 			return err
 		}
-		if err := refuseAddTableTargetOnlyUniqueKeys(scoped.Tables[0], actual, a.Source, a.Target, a.AcceptTargetOnlyUniqueKeys); err != nil {
-			return err
-		}
+	}
+	if err := a.refuseTargetOnlyUniqueKeys(ctx, scoped.Tables[0], targetSchema); err != nil {
+		return err
 	}
 	// The byte-shaped array-leaf half of the same shape — a source element
 	// type the applier's target-derived columns cannot carry. Keyed on the
 	// target ENGINE, not the catalog, because the table being added
 	// normally does not exist on the target yet.
 	return preflightArrayBytesLeafOnCDC(scoped, engineNameOrEmpty(a.Target), "add-table")
+}
+
+// refuseTargetOnlyUniqueKeys runs the unique-key door for the added table on
+// the door's own reads, not the shape gate's: the plain schema read carries
+// no [ir.UniqueKeyFact]s, so a pre-created Postgres target's NULLS NOT
+// DISTINCT, index-level COLLATE and partitioned keys were invisible to it,
+// and a failed read was a WARN and a skip (round-3 review MEDIUM). Both
+// sides now have their facts folded in — the source's into a copy of the
+// table this command will create, so its keys stay as read — and a read
+// that fails refuses the command: the next run reads again.
+func (a *AddTable) refuseTargetOnlyUniqueKeys(ctx context.Context, source *ir.Table, targetSchema string) error {
+	src := &ir.Schema{Tables: []*ir.Table{cloneTableKeys(source)}}
+	foldUniqueKeyFacts(a.sourceKeyFacts, src)
+	target, err := a.readTargetKeys(ctx, source.Name, targetSchema)
+	if err != nil {
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: add-table: unique-key door: %w", err))
+	}
+	return refuseAddTableTargetOnlyUniqueKeys(src.Tables[0], target, a.Source, a.Target, a.AcceptTargetOnlyUniqueKeys)
+}
+
+// readTargetKeys reads the target's counterpart of table, with its
+// unique-key facts folded in, the way the stream's door reads a target.
+func (a *AddTable) readTargetKeys(ctx context.Context, table, targetSchema string) (map[string]*ir.Table, error) {
+	tr, err := a.Target.OpenSchemaReader(ctx, a.TargetDSN)
+	if err != nil {
+		return nil, fmt.Errorf("open target schema reader: %w", err)
+	}
+	defer migcore.CloseIf(tr)
+	if targetSchema != "" {
+		migcore.ApplyTargetSchema(tr, targetSchema)
+	}
+	migcore.ApplyVerbatimExtensionPassthrough(tr, true)
+	if scoper, ok := tr.(ir.TableScoper); ok {
+		scoper.SetTableScope(func(name string) bool { return strings.EqualFold(name, table) })
+	}
+	schema, err := tr.ReadSchema(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("read target schema: %w", err)
+	}
+	if schema == nil {
+		return nil, nil
+	}
+	if err := applyUniqueKeyFacts(ctx, tr, schema); err != nil {
+		return nil, fmt.Errorf("read target unique-key facts: %w", err)
+	}
+	out := map[string]*ir.Table{}
+	for _, t := range schema.Tables {
+		if t != nil && strings.EqualFold(t.Name, table) {
+			out[t.Name] = t
+		}
+	}
+	return out, nil
 }
 
 // refuseAddTableTargetOnlyUniqueKeys is the add-table entry of the

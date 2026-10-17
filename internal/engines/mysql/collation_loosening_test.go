@@ -45,6 +45,9 @@ func TestCollationLoosening_NameMatrix(t *testing.T) {
 		{"CHAR ai_ci", ir.Char{Length: 9, Collation: "utf8mb4_0900_ai_ci"}, c | a | p, true},
 		{"TEXT general_ci", ir.Text{Size: ir.TextMedium, Collation: "utf8mb4_general_ci"}, c | a | p, true},
 		{"TEXT 0900_as_cs", ir.Text{Size: ir.TextMedium, Collation: "utf8mb4_0900_as_cs"}, 0, true},
+		{"mariadb weight-level suffix is unknown", ir.Varchar{Length: 9, Collation: "utf8mb4_thai_520_w2"}, 0, false},
+		{"kana-sensitive is unknown", ir.Varchar{Length: 9, Collation: "utf8mb4_ja_0900_as_cs_ks"}, 0, false},
+		{"a name with no case token is unknown", ir.Varchar{Length: 9, Collation: "utf8mb4_unknown_0900"}, 0, false},
 		{"no collation recorded", ir.Varchar{Length: 9}, 0, false},
 		{"not a character type", ir.Integer{Width: 32}, 0, false},
 	}

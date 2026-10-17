@@ -192,6 +192,9 @@ func interceptSchemaSnapshotsForCoordination(
 							ctx, "shard consolidation intercept: seeded table cache",
 							"table", key,
 						)
+						if router.uniqueKeys != nil && !router.uniqueKeys(ctx, snap) {
+							return
+						}
 						select {
 						case out <- c:
 						case <-ctx.Done():
@@ -284,6 +287,9 @@ func interceptSchemaSnapshotsForCoordination(
 				// version (the existing per-engine SchemaSnapshot
 				// dispatch path handles that under the same tx as the
 				// position write).
+				if router.uniqueKeys != nil && !router.uniqueKeys(ctx, snap) {
+					return
+				}
 				select {
 				case out <- c:
 				case <-ctx.Done():
