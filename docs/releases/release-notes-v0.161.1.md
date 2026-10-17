@@ -1,0 +1,67 @@
+# sluice v0.161.1
+
+**HIGH fix, silent: a unique key the target still has after the source dropped it could let a later source row overwrite a different row at exit 0 (SOURCE-DROPPED-UNIQUE-KEY-MERGE). The hole is long-standing: every release for a MySQL target with a primary key, since v0.99.5 for a MySQL target without one, and since v0.99.13 for a Postgres target whose ON CONFLICT key is a unique index. The fix adds a new terminal refusal, `UNIQUE-KEY-CONFLICT-OTHER-ROW`. No backup format change; drop-in from v0.161.0 except for that refusal.**
+
+<!-- notes-claims-exempt: POSTGRES-TRIGGER-DROP-INDEX-MARKER MYSQL-UNSUPPLIED-PK-IDENTITY COPY-RETRY-DUPLICATE-TOLERANCE-STALE-KEY -->
+
+## Fixed
+
+- **A source `DROP INDEX` on a unique index no longer lets the target merge two source rows (HIGH, silent; SOURCE-DROPPED-UNIQUE-KEY-MERGE).** sluice does not forward a source `DROP INDEX`, so the target kept the unique key. The source's next row that duplicated the dropped key then arrived as an upsert onto the row that held it.
+  - **Measured on v0.161.0 with real servers.** The source table was `kd(id PK, k, v)` with `CREATE UNIQUE INDEX kd_k ON kd(k)` and row (1,'a','one'). The source then ran `DROP INDEX kd_k` and inserted (99,'a','ninetynine'). A MySQL target ended with `1 a ninetynine` and no row 99; on a table without a primary key, the id itself was rewritten. A Postgres target without a primary key did the same through its ON CONFLICT key. That includes a table with a second unique index (plain or expression) where the dropped index was the ON CONFLICT key itself, so no unique violation fires.
+  - **Where it was silent.** A pgoutput or `postgres-trigger` source, live or stopped. A MySQL binlog source whose DROP landed while the stream was stopped.
+  - **Affected releases.** On a MySQL target with a primary key, every release through v0.161.0: the MySQL applier has used `INSERT … ON DUPLICATE KEY UPDATE` since v0.1.0, and MySQL resolves that through any unique key. On a MySQL target without a primary key, v0.99.5 through v0.161.0, since v0.99.5 introduced the full-row upsert for those tables. On a Postgres target whose ON CONFLICT key is a unique index rather than the primary key, v0.99.13 through v0.161.0, since v0.99.13 keyed the CDC Insert on that index. A Postgres target keyed on its primary key was never exposed, because a conflict through another unique index raises a unique violation.
+  - **The apply guard: `UNIQUE-KEY-CONFLICT-OTHER-ROW`.** Every guarded upsert now checks, inside the statement, that the row it matched carries the incoming row's primary key. On a table without one that has two or more unique keys, the check is agreement on every unique key's columns, compared NULL-safely. A mismatch refuses before anything is written, naming the target key and the remedy. The refusal is terminal, and the fleet supervisor does not restart a leg that hits it (`supervisor_restart_refusals.go`).
+    - **MySQL target:** every table with a unique key besides a primary key the rows supply. This covers CDC apply and the idempotent copy writer.
+    - **Postgres target:** every table whose ON CONFLICT key is not its primary key, with two or more unique indexes when there is no primary key. This covers the serial and pipelined CDC Insert paths. Expression indexes count, through the columns they read (`uniqueIndexColumnsFor`). An expression that reads no column makes the guard refuse every conflict, loudly.
+    - Any other table renders the statement exactly as before.
+  - **The MySQL copy writer.** It refuses the same way when a conflict may have come through a target unique key that the copy's own source table does not declare (`copyGuardScope`). A stale row refreshed through a declared key, such as a VStream catch-up re-emission or a resumed copy, is absorbed as before. The exception is an undeclared key with a functional part, whose match cannot be told from its columns. The batched core's transient-retry re-send now takes the same guard. A prefix key is compared on its prefix, as the server matches it.
+  - **The pgoutput door.** A pgoutput stream now also refuses a live `CREATE UNIQUE INDEX`, `DROP INDEX` or structural change of a plain unique index with `UNFORWARDED-SCHEMA-CHANGE`. It already did this for a UNIQUE constraint. An `ALTER INDEX … RENAME` is not refused (`renamedUniqueIndexes`).
+  - **Not closed, stated:**
+    - **A table with no primary key and exactly one unique key.** There, the merge and the newer-image re-send the upsert exists to absorb are the same statement against the same row, so the apply guard cannot tell them apart. The shape is still silent wherever the source does not see the DROP: a `postgres-trigger` source, a VStream source, or a DROP made while the stream was stopped. Filed as UNIQUE-KEY-STOPPED-WINDOW-DOOR and POSTGRES-TRIGGER-DROP-INDEX-MARKER.
+    - **NULL and partial-index keys on a table with no primary key.** The guard cannot catch a row whose differing unique-key columns are all NULL, or fall outside a partial unique index's predicate. Example: two different source rows (NULL,'a','one') and (NULL,'a','two') under kd(id UNIQUE NULL, k UNIQUE) agree on every unique key, so the second overwrites the first at exit 0. Pinned as an accepted residual on both engines by `TestUniqueKeyConflictGuard_AcceptedSilentResidual_NullKeyColumnsMerge`.
+    - **A MySQL surrogate primary key the rows do not supply, beside exactly one other unique key** (MYSQL-UNSUPPLIED-PK-IDENTITY).
+    - **A MySQL `LOAD DATA` copy's transient-retry replay** onto a target pre-created with an undeclared unique key (COPY-RETRY-DUPLICATE-TOLERANCE-STALE-KEY).
+  - **The trade, stated.** A change re-delivered onto a target that is already ahead of it now refuses, where it used to converge, when the row's other unique column differs between the two. On a MySQL table with a primary key, that means a unique value that moved between rows. On a MySQL or Postgres table without one (or with a surrogate primary key the rows do not supply) and two or more unique keys, it means any change to one of those keys. By code reading, the re-delivery paths are:
+    - a lock-free MySQL capture's overlap;
+    - the VStream auto-shard stitch window;
+    - a broker re-run without apply marks.
+
+    **None of these paths is measured.** An interrupted cold start does not hit this: it resumes through the copy writer, which absorbs a conflict through a key the source declares. A Postgres target with a primary key has always refused the moved-value case with a unique violation. Tracked as UNIQUE-KEY-GUARD-OVERLAP-REFUSAL.
+  - **The remedy the refusal prints** (`UniqueKeyConflictRecopyRemedy`): drop that unique key on the target and restart, or re-copy.
+    - **`sync start`:** restart with `--restart-from-scratch` and the same `--stream-id`. From a Postgres pgoutput source, first drop the stream's replication slot, because a fresh snapshot refuses to inherit it. Use `sluice slot drop <SLOT> --source-driver=postgres --source <DSN> --yes`. `<SLOT>` is the literal slot name, as `sluice slot list` prints it: `sluice_slot` by default, otherwise `sluice_` plus `--slot-name`, unless that value already starts with `sluice_`. `slot drop` never adds the prefix itself.
+    - **Measured:** the `sync start` re-copy converged on a provoked refusal on both of its re-copy paths, onto a MySQL target (`TestStreamer_UniqueKeyConflict_TradeRemedy`). From a native MySQL binlog source, `--restart-from-scratch` drops and recreates the target tables. From a Postgres pgoutput source, it re-copies onto the existing rows without dropping them, after the slot is dropped. That measurement is how the slot-drop step got into the remedy.
+    - **Unmeasured:** the test dropped the slot with SQL, so the printed `sluice slot drop` command itself was not run.
+    - **Unmeasured:** a VStream source. Its restart re-runs the auto-shard stitch window, so under live writes the refusal may fire again.
+    - **Unmeasured:** a stale target row the source no longer has, on the upsert re-copy path. A re-copy that deletes nothing cannot remove it; `--reset-target-data --yes` is the fallback.
+    - **`sync from-backup run`, unmeasured:** this command has no `--restart-from-scratch`. Its remedy is to re-run with `--reset-target-data --yes`, which drops the target tables and restores the chain again. That leg has not been run end to end, and the printed remedy says so.
+  - Pinned on real servers by `TestUniqueKeyConflictGuard_MySQLFamily`, `TestUniqueKeyConflictGuard_CopyWriter` and `TestUniqueKeyConflictGuard_CopyWriterPrefixKey` (MySQL 8.0 and MariaDB 11.4), and by `TestUniqueKeyConflictGuard_Postgres`. End to end, they are pinned by `TestStreamer_UniqueKeyConflict_PostgresSource`, `TestStreamer_UniqueKeyConflict_MySQLSource`, `TestStreamer_UniqueKeyConflict_TriggerCDC` and `TestStreamer_UniqueKeyConflict_TradeRemedy`. These are graded against the source's rows read by id, never the stream's logs, and include controls that must converge without a refusal.
+
+## Maintenance
+
+- **Test only (c12daa82):** the backup-stream rollover lane now names its window premise. `krwRequireWindowCaptured` fails `WINDOW-SPLIT` when the window lands across more than one incremental. Its rollover window is widened from 4s to 10s, after a loaded CI runner split a window and produced a misleading broker assertion. No product change.
+- **Docs (1eb8c178, 5bccc062, 175e27e6):** two trigger-CDC statements in the operator and backup-format docs were updated for v0.161.0. The v0.161.0 notes and CHANGELOG entry gained a dated correction. That correction now gives the measured `postgres-trigger` remedy for Bug 318: pre-create the target table with a `utf8mb4_0900_bin` key, then run `sync start --restart-from-scratch --schema-already-applied`. It also narrows the `FormatVersion` 15 and typo'd-filter statements.
+
+## Compatibility
+
+- **New terminal refusal: `UNIQUE-KEY-CONFLICT-OTHER-ROW`** on MySQL and Postgres targets, as scoped above. Each one replaces a silent overwrite. In the re-delivery windows listed under the trade, it can also refuse a change that used to converge. The fleet supervisor does not restart a leg that hits it.
+- **New pgoutput refusals:** a live `CREATE UNIQUE INDEX`, `DROP INDEX` or structural change of a plain unique index now stops the stream with `UNFORWARDED-SCHEMA-CHANGE`. An index rename does not.
+- **No backup format change.** `BackupFormatVersion` stays 15, and nothing under the backup package changed. Backups and chains move freely between v0.161.0 and v0.161.1.
+- **No CLI changes.** No flag or default changed. Statements against unguarded tables render exactly as before.
+- **Not affected:** a Postgres target table keyed on its primary key, which was already loud; SQLite and D1 targets, whose appliers this release does not touch.
+- **Not run for this release:** the dispatch-only `psverify` suite, which needs billable live PlanetScale infrastructure. Coverage for this change is the CI integration matrix, on real MySQL, MariaDB and Postgres containers, plus the Integration (vstream) job, whose `TestVStream_KeyCollationGuard_ShardedTarget` target table now also arms the conflict-identity guard through vtgate; there is no VStream-specific pin for the new refusal itself.
+
+## Who needs this — action required
+
+- **Anyone streaming into a MySQL target, or a Postgres target with no primary key on the affected tables, whose source has ever dropped a unique index (or UNIQUE constraint) during the stream's life.** This applies to any of the affected releases above, and especially to a `postgres-trigger` source, a pgoutput source, or any DROP made while the stream was stopped. A later source row duplicating the dropped key may have overwritten another row at exit 0. For each affected table:
+  1. Compare the target's rows against the source's, by primary key or id. A row-count shortfall is the tell.
+  2. Drop the stale unique key on the target.
+  3. Re-copy the table on v0.161.1, using the remedy above.
+- **Anyone with a keyless target table that has exactly one unique key, or a MySQL surrogate primary key beside one unique key.** This release does not guard that shape. If the source may drop that key, drop it on the target too, or add a primary key.
+- **Operators who hit `UNIQUE-KEY-CONFLICT-OTHER-ROW` after upgrading.** First check whether the source still has the key the refusal names. If it does not, drop the key on the target and restart. If it does, the refusal is the re-delivery trade, and the re-copy converges. The `sync start` re-copy is measured. The `sync from-backup run --reset-target-data --yes` leg and the printed `sluice slot drop` step are unmeasured.
+- **Everyone else:** upgrade. No action is needed.
+
+---
+
+**Install:** `brew install sluicesync/tap/sluice` · `go install sluicesync.dev/sluice/cmd/sluice@v0.161.1` · **Container:** `ghcr.io/sluicesync/sluice:0.161.1`
+
+**Full changelog:** https://github.com/sluicesync/sluice/blob/main/CHANGELOG.md
