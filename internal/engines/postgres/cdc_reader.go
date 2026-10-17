@@ -1278,7 +1278,7 @@ func (r *CDCReader) dispatchWAL(
 		if err := r.gradeRelationSchemaRace(relations, m.RelationID, entry); err != nil {
 			return withPreAlterReplayWedge(err, relations[m.RelationID], *currentTxnLSN, r.slotName)
 		}
-		keysMoved, err := r.gradeUnforwardedClasses(ctx, m.RelationID, entry)
+		keysMoved, rebaseline, err := r.gradeUnforwardedClasses(ctx, m.RelationID, entry)
 		if err != nil {
 			return err
 		}
@@ -1297,7 +1297,7 @@ func (r *CDCReader) dispatchWAL(
 			slog.String("wal_start", xld.WALStart.String()),
 			slog.String("server_wal_end", xld.ServerWALEnd.String()),
 		)
-		return r.maybeSnapshotSchema(ctx, entry, m.RelationID, xld.WALStart, keysMoved, snapshotSig, out)
+		return r.sendRelationBoundary(ctx, entry, m.RelationID, xld.WALStart, keysMoved, rebaseline, snapshotSig, out)
 
 	case *pglogrepl.RelationMessage:
 		if err := r.ensureRelationTypeOIDs(ctx, m.Columns); err != nil {
@@ -1322,7 +1322,7 @@ func (r *CDCReader) dispatchWAL(
 		if err := r.gradeRelationSchemaRace(relations, m.RelationID, entry); err != nil {
 			return withPreAlterReplayWedge(err, relations[m.RelationID], *currentTxnLSN, r.slotName)
 		}
-		keysMoved, err := r.gradeUnforwardedClasses(ctx, m.RelationID, entry)
+		keysMoved, rebaseline, err := r.gradeUnforwardedClasses(ctx, m.RelationID, entry)
 		if err != nil {
 			return err
 		}
@@ -1338,7 +1338,7 @@ func (r *CDCReader) dispatchWAL(
 			slog.String("wal_start", xld.WALStart.String()),
 			slog.String("server_wal_end", xld.ServerWALEnd.String()),
 		)
-		return r.maybeSnapshotSchema(ctx, entry, m.RelationID, xld.WALStart, keysMoved, snapshotSig, out)
+		return r.sendRelationBoundary(ctx, entry, m.RelationID, xld.WALStart, keysMoved, rebaseline, snapshotSig, out)
 
 	case *pglogrepl.BeginMessage:
 		r.decodingXid = m.Xid
@@ -2266,6 +2266,28 @@ func (r *CDCReader) maybeSnapshotSchema(
 		return err
 	}
 	snapshotSig[relID] = sig
+	return nil
+}
+
+// sendRelationBoundary ends a RelationMessage: it sends the relation's
+// boundary ([CDCReader.maybeSnapshotSchema]) and only then re-baselines the
+// facts the next RelationMessage diffs against, so a retry before the send
+// reports a unique key lost with a column again
+// ([CDCReader.gradeUnforwardedClasses]).
+func (r *CDCReader) sendRelationBoundary(
+	ctx context.Context,
+	entry *relationCacheEntry,
+	relID uint32,
+	relLSN pglogrepl.LSN,
+	uniqueKeysMoved bool,
+	rebaseline func(),
+	snapshotSig map[uint32]relationSnapshotSig,
+	out chan<- ir.Change,
+) error {
+	if err := r.maybeSnapshotSchema(ctx, entry, relID, relLSN, uniqueKeysMoved, snapshotSig, out); err != nil {
+		return err
+	}
+	rebaseline()
 	return nil
 }
 

@@ -69,6 +69,9 @@ type schemaForwardDeps struct {
 	// uniqueKeys judges each snapshot after its DDL and before it is
 	// forwarded ([uniqueKeyBoundaryGate]); nil judges nothing.
 	uniqueKeys uniqueKeyBoundaryHook
+	// uniqueKeysBeforeDDL is the gate's early call, made before a boundary's
+	// DDL ([uniqueKeyBoundaryGate.beforeDDLHook]); nil judges nothing.
+	uniqueKeysBeforeDDL uniqueKeyBoundaryHook
 
 	// applier issues the per-shape ALTER/CREATE/DROP DDL on the target
 	// (ADR-0091). Both PG and MySQL SchemaWriters implement the full
@@ -328,6 +331,12 @@ func interceptAddColumnForward(
 				// boundary, and it came from CDC — so the next comparison
 				// is CDC→CDC (full guard lifts).
 				delete(seedSourced, key)
+				// A boundary that only adds columns is judged before its DDL
+				// (uniqueKeyBoundaryGate.beforeDDLHook says why); any other is
+				// judged after it, in accept().
+				if deps.uniqueKeysBeforeDDL != nil && !deps.uniqueKeysBeforeDDL(ctx, snap) {
+					return
+				}
 				// accept passes an accepted boundary downstream carrying the
 				// table's new column-order record when its column list moved
 				// (RENAME-SWAP-FORWARD), so the applier writes the record on

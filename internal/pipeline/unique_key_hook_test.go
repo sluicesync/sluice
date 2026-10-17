@@ -102,31 +102,67 @@ func TestAddTableUniqueKeyDoor_ReadFailureRefuses(t *testing.T) {
 	}
 }
 
-// TestPendingDrop pins the boundary check's deferral (round-3 review): a
-// target key on a column the boundary snapshot still has but the source
-// catalog no longer does is a DROP COLUMN the stream has not reached yet,
-// deferred to that DROP's own boundary. A column the snapshot lacks too (the
-// DROP being judged), one the catalog still has, an expression part, and a
-// check with no snapshot columns (the open door) are never deferred.
-func TestPendingDrop(t *testing.T) {
-	source := &ir.Table{Name: "kd", Columns: []*ir.Column{{Name: "id"}, {Name: "k"}}} // doomed already dropped in the catalog
-	key := func(parts ...ir.IndexColumn) *ir.Index { return &ir.Index{Name: "x", Unique: true, Columns: parts} }
-	cases := []struct {
-		name string
-		key  *ir.Index
-		pos  map[string]bool
-		want bool
-	}{
-		{"the snapshot still has doomed", key(ir.IndexColumn{Column: "doomed"}), map[string]bool{"id": true, "k": true, "doomed": true}, true},
-		{"composite with a pending column", key(ir.IndexColumn{Column: "k"}, ir.IndexColumn{Column: "Doomed"}), map[string]bool{"k": true, "doomed": true}, true},
-		{"the DROP's own boundary", key(ir.IndexColumn{Column: "doomed"}), map[string]bool{"id": true, "k": true}, false},
-		{"a column the catalog has", key(ir.IndexColumn{Column: "k"}), map[string]bool{"k": true}, false},
-		{"an expression part", key(ir.IndexColumn{Expression: "lower(doomed)"}), map[string]bool{"doomed": true}, false},
-		{"no snapshot columns (the open door)", key(ir.IndexColumn{Column: "doomed"}), nil, false},
+// TestUniqueKeyBoundaryGate_BeforeDDL pins the gate's two calls (round-4
+// review): a boundary that only adds columns is judged at the early call,
+// before its DDL, and the late call for it then judges nothing; a boundary
+// that drops a column is not judged early (its DDL can change the target's
+// keys) and is judged at the late call.
+func TestUniqueKeyBoundaryGate_BeforeDDL(t *testing.T) {
+	var judged []string
+	gate := newUniqueKeyBoundaryGate(uniqueKeyChecks{
+		boundary: func(_ context.Context, s ir.SchemaSnapshot) (*ir.SourceUniqueKeyAbsentError, error) {
+			judged = append(judged, columnList(s.IR))
+			return nil, nil
+		},
+		colsKey:  func(_, table string) string { return table },
+		seedCols: map[string]string{"kd": columnList(ukrSnap("kd", "id", "k", "doomed").IR)},
+	}, &atomic.Pointer[error]{})
+	early, late := gate.beforeDDLHook(), gate.hook()
+	ctx := context.Background()
+	snap := func(cols ...string) ir.SchemaSnapshot {
+		s := ukrSnap("kd", cols...)
+		s.Schema = "public"
+		return s
+	}
+
+	added := snap("id", "k", "doomed", "n")
+	if !early(ctx, added) || len(judged) != 1 {
+		t.Fatalf("an added column was not judged early: %d checks", len(judged))
+	}
+	if !late(ctx, added) || len(judged) != 1 {
+		t.Fatalf("the late call judged the early-judged boundary again: %d checks", len(judged))
+	}
+
+	dropped := snap("id", "k", "n")
+	if !early(ctx, dropped) || len(judged) != 1 {
+		t.Fatalf("a dropped column was judged before its DDL: %d checks", len(judged))
+	}
+	if !late(ctx, dropped) || len(judged) != 2 {
+		t.Fatalf("a dropped column was not judged after its DDL: %d checks", len(judged))
+	}
+}
+
+// TestUniqueKeyColsLookup pins the first-boundary seed's key (round-4
+// review LOW): a snapshot spelling a table differently from the open read (a
+// MySQL source with lower_case_table_names=2) still finds its seed, while two
+// seeded tables equal without case keep separate baselines.
+func TestUniqueKeyColsLookup(t *testing.T) {
+	lookup := uniqueKeyColsLookup(map[string]string{
+		uniqueKeyColsKey("", "Orders"): "o",
+		uniqueKeyColsKey("", "Users"):  "U",
+		uniqueKeyColsKey("", "users"):  "u",
+	})
+	cases := []struct{ table, want string }{
+		{"Orders", uniqueKeyColsKey("", "Orders")},
+		{"orders", uniqueKeyColsKey("", "Orders")}, // folded: unambiguous
+		{"users", uniqueKeyColsKey("", "users")},   // exact wins
+		{"Users", uniqueKeyColsKey("", "Users")},
+		{"USERS", uniqueKeyColsKey("", "USERS")}, // ambiguous: no seed
+		{"other", uniqueKeyColsKey("", "other")},
 	}
 	for _, c := range cases {
-		if got := pendingDrop(c.key, source, c.pos); got != c.want {
-			t.Errorf("%s: pendingDrop = %v, want %v", c.name, got, c.want)
+		if got := lookup("", c.table); got != c.want {
+			t.Errorf("lookup(%q) = %q, want %q", c.table, got, c.want)
 		}
 	}
 }

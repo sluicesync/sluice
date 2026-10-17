@@ -177,14 +177,42 @@ type uniqueKeyDoorState struct {
 }
 
 // uniqueKeyColsKey keys a table's column list by source namespace ("" on a
-// single-namespace stream; folded) and table name, NOT folded: the open
-// door's read and the change stream name a table from one server, so its
-// case agrees, and folding would let `Users` and `users` (a Postgres source
-// may hold both) share one baseline (round-3 review LOW). A name the two
-// reads spell differently only loses its seed, so its first snapshot is not
-// compared: the behaviour before the seed existed.
+// single-namespace stream; folded) and table name as spelled. The lookup
+// ([uniqueKeyColsLookup]) folds the name when that is unambiguous.
 func uniqueKeyColsKey(namespace, table string) string {
 	return strings.ToLower(namespace) + "\x00" + table
+}
+
+// uniqueKeyColsLookup returns the key a snapshot of (namespace, table)
+// takes in seed: its exact spelling when seeded, else the one seeded table
+// that folds to it, else the exact spelling. Folding matters because the
+// open door's read and the change stream can spell a table differently (a
+// MySQL source with lower_case_table_names=2), and a missed seed silently
+// skips a table's first-boundary check. Folding only when unambiguous
+// matters because a Postgres source may hold `Users` beside `users`, which
+// must keep separate baselines (round-3 and round-4 review LOWs).
+func uniqueKeyColsLookup(seed map[string]string) func(namespace, table string) string {
+	folded := map[string]string{}
+	collide := map[string]bool{}
+	for k := range seed {
+		f := strings.ToLower(k)
+		if _, seen := folded[f]; seen {
+			collide[f] = true
+		}
+		folded[f] = k
+	}
+	return func(namespace, table string) string {
+		exact := uniqueKeyColsKey(namespace, table)
+		if _, ok := seed[exact]; ok {
+			return exact
+		}
+		if f := strings.ToLower(exact); !collide[f] {
+			if k, ok := folded[f]; ok {
+				return k
+			}
+		}
+		return exact
+	}
 }
 
 // sourceSeesUniqueKeyDDLLive reports a source whose change stream refuses a
@@ -362,44 +390,6 @@ type uniqueKeyCompare struct {
 	// collations arms the collation direction ([keyColumnWeakening]); see
 	// [Streamer.uniqueKeyCollationsArmed].
 	collations bool
-	// positionCols, at a boundary check, is the boundary snapshot's column
-	// names (folded): the source table's columns AT THE STREAM'S POSITION.
-	// The source catalog is read now, and may already be past that position
-	// (round-3 review, measured: a DROP COLUMN run right after the boundary
-	// being judged). A target key on a column the snapshot still has but the
-	// catalog no longer does is therefore a DROP COLUMN the stream has not
-	// reached, not a key the source dropped: it is deferred, and judged at
-	// that DROP's own boundary, which the gate is guaranteed to see because
-	// the column leaves the change stream's column list there.
-	positionCols map[string]bool
-}
-
-// snapshotColumnNames folds a boundary snapshot's column names.
-func snapshotColumnNames(t *ir.Table) map[string]bool {
-	out := map[string]bool{}
-	if t == nil {
-		return out
-	}
-	for _, c := range t.Columns {
-		if c != nil {
-			out[strings.ToLower(c.Name)] = true
-		}
-	}
-	return out
-}
-
-// pendingDrop reports a key with a plain part on a column the stream's
-// position still has and the source catalog does not ([uniqueKeyCompare.positionCols]).
-func pendingDrop(key *ir.Index, source *ir.Table, positionCols map[string]bool) bool {
-	if len(positionCols) == 0 {
-		return false
-	}
-	for _, p := range key.Columns {
-		if p.Expression == "" && positionCols[strings.ToLower(p.Column)] && columnNamed(source, p.Column) == nil {
-			return true
-		}
-	}
-	return false
 }
 
 // compareUniqueKeys reads both catalogs for every scope and returns the
@@ -469,7 +459,7 @@ func (s *Streamer) compareUniqueKeys(ctx context.Context, scopes []uniqueKeyDoor
 			}
 			weakened := weakening(st, tt)
 			for _, key := range uncoveredTargetKeys(st, tt, s.Target.Name(), weakened) {
-				if pendingDrop(key, st, req.positionCols) || accept.allows(sc.namespace, tt.Name, key.Name) || accept.allows(sc.targetNamespace, tt.Name, key.Name) {
+				if accept.allows(sc.namespace, tt.Name, key.Name) || accept.allows(sc.targetNamespace, tt.Name, key.Name) {
 					continue
 				}
 				table := tt.Name

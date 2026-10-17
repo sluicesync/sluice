@@ -198,53 +198,115 @@ func TestStreamer_UniqueKeyDoor_Review3AddTableFacts(t *testing.T) {
 	<-runErr
 }
 
-// TestStreamer_UniqueKeyDoor_Review3CatalogAheadOfPosition pins the
-// boundary check's deferral: the source catalog is read when a boundary is
-// judged, and may already be past it. A large transaction on another table
-// puts the reader seconds behind; behind it, one transaction adds a column
-// and the next drops a UNIQUE column, so when the reader handles the ADD's
-// Relation the catalog no longer has the dropped column or its key while the
-// target, correctly at that position, still has both. (Not one transaction:
-// the forward path applies a mid-transaction DROP before the applier has
-// written the transaction's earlier rows, which is the forward path's own
-// limit, not this door's.) Judging the
-// target key there refused a working stream (measured through
-// TestStreamer_PGSource_UnforwardedSchemaChange_Refuses' control). The key
-// must be deferred to the DROP's own boundary, where the forwarded DROP
-// COLUMN removes it from the target, and the stream must converge.
+// TestStreamer_UniqueKeyDoor_Review3CatalogAheadOfPosition pins what the
+// boundary check does when the source catalog is already past the boundary
+// it judges (it is read when the check runs). A large transaction on
+// another table puts the reader behind; behind it come two transactions, so
+// at the first one's Relation the catalog already reflects the second:
+//
+//   - "column dropped ahead": a column is added, then (next transaction) a
+//     UNIQUE column is dropped. The target key is lost with a column the
+//     stream has not reached yet;
+//   - "key dropped, duplicate, then column dropped" (the round-4 reviewer's
+//     probe): the source drops the key ON ITS OWN and writes a duplicate of
+//     row 1, then drops the column. On a table with no primary key the
+//     target's key is the upsert's conflict key on both engines.
+//
+// The two are indistinguishable to the reader and the gate. The round-3
+// cut deferred the first one, and that deferral passed the second, merging
+// row 3 onto row 1 at exit 0 on a MySQL target. So both refuse at the
+// earlier boundary (loud), with no row merged. A plain restart refuses
+// again at open: the stream stops before the DROP COLUMN, so its position
+// never passes it, and the open door sees the same two catalogs. The printed
+// drop-the-key remedy converges, and the duplicate then lands as its own row.
+// Graded on the source's rows against the target's.
 func TestStreamer_UniqueKeyDoor_Review3CatalogAheadOfPosition(t *testing.T) {
 	pgNew, pgCleanup := ukcPGServer(t)
 	defer pgCleanup()
 	myNew, myCleanup := ukcMySQLServer(t)
 	defer myCleanup()
-	for _, tg := range []struct {
-		engine string
-		mk     func(string) twfbDB
-	}{{"postgres", pgNew}, {"mysql", myNew}} {
-		t.Run("into "+tg.engine, func(t *testing.T) {
-			tag := "ukdr3k" + tg.engine[:2]
-			src, tgt := pgNew(tag+"_s"), tg.mk(tag+"_t")
-			src.exec(t, "CREATE TABLE kd (id int PRIMARY KEY, k varchar(20) NOT NULL, v varchar(20), doomed varchar(20) UNIQUE); "+
-				"ALTER TABLE kd REPLICA IDENTITY FULL; INSERT INTO kd VALUES (1,'a','one','x'),(2,'b','two','y'); "+
-				"CREATE TABLE bulk (id int PRIMARY KEY, pad text)")
-			cell := twfbCell{src: src, tgt: tgt, streamID: tag, slotName: tag}
-			run := startTWFBRun(cell.streamer())
-			if !tgt.waitRow(t, "kd", 2, run, 180*time.Second) {
-				t.Fatalf("the cold start never delivered the seed (%v)", run.stop(t))
-			}
-			cell.waitStreaming(t, run)
-			src.exec(t, "INSERT INTO bulk SELECT g, repeat('x', 200) FROM generate_series(1, 1000) g")
-			src.exec(t, "ALTER TABLE kd ADD COLUMN n int NOT NULL DEFAULT 0; INSERT INTO kd (id,k,v,doomed) VALUES (3,'c','three','z')")
-			src.exec(t, "ALTER TABLE kd DROP COLUMN doomed; INSERT INTO kd (id,k,v) VALUES (4,'d','four')")
-			ukdAwaitExitOrConverge(t, run, src, tgt, 240*time.Second)
-			if run.exited() {
-				t.Fatalf("the stream exited: %v (source %s, target %s)", run.err, ukdRows(t, src), ukdRows(t, tgt))
-			}
-			if s, g := ukdRows(t, src), ukdRows(t, tgt); s != g {
-				_ = run.stop(t)
-				t.Fatalf("source %s, target %s", s, g)
-			}
-			_ = run.stop(t)
-		})
+	shapes := []struct {
+		name, tag, create, txn1, txn2 string
+	}{
+		{
+			"column dropped ahead", "a",
+			"CREATE TABLE kd (id int PRIMARY KEY, k varchar(20) NOT NULL, v varchar(20), doomed varchar(20) UNIQUE); " +
+				"ALTER TABLE kd REPLICA IDENTITY FULL; INSERT INTO kd VALUES (1,'a','one','x'),(2,'b','two','y')",
+			"ALTER TABLE kd ADD COLUMN n int NOT NULL DEFAULT 0; INSERT INTO kd (id,k,v,doomed) VALUES (3,'c','three','z')",
+			"ALTER TABLE kd DROP COLUMN doomed; INSERT INTO kd (id,k,v) VALUES (4,'d','four')",
+		},
+		{
+			"key dropped, duplicate, then column dropped", "b",
+			"CREATE TABLE kd (id int NOT NULL, k varchar(20) NOT NULL, v varchar(20), doomed varchar(20)); " +
+				"CREATE UNIQUE INDEX kd_doomed ON kd (doomed); " +
+				"ALTER TABLE kd REPLICA IDENTITY FULL; INSERT INTO kd VALUES (1,'a','one','x'),(2,'b','two','y')",
+			"DROP INDEX kd_doomed; INSERT INTO kd (id,k,v,doomed) VALUES (3,'c','three','x')",
+			"ALTER TABLE kd DROP COLUMN doomed; INSERT INTO kd (id,k,v) VALUES (4,'d','four')",
+		},
 	}
+	for _, sh := range shapes {
+		for _, tg := range []struct {
+			engine string
+			mk     func(string) twfbDB
+		}{{"postgres", pgNew}, {"mysql", myNew}} {
+			t.Run(sh.name+"/into "+tg.engine, func(t *testing.T) {
+				tag := "ukdr3k" + sh.tag + tg.engine[:2]
+				src, tgt := pgNew(tag+"_s"), tg.mk(tag+"_t")
+				src.exec(t, sh.create+"; CREATE TABLE bulk (id int PRIMARY KEY, pad text)")
+				cell := twfbCell{src: src, tgt: tgt, streamID: tag, slotName: tag}
+				run := startTWFBRun(cell.streamer())
+				if !tgt.waitRow(t, "kd", 2, run, 180*time.Second) {
+					t.Fatalf("the cold start never delivered the seed (%v)", run.stop(t))
+				}
+				cell.waitStreaming(t, run)
+				src.exec(t, "INSERT INTO bulk SELECT g, repeat('x', 200) FROM generate_series(1, 1000) g")
+				src.exec(t, sh.txn1)
+				src.exec(t, sh.txn2)
+				ukdAwaitExitOrConverge(t, run, src, tgt, 240*time.Second)
+				refusal := ukdR3RequireNoMergeRefusal(t, run, src, tgt, ir.UniqueKeyDoorAtSchemaChange)
+
+				// A plain restart cannot pass the DROP COLUMN: it refuses at open.
+				again := startTWFBRun(cell.streamer())
+				ukdAwaitExitOrConverge(t, again, src, tgt, 120*time.Second)
+				ukdR3RequireNoMergeRefusal(t, again, src, tgt, ir.UniqueKeyDoorAtOpen)
+
+				// The printed remedy: drop the key on the target, start again.
+				k := refusal.Keys[0]
+				stmt := "ALTER TABLE kd DROP INDEX " + k.Key
+				switch {
+				case tg.engine == "postgres" && k.Constraint:
+					stmt = "ALTER TABLE kd DROP CONSTRAINT " + k.Key
+				case tg.engine == "postgres":
+					stmt = "DROP INDEX " + k.Key
+				}
+				tgt.exec(t, stmt)
+				ukdConvergeAndResume(t, cell.streamer(), src, tgt, "INSERT INTO kd (id,k,v) VALUES (8,'r','eight')")
+			})
+		}
+	}
+}
+
+// ukdR3RequireNoMergeRefusal requires run to have refused with the
+// unique-key door at when, row 1 intact and no target row the source lacks.
+func ukdR3RequireNoMergeRefusal(t *testing.T, run *twfbRun, src, tgt twfbDB, when ir.UniqueKeyDoorWhen) *ir.SourceUniqueKeyAbsentError {
+	t.Helper()
+	if !run.exited() {
+		_ = run.stop(t)
+		t.Fatalf("nothing refused (source %s, target %s)", ukdRows(t, src), ukdRows(t, tgt))
+	}
+	var refusal *ir.SourceUniqueKeyAbsentError
+	if !errors.As(run.err, &refusal) || refusal.When != when || len(refusal.Keys) == 0 {
+		t.Fatalf("refused with %v; want SOURCE-UNIQUE-KEY-ABSENT at %v", run.err, when)
+	}
+	t.Logf("refusal (%v): %v", when, run.err)
+	s, g := ukdRows(t, src), ukdRows(t, tgt)
+	if !strings.Contains(g, "1|a|one") {
+		t.Fatalf("row 1 changed: target %s", g)
+	}
+	for _, row := range strings.Split(g, ",") {
+		if row != "" && !strings.Contains(","+s+",", ","+row+",") {
+			t.Fatalf("the target holds %q, which the source does not (source %s)", row, s)
+		}
+	}
+	return refusal
 }

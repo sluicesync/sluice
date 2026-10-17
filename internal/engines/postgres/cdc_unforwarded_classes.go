@@ -780,32 +780,40 @@ func (r *CDCReader) captureUnforwardedBaseline(ctx context.Context) error {
 //
 // uniqueKeysMoved reports a unique key the relation lost with a dropped
 // column ([uniqueKeysLostWithColumn]): the caller hands it on to the
-// pipeline's unique-key compare.
-func (r *CDCReader) gradeUnforwardedClasses(ctx context.Context, relationID uint32, entry *relationCacheEntry) (uniqueKeysMoved bool, err error) {
+// pipeline's unique-key compare. The re-baseline is NOT done here: the
+// caller runs rebaseline only once the boundary carrying that report has
+// been sent (round-4 review LOW). A reader retry in between then starts from
+// the old baseline (carried, GC-32) and reports the lost key again, where a
+// re-baseline taken first would drop it — and for a dropped generated column
+// nothing else marks the boundary.
+func (r *CDCReader) gradeUnforwardedClasses(ctx context.Context, relationID uint32, entry *relationCacheEntry) (uniqueKeysMoved bool, rebaseline func(), err error) {
+	noop := func() {}
 	r.unforwarded.mu.Lock()
 	armed := r.unforwarded.facts != nil
 	prior := r.unforwarded.facts[relationID]
 	r.unforwarded.mu.Unlock()
 	if !armed || r.db == nil || !r.relationInScope(entry.Schema, entry.Name) {
-		return false, nil
+		return false, noop, nil
 	}
 	facts, err := readRelationFacts(ctx, r.db, relationID)
 	if err != nil {
-		return false, fmt.Errorf("postgres: cdc: relation %s.%s: read the schema objects logical replication does not carry: %w", entry.Schema, entry.Name, err)
+		return false, noop, fmt.Errorf("postgres: cdc: relation %s.%s: read the schema objects logical replication does not carry: %w", entry.Schema, entry.Name, err)
 	}
 	cur := facts[relationID]
 	if cur == nil {
-		return false, nil // dropped since the message was written; the DML path owns that
+		return false, noop, nil // dropped since the message was written; the DML path owns that
 	}
 	if prior != nil {
 		if deltas := diffRelationFacts(prior, cur); len(deltas) > 0 {
-			return false, &terminalPGError{err: unforwardedChangeError(entry.Schema, entry.Name, deltas)}
+			return false, noop, &terminalPGError{err: unforwardedChangeError(entry.Schema, entry.Name, deltas)}
 		}
 	}
-	r.unforwarded.mu.Lock()
-	r.unforwarded.facts[relationID] = cur
-	r.unforwarded.mu.Unlock()
-	return len(uniqueKeysLostWithColumn(prior, cur)) > 0, nil
+	rebaseline = func() {
+		r.unforwarded.mu.Lock()
+		r.unforwarded.facts[relationID] = cur
+		r.unforwarded.mu.Unlock()
+	}
+	return len(uniqueKeysLostWithColumn(prior, cur)) > 0, rebaseline, nil
 }
 
 func unforwardedChangeError(schema, table string, deltas []string) error {

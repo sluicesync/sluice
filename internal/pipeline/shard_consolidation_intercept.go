@@ -162,6 +162,11 @@ func interceptSchemaSnapshotsForCoordination(
 				post := normalizeSnapshotForComparison(normalizer, snap.IR)
 				cache[key] = post
 				version[key]++
+				// Judged before any write-ahead or ALTER when it only adds
+				// columns (uniqueKeyBoundaryGate.beforeDDLHook).
+				if router.uniqueKeysBeforeDDL != nil && !router.uniqueKeysBeforeDDL(ctx, snap) {
+					return
+				}
 				route := true
 				var firstOwed []*ir.Column
 				if !hadPre {
