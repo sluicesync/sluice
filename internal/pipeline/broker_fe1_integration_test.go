@@ -445,7 +445,9 @@ func fe1RunToTailThenCancel(t *testing.T, c *fe1Chain, b *SyncFromBackup) error 
 		case <-time.After(500 * time.Millisecond):
 		}
 		pos := fe1Q(t, c.dst, fmt.Sprintf(`SELECT coalesce(string_agg(source_position, ','), '') FROM sluice_cdc_state WHERE stream_id = '%s'`, b.StreamID))
-		if strings.Contains(pos, c.tailID) {
+		// Fully applied, not a frontier standing inside the tail (which
+		// names its id too): the "while idle" the doc promises.
+		if brokerTailFullyApplied(pos, c.tailID) {
 			time.Sleep(500 * time.Millisecond) // into the tick wait
 			cancel()
 			return <-done

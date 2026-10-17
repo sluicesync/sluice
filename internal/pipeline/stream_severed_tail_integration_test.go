@@ -57,6 +57,7 @@ package pipeline
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -467,7 +468,11 @@ func (c *sevChain) broker() {
 			defer func() { _ = recover() }()
 			pos = sevQuery(t, c.e.driver, c.brk, posQ)
 		}()
-		if strings.Contains(pos, tail) {
+		// Fully applied through the tail, not merely standing inside it: a
+		// frontier token inside the tail carries its id too, and cancelling
+		// there compared a target still missing the tail's later
+		// transactions (SEVERED-TAIL-BROKER-SENTINEL-DIVERGES).
+		if brokerTailFullyApplied(pos, tail) {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -475,7 +480,13 @@ func (c *sevChain) broker() {
 		}
 	}
 	cancel()
-	<-done
+	// Cancelled while idle between polls: a clean exit, or a cancellation
+	// surfacing through a poll. A partial-incremental refusal here means
+	// the wait above let the cancel land mid-apply, and the compare below
+	// would grade a half-applied tail.
+	if err := <-done; err != nil && (!errors.Is(err, context.Canceled) || strings.Contains(err.Error(), BrokerIncrementalPartialMarker)) {
+		t.Fatalf("broker exit after reaching the chain tail: %v", err)
+	}
 	c.compare(c.brk, "broker")
 }
 
