@@ -198,3 +198,36 @@ func TestUncoveredTargetUniqueKeys_TargetOnlyColumns(t *testing.T) {
 		t.Errorf("a table the source no longer has must not be judged here, got %v", got)
 	}
 }
+
+// TestUncoveredTargetUniqueKeys_ColumnWeakened pins the collation direction
+// (round-2 review MEDIUM-2) over each part shape it reaches — a whole
+// column, a prefix, a composite key where only one column is weakened —
+// and the shapes it must leave alone: an expression part (the functional
+// key guard's) and a nil option (the caller cannot order the pair).
+func TestUncoveredTargetUniqueKeys_ColumnWeakened(t *testing.T) {
+	pkID := ukcKey("PRIMARY", ukcCol("id"))
+	weakK := func(s, tc string) bool { return strings.EqualFold(s, "k") && strings.EqualFold(tc, "k") }
+	cells := []struct {
+		name     string
+		source   *ir.Index
+		target   *ir.Index
+		weakened func(string, string) bool
+		want     string
+	}{
+		{"whole column, weakened", ukcKey("kd_k", ukcCol("k")), ukcKey("kd_k", ukcCol("k")), weakK, "kd_k"},
+		{"whole column, not weakened", ukcKey("kd_k", ukcCol("k")), ukcKey("kd_k", ukcCol("k")), func(string, string) bool { return false }, ""},
+		{"whole column, nil option", ukcKey("kd_k", ukcCol("k")), ukcKey("kd_k", ukcCol("k")), nil, ""},
+		{"prefix, weakened", ukcKey("kd_k", ukcPrefix("k", 4)), ukcKey("kd_k", ukcPrefix("k", 8)), weakK, "kd_k"},
+		{"composite, the weakened column implied", ukcKey("kd_ka", ukcCol("k"), ukcCol("a")), ukcKey("kd_ka", ukcCol("k"), ukcCol("a")), weakK, "kd_ka"},
+		{"composite, a stricter source subset avoids it", ukcKey("kd_a", ukcCol("a")), ukcKey("kd_ka", ukcCol("k"), ukcCol("a")), weakK, ""},
+		{"expression parts are not judged", ukcKey("kd_e", ukcExpr("lower(k)", "mysql")), ukcKey("kd_e", ukcExpr("lower(k)", "mysql")), weakK, ""},
+	}
+	for _, c := range cells {
+		t.Run(c.name, func(t *testing.T) {
+			got := UncoveredTargetUniqueKeysWith(ukcTable(pkID, c.source), ukcTable(pkID, c.target), CoverOptions{ColumnWeakened: c.weakened})
+			if ukcNames(got) != c.want {
+				t.Fatalf("uncovered = %q, want %q", ukcNames(got), c.want)
+			}
+		})
+	}
+}

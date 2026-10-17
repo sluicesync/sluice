@@ -49,18 +49,25 @@ import (
 // ukdRows reads table kd as a sorted multiset of "id|k|v", NULL as "∅".
 func ukdRows(t *testing.T, db twfbDB) string {
 	t.Helper()
+	return ukdRowsOf(t, db, "kd")
+}
+
+// ukdRowsOf is [ukdRows] over another table.
+func ukdRowsOf(t *testing.T, db twfbDB, table string) string {
+	t.Helper()
 	conn, err := sql.Open(db.driver(), db.dsn)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
 	defer func() { _ = conn.Close() }()
-	q := "SELECT COALESCE(CAST(id AS CHAR), '∅'), COALESCE(k, '∅'), COALESCE(v, '∅') FROM kd"
+	q := "SELECT COALESCE(CAST(id AS CHAR), '∅'), COALESCE(k, '∅'), COALESCE(v, '∅') FROM " + table
 	if db.engine == "postgres" {
-		q = "SELECT COALESCE(id::text, '∅'), COALESCE(k, '∅'), COALESCE(v, '∅') FROM kd"
+		// k::text: a bpchar column reads without its padding, as MySQL's CHAR does.
+		q = "SELECT COALESCE(id::text, '∅'), COALESCE(k::text, '∅'), COALESCE(v, '∅') FROM " + table
 	}
 	rows, err := conn.Query(q)
 	if err != nil {
-		t.Fatalf("read kd: %v", err)
+		t.Fatalf("read %s: %v", table, err)
 	}
 	defer func() { _ = rows.Close() }()
 	var out []string

@@ -2347,7 +2347,7 @@ func (s *Streamer) runOnce(ctx context.Context) (err error) {
 	// dispatch branch above alike and consults no persisted state. Also
 	// arms the mid-stream re-check for a source whose change stream
 	// carries no DDL (unique_key_door.go).
-	if err := s.phaseRefuseTargetOnlyUniqueKeys(ctx, applier, streamID); err != nil {
+	if err := s.phaseRefuseTargetOnlyUniqueKeys(ctx, applier, streamID, warmResumed); err != nil {
 		return err
 	}
 

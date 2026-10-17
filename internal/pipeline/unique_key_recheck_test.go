@@ -204,7 +204,76 @@ func TestInterceptUniqueKeyChecks(t *testing.T) {
 			t.Fatalf("a cancellation surfaced %v", err)
 		}
 	})
-	t.Run("the boundary check runs on a moved column list, not on the first snapshot", func(t *testing.T) {
+	refusingBoundary := func(tables *[]string) func(context.Context, string, string) (*ir.SourceUniqueKeyAbsentError, error) {
+		return func(_ context.Context, _, table string) (*ir.SourceUniqueKeyAbsentError, error) {
+			*tables = append(*tables, table)
+			return &ir.SourceUniqueKeyAbsentError{When: ir.UniqueKeyDoorAtSchemaChange}, nil
+		}
+	}
+	keyByTable := func(_, table string) string { return uniqueKeyColsKey("", table) }
+	t.Run("a FIRST snapshot that differs from the open door's read is checked (round-2 HIGH-1)", func(t *testing.T) {
+		var h ukrHarness
+		var tables []string
+		cfg := uniqueKeyChecks{
+			maxFailures: 3, boundary: refusingBoundary(&tables), colsKey: keyByTable,
+			seedCols: map[string]string{uniqueKeyColsKey("", "kd"): columnList(ukrSnap("kd", "id", "k", "b").IR)},
+		}
+		// The table's first snapshot of the run already lacks b: the DROP
+		// COLUMN came before the table's first change in the run.
+		got, err := h.run(t, ctx, cfg, []ir.Change{ukrSnap("kd", "id", "k"), watchedRow}, make([]time.Duration, 2))
+		if strings.Join(tables, ",") != "kd" || !errors.Is(err, ir.ErrSourceUniqueKeyAbsent) || len(got) != 0 {
+			t.Fatalf("checked %v, forwarded %d, err=%v; want the first snapshot checked and withheld", tables, len(got), err)
+		}
+	})
+	t.Run("a first snapshot matching the open door's read is not checked", func(t *testing.T) {
+		var h ukrHarness
+		var tables []string
+		cfg := uniqueKeyChecks{
+			maxFailures: 3, boundary: refusingBoundary(&tables), colsKey: keyByTable,
+			seedCols: map[string]string{uniqueKeyColsKey("", "kd"): columnList(ukrSnap("kd", "id", "k").IR)},
+		}
+		got, err := h.run(t, ctx, cfg, []ir.Change{ukrSnap("kd", "k", "id"), watchedRow}, make([]time.Duration, 2))
+		if len(tables) != 0 || err != nil || len(got) != 2 {
+			t.Fatalf("checked %v, forwarded %d, err=%v", tables, len(got), err)
+		}
+	})
+	t.Run("a boundary read failure stops the stream at once, outside the periodic budget (round-2 MEDIUM-1)", func(t *testing.T) {
+		var h ukrHarness
+		cfg := uniqueKeyChecks{
+			maxFailures: 3, colsKey: keyByTable,
+			seedCols: map[string]string{uniqueKeyColsKey("", "kd"): columnList(ukrSnap("kd", "id", "k", "b").IR)},
+			boundary: func(context.Context, string, string) (*ir.SourceUniqueKeyAbsentError, error) {
+				return nil, errors.New("catalog down")
+			},
+		}
+		got, err := h.run(t, ctx, cfg, []ir.Change{ukrSnap("kd", "id", "k"), watchedRow}, make([]time.Duration, 2))
+		if err == nil || !strings.Contains(err.Error(), SourceUniqueKeyRecheckFailedMarker) || errors.Is(err, ir.ErrSourceUniqueKeyAbsent) {
+			t.Fatalf("err=%v; want the fail-closed %s", err, SourceUniqueKeyRecheckFailedMarker)
+		}
+		if len(got) != 0 {
+			t.Fatalf("forwarded=%d; the unjudged snapshot and what follows must be withheld", len(got))
+		}
+	})
+	t.Run("a hold released by the cap on its commit leaves the transaction closed (round-2 L-b)", func(t *testing.T) {
+		var h ukrHarness
+		checks := 0
+		changes := []ir.Change{begin}
+		for i := 0; i < uniqueKeyHoldCap-2; i++ {
+			changes = append(changes, otherRow)
+		}
+		// The cap lands on the commit; then a row outside any transaction. The
+		// unwatched row between them is received only once the commit has
+		// been judged, so the clock moves for the watched row alone.
+		changes = append(changes, commit, otherRow, watchedRow)
+		advance := make([]time.Duration, len(changes))
+		advance[0] = 11 * time.Second
+		advance[len(advance)-1] = 11 * time.Second
+		_, _ = h.run(t, ctx, periodic(pass(&checks)), changes, advance)
+		if checks != 2 {
+			t.Fatalf("checks=%d; want 2 — the cap's check, then the out-of-transaction watched row's", checks)
+		}
+	})
+	t.Run("the boundary check runs on a moved column list, not on an unseeded first snapshot", func(t *testing.T) {
 		var h ukrHarness
 		var tables []string
 		cfg := uniqueKeyChecks{maxFailures: 3, boundary: func(_ context.Context, _, table string) (*ir.SourceUniqueKeyAbsentError, error) {

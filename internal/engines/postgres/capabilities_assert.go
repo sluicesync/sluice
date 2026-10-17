@@ -30,6 +30,7 @@ var (
 	// registry holds an Engine value, see init()).
 	_ ir.Engine                         = Engine{}
 	_ ir.CollationResolverProvider      = Engine{}
+	_ ir.CollationLooseningResolver     = Engine{} // the unique-key door's collation direction (MEDIUM-2)
 	_ irbackup.SnapshotOpener           = Engine{}
 	_ ir.CDCReaderWithSlotOpener        = Engine{}
 	_ ir.CDCSchemaSnapshotNormalizer    = Engine{}

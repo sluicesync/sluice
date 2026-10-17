@@ -50,11 +50,20 @@ package pipeline
 //     pgoutput and the binlog are not re-checked: their own doors refuse a
 //     live unique-key DROP before the next row of the table (postgres and
 //     mysql cdc_unforwarded_classes.go).
-//   - After a SCHEMA CHANGE the stream forwarded to the target, on every
-//     source, for that table: a forwarded DROP COLUMN narrows a MySQL-family
-//     target key that included the column (UNIQUE(a,b) → UNIQUE(a)) while a
-//     Postgres source drops such an index outright, which no source-side
-//     door sees because the source's own change is the column.
+//   - At a SCHEMA BOUNDARY that moves a table's column list, on every
+//     source, for that table, after the schema-forward intercepts whether
+//     or not they forwarded it: a Postgres source drops an index outright
+//     with a column it covers, a forwarded DROP COLUMN narrows a
+//     MySQL-family target key that included the column (UNIQUE(a,b) →
+//     UNIQUE(a)), and a DROP COLUMN at the first boundary after a cold start
+//     is not forwarded at all (ADR-0091 §3), leaving the target's column and
+//     its key — none of which a source-side door sees, because the source's
+//     own change is the column. A table's FIRST boundary of the run is
+//     compared with the column list this door read at open (pgoutput sends
+//     a snapshot at each table's first Relation of a session, so a DROP
+//     COLUMN made before the table's first change arrives as that first
+//     boundary; round-2 review HIGH-1). A catalog read that fails there
+//     stops the stream (restartable) rather than pass the boundary unjudged.
 //
 // Tables live-added while the stream runs (ADR-0034) join the re-check only
 // at the next start; `schema add-table` judged a pre-created one before
@@ -153,6 +162,19 @@ type uniqueKeyDoorState struct {
 	// periodic arms the periodic re-check: a source whose change stream
 	// carries no DDL.
 	periodic bool
+	// openCols is each in-scope source table's column list as the
+	// stream-open door read it, keyed by [uniqueKeyColsKey]: the boundary
+	// check's baseline for a table's FIRST schema snapshot of the run (the
+	// pgoutput reader emits one at each table's first Relation of a
+	// session, so a DROP COLUMN made before the table's first change in the
+	// run arrives as that first snapshot — round-2 review HIGH-1).
+	openCols map[string]string
+}
+
+// uniqueKeyColsKey keys a table's column list by source namespace ("" on a
+// single-namespace stream) and folded table name.
+func uniqueKeyColsKey(namespace, table string) string {
+	return strings.ToLower(namespace) + "\x00" + strings.ToLower(table)
 }
 
 // sourceSeesUniqueKeyDDLLive reports a source whose change stream refuses a
@@ -169,7 +191,7 @@ func sourceSeesUniqueKeyDDLLive(source ir.Engine) bool {
 // phaseRefuseTargetOnlyUniqueKeys is the stream-open door (---- 4c ----).
 // It records the tables to watch for the mid-stream re-check on a source
 // that needs one.
-func (s *Streamer) phaseRefuseTargetOnlyUniqueKeys(ctx context.Context, applier ir.ChangeApplier, streamID string) error {
+func (s *Streamer) phaseRefuseTargetOnlyUniqueKeys(ctx context.Context, applier ir.ChangeApplier, streamID string, warmResumed bool) error {
 	s.uniqueKeyDoor = nil
 	s.uniqueKeyRecheckErr.Store(nil)
 	scopes, err := s.uniqueKeyDoorScopes(ctx)
@@ -180,7 +202,10 @@ func (s *Streamer) phaseRefuseTargetOnlyUniqueKeys(ctx context.Context, applier 
 	if err != nil {
 		return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("pipeline: unique-key door: %w", err))
 	}
-	absent, watched, err := s.compareUniqueKeys(ctx, scopes, liveAdded, nil)
+	openCols := map[string]string{}
+	absent, watched, err := s.compareUniqueKeys(ctx, scopes, uniqueKeyCompare{
+		liveAdded: liveAdded, cols: openCols, collations: s.uniqueKeyCollationsArmed(!warmResumed),
+	})
 	if err != nil {
 		return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("pipeline: unique-key door: %w", err))
 	}
@@ -188,7 +213,7 @@ func (s *Streamer) phaseRefuseTargetOnlyUniqueKeys(ctx context.Context, applier 
 		return s.uniqueKeyRefusal(absent, ir.UniqueKeyDoorAtOpen)
 	}
 	periodic := !sourceSeesUniqueKeyDDLLive(s.Source) && len(watched) > 0
-	s.uniqueKeyDoor = &uniqueKeyDoorState{scopes: scopes, watched: watched, periodic: periodic}
+	s.uniqueKeyDoor = &uniqueKeyDoorState{scopes: scopes, watched: watched, periodic: periodic, openCols: openCols}
 	if periodic {
 		slog.InfoContext(ctx, "unique-key door: this source's change stream carries no DDL; re-checking the target's "+
 			"unique keys against the source's periodically",
@@ -197,6 +222,27 @@ func (s *Streamer) phaseRefuseTargetOnlyUniqueKeys(ctx context.Context, applier 
 			slog.Int("tables", countWatched(watched)))
 	}
 	return nil
+}
+
+// uniqueKeyCollationsArmed reports whether a comparison judges key-column
+// collation direction ([keyColumnWeakening]). A source whose change stream
+// carries DDL hands a source column's collation change to the key-collation
+// door (key_collation_boundary.go), which FORWARDS it to the target in
+// forward mode; judging it here at a warm open, before the forward is
+// replayed, would refuse a stream that heals itself (the
+// TestKeyCollationFirstBoundary warm cells), and judging it at a boundary
+// would duplicate that door. So on such a source the direction is judged
+// only at a cold start's open, when no earlier change is waiting to be
+// replayed and a mismatch can only be a target pre-created that way. A
+// source whose stream carries no DDL (VStream, the trigger engines) has no
+// such door for a stopped-window change, and is judged on every check: the
+// VStream half of VSTREAM-KEY-COLUMN-COLLATION.
+//
+// Stated residual: a DDL-carrying source whose key column is ALTERed during
+// a cold start's copy differs from the target created before it at that
+// open, and refuses (loudly) although the forward would have healed it.
+func (s *Streamer) uniqueKeyCollationsArmed(coldOpen bool) bool {
+	return coldOpen || !sourceSeesUniqueKeyDDLLive(s.Source)
 }
 
 // uniqueKeyRefusal builds the refusal for this stream.
@@ -291,16 +337,32 @@ func (s *Streamer) uniqueKeyDoorLiveAdded(ctx context.Context, applier ir.Change
 	return out, nil
 }
 
+// uniqueKeyCompare is one comparison's inputs beyond the scopes.
+type uniqueKeyCompare struct {
+	// liveAdded holds tables live-added to the stream (the open door).
+	liveAdded map[string]bool
+	// only, when non-nil, restricts the read to those tables per scope
+	// (the re-checks).
+	only map[int][]string
+	// cols, when non-nil, receives each source table's column list (the
+	// open door's baseline for the boundary check).
+	cols map[string]string
+	// collations arms the collation direction ([keyColumnWeakening]); see
+	// [Streamer.uniqueKeyCollationsArmed].
+	collations bool
+}
+
 // compareUniqueKeys reads both catalogs for every scope and returns the
 // target unique keys no source key implies (minus the accepted ones), and
-// per scope the tables to watch mid-stream. only, when non-nil, restricts
-// the read to those tables per scope (the re-check).
-func (s *Streamer) compareUniqueKeys(
-	ctx context.Context,
-	scopes []uniqueKeyDoorScope,
-	liveAdded map[string]bool,
-	only map[int][]string,
-) ([]ir.AbsentUniqueKey, map[int][]string, error) {
+// per scope the tables to watch mid-stream.
+func (s *Streamer) compareUniqueKeys(ctx context.Context, scopes []uniqueKeyDoorScope, req uniqueKeyCompare) ([]ir.AbsentUniqueKey, map[int][]string, error) {
+	liveAdded, only, cols := req.liveAdded, req.only, req.cols
+	weakening := func(st, tt *ir.Table) func(string, string) bool {
+		if !req.collations {
+			return nil
+		}
+		return keyColumnWeakening(s.Source, s.Target, st, tt)
+	}
 	accept := parseAcceptedUniqueKeys(s.AcceptTargetOnlyUniqueKeys)
 	var absent []ir.AbsentUniqueKey
 	watched := map[int][]string{}
@@ -345,6 +407,9 @@ func (s *Streamer) compareUniqueKeys(
 			return nil, nil, err
 		}
 		for _, st := range src {
+			if cols != nil {
+				cols[uniqueKeyColsKey(sc.namespace, st.Name)] = columnList(st)
+			}
 			tt := matchTargetTable(tgt, st.Name)
 			if tt == nil {
 				continue // not created yet, or dropped: other doors' question
@@ -352,7 +417,8 @@ func (s *Streamer) compareUniqueKeys(
 			if hasSecondaryUniqueKey(tt) {
 				watched[i] = append(watched[i], st.Name)
 			}
-			for _, key := range uncoveredTargetKeys(st, tt, s.Target.Name()) {
+			weakened := weakening(st, tt)
+			for _, key := range uncoveredTargetKeys(st, tt, s.Target.Name(), weakened) {
 				if accept.allows(sc.namespace, tt.Name, key.Name) || accept.allows(sc.targetNamespace, tt.Name, key.Name) {
 					continue
 				}
@@ -360,7 +426,7 @@ func (s *Streamer) compareUniqueKeys(
 				if sc.targetNamespace != "" {
 					table = sc.targetNamespace + "." + table
 				}
-				absent = append(absent, absentUniqueKey(table, tt, key))
+				absent = append(absent, absentUniqueKey(table, tt, key, weakened))
 			}
 		}
 	}
@@ -494,7 +560,9 @@ func applyUniqueKeyFacts(ctx context.Context, reader any, schema *ir.Schema) err
 			for i := range idx.Columns {
 				if i < len(f.PartCollations) && f.PartCollations[i] != "" {
 					idx.Columns[i].Collation = f.PartCollations[i]
-					idx.Columns[i].CollationDialect = "postgres"
+					if i < len(f.Parts) {
+						idx.Columns[i].CollationDialect = f.Parts[i].CollationDialect
+					}
 				}
 			}
 			kept = append(kept, idx)
@@ -505,16 +573,152 @@ func applyUniqueKeyFacts(ctx context.Context, reader any, schema *ir.Schema) err
 				t.PrimaryKey = nil
 			}
 		}
+		addUnlistedUniqueKeys(t, tf)
 	}
 	return nil
+}
+
+// addUnlistedUniqueKeys adds to t every enforcing unique index the facts
+// describe and the schema read did not list — a Postgres partitioned
+// table's, whose keys the reader's index read (ordinary tables only) leaves
+// out, so without this the door would see a partitioned target as keyless
+// and pass it (round-2 review L-a).
+func addUnlistedUniqueKeys(t *ir.Table, tf map[string]ir.UniqueKeyFact) {
+	listed := map[string]bool{}
+	if t.PrimaryKey != nil {
+		listed[t.PrimaryKey.Name] = true
+	}
+	for _, idx := range t.Indexes {
+		if idx != nil {
+			listed[idx.Name] = true
+		}
+	}
+	names := make([]string, 0, len(tf))
+	for name := range tf {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		f := tf[name]
+		if listed[name] || !f.Enforcing || len(f.Parts) == 0 {
+			continue
+		}
+		idx := &ir.Index{
+			Name: name, Unique: true, Columns: append([]ir.IndexColumn(nil), f.Parts...),
+			ConstraintNullsNotDistinct: f.NullsNotDistinct, Predicate: f.Predicate, PredicateDialect: f.PredicateDialect,
+		}
+		if f.Primary && t.PrimaryKey == nil {
+			t.PrimaryKey = idx
+			continue
+		}
+		t.Indexes = append(t.Indexes, idx)
+	}
 }
 
 // uncoveredTargetKeys is the cover rule with the source's secondary index
 // names mapped to the names the target engine holds them under (a Postgres
 // target table-prefixes them, translate.PGEffectiveIndexName), since a
 // cross-dialect expression or partial key is matched by name.
-func uncoveredTargetKeys(source, target *ir.Table, targetEngine string) []*ir.Index {
-	return irdiff.UncoveredTargetUniqueKeys(translate.WithTargetIndexNames(source, targetEngine), target)
+//
+// Two source keys can map to one target name (`kd_x` and `x` on table kd
+// both become `kd_x`; only an operator-built target reaches that, since
+// sluice's own writer would have refused the collision): the name then
+// identifies neither, so both lose it and can cover a target key only
+// structurally (round-2 review L-c).
+func uncoveredTargetKeys(source, target *ir.Table, targetEngine string, weakened func(sourceColumn, targetColumn string) bool) []*ir.Index {
+	mapped := translate.WithTargetIndexNames(source, targetEngine)
+	if mapped != nil {
+		seen := map[string]int{}
+		for _, idx := range mapped.Indexes {
+			if idx != nil && idx.Unique && idx.Name != "" {
+				seen[strings.ToLower(idx.Name)]++
+			}
+		}
+		var out []*ir.Index
+		for i, idx := range mapped.Indexes {
+			if idx == nil || !idx.Unique || seen[strings.ToLower(idx.Name)] < 2 {
+				continue
+			}
+			if out == nil {
+				out = append([]*ir.Index(nil), mapped.Indexes...)
+			}
+			nameless := *idx
+			nameless.Name = ""
+			out[i] = &nameless
+		}
+		if out != nil {
+			t := *mapped
+			t.Indexes = out
+			mapped = &t
+		}
+	}
+	return irdiff.UncoveredTargetUniqueKeysWith(mapped, target, irdiff.CoverOptions{ColumnWeakened: weakened})
+}
+
+// keyColumnWeakening is the cover rule's collation direction for one table
+// pair (round-2 review MEDIUM-2): it reports a target column that equates
+// values its source column keeps apart (case, accents, trailing spaces),
+// read through each engine's [ir.CollationLooseningResolver]. A column
+// either side cannot classify is not weakened: an unknown is not evidence.
+//
+// It is armed for a same-family pair and for a Postgres-family target, and
+// returns nil otherwise. The lane it withholds, a Postgres or SQLite source
+// into a MySQL-family target, would refuse working configurations: a
+// Postgres text key is byte-exact, and the target column sluice creates for
+// it takes the target's default collation, which is case-insensitive
+// (`utf8mb4_0900_ai_ci`), so every such key would refuse at every open.
+// That lane's case-folding merge is the key-collation guard's
+// (KEY-COLLATION-PG-DEFAULT-TO-MYSQL), which refuses it at apply time for a
+// unique key beside a primary key and documents the primary key as
+// uncovered.
+//
+// A Postgres nondeterministic collation reports case AND accent loosening
+// because which one it folds is not recorded, so a MySQL `_as_ci` source
+// column against a Postgres ICU `ks-level2` target column refuses although
+// only case folds there: a named, conservative false refusal, which
+// --accept-target-only-unique-key answers.
+func keyColumnWeakening(source, target ir.Engine, st, tt *ir.Table) func(sourceColumn, targetColumn string) bool {
+	if source == nil || target == nil {
+		return nil
+	}
+	sr, ok1 := source.(ir.CollationLooseningResolver)
+	tr, ok2 := target.(ir.CollationLooseningResolver)
+	if !ok1 || !ok2 {
+		return nil
+	}
+	if !translate.SameStorageShapeFamily(source.Name(), target.Name()) && !translate.SameStorageShapeFamily(target.Name(), "postgres") {
+		return nil
+	}
+	return func(sourceColumn, targetColumn string) bool {
+		sc, tc := columnNamed(st, sourceColumn), columnNamed(tt, targetColumn)
+		if sc == nil || tc == nil {
+			return false
+		}
+		sl, sok := sr.CollationLoosening(sc.Type)
+		tl, tok := tr.CollationLoosening(tc.Type)
+		return sok && tok && tl&^sl != 0
+	}
+}
+
+// columnNamed finds a column by its exact name, else the one column equal
+// to it without case.
+func columnNamed(t *ir.Table, name string) *ir.Column {
+	var folded *ir.Column
+	n := 0
+	for _, c := range t.Columns {
+		switch {
+		case c == nil:
+		case c.Name == name:
+			return c
+		case strings.EqualFold(c.Name, name):
+			folded = c
+			n++
+		}
+	}
+	if n == 1 {
+		return folded
+	}
+	return nil
 }
 
 // matchTargetTable finds the target table for a source table: the exact
@@ -553,13 +757,21 @@ func hasSecondaryUniqueKey(t *ir.Table) bool {
 // constraint owns — a Postgres UNIQUE constraint, a named primary key — is
 // marked, since `DROP INDEX` refuses it (measured: a keyless table's unique
 // key lands on a Postgres target as a constraint, SQLSTATE 2BP01).
-func absentUniqueKey(table string, t *ir.Table, key *ir.Index) ir.AbsentUniqueKey {
-	return ir.AbsentUniqueKey{
+func absentUniqueKey(table string, t *ir.Table, key *ir.Index, weakened func(sourceColumn, targetColumn string) bool) ir.AbsentUniqueKey {
+	k := ir.AbsentUniqueKey{
 		Table:      table,
 		Key:        key.Name,
 		Columns:    renderKeyParts(key),
 		Constraint: key.ConstraintBacked || (key == t.PrimaryKey && key.ConstraintNamed),
 	}
+	if weakened != nil {
+		for _, c := range key.Columns {
+			if c.Expression == "" && weakened(c.Column, c.Column) {
+				k.LooserColumns = append(k.LooserColumns, c.Column)
+			}
+		}
+	}
+	return k
 }
 
 // renderKeyParts renders a key's parts for the refusal: "(k)", "(c(10))",

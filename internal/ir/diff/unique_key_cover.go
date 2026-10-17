@@ -83,18 +83,20 @@ package diff
 // subset rule still covers a key that only ADDS such a column to a key the
 // source enforces, which is the `--inject-shard-column` composite key).
 //
+// # Column collations
+//
+// A column collation is TRANSLATED between engines and even between
+// servers of one family (a MySQL 8 → MariaDB target takes
+// `utf8mb4_uca1400_*` names, Bug 305), so names are never compared. What
+// is compared, when the caller supplies [CoverOptions.ColumnWeakened], is
+// the direction: a plain part whose target column is case-, accent- or
+// pad-insensitive where its source column is sensitive is not implied,
+// because the target key forbids rows the source key allows. The caller
+// decides per engine pair whether it can tell (round-2 review MEDIUM-2).
+//
 // Not compared: DESC and NULLS ordering (they do not change which rows may
-// coexist); a functional part's hidden collation (the functional-key guard
-// owns it); and COLUMN collations, which the key-collation guard owns at
-// apply time on every lane EXCEPT a VStream source, where that guard is
-// unarmed (key_collation_boundary.go, F17) — so a VStream source column
-// moved from a `_ci` to a `_bin` collation while the stream was stopped is
-// seen by neither (stated residual). They are not compared here because a
-// column collation is TRANSLATED between engines and even between servers
-// of one family (a MySQL 8 → MariaDB target takes `utf8mb4_uca1400_*`
-// names, Bug 305), so an exact comparison refuses working configurations,
-// and no ordering of collations by strictness is available to compare
-// instead.
+// coexist); and a functional part's hidden collation (the functional-key
+// guard owns it).
 
 import (
 	"strings"
@@ -108,10 +110,32 @@ import (
 // read-back IR from their own engine's schema reader. A nil source table
 // returns nil: a table the source no longer has is not this question.
 func UncoveredTargetUniqueKeys(source, target *ir.Table) []*ir.Index {
+	return UncoveredTargetUniqueKeysWith(source, target, CoverOptions{})
+}
+
+// CoverOptions carries what the caller knows about a table pair that the
+// two read-back tables cannot say on their own.
+type CoverOptions struct {
+	// ColumnWeakened reports that the target column equates values the
+	// same-named source column keeps apart: a case-, accent- or
+	// pad-insensitive collation where the source's is sensitive. A plain
+	// part on such a column is then never implied, since two source rows
+	// distinct only in case would be one row under the target key. nil
+	// compares no column collations (the caller cannot order them for this
+	// engine pair).
+	ColumnWeakened func(sourceColumn, targetColumn string) bool
+}
+
+// UncoveredTargetUniqueKeysWith is [UncoveredTargetUniqueKeys] with the
+// caller's [CoverOptions].
+func UncoveredTargetUniqueKeysWith(source, target *ir.Table, opts CoverOptions) []*ir.Index {
 	if source == nil || target == nil {
 		return nil
 	}
-	r := coverRule{exact: hasCaseCollidingColumns(source) || hasCaseCollidingColumns(target)}
+	r := coverRule{
+		exact:    hasCaseCollidingColumns(source) || hasCaseCollidingColumns(target),
+		weakened: opts.ColumnWeakened,
+	}
 	sourceKeys := uniqueKeysOf(source)
 	sourceCols := make(map[string]bool, len(source.Columns))
 	for _, c := range source.Columns {
@@ -145,6 +169,8 @@ type coverRule struct {
 	// case (L7 of the round-1 review): folding would let `"Email"` vouch
 	// for `email`.
 	exact bool
+	// weakened is [CoverOptions.ColumnWeakened].
+	weakened func(sourceColumn, targetColumn string) bool
 }
 
 func (r coverRule) sameName(a, b string) bool {
@@ -271,6 +297,9 @@ func (r coverRule) partImplies(s, t ir.IndexColumn) bool {
 		return r.normalizeKeyText(s.Expression, sh) == r.normalizeKeyText(t.Expression, th)
 	}
 	if !r.sameName(s.Column, t.Column) {
+		return false
+	}
+	if r.weakened != nil && r.weakened(s.Column, t.Column) {
 		return false
 	}
 	switch {
