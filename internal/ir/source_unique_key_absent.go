@@ -104,16 +104,19 @@ const sourceUniqueKeyDropClause = "drop each named key on the target (`DROP INDE
 	"CONSTRAINT` for a constraint) and start again with the same `--stream-id`"
 
 // sourceUniqueKeyRecopyClause is the remedy for rows that may already have
-// merged. A re-copy ONTO the existing tables (--restart-from-scratch on an
-// upsert-copy source) keeps the key, so this check would refuse it again,
-// and it cannot remove a row a merge left behind (on a table with no
-// primary key the merged row carries the other row's identity); dropping
-// and re-creating the tables from the source does both.
-const sourceUniqueKeyRecopyClause = "re-copy from a clean target with `sluice sync start --reset-target-data --yes` " +
-	"and the same `--stream-id` (" + PgoutputSlotDropClause + "): it drops the stream's target tables, these keys " +
-	"with them, and copies them again from the source (destructive). A re-copy onto the existing tables " +
-	"(`--restart-from-scratch`) keeps the keys, so this check would refuse it again, and cannot remove a row a " +
-	"merge left behind."
+// merged: dropping and re-creating the tables from the source removes both
+// the key and any row a merge left behind (on a table with no primary key
+// the merged row carries the other row's identity). Both operator re-copies
+// do it on every source: --reset-target-data drops the tables, and an
+// operator --restart-from-scratch clears them too (streamer_coldstart.go,
+// freshCopyOperatorRestart.clearsTarget — even for VStream, whose snapshot
+// reader is the one ir.IdempotentCopyReader and whose AUTOMATIC re-snapshot
+// alone upserts onto the existing rows; Bug 320). Both measured converging
+// from this refusal (TestStreamer_UniqueKeyDoor_PostgresSource's clean
+// re-copy cells, TestStreamer_UniqueKeyDoor_TriggerCDC).
+const sourceUniqueKeyRecopyClause = "re-copy from a clean target: `sluice sync start --restart-from-scratch` " +
+	"or `--reset-target-data --yes`, with the same `--stream-id` (" + PgoutputSlotDropClause + "); both drop and " +
+	"re-create the stream's target tables from the source, these keys and any merged row with them (destructive)."
 
 func (e *SourceUniqueKeyAbsentError) remedy() string {
 	switch e.When {
