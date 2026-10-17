@@ -44,9 +44,70 @@ import (
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/engines/pgtrigger"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // ukdRows reads table kd as a sorted multiset of "id|k|v", NULL as "∅".
+// ukdAcceptValue reads db's table and returns the
+// --accept-target-only-unique-key value accepting its key as it is now
+// (`table.key=<fingerprint>`), read the way the door reads a target (the
+// engine's schema reader plus its unique-key facts); nil when the table or
+// key does not exist yet. A test takes it from the catalog the way an
+// operator takes it from the refusal.
+func ukdAcceptValue(t *testing.T, db twfbDB, table, key string) []string {
+	t.Helper()
+	eng, ok := engines.Get(db.engine)
+	if !ok {
+		t.Fatalf("engine %q not registered", db.engine)
+	}
+	ctx := context.Background()
+	sr, err := eng.OpenSchemaReader(ctx, db.dsn)
+	if err != nil {
+		t.Fatalf("open schema reader: %v", err)
+	}
+	defer migcore.CloseIf(sr)
+	schema, err := sr.ReadSchema(ctx)
+	if err != nil {
+		t.Fatalf("read schema: %v", err)
+	}
+	if err := applyUniqueKeyFacts(ctx, sr, schema); err != nil {
+		t.Fatalf("read unique-key facts: %v", err)
+	}
+	for _, tbl := range schema.Tables {
+		if !strings.EqualFold(tbl.Name, table) {
+			continue
+		}
+		keys := append([]*ir.Index{tbl.PrimaryKey}, tbl.Indexes...)
+		for _, idx := range keys {
+			if idx != nil && strings.EqualFold(idx.Name, key) {
+				return []string{table + "." + idx.Name + "=" + keyFingerprint(idx, tbl)}
+			}
+		}
+	}
+	return nil
+}
+
+// ukdAcceptFromRefusal returns the value a SOURCE-UNIQUE-KEY-ABSENT refusal
+// prints for key, as an operator would paste it.
+func ukdAcceptFromRefusal(t *testing.T, err error, key string) string {
+	t.Helper()
+	var refusal *ir.SourceUniqueKeyAbsentError
+	if !errors.As(err, &refusal) {
+		t.Fatalf("not a SOURCE-UNIQUE-KEY-ABSENT refusal: %v", err)
+	}
+	for _, k := range refusal.Keys {
+		if strings.EqualFold(k.Key, key) && k.Fingerprint != "" {
+			value := k.Table + "." + k.Key + "=" + k.Fingerprint
+			if !strings.Contains(err.Error(), "--accept-target-only-unique-key "+value) {
+				t.Fatalf("the refusal does not print the value %s: %v", value, err)
+			}
+			return value
+		}
+	}
+	t.Fatalf("the refusal names no key %s with a fingerprint: %v", key, err)
+	return ""
+}
+
 func ukdRows(t *testing.T, db twfbDB) string {
 	t.Helper()
 	return ukdRowsOf(t, db, "kd")
@@ -616,7 +677,7 @@ func TestStreamer_UniqueKeyDoor_WorkingConfigurations(t *testing.T) {
 		t.Logf("refusal: %v", run.err)
 		accepted := func() *Streamer {
 			s := cell.streamer()
-			s.AcceptTargetOnlyUniqueKeys = []string{"kd.kd_v"}
+			s.AcceptTargetOnlyUniqueKeys = []string{ukdAcceptFromRefusal(t, run.err, "kd_v")}
 			return s
 		}
 		ukdConvergeAndResume(t, accepted(), src, tgt, "INSERT INTO kd VALUES (9,'z','nine')")
@@ -741,7 +802,7 @@ func TestStreamer_UniqueKeyDoor_AddTable(t *testing.T) {
 			if tc.remedy == "accept" {
 				// The accepted key cannot hold the source's two rows: the copy
 				// must refuse loudly rather than merge them.
-				err = add([]string{tc.table + ".o_customer"})
+				err = add([]string{ukdAcceptFromRefusal(t, err, "o_customer")})
 				if err == nil {
 					t.Fatalf("the accepted key held two source rows for customer 7: ids %s",
 						tgt.scalar(t, "SELECT group_concat(id) FROM "+tc.table))

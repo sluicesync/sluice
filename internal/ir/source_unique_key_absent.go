@@ -78,14 +78,17 @@ type AbsentUniqueKey struct {
 	// stricter equality. The refusal names them, and an ALTER of each to a
 	// collation as strict as the source's is one more way to clear it.
 	LooserColumns []string
-	// AcceptedShape is the shape an --accept-target-only-unique-key
-	// acceptance of this key was bound to at the stream's start, when the
-	// key no longer has it (a forwarded DROP COLUMN narrowed it, say).
-	// AcceptedUnrecorded marks an accepted key the stream's start never saw
-	// (its table joined while the stream ran), whose acceptance therefore
-	// has no shape to hold it to.
-	AcceptedShape      string
-	AcceptedUnrecorded bool
+	// Shape and Fingerprint are the key's shape as it is now (its parts'
+	// columns, full types and effective collations, NULLS NOT DISTINCT, its
+	// predicate) and the short hash of it that an
+	// --accept-target-only-unique-key acceptance must carry. The refusal
+	// prints the exact flag value to pass.
+	Shape       string
+	Fingerprint string
+	// AcceptedFingerprint is the fingerprint an acceptance of this key
+	// carries when the key's shape no longer hashes to it (a forwarded DROP
+	// COLUMN narrowed it, a collation change loosened it).
+	AcceptedFingerprint string
 }
 
 // SourceUniqueKeyAbsentError is the refusal. Engine-neutral: the pipeline
@@ -117,14 +120,14 @@ func (e *SourceUniqueKeyAbsentError) Error() string {
 		if k.Constraint {
 			keys[i] += " [a constraint: ALTER TABLE " + k.Table + " DROP CONSTRAINT " + name + "]"
 		}
-		switch {
-		case k.AcceptedUnrecorded:
-			keys[i] += " [accepted by name, but this stream's start never saw the key (its table joined while the stream " +
-				"ran), so the acceptance has no shape to hold it to: restart with the same flag to record it]"
-		case k.AcceptedShape != "":
-			keys[i] += " [accepted by name as " + k.AcceptedShape + " at this stream's start; the acceptance covered that " +
-				"shape, not this one, and a narrower key merges rows the accepted one kept apart: drop it on the target, or, " +
-				"having checked it, restart with the same flag to accept the new shape]"
+		if k.AcceptedFingerprint != "" {
+			keys[i] += " [accepted with fingerprint " + k.AcceptedFingerprint + ", which is not this key's shape now: " +
+				"it has changed since it was accepted, and a narrower or looser key merges rows the accepted one kept " +
+				"apart]"
+		}
+		if k.Fingerprint != "" && name != "(unnamed)" {
+			keys[i] += " [shape " + k.Shape + "; to accept it as it is now: --accept-target-only-unique-key " +
+				k.Table + "." + name + "=" + k.Fingerprint + "]"
 		}
 		if len(k.LooserColumns) > 0 {
 			keys[i] += " [the target's " + strings.Join(k.LooserColumns, ", ") + " compares case-, accent- or " +
@@ -144,8 +147,8 @@ func (e *SourceUniqueKeyAbsentError) Error() string {
 
 // sourceUniqueKeyAcceptClause is the acknowledgement half of every remedy.
 const sourceUniqueKeyAcceptClause = "If a key is one the target should enforce beyond the source (one the target " +
-	"was built with on purpose), accept it by name with `--accept-target-only-unique-key <table>.<key>` (repeatable) " +
-	"on every start; the apply-time guard (UNIQUE-KEY-CONFLICT-OTHER-ROW) still refuses a merge through it wherever " +
+	"was built with on purpose), accept it with the `--accept-target-only-unique-key <table>.<key>=<fingerprint>` value printed beside the key " +
+	"(repeatable), on every start — the fingerprint binds the acceptance to the key's shape, so a key that later changes shape refuses again; the apply-time guard (UNIQUE-KEY-CONFLICT-OTHER-ROW) still refuses a merge through it wherever " +
 	"it can tell the rows apart."
 
 // sourceUniqueKeyDropClause is the drop-the-key remedy.
@@ -191,7 +194,7 @@ func (e *SourceUniqueKeyAbsentError) remedy() string {
 	switch e.When {
 	case UniqueKeyDoorAddTable:
 		return "Refusing before the table is copied or handed to the stream. Drop each named key on the target table " +
-			"and run add-table again, or accept it by name with `--accept-target-only-unique-key <table>.<key>`."
+			"and run add-table again, or accept it with the `--accept-target-only-unique-key <table>.<key>=<fingerprint>` value printed beside the key."
 	case UniqueKeyDoorAtSchemaChange:
 		return "Found at a source schema change that moved the table's columns (a Postgres source drops an index " +
 			"outright with a column it covers, while a forwarded DROP COLUMN narrows a MySQL-family key that " +

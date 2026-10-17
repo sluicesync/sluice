@@ -1594,6 +1594,12 @@ type Streamer struct {
 	uniqueKeyDoor         *uniqueKeyDoorState
 	uniqueKeyRecheckErr   atomic.Pointer[error]
 	uniqueKeyRecheckEvery time.Duration
+	// uniqueKeyBoundaryFault is a TEST SEAM: when non-nil, the boundary
+	// check calls it first and fails with its error, standing in for a
+	// transient catalog-read failure after a forwarded DDL — the stop that
+	// let round 5's next open re-bind an acceptance to a narrowed key
+	// (round-6 review MEDIUM-A). Nil outside tests.
+	uniqueKeyBoundaryFault func(snap ir.SchemaSnapshot) error
 
 	// serverSideRowFilters is the subset of [RowFilters] pushed into a VStream
 	// source's SERVER-side stream filter (cold-start COPY + warm-resume). It

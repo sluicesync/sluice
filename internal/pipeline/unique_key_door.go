@@ -114,6 +114,8 @@ package pipeline
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -177,9 +179,6 @@ type uniqueKeyDoorState struct {
 	// session, so a DROP COLUMN made before the table's first change in the
 	// run arrives as that first snapshot — round-2 review HIGH-1).
 	openCols map[string]string
-	// acceptedShapes is each accepted key's shape as the open door saw it
-	// ([uniqueKeyCompare.acceptedShapes]); read-only after open.
-	acceptedShapes map[string]string
 	// openTypes is each source table's column types as the open door read them.
 	openTypes map[string]map[string]ir.Type
 }
@@ -216,10 +215,10 @@ func (s *Streamer) phaseRefuseTargetOnlyUniqueKeys(ctx context.Context, applier 
 	if err != nil {
 		return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("pipeline: unique-key door: %w", err))
 	}
-	openCols, acceptedShapes, openTypes := map[string]string{}, map[string]string{}, map[string]map[string]ir.Type{}
+	openCols, openTypes := map[string]string{}, map[string]map[string]ir.Type{}
 	absent, watched, err := s.compareUniqueKeys(ctx, scopes, uniqueKeyCompare{
 		liveAdded: liveAdded, cols: openCols, collations: s.uniqueKeyCollationsArmed(!warmResumed),
-		acceptedShapes: acceptedShapes, recordAccepted: true, colTypes: openTypes,
+		colTypes: openTypes,
 	})
 	if err != nil {
 		return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("pipeline: unique-key door: %w", err))
@@ -229,7 +228,7 @@ func (s *Streamer) phaseRefuseTargetOnlyUniqueKeys(ctx context.Context, applier 
 	}
 	periodic := !sourceSeesUniqueKeyDDLLive(s.Source) && len(watched) > 0
 	s.uniqueKeyDoor = &uniqueKeyDoorState{
-		scopes: scopes, watched: watched, periodic: periodic, openCols: openCols, acceptedShapes: acceptedShapes, openTypes: openTypes,
+		scopes: scopes, watched: watched, periodic: periodic, openCols: openCols, openTypes: openTypes,
 	}
 	if periodic {
 		slog.InfoContext(ctx, "unique-key door: this source's change stream carries no DDL; re-checking the target's "+
@@ -372,35 +371,6 @@ type uniqueKeyCompare struct {
 	// collations arms the collation direction ([keyColumnWeakening]); see
 	// [Streamer.uniqueKeyCollationsArmed].
 	collations bool
-	// acceptedShapes binds each --accept-target-only-unique-key acceptance
-	// to the key's shape as accepted (round-5 review MEDIUM-1): the open
-	// door records it (recordAccepted), and a later check honours the
-	// acceptance only while the key still has that shape. The flag names a
-	// key, and a forwarded DROP COLUMN can narrow a MySQL-family key under
-	// the same name (UNIQUE (a, x) becomes UNIQUE (a)); passing it by name
-	// let the next row duplicating a overwrite another at exit 0. nil (the
-	// add-table check, which judges once) honours the name alone. Written
-	// only by the open door, read-only after.
-	acceptedShapes map[string]string
-	recordAccepted bool
-}
-
-// acceptedShapeKey keys a target key for [uniqueKeyCompare.acceptedShapes].
-func acceptedShapeKey(targetNamespace, table, key string) string {
-	return strings.ToLower(targetNamespace) + "\x00" + strings.ToLower(table) + "\x00" + strings.ToLower(key)
-}
-
-// acceptedShape renders what an acceptance is bound to: the key's parts
-// (with any index collation), NULLS NOT DISTINCT and its predicate.
-func acceptedShape(key *ir.Index) string {
-	s := renderKeyParts(key)
-	if key.ConstraintNullsNotDistinct {
-		s += " NULLS NOT DISTINCT"
-	}
-	if p := strings.TrimSpace(key.Predicate); p != "" {
-		s += " WHERE " + p
-	}
-	return s
 }
 
 // compareUniqueKeys reads both catalogs for every scope and returns the
@@ -492,20 +462,13 @@ func (s *Streamer) compareUniqueKeys(ctx context.Context, scopes []uniqueKeyDoor
 					}
 					ambiguous[entry][sc.targetNamespace] = true
 				}
-				if req.acceptedShapes == nil {
-					continue
-				}
-				shapeKey, shape := acceptedShapeKey(sc.targetNamespace, tt.Name, key.Name), acceptedShape(key)
-				if req.recordAccepted {
-					req.acceptedShapes[shapeKey] = shape
-					continue
-				}
-				recorded, ok := req.acceptedShapes[shapeKey]
-				if ok && recorded == shape {
+				// Honoured only while the key still has the shape the flag
+				// carries (round-6 review MEDIUM-A/B).
+				if accept[entry].fingerprint == keyFingerprint(key, tt) {
 					continue
 				}
 				k := absentUniqueKey(table, tt, key, weakened)
-				k.AcceptedShape, k.AcceptedUnrecorded = recorded, !ok
+				k.AcceptedFingerprint = accept[entry].fingerprint
 				absent = append(absent, k)
 			}
 		}
@@ -674,6 +637,57 @@ func foldUniqueKeyFacts(facts map[string]map[string]ir.UniqueKeyFact, schema *ir
 			}
 		}
 		addUnlistedUniqueKeys(t, tf)
+		stampArrayElementDeterminism(t, tf)
+	}
+}
+
+// stampArrayElementDeterminism sets, on each ARRAY key column of t whose
+// element is a character type the schema read left unclassified, the
+// determinism of the collation its unique index compares it under (round-6
+// review LOW-B): without it the collation direction cannot classify the
+// column at all, and a `text[] COLLATE <nondeterministic>` target key passed
+// against a deterministic source one, merging {A} and {a}. It rewrites the
+// door's own read only (the schema read is left alone: its element types
+// feed the emitted DDL and the backup schema hash).
+func stampArrayElementDeterminism(t *ir.Table, tf map[string]ir.UniqueKeyFact) {
+	for _, f := range tf {
+		for i, p := range f.Parts {
+			if p.Expression != "" || i >= len(f.PartDeterministic) {
+				continue
+			}
+			col := columnNamed(t, p.Column)
+			if col == nil {
+				continue
+			}
+			arr, ok := ir.UnwrapDomain(col.Type).(ir.Array)
+			if !ok {
+				continue
+			}
+			det := ir.CollationDeterministic
+			if !f.PartDeterministic[i] {
+				det = ir.CollationNonDeterministic
+			}
+			switch e := arr.Element.(type) {
+			case ir.Text:
+				if e.Determinism == ir.CollationDeterminismUnknown {
+					e.Determinism = det
+					arr.Element = e
+				}
+			case ir.Varchar:
+				if e.Determinism == ir.CollationDeterminismUnknown {
+					e.Determinism = det
+					arr.Element = e
+				}
+			case ir.Char:
+				if e.Determinism == ir.CollationDeterminismUnknown {
+					e.Determinism = det
+					arr.Element = e
+				}
+			default:
+				continue
+			}
+			col.Type = arr
+		}
 	}
 }
 
@@ -848,8 +862,11 @@ func keyColumnWeakening(source, target ir.Engine, st, tt *ir.Table) func(sourceC
 // no [ir.CollationLooseningResolver] (sqlite-trigger, d1-trigger) into a
 // Postgres-family target (round-5 review MEDIUM-2): fail closed, narrowly.
 // A target key column KNOWN to fold case or accents (citext, a
-// nondeterministic collation) is weakened unless the source column's own
-// collation folds the same (SQLite NOCASE folds case). The default mapping
+// nondeterministic collation) is weakened, whatever the source column
+// declares: the SQLite reader stamps no column collation, and a NOCASE
+// column folds ASCII case only where citext and ICU fold Unicode (É and é,
+// ß and ss), so a NOCASE exemption (round 5) could never fire and would have
+// been wrong if it had (round-6 review LOW-A). The default mapping
 // — a SQLite TEXT key onto a deterministic Postgres text column — reports
 // no folding and passes, and so does a bpchar column's trailing-space rule,
 // which a SQLite CHAR declaration lands on by default. Withholding all of
@@ -861,15 +878,7 @@ func foldingTargetColumn(tr ir.CollationLooseningResolver, st, tt *ir.Table) fun
 			return false
 		}
 		tl, tok := tr.CollationLoosening(tc.Type)
-		fold := tl & (ir.LooseCase | ir.LooseAccent)
-		if !tok || fold == 0 {
-			return false
-		}
-		var sourceFold ir.CollationLoosening
-		if coll, ok := characterCollation(sc.Type); ok && strings.EqualFold(strings.TrimSpace(coll), "nocase") {
-			sourceFold = ir.LooseCase
-		}
-		return fold&^sourceFold != 0
+		return tok && tl&(ir.LooseCase|ir.LooseAccent) != 0
 	}
 }
 
@@ -965,10 +974,12 @@ func hasSecondaryUniqueKey(t *ir.Table) bool {
 // key lands on a Postgres target as a constraint, SQLSTATE 2BP01).
 func absentUniqueKey(table string, t *ir.Table, key *ir.Index, weakened func(sourceColumn, targetColumn string) bool) ir.AbsentUniqueKey {
 	k := ir.AbsentUniqueKey{
-		Table:      table,
-		Key:        key.Name,
-		Columns:    renderKeyParts(key),
-		Constraint: key.ConstraintBacked || (key == t.PrimaryKey && key.ConstraintNamed),
+		Table:       table,
+		Key:         key.Name,
+		Columns:     renderKeyParts(key),
+		Constraint:  key.ConstraintBacked || (key == t.PrimaryKey && key.ConstraintNamed),
+		Shape:       keyShape(key, t),
+		Fingerprint: keyFingerprint(key, t),
 	}
 	if weakened != nil {
 		for _, c := range key.Columns {
@@ -1013,49 +1024,139 @@ func lowerSet(names []string) map[string]bool {
 }
 
 // acceptedUniqueKeys is the parsed --accept-target-only-unique-key list:
-// `<table>.<key>`, or `<namespace>.<table>.<key>` on a multi-database
-// stream. Names compare without case.
+// `<table>.<key>=<fingerprint>`, or `<namespace>.<table>.<key>=<fingerprint>`
+// on a multi-database stream. Names compare without case.
+//
+// The fingerprint ([keyFingerprint]) binds the acceptance to the key's
+// shape (round-6 review MEDIUM-A): it is in the flag value, so it survives a
+// restart unchanged. An acceptance bound only to a name re-bound itself on
+// every start to whatever shape the target held then: a forwarded DROP
+// COLUMN that narrowed the key, followed by a stop before the boundary was
+// judged, came back accepted, and a standing flag in a fleet spec
+// re-accepted every narrowing at the next restart. The refusal prints the
+// exact value to pass, fingerprint included.
 type acceptedUniqueKeys []acceptedUniqueKey
 
-type acceptedUniqueKey struct{ namespace, table, key string }
+type acceptedUniqueKey struct{ namespace, table, key, fingerprint string }
+
+// acceptedFingerprintLen is the fingerprint's length in hex digits.
+const acceptedFingerprintLen = 12
+
+// splitAcceptedUniqueKey splits one flag value into its name parts and its
+// fingerprint; ok is false for a malformed value.
+func splitAcceptedUniqueKey(e string) (acceptedUniqueKey, bool) {
+	name, fp, hasFP := strings.Cut(strings.TrimSpace(e), "=")
+	if !hasFP || len(fp) != acceptedFingerprintLen || strings.Trim(fp, "0123456789abcdef") != "" {
+		return acceptedUniqueKey{}, false
+	}
+	parts := strings.Split(name, ".")
+	for _, p := range parts {
+		if p == "" {
+			return acceptedUniqueKey{}, false
+		}
+	}
+	switch len(parts) {
+	case 2:
+		return acceptedUniqueKey{table: parts[0], key: parts[1], fingerprint: fp}, true
+	case 3:
+		return acceptedUniqueKey{namespace: parts[0], table: parts[1], key: parts[2], fingerprint: fp}, true
+	}
+	return acceptedUniqueKey{}, false
+}
 
 func parseAcceptedUniqueKeys(entries []string) acceptedUniqueKeys {
 	var out acceptedUniqueKeys
 	for _, e := range entries {
-		parts := strings.Split(strings.TrimSpace(e), ".")
-		switch len(parts) {
-		case 2:
-			out = append(out, acceptedUniqueKey{table: parts[0], key: parts[1]})
-		case 3:
-			out = append(out, acceptedUniqueKey{namespace: parts[0], table: parts[1], key: parts[2]})
+		if a, ok := splitAcceptedUniqueKey(e); ok {
+			out = append(out, a)
 		}
 	}
 	return out
 }
 
-// validateAcceptedUniqueKeys refuses an entry that is not `<table>.<key>`
-// or `<namespace>.<table>.<key>`: a typo would otherwise accept nothing and
-// look like a refusal that ignores the flag.
+// validateAcceptedUniqueKeys refuses a value that is not
+// `[<namespace>.]<table>.<key>=<fingerprint>`, including one with no
+// fingerprint or a malformed one: a typo would otherwise accept nothing and
+// look like a refusal that ignores the flag, and a value with no
+// fingerprint would accept whatever shape the key has.
 func validateAcceptedUniqueKeys(entries []string) error {
 	for _, e := range entries {
-		parts := strings.Split(strings.TrimSpace(e), ".")
-		ok := len(parts) == 2 || len(parts) == 3
-		for _, p := range parts {
-			if p == "" {
-				ok = false
-			}
-		}
-		if !ok {
-			return fmt.Errorf("pipeline: --accept-target-only-unique-key %q: want <table>.<key> (or <namespace>.<table>.<key> "+
-				"on a multi-database stream)", e)
+		if _, ok := splitAcceptedUniqueKey(e); !ok {
+			return fmt.Errorf("pipeline: --accept-target-only-unique-key %q: want <table>.<key>=<fingerprint> (or "+
+				"<namespace>.<table>.<key>=<fingerprint> on a multi-database stream), the fingerprint being the %d hex "+
+				"digits the SOURCE-UNIQUE-KEY-ABSENT refusal prints for the key; it binds the acceptance to the key's "+
+				"shape", e, acceptedFingerprintLen)
 		}
 	}
 	return nil
 }
 
-func (a acceptedUniqueKeys) allows(namespace, table, key string) bool {
-	_, ok := a.match(table, key, namespace)
-	return ok
+// keyShape renders a target unique key's shape for its fingerprint, and
+// for the refusal (round-6 review MEDIUM-B): each part's column, folded,
+// with its prefix length, its FULL type (size included) and its effective
+// collation — the index's own where it has one, else the column's, which
+// is where a MySQL key, and a Postgres key inheriting its column's
+// collation, hold it — or the expression, normalized; then NULLS NOT
+// DISTINCT and the predicate. The key's NAME is not in it, so the Postgres
+// writer's table prefix and a rename change nothing; identifier case and
+// whitespace are folded.
+func keyShape(key *ir.Index, table *ir.Table) string {
+	parts := make([]string, len(key.Columns))
+	for i, p := range key.Columns {
+		if p.Expression != "" {
+			parts[i] = "expr " + normalizeShapeText(p.Expression)
+			continue
+		}
+		s := strings.ToLower(p.Column)
+		if p.Length > 0 {
+			s += fmt.Sprintf("(%d)", p.Length)
+		}
+		coll := strings.ToLower(strings.TrimSpace(p.Collation))
+		if col := columnNamed(table, p.Column); col != nil {
+			s += " " + ir.UnwrapDomain(col.Type).String()
+			if coll == "" {
+				c, _ := characterCollation(col.Type)
+				coll = strings.ToLower(strings.TrimSpace(c))
+			}
+		}
+		if coll != "" {
+			s += " collate " + coll
+		}
+		parts[i] = s
+	}
+	out := "(" + strings.Join(parts, ", ") + ")"
+	if key.ConstraintNullsNotDistinct {
+		out += " nulls not distinct"
+	}
+	if pred := strings.TrimSpace(key.Predicate); pred != "" {
+		if len(pred) > 5 && strings.EqualFold(pred[:6], "where ") {
+			pred = pred[6:]
+		}
+		out += " where " + normalizeShapeText(pred)
+	}
+	return out
+}
+
+// normalizeShapeText folds an expression or predicate's case and drops its
+// whitespace and identifier quotes, so a re-render of one definition (a
+// catalog's spacing, quoting or case) is one shape.
+func normalizeShapeText(s string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(s) {
+		switch r {
+		case ' ', '\t', '\n', '\r', '"', '`':
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+// keyFingerprint is the short, stable hash of [keyShape] an acceptance
+// carries.
+func keyFingerprint(key *ir.Index, table *ir.Table) string {
+	sum := sha256.Sum256([]byte(keyShape(key, table)))
+	return hex.EncodeToString(sum[:])[:acceptedFingerprintLen]
 }
 
 // match returns the entry accepting table.key in any of namespaces (a

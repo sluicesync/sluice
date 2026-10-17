@@ -22,6 +22,13 @@ type UniqueKeyFact struct {
 	// compares that part under when it differs from the column's own
 	// (`CREATE UNIQUE INDEX … (k COLLATE "x")`); "" where it does not.
 	PartCollations []string
+	// PartDeterministic holds, per key part, whether the collation the index
+	// compares that part under is deterministic (pg_collation
+	// .collisdeterministic). The door stamps it onto an ARRAY key column's
+	// element, which the schema read leaves unclassified (round-6 review
+	// LOW-B): stamping it in the schema read itself would change the emitted
+	// DDL and the backup schema hash.
+	PartDeterministic []bool
 	// Primary, Parts and Predicate describe the index itself, so the door
 	// can judge one the schema read does not list: the Postgres reader's
 	// index read covers ordinary tables only, so a PARTITIONED table's keys

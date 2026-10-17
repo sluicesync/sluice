@@ -159,7 +159,9 @@ func ukcRun(t *testing.T, sc ukcScenario, src, tgt twfbDB, cell twfbCell, newStr
 	build := newStreamer
 	newStreamer = func() *Streamer {
 		s := build()
-		s.AcceptTargetOnlyUniqueKeys = []string{"kd.kd_k"}
+		// Accepted as the target holds it, once it exists (a cold start's
+		// copied key is covered and needs no acceptance).
+		s.AcceptTargetOnlyUniqueKeys = ukdAcceptValue(t, tgt, "kd", "kd_k")
 		return s
 	}
 	srcDialect := "mysql"

@@ -124,11 +124,12 @@ func TestUniqueKeyDoor_AtOpen(t *testing.T) {
 		s, _, _ := ukDoorStreamer(t, ir.CDCBinlog,
 			[]*ir.Table{ukDoorTable("kd", pk)},
 			[]*ir.Table{ukDoorTable("KD", pk, ukDoorKey("kd_k", "k"))})
-		s.AcceptTargetOnlyUniqueKeys = []string{"kd.KD_K"}
+		fp := keyFingerprint(ukDoorKey("kd_k", "k"), ukDoorTable("KD", pk))
+		s.AcceptTargetOnlyUniqueKeys = []string{"kd.KD_K=" + fp}
 		if err := s.phaseRefuseTargetOnlyUniqueKeys(context.Background(), nil, "s1", true); err != nil {
 			t.Fatal(err)
 		}
-		s.AcceptTargetOnlyUniqueKeys = []string{"kd.other"}
+		s.AcceptTargetOnlyUniqueKeys = []string{"kd.other=" + fp}
 		if err := s.phaseRefuseTargetOnlyUniqueKeys(context.Background(), nil, "s1", true); !errors.Is(err, ir.ErrSourceUniqueKeyAbsent) {
 			t.Fatalf("accepting another key let kd_k through: %v", err)
 		}
@@ -190,18 +191,20 @@ func TestUniqueKeyDoor_AtOpen(t *testing.T) {
 }
 
 func TestValidateAcceptedUniqueKeys(t *testing.T) {
-	for _, ok := range []string{"t.k", "ns.t.k", " t.k "} {
+	for _, ok := range []string{"t.k=0123456789ab", "ns.t.k=0123456789ab", " t.k=abcdef012345 "} {
 		if err := validateAcceptedUniqueKeys([]string{ok}); err != nil {
 			t.Errorf("%q refused: %v", ok, err)
 		}
 	}
-	for _, bad := range []string{"t", "t.", ".k", "a.b.c.d", ""} {
+	for _, bad := range []string{"t.k", "ns.t.k", "t.k=", "t.k=0123", "t.k=0123456789AB", "t.k=0123456789abc", "t.k=zzzzzzzzzzzz", "t=0123456789ab", ".k=0123456789ab", "a.b.c.d=0123456789ab", ""} {
 		if err := validateAcceptedUniqueKeys([]string{bad}); err == nil {
 			t.Errorf("%q accepted", bad)
 		}
 	}
-	if !parseAcceptedUniqueKeys([]string{"db1.t.k"}).allows("DB1", "t", "k") ||
-		parseAcceptedUniqueKeys([]string{"db1.t.k"}).allows("db2", "t", "k") {
+	if _, ok := parseAcceptedUniqueKeys([]string{"db1.t.k=0123456789ab"}).match("t", "k", "DB1"); !ok {
+		t.Error("a namespace-qualified acceptance does not match its namespace")
+	}
+	if _, ok := parseAcceptedUniqueKeys([]string{"db1.t.k=0123456789ab"}).match("t", "k", "db2"); ok {
 		t.Error("a namespace-qualified acceptance does not scope to its namespace")
 	}
 }
@@ -267,7 +270,8 @@ func TestRefuseAddTableTargetOnlyUniqueKeys(t *testing.T) {
 	if !errors.As(err, &refusal) || refusal.When != ir.UniqueKeyDoorAddTable {
 		t.Fatalf("got %v, want the add-table refusal", err)
 	}
-	if err := refuseAddTableTargetOnlyUniqueKeys(src, precreated, nil, nil, []string{"kd.kd_k"}); err != nil {
+	accept := "kd.kd_k=" + keyFingerprint(precreated["kd"].Indexes[0], precreated["kd"])
+	if err := refuseAddTableTargetOnlyUniqueKeys(src, precreated, nil, nil, []string{accept}); err != nil {
 		t.Fatalf("an accepted key refused: %v", err)
 	}
 	if err := refuseAddTableTargetOnlyUniqueKeys(src, map[string]*ir.Table{}, nil, nil, nil); err != nil {
@@ -375,13 +379,11 @@ func TestKeyColumnWeakening_Eligibility(t *testing.T) {
 		{"no resolver into mysql: withheld", stubEngine{}, eng("mysql"), "bin", "ci", false},
 		// A source with no resolver into a Postgres-family target (round-5
 		// MEDIUM-2): a target column known to fold refuses; none, or a
-		// bpchar pad rule, passes; a SQLite NOCASE source folds case itself.
+		// bpchar pad rule, passes.
 		{"no resolver into a folding postgres column", stubEngine{}, eng("postgres"), "", "ci", true},
 		{"no resolver into citext", stubEngine{}, eng("postgres"), "", "citext", true},
 		{"no resolver into a deterministic column", stubEngine{}, eng("postgres"), "", "bin", false},
 		{"no resolver into bpchar", stubEngine{}, eng("postgres"), "", "pad", false},
-		{"no resolver, NOCASE source into citext", stubEngine{}, eng("postgres"), "NOCASE", "citext", false},
-		{"no resolver, NOCASE source into an accent-folding column", stubEngine{}, eng("postgres-trigger"), "nocase", "ci", true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

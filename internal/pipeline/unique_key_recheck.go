@@ -40,11 +40,14 @@ type uniqueKeyChecks struct {
 	// stream-open door read it, keyed by colsKey; a snapshot is checked when
 	// its column list differs from the last one known for its table,
 	// starting from that seed.
-	boundary    func(ctx context.Context, snap ir.SchemaSnapshot) (*ir.SourceUniqueKeyAbsentError, error)
-	seedCols    map[string]string
-	seedTypes   map[string]map[string]ir.Type
-	colsKey     func(schema, table string) string
-	maxFailures int
+	boundary  func(ctx context.Context, snap ir.SchemaSnapshot) (*ir.SourceUniqueKeyAbsentError, error)
+	seedCols  map[string]string
+	seedTypes map[string]map[string]ir.Type
+	// acceptedTable reports a table carrying an --accept-target-only-unique-key
+	// acceptance (nil: none).
+	acceptedTable func(schema, table string) bool
+	colsKey       func(schema, table string) string
+	maxFailures   int
 }
 
 func (c uniqueKeyChecks) armed() bool { return c.periodic != nil || c.boundary != nil }
@@ -262,6 +265,9 @@ type uniqueKeyBoundaryGate struct {
 	prevCols  map[string]string
 	prevTypes map[string]map[string]ir.Type
 	seedTypes map[string]map[string]ir.Type
+	// acceptedTable reports a table carrying an accepted key, whose type-only
+	// boundaries are judged too ([uniqueKeyChecks.acceptedTable]).
+	acceptedTable func(schema, table string) bool
 	// foldedSeed is the open door's column lists keyed by the folded
 	// spelling, for a table the change stream spells differently from the
 	// open read (a MySQL source with lower_case_table_names=2). It is a READ
@@ -290,7 +296,7 @@ func newUniqueKeyBoundaryGate(cfg uniqueKeyChecks, errStore *atomic.Pointer[erro
 	g := &uniqueKeyBoundaryGate{
 		check: cfg.boundary, colsKey: cfg.colsKey, errStore: errStore,
 		prevCols: map[string]string{}, prevTypes: map[string]map[string]ir.Type{},
-		seedTypes: cfg.seedTypes, foldedSeed: map[string]string{},
+		seedTypes: cfg.seedTypes, foldedSeed: map[string]string{}, acceptedTable: cfg.acceptedTable,
 	}
 	collide := map[string]bool{}
 	for k, v := range cfg.seedCols {
@@ -476,7 +482,12 @@ func (g *uniqueKeyBoundaryGate) judgeAt(ctx context.Context, snap ir.SchemaSnaps
 	key := g.keyOf(snap)
 	cols := columnList(snap.IR)
 	prev, seen := g.prev(key)
-	if snap.UniqueKeysMoved || (seen && columnsMoved(prev, cols)) {
+	// A type-only change (no column moved) is judged too on a table carrying
+	// an accepted key (round-6 review MEDIUM-B): its fingerprint holds each
+	// part's type and collation, so `MODIFY k … COLLATE utf8mb4_0900_ai_ci`
+	// loosens the accepted key without moving a column.
+	typeOnly := seen && g.acceptedTable != nil && g.acceptedTable(snap.Schema, snap.Table) && !g.typesKept(key, snap.IR)
+	if snap.UniqueKeysMoved || (seen && columnsMoved(prev, cols)) || typeOnly {
 		refusal, err := g.check(ctx, snap)
 		switch {
 		case ctx.Err() != nil:
@@ -588,6 +599,15 @@ func (s *Streamer) uniqueKeyChecksFor() uniqueKeyChecks {
 	cfg := uniqueKeyChecks{period: s.uniqueKeyRecheckPeriod(), maxFailures: uniqueKeyRecheckMaxFailures}
 	multi := len(door.scopes) > 1 || (len(door.scopes) == 1 && door.scopes[0].namespace != "")
 	cfg.seedCols, cfg.seedTypes = door.openCols, door.openTypes
+	accepted := parseAcceptedUniqueKeys(s.AcceptTargetOnlyUniqueKeys)
+	cfg.acceptedTable = func(schema, table string) bool {
+		for _, e := range accepted {
+			if strings.EqualFold(e.table, table) && (e.namespace == "" || strings.EqualFold(e.namespace, schema)) {
+				return true
+			}
+		}
+		return false
+	}
 	cfg.colsKey = func(schema, table string) string {
 		if !multi {
 			schema = ""
@@ -595,6 +615,11 @@ func (s *Streamer) uniqueKeyChecksFor() uniqueKeyChecks {
 		return uniqueKeyColsKey(schema, table)
 	}
 	cfg.boundary = func(ctx context.Context, snap ir.SchemaSnapshot) (*ir.SourceUniqueKeyAbsentError, error) {
+		if s.uniqueKeyBoundaryFault != nil {
+			if err := s.uniqueKeyBoundaryFault(snap); err != nil {
+				return nil, err
+			}
+		}
 		i, ok := door.scopeFor(snap.Schema)
 		if !ok {
 			return nil, fmt.Errorf("the schema change of %s names a namespace this stream's unique-key check has no "+
@@ -602,7 +627,6 @@ func (s *Streamer) uniqueKeyChecksFor() uniqueKeyChecks {
 		}
 		absent, _, err := s.compareUniqueKeys(ctx, door.scopes, uniqueKeyCompare{
 			only: map[int][]string{i: {snap.Table}}, collations: s.uniqueKeyCollationsArmed(false),
-			acceptedShapes: door.acceptedShapes,
 		})
 		if err != nil || len(absent) == 0 {
 			return nil, err
@@ -626,7 +650,7 @@ func (s *Streamer) uniqueKeyChecksFor() uniqueKeyChecks {
 	}
 	cfg.periodic = func(ctx context.Context) (*ir.SourceUniqueKeyAbsentError, error) {
 		absent, _, err := s.compareUniqueKeys(ctx, door.scopes, uniqueKeyCompare{
-			only: door.watched, collations: s.uniqueKeyCollationsArmed(false), acceptedShapes: door.acceptedShapes,
+			only: door.watched, collations: s.uniqueKeyCollationsArmed(false),
 		})
 		if err != nil || len(absent) == 0 {
 			return nil, err

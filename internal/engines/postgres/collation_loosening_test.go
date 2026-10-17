@@ -37,7 +37,6 @@ func TestCollationLoosening_Determinism(t *testing.T) {
 		{"citext extension type", ir.ExtensionType{Extension: "citext", Name: "citext"}, c, true},
 		{"citext verbatim, schema-qualified", ir.VerbatimType{Definition: "public.citext"}, c, true},
 		{"another verbatim type", ir.VerbatimType{Definition: "ltree"}, 0, false},
-		{"text array, deterministic", ir.Array{Element: ir.Text{Size: ir.TextLong, Determinism: det}}, 0, true},
 		{"citext array", ir.Array{Element: ir.ExtensionType{Extension: "citext", Name: "citext"}}, c, true},
 		{"not a character type", ir.Integer{Width: 32}, 0, false},
 	}

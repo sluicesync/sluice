@@ -11,8 +11,8 @@
 //     accepted MySQL key UNIQUE (k, x) to UNIQUE (k) under its own name used
 //     to pass by name, so the next row duplicating k overwrote row 1 at exit
 //     0. It must refuse, naming the accepted shape. The same holds for a
-//     table added with `schema add-table` while the stream ran, whose
-//     accepted key the stream's start never saw.
+//     table added with `schema add-table` while the stream ran (round 6:
+//     the acceptance carries the shape as a fingerprint, so it holds there).
 //   - MEDIUM-2: a sqlite-trigger source (no collation resolver) into a
 //     Postgres target column known to fold — citext, a nondeterministic
 //     collation — refuses; the default deterministic text column passes.
@@ -46,9 +46,10 @@ func TestStreamer_UniqueKeyDoor_Review5AcceptedKeyNarrowed(t *testing.T) {
 	ukdColdStartStop(t, cell, cell.streamer)
 	// The operator's key, accepted by name on every start from here.
 	tgt.exec(t, "ALTER TABLE kd ADD UNIQUE KEY uk (k, x)")
+	accept := ukdAcceptValue(t, tgt, "kd", "uk") // taken once, as the operator pastes it
 	accepted := func() *Streamer {
 		s := cell.streamer()
-		s.AcceptTargetOnlyUniqueKeys = []string{"kd.uk"}
+		s.AcceptTargetOnlyUniqueKeys = accept
 		// A keyless table cannot be backfilled by cursor; the priming ADD
 		// COLUMN below needs none.
 		s.SuppressAddedColumnBackfill = true
@@ -67,8 +68,9 @@ func TestStreamer_UniqueKeyDoor_Review5AcceptedKeyNarrowed(t *testing.T) {
 	src.exec(t, "INSERT INTO kd (id,k,v) VALUES (99,'a','ninetynine')")
 	ukdAwaitExitOrConverge(t, run, src, tgt, 90*time.Second)
 	refusal := ukdR3RequireNoMergeRefusal(t, run, src, tgt, ir.UniqueKeyDoorAtSchemaChange)
-	if refusal.Keys[0].AcceptedShape != "(k, x)" || !strings.Contains(run.err.Error(), "accepted by name as (k, x)") {
-		t.Fatalf("the refusal does not name the accepted shape: %v", run.err)
+	if !strings.HasSuffix(accept[0], "="+refusal.Keys[0].AcceptedFingerprint) ||
+		!strings.Contains(run.err.Error(), "accepted with fingerprint "+refusal.Keys[0].AcceptedFingerprint) {
+		t.Fatalf("the refusal does not name the accepted fingerprint: %v", run.err)
 	}
 	if g := ukdRows(t, tgt); strings.Contains(g, "99|") {
 		t.Fatalf("the duplicate was applied: target %s", g)
@@ -92,10 +94,16 @@ func TestStreamer_UniqueKeyDoor_Review5AddTableAcceptedKey(t *testing.T) {
 		t.Fatal("mysql engine not registered")
 	}
 	const streamID = "ukd-r5-add"
+	// The operator's pre-created table, with the key they accept: its value
+	// is taken from the catalog before anything starts, and passed to the
+	// stream and to add-table alike.
+	applyDDLMySQL(t, tgtDSN, "CREATE TABLE kd (id INT NOT NULL PRIMARY KEY, k VARCHAR(20) NOT NULL, x INT NULL, v VARCHAR(20), "+
+		"UNIQUE KEY uk (k, x));")
+	accept := ukdAcceptValue(t, twfbDB{engine: "mysql", dsn: tgtDSN}, "kd", "uk")
 	streamer := &Streamer{
 		Source: mysqlEng, Target: mysqlEng, SourceDSN: srcDSN, TargetDSN: tgtDSN, StreamID: streamID,
 		Filter:                     mustNewFilter(t, []string{"users"}, nil),
-		AcceptTargetOnlyUniqueKeys: []string{"kd.uk"},
+		AcceptTargetOnlyUniqueKeys: accept,
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -110,13 +118,11 @@ func TestStreamer_UniqueKeyDoor_Review5AddTableAcceptedKey(t *testing.T) {
 	}
 	applyDDLMySQL(t, srcDSN, "CREATE TABLE kd (id INT NOT NULL PRIMARY KEY, k VARCHAR(20) NOT NULL, x INT NULL, v VARCHAR(20)); "+
 		"INSERT INTO kd VALUES (1,'a',1,'one'),(2,'b',1,'two');")
-	applyDDLMySQL(t, tgtDSN, "CREATE TABLE kd (id INT NOT NULL PRIMARY KEY, k VARCHAR(20) NOT NULL, x INT NULL, v VARCHAR(20), "+
-		"UNIQUE KEY uk (k, x));")
 	actx, acancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer acancel()
 	if err := (&AddTable{
 		Source: mysqlEng, Target: mysqlEng, SourceDSN: srcDSN, TargetDSN: tgtDSN,
-		StreamID: streamID, TableName: "kd", LiveMode: true, AcceptTargetOnlyUniqueKeys: []string{"kd.uk"},
+		StreamID: streamID, TableName: "kd", LiveMode: true, AcceptTargetOnlyUniqueKeys: accept,
 	}).Run(actx); err != nil {
 		t.Fatalf("add-table with the key accepted: %v", err)
 	}
@@ -150,8 +156,8 @@ func TestStreamer_UniqueKeyDoor_Review5AddTableAcceptedKey(t *testing.T) {
 		t.Fatalf("nothing refused; target %s", ukdRows(t, tgt))
 	}
 	var refusal *ir.SourceUniqueKeyAbsentError
-	if !errors.As(err, &refusal) || refusal.When != ir.UniqueKeyDoorAtSchemaChange || !refusal.Keys[0].AcceptedUnrecorded {
-		t.Fatalf("refused with %v; want the boundary SOURCE-UNIQUE-KEY-ABSENT naming an unrecorded acceptance", err)
+	if !errors.As(err, &refusal) || refusal.When != ir.UniqueKeyDoorAtSchemaChange || refusal.Keys[0].AcceptedFingerprint == "" {
+		t.Fatalf("refused with %v; want the boundary SOURCE-UNIQUE-KEY-ABSENT naming the accepted fingerprint", err)
 	}
 	t.Logf("refusal: %v", err)
 	if g := ukdRows(t, tgt); !strings.Contains(g, "1|a|one") || strings.Contains(g, "99|") {

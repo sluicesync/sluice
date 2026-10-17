@@ -763,7 +763,7 @@ func (a *AddTable) preflightTargetForStream(ctx context.Context, scoped *ir.Sche
 // table this command will create, so its keys stay as read — and a read
 // that fails refuses the command: the next run reads again.
 func (a *AddTable) refuseTargetOnlyUniqueKeys(ctx context.Context, source *ir.Table, targetSchema string) error {
-	src := &ir.Schema{Tables: []*ir.Table{cloneTableKeys(source)}}
+	src := &ir.Schema{Tables: []*ir.Table{cloneTableKeys(cloneTableColumns(source))}}
 	foldUniqueKeyFacts(a.sourceKeyFacts, src)
 	target, err := a.readTargetKeys(ctx, source.Name, targetSchema)
 	if err != nil {
@@ -840,9 +840,15 @@ func refuseAddTableTargetOnlyUniqueKeysAsRead(source, asRead *ir.Table, targetTa
 	var absent []ir.AbsentUniqueKey
 	weakened := keyColumnWeakening(sourceEngine, targetEngine, asRead, target)
 	for _, key := range uncoveredTargetKeys(source, target, engineNameOrEmpty(targetEngine), weakened) {
-		if !accepted.allows("", target.Name, key.Name) {
-			absent = append(absent, absentUniqueKey(target.Name, target, key, weakened))
+		entry, ok := accepted.match(target.Name, key.Name, "")
+		if ok && accepted[entry].fingerprint == keyFingerprint(key, target) {
+			continue
 		}
+		k := absentUniqueKey(target.Name, target, key, weakened)
+		if ok {
+			k.AcceptedFingerprint = accepted[entry].fingerprint
+		}
+		absent = append(absent, k)
 	}
 	if len(absent) == 0 {
 		return nil

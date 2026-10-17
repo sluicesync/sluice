@@ -44,7 +44,8 @@ func (r *SchemaReader) UniqueKeyFacts(ctx context.Context) (map[string]map[strin
 		       ix.indisprimary,
 		       COALESCE(a.attname, ''),
 		       CASE WHEN k.attnum = 0 THEN pg_catalog.pg_get_indexdef(ix.indexrelid, k.ord::int, true) ELSE '' END,
-		       COALESCE(pg_catalog.pg_get_expr(ix.indpred, ix.indrelid), '')
+		       COALESCE(pg_catalog.pg_get_expr(ix.indpred, ix.indrelid), ''),
+		       COALESCE(c.collisdeterministic, true)
 		FROM   pg_index ix
 		JOIN   pg_class      cl ON cl.oid = ix.indrelid
 		JOIN   pg_class      i  ON i.oid  = ix.indexrelid
@@ -66,8 +67,8 @@ func (r *SchemaReader) UniqueKeyFacts(ctx context.Context) (map[string]map[strin
 	out := map[string]map[string]ir.UniqueKeyFact{}
 	for rows.Next() {
 		var table, index, coll, column, expr, pred string
-		var enforcing, nnd, primary bool
-		if err := rows.Scan(&table, &index, &enforcing, &nnd, &coll, &primary, &column, &expr, &pred); err != nil {
+		var enforcing, nnd, primary, deterministic bool
+		if err := rows.Scan(&table, &index, &enforcing, &nnd, &coll, &primary, &column, &expr, &pred, &deterministic); err != nil {
 			return nil, fmt.Errorf("postgres: unique-key facts: %w", err)
 		}
 		if r.tableScope != nil && !r.tableScope(table) {
@@ -82,6 +83,7 @@ func (r *SchemaReader) UniqueKeyFacts(ctx context.Context) (map[string]map[strin
 			f.PredicateDialect = dialectName
 		}
 		f.PartCollations = append(f.PartCollations, coll)
+		f.PartDeterministic = append(f.PartDeterministic, deterministic)
 		part := ir.IndexColumn{Column: column, Collation: coll}
 		if expr != "" {
 			part = ir.IndexColumn{Expression: expr, ExpressionDialect: dialectName}
