@@ -55,6 +55,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/config"
 	"sluicesync.dev/sluice/internal/ir"
+	irdiff "sluicesync.dev/sluice/internal/ir/diff"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/redact"
 	"sluicesync.dev/sluice/internal/translate"
@@ -252,6 +253,11 @@ type AddTable struct {
 	// design. Threaded into the bulk-copy phase of the add-table
 	// path so a newly-added table is PII-clean from the first row.
 	Redactor *redact.Registry
+
+	// AcceptTargetOnlyUniqueKeys is [Streamer.AcceptTargetOnlyUniqueKeys]
+	// for the table being added: unique keys a pre-created target table
+	// carries beyond the source's, accepted by name (`<table>.<key>`).
+	AcceptTargetOnlyUniqueKeys []string
 }
 
 // Run executes the add-table flow. Returns nil on success or a
@@ -400,29 +406,9 @@ func (a *AddTable) Run(ctx context.Context) error {
 		return err
 	}
 
-	// The SCHEMA-keyed half of the same refusal (see
-	// preflightBinaryTargetColumnsOnCDC): a pre-existing EMPTY target
-	// table whose column is already binary passes the emptiness check
-	// above and is then fed by the live stream, with no override on this
-	// command line for the config check to see. The usual case is that
-	// the table does not exist yet, and the catalog read finds nothing.
-	addGate := &existingTablesGate{
-		Source:       a.Source,
-		Target:       a.Target,
-		TargetDSN:    a.TargetDSN,
-		TargetSchema: preflight.resolvedTargetSchema,
-		Mode:         "add-table",
-	}
-	if actual, ok := addGate.readTargetTablesForShapeGate(ctx); ok {
-		if err := preflightBinaryTargetColumnsOnCDC(scoped, actual, "add-table"); err != nil {
-			return err
-		}
-	}
-	// The byte-shaped array-leaf half of the same shape — a source element
-	// type the applier's target-derived columns cannot carry. Keyed on the
-	// target ENGINE, not the catalog, because the table being added
-	// normally does not exist on the target yet.
-	if err := preflightArrayBytesLeafOnCDC(scoped, engineNameOrEmpty(a.Target), "add-table"); err != nil {
+	// What the table's target counterpart must be before the live stream is
+	// handed it (the binary-column halves, the unique-key door).
+	if err := a.preflightTargetForStream(ctx, scoped, preflight.resolvedTargetSchema); err != nil {
 		return err
 	}
 
@@ -721,8 +707,76 @@ func (a *AddTable) logAddComplete(ctx context.Context) {
 	)
 }
 
+// preflightTargetForStream runs the checks the table's target counterpart
+// owes before the live stream is handed it. Carved out of Run for the
+// funlen ceiling when the unique-key door joined it.
+func (a *AddTable) preflightTargetForStream(ctx context.Context, scoped *ir.Schema, targetSchema string) error {
+	// The SCHEMA-keyed half of the same refusal (see
+	// preflightBinaryTargetColumnsOnCDC): a pre-existing EMPTY target
+	// table whose column is already binary passes the emptiness check
+	// above and is then fed by the live stream, with no override on this
+	// command line for the config check to see. The usual case is that
+	// the table does not exist yet, and the catalog read finds nothing.
+	addGate := &existingTablesGate{
+		Source:       a.Source,
+		Target:       a.Target,
+		TargetDSN:    a.TargetDSN,
+		TargetSchema: targetSchema,
+		Mode:         "add-table",
+	}
+	if actual, ok := addGate.readTargetTablesForShapeGate(ctx); ok {
+		if err := preflightBinaryTargetColumnsOnCDC(scoped, actual, "add-table"); err != nil {
+			return err
+		}
+		if err := refuseAddTableTargetOnlyUniqueKeys(scoped.Tables[0], actual, a.AcceptTargetOnlyUniqueKeys); err != nil {
+			return err
+		}
+	}
+	// The byte-shaped array-leaf half of the same shape — a source element
+	// type the applier's target-derived columns cannot carry. Keyed on the
+	// target ENGINE, not the catalog, because the table being added
+	// normally does not exist on the target yet.
+	return preflightArrayBytesLeafOnCDC(scoped, engineNameOrEmpty(a.Target), "add-table")
+}
+
+// refuseAddTableTargetOnlyUniqueKeys is the add-table entry of the
+// unique-key door (unique_key_door.go, UNIQUE-KEY-STOPPED-WINDOW-DOOR): a
+// PRE-CREATED target table joins the stream with whatever unique keys it
+// has, and one the source does not enforce is a merge waiting for its first
+// duplicate, so each must be implied by a source key or accepted by name. A
+// table sluice creates copies the source's keys, which imply themselves.
+// It reads the shape gate's catalog, so it degrades with that read (its
+// WARN). source is the scoped table after the operator's overrides, which
+// change column types and generated expressions, never keys.
+func refuseAddTableTargetOnlyUniqueKeys(source *ir.Table, targetTables map[string]*ir.Table, accept []string) error {
+	tables := make([]*ir.Table, 0, len(targetTables))
+	for _, t := range targetTables {
+		if t != nil {
+			tables = append(tables, t)
+		}
+	}
+	target := matchTargetTable(tables, source.Name)
+	if target == nil {
+		return nil
+	}
+	accepted := parseAcceptedUniqueKeys(accept)
+	var absent []ir.AbsentUniqueKey
+	for _, key := range irdiff.UncoveredTargetUniqueKeys(source, target) {
+		if !accepted.allows("", target.Name, key.Name) {
+			absent = append(absent, ir.AbsentUniqueKey{Table: target.Name, Key: key.Name, Columns: renderKeyParts(key)})
+		}
+	}
+	if len(absent) == 0 {
+		return nil
+	}
+	return &ir.SourceUniqueKeyAbsentError{Keys: absent, When: ir.UniqueKeyDoorAddTable}
+}
+
 // validate enforces the required-fields contract.
 func (a *AddTable) validate() error {
+	if err := validateAcceptedUniqueKeys(a.AcceptTargetOnlyUniqueKeys); err != nil {
+		return err
+	}
 	switch {
 	case a.Source == nil:
 		return errors.New("pipeline: add-table: Source engine is nil")

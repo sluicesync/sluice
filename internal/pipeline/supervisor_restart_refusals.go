@@ -102,6 +102,15 @@ import (
 //     persisted position, the target key is unchanged by a restart, so the
 //     re-delivered row matches the same row and refuses again until the
 //     operator drops the key or re-copies.
+//   - SOURCE-UNIQUE-KEY-ABSENT (every source and target, codeless;
+//     UNIQUE-KEY-STOPPED-WINDOW-DOOR): listed. The stream-open door and the
+//     mid-stream re-check compare the target's unique keys with the source's
+//     current ones and persist nothing, so a restart reads both catalogs
+//     back unchanged and refuses again until the operator drops the key on
+//     the target, re-copies, or accepts the key by name
+//     (--accept-target-only-unique-key / the fleet spec's
+//     accept-target-only-unique-key, a standing key). Its catalog-read
+//     failure is NOT the marker and stays restartable.
 //   - DEFERRED-KEY-CHECK-FAILED-AT-COMMIT (Postgres target, codeless): NOT
 //     listed. It is the COMMIT of a target transaction that a deferrable
 //     constraint's re-check refused, and one of its causes is a source
@@ -138,6 +147,7 @@ var refusalsARestartRepeats = []error{
 	ir.ErrColumnIdentityChanged,
 	ir.ErrKeyCollationMerge,
 	ir.ErrUniqueKeyConflictOtherRow,
+	ir.ErrSourceUniqueKeyAbsent,
 }
 
 // refusalARestartRepeats returns the listed sentinel err carries, or nil.

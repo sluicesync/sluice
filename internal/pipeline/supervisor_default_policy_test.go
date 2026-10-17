@@ -264,6 +264,11 @@ func TestSupervisor_RefusalsARestartRepeatsAreNotRestarted(t *testing.T) {
 		"UNIQUE-KEY-CONFLICT-OTHER-ROW": fmt.Errorf("pipeline: apply: %w", &ir.UniqueKeyConflictError{
 			Schema: "public", Table: "t", Keys: "kd_k (k)", Cause: terminalTestErr{"guard raised"},
 		}),
+		// The real refusal type the stream-open unique-key door returns
+		// (unique_key_door.go), unwrapped from runOnce as it is there.
+		"SOURCE-UNIQUE-KEY-ABSENT": &ir.SourceUniqueKeyAbsentError{
+			Keys: []ir.AbsentUniqueKey{{Table: "kd", Key: "kd_k", Columns: "(k)"}}, SourceSeesDDLLive: true,
+		},
 	}
 
 	if len(cases) != len(refusalsARestartRepeats) {

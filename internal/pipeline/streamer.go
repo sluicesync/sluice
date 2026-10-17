@@ -482,6 +482,16 @@ type Streamer struct {
 	// tests). See [Streamer.phaseRefuseRecordedUnforwardedChange].
 	AcceptUnforwardedSchemaChange string
 
+	// AcceptTargetOnlyUniqueKeys names target unique keys the operator
+	// accepts although no source key implies them
+	// (`--accept-target-only-unique-key <table>.<key>`, repeatable): keys the
+	// target was built with on purpose. Every other target unique key the
+	// source does not enforce refuses SOURCE-UNIQUE-KEY-ABSENT at stream
+	// open and at the mid-stream re-check (unique_key_door.go). Standing,
+	// not one-shot: the key stays on the target, so the acceptance must too.
+	// Zero-value safe: empty accepts nothing.
+	AcceptTargetOnlyUniqueKeys []string
+
 	// AcceptSlotAckedPastPosition is the operator's one-shot
 	// acknowledgement of a SLOT-ACKED-PAST-TARGET-POSITION warm-resume
 	// refusal (`--accept-slot-acked-past-position`), given as the exact
@@ -1575,6 +1585,16 @@ type Streamer struct {
 	whereFilter    *whereCDCFilter
 	whereFilterErr atomic.Pointer[error]
 
+	// uniqueKeyDoor is what the stream-open unique-key door learned for the
+	// mid-stream re-check: which tables to watch, per namespace
+	// (unique_key_door.go). uniqueKeyRecheckErr is the re-check intercept's
+	// error sink, surfaced like whereFilterErr. uniqueKeyRecheckEvery
+	// overrides the re-check period (tests); zero is
+	// [uniqueKeyRecheckInterval].
+	uniqueKeyDoor         *uniqueKeyDoorState
+	uniqueKeyRecheckErr   atomic.Pointer[error]
+	uniqueKeyRecheckEvery time.Duration
+
 	// serverSideRowFilters is the subset of [RowFilters] pushed into a VStream
 	// source's SERVER-side stream filter (cold-start COPY + warm-resume). It
 	// equals RowFilters on every path EXCEPT a VStream source with a
@@ -1807,6 +1827,12 @@ func (s *Streamer) Run(ctx context.Context) error {
 	// why `migrate` is deliberately not refused). No-op when Mappings is
 	// empty or lands on no binary type.
 	if err := preflightBinaryTypeOverrideOnCDC(s.Mappings); err != nil {
+		return err
+	}
+
+	// A malformed --accept-target-only-unique-key would accept nothing and
+	// read as a refusal that ignores the flag (unique_key_door.go).
+	if err := validateAcceptedUniqueKeys(s.AcceptTargetOnlyUniqueKeys); err != nil {
 		return err
 	}
 
@@ -2311,6 +2337,17 @@ func (s *Streamer) runOnce(ctx context.Context) (err error) {
 	// cannot upsert into is refused at start rather than killing the
 	// stream on its first change (and every warm resume after it).
 	if err := s.phasePreflightUpsertKeys(ctx, applier); err != nil {
+		return err
+	}
+
+	// ---- 4d. Unique-key door (UNIQUE-KEY-STOPPED-WINDOW-DOOR) ----
+	// Same placement and reason as 4c: every target unique key must be one
+	// a source key implies, or the source's next duplicate of it upserts
+	// onto a different row. Compares the two catalogs, so it reaches every
+	// dispatch branch above alike and consults no persisted state. Also
+	// arms the mid-stream re-check for a source whose change stream
+	// carries no DDL (unique_key_door.go).
+	if err := s.phaseRefuseTargetOnlyUniqueKeys(ctx, applier, streamID); err != nil {
 		return err
 	}
 
