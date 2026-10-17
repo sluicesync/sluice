@@ -254,6 +254,9 @@ type uniqueKeyBoundaryGate struct {
 	colsKey  func(schema, table string) string
 	prevCols map[string]string
 	errStore *atomic.Pointer[error]
+	// judgedEarly is the boundary [beforeDDLHook] judged, so the late call
+	// for the same boundary does not judge it twice.
+	judgedEarly string
 }
 
 // newUniqueKeyBoundaryGate builds the gate for cfg (nil when cfg arms no
@@ -277,6 +280,72 @@ func (g *uniqueKeyBoundaryGate) hook() uniqueKeyBoundaryHook {
 	return g.judge
 }
 
+// beforeDDLHook is the gate's early call, made by an intercept that is
+// about to apply a boundary's DDL (nil for a nil gate). It judges only a
+// boundary that keeps every column the table had, so its DDL can only ADD:
+// the target's keys are the same before that DDL and after it. Judging such a
+// boundary BEFORE the ALTER matters for an ADD COLUMN, whose backfill is
+// recorded as owed before the ALTER runs, so a refusal after the ALTER also
+// ended the stream as ADD-COLUMN-BACKFILL-INCOMPLETE — a second refusal,
+// recorded and persistent, burying this one (round-4 review, measured). A
+// boundary that drops or renames a column can change the target's keys
+// through its DDL and is judged after it, at the late call, which then
+// skips a boundary already judged early.
+func (g *uniqueKeyBoundaryGate) beforeDDLHook() uniqueKeyBoundaryHook {
+	if g == nil {
+		return nil
+	}
+	return func(ctx context.Context, snap ir.SchemaSnapshot) bool {
+		if snap.IR == nil {
+			return true
+		}
+		prev, seen := g.prevCols[g.keyOf(snap)]
+		if !seen || !columnsKept(prev, columnList(snap.IR)) {
+			return true
+		}
+		if !g.judge(ctx, snap) {
+			return false
+		}
+		g.judgedEarly = boundaryID(snap)
+		return true
+	}
+}
+
+// boundaryID identifies one snapshot between the early and late calls.
+func boundaryID(snap ir.SchemaSnapshot) string {
+	return snap.QualifiedName() + "\x00" + snap.Position.Token + "\x00" + columnList(snap.IR)
+}
+
+func (g *uniqueKeyBoundaryGate) keyOf(snap ir.SchemaSnapshot) string {
+	if g.colsKey != nil {
+		return g.colsKey(snap.Schema, snap.Table)
+	}
+	return snap.QualifiedName()
+}
+
+// columnsKept reports that every column of prev is in cur, with its stable
+// id where both carry one ([columnsMoved]'s rule): cur only adds.
+func columnsKept(prev, cur string) bool {
+	if prev == "" {
+		return true
+	}
+	c := map[string]string{}
+	if cur != "" {
+		for _, e := range strings.Split(cur, "\x00") {
+			name, id, _ := strings.Cut(e, "\x01")
+			c[name] = id
+		}
+	}
+	for _, e := range strings.Split(prev, "\x00") {
+		name, pid, _ := strings.Cut(e, "\x01")
+		cid, ok := c[name]
+		if !ok || (pid != "0" && cid != "0" && pid != cid) {
+			return false
+		}
+	}
+	return true
+}
+
 // uniqueKeyBoundaryHook judges one snapshot; false means a refusal or a
 // fail-closed stop was stored and the caller must stop forwarding.
 type uniqueKeyBoundaryHook func(ctx context.Context, snap ir.SchemaSnapshot) bool
@@ -294,10 +363,11 @@ func (g *uniqueKeyBoundaryGate) judge(ctx context.Context, snap ir.SchemaSnapsho
 	if g == nil || snap.IR == nil {
 		return true
 	}
-	key := snap.QualifiedName()
-	if g.colsKey != nil {
-		key = g.colsKey(snap.Schema, snap.Table)
+	if g.judgedEarly != "" && g.judgedEarly == boundaryID(snap) {
+		g.judgedEarly = ""
+		return true // judged before its DDL ([beforeDDLHook])
 	}
+	key := g.keyOf(snap)
 	cols := columnList(snap.IR)
 	prev, seen := g.prevCols[key]
 	if snap.UniqueKeysMoved || (seen && columnsMoved(prev, cols)) {
@@ -411,17 +481,17 @@ func (s *Streamer) uniqueKeyChecksFor() uniqueKeyChecks {
 	cfg := uniqueKeyChecks{period: s.uniqueKeyRecheckPeriod(), maxFailures: uniqueKeyRecheckMaxFailures}
 	multi := len(door.scopes) > 1 || (len(door.scopes) == 1 && door.scopes[0].namespace != "")
 	cfg.seedCols = door.openCols
+	lookup := uniqueKeyColsLookup(door.openCols)
 	cfg.colsKey = func(schema, table string) string {
 		if !multi {
 			schema = ""
 		}
-		return uniqueKeyColsKey(schema, table)
+		return lookup(schema, table)
 	}
 	cfg.boundary = func(ctx context.Context, snap ir.SchemaSnapshot) (*ir.SourceUniqueKeyAbsentError, error) {
 		i := door.scopeFor(snap.Schema)
 		absent, _, err := s.compareUniqueKeys(ctx, door.scopes, uniqueKeyCompare{
 			only: map[int][]string{i: {snap.Table}}, collations: s.uniqueKeyCollationsArmed(false),
-			positionCols: snapshotColumnNames(snap.IR),
 		})
 		if err != nil || len(absent) == 0 {
 			return nil, err

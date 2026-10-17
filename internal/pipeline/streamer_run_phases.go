@@ -1154,6 +1154,7 @@ func (s *Streamer) phaseWireInterceptChain(applyCtx context.Context, changes <-c
 	if s.boundaryRouter != nil {
 		s.boundaryRouter.firstBoundary = witness
 		s.boundaryRouter.uniqueKeys = uniqueKeyGate.hook()
+		s.boundaryRouter.uniqueKeysBeforeDDL = uniqueKeyGate.beforeDDLHook()
 		shapeABackfill = s.addedColumnBackfill(streamID, s.shapeSourceSchemaReader)
 		// The lease holder's ALTER is preceded by the backfill's durable
 		// write-ahead record (schema_forward_backfill_ledger.go).
@@ -1184,12 +1185,13 @@ func (s *Streamer) phaseWireInterceptChain(applyCtx context.Context, changes <-c
 		if deltaApplier, ok := s.addColumnForwardWriter.(ir.ShapeDeltaApplier); ok {
 			forwarding = true
 			deps := schemaForwardDeps{
-				applier:          deltaApplier,
-				sourceEngineName: s.Source.Name(),
-				targetEngineName: s.Target.Name(),
-				normalizer:       snapshotNormalizer,
-				witness:          witness,
-				uniqueKeys:       uniqueKeyGate.hook(),
+				applier:             deltaApplier,
+				sourceEngineName:    s.Source.Name(),
+				targetEngineName:    s.Target.Name(),
+				normalizer:          snapshotNormalizer,
+				witness:             witness,
+				uniqueKeys:          uniqueKeyGate.hook(),
+				uniqueKeysBeforeDDL: uniqueKeyGate.beforeDDLHook(),
 			}
 			if s.addColumnForwardSchemaReader != nil {
 				deps.defaultProber = newSourceDefaultProber(s.addColumnForwardSchemaReader)

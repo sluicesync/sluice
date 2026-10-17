@@ -52,6 +52,9 @@ type BoundaryRouter struct {
 	// uniqueKeys judges each snapshot after its ALTER and before the Shape-A
 	// intercept forwards it ([uniqueKeyBoundaryGate]); nil judges nothing.
 	uniqueKeys uniqueKeyBoundaryHook
+	// uniqueKeysBeforeDDL is the gate's early call, made before the router
+	// writes ahead or applies an ALTER ([uniqueKeyBoundaryGate.beforeDDLHook]).
+	uniqueKeysBeforeDDL uniqueKeyBoundaryHook
 
 	mgr     *LeaseManager
 	applier ir.ShapeDeltaApplier
