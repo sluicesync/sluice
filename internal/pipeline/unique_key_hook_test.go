@@ -141,28 +141,3 @@ func TestUniqueKeyBoundaryGate_BeforeDDL(t *testing.T) {
 		t.Fatalf("a dropped column was not judged after its DDL: %d checks", len(judged))
 	}
 }
-
-// TestUniqueKeyColsLookup pins the first-boundary seed's key (round-4
-// review LOW): a snapshot spelling a table differently from the open read (a
-// MySQL source with lower_case_table_names=2) still finds its seed, while two
-// seeded tables equal without case keep separate baselines.
-func TestUniqueKeyColsLookup(t *testing.T) {
-	lookup := uniqueKeyColsLookup(map[string]string{
-		uniqueKeyColsKey("", "Orders"): "o",
-		uniqueKeyColsKey("", "Users"):  "U",
-		uniqueKeyColsKey("", "users"):  "u",
-	})
-	cases := []struct{ table, want string }{
-		{"Orders", uniqueKeyColsKey("", "Orders")},
-		{"orders", uniqueKeyColsKey("", "Orders")}, // folded: unambiguous
-		{"users", uniqueKeyColsKey("", "users")},   // exact wins
-		{"Users", uniqueKeyColsKey("", "Users")},
-		{"USERS", uniqueKeyColsKey("", "USERS")}, // ambiguous: no seed
-		{"other", uniqueKeyColsKey("", "other")},
-	}
-	for _, c := range cases {
-		if got := lookup("", c.table); got != c.want {
-			t.Errorf("lookup(%q) = %q, want %q", c.table, got, c.want)
-		}
-	}
-}

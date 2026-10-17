@@ -345,7 +345,7 @@ func (e ukLooseEngine) CollationLoosening(t ir.Type) (ir.CollationLoosening, boo
 // without a resolver; a column either side cannot classify is never
 // weakened.
 func TestKeyColumnWeakening_Eligibility(t *testing.T) {
-	loose := map[string]ir.CollationLoosening{"bin": 0, "ci": ir.LooseCase | ir.LooseAccent}
+	loose := map[string]ir.CollationLoosening{"bin": 0, "ci": ir.LooseCase | ir.LooseAccent, "citext": ir.LooseCase, "pad": ir.LoosePad}
 	eng := func(name string) ir.Engine { return ukLooseEngine{name: name, loose: loose} }
 	table := func(coll string) *ir.Table {
 		return &ir.Table{Name: "kd", Columns: []*ir.Column{{Name: "k", Type: ir.Varchar{Length: 9, Collation: coll}}}}
@@ -372,7 +372,16 @@ func TestKeyColumnWeakening_Eligibility(t *testing.T) {
 		{"unclassified on both sides, the same name", eng("mysql"), eng("mysql"), "unknown", "unknown", false},
 		{"unclassified source, target folds nothing", eng("mysql"), eng("mysql"), "unknown", "bin", false},
 		{"unclassified across families", eng("mysql"), eng("postgres"), "bin", "unknown", false},
-		{"no resolver", stubEngine{}, eng("mysql"), "bin", "ci", false},
+		{"no resolver into mysql: withheld", stubEngine{}, eng("mysql"), "bin", "ci", false},
+		// A source with no resolver into a Postgres-family target (round-5
+		// MEDIUM-2): a target column known to fold refuses; none, or a
+		// bpchar pad rule, passes; a SQLite NOCASE source folds case itself.
+		{"no resolver into a folding postgres column", stubEngine{}, eng("postgres"), "", "ci", true},
+		{"no resolver into citext", stubEngine{}, eng("postgres"), "", "citext", true},
+		{"no resolver into a deterministic column", stubEngine{}, eng("postgres"), "", "bin", false},
+		{"no resolver into bpchar", stubEngine{}, eng("postgres"), "", "pad", false},
+		{"no resolver, NOCASE source into citext", stubEngine{}, eng("postgres"), "NOCASE", "citext", false},
+		{"no resolver, NOCASE source into an accent-folding column", stubEngine{}, eng("postgres-trigger"), "nocase", "ci", true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

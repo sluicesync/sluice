@@ -801,7 +801,19 @@ func (r *CDCReader) gradeUnforwardedClasses(ctx context.Context, relationID uint
 	}
 	cur := facts[relationID]
 	if cur == nil {
-		return false, noop, nil // dropped since the message was written; the DML path owns that
+		// Dropped since the message was written; the DML path owns that.
+		// Stated residual (round-5 review LOW-5), deliberately NOT refused:
+		// a DROP INDEX, a duplicate written through the target's stale key,
+		// then a DROP TABLE (or a drop and re-create) all ahead of the reader
+		// leave nothing here to compare — the catalog no longer has the
+		// table, and which keys it had at the message's position is not
+		// recoverable from the current catalog. A RelationMessage for a table
+		// already dropped arrives whenever the reader lags a DROP TABLE, so
+		// refusing on it (or on "the prior baseline had a unique key") would
+		// refuse every lagging DROP TABLE of a keyed table. The narrowest
+		// correct predicate needs a position-anchored catalog, which logical
+		// decoding does not give a client (GC-2's own scope note).
+		return false, noop, nil
 	}
 	if prior != nil {
 		if deltas := diffRelationFacts(prior, cur); len(deltas) > 0 {

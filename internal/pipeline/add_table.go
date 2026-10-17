@@ -262,6 +262,9 @@ type AddTable struct {
 	// Run while the source reader is open and folded into a COPY of the
 	// added table by the unique-key door ([AddTable.refuseTargetOnlyUniqueKeys]).
 	sourceKeyFacts map[string]map[string]ir.UniqueKeyFact
+	// sourceAsRead is the added table before --type-override, whose column
+	// collations the unique-key door judges direction on.
+	sourceAsRead *ir.Table
 }
 
 // Run executes the add-table flow. Returns nil on success or a
@@ -366,6 +369,10 @@ func (a *AddTable) Run(ctx context.Context) error {
 
 	// Apply per-column type / expression overrides (CLI parity with
 	// migrate / sync-start), then the redaction preflight on the result.
+	// The unique-key door judges collation direction on the table as READ:
+	// an override toward a looser collation is the very weakening it looks
+	// for (round-5 review LOW-6).
+	a.sourceAsRead = cloneTableColumns(scoped.Tables[0])
 	scoped, err = a.translateScopedSchema(scoped)
 	if err != nil {
 		return err
@@ -762,7 +769,7 @@ func (a *AddTable) refuseTargetOnlyUniqueKeys(ctx context.Context, source *ir.Ta
 	if err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: add-table: unique-key door: %w", err))
 	}
-	return refuseAddTableTargetOnlyUniqueKeys(src.Tables[0], target, a.Source, a.Target, a.AcceptTargetOnlyUniqueKeys)
+	return refuseAddTableTargetOnlyUniqueKeysAsRead(src.Tables[0], a.sourceAsRead, target, a.Source, a.Target, a.AcceptTargetOnlyUniqueKeys)
 }
 
 // readTargetKeys reads the target's counterpart of table, with its
@@ -809,6 +816,16 @@ func (a *AddTable) readTargetKeys(ctx context.Context, table, targetSchema strin
 // WARN). source is the scoped table after the operator's overrides, which
 // change column types and generated expressions, never keys.
 func refuseAddTableTargetOnlyUniqueKeys(source *ir.Table, targetTables map[string]*ir.Table, sourceEngine, targetEngine ir.Engine, accept []string) error {
+	return refuseAddTableTargetOnlyUniqueKeysAsRead(source, nil, targetTables, sourceEngine, targetEngine, accept)
+}
+
+// refuseAddTableTargetOnlyUniqueKeysAsRead is [refuseAddTableTargetOnlyUniqueKeys]
+// with the collation direction judged on asRead, the source table before
+// --type-override (nil: source itself).
+func refuseAddTableTargetOnlyUniqueKeysAsRead(source, asRead *ir.Table, targetTables map[string]*ir.Table, sourceEngine, targetEngine ir.Engine, accept []string) error {
+	if asRead == nil {
+		asRead = source
+	}
 	tables := make([]*ir.Table, 0, len(targetTables))
 	for _, t := range targetTables {
 		if t != nil {
@@ -821,7 +838,7 @@ func refuseAddTableTargetOnlyUniqueKeys(source *ir.Table, targetTables map[strin
 	}
 	accepted := parseAcceptedUniqueKeys(accept)
 	var absent []ir.AbsentUniqueKey
-	weakened := keyColumnWeakening(sourceEngine, targetEngine, source, target)
+	weakened := keyColumnWeakening(sourceEngine, targetEngine, asRead, target)
 	for _, key := range uncoveredTargetKeys(source, target, engineNameOrEmpty(targetEngine), weakened) {
 		if !accepted.allows("", target.Name, key.Name) {
 			absent = append(absent, absentUniqueKey(target.Name, target, key, weakened))

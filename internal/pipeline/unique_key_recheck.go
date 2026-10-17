@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -41,6 +42,7 @@ type uniqueKeyChecks struct {
 	// starting from that seed.
 	boundary    func(ctx context.Context, snap ir.SchemaSnapshot) (*ir.SourceUniqueKeyAbsentError, error)
 	seedCols    map[string]string
+	seedTypes   map[string]map[string]ir.Type
 	colsKey     func(schema, table string) string
 	maxFailures int
 }
@@ -252,11 +254,31 @@ func (r *uniqueKeyRunner) emit(ctx context.Context, c ir.Change) bool {
 type uniqueKeyBoundaryGate struct {
 	check    func(ctx context.Context, snap ir.SchemaSnapshot) (*ir.SourceUniqueKeyAbsentError, error)
 	colsKey  func(schema, table string) string
-	prevCols map[string]string
 	errStore *atomic.Pointer[error]
-	// judgedEarly is the boundary [beforeDDLHook] judged, so the late call
-	// for the same boundary does not judge it twice.
-	judgedEarly string
+
+	// prevCols and prevTypes are each table's last judged column list and
+	// column types, keyed by the table's exact spelling ([uniqueKeyColsKey]).
+	// prevTypes holds change-stream types only; seedTypes the open door's.
+	prevCols  map[string]string
+	prevTypes map[string]map[string]ir.Type
+	seedTypes map[string]map[string]ir.Type
+	// foldedSeed is the open door's column lists keyed by the folded
+	// spelling, for a table the change stream spells differently from the
+	// open read (a MySQL source with lower_case_table_names=2). It is a READ
+	// fallback only and never written, so another spelling (a table added
+	// mid-run that folds onto a seeded one) can read a stale baseline but
+	// never overwrite a seeded one (round-5 review LOW-4). Folded spellings
+	// that collide are left out.
+	foldedSeed map[string]string
+
+	// calls counts gate entries, early and late; earlyAt and earlyID mark
+	// the early call that judged a boundary, so the late call for the SAME
+	// boundary, and only when it is the very next entry, skips (round-5
+	// review LOW-2: a Postgres boundary's position token is a constant 0/0,
+	// so an identity alone could match a later snapshot).
+	calls   int
+	earlyAt int
+	earlyID string
 }
 
 // newUniqueKeyBoundaryGate builds the gate for cfg (nil when cfg arms no
@@ -265,11 +287,34 @@ func newUniqueKeyBoundaryGate(cfg uniqueKeyChecks, errStore *atomic.Pointer[erro
 	if cfg.boundary == nil {
 		return nil
 	}
-	prevCols := make(map[string]string, len(cfg.seedCols))
-	for k, v := range cfg.seedCols {
-		prevCols[k] = v
+	g := &uniqueKeyBoundaryGate{
+		check: cfg.boundary, colsKey: cfg.colsKey, errStore: errStore,
+		prevCols: map[string]string{}, prevTypes: map[string]map[string]ir.Type{},
+		seedTypes: cfg.seedTypes, foldedSeed: map[string]string{},
 	}
-	return &uniqueKeyBoundaryGate{check: cfg.boundary, colsKey: cfg.colsKey, prevCols: prevCols, errStore: errStore}
+	collide := map[string]bool{}
+	for k, v := range cfg.seedCols {
+		g.prevCols[k] = v
+		f := strings.ToLower(k)
+		if _, seen := g.foldedSeed[f]; seen {
+			collide[f] = true
+		}
+		g.foldedSeed[f] = v
+	}
+	for f := range collide {
+		delete(g.foldedSeed, f)
+	}
+	return g
+}
+
+// prev returns a table's baseline: its own, else the open door's under a
+// folded spelling.
+func (g *uniqueKeyBoundaryGate) prev(key string) (string, bool) {
+	if v, ok := g.prevCols[key]; ok {
+		return v, true
+	}
+	v, ok := g.foldedSeed[strings.ToLower(key)]
+	return v, ok
 }
 
 // hook is the gate as the schema intercepts take it (nil for a nil gate).
@@ -282,31 +327,36 @@ func (g *uniqueKeyBoundaryGate) hook() uniqueKeyBoundaryHook {
 
 // beforeDDLHook is the gate's early call, made by an intercept that is
 // about to apply a boundary's DDL (nil for a nil gate). It judges only a
-// boundary that keeps every column the table had, so its DDL can only ADD:
-// the target's keys are the same before that DDL and after it. Judging such a
-// boundary BEFORE the ALTER matters for an ADD COLUMN, whose backfill is
-// recorded as owed before the ALTER runs, so a refusal after the ALTER also
-// ended the stream as ADD-COLUMN-BACKFILL-INCOMPLETE — a second refusal,
-// recorded and persistent, burying this one (round-4 review, measured). A
-// boundary that drops or renames a column can change the target's keys
-// through its DDL and is judged after it, at the late call, which then
-// skips a boundary already judged early.
+// boundary that keeps every column the table had, each with an unchanged
+// type ([typesKept]): its DDL can then only ADD columns, and the target's
+// keys are the same before that DDL and after it. A boundary that also
+// changes a kept column (`ADD n, MODIFY k … COLLATE utf8mb4_bin`) could
+// change a target key through its DDL, and judging it early, against the
+// pre-DDL target, refused a working stream (round-5 review LOW-1). Judging
+// a purely additive boundary BEFORE the ALTER matters for an ADD COLUMN,
+// whose backfill is recorded as owed before the ALTER runs, so a refusal
+// after the ALTER also ended the stream as ADD-COLUMN-BACKFILL-INCOMPLETE —
+// a second, persistent refusal burying this one (round-4 review, measured).
+// Everything else is judged at the late call, after its DDL, which skips a
+// boundary the immediately preceding early call judged.
 func (g *uniqueKeyBoundaryGate) beforeDDLHook() uniqueKeyBoundaryHook {
 	if g == nil {
 		return nil
 	}
 	return func(ctx context.Context, snap ir.SchemaSnapshot) bool {
+		g.calls++
 		if snap.IR == nil {
 			return true
 		}
-		prev, seen := g.prevCols[g.keyOf(snap)]
-		if !seen || !columnsKept(prev, columnList(snap.IR)) {
+		key := g.keyOf(snap)
+		prev, seen := g.prev(key)
+		if !seen || !columnsKept(prev, columnList(snap.IR)) || !g.typesKept(key, snap.IR) {
 			return true
 		}
-		if !g.judge(ctx, snap) {
+		if !g.judgeAt(ctx, snap) {
 			return false
 		}
-		g.judgedEarly = boundaryID(snap)
+		g.earlyAt, g.earlyID = g.calls, boundaryID(snap)
 		return true
 	}
 }
@@ -321,6 +371,53 @@ func (g *uniqueKeyBoundaryGate) keyOf(snap ir.SchemaSnapshot) string {
 		return g.colsKey(snap.Schema, snap.Table)
 	}
 	return snap.QualifiedName()
+}
+
+// typesKept reports that every column of cur the table already had keeps
+// its type. Against the previous change-stream snapshot the comparison is
+// exact. Against the open door's read (the table's first boundary of the
+// run) it compares the Go type and, where both record one, the collation:
+// the two readers differ in fidelity (a change stream may carry no
+// collation at all), and an unequal fidelity must not read as a change.
+func (g *uniqueKeyBoundaryGate) typesKept(key string, cur *ir.Table) bool {
+	prev, cdc := g.prevTypes[key]
+	if !cdc {
+		prev = g.seedTypes[key]
+	}
+	for _, c := range cur.Columns {
+		if c == nil {
+			continue
+		}
+		pt, ok := prev[c.Name]
+		if !ok {
+			continue // added, or not known: columnsKept judged the names
+		}
+		if cdc {
+			if !reflect.DeepEqual(pt, c.Type) {
+				return false
+			}
+			continue
+		}
+		if reflect.TypeOf(ir.UnwrapDomain(pt)) != reflect.TypeOf(ir.UnwrapDomain(c.Type)) {
+			return false
+		}
+		pc, _ := characterCollation(pt)
+		cc, _ := characterCollation(c.Type)
+		if pc != "" && cc != "" && !strings.EqualFold(pc, cc) {
+			return false
+		}
+	}
+	return true
+}
+
+func columnTypes(t *ir.Table) map[string]ir.Type {
+	out := make(map[string]ir.Type, len(t.Columns))
+	for _, c := range t.Columns {
+		if c != nil {
+			out[c.Name] = c.Type
+		}
+	}
+	return out
 }
 
 // columnsKept reports that every column of prev is in cur, with its stable
@@ -350,7 +447,23 @@ func columnsKept(prev, cur string) bool {
 // fail-closed stop was stored and the caller must stop forwarding.
 type uniqueKeyBoundaryHook func(ctx context.Context, snap ir.SchemaSnapshot) bool
 
-// judge runs the check for a snapshot whose columns moved ([columnsMoved])
+// judge is the gate's late call, made after a boundary's DDL: it skips the
+// boundary the immediately preceding early call judged, and judges any
+// other ([judgeAt]).
+func (g *uniqueKeyBoundaryGate) judge(ctx context.Context, snap ir.SchemaSnapshot) bool {
+	if g == nil || snap.IR == nil {
+		return true
+	}
+	g.calls++
+	if g.earlyAt != 0 && g.earlyAt == g.calls-1 && g.earlyID == boundaryID(snap) {
+		g.earlyAt = 0
+		return true // judged before its DDL ([beforeDDLHook])
+	}
+	g.earlyAt = 0
+	return g.judgeAt(ctx, snap)
+}
+
+// judgeAt runs the check for a snapshot whose columns moved ([columnsMoved])
 // or whose reader reports a unique key lost with a column
 // ([ir.SchemaSnapshot.UniqueKeysMoved]: a dropped generated column is not in
 // a Postgres change stream's column list, so only the reader's catalog read
@@ -359,17 +472,10 @@ type uniqueKeyBoundaryHook func(ctx context.Context, snap ir.SchemaSnapshot) boo
 // the table unwatched for the rest of the run on a source with no periodic
 // re-check (round-2 review MEDIUM-1). It is not counted toward the periodic
 // failure budget.
-func (g *uniqueKeyBoundaryGate) judge(ctx context.Context, snap ir.SchemaSnapshot) bool {
-	if g == nil || snap.IR == nil {
-		return true
-	}
-	if g.judgedEarly != "" && g.judgedEarly == boundaryID(snap) {
-		g.judgedEarly = ""
-		return true // judged before its DDL ([beforeDDLHook])
-	}
+func (g *uniqueKeyBoundaryGate) judgeAt(ctx context.Context, snap ir.SchemaSnapshot) bool {
 	key := g.keyOf(snap)
 	cols := columnList(snap.IR)
-	prev, seen := g.prevCols[key]
+	prev, seen := g.prev(key)
 	if snap.UniqueKeysMoved || (seen && columnsMoved(prev, cols)) {
 		refusal, err := g.check(ctx, snap)
 		switch {
@@ -388,6 +494,7 @@ func (g *uniqueKeyBoundaryGate) judge(ctx context.Context, snap ir.SchemaSnapsho
 		}
 	}
 	g.prevCols[key] = cols
+	g.prevTypes[key] = columnTypes(snap.IR)
 	return true
 }
 
@@ -480,18 +587,22 @@ func (s *Streamer) uniqueKeyChecksFor() uniqueKeyChecks {
 	}
 	cfg := uniqueKeyChecks{period: s.uniqueKeyRecheckPeriod(), maxFailures: uniqueKeyRecheckMaxFailures}
 	multi := len(door.scopes) > 1 || (len(door.scopes) == 1 && door.scopes[0].namespace != "")
-	cfg.seedCols = door.openCols
-	lookup := uniqueKeyColsLookup(door.openCols)
+	cfg.seedCols, cfg.seedTypes = door.openCols, door.openTypes
 	cfg.colsKey = func(schema, table string) string {
 		if !multi {
 			schema = ""
 		}
-		return lookup(schema, table)
+		return uniqueKeyColsKey(schema, table)
 	}
 	cfg.boundary = func(ctx context.Context, snap ir.SchemaSnapshot) (*ir.SourceUniqueKeyAbsentError, error) {
-		i := door.scopeFor(snap.Schema)
+		i, ok := door.scopeFor(snap.Schema)
+		if !ok {
+			return nil, fmt.Errorf("the schema change of %s names a namespace this stream's unique-key check has no "+
+				"scope for", snap.QualifiedName())
+		}
 		absent, _, err := s.compareUniqueKeys(ctx, door.scopes, uniqueKeyCompare{
 			only: map[int][]string{i: {snap.Table}}, collations: s.uniqueKeyCollationsArmed(false),
+			acceptedShapes: door.acceptedShapes,
 		})
 		if err != nil || len(absent) == 0 {
 			return nil, err
@@ -514,7 +625,9 @@ func (s *Streamer) uniqueKeyChecksFor() uniqueKeyChecks {
 		return watched[schema+"\x00"+strings.ToLower(table)]
 	}
 	cfg.periodic = func(ctx context.Context) (*ir.SourceUniqueKeyAbsentError, error) {
-		absent, _, err := s.compareUniqueKeys(ctx, door.scopes, uniqueKeyCompare{only: door.watched, collations: s.uniqueKeyCollationsArmed(false)})
+		absent, _, err := s.compareUniqueKeys(ctx, door.scopes, uniqueKeyCompare{
+			only: door.watched, collations: s.uniqueKeyCollationsArmed(false), acceptedShapes: door.acceptedShapes,
+		})
 		if err != nil || len(absent) == 0 {
 			return nil, err
 		}
@@ -523,13 +636,19 @@ func (s *Streamer) uniqueKeyChecksFor() uniqueKeyChecks {
 	return cfg
 }
 
-// scopeFor returns the scope index of a source namespace (0 on a
-// single-namespace stream).
-func (d *uniqueKeyDoorState) scopeFor(schema string) int {
+// scopeFor returns the scope index of a source namespace: the one scope of a
+// single-namespace stream, else the scope naming it. ok is false for a
+// namespace no scope names (round-5 review LOW-5): that used to answer
+// scope 0, whose table filter then judged nothing for the boundary, so the
+// caller now refuses instead of passing it unjudged.
+func (d *uniqueKeyDoorState) scopeFor(schema string) (int, bool) {
+	if len(d.scopes) == 1 && d.scopes[0].namespace == "" {
+		return 0, true
+	}
 	for i, sc := range d.scopes {
 		if sc.namespace != "" && strings.EqualFold(sc.namespace, schema) {
-			return i
+			return i, true
 		}
 	}
-	return 0
+	return 0, false
 }

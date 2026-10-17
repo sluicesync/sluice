@@ -51,8 +51,11 @@ package pipeline
 //     live unique-key DROP before the next row of the table (postgres and
 //     mysql cdc_unforwarded_classes.go).
 //   - At a SCHEMA BOUNDARY that moves a table's column list, on every
-//     source, for that table, after the schema-forward intercepts whether
-//     or not they forwarded it: a Postgres source drops an index outright
+//     source, for that table, judged by the schema intercept that handles
+//     it: before its DDL when the boundary only adds columns (every kept
+//     column unchanged), else after its DDL, whether or not it was
+//     forwarded ([uniqueKeyBoundaryGate]):
+//     a Postgres source drops an index outright
 //     with a column it covers, a forwarded DROP COLUMN narrows a
 //     MySQL-family target key that included the column (UNIQUE(a,b) →
 //     UNIQUE(a)), and a DROP COLUMN at the first boundary after a cold start
@@ -174,45 +177,18 @@ type uniqueKeyDoorState struct {
 	// session, so a DROP COLUMN made before the table's first change in the
 	// run arrives as that first snapshot — round-2 review HIGH-1).
 	openCols map[string]string
+	// acceptedShapes is each accepted key's shape as the open door saw it
+	// ([uniqueKeyCompare.acceptedShapes]); read-only after open.
+	acceptedShapes map[string]string
+	// openTypes is each source table's column types as the open door read them.
+	openTypes map[string]map[string]ir.Type
 }
 
 // uniqueKeyColsKey keys a table's column list by source namespace ("" on a
-// single-namespace stream; folded) and table name as spelled. The lookup
-// ([uniqueKeyColsLookup]) folds the name when that is unambiguous.
+// single-namespace stream; folded) and table name as spelled
+// ([uniqueKeyBoundaryGate] folds it for a read fallback only).
 func uniqueKeyColsKey(namespace, table string) string {
 	return strings.ToLower(namespace) + "\x00" + table
-}
-
-// uniqueKeyColsLookup returns the key a snapshot of (namespace, table)
-// takes in seed: its exact spelling when seeded, else the one seeded table
-// that folds to it, else the exact spelling. Folding matters because the
-// open door's read and the change stream can spell a table differently (a
-// MySQL source with lower_case_table_names=2), and a missed seed silently
-// skips a table's first-boundary check. Folding only when unambiguous
-// matters because a Postgres source may hold `Users` beside `users`, which
-// must keep separate baselines (round-3 and round-4 review LOWs).
-func uniqueKeyColsLookup(seed map[string]string) func(namespace, table string) string {
-	folded := map[string]string{}
-	collide := map[string]bool{}
-	for k := range seed {
-		f := strings.ToLower(k)
-		if _, seen := folded[f]; seen {
-			collide[f] = true
-		}
-		folded[f] = k
-	}
-	return func(namespace, table string) string {
-		exact := uniqueKeyColsKey(namespace, table)
-		if _, ok := seed[exact]; ok {
-			return exact
-		}
-		if f := strings.ToLower(exact); !collide[f] {
-			if k, ok := folded[f]; ok {
-				return k
-			}
-		}
-		return exact
-	}
 }
 
 // sourceSeesUniqueKeyDDLLive reports a source whose change stream refuses a
@@ -240,9 +216,10 @@ func (s *Streamer) phaseRefuseTargetOnlyUniqueKeys(ctx context.Context, applier 
 	if err != nil {
 		return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("pipeline: unique-key door: %w", err))
 	}
-	openCols := map[string]string{}
+	openCols, acceptedShapes, openTypes := map[string]string{}, map[string]string{}, map[string]map[string]ir.Type{}
 	absent, watched, err := s.compareUniqueKeys(ctx, scopes, uniqueKeyCompare{
 		liveAdded: liveAdded, cols: openCols, collations: s.uniqueKeyCollationsArmed(!warmResumed),
+		acceptedShapes: acceptedShapes, recordAccepted: true, colTypes: openTypes,
 	})
 	if err != nil {
 		return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("pipeline: unique-key door: %w", err))
@@ -251,7 +228,9 @@ func (s *Streamer) phaseRefuseTargetOnlyUniqueKeys(ctx context.Context, applier 
 		return s.uniqueKeyRefusal(absent, ir.UniqueKeyDoorAtOpen)
 	}
 	periodic := !sourceSeesUniqueKeyDDLLive(s.Source) && len(watched) > 0
-	s.uniqueKeyDoor = &uniqueKeyDoorState{scopes: scopes, watched: watched, periodic: periodic, openCols: openCols}
+	s.uniqueKeyDoor = &uniqueKeyDoorState{
+		scopes: scopes, watched: watched, periodic: periodic, openCols: openCols, acceptedShapes: acceptedShapes, openTypes: openTypes,
+	}
 	if periodic {
 		slog.InfoContext(ctx, "unique-key door: this source's change stream carries no DDL; re-checking the target's "+
 			"unique keys against the source's periodically",
@@ -387,9 +366,41 @@ type uniqueKeyCompare struct {
 	// cols, when non-nil, receives each source table's column list (the
 	// open door's baseline for the boundary check).
 	cols map[string]string
+	// colTypes, when non-nil, receives each source table's column types (the
+	// boundary check's early-call baseline, [uniqueKeyBoundaryGate.typesKept]).
+	colTypes map[string]map[string]ir.Type
 	// collations arms the collation direction ([keyColumnWeakening]); see
 	// [Streamer.uniqueKeyCollationsArmed].
 	collations bool
+	// acceptedShapes binds each --accept-target-only-unique-key acceptance
+	// to the key's shape as accepted (round-5 review MEDIUM-1): the open
+	// door records it (recordAccepted), and a later check honours the
+	// acceptance only while the key still has that shape. The flag names a
+	// key, and a forwarded DROP COLUMN can narrow a MySQL-family key under
+	// the same name (UNIQUE (a, x) becomes UNIQUE (a)); passing it by name
+	// let the next row duplicating a overwrite another at exit 0. nil (the
+	// add-table check, which judges once) honours the name alone. Written
+	// only by the open door, read-only after.
+	acceptedShapes map[string]string
+	recordAccepted bool
+}
+
+// acceptedShapeKey keys a target key for [uniqueKeyCompare.acceptedShapes].
+func acceptedShapeKey(targetNamespace, table, key string) string {
+	return strings.ToLower(targetNamespace) + "\x00" + strings.ToLower(table) + "\x00" + strings.ToLower(key)
+}
+
+// acceptedShape renders what an acceptance is bound to: the key's parts
+// (with any index collation), NULLS NOT DISTINCT and its predicate.
+func acceptedShape(key *ir.Index) string {
+	s := renderKeyParts(key)
+	if key.ConstraintNullsNotDistinct {
+		s += " NULLS NOT DISTINCT"
+	}
+	if p := strings.TrimSpace(key.Predicate); p != "" {
+		s += " WHERE " + p
+	}
+	return s
 }
 
 // compareUniqueKeys reads both catalogs for every scope and returns the
@@ -404,6 +415,10 @@ func (s *Streamer) compareUniqueKeys(ctx context.Context, scopes []uniqueKeyDoor
 		return keyColumnWeakening(s.Source, s.Target, st, tt)
 	}
 	accept := parseAcceptedUniqueKeys(s.AcceptTargetOnlyUniqueKeys)
+	// ambiguous counts, per 2-part acceptance, the namespaces it accepted a
+	// key in (round-5 review LOW-3): on a multi-database stream `<table>.<key>`
+	// silently matched every namespace.
+	ambiguous := map[int]map[string]bool{}
 	var absent []ir.AbsentUniqueKey
 	watched := map[int][]string{}
 	for i, sc := range scopes {
@@ -449,6 +464,9 @@ func (s *Streamer) compareUniqueKeys(ctx context.Context, scopes []uniqueKeyDoor
 		for _, st := range src {
 			if cols != nil {
 				cols[uniqueKeyColsKey(sc.namespace, st.Name)] = columnList(st)
+				if req.colTypes != nil {
+					req.colTypes[uniqueKeyColsKey(sc.namespace, st.Name)] = columnTypes(st)
+				}
 			}
 			tt := matchTargetTable(tgt, st.Name)
 			if tt == nil {
@@ -459,15 +477,45 @@ func (s *Streamer) compareUniqueKeys(ctx context.Context, scopes []uniqueKeyDoor
 			}
 			weakened := weakening(st, tt)
 			for _, key := range uncoveredTargetKeys(st, tt, s.Target.Name(), weakened) {
-				if accept.allows(sc.namespace, tt.Name, key.Name) || accept.allows(sc.targetNamespace, tt.Name, key.Name) {
-					continue
-				}
 				table := tt.Name
 				if sc.targetNamespace != "" {
 					table = sc.targetNamespace + "." + table
 				}
-				absent = append(absent, absentUniqueKey(table, tt, key, weakened))
+				entry, accepted := accept.match(tt.Name, key.Name, sc.namespace, sc.targetNamespace)
+				if !accepted {
+					absent = append(absent, absentUniqueKey(table, tt, key, weakened))
+					continue
+				}
+				if accept[entry].namespace == "" && len(scopes) > 1 {
+					if ambiguous[entry] == nil {
+						ambiguous[entry] = map[string]bool{}
+					}
+					ambiguous[entry][sc.targetNamespace] = true
+				}
+				if req.acceptedShapes == nil {
+					continue
+				}
+				shapeKey, shape := acceptedShapeKey(sc.targetNamespace, tt.Name, key.Name), acceptedShape(key)
+				if req.recordAccepted {
+					req.acceptedShapes[shapeKey] = shape
+					continue
+				}
+				recorded, ok := req.acceptedShapes[shapeKey]
+				if ok && recorded == shape {
+					continue
+				}
+				k := absentUniqueKey(table, tt, key, weakened)
+				k.AcceptedShape, k.AcceptedUnrecorded = recorded, !ok
+				absent = append(absent, k)
 			}
+		}
+	}
+	for entry, namespaces := range ambiguous {
+		if len(namespaces) > 1 {
+			e := accept[entry]
+			return nil, nil, fmt.Errorf("--accept-target-only-unique-key %s.%s matches the key in %d databases of this "+
+				"multi-database stream (%s); name the database it is meant for: <database>.%s.%s",
+				e.table, e.key, len(namespaces), strings.Join(sortedNamespaces(namespaces), ", "), e.table, e.key)
 		}
 	}
 	sort.SliceStable(absent, func(a, b int) bool {
@@ -632,6 +680,23 @@ func foldUniqueKeyFacts(facts map[string]map[string]ir.UniqueKeyFact, schema *ir
 // cloneTableKeys copies t deeply enough for [foldUniqueKeyFacts] to change
 // its keys without touching t: add-table folds facts into the table it is
 // about to CREATE, whose keys must stay as read.
+// cloneTableColumns copies t with its own Column values, so a later in-place
+// rewrite of the original's columns (an override) does not reach the copy.
+func cloneTableColumns(t *ir.Table) *ir.Table {
+	if t == nil {
+		return nil
+	}
+	cp := *t
+	cp.Columns = make([]*ir.Column, len(t.Columns))
+	for i, c := range t.Columns {
+		if c != nil {
+			col := *c
+			cp.Columns[i] = &col
+		}
+	}
+	return &cp
+}
+
 func cloneTableKeys(t *ir.Table) *ir.Table {
 	cp := *t
 	cloneIndex := func(idx *ir.Index) *ir.Index {
@@ -755,6 +820,9 @@ func keyColumnWeakening(source, target ir.Engine, st, tt *ir.Table) func(sourceC
 	}
 	sr, ok1 := source.(ir.CollationLooseningResolver)
 	tr, ok2 := target.(ir.CollationLooseningResolver)
+	if !ok1 && ok2 && translate.SameStorageShapeFamily(target.Name(), "postgres") {
+		return foldingTargetColumn(tr, st, tt)
+	}
 	if !ok1 || !ok2 {
 		return nil
 	}
@@ -773,6 +841,35 @@ func keyColumnWeakening(source, target ir.Engine, st, tt *ir.Table) func(sourceC
 			return tl&^sl != 0
 		}
 		return unknownCollationWeakened(sc.Type, tc.Type, tl, tok, sameFamily)
+	}
+}
+
+// foldingTargetColumn is the collation direction for a source engine with
+// no [ir.CollationLooseningResolver] (sqlite-trigger, d1-trigger) into a
+// Postgres-family target (round-5 review MEDIUM-2): fail closed, narrowly.
+// A target key column KNOWN to fold case or accents (citext, a
+// nondeterministic collation) is weakened unless the source column's own
+// collation folds the same (SQLite NOCASE folds case). The default mapping
+// — a SQLite TEXT key onto a deterministic Postgres text column — reports
+// no folding and passes, and so does a bpchar column's trailing-space rule,
+// which a SQLite CHAR declaration lands on by default. Withholding all of
+// it, as before, let 'a' and 'A' merge on a pre-created citext target.
+func foldingTargetColumn(tr ir.CollationLooseningResolver, st, tt *ir.Table) func(sourceColumn, targetColumn string) bool {
+	return func(sourceColumn, targetColumn string) bool {
+		sc, tc := columnNamed(st, sourceColumn), columnNamed(tt, targetColumn)
+		if sc == nil || tc == nil {
+			return false
+		}
+		tl, tok := tr.CollationLoosening(tc.Type)
+		fold := tl & (ir.LooseCase | ir.LooseAccent)
+		if !tok || fold == 0 {
+			return false
+		}
+		var sourceFold ir.CollationLoosening
+		if coll, ok := characterCollation(sc.Type); ok && strings.EqualFold(strings.TrimSpace(coll), "nocase") {
+			sourceFold = ir.LooseCase
+		}
+		return fold&^sourceFold != 0
 	}
 }
 
@@ -957,13 +1054,34 @@ func validateAcceptedUniqueKeys(entries []string) error {
 }
 
 func (a acceptedUniqueKeys) allows(namespace, table, key string) bool {
-	for _, e := range a {
-		if e.namespace != "" && !strings.EqualFold(e.namespace, namespace) {
+	_, ok := a.match(table, key, namespace)
+	return ok
+}
+
+// match returns the entry accepting table.key in any of namespaces (a
+// 3-part entry must name one of them; a 2-part entry matches any).
+func (a acceptedUniqueKeys) match(table, key string, namespaces ...string) (int, bool) {
+	for i, e := range a {
+		if !strings.EqualFold(e.table, table) || !strings.EqualFold(e.key, key) {
 			continue
 		}
-		if strings.EqualFold(e.table, table) && strings.EqualFold(e.key, key) {
-			return true
+		if e.namespace == "" {
+			return i, true
+		}
+		for _, ns := range namespaces {
+			if strings.EqualFold(e.namespace, ns) {
+				return i, true
+			}
 		}
 	}
-	return false
+	return 0, false
+}
+
+func sortedNamespaces(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }

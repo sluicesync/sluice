@@ -78,6 +78,14 @@ type AbsentUniqueKey struct {
 	// stricter equality. The refusal names them, and an ALTER of each to a
 	// collation as strict as the source's is one more way to clear it.
 	LooserColumns []string
+	// AcceptedShape is the shape an --accept-target-only-unique-key
+	// acceptance of this key was bound to at the stream's start, when the
+	// key no longer has it (a forwarded DROP COLUMN narrowed it, say).
+	// AcceptedUnrecorded marks an accepted key the stream's start never saw
+	// (its table joined while the stream ran), whose acceptance therefore
+	// has no shape to hold it to.
+	AcceptedShape      string
+	AcceptedUnrecorded bool
 }
 
 // SourceUniqueKeyAbsentError is the refusal. Engine-neutral: the pipeline
@@ -108,6 +116,15 @@ func (e *SourceUniqueKeyAbsentError) Error() string {
 		keys[i] = k.Table + "." + name + " " + k.Columns
 		if k.Constraint {
 			keys[i] += " [a constraint: ALTER TABLE " + k.Table + " DROP CONSTRAINT " + name + "]"
+		}
+		switch {
+		case k.AcceptedUnrecorded:
+			keys[i] += " [accepted by name, but this stream's start never saw the key (its table joined while the stream " +
+				"ran), so the acceptance has no shape to hold it to: restart with the same flag to record it]"
+		case k.AcceptedShape != "":
+			keys[i] += " [accepted by name as " + k.AcceptedShape + " at this stream's start; the acceptance covered that " +
+				"shape, not this one, and a narrower key merges rows the accepted one kept apart: drop it on the target, or, " +
+				"having checked it, restart with the same flag to accept the new shape]"
 		}
 		if len(k.LooserColumns) > 0 {
 			keys[i] += " [the target's " + strings.Join(k.LooserColumns, ", ") + " compares case-, accent- or " +
