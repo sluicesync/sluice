@@ -7,9 +7,10 @@ package pipeline
 // ADR-0093 auto-resnapshot recovery both force a fresh cold-start onto a
 // NON-dropped target, relying on the (misleading) hint that "the
 // idempotent copy absorbs the overlap". That contract only holds for
-// IDEMPOTENT snapshot readers (VStream/PlanetScale, Postgres) whose
-// cold-copy upserts. The NATIVE MySQL binlog snapshot does NOT implement
-// ir.IdempotentCopyReader, so its cold-copy runs PLAIN INSERT — which
+// IDEMPOTENT snapshot readers (VStream/PlanetScale only) whose cold-copy
+// upserts. The NATIVE MySQL binlog snapshot and the Postgres snapshot do
+// NOT implement ir.IdempotentCopyReader, so their cold-copy runs PLAIN
+// INSERT — which
 // dup-key ERRORS (MySQL Error 1062) on a target that already holds the
 // prior copy's rows.
 //

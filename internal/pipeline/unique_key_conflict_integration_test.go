@@ -360,12 +360,14 @@ func TestStreamer_UniqueKeyConflict_TriggerCDC(t *testing.T) {
 
 // TestStreamer_UniqueKeyConflict_TradeRemedy provokes the guard's stated
 // false refusal (UNIQUE-KEY-GUARD-OVERLAP-REFUSAL) and measures the remedy
-// the refusal prints, on BOTH re-copy paths `--restart-from-scratch` has
-// (cmd/sluice cli.go, RestartFromScratch): a native MySQL binlog source,
-// whose plain-INSERT copy makes the restart DROP and recreate the target
-// tables first (it converges almost by construction), and a Postgres
-// pgoutput source, whose idempotent upsert copy re-copies ONTO the existing
-// rows without dropping them. kd has no primary key and two unique keys (id,
+// the refusal prints, from a native MySQL binlog source and a Postgres
+// pgoutput source. BOTH take the same drop path: their plain-INSERT copies
+// make the restart DROP and recreate the target tables first (only the
+// VStream snapshot reader is idempotent — copyReaderIsIdempotent — so the
+// upsert re-copy path, which leaves the target's rows in place, is NOT
+// measured here; this test called the pgoutput cell "the upsert re-copy
+// path" until 2026-10-17, Bug 320). The pgoutput cell adds the slot-drop
+// step the remedy names. kd has no primary key and two unique keys (id,
 // k). While the stream is stopped the source inserts (3,'c') and then moves
 // it to id 4, and the TARGET is made to hold (4,'c') already — the state a
 // re-delivery window leaves: the target ahead of the change being replayed.
@@ -374,10 +376,11 @@ func TestStreamer_UniqueKeyConflict_TriggerCDC(t *testing.T) {
 // keys, so the remedy that applies is the re-copy for `sync start`,
 // `--restart-from-scratch` with the same stream id. It must converge: the
 // target equal to the source by id, and the stream live again. Not measured:
-// a VStream source, whose restart re-runs the auto-shard stitch window, so
-// under live writes the refusal may fire again; and the upsert path with a
-// stale target row the source no longer has, which a re-copy that deletes
-// nothing cannot remove (`--reset-target-data --yes` is the fallback).
+// a VStream source — the only upsert re-copy path — whose restart re-runs
+// the auto-shard stitch window, so under live writes the refusal may fire
+// again, and whose re-copy deletes nothing, so a stale target row the
+// source no longer has survives it (`--reset-target-data --yes` is the
+// fallback).
 func TestStreamer_UniqueKeyConflict_TradeRemedy(t *testing.T) {
 	myNew, myCleanup := ukcMySQLServer(t)
 	defer myCleanup()
@@ -386,7 +389,7 @@ func TestStreamer_UniqueKeyConflict_TradeRemedy(t *testing.T) {
 		src.exec(t, ukcCreate("mysql", true))
 		ukcTradeRemedy(t, src, tgt, twfbCell{src: src, tgt: tgt, streamID: "ukctr"})
 	})
-	t.Run("postgres-pgoutput source, the upsert re-copy path", func(t *testing.T) {
+	t.Run("postgres-pgoutput source, the drop path plus the slot drop", func(t *testing.T) {
 		pgNew, pgCleanup := ukcPGServer(t)
 		defer pgCleanup()
 		src, tgt := pgNew("ukctrp_s"), myNew("ukctrp_t")

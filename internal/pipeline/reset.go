@@ -148,7 +148,7 @@ func resetTargetTablesForRestart(ctx context.Context, schema *ir.Schema, rw ir.R
 	dropper, ok := rw.(ir.TableDropper)
 	if !ok {
 		return errors.New(
-			"pipeline: restart-from-scratch onto a non-idempotent source (native MySQL binlog) needs an empty target, " +
+			"pipeline: restart-from-scratch onto a non-idempotent source (native MySQL binlog, Postgres) needs an empty target, " +
 				"but this target engine's row writer does not support DROP TABLE — drop the dest tables manually, " +
 				"or re-run with --reset-target-data, before retrying",
 		)

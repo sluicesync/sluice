@@ -60,6 +60,11 @@
 - **Operators who hit `UNIQUE-KEY-CONFLICT-OTHER-ROW` after upgrading.** First check whether the source still has the key the refusal names. If it does not, drop the key on the target and restart. If it does, the refusal is the re-delivery trade, and the re-copy converges. The `sync start` re-copy is measured. The `sync from-backup run --reset-target-data --yes` leg and the printed `sluice slot drop` step are unmeasured.
 - **Everyone else:** upgrade. No action is needed.
 
+**Corrected 2026-10-17 (found by this release's regression cycle, which ran the printed remedy through the real CLI).** Three statements above were wrong or wider than the code.
+- **A Postgres pgoutput source's `--restart-from-scratch` drops and recreates the target tables; it does not re-copy onto the existing rows.** Only the VStream snapshot reader is idempotent (`copyReaderIsIdempotent`), so binlog and pgoutput both take the drop path. The warning that a stale target row the source no longer has survives the re-copy applies to a VStream source alone; on pgoutput the cycle saw the stale row removed. The VStream upsert re-copy path is the one that remains unmeasured. The `--restart-from-scratch` help text carried the same error and is corrected on `main` for the next release.
+- **Both remedy legs marked unmeasured are now measured, and both work as printed.** `sluice slot drop <SLOT> --source-driver=postgres --source <DSN> --yes`, given the literal slot name `sluice slot list` prints, followed by `sluice sync start --restart-from-scratch` with the same `--stream-id`, converged to the source by id. `sluice sync from-backup run --reset-target-data --yes` also converged on a provoked refusal and stayed live through a further incremental.
+- **Only a plain unique index's `ALTER INDEX … RENAME` is let through.** Renaming a constraint-owned index (a UNIQUE constraint's or the primary key's, by `RENAME CONSTRAINT` or `ALTER INDEX … RENAME`) still stops a pgoutput stream with `UNFORWARDED-SCHEMA-CHANGE`. That is loud, loses nothing, and is unchanged since v0.156.0.
+
 ---
 
 **Install:** `brew install sluicesync/tap/sluice` · `go install sluicesync.dev/sluice/cmd/sluice@v0.161.1` · **Container:** `ghcr.io/sluicesync/sluice:0.161.1`

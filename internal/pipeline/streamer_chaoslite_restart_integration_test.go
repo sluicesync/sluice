@@ -32,11 +32,13 @@
 // fresh cold start behaves differently per source class. With a
 // non-idempotent source (MySQL binlog → PG), it DROPS + recreates the
 // in-scope target tables — pinned by the PG table's OID staying
-// constant. With an idempotent source (PG → MySQL), it re-copies with
-// UPSERT (tables survive) but recreates the slot at NOW, so the
-// outage-window DELETE is never replayed — pinned by the
-// deleted-row-absent convergence itself; the MySQL CREATE_TIME check is
-// a belt. PG exposes no slot-creation identity in its catalogs, so slot
+// constant. A Postgres source is ALSO non-idempotent (only the VStream
+// snapshot reader implements ir.IdempotentCopyReader; see
+// copyReaderIsIdempotent), so on PG → MySQL it drops + recreates too —
+// pinned by the MySQL CREATE_TIME staying constant — and it recreates
+// the slot at NOW, so the outage-window DELETE convergence is a second
+// witness. (This comment said the PG leg upserts with tables surviving
+// until 2026-10-17; the assertions never depended on it.) PG exposes no slot-creation identity in its catalogs, so slot
 // sameness is asserted indirectly through that DELETE replay.
 //
 // Containers are stopped + started IN PLACE (docker stop/start; only
@@ -568,11 +570,10 @@ func TestStreamer_ChaosLite_MySQLToPG_ContainerRestarts(t *testing.T) {
 
 // TestStreamer_ChaosLite_PGToMySQL_ContainerRestarts — PG (logical)
 // source → MySQL target: the reverse leg, same phases. Here the
-// restart-from-scratch witness is the outage-window DELETE itself (an
-// idempotent PG source re-snapshots with UPSERT and a slot recreated at
-// NOW, which never replays the DELETE → orphan row → convergence
-// fails); CREATE_TIME is the drop+recreate belt and the slot count pins
-// single-slot warm resume.
+// restart-from-scratch witnesses are CREATE_TIME (a PG source is
+// non-idempotent, so a restart-from-scratch drops + recreates the MySQL
+// tables) and the outage-window DELETE (the slot is recreated at NOW,
+// which never replays it); the slot count pins single-slot warm resume.
 func TestStreamer_ChaosLite_PGToMySQL_ContainerRestarts(t *testing.T) {
 	srcDSN, restartSource, srcCleanup := startPostgresChaos(t, true /* source: logical WAL */)
 	defer srcCleanup()
