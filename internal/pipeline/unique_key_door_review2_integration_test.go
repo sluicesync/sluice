@@ -23,7 +23,10 @@
 //     Postgres deterministic key against a pre-created nondeterministic
 //     target column refuses; a MySQL 8 NO PAD CHAR key into a Postgres
 //     bpchar (both ignore trailing spaces, premise checked on the source)
-//     converges; and a same-family MySQL mismatch is refused first by the
+//     converges; a binlog warm open after a key column was made stricter
+//     while stopped converges (the key-collation door forwards it, so the
+//     direction is not judged there); and a same-family MySQL mismatch is
+//     refused first by the
 //     pre-create shape gate, the premise that keeps the arm's reach on a
 //     binlog source to Postgres-family targets. The VStream half is in
 //     unique_key_door_vstream_integration_test.go.
@@ -33,6 +36,7 @@
 package pipeline
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -198,6 +202,32 @@ func TestStreamer_UniqueKeyDoor_Review2ColumnCollation(t *testing.T) {
 		if g := ukdRows(t, tgt); g != "" {
 			t.Fatalf("rows moved: target %s", g)
 		}
+	})
+	// The disarm, pinned to fail if broken: on a binlog source a warm open
+	// does NOT judge collation direction, because the key-collation door
+	// forwards a key column's collation change made while the stream was
+	// stopped. Judging it at that open refused this working configuration
+	// (mutation D; the KeyCollationFirstBoundary warm-primed cells tolerate
+	// any refusal, so they could not catch it).
+	t.Run("mysql binlog warm open after a key column was made case-sensitive converges", func(t *testing.T) {
+		src, tgt := myNew("ukdccw_s"), myNew("ukdccw_t")
+		src.exec(t, myTable("utf8mb4_0900_ai_ci")+"; INSERT INTO kd VALUES (1,'a','one'),(2,'b','two')")
+		cell := twfbCell{src: src, tgt: tgt, streamID: "ukdccw"}
+		run := startTWFBRun(cell.streamer())
+		if !tgt.waitRow(t, "kd", 2, run, 180*time.Second) {
+			t.Fatalf("the cold start never delivered the seed (%v)", run.stop(t))
+		}
+		cell.waitStreaming(t, run)
+		src.exec(t, "INSERT INTO kd VALUES (50,'p','fifty')")
+		if !tgt.waitRow(t, "kd", 50, run, 60*time.Second) {
+			t.Fatalf("the priming row never landed (%v)", run.stop(t))
+		}
+		if err := run.stop(t); err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("the clean stop returned %v", err)
+		}
+		src.exec(t, "ALTER TABLE kd MODIFY k VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL")
+		src.exec(t, "INSERT INTO kd VALUES (99,'A','upper')")
+		ukdConvergeAndResume(t, cell.streamer(), src, tgt, "INSERT INTO kd VALUES (9,'z','nine')")
 	})
 	t.Run("mysql NO PAD CHAR key into a Postgres bpchar converges", func(t *testing.T) {
 		src, tgt := myNew("ukdccd_s"), pgNew("ukdccd_t")

@@ -229,8 +229,10 @@ func (s *Streamer) phaseRefuseTargetOnlyUniqueKeys(ctx context.Context, applier 
 // carries DDL hands a source column's collation change to the key-collation
 // door (key_collation_boundary.go), which FORWARDS it to the target in
 // forward mode; judging it here at a warm open, before the forward is
-// replayed, would refuse a stream that heals itself (the
-// TestKeyCollationFirstBoundary warm cells), and judging it at a boundary
+// replayed, would refuse a stream that heals itself (pinned by the
+// Review2ColumnCollation binlog warm-open cell, which fails if this is
+// broken; the KeyCollationFirstBoundary warm-primed cells tolerate any
+// refusal and do not), and judging it at a boundary
 // would duplicate that door. So on such a source the direction is judged
 // only at a cold start's open, when no earlier change is waiting to be
 // replayed and a mismatch can only be a target pre-created that way. A
