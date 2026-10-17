@@ -763,7 +763,7 @@ func refuseAddTableTargetOnlyUniqueKeys(source *ir.Table, targetTables map[strin
 	var absent []ir.AbsentUniqueKey
 	for _, key := range irdiff.UncoveredTargetUniqueKeys(source, target) {
 		if !accepted.allows("", target.Name, key.Name) {
-			absent = append(absent, ir.AbsentUniqueKey{Table: target.Name, Key: key.Name, Columns: renderKeyParts(key)})
+			absent = append(absent, absentUniqueKey(target.Name, target, key))
 		}
 	}
 	if len(absent) == 0 {

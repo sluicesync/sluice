@@ -233,7 +233,10 @@ func TestUniqueKeyConflictGuard_Postgres(t *testing.T) {
 // UNIQUE(id) nullable beside it, rows (NULL,'a','one') and (NULL,'a','two')
 // agree on every unique index's columns under IS NOT DISTINCT FROM, so the
 // second overwrites the first at exit 0. A partial unique index behaves the
-// same for rows outside its predicate (its predicate is not read).
+// same for rows outside its predicate (its predicate is not read). Closed
+// above the applier by the pipeline's unique-key door
+// (UNIQUE-KEY-STOPPED-WINDOW-DOOR, TestStreamer_UniqueKeyDoor_*); not flipped
+// here, for the reason the MySQL twin gives.
 func TestUniqueKeyConflictGuard_AcceptedSilentResidual_NullKeyColumnsMerge(t *testing.T) {
 	for _, batched := range []bool{false, true} {
 		t.Run(fmt.Sprintf("batched=%t", batched), func(t *testing.T) {

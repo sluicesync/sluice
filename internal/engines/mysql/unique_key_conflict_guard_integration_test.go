@@ -322,7 +322,14 @@ func TestUniqueKeyConflictGuard_CopyWriterPrefixKey(t *testing.T) {
 // image of the same row (the same statement against the same row), and a
 // plain `=` would only move the miss (NULL rows would then always count as
 // different and refuse every re-delivery). It belongs with the single-key
-// keyless residual: closed only at the source (UNIQUE-KEY-STOPPED-WINDOW-DOOR).
+// keyless residual, and like it is closed above the applier: the pipeline's
+// unique-key door (UNIQUE-KEY-STOPPED-WINDOW-DOOR) refuses the target's
+// kd_k once the source no longer declares it, at stream open and on the
+// mid-stream re-check, pinned by TestStreamer_UniqueKeyDoor_*'s
+// keyless-null-key cells. This pin is deliberately NOT flipped: it pins
+// the applier tier, whose behaviour the door does not change, and the
+// re-check's window (by code reading, a keyless table on a VStream source)
+// it.
 func TestUniqueKeyConflictGuard_AcceptedSilentResidual_NullKeyColumnsMerge(t *testing.T) {
 	for _, srv := range kcgServers(t) {
 		for _, batched := range []bool{false, true} {

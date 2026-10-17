@@ -64,15 +64,24 @@ package mysql
 //     projectTableIR). Comparing every column was considered and rejected —
 //     it refuses every newer-image re-send. That shape is left to the
 //     source-side doors (both engines' cdc_unforwarded_classes.go, live) and
-//     the filed stream-open comparison for a DROP made while the stream was
-//     stopped (UNIQUE-KEY-STOPPED-WINDOW-DOOR).
+//     the pipeline's unique-key door (pipeline/unique_key_door.go,
+//     UNIQUE-KEY-STOPPED-WINDOW-DOOR), which compares the target's unique
+//     keys with the source's at every stream open — so a DROP made while the
+//     stream was stopped refuses before any change of the run applies — and
+//     every 15 seconds on a source whose change stream carries no DDL (a
+//     VStream source is the one such lane that can carry a keyless table;
+//     the trigger engines refuse one at setup). The re-check's window is the
+//     one place this shape is still silent.
 //
-//     The same holds, accepted and pinned
+//     The same holds, accepted and pinned at THIS tier
 //     (TestUniqueKeyConflictGuard_AcceptedSilentResidual_NullKeyColumnsMerge),
 //     for two different source rows that agree on every unique key because
 //     the columns they differ in are NULL there (`<=>` calls NULL equal and a
 //     unique key admits many NULLs): apply cannot tell them from a newer image
-//     either, and a plain `=` would only move the miss.
+//     either, and a plain `=` would only move the miss. The stream closes it
+//     the same way as the single-key shape (pinned end to end by
+//     TestStreamer_UniqueKeyDoor_*); the engine pin stays, because the
+//     applier's own behaviour is unchanged.
 //
 // The guard is ARMED only where a conflict can come through a key other
 // than the identity: a target table with a unique key besides its primary

@@ -48,7 +48,7 @@ package postgres
 // they differ in are NULL there (IS NOT DISTINCT FROM calls NULL equal, and a
 // unique index admits many NULLs), or lie outside a partial index's predicate
 // (which is not read). Apply cannot tell them from a newer image of one row;
-// it is the single-index residual's shape, closed only at the source.
+// it is the single-index residual's shape, closed above this tier (below).
 //
 // The shape left open — no primary key and exactly ONE unique index — is
 // stated so it cannot be read as broader. The merge and the newer-image
@@ -63,8 +63,13 @@ package postgres
 // unknowable source key set, with a plain INSERT as the alternative refusing
 // every re-delivery. That shape is closed at the source instead: the
 // pgoutput door now refuses a live DROP INDEX (cdc_unforwarded_classes.go),
-// and a DROP made while the stream was stopped is the filed stream-open
-// comparison (UNIQUE-KEY-STOPPED-WINDOW-DOOR).
+// and the pipeline's unique-key door (pipeline/unique_key_door.go,
+// UNIQUE-KEY-STOPPED-WINDOW-DOOR) compares the target's unique keys with the
+// source's at every stream open, so a DROP made while the stream was stopped
+// refuses before any change of the run applies, and every 15 seconds on a
+// source whose change stream carries no DDL; its re-check window is the one
+// place this shape is still silent (pinned end to end by
+// TestStreamer_UniqueKeyDoor_*).
 //
 // The cost of the union arm, stated: an image of the SAME source row whose
 // other unique column differs from the target's (a keyless row whose `email`
