@@ -247,8 +247,11 @@ type resumeDispatchEngine struct {
 func (e *resumeDispatchEngine) Name() string                  { return e.name }
 func (e *resumeDispatchEngine) Capabilities() ir.Capabilities { return e.caps }
 
+// OpenSchemaReader serves an empty schema: the stream-open unique-key door
+// (unique_key_door.go) reads both catalogs on every dispatch branch, and an
+// empty one has nothing for it to judge.
 func (e *resumeDispatchEngine) OpenSchemaReader(context.Context, string) (ir.SchemaReader, error) {
-	return nil, errors.New("not used in dispatch test")
+	return &cutoverPlainReader{schema: &ir.Schema{}}, nil
 }
 
 func (e *resumeDispatchEngine) OpenSchemaWriter(context.Context, string) (ir.SchemaWriter, error) {

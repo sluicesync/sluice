@@ -1109,6 +1109,13 @@ func (s *Streamer) startTelemetrySidecars(ctx context.Context, applier ir.Change
 // restart picks up a fresh seed in its next coldStart run.
 func (s *Streamer) phaseWireInterceptChain(applyCtx context.Context, changes <-chan ir.Change, liveFilter *liveAddedFilter, streamID string) <-chan ir.Change {
 	filtered := filterChangesWithLiveAdd(applyCtx, changes, s.Filter, liveFilter)
+	// UNIQUE-KEY-STOPPED-WINDOW-DOOR: on a source whose change stream
+	// carries no DDL, re-check the target's unique keys against the
+	// source's every period, at a transaction boundary, before the next
+	// change is forwarded. A verbatim pass-through when the stream-open
+	// door armed nothing (unique_key_door.go).
+	filtered = interceptUniqueKeyRecheck(applyCtx, filtered, s.uniqueKeyRecheckPeriod(), s.uniqueKeyRecheck(),
+		&s.uniqueKeyRecheckErr, time.Now)
 	// ADR-0173 Phase 2: continuous *filtered* sync — the client-side
 	// row-move dispatch. When a `--where` predicate is set (s.whereFilter
 	// compiled by preflightRowFilters), evaluate it per row-bearing change
@@ -1319,6 +1326,14 @@ func (s *Streamer) phaseSettleDispatch(ctx context.Context, applier ir.ChangeApp
 	if dispatchErr == nil {
 		if whereErrPtr := s.whereFilterErr.Load(); whereErrPtr != nil && *whereErrPtr != nil {
 			dispatchErr = *whereErrPtr
+		}
+	}
+	// UNIQUE-KEY-STOPPED-WINDOW-DOOR: the mid-stream re-check closes the
+	// channel on a refusal the same way; returned unwrapped (below, through
+	// the standard path) so the sentinel reaches the supervisor roster.
+	if dispatchErr == nil {
+		if ukErrPtr := s.uniqueKeyRecheckErr.Load(); ukErrPtr != nil && *ukErrPtr != nil {
+			dispatchErr = *ukErrPtr
 		}
 	}
 	// ADR-0157: the streamer surfaces a schema-forward refusal here (the

@@ -209,6 +209,7 @@ var migrateSyncDivergenceReason = map[string]string{
 	"shard-coordination-retry-period":   reasonShapeALiveDDL,
 
 	// ---- sync-only: the rest ----
+	"accept-target-only-unique-key":    "inapplicable: accepts a target unique key the stream-open door (UNIQUE-KEY-STOPPED-WINDOW-DOOR) would refuse because a CDC upsert would merge through it; migrate applies no change stream, and its copy cannot merge through such a key — a plain INSERT/COPY duplicate is a loud 1062/23505/LOAD DATA refusal, and the resumed idempotent copy refuses a conflict through a key its source does not declare (MySQL undeclaredUniqueKeys) or raises 23505 (Postgres, whose arbiter is the source key)",
 	"accept-slot-acked-past-position":  "inapplicable: acknowledges the warm-resume SLOT-ACKED-PAST-TARGET-POSITION refusal (GC-41), which compares a Postgres source slot's confirmed_flush_lsn with the stream's persisted position; migrate reads no slot and resumes no change stream",
 	"accept-unforwarded-schema-change": "inapplicable: acknowledges a refusal the CDC readers' unforwarded-schema-change door (GC-2) recorded on the stream's sluice_cdc_state row; migrate opens no change stream and keeps no stream row, so there is no refusal to record or acknowledge",
 	"where-strict-collation":           "inapplicable: ADR-0174 Piece 1's strictness applies to the CDC leg's CLIENT-SIDE predicate evaluator (buildWhereCDCFilter is its only consumer). migrate pushes --where down to the source, which applies its own collation natively — there is no client-side re-evaluation to be strict about",

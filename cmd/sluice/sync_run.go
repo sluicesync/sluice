@@ -143,6 +143,14 @@ type SyncSpec struct {
 	// standalone flag; compiled at sync-start by the Streamer's preflight.
 	Where []string `koanf:"where"`
 
+	// AcceptTargetOnlyUniqueKey mirrors `sync start
+	// --accept-target-only-unique-key` (UNIQUE-KEY-STOPPED-WINDOW-DOOR). A
+	// STANDING acceptance of a key the target is built with on purpose, so
+	// unlike the one-shot acknowledgements it belongs in fleet config: the
+	// key stays on the target, and a leg without the key here would refuse
+	// on every start.
+	AcceptTargetOnlyUniqueKey []string `koanf:"accept-target-only-unique-key"`
+
 	ApplyConcurrency int    `koanf:"apply-concurrency"`
 	ExactlyOnceLanes bool   `koanf:"exactly-once-lanes"`
 	ApplyBatchSize   string `koanf:"apply-batch-size"`
@@ -1008,6 +1016,8 @@ func buildStreamerFromSpec(ctx context.Context, spec *SyncSpec, g *Globals) (*pi
 		RowFilters:         rowFilters,
 		Filter:             filter,
 		TargetSchema:       spec.TargetSchema,
+
+		AcceptTargetOnlyUniqueKeys: spec.AcceptTargetOnlyUniqueKey,
 
 		// ADR-0148 / audit MED-A1 gap #12: arm the deploy-request index-build
 		// fallback for this sync's cold-start deferred index phase. nil unless

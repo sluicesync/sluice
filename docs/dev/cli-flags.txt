@@ -431,6 +431,7 @@ restore --target-driver
 restore --target-schema
 restore --target-tls-ca
 restore --verify-key
+schema add-table --accept-target-only-unique-key
 schema add-table --control-keyspace
 schema add-table --dry-run
 schema add-table --expr-override
@@ -550,6 +551,7 @@ sync health --target-driver
 sync run --dashboard-listen
 sync run --dry-run
 sync start --accept-slot-acked-past-position
+sync start --accept-target-only-unique-key
 sync start --accept-unforwarded-schema-change
 sync start --all-databases
 sync start --all-schemas
