@@ -30,7 +30,7 @@ The user has multiple source→target sync streams and wants one supervised proc
 - **Fleet composition:** N legs, each `stream-id` → source→target, and the restart policy in effect.
 - **Startup result:** dry-run validation outcome; which legs came up; any leg refused/looping and why.
 - **Monitoring surface:** the `sync status --all` roll-up and per-leg `sync health` verdicts (+ exit codes); the dashboard/TUI address if enabled (with the no-auth caveat).
-- **Per-leg issues:** name any breached threshold, restart-looping leg, or `failed` leg, and route it to `sluice-error-triage` / `cdc-sync-operator`. For a `failed` leg, quote the message, and name `UNFORWARDED-SCHEMA-CHANGE` (or any of the five markers in step 2) explicitly when it appears, and `ADD-COLUMN-BACKFILL-INCOMPLETE` too when present (its repair is to copy the added column's values from the source, not to apply a change to the target).
+- **Per-leg issues:** name any breached threshold, restart-looping leg, or `failed` leg, and route it to `sluice-error-triage` / `cdc-sync-operator`. For a `failed` leg, quote the message, and name `UNFORWARDED-SCHEMA-CHANGE` (or any of the markers in step 2) explicitly when it appears, and `ADD-COLUMN-BACKFILL-INCOMPLETE` too when present (its repair is to copy the added column's values from the source, not to apply a change to the target).
 
 Per-leg recovery that needs a destructive flag (`--reset-target-data`, `--restart-from-scratch`, `slot drop`, …), `--accept-unforwarded-schema-change`, `--accept-slot-acked-past-position` or a leg's `accept-target-only-unique-key` acceptance (the fleet key for `--accept-target-only-unique-key`) is still approval-gated. Surface it; don't auto-apply it. Keep tokens/URLs in env, never in the committed YAML.
 
