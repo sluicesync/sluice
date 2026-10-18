@@ -746,6 +746,27 @@ What this does not catch, stated so it is not read as broader:
 - The check needs the target tables to exist, so on a cold start into a pre-created target an extra key refuses after the copy, not before it (the copy itself cannot merge through such a key).
 - `sync from-backup run` and `sluice restore` do not run this check. A backup chain records a source `DROP INDEX` as a schema change of the window it falls in, and both apply it to the target before that window's rows, so the duplicate lands as its own row (measured for a MySQL source). A target pre-created with an extra unique key is not judged there.
 
+## `sync`: a table the stream never brought in refuses a warm resume (`INCLUDE-TABLE-SCOPE-DRIFT`)
+
+A warm resume copies nothing: it continues the change stream from the persisted position. So a table that joins the stream's scope on a restart, by a widened `--include-table` or a narrowed `--exclude-table`, is never copied, and on a Postgres pgoutput source it is not streamed either, because only the cold start scopes the publication. Through v0.162.0 the stream came back green and the table stayed empty or absent on the target (Bug 321). A table joins a running stream through `sluice schema add-table`, never through the flags of a restart.
+
+Every warm `sync start` (and `sync run` leg start) therefore checks, before the reader opens, each table in its current scope against two pieces of evidence:
+
+- **pgoutput, single-namespace streams:** the publication the stream reads through, as the server expands it (`pg_publication_tables`). A table in scope that the publication does not deliver was never copied by this stream and cannot be streamed by it. This also catches a table created on the source since the cold start of a stream with no filter.
+- **Every source:** `schema add-table` records its table as pending on the stream's `sluice_cdc_state` row before it changes anything, and clears it only after the copy and the hand-off succeed. A failed or interrupted add leaves the record, and on a Postgres source also takes the table back out of the publication, so a live stream stops streaming into the partial copy.
+
+A table either one convicts is named in a codeless exit-1 refusal containing `INCLUDE-TABLE-SCOPE-DRIFT`; nothing has been applied. Every restart repeats it and `sync run` does not restart the leg. Remedies, per named table:
+
+1. With the stream stopped, run `sluice schema add-table <table>` with the stream's `--source-driver`, `--source`, `--target-driver`, `--target` and `--stream-id`, then the same `sync start` again. add-table refuses a target table that already holds rows, so empty a partial copy first.
+2. Take the table out of scope (`--include-table` / `--exclude-table`).
+3. Re-copy every table with `--restart-from-scratch`. On a Postgres source that run first refuses because the stream's replication slot exists; drop it with `sluice slot drop`, then re-run. The re-copy clears the pending record.
+
+Narrowing the scope is not refused: the table stops being applied, and the rows already on the target stay as they were. What the check cannot see, because the stream keeps no record of the tables it established:
+
+- a MySQL-family binlog, VStream or trigger-CDC source streams every table, so a widened table whose target counterpart was pre-created is streamed from the persisted position and rows written before it never arrive (INCLUDE-TABLE-SCOPE-DRIFT-STREAMED); with no target table its changes are skipped loudly, as before (`sluice_cdc_skipped_tables`, `sync health`);
+- a pgoutput stream re-widened to a table it had narrowed away: the table stayed in the publication while the narrowed run dropped its changes (INCLUDE-TABLE-RE-WIDEN);
+- a FOR ALL TABLES publication, a publication dropped since the cold start, and an add-table that failed under a binary older than this check.
+
 ## `sync`: a schema change the stream did not see is checked against the target (`RESUME-SCHEMA-DIVERGENCE`)
 
 When `sync` starts on a stream that already ran — a warm resume, a restart, a `sync run` leg restart, an automatic retry after a transient error — it has no record of the schema change that may have happened since: the change was made while it was stopped, or after it restarted and before the table's next row. Since v0.156.10 each table's first schema boundary on such a start is compared with the target table itself (column names and types; the source's shape is rendered the way the cold start created the target, and a column named by `--type-override` is compared by presence only — its type is the operator's, so an override changed between runs is not seen here). Postgres and PlanetScale/Vitess sources produce that boundary at each table's first change; MySQL and MariaDB binlog sources do too since this release.

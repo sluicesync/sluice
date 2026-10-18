@@ -269,6 +269,10 @@ func TestSupervisor_RefusalsARestartRepeatsAreNotRestarted(t *testing.T) {
 		"SOURCE-UNIQUE-KEY-ABSENT": &ir.SourceUniqueKeyAbsentError{
 			Keys: []ir.AbsentUniqueKey{{Table: "kd", Key: "kd_k", Columns: "(k)"}}, SourceSeesDDLLive: true,
 		},
+		// Built by the real constructor the warm-resume scope door returns
+		// (streamer_scope_drift.go).
+		"INCLUDE-TABLE-SCOPE-DRIFT": (&Streamer{Source: nonScoperEngine{}, Target: nonScoperEngine{}}).
+			includeTableScopeDriftError("st", "sluice_pub", []scopeDriftTable{{name: "nt", unpublished: true}}),
 	}
 
 	if len(cases) != len(refusalsARestartRepeats) {

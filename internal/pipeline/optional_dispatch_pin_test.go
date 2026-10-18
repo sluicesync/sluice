@@ -159,6 +159,13 @@ var (
 	// accurate but unspecific — and a backup chain's no longer refusing the
 	// sync acknowledgement by name.
 	_ resumeOriginNoter = (*postgres.CDCReader)(nil)
+	// INCLUDE-TABLE-SCOPE-DRIFT (Bug 321): the warm-resume door's publication
+	// evidence. A rename would make the assertion miss and the door's pgoutput
+	// arm a no-op — the widened table streaming nothing at exit 0 again.
+	_ publicationMembershipChecker = postgres.Engine{}
+	// Its add-table half: the undo of a publication add whose copy failed. A
+	// rename would leave a live stream streaming into the partial table.
+	_ publicationTableDropper = postgres.Engine{}
 )
 
 // unpinnedPipelineSurfaces is the FROZEN remainder: pipeline-local interfaces

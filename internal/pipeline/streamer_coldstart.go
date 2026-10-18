@@ -348,7 +348,14 @@ func (s *Streamer) coldStart(ctx context.Context, applier ir.ChangeApplier, stre
 	// Persist the cold-start CDC anchor (GitHub #15), then start CDC
 	// from the snapshot's position. The returned stop closure closes
 	// the snapshot stream when Run unwinds.
-	return s.coldStartBeginCDC(ctx, stream, applier, streamID)
+	changes, stop, err = s.coldStartBeginCDC(ctx, stream, applier, streamID)
+	if err == nil {
+		// Every in-scope table is now copied under this anchor, so an
+		// add-table that had failed on one of them is remedied (a
+		// --restart-from-scratch keeps the control row that carries it).
+		s.clearPendingAddedTablesAfterColdStart(ctx, applier, streamID, snapshotTables)
+	}
+	return changes, stop, err
 }
 
 // coldStartReadSourceSchema opens the source SchemaReader, reads and

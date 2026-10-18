@@ -1154,6 +1154,78 @@ func addTablesToPublication(ctx context.Context, db *sql.DB, name, schema string
 	return nil
 }
 
+// unpublishedTables reports which of tables (bare names in schema) the
+// named publication does not deliver — the INCLUDE-TABLE-SCOPE-DRIFT door's
+// evidence (Bug 321). It reads pg_publication_tables, the server's own
+// expansion of the publication: explicit members, FOR TABLES IN SCHEMA
+// members and FOR ALL TABLES alike, minus what Postgres will not publish (an
+// unlogged table). So the answer is what pgoutput decodes, not what sluice
+// believes it asked for. checked is false when the publication does not
+// exist: then there is no evidence either way, and the CDC reader's own open
+// handles the absence (it recreates the publication FOR ALL TABLES; see
+// [ensurePublication]'s create arm).
+func unpublishedTables(ctx context.Context, db *sql.DB, name, schema string, tables []string) (missing []string, checked bool, err error) {
+	var exists bool
+	if err := db.QueryRowContext(ctx, "SELECT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = $1)", name).Scan(&exists); err != nil {
+		return nil, false, fmt.Errorf("postgres: check publication %q: %w", name, err)
+	}
+	if !exists {
+		return nil, false, nil
+	}
+	rows, err := db.QueryContext(ctx, "SELECT tablename FROM pg_catalog.pg_publication_tables WHERE pubname = $1 AND schemaname = $2", name, schema)
+	if err != nil {
+		return nil, false, fmt.Errorf("postgres: list tables publication %q delivers: %w", name, err)
+	}
+	defer func() { _ = rows.Close() }()
+	published := map[string]bool{}
+	for rows.Next() {
+		var table string
+		if err := rows.Scan(&table); err != nil {
+			return nil, false, fmt.Errorf("postgres: scan publication %q table: %w", name, err)
+		}
+		published[table] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, fmt.Errorf("postgres: list tables publication %q delivers: %w", name, err)
+	}
+	for _, t := range tables {
+		if !published[t] {
+			missing = append(missing, t)
+		}
+	}
+	return missing, true, nil
+}
+
+// dropTablesFromPublication is [addTablesToPublication]'s undo, for the
+// add-table flow that added a table and then failed to copy it: `ALTER
+// PUBLICATION … DROP TABLE` for each named table the publication lists
+// explicitly. A FOR ALL TABLES publication lists nothing explicitly and is
+// left alone, as is a missing publication. The caller passes only tables it
+// added itself in this run, so no other stream's member is ever removed.
+func dropTablesFromPublication(ctx context.Context, db *sql.DB, name, schema string, tables []string) error {
+	if len(tables) == 0 {
+		return nil
+	}
+	existing, err := publicationMemberSet(ctx, db, name)
+	if err != nil {
+		return err
+	}
+	toDrop := make([]string, 0, len(tables))
+	for _, t := range tables {
+		if _, ok := existing[schema+"."+t]; ok {
+			toDrop = append(toDrop, t)
+		}
+	}
+	if len(toDrop) == 0 {
+		return nil
+	}
+	alterQuery := fmt.Sprintf(`ALTER PUBLICATION %s DROP TABLE %s`, quoteIdent(name), formatPublicationTableList(schema, toDrop, nil))
+	if _, err := db.ExecContext(ctx, alterQuery); err != nil {
+		return classifyPublicationPermission(ctx, db, name, fmt.Errorf("postgres: alter publication %q drop tables: %w", name, err))
+	}
+	return nil
+}
+
 // formatPublicationTableList renders a comma-separated list of
 // schema-qualified, double-quoted table identifiers for use after
 // `FOR TABLE` / `SET TABLE`. filters is the ADR-0176 row-filter map

@@ -95,7 +95,10 @@ var shardedTargetDoorRoster = map[string]doorClass{
 
 	// --- CreateTablesWithoutConstraints (every call is a create; the door
 	//     lives INSIDE this method, so all are covered uniformly) ---
-	"add_table.go::(*AddTable).Run::CreateTablesWithoutConstraints":                              classCreates,
+	// Moved from Run into bringInTable (Bug 321: the add-table pending record
+	// brackets exactly the state-changing span). Same call, same table; the
+	// door is inside the method, so the move changes nothing it reaches.
+	"add_table.go::(*AddTable).bringInTable::CreateTablesWithoutConstraints":                     classCreates,
 	"broker.go::(*SyncFromBackup).applySchemaDeltas::CreateTablesWithoutConstraints":             classCreates,
 	"migrate.go::runBulkCopyWithOpts::CreateTablesWithoutConstraints":                            classCreates,
 	"migrate.go::runBulkCopyForAddTable::CreateTablesWithoutConstraints":                         classCreates,

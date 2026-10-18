@@ -30,6 +30,13 @@ package pipeline
 //   5. Apply per-column type / expression overrides.
 //   6. Open target writers; refuse if the target table already
 //      exists with rows (TableEmptyChecker).
+//   6a. Record the table as pending on the stream's control row
+//      (INCLUDE-TABLE-SCOPE-DRIFT, Bug 321). Everything above refuses
+//      without changing anything; everything below changes state, so a
+//      failure from here leaves the record, `sync start` refuses a warm
+//      resume that includes the table, and on PG the publication add of
+//      step 7 is taken back. Cleared after step 9 (and the MySQL
+//      filter-flip) succeed.
 //   7. For PG: ALTER PUBLICATION ... ADD TABLE so the slot picks up
 //      events on the new table from this LSN forward (idempotent).
 //      MySQL has no publication; the binlog already covers everything.
@@ -52,6 +59,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	"sluicesync.dev/sluice/internal/config"
 	"sluicesync.dev/sluice/internal/ir"
@@ -265,6 +273,10 @@ type AddTable struct {
 	// sourceAsRead is the added table before --type-override, whose column
 	// collations the unique-key door judges direction on.
 	sourceAsRead *ir.Table
+	// publicationAddedByThisRun is whether this run's publication add is what
+	// put the table in the publication ([AddTable.notePublicationAdd]), so a
+	// failed add may take it back out ([AddTable.undoFailedAdd]).
+	publicationAddedByThisRun bool
 }
 
 // Run executes the add-table flow. Returns nil on success or a
@@ -487,6 +499,32 @@ func (a *AddTable) Run(ctx context.Context) error {
 		return err
 	}
 
+	// INCLUDE-TABLE-SCOPE-DRIFT (Bug 321): every check that can refuse
+	// without changing anything has run. From the CREATE below on, a
+	// failure leaves the table half brought in — on the target, in the
+	// publication — so it is recorded as pending first and cleared only once
+	// the copy and the hand-off have succeeded. `sync start` refuses a warm
+	// resume whose scope includes a pending table.
+	if err := a.recordPendingAdd(ctx, applier); err != nil {
+		return err
+	}
+	if err := a.bringInTable(ctx, applier, preflight, scoped, sw, rw); err != nil {
+		return a.undoFailedAdd(ctx, applier, err)
+	}
+	if err := a.clearPendingAdd(ctx, applier); err != nil {
+		return err
+	}
+
+	a.logAddComplete(ctx)
+	return nil
+}
+
+// bringInTable is the part of the add that changes state: it creates the
+// target table, extends the publication, copies the rows from a fresh
+// snapshot and hands the table to the stream. Carved out of Run so the
+// pending record brackets exactly this span ([AddTable.recordPendingAdd]).
+func (a *AddTable) bringInTable(ctx context.Context, applier ir.ChangeApplier, preflight addTablePreflight, scoped *ir.Schema, sw ir.SchemaWriter, rw ir.RowWriter) error {
+	a.publicationAddedByThisRun = false
 	if err := sw.CreateTablesWithoutConstraints(ctx, scoped); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf("pipeline: add-table: create target table: %w", err))
 	}
@@ -495,6 +533,9 @@ func (a *AddTable) Run(ctx context.Context) error {
 	// snapshot's slot is created so the slot's pinned catalog snapshot
 	// already includes the new table (Bug 13 / ADR-0021 ordering), and
 	// capture the ADR-0036 pg_current_wal_lsn() window around the ALTER.
+	if err := a.notePublicationAdd(ctx); err != nil {
+		return err
+	}
 	lsnBeforePubAdd, lsnAfterPubAdd, err := a.extendPublicationScope(ctx)
 	if err != nil {
 		return err
@@ -581,12 +622,94 @@ func (a *AddTable) Run(ctx context.Context) error {
 	// ---- 7. MySQL-side filter-flip (ADR-0034): record the new table on
 	// cdc-state.live_added_tables so the running streamer's poll merges
 	// it into the dispatch filter. No-op on the drained and PG paths.
-	if err := a.recordLiveAddedTable(ctx, applier, preflight); err != nil {
-		return err
-	}
+	return a.recordLiveAddedTable(ctx, applier, preflight)
+}
 
-	a.logAddComplete(ctx)
+// recordPendingAdd records the table as pending on the stream's control row
+// ([ir.PendingAddedTablesStore]) before the add changes anything. A failure
+// to record refuses the add: an add whose failure could not be remembered
+// must not start. An applier without the surface (test stubs only — both
+// shipping appliers implement it) skips it.
+func (a *AddTable) recordPendingAdd(ctx context.Context, applier ir.ChangeApplier) error {
+	store, ok := applier.(ir.PendingAddedTablesStore)
+	if !ok {
+		slog.DebugContext(ctx, "add-table: target applier keeps no pending-add record; skipping it", slog.String("target", a.Target.Name()))
+		return nil
+	}
+	if err := store.RecordPendingAddedTable(ctx, a.StreamID, a.TableName); err != nil {
+		return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf(
+			"pipeline: add-table: record %q as pending on the stream's control row before changing anything "+
+				"(nothing was changed): %w", a.TableName, err,
+		))
+	}
 	return nil
+}
+
+// clearPendingAdd clears the pending record once the table is fully brought
+// in. A failure here is reported, not swallowed: the table IS copied, but the
+// record it leaves makes the next warm resume refuse with
+// INCLUDE-TABLE-SCOPE-DRIFT, and the operator should know why.
+func (a *AddTable) clearPendingAdd(ctx context.Context, applier ir.ChangeApplier) error {
+	store, ok := applier.(ir.PendingAddedTablesStore)
+	if !ok {
+		return nil
+	}
+	if err := store.ClearPendingAddedTables(ctx, a.StreamID, []string{a.TableName}); err != nil {
+		return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf(
+			"pipeline: add-table: %q was copied and handed to the stream, but clearing its pending record failed, "+
+				"so the next `sync start` will refuse INCLUDE-TABLE-SCOPE-DRIFT naming it until the record is "+
+				"cleared (re-running add-table needs the target table emptied first; --restart-from-scratch "+
+				"clears it): %w", a.TableName, err,
+		))
+	}
+	return nil
+}
+
+// notePublicationAdd records, before the publication add, whether the table
+// is outside the publication now — that is, whether this run's add is what
+// puts it there, and so what [AddTable.undoFailedAdd] may take back. A table
+// already a member (a re-run, another stream's table) is never removed.
+func (a *AddTable) notePublicationAdd(ctx context.Context) error {
+	a.publicationAddedByThisRun = false
+	checker, ok := a.Source.(publicationMembershipChecker)
+	if !ok {
+		return nil
+	}
+	missing, publication, err := checker.UnpublishedTables(ctx, a.SourceDSN, []string{a.TableName})
+	if err != nil {
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: add-table: read publication membership: %w", err))
+	}
+	a.publicationAddedByThisRun = publication != "" && len(missing) == 1
+	return nil
+}
+
+// undoFailedAdd is the add's failure path after the pending record (Bug 321
+// path 2). The record stays, so the next warm resume refuses rather than
+// streaming into a table whose copy did not land. On a publication source it
+// also takes back the publication add this run made, so a LIVE stream stops
+// streaming the table's changes into that partial copy now rather than at
+// its next restart. Runs on a context detached from cancellation: a Ctrl-C
+// is the commonest way to get here. The returned error names both facts.
+func (a *AddTable) undoFailedAdd(ctx context.Context, applier ir.ChangeApplier, cause error) error {
+	note := fmt.Sprintf("the add of %q did not complete", a.TableName)
+	if _, ok := applier.(ir.PendingAddedTablesStore); ok {
+		note += "; it stays recorded as pending, so `sync start` refuses INCLUDE-TABLE-SCOPE-DRIFT for it until " +
+			"a re-run of add-table succeeds (empty the target table first if rows landed) or a " +
+			"--restart-from-scratch re-copies it"
+	}
+	if dropper, ok := a.Source.(publicationTableDropper); ok && a.publicationAddedByThisRun {
+		undoCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		if err := dropper.DropPublicationTables(undoCtx, a.SourceDSN, []string{a.TableName}); err != nil {
+			slog.WarnContext(ctx, "add-table: could not take the table back out of the source publication after the "+
+				"add failed; a running stream keeps streaming its changes into the partial target copy until the "+
+				"table is removed from the publication by hand", slog.String("table", a.TableName), slog.String("error", err.Error()))
+			note += "; taking it back out of the source publication FAILED (" + err.Error() + ")"
+		} else {
+			note += "; it was taken back out of the source publication"
+		}
+	}
+	return fmt.Errorf("%w (%s)", cause, note)
 }
 
 // translateScopedSchema applies the operator's per-column type /

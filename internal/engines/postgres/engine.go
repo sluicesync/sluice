@@ -448,6 +448,47 @@ func (e Engine) AddPublicationTables(ctx context.Context, dsn string, tables []s
 	return classifyStandbyReadOnly(addTablesToPublication(ctx, db, e.publicationName(), cfg.schema, tables))
 }
 
+// UnpublishedTables reports which of tables (bare names in the DSN's schema)
+// this engine value's publication does not deliver, for the pipeline's
+// INCLUDE-TABLE-SCOPE-DRIFT door (Bug 321), with the publication's name for
+// the refusal. The name is empty when the publication does not exist: no
+// evidence either way. Read-only. Discovered by the pipeline via structural
+// interface (publicationMembershipChecker).
+func (e Engine) UnpublishedTables(ctx context.Context, dsn string, tables []string) (missing []string, publication string, err error) {
+	cfg, err := e.parseDSN(dsn)
+	if err != nil {
+		return nil, "", err
+	}
+	db, err := openDB(ctx, cfg)
+	if err != nil {
+		return nil, "", err
+	}
+	defer func() { _ = db.Close() }()
+	missing, checked, err := unpublishedTables(ctx, db, e.publicationName(), cfg.schema, tables)
+	if err != nil || !checked {
+		return nil, "", err
+	}
+	return missing, e.publicationName(), nil
+}
+
+// DropPublicationTables removes tables from this engine value's publication
+// — the undo of [Engine.AddPublicationTables] for an add-table whose copy
+// failed (Bug 321 path 2), so a live stream stops streaming changes into a
+// table whose copy did not land. Tolerant of a table already absent and of a
+// FOR ALL TABLES publication (nothing to drop).
+func (e Engine) DropPublicationTables(ctx context.Context, dsn string, tables []string) error {
+	cfg, err := e.parseDSN(dsn)
+	if err != nil {
+		return err
+	}
+	db, err := openDB(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = db.Close() }()
+	return classifyStandbyReadOnly(dropTablesFromPublication(ctx, db, e.publicationName(), cfg.schema, tables))
+}
+
 // ExtractSnapshotLSN decodes a Postgres snapshot stream's
 // [ir.Position] and returns the LSN it carries. Used by the live
 // mid-stream add-table flow (ADR-0030) to enforce the

@@ -499,13 +499,33 @@ func (s *Streamer) compareUniqueKeys(ctx context.Context, scopes []uniqueKeyDoor
 // cross-engine copy would refuse is not this door's concern (the cold start
 // refuses it on its own read).
 func (s *Streamer) readUniqueKeyDoorSource(ctx context.Context, sc uniqueKeyDoorScope, inScope func(string) bool) ([]*ir.Table, error) {
-	sr, err := s.Source.OpenSchemaReader(ctx, sc.sourceDSN)
+	sr, schema, err := s.openScopedSourceSchema(ctx, sc.sourceDSN, inScope)
 	if err != nil {
-		return nil, connectHint(fmt.Errorf("open source schema reader: %w", err))
+		return nil, err
 	}
 	defer migcore.CloseIf(sr)
+	if schema == nil {
+		return nil, nil
+	}
+	if err := applyUniqueKeyFacts(ctx, sr, schema); err != nil {
+		return nil, connectHint(fmt.Errorf("read source unique-key facts: %w", err))
+	}
+	return s.streamTablesOf(schema, inScope), nil
+}
+
+// openScopedSourceSchema opens a source schema reader on dsn, scoped to
+// inScope where the engine can push the scope down, and reads the schema.
+// The caller closes the returned reader (nil on error). Shared by the
+// stream-open doors that ask the source catalog about the stream's tables:
+// the unique-key door and the INCLUDE-TABLE-SCOPE-DRIFT door.
+func (s *Streamer) openScopedSourceSchema(ctx context.Context, dsn string, inScope func(string) bool) (ir.SchemaReader, *ir.Schema, error) {
+	sr, err := s.Source.OpenSchemaReader(ctx, dsn)
+	if err != nil {
+		return nil, nil, connectHint(fmt.Errorf("open source schema reader: %w", err))
+	}
 	if err := applyEnabledPGExtensions(ctx, sr, s.EnabledPGExtensions); err != nil {
-		return nil, connectHint(fmt.Errorf("enable PG extensions on source: %w", err))
+		migcore.CloseIf(sr)
+		return nil, nil, connectHint(fmt.Errorf("enable PG extensions on source: %w", err))
 	}
 	migcore.ApplyVerbatimExtensionPassthrough(sr, true)
 	if scoper, ok := sr.(ir.TableScoper); ok {
@@ -513,14 +533,18 @@ func (s *Streamer) readUniqueKeyDoorSource(ctx context.Context, sc uniqueKeyDoor
 	}
 	schema, err := sr.ReadSchema(ctx)
 	if err != nil {
-		return nil, connectHint(fmt.Errorf("read source schema: %w", err))
+		migcore.CloseIf(sr)
+		return nil, nil, connectHint(fmt.Errorf("read source schema: %w", err))
 	}
-	if schema == nil {
-		return nil, nil
-	}
-	if err := applyUniqueKeyFacts(ctx, sr, schema); err != nil {
-		return nil, connectHint(fmt.Errorf("read source unique-key facts: %w", err))
-	}
+	return sr, schema, nil
+}
+
+// streamTablesOf returns the tables of schema the stream applies to: those
+// inScope admits, minus the ORM migration-history tables the stream skips —
+// the same two prunes the cold start's read applies (the table filter in
+// [migcore.ApplyTableFilter] is [migcore.TableFilter.Allows], and
+// [applyORMTableSkip]).
+func (s *Streamer) streamTablesOf(schema *ir.Schema, inScope func(string) bool) []*ir.Table {
 	var out []*ir.Table
 	for _, t := range schema.Tables {
 		if t == nil || !inScope(t.Name) {
@@ -534,7 +558,7 @@ func (s *Streamer) readUniqueKeyDoorSource(ctx context.Context, sc uniqueKeyDoor
 		}
 		out = append(out, t)
 	}
-	return out, nil
+	return out
 }
 
 // readUniqueKeyDoorTarget reads the target tables whose names (folded)

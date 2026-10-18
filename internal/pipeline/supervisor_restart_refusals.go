@@ -111,6 +111,13 @@ import (
 //     (--accept-target-only-unique-key / the fleet spec's
 //     accept-target-only-unique-key, a standing key). Its catalog-read
 //     failure is NOT the marker and stays restartable.
+//   - INCLUDE-TABLE-SCOPE-DRIFT (every source's warm resume, codeless; Bug
+//     321): listed. It reads the source's publication membership and the
+//     add-table pending record on the target's control row, and a restart
+//     changes neither, so it refuses again until the operator runs
+//     `sluice schema add-table` for the named table, takes it out of scope,
+//     or re-copies with --restart-from-scratch. Its catalog and control-row
+//     read failures are NOT the marker and stay restartable.
 //   - DEFERRED-KEY-CHECK-FAILED-AT-COMMIT (Postgres target, codeless): NOT
 //     listed. It is the COMMIT of a target transaction that a deferrable
 //     constraint's re-check refused, and one of its causes is a source
@@ -148,6 +155,7 @@ var refusalsARestartRepeats = []error{
 	ir.ErrKeyCollationMerge,
 	ir.ErrUniqueKeyConflictOtherRow,
 	ir.ErrSourceUniqueKeyAbsent,
+	ir.ErrIncludeTableScopeDrift,
 }
 
 // refusalARestartRepeats returns the listed sentinel err carries, or nil.

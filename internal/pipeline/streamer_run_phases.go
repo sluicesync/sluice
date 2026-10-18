@@ -737,6 +737,11 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, applier
 			// populated target).
 			changes, stop, err = s.coldStartMultiDatabase(streamCtx, applier, streamID, restartReason(s.RestartFromScratch))
 		case found:
+			// INCLUDE-TABLE-SCOPE-DRIFT: before the reader opens (see the
+			// single-database branch below).
+			if err := s.phaseRefuseIncludeTableScopeDrift(ctx, applier, streamID); err != nil {
+				return nil, func() {}, false, err
+			}
 			changes, stop, err = s.warmResumeMultiDatabase(streamCtx, persisted, applier, streamID)
 			warmResumed = err == nil
 			// Slot-missing fall-through (ADR-0022), multi-database analogue:
@@ -830,6 +835,14 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, applier
 		// answers the question, but it no longer excludes anything.
 		if s.schemaDeltaAppliesToTarget() {
 			s.readerSchemaSeed = s.warmResumeSchemaSeedLoader(applier, streamID, persisted)
+		}
+		// INCLUDE-TABLE-SCOPE-DRIFT (Bug 321): a table in the stream's scope
+		// that it never brought in would be neither copied (a warm resume
+		// copies nothing) nor, on pgoutput, streamed. Asked here, before the
+		// reader opens, so a refusal applies nothing and leaves the
+		// publication as it found it (the reader's own open re-ensures it).
+		if err := s.phaseRefuseIncludeTableScopeDrift(ctx, applier, streamID); err != nil {
+			return nil, func() {}, false, err
 		}
 		changes, stop, err = s.warmResume(streamCtx, persisted)
 		warmResumed = err == nil
