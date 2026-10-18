@@ -168,6 +168,9 @@ type scopeDriftTable struct {
 	// (N2); legacyUnpublished: no record, literal, missing from an unshared
 	// publication.
 	unpublished, legacyUnpublished bool
+	// addAbandoned: its add-table was retired by `--abandon` and its changes
+	// would still be applied onto the possibly partial copy (R4-1).
+	addAbandoned bool
 	// addInProgress / addIncomplete: a pending add-table with a fresh / stale
 	// heartbeat; heartbeatAge is its age.
 	addInProgress, addIncomplete bool
@@ -190,7 +193,7 @@ func (d *scopeDriftTable) yieldToLiveAdd() {
 // onlyInProgress reports a table convicted by nothing but a live add-table
 // (after [scopeDriftTable.yieldToLiveAdd]).
 func (d scopeDriftTable) onlyInProgress() bool {
-	return d.addInProgress && !d.addIncomplete && !d.dropped && !d.notEstablished &&
+	return d.addInProgress && !d.addIncomplete && !d.addAbandoned && !d.dropped && !d.notEstablished &&
 		d.appliedWhy == "" && !d.unpublished && !d.legacyUnpublished
 }
 
@@ -235,19 +238,32 @@ func (s *Streamer) phaseRefuseIncludeTableScopeDrift(ctx context.Context, applie
 		return drift[t.key()]
 	}
 
-	if err := s.judgePendingAdds(ctx, applier, streamID, scope.tables, inScope, entry); err != nil {
+	abandoned, clearable, err := s.judgePendingAdds(ctx, applier, streamID, scope.tables, inScope, entry)
+	if err != nil {
 		return err
 	}
 	membership, err := s.readPublicationMembership(ctx, scope.tables)
 	if err != nil {
 		return err
 	}
+	var notApplied map[string]bool
 	if rec.Recorded {
-		if err := s.judgeAgainstRecord(ctx, streamID, scope, rec, membership, entry); err != nil {
+		if notApplied, err = s.judgeAgainstRecord(ctx, streamID, scope, rec, membership, entry); err != nil {
 			return err
 		}
 	} else {
 		s.judgeLegacy(ctx, streamID, scope.tables, membership, entry)
+		notApplied = legacyNotDelivered(scope.tables, membership)
+	}
+	// R4-1: an abandoned add's table may hold a partial copy. It convicts
+	// unless this stream provably applies nothing onto it; then its entry has
+	// done its job and is cleared, like one out of scope.
+	for _, t := range abandoned {
+		if notApplied[t.key()] {
+			clearable = append(clearable, t.name)
+		} else {
+			entry(t).addAbandoned = true
+		}
 	}
 
 	if len(drift) > 0 {
@@ -256,7 +272,25 @@ func (s *Streamer) phaseRefuseIncludeTableScopeDrift(ctx context.Context, applie
 	if rec.Recorded {
 		s.narrowEstablished(ctx, applier, streamID, rec, scope)
 	}
+	clearAbandonedAdds(ctx, applier, streamID, clearable)
 	return nil
+}
+
+// clearAbandonedAdds removes abandoned pending entries a passing door found
+// harmless (out of scope, gone from the source, or not applied). A failure
+// WARNs: the entry keeps `sync health` at ADD-TABLE ABANDONED, which is loud.
+func clearAbandonedAdds(ctx context.Context, applier ir.ChangeApplier, streamID string, tables []string) {
+	store, ok := applier.(ir.PendingAddedTablesStore)
+	if !ok || len(tables) == 0 {
+		return
+	}
+	if err := store.ClearPendingAddedTables(ctx, streamID, tables); err != nil {
+		slog.WarnContext(ctx, "could not clear abandoned add-table records this stream applies nothing onto; `sync health` "+
+			"keeps reporting them", slog.String("stream_id", streamID), slog.String("error", err.Error()))
+		return
+	}
+	slog.InfoContext(ctx, "cleared abandoned add-table records: this stream applies no changes onto those tables",
+		slog.String("stream_id", streamID), slog.String("tables", strings.Join(tables, ", ")))
 }
 
 // readStreamScope reads the source tables the stream applies to, per
@@ -316,32 +350,46 @@ func readEstablishedRecord(ctx context.Context, applier ir.ChangeApplier, stream
 }
 
 // judgePendingAdds marks every in-scope table whose add-table is pending:
-// in progress while its heartbeat is fresh, incomplete once stale. A pending
-// name the source no longer has (dropped or renamed since) cannot be streamed
-// into, so it is ignored with a WARN naming the abandon path.
-func (s *Streamer) judgePendingAdds(ctx context.Context, applier ir.ChangeApplier, streamID string, scope []scopeTable, inScope func(string) bool, entry func(scopeTable) *scopeDriftTable) error {
+// in progress while its heartbeat is fresh, incomplete once stale. An
+// ABANDONED entry (R4-1) is not judged here: it is returned, for the door to
+// convict unless the table's changes are provably not applied, and an
+// abandoned entry for a table out of scope or gone from the source is
+// returned as clearable — nothing applies changes onto that table's partial
+// copy any more. Any other pending name the source no longer has (dropped or
+// renamed since) cannot be streamed into, so it is ignored with a WARN naming
+// the abandon path.
+func (s *Streamer) judgePendingAdds(ctx context.Context, applier ir.ChangeApplier, streamID string, scope []scopeTable, inScope func(string) bool, entry func(scopeTable) *scopeDriftTable) (abandoned []scopeTable, clearable []string, err error) {
 	store, ok := applier.(ir.PendingAddedTablesStore)
 	if !ok {
-		return nil
+		return nil, nil, nil
 	}
 	// now is the control-table server's clock, the one every entry was
 	// stamped with (S-C): this host's clock is never compared with another's.
 	pending, now, err := store.ReadPendingAddedTables(ctx, streamID)
 	if err != nil {
-		return controlReadFailure(fmt.Errorf("pipeline: include-table scope door: %w", err))
+		return nil, nil, controlReadFailure(fmt.Errorf("pipeline: include-table scope door: %w", err))
 	}
 	var absent []string
 	for _, p := range pending {
 		if !inScope(p.Table) {
+			if p.Abandoned() {
+				clearable = append(clearable, p.Table)
+			}
 			continue
 		}
-		warnFutureHeartbeat(ctx, p, now)
+		if !p.Abandoned() {
+			warnFutureHeartbeat(ctx, p, now)
+		}
 		found := false
 		for _, t := range scope {
 			if t.name != p.Table {
 				continue
 			}
 			found = true
+			if p.Abandoned() {
+				abandoned = append(abandoned, t)
+				continue
+			}
 			e := entry(t)
 			e.heartbeatAge = now.Sub(p.HeartbeatAt).Round(time.Second)
 			if p.Fresh(now) {
@@ -350,21 +398,27 @@ func (s *Streamer) judgePendingAdds(ctx context.Context, applier ir.ChangeApplie
 				e.addIncomplete = true
 			}
 		}
-		if !found {
+		switch {
+		case found:
+		case p.Abandoned():
+			clearable = append(clearable, p.Table)
+		default:
 			absent = append(absent, p.Table)
 		}
 	}
 	if len(absent) > 0 {
 		slog.WarnContext(ctx, "a pending `sluice schema add-table` names a table the source no longer has; ignoring it "+
-			"(`sluice schema add-table --abandon <table>` removes the record)",
+			"(`sluice schema add-table --abandon <table>` retires the record)",
 			slog.String("stream_id", streamID), slog.String("tables", strings.Join(absent, ", ")))
 	}
-	return nil
+	return abandoned, clearable, nil
 }
 
 // judgeAgainstRecord applies the established/dropped record — and, on
-// pgoutput, the publication — to every in-scope table.
-func (s *Streamer) judgeAgainstRecord(ctx context.Context, streamID string, scope streamScope, rec ir.EstablishedRecord, m *ir.PublicationMembership, entry func(scopeTable) *scopeDriftTable) error {
+// pgoutput, the publication — to every in-scope table. It returns the
+// never-established tables whose changes are provably not applied (the WARN
+// case), by key.
+func (s *Streamer) judgeAgainstRecord(ctx context.Context, streamID string, scope streamScope, rec ir.EstablishedRecord, m *ir.PublicationMembership, entry func(scopeTable) *scopeDriftTable) (notApplied map[string]bool, err error) {
 	established, dropped := toSet(rec.Established), toSet(rec.Dropped)
 	missing := map[string]bool{}
 	if m != nil {
@@ -387,12 +441,13 @@ func (s *Streamer) judgeAgainstRecord(ctx context.Context, streamID string, scop
 			entry(t).unpublished = true
 		}
 	}
+	notApplied = map[string]bool{}
 	if len(candidates) == 0 {
-		return nil
+		return notApplied, nil
 	}
 	applied, err := s.changesWouldApply(ctx, scope, candidates, m)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	var outside []string
 	for _, t := range candidates {
@@ -400,6 +455,7 @@ func (s *Streamer) judgeAgainstRecord(ctx context.Context, streamID string, scop
 			entry(t).appliedWhy = why
 		} else {
 			outside = append(outside, t.display())
+			notApplied[t.key()] = true
 		}
 	}
 	if len(outside) > 0 {
@@ -409,7 +465,24 @@ func (s *Streamer) judgeAgainstRecord(ctx context.Context, streamID string, scop
 			"counted); they stay out until `sluice schema add-table` copies them (ADR-0021)",
 			slog.String("stream_id", streamID), slog.String("tables", strings.Join(outside, ", ")))
 	}
-	return nil
+	return notApplied, nil
+}
+
+// legacyNotDelivered is the no-record stream's "provably not applied": a
+// FOR TABLE publication that does not list the table. Every other no-record
+// shape has no such proof.
+func legacyNotDelivered(scope []scopeTable, m *ir.PublicationMembership) map[string]bool {
+	out := map[string]bool{}
+	if m == nil || m.Publication == "" || m.AllTables {
+		return out
+	}
+	missing := toSet(m.Missing)
+	for _, t := range scope {
+		if missing[t.name] {
+			out[t.key()] = true
+		}
+	}
+	return out
 }
 
 // changesWouldApply returns, for each never-established candidate, why its
@@ -515,52 +588,48 @@ func (s *Streamer) scopeDriftRefusal(ctx context.Context, streamID string, m *ir
 // applies into the dropped set — its changes are discarded from here on —
 // and forgets the ones gone from the source (an established one, or a
 // dropped one: a table recreated under the name later is a new table, which
-// the established record already does not hold). Dropped is written first,
-// so a stop between the two writes leaves a table in both sets, which refuses,
-// rather than in neither. A failed write WARNs: it is the re-widen check that
-// weakens, not this stream.
+// the established record already does not hold). The source catalog is read
+// first, for the entries the record held when the door read it; the write is
+// one row-locked read-modify-write of both sets
+// ([ir.EstablishedTablesStore.NarrowEstablishedRecord], R4-4), so a
+// `schema add-table` completing concurrently is judged under the lock rather
+// than overwritten by a replace computed from an older read. A failed write
+// WARNs: it is the re-widen check that weakens, not this stream.
 func (s *Streamer) narrowEstablished(ctx context.Context, applier ir.ChangeApplier, streamID string, rec ir.EstablishedRecord, scope streamScope) {
-	inScope := map[string]bool{}
+	inScope := make([]string, 0, len(scope.tables))
+	in := map[string]bool{}
 	for _, t := range scope.tables {
-		inScope[t.key()] = true
+		inScope = append(inScope, t.key())
+		in[t.key()] = true
 	}
-	var leaving, keepEst []string
+	candidates := append([]string(nil), rec.Dropped...)
 	for _, k := range rec.Established {
-		if inScope[k] {
-			keepEst = append(keepEst, k)
-		} else {
-			leaving = append(leaving, k)
+		if !in[k] {
+			candidates = append(candidates, k)
 		}
 	}
-	if len(leaving) == 0 && len(rec.Dropped) == 0 {
+	if len(candidates) == 0 {
 		return
 	}
-	present, err := s.presentInSource(ctx, scope, append(append([]string(nil), leaving...), rec.Dropped...))
+	present, err := s.presentInSource(ctx, scope, candidates)
 	if err != nil {
 		slog.WarnContext(ctx, "could not read the source catalog to narrow the established-table record; it is left as it "+
 			"was", slog.String("stream_id", streamID), slog.String("error", err.Error()))
 		return
 	}
-	var dropped []string
-	for _, k := range append(append([]string(nil), rec.Dropped...), leaving...) {
-		if present[k] {
-			dropped = append(dropped, k)
+	var gone []string
+	for _, k := range candidates {
+		if !present[k] {
+			gone = append(gone, k)
 		}
 	}
-	store := applier.(ir.EstablishedTablesStore)
-	if !sameSet(dropped, rec.Dropped) {
-		if err := store.RecordDroppedTables(ctx, streamID, dropped); err != nil {
-			slog.WarnContext(ctx, "could not update the stream's dropped-table record; bringing a table back into scope "+
-				"later may not be refused", slog.String("stream_id", streamID), slog.String("error", err.Error()))
-			return
-		}
+	leaving, err := applier.(ir.EstablishedTablesStore).NarrowEstablishedRecord(ctx, streamID, inScope, gone)
+	if err != nil {
+		slog.WarnContext(ctx, "could not narrow the stream's established-table record; bringing a table back into scope "+
+			"later may not be refused", slog.String("stream_id", streamID), slog.String("error", err.Error()))
+		return
 	}
 	if len(leaving) > 0 {
-		if err := store.RecordEstablishedTables(ctx, streamID, keepEst); err != nil {
-			slog.WarnContext(ctx, "could not narrow the stream's established-table record", slog.String("stream_id", streamID),
-				slog.String("error", err.Error()))
-			return
-		}
 		shown := make([]string, len(leaving))
 		for i, k := range leaving {
 			shown[i] = strings.ReplaceAll(k, "\x00", ".")
@@ -633,6 +702,10 @@ func (s *Streamer) includeTableScopeDriftError(streamID, publication string, tab
 		if t.addIncomplete {
 			why = append(why, fmt.Sprintf("its `sluice schema add-table` started and did not complete (last heartbeat %s ago), "+
 				"so its copy may be partial", t.heartbeatAge))
+		}
+		if t.addAbandoned {
+			why = append(why, "its `sluice schema add-table` was abandoned (`--abandon`), so its target copy may be partial "+
+				"and this stream would keep applying changes onto it")
 		}
 		if t.addInProgress {
 			why = append(why, fmt.Sprintf("its `sluice schema add-table` is still running (heartbeat %s ago)", t.heartbeatAge))

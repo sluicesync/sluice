@@ -1002,6 +1002,40 @@ func (s *Streamer) coldStartGatePreflight(ctx context.Context, schema *ir.Schema
 		}
 	}
 
+	// The CDC-lane array-bytes refusal: a source-side distinction the
+	// applier's target-derived column types cannot carry, for the array
+	// families whose element leaf is byte-shaped. It asks the target ENGINE
+	// (the offending column is usually one sluice is about to CREATE, so a
+	// catalog-keyed check would no-op on the ordinary fresh cold start) and
+	// needs no connection, so it is a deterministic function of the schema —
+	// and therefore runs HERE, above the switch, before any branch marks the
+	// record in progress or drops the target (Bug 321 R4-2). It used to run
+	// last, after a --reset-target-data / --restart-from-scratch branch had
+	// already dropped the in-scope tables: a schema that trips it dropped the
+	// target and then refused, on every re-run. The cost is precedence: a
+	// target that is also populated now reports this verdict before Bug 9's.
+	//
+	// The binary-column refusal below is NOT moved. It reads the target
+	// catalog, and on the two drop branches it runs after the drop, finds no
+	// in-scope table and cannot refuse; run before the drop it would refuse
+	// on the column types of tables about to be dropped and recreated from
+	// the source — a false refusal. So no deterministic refusal follows a drop.
+	if err := preflightArrayBytesLeafOnCDC(schema, engineNameOrEmpty(s.Target), "sync cold-start"); err != nil {
+		migcore.CloseIf(rw)
+		migcore.CloseIf(sw)
+		_ = stream.Abandon()
+		return nil, err
+	}
+	// The query-timeout raise's deterministic refusals, for the same reason:
+	// the raise itself runs after this gate (it must not restart the keyspace
+	// under an in-flight copy), which on a drop branch is after the drop.
+	if err := preflightQueryTimeoutRaise(s.RaiseQueryTimeout, s.QueryTimeoutController, queryTimeoutRaiseRecorder(applier)); err != nil {
+		migcore.CloseIf(rw)
+		migcore.CloseIf(sw)
+		_ = stream.Abandon()
+		return nil, err
+	}
+
 	var createSchema *ir.Schema
 
 	// INCLUDE-TABLE-SCOPE-DRIFT: the record is marked in progress at the
@@ -1212,21 +1246,6 @@ func (s *Streamer) coldStartGatePreflight(ctx context.Context, schema *ir.Schema
 			_ = stream.Abandon()
 			return nil, err
 		}
-	}
-	// The same hazard SHAPE — a source-side distinction the applier's
-	// target-derived column types cannot carry — for the array families
-	// whose element leaf is byte-shaped. Deliberately NOT inside the
-	// catalog-read block above: the offending column is usually one
-	// sluice is about to CREATE, so a catalog-keyed check would find
-	// nothing and no-op on exactly the ordinary fresh cold start. It asks
-	// the target ENGINE instead and needs no connection. Ordered last so
-	// a target that is wrong in several ways reports the older, more
-	// general verdicts first.
-	if err := preflightArrayBytesLeafOnCDC(schema, engineNameOrEmpty(s.Target), "sync cold-start"); err != nil {
-		migcore.CloseIf(rw)
-		migcore.CloseIf(sw)
-		_ = stream.Abandon()
-		return nil, err
 	}
 	return createSchema, nil
 }

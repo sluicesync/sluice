@@ -25,7 +25,9 @@ package pipeline
 // taken over cancels the copy, and the completion records nothing.
 //
 // `--abandon` is how an operator retires an entry no add-table can clear: its
-// table was dropped on the source, or taken out of the stream's scope.
+// table was dropped on the source, or taken out of the stream's scope. It marks
+// the entry ABANDONED; a stream start clears it once it proves nothing is
+// applied onto the table, and refuses otherwise.
 
 import (
 	"context"
@@ -191,8 +193,11 @@ func (a *AddTable) undoFailedAdd(ctx context.Context, applier ir.ChangeApplier, 
 	return fmt.Errorf("%w (%s)", cause, note)
 }
 
-// runAbandon is `sluice schema add-table --abandon <table>`: it removes the
-// table's pending entry. On a publication source it also takes the table back
+// runAbandon is `sluice schema add-table --abandon <table>`: it marks the
+// table's pending entry ABANDONED rather than removing it (R4-1: a running
+// stream may still be applying onto the partial copy, and the entry is what
+// keeps `sync health` red until a restart judges the table — see
+// [ir.PendingAddedTable.Abandoned]). On a publication source it also takes the table back
 // out of the publication when nothing else needs it there — not when the
 // stream established it, and not when another sluice slot on the same
 // database exists (that stream may read it through the same publication) —
@@ -245,12 +250,15 @@ func (a *AddTable) runAbandon(ctx context.Context) error {
 	a.abandonPublicationMembership(ctx, applier)
 	a.dropAbandonedSnapshotSlot(ctx)
 
-	if err := store.ClearPendingAddedTables(ctx, a.StreamID, []string{a.TableName}); err != nil {
+	if err := store.AbandonPendingAddedTable(ctx, a.StreamID, a.TableName); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf("pipeline: add-table --abandon: %w", err))
 	}
-	slog.WarnContext(ctx, "add-table --abandon: removed the pending add-table record. The target table was left as it "+
-		"is and may hold a partial copy: drop or empty it, or bring the table in with `sluice schema add-table` after "+
-		"emptying it", slog.String("stream_id", a.StreamID), slog.String("table", a.TableName))
+	slog.WarnContext(ctx, "add-table --abandon: marked the pending add-table record ABANDONED. RESTART THE STREAM: a "+
+		"running stream may still be applying changes onto this table's partial copy, and nothing re-checks a running "+
+		"stream. On restart the record is cleared if the table is out of the stream's scope or its changes are not "+
+		"applied; otherwise the start refuses INCLUDE-TABLE-SCOPE-DRIFT. Until then `sync health` exits 1 with ADD-TABLE "+
+		"ABANDONED. The target table was left as it is and may hold a partial copy: drop or empty it, or bring the table "+
+		"in with `sluice schema add-table` after emptying it", slog.String("stream_id", a.StreamID), slog.String("table", a.TableName))
 	return nil
 }
 

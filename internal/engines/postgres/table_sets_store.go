@@ -115,6 +115,27 @@ func (a *ChangeApplier) ClearPendingAddedTables(ctx context.Context, streamID st
 	return a.updateTableSet(ctx, streamID, appliershared.PendingAddedTablesColumn, false, false, appliershared.PendingClear(tables))
 }
 
+// AbandonPendingAddedTable implements [ir.PendingAddedTablesStore].
+func (a *ChangeApplier) AbandonPendingAddedTable(ctx context.Context, streamID, table string) error {
+	return a.updateTableSet(ctx, streamID, appliershared.PendingAddedTablesColumn, false, false, appliershared.PendingAbandon(table))
+}
+
+// NarrowEstablishedRecord implements [ir.EstablishedTablesStore].
+func (a *ChangeApplier) NarrowEstablishedRecord(ctx context.Context, streamID string, inScope, gone []string) ([]string, error) {
+	if err := a.ensureTableSetColumns(ctx, streamID, appliershared.EstablishedTablesColumn, appliershared.DroppedTablesColumn); err != nil {
+		return nil, err
+	}
+	ref := controlTableRef(a.controlSchema)
+	q := appliershared.RecordQueries{
+		ReadForUpdate: "SELECT " + appliershared.EstablishedTablesColumn + ", " + appliershared.DroppedTablesColumn +
+			" FROM " + ref + " WHERE stream_id = $1 FOR UPDATE",
+		Update: "UPDATE " + ref + " SET " + appliershared.EstablishedTablesColumn + " = $1, " +
+			appliershared.DroppedTablesColumn + " = $2 WHERE stream_id = $3",
+	}
+	leaving, err := appliershared.NarrowEstablished(ctx, a.db, controlCfg, q, streamID, inScope, gone)
+	return leaving, classifyApplierError(err)
+}
+
 // ReadPendingAddedTables implements [ir.PendingAddedTablesStore].
 func (a *ChangeApplier) ReadPendingAddedTables(ctx context.Context, streamID string) ([]ir.PendingAddedTable, time.Time, error) {
 	entries, now, err := appliershared.ReadPendingEntries(ctx, a.db, controlCfg, a.tableSetQueries(appliershared.PendingAddedTablesColumn), streamID)

@@ -18,10 +18,14 @@ var (
 	_ ir.EstablishedTablesStore  = (*ChangeApplier)(nil)
 )
 
-// mysqlServerNowMillis reads the server's clock in Unix milliseconds.
-// UNIX_TIMESTAMP undoes the session time_zone NOW applies, so the value is
-// UTC whatever the session's zone.
-const mysqlServerNowMillis = "SELECT CAST(FLOOR(UNIX_TIMESTAMP(NOW(6)) * 1000) AS SIGNED)"
+// mysqlServerNowMillis reads the server's clock in Unix milliseconds, with no
+// time-zone conversion anywhere: UTC_TIMESTAMP(6) is UTC whatever the
+// session's time_zone, and TIMESTAMPDIFF over two DATETIMEs is plain
+// arithmetic. UNIX_TIMESTAMP(NOW(6)) was not DST-proof: NOW renders the
+// session zone's local time, and in a fall-back hour that local time names
+// two instants, of which UNIX_TIMESTAMP picks one — an hour off for the other
+// (pinned by TestMySQLServerNowMillis_DSTFallBack).
+const mysqlServerNowMillis = "SELECT TIMESTAMPDIFF(MICROSECOND, '1970-01-01 00:00:00', UTC_TIMESTAMP(6)) DIV 1000"
 
 // tableSetQueries renders the statements the shared table-set helpers run
 // against one column of this applier's control table.
@@ -111,6 +115,26 @@ func (a *ChangeApplier) ClearPendingAddedTables(ctx context.Context, streamID st
 		return nil
 	}
 	return a.updateTableSet(ctx, streamID, appliershared.PendingAddedTablesColumn, false, false, appliershared.PendingClear(tables))
+}
+
+// AbandonPendingAddedTable implements [ir.PendingAddedTablesStore].
+func (a *ChangeApplier) AbandonPendingAddedTable(ctx context.Context, streamID, table string) error {
+	return a.updateTableSet(ctx, streamID, appliershared.PendingAddedTablesColumn, false, false, appliershared.PendingAbandon(table))
+}
+
+// NarrowEstablishedRecord implements [ir.EstablishedTablesStore].
+func (a *ChangeApplier) NarrowEstablishedRecord(ctx context.Context, streamID string, inScope, gone []string) ([]string, error) {
+	if err := a.ensureTableSetColumns(ctx, streamID, appliershared.EstablishedTablesColumn, appliershared.DroppedTablesColumn); err != nil {
+		return nil, err
+	}
+	ref := controlTableRef(a.controlKeyspace, controlTableName)
+	q := appliershared.RecordQueries{
+		ReadForUpdate: "SELECT " + appliershared.EstablishedTablesColumn + ", " + appliershared.DroppedTablesColumn +
+			" FROM " + ref + " WHERE stream_id = ? FOR UPDATE",
+		Update: "UPDATE " + ref + " SET " + appliershared.EstablishedTablesColumn + " = ?, " +
+			appliershared.DroppedTablesColumn + " = ? WHERE stream_id = ?",
+	}
+	return appliershared.NarrowEstablished(ctx, a.db, controlCfg, q, streamID, inScope, gone)
 }
 
 // ReadPendingAddedTables implements [ir.PendingAddedTablesStore].

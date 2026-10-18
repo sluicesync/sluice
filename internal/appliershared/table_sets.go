@@ -348,6 +348,25 @@ func PendingClear(tables []string) TableSetEdit {
 	}
 }
 
+// PendingAbandon is the [TableSetEdit] that rewrites table's entry as
+// abandoned whatever its token: [ir.PendingAddAbandonedToken], heartbeat the
+// epoch, start kept. No entry is nothing to write.
+func PendingAbandon(table string) TableSetEdit {
+	return func(set map[string]struct{}, _ bool, _ time.Time) (map[string]struct{}, bool) {
+		for entry := range set {
+			p, err := DecodePendingEntry(entry)
+			if err != nil || p.Table != table {
+				continue
+			}
+			delete(set, entry)
+			p.Token, p.HeartbeatAt = ir.PendingAddAbandonedToken, time.Unix(0, 0).UTC()
+			set[EncodePendingEntry(p)] = struct{}{}
+			return set, true
+		}
+		return nil, false
+	}
+}
+
 // ownPendingEntry finds table's entry when it carries token.
 func ownPendingEntry(set map[string]struct{}, table, token string) (string, ir.PendingAddedTable, bool) {
 	for entry := range set {
@@ -471,6 +490,95 @@ func CompletePendingAdd(ctx context.Context, db *sql.DB, cfg *ControlTableConfig
 		return fmt.Errorf("%s: complete pending add-table: commit: %w", cfg.EngineName, err)
 	}
 	return nil
+}
+
+// NarrowRecord computes a resume's narrowing of a record: established keeps
+// the entries in inScope, the rest (leaving) join dropped, and dropped loses
+// the entries in gone. Pure, so [NarrowEstablished] applies it to the values
+// it read under its row lock — an entry a concurrent completion added since
+// the caller's own read is judged too (kept if in scope, dropped otherwise),
+// never overwritten away.
+func NarrowRecord(established, dropped, inScope, gone []string) (nextEstablished, nextDropped, leaving []string) {
+	in, isGone := toEntrySet(inScope), toEntrySet(gone)
+	nextEstablished = []string{}
+	drop := toEntrySet(dropped)
+	for _, e := range established {
+		if _, ok := in[e]; ok {
+			nextEstablished = append(nextEstablished, e)
+		} else {
+			leaving = append(leaving, e)
+			drop[e] = struct{}{}
+		}
+	}
+	nextDropped = []string{}
+	for e := range drop {
+		if _, ok := isGone[e]; !ok {
+			nextDropped = append(nextDropped, e)
+		}
+	}
+	sort.Strings(nextEstablished)
+	sort.Strings(nextDropped)
+	sort.Strings(leaving)
+	return nextEstablished, nextDropped, leaving
+}
+
+// RecordQueries are the statements [NarrowEstablished] runs: both record
+// columns of one row, read under a lock and written in one UPDATE.
+type RecordQueries struct {
+	// ReadForUpdate is `SELECT established_tables, dropped_tables … WHERE
+	// stream_id = <p1> FOR UPDATE`.
+	ReadForUpdate string
+	// Update is `UPDATE … SET established_tables = <p1>, dropped_tables =
+	// <p2> WHERE stream_id = <p3>`.
+	Update string
+}
+
+// NarrowEstablished is [ir.EstablishedTablesStore.NarrowEstablishedRecord]:
+// [NarrowRecord] over the values read under a row lock, written back in the
+// same transaction. No row, no record, or a cold start in progress: nothing
+// is written. The caller has ensured both columns exist.
+func NarrowEstablished(ctx context.Context, db *sql.DB, cfg *ControlTableConfig, q RecordQueries, streamID string, inScope, gone []string) (leaving []string, err error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("%s: narrow established-table record: begin: %w", cfg.EngineName, err)
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+	var establishedCol, droppedCol sql.NullString
+	switch serr := tx.QueryRowContext(ctx, q.ReadForUpdate, streamID).Scan(&establishedCol, &droppedCol); {
+	case errors.Is(serr, sql.ErrNoRows):
+		return nil, tx.Rollback()
+	case serr != nil:
+		return nil, fmt.Errorf("%s: narrow established-table record: %w", cfg.EngineName, serr)
+	}
+	if !establishedCol.Valid {
+		return nil, tx.Rollback()
+	}
+	est, err := DecodeTableSet(establishedCol.String)
+	if err != nil {
+		return nil, fmt.Errorf("%s: narrow established-table record: %w", cfg.EngineName, err)
+	}
+	if _, inProgress := toEntrySet(est)[ColdStartInProgressEntry]; inProgress {
+		return nil, tx.Rollback()
+	}
+	drop, err := DecodeTableSet(droppedCol.String)
+	if err != nil {
+		return nil, fmt.Errorf("%s: narrow established-table record: %w", cfg.EngineName, err)
+	}
+	nextEst, nextDrop, leaving := NarrowRecord(est, drop, inScope, gone)
+	if EncodeTableSet(nextEst) == EncodeTableSet(est) && EncodeTableSet(nextDrop) == EncodeTableSet(drop) {
+		return nil, tx.Rollback()
+	}
+	if _, err := tx.ExecContext(ctx, q.Update, EncodeTableSet(nextEst), EncodeTableSet(nextDrop), streamID); err != nil {
+		return nil, fmt.Errorf("%s: narrow established-table record: %w", cfg.EngineName, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("%s: narrow established-table record: commit: %w", cfg.EngineName, err)
+	}
+	return leaving, nil
 }
 
 func nullableString(s sql.NullString) any {

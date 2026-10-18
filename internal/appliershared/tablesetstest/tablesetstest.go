@@ -255,6 +255,8 @@ func EstablishedRoundTrip(ctx context.Context, t *testing.T, store Store, errStr
 		t.Fatalf("the empty set: %+v; want recorded, empty, finished", rec)
 	}
 
+	narrowAndAbandon(ctx, t, store)
+
 	// A multi-database record is left alone by add-table (F3).
 	if err := store.RecordEstablishedTables(ctx, "s1", []string{"app\x00orders"}); err != nil {
 		t.Fatal(err)
@@ -268,5 +270,84 @@ func EstablishedRoundTrip(ctx context.Context, t *testing.T, store Store, errStr
 	}
 	if err := store.RecordEstablishedTables(ctx, "no-such-stream", []string{"x"}); !errors.Is(err, errStreamNotFound) {
 		t.Fatalf("Record on a missing row = %v; want the stream-not-found error", err)
+	}
+}
+
+// narrowAndAbandon is the round-5 half of [EstablishedRoundTrip] on stream
+// s1: the row-locked narrowing (R4-4) and the abandoned pending entry (R4-1).
+// It leaves s1 in a cold start in progress.
+func narrowAndAbandon(ctx context.Context, t *testing.T, store Store) {
+	t.Helper()
+	read := func() ir.EstablishedRecord {
+		t.Helper()
+		rec, err := store.ReadEstablishedRecord(ctx, "s1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return rec
+	}
+	recordPending := func(table, token string) {
+		t.Helper()
+		if err := store.RecordPendingAddedTable(ctx, "s1", table, token); err != nil {
+			t.Fatal(err)
+		}
+	}
+	complete := func(table, token string) error {
+		t.Helper()
+		return store.CompletePendingAddedTable(ctx, "s1", table, token)
+	}
+
+	// R4-4: the narrowing is judged on the values under its row lock. The
+	// caller decided the scope from an older read of {a, b}; a completion of
+	// c has landed since. c survives, b moves to dropped.
+	if err := store.RecordEstablishedTables(ctx, "s1", []string{"a", "b"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordDroppedTables(ctx, "s1", []string{"c", "gone"}); err != nil {
+		t.Fatal(err)
+	}
+	recordPending("c", "tok-n")
+	if err := complete("c", "tok-n"); err != nil {
+		t.Fatal(err)
+	}
+	leaving, err := store.NarrowEstablishedRecord(ctx, "s1", []string{"a", "c"}, []string{"gone"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec := read(); !reflect.DeepEqual(rec.Established, []string{"a", "c"}) || !reflect.DeepEqual(rec.Dropped, []string{"b"}) ||
+		!reflect.DeepEqual(leaving, []string{"b"}) {
+		t.Fatalf("after the narrowing: %+v leaving %q; want established [a c], dropped [b]", rec, leaving)
+	}
+	if err := store.BeginColdStartRecord(ctx, "s1"); err != nil {
+		t.Fatal(err)
+	}
+	if leaving, err := store.NarrowEstablishedRecord(ctx, "s1", nil, nil); err != nil || leaving != nil || !read().ColdStartInProgress {
+		t.Fatalf("a narrowing during a cold start in progress: %q, %v, %+v; want nothing written", leaving, err, read())
+	}
+	if leaving, err := store.NarrowEstablishedRecord(ctx, "no-such-stream", nil, nil); err != nil || leaving != nil {
+		t.Fatalf("a narrowing of a missing row: %q, %v; want nothing to do", leaving, err)
+	}
+
+	// R4-1: --abandon rewrites the entry, never removes it, and the add it
+	// abandoned is superseded.
+	recordPending("ab", "tok-ab")
+	if err := store.AbandonPendingAddedTable(ctx, "s1", "ab"); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := store.ReadPendingAddedTables(ctx, "s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Table != "ab" || !got[0].Abandoned() || got[0].StartedAt.IsZero() || !got[0].HeartbeatAt.Equal(time.Unix(0, 0)) {
+		t.Fatalf("after --abandon: %+v; want one abandoned entry, start kept", got)
+	}
+	if err := complete("ab", "tok-ab"); !errors.Is(err, ir.ErrPendingAddSuperseded) {
+		t.Fatalf("Complete of an abandoned add = %v; want ErrPendingAddSuperseded", err)
+	}
+	if err := store.AbandonPendingAddedTable(ctx, "s1", "never-recorded"); err != nil {
+		t.Fatalf("abandoning nothing: %v", err)
+	}
+	if err := store.ClearPendingAddedTables(ctx, "s1", []string{"ab"}); err != nil {
+		t.Fatal(err)
 	}
 }

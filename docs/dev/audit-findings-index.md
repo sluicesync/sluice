@@ -60,6 +60,7 @@ Indexed when filed. Residuals named while fixing Bug 321 (no audit pass).
 
 - TABLE-RECREATED-WHILE-STOPPED filed
 - ADD-TABLE-SNAPSHOT-SLOT-PERSISTENT filed
+- MULTIDB-COLDSTART-REFUSAL-AFTER-COPY filed
 
 ## 2026-10-15 — GitHub #356 (an outside user's report): fixed, with what it leaves open
 

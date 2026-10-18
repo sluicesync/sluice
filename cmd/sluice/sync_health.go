@@ -124,6 +124,11 @@ type HealthResult struct {
 	// an add-table still copying — reported, not tripped, so a cron probe
 	// does not page through every normal --no-drain add.
 	PendingAddedTablesTripped bool `json:"pending_added_tables_tripped,omitempty"`
+	// PendingAddedTablesAbandoned: at least one entry was retired by `schema
+	// add-table --abandon` (R4-1). It trips too, and its remedy is to restart
+	// the stream: only a stream start judges the table, and a running stream
+	// may still be applying changes onto the partial copy.
+	PendingAddedTablesAbandoned bool `json:"pending_added_tables_abandoned,omitempty"`
 }
 
 // PendingAddHealth is one pending add-table entry in the health output.
@@ -132,19 +137,25 @@ type PendingAddHealth struct {
 	StartedAt   string `json:"started_at"`
 	HeartbeatAt string `json:"heartbeat_at"`
 	InProgress  bool   `json:"in_progress"`
+	Abandoned   bool   `json:"abandoned,omitempty"`
 }
 
-// applyPendingAddsHealth classifies each pending entry fresh (in progress) or
-// stale (the add died; trips). Pure, so the classifier is unit-pinnable.
+// applyPendingAddsHealth classifies each pending entry fresh (in progress),
+// stale (the add died; trips) or abandoned (trips; restart the stream). Pure,
+// so the classifier is unit-pinnable.
 func applyPendingAddsHealth(r *HealthResult, pending []ir.PendingAddedTable, now time.Time) {
 	for _, p := range pending {
-		fresh := p.Fresh(now)
+		abandoned := p.Abandoned()
+		fresh := !abandoned && p.Fresh(now)
 		r.PendingAddedTables = append(r.PendingAddedTables, PendingAddHealth{
 			Table: p.Table, StartedAt: p.StartedAt.UTC().Format(time.RFC3339),
-			HeartbeatAt: p.HeartbeatAt.UTC().Format(time.RFC3339), InProgress: fresh,
+			HeartbeatAt: p.HeartbeatAt.UTC().Format(time.RFC3339), InProgress: fresh, Abandoned: abandoned,
 		})
 		if !fresh {
 			r.PendingAddedTablesTripped = true
+		}
+		if abandoned {
+			r.PendingAddedTablesAbandoned = true
 		}
 	}
 }
@@ -301,16 +312,35 @@ type pendingAddedTablesError struct {
 func (pendingAddedTablesError) ExitCode() int { return 1 }
 
 func (e pendingAddedTablesError) Error() string {
-	var stale []string
+	var stale, abandoned []string
 	for _, p := range e.result.PendingAddedTables {
-		if !p.InProgress {
+		switch {
+		case p.Abandoned:
+			abandoned = append(abandoned, p.Table)
+		case !p.InProgress:
 			stale = append(stale, fmt.Sprintf("%s (last heartbeat %s)", p.Table, p.HeartbeatAt))
 		}
 	}
-	return fmt.Sprintf("stream %q has a `sluice schema add-table` that stopped without completing, for: %s — the "+
-		"table's target copy may be partial while the stream applies its changes (INCLUDE-TABLE-SCOPE-DRIFT); %s",
-		e.streamID, strings.Join(stale, ", "), pendingAddedTablesRemedy)
+	var parts []string
+	if len(abandoned) > 0 {
+		parts = append(parts, fmt.Sprintf("stream %q has an abandoned `sluice schema add-table` for: %s — %s",
+			e.streamID, strings.Join(abandoned, ", "), pendingAddedTablesAbandonedRemedy))
+	}
+	if len(stale) > 0 {
+		parts = append(parts, fmt.Sprintf("stream %q has a `sluice schema add-table` that stopped without completing, for: %s — the "+
+			"table's target copy may be partial while the stream applies its changes (INCLUDE-TABLE-SCOPE-DRIFT); %s",
+			e.streamID, strings.Join(stale, ", "), pendingAddedTablesRemedy))
+	}
+	return strings.Join(parts, "; ")
 }
+
+// pendingAddedTablesAbandonedRemedy is the remedy for an entry `--abandon`
+// retired (R4-1), shared by `sync health` and `sync status`.
+const pendingAddedTablesAbandonedRemedy = "ADD-TABLE ABANDONED: restart the stream. A running stream may still be " +
+	"applying changes onto the table's target copy, which may be partial, and only a stream start judges the table: " +
+	"it clears the record if the table is out of the stream's scope or its changes are not applied, and refuses " +
+	"INCLUDE-TABLE-SCOPE-DRIFT otherwise. To keep the table, stop the stream, empty the target table and add it again " +
+	"with `sluice schema add-table <table>`"
 
 // pendingAddedTablesRemedy is shared by `sync health` and `sync status`. Run
 // with the stream's own driver/DSN flags; --abandon is the only exit for a
@@ -318,7 +348,8 @@ func (e pendingAddedTablesError) Error() string {
 const pendingAddedTablesRemedy = "if the table still exists on the source and is in the stream's scope: stop the " +
 	"stream, empty the target table and add it again with `sluice schema add-table <table>`, or re-copy with " +
 	"`sync start --restart-from-scratch`; if it was dropped on the source or taken out of the stream's scope: " +
-	"`sluice schema add-table --abandon <table> --yes` removes the record (the target table may hold a partial copy)"
+	"`sluice schema add-table --abandon <table> --yes` retires the record (the target table may hold a partial copy), " +
+	"then restart the stream, which clears it"
 
 // applySkippedTablesHealth folds the C-11 skip ledger into the health
 // result: the stream's rows, the total, and the trip flag (nonzero
@@ -557,6 +588,8 @@ func renderHealthText(w io.Writer, r HealthResult) error {
 		state = fmt.Sprintf("STALE (lag %d bytes, threshold %d)", r.LagBytes, r.LagThreshold)
 	case r.SkippedTablesTripped:
 		state = fmt.Sprintf("SKIPPING (%d event(s) skipped for %d table(s) the target lacks)", r.SkippedEventsTotal, len(r.SkippedTables))
+	case r.PendingAddedTablesAbandoned:
+		state = "ADD-TABLE ABANDONED: restart the stream (an abandoned add-table's table may be partial on the target)"
 	case r.PendingAddedTablesTripped:
 		state = "ADD-TABLE INCOMPLETE (an add-table stopped without completing)"
 	}
@@ -608,16 +641,27 @@ func renderHealthText(w io.Writer, r HealthResult) error {
 			return err
 		}
 	}
+	incomplete := false
 	for _, t := range r.PendingAddedTables {
 		state := "stopped without completing"
-		if t.InProgress {
+		switch {
+		case t.Abandoned:
+			state = "abandoned"
+		case t.InProgress:
 			state = "in progress"
+		default:
+			incomplete = true
 		}
 		if _, err := fmt.Fprintf(w, "pending_added_table: %s %s started_at=%s heartbeat_at=%s\n", t.Table, state, t.StartedAt, t.HeartbeatAt); err != nil {
 			return err
 		}
 	}
-	if r.PendingAddedTablesTripped {
+	if r.PendingAddedTablesAbandoned {
+		if _, err := fmt.Fprintf(w, "pending_added_tables_abandoned_remedy: %s\n", pendingAddedTablesAbandonedRemedy); err != nil {
+			return err
+		}
+	}
+	if incomplete {
 		if _, err := fmt.Fprintf(w, "pending_added_tables_remedy: %s\n", pendingAddedTablesRemedy); err != nil {
 			return err
 		}

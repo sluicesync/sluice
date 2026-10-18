@@ -156,6 +156,9 @@ var targetPreflightStoppedColdStartResumeVsColdStartExempt = map[string]coldStar
 		"is decided by the copy-shape gate (its `shard` aspect included) and the row floor."},
 	"preflightColdStart": {exemptArchitectural, "refuses a COPY into a populated target; the resume REQUIRES a " +
 		"populated target (the row floor refuses an emptied one) and copies nothing into it."},
+	"preflightQueryTimeoutRaise": {exemptArchitectural, "the cold start hoists the raise's deterministic refusals " +
+		"above its drop branches (Bug 321 R4-2); the resume drops nothing, and its own maybeRaiseQueryTimeout call " +
+		"runs the same refusals before it raises."},
 }
 
 // resumeRunsNoCopySourceBoolRanges is the one exemption both resume rosters

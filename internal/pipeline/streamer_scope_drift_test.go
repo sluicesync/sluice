@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"sluicesync.dev/sluice/internal/appliershared"
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
@@ -62,6 +63,20 @@ func (a *scopeDriftApplier) CompletePendingAddedTable(_ context.Context, _, tabl
 func (a *scopeDriftApplier) ClearPendingAddedTables(_ context.Context, _ string, tables []string) error {
 	a.writes = append(a.writes, "clear="+strings.Join(tables, ","))
 	return nil
+}
+
+func (a *scopeDriftApplier) AbandonPendingAddedTable(_ context.Context, _, table string) error {
+	a.writes = append(a.writes, "abandon="+table)
+	return nil
+}
+
+func (a *scopeDriftApplier) NarrowEstablishedRecord(_ context.Context, _ string, inScope, gone []string) ([]string, error) {
+	est, drop, leaving := appliershared.NarrowRecord(a.rec.Established, a.rec.Dropped, inScope, gone)
+	if len(leaving) > 0 || !sameSet(drop, a.rec.Dropped) {
+		a.writes = append(a.writes, "narrow=established:"+strings.Join(est, ",")+" dropped:"+strings.Join(drop, ","))
+		a.rec.Established, a.rec.Dropped = est, drop
+	}
+	return leaving, nil
 }
 
 func (a *scopeDriftApplier) ReadPendingAddedTables(context.Context, string) ([]ir.PendingAddedTable, time.Time, error) {
@@ -264,13 +279,13 @@ func TestScopeDriftDoor_DroppedArm(t *testing.T) {
 			"nt (", reasonDropped)
 	}
 
-	t.Run("a narrowing moves the table to dropped, dropped first", func(t *testing.T) {
+	t.Run("a narrowing moves the table to dropped, in one locked write", func(t *testing.T) {
 		src := newScopeDriftEngine("kd", "nt")
 		src.published = []string{"kd", "nt"}
 		app := recorded([]string{"kd", "nt"})
 		requireNoDrift(t, driftStreamer(t, src, nonScoperEngine{}, "kd").phaseRefuseIncludeTableScopeDrift(ctx, app, "st"))
-		if strings.Join(app.writes, " ") != "dropped=nt established=kd" {
-			t.Fatalf("writes %v, want [dropped=nt established=kd]", app.writes)
+		if strings.Join(app.writes, " ") != "narrow=established:kd dropped:nt" {
+			t.Fatalf("writes %v, want [narrow=established:kd dropped:nt]", app.writes)
 		}
 	})
 
@@ -279,8 +294,8 @@ func TestScopeDriftDoor_DroppedArm(t *testing.T) {
 		src.published = []string{"kd"}
 		app := recorded([]string{"kd", "gone"}, "alsogone")
 		requireNoDrift(t, driftStreamer(t, src, nonScoperEngine{}).phaseRefuseIncludeTableScopeDrift(ctx, app, "st"))
-		if strings.Join(app.writes, " ") != "dropped= established=kd" {
-			t.Fatalf("writes %v, want [dropped= established=kd]", app.writes)
+		if strings.Join(app.writes, " ") != "narrow=established:kd dropped:" {
+			t.Fatalf("writes %v, want [narrow=established:kd dropped:]", app.writes)
 		}
 	})
 
@@ -424,6 +439,87 @@ func TestScopeDriftDoor_PendingArm(t *testing.T) {
 		var cp *connectPhaseError
 		if err == nil || errors.Is(err, ir.ErrIncludeTableScopeDrift) || !errors.As(err, &cp) {
 			t.Fatalf("want a restartable non-marker failure, got %T %v", err, err)
+		}
+	})
+}
+
+// TestScopeDriftDoor_AbandonedAdd is R4-1: an entry `--abandon` retired
+// convicts terminally on any stream open that would apply changes onto the
+// table, and is cleared — only — by an open that finds the table out of
+// scope, gone from the source, or provably not applied.
+func TestScopeDriftDoor_AbandonedAdd(t *testing.T) {
+	ctx := context.Background()
+	abandoned := ir.PendingAddedTable{Table: "nt", Token: ir.PendingAddAbandonedToken, StartedAt: time.Now().Add(-time.Hour), HeartbeatAt: time.Unix(0, 0)}
+	withAbandoned := func(app *scopeDriftApplier) *scopeDriftApplier {
+		app.pending = []ir.PendingAddedTable{abandoned}
+		return app
+	}
+	src := func(tables []string, published ...string) *scopeDriftEngine {
+		e := newScopeDriftEngine(tables...)
+		e.published = published
+		return e
+	}
+	const reasonAbandoned = "was abandoned (`--abandon`)"
+	cleared := func(app *scopeDriftApplier) bool {
+		for _, w := range app.writes {
+			if w == "clear=nt" {
+				return true
+			}
+		}
+		return false
+	}
+
+	t.Run("established, in scope: refuses", func(t *testing.T) {
+		app := withAbandoned(recorded([]string{"kd", "nt"}))
+		requireDrift(t, driftStreamer(t, src([]string{"kd", "nt"}, "kd", "nt"), nonScoperEngine{}).phaseRefuseIncludeTableScopeDrift(ctx, app, "st"),
+			"nt (", reasonAbandoned)
+		if cleared(app) {
+			t.Fatal("a refused open cleared the abandoned entry")
+		}
+	})
+	t.Run("unfiltered, delivered: refuses", func(t *testing.T) {
+		app := withAbandoned(recorded([]string{"kd"}))
+		requireDrift(t, driftStreamer(t, src([]string{"kd", "nt"}, "kd", "nt"), nonScoperEngine{}).phaseRefuseIncludeTableScopeDrift(ctx, app, "st"),
+			reasonAbandoned, reasonInPublication)
+	})
+	t.Run("literal, never established: refuses", func(t *testing.T) {
+		app := withAbandoned(recorded([]string{"kd"}))
+		requireDrift(t, driftStreamer(t, src([]string{"kd", "nt"}, "kd"), nonScoperEngine{}, "kd", "nt").phaseRefuseIncludeTableScopeDrift(ctx, app, "st"),
+			reasonAbandoned, reasonLiteral)
+	})
+	t.Run("no record, not provably undelivered: refuses", func(t *testing.T) {
+		app := withAbandoned(&scopeDriftApplier{})
+		requireDrift(t, driftStreamer(t, src([]string{"kd", "nt"}, "kd", "nt"), nonScoperEngine{}).phaseRefuseIncludeTableScopeDrift(ctx, app, "st"),
+			reasonAbandoned)
+	})
+	for name, mk := range map[string]func() (*Streamer, *scopeDriftApplier){
+		"out of scope": func() (*Streamer, *scopeDriftApplier) {
+			return driftStreamer(t, src([]string{"kd", "nt"}, "kd", "nt"), nonScoperEngine{}, "kd"), withAbandoned(recorded([]string{"kd"}))
+		},
+		"gone from the source": func() (*Streamer, *scopeDriftApplier) {
+			return driftStreamer(t, src([]string{"kd"}, "kd"), nonScoperEngine{}), withAbandoned(recorded([]string{"kd"}))
+		},
+		"unfiltered, not in the publication": func() (*Streamer, *scopeDriftApplier) {
+			return driftStreamer(t, src([]string{"kd", "nt"}, "kd"), nonScoperEngine{}), withAbandoned(recorded([]string{"kd"}))
+		},
+		"no record, not in a FOR TABLE publication": func() (*Streamer, *scopeDriftApplier) {
+			return driftStreamer(t, src([]string{"kd", "nt"}, "kd"), nonScoperEngine{}), withAbandoned(&scopeDriftApplier{})
+		},
+	} {
+		t.Run("cleared: "+name, func(t *testing.T) {
+			s, app := mk()
+			requireNoDrift(t, s.phaseRefuseIncludeTableScopeDrift(ctx, app, "st"))
+			if !cleared(app) {
+				t.Fatalf("writes %v; want the abandoned entry cleared", app.writes)
+			}
+		})
+	}
+	t.Run("a stale entry that is not abandoned is not cleared out of scope", func(t *testing.T) {
+		app := recorded([]string{"kd"})
+		app.pending = []ir.PendingAddedTable{{Table: "nt", Token: "t", StartedAt: abandoned.StartedAt, HeartbeatAt: abandoned.StartedAt}}
+		requireNoDrift(t, driftStreamer(t, src([]string{"kd", "nt"}, "kd", "nt"), nonScoperEngine{}, "kd").phaseRefuseIncludeTableScopeDrift(ctx, app, "st"))
+		if cleared(app) {
+			t.Fatal("cleared a dead add's entry; only --abandon retires it")
 		}
 	})
 }

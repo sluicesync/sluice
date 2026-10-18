@@ -40,8 +40,9 @@ var ErrIncludeTableScopeDrift = errors.New("INCLUDE-TABLE-SCOPE-DRIFT")
 var ErrIncludeTableAddInProgress = errors.New("INCLUDE-TABLE-ADD-IN-PROGRESS")
 
 // ErrPendingAddSuperseded classifies an add-table that found its own pending
-// entry gone or replaced: `sluice schema add-table --abandon` removed it, or a
-// re-run add took it over. The add stops without recording the table as
+// entry gone or replaced: `sluice schema add-table --abandon` marked it
+// abandoned (or a stream start then cleared it), or a re-run add took it
+// over. The add stops without recording the table as
 // established — its copy is not the one the stream will be told about.
 var ErrPendingAddSuperseded = errors.New("PENDING-ADD-SUPERSEDED")
 
@@ -91,6 +92,15 @@ type EstablishedTablesStore interface {
 
 	// RecordDroppedTables replaces the dropped set. The row must exist.
 	RecordDroppedTables(ctx context.Context, streamID string, tables []string) error
+
+	// NarrowEstablishedRecord is a resume's narrowing, as one row-locked
+	// read-modify-write of both sets (so a concurrent
+	// CompletePendingAddedTable cannot be lost between a read and a
+	// replace): established keeps only the entries in inScope, the rest move
+	// to dropped, and dropped loses the entries in gone (tables the source
+	// no longer has). It returns the entries that moved. A stream with no
+	// record, or a cold start in progress, is left alone.
+	NarrowEstablishedRecord(ctx context.Context, streamID string, inScope, gone []string) (leaving []string, err error)
 }
 
 // Pending add-table liveness. A running add-table refreshes its entry's
@@ -128,6 +138,18 @@ func (p PendingAddedTable) FromTheFuture(now time.Time) bool {
 	return p.HeartbeatAt.Sub(now) > PendingAddFutureTolerance
 }
 
+// PendingAddAbandonedToken is the token `sluice schema add-table --abandon`
+// writes over an entry. No add-table run draws it, so the abandoned add is
+// superseded ([ErrPendingAddSuperseded]) if it was still running.
+const PendingAddAbandonedToken = "ABANDONED"
+
+// Abandoned reports an entry `--abandon` retired. It is not removed: a
+// running stream may still be applying changes onto the table's partial
+// copy, so the entry stays — `sync health` reports ADD-TABLE ABANDONED — until
+// a stream open finds the table out of scope or not delivered, a re-run
+// add-table replaces it, or a cold start copies the table.
+func (p PendingAddedTable) Abandoned() bool { return p.Token == PendingAddAbandonedToken }
+
 // PendingAddedTablesStore is the optional [ChangeApplier] surface that
 // records, on the stream's row of the per-target `sluice_cdc_state` table,
 // the tables whose `sluice schema add-table` has started and not completed.
@@ -142,9 +164,11 @@ func (p PendingAddedTable) FromTheFuture(now time.Time) bool {
 // tracking ([ErrPendingAddSuperseded]). A failure leaves the entry, and
 // `sync start` refuses a warm resume whose scope includes the table instead
 // of streaming changes into a table whose copy never landed. A cold start
-// that copies the table, and `sluice schema add-table --abandon`, clear it.
+// that copies the table clears it; `sluice schema add-table --abandon` marks
+// it abandoned ([PendingAddedTable.Abandoned]) for a stream start to clear.
 //
-// Timestamps are the server's (NOW()), and reads return the server's now.
+// Timestamps are the control-table server's clock, read without any session
+// time-zone conversion, and reads return the server's now.
 // Implemented by the Postgres and MySQL-family appliers. The columns are
 // added on the first Record, not at every start.
 type PendingAddedTablesStore interface {
@@ -170,6 +194,11 @@ type PendingAddedTablesStore interface {
 	// ClearPendingAddedTables removes tables' entries whatever their tokens.
 	// Idempotent and tolerant of a missing row, table or column.
 	ClearPendingAddedTables(ctx context.Context, streamID string, tables []string) error
+
+	// AbandonPendingAddedTable rewrites table's entry as abandoned
+	// ([PendingAddedTable.Abandoned]): token [PendingAddAbandonedToken],
+	// heartbeat the epoch, start kept. A missing entry is nothing to abandon.
+	AbandonPendingAddedTable(ctx context.Context, streamID, table string) error
 
 	// ReadPendingAddedTables returns streamID's entries and the server's now:
 	// none when there is no row, no control table, or no column. A stored

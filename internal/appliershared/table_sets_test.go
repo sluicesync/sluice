@@ -126,3 +126,25 @@ func TestPendingEntryCodec(t *testing.T) {
 		t.Error("the sentinel must lead with NUL: no bare table name or namespace\\x00table key does")
 	}
 }
+
+// TestNarrowRecord is R4-4's arithmetic. The door read established {a, b}
+// and decided the scope is {a, c}; by the time the narrowing locks the row,
+// a concurrent `schema add-table c` has completed (established {a, b, c},
+// dropped without c). Computed from the locked values, c stays established
+// and only b moves; computed from the door's read — the round-4 replace —
+// c was overwritten away and its completed copy forgotten.
+func TestNarrowRecord(t *testing.T) {
+	est, drop, leaving := NarrowRecord([]string{"a", "b", "c"}, []string{"gone", "x"}, []string{"a", "c"}, []string{"gone"})
+	if !reflect.DeepEqual(est, []string{"a", "c"}) || !reflect.DeepEqual(drop, []string{"b", "x"}) || !reflect.DeepEqual(leaving, []string{"b"}) {
+		t.Fatalf("established %q dropped %q leaving %q; want [a c] [b x] [b]", est, drop, leaving)
+	}
+	// A leaving table the source no longer has is forgotten, not dropped.
+	est, drop, leaving = NarrowRecord([]string{"a", "b"}, nil, []string{"a"}, []string{"b"})
+	if !reflect.DeepEqual(est, []string{"a"}) || len(drop) != 0 || !reflect.DeepEqual(leaving, []string{"b"}) {
+		t.Fatalf("established %q dropped %q leaving %q", est, drop, leaving)
+	}
+	// Narrowing to nothing records the empty set, not "no record".
+	if est, _, _ := NarrowRecord([]string{"a"}, nil, nil, nil); est == nil || len(est) != 0 {
+		t.Fatalf("established %#v; want the empty, non-nil set", est)
+	}
+}

@@ -769,7 +769,8 @@ func (r *scopeDriftRig) setPending(table string, heartbeat time.Time) {
 // TestIncludeTableScopeDrift_PendingLivenessInHealthAndAbandon is F1: `sync
 // health` reports an add-table that is still running as in progress (exit 0),
 // one whose heartbeat went stale as ADD-TABLE INCOMPLETE (exit 1), and
-// `schema add-table --abandon` clears it.
+// `schema add-table --abandon` marks it abandoned (exit 1) until the next
+// stream open, which finds nt out of scope and clears it.
 func TestIncludeTableScopeDrift_PendingLivenessInHealthAndAbandon(t *testing.T) {
 	src, tgt, cleanup := startPostgresLogical(t)
 	defer cleanup()
@@ -796,8 +797,14 @@ func TestIncludeTableScopeDrift_PendingLivenessInHealthAndAbandon(t *testing.T) 
 	if got, _ := r.waitScalar(src, "SELECT COUNT(*)::text FROM pg_replication_slots WHERE slot_name = 'sluice_addtable_nt'", "0", 0); got != "0" {
 		t.Fatalf("--abandon left the dead add's snapshot slot behind (count %s)\n%s%s", got, stdout, stderr)
 	}
+	// R4-1: the entry stays, ABANDONED, until a stream open judges nt; this
+	// stream's scope is kd alone, so the restart clears it.
+	if code, out := r.health(); code != 1 || !strings.Contains(out, "pending_added_table: nt abandoned") {
+		t.Fatalf("health after --abandon: exit %d, want 1 with the entry abandoned\n%s", code, out)
+	}
+	requireStreaming(t, r.startSync("kd"), 8*time.Second, "restart with the abandoned table out of scope")
 	if code, out := r.health(); code != 0 || strings.Contains(out, "pending_added_table") {
-		t.Fatalf("health after --abandon: exit %d\n%s", code, out)
+		t.Fatalf("health after the restart: exit %d\n%s", code, out)
 	}
 }
 
@@ -991,4 +998,121 @@ func TestIncludeTableScopeDrift_MultiDatabaseRemedyIsTheRecopy(t *testing.T) {
 	if !strings.Contains(log, "re-copy the stream with --restart-from-scratch") || strings.Contains(log, "run `sluice schema add-table") {
 		t.Fatal("the multi-database refusal must name the re-copy, not add-table")
 	}
+}
+
+// TestIncludeTableScopeDrift_AbandonKeepsHealthRedUntilARestartJudgesIt is
+// R4-1. A dead add-table left nt in a publication a same-database peer slot
+// shares, so `--abandon` cannot take it out, and a running stream would keep
+// applying nt's changes onto the partial copy. --abandon therefore leaves the
+// entry, ABANDONED: `sync health` exits 1 saying to restart the stream; a
+// restart that would apply nt's changes refuses, naming the abandon; and a
+// restart that applies nothing onto nt (it is out of scope) clears the entry
+// and health goes green. Before R4-1 --abandon deleted the entry and health
+// went green at once, with the stream still applying into the partial copy.
+func TestIncludeTableScopeDrift_AbandonKeepsHealthRedUntilARestartJudgesIt(t *testing.T) {
+	src, tgt, cleanup := startPostgresLogical(t)
+	defer cleanup()
+	r := newScopeDriftRig(t, "postgres", src, tgt)
+	r.establishKD("")
+	r.exec(src, "CREATE TABLE nt (id INT PRIMARY KEY, e VARCHAR(20)); INSERT INTO nt VALUES (1, 'x'), (2, 'y')")
+	r.exec(tgt, "CREATE TABLE nt (id INT PRIMARY KEY, e VARCHAR(20)); INSERT INTO nt VALUES (1, 'x')") // the partial copy
+	// The dead add's state: nt in the publication, its entry stale, and a
+	// peer stream's slot on the same database, which makes the publication
+	// shared, so --abandon leaves nt in it.
+	r.exec(src, "ALTER PUBLICATION sluice_pub ADD TABLE nt")
+	r.exec(src, "SELECT pg_catalog.pg_create_logical_replication_slot('sluice_peer', 'pgoutput')")
+	defer r.exec(src, "SELECT pg_catalog.pg_drop_replication_slot('sluice_peer')")
+	r.setPending("nt", time.Now().Add(-ir.PendingAddStaleAfter-time.Minute))
+
+	args := append([]string{"schema", "add-table", "nt", "--abandon", "--yes"}, r.connArgs()...)
+	stdout, stderr, code := runSluice(t, r.bin, append(args, "--stream-id="+r.streamID)...)
+	if code != 0 || !strings.Contains(stdout+stderr, "RESTART THE STREAM") {
+		t.Fatalf("add-table --abandon: exit %d, want 0 telling the operator to restart the stream\n%s%s", code, stdout, stderr)
+	}
+	if code, out := r.health(); code != 1 || !strings.Contains(out, "ADD-TABLE ABANDONED: restart the stream") || !strings.Contains(out, "may be partial") {
+		t.Fatalf("health after --abandon: exit %d, want 1 with ADD-TABLE ABANDONED\n%s", code, out)
+	}
+
+	r.requireScopeDriftRefusal(r.startSync(""), "nt", "was abandoned")
+	if got := r.rows(tgt, "nt", "e"); got != "1|x" {
+		t.Fatalf("the refused restart applied into nt: %q", got)
+	}
+	if code, _ := r.health(); code != 1 {
+		t.Fatal("a refused restart cleared the abandoned entry")
+	}
+
+	run := r.startSync("", "--exclude-table=nt")
+	requireStreaming(t, run, 8*time.Second, "restart with the abandoned table out of scope")
+	if code, out := r.health(); code != 0 || strings.Contains(out, "pending_added_table") {
+		t.Fatalf("health after a restart that applies nothing onto nt: exit %d, want 0 with the entry cleared\n%s", code, out)
+	}
+}
+
+// TestIncludeTableScopeDrift_RestartFromScratchRefusesBeforeDropping is R4-2:
+// a deterministic refusal must precede the drop. A Postgres → MySQL stream's
+// source table gains a `bytea[]` column while it is stopped, which the
+// CDC-lane array-bytes preflight refuses against a MySQL target. The
+// --restart-from-scratch re-copy refuses on it — and the target's rows must
+// still be there, and the record must not read "cold start in progress".
+// Before R4-2 the preflight ran after the restart branch's drop, so the target
+// table was gone and every re-run dropped and refused again.
+func TestIncludeTableScopeDrift_RestartFromScratchRefusesBeforeDropping(t *testing.T) {
+	src, _, pgCleanup := startPostgresLogical(t)
+	defer pgCleanup()
+	_, tgt, myCleanup := startMySQL(t)
+	defer myCleanup()
+	bin := scopeDriftBinary(t)
+	pg := newScopeDriftRigWith(t, bin, "postgres", src, tgt)
+	my := newScopeDriftRigWith(t, bin, "mysql", src, tgt)
+	logDir := t.TempDir()
+	runs := 0
+	start := func(extra ...string) *straddleBinaryRun {
+		runs++
+		args := append([]string{
+			"--log-level=info", "--no-progress", "sync", "start", "--source-driver=postgres", "--source=" + src,
+			"--target-driver=mysql", "--target=" + tgt, "--stream-id=r42", "--slot-name=r42",
+		}, extra...)
+		run := &straddleBinaryRun{t: t, bin: bin, args: args, logPath: filepath.Join(logDir, fmt.Sprintf("r42-%d.log", runs))}
+		run.start()
+		t.Cleanup(run.end)
+		return run
+	}
+
+	pg.exec(src, "CREATE TABLE kd (id INT PRIMARY KEY, k VARCHAR(20)); INSERT INTO kd VALUES (1, 'a'), (2, 'b')")
+	run := start()
+	if got, ok := my.waitRows(tgt, "kd", "k", "1|a,2|b", 120*time.Second); !ok {
+		t.Fatalf("cold start: target kd = %q%s", got, run.logTail())
+	}
+	pg.exec(src, "INSERT INTO kd VALUES (3, 'c')")
+	if got, ok := my.waitRows(tgt, "kd", "k", "1|a,2|b,3|c", 60*time.Second); !ok {
+		t.Fatalf("cdc: target kd = %q%s", got, run.logTail())
+	}
+	run.end()
+	time.Sleep(2 * time.Second)
+
+	pg.exec(src, "ALTER TABLE kd ADD COLUMN blobs bytea[]")
+	if stdout, stderr, code := runSluice(t, bin, "slot", "drop", "sluice_r42", "--source-driver=postgres", "--source="+src, "--yes"); code != 0 {
+		t.Fatalf("slot drop: exit %d\n%s%s", code, stdout, stderr)
+	}
+	run = start("--restart-from-scratch")
+	if !waitExit(run, 120*time.Second) || !strings.Contains(scopeDriftLog(t, run), "cannot be applied faithfully") {
+		t.Fatalf("--restart-from-scratch with a bytea[] column against MySQL: want the array-bytes refusal%s", run.logTail())
+	}
+	if got := my.rows(tgt, "kd", "k"); got != "1|a,2|b,3|c" {
+		t.Fatalf("target kd = %q after the refusal, want 1|a,2|b,3|c: the re-copy dropped the target before refusing%s", got, run.logTail())
+	}
+	if got, _ := my.waitScalar(tgt, "SELECT COUNT(*) FROM sluice_cdc_state WHERE stream_id = 'r42' AND established_tables LIKE '%cold-start-in-progress%'", "0", 0); got != "0" {
+		t.Fatalf("the refused re-copy marked the record in progress (count %s) although it changed nothing", got)
+	}
+}
+
+// newScopeDriftRigWith is a rig on an explicit binary, for a cross-engine
+// pair where each side needs its own SQL driver.
+func newScopeDriftRigWith(t *testing.T, bin, driver, src, tgt string) *scopeDriftRig {
+	t.Helper()
+	sqlDriver := "pgx"
+	if driver == "mysql" {
+		sqlDriver = "mysql"
+	}
+	return &scopeDriftRig{t: t, bin: bin, driver: driver, sqlDriver: sqlDriver, src: src, tgt: tgt, streamID: "r42", logDir: t.TempDir()}
 }

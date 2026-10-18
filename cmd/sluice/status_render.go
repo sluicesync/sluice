@@ -108,7 +108,7 @@ func writePendingAddedTablesText(ctx context.Context, out io.Writer, applier ir.
 	if !ok || opts.Format == "json" {
 		return nil
 	}
-	header := false
+	header, abandoned := false, false
 	for _, st := range streams {
 		pending, now, err := store.ReadPendingAddedTables(ctx, st.StreamID)
 		if err != nil {
@@ -125,13 +125,23 @@ func writePendingAddedTablesText(ctx context.Context, out io.Writer, applier ir.
 		}
 		parts := make([]string, 0, len(pending))
 		for _, p := range pending {
-			state := "stopped without completing"
-			if p.Fresh(now) {
-				state = "in progress"
+			switch {
+			case p.Abandoned():
+				abandoned = true
+				parts = append(parts, p.Table+" (abandoned: restart the stream)")
+				continue
+			case p.Fresh(now):
+				parts = append(parts, fmt.Sprintf("%s (in progress, heartbeat %s ago)", p.Table, now.Sub(p.HeartbeatAt).Round(time.Second)))
+			default:
+				parts = append(parts, fmt.Sprintf("%s (stopped without completing, heartbeat %s ago)", p.Table, now.Sub(p.HeartbeatAt).Round(time.Second)))
 			}
-			parts = append(parts, fmt.Sprintf("%s (%s, heartbeat %s ago)", p.Table, state, now.Sub(p.HeartbeatAt).Round(time.Second)))
 		}
 		if _, err := fmt.Fprintf(out, "  %s: %s\n", st.StreamID, strings.Join(parts, ", ")); err != nil {
+			return err
+		}
+	}
+	if abandoned {
+		if _, err := fmt.Fprintf(out, "remedy (abandoned): %s\n", pendingAddedTablesAbandonedRemedy); err != nil {
 			return err
 		}
 	}

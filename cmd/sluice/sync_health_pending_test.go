@@ -45,3 +45,32 @@ func TestApplyPendingAddsHealth(t *testing.T) {
 		t.Fatalf("the error names %q", err.Error())
 	}
 }
+
+// TestApplyPendingAddsHealth_Abandoned is R4-1: an entry `--abandon` retired
+// is not removed, and it trips `sync health` with ADD-TABLE ABANDONED and a
+// remedy that says to restart the stream — the only thing that judges the
+// table — and that the target table may be partial.
+func TestApplyPendingAddsHealth_Abandoned(t *testing.T) {
+	now := time.Now()
+	abandoned := ir.PendingAddedTable{Table: "gone", Token: ir.PendingAddAbandonedToken, StartedAt: now.Add(-time.Hour), HeartbeatAt: time.Unix(0, 0)}
+	r := HealthResult{Found: true}
+	applyPendingAddsHealth(&r, []ir.PendingAddedTable{abandoned}, now)
+	if !r.PendingAddedTablesTripped || !r.PendingAddedTablesAbandoned || !r.PendingAddedTables[0].Abandoned || r.PendingAddedTables[0].InProgress {
+		t.Fatalf("an abandoned entry: %+v; want tripped and abandoned", r)
+	}
+	var out bytes.Buffer
+	if err := renderHealthText(&out, r); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"ADD-TABLE ABANDONED: restart the stream", "pending_added_table: gone abandoned", "may be partial"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("health text lacks %q:\n%s", want, out.String())
+		}
+	}
+	if strings.Contains(out.String(), "pending_added_tables_remedy:") {
+		t.Fatalf("an abandoned-only result printed the --abandon remedy, which would loop:\n%s", out.String())
+	}
+	if err := (pendingAddedTablesError{streamID: "st", result: r}); !strings.Contains(err.Error(), "ADD-TABLE ABANDONED: restart the stream") {
+		t.Fatalf("the error: %q", err.Error())
+	}
+}

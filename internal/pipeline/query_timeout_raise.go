@@ -96,6 +96,11 @@ func autoRevertDanglingQueryTimeoutRaise(ctx context.Context, controller ir.Quer
 // The revert closure is idempotent-safe and runs on an uncancellable,
 // timeout-bounded context so an aborting copy still restores the keyspace.
 //
+// The two refusals are [preflightQueryTimeoutRaise], which a sync cold start
+// also runs before its gate: they are deterministic, so they must precede the
+// target drop of --restart-from-scratch / --reset-target-data rather than
+// follow it (Bug 321 R4-2).
+//
 // armed-but-no-controller and armed-but-no-recorder BOTH refuse loudly rather
 // than silently no-op — the operator explicitly asked for the raise and should
 // learn why it can't happen. (The CLI already refuses a flag set without a
@@ -106,12 +111,8 @@ func maybeRaiseQueryTimeout(ctx context.Context, armed bool, controller ir.Query
 	if !armed {
 		return nil, nil
 	}
-	if controller == nil {
-		return nil, errors.New("pipeline: --planetscale-raise-query-timeout is set but no PlanetScale control-plane controller is available " +
-			"(non-planetscale target, or missing --planetscale-org / service token)")
-	}
-	if recorder == nil {
-		return nil, errors.New("pipeline: --planetscale-raise-query-timeout requires a target that can record the raise crash-safely, which this target does not provide")
+	if err := preflightQueryTimeoutRaise(armed, controller, recorder); err != nil {
+		return nil, err
 	}
 
 	// Size gate: two rolling restarts for a small copy are worse than the wall
@@ -151,6 +152,22 @@ func maybeRaiseQueryTimeout(ctx context.Context, armed bool, controller ir.Query
 	}
 
 	return func() { revertQueryTimeoutRaise(ctx, controller, recorder, recordKey) }, nil
+}
+
+// preflightQueryTimeoutRaise is the raise's deterministic refusals: armed
+// with no controller, or with no recorder. nil when unarmed.
+func preflightQueryTimeoutRaise(armed bool, controller ir.QueryTimeoutController, recorder ir.QueryTimeoutRaiseRecorder) error {
+	if !armed {
+		return nil
+	}
+	if controller == nil {
+		return errors.New("pipeline: --planetscale-raise-query-timeout is set but no PlanetScale control-plane controller is available " +
+			"(non-planetscale target, or missing --planetscale-org / service token)")
+	}
+	if recorder == nil {
+		return errors.New("pipeline: --planetscale-raise-query-timeout requires a target that can record the raise crash-safely, which this target does not provide")
+	}
+	return nil
 }
 
 // revertQueryTimeoutRaise restores the keyspace query timeout to the recorded
