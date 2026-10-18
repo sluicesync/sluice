@@ -1359,8 +1359,10 @@ func TestIncludeTableScopeDrift_ExcludeOfAnAddedTableRefuses(t *testing.T) {
 // --no-drain` (which cannot know the stream's flags, and completes). Before
 // R6-S1 the stream kept running green and target tmp_keep stayed at its copy
 // while the source changed. Now the running stream stops with the refusal
-// within its poll interval; the same restart refuses before applying
-// anything; `--abandon` takes the table out and the stream runs.
+// within its poll interval, having recorded the table as dropped (R8); a
+// restart that only narrows the exclusion refuses (R7-S1: before R8 it
+// streamed the table onto a copy missing the window's changes, at exit 0);
+// emptying the target table and adding it again converges.
 func liveAddOfAnExcludedTable(t *testing.T, r *scopeDriftRig) {
 	t.Helper()
 	r.exec(r.src, "CREATE TABLE kd (id INT PRIMARY KEY, k VARCHAR(20)); INSERT INTO kd VALUES (1, 'a');"+
@@ -1373,20 +1375,34 @@ func liveAddOfAnExcludedTable(t *testing.T, r *scopeDriftRig) {
 	if got, ok := r.waitRows(r.tgt, "kd", "k", "1|a,2|b", 60*time.Second); !ok {
 		t.Fatalf("cdc: target kd = %q%s", got, run.logTail())
 	}
-	if code, out := r.addTable("tmp_keep", "--no-drain"); code != 0 {
+	// The add cannot know the stream's flags. It usually completes before the
+	// poll sees it; if the stream's refusal abandons it first, it stops with
+	// PENDING-ADD-SUPERSEDED (R8). Either is correct.
+	if code, out := r.addTable("tmp_keep", "--no-drain"); code != 0 && !strings.Contains(out, "PENDING-ADD-SUPERSEDED") {
 		t.Fatalf("schema add-table tmp_keep --no-drain: exit %d\n%s", code, out)
 	}
 	r.exec(r.src, "UPDATE tmp_keep SET e = 'changed' WHERE id = 1")
-	requireLiveAddedExcludedRefusal(t, run, "tmp_keep", "stopped as soon as it saw the add", "redo its copy")
+	requireLiveAddedExcludedRefusal(t, run, "tmp_keep", "stopped when it saw the add", "recorded the table as dropped")
 
-	requireLiveAddedExcludedRefusal(t, r.startSync("", "--exclude-table=tmp_*"), "tmp_keep", "Nothing has been applied by this run")
+	// R8: narrowing the exclusion alone must not bring the table back — its
+	// changes in the window before the stop were discarded. Before R8 this
+	// restart streamed it onto the incomplete copy at exit 0.
+	r.requireScopeDriftRefusal(r.startSync(""), "tmp_keep", scopeDriftReasonDropped)
 
-	r.abandonAdd("tmp_keep")
-	run = r.startSync("", "--exclude-table=tmp_*")
-	requireStreaming(t, run, 8*time.Second, "restart after --abandon took the excluded table out")
-	r.exec(r.src, "INSERT INTO kd VALUES (3, 'c')")
+	// The remedy the refusal names: empty the target table, add it again,
+	// restart without the exclusion. It converges.
+	r.exec(r.tgt, "DELETE FROM tmp_keep")
+	if code, out := r.addTable("tmp_keep"); code != 0 {
+		t.Fatalf("schema add-table tmp_keep (the remedy): exit %d\n%s", code, out)
+	}
+	run = r.startSync("")
+	requireStreaming(t, run, 8*time.Second, "restart after the remedy re-copied the table")
+	r.exec(r.src, "INSERT INTO tmp_keep VALUES (3, 'z'); INSERT INTO kd VALUES (3, 'c')")
+	if got, ok := r.waitRows(r.tgt, "tmp_keep", "e", "1|changed,2|y,3|z", 60*time.Second); !ok {
+		t.Fatalf("after the remedy: target tmp_keep = %q, want 1|changed,2|y,3|z%s", got, run.logTail())
+	}
 	if got, ok := r.waitRows(r.tgt, "kd", "k", "1|a,2|b,3|c", 60*time.Second); !ok {
-		t.Fatalf("kd after --abandon: target kd = %q%s", got, run.logTail())
+		t.Fatalf("after the remedy: target kd = %q%s", got, run.logTail())
 	}
 }
 

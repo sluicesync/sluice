@@ -110,7 +110,12 @@ func TestLiveAddedExcluded_RunningStreamStops(t *testing.T) {
 	base := migcore.TableFilter{Exclude: []string{"tmp_*"}}
 	live := &liveAddedFilter{}
 	reader := &fakeLiveAddedReader{}
-	go pollLiveAddedTables(ctx, reader, liveAddedCheck{streamID: "st", base: base, source: "postgres", target: "postgres"}, live)
+	retired := make(chan []string, 1)
+	check := liveAddedCheck{
+		streamID: "st", base: base, source: "postgres", target: "postgres",
+		retire: func(_ context.Context, tables []string) error { retired <- tables; return nil },
+	}
+	go pollLiveAddedTables(ctx, reader, check, live)
 
 	in := make(chan ir.Change, 8)
 	out := filterChangesWithLiveAdd(ctx, in, base, live)
@@ -138,10 +143,22 @@ func TestLiveAddedExcluded_RunningStreamStops(t *testing.T) {
 	if !errors.Is(err, ir.ErrIncludeTableScopeDrift) {
 		t.Fatalf("refusal = %v", err)
 	}
-	for _, want := range []string{LiveAddedTableExcludedMarker, "tmp_keep", "stopped as soon as it saw the add", "redo its copy"} {
+	for _, want := range []string{
+		LiveAddedTableExcludedMarker, "tmp_keep", "stopped when it saw the add", "recorded the table as dropped",
+		"only narrows the exclusion refuses", "--source-driver postgres --source <SOURCE-DSN>",
+	} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("refusal lacks %q: %v", want, err)
 		}
+	}
+	// R8: the refusal was written to the control row, before it was raised.
+	select {
+	case got := <-retired:
+		if !reflect.DeepEqual(got, []string{"tmp_keep"}) {
+			t.Errorf("retired %v, want [tmp_keep]", got)
+		}
+	default:
+		t.Error("the running refusal did not record the excluded table as dropped (RetireLiveAddedTables)")
 	}
 	if live.Contains("tmp_keep") {
 		t.Error("the contradicting set was installed")
@@ -150,5 +167,28 @@ func TestLiveAddedExcluded_RunningStreamStops(t *testing.T) {
 	s.liveFilterRef.Store(live)
 	if !s.interceptErrorPending() {
 		t.Error("interceptErrorPending misses the refusal, so a reshard reopen could run past it")
+	}
+}
+
+// TestLiveAddedExcluded_RetireFailureStillStops is R8's failure arm: a
+// control-row write that fails does not keep the stream running; the
+// refusal says the narrowed-exclusion restart is unprotected.
+func TestLiveAddedExcluded_RetireFailureStillStops(t *testing.T) {
+	live := &liveAddedFilter{}
+	check := liveAddedCheck{
+		streamID: "st", base: migcore.TableFilter{Exclude: []string{"tmp_*"}}, source: "mysql", target: "mysql",
+		retire: func(context.Context, []string) error { return errors.New("control row unwritable") },
+	}
+	if observeLiveAdded(context.Background(), check, live, []string{"tmp_keep"}) {
+		t.Fatal("the contradiction was installed")
+	}
+	err := live.refusalErr()
+	if err == nil {
+		t.Fatal("a failed control-row write kept the stream running")
+	}
+	for _, want := range []string{"FAILED", "control row unwritable", "narrows --exclude-table"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal lacks %q: %v", want, err)
+		}
 	}
 }

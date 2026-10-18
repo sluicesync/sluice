@@ -72,7 +72,7 @@ func (s *Streamer) buildDryRunPlan(ctx context.Context, streamID string, persist
 	migcore.ApplyVerbatimExtensionPassthrough(sr, verbatimLiveSameEnginePG(s.Source, s.Target))
 	// catalog Bug 76: scope per-column type validation to the filtered
 	// table set (s.Filter already has engine defaults merged in Run).
-	scopeTally := migcore.ApplyTableScopeTallied(sr, s.Filter)
+	scopeTally := migcore.ApplyTableScopeTallied(sr, s.copyFilter())
 	schema, err := sr.ReadSchema(ctx)
 	if err != nil {
 		return nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: dry-run: read source schema: %w", err))
@@ -92,13 +92,13 @@ func (s *Streamer) buildDryRunPlan(ctx context.Context, streamID string, persist
 		plan.noSourceTables = true
 		return plan, nil
 	}
-	if err := migcore.ApplyTableFilter(ctx, schema, s.Filter); err != nil {
+	if err := migcore.ApplyTableFilter(ctx, schema, s.copyFilter()); err != nil {
 		return nil, err
 	}
 	applyViewFilter(ctx, schema, s.ViewFilter, s.SkipViews)
 	// ADR-0143: mirror the cold-start ORM-table skip so the dry-run preview
 	// honestly reflects what a real run would copy.
-	applyORMTableSkip(ctx, schema, s.SkipORMTables, s.Filter)
+	applyORMTableSkip(ctx, schema, s.SkipORMTables, s.copyFilter())
 	mapped, err := translate.ApplyMappings(schema, s.Mappings)
 	if err != nil {
 		return nil, fmt.Errorf("pipeline: dry-run: apply mappings: %w", err)

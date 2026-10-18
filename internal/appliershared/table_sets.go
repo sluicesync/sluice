@@ -753,6 +753,127 @@ func NarrowEstablished(ctx context.Context, db *sql.DB, cfg *ControlTableConfig,
 	return leaving, nil
 }
 
+// RetireQueries are the statements [RetireLiveAddedTables] runs: the three
+// record columns and the live-added set of one row, read under a lock and
+// written in one UPDATE.
+type RetireQueries struct {
+	// ReadForUpdate is `SELECT pending_added_tables, established_tables,
+	// dropped_tables, live_added_tables … WHERE stream_id = <p1> FOR UPDATE`.
+	ReadForUpdate string
+	// Update is `UPDATE … SET pending_added_tables = <p1>, established_tables
+	// = <p2>, dropped_tables = <p3>, live_added_tables = <p4> WHERE stream_id
+	// = <p5>`.
+	Update string
+}
+
+// LiveAddedCodec is an engine's live_added_tables encoding (MySQL keeps a
+// comma list, Postgres the table-set codec). Encode returns nil for the
+// empty set.
+type LiveAddedCodec struct {
+	Decode func(stored string) ([]string, error)
+	Encode func(tables []string) any
+}
+
+// RetireLiveAddedTables is [ir.LiveAddedTableRetirer]: in one row-locked
+// transaction, each of tables has its pending add-table entry marked
+// abandoned (its token invalidated, so a still-running add stops with
+// PENDING-ADD-SUPERSEDED and records nothing), leaves the established set
+// for the dropped set (it joins dropped even when its add had not completed:
+// its changes were discarded either way), and leaves the live-added set.
+// Afterwards the table returns only through a fresh `schema add-table` onto
+// an emptied target table, or a cold start that copies it; every other
+// admit refuses as dropped. No row is nothing to retire; the established
+// half is skipped for a stream with no record, a cold start in progress, or
+// a multi-database record. The caller has ensured the columns exist.
+func RetireLiveAddedTables(ctx context.Context, db *sql.DB, cfg *ControlTableConfig, q RetireQueries, live LiveAddedCodec, streamID string, tables []string) (err error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("%s: retire live-added tables: begin: %w", cfg.EngineName, err)
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+	var pendingCol, establishedCol, droppedCol, liveCol sql.NullString
+	switch serr := tx.QueryRowContext(ctx, q.ReadForUpdate, streamID).Scan(&pendingCol, &establishedCol, &droppedCol, &liveCol); {
+	case errors.Is(serr, sql.ErrNoRows):
+		return tx.Rollback()
+	case serr != nil:
+		return fmt.Errorf("%s: retire live-added tables: %w", cfg.EngineName, serr)
+	}
+
+	pendingNext := nullableString(pendingCol)
+	if pendingCol.Valid {
+		pending, err := DecodeTableSet(pendingCol.String)
+		if err != nil {
+			return fmt.Errorf("%s: retire live-added tables: %w", cfg.EngineName, undecodable(PendingAddedTablesColumn, pendingCol.String, err))
+		}
+		pset := toEntrySet(pending)
+		for _, t := range tables {
+			if next, changed := PendingAbandon(t).Apply(pset, true, time.Time{}); changed {
+				pset = next
+			}
+		}
+		pendingNext = encodeNext(pset)
+	}
+
+	establishedNext, droppedNext := nullableString(establishedCol), nullableString(droppedCol)
+	if establishedCol.Valid {
+		est, ids, err := DecodeTableSetIDs(establishedCol.String)
+		if err != nil {
+			return fmt.Errorf("%s: retire live-added tables: %w", cfg.EngineName, undecodable(EstablishedTablesColumn, establishedCol.String, err))
+		}
+		if !inProgressOrMultiDatabase(est) {
+			drop, err := DecodeTableSet(droppedCol.String)
+			if err != nil {
+				return fmt.Errorf("%s: retire live-added tables: %w", cfg.EngineName, undecodable(DroppedTablesColumn, droppedCol.String, err))
+			}
+			eset, dset := toEntrySet(est), toEntrySet(drop)
+			for _, t := range tables {
+				delete(eset, t)
+				delete(ids, t)
+				dset[t] = struct{}{}
+			}
+			establishedNext = EncodeTableSetIDs(entriesOf(eset), ids)
+			droppedNext = EncodeTableSet(entriesOf(dset))
+		}
+	}
+
+	liveNext := nullableString(liveCol)
+	if liveCol.Valid {
+		current, err := live.Decode(liveCol.String)
+		if err != nil {
+			return fmt.Errorf("%s: retire live-added tables: %w", cfg.EngineName, undecodable("live_added_tables", liveCol.String, err))
+		}
+		leaving := toEntrySet(tables)
+		kept := make([]string, 0, len(current))
+		for _, t := range current {
+			if _, gone := leaving[t]; !gone {
+				kept = append(kept, t)
+			}
+		}
+		liveNext = live.Encode(kept)
+	}
+	if _, err := tx.ExecContext(ctx, q.Update, pendingNext, establishedNext, droppedNext, liveNext, streamID); err != nil {
+		return fmt.Errorf("%s: retire live-added tables: %w", cfg.EngineName, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("%s: retire live-added tables: commit: %w", cfg.EngineName, err)
+	}
+	return nil
+}
+
+// entriesOf is a set's entries, sorted.
+func entriesOf(set map[string]struct{}) []string {
+	out := make([]string, 0, len(set))
+	for e := range set {
+		out = append(out, e)
+	}
+	sort.Strings(out)
+	return out
+}
+
 func nullableString(s sql.NullString) any {
 	if !s.Valid {
 		return nil

@@ -230,3 +230,34 @@ func (a *ChangeApplier) RecordEstablishedTables(ctx context.Context, streamID st
 func (a *ChangeApplier) RecordDroppedTables(ctx context.Context, streamID string, tables []string) error {
 	return a.updateTableSet(ctx, streamID, appliershared.DroppedTablesColumn, true, true, appliershared.EstablishedReplace(tables))
 }
+
+var _ ir.LiveAddedTableRetirer = (*ChangeApplier)(nil)
+
+// RetireLiveAddedTables implements [ir.LiveAddedTableRetirer]: the running
+// stream's LIVE-ADDED-TABLE-EXCLUDED write ([appliershared.RetireLiveAddedTables])
+// over this engine's comma-list live_added_tables.
+func (a *ChangeApplier) RetireLiveAddedTables(ctx context.Context, streamID string, tables []string) error {
+	if err := a.ensureTableSetColumns(ctx, streamID); err != nil {
+		return err
+	}
+	if err := ensureLiveAddedTablesColumn(ctx, a.db, a.controlKeyspace); err != nil {
+		return err
+	}
+	ref := controlTableRef(a.controlKeyspace, controlTableName)
+	q := appliershared.RetireQueries{
+		ReadForUpdate: "SELECT " + appliershared.PendingAddedTablesColumn + ", " + appliershared.EstablishedTablesColumn + ", " +
+			appliershared.DroppedTablesColumn + ", live_added_tables FROM " + ref + " WHERE stream_id = ? FOR UPDATE",
+		Update: "UPDATE " + ref + " SET " + appliershared.PendingAddedTablesColumn + " = ?, " + appliershared.EstablishedTablesColumn +
+			" = ?, " + appliershared.DroppedTablesColumn + " = ?, live_added_tables = ? WHERE stream_id = ?",
+	}
+	codec := appliershared.LiveAddedCodec{
+		Decode: func(stored string) ([]string, error) { return parseLiveAddedTables(stored), nil },
+		Encode: func(tables []string) any {
+			if len(tables) == 0 {
+				return nil
+			}
+			return strings.Join(tables, ",")
+		},
+	}
+	return appliershared.RetireLiveAddedTables(ctx, a.db, controlCfg, q, codec, streamID, tables)
+}

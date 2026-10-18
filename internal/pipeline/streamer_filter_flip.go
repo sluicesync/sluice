@@ -30,6 +30,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -357,38 +358,67 @@ type liveAddedCheck struct {
 	streamID       string
 	base           migcore.TableFilter
 	source, target string // engine names
+
+	// retire records a running stream's refusal on the control row
+	// ([ir.LiveAddedTableRetirer]); nil when the target cannot.
+	retire func(ctx context.Context, tables []string) error
 }
 
 // liveAddedCheckFor is the stream's [liveAddedCheck].
-func (s *Streamer) liveAddedCheckFor(streamID string) liveAddedCheck {
-	return liveAddedCheck{streamID: streamID, base: s.Filter, source: s.Source.Name(), target: s.Target.Name()}
+func (s *Streamer) liveAddedCheckFor(streamID string, applier ir.ChangeApplier) liveAddedCheck {
+	c := liveAddedCheck{streamID: streamID, base: s.Filter, source: s.Source.Name(), target: s.Target.Name()}
+	if r, ok := applier.(ir.LiveAddedTableRetirer); ok {
+		c.retire = func(ctx context.Context, tables []string) error {
+			return r.RetireLiveAddedTables(ctx, streamID, tables)
+		}
+	}
+	return c
 }
 
-// refusal is the LIVE-ADDED-TABLE-EXCLUDED refusal of tables. It carries
-// [ir.ErrIncludeTableScopeDrift]: a restart reads the same control row and
-// the same flags, so it is terminal, and in the fleet supervisor's
-// do-not-restart roster. running says the stream stopped mid-run rather than
-// at its start.
-func (c liveAddedCheck) refusal(tables []string, running bool) error {
-	list := strings.Join(tables, ", ")
-	what := "Nothing has been applied by this run."
-	if running {
-		// The poll sees the add up to one poll interval after it was
-		// recorded; changes in between were dropped as excluded, so keeping
-		// the table needs its copy redone, not just the flag narrowed.
-		what = fmt.Sprintf("The running stream stopped as soon as it saw the add, forwarding nothing it received after "+
-			"that; changes to the table that reached it between the add and that moment (at most one poll interval, the "+
-			"window every live add has — ADR-0034) were dropped as excluded, so to keep the table, also redo its copy: "+
-			"empty the target table and run `sluice schema add-table <table> --source-driver %s --source <SOURCE-DSN> --target-driver %s --target <TARGET-DSN> --stream-id %s --yes` "+
-			"once --exclude-table no longer names it.", c.source, c.target, c.streamID)
+// refusal is the LIVE-ADDED-TABLE-EXCLUDED refusal of tables at a start. It
+// carries [ir.ErrIncludeTableScopeDrift]: a restart reads the same control
+// row and the same flags, so it is terminal, and in the fleet supervisor's
+// do-not-restart roster.
+func (c liveAddedCheck) refusal(tables []string) error {
+	return c.refusalWith(tables, fmt.Sprintf("Decide which you meant: to keep the table, narrow --exclude-table so no "+
+		"pattern matches it; to take it out, run `sluice schema add-table <table> --abandon --source-driver %s --source <SOURCE-DSN> --target-driver %s --target <TARGET-DSN> --stream-id %s --yes`, "+
+		"which removes it from the live-added set. Then start again. Nothing has been applied by this run.",
+		c.source, c.target, c.streamID))
+}
+
+// runningRefusal is the refusal a running stream stops with, after
+// [liveAddedCheck.retire] wrote retireErr's outcome (R8): the table's
+// changes in the window between the add and the poll that saw it were
+// discarded as excluded while other tables' changes moved the persisted
+// position past them, so narrowing the exclusion must not bring it back
+// without a fresh copy. The retire makes the stream's record say so.
+func (c liveAddedCheck) runningRefusal(tables []string, retireErr error) error {
+	addCmd := fmt.Sprintf("`sluice schema add-table <table> --source-driver %s --source <SOURCE-DSN> --target-driver %s --target <TARGET-DSN> --stream-id %s --yes`",
+		c.source, c.target, c.streamID)
+	what := "The running stream stopped when it saw the add. Changes to the table that reached it between the add and " +
+		"that moment (at most one poll interval, the window every live add has — ADR-0034) were discarded as excluded, " +
+		"so the stream has recorded the table as dropped, abandoned its add-table (a still-running add stops and records " +
+		"nothing) and taken it out of the live-added set. The table comes back only with a fresh copy: narrow " +
+		"--exclude-table so it no longer names it, empty the target table, and run " + addCmd + " — or re-copy the " +
+		"stream with --restart-from-scratch. A restart that only narrows the exclusion refuses (the table reads as " +
+		"dropped). To leave it out, keep the exclusion; the next start passes."
+	if retireErr != nil {
+		what = "The running stream stopped when it saw the add, and changes to the table in the window before that were " +
+			"discarded as excluded — but recording that on the control row FAILED (" + retireErr.Error() + "), so nothing " +
+			"on record stops a restart that only narrows --exclude-table from streaming the table onto its incomplete copy. " +
+			"Do not do that: with the exclusion still in place every start refuses; to keep the table, empty its target " +
+			"table and run " + addCmd + " after narrowing the exclusion, or re-copy the stream with --restart-from-scratch."
 	}
+	return c.refusalWith(tables, what)
+}
+
+func (c liveAddedCheck) refusalWith(tables []string, what string) error {
+	list := strings.Join(tables, ", ")
 	return fmt.Errorf("pipeline: %w: %s: stream %q has %s in its live-added set — `sluice schema add-table` brought "+
 		"it into the stream — and an --exclude-table pattern names it. The two contradict each other: the add said the "+
 		"table is in the stream's scope, and the exclusion would apply none of its changes, so its target copy would go "+
-		"stale while the stream reported healthy. Decide which you meant: to keep the table, narrow --exclude-table so "+
-		"no pattern matches it; to take it out, run `sluice schema add-table <table> --abandon --source-driver %s --source <SOURCE-DSN> --target-driver %s --target <TARGET-DSN> --stream-id %s --yes`, "+
-		"which removes it from the live-added set. Then start again. %s",
-		ir.ErrIncludeTableScopeDrift, LiveAddedTableExcludedMarker, c.streamID, list, c.source, c.target, c.streamID, what)
+		"stale while the stream reported healthy. %s",
+		ir.ErrIncludeTableScopeDrift, LiveAddedTableExcludedMarker, c.streamID, list, what)
 }
 
 // phaseReadLiveAddedScope reads the stream's live-added set at a start, on
@@ -438,7 +468,7 @@ func (s *Streamer) phaseReadLiveAddedScope(ctx context.Context, applier ir.Chang
 	if excluded := liveAddedExcluded(s.Filter, tables); len(excluded) > 0 {
 		slog.ErrorContext(ctx, "start refused: "+LiveAddedTableExcludedMarker, slog.String("stream_id", streamID),
 			slog.String("tables", strings.Join(excluded, ", ")))
-		return s.liveAddedCheckFor(streamID).refusal(excluded, false)
+		return s.liveAddedCheckFor(streamID, applier).refusal(excluded)
 	}
 	s.startLiveAdded = tables
 	return nil
@@ -539,13 +569,35 @@ func pollLiveAddedTables(pollCtx context.Context, reader liveAddedTablesReader, 
 // when an explicit --exclude-table names one of its tables — raises
 // LIVE-ADDED-TABLE-EXCLUDED on target instead and reports false (R6-S1). The
 // refusal is raised before the set is installed, and the dispatch filter
-// checks it before forwarding each change, so no change the stream receives
-// from then on is applied or acknowledged.
+// checks it before forwarding each change.
+//
+// Before raising it, the refusal is written to the control row (R8,
+// [ir.LiveAddedTableRetirer]): the table's changes in the window since the
+// add were discarded while other tables' changes moved the persisted
+// position past them, so it must not come back on a restart that only
+// narrows the exclusion. The write runs here, synchronously, while the
+// stream is still alive — raising first would let the process exit with the
+// write in flight; the cost is that changes the stream receives during that
+// one transaction still flow (the excluded table's are dropped, as before,
+// and the record now says so). A failed write still stops the stream: it is
+// logged at ERROR and the refusal says what it leaves unprotected.
 func observeLiveAdded(ctx context.Context, check liveAddedCheck, target *liveAddedFilter, tables []string) bool {
 	if excluded := liveAddedExcluded(check.base, tables); len(excluded) > 0 {
 		slog.ErrorContext(ctx, "stream stopping: "+LiveAddedTableExcludedMarker, slog.String("stream_id", check.streamID),
 			slog.String("tables", strings.Join(excluded, ", ")))
-		target.refuse(check.refusal(excluded, true))
+		var retireErr error
+		if check.retire != nil {
+			retireErr = check.retire(ctx, excluded)
+		} else {
+			retireErr = errors.New("the target keeps no add-table record")
+		}
+		if retireErr != nil {
+			slog.ErrorContext(ctx, LiveAddedTableExcludedMarker+": could not record the excluded tables as dropped on the "+
+				"control row; a restart that only narrows --exclude-table would stream them onto their incomplete copies",
+				slog.String("stream_id", check.streamID), slog.String("tables", strings.Join(excluded, ", ")),
+				slog.String("error", retireErr.Error()))
+		}
+		target.refuse(check.runningRefusal(excluded, retireErr))
 		return false
 	}
 	target.Set(tables)

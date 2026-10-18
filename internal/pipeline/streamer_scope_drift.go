@@ -741,10 +741,12 @@ func (s *Streamer) narrowEstablished(ctx context.Context, applier ir.ChangeAppli
 			slog.String("to", strings.ReplaceAll(renamed, "\x00", ".")))
 	}
 	for k, id := range fix.IDs {
-		slog.InfoContext(ctx, "the stream's record takes a table's new engine id: the source rebuilt it while the stream was "+
-			"stopped (OPTIMIZE TABLE, a copying ALTER, TRUNCATE), which on this engine assigns a new id, and nothing "+
-			"shows it is a different table", slog.String("stream_id", streamID),
-			slog.String("table", strings.ReplaceAll(k, "\x00", ".")), slog.String("id", id))
+		slog.WarnContext(ctx, "the stream's record takes a table's new engine id: its id changed while the stream was "+
+			"stopped and nothing shows it is a different table. On this engine a rebuild (OPTIMIZE TABLE, a copying "+
+			"ALTER, TRUNCATE) assigns a new id, and so does a DROP and re-CREATE under the same name, which sluice cannot "+
+			"tell apart (TABLE-RECREATED-WHILE-STOPPED): if the table was re-created while stopped, re-copy it",
+			slog.String("stream_id", streamID), slog.String("table", strings.ReplaceAll(k, "\x00", ".")),
+			slog.String("old_id", rec.IDs[k]), slog.String("new_id", id))
 	}
 	if len(leaving) > 0 {
 		shown := make([]string, len(leaving))
@@ -817,7 +819,9 @@ func (s *Streamer) includeTableScopeDriftError(streamID, publication string, tab
 	for _, t := range tables {
 		var why []string
 		if t.dropped {
-			why = append(why, "it left this stream's scope earlier and its changes since then were discarded, so its target copy is stale")
+			why = append(why, "it is on this stream's dropped record (it left this stream's scope earlier, the running stream "+
+				"stopped its add-table with LIVE-ADDED-TABLE-EXCLUDED, or a re-copy over an unreadable record could not rule "+
+				"either out), so changes to it were discarded and its target copy may be stale")
 		}
 		if t.renamedFrom != "" {
 			why = append(why, fmt.Sprintf("it is %s renamed on the source, but %s: the target was not renamed — rename "+

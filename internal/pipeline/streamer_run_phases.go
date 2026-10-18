@@ -46,7 +46,7 @@ func (s *Streamer) seedLiveAddedFilter(ctx context.Context, applier ir.ChangeApp
 		return
 	}
 	// An add recorded since the start's own check (R6-S1) refuses here too.
-	if !observeLiveAdded(ctx, s.liveAddedCheckFor(streamID), target, tables) {
+	if !observeLiveAdded(ctx, s.liveAddedCheckFor(streamID, applier), target, tables) {
 		return
 	}
 	slog.InfoContext(
@@ -77,7 +77,7 @@ func (s *Streamer) startLiveAddedTablesPoll(applyCtx context.Context, applier ir
 		applyCtx, "live-added-tables poll started",
 		slog.String("stream_id", streamID),
 	)
-	go pollLiveAddedTables(applyCtx, reader, s.liveAddedCheckFor(streamID), target)
+	go pollLiveAddedTables(applyCtx, reader, s.liveAddedCheckFor(streamID, applier), target)
 }
 
 // startStopSignalPoll wires the optional stop-signal poll goroutine

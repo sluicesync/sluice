@@ -31,15 +31,19 @@ import (
 // unlogged table the operator already excluded via --exclude-table never
 // trips the door (the Bug 246 discipline; [migcore.TableFilter.Allows]
 // is exactly the predicate [migcore.ApplyTableFilter] scopes each
-// database's schema with). Sources without the surface (MySQL — no
-// unlogged concept) skip silently.
+// database's schema with). That scope includes the stream's live-added
+// tables ([Streamer.copyFilter], Bug 321 R7b): both callers run after the
+// start read the set, and a live-added table flipped UNLOGGED after its add
+// drops out of a FOR ALL TABLES publication like any other. Sources without
+// the surface (MySQL — no unlogged concept) skip silently.
 func (s *Streamer) preflightSpanningUnloggedTables(ctx context.Context, schemas []string) error {
 	pf, ok := s.Source.(ir.UnloggedCapturePreflighter)
 	if !ok {
 		return nil
 	}
+	scope := s.copyFilter()
 	return pf.PreflightSpanningUnloggedTables(ctx, s.SourceDSN, schemas, func(_, table string) bool {
-		return s.Filter.Allows(table)
+		return scope.Allows(table)
 	})
 }
 

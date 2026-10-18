@@ -2233,6 +2233,11 @@ func (s *Streamer) runOnce(ctx context.Context) (err error) {
 
 	// ---- 3.5. Dry-run: print plan and exit before any state mutation. ----
 	if s.DryRun {
+		// The plan's table list is the cold start's copy scope, live-added
+		// tables included (R7b); the read refuses what the start would.
+		if err := s.phaseReadLiveAddedScope(ctx, applier, streamID); err != nil {
+			return err
+		}
 		return s.logDryRunPlan(ctx, streamID, persisted, found)
 	}
 

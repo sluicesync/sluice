@@ -101,6 +101,17 @@ type TableIdentityReader interface {
 	TableIdentitySurvivesRebuild() bool
 }
 
+// LiveAddedTableRetirer is the optional applier surface the running
+// stream's LIVE-ADDED-TABLE-EXCLUDED refusal writes through (Bug 321 R8):
+// in one row-locked transaction on the stream's control row, each table's
+// pending add-table entry is marked abandoned, the table moves from the
+// established set to the dropped set, and it leaves the live-added set. The
+// changes the stream discarded before it stopped are then on record, so a
+// start that admits the table again refuses until it is copied again.
+type LiveAddedTableRetirer interface {
+	RetireLiveAddedTables(ctx context.Context, streamID string, tables []string) error
+}
+
 // DroppedAllUncopiedEntry is the dropped-set value behind
 // [EstablishedRecord.DroppedAllUncopied]. It cannot collide with a real
 // entry: a bare table name contains no NUL, and a multi-database entry has a

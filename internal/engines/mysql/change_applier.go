@@ -1102,6 +1102,11 @@ func (a *ChangeApplier) RecordLiveAddedTable(ctx context.Context, streamID, tabl
 	if streamID == "" {
 		return errors.New("mysql: applier: RecordLiveAddedTable: streamID is empty")
 	}
+	// A control table that predates the column gets it here too, not only
+	// at an applier's control-table ensure.
+	if err := ensureLiveAddedTablesColumn(ctx, a.db, a.controlKeyspace); err != nil {
+		return err
+	}
 	return recordLiveAddedTable(ctx, a.db, a.controlKeyspace, streamID, tableName)
 }
 

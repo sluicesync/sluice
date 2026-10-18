@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/appliershared"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // liveAddedTablesColumn is sluice_cdc_state's live-added set column, added
@@ -84,4 +85,34 @@ func (a *ChangeApplier) ensureLiveAddedColumn(ctx context.Context, streamID stri
 		return fmt.Errorf("postgres: applier: record live-added table: %w", err)
 	}
 	return nil
+}
+
+var _ ir.LiveAddedTableRetirer = (*ChangeApplier)(nil)
+
+// RetireLiveAddedTables implements [ir.LiveAddedTableRetirer]: the running
+// stream's LIVE-ADDED-TABLE-EXCLUDED write ([appliershared.RetireLiveAddedTables]).
+func (a *ChangeApplier) RetireLiveAddedTables(ctx context.Context, streamID string, tables []string) error {
+	if err := a.ensureTableSetColumns(ctx, streamID); err != nil {
+		return err
+	}
+	if err := a.ensureLiveAddedColumn(ctx, streamID); err != nil {
+		return err
+	}
+	ref := controlTableRef(a.controlSchema)
+	q := appliershared.RetireQueries{
+		ReadForUpdate: "SELECT " + appliershared.PendingAddedTablesColumn + ", " + appliershared.EstablishedTablesColumn + ", " +
+			appliershared.DroppedTablesColumn + ", " + liveAddedTablesColumn + " FROM " + ref + " WHERE stream_id = $1 FOR UPDATE",
+		Update: "UPDATE " + ref + " SET " + appliershared.PendingAddedTablesColumn + " = $1, " + appliershared.EstablishedTablesColumn +
+			" = $2, " + appliershared.DroppedTablesColumn + " = $3, " + liveAddedTablesColumn + " = $4 WHERE stream_id = $5",
+	}
+	codec := appliershared.LiveAddedCodec{
+		Decode: appliershared.DecodeTableSet,
+		Encode: func(tables []string) any {
+			if len(tables) == 0 {
+				return nil
+			}
+			return appliershared.EncodeTableSet(tables)
+		},
+	}
+	return classifyApplierError(appliershared.RetireLiveAddedTables(ctx, a.db, controlCfg, q, codec, streamID, tables))
 }

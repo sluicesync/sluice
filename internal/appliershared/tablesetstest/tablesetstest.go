@@ -388,6 +388,71 @@ func narrowAndAbandon(ctx context.Context, t *testing.T, store Store) {
 	if err := store.ClearPendingAddedTables(ctx, "s1", []string{"ab"}); err != nil {
 		t.Fatal(err)
 	}
+	retireLiveAdded(ctx, t, store, read, recordPending, complete)
+}
+
+// retireStore is a [Store] that also keeps the live-added set and retires
+// from it ([ir.LiveAddedTableRetirer]) — both shipping appliers.
+type retireStore interface {
+	Store
+	ir.LiveAddedTableRetirer
+	RecordLiveAddedTable(ctx context.Context, streamID, table string) error
+	ReadLiveAddedTables(ctx context.Context, streamID string) ([]string, error)
+}
+
+// retireLiveAdded is Bug 321 R8's control-row write: a completed add's table
+// leaves established for dropped, a still-pending add is abandoned (its own
+// completion then supersedes), the dropped set takes it even so, and both
+// leave the live-added set; other entries are untouched; a missing row is
+// nothing to do.
+func retireLiveAdded(ctx context.Context, t *testing.T, store Store, read func() ir.EstablishedRecord, recordPending func(table, token string), complete func(table, token string) error) {
+	t.Helper()
+	r, ok := store.(retireStore)
+	if !ok {
+		t.Fatal("the store does not retire live-added tables (ir.LiveAddedTableRetirer)")
+	}
+	if err := store.RecordEstablishedTables(ctx, "s1", []string{"a"}, map[string]string{"a": "7"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordDroppedTables(ctx, "s1", []string{"old"}); err != nil {
+		t.Fatal(err)
+	}
+	recordPending("rt", "tok-rt")
+	if err := complete("rt", "tok-rt"); err != nil {
+		t.Fatal(err)
+	}
+	recordPending("rp", "tok-rp")
+	for _, tbl := range []string{"keep", "rt", "rp"} {
+		if err := r.RecordLiveAddedTable(ctx, "s1", tbl); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := r.RetireLiveAddedTables(ctx, "s1", []string{"rt", "rp"}); err != nil {
+		t.Fatal(err)
+	}
+	if rec := read(); !reflect.DeepEqual(rec.Established, []string{"a"}) || rec.IDs["a"] != "7" ||
+		!reflect.DeepEqual(rec.Dropped, []string{"old", "rp", "rt"}) {
+		t.Fatalf("after the retire: %+v; want established [a] (id kept), dropped [old rp rt]", rec)
+	}
+	pending, _, err := store.ReadPendingAddedTables(ctx, "s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 || pending[0].Table != "rp" || !pending[0].Abandoned() {
+		t.Fatalf("pending after the retire: %+v; want rp abandoned", pending)
+	}
+	if err := complete("rp", "tok-rp"); !errors.Is(err, ir.ErrPendingAddSuperseded) {
+		t.Fatalf("the retired add's completion = %v; want ErrPendingAddSuperseded", err)
+	}
+	if live, err := r.ReadLiveAddedTables(ctx, "s1"); err != nil || !reflect.DeepEqual(live, []string{"keep"}) {
+		t.Fatalf("live-added after the retire: %v, %v; want [keep]", live, err)
+	}
+	if err := r.RetireLiveAddedTables(ctx, "no-such-stream", []string{"rt"}); err != nil {
+		t.Fatalf("retiring on a missing row: %v", err)
+	}
+	if err := store.ClearPendingAddedTables(ctx, "s1", []string{"rp"}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // RawColumn writes and reads stream s1's raw column value with the test's
